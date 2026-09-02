@@ -318,7 +318,7 @@ impl Guard<'_> {
         if self.fp_allowed {
             return;
         }
-        self.dg.error_note(
+        self.dg.error_note_help(
             span,
             format!(
                 "floating point ({}) is allowed in profile 'kernel' only with #[allow_fp] — '{}' does not have the attribute",
@@ -326,6 +326,11 @@ impl Guard<'_> {
             ),
             "SPEC §2: in the kernel the FPU/SSE registers belong to the interrupted thread; \
              whoever touches them must save their state himself",
+            format!(
+                "write '#[allow_fp]' in front of '{}' and save the FPU state yourself, \
+                 or compute in integers",
+                self.func
+            ),
         );
     }
 
@@ -439,7 +444,12 @@ impl Guard<'_> {
                          that could accept a system call",
                     )
                 };
-                self.dg.error_note(e.span, what, why);
+                self.dg.error_note_help(
+                    e.span,
+                    what,
+                    why,
+                    "reach the machine directly: 'asm { … }', a memory mapped register, or a driver of your own -- and keep the standard library, which makes system calls, out of a kernel build",
+                );
                 for a in args {
                     self.expr(a);
                 }

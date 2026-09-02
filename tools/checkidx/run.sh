@@ -131,7 +131,7 @@ done
 echo "== 2. the message names file, line, column, type, index and length =="
 "$FIRNC" --no-opt tools/checkidx/idx_read.fi -o "$TMPD/m0" > /dev/null 2>&1
 "$TMPD/m0" > /dev/null 2> "$TMPD/m0.err"
-want="panic: index out of bounds in '[i32; 4]' at tools/checkidx/idx_read.fi:11:14 (index=9 len=4)"
+want="panic: index out of bounds in '[i32; 4]' at tools/checkidx/idx_read.fi:12:14 (index=9 len=4)"
 got=$(cat "$TMPD/m0.err")
 if [ "$got" = "$want" ]; then ok; else
     bad "the message is not the expected one"

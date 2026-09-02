@@ -64,7 +64,7 @@
 //! guarantee would be worse than a missing convenience.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use crate::fasthash::HashSet;
 
 use crate::ast::{Expr, TypeExpr};
 use crate::diag::{Diags, Span};
@@ -415,13 +415,17 @@ pub(crate) fn bound_check(
             ty_name
         )
     };
-    dg.error_note(
+    dg.error_note_help(
         span,
         format!(
             "type '{}' does not implement the interface '{}' — bound on the type parameter '{}' of '{}'",
             ty_name, iface, pname, base
         ),
         note,
+        format!(
+            "write 'impl {} for {} {{ … }}' with every method of the interface, or pass a type that has it",
+            iface, ty_name
+        ),
     );
     false
 }
@@ -682,11 +686,26 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     if ck.tcx.lookup(name).is_some() {
         return None; // the ordinary resolution finds the struct
     }
-    ck.dg.error_note(
-        span,
-        format!("unknown interface '{}'", iface),
-        format!("an interface is declared with 'interface {} {{ … }}'", iface),
-    );
+    // ROUND TEMPO: the compiler knows the interfaces it has read -- so it
+    // can say which one was probably meant instead of only saying that this
+    // one is unknown.
+    let known: Vec<String> =
+        REG.with(|r| r.borrow().ifaces.iter().map(|i| i.name.clone()).collect());
+    let hint = crate::diag::nearest(iface, known.iter().map(|s| s.as_str()));
+    match hint {
+        Some(n) => ck.dg.error_note_help(
+            span,
+            format!("unknown interface '{}'", iface),
+            format!("an interface is declared with 'interface {} {{ … }}'", iface),
+            crate::diag::did_you_mean(&n),
+        ),
+        None => ck.dg.error_note_help(
+            span,
+            format!("unknown interface '{}'", iface),
+            format!("an interface is declared with 'interface {} {{ … }}'", iface),
+            "declare the interface before the 'impl' that uses it, or import the module it lives in",
+        ),
+    }
     Some(Type::Error)
 }
 

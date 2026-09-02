@@ -48,7 +48,7 @@
 //! it is not in this round and is named as open in `docs/ROUND82.md` §7.
 
 use crate::fir::{BinOp, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// Which comparison is the negation of this one?
 fn invert(op: CmpOp) -> CmpOp {
@@ -80,9 +80,9 @@ pub(crate) fn run(f: &mut Func) -> usize {
 
     // ---- the tables this pass reads --------------------------------------
     // constants, comparisons and negations, each by their result value
-    let mut consts: HashMap<Val, i128> = HashMap::new();
-    let mut cmps: HashMap<Val, (CmpOp, FTy, Val, Val)> = HashMap::new();
-    let mut nots: HashMap<Val, Val> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
+    let mut cmps: HashMap<Val, (CmpOp, FTy, Val, Val)> = HashMap::default();
+    let mut nots: HashMap<Val, Val> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             let d = match i.dst {

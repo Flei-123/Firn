@@ -65,7 +65,7 @@
 //! construction of the control flow), and the type (holds by definition).
 
 use crate::fir::{BinOp, CmpOp, FTy, Func, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// Inclusive interval of the mathematical value.
 type Range = (i128, i128);
@@ -170,8 +170,8 @@ fn facts_per_block(f: &Func) -> Vec<Vec<(Val, bool)>> {
 
 impl<'a> Ana<'a> {
     fn new(f: &'a Func) -> Ana<'a> {
-        let mut site = HashMap::new();
-        let mut cmps = HashMap::new();
+        let mut site = HashMap::default();
+        let mut cmps = HashMap::default();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, i) in b.insts.iter().enumerate() {
                 if let Some(d) = i.dst {

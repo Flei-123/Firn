@@ -245,7 +245,7 @@ pub(crate) fn check_lambda(ck: &mut Checker, d: &LambdaDecl) -> Type {
     // the scopes BELOW is a capture — `Checker::capture_base` records that
     // at the places where a name really gets used.
     let base = ck.scopes.len();
-    ck.scopes.push(std::collections::HashMap::new());
+    ck.scopes.push(crate::fasthash::HashMap::default());
     ck.capture_frames.push((base, Vec::new()));
     for (p, t) in d.params.iter().zip(params.iter()) {
         ck.declare_var(&p.name, t.clone(), false, p.span);

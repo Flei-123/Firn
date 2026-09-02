@@ -16,7 +16,7 @@ use crate::ast::{
     Attr, Block, ConstDecl, Expr, ExprKind, BinOp, ExternInfo, FnDecl, ImportDecl, Param, Program, Stmt,
     StructDecl, TypeExpr, UnOp,
 };
-use std::collections::HashSet;
+use crate::fasthash::HashSet;
 use crate::diag::{Diags, Span};
 use crate::lexer::{TokKind, Token};
 
@@ -955,10 +955,17 @@ impl<'a> Parser<'a> {
             }
             other => {
                 if !self.recovering {
-                    self.error_here(format!(
-                        "expected an expression, found '{}'",
-                        other.text()
-                    ));
+                    // ROUND TEMPO: say what an expression IS here. The
+                    // reader is looking at a token the parser cannot start
+                    // with, and the list is short enough to print.
+                    let sp = self.span();
+                    self.dg.error_note_help(
+                        sp,
+                        format!("expected an expression, found '{}'", other.text()),
+                        "an expression begins with a number, a string, a name, '(', '[', '-', '!', '~', '&' or '*'",
+                        "a value is missing here -- or one token too many stands in front of it",
+                    );
+                    self.recovering = true;
                 }
                 let sp = self.span();
                 self.broken_expr(sp)
@@ -1007,6 +1014,20 @@ impl<'a> Parser<'a> {
         if self.too_deep() {
             return Block { stmts: Vec::new(), span: start, end: start };
         }
+        // ROUND TEMPO: remember WHERE the block opened. If the file ends
+        // before its `}`, the position of the end of file is true and
+        // useless -- what the reader needs is the brace that is still open
+        // (the same thing `rustc` and `clang` print as "unclosed
+        // delimiter"). Measured before the round:
+        //
+        //   error: expected '}' at the end of the block, found 'end of file'
+        //     --> tests/neg/missing_brace.fi:4:1
+        //      |
+        //    4 |
+        //      | ^ here
+        //
+        // -- an empty source line under a marker.
+        let opened = self.span();
         if !self.expect(TokKind::LBrace, ctx) {
             self.recovering = false;
             return Block { stmts: Vec::new(), span: start, end: start };
@@ -1019,7 +1040,17 @@ impl<'a> Parser<'a> {
             }
             if self.at_eof() {
                 if !self.recovering {
-                    self.error_here("expected '}' at the end of the block, found 'end of file'");
+                    let sp = self.span();
+                    self.dg.error_note_help(
+                        sp,
+                        "expected '}' at the end of the block, found 'end of file'",
+                        format!(
+                            "the block opened at line {}, column {} and was never closed",
+                            opened.line, opened.col
+                        ),
+                        "add the missing '}' -- or find the one that is missing further up: a brace forgotten in the middle makes the file end inside a block",
+                    );
+                    self.recovering = true;
                 }
                 break;
             }
@@ -2192,7 +2223,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         no_struct_lit: false,
         paren_depth: 0,
         file,
-        modules: HashSet::new(),
+        modules: HashSet::default(),
         loop_depth: 0,
         pending_attrs: Vec::new(),
         hoist: Vec::new(),

@@ -91,7 +91,13 @@ python3 tools/lexnum/check.py "$WORK"
 RC=$?
 
 echo "== 4. the literals that have to be REFUSED =="
-"$FIRNC" --emit=tokens "$WORK/bad_cases.fi" > "$WORK/bad_a.txt" 2>"$WORK/bad_ae.txt"
+# ROUND TEMPO: firnc0 collapses repetitions of the SAME sentence (see
+# compiler/src/diag.rs, REPEATS_SHOWN); the lexer in Firn does not do that
+# yet.  What is compared here are the NUMBER READERS, not the shape of a
+# message list, so firnc0 is asked for every repetition -- that is exactly
+# what `--all-errors` is for.  When `lib/firnc1` has caught up, the flag
+# comes out again.
+"$FIRNC" --all-errors --emit=tokens "$WORK/bad_cases.fi" > "$WORK/bad_a.txt" 2>"$WORK/bad_ae.txt"
 "$DUMP" "$WORK/bad_cases.fi" > "$WORK/bad_b.txt" 2>"$WORK/bad_be.txt"
 # The dump binary writes its counts to the error output when there was no
 # diagnostic; with diagnostics the whole stream belongs to the messages.

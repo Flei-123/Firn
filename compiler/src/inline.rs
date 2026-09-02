@@ -32,7 +32,7 @@
 //!  * at most `MAX_INLINES` embeddings per module.
 
 use crate::fir::{FTy, Func, Inst, Module, Op, Term, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fasthash::{HashMap, HashSet};
 
 const MAX_CALLEE_INSTS: usize = 40;
 const MAX_CALLEE_BLOCKS: usize = 8;
@@ -51,7 +51,7 @@ const MAX_INLINES: usize = 2000;
 
 /// Can `from` reach `to` through calls?
 fn reaches(m: &Module, from: &str, to: &str) -> bool {
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::default();
     let mut stack = vec![from];
     while let Some(cur) = stack.pop() {
         if cur == to {
@@ -185,7 +185,7 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     } else {
         None
     };
-    let mut valmap: HashMap<Val, Val> = HashMap::new();
+    let mut valmap: HashMap<Val, Val> = HashMap::default();
     for (k, a) in args.iter().enumerate() {
         valmap.insert(k as Val, *a);
     }
@@ -219,7 +219,7 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     let mv = |v: Val| -> Val { valmap.get(&v).copied().unwrap_or(v) };
 
     // 3. Create the blocks of the body + the continuation block.
-    let mut blockmap: HashMap<u32, u32> = HashMap::new();
+    let mut blockmap: HashMap<u32, u32> = HashMap::default();
     for b in &callee.blocks {
         let nb = f.add_block();
         blockmap.insert(b.id, nb);

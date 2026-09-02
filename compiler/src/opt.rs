@@ -28,7 +28,7 @@
 //! the optimizer cannot hang under any circumstances.
 
 use crate::fir::{BinOp, BlockId, CmpOp, FTy, Func, Module, Op, Term, UnOp, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fasthash::{HashMap, HashSet};
 
 /// hard upper bound of the fixpoint iterations
 const MAX_ROUNDS: u32 = 50;
@@ -204,6 +204,9 @@ pub struct OptConfig {
     pub level: Level,
     /// passes switched off one by one (`--no-pass=`)
     pub disabled: Vec<String>,
+    /// **ROUND TEMPO** -- how many worker threads the per-function work may
+    /// use (`-j`). 1 = the sequential path this compiler had until now.
+    pub jobs: usize,
 }
 
 impl Default for OptConfig {
@@ -213,7 +216,7 @@ impl Default for OptConfig {
         // Round 72 found this line lying: `firnc -o x file.fi` silently built
         // release-fast (unchecked arithmetic) while every doc and the `Level`
         // enum comment above said dev-fast is the default.
-        OptConfig { level: Level::DevFast, disabled: Vec::new() }
+        OptConfig { level: Level::DevFast, disabled: Vec::new(), jobs: 1 }
     }
 }
 
@@ -284,7 +287,46 @@ pub struct PassClock {
     pub rounds: usize,
 }
 
+impl OptStats {
+    /// **ROUND TEMPO** -- adds up two tallies. Every field is a counter, so
+    /// the sum does not depend on which worker counted what: the numbers of
+    /// a parallel run are the numbers of a sequential one.
+    fn merge(&mut self, o: &OptStats) {
+        self.folded += o.folded;
+        self.removed_insts += o.removed_insts;
+        self.removed_blocks += o.removed_blocks;
+        self.promoted_loads += o.promoted_loads;
+        self.copies += o.copies;
+        self.cse += o.cse;
+        self.merged_blocks += o.merged_blocks;
+        self.inlined += o.inlined;
+        self.removed_checks += o.removed_checks;
+        self.hoisted += o.hoisted;
+        self.threaded += o.threaded;
+        self.strength += o.strength;
+        self.phis_folded += o.phis_folded;
+    }
+}
+
 impl PassClock {
+    /// **ROUND TEMPO** -- the same for the pass clock. The times ADD UP over
+    /// the workers, so the table keeps saying what the passes cost in CPU
+    /// time; the wall clock of the phase is what `--timings` prints.
+    fn merge(&mut self, o: &PassClock) {
+        self.rounds += o.rounds;
+        for (n, ms, idle, runs, nix) in &o.rows {
+            match self.rows.iter_mut().position(|r| r.0 == *n) {
+                Some(i) => {
+                    self.rows[i].1 += ms;
+                    self.rows[i].2 += idle;
+                    self.rows[i].3 += runs;
+                    self.rows[i].4 += nix;
+                }
+                None => self.rows.push((n, *ms, *idle, *runs, *nix)),
+            }
+        }
+    }
+
     fn add(&mut self, name: &'static str, t: std::time::Instant) {
         self.add2(name, t, true)
     }
@@ -342,9 +384,7 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     };
     // Clean up per function first, so that the size heuristic of the inliner
     // works on bodies that are already simplified.
-    for f in m.funcs.iter_mut() {
-        optimize_func(f, &mut st, cfg, &mut clk);
-    }
+    optimize_all(&mut m.funcs, &mut st, cfg, &mut clk);
     if cfg.runs("inline") {
         let t = std::time::Instant::now();
         st.inlined += crate::inline::inline_module(m);
@@ -352,12 +392,77 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         for f in m.funcs.iter() {
             phi_check(f, "inline");
         }
-        for f in m.funcs.iter_mut() {
-            optimize_func(f, &mut st, cfg, &mut clk);
-        }
+        optimize_all(&mut m.funcs, &mut st, cfg, &mut clk);
     }
     clk.print();
     st
+}
+
+/// **ROUND TEMPO -- THE OPTIMIZER ON MORE THAN ONE CORE.**
+///
+/// ## What was measured
+///
+/// `--timings` over the three real builds of this repository said that the
+/// optimizer is the second largest phase (27-30 % of the wall clock), and
+/// `time` said the compiler runs at **99 % CPU on a machine with 20 of
+/// them**. The phase is per function and the passes touch nothing but the
+/// `Func` they are handed -- `opt`, `mem2reg`, `peephole`, `licm`,
+/// `rangecheck` and `threading` between them reach for no global state, no
+/// `thread_local!`, no interning table (checked file by file: the only
+/// `crate::` paths in them are `fir`, `threading` and each other).
+///
+/// ## How the work is handed out
+///
+/// NOT in equal slices. One function of `bin/firnc1.fi` --
+/// `gctext::gctext_write`, the collector source as a 19,199 word array --
+/// alone accounts for 131,662 of the 353,944 lines of assembly; a static
+/// split would leave one worker with it and nineteen idle. So the functions
+/// lie in one queue and every worker takes the next one as soon as it is
+/// free. The slowest function then costs what it costs, and nothing else
+/// waits for it.
+///
+/// ## Why the result does not change
+///
+/// A pass reads and writes exactly one function. Two functions cannot see
+/// each other, so the ORDER they are worked in cannot matter; the counters
+/// and the pass clock are added up afterwards. The proof is not the
+/// argument but the file: the emitted assembly of `-j1` and `-j20` is
+/// compared octet for octet in `tools/tempo/run.sh`.
+fn optimize_all(funcs: &mut [Func], st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
+    // Under a handful of functions the threads cost more than they bring.
+    if cfg.jobs <= 1 || funcs.len() < 16 {
+        for f in funcs.iter_mut() {
+            optimize_func(f, st, cfg, clk);
+        }
+        return;
+    }
+    use std::sync::Mutex;
+    let jobs = cfg.jobs.min(funcs.len());
+    let queue: Mutex<Vec<&mut Func>> = Mutex::new(funcs.iter_mut().rev().collect());
+    let out: Mutex<Vec<(OptStats, PassClock)>> = Mutex::new(Vec::new());
+    let on = clk.on;
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                let mut lst = OptStats::default();
+                let mut lclk = PassClock { on, ..Default::default() };
+                loop {
+                    // The lock is held for the pop alone -- the work itself
+                    // happens outside it, which is the whole point.
+                    let next = queue.lock().unwrap().pop();
+                    match next {
+                        Some(f) => optimize_func(f, &mut lst, cfg, &mut lclk),
+                        None => break,
+                    }
+                }
+                out.lock().unwrap().push((lst, lclk));
+            });
+        }
+    });
+    for (lst, lclk) in out.into_inner().unwrap() {
+        st.merge(&lst);
+        clk.merge(&lclk);
+    }
 }
 
 // ROUND 87 -- WHY THE SAME PASS DOES NOT RUN TWICE OVER THE SAME CODE.
@@ -643,8 +748,8 @@ fn cse(f: &mut Func) -> usize {
     }
     let dom = crate::mem2reg::dominators(f);
     let n = f.blocks.len();
-    let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::new();
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::default();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for bi in 0..n {
         for ii in 0..f.blocks[bi].insts.len() {
             let inst = &f.blocks[bi].insts[ii];
@@ -705,10 +810,10 @@ fn cse(f: &mut Func) -> usize {
 fn known_facts(f: &Func) -> Vec<HashMap<Val, bool>> {
     let preds = crate::mem2reg::preds(f);
     let n = f.blocks.len();
-    let mut known: Vec<HashMap<Val, bool>> = vec![HashMap::new(); n];
+    let mut known: Vec<HashMap<Val, bool>> = vec![HashMap::default(); n];
     for bi in 0..n {
         let mut cur = bi;
-        let mut facts: HashMap<Val, bool> = HashMap::new();
+        let mut facts: HashMap<Val, bool> = HashMap::default();
         for _ in 0..64 {
             if preds[cur].len() != 1 {
                 break;
@@ -813,7 +918,7 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
     }
     let consts = const_map(f);
     // Every comparison in the function, by the value it produces.
-    let mut cmps: HashMap<Val, (CmpOp, Val, Val)> = HashMap::new();
+    let mut cmps: HashMap<Val, (CmpOp, Val, Val)> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Cmp { op, a, b: rhs, .. }) = (i.dst, &i.op) {
@@ -824,9 +929,9 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
     let known = known_facts(f);
     let preds = crate::mem2reg::preds(f);
     // Where every value is defined: (block, position in that block).
-    let mut site: HashMap<Val, (usize, usize)> = HashMap::new();
+    let mut site: HashMap<Val, (usize, usize)> = HashMap::default();
     // The address a value was LOADED from, if it is a load.
-    let mut loaded_from: HashMap<Val, Val> = HashMap::new();
+    let mut loaded_from: HashMap<Val, Val> = HashMap::default();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
             if let Some(d) = i.dst {
@@ -933,7 +1038,7 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
     if hits.is_empty() {
         return 0;
     }
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for (bi, ii, dst, idx) in hits {
         f.blocks[bi].insts[ii].op = Op::Const(0);
         map.insert(dst, idx);
@@ -947,7 +1052,7 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
 
 /// Collects all known constant values of the function.
 fn const_map(f: &Func) -> HashMap<Val, i128> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -1348,8 +1453,8 @@ fn collect_uses_filtered(
     blocks: &[usize],
     phi_edge: &dyn Fn(crate::fir::BlockId) -> bool,
 ) -> HashSet<Val> {
-    let mut used: HashSet<Val> = HashSet::new();
-    let mut phi_args: HashMap<Val, Vec<Val>> = HashMap::new();
+    let mut used: HashSet<Val> = HashSet::default();
+    let mut phi_args: HashMap<Val, Vec<Val>> = HashMap::default();
     let mut work: Vec<Val> = Vec::new();
     let mut buf = Vec::new();
     for &bi in blocks {
@@ -1402,7 +1507,7 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     if f.blocks.is_empty() {
         return false;
     }
-    let mut index_of: HashMap<BlockId, usize> = HashMap::new();
+    let mut index_of: HashMap<BlockId, usize> = HashMap::default();
     for (i, b) in f.blocks.iter().enumerate() {
         index_of.insert(b.id, i);
     }
@@ -1483,7 +1588,7 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     let removed_blocks = reachable.iter().filter(|&&r| !r).count();
 
     // renumber without gaps, the order survives
-    let mut new_id: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut new_id: HashMap<BlockId, BlockId> = HashMap::default();
     let mut kept = Vec::with_capacity(live_idx.len());
     for (n, &i) in live_idx.iter().enumerate() {
         new_id.insert(f.blocks[i].id, n as BlockId);

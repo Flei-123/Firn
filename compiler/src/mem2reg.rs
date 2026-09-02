@@ -29,7 +29,7 @@
 //! branch.
 
 use crate::fir::{BinOp, FTy, Func, Inst, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// Instructions that the optimizer treats as untouchable (SPEC §9 and
 /// — since round 52 — SPEC §2: inline assembler and MMIO are `volatile`).
@@ -268,7 +268,7 @@ struct CellUse {
 }
 
 fn scan_cells(f: &Func) -> HashMap<Val, CellUse> {
-    let mut cells: HashMap<Val, CellUse> = HashMap::new();
+    let mut cells: HashMap<Val, CellUse> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { .. }) = (i.dst, &i.op) {
@@ -339,7 +339,7 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
         return 0;
     }
     let dom = dominators(f);
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for (cell, u) in cells.iter() {
         if !u.simple || u.stores.len() != 1 || u.loads.is_empty() || locked(f, *cell) {
             continue;
@@ -583,8 +583,8 @@ pub(crate) fn dom_frontiers(dt: &DomTree) -> Vec<Vec<u32>> {
 /// deliberately does not rewrite those operands -- so a value one of them
 /// reads must never be deleted, and a cell whose `load` feeds one is not
 /// promotable.
-fn untouchable_uses(f: &Func) -> std::collections::HashSet<Val> {
-    let mut out = std::collections::HashSet::new();
+fn untouchable_uses(f: &Func) -> crate::fasthash::HashSet<Val> {
+    let mut out = crate::fasthash::HashSet::default();
     let mut buf = Vec::new();
     for b in &f.blocks {
         for i in &b.insts {
@@ -698,7 +698,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
         return 0;
     }
     let ncell = list.len();
-    let mut idx_of: HashMap<Val, usize> = HashMap::new();
+    let mut idx_of: HashMap<Val, usize> = HashMap::default();
     for (k, (c, _)) in list.iter().enumerate() {
         idx_of.insert(*c, k);
     }
@@ -710,7 +710,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
 
     // ---- 3. phi placement ------------------------------------------------
     // `phi_of[b][k]` = the value the phi for cell k defines in block b.
-    let mut phi_of: Vec<HashMap<usize, Val>> = vec![HashMap::new(); nb];
+    let mut phi_of: Vec<HashMap<usize, Val>> = vec![HashMap::default(); nb];
     let mut defs: Vec<Vec<usize>> = vec![Vec::new(); ncell];
     for (k, (cell, _)) in list.iter().enumerate() {
         let u = &cells[cell];
@@ -789,7 +789,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
     }
     let mut stack: Vec<Vec<Val>> = vec![Vec::new(); ncell];
     let mut pushed: Vec<Vec<usize>> = vec![Vec::new(); nb];
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let mut resolved = 0usize;
     // (block, is_exit)
     let mut work: Vec<(usize, bool)> = Vec::new();
@@ -989,7 +989,7 @@ pub(crate) fn simplify_phis(f: &mut Func) -> usize {
         return 0;
     }
     let pr = preds(f);
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let mut changed = 0usize;
     for (bi, b) in f.blocks.iter_mut().enumerate() {
         let np = b.phi_count();
@@ -1103,10 +1103,10 @@ fn clobbers_memory(op: &Op) -> bool {
 /// each only within one block and only without a memory effect between
 /// them. Yields the number of forwarded `load`s.
 pub(crate) fn forward_local_loads(f: &mut Func) -> usize {
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for b in &f.blocks {
         // known cell contents: address value -> (type, value)
-        let mut known: HashMap<Val, (crate::fir::FTy, Val)> = HashMap::new();
+        let mut known: HashMap<Val, (crate::fir::FTy, Val)> = HashMap::default();
         for i in &b.insts {
             match &i.op {
                 Op::Load { addr } => {
@@ -1147,7 +1147,7 @@ pub(crate) fn forward_local_loads(f: &mut Func) -> usize {
 /// Identities and trivial algebraic simplifications. Yields the number of
 /// substitutions.
 pub(crate) fn copy_propagate(f: &mut Func) -> usize {
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -1155,7 +1155,7 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
             }
         }
     }
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             let d = match i.dst {

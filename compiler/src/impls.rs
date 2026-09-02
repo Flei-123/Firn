@@ -72,7 +72,7 @@ use crate::ast::{Expr, ExprKind, FnDecl, Param, Program, TypeExpr, UnOp};
 use crate::diag::Span;
 use crate::lexer::TokKind;
 use crate::parser::Parser;
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 use crate::sema::{Checker, FnSig, TypeInfo};
 use crate::types::{Type, TypeCtx};
@@ -715,11 +715,28 @@ pub(crate) fn hook_call(
                 );
                 return Some(Type::Error);
             }
-            ck.dg.error_note(
-                nspan,
-                format!("type '{}' has no method '{}'", sname, method),
-                nearest_note(&sname, &method, present),
-            );
+            // ROUND TEMPO: the note lists what the type HAS; if one of them
+            // is close enough to be a typo, that belongs under `help:` --
+            // the reader looks there for what to write.
+            let near = crate::diag::nearest(&method, present.iter().map(|s| s.as_str()));
+            let note = nearest_note(&sname, &method, present);
+            match near {
+                Some(n) => ck.dg.error_note_help(
+                    nspan,
+                    format!("type '{}' has no method '{}'", sname, method),
+                    note,
+                    crate::diag::did_you_mean(&n),
+                ),
+                None => ck.dg.error_note_help(
+                    nspan,
+                    format!("type '{}' has no method '{}'", sname, method),
+                    note,
+                    format!(
+                        "declare it: 'impl {} {{ fn {}(self, …) -> … {{ … }} }}'",
+                        sname, method
+                    ),
+                ),
+            }
             return Some(Type::Error);
         }
     };

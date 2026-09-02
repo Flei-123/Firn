@@ -53,7 +53,7 @@
 //! round. In `matmul` `r * n` reaches the head of the `cc` loop that way.
 
 use crate::fir::{BinOp, Func, Inst, Op, Term, Val};
-use std::collections::HashSet;
+use crate::fasthash::HashSet;
 
 /// Hoists loop invariant instructions into the preheader. Yields the count.
 pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
@@ -119,7 +119,7 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
 /// Body of the natural loop belonging to the back edge `back -> head`:
 /// `head` plus everything that reaches `back` without passing `head`.
 fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize> {
-    let mut body = HashSet::new();
+    let mut body = HashSet::default();
     body.insert(head);
     let mut stack = Vec::new();
     if back != head {
@@ -194,7 +194,7 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
     let mut buf: Vec<Val> = Vec::new();
     let mut order: Vec<usize> = body.iter().copied().collect();
     order.sort_unstable();
-    let mut in_loop: HashSet<Val> = HashSet::new();
+    let mut in_loop: HashSet<Val> = HashSet::default();
     for &b in &order {
         for i in &f.blocks[b].insts {
             if let Some(d) = i.dst {

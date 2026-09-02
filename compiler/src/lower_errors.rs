@@ -14,7 +14,7 @@
 //!  * `a catch b` — `if a.__err == 0 { a.__val } else { b }`
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use crate::fasthash::HashSet;
 
 use crate::ast::{Expr, ExprId, ExprKind};
 use crate::errors::{
@@ -36,7 +36,7 @@ enum Kind {
 thread_local! {
     /// Expressions whose implicit conversion is being produced right now. Keeps
     /// the access to the raw value from running into the conversion again.
-    static BUSY: RefCell<HashSet<ExprId>> = RefCell::new(HashSet::new());
+    static BUSY: RefCell<HashSet<ExprId>> = RefCell::new(HashSet::default());
 }
 
 fn busy(id: ExprId) -> bool {

@@ -722,7 +722,7 @@ fn check_catch(ck: &mut Checker, id: ExprId, args: &[Expr]) -> Type {
             Some(t) => t,
             None => Type::Error,
         };
-        ck.scopes.push(std::collections::HashMap::new());
+        ck.scopes.push(crate::fasthash::HashMap::default());
         ck.declare_var(name, set_ty, false, rhs.span);
     }
     let rt = ck.expr(rhs, Some(&want));
