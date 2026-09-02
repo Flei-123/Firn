@@ -10,7 +10,7 @@
 //! generic name without type arguments) are reported with line and
 //! column; there is no crash.
 
-use std::collections::{HashMap, HashSet};
+use crate::fasthash::{HashMap, HashSet};
 
 use crate::ast::{Block, Expr, ExprKind, FnDecl, Program, Stmt, StructDecl, TypeExpr};
 use crate::diag::{Diags, Span};
@@ -33,7 +33,7 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
         .filter(|(_, i)| !i.is_abstract)
         .collect();
     queue.reverse();
-    let mut done: HashSet<String> = HashSet::new();
+    let mut done: HashSet<String> = HashSet::default();
     let mut next_id = prog.expr_count;
     let mut count = 0usize;
 
@@ -83,7 +83,7 @@ fn bind_params(
         );
         return None;
     }
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for (p, a) in params.iter().zip(inst.args.iter()) {
         // EVERY bound must hold. What is reported is the FIRST violated one —
         // a cascade of follow-up messages about the same type argument says

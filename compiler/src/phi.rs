@@ -209,7 +209,7 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
     // How often is every value read? A value this phi is the ONLY reader of
     // may have its definition rewritten to produce the phi's value straight
     // away (see the header).
-    let mut uses: std::collections::HashMap<Val, usize> = std::collections::HashMap::new();
+    let mut uses: crate::fasthash::HashMap<Val, usize> = crate::fasthash::HashMap::default();
     let mut buf = Vec::new();
     for b in f.blocks.iter() {
         for i in b.insts.iter() {
@@ -234,7 +234,7 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
     // written by every predecessor of its own block, and rewriting the one
     // definition that happens to sit in this block would leave the others
     // writing a value nobody reads.
-    let mut phi_dsts: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    let mut phi_dsts: crate::fasthash::HashSet<Val> = crate::fasthash::HashSet::default();
     for b in f.blocks.iter() {
         for i in b.insts.iter() {
             if let (Some(d), Op::Phi { .. }) = (i.dst, &i.op) {
@@ -315,7 +315,7 @@ fn coalesce_chains(f: &mut Func) {
     for _round in 0..16 {
         let nb = f.blocks.len();
         // Uses per value. A phi entry naming the phi's own value is not one.
-        let mut uses: std::collections::HashMap<Val, usize> = std::collections::HashMap::new();
+        let mut uses: crate::fasthash::HashMap<Val, usize> = crate::fasthash::HashMap::default();
         for b in f.blocks.iter() {
             for i in b.insts.iter() {
                 if let (Some(d), Op::Phi { incoming }) = (i.dst, &i.op) {
@@ -342,7 +342,7 @@ fn coalesce_chains(f: &mut Func) {
                 *uses.entry(v).or_insert(0) += 1;
             }
         }
-        let mut phi_block: std::collections::HashMap<Val, usize> = std::collections::HashMap::new();
+        let mut phi_block: crate::fasthash::HashMap<Val, usize> = crate::fasthash::HashMap::default();
         for (bi, b) in f.blocks.iter().enumerate() {
             let np = b.phi_count();
             for i in b.insts[..np].iter() {
@@ -437,9 +437,9 @@ fn coalesce_chains(f: &mut Func) {
         // EACH OTHER: take a pair unless one of its ends has already been
         // used at the other end. `x1 -> x2` and `x3 -> x4` go in one round,
         // `x2 -> x4` follows in the next, and the chain is gone in two.
-        let mut chosen_x: std::collections::HashSet<Val> = std::collections::HashSet::new();
-        let mut chosen_y: std::collections::HashSet<Val> = std::collections::HashSet::new();
-        let mut map: std::collections::HashMap<Val, Val> = std::collections::HashMap::new();
+        let mut chosen_x: crate::fasthash::HashSet<Val> = crate::fasthash::HashSet::default();
+        let mut chosen_y: crate::fasthash::HashSet<Val> = crate::fasthash::HashSet::default();
+        let mut map: crate::fasthash::HashMap<Val, Val> = crate::fasthash::HashMap::default();
         for (x, y) in pairs.iter() {
             if chosen_y.contains(x) || chosen_x.contains(y) {
                 continue;
@@ -528,8 +528,8 @@ fn fold_into_definitions(
     f: &mut Func,
     p: usize,
     par: Vec<Par>,
-    uses: &std::collections::HashMap<Val, usize>,
-    phi_dsts: &std::collections::HashSet<Val>,
+    uses: &crate::fasthash::HashMap<Val, usize>,
+    phi_dsts: &crate::fasthash::HashSet<Val>,
 ) -> Vec<Par> {
     // Only when the predecessor goes exactly one way -- and `Term::Br` is
     // asked for by name rather than "one successor", because a `switch` with
@@ -709,8 +709,8 @@ mod tests {
             .collect();
         assert_eq!(copies.len(), 3, "a two-cycle needs one rescue: {:?}", copies);
         // Play the sequence through: a and b really do swap.
-        let mut env: std::collections::HashMap<Val, i64> =
-            std::collections::HashMap::new();
+        let mut env: crate::fasthash::HashMap<Val, i64> =
+            crate::fasthash::HashMap::default();
         env.insert(a, 11);
         env.insert(b, 22);
         for (d, s) in &copies {

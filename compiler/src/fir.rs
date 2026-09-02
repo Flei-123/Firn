@@ -686,7 +686,7 @@ pub struct Func {
     /// Values that stem from `secret[T]` (SPEC §9.2). The optimizer and the
     /// code generator treat them specially: no branch, no data dependent
     /// access, no removal of writes.
-    pub secret: std::collections::HashSet<Val>,
+    pub secret: crate::fasthash::HashSet<Val>,
     /// `#[constant_time]`: the code generator aborts when a conditional jump
     /// depends on a `secret` value.
     pub constant_time: bool,
@@ -713,7 +713,7 @@ impl Func {
             ret,
             blocks: vec![Block { id: 0, insts: Vec::new(), term: Term::Unset }],
             val_types,
-            secret: std::collections::HashSet::new(),
+            secret: crate::fasthash::HashSet::default(),
             constant_time: false,
             interrupt: false,
             loc_stamp: Loc::NONE,

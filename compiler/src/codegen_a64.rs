@@ -76,7 +76,7 @@
 use crate::codegen_x86::{block_label, label, Emitter};
 use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, Val};
 use crate::syscalls;
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// Argument registers of AAPCS64, integer class.
 const ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
@@ -192,7 +192,7 @@ fn layout(f: &Func) -> Frame {
         *s = cursor;
     }
     let mut alloca_off: Vec<Option<u64>> = vec![None; n];
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     let mut outgoing = 0u64;
     for b in &f.blocks {
         if b.id != f.entry() && b.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })) {
@@ -211,7 +211,7 @@ fn layout(f: &Func) -> Frame {
     // ROUND 92: only a value with EXACTLY ONE definition is the constant its
     // `const` instruction names. After `phi.rs` a value can be written from
     // several blocks -- see the long note in `regalloc.rs::immediate_consts`.
-    let mut defs: HashMap<Val, u32> = HashMap::new();
+    let mut defs: HashMap<Val, u32> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {

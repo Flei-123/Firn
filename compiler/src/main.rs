@@ -7,6 +7,7 @@
 
 mod abi;
 mod ast;
+mod asmsplit;
 mod ast_canon;
 mod layout_canon;
 mod atomic;
@@ -27,6 +28,7 @@ mod lsp;
 mod errors;
 mod extfn;
 mod threading;
+mod fasthash;
 mod fir;
 mod fnval;
 mod gc;
@@ -116,6 +118,9 @@ struct Options {
     only_object: bool,
     /// **ROUND 82** — `--timings`: wall clock per phase to stderr.
     timings: bool,
+    /// **ROUND TEMPO** — `--all-errors`: do not collapse repetitions of the
+    /// same message (`diag::REPEATS_SHOWN`).
+    all_errors: bool,
     /// **ROUND 94** — `--test`: the entry point of the binary is the test
     /// runner, not the program's own `main` (`testrun.rs`).
     test_mode: bool,
@@ -178,6 +183,32 @@ impl Timings {
     }
 }
 
+/// **ROUND TEMPO** -- a short, stable name for THIS compilation unit.
+///
+/// FNV-1a over the path of the object file, printed in base 36. Two objects
+/// of one build get different tags, and building the same object twice
+/// gives the same one -- reproducibility (`tools/repro`) needs that.
+fn unit_tag(obj: &Path) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in obj.display().to_string().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    let mut out = String::from(".u");
+    let mut v = h;
+    for _ in 0..8 {
+        let d = (v % 36) as u32;
+        out.push(char::from_digit(d, 36).unwrap_or('0'));
+        v /= 36;
+    }
+    out
+}
+
+/// **ROUND TEMPO** -- one worker per core, as `make -j` reads it.
+fn auto_jobs() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
 fn usage() -> String {
     let c = config::compiler_name();
     format!(
@@ -217,6 +248,8 @@ fn usage() -> String {
          --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
          --stats            print the size of the FIR (instructions/blocks)\n  \
          --timings          wall clock per compiler phase (ROUND 82)\n  \
+         --all-errors       print every repetition of a message (ROUND TEMPO)\n  \
+         -j[N]              use N cores (optimizer and 'as');\n                     '-j' alone = one per core (ROUND TEMPO)\n  \
          --test             build and RUN the test cases (#[test], ROUND 94)\n  \
          --format=json|tap  report of --test (default: json)\n  \
          --test-limit=<s>   time limit per case in seconds (default 30, 0 = none)\n  \
@@ -246,6 +279,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut optcfg = opt::OptConfig::default();
     let mut only_object = false;
     let mut timings = false;
+    let mut all_errors = false;
     let mut test_mode = false;
     let mut test_format = testrun::Format::Json;
     let mut test_limit: u32 = 30;
@@ -330,6 +364,25 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--keep-asm" => keep_asm = true,
             "--stats" => stats = true,
             "--timings" => timings = true,
+            "--all-errors" => all_errors = true,
+            // ROUND TEMPO -- `-j N` / `-j` : how many cores the compiler may
+            // use for the per-function work and for the assembler. `-j`
+            // without a number means "as many as the machine has", the same
+            // rule `make -j` follows.
+            "-j" => optcfg.jobs = auto_jobs(),
+            _ if a.starts_with("-j") && a.len() > 2 => {
+                let v = &a[2..];
+                match v.parse::<usize>() {
+                    Ok(0) => optcfg.jobs = auto_jobs(),
+                    Ok(n) => optcfg.jobs = n,
+                    Err(_) => {
+                        return Err(format!(
+                            "'-j' expects a number of workers, found '{}' ('-j' alone = one per core)",
+                            v
+                        ))
+                    }
+                }
+            }
             "--test" => test_mode = true,
             "--no-run" => no_run = true,
             _ if a.starts_with("--format=") => {
@@ -422,6 +475,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         optcfg,
         only_object,
         timings,
+        all_errors,
         test_mode,
         test_format,
         test_limit,
@@ -542,10 +596,22 @@ fn run(opts: &Options) -> i32 {
             eprint!("{}", t);
             return 2;
         }
-        Err(modules::Error::Diag(d)) => {
-            // Print errors of the module resolution using the usual format.
+        Err(modules::Error::Diag(d, read)) => {
+            // ROUND TEMPO: the files that WERE read go into the source map
+            // first, in exactly the order `resolve` numbered them. Only then
+            // does `Span::file` of the diagnostic point at the right file --
+            // before this round the map held the root file alone and the
+            // message came out as `<unknown>:86:1` with an empty source line
+            // (measured while building the Osum kernel).
             let src = std::fs::read_to_string(path).unwrap_or_default();
-            let mut dg = diag::Diags::new(&path.display().to_string(), &src);
+            let mut dg = match read.first() {
+                Some(f) => diag::Diags::new(&f.path.display().to_string(), &f.src),
+                None => diag::Diags::new(&path.display().to_string(), &src),
+            };
+            for f in read.iter().skip(1) {
+                dg.add_file(&f.path.display().to_string(), &f.src);
+            }
+            dg.show_all(opts.all_errors);
             dg.report(d);
             return report(&dg);
         }
@@ -597,6 +663,7 @@ fn run(opts: &Options) -> i32 {
     for f in files.iter().skip(1) {
         dg.add_file(&f.path.display().to_string(), &f.src);
     }
+    dg.show_all(opts.all_errors);
     // Line table for .debug_line: instruction-exact only without the optimizer.
     // The file names come out of `modules::resolve` and are, since round 93,
     // already relative to the working directory
@@ -979,9 +1046,40 @@ fn run(opts: &Options) -> i32 {
             Some(p) => p.clone(),
             None => out.with_extension("o"),
         };
-        if let Err(code) = assemble(&asm_path, &obj_path) {
-            return code;
+        // ROUND TEMPO: the kernel profile writes an OBJECT file, so `ld`
+        // does not run here -- and until this round `-j` therefore did
+        // nothing for the Osum kernel, one of the three builds this round
+        // measures. `ld -r` is the answer: it is still `ld`, and it turns
+        // the parts back into the single object the build script expects.
+        let mut done = false;
+        // The tag: unique per compilation unit, derived from the path of
+        // the object being written. Deterministic -- the same build twice
+        // produces the same names.
+        let tag = unit_tag(&obj_path);
+        match assemble_parallel(&asm, &obj_path, opts.optcfg.jobs, Some(&tag)) {
+            Ok(Some(objs)) => {
+                if let Err(code) = link_relocatable(&objs, &obj_path) {
+                    return code;
+                }
+                for o in &objs {
+                    let _ = std::fs::remove_file(o);
+                }
+                done = true;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
         }
+        if !done {
+            if let Err(code) = assemble(&asm_path, &obj_path) {
+                return code;
+            }
+        }
+        // ROUND TEMPO: `--timings` used to say nothing at all under
+        // `profile kernel` and `-c` -- the function returned here, in front
+        // of the print. The Osum kernel is one of the three big builds this
+        // round measures, so exactly the interesting case had no numbers.
+        tm.mark("as");
+        tm.print();
         if !opts.keep_asm {
             let _ = std::fs::remove_file(&asm_path);
         }
@@ -989,10 +1087,28 @@ fn run(opts: &Options) -> i32 {
     }
     let obj_path = out.with_extension("o");
     tm.mark("write .s");
-    if let Err(code) = assemble_and_link(&asm_path, &obj_path, &out) {
+    // ROUND TEMPO: with `-j` the assembly is cut into parts at function
+    // boundaries and `as` runs on all of them at once (asmsplit.rs). The
+    // objects go to `ld` in link order, so the text of the program comes out
+    // in the same order as before.
+    let objs = match assemble_parallel(&asm, &out, opts.optcfg.jobs, None) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            if let Err(code) = assemble(&asm_path, &obj_path) {
+                return code;
+            }
+            vec![obj_path.clone()]
+        }
+        Err(code) => return code,
+    };
+    tm.mark("as");
+    if let Err(code) = link(&objs, &out) {
         return code;
     }
-    tm.mark("as + ld");
+    tm.mark("ld");
+    for o in &objs {
+        let _ = std::fs::remove_file(o);
+    }
     let _ = std::fs::remove_file(&obj_path);
     if !opts.keep_asm {
         let _ = std::fs::remove_file(&asm_path);
@@ -1077,9 +1193,87 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     }
 }
 
-fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
+/// **ROUND TEMPO** -- `as` on several cores.
+///
+/// Returns `Ok(None)` when nothing was split (no `-j`, or the program is too
+/// small for it to pay) -- the caller then takes the old single path.
+fn assemble_parallel(
+    asm: &str,
+    out: &Path,
+    jobs: usize,
+    tag: Option<&str>,
+) -> Result<Option<Vec<PathBuf>>, i32> {
+    if jobs < 2 {
+        return Ok(None);
+    }
+    let sp = match asmsplit::split(asm, jobs, tag) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let mut paths: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (i, text) in sp.parts.iter().enumerate() {
+        let s = out.with_extension(format!("p{}.s", i));
+        let o = out.with_extension(format!("p{}.o", i));
+        if let Err(e) = std::fs::write(&s, text.as_bytes()) {
+            eprintln!("error: cannot write '{}': {}", s.display(), e);
+            return Err(2);
+        }
+        paths.push((s, o));
+    }
+    let fail = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for (s, o) in &paths {
+            scope.spawn(|| {
+                if assemble(s, o).is_err() {
+                    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    for (s, _) in &paths {
+        let _ = std::fs::remove_file(s);
+    }
+    if fail.load(std::sync::atomic::Ordering::Relaxed) {
+        for (_, o) in &paths {
+            let _ = std::fs::remove_file(o);
+        }
+        return Err(3);
+    }
+    Ok(Some(paths.into_iter().map(|(_, o)| o).collect()))
+}
+
+/// **ROUND TEMPO** -- `ld -r`: several objects into ONE object, nothing
+/// resolved, no entry point. That is what makes `-j` work for a build that
+/// wants an object file (`-c`, `profile kernel`).
+fn link_relocatable(objs: &[PathBuf], out: &Path) -> Result<(), i32> {
     let t = target::active();
-    assemble(asm, obj)?;
+    let tmp = out.with_extension("merged.o");
+    let mut cmd = Command::new(t.linker());
+    cmd.arg("-r").arg("-o").arg(&tmp);
+    for o in objs {
+        cmd.arg(o);
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("error: '{} -r' failed ({})", t.linker(), s);
+            return Err(3);
+        }
+        Err(e) => {
+            eprintln!("error: cannot run '{}': {}", t.linker(), e);
+            return Err(3);
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        eprintln!("error: cannot write '{}': {}", out.display(), e);
+        return Err(2);
+    }
+    Ok(())
+}
+
+/// `ld` over one or many objects.
+fn link(objs: &[PathBuf], out: &Path) -> Result<(), i32> {
+    let t = target::active();
     // `-n` (`--nmagic`) switches OFF the page alignment of the sections and
     // puts everything into ONE loadable segment. That was free as long as
     // a Firn program had nothing but `.text` and `.rodata`: one segment,
@@ -1097,7 +1291,11 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     if !crate::statics::any() {
         cmd.arg("-n");
     }
-    let st = cmd.arg("-o").arg(out).arg(obj).status();
+    cmd.arg("-o").arg(out);
+    for o in objs {
+        cmd.arg(o);
+    }
+    let st = cmd.status();
     match st {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {

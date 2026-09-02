@@ -42,7 +42,7 @@
 use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, Program, Stmt, UnOp};
 use crate::diag::Span;
 use crate::types::Type;
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// Upper bound of statements executed per `comptime` evaluation.
 const MAX_STEPS: u64 = 2_000_000;
@@ -90,7 +90,7 @@ impl<'a> Execution<'a> {
             steps: 0,
             output: String::new(),
             base: std::path::PathBuf::from("."),
-            files: HashMap::new(),
+            files: HashMap::default(),
         }
     }
 
@@ -128,7 +128,7 @@ impl<'a> Execution<'a> {
                 ),
             ));
         }
-        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::new()];
+        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::default()];
         for (p, v) in f.params.iter().zip(args.iter()) {
             env[0].insert(p.name.clone(), *v);
         }
@@ -146,7 +146,7 @@ impl<'a> Execution<'a> {
         env: &mut Vec<HashMap<String, i128>>,
         depth: u32,
     ) -> Result<Flow, Error> {
-        env.push(HashMap::new());
+        env.push(HashMap::default());
         let mut r = Flow::Next;
         for s in &b.stmts {
             r = self.stmt(s, env, depth)?;
@@ -269,7 +269,7 @@ impl<'a> Execution<'a> {
                             ),
                         ));
                     }
-                    env.push(HashMap::new());
+                    env.push(HashMap::default());
                     if let Some(top) = env.last_mut() {
                         top.insert(name.clone(), i);
                     }
@@ -559,13 +559,13 @@ pub(crate) fn run_blocks_out(
     if prog.comptime_blocks.is_empty() {
         return String::new();
     }
-    let empty_consts: HashMap<String, (Type, i128)> = HashMap::new();
+    let empty_consts: HashMap<String, (Type, i128)> = HashMap::default();
     let empty_types: Vec<Type> = Vec::new();
     let mut total = String::new();
     for (b, _span) in &prog.comptime_blocks {
         let mut run = Execution::new(prog, &empty_consts, &empty_types);
         run.base = base.to_path_buf();
-        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::new()];
+        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::default()];
         match run.block(b, &mut env, 0) {
             Ok(_) => total.push_str(&run.output),
             Err((span, msg)) => dg.error(span, msg),

@@ -30,7 +30,7 @@
 //! `TypeCtx::set_fields`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 use crate::ast::{Block, Expr, ExprKind, Stmt, TypeExpr};
 use crate::diag::{Diag, Span};
@@ -916,7 +916,7 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
 
     // 1. check patterns, create bindings, check the body
     for arm in &mi.arms {
-        ck.scopes.push(HashMap::new());
+        ck.scopes.push(HashMap::default());
         check_pattern(ck, &arm.pat, &subject_type(&subject, &sty), &subject, true);
         ck.check_block(&arm.body, true);
         ck.scopes.pop();

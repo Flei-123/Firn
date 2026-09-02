@@ -12,7 +12,7 @@
 //! Aggregates (structs, arrays) are never FIR values but always addresses
 //! only; copies run through `copymem`.
 
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 use crate::ast::{self, Expr, ExprKind, Program, Stmt};
 use crate::diag::{Diags, Span};
@@ -309,7 +309,7 @@ impl<'a> Lower<'a> {
     }
 
     pub(crate) fn enter(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
     }
     pub(crate) fn leave(&mut self) {
         self.scopes.pop();
@@ -1971,7 +1971,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     f.interrupt = crate::core::has_interrupt(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
-        pinned: HashMap::new(),
+        pinned: HashMap::default(),
         info,
         dg,
         f,
@@ -2179,10 +2179,10 @@ mod tests {
         let mut ti = TypeInfo {
             tcx,
             expr_types: b.types.clone(),
-            consts: HashMap::new(),
-            statics: HashMap::new(),
-            fns: HashMap::new(),
-            widen_f32: std::collections::HashSet::new(),
+            consts: HashMap::default(),
+            statics: HashMap::default(),
+            fns: HashMap::default(),
+            widen_f32: crate::fasthash::HashSet::default(),
         };
         for (n, s) in fns {
             ti.fns.insert(n.to_string(), s);

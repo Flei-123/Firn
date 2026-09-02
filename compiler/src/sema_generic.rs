@@ -23,7 +23,7 @@
 //! unsatisfied is a plain error with line and column.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 use crate::ast::{Expr, ExprKind, FnDecl, StructDecl, TypeExpr};
 use crate::diag::Span;

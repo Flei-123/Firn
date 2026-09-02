@@ -52,7 +52,7 @@
 
 use crate::codegen_x86::{block_label, label, size_word, Emitter, Frame, ARG_REGS};
 use crate::fir::{BinOp, Block, BlockId, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// Place of a value after the allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -751,7 +751,7 @@ fn exact_crossings(f: &Func, live: &Live) -> Vec<RegMask> {
 
 /// Finds `alloca`s that can live entirely in a register.
 fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
-    let mut cand: HashMap<Val, Option<FTy>> = HashMap::new();
+    let mut cand: HashMap<Val, Option<FTy>> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { size, .. }) = (i.dst, &i.op) {
@@ -762,7 +762,7 @@ fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
         }
     }
     if cand.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
     let mut bad: Vec<Val> = Vec::new();
     let mut buf = Vec::new();
@@ -844,7 +844,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
     // of the sum was replaced by the immediate `0` of its FIRST definition
     // and the `add` on the back edge wrote a value nobody looked at again.
     // The same trap sits in `codegen_a64.rs::layout`.
-    let mut defs: HashMap<Val, u32> = HashMap::new();
+    let mut defs: HashMap<Val, u32> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -852,7 +852,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
             }
         }
     }
-    let mut cand: HashMap<Val, i64> = HashMap::new();
+    let mut cand: HashMap<Val, i64> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -930,7 +930,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
 /// base of a `ptradd`: they are addressed through `rbp` directly, the pointer
 /// never has to sit in a register.
 fn direct_frame_addrs(f: &Func, fr: &Frame) -> HashMap<Val, u64> {
-    let mut cand: HashMap<Val, u64> = HashMap::new();
+    let mut cand: HashMap<Val, u64> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { .. }) = (i.dst, &i.op) {
@@ -1091,12 +1091,12 @@ pub fn allocate(f: &Func) -> Alloc {
     }
     let mut alloc = Alloc {
         locs,
-        alias: HashMap::new(),
-        alias_src: HashMap::new(),
-        imms: HashMap::new(),
-        frame_addr: HashMap::new(),
-        cells: HashMap::new(),
-        cell_ty: HashMap::new(),
+        alias: HashMap::default(),
+        alias_src: HashMap::default(),
+        imms: HashMap::default(),
+        frame_addr: HashMap::default(),
+        cells: HashMap::default(),
+        cell_ty: HashMap::default(),
         saved: Vec::new(),
         frame,
         stats: None,
@@ -1335,7 +1335,7 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut free_arg: Vec<&'static str> = ARG_SPARE.to_vec();
     let mut free_div: Vec<&'static str> = DIV_SPARE.to_vec();
     let mut active: Vec<(Iv, &'static str)> = Vec::new();
-    let mut assign: HashMap<Val, &'static str> = HashMap::new();
+    let mut assign: HashMap<Val, &'static str> = HashMap::default();
     let mut used_saved: Vec<&'static str> = Vec::new();
 
     let free = |r: &'static str,
@@ -1703,7 +1703,7 @@ struct Ra<'a> {
     /// they move entirely into its operand.
     offset: HashMap<Val, Address>,
     /// Instructions (scaling `shl`/`mul`) that disappear entirely along the way.
-    skipped: std::collections::HashSet<Val>,
+    skipped: crate::fasthash::HashSet<Val>,
     /// Instructions of which only the FILLING of their register is left:
     /// value -> source value. The rest of the computation sits in the memory
     /// operand of the following access.
@@ -1802,11 +1802,11 @@ fn foldable_addresses(
     f: &Func,
     a: &Alloc,
     read: &[u32],
-) -> (HashMap<Val, Address>, std::collections::HashSet<Val>, HashMap<Val, Val>) {
-    use std::collections::HashSet;
-    let mut out: HashMap<Val, Address> = HashMap::new();
-    let mut away: HashSet<Val> = HashSet::new();
-    let mut before: HashMap<Val, Val> = HashMap::new();
+) -> (HashMap<Val, Address>, crate::fasthash::HashSet<Val>, HashMap<Val, Val>) {
+    use crate::fasthash::HashSet;
+    let mut out: HashMap<Val, Address> = HashMap::default();
+    let mut away: HashSet<Val> = HashSet::default();
+    let mut before: HashMap<Val, Val> = HashMap::default();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
         return (out, away, before);
     }
@@ -2195,9 +2195,9 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
     let max_slot = nv as u64 * 8;
     let mut out = String::with_capacity(asm.len());
     // slot_off -> (register with the same content, width of the storage)
-    let mut sync: HashMap<u64, (String, u32)> = HashMap::new();
+    let mut sync: HashMap<u64, (String, u32)> = HashMap::default();
     // register -> slot_off (the reverse)
-    let mut holds: HashMap<String, u64> = HashMap::new();
+    let mut holds: HashMap<String, u64> = HashMap::default();
     // ZERO EXTENSION (round 51). `nullab[r] = k` means: all bits from k on
     // are guaranteed zero in `r`. Without an entry nothing is known.
     //
@@ -2211,7 +2211,7 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
     // — but only if r8 is zero up top anyway. Exactly that condition was
     // missing in round 43, which is why the case was deferred there
     // (docs/ROUND43.md §6).
-    let mut nullab: HashMap<String, u32> = HashMap::new();
+    let mut nullab: HashMap<String, u32> = HashMap::default();
     let kill_reg = |r: &str,
                     sync: &mut HashMap<u64, (String, u32)>,
                     holds: &mut HashMap<String, u64>| {

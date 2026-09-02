@@ -19,7 +19,7 @@
 //! As many errors as possible are collected: after an error the check carries
 //! on with `Type::Error`, which is compatible with everything.
 
-use std::collections::{HashMap, HashSet};
+use crate::fasthash::{HashMap, HashSet};
 
 use crate::ast::{
     BinOp, Block, Expr, ExprId, ExprKind, FnDecl, Program, Stmt, TypeExpr, UnOp,
@@ -83,7 +83,7 @@ pub(crate) struct Checker<'a> {
     /// (`f"{x}"` with an i32 into `io.fmt_number(… i64)`). A set, not a
     /// single slot: the chain of an `f"…"` is itself made of such calls, so
     /// while one is being checked the next one is already being resolved.
-    widen: std::collections::HashSet<crate::ast::ExprId>,
+    widen: crate::fasthash::HashSet<crate::ast::ExprId>,
     /// **ROUND 71** — see `TypeInfo::widen_f32`.
     pub(crate) widen_f32: HashSet<crate::ast::ExprId>,
     pub(crate) dg: &'a mut Diags,
@@ -111,19 +111,19 @@ pub(crate) struct Checker<'a> {
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
     let mut ck = Checker {
-        widen: std::collections::HashSet::new(),
-        widen_f32: HashSet::new(),
+        widen: crate::fasthash::HashSet::default(),
+        widen_f32: HashSet::default(),
         dg,
         tcx: TypeCtx::new(),
-        fns: HashMap::new(),
-        consts: HashMap::new(),
-        statics: HashMap::new(),
+        fns: HashMap::default(),
+        consts: HashMap::default(),
+        statics: HashMap::default(),
         prog: None,
         expr_types: vec![Type::Error; prog.expr_count as usize],
         scopes: Vec::new(),
         ret: Type::Void,
         depth: 0,
-        must_consume_fns: HashSet::new(),
+        must_consume_fns: HashSet::default(),
         capture_frames: Vec::new(),
     };
     ck.run(prog);
@@ -279,10 +279,12 @@ impl<'a> Checker<'a> {
         } else {
             return;
         };
-        self.dg.error_note(
+        self.dg.error_note_help(
             e.span,
             format!("the result must not be discarded: {}", basic),
             "bind it to a variable or pass it on".to_string(),
+            "write 'let x = …' and use 'x', or hand the value to the function that consumes it"
+                .to_string(),
         );
     }
 
@@ -498,7 +500,7 @@ impl<'a> Checker<'a> {
         // 2. resolve the field types
         let mut resolved: Vec<Vec<(String, Type)>> = Vec::with_capacity(prog.structs.len());
         for s in &prog.structs {
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen: HashSet<String> = HashSet::default();
             let mut fields: Vec<(String, Type)> = Vec::new();
             for (name, te, span) in &s.fields {
                 let ty = self.resolve_ty(te);
@@ -533,7 +535,7 @@ impl<'a> Checker<'a> {
         }
         let mut state = vec![0u8; n]; // 0 = new, 1 = on the path, 2 = done
         let mut order: Vec<usize> = Vec::new();
-        let mut bad: HashSet<usize> = HashSet::new();
+        let mut bad: HashSet<usize> = HashSet::default();
         for i in 0..n {
             find_cycles(i, &deps, &mut state, &mut order, &mut bad);
         }
@@ -582,7 +584,7 @@ impl<'a> Checker<'a> {
     fn collect_fns(&mut self, prog: &Program) {
         for f in &prog.funcs {
             let mut params = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen: HashSet<String> = HashSet::default();
             for p in &f.params {
                 let ty = self.resolve_ty(&p.ty);
                 if !seen.insert(p.name.clone()) {
@@ -624,10 +626,11 @@ impl<'a> Checker<'a> {
                 if crate::prof::is_kernel() {
                     return;
                 }
-                self.dg.error_note(
+                self.dg.error_note_help(
                     Span::none(),
                     "the program has no function 'main'",
                     "'fn main() -> i32' is expected",
+                    "add 'fn main() -> i32 { return 0 }' to the root file, or build the file as a module with '-c'",
                 );
             }
             Some(sig) => {
@@ -673,7 +676,7 @@ impl<'a> Checker<'a> {
         };
         self.ret = sig.ret.clone();
         self.scopes.clear();
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         for (p, ty) in f.params.iter().zip(sig.params.iter()) {
             self.declare_var(&p.name, ty.clone(), false, p.span);
         }
@@ -1150,7 +1153,7 @@ compile time)"
 
     pub(crate) fn check_block(&mut self, b: &Block, reuse_scope: bool) {
         if !reuse_scope {
-            self.scopes.push(HashMap::new());
+            self.scopes.push(HashMap::default());
         }
         for s in &b.stmts {
             self.check_stmt(s);
@@ -1231,8 +1234,17 @@ compile time)"
                     }
                 };
                 if let Mutability::Fixed(reason) = mutability {
-                    let note = fixed_note(&reason);
-                    self.dg.error_note(*span, reason, note);
+                    // ROUND TEMPO: `fixed_note` has always said what to
+                    // WRITE ("use 'var' instead of 'let'"). That is a help,
+                    // not a note -- a reader looks for the reason under
+                    // `note:` and for the cure under `help:`.
+                    let cure = fixed_note(&reason);
+                    self.dg.error_note_help(
+                        *span,
+                        reason,
+                        "the binding decides whether a name may be written to at all",
+                        cure,
+                    );
                 }
                 // HOOK fehlerunionen: implicit conversion (errors.rs)
                 if crate::errors::hook_coerce(self, value, &ty) {
@@ -1262,8 +1274,17 @@ compile time)"
                     }
                 };
                 if let Mutability::Fixed(reason) = mutability {
-                    let note = fixed_note(&reason);
-                    self.dg.error_note(*span, reason, note);
+                    // ROUND TEMPO: `fixed_note` has always said what to
+                    // WRITE ("use 'var' instead of 'let'"). That is a help,
+                    // not a note -- a reader looks for the reason under
+                    // `note:` and for the cure under `help:`.
+                    let cure = fixed_note(&reason);
+                    self.dg.error_note_help(
+                        *span,
+                        reason,
+                        "the binding decides whether a name may be written to at all",
+                        cure,
+                    );
                 }
                 // The right side gets the type of the left one as its hint -
                 // exactly what `binary` would give it (`probe(l)`).
@@ -1291,8 +1312,17 @@ compile time)"
                     None => return,
                 };
                 if let Mutability::Fixed(reason) = mutability {
-                    let note = fixed_note(&reason);
-                    self.dg.error_note(*span, reason, note);
+                    // ROUND TEMPO: `fixed_note` has always said what to
+                    // WRITE ("use 'var' instead of 'let'"). That is a help,
+                    // not a note -- a reader looks for the reason under
+                    // `note:` and for the cure under `help:`.
+                    let cure = fixed_note(&reason);
+                    self.dg.error_note_help(
+                        *span,
+                        reason,
+                        "the binding decides whether a name may be written to at all",
+                        cure,
+                    );
                 }
                 if !ty.is_error() && !ty.is_concrete_int() {
                     self.dg.error_note(
@@ -1340,7 +1370,7 @@ compile time)"
                 } else {
                     st
                 };
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 self.declare_var(name, ty, false, *name_span);
                 self.check_block(body, true);
                 self.scopes.pop();
@@ -2230,7 +2260,7 @@ compile time)"
         if lt.is_float() || rt.is_float() {
             let allowed = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
             if !allowed {
-                self.dg.error_note(
+                self.dg.error_note_help(
                     e.span,
                     format!(
                         "operator '{}' is not defined for {}",
@@ -2238,6 +2268,7 @@ compile time)"
                         self.tcx.name_of(if lt.is_float() { &lt } else { &rt })
                     ),
                     "allowed are '+', '-', '*', '/' and the comparisons; for the rest convert explicitly",
+                    "write '(a as i64) <op> (b as i64)' if the bit pattern is what is meant",
                 );
                 return Type::Error;
             }
@@ -2466,15 +2497,20 @@ compile time)"
             return;
         }
         if !assignable(&t, p) {
-            self.dg.error(
+            // ROUND TEMPO: Firn converts nothing behind the programmer's
+            // back (SPEC 3.2). So the cure is always the same and the
+            // message may as well say it.
+            let (from, to) = (self.tcx.name_of(&t), self.tcx.name_of(p));
+            let numeric = t.is_int() && p.is_int();
+            self.dg.error_note_help(
                 a.span,
-                format!(
-                    "argument {} of '{}' has type {}, expected {}",
-                    nr,
-                    who,
-                    self.tcx.name_of(&t),
-                    self.tcx.name_of(p)
-                ),
+                format!("argument {} of '{}' has type {}, expected {}", nr, who, from, to),
+                "Firn converts nothing on its own -- a conversion has to stand in the source text (SPEC 3.2)",
+                if numeric {
+                    format!("write '… as {}' if the value really fits, or change the parameter to {}", to, from)
+                } else {
+                    format!("pass a value of type {} here", to)
+                },
             );
         }
     }
@@ -2498,7 +2534,7 @@ compile time)"
             .get(idx)
             .map(|s| s.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect())
             .unwrap_or_default();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
         for (fname, fexpr, fspan) in fields {
             match def_fields.iter().find(|(n, _)| n == fname) {
                 Some((_, ft)) => {
@@ -3265,18 +3301,18 @@ mod tests {
         first: &Program,
     ) -> Checker<'d> {
         let mut ck = Checker {
-        widen: std::collections::HashSet::new(),
-        widen_f32: HashSet::new(),
+        widen: crate::fasthash::HashSet::default(),
+        widen_f32: HashSet::default(),
             dg,
             tcx: TypeCtx::new(),
-            fns: HashMap::new(),
-            consts: HashMap::new(),
-            statics: HashMap::new(),
+            fns: HashMap::default(),
+            consts: HashMap::default(),
+            statics: HashMap::default(),
             expr_types: vec![Type::Error; first.expr_count as usize],
             scopes: Vec::new(),
             ret: Type::Void,
             depth: 0,
-            must_consume_fns: HashSet::new(),
+            must_consume_fns: HashSet::default(),
             capture_frames: Vec::new(),
             prog: None,
         };

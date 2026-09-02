@@ -81,7 +81,7 @@
 //! Switchable off with `--no-pass=thread-bool`.
 
 use crate::fir::{BlockId, FTy, Func, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// Does this instruction change memory that we cannot survey?
 fn disturbs_memory(op: &Op) -> bool {
@@ -114,8 +114,8 @@ struct Fork {
 /// cell that stands in a fork block is left in memory for exactly one more
 /// round; afterwards the fork block is unreachable, this list is empty, and
 /// the cell is promoted like any other.
-pub(crate) fn fork_cells(f: &Func) -> std::collections::HashSet<Val> {
-    let mut out = std::collections::HashSet::new();
+pub(crate) fn fork_cells(f: &Func) -> crate::fasthash::HashSet<Val> {
+    let mut out = crate::fasthash::HashSet::default();
     if f.constant_time || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return out;
     }
@@ -390,7 +390,7 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
     }
 
     // 1. Collect the switch blocks.
-    let mut forks: HashMap<BlockId, Fork> = HashMap::new();
+    let mut forks: HashMap<BlockId, Fork> = HashMap::default();
     for b in &f.blocks {
         if b.id == 0 || b.insts.len() != 1 {
             continue; // bb0 carries the allocas
@@ -458,9 +458,9 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
 }
 
 /// `alloca`s whose pointer does NOT escape (address of `load`/`store` only).
-fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
-    use std::collections::HashSet;
-    let mut cells: HashSet<Val> = HashSet::new();
+fn simple_cells(f: &Func) -> crate::fasthash::HashSet<Val> {
+    use crate::fasthash::HashSet;
+    let mut cells: HashSet<Val> = HashSet::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { .. }) = (i.dst, &i.op) {
@@ -471,7 +471,7 @@ fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
     if cells.is_empty() {
         return cells;
     }
-    let mut out: HashSet<Val> = HashSet::new();
+    let mut out: HashSet<Val> = HashSet::default();
     let mut buf = Vec::new();
     for b in &f.blocks {
         for i in &b.insts {

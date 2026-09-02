@@ -34,7 +34,7 @@
 //!
 //! This file belongs to the module `nogc` (PLAN.md, round "hardening test 2").
 
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 use crate::ast::{Block, Expr, ExprKind, FnDecl, Program, Stmt};
 use crate::diag::Span;
@@ -101,7 +101,7 @@ fn collect_findings(
     expr_types: &[Type],
     rules: Rules,
 ) -> Vec<(Span, String, String)> {
-    let mut marked: HashMap<&str, bool> = HashMap::new();
+    let mut marked: HashMap<&str, bool> = HashMap::default();
     for f in &prog.funcs {
         // With names declared twice (a separate error of the type check)
         // the stricter entry counts: marked stays marked.

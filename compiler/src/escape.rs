@@ -86,7 +86,7 @@
 //! order, or a program with two escaping locals would be blamed for
 //! different ones.
 
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, Program, Stmt, UnOp};
 use crate::diag::{Diag, Span};
@@ -256,7 +256,7 @@ pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
 /// The pass proper, without `Checker` — testable on its own that way.
 fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, String)> {
     // --- phase 1: the summaries, to a fixed point ---------------------------
-    let mut sums: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut sums: HashMap<String, Vec<u64>> = HashMap::default();
     for f in &prog.funcs {
         // Declared twice is an error of the type check; the first entry wins
         // here and the run stays deterministic.

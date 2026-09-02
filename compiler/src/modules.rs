@@ -22,7 +22,7 @@
 //! namespaces, no separate object file format — there is no `.o` file per
 //! module and there are no interface files.
 
-use std::collections::{HashMap, HashSet};
+use crate::fasthash::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::ast::{Block, Expr, ExprKind, Program, Stmt, TypeExpr};
@@ -83,7 +83,28 @@ fn extra_search_paths() -> Vec<PathBuf> {
 /// source excerpt; `Paket` is a fully formatted text that `firnc0` and
 /// `firnc1` print CHARACTER FOR CHARACTER alike (round 48).
 pub enum Error {
-    Diag(Diag),
+    /// **ROUND TEMPO** -- the diagnostic AND the source files that were
+    /// already read when it happened.
+    ///
+    /// Before this round the error travelled alone. `main.rs` then built a
+    /// `Diags` that knew ONLY the root file, while the span of the message
+    /// pointed at the module that contained the bad `import` -- file number
+    /// 3, say. The renderer looked up number 3, found nothing, and printed
+    ///
+    /// ```text
+    /// error: cannot read 'kernel/net/wire.fi': No such file or directory
+    ///    --> <unknown>:86:1
+    ///     |
+    ///  86 |
+    ///     | ^^^^^^ here
+    /// ```
+    ///
+    /// -- an unnamed file and an EMPTY source line, for a mistake whose
+    /// position the compiler knew exactly. Measured live while building the
+    /// Osum kernel. With the files alongside, `main.rs` registers them in
+    /// the same order they were resolved in, the numbers fit again, and the
+    /// message names the file and prints the `import` line with its marker.
+    Diag(Diag, Vec<SourceFile>),
     Package(String),
 }
 
@@ -114,13 +135,13 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
     let work_dir = package_world::cwd();
     let base = root.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let mut out: Vec<SourceFile> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut seen: HashSet<PathBuf> = HashSet::default();
     let mut queue: Vec<Waiting> = vec![Waiting {
         path: root.to_path_buf(),
         span: Span::none(),
     }];
     // module name -> path seen first, for the conflict check.
-    let mut names: HashMap<String, String> = HashMap::new();
+    let mut names: HashMap<String, String> = HashMap::default();
     while !queue.is_empty() {
         let entry = queue.remove(0);
         let path = entry.path;
@@ -144,8 +165,11 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                             base.display().to_string()
                         }
                     )),
-                    help: None,
-                }));
+                    help: Some(
+                        "check the spelling of the module name, or set $FIRNLIB to the directory the library lives in"
+                            .to_string(),
+                    ),
+                }, out));
             }
         };
         let id = out.len() as u32;
@@ -507,7 +531,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     // Which module offers what?
     let mut infos: Vec<ModuleInfo> = Vec::new();
     for (f, p) in files.iter().zip(progs.iter()) {
-        let mut items: HashSet<String> = HashSet::new();
+        let mut items: HashSet<String> = HashSet::default();
         for x in &p.funcs {
             items.insert(x.name.clone());
         }
@@ -673,7 +697,7 @@ struct Renamer<'a, 'b> {
 
 impl<'a, 'b> Renamer<'a, 'b> {
     fn push_scope(&mut self) {
-        self.locals.push(HashSet::new());
+        self.locals.push(HashSet::default());
     }
     fn pop_scope(&mut self) {
         self.locals.pop();

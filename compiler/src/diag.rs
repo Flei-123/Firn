@@ -86,7 +86,24 @@ pub struct Diags {
     items: Vec<Diag>,
     /// Upper bound, so that broken input cannot produce a flood of errors.
     max: usize,
+    /// **ROUND TEMPO** -- `--all-errors`: print every repetition instead of
+    /// collapsing them (see [`REPEATS_SHOWN`]).
+    show_all: bool,
 }
+
+/// **ROUND TEMPO -- how many times the SAME sentence is printed.**
+///
+/// One mistake by the user can make the compiler say the same thing twenty
+/// times. `tests/neg/free_gc_class_in_kernel.fi` is the measured case: a
+/// `gc class` under `profile kernel` is ONE mistake, and before this round
+/// it produced **24 messages**, 23 of them inside `lib/gc/gc.fi` -- a file
+/// the user never wrote and cannot change. What is left after the first two
+/// is noise that pushes the real cause off the screen.
+///
+/// Two are shown, not one: two places carry the information "this is not a
+/// single accident". From the third on they are counted and summarised.
+/// `--all-errors` turns the collapsing off.
+pub const REPEATS_SHOWN: usize = 2;
 
 const TABWIDTH: usize = 4;
 
@@ -110,6 +127,7 @@ impl Diags {
             files: Vec::new(),
             items: Vec::new(),
             max: 40,
+            show_all: false,
         };
         d.add_file(file, src);
         d
@@ -126,6 +144,11 @@ impl Diags {
                 .collect(),
         });
         id
+    }
+
+    /// **ROUND TEMPO** -- `--all-errors`: no repetition is collapsed.
+    pub fn show_all(&mut self, on: bool) {
+        self.show_all = on;
     }
 
     /// Name of the source file carrying the number `file`.
@@ -166,6 +189,30 @@ impl Diags {
             span,
             label: "here".to_string(),
             note: None,
+            help: Some(help.into()),
+        });
+    }
+
+    /// **ROUND TEMPO** -- explanation AND suggestion.
+    ///
+    /// The survey of this round (`tools/tempo/errors_survey.py`) counted
+    /// what the 193 negative tests actually produce: 97.9 % of the messages
+    /// name file, line and column and print the source line with a marker
+    /// -- but only **6.0 %** said what to WRITE instead. `note` says why
+    /// something is wrong, `help` says how to fix it, and most places had
+    /// only the first of the two because there was no call that took both.
+    pub fn error_note_help(
+        &mut self,
+        span: Span,
+        msg: impl Into<String>,
+        note: impl Into<String>,
+        help: impl Into<String>,
+    ) {
+        self.push(Diag {
+            msg: msg.into(),
+            span,
+            label: "here".to_string(),
+            note: Some(note.into()),
             help: Some(help.into()),
         });
     }
@@ -225,11 +272,86 @@ impl Diags {
     /// All collected diagnostics as text.
     pub fn render(&self) -> String {
         let mut out = String::new();
+        if self.show_all {
+            for d in &self.items {
+                out.push_str(&self.render_one(d));
+            }
+            if self.items.len() > 1 {
+                out.push_str(&format!("{} errors found\n", self.items.len()));
+            }
+            return out;
+        }
+        // ROUND TEMPO -- REPETITIONS OF THE SAME SENTENCE.
+        //
+        // First count how often each message text occurs, so that the last
+        // message still shown already knows how many more would follow: a
+        // reader must not have to scroll to learn that there are nineteen
+        // more of them with one and the same cause.
+        let mut total: Vec<(&str, usize)> = Vec::new();
         for d in &self.items {
+            match total.iter_mut().find(|(m, _)| *m == d.msg.as_str()) {
+                Some(e) => e.1 += 1,
+                None => total.push((d.msg.as_str(), 1)),
+            }
+        }
+        let mut shown_of: Vec<(&str, usize)> = Vec::new();
+        let mut hidden = 0usize;
+        for (i, d) in self.items.iter().enumerate() {
+            let seen = match shown_of.iter_mut().find(|(m, _)| *m == d.msg.as_str()) {
+                Some(e) => {
+                    e.1 += 1;
+                    e.1
+                }
+                None => {
+                    shown_of.push((d.msg.as_str(), 1));
+                    1
+                }
+            };
+            if seen > REPEATS_SHOWN {
+                hidden += 1;
+                continue;
+            }
             out.push_str(&self.render_one(d));
+            let n = total
+                .iter()
+                .find(|(m, _)| *m == d.msg.as_str())
+                .map(|(_, n)| *n)
+                .unwrap_or(1);
+            if seen == REPEATS_SHOWN && n > REPEATS_SHOWN {
+                let more = n - REPEATS_SHOWN;
+                let next = self.items[i + 1..]
+                    .iter()
+                    .find(|o| o.msg == d.msg)
+                    .map(|o| {
+                        format!(
+                            "{}:{}:{}",
+                            self.file_name(o.span.file),
+                            o.span.line,
+                            o.span.col
+                        )
+                    })
+                    .unwrap_or_default();
+                let w = d.span.line.to_string().len();
+                let pad = " ".repeat(w + 1);
+                out.push_str(&format!(
+                    "{} = note: the same error at {} more place{} (next {}) -- one cause; '--all-errors' prints them all\n",
+                    pad,
+                    more,
+                    if more == 1 { "" } else { "s" },
+                    next
+                ));
+            }
         }
         if self.items.len() > 1 {
-            out.push_str(&format!("{} errors found\n", self.items.len()));
+            if hidden > 0 {
+                out.push_str(&format!(
+                    "{} errors found ({} of them repetitions of a sentence already printed)\n",
+                    self.items.len(),
+                    hidden
+                ));
+            } else {
+                out.push_str(&format!("{} errors found\n", self.items.len()));
+            }
         }
         out
     }
