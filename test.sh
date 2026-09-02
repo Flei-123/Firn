@@ -1502,6 +1502,37 @@ else
     grep -E 'FAIL' "$WORK/win_machine.log" "$WORK/win_net.log" "$WORK/win_run.log" | head -12 | sed 's/^/        /'
 fi
 
+echo "== 65b. WINDOWS: the real programs of this repository (ROUND MERGE-WIN) =="
+# Section 65 asks whether a TEST CASE behaves the same on both operating
+# systems. This one asks the question that comes after it, and it asks it
+# with the programs this repository actually ships:
+#
+#   programs.sh  every tool in bin/ -- the compiler written in Firn and the
+#                six dump tools -- plus the examples, built as .exe and RUN.
+#                Standard input, argv, files, the collector.
+#   selfhost.sh  THE COMPILER ITSELF as a Windows program, over the whole
+#                corpus of tests/ and examples/: the assembly `firnc1.exe`
+#                writes under Wine has to be CHARACTER IDENTICAL with the
+#                one the Linux build of the same compiler writes.
+#   seam.sh      what the seam really answers, measured instead of read out
+#                of win_seam.rs: one probe per system call number, on both
+#                operating systems, and a table of BOUND vs ENOSYS.
+#
+# All three SKIP cleanly (exit 0) where the mingw binutils or Wine are not
+# installed.
+bash tools/windows/programs.sh > "$WORK/win_programs.log" 2>&1 && WPRC=0 || WPRC=$?
+grep -E '^  (RESULT|SKIP)' "$WORK/win_programs.log" | sed 's/^/ /'
+bash tools/windows/selfhost.sh > "$WORK/win_selfhost.log" 2>&1 && WSRC=0 || WSRC=$?
+grep -E '^  (SAME|REFUSED|DIFFERENT|corpus|RESULT|SKIP)' "$WORK/win_selfhost.log" | sed 's/^/ /'
+bash tools/windows/seam.sh > "$WORK/win_seam.log" 2>&1 && WERC=0 || WERC=$?
+grep -E '^  (BOUND|MISSING|SKIP)' "$WORK/win_seam.log" | sed 's/^/ /'
+if [ "$WPRC" -eq 0 ] && [ "$WSRC" -eq 0 ] && [ "$WERC" -eq 0 ]; then
+    ok
+else
+    bad "the windows programs failed (see .test-work/win_programs.log, win_selfhost.log, win_seam.log)"
+    grep -E 'DIFFERENT|FAIL' "$WORK/win_programs.log" "$WORK/win_selfhost.log" "$WORK/win_seam.log" | head -12 | sed 's/^/        /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
