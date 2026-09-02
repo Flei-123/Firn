@@ -71,6 +71,8 @@ mod syscalls;
 mod archsel;
 mod target;
 mod types;
+mod win;
+mod win_seam;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -208,6 +210,8 @@ fn usage() -> String {
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
                               | x86_64-none | aarch64-none (freestanding:\n  \
                               no operating system, ELF object, no syscall)\n  \
+                              | x86_64-windows (round WINDOWS: PE/COFF .exe,\n  \
+                              Win64 at the boundary, syscall over Win32)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -780,6 +784,44 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    // --- ROUND WINDOWS: the system seam -------------------------------
+    //
+    // The same shape as the `comptime` injection above and the `--test`
+    // one: source text that arises DURING the compilation is lexed,
+    // parsed and appended, after which the type checker sees no
+    // difference to hand written text.
+    //
+    // What is injected is `win_seam.rs` -- the layer that answers a
+    // `syscall(...)` over Win32, written in Firn. It goes in whenever the
+    // target is Windows, because `_start` itself calls into it (the
+    // standard handles, the command line) even in a program that never
+    // says `syscall` at all.
+    if target::windows() && !dg.has_errors() {
+        let src = win_seam::source();
+        let file = dg.add_file("<windows seam>", &src);
+        dwarf::add_file("<windows seam>");
+        let toks = lexer::lex_file(&src, file, &mut dg);
+        // `parser::parse` would call `reset_hooks` and thereby throw away
+        // everything the MAIN parse registered -- the `gc class`es, the
+        // interfaces, the error sets, the builtin `str` of round 70. The
+        // seam declares none of those, so it is parsed as a further MODULE
+        // of the same compilation, which is what it is.
+        let mut extra = parser::parse_module(&toks, &mut dg, file, 0);
+        let mut next = prog.expr_count;
+        for f in extra.funcs.iter_mut() {
+            crate::mono::renumber_block(&mut f.body, &mut next);
+        }
+        for c in extra.consts.iter_mut() {
+            crate::mono::renumber_expr(&mut c.value, &mut next);
+        }
+        prog.expr_count = next;
+        prog.funcs.extend(extra.funcs);
+        prog.structs.extend(extra.structs);
+        prog.consts.extend(extra.consts);
+        prog.statics.extend(extra.statics);
+        win::note_baseline();
+    }
+
     tm.mark("comptime");
     // ROUND ARM-FREESTANDING: `#[arch(...)]` -- throw away every function
     // that belongs to another machine, BEFORE anything has looked at a type
@@ -1037,6 +1079,12 @@ fn default_output(input: &Path) -> PathBuf {
     if p.as_os_str().is_empty() {
         p = PathBuf::from("a.out");
     }
+    // ROUND WINDOWS: an image without `.exe` is not startable there, and a
+    // name without a suffix would collide with the Linux build in the same
+    // directory.
+    if target::windows() {
+        p.set_extension("exe");
+    }
     p
 }
 
@@ -1094,7 +1142,17 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     // page aligned segments, everything else stays bit for bit what it was
     // (`tools/repro`).
     let mut cmd = Command::new(t.linker());
-    if !crate::statics::any() {
+    if t.is_windows() {
+        // ROUND WINDOWS. The linker gets exactly three things and no
+        // library at all: the entry point (ours, `_start`), the subsystem
+        // (a console program, so that stdout is a console and not a
+        // window), and a fixed image base so that no relocation section is
+        // needed. The import table comes out of our own object file
+        // (`win.rs::idata_asm`) -- `-lkernel32` never appears here, and no
+        // foreign object file enters the image.
+        cmd.arg("-e").arg("_start");
+        cmd.arg("--subsystem").arg("console");
+    } else if !crate::statics::any() {
         cmd.arg("-n");
     }
     let st = cmd.arg("-o").arg(out).arg(obj).status();
