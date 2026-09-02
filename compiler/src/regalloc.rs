@@ -2642,7 +2642,9 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     e.line("push rbp");
     e.line("mov rbp, rsp");
     if a.frame.size > 0 {
-        e.line(&format!("sub rsp, {}", a.frame.size));
+        // ROUND WINDOWS: a frame of a page or more probes first
+        // (codegen_x86::emit_frame). On Linux this is the `sub` it always was.
+        crate::codegen_x86::emit_frame(e, a.frame.size);
     }
     for (r, off) in &a.saved {
         e.line(&format!("mov qword ptr [rbp-{}], {}", off, r));
@@ -3941,6 +3943,44 @@ fn emit_inst(
             if args.is_empty() {
                 return Err("internal error: syscall without number".to_string());
             }
+            // ROUND WINDOWS: not an instruction but a call into the seam.
+            // Seven System V arguments -- the seventh over the stack -- and
+            // the same parallel move problem as an ordinary call, because
+            // `r8`/`r9` are homes of the allocation as well.
+            if crate::target::windows() {
+                e.line("sub rsp, 16");
+                if args.len() >= 7 {
+                    ra.load_full(e, "rax", args[6]);
+                } else {
+                    e.line("xor eax, eax");
+                }
+                e.line("mov qword ptr [rsp], rax");
+                let mut wmoves: Vec<(String, String)> = Vec::new();
+                let mut wlater: Vec<(usize, Val)> = Vec::new();
+                for k in 0..ARG_REGS.len().min(args.len()) {
+                    let o = ra.opnd(args[k]);
+                    if is_reg64(&o) {
+                        wmoves.push((ARG_REGS[k].to_string(), o));
+                    } else {
+                        wlater.push((k, args[k]));
+                    }
+                }
+                parallel_reg_moves(e, &wmoves);
+                for (k, arg) in wlater {
+                    ra.load_full(e, ARG_REGS[k], arg);
+                }
+                // The unused ones LAST: before the moves they could have
+                // destroyed a source that still had to travel.
+                for k in args.len()..ARG_REGS.len() {
+                    e.line(&format!("mov {}, 0", ARG_REGS[k]));
+                }
+                e.line(&format!("call {}", label(crate::win_seam::SYSCALL_FN)));
+                e.line("add rsp, 16");
+                if let Some(d) = i.dst {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             // The same class of bug as with the call: `r10`, `r8` and `r9`
             // are at the same time scratch registers of the allocation.
             let mut sys_moves: Vec<(String, String)> = Vec::new();
@@ -4024,6 +4064,25 @@ fn emit_inst(
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
+            // ROUND WINDOWS: `clone(2)` has no Win32 equivalent this round
+            // can honour -- `CreateThread` hands the child a stack of its
+            // own and a different entry convention, and the collector's
+            // thread table (lib/gc/gc.fi) is built on the Linux shape.
+            //
+            // A COMPILE ERROR would be the wrong answer, and the round
+            // measured why: `lib/gc/gc.fi` CONTAINS a spawn, so every
+            // program that links the collector would be refused -- 93 of
+            // 309 cases, almost none of which ever start a thread. So the
+            // instruction becomes what the seam does with a system call it
+            // cannot serve: `-38` (ENOSYS), the value `thread_spawn`
+            // already knows as a failure.
+            if crate::target::windows() {
+                crate::thread::spawn_unsupported(e);
+                if let Some(d) = i.dst {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             let d = i.dst.ok_or("internal error: spawn without target")?;
             ra.load_full(e, "rdi", *arg);
             ra.load_full(e, "rsi", *stack);
