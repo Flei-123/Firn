@@ -92,8 +92,19 @@ pub(crate) fn records_asm() -> String {
     let _ = writeln!(out, "{}", crate::target::align(8));
     for k in recs {
         let sym = crate::codegen_x86::label(&k);
+        // ROUND CERTUS-WINDOWS. Word 0 of the record is the address a
+        // caller jumps to. For a `#[win_callback]` function on the Windows
+        // target that address must be the Win64 -> System V thunk and not
+        // the Firn body -- otherwise `user32` enters a System V function
+        // with Win64 arguments, which is a crash with no message.
+        let mut code = sym.clone();
+        if crate::target::windows() {
+            if let Some(argc) = crate::win::is_callback(&k) {
+                code = crate::win::note_callback(&sym, argc);
+            }
+        }
         let _ = writeln!(out, "{}{}:", RECORD_LABEL, sym);
-        let _ = writeln!(out, "    .quad {}", sym);
+        let _ = writeln!(out, "    .quad {}", code);
     }
     out
 }
