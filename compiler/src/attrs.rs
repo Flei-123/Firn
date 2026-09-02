@@ -100,6 +100,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "explicit C link name for 'extern fn', e.g. #[link_name(exit)] (SPEC 14.5)",
     },
     AttrInfo {
+        name: "win_callback",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "Windows may call this function back: emit the Win64 -> System V thunk (round CERTUS-WINDOWS, win.rs)",
+    },
+    AttrInfo {
         name: "export_c",
         target: Target::Func,
         args: 0,
