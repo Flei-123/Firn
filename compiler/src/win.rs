@@ -121,6 +121,64 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("setsockopt", "WS2_32.dll", 5),
     ("getsockname", "WS2_32.dll", 3),
     ("ioctlsocket", "WS2_32.dll", 3),
+    // --- ws2_32: what round CERTUS-WINDOWS had to add ------------------
+    // `sendto`/`recvfrom` WITH an address. Round MERGE-WIN bound only the
+    // connected form and wrote down that Certus does not need the other
+    // one -- which was measured on the wrong tree: `lib/net/udp.fi` asks
+    // every DNS question with `sendto(fd, .., addr, alen)`, and a UDP
+    // socket that was never `connect`ed answers WSAENOTCONN to `send`.
+    ("sendto", "WS2_32.dll", 6),
+    ("recvfrom", "WS2_32.dll", 6),
+    ("select", "WS2_32.dll", 5),
+    // --- kernel32: directories, renaming, and looking a symbol up -----
+    ("CreateDirectoryW", "KERNEL32.dll", 2),
+    ("MoveFileExW", "KERNEL32.dll", 3),
+    ("GetModuleHandleW", "KERNEL32.dll", 1),
+    ("GetProcAddress", "KERNEL32.dll", 2),
+    // --- user32: the window ------------------------------------------
+    // Round MERGE-WIN 5.2 says "any GUI" is not bound and therefore not
+    // reachable. This is where that stops being true. Everything here is
+    // Win32 straight out of the DLL; no wrapper library, no widget set.
+    ("RegisterClassW", "USER32.dll", 1),
+    ("CreateWindowExW", "USER32.dll", 12),
+    ("DestroyWindow", "USER32.dll", 1),
+    ("ShowWindow", "USER32.dll", 2),
+    ("UpdateWindow", "USER32.dll", 1),
+    ("DefWindowProcW", "USER32.dll", 4),
+    ("GetMessageW", "USER32.dll", 4),
+    ("PeekMessageW", "USER32.dll", 5),
+    ("TranslateMessage", "USER32.dll", 1),
+    ("DispatchMessageW", "USER32.dll", 1),
+    ("PostQuitMessage", "USER32.dll", 1),
+    ("GetClientRect", "USER32.dll", 2),
+    ("InvalidateRect", "USER32.dll", 3),
+    ("ValidateRect", "USER32.dll", 2),
+    ("GetDC", "USER32.dll", 1),
+    ("ReleaseDC", "USER32.dll", 2),
+    ("IsWindow", "USER32.dll", 1),
+    ("SetWindowTextW", "USER32.dll", 2),
+    ("LoadCursorW", "USER32.dll", 2),
+    ("SetProcessDpiAwarenessContext", "USER32.dll", 1),
+    ("SetProcessDPIAware", "USER32.dll", 0),
+    ("GetDpiForWindow", "USER32.dll", 1),
+    ("MsgWaitForMultipleObjectsEx", "USER32.dll", 5),
+    ("AdjustWindowRectEx", "USER32.dll", 4),
+    ("GetSystemMetrics", "USER32.dll", 1),
+    ("GetKeyState", "USER32.dll", 1),
+    ("SetCapture", "USER32.dll", 1),
+    ("ReleaseCapture", "USER32.dll", 0),
+    // --- gdi32: the DIB section and the one blit ----------------------
+    ("CreateDIBSection", "GDI32.dll", 6),
+    ("CreateCompatibleDC", "GDI32.dll", 1),
+    ("SelectObject", "GDI32.dll", 2),
+    ("BitBlt", "GDI32.dll", 9),
+    ("DeleteObject", "GDI32.dll", 1),
+    ("DeleteDC", "GDI32.dll", 1),
+    ("SetTextColor", "GDI32.dll", 2),
+    ("SetBkColor", "GDI32.dll", 2),
+    ("SetBkMode", "GDI32.dll", 2),
+    ("TextOutA", "GDI32.dll", 5),
+    ("GetStockObject", "GDI32.dll", 1),
     // --- advapi32: the random source ----------------------------------
     // `SystemFunction036` IS `RtlGenRandom`; that is the name it is
     // exported under, and Microsoft's own header only gives it the other

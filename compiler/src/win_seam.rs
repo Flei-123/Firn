@@ -84,6 +84,12 @@ pub const BASELINE: &[&str] = &[
     "accept",
     "setsockopt",
     "getsockname",
+    // ROUND CERTUS-WINDOWS: the address carrying forms and `select`.
+    "sendto",
+    "recvfrom",
+    "select",
+    "CreateDirectoryW",
+    "MoveFileExW",
     "SystemFunction036",
 ];
 
@@ -150,6 +156,11 @@ extern fn listen(s: i64, back: i64) -> i32;
 extern fn accept(s: i64, a: u64, n: u64) -> i64;
 extern fn setsockopt(s: i64, lvl: i64, opt: i64, v: u64, n: i64) -> i32;
 extern fn getsockname(s: i64, a: u64, n: u64) -> i32;
+extern fn sendto(s: i64, b: u64, n: i64, f: i64, a: u64, al: i64) -> i32;
+extern fn recvfrom(s: i64, b: u64, n: i64, f: i64, a: u64, al: u64) -> i32;
+extern fn select(n: i64, rd: u64, wr: u64, ex: u64, tv: u64) -> i32;
+extern fn CreateDirectoryW(p: u64, sa: i64) -> i32;
+extern fn MoveFileExW(a: u64, b: u64, fl: i64) -> i32;
 extern fn SystemFunction036(buf: u64, n: i64) -> i32;
 
 // 0 = free, 1 = file handle, 2 = socket, 3 = a file that only exists here
@@ -783,6 +794,159 @@ fn __win_dup(fd: i64, into: i64) -> i64 {
     return into
 }
 
+// ------------------------------------------------- the address family
+// ROUND CERTUS-WINDOWS. A `sockaddr_in` is the same twelve octets on both
+// systems, and AF_INET is 2 on both -- that is why round MERGE-WIN got
+// away without ever looking. AF_INET6 is 10 on Linux and 23 on Windows,
+// and `lib/net/dns.fi` opens exactly that socket to find out whether the
+// machine has a v6 route. Passing 10 through makes Winsock answer
+// WSAEAFNOSUPPORT, which is not wrong here (the answer "no v6" is
+// correct), but it would be wrong the moment anything really speaks v6.
+// So the number is translated in both directions, in one place.
+fn __win_af_to_win(af: i64) -> i64 {
+    if af == 10 { return 23 }
+    return af
+}
+
+// A sockaddr on its way OUT: if it is v6, its family octets have to say 23.
+// Everything else is copied unchanged. The copy goes into scratch, because
+// the caller's buffer belongs to the caller.
+fn __win_sa_out(a: u64, n: i64) -> u64 {
+    if n <= 0 { return a }
+    let fam: i64 = __win_ld16(a, 0)
+    if fam != 10 { return a }
+    let d: u64 = __win_tmp + 1024
+    var i: i64 = 0
+    while i < n {
+        __win_st8(d, i, __win_ld8(a, i))
+        i = i + 1
+    }
+    __win_st16(d, 0, 23)
+    return d
+}
+
+// A sockaddr on its way IN: Windows says 23, the library expects 10.
+fn __win_sa_in(a: u64, n: i64) {
+    if n <= 0 { return }
+    if __win_ld16(a, 0) == 23 {
+        __win_st16(a, 0, 10)
+    }
+}
+
+// ------------------------------------------------------------- poll
+// `poll(2)` over `select`. Linux `struct pollfd` is {i32 fd, i16 events,
+// i16 revents} = 8 octets; a Windows `fd_set` is {u32 count, pad,
+// SOCKET[64]}. Only sockets can be waited for -- a file handle is always
+// ready and is answered that way, which is what `poll` on a regular file
+// does on Linux too.
+fn __win_fdset_clear(p: u64) {
+    __win_st64(p, 0, 0)
+}
+
+fn __win_fdset_add(p: u64, s: i64) {
+    let c: i64 = __win_ld64(p, 0)
+    if c >= 64 { return }
+    __win_st64(p, 1 + c, s)
+    __win_st64(p, 0, c + 1)
+}
+
+fn __win_fdset_has(p: u64, s: i64) -> bool {
+    let c: i64 = __win_ld64(p, 0)
+    var i: i64 = 0
+    while i < c {
+        if __win_ld64(p, 1 + i) == s { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn __win_poll(fds: u64, nfds: i64, ms: i64) -> i64 {
+    if nfds <= 0 {
+        if ms > 0 { Sleep(ms) }
+        return 0
+    }
+    let rd: u64 = __win_tmp + 2048
+    let wr: u64 = __win_tmp + 3072
+    let ex: u64 = __win_tmp + 4096
+    __win_fdset_clear(rd)
+    __win_fdset_clear(wr)
+    __win_fdset_clear(ex)
+    var ready: i64 = 0
+    var socks: i64 = 0
+    var i: i64 = 0
+    while i < nfds {
+        let off: i64 = i * 8
+        let q: *mut i32 = ((fds as i64) + off) as *mut i32
+        let fd: i64 = (*q) as i64
+        let ev: i64 = __win_ld16(fds, off / 2 + 2)
+        let rp: *mut u16 = ((fds as i64) + off + 6) as *mut u16
+        *rp = 0 as u16
+        if fd >= 0 {
+            if __win_kind_of(fd) == 2 {
+                let h: i64 = __win_handle(fd)
+                if (ev & 1) != 0 { __win_fdset_add(rd, h) }
+                if (ev & 4) != 0 { __win_fdset_add(wr, h) }
+                __win_fdset_add(ex, h)
+                socks = socks + 1
+            } else {
+                if __win_kind_of(fd) != 0 {
+                    // a file or the console: always ready
+                    *rp = (ev & 5) as u16
+                    ready = ready + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if socks == 0 {
+        if ready == 0 {
+            if ms > 0 { Sleep(ms) }
+        }
+        return ready
+    }
+    if ready > 0 {
+        // something is ready already -- ask without waiting
+        let tv0: u64 = __win_tmp + 5120
+        __win_st64(tv0, 0, 0)
+        __win_st64(tv0, 1, 0)
+        select(0, rd, wr, ex, tv0)
+    } else {
+        var tvp: u64 = 0
+        if ms >= 0 {
+            let tv: u64 = __win_tmp + 5120
+            __win_st64(tv, 0, ms / 1000)
+            __win_st64(tv, 1, (ms % 1000) * 1000)
+            tvp = tv
+        }
+        let r: i32 = select(0, rd, wr, ex, tvp)
+        if (r as i64) < 0 {
+            return __win_sockerrno()
+        }
+    }
+    i = 0
+    while i < nfds {
+        let off: i64 = i * 8
+        let q: *mut i32 = ((fds as i64) + off) as *mut i32
+        let fd: i64 = (*q) as i64
+        let rp: *mut u16 = ((fds as i64) + off + 6) as *mut u16
+        if fd >= 0 {
+            if __win_kind_of(fd) == 2 {
+                let h: i64 = __win_handle(fd)
+                var re: i64 = 0
+                if __win_fdset_has(rd, h) { re = re | 1 }
+                if __win_fdset_has(wr, h) { re = re | 4 }
+                if __win_fdset_has(ex, h) { re = re | 8 }
+                if re != 0 {
+                    *rp = re as u16
+                    ready = ready + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ready
+}
+
 // --------------------------------------------------------- the dispatcher
 // The number is the canonical (x86-64 Linux) one, exactly as it is written
 // in the source. Everything that has no Windows equivalent answers -38
@@ -900,7 +1064,7 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
     if nr == 41 {
         // socket(domain, type, protocol)
         __win_wsa_up()
-        let s: i64 = socket(a1, a2 & 255, a3)
+        let s: i64 = socket(__win_af_to_win(a1), a2 & 255, a3)
         if s == 0 - 1 {
             return __win_sockerrno()
         }
@@ -910,17 +1074,73 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         if __win_kind_of(a1) != 2 {
             return 0 - 88
         }
-        if connect(__win_handle(a1), a2 as u64, a3) != 0 {
+        if connect(__win_handle(a1), __win_sa_out(a2 as u64, a3), a3) != 0 {
             return __win_sockerrno()
         }
         return 0
     }
     if nr == 44 {
-        // sendto(fd, buf, len, flags, addr, alen) -- connected form only
-        return __win_write(a1, a2 as u64, a3)
+        // sendto(fd, buf, len, flags, addr, alen).
+        // Without an address this is the connected form and goes through
+        // the same path `write` takes. WITH one it is the form round
+        // MERGE-WIN did not bind, and it is the form every DNS question
+        // in `lib/net/udp.fi` uses.
+        if a5 == 0 || a6 <= 0 {
+            return __win_write(a1, a2 as u64, a3)
+        }
+        if __win_kind_of(a1) != 2 {
+            return 0 - 88
+        }
+        let sa: u64 = __win_sa_out(a5 as u64, a6)
+        let r: i64 = sendto(__win_handle(a1), a2 as u64, a3, a4, sa, a6) as i64
+        if r < 0 {
+            return __win_sockerrno()
+        }
+        return r
     }
     if nr == 45 {
-        return __win_read(a1, a2 as u64, a3)
+        // recvfrom(fd, buf, len, flags, addr, alenp)
+        if a5 == 0 || a6 == 0 {
+            return __win_read(a1, a2 as u64, a3)
+        }
+        if __win_kind_of(a1) != 2 {
+            return 0 - 88
+        }
+        let r: i64 = recvfrom(__win_handle(a1), a2 as u64, a3, a4,
+            a5 as u64, a6 as u64) as i64
+        if r < 0 {
+            return __win_sockerrno()
+        }
+        let lp: *mut i32 = a6 as *mut i32
+        __win_sa_in(a5 as u64, (*lp) as i64)
+        return r
+    }
+    if nr == 7 {
+        return __win_poll(a1 as u64, a2, a3)
+    }
+    if nr == 83 {
+        // mkdir(path, mode) -- the mode has no Windows equivalent.
+        if __win_u8_to_u16(a1 as u64, __win_path, 16384) < 0 {
+            return 0 - 36
+        }
+        if CreateDirectoryW(__win_path, 0) == 0 {
+            return __win_errno()
+        }
+        return 0
+    }
+    if nr == 82 {
+        // rename(old, new). MOVEFILE_REPLACE_EXISTING = 1, which is what
+        // rename(2) does and what CreateDirectoryW's neighbour does not.
+        if __win_u8_to_u16(a1 as u64, __win_path, 8192) < 0 {
+            return 0 - 36
+        }
+        if __win_u8_to_u16(a2 as u64, __win_path + 16384, 8192) < 0 {
+            return 0 - 36
+        }
+        if MoveFileExW(__win_path, __win_path + 16384, 1) == 0 {
+            return __win_errno()
+        }
+        return 0
     }
     if nr == 48 {
         if __win_kind_of(a1) != 2 {
@@ -935,7 +1155,7 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         if __win_kind_of(a1) != 2 {
             return 0 - 88
         }
-        if bind(__win_handle(a1), a2 as u64, a3) != 0 {
+        if bind(__win_handle(a1), __win_sa_out(a2 as u64, a3), a3) != 0 {
             return __win_sockerrno()
         }
         return 0
