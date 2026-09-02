@@ -52,7 +52,7 @@
 //! thunk).
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Prefix of every symbol this file invents. Same idea as `_F0.`
 /// (`modules.rs`): reserved, and no source text can produce it.
@@ -60,6 +60,11 @@ pub const PREFIX: &str = "_Fwin.";
 
 /// The stack probe. Called with the frame size in `rax`.
 pub const CHKSTK: &str = "_Fwin.chkstk";
+
+/// Prefix of a CALLBACK thunk: the mirror image of `PREFIX`. `_Fwin.X`
+/// takes System V arguments and hands them to Win32; `_Fwincb.X` takes
+/// Win64 arguments and hands them to Firn.
+pub const CBPREFIX: &str = "_Fwincb.";
 
 /// The stub that takes the LINUX system call register convention and hands
 /// it to the seam. Everything that emits a `syscall` instruction as HAND
@@ -165,6 +170,8 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("AdjustWindowRectEx", "USER32.dll", 4),
     ("GetSystemMetrics", "USER32.dll", 1),
     ("GetKeyState", "USER32.dll", 1),
+    ("SetWindowLongPtrW", "USER32.dll", 3),
+    ("GetWindowLongPtrW", "USER32.dll", 2),
     ("SetCapture", "USER32.dll", 1),
     ("ReleaseCapture", "USER32.dll", 0),
     // --- gdi32: the DIB section and the one blit ----------------------
@@ -179,6 +186,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("SetBkMode", "GDI32.dll", 2),
     ("TextOutA", "GDI32.dll", 5),
     ("GetStockObject", "GDI32.dll", 1),
+    ("GdiFlush", "GDI32.dll", 0),
     // --- advapi32: the random source ----------------------------------
     // `SystemFunction036` IS `RtlGenRandom`; that is the name it is
     // exported under, and Microsoft's own header only gives it the other
@@ -194,6 +202,10 @@ pub fn known(name: &str) -> Option<(&'static str, u32)> {
 thread_local! {
     /// Which imports this compilation unit really needs.
     static USED: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
+    /// Functions carrying `#[win_callback]`: internal name -> arity.
+    static CBMARK: RefCell<BTreeMap<String, u32>> = RefCell::new(BTreeMap::new());
+    /// Callback thunks that really have to be emitted: symbol -> arity.
+    static CBUSED: RefCell<BTreeMap<String, u32>> = RefCell::new(BTreeMap::new());
     /// Did any function need a stack probe?
     static PROBED: RefCell<bool> = const { RefCell::new(false) };
     /// Did the hand written runtime need the system call stub?
@@ -203,6 +215,8 @@ thread_local! {
 /// Only for the module tests, which compile several programs in one process.
 pub fn reset() {
     USED.with(|u| u.borrow_mut().clear());
+    CBMARK.with(|u| u.borrow_mut().clear());
+    CBUSED.with(|u| u.borrow_mut().clear());
     PROBED.with(|p| *p.borrow_mut() = false);
     SYSSTUB_USED.with(|p| *p.borrow_mut() = false);
 }
@@ -213,6 +227,35 @@ pub fn note(name: &str) -> Option<String> {
     known(name)?;
     USED.with(|u| u.borrow_mut().insert(name.to_string()));
     Some(format!("{}{}", PREFIX, name))
+}
+
+/// Registers `name` (the internal FIR name) as `#[win_callback]` with its
+/// arity. Called from `extfn::register`, next to its two neighbours.
+pub fn mark_callback(name: &str, argc: u32) {
+    CBMARK.with(|c| {
+        c.borrow_mut().insert(name.to_string(), argc);
+    });
+}
+
+/// Is this function marked `#[win_callback]`? If so, its arity.
+pub fn is_callback(name: &str) -> Option<u32> {
+    CBMARK.with(|c| c.borrow().get(name).copied())
+}
+
+/// The callback thunk symbol for a function symbol.
+pub fn cb_thunk(sym: &str) -> String {
+    format!("{}{}", CBPREFIX, sym)
+}
+
+/// Records that the callback thunk for `sym` has to be emitted, and yields
+/// its symbol. `fnval::records_asm` calls this: the record of a
+/// `#[win_callback]` function holds the address of the THUNK, because that
+/// address is the only one Windows may ever jump to.
+pub fn note_callback(sym: &str, argc: u32) -> String {
+    CBUSED.with(|c| {
+        c.borrow_mut().insert(sym.to_string(), argc);
+    });
+    cb_thunk(sym)
 }
 
 /// The thunk symbol of an import (without registering it).
@@ -346,6 +389,76 @@ fn thunk_asm(name: &str, argc: u32) -> String {
     s.push_str(&format!("    call [rip + {}]\n", imp(name)));
     // `leave` is `mov rsp, rbp` + `pop rbp` — the shadow space disappears
     // with the frame, whatever the callee did to it.
+    s.push_str("    leave\n    ret\n");
+    s
+}
+
+/// **One Win64 -> System V thunk: the mirror image of `thunk_asm`.**
+///
+/// Round MERGE-WIN 5.3 named this as the ONE thing missing for a window:
+/// "A Firn function cannot be handed to Windows as a function pointer. The
+/// thunk exists in one direction only." This is the other direction.
+///
+/// A window procedure is a callback. Windows enters it with `rcx, rdx, r8,
+/// r9` and 32 octets of shadow space, and it expects `rbx`, `rbp`, `rsi`,
+/// `rdi`, `r12`-`r15` and **`xmm6`-`xmm15`** to come back unchanged. Firn
+/// compiles to System V, where `rsi`/`rdi` are argument registers and every
+/// `xmm` is scratch -- so a Firn function entered directly by `user32`
+/// would quietly destroy ten SSE registers of its caller.
+///
+/// So: save what Win64 calls callee-saved and System V does not, move the
+/// arguments across, call, restore.
+///
+/// The alignment, and it is the whole reason this is written out rather
+/// than hand waved: Windows enters with `rsp = 8 (mod 16)`. `push rbp`
+/// makes it 0, the two further pushes make it 0 again, and the 160 octets
+/// of `xmm` room keep it 0 -- which is exactly what System V wants at a
+/// `call`.
+fn cb_thunk_asm(sym: &str, argc: u32) -> String {
+    let mut s = String::new();
+    let t = cb_thunk(sym);
+    s.push_str(&format!("\n.globl {}\n{}:\n", t, t));
+    s.push_str(&format!(
+        "    # Win64 -> System V for {}({} arguments)\n",
+        sym, argc
+    ));
+    s.push_str("    push rbp\n    mov rbp, rsp\n");
+    s.push_str("    push rsi\n    push rdi\n");
+    s.push_str("    sub rsp, 160\n");
+    for k in 0..10u32 {
+        s.push_str(&format!("    movaps [rsp+{}], xmm{}\n", k * 16, k + 6));
+    }
+    // The order destroys nothing: rcx and rdx are read before they are
+    // written, r8 is parked in r10 (scratch in both conventions).
+    if argc >= 3 {
+        s.push_str("    mov r10, r8\n");
+    }
+    if argc >= 1 {
+        s.push_str("    mov rdi, rcx\n");
+    }
+    if argc >= 4 {
+        s.push_str("    mov rcx, r9\n");
+    }
+    if argc >= 2 {
+        s.push_str("    mov rsi, rdx\n");
+    }
+    if argc >= 3 {
+        s.push_str("    mov rdx, r10\n");
+    }
+    // Arguments five and six come off the caller's frame: the return
+    // address is at [rbp+8], the shadow space at [rbp+16..47].
+    if argc >= 5 {
+        s.push_str("    mov r8, qword ptr [rbp+48]\n");
+    }
+    if argc >= 6 {
+        s.push_str("    mov r9, qword ptr [rbp+56]\n");
+    }
+    s.push_str(&format!("    call {}\n", sym));
+    for k in 0..10u32 {
+        s.push_str(&format!("    movaps xmm{}, [rsp+{}]\n", k + 6, k * 16));
+    }
+    s.push_str("    add rsp, 160\n");
+    s.push_str("    pop rdi\n    pop rsi\n");
     s.push_str("    leave\n    ret\n");
     s
 }
@@ -500,7 +613,8 @@ pub fn start_asm(gc_init: Option<&str>, seam_init: &str, argv_sym: &str, main_sy
 pub fn runtime_asm() -> String {
     let used: Vec<String> = USED.with(|u| u.borrow().iter().cloned().collect());
     let mut s = String::new();
-    if used.is_empty() && !probed() && !sysstub_used() {
+    let any_cb = CBUSED.with(|c| !c.borrow().is_empty());
+    if used.is_empty() && !probed() && !sysstub_used() && !any_cb {
         return s;
     }
     s.push_str("\n# ==== round WINDOWS: the boundary to Win32 ====\n");
@@ -508,6 +622,11 @@ pub fn runtime_asm() -> String {
     for u in &used {
         let (_, argc) = known(u).expect("registered import is known");
         s.push_str(&thunk_asm(u, argc));
+    }
+    let cbs: Vec<(String, u32)> =
+        CBUSED.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
+    for (sym, argc) in &cbs {
+        s.push_str(&cb_thunk_asm(sym, *argc));
     }
     if probed() {
         s.push_str(&chkstk_asm());
