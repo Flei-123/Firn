@@ -182,6 +182,12 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // dieser Runde ein echtes WM_SIZE erzeugt (tools/windows/groesse.fi).
     ("FindWindowW", "USER32.dll", 2),
     ("SetWindowPos", "USER32.dll", 7),
+    // Runde CERTUS-WIN4: die STARTGROESSE. SPI_GETWORKAREA gibt den
+    // Schirm OHNE Taskleiste; GetWindowRect braucht es, um das Fenster
+    // mittig zu setzen. Ohne die zwei Zeilen findet der Binder die
+    // Symbole nicht -- diese Liste IST die Importtabelle.
+    ("SystemParametersInfoW", "USER32.dll", 4),
+    ("GetWindowRect", "USER32.dll", 2),
     ("ReleaseCapture", "USER32.dll", 0),
     // --- gdi32: the DIB section and the one blit ----------------------
     ("CreateDIBSection", "GDI32.dll", 6),
