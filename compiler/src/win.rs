@@ -173,6 +173,15 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("SetWindowLongPtrW", "USER32.dll", 3),
     ("GetWindowLongPtrW", "USER32.dll", 2),
     ("SetCapture", "USER32.dll", 1),
+    // Runde CERTUS-WIN2: WM_SETTINGCHANGE an alle Fenster schicken --
+    // damit sich der Wechsel hell/dunkel im laufenden Betrieb BELEGEN
+    // laesst und nicht nur behauptet wird (tools/windows/farbruf.fi).
+    ("SendMessageTimeoutW", "USER32.dll", 7),
+    // ... und die zwei, mit denen sich ein Fenster VON EINEM ANDEREN
+    // PROZESS aus vergroessern laesst -- der Weg, auf dem die Abnahme
+    // dieser Runde ein echtes WM_SIZE erzeugt (tools/windows/groesse.fi).
+    ("FindWindowW", "USER32.dll", 2),
+    ("SetWindowPos", "USER32.dll", 7),
     ("ReleaseCapture", "USER32.dll", 0),
     // --- gdi32: the DIB section and the one blit ----------------------
     ("CreateDIBSection", "GDI32.dll", 6),
@@ -187,11 +196,28 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("TextOutA", "GDI32.dll", 5),
     ("GetStockObject", "GDI32.dll", 1),
     ("GdiFlush", "GDI32.dll", 0),
+    // --- iphlpapi: WEN FRAGT MAN NACH NAMEN? (Runde CERTUS-WIN2) ------
+    // Windows hat kein `/etc/resolv.conf`. Die Namensserver stehen je
+    // Netzwerkkarte in `IP_ADAPTER_ADDRESSES.FirstDnsServerAddress`;
+    // `GetNetworkParams` ist der aeltere, einfachere Weg fuer IPv4.
+    ("GetAdaptersAddresses", "IPHLPAPI.DLL", 5),
+    ("GetNetworkParams", "IPHLPAPI.DLL", 2),
+    // --- kernel32: die Umgebung ---------------------------------------
+    // `/proc/self/environ` gibt es hier nicht; die Umgebung kommt als
+    // ein Block UTF-16 aus kernel32.
+    ("FreeEnvironmentStringsW", "KERNEL32.dll", 1),
+    // --- user32/gdi32: was die Groessenaenderung und die Leiste brauchen
+    ("GetSysColor", "USER32.dll", 1),
     // --- advapi32: the random source ----------------------------------
     // `SystemFunction036` IS `RtlGenRandom`; that is the name it is
     // exported under, and Microsoft's own header only gives it the other
     // one through a macro.
     ("SystemFunction036", "ADVAPI32.dll", 2),
+    // --- advapi32: die Systemeinstellung hell/dunkel -------------------
+    // HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize,
+    // Wert `AppsUseLightTheme`. `RegGetValueW` macht Oeffnen, Lesen und
+    // Schliessen in einem Aufruf.
+    ("RegGetValueW", "ADVAPI32.dll", 7),
 ];
 
 /// DLL and arity of a known Win32 function.
@@ -200,6 +226,12 @@ pub fn known(name: &str) -> Option<(&'static str, u32)> {
 }
 
 thread_local! {
+    /// Round CERTUS-WIN2: which PE subsystem the image declares.
+    /// `console` (the default) gives the program a console -- which is
+    /// right for every test program in this tree, because that is where
+    /// their output is compared. A WINDOW program wants `windows`:
+    /// otherwise double clicking a browser opens a DOS box next to it.
+    static SUBSYSTEM: RefCell<String> = RefCell::new(String::from("console"));
     /// Which imports this compilation unit really needs.
     static USED: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
     /// Functions carrying `#[win_callback]`: internal name -> arity.
@@ -210,6 +242,24 @@ thread_local! {
     static PROBED: RefCell<bool> = const { RefCell::new(false) };
     /// Did the hand written runtime need the system call stub?
     static SYSSTUB_USED: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// The PE subsystem this image declares (`console` or `windows`).
+pub fn subsystem() -> String {
+    SUBSYSTEM.with(|s| s.borrow().clone())
+}
+
+/// `--win-subsystem=windows` on the command line. Refused for anything
+/// else, so that a typo does not silently produce a console program.
+pub fn set_subsystem(v: &str) -> Result<(), String> {
+    if v != "console" && v != "windows" {
+        return Err(format!(
+            "unknown --win-subsystem '{}' (console, windows)",
+            v
+        ));
+    }
+    SUBSYSTEM.with(|s| *s.borrow_mut() = v.to_string());
+    Ok(())
 }
 
 /// Only for the module tests, which compile several programs in one process.
