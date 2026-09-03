@@ -696,10 +696,12 @@ impl<'a> Checker<'a> {
     fn check_consts(&mut self, prog: &Program) {
         for c in &prog.consts {
             let ty = self.resolve_ty(&c.ty);
-            if !ty.is_error() && !(ty.is_concrete_int() || ty == Type::Bool) {
+            if !ty.is_error()
+                && !(ty.is_concrete_int() || ty == Type::Bool || ty.is_float())
+            {
                 self.dg.error(
                     c.ty.span(),
-                    "'const' supports only integer and bool types in stage 0",
+                    "'const' supports only integer, bool and floating point types in stage 0",
                 );
                 self.type_out_expr(&c.value);
                 continue;
@@ -724,7 +726,19 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            match self.eval_const(&c.value) {
+            // ROUND FIRN-LUECKEN: a `const f64` is evaluated as a NUMBER and
+            // stored as its BIT PATTERN -- exactly the shape in which a float
+            // literal travels into FIR (lower.rs::ExprKind::Float). The two
+            // evaluators are kept strictly apart: an integer never slides
+            // into a float here and a float never into an integer, which is
+            // the mistake `opt.rs::fold_cast` describes for round 20.
+            let ev = if ty.is_float() {
+                self.eval_const_float(&c.value, ty == Type::F32, 0)
+                    .map(|b| b as i128)
+            } else {
+                self.eval_const(&c.value)
+            };
+            match ev {
                 Ok(v) => {
                     self.consts.insert(c.name.clone(), (ty.clone(), wrap(v, &ty)));
                 }
@@ -1013,27 +1027,101 @@ compile time)"
         Ok(())
     }
 
-    /// The bit pattern of a floating point initial value. Only a literal
-    /// (with an optional minus in front) -- `0.1 + 0.2` at compile time
-    /// would need a second, exactly IEEE-754 conforming evaluator, and one
-    /// that is only ALMOST right is worse than none.
+    /// The bit pattern of a floating point initial value of a `static`. The
+    /// same walk a `const` uses -- a `const` and a `static` may not disagree
+    /// about what `1.0 / 3.0` is.
     fn eval_static_float(&self, e: &Expr, single: bool) -> Result<u64, (Span, String)> {
+        self.eval_const_float(e, single, 0)
+    }
+
+    /// **ROUND FIRN-LUECKEN** — the bit pattern of a floating point constant
+    /// expression.
+    ///
+    /// Until this round the answer was "there is none": `const` took integers
+    /// and bools, and a `static f64` took a bare literal. The note that stood
+    /// here said an evaluator that is only ALMOST IEEE-754 would be worse than
+    /// none. That is true, and it is exactly why THIS one is allowed to exist:
+    /// it does not compute in some private format, it computes in `f64` and in
+    /// `f32` — the same two formats the machine has, with the same
+    /// round-to-nearest-even. `0.1 + 0.2` folded here and `0.1 + 0.2` computed
+    /// by `addsd` at runtime are the same 64 bits, and the self hosted
+    /// compiler (`lib/firnc1/sema.fi`) does the very same operations on the
+    /// very same hardware, so the two translators cannot drift apart.
+    ///
+    /// What is deliberately NOT allowed:
+    ///
+    ///   * an integer literal or an integer constant. `const A: f64 = 100`
+    ///     stays an error and does not silently become the bit pattern 100
+    ///     (that is 5e-322) -- the very mistake `opt.rs::fold_cast` reports
+    ///     from round 20.
+    ///   * a cast. `X as f64` would be that same door with a friendlier name.
+    ///   * an `f64` constant inside an `f32` constant: narrowing rounds, and a
+    ///     rounding that the reader did not write down does not happen here.
+    ///     The other direction (`f32` in an `f64` place) is exact and is the
+    ///     one implicit conversion the language has (round 71).
+    fn eval_const_float(&self, e: &Expr, single: bool, d: u32) -> Result<u64, (Span, String)> {
+        if d >= MAX_DEPTH {
+            return Err((
+                e.span,
+                "constant expression is nested too deeply".to_string(),
+            ));
+        }
         match &e.kind {
-            ExprKind::Float(bits, s32) => {
-                Ok(if single { *s32 as u64 } else { *bits })
-            }
-            ExprKind::FloatF32(b) => Ok(*b as u64),
+            // The token carries BOTH patterns: the correctly rounded binary64
+            // AND the correctly rounded binary32 of the same TEXT. Narrowing
+            // the binary64 here would be one rounding too many (round 71).
+            ExprKind::Float(bits, s32) => Ok(if single { *s32 as u64 } else { *bits }),
+            ExprKind::FloatF32(b) => Ok(if single {
+                *b as u64
+            } else {
+                (f32::from_bits(*b) as f64).to_bits()
+            }),
+            ExprKind::Ident(n) => match self.consts.get(n) {
+                Some((Type::F64, v)) if !single => Ok(*v as u64),
+                Some((Type::F32, v)) if single => Ok(*v as u64),
+                Some((Type::F32, v)) => Ok((f32::from_bits(*v as u32) as f64).to_bits()),
+                Some((Type::F64, _)) => Err((
+                    e.span,
+                    format!(
+                        "'{}' is an f64 constant and does not narrow to f32 by itself",
+                        n
+                    ),
+                )),
+                Some(_) => Err((
+                    e.span,
+                    format!(
+                        "'{}' is not a floating point constant (an integer does not \
+become a float here -- write '1.0', not '1')",
+                        n
+                    ),
+                )),
+                None => Err((
+                    e.span,
+                    format!("'{}' is not an already declared constant", n),
+                )),
+            },
             ExprKind::Unary(UnOp::Neg, inner) => {
-                let v = self.eval_static_float(inner, single)?;
+                let v = self.eval_const_float(inner, single, d + 1)?;
                 Ok(if single {
                     (v as u32 ^ 0x8000_0000) as u64
                 } else {
                     v ^ 0x8000_0000_0000_0000
                 })
             }
+            ExprKind::Binary(op, l, r) => {
+                let a = self.eval_const_float(l, single, d + 1)?;
+                let b = self.eval_const_float(r, single, d + 1)?;
+                float_fold(*op, a, b, single).ok_or((
+                    e.span,
+                    "a floating point constant knows '+', '-', '*' and '/' and nothing else"
+                        .to_string(),
+                ))
+            }
             _ => Err((
                 e.span,
-                "a floating point 'static' starts from a literal ('1.5', '-0.25')".to_string(),
+                "a floating point constant is built from literals ('1.5', '-0.25'), \
+constants declared before it, and '+ - * /'"
+                    .to_string(),
             )),
         }
     }
@@ -1626,7 +1714,13 @@ compile time)"
             ExprKind::Int(v) => Some(*v),
             ExprKind::Cast(inner, _) => self.literal_index(inner),
             ExprKind::Unary(UnOp::Neg, inner) => self.literal_index(inner).map(|v| -v),
-            ExprKind::Ident(n) => self.consts.get(n).map(|(_, v)| *v),
+            // ROUND FIRN-LUECKEN: a float constant carries a bit pattern, not
+            // an index.
+            ExprKind::Ident(n) => self
+                .consts
+                .get(n)
+                .filter(|(t, _)| !t.is_float())
+                .map(|(_, v)| *v),
             _ => None,
         }
     }
@@ -2835,6 +2929,13 @@ compile time)"
             ExprKind::Int(v) => Ok(*v),
             ExprKind::Bool(b) => Ok(if *b { 1 } else { 0 }),
             ExprKind::Ident(n) => match self.consts.get(n) {
+                // ROUND FIRN-LUECKEN: the stored value of a float constant is
+                // a BIT PATTERN. Handing it out here would make
+                // `[0; SCALE]` an array of 4613937818241073152 elements.
+                Some((t, _)) if t.is_float() => Err((
+                    e.span,
+                    format!("'{}' is a floating point constant and is not a number here", n),
+                )),
                 Some((_, v)) => Ok(*v),
                 None => Err((
                     e.span,
@@ -3045,6 +3146,35 @@ fn fixed_note(reason: &str) -> &'static str {
     } else {
         "use 'var' instead of 'let'"
     }
+}
+
+/// **ROUND FIRN-LUECKEN** — one floating point operation on two bit
+/// patterns, in the format the constant really has. `f32` is computed as
+/// `f32` and not as a narrowed `f64`: that is one instruction of the machine,
+/// one rounding, and the same result the program would compute at runtime.
+fn float_fold(op: BinOp, a: u64, b: u64, single: bool) -> Option<u64> {
+    if single {
+        let x = f32::from_bits(a as u32);
+        let y = f32::from_bits(b as u32);
+        let r = match op {
+            BinOp::Add => x + y,
+            BinOp::Sub => x - y,
+            BinOp::Mul => x * y,
+            BinOp::Div => x / y,
+            _ => return None,
+        };
+        return Some(r.to_bits() as u64);
+    }
+    let x = f64::from_bits(a);
+    let y = f64::from_bits(b);
+    let r = match op {
+        BinOp::Add => x + y,
+        BinOp::Sub => x - y,
+        BinOp::Mul => x * y,
+        BinOp::Div => x / y,
+        _ => return None,
+    };
+    Some(r.to_bits())
 }
 
 fn wrap(v: i128, t: &Type) -> i128 {

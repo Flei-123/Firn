@@ -1008,7 +1008,7 @@ fn static_bytes(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
         }
     } else if k == types.K_F64 || k == types.K_F32 {
         var bits: u64 = 0
-        if !static_float(s, e, k == types.K_F32, &bits) {
+        if !const_float(s, e, k == types.K_F32, &bits) {
             *good = false
         }
         var q5: usize = 0
@@ -1049,11 +1049,56 @@ fn static_bytes(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
     rt.buf_set_len(&(*s).g_data, start + want)
 }
 
-// The bit pattern of a floating point initial value. Only a literal, with
-// an optional minus in front: `0.1 + 0.2` at compile time would need a
-// second evaluator that is exactly IEEE-754 faithful, and one that is only
-// ALMOST right is worse than none.
-fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
+// ROUND FIRN-LUECKEN -- the four bit conversions. A floating point number
+// and its bit pattern are the same octets; the only way to look at them
+// from the other side is through the address (lexer.fi does it the same
+// way, and for the same reason).
+fn f64_of_bits(b: u64) -> f64 {
+    var t: f64 = 0.0
+    let p: u64 = (&t) as u64
+    rt.st64(p, 0, b)
+    return *(p as *mut f64)
+}
+
+fn bits_of_f64(x: f64) -> u64 {
+    var t: f64 = 0.0
+    let p: u64 = (&t) as u64
+    *(p as *mut f64) = x
+    return rt.ld64(p, 0)
+}
+
+fn f32_of_bits(b: u32) -> f32 {
+    var t: f32 = 0.0f
+    let p: u64 = (&t) as u64
+    rt.st32(p, 0, b)
+    return *(p as *mut f32)
+}
+
+fn bits_of_f32(x: f32) -> u32 {
+    var t: f32 = 0.0f
+    let p: u64 = (&t) as u64
+    *(p as *mut f32) = x
+    return rt.ld32(p, 0)
+}
+
+// ROUND FIRN-LUECKEN -- THE BIT PATTERN OF A FLOATING POINT CONSTANT.
+//
+// Until this round there was none: `const` took integers and bools, a
+// `static f64` took a bare literal, and the note here said that an
+// evaluator which is only ALMOST IEEE-754 is worse than none. That is
+// true, and it is why this one may exist: it computes in `f64` and in
+// `f32`, the two formats the machine has, with the machine's own
+// round-to-nearest-even. `0.1 + 0.2` folded here and `0.1 + 0.2` computed
+// by `addsd` at runtime are the same 64 bits -- and `firnc0` does the
+// same operations on the same hardware, so the two translators cannot
+// drift apart. The fixpoint depends on that.
+//
+// NOT allowed, on purpose: an integer (literal or constant) and a cast.
+// `const A: f64 = 100` would otherwise become the bit pattern 100, which
+// is 5e-322 -- the mistake opt.rs describes from round 20. And no `f64`
+// inside an `f32` constant: narrowing rounds, and a rounding the reader
+// did not write down does not happen here. The other direction is exact.
+fn const_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.e_kind(b, e)
     if a == ast.E_FLOAT {
@@ -1068,12 +1113,36 @@ fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
         return true
     }
     if a == ast.E_FLOAT32 {
-        *out = ast.e_number(b, e)
+        if single {
+            *out = ast.e_number(b, e)
+        } else {
+            *out = bits_of_f64(f32_of_bits(ast.e_number(b, e) as u32) as f64)
+        }
         return true
+    }
+    if a == ast.E_ID {
+        let kt: u32 = const_search(s, ast.e_a(b, e))
+        if kt == NONE {
+            return false
+        }
+        let v: u64 = const_value(s, ast.e_a(b, e))
+        if is_f64(s, kt) && !single {
+            *out = v
+            return true
+        }
+        if is_f32(s, kt) {
+            if single {
+                *out = v
+            } else {
+                *out = bits_of_f64(f32_of_bits(v as u32) as f64)
+            }
+            return true
+        }
+        return false
     }
     if a == ast.E_UN && ast.e_a(b, e) == 0 {
         var inner: u64 = 0
-        if !static_float(s, ast.e_b(b, e), single, &inner) {
+        if !const_float(s, ast.e_b(b, e), single, &inner) {
             return false
         }
         if single {
@@ -1081,6 +1150,40 @@ fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
         } else {
             *out = inner ^ 9223372036854775808
         }
+        return true
+    }
+    if a == ast.E_BIN {
+        let op: u32 = ast.e_a(b, e)
+        if op > 3 {
+            return false
+        }
+        var x: u64 = 0
+        var y: u64 = 0
+        if !const_float(s, ast.e_b(b, e), single, &x) {
+            return false
+        }
+        if !const_float(s, ast.e_c(b, e), single, &y) {
+            return false
+        }
+        if single {
+            let p: f32 = f32_of_bits(x as u32)
+            let q: f32 = f32_of_bits(y as u32)
+            var r: f32 = 0.0f
+            if op == 0 { r = p + q }
+            else if op == 1 { r = p - q }
+            else if op == 2 { r = p * q }
+            else { r = p / q }
+            *out = bits_of_f32(r) as u64
+            return true
+        }
+        let p2: f64 = f64_of_bits(x)
+        let q2: f64 = f64_of_bits(y)
+        var r2: f64 = 0.0
+        if op == 0 { r2 = p2 + q2 }
+        else if op == 1 { r2 = p2 - q2 }
+        else if op == 2 { r2 = p2 * q2 }
+        else { r2 = p2 / q2 }
+        *out = bits_of_f64(r2)
         return true
     }
     return false
@@ -1099,7 +1202,15 @@ fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
         return 0
     }
     if a == ast.E_ID {
-        if const_search(s, ast.e_a(b, e)) == NONE {
+        let kt: u32 = const_search(s, ast.e_a(b, e))
+        if kt == NONE {
+            *good = false
+            return 0
+        }
+        // ROUND FIRN-LUECKEN: what is stored for a float constant is a BIT
+        // PATTERN. Handing it out here would make `[0; SCALE]` an array of
+        // 4613937818241073152 elements.
+        if is_f64(s, kt) || is_f32(s, kt) {
             *good = false
             return 0
         }
@@ -1314,7 +1425,13 @@ fn literal_index(s: *mut Sema, e: u32, out: *mut i64) -> bool {
         return true
     }
     if a == ast.E_ID {
-        if const_search(s, ast.e_a(b, e)) == NONE {
+        let kt: u32 = const_search(s, ast.e_a(b, e))
+        if kt == NONE {
+            return false
+        }
+        // ROUND FIRN-LUECKEN: a float constant carries a bit pattern, not
+        // an index.
+        if is_f64(s, kt) || is_f32(s, kt) {
             return false
         }
         *out = const_value(s, ast.e_a(b, e)) as i64
@@ -3942,11 +4059,23 @@ fn sema_run(s: *mut Sema) {
             complain(s)
         }
         var good: bool = true
-        let v: i64 = const_eval(s, ast.const_value(b, i), &good)
+        var raw: u64 = 0
+        // ROUND FIRN-LUECKEN: a `const f64` is evaluated as a NUMBER and
+        // stored as its BIT PATTERN -- exactly the shape in which a float
+        // literal travels into FIR (lower.fi::E_FLOAT). The two evaluators
+        // stay strictly apart; neither type slides into the other.
+        if is_f64(s, t) || is_f32(s, t) {
+            if !const_float(s, ast.const_value(b, i), is_f32(s, t), &raw) {
+                good = false
+            }
+        } else {
+            let v: i64 = const_eval(s, ast.const_value(b, i), &good)
+            raw = wrap(s, v, t) as u64
+        }
         vec_push[u32](&(*s).k_name, ast.const_name(b, i))
         vec_push[u32](&(*s).k_ty, t)
         if good {
-            vec_push[u64](&(*s).k_value, wrap(s, v, t) as u64)
+            vec_push[u64](&(*s).k_value, raw)
         } else {
             vec_push[u64](&(*s).k_value, 0)
             complain(s)
