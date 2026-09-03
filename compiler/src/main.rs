@@ -208,6 +208,7 @@ fn usage() -> String {
          --package-info <dir> read the manifest of <dir> and report\n  \
          --lock             write <dir>/firn.lock (only with --package)\n  \
          --locked           build only if firn.lock fits (only with --package)\n  \
+         --win-subsystem=windows  a PE window program (no console)\n  \
          --emit=exe         produce an executable (default, calls as/ld)\n  \
          --emit=asm         write x86_64 assembler to the output\n  \
          --emit=fir         FIR text form (after optimization, if active)\n  \
@@ -353,6 +354,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--pic" => target::pic_set(true),
             _ if a.starts_with("--target=") => {
                 if let Err(e) = target::flag_set(&a["--target=".len()..]) {
+                    return Err(e);
+                }
+            }
+            // ROUND CERTUS-WIN2: ein FENSTERPROGRAMM ist kein
+            // Konsolenprogramm. Ohne das steht neben Certus ein
+            // schwarzes DOS-Fenster, sobald jemand die exe anklickt.
+            _ if a.starts_with("--win-subsystem=") => {
+                if let Err(e) = win::set_subsystem(&a["--win-subsystem=".len()..]) {
                     return Err(e);
                 }
             }
@@ -1292,7 +1301,7 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
         // (`win.rs::idata_asm`) -- `-lkernel32` never appears here, and no
         // foreign object file enters the image.
         cmd.arg("-e").arg("_start");
-        cmd.arg("--subsystem").arg("console");
+        cmd.arg("--subsystem").arg(win::subsystem());
     } else if !crate::statics::any() {
         cmd.arg("-n");
     }
