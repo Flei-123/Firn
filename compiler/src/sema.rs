@@ -40,6 +40,13 @@ pub struct TypeInfo {
     pub expr_types: Vec<Type>,
     /// Evaluated `const` declarations: name -> (type, value).
     pub consts: HashMap<String, (Type, i128)>,
+    /// **ROUND FIRN-ENV** — the OCTETS of every `const` of type `str`. A
+    /// text constant is not a number and has no place in `consts`; the name
+    /// stands there all the same (with 0), so that everything asking "is
+    /// this spelling taken, and by what type" keeps working with one table.
+    /// The lowering materialises these octets at every use, exactly as it
+    /// does for a written literal (`lower.rs::write_into`).
+    pub const_texts: HashMap<String, Vec<u8>>,
     /// **ROUND 89** — `static` declarations: name -> (type, `mut`?).
     /// Unlike a `const`, a `static` has an ADDRESS; the initial value does
     /// not live here but in `statics.rs`, already turned into octets.
@@ -89,6 +96,8 @@ pub(crate) struct Checker<'a> {
     pub(crate) tcx: TypeCtx,
     pub(crate) fns: HashMap<String, FnSig>,
     pub(crate) consts: HashMap<String, (Type, i128)>,
+    /// **ROUND FIRN-ENV** — see `TypeInfo::const_texts`.
+    pub(crate) const_texts: HashMap<String, Vec<u8>>,
     /// **ROUND 89** — see `TypeInfo::statics`.
     pub(crate) statics: HashMap<String, (Type, bool)>,
     /// The program of the current pass — needed by `comptime`, which runs
@@ -116,6 +125,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         tcx: TypeCtx::new(),
         fns: HashMap::new(),
         consts: HashMap::new(),
+        const_texts: HashMap::new(),
         statics: HashMap::new(),
         prog: None,
         expr_types: vec![Type::Error; prog.expr_count as usize],
@@ -142,6 +152,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         tcx: ck.tcx,
         expr_types: ck.expr_types,
         consts: ck.consts,
+        const_texts: ck.const_texts,
         statics: ck.statics,
         fns: ck.fns,
         widen_f32: ck.widen_f32,
@@ -696,12 +707,18 @@ impl<'a> Checker<'a> {
     fn check_consts(&mut self, prog: &Program) {
         for c in &prog.consts {
             let ty = self.resolve_ty(&c.ty);
+            // HOOK env (round FIRN-ENV): a `const` of type `str`. It is the
+            // one aggregate a constant may have, and for the same reason a
+            // number may be one: the value is FINISHED at compile time --
+            // octets, not an address, not an allocation.
+            let is_text = crate::strtype::is_str(&ty);
             if !ty.is_error()
-                && !(ty.is_concrete_int() || ty == Type::Bool || ty.is_float())
+                && !(ty.is_concrete_int() || ty == Type::Bool || ty.is_float() || is_text)
             {
                 self.dg.error(
                     c.ty.span(),
-                    "'const' supports only integer, bool and floating point types in stage 0",
+                    "'const' supports only integer, bool, floating point and 'str' types in \
+stage 0",
                 );
                 self.type_out_expr(&c.value);
                 continue;
@@ -724,6 +741,25 @@ impl<'a> Checker<'a> {
                     c.span,
                     format!("constant '{}' is already declared", c.name),
                 );
+                continue;
+            }
+            // HOOK env (round FIRN-ENV): a text constant is octets, and
+            // they are collected by their own walk -- `eval_const` answers
+            // "which NUMBER is this", which is the wrong question for a
+            // brand name. `+` works, and it means the same thing it means at
+            // run time: the two octet sequences after one another.
+            if is_text {
+                match self.const_octets(&c.value, 0) {
+                    Ok(b) => {
+                        self.const_texts.insert(c.name.clone(), b);
+                        self.consts.insert(c.name.clone(), (ty.clone(), 0));
+                    }
+                    Err((span, msg)) => {
+                        self.dg.error(span, msg);
+                        self.const_texts.insert(c.name.clone(), Vec::new());
+                        self.consts.insert(c.name.clone(), (ty.clone(), 0));
+                    }
+                }
                 continue;
             }
             // ROUND FIRN-LUECKEN: a `const f64` is evaluated as a NUMBER and
@@ -1032,6 +1068,78 @@ compile time)"
     /// about what `1.0 / 3.0` is.
     fn eval_static_float(&self, e: &Expr, single: bool) -> Result<u64, (Span, String)> {
         self.eval_const_float(e, single, 0)
+    }
+
+    /// **ROUND FIRN-ENV** — the OCTETS of a text constant expression.
+    ///
+    /// The third of the three constant walks, next to `eval_const` (which
+    /// number is this) and `eval_const_float` (which bit pattern). It stands
+    /// apart for the same reason those two do: a text is neither a number
+    /// nor a bit pattern, and an evaluator that pretended otherwise would be
+    /// the round 20 mistake in a new place.
+    ///
+    /// What is allowed:
+    ///
+    ///   * a text literal — and therefore `__env_or(…)` as well, which the
+    ///     parser has already turned into exactly that (env.rs);
+    ///   * a text constant declared BEFORE this one;
+    ///   * `+` between the two, which concatenates. The same meaning `+`
+    ///     has on a `str` at run time, only without the collector: the
+    ///     octets are already there.
+    ///
+    /// What is deliberately NOT allowed: a call, an index, a cast, a number.
+    /// Everything a `comptime` function could compute belongs in `comptime`,
+    /// which owns the interpreter with the step limit.
+    fn const_octets(&self, e: &Expr, d: u32) -> Result<Vec<u8>, (Span, String)> {
+        if d >= MAX_DEPTH {
+            return Err((
+                e.span,
+                "constant expression is nested too deeply".to_string(),
+            ));
+        }
+        match &e.kind {
+            ExprKind::Text(false, inner) => match &inner.kind {
+                ExprKind::ArrayLit(elems) => {
+                    let mut out = Vec::with_capacity(elems.len());
+                    for el in elems {
+                        match &el.kind {
+                            ExprKind::Int(v) if (0..256).contains(v) => out.push(*v as u8),
+                            _ => {
+                                return Err((
+                                    e.span,
+                                    "this text literal is not made of octets".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
+                _ => Err((e.span, "this text literal has no octets".to_string())),
+            },
+            ExprKind::Text(true, _) => Err((
+                e.span,
+                "a u\"…\" literal is WTF-16 and is no 'str' (SPEC §8.2)".to_string(),
+            )),
+            ExprKind::Ident(n) => match self.const_texts.get(n) {
+                Some(b) => Ok(b.clone()),
+                None => Err((
+                    e.span,
+                    format!("'{}' is not an already declared text constant", n),
+                )),
+            },
+            ExprKind::Binary(BinOp::Add, l, r) => {
+                let mut a = self.const_octets(l, d + 1)?;
+                let b = self.const_octets(r, d + 1)?;
+                a.extend_from_slice(&b);
+                Ok(a)
+            }
+            _ => Err((
+                e.span,
+                "a text constant is built from text literals, text constants declared before \
+it and '+'"
+                    .to_string(),
+            )),
+        }
     }
 
     /// **ROUND FIRN-LUECKEN** — the bit pattern of a floating point constant
@@ -2928,6 +3036,13 @@ constants declared before it, and '+ - * /'"
         match &e.kind {
             ExprKind::Int(v) => Ok(*v),
             ExprKind::Bool(b) => Ok(if *b { 1 } else { 0 }),
+            ExprKind::Ident(n) if self.const_texts.contains_key(n) => Err((
+                e.span,
+                // ROUND FIRN-ENV: `consts` carries a 0 for a text constant
+                // so that the name is taken. Handing THAT out here would
+                // turn `[0; NAME]` into an empty array without a word.
+                format!("'{}' is a text constant and is not a number here", n),
+            )),
             ExprKind::Ident(n) => match self.consts.get(n) {
                 // ROUND FIRN-LUECKEN: the stored value of a float constant is
                 // a BIT PATTERN. Handing it out here would make
@@ -3400,6 +3515,7 @@ mod tests {
             tcx: TypeCtx::new(),
             fns: HashMap::new(),
             consts: HashMap::new(),
+            const_texts: HashMap::new(),
             statics: HashMap::new(),
             expr_types: vec![Type::Error; first.expr_count as usize],
             scopes: Vec::new(),
