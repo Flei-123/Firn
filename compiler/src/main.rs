@@ -16,6 +16,7 @@ mod codegen_a64;
 mod codegen_switch;
 mod codegen_x86;
 mod comptime;
+mod env;
 mod config;
 mod checkmode;
 mod ct;
@@ -123,6 +124,13 @@ struct Options {
     test_limit: u32,
     /// `--no-run`: build the test binary, do not start it.
     no_run: bool,
+    /// **ROUND FIRN-ENV** — `--env-allow=<prefix>`: which environment
+    /// variables `__env_or`/`__env_has` may read. Adds to the default
+    /// prefix `FIRN_`; may be given several times and may carry a comma
+    /// separated list (env.rs).
+    env_allow: Vec<String>,
+    /// `--env-log`: print every variable read at build time, with its value.
+    env_log: bool,
 }
 
 /// **ROUND 82** — the wall clock per compiler phase (`--timings`).
@@ -210,6 +218,9 @@ fn usage() -> String {
          --no-pass=<name>   switch off a single optimization pass\n  \
          --list-passes      print the pass register with its labels\n  \
          --list-attrs       print the known attributes and their state\n  \
+         --env-allow=<pre>  permit build time environment variables with this\n  \
+                              prefix (__env_or/__env_has; default: FIRN_)\n  \
+         --env-log          print which environment variables were read\n  \
          --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
          --stats            print the size of the FIR (instructions/blocks)\n  \
          --timings          wall clock per compiler phase (ROUND 82)\n  \
@@ -246,6 +257,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut test_format = testrun::Format::Json;
     let mut test_limit: u32 = 30;
     let mut no_run = false;
+    let mut env_allow: Vec<String> = Vec::new();
+    let mut env_log = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -342,6 +355,18 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     Err(_) => return Err(format!("'--test-limit={}' is no number", v)),
                 }
             }
+            // ROUND FIRN-ENV: the allow list of the build time environment
+            // (env.rs). Deliberately an option of the BUILD and not of the
+            // program: the environment belongs to whoever translates, so
+            // the permission does too.
+            "--env-log" => env_log = true,
+            _ if a.starts_with("--env-allow=") => {
+                let v = &a["--env-allow=".len()..];
+                if v.is_empty() {
+                    return Err("--env-allow expects a prefix, e.g. --env-allow=FV_".to_string());
+                }
+                env_allow.push(v.to_string());
+            }
             "-o" => {
                 i += 1;
                 match args.get(i) {
@@ -405,6 +430,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         return Err(format!("no input file given (.{})", config::FILE_EXT));
     }
     Ok(Options {
+        env_allow,
+        env_log,
         input,
         output,
         lock: lock_write,
@@ -445,7 +472,15 @@ fn main() {
             std::process::exit(2);
         }
     };
-    std::process::exit(run(&opts));
+    let rc = run(&opts);
+    // ROUND FIRN-ENV: the manifest stands HERE and not inside `run`, so that
+    // it is printed on every path -- also when the translation stops with an
+    // error. Which variables were read is exactly the question one asks when
+    // two builds came out different.
+    if opts.env_log {
+        eprint!("{}", env::manifest());
+    }
+    std::process::exit(rc);
 }
 
 fn run(opts: &Options) -> i32 {
@@ -459,6 +494,10 @@ fn run(opts: &Options) -> i32 {
     // integer arithmetic? Set once, read by `lower.rs` for every "+ - * /"
     // and narrowing "as".
     crate::checkmode::set_from_level(opts.optcfg.level);
+    // ROUND FIRN-ENV (env.rs): WHICH environment variables this translation
+    // may read, and whether it says so. Set once, before the first file is
+    // parsed -- the parser is where `__env_or` is resolved.
+    crate::env::configure(&opts.env_allow, opts.env_log);
     // The sentence stands here and not in `parse_args`, because `firnc1`
     // has to write it CHARACTER FOR CHARACTER and has no `--help` remark
     // there (round 48).
