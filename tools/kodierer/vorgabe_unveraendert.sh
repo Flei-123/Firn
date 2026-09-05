@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# RUNDE KODIERER -- Beweis, dass der VORGABEPFAD sich nicht geaendert hat.
+# RUNDE KODIERER -- Beweis, dass der WEG UEBER `as` sich nicht geaendert hat.
 #
-# Die Runde hat Module HINZUGEFUEGT und eine Fahne eingebaut; ohne
-# `--asm-intern` soll firnc genau das tun, was es vorher tat. Das laesst sich
-# staerker und billiger pruefen als mit der ganzen Testsuite: derselbe
-# Testfall, gebaut mit dem UNBERUEHRTEN Uebersetzer und mit dem dieser Runde,
-# Ergebnis Oktett fuer Oktett vergleichen.
+# Runde KODIERER hat Module hinzugefuegt und eine Fahne eingebaut; Runde
+# KODIERER II hat die Fahne umgedreht -- der eigene Kodierer ist jetzt
+# Vorgabe, `--asm-extern` ruft `as`. Diese RUECKFALLEBENE muss weiterhin
+# genau das tun, was firnc vorher tat, sonst waere sie keine. Das laesst
+# sich staerker und billiger pruefen als mit der ganzen Testsuite:
+# derselbe Testfall, gebaut mit dem UNBERUEHRTEN Uebersetzer und mit dem
+# dieser Runde unter `--asm-extern`, Ergebnis Oktett fuer Oktett
+# vergleichen.
 #
 # Aufruf: bash tools/kodierer/vorgabe_unveraendert.sh [alter-firnc] [muster]
 set -u
@@ -25,7 +28,7 @@ gleich=0; anders=0; sprung=0
 for t in $MUSTER; do
     [ -f "$t" ] || continue
     "$ALT" -o "$W/a" "$t" >/dev/null 2>&1 || { sprung=$((sprung+1)); continue; }
-    "$NEU" -o "$W/b" "$t" >/dev/null 2>&1 || { sprung=$((sprung+1)); continue; }
+    "$NEU" --asm-extern -o "$W/b" "$t" >/dev/null 2>&1 || { sprung=$((sprung+1)); continue; }
     if cmp -s "$W/a" "$W/b"; then
         gleich=$((gleich+1))
     else

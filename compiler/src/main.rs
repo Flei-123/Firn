@@ -236,6 +236,8 @@ fn usage() -> String {
          --test-limit=<s>   time limit per case in seconds (default 30, 0 = none)\n  \
          --no-run           with --test: only build, do not run\n  \
          --keep-asm         keep the generated .s file\n  \
+         --asm-extern       assemble with `as` instead of the built in\n  \
+                              encoder (fallback, RUNDE KODIERER II)\n  \
          --version          print the version\n  \
          -h, --help         this help\n",
         name = c,
@@ -344,10 +346,11 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 }
             }
             "--keep-asm" => keep_asm = true,
-            // RUNDE KODIERER: den eigenen Binaerkodierer statt `as` benutzen.
-            // Vorgabe bleibt `as`, bis die Gegenprobe ueber den ganzen Baum
-            // oktettgleich ist (tools/kodierer/run.sh).
+            // RUNDE KODIERER II: der eigene Binaerkodierer ist die Vorgabe.
+            // `--asm-extern` ruft wieder `as` — die Rueckfallebene und das
+            // Vergleichsmass der Abnahme (tools/kodierer/run.sh).
             "--asm-intern" => asm_intern::set(true),
+            "--asm-extern" => asm_intern::set(false),
             "--stats" => stats = true,
             "--timings" => timings = true,
             "--test" => test_mode = true,
@@ -502,7 +505,7 @@ fn main() {
     std::process::exit(rc);
 }
 
-/// `--nur-obj [--asm-intern] [--target=…] -o <aus.o> <ein.s>`
+/// `--nur-obj [--asm-extern] [--target=…] -o <aus.o> <ein.s>`
 fn nur_obj(args: &[String]) -> i32 {
     let mut out: Option<PathBuf> = None;
     let mut inp: Option<PathBuf> = None;
@@ -511,6 +514,7 @@ fn nur_obj(args: &[String]) -> i32 {
         match args[i].as_str() {
             "--nur-obj" => {}
             "--asm-intern" => asm_intern::set(true),
+            "--asm-extern" => asm_intern::set(false),
             "-o" => {
                 i += 1;
                 out = args.get(i).map(PathBuf::from);
