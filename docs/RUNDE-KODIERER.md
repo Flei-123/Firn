@@ -6,9 +6,12 @@
 > **NACHTRAG — RUNDE KODIERER II, selber Tag.** Der einzige Grund, warum
 > `as` nach der ersten Runde noch Vorgabe blieb, war das fehlende
 > `.debug_line`. Der ist weg: TEIL 7 baut die DWARF-Zeilentabelle selbst,
-> TEIL 8 nimmt sie ab, und seit dieser Runde ist **der eigene Kodierer die
-> Vorgabe**; `--asm-extern` ist die Rückfallebene. TEIL 9 hält die vier
-> SIMD-Befehle fest, die die Runde RASTERN gemeldet hat.
+> TEIL 8 nimmt sie ab (1 705 + 1 680 Einheiten, **oktettgleich**, dazu
+> 34 Mio. ausgewertete Tabellenzeilen und eine `gdb`-Sitzung, die
+> zeichengleich ist), TEIL 9 hält die vier SIMD-Befehle der Runde RASTERN
+> fest, TEIL 10 misst neu. **Seit dieser Runde ist der eigene Kodierer die
+> Vorgabe**; `--asm-extern` ist die Rückfallebene. `firnc` ruft kein
+> fremdes Programm mehr, außer `ld`.
 
 ---
 
@@ -637,14 +640,23 @@ nichts. Das ist eine offene Baustelle von Runde 80, nicht von dieser.
 
 ```
                                         x86-64          ARM64
-   Übersetzungseinheiten                 1 705         A64ZAHL
-   bitgleich gegen `as`                  1 705         A64GUT     (100 %)
-   verglichene Oktette             424 702 304        A64BYTES
-   verglichene Umsetzungen           3 568 565        A64RELOC
-   davon Fehlersuch-Oktette        123 562 840        A64DWARF
-   verglichene Tabellenzeilen       23 225 373        A64ROWS
+   Übersetzungseinheiten                 1 705         1 680
+   bitgleich gegen `as`                  1 705         1 680     (100 %)
+   verglichene Oktette             424 702 304    502 284 944
+   verglichene Umsetzungen           3 568 565      4 354 424
+   davon Fehlersuch-Oktette        123 562 840     58 638 305
+   verglichene Tabellenzeilen       23 225 373     11 104 058
    Abweichungen                              0               0
+   übersprungen                              0              25
 ```
+
+*(Die 25 übersprungenen sind wieder Quellen, die für `aarch64-linux` gar
+nicht bauen — dieselben wie in TEIL 4, jetzt über fünf Baustufen statt drei
+gezählt.)*
+
+Zusammen mit TEIL 3/4 sind damit **über 1,6 Milliarden Oktette** gegen `as`
+geprüft, davon 182 Millionen Fehlersuchinformation, und 34 Millionen
+ausgewertete Tabellenzeilen.
 
 Fünf Baustufen je Quelle statt vorher drei: `dev-fast`, `release-fast`,
 `release-safe`, `no-opt` (eigene `.debug_info`) und `streu` (gestreute
@@ -742,6 +754,114 @@ das Richtige.
 auspacken) ist im Kodierer schon drin und bräuchte nur noch einen Namen in
 `simd.rs` — vier Zeilen, ARM64-Gegenstück `zip2 .16b`. Sie wurde nicht
 hinzugefügt, weil der Auftrag ausdrücklich vier Befehle nannte.
+
+
+---
+
+# TEIL 10 — DIE MESSUNG NACH DER UMSTELLUNG
+
+## 10.1 Was das Übersetzen jetzt kostet
+
+`lib/js/parse_main.fi`, `firnc --timings`, Bestwert aus neun Läufen. **Der
+Wirt war dabei nicht ruhig** — drei fremde Prüfsuiten und eine zweite
+Abnahme liefen daneben (Lastmittel um 12 auf 20 Kernen). Die absoluten
+Zahlen sind darum nicht mit denen aus TEIL 5 vergleichbar; das **Verhältnis**
+schon, denn beide Wege wurden unter denselben Bedingungen gemessen.
+
+```
+                      über `as`      eigener Weg
+   Optimierer          162,6 ms        167,1 ms
+   as + ld             238,9 ms        146,8 ms   <<<
+   Codeerzeuger        123,4 ms        127,5 ms
+   sema                 52,5 ms         55,7 ms
+   lex+parse            45,1 ms         51,6 ms
+   lower                27,1 ms         27,9 ms
+   mono                  1,7 ms          1,7 ms
+   .s schreiben          0,9 ms          1,1 ms
+   ------------------------------------------
+   GESAMT              657,4 ms        587,5 ms   (−10,6 %)
+```
+
+Über drei große Quellen (`parse_main.fi`, `firnc1.fi`, `b4_main.fi`,
+`tools/kodierer/messung.sh`, Bestwert aus fünf Läufen):
+**9 240 ms → 8 152 ms, −11,8 %.**
+
+## 10.2 Was die Zeilentabelle kostet — und was sie bei `as` kostete
+
+Dieselbe `.s`-Datei, einmal wie sie ist und einmal mit entfernten
+`.file`/`.loc`-Zeilen (118 053 gegen 93 785 Zeilen), beide durch beide
+Assembler:
+
+```
+                                    mit Tabelle   ohne Tabelle   Differenz
+   eigener Kodierer                   173,2 ms      146,6 ms      26,7 ms
+   as (GNU binutils 2.40)             229,7 ms      163,9 ms      65,8 ms
+   -----------------------------------------------------------------------
+   Faktor                               1,33 x        1,12 x
+   ld                                    6,1 ms
+```
+
+Zwei Dinge stehen da:
+
+1. **Die Zeilentabelle kostet uns 26,7 ms, `as` kostet sie 65,8 ms.** Wir
+   erzeugen sie also **2,5-mal so schnell** — obwohl sie oktettgleich ist.
+   Der Grund ist kein Kunstgriff, sondern eine fehlende Umständlichkeit:
+   `as` legt für jede `.loc` ein Symbol und einen Fragment-Eintrag an und
+   relaxiert die Zeilenschritte anschließend in einer eigenen Runde. Wir
+   haben die endgültigen Adressen ohnehin schon, weil die Quellstellen als
+   nulllange Stücke durch dieselbe Fixpunkt-Iteration laufen wie die
+   Sprünge (§7.5).
+2. **Der ehrliche Rückschritt gegenüber TEIL 5.** Dort stand „1,52 ×" für
+   den Assemblerschritt — gemessen an einem Kodierer, der die
+   Fehlersuchinformation gar nicht erzeugte. Jetzt sind es 1,33 ×, weil er
+   sie erzeugt. Der Vergleich, der zählt, ist der mit gleichem Ergebnis,
+   und der lautet 1,33 ×.
+
+## 10.3 Braucht es jetzt einen eigenen Binder?
+
+Nein, und die Zahl ist noch deutlicher als in TEIL 5c: **`ld` kostet 6,1 ms**
+von 587. Ein eigener Binder wäre für die Geschwindigkeit sinnlos. Er wäre
+nur dann interessant, wenn OrientOS auch die *letzte* fremde Binärabhängigkeit
+loswerden soll — und dann ist es der einfachste Binderfall, den es gibt: eine
+Objektdatei je Programm, keine Bibliotheken, keine dynamische Bindung.
+
+## 10.4 Der nächste Schritt — und wie der Prüfstand ihn überlebt
+
+Der Auftrag fragt nach dem, was in TEIL 5a als Schätzung stand: `codegen_x86.rs`
+soll `x86enc::Inst` **direkt** erzeugen statt Assemblertext. Diese Runde hat
+damit **nicht** angefangen, und das ist eine bewusste Entscheidung — nicht
+aus Zeitmangel, sondern weil die Antwort auf die Prüfstandsfrage zuerst
+stehen muss. Sie lautet:
+
+> **Der Text bleibt — er wird nur nicht mehr gebraucht.**
+
+Der Prüfstand dieser beiden Runden lebt davon, dass es einen Assemblertext
+gibt, den man `as` vorlegen kann. Fällt der Text weg, fällt der Prüfstand
+weg. Die Lösung ist eine Kette statt eines Vergleichs:
+
+```
+   (a)  Text  --as-->        Oktette A     (heute geprüft: A == B)
+   (b)  Text  --Zerteiler--> Oktette B
+   (c)  FIR   --codegen-->   Inst   --Kodierer--> Oktette C
+
+   zu zeigen:  C == B     dann folgt  C == A
+```
+
+Konkret:
+
+1. `codegen_x86.rs` erzeugt **beides** — den Text wie bisher (für
+   `--emit=asm`, für `--asm-extern`, für Menschen) *und* den `Inst`-Strom.
+   Das kostet Zeit, aber nur solange die Umstellung läuft.
+2. Ein neuer Prüflauf (`tools/kodierer/direkt.sh`) baut jede Einheit beide
+   Male und vergleicht C gegen B — Oktett für Oktett, mit demselben
+   Werkzeug, das heute A gegen B vergleicht.
+3. Ist das über den ganzen Baum grün, wird die Texterzeugung im
+   Codeerzeuger **abschaltbar** (nicht gelöscht): Vorgabe ist der direkte
+   Weg, `--emit=asm` und `--asm-extern` schalten sie wieder ein.
+
+Damit bleibt bis zum Schluss nachprüfbar, was der Kodierer tut, und `as`
+bleibt bis zum Schluss das Maß. Der geschätzte Gewinn steht in §5a: noch
+einmal grob 100–150 ms von 587, also rund 20 %. Es bleibt eine Schätzung.
 
 
 ---
