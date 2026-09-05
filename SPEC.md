@@ -788,6 +788,11 @@ round 82: `__v128_load`/`store`/`zero`/`from_u64`/`get_u64`/`get_u32`/
 `aeskeygenassist`, `__sha256rnds2`/`sha256msg1`/`sha256msg2`, `__pclmulqdq`,
 `__crc32_u8`/`__crc32_u64` and `__cpu_features`.
 
+RUNDE KODIERER II adds the four that alpha blending needs and round 82 did
+not have -- an integer multiply and the packing between eight and sixteen
+bits: `__v128_mullo16` (`pmullw`), `__v128_mulhi16u` (`pmulhuw`),
+`__v128_unpacklo8` (`punpcklbw`), `__v128_packus16` (`packuswb`).
+
 An immediate operand (`__v128_shuffle32`, `__v128_alignr`, `__v128_blend16`,
 `__aeskeygenassist`, `__pclmulqdq`, the byte and bit shifts, the extractors)
 **must be an integer literal** and is range checked at compile time. It is

@@ -924,7 +924,17 @@ Fehlersucher.
   Abschnittsreihenfolge und die Symboltabellen-Reihenfolge unterscheiden
   sich; verglichen wurde der *Inhalt*, der beim Binden zählt.
 * **ARM64 ist nur gegen `as` geprüft, nicht auf echter Hardware gelaufen.**
-  Für x86-64 liegt die Ausführungsprobe vor (314/314), für ARM64 nicht.
+  Für x86-64 liegt die Ausführungsprobe vor (314/314), für ARM64 nur unter
+  `qemu-aarch64` — und zwar für `tests/1614_simd_ops.fi`, also für die vier
+  neuen Vektorbefehle aus TEIL 9. Eine echte ARM64-Maschine hat diese Runde
+  nicht gesehen.
+* **Auf ARM64 gibt es gar keine Zeilentabelle zu erzeugen.**
+  `codegen_a64.rs` schreibt keine `.loc` (offen seit Runde 80). Der
+  ARM64-Zweig von `dwarf_line.rs` ist deshalb nur an *gestreuten*
+  Quellstellen geprüft (§8.1, Punkt 3) — dort allerdings über 58 Millionen
+  Oktette und 11 Millionen Tabellenzeilen.
+* **Der Codeerzeuger schreibt weiterhin Assemblertext.** Der Schritt
+  „direkt `Inst`" ist geplant, aber nicht angefangen (§10.4).
 * **Die volle Prüfsuite (`bash test.sh`, 1562 Punkte) wurde in dieser Runde
   nicht zu Ende gefahren** — auf dem Wirt waren nur noch rund 300 MB Platte
   frei (52 von 54 GB durch andere Projekte belegt), und die Suite baut den
