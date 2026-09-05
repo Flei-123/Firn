@@ -213,6 +213,7 @@ sobald das Ziel global ist (`R_AARCH64_JUMP26` bzw. `R_AARCH64_CALL26`).
    tools/kodierer/run.sh          die Abnahme über den ganzen Baum
    tools/kodierer/vergleich.py    eine Einheit: as gegen Kodierer, oktettweise
    tools/kodierer/ende_zu_ende.sh die Probe aufs Ganze: bauen und LAUFEN lassen
+   tools/kodierer/vorgabe_unveraendert.sh   der Vorgabepfad gegen den alten firnc
    tools/kodierer/messung.sh      TEIL 5, die Zeitmessung
 ```
 
@@ -498,6 +499,7 @@ weil ein Prozessstart und ein fremder Assembler weggefallen sind.
    bash tools/kodierer/run.sh              # x86-64, ganzer Baum
    bash tools/kodierer/run.sh --a64        # ARM64
    bash tools/kodierer/ende_zu_ende.sh     # bauen UND laufen lassen
+   bash tools/kodierer/vorgabe_unveraendert.sh   # Vorgabepfad unberuehrt?
    RUNS=5 bash tools/kodierer/messung.sh bin/firnc1.fi
 ```
 
@@ -516,3 +518,11 @@ weil ein Prozessstart und ein fremder Assembler weggefallen sind.
   sich; verglichen wurde der *Inhalt*, der beim Binden zählt.
 * **ARM64 ist nur gegen `as` geprüft, nicht auf echter Hardware gelaufen.**
   Für x86-64 liegt die Ausführungsprobe vor (314/314), für ARM64 nicht.
+* **Die volle Prüfsuite (`bash test.sh`, 1562 Punkte) wurde in dieser Runde
+  nicht zu Ende gefahren** — auf dem Wirt waren nur noch rund 300 MB Platte
+  frei (52 von 54 GB durch andere Projekte belegt), und die Suite baut den
+  Übersetzer mehrfach mit sich selbst. Was stattdessen vorliegt, ist die
+  **stärkere** Aussage für den Vorgabepfad (§3.4): 314 von 314 Programmen
+  sind oktettgleich zum unberührten Übersetzer. Die Modultests des
+  Übersetzers (`cargo test --release`) laufen durch, darunter die sieben
+  neuen Fälle in `x86enc.rs`, die genau die vier Fallen aus §2.3 festnageln.
