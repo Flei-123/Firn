@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/english/fstrings.py — in `f"...{name}..."` steht ein BEZEICHNER
 # mitten in einem Zeichenkettenliteral. Der normale Umbenenner laesst
 # Literale in Ruhe; dieses Werkzeug holt genau die Klammerinhalte nach.

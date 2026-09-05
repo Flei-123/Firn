@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/liveb4/invalidate.py -- what does NARROWING the recomputation buy,
 and is the picture afterwards still the right one?
 

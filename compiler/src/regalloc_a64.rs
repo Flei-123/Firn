@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **Round BILLIG — register allocation for aarch64.**
 //!
 //! Up to this round `codegen_a64.rs` gave every FIR value its own eight-byte

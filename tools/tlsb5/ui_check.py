@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/tlsb5/ui_check.py -- the browser window, seen from the SERVER.
 
 The trap this file exists to avoid is the one round K7B fell into: a

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # Proof of the SYMBOL NAMING SCHEME (DESIGN_GOALS.md 4, modules.rs).
 #
 # It is checked on a binary that was really built:

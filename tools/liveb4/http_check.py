@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/liveb4/http_check.py -- the HTTP client against a REAL server.
 
 `tools/liveb4/server.py` is Python's own `http.server`. It shares no line

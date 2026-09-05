@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/paintb3/harvest.py -- fetch the reference tests of round B3 out of
 the Web Platform Tests.
 

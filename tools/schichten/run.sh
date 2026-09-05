@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # ARCHITECTURE CHECK: field access is separated from the memory location.
 #
 # Background: DESIGN_GOALS.md 8. As long as `a.b` is written out as

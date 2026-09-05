@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/dom_soak/run.sh -- soak run of the DOM prototype (acceptance item 2).
 #
 # Checks the promise from FIRN-ANFORDERUNGEN.md 13: "DOM prototype with

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/paintb3/run.sh -- ROUND B3: the browser becomes VISIBLE.
 #
 #   1. compile the three root files of the round in THREE build stages

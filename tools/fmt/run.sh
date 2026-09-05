@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/fmt/run.sh -- THE PROOF FOR firnfmt (round 64, point 1).
 #
 # Six steps, every one of them with a number at the end. Nothing is

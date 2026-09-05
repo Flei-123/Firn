@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **Round WINDOWS — the seam that replaces `syscall`.**
 //!
 //! `syscall(nr, a1..a6)` is built into the language (SPEC §13) and the number

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # Throughput of the Firn tokenizer on TWO input corpora, after that -- if
 # available -- html5ever (cargo --release) on THE SAME corpora.
 #

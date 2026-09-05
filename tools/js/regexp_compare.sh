@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/js/regexp_compare.sh -- the PATTERN ENGINE against node, character
 # for character.
 #

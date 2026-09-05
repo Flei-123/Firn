@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/paintb3/textfit.py -- does the LAYOUT break the line where the
 LETTERS end?
 

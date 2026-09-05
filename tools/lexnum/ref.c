@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MPL-2.0 */
 /* tools/lexnum/ref.c -- the yardstick from OUTSIDE for round 65.
  *
  * Reads one decimal literal per line and writes the BIT PATTERN of the

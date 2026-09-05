@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # Proves that NOTHING was changed in the html5lib test data.
 #
 # Two things are checked:

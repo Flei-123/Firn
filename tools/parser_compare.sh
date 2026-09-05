@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/parser_compare.sh -- the parser written in FIRN against the one
 # written in RUST, over the whole source corpus.
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """Zieht die ERWARTETEN MELDUNGSTEXTE der Negativtests auf Englisch nach.
 
 Verfahren (mechanisch, ohne Raten): fuer jeden Test in tests/neg/ laeuft
