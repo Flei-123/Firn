@@ -594,7 +594,26 @@ eigene `.debug_info` mit Namen, Typen und Variablen. Dann legt `as` keine
 an — und wir auch nicht. Auch dieser Zweig steckt in der Abnahme (die
 Baustufe `no-opt` in `run.sh`).
 
-## 7.5 Was der interne Assembler dafür lernen musste
+## 7.5 Die `.loc`-Zusätze: lieber abbrechen als still lügen
+
+`.loc` kann mehr als Datei, Zeile und Spalte: `is_stmt`, `basic_block`,
+`prologue_end`, `epilogue_begin`, `isa`, `discriminator`, `view`. Der
+Codeerzeuger von Firn schreibt keinen davon — aber Firn hat
+**Inline-Assembler**, und wer in einem `asm`-Block `.loc 1 5 3 is_stmt 0`
+hinschreibt, bekäme von einem nachlässigen Zerteiler eine Zeilentabelle, die
+`as` anders gebaut hätte. Also: jeder nicht erkannte Zusatz ist ein
+**Fehler mit Namen**, kein stilles Überlesen.
+
+```
+   error: interner Kodierer: Zeile 5: `.loc`-Zusatz `is_stmt` wird nicht
+          nachgebildet (nur Datei, Zeile, Spalte)
+```
+
+Die Spalte selbst ist umgekehrt **freiwillig**: fehlt sie, behält `as` die
+zuletzt genannte (`current` in `dwarf2_directive_loc` ist statisch). Auch
+das ist nachgebildet und geprüft.
+
+## 7.6 Was der interne Assembler dafür lernen musste
 
 Bis dahin kannte er fünf Abschnitte. Jetzt sind es zehn: die fünf
 `.debug_*` kommen dazu — zwei davon (`.debug_abbrev`, `.debug_info`) als
