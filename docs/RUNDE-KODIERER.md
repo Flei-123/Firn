@@ -748,20 +748,26 @@ der zählt. Stand bei Abgabe: **Abschnitte 1 bis 15 grün, null Fehlschläge.**
    13  Auslegung/ABI in Firn gegen Rust       370 gleich, 0 ab
    14  Typprüfer in Firn gegen Rust     187 gleich, 37 201 Ausdrücke
    15  Absenkung in Firn gegen Rust       183 gleich, 1 bekannt
-   16  Selbstübersetzung (self_compare.sh)                LÄUFT
+   16  Selbstübersetzung: der Firn-Übersetzer baut und läuft
+                            337 gleiches Verhalten, 0 abweichend
+   17  der Fixpunkt: Firn übersetzt sich selbst             LÄUFT
 ```
 
 Die beiden mit „1 bekannt" sind die Grundlinie, die schon vor beiden Runden
 rot war und im Werkzeug namentlich steht — sie gehören nicht dieser Runde.
 
-**Abschnitt 16 und die folgenden liefen bei Abgabe noch.** Sie sind auf
-diesem Wirt sehr langsam: `self_compare.sh` lässt den *in Firn geschriebenen*
-Übersetzer jede Testdatei übersetzen und ausführen, und daneben liefen drei
-fremde Prüfsuiten der Runde SAMMELN. Das Protokoll läuft weiter unter
-`/root/KOD2-test.log`; bis dahin ist kein einziger Fehlschlag aufgetreten.
+Abschnitt 16 ist besonders erwähnenswert: dort übersetzt der **in Firn
+geschriebene** Übersetzer 337 Programme, und die laufen wie die aus `firnc0`.
+Er tut das weiterhin über `as`/`ld` (§10.3) — die Aussage ist also, dass die
+Umstellung von `firnc0` die selbstgehostete Kette nicht gestört hat.
+
+**Abschnitt 17 und die folgenden liefen bei Abgabe noch.** Auf diesem Wirt
+ist das sehr langsam, und daneben liefen drei fremde Prüfsuiten der Runde
+SAMMELN. Das Protokoll läuft weiter unter `/root/KOD2-test.log`; bis dahin
+ist kein einziger Fehlschlag aufgetreten.
 
 Ich sage ausdrücklich nicht „die Suite ist grün". Was ich sagen kann:
-**bis Abschnitt 15 einschließlich ist sie grün**, und für den Vorgabepfad
+**bis Abschnitt 16 einschließlich ist sie grün**, und für den Vorgabepfad
 liegt mit §8.4 die stärkere Aussage vor (314/314 gleiches Verhalten,
 313/313 Oktettgleichheit der Rückfallebene).
 
