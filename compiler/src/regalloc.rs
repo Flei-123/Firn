@@ -444,22 +444,22 @@ fn layout(f: &Func, extra_slots: u64) -> (Frame, Vec<(&'static str, u64)>) {
 
 // ----------------------------------------------------------- Liveness analysis ---
 
-struct Live {
+pub(crate) struct Live {
     /// linear position of the first instruction per block
-    block_start: Vec<usize>,
+    pub(crate) block_start: Vec<usize>,
     /// position of the terminator per block
-    block_end: Vec<usize>,
+    pub(crate) block_end: Vec<usize>,
     /// position of every instruction: pos[block][index]
-    pos: Vec<Vec<usize>>,
-    live_in: Vec<Vec<bool>>,
-    live_out: Vec<Vec<bool>>,
+    pub(crate) pos: Vec<Vec<usize>>,
+    pub(crate) live_in: Vec<Vec<bool>>,
+    pub(crate) live_out: Vec<Vec<bool>>,
     /// Did the data flow reach its fixed point? (round 87 -- the loop has a
     /// round limit, and below that limit the sets may be TOO SMALL. Anything
     /// finer than the interval bounds may then not be derived from them.)
-    converged: bool,
+    pub(crate) converged: bool,
 }
 
-fn compute_live(f: &Func) -> Live {
+pub(crate) fn compute_live(f: &Func) -> Live {
     let nb = f.blocks.len();
     let nv = f.val_types.len();
     let mut pos = Vec::with_capacity(nb);
@@ -750,7 +750,7 @@ fn exact_crossings(f: &Func, live: &Live) -> Vec<RegMask> {
 // ---------------------------------------------------------- Cell analysis ---
 
 /// Finds `alloca`s that can live entirely in a register.
-fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
+pub(crate) fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
     let mut cand: HashMap<Val, Option<FTy>> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
@@ -993,7 +993,7 @@ struct Iv {
 
 /// Loop depth per block (approximation: back edge u->v with v <= u spans
 /// the blocks [v, u]).
-fn loop_depth(f: &Func) -> Vec<u32> {
+pub(crate) fn loop_depth(f: &Func) -> Vec<u32> {
     let nb = f.blocks.len();
     let mut depth = vec![0u32; nb];
     for (u, b) in f.blocks.iter().enumerate() {
