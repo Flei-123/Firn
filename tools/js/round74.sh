@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/js/round74.sh -- the FEATURES OF ROUND 74 against test262, per
 # group, plus the endurance run for the objects the round adds.
 #

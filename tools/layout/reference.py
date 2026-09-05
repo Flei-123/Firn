@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """The FROZEN browser measurement -- round 78.
 
 Rounds 61 and 67 proved the layout engine against a real Chromium: the

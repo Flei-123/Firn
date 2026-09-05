@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/tlsb5/jpeg_check.py -- the JPEG decoder against libjpeg.
 
 Every reference picture here was written by PILLOW, which is libjpeg

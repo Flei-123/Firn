@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/english/fstrings2.py — Bezeichner in f-Zeichenketten nachziehen.
 
 In `f"... {quadrat(9)} ..."` steht ein AUSDRUCK mitten im Literal. Der

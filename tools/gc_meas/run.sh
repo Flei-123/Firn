@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/gc_meas/run.sh -- GC measuring tools of round 38:
 #   1. pause histogram   (pause.fi, DOM workload, all pauses in classes)
 #   2. fragmentation     (frag.fi, changing object sizes under continuous load)

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Atomic read-modify-write operation (round 47) — the foundation of
 //! `Arc[T]` (SPEC §3.4: "`Arc[T]` is the thread-safe variant (atomic
 //! counter). A separate type, so that single-threaded code does not pay for

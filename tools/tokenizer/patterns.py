@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """Dynamically weighted INSTRUCTION PATTERNS of a Firn binary (round 51).
 
 WHY: `tools/tokenizer/profile.py` answers "which FUNCTION costs?".

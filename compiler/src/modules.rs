@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Minimal module system: several `.fi` files get merged into ONE program
 //! and compiled into ONE binary.
 //!

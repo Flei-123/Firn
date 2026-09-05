@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! **Round 72** — checked arithmetic: the panic path (SPEC §13, `L9`).
 //!
 //! `release-safe` promised to CHECK integer arithmetic and did not: the

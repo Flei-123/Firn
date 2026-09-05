@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! FIR — the intermediate language of our own (SPEC §8.1).
 //!
 //! Properties (invariants, see docs/FIR.md):

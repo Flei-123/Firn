@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! The lock file `firn.lock` — what a build of a package really consumed
 //! (round 93).
 //!

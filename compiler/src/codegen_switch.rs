@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Code generation for `Term::Switch` (SPEC §6.3, `P4`).
 //!
 //! INTERFACE (fixed, called by `codegen_x86.rs`):

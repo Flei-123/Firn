@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/paintb3/font_check.py -- the counter-check for the TrueType reader
 and the glyph rasteriser of round B3.
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Error unions `E!T` — SPEC §5.1 (`L7`, the normal way).
 //!
 //! This file belongs to the module `fehlerunionen`. It holds

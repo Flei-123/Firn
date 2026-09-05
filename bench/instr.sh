@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # bench/instr.sh -- A/B comparison of two firnc builds over the EXECUTED
 # INSTRUCTIONS instead of over the clock.
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/css/run.sh -- the CSS path of round 60: syntax, selectors, cascade.
 #
 #   0. are the foreign test data unchanged? (sha256 against the upstream commit)

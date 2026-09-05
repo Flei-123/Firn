@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/lex_compare.sh -- the lexer written in FIRN against the one written
 # in RUST, over the whole source corpus, octet for octet.
 #

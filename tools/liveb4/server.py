@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/liveb4/server.py -- a REAL server for round B4.
 
 The point of this file is that it is NOT the client. `lib/net/http.fi`

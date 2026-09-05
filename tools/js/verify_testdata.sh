@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # Proves that NOTHING was changed in the test262 subset.
 #   1. the sha256 of the archive itself,
 #   2. the archive unpacks to exactly the expected number of files,

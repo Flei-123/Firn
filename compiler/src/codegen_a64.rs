@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **Round 80 — the aarch64 (A64) code generator: FIR -> GNU assembler text.**
 //!
 //! INTERFACE (the same one `codegen_x86.rs` has, and deliberately so):

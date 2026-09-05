@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MPL-2.0 */
 /* beispiele/kernel/linker.ld — Runde 52.
  *
  * Bindet `start.s` (Multiboot-Kopf, Langer Modus) und die freistehende

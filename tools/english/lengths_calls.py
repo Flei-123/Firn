@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """Richtet die LAENGENANGABEN an den Aufrufstellen `(&x[0]) as u64, N`.
 
 Die Umbenennung aendert die Byte-Laenge der Zeichenkettenliterale. Die
