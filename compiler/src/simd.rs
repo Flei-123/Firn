@@ -134,10 +134,18 @@ pub enum SimdKind {
     Add32,
     Add64,
     Sub32,
+    /// RUNDE KODIERER II — die vier Befehle, die der Runde RASTERN fehlten.
+    /// Ohne sie gibt es kein Alphaüberblenden im Vektor: acht Farbanteile
+    /// mit einem Gewicht multiplizieren geht nur über 16 Bit, und dafür
+    /// braucht man das Auspacken 8→16 hin und das Packen 16→8 zurück.
+    Mul16Lo,
+    Mul16HiU,
     // --- shuffling and shifting ---------------------------------------
     ShuffleB,
     Shuffle32,
     AlignR,
+    UnpackLo8,
+    PackU8,
     UnpackLo32,
     UnpackHi32,
     UnpackLo64,
@@ -239,6 +247,10 @@ static TABLE: &[Sig] = &[
     s("__v128_add32", SimdKind::Add32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_add64", SimdKind::Add64, &[P::V, P::V], None, Some(P::V)),
     s("__v128_sub32", SimdKind::Sub32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_mullo16", SimdKind::Mul16Lo, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_mulhi16u", SimdKind::Mul16HiU, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_unpacklo8", SimdKind::UnpackLo8, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_packus16", SimdKind::PackU8, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle8", SimdKind::ShuffleB, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle32", SimdKind::Shuffle32, &[P::V], Some(255), Some(P::V)),
     s("__v128_alignr", SimdKind::AlignR, &[P::V, P::V], Some(31), Some(P::V)),
@@ -1013,6 +1025,12 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::Add32 => bin(e, fr, "paddd", need(dst)?, args[0], args[1]),
         SimdKind::Add64 => bin(e, fr, "paddq", need(dst)?, args[0], args[1]),
         SimdKind::Sub32 => bin(e, fr, "psubd", need(dst)?, args[0], args[1]),
+        // Die unteren 16 Bit des Produkts sind für vorzeichenbehaftet und
+        // vorzeichenlos dieselben — deshalb gibt es nur EIN `pmullw`.
+        SimdKind::Mul16Lo => bin(e, fr, "pmullw", need(dst)?, args[0], args[1]),
+        SimdKind::Mul16HiU => bin(e, fr, "pmulhuw", need(dst)?, args[0], args[1]),
+        SimdKind::UnpackLo8 => bin(e, fr, "punpcklbw", need(dst)?, args[0], args[1]),
+        SimdKind::PackU8 => bin(e, fr, "packuswb", need(dst)?, args[0], args[1]),
         SimdKind::ShuffleB => bin(e, fr, "pshufb", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo32 => bin(e, fr, "punpckldq", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "punpckhdq", need(dst)?, args[0], args[1]),

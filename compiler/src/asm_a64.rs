@@ -2136,6 +2136,74 @@ impl Asm {
                 return Ok(Some(()));
             }
         }
+        // RUNDE KODIERER II — `mul` auf Vektoren. Der Name teilt sich mit
+        // dem skalaren `mul`; die Anordnung (`v0.8h`) entscheidet.
+        if m == "mul" && ops.len() == 3 {
+            if let (Some(a), Some(b), Some(c)) =
+                (parse_vec(&ops[0]), parse_vec(&ops[1]), parse_vec(&ops[2]))
+            {
+                let size = match a.elem {
+                    'b' => 0u32,
+                    'h' => 1,
+                    _ => 2,
+                };
+                let q = if a.count * elem_bits(a.elem) == 128 { 1u32 } else { 0 };
+                self.word(
+                    0x0E20_9C00 | (q << 30) | (size << 22) | rm(c.reg) | rn(b.reg) | rd(a.reg),
+                );
+                return Ok(Some(()));
+            }
+        }
+        // umull/umull2, smull/smull2: verbreiterndes Produkt. `size` zählt
+        // hier die QUELLbreite, nicht die des Ziels.
+        if matches!(m, "umull" | "umull2" | "smull" | "smull2") && ops.len() == 3 {
+            if let (Some(a), Some(b), Some(c)) =
+                (parse_vec(&ops[0]), parse_vec(&ops[1]), parse_vec(&ops[2]))
+            {
+                let _ = a;
+                let size = match b.elem {
+                    'b' => 0u32,
+                    'h' => 1,
+                    _ => 2,
+                };
+                let q = if m.ends_with('2') { 1u32 } else { 0 };
+                let u = if m.starts_with('u') { 1u32 } else { 0 };
+                self.word(
+                    0x0E20_C000 | (u << 29) | (q << 30) | (size << 22) | rm(c.reg) | rn(b.reg)
+                        | rd(a.reg),
+                );
+                return Ok(Some(()));
+            }
+        }
+        // sqxtun/sqxtun2, sqxtn/sqxtn2, uqxtn/uqxtn2, xtn/xtn2: verengen.
+        // `size` ist die ZIELbreite, `2` schreibt in die obere Hälfte.
+        if matches!(
+            m,
+            "sqxtun" | "sqxtun2" | "sqxtn" | "sqxtn2" | "uqxtn" | "uqxtn2" | "xtn" | "xtn2"
+        ) && ops.len() == 2
+        {
+            if let (Some(a), Some(b)) = (parse_vec(&ops[0]), parse_vec(&ops[1])) {
+                let _ = b;
+                let size = match a.elem {
+                    'b' => 0u32,
+                    'h' => 1,
+                    _ => 2,
+                };
+                let q = if m.ends_with('2') { 1u32 } else { 0 };
+                let base = m.trim_end_matches('2');
+                let (u, opcode) = match base {
+                    "xtn" => (0u32, 0b10010u32),
+                    "sqxtun" => (1, 0b10010),
+                    "sqxtn" => (0, 0b10100),
+                    _ => (1, 0b10100),
+                };
+                self.word(
+                    0x0E20_0800 | (u << 29) | (q << 30) | (size << 22) | (opcode << 12)
+                        | rn(b.reg) | rd(a.reg),
+                );
+                return Ok(Some(()));
+            }
+        }
         // movi v0.16b, #imm
         if m == "movi" && ops.len() == 2 {
             let a = parse_vec(&ops[0]).ok_or_else(|| self.err("Vektorregister"))?;
