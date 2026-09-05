@@ -1,0 +1,623 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/big.fi -- big integers and Montgomery arithmetic, round B5.
+//
+// THREE THINGS IN THIS ROUND NEED THE SAME ARITHMETIC and none of them
+// needs anything else: X25519 (the key exchange of the handshake), NIST
+// P-256 (the signature on most certificates that are not RSA) and RSA
+// (the signature on the rest, and on almost every certificate authority).
+// All three are "multiply two numbers of a few hundred bits and reduce
+// modulo a third". So there is ONE implementation of that here, and the
+// three curves and the one cipher above it are thin.
+//
+// ============================================================== THE SHAPE
+//
+// A number is `n` limbs of 32 bits, least significant first, in a fixed
+// array. Fixed, not grown: this file is reached from a TLS handshake, and
+// an allocator in the middle of a key exchange is a failure mode nobody
+// wants to debug. `BIG_MAX` is 136 limbs = 4352 bits, which holds an
+// RSA-4096 modulus (128 limbs) with room for the carry limb a Montgomery
+// step needs.
+//
+// The limbs are `u32` in the struct and `u64` in every calculation. That
+// is not laziness, it is the ONE bound that makes the whole file safe:
+//
+//     (2^32-1) * (2^32-1) + (2^32-1) + (2^32-1) = 2^64 - 1
+//
+// exactly. A limb product plus an accumulator limb plus a carry limb fits
+// in a u64 with nothing to spare and nothing over. Firn traps on integer
+// overflow (a `u64 + u64` that wraps is a panic, not a silent 0), so an
+// implementation that got this wrong would not compute a wrong signature
+// -- it would stop. That is the reason the bound is written down here.
+//
+// ======================================================= WHY MONTGOMERY
+//
+// The obvious way to reduce modulo m is to divide by m. Knuth's algorithm
+// D is a page of code with a correction step that is exercised by roughly
+// one input in 2^32, which is another way of saying it is a page of code
+// that is never tested. Montgomery multiplication replaces the division
+// with a multiplication by a constant and a shift, has no data dependent
+// branch except one final conditional subtraction, and is the same
+// algorithm for every odd modulus. It costs a transformation in and out of
+// its own domain, which is paid once per scalar multiplication and not
+// once per field multiplication.
+//
+// The one thing it cannot do is an even modulus. Every modulus here is
+// prime and larger than two, so that is not a limit that anybody meets.
+//
+// R^2 mod m, the constant that transforms into the domain, is computed
+// WITHOUT a division: start at 1 and double 2*32*n times, subtracting m
+// whenever the value reaches it. That is 8192 doublings for RSA-4096 and
+// it happens once per modulus, not once per operation.
+//
+// ==================================================================== HONEST
+//
+// B1 NOT CONSTANT TIME. `big_cmp` stops at the first differing limb and
+//    `mont_pow` looks at the exponent bit by bit with a branch. For what
+//    this file is used for in round B5 -- VERIFYING somebody else's
+//    signature and computing a key exchange whose secret half lives for
+//    one handshake -- the exponent is public in the signature case, and in
+//    the X25519 case `x25519_scalar_mult` uses the constant-time ladder of
+//    `x25519.fi` and never calls `mont_pow`. A `big_modexp` with a SECRET
+//    exponent (RSA decryption, which this repository does not do) would
+//    leak the exponent through timing and must not use this function.
+// B2 NO NEGATIVE NUMBERS. Everything here is a non-negative integer.
+//    Subtraction returns a borrow and the caller decides what it means.
+// B3 THE CAPACITY IS NOT CHECKED IN THE HOT PATH. `big_set_len` refuses a
+//    length above BIG_MAX; the arithmetic below trusts the lengths it is
+//    given, because a bound check per limb on a modular exponentiation is
+//    a measurable cost for a condition that a caller in this repository
+//    cannot produce.
+import std.rt
+
+export {
+    Big, Mont, BIG_MAX,
+    big_new, big_zero, big_set_u32, big_copy, big_is_zero, big_cmp,
+    big_from_be, big_to_be, big_bitlen, big_bit, big_limbs, big_set_len,
+    big_add, big_sub, big_shl1, big_mod, big_add_mod, big_sub_mod,
+    select_into,
+    big_odd, big_equal_u32,
+    mont_new, mont_init, mont_mul, mont_to, mont_from, mont_pow,
+    mont_one, mont_modulus, mont_len,
+}
+
+const BIG_MAX: usize = 136
+const M32: u64 = 4294967295
+
+struct Big {
+    n: usize, // limbs in use; limbs above it read as zero
+    d: [u32; 136],
+}
+
+// A modulus with the two constants Montgomery arithmetic needs. The caller
+// owns it and it is valid for exactly one modulus.
+struct Mont {
+    m: Big, // the modulus, odd
+    rr: Big, // R^2 mod m, R = 2^(32*nl)
+    one: Big, // 1 in the Montgomery domain = R mod m
+    n0: u64, // -m[0]^-1 mod 2^32
+    nl: usize, // the length of the modulus in limbs
+    ok: bool,
+}
+
+// ------------------------------------------------------------- The number
+
+fn big_new() -> Big {
+    return Big { n: 0, d: [0; 136] }
+}
+
+fn big_zero(a: *mut Big) {
+    var i: usize = 0
+    while i < BIG_MAX {
+        (*a).d[i] = 0 as u32
+        i = i + 1
+    }
+    (*a).n = 0
+}
+
+fn big_limbs(a: *mut Big) -> usize {
+    return (*a).n
+}
+
+// Sets the working length. Limbs that come into view are zero.
+fn big_set_len(a: *mut Big, n: usize) -> bool {
+    if n > BIG_MAX {
+        return false
+    }
+    var i: usize = (*a).n
+    while i < n {
+        (*a).d[i] = 0 as u32
+        i = i + 1
+    }
+    (*a).n = n
+    return true
+}
+
+fn big_set_u32(a: *mut Big, v: u32) {
+    big_zero(a)
+    (*a).d[0] = v
+    (*a).n = 1
+}
+
+fn big_copy(dst: *mut Big, src: *mut Big) {
+    var i: usize = 0
+    while i < BIG_MAX {
+        (*dst).d[i] = (*src).d[i]
+        i = i + 1
+    }
+    (*dst).n = (*src).n
+}
+
+fn big_is_zero(a: *mut Big) -> bool {
+    var i: usize = 0
+    while i < (*a).n {
+        if (*a).d[i] != 0 as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn big_odd(a: *mut Big) -> bool {
+    if (*a).n == 0 {
+        return false
+    }
+    return ((*a).d[0] & 1 as u32) == 1 as u32
+}
+
+fn big_equal_u32(a: *mut Big, v: u32) -> bool {
+    if (*a).n == 0 {
+        return v == 0 as u32
+    }
+    if (*a).d[0] != v {
+        return false
+    }
+    var i: usize = 1
+    while i < (*a).n {
+        if (*a).d[i] != 0 as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// -1, 0, +1. Compares over the LONGER of the two lengths, so a number that
+// carries leading zero limbs compares equal to the same number without
+// them -- there is no normalisation step anywhere in this file.
+fn big_cmp(a: *mut Big, b: *mut Big) -> i32 {
+    var n: usize = (*a).n
+    if (*b).n > n {
+        n = (*b).n
+    }
+    var i: usize = n
+    while i > 0 {
+        i = i - 1
+        var av: u32 = 0 as u32
+        var bv: u32 = 0 as u32
+        if i < (*a).n {
+            av = (*a).d[i]
+        }
+        if i < (*b).n {
+            bv = (*b).d[i]
+        }
+        if av != bv {
+            if av > bv {
+                return 1
+            }
+            return 0 - 1
+        }
+    }
+    return 0
+}
+
+// Big-endian octets in, as a number. `n` octets, any length up to
+// BIG_MAX*4. The result keeps `(n+3)/4` limbs even when the leading
+// octets are zero -- a 2048 bit RSA modulus stays 64 limbs long.
+fn big_from_be(a: *mut Big, p: u64, n: usize) -> bool {
+    if n > BIG_MAX * 4 {
+        return false
+    }
+    big_zero(a)
+    let nl: usize = (n + 3) / 4
+    var i: usize = 0
+    while i < n {
+        let oct: u64 = rt.ld8(p, n - 1 - i) as u64
+        let limb: usize = i / 4
+        let sh: u64 = ((i % 4) as u64) * 8
+        (*a).d[limb] = (((*a).d[limb] as u64) | (oct << sh)) as u32
+        i = i + 1
+    }
+    (*a).n = nl
+    return true
+}
+
+// The number as `n` big-endian octets, left-padded with zeros. Returns
+// false when the number does not fit -- a truncated signature would
+// verify against nothing and it is better to say so.
+fn big_to_be(a: *mut Big, out: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        let idx: usize = n - 1 - i
+        let limb: usize = i / 4
+        var v: u64 = 0
+        if limb < (*a).n {
+            v = (*a).d[limb] as u64
+        }
+        let sh: u64 = ((i % 4) as u64) * 8
+        rt.st8(out, idx, ((v >> sh) & 255 as u64) as u8)
+        i = i + 1
+    }
+    // everything above `n` octets has to be zero
+    var j: usize = n
+    while j < (*a).n * 4 {
+        let limb: usize = j / 4
+        let sh: u64 = ((j % 4) as u64) * 8
+        if (((*a).d[limb] as u64 >> sh) & 255 as u64) != 0 as u64 {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+fn big_bitlen(a: *mut Big) -> usize {
+    var i: usize = (*a).n
+    while i > 0 {
+        i = i - 1
+        if (*a).d[i] != 0 as u32 {
+            var v: u64 = (*a).d[i] as u64
+            var b: usize = 0
+            while v != 0 as u64 {
+                v = v >> 1
+                b = b + 1
+            }
+            return i * 32 + b
+        }
+    }
+    return 0
+}
+
+fn big_bit(a: *mut Big, i: usize) -> u32 {
+    let limb: usize = i / 32
+    if limb >= (*a).n {
+        return 0 as u32
+    }
+    return (((*a).d[limb] as u64 >> ((i % 32) as u64)) & 1 as u64) as u32
+}
+
+// --------------------------------------------------------- Add / subtract
+
+// r = a + b over `nl` limbs; the carry out is the return value.
+fn big_add(r: *mut Big, a: *mut Big, b: *mut Big, nl: usize) -> u64 {
+    var carry: u64 = 0
+    var i: usize = 0
+    while i < nl {
+        var av: u64 = 0
+        var bv: u64 = 0
+        if i < (*a).n {
+            av = (*a).d[i] as u64
+        }
+        if i < (*b).n {
+            bv = (*b).d[i] as u64
+        }
+        let t: u64 = av + bv + carry
+        (*r).d[i] = (t & M32) as u32
+        carry = t >> 32
+        i = i + 1
+    }
+    (*r).n = nl
+    return carry
+}
+
+// r = a - b over `nl` limbs; the borrow out is the return value (1 when
+// b was the larger). The limbs of r are then a - b + 2^(32*nl).
+fn big_sub(r: *mut Big, a: *mut Big, b: *mut Big, nl: usize) -> u64 {
+    var borrow: u64 = 0
+    var i: usize = 0
+    while i < nl {
+        var av: u64 = 0
+        var bv: u64 = 0
+        if i < (*a).n {
+            av = (*a).d[i] as u64
+        }
+        if i < (*b).n {
+            bv = (*b).d[i] as u64
+        }
+        // + 2^32 so that the subtraction never goes below zero, which in
+        // Firn is a trap and not a wrap.
+        let t: u64 = av + 4294967296 as u64 - bv - borrow
+        (*r).d[i] = (t & M32) as u32
+        if t < 4294967296 as u64 {
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        i = i + 1
+    }
+    (*r).n = nl
+    return borrow
+}
+
+// a = a * 2 over `nl` limbs; the bit shifted out is the return value.
+fn big_shl1(a: *mut Big, nl: usize) -> u64 {
+    var carry: u64 = 0
+    var i: usize = 0
+    while i < nl {
+        var v: u64 = 0
+        if i < (*a).n {
+            v = (*a).d[i] as u64
+        }
+        let t: u64 = (v << 1) | carry
+        (*a).d[i] = (t & M32) as u32
+        carry = t >> 32
+        i = i + 1
+    }
+    (*a).n = nl
+    return carry
+}
+
+// r = a mod m, by the school method in base two: walk the bits of `a` from
+// the top, double the remainder, and subtract the modulus when it fits.
+// One pass, no estimate, no correction step. It is O(bits x limbs) and it
+// is used where that does not matter -- reducing a hash modulo the group
+// order, and building R^2 -- never inside a loop.
+fn big_mod(r: *mut Big, a: *mut Big, m: *mut Big) -> bool {
+    let nl: usize = (*m).n
+    if nl == 0 {
+        return false
+    }
+    big_zero(r)
+    let ok: bool = big_set_len(r, nl)
+    var tmp: Big = big_new()
+    let ok2: bool = big_set_len(&tmp, nl)
+    var i: usize = big_bitlen(a)
+    while i > 0 {
+        i = i - 1
+        let out: u64 = big_shl1(r, nl)
+        (*r).d[0] = (((*r).d[0] as u64) | (big_bit(a, i) as u64)) as u32
+        // `out` is the bit that left the top of the remainder. It can only
+        // be 1 when the remainder was already at least 2^(32*nl)/2 >= m,
+        // so a single subtraction still restores the invariant r < m.
+        if out != 0 as u64 || big_cmp(r, m) >= 0 {
+            let b: u64 = big_sub(&tmp, r, m, nl)
+            big_copy(r, &tmp)
+        }
+    }
+    return true
+}
+
+// Picks limb by limb: `s` when mask is all ones, `t` when it is zero. No
+// branch and no memory address depends on the choice -- which is what
+// makes the two functions below usable inside the X25519 ladder.
+fn select_into(r: *mut Big, t: *mut Big, s: *mut Big, mask: u64,
+    nl: usize) {
+    var i: usize = 0
+    while i < nl {
+        let tv: u64 = (*t).d[i] as u64
+        let sv: u64 = (*s).d[i] as u64
+        (*r).d[i] = ((tv ^ (mask & (tv ^ sv)))) as u32
+        i = i + 1
+    }
+    (*r).n = nl
+}
+
+// r = (a + b) mod m, for a, b already below m. Branch-free: the sum is
+// reduced exactly when it carried out or when subtracting m did NOT
+// borrow, and that condition is turned into a mask.
+fn big_add_mod(r: *mut Big, a: *mut Big, b: *mut Big, m: *mut Big) {
+    let nl: usize = (*m).n
+    var t: Big = big_new()
+    let carry: u64 = big_add(&t, a, b, nl)
+    var s: Big = big_new()
+    let borrow: u64 = big_sub(&s, &t, m, nl)
+    // take s  <=>  carry == 1 or borrow == 0
+    let need: u64 = carry | (1 as u64 -% borrow)
+    let mask: u64 = (0 as u64) -% (need & 1 as u64)
+    select_into(r, &t, &s, mask, nl)
+}
+
+// r = (a - b) mod m, for a, b already below m. Branch-free in the same
+// way: add m back exactly when the subtraction borrowed.
+fn big_sub_mod(r: *mut Big, a: *mut Big, b: *mut Big, m: *mut Big) {
+    let nl: usize = (*m).n
+    var t: Big = big_new()
+    let borrow: u64 = big_sub(&t, a, b, nl)
+    var s: Big = big_new()
+    let c: u64 = big_add(&s, &t, m, nl)
+    let mask: u64 = (0 as u64) -% borrow
+    select_into(r, &t, &s, mask, nl)
+}
+
+// ------------------------------------------------------------- Montgomery
+
+fn mont_new() -> Mont {
+    return Mont { m: big_new(), rr: big_new(), one: big_new(),
+        n0: 0, nl: 0, ok: false }
+}
+
+fn mont_modulus(mc: *mut Mont) -> *mut Big {
+    return &(*mc).m
+}
+
+fn mont_len(mc: *mut Mont) -> usize {
+    return (*mc).nl
+}
+
+fn mont_one(mc: *mut Mont) -> *mut Big {
+    return &(*mc).one
+}
+
+// -m^-1 mod 2^32 by Newton's iteration. `x = x * (2 - m*x)` doubles the
+// number of correct bits every step and 2^1 -> 2^32 is five steps; the
+// sixth is free and removes the temptation to count.
+fn inv32(m0: u64) -> u64 {
+    var x: u64 = 1
+    var i: usize = 0
+    while i < 6 {
+        // 2 - m0*x, all modulo 2^32
+        let t: u64 = (m0 * x) & M32
+        // 2 - m0*x, modulo 2^32. The 2^32 is added first so that the
+        // subtraction never goes below zero, which in Firn is a trap.
+        let two_minus: u64 = (2 as u64 + 4294967296 as u64 - t) & M32
+        x = (x * two_minus) & M32
+        i = i + 1
+    }
+    // x is m0^-1; we want -m0^-1
+    return (4294967296 as u64 - x) & M32
+}
+
+fn mont_init(mc: *mut Mont, m: *mut Big) -> bool {
+    if (*m).n == 0 || !big_odd(m) {
+        (*mc).ok = false
+        return false
+    }
+    // The CIOS loop needs nl+2 limbs of accumulator, not 2*nl -- that is
+    // the whole point of interleaving the reduction with the
+    // multiplication.
+    if (*m).n + 2 > BIG_MAX {
+        (*mc).ok = false
+        return false
+    }
+    big_copy(&(*mc).m, m)
+    (*mc).nl = (*m).n
+    (*mc).n0 = inv32((*m).d[0] as u64)
+    // R mod m and R^2 mod m by doubling, so that this file needs no
+    // division at all. R = 2^(32*nl).
+    var x: Big = big_new()
+    big_set_u32(&x, 1 as u32)
+    let ok: bool = big_set_len(&x, (*mc).nl)
+    var tmp: Big = big_new()
+    let ok2: bool = big_set_len(&tmp, (*mc).nl)
+    var i: usize = 0
+    let bits: usize = 32 * (*mc).nl
+    while i < bits {
+        let out: u64 = big_shl1(&x, (*mc).nl)
+        if out != 0 as u64 || big_cmp(&x, m) >= 0 {
+            let b: u64 = big_sub(&tmp, &x, m, (*mc).nl)
+            big_copy(&x, &tmp)
+        }
+        i = i + 1
+    }
+    big_copy(&(*mc).one, &x) // R mod m = 1 in the domain
+    while i < bits * 2 {
+        let out: u64 = big_shl1(&x, (*mc).nl)
+        if out != 0 as u64 || big_cmp(&x, m) >= 0 {
+            let b: u64 = big_sub(&tmp, &x, m, (*mc).nl)
+            big_copy(&x, &tmp)
+        }
+        i = i + 1
+    }
+    big_copy(&(*mc).rr, &x)
+    (*mc).ok = true
+    return true
+}
+
+// r = a * b * R^-1 mod m. The CIOS form (Koc, Acar, Kaliski 1996): one
+// pass that interleaves the multiplication and the reduction, so the
+// intermediate never grows past nl+2 limbs.
+//
+// The bound that makes it safe: `t[j] + a_i*b_j + carry` with every part
+// at most 2^32-1 is at most 2^64-1 (see the head of this file). The extra
+// limb `t[nl+1]` holds the two carries that can leave the top.
+fn mont_mul(mc: *mut Mont, r: *mut Big, a: *mut Big, b: *mut Big) {
+    let nl: usize = (*mc).nl
+    var t: [u64; 274] = [0; 274]
+    var i: usize = 0
+    while i < nl + 2 {
+        t[i] = 0
+        i = i + 1
+    }
+    i = 0
+    while i < nl {
+        var ai: u64 = 0
+        if i < (*a).n {
+            ai = (*a).d[i] as u64
+        }
+        // t = t + a_i * b
+        var carry: u64 = 0
+        var j: usize = 0
+        while j < nl {
+            var bj: u64 = 0
+            if j < (*b).n {
+                bj = (*b).d[j] as u64
+            }
+            let s: u64 = t[j] + ai * bj + carry
+            t[j] = s & M32
+            carry = s >> 32
+            j = j + 1
+        }
+        let s1: u64 = t[nl] + carry
+        t[nl] = s1 & M32
+        t[nl + 1] = t[nl + 1] + (s1 >> 32)
+        // m_i = t_0 * n0 mod 2^32, then t = (t + m_i * m) / 2^32
+        let mi: u64 = (t[0] * (*mc).n0) & M32
+        let s0: u64 = t[0] + mi * ((*mc).m.d[0] as u64)
+        carry = s0 >> 32
+        j = 1
+        while j < nl {
+            let s: u64 = t[j] + mi * ((*mc).m.d[j] as u64) + carry
+            t[j - 1] = s & M32
+            carry = s >> 32
+            j = j + 1
+        }
+        let s2: u64 = t[nl] + carry
+        t[nl - 1] = s2 & M32
+        t[nl] = (s2 >> 32) + t[nl + 1]
+        t[nl + 1] = 0
+        i = i + 1
+    }
+    var out: Big = big_new()
+    i = 0
+    while i < nl {
+        out.d[i] = t[i] as u32
+        i = i + 1
+    }
+    out.n = nl
+    // One conditional subtraction: the CIOS result is below 2*m. Written
+    // branch-free, because the X25519 ladder runs on this function and a
+    // jump that depends on a secret value is exactly what it must not do.
+    var sub: Big = big_new()
+    let borrow: u64 = big_sub(&sub, &out, &(*mc).m, nl)
+    var top: u64 = 0
+    if t[nl] != 0 as u64 {
+        top = 1
+    }
+    let need: u64 = top | (1 as u64 -% borrow)
+    let mask: u64 = (0 as u64) -% (need & 1 as u64)
+    select_into(r, &out, &sub, mask, nl)
+}
+
+// r = a * R mod m -- into the domain.
+fn mont_to(mc: *mut Mont, r: *mut Big, a: *mut Big) {
+    mont_mul(mc, r, a, &(*mc).rr)
+}
+
+// r = a * R^-1 mod m -- out of the domain.
+fn mont_from(mc: *mut Mont, r: *mut Big, a: *mut Big) {
+    var one: Big = big_new()
+    big_set_u32(&one, 1 as u32)
+    mont_mul(mc, r, a, &one)
+}
+
+// r = base^e mod m, with `base` ALREADY in the Montgomery domain and `r`
+// coming back in it. Square and multiply from the top bit down.
+//
+// See B1 in the head: the exponent is walked with a branch and this is
+// therefore only for a PUBLIC exponent.
+fn mont_pow(mc: *mut Mont, r: *mut Big, base: *mut Big, e: *mut Big) {
+    var acc: Big = big_new()
+    big_copy(&acc, &(*mc).one)
+    var tmp: Big = big_new()
+    var i: usize = big_bitlen(e)
+    while i > 0 {
+        i = i - 1
+        mont_mul(mc, &tmp, &acc, &acc)
+        big_copy(&acc, &tmp)
+        if big_bit(e, i) != 0 as u32 {
+            mont_mul(mc, &tmp, &acc, base)
+            big_copy(&acc, &tmp)
+        }
+    }
+    big_copy(r, &acc)
+}

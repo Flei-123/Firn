@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/liveb4/cookie_check.py -- the dates and the cookie jar.
 
 TWO measurements, and the second one is the interesting one.

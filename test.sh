@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # The complete test suite for firnc0.
 #
 # Sequence:
@@ -168,6 +169,15 @@
 #      aarch64-linux-gnu-gcc in both directions past the end of the
 #      register file (tools/aarch64/machine.sh). What aarch64 cannot do is
 #      counted and named, not filtered out.
+#  65. FREESTANDING TARGETS (tools/freestanding/none.sh, round
+#      ARM-FREESTANDING): `--target=x86_64-none` and `--target=aarch64-none`
+#      -- no operating system underneath. The x86 build has to stay OCTET
+#      IDENTICAL to the plain `profile kernel` build, and both images have
+#      to BOOT in QEMU and say something over the serial line.
+#  66. The two system call tables (tools/aarch64/syscall_table.sh, round
+#      ARM-FREESTANDING): `compiler/src/syscalls.rs` against
+#      `lib/firnc1/syscalls.fi`, the latter read out of a running program
+#      built by both compilers.
 #  44. Checked integer arithmetic (tools/checked/run.sh, round 72): a
 #      program that goes out of range ABORTS in dev/dev-fast/release-safe
 #      and WRAPS in release-fast -- in BOTH compilers, with the same
@@ -1091,6 +1101,41 @@ for stage in "" "--no-opt"; do
     fi
 done
 
+echo "== 65. FREESTANDING TARGETS: no operating system underneath (ROUND ARM-FREESTANDING) =="
+# `--target=x86_64-none` and `--target=aarch64-none`. The two sharp claims
+# are checked and not asserted:
+#   * the x86 path does not change -- `--target=x86_64-none` and the plain
+#     build of a `profile kernel` source produce the SAME OCTETS;
+#   * both images BOOT. qemu-system-x86_64 -kernel and
+#     qemu-system-aarch64 -M virt, and the serial output is compared.
+# In between: the object file is ET_REL with no undefined name except the
+# two the kernel author owes it, `syscall` and `profile app` are refused
+# with a message that names the target, and `eret`/`mrs`/`msr` plus the
+# interrupt register save are really in the machine code (round 80 could
+# produce none of them).
+bash tools/freestanding/none.sh > "$WORK/none.log" 2>&1 && NRC=0 || NRC=$?
+if [ "$NRC" -eq 0 ]; then
+    ok
+    grep -E '^(FREESTANDING TARGETS|SKIP)' "$WORK/none.log" | sed 's/^/ /'
+else
+    bad "tools/freestanding/none.sh failed (see .test-work/none.log)"
+    grep -E '^  FAIL' "$WORK/none.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 66. the two system call tables agree (ROUND ARM-FREESTANDING) =="
+# `compiler/src/syscalls.rs` (in use since round 80) and
+# `lib/firnc1/syscalls.fi` (new, and without a caller until firnc1 can
+# generate A64). The Firn one is read out of a RUNNING program built by both
+# compilers, so a table that drifts is caught the day it drifts.
+bash tools/aarch64/syscall_table.sh > "$WORK/systab.log" 2>&1 && SRC0=0 || SRC0=$?
+if [ "$SRC0" -eq 0 ]; then
+    ok
+    grep -E '^(SYSCALL TABLES|  \(firnc1)' "$WORK/systab.log" | sed 's/^/ /'
+else
+    bad "tools/aarch64/syscall_table.sh failed (see .test-work/systab.log)"
+    grep -E '^  FAIL' "$WORK/systab.log" | head -10 | sed 's/^/   /'
+fi
+
 echo "== 44. checked integer arithmetic (tools/checked/run.sh, ROUND 72) =="
 # SPEC section 13, item L9. The number 44 and not 40: round 72 took 40 while
 # it stood on an older `main`, and 40 to 43 were handed out in the meantime
@@ -1397,6 +1442,111 @@ else
     bad "tools/liveb4/run.sh failed (see .test-work/liveb4.log)"
     grep -E 'FAIL|Traceback|Error' "$WORK/liveb4.log" | head -12 | sed 's/^/   /'
     tail -5 "$WORK/liveb4.log" | sed 's/^/   /'
+fi
+
+echo "== 64. CHAPTER Z: the defence against fingerprinting (ROUND B6) =="
+# The number 64 is fixed for this round. 63 belongs to round B4.
+#
+# The occasion was a page on AliExpress on 24 August 2026: a WebAudio graph
+# with a sawtooth oscillator and an `AnalyserNode` AT VOLUME ZERO, out of
+# which a device fingerprint was read. Muting the tab did not help, because
+# there was no media element to mute -- the measurement was never meant to
+# be heard.
+#
+# What runs here is the part of chapter Z whose building blocks exist: the
+# canvas readback (`toDataURL`, `getImageData`) and the `navigator` fields,
+# noised PER ORIGIN AND PER SESSION after Brave's method, on by default and
+# with no switch (Z3, Z4, Z6). WebAudio is not built yet; Z1 stands in
+# REQUIREMENTS.md as a condition on ITS construction, not as a repair
+# afterwards.
+#
+# THE GUARDS, and they are the point of the section:
+#   * the same session and the same origin give BYTE-IDENTICAL answers over
+#     twenty reads. A reading that differs from itself can be averaged away
+#     and tells the script it is being lied to.
+#   * THE COUNTER-CHECK: the same path with the farbling taken out has to
+#     give exactly ONE answer over 500 origins. "500 origins, 500 different
+#     canvases" is also true of a program that returns pure noise.
+#   * the largest deviation of any colour channel is reported, not a mean,
+#     and the alpha channel is checked separately -- a flipped alpha bit is
+#     visible where a pixel is fully transparent.
+#   * all three build stages have to give the SAME numbers. A key stream
+#     that depends on the optimiser depends on the machine.
+bash tools/fpz/run.sh > "$WORK/fpz.log" 2>&1 && ZRC=0 || ZRC=$?
+grep -E '^   (stable|[0-9]+ origins|the same path|[0-9]+ sessions|largest|alpha|share|16 x 16|navigator|clock|checks)' \
+    "$WORK/fpz.log" | sed 's/^/ /'
+grep -E '^FPZ OK: ' "$WORK/fpz.log" | tail -1 | sed 's/^/ /'
+if [ "$ZRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/fpz/run.sh failed (see .test-work/fpz.log)"
+    grep -E 'FAIL|Traceback|Error' "$WORK/fpz.log" | head -12 | sed 's/^/   /'
+    tail -5 "$WORK/fpz.log" | sed 's/^/   /'
+fi
+
+echo "== 65. WINDOWS: the same program on two operating systems (ROUND WINDOWS) =="
+# `--target=x86_64-windows` builds a PE/COFF `.exe`. THREE tools, and each
+# asks a different question:
+#
+#   machine.sh  what the FILE is -- PE32+, an import table of our own, no C
+#               runtime symbol in the image, the Win64 thunk in the right
+#               order, 32 octets of shadow space, the stack probe with its
+#               counter-check, and a scan of the whole corpus that must find
+#               NO `syscall` instruction left anywhere.
+#   run.sh      what the program DOES -- every case of tests/ built twice and
+#               run twice (natively and under Wine), standard output compared
+#               character for character and the exit code compared. Whatever
+#               differs is grouped by CAUSE (tools/windows/causes.txt); the
+#               floor is tools/windows/minquota.txt.
+#   net.sh      that the seam carries more than printf -- a TCP client over
+#               `ws2_32.dll`, against a server with a fixed reply, with the
+#               port coming out of argv so the start block is measured too.
+#
+# All three SKIP cleanly (exit 0) where the mingw binutils or Wine are not
+# installed: a machine that never had them must not turn the suite red.
+bash tools/windows/machine.sh > "$WORK/win_machine.log" 2>&1 && WMRC=0 || WMRC=$?
+grep -E '^  (passed|SKIP)' "$WORK/win_machine.log" | sed 's/^/ /'
+bash tools/windows/net.sh > "$WORK/win_net.log" 2>&1 && WNRC=0 || WNRC=$?
+grep -E '^  (passed|SKIP|OK    (linux|windows under))' "$WORK/win_net.log" | sed 's/^/ /'
+bash tools/windows/run.sh > "$WORK/win_run.log" 2>&1 && WRRC=0 || WRRC=$?
+grep -E '^  (SAME|DIFFERENT|NOT SUPPORTED|RESULT|SKIP)' "$WORK/win_run.log" | sed 's/^/ /'
+grep -E '^  -- what does not work' -A6 "$WORK/win_run.log" | sed 's/^/ /'
+if [ "$WMRC" -eq 0 ] && [ "$WNRC" -eq 0 ] && [ "$WRRC" -eq 0 ]; then
+    ok
+else
+    bad "the windows target failed (see .test-work/win_*.log)"
+    grep -E 'FAIL' "$WORK/win_machine.log" "$WORK/win_net.log" "$WORK/win_run.log" | head -12 | sed 's/^/        /'
+fi
+
+echo "== 65b. WINDOWS: the real programs of this repository (ROUND MERGE-WIN) =="
+# Section 65 asks whether a TEST CASE behaves the same on both operating
+# systems. This one asks the question that comes after it, and it asks it
+# with the programs this repository actually ships:
+#
+#   programs.sh  every tool in bin/ -- the compiler written in Firn and the
+#                six dump tools -- plus the examples, built as .exe and RUN.
+#                Standard input, argv, files, the collector.
+#   selfhost.sh  THE COMPILER ITSELF as a Windows program, over the whole
+#                corpus of tests/ and examples/: the assembly `firnc1.exe`
+#                writes under Wine has to be CHARACTER IDENTICAL with the
+#                one the Linux build of the same compiler writes.
+#   seam.sh      what the seam really answers, measured instead of read out
+#                of win_seam.rs: one probe per system call number, on both
+#                operating systems, and a table of BOUND vs ENOSYS.
+#
+# All three SKIP cleanly (exit 0) where the mingw binutils or Wine are not
+# installed.
+bash tools/windows/programs.sh > "$WORK/win_programs.log" 2>&1 && WPRC=0 || WPRC=$?
+grep -E '^  (RESULT|SKIP)' "$WORK/win_programs.log" | sed 's/^/ /'
+bash tools/windows/selfhost.sh > "$WORK/win_selfhost.log" 2>&1 && WSRC=0 || WSRC=$?
+grep -E '^  (SAME|REFUSED|DIFFERENT|corpus|RESULT|SKIP)' "$WORK/win_selfhost.log" | sed 's/^/ /'
+bash tools/windows/seam.sh > "$WORK/win_seam.log" 2>&1 && WERC=0 || WERC=$?
+grep -E '^  (BOUND|MISSING|SKIP)' "$WORK/win_seam.log" | sed 's/^/ /'
+if [ "$WPRC" -eq 0 ] && [ "$WSRC" -eq 0 ] && [ "$WERC" -eq 0 ]; then
+    ok
+else
+    bad "the windows programs failed (see .test-work/win_programs.log, win_selfhost.log, win_seam.log)"
+    grep -E 'DIFFERENT|FAIL' "$WORK/win_programs.log" "$WORK/win_selfhost.log" "$WORK/win_seam.log" | head -12 | sed 's/^/        /'
 fi
 
 TOTAL=$((PASS + FAIL))

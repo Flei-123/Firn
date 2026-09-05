@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Round 64 — `.debug_abbrev` and `.debug_info` in DWARF 4, written by the
 //! compiler itself.
 //!

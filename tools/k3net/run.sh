@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/k3net/run.sh -- ROUND K3: A TCP/IP STACK, MEASURED AGAINST LINUX.
 #
 # `lib/net/` is Ethernet, ARP, IPv4, ICMP, UDP and TCP written in Firn

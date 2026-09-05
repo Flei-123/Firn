@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/escape/run.sh -- THE ESCAPE ANALYSIS, MEASURED IN BOTH COMPILERS
 # (round 79, compiler/src/escape.rs and lib/firnc1/escape.fi).
 #

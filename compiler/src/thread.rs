@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 49 — threads.** The three primitives that make concurrency
 //! possible at all. Everything else (stack, join, mutex, channel, the thread
 //! safety of the collector) stands as readable Firn at `lib/gc/gc.fi`.
@@ -270,6 +271,20 @@ pub(crate) fn lower_thread_call(
 /// The local label `1:` is a **numeric** label of the assembler: `jnz 1f`
 /// jumps forward to the next `1:`. That way this sequence needs no counter
 /// and may appear as often as you like in the same module.
+/// **ROUND WINDOWS** — the same instruction where there is no `clone(2)`.
+///
+/// The postcondition of `spawn_sequence` is "`rax` = thread id (> 0) or a
+/// negative error value", and that second half is what makes an honest
+/// answer possible without a second mechanism: `-38` is `ENOSYS`, the
+/// number the seam gives for every system call Windows has no counterpart
+/// for. A program that never starts a thread never reaches this
+/// instruction; one that does gets a failure it can read, at the line
+/// where it started the thread.
+pub(crate) fn spawn_unsupported(e: &mut crate::codegen_x86::Emitter) {
+    e.raw("    # windows: clone(2) has no equivalent -- ENOSYS");
+    e.line("mov rax, -38");
+}
+
 pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     // Put the argument on the CHILD stack — in the child `rdi` is overwritten
     // with the flags, and there is no other way to reach the value.

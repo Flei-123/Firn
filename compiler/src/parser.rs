@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Hand-written, recursive descent parser (no generator).
 //!
 //! INTERFACE (fixed):

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Proves that NOTHING was changed in the css-parsing-tests data.
 #
 # Three things are checked:

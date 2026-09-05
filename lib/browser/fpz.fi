@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/fpz.fi -- CERTUS, chapter Z: the defence against
+// fingerprinting. Round B6.
+//
+// WHY THIS FILE EXISTS AND WHY IT EXISTS NOW
+//
+// On 24 August 2026 a page on AliExpress built a WebAudio graph with a
+// sawtooth oscillator and an `AnalyserNode` at volume ZERO and read a
+// device fingerprint out of the tiny arithmetic differences between one
+// machine and the next. Muting the tab did not help, muting the browser
+// did not help, muting the system did not help -- there was no media
+// element for the mute to take hold of. The measurement was never meant
+// to be heard.
+//
+// The lesson is not "add a switch for WebAudio". It is that a reading
+// which is not needed to SHOW the page must not be exact. Chapter Z of
+// the requirements says so for six channels; this file is the two of them
+// whose building blocks already exist -- the canvas and the `navigator`
+// fields. WebAudio (F10.10) does not exist yet, and Z1 stands in the
+// requirements as a condition ON its construction rather than as a repair
+// afterwards.
+//
+// THE METHOD IS BRAVE'S, AND THE REASON IS IN ITS SHAPE
+//
+// A fixed false value ("every machine has 4 cores") is itself a mark: it
+// says "this is Certus", and it is the same on every visit, so the value
+// can be used as a signal instead of the true one. A value drawn afresh
+// on every READ is worse still: a script reads twice, sees a difference,
+// and knows it is being lied to -- and can average the noise away.
+//
+// What works is a fingerprint that is CONSISTENT IN ITSELF and DIFFERENT
+// FOR EVERY (site, session) pair. Within one visit to one site every
+// reading agrees with every other, so nothing looks broken; between two
+// sites, and between two visits, nothing lines up, so nothing can be
+// joined. That is Z4, and it is what this file computes.
+//
+// THE KEY. One secret per session (32 octets from `getrandom`, never
+// leaving the process), hashed together with the ORIGIN of the document:
+//
+//     key = SHA-256("certus/fp/v1" | session | origin-length | origin)
+//
+// The origin goes in with its length in front of it, not glued on: two
+// origins `https://a.example` and `https://a.example.x` must not be able
+// to produce the same key by moving the boundary.
+//
+// WHAT IS NOISED AND WHAT IS NOT
+//
+//   canvas   the pixels a script READS BACK (`toDataURL`, `getImageData`)
+//            are farbled -- never the pixels that are shown. A drawing
+//            that changed the canvas itself would drift with every read
+//            and would be visible after a few of them.
+//   navigator  `hardwareConcurrency` and `deviceMemory` are drawn from the
+//            key out of the plausible values; the user agent is FROZEN
+//            instead (a random one is a mark of its own, see below).
+//   clocks   coarsened to a fixed step and then moved by a per-key offset,
+//            so that a difference of two readings cannot be sharpened by
+//            repeating it.
+//
+// NO SWITCH (Z6). There is no parameter to turn this off, and there is no
+// "strict" and "standard" mode either. Every mode a user can be in is a
+// bit of a fingerprint.
+import std.rt
+import std.crypto.sha256
+import std.crypto.random
+
+export {
+    FpKey,
+    FP_KEY_SIZE, FP_PIXEL_RATE, FP_CLOCK_STEP_US,
+    fp_session_new, fp_session_fixed,
+    fp_key_for_origin, fp_key_word,
+    fp_canvas_read, fp_canvas_farble_count,
+    fp_hardware_concurrency, fp_device_memory, fp_screen_round,
+    fp_clock_us, fp_user_agent, fp_user_agent_len,
+}
+
+const FP_KEY_SIZE: usize = 32
+
+// One pixel in FP_PIXEL_RATE gets the low bit of ONE of its three colour
+// channels flipped. The number is a compromise with two hard ends:
+//
+//   too rare  -- a script that reads a 16 x 16 canvas (256 pixels) would
+//                often get an untouched image, and two sites would then
+//                see the same hash after all;
+//   too often -- the picture stops being the picture. At one pixel in 8 a
+//                photograph read back and drawn again is measurably
+//                grainier.
+//
+// 1 in 32 puts about eight touched pixels into the smallest canvas that is
+// used for fingerprinting in the wild (16 x 16) and changes at most one
+// unit of one channel anywhere. `tools/fpz/fp_check.py` measures both
+// ends: the share of canvases that come out DIFFERENT per origin, and the
+// largest deviation of any channel.
+const FP_PIXEL_RATE: u64 = 32
+
+// The step the clock is rounded down to before the per-key offset is
+// added: 100 microseconds. Below that a script can measure the cost of
+// single operations, which is what the cache- and audio-timing attacks
+// need.
+const FP_CLOCK_STEP_US: u64 = 100
+
+// The session secret. Made ONCE when the browser starts, kept in memory,
+// never written anywhere and never given to a page.
+struct FpKey {
+    b: [u8; 32],
+}
+
+fn fp_key_zero() -> FpKey {
+    return FpKey { b: [0; 32] }
+}
+
+// A fresh session secret out of `getrandom(2)`. Answers `false` when the
+// kernel would not give one -- and the caller must then REFUSE to run,
+// not fall back on a counter: a predictable session secret is the same as
+// no defence at all, and it would look like one that works.
+fn fp_session_new(out: *mut FpKey) -> bool {
+    return random.random_bytes((&(*out).b[0]) as u64, FP_KEY_SIZE)
+}
+
+// A session secret with a value chosen by the caller. This exists for the
+// MEASUREMENT: `tools/fpz/fp_check.py` has to ask the same question twice
+// with the same session and once with another one, and it can only do that
+// if the session is an input. It is not used anywhere else.
+fn fp_session_fixed(out: *mut FpKey, seed: u64) {
+    var i: usize = 0
+    while i < FP_KEY_SIZE {
+        rt.st8((&(*out).b[0]) as u64, i,
+            ((seed >> ((i as u64 % 8) * 8)) & 255) as u8)
+        i = i + 1
+    }
+    // The eight octets above repeat four times, which is fine as an INPUT
+    // to the hash below and would not be fine as a key. The hash is what
+    // makes it one.
+}
+
+// key = SHA-256("certus/fp/v1" | session | u64 length | origin)
+fn fp_key_for_origin(session: *mut FpKey, origin: u64, olen: usize,
+    out: *mut FpKey) {
+    var lit: [u8; 12] = "certus/fp/v1"
+    var s: sha256.Sha256 = sha256.sha256_new()
+    sha256.sha256_update(&s, (&lit[0]) as u64, 12)
+    sha256.sha256_update(&s, (&(*session).b[0]) as u64, FP_KEY_SIZE)
+    var lenbuf: [u8; 8] = [0; 8]
+    var i: usize = 0
+    while i < 8 {
+        lenbuf[i] = ((olen as u64 >> (i as u64 * 8)) & 255) as u8
+        i = i + 1
+    }
+    sha256.sha256_update(&s, (&lenbuf[0]) as u64, 8)
+    if olen > 0 {
+        sha256.sha256_update(&s, origin, olen)
+    }
+    sha256.sha256_final(&s, (&(*out).b[0]) as u64)
+}
+
+// A 64-bit word of the stream that belongs to this key. Counter-based, so
+// the caller may ask for word 4711 without computing the 4710 before it,
+// and so two runs over the same picture give the same words in the same
+// places.
+//
+// SplitMix64 seeded from the key. The key comes out of SHA-256, so the
+// seed is already uniform; SplitMix's job here is only to spread ONE
+// counter over the whole range, and it is the cheapest construction that
+// does that with no state to carry.
+fn fp_key_word(k: *mut FpKey, counter: u64) -> u64 {
+    var z: u64 = rt.ld64((&(*k).b[0]) as u64, 0)
+    // The arithmetic WRAPS on purpose (`+%`, `*%`, SPEC 9.3). SplitMix is
+    // defined modulo 2^64; with the checked operators every second call
+    // would stop the browser, and writing the reduction out by hand would
+    // be the same thing said less clearly.
+    z = z +% counter *% 11400714819323198485
+    z = (z ^ (z >> 30)) *% 13787848793156543929
+    z = (z ^ (z >> 27)) *% 10723151780598845931
+    return z ^ (z >> 31)
+}
+
+// ------------------------------------------------------------- The canvas
+//
+// `toDataURL` and `getImageData` both end here. `src` is what is really on
+// the canvas, `dst` is what the page gets to see -- two different buffers,
+// because the canvas itself must not change: a script that reads the same
+// canvas ten times has to get the same ten answers, and a canvas that was
+// farbled in place would drift away from the picture on the screen.
+//
+// The channel order is the one of `lib/paint/canvas.fi`: four octets per
+// pixel, the fourth being alpha. ALPHA IS NEVER TOUCHED. A flipped alpha
+// bit is visible where a pixel is fully transparent or fully opaque, and
+// it is exactly the case a compositor may treat differently.
+fn fp_canvas_read(k: *mut FpKey, src: u64, dst: u64, npx: usize) -> usize {
+    var touched: usize = 0
+    var i: usize = 0
+    while i < npx {
+        let o: usize = i * 4
+        var w: u64 = fp_key_word(k, i as u64)
+        var c0: u8 = rt.ld8(src, o)
+        var c1: u8 = rt.ld8(src, o + 1)
+        var c2: u8 = rt.ld8(src, o + 2)
+        let a: u8 = rt.ld8(src, o + 3)
+        if (w % FP_PIXEL_RATE) == 0 {
+            let ch: u64 = (w >> 8) % 3
+            if ch == 0 {
+                c0 = (c0 as u64 ^ 1) as u8
+            } else if ch == 1 {
+                c1 = (c1 as u64 ^ 1) as u8
+            } else {
+                c2 = (c2 as u64 ^ 1) as u8
+            }
+            touched = touched + 1
+        }
+        rt.st8(dst, o, c0)
+        rt.st8(dst, o + 1, c1)
+        rt.st8(dst, o + 2, c2)
+        rt.st8(dst, o + 3, a)
+        i = i + 1
+    }
+    return touched
+}
+
+// How many pixels of a canvas of `npx` pixels this key would touch --
+// without a buffer, for the measurement and for a caller that wants to
+// know whether a read is worth farbling at all.
+fn fp_canvas_farble_count(k: *mut FpKey, npx: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < npx {
+        if (fp_key_word(k, i as u64) % FP_PIXEL_RATE) == 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------- `navigator`
+//
+// `hardwareConcurrency` is the number of cores. The real one is a good
+// fingerprint bit on its own (it splits the world into about eight groups)
+// and it is used for exactly one honest purpose: deciding how many workers
+// to start. A value that is TOO HIGH would make a page start more workers
+// than the machine has, so the answer is drawn from 2 up to the real
+// number and never above it -- a page that believes it is slower than it
+// is loses nothing but a little speed.
+fn fp_hardware_concurrency(k: *mut FpKey, real: u32) -> u32 {
+    var top: u32 = real
+    if top < 2 as u32 {
+        top = 2
+    }
+    if top > 16 as u32 {
+        top = 16
+    }
+    let span: u64 = (top - 1) as u64
+    return 2 + (fp_key_word(k, 1000001) % span) as u32
+}
+
+// `deviceMemory` is specified as one of six values (0.25, 0.5, 1, 2, 4, 8
+// gibibytes) -- the specification itself rounds, which is the only reason
+// this field is not worse than it is. The two smallest are left out: they
+// make a page switch to a "low memory" layout, and that IS visible.
+fn fp_device_memory(k: *mut FpKey) -> f64 {
+    let pick: u64 = fp_key_word(k, 1000002) % 4
+    if pick == 0 {
+        return 1.0
+    }
+    if pick == 1 {
+        return 2.0
+    }
+    if pick == 2 {
+        return 4.0
+    }
+    return 8.0
+}
+
+// The screen size is not noised but ROUNDED DOWN to a multiple of 50 --
+// noise here would be visible (a page lays itself out to it) and the
+// rounding puts the many nearly-equal window sizes into few groups.
+fn fp_screen_round(v: u32) -> u32 {
+    return (v / 50 as u32) * 50 as u32
+}
+
+// A clock reading, in microseconds. Rounded down to FP_CLOCK_STEP_US and
+// then moved by a per-key offset within one step. The rounding alone is
+// not enough: a script can repeat a measurement across a step boundary and
+// recover a finer value from how often it falls on each side. The offset
+// makes the boundary lie somewhere else for every site and every session.
+fn fp_clock_us(k: *mut FpKey, real_us: u64) -> u64 {
+    let off: u64 = fp_key_word(k, 1000003) % FP_CLOCK_STEP_US
+    if real_us < off {
+        return 0
+    }
+    return ((real_us - off) / FP_CLOCK_STEP_US) * FP_CLOCK_STEP_US
+}
+
+// THE USER AGENT IS FROZEN, NOT NOISED, and that is a different decision
+// from all of the above. A user agent drawn per site is a mark: no two
+// requests from one person agree, which is itself rare enough to be
+// recognised, and half the web serves a broken page to a browser it does
+// not know. One string for every Certus on every machine is the smaller
+// evil: it says nothing about THIS machine.
+fn fp_user_agent(out: u64) -> usize {
+    var lit: [u8; 64] =
+    "Mozilla/5.0 (X11; Linux x86_64) Certus/1.0 (like Gecko) OrientOS"
+    var i: usize = 0
+    while i < 64 {
+        rt.st8(out, i, lit[i])
+        i = i + 1
+    }
+    return 64
+}
+
+fn fp_user_agent_len() -> usize {
+    return 64
+}

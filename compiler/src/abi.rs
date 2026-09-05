@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Calling convention: System V AMD64 (SPEC §13, §14.1).
 //!
 //! This file is the **single truth** about how a value crosses a function

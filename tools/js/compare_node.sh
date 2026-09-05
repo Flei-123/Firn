@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/js/compare_node.sh -- the CROSS CHECK against a foreign engine.
 #
 # The same small programs run through node and through this engine; the

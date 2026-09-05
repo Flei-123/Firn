@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/english/lengths.py — prueft (und richtet) die Laengenangaben von
 # Zeichenkettenpuffern in Firn:  var m: [u8; 42] = "…"
 #

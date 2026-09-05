@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/x25519.fi -- the X25519 key exchange (RFC 7748), round B5.
+//
+// This is the one function in the whole handshake whose input is SECRET.
+// Everything else in round B5 either verifies somebody else's public
+// signature or encrypts with a key that already exists; here a private
+// scalar meets a public point, and the answer is the shared secret from
+// which every key of the connection is derived. If the timing of this
+// function depends on the scalar, the connection is readable.
+//
+// ================================================================ THE CURVE
+//
+// Curve25519 is `v^2 = u^3 + 486662*u^2 + u` over the field of
+// p = 2^255 - 19. X25519 computes only the u coordinate of `scalar * point`
+// and that is the whole trick: on a Montgomery curve the u coordinate of a
+// sum can be computed from the u coordinates of the two summands and of
+// their difference, WITHOUT the v coordinate. So the ladder below carries
+// two projective points and never decides whether a point is on the curve
+// or on its twist -- which is why X25519 needs no point validation and why
+// every 32 octet string is a valid public key.
+//
+// ============================================================= THE LADDER
+//
+// RFC 7748 5. Per bit of the scalar the same eleven field operations run,
+// in the same order, on the same two points; only WHICH of the two is
+// which changes, and that change is a conditional swap. `cswap` here is
+// written with a MASK and not with a branch:
+//
+//     t = mask & (a ^ b);  a = a ^ t;  b = b ^ t
+//
+// with mask = 0 or all ones. No jump depends on the scalar and no memory
+// address does either, so the ladder itself leaks nothing through timing
+// or through the cache.
+//
+// THE CLAMPING (RFC 7748 5, "decodeScalar25519") is not cosmetic:
+//   * the low three bits are cleared, so the scalar is a multiple of the
+//     cofactor 8 and a small-subgroup point cannot reveal anything;
+//   * bit 254 is set, so the ladder always runs the same number of
+//     significant steps -- a scalar with leading zeros would otherwise be
+//     visibly faster;
+//   * bit 255 is cleared, so the scalar stays below the group order.
+// An implementation that skips clamping interoperates perfectly and is
+// broken, which is the worst combination there is.
+//
+// THE TOP BIT OF THE U COORDINATE is masked off on input (RFC 7748 5,
+// "decodeUCoordinate"). It is not part of the number; some
+// implementations used to put a sign bit there.
+//
+// =========================================================== THE FIELD
+//
+// The arithmetic is the generic Montgomery multiplication of
+// `std.crypto.big`, with p as the modulus. The alternative -- ten limbs of
+// 25.5 bits and a reduction written by hand for this one prime -- is about
+// three times faster and is a page of index arithmetic that only its
+// author can check. This round chose the version that shares its
+// multiplication with RSA and P-256 and is therefore tested three times
+// over. What it costs is measured in `docs/ROUNDB5.md`.
+//
+// ==================================================================== HONEST
+//
+// X1 THE FINAL CONDITIONAL SUBTRACTION of the Montgomery multiplication is
+//    written branch-free (`std.crypto.big`), and `cswap` is branch-free.
+//    What is NOT constant time is `mont_pow`, which is used once at the
+//    end for the inversion z^(p-2) -- and its exponent is the PUBLIC
+//    constant p-2, the same for every call, so there is nothing there to
+//    leak.
+// X2 THE ALL-ZERO RESULT is a failure and this function says so. RFC 7748
+//    6.1: a peer who sends a point of small order forces a shared secret
+//    of zero, and an implementation that carries on has no key exchange at
+//    all -- it has a constant that the attacker also knows.
+// X3 NO EDWARDS FORM, no signature. Ed25519 is a different curve
+//    arithmetic on the same field; this file is only the key exchange.
+import std.rt
+import std.crypto.big
+
+export { x25519, x25519_base, x25519_keypair, X25519_LEN }
+
+const X25519_LEN: usize = 32
+
+// p = 2^255 - 19, as eight 32 bit limbs, least significant first.
+fn field_p(m: *mut big.Big) {
+    big.big_zero(m)
+    (*m).d[0] = 4294967277 as u32 // 2^32 - 19
+    var i: usize = 1
+    while i < 7 {
+        (*m).d[i] = 4294967295 as u32
+        i = i + 1
+    }
+    (*m).d[7] = 2147483647 as u32 // 2^31 - 1
+    (*m).n = 8
+}
+
+// p - 2, the exponent of the inversion.
+fn field_p_minus_2(m: *mut big.Big) {
+    field_p(m)
+    (*m).d[0] = 4294967275 as u32
+}
+
+// 32 little-endian octets into a number.
+fn from_le(a: *mut big.Big, p: u64) {
+    big.big_zero(a)
+    var i: usize = 0
+    while i < 32 {
+        let limb: usize = i / 4
+        let sh: u64 = ((i % 4) as u64) * 8
+        (*a).d[limb] = (((*a).d[limb] as u64)
+            | ((rt.ld8(p, i) as u64) << sh)) as u32
+        i = i + 1
+    }
+    (*a).n = 8
+}
+
+fn to_le(a: *mut big.Big, out: u64) {
+    var i: usize = 0
+    while i < 32 {
+        let limb: usize = i / 4
+        let sh: u64 = ((i % 4) as u64) * 8
+        var v: u64 = 0
+        if limb < (*a).n {
+            v = (*a).d[limb] as u64
+        }
+        rt.st8(out, i, ((v >> sh) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+// The conditional swap of the ladder. `bit` is 0 or 1 and NOTHING here
+// branches on it.
+fn cswap(bit: u32, a: *mut big.Big, b: *mut big.Big) {
+    let mask: u64 = (0 as u64) -% (bit as u64)
+    var i: usize = 0
+    while i < 8 {
+        let t: u64 = mask & (((*a).d[i] as u64) ^ ((*b).d[i] as u64))
+        (*a).d[i] = (((*a).d[i] as u64) ^ t) as u32
+        (*b).d[i] = (((*b).d[i] as u64) ^ t) as u32
+        i = i + 1
+    }
+}
+
+// The function of RFC 7748 5: 32 octets of scalar, 32 octets of u, 32
+// octets out. `false` means the result was the all-zero value (X2).
+fn x25519(scalar: u64, upoint: u64, out: u64) -> bool {
+    var k: [u8; 32] = [0; 32]
+    var i: usize = 0
+    while i < 32 {
+        k[i] = rt.ld8(scalar, i)
+        i = i + 1
+    }
+    k[0] = k[0] & 248 as u8
+    k[31] = k[31] & 127 as u8
+    k[31] = k[31] | 64 as u8
+
+    var ub: [u8; 32] = [0; 32]
+    i = 0
+    while i < 32 {
+        ub[i] = rt.ld8(upoint, i)
+        i = i + 1
+    }
+    ub[31] = ub[31] & 127 as u8
+
+    var p: big.Big = big.big_new()
+    field_p(&p)
+    var mc: big.Mont = big.mont_new()
+    if !big.mont_init(&mc, &p) {
+        return false
+    }
+    var u: big.Big = big.big_new()
+    from_le(&u, (&ub[0]) as u64)
+    var ur: big.Big = big.big_new()
+    let okm: bool = big.big_mod(&ur, &u, &p)
+    var x1: big.Big = big.big_new()
+    big.mont_to(&mc, &x1, &ur)
+
+    var x2: big.Big = big.big_new()
+    big.big_copy(&x2, big.mont_one(&mc))
+    var z2: big.Big = big.big_new()
+    let okz: bool = big.big_set_len(&z2, 8)
+    var x3: big.Big = big.big_new()
+    big.big_copy(&x3, &x1)
+    var z3: big.Big = big.big_new()
+    big.big_copy(&z3, big.mont_one(&mc))
+
+    // a24 = 121665, in the Montgomery domain.
+    var a24r: big.Big = big.big_new()
+    big.big_set_u32(&a24r, 121665 as u32)
+    var a24: big.Big = big.big_new()
+    big.mont_to(&mc, &a24, &a24r)
+
+    var aa: big.Big = big.big_new()
+    var bb: big.Big = big.big_new()
+    var ta: big.Big = big.big_new()
+    var tb: big.Big = big.big_new()
+    var cc: big.Big = big.big_new()
+    var dd: big.Big = big.big_new()
+    var da: big.Big = big.big_new()
+    var cb: big.Big = big.big_new()
+    var ee: big.Big = big.big_new()
+    var t1: big.Big = big.big_new()
+    var t2: big.Big = big.big_new()
+
+    var swap: u32 = 0
+    var t: usize = 255
+    while t > 0 {
+        t = t - 1
+        let kt: u32 = ((k[t / 8] as u64 >> ((t % 8) as u64)) & 1 as u64)
+        as u32
+        swap = swap ^ kt
+        cswap(swap, &x2, &x3)
+        cswap(swap, &z2, &z3)
+        swap = kt
+        // A = x2 + z2 ; AA = A^2 ; B = x2 - z2 ; BB = B^2
+        big.big_add_mod(&ta, &x2, &z2, &p)
+        big.mont_mul(&mc, &aa, &ta, &ta)
+        big.big_sub_mod(&tb, &x2, &z2, &p)
+        big.mont_mul(&mc, &bb, &tb, &tb)
+        // E = AA - BB
+        big.big_sub_mod(&ee, &aa, &bb, &p)
+        // C = x3 + z3 ; D = x3 - z3
+        big.big_add_mod(&cc, &x3, &z3, &p)
+        big.big_sub_mod(&dd, &x3, &z3, &p)
+        // DA = D*A ; CB = C*B
+        big.mont_mul(&mc, &da, &dd, &ta)
+        big.mont_mul(&mc, &cb, &cc, &tb)
+        // x3 = (DA + CB)^2
+        big.big_add_mod(&t1, &da, &cb, &p)
+        big.mont_mul(&mc, &x3, &t1, &t1)
+        // z3 = x1 * (DA - CB)^2
+        big.big_sub_mod(&t2, &da, &cb, &p)
+        big.mont_mul(&mc, &t1, &t2, &t2)
+        big.mont_mul(&mc, &z3, &x1, &t1)
+        // x2 = AA * BB
+        big.mont_mul(&mc, &x2, &aa, &bb)
+        // z2 = E * (AA + a24 * E)
+        big.mont_mul(&mc, &t1, &a24, &ee)
+        big.big_add_mod(&t2, &aa, &t1, &p)
+        big.mont_mul(&mc, &z2, &ee, &t2)
+    }
+    cswap(swap, &x2, &x3)
+    cswap(swap, &z2, &z3)
+
+    // z2^(p-2) -- Fermat's inversion. See X1: the exponent is public.
+    var e: big.Big = big.big_new()
+    field_p_minus_2(&e)
+    var inv: big.Big = big.big_new()
+    big.mont_pow(&mc, &inv, &z2, &e)
+    var res: big.Big = big.big_new()
+    big.mont_mul(&mc, &res, &x2, &inv)
+    var plain: big.Big = big.big_new()
+    big.mont_from(&mc, &plain, &res)
+    to_le(&plain, out)
+    return !big.big_is_zero(&plain)
+}
+
+// scalar * the base point u = 9.
+fn x25519_base(scalar: u64, out: u64) -> bool {
+    var base: [u8; 32] = [0; 32]
+    base[0] = 9 as u8
+    return x25519(scalar, (&base[0]) as u64, out)
+}
+
+// A private scalar (32 random octets, unclamped -- the clamping happens in
+// `x25519`) and the public value that belongs to it.
+fn x25519_keypair(priv_in: u64, pub_out: u64) -> bool {
+    return x25519_base(priv_in, pub_out)
+}

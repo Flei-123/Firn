@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Runner for the DOM and the style tree of round B1 (lib/dom/).
 
 A WORKBENCH, NOT A PRODUCT: no DOM logic here. It reads the cases of

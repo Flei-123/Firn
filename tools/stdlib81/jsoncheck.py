@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/stdlib81/jsoncheck.py -- lib/std/json.fi against JSONTestSuite.
 
 Three questions, and the second is the one that matters:

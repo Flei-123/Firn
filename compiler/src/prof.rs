@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Profiles `kernel` and `app` (SPEC.md §2) — round 52.**
 //!
 //! Up to round 51 `profile` was a declaration that was parsed, checked for
@@ -108,6 +109,17 @@ pub fn flag_set(name: &str) -> Result<(), String> {
 }
 
 /// Fix the profile from the declaration; the command line wins.
+///
+/// **ROUND ARM-FREESTANDING** adds the third source, and it is the weakest
+/// of the three on purpose: a FREESTANDING TARGET (`--target=x86_64-none`,
+/// `--target=aarch64-none`) turns the kernel profile on when neither the
+/// command line nor the source has said anything. It cannot be otherwise —
+/// every single thing the kernel profile forbids (system calls, the
+/// standard library, `_start`, a collector) is forbidden by the ABSENCE OF
+/// AN OPERATING SYSTEM, not by a word in line 1. The declaration in the
+/// source keeps winning over it, so that a source which says `profile app`
+/// is not silently turned into something else — that combination is a
+/// contradiction and `hook_check` reports it as one.
 pub fn define(prog: &Program, _unused: Option<()>) {
     if let Some(p) = FLAG.with(|f| f.get()) {
         ACTIVE.with(|a| a.set(p));
@@ -115,7 +127,10 @@ pub fn define(prog: &Program, _unused: Option<()>) {
     }
     let p = match prog.profile.as_ref().map(|(n, _)| n.as_str()) {
         Some("kernel") => Profile::Kernel,
-        _ => Profile::App,
+        Some(_) => Profile::App,
+        // Nothing said at all: the target decides.
+        None if crate::target::freestanding() => Profile::Kernel,
+        None => Profile::App,
     };
     ACTIVE.with(|a| a.set(p));
 }
@@ -194,6 +209,32 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
         }
     }
     define(prog, None);
+    // ROUND ARM-FREESTANDING: `profile app` under a target that has no
+    // operating system. Everything the `app` profile presumes -- `write`,
+    // `mmap`, `exit_group`, a `_start` that a loader jumps to -- comes from
+    // the operating system, and there is none. Reported here, once, at the
+    // declaration itself rather than 200 lines later at the first `syscall`.
+    if crate::target::freestanding() && !is_kernel() {
+        let span = prog
+            .profile
+            .as_ref()
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| {
+                prog.funcs.first().map(|f| f.span).unwrap_or(Span::in_file(0, 1, 1, 1))
+            });
+        dg.error_note(
+            span,
+            format!(
+                "profile 'app' cannot be built for the target '{}'",
+                crate::target::active().name()
+            ),
+            "the target name ends in '-none': there is no operating system under it, \
+             and the app profile presupposes one (write, mmap, exit_group, a _start \
+             that a loader jumps to) -- write 'profile kernel' or choose a target \
+             with an operating system",
+        );
+        return;
+    }
     if !is_kernel() {
         return;
     }
@@ -375,12 +416,30 @@ impl Guard<'_> {
                 self.block(&d.body);
             }
             ExprKind::Syscall(args) => {
-                self.dg.error_note(
-                    e.span,
-                    "'syscall' does not exist in profile 'kernel'".to_string(),
-                    "under a freestanding kernel there is no operating system \
-                     that could accept a system call",
-                );
+                // ROUND ARM-FREESTANDING: the same refusal, but it names the
+                // reason the reader actually has. Somebody who wrote
+                // `--target=aarch64-none` never typed the word "kernel"
+                // anywhere and would have had to guess where that message
+                // came from.
+                let (what, why) = if crate::target::freestanding() {
+                    (
+                        format!(
+                            "'syscall' does not exist on the target '{}'",
+                            crate::target::active().name()
+                        ),
+                        "the target name ends in '-none': there is no operating system \
+                         under it that could accept a system call -- a freestanding \
+                         program reaches its machine through 'asm', MMIO and its own \
+                         drivers",
+                    )
+                } else {
+                    (
+                        "'syscall' does not exist in profile 'kernel'".to_string(),
+                        "under a freestanding kernel there is no operating system \
+                         that could accept a system call",
+                    )
+                };
+                self.dg.error_note(e.span, what, why);
                 for a in args {
                     self.expr(a);
                 }

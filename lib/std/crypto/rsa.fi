@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/rsa.fi -- RSA signature VERIFICATION, round B5.
+//
+// Not signing. Not decryption. This file takes a public key, a signature
+// and a hash and answers one question: did the holder of the private key
+// sign this? That is the only RSA operation a browser performs, and it is
+// the safe half -- everything here works on data an attacker already has,
+// so nothing in it needs to be constant time (which is why
+// `std.crypto.big` may use a square-and-multiply with a branch).
+//
+// ======================================================= TWO PADDINGS
+//
+// PKCS#1 v1.5 (RFC 8017 9.2) is what almost every certificate authority
+// signs certificates with:
+//
+//     00 01 FF FF ... FF 00 || DigestInfo(hash)
+//
+// and the DigestInfo is a DER structure naming the hash algorithm. The
+// verification here is the STRICT one: the expected encoding is BUILT and
+// compared as octets. It does not parse the signature and pick out the
+// hash, which is the mistake behind the Bleichenbacher '06 forgery -- a
+// parser that skips trailing garbage accepts signatures that were never
+// made with the key. Building the expected block and comparing it cannot
+// have that bug, because there is nothing to skip.
+//
+// RSA-PSS (RFC 8017 9.1) is what TLS 1.3 requires for the handshake
+// signature itself (RFC 8446 4.2.3: `rsa_pkcs1_*` may only appear in
+// certificates, never in CertificateVerify). It is randomised, so it
+// cannot be built and compared; it has to be taken apart:
+//
+//     EM = maskedDB || H || 0xbc
+//     DB = MGF1(H) xor maskedDB, then the leading bits masked off
+//     DB = PS(zeros) || 0x01 || salt
+//     H' = Hash(0^8 || mHash || salt)     and H' must equal H
+//
+// Every one of those checks is a real one and every one of them is here.
+// The eight zero octets in front are not decoration: they stop a signature
+// over a raw hash from being reusable as a signature over something else.
+//
+// =================================================================== HONEST
+//
+// R1 THE PUBLIC EXPONENT IS NOT RESTRICTED to 65537. It is whatever the
+//    certificate says. An exponent of 1 or 0 makes the modular
+//    exponentiation the identity and is refused; anything else is
+//    computed. e = 3 is legal and still in use.
+// R2 THE MODULUS SIZE is bounded by `std.crypto.big`'s BIG_MAX, which
+//    holds RSA-4096. A larger key is refused, not truncated.
+// R3 NO SIGNING, NO DECRYPTION, NO KEY GENERATION. Those need the private
+//    exponent and they need blinding, constant-time arithmetic and a
+//    primality test; none of that is here and none of it is needed to
+//    check somebody else's certificate.
+// R4 A SIGNATURE MUST BE EXACTLY AS LONG AS THE MODULUS (RFC 8017 8.2.2
+//    step 1). A shorter one is refused rather than left-padded -- the
+//    padding would make two different signatures verify the same.
+import std.rt
+import std.crypto.big
+import std.crypto.sha256
+import std.crypto.sha512
+
+export { RSA_SHA1, RSA_SHA256, RSA_SHA384, RSA_SHA512,
+    rsa_verify_pkcs1, rsa_verify_pss,
+    rsa_verify_pkcs1_sha256, rsa_verify_pss_sha256,
+    rsa_public_op, hash_of, hash_size }
+
+const RSA_SHA1: u32 = 1
+const RSA_SHA256: u32 = 2
+const RSA_SHA384: u32 = 3
+const RSA_SHA512: u32 = 4
+
+fn hash_size(alg: u32) -> usize {
+    if alg == RSA_SHA1 {
+        return 20
+    }
+    if alg == RSA_SHA256 {
+        return 32
+    }
+    if alg == RSA_SHA384 {
+        return 48
+    }
+    if alg == RSA_SHA512 {
+        return 64
+    }
+    return 0
+}
+
+// The digest of `n` octets, by the named algorithm. SHA-1 is reached
+// through `std.crypto.sha1` only where a certificate authority still uses
+// it; see `lib/tls/x509.fi` for the policy on that.
+fn hash_of(alg: u32, p: u64, n: usize, out: u64) -> bool {
+    if alg == RSA_SHA256 {
+        sha256.sha256(p, n, out)
+        return true
+    }
+    if alg == RSA_SHA384 {
+        sha512.sha384(p, n, out)
+        return true
+    }
+    if alg == RSA_SHA512 {
+        sha512.sha512(p, n, out)
+        return true
+    }
+    return false
+}
+
+// s^e mod n, into `out` of exactly `nlen` octets.
+fn rsa_public_op(n: u64, nlen: usize, e: u64, elen: usize,
+    sig: u64, siglen: usize, out: u64) -> bool {
+    if siglen != nlen {
+        return false // R4
+    }
+    if nlen > big.BIG_MAX * 4 {
+        return false // R2
+    }
+    var mod: big.Big = big.big_new()
+    if !big.big_from_be(&mod, n, nlen) {
+        return false
+    }
+    if !big.big_odd(&mod) {
+        return false
+    }
+    var ex: big.Big = big.big_new()
+    if !big.big_from_be(&ex, e, elen) {
+        return false
+    }
+    if big.big_equal_u32(&ex, 0 as u32) || big.big_equal_u32(&ex, 1 as u32) {
+        return false // R1
+    }
+    var s: big.Big = big.big_new()
+    if !big.big_from_be(&s, sig, siglen) {
+        return false
+    }
+    // A signature must be strictly below the modulus (RFC 8017 8.2.2).
+    if big.big_cmp(&s, &mod) >= 0 {
+        return false
+    }
+    var mc: big.Mont = big.mont_new()
+    if !big.mont_init(&mc, &mod) {
+        return false
+    }
+    var sm: big.Big = big.big_new()
+    big.mont_to(&mc, &sm, &s)
+    var rm: big.Big = big.big_new()
+    big.mont_pow(&mc, &rm, &sm, &ex)
+    var r: big.Big = big.big_new()
+    big.mont_from(&mc, &r, &rm)
+    return big.big_to_be(&r, out, nlen)
+}
+
+// The DER DigestInfo prefix for an algorithm. `out` gets `*n` octets.
+fn digest_info(alg: u32, out: u64, n: *mut usize) -> bool {
+    if alg == RSA_SHA1 {
+        var d: [u8; 15] = [48, 33, 48, 9, 6, 5, 43, 14, 3, 2, 26, 5, 0, 4,
+            20]
+        var i: usize = 0
+        while i < 15 {
+            rt.st8(out, i, d[i])
+            i = i + 1
+        }
+        *n = 15
+        return true
+    }
+    if alg == RSA_SHA256 {
+        var d: [u8; 19] = [48, 49, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4,
+            2, 1, 5, 0, 4, 32]
+        var i: usize = 0
+        while i < 19 {
+            rt.st8(out, i, d[i])
+            i = i + 1
+        }
+        *n = 19
+        return true
+    }
+    if alg == RSA_SHA384 {
+        var d: [u8; 19] = [48, 65, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4,
+            2, 2, 5, 0, 4, 48]
+        var i: usize = 0
+        while i < 19 {
+            rt.st8(out, i, d[i])
+            i = i + 1
+        }
+        *n = 19
+        return true
+    }
+    if alg == RSA_SHA512 {
+        var d: [u8; 19] = [48, 81, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4,
+            2, 3, 5, 0, 4, 64]
+        var i: usize = 0
+        while i < 19 {
+            rt.st8(out, i, d[i])
+            i = i + 1
+        }
+        *n = 19
+        return true
+    }
+    return false
+}
+
+const EM_MAX: usize = 544
+
+// RFC 8017 8.2.2, in the "build and compare" form described above.
+fn rsa_verify_pkcs1(n: u64, nlen: usize, e: u64, elen: usize,
+    sig: u64, siglen: usize, hash: u64, alg: u32) -> bool {
+    let hlen: usize = hash_size(alg)
+    if hlen == 0 || nlen > EM_MAX {
+        return false
+    }
+    var em: [u8; 544] = [0; 544]
+    if !rsa_public_op(n, nlen, e, elen, sig, siglen, (&em[0]) as u64) {
+        return false
+    }
+    var di: [u8; 19] = [0; 19]
+    var dilen: usize = 0
+    if !digest_info(alg, (&di[0]) as u64, &dilen) {
+        return false
+    }
+    // 00 01 FF..FF 00 DigestInfo Hash, with at least eight FF octets
+    // (RFC 8017 9.2 note 3).
+    let tlen: usize = dilen + hlen
+    if nlen < tlen + 11 {
+        return false
+    }
+    var want: [u8; 544] = [0; 544]
+    want[0] = 0 as u8
+    want[1] = 1 as u8
+    let pslen: usize = nlen - tlen - 3
+    var i: usize = 0
+    while i < pslen {
+        want[2 + i] = 255 as u8
+        i = i + 1
+    }
+    want[2 + pslen] = 0 as u8
+    i = 0
+    while i < dilen {
+        want[3 + pslen + i] = di[i]
+        i = i + 1
+    }
+    i = 0
+    while i < hlen {
+        want[3 + pslen + dilen + i] = rt.ld8(hash, i)
+        i = i + 1
+    }
+    var diff: u64 = 0
+    i = 0
+    while i < nlen {
+        diff = diff | ((em[i] as u64) ^ (want[i] as u64))
+        i = i + 1
+    }
+    return diff == 0 as u64
+}
+
+fn rsa_verify_pkcs1_sha256(n: u64, nlen: usize, e: u64, elen: usize,
+    sig: u64, siglen: usize, hash: u64) -> bool {
+    return rsa_verify_pkcs1(n, nlen, e, elen, sig, siglen, hash, RSA_SHA256)
+}
+
+// MGF1 (RFC 8017 B.2.1): the mask is Hash(seed || counter) concatenated.
+fn mgf1(alg: u32, seed: u64, seedlen: usize, out: u64, outlen: usize)
+-> bool {
+    let hlen: usize = hash_size(alg)
+    if hlen == 0 {
+        return false
+    }
+    var buf: rt.Buf = rt.buf_new()
+    var digest: [u8; 64] = [0; 64]
+    var done: usize = 0
+    var counter: u64 = 0
+    while done < outlen {
+        rt.buf_clear(&buf)
+        rt.buf_push_bytes(&buf, seed, seedlen)
+        rt.buf_push(&buf, ((counter >> 24) & 255 as u64) as u8)
+        rt.buf_push(&buf, ((counter >> 16) & 255 as u64) as u8)
+        rt.buf_push(&buf, ((counter >> 8) & 255 as u64) as u8)
+        rt.buf_push(&buf, (counter & 255 as u64) as u8)
+        let ok: bool = hash_of(alg, buf.ptr, buf.len, (&digest[0]) as u64)
+        if !ok {
+            rt.buf_free(&buf)
+            return false
+        }
+        var i: usize = 0
+        while i < hlen && done < outlen {
+            rt.st8(out, done, digest[i])
+            done = done + 1
+            i = i + 1
+        }
+        counter = counter + 1
+    }
+    rt.buf_free(&buf)
+    return true
+}
+
+// RFC 8017 9.1.2, with the salt length equal to the hash length -- which
+// is what TLS 1.3 prescribes (RFC 8446 4.2.3) and what every server sends.
+fn rsa_verify_pss(n: u64, nlen: usize, e: u64, elen: usize,
+    sig: u64, siglen: usize, hash: u64, alg: u32) -> bool {
+    let hlen: usize = hash_size(alg)
+    if hlen == 0 || nlen > EM_MAX {
+        return false
+    }
+    let slen: usize = hlen
+    // emBits = modBits - 1, and modBits is the true bit length of n.
+    var mod: big.Big = big.big_new()
+    if !big.big_from_be(&mod, n, nlen) {
+        return false
+    }
+    let embits: usize = big.big_bitlen(&mod) - 1
+    let emlen: usize = (embits + 7) / 8
+    if emlen < hlen + slen + 2 {
+        return false
+    }
+    var full: [u8; 544] = [0; 544]
+    if !rsa_public_op(n, nlen, e, elen, sig, siglen, (&full[0]) as u64) {
+        return false
+    }
+    // The encoded message is `emlen` octets; when the modulus is not a
+    // whole number of octets the first one is dropped and must be zero.
+    var em: u64 = (&full[0]) as u64
+    if emlen < nlen {
+        var k: usize = 0
+        while k < nlen - emlen {
+            if full[k] != 0 as u8 {
+                return false
+            }
+            k = k + 1
+        }
+        em = em + (nlen - emlen) as u64
+    }
+    if rt.ld8(em, emlen - 1) != 188 as u8 {
+        return false // 0xbc
+    }
+    let dblen: usize = emlen - hlen - 1
+    var mask: [u8; 544] = [0; 544]
+    if !mgf1(alg, em + dblen as u64, hlen, (&mask[0]) as u64, dblen) {
+        return false
+    }
+    var db: [u8; 544] = [0; 544]
+    var i: usize = 0
+    while i < dblen {
+        db[i] = rt.ld8(em, i) ^ mask[i]
+        i = i + 1
+    }
+    // The leftmost 8*emLen - emBits bits of DB have to be zero.
+    // RFC 8017 9.1.2 step 6 and step 9, and they are about DIFFERENT
+    // octets: the leftmost bits of MASKEDDB (that is, of EM itself) have
+    // to be zero already, and the leftmost bits of the UNMASKED DB are
+    // then set to zero. Checking the unmasked one instead is a mistake
+    // that rejects every valid signature -- which is how it was found.
+    let spare: usize = 8 * emlen - embits
+    if spare > 0 {
+        let keep: u64 = (255 as u64) >> (spare as u64)
+        if ((rt.ld8(em, 0) as u64) & ~keep & 255 as u64) != 0 as u64 {
+            return false
+        }
+        db[0] = ((db[0] as u64) & keep) as u8
+    }
+    let pslen: usize = dblen - slen - 1
+    i = 0
+    while i < pslen {
+        if db[i] != 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    if db[pslen] != 1 as u8 {
+        return false
+    }
+    // H' = Hash(00 00 00 00 00 00 00 00 || mHash || salt)
+    var mp: rt.Buf = rt.buf_new()
+    var zeros: [u8; 8] = [0; 8]
+    rt.buf_push_bytes(&mp, (&zeros[0]) as u64, 8)
+    rt.buf_push_bytes(&mp, hash, hlen)
+    rt.buf_push_bytes(&mp, (&db[pslen + 1]) as u64, slen)
+    var hp: [u8; 64] = [0; 64]
+    let okh: bool = hash_of(alg, mp.ptr, mp.len, (&hp[0]) as u64)
+    rt.buf_free(&mp)
+    if !okh {
+        return false
+    }
+    var diff: u64 = 0
+    i = 0
+    while i < hlen {
+        diff = diff | ((hp[i] as u64) ^ (rt.ld8(em, dblen + i) as u64))
+        i = i + 1
+    }
+    return diff == 0 as u64
+}
+
+fn rsa_verify_pss_sha256(n: u64, nlen: usize, e: u64, elen: usize,
+    sig: u64, siglen: usize, hash: u64) -> bool {
+    return rsa_verify_pss(n, nlen, e, elen, sig, siglen, hash, RSA_SHA256)
+}

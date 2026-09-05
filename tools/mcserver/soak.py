@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/mcserver/soak.py -- does the server survive being used? (round 76)
 
     soak.py <port> <pid> <pings> <logins>

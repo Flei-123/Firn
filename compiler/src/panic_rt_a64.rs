@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! **Round 83** — the checked arithmetic of round 72 on the SECOND machine
 //! (`docs/ROUND80.md` §7, SPEC §13 item `L9`).
 //!
@@ -91,9 +92,46 @@ pub(crate) fn trampoline_asm() -> String {
         for (label, _, _) in entries() {
             s.push_str(&format!("{}:\n", label));
             s.push_str(&format!("    bl {}\n", crate::codegen_x86::label(&h)));
+            if crate::prof::is_kernel() {
+                // ROUND ARM-FREESTANDING: it came back anyway, and there is
+                // no `exit_group` here to end it with. `brk #0` is what
+                // `ud2` is on the other machine -- a deliberate trap, not a
+                // fall-through into whatever `.text` holds next.
+                s.push_str("    // a panic handler is not supposed to come back.\n");
+                s.push_str("    brk #0\n");
+                continue;
+            }
             s.push_str("    mov x0, #101\n");
             s.push_str("    mov x8, #94\n");
             s.push_str("    svc #0\n");
+            s.push_str("    brk #0\n");
+        }
+        return s;
+    }
+    // ROUND ARM-FREESTANDING -- the kernel ending, the A64 twin of
+    // `panic_rt.rs`'s. There is no runtime here: no `write` to print the
+    // message with and no `exit_group` to stop with. SPEC section 2 already
+    // promised the answer ("calls osum_panic, configurable"), and the
+    // argument registers x0..x4 ARE the AAPCS64 order the trampoline
+    // already hands its five values in, so nothing has to be shuffled --
+    // which is the one place where A64 is easier than x86-64 here (there
+    // the trampoline's rdi/esi/rdx/rcx/r9 needed r9 moved into r8 first).
+    //
+    // `osum_panic` stays UNDEFINED in the object file on purpose. A kernel
+    // that never defines it gets a link error, and a link error is the
+    // honest outcome; quietly returning into code that has just proved its
+    // own arithmetic wrong is not.
+    if crate::prof::is_kernel() {
+        for (label, _, _) in entries() {
+            s.push_str(&format!("{}:\n", label));
+            // x5 carries "read the two values as unsigned" and is the fifth
+            // argument by AAPCS64 anyway -- see the register list in the
+            // header of this file. The x86 side hands it in r9 and has to
+            // move it; here it already sits where the callee looks.
+            s.push_str(&format!("    bl {}\n", crate::panic_rt::OSUM_PANIC));
+            s.push_str("    // osum_panic is not supposed to come back; running\n");
+            s.push_str("    // into whatever comes next in .text would be silently\n");
+            s.push_str("    // wrong, so this traps instead of guessing.\n");
             s.push_str("    brk #0\n");
         }
         return s;

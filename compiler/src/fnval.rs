@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 58** — functions as first class values: function pointers and
 //! closures (`docs/ROUND58.md`).
 //!

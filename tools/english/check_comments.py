@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/english/check_comments.py — MASSSTAB fuer Etappe B.
 
 Etappe A hat Bezeichner, Meldungen und Pfadnamen englisch gemacht. Etappe B
@@ -69,17 +70,34 @@ def kommentarzeilen(pfad):
 # keine Prosa. `erst` in einem Satz ueber alte Namen ist kein deutscher Satz.
 CODESPAN = re.compile(r'`[^`]*`')
 
+# Runde B5: PFADE sind kein Deutsch. Die erste Zeile jeder Quelle in
+# diesem Verzeichnis nennt ihren eigenen Pfad ohne Rueckwaertsstriche
+# (`// lib/tls/der.fi -- ...`), und ein Dateistamm, der zufaellig wie ein
+# Funktionswort aussieht, hat den Pruefer sonst genau dort anschlagen
+# lassen, wo er am wenigsten hilft. Erkannt wird alles, was einen
+# Schraegstrich oder eine bekannte Endung traegt.
+PFAD = re.compile(r'\S*(?:/\S*|\.(?:fi|rs|py|sh|md|txt|tsv|toml|json|c|h))'
+                  r'\S*')
+
 # Runde 88: EIGENNAMEN, die zufaellig wie ein deutsches Funktionswort
 # aussehen. `MIT` ist der Name der Lizenz, nicht die Praeposition `mit` --
 # und weil RE_WORT ohne Ruecksicht auf Gross- und Kleinschreibung sucht,
 # meldete `MIT -- see [LICENSE](LICENSE)` eine deutsche Zeile. Die Liste
 # wird GROSS/KLEIN GENAU angewendet: `mit` faellt weiter auf.
-NAMEN = re.compile(r'\b(?:MIT)\b')
+#
+# Runde B5: `DER` sind die DISTINGUISHED ENCODING RULES aus X.690 -- die
+# Kodierung, in der jedes Zertifikat steht. GROSS geschrieben ist es das
+# Fachwort der Norm und niemals der deutsche Artikel, der in Prosa klein
+# steht. Ohne diesen Eintrag meldet der Pruefer elf Zeilen von
+# `lib/tls/der.fi`, `x509.fi` und `rsa.fi` als deutsch, obwohl jede davon
+# ein englischer Satz ueber ASN.1 ist.
+NAMEN = re.compile(r'\b(?:MIT|DER)\b')
 
 
 def deutsch(zeilen):
     return [(i, z) for i, z in zeilen
-            if RE_WORT.search(NAMEN.sub(' ', CODESPAN.sub(' ', z)))]
+            if RE_WORT.search(NAMEN.sub(' ', PFAD.sub(' ',
+                                              CODESPAN.sub(' ', z))))]
 
 
 def bereich(pfad):

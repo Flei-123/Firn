@@ -1,0 +1,661 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/ecdsa.fi -- NIST P-256 and P-384, and the verification
+// of an ECDSA signature on them (round B5).
+//
+// The other half of "can this certificate be trusted". RSA is in
+// `rsa.fi`; these are the two curves that carry the modern web. P-256 is
+// what Let's Encrypt and Google issue leaf certificates on; P-384 turned
+// out to be NOT optional, and that is a measured statement: the very first
+// real chain this round tried -- `example.com`, behind Cloudflare -- has a
+// P-384 intermediate and a P-384 root, and with P-256 alone the whole
+// chain came back `PARSE`. A browser that cannot do P-384 cannot open a
+// large part of the web.
+//
+// Verification only. A verifier works on public data -- the public key,
+// the signature, the hash -- so nothing here has to hide anything, and the
+// square-and-multiply of `std.crypto.big` with its branch on the exponent
+// bit is exactly right. SIGNING on these curves would need a constant-time
+// scalar multiplication and a nonce that is never reused; neither is here,
+// and neither is needed by a browser.
+//
+// ============================================================ THE GEOMETRY
+//
+// The points are carried in JACOBIAN coordinates: (X, Y, Z) stands for the
+// affine point (X/Z^2, Y/Z^3). The reason is that a point addition in
+// affine coordinates needs a modular INVERSION, which costs about as much
+// as a hundred multiplications; in Jacobian coordinates addition and
+// doubling need none, and the single inversion is paid once at the end. A
+// scalar multiplication therefore costs a few hundred doublings and
+// additions of a dozen multiplications each, plus one inversion --
+// instead of one inversion per bit.
+//
+// The doubling formula uses a = -3, which BOTH curves were chosen to
+// have: it turns `3*(X^2 - Z^4)` into `3*(X - Z^2)*(X + Z^2)` and saves
+// two squarings per bit. That is also why one piece of code serves both
+// curves -- everything that differs between them is a number in a
+// `Curve`, not a line of arithmetic.
+//
+// Z = 0 is the point at infinity. It has no affine form and every
+// operation below checks for it -- an addition that returns infinity
+// without saying so is how a verifier ends up accepting the signature
+// (r, s) = (0, 0).
+//
+// ============================================================== THE CHECKS
+//
+// ECDSA verification (SEC 1, 4.1.4) is four conditions and ALL FOUR are
+// here, because each of them alone is a forgery:
+//
+//   1. r and s must lie in [1, n-1]. s = 0 makes the inversion undefined
+//      and r = 0 makes the answer independent of the message.
+//   2. the public key must be a point ON the curve, and not the point at
+//      infinity. A "public key" off the curve lies in a group where the
+//      discrete logarithm is easy.
+//   3. R = u1*G + u2*Q must not be the point at infinity.
+//   4. R.x mod n must equal r.
+//
+// The hash is taken as its leftmost `ceil(log2 n)` bits, which for a hash
+// shorter than the curve means the whole hash and for a longer one means a
+// truncation -- SEC 1, 4.1.4 step 3.
+//
+// ==================================================================== HONEST
+//
+// E1 P-256 AND P-384 ONLY. Not P-521, not Ed25519, not any of the
+//    Brainpool curves. A chain that needs one of those comes back
+//    `UNSUPPORTED` from `lib/tls/x509.fi` and is refused, not accepted.
+// E2 UNCOMPRESSED POINTS ONLY (the 0x04 form, SEC 1 2.3.3). A compressed
+//    public key needs a square root modulo p; certificates in the wild are
+//    uncompressed and a compressed one is refused rather than guessed at.
+// E3 NOT CONSTANT TIME, on purpose -- see above. This file must never be
+//    used to sign.
+// E4 THE TWO SCALAR MULTIPLICATIONS ARE SEPARATE. Shamir's trick (one
+//    ladder over both scalars) is about 30 % faster and is not here; the
+//    measured cost of a verification is in docs/ROUNDB5.md.
+// E5 THE CONSTANTS WERE CHECKED, NOT COPIED. The generator that produced
+//    the tables below verified for both curves that G satisfies
+//    y^2 = x^3 - 3x + b and that n*G is the point at infinity, with an
+//    independent affine implementation. A transcription error in a curve
+//    constant produces a verifier that rejects everything, or -- worse --
+//    one that works in a group of the wrong order.
+import std.rt
+import std.crypto.big
+
+export { Curve, curve_new_p256, curve_p256, curve_p384,
+    ecdsa_verify_curve,
+    ecdsa_verify, ecdsa_verify_p384, point_valid, curve_bytes,
+    P256_LEN, P384_LEN }
+
+const P256_LEN: usize = 32
+const P384_LEN: usize = 48
+
+// ---- P256: p, n, n-2, b, and the base point.
+
+fn p256_p(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 4294967295 as u32
+    (*a).d[1] = 4294967295 as u32
+    (*a).d[2] = 4294967295 as u32
+    (*a).d[3] = 0 as u32
+    (*a).d[4] = 0 as u32
+    (*a).d[5] = 0 as u32
+    (*a).d[6] = 1 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).n = 8
+}
+
+fn p256_n(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 4234356049 as u32
+    (*a).d[1] = 4089039554 as u32
+    (*a).d[2] = 2803342980 as u32
+    (*a).d[3] = 3169254061 as u32
+    (*a).d[4] = 4294967295 as u32
+    (*a).d[5] = 4294967295 as u32
+    (*a).d[6] = 0 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).n = 8
+}
+
+fn p256_nm2(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 4234356047 as u32
+    (*a).d[1] = 4089039554 as u32
+    (*a).d[2] = 2803342980 as u32
+    (*a).d[3] = 3169254061 as u32
+    (*a).d[4] = 4294967295 as u32
+    (*a).d[5] = 4294967295 as u32
+    (*a).d[6] = 0 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).n = 8
+}
+
+fn p256_b(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 668098635 as u32
+    (*a).d[1] = 1003371582 as u32
+    (*a).d[2] = 3428036854 as u32
+    (*a).d[3] = 1696401072 as u32
+    (*a).d[4] = 1989707452 as u32
+    (*a).d[5] = 3018571093 as u32
+    (*a).d[6] = 2855965671 as u32
+    (*a).d[7] = 1522939352 as u32
+    (*a).n = 8
+}
+
+fn p256_gx(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 3633889942 as u32
+    (*a).d[1] = 4104206661 as u32
+    (*a).d[2] = 770388896 as u32
+    (*a).d[3] = 1996717441 as u32
+    (*a).d[4] = 1671708914 as u32
+    (*a).d[5] = 4173129445 as u32
+    (*a).d[6] = 3777774151 as u32
+    (*a).d[7] = 1796723186 as u32
+    (*a).n = 8
+}
+
+fn p256_gy(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 935285237 as u32
+    (*a).d[1] = 3417718888 as u32
+    (*a).d[2] = 1798397646 as u32
+    (*a).d[3] = 734933847 as u32
+    (*a).d[4] = 2081398294 as u32
+    (*a).d[5] = 2397563722 as u32
+    (*a).d[6] = 4263149467 as u32
+    (*a).d[7] = 1340293858 as u32
+    (*a).n = 8
+}
+
+// ---- P384: p, n, n-2, b, and the base point.
+
+fn p384_p(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 4294967295 as u32
+    (*a).d[1] = 0 as u32
+    (*a).d[2] = 0 as u32
+    (*a).d[3] = 4294967295 as u32
+    (*a).d[4] = 4294967294 as u32
+    (*a).d[5] = 4294967295 as u32
+    (*a).d[6] = 4294967295 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).d[8] = 4294967295 as u32
+    (*a).d[9] = 4294967295 as u32
+    (*a).d[10] = 4294967295 as u32
+    (*a).d[11] = 4294967295 as u32
+    (*a).n = 12
+}
+
+fn p384_n(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 3435473267 as u32
+    (*a).d[1] = 3974895978 as u32
+    (*a).d[2] = 1219536762 as u32
+    (*a).d[3] = 1478102450 as u32
+    (*a).d[4] = 4097256927 as u32
+    (*a).d[5] = 3345173889 as u32
+    (*a).d[6] = 4294967295 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).d[8] = 4294967295 as u32
+    (*a).d[9] = 4294967295 as u32
+    (*a).d[10] = 4294967295 as u32
+    (*a).d[11] = 4294967295 as u32
+    (*a).n = 12
+}
+
+fn p384_nm2(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 3435473265 as u32
+    (*a).d[1] = 3974895978 as u32
+    (*a).d[2] = 1219536762 as u32
+    (*a).d[3] = 1478102450 as u32
+    (*a).d[4] = 4097256927 as u32
+    (*a).d[5] = 3345173889 as u32
+    (*a).d[6] = 4294967295 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).d[8] = 4294967295 as u32
+    (*a).d[9] = 4294967295 as u32
+    (*a).d[10] = 4294967295 as u32
+    (*a).d[11] = 4294967295 as u32
+    (*a).n = 12
+}
+
+fn p384_b(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 3555470063 as u32
+    (*a).d[1] = 713410797 as u32
+    (*a).d[2] = 2318324125 as u32
+    (*a).d[3] = 3327539597 as u32
+    (*a).d[4] = 1343457114 as u32
+    (*a).d[5] = 51644559 as u32
+    (*a).d[6] = 4269883666 as u32
+    (*a).d[7] = 404593774 as u32
+    (*a).d[8] = 3824692505 as u32
+    (*a).d[9] = 2559444331 as u32
+    (*a).d[10] = 3795773412 as u32
+    (*a).d[11] = 3006345127 as u32
+    (*a).n = 12
+}
+
+fn p384_gx(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 1920338615 as u32
+    (*a).d[1] = 978607672 as u32
+    (*a).d[2] = 3210029420 as u32
+    (*a).d[3] = 1426256477 as u32
+    (*a).d[4] = 2186553912 as u32
+    (*a).d[5] = 1509376480 as u32
+    (*a).d[6] = 2343017368 as u32
+    (*a).d[7] = 1847409506 as u32
+    (*a).d[8] = 4079005044 as u32
+    (*a).d[9] = 2394015518 as u32
+    (*a).d[10] = 3196781879 as u32
+    (*a).d[11] = 2861025826 as u32
+    (*a).n = 12
+}
+
+fn p384_gy(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 2431258207 as u32
+    (*a).d[1] = 2051218812 as u32
+    (*a).d[2] = 494829981 as u32
+    (*a).d[3] = 174109134 as u32
+    (*a).d[4] = 3052452032 as u32
+    (*a).d[5] = 3923390739 as u32
+    (*a).d[6] = 681186428 as u32
+    (*a).d[7] = 4176747965 as u32
+    (*a).d[8] = 2459098153 as u32
+    (*a).d[9] = 1570674879 as u32
+    (*a).d[10] = 2519084143 as u32
+    (*a).d[11] = 907533898 as u32
+    (*a).n = 12
+}
+
+// Everything that differs between the two curves.
+struct Curve {
+    p: big.Big,
+    n: big.Big,
+    nm2: big.Big,
+    b: big.Big,
+    gx: big.Big,
+    gy: big.Big,
+    nbytes: usize,
+}
+
+fn curve_new() -> Curve {
+    return Curve { p: big.big_new(), n: big.big_new(), nm2: big.big_new(),
+        b: big.big_new(), gx: big.big_new(), gy: big.big_new(),
+        nbytes: 0 }
+}
+
+// An empty curve, so that a caller can declare one before it knows which.
+fn curve_new_p256() -> Curve {
+    var c: Curve = curve_new()
+    curve_p256(&c)
+    return c
+}
+
+fn curve_p256(c: *mut Curve) {
+    *c = curve_new()
+    p256_p(&(*c).p)
+    p256_n(&(*c).n)
+    p256_nm2(&(*c).nm2)
+    p256_b(&(*c).b)
+    p256_gx(&(*c).gx)
+    p256_gy(&(*c).gy)
+    (*c).nbytes = P256_LEN
+}
+
+fn curve_p384(c: *mut Curve) {
+    *c = curve_new()
+    p384_p(&(*c).p)
+    p384_n(&(*c).n)
+    p384_nm2(&(*c).nm2)
+    p384_b(&(*c).b)
+    p384_gx(&(*c).gx)
+    p384_gy(&(*c).gy)
+    (*c).nbytes = P384_LEN
+}
+
+fn curve_bytes(c: *mut Curve) -> usize {
+    return (*c).nbytes
+}
+
+// A point in Jacobian coordinates, every value in the Montgomery domain
+// of the field modulus.
+struct Pt {
+    x: big.Big,
+    y: big.Big,
+    z: big.Big,
+}
+
+fn pt_new() -> Pt {
+    return Pt { x: big.big_new(), y: big.big_new(), z: big.big_new() }
+}
+
+fn pt_is_inf(a: *mut Pt) -> bool {
+    return big.big_is_zero(&(*a).z)
+}
+
+fn pt_copy(dst: *mut Pt, src: *mut Pt) {
+    big.big_copy(&(*dst).x, &(*src).x)
+    big.big_copy(&(*dst).y, &(*src).y)
+    big.big_copy(&(*dst).z, &(*src).z)
+}
+
+fn pt_set_inf(a: *mut Pt, nl: usize) {
+    big.big_set_u32(&(*a).x, 1 as u32)
+    big.big_set_u32(&(*a).y, 1 as u32)
+    big.big_zero(&(*a).z)
+    let ok: bool = big.big_set_len(&(*a).z, nl)
+}
+
+// r = 2*a, the a = -3 doubling ("dbl-2001-b").
+fn pt_double(mc: *mut big.Mont, m: *mut big.Big, r: *mut Pt, a: *mut Pt) {
+    if pt_is_inf(a) {
+        pt_copy(r, a)
+        return
+    }
+    var delta: big.Big = big.big_new()
+    big.mont_mul(mc, &delta, &(*a).z, &(*a).z)
+    var gamma: big.Big = big.big_new()
+    big.mont_mul(mc, &gamma, &(*a).y, &(*a).y)
+    var beta: big.Big = big.big_new()
+    big.mont_mul(mc, &beta, &(*a).x, &gamma)
+    var t1: big.Big = big.big_new()
+    var t2: big.Big = big.big_new()
+    big.big_sub_mod(&t1, &(*a).x, &delta, m)
+    big.big_add_mod(&t2, &(*a).x, &delta, m)
+    var t3: big.Big = big.big_new()
+    big.mont_mul(mc, &t3, &t1, &t2)
+    var alpha: big.Big = big.big_new()
+    big.big_add_mod(&alpha, &t3, &t3, m)
+    big.big_add_mod(&alpha, &alpha, &t3, m) // 3*(X-delta)*(X+delta)
+    var a2: big.Big = big.big_new()
+    big.mont_mul(mc, &a2, &alpha, &alpha)
+    var b4: big.Big = big.big_new()
+    big.big_add_mod(&b4, &beta, &beta, m)
+    big.big_add_mod(&b4, &b4, &b4, m) // 4*beta
+    var b8: big.Big = big.big_new()
+    big.big_add_mod(&b8, &b4, &b4, m) // 8*beta
+    var x3: big.Big = big.big_new()
+    big.big_sub_mod(&x3, &a2, &b8, m)
+    // Z3 = (Y+Z)^2 - gamma - delta
+    var yz: big.Big = big.big_new()
+    big.big_add_mod(&yz, &(*a).y, &(*a).z, m)
+    var yz2: big.Big = big.big_new()
+    big.mont_mul(mc, &yz2, &yz, &yz)
+    var z3: big.Big = big.big_new()
+    big.big_sub_mod(&z3, &yz2, &gamma, m)
+    big.big_sub_mod(&z3, &z3, &delta, m)
+    // Y3 = alpha*(4*beta - X3) - 8*gamma^2
+    var t4: big.Big = big.big_new()
+    big.big_sub_mod(&t4, &b4, &x3, m)
+    var t5: big.Big = big.big_new()
+    big.mont_mul(mc, &t5, &alpha, &t4)
+    var g2: big.Big = big.big_new()
+    big.mont_mul(mc, &g2, &gamma, &gamma)
+    var g8: big.Big = big.big_new()
+    big.big_add_mod(&g8, &g2, &g2, m)
+    big.big_add_mod(&g8, &g8, &g8, m)
+    big.big_add_mod(&g8, &g8, &g8, m) // 8*gamma^2
+    var y3: big.Big = big.big_new()
+    big.big_sub_mod(&y3, &t5, &g8, m)
+    big.big_copy(&(*r).x, &x3)
+    big.big_copy(&(*r).y, &y3)
+    big.big_copy(&(*r).z, &z3)
+}
+
+// r = a + b ("add-2007-bl"), with the two degenerate cases handled.
+fn pt_add(mc: *mut big.Mont, m: *mut big.Big, r: *mut Pt, a: *mut Pt,
+    b: *mut Pt) {
+    if pt_is_inf(a) {
+        pt_copy(r, b)
+        return
+    }
+    if pt_is_inf(b) {
+        pt_copy(r, a)
+        return
+    }
+    var z1z1: big.Big = big.big_new()
+    big.mont_mul(mc, &z1z1, &(*a).z, &(*a).z)
+    var z2z2: big.Big = big.big_new()
+    big.mont_mul(mc, &z2z2, &(*b).z, &(*b).z)
+    var u1: big.Big = big.big_new()
+    big.mont_mul(mc, &u1, &(*a).x, &z2z2)
+    var u2: big.Big = big.big_new()
+    big.mont_mul(mc, &u2, &(*b).x, &z1z1)
+    var t: big.Big = big.big_new()
+    big.mont_mul(mc, &t, &(*b).z, &z2z2)
+    var s1: big.Big = big.big_new()
+    big.mont_mul(mc, &s1, &(*a).y, &t)
+    big.mont_mul(mc, &t, &(*a).z, &z1z1)
+    var s2: big.Big = big.big_new()
+    big.mont_mul(mc, &s2, &(*b).y, &t)
+    var h: big.Big = big.big_new()
+    big.big_sub_mod(&h, &u2, &u1, m)
+    var rr: big.Big = big.big_new()
+    big.big_sub_mod(&rr, &s2, &s1, m)
+    if big.big_is_zero(&h) {
+        if big.big_is_zero(&rr) {
+            pt_double(mc, m, r, a)
+            return
+        }
+        pt_set_inf(r, (*m).n)
+        return
+    }
+    var h2: big.Big = big.big_new()
+    big.big_add_mod(&h2, &h, &h, m)
+    var i: big.Big = big.big_new()
+    big.mont_mul(mc, &i, &h2, &h2)
+    var j: big.Big = big.big_new()
+    big.mont_mul(mc, &j, &h, &i)
+    var r2: big.Big = big.big_new()
+    big.big_add_mod(&r2, &rr, &rr, m)
+    var v: big.Big = big.big_new()
+    big.mont_mul(mc, &v, &u1, &i)
+    var x3: big.Big = big.big_new()
+    big.mont_mul(mc, &x3, &r2, &r2)
+    big.big_sub_mod(&x3, &x3, &j, m)
+    var v2: big.Big = big.big_new()
+    big.big_add_mod(&v2, &v, &v, m)
+    big.big_sub_mod(&x3, &x3, &v2, m)
+    var t2: big.Big = big.big_new()
+    big.big_sub_mod(&t2, &v, &x3, m)
+    var y3: big.Big = big.big_new()
+    big.mont_mul(mc, &y3, &r2, &t2)
+    var sj: big.Big = big.big_new()
+    big.mont_mul(mc, &sj, &s1, &j)
+    var sj2: big.Big = big.big_new()
+    big.big_add_mod(&sj2, &sj, &sj, m)
+    big.big_sub_mod(&y3, &y3, &sj2, m)
+    var zs: big.Big = big.big_new()
+    big.big_add_mod(&zs, &(*a).z, &(*b).z, m)
+    var zs2: big.Big = big.big_new()
+    big.mont_mul(mc, &zs2, &zs, &zs)
+    big.big_sub_mod(&zs2, &zs2, &z1z1, m)
+    big.big_sub_mod(&zs2, &zs2, &z2z2, m)
+    var z3: big.Big = big.big_new()
+    big.mont_mul(mc, &z3, &zs2, &h)
+    big.big_copy(&(*r).x, &x3)
+    big.big_copy(&(*r).y, &y3)
+    big.big_copy(&(*r).z, &z3)
+}
+
+// r = k * a, double and add from the top bit. See E3: the scalar is
+// public in a verification.
+fn pt_mul(mc: *mut big.Mont, m: *mut big.Big, r: *mut Pt, k: *mut big.Big,
+    a: *mut Pt) {
+    var acc: Pt = pt_new()
+    pt_set_inf(&acc, (*m).n)
+    var tmp: Pt = pt_new()
+    var i: usize = big.big_bitlen(k)
+    while i > 0 {
+        i = i - 1
+        pt_double(mc, m, &tmp, &acc)
+        pt_copy(&acc, &tmp)
+        if big.big_bit(k, i) != 0 as u32 {
+            pt_add(mc, m, &tmp, &acc, a)
+            pt_copy(&acc, &tmp)
+        }
+    }
+    pt_copy(r, &acc)
+}
+
+// Is (x, y) a point on y^2 = x^3 - 3x + b, and not the point at infinity?
+// The coordinates are `curve_bytes(c)` big-endian octets each.
+fn point_valid(c: *mut Curve, qx: u64, qy: u64) -> bool {
+    let nb: usize = (*c).nbytes
+    var mc: big.Mont = big.mont_new()
+    if !big.mont_init(&mc, &(*c).p) {
+        return false
+    }
+    var x: big.Big = big.big_new()
+    var y: big.Big = big.big_new()
+    if !big.big_from_be(&x, qx, nb) || !big.big_from_be(&y, qy, nb) {
+        return false
+    }
+    if big.big_cmp(&x, &(*c).p) >= 0 || big.big_cmp(&y, &(*c).p) >= 0 {
+        return false
+    }
+    if big.big_is_zero(&x) && big.big_is_zero(&y) {
+        return false
+    }
+    var xm: big.Big = big.big_new()
+    var ym: big.Big = big.big_new()
+    big.mont_to(&mc, &xm, &x)
+    big.mont_to(&mc, &ym, &y)
+    var lhs: big.Big = big.big_new()
+    big.mont_mul(&mc, &lhs, &ym, &ym)
+    var x2: big.Big = big.big_new()
+    big.mont_mul(&mc, &x2, &xm, &xm)
+    var x3: big.Big = big.big_new()
+    big.mont_mul(&mc, &x3, &x2, &xm)
+    var three_x: big.Big = big.big_new()
+    big.big_add_mod(&three_x, &xm, &xm, &(*c).p)
+    big.big_add_mod(&three_x, &three_x, &xm, &(*c).p)
+    var bm: big.Big = big.big_new()
+    big.mont_to(&mc, &bm, &(*c).b)
+    var rhs: big.Big = big.big_new()
+    big.big_sub_mod(&rhs, &x3, &three_x, &(*c).p)
+    big.big_add_mod(&rhs, &rhs, &bm, &(*c).p)
+    return big.big_cmp(&lhs, &rhs) == 0
+}
+
+// SEC 1, 4.1.4. `qx`, `qy`, `rsig`, `ssig` are `curve_bytes(c)`
+// big-endian octets each; `hash` is the digest of the signed data.
+fn ecdsa_verify_curve(c: *mut Curve, qx: u64, qy: u64, rsig: u64,
+    ssig: u64, hash: u64, hlen: usize) -> bool {
+    let nb: usize = (*c).nbytes
+    var r: big.Big = big.big_new()
+    var s: big.Big = big.big_new()
+    if !big.big_from_be(&r, rsig, nb) || !big.big_from_be(&s, ssig, nb) {
+        return false
+    }
+    // check 1
+    if big.big_is_zero(&r) || big.big_is_zero(&s) {
+        return false
+    }
+    if big.big_cmp(&r, &(*c).n) >= 0 || big.big_cmp(&s, &(*c).n) >= 0 {
+        return false
+    }
+    // check 2
+    if !point_valid(c, qx, qy) {
+        return false
+    }
+    var use_len: usize = hlen
+    if use_len > nb {
+        use_len = nb
+    }
+    var e0: big.Big = big.big_new()
+    if !big.big_from_be(&e0, hash, use_len) {
+        return false
+    }
+    var e: big.Big = big.big_new()
+    if !big.big_mod(&e, &e0, &(*c).n) {
+        return false
+    }
+    var nc: big.Mont = big.mont_new()
+    if !big.mont_init(&nc, &(*c).n) {
+        return false
+    }
+    // w = s^-1 mod n, by Fermat: n is prime.
+    var sm: big.Big = big.big_new()
+    big.mont_to(&nc, &sm, &s)
+    var wm: big.Big = big.big_new()
+    big.mont_pow(&nc, &wm, &sm, &(*c).nm2)
+    var em: big.Big = big.big_new()
+    big.mont_to(&nc, &em, &e)
+    var u1m: big.Big = big.big_new()
+    big.mont_mul(&nc, &u1m, &em, &wm)
+    var u1: big.Big = big.big_new()
+    big.mont_from(&nc, &u1, &u1m)
+    var rm: big.Big = big.big_new()
+    big.mont_to(&nc, &rm, &r)
+    var u2m: big.Big = big.big_new()
+    big.mont_mul(&nc, &u2m, &rm, &wm)
+    var u2: big.Big = big.big_new()
+    big.mont_from(&nc, &u2, &u2m)
+
+    var mc: big.Mont = big.mont_new()
+    if !big.mont_init(&mc, &(*c).p) {
+        return false
+    }
+    var one: big.Big = big.big_new()
+    big.big_set_u32(&one, 1 as u32)
+    var g: Pt = pt_new()
+    big.mont_to(&mc, &g.x, &(*c).gx)
+    big.mont_to(&mc, &g.y, &(*c).gy)
+    big.mont_to(&mc, &g.z, &one)
+    var q: Pt = pt_new()
+    var qxb: big.Big = big.big_new()
+    var qyb: big.Big = big.big_new()
+    let o1: bool = big.big_from_be(&qxb, qx, nb)
+    let o2: bool = big.big_from_be(&qyb, qy, nb)
+    big.mont_to(&mc, &q.x, &qxb)
+    big.mont_to(&mc, &q.y, &qyb)
+    big.mont_to(&mc, &q.z, &one)
+
+    var p1: Pt = pt_new()
+    pt_mul(&mc, &(*c).p, &p1, &u1, &g)
+    var p2: Pt = pt_new()
+    pt_mul(&mc, &(*c).p, &p2, &u2, &q)
+    var sum: Pt = pt_new()
+    pt_add(&mc, &(*c).p, &sum, &p1, &p2)
+    // check 3
+    if pt_is_inf(&sum) {
+        return false
+    }
+    // x = X / Z^2, back out of the Montgomery domain
+    var pm2: big.Big = big.big_new()
+    big.big_copy(&pm2, &(*c).p)
+    pm2.d[0] = ((pm2.d[0] as u64) - 2 as u64) as u32
+    var zi: big.Big = big.big_new()
+    big.mont_pow(&mc, &zi, &sum.z, &pm2)
+    var zi2: big.Big = big.big_new()
+    big.mont_mul(&mc, &zi2, &zi, &zi)
+    var xm: big.Big = big.big_new()
+    big.mont_mul(&mc, &xm, &sum.x, &zi2)
+    var xaff: big.Big = big.big_new()
+    big.mont_from(&mc, &xaff, &xm)
+    var xn: big.Big = big.big_new()
+    if !big.big_mod(&xn, &xaff, &(*c).n) {
+        return false
+    }
+    // check 4
+    return big.big_cmp(&xn, &r) == 0
+}
+
+fn ecdsa_verify(qx: u64, qy: u64, rsig: u64, ssig: u64, hash: u64,
+    hlen: usize) -> bool {
+    var c: Curve = curve_new()
+    curve_p256(&c)
+    return ecdsa_verify_curve(&c, qx, qy, rsig, ssig, hash, hlen)
+}
+
+fn ecdsa_verify_p384(qx: u64, qy: u64, rsig: u64, ssig: u64, hash: u64,
+    hlen: usize) -> bool {
+    var c: Curve = curve_new()
+    curve_p384(&c)
+    return ecdsa_verify_curve(&c, qx, qy, rsig, ssig, hash, hlen)
+}
