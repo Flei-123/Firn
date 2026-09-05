@@ -1,0 +1,106 @@
+// expect_exit: 0
+
+// ROUND 47 -- CYCLES OF `Arc[T]` LEAK. Made visible, not hidden.
+//
+// That is the same statement as in tests/552 for `Rc`, and it stands here
+// once more because `Arc` dissolves just as few cycles as `Rc` -- the
+// atomic counter changes NOTHING about it. Whoever has cycles takes either
+// `AtomWeakRef` (breaks it by hand) or `gc class`/`Gc[T]`
+// (dissolves it, SPEC 3.5).
+//
+// The test shows both in ONE run:
+//   A  1000 cycle pairs, both sides strong -> nothing becomes free
+//   B  the same 1000 pairs, one side weak -> everything becomes free
+// And it demands that A really leaks: if the leak were gone, the statement
+// of the documentation would be false and the test would have to fire.
+
+struct Cell {
+    partner: usize,
+    value: u64,
+}
+
+fn main() -> i32 {
+    var h: ArcHeap = ArcHeap {
+        base: 0 as usize, capacity: 0 as usize, next: 0 as usize,
+        free: [0 as usize; 8], live: 0 as usize, used: 0 as usize,
+        allocations: 0 as usize, releases: 0 as usize
+    }
+    if !arc_heap_init(&h, 1048576 as usize) {
+        return 90
+    }
+    let rc: i32 = run(&h) catch 91
+    arc_heap_free(&h)
+    return rc
+}
+
+fn run(h: *mut ArcHeap) -> AllocError!i32 {
+    let n: u64 = 1000 as u64
+
+    // --- A: both sides strong -> A LEAK ----------------------------------
+    var i: u64 = 0
+    while i < n {
+        var a: AtomicRef[Cell] = arc_empty[Cell]()
+        var b: AtomicRef[Cell] = arc_empty[Cell]()
+        if !(try arc_new[Cell](h, Cell { partner: 0 as usize, value: i }, &a)) {
+            return 1
+        }
+        if !(try arc_new[Cell](h, Cell { partner: 0 as usize, value: i }, &b)) {
+            return 2
+        }
+        // The cycle: every cell holds a STRONG reference to the other one.
+        // Stage 0 has no destructors, which is why the reference lies in the value
+        // as a raw address (SPEC 3.6) and the counter is incremented by hand.
+        var ka: AtomicRef[Cell] = arc_clone[Cell](a)
+        var kb: AtomicRef[Cell] = arc_clone[Cell](b)
+        (*(arc_value_address[Cell](a) as *mut Cell)).partner = arc_raw_address[Cell](kb)
+        (*(arc_value_address[Cell](b) as *mut Cell)).partner = arc_raw_address[Cell](ka)
+        // Let go of the outer references -- the inner ones stay.
+        arc_free[Cell](h, &a)
+        arc_free[Cell](h, &b)
+        i = i + 1 as u64
+    }
+    let leak: usize = arc_heap_live(h)
+    if leak != (2 as usize) * (n as usize) {
+        return 3
+    }
+    if arc_heap_releases(h) != 0 as usize {
+        return 4
+    }
+
+    // --- B: one side weak -> NO leak -------------------------------------
+    let before_b: usize = arc_heap_releases(h)
+    var j: u64 = 0
+    while j < n {
+        var a: AtomicRef[Cell] = arc_empty[Cell]()
+        var b: AtomicRef[Cell] = arc_empty[Cell]()
+        if !(try arc_new[Cell](h, Cell { partner: 0 as usize, value: j }, &a)) {
+            return 5
+        }
+        if !(try arc_new[Cell](h, Cell { partner: 0 as usize, value: j }, &b)) {
+            return 6
+        }
+        // a holds b STRONGLY, b holds a only WEAKLY.
+        var kb: AtomicRef[Cell] = arc_clone[Cell](b)
+        var wa: AtomWeakRef[Cell] = aweak_of[Cell](a)
+        (*(arc_value_address[Cell](a) as *mut Cell)).partner = arc_raw_address[Cell](kb)
+        (*(arc_value_address[Cell](b) as *mut Cell)).partner = aweak_raw_address[Cell](wa)
+        arc_free[Cell](h, &b)
+        // Let go of a: a dies and gives its strong reference to b back by
+        // hand while doing so (stage 0 has no `drop`), then b dies, then the
+        // weak reference falls.
+        var inner: AtomicRef[Cell] = arc_raw_ref[Cell](
+            (*(arc_value_address[Cell](a) as *mut Cell)).partner)
+        arc_free[Cell](h, &a)
+        arc_free[Cell](h, &inner)
+        aweak_free[Cell](h, &wa)
+        j = j + 1 as u64
+    }
+    if arc_heap_releases(h) - before_b != (2 as usize) * (n as usize) {
+        return 7
+    }
+    // Exactly the leak from part A is left -- no more, no less.
+    if arc_heap_live(h) != leak {
+        return 8
+    }
+    return 0
+}

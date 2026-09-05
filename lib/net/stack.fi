@@ -1,0 +1,600 @@
+// SPDX-License-Identifier: GPL-2.0-only
+profile kernel
+
+// lib/net/stack.fi -- round K3: everything between the wire and the
+// application.
+//
+// `wire` knows the octets, `tcp` knows the state machine. This file is
+// what is left: which frame belongs to whom, who owns a hardware
+// address, when an ARP entry is stale, and where a datagram waits while
+// its Ethernet header is still missing an address.
+//
+// THE TWO DOORS, and they are deliberately small.
+//
+//   downwards   net_input(s, frame, n, now)         a frame arrived
+//               net_output(s, buf, cap, now) -> n   a frame to send, or 0
+//   upwards     net_listen / net_accept / net_connect / net_send /
+//               net_recv / net_close, plus udp_bind / udp_send / udp_recv
+//               and net_poll(s, now) for the clock
+//
+// There is nothing else. No driver, no interrupt, no thread: whoever has
+// a network card writes the twenty lines that move octets between the
+// card and those two functions, and whoever has none -- the test suite
+// of this round, for one -- writes a pipe instead. That is the whole
+// reason a TCP stack can be developed and MEASURED without a driver
+// existing.
+//
+// NO GLOBAL VARIABLE (SPEC 14.1 item 5), so all of it lives in one
+// struct the caller owns. `net_size()` says how big it is; under
+// `profile kernel` the caller points it at physical memory, in the
+// `app` profile at an `mmap`ed page. The struct is about 1.2 MB, and
+// almost all of that is the eight send and eight receive buffers of
+// 64 KiB each in `tcp`.
+
+import net.wire
+import net.tcp
+
+export {
+    Stack,
+    net_size, net_init, net_input, net_output, net_poll,
+    net_listen, net_accept, net_connect, net_send, net_recv, net_close,
+    net_abort, net_state, net_error, net_readable, net_writable,
+    net_tcp, net_ip, net_mac_at, net_set_arp_ttl, net_stat,
+    net_arp_find, net_arp_learn, net_arp_valid, net_pending,
+    udp_bind, udp_send, udp_recv, udp_close,
+    NS_RX, NS_TX, NS_NOT_FOR_US, NS_ARP_RX, NS_ARP_TX, NS_IP_RX, NS_IP_BAD,
+    NS_FRAG, NS_ICMP, NS_UDP_RX, NS_UDP_BAD, NS_OUT_DROP, NS_OUT_FULL,
+    NS_ARP_REQ, NS_ETYPE_OTHER, NS_COUNT,
+}
+
+// The lengths, all of them integer literals a second time in the struct
+// below -- SPEC 12.1 wants a literal there.
+const OUT_SLOTS: usize = 32
+const SLOT: usize = 1536
+const ARP_SLOTS: usize = 16
+const UDP_SOCK: usize = 4
+const UDP_Q: usize = 4
+const UDP_MAX: usize = 1472
+
+const ARP_TTL: u64 = 60000000
+const ARP_REQ_GAP: u64 = 1000000
+const OUT_TTL: u64 = 3000000
+
+const NS_RX: u32 = 0
+const NS_TX: u32 = 1
+const NS_NOT_FOR_US: u32 = 2
+const NS_ARP_RX: u32 = 3
+const NS_ARP_TX: u32 = 4
+const NS_IP_RX: u32 = 5
+const NS_IP_BAD: u32 = 6
+const NS_FRAG: u32 = 7
+const NS_ICMP: u32 = 8
+const NS_UDP_RX: u32 = 9
+const NS_UDP_BAD: u32 = 10
+const NS_OUT_DROP: u32 = 11
+const NS_OUT_FULL: u32 = 12
+const NS_ARP_REQ: u32 = 13
+const NS_ETYPE_OTHER: u32 = 14
+const NS_COUNT: usize = 15
+
+struct Stack {
+    ip: u32,
+    mask: u32,
+    gw: u32,
+    mac: [u8; 6],
+    rand: u64,
+    arp_ttl: u64,
+    arp_next_req: u64,
+
+    arp_ip: [u32; 16],
+    arp_mac: [u8; 96],
+    arp_at: [u64; 16],
+    arp_used: [u32; 16],
+    arp_turn: usize,
+
+    out_buf: [u8; 49152],
+    out_len: [usize; 32],
+    out_dst: [u32; 32],
+    out_at: [u64; 32],
+    out_head: usize,
+    out_tail: usize,
+
+    udp_used: [u32; 4],
+    udp_port: [u16; 4],
+    udp_head: [usize; 4],
+    udp_tail: [usize; 4],
+    udp_dlen: [usize; 16],
+    udp_sip: [u32; 16],
+    udp_sport: [u16; 16],
+    udp_data: [u8; 23552],
+
+    stat: [u64; 15],
+    t: tcp.Tcp,
+}
+
+// HOW BIG THE THING IS, and why it is asked this way. `size_of[T]()`
+// resolves its type argument in the ROOT file of the compilation only
+// (the same restriction lib/std/json.fi names), so a module cannot ask
+// for the size of its own struct. The classic detour works and costs
+// nothing: `&(*p).b` is address arithmetic, not a memory access, so a
+// null pointer is a perfectly good ruler. `Pair` exists for no other
+// reason.
+struct Pair { a: Stack, b: Stack, }
+
+fn net_size() -> usize {
+    let p: *mut Pair = 0 as *mut Pair
+    let a: u64 = (&(*p).a) as u64
+    let b: u64 = (&(*p).b) as u64
+    return (b - a) as usize
+}
+
+fn bump(s: *mut Stack, which: u32) {
+    (*s).stat[which as usize] = (*s).stat[which as usize] +% 1
+}
+
+fn net_stat(s: *mut Stack, which: u32) -> u64 {
+    return (*s).stat[which as usize]
+}
+
+fn net_tcp(s: *mut Stack) -> *mut tcp.Tcp {
+    return &(*s).t
+}
+
+fn net_ip(s: *mut Stack) -> u32 { return (*s).ip }
+fn net_mac_at(s: *mut Stack) -> *mut u8 { return &(*s).mac[0] }
+fn net_set_arp_ttl(s: *mut Stack, us: u64) { (*s).arp_ttl = us }
+
+fn net_init(s: *mut Stack, ip: u32, mask: u32, gw: u32, mac: *mut u8, seed: u64) {
+    (*s).ip = ip
+    (*s).mask = mask
+    (*s).gw = gw
+    var i: usize = 0
+    while i < 6 {
+        (*s).mac[i] = wire.ld8(mac, i)
+        i = i + 1
+    }
+    (*s).rand = wire.next_random(seed)
+    (*s).arp_ttl = ARP_TTL
+    (*s).arp_next_req = 0
+    (*s).arp_turn = 0
+    i = 0
+    while i < ARP_SLOTS {
+        (*s).arp_used[i] = 0
+        (*s).arp_ip[i] = 0
+        (*s).arp_at[i] = 0
+        i = i + 1
+    }
+    (*s).out_head = 0
+    (*s).out_tail = 0
+    i = 0
+    while i < UDP_SOCK {
+        (*s).udp_used[i] = 0
+        (*s).udp_port[i] = 0 as u16
+        (*s).udp_head[i] = 0
+        (*s).udp_tail[i] = 0
+        i = i + 1
+    }
+    i = 0
+    while i < NS_COUNT {
+        (*s).stat[i] = 0
+        i = i + 1
+    }
+    tcp.tcp_init(&(*s).t, seed +% 12345)
+}
+
+// ===================================================================
+// 1. the ARP cache
+// ===================================================================
+
+fn arp_slot_mac(s: *mut Stack, i: usize) -> *mut u8 {
+    return &(*s).arp_mac[i * 6]
+}
+
+fn net_arp_learn(s: *mut Stack, ip: u32, mac: *mut u8, now: u64) {
+    if ip == 0 { return }
+    var i: usize = 0
+    while i < ARP_SLOTS {
+        if (*s).arp_used[i] == 1 && (*s).arp_ip[i] == ip {
+            wire.copy(arp_slot_mac(s, i), mac, 6)
+            (*s).arp_at[i] = now
+            return
+        }
+        i = i + 1
+    }
+    // A free slot, otherwise the one that has been standing longest.
+    var pick: usize = ARP_SLOTS
+    i = 0
+    while i < ARP_SLOTS {
+        if (*s).arp_used[i] == 0 { pick = i; i = ARP_SLOTS } else { i = i + 1 }
+    }
+    if pick == ARP_SLOTS {
+        pick = 0
+        var oldest: u64 = (*s).arp_at[0]
+        i = 1
+        while i < ARP_SLOTS {
+            if (*s).arp_at[i] < oldest { oldest = (*s).arp_at[i]; pick = i }
+            i = i + 1
+        }
+    }
+    (*s).arp_used[pick] = 1
+    (*s).arp_ip[pick] = ip
+    (*s).arp_at[pick] = now
+    wire.copy(arp_slot_mac(s, pick), mac, 6)
+}
+
+// An entry that is older than the lifetime is not answered with -- that
+// is the difference between a cache and a table. A machine that got a
+// new card keeps its address, and a stack that never forgets talks to a
+// hardware address that is gone.
+fn net_arp_find(s: *mut Stack, ip: u32, now: u64) -> i32 {
+    var i: usize = 0
+    while i < ARP_SLOTS {
+        if (*s).arp_used[i] == 1 && (*s).arp_ip[i] == ip {
+            if now >= (*s).arp_at[i] && (now - (*s).arp_at[i]) > (*s).arp_ttl {
+                (*s).arp_used[i] = 0
+                return 0 - 1
+            }
+            return i as i32
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn net_arp_valid(s: *mut Stack, ip: u32, now: u64) -> bool {
+    return net_arp_find(s, ip, now) >= 0
+}
+
+fn next_hop(s: *mut Stack, ip: u32) -> u32 {
+    if ((ip & (*s).mask) == ((*s).ip & (*s).mask)) { return ip }
+    if (*s).gw != 0 { return (*s).gw }
+    return ip
+}
+
+// ===================================================================
+// 2. the outbox
+// ===================================================================
+
+fn slot_at(s: *mut Stack, i: usize) -> *mut u8 {
+    return &(*s).out_buf[i * SLOT]
+}
+
+fn out_next(i: usize) -> usize {
+    return (i + 1) % OUT_SLOTS
+}
+
+fn out_room(s: *mut Stack) -> bool {
+    return out_next((*s).out_tail) != (*s).out_head
+}
+
+fn net_pending(s: *mut Stack) -> usize {
+    if (*s).out_tail >= (*s).out_head { return (*s).out_tail - (*s).out_head }
+    return OUT_SLOTS - (*s).out_head + (*s).out_tail
+}
+
+// `dst` is the IP the Ethernet address still has to be looked up for;
+// 0 means the frame is complete as it stands.
+fn out_commit(s: *mut Stack, len: usize, dst: u32, now: u64) {
+    let k: usize = (*s).out_tail
+    (*s).out_len[k] = len
+    (*s).out_dst[k] = dst
+    (*s).out_at[k] = now
+    (*s).out_tail = out_next(k)
+}
+
+// ===================================================================
+// 3. incoming frames
+// ===================================================================
+
+fn net_input(s: *mut Stack, f: *mut u8, n: usize, now: u64) {
+    if n < wire.ETH_HDR { return }
+    bump(s, NS_RX)
+    if !wire.eth_dst_is(f, &(*s).mac[0]) && !wire.eth_is_broadcast(f) {
+        bump(s, NS_NOT_FOR_US)
+        return
+    }
+    let et: u16 = wire.eth_type(f)
+    let body: *mut u8 = ((f as u64) + wire.ETH_HDR as u64) as *mut u8
+    let avail: usize = n - wire.ETH_HDR
+    if et == wire.ETYPE_ARP {
+        arp_in(s, body, avail, now)
+    } else if et == wire.ETYPE_IP4 {
+        ip_in(s, body, avail, now)
+    } else {
+        bump(s, NS_ETYPE_OTHER)
+    }
+}
+
+fn arp_in(s: *mut Stack, a: *mut u8, avail: usize, now: u64) {
+    if !wire.arp_ok(a, avail) { return }
+    bump(s, NS_ARP_RX)
+    let spa: u32 = wire.arp_spa(a)
+    // Learn from every ARP packet that comes past, request or reply --
+    // whoever asks has just said what his address is.
+    net_arp_learn(s, spa, wire.arp_sha_at(a), now)
+    if wire.arp_op(a) != wire.ARP_REQUEST { return }
+    if wire.arp_tpa(a) != (*s).ip { return }
+    if !out_room(s) { bump(s, NS_OUT_FULL); return }
+    let slot: *mut u8 = slot_at(s, (*s).out_tail)
+    wire.eth_build(slot, wire.arp_sha_at(a), &(*s).mac[0], wire.ETYPE_ARP)
+    let body: *mut u8 = ((slot as u64) + wire.ETH_HDR as u64) as *mut u8
+    wire.arp_build(body, wire.ARP_REPLY, &(*s).mac[0], (*s).ip, wire.arp_sha_at(a), spa)
+    out_commit(s, wire.ETH_HDR + wire.ARP_LEN, 0, now)
+    bump(s, NS_ARP_TX)
+}
+
+fn ip_in(s: *mut Stack, h: *mut u8, avail: usize, now: u64) {
+    if !wire.ip_header_ok(h, avail) {
+        bump(s, NS_IP_BAD)
+        return
+    }
+    bump(s, NS_IP_RX)
+    let dst: u32 = wire.ip_dst(h)
+    if dst != (*s).ip && dst != 0xFFFFFFFF {
+        // Not addressed to us and not a broadcast. A stack that routes
+        // would forward it here; this one does not, and says so.
+        if (dst | (~(*s).mask)) != dst || (dst & (*s).mask) != ((*s).ip & (*s).mask) {
+            bump(s, NS_NOT_FOR_US)
+            return
+        }
+    }
+    // A FRAGMENT IS REFUSED, not silently taken for a whole datagram.
+    // Reassembly is not built (docs/OSUM-K3.md); what IS built is the
+    // recognition, because handing half a TCP segment to the state
+    // machine is worse than dropping it.
+    if wire.ip_is_fragment(h) {
+        bump(s, NS_FRAG)
+        return
+    }
+    let p: u8 = wire.ip_proto(h)
+    if p == wire.IP_ICMP {
+        icmp_in(s, h, now)
+    } else if p == wire.IP_UDP {
+        udp_in(s, h, now)
+    } else if p == wire.IP_TCP {
+        tcp.tcp_input(&(*s).t, h, avail, now)
+    }
+}
+
+fn icmp_in(s: *mut Stack, h: *mut u8, now: u64) {
+    let ihl: usize = wire.ip_ihl(h)
+    let total: usize = wire.ip_total(h)
+    if total < ihl + 8 { return }
+    let ilen: usize = total - ihl
+    let icmp: *mut u8 = ((h as u64) + ihl as u64) as *mut u8
+    if wire.icmp_type(icmp) != wire.ICMP_ECHO { return }
+    if wire.icmp_code(icmp) != 0 as u8 { return }
+    if wire.checksum(icmp, ilen) != 0 as u16 { return }
+    if ilen > SLOT - wire.ETH_HDR - wire.IP_HDR { return }
+    if !out_room(s) { bump(s, NS_OUT_FULL); return }
+    let slot: *mut u8 = slot_at(s, (*s).out_tail)
+    let out: *mut u8 = ((slot as u64) + wire.ETH_HDR as u64) as *mut u8
+    let peer: u32 = wire.ip_src(h)
+    wire.ip_build(out, next_id(s), wire.IP_ICMP, (*s).ip, peer, ilen)
+    let o: *mut u8 = ((out as u64) + wire.IP_HDR as u64) as *mut u8
+    wire.copy(o, icmp, ilen)
+    wire.st8(o, 0, wire.ICMP_ECHO_REPLY)
+    wire.put16(o, 2, 0 as u16)
+    wire.put16(o, 2, wire.checksum(o, ilen))
+    out_commit(s, wire.ETH_HDR + wire.IP_HDR + ilen, peer, now)
+    bump(s, NS_ICMP)
+}
+
+fn next_id(s: *mut Stack) -> u16 {
+    (*s).rand = wire.next_random((*s).rand)
+    return (((*s).rand >> 32) & 0xFFFF) as u16
+}
+
+// ===================================================================
+// 4. UDP
+// ===================================================================
+
+fn udp_find(s: *mut Stack, port: u16) -> i32 {
+    var i: usize = 0
+    while i < UDP_SOCK {
+        if (*s).udp_used[i] == 1 && (*s).udp_port[i] == port { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn udp_bind(s: *mut Stack, port: u16) -> i32 {
+    if udp_find(s, port) >= 0 { return 0 - 1 }
+    var i: usize = 0
+    while i < UDP_SOCK {
+        if (*s).udp_used[i] == 0 {
+            (*s).udp_used[i] = 1
+            (*s).udp_port[i] = port
+            (*s).udp_head[i] = 0
+            (*s).udp_tail[i] = 0
+            return i as i32
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn udp_close(s: *mut Stack, h: i32) {
+    if h < 0 { return }
+    (*s).udp_used[h as usize] = 0
+}
+
+fn udp_in(s: *mut Stack, h: *mut u8, now: u64) {
+    let ihl: usize = wire.ip_ihl(h)
+    let total: usize = wire.ip_total(h)
+    let u: *mut u8 = ((h as u64) + ihl as u64) as *mut u8
+    let ulen: usize = wire.udp_len(u)
+    if ulen < wire.UDP_HDR { bump(s, NS_UDP_BAD); return }
+    if ihl + ulen > total { bump(s, NS_UDP_BAD); return }
+    if wire.udp_csum(u) != 0 as u16 {
+        var acc: u64 = wire.pseudo_sum(wire.ip_src(h), wire.ip_dst(h), wire.IP_UDP, ulen)
+        acc = acc + wire.sum16(u, ulen)
+        if wire.fold(acc) != 0 as u16 { bump(s, NS_UDP_BAD); return }
+    }
+    let sock: i32 = udp_find(s, wire.udp_dport(u))
+    if sock < 0 { return }
+    let k: usize = sock as usize
+    let nxt: usize = ((*s).udp_tail[k] + 1) % UDP_Q
+    if nxt == (*s).udp_head[k] { return } // the queue is full, the datagram is lost
+    let dlen: usize = ulen - wire.UDP_HDR
+    if dlen > UDP_MAX { return }
+    let idx: usize = k * UDP_Q + (*s).udp_tail[k]
+    var i: usize = 0
+    while i < dlen {
+        (*s).udp_data[idx * UDP_MAX + i] = wire.ld8(u, wire.UDP_HDR + i)
+        i = i + 1
+    }
+    (*s).udp_dlen[idx] = dlen
+    (*s).udp_sip[idx] = wire.ip_src(h)
+    (*s).udp_sport[idx] = wire.udp_sport(u)
+    (*s).udp_tail[k] = nxt
+    bump(s, NS_UDP_RX)
+}
+
+fn udp_recv(s: *mut Stack, h: i32, dst: *mut u8, cap: usize,
+    sip: *mut u32, sport: *mut u16) -> usize {
+    if h < 0 { return 0 }
+    let k: usize = h as usize
+    if (*s).udp_used[k] == 0 { return 0 }
+    if (*s).udp_head[k] == (*s).udp_tail[k] { return 0 }
+    let idx: usize = k * UDP_Q + (*s).udp_head[k]
+    var n: usize = (*s).udp_dlen[idx]
+    if n > cap { n = cap }
+    var i: usize = 0
+    while i < n {
+        wire.st8(dst, i, (*s).udp_data[idx * UDP_MAX + i])
+        i = i + 1
+    }
+    *sip = (*s).udp_sip[idx]
+    *sport = (*s).udp_sport[idx]
+    (*s).udp_head[k] = ((*s).udp_head[k] + 1) % UDP_Q
+    return n
+}
+
+fn udp_send(s: *mut Stack, sport: u16, dip: u32, dport: u16,
+    data: *mut u8, n: usize, now: u64) -> bool {
+    if n > UDP_MAX { return false }
+    if !out_room(s) { bump(s, NS_OUT_FULL); return false }
+    let slot: *mut u8 = slot_at(s, (*s).out_tail)
+    let out: *mut u8 = ((slot as u64) + wire.ETH_HDR as u64) as *mut u8
+    wire.ip_build(out, next_id(s), wire.IP_UDP, (*s).ip, dip, wire.UDP_HDR + n)
+    let u: *mut u8 = ((out as u64) + wire.IP_HDR as u64) as *mut u8
+    wire.copy(((u as u64) + wire.UDP_HDR as u64) as *mut u8, data, n)
+    wire.udp_build(u, sport, dport, n, (*s).ip, dip)
+    out_commit(s, wire.ETH_HDR + wire.IP_HDR + wire.UDP_HDR + n, dip, now)
+    return true
+}
+
+// ===================================================================
+// 5. the clock and the way out
+// ===================================================================
+
+fn net_poll(s: *mut Stack, now: u64) {
+    tcp.tcp_timers(&(*s).t, now)
+    var go: bool = true
+    while go {
+        if !out_room(s) { go = false } else {
+            let slot: *mut u8 = slot_at(s, (*s).out_tail)
+            let out: *mut u8 = ((slot as u64) + wire.ETH_HDR as u64) as *mut u8
+            var dst: u32 = 0
+            let n: usize = tcp.tcp_pull(&(*s).t, out, SLOT - wire.ETH_HDR, now, &dst)
+            if n == 0 { go = false } else {
+                out_commit(s, wire.ETH_HDR + n, dst, now)
+            }
+        }
+    }
+}
+
+fn arp_request(s: *mut Stack, buf: *mut u8, cap: usize, ip: u32, now: u64) -> usize {
+    if cap < wire.ETH_HDR + wire.ARP_LEN { return 0 }
+    var bcast: [u8; 6] = [0 as u8; 6]
+    wire.mac_broadcast(&bcast[0])
+    var zero: [u8; 6] = [0 as u8; 6]
+    wire.eth_build(buf, &bcast[0], &(*s).mac[0], wire.ETYPE_ARP)
+    let body: *mut u8 = ((buf as u64) + wire.ETH_HDR as u64) as *mut u8
+    wire.arp_build(body, wire.ARP_REQUEST, &(*s).mac[0], (*s).ip, &zero[0], ip)
+    (*s).arp_next_req = now + ARP_REQ_GAP
+    bump(s, NS_ARP_REQ)
+    bump(s, NS_TX)
+    return wire.ETH_HDR + wire.ARP_LEN
+}
+
+// The one place a frame really leaves. A datagram whose hardware address
+// is not known yet blocks the head of the queue and produces an ARP
+// request instead of itself -- and if the answer does not come within
+// three seconds it is thrown away rather than kept forever.
+fn net_output(s: *mut Stack, buf: *mut u8, cap: usize, now: u64) -> usize {
+    var guard: usize = 0
+    while (*s).out_head != (*s).out_tail && guard < OUT_SLOTS {
+        guard = guard + 1
+        let e: usize = (*s).out_head
+        let len: usize = (*s).out_len[e]
+        let slot: *mut u8 = slot_at(s, e)
+        if len > cap {
+            (*s).out_head = out_next(e)
+            bump(s, NS_OUT_DROP)
+            continue
+        }
+        if (*s).out_dst[e] == 0 {
+            wire.copy(buf, slot, len)
+            (*s).out_head = out_next(e)
+            bump(s, NS_TX)
+            return len
+        }
+        let nh: u32 = next_hop(s, (*s).out_dst[e])
+        let a: i32 = net_arp_find(s, nh, now)
+        if a >= 0 {
+            wire.eth_build(slot, arp_slot_mac(s, a as usize), &(*s).mac[0], wire.ETYPE_IP4)
+            wire.copy(buf, slot, len)
+            (*s).out_head = out_next(e)
+            bump(s, NS_TX)
+            return len
+        }
+        if now >= (*s).out_at[e] && (now - (*s).out_at[e]) > OUT_TTL {
+            (*s).out_head = out_next(e)
+            bump(s, NS_OUT_DROP)
+            continue
+        }
+        if now >= (*s).arp_next_req {
+            return arp_request(s, buf, cap, nh, now)
+        }
+        return 0
+    }
+    return 0
+}
+
+// ===================================================================
+// 6. the TCP door
+// ===================================================================
+
+fn eph_port(s: *mut Stack) -> u16 {
+    (*s).rand = wire.next_random((*s).rand)
+    return ((((*s).rand >> 40) & 16383) + 49152) as u16
+}
+
+fn net_listen(s: *mut Stack, port: u16) -> i32 {
+    return tcp.tcp_listen(&(*s).t, 0, port)
+}
+
+fn net_accept(s: *mut Stack, l: i32) -> i32 {
+    return tcp.tcp_accept(&(*s).t, l)
+}
+
+fn net_connect(s: *mut Stack, ip: u32, port: u16, now: u64) -> i32 {
+    return tcp.tcp_connect(&(*s).t, (*s).ip, eph_port(s), ip, port, now)
+}
+
+fn net_send(s: *mut Stack, h: i32, p: *mut u8, n: usize) -> usize {
+    return tcp.tcp_send(&(*s).t, h, p, n)
+}
+
+fn net_recv(s: *mut Stack, h: i32, p: *mut u8, n: usize) -> usize {
+    return tcp.tcp_recv(&(*s).t, h, p, n)
+}
+
+fn net_close(s: *mut Stack, h: i32) { tcp.tcp_close(&(*s).t, h) }
+fn net_abort(s: *mut Stack, h: i32) { tcp.tcp_abort(&(*s).t, h) }
+fn net_state(s: *mut Stack, h: i32) -> u32 { return tcp.tcp_state(&(*s).t, h) }
+fn net_error(s: *mut Stack, h: i32) -> i32 { return tcp.tcp_error(&(*s).t, h) }
+fn net_readable(s: *mut Stack, h: i32) -> usize { return tcp.tcp_readable(&(*s).t, h) }
+fn net_writable(s: *mut Stack, h: i32) -> usize { return tcp.tcp_writable(&(*s).t, h) }

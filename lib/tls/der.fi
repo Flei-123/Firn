@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/tls/der.fi -- ASN.1 in its Distinguished Encoding Rules, round B5.
+//
+// A certificate is a DER structure and nothing else, so before anything
+// can be trusted, something has to read DER. This is that something, and
+// it is deliberately the SMALL version: a cursor over octets that hands
+// back "tag, where the contents start, how long they are" and refuses
+// everything DER does not allow.
+//
+// ================================================== WHY A PARSER IS A RISK
+//
+// Every certificate a browser reads was handed to it by whoever it is
+// talking to, INCLUDING an attacker. The parser runs before any signature
+// has been checked -- it has to, because the signature is inside the thing
+// being parsed. So this file is the largest attack surface in the whole
+// round, and it is written accordingly:
+//
+//   * no allocation. A cursor is three numbers; the contents stay where
+//     they arrived. Nothing here can be made to ask for a gigabyte.
+//   * no recursion the input can control. `der_read` is flat; the callers
+//     in `x509.fi` nest to a fixed depth that the file itself decides.
+//   * every length is checked against what is really there BEFORE it is
+//     used, and a length that reaches past the end is a refusal.
+//   * the indefinite length form (0x80) is REFUSED. BER allows it, DER
+//     does not, and accepting it is how two parsers come to disagree about
+//     where a certificate ends -- which is the shape of a real attack.
+//   * a high tag number (0x1f) is refused. X.509 has none, and the
+//     multi-octet form is another place for two parsers to differ.
+//   * a length in non-minimal form (0x81 0x05 instead of 0x05, or a
+//     leading zero octet) is refused, for the same reason.
+//
+// ============================================================== THE TAGS
+//
+// Only the ones X.509 contains are named. A tag this file does not know is
+// not an error -- `der_read` returns it and the caller decides -- because
+// certificates legitimately contain extensions nobody here has heard of.
+import std.rt
+
+export {
+    Der, der_open, der_read, der_peek, der_done, der_rest,
+    der_enter, der_skip, der_uint,
+    T_BOOL, T_INT, T_BITSTRING, T_OCTETSTRING, T_NULL, T_OID, T_UTF8,
+    T_SEQ, T_SET, T_PRINTABLE, T_IA5, T_UTCTIME, T_GENTIME, T_TELETEX,
+    T_CONTEXT, T_CONSTRUCTED,
+}
+
+const T_BOOL: u32 = 1
+const T_INT: u32 = 2
+const T_BITSTRING: u32 = 3
+const T_OCTETSTRING: u32 = 4
+const T_NULL: u32 = 5
+const T_OID: u32 = 6
+const T_UTF8: u32 = 12
+const T_SEQ: u32 = 48 // SEQUENCE, constructed
+const T_SET: u32 = 49
+const T_PRINTABLE: u32 = 19
+const T_TELETEX: u32 = 20
+const T_IA5: u32 = 22
+const T_UTCTIME: u32 = 23
+const T_GENTIME: u32 = 24
+const T_CONTEXT: u32 = 128
+const T_CONSTRUCTED: u32 = 32
+
+// A cursor over a stretch of octets. `base` is the whole message so that
+// every offset this file hands out is an offset into the SAME buffer --
+// a certificate has to hash a substring of itself, and an offset that
+// means something different in a child cursor would make that impossible.
+struct Der {
+    base: u64,
+    at: usize, // where the cursor stands
+    end: usize, // one past the last octet it may read
+    ok: bool, // false once something was malformed
+}
+
+fn der_open(base: u64, off: usize, len: usize) -> Der {
+    return Der { base: base, at: off, end: off + len, ok: true }
+}
+
+fn der_done(d: *mut Der) -> bool {
+    return (*d).at >= (*d).end
+}
+
+fn der_rest(d: *mut Der) -> usize {
+    if (*d).at >= (*d).end {
+        return 0
+    }
+    return (*d).end - (*d).at
+}
+
+// Reads one TLV and advances past it. `tag` is the first octet as it
+// stands (so a SEQUENCE is 0x30, not 0x10); `off`/`len` describe the
+// CONTENTS.
+fn der_read(d: *mut Der, tag: *mut u32, off: *mut usize,
+    len: *mut usize) -> bool {
+    if !(*d).ok || (*d).at + 2 > (*d).end {
+        (*d).ok = false
+        return false
+    }
+    let t: u8 = rt.ld8((*d).base, (*d).at)
+    if (t & 31 as u8) == 31 as u8 {
+        (*d).ok = false // high tag number form -- see the head
+        return false
+    }
+    var i: usize = (*d).at + 1
+    let l0: u8 = rt.ld8((*d).base, i)
+    i = i + 1
+    var length: usize = 0
+    if l0 < 128 as u8 {
+        length = l0 as usize
+    } else {
+        let nb: usize = (l0 & 127 as u8) as usize
+        if nb == 0 || nb > 4 {
+            (*d).ok = false // indefinite, or longer than this parser reads
+            return false
+        }
+        if i + nb > (*d).end {
+            (*d).ok = false
+            return false
+        }
+        if rt.ld8((*d).base, i) == 0 as u8 {
+            (*d).ok = false // a leading zero octet is not minimal
+            return false
+        }
+        var k: usize = 0
+        while k < nb {
+            length = length * 256 + (rt.ld8((*d).base, i + k) as usize)
+            k = k + 1
+        }
+        if nb == 1 && length < 128 {
+            (*d).ok = false // should have used the short form
+            return false
+        }
+        i = i + nb
+    }
+    if i + length > (*d).end {
+        (*d).ok = false
+        return false
+    }
+    *tag = t as u32
+    *off = i
+    *len = length
+    (*d).at = i + length
+    return true
+}
+
+// The tag of the next TLV without consuming it. 0 when there is none.
+fn der_peek(d: *mut Der) -> u32 {
+    if !(*d).ok || (*d).at >= (*d).end {
+        return 0
+    }
+    return rt.ld8((*d).base, (*d).at) as u32
+}
+
+// Reads a TLV that MUST have the given tag and opens a cursor over its
+// contents.
+fn der_enter(d: *mut Der, want: u32, child: *mut Der) -> bool {
+    var tag: u32 = 0
+    var off: usize = 0
+    var len: usize = 0
+    if !der_read(d, &tag, &off, &len) {
+        return false
+    }
+    if tag != want {
+        (*d).ok = false
+        return false
+    }
+    *child = der_open((*d).base, off, len)
+    return true
+}
+
+fn der_skip(d: *mut Der) -> bool {
+    var tag: u32 = 0
+    var off: usize = 0
+    var len: usize = 0
+    return der_read(d, &tag, &off, &len)
+}
+
+// A non-negative INTEGER that fits in 63 bits, for the small ones (a
+// version number, a path length). Refuses a negative value and one that
+// is too large -- a serial number is NOT read with this.
+fn der_uint(d: *mut Der, out: *mut u64) -> bool {
+    var tag: u32 = 0
+    var off: usize = 0
+    var len: usize = 0
+    if !der_read(d, &tag, &off, &len) {
+        return false
+    }
+    if tag != T_INT || len == 0 || len > 8 {
+        return false
+    }
+    if (rt.ld8((*d).base, off) & 128 as u8) != 0 as u8 {
+        return false // negative
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < len {
+        v = (v << 8) | (rt.ld8((*d).base, off + i) as u64)
+        i = i + 1
+    }
+    *out = v
+    return true
+}

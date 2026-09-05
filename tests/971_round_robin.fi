@@ -1,0 +1,180 @@
+// expect_exit: 42
+// Round 62: the decision of the scheduler, as an ordinary program.
+//
+// `the osum repository (kernel/sched.fi)` divides the processor with a WEIGHTED ROUND
+// ROBIN: everybody gets a turn in the order of the table, and the length
+// of the turn is the priority in timer ticks. That code only ever runs in
+// QEMU (tools/kernel/run.sh) -- the same decision stands here on a table
+// of its own, so that the test suite runs it in all three build stages
+// and with BOTH compilers.
+//
+// What comes out of it is not approximate but exact: three tasks with the
+// priorities 1, 2 and 3 use up one cycle of six ticks, and of those the
+// first gets one, the second two, the third three. After 600 ticks the
+// counters therefore read 100, 200, 300 -- and if they read anything
+// else, the division is wrong.
+//
+// The second half is what the kernel does when somebody drops out: a
+// sleeping task is skipped, the remaining ones divide its share, and the
+// last one that is left keeps the processor instead of the picking
+// running into the void.
+
+const T_STATE: u64 = 0
+const T_PRIO: u64 = 8
+const T_BUDGET: u64 = 16
+const T_TICKS: u64 = 24
+const T_RUNS: u64 = 32
+const SLOT: u64 = 40
+
+const S_FREE: u64 = 0
+const S_READY: u64 = 1
+const S_RUN: u64 = 2
+const S_SLEEP: u64 = 3
+
+fn tget(table: u64, i: u64, field: u64) -> u64 {
+    return __mmio_read64((table + i * SLOT + field) as *mut u64)
+}
+
+fn tset(table: u64, i: u64, field: u64, v: u64) {
+    __mmio_write64((table + i * SLOT + field) as *mut u64, v)
+}
+
+// Round robin: from the current one onwards, the first ready one.
+fn pick(table: u64, n: u64, cur: u64) -> u64 {
+    var k: u64 = 1
+    while k <= n {
+        let i: u64 = (cur + k) % n
+        if tget(table, i, T_STATE) == S_READY {
+            return i
+        }
+        k = k + 1
+    }
+    if tget(table, cur, T_STATE) == S_RUN {
+        return cur
+    }
+    return n // nobody -- the idle task
+}
+
+// One timer tick, exactly as `sched.on_tick` does it.
+fn tick(table: u64, n: u64, cur: u64) -> u64 {
+    tset(table, cur, T_TICKS, tget(table, cur, T_TICKS) + 1)
+    let budget: u64 = tget(table, cur, T_BUDGET)
+    if budget > 1 {
+        tset(table, cur, T_BUDGET, budget - 1)
+        return cur
+    }
+    tset(table, cur, T_BUDGET, 0)
+    let next: u64 = pick(table, n, cur)
+    if next == cur || next == n {
+        tset(table, cur, T_BUDGET, tget(table, cur, T_PRIO))
+        return cur
+    }
+    if tget(table, cur, T_STATE) == S_RUN {
+        tset(table, cur, T_STATE, S_READY)
+    }
+    tset(table, next, T_STATE, S_RUN)
+    tset(table, next, T_BUDGET, tget(table, next, T_PRIO))
+    tset(table, next, T_RUNS, tget(table, next, T_RUNS) + 1)
+    return next
+}
+
+fn setup(table: u64, n: u64) {
+    var i: u64 = 0
+    while i < n {
+        tset(table, i, T_STATE, S_READY)
+        tset(table, i, T_PRIO, i + 1)
+        tset(table, i, T_BUDGET, i + 1)
+        tset(table, i, T_TICKS, 0)
+        tset(table, i, T_RUNS, 0)
+        i = i + 1
+    }
+    tset(table, 0, T_STATE, S_RUN)
+}
+
+fn main() -> i32 {
+    var buf: [u8; 240] = [0 as u8; 240]
+    let table: u64 = (&buf[0]) as u64
+    let n: u64 = 3
+
+    // 1. THE DIVISION. 600 ticks, 100 cycles of six -- 100, 200, 300.
+    setup(table, n)
+    var cur: u64 = 0
+    var t: u64 = 0
+    while t < 600 {
+        cur = tick(table, n, cur)
+        t = t + 1
+    }
+    if tget(table, 0, T_TICKS) != 100 {
+        return 1
+    }
+    if tget(table, 1, T_TICKS) != 200 {
+        return 2
+    }
+    if tget(table, 2, T_TICKS) != 300 {
+        return 3
+    }
+    // Everything was handed out, nothing lost.
+    let total: u64 = tget(table, 0, T_TICKS) + tget(table, 1, T_TICKS) + tget(table, 2, T_TICKS)
+    if total != 600 {
+        return 4
+    }
+    // The turns: the same number for everybody, and the length of a turn
+    // is the priority.
+    var i: u64 = 0
+    while i < n {
+        let runs: u64 = tget(table, i, T_RUNS)
+        if runs < 99 || runs > 100 {
+            return 5
+        }
+        if tget(table, i, T_TICKS) / runs != tget(table, i, T_PRIO) {
+            return 6
+        }
+        i = i + 1
+    }
+    // Nobody starves: the one with the lowest priority ran as well.
+    if tget(table, 0, T_RUNS) == 0 {
+        return 7
+    }
+
+    // 2. A SLEEPER IS SKIPPED. The middle one drops out, the other two
+    //    divide six ticks between them in the ratio 1 to 3.
+    setup(table, n)
+    tset(table, 1, T_STATE, S_SLEEP)
+    cur = 0
+    t = 0
+    while t < 400 {
+        cur = tick(table, n, cur)
+        t = t + 1
+    }
+    if tget(table, 1, T_TICKS) != 0 {
+        return 8
+    }
+    if tget(table, 0, T_TICKS) != 100 {
+        return 9
+    }
+    if tget(table, 2, T_TICKS) != 300 {
+        return 10
+    }
+
+    // 3. THE LAST ONE LEFT keeps the processor -- the picking must not
+    //    run into the void when nobody else is ready.
+    setup(table, n)
+    tset(table, 1, T_STATE, S_SLEEP)
+    tset(table, 2, T_STATE, S_SLEEP)
+    cur = 0
+    t = 0
+    while t < 50 {
+        cur = tick(table, n, cur)
+        if cur != 0 {
+            return 11
+        }
+        t = t + 1
+    }
+    if tget(table, 0, T_TICKS) != 50 {
+        return 12
+    }
+    if tget(table, 0, T_RUNS) != 0 {
+        return 13 // no switch happened at all
+    }
+    return 42
+}

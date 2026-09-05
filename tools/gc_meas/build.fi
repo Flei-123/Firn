@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/gc_meas/build.fi -- pauses over the WHOLE run, BUILD-UP INCLUDED
+// (round 44).
+//
+// WHY a new measuring program: pause_big.fi calls gc_hist_reset() AFTER the
+// build-up of the live set -- so the histogram there only shows the
+// steady state. But exactly the pauses of the build-up (full stop-the-world runs
+// below INKR_AB) are the subject of this round. This run
+// clears NOTHING: phase 0 is the balance after the build-up, phase 1 the balance
+// over the WHOLE run (build-up + steady state). The steady state alone is
+// the difference.
+//
+// Output deliberately without text markers (machine readable, one character per kind of line):
+//   A  <run> <pause_ns> <heap_bytes> <full_runs> <child_index>
+//        one collection DURING the build-up (at which heap size?)
+//   S  <t_ms> <cycles> <rss_kib> <live> <runs> <heap_bytes> <pause_max_ns>
+//        a sample in the steady state
+//   H  <phase> <type> <bucket> <count>  slice histogram (cumulative)
+//   M  <phase> <type> <ns>               longest slice per type (cumulative)
+//   C  <phase> <bucket> <count>          whole interruption in COMPUTE TIME
+//   K  <phase> <code> <value>            key figures, see below
+//
+// Key figure codes: 0 ms, 1 cycles, 2 collections, 3 full_runs, 4 heap_bytes,
+// 5 rss_kib, 6 live_bytes, 7 overflows, 8 pause_max_ns, 9 pause_total_ns,
+// 10 barriers, 11 total_bytes, 12 live_objects, 13 stop_max_ns
+// (the longest WHOLE interruption, histogram type 7), 14..20 diagnostics
+// gc_diag(0..6): new chunks while idle/marking/sweeping, mark slices,
+// sweep slices, grey allocations, allocations in total, 21 longest whole
+// interruption in pure compute time.
+//
+// Phases: 0 = after the build-up, 1 = end (the whole run).
+
+import dom
+import meas
+
+const BUDGET_MS: i64 = 20000 // GCM_BUDGET_MS
+const CHILDREN: u32 = 120000 // GCM_CHILDREN
+const SAMPLE: i64 = 1000 // GCM_SAMPLE
+// Switching threshold atomic/incremental (round 44, gc_set_incr_ab).
+// 0 = always incremental, 8388608 = the old behaviour.
+const INCR_THRESHOLD: u64 = 8388608 // GCM_THRESHOLD
+// A second clock: the pure compute time of the thread (round 44). Only with it
+// can a pause caused by the collector be told apart from one in which
+// the machine has preempted the process.
+const CPU_CLOCK: u64 = 1 // GCM_CPUUHR
+
+fn kenn(phase: u64, code: u64, value: u64) {
+    meas.meas_char(75)
+    meas.meas_tab()
+    meas.meas_u64(phase)
+    meas.meas_tab()
+    meas.meas_u64(code)
+    meas.meas_tab()
+    meas.meas_u64(value)
+    meas.meas_nl()
+}
+
+fn hist_out(phase: u64) {
+    var ty: u64 = 0
+    while ty < 8 {
+        var bucket: u64 = 0
+        while bucket < 16 {
+            let n: u64 = gc_hist(ty, bucket)
+            if n != 0 {
+                meas.meas_char(72)
+                meas.meas_tab()
+                meas.meas_u64(phase)
+                meas.meas_tab()
+                meas.meas_u64(ty)
+                meas.meas_tab()
+                meas.meas_u64(bucket)
+                meas.meas_tab()
+                meas.meas_u64(n)
+                meas.meas_nl()
+            }
+            bucket = bucket + 1
+        }
+        ty = ty + 1
+    }
+    var fc: u64 = 0
+    while fc < 16 {
+        let nc: u64 = gc_chist(fc)
+        if nc != 0 {
+            meas.meas_char(67)
+            meas.meas_tab()
+            meas.meas_u64(phase)
+            meas.meas_tab()
+            meas.meas_u64(fc)
+            meas.meas_tab()
+            meas.meas_u64(nc)
+            meas.meas_nl()
+        }
+        fc = fc + 1
+    }
+    var t2: u64 = 0
+    while t2 < 5 {
+        meas.meas_char(77)
+        meas.meas_tab()
+        meas.meas_u64(phase)
+        meas.meas_tab()
+        meas.meas_u64(t2)
+        meas.meas_tab()
+        meas.meas_u64(gc_pause_max_ty(t2))
+        meas.meas_nl()
+        t2 = t2 + 1
+    }
+}
+
+fn metrics(phase: u64, ms: u64, cycles: u64) {
+    kenn(phase, 0, ms)
+    kenn(phase, 1, cycles)
+    kenn(phase, 2, gc_collections())
+    kenn(phase, 3, gc_full_runs())
+    kenn(phase, 4, gc_heap_bytes())
+    kenn(phase, 5, meas.meas_rss_kib())
+    kenn(phase, 6, gc_live_bytes())
+    kenn(phase, 7, gc_overflows())
+    kenn(phase, 8, gc_pause_ns_max())
+    kenn(phase, 9, gc_pause_ns_total())
+    kenn(phase, 10, gc_barriers())
+    kenn(phase, 11, gc_total_bytes())
+    kenn(phase, 12, gc_live_objects())
+    kenn(phase, 13, gc_stop_max())
+    kenn(phase, 21, gc_cpu_stop_max())
+    var i: u64 = 0
+    while i < 7 {
+        kenn(phase, 14 + i, gc_diag(i))
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 2
+    }
+    return run() catch 9
+}
+
+fn run() -> AllocError!i32 {
+    gc_set_incr_ab(INCR_THRESHOLD)
+    gc_set_cpu_clock(CPU_CLOCK)
+    let t0: u64 = meas.meas_now_ms()
+    // ---- build up a large live set (every collection is reported) ----------
+    let root = try dom.dom_elem_new(1)
+    var k: u32 = 0
+    var runs: u64 = 0
+    while k < CHILDREN {
+        let kind = try dom.dom_node_new(1000 + k, dom.DOM_KIND_TEXT)
+        // Round 53: the list of children is a GcVec, so appending can
+        // allocate and is therefore fallible.
+        let ok: bool = try dom.dom_append_child(root, kind)
+        let l: u64 = gc_collections()
+        if l != runs {
+            runs = l
+            meas.meas_char(65)
+            meas.meas_tab()
+            meas.meas_u64(l)
+            meas.meas_tab()
+            meas.meas_u64(gc_pause_ns_last())
+            meas.meas_tab()
+            meas.meas_u64(gc_heap_bytes())
+            meas.meas_tab()
+            meas.meas_u64(gc_full_runs())
+            meas.meas_tab()
+            meas.meas_u64(k as u64)
+            meas.meas_nl()
+        }
+        k = k + 1
+    }
+    let t1: u64 = meas.meas_now_ms()
+    metrics(0, t1 - t0, 0)
+    hist_out(0)
+
+    // ---- steady state: the same stream of rubbish as pause.fi --------------
+    var cycles: u64 = 0
+    var since: i64 = 0
+    var t: u64 = 0
+    var running: bool = true
+    while running {
+        let n: u64 = dom.dom_cycle_build() catch 0
+        if n != dom.DOM_OBJECTS_PER_SET {
+            return 5
+        }
+        cycles = cycles + 1
+        since = since + 1
+        if since >= SAMPLE {
+            since = 0
+            t = meas.meas_now_ms() - t1
+            meas.meas_char(83)
+            meas.meas_tab()
+            meas.meas_u64(t)
+            meas.meas_tab()
+            meas.meas_u64(cycles)
+            meas.meas_tab()
+            meas.meas_u64(meas.meas_rss_kib())
+            meas.meas_tab()
+            meas.meas_u64(gc_live_objects())
+            meas.meas_tab()
+            meas.meas_u64(gc_collections())
+            meas.meas_tab()
+            meas.meas_u64(gc_heap_bytes())
+            meas.meas_tab()
+            meas.meas_u64(gc_pause_ns_max())
+            meas.meas_nl()
+            if t >= BUDGET_MS as u64 {
+                running = false
+            }
+        }
+    }
+    // The root MUST still be used here, otherwise the collector may collect it
+    // during the loop -- then the run measures nothing.
+    if dom.dom_children_count(root) != CHILDREN {
+        return 6
+    }
+    let t2: u64 = meas.meas_now_ms()
+    metrics(1, t2 - t1, cycles)
+    hist_out(1)
+    return 0
+}

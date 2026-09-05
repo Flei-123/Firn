@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/gcm.fi -- AES-GCM (NIST SP 800-38D), round B5.
+//
+// `TLS_AES_128_GCM_SHA256` is the ONE cipher suite that RFC 8446 9.1 makes
+// mandatory: "A TLS-compliant application MUST implement the
+// TLS_AES_128_GCM_SHA256 cipher suite". Without it there are servers this
+// browser simply cannot talk to, whatever else it offers. So it is here.
+//
+// `aes.fi` (round 81) already has the block cipher, in both the scalar and
+// the AES-NI form. What was missing is GCM, and GCM is two things
+// bolted together:
+//
+//   * CTR mode for the confidentiality: the counter block is encrypted and
+//     xored onto the plaintext. Nothing new.
+//   * GHASH for the authentication: a polynomial evaluation in the field
+//     GF(2^128), with the hash key H = AES_K(0^128).
+//
+// ================================================================== GHASH
+//
+// GF(2^128) with the reducing polynomial x^128 + x^7 + x^2 + x + 1, and --
+// this is the part that trips everybody up -- GCM numbers the bits the
+// OTHER WAY ROUND from every textbook. Bit 0 of the field element is the
+// MOST significant bit of the first octet. So the multiplication shifts
+// RIGHT, and the reduction constant is 0xe1 in the top octet
+// (SP 800-38D 6.3, algorithm 1). An implementation that shifts left and
+// reduces with 0x87 computes a perfectly good field multiplication in a
+// field nobody else is using.
+//
+// The multiplication here is the bitwise one: 128 iterations, one bit of
+// the operand each, with the shift and the conditional reduction. That is
+// the algorithm as the standard writes it, and it is SLOW -- see G2. It is
+// also the version whose correctness can be read off the page, which is
+// what round B5 needed first.
+//
+// ================================================================= THE IV
+//
+// TLS 1.3 always uses a 96 bit nonce, and for that length J0 is simply
+// `IV || 0^31 || 1` (SP 800-38D 7.1 step 2, first case). The other case --
+// a nonce of any other length gets GHASHed into shape -- is NOT
+// implemented, and `gcm_seal` refuses anything but twelve octets rather
+// than silently doing the wrong thing. That is a real boundary and it is
+// enforced, not documented.
+//
+// ==================================================================== HONEST
+//
+// G1 AES-128 ONLY, because `aes.fi` is AES-128 only (its note A1). So
+//    `TLS_AES_256_GCM_SHA384` is not offered by the handshake. The
+//    mandatory suite is the 128 bit one and every TLS 1.3 server has it.
+// G2 THE BITWISE GHASH IS SLOW. Measured in docs/ROUNDB5.md. A 4 bit table
+//    (16 entries, the standard "shoup" trick) is eight times faster and a
+//    `pclmulqdq` path -- the intrinsic exists in this compiler since round
+//    82 -- is another twenty. Neither is here, because a wrong MAC is a
+//    security hole and a slow one is a number in a table.
+// G3 THE TAG COMPARISON is `chacha.tag_equal`, which does not stop early.
+//    Same reason as C1 there.
+// G4 NO IN-PLACE OPERATION. `out` and `src` must not overlap.
+import std.rt
+import std.crypto.aes
+import std.crypto.chacha
+
+export { GcmKey, gcm_new, gcm_seal, gcm_open, ghash, GCM_TAG, GCM_NONCE }
+
+const GCM_TAG: usize = 16
+const GCM_NONCE: usize = 12
+
+struct GcmKey {
+    a: aes.Aes,
+    h_hi: u64, // the hash subkey H, as two 64 bit halves in BIG-endian
+    h_lo: u64, // reading -- octet 0 is the top of `h_hi`
+    ok: bool,
+}
+
+fn be64(p: u64, off: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < 8 {
+        v = (v << 8) | (rt.ld8(p, off + i) as u64)
+        i = i + 1
+    }
+    return v
+}
+
+fn put_be64(p: u64, off: usize, v: u64) {
+    var i: usize = 0
+    while i < 8 {
+        rt.st8(p, off + i, ((v >> ((7 - i) as u64 * 8)) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+// Only a 16 octet key is accepted -- see G1.
+fn gcm_new(key: u64, keylen: usize) -> GcmKey {
+    var g: GcmKey = GcmKey { a: aes.aes128_new(key), h_hi: 0, h_lo: 0,
+        ok: false }
+    if keylen != 16 {
+        return g
+    }
+    var zero: [u8; 16] = [0; 16]
+    var h: [u8; 16] = [0; 16]
+    aes.aes_encrypt_block(&g.a, (&zero[0]) as u64, (&h[0]) as u64)
+    g.h_hi = be64((&h[0]) as u64, 0)
+    g.h_lo = be64((&h[0]) as u64, 8)
+    g.ok = true
+    return g
+}
+
+// z = x * y in GF(2^128), GCM's bit order. `x` is the accumulator and `y`
+// the hash subkey.
+fn gf_mul(xhi: u64, xlo: u64, yhi: u64, ylo: u64, zhi: *mut u64,
+    zlo: *mut u64) {
+    var rhi: u64 = 0
+    var rlo: u64 = 0
+    var vhi: u64 = yhi
+    var vlo: u64 = ylo
+    var i: usize = 0
+    while i < 128 {
+        // bit i of x, counted from the MOST significant bit of the first
+        // octet -- that is what GCM calls X_i.
+        var bit: u64 = 0
+        if i < 64 {
+            bit = (xhi >> ((63 - i) as u64)) & 1 as u64
+        } else {
+            bit = (xlo >> ((127 - i) as u64)) & 1 as u64
+        }
+        if bit != 0 as u64 {
+            rhi = rhi ^ vhi
+            rlo = rlo ^ vlo
+        }
+        let lsb: u64 = vlo & 1 as u64
+        vlo = (vlo >> 1) | ((vhi & 1 as u64) << 63)
+        vhi = vhi >> 1
+        if lsb != 0 as u64 {
+            // x^128 = x^7 + x^2 + x + 1, which in this bit order is the
+            // constant 0xe1 in the topmost octet.
+            vhi = vhi ^ 16212958658533785600 as u64
+        }
+        i = i + 1
+    }
+    *zhi = rhi
+    *zlo = rlo
+}
+
+// GHASH over `n` octets, which must be a multiple of 16.
+fn ghash(g: *mut GcmKey, data: u64, n: usize, yhi: *mut u64,
+    ylo: *mut u64) {
+    var ahi: u64 = *yhi
+    var alo: u64 = *ylo
+    var at: usize = 0
+    while at + 16 <= n {
+        ahi = ahi ^ be64(data, at)
+        alo = alo ^ be64(data, at + 8)
+        var nhi: u64 = 0
+        var nlo: u64 = 0
+        gf_mul(ahi, alo, (*g).h_hi, (*g).h_lo, &nhi, &nlo)
+        ahi = nhi
+        alo = nlo
+        at = at + 16
+    }
+    *yhi = ahi
+    *ylo = alo
+}
+
+// The same, for a partial block: the rest is padded with zeros.
+fn ghash_pad(g: *mut GcmKey, data: u64, n: usize, yhi: *mut u64,
+    ylo: *mut u64) {
+    let whole: usize = (n / 16) * 16
+    ghash(g, data, whole, yhi, ylo)
+    if whole < n {
+        var blk: [u8; 16] = [0; 16]
+        var i: usize = 0
+        while whole + i < n {
+            blk[i] = rt.ld8(data, whole + i)
+            i = i + 1
+        }
+        ghash(g, (&blk[0]) as u64, 16, yhi, ylo)
+    }
+}
+
+// CTR over the counter block `ctr`, which is advanced in its last four
+// octets (inc32 of SP 800-38D 6.2).
+fn gctr(g: *mut GcmKey, ctr: u64, src: u64, n: usize, dst: u64) {
+    var blk: [u8; 16] = [0; 16]
+    var ks: [u8; 16] = [0; 16]
+    var i: usize = 0
+    while i < 16 {
+        blk[i] = rt.ld8(ctr, i)
+        i = i + 1
+    }
+    var at: usize = 0
+    while at < n {
+        aes.aes_encrypt_block(&(*g).a, (&blk[0]) as u64, (&ks[0]) as u64)
+        i = 0
+        while i < 16 && at + i < n {
+            rt.st8(dst, at + i, rt.ld8(src, at + i) ^ ks[i])
+            i = i + 1
+        }
+        // inc32 on the last four octets
+        var c: u64 = (blk[12] as u64) << 24 | (blk[13] as u64) << 16
+        | (blk[14] as u64) << 8 | (blk[15] as u64)
+        c = (c +% (1 as u64)) & 4294967295 as u64
+        blk[12] = ((c >> 24) & 255 as u64) as u8
+        blk[13] = ((c >> 16) & 255 as u64) as u8
+        blk[14] = ((c >> 8) & 255 as u64) as u8
+        blk[15] = (c & 255 as u64) as u8
+        at = at + 16
+    }
+}
+
+fn tag_of(g: *mut GcmKey, j0: u64, aad: u64, na: usize, ct: u64,
+    nc: usize, tag: u64) {
+    var yhi: u64 = 0
+    var ylo: u64 = 0
+    ghash_pad(g, aad, na, &yhi, &ylo)
+    ghash_pad(g, ct, nc, &yhi, &ylo)
+    var lens: [u8; 16] = [0; 16]
+    put_be64((&lens[0]) as u64, 0, (na as u64) * 8)
+    put_be64((&lens[0]) as u64, 8, (nc as u64) * 8)
+    ghash(g, (&lens[0]) as u64, 16, &yhi, &ylo)
+    var s: [u8; 16] = [0; 16]
+    put_be64((&s[0]) as u64, 0, yhi)
+    put_be64((&s[0]) as u64, 8, ylo)
+    gctr(g, j0, (&s[0]) as u64, 16, tag)
+}
+
+fn make_j0(nonce: u64, j0: u64) {
+    var i: usize = 0
+    while i < 12 {
+        rt.st8(j0, i, rt.ld8(nonce, i))
+        i = i + 1
+    }
+    rt.st8(j0, 12, 0 as u8)
+    rt.st8(j0, 13, 0 as u8)
+    rt.st8(j0, 14, 0 as u8)
+    rt.st8(j0, 15, 1 as u8)
+}
+
+// `out` gets n + 16 octets. A key or a nonce of the wrong length is a
+// refusal (see G1 and THE IV above), not a guess.
+fn gcm_seal(key: u64, keylen: usize, nonce: u64, aad: u64, na: usize,
+    plain: u64, n: usize, out: u64) -> bool {
+    var g: GcmKey = gcm_new(key, keylen)
+    if !g.ok {
+        return false
+    }
+    var j0: [u8; 16] = [0; 16]
+    make_j0(nonce, (&j0[0]) as u64)
+    var ctr: [u8; 16] = [0; 16]
+    var i: usize = 0
+    while i < 16 {
+        ctr[i] = j0[i]
+        i = i + 1
+    }
+    ctr[15] = 2 as u8
+    gctr(&g, (&ctr[0]) as u64, plain, n, out)
+    tag_of(&g, (&j0[0]) as u64, aad, na, out, n, out + n as u64)
+    return true
+}
+
+// `n` counts the tag. `false` means the tag did not match; the plaintext
+// is only written when it did (G3).
+fn gcm_open(key: u64, keylen: usize, nonce: u64, aad: u64, na: usize,
+    ct: u64, n: usize, out: u64) -> bool {
+    if n < GCM_TAG {
+        return false
+    }
+    var g: GcmKey = gcm_new(key, keylen)
+    if !g.ok {
+        return false
+    }
+    let clen: usize = n - GCM_TAG
+    var j0: [u8; 16] = [0; 16]
+    make_j0(nonce, (&j0[0]) as u64)
+    var want: [u8; 16] = [0; 16]
+    tag_of(&g, (&j0[0]) as u64, aad, na, ct, clen, (&want[0]) as u64)
+    if !chacha.tag_equal((&want[0]) as u64, ct + clen as u64, GCM_TAG) {
+        return false
+    }
+    var ctr: [u8; 16] = [0; 16]
+    var i: usize = 0
+    while i < 16 {
+        ctr[i] = j0[i]
+        i = i + 1
+    }
+    ctr[15] = 2 as u8
+    gctr(&g, (&ctr[0]) as u64, ct, clen, out)
+    return true
+}

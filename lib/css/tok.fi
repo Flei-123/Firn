@@ -1,0 +1,1226 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/css/tok.fi -- the CSS TOKENIZER (css-syntax-3, section 4) in Firn.
+//
+// The counterpart of lib/html/tokenizer.fi for the second language of a
+// page. It follows the algorithms of the 2021 candidate recommendation
+// draft of CSS Syntax Level 3 -- the same draft the official test data
+// (testdata/css-parsing-tests/) are written against.
+//
+// WHAT IS IN HERE (every algorithm of section 4.3):
+//   consume a token, consume comments, consume a string token,
+//   consume a numeric token, consume a number, consume an ident-like token,
+//   consume a name, consume an escaped code point, consume a url token,
+//   consume the remnants of a bad url, consume a unicode-range token,
+//   check if two code points are a valid escape,
+//   check if three code points would start an identifier,
+//   check if three code points would start a number.
+//
+// ERROR TOLERANCE IS NOT AN EXTRA -- it is the specification. A CSS
+// tokenizer never stops: an unterminated string, a broken url, a stray
+// backslash all produce a token that says what went wrong, and the
+// tokenizer carries on with the next code point. The four token kinds
+// T_BAD_STRING, T_EOF_IN_STRING, T_BAD_URL and T_EOF_IN_URL are exactly
+// those cases; the parser turns them into error nodes.
+//
+// THE STORAGE: no object per token. Six parallel columns of u32
+// (`mem.CpBuf`) hold the token; the text lies in ONE pool of code points
+// and every token names an offset and a length in it. A token therefore
+// costs 24 bytes plus its text and NOT a heap object -- the parser above
+// puts what it keeps into the GC heap, the tokenizer itself never touches
+// the collector (everything here is `#[no_gc]`, SPEC 3.5.4).
+//
+// THE NUMBER VALUE is deliberately NOT stored as a binary float. The token
+// keeps the REPRESENTATION (the source text of the number) plus the flag
+// integer/number; whoever needs a value calls `tok_number_value`, which
+// computes it from the parts. The reason is honesty of the output: the
+// value of a CSS number is by definition the value of its decimal
+// representation, and printing a binary double back as the shortest
+// round-trip decimal needs an algorithm (Ryu/Grisu) which Firn does not
+// have here. See docs/ROUND60.md.
+import html.mem
+
+export {
+    Tokens,
+    T_EOF, T_IDENT, T_FUNCTION, T_AT_KEYWORD, T_HASH, T_STRING,
+    T_BAD_STRING, T_EOF_IN_STRING, T_URL, T_BAD_URL, T_EOF_IN_URL,
+    T_DELIM, T_NUMBER, T_PERCENTAGE, T_DIMENSION, T_UNICODE_RANGE,
+    T_INCLUDE_MATCH, T_DASH_MATCH, T_PREFIX_MATCH, T_SUFFIX_MATCH,
+    T_SUBSTRING_MATCH, T_COLUMN, T_WHITESPACE, T_CDO, T_CDC,
+    T_COLON, T_SEMICOLON, T_COMMA,
+    T_OPEN_SQUARE, T_CLOSE_SQUARE, T_OPEN_ROUND, T_CLOSE_ROUND,
+    T_OPEN_CURLY, T_CLOSE_CURLY,
+    F_INTEGER, F_HASH_ID,
+    tokens_new, tokens_init, tokens_free, tokens_clear,
+    tokenize, tokenize_ptr,
+    tok_count, tok_kind, tok_value_off, tok_value_len,
+    tok_unit_off, tok_unit_len, tok_flags, tok_range_start, tok_range_end,
+    tok_pool_at, tok_pool_ptr, tok_source_length,
+    tok_value_equals_ascii, tok_value_equals_ascii_lower,
+    tok_number_value, tok_number_integer,
+    is_whitespace, is_digit, is_hex_digit, is_ident_start, is_ident_char,
+    ascii_lower,
+}
+
+// The end of the input. Same value as in the HTML tokenizer.
+const T_EOF_CP: u32 = 0xFFFFFFFF
+
+// ------------------------------------------------------------ Token kinds
+
+const T_EOF: u32 = 0
+const T_IDENT: u32 = 1
+const T_FUNCTION: u32 = 2
+const T_AT_KEYWORD: u32 = 3
+const T_HASH: u32 = 4
+const T_STRING: u32 = 5
+const T_BAD_STRING: u32 = 6
+const T_EOF_IN_STRING: u32 = 7
+const T_URL: u32 = 8
+const T_BAD_URL: u32 = 9
+const T_EOF_IN_URL: u32 = 10
+const T_DELIM: u32 = 11
+const T_NUMBER: u32 = 12
+const T_PERCENTAGE: u32 = 13
+const T_DIMENSION: u32 = 14
+const T_UNICODE_RANGE: u32 = 15
+const T_INCLUDE_MATCH: u32 = 16 // ~=
+const T_DASH_MATCH: u32 = 17 // |=
+const T_PREFIX_MATCH: u32 = 18 // ^=
+const T_SUFFIX_MATCH: u32 = 19 // $=
+const T_SUBSTRING_MATCH: u32 = 20 // *=
+const T_COLUMN: u32 = 21 // ||
+const T_WHITESPACE: u32 = 22
+const T_CDO: u32 = 23 // <!--
+const T_CDC: u32 = 24 // -->
+const T_COLON: u32 = 25
+const T_SEMICOLON: u32 = 26
+const T_COMMA: u32 = 27
+const T_OPEN_SQUARE: u32 = 28
+const T_CLOSE_SQUARE: u32 = 29
+const T_OPEN_ROUND: u32 = 30
+const T_CLOSE_ROUND: u32 = 31
+const T_OPEN_CURLY: u32 = 32
+const T_CLOSE_CURLY: u32 = 33
+
+// The flags of a token.
+const F_INTEGER: u32 = 1 // the number type is "integer", not "number"
+const F_HASH_ID: u32 = 2 // the hash type is "id", not "unrestricted"
+
+// -------------------------------------------------------- The token store
+
+// Six columns and one text pool. `src` holds the input after the
+// preprocessing of section 3.3 (line endings normalized, U+0000 replaced).
+struct Tokens {
+    kind: mem.CpBuf,
+    a0: mem.CpBuf, // the offset of the value in the pool
+    a1: mem.CpBuf, // the length of the value
+    b0: mem.CpBuf, // the offset of the unit / the start of a range
+    b1: mem.CpBuf, // the length of the unit / the end of a range
+    fl: mem.CpBuf, // F_INTEGER, F_HASH_ID
+    pool: mem.CpBuf, // all token texts, one after another
+    src: mem.CpBuf, // the preprocessed input
+}
+
+#[no_gc]
+fn tokens_new() -> Tokens {
+    return Tokens {
+        kind: mem.cp_new(), a0: mem.cp_new(), a1: mem.cp_new(),
+        b0: mem.cp_new(), b1: mem.cp_new(), fl: mem.cp_new(),
+        pool: mem.cp_new(), src: mem.cp_new(),
+    }
+}
+
+#[no_gc]
+fn tokens_init(t: *mut Tokens) {
+    mem.cp_init(&(*t).kind)
+    mem.cp_init(&(*t).a0)
+    mem.cp_init(&(*t).a1)
+    mem.cp_init(&(*t).b0)
+    mem.cp_init(&(*t).b1)
+    mem.cp_init(&(*t).fl)
+    mem.cp_init(&(*t).pool)
+    mem.cp_init(&(*t).src)
+}
+
+#[no_gc]
+fn tokens_free(t: *mut Tokens) {
+    mem.cp_free(&(*t).kind)
+    mem.cp_free(&(*t).a0)
+    mem.cp_free(&(*t).a1)
+    mem.cp_free(&(*t).b0)
+    mem.cp_free(&(*t).b1)
+    mem.cp_free(&(*t).fl)
+    mem.cp_free(&(*t).pool)
+    mem.cp_free(&(*t).src)
+}
+
+#[no_gc]
+fn tokens_clear(t: *mut Tokens) {
+    mem.cp_clear(&(*t).kind)
+    mem.cp_clear(&(*t).a0)
+    mem.cp_clear(&(*t).a1)
+    mem.cp_clear(&(*t).b0)
+    mem.cp_clear(&(*t).b1)
+    mem.cp_clear(&(*t).fl)
+    mem.cp_clear(&(*t).pool)
+    mem.cp_clear(&(*t).src)
+}
+
+#[no_gc]
+fn tok_count(t: *mut Tokens) -> usize {
+    return mem.cp_len(&(*t).kind)
+}
+
+#[no_gc]
+fn tok_kind(t: *mut Tokens, i: usize) -> u32 {
+    if i >= mem.cp_len(&(*t).kind) {
+        return T_EOF
+    }
+    return mem.cp_at(&(*t).kind, i)
+}
+
+#[no_gc]
+fn tok_value_off(t: *mut Tokens, i: usize) -> usize {
+    return mem.cp_at(&(*t).a0, i) as usize
+}
+
+#[no_gc]
+fn tok_value_len(t: *mut Tokens, i: usize) -> usize {
+    return mem.cp_at(&(*t).a1, i) as usize
+}
+
+#[no_gc]
+fn tok_unit_off(t: *mut Tokens, i: usize) -> usize {
+    return mem.cp_at(&(*t).b0, i) as usize
+}
+
+#[no_gc]
+fn tok_unit_len(t: *mut Tokens, i: usize) -> usize {
+    return mem.cp_at(&(*t).b1, i) as usize
+}
+
+#[no_gc]
+fn tok_flags(t: *mut Tokens, i: usize) -> u32 {
+    return mem.cp_at(&(*t).fl, i)
+}
+
+#[no_gc]
+fn tok_range_start(t: *mut Tokens, i: usize) -> u32 {
+    return mem.cp_at(&(*t).b0, i)
+}
+
+#[no_gc]
+fn tok_range_end(t: *mut Tokens, i: usize) -> u32 {
+    return mem.cp_at(&(*t).b1, i)
+}
+
+#[no_gc]
+fn tok_pool_at(t: *mut Tokens, off: usize) -> u32 {
+    return mem.cp_at(&(*t).pool, off)
+}
+
+#[no_gc]
+fn tok_pool_ptr(t: *mut Tokens) -> *mut u8 {
+    return mem.cp_ptr(&(*t).pool)
+}
+
+#[no_gc]
+fn tok_source_length(t: *mut Tokens) -> usize {
+    return mem.cp_len(&(*t).src)
+}
+
+// Compares the value of a token with an ASCII literal, exactly.
+#[no_gc]
+fn tok_value_equals_ascii(t: *mut Tokens, i: usize, p: u64, n: usize) -> bool {
+    if tok_value_len(t, i) != n {
+        return false
+    }
+    let off: usize = tok_value_off(t, i)
+    var k: usize = 0
+    while k < n {
+        if tok_pool_at(t, off + k) != (*((p + k as u64) as *mut u8)) as u32 {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// The same, but the token value is ASCII lowercased first. `p` has to be
+// lower case already. That is the comparison CSS keywords need.
+#[no_gc]
+fn tok_value_equals_ascii_lower(t: *mut Tokens, i: usize, p: u64, n: usize) -> bool {
+    if tok_value_len(t, i) != n {
+        return false
+    }
+    let off: usize = tok_value_off(t, i)
+    var k: usize = 0
+    while k < n {
+        if ascii_lower(tok_pool_at(t, off + k)) != (*((p + k as u64) as *mut u8)) as u32 {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------- Character categories
+
+#[no_gc]
+fn ascii_lower(c: u32) -> u32 {
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return c + 32 as u32
+    }
+    return c
+}
+
+#[no_gc]
+fn is_whitespace(c: u32) -> bool {
+    return c == 32 as u32 || c == 10 as u32 || c == 9 as u32
+}
+
+#[no_gc]
+fn is_digit(c: u32) -> bool {
+    return c >= 48 as u32 && c <= 57 as u32
+}
+
+#[no_gc]
+fn is_hex_digit(c: u32) -> bool {
+    if is_digit(c) {
+        return true
+    }
+    if c >= 65 as u32 && c <= 70 as u32 {
+        return true
+    }
+    return c >= 97 as u32 && c <= 102 as u32
+}
+
+#[no_gc]
+fn hex_value(c: u32) -> u32 {
+    if is_digit(c) {
+        return c - 48 as u32
+    }
+    if c >= 65 as u32 && c <= 70 as u32 {
+        return c - 55 as u32
+    }
+    return c - 87 as u32
+}
+
+#[no_gc]
+fn is_letter(c: u32) -> bool {
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return true
+    }
+    return c >= 97 as u32 && c <= 122 as u32
+}
+
+// "ident-start code point": a letter, a non-ASCII code point or U+005F.
+// EOF is none of them -- T_EOF_CP is above every code point, so the test
+// `c >= 0x80` has to exclude it expressly.
+#[no_gc]
+fn is_ident_start(c: u32) -> bool {
+    if c == T_EOF_CP {
+        return false
+    }
+    if is_letter(c) {
+        return true
+    }
+    if c == 95 as u32 {
+        return true
+    }
+    return c >= 0x80 as u32
+}
+
+#[no_gc]
+fn is_ident_char(c: u32) -> bool {
+    if is_ident_start(c) {
+        return true
+    }
+    if is_digit(c) {
+        return true
+    }
+    return c == 45 as u32
+}
+
+// Not allowed unescaped inside a url token (section 4.2 "non-printable").
+#[no_gc]
+fn is_non_printable(c: u32) -> bool {
+    if c == T_EOF_CP {
+        return false
+    }
+    if c <= 8 as u32 {
+        return true
+    }
+    if c == 11 as u32 {
+        return true
+    }
+    if c >= 14 as u32 && c <= 31 as u32 {
+        return true
+    }
+    return c == 127 as u32
+}
+
+// --------------------------------------------------------- The lexer state
+
+struct Lex {
+    p: u64, // the base of the preprocessed source (4 bytes per code point)
+    n: usize, // the number of code points
+    i: usize, // the reading position
+}
+
+#[no_gc]
+fn at(l: *mut Lex, k: usize) -> u32 {
+    if k >= (*l).n {
+        return T_EOF_CP
+    }
+    return *(((*l).p + k as u64 * 4) as *mut u32)
+}
+
+#[no_gc]
+fn cur(l: *mut Lex) -> u32 {
+    return at(l, (*l).i)
+}
+
+#[no_gc]
+fn ahead(l: *mut Lex, k: usize) -> u32 {
+    return at(l, (*l).i + k)
+}
+
+// "check if two code points are a valid escape". The EOF code point is NOT
+// a newline, so a backslash right before the end of the input starts a
+// valid escape -- and `consume_escape` then delivers U+FFFD. That is what
+// the standard says, and the test data check it.
+#[no_gc]
+fn valid_escape(a: u32, b: u32) -> bool {
+    if a != 92 as u32 {
+        return false
+    }
+    return b != 10 as u32
+}
+
+#[no_gc]
+fn would_start_ident(c0: u32, c1: u32, c2: u32) -> bool {
+    if c0 == 45 as u32 {
+        if is_ident_start(c1) || c1 == 45 as u32 {
+            return true
+        }
+        return valid_escape(c1, c2)
+    }
+    if is_ident_start(c0) {
+        return true
+    }
+    return valid_escape(c0, c1)
+}
+
+#[no_gc]
+fn would_start_number(c0: u32, c1: u32, c2: u32) -> bool {
+    if c0 == 43 as u32 || c0 == 45 as u32 {
+        if is_digit(c1) {
+            return true
+        }
+        return c1 == 46 as u32 && is_digit(c2)
+    }
+    if c0 == 46 as u32 {
+        return is_digit(c1)
+    }
+    return is_digit(c0)
+}
+
+// ------------------------------------------------------------- The pool
+
+#[no_gc]
+fn pool_push(t: *mut Tokens, c: u32) {
+    mem.cp_push(&(*t).pool, c)
+}
+
+#[no_gc]
+fn pool_length(t: *mut Tokens) -> usize {
+    return mem.cp_len(&(*t).pool)
+}
+
+#[no_gc]
+fn emit(t: *mut Tokens, kind: u32, a0: usize, a1: usize, b0: u32, b1: u32, fl: u32) {
+    mem.cp_push(&(*t).kind, kind)
+    mem.cp_push(&(*t).a0, a0 as u32)
+    mem.cp_push(&(*t).a1, a1 as u32)
+    mem.cp_push(&(*t).b0, b0)
+    mem.cp_push(&(*t).b1, b1)
+    mem.cp_push(&(*t).fl, fl)
+}
+
+// A token without text (delimiters, punctuation). The delimiter character
+// itself goes into the pool, so that the writer can print it.
+#[no_gc]
+fn emit_delim(t: *mut Tokens, c: u32) {
+    let off: usize = pool_length(t)
+    pool_push(t, c)
+    emit(t, T_DELIM, off, 1, 0, 0, 0)
+}
+
+#[no_gc]
+fn emit_plain(t: *mut Tokens, kind: u32) {
+    emit(t, kind, 0, 0, 0, 0, 0)
+}
+
+// --------------------------------------------------- Section 4.3.7 escapes
+
+// "consume an escaped code point". The backslash is already consumed.
+#[no_gc]
+fn consume_escape(l: *mut Lex) -> u32 {
+    let c: u32 = cur(l)
+    if c == T_EOF_CP {
+        return 0xFFFD as u32
+    }
+    (*l).i = (*l).i + 1
+    if !is_hex_digit(c) {
+        return c
+    }
+    var v: u32 = hex_value(c)
+    var k: usize = 1
+    while k < 6 && is_hex_digit(cur(l)) {
+        v = v * 16 as u32 + hex_value(cur(l))
+        (*l).i = (*l).i + 1
+        k = k + 1
+    }
+    if is_whitespace(cur(l)) {
+        (*l).i = (*l).i + 1
+    }
+    if v == 0 as u32 {
+        return 0xFFFD as u32
+    }
+    if v >= 0xD800 as u32 && v <= 0xDFFF as u32 {
+        return 0xFFFD as u32
+    }
+    if v > 0x10FFFF as u32 {
+        return 0xFFFD as u32
+    }
+    return v
+}
+
+// --------------------------------------------------- Section 4.3.11 a name
+
+// "consume a name": appends to the pool and returns the number of code
+// points appended.
+#[no_gc]
+fn consume_name(l: *mut Lex, t: *mut Tokens) -> usize {
+    var n: usize = 0
+    var next: bool = true
+    while next {
+        let c: u32 = cur(l)
+        if is_ident_char(c) {
+            (*l).i = (*l).i + 1
+            pool_push(t, c)
+            n = n + 1
+        } else if valid_escape(c, ahead(l, 1)) {
+            (*l).i = (*l).i + 1
+            pool_push(t, consume_escape(l))
+            n = n + 1
+        } else {
+            next = false
+        }
+    }
+    return n
+}
+
+// ---------------------------------------------- Section 4.3.4 string token
+
+#[no_gc]
+fn consume_string(l: *mut Lex, t: *mut Tokens, quote: u32) {
+    let off: usize = pool_length(t)
+    var n: usize = 0
+    var next: bool = true
+    while next {
+        let c: u32 = cur(l)
+        if c == T_EOF_CP {
+            // The string is emitted with what it has, and the error
+            // follows as a token of its own.
+            emit(t, T_STRING, off, n, 0, 0, 0)
+            emit_plain(t, T_EOF_IN_STRING)
+            return
+        }
+        if c == quote {
+            (*l).i = (*l).i + 1
+            emit(t, T_STRING, off, n, 0, 0, 0)
+            return
+        }
+        if c == 10 as u32 {
+            // The newline is NOT consumed: it becomes a whitespace token.
+            mem.cp_set_len(&(*t).pool, off)
+            emit_plain(t, T_BAD_STRING)
+            return
+        }
+        if c == 92 as u32 {
+            let b: u32 = ahead(l, 1)
+            if b == T_EOF_CP {
+                (*l).i = (*l).i + 1
+            } else if b == 10 as u32 {
+                (*l).i = (*l).i + 2
+            } else {
+                (*l).i = (*l).i + 1
+                pool_push(t, consume_escape(l))
+                n = n + 1
+            }
+        } else {
+            (*l).i = (*l).i + 1
+            pool_push(t, c)
+            n = n + 1
+        }
+    }
+}
+
+// ------------------------------------------ Section 4.3.14 bad url remnants
+
+#[no_gc]
+fn consume_bad_url_remnants(l: *mut Lex) {
+    var next: bool = true
+    while next {
+        let c: u32 = cur(l)
+        if c == T_EOF_CP {
+            next = false
+        } else if c == 41 as u32 {
+            (*l).i = (*l).i + 1
+            next = false
+        } else if valid_escape(c, ahead(l, 1)) {
+            (*l).i = (*l).i + 1
+            consume_escape(l)
+        } else {
+            (*l).i = (*l).i + 1
+        }
+    }
+}
+
+// ------------------------------------------------- Section 4.3.6 url token
+
+// The `url(` is already consumed.
+#[no_gc]
+fn consume_url(l: *mut Lex, t: *mut Tokens) {
+    while is_whitespace(cur(l)) {
+        (*l).i = (*l).i + 1
+    }
+    let off: usize = pool_length(t)
+    var n: usize = 0
+    var next: bool = true
+    while next {
+        let c: u32 = cur(l)
+        if c == 41 as u32 {
+            (*l).i = (*l).i + 1
+            emit(t, T_URL, off, n, 0, 0, 0)
+            return
+        }
+        if c == T_EOF_CP {
+            emit(t, T_URL, off, n, 0, 0, 0)
+            emit_plain(t, T_EOF_IN_URL)
+            return
+        }
+        if is_whitespace(c) {
+            while is_whitespace(cur(l)) {
+                (*l).i = (*l).i + 1
+            }
+            if cur(l) == 41 as u32 {
+                (*l).i = (*l).i + 1
+                emit(t, T_URL, off, n, 0, 0, 0)
+                return
+            }
+            if cur(l) == T_EOF_CP {
+                emit(t, T_URL, off, n, 0, 0, 0)
+                emit_plain(t, T_EOF_IN_URL)
+                return
+            }
+            consume_bad_url_remnants(l)
+            mem.cp_set_len(&(*t).pool, off)
+            emit_plain(t, T_BAD_URL)
+            return
+        }
+        if c == 34 as u32 || c == 39 as u32 || c == 40 as u32 || is_non_printable(c) {
+            consume_bad_url_remnants(l)
+            mem.cp_set_len(&(*t).pool, off)
+            emit_plain(t, T_BAD_URL)
+            return
+        }
+        if c == 92 as u32 {
+            if valid_escape(c, ahead(l, 1)) {
+                (*l).i = (*l).i + 1
+                pool_push(t, consume_escape(l))
+                n = n + 1
+            } else {
+                consume_bad_url_remnants(l)
+                mem.cp_set_len(&(*t).pool, off)
+                emit_plain(t, T_BAD_URL)
+                return
+            }
+        } else {
+            (*l).i = (*l).i + 1
+            pool_push(t, c)
+            n = n + 1
+        }
+    }
+}
+
+// ------------------------------------------ Section 4.3.3 ident-like token
+
+#[no_gc]
+fn is_url_name(t: *mut Tokens, off: usize, n: usize) -> bool {
+    if n != 3 {
+        return false
+    }
+    if ascii_lower(mem.cp_at(&(*t).pool, off)) != 117 as u32 {
+        return false
+    }
+    if ascii_lower(mem.cp_at(&(*t).pool, off + 1)) != 114 as u32 {
+        return false
+    }
+    return ascii_lower(mem.cp_at(&(*t).pool, off + 2)) == 108 as u32
+}
+
+#[no_gc]
+fn consume_ident_like(l: *mut Lex, t: *mut Tokens) {
+    let off: usize = pool_length(t)
+    let n: usize = consume_name(l, t)
+    if cur(l) == 40 as u32 && is_url_name(t, off, n) {
+        (*l).i = (*l).i + 1
+        // "While the next two input code points are whitespace, consume
+        // the next input code point."
+        while is_whitespace(cur(l)) && is_whitespace(ahead(l, 1)) {
+            (*l).i = (*l).i + 1
+        }
+        let c0: u32 = cur(l)
+        let c1: u32 = ahead(l, 1)
+        if c0 == 34 as u32 || c0 == 39 as u32 {
+            emit(t, T_FUNCTION, off, n, 0, 0, 0)
+            return
+        }
+        if is_whitespace(c0) && (c1 == 34 as u32 || c1 == 39 as u32) {
+            emit(t, T_FUNCTION, off, n, 0, 0, 0)
+            return
+        }
+        consume_url(l, t)
+        return
+    }
+    if cur(l) == 40 as u32 {
+        (*l).i = (*l).i + 1
+        emit(t, T_FUNCTION, off, n, 0, 0, 0)
+        return
+    }
+    emit(t, T_IDENT, off, n, 0, 0, 0)
+}
+
+// ----------------------------------------- Section 4.3.12 consume a number
+
+// Consumes a number and puts its REPRESENTATION into the pool. Returns the
+// number of code points; `integer` says whether the type is "integer".
+#[no_gc]
+fn consume_number(l: *mut Lex, t: *mut Tokens, integer: *mut bool) -> usize {
+    var n: usize = 0
+    *integer = true
+    let s: u32 = cur(l)
+    if s == 43 as u32 || s == 45 as u32 {
+        pool_push(t, s)
+        n = n + 1
+        (*l).i = (*l).i + 1
+    }
+    while is_digit(cur(l)) {
+        pool_push(t, cur(l))
+        n = n + 1
+        (*l).i = (*l).i + 1
+    }
+    if cur(l) == 46 as u32 && is_digit(ahead(l, 1)) {
+        *integer = false
+        pool_push(t, cur(l))
+        n = n + 1
+        (*l).i = (*l).i + 1
+        while is_digit(cur(l)) {
+            pool_push(t, cur(l))
+            n = n + 1
+            (*l).i = (*l).i + 1
+        }
+    }
+    let e: u32 = cur(l)
+    if e == 101 as u32 || e == 69 as u32 {
+        let e1: u32 = ahead(l, 1)
+        let e2: u32 = ahead(l, 2)
+        var take: bool = false
+        if is_digit(e1) {
+            take = true
+        } else if (e1 == 43 as u32 || e1 == 45 as u32) && is_digit(e2) {
+            take = true
+        }
+        if take {
+            *integer = false
+            pool_push(t, e)
+            n = n + 1
+            (*l).i = (*l).i + 1
+            if cur(l) == 43 as u32 || cur(l) == 45 as u32 {
+                pool_push(t, cur(l))
+                n = n + 1
+                (*l).i = (*l).i + 1
+            }
+            while is_digit(cur(l)) {
+                pool_push(t, cur(l))
+                n = n + 1
+                (*l).i = (*l).i + 1
+            }
+        }
+    }
+    return n
+}
+
+// -------------------------------------------- Section 4.3.2 numeric token
+
+#[no_gc]
+fn consume_numeric(l: *mut Lex, t: *mut Tokens) {
+    let off: usize = pool_length(t)
+    var integer: bool = true
+    let n: usize = consume_number(l, t, &integer)
+    var fl: u32 = 0
+    if integer {
+        fl = F_INTEGER
+    }
+    if would_start_ident(cur(l), ahead(l, 1), ahead(l, 2)) {
+        let uoff: usize = pool_length(t)
+        let un: usize = consume_name(l, t)
+        emit(t, T_DIMENSION, off, n, uoff as u32, un as u32, fl)
+        return
+    }
+    if cur(l) == 37 as u32 {
+        (*l).i = (*l).i + 1
+        emit(t, T_PERCENTAGE, off, n, 0, 0, fl)
+        return
+    }
+    emit(t, T_NUMBER, off, n, 0, 0, fl)
+}
+
+// ------------------------------------- Section 4.3.5 unicode-range token
+
+// The `u`/`U` is not consumed yet.
+#[no_gc]
+fn consume_unicode_range(l: *mut Lex, t: *mut Tokens) {
+    (*l).i = (*l).i + 2 // u and +
+    var start: u32 = 0
+    var digits: usize = 0
+    while digits < 6 && is_hex_digit(cur(l)) {
+        start = start * 16 as u32 + hex_value(cur(l))
+        (*l).i = (*l).i + 1
+        digits = digits + 1
+    }
+    var marks: usize = 0
+    while digits + marks < 6 && cur(l) == 63 as u32 {
+        (*l).i = (*l).i + 1
+        marks = marks + 1
+    }
+    if marks > 0 {
+        var lo: u32 = start
+        var hi: u32 = start
+        var k: usize = 0
+        while k < marks {
+            lo = lo * 16 as u32
+            hi = hi * 16 as u32 + 15 as u32
+            k = k + 1
+        }
+        emit(t, T_UNICODE_RANGE, 0, 0, lo, hi, 0)
+        return
+    }
+    if cur(l) == 45 as u32 && is_hex_digit(ahead(l, 1)) {
+        (*l).i = (*l).i + 1
+        var end: u32 = 0
+        var d2: usize = 0
+        while d2 < 6 && is_hex_digit(cur(l)) {
+            end = end * 16 as u32 + hex_value(cur(l))
+            (*l).i = (*l).i + 1
+            d2 = d2 + 1
+        }
+        emit(t, T_UNICODE_RANGE, 0, 0, start, end, 0)
+        return
+    }
+    emit(t, T_UNICODE_RANGE, 0, 0, start, start, 0)
+}
+
+// ------------------------------------------------ Section 4.3.2 comments
+
+#[no_gc]
+fn consume_comments(l: *mut Lex) {
+    var next: bool = true
+    while next {
+        if cur(l) == 47 as u32 && ahead(l, 1) == 42 as u32 {
+            (*l).i = (*l).i + 2
+            var inside: bool = true
+            while inside {
+                let c: u32 = cur(l)
+                if c == T_EOF_CP {
+                    inside = false
+                } else if c == 42 as u32 && ahead(l, 1) == 47 as u32 {
+                    (*l).i = (*l).i + 2
+                    inside = false
+                } else {
+                    (*l).i = (*l).i + 1
+                }
+            }
+        } else {
+            next = false
+        }
+    }
+}
+
+// -------------------------------------------------- Section 4.3.1 a token
+
+#[no_gc]
+fn consume_token(l: *mut Lex, t: *mut Tokens) {
+    consume_comments(l)
+    let c: u32 = cur(l)
+    if c == T_EOF_CP {
+        return
+    }
+    if is_whitespace(c) {
+        while is_whitespace(cur(l)) {
+            (*l).i = (*l).i + 1
+        }
+        emit_plain(t, T_WHITESPACE)
+        return
+    }
+    if c == 34 as u32 || c == 39 as u32 {
+        (*l).i = (*l).i + 1
+        consume_string(l, t, c)
+        return
+    }
+    if c == 35 as u32 {
+        let c1: u32 = ahead(l, 1)
+        if is_ident_char(c1) || valid_escape(c1, ahead(l, 2)) {
+            var fl: u32 = 0
+            if would_start_ident(c1, ahead(l, 2), ahead(l, 3)) {
+                fl = F_HASH_ID
+            }
+            (*l).i = (*l).i + 1
+            let off: usize = pool_length(t)
+            let n: usize = consume_name(l, t)
+            emit(t, T_HASH, off, n, 0, 0, fl)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 40 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_OPEN_ROUND)
+        return
+    }
+    if c == 41 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_CLOSE_ROUND)
+        return
+    }
+    if c == 43 as u32 {
+        if would_start_number(c, ahead(l, 1), ahead(l, 2)) {
+            consume_numeric(l, t)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 44 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_COMMA)
+        return
+    }
+    if c == 45 as u32 {
+        if would_start_number(c, ahead(l, 1), ahead(l, 2)) {
+            consume_numeric(l, t)
+            return
+        }
+        if ahead(l, 1) == 45 as u32 && ahead(l, 2) == 62 as u32 {
+            (*l).i = (*l).i + 3
+            emit_plain(t, T_CDC)
+            return
+        }
+        if would_start_ident(c, ahead(l, 1), ahead(l, 2)) {
+            consume_ident_like(l, t)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 46 as u32 {
+        if would_start_number(c, ahead(l, 1), ahead(l, 2)) {
+            consume_numeric(l, t)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 58 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_COLON)
+        return
+    }
+    if c == 59 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_SEMICOLON)
+        return
+    }
+    if c == 60 as u32 {
+        if ahead(l, 1) == 33 as u32 && ahead(l, 2) == 45 as u32 && ahead(l, 3) == 45 as u32 {
+            (*l).i = (*l).i + 4
+            emit_plain(t, T_CDO)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 64 as u32 {
+        if would_start_ident(ahead(l, 1), ahead(l, 2), ahead(l, 3)) {
+            (*l).i = (*l).i + 1
+            let off: usize = pool_length(t)
+            let n: usize = consume_name(l, t)
+            emit(t, T_AT_KEYWORD, off, n, 0, 0, 0)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 91 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_OPEN_SQUARE)
+        return
+    }
+    if c == 92 as u32 {
+        if valid_escape(c, ahead(l, 1)) {
+            consume_ident_like(l, t)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 93 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_CLOSE_SQUARE)
+        return
+    }
+    if c == 123 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_OPEN_CURLY)
+        return
+    }
+    if c == 125 as u32 {
+        (*l).i = (*l).i + 1
+        emit_plain(t, T_CLOSE_CURLY)
+        return
+    }
+    // The match tokens of Selectors: ~= |= ^= $= *= and the column ||.
+    // They exist only when the two code points stand DIRECTLY next to each
+    // other -- a comment in between splits them into two delimiters.
+    if c == 126 as u32 && ahead(l, 1) == 61 as u32 {
+        (*l).i = (*l).i + 2
+        emit_plain(t, T_INCLUDE_MATCH)
+        return
+    }
+    if c == 124 as u32 {
+        if ahead(l, 1) == 61 as u32 {
+            (*l).i = (*l).i + 2
+            emit_plain(t, T_DASH_MATCH)
+            return
+        }
+        if ahead(l, 1) == 124 as u32 {
+            (*l).i = (*l).i + 2
+            emit_plain(t, T_COLUMN)
+            return
+        }
+        (*l).i = (*l).i + 1
+        emit_delim(t, c)
+        return
+    }
+    if c == 94 as u32 && ahead(l, 1) == 61 as u32 {
+        (*l).i = (*l).i + 2
+        emit_plain(t, T_PREFIX_MATCH)
+        return
+    }
+    if c == 36 as u32 && ahead(l, 1) == 61 as u32 {
+        (*l).i = (*l).i + 2
+        emit_plain(t, T_SUFFIX_MATCH)
+        return
+    }
+    if c == 42 as u32 && ahead(l, 1) == 61 as u32 {
+        (*l).i = (*l).i + 2
+        emit_plain(t, T_SUBSTRING_MATCH)
+        return
+    }
+    if is_digit(c) {
+        consume_numeric(l, t)
+        return
+    }
+    if c == 117 as u32 || c == 85 as u32 {
+        if ahead(l, 1) == 43 as u32 {
+            let c2: u32 = ahead(l, 2)
+            if is_hex_digit(c2) || c2 == 63 as u32 {
+                consume_unicode_range(l, t)
+                return
+            }
+        }
+    }
+    if is_ident_start(c) {
+        consume_ident_like(l, t)
+        return
+    }
+    (*l).i = (*l).i + 1
+    emit_delim(t, c)
+}
+
+// -------------------------------------------------------- The entry point
+
+// Section 3.3 "preprocessing the input stream": CRLF, CR and FF become LF,
+// U+0000 becomes U+FFFD. Everything else stays.
+#[no_gc]
+fn preprocess(t: *mut Tokens, p: u64, n: usize) {
+    mem.cp_clear(&(*t).src)
+    mem.cp_reserve(&(*t).src, n + 1)
+    let target: u64 = mem.cp_ptr(&(*t).src) as u64
+    var out: usize = 0
+    var i: usize = 0
+    while i < n {
+        var c: u32 = *((p + i as u64 * 4) as *mut u32)
+        i = i + 1
+        if c == 13 as u32 {
+            if i < n && *((p + i as u64 * 4) as *mut u32) == 10 as u32 {
+                i = i + 1
+            }
+            c = 10 as u32
+        } else if c == 12 as u32 {
+            c = 10 as u32
+        } else if c == 0 as u32 {
+            c = 0xFFFD as u32
+        }
+        *((target + out as u64 * 4) as *mut u32) = c
+        out = out + 1
+    }
+    mem.cp_set_len(&(*t).src, out)
+}
+
+// Tokenizes `n` code points at `p` into `t`. The store is emptied first.
+#[no_gc]
+fn tokenize_ptr(t: *mut Tokens, p: u64, n: usize) {
+    tokens_clear(t)
+    preprocess(t, p, n)
+    var l: Lex = Lex {
+        p: mem.cp_ptr(&(*t).src) as u64,
+        n: mem.cp_len(&(*t).src),
+        i: 0,
+    }
+    var next: bool = true
+    while next {
+        consume_comments(&l)
+        if l.i >= l.n {
+            next = false
+        } else {
+            let before: usize = l.i
+            consume_token(&l, t)
+            if l.i == before {
+                // No algorithm may stand still. If one ever did, the
+                // tokenizer would hang instead of reporting -- so this
+                // check stays in, and it costs one comparison per token.
+                l.i = l.i + 1
+            }
+        }
+    }
+}
+
+#[no_gc]
+fn tokenize(t: *mut Tokens, input: *mut mem.CpBuf) {
+    tokenize_ptr(t, mem.cp_ptr(input) as u64, mem.cp_len(input))
+}
+
+// ------------------------------------------------------- The number value
+
+// The numeric value of a number token, computed from its representation
+// per section 4.3.13: value = s * (i + f * 10^-d) * 10^(t * e).
+#[no_gc]
+fn tok_number_value(t: *mut Tokens, i: usize) -> f64 {
+    let off: usize = tok_value_off(t, i)
+    let n: usize = tok_value_len(t, i)
+    var k: usize = 0
+    var sign: f64 = 1.0
+    if k < n {
+        let c: u32 = tok_pool_at(t, off)
+        if c == 45 as u32 {
+            // LANGUAGE GAP (round 60): `-1.0` is rejected -- the unary
+            // minus of stage 0 works on integers only. `0.0 - 1.0` it is.
+            sign = 0.0 - 1.0
+            k = 1
+        } else if c == 43 as u32 {
+            k = 1
+        }
+    }
+    var whole: f64 = 0.0
+    while k < n && is_digit(tok_pool_at(t, off + k)) {
+        whole = whole * 10.0 + (tok_pool_at(t, off + k) - 48 as u32) as f64
+        k = k + 1
+    }
+    if k < n && tok_pool_at(t, off + k) == 46 as u32 {
+        k = k + 1
+        var scale: f64 = 0.1
+        while k < n && is_digit(tok_pool_at(t, off + k)) {
+            whole = whole + (tok_pool_at(t, off + k) - 48 as u32) as f64 * scale
+            scale = scale * 0.1
+            k = k + 1
+        }
+    }
+    var value: f64 = sign * whole
+    if k < n {
+        let e: u32 = tok_pool_at(t, off + k)
+        if e == 101 as u32 || e == 69 as u32 {
+            k = k + 1
+            var esign: i64 = 1
+            if k < n && tok_pool_at(t, off + k) == 45 as u32 {
+                esign = -1
+                k = k + 1
+            } else if k < n && tok_pool_at(t, off + k) == 43 as u32 {
+                k = k + 1
+            }
+            var ev: i64 = 0
+            while k < n && is_digit(tok_pool_at(t, off + k)) {
+                if ev < 1000 {
+                    ev = ev * 10 + (tok_pool_at(t, off + k) - 48 as u32) as i64
+                }
+                k = k + 1
+            }
+            var c2: i64 = 0
+            while c2 < ev {
+                if esign > 0 {
+                    value = value * 10.0
+                } else {
+                    value = value / 10.0
+                }
+                c2 = c2 + 1
+            }
+        }
+    }
+    return value
+}
+
+// The value of an integer number token as i64 (An+B needs exactly that).
+#[no_gc]
+fn tok_number_integer(t: *mut Tokens, i: usize) -> i64 {
+    let off: usize = tok_value_off(t, i)
+    let n: usize = tok_value_len(t, i)
+    var k: usize = 0
+    var sign: i64 = 1
+    if k < n {
+        let c: u32 = tok_pool_at(t, off)
+        if c == 45 as u32 {
+            sign = -1
+            k = 1
+        } else if c == 43 as u32 {
+            k = 1
+        }
+    }
+    var v: i64 = 0
+    while k < n && is_digit(tok_pool_at(t, off + k)) {
+        if v < 1000000000 {
+            v = v * 10 + (tok_pool_at(t, off + k) - 48 as u32) as i64
+        }
+        k = k + 1
+    }
+    return sign * v
+}

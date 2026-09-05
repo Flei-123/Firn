@@ -1,0 +1,581 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/dom/b1_dom_main.fi -- the driver for the DOM and the style tree (round B1).
+//
+// HTML in, ANSWERS TO QUESTIONS out. The questions are the ones a DOM has
+// to be able to answer, and they are asked as plain lines so a runner can
+// compare them line by line:
+//
+//   id <value>            document.getElementById
+//   tag <name>            getElementsByTagName ("*" = every element)
+//   class <value>         getElementsByClassName
+//   q <selector>          querySelector
+//   qa <selector>         querySelectorAll
+//   text <index>          textContent
+//   inner <index>         innerHTML (reading)
+//   outer <index>         outerHTML (reading)
+//   attr <index> <name> [ns]  getAttribute; `ns` is the NS_* number of
+//                         lib/browser/node.fi (4 = XLink, 5 = XML), 0 or
+//                         missing = the null namespace
+//   count                 the number of elements
+//   style <index>         the computed style, the fields in a fixed order
+//
+// `<index>` is the position of the element in document order, from 0.
+// The answer to a search is either `-1` or a list of indices.
+//
+// The job format (little-endian):
+//     u32 n ; u8[n]   the HTML document (WTF-8)
+//     u32 n ; u8[n]   a USER stylesheet (may be empty) -- the origin between
+//                     the default stylesheet and the author
+//     u32 n ; u8[n]   the questions, one per line
+// The answer per job: one line per question, then `#END`.
+//
+// Compile with:  firnc -o build/b1dom lib/dom/b1_dom_main.fi
+
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+import dom.api
+import dom.style
+
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn lit(out: *mut mem.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn nl(out: *mut mem.Buf) {
+    mem.buf_push(out, 10 as u8)
+}
+
+#[no_gc]
+fn space(out: *mut mem.Buf) {
+    mem.buf_push(out, 32 as u8)
+}
+
+#[no_gc]
+fn hex_digit(v: u32) -> u8 {
+    if v < 10 as u32 {
+        return (48 as u32 + v) as u8
+    }
+    return (87 as u32 + v) as u8
+}
+
+#[no_gc]
+fn out_hex8(out: *mut mem.Buf, v: u32) {
+    var i: i64 = 7
+    while i >= 0 {
+        mem.buf_push(out, hex_digit((v >> (i as u32 * 4 as u32)) & 15 as u32))
+        i = i - 1
+    }
+}
+
+#[no_gc]
+fn out_i64(out: *mut mem.Buf, v: i64) {
+    if v < 0 {
+        mem.buf_push(out, 45 as u8)
+        mem.buf_push_dec(out, (0 - v) as u64)
+    } else {
+        mem.buf_push_dec(out, v as u64)
+    }
+}
+
+// Three decimal places -- enough for computed lengths, and Firn has no
+// shortest round trip printer.
+#[no_gc]
+fn out_fixed(out: *mut mem.Buf, v: f64) {
+    var x: f64 = v
+    var negative: bool = false
+    if x < 0.0 {
+        negative = true
+        x = 0.0 - x
+    }
+    let scaled: i64 = (x * 1000.0 + 0.5) as i64
+    if negative && scaled != 0 {
+        mem.buf_push(out, 45 as u8)
+    }
+    mem.buf_push_dec(out, (scaled / 1000) as u64)
+    mem.buf_push(out, 46 as u8)
+    let rest: i64 = scaled % 1000
+    mem.buf_push(out, (48 + rest / 100) as u8)
+    mem.buf_push(out, (48 + (rest / 10) % 10) as u8)
+    mem.buf_push(out, (48 + rest % 10) as u8)
+}
+
+// A code point buffer out of a byte range (WTF-8).
+#[no_gc]
+fn cp_out_bytes(ins: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = mem.buf_at(ins, off + i) as u32
+        if c0 < 0x80 as u32 {
+            mem.cp_push(out, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 {
+            mem.cp_push(out, ((c0 & 0x07 as u32) << 18) |
+                ((mem.buf_at(ins, off + i + 1) as u32 & 0x3F as u32) << 12) |
+                ((mem.buf_at(ins, off + i + 2) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(ins, off + i + 3) as u32 & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 {
+            mem.cp_push(out, ((c0 & 0x0F as u32) << 12) |
+                ((mem.buf_at(ins, off + i + 1) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(ins, off + i + 2) as u32 & 0x3F as u32))
+            i = i + 3
+        } else {
+            mem.cp_push(out, ((c0 & 0x1F as u32) << 6) |
+                (mem.buf_at(ins, off + i + 1) as u32 & 0x3F as u32))
+            i = i + 2
+        }
+    }
+}
+
+// The index of an element in document order, or -1.
+fn index_of(doc: Gc[Node], k: Gc[Node]) -> i64 {
+    if k == gc_null[Node]() {
+        return -1
+    }
+    var i: i64 = 0
+    var e: Gc[Elem] = api.dom_first_elem(doc)
+    while e != gc_null[Elem]() {
+        if e as u64 == k as u64 {
+            return i
+        }
+        i = i + 1
+        e = api.dom_next_elem(e, doc)
+    }
+    return -1
+}
+
+fn out_list(out: *mut mem.Buf, doc: Gc[Node], v: Gc[GcVec]) {
+    let n: u64 = gcvec_length(v)
+    mem.buf_push_dec(out, n)
+    var i: u64 = 0
+    while i < n {
+        space(out)
+        let e: Gc[Elem] = gcvec_read[Elem](v, i)
+        out_i64(out, index_of(doc, e))
+        i = i + 1
+    }
+}
+
+// A selector out of a code point buffer.
+fn parse_selector(t: *mut tok.Tokens, text: *mut mem.CpBuf,
+    nm: *mut names.Names, tmp: *mut mem.CpBuf) -> Gc[Sel] {
+    tok.tokenize(t, text)
+    var p: cv.Parser = cv.parser_new(t)
+    let values = cv.parse_component_value_list(&p) catch gc_null[Cv]()
+    return sel.sel_parse(values, nm, tmp) catch gc_null[Sel]()
+}
+
+// The word `k` of a command line, as code points.
+#[no_gc]
+fn word_of(line: *mut mem.CpBuf, k: usize, out: *mut mem.CpBuf) -> bool {
+    mem.cp_clear(out)
+    let n: usize = mem.cp_len(line)
+    var i: usize = 0
+    var number: usize = 0
+    while i < n {
+        while i < n && mem.cp_at(line, i) == 32 as u32 {
+            i = i + 1
+        }
+        if i >= n {
+            return false
+        }
+        var j: usize = i
+        while j < n && mem.cp_at(line, j) != 32 as u32 {
+            j = j + 1
+        }
+        if number == k {
+            var x: usize = i
+            while x < j {
+                mem.cp_push(out, mem.cp_at(line, x))
+                x = x + 1
+            }
+            return true
+        }
+        number = number + 1
+        i = j
+    }
+    return false
+}
+
+// Everything from word `k` on -- a selector may contain spaces.
+#[no_gc]
+fn rest_of(line: *mut mem.CpBuf, k: usize, out: *mut mem.CpBuf) -> bool {
+    mem.cp_clear(out)
+    let n: usize = mem.cp_len(line)
+    var i: usize = 0
+    var number: usize = 0
+    while i < n {
+        while i < n && mem.cp_at(line, i) == 32 as u32 {
+            i = i + 1
+        }
+        if i >= n {
+            return false
+        }
+        if number == k {
+            var x: usize = i
+            while x < n {
+                mem.cp_push(out, mem.cp_at(line, x))
+                x = x + 1
+            }
+            return true
+        }
+        var j: usize = i
+        while j < n && mem.cp_at(line, j) != 32 as u32 {
+            j = j + 1
+        }
+        number = number + 1
+        i = j
+    }
+    return false
+}
+
+#[no_gc]
+fn cp_number(b: *mut mem.CpBuf) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    let n: usize = mem.cp_len(b)
+    if n == 0 {
+        return -1
+    }
+    while i < n {
+        let c: u32 = mem.cp_at(b, i)
+        if c < 48 as u32 || c > 57 as u32 {
+            return -1
+        }
+        v = v * 10 + (c as i64 - 48)
+        i = i + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn cp_is(b: *mut mem.CpBuf, p: *mut u8, n: usize) -> bool {
+    if mem.cp_len(b) != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if mem.cp_at(b, i) != (*((p as u64 + i as u64) as *mut u8)) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn out_chain(out: *mut mem.Buf, k: Gc[Chain]) {
+    if k == gc_null[Chain]() {
+        return
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            api_cp(out, s.chars[i])
+            i = i + 1
+        }
+        s = s.next
+    }
+}
+
+#[no_gc]
+fn api_cp(out: *mut mem.Buf, c: u32) {
+    if c < 0x80 as u32 {
+        mem.buf_push(out, c as u8)
+    } else if c < 0x800 as u32 {
+        mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else if c < 0x10000 as u32 {
+        mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else {
+        mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    }
+}
+
+fn out_length(out: *mut mem.Buf, st: Gc[Style], slot: usize) {
+    let u: u32 = cascade.style_unit(st, slot)
+    if u == cascade.U_AUTO {
+        var l: [u8; 4] = "auto"
+        lit(out, &l[0], 4)
+        return
+    }
+    out_fixed(out, cascade.style_length(st, slot))
+    if u == cascade.U_PERCENT {
+        mem.buf_push(out, 37 as u8)
+    }
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    var sty: style.Styler = style.styler_new(driver.run_names(&run))
+    style.styler_init(&sty)
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var line: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&line)
+    var arg: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&arg)
+    var tmp: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&tmp)
+
+    var ins: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&ins)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+
+    let total: usize = mem.buf_len(&ins)
+    var off: usize = 0
+    while off + 12 <= total {
+        let n_html: usize = read_u32(&ins, off) as usize
+        let o_html: usize = off + 4
+        let n_css: usize = read_u32(&ins, o_html + n_html) as usize
+        let o_css: usize = o_html + n_html + 4
+        let n_ask: usize = read_u32(&ins, o_css + n_css) as usize
+        let o_ask: usize = o_css + n_css + 4
+        off = o_ask + n_ask
+
+        driver.run_text_out_bytes(&run,
+            ((mem.buf_ptr(&ins) as u64) + o_html as u64) as *mut u8, n_html)
+        driver.run_context_out_bytes(&run, 0 as *mut u8, 0)
+        let rc: u32 = driver.run_document_build(&run)
+        if rc != 0 as u32 {
+            var broken: [u8; 8] = "#BROKEN "
+            lit(&out, &broken[0], 8)
+            mem.buf_push_dec(&out, rc as u64)
+            nl(&out)
+        }
+        let doc: Gc[Node] = driver.run_document(&run)
+        let nm: *mut names.Names = driver.run_names(&run)
+
+        style.styler_reset(&sty)
+        if n_css > 0 {
+            let ok: bool = style.style_add_sheet(&sty, cascade.ORIGIN_USER,
+                ((mem.buf_ptr(&ins) as u64) + o_css as u64) as *mut u8, n_css, nm)
+            catch false
+        }
+        let styled: bool = style.style_document(&sty, doc, nm)
+        if !styled {
+            var bs: [u8; 12] = "#BROKENSTYLE"
+            lit(&out, &bs[0], 12)
+            nl(&out)
+        }
+
+        // ---- the questions
+        var from: usize = o_ask
+        var i: usize = o_ask
+        let ask_end: usize = o_ask + n_ask
+        while i <= ask_end {
+            let at_end: bool = i == ask_end
+            var newline: bool = at_end
+            if !at_end {
+                newline = mem.buf_at(&ins, i) == 10 as u8
+            }
+            if newline {
+                if i > from {
+                    cp_out_bytes(&ins, from, i - from, &line)
+                    answer(&out, &line, &arg, &tmp, doc, nm, &sty, &t)
+                }
+                from = i + 1
+            }
+            i = i + 1
+        }
+        var e: [u8; 5] = "#END\n"
+        lit(&out, &e[0], 5)
+        if mem.buf_len(&out) > 65536 {
+            mem.buf_flush(&out, 1)
+        }
+        driver.run_tree_release(&run)
+        style.styler_reset(&sty)
+    }
+    mem.buf_flush(&out, 1)
+    driver.run_free(&run)
+    return 0
+}
+
+fn answer(out: *mut mem.Buf, line: *mut mem.CpBuf, arg: *mut mem.CpBuf,
+    tmp: *mut mem.CpBuf, doc: Gc[Node], nm: *mut names.Names,
+    sty: *mut style.Styler, t: *mut tok.Tokens) {
+    if !word_of(line, 0, arg) {
+        return
+    }
+    var w_id: [u8; 2] = "id"
+    var w_tag: [u8; 3] = "tag"
+    var w_class: [u8; 5] = "class"
+    var w_q: [u8; 1] = "q"
+    var w_qa: [u8; 2] = "qa"
+    var w_text: [u8; 4] = "text"
+    var w_inner: [u8; 5] = "inner"
+    var w_outer: [u8; 5] = "outer"
+    var w_attr: [u8; 4] = "attr"
+    var w_count: [u8; 5] = "count"
+    var w_style: [u8; 5] = "style"
+    var w_star: [u8; 1] = "*"
+
+    if cp_is(arg, &w_count[0], 5) {
+        mem.buf_push_dec(out, api.dom_elem_count(doc))
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_id[0], 2) {
+        let ok: bool = rest_of(line, 1, tmp)
+        var attr_id: [u8; 2] = "id"
+        let id_atom: u32 = names.names_of_bytes(nm, &attr_id[0], 2)
+        let e: Gc[Elem] = api.dom_by_id(doc, id_atom, tmp)
+        out_i64(out, index_of(doc, e))
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_tag[0], 3) {
+        let ok: bool = word_of(line, 1, tmp)
+        var name: u32 = 0
+        if !cp_is(tmp, &w_star[0], 1) {
+            name = names.names_of_cp(nm, tmp)
+        }
+        let v = api.dom_by_tag(doc, name) catch gc_null[GcVec]()
+        out_list(out, doc, v)
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_class[0], 5) {
+        let ok: bool = word_of(line, 1, tmp)
+        var attr_class: [u8; 5] = "class"
+        let atom: u32 = names.names_of_bytes(nm, &attr_class[0], 5)
+        let v = api.dom_by_class(doc, atom, tmp) catch gc_null[GcVec]()
+        out_list(out, doc, v)
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_q[0], 1) || cp_is(arg, &w_qa[0], 2) {
+        let ok: bool = rest_of(line, 1, tmp)
+        var scratch: mem.CpBuf = mem.cp_new()
+        mem.cp_init(&scratch)
+        let s: Gc[Sel] = parse_selector(t, tmp, nm, &scratch)
+        mem.cp_free(&scratch)
+        if s == gc_null[Sel]() {
+            var inv: [u8; 7] = "invalid"
+            lit(out, &inv[0], 7)
+            nl(out)
+            return
+        }
+        if cp_is(arg, &w_q[0], 1) {
+            let e: Gc[Elem] = api.dom_query(doc, s, style.styler_ctx(sty))
+            out_i64(out, index_of(doc, e))
+        } else {
+            let v = api.dom_query_all(doc, s, style.styler_ctx(sty))
+            catch gc_null[GcVec]()
+            out_list(out, doc, v)
+        }
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_text[0], 4) {
+        let ok: bool = word_of(line, 1, tmp)
+        let k: Gc[Elem] = api.dom_elem_at(doc, cp_number(tmp) as u64)
+        let c = api.dom_text_content(k) catch gc_null[Chain]()
+        out_chain(out, c)
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_inner[0], 5) {
+        let ok: bool = word_of(line, 1, tmp)
+        let k: Gc[Elem] = api.dom_elem_at(doc, cp_number(tmp) as u64)
+        api.dom_inner_html(k, nm, out)
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_outer[0], 5) {
+        let ok: bool = word_of(line, 1, tmp)
+        let k: Gc[Elem] = api.dom_elem_at(doc, cp_number(tmp) as u64)
+        api.dom_outer_html(k, nm, out)
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_attr[0], 4) {
+        let ok: bool = word_of(line, 1, tmp)
+        let k: Gc[Elem] = api.dom_elem_at(doc, cp_number(tmp) as u64)
+        let ok2: bool = word_of(line, 2, tmp)
+        let atom: u32 = names.names_of_cp(nm, tmp)
+        var ans: u32 = 0
+        if word_of(line, 3, tmp) {
+            let x: i64 = cp_number(tmp)
+            if x > 0 {
+                ans = x as u32
+            }
+        }
+        let v: Gc[Chain] = api.dom_attr_get(k, atom, ans)
+        if v == gc_null[Chain]() {
+            var no: [u8; 4] = "null"
+            lit(out, &no[0], 4)
+        } else {
+            out_chain(out, v)
+        }
+        nl(out)
+        return
+    }
+    if cp_is(arg, &w_style[0], 5) {
+        let ok: bool = word_of(line, 1, tmp)
+        let k: Gc[Elem] = api.dom_elem_at(doc, cp_number(tmp) as u64)
+        let st: Gc[Style] = style.style_of(sty, k)
+        if st == gc_null[Style]() {
+            var no: [u8; 4] = "null"
+            lit(out, &no[0], 4)
+            nl(out)
+            return
+        }
+        mem.buf_push_dec(out, cascade.style_display(st) as u64)
+        space(out)
+        out_hex8(out, cascade.style_color(st, 0))
+        space(out)
+        out_fixed(out, cascade.style_font_size(st))
+        var slot: usize = 0
+        while slot < 8 {
+            space(out)
+            out_length(out, st, slot)
+            slot = slot + 1
+        }
+        space(out)
+        mem.buf_push_dec(out, cascade.style_text_align(st) as u64)
+        space(out)
+        mem.buf_push_dec(out, cascade.style_white_space(st) as u64)
+        nl(out)
+        return
+    }
+    var un: [u8; 8] = "#UNKNOWN"
+    lit(out, &un[0], 8)
+    nl(out)
+}

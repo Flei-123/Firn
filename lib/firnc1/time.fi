@@ -1,0 +1,721 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/time.fi -- THE COMPTIME INTERPRETER (round 35).
+//
+// Port of `compiler/src/comptime.rs`: runs `comptime { ... }` blocks
+// at COMPILE TIME. What they write through `emit_raw`/`emit_number` is
+// FIRN SOURCE TEXT, which the very same run can lex, parse and append to the
+// program -- after that the type checker sees no difference to handwritten
+// source text (SPEC 6.4, acceptance point 6).
+//
+// SCOPE (like stage 0): integers and bool; let/var, assignment to local
+//   variables, if/else, while, for, break, continue, return, blocks; all
+//   operators, with short circuiting for &&/||; calls to other functions of
+//   the program (recursive ones too); the intrinsics `emit_raw`,
+//   `emit_number`, `file_size` and `file_byte`.
+//
+// LIMITS (like stage 0): at most MAX_STEPS executed statements and
+// MAX_DEPTH nested calls -- a comptime must not hang the
+// compiler. No pointers, arrays, structs, syscall, floating point.
+//
+// DIFFERENCES TO STAGE 0, honestly stated:
+//   * values are i64, not i128 -- shift widths are 0..63.
+//   * `x as T` passes the value through: stage 0 reads the target type from
+//     the type entries of the type checker, which are still EMPTY while the
+//     block runs, and falls back to i64 there too (comptime.rs, ExprKind::Cast).
+//   * `emit_raw` does not check UTF-8 -- invalid bytes are reported by the
+//     lexer of the generated text one stage later, with a better location.
+//
+// SECURITY (DESIGN_GOALS 3, supply chain): `file_*` reads ONLY relative to the
+// root source file -- no absolute path, no `..` as a path piece.
+
+import rt
+import vec
+import intern
+import ast
+
+export { Time, time_new, time_free, time_run, time_error, time_output }
+
+const MAX_STEPS: u64 = 2000000
+const MAX_DEPTH: i64 = 64
+
+// Result of an executed statement (Flow in comptime.rs).
+const F_NEXT: u32 = 0
+const F_RET: u32 = 1
+const F_BREAK: u32 = 2
+const F_CONT: u32 = 3
+
+// unary operators (parser.fi)
+const U_NEG: u32 = 0
+const U_NOT: u32 = 1
+const U_BITNOT: u32 = 4
+
+// binary operators (parser.fi)
+const B_ADD: u32 = 0
+const B_SUB: u32 = 1
+const B_MUL: u32 = 2
+const B_DIV: u32 = 3
+const B_REM: u32 = 4
+const B_AND: u32 = 5
+const B_OR: u32 = 6
+const B_XOR: u32 = 7
+const B_SHL: u32 = 8
+const B_SHR: u32 = 9
+const B_EQ: u32 = 10
+const B_NE: u32 = 11
+const B_LT: u32 = 12
+const B_LE: u32 = 13
+const B_GT: u32 = 14
+const B_GE: u32 = 15
+const B_LAND: u32 = 16
+const B_LOR: u32 = 17
+// ROUND 72 (ast.rs::BinOp) -- the explicit wrap/saturate forms.
+const B_ADDWRAP: u32 = 18
+const B_SUBWRAP: u32 = 19
+const B_MULWRAP: u32 = 20
+
+struct Time {
+    tree: u64, // *mut ast.Tree
+    it: u64, // *mut intern.Interner
+    output: rt.Buf, // the source text built up by emit_*
+    base: rt.Buf, // directory of the root source file (with slash)
+    steps: u64,
+    ret: i64, // return value, if the flow is F_RET
+    err: usize,
+    // ENVIRONMENT: a flat stack of (name, value); `flimit` holds the
+    // start of each scope. The search runs top down -- a newer
+    // entry of the same name shadows the older one (like the HashMap stacks
+    // in comptime.rs).
+    uname: Vec[u32],
+    uvalue: Vec[i64],
+    flimit: Vec[u32],
+    // FILE CACHE: read once, after that byte by byte from
+    // `dalle`. Names and contents each live in ONE buffer (append only,
+    // never modified -- which is why offset and length are enough).
+    dnames: rt.Buf,
+    doff: Vec[u32],
+    dlen: Vec[u32],
+    dalle: rt.Buf,
+    ioff: Vec[u32],
+    ilen: Vec[u32],
+    // Interned numbers of the intrinsics, fetched once at creation.
+    n_emit_raw: u32,
+    n_emit_number: u32,
+    n_size: u32,
+    n_byte: u32,
+}
+
+fn time_new(tree: u64, it: u64, base: u64, base_n: usize) -> Time {
+    var z: Time = Time {
+        tree: tree, it: it,
+        output: rt.buf_new(), base: rt.buf_new(),
+        steps: 0, ret: 0, err: 0,
+        uname: vec_new[u32](), uvalue: vec_new[i64](), flimit: vec_new[u32](),
+        dnames: rt.buf_new(), doff: vec_new[u32](), dlen: vec_new[u32](),
+        dalle: rt.buf_new(), ioff: vec_new[u32](), ilen: vec_new[u32](),
+        n_emit_raw: 0, n_emit_number: 0, n_size: 0, n_byte: 0,
+    }
+    rt.buf_push_bytes(&z.base, base, base_n)
+    let ip: *mut intern.Interner = it as *mut intern.Interner
+    var w1: [u8; 8] = "emit_raw"
+    var w2: [u8; 11] = "emit_number"
+    var w3: [u8; 9] = "file_size"
+    var w4: [u8; 9] = "file_byte"
+    z.n_emit_raw = intern.intern_number(ip, (&w1[0]) as u64, 8) as u32
+    z.n_emit_number = intern.intern_number(ip, (&w2[0]) as u64, 11) as u32
+    z.n_size = intern.intern_number(ip, (&w3[0]) as u64, 9) as u32
+    z.n_byte = intern.intern_number(ip, (&w4[0]) as u64, 9) as u32
+    return z
+}
+
+fn time_free(z: *mut Time) {
+    rt.buf_free(&(*z).output)
+    rt.buf_free(&(*z).base)
+    vec_free[u32](&(*z).uname)
+    vec_free[i64](&(*z).uvalue)
+    vec_free[u32](&(*z).flimit)
+    rt.buf_free(&(*z).dnames)
+    vec_free[u32](&(*z).doff)
+    vec_free[u32](&(*z).dlen)
+    rt.buf_free(&(*z).dalle)
+    vec_free[u32](&(*z).ioff)
+    vec_free[u32](&(*z).ilen)
+}
+
+fn time_error(z: *mut Time) -> usize { return (*z).err }
+fn time_output(z: *mut Time) -> *mut rt.Buf { return &(*z).output }
+
+// Reports an error: "comptime: <msg>" on stderr, then counts it. Stage 0
+// reports the source position too; the tree of this stage carries no
+// positions, so the plain message has to do.
+fn broken(z: *mut Time, msg: u64, n: usize) {
+    if (*z).err == 0 {
+        var header: [u8; 10] = "comptime: "
+        rt.write_everything(2, (&header[0]) as u64, 10)
+        rt.write_everything(2, msg, n)
+        var nl: [u8; 1] = "\n"
+        rt.write_everything(2, (&nl[0]) as u64, 1)
+    }
+    (*z).err = (*z).err + 1
+}
+
+// --------------------------------------------------------- environment
+
+fn frame_on(z: *mut Time) {
+    vec_push[u32](&(*z).flimit, vec_len[u32](&(*z).uname) as u32)
+}
+
+// There is no `vec_truncate` in the runtime (lib/rt/vec.fi) -- so this
+// pops down to the target size. The scope only ever shrinks by what
+// `frame_on` just opened, so this loop is bounded.
+fn frame_off(z: *mut Time) {
+    let start: u32 = vec_at[u32](&(*z).flimit, vec_len[u32](&(*z).flimit) - 1)
+    while vec_len[u32](&(*z).uname) > start as usize {
+        vec_pop[u32](&(*z).uname)
+        vec_pop[i64](&(*z).uvalue)
+    }
+    vec_pop[u32](&(*z).flimit)
+}
+
+fn set_local(z: *mut Time, name: u32, value: i64) {
+    vec_push[u32](&(*z).uname, name)
+    vec_push[i64](&(*z).uvalue, value)
+}
+
+// Searches TOP DOWN (newest entry first) and returns the slot in
+// `uvalue`, or -1.
+fn slot_search(z: *mut Time, name: u32) -> i64 {
+    var i: i64 = vec_len[u32](&(*z).uname) as i64 - 1
+    while i >= 0 {
+        if vec_at[u32](&(*z).uname, i as usize) == name {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// --------------------------------------------------------------- files
+
+// Reads a data file -- ONCE, after that from the cache. Returns
+// the slot in ioff/ilen, or -1 (the error has been reported by then).
+//
+// SECURITY (DESIGN_GOALS 3): only RELATIVE to the root source file, no
+// absolute path, no `..` as a path piece -- a library pulled into the build
+// must not break out of its directory.
+fn read_file(z: *mut Time, path: u64, n: usize) -> i64 {
+    var m1: [u8; 47] = "empty file name                                "
+    if n == 0 {
+        broken(z, (&m1[0]) as u64, 15)
+        return -1
+    }
+    if rt.ld8(path, 0) == 47 as u8 {
+        var m2: [u8; 68] = "absolute path — only paths relative to the source file are allowed"
+        broken(z, (&m2[0]) as u64, 68)
+        return -1
+    }
+    if rt.ld8(path, 0) == 92 as u8 {
+        var m2b: [u8; 68] = "absolute path — only paths relative to the source file are allowed"
+        broken(z, (&m2b[0]) as u64, 68)
+        return -1
+    }
+    // `..` as a whole path element is forbidden (`a..b` is fine).
+    var i: usize = 0
+    while i < n {
+        var j: usize = i
+        while j < n {
+            if rt.ld8(path, j) == 47 as u8 {
+                break
+            }
+            j = j + 1
+        }
+        if j - i == 2 {
+            if rt.ld8(path, i) == 46 as u8 {
+                if rt.ld8(path, i + 1) == 46 as u8 {
+                    var m3: [u8; 73] = "'..' in the path — access stays inside the directory of the source file"
+                    broken(z, (&m3[0]) as u64, 73)
+                    return -1
+                }
+            }
+        }
+        i = j + 1
+    }
+    // Already read?
+    var k: usize = 0
+    while k < vec_len[u32](&(*z).doff) {
+        if vec_at[u32](&(*z).dlen, k) as usize == n {
+            let anf: u64 = rt.buf_ptr(&(*z).dnames) + vec_at[u32](&(*z).doff, k) as u64
+            if rt.mem_eq(anf, path, n) {
+                return k as i64
+            }
+        }
+        k = k + 1
+    }
+    // Reading: <base><path>\0
+    var full: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&full)
+    rt.buf_push_bytes(&full, rt.buf_ptr(&(*z).base), rt.buf_len(&(*z).base))
+    rt.buf_push_bytes(&full, path, n)
+    rt.buf_push(&full, 0 as u8)
+    var content: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&content)
+    if !rt.read_file(rt.buf_ptr(&full), &content) {
+        var m4: [u8; 17] = "file not readable"
+        broken(z, (&m4[0]) as u64, 17)
+        return -1
+    }
+    let slot: u32 = vec_len[u32](&(*z).doff) as u32
+    vec_push[u32](&(*z).doff, rt.buf_len(&(*z).dnames) as u32)
+    vec_push[u32](&(*z).dlen, n as u32)
+    rt.buf_push_bytes(&(*z).dnames, path, n)
+    vec_push[u32](&(*z).ioff, rt.buf_len(&(*z).dalle) as u32)
+    vec_push[u32](&(*z).ilen, rt.buf_len(&content) as u32)
+    rt.buf_push_bytes(&(*z).dalle, rt.buf_ptr(&content), rt.buf_len(&content))
+    return slot as i64
+}
+
+// -------------------------------------------------------- expressions
+
+fn compute(z: *mut Time, op: u32, a: i64, b: i64) -> i64 {
+    if op == B_ADD { return a + b }
+    if op == B_SUB { return a - b }
+    if op == B_MUL { return a * b }
+    if op == B_DIV {
+        if b == 0 {
+            var m: [u8; 16] = "division by zero"
+            broken(z, (&m[0]) as u64, 16)
+            return 0
+        }
+        return a / b
+    }
+    if op == B_REM {
+        if b == 0 {
+            var m: [u8; 29] = "remainder on division by zero"
+            broken(z, (&m[0]) as u64, 29)
+            return 0
+        }
+        return a % b
+    }
+    if op == B_AND { return a & b }
+    if op == B_OR { return a | b }
+    if op == B_XOR { return a ^ b }
+    if op == B_SHL {
+        if b < 0 { return offset_error(z) }
+        if b > 63 { return offset_error(z) }
+        return a << b as u64
+    }
+    if op == B_SHR {
+        if b < 0 { return offset_error(z) }
+        if b > 63 { return offset_error(z) }
+        return a >> b as u64
+    }
+    if op == B_EQ { if a == b { return 1 } return 0 }
+    if op == B_NE { if a != b { return 1 } return 0 }
+    if op == B_LT { if a < b { return 1 } return 0 }
+    if op == B_LE { if a <= b { return 1 } return 0 }
+    if op == B_GT { if a > b { return 1 } return 0 }
+    if op == B_GE { if a >= b { return 1 } return 0 }
+    if op == B_LAND { if a != 0 { if b != 0 { return 1 } } return 0 }
+    if op == B_LOR { if a != 0 { return 1 } if b != 0 { return 1 } return 0 }
+    // ROUND 72: `+% -% *%` at compile time. The interpreter computes in
+    // i64 throughout, so wrapping is what plain arithmetic already does
+    // here -- and `+|`/`-|`/`*|` fall through to the message below, the
+    // same limit `firnc0`'s own constant folding states in words.
+    if op == B_ADDWRAP { return a + b }
+    if op == B_SUBWRAP { return a - b }
+    if op == B_MULWRAP { return a * b }
+    var m: [u8; 16] = "unknown operator"
+    broken(z, (&m[0]) as u64, 16)
+    return 0
+}
+
+fn offset_error(z: *mut Time) -> i64 {
+    var m: [u8; 26] = "shift amount outside 0..63"
+    broken(z, (&m[0]) as u64, 26)
+    return 0
+}
+
+// The text of a string literal: the parser has already turned "abc" into
+// an array literal of bytes (round 8) -- here it is read back.
+// That is why `emit_raw` needs no strings in the interpreter.
+fn literal_text(z: *mut Time, e0: u32, out: *mut rt.Buf) -> bool {
+    let b: *mut ast.Tree = (*z).tree as *mut ast.Tree
+    // ROUND 70 (strtype.rs): the text literal is its own node now and
+    // carries the array literal of its octets inside.
+    var e: u32 = e0
+    if ast.e_kind(b, e) == ast.E_TEXT {
+        e = ast.e_a(b, e)
+    }
+    if ast.e_kind(b, e) != ast.E_ALIT {
+        var m: [u8; 25] = "expected a string literal"
+        broken(z, (&m[0]) as u64, 25)
+        return false
+    }
+    let off: u32 = ast.e_b(b, e)
+    let n: u32 = ast.e_c(b, e)
+    var i: u32 = 0
+    while i < n {
+        let k: u32 = ast.child_at(b, off + i)
+        if ast.e_kind(b, k) != ast.E_INT {
+            var m2: [u8; 25] = "expected a string literal"
+            broken(z, (&m2[0]) as u64, 25)
+            return false
+        }
+        let w: u64 = ast.e_number(b, k)
+        if w > 255 {
+            var m3: [u8; 25] = "expected a string literal"
+            broken(z, (&m3[0]) as u64, 25)
+            return false
+        }
+        rt.buf_push(out, w as u8)
+        i = i + 1
+    }
+    return true
+}
+
+fn expr(z: *mut Time, e: u32, depth: i64) -> i64 {
+    let b: *mut ast.Tree = (*z).tree as *mut ast.Tree
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT {
+        return ast.e_number(b, e) as i64
+    }
+    if a == ast.E_BOOL {
+        // For E_BOOL the value sits in e_a (0 or 1), not in e_number.
+        return ast.e_a(b, e) as i64
+    }
+    if a == ast.E_ID {
+        let slot: i64 = slot_search(z, ast.e_a(b, e))
+        if slot >= 0 {
+            return vec_at[i64](&(*z).uvalue, slot as usize)
+        }
+        // Program wide constants are NOT visible here: the blocks
+        // run before the type check (SPEC 14.1.comptime), as in stage 0.
+        var m: [u8; 22] = "name is not known here"
+        broken(z, (&m[0]) as u64, 22)
+        return 0
+    }
+    if a == ast.E_UN {
+        let op: u32 = ast.e_a(b, e)
+        let v: i64 = expr(z, ast.e_b(b, e), depth)
+        if op == U_NEG { return 0 - v }
+        if op == U_NOT { if v == 0 { return 1 } return 0 }
+        if op == U_BITNOT { return 0 - v - 1 }
+        var m: [u8; 47] = "pointer operations do not exist at compile time"
+        broken(z, (&m[0]) as u64, 47)
+        return 0
+    }
+    if a == ast.E_BIN {
+        let op: u32 = ast.e_a(b, e)
+        let left: i64 = expr(z, ast.e_b(b, e), depth)
+        if (*z).err > 0 { return 0 }
+        // Short circuit kept: `false && f()` does not call `f`.
+        if op == B_LAND {
+            if left == 0 { return 0 }
+        }
+        if op == B_LOR {
+            if left != 0 { return 1 }
+        }
+        let right: i64 = expr(z, ast.e_c(b, e), depth)
+        if (*z).err > 0 { return 0 }
+        return compute(z, op, left, right)
+    }
+    if a == ast.E_AS {
+        // Stage 0 reads the target type from the type checker entries;
+        // they are EMPTY while the block runs, and the i64 fallback applies
+        // there too. This interpreter uses i64 throughout -- the value passes.
+        return expr(z, ast.e_a(b, e), depth)
+    }
+    if a == ast.E_CALL {
+        let name: u32 = ast.e_a(b, e)
+        let off: u32 = ast.e_b(b, e)
+        let n: u32 = ast.e_c(b, e)
+        // EMIT: the only side effects that a comptime may have --
+        // they write into the source text buffer (SPEC 6.4).
+        if name == (*z).n_emit_raw {
+            if n != 1 {
+                var m: [u8; 39] = "'emit_raw' expects exactly one argument"
+                broken(z, (&m[0]) as u64, 39)
+                return 0
+            }
+            literal_text(z, ast.child_at(b, off), &(*z).output)
+            return 0
+        }
+        if name == (*z).n_emit_number {
+            if n != 1 {
+                var m: [u8; 42] = "'emit_number' expects exactly one argument"
+                broken(z, (&m[0]) as u64, 42)
+                return 0
+            }
+            let v: i64 = expr(z, ast.child_at(b, off), depth)
+            rt.buf_push_dec_i64(&(*z).output, v)
+            return v
+        }
+        // DATA ACCESS AT COMPILE TIME -- byte by byte, so that the
+        // interpreter needs neither strings nor arrays.
+        if name == (*z).n_size {
+            if n != 1 {
+                var m: [u8; 40] = "'file_size' expects exactly one argument"
+                broken(z, (&m[0]) as u64, 40)
+                return 0
+            }
+            var path: rt.Buf = rt.buf_new()
+            defer rt.buf_free(&path)
+            if !literal_text(z, ast.child_at(b, off), &path) {
+                return 0
+            }
+            let d: i64 = read_file(z, rt.buf_ptr(&path), rt.buf_len(&path))
+            if d < 0 { return 0 }
+            return vec_at[u32](&(*z).ilen, d as usize) as i64
+        }
+        if name == (*z).n_byte {
+            if n != 2 {
+                var m: [u8; 34] = "'file_byte' expects path and index"
+                broken(z, (&m[0]) as u64, 34)
+                return 0
+            }
+            var path2: rt.Buf = rt.buf_new()
+            defer rt.buf_free(&path2)
+            if !literal_text(z, ast.child_at(b, off), &path2) {
+                return 0
+            }
+            let idx: i64 = expr(z, ast.child_at(b, off + 1), depth)
+            if (*z).err > 0 { return 0 }
+            let d2: i64 = read_file(z, rt.buf_ptr(&path2), rt.buf_len(&path2))
+            if d2 < 0 { return 0 }
+            let total: i64 = vec_at[u32](&(*z).ilen, d2 as usize) as i64
+            if idx < 0 { return -1 }
+            if idx >= total { return -1 }
+            let anf: u64 = rt.buf_ptr(&(*z).dalle) + vec_at[u32](&(*z).ioff, d2 as usize) as u64
+            return rt.ld8(anf, idx as usize) as i64
+        }
+        // Ordinary call: evaluate the arguments, then the function.
+        var values: Vec[i64] = vec_new[i64]()
+        defer vec_free[i64](&values)
+        var i: u32 = 0
+        while i < n {
+            vec_push[i64](&values, expr(z, ast.child_at(b, off + i), depth))
+            if (*z).err > 0 {
+                return 0
+            }
+            i = i + 1
+        }
+        return call_on(z, name, &values, depth + 1)
+    }
+    var m: [u8; 58] = "only literals, names, operators and calls are allowed here"
+    broken(z, (&m[0]) as u64, 58)
+    return 0
+}
+
+// Calls the named function with arguments that are already evaluated.
+fn call_on(z: *mut Time, name: u32, values: *mut Vec[i64], depth: i64) -> i64 {
+    let b: *mut ast.Tree = (*z).tree as *mut ast.Tree
+    if depth >= MAX_DEPTH {
+        var m: [u8; 25] = "more than 64 nested calls"
+        broken(z, (&m[0]) as u64, 25)
+        return 0
+    }
+    var fi: i64 = -1
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        if ast.fn_name(b, i) == name {
+            fi = i as i64
+            break
+        }
+        i = i + 1
+    }
+    if fi < 0 {
+        var m: [u8; 33] = "is not a function of this program"
+        broken(z, (&m[0]) as u64, 33)
+        return 0
+    }
+    let fu: usize = fi as usize
+    let poff: u32 = ast.fn_poff(b, fu)
+    let plen: u32 = ast.fn_plen(b, fu)
+    if plen as usize != vec_len[i64](values) {
+        var m: [u8; 38] = "wrong argument count for this function"
+        broken(z, (&m[0]) as u64, 38)
+        return 0
+    }
+    frame_on(z)
+    var k: u32 = 0
+    while k < plen {
+        set_local(z, ast.param_name(b, poff + k), vec_at[i64](values, k as usize))
+        k = k + 1
+    }
+    let flow: u32 = block(z, ast.fn_body(b, fu), depth)
+    frame_off(z)
+    if flow == F_RET {
+        return (*z).ret
+    }
+    // A function without `return` returns 0.
+    return 0
+}
+
+// ----------------------------------------------------------- statements
+
+fn block(z: *mut Time, bi: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = (*z).tree as *mut ast.Tree
+    frame_on(z)
+    var flow: u32 = F_NEXT
+    let off: u32 = ast.b_off(b, bi)
+    let n: u32 = ast.b_len(b, bi)
+    var i: u32 = 0
+    while i < n {
+        flow = stmt(z, ast.slist_at(b, off + i), depth)
+        if flow != F_NEXT {
+            break
+        }
+        if (*z).err > 0 {
+            break
+        }
+        i = i + 1
+    }
+    frame_off(z)
+    return flow
+}
+
+fn step(z: *mut Time) -> bool {
+    (*z).steps = (*z).steps + 1
+    if (*z).steps > MAX_STEPS {
+        var m: [u8; 41] = "more than 2000000 steps — endless loop?"
+        broken(z, (&m[0]) as u64, 41)
+        return false
+    }
+    return true
+}
+
+fn stmt(z: *mut Time, si: u32, depth: i64) -> u32 {
+    if !step(z) {
+        return F_RET
+    }
+    let b: *mut ast.Tree = (*z).tree as *mut ast.Tree
+    let a: u32 = ast.s_kind(b, si)
+    if a == ast.S_LET || a == ast.S_VAR {
+        let v: i64 = expr(z, ast.s_c(b, si), depth)
+        if (*z).err > 0 { return F_RET }
+        set_local(z, ast.s_a(b, si), v)
+        return F_NEXT
+    }
+    // ROUND 70 (comptime.rs): the comptime interpreter knows no compound
+    // assignment. It refuses it instead of computing something wrong.
+    if a == ast.S_ZUWOP || a == ast.S_STEP {
+        var mo: [u8; 55] = "'+=' and '++' are not available in a comptime block yet"
+        broken(z, (&mo[0]) as u64, 55)
+        return F_RET
+    }
+    if a == ast.S_ZUW {
+        // Only assignments to a local variable -- no field, no index,
+        // no pointer (comptime.rs, Stmt::Assign).
+        let target: u32 = ast.s_a(b, si)
+        if ast.e_kind(b, target) != ast.E_ID {
+            var m: [u8; 57] = "only assignments to a local variable (no field, no index)"
+            broken(z, (&m[0]) as u64, 57)
+            return F_RET
+        }
+        let v: i64 = expr(z, ast.s_b(b, si), depth)
+        if (*z).err > 0 { return F_RET }
+        let slot: i64 = slot_search(z, ast.e_a(b, target))
+        if slot < 0 {
+            var m2: [u8; 23] = "is not a local variable"
+            broken(z, (&m2[0]) as u64, 23)
+            return F_RET
+        }
+        vec_set[i64](&(*z).uvalue, slot as usize, v)
+        return F_NEXT
+    }
+    if a == ast.S_EXPR {
+        expr(z, ast.s_a(b, si), depth)
+        if (*z).err > 0 { return F_RET }
+        return F_NEXT
+    }
+    if a == ast.S_BLOCK {
+        return block(z, ast.s_a(b, si), depth)
+    }
+    if a == ast.S_RET {
+        let w: u32 = ast.s_a(b, si)
+        if w == ast.NOTHING {
+            (*z).ret = 0
+        } else {
+            (*z).ret = expr(z, w, depth)
+        }
+        return F_RET
+    }
+    if a == ast.S_IF {
+        let cond: i64 = expr(z, ast.s_a(b, si), depth)
+        if (*z).err > 0 { return F_RET }
+        if cond != 0 {
+            return block(z, ast.s_b(b, si), depth)
+        }
+        let els: u32 = ast.s_c(b, si)
+        if els != ast.NOTHING {
+            return stmt(z, els, depth)
+        }
+        return F_NEXT
+    }
+    if a == ast.S_WHILE {
+        while true {
+            if !step(z) {
+                return F_RET
+            }
+            let cond: i64 = expr(z, ast.s_a(b, si), depth)
+            if (*z).err > 0 { return F_RET }
+            if cond == 0 {
+                return F_NEXT
+            }
+            let flow: u32 = block(z, ast.s_b(b, si), depth)
+            if flow == F_RET { return F_RET }
+            if flow == F_BREAK { return F_NEXT }
+        }
+    }
+    if a == ast.S_FOR {
+        let of: i64 = expr(z, ast.s_b(b, si), depth)
+        if (*z).err > 0 { return F_RET }
+        let to: i64 = expr(z, ast.s_c(b, si), depth)
+        if (*z).err > 0 { return F_RET }
+        var i: i64 = of
+        while i < to {
+            if !step(z) {
+                return F_RET
+            }
+            // A scope of its own per iteration -- the loop variable belongs
+            // to it (comptime.rs pushes a new level per iteration).
+            frame_on(z)
+            set_local(z, ast.s_a(b, si), i)
+            let flow: u32 = block(z, ast.s_d(b, si), depth)
+            frame_off(z)
+            if flow == F_RET { return F_RET }
+            if flow == F_BREAK { return F_NEXT }
+            i = i + 1
+        }
+        return F_NEXT
+    }
+    if a == ast.S_BREAK { return F_BREAK }
+    if a == ast.S_CONT { return F_CONT }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        var m: [u8; 54] = "'defer' and 'errdefer' are not allowed at compile time"
+        broken(z, (&m[0]) as u64, 54)
+        return F_RET
+    }
+    var m: [u8; 45] = "this statement does not exist at compile time"
+    broken(z, (&m[0]) as u64, 45)
+    return F_RET
+}
+
+// --------------------------------------------------------------- the run
+
+// Runs all `comptime { ... }` blocks of the program; the produced
+// source text is in `output` afterwards. This runs BEFORE the type
+// check: the blocks may therefore not use program wide constants,
+// but they may call any function of the program.
+fn time_run(z: *mut Time) {
+    let b: *mut ast.Tree = (*z).tree as *mut ast.Tree
+    var i: usize = 0
+    while i < ast.ct_count(b) {
+        frame_on(z)
+        block(z, ast.ct_block(b, i), 0)
+        frame_off(z)
+        if (*z).err > 0 {
+            return
+        }
+        i = i + 1
+    }
+}

@@ -1,0 +1,606 @@
+// SPDX-License-Identifier: MIT
+// lib/std/nbt.fi -- Named Binary Tag, writer and reader (round 76).
+//
+// NBT is Minecraft's data format: a tree of named, typed values, big
+// endian, no schema, no self description beyond one type octet per value.
+// It is the format the world is stored in AND the format the registries
+// travel in over the wire, which is why it stands here and not in a demo.
+//
+// THE SHAPE. Every tag inside a compound is
+//
+//     [u8 type] [u16 name length] [name octets] [payload]
+//
+// and a compound ends with a single 0 octet (TAG_End) instead of the next
+// type. A LIST is different in exactly one way, and it is the way people
+// get wrong: its elements carry NEITHER a type NOR a name, because both
+// stand once in the list header:
+//
+//     [u8 type=9] [u16 name length] [name] [u8 element type] [i32 count]
+//     [payload] [payload] ...
+//
+// So a list of compounds is a sequence of compounds each of which ends with
+// its own TAG_End, without any name in between. An empty list carries
+// element type 0 (TAG_End) by convention and a count of 0.
+//
+// --------------------------------------------------- THE ROOT, AND 1.20.2
+//
+// A .nbt FILE begins with a NAMED compound: `[10][u16 len][name]`, and the
+// name is usually empty or "Level". Since 1.20.2 the NETWORK form omits the
+// name entirely -- `[10]` and straight into the content. That single octet
+// is the whole difference, and it is enough to make a client disconnect
+// without a message if it is wrong. Both are here:
+// `nbt_root_begin` for the file form, `nbt_root_begin_anon` for the network
+// form.
+//
+// ---------------------------------------------------- THE STRING ENCODING
+//
+// Java writes NBT strings in MODIFIED UTF-8: the same as UTF-8 except that
+// U+0000 is written as C0 80 and characters outside the BMP are written as
+// a surrogate pair of three octets each. This module writes and reads plain
+// UTF-8 and says so, because the two differ nowhere in the octets any
+// protocol packet of this round contains (identifiers, translation keys and
+// biome names are ASCII). NBT2 below names the limit; whoever needs the
+// difference builds it on `lib/std/str.fi`, which has the WTF-16 machinery
+// for it (SPEC 8.2).
+//
+// ------------------------------------------------------ THE READER IS PULL
+//
+// There is no tree that gets built. A reader walks: it asks for the next
+// type, gets the name as a SPAN into the buffer, and either reads the
+// payload or skips it. Two reasons, and the second is the important one:
+//
+//   * a tree needs an allocation per node, and the registry codec of
+//     1.20.4 has a few thousand nodes -- for a lookup of four values;
+//   * a tree needs a variant type. Stage 0 has enumerations with payloads
+//     only as `match` over an `enum` (SPEC 6.3), and `Map[K, V]` here holds
+//     scalars only. A tree of NBT would first cost a data structure round.
+//
+// `nbt_skip_payload` is what makes the pull reader complete: whoever does
+// not care about a subtree steps over it, including its nesting.
+//
+// ------------------------------------------------------------------ HONEST
+//
+// NBT1 NO COMPRESSION. Real .nbt files on disk are gzip'ed; this module
+//      reads and writes the RAW form. Round 76 deliberately has no deflate
+//      (the Minecraft server it feeds runs with
+//      network-compression-threshold -1), and a gzip reader is a round of
+//      its own.
+// NBT2 PLAIN UTF-8, not Java's modified UTF-8 -- see above.
+// NBT3 THE WRITER DOES NOT CHECK THE SHAPE. Whoever writes a tag into a
+//      list, or forgets an `nbt_end`, produces a stream that the reader
+//      here and the client there both reject. A checking writer would need
+//      a stack of open containers; `tests/1602_nbt_roundtrip.fi` and the
+//      Python counter-reader check the shape from outside instead.
+// NBT4 THE READER HAS A DEPTH LIMIT (256). Without it a peer sends 100,000
+//      opening compounds and the skip recursion runs the stack into the
+//      guard page. That is not a theoretical case; it is the cheapest
+//      denial of service a binary tree format offers.
+//      WHY 256 AND NOT 512 (the number the vanilla reader uses): MEASURED.
+//      `tools/nbt/dump.fi` recurses per nesting level, and its frame under
+//      `--opt-level=release-fast` is 25,904 octets -- the inliner gives
+//      every inlined call site room of its own instead of reusing the
+//      slots. On an 8 MiB stack that is 309 levels before the guard page;
+//      without the optimiser the same program reaches 1,962. A limit of
+//      512 would therefore be a limit that the optimised build cannot
+//      keep, which is worse than no limit at all. The number is set below
+//      the SMALLEST measured value, not above the largest.
+//      docs/ROUND76.md names the finding.
+// NBT5 `i32` LENGTHS ARE CHECKED AGAINST WHAT IS REALLY THERE. An array
+//      that announces 2,000,000,000 entries gets `Underflow`, not an
+//      allocation.
+
+import rt
+import bytes
+
+export {
+    NbtError,
+    TAG_END, TAG_BYTE, TAG_SHORT, TAG_INT, TAG_LONG, TAG_FLOAT, TAG_DOUBLE,
+    TAG_BYTE_ARRAY, TAG_STRING, TAG_LIST, TAG_COMPOUND, TAG_INT_ARRAY,
+    TAG_LONG_ARRAY,
+    NBT_MAX_DEPTH,
+
+    // writing
+    nbt_root_begin, nbt_root_begin_anon, nbt_end,
+    nbt_name, nbt_raw_string,
+    nbt_byte, nbt_short, nbt_int, nbt_long, nbt_float, nbt_double,
+    nbt_string, nbt_byte_array, nbt_int_array, nbt_long_array,
+    nbt_compound_begin, nbt_list_begin, nbt_list_open, nbt_list_patch,
+    nbt_c_byte, nbt_c_short, nbt_c_int, nbt_c_long, nbt_c_float,
+    nbt_c_double, nbt_c_string, nbt_c_compound_begin, nbt_c_list_open,
+    nbt_c_list_begin, nbt_c_byte_array, nbt_c_int_array, nbt_c_long_array,
+    nbt_c_root_begin,
+
+    // reading
+    nbt_read_type, nbt_read_name, nbt_read_string,
+    nbt_read_i8, nbt_read_i16, nbt_read_i32, nbt_read_i64,
+    nbt_read_f32, nbt_read_f64,
+    nbt_read_array_len, nbt_read_list_header,
+    nbt_skip_payload, nbt_read_root, nbt_read_root_anon,
+    nbt_type_name,
+}
+
+const TAG_END: u8 = 0
+const TAG_BYTE: u8 = 1
+const TAG_SHORT: u8 = 2
+const TAG_INT: u8 = 3
+const TAG_LONG: u8 = 4
+const TAG_FLOAT: u8 = 5
+const TAG_DOUBLE: u8 = 6
+const TAG_BYTE_ARRAY: u8 = 7
+const TAG_STRING: u8 = 8
+const TAG_LIST: u8 = 9
+const TAG_COMPOUND: u8 = 10
+const TAG_INT_ARRAY: u8 = 11
+const TAG_LONG_ARRAY: u8 = 12
+
+// NBT4.
+const NBT_MAX_DEPTH: i32 = 256
+
+error NbtError {
+    Underflow, // the octets end in the middle of a value
+    BadTag, // a type octet above 12
+    TooDeep, // more than NBT_MAX_DEPTH nested containers
+    Range, // a negative length
+}
+
+// ------------------------------------------------------------------ Writing
+
+// A name: u16 length, then the octets. The same encoding as an NBT string
+// payload, which is why `nbt_raw_string` is the same function under a name
+// that says what it is used for.
+fn nbt_name(b: *mut bytes.Bytes, p: u64, n: usize) {
+    bytes.put_u16(b, n as u16)
+    bytes.put_raw(b, p, n)
+}
+
+fn nbt_raw_string(b: *mut bytes.Bytes, p: u64, n: usize) {
+    nbt_name(b, p, n)
+}
+
+// The FILE form: a named root compound. The caller writes the entries and
+// closes with `nbt_end`.
+fn nbt_root_begin(b: *mut bytes.Bytes, p: u64, n: usize) {
+    bytes.put_u8(b, TAG_COMPOUND)
+    nbt_name(b, p, n)
+}
+
+// The NETWORK form since 1.20.2: the root compound has no name at all. Not
+// an empty name -- no name field. One octet, and the difference between a
+// client that joins and one that vanishes.
+fn nbt_root_begin_anon(b: *mut bytes.Bytes) {
+    bytes.put_u8(b, TAG_COMPOUND)
+}
+
+// Closes a compound (and only a compound: a list ends after its counted
+// elements, without a TAG_End).
+fn nbt_end(b: *mut bytes.Bytes) {
+    bytes.put_u8(b, TAG_END)
+}
+
+fn nbt_byte(b: *mut bytes.Bytes, p: u64, n: usize, v: i8) {
+    bytes.put_u8(b, TAG_BYTE)
+    nbt_name(b, p, n)
+    bytes.put_i8(b, v)
+}
+
+fn nbt_short(b: *mut bytes.Bytes, p: u64, n: usize, v: i16) {
+    bytes.put_u8(b, TAG_SHORT)
+    nbt_name(b, p, n)
+    bytes.put_i16(b, v)
+}
+
+fn nbt_int(b: *mut bytes.Bytes, p: u64, n: usize, v: i32) {
+    bytes.put_u8(b, TAG_INT)
+    nbt_name(b, p, n)
+    bytes.put_i32(b, v)
+}
+
+fn nbt_long(b: *mut bytes.Bytes, p: u64, n: usize, v: i64) {
+    bytes.put_u8(b, TAG_LONG)
+    nbt_name(b, p, n)
+    bytes.put_i64(b, v)
+}
+
+fn nbt_float(b: *mut bytes.Bytes, p: u64, n: usize, v: f32) {
+    bytes.put_u8(b, TAG_FLOAT)
+    nbt_name(b, p, n)
+    bytes.put_f32(b, v)
+}
+
+fn nbt_double(b: *mut bytes.Bytes, p: u64, n: usize, v: f64) {
+    bytes.put_u8(b, TAG_DOUBLE)
+    nbt_name(b, p, n)
+    bytes.put_f64(b, v)
+}
+
+fn nbt_string(b: *mut bytes.Bytes, p: u64, n: usize, vp: u64, vn: usize) {
+    bytes.put_u8(b, TAG_STRING)
+    nbt_name(b, p, n)
+    nbt_raw_string(b, vp, vn)
+}
+
+// The three arrays. Their length is a SIGNED i32 -- not a VarInt and not
+// unsigned; NBT predates the VarInt of the protocol.
+fn nbt_byte_array(b: *mut bytes.Bytes, p: u64, n: usize, src: u64, count: usize) {
+    bytes.put_u8(b, TAG_BYTE_ARRAY)
+    nbt_name(b, p, n)
+    bytes.put_i32(b, count as i32)
+    bytes.put_raw(b, src, count)
+}
+
+// `src` points at `count` i32 values in MACHINE order; they go out big
+// endian one by one. A `mem_copy` here would be the classic silent
+// endianness bug.
+fn nbt_int_array(b: *mut bytes.Bytes, p: u64, n: usize, src: u64, count: usize) {
+    bytes.put_u8(b, TAG_INT_ARRAY)
+    nbt_name(b, p, n)
+    bytes.put_i32(b, count as i32)
+    var i: usize = 0
+    while i < count {
+        bytes.put_i32(b, *((src + (i as u64) * 4) as *mut i32))
+        i = i + 1
+    }
+}
+
+fn nbt_long_array(b: *mut bytes.Bytes, p: u64, n: usize, src: u64, count: usize) {
+    bytes.put_u8(b, TAG_LONG_ARRAY)
+    nbt_name(b, p, n)
+    bytes.put_i32(b, count as i32)
+    var i: usize = 0
+    while i < count {
+        bytes.put_i64(b, *((src + (i as u64) * 8) as *mut i64))
+        i = i + 1
+    }
+}
+
+fn nbt_compound_begin(b: *mut bytes.Bytes, p: u64, n: usize) {
+    bytes.put_u8(b, TAG_COMPOUND)
+    nbt_name(b, p, n)
+}
+
+// A list whose length is KNOWN. `elem` is the type of every element; for
+// `count == 0` the convention is `TAG_END`.
+fn nbt_list_open(b: *mut bytes.Bytes, p: u64, n: usize, elem: u8, count: i32) {
+    bytes.put_u8(b, TAG_LIST)
+    nbt_name(b, p, n)
+    bytes.put_u8(b, elem)
+    bytes.put_i32(b, count)
+}
+
+// A list whose length is NOT known yet: a placeholder goes out, the return
+// value is the offset it stands at, and `nbt_list_patch` fills it in once
+// the elements are written. Without this the caller would have to build the
+// content into a second buffer and copy it.
+fn nbt_list_begin(b: *mut bytes.Bytes, p: u64, n: usize, elem: u8) -> usize {
+    bytes.put_u8(b, TAG_LIST)
+    nbt_name(b, p, n)
+    bytes.put_u8(b, elem)
+    let mark: usize = bytes.bytes_len(b)
+    bytes.put_i32(b, 0)
+    return mark
+}
+
+fn nbt_list_patch(b: *mut bytes.Bytes, mark: usize, count: i32) {
+    bytes.bytes_patch_u32(b, mark, count as u32)
+}
+
+// ---------------------------------------- The same, with a literal as name
+//
+// A Firn string literal is a null terminated array (`var s: [u8; 5] = "min\0"`),
+// so the length is one `c_length` away. These wrappers exist so that a
+// caller writing a registry by hand does not repeat that call forty times.
+
+fn nbt_c_root_begin(b: *mut bytes.Bytes, p: u64) {
+    nbt_root_begin(b, p, rt.c_length(p))
+}
+
+fn nbt_c_byte(b: *mut bytes.Bytes, p: u64, v: i8) {
+    nbt_byte(b, p, rt.c_length(p), v)
+}
+
+fn nbt_c_short(b: *mut bytes.Bytes, p: u64, v: i16) {
+    nbt_short(b, p, rt.c_length(p), v)
+}
+
+fn nbt_c_int(b: *mut bytes.Bytes, p: u64, v: i32) {
+    nbt_int(b, p, rt.c_length(p), v)
+}
+
+fn nbt_c_long(b: *mut bytes.Bytes, p: u64, v: i64) {
+    nbt_long(b, p, rt.c_length(p), v)
+}
+
+fn nbt_c_float(b: *mut bytes.Bytes, p: u64, v: f32) {
+    nbt_float(b, p, rt.c_length(p), v)
+}
+
+fn nbt_c_double(b: *mut bytes.Bytes, p: u64, v: f64) {
+    nbt_double(b, p, rt.c_length(p), v)
+}
+
+fn nbt_c_string(b: *mut bytes.Bytes, p: u64, vp: u64) {
+    nbt_string(b, p, rt.c_length(p), vp, rt.c_length(vp))
+}
+
+fn nbt_c_compound_begin(b: *mut bytes.Bytes, p: u64) {
+    nbt_compound_begin(b, p, rt.c_length(p))
+}
+
+fn nbt_c_list_open(b: *mut bytes.Bytes, p: u64, elem: u8, count: i32) {
+    nbt_list_open(b, p, rt.c_length(p), elem, count)
+}
+
+fn nbt_c_list_begin(b: *mut bytes.Bytes, p: u64, elem: u8) -> usize {
+    return nbt_list_begin(b, p, rt.c_length(p), elem)
+}
+
+fn nbt_c_byte_array(b: *mut bytes.Bytes, p: u64, src: u64, count: usize) {
+    nbt_byte_array(b, p, rt.c_length(p), src, count)
+}
+
+fn nbt_c_int_array(b: *mut bytes.Bytes, p: u64, src: u64, count: usize) {
+    nbt_int_array(b, p, rt.c_length(p), src, count)
+}
+
+fn nbt_c_long_array(b: *mut bytes.Bytes, p: u64, src: u64, count: usize) {
+    nbt_long_array(b, p, rt.c_length(p), src, count)
+}
+
+// ------------------------------------------------------------------ Reading
+
+// The name of a tag type as the specification spells it -- for error
+// messages and for the dumper of the test. It is COPIED into a buffer the
+// caller owns and closed with a null octet; the return value is the length
+// WITHOUT that octet. A name that does not fit into `cap` is cut off, the
+// terminator is always written.
+//
+// ROUND 79 -- THIS USED TO HAND OUT A DANGLING POINTER. The old form was
+// `fn nbt_type_name(t: u8) -> u64` and returned `(&end[0]) as u64`: the
+// address of a `var` array of its OWN frame, dead the moment it returned. A
+// comment above it claimed the names lay "in read only data" -- a `var`
+// array never does, it lies in the frame. That is gap 9 of docs/ROUND66.md,
+// realised in a shipped library, and nobody noticed because nothing in the
+// tree calls the function. The escape analysis of round 79
+// (compiler/src/escape.rs) found all fourteen returns at once; the
+// signature change is the fix, not an `#[allow_escape]`.
+fn nbt_type_name(t: u8, out: *mut u8, cap: usize) -> usize {
+    var end: [u8; 7] = "TAG_End"
+    var byte: [u8; 8] = "TAG_Byte"
+    var short: [u8; 9] = "TAG_Short"
+    var int: [u8; 7] = "TAG_Int"
+    var long: [u8; 8] = "TAG_Long"
+    var float: [u8; 9] = "TAG_Float"
+    var double: [u8; 10] = "TAG_Double"
+    var ba: [u8; 14] = "TAG_Byte_Array"
+    var st: [u8; 10] = "TAG_String"
+    var li: [u8; 8] = "TAG_List"
+    var co: [u8; 12] = "TAG_Compound"
+    var ia: [u8; 13] = "TAG_Int_Array"
+    var la: [u8; 14] = "TAG_Long_Array"
+    var un: [u8; 7] = "TAG_???"
+    if t == TAG_END { return nbt_name_out(out, cap, (&end[0]) as u64, 7) }
+    if t == TAG_BYTE { return nbt_name_out(out, cap, (&byte[0]) as u64, 8) }
+    if t == TAG_SHORT { return nbt_name_out(out, cap, (&short[0]) as u64, 9) }
+    if t == TAG_INT { return nbt_name_out(out, cap, (&int[0]) as u64, 7) }
+    if t == TAG_LONG { return nbt_name_out(out, cap, (&long[0]) as u64, 8) }
+    if t == TAG_FLOAT { return nbt_name_out(out, cap, (&float[0]) as u64, 9) }
+    if t == TAG_DOUBLE { return nbt_name_out(out, cap, (&double[0]) as u64, 10) }
+    if t == TAG_BYTE_ARRAY { return nbt_name_out(out, cap, (&ba[0]) as u64, 14) }
+    if t == TAG_STRING { return nbt_name_out(out, cap, (&st[0]) as u64, 10) }
+    if t == TAG_LIST { return nbt_name_out(out, cap, (&li[0]) as u64, 8) }
+    if t == TAG_COMPOUND { return nbt_name_out(out, cap, (&co[0]) as u64, 12) }
+    if t == TAG_INT_ARRAY { return nbt_name_out(out, cap, (&ia[0]) as u64, 13) }
+    if t == TAG_LONG_ARRAY { return nbt_name_out(out, cap, (&la[0]) as u64, 14) }
+    return nbt_name_out(out, cap, (&un[0]) as u64, 7)
+}
+
+// Copy the name into the caller's buffer while the frame that holds it is
+// still alive, and terminate it. That is the whole point of the round 79
+// change: the copy happens HERE, not at the caller, so no address of a
+// frame ever leaves `nbt_type_name`.
+fn nbt_name_out(out: *mut u8, cap: usize, source: u64, n: usize) -> usize {
+    let target: u64 = out as u64
+    var i: usize = 0
+    while i < n && i + 1 < cap {
+        rt.st8(target, i, rt.ld8(source, i))
+        i = i + 1
+    }
+    if cap > 0 {
+        rt.st8(target, i, 0 as u8)
+    }
+    return n
+}
+
+// The next type octet inside a compound. `TAG_END` means: this compound is
+// finished; the caller does NOT read a name after it.
+fn nbt_read_type(b: *mut bytes.Bytes) -> NbtError!u8 {
+    let t: u8 = bytes.get_u8(b) catch 255 as u8
+    if t == 255 as u8 && bytes.bytes_remaining(b) == 0 {
+        return NbtError::Underflow
+    }
+    if t > TAG_LONG_ARRAY {
+        return NbtError::BadTag
+    }
+    return t
+}
+
+// A name as a SPAN into the buffer -- no copy, exactly as
+// `bytes.get_string`.
+fn nbt_read_name(b: *mut bytes.Bytes, out_n: *mut usize) -> NbtError!u64 {
+    *out_n = 0
+    let n: u16 = bytes.get_u16(b) catch 65535 as u16
+    if bytes.bytes_remaining(b) < n as usize {
+        return NbtError::Underflow
+    }
+    let p: u64 = bytes.get_span(b, n as usize) catch 0
+    if p == 0 && n != 0 as u16 {
+        return NbtError::Underflow
+    }
+    *out_n = n as usize
+    return p
+}
+
+fn nbt_read_string(b: *mut bytes.Bytes, out_n: *mut usize) -> NbtError!u64 {
+    return nbt_read_name(b, out_n)
+}
+
+fn nbt_read_i8(b: *mut bytes.Bytes) -> NbtError!i8 {
+    if bytes.bytes_remaining(b) < 1 { return NbtError::Underflow }
+    return bytes.get_i8(b) catch 0 as i8
+}
+
+fn nbt_read_i16(b: *mut bytes.Bytes) -> NbtError!i16 {
+    if bytes.bytes_remaining(b) < 2 { return NbtError::Underflow }
+    return bytes.get_i16(b) catch 0 as i16
+}
+
+fn nbt_read_i32(b: *mut bytes.Bytes) -> NbtError!i32 {
+    if bytes.bytes_remaining(b) < 4 { return NbtError::Underflow }
+    return bytes.get_i32(b) catch 0
+}
+
+fn nbt_read_i64(b: *mut bytes.Bytes) -> NbtError!i64 {
+    if bytes.bytes_remaining(b) < 8 { return NbtError::Underflow }
+    return bytes.get_i64(b) catch 0
+}
+
+fn nbt_read_f32(b: *mut bytes.Bytes) -> NbtError!f32 {
+    if bytes.bytes_remaining(b) < 4 { return NbtError::Underflow }
+    return bytes.get_f32(b) catch 0.0f
+}
+
+fn nbt_read_f64(b: *mut bytes.Bytes) -> NbtError!f64 {
+    if bytes.bytes_remaining(b) < 8 { return NbtError::Underflow }
+    return bytes.get_f64(b) catch 0.0
+}
+
+// NBT5: a negative length is a lie, and a length larger than what is left
+// is a lie too -- both before anything is reserved.
+fn nbt_read_array_len(b: *mut bytes.Bytes, width: usize) -> NbtError!i32 {
+    let n: i32 = try nbt_read_i32(b)
+    if n < 0 {
+        return NbtError::Range
+    }
+    if bytes.bytes_remaining(b) < (n as usize) * width {
+        return NbtError::Underflow
+    }
+    return n
+}
+
+fn nbt_read_list_header(b: *mut bytes.Bytes, out_elem: *mut u8, out_n: *mut i32) -> NbtError!bool {
+    *out_elem = TAG_END
+    *out_n = 0
+    let e: u8 = try nbt_read_type(b)
+    let n: i32 = try nbt_read_i32(b)
+    if n < 0 {
+        return NbtError::Range
+    }
+    *out_elem = e
+    *out_n = n
+    return true
+}
+
+// Step over the payload of `tag`, whatever it contains. `depth` counts the
+// containers already open (NBT4).
+fn nbt_skip_at(b: *mut bytes.Bytes, tag: u8, depth: i32) -> NbtError!bool {
+    if depth > NBT_MAX_DEPTH {
+        return NbtError::TooDeep
+    }
+    if tag == TAG_END {
+        return true
+    }
+    if tag == TAG_BYTE {
+        try nbt_read_i8(b)
+        return true
+    }
+    if tag == TAG_SHORT {
+        try nbt_read_i16(b)
+        return true
+    }
+    if tag == TAG_INT || tag == TAG_FLOAT {
+        try nbt_read_i32(b)
+        return true
+    }
+    if tag == TAG_LONG || tag == TAG_DOUBLE {
+        try nbt_read_i64(b)
+        return true
+    }
+    if tag == TAG_STRING {
+        var skip_n: usize = 0
+        try nbt_read_name(b, &skip_n)
+        return true
+    }
+    if tag == TAG_BYTE_ARRAY {
+        let n: i32 = try nbt_read_array_len(b, 1)
+        let s: usize = bytes.bytes_skip(b, n as usize) catch 0
+        if s == 0 && n != 0 {
+            return NbtError::Underflow
+        }
+        return true
+    }
+    if tag == TAG_INT_ARRAY {
+        let n: i32 = try nbt_read_array_len(b, 4)
+        let s: usize = bytes.bytes_skip(b, (n as usize) * 4) catch 0
+        if s == 0 && n != 0 {
+            return NbtError::Underflow
+        }
+        return true
+    }
+    if tag == TAG_LONG_ARRAY {
+        let n: i32 = try nbt_read_array_len(b, 8)
+        let s: usize = bytes.bytes_skip(b, (n as usize) * 8) catch 0
+        if s == 0 && n != 0 {
+            return NbtError::Underflow
+        }
+        return true
+    }
+    if tag == TAG_LIST {
+        var elem: u8 = TAG_END
+        var n: i32 = 0
+        try nbt_read_list_header(b, &elem, &n)
+        var i: i32 = 0
+        while i < n {
+            try nbt_skip_at(b, elem, depth + 1)
+            i = i + 1
+        }
+        return true
+    }
+    if tag == TAG_COMPOUND {
+        var running: bool = true
+        while running {
+            let t: u8 = try nbt_read_type(b)
+            if t == TAG_END {
+                running = false
+            } else {
+                var nn: usize = 0
+                try nbt_read_name(b, &nn)
+                try nbt_skip_at(b, t, depth + 1)
+            }
+        }
+        return true
+    }
+    return NbtError::BadTag
+}
+
+fn nbt_skip_payload(b: *mut bytes.Bytes, tag: u8) -> NbtError!bool {
+    return nbt_skip_at(b, tag, 0)
+}
+
+// The FILE form: type octet, root name, and the cursor stands on the first
+// entry. `*out_n` gets the length of the root name.
+fn nbt_read_root(b: *mut bytes.Bytes, out_n: *mut usize) -> NbtError!u64 {
+    let t: u8 = try nbt_read_type(b)
+    if t != TAG_COMPOUND {
+        return NbtError::BadTag
+    }
+    return nbt_read_name(b, out_n)
+}
+
+// The NETWORK form since 1.20.2: type octet, and nothing else.
+fn nbt_read_root_anon(b: *mut bytes.Bytes) -> NbtError!bool {
+    let t: u8 = try nbt_read_type(b)
+    if t != TAG_COMPOUND {
+        return NbtError::BadTag
+    }
+    return true
+}

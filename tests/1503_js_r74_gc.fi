@@ -1,0 +1,157 @@
+// expect_exit: 0
+// tests/1503_js_r74_gc.fi -- ROUND 74: EVERYTHING NEW IS AN ORDINARY
+// GC OBJECT.
+//
+// The same proof round 66 gave for the generators, now for what round 74
+// adds: a compiled REGULAR EXPRESSION (`val.JsRegExp` with its two raw
+// vectors), the ITERATOR objects of Array/String/Map/Set, a DATE, the weak
+// collections and the results of `matchAll`. None of them has an external
+// root, none is pinned, none has a finalizer -- so a program that drops
+// them must give the memory back.
+//
+// The program below builds in every round 200 of each, uses them once and
+// drops them. What is checked:
+//   1. after three rounds and a collection the number of LIVE objects is
+//      back where it started,
+//   2. the COUNTER CHECK: the same program that KEEPS everything in a
+//      global array must push the number up. A measurement that cannot see
+//      a leak is not a measurement.
+//
+// The long version with the RSS of the process is in tools/js/soak.sh.
+import html.mem
+import js.lex
+import js.ast
+import js.parse
+import js.val
+import js.interp
+import js.builtin
+import js.gen
+
+const CLEAN_LEN: usize = 301
+const LEAK_LEN: usize = 351
+
+fn __gc_finalize(kind: u64, p: *mut u8) {
+}
+
+// Lay a deep, nulled frame over the abandoned frames: the stack scan is
+// conservative, and an old pointer in a dead frame would keep alive exactly
+// what is supposed to die here (docs/reports/dom.md).
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    var i: usize = 0
+    while i < 256 {
+        buffer[i] = 0
+        i = i + 1
+    }
+    barrier(&buffer)
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+// ROUND 79 -- the realm is a GC object and is handed the addresses of `ctx`,
+// `t` and `nm`, which lie in THIS frame. It is sound here and only here: the
+// realm comes into being in this call, nothing outside gets hold of it, and
+// it is garbage the moment this function returns. The escape analysis
+// (compiler/src/escape.rs) cannot see that, so the exception is said out
+// loud instead of the check being weakened (docs/ROUND79.md 3).
+#[allow_escape]
+fn run(src: *mut u8, len: usize, nm: *mut lex.Names) -> AllocError!u64 {
+    var l: lex.Lexer = lex.lex_new()
+    lex.lex_init(&l, nm)
+    var t: ast.Ast = ast.ast_new()
+    ast.ast_init(&t)
+    var p: parse.Parser = parse.parser_new()
+    parse.parser_init(&p, &l, &t, nm)
+    lex.lex_set_ascii(&l, src, len)
+    let prog: u32 = parse.parse_program(&p, false)
+    if parse.parse_error(&p) != parse.ERR_NONE {
+        return 1
+    }
+    var ctx: interp.Ctx = interp.ctx_new()
+    ctx.native = builtin.native_dispatch
+    ctx.arity = builtin.native_arity_of
+    ctx.gen_start = gen.gen_start
+    ctx.gen_native = gen.gen_native
+    var sp: gen.Susp = gen.susp_new()
+    gen.susp_init(&sp)
+    ctx.gen_data = (&sp) as *mut u8
+    let r: Gc[Realm] = try val.realm_new()
+    val.realm_set_ctx(r, (&ctx) as *mut u8)
+    val.realm_set_ast(r, &t, nm)
+    let g: Gc[JsObj] = try builtin.install(r)
+    let okg: bool = try gen.install_gen(r)
+    let v: Gc[JsVal] = try interp.run_program(r, prog, r.global_env)
+    var bad: u64 = 0
+    if ctx.comp == interp.C_THROW {
+        bad = 2
+    }
+    let okj: bool = try gen.run_jobs(r)
+    parse.parser_free(&p)
+    ast.ast_free(&t)
+    lex.lex_free(&l)
+    gen.susp_free(&sp)
+    return bad
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    gc_set_max_bytes(1 << 30)
+    var nm: lex.Names = lex.Names { pool: mem.cp_new(), off: mem.cp_new(),
+        len: mem.cp_new(), hash: mem.cp_new(), buckets: mem.cp_new(),
+        mask: 0, n: 0 }
+    lex.names_init(&nm)
+
+    // Every round: a compiled pattern with two groups, an iterator in
+    // mid-flight, a Map with an object value, a WeakMap over it, a Date
+    // and the result list of a `matchAll`.
+    var clean: [u8; 301] = "for(var i=0;i<200;i++){var re=new RegExp(\"(a+)(b|c)\"+i,\"g\");re.exec(\"xaaab\"+i);var it=[1,2,3][Symbol.iterator]();it.next();var m=new Map([[i,{}]]);var w=new WeakMap();w.set(m,i);var d=new Date(i*1000);var s=new Set([i,i+1]).union(new Set([i+2]));var t=\"a1b2c3\".matchAll(/\\w(\\d)/g);var q=[...t].length}"
+    var leak: [u8; 351] = "var keep=[];for(var i=0;i<200;i++){var re=new RegExp(\"(a+)(b|c)\"+i,\"g\");keep.push(re.exec(\"xaaab\"+i));var it=[1,2,3][Symbol.iterator]();it.next();keep.push(it);var m=new Map([[i,{}]]);var w=new WeakMap();w.set(m,i);keep.push(w);keep.push(new Date(i*1000));keep.push(new Set([i,i+1]).union(new Set([i+2])));keep.push([...\"a1b2c3\".matchAll(/\\w(\\d)/g)])}"
+
+    // Warm up once, so that the interned names and the built ins are not
+    // counted as growth.
+    let w: u64 = run(&clean[0], CLEAN_LEN, &nm) catch 9
+    if w != 0 {
+        return 10 + w as i32
+    }
+    scrub(6)
+    gc_collect()
+    let base: u64 = gc_live_objects()
+
+    var round: u64 = 0
+    while round < 3 {
+        let e: u64 = run(&clean[0], CLEAN_LEN, &nm) catch 9
+        if e != 0 {
+            return 20 + e as i32
+        }
+        scrub(6)
+        gc_collect()
+        round = round + 1
+    }
+    let after: u64 = gc_live_objects()
+    if after > base + 4000 {
+        return 3
+    }
+
+    // The counter check: holding on MUST show up.
+    let e2: u64 = run(&leak[0], LEAK_LEN, &nm) catch 9
+    if e2 != 0 {
+        return 30 + e2 as i32
+    }
+    let peak: u64 = gc_live_objects()
+    if peak <= after + 4000 {
+        // A leak that the measurement cannot see means the measurement is
+        // broken -- that is a failure, not a success.
+        return 4
+    }
+    scrub(6)
+    gc_collect()
+    let end: u64 = gc_live_objects()
+    if end > base + 4000 {
+        return 5
+    }
+    lex.names_free(&nm)
+    return 0
+}

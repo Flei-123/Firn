@@ -1,0 +1,859 @@
+// SPDX-License-Identifier: MIT
+// lib/std/io.fi -- std.io: the unified input/output facade.
+//
+// Part of the std facade (round 39): uniform, C# flavored names on top of
+// the building blocks from lib/rt -- those stay unchanged, std calls them.
+// `rt` lies next to this file (lib/std/rt.fi), so that the import resolves
+// inside every project directory.
+//
+// It contains the `Fmt` builder as well: the parser translates the string
+// interpolation `f"..."` at compile time into a chain of
+// `fmt_new/fmt_text/fmt_number` -- no varargs, no parsing at run time.
+// ROUND 69: `io` is the ONE place that sees both address worlds -- `rt`
+// carries an address as a `u64`, `str`/`num` as a `*mut u8`. That is why
+// the bridge lives here and nowhere else (docs/ROUND69.md).
+import rt
+import str
+import num
+
+export {
+    // ROUND 88 -- the plain name takes TEXT. Whoever hands over raw octets
+    // says so: `_bytes`. See the note "the four families" further down.
+    print, print_line, eprint, eprint_line, new_line,
+    print_bytes, print_line_bytes, eprint_bytes, eprint_line_bytes,
+    // round 39
+    read_file, write_file,
+    Fmt, fmt_new, fmt_text, fmt_number, fmt_len, fmt_print, fmt_free,
+    // round 42 -- output, files, lines
+    print_c, eprint_c, print_fd,
+    read_stdin, append_file, file_exists,
+    LineReader, lines_new, lines_of_buf, lines_next, lines_number,
+    // round 42 -- the Fmt builder, built out
+    fmt_char, fmt_bool, fmt_u64, fmt_hex, fmt_c, fmt_repeat,
+    fmt_line, fmt_wide, fmt_append, fmt_content, fmt_print_line,
+    fmt_eprint, fmt_eprint_line, fmt_in_file,
+    // round 69 -- the comfort layer: spans instead of pointer/length pairs
+    span_of_buf, write, write_line, write_err, write_err_line,
+    write_c, write_c_line, fmt_span, fmt_f64,
+    // round 71 -- the second floating point width
+    fmt_f32, read_f32, ask_f32,
+    // round 69 -- input without a buffer of your own
+    Text, text_new, text_span, text_length, text_is_ok, text_free, text_of,
+    read_line, read_text, read_all, prompt,
+    // round 88 -- a file by its name
+    read_file_text, write_file_text,
+    // round 70 -- str
+    fmt_value, fmt_str, print_str, println_str,
+    read_i64, read_f64, ask_i64, ask_f64,
+}
+
+// ------------------------------------------------------------ Input/output
+
+// **ROUND 88 -- THE FOUR FAMILIES, AND WHY THERE IS ONLY ONE RULE NOW.**
+//
+// Up to round 87 `std.io` had four ways of writing the same sentence, and
+// the shortest name was the one nobody could guess:
+//
+//     io.print(p, n)          pointer + length   (round 39)
+//     io.write_line(s)        a Span             (round 42/69)
+//     io.println_str(s)       a str              (round 70)
+//     io.print_line()         NOTHING -- only the line feed
+//
+// So `io.print_line("hello")`, the first thing anybody writes, answered
+// with "function 'io__print_line' expects 0 argument(s), found 1". The name
+// that reads like "print this line" was the one that could not print a line.
+//
+// THE RULE SINCE ROUND 88: **the plain name takes TEXT.** `print`,
+// `print_line`, `eprint`, `eprint_line` take a `str` -- and because `str`
+// and `str.Span` are the same two words (SPEC 8.0), a `Span` fits in there
+// as well, without a conversion.
+//
+// Whoever really has a pointer and a length says so: `print_bytes`,
+// `print_line_bytes`, `eprint_bytes`, `eprint_line_bytes` -- that is the
+// old round 39 family, under a name that names what it takes. The line feed
+// on its own is `new_line()`.
+//
+// `write`/`write_line` (round 69) and `print_str`/`println_str` (round 70)
+// stay: they do exactly the same and no program has to be rewritten. New
+// text should use `print` and `print_line`.
+
+// Text onto stdout (fd 1), without a line feed.
+fn print(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+// Text onto stdout with a line feed -- the naming that anybody expects.
+fn print_line(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+    new_line()
+}
+
+// Text onto stderr (fd 2), without a line feed.
+fn eprint(s: str) {
+    rt.write_everything(2, s.p as u64, s.n)
+}
+
+// Text onto stderr with a line feed.
+fn eprint_line(s: str) {
+    rt.write_everything(2, s.p as u64, s.n)
+    var nl: [u8; 1] = "\n"
+    rt.write_everything(2, (&nl[0]) as u64, 1)
+}
+
+// `n` octets from `p` onto stdout (fd 1), written completely.
+// (Round 39; up to round 87 this was called `print`.)
+fn print_bytes(p: u64, n: usize) {
+    rt.write_everything(1, p, n)
+}
+
+// `n` octets from `p` onto stderr (fd 2), written completely.
+// (Round 39; up to round 87 this was called `eprint`.)
+fn eprint_bytes(p: u64, n: usize) {
+    rt.write_everything(2, p, n)
+}
+
+// Reads a whole file into `out`. `path` points at a null terminated
+// sequence. true = it was read.
+fn read_file(path: u64, out: *mut rt.Buf) -> bool {
+    return rt.read_file(path, out)
+}
+
+// Writes `n` octets from `p` into a file (overwriting, mode 0755).
+// true = it was written.
+fn write_file(path: u64, p: u64, n: usize) -> bool {
+    return rt.write_file(path, p, n)
+}
+
+// --------------------------------------------------------- The Fmt builder
+//
+// Assembling text inside a growing buffer. Every step takes the builder BY
+// VALUE and gives it back BY VALUE -- that way the chain is a single
+// expression, and that is exactly what the parser produces for `f"..."`.
+struct Fmt {
+    b: rt.Buf,
+}
+
+// An empty builder.
+fn fmt_new() -> Fmt {
+    return Fmt { b: rt.buf_new() }
+}
+
+// Append a text segment: `n` octets from `p` (NOT null terminated).
+fn fmt_text(f: Fmt, p: u64, n: usize) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_bytes(&g.b, p, n)
+    return g
+}
+
+// A scalar value as decimal text. The parser does not know the type of an
+// interpolated expression at compile time -- so the interpolation inserts
+// it with `as i64`.
+// AN HONEST LIMIT of the core version: the display is the one of `i64`
+// (a u64 above i64::MAX wraps around, an f64 is truncated, a bool becomes
+// 0/1). Integers -- the normal case -- are always right.
+fn fmt_number(f: Fmt, v: i64) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_dec_i64(&g.b, v)
+    return g
+}
+
+// The length of the built text in octets.
+fn fmt_len(f: Fmt) -> usize {
+    var g: Fmt = f
+    return rt.buf_len(&g.b)
+}
+
+// Write the content onto stdout and release the buffer.
+fn fmt_print(f: Fmt) {
+    var g: Fmt = f
+    rt.write_everything(1, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_free(&g.b)
+}
+
+// Release the buffer without printing anything.
+fn fmt_free(f: Fmt) {
+    var g: Fmt = f
+    rt.buf_free(&g.b)
+}
+
+// =====================================================================
+// Round 42 -- the build out: lines, stdin, appending to files and an Fmt
+// builder that can do more than text and decimal numbers.
+// =====================================================================
+
+const O_ONLY_READ: i64 = 0
+const O_APPEND: i64 = 1089 // O_WRONLY|O_CREAT|O_APPEND
+const O_MODE: i64 = 493 // 0755
+const IO_SYS_OPEN: i64 = 2
+const IO_SYS_CLOSE: i64 = 3
+
+// ----------------------------------------------------- Output, short forms
+
+// Like `print_bytes`, with a line feed. Two write calls -- an intermediate
+// buffer would be one allocation per line.
+// (Round 42; up to round 87 this was called `println`.)
+fn print_line_bytes(p: u64, n: usize) {
+    rt.write_everything(1, p, n)
+    var nl: [u8; 1] = "\n"
+    rt.write_everything(1, (&nl[0]) as u64, 1)
+}
+
+// (Round 42; up to round 87 this was called `eprintln`.)
+fn eprint_line_bytes(p: u64, n: usize) {
+    rt.write_everything(2, p, n)
+    var nl: [u8; 1] = "\n"
+    rt.write_everything(2, (&nl[0]) as u64, 1)
+}
+
+// A null terminated sequence (without the null octet) -- the form command
+// line arguments arrive in (`rt.arg_ptr`).
+fn print_c(p: u64) {
+    rt.write_everything(1, p, rt.c_length(p))
+}
+
+fn eprint_c(p: u64) {
+    rt.write_everything(2, p, rt.c_length(p))
+}
+
+// ONLY the line feed. Up to round 87 this was called `print_line` -- and
+// that name now belongs to the thing everybody means by it (see above).
+fn new_line() {
+    var nl: [u8; 1] = "\n"
+    rt.write_everything(1, (&nl[0]) as u64, 1)
+}
+
+// Onto an arbitrary descriptor. `false` = the write call broke off.
+fn print_fd(fd: i64, p: u64, n: usize) -> bool {
+    return rt.write_everything(fd, p, n)
+}
+
+// ------------------------------------------------------------------- Files
+
+// Everything from standard input up to the end.
+fn read_stdin(out: *mut rt.Buf) -> bool {
+    return rt.read_stdin(out)
+}
+
+// APPEND to a file instead of overwriting it (O_APPEND). Creates it if it
+// is missing. That is the difference between a log and a
+// lost log.
+fn append_file(path: u64, p: u64, n: usize) -> bool {
+    let fd: i64 = syscall(IO_SYS_OPEN, path as i64, O_APPEND, O_MODE, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    let ok: bool = rt.write_everything(fd, p, n)
+    syscall(IO_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return ok
+}
+
+// Can the file be opened for reading? Stage 0 says no more than that: there
+// is no `stat`, and guessing from the size would be a lie.
+fn file_exists(path: u64) -> bool {
+    let fd: i64 = syscall(IO_SYS_OPEN, path as i64, O_ONLY_READ, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    syscall(IO_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return true
+}
+
+// ------------------------------------------------------------------- Lines
+//
+// A CURSOR over a block that has already been read -- no second buffer, no
+// copying. Every line comes as pointer + length INSIDE the block:
+//
+//     var buf: rt.Buf = rt.buf_new()
+//     io.read_file(path, &buf)
+//     var z: io.LineReader = io.lines_of_buf(&buf)
+//     var p: u64 = 0
+//     var n: usize = 0
+//     while io.lines_next(&z, &p, &n) { ... }
+//
+// The line feed is NOT part of the line; a preceding \r is removed with it
+// (DOS line endings). If the block ends with \n there is NO empty final
+// line -- that is the rule `wc -l` and every editor
+// uses.
+
+struct LineReader {
+    p: u64,
+    n: usize,
+    i: usize,
+}
+
+fn lines_new(p: u64, n: usize) -> LineReader {
+    return LineReader { p: p, n: n, i: 0 }
+}
+
+fn lines_of_buf(b: *mut rt.Buf) -> LineReader {
+    return LineReader { p: rt.buf_ptr(b), n: rt.buf_len(b), i: 0 }
+}
+
+fn lines_next(z: *mut LineReader, ap: *mut u64, an: *mut usize) -> bool {
+    let end: usize = (*z).n
+    var i: usize = (*z).i
+    if i >= end {
+        return false
+    }
+    let start: usize = i
+    while i < end && rt.ld8((*z).p, i) != 10 as u8 {
+        i = i + 1
+    }
+    var length: usize = i - start
+    if length > 0 && rt.ld8((*z).p, start + length - 1) == 13 as u8 {
+        length = length - 1
+    }
+    *ap = (*z).p + start as u64
+    *an = length
+    if i < end {
+        i = i + 1
+    }
+    (*z).i = i
+    return true
+}
+
+// How many lines the block has (without consuming it).
+fn lines_number(p: u64, n: usize) -> usize {
+    var z: LineReader = lines_new(p, n)
+    var ap: u64 = 0
+    var an: usize = 0
+    var k: usize = 0
+    while lines_next(&z, &ap, &an) {
+        k = k + 1
+    }
+    return k
+}
+
+// ---------------------------------------------------------- Fmt, built out
+//
+// The same shape as in round 39: value in, value out, so that the whole
+// chain stays ONE expression.
+
+// A single octet. With it `{c}` becomes printable as a LETTER -- with
+// `fmt_number` the number 65 would come out instead of "A".
+fn fmt_char(f: Fmt, c: u8) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push(&g.b, c)
+    return g
+}
+
+// ROUND 69: the two words are `true` and `false` -- the same spelling the
+// language itself uses. Until then they were German (`wahr`/`falsch`), a
+// leftover of the time before the English migration; a library that prints
+// a bool in a different language than the source is written in is a seam,
+// not a feature.
+fn fmt_bool(f: Fmt, w: bool) -> Fmt {
+    var g: Fmt = f
+    var yes: [u8; 4] = "true"
+    var no: [u8; 5] = "false"
+    if w {
+        rt.buf_push_bytes(&g.b, rt.addr_of(&yes[0]), 4)
+    } else {
+        rt.buf_push_bytes(&g.b, rt.addr_of(&no[0]), 5)
+    }
+    return g
+}
+
+// Unsigned -- `fmt_number` shows i64 and would wrap above i64::MAX.
+fn fmt_u64(f: Fmt, v: u64) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_dec_u64(&g.b, v)
+    return g
+}
+
+// Hexadecimal, at least `min` digits, without "0x".
+fn fmt_hex(f: Fmt, v: u64, min: usize) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_hex_u64(&g.b, v, min)
+    return g
+}
+
+// A null terminated sequence.
+fn fmt_c(f: Fmt, p: u64) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_bytes(&g.b, p, rt.c_length(p))
+    return g
+}
+
+fn fmt_repeat(f: Fmt, c: u8, times: usize) -> Fmt {
+    var g: Fmt = f
+    var i: usize = 0
+    while i < times {
+        rt.buf_push(&g.b, c)
+        i = i + 1
+    }
+    return g
+}
+
+fn fmt_line(f: Fmt) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push(&g.b, 10 as u8)
+    return g
+}
+
+// Pad to `width` on the right, then the number -- for tables.
+fn fmt_wide(f: Fmt, v: i64, width: usize, filler: u8) -> Fmt {
+    var g: Fmt = f
+    var digits: usize = 1
+    var x: u64 = v as u64
+    if v < 0 {
+        digits = 2
+        x = (0 - (v + 1)) as u64 + 1
+    }
+    var rest: u64 = x / 10
+    while rest > 0 {
+        digits = digits + 1
+        rest = rest / 10
+    }
+    var i: usize = digits
+    while i < width {
+        rt.buf_push(&g.b, filler)
+        i = i + 1
+    }
+    rt.buf_push_dec_i64(&g.b, v)
+    return g
+}
+
+// Join two builders: `h` is appended AND RELEASED. That lets a function
+// return an Fmt which the caller keeps building on.
+fn fmt_append(f: Fmt, h: Fmt) -> Fmt {
+    var g: Fmt = f
+    var q: Fmt = h
+    rt.buf_push_bytes(&g.b, rt.buf_ptr(&q.b), rt.buf_len(&q.b))
+    rt.buf_free(&q.b)
+    return g
+}
+
+// APPEND the content to a buffer and release the builder -- the way to not
+// print an `f"..."` but to process it further.
+fn fmt_content(f: Fmt, out: *mut rt.Buf) {
+    var g: Fmt = f
+    rt.buf_push_bytes(out, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_free(&g.b)
+}
+
+fn fmt_print_line(f: Fmt) {
+    var g: Fmt = f
+    rt.buf_push(&g.b, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_free(&g.b)
+}
+
+// Onto stderr instead of stdout -- diagnostics do not belong in the output.
+fn fmt_eprint(f: Fmt) {
+    var g: Fmt = f
+    rt.write_everything(2, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_free(&g.b)
+}
+
+fn fmt_eprint_line(f: Fmt) {
+    var g: Fmt = f
+    rt.buf_push(&g.b, 10 as u8)
+    rt.write_everything(2, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_free(&g.b)
+}
+
+// Write into a file (overwriting) and release.
+fn fmt_in_file(f: Fmt, path: u64) -> bool {
+    var g: Fmt = f
+    let ok: bool = rt.write_file(path, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_free(&g.b)
+    return ok
+}
+
+// =====================================================================
+// Round 69 -- the comfort layer.
+//
+// THE COMPLAINT that started this: reading one number looked like this.
+//
+//     var input: rt.Buf = rt.buf_new()
+//     if !io.read_stdin(&input) { return 1 }
+//     let s = str.span(rt.buf_ptr(&input) as *mut u8, rt.buf_len(&input)).trim()
+//     var x: i64 = 0
+//     if !num.text_to_i64(s.p, s.n, &x) { ... }
+//
+// Five lines, one cast, one buffer the caller has to manage and two loose
+// parameters where a `Span` already exists. In C# it is one line. The
+// library had everything it needed -- it was only uncomfortable and
+// disagreed with itself at the seams.
+//
+// ONE ADDRESS FORM. Outward an address is a `*mut u8`, never a bare `u64`
+// (the reasons are in docs/ROUND69.md). `str` and `num` were already like
+// that; `rt` got `rt.buf_data`/`rt.ptr_of`/`rt.addr_of` and keeps its `u64`
+// forms as thin shells. `io` is the only module that sees both worlds, so
+// every crossing happens HERE -- and never in the caller's code.
+//
+// NOTHING OLD BREAKS. Everything above this line stays exactly as it was.
+// The functions below are ADDED next to it; where the same job exists in
+// both forms, the new one is the `Span` form and the old one keeps its
+// name.
+// =====================================================================
+
+const IO_SYS_READ: i64 = 0
+const IO_STDIN: i64 = 0
+
+// ------------------------------------------------------- Buffer -> Span
+
+// The contents of a buffer as a reading view. Valid as long as the buffer
+// lives and does NOT grow -- growing may move it.
+fn span_of_buf(b: *mut rt.Buf) -> str.Span {
+    return str.span(rt.buf_data(b), rt.buf_len(b))
+}
+
+// ------------------------------------------------------ Output as a Span
+//
+// The `print`/`eprint` family above takes `(p: u64, n: usize)` -- the form
+// from round 39, when there was no `Span`. These four take the `Span`
+// itself, so that the caller neither casts nor takes text apart.
+
+fn write(s: str.Span) {
+    rt.write_everything(1, rt.addr_of(s.p), s.n)
+}
+
+fn write_line(s: str.Span) {
+    rt.write_everything(1, rt.addr_of(s.p), s.n)
+    new_line()
+}
+
+fn write_err(s: str.Span) {
+    rt.write_everything(2, rt.addr_of(s.p), s.n)
+}
+
+fn write_err_line(s: str.Span) {
+    rt.write_everything(2, rt.addr_of(s.p), s.n)
+    var nl: [u8; 1] = "\n"
+    rt.write_everything(2, rt.addr_of(&nl[0]), 1)
+}
+
+// A null terminated sequence with a TYPED address -- the form
+// `&literal[0]` gives you, without `as u64`.
+fn write_c(p: *mut u8) {
+    rt.write_everything(1, rt.addr_of(p), str.c_length(p))
+}
+
+fn write_c_line(p: *mut u8) {
+    write_c(p)
+    new_line()
+}
+
+// ------------------------------------------------- The builder, built out
+
+// A `Span` as a text segment -- the `Span` counterpart of `fmt_text`.
+fn fmt_span(f: Fmt, s: str.Span) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_bytes(&g.b, rt.addr_of(s.p), s.n)
+    return g
+}
+
+// A FLOATING POINT number as the shortest decimal text that reads back
+// (`num.write_f64` -> dtoa). This is the library side of `{x}` for `f64`:
+// the interpolation `f"..."` still casts every value to `i64`
+// (compiler/src/parser.rs, section interpolation), so a later compiler
+// round only has to pick this function instead of `fmt_number` -- the
+// library no longer stands in the way.
+//
+// THE COST, honestly: `num.write_f64` allocates its scratch memory per
+// call (14 KiB, one mmap) and releases it again. Whoever writes many
+// numbers in a loop calls `dtoa` directly with scratch memory of their own.
+// On failure (out of memory) NOTHING is appended -- an invented number
+// would be worse than a gap.
+fn fmt_f64(f: Fmt, x: f64) -> Fmt {
+    var g: Fmt = f
+    var b: num.Bytes = num.bytes_new()
+    if num.write_f64(&b, x) {
+        rt.buf_push_bytes(&g.b, rt.addr_of(b.ptr), b.len)
+    }
+    num.bytes_free(&b)
+    return g
+}
+
+// ROUND 71: the same step for an `f32`. The type checker picks it
+// (sema.rs::fmt_target) -- `f"{x}"` with an f32 prints the SHORTEST text
+// that reads back as this f32, not the seventeen digits of the double next
+// to it.
+fn fmt_f32(f: Fmt, x: f32) -> Fmt {
+    var g: Fmt = f
+    var b: num.Bytes = num.bytes_new()
+    if num.write_f32(&b, x) {
+        rt.buf_push_bytes(&g.b, rt.addr_of(b.ptr), b.len)
+    }
+    num.bytes_free(&b)
+    return g
+}
+
+// ================================================================= Input
+//
+// WHO OWNS THE MEMORY -- the question spelled out, because Firn answers it
+// neither with a garbage collector nor with a hidden buffer:
+//
+//   * `Text` OWNS its octets. It is the only thing that has to be released.
+//   * `Span` OWNS NOTHING. It is a view INTO a `Text` and is valid exactly
+//     as long as that `Text` lives and is not written to again.
+//
+// A reader CANNOT keep a buffer of its own somewhere: stage 0 has no global
+// variables (SPEC 14.1, item 5). Returning a `Span` alone would therefore
+// be a lie -- nobody could release the memory behind it, and a trimmed
+// `Span` does not even point at the start of the block any more. So the
+// owner is returned, and the view is one call away:
+//
+//     var line: io.Text = io.read_text()
+//     defer line.free()
+//     let s: str.Span = line.span().trim()
+//
+// And whoever only wants the NUMBER owns nothing at all: `io.read_i64()`
+// and `io.ask_i64(f"...")` read, parse and release in one step -- there is
+// nothing left to forget.
+
+struct Text {
+    b: rt.Buf,
+    ok: bool,
+}
+
+// An empty, released text.
+fn text_new() -> Text {
+    return Text { b: rt.buf_new(), ok: false }
+}
+
+// The view onto the content. Valid until `text_free` or the next write.
+fn text_span(t: *mut Text) -> str.Span {
+    return span_of_buf(&(*t).b)
+}
+
+fn text_length(t: *mut Text) -> usize {
+    return rt.buf_len(&(*t).b)
+}
+
+// false = there was nothing to read any more (end of input). An EMPTY LINE
+// is `true` with length 0 -- that is the difference between "nothing came"
+// and "an empty line came", and C# makes it too (`ReadLine() == null`).
+fn text_is_ok(t: *mut Text) -> bool {
+    return (*t).ok
+}
+
+fn text_free(t: *mut Text) {
+    rt.buf_free(&(*t).b)
+    (*t).ok = false
+}
+
+// An `f"..."` as an owned text -- the way to get a `Span` out of a string
+// LITERAL without writing out `var x: [u8; N]`. It allocates; for pure
+// output `io.fmt_print_line(f"...")` stays the cheaper way.
+fn text_of(f: Fmt) -> Text {
+    var t: Text = text_new()
+    fmt_content(f, &t.b)
+    t.ok = true
+    return t
+}
+
+impl Text {
+    fn span(*self) -> str.Span { return text_span(self) }
+    fn length(*self) -> usize { return text_length(self) }
+    fn is_ok(*self) -> bool { return text_is_ok(self) }
+    fn free(*mut self) { text_free(self) }
+}
+
+// ---------------------------------------------------------- Reading input
+
+// ONE line from standard input, without the line feed; a `\r` directly in
+// front of it is dropped as well (DOS line endings) -- the same rule
+// `LineReader` follows.
+//
+// ONE read(2) PER OCTET, and that is deliberate: a buffered reader would
+// have to keep the octets it read too much somewhere, and without global
+// variables there is no such place -- it would swallow input that belongs
+// to whoever reads next. Correctness before speed at this seam; whoever
+// reads MANY lines takes `read_all()` plus the `LineReader` cursor, which
+// reads in blocks of 64 KiB.
+fn read_text() -> Text {
+    var t: Text = text_new()
+    var got: bool = false
+    var running: bool = true
+    var c: [u8; 1] = [0 as u8; 1]
+    while running {
+        let r: i64 = syscall(IO_SYS_READ, IO_STDIN, rt.addr_of(&c[0]) as i64, 1, 0,
+            0, 0)
+        if r <= 0 {
+            running = false
+        } else {
+            got = true
+            if c[0] == 10 as u8 {
+                running = false
+            } else {
+                rt.buf_push(&t.b, c[0])
+            }
+        }
+    }
+    if got {
+        let n: usize = rt.buf_len(&t.b)
+        if n > 0 && rt.buf_at(&t.b, n - 1) == 13 as u8 {
+            rt.buf_set_len(&t.b, n - 1)
+        }
+        t.ok = true
+    }
+    return t
+}
+
+// EVERYTHING from standard input up to the end, as an owned text.
+fn read_all() -> Text {
+    var t: Text = text_new()
+    t.ok = rt.read_stdin(&t.b)
+    return t
+}
+
+// **ROUND 88** -- A WHOLE FILE, ADDRESSED BY ITS NAME AS TEXT.
+//
+// `read_file(path: u64, out: *mut rt.Buf)` is the round 39 form: the path as
+// a NULL TERMINATED address, the content into a buffer the caller brought
+// along. Whoever writes his first Firn program had to write
+//
+//     var path: [u8; 15] = "notes.txt\0"
+//     var b: rt.Buf = rt.buf_new()
+//     io.read_file((&path[0]) as u64, &b)
+//
+// -- three lines and two concepts (the null octet, the foreign buffer) for
+// something that is one sentence. Here the file name is a `str`, the null
+// octet is added where it is needed, and what comes back is a `Text` that
+// owns its octets, exactly like `read_text()` and `read_all()`:
+//
+//     var t: io.Text = io.read_file_text("notes.txt")
+//     defer t.free()
+//     if t.is_ok() { io.print_line(t.span()) }
+fn read_file_text(path: str) -> Text {
+    var t: Text = text_new()
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    t.ok = rt.read_file(rt.buf_ptr(&c), &t.b)
+    rt.buf_free(&c)
+    return t
+}
+
+// The counterpart: write text into a file addressed by its name (overwrite,
+// mode 0755). true = it was written.
+fn write_file_text(path: str, content: str) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let ok: bool = rt.write_file(rt.buf_ptr(&c), content.p as u64, content.n)
+    rt.buf_free(&c)
+    return ok
+}
+
+// Ask a question and read the answer. The question is an `f"..."`, so that
+// a string literal needs neither a length nor an array of its own:
+//
+//     var name: io.Text = io.prompt(f"Your name: ")
+//
+// The builder is written out WITHOUT a line feed (a prompt stays on its
+// line) and released while doing so.
+fn prompt(question: Fmt) -> Text {
+    fmt_print(question)
+    return read_text()
+}
+
+// -------------------------------------------------- Reading numbers whole
+//
+// The common case in one call: read a line, trim it, parse it, release the
+// buffer. Nothing is left over that could be forgotten.
+
+fn read_i64() -> num.ParsedI64 {
+    var t: Text = read_text()
+    if !t.ok {
+        text_free(&t)
+        return num.parsed_i64_none()
+    }
+    let r: num.ParsedI64 = num.parse_i64(str.trim(text_span(&t)))
+    text_free(&t)
+    return r
+}
+
+fn read_f64() -> num.ParsedF64 {
+    var t: Text = read_text()
+    if !t.ok {
+        text_free(&t)
+        return num.parsed_f64_none()
+    }
+    let r: num.ParsedF64 = num.parse_f64(str.trim(text_span(&t)))
+    text_free(&t)
+    return r
+}
+
+fn ask_i64(question: Fmt) -> num.ParsedI64 {
+    fmt_print(question)
+    return read_i64()
+}
+
+fn ask_f64(question: Fmt) -> num.ParsedF64 {
+    fmt_print(question)
+    return read_f64()
+}
+
+// ROUND 71: the same pair for the single width.
+fn read_f32() -> num.ParsedF32 {
+    var t: Text = read_text()
+    if !t.ok {
+        text_free(&t)
+        return num.parsed_f32_none()
+    }
+    let r: num.ParsedF32 = num.parse_f32(str.trim(text_span(&t)))
+    text_free(&t)
+    return r
+}
+
+fn ask_f32(question: Fmt) -> num.ParsedF32 {
+    fmt_print(question)
+    return read_f32()
+}
+
+// ===================================================================== ROUND 70
+// `str` is a language type since round 70. The interpolation f"..." picks the
+// formatting function by the TYPE of the expression -- fmt_value for whole
+// numbers, fmt_bool, fmt_f64, and fmt_str for text.
+
+fn fmt_value(f: Fmt, v: i64) -> Fmt {
+    return fmt_number(f, v)
+}
+
+fn fmt_str(f: Fmt, s: str) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_bytes(&g.b, s.p as u64, s.n)
+    return g
+}
+
+// The round 70 spelling. Since round 88 `print` and `print_line` do exactly
+// the same; these two stay so that no program has to be rewritten.
+fn print_str(s: str) {
+    print(s)
+}
+
+fn println_str(s: str) {
+    print_line(s)
+}
+
+// One line from standard input, WITHOUT a buffer of your own: the result is a
+// `str` and owns its memory (round 70). The Text variant of round 69 lives on
+// as `read_text` for whoever wants the ok flag.
+fn read_line() -> str {
+    var b: rt.Buf = rt.buf_new()
+    var c: [u8; 1] = [0]
+    var going: bool = true
+    while going {
+        let got: i64 = syscall(IO_SYS_READ, IO_STDIN, rt.addr_of(&c[0]) as i64, 1, 0, 0, 0)
+        if got != 1 {
+            going = false
+        } else {
+            if c[0] == 10 as u8 {
+                going = false
+            } else {
+                rt.buf_push(&b, c[0])
+            }
+        }
+    }
+    var n: usize = rt.buf_len(&b)
+    if n > 0 && rt.buf_at(&b, n - 1) == 13 as u8 {
+        n = n - 1
+    }
+    let out: str = __str_copy(str { p: rt.buf_ptr(&b) as *mut u8, n: n })
+    rt.buf_free(&b)
+    return out
+}

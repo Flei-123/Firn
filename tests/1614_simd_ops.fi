@@ -1,0 +1,677 @@
+// expect_out: simd ok
+// tests/1614_simd_ops.fi -- ROUND 91: the intrinsics of round 82 against a
+// SCALAR REFERENCE, on both machines.
+//
+// WHY THIS FILE EXISTS. Round 82 built 42 intrinsics for x86-64; round 91
+// built their aarch64 counterparts. Only twenty of them are reachable
+// through `lib/std/crypto` and therefore through `tests/1613_crypto.fi` --
+// the other twenty-two would have been code that compiles, assembles and
+// nobody ever ran. An untested instruction mapping is a claim, not a
+// measurement.
+//
+// So every intrinsic here is held against the same thing computed WITHOUT
+// it, in plain Firn, in this file. That check is not about the two machines:
+// it fails on x86-64 just as loudly. What the two machines add is
+// `tools/aarch64/run.sh`, which compiles this program for both and compares
+// what it prints -- so a mapping that is wrong only on aarch64 shows up
+// there.
+//
+// THE TRAP THIS FILE IS AIMED AT. `__aesenc` is named after the x86
+// instruction and MEANS it:
+//
+//     AESENC(s,k) = MixColumns(SubBytes(ShiftRows(s))) xor k
+//
+// ARM's `aese` does the AddRoundKey FIRST and x86 does it LAST, so writing
+// `aese` for `__aesenc` compiles, runs, and computes a different cipher.
+// Section D below runs the FIPS 197 C.1 known answer test through the
+// intrinsics -- INCLUDING the key schedule out of `__aeskeygenassist` --
+// which is exactly the shape that catches it.
+//
+// Everything is asked for first: a processor without SSSE3/SSE4.1 (or
+// without NEON) must not EXECUTE any of this, so the program says "simd ok"
+// and returns 0 there. That is the house rule of round 82 and the reason the
+// scalar path still exists.
+import std.cpu
+import std.rt
+import std.io
+import std.crypto.accel
+
+// ---------------------------------------------------------------- helpers
+
+fn spill(v: v128, out: u64) {
+    __v128_store(out as *mut u8, v)
+}
+
+fn eq16(a: u64, b: u64) -> bool {
+    return rt.mem_eq(a, b, 16)
+}
+
+// `pshufd` in plain Firn: four 32-bit lanes, two bits of the immediate each.
+fn ref_shuffle32(src: u64, out: u64, imm: u32) {
+    var l: usize = 0
+    while l < 4 {
+        let s: usize = ((imm >> ((l as u32) * 2)) & 3 as u32) as usize
+        var k: usize = 0
+        while k < 4 {
+            rt.st8(out, l * 4 + k, rt.ld8(src, s * 4 + k))
+            k = k + 1
+        }
+        l = l + 1
+    }
+}
+
+// `palignr(a, b, n)`: the 32 octets b:a shifted right by n, low half kept.
+fn ref_alignr(a: u64, b: u64, out: u64, n: usize) {
+    var i: usize = 0
+    while i < 16 {
+        let s: usize = i + n
+        if s < 16 {
+            rt.st8(out, i, rt.ld8(b, s))
+        } else {
+            if s < 32 {
+                rt.st8(out, i, rt.ld8(a, s - 16))
+            } else {
+                rt.st8(out, i, 0 as u8)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn ref_shl_bytes(a: u64, out: u64, n: usize) {
+    var i: usize = 0
+    while i < 16 {
+        if i < n {
+            rt.st8(out, i, 0 as u8)
+        } else {
+            rt.st8(out, i, rt.ld8(a, i - n))
+        }
+        i = i + 1
+    }
+}
+
+fn ref_shr_bytes(a: u64, out: u64, n: usize) {
+    var i: usize = 0
+    while i < 16 {
+        if i + n < 16 {
+            rt.st8(out, i, rt.ld8(a, i + n))
+        } else {
+            rt.st8(out, i, 0 as u8)
+        }
+        i = i + 1
+    }
+}
+
+// `pblendw`: eight 16-bit lanes, bit i of the immediate takes lane i from b.
+fn ref_blend16(a: u64, b: u64, out: u64, imm: u32) {
+    var l: usize = 0
+    while l < 8 {
+        var from: u64 = a
+        if ((imm >> (l as u32)) & 1 as u32) != 0 as u32 {
+            from = b
+        }
+        rt.st8(out, l * 2, rt.ld8(from, l * 2))
+        rt.st8(out, l * 2 + 1, rt.ld8(from, l * 2 + 1))
+        l = l + 1
+    }
+}
+
+// One octet of CRC-32C (Castagnoli), the polynomial SSE 4.2's `crc32` and
+// A64's `crc32c*` both implement -- bit reflected, so the register shifts
+// right.
+fn ref_crc32c_u8(crc: u32, v: u8) -> u32 {
+    var c: u32 = crc ^ (v as u32)
+    var k: usize = 0
+    while k < 8 {
+        if (c & 1 as u32) != 0 as u32 {
+            c = (c >> 1) ^ 2197175160 as u32
+        } else {
+            c = c >> 1
+        }
+        k = k + 1
+    }
+    return c
+}
+
+// Carry-less multiplication of two 64-bit values -> 128 bits.
+fn ref_clmul(x: u64, y: u64, out: u64) {
+    var lo: u64 = 0
+    var hi: u64 = 0
+    var i: usize = 0
+    while i < 64 {
+        if ((y >> (i as u64)) & 1) != 0 {
+            lo = lo ^ (x << (i as u64))
+            if i > 0 {
+                hi = hi ^ (x >> ((64 - i) as u64))
+            }
+        }
+        i = i + 1
+    }
+    rt.st64(out, 0, lo)
+    rt.st64(out, 1, hi)
+}
+
+// The AES-NI key expansion step. `t0` is what `__aeskeygenassist` gave; the
+// broadcast of its top word and the three shifted xors are the rest of it.
+// Both parameters and the result are `v128`, so this also exercises the
+// vector half of the calling convention (System V xmm0-7 / AAPCS64 v0-v7).
+fn key_next(k: v128, t0: v128) -> v128 {
+    let t: v128 = __v128_shuffle32(t0, 255)
+    var x: v128 = __v128_xor(k, __v128_shl_bytes(k, 4))
+    x = __v128_xor(x, __v128_shl_bytes(x, 4))
+    x = __v128_xor(x, __v128_shl_bytes(x, 4))
+    return __v128_xor(x, t)
+}
+
+fn hex_is(p: u64, n: usize, lit: u64) -> bool {
+    var digits: [u8; 17] = "0123456789abcdef\0"
+    var i: usize = 0
+    while i < n {
+        let v: u8 = rt.ld8(p, i)
+        if rt.ld8(lit, i * 2) != digits[(v >> 4) as usize] {
+            return false
+        }
+        if rt.ld8(lit, i * 2 + 1) != digits[(v & 15 as u8) as usize] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------------- main
+
+fn main() -> i32 {
+    var ok: [u8; 8] = "simd ok\0"
+    let okp: u64 = (&ok[0]) as u64
+
+    // The processor is ASKED, always, before a single vector instruction is
+    // executed (SPEC §8.6, round 82).
+    if !cpu.has_ssse3() || !cpu.has_sse41() || !cpu.has_sse2() {
+        io.print_line_bytes(okp, 7)
+        return 0
+    }
+
+    var av: [u8; 16] = [0; 16]
+    var bv: [u8; 16] = [0; 16]
+    var got: [u8; 16] = [0; 16]
+    var want: [u8; 16] = [0; 16]
+    let ap: u64 = (&av[0]) as u64
+    let bp: u64 = (&bv[0]) as u64
+    let gp: u64 = (&got[0]) as u64
+    let wp: u64 = (&want[0]) as u64
+
+    var i: usize = 0
+    while i < 16 {
+        rt.st8(ap, i, ((i * 37 + 11) % 256) as u8)
+        rt.st8(bp, i, ((i * 91 + 3) % 256) as u8)
+        i = i + 1
+    }
+
+    // --- A: memory, and the bitwise instructions
+    let a: v128 = __v128_load(ap as *u8)
+    let b: v128 = __v128_load(bp as *u8)
+    spill(a, gp)
+    if !eq16(gp, ap) {
+        return 10
+    }
+    i = 0
+    while i < 16 {
+        rt.st8(wp, i, rt.ld8(ap, i) ^ rt.ld8(bp, i))
+        i = i + 1
+    }
+    spill(__v128_xor(a, b), gp)
+    if !eq16(gp, wp) {
+        return 11
+    }
+    i = 0
+    while i < 16 {
+        rt.st8(wp, i, rt.ld8(ap, i) & rt.ld8(bp, i))
+        i = i + 1
+    }
+    spill(__v128_and(a, b), gp)
+    if !eq16(gp, wp) {
+        return 12
+    }
+    i = 0
+    while i < 16 {
+        rt.st8(wp, i, rt.ld8(ap, i) | rt.ld8(bp, i))
+        i = i + 1
+    }
+    spill(__v128_or(a, b), gp)
+    if !eq16(gp, wp) {
+        return 13
+    }
+    // andnot(a, b) = ~a & b -- the one whose operands change places on A64.
+    i = 0
+    while i < 16 {
+        rt.st8(wp, i, (rt.ld8(ap, i) ^ 255 as u8) & rt.ld8(bp, i))
+        i = i + 1
+    }
+    spill(__v128_andnot(a, b), gp)
+    if !eq16(gp, wp) {
+        return 14
+    }
+    spill(__v128_zero(), gp)
+    i = 0
+    while i < 16 {
+        rt.st8(wp, i, 0 as u8)
+        i = i + 1
+    }
+    if !eq16(gp, wp) {
+        return 15
+    }
+
+    // --- B: the shuffles
+    // `pshufb`, with two indices whose top bit is set: those write a zero
+    // octet, and only the low four bits count for the rest. On A64 that rule
+    // is a mask plus `tbl`, and it is the mask this checks.
+    var idxv: [u8; 16] = [3, 1, 0, 15, 130, 7, 7, 2, 9, 200, 11, 12, 13, 14, 5, 6]
+    let ip: u64 = (&idxv[0]) as u64
+    let iv: v128 = __v128_load(ip as *u8)
+    i = 0
+    while i < 16 {
+        let k: u8 = rt.ld8(ip, i)
+        if (k & 128 as u8) != 0 as u8 {
+            rt.st8(wp, i, 0 as u8)
+        } else {
+            rt.st8(wp, i, rt.ld8(ap, (k & 15 as u8) as usize))
+        }
+        i = i + 1
+    }
+    spill(__v128_shuffle8(a, iv), gp)
+    if !eq16(gp, wp) {
+        return 20
+    }
+    ref_shuffle32(ap, wp, 177)
+    spill(__v128_shuffle32(a, 177), gp)
+    if !eq16(gp, wp) {
+        return 21
+    }
+    ref_shuffle32(ap, wp, 27)
+    spill(__v128_shuffle32(a, 27), gp)
+    if !eq16(gp, wp) {
+        return 22
+    }
+    ref_shuffle32(ap, wp, 14)
+    spill(__v128_shuffle32(a, 14), gp)
+    if !eq16(gp, wp) {
+        return 23
+    }
+    ref_alignr(ap, bp, wp, 4)
+    spill(__v128_alignr(a, b, 4), gp)
+    if !eq16(gp, wp) {
+        return 24
+    }
+    ref_alignr(ap, bp, wp, 8)
+    spill(__v128_alignr(a, b, 8), gp)
+    if !eq16(gp, wp) {
+        return 25
+    }
+    // 16 and above walk out of the second operand into the first, and
+    // zeroes come in at the top.
+    ref_alignr(ap, bp, wp, 16)
+    spill(__v128_alignr(a, b, 16), gp)
+    if !eq16(gp, wp) {
+        return 26
+    }
+    ref_alignr(ap, bp, wp, 20)
+    spill(__v128_alignr(a, b, 20), gp)
+    if !eq16(gp, wp) {
+        return 27
+    }
+    ref_shl_bytes(ap, wp, 1)
+    spill(__v128_shl_bytes(a, 1), gp)
+    if !eq16(gp, wp) {
+        return 28
+    }
+    ref_shl_bytes(ap, wp, 4)
+    spill(__v128_shl_bytes(a, 4), gp)
+    if !eq16(gp, wp) {
+        return 29
+    }
+    ref_shr_bytes(ap, wp, 1)
+    spill(__v128_shr_bytes(a, 1), gp)
+    if !eq16(gp, wp) {
+        return 30
+    }
+    ref_shr_bytes(ap, wp, 5)
+    spill(__v128_shr_bytes(a, 5), gp)
+    if !eq16(gp, wp) {
+        return 31
+    }
+    ref_blend16(ap, bp, wp, 240)
+    spill(__v128_blend16(a, b, 240), gp)
+    if !eq16(gp, wp) {
+        return 32
+    }
+    ref_blend16(ap, bp, wp, 85)
+    spill(__v128_blend16(a, b, 85), gp)
+    if !eq16(gp, wp) {
+        return 33
+    }
+    // the four interleavings
+    i = 0
+    while i < 4 {
+        rt.st8(wp, i, rt.ld8(ap, i))
+        rt.st8(wp, 4 + i, rt.ld8(bp, i))
+        rt.st8(wp, 8 + i, rt.ld8(ap, 4 + i))
+        rt.st8(wp, 12 + i, rt.ld8(bp, 4 + i))
+        i = i + 1
+    }
+    spill(__v128_unpacklo32(a, b), gp)
+    if !eq16(gp, wp) {
+        return 34
+    }
+    i = 0
+    while i < 4 {
+        rt.st8(wp, i, rt.ld8(ap, 8 + i))
+        rt.st8(wp, 4 + i, rt.ld8(bp, 8 + i))
+        rt.st8(wp, 8 + i, rt.ld8(ap, 12 + i))
+        rt.st8(wp, 12 + i, rt.ld8(bp, 12 + i))
+        i = i + 1
+    }
+    spill(__v128_unpackhi32(a, b), gp)
+    if !eq16(gp, wp) {
+        return 35
+    }
+    i = 0
+    while i < 8 {
+        rt.st8(wp, i, rt.ld8(ap, i))
+        rt.st8(wp, 8 + i, rt.ld8(bp, i))
+        i = i + 1
+    }
+    spill(__v128_unpacklo64(a, b), gp)
+    if !eq16(gp, wp) {
+        return 36
+    }
+    i = 0
+    while i < 8 {
+        rt.st8(wp, i, rt.ld8(ap, 8 + i))
+        rt.st8(wp, 8 + i, rt.ld8(bp, 8 + i))
+        i = i + 1
+    }
+    spill(__v128_unpackhi64(a, b), gp)
+    if !eq16(gp, wp) {
+        return 37
+    }
+
+    // --- C: the lane arithmetic
+    var g32: [u32; 4] = [0; 4]
+    var w32: [u32; 4] = [0; 4]
+    let g32p: u64 = (&g32[0]) as u64
+    let w32p: u64 = (&w32[0]) as u64
+    var l: usize = 0
+    while l < 4 {
+        rt.st32(w32p, l, rt.ld32(ap, l) +% rt.ld32(bp, l))
+        l = l + 1
+    }
+    spill(__v128_add32(a, b), g32p)
+    if !eq16(g32p, w32p) {
+        return 40
+    }
+    l = 0
+    while l < 4 {
+        rt.st32(w32p, l, rt.ld32(ap, l) -% rt.ld32(bp, l))
+        l = l + 1
+    }
+    spill(__v128_sub32(a, b), g32p)
+    if !eq16(g32p, w32p) {
+        return 41
+    }
+    l = 0
+    while l < 2 {
+        rt.st64(w32p, l, rt.ld64(ap, l) +% rt.ld64(bp, l))
+        l = l + 1
+    }
+    spill(__v128_add64(a, b), g32p)
+    if !eq16(g32p, w32p) {
+        return 42
+    }
+    i = 0
+    while i < 16 {
+        rt.st8(wp, i, rt.ld8(ap, i) +% rt.ld8(bp, i))
+        i = i + 1
+    }
+    spill(__v128_add8(a, b), gp)
+    if !eq16(gp, wp) {
+        return 43
+    }
+    l = 0
+    while l < 4 {
+        rt.st32(w32p, l, rt.ld32(ap, l) << 5)
+        l = l + 1
+    }
+    spill(__v128_shl32(a, 5), g32p)
+    if !eq16(g32p, w32p) {
+        return 44
+    }
+    l = 0
+    while l < 4 {
+        rt.st32(w32p, l, rt.ld32(ap, l) >> 7)
+        l = l + 1
+    }
+    spill(__v128_shr32(a, 7), g32p)
+    if !eq16(g32p, w32p) {
+        return 45
+    }
+    l = 0
+    while l < 2 {
+        rt.st64(w32p, l, rt.ld64(ap, l) << 13)
+        l = l + 1
+    }
+    spill(__v128_shl64(a, 13), g32p)
+    if !eq16(g32p, w32p) {
+        return 46
+    }
+    l = 0
+    while l < 2 {
+        rt.st64(w32p, l, rt.ld64(ap, l) >> 21)
+        l = l + 1
+    }
+    spill(__v128_shr64(a, 21), g32p)
+    if !eq16(g32p, w32p) {
+        return 47
+    }
+    // a shift of zero is a move, and `ushr` cannot even encode it on A64.
+    spill(__v128_shr32(a, 0), gp)
+    if !eq16(gp, ap) {
+        return 48
+    }
+    spill(__v128_shl64(a, 0), gp)
+    if !eq16(gp, ap) {
+        return 49
+    }
+
+    // --- D: construction and extraction
+    let lo: u64 = rt.ld64(ap, 0)
+    let hi: u64 = rt.ld64(ap, 1)
+    spill(__v128_from_u64(lo, hi), gp)
+    if !eq16(gp, ap) {
+        return 50
+    }
+    if __v128_get_u64(a, 0) != lo {
+        return 51
+    }
+    if __v128_get_u64(a, 1) != hi {
+        return 52
+    }
+    if __v128_get_u32(a, 0) != rt.ld32(ap, 0) {
+        return 53
+    }
+    if __v128_get_u32(a, 3) != rt.ld32(ap, 3) {
+        return 54
+    }
+    i = 0
+    while i < 16 {
+        rt.st8(wp, i, rt.ld8(ap, i))
+        i = i + 1
+    }
+    rt.st32(wp, 2, 3735928559 as u32)
+    spill(__v128_set_u32(a, 3735928559 as u32, 2), gp)
+    if !eq16(gp, wp) {
+        return 55
+    }
+
+    // --- E: AES, the FIPS 197 C.1 known answer test THROUGH the intrinsics.
+    //
+    // The key schedule comes out of `__aeskeygenassist`, so this covers the
+    // one instruction of the family that has no ARM counterpart at all (A64
+    // has no plain SubBytes) as well as the four round instructions.
+    if cpu.has_aes() {
+        var key: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        var rk: [u8; 176] = [0; 176]
+        let rkp: u64 = (&rk[0]) as u64
+        var k: v128 = __v128_load((&key[0]) as *u8)
+        __v128_store(rkp as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 1))
+        __v128_store((rkp + 16) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 2))
+        __v128_store((rkp + 32) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 4))
+        __v128_store((rkp + 48) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 8))
+        __v128_store((rkp + 64) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 16))
+        __v128_store((rkp + 80) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 32))
+        __v128_store((rkp + 96) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 64))
+        __v128_store((rkp + 112) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 128))
+        __v128_store((rkp + 128) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 27))
+        __v128_store((rkp + 144) as *mut u8, k)
+        k = key_next(k, __aeskeygenassist(k, 54))
+        __v128_store((rkp + 160) as *mut u8, k)
+        // FIPS 197 A.1: w4..w7 and w40..w43, the two ends of the schedule.
+        var v_rk1: [u8; 33] = "d6aa74fdd2af72fadaa678f1d6ab76fe\0"
+        var v_rk10: [u8; 33] = "13111d7fe3944a17f307a78b4d2b30c5\0"
+        if !hex_is(rkp + 16, 16, (&v_rk1[0]) as u64) {
+            return 60
+        }
+        if !hex_is(rkp + 160, 16, (&v_rk10[0]) as u64) {
+            return 61
+        }
+        // FIPS 197 C.1, forwards.
+        var plain: [u8; 16] = [0, 17, 34, 51, 68, 85, 102, 119, 136, 153,
+            170, 187, 204, 221, 238, 255]
+        var v_ct: [u8; 33] = "69c4e0d86a7b0430d8cdb78070b4c55a\0"
+        var s: v128 = __v128_load((&plain[0]) as *u8)
+        s = __v128_xor(s, __v128_load(rkp as *u8))
+        s = __aesenc(s, __v128_load((rkp + 16) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 32) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 48) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 64) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 80) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 96) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 112) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 128) as *u8))
+        s = __aesenc(s, __v128_load((rkp + 144) as *u8))
+        s = __aesenclast(s, __v128_load((rkp + 160) as *u8))
+        spill(s, gp)
+        if !hex_is(gp, 16, (&v_ct[0]) as u64) {
+            return 62
+        }
+        // and back, over the equivalent inverse cipher: the round keys in
+        // reverse order with `__aesimc` on the nine middle ones.
+        var dk: [u8; 176] = [0; 176]
+        let dkp: u64 = (&dk[0]) as u64
+        __v128_store(dkp as *mut u8, __v128_load((rkp + 160) as *u8))
+        var r: usize = 1
+        while r < 10 {
+            let src: v128 = __v128_load((rkp + ((10 - r) * 16) as u64) as *u8)
+            __v128_store((dkp + (r * 16) as u64) as *mut u8, __aesimc(src))
+            r = r + 1
+        }
+        __v128_store((dkp + 160) as *mut u8, __v128_load(rkp as *u8))
+        var c: v128 = __v128_load(gp as *u8)
+        c = __v128_xor(c, __v128_load(dkp as *u8))
+        c = __aesdec(c, __v128_load((dkp + 16) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 32) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 48) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 64) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 80) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 96) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 112) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 128) as *u8))
+        c = __aesdec(c, __v128_load((dkp + 144) as *u8))
+        c = __aesdeclast(c, __v128_load((dkp + 160) as *u8))
+        spill(c, gp)
+        if !eq16(gp, (&plain[0]) as u64) {
+            return 63
+        }
+    }
+
+    // --- F: SHA-256. `sha256_ni_blocks` is the ensemble of `__sha256rnds2`,
+    // `__sha256msg1` and `__sha256msg2`; FIPS 180-4 Appendix A is its
+    // published answer. On aarch64 two of those three are built out of
+    // ordinary instructions (ARM's `sha256h` does four rounds where x86 does
+    // two, and `sha256su1` folds in a term x86's `SHA256MSG2` does not), so
+    // this is the vector that decides whether that was done right.
+    if cpu.has_sha() {
+        var blk: [u8; 64] = [0; 64]
+        let bkp: u64 = (&blk[0]) as u64
+        rt.st8(bkp, 0, 97 as u8)
+        rt.st8(bkp, 1, 98 as u8)
+        rt.st8(bkp, 2, 99 as u8)
+        rt.st8(bkp, 3, 128 as u8)
+        rt.st8(bkp, 63, 24 as u8)
+        var h: [u32; 8] = [1779033703, 3144134277, 1013904242, 2773480762,
+            1359893119, 2600822924, 528734635, 1541459225]
+        let hp: u64 = (&h[0]) as u64
+        accel.sha256_ni_blocks(hp, bkp, 1)
+        var digest: [u32; 8] = [3128432319, 2399260650, 1094795486,
+            1571693091, 2953011619, 2518121116, 3021012833, 4060091821]
+        if !rt.mem_eq(hp, (&digest[0]) as u64, 32) {
+            return 70
+        }
+    }
+
+    // --- G: CRC-32C. The instruction is the raw update, so the reference is
+    // the raw update: eight shifts of the reflected polynomial per octet.
+    if cpu.has_sse42() {
+        var acc: u64 = 4294967295
+        var racc: u32 = 4294967295 as u32
+        i = 0
+        while i < 16 {
+            acc = __crc32_u8(acc, rt.ld8(ap, i))
+            racc = ref_crc32c_u8(racc, rt.ld8(ap, i))
+            i = i + 1
+        }
+        if acc != racc as u64 {
+            return 80
+        }
+        acc = __crc32_u64(acc, rt.ld64(bp, 0))
+        i = 0
+        while i < 8 {
+            racc = ref_crc32c_u8(racc, rt.ld8(bp, i))
+            i = i + 1
+        }
+        if acc != racc as u64 {
+            return 81
+        }
+    }
+
+    // --- H: the carry-less product.
+    if cpu.has_pclmul() {
+        ref_clmul(rt.ld64(ap, 0), rt.ld64(bp, 0), wp)
+        spill(__pclmulqdq(a, b, 0), gp)
+        if !eq16(gp, wp) {
+            return 90
+        }
+        ref_clmul(rt.ld64(ap, 1), rt.ld64(bp, 1), wp)
+        spill(__pclmulqdq(a, b, 17), gp)
+        if !eq16(gp, wp) {
+            return 91
+        }
+        ref_clmul(rt.ld64(ap, 1), rt.ld64(bp, 0), wp)
+        spill(__pclmulqdq(a, b, 1), gp)
+        if !eq16(gp, wp) {
+            return 92
+        }
+    }
+
+    io.print_line_bytes(okp, 7)
+    return 0
+}

@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/strsoak/soak.fi -- THE LEAK PROOF for `str` (round 70).
+//
+// The endurance run builds MANY short lived strings with `+`. Every one of
+// them lands in the GC heap (`__str_concat` in lib/gc/gc.fi), and every one
+// of them is dead again in the next iteration. If the collector really takes
+// them back, the resident memory of the process stays flat; if it does not,
+// it grows linearly.
+//
+// WHAT IS MEASURED is the REAL memory consumption of the process (RSS out of
+// /proc/self/statm), not the self-report of the runtime. A runtime that
+// counts wrongly would otherwise certify its own correctness.
+//
+// The counter-check runs the very same loop with the collector switched OFF
+// (`--leak`): then `gc_set_limit` is set so high that no cycle is ever
+// started. If THAT one stays flat too, the measuring method is broken and
+// the caller must not believe the green result -- which is exactly what
+// tools/strsoak/run.sh checks.
+//
+// Arguments:  soak <rounds> [--leak]
+import std.io
+import std.rt
+
+// The collector runtime brings its own SYS_OPEN/SYS_CLOSE along (program wide
+// names), so this file names its three numbers differently.
+const NR_OPEN: i64 = 2
+const NR_READ: i64 = 0
+const NR_CLOSE: i64 = 3
+
+// Resident set size in pages, out of /proc/self/statm (field 2).
+fn rss_pages() -> u64 {
+    var path: [u8; 18] = "/proc/self/statm\0\0"
+    let fd: i64 = syscall(NR_OPEN, (&path[0]) as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return 0
+    }
+    var buf: [u8; 128] = [0 as u8; 128]
+    let got: i64 = syscall(NR_READ, fd, (&buf[0]) as i64, 128, 0, 0, 0)
+    syscall(NR_CLOSE, fd, 0, 0, 0, 0, 0)
+    if got <= 0 {
+        return 0
+    }
+    // skip field 1, then read field 2
+    var i: usize = 0
+    let n: usize = got as usize
+    while i < n && buf[i] != 32 as u8 {
+        i = i + 1
+    }
+    while i < n && buf[i] == 32 as u8 {
+        i = i + 1
+    }
+    var v: u64 = 0
+    while i < n && buf[i] >= 48 as u8 && buf[i] <= 57 as u8 {
+        v = v * 10 + (buf[i] as u64 - 48)
+        i = i + 1
+    }
+    return v
+}
+
+// One round: a handful of concatenations whose results all die again.
+// The result is handed back so that the optimizer cannot drop the work.
+fn one_round(k: u64) -> usize {
+    let head: str = "firn/"
+    let tail: str = "/round"
+    var acc: str = ""
+    var i: u64 = 0
+    while i < 8 {
+        let piece: str = head + "abcdefgh" + tail
+        acc = piece + "!"
+        i = i + 1
+    }
+    let _unused: u64 = k
+    return acc.n
+}
+
+// A decimal number out of a null terminated argument; 0 = none.
+fn arg_number(p: u64) -> u64 {
+    if p == 0 {
+        return 0
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 + (rt.ld8(p, i) as u64 - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn main(start: u64) -> i32 {
+    if !gc_init() {
+        return 1
+    }
+    var rounds: u64 = 200000
+    var leak: bool = false
+    var ai: usize = 1
+    while ai < rt.arg_count(start) {
+        let p: u64 = rt.arg_ptr(start, ai)
+        var lw: [u8; 6] = "--leak"
+        if rt.c_length(p) == 6 && rt.mem_eq(p, (&lw[0]) as u64, 6) {
+            leak = true
+        } else {
+            let v: u64 = arg_number(p)
+            if v > 0 {
+                rounds = v
+            }
+        }
+        ai = ai + 1
+    }
+    // The counter-check: a limit so high that no cycle is ever started.
+    if leak {
+        gc_set_limit(18446744073709551615)
+    }
+    let rss0: u64 = rss_pages()
+    var total: usize = 0
+    var k: u64 = 0
+    var peak: u64 = rss0
+    while k < rounds {
+        total = total + one_round(k)
+        if k % 4096 == 0 {
+            let now: u64 = rss_pages()
+            if now > peak {
+                peak = now
+            }
+        }
+        k = k + 1
+    }
+    let done: u64 = rss_pages()
+    io.fmt_print_line(f"rounds={rounds} rss_start_kib={rss0 * 4} rss_end_kib={done * 4} rss_peak_kib={peak * 4} bytes_built={total} runs={gc_collections()} heap_kib={gc_heap_bytes() / 1024}")
+    return 0
+}

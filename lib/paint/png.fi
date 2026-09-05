@@ -1,0 +1,500 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/paint/png.fi -- the picture leaves the process: PPM and PNG out,
+// PNG in.
+//
+// PPM IS THERE ON PURPOSE and is not a fallback. It is eleven octets of
+// header and then the raw pixels; a bug in the writer cannot hide in it,
+// and a harness can read it without a library. Whenever the two disagree
+// about a picture, PPM is the one that is right.
+//
+// PNG is the one anybody can look at. It needs three things, and all
+// three are already in this repository: DEFLATE (round 81, written in
+// Firn, no zlib linked in), the CRC-32 that comes with it, and the
+// Adler-32 of the zlib frame. What this file adds is the chunk structure,
+// the per-row FILTER and the reverse of it.
+//
+// THE FILTER is the part of PNG people forget. Every row is preceded by
+// one octet saying how it was predicted from the row above and from the
+// pixel to the left; a decoder that ignores it gets noise, and an encoder
+// that always writes 0 produces a file three times too large. The encoder
+// here picks per row, by the standard heuristic of the specification
+// (minimum sum of absolute differences), and the decoder implements all
+// five.
+import rt.rt
+import html.mem
+import std.deflate
+import paint.canvas
+
+export {
+    write_ppm, write_png, Image, image_new, image_free, decode_png,
+    image_width, image_height, image_pixel, image_ok,
+}
+
+// ------------------------------------------------------------------ PPM
+
+#[no_gc]
+fn push_dec(b: *mut mem.Buf, v: u64) {
+    mem.buf_push_dec(b, v)
+}
+
+fn write_ppm(cv: *mut canvas.Canvas, out: *mut mem.Buf) {
+    let w: usize = canvas.canvas_width(cv)
+    let h: usize = canvas.canvas_height(cv)
+    var head: [u8; 3] = "P6\n"
+    var i: usize = 0
+    while i < 3 {
+        mem.buf_push(out, head[i])
+        i = i + 1
+    }
+    push_dec(out, w as u64)
+    mem.buf_push(out, 32 as u8)
+    push_dec(out, h as u64)
+    mem.buf_push(out, 10 as u8)
+    var m: [u8; 4] = "255\n"
+    i = 0
+    while i < 4 {
+        mem.buf_push(out, m[i])
+        i = i + 1
+    }
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            let v: u32 = canvas.canvas_get(cv, x, y)
+            // The canvas is PREMULTIPLIED; PPM has no alpha, so the
+            // picture is put on white -- which is what a browser window
+            // is behind the page.
+            let a: u32 = (v >> 24) & 255 as u32
+            let inv: u32 = 255 - a
+            mem.buf_push(out, (((v >> 16) & 255 as u32) + inv) as u8)
+            mem.buf_push(out, (((v >> 8) & 255 as u32) + inv) as u8)
+            mem.buf_push(out, ((v & 255 as u32) + inv) as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// ------------------------------------------------------------------ PNG
+
+#[no_gc]
+fn be32(b: *mut mem.Buf, v: u32) {
+    mem.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+    mem.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    mem.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    mem.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn chunk(out: *mut mem.Buf, tag: *mut u8, payload: u64, n: usize) {
+    be32(out, n as u32)
+    let start: usize = mem.buf_len(out)
+    var i: usize = 0
+    while i < 4 {
+        mem.buf_push(out, *((tag as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        mem.buf_push(out, *((payload + i as u64) as *mut u8))
+        i = i + 1
+    }
+    let base: u64 = mem.buf_ptr(out) as u64 + start as u64
+    be32(out, deflate.crc32(base, 4 + n))
+}
+
+// The filter of one row, chosen by the sum of absolute differences -- the
+// heuristic the PNG specification itself recommends (12.8).
+#[no_gc]
+fn paeth(a: i32, b: i32, c: i32) -> i32 {
+    let pp: i32 = a + b - c
+    var pa: i32 = pp - a
+    if pa < 0 {
+        pa = 0 - pa
+    }
+    var pb: i32 = pp - b
+    if pb < 0 {
+        pb = 0 - pb
+    }
+    var pc: i32 = pp - c
+    if pc < 0 {
+        pc = 0 - pc
+    }
+    if pa <= pb && pa <= pc {
+        return a
+    }
+    if pb <= pc {
+        return b
+    }
+    return c
+}
+
+fn write_png(cv: *mut canvas.Canvas, out: *mut mem.Buf) -> bool {
+    let w: usize = canvas.canvas_width(cv)
+    let h: usize = canvas.canvas_height(cv)
+    if w == 0 || h == 0 {
+        return false
+    }
+    // ---- the raw scan lines, RGBA, with a filter octet in front of each
+    let stride: usize = w * 4
+    let raw_n: usize = (stride + 1) * h
+    let raw: *mut u8 = mem.heap_alloc(raw_n)
+    if raw as usize == 0 {
+        return false
+    }
+    let prev: *mut u8 = mem.heap_alloc(stride)
+    let cur: *mut u8 = mem.heap_alloc(stride)
+    let best: *mut u8 = mem.heap_alloc(stride)
+    if prev as usize == 0 || cur as usize == 0 || best as usize == 0 {
+        return false
+    }
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            let v: u32 = canvas.canvas_get(cv, x, y)
+            // PNG wants STRAIGHT alpha, the canvas holds premultiplied.
+            let a: u32 = (v >> 24) & 255 as u32
+            var r: u32 = (v >> 16) & 255 as u32
+            var g: u32 = (v >> 8) & 255 as u32
+            var b: u32 = v & 255 as u32
+            if a != 0 as u32 && a != 255 as u32 {
+                r = unpremul(r, a)
+                g = unpremul(g, a)
+                b = unpremul(b, a)
+            }
+            let p: u64 = cur as u64 + (x * 4) as u64
+            *(p as *mut u8) = r as u8
+            *((p + 1) as *mut u8) = g as u8
+            *((p + 2) as *mut u8) = b as u8
+            *((p + 3) as *mut u8) = a as u8
+            x = x + 1
+        }
+        // choose the filter
+        var bestf: u32 = 0
+        var bestsum: u64 = 0
+        var f: u32 = 0
+        while f < 5 as u32 {
+            var sum: u64 = 0
+            var i: usize = 0
+            while i < stride {
+                let v: i32 = filt(f, cur, prev, i, stride) as i32
+                var d: i32 = v
+                if d > 127 {
+                    d = 256 - d
+                }
+                sum = sum + (d as u64)
+                i = i + 1
+            }
+            if f == 0 as u32 || sum < bestsum {
+                bestsum = sum
+                bestf = f
+            }
+            f = f + 1 as u32
+        }
+        let rowbase: u64 = raw as u64 + ((stride + 1) * y) as u64
+        *(rowbase as *mut u8) = bestf as u8
+        var i2: usize = 0
+        while i2 < stride {
+            *((rowbase + 1 + i2 as u64) as *mut u8) =
+            filt(bestf, cur, prev, i2, stride)
+            i2 = i2 + 1
+        }
+        mem.mem_copy(prev, cur, stride)
+        y = y + 1
+    }
+    // ---- zlib
+    var z: rt.Buf = rt.buf_new()
+    let zn: usize = deflate.zlib_compress(raw as u64, raw_n, 6, &z) catch 0
+    if zn == 0 {
+        return false
+    }
+    // ---- the file
+    var sig: [u8; 8] = [137 as u8, 80 as u8, 78 as u8, 71 as u8,
+        13 as u8, 10 as u8, 26 as u8, 10 as u8]
+    var i3: usize = 0
+    while i3 < 8 {
+        mem.buf_push(out, sig[i3])
+        i3 = i3 + 1
+    }
+    var ihdr: [u8; 13] = [0 as u8; 13]
+    put_be32(&ihdr[0], 0, w as u32)
+    put_be32(&ihdr[0], 4, h as u32)
+    ihdr[8] = 8 as u8 // bit depth
+    ihdr[9] = 6 as u8 // colour type 6 = RGBA
+    ihdr[10] = 0 as u8
+    ihdr[11] = 0 as u8
+    ihdr[12] = 0 as u8
+    var t1: [u8; 4] = "IHDR"
+    chunk(out, &t1[0], (&ihdr[0]) as u64, 13)
+    var t2: [u8; 4] = "IDAT"
+    chunk(out, &t2[0], rt.buf_ptr(&z), rt.buf_len(&z))
+    var t3: [u8; 4] = "IEND"
+    chunk(out, &t3[0], 0, 0)
+    rt.buf_free(&z)
+    mem.heap_free(raw, raw_n)
+    mem.heap_free(prev, stride)
+    mem.heap_free(cur, stride)
+    mem.heap_free(best, stride)
+    return true
+}
+
+#[no_gc]
+fn unpremul(v: u32, a: u32) -> u32 {
+    let r: u32 = (v * 255 + a / 2) / a
+    if r > 255 as u32 {
+        return 255
+    }
+    return r
+}
+
+#[no_gc]
+fn put_be32(p: *mut u8, off: usize, v: u32) {
+    *((p as u64 + off as u64) as *mut u8) = ((v >> 24) & 255 as u32) as u8
+    *((p as u64 + off as u64 + 1) as *mut u8) = ((v >> 16) & 255 as u32) as u8
+    *((p as u64 + off as u64 + 2) as *mut u8) = ((v >> 8) & 255 as u32) as u8
+    *((p as u64 + off as u64 + 3) as *mut u8) = (v & 255 as u32) as u8
+}
+
+#[no_gc]
+fn at(p: *mut u8, i: usize) -> u32 {
+    let v: u8 = *((p as u64 + i as u64) as *mut u8)
+    return v as u32
+}
+
+// The five filters of PNG 9.2, in the encoding direction.
+#[no_gc]
+fn filt(f: u32, cur: *mut u8, prev: *mut u8, i: usize, stride: usize) -> u8 {
+    let x: u32 = at(cur, i)
+    var a: u32 = 0
+    if i >= 4 {
+        a = at(cur, i - 4)
+    }
+    let b: u32 = at(prev, i)
+    var c: u32 = 0
+    if i >= 4 {
+        c = at(prev, i - 4)
+    }
+    if f == 0 as u32 {
+        return x as u8
+    }
+    if f == 1 as u32 {
+        return ((x -% a) & 255 as u32) as u8
+    }
+    if f == 2 as u32 {
+        return ((x -% b) & 255 as u32) as u8
+    }
+    if f == 3 as u32 {
+        return ((x -% ((a + b) / 2)) & 255 as u32) as u8
+    }
+    return ((x -% (paeth(a as i32, b as i32, c as i32) as u32)) &
+        255 as u32) as u8
+}
+
+// ------------------------------------------------------- PNG, the way in
+
+struct Image {
+    px: *mut u8, // w * h * 4, STRAIGHT RGBA
+    w: usize,
+    h: usize,
+    cap: usize,
+    ok: usize,
+}
+
+#[no_gc]
+fn image_new() -> Image {
+    return Image { px: 0 as *mut u8, w: 0, h: 0, cap: 0, ok: 0 }
+}
+
+#[no_gc]
+fn image_free(im: *mut Image) {
+    mem.heap_free((*im).px, (*im).cap)
+    (*im).px = 0 as *mut u8
+    (*im).ok = 0
+}
+
+#[no_gc]
+fn image_ok(im: *mut Image) -> bool {
+    return (*im).ok != 0
+}
+
+#[no_gc]
+fn image_width(im: *mut Image) -> usize {
+    return (*im).w
+}
+
+#[no_gc]
+fn image_height(im: *mut Image) -> usize {
+    return (*im).h
+}
+
+// STRAIGHT RGBA as 0xAARRGGBB.
+#[no_gc]
+fn image_pixel(im: *mut Image, x: usize, y: usize) -> u32 {
+    if (*im).ok == 0 || x >= (*im).w || y >= (*im).h {
+        return 0 as u32
+    }
+    let p: u64 = (*im).px as u64 + ((y * (*im).w + x) * 4) as u64
+    return (at((*im).px, (y * (*im).w + x) * 4 + 3) << 24) |
+    (at((*im).px, (y * (*im).w + x) * 4) << 16) |
+    (at((*im).px, (y * (*im).w + x) * 4 + 1) << 8) |
+    at((*im).px, (y * (*im).w + x) * 4 + 2)
+}
+
+fn rd_be32(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 24) | ((rt.ld8(p, off + 1) as u32) << 16) |
+    ((rt.ld8(p, off + 2) as u32) << 8) | (rt.ld8(p, off + 3) as u32)
+}
+
+// Colour types 0 (grey), 2 (RGB), 4 (grey+alpha) and 6 (RGBA) at eight
+// bits, without interlacing. A palette (type 3) and sixteen bit samples
+// are refused rather than guessed at -- named in docs/ROUNDB3.md.
+fn decode_png(src: u64, n: usize, im: *mut Image) -> bool {
+    (*im).ok = 0
+    if n < 8 {
+        return false
+    }
+    if rt.ld8(src, 0) as u32 != 137 as u32 || rt.ld8(src, 1) as u32 != 80 as u32 {
+        return false
+    }
+    var off: usize = 8
+    var w: usize = 0
+    var h: usize = 0
+    var ctype: u32 = 0
+    var depth: u32 = 0
+    var idat: rt.Buf = rt.buf_new()
+    var seen_ihdr: bool = false
+    while off + 8 <= n {
+        let len: usize = rd_be32(src, off) as usize
+        let t0: u32 = rt.ld8(src, off + 4) as u32
+        let t1: u32 = rt.ld8(src, off + 5) as u32
+        let t2: u32 = rt.ld8(src, off + 6) as u32
+        let t3: u32 = rt.ld8(src, off + 7) as u32
+        let body: usize = off + 8
+        if body + len > n {
+            break
+        }
+        if t0 == 73 as u32 && t1 == 72 as u32 && t2 == 68 as u32 &&
+        t3 == 82 as u32 {
+            w = rd_be32(src, body) as usize
+            h = rd_be32(src, body + 4) as usize
+            depth = rt.ld8(src, body + 8) as u32
+            ctype = rt.ld8(src, body + 9) as u32
+            if rt.ld8(src, body + 12) as u32 != 0 as u32 {
+                return false // interlaced
+            }
+            seen_ihdr = true
+        } else if t0 == 73 as u32 && t1 == 68 as u32 && t2 == 65 as u32 &&
+        t3 == 84 as u32 {
+            var i: usize = 0
+            while i < len {
+                rt.buf_push(&idat, rt.ld8(src, body + i))
+                i = i + 1
+            }
+        } else if t0 == 73 as u32 && t1 == 69 as u32 && t2 == 78 as u32 &&
+        t3 == 68 as u32 {
+            break
+        }
+        off = body + len + 4
+    }
+    if !seen_ihdr || w == 0 || h == 0 || depth != 8 as u32 {
+        return false
+    }
+    var comps: usize = 4
+    if ctype == 0 as u32 {
+        comps = 1
+    } else if ctype == 2 as u32 {
+        comps = 3
+    } else if ctype == 4 as u32 {
+        comps = 2
+    } else if ctype != 6 as u32 {
+        return false // a palette; not decoded here
+    }
+    var raw: rt.Buf = rt.buf_new()
+    let got: usize = deflate.zlib_decompress(rt.buf_ptr(&idat),
+        rt.buf_len(&idat), &raw) catch 0
+    let stride: usize = w * comps
+    if got < (stride + 1) * h {
+        return false
+    }
+    (*im).cap = w * h * 4
+    (*im).px = mem.heap_alloc((*im).cap)
+    if (*im).px as usize == 0 {
+        return false
+    }
+    (*im).w = w
+    (*im).h = h
+    let rawp: u64 = rt.buf_ptr(&raw)
+    let line: *mut u8 = mem.heap_alloc(stride)
+    let prev: *mut u8 = mem.heap_alloc(stride)
+    var y: usize = 0
+    while y < h {
+        let rb: u64 = rawp + ((stride + 1) * y) as u64
+        let f: u32 = rt.ld8(rb, 0) as u32
+        var i: usize = 0
+        while i < stride {
+            let x0: u32 = rt.ld8(rb, 1 + i) as u32
+            var a: u32 = 0
+            if i >= comps {
+                a = at(line, i - comps)
+            }
+            let b: u32 = at(prev, i)
+            var c: u32 = 0
+            if i >= comps {
+                c = at(prev, i - comps)
+            }
+            var v: u32 = x0
+            if f == 1 as u32 {
+                v = (x0 + a) & 255 as u32
+            } else if f == 2 as u32 {
+                v = (x0 + b) & 255 as u32
+            } else if f == 3 as u32 {
+                v = (x0 + (a + b) / 2) & 255 as u32
+            } else if f == 4 as u32 {
+                v = (x0 + (paeth(a as i32, b as i32, c as i32) as u32)) &
+                255 as u32
+            }
+            *((line as u64 + i as u64) as *mut u8) = v as u8
+            i = i + 1
+        }
+        var x: usize = 0
+        while x < w {
+            var r: u32 = 0
+            var g: u32 = 0
+            var bl: u32 = 0
+            var al: u32 = 255
+            if comps == 1 {
+                r = at(line, x)
+                g = r
+                bl = r
+            } else if comps == 2 {
+                r = at(line, x * 2)
+                g = r
+                bl = r
+                al = at(line, x * 2 + 1)
+            } else if comps == 3 {
+                r = at(line, x * 3)
+                g = at(line, x * 3 + 1)
+                bl = at(line, x * 3 + 2)
+            } else {
+                r = at(line, x * 4)
+                g = at(line, x * 4 + 1)
+                bl = at(line, x * 4 + 2)
+                al = at(line, x * 4 + 3)
+            }
+            let p: u64 = (*im).px as u64 + ((y * w + x) * 4) as u64
+            *(p as *mut u8) = r as u8
+            *((p + 1) as *mut u8) = g as u8
+            *((p + 2) as *mut u8) = bl as u8
+            *((p + 3) as *mut u8) = al as u8
+            x = x + 1
+        }
+        mem.mem_copy(prev, line, stride)
+        y = y + 1
+    }
+    mem.heap_free(line, stride)
+    mem.heap_free(prev, stride)
+    rt.buf_free(&raw)
+    rt.buf_free(&idat)
+    (*im).ok = 1
+    return true
+}

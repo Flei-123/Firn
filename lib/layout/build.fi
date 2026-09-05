@@ -1,0 +1,641 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/layout/build.fi -- from the DOM with computed styles to the BOX TREE.
+//
+// This step is short and is nevertheless the one that decides whether the
+// numbers afterwards can be right at all, because it is where the box tree
+// stops being the DOM tree:
+//
+//   * `display: none` produces no box, and no box for any descendant.
+//   * A floated or absolutely positioned elem is BLOCKIFIED: `float:
+//     left` on a `span` makes a block box out of it (CSS 2.1, 9.7).
+//   * A block container that has BOTH block-level and inline-level
+//     children wraps every run of inline children in an ANONYMOUS BLOCK
+//     (CSS 2.1, 9.2.1.1). Without that step a `<div>text<p>x</p></div>` is
+//     one pixel high and everything below it sits wrong.
+//   * White space between two block-level boxes produces no box at all.
+//
+// What is NOT done here is named openly: a block-level box inside an
+// INLINE box has to split the inline box into three parts. Instead the
+// inline box is promoted to a block box -- see docs/ROUND61.md.
+import html.mem
+import browser.node
+import browser.names
+import css.cascade
+import layout.box
+
+export {
+    build_document, build_subtree, chain_all_space,
+}
+
+fn style_of(styles: Gc[GcMap], k: Gc[Node], fallback: Gc[Style]) -> Gc[Style] {
+    let s: Gc[Style] = gcmap_get_value[Style](styles, k as u64)
+    if s == gc_null[Style]() {
+        return fallback
+    }
+    return s
+}
+
+// Is the text node nothing but white space? Walked over the STRANDS, not
+// with `chain_at` -- the latter is O(n/28) per character and would turn
+// the check into O(n^2) on a long paragraph.
+fn chain_all_space(k: Gc[Chain]) -> bool {
+    if k == gc_null[Chain]() {
+        return true
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            let c: u32 = s.chars[i]
+            if c != 32 as u32 && c != 9 as u32 && c != 10 as u32 &&
+            c != 13 as u32 && c != 12 as u32 {
+                return false
+            }
+            i = i + 1
+        }
+        s = s.next
+    }
+    return true
+}
+
+// The kind of box an elem makes. `out_of_flow` blockifies -- that is
+// the rule that makes `float: left` on a `span` behave like a `div`.
+fn box_kind_for(s: Gc[Style], out_of_flow: bool) -> u32 {
+    return box_kind_in(s, out_of_flow, false)
+}
+
+// The same question, but knowing whether the parent is a FLEX CONTAINER.
+// Every child of one is BLOCKIFIED (css-display-3, 2.7): `display:
+// inline` on a flex item behaves like `block`, `inline-block` like
+// `block`, `inline-flex` like `flex`. Without that a `span` in a flex
+// row would become an inline box and never see the flex algorithm.
+fn box_kind_in(s: Gc[Style], out_of_flow: bool, flex_item: bool) -> u32 {
+    let d: u32 = cascade.style_display(s)
+    if flex_item {
+        if d == cascade.D_FLEX || d == cascade.D_INLINE_FLEX {
+            return box.BK_FLEX
+        }
+        return box.BK_BLOCK
+    }
+    if d == cascade.D_FLEX {
+        return box.BK_FLEX
+    }
+    if d == cascade.D_INLINE_FLEX {
+        if out_of_flow {
+            return box.BK_FLEX
+        }
+        return box.BK_ATOMIC
+    }
+    if d == cascade.D_INLINE_BLOCK || d == cascade.D_INLINE_TABLE {
+        if out_of_flow {
+            return box.BK_BLOCK
+        }
+        return box.BK_ATOMIC
+    }
+    if d == cascade.D_INLINE {
+        if out_of_flow {
+            return box.BK_BLOCK
+        }
+        return box.BK_INLINE
+    }
+    return box.BK_BLOCK
+}
+
+// Does the box open its own block formatting context?
+fn bfc_for(s: Gc[Style], kind: u32, out_of_flow: bool, root: bool,
+    flex_item: bool) -> bool {
+    if root || out_of_flow || flex_item {
+        // A flex item ALWAYS establishes its own formatting context: its
+        // margins never collapse with anything, and a float inside it
+        // never sticks out. Forgetting that shows up as a margin escaping
+        // out of the first item and moving the whole container.
+        return true
+    }
+    if kind == box.BK_ATOMIC || kind == box.BK_FLEX {
+        return true
+    }
+    if cascade.style_overflow(s) != cascade.OV_VISIBLE {
+        return true
+    }
+    return false
+}
+
+// Does this child care what the CONTENT HEIGHT of its parent turns out to
+// be? Everything that resolves a percentage against it, everything that
+// hangs from its bottom edge, and every flex container -- whose whole
+// cross axis is decided by a definite height. The answer travels UPWARDS
+// while the tree is built, so one bit at the top answers for a whole
+// subtree.
+fn depends_on_height(k: Gc[Box]) -> bool {
+    if (k.flags & box.F_H_DEPENDS) != 0 as u32 {
+        return true
+    }
+    if (k.flags & box.F_FLEX_BOX) != 0 as u32 {
+        return true
+    }
+    let s: Gc[Style] = k.style
+    if cascade.style_unit(s, cascade.S_HEIGHT) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_MIN_HEIGHT) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_MAX_HEIGHT) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_TOP) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_BOTTOM) != cascade.U_AUTO {
+        return true
+    }
+    // ROUND B6 -- `stretch` in the BLOCK axis is exactly the same kind of
+    // dependency as a percentage: it is a number only once the containing
+    // block's height is settled. Without this line a `height: stretch`
+    // inside a stretched flex item never saw the stretched height,
+    // because the second layout pass is taken only for boxes that say
+    // they care (`css/css-sizing/stretch/flex-item-height-001`).
+    if cascade.style_unit(s, cascade.S_HEIGHT) == cascade.U_STRETCH {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_MIN_HEIGHT) == cascade.U_STRETCH {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_MAX_HEIGHT) == cascade.U_STRETCH {
+        return true
+    }
+    return false
+}
+
+fn is_br(k: Gc[Node], nm: *mut names.Names) -> bool {
+    if !node.node_is_elem(k) {
+        return false
+    }
+    var lit: [u8; 2] = "br"
+    return names.names_equal_ascii(nm, node.elem_name(k), &lit[0], 2)
+}
+
+// One node -> at most one box. Returns null for `display: none`, for
+// comments and for everything without a box.
+fn build_node(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+    nm: *mut names.Names, root: bool) -> AllocError!Gc[Box] {
+    return try build_node_in(k, styles, parent_style, nm, root, false)
+}
+
+fn build_node_in(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+    nm: *mut names.Names, root: bool, flex_item: bool)
+-> AllocError!Gc[Box] {
+    if k.kind == node.K_TEXT {
+        let t: Gc[Text] = k as Gc[Text]
+        let b = try box.box_new(box.BK_TEXT, parent_style, k)
+        return b
+    }
+    if k.kind != node.K_ELEM {
+        return gc_null[Box]()
+    }
+    let s: Gc[Style] = style_of(styles, k, parent_style)
+    if cascade.style_display(s) == cascade.D_NONE {
+        return gc_null[Box]()
+    }
+    let pos: u32 = cascade.style_position(s)
+    let abs: bool = pos == cascade.POS_ABSOLUTE || pos == cascade.POS_FIXED
+    var flt: u32 = cascade.style_float(s)
+    if abs {
+        flt = cascade.FLOAT_NONE // `position: absolute` beats `float`
+    }
+    let out_of_flow: bool = abs || flt != cascade.FLOAT_NONE
+    let kind: u32 = box_kind_in(s, out_of_flow, flex_item)
+    let b = try box.box_new(kind, s, k)
+    if abs {
+        b.flags = b.flags | box.F_ABS
+    }
+    if flt != cascade.FLOAT_NONE {
+        b.flags = b.flags | box.F_FLOAT
+    }
+    if bfc_for(s, kind, out_of_flow, root, flex_item) {
+        b.flags = b.flags | box.F_BFC
+    }
+    let disp: u32 = cascade.style_display(s)
+    if disp == cascade.D_FLEX || disp == cascade.D_INLINE_FLEX {
+        b.flags = b.flags | box.F_FLEX_BOX
+    }
+    if flex_item && !abs {
+        // Remembered because the PAINT ORDER needs it: a flex item with a
+        // `z-index` makes a stacking context although it is not
+        // positioned (css-flexbox-1, 4.3), and by the time the order is
+        // computed nobody can see any more whose child this box was.
+        b.flags = b.flags | box.F_FLEX_ITEM
+    }
+    if is_br(k, nm) {
+        // `<br>` is not a box but a forced break. It is kept as an empty
+        // inline box and recognized again in the inline layout.
+        b.kind = box.BK_INLINE
+        b.flags = b.flags | box.F_BR
+        return b
+    }
+    if replaced_attach(b, k, nm) {
+        // A replaced element IS its content: a `<canvas>` fallback, the
+        // shapes inside an `<svg>` and the text inside an `<object>` are
+        // not laid out. Building children here would give the box a
+        // content height it must not have.
+        return b
+    }
+    let ok: bool = try build_children(b, k, styles, s, nm)
+    return b
+}
+
+// ------------------------------------------------- ROUND B6: the replaced
+// elements that are NOT pictures
+//
+// Round B5 gave `<img>` an intrinsic size, and it took it out of a decoded
+// picture or out of the `width`/`height` attributes. That leaves out every
+// other replaced element in HTML, and the official suite is full of them:
+// a `<canvas>` is 300 x 150 unless its attributes say otherwise, a
+// `<video>` with nothing playing is 300 x 150 AND HAS NO RATIO, an
+// `<svg>` takes its size from `width`/`height` and its ratio from
+// `viewBox`, and `<object>`, `<embed>` and `<iframe>` fall back to the
+// default object size of css-images-3, 5.1.
+//
+// The difference between "has a size" and "has a ratio" is the whole
+// point. `<video style="height: 100px">` is 300 wide, not 200: it has no
+// natural ratio to transfer the height through, so the width falls back
+// to the default object width. An engine that stores only `iw`/`ih` and
+// divides cannot tell those two cases apart.
+//
+// WHAT IS NOT HERE, so the numbers do not promise it: the `<svg>` is not
+// parsed. Its `viewBox` is read as four numbers and nothing else, and
+// `preserveAspectRatio` is ignored. A `data:` URL in an `<img>` is not
+// decoded either -- an `<img>` without a picture is replaced only if it
+// carries both dimension attributes, which is also what round B5 does.
+fn attr_chain(k: Gc[Node], id: u32, nsid: u32) -> Gc[Chain] {
+    if id == 0 as u32 {
+        return gc_null[Chain]()
+    }
+    return node.attr_value(k as Gc[Elem], id, nsid)
+}
+
+// A non-negative CSS number out of an attribute: digits, one dot, and
+// whatever follows is ignored (`width="40px"` in a test is not a length,
+// but reading the 40 is what a browser does for the HTML attributes).
+fn chain_num(c: Gc[Chain], out: *mut f64) -> bool {
+    if c == gc_null[Chain]() {
+        return false
+    }
+    let n: u64 = node.chain_len(c)
+    var i: u64 = 0
+    while i < n {
+        let ch: u32 = node.chain_at(c, i)
+        if ch != 32 as u32 && ch != 9 as u32 && ch != 10 as u32 &&
+        ch != 13 as u32 && ch != 12 as u32 {
+            break
+        }
+        i = i + 1
+    }
+    var v: f64 = 0.0
+    var any: bool = false
+    while i < n {
+        let ch: u32 = node.chain_at(c, i)
+        if ch < 48 as u32 || ch > 57 as u32 {
+            break
+        }
+        v = v * 10.0 + (ch - 48 as u32) as f64
+        any = true
+        i = i + 1
+    }
+    if i < n && node.chain_at(c, i) == 46 as u32 {
+        i = i + 1
+        var scale: f64 = 0.1
+        while i < n {
+            let ch: u32 = node.chain_at(c, i)
+            if ch < 48 as u32 || ch > 57 as u32 {
+                break
+            }
+            v = v + ((ch - 48 as u32) as f64) * scale
+            scale = scale / 10.0
+            any = true
+            i = i + 1
+        }
+    }
+    if !any {
+        return false
+    }
+    *out = v
+    return true
+}
+
+// The third and fourth number of a `viewBox`, which are its width and its
+// height. Four numbers separated by white space or commas.
+fn viewbox_ratio(c: Gc[Chain], out: *mut f64) -> bool {
+    if c == gc_null[Chain]() {
+        return false
+    }
+    let n: u64 = node.chain_len(c)
+    var i: u64 = 0
+    var got: u32 = 0
+    var vals: [f64; 4] = [0.0; 4]
+    while i < n && got < 4 as u32 {
+        var ch: u32 = node.chain_at(c, i)
+        while i < n && (ch == 32 as u32 || ch == 9 as u32 || ch == 10 as u32 ||
+            ch == 13 as u32 || ch == 12 as u32 || ch == 44 as u32) {
+            i = i + 1
+            if i < n {
+                ch = node.chain_at(c, i)
+            }
+        }
+        if i >= n {
+            break
+        }
+        var sign: f64 = 1.0
+        if ch == 45 as u32 {
+            sign = 0.0 - 1.0
+            i = i + 1
+        } else if ch == 43 as u32 {
+            i = i + 1
+        }
+        var v: f64 = 0.0
+        var any: bool = false
+        while i < n {
+            let d: u32 = node.chain_at(c, i)
+            if d < 48 as u32 || d > 57 as u32 {
+                break
+            }
+            v = v * 10.0 + (d - 48 as u32) as f64
+            any = true
+            i = i + 1
+        }
+        if i < n && node.chain_at(c, i) == 46 as u32 {
+            i = i + 1
+            var scale: f64 = 0.1
+            while i < n {
+                let d: u32 = node.chain_at(c, i)
+                if d < 48 as u32 || d > 57 as u32 {
+                    break
+                }
+                v = v + ((d - 48 as u32) as f64) * scale
+                scale = scale / 10.0
+                any = true
+                i = i + 1
+            }
+        }
+        if !any {
+            return false
+        }
+        vals[got as usize] = sign * v
+        got = got + 1 as u32
+    }
+    if got < 4 as u32 {
+        return false
+    }
+    if vals[2] <= 0.0 || vals[3] <= 0.0 {
+        return false
+    }
+    *out = vals[2] / vals[3]
+    return true
+}
+
+// Marks `b` as a replaced element where the elem is one, and answers
+// whether it did. The natural size goes into `iw`/`ih`, the natural ratio
+// into `ratio`; either may stay at zero, and `box.replaced_size` knows
+// what each combination means.
+fn replaced_attach(b: Gc[Box], k: Gc[Node], nm: *mut names.Names) -> bool {
+    if !node.node_is_elem(k) {
+        return false
+    }
+    let nameid: u32 = node.elem_name(k)
+    var l_canvas: [u8; 6] = "canvas"
+    var l_video: [u8; 5] = "video"
+    var l_svg: [u8; 3] = "svg"
+    var l_object: [u8; 6] = "object"
+    var l_embed: [u8; 5] = "embed"
+    var l_iframe: [u8; 6] = "iframe"
+    var l_img: [u8; 3] = "img"
+    var l_w: [u8; 5] = "width"
+    var l_h: [u8; 6] = "height"
+    var l_vb: [u8; 7] = "viewBox"
+    var l_vb2: [u8; 7] = "viewbox"
+
+    let is_canvas: bool = names.names_equal_ascii(nm, nameid, &l_canvas[0], 6)
+    let is_video: bool = names.names_equal_ascii(nm, nameid, &l_video[0], 5)
+    let is_svg: bool = names.names_equal_ascii(nm, nameid, &l_svg[0], 3)
+    let is_obj: bool = names.names_equal_ascii(nm, nameid, &l_object[0], 6) ||
+    names.names_equal_ascii(nm, nameid, &l_embed[0], 5) ||
+    names.names_equal_ascii(nm, nameid, &l_iframe[0], 6)
+    let is_img: bool = names.names_equal_ascii(nm, nameid, &l_img[0], 3)
+    if !is_canvas && !is_video && !is_svg && !is_obj && !is_img {
+        return false
+    }
+    let a_w: u32 = names.names_find_bytes(nm, (&l_w[0]) as *mut u8, 5)
+    let a_h: u32 = names.names_find_bytes(nm, (&l_h[0]) as *mut u8, 6)
+    var aw: f64 = 0.0
+    var ah: f64 = 0.0
+    let has_aw: bool = chain_num(attr_chain(k, a_w, 0 as u32), &aw)
+    let has_ah: bool = chain_num(attr_chain(k, a_h, 0 as u32), &ah)
+
+    if is_canvas {
+        // The bitmap of a canvas IS its natural size, and the two
+        // attributes default to 300 and 150 (HTML, 4.12.5).
+        if has_aw && aw > 0.0 {
+            b.iw = aw
+        } else {
+            b.iw = box.DEFAULT_OBJECT_W()
+        }
+        if has_ah && ah > 0.0 {
+            b.ih = ah
+        } else {
+            b.ih = box.DEFAULT_OBJECT_H()
+        }
+        b.ratio = b.iw / b.ih
+        b.flags = b.flags | box.F_REPLACED
+        b.int_ok = 0 as u32
+        return true
+    }
+    if is_video || is_obj {
+        // No natural size and NO natural ratio -- the fallback of
+        // css-images-3, 5.1 is used per axis, not as a rectangle.
+        b.iw = 0.0
+        b.ih = 0.0
+        b.ratio = 0.0
+        b.flags = b.flags | box.F_REPLACED
+        b.int_ok = 0 as u32
+        return true
+    }
+    if is_svg {
+        var a_vb: u32 = names.names_find_bytes(nm, (&l_vb[0]) as *mut u8, 7)
+        if a_vb == 0 as u32 {
+            a_vb = names.names_find_bytes(nm, (&l_vb2[0]) as *mut u8, 7)
+        }
+        var r: f64 = 0.0
+        let has_r: bool = viewbox_ratio(attr_chain(k, a_vb, 0 as u32), &r)
+        if has_aw && aw > 0.0 {
+            b.iw = aw
+        }
+        if has_ah && ah > 0.0 {
+            b.ih = ah
+        }
+        if has_r {
+            b.ratio = r
+        }
+        if !has_aw && !has_ah && has_r {
+            // SVG2, 8.2: `width` and `height` of an `<svg>` root default
+            // to `auto`, and `auto` there is `100%`. With a `viewBox` to
+            // give the ratio that is a box which fills the inline axis
+            // and takes its height from the ratio -- which is what the
+            // suite measures (600 wide in a 600 block, 400 in a 400 one).
+            b.flags = b.flags | box.F_FILL_INLINE
+        }
+        b.flags = b.flags | box.F_REPLACED
+        b.int_ok = 0 as u32
+        return true
+    }
+    // `<img>`: only with BOTH dimension attributes, which is the rule
+    // round B5 gave itself. Without them and without a decoded picture an
+    // image has no size at all, and giving it one would make every page
+    // with a broken picture reflow (see `lib/browser/images.fi`).
+    if has_aw && has_ah && aw > 0.0 && ah > 0.0 {
+        b.iw = aw
+        b.ih = ah
+        b.ratio = aw / ah
+        b.flags = b.flags | box.F_REPLACED
+        b.int_ok = 0 as u32
+        return true
+    }
+    return false
+}
+
+// Does this elem have at least one block-level child box? Asked BEFORE
+// building, because the answer decides whether anonymous blocks are
+// needed, and an anonymous block cannot be inserted afterwards without
+// moving what has already been built.
+fn has_block_children(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+    flex_parent: bool) -> bool {
+    if flex_parent {
+        // In a flex container EVERY child is block-level, and a run of
+        // text between two items becomes an anonymous flex item
+        // (css-flexbox-1, 4). Answering `true` here is what makes that
+        // anonymous box appear.
+        return true
+    }
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            let s: Gc[Style] = style_of(styles, c, parent_style)
+            if cascade.style_display(s) != cascade.D_NONE {
+                let pos: u32 = cascade.style_position(s)
+                let abs: bool = pos == cascade.POS_ABSOLUTE ||
+                pos == cascade.POS_FIXED
+                let flt: bool = cascade.style_float(s) != cascade.FLOAT_NONE
+                if !abs && !flt {
+                    let kind: u32 = box_kind_in(s, false, flex_parent)
+                    if box.is_block_level(kind) {
+                        return true
+                    }
+                }
+            }
+        }
+        c = c.next
+    }
+    return false
+}
+
+fn build_children(parent: Gc[Box], k: Gc[Node], styles: Gc[GcMap],
+    parent_style: Gc[Style], nm: *mut names.Names)
+-> AllocError!bool {
+    let flex_parent: bool = parent.kind == box.BK_FLEX ||
+    (parent.flags & box.F_FLEX_BOX) != 0 as u32
+    let mixed: bool = has_block_children(k, styles, parent_style, flex_parent)
+    if mixed {
+        parent.flags = parent.flags | box.F_HAS_BLOCKS
+    }
+    var anon: Gc[Box] = gc_null[Box]()
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        let kid = try build_node_in(c, styles, parent_style, nm, false,
+            flex_parent)
+        if kid != gc_null[Box]() {
+            if depends_on_height(kid) {
+                parent.flags = parent.flags | box.F_H_DEPENDS
+            }
+            let out_of_flow: bool =
+            (kid.flags & (box.F_ABS | box.F_FLOAT)) != 0 as u32
+            if !mixed {
+                let ok: bool = try box.box_add(parent, kid)
+            } else if out_of_flow {
+                // A float or an absolutely positioned box is NOT inline
+                // content -- it must not land in an anonymous block, or
+                // the line box of that block would give it a height it
+                // does not have.
+                let oko: bool = try box.box_add(parent, kid)
+            } else if box.is_block_level(kid.kind) {
+                anon = gc_null[Box]()
+                let ok2: bool = try box.box_add(parent, kid)
+            } else {
+                // Inline-level content, and out-of-flow boxes that stand
+                // among it: they belong to the same anonymous block, so
+                // that a float keeps its place between two paragraphs.
+                var drop: bool = false
+                if kid.kind == box.BK_TEXT {
+                    let t: Gc[Text] = c as Gc[Text]
+                    if chain_all_space(t.data) {
+                        // White space between block-level boxes makes no
+                        // box at all -- CSS 2.1, 9.2.1.1.
+                        drop = anon == gc_null[Box]()
+                    }
+                }
+                if !drop {
+                    if anon == gc_null[Box]() {
+                        // NOT `parent_style`: an anonymous box has the
+                        // box properties of the INITIAL style and only
+                        // the inherited ones of its parent. See
+                        // `cascade.style_anonymous`.
+                        let astyle = try cascade.style_anonymous(parent_style)
+                        anon = try box.box_new(box.BK_ANON, astyle,
+                            gc_null[Node]())
+                        let ok3: bool = try box.box_add(parent, anon)
+                    }
+                    let ok4: bool = try box.box_add(anon, kid)
+                }
+            }
+            // A block-level box inside an INLINE box: the standard splits
+            // the inline box in three. Instead it is promoted to a block
+            // box here -- named in docs/ROUND61.md as a known deviation.
+            if parent.kind == box.BK_INLINE && box.is_block_level(kid.kind) &&
+            !out_of_flow {
+                parent.kind = box.BK_BLOCK
+                parent.flags = parent.flags | box.F_HAS_BLOCKS
+            }
+        }
+        c = c.next
+    }
+    return true
+}
+
+// The whole document. Returns the box of the ROOT ELEMENT (`html`), the
+// one that everything else hangs on.
+fn build_document(doc: Gc[Node], styles: Gc[GcMap], root_style: Gc[Style],
+    nm: *mut names.Names) -> AllocError!Gc[Box] {
+    var c: Gc[Node] = doc.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            let s: Gc[Style] = style_of(styles, c, root_style)
+            if cascade.style_display(s) == cascade.D_NONE {
+                return gc_null[Box]()
+            }
+            let b = try box.box_new(box.BK_BLOCK, s, c)
+            // The root elem ALWAYS opens a block formatting context,
+            // and its margins never collapse with those of its children.
+            b.flags = b.flags | box.F_BFC
+            let ok: bool = try build_children(b, c, styles, s, nm)
+            return b
+        }
+        c = c.next
+    }
+    return gc_null[Box]()
+}
+
+// A subtree on its own -- used by the endurance run, which builds and
+// drops box trees without a document around them.
+fn build_subtree(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+    nm: *mut names.Names) -> AllocError!Gc[Box] {
+    return try build_node(k, styles, parent_style, nm, true)
+}

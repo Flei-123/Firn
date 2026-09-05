@@ -1,0 +1,1965 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/lexer.fi -- THE FIRN LEXER, WRITTEN IN FIRN.
+//
+// First part of stage 1 (docs/SELF_HOSTING.md section 2, point 5). The lexer
+// has the smallest interface of the whole compiler -- text enters, a token
+// array comes out -- and it needs exactly what rounds 15 to 19 built:
+// allocator (`rt`), `Vec[T]` and `Interner`.
+//
+// YARDSTICK: `bin/lexdump.fi` writes the token stream with the EXACT same
+// format as `firnc0 --emit=tokens`. `tools/lex_compare.sh` runs both over the
+// whole source corpus and compares byte for byte. That is not a
+// self assessment but a counter check against an independent implementation
+// written in another language.
+//
+// LAYOUT: struct of arrays instead of array of structs. `Vec[T]` requires
+// `T: Scalar`, but a token is a compound -- so kind, line, column,
+// length, numeric value and index sit in SIX equally long `Vec`.
+// That is not just a workaround: the parser usually reads only the kind.
+//
+// CHARACTERS VERSUS BYTES: `firnc0` works on `Vec<char>` and counts columns
+// in CHARACTERS. This lexer works on bytes and counts a column only at the
+// LEADING byte of a UTF-8 character. Without that, every column after an
+// umlaut in the same line would be off.
+
+import rt
+import vec
+import intern
+import diag
+
+export { Lexer, lex_new, lex_free, lex_run, lex_count, lex_kind, lex_line,
+    lex_col, lex_length, lex_number, lex_nr, lex_error,
+    lex_lit_kind, lex_lit_len, lex_lit_byte, lex_lit_unit,
+    lex_name_ptr, lex_name_length, lex_float_slow,
+    tab_build, tab_count, tab_ptr, tab_length, Table, table_new, table_free,
+    lex_diags, lex_names, lex_names_set,
+    lex_kw_ptr, lex_kw_len, A_FSTR, lex_file_name,
+    A_PLUSEQ, A_MINUSEQ, A_STAREQ, A_SLASHEQ, A_PERCENTEQ,
+    A_AMPEQ, A_PIPEEQ, A_CARETEQ, A_SHLEQ, A_SHREQ,
+    A_PLUSPLUS, A_MINUSMINUS, A_FLOATF32,
+    A_PLUSPERCENT, A_MINUSPERCENT, A_STARPERCENT,
+    A_PLUSPIPE, A_MINUSPIPE, A_STARPIPE, A_KWSTATIC }
+
+// ------------------------------------------------------------ token kinds
+// order = the order in `compiler/src/lexer.rs`.
+const A_INT: u32 = 0
+const A_IDENT: u32 = 1
+const A_FLOAT: u32 = 2
+const A_STR: u32 = 3
+const A_KWFN: u32 = 4
+const A_KWLET: u32 = 5
+const A_KWVAR: u32 = 6
+const A_KWIF: u32 = 7
+const A_KWELSE: u32 = 8
+const A_KWWHILE: u32 = 9
+const A_KWRETURN: u32 = 10
+const A_KWSTRUCT: u32 = 11
+const A_KWCONST: u32 = 12
+const A_KWPROFILE: u32 = 13
+const A_KWAS: u32 = 14
+const A_KWMUT: u32 = 15
+const A_KWTRUE: u32 = 16
+const A_KWFALSE: u32 = 17
+const A_KWSYSCALL: u32 = 18
+const A_KWEXTERN: u32 = 19
+const A_KWBREAK: u32 = 20
+const A_KWCONTINUE: u32 = 21
+const A_KWDEFER: u32 = 22
+const A_KWERRDEFER: u32 = 23
+const A_KWCOMPTIME: u32 = 24
+const A_KWFOR: u32 = 25
+const A_KWIN: u32 = 26
+const A_KWIMPORT: u32 = 27
+const A_KWEXPORT: u32 = 28
+const A_KWENUM: u32 = 29
+const A_KWMATCH: u32 = 30
+const A_KWERROR: u32 = 31
+const A_KWTRY: u32 = 32
+const A_KWCATCH: u32 = 33
+const A_LPAREN: u32 = 34
+const A_RPAREN: u32 = 35
+const A_LBRACE: u32 = 36
+const A_RBRACE: u32 = 37
+const A_LBRACKET: u32 = 38
+const A_RBRACKET: u32 = 39
+const A_COMMA: u32 = 40
+const A_COLON: u32 = 41
+const A_SEMI: u32 = 42
+const A_DOT: u32 = 43
+const A_DOTDOT: u32 = 44
+const A_ARROW: u32 = 45
+const A_ASSIGN: u32 = 46
+const A_PLUS: u32 = 47
+const A_MINUS: u32 = 48
+const A_STAR: u32 = 49
+const A_SLASH: u32 = 50
+const A_PERCENT: u32 = 51
+const A_AMP: u32 = 52
+const A_PIPE: u32 = 53
+const A_CARET: u32 = 54
+const A_SHL: u32 = 55
+const A_SHR: u32 = 56
+const A_ANDAND: u32 = 57
+const A_OROR: u32 = 58
+const A_NOT: u32 = 59
+const A_QUESTION: u32 = 60
+const A_HASH: u32 = 61
+const A_EQEQ: u32 = 62
+const A_NOTEQ: u32 = 63
+const A_LT: u32 = 64
+const A_LE: u32 = 65
+const A_GT: u32 = 66
+const A_GE: u32 = 67
+const A_EOF: u32 = 68
+const A_FSTR: u32 = 69
+// ROUND 68: `~`, the bitwise complement.
+const A_TILDE: u32 = 70
+// ROUND 70 (lexer.rs): the compound assignments and the two step operators.
+// They open a STATEMENT, not an operator -- `x += e` is exactly `x = x + e`.
+const A_PLUSEQ: u32 = 71
+const A_MINUSEQ: u32 = 72
+const A_STAREQ: u32 = 73
+const A_SLASHEQ: u32 = 74
+const A_PERCENTEQ: u32 = 75
+const A_AMPEQ: u32 = 76
+const A_PIPEEQ: u32 = 77
+const A_CARETEQ: u32 = 78
+const A_SHLEQ: u32 = 79
+const A_SHREQ: u32 = 80
+const A_PLUSPLUS: u32 = 81
+const A_MINUSMINUS: u32 = 82
+// ROUND 71 (lexer.rs::TokKind::FloatF32): a float literal WITH the suffix
+// `f`, as the bit pattern of an IEEE-754 binary32.
+const A_FLOATF32: u32 = 83
+// ROUND 72 (lexer.rs): the explicit wrap and saturate operators of SPEC 13,
+// item L9 -- `+% -% *%` keep the low order bits, `+| -| *|` clamp to the
+// type's own MIN/MAX. They are NEVER checked, in any build level; that is
+// the whole reason for spelling them out. The numbering continues at the
+// end, unlike `lexer.rs`, which inserts them in front of `Eof`: the two
+// compilers agree on the NAME of a token kind (`bin/lexdump.fi`'s table,
+// compared against `firnc0 --emit=tokens`), never on its number.
+const A_PLUSPERCENT: u32 = 84
+const A_MINUSPERCENT: u32 = 85
+const A_STARPERCENT: u32 = 86
+const A_PLUSPIPE: u32 = 87
+const A_MINUSPIPE: u32 = 88
+const A_STARPIPE: u32 = 89
+// ROUND 89 (SPEC 14.1.statics) -- `static`. Deliberately NOT 34: the
+// keyword table maps its index k to the kind `4 + k`, and 34 is already
+// `A_LPAREN`. Renumbering every punctuation token to make room for one
+// keyword would have touched two hundred places for nothing -- the token
+// NUMBERS are private to this file (`tools/lex_compare.sh` compares the
+// token NAMES), so the last keyword gets a number of its own instead.
+const A_KWSTATIC: u32 = 90
+// The index of `static` in the keyword table (the last entry).
+const KW_STATIC_AT: usize = 30
+
+// kind of a string literal
+const L_BYTES: u32 = 0
+const L_STR: u32 = 1
+const L_STR16: u32 = 2
+// `f"..."` (interpolation, round 39): the literal table carries the RAW
+// body -- it is decoded and split up only in the parser.
+const L_FSTR: u32 = 3
+
+// ------------------------------------------------------------------- table
+// Firn has no mutable global state (point 13 of the list in
+// docs/SELF_HOSTING.md). So a word table cannot be a global constant --
+// it is built from ONE '|' separated literal.
+struct Table {
+    txt: u64,
+    off: Vec[u32],
+    len: Vec[u32],
+}
+
+fn table_new() -> Table {
+    return Table { txt: 0, off: vec_new[u32](), len: vec_new[u32]() }
+}
+
+fn table_free(t: *mut Table) {
+    vec_free[u32](&(*t).off)
+    vec_free[u32](&(*t).len)
+}
+
+fn tab_build(t: *mut Table, p: u64, n: usize) {
+    (*t).txt = p
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(p, i) == 124 as u8 {
+            vec_push[u32](&(*t).off, start as u32)
+            vec_push[u32](&(*t).len, (i - start) as u32)
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+fn tab_count(t: *mut Table) -> usize { return vec_len[u32](&(*t).off) }
+fn tab_ptr(t: *mut Table, i: usize) -> u64 { return (*t).txt + vec_at[u32](&(*t).off, i) as u64 }
+fn tab_length(t: *mut Table, i: usize) -> usize { return vec_at[u32](&(*t).len, i) as usize }
+
+// ------------------------------------------------------------------ lexer
+
+struct Lexer {
+    q: u64, // source text (bytes)
+    n: usize,
+    p: usize, // read position, in BYTES
+    line: u32,
+    col: u32, // column in CHARACTERS, 1-based
+    kind: Vec[u32],
+    zl: Vec[u32],
+    spl: Vec[u32],
+    ln: Vec[u32],
+    number: Vec[u64], // int value or bit pattern of the f64
+    nr: Vec[u32], // ident: intern number | str: index into the literal table
+    names: intern.Interner,
+    // If this pointer is set, a shared table is used INSTEAD of our own
+    // one. The module system needs that: several files, one namespace --
+    // otherwise the same number would mean two different words in two files.
+    names_extern: u64,
+    lit: rt.Buf, // contents of all literals one after another
+    lit_off: Vec[u32], // offset in `lit` (in BYTES)
+    lit_len: Vec[u32], // length in ELEMENTS (u16 for Str16!)
+    lit_kind: Vec[u32],
+    kw: Table,
+    kw_txt: u64, // keyword text just as handed to `lex_new` --
+    kw_len: usize, // the parser needs it to lex fragments
+    // (interpolation, round 39)
+    digits: Vec[u8], // scratch pad for the digits of a numeric literal
+    dg: diag.Diags, // collected messages
+    file: u32, // index of the source file in the map
+    msg: rt.Buf, // scratch pad for the message text
+    // ROUND 64: scratch pad for the SUGGESTION (`= help: ...`).
+    hint: rt.Buf,
+    float_slow: usize,
+}
+
+fn lex_new(q: u64, n: usize, kw_txt: u64, kw_len: usize, name: u64, name_n: usize) -> Lexer {
+    var l: Lexer = Lexer {
+        q: q, n: n, p: 0, line: 1, col: 1,
+        kind: vec_new[u32](), zl: vec_new[u32](), spl: vec_new[u32](),
+        ln: vec_new[u32](), number: vec_new[u64](), nr: vec_new[u32](),
+        names: intern.intern_new(),
+        names_extern: 0,
+        lit: rt.buf_new(),
+        lit_off: vec_new[u32](), lit_len: vec_new[u32](), lit_kind: vec_new[u32](),
+        kw: table_new(),
+        kw_txt: kw_txt, kw_len: kw_len,
+        digits: vec_new[u8](),
+        dg: diag.diag_new(),
+        file: 0,
+        msg: rt.buf_new(),
+        hint: rt.buf_new(),
+        float_slow: 0,
+    }
+    tab_build(&l.kw, kw_txt, kw_len)
+    l.file = diag.diag_file(&l.dg, name, name_n, q, n)
+    return l
+}
+
+fn lex_free(l: *mut Lexer) {
+    vec_free[u32](&(*l).kind)
+    vec_free[u32](&(*l).zl)
+    vec_free[u32](&(*l).spl)
+    vec_free[u32](&(*l).ln)
+    vec_free[u64](&(*l).number)
+    vec_free[u32](&(*l).nr)
+    // A SHARED table belongs to the caller and is not released here.
+    if (*l).names_extern == 0 {
+        intern.intern_free(&(*l).names)
+    }
+    rt.buf_free(&(*l).lit)
+    vec_free[u32](&(*l).lit_off)
+    vec_free[u32](&(*l).lit_len)
+    vec_free[u32](&(*l).lit_kind)
+    vec_free[u8](&(*l).digits)
+    table_free(&(*l).kw)
+    rt.buf_free(&(*l).msg)
+    rt.buf_free(&(*l).hint)
+    diag.diag_free(&(*l).dg)
+}
+
+fn lex_count(l: *mut Lexer) -> usize { return vec_len[u32](&(*l).kind) }
+fn lex_kind(l: *mut Lexer, i: usize) -> u32 { return vec_at[u32](&(*l).kind, i) }
+fn lex_kw_ptr(l: *mut Lexer) -> u64 { return (*l).kw_txt }
+fn lex_kw_len(l: *mut Lexer) -> usize { return (*l).kw_len }
+fn lex_line(l: *mut Lexer, i: usize) -> u32 { return vec_at[u32](&(*l).zl, i) }
+fn lex_col(l: *mut Lexer, i: usize) -> u32 { return vec_at[u32](&(*l).spl, i) }
+fn lex_length(l: *mut Lexer, i: usize) -> u32 { return vec_at[u32](&(*l).ln, i) }
+fn lex_number(l: *mut Lexer, i: usize) -> u64 { return vec_at[u64](&(*l).number, i) }
+fn lex_nr(l: *mut Lexer, i: usize) -> u32 { return vec_at[u32](&(*l).nr, i) }
+fn lex_error(l: *mut Lexer) -> usize { return diag.diag_count(&(*l).dg) }
+// ROUND 72: the NAME of the file this lexer read, written into `out`.
+// The checked arithmetic panic message carries it (SPEC 13, item L9), and
+// the parser needs it while building the tree -- long before any
+// diagnostic would.
+fn lex_file_name(l: *mut Lexer, out: *mut rt.Buf) {
+    diag.diag_file_name(&(*l).dg, (*l).file, out)
+}
+
+fn lex_diags(l: *mut Lexer) -> *mut diag.Diags { return &(*l).dg }
+fn lex_names(l: *mut Lexer) -> *mut intern.Interner {
+    if (*l).names_extern != 0 {
+        return (*l).names_extern as *mut intern.Interner
+    }
+    return &(*l).names
+}
+
+// Has to be set BEFORE `lex_run`.
+fn lex_names_set(l: *mut Lexer, it: u64) {
+    (*l).names_extern = it
+}
+
+// ----------------------------------------------------------------- messages
+//
+// The text of a message is assembled in `msg` and then handed to
+// `diag` as a byte sequence. Firn has no string concatenation (point 4 of
+// the list in docs/SELF_HOSTING.md) -- this buffer IS the concatenation.
+
+fn m_on(l: *mut Lexer) {
+    rt.buf_clear(&(*l).msg)
+}
+
+fn m_txt(l: *mut Lexer, p: u64, n: usize) {
+    rt.buf_push_bytes(&(*l).msg, p, n)
+}
+
+fn m_number(l: *mut Lexer, v: u64) {
+    rt.buf_push_dec_u64(&(*l).msg, v)
+}
+
+// Copy one CHARACTER of the source (all its bytes) into the message.
+fn m_char(l: *mut Lexer, i: usize) {
+    var w: usize = 1
+    while i + w < (*l).n {
+        if (oct(l, i + w) & 192) != 128 { break }
+        w = w + 1
+    }
+    var k: usize = 0
+    while k < w {
+        rt.buf_push(&(*l).msg, oct(l, i + k) as u8)
+        k = k + 1
+    }
+}
+
+// A code point as four UPPERCASE hex digits (`{:04X}` in Rust).
+fn m_hex4(l: *mut Lexer, v: u64) {
+    var i: i64 = 3
+    while i >= 0 {
+        let d: u64 = (v >> (i * 4) as u64) & 15
+        if d < 10 {
+            rt.buf_push(&(*l).msg, (48 + d) as u8)
+        } else {
+            rt.buf_push(&(*l).msg, (55 + d) as u8)
+        }
+        i = i - 1
+    }
+}
+
+fn m_report(l: *mut Lexer, line: u32, col: u32, length: u32) {
+    diag.diag_error(&(*l).dg, (*l).file, line, col, length,
+        rt.buf_ptr(&(*l).msg), rt.buf_len(&(*l).msg))
+}
+
+// ROUND 64: the same, with the SUGGESTION out of `(*l).hint`.
+fn m_report_help(l: *mut Lexer, line: u32, col: u32, length: u32) {
+    diag.diag_error_help(&(*l).dg, (*l).file, line, col, length,
+        rt.buf_ptr(&(*l).msg), rt.buf_len(&(*l).msg),
+        rt.buf_ptr(&(*l).hint), rt.buf_len(&(*l).hint))
+}
+
+fn h_txt(l: *mut Lexer, p: u64, n: usize) {
+    rt.buf_push_bytes(&(*l).hint, p, n)
+}
+
+// A code point as four UPPERCASE hex digits (`{:04X}` in Rust).
+fn h_hex4(l: *mut Lexer, v: u64) {
+    var i: i64 = 3
+    while i >= 0 {
+        let d: u64 = (v >> (i * 4) as u64) & 15
+        if d < 10 {
+            rt.buf_push(&(*l).hint, (48 + d) as u8)
+        } else {
+            rt.buf_push(&(*l).hint, (55 + d) as u8)
+        }
+        i = i - 1
+    }
+}
+
+// How many octets does the UTF-8 character at `i` have?
+fn char_width(l: *mut Lexer, i: usize) -> usize {
+    var w: usize = 1
+    while i + w < (*l).n {
+        if (oct(l, i + w) & 192) != 128 { break }
+        w = w + 1
+    }
+    return w
+}
+
+// ROUND 64 -- THE SUGGESTION FOR AN UNKNOWN CHARACTER.
+//
+// "unknown character" was the message that helped the least: it named the
+// character and left the reader alone with it. Yet exactly these characters
+// come out of copying from a document or a web page -- typographic quotation
+// marks, an en dash instead of a minus, a non-breaking blank. The lexer knows
+// them and now says what to write instead.
+//
+// The twin in Rust is `compiler/src/lexer.rs::char_hint`; the texts have to
+// be identical octet for octet, and `tools/lex_compare.sh` compares the whole
+// error output of both lexers. true = there is a suggestion, it stands in
+// `(*l).hint`.
+fn char_hint(l: *mut Lexer, cp: u32) -> bool {
+    rt.buf_clear(&(*l).hint)
+    // apostrophe and single typographic quotation marks
+    if cp == 39 || cp == 8216 || cp == 8217 || cp == 8218 || cp == 8219 {
+        var t1: [u8; 63] = "Firn has no character literals -- write a text literal with '\"'"
+        h_txt(l, (&t1[0]) as u64, 63)
+        return true
+    }
+    // double typographic quotation marks, guillemets, backtick
+    if cp == 8220 || cp == 8221 || cp == 8222 || cp == 171 || cp == 187 || cp == 96 {
+        var t2: [u8; 36] = "did you mean the quotation mark '\"'?"
+        h_txt(l, (&t2[0]) as u64, 36)
+        return true
+    }
+    // en dash, em dash, the real minus sign
+    if cp == 8211 || cp == 8212 || cp == 8722 {
+        var t3: [u8; 32] = "did you mean the minus sign '-'?"
+        h_txt(l, (&t3[0]) as u64, 32)
+        return true
+    }
+    // blanks that do not look like blanks
+    if cp == 160 || cp == 8199 || cp == 8239 || cp == 12288 {
+        var t4: [u8; 20] = "that is the blank U+"
+        h_txt(l, (&t4[0]) as u64, 20)
+        h_hex4(l, cp as u64)
+        var t5: [u8; 22] = ", not the blank U+0020"
+        h_txt(l, (&t5[0]) as u64, 22)
+        return true
+    }
+    if cp == 64 {
+        var t7: [u8; 69] = "Firn has no annotations with '@' -- an attribute is written '#[name]'"
+        h_txt(l, (&t7[0]) as u64, 69)
+        return true
+    }
+    return false
+}
+fn lex_float_slow(l: *mut Lexer) -> usize { return (*l).float_slow }
+
+fn lex_lit_kind(l: *mut Lexer, k: usize) -> u32 { return vec_at[u32](&(*l).lit_kind, k) }
+fn lex_lit_len(l: *mut Lexer, k: usize) -> usize { return vec_at[u32](&(*l).lit_len, k) as usize }
+
+fn lex_lit_byte(l: *mut Lexer, k: usize, i: usize) -> u8 {
+    return rt.ld8(rt.buf_ptr(&(*l).lit), vec_at[u32](&(*l).lit_off, k) as usize + i)
+}
+
+fn lex_lit_unit(l: *mut Lexer, k: usize, i: usize) -> u16 {
+    let b: u64 = rt.buf_ptr(&(*l).lit) + vec_at[u32](&(*l).lit_off, k) as u64
+    return rt.ld16(b, i)
+}
+
+fn lex_name_ptr(l: *mut Lexer, nr: u32) -> u64 {
+    return intern.intern_ptr(lex_names(l), nr)
+}
+
+fn lex_name_length(l: *mut Lexer, nr: u32) -> usize {
+    return intern.intern_length(lex_names(l), nr)
+}
+
+// ---------------------------------------------------------- character access
+// 256 means end of file -- that keeps it distinct from every byte value.
+
+fn look(l: *mut Lexer, k: usize) -> u32 {
+    if (*l).p + k >= (*l).n {
+        return 256
+    }
+    return rt.ld8((*l).q, (*l).p + k) as u32
+}
+
+fn oct(l: *mut Lexer, i: usize) -> u32 {
+    if i >= (*l).n {
+        return 256
+    }
+    return rt.ld8((*l).q, i) as u32
+}
+
+// One BYTE further. Line and column are tracked only at the leading
+// byte -- continuation bytes (10xxxxxx) belong to the same character.
+fn vor1(l: *mut Lexer) {
+    if (*l).p >= (*l).n {
+        return
+    }
+    let b: u8 = rt.ld8((*l).q, (*l).p)
+    (*l).p = (*l).p + 1
+    if (b & 192 as u8) == 128 as u8 {
+        return
+    }
+    if b == 10 as u8 {
+        (*l).line = (*l).line + 1
+        (*l).col = 1
+    } else {
+        (*l).col = (*l).col + 1
+    }
+}
+
+// One CHARACTER further.
+fn sign(l: *mut Lexer) {
+    vor1(l)
+    while (*l).p < (*l).n {
+        let b: u8 = rt.ld8((*l).q, (*l).p)
+        if (b & 192 as u8) != 128 as u8 {
+            break
+        }
+        vor1(l)
+    }
+}
+
+fn tok(l: *mut Lexer, kind: u32, line: u32, col: u32, length: u32, number: u64, nr: u32) {
+    vec_push[u32](&(*l).kind, kind)
+    vec_push[u32](&(*l).zl, line)
+    vec_push[u32](&(*l).spl, col)
+    vec_push[u32](&(*l).ln, length)
+    vec_push[u64](&(*l).number, number)
+    vec_push[u32](&(*l).nr, nr)
+}
+
+fn is_digit(c: u32) -> bool { return c >= 48 && c <= 57 }
+fn is_letter(c: u32) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+fn is_name_start(c: u32) -> bool { return c == 95 || is_letter(c) }
+fn is_name_next(c: u32) -> bool { return c == 95 || is_letter(c) || is_digit(c) }
+
+// HONEST LIMIT: `char::is_whitespace` in Rust knows U+00A0, U+2028
+// and others. Here only ASCII whitespace counts; anything else becomes
+// 'unknown character'. The source corpus contains no Unicode whitespace.
+fn is_empty(c: u32) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+fn hex_value(c: u32) -> i32 {
+    if c >= 48 && c <= 57 { return (c - 48) as i32 }
+    if c >= 97 && c <= 102 { return (c - 97 + 10) as i32 }
+    if c >= 65 && c <= 70 { return (c - 65 + 10) as i32 }
+    return -1
+}
+
+// ------------------------------------------------- whitespace and comments
+
+fn skip(l: *mut Lexer) {
+    while true {
+        let c: u32 = look(l, 0)
+        if is_empty(c) {
+            vor1(l)
+        } else if c == 47 && look(l, 1) == 47 {
+            while (*l).p < (*l).n {
+                if look(l, 0) == 10 { break }
+                vor1(l)
+            }
+        } else if c == 47 && look(l, 1) == 42 {
+            let kz: u32 = (*l).line
+            let ks: u32 = (*l).col
+            vor1(l)
+            vor1(l)
+            var depth: usize = 1
+            while depth > 0 {
+                if (*l).p >= (*l).n {
+                    var mk: [u8; 42] = "block comment is not closed ('*/' missing)"
+                    m_on(l)
+                    m_txt(l, (&mk[0]) as u64, 42)
+                    m_report(l, kz, ks, 2)
+                    break
+                }
+                if look(l, 0) == 47 && look(l, 1) == 42 {
+                    vor1(l)
+                    vor1(l)
+                    depth = depth + 1
+                } else if look(l, 0) == 42 && look(l, 1) == 47 {
+                    vor1(l)
+                    vor1(l)
+                    depth = depth - 1
+                } else {
+                    vor1(l)
+                }
+            }
+        } else {
+            return
+        }
+    }
+}
+
+// -------------------------------------------------------------- identifiers
+
+fn lex_name(l: *mut Lexer) {
+    let line: u32 = (*l).line
+    let col: u32 = (*l).col
+    let start: usize = (*l).p
+    while (*l).p < (*l).n {
+        if !is_name_next(look(l, 0)) { break }
+        vor1(l)
+    }
+    let len: usize = (*l).p - start
+    var k: usize = 0
+    while k < tab_count(&(*l).kw) {
+        if tab_length(&(*l).kw, k) == len {
+            if rt.mem_eq(tab_ptr(&(*l).kw, k), (*l).q + start as u64, len) {
+                // ROUND 89: every keyword but the last one is `4 + k`; see
+                // `A_KWSTATIC` above for why the last one is not.
+                var kind: u32 = 4 + k as u32
+                if k >= KW_STATIC_AT { kind = A_KWSTATIC + (k - KW_STATIC_AT) as u32 }
+                tok(l, kind, line, col, len as u32, 0, 0)
+                return
+            }
+        }
+        k = k + 1
+    }
+    let n: i64 = intern.intern_number(lex_names(l), (*l).q + start as u64, len)
+    tok(l, A_IDENT, line, col, len as u32, 0, n as u32)
+}
+
+// ------------------------------------------------------------------- numbers
+
+// Bit pattern of a binary64. The detour through the ADDRESS is deliberate:
+// a direct `(&t) as *mut u64` followed by a read was treated by the stage 0
+// code generator as a value conversion and gave the number 1 instead of the
+// pattern 4607182418800017408 -- the bug only shows up because `firnc0`
+// is there to compare against. Through `rt.ld64` on the same address it is a
+// true reinterpretation of the very same eight bytes.
+// The way back: the binary64 belonging to a bit pattern.
+fn f64_of_bits(b: u64) -> f64 {
+    var t: f64 = 0.0
+    let p: u64 = (&t) as u64
+    rt.st64(p, 0, b)
+    return *(p as *mut f64)
+}
+
+fn bits_of(x: f64) -> u64 {
+    var t: f64 = 0.0
+    let p: u64 = (&t) as u64
+    *(p as *mut f64) = x
+    return rt.ld64(p, 0)
+}
+
+// 10^k is EXACTLY representable as binary64 for k <= 22, and the product
+// 10^(k-1) * 10 rounds exactly to 10^k. That is why this loop is exact.
+// 10^k as an integer; 0 as soon as it no longer fits into 64 bit.
+fn ten_high_whole(k: usize) -> u64 {
+    if k > 19 {
+        return 0
+    }
+    var t: u64 = 1
+    var i: usize = 0
+    while i < k {
+        t = t * 10
+        i = i + 1
+    }
+    return t
+}
+
+// ROUND 71 -- decimal text -> `f32` bit pattern, over the correctly rounded
+// binary64 in between.
+//
+// That this is EXACT and not a double rounding is a theorem, not a hope:
+// binary64 carries 53 bits, and 2*24+2 = 50 of them are enough to make
+// decimal -> binary64 -> binary32 give the same result as decimal ->
+// binary32 directly (Figueroa 1995). `tools/lexnum/run.sh` measures it
+// against C `strtof` and `numpy.float32` on top of that.
+//
+// The detour through the ADDRESS is the same one as in `bits_of`: only a
+// read through `rt.ld32` on the same four bytes is a true reinterpretation.
+fn narrow_f32(x: f64) -> u32 {
+    var t: f32 = 0.0
+    let p: u64 = (&t) as u64
+    *(p as *mut f32) = x as f32
+    return rt.ld32(p, 0)
+}
+
+// Is the character allowed to continue an identifier? A suffix `f` must not
+// swallow the beginning of a name -- `1.5foo` stays a mistake.
+fn suffix_free(c: u32) -> bool {
+    return !(is_letter(c) || is_digit(c) || c == 95)
+}
+
+fn ten_high(k: usize) -> f64 {
+    var t: f64 = 1.0
+    var i: usize = 0
+    while i < k {
+        t = t * 10.0
+        i = i + 1
+    }
+    return t
+}
+
+// ------------------------------------------------------- the value of a literal
+//
+// A decimal literal has to become the NEAREST binary64, correctly rounded,
+// at exactly half distance towards the EVEN mantissa. Round 65 found three
+// ways in which the step by step computation missed that, and every one of
+// them was a real divergence against `firnc0`:
+//
+//   * `9007199254740991.0` came out one ULP too small (4845873199050653694
+//     instead of ...695). The digits are collected into a u64
+//     (90071992547409910), that no longer fits into 2^53 -- and the
+//     division by ten afterwards rounds a SECOND time.
+//   * `2.2250738585072011e-308` came out four ULP too large: 308 single
+//     divisions by ten, each of them rounding once.
+//   * `18446744073709551616.0` became 0.0 and `1844674407370955161.9`
+//     became 0.3: the mantissa wrapped around in the u64 without anyone
+//     noticing. That is not an ULP, that is a different number.
+//
+// The exact path below holds the value as the fraction D * 10^exp of two
+// big integers, scales it until the quotient has exactly 53 bit and lets
+// the remainder decide the rounding. That is the same method as
+// `lib/num/strtod.fi` (SPEC 8.4, requirement Z5); it is written out here
+// because the lexer of the compiler must not depend on the standard
+// library.
+
+// 256 limbs of 32 bit = 8192 bit. WIDTH OF THE WORST CASE: the numerator is
+// at most 781 significant digits (2596 bit) shifted left by at most 1381
+// bit, the denominator at most 10^1181 (3924 bit) shifted by at most 63 --
+// under 4100 bit either way, so the block is twice as wide as it has to be.
+const BN_LIMBS: usize = 256
+// Significant digits that are kept; everything below is folded into a
+// sticky digit. An exact halfway case has at most 752 digits (5^1075), so
+// 780 is more than enough for correct rounding.
+const F_MAXDIG: usize = 780
+const F_INF_BITS: u64 = 9218868437227405312
+const F_TWO52: u64 = 4503599627370496
+const F_TWO53: u64 = 9007199254740992
+
+// An unsigned big number: u32 limbs, least significant first, in a block of
+// memory the caller owns. `n` counts the limbs in use, leading zero limbs
+// are cut off (`bn_norm`), so `n` is at the same time the length in limbs.
+struct Bn {
+    d: u64,
+    n: usize,
+}
+
+fn bn_limb(b: *mut Bn, i: usize) -> u32 {
+    if i >= (*b).n {
+        return 0 as u32
+    }
+    return rt.ld32((*b).d, i)
+}
+
+fn bn_setlimb(b: *mut Bn, i: usize, v: u32) {
+    if i >= BN_LIMBS {
+        return
+    }
+    rt.st32((*b).d, i, v)
+    if i >= (*b).n {
+        var k: usize = (*b).n
+        while k < i {
+            rt.st32((*b).d, k, 0 as u32)
+            k = k + 1
+        }
+        (*b).n = i + 1
+    }
+}
+
+fn bn_norm(b: *mut Bn) {
+    while (*b).n > 0 {
+        if rt.ld32((*b).d, (*b).n - 1) != 0 as u32 {
+            return
+        }
+        (*b).n = (*b).n - 1
+    }
+}
+
+fn bn_is_zero(b: *mut Bn) -> bool {
+    return (*b).n == 0
+}
+
+fn bn_set_u64(b: *mut Bn, v: u64) {
+    (*b).n = 0
+    if v == 0 {
+        return
+    }
+    rt.st32((*b).d, 0, (v & 4294967295) as u32)
+    (*b).n = 1
+    if v >= 4294967296 {
+        rt.st32((*b).d, 1, (v >> 32) as u32)
+        (*b).n = 2
+    }
+}
+
+fn bn_copy(target: *mut Bn, source: *mut Bn) {
+    var i: usize = 0
+    while i < (*source).n {
+        rt.st32((*target).d, i, rt.ld32((*source).d, i))
+        i = i + 1
+    }
+    (*target).n = (*source).n
+}
+
+fn bn_cmp(a: *mut Bn, b: *mut Bn) -> i32 {
+    if (*a).n != (*b).n {
+        if (*a).n < (*b).n {
+            return -1
+        }
+        return 1
+    }
+    var i: usize = (*a).n
+    while i > 0 {
+        i = i - 1
+        let x: u32 = rt.ld32((*a).d, i)
+        let y: u32 = rt.ld32((*b).d, i)
+        if x != y {
+            if x < y {
+                return -1
+            }
+            return 1
+        }
+    }
+    return 0
+}
+
+// a -= b, precondition a >= b
+fn bn_sub(a: *mut Bn, b: *mut Bn) {
+    var borrow: u64 = 0
+    var i: usize = 0
+    while i < (*a).n {
+        let x: u64 = bn_limb(a, i) as u64
+        let y: u64 = bn_limb(b, i) as u64 + borrow
+        if x >= y {
+            rt.st32((*a).d, i, (x - y) as u32)
+            borrow = 0
+        } else {
+            rt.st32((*a).d, i, (x + 4294967296 - y) as u32)
+            borrow = 1
+        }
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+// a *= m
+fn bn_mul_small(a: *mut Bn, m: u32) {
+    if m == 0 as u32 {
+        (*a).n = 0
+        return
+    }
+    var carry: u64 = 0
+    var i: usize = 0
+    let n: usize = (*a).n
+    while i < n {
+        let p: u64 = rt.ld32((*a).d, i) as u64 * m as u64 + carry
+        rt.st32((*a).d, i, (p & 4294967295) as u32)
+        carry = p >> 32
+        i = i + 1
+    }
+    while carry != 0 {
+        bn_setlimb(a, i, (carry & 4294967295) as u32)
+        carry = carry >> 32
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+// a += v
+fn bn_add_small(a: *mut Bn, v: u32) {
+    var carry: u64 = v as u64
+    var i: usize = 0
+    while carry != 0 {
+        let s: u64 = bn_limb(a, i) as u64 + carry
+        bn_setlimb(a, i, (s & 4294967295) as u32)
+        carry = s >> 32
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+fn bn_bitlen(a: *mut Bn) -> usize {
+    if (*a).n == 0 {
+        return 0
+    }
+    var v: u32 = rt.ld32((*a).d, (*a).n - 1)
+    var bits: usize = 0
+    while v != 0 as u32 {
+        v = v >> 1
+        bits = bits + 1
+    }
+    return ((*a).n - 1) * 32 + bits
+}
+
+// a <<= bits
+fn bn_shl(a: *mut Bn, bits: usize) {
+    if (*a).n == 0 || bits == 0 {
+        return
+    }
+    let words: usize = bits / 32
+    let sh: usize = bits % 32
+    var i: usize = (*a).n
+    if sh == 0 {
+        while i > 0 {
+            i = i - 1
+            bn_setlimb(a, i + words, rt.ld32((*a).d, i))
+        }
+    } else {
+        // the new top limb first, otherwise it would be overwritten
+        let top: u32 = rt.ld32((*a).d, (*a).n - 1) >> (32 - sh)
+        if top != 0 as u32 {
+            bn_setlimb(a, (*a).n + words, top)
+        }
+        while i > 0 {
+            i = i - 1
+            var v: u32 = rt.ld32((*a).d, i) << sh
+            if i > 0 {
+                v = v + (rt.ld32((*a).d, i - 1) >> (32 - sh))
+            }
+            bn_setlimb(a, i + words, v)
+        }
+    }
+    var k: usize = 0
+    while k < words {
+        rt.st32((*a).d, k, 0 as u32)
+        k = k + 1
+    }
+    bn_norm(a)
+}
+
+// a *= 10^e, in steps of 10^9 -- that is the largest power of ten that
+// still fits into one limb.
+fn bn_mul_pow10(a: *mut Bn, e: usize) {
+    var rest: usize = e
+    while rest >= 9 {
+        bn_mul_small(a, 1000000000 as u32)
+        rest = rest - 9
+    }
+    var m: u32 = 1 as u32
+    var k: usize = 0
+    while k < rest {
+        m = m * 10 as u32
+        k = k + 1
+    }
+    if m != 1 as u32 {
+        bn_mul_small(a, m)
+    }
+}
+
+// The whole part of the quotient as a u64; the remainder stays in `num`.
+// Precondition: the quotient fits into 64 bit -- the caller scales
+// beforehand. `tmp` is scratch memory.
+fn bn_div_q(num: *mut Bn, divisor: *mut Bn, tmp: *mut Bn) -> u64 {
+    if bn_cmp(num, divisor) < 0 {
+        return 0
+    }
+    let bn: usize = bn_bitlen(num)
+    let bd: usize = bn_bitlen(divisor)
+    let k: usize = bn - bd
+    if k > 63 {
+        // The caller scaled wrongly; a clean 0 is better than a silently
+        // wrong answer.
+        return 0
+    }
+    var q: u64 = 0
+    var i: usize = k + 1
+    while i > 0 {
+        i = i - 1
+        bn_copy(tmp, divisor)
+        bn_shl(tmp, i)
+        if bn_cmp(num, tmp) >= 0 {
+            bn_sub(num, tmp)
+            q = q + (1 << i)
+        }
+    }
+    return q
+}
+
+fn bits_in_u64(v: u64) -> usize {
+    var x: u64 = v
+    var n: usize = 0
+    while x != 0 {
+        x = x >> 1
+        n = n + 1
+    }
+    return n
+}
+
+// The quotient of 2^s * num0 / den0; the remainder stays in `numw`, the
+// scaled denominator in `denw` -- the rounding afterwards needs both.
+fn float_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn,
+    tmp: *mut Bn, s: i64) -> u64 {
+    bn_copy(numw, num0)
+    bn_copy(denw, den0)
+    if s >= 0 {
+        bn_shl(numw, s as usize)
+    } else {
+        bn_shl(denw, (0 - s) as usize)
+    }
+    return bn_div_q(numw, denw, tmp)
+}
+
+// The exact path: the digits stand in `(*l).digits` (one per element, value
+// 0..9), `exp0` is the decimal exponent that belongs to them. The result is
+// the BIT PATTERN of the correctly rounded binary64; the literal has no
+// sign, a leading minus is a unary operator of the parser.
+// ROUND 71 -- `odd = true` rounds TO ODD instead of to nearest: cut off,
+// and set the last bit when anything was left over.
+//
+// That is the one thing that makes a correct `f32` out of it. The way
+// decimal -> binary64 (nearest) -> binary32 (nearest) is NOT correctly
+// rounded: at the exact middle between two binary32 values the intermediate
+// rounding lands ON the middle, and the tie-to-even then decides without
+// knowing which side the real value lay on. Measured against C `strtof`:
+// 63568 of 239064 such cases came out one ulp wrong.
+//
+// With round-to-odd it cannot happen: a value with the last bit set is
+// never exactly a binary32 middle, so the second rounding always has a
+// direction and it is the right one (Boldo/Melquiond -- 53 >= 24 + 2).
+fn float_exact(l: *mut Lexer, exp0: i64, odd: bool) -> u64 {
+    // six big numbers of 256 limbs, one behind the other
+    var block: [u32; 1536] = [0 as u32; 1536]
+    let mem: u64 = (&block[0]) as u64
+    var d: Bn = Bn { d: mem, n: 0, }
+    var num0: Bn = Bn { d: mem + 1024, n: 0, }
+    var den0: Bn = Bn { d: mem + 2048, n: 0, }
+    var numw: Bn = Bn { d: mem + 3072, n: 0, }
+    var denw: Bn = Bn { d: mem + 4096, n: 0, }
+    var tmp: Bn = Bn { d: mem + 5120, n: 0, }
+
+    // --- the digits, leading zeros skipped, the tail folded into a sticky
+    // digit: a digit 1 below the last kept place is smaller than every
+    // non-zero tail and larger than none, so an exact halfway case can
+    // never come out of a tail that was cut off.
+    var exp: i64 = exp0
+    var nsig: usize = 0
+    var sticky: bool = false
+    var i: usize = 0
+    let cnt: usize = vec_len[u8](&(*l).digits)
+    while i < cnt {
+        let dig: u32 = vec_at[u8](&(*l).digits, i) as u32
+        // A leading zero carries no information and does not move the
+        // exponent either -- it is simply not a significant digit.
+        if !bn_is_zero(&d) || dig != 0 as u32 {
+            if nsig < F_MAXDIG {
+                bn_mul_small(&d, 10 as u32)
+                bn_add_small(&d, dig)
+                nsig = nsig + 1
+            } else {
+                // one digit less in front, one more in the exponent
+                exp = exp + 1
+                if dig != 0 as u32 {
+                    sticky = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    if sticky {
+        bn_mul_small(&d, 10 as u32)
+        bn_add_small(&d, 1 as u32)
+        exp = exp - 1
+    }
+    if bn_is_zero(&d) {
+        return 0
+    }
+
+    // --- rough range: 10^(magnitude-1) <= value < 10^magnitude
+    let magnitude: i64 = exp + nsig as i64
+    if magnitude - 1 >= 309 {
+        return F_INF_BITS
+    }
+    if magnitude <= -400 {
+        return 0
+    }
+
+    // --- the value as a fraction of two integers
+    bn_copy(&num0, &d)
+    bn_set_u64(&den0, 1)
+    if exp > 0 {
+        bn_mul_pow10(&num0, exp as usize)
+    } else if exp < 0 {
+        bn_mul_pow10(&den0, (0 - exp) as usize)
+    }
+
+    // --- scale until the quotient has exactly 53 bit
+    var s: i64 = 53 - (bn_bitlen(&num0) as i64 - bn_bitlen(&den0) as i64)
+    var q: u64 = 0
+    var done: bool = false
+    var iter: usize = 0
+    while !done && iter < 6 {
+        q = float_quot(&num0, &den0, &numw, &denw, &tmp, s)
+        let qb: i64 = bits_in_u64(q) as i64
+        if qb == 53 {
+            done = true
+        } else {
+            s = s + (53 - qb)
+        }
+        iter = iter + 1
+    }
+    var e2: i64 = 0 - s
+    // Below 2^-1074 there is no room left for 53 bit: the number becomes
+    // subnormal and the quotient is taken at the fixed place.
+    if e2 < -1074 {
+        s = 1074
+        e2 = -1074
+        q = float_quot(&num0, &den0, &numw, &denw, &tmp, s)
+    }
+
+    // --- ROUND 71: round to odd, if that is what was asked for
+    if odd {
+        if !bn_is_zero(&numw) {
+            q = q | 1
+        }
+        if e2 > 971 {
+            return F_INF_BITS
+        }
+        if q == 0 {
+            return 0
+        }
+        if q >= F_TWO52 {
+            let biased_o: u64 = (e2 + 1075) as u64
+            return (biased_o << 52) + (q - F_TWO52)
+        }
+        return q
+    }
+    // --- round: the remainder against half the denominator, at exactly
+    // half distance towards the even mantissa
+    bn_shl(&numw, 1)
+    let cv: i32 = bn_cmp(&numw, &denw)
+    var up: bool = false
+    if cv > 0 {
+        up = true
+    } else if cv == 0 {
+        if q % 2 == 1 {
+            up = true
+        }
+    }
+    if up {
+        q = q + 1
+        if q == F_TWO53 {
+            q = F_TWO52
+            e2 = e2 + 1
+        }
+    }
+    if e2 > 971 {
+        return F_INF_BITS
+    }
+    if q == 0 {
+        return 0
+    }
+    if q >= F_TWO52 {
+        let biased: u64 = (e2 + 1075) as u64
+        return (biased << 52) + (q - F_TWO52)
+    }
+    // subnormal: the exponent field stays 0, the quotient IS the mantissa
+    return q
+}
+
+// Clinger's fast path: if the mantissa fits into 2^53 and the decimal
+// exponent lies between -22 and 22, ONE multiplication or division is
+// correctly rounded in binary64 -- so the result is exact to the bit.
+// Everything else goes through `float_exact` and is exact as well; the
+// counter `float_slow` says how often that was necessary.
+fn float_bits(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> u64 {
+    if !overflow && mant <= F_TWO53 && e >= -22 && e <= 22 {
+        let f: f64 = mant as f64
+        if e >= 0 {
+            return bits_of(f * ten_high(e as usize))
+        }
+        return bits_of(f / ten_high((0 - e) as usize))
+    }
+    // An extension of Clinger: if the exponent is above 22, the excess can
+    // often be folded into the MANTISSA, as long as that stays exact
+    // (<= 2^53). Then ONE multiplication is enough, and so is ONE
+    // rounding -- the result is still correctly rounded.
+    if !overflow && e > 22 && e <= 37 {
+        let excess: usize = (e - 22) as usize
+        let factor: u64 = ten_high_whole(excess)
+        if factor > 0 && mant <= F_TWO53 / factor {
+            return bits_of((mant * factor) as f64 * ten_high(22))
+        }
+    }
+    (*l).float_slow = (*l).float_slow + 1
+    return float_exact(l, e, false)
+}
+
+// ROUND 71 -- the CORRECTLY ROUNDED binary32 of the same digits.
+//
+// Always the exact way, never Clinger's fast path: the fast path delivers a
+// correctly rounded binary64, and that is exactly one rounding too many
+// (see `float_exact`). The cost is a few microseconds per float literal in
+// the source text -- next to reading the file it does not show up.
+fn float32_bits(l: *mut Lexer, e: i64) -> u32 {
+    return narrow_f32(f64_of_bits(float_exact(l, e, true)))
+}
+
+fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
+    mant0: u64, over0: bool, n_before: usize) -> bool {
+    var width: u32 = width0
+    var mant: u64 = mant0
+    var over: bool = over0
+    var n_after: i64 = 0
+    let _ = n_before
+    if look(l, 0) == 46 {
+        vor1(l)
+        width = width + 1
+        while (*l).p < (*l).n {
+            let c: u32 = look(l, 0)
+            if c == 95 {
+                vor1(l)
+                width = width + 1
+                continue
+            }
+            if !is_digit(c) { break }
+            let dig: u64 = (c - 48) as u64
+            // The limit is computed WITH the digit: `mant * 10 + dig` used
+            // to wrap around silently at the last digit, and
+            // `18446744073709551616.0` became 0.0 (round 65).
+            if mant > (18446744073709551615 - dig) / 10 {
+                over = true
+            } else {
+                mant = mant * 10 + dig
+            }
+            // The digits go into the same scratch pad as those before the
+            // point; `float_exact` reads all of them together.
+            vec_push[u8](&(*l).digits, (c - 48) as u8)
+            n_after = n_after + 1
+            vor1(l)
+            width = width + 1
+        }
+    }
+    var expo: i64 = 0
+    if look(l, 0) == 101 || look(l, 0) == 69 {
+        vor1(l)
+        width = width + 1
+        var neg: bool = false
+        if look(l, 0) == 43 || look(l, 0) == 45 {
+            if look(l, 0) == 45 { neg = true }
+            vor1(l)
+            width = width + 1
+        }
+        var digits: usize = 0
+        while (*l).p < (*l).n {
+            let c: u32 = look(l, 0)
+            if c == 95 {
+                vor1(l)
+                width = width + 1
+                continue
+            }
+            if !is_digit(c) { break }
+            if expo < 100000 {
+                expo = expo * 10 + (c - 48) as i64
+            }
+            digits = digits + 1
+            vor1(l)
+            width = width + 1
+        }
+        if digits == 0 {
+            var b: u32 = width
+            if b < 1 { b = 1 }
+            var me: [u8; 72] = "floating point literal: the digits of the exponent are missing after 'e'"
+            m_on(l)
+            m_txt(l, (&me[0]) as u64, 72)
+            m_report(l, line, col, b)
+            tok(l, A_FLOAT, line, col, b, 0, 0)
+            return true
+        }
+        if neg { expo = 0 - expo }
+    }
+    let bits: u64 = float_bits(l, mant, over, expo - n_after)
+    let single: u32 = float32_bits(l, expo - n_after)
+    // ROUND 71: the suffix `f` makes an `f32` out of it.
+    if look(l, 0) == 102 && suffix_free(look(l, 1)) {
+        vor1(l)
+        width = width + 1
+        var b3: u32 = width
+        if b3 < 1 { b3 = 1 }
+        tok(l, A_FLOATF32, line, col, b3, single as u64, 0)
+        return true
+    }
+    var b2: u32 = width
+    if b2 < 1 { b2 = 1 }
+    // The token carries BOTH bit patterns: `number` the binary64, `nr` the
+    // binary32 of the very same text (lexer.rs::TokKind::Float).
+    tok(l, A_FLOAT, line, col, b2, bits, single)
+    return true
+}
+
+fn lex_int(l: *mut Lexer) {
+    let line: u32 = (*l).line
+    let col: u32 = (*l).col
+    var width: u32 = 0
+    var base: u32 = 10
+    if look(l, 0) == 48 {
+        let c2: u32 = look(l, 1)
+        if c2 == 120 || c2 == 88 {
+            base = 16
+        } else if c2 == 98 || c2 == 66 {
+            base = 2
+        }
+        if base != 10 {
+            vor1(l)
+            vor1(l)
+            width = width + 2
+        }
+    }
+    vec_clear[u8](&(*l).digits)
+    var bad: bool = false
+    var s_line: u32 = 0
+    var s_col: u32 = 0
+    var s_pos: usize = 0
+    while (*l).p < (*l).n {
+        let c: u32 = look(l, 0)
+        if c == 95 {
+            vor1(l)
+            width = width + 1
+            continue
+        }
+        if !(is_digit(c) || is_letter(c)) {
+            break
+        }
+        // For base 10 an 'e'/'E' followed by a digit or a sign ends
+        // the integer -- otherwise '1e3' would count as an invalid digit.
+        if base == 10 && (c == 101 || c == 69) {
+            let c2: u32 = look(l, 1)
+            if is_digit(c2) || c2 == 43 || c2 == 45 {
+                break
+            }
+        }
+        // ROUND 71: `2f` -- the f32 suffix on a literal without a point and
+        // without an exponent. At base 16 `f` is a digit, which is why this
+        // only holds for base 10, and a letter must not follow.
+        if base == 10 && c == 102 && !bad && vec_len[u8](&(*l).digits) > 0 {
+            if suffix_free(look(l, 1)) {
+                vor1(l)
+                width = width + 1
+                var m2: u64 = 0
+                var i2: usize = 0
+                while i2 < vec_len[u8](&(*l).digits) {
+                    m2 = m2 * 10 + vec_at[u8](&(*l).digits, i2) as u64
+                    i2 = i2 + 1
+                }
+                var bf: u32 = width
+                if bf < 1 { bf = 1 }
+                let _ = m2
+                tok(l, A_FLOATF32, line, col, bf, float32_bits(l, 0) as u64, 0)
+                return
+            }
+        }
+        let w: i32 = hex_value(c)
+        if w >= 0 && (w as u32) < base {
+            vec_push[u8](&(*l).digits, w as u8)
+        } else {
+            // Only the FIRST invalid digit is reported.
+            if !bad {
+                bad = true
+                s_line = (*l).line
+                s_col = (*l).col
+                s_pos = (*l).p
+            }
+        }
+        vor1(l)
+        width = width + 1
+    }
+    let cnt: usize = vec_len[u8](&(*l).digits)
+    // Floating point only for base 10.
+    if base == 10 && !bad && cnt > 0 {
+        let dot: bool = look(l, 0) == 46 && is_digit(look(l, 1))
+        var expo: bool = false
+        if look(l, 0) == 101 || look(l, 0) == 69 {
+            let c2: u32 = look(l, 1)
+            expo = is_digit(c2) || c2 == 43 || c2 == 45
+        }
+        if dot || expo {
+            var m: u64 = 0
+            var ue: bool = false
+            var i: usize = 0
+            while i < cnt {
+                let dig: u64 = vec_at[u8](&(*l).digits, i) as u64
+                // WITH the digit in the limit: `m * 10 + dig` wrapped
+                // around silently before (round 65).
+                if m > (18446744073709551615 - dig) / 10 {
+                    ue = true
+                } else {
+                    m = m * 10 + dig
+                }
+                i = i + 1
+            }
+            lex_float_rest(l, line, col, width, m, ue, cnt)
+            return
+        }
+    }
+    var b: u32 = width
+    if b < 1 { b = 1 }
+    if bad {
+        var m1: [u8; 19] = "invalid character '"
+        var m2: [u8; 32] = "' in an integer literal to base "
+        m_on(l)
+        m_txt(l, (&m1[0]) as u64, 19)
+        m_char(l, s_pos)
+        m_txt(l, (&m2[0]) as u64, 32)
+        m_number(l, base as u64)
+        m_report(l, s_line, s_col, 1)
+        tok(l, A_INT, line, col, b, 0, 0)
+        return
+    }
+    if cnt == 0 {
+        var m3: [u8; 37] = "integer literal without digits (base "
+        m_on(l)
+        m_txt(l, (&m3[0]) as u64, 37)
+        m_number(l, base as u64)
+        var m4: [u8; 1] = ")"
+        m_txt(l, (&m4[0]) as u64, 1)
+        m_report(l, line, col, b)
+        tok(l, A_INT, line, col, b, 0, 0)
+        return
+    }
+    var value: u64 = 0
+    var too_big: bool = false
+    var i: usize = 0
+    while i < cnt {
+        let d: u64 = vec_at[u8](&(*l).digits, i) as u64
+        let limit: u64 = (18446744073709551615 - d) / base as u64
+        if value > limit {
+            too_big = true
+            break
+        }
+        value = value * base as u64 + d
+        i = i + 1
+    }
+    if too_big {
+        var m5: [u8; 47] = "integer literal is too large (more than 64 bit)"
+        m_on(l)
+        m_txt(l, (&m5[0]) as u64, 47)
+        m_report(l, line, col, b)
+        tok(l, A_INT, line, col, b, 0, 0)
+        return
+    }
+    tok(l, A_INT, line, col, b, value, 0)
+}
+
+// ------------------------------------------------------ punctuation and operators
+
+// `false` if the character is unknown.
+fn lex_char(l: *mut Lexer) -> bool {
+    let line: u32 = (*l).line
+    let col: u32 = (*l).col
+    let c: u32 = look(l, 0)
+    if c == 256 {
+        return true
+    }
+    let n: u32 = look(l, 1)
+    var kind: u32 = 999
+    var width: u32 = 1
+    // ROUND 70: THREE characters first -- `<<=` and `>>=` would otherwise be
+    // read as `<<` plus `=`, and the compound assignment would fall apart
+    // into two tokens.
+    let n2: u32 = look(l, 2)
+    if c == 60 && n == 60 && n2 == 61 { kind = A_SHLEQ; width = 3 }
+    else if c == 62 && n == 62 && n2 == 61 { kind = A_SHREQ; width = 3 }
+    else if c == 45 && n == 62 { kind = A_ARROW; width = 2 }
+    // ROUND 70: the compound assignments and the two step operators.
+    // `++`/`--` are read GREEDILY; `a - -b` stays two tokens because of the
+    // blank between them.
+    else if c == 43 && n == 61 { kind = A_PLUSEQ; width = 2 }
+    else if c == 45 && n == 61 { kind = A_MINUSEQ; width = 2 }
+    else if c == 42 && n == 61 { kind = A_STAREQ; width = 2 }
+    else if c == 47 && n == 61 { kind = A_SLASHEQ; width = 2 }
+    else if c == 37 && n == 61 { kind = A_PERCENTEQ; width = 2 }
+    else if c == 38 && n == 61 { kind = A_AMPEQ; width = 2 }
+    else if c == 124 && n == 61 { kind = A_PIPEEQ; width = 2 }
+    else if c == 94 && n == 61 { kind = A_CARETEQ; width = 2 }
+    else if c == 43 && n == 43 { kind = A_PLUSPLUS; width = 2 }
+    else if c == 45 && n == 45 { kind = A_MINUSMINUS; width = 2 }
+    // ROUND 72: explicit wrap/saturate arithmetic (SPEC 13, item L9). Read
+    // GREEDILY like the pairs above, BEFORE the one character `+`/`-`/`*`
+    // further down -- otherwise `h *% 1099511628211` would scan as `*` and
+    // `%` and the parser would report a missing operand.
+    else if c == 43 && n == 37 { kind = A_PLUSPERCENT; width = 2 }
+    else if c == 45 && n == 37 { kind = A_MINUSPERCENT; width = 2 }
+    else if c == 42 && n == 37 { kind = A_STARPERCENT; width = 2 }
+    else if c == 43 && n == 124 { kind = A_PLUSPIPE; width = 2 }
+    else if c == 45 && n == 124 { kind = A_MINUSPIPE; width = 2 }
+    else if c == 42 && n == 124 { kind = A_STARPIPE; width = 2 }
+    else if c == 46 && n == 46 { kind = A_DOTDOT; width = 2 }
+    else if c == 60 && n == 60 { kind = A_SHL; width = 2 }
+    else if c == 62 && n == 62 { kind = A_SHR; width = 2 }
+    else if c == 38 && n == 38 { kind = A_ANDAND; width = 2 }
+    else if c == 124 && n == 124 { kind = A_OROR; width = 2 }
+    else if c == 61 && n == 61 { kind = A_EQEQ; width = 2 }
+    else if c == 33 && n == 61 { kind = A_NOTEQ; width = 2 }
+    else if c == 60 && n == 61 { kind = A_LE; width = 2 }
+    else if c == 62 && n == 61 { kind = A_GE; width = 2 }
+    else if c == 40 { kind = A_LPAREN }
+    else if c == 41 { kind = A_RPAREN }
+    else if c == 123 { kind = A_LBRACE }
+    else if c == 125 { kind = A_RBRACE }
+    else if c == 91 { kind = A_LBRACKET }
+    else if c == 93 { kind = A_RBRACKET }
+    else if c == 44 { kind = A_COMMA }
+    else if c == 58 { kind = A_COLON }
+    else if c == 59 { kind = A_SEMI }
+    else if c == 46 { kind = A_DOT }
+    else if c == 61 { kind = A_ASSIGN }
+    else if c == 43 { kind = A_PLUS }
+    else if c == 45 { kind = A_MINUS }
+    else if c == 42 { kind = A_STAR }
+    else if c == 47 { kind = A_SLASH }
+    else if c == 37 { kind = A_PERCENT }
+    else if c == 38 { kind = A_AMP }
+    else if c == 124 { kind = A_PIPE }
+    else if c == 94 { kind = A_CARET }
+    else if c == 35 { kind = A_HASH }
+    else if c == 33 { kind = A_NOT }
+    else if c == 126 { kind = A_TILDE }
+    else if c == 63 { kind = A_QUESTION }
+    else if c == 60 { kind = A_LT }
+    else if c == 62 { kind = A_GT }
+    else { return false }
+    var i: u32 = 0
+    while i < width {
+        vor1(l)
+        i = i + 1
+    }
+    tok(l, kind, line, col, width, 0, 0)
+    return true
+}
+
+// ------------------------------------------------------------ string literals
+
+fn push_utf8(l: *mut Lexer, cp: u32) {
+    if cp < 128 {
+        rt.buf_push(&(*l).lit, cp as u8)
+    } else if cp < 2048 {
+        rt.buf_push(&(*l).lit, (192 + (cp >> 6)) as u8)
+        rt.buf_push(&(*l).lit, (128 + (cp & 63)) as u8)
+    } else if cp < 65536 {
+        rt.buf_push(&(*l).lit, (224 + (cp >> 12)) as u8)
+        rt.buf_push(&(*l).lit, (128 + ((cp >> 6) & 63)) as u8)
+        rt.buf_push(&(*l).lit, (128 + (cp & 63)) as u8)
+    } else {
+        rt.buf_push(&(*l).lit, (240 + (cp >> 18)) as u8)
+        rt.buf_push(&(*l).lit, (128 + ((cp >> 12) & 63)) as u8)
+        rt.buf_push(&(*l).lit, (128 + ((cp >> 6) & 63)) as u8)
+        rt.buf_push(&(*l).lit, (128 + (cp & 63)) as u8)
+    }
+}
+
+fn push_u16(l: *mut Lexer, v: u32) {
+    rt.buf_push(&(*l).lit, (v & 255) as u8)
+    rt.buf_push(&(*l).lit, ((v >> 8) & 255) as u8)
+}
+
+fn push_utf16(l: *mut Lexer, cp: u32) {
+    if cp > 65535 {
+        let r: u32 = cp - 65536
+        push_u16(l, 55296 + (r >> 10))
+        push_u16(l, 56320 + (r & 1023))
+    } else {
+        push_u16(l, cp)
+    }
+}
+
+// Code point of the UTF-8 character at `i`, which is `w` bytes long.
+fn utf8_code_point(l: *mut Lexer, i: usize, w: usize) -> u32 {
+    let b0: u32 = oct(l, i)
+    if w == 1 { return b0 }
+    if w == 2 { return ((b0 & 31) << 6) | (oct(l, i + 1) & 63) }
+    if w == 3 {
+        return ((b0 & 15) << 12) | ((oct(l, i + 1) & 63) << 6) | (oct(l, i + 2) & 63)
+    }
+    return ((b0 & 7) << 18) | ((oct(l, i + 1) & 63) << 12) | ((oct(l, i + 2) & 63) << 6) | (oct(l, i + 3) & 63)
+}
+
+// Exactly `count` hex digits starting at `i`; -1 if one is missing.
+fn hex_fixed(l: *mut Lexer, i: usize, cnt: usize, end: usize) -> i64 {
+    if i + cnt > end { return -1 }
+    var v: i64 = 0
+    var k: usize = 0
+    while k < cnt {
+        let h: i32 = hex_value(oct(l, i + k))
+        if h < 0 { return -1 }
+        v = v * 16 + h as i64
+        k = k + 1
+    }
+    return v
+}
+
+// Read `\uXXXX` or `\u{...}` at `i`. Returns (width << 32) | code point,
+// or -1 on error. Firn has no multiple returns -- hence the packing.
+// Error codes, so that the message is exactly the one `firnc0` gives:
+//   -1 non hexadecimal digit in `\u{...}`
+//   -2 code point above U+10FFFF
+//   -3 `\u{...}` not terminated
+//   -4 `\uXXXX` without four hex digits
+fn read_u_escape(l: *mut Lexer, i: usize, end: usize) -> i64 {
+    if oct(l, i) == 123 {
+        var j: usize = i + 1
+        var v: i64 = 0
+        var n: usize = 0
+        while j < end {
+            let d: u32 = oct(l, j)
+            if d == 125 { break }
+            let h: i32 = hex_value(d)
+            if h < 0 { return -1 }
+            v = v * 16 + h as i64
+            if v > 1114111 { return -2 }
+            n = n + 1
+            j = j + 1
+        }
+        if n == 0 || j >= end || oct(l, j) != 125 { return -3 }
+        let br: i64 = (j + 1 - i) as i64
+        return (br << 32) | v
+    }
+    let v: i64 = hex_fixed(l, i, 4, end)
+    if v < 0 { return -4 }
+    return (4 << 32) | v
+}
+
+fn is_high_surrogate(cp: i64) -> bool { return cp >= 55296 && cp <= 56319 }
+fn is_deep_surrogate(cp: i64) -> bool { return cp >= 56320 && cp <= 57343 }
+
+// Does an escaped LOW surrogate follow at `i`? Returns as above.
+fn peek_deep(l: *mut Lexer, i: usize, end: usize) -> i64 {
+    if i + 1 >= end { return -1 }
+    if oct(l, i) != 92 || oct(l, i + 1) != 117 { return -1 }
+    let r: i64 = read_u_escape(l, i + 2, end)
+    if r < 0 { return -1 }
+    let cp: i64 = r & 4294967295
+    if !is_deep_surrogate(cp) { return -1 }
+    let br: i64 = (r >> 32) + 2
+    return (br << 32) | cp
+}
+
+// Report a literal error. Rust puts the column at
+// `column + off`, where `off` counts CHARACTERS from the start of the literal
+// (`b`/`u` and quotes included), and prefixes every message with the fixed
+// text from `lit_on`.
+fn lit_on(l: *mut Lexer) {
+    var v: [u8; 21] = "in a string literal: "
+    m_on(l)
+    m_txt(l, (&v[0]) as u64, 21)
+}
+
+fn lit_report(l: *mut Lexer, line: u32, col: u32, off: usize) {
+    m_report(l, line, col + off as u32, 1)
+}
+
+// Decodes the body [bs, be) and appends it to `lit`. `false` = error.
+// `lead` is the number of characters before the body (1 for `"`, 2 for `b"`).
+fn decode(l: *mut Lexer, kind: u32, bs: usize, be: usize,
+    line: u32, col: u32, lead: usize) -> bool {
+    var i: usize = bs
+    var zi: usize = 0 // character counter within the body
+    var good: bool = true
+    while i < be {
+        let b: u32 = oct(l, i)
+        if b != 92 {
+            var w: usize = 1
+            while i + w < be {
+                if (oct(l, i + w) & 192) != 128 { break }
+                w = w + 1
+            }
+            if kind == L_BYTES {
+                if b > 127 {
+                    var e1: [u8; 11] = "character '"
+                    var e2: [u8; 61] = "' is not allowed in a Bytes literal, write the octets as \\xNN"
+                    lit_on(l)
+                    m_txt(l, (&e1[0]) as u64, 11)
+                    m_char(l, i)
+                    m_txt(l, (&e2[0]) as u64, 61)
+                    lit_report(l, line, col, lead + zi)
+                    good = false
+                } else {
+                    rt.buf_push(&(*l).lit, b as u8)
+                }
+            } else if kind == L_STR {
+                var k: usize = 0
+                while k < w {
+                    rt.buf_push(&(*l).lit, oct(l, i + k) as u8)
+                    k = k + 1
+                }
+            } else {
+                push_utf16(l, utf8_code_point(l, i, w))
+            }
+            i = i + w
+            zi = zi + 1
+            continue
+        }
+        let start: usize = zi // character index of the backslash
+        i = i + 1
+        zi = zi + 1
+        if i >= be {
+            var e3: [u8; 32] = "escape at the end of the literal"
+            lit_on(l)
+            m_txt(l, (&e3[0]) as u64, 32)
+            lit_report(l, line, col, lead + start)
+            return false
+        }
+        let e: u32 = oct(l, i)
+        let e_pos: usize = i
+        var ew: usize = 1
+        while i + ew < be {
+            if (oct(l, i + ew) & 192) != 128 { break }
+            ew = ew + 1
+        }
+        i = i + ew
+        zi = zi + 1
+        var v: i64 = -1
+        if e == 110 { v = 10 }
+        else if e == 114 { v = 13 }
+        else if e == 116 { v = 9 }
+        else if e == 48 { v = 0 }
+        else if e == 92 { v = 92 }
+        else if e == 34 { v = 34 }
+        else if e == 39 { v = 39 }
+        if v >= 0 {
+            if kind == L_STR16 {
+                push_u16(l, v as u32)
+            } else {
+                rt.buf_push(&(*l).lit, v as u8)
+            }
+            continue
+        }
+        if e == 120 {
+            let h: i64 = hex_fixed(l, i, 2, be)
+            if h < 0 {
+                var e4: [u8; 41] = "\\x expects exactly two hexadecimal digits"
+                lit_on(l)
+                m_txt(l, (&e4[0]) as u64, 41)
+                lit_report(l, line, col, lead + start)
+                return false
+            }
+            i = i + 2
+            zi = zi + 2
+            if kind == L_STR && h > 127 {
+                var e5: [u8; 57] = "\\xNN above 0x7F does not yield valid UTF-8, write \\u{...}"
+                lit_on(l)
+                m_txt(l, (&e5[0]) as u64, 57)
+                lit_report(l, line, col, lead + start)
+                good = false
+                continue
+            }
+            if kind == L_STR16 {
+                push_u16(l, h as u32)
+            } else {
+                rt.buf_push(&(*l).lit, h as u8)
+            }
+            continue
+        }
+        if e == 117 {
+            let r: i64 = read_u_escape(l, i, be)
+            if r < 0 {
+                lit_on(l)
+                if r == 0 - 1 {
+                    var f1: [u8; 34] = "\\u{...} expects hexadecimal digits"
+                    m_txt(l, (&f1[0]) as u64, 34)
+                } else if r == 0 - 2 {
+                    var f2: [u8; 46] = "code point above U+10FFFF is not representable"
+                    m_txt(l, (&f2[0]) as u64, 46)
+                } else if r == 0 - 3 {
+                    var f3: [u8; 25] = "\\u{...} is not terminated"
+                    m_txt(l, (&f3[0]) as u64, 25)
+                } else {
+                    var f4: [u8; 42] = "\\u expects exactly four hexadecimal digits"
+                    m_txt(l, (&f4[0]) as u64, 42)
+                }
+                lit_report(l, line, col, lead + start)
+                return false
+            }
+            let cp: i64 = r & 4294967295
+            let br: usize = (r >> 32) as usize
+            i = i + br
+            zi = zi + br
+            if kind == L_BYTES {
+                var f5: [u8; 56] = "\\u is not allowed in a Bytes literal (Bytes is not text)"
+                lit_on(l)
+                m_txt(l, (&f5[0]) as u64, 56)
+                lit_report(l, line, col, lead + start)
+                return false
+            }
+            if kind == L_STR16 {
+                if cp > 65535 {
+                    push_utf16(l, cp as u32)
+                } else {
+                    push_u16(l, cp as u32)
+                }
+                continue
+            }
+            // `Str` is checked UTF-8: unpaired surrogates are errors,
+            // a valid pair is joined into ONE code point.
+            var unpaired: bool = false
+            if is_high_surrogate(cp) {
+                let t: i64 = peek_deep(l, i, be)
+                if t < 0 {
+                    unpaired = true
+                } else {
+                    let tb: usize = (t >> 32) as usize
+                    i = i + tb
+                    zi = zi + tb
+                    let lo: i64 = t & 4294967295
+                    push_utf8(l, (65536 + ((cp - 55296) << 10) + (lo - 56320)) as u32)
+                }
+            } else if is_deep_surrogate(cp) {
+                unpaired = true
+            } else {
+                push_utf8(l, cp as u32)
+            }
+            if unpaired {
+                var g1: [u8; 21] = "unpaired surrogate U+"
+                var g2: [u8; 62] = " in a Str literal; Str is checked UTF-8 — use u\"...\" (Str16)"
+                lit_on(l)
+                m_txt(l, (&g1[0]) as u64, 21)
+                m_hex4(l, cp as u64)
+                m_txt(l, (&g2[0]) as u64, 62)
+                lit_report(l, line, col, lead + start)
+                return false
+            }
+            continue
+        }
+        var h1: [u8; 17] = "unknown escape '\\"
+        var h2: [u8; 1] = "'"
+        lit_on(l)
+        m_txt(l, (&h1[0]) as u64, 17)
+        m_char(l, e_pos)
+        m_txt(l, (&h2[0]) as u64, 1)
+        lit_report(l, line, col, lead + start)
+        return false
+    }
+    return good
+}
+
+// `false` if there is no literal at this position.
+fn lex_text(l: *mut Lexer) -> bool {
+    let c0: u32 = look(l, 0)
+    var kind: u32 = 0
+    var front: usize = 0
+    if c0 == 34 {
+        kind = L_STR
+        front = 0
+    } else if c0 == 98 && look(l, 1) == 34 {
+        kind = L_BYTES
+        front = 1
+    } else if c0 == 117 && look(l, 1) == 34 {
+        kind = L_STR16
+        front = 1
+    } else if c0 == 102 && look(l, 1) == 34 {
+        kind = L_FSTR
+        front = 1
+    } else {
+        return false
+    }
+    let line: u32 = (*l).line
+    let col: u32 = (*l).col
+    let bs: usize = (*l).p + front + 1
+    var i: usize = bs
+    var chars: usize = front + 1
+    var closed: bool = false
+    var be: usize = (*l).n
+    while i < (*l).n {
+        let b: u32 = oct(l, i)
+        if b == 92 {
+            i = i + 1
+            chars = chars + 1
+            if i >= (*l).n { break }
+            if oct(l, i) == 10 { break }
+            i = i + 1
+            chars = chars + 1
+            while i < (*l).n {
+                if (oct(l, i) & 192) != 128 { break }
+                i = i + 1
+            }
+            continue
+        }
+        if b == 34 {
+            be = i
+            closed = true
+            i = i + 1
+            chars = chars + 1
+            break
+        }
+        if b == 10 {
+            be = i
+            break
+        }
+        i = i + 1
+        chars = chars + 1
+        while i < (*l).n {
+            if (oct(l, i) & 192) != 128 { break }
+            i = i + 1
+        }
+    }
+    if !closed {
+        be = i
+    }
+    var z: usize = 0
+    while z < chars {
+        sign(l)
+        z = z + 1
+    }
+    let offset: usize = rt.buf_len(&(*l).lit)
+    var good: bool = closed
+    if closed && kind == L_FSTR {
+        // Interpolation: the body stays RAW -- splitting it into text and
+        // expression segments and decoding it is the parser's job (round 39).
+        rt.buf_push_bytes(&(*l).lit, (*l).q + bs as u64, be - bs)
+    } else if closed {
+        good = decode(l, kind, bs, be, line, col, front + 1)
+    } else {
+        // The offset here is `lead + characters in the body` -- exactly what
+        // `chars` holds, because the counter starts at `lead` and the closing
+        // quote was never read.
+        var u1: [u8; 34] = "string literal without a closing \""
+        lit_on(l)
+        m_txt(l, (&u1[0]) as u64, 34)
+        lit_report(l, line, col, chars)
+    }
+    if !good {
+        // Carry on lexing with an EMPTY literal -- exactly like firnc0, so
+        // that follow up errors do not stem from a broken token sequence.
+        rt.buf_set_len(&(*l).lit, offset)
+    }
+    let bytes: usize = rt.buf_len(&(*l).lit) - offset
+    var elems: usize = bytes
+    if kind == L_STR16 {
+        elems = bytes / 2
+    }
+    let k: usize = vec_len[u32](&(*l).lit_off)
+    vec_push[u32](&(*l).lit_off, offset as u32)
+    vec_push[u32](&(*l).lit_len, elems as u32)
+    vec_push[u32](&(*l).lit_kind, kind)
+    var tkind: u32 = A_STR
+    if kind == L_FSTR {
+        tkind = A_FSTR
+    }
+    tok(l, tkind, line, col, chars as u32, 0, k as u32)
+    return true
+}
+
+// ---------------------------------------------------------------- the run
+
+fn lex_run(l: *mut Lexer) {
+    while true {
+        skip(l)
+        let c: u32 = look(l, 0)
+        if c == 256 {
+            break
+        }
+        if lex_text(l) {
+            continue
+        }
+        if is_digit(c) {
+            lex_int(l)
+        } else if is_name_start(c) {
+            lex_name(l)
+        } else if !lex_char(l) {
+            var w1: [u8; 19] = "unknown character '"
+            var w2: [u8; 20] = "' in the source text"
+            let uz: u32 = (*l).line
+            let us: u32 = (*l).col
+            m_on(l)
+            m_txt(l, (&w1[0]) as u64, 19)
+            m_char(l, (*l).p)
+            m_txt(l, (&w2[0]) as u64, 20)
+            let cp: u32 = utf8_code_point(l, (*l).p, char_width(l, (*l).p))
+            if char_hint(l, cp) {
+                m_report_help(l, uz, us, 1)
+            } else {
+                m_report(l, uz, us, 1)
+            }
+            sign(l)
+        }
+    }
+    tok(l, A_EOF, (*l).line, (*l).col, 0, 0, 0)
+}

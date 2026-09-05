@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: MIT
+// lib/gc/gcvec.fi -- `GcVec`: the collection of VARIABLE LENGTH inside the
+// GC heap (SPEC 3.5.2, round 53).
+//
+// This file is APPENDED to `lib/gc/gc.fi` and forms ONE module with it
+// (`compiler/src/gc.rs::runtime_source`). It only enters the program when
+// `GcVec`/`GcMap` really occurs there -- programs without collections pay
+// not one byte. Every name from `gc.fi` (HEADER, F_SLOTS, SLOT_HEADER,
+// __gc_ld64, __gc_alloc_raw, __gc_barrier, ...) is visible here.
+//
+// ----------------------------------------------------------- Why like this
+//
+// The collector traces the heap PRECISELY through the compiler generated
+// type table: a fixed list of field offsets per class. A collection that
+// grows does not fit into that -- its element count is known only at run
+// time. That is exactly why `SPEC.md` 1197 said "no GcVec/GcMap" until now.
+//
+// The solution is a second object, the SLOT BUFFER: an ordinary GC block
+// whose payload is an array of elements and which carries the bit `F_SLOTS`
+// in its block header. `__gc_trace` (gc.fi) switches on that bit over to
+// `__gc_trace_slots` and reads the element count, the step width and the
+// pointer mask out of the buffer itself. The buffer is thereby a fully
+// fledged object traced by the collector -- no special path, no external
+// root, no pinning.
+//
+//     Gc[GcVec] ---buffer---> Gc[GcSlots] ---elements---> Gc[T] ...
+//        ^ an ordinary              ^ F_SLOTS, __gc_trace_slots
+//          strong field,
+//          type table + barrier from the compiler
+//
+// ------------------------------------------- The barrier question (goal 4)
+//
+// Since round 44 the collector marks in slices. So it may run IN THE MIDDLE
+// of the growing. Three places are critical, and all three hang on the same
+// Dijkstra insertion barrier from `gc.fi`:
+//
+//  (B1) A NEW BUFFER. `gcvec_slot` creates a larger buffer -- and
+//       `__gc_alloc_raw` is exactly the place where a marking or sweeping
+//       slice runs. After it the vector itself may long since be BLACK. The
+//       new buffer is found anyway, because it is hung in through the
+//       ordinary strong field `v.buffer` and the compiler puts
+//       `__gc_barrier` there: that colors it grey.
+//
+//  (B2) THE OLD BUFFER during the copying. Between the allocation and the
+//       hanging in NOTHING allocates -- so no slice can run.
+//       The old buffer hangs on the vector the whole time, the new one on
+//       the stack (caught conservatively). If the old one drops out
+//       afterwards, it is either traced already (black) or still lies grey
+//       on the mark stack -- in both cases its elements have been seen.
+//
+//  (B3) EVERY ELEMENT ENTERED. An element is written with `__gc_st64`, not
+//       through a typed field -- the compiler cannot put a barrier here,
+//       because it does not know the buffer at all.
+//       So `gcvec_set_raw` calls it ITSELF. Without that, a freshly
+//       appended child disappears behind an already black buffer.
+//       `tests/841_gcvec_incremental.fi` provokes exactly this case.
+//
+// What is NOT necessary: coloring the buffer grey again by hand when it
+// grows. Every element that ever stands in it has either turned grey
+// through (B3) or stood in the old buffer before, which is traced per (B2).
+// That is the whole reasoning; it stands here because it cannot be read off
+// the code.
+
+// `S_SLOTS_TID` stands in gc.fi: the compiler hands out the type ids, the
+// runtime does not know them -- it learns the one of `GcSlots` once per
+// process by creating ONE ordinary instance and reading its block header,
+// and puts it into the state block.
+
+// The step width/mask inside `desc` (see __gc_trace_slots).
+const GCVEC_DESC_PTR: u64 = 257
+const GCVEC_DESC_RAW: u64 = 1
+// The initial capacity of a buffer in elements.
+const GCVEC_START: u64 = 8
+
+// The slot buffer. Its fields coincide with the header that
+// `__gc_trace_slots` reads; the elements lie behind it and are allocated
+// OVERSIZED (which is why it is `__gc_alloc_raw` and not `gc GcSlots{...}`).
+gc class GcSlots {
+    n: u64,
+    desc: u64,
+    progress: u64,
+    cap: u64,
+}
+
+// The vector. An ordinary `gc class` with ONE strong field -- that makes it
+// usable everywhere a `Gc[T]` is usable, in particular as a field of another
+// `gc class` (`children: GcVec[Gc[Node]]`).
+gc class GcVec {
+    buffer: Gc[GcSlots],
+    desc: u64,
+}
+
+// --------------------------------------------------------- The slot buffer
+
+// Get the type id of `GcSlots` (once per process).
+fn __gcslots_tid() -> AllocError!u64 {
+    let st: u64 = __gc_state() as u64
+    let t: u64 = __gc_ld64(st + S_SLOTS_TID)
+    if t != 0 {
+        return t
+    }
+    let template: Gc[GcSlots] = try gc GcSlots { n: 0, desc: 0, progress: 0, cap: 0 }
+    let new: u64 = __gc_ld32((template as u64) - HEADER) as u64
+    __gc_st64(st + S_SLOTS_TID, new)
+    return new
+}
+
+// Create a buffer for `cap` elements. `desc` determines the step width and
+// the pointer mask. The payload is nulled after `__gc_alloc_raw`, so the
+// buffer is traceable from the very first moment (n = 0, progress = 0).
+fn __gcslots_new(cap: u64, desc: u64) -> AllocError!Gc[GcSlots] {
+    let tid: u64 = try __gcslots_tid()
+    let step: u64 = desc & 255
+    let bytes: u64 = SLOT_HEADER + cap * step * 8
+    let p: *mut u8 = __gc_alloc_raw(tid, bytes)
+    let a: u64 = p as u64
+    if a == 0 {
+        return AllocError::OutOfMemory
+    }
+    // THE bit. From here on the collector traces this block as a slot buffer.
+    __gc_st32(a - HEADER + 4, __gc_ld32(a - HEADER + 4) | F_SLOTS)
+    __gc_st64(a + 8, desc)
+    __gc_st64(a + 24, cap)
+    return a as Gc[GcSlots]
+}
+
+// The address of element `i` (internal only; no bounds check).
+fn __gcslots_addr(s: Gc[GcSlots], i: u64) -> u64 {
+    return (s as u64) + SLOT_HEADER + i * (s.desc & 255) * 8
+}
+
+// ------------------------------------------------------------------- GcVec
+
+// An empty vector for Gc pointers (`GcVec[Gc[T]]`). The buffer comes into
+// being only at the first entry -- an empty vector costs one object, not two.
+fn gcvec_new() -> AllocError!Gc[GcVec] {
+    return try gc GcVec { buffer: gc_null[GcSlots](), desc: GCVEC_DESC_PTR }
+}
+
+// An empty vector for RAW words (`GcVec[u64]`): the collector does NOT
+// trace the elements. For numbers, ids, atoms.
+fn gcvec_new_raw() -> AllocError!Gc[GcVec] {
+    return try gc GcVec { buffer: gc_null[GcSlots](), desc: GCVEC_DESC_RAW }
+}
+
+fn gcvec_length(v: Gc[GcVec]) -> u64 {
+    let s: Gc[GcSlots] = v.buffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    return s.n
+}
+
+fn gcvec_capacity(v: Gc[GcVec]) -> u64 {
+    let s: Gc[GcSlots] = v.buffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    return s.cap
+}
+
+// Make room for at least `n` elements. Doubling, so that `n` appends cost
+// O(n) together.
+//
+// HERE lies the trap of the round: `__gcslots_new` allocates, and at an
+// allocation site a collector slice runs. See (B1)/(B2) in the top
+// comment.
+fn gcvec_slot(v: Gc[GcVec], at_least: u64) -> AllocError!bool {
+    let old: Gc[GcSlots] = v.buffer
+    var oldcap: u64 = 0
+    var n: u64 = 0
+    if (old as u64) != 0 {
+        oldcap = old.cap
+        n = old.n
+    }
+    if oldcap >= at_least {
+        return true
+    }
+    var newcap: u64 = oldcap * 2
+    if newcap < GCVEC_START {
+        newcap = GCVEC_START
+    }
+    while newcap < at_least {
+        newcap = newcap * 2
+    }
+    let new: Gc[GcSlots] = try __gcslots_new(newcap, v.desc)
+    // Copying over. Between the allocation above and the hanging in below
+    // nothing allocates, so NO slice can come in between here.
+    let step: u64 = v.desc & 255
+    let qa: u64 = (old as u64) + SLOT_HEADER
+    let za: u64 = (new as u64) + SLOT_HEADER
+    var i: u64 = 0
+    let words: u64 = n * step
+    while i < words {
+        __gc_st64(za + i * 8, __gc_ld64(qa + i * 8))
+        i = i + 1
+    }
+    __gc_st64((new as u64), n)
+    // An assignment into a strong field: the compiler puts __gc_barrier here.
+    // That is (B1) -- without this line a black vector loses its fresh
+    // buffer.
+    v.buffer = new
+    return true
+}
+
+// Set element `i` as a raw word. It calls the insertion barrier ITSELF,
+// because the compiler does not know the buffer -- see (B3).
+fn gcvec_set_raw(v: Gc[GcVec], i: u64, w: u64) -> bool {
+    let s: Gc[GcSlots] = v.buffer
+    if (s as u64) == 0 {
+        return false
+    }
+    if i >= s.n {
+        return false
+    }
+    let a: u64 = __gcslots_addr(s, i)
+    if (s.desc >> 8) != 0 {
+        __gc_barrier(a as *mut u8, w as *mut u8)
+    }
+    __gc_st64(a, w)
+    return true
+}
+
+fn gcvec_read_raw(v: Gc[GcVec], i: u64) -> u64 {
+    let s: Gc[GcSlots] = v.buffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    if i >= s.n {
+        return 0
+    }
+    return __gc_ld64(__gcslots_addr(s, i))
+}
+
+// Appending. The order is deliberate: first the barrier and the value, THEN
+// the length. The other way round a null word would stand in the traced
+// area for a moment -- harmless, but the order here is the one that still
+// holds with several threads (round 49).
+fn gcvec_append_raw(v: Gc[GcVec], w: u64) -> AllocError!bool {
+    let n: u64 = gcvec_length(v)
+    if !(try gcvec_slot(v, n + 1)) {
+        return false
+    }
+    let s: Gc[GcSlots] = v.buffer
+    let a: u64 = __gcslots_addr(s, n)
+    if (s.desc >> 8) != 0 {
+        __gc_barrier(a as *mut u8, w as *mut u8)
+    }
+    __gc_st64(a, w)
+    __gc_st64((s as u64), n + 1)
+    return true
+}
+
+// Remove the last element and return it (0 for an empty vector). The slot is
+// NULLED: a pointer beyond the length is no longer traced, but it should not
+// stay behind in the buffer as a corpse either.
+fn gcvec_detach_raw(v: Gc[GcVec]) -> u64 {
+    let s: Gc[GcSlots] = v.buffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    let n: u64 = s.n
+    if n == 0 {
+        return 0
+    }
+    let a: u64 = __gcslots_addr(s, n - 1)
+    let w: u64 = __gc_ld64(a)
+    __gc_st64((s as u64), n - 1)
+    __gc_st64(a, 0)
+    return w
+}
+
+// Remove element `i`, the order is preserved (the DOM needs that:
+// `removeChild` must not shuffle the siblings).
+fn gcvec_remove(v: Gc[GcVec], i: u64) -> bool {
+    let s: Gc[GcSlots] = v.buffer
+    if (s as u64) == 0 {
+        return false
+    }
+    let n: u64 = s.n
+    if i >= n {
+        return false
+    }
+    let step: u64 = s.desc & 255
+    let base: u64 = (s as u64) + SLOT_HEADER
+    var k: u64 = i * step
+    let end: u64 = (n - 1) * step
+    while k < end {
+        __gc_st64(base + k * 8, __gc_ld64(base + (k + step) * 8))
+        k = k + 1
+    }
+    __gc_st64((s as u64), n - 1)
+    var j: u64 = 0
+    while j < step {
+        __gc_st64(base + (end + j) * 8, 0)
+        j = j + 1
+    }
+    return true
+}
+
+// Everything out. The buffer STAYS -- whoever wants to be rid of it creates
+// a new vector. The slots are nulled so that no dead pointer keeps the
+// collector busy.
+fn gcvec_clear(v: Gc[GcVec]) {
+    let s: Gc[GcSlots] = v.buffer
+    if (s as u64) == 0 {
+        return
+    }
+    let words: u64 = s.n * (s.desc & 255)
+    let base: u64 = (s as u64) + SLOT_HEADER
+    __gc_st64((s as u64), 0)
+    var i: u64 = 0
+    while i < words {
+        __gc_st64(base + i * 8, 0)
+        i = i + 1
+    }
+}
+
+// Looks for a raw word, returns the index or the length (= not found).
+fn gcvec_find_raw(v: Gc[GcVec], w: u64) -> u64 {
+    let n: u64 = gcvec_length(v)
+    var i: u64 = 0
+    while i < n {
+        if gcvec_read_raw(v, i) == w {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------- The typed view
+//
+// Stage 0 has no methods. The type safe surface is generic functions --
+// possible since `Gc[T]` may stand inside a template (the compiler hooks
+// of round 53, `mono.rs::subst_name` and
+// `lib/firnc1/mono.fi::subst_ty`).
+
+fn gcvec_append[T: Any](v: Gc[GcVec], x: Gc[T]) -> AllocError!bool {
+    return try gcvec_append_raw(v, x as u64)
+}
+
+fn gcvec_read[T: Any](v: Gc[GcVec], i: u64) -> Gc[T] {
+    return gcvec_read_raw(v, i) as Gc[T]
+}
+
+fn gcvec_set[T: Any](v: Gc[GcVec], i: u64, x: Gc[T]) -> bool {
+    return gcvec_set_raw(v, i, x as u64)
+}
+
+fn gcvec_detach[T: Any](v: Gc[GcVec]) -> Gc[T] {
+    return gcvec_detach_raw(v) as Gc[T]
+}
+
+fn gcvec_find[T: Any](v: Gc[GcVec], x: Gc[T]) -> u64 {
+    return gcvec_find_raw(v, x as u64)
+}

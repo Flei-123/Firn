@@ -1,0 +1,163 @@
+// expect_exit: 0
+// tests/901_dom_tree_gc.fi -- THE TREE HOLDS IN THE COLLECTOR (round 54).
+//
+// A DOM tree is exactly the kind of cycle a reference count fails at:
+// every node holds its parent STRONGLY and its children STRONGLY, plus both
+// siblings. A tree of n nodes has about 2n cycles; if it becomes
+// unreachable, a reference count frees NOTHING.
+//
+// What is checked here is the STRUCTURE of the statement; the measurement
+// over many rounds with RSS and a counter-check is in tools/html/gc_tree.sh.
+//
+//   A  A tree that has been built is really cyclic (the back references hold).
+//   B  As long as it is reachable, it survives every collection.
+//   C  If it becomes unreachable, the number of live objects sinks back to
+//      the level from before -- so it is collected.
+//   D  Over many rounds neither the object count nor the heap grows.
+//
+// Every return value != 0 names the place.
+
+import browser.node
+
+const WIDTH: u32 = 8
+const DEPTH: u32 = 4
+
+// Builds a tree with WIDTH^DEPTH-like branching and yields the number of
+// nodes created. All references are strong, in both directions.
+fn tree_build(parent: Gc[Node], depth: u32) -> AllocError!u64 {
+    if depth == 0 as u32 {
+        return 0
+    }
+    var n: u64 = 0
+    var i: u32 = 0
+    while i < WIDTH {
+        let e = try node.elem_new(100 + i, node.NS_HTML)
+        node.append_child(parent, e)
+        // The back reference MUST hold, otherwise the cycle would be none.
+        if e.parent != parent {
+            return 0
+        }
+        n = n + 1
+        n = n + try tree_build(e, depth - 1)
+        i = i + 1
+    }
+    return n
+}
+
+fn node_count(k: Gc[Node]) -> u64 {
+    if k == gc_null[Node]() {
+        return 0
+    }
+    var n: u64 = 1
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        n = n + node_count(c)
+        c = c.next
+    }
+    return n
+}
+
+// Builds a tree, checks it and lets it fall with the return.
+// A FUNCTION OF ITS OWN: after the return the strong pointer must not lie
+// in any LIVE frame any more (the stack scan is conservative, SPEC 3.5.3).
+fn a_round(depth: u32) -> u64 {
+    let d = node.document_new() catch gc_null[Document]()
+    if d == gc_null[Document]() {
+        return 0
+    }
+    let n: u64 = tree_build(d, depth) catch 0
+    if n == 0 {
+        return 0
+    }
+    // The tree is completely reachable through the chain of children ...
+    if node_count(d) != n + 1 {
+        return 0
+    }
+    // ... and back again through the chain of parents (that is the cycle).
+    var deep: Gc[Node] = d
+    while deep.first_child != gc_null[Node]() {
+        deep = deep.first_child
+    }
+    var high: Gc[Node] = deep
+    while high.parent != gc_null[Node]() {
+        high = high.parent
+    }
+    if high != d {
+        return 0
+    }
+    // B: a collection in the middle of operation takes nothing reachable away.
+    gc_collect()
+    if node_count(d) != n + 1 {
+        return 0
+    }
+    return n
+}
+
+// Puts a deep, cleared frame over the frames that have been given up: the
+// conservative stack scan would otherwise read an old pointer as a root.
+// The self call keeps the function out of the inliner.
+fn scrub_deep(n: u64) {
+    var buffer: [u64; 512] = [0; 512]
+    var i: usize = 0
+    while i < 512 {
+        buffer[i] = 0
+        i = i + 1
+    }
+    barrier(&buffer)
+    if n > 0 {
+        scrub_deep(n - 1)
+    }
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    // Base level
+    scrub_deep(3)
+    gc_collect()
+    let base: u64 = gc_live_objects()
+
+    // A and B
+    let n: u64 = a_round(DEPTH)
+    if n == 0 {
+        return 1
+    }
+    // 8 + 64 + 512 + 4096 = 4680 elements
+    if n != 4680 {
+        return 2
+    }
+
+    // C: unreachable -> collected
+    scrub_deep(3)
+    gc_collect()
+    let after: u64 = gc_live_objects()
+    if after > base + 64 {
+        return 3
+    }
+
+    // D: many rounds, no growth
+    let heap0: u64 = gc_heap_bytes()
+    var r: u32 = 0
+    while r < 20 as u32 {
+        if a_round(DEPTH) != 4680 {
+            return 4
+        }
+        r = r + 1
+    }
+    scrub_deep(3)
+    gc_collect()
+    if gc_live_objects() > base + 64 {
+        return 5
+    }
+    // The heap may settle once, but it must not grow with the rounds.
+    let heap1: u64 = gc_heap_bytes()
+    if heap1 > heap0 * 4 + 1048576 {
+        return 6
+    }
+    // Something was really collected.
+    if gc_collections() == 0 {
+        return 7
+    }
+    return 0
+}

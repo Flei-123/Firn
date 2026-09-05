@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/sha512.fi -- SHA-512 and SHA-384 (FIPS 180-4), round B5.
+//
+// WHY IT IS HERE AT ALL. Round B5 needs SHA-384 in exactly two places and
+// both of them are somebody else's choice, not ours:
+//
+//   * a certificate authority that signs with `sha384WithRSAEncryption` or
+//     `ecdsa-with-SHA384`. Several of the roots in a normal trust store do,
+//     and a chain with one of them in it cannot be checked without this
+//     file. That is not a hypothetical -- it is the difference between
+//     "verified" and "unknown issuer" on a real site.
+//   * the cipher suite `TLS_AES_256_GCM_SHA384`, whose key schedule runs
+//     on SHA-384. This round does not OFFER that suite (see
+//     `lib/tls/handshake.fi`), so the hash is here for the certificates.
+//
+// SHA-512 is SHA-256 with 64 bit words, 80 rounds instead of 64, different
+// rotation amounts and a 1024 bit block. SHA-384 is the same function with
+// a different initial state, truncated to 48 octets -- and the different
+// initial state is what stops `sha384(x)` from being a prefix of
+// `sha512(x)`, which would be a real weakness.
+//
+// THE ARITHMETIC. Firn traps on integer overflow, and SHA-512 adds modulo
+// 2^64 on purpose. Every addition here is therefore written with the
+// wrapping operator `+%` (SPEC 9.3). That is not a workaround: it says at
+// every single site that the wrap IS the definition, and a reader who sees
+// a plain `+` in the round function of this file has found a bug.
+//
+// The 80 round constants are the first 64 bits of the fractional parts of
+// the cube roots of the first 80 primes, exactly as FIPS 180-4 4.2.3 lists
+// them, and the eight initial values for SHA-512 are the same of the
+// square roots of the first eight primes. They stand here as decimal
+// numbers because that is what the language reads; the generator that
+// produced them is three lines of `decimal` and it is in the commit that
+// added this file.
+//
+// THE LENGTH FIELD IS 128 BITS in SHA-512 and only the low 64 are written
+// here. A message of 2^61 octets is two exabytes; the high half is zero
+// for anything this program can be handed, and writing it as a constant
+// zero is honest where computing it would be theatre.
+//
+// PROVEN: FIPS 180-4 appendix C ("abc" and the two-block message) plus
+// Python's `hashlib` over random inputs of every length from 0 to 300 --
+// which is what catches a padding that is wrong only at a block boundary.
+// In `tools/tlsb5/crypto_check.py`.
+import std.rt
+
+export { Sha512, sha512_new, sha384_new, sha512_update, sha512_final,
+    sha512, sha384, SHA512_SIZE, SHA384_SIZE, SHA512_BLOCK }
+
+const SHA512_SIZE: usize = 64
+const SHA384_SIZE: usize = 48
+const SHA512_BLOCK: usize = 128
+
+struct Sha512 {
+    h: [u64; 8],
+    k: [u64; 80],
+    block: [u8; 128],
+    used: usize,
+    total: u64,
+    outlen: usize,
+}
+
+fn rotr64(x: u64, n: u64) -> u64 {
+    if n == 0 as u64 {
+        return x
+    }
+    return (x >> n) | (x << (64 as u64 - n))
+}
+
+fn k_table() -> [u64; 80] {
+    var k: [u64; 80] = [
+        4794697086780616226, 8158064640168781261, 13096744586834688815,
+        16840607885511220156, 4131703408338449720, 6480981068601479193,
+        10538285296894168987, 12329834152419229976, 15566598209576043074,
+        1334009975649890238, 2608012711638119052, 6128411473006802146,
+        8268148722764581231, 9286055187155687089, 11230858885718282805,
+        13951009754708518548, 16472876342353939154, 17275323862435702243,
+        1135362057144423861, 2597628984639134821, 3308224258029322869,
+        5365058923640841347, 6679025012923562964, 8573033837759648693,
+        10970295158949994411, 12119686244451234320, 12683024718118986047,
+        13788192230050041572, 14330467153632333762, 15395433587784984357,
+        489312712824947311, 1452737877330783856, 2861767655752347644,
+        3322285676063803686, 5560940570517711597, 5996557281743188959,
+        7280758554555802590, 8532644243296465576, 9350256976987008742,
+        10552545826968843579, 11727347734174303076, 12113106623233404929,
+        14000437183269869457, 14369950271660146224, 15101387698204529176,
+        15463397548674623760, 17586052441742319658, 1182934255886127544,
+        1847814050463011016, 2177327727835720531, 2830643537854262169,
+        3796741975233480872, 4115178125766777443, 5681478168544905931,
+        6601373596472566643, 7507060721942968483, 8399075790359081724,
+        8693463985226723168, 9568029438360202098, 10144078919501101548,
+        10430055236837252648, 11840083180663258601, 13761210420658862357,
+        14299343276471374635, 14566680578165727644, 15097957966210449927,
+        16922976911328602910, 17689382322260857208, 500013540394364858,
+        748580250866718886, 1242879168328830382, 1977374033974150939,
+        2944078676154940804, 3659926193048069267, 4368137639120453308,
+        4836135668995329356, 5532061633213252278, 6448918945643986474,
+        6902733635092675308, 7801388544844847127
+    ]
+    return k
+}
+
+fn sha512_new() -> Sha512 {
+    return Sha512 {
+        h: [
+            7640891576956012808, 13503953896175478587, 4354685564936845355, 11912009170470909681,
+            5840696475078001361, 11170449401992604703, 2270897969802886507, 6620516959819538809
+        ],
+        k: k_table(), block: [0; 128], used: 0, total: 0,
+        outlen: SHA512_SIZE }
+}
+
+// SHA-384: the same rounds, a different start, a shorter answer.
+fn sha384_new() -> Sha512 {
+    return Sha512 {
+        h: [
+            14680500436340154072, 7105036623409894663, 10473403895298186519, 1526699215303891257,
+            7436329637833083697, 10282925794625328401, 15784041429090275239, 5167115440072839076
+        ],
+        k: k_table(), block: [0; 128], used: 0, total: 0,
+        outlen: SHA384_SIZE }
+}
+
+fn sha512_block(s: *mut Sha512, p: u64) {
+    var w: [u64; 80] = [0; 80]
+    var i: usize = 0
+    while i < 16 {
+        var v: u64 = 0
+        var j: usize = 0
+        while j < 8 {
+            v = (v << 8) | (rt.ld8(p, i * 8 + j) as u64)
+            j = j + 1
+        }
+        w[i] = v
+        i = i + 1
+    }
+    while i < 80 {
+        let s0: u64 = rotr64(w[i - 15], 1) ^ rotr64(w[i - 15], 8)
+        ^ (w[i - 15] >> 7)
+        let s1: u64 = rotr64(w[i - 2], 19) ^ rotr64(w[i - 2], 61)
+        ^ (w[i - 2] >> 6)
+        w[i] = w[i - 16] +% s0 +% w[i - 7] +% s1
+        i = i + 1
+    }
+    var a: u64 = (*s).h[0]
+    var b: u64 = (*s).h[1]
+    var c: u64 = (*s).h[2]
+    var d: u64 = (*s).h[3]
+    var e: u64 = (*s).h[4]
+    var f: u64 = (*s).h[5]
+    var g: u64 = (*s).h[6]
+    var hh: u64 = (*s).h[7]
+    i = 0
+    while i < 80 {
+        let big1: u64 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
+        let ch: u64 = (e & f) ^ ((~e) & g)
+        let t1: u64 = hh +% big1 +% ch +% (*s).k[i] +% w[i]
+        let big0: u64 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
+        let maj: u64 = (a & b) ^ (a & c) ^ (b & c)
+        let t2: u64 = big0 +% maj
+        hh = g
+        g = f
+        f = e
+        e = d +% t1
+        d = c
+        c = b
+        b = a
+        a = t1 +% t2
+        i = i + 1
+    }
+    (*s).h[0] = (*s).h[0] +% a
+    (*s).h[1] = (*s).h[1] +% b
+    (*s).h[2] = (*s).h[2] +% c
+    (*s).h[3] = (*s).h[3] +% d
+    (*s).h[4] = (*s).h[4] +% e
+    (*s).h[5] = (*s).h[5] +% f
+    (*s).h[6] = (*s).h[6] +% g
+    (*s).h[7] = (*s).h[7] +% hh
+}
+
+fn sha512_update(s: *mut Sha512, p: u64, n: usize) {
+    (*s).total = (*s).total +% (n as u64)
+    var at: usize = 0
+    while at < n {
+        if (*s).used == 0 && n - at >= 128 {
+            sha512_block(s, p + at as u64)
+            at = at + 128
+        } else {
+            (*s).block[(*s).used] = rt.ld8(p, at)
+            (*s).used = (*s).used + 1
+            at = at + 1
+            if (*s).used == 128 {
+                sha512_block(s, (&(*s).block[0]) as u64)
+                (*s).used = 0
+            }
+        }
+    }
+}
+
+fn sha512_final(s: *mut Sha512, out: u64) {
+    let bits: u64 = (*s).total *% (8 as u64)
+    var pad: [u8; 144] = [0; 144]
+    pad[0] = 128 as u8
+    var padlen: usize = 1
+    while ((*s).used + padlen) % 128 != 112 {
+        padlen = padlen + 1
+    }
+    // The high 64 bits of the 128 bit length -- see the head of the file.
+    var i: usize = 0
+    while i < 8 {
+        pad[padlen + i] = 0 as u8
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        pad[padlen + 8 + i] = ((bits >> ((7 - i) as u64 * 8)) & 255 as u64)
+        as u8
+        i = i + 1
+    }
+    sha512_update(s, (&pad[0]) as u64, padlen + 16)
+    let want: usize = (*s).outlen
+    i = 0
+    while i < want {
+        let wi: usize = i / 8
+        let bi: u64 = (7 - (i % 8)) as u64
+        rt.st8(out, i, (((*s).h[wi] >> (bi * 8)) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+fn sha512(p: u64, n: usize, out: u64) {
+    var s: Sha512 = sha512_new()
+    sha512_update(&s, p, n)
+    sha512_final(&s, out)
+}
+
+fn sha384(p: u64, n: usize, out: u64) {
+    var s: Sha512 = sha384_new()
+    sha512_update(&s, p, n)
+    sha512_final(&s, out)
+}

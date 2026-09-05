@@ -1,0 +1,209 @@
+// lib/num/f32_text.fi -- binary32 -> the SHORTEST decimal text that reads
+// back (round 71).
+//
+// WHY THIS FILE EXISTS. `dtoa` produces the shortest text for a binary64.
+// For an `f32` that is not enough: 0.1f widened to a double is
+// 0.100000001490116119384765625, and the shortest text for THAT double is
+// "0.10000000149011612" -- seventeen digits where one would do. The
+// round-trip guarantee of `f32` is a different one, and a weaker one: the
+// text only has to lead back to the same FOUR octets.
+//
+// THE PROCEDURE, and why it is provably right:
+//
+//   1. Widen the value to a binary64. That is exact -- every binary32 is a
+//      binary64.
+//   2. Let `dtoa_digits` produce the shortest digit string D of that
+//      double. D reads back exactly to the double, hence exactly to the
+//      f32.
+//   3. Shorten: for p = 1, 2, 3, ... take the first p digits of D, once cut
+//      off and once rounded up, and CHECK each candidate -- read it with
+//      the correctly rounded `strtod`, narrow to binary32, compare the
+//      octets. The first candidate that matches wins.
+//
+// The check is what makes the whole thing safe. Whatever comes out of here
+// has been read back once and has led to the same value; there is no case
+// distinction that could be forgotten. Nine significant digits always
+// suffice for a binary32, so the loop terminates long before D runs out.
+//
+// The check reads with `strtod_odd` and narrows once -- the CORRECT way
+// (lib/num/core_facade.fi). Reading with `strtod` and narrowing afterwards
+// would be the double rounding that this round found, and the check would
+// then bless texts that no other reader accepts.
+//
+// Include:  //#include lib/num/f32_text.fi
+//           (needs bignum, dtoa, strtod, core_bits, core_facade)
+
+// The digits of one candidate. Nine are always enough for a binary32; the
+// two extra places carry the overflow of "999 -> 1000".
+const F32A_MAX: usize = 12
+
+// Cut the digit string `src` (length `n`) to `p` places, once downwards
+// (`up = false`) and once upwards (`up = true`). The exponent may move by
+// one when 9...9 turns into 10...0; that is what `k10` is for.
+//
+// Returns the number of digits really written (`p`, or 1 after an
+// overflow).
+#[allow_fp]
+fn f32a_cut(src: *mut u8, n: usize, p: usize, up: bool, dst: *mut u8, k10: *mut i64) -> usize {
+    var i: usize = 0
+    while i < p {
+        var d: u8 = 48 as u8
+        if i < n {
+            d = ld8(src, i)
+        }
+        st8(dst, i, d)
+        i = i + 1
+    }
+    if !up {
+        return p
+    }
+    // Round up: increment the last place, carry to the left.
+    var j: usize = p
+    while j > 0 {
+        j = j - 1
+        let d2: u8 = ld8(dst, j)
+        if d2 < 57 as u8 {
+            st8(dst, j, d2 + 1 as u8)
+            return p
+        }
+        st8(dst, j, 48 as u8)
+    }
+    // Everything was a nine: 999 -> 1000, and one digit is enough for that.
+    st8(dst, 0, 49 as u8)
+    *k10 = *k10 + 1
+    return 1
+}
+
+// Is rounding UP the closer of the two candidates?
+//
+// The digits after the cut decide, exactly as in any correct rounding:
+// above a half upwards, below a half downwards, at exactly a half towards
+// the EVEN last digit. Without this the shortest text would be right but
+// not the nearest one -- 3.4028234e+38 and 3.4028235e+38 both read back as
+// the largest binary32, and only the second is the one every other
+// implementation prints.
+#[allow_fp]
+fn f32a_up(src: *mut u8, n: usize, p: usize) -> bool {
+    if p >= n {
+        return false
+    }
+    let d: u8 = ld8(src, p)
+    if d > 53 as u8 {
+        return true
+    }
+    if d < 53 as u8 {
+        return false
+    }
+    // exactly 5: is anything else behind it?
+    var i: usize = p + 1
+    while i < n {
+        if ld8(src, i) != 48 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    // a true half -- towards the even digit
+    var last: u8 = 48 as u8
+    if p > 0 {
+        last = ld8(src, p - 1)
+    }
+    return (last - 48 as u8) % 2 as u8 == 1 as u8
+}
+
+// Does the candidate read back as exactly this binary32?
+//
+// The text is built in the plainest form there is -- digits, `e`, exponent
+// -- because `strtod` reads that and nothing about the formatting may
+// influence the decision.
+#[allow_fp]
+fn f32a_holds(bits: u32, dig: *mut u8, p: usize, k10: i64, sws: *mut u8) -> bool {
+    var probe: Bytes = Bytes { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    var i: usize = 0
+    while i < p {
+        bytes_push(&probe, ld8(dig, i))
+        i = i + 1
+    }
+    bytes_push(&probe, 101 as u8) // e
+    dtoa_push_int(&probe, k10 - p as i64)
+    var used: usize = 0
+    // The CORRECT way back (round 71): round to odd in between, then narrow
+    // once. Reading with `strtod` and narrowing afterwards would be the very
+    // double rounding this round found -- and the check would then bless
+    // candidates that no other reader accepts.
+    let db: u64 = strtod_odd(probe.ptr, probe.len, sws, &used)
+    bytes_free(&probe)
+    if used == 0 {
+        return false
+    }
+    let back: f32 = bits_f64(db) as f32
+    return f32_bits(back) == bits
+}
+
+// The complete text output for a binary32, in the same shape as `dtoa`.
+// `ws` is the scratch memory of `dtoa` (`dtoa_work_bytes()`), `sws` that of
+// `strtod` (`strtod_work_bytes()`).
+#[allow_fp]
+fn ftoa32(bits: u32, out: *mut Bytes, ws: *mut u8, sws: *mut u8) {
+    bytes_clear(out)
+    if f32_bits_is_nan(bits) {
+        bytes_push(out, 78 as u8) // N
+        bytes_push(out, 97 as u8) // a
+        bytes_push(out, 78 as u8) // N
+        return
+    }
+    if f32_bits_sign(bits) && !f32_bits_is_zero(bits) {
+        bytes_push(out, 45 as u8) // -
+    }
+    if f32_bits_is_inf(bits) {
+        bytes_push(out, 73 as u8) // I
+        bytes_push(out, 110 as u8)
+        bytes_push(out, 102 as u8)
+        bytes_push(out, 105 as u8)
+        bytes_push(out, 110 as u8)
+        bytes_push(out, 105 as u8)
+        bytes_push(out, 116 as u8)
+        bytes_push(out, 121 as u8)
+        return
+    }
+    if f32_bits_is_zero(bits) {
+        bytes_push(out, 48 as u8) // like `dtoa`: even -0 becomes "0"
+        return
+    }
+    // 1. exactly widen and let `dtoa` produce the digits of the double.
+    //    The SIGN has already been written; from here on only the magnitude
+    //    counts -- the candidates carry no sign, and neither does the check.
+    let mag: u32 = bits & 2147483647
+    let wide: f64 = bits_f32(mag) as f64
+    var digits: [u8; 32] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
+    var n10: i64 = 0
+    let k: usize = dtoa_digits(f64_bits(wide), &digits[0], &n10, ws)
+
+    // 2. shorten, and check every candidate
+    var cand: [u8; 12] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
+    var p: usize = 1
+    while p < k && p < F32A_MAX {
+        // The NEARER candidate first: among texts of equal length the
+        // correctly rounded one wins.
+        let near: bool = f32a_up(&digits[0], k, p)
+        var e1: i64 = n10
+        let n1: usize = f32a_cut(&digits[0], k, p, near, &cand[0], &e1)
+        if f32a_holds(mag, &cand[0], n1, e1, sws) {
+            dtoa_write(out, &cand[0], n1, e1)
+            return
+        }
+        var e2: i64 = n10
+        let n2: usize = f32a_cut(&digits[0], k, p, !near, &cand[0], &e2)
+        if f32a_holds(mag, &cand[0], n2, e2, sws) {
+            dtoa_write(out, &cand[0], n2, e2)
+            return
+        }
+        p = p + 1
+    }
+    // 3. nothing shorter held: the digits of the double read back in any
+    //    case, because the double IS the f32.
+    dtoa_write(out, &digits[0], k, n10)
+}

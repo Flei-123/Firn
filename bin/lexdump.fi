@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// bin/lexdump.fi -- the token stream in the format of `firnc0 --emit=tokens`.
+//
+// Reads the source text from standard input and writes the token stream
+// to standard output. The format is DELIBERATELY the same as
+// `firnc0 --emit=tokens` down to the byte -- only that way can the lexer
+// written in Firn be checked against the one written in Rust
+// (`tools/lex_compare.sh`).
+//
+// Rust writes "{:>4}:{:<4} {:?}": the line right aligned in four columns,
+// a colon, the column left aligned in four columns, a space, then the
+// debug form of the token kind.
+
+import rt
+import lexer
+import diag
+
+const L_BYTES: u32 = 0
+const L_STR: u32 = 1
+const L_STR16: u32 = 2
+
+fn write_lit(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(b, p, n)
+}
+
+// right aligned in `width` columns
+fn dec_right(b: *mut rt.Buf, v: u64, width: usize) {
+    var digits: usize = 1
+    var t: u64 = v
+    while t >= 10 {
+        t = t / 10
+        digits = digits + 1
+    }
+    var i: usize = digits
+    while i < width {
+        rt.buf_push(b, 32 as u8)
+        i = i + 1
+    }
+    rt.buf_push_dec_u64(b, v)
+}
+
+// left aligned in `width` columns
+fn dec_left(b: *mut rt.Buf, v: u64, width: usize) {
+    var digits: usize = 1
+    var t: u64 = v
+    while t >= 10 {
+        t = t / 10
+        digits = digits + 1
+    }
+    rt.buf_push_dec_u64(b, v)
+    var i: usize = digits
+    while i < width {
+        rt.buf_push(b, 32 as u8)
+        i = i + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    // --- read the source: either from a file (the first argument) or from
+    // standard input. The FILE NAME is needed because it appears in every
+    // diagnostic -- without command line arguments (round 21) that would fail.
+    var source: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&source)
+    var name: u64 = 0
+    var name_n: usize = 0
+    if rt.arg_count(start) > 1 {
+        name = rt.arg_ptr(start, 1)
+        name_n = rt.c_length(name)
+        if !rt.read_file(name, &source) {
+            return 2
+        }
+    } else {
+        var sn: [u8; 7] = "<stdin>"
+        name = (&sn[0]) as u64
+        name_n = 7
+        if !rt.read_stdin(&source) {
+            return 2
+        }
+    }
+
+    // --- word tables (Firn has no mutable global state)
+    var kwtxt: [u8; 179] = "fn|let|var|if|else|while|return|struct|const|profile|as|mut|true|false|syscall|extern|break|continue|defer|errdefer|comptime|for|in|import|export|enum|match|error|try|catch|static"
+    var namtxt: [u8; 636] = "Int|Ident|Float|Str|KwFn|KwLet|KwVar|KwIf|KwElse|KwWhile|KwReturn|KwStruct|KwConst|KwProfile|KwAs|KwMut|KwTrue|KwFalse|KwSyscall|KwExtern|KwBreak|KwContinue|KwDefer|KwErrDefer|KwComptime|KwFor|KwIn|KwImport|KwExport|KwEnum|KwMatch|KwError|KwTry|KwCatch|LParen|RParen|LBrace|RBrace|LBracket|RBracket|Comma|Colon|Semi|Dot|DotDot|Arrow|Assign|Plus|Minus|Star|Slash|Percent|Amp|Pipe|Caret|Shl|Shr|AndAnd|OrOr|Not|Question|Hash|EqEq|NotEq|Lt|Le|Gt|Ge|Eof|FStr|Tilde|PlusEq|MinusEq|StarEq|SlashEq|PercentEq|AmpEq|PipeEq|CaretEq|ShlEq|ShrEq|PlusPlus|MinusMinus|FloatF32|PlusPercent|MinusPercent|StarPercent|PlusPipe|MinusPipe|StarPipe|KwStatic"
+    var lktxt: [u8; 15] = "Bytes|Str|Str16"
+
+    var names: lexer.Table = lexer.table_new()
+    defer lexer.table_free(&names)
+    lexer.tab_build(&names, (&namtxt[0]) as u64, 636)
+
+    var litarten: lexer.Table = lexer.table_new()
+    defer lexer.table_free(&litarten)
+    lexer.tab_build(&litarten, (&lktxt[0]) as u64, 15)
+
+    var l: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&source), rt.buf_len(&source),
+        (&kwtxt[0]) as u64, 179, name, name_n)
+    defer lexer.lex_free(&l)
+    lexer.lex_run(&l)
+
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+
+    var i: usize = 0
+    while i < lexer.lex_count(&l) {
+        let kind: u32 = lexer.lex_kind(&l, i)
+        dec_right(&out, lexer.lex_line(&l, i) as u64, 4)
+        rt.buf_push(&out, 58 as u8)
+        dec_left(&out, lexer.lex_col(&l, i) as u64, 4)
+        rt.buf_push(&out, 32 as u8)
+        // name of the kind
+        write_lit(&out, lexer.tab_ptr(&names, kind as usize),
+            lexer.tab_length(&names, kind as usize))
+        if kind == 0 {
+            // Int(...)
+            rt.buf_push(&out, 40 as u8)
+            rt.buf_push_dec_u64(&out, lexer.lex_number(&l, i))
+            rt.buf_push(&out, 41 as u8)
+        } else if kind == 2 || kind == 83 {
+            // Float(bit pattern) / FloatF32(bit pattern) -- round 71
+            rt.buf_push(&out, 40 as u8)
+            rt.buf_push_dec_u64(&out, lexer.lex_number(&l, i))
+            rt.buf_push(&out, 41 as u8)
+        } else if kind == 1 {
+            // Ident("name")
+            let nr: u32 = lexer.lex_nr(&l, i)
+            rt.buf_push(&out, 40 as u8)
+            rt.buf_push(&out, 34 as u8)
+            write_lit(&out, lexer.lex_name_ptr(&l, nr), lexer.lex_name_length(&l, nr))
+            rt.buf_push(&out, 34 as u8)
+            rt.buf_push(&out, 41 as u8)
+        } else if kind == 69 {
+            // FStr("raw") -- interpolation (round 39); the escaping is
+            // the debug form of a Rust string, so that the stream stays
+            // byte identical with `firnc0 --emit=tokens`.
+            let k: usize = lexer.lex_nr(&l, i) as usize
+            let n: usize = lexer.lex_lit_len(&l, k)
+            rt.buf_push(&out, 40 as u8)
+            rt.buf_push(&out, 34 as u8)
+            var j2: usize = 0
+            while j2 < n {
+                let b: u32 = lexer.lex_lit_byte(&l, k, j2) as u32
+                if b == 34 || b == 92 {
+                    rt.buf_push(&out, 92 as u8)
+                    rt.buf_push(&out, b as u8)
+                } else if b == 10 {
+                    rt.buf_push(&out, 92 as u8)
+                    rt.buf_push(&out, 110 as u8)
+                } else if b == 9 {
+                    rt.buf_push(&out, 92 as u8)
+                    rt.buf_push(&out, 116 as u8)
+                } else if b == 13 {
+                    rt.buf_push(&out, 92 as u8)
+                    rt.buf_push(&out, 114 as u8)
+                } else {
+                    rt.buf_push(&out, b as u8)
+                }
+                j2 = j2 + 1
+            }
+            rt.buf_push(&out, 34 as u8)
+            rt.buf_push(&out, 41 as u8)
+        } else if kind == 3 {
+            // Str(kind, Octets([..])) or Str(Str16, Units([..]))
+            let k: usize = lexer.lex_nr(&l, i) as usize
+            let la: u32 = lexer.lex_lit_kind(&l, k)
+            let n: usize = lexer.lex_lit_len(&l, k)
+            rt.buf_push(&out, 40 as u8)
+            write_lit(&out, lexer.tab_ptr(&litarten, la as usize),
+                lexer.tab_length(&litarten, la as usize))
+            rt.buf_push(&out, 44 as u8)
+            rt.buf_push(&out, 32 as u8)
+            if la == L_STR16 {
+                var u: [u8; 6] = "Units("
+                write_lit(&out, (&u[0]) as u64, 6)
+            } else {
+                var o: [u8; 7] = "Octets("
+                write_lit(&out, (&o[0]) as u64, 7)
+            }
+            rt.buf_push(&out, 91 as u8)
+            var j: usize = 0
+            while j < n {
+                if j > 0 {
+                    rt.buf_push(&out, 44 as u8)
+                    rt.buf_push(&out, 32 as u8)
+                }
+                if la == L_STR16 {
+                    rt.buf_push_dec_u64(&out, lexer.lex_lit_unit(&l, k, j) as u64)
+                } else {
+                    rt.buf_push_dec_u64(&out, lexer.lex_lit_byte(&l, k, j) as u64)
+                }
+                j = j + 1
+            }
+            rt.buf_push(&out, 93 as u8)
+            rt.buf_push(&out, 41 as u8)
+            rt.buf_push(&out, 41 as u8)
+        }
+        rt.buf_push(&out, 10 as u8)
+        i = i + 1
+    }
+    if !rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out)) {
+        return 3
+    }
+    // --- diagnostics to standard error, in the format of `firnc0`.
+    if lexer.lex_error(&l) > 0 {
+        var fb: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&fb)
+        diag.diag_render(lexer.lex_diags(&l), &fb)
+        rt.write_everything(2, rt.buf_ptr(&fb), rt.buf_len(&fb))
+        return 1
+    }
+    // Counters go to standard ERROR -- the comparison with `firnc0` reads
+    // only standard output and stays unaffected.
+    var stat: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&stat)
+    var t1: [u8; 9] = "; tokens "
+    rt.buf_push_bytes(&stat, (&t1[0]) as u64, 9)
+    rt.buf_push_dec_u64(&stat, lexer.lex_count(&l) as u64)
+    var t2: [u8; 13] = "  float_slow "
+    rt.buf_push_bytes(&stat, (&t2[0]) as u64, 13)
+    rt.buf_push_dec_u64(&stat, lexer.lex_float_slow(&l) as u64)
+    var t3: [u8; 8] = "  error "
+    rt.buf_push_bytes(&stat, (&t3[0]) as u64, 8)
+    rt.buf_push_dec_u64(&stat, lexer.lex_error(&l) as u64)
+    rt.buf_push(&stat, 10 as u8)
+    rt.write_everything(2, rt.buf_ptr(&stat), rt.buf_len(&stat))
+    return 0
+}

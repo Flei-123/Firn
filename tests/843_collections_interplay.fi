@@ -1,0 +1,347 @@
+// expect_exit: 0
+// Round 53, goal 3: the INTERPLAY of the new collections with the rest of
+// the memory management -- `Gc[T]`, `GcWeak[T]` (round 47) and the
+// finalizers (round 47) -- and goal 4 for `GcMap`: the moving of an
+// existing object WHILE a marking is running.
+//
+//   A  `GcWeak` on an object that only a `GcVec` holds: alive. After
+//      clearing the `GcVec`: cleared. So the collection really holds
+//      strongly, and it really does not hold any longer.
+//   B  The same for the VALUE of a `GcMap`.
+//   C  Finalizers on objects that a collection holds: they run exactly
+//      once, and only once the collection lets go of them.
+//   D  `GcMap` incrementally: move values between maps while
+//      marking is running (gc_set_slice(2)). Without the barrier in
+//      `gcmap_set` they get lost.
+
+const T_SYS_MMAP: i64 = 9
+const T_PROT_RW: i64 = 3
+const T_MAP_ANON: i64 = 34
+const Z_COUNT: u64 = 0
+const Z_SUM: u64 = 8
+
+gc class Handle {
+    next: Gc[Handle],
+    counter: *mut u8,
+    tok_nr: u64,
+}
+
+gc class Observer {
+    target: GcWeak[Handle],
+}
+
+// The dispatcher. Because the root file declares it itself, the
+// compiler leaves out its empty default.
+fn __gc_finalize(kind: u64, p: *mut u8) {
+    let g: Gc[Handle] = p as Gc[Handle]
+    let z: u64 = g.counter as u64
+    if z == 0 {
+        return
+    }
+    *((z + Z_COUNT) as *mut u64) = *((z + Z_COUNT) as *mut u64) + 1
+    *((z + Z_SUM) as *mut u64) = *((z + Z_SUM) as *mut u64) + kind
+}
+
+fn page() -> u64 {
+    let r: i64 = syscall(T_SYS_MMAP, 0, 4096, T_PROT_RW, T_MAP_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(z: u64, off: u64) -> u64 {
+    return *((z + off) as *mut u64)
+}
+
+fn handle(z: u64, tok_nr: u64) -> AllocError!Gc[Handle] {
+    return try gc Handle {
+        next: gc_null[Handle](),
+        counter: z as *mut u8,
+        tok_nr: tok_nr,
+    }
+}
+
+// Clear the dead stack area below one's own frame: the scan is
+// conservative, and old pointers in frames that have been left otherwise
+// keep alive exactly what is SUPPOSED to die here (docs/reports/dom.md).
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 256 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+// A/B: create a handle, hang it ONLY into the collection and give a weak
+// reference to it back. Recursive, so that the strong pointer does not
+// stay behind in the frame of the caller.
+fn hang_vec(v: Gc[GcVec], b: Gc[Observer], z: u64, depth: u64) -> AllocError!bool {
+    if depth > 0 {
+        return try hang_vec(v, b, z, depth - 1)
+    }
+    let g: Gc[Handle] = try handle(z, 1)
+    b.target = weak(g)
+    return try gcvec_append[Handle](v, g)
+}
+
+fn hang_map(m: Gc[GcMap], b: Gc[Observer], z: u64, depth: u64) -> AllocError!bool {
+    if depth > 0 {
+        return try hang_map(m, b, z, depth - 1)
+    }
+    let g: Gc[Handle] = try handle(z, 1)
+    b.target = weak(g)
+    return try gcmap_set_value[Handle](m, 4711, g)
+}
+
+// RECURSIVE on purpose: a recursive function is never inlined
+// (inline.rs). Were it inlined, the strong pointer from `strong()` would
+// lie in the frame of the caller and the conservative scan would keep alive
+// exactly the object whose death is checked here (docs/reports/dom.md).
+fn lives(b: Gc[Observer], depth: u64) -> bool {
+    if depth > 0 {
+        return lives(b, depth - 1)
+    }
+    return (strong(b.target) as u64) != 0
+}
+
+// C: hang many handles with a finalizer into a collection.
+fn with_finalizers(v: Gc[GcVec], z: u64, n: u64) -> AllocError!bool {
+    var i: u64 = 0
+    while i < n {
+        let g: Gc[Handle] = try handle(z, i)
+        if !gc_finalizer_set(g as *mut u8, 5) {
+            return false
+        }
+        let ok: bool = try gcvec_append[Handle](v, g)
+        i = i + 1
+    }
+    return true
+}
+
+// D: moving between maps while marking is running.
+const MM: u64 = 32
+const KK: u64 = 150
+
+fn garbage(k: u64) -> AllocError!u64 {
+    if k == 0 {
+        return 0
+    }
+    let dead: Gc[Handle] = try gc Handle {
+        next: gc_null[Handle](),
+        counter: 0 as *mut u8,
+        tok_nr: 0,
+    }
+    return try garbage(k - 1)
+}
+
+fn maps_build(all: Gc[GcVec]) -> AllocError!bool {
+    var j: u64 = 0
+    while j < MM {
+        let m: Gc[GcMap] = try gcmap_new(false, true)
+        let ok: bool = try gcvec_append[GcMap](all, m)
+        var k: u64 = 0
+        while k < KK {
+            let g: Gc[Handle] = try handle(0, j * KK + k + 1)
+            let o2: bool = try gcmap_set_value[Handle](m, k + 2, g)
+            k = k + 1
+        }
+        j = j + 1
+    }
+    return true
+}
+
+fn maps_relink(all: Gc[GcVec], p1a: *mut u64) -> AllocError!bool {
+    var p1: u64 = 0
+    var r: u64 = 0
+    while r < 3 {
+        var s: u64 = 0
+        while gc_phase() != 1 && s < 400000 {
+            let m: u64 = try garbage(1)
+            s = s + 1
+        }
+        let l0: u64 = gc_collections()
+        var t: u64 = 0
+        while gc_phase() == 1 && t < 40000 {
+            let j: u64 = (r * 5 + t) % MM
+            let of: Gc[GcMap] = gcvec_read[GcMap](all, j)
+            let after: Gc[GcMap] = gcvec_read[GcMap](all, (j * 7 + 3) % MM)
+            let sl: u64 = t % KK + 2
+            if gcmap_has(of, sl) {
+                // The target key is new -- so the map grows during the
+                // moving and rehashes everything while doing so.
+                let targetsl: u64 = 2 + KK + p1
+                p1 = p1 + 1
+                let g: Gc[Handle] = gcmap_get_value[Handle](of, sl)
+                let away: bool = gcmap_remove(of, sl)
+                let ok: bool = try gcmap_set_value[Handle](after, targetsl, g)
+            }
+            let m: u64 = try garbage(1)
+            t = t + 1
+        }
+        var g2: u64 = 0
+        while gc_collections() == l0 && g2 < 400000 {
+            let m: u64 = try garbage(16)
+            g2 = g2 + 1
+        }
+        r = r + 1
+    }
+    *p1a = p1
+    return true
+}
+
+fn maps_sum(all: Gc[GcVec], cnt_out: *mut u64) -> u64 {
+    var s: u64 = 0
+    var cnt: u64 = 0
+    var j: u64 = 0
+    while j < MM {
+        let m: Gc[GcMap] = gcvec_read[GcMap](all, j)
+        var p: u64 = 0
+        while p < gcmap_capacity(m) {
+            if gcmap_slot_used(m, p) {
+                let g: Gc[Handle] = gcmap_slot_value_as[Handle](m, p)
+                if (g as u64) == 0 {
+                    return 0
+                }
+                s = s + g.tok_nr
+                cnt = cnt + 1
+            }
+            p = p + 1
+        }
+        j = j + 1
+    }
+    *cnt_out = cnt
+    return s
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    let z: u64 = page()
+    if z == 0 {
+        return 91
+    }
+
+    // --- A: GcVec holds strongly, and only as long as it should ---------
+    let b1: Gc[Observer] = gc Observer { target: weak_null[Handle]() } catch gc_null[Observer]()
+    let v: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
+    if (b1 as u64) == 0 || (v as u64) == 0 {
+        return 92
+    }
+    let oa: bool = hang_vec(v, b1, z, 3) catch false
+    if !oa {
+        return 1
+    }
+    scrub(3)
+    gc_collect()
+    if !lives(b1, 2) {
+        return 2
+    }
+    gcvec_clear(v)
+    scrub(3)
+    gc_collect()
+    gc_collect()
+    if lives(b1, 2) {
+        return 3
+    }
+
+    // --- B: the same for the value of a GcMap ---------------------------
+    let b2: Gc[Observer] = gc Observer { target: weak_null[Handle]() } catch gc_null[Observer]()
+    let mm: Gc[GcMap] = gcmap_new(false, true) catch gc_null[GcMap]()
+    let ob: bool = hang_map(mm, b2, z, 3) catch false
+    if !ob {
+        return 4
+    }
+    scrub(3)
+    gc_collect()
+    if !lives(b2, 2) {
+        return 5
+    }
+    if !gcmap_remove(mm, 4711) {
+        return 6
+    }
+    scrub(3)
+    gc_collect()
+    gc_collect()
+    if lives(b2, 2) {
+        return 7
+    }
+
+    // --- C: finalizers on objects in a collection -----------------------
+    let fv: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
+    let oc: bool = with_finalizers(fv, z, 500) catch false
+    if !oc {
+        return 8
+    }
+    gc_collect()
+    // Reachable -> no finalizer may have run.
+    if ld(z, Z_COUNT) != 0 {
+        return 9
+    }
+    gcvec_clear(fv)
+    scrub(6)
+    gc_collect()
+    gc_collect()
+    gc_collect()
+    // Not ALL 500: the stack scan is conservative, a few accidental
+    // hits hold single objects (measured: 499 of 500). What is promised
+    // is not "all of them at once", what is promised is "at most once per
+    // object" and "only what is unreachable". Both are checked here.
+    let ran: u64 = ld(z, Z_COUNT)
+    if ran < 480 || ran > 500 {
+        return 10
+    }
+    // Cleanup kind 5 at every call.
+    if ld(z, Z_SUM) != ran * 5 {
+        return 11
+    }
+    // C2: AT MOST ONCE per object -- further runs must not push the number
+    // above 500.
+    gc_collect()
+    gc_collect()
+    if ld(z, Z_COUNT) > 500 {
+        return 12
+    }
+    if ld(z, Z_COUNT) < ran {
+        return 12
+    }
+
+    // --- D: GcMap incrementally -----------------------------------------
+    let all: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
+    if !(maps_build(all) catch false) {
+        return 13
+    }
+    gc_collect()
+    let should: u64 = MM * KK * (MM * KK + 1) / 2
+    var p1: u64 = 0
+    gc_set_slice(2)
+    let od: bool = maps_relink(all, &p1) catch false
+    gc_set_slice(0)
+    if !od {
+        return 14
+    }
+    if p1 < 2000 {
+        return 15
+    }
+    var wv: u64 = 0
+    while wv < 60 {
+        let m: u64 = garbage(2000) catch 0
+        wv = wv + 1
+    }
+    gc_collect()
+    var cnt: u64 = 0
+    let actual: u64 = maps_sum(all, &cnt)
+    if cnt != MM * KK {
+        return 16
+    }
+    if actual != should {
+        return 17
+    }
+    return 0
+}

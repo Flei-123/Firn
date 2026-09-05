@@ -1,0 +1,496 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/b5_main.fi -- THE PAGE WITH ITS PICTURES (root file of
+// round B5).
+//
+// `lib/paint/b3_main.fi` of round B3 with one step more: between the box
+// tree and its geometry the PICTURES are attached, so that an `<img>` is
+// laid out at the size it will really be drawn at. Everything else in the
+// pipeline is round B1 to B3 unchanged.
+//
+//   1. HTML -> DOM                (lib/browser/, round 54)
+//   2. CSS  -> stylesheet         (lib/css/, round 60)
+//   3. cascade + inheritance      (lib/css/cascade.fi, round B1)
+//   4. DOM  -> box tree           (lib/layout/build.fi)
+//   4b. THE PICTURES ARE ATTACHED (lib/browser/images.fi)      <- new
+//   5. box tree -> geometry       (lib/layout/flow.fi, round B2)
+//   6. box tree -> display list   (lib/paint/display.fi)
+//   7. display list -> pixels     (lib/paint/painter.fi)
+//   8. pixels -> PPM or PNG       (lib/paint/png.fi)
+//
+// The job on stdin is round B3's, with ONE section added at the end:
+//     u32  viewport width          u32  viewport height
+//     u32  n ; u8[n]   the HTML document (WTF-8)
+//     u32  n ; u8[n]   the user agent stylesheet   (origin 0)
+//     u32  n ; u8[n]   the author stylesheet       (origin 2)
+//     u32  n ; u8[n]   the font file (TrueType), n = 0 for none
+//     u32  flags       1 = PNG instead of PPM, 2 = the report as well
+//     u32  nimg        THE PICTURES, and then per picture:
+//        u32 n ; u8[n]    the URL exactly as the `src` attribute has it
+//        u32 n ; u8[n]    the file (PNG or JPEG, told apart by its first
+//                         octets)
+//     u32  lazy_y      the y below which a `loading="lazy"` picture is
+//                      NOT asked for
+//
+// The pictures come in with the job rather than being fetched here,
+// because this programme is the measurement of the LAYOUT and the
+// PAINTING. Fetching them is `lib/net/http.fi`, which round B5 measures
+// separately and which the browser window uses.
+//
+// The report (flag 2) gains four lines:
+//     IMAGES <n>      how many `<img>` boxes got an intrinsic size
+//     DECODED <n>     how many pictures in the store really decoded
+//     PENDING <n>     how many `src` the page still wants
+//     IMG <x> <y> <w> <h>   one line per replaced box, in document order
+import std.rt
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+import layout.box
+import layout.build
+import layout.flow
+import layout.stack
+import font.metrics
+import paint.canvas
+import paint.display
+import paint.painter
+import paint.png
+import paint.jpeg
+import browser.images
+
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn byte_at(base: u64, total: usize, k: usize) -> u32 {
+    if k >= total {
+        return 0 as u32
+    }
+    return (*((base + k as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn decode_wtf8(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    let base: u64 = mem.buf_ptr(b) as u64
+    let total: usize = mem.buf_len(b)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = byte_at(base, total, off + i)
+        if c0 < 0x80 as u32 {
+            mem.cp_push(out, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 {
+            mem.cp_push(out, ((c0 & 0x07 as u32) << 18) |
+                ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 12) |
+                ((byte_at(base, total, off + i + 2) & 0x3F as u32) << 6) |
+                (byte_at(base, total, off + i + 3) & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 {
+            mem.cp_push(out, ((c0 & 0x0F as u32) << 12) |
+                ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 6) |
+                (byte_at(base, total, off + i + 2) & 0x3F as u32))
+            i = i + 3
+        } else {
+            mem.cp_push(out, ((c0 & 0x1F as u32) << 6) |
+                (byte_at(base, total, off + i + 1) & 0x3F as u32))
+            i = i + 2
+        }
+    }
+}
+
+#[no_gc]
+fn lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+fn parse_sheet(text: *mut mem.CpBuf, t: *mut tok.Tokens) -> AllocError!Gc[Cv] {
+    tok.tokenize(t, text)
+    var p: cv.Parser = cv.parser_new(t)
+    return try cv.parse_stylesheet(&p)
+}
+
+fn chain_last(r: Gc[Rule]) -> Gc[Rule] {
+    var x: Gc[Rule] = r
+    while x != gc_null[Rule]() && x.next != gc_null[Rule]() {
+        x = x.next
+    }
+    return x
+}
+
+fn add_sheet(head: Gc[Rule], sheet: Gc[Cv], origin: u32, order: *mut u32,
+    nm: *mut names.Names, tmp: *mut mem.CpBuf) -> AllocError!Gc[Rule] {
+    var next_order: u32 = *order
+    let part = try cascade.collect_rules(sheet, origin, next_order, nm, tmp,
+        &next_order)
+    *order = next_order
+    if part == gc_null[Rule]() {
+        return head
+    }
+    if head == gc_null[Rule]() {
+        return part
+    }
+    let last: Gc[Rule] = chain_last(head)
+    last.next = part
+    return head
+}
+
+fn elem_text(k: Gc[Node], out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_TEXT {
+            let t: Gc[Text] = c as Gc[Text]
+            node.chain_after_cpbuf(t.data, out)
+        }
+        c = c.next
+    }
+}
+
+fn chain_to_cpbuf(k: Gc[Chain], out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    if k == gc_null[Chain]() {
+        return
+    }
+    node.chain_after_cpbuf(k, out)
+}
+
+fn next_in_order(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+// Room for one `font.metrics.FontSet` -- generous on purpose, the struct
+// is a handful of offsets and this is allocated once per process.
+const IMGSTORE_BYTES: usize = 65536
+const FONTSET_BYTES: usize = 4096
+
+// The clock. `clock_gettime(CLOCK_MONOTONIC)` -- number 228 on x86_64,
+// exactly as lib/std/hash.fi uses it for its seed.
+#[no_gc]
+fn micros() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000 + (ts[1] as u64) / 1000
+}
+
+// One line per replaced box, in document order: where it stands and how
+// big it came out. That is what `tools/tlsb5/img_check.py` compares
+// against the sizing rules of CSS 2.1 10.3.2.
+fn report_boxes(b: Gc[Box], rep: *mut mem.Buf) {
+    if b == gc_null[Box]() {
+        return
+    }
+    if (b.flags & box.F_REPLACED) != 0 as u32 && b.iw > 0.0 {
+        var k: [u8; 4] = "IMG "
+        lit(rep, (&k[0]) as u64, 4)
+        mem.buf_push_dec(rep, (b.x + 0.5) as u64)
+        mem.buf_push(rep, 32 as u8)
+        mem.buf_push_dec(rep, (b.y + 0.5) as u64)
+        mem.buf_push(rep, 32 as u8)
+        mem.buf_push_dec(rep, (b.w + 0.5) as u64)
+        mem.buf_push(rep, 32 as u8)
+        mem.buf_push_dec(rep, (b.h + 0.5) as u64)
+        mem.buf_push(rep, 10 as u8)
+    }
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        report_boxes(box.box_kid(b, i), rep)
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    var inb: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&inb)
+    let total: usize = mem.buf_len(&inb)
+    if total < 8 {
+        return 1
+    }
+    let vw: f64 = read_u32(&inb, 0) as f64
+    let vh: f64 = read_u32(&inb, 4) as f64
+    var off: usize = 8
+    let html_n: usize = read_u32(&inb, off) as usize
+    let html_at: usize = off + 4
+    off = html_at + html_n
+    let ua_n: usize = read_u32(&inb, off) as usize
+    let ua_at: usize = off + 4
+    off = ua_at + ua_n
+    let au_n: usize = read_u32(&inb, off) as usize
+    let au_at: usize = off + 4
+    off = au_at + au_n
+    var font_n: usize = 0
+    var font_at: usize = off + 4
+    if off + 4 <= total {
+        font_n = read_u32(&inb, off) as usize
+    }
+    off = font_at + font_n
+    var flags: u32 = 0
+    if off + 4 <= total {
+        flags = read_u32(&inb, off)
+    }
+    off = off + 4
+    var nimg: usize = 0
+    if off + 4 <= total {
+        nimg = read_u32(&inb, off) as usize
+    }
+    off = off + 4
+    // ON THE HEAP, not on the stack, for exactly the reason the escape
+    // check of round 79 gives: the address of a decoded picture is
+    // stamped into every replaced box of the tree, and a frame pointer
+    // must not be. The same shape as the FontSet above.
+    let sp: *mut images.ImgStore =
+    mem.heap_alloc(IMGSTORE_BYTES) as *mut images.ImgStore
+    if sp as usize == 0 {
+        return 94
+    }
+    *sp = images.img_store_new()
+    var ii: usize = 0
+    while ii < nimg && off + 4 <= total {
+        let un: usize = read_u32(&inb, off) as usize
+        let uat: usize = off + 4
+        off = uat + un
+        if off + 4 > total {
+            break
+        }
+        let dn: usize = read_u32(&inb, off) as usize
+        let dat: usize = off + 4
+        off = dat + dn
+        let base: u64 = mem.buf_ptr(&inb) as u64
+        let idx: i32 = images.img_store_add(sp, base + uat as u64, un,
+            base + dat as u64, dn)
+        ii = ii + 1
+    }
+    var lazy_y: f64 = 1.0e9
+    if off + 4 <= total {
+        lazy_y = read_u32(&inb, off) as f64
+    }
+
+    let t0: u64 = micros()
+
+    // ---- the font. On the HEAP and not on the stack: its address is
+    // stamped into every box of the tree, and the escape check of round 79
+    // is right to refuse a frame pointer for that even when the frame in
+    // question is `main`.
+    let fsp: *mut metrics.FontSet =
+    mem.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 93
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if font_n > 0 {
+        let fp: *mut u8 = (mem.buf_ptr(&inb) as u64 + font_at as u64) as *mut u8
+        if metrics.fontset_load(fsp, fp, font_n) {
+            fm = fsp as u64
+        }
+    }
+
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var text: mem.CpBuf = mem.cp_new()
+    var tmp: mem.CpBuf = mem.cp_new()
+    let nm: *mut names.Names = driver.run_names(&run)
+    var cx: sel.Ctx = sel.ctx_new(nm)
+    sel.ctx_init(&cx)
+    var w: cascade.Winner = cascade.winner_new()
+    var style_word: [u8; 5] = "style"
+    let n_style: u32 = names.names_of_bytes(nm, &style_word[0], 5)
+
+    // ---- 1. HTML -> DOM
+    driver.run_text_out_bytes(&run,
+        ((mem.buf_ptr(&inb) as u64) + html_at as u64) as *mut u8, html_n)
+    let rc: u32 = driver.run_document_build(&run)
+    let doc: Gc[Node] = driver.run_document(&run)
+
+    // ---- 2. the stylesheets: the UA sheet, the author sheet, every <style>
+    var rules: Gc[Rule] = gc_null[Rule]()
+    var order: u32 = 0
+    decode_wtf8(&inb, ua_at, ua_n, &text)
+    let ua = parse_sheet(&text, &t) catch gc_null[Cv]()
+    rules = add_sheet(rules, ua, cascade.ORIGIN_UA, &order, nm, &tmp)
+    catch gc_null[Rule]()
+    decode_wtf8(&inb, au_at, au_n, &text)
+    let author = parse_sheet(&text, &t) catch gc_null[Cv]()
+    rules = add_sheet(rules, author, cascade.ORIGIN_AUTHOR, &order, nm, &tmp)
+    catch gc_null[Rule]()
+    var sk: Gc[Node] = doc
+    while sk != gc_null[Node]() {
+        if sk.kind == node.K_ELEM && node.elem_name(sk) == n_style {
+            elem_text(sk, &text)
+            let inner = parse_sheet(&text, &t) catch gc_null[Cv]()
+            rules = add_sheet(rules, inner, cascade.ORIGIN_AUTHOR, &order,
+                nm, &tmp) catch gc_null[Rule]()
+        }
+        sk = next_in_order(sk, doc)
+    }
+
+    // ---- 3. the cascade per elem
+    var styles: Gc[GcMap] = gcmap_new(true, true) catch gc_null[GcMap]()
+    let root_style = cascade.style_root() catch gc_null[Style]()
+    sel.ctx_set_hover(&cx, gc_null[Node]())
+    var k: Gc[Node] = doc
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            var parent_style: Gc[Style] = root_style
+            let parent: Gc[Node] = k.parent
+            if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                let found: Gc[Style] = gcmap_get_value[Style](styles,
+                    parent as u64)
+                if found != gc_null[Style]() {
+                    parent_style = found
+                }
+            }
+            var inline_decls: Gc[GcVec] = gc_null[GcVec]()
+            let e: Gc[Elem] = node.node_as_elem(k)
+            let av: Gc[Chain] = node.attr_value(e, n_style, 0)
+            if av != gc_null[Chain]() && node.chain_len(av) > 0 {
+                chain_to_cpbuf(av, &tmp)
+                tok.tokenize(&t, &tmp)
+                var ip: cv.Parser = cv.parser_new(&t)
+                let values = cv.parse_component_value_list(&ip)
+                catch gc_null[Cv]()
+                if values != gc_null[Cv]() {
+                    inline_decls = cascade.parse_inline_declarations(values)
+                    catch gc_null[GcVec]()
+                }
+            }
+            let s = cascade.cascade_elem_inline(rules, k, parent_style,
+                &cx, &w, inline_decls) catch gc_null[Style]()
+            if s != gc_null[Style]() {
+                let ok: bool = gcmap_set_value[Style](styles, k as u64, s)
+                catch false
+            }
+        }
+        k = next_in_order(k, doc)
+    }
+
+    // ---- 4./5. the box tree and its geometry
+    let root: Gc[Box] = build.build_document(doc, styles, root_style, nm)
+    catch gc_null[Box]()
+    var nattached: usize = 0
+    if root != gc_null[Box]() {
+        // ---- 4b. the pictures, BEFORE the geometry: an `<img>` whose
+        // size is not known lays out as an empty box and the page jumps
+        // when it arrives. See lib/browser/images.fi.
+        images.attach_images(root, sp, nm, &nattached)
+        var layout_fm: u64 = fm
+        if (flags & 4 as u32) != 0 as u32 {
+            layout_fm = 0
+        }
+        box.box_stamp_font(root, layout_fm)
+        box.box_stamp_alpha(root, 1.0)
+        let okl: bool = flow.layout_document(root, vw, vh) catch false
+        box.box_stamp_clip(root, 0.0 - 1.0e9, 0.0 - 1.0e9, 1.0e9, 1.0e9)
+        images.collect_pending(root, sp, nm, lazy_y)
+    }
+    let t1: u64 = micros()
+
+    // ---- 6. the display list
+    let dl: Gc[DisplayList] = display.build_display_list(root, vw, vh,
+        0xFFFFFFFF) catch gc_null[DisplayList]()
+    let t2: u64 = micros()
+
+    // ---- 7. the picture
+    var p: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&p, vw as usize, vh as usize) {
+        return 92
+    }
+    painter.painter_set_font(&p, fm)
+    canvas.canvas_clear(painter.painter_canvas(&p), 0xFFFFFFFF)
+    var ncmd: u64 = 0
+    if dl != gc_null[DisplayList]() {
+        ncmd = painter.painter_run(&p, dl)
+    }
+    let t3: u64 = micros()
+
+    // ---- 8. out
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if (flags & 1 as u32) != 0 as u32 {
+        let okp: bool = png.write_png(painter.painter_canvas(&p), &out)
+    } else {
+        png.write_ppm(painter.painter_canvas(&p), &out)
+    }
+    mem.buf_flush(&out, 1)
+
+    if (flags & 2 as u32) != 0 as u32 {
+        var rep: mem.Buf = mem.buf_new()
+        mem.buf_init(&rep)
+        var k1: [u8; 5] = "CMDS "
+        lit(&rep, (&k1[0]) as u64, 5)
+        mem.buf_push_dec(&rep, ncmd)
+        mem.buf_push(&rep, 10 as u8)
+        var k2: [u8; 4] = "INK "
+        lit(&rep, (&k2[0]) as u64, 4)
+        mem.buf_push_dec(&rep, painter.painter_glyph_ink(&p))
+        mem.buf_push(&rep, 10 as u8)
+        var k3: [u8; 10] = "US-LAYOUT "
+        lit(&rep, (&k3[0]) as u64, 10)
+        mem.buf_push_dec(&rep, t1 - t0)
+        mem.buf_push(&rep, 10 as u8)
+        var k4: [u8; 8] = "US-LIST "
+        lit(&rep, (&k4[0]) as u64, 8)
+        mem.buf_push_dec(&rep, t2 - t1)
+        mem.buf_push(&rep, 10 as u8)
+        var k5: [u8; 9] = "US-PAINT "
+        lit(&rep, (&k5[0]) as u64, 9)
+        mem.buf_push_dec(&rep, t3 - t2)
+        mem.buf_push(&rep, 10 as u8)
+        var k6: [u8; 9] = "US-TOTAL "
+        lit(&rep, (&k6[0]) as u64, 9)
+        mem.buf_push_dec(&rep, t3 - t0)
+        mem.buf_push(&rep, 10 as u8)
+        var k7: [u8; 7] = "IMAGES "
+        lit(&rep, (&k7[0]) as u64, 7)
+        mem.buf_push_dec(&rep, nattached as u64)
+        mem.buf_push(&rep, 10 as u8)
+        var k8: [u8; 8] = "DECODED "
+        lit(&rep, (&k8[0]) as u64, 8)
+        mem.buf_push_dec(&rep, images.img_store_decoded(sp) as u64)
+        mem.buf_push(&rep, 10 as u8)
+        var k9: [u8; 8] = "PENDING "
+        lit(&rep, (&k9[0]) as u64, 8)
+        mem.buf_push_dec(&rep, images.pending_count(sp) as u64)
+        mem.buf_push(&rep, 10 as u8)
+        report_boxes(root, &rep)
+        mem.buf_flush(&rep, 2)
+    }
+    painter.painter_free(&p)
+    mem.heap_free(fsp as *mut u8, FONTSET_BYTES)
+    driver.run_tree_release(&run)
+    return 0
+}

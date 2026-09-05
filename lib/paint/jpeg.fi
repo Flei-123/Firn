@@ -1,0 +1,894 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/paint/jpeg.fi -- a baseline JPEG decoder (ITU-T T.81), round B5.
+//
+// Round B3 brought PNG, which is what a screenshot and a logo are. A
+// PHOTOGRAPH on the web is a JPEG, and without this file every `<img>`
+// that matters comes out empty.
+//
+// ================================================================ THE CHAIN
+//
+// A baseline JPEG is five transformations, and the decoder runs them
+// backwards:
+//
+//   colour     RGB -> Y'CbCr, because the eye sees brightness sharply and
+//              colour bluntly
+//   sampling   the two colour planes are stored at half resolution (4:2:0
+//              is two out of three of everything on the web)
+//   DCT        every 8x8 block becomes 64 frequency coefficients
+//   quantise   each coefficient is divided by a number from a table --
+//              THIS is where the loss happens, and nothing after it is
+//              reversible
+//   entropy    the coefficients are Huffman coded in zig-zag order, with
+//              the DC coefficient stored as a difference from the previous
+//              block's
+//
+// ============================================== WHAT IS HERE AND WHAT IS NOT
+//
+// SOF0 (baseline) and SOF1 (extended sequential, which is the same
+// arithmetic with a different marker) at eight bits. `decode_jpeg` refuses
+// everything else BY NAME rather than producing a grey rectangle:
+//
+//   J1 NO PROGRESSIVE JPEG (SOF2). A progressive file stores the
+//      coefficients in several scans of increasing precision and needs a
+//      whole second entropy decoder with spectral selection and successive
+//      approximation. Roughly a third of the photographs on the web are
+//      progressive, so this is a real hole and it is named, not hidden:
+//      `jpeg_reason` says `PROGRESSIVE` and the `<img>` stays empty.
+//   J2 NO ARITHMETIC CODING (SOF9/SOF10), which is patent-free since 2002
+//      and still used by almost nobody.
+//   J3 NO 12 BIT SAMPLES, no lossless mode, no hierarchical mode.
+//   J4 NO CMYK AND NO ADOBE TRANSFORM. One component (grey) and three
+//      (Y'CbCr) are decoded; four components come back `COMPONENTS`.
+//   J5 NO EXIF ORIENTATION. A photograph that says "rotate me" is decoded
+//      as it stands. That is a display decision and it belongs with the
+//      `<img>` element, not here.
+//
+// ============================================== WHY THE UPSAMPLING MATTERS
+//
+// The obvious way to bring a half-resolution chroma plane back up is to
+// repeat every sample twice. libjpeg does something better -- a triangle
+// filter, `(3*near + far + 1) / 4` -- and Pillow, which this decoder is
+// measured against, is libjpeg. With plain repetition the two disagree by
+// up to about thirty levels on a sharp colour edge, and the measurement
+// would then be measuring the upsampler and nothing else. So the same
+// triangle filter is here, for the two ratios that occur in practice
+// (2x1 and 2x2); anything else falls back to repetition and says so.
+//
+// ================================================== THE INVERSE TRANSFORM
+//
+// A straight separable IDCT in f64: eight one-dimensional transforms over
+// the rows and eight over the columns, with the cosine table computed
+// once. libjpeg uses a fixed-point integer approximation, so the two do
+// not agree exactly -- and they are not supposed to. T.81 does not
+// prescribe an IDCT at all, it prescribes an accuracy. The measured
+// difference is in docs/ROUNDB5.md and it is where the per-pixel bound of
+// the acceptance run comes from.
+import std.rt
+import html.mem
+import paint.png
+
+export { decode_jpeg, jpeg_reason, jpeg_sniff,
+    JR_OK, JR_NOT_JPEG, JR_PROGRESSIVE, JR_ARITHMETIC, JR_PRECISION,
+    JR_COMPONENTS, JR_TRUNCATED, JR_HUFFMAN, JR_MEMORY, JR_SAMPLING }
+
+const JR_OK: u32 = 0
+const JR_NOT_JPEG: u32 = 1
+const JR_PROGRESSIVE: u32 = 2
+const JR_ARITHMETIC: u32 = 3
+const JR_PRECISION: u32 = 4
+const JR_COMPONENTS: u32 = 5
+const JR_TRUNCATED: u32 = 6
+const JR_HUFFMAN: u32 = 7
+const JR_MEMORY: u32 = 8
+const JR_SAMPLING: u32 = 9
+
+const MAXC: usize = 4
+
+struct Huff {
+    // `look[i]` for a code of length i: the smallest code, the largest
+    // code, and where its values start in `sym`. The classic three-array
+    // decoder of T.81 annex F -- one comparison per bit, no table of
+    // 2^16 entries to build.
+    mincode: [i32; 17],
+    maxcode: [i32; 17],
+    valptr: [i32; 17],
+    sym: [u8; 256],
+    present: bool,
+}
+
+struct Comp {
+    id: u32,
+    h: usize,
+    v: usize,
+    tq: usize,
+    td: usize,
+    ta: usize,
+    pred: i32, // the running DC predictor
+    plane: *mut u8,
+    pw: usize, // the plane is a whole number of blocks wide
+    ph: usize,
+    cap: usize,
+}
+
+struct Jpeg {
+    qt: [u16; 256], // four tables of 64
+    qt_have: [bool; 4],
+    dc: [Huff; 4],
+    ac: [Huff; 4],
+    comp: [Comp; 4],
+    nc: usize,
+    w: usize,
+    h: usize,
+    hmax: usize,
+    vmax: usize,
+    mcux: usize,
+    mcuy: usize,
+    restart: usize,
+    // the bit reader
+    src: u64,
+    n: usize,
+    at: usize,
+    bits: u32,
+    nbits: u32,
+    hit_marker: bool,
+    reason: u32,
+}
+
+// The zig-zag order of T.81 figure A.6.
+fn zigzag() -> [u8; 64] {
+    var z: [u8; 64] = [
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+        12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+        35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63
+    ]
+    return z
+}
+
+fn huff_new() -> Huff {
+    return Huff { mincode: [0; 17], maxcode: [0; 17], valptr: [0; 17],
+        sym: [0; 256], present: false }
+}
+
+fn comp_new() -> Comp {
+    return Comp { id: 0, h: 1, v: 1, tq: 0, td: 0, ta: 0, pred: 0,
+        plane: 0 as *mut u8, pw: 0, ph: 0, cap: 0 }
+}
+
+fn jpeg_new() -> Jpeg {
+    return Jpeg { qt: [0; 256], qt_have: [false; 4],
+        dc: [huff_new(); 4], ac: [huff_new(); 4], comp: [comp_new(); 4],
+        nc: 0, w: 0, h: 0, hmax: 1, vmax: 1, mcux: 0, mcuy: 0, restart: 0,
+        src: 0, n: 0, at: 0, bits: 0, nbits: 0, hit_marker: false,
+        reason: JR_OK }
+}
+
+// Does this look like a JPEG at all? SOI, and the first marker after it.
+fn jpeg_sniff(p: u64, n: usize) -> bool {
+    if n < 3 {
+        return false
+    }
+    return rt.ld8(p, 0) == 255 as u8 && rt.ld8(p, 1) == 216 as u8
+    && rt.ld8(p, 2) == 255 as u8
+}
+
+fn jpeg_reason(j: *mut Jpeg) -> u32 {
+    return (*j).reason
+}
+
+// ------------------------------------------------------- The bit reader
+
+// One bit out of the entropy-coded segment. `0xFF 0x00` is a stuffed
+// literal 0xFF; `0xFF <anything else>` is a MARKER and the segment ends
+// there -- a decoder that reads on treats a restart marker as data and
+// produces noise from the first one.
+fn get_bit(j: *mut Jpeg) -> u32 {
+    if (*j).nbits == 0 as u32 {
+        if (*j).at >= (*j).n {
+            (*j).hit_marker = true
+            return 0 as u32
+        }
+        var b: u8 = rt.ld8((*j).src, (*j).at)
+        (*j).at = (*j).at + 1
+        if b == 255 as u8 {
+            if (*j).at < (*j).n {
+                let nxt: u8 = rt.ld8((*j).src, (*j).at)
+                if nxt == 0 as u8 {
+                    (*j).at = (*j).at + 1
+                } else {
+                    (*j).at = (*j).at - 1
+                    (*j).hit_marker = true
+                    return 0 as u32
+                }
+            } else {
+                (*j).hit_marker = true
+                return 0 as u32
+            }
+        }
+        (*j).bits = b as u32
+        (*j).nbits = 8 as u32
+    }
+    (*j).nbits = (*j).nbits - 1 as u32
+    return ((*j).bits >> (*j).nbits) & 1 as u32
+}
+
+fn get_bits(j: *mut Jpeg, k: u32) -> i32 {
+    var v: i32 = 0
+    var i: u32 = 0
+    while i < k {
+        v = v * 2 + (get_bit(j) as i32)
+        i = i + 1 as u32
+    }
+    return v
+}
+
+// T.81 F.2.2.1: a value of `s` bits whose top bit is 0 is negative.
+fn extend(v: i32, s: u32) -> i32 {
+    if s == 0 as u32 {
+        return 0
+    }
+    let half: i32 = 1 << ((s - 1 as u32) as i32)
+    if v < half {
+        return v - (1 << (s as i32)) + 1
+    }
+    return v
+}
+
+fn huff_decode(j: *mut Jpeg, t: *mut Huff) -> i32 {
+    var code: i32 = 0
+    var l: usize = 1
+    while l <= 16 {
+        code = code * 2 + (get_bit(j) as i32)
+        if (*t).maxcode[l] >= 0 && code <= (*t).maxcode[l] {
+            let idx: i32 = (*t).valptr[l] + code - (*t).mincode[l]
+            if idx < 0 || idx > 255 {
+                return 0 - 1
+            }
+            return (*t).sym[idx as usize] as i32
+        }
+        l = l + 1
+    }
+    return 0 - 1
+}
+
+// ------------------------------------------------------------ The IDCT
+
+fn idct_table() -> [f64; 64] {
+    var t: [f64; 64] = [0.0; 64]
+    var u: usize = 0
+    while u < 8 {
+        var x: usize = 0
+        while x < 8 {
+            var cu: f64 = 1.0
+            if u == 0 {
+                cu = 0.70710678118654752440
+            }
+            // cos((2x+1) u pi / 16)
+            let quarter: f64 = 3.14159265358979323846 / 16.0
+            let ang: f64 = ((2 * x + 1) as f64) * (u as f64) * quarter
+            t[u * 8 + x] = cu * cos_of(ang)
+            x = x + 1
+        }
+        u = u + 1
+    }
+    return t
+}
+
+// cos by its series, on the reduced argument. `std.math` is not imported
+// here because this file is reached from the kernel-free half of the
+// browser and `math.fi` is not.
+fn cos_of(a: f64) -> f64 {
+    let twopi: f64 = 6.28318530717958647692
+    var x: f64 = a
+    while x >= twopi {
+        x = x - twopi
+    }
+    while x < 0.0 {
+        x = x + twopi
+    }
+    if x > 3.14159265358979323846 {
+        x = twopi - x
+    }
+    // now 0 <= x <= pi; the series converges quickly there
+    var term: f64 = 1.0
+    var sum: f64 = 1.0
+    var k: usize = 1
+    while k < 16 {
+        let a1: f64 = (2 * k - 1) as f64
+        let a2: f64 = (2 * k) as f64
+        term = term * (0.0 - x) * x / (a1 * a2)
+        sum = sum + term
+        k = k + 1
+    }
+    return sum
+}
+
+fn idct_block(coef: *mut [f64; 64], out: *mut [f64; 64],
+    tbl: *mut [f64; 64]) {
+    var tmp: [f64; 64] = [0.0; 64]
+    // rows
+    var y: usize = 0
+    while y < 8 {
+        var x: usize = 0
+        while x < 8 {
+            var s: f64 = 0.0
+            var u: usize = 0
+            while u < 8 {
+                s = s + (*coef)[y * 8 + u] * (*tbl)[u * 8 + x]
+                u = u + 1
+            }
+            tmp[y * 8 + x] = s
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // columns
+    var x2: usize = 0
+    while x2 < 8 {
+        var y2: usize = 0
+        while y2 < 8 {
+            var s: f64 = 0.0
+            var v: usize = 0
+            while v < 8 {
+                s = s + tmp[v * 8 + x2] * (*tbl)[v * 8 + y2]
+                v = v + 1
+            }
+            (*out)[y2 * 8 + x2] = s / 4.0
+            y2 = y2 + 1
+        }
+        x2 = x2 + 1
+    }
+}
+
+fn clamp255(v: f64) -> u8 {
+    var r: f64 = v + 0.5
+    if r < 0.0 {
+        return 0 as u8
+    }
+    if r > 255.0 {
+        return 255 as u8
+    }
+    return (r as i64) as u8
+}
+
+// --------------------------------------------------------- The markers
+
+fn be16(p: u64, off: usize) -> usize {
+    return ((rt.ld8(p, off) as usize) << 8) | (rt.ld8(p, off + 1) as usize)
+}
+
+fn build_huff(t: *mut Huff, counts: u64, values: u64, nvals: usize) {
+    var code: i32 = 0
+    var k: usize = 0
+    var l: usize = 1
+    while l <= 16 {
+        let n: usize = rt.ld8(counts, l - 1) as usize
+        if n == 0 {
+            (*t).maxcode[l] = 0 - 1
+        } else {
+            (*t).valptr[l] = k as i32
+            (*t).mincode[l] = code
+            code = code + (n as i32)
+            k = k + n
+            (*t).maxcode[l] = code - 1
+        }
+        code = code * 2
+        l = l + 1
+    }
+    var i: usize = 0
+    while i < nvals && i < 256 {
+        (*t).sym[i] = rt.ld8(values, i)
+        i = i + 1
+    }
+    (*t).present = true
+}
+
+fn free_planes(j: *mut Jpeg) {
+    var i: usize = 0
+    while i < MAXC {
+        if (*j).comp[i].plane != 0 as *mut u8 {
+            mem.heap_free((*j).comp[i].plane, (*j).comp[i].cap)
+            (*j).comp[i].plane = 0 as *mut u8
+        }
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------ The scan
+
+fn decode_scan(j: *mut Jpeg, order: *mut [usize; 4], nsel: usize) -> bool {
+    var tbl: [f64; 64] = idct_table()
+    var zz: [u8; 64] = zigzag()
+    var coef: [f64; 64] = [0.0; 64]
+    var pix: [f64; 64] = [0.0; 64]
+    var mcu: usize = 0
+    let total: usize = (*j).mcux * (*j).mcuy
+    var since_restart: usize = 0
+    while mcu < total {
+        // THE ENTROPY DATA RAN OUT BEFORE THE PICTURE DID. Reading on
+        // would fill the rest with zero bits and produce a plausible
+        // half-picture -- which is exactly the failure this round must
+        // not have, because it looks like a decoded image.
+        if (*j).hit_marker {
+            (*j).reason = JR_TRUNCATED
+            return false
+        }
+        if (*j).restart > 0 && since_restart == (*j).restart {
+            // A restart marker: the bit reader is flushed to the next
+            // octet boundary and the DC predictors go back to zero. That
+            // is the whole point of restart intervals -- a corrupt
+            // segment cannot poison the rest of the picture.
+            (*j).nbits = 0 as u32
+            (*j).hit_marker = false
+            while (*j).at + 1 < (*j).n {
+                if rt.ld8((*j).src, (*j).at) == 255 as u8 {
+                    let m: u8 = rt.ld8((*j).src, (*j).at + 1)
+                    if m >= 208 as u8 && m <= 215 as u8 {
+                        (*j).at = (*j).at + 2
+                        break
+                    }
+                }
+                (*j).at = (*j).at + 1
+            }
+            var ci0: usize = 0
+            while ci0 < (*j).nc {
+                (*j).comp[ci0].pred = 0
+                ci0 = ci0 + 1
+            }
+            since_restart = 0
+        }
+        let my: usize = mcu / (*j).mcux
+        let mx: usize = mcu % (*j).mcux
+        var s: usize = 0
+        while s < nsel {
+            let ci: usize = (*order)[s]
+            let ch: usize = (*j).comp[ci].h
+            let cv: usize = (*j).comp[ci].v
+            var by: usize = 0
+            while by < cv {
+                var bx: usize = 0
+                while bx < ch {
+                    var k: usize = 0
+                    while k < 64 {
+                        coef[k] = 0.0
+                        k = k + 1
+                    }
+                    // DC
+                    let td: usize = (*j).comp[ci].td
+                    let sdc: i32 = huff_decode(j, &(*j).dc[td])
+                    if sdc < 0 {
+                        (*j).reason = JR_HUFFMAN
+                        return false
+                    }
+                    var diff: i32 = 0
+                    if sdc > 0 {
+                        diff = extend(get_bits(j, sdc as u32), sdc as u32)
+                    }
+                    (*j).comp[ci].pred = (*j).comp[ci].pred + diff
+                    let q: usize = (*j).comp[ci].tq * 64
+                    let qdc: f64 = (*j).qt[q] as f64
+                    coef[0] = ((*j).comp[ci].pred as f64) * qdc
+                    // AC
+                    let ta: usize = (*j).comp[ci].ta
+                    var kk: usize = 1
+                    while kk < 64 {
+                        let rs: i32 = huff_decode(j, &(*j).ac[ta])
+                        if rs < 0 {
+                            (*j).reason = JR_HUFFMAN
+                            return false
+                        }
+                        let run: i32 = rs / 16
+                        let size: i32 = rs % 16
+                        if size == 0 {
+                            if run != 15 {
+                                break // end of block
+                            }
+                            kk = kk + 16
+                            continue
+                        }
+                        kk = kk + (run as usize)
+                        if kk > 63 {
+                            break
+                        }
+                        let v: i32 = extend(get_bits(j, size as u32),
+                            size as u32)
+                        let pos: usize = zz[kk] as usize
+                        coef[pos] = (v as f64) * ((*j).qt[q + kk] as f64)
+                        kk = kk + 1
+                    }
+                    idct_block(&coef, &pix, &tbl)
+                    // into the plane
+                    let px0: usize = (mx * ch + bx) * 8
+                    let py0: usize = (my * cv + by) * 8
+                    var yy: usize = 0
+                    while yy < 8 {
+                        var xx: usize = 0
+                        while xx < 8 {
+                            let px: usize = px0 + xx
+                            let py: usize = py0 + yy
+                            if px < (*j).comp[ci].pw
+                            && py < (*j).comp[ci].ph {
+                                let off: usize = py * (*j).comp[ci].pw + px
+                                rt.st8((*j).comp[ci].plane as u64, off,
+                                    clamp255(pix[yy * 8 + xx] + 128.0))
+                            }
+                            xx = xx + 1
+                        }
+                        yy = yy + 1
+                    }
+                    bx = bx + 1
+                }
+                by = by + 1
+            }
+            s = s + 1
+        }
+        since_restart = since_restart + 1
+        mcu = mcu + 1
+    }
+    return true
+}
+
+// -------------------------------------------------------- The upsampling
+
+// libjpeg's triangle filter, horizontally: `(3*near + far + bias) / 4`.
+// See the head of the file for why it is here and not plain repetition.
+fn sample_at(j: *mut Jpeg, ci: usize, x: usize, y: usize) -> i32 {
+    var xx: usize = x
+    var yy: usize = y
+    if xx >= (*j).comp[ci].pw {
+        xx = (*j).comp[ci].pw - 1
+    }
+    if yy >= (*j).comp[ci].ph {
+        yy = (*j).comp[ci].ph - 1
+    }
+    return rt.ld8((*j).comp[ci].plane as u64,
+        yy * (*j).comp[ci].pw + xx) as i32
+}
+
+// The value of component `ci` at full-resolution pixel (x, y).
+fn upsampled(j: *mut Jpeg, ci: usize, x: usize, y: usize, cw: usize,
+    chh: usize) -> i32 {
+    let sx: usize = (*j).hmax / (*j).comp[ci].h
+    let sy: usize = (*j).vmax / (*j).comp[ci].v
+    if sx == 1 && sy == 1 {
+        return sample_at(j, ci, x, y)
+    }
+    if sx == 2 && sy == 1 {
+        let c: usize = x / 2
+        var near: i32 = sample_at(j, ci, c, y)
+        var far: i32 = near
+        if (x & 1) == 0 {
+            if c > 0 {
+                far = sample_at(j, ci, c - 1, y)
+            }
+            return (3 * near + far + 2) / 4
+        }
+        if c + 1 < cw {
+            far = sample_at(j, ci, c + 1, y)
+        }
+        return (3 * near + far + 1) / 4
+    }
+    if sx == 2 && sy == 2 {
+        // vertical first: the column sums libjpeg builds
+        let cx: usize = x / 2
+        let cy: usize = y / 2
+        var oy: usize = cy
+        if (y & 1) == 0 {
+            if cy > 0 {
+                oy = cy - 1
+            }
+        } else {
+            if cy + 1 < chh {
+                oy = cy + 1
+            }
+        }
+        var lastx: usize = cx
+        var nextx: usize = cx
+        if cx > 0 {
+            lastx = cx - 1
+        }
+        if cx + 1 < cw {
+            nextx = cx + 1
+        }
+        let this_sum: i32 = 3 * sample_at(j, ci, cx, cy)
+        +sample_at(j, ci, cx, oy)
+        if (x & 1) == 0 {
+            let other: i32 = 3 * sample_at(j, ci, lastx, cy)
+            +sample_at(j, ci, lastx, oy)
+            return (this_sum * 3 + other + 8) / 16
+        }
+        let other: i32 = 3 * sample_at(j, ci, nextx, cy)
+        +sample_at(j, ci, nextx, oy)
+        return (this_sum * 3 + other + 7) / 16
+    }
+    // any other ratio: repetition, and it is the honest fallback
+    return sample_at(j, ci, x / sx, y / sy)
+}
+
+// ---------------------------------------------------------- The decoder
+
+fn decode_jpeg(src: u64, n: usize, im: *mut png.Image, why: *mut u32)
+-> bool {
+    *why = JR_NOT_JPEG
+    (*im).ok = 0
+    if !jpeg_sniff(src, n) {
+        return false
+    }
+    var j: Jpeg = jpeg_new()
+    var zz: [u8; 64] = zigzag()
+    var at: usize = 2
+    var have_frame: bool = false
+    var order: [usize; 4] = [0; 4]
+    var nsel: usize = 0
+    while at + 3 < n {
+        if rt.ld8(src, at) != 255 as u8 {
+            at = at + 1
+            continue
+        }
+        var m: u8 = rt.ld8(src, at + 1)
+        while m == 255 as u8 && at + 2 < n {
+            at = at + 1
+            m = rt.ld8(src, at + 1)
+        }
+        at = at + 2
+        if m == 216 as u8 || m == 1 as u8 {
+            continue // SOI, TEM -- no payload
+        }
+        if m == 217 as u8 {
+            break // EOI
+        }
+        if at + 1 >= n {
+            break
+        }
+        let seglen: usize = be16(src, at)
+        if seglen < 2 || at + seglen > n {
+            free_planes(&j)
+            *why = JR_TRUNCATED
+            return false
+        }
+        let body: usize = at + 2
+        let blen: usize = seglen - 2
+        if m == 219 as u8 { // DQT
+            var q: usize = body
+            while q < body + blen {
+                let pq: usize = (rt.ld8(src, q) as usize) >> 4
+                let tq: usize = (rt.ld8(src, q) as usize) & 15
+                q = q + 1
+                if tq > 3 {
+                    free_planes(&j)
+                    *why = JR_TRUNCATED
+                    return false
+                }
+                var k: usize = 0
+                while k < 64 {
+                    if pq == 0 {
+                        j.qt[tq * 64 + k] = rt.ld8(src, q + k) as u16
+                    } else {
+                        j.qt[tq * 64 + k] = be16(src, q + k * 2) as u16
+                    }
+                    k = k + 1
+                }
+                if pq == 0 {
+                    q = q + 64
+                } else {
+                    q = q + 128
+                }
+                j.qt_have[tq] = true
+            }
+        } else if m == 196 as u8 { // DHT
+            var q: usize = body
+            while q + 17 <= body + blen {
+                let tc: usize = (rt.ld8(src, q) as usize) >> 4
+                let th: usize = (rt.ld8(src, q) as usize) & 15
+                q = q + 1
+                var total: usize = 0
+                var k: usize = 0
+                while k < 16 {
+                    total = total + (rt.ld8(src, q + k) as usize)
+                    k = k + 1
+                }
+                if th > 3 || q + 16 + total > n {
+                    free_planes(&j)
+                    *why = JR_TRUNCATED
+                    return false
+                }
+                if tc == 0 {
+                    build_huff(&j.dc[th], src + q as u64,
+                        src + (q + 16) as u64, total)
+                } else {
+                    build_huff(&j.ac[th], src + q as u64,
+                        src + (q + 16) as u64, total)
+                }
+                q = q + 16 + total
+            }
+        } else if m == 221 as u8 { // DRI
+            j.restart = be16(src, body)
+        } else if m == 194 as u8 { // SOF2
+            free_planes(&j)
+            *why = JR_PROGRESSIVE
+            return false
+        } else if m == 201 as u8 || m == 202 as u8 || m == 203 as u8 {
+            free_planes(&j)
+            *why = JR_ARITHMETIC
+            return false
+        } else if m == 192 as u8 || m == 193 as u8 { // SOF0 / SOF1
+            if blen < 6 {
+                free_planes(&j)
+                *why = JR_TRUNCATED
+                return false
+            }
+            if rt.ld8(src, body) != 8 as u8 {
+                free_planes(&j)
+                *why = JR_PRECISION
+                return false
+            }
+            j.h = be16(src, body + 1)
+            j.w = be16(src, body + 3)
+            j.nc = rt.ld8(src, body + 5) as usize
+            if j.nc != 1 && j.nc != 3 {
+                free_planes(&j)
+                *why = JR_COMPONENTS
+                return false
+            }
+            if j.w == 0 || j.h == 0 || j.w > 20000 || j.h > 20000 {
+                free_planes(&j)
+                *why = JR_TRUNCATED
+                return false
+            }
+            var ci: usize = 0
+            while ci < j.nc {
+                let o: usize = body + 6 + ci * 3
+                j.comp[ci].id = rt.ld8(src, o) as u32
+                j.comp[ci].h = (rt.ld8(src, o + 1) as usize) >> 4
+                j.comp[ci].v = (rt.ld8(src, o + 1) as usize) & 15
+                j.comp[ci].tq = rt.ld8(src, o + 2) as usize
+                if j.comp[ci].h == 0 || j.comp[ci].v == 0
+                || j.comp[ci].h > 4 || j.comp[ci].v > 4
+                || j.comp[ci].tq > 3 {
+                    free_planes(&j)
+                    *why = JR_SAMPLING
+                    return false
+                }
+                if j.comp[ci].h > j.hmax {
+                    j.hmax = j.comp[ci].h
+                }
+                if j.comp[ci].v > j.vmax {
+                    j.vmax = j.comp[ci].v
+                }
+                ci = ci + 1
+            }
+            j.mcux = (j.w + j.hmax * 8 - 1) / (j.hmax * 8)
+            j.mcuy = (j.h + j.vmax * 8 - 1) / (j.vmax * 8)
+            ci = 0
+            while ci < j.nc {
+                j.comp[ci].pw = j.mcux * j.comp[ci].h * 8
+                j.comp[ci].ph = j.mcuy * j.comp[ci].v * 8
+                let cap: usize = j.comp[ci].pw * j.comp[ci].ph
+                j.comp[ci].plane = mem.heap_alloc(cap)
+                j.comp[ci].cap = cap
+                if j.comp[ci].plane == 0 as *mut u8 {
+                    free_planes(&j)
+                    *why = JR_MEMORY
+                    return false
+                }
+                var z: usize = 0
+                while z < cap {
+                    rt.st8(j.comp[ci].plane as u64, z, 128 as u8)
+                    z = z + 1
+                }
+                ci = ci + 1
+            }
+            have_frame = true
+        } else if m == 218 as u8 { // SOS
+            if !have_frame {
+                free_planes(&j)
+                *why = JR_TRUNCATED
+                return false
+            }
+            let ns: usize = rt.ld8(src, body) as usize
+            nsel = 0
+            var s: usize = 0
+            while s < ns && s < MAXC {
+                let cs: u32 = rt.ld8(src, body + 1 + s * 2) as u32
+                let tt: u8 = rt.ld8(src, body + 2 + s * 2)
+                var ci: usize = 0
+                while ci < j.nc {
+                    if j.comp[ci].id == cs {
+                        j.comp[ci].td = (tt as usize) >> 4
+                        j.comp[ci].ta = (tt as usize) & 15
+                        order[nsel] = ci
+                        nsel = nsel + 1
+                    }
+                    ci = ci + 1
+                }
+                s = s + 1
+            }
+            if nsel != j.nc {
+                // A baseline file has ONE scan with every component in it.
+                // Several scans mean progressive or a non-interleaved
+                // sequential file, and neither is decoded here.
+                free_planes(&j)
+                *why = JR_PROGRESSIVE
+                return false
+            }
+            j.src = src
+            j.n = n
+            j.at = body + blen
+            j.bits = 0
+            j.nbits = 0
+            j.hit_marker = false
+            var ci2: usize = 0
+            while ci2 < j.nc {
+                j.comp[ci2].pred = 0
+                ci2 = ci2 + 1
+            }
+            if !decode_scan(&j, &order, nsel) {
+                let r: u32 = j.reason
+                free_planes(&j)
+                *why = r
+                return false
+            }
+            break
+        }
+        at = at + seglen
+    }
+    if !have_frame {
+        free_planes(&j)
+        *why = JR_TRUNCATED
+        return false
+    }
+    // ------------------------------------------------ colour and output
+    let w: usize = j.w
+    let h: usize = j.h
+    let cap: usize = w * h * 4
+    (*im).px = mem.heap_alloc(cap)
+    if (*im).px == 0 as *mut u8 {
+        free_planes(&j)
+        *why = JR_MEMORY
+        return false
+    }
+    (*im).cap = cap
+    (*im).w = w
+    (*im).h = h
+    var cw: usize = 0
+    var chh: usize = 0
+    if j.nc == 3 {
+        cw = (w * j.comp[1].h + j.hmax - 1) / j.hmax
+        chh = (h * j.comp[1].v + j.vmax - 1) / j.vmax
+    }
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            var r: i32 = 0
+            var g: i32 = 0
+            var b: i32 = 0
+            if j.nc == 1 {
+                let v: i32 = sample_at(&j, 0, x, y)
+                r = v
+                g = v
+                b = v
+            } else {
+                let yy: f64 = (sample_at(&j, 0, x, y)) as f64
+                let cb: f64 = (upsampled(&j, 1, x, y, cw, chh) as f64)
+                -128.0
+                let cr: f64 = (upsampled(&j, 2, x, y, cw, chh) as f64)
+                -128.0
+                r = (clamp255(yy + 1.402 * cr)) as i32
+                g = (clamp255(yy - 0.344136 * cb - 0.714136 * cr)) as i32
+                b = (clamp255(yy + 1.772 * cb)) as i32
+            }
+            let o: usize = (y * w + x) * 4
+            rt.st8((*im).px as u64, o, r as u8)
+            rt.st8((*im).px as u64, o + 1, g as u8)
+            rt.st8((*im).px as u64, o + 2, b as u8)
+            rt.st8((*im).px as u64, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    free_planes(&j)
+    (*im).ok = 1
+    *why = JR_OK
+    return true
+}

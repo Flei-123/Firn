@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/css/anb.fi -- the An+B micro syntax of css-syntax-3.
+//
+// `:nth-child(2n+1)` is not an ordinary component value: `2n+1` is a
+// grammar of its own over the TOKENS, and the standard writes it out in
+// seventeen alternatives. The trap in it is the `+`: in `+n+1` the plus
+// belongs to the `n` only when NO whitespace stands in between, while in
+// `n + 1` the whitespace around the plus is allowed. A parser that simply
+// throws whitespace away gets `+ n` wrong -- and the official test file
+// An+B.json checks exactly that with 128 cases.
+//
+// The result is the pair (A, B) of `An+B`. `anb_parse` says with its
+// return value whether the input was valid at all.
+import html.mem
+import css.tok
+
+export { Anb, anb_new, anb_parse, anb_matches }
+
+struct Anb {
+    a: i64,
+    b: i64,
+    ok: bool,
+}
+
+#[no_gc]
+fn anb_new() -> Anb {
+    return Anb { a: 0, b: 0, ok: false }
+}
+
+// ------------------------------------------------------------- Predicates
+
+#[no_gc]
+fn is_integer_number(t: *mut tok.Tokens, i: usize) -> bool {
+    if tok.tok_kind(t, i) != tok.T_NUMBER {
+        return false
+    }
+    return (tok.tok_flags(t, i) & tok.F_INTEGER) != 0 as u32
+}
+
+// A number whose representation carries an explicit sign.
+#[no_gc]
+fn is_signed_integer(t: *mut tok.Tokens, i: usize) -> bool {
+    if !is_integer_number(t, i) {
+        return false
+    }
+    if tok.tok_value_len(t, i) == 0 {
+        return false
+    }
+    let c: u32 = tok.tok_pool_at(t, tok.tok_value_off(t, i))
+    return c == 43 as u32 || c == 45 as u32
+}
+
+#[no_gc]
+fn is_signless_integer(t: *mut tok.Tokens, i: usize) -> bool {
+    if !is_integer_number(t, i) {
+        return false
+    }
+    if tok.tok_value_len(t, i) == 0 {
+        return false
+    }
+    return tok.is_digit(tok.tok_pool_at(t, tok.tok_value_off(t, i)))
+}
+
+#[no_gc]
+fn is_delim(t: *mut tok.Tokens, i: usize, c: u32) -> bool {
+    if tok.tok_kind(t, i) != tok.T_DELIM {
+        return false
+    }
+    if tok.tok_value_len(t, i) != 1 {
+        return false
+    }
+    return tok.tok_pool_at(t, tok.tok_value_off(t, i)) == c
+}
+
+// The shape of a name: `n`, `-n`, `n-`, `-n-`, `n-<digits>`, `-n-<digits>`.
+// Returns
+//   0 no match, 1 = "n", 2 = "-n", 3 = "n-", 4 = "-n-",
+//   5 = "n-<digits>", 6 = "-n-<digits>"
+// and puts the digits (as a positive number) into `value`.
+#[no_gc]
+fn name_shape(t: *mut tok.Tokens, off: usize, n: usize, value: *mut i64) -> u32 {
+    *value = 0
+    var i: usize = 0
+    var minus: bool = false
+    if n == 0 {
+        return 0
+    }
+    if tok.tok_pool_at(t, off) == 45 as u32 {
+        minus = true
+        i = 1
+    }
+    if i >= n {
+        return 0
+    }
+    if tok.ascii_lower(tok.tok_pool_at(t, off + i)) != 110 as u32 {
+        return 0
+    }
+    i = i + 1
+    if i >= n {
+        if minus {
+            return 2
+        }
+        return 1
+    }
+    if tok.tok_pool_at(t, off + i) != 45 as u32 {
+        return 0
+    }
+    i = i + 1
+    if i >= n {
+        if minus {
+            return 4
+        }
+        return 3
+    }
+    var v: i64 = 0
+    var digits: usize = 0
+    while i < n {
+        let c: u32 = tok.tok_pool_at(t, off + i)
+        if !tok.is_digit(c) {
+            return 0
+        }
+        if v < 1000000000 {
+            v = v * 10 + (c - 48 as u32) as i64
+        }
+        digits = digits + 1
+        i = i + 1
+    }
+    if digits == 0 {
+        return 0
+    }
+    *value = v
+    if minus {
+        return 6
+    }
+    return 5
+}
+
+#[no_gc]
+fn ident_equals(t: *mut tok.Tokens, i: usize, p: u64, n: usize) -> bool {
+    return tok.tok_value_equals_ascii_lower(t, i, p, n)
+}
+
+// ------------------------------------------------------------ The parser
+
+// The state machine of the grammar. `i` walks the token stream.
+struct Walk {
+    t: *mut tok.Tokens,
+    i: usize,
+    n: usize,
+}
+
+#[no_gc]
+fn skip_ws(w: *mut Walk) {
+    while (*w).i < (*w).n && tok.tok_kind((*w).t, (*w).i) == tok.T_WHITESPACE {
+        (*w).i = (*w).i + 1
+    }
+}
+
+#[no_gc]
+fn done(w: *mut Walk) -> bool {
+    return (*w).i >= (*w).n
+}
+
+// The B part after an `n`: nothing, a signed integer, or a sign plus a
+// signless integer.
+#[no_gc]
+fn read_b(w: *mut Walk, out: *mut Anb) -> bool {
+    skip_ws(w)
+    if done(w) {
+        (*out).b = 0
+        return true
+    }
+    let t: *mut tok.Tokens = (*w).t
+    if is_signed_integer(t, (*w).i) {
+        (*out).b = tok.tok_number_integer(t, (*w).i)
+        (*w).i = (*w).i + 1
+        return true
+    }
+    var sign: i64 = 0
+    if is_delim(t, (*w).i, 43 as u32) {
+        sign = 1
+    } else if is_delim(t, (*w).i, 45 as u32) {
+        sign = -1
+    } else {
+        return false
+    }
+    (*w).i = (*w).i + 1
+    skip_ws(w)
+    if done(w) {
+        return false
+    }
+    if !is_signless_integer(t, (*w).i) {
+        return false
+    }
+    (*out).b = sign * tok.tok_number_integer(t, (*w).i)
+    (*w).i = (*w).i + 1
+    return true
+}
+
+// After `n-`: a signless integer is required, and it counts NEGATIVE.
+#[no_gc]
+fn read_b_after_dash(w: *mut Walk, out: *mut Anb) -> bool {
+    skip_ws(w)
+    if done(w) {
+        return false
+    }
+    if !is_signless_integer((*w).t, (*w).i) {
+        return false
+    }
+    (*out).b = 0 - tok.tok_number_integer((*w).t, (*w).i)
+    (*w).i = (*w).i + 1
+    return true
+}
+
+// The ident branch. `a_sign` is +1 or -1 for the `n` shapes without their
+// own sign; the shape decides the rest.
+#[no_gc]
+fn from_ident(w: *mut Walk, out: *mut Anb) -> bool {
+    let t: *mut tok.Tokens = (*w).t
+    let i: usize = (*w).i
+    var odd: [u8; 3] = "odd"
+    var even: [u8; 4] = "even"
+    if ident_equals(t, i, (&odd[0]) as u64, 3) {
+        (*out).a = 2
+        (*out).b = 1
+        (*w).i = i + 1
+        return true
+    }
+    if ident_equals(t, i, (&even[0]) as u64, 4) {
+        (*out).a = 2
+        (*out).b = 0
+        (*w).i = i + 1
+        return true
+    }
+    var value: i64 = 0
+    let shape: u32 = name_shape(t, tok.tok_value_off(t, i), tok.tok_value_len(t, i), &value)
+    if shape == 0 as u32 {
+        return false
+    }
+    (*w).i = i + 1
+    if shape == 1 as u32 {
+        (*out).a = 1
+        return read_b(w, out)
+    }
+    if shape == 2 as u32 {
+        (*out).a = -1
+        return read_b(w, out)
+    }
+    if shape == 3 as u32 {
+        (*out).a = 1
+        return read_b_after_dash(w, out)
+    }
+    if shape == 4 as u32 {
+        (*out).a = -1
+        return read_b_after_dash(w, out)
+    }
+    if shape == 5 as u32 {
+        (*out).a = 1
+        (*out).b = 0 - value
+        return true
+    }
+    (*out).a = -1
+    (*out).b = 0 - value
+    return true
+}
+
+// Parses `n` tokens of `t` as An+B. The result stands in `out`; the
+// return value says whether the input was valid.
+#[no_gc]
+fn anb_parse(t: *mut tok.Tokens, out: *mut Anb) -> bool {
+    (*out).a = 0
+    (*out).b = 0
+    (*out).ok = false
+    var w: Walk = Walk { t: t, i: 0, n: tok.tok_count(t) }
+    skip_ws(&w)
+    if done(&w) {
+        return false
+    }
+    let k: u32 = tok.tok_kind(t, w.i)
+    var good: bool = false
+    if k == tok.T_IDENT {
+        good = from_ident(&w, out)
+    } else if k == tok.T_DELIM && is_delim(t, w.i, 43 as u32) {
+        // `+`, and the ident has to follow WITHOUT whitespace.
+        w.i = w.i + 1
+        if done(&w) {
+            return false
+        }
+        if tok.tok_kind(t, w.i) != tok.T_IDENT {
+            return false
+        }
+        var odd: [u8; 3] = "odd"
+        var even: [u8; 4] = "even"
+        if ident_equals(t, w.i, (&odd[0]) as u64, 3) {
+            return false
+        }
+        if ident_equals(t, w.i, (&even[0]) as u64, 4) {
+            return false
+        }
+        var value: i64 = 0
+        let shape: u32 = name_shape(t, tok.tok_value_off(t, w.i),
+            tok.tok_value_len(t, w.i), &value)
+        // Only the shapes without their own minus may carry a `+`.
+        if shape == 2 as u32 || shape == 4 as u32 || shape == 6 as u32 {
+            return false
+        }
+        good = from_ident(&w, out)
+    } else if k == tok.T_DIMENSION {
+        if (tok.tok_flags(t, w.i) & tok.F_INTEGER) == 0 as u32 {
+            return false
+        }
+        var value: i64 = 0
+        let shape: u32 = name_shape(t, tok.tok_unit_off(t, w.i),
+            tok.tok_unit_len(t, w.i), &value)
+        if shape != 1 as u32 && shape != 3 as u32 && shape != 5 as u32 {
+            return false
+        }
+        (*out).a = tok.tok_number_integer(t, w.i)
+        w.i = w.i + 1
+        if shape == 1 as u32 {
+            good = read_b(&w, out)
+        } else if shape == 3 as u32 {
+            good = read_b_after_dash(&w, out)
+        } else {
+            (*out).b = 0 - value
+            good = true
+        }
+    } else if k == tok.T_NUMBER {
+        if (tok.tok_flags(t, w.i) & tok.F_INTEGER) == 0 as u32 {
+            return false
+        }
+        (*out).a = 0
+        (*out).b = tok.tok_number_integer(t, w.i)
+        w.i = w.i + 1
+        good = true
+    } else {
+        return false
+    }
+    if !good {
+        return false
+    }
+    skip_ws(&w)
+    if !done(&w) {
+        return false
+    }
+    (*out).ok = true
+    return true
+}
+
+// Does the 1-based position `pos` belong to An+B? For A = 0 the answer is
+// `pos == B`, otherwise there has to be an n >= 0 with pos = A*n + B.
+#[no_gc]
+fn anb_matches(a: i64, b: i64, pos: i64) -> bool {
+    if a == 0 {
+        return pos == b
+    }
+    let d: i64 = pos - b
+    if a > 0 {
+        if d < 0 {
+            return false
+        }
+        return d % a == 0
+    }
+    if d > 0 {
+        return false
+    }
+    return (0 - d) % (0 - a) == 0
+}

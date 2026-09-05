@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/html/tokenize_main.fi -- the driver of the HTML5 tokenizer (root file).
+//
+// It reads a stream of JOBS from standard input and writes ONE line of
+// html5lib JSON per job onto standard output.
+//
+// The job format (little-endian, see tools/tokenizer/LOG.md):
+//     u32  start_state  0=Data 1=PLAINTEXT 2=RCDATA 3=RAWTEXT 4=ScriptData 5=CDATA
+//     u32  flags        bit 0 = XML adjustment (xmlViolationTests), otherwise 0
+//     u32  len_lasttag  the length of the lastStartTag in bytes (WTF-8)
+//     u8[] lasttag
+//     u32  len_input    the length of the input in bytes (WTF-8)
+//     u8[] input
+// The end of the stream = the end of the input.
+//
+// The output per job:
+//     [ ... ]                     the token list (html5lib JSON, pure ASCII)
+//     the abort marker            the tokenizer reached a state it does not
+//                                 know yet -> the harness counts the case as a
+//                                 FAILURE (never as skipped)
+//
+// Compile with:  firnc -o build/tokenize lib/html/tokenize_main.fi
+import mem
+import tokens
+import tokenizer
+
+// Reads a u32 (little-endian) from the input buffer.
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+// WTF-8 -> code points. Unpaired surrogates (ED A0 80 ...) are preserved.
+// Line endings are normalized per the HTML standard (\r\n and \r -> \n).
+// The byte at the absolute position `k`, 0 beyond the end -- word for word
+// the same as `mem.buf_at`, but with a PRELOADED base pointer and length.
+//
+// WHY: `mem.buf_at(b, k)` reads two fields out of the struct per call --
+// `(*b).len` for the range check and `(*b).ptr` for the address. The
+// optimizer must not merge these loads across the loop, because in between
+// something is written through another pointer (`out`) and Firn has no alias
+// analysis yet: it cannot prove that `out` and `b` are different
+// objects.
+//
+// Measured (callgrind, corpus realweb): `decode` therefore needed 225
+// instructions per byte and was, with 28 %, the largest single item of the
+// tokenizer -- at up to five accesses per character.
+#[no_gc]
+fn byte_at(base: u64, total: usize, k: usize) -> u32 {
+    if k >= total {
+        return 0 as u32
+    }
+    return (*((base + k as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn decode(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    // Load ONCE instead of at every access (see byte_at).
+    let base: u64 = mem.buf_ptr(b) as u64
+    let total: usize = mem.buf_len(b)
+    // A code point costs at least one byte: `len` slots are ALWAYS enough.
+    mem.cp_reserve(out, len)
+    let target: u64 = mem.cp_ptr(out) as u64
+    var outi: usize = 0
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = byte_at(base, total, off + i)
+        // The fast path (round 40): pure ASCII except CR.
+        if c0 < 0x80 as u32 && c0 != 13 as u32 {
+            *((target + outi as u64 * 4) as *mut u32) = c0
+            outi = outi + 1
+            i = i + 1
+            continue
+        }
+        var cp: u32 = c0
+        var width: usize = 1
+        if c0 >= 0xF0 as u32 {
+            width = 4
+            cp = ((c0 & 0x07 as u32) << 18) |
+            ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 12) |
+            ((byte_at(base, total, off + i + 2) & 0x3F as u32) << 6) |
+            (byte_at(base, total, off + i + 3) & 0x3F as u32)
+        } else if c0 >= 0xE0 as u32 {
+            width = 3
+            cp = ((c0 & 0x0F as u32) << 12) |
+            ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 6) |
+            (byte_at(base, total, off + i + 2) & 0x3F as u32)
+        } else if c0 >= 0xC0 as u32 {
+            width = 2
+            cp = ((c0 & 0x1F as u32) << 6) |
+            (byte_at(base, total, off + i + 1) & 0x3F as u32)
+        }
+        i = i + width
+        if cp == 13 as u32 {
+            // \r or \r\n -> \n
+            cp = 10 as u32
+            if i < len && byte_at(base, total, off + i) == 10 as u32 {
+                i = i + 1
+            }
+        }
+        *((target + outi as u64 * 4) as *mut u32) = cp
+        outi = outi + 1
+    }
+    mem.cp_set_len(out, outi)
+}
+
+#[no_gc]
+fn main() -> i32 {
+    var ins: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&ins)
+
+    var s: tokens.Sink = tokens.sink_new()
+    tokens.sink_init(&s)
+
+    var text: mem.CpBuf = mem.cp_new()
+    var lasttag: mem.CpBuf = mem.cp_new()
+
+    let total: usize = mem.buf_len(&ins)
+    var off: usize = 0
+    while off + 16 <= total {
+        let state: u32 = read_u32(&ins, off)
+        let flags: u32 = read_u32(&ins, off + 4)
+        let ltlen: usize = read_u32(&ins, off + 8) as usize
+        decode(&ins, off + 12, ltlen, &lasttag)
+        let inlen: usize = read_u32(&ins, off + 12 + ltlen) as usize
+        decode(&ins, off + 16 + ltlen, inlen, &text)
+        off = off + 16 + ltlen + inlen
+
+        tokens.sink_set_xml_mode(&s, (flags & 1 as u32) != 0 as u32)
+        tokens.sink_set_last_start_tag_cp(&s, &lasttag)
+        tokens.sink_begin(&s)
+        let ok: bool = tokenizer.tokenize(&text, state, &s)
+        if ok {
+            tokens.sink_end(&s)
+        } else {
+            tokens.sink_abort(&s)
+        }
+    }
+    tokens.sink_flush_out(&s)
+    return 0
+}

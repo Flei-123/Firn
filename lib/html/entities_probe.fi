@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/html/entities_probe.fi -- a test bench for lib/html/entities.fi (in Firn).
+//
+// A tiny driver that can only drive the character reference part of the
+// tokenizer: characters are emitted, '&' goes to `entities.char_ref`. With it
+// the module `entities` can be measured against the official expectations
+// independently of the rest of the state machine:
+//
+//     firnc -o build/entities_probe lib/html/entities_probe.fi
+//     python3 tools/tokenizer/check_entities.py
+//
+// The input and output formats are the same as with the real driver
+// (tools/tokenizer/LOG.md); `start_state` is read as "inside an attribute
+// value": 0 = the character stream (Data), 1 = an attribute value.
+import mem
+import tokens
+import entities
+
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+// WTF-8 -> code points (as in lib/html/tokenize_main.fi, without the line
+// ending rewrite, because the bench is meant to see the input unchanged).
+#[no_gc]
+fn decode(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = mem.buf_at(b, off + i) as u32
+        var cp: u32 = c0
+        var width: usize = 1
+        if c0 >= 0xF0 as u32 {
+            width = 4
+            cp = ((c0 & 0x07 as u32) << 18) |
+            ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 12) |
+            ((mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32) << 6) |
+            (mem.buf_at(b, off + i + 3) as u32 & 0x3F as u32)
+        } else if c0 >= 0xE0 as u32 {
+            width = 3
+            cp = ((c0 & 0x0F as u32) << 12) |
+            ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 6) |
+            (mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32)
+        } else if c0 >= 0xC0 as u32 {
+            width = 2
+            cp = ((c0 & 0x1F as u32) << 6) |
+            (mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32)
+        }
+        i = i + width
+        mem.cp_push(out, cp)
+    }
+}
+
+// The character stream: everything except '&' unchanged, '&' to the module `entities`.
+#[no_gc]
+fn run(text: *mut mem.CpBuf, in_attr: bool, s: *mut tokens.Sink) {
+    let n: usize = mem.cp_len(text)
+    var pos: usize = 0
+    while pos < n {
+        let c: u32 = mem.cp_at(text, pos)
+        pos = pos + 1
+        if c == 38 as u32 {
+            pos = entities.char_ref(text, pos, in_attr, s)
+        } else if in_attr {
+            tokens.tok_attr_value_push(s, c)
+        } else {
+            tokens.sink_emit_char(s, c)
+        }
+    }
+}
+
+#[no_gc]
+fn main() -> i32 {
+    var ins: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&ins)
+
+    var s: tokens.Sink = tokens.sink_new()
+    tokens.sink_init(&s)
+
+    var text: mem.CpBuf = mem.cp_new()
+    var lasttag: mem.CpBuf = mem.cp_new()
+
+    let total: usize = mem.buf_len(&ins)
+    var off: usize = 0
+    while off + 16 <= total {
+        let kind: u32 = read_u32(&ins, off)
+        // Word 2 holds the job flags (bit 0 = the XML adjustment); the
+        // bench knows no XML adjustment and reads over it.
+        let ltlen: usize = read_u32(&ins, off + 8) as usize
+        decode(&ins, off + 12, ltlen, &lasttag)
+        let inlen: usize = read_u32(&ins, off + 12 + ltlen) as usize
+        decode(&ins, off + 16 + ltlen, inlen, &text)
+        off = off + 16 + ltlen + inlen
+
+        tokens.sink_begin(&s)
+        if kind == 1 as u32 {
+            // An attribute value: emit it as a StartTag "x" with one attribute "a".
+            tokens.tok_start_tag(&s)
+            tokens.tok_name_push(&s, 120 as u32)
+            tokens.tok_attr_start(&s)
+            tokens.tok_attr_name_push(&s, 97 as u32)
+            run(&text, true, &s)
+            tokens.tok_attr_finish(&s)
+            tokens.tok_emit(&s)
+        } else {
+            run(&text, false, &s)
+        }
+        tokens.sink_end(&s)
+    }
+    tokens.sink_flush_out(&s)
+    return 0
+}

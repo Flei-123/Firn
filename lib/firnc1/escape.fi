@@ -1,0 +1,1723 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/escape.fi -- THE ESCAPE ANALYSIS, WRITTEN IN FIRN.
+//
+// Twin of `compiler/src/escape.rs` (round 79). Both have to reject the same
+// programs WITH THE SAME TEXT; `tools/escape/run.sh` compares the messages
+// character for character in both compilers. Everything in here therefore
+// follows the Rust file line for line -- the same order of the walk, the
+// same order of the marks, the same words.
+//
+// THE QUESTION: does the address of a LOCAL leave the frame that local lives
+// in? Gap 9 of docs/ROUND66.md:
+//
+//     fn bad() -> *mut i64 {
+//         var x: i64 = 5
+//         return &x          // x is dead on return -- the pointer is not
+//     }
+//
+// THE MODEL. A pointer value carries a `Taint`: a bit per PARAMETER it is
+// derived from, plus the first LOCAL of this frame it points into. It
+// travels through address arithmetic, casts, aggregate literals and
+// assignments to locals -- and NOT through a load out of memory, because
+// what lies in the heap is data and not the address of the pointer that led
+// there.
+//
+// A taint that reaches a SINK -- the return value, a write through a pointer
+// that is not this frame's, the thread primitive -- is the error if it holds
+// a local. If it holds a parameter it is no error but a FACT about the
+// function, which goes into its SUMMARY and is used at every call of it.
+// The summaries are driven to a fixed point over the whole program before
+// anything is reported; that is how the check crosses function boundaries
+// without a single lifetime annotation.
+//
+// WHERE IT CANNOT DECIDE, IT ALLOWS. Every gap that costs is named in
+// docs/ROUND79.md section 4. A false alarm would be far worse: it would make
+// correct programs unbuildable.
+//
+// THE WAY OUT is `#[allow_escape]` on a function (attrs.rs). It empties the
+// summary too, so a vouched-for function does not send its callers red
+// instead.
+//
+// WHY THE STATE IS IN INSERTION ORDERED LISTS: the two compilers have to
+// walk the same marks in the same order, or a program with two escaping
+// locals would be blamed for different ones. `firnc0` keeps `Vec<(String,
+// Taint)>` for exactly the same reason.
+//
+// A PLACE PATH is not a piece of text but a sequence of numbers: the intern
+// number of the root local, then one number per step -- the intern number of
+// a field, or NOTHING for an index. `st.konts` and `st.over` are two
+// different places, which is what keeps `lib/js/regexp.fi` and
+// `lib/firnc1/parser.fi` from being rejected.
+
+import rt
+import vec
+import intern
+import ast
+import types
+import pattern
+import diag
+import sema
+
+export { escape_check }
+
+const NOTHING: u32 = 4294967295
+
+// Upper bound for the fixed point over the call graph. Every round can only
+// ADD sink bits and there are finitely many, so the loop ends by itself; the
+// bound is the second safeguard, like MAX_DEPTH in nogc.fi.
+const MAX_ROUNDS: u32 = 12
+// Deepest nesting of `match` bodies that is still walked.
+const MAX_DEPTH: u32 = 256
+
+// The sinks, as bits.
+const SINK_RETURN: u64 = 1
+const SINK_FOREIGN: u64 = 2
+const SINK_THREAD: u64 = 4
+
+// The unary and binary operators, in the numbering of parser.fi.
+const U_ADDR: u32 = 2
+const U_DEREF: u32 = 3
+const B_ADD: u32 = 0
+const B_SUB: u32 = 1
+
+// The ways out, for the message.
+const R_RETURN: u32 = 0
+const R_PTR: u32 = 1
+const R_FOREIGN: u32 = 2
+const R_CALL: u32 = 3
+const R_THREAD: u32 = 4
+
+// What `root_of` found.
+const ROOT_LOCAL: u32 = 0
+const ROOT_BEHIND: u32 = 1
+const ROOT_OTHER: u32 = 2
+
+// Written into what parameter `j` points at. Parameters from 56 on count as
+// SINK_FOREIGN -- no signature of this language has that many, and the
+// coarser answer is the safe one.
+fn out_bit(j: u32) -> u64 {
+    if j < 56 {
+        return (1 as u64) << ((8 + j) as u64)
+    }
+    return SINK_FOREIGN
+}
+
+// Where a pointer value can have come from.
+struct Taint {
+    mask: u64, // bit i -- derived from parameter i
+    lname: u32, // the FIRST local source, NOTHING = none
+    ldecl: u64, // where it is declared
+    ltake: u64, // where its address is taken
+}
+
+fn t_none() -> Taint {
+    return Taint { mask: 0, lname: NOTHING, ldecl: 0, ltake: 0 }
+}
+
+fn t_is_empty(t: Taint) -> bool {
+    return t.mask == 0 && t.lname == NOTHING
+}
+
+fn t_param(i: u32) -> Taint {
+    var t: Taint = t_none()
+    if i < 64 {
+        t.mask = (1 as u64) << (i as u64)
+    }
+    return t
+}
+
+// Union. The FIRST local wins -- the same rule as in the Rust twin, so both
+// name the same variable when two of them meet in one value.
+fn t_unite(a: Taint, o: Taint) -> Taint {
+    var r: Taint = a
+    r.mask = r.mask | o.mask
+    if r.lname == NOTHING {
+        r.lname = o.lname
+        r.ldecl = o.ldecl
+        r.ltake = o.ltake
+    }
+    return r
+}
+
+struct Esc {
+    sm: u64, // the type checker (types of the expressions)
+    mu: u64, // the pattern registry (0 = none)
+    it: u64, // the interner
+
+    // --- the summaries: one u64 per parameter of every function
+    sum_off: Vec[u32], // per function: offset into `sum`
+    sum: Vec[u64],
+
+    // --- the function being checked
+    who: u32, // its name
+    fend: u64, // the closing brace of its body
+    np: u32, // number of parameters
+    poff: u32, // offset of its parameters in the tree
+    found: Vec[u64], // the summary being built
+
+    // --- its locals (parameters included), in the order they turn up
+    lname: Vec[u32], ldecl: Vec[u64],
+
+    // --- the marks: place path -> taint, insertion ordered
+    pcomp: Vec[u32], // the components of every path, one after another
+    p_off: Vec[u32], p_len: Vec[u32],
+    t_mask: Vec[u64], t_lname: Vec[u32], t_ldecl: Vec[u64], t_ltake: Vec[u64],
+    // scratch for the path currently being built
+    pbuf: Vec[u32],
+
+    // --- the findings
+    f_pos: Vec[u64], f_lname: Vec[u32], f_ldecl: Vec[u64], f_ltake: Vec[u64],
+    f_who: Vec[u32], f_fend: Vec[u64],
+    f_route: Vec[u32], f_rname: Vec[u32], f_rarg: Vec[u32],
+
+    report: bool,
+    depth: u32,
+}
+
+fn tree(e: *mut Esc) -> *mut ast.Tree {
+    return sema.sema_tree((*e).sm as *mut sema.Sema)
+}
+fn names(e: *mut Esc) -> *mut intern.Interner { return (*e).it as *mut intern.Interner }
+fn table(e: *mut Esc) -> *mut types.Types {
+    return sema.sema_types((*e).sm as *mut sema.Sema)
+}
+
+// Is the expression of a POINTER type? Only the type table can tell `a[i]`
+// on an array from `p[i]` on a pointer, and the whole difference between an
+// address of this frame and one of somebody else's hangs on it.
+fn is_ptr(e: *mut Esc, x: u32) -> bool {
+    let t: u32 = sema.sema_ty((*e).sm as *mut sema.Sema, x)
+    return types.is_ptr(table(e), t)
+}
+
+// ------------------------------------------------------------- the names
+
+// A name produced by the compiler itself (`__match#N`, `__try#`,
+// `Enum::Variant`, `asm$N`) -- never a function of the source text.
+fn is_internal(it: *mut intern.Interner, nr: u32) -> bool {
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    while i < n {
+        let b: u8 = rt.ld8(p, i)
+        if b == 35 as u8 {
+            return true
+        }
+        if b == 36 as u8 {
+            return true
+        }
+        if b == 58 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 58 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// A generated closure body (`__closure#N`, round 58). Deliberately NOT
+// checked -- gap E4 of docs/ROUND79.md. It is skipped in BOTH compilers, so
+// that the two never disagree about it.
+fn is_closure(it: *mut intern.Interner, nr: u32) -> bool {
+    var w: [u8; 10] = "__closure#"
+    return intern.intern_prefix(it, nr, (&w[0]) as u64, 10)
+}
+
+// The thread primitive of round 49 (thread.rs). Its first argument is handed
+// to a NEW stack that outlives this frame.
+fn is_thread_start(it: *mut intern.Interner, nr: u32) -> bool {
+    var w: [u8; 14] = "__thread_start"
+    return intern.intern_equal(it, nr, (&w[0]) as u64, 14)
+}
+
+// Write `helper__square` (module system) as `helper.square` again -- the
+// message shall show the name that stands in the source. The same rule as
+// `nogc::readable` and `escape.rs::readable`.
+fn say_name(e: *mut Esc, out: *mut rt.Buf, nr: u32) {
+    let it: *mut intern.Interner = names(e)
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var plain: bool = false
+    if n > 0 {
+        if rt.ld8(p, 0) == 95 as u8 {
+            plain = true
+        }
+    }
+    if is_internal(it, nr) {
+        plain = true
+    }
+    // Exactly ONE `__` in the middle, with something on both sides.
+    var cut: i64 = 0 - 1
+    var count: usize = 0
+    var i: usize = 0
+    while !plain && i + 1 < n {
+        if rt.ld8(p, i) == 95 as u8 && rt.ld8(p, i + 1) == 95 as u8 {
+            count = count + 1
+            if cut < 0 {
+                cut = i as i64
+            }
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    if plain || count != 1 || cut <= 0 || (cut as usize) + 2 >= n {
+        rt.buf_push_bytes(out, p, n)
+        return
+    }
+    rt.buf_push_bytes(out, p, cut as usize)
+    rt.buf_push(out, 46 as u8)
+    rt.buf_push_bytes(out, p + (cut as u64) + 2, n - (cut as usize) - 2)
+}
+
+// ------------------------------------------------------------- the locals
+
+fn decl_of(e: *mut Esc, nr: u32) -> u64 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*e).lname) {
+        if vec_at[u32](&(*e).lname, i) == nr {
+            return vec_at[u64](&(*e).ldecl, i)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn is_local(e: *mut Esc, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*e).lname) {
+        if vec_at[u32](&(*e).lname, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn declare(e: *mut Esc, nr: u32, at: u64) {
+    if is_local(e, nr) {
+        return
+    }
+    vec_push[u32](&(*e).lname, nr)
+    vec_push[u64](&(*e).ldecl, at)
+}
+
+// Every `let`/`var` of a block, with the place it is declared at. A name
+// declared twice keeps the FIRST place -- gap E5.
+fn collect_block(e: *mut Esc, b: *mut ast.Tree, bi: u32) {
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        collect_stmt(e, b, ast.slist_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+}
+
+fn collect_stmt(e: *mut Esc, b: *mut ast.Tree, s: u32) {
+    let a: u32 = ast.s_kind(b, s)
+    if a == ast.S_LET || a == ast.S_VAR {
+        declare(e, ast.s_a(b, s), ast.stmt_pos(b, s))
+        return
+    }
+    if a == ast.S_IF {
+        collect_block(e, b, ast.s_b(b, s))
+        if ast.s_c(b, s) != NOTHING {
+            collect_stmt(e, b, ast.s_c(b, s))
+        }
+        return
+    }
+    if a == ast.S_WHILE {
+        collect_block(e, b, ast.s_b(b, s))
+        return
+    }
+    if a == ast.S_FOR {
+        declare(e, ast.s_a(b, s), ast.stmt_pos(b, s))
+        collect_block(e, b, ast.s_d(b, s))
+        return
+    }
+    if a == ast.S_BLOCK {
+        collect_block(e, b, ast.s_a(b, s))
+        return
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        collect_stmt(e, b, ast.s_a(b, s))
+        return
+    }
+}
+
+// -------------------------------------------------------- the place paths
+
+// Build the path of the place `x` into `pbuf`. Returns false when the place
+// is not one of this frame (a constant, or something a pointer leads to).
+fn path_of(e: *mut Esc, x: u32) -> bool {
+    let b: *mut ast.Tree = tree(e)
+    let a: u32 = ast.e_kind(b, x)
+    if a == ast.E_ID {
+        if !is_local(e, ast.e_a(b, x)) {
+            return false
+        }
+        vec_push[u32](&(*e).pbuf, ast.e_a(b, x))
+        return true
+    }
+    if a == ast.E_FIELD {
+        if is_ptr(e, ast.e_a(b, x)) {
+            return false
+        }
+        if !path_of(e, ast.e_a(b, x)) {
+            return false
+        }
+        vec_push[u32](&(*e).pbuf, ast.e_b(b, x))
+        return true
+    }
+    if a == ast.E_IDX {
+        if is_ptr(e, ast.e_a(b, x)) {
+            return false
+        }
+        if !path_of(e, ast.e_a(b, x)) {
+            return false
+        }
+        vec_push[u32](&(*e).pbuf, NOTHING)
+        return true
+    }
+    return false
+}
+
+// Is the path `off..off+len` below the stored path `i`? (the other
+// direction of `is_under`)
+fn is_above(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
+    let mine_len: u32 = vec_at[u32](&(*e).p_len, i)
+    if len < mine_len {
+        return false
+    }
+    let mine: u32 = vec_at[u32](&(*e).p_off, i)
+    var k: u32 = 0
+    while k < mine_len {
+        if vec_at[u32](&(*e).pcomp, (mine + k) as usize)
+        != vec_at[u32](&(*e).pcomp, (off + k) as usize) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// Is the stored path `i` the path `off..off+len` of `pcomp`, or below it?
+fn is_under(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
+    if vec_at[u32](&(*e).p_len, i) < len {
+        return false
+    }
+    let mine: u32 = vec_at[u32](&(*e).p_off, i)
+    var k: u32 = 0
+    while k < len {
+        if vec_at[u32](&(*e).pcomp, (mine + k) as usize)
+        != vec_at[u32](&(*e).pcomp, (off + k) as usize) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// Everything marked at this place, BELOW it or ABOVE it.
+//
+// Below, because reading the whole struct reads its fields with it. Above,
+// because a mark at `a` says "somewhere in `a` there is an address of this
+// frame", and reading `a[0]` may well be the way it comes back out
+// (tools/escape/reject/22_array_of_addresses.fi). Both directions are the
+// conservative reading; only SIBLINGS stay apart, and that is the case that
+// keeps lib/firnc1/parser.fi and lib/js/regexp.fi buildable.
+fn taint_under(e: *mut Esc, off: u32, len: u32) -> Taint {
+    var out: Taint = t_none()
+    var i: usize = 0
+    while i < vec_len[u32](&(*e).p_len) {
+        if is_under(e, i, off, len) || is_above(e, i, off, len) {
+            var o: Taint = Taint { mask: vec_at[u64](&(*e).t_mask, i),
+                lname: vec_at[u32](&(*e).t_lname, i),
+                ldecl: vec_at[u64](&(*e).t_ldecl, i),
+                ltake: vec_at[u64](&(*e).t_ltake, i) }
+            out = t_unite(out, o)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Writing into a place of this frame: it replaces exactly that place and
+// everything below it.
+fn write_local(e: *mut Esc, off: u32, len: u32, t: Taint) {
+    var i: usize = 0
+    while i < vec_len[u32](&(*e).p_len) {
+        if is_under(e, i, off, len) {
+            mark_remove(e, i)
+        } else {
+            i = i + 1
+        }
+    }
+    if t_is_empty(t) {
+        return
+    }
+    let new: u32 = vec_len[u32](&(*e).pcomp) as u32
+    var k: u32 = 0
+    while k < len {
+        vec_push[u32](&(*e).pcomp, vec_at[u32](&(*e).pcomp, (off + k) as usize))
+        k = k + 1
+    }
+    vec_push[u32](&(*e).p_off, new)
+    vec_push[u32](&(*e).p_len, len)
+    vec_push[u64](&(*e).t_mask, t.mask)
+    vec_push[u32](&(*e).t_lname, t.lname)
+    vec_push[u64](&(*e).t_ldecl, t.ldecl)
+    vec_push[u64](&(*e).t_ltake, t.ltake)
+}
+
+// Remove mark `i`, keeping the ORDER of the rest -- the order is part of the
+// agreement with the Rust twin.
+fn mark_remove(e: *mut Esc, i: usize) {
+    vec_remove[u32](&(*e).p_off, i)
+    vec_remove[u32](&(*e).p_len, i)
+    vec_remove[u64](&(*e).t_mask, i)
+    vec_remove[u32](&(*e).t_lname, i)
+    vec_remove[u64](&(*e).t_ldecl, i)
+    vec_remove[u64](&(*e).t_ltake, i)
+}
+
+// The taint of a place given as an expression, or the empty one.
+fn taint_of_place(e: *mut Esc, x: u32) -> Taint {
+    vec_clear[u32](&(*e).pbuf)
+    if !path_of(e, x) {
+        return t_none()
+    }
+    let off: u32 = push_pbuf(e)
+    let len: u32 = vec_len[u32](&(*e).pbuf) as u32
+    return taint_under(e, off, len)
+}
+
+// A fresh copy of the path `off..off+len` with one more component at the
+// end, in the shared pool. Returns its offset.
+fn path_extend(e: *mut Esc, off: u32, len: u32, comp: u32) -> u32 {
+    let new: u32 = vec_len[u32](&(*e).pcomp) as u32
+    var k: u32 = 0
+    while k < len {
+        vec_push[u32](&(*e).pcomp, vec_at[u32](&(*e).pcomp, (off + k) as usize))
+        k = k + 1
+    }
+    vec_push[u32](&(*e).pcomp, comp)
+    return new
+}
+
+// Put the value of `x` into the place `off..off+len` -- FIELD FOR FIELD when
+// it is an aggregate literal.
+//
+// `M { p: &x, flag: true }` marks `m.p` and not `m`. The difference is not
+// cosmetic: a mark on the whole struct would be inherited by every field
+// read out of it afterwards, and lib/js/regexp.fi builds exactly such a
+// struct (`konts: &konts[0]`) and reads a DIFFERENT field out of it
+// (`st.over`) one line later. Marking the whole thing would reject that
+// correct program.
+fn store_value(e: *mut Esc, off: u32, len: u32, x: u32) {
+    let b: *mut ast.Tree = tree(e)
+    let a: u32 = ast.e_kind(b, x)
+    if a == ast.E_SLIT {
+        write_local(e, off, len, t_none())
+        var k: u32 = 0
+        while k < ast.e_c(b, x) {
+            let fname: u32 = ast.child_at(b, ast.e_b(b, x) + k * 2)
+            let fval: u32 = ast.child_at(b, ast.e_b(b, x) + k * 2 + 1)
+            let inner: u32 = path_extend(e, off, len, fname)
+            store_value(e, inner, len + 1, fval)
+            k = k + 1
+        }
+        return
+    }
+    // An array is index INsensitive: everything that goes in lands under one
+    // `[]`. Nothing else would be honest -- the index is a value at run time.
+    if a == ast.E_ALIT {
+        write_local(e, off, len, t_none())
+        var t: Taint = t_none()
+        var j: u32 = 0
+        while j < ast.e_c(b, x) {
+            t = t_unite(t, value(e, ast.child_at(b, ast.e_b(b, x) + j)))
+            j = j + 1
+        }
+        let inner2: u32 = path_extend(e, off, len, NOTHING)
+        write_local(e, inner2, len + 1, t)
+        return
+    }
+    if a == ast.E_AWDH {
+        write_local(e, off, len, t_none())
+        let t2: Taint = value(e, ast.e_a(b, x))
+        let inner3: u32 = path_extend(e, off, len, NOTHING)
+        write_local(e, inner3, len + 1, t2)
+        return
+    }
+    if a == ast.E_TEXT {
+        store_value(e, off, len, ast.e_a(b, x))
+        return
+    }
+    write_local(e, off, len, value(e, x))
+}
+
+// Move `pbuf` into the shared component pool and yield its offset.
+fn push_pbuf(e: *mut Esc) -> u32 {
+    let off: u32 = vec_len[u32](&(*e).pcomp) as u32
+    var i: usize = 0
+    while i < vec_len[u32](&(*e).pbuf) {
+        vec_push[u32](&(*e).pcomp, vec_at[u32](&(*e).pbuf, i))
+        i = i + 1
+    }
+    return off
+}
+
+// --------------------------------------------------------------- the walk
+
+// The taint of the VALUE of `x`.
+fn value(e: *mut Esc, x: u32) -> Taint {
+    let b: *mut ast.Tree = tree(e)
+    let a: u32 = ast.e_kind(b, x)
+    if a == ast.E_ID {
+        return taint_of_place(e, x)
+    }
+    if a == ast.E_UN {
+        let op: u32 = ast.e_a(b, x)
+        if op == U_ADDR {
+            return address_of(e, ast.e_b(b, x), ast.expr_pos(b, x))
+        }
+        // A LOAD out of memory yields data, not the address that led there.
+        // Without this line the analysis would call every `(*v).ptr` a
+        // pointer into the caller's frame, and `vec_push` would never be
+        // recognised as storing.
+        if op == U_DEREF {
+            return t_none()
+        }
+        return value(e, ast.e_b(b, x))
+    }
+    if a == ast.E_AS {
+        return value(e, ast.e_a(b, x))
+    }
+    if a == ast.E_BIN {
+        let op: u32 = ast.e_a(b, x)
+        // Pointer arithmetic keeps the source; `&a[0] + 3` still points into `a`.
+        if op == B_ADD {
+            return t_unite(value(e, ast.e_b(b, x)), value(e, ast.e_c(b, x)))
+        }
+        // The DIFFERENCE of two addresses is a distance and no address at
+        // all -- `(&p.b) as usize - (&p.a) as usize` is how lib/std/rc.fi
+        // measures the stride of a type. Only `address - number` stays an
+        // address.
+        if op == B_SUB {
+            if t_is_empty(value(e, ast.e_c(b, x))) {
+                return value(e, ast.e_b(b, x))
+            }
+            return t_none()
+        }
+        return t_none()
+    }
+    // Reading a field/element of a LOCAL aggregate: whatever was put into
+    // that very field is what comes out.
+    if a == ast.E_FIELD || a == ast.E_IDX {
+        return taint_of_place(e, x)
+    }
+    if a == ast.E_SLIT {
+        var out: Taint = t_none()
+        var k: u32 = 0
+        while k < ast.e_c(b, x) {
+            out = t_unite(out, value(e, ast.child_at(b, ast.e_b(b, x) + k * 2 + 1)))
+            k = k + 1
+        }
+        return out
+    }
+    if a == ast.E_ALIT {
+        var out2: Taint = t_none()
+        var j: u32 = 0
+        while j < ast.e_c(b, x) {
+            out2 = t_unite(out2, value(e, ast.child_at(b, ast.e_b(b, x) + j)))
+            j = j + 1
+        }
+        return out2
+    }
+    if a == ast.E_AWDH {
+        return value(e, ast.e_a(b, x))
+    }
+    if a == ast.E_TEXT {
+        return value(e, ast.e_a(b, x))
+    }
+    if a == ast.E_CALL {
+        return call_result(e, x)
+    }
+    return t_none()
+}
+
+// The taint of the ADDRESS of the place `x` (`&x`). `at` is where the `&`
+// stands, for the message.
+fn address_of(e: *mut Esc, x: u32, at: u64) -> Taint {
+    let b: *mut ast.Tree = tree(e)
+    let a: u32 = ast.e_kind(b, x)
+    if a == ast.E_ID {
+        let nr: u32 = ast.e_a(b, x)
+        if !is_local(e, nr) {
+            // A constant lies in .rodata and outlives everything.
+            return t_none()
+        }
+        var t: Taint = t_none()
+        t.lname = nr
+        t.ldecl = decl_of(e, nr)
+        t.ltake = at
+        return t
+    }
+    // `&(*p).f` and `&p[i]` are `p` plus an offset -- the frame of the local
+    // `p` has nothing to do with it.
+    if a == ast.E_UN && ast.e_a(b, x) == U_DEREF {
+        return value(e, ast.e_b(b, x))
+    }
+    if a == ast.E_FIELD || a == ast.E_IDX {
+        if is_ptr(e, ast.e_a(b, x)) {
+            return value(e, ast.e_a(b, x))
+        }
+        return address_of(e, ast.e_a(b, x), at)
+    }
+    return t_none()
+}
+
+// Where a place expression is rooted. Return: ROOT_LOCAL (`out` = the name),
+// ROOT_BEHIND (`out` = the pointer expression), ROOT_OTHER.
+fn root_of(e: *mut Esc, x: u32, out: *mut u32) -> u32 {
+    let b: *mut ast.Tree = tree(e)
+    let a: u32 = ast.e_kind(b, x)
+    if a == ast.E_ID {
+        if is_local(e, ast.e_a(b, x)) {
+            *out = ast.e_a(b, x)
+            return ROOT_LOCAL
+        }
+        return ROOT_OTHER
+    }
+    if a == ast.E_UN && ast.e_a(b, x) == U_DEREF {
+        *out = ast.e_b(b, x)
+        return ROOT_BEHIND
+    }
+    if a == ast.E_FIELD || a == ast.E_IDX {
+        if is_ptr(e, ast.e_a(b, x)) {
+            *out = ast.e_a(b, x)
+            return ROOT_BEHIND
+        }
+        return root_of(e, ast.e_a(b, x), out)
+    }
+    return ROOT_OTHER
+}
+
+// ------------------------------------------------------------ the summaries
+
+// Offset of the summary of function `fi`.
+fn sum_at(e: *mut Esc, fi: usize) -> u32 { return vec_at[u32](&(*e).sum_off, fi) }
+
+// The index of the function with this name, or -1. The FIRST wins -- a name
+// declared twice is an error of the type check.
+fn fn_index(e: *mut Esc, nr: u32) -> i64 {
+    let b: *mut ast.Tree = tree(e)
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        if ast.fn_name(b, i) == nr {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// What a call yields: the taint of every argument that the callee passes
+// through to its result.
+fn call_result(e: *mut Esc, x: u32) -> Taint {
+    let b: *mut ast.Tree = tree(e)
+    let fi: i64 = fn_index(e, ast.e_a(b, x))
+    if fi < 0 {
+        return t_none()
+    }
+    let off: u32 = sum_at(e, fi as usize)
+    let np: u32 = ast.fn_plen(b, fi as usize)
+    var out: Taint = t_none()
+    var i: u32 = 0
+    while i < np && i < ast.e_c(b, x) {
+        if vec_at[u64](&(*e).sum, (off + i) as usize) & SINK_RETURN != 0 {
+            out = t_unite(out, value(e, ast.child_at(b, ast.e_b(b, x) + i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ------------------------------------------------------------------ sinks
+
+// A taint reaches a sink. A parameter bit is a fact for the summary, a local
+// source is the error.
+fn flow(e: *mut Esc, t: Taint, sink: u64, route: u32, rname: u32, rarg: u32, at: u64) {
+    if t.mask != 0 {
+        var i: u32 = 0
+        while i < (*e).np && i < 64 {
+            if t.mask & ((1 as u64) << (i as u64)) != 0 {
+                let old: u64 = vec_at[u64](&(*e).found, i as usize)
+                vec_set[u64](&(*e).found, i as usize, old | sink)
+            }
+            i = i + 1
+        }
+    }
+    if t.lname == NOTHING {
+        return
+    }
+    if !(*e).report {
+        return
+    }
+    var place: u64 = at
+    if place == 0 {
+        place = t.ltake
+    }
+    vec_push[u64](&(*e).f_pos, place)
+    vec_push[u32](&(*e).f_lname, t.lname)
+    vec_push[u64](&(*e).f_ldecl, t.ldecl)
+    vec_push[u64](&(*e).f_ltake, t.ltake)
+    vec_push[u32](&(*e).f_who, (*e).who)
+    vec_push[u64](&(*e).f_fend, (*e).fend)
+    vec_push[u32](&(*e).f_route, route)
+    vec_push[u32](&(*e).f_rname, rname)
+    vec_push[u32](&(*e).f_rarg, rarg)
+}
+
+// A write goes through the pointer whose taint is `pt`: into a parameter's
+// storage, or out of sight. Returns the sink bits, `route`/`rname` say which
+// way out it is.
+fn through(e: *mut Esc, pt: Taint, route: *mut u32, rname: *mut u32) -> u64 {
+    let b: *mut ast.Tree = tree(e)
+    var i: u32 = 0
+    while i < (*e).np && i < 64 {
+        if pt.mask & ((1 as u64) << (i as u64)) != 0 {
+            *route = R_PTR
+            *rname = ast.param_name(b, (*e).poff + i)
+            return out_bit(i)
+        }
+        i = i + 1
+    }
+    *route = R_FOREIGN
+    *rname = NOTHING
+    return SINK_FOREIGN
+}
+
+// The taint `t` is written into the place `target`.
+fn store(e: *mut Esc, target: u32, t: Taint, at: u64) {
+    vec_clear[u32](&(*e).pbuf)
+    if path_of(e, target) {
+        let off: u32 = push_pbuf(e)
+        let len: u32 = vec_len[u32](&(*e).pbuf) as u32
+        write_local(e, off, len, t)
+        return
+    }
+    if t_is_empty(t) {
+        return
+    }
+    var root: u32 = 0
+    let kind: u32 = root_of(e, target, &root)
+    if kind == ROOT_LOCAL {
+        // A place of this frame the path did not catch (an index behind a
+        // cast and the like): mark the root local, coarsely but safely.
+        vec_clear[u32](&(*e).pbuf)
+        vec_push[u32](&(*e).pbuf, root)
+        let off2: u32 = push_pbuf(e)
+        var cur: Taint = taint_under(e, off2, 1)
+        cur = t_unite(cur, t)
+        write_local(e, off2, 1, cur)
+        return
+    }
+    if kind == ROOT_BEHIND {
+        let pt: Taint = value(e, root)
+        // Into the frame itself: `var b: Box; let q = &b; (*q).p = &x` writes
+        // into `b`, and `b` lives exactly as long as `x`.
+        if pt.lname != NOTHING {
+            return
+        }
+        var route: u32 = 0
+        var rname: u32 = NOTHING
+        let sink: u64 = through(e, pt, &route, &rname)
+        flow(e, t, sink, route, rname, 0, at)
+        return
+    }
+    flow(e, t, SINK_FOREIGN, R_FOREIGN, NOTHING, 0, at)
+}
+
+// The callee writes into `*dst`. `dst` is an ARGUMENT here, so the place is
+// one indirection further out than in `store`.
+fn store_through(e: *mut Esc, dst: u32, t: Taint, at: u64, callee: u32, argno: u32) {
+    let b: *mut ast.Tree = tree(e)
+    // `f(&out, &x)`: what lands in `out` stays in this frame.
+    if ast.e_kind(b, dst) == ast.E_UN && ast.e_a(b, dst) == U_ADDR {
+        vec_clear[u32](&(*e).pbuf)
+        if path_of(e, ast.e_b(b, dst)) {
+            let off: u32 = push_pbuf(e)
+            let len: u32 = vec_len[u32](&(*e).pbuf) as u32
+            var cur: Taint = taint_under(e, off, len)
+            cur = t_unite(cur, t)
+            write_local(e, off, len, cur)
+            return
+        }
+    }
+    let dt: Taint = value(e, dst)
+    if dt.lname != NOTHING {
+        return
+    }
+    var route: u32 = 0
+    var rname: u32 = NOTHING
+    let sink: u64 = through(e, dt, &route, &rname)
+    if route == R_FOREIGN {
+        flow(e, t, sink, R_CALL, callee, argno, at)
+        return
+    }
+    flow(e, t, sink, route, rname, 0, at)
+}
+
+// ------------------------------------------------------------- statements
+
+fn walk_block(e: *mut Esc, bi: u32) {
+    let b: *mut ast.Tree = tree(e)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        walk_stmt(e, ast.slist_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+}
+
+fn walk_stmt(e: *mut Esc, s: u32) {
+    let b: *mut ast.Tree = tree(e)
+    let a: u32 = ast.s_kind(b, s)
+    let at: u64 = ast.stmt_pos(b, s)
+    if a == ast.S_LET || a == ast.S_VAR {
+        walk_expr(e, ast.s_c(b, s))
+        vec_clear[u32](&(*e).pbuf)
+        vec_push[u32](&(*e).pbuf, ast.s_a(b, s))
+        let off: u32 = push_pbuf(e)
+        store_value(e, off, 1, ast.s_c(b, s))
+        return
+    }
+    if a == ast.S_ZUW {
+        walk_expr(e, ast.s_b(b, s))
+        walk_expr(e, ast.s_a(b, s))
+        vec_clear[u32](&(*e).pbuf)
+        if path_of(e, ast.s_a(b, s)) {
+            let off2: u32 = push_pbuf(e)
+            let len2: u32 = vec_len[u32](&(*e).pbuf) as u32
+            store_value(e, off2, len2, ast.s_b(b, s))
+            return
+        }
+        let v2: Taint = value(e, ast.s_b(b, s))
+        store(e, ast.s_a(b, s), v2, at)
+        return
+    }
+    if a == ast.S_ZUWOP {
+        walk_expr(e, ast.s_b(b, s))
+        walk_expr(e, ast.s_a(b, s))
+        // `p += n` keeps whatever `p` already pointed into.
+        var v3: Taint = value(e, ast.s_a(b, s))
+        v3 = t_unite(v3, value(e, ast.s_b(b, s)))
+        store(e, ast.s_a(b, s), v3, at)
+        return
+    }
+    if a == ast.S_STEP {
+        // `p++` changes no source.
+        walk_expr(e, ast.s_a(b, s))
+        return
+    }
+    if a == ast.S_IF {
+        walk_expr(e, ast.s_a(b, s))
+        var before: Esc = snap_take(e)
+        walk_block(e, ast.s_b(b, s))
+        var after_then: Esc = snap_take(e)
+        snap_put(e, &before)
+        if ast.s_c(b, s) != NOTHING {
+            walk_stmt(e, ast.s_c(b, s))
+        }
+        snap_merge(e, &after_then)
+        snap_free(&before)
+        snap_free(&after_then)
+        return
+    }
+    if a == ast.S_WHILE {
+        walk_expr(e, ast.s_a(b, s))
+        // Twice, so that what the end of the body marks is visible at its
+        // beginning. A third round can add nothing the second did not
+        // already carry into the merged state.
+        var w1: Esc = snap_take(e)
+        walk_block(e, ast.s_b(b, s))
+        snap_merge(e, &w1)
+        snap_free(&w1)
+        var w2: Esc = snap_take(e)
+        walk_block(e, ast.s_b(b, s))
+        snap_merge(e, &w2)
+        snap_free(&w2)
+        return
+    }
+    if a == ast.S_FOR {
+        walk_expr(e, ast.s_b(b, s))
+        walk_expr(e, ast.s_c(b, s))
+        declare(e, ast.s_a(b, s), at)
+        var g1: Esc = snap_take(e)
+        walk_block(e, ast.s_d(b, s))
+        snap_merge(e, &g1)
+        snap_free(&g1)
+        var g2: Esc = snap_take(e)
+        walk_block(e, ast.s_d(b, s))
+        snap_merge(e, &g2)
+        snap_free(&g2)
+        return
+    }
+    if a == ast.S_RET {
+        if ast.s_a(b, s) != NOTHING {
+            walk_expr(e, ast.s_a(b, s))
+            let v4: Taint = value(e, ast.s_a(b, s))
+            flow(e, v4, SINK_RETURN, R_RETURN, NOTHING, 0, at)
+        }
+        return
+    }
+    if a == ast.S_EXPR {
+        walk_expr(e, ast.s_a(b, s))
+        return
+    }
+    if a == ast.S_BLOCK {
+        walk_block(e, ast.s_a(b, s))
+        return
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        // A deferred statement runs in the same frame, under the same rules.
+        walk_stmt(e, ast.s_a(b, s))
+        return
+    }
+}
+
+// ------------------------------------------------------------ expressions
+
+fn walk_expr(e: *mut Esc, x: u32) {
+    let b: *mut ast.Tree = tree(e)
+    let a: u32 = ast.e_kind(b, x)
+    if a == ast.E_CALL {
+        var k: u32 = 0
+        while k < ast.e_c(b, x) {
+            walk_expr(e, ast.child_at(b, ast.e_b(b, x) + k))
+            k = k + 1
+        }
+        walk_call(e, x)
+        walk_match_cases(e, ast.e_a(b, x))
+        return
+    }
+    if a == ast.E_LAMBDA {
+        // Round 58: a closure body is its own function and is checked
+        // nowhere -- gap E4 of docs/ROUND79.md.
+        return
+    }
+    if a == ast.E_UN {
+        walk_expr(e, ast.e_b(b, x))
+        return
+    }
+    if a == ast.E_BIN {
+        walk_expr(e, ast.e_b(b, x))
+        walk_expr(e, ast.e_c(b, x))
+        return
+    }
+    if a == ast.E_FIELD {
+        walk_expr(e, ast.e_a(b, x))
+        return
+    }
+    if a == ast.E_IDX {
+        walk_expr(e, ast.e_a(b, x))
+        walk_expr(e, ast.e_b(b, x))
+        return
+    }
+    if a == ast.E_SYSCALL || a == ast.E_ALIT {
+        var j: u32 = 0
+        while j < ast.e_c(b, x) {
+            walk_expr(e, ast.child_at(b, ast.e_b(b, x) + j))
+            j = j + 1
+        }
+        return
+    }
+    if a == ast.E_AS {
+        walk_expr(e, ast.e_a(b, x))
+        return
+    }
+    if a == ast.E_TEXT {
+        walk_expr(e, ast.e_a(b, x))
+        return
+    }
+    if a == ast.E_SLIT {
+        var m: u32 = 0
+        while m < ast.e_c(b, x) {
+            walk_expr(e, ast.child_at(b, ast.e_b(b, x) + m * 2 + 1))
+            m = m + 1
+        }
+        return
+    }
+    if a == ast.E_AWDH {
+        walk_expr(e, ast.e_a(b, x))
+        walk_expr(e, ast.e_b(b, x))
+        return
+    }
+}
+
+fn walk_call(e: *mut Esc, x: u32) {
+    let b: *mut ast.Tree = tree(e)
+    let name: u32 = ast.e_a(b, x)
+    let at: u64 = ast.expr_pos(b, x)
+    let argc: u32 = ast.e_c(b, x)
+    let aoff: u32 = ast.e_b(b, x)
+    // Round 49: the first argument of the thread primitive is handed to a
+    // stack of its own that keeps running when this frame is gone.
+    if is_thread_start(names(e), name) {
+        if argc > 0 {
+            let t0: Taint = value(e, ast.child_at(b, aoff))
+            flow(e, t0, SINK_THREAD, R_THREAD, NOTHING, 0, at)
+        }
+        return
+    }
+    if is_internal(names(e), name) {
+        return
+    }
+    let fi: i64 = fn_index(e, name)
+    if fi < 0 {
+        // Unknown name (the type check reports it), or an `extern fn` whose
+        // body is not here: gap E3.
+        return
+    }
+    let off: u32 = sum_at(e, fi as usize)
+    let np: u32 = ast.fn_plen(b, fi as usize)
+    var i: u32 = 0
+    while i < np && i < argc {
+        let fl: u64 = vec_at[u64](&(*e).sum, (off + i) as usize)
+        let t: Taint = value(e, ast.child_at(b, aoff + i))
+        if !t_is_empty(t) {
+            if fl & (SINK_FOREIGN | SINK_THREAD) != 0 {
+                flow(e, t, SINK_FOREIGN, R_CALL, name, i + 1, at)
+            }
+            var j: u32 = 0
+            while j < argc && j < 56 {
+                if fl & out_bit(j) != 0 {
+                    // Argument `i` lands in what argument `j` points at.
+                    store_through(e, ast.child_at(b, aoff + j), t, at, name, i + 1)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// `match` sits in the tree as the call `__match#N`; the bodies of its arms
+// live in the registry of pattern.fi. Without this descent every state
+// machine would be a blind spot (the same reasoning as in nogc.fi).
+fn walk_match_cases(e: *mut Esc, name: u32) {
+    if (*e).mu == 0 {
+        return
+    }
+    if !pattern.pat_is_matchname(names(e), name) {
+        return
+    }
+    if (*e).depth >= MAX_DEPTH {
+        return
+    }
+    let mi: u32 = pattern.pat_match_number(names(e), name)
+    let m: *mut pattern.Pat = (*e).mu as *mut pattern.Pat
+    (*e).depth = (*e).depth + 1
+    walk_expr(e, pattern.pat_m_subj(m, mi))
+    let aoff: u32 = pattern.pat_m_aoff(m, mi)
+    let alen: u32 = pattern.pat_m_alen(m, mi)
+    var k: u32 = 0
+    while k < alen {
+        var before: Esc = snap_take(e)
+        walk_block(e, pattern.pat_a_block(m, aoff + k))
+        snap_merge(e, &before)
+        snap_free(&before)
+        k = k + 1
+    }
+    (*e).depth = (*e).depth - 1
+}
+
+// ------------------------------------------------------------- snapshots
+//
+// An `Esc` whose mark lists alone are filled -- everything else stays empty.
+// A struct of its own would need six more `Vec` types in the code generator
+// for nothing.
+
+fn snap_take(e: *mut Esc) -> Esc {
+    var s: Esc = esc_empty()
+    var i: usize = 0
+    while i < vec_len[u32](&(*e).p_len) {
+        vec_push[u32](&s.p_off, vec_at[u32](&(*e).p_off, i))
+        vec_push[u32](&s.p_len, vec_at[u32](&(*e).p_len, i))
+        vec_push[u64](&s.t_mask, vec_at[u64](&(*e).t_mask, i))
+        vec_push[u32](&s.t_lname, vec_at[u32](&(*e).t_lname, i))
+        vec_push[u64](&s.t_ldecl, vec_at[u64](&(*e).t_ldecl, i))
+        vec_push[u64](&s.t_ltake, vec_at[u64](&(*e).t_ltake, i))
+        i = i + 1
+    }
+    return s
+}
+
+fn marks_clear(e: *mut Esc) {
+    vec_clear[u32](&(*e).p_off)
+    vec_clear[u32](&(*e).p_len)
+    vec_clear[u64](&(*e).t_mask)
+    vec_clear[u32](&(*e).t_lname)
+    vec_clear[u64](&(*e).t_ldecl)
+    vec_clear[u64](&(*e).t_ltake)
+}
+
+fn snap_put(e: *mut Esc, s: *mut Esc) {
+    marks_clear(e)
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).p_len) {
+        vec_push[u32](&(*e).p_off, vec_at[u32](&(*s).p_off, i))
+        vec_push[u32](&(*e).p_len, vec_at[u32](&(*s).p_len, i))
+        vec_push[u64](&(*e).t_mask, vec_at[u64](&(*s).t_mask, i))
+        vec_push[u32](&(*e).t_lname, vec_at[u32](&(*s).t_lname, i))
+        vec_push[u64](&(*e).t_ldecl, vec_at[u64](&(*s).t_ldecl, i))
+        vec_push[u64](&(*e).t_ltake, vec_at[u64](&(*s).t_ltake, i))
+        i = i + 1
+    }
+}
+
+// Union of two markings -- what one branch marks counts afterwards. `s` is
+// the state that was there BEFORE, so its entries come first; the Rust twin
+// merges in the same direction.
+fn snap_merge(e: *mut Esc, s: *mut Esc) {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).p_len) {
+        let off: u32 = vec_at[u32](&(*s).p_off, i)
+        let len: u32 = vec_at[u32](&(*s).p_len, i)
+        var o: Taint = Taint { mask: vec_at[u64](&(*s).t_mask, i),
+            lname: vec_at[u32](&(*s).t_lname, i),
+            ldecl: vec_at[u64](&(*s).t_ldecl, i),
+            ltake: vec_at[u64](&(*s).t_ltake, i) }
+        var hit: bool = false
+        var j: usize = 0
+        while j < vec_len[u32](&(*e).p_len) {
+            if same_path(e, j, off, len) {
+                var cur: Taint = Taint { mask: vec_at[u64](&(*e).t_mask, j),
+                    lname: vec_at[u32](&(*e).t_lname, j),
+                    ldecl: vec_at[u64](&(*e).t_ldecl, j),
+                    ltake: vec_at[u64](&(*e).t_ltake, j) }
+                cur = t_unite(cur, o)
+                vec_set[u64](&(*e).t_mask, j, cur.mask)
+                vec_set[u32](&(*e).t_lname, j, cur.lname)
+                vec_set[u64](&(*e).t_ldecl, j, cur.ldecl)
+                vec_set[u64](&(*e).t_ltake, j, cur.ltake)
+                hit = true
+                break
+            }
+            j = j + 1
+        }
+        if !hit {
+            vec_push[u32](&(*e).p_off, off)
+            vec_push[u32](&(*e).p_len, len)
+            vec_push[u64](&(*e).t_mask, o.mask)
+            vec_push[u32](&(*e).t_lname, o.lname)
+            vec_push[u64](&(*e).t_ldecl, o.ldecl)
+            vec_push[u64](&(*e).t_ltake, o.ltake)
+        }
+        i = i + 1
+    }
+}
+
+fn same_path(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
+    if vec_at[u32](&(*e).p_len, i) != len {
+        return false
+    }
+    let mine: u32 = vec_at[u32](&(*e).p_off, i)
+    var k: u32 = 0
+    while k < len {
+        if vec_at[u32](&(*e).pcomp, (mine + k) as usize)
+        != vec_at[u32](&(*e).pcomp, (off + k) as usize) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn snap_free(s: *mut Esc) {
+    esc_free(s)
+}
+
+// ------------------------------------------------------------ the messages
+//
+// Word for word `escape.rs::Route::text`, `::help` and `Pass::blame`. Every
+// literal here has a twin over there; if one of them changes, both change --
+// tools/escape/run.sh compares them character for character.
+
+fn say_pos(out: *mut rt.Buf, p: u64) {
+    rt.buf_push_dec_u64(out, ast.pos_line(p) as u64)
+    rt.buf_push(out, 58 as u8)
+    rt.buf_push_dec_u64(out, ast.pos_col(p) as u64)
+}
+
+fn build_msg(e: *mut Esc, out: *mut rt.Buf, k: usize) {
+    var m1: [u8; 26] = "the address of the local '"
+    rt.buf_push_bytes(out, (&m1[0]) as u64, 26)
+    rt.buf_push_bytes(out, intern.intern_ptr(names(e), vec_at[u32](&(*e).f_lname, k)),
+        intern.intern_length(names(e), vec_at[u32](&(*e).f_lname, k)))
+    var m2: [u8; 10] = "' escapes "
+    rt.buf_push_bytes(out, (&m2[0]) as u64, 10)
+    let route: u32 = vec_at[u32](&(*e).f_route, k)
+    if route == R_RETURN {
+        var r1: [u8; 24] = "through the return value"
+        rt.buf_push_bytes(out, (&r1[0]) as u64, 24)
+        return
+    }
+    if route == R_PTR {
+        var r2: [u8; 21] = "through the pointer '"
+        rt.buf_push_bytes(out, (&r2[0]) as u64, 21)
+        say_name(e, out, vec_at[u32](&(*e).f_rname, k))
+        rt.buf_push(out, 39 as u8)
+        return
+    }
+    if route == R_FOREIGN {
+        var r3: [u8; 53] = "through a pointer that does not point into this frame"
+        rt.buf_push_bytes(out, (&r3[0]) as u64, 53)
+        return
+    }
+    if route == R_CALL {
+        var r4: [u8; 6] = "into '"
+        rt.buf_push_bytes(out, (&r4[0]) as u64, 6)
+        say_name(e, out, vec_at[u32](&(*e).f_rname, k))
+        var r5: [u8; 28] = "', which keeps its argument "
+        rt.buf_push_bytes(out, (&r5[0]) as u64, 28)
+        rt.buf_push_dec_u64(out, vec_at[u32](&(*e).f_rarg, k) as u64)
+        return
+    }
+    var r6: [u8; 17] = "into a new thread"
+    rt.buf_push_bytes(out, (&r6[0]) as u64, 17)
+}
+
+fn build_note(e: *mut Esc, out: *mut rt.Buf, k: usize) {
+    let nm: u32 = vec_at[u32](&(*e).f_lname, k)
+    let who: u32 = vec_at[u32](&(*e).f_who, k)
+    rt.buf_push(out, 39 as u8)
+    rt.buf_push(out, 38 as u8)
+    rt.buf_push_bytes(out, intern.intern_ptr(names(e), nm), intern.intern_length(names(e), nm))
+    var n1: [u8; 5] = "' at "
+    rt.buf_push_bytes(out, (&n1[0]) as u64, 5)
+    say_pos(out, vec_at[u64](&(*e).f_ltake, k))
+    var n2: [u8; 27] = " points into the frame of '"
+    rt.buf_push_bytes(out, (&n2[0]) as u64, 27)
+    say_name(e, out, who)
+    var n3: [u8; 4] = "'; '"
+    rt.buf_push_bytes(out, (&n3[0]) as u64, 4)
+    rt.buf_push_bytes(out, intern.intern_ptr(names(e), nm), intern.intern_length(names(e), nm))
+    var n4: [u8; 17] = "' is declared at "
+    rt.buf_push_bytes(out, (&n4[0]) as u64, 17)
+    say_pos(out, vec_at[u64](&(*e).f_ldecl, k))
+    var n5: [u8; 13] = " and dies at "
+    rt.buf_push_bytes(out, (&n5[0]) as u64, 13)
+    say_pos(out, vec_at[u64](&(*e).f_fend, k))
+    var n6: [u8; 9] = ", where '"
+    rt.buf_push_bytes(out, (&n6[0]) as u64, 9)
+    say_name(e, out, who)
+    var n7: [u8; 9] = "' returns"
+    rt.buf_push_bytes(out, (&n7[0]) as u64, 9)
+}
+
+fn build_help(e: *mut Esc, out: *mut rt.Buf, k: usize) {
+    let route: u32 = vec_at[u32](&(*e).f_route, k)
+    let who: u32 = vec_at[u32](&(*e).f_who, k)
+    if route == R_RETURN {
+        var h1: [u8; 79] = "return the VALUE, or let the caller own the storage and pass a pointer in ('fn "
+        rt.buf_push_bytes(out, (&h1[0]) as u64, 79)
+        say_name(e, out, who)
+        var h2: [u8; 17] = "(out: *mut T)'); "
+        rt.buf_push_bytes(out, (&h2[0]) as u64, 17)
+        say_tail(e, out, who)
+        return
+    }
+    if route == R_PTR || route == R_FOREIGN {
+        var h3: [u8; 75] = "copy the value instead of its address, or put it on the GC heap with 'gc'; "
+        rt.buf_push_bytes(out, (&h3[0]) as u64, 75)
+        say_tail(e, out, who)
+        return
+    }
+    if route == R_CALL {
+        var h4: [u8; 6] = "give '"
+        rt.buf_push_bytes(out, (&h4[0]) as u64, 6)
+        say_name(e, out, vec_at[u32](&(*e).f_rname, k))
+        var h5: [u8; 74] = "' storage that outlives this frame -- the GC heap, or the caller's frame; "
+        rt.buf_push_bytes(out, (&h5[0]) as u64, 74)
+        say_tail(e, out, who)
+        return
+    }
+    var h6: [u8; 66] = "the thread outlives this frame: hand it storage from the GC heap; "
+    rt.buf_push_bytes(out, (&h6[0]) as u64, 66)
+    say_tail(e, out, who)
+}
+
+// The last sentence of every help text: where the way out stands.
+fn say_tail(e: *mut Esc, out: *mut rt.Buf, who: u32) {
+    var t1: [u8; 22] = "'#[allow_escape]' on '"
+    rt.buf_push_bytes(out, (&t1[0]) as u64, 22)
+    say_name(e, out, who)
+    var t2: [u8; 25] = "' switches this check off"
+    rt.buf_push_bytes(out, (&t2[0]) as u64, 25)
+}
+
+// ------------------------------------------------------------ the driver
+
+fn esc_empty() -> Esc {
+    return Esc {
+        sm: 0, mu: 0, it: 0,
+        sum_off: vec_new[u32](), sum: vec_new[u64](),
+        who: NOTHING, fend: 0, np: 0, poff: 0, found: vec_new[u64](),
+        lname: vec_new[u32](), ldecl: vec_new[u64](),
+        pcomp: vec_new[u32](), p_off: vec_new[u32](), p_len: vec_new[u32](),
+        t_mask: vec_new[u64](), t_lname: vec_new[u32](),
+        t_ldecl: vec_new[u64](), t_ltake: vec_new[u64](),
+        pbuf: vec_new[u32](),
+        f_pos: vec_new[u64](), f_lname: vec_new[u32](),
+        f_ldecl: vec_new[u64](), f_ltake: vec_new[u64](),
+        f_who: vec_new[u32](), f_fend: vec_new[u64](),
+        f_route: vec_new[u32](), f_rname: vec_new[u32](), f_rarg: vec_new[u32](),
+        report: false, depth: 0,
+    }
+}
+
+fn esc_free(e: *mut Esc) {
+    vec_free[u32](&(*e).sum_off)
+    vec_free[u64](&(*e).sum)
+    vec_free[u64](&(*e).found)
+    vec_free[u32](&(*e).lname)
+    vec_free[u64](&(*e).ldecl)
+    vec_free[u32](&(*e).pcomp)
+    vec_free[u32](&(*e).p_off)
+    vec_free[u32](&(*e).p_len)
+    vec_free[u64](&(*e).t_mask)
+    vec_free[u32](&(*e).t_lname)
+    vec_free[u64](&(*e).t_ldecl)
+    vec_free[u64](&(*e).t_ltake)
+    vec_free[u32](&(*e).pbuf)
+    vec_free[u64](&(*e).f_pos)
+    vec_free[u32](&(*e).f_lname)
+    vec_free[u64](&(*e).f_ldecl)
+    vec_free[u64](&(*e).f_ltake)
+    vec_free[u32](&(*e).f_who)
+    vec_free[u64](&(*e).f_fend)
+    vec_free[u32](&(*e).f_route)
+    vec_free[u32](&(*e).f_rname)
+    vec_free[u32](&(*e).f_rarg)
+}
+
+// Is this function left out? `extern fn` has no body here, a closure body is
+// checked nowhere (gap E4), and `#[allow_escape]` vouches for the whole
+// function -- its summary stays EMPTY, so no call of it is blamed for what
+// it does with the pointers it is given. Anything else would make the way
+// out useless: the author would silence the function and the caller would go
+// red instead.
+fn skipped(e: *mut Esc, fi: usize) -> bool {
+    let b: *mut ast.Tree = tree(e)
+    if ast.fn_extern(b, fi) != 0 {
+        return true
+    }
+    if ast.fn_esc(b, fi) != 0 {
+        return true
+    }
+    return is_closure(names(e), ast.fn_name(b, fi))
+}
+
+// One function: set the frame up, walk the body.
+fn run_fn(e: *mut Esc, fi: usize, report: bool) {
+    let b: *mut ast.Tree = tree(e)
+    (*e).who = ast.fn_name(b, fi)
+    (*e).fend = ast.fn_end(b, fi)
+    (*e).np = ast.fn_plen(b, fi)
+    (*e).poff = ast.fn_poff(b, fi)
+    (*e).report = report
+    (*e).depth = 0
+    vec_clear[u32](&(*e).lname)
+    vec_clear[u64](&(*e).ldecl)
+    marks_clear(e)
+    vec_clear[u32](&(*e).pcomp)
+    vec_clear[u64](&(*e).found)
+    var i: u32 = 0
+    while i < (*e).np {
+        vec_push[u64](&(*e).found, 0)
+        i = i + 1
+    }
+    // A parameter slot lies in the frame too, so `&p` points into it.
+    i = 0
+    while i < (*e).np {
+        declare(e, ast.param_name(b, (*e).poff + i), ast.param_pos(b, (*e).poff + i))
+        i = i + 1
+    }
+    collect_block(e, b, ast.fn_body(b, fi))
+    i = 0
+    while i < (*e).np {
+        vec_clear[u32](&(*e).pbuf)
+        vec_push[u32](&(*e).pbuf, ast.param_name(b, (*e).poff + i))
+        let off: u32 = push_pbuf(e)
+        write_local(e, off, 1, t_param(i))
+        i = i + 1
+    }
+    walk_block(e, ast.fn_body(b, fi))
+}
+
+// THE PASS. Returns the number of findings; the messages are already on
+// standard error by then.
+fn escape_check(sm: u64, mu: u64, it: u64) -> usize {
+    var e: Esc = esc_empty()
+    e.sm = sm
+    e.mu = mu
+    e.it = it
+    let b: *mut ast.Tree = tree(&e)
+
+    // --- the summaries, one u64 per parameter of every function
+    var total: usize = 0
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        vec_push[u32](&e.sum_off, total as u32)
+        total = total + ast.fn_plen(b, i) as usize
+        i = i + 1
+    }
+    i = 0
+    while i < total {
+        vec_push[u64](&e.sum, 0)
+        i = i + 1
+    }
+
+    // --- phase 1: to a fixed point. All functions of one round see the OLD
+    //     summaries, exactly as in the Rust twin, so the result does not
+    //     depend on the order.
+    var fresh_fn: Vec[u32] = vec_new[u32]()
+    var fresh_bits: Vec[u64] = vec_new[u64]()
+    var round: u32 = 0
+    while round < MAX_ROUNDS {
+        vec_clear[u32](&fresh_fn)
+        vec_clear[u64](&fresh_bits)
+        i = 0
+        while i < ast.fn_count(b) {
+            if !skipped(&e, i) {
+                run_fn(&e, i, false)
+                let off: u32 = sum_at(&e, i)
+                var differs: bool = false
+                var k: u32 = 0
+                while k < e.np {
+                    if vec_at[u64](&e.sum, (off + k) as usize) != vec_at[u64](&e.found, k as usize) {
+                        differs = true
+                    }
+                    k = k + 1
+                }
+                if differs {
+                    vec_push[u32](&fresh_fn, i as u32)
+                    k = 0
+                    while k < e.np {
+                        vec_push[u64](&fresh_bits, vec_at[u64](&e.found, k as usize))
+                        k = k + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if vec_len[u32](&fresh_fn) == 0 {
+            break
+        }
+        var w: usize = 0
+        var j: usize = 0
+        while j < vec_len[u32](&fresh_fn) {
+            let fi: usize = vec_at[u32](&fresh_fn, j) as usize
+            let off2: u32 = sum_at(&e, fi)
+            var k2: u32 = 0
+            while k2 < ast.fn_plen(b, fi) {
+                vec_set[u64](&e.sum, (off2 + k2) as usize, vec_at[u64](&fresh_bits, w))
+                w = w + 1
+                k2 = k2 + 1
+            }
+            j = j + 1
+        }
+        round = round + 1
+    }
+    vec_free[u32](&fresh_fn)
+    vec_free[u64](&fresh_bits)
+
+    // --- phase 2: the report
+    i = 0
+    while i < ast.fn_count(b) {
+        if !skipped(&e, i) {
+            run_fn(&e, i, true)
+        }
+        i = i + 1
+    }
+
+    sort_findings(&e)
+    let n: usize = vec_len[u64](&e.f_pos)
+    if n > 0 {
+        print_findings(&e)
+    }
+    esc_free(&e)
+    return n
+}
+
+// Sort by (file, line, column) and throw the duplicates out. The packed
+// position is built so that comparing it as a NUMBER gives exactly that
+// order (ast.pos_pack). Insertion sort, because it is stable -- the Rust
+// twin sorts stably too, and two findings at the same place have to come out
+// in the same order in both compilers.
+fn sort_findings(e: *mut Esc) {
+    var i: usize = 1
+    while i < vec_len[u64](&(*e).f_pos) {
+        var j: usize = i
+        while j > 0 && vec_at[u64](&(*e).f_pos, j - 1) > vec_at[u64](&(*e).f_pos, j) {
+            swap_findings(e, j - 1, j)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    // Duplicates: the same place and the same message.
+    i = 0
+    while i + 1 < vec_len[u64](&(*e).f_pos) {
+        if same_finding(e, i, i + 1) {
+            remove_finding(e, i + 1)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn same_finding(e: *mut Esc, a: usize, c: usize) -> bool {
+    if vec_at[u64](&(*e).f_pos, a) != vec_at[u64](&(*e).f_pos, c) {
+        return false
+    }
+    if vec_at[u32](&(*e).f_lname, a) != vec_at[u32](&(*e).f_lname, c) {
+        return false
+    }
+    if vec_at[u32](&(*e).f_route, a) != vec_at[u32](&(*e).f_route, c) {
+        return false
+    }
+    if vec_at[u32](&(*e).f_rname, a) != vec_at[u32](&(*e).f_rname, c) {
+        return false
+    }
+    return vec_at[u32](&(*e).f_rarg, a) == vec_at[u32](&(*e).f_rarg, c)
+}
+
+fn swap_findings(e: *mut Esc, a: usize, c: usize) {
+    vec_swap[u64](&(*e).f_pos, a, c)
+    vec_swap[u32](&(*e).f_lname, a, c)
+    vec_swap[u64](&(*e).f_ldecl, a, c)
+    vec_swap[u64](&(*e).f_ltake, a, c)
+    vec_swap[u32](&(*e).f_who, a, c)
+    vec_swap[u64](&(*e).f_fend, a, c)
+    vec_swap[u32](&(*e).f_route, a, c)
+    vec_swap[u32](&(*e).f_rname, a, c)
+    vec_swap[u32](&(*e).f_rarg, a, c)
+}
+
+fn remove_finding(e: *mut Esc, i: usize) {
+    vec_remove[u64](&(*e).f_pos, i)
+    vec_remove[u32](&(*e).f_lname, i)
+    vec_remove[u64](&(*e).f_ldecl, i)
+    vec_remove[u64](&(*e).f_ltake, i)
+    vec_remove[u32](&(*e).f_who, i)
+    vec_remove[u64](&(*e).f_fend, i)
+    vec_remove[u32](&(*e).f_route, i)
+    vec_remove[u32](&(*e).f_rname, i)
+    vec_remove[u32](&(*e).f_rarg, i)
+}
+
+// ------------------------------------------------------------- the output
+//
+// Through `diag.fi`, so that the rendering -- the arrow line, the source
+// line, the marker, `= note:` and `= help:` -- is the SAME code that the
+// lexer's messages go through, and therefore byte for byte the rendering of
+// `compiler/src/diag.rs`.
+//
+// The source texts are gone by this point: `bin/firnc1.fi` lexes every
+// module into ONE buffer that it reuses. So the files are read again here.
+// A finding is rare and a re-read costs nothing; keeping every source text
+// of a translation alive for a case that almost never happens would cost on
+// every build.
+fn print_findings(e: *mut Esc) {
+    let b: *mut ast.Tree = tree(e)
+    var d: diag.Diags = diag.diag_new()
+    // The sources, one heap block each -- a `Vec` of buffers would move its
+    // contents on growth and `diag.fi` keeps the POINTER.
+    var src_ptr: Vec[u64] = vec_new[u64]()
+    var src_len: Vec[u64] = vec_new[u64]()
+    var src_file: Vec[u32] = vec_new[u32]()
+    var src_nr: Vec[u32] = vec_new[u32]()
+    var msg: rt.Buf = rt.buf_new()
+    var note: rt.Buf = rt.buf_new()
+    var help: rt.Buf = rt.buf_new()
+    var path: rt.Buf = rt.buf_new()
+    var text: rt.Buf = rt.buf_new()
+
+    var i: usize = 0
+    while i < vec_len[u64](&(*e).f_pos) {
+        let pos: u64 = vec_at[u64](&(*e).f_pos, i)
+        let file: u32 = ast.pos_file(pos)
+        // Already registered?
+        var nr: u32 = NOTHING
+        var k: usize = 0
+        while k < vec_len[u32](&src_file) {
+            if vec_at[u32](&src_file, k) == file {
+                nr = vec_at[u32](&src_nr, k)
+            }
+            k = k + 1
+        }
+        if nr == NOTHING {
+            var fp: u64 = 0
+            var name_n: usize = 0
+            if (file as usize) < ast.file_count(b) {
+                fp = ast.file_ptr(b, file)
+                name_n = ast.file_length(b, file)
+            }
+            rt.buf_clear(&path)
+            rt.buf_push_bytes(&path, fp, name_n)
+            rt.buf_push(&path, 0 as u8)
+            rt.buf_clear(&text)
+            var sp: u64 = 0
+            var sn: usize = 0
+            if rt.read_file(rt.buf_ptr(&path), &text) {
+                sn = rt.buf_len(&text)
+                sp = rt.heap_alloc(sn + 1)
+                if sp != 0 {
+                    rt.mem_copy(sp, rt.buf_ptr(&text), sn)
+                } else {
+                    sn = 0
+                }
+            }
+            nr = diag.diag_file(&d, fp, name_n, sp, sn)
+            vec_push[u64](&src_ptr, sp)
+            vec_push[u64](&src_len, sn as u64)
+            vec_push[u32](&src_file, file)
+            vec_push[u32](&src_nr, nr)
+        }
+        rt.buf_clear(&msg)
+        rt.buf_clear(&note)
+        rt.buf_clear(&help)
+        build_msg(e, &msg, i)
+        build_note(e, &note, i)
+        build_help(e, &help, i)
+        diag.diag_error_note_help(&d, nr, ast.pos_line(pos), ast.pos_col(pos), 1,
+            rt.buf_ptr(&msg), rt.buf_len(&msg),
+            rt.buf_ptr(&note), rt.buf_len(&note),
+            rt.buf_ptr(&help), rt.buf_len(&help))
+        i = i + 1
+    }
+
+    var out: rt.Buf = rt.buf_new()
+    diag.diag_render(&d, &out)
+    rt.write_everything(2, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+
+    i = 0
+    while i < vec_len[u64](&src_ptr) {
+        let sp2: u64 = vec_at[u64](&src_ptr, i)
+        if sp2 != 0 {
+            rt.heap_free(sp2, vec_at[u64](&src_len, i) as usize + 1)
+        }
+        i = i + 1
+    }
+    vec_free[u64](&src_ptr)
+    vec_free[u64](&src_len)
+    vec_free[u32](&src_file)
+    vec_free[u32](&src_nr)
+    rt.buf_free(&msg)
+    rt.buf_free(&note)
+    rt.buf_free(&help)
+    rt.buf_free(&path)
+    rt.buf_free(&text)
+    diag.diag_free(&d)
+}

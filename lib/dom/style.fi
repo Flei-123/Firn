@@ -1,0 +1,324 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/dom/style.fi -- the STYLE TREE: from a DOM to one computed style per element.
+//
+// This is the third part of round B1 and the one that hangs the CSS onto
+// the tree. Everything it needs already existed and stood UNCONNECTED:
+// `lib/css/tok.fi` and `cv.fi` read a stylesheet, `sel.fi` matches
+// selectors against the DOM, `cascade.fi` resolves origin, specificity,
+// order and inheritance for ONE element. What was missing is the piece
+// that walks a document and lets those three do their work for EVERY
+// element -- including the two sources a browser has and a test harness
+// does not hand in:
+//
+//   1. THE DEFAULT STYLESHEET (lib/dom/ua.css, built in as ua_data.fi).
+//      Without it `div` is not `display: block` and every computed style
+//      is a lie.
+//   2. THE `<style>` ELEMENTS OF THE DOCUMENT ITSELF, in document order,
+//      as origin AUTHOR. That is where `order of appearance` comes from.
+//   3. The `style=` attribute per element, which cascade.fi already takes
+//      as `cascade_elem_inline`.
+//
+// THE ORDER OF THE WALK IS THE POINT: inheritance and `em` need the
+// computed style OF THE PARENT. The walk is in document order, so the
+// parent is always finished before its children -- exactly once per
+// element, no second pass.
+//
+// WHERE A `Styler` HAS TO LIE: in the FRAME of the caller, as a `var`. It
+// holds `Gc[...]` fields (the rule list, the style table); the stack scan
+// of the collector is conservative (SPEC 3.5.3) and finds them there
+// without registering. On the heap they would be invisible.
+
+import html.mem
+import browser.node
+import browser.names
+import browser.tag
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+import dom.api
+import dom.ua_data
+
+export {
+    Styler,
+    styler_new, styler_init, styler_free, styler_reset,
+    styler_ctx, styler_rules, styler_count,
+    style_add_sheet, style_add_ua, style_document, style_of, style_root_of,
+    styler_set_hover,
+}
+
+struct Styler {
+    // The Gc fields -- they are the reason a `Styler` belongs in a frame.
+    rules: Gc[Rule],
+    styles: Gc[GcMap],
+    root: Gc[Style],
+
+    t: tok.Tokens,
+    cx: sel.Ctx,
+    w: cascade.Winner,
+    text: mem.CpBuf,
+    tmp: mem.CpBuf,
+    order: u32,
+    count: u64,
+    ua_done: bool,
+}
+
+fn styler_new(nm: *mut names.Names) -> Styler {
+    return Styler {
+        rules: gc_null[Rule](),
+        styles: gc_null[GcMap](),
+        root: gc_null[Style](),
+        t: tok.tokens_new(),
+        cx: sel.ctx_new(nm),
+        w: cascade.winner_new(),
+        text: mem.cp_new(),
+        tmp: mem.cp_new(),
+        order: 0,
+        count: 0,
+        ua_done: false,
+    }
+}
+
+// ONCE before the first document.
+fn styler_init(s: *mut Styler) {
+    tok.tokens_init(&(*s).t)
+    sel.ctx_init(&(*s).cx)
+    mem.cp_init(&(*s).text)
+    mem.cp_init(&(*s).tmp)
+    (*s).rules = gc_null[Rule]()
+    (*s).styles = gc_null[GcMap]()
+    (*s).root = gc_null[Style]()
+    (*s).order = 0
+    (*s).count = 0
+    (*s).ua_done = false
+}
+
+fn styler_free(s: *mut Styler) {
+    sel.ctx_free(&(*s).cx)
+    mem.cp_free(&(*s).text)
+    mem.cp_free(&(*s).tmp)
+    (*s).rules = gc_null[Rule]()
+    (*s).styles = gc_null[GcMap]()
+    (*s).root = gc_null[Style]()
+}
+
+// Throws the rules and the style table away -- the next document starts
+// from nothing. Without this the collector would keep holding the last
+// tree through the style table.
+fn styler_reset(s: *mut Styler) {
+    (*s).rules = gc_null[Rule]()
+    (*s).styles = gc_null[GcMap]()
+    (*s).root = gc_null[Style]()
+    (*s).order = 0
+    (*s).count = 0
+    (*s).ua_done = false
+    sel.ctx_set_hover(&(*s).cx, gc_null[Node]())
+}
+
+fn styler_ctx(s: *mut Styler) -> *mut sel.Ctx {
+    return &(*s).cx
+}
+
+fn styler_rules(s: *mut Styler) -> Gc[Rule] {
+    return (*s).rules
+}
+
+fn styler_count(s: *mut Styler) -> u64 {
+    return (*s).count
+}
+
+fn styler_set_hover(s: *mut Styler, k: Gc[Node]) {
+    sel.ctx_set_hover(&(*s).cx, k)
+}
+
+fn chain_last(r: Gc[Rule]) -> Gc[Rule] {
+    var x: Gc[Rule] = r
+    while x != gc_null[Rule]() && x.next != gc_null[Rule]() {
+        x = x.next
+    }
+    return x
+}
+
+// Adds a stylesheet that lies as CODE POINTS in `(*s).text`.
+fn add_parsed(s: *mut Styler, origin: u32,
+    nm: *mut names.Names) -> AllocError!bool {
+    tok.tokenize(&(*s).t, &(*s).text)
+    var p: cv.Parser = cv.parser_new(&(*s).t)
+    let sheet = try cv.parse_stylesheet(&p)
+    var next_order: u32 = (*s).order
+    let part = try cascade.collect_rules(sheet, origin, next_order, nm,
+        &(*s).tmp, &next_order)
+    (*s).order = next_order
+    if part == gc_null[Rule]() {
+        return true
+    }
+    if (*s).rules == gc_null[Rule]() {
+        (*s).rules = part
+    } else {
+        let last: Gc[Rule] = chain_last((*s).rules)
+        last.next = part
+    }
+    return true
+}
+
+// The DEFAULT STYLESHEET. It must be the FIRST sheet: the cascade sorts by
+// origin first, but the order of appearance decides between two rules of
+// the same origin and specificity, and the user agent origin has to start
+// at 0.
+fn style_add_ua(s: *mut Styler, nm: *mut names.Names) -> AllocError!bool {
+    if (*s).ua_done {
+        return true
+    }
+    var raw: mem.Buf = mem.buf_new()
+    mem.buf_init(&raw)
+    ua_data.ua_bytes(&raw)
+    mem.cp_clear(&(*s).text)
+    var i: usize = 0
+    let n: usize = mem.buf_len(&raw)
+    while i < n {
+        // The default stylesheet is pure ASCII -- the generator refuses
+        // anything else, so byte and code point are the same thing here.
+        mem.cp_push(&(*s).text, mem.buf_at(&raw, i) as u32)
+        i = i + 1
+    }
+    mem.buf_free(&raw)
+    let ok: bool = try add_parsed(s, cascade.ORIGIN_UA, nm)
+    (*s).ua_done = true
+    return ok
+}
+
+// A stylesheet out of a byte buffer (WTF-8), for a user or author sheet
+// that does not stand in the document.
+fn style_add_sheet(s: *mut Styler, origin: u32, p: *mut u8, n: usize,
+    nm: *mut names.Names) -> AllocError!bool {
+    mem.cp_clear(&(*s).text)
+    var i: usize = 0
+    while i < n {
+        let c0: u32 = (*((p as u64 + i as u64) as *mut u8)) as u32
+        if c0 < 0x80 as u32 {
+            mem.cp_push(&(*s).text, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 {
+            mem.cp_push(&(*s).text, ((c0 & 0x07 as u32) << 18) |
+                ((byte_at(p, n, i + 1) & 0x3F as u32) << 12) |
+                ((byte_at(p, n, i + 2) & 0x3F as u32) << 6) |
+                (byte_at(p, n, i + 3) & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 {
+            mem.cp_push(&(*s).text, ((c0 & 0x0F as u32) << 12) |
+                ((byte_at(p, n, i + 1) & 0x3F as u32) << 6) |
+                (byte_at(p, n, i + 2) & 0x3F as u32))
+            i = i + 3
+        } else {
+            mem.cp_push(&(*s).text, ((c0 & 0x1F as u32) << 6) |
+                (byte_at(p, n, i + 1) & 0x3F as u32))
+            i = i + 2
+        }
+    }
+    return try add_parsed(s, origin, nm)
+}
+
+#[no_gc]
+fn byte_at(p: *mut u8, n: usize, i: usize) -> u32 {
+    if i >= n {
+        return 0
+    }
+    return (*((p as u64 + i as u64) as *mut u8)) as u32
+}
+
+// The `<style>` elements of the document, in document order, as AUTHOR.
+fn add_document_sheets(s: *mut Styler, doc: Gc[Node],
+    nm: *mut names.Names) -> AllocError!bool {
+    var e: Gc[Elem] = api.dom_first_elem(doc)
+    while e != gc_null[Elem]() {
+        if e.ns == node.NS_HTML && e.name == tag.M_STYLE {
+            let text = try api.dom_text_content(e)
+            mem.cp_clear(&(*s).text)
+            node.chain_after_cpbuf(text, &(*s).text)
+            let ok: bool = try add_parsed(s, cascade.ORIGIN_AUTHOR, nm)
+        }
+        e = api.dom_next_elem(e, doc)
+    }
+    return true
+}
+
+// The declarations of the `style` attribute of an element, or null.
+fn inline_declarations(s: *mut Styler, e: Gc[Elem],
+    style_attr: u32) -> AllocError!Gc[GcVec] {
+    let v: Gc[Chain] = node.attr_value(e, style_attr, 0)
+    if v == gc_null[Chain]() || node.chain_len(v) == 0 {
+        return gc_null[GcVec]()
+    }
+    mem.cp_clear(&(*s).text)
+    node.chain_after_cpbuf(v, &(*s).text)
+    tok.tokenize(&(*s).t, &(*s).text)
+    var p: cv.Parser = cv.parser_new(&(*s).t)
+    let values = try cv.parse_component_value_list(&p)
+    return try cascade.parse_inline_declarations(values)
+}
+
+// THE WHOLE STEP: default stylesheet, the sheets of the document, then one
+// computed style per element. `false` = out of memory.
+fn style_document(s: *mut Styler, doc: Gc[Node],
+    nm: *mut names.Names) -> bool {
+    let ua: bool = style_add_ua(s, nm) catch false
+    if !ua {
+        return false
+    }
+    let own: bool = add_document_sheets(s, doc, nm) catch false
+    if !own {
+        return false
+    }
+    (*s).styles = gcmap_new(true, true) catch gc_null[GcMap]()
+    if (*s).styles == gc_null[GcMap]() {
+        return false
+    }
+    (*s).root = cascade.style_root() catch gc_null[Style]()
+    if (*s).root == gc_null[Style]() {
+        return false
+    }
+    var style_attr: u32 = 0
+    var lit_style: [u8; 5] = "style"
+    style_attr = names.names_of_bytes(nm, &lit_style[0], 5)
+    (*s).count = 0
+    var e: Gc[Elem] = api.dom_first_elem(doc)
+    while e != gc_null[Elem]() {
+        // The style of the parent is already there -- document order.
+        var parent_style: Gc[Style] = (*s).root
+        let parent: Gc[Node] = e.parent
+        if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+            let found: Gc[Style] = gcmap_get_value[Style]((*s).styles, parent as u64)
+            if found != gc_null[Style]() {
+                parent_style = found
+            }
+        }
+        let inline = inline_declarations(s, e, style_attr) catch gc_null[GcVec]()
+        let computed = cascade.cascade_elem_inline((*s).rules, e, parent_style,
+            &(*s).cx, &(*s).w, inline) catch gc_null[Style]()
+        if computed == gc_null[Style]() {
+            return false
+        }
+        let ok: bool = gcmap_set_value[Style]((*s).styles, e as u64, computed)
+        catch false
+        if !ok {
+            return false
+        }
+        (*s).count = (*s).count + 1
+        e = api.dom_next_elem(e, doc)
+    }
+    return true
+}
+
+// The computed style of an element, or null if it has none.
+fn style_of(s: *mut Styler, k: Gc[Node]) -> Gc[Style] {
+    if (*s).styles == gc_null[GcMap]() || k == gc_null[Node]() {
+        return gc_null[Style]()
+    }
+    return gcmap_get_value[Style]((*s).styles, k as u64)
+}
+
+// The style of the initial containing block -- the parent of the root
+// element in the inheritance.
+fn style_root_of(s: *mut Styler) -> Gc[Style] {
+    return (*s).root
+}

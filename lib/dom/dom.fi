@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/dom/dom.fi -- the DOM prototype in Firn (acceptance point 2, PLAN.md 3).
+//
+// THE PURPOSE: the proof that the chosen memory model (the opt-in tracing
+// GC, SPEC 3.5) carries exactly what a reference count fails at -- the
+// CYCLIC object graph of a DOM. Every kind of cycle built here really does
+// occur in a real browser engine:
+//
+//   1. node <-> child      parent AND child pointers, both STRONG; the
+//                          children list is a `GcVec` (round 53).
+//   2. Element extends Node  inheritance with attributes as a `GcMap` whose
+//                          VALUES themselves lie on the GC heap.
+//   3. node <-> listener   The node holds its listeners in a `GcVec`, and
+//                          every listener holds its node (Gecko had to
+//                          retrofit a cycle collector for that).
+//   4. collection -> root  A live `HTMLCollection` holds its root node.
+//   5. observer -> GcWeak  Does NOT keep its target alive (a counter check).
+//   6. node <-> wrapper    The simulated JS wrapper holds the node, and the
+//                          node holds the wrapper.
+//
+// A reference count NEVER releases in 1, 3 and 6. The proof that Firn
+// dissolves them stands in tests/560_dom_cycles.fi and in the endurance run
+// lib/dom/soak_gc.fi (the measurement: tools/dom_soak/run.sh).
+//
+// ---------------------------------------------------------------- Round 53
+//
+// Up to round 52 this said: "stage 0 has no collections of variable length.
+// Therefore: the children list as a singly linked sibling chain, a fixed
+// number of attributes." Both are gone. The tree now uses
+//
+//     children: GcVec[Gc[Node]]        (SPEC 3.5.2)
+//     listener: GcVec[Gc[Listener]]
+//     attrs:    GcMap[Atom, Gc[Str]]
+//
+// and with that the cycles 1, 2 and 3 run OVER COLLECTIONS -- exactly the
+// case `SPEC.md` 3.5.2 describes as the DOM foundation and which the
+// collector has been able to collect since round 53. The collections are
+// created ONLY ON DEMAND: a leaf node without attributes and without
+// listeners still costs exactly one object, and in a DOM that is the most
+// frequent node of all.
+// Stage 0 still has no methods -- instead of `parent.children.push(child)`
+// this says `dom_append_child(parent, child)`.
+
+export {
+    Node, Elem, Listener, Collection, Wrapper, Observer, Str,
+    DOM_KIND_NODE, DOM_KIND_ELEM, DOM_KIND_TEXT,
+    DOM_OBJECTS_PER_SET,
+    dom_node_new, dom_elem_new,
+    dom_append_child, dom_children_count, dom_child, dom_remove_child,
+    dom_listener_append, dom_listener_count, dom_listener,
+    dom_collection_new, dom_collection_refresh, dom_wrapper_append,
+    dom_observer_new,
+    dom_attr_set, dom_attr_read, dom_attr_remove,
+    dom_attr_number,
+    dom_cycle_build, dom_cycle_discard, dom_scrub_deep,
+    dom_self_test, dom_observer_test, dom_observer_lives, dom_observer_create
+}
+
+// ------------------------------------------------------------- The classes
+
+// A node holds its parent STRONGLY. That makes the cycle real and not
+// defined away with `GcWeak` -- and that is exactly the point of the proof.
+gc class Node {
+    parent: Gc[Node],
+    children: GcVec[Gc[Node]],
+    listener: GcVec[Gc[Listener]],
+    wrapper: Gc[Wrapper],
+    id: u32,
+    kind: u32,
+}
+
+// The prefix layout (SPEC 4.4): the inherited fields lie in front, which is
+// why every `Gc[Element]` is a `Gc[Node]` for free.
+gc class Elem extends Node {
+    attrs: GcMap[u32, Gc[Str]],
+}
+
+// The attribute value lies on the GC heap -- otherwise the value column of
+// the `GcMap` would be a mere number with nothing for the collector to trace.
+gc class Str {
+    id: u32,
+    length: u32,
+}
+
+gc class Listener {
+    target: Gc[Node],
+    ty: u32,
+}
+
+gc class Collection {
+    root: Gc[Node],
+    length: u32,
+}
+
+gc class Wrapper {
+    node: Gc[Node],
+    id: u32,
+}
+
+// The observer holds its target WEAKLY -- it must not keep it alive.
+gc class Observer {
+    target: GcWeak[Node],
+    hit: u32,
+}
+
+const DOM_KIND_NODE: u32 = 1
+const DOM_KIND_ELEM: u32 = 2
+const DOM_KIND_TEXT: u32 = 3
+
+// One set from dom_cycle_build(), object by object:
+//   1  the root element
+//   3  the attribute table (GcMap) + its slot buffer + a Str as a value
+//   3  child nodes
+//   2  the children list (GcVec) + its slot buffer
+//   3  listeners + the listener list (GcVec) + its slot buffer
+//   1  a collection
+//   1  a wrapper
+// Before round 53 it was 7 -- the collections cost the difference, and that
+// is exactly the price for the tree being allowed to get arbitrarily wide.
+const DOM_OBJECTS_PER_SET: u64 = 14
+
+// ---------------------------------------------------------------- Creation
+
+fn dom_node_new(id: u32, kind: u32) -> AllocError!Gc[Node] {
+    return try gc Node {
+        parent: gc_null[Node](),
+        children: gc_null[GcVec](),
+        listener: gc_null[GcVec](),
+        wrapper: gc_null[Wrapper](),
+        id: id,
+        kind: kind,
+    }
+}
+
+fn dom_elem_new(id: u32) -> AllocError!Gc[Elem] {
+    return try gc Elem {
+        parent: gc_null[Node](),
+        children: gc_null[GcVec](),
+        listener: gc_null[GcVec](),
+        wrapper: gc_null[Wrapper](),
+        id: id,
+        kind: DOM_KIND_ELEM,
+        attrs: gc_null[GcMap](),
+    }
+}
+
+// ------------------------------------------------------ The tree structure
+
+// Appends `child` to `parent` -- BOTH directions strong. That is cycle 1,
+// and it now runs over a `GcVec`: parent -> GcVec -> child -> parent.
+//
+// The children list comes into being at the FIRST child. A leaf thereby
+// stays as cheap as before.
+fn dom_append_child(parent: Gc[Node], kind: Gc[Node]) -> AllocError!bool {
+    if parent.children == gc_null[GcVec]() {
+        parent.children = try gcvec_new()
+    }
+    if !(try gcvec_append[Node](parent.children, kind)) {
+        return false
+    }
+    kind.parent = parent
+    return true
+}
+
+fn dom_children_count(parent: Gc[Node]) -> u32 {
+    if parent.children == gc_null[GcVec]() {
+        return 0
+    }
+    return gcvec_length(parent.children) as u32
+}
+
+fn dom_child(parent: Gc[Node], i: u64) -> Gc[Node] {
+    if parent.children == gc_null[GcVec]() {
+        return gc_null[Node]()
+    }
+    return gcvec_read[Node](parent.children, i)
+}
+
+// `removeChild`: the order of the siblings is preserved, and the back
+// reference is dropped -- otherwise the child keeps holding its old parent.
+fn dom_remove_child(parent: Gc[Node], i: u64) -> bool {
+    if parent.children == gc_null[GcVec]() {
+        return false
+    }
+    let k: Gc[Node] = gcvec_read[Node](parent.children, i)
+    if k == gc_null[Node]() {
+        return false
+    }
+    if !gcvec_remove(parent.children, i) {
+        return false
+    }
+    k.parent = gc_null[Node]()
+    return true
+}
+
+// Cycle 3: the node holds its listeners in a `GcVec`, and every listener
+// holds its node back.
+fn dom_listener_append(node: Gc[Node], ty: u32) -> AllocError!Gc[Listener] {
+    if node.listener == gc_null[GcVec]() {
+        node.listener = try gcvec_new()
+    }
+    let l: Gc[Listener] = try gc Listener { target: node, ty: ty }
+    if !(try gcvec_append[Listener](node.listener, l)) {
+        return gc_null[Listener]()
+    }
+    return l
+}
+
+fn dom_listener_count(node: Gc[Node]) -> u32 {
+    if node.listener == gc_null[GcVec]() {
+        return 0
+    }
+    return gcvec_length(node.listener) as u32
+}
+
+fn dom_listener(node: Gc[Node], i: u64) -> Gc[Listener] {
+    if node.listener == gc_null[GcVec]() {
+        return gc_null[Listener]()
+    }
+    return gcvec_read[Listener](node.listener, i)
+}
+
+// Cycle 4: a live collection holds its root.
+fn dom_collection_new(root: Gc[Node]) -> AllocError!Gc[Collection] {
+    return try gc Collection { root: root, length: 0 }
+}
+
+fn dom_collection_refresh(s: Gc[Collection]) -> u32 {
+    let n: u32 = dom_children_count(s.root)
+    s.length = n
+    return n
+}
+
+// Cycle 6: JS wrapper <-> node.
+fn dom_wrapper_append(node: Gc[Node], id: u32) -> AllocError!Gc[Wrapper] {
+    let w = try gc Wrapper { node: node, id: id }
+    node.wrapper = w
+    return w
+}
+
+// Counter check 5: a weak reference, it does NOT hold the target.
+fn dom_observer_new(target: Gc[Node]) -> AllocError!Gc[Observer] {
+    return try gc Observer { target: weak(target), hit: 0 }
+}
+
+// -------------------------------------------------------------- Attributes
+//
+// `attrs: GcMap[Atom, Gc[Str]]` (SPEC 3.5.2). The key is the atom id, the
+// value an object on the GC heap. The ids 0 and 1 are reserved
+// (GCMAP_EMPTY/GCMAP_TOMBSTONE); 0 already meant "not present"
+// before that.
+
+fn dom_attr_set(e: Gc[Elem], name: u32, value: u32) -> AllocError!bool {
+    if name < 2 {
+        return false
+    }
+    if e.attrs == gc_null[GcMap]() {
+        e.attrs = try gcmap_new(false, true)
+    }
+    let s: Gc[Str] = try gc Str { id: value, length: 0 }
+    return try gcmap_set_value[Str](e.attrs, name as u64, s)
+}
+
+// 0 = not present (the atom id 0 is reserved).
+fn dom_attr_read(e: Gc[Elem], name: u32) -> u32 {
+    if e.attrs == gc_null[GcMap]() {
+        return 0
+    }
+    let s: Gc[Str] = gcmap_get_value[Str](e.attrs, name as u64)
+    if s == gc_null[Str]() {
+        return 0
+    }
+    return s.id
+}
+
+fn dom_attr_remove(e: Gc[Elem], name: u32) -> bool {
+    if e.attrs == gc_null[GcMap]() {
+        return false
+    }
+    return gcmap_remove(e.attrs, name as u64)
+}
+
+fn dom_attr_number(e: Gc[Elem]) -> u32 {
+    if e.attrs == gc_null[GcMap]() {
+        return 0
+    }
+    return gcmap_size(e.attrs) as u32
+}
+
+// --------------------------------------------------- The endurance run set
+
+// Builds ONE complete set of cycles (kinds 1, 2, 3, 4 and 6) and returns
+// the number of objects created while doing so.
+//
+// AN HONEST NOTE: stage 0 has no global variables. The set therefore hangs
+// exclusively on the frame cells of THIS function and is unreachable once it
+// returns -- which is exactly what the endurance run wants. A reference
+// count would release nothing here (the child holds the parent, the parent
+// holds its GcVec, the GcVec holds the child; the listener holds the node,
+// the node holds its listener list).
+fn dom_cycle_build() -> AllocError!u64 {
+    let w = try dom_elem_new(1)
+    let root: Gc[Node] = w
+    if !(try dom_attr_set(w, 7, 42)) {
+        return 0
+    }
+
+    var i: u32 = 0
+    while i < 3 {
+        let k = try dom_node_new(100 + i, DOM_KIND_TEXT)
+        if !(try dom_append_child(root, k)) {
+            return 0
+        }
+        // Check the back reference, so that the cycle does not get optimized away.
+        if k.parent != root {
+            return 0
+        }
+        i = i + 1
+    }
+
+    let l = try dom_listener_append(root, 5)
+    if l.target != root {
+        return 0
+    }
+    let s = try dom_collection_new(root)
+    if dom_collection_refresh(s) != 3 {
+        return 0
+    }
+    let wr = try dom_wrapper_append(root, 9)
+    if wr.node != root {
+        return 0
+    }
+    return DOM_OBJECTS_PER_SET
+}
+
+// Lets the set built last become unreachable for certain.
+//
+// The set is already unreachable once `dom_cycle_build()` has returned;
+// what can remain are OLD POINTERS in abandoned stack frames.
+// The stack scan of the collector is conservative (SPEC 3.5.3) -- such an
+// old pointer keeps a long dead object alive. This function lays a deep
+// frame filled with zeros over exactly that area. That is the honest price
+// of the conservative scan, paid here instead of kept quiet.
+fn dom_cycle_discard() {
+    dom_scrub_deep(3)
+}
+
+// The self call is deliberate and no gimmick: a recursive function is NEVER
+// inlined (compiler/src/inline.rs). Only that way do the nulled frames
+// really lie BELOW the caller -- inlined they would be part of its own,
+// LIVE frame and would clean nothing at all.
+// The runtime in lib/gc/gc.fi uses the same build (`__gc_scrub_deep`).
+fn dom_scrub_deep(n: u64) {
+    var buffer: [u64; 512] = [0; 512]
+    var i: usize = 0
+    while i < 512 {
+        buffer[i] = 0
+        i = i + 1
+    }
+    barrier(&buffer)
+    if n > 0 {
+        dom_scrub_deep(n - 1)
+    }
+}
+
+// ----------------------------------------------------------- The self test
+
+// Checks every kind of cycle separately. 0 = everything is fine, otherwise an error code.
+fn dom_self_test() -> i32 {
+    // --- kind 1: parent <-> child over a GcVec, both strong
+    let e = dom_elem_new(1) catch gc_null[Elem]()
+    if e == gc_null[Elem]() {
+        return 1
+    }
+    let root: Gc[Node] = e
+    let k1 = dom_node_new(11, DOM_KIND_TEXT) catch gc_null[Node]()
+    let k2 = dom_node_new(12, DOM_KIND_TEXT) catch gc_null[Node]()
+    if k1 == gc_null[Node]() || k2 == gc_null[Node]() {
+        return 2
+    }
+    if !(dom_append_child(root, k1) catch false) {
+        return 3
+    }
+    if !(dom_append_child(root, k2) catch false) {
+        return 3
+    }
+    if dom_child(root, 0) != k1 || dom_child(root, 1) != k2 {
+        return 3
+    }
+    if k1.parent != root || k2.parent != root {
+        return 4
+    }
+    if dom_child(k1.parent, 0) != k1 {
+        return 5
+    }
+    if dom_children_count(root) != 2 {
+        return 6
+    }
+
+    // --- kind 2: inheritance and attributes in a GcMap
+    if !(dom_attr_set(e, 7, 42) catch false) {
+        return 7
+    }
+    if !(dom_attr_set(e, 8, 43) catch false) {
+        return 8
+    }
+    if dom_attr_read(e, 7) != 42 || dom_attr_read(e, 8) != 43 {
+        return 9
+    }
+    if dom_attr_read(e, 99) != 0 {
+        return 10
+    }
+    // The number of attributes is no longer limited to four.
+    var a: u32 = 10
+    while a < 200 {
+        if !(dom_attr_set(e, a, a * 2) catch false) {
+            return 24
+        }
+        a = a + 1
+    }
+    if dom_attr_number(e) != 192 {
+        return 25
+    }
+    if dom_attr_read(e, 150) != 300 {
+        return 26
+    }
+    if !dom_attr_remove(e, 150) {
+        return 27
+    }
+    if dom_attr_read(e, 150) != 0 || dom_attr_number(e) != 191 {
+        return 28
+    }
+    // An upcast is free, a downcast is only checked.
+    if root.as?[Elem] == gc_null[Elem]() {
+        return 11
+    }
+    if k1.as?[Elem] != gc_null[Elem]() {
+        return 12
+    }
+
+    // --- kind 3: node <-> listener over a GcVec
+    let l = dom_listener_append(root, 5) catch gc_null[Listener]()
+    if l == gc_null[Listener]() {
+        return 13
+    }
+    if dom_listener(root, 0) != l || l.target != root {
+        return 14
+    }
+    if dom_listener(dom_listener(root, 0).target, 0) != l {
+        return 15
+    }
+
+    // --- kind 4: a collection holds its root
+    let s = dom_collection_new(root) catch gc_null[Collection]()
+    if s == gc_null[Collection]() {
+        return 16
+    }
+    if dom_collection_refresh(s) != 2 || s.root != root {
+        return 17
+    }
+
+    // --- kind 6: node <-> JS wrapper
+    let w = dom_wrapper_append(root, 9) catch gc_null[Wrapper]()
+    if w == gc_null[Wrapper]() {
+        return 18
+    }
+    if root.wrapper != w || w.node != root {
+        return 19
+    }
+
+    // A collection run in the middle of operation must not take away anything
+    // reachable -- not out of the collections either.
+    let before: u64 = gc_collections()
+    gc_collect()
+    if gc_collections() != before + 1 {
+        return 20
+    }
+    if dom_listener(root, 0).target != root || w.node.wrapper != w {
+        return 21
+    }
+    if dom_children_count(root) != 2 {
+        return 22
+    }
+    if dom_attr_read(e, 7) != 42 {
+        return 23
+    }
+
+    // --- rebuilding the tree: removeChild drops the back reference
+    if !dom_remove_child(root, 0) {
+        return 29
+    }
+    if dom_children_count(root) != 1 {
+        return 30
+    }
+    if dom_child(root, 0) != k2 {
+        return 31
+    }
+    if k1.parent != gc_null[Node]() {
+        return 32
+    }
+
+    // --- width: 5000 children on ONE node. Exactly that was not possible
+    // before round 53 (a fixed number of attributes, a linked list without an index).
+    let wide = dom_elem_new(2) catch gc_null[Elem]()
+    if wide == gc_null[Elem]() {
+        return 33
+    }
+    let bw: Gc[Node] = wide
+    var i: u32 = 0
+    while i < 5000 {
+        let k = dom_node_new(1000 + i, DOM_KIND_TEXT) catch gc_null[Node]()
+        if k == gc_null[Node]() {
+            return 34
+        }
+        if !(dom_append_child(bw, k) catch false) {
+            return 35
+        }
+        i = i + 1
+    }
+    gc_collect()
+    gc_collect()
+    if dom_children_count(bw) != 5000 {
+        return 36
+    }
+    var j: u64 = 0
+    while j < 5000 {
+        let k: Gc[Node] = dom_child(bw, j)
+        if k == gc_null[Node]() {
+            return 37
+        }
+        if k.id != 1000 + j as u32 {
+            return 38
+        }
+        if k.parent != bw {
+            return 39
+        }
+        j = j + 1
+    }
+
+    return 0
+}
+
+// --- kind 5: an observer over GcWeak does NOT hold its target.
+//
+// DELIBERATELY A FUNCTION OF ITS OWN, and that is the interesting part of
+// the proof: the stack scan is CONSERVATIVE (SPEC 3.5.3). If this check
+// stood in the body of `dom_self_test`, an old copy of the strong pointer
+// would still lie there in a frame cell of that LIVE function -- and a
+// conservative collector has to treat such a cell as a root. The target
+// would then survive, and the test would measure a property the language
+// does not promise at all.
+//
+// Measured: that is exactly how it behaves. With `--no-pass=inline` the
+// check passes in the body of `dom_self_test` too, with inlining it does not
+// -- the inlined cells become part of the live frame. That is why it stands
+// here, with a shallow caller and without further live Gc values.
+//
+// 0 = the target that was only observed weakly has been collected.
+fn dom_observer_test() -> i32 {
+    var beo: Gc[Observer] = gc_null[Observer]()
+    let rc: i32 = dom_observer_create(&beo)
+    if rc != 0 {
+        return rc
+    }
+    if beo == gc_null[Observer]() {
+        return 4
+    }
+    // As long as the strong pointer lived in the frame of `dom_observer_create`,
+    // the target was reachable; now it hangs on the weak reference only.
+    if !dom_observer_lives(beo, 1) {
+        return 5
+    }
+    dom_cycle_discard()
+    // Round 49: clean the dead frames first, then collect -- otherwise a bit
+    // pattern in a frame slot that was not overwritten keeps the target alive,
+    // and the test measures the frame layout instead of the weak
+    // reference (gc.fi::gc_stack_clean).
+    gc_stack_clean()
+    gc_collect()
+    if dom_observer_lives(beo, 1) {
+        return 6
+    }
+    // The observer itself lives on -- only its target is gone.
+    if beo.hit != 0 {
+        return 7
+    }
+    return 0
+}
+
+// Is the target of the observer still alive? The answer is a `bool` -- and
+// that is no cosmetics: if a `Gc[Node]` were returned here, the strong
+// pointer would lie in a frame cell of the LIVE caller, and the conservative
+// scan would have to treat it as a root. The question would change its own
+// answer. Measured: with `strong(b.target)` right in the caller the check
+// fails under `--no-opt`, while with this version it passes in all
+// three build stages.
+//
+// The self call keeps the function out of the inliner (inline.rs) --
+// inlined, the strong pointer would lie in the live frame again.
+fn dom_observer_lives(b: Gc[Observer], depth: u64) -> bool {
+    if depth > 0 {
+        return dom_observer_lives(b, depth - 1)
+    }
+    return strong(b.target) != gc_null[Node]()
+}
+
+// Creates a target that is observed WEAKLY only: the strong pointer lives
+// exclusively in the frame of this function.
+// The self call keeps the function out of the inliner (inline.rs,
+// round 49): inlined, `target` and `b` lay in frame slots of the LIVE
+// caller `dom_observer_test`, and the conservative scan thereby kept the
+// target alive -- the test would then have measured the frame layout instead
+// of the weak reference.
+fn dom_observer_create(out: *mut Gc[Observer]) -> i32 {
+    return dom_observer_create_t(out, 1)
+}
+
+fn dom_observer_create_t(out: *mut Gc[Observer], depth: u64) -> i32 {
+    if depth > 0 {
+        return dom_observer_create_t(out, depth - 1)
+    }
+    let target = dom_node_new(77, DOM_KIND_NODE) catch gc_null[Node]()
+    if target == gc_null[Node]() {
+        return 1
+    }
+    let b = dom_observer_new(target) catch gc_null[Observer]()
+    if b == gc_null[Observer]() {
+        return 2
+    }
+    if strong(b.target) != target {
+        return 3
+    }
+    *out = b
+    return 0
+}

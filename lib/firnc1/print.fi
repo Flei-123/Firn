@@ -1,0 +1,625 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/print.fi -- canonical printing of the syntax tree.
+//
+// ONE implementation for two yardsticks:
+//   * without type table -> format of `firnc0 --emit=ast-canon` (parser)
+//   * with    type table -> format of `firnc0 --emit=types`     (type checker)
+//
+// The difference is exactly one addition per expression: `(int 5)` becomes
+// `(int 5 :i32)`. That is why it is the same function with a pointer that may
+// be null as well -- two almost identical printers would be a source of
+// errors, not a relief.
+
+import rt
+import vec
+import intern
+import ast
+import types
+import sema
+
+export { print_program }
+
+fn write(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(b, p, n)
+}
+
+fn name_out(it: *mut intern.Interner, b: *mut rt.Buf, nr: u32) {
+    rt.buf_push_bytes(b, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+}
+
+fn chars(b: *mut rt.Buf, c: u32) {
+    rt.buf_push(b, c as u8)
+}
+
+// ------------------------------------------------------------------- types
+
+fn print_ty(t: *mut ast.Tree, it: *mut intern.Interner, b: *mut rt.Buf, i: u32) {
+    if i == ast.NOTHING {
+        chars(b, 45)
+        return
+    }
+    let a: u32 = ast.t_kind(t, i)
+    if a == ast.T_NAME {
+        name_out(it, b, ast.t_a(t, i))
+        return
+    }
+    if a == ast.T_PTR {
+        var s1: [u8; 5] = "(ptr "
+        write(b, (&s1[0]) as u64, 5)
+        if ast.t_b(t, i) == 1 {
+            var m1: [u8; 4] = "mut "
+            write(b, (&m1[0]) as u64, 4)
+        } else {
+            var m2: [u8; 6] = "const "
+            write(b, (&m2[0]) as u64, 6)
+        }
+        print_ty(t, it, b, ast.t_a(t, i))
+        chars(b, 41)
+        return
+    }
+    if a == ast.T_FN {
+        // ROUND 58: `(fnty (T1 T2) R)` -- like ast_canon.rs.
+        var f1: [u8; 7] = "(fnty ("
+        write(b, (&f1[0]) as u64, 7)
+        let packed: u64 = ast.t_b(t, i)
+        let off: u32 = (packed >> 32) as u32
+        let cnt: u32 = (packed & 4294967295) as u32
+        var k: u32 = 0
+        while k < cnt {
+            if k > 0 {
+                chars(b, 32)
+            }
+            print_ty(t, it, b, ast.child_at(t, off + k))
+            k = k + 1
+        }
+        chars(b, 41)
+        chars(b, 32)
+        if ast.t_a(t, i) == ast.NOTHING {
+            var vw: [u8; 4] = "void"
+            write(b, (&vw[0]) as u64, 4)
+        } else {
+            print_ty(t, it, b, ast.t_a(t, i))
+        }
+        chars(b, 41)
+        return
+    }
+    var s2: [u8; 5] = "(arr "
+    write(b, (&s2[0]) as u64, 5)
+    rt.buf_push_dec_u64(b, ast.t_b(t, i))
+    chars(b, 32)
+    print_ty(t, it, b, ast.t_a(t, i))
+    chars(b, 41)
+}
+
+// ------------------------------------------------------------- expressions
+
+// Operator texts following the order of `ast::BinOp`.
+// ROUND 58: is this the name of a generated closure function?
+fn is_closure_name(it: *mut intern.Interner, nr: u32) -> bool {
+    var cw: [u8; 10] = "__closure#"
+    return intern.intern_prefix(it, nr, (&cw[0]) as u64, 10)
+}
+
+// The function of the tree that belongs to a closure literal, or NOTHING.
+fn closure_fn(t: *mut ast.Tree, name: u32) -> u32 {
+    var i: usize = 0
+    while i < ast.fn_count(t) {
+        if ast.fn_name(t, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return ast.NOTHING
+}
+
+fn print_binop(b: *mut rt.Buf, op: u32) {
+    // The separator is '~', because '|' is itself one of the operators.
+    var tab: [u8; 61] = "+~-~*~/~%~&~|~^~<<~>>~==~!=~<~<=~>~>=~&&~||~+%~-%~*%~+|~-|~*|"
+    var i: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while i < 61 {
+        if tab[i] == 126 as u8 {
+            if nr == op {
+                write(b, (&tab[start]) as u64, i - start)
+                return
+            }
+            nr = nr + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if nr == op {
+        write(b, (&tab[start]) as u64, 61 - start)
+    }
+}
+
+fn print_unop(b: *mut rt.Buf, op: u32) {
+    if op == 0 { chars(b, 45) }
+    else if op == 1 { chars(b, 33) }
+    else if op == 2 { chars(b, 38) }
+    else if op == 4 { chars(b, 126) }
+    else { chars(b, 42) }
+}
+
+// Closes an expression: first the type (if there is a type table),
+// then the parenthesis.
+fn end(sm: u64, it: *mut intern.Interner, b: *mut rt.Buf, i: u32) {
+    if sm != 0 {
+        let s: *mut sema.Sema = sm as *mut sema.Sema
+        var d: [u8; 2] = " :"
+        rt.buf_push_bytes(b, (&d[0]) as u64, 2)
+        types.name_of(sema.sema_types(s), it, b, sema.sema_ty(s, i))
+    }
+    rt.buf_push(b, 41 as u8)
+}
+
+fn print_expr(t: *mut ast.Tree, it: *mut intern.Interner, b: *mut rt.Buf, i: u32, sm: u64) {
+    let a: u32 = ast.e_kind(t, i)
+    // ROUND 58 (fnval.rs): the closure literal. Printed INLINE, together
+    // with the body that sits in the generated function -- that way the
+    // tree reads the same in both compilers.
+    if a == ast.E_LAMBDA {
+        var s1: [u8; 9] = "(closure "
+        write(b, (&s1[0]) as u64, 9)
+        if (ast.e_number(t, i) & 1) == 1 {
+            var g: [u8; 2] = "gc"
+            write(b, (&g[0]) as u64, 2)
+        } else {
+            var pl: [u8; 5] = "plain"
+            write(b, (&pl[0]) as u64, 5)
+        }
+        var op: [u8; 2] = " ("
+        write(b, (&op[0]) as u64, 2)
+        var k: u32 = 0
+        while k < ast.e_c(t, i) {
+            if k > 0 {
+                chars(b, 32)
+            }
+            var pw: [u8; 7] = "(param "
+            write(b, (&pw[0]) as u64, 7)
+            name_out(it, b, ast.param_name(t, ast.e_b(t, i) + k))
+            chars(b, 32)
+            print_ty(t, it, b, ast.param_ty(t, ast.e_b(t, i) + k))
+            chars(b, 41)
+            k = k + 1
+        }
+        chars(b, 41)
+        chars(b, 32)
+        let packed: u64 = ast.e_number(t, i)
+        if (packed >> 1) == 0 {
+            chars(b, 45)
+        } else {
+            print_ty(t, it, b, ((packed >> 1) - 1) as u32)
+        }
+        chars(b, 32)
+        let fi: u32 = closure_fn(t, ast.e_a(t, i))
+        if fi == ast.NOTHING {
+            chars(b, 45)
+        } else {
+            print_block(t, it, b, ast.fn_body(t, fi as usize), sm)
+        }
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_INT {
+        var s: [u8; 5] = "(int "
+        write(b, (&s[0]) as u64, 5)
+        rt.buf_push_dec_u64(b, ast.e_number(t, i))
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_FLOAT {
+        var s: [u8; 7] = "(float "
+        write(b, (&s[0]) as u64, 7)
+        rt.buf_push_dec_u64(b, ast.e_number(t, i))
+        end(sm, it, b, i)
+        return
+    }
+    // ROUND 71 (ast_canon.rs): the f32 literal carries its binary32 pattern.
+    if a == ast.E_FLOAT32 {
+        var s2: [u8; 9] = "(float32 "
+        write(b, (&s2[0]) as u64, 9)
+        rt.buf_push_dec_u64(b, ast.e_number(t, i))
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_BOOL {
+        var s: [u8; 6] = "(bool "
+        write(b, (&s[0]) as u64, 6)
+        if ast.e_a(t, i) == 1 {
+            var w: [u8; 4] = "true"
+            write(b, (&w[0]) as u64, 4)
+        } else {
+            var w2: [u8; 5] = "false"
+            write(b, (&w2[0]) as u64, 5)
+        }
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_ID {
+        var s: [u8; 4] = "(id "
+        write(b, (&s[0]) as u64, 4)
+        name_out(it, b, ast.e_a(t, i))
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_UN {
+        var s: [u8; 4] = "(un "
+        write(b, (&s[0]) as u64, 4)
+        print_unop(b, ast.e_a(t, i))
+        chars(b, 32)
+        print_expr(t, it, b, ast.e_b(t, i), sm)
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_BIN {
+        var s: [u8; 5] = "(bin "
+        write(b, (&s[0]) as u64, 5)
+        print_binop(b, ast.e_a(t, i))
+        chars(b, 32)
+        print_expr(t, it, b, ast.e_b(t, i), sm)
+        chars(b, 32)
+        print_expr(t, it, b, ast.e_c(t, i), sm)
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_FIELD {
+        var s: [u8; 7] = "(field "
+        write(b, (&s[0]) as u64, 7)
+        print_expr(t, it, b, ast.e_a(t, i), sm)
+        chars(b, 32)
+        name_out(it, b, ast.e_b(t, i))
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_IDX {
+        var s: [u8; 5] = "(idx "
+        write(b, (&s[0]) as u64, 5)
+        print_expr(t, it, b, ast.e_a(t, i), sm)
+        chars(b, 32)
+        print_expr(t, it, b, ast.e_b(t, i), sm)
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_CALL {
+        var s: [u8; 6] = "(call "
+        write(b, (&s[0]) as u64, 6)
+        name_out(it, b, ast.e_a(t, i))
+        var k: u32 = 0
+        while k < ast.e_c(t, i) {
+            chars(b, 32)
+            print_expr(t, it, b, ast.child_at(t, ast.e_b(t, i) + k), sm)
+            k = k + 1
+        }
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_SYSCALL {
+        var s: [u8; 8] = "(syscall"
+        write(b, (&s[0]) as u64, 8)
+        var k: u32 = 0
+        while k < ast.e_c(t, i) {
+            chars(b, 32)
+            print_expr(t, it, b, ast.child_at(t, ast.e_b(t, i) + k), sm)
+            k = k + 1
+        }
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_AS {
+        var s: [u8; 4] = "(as "
+        write(b, (&s[0]) as u64, 4)
+        print_expr(t, it, b, ast.e_a(t, i), sm)
+        chars(b, 32)
+        print_ty(t, it, b, ast.e_b(t, i))
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_SLIT {
+        var s: [u8; 6] = "(slit "
+        write(b, (&s[0]) as u64, 6)
+        name_out(it, b, ast.e_a(t, i))
+        var k: u32 = 0
+        while k < ast.e_c(t, i) {
+            var f: [u8; 4] = " (f "
+            write(b, (&f[0]) as u64, 4)
+            name_out(it, b, ast.child_at(t, ast.e_b(t, i) + k * 2))
+            chars(b, 32)
+            print_expr(t, it, b, ast.child_at(t, ast.e_b(t, i) + k * 2 + 1), sm)
+            chars(b, 41)
+            k = k + 1
+        }
+        end(sm, it, b, i)
+        return
+    }
+    if a == ast.E_ALIT {
+        var s: [u8; 5] = "(alit"
+        write(b, (&s[0]) as u64, 5)
+        var k: u32 = 0
+        while k < ast.e_c(t, i) {
+            chars(b, 32)
+            print_expr(t, it, b, ast.child_at(t, ast.e_b(t, i) + k), sm)
+            k = k + 1
+        }
+        end(sm, it, b, i)
+        return
+    }
+    // ROUND 70 (ast_canon.rs): the text literal -- `(text W INNER)`.
+    if a == ast.E_TEXT {
+        var tw: [u8; 6] = "(text "
+        write(b, (&tw[0]) as u64, 6)
+        if ast.e_b(t, i) == 1 {
+            chars(b, 49)
+        } else {
+            chars(b, 48)
+        }
+        chars(b, 32)
+        print_expr(t, it, b, ast.e_a(t, i), sm)
+        end(sm, it, b, i)
+        return
+    }
+    var s: [u8; 6] = "(awdh "
+    write(b, (&s[0]) as u64, 6)
+    print_expr(t, it, b, ast.e_a(t, i), sm)
+    chars(b, 32)
+    print_expr(t, it, b, ast.e_b(t, i), sm)
+    end(sm, it, b, i)
+}
+
+// --------------------------------------------------------------- statements
+
+fn print_block(t: *mut ast.Tree, it: *mut intern.Interner, b: *mut rt.Buf, i: u32, sm: u64) {
+    var s: [u8; 4] = "(blk"
+    write(b, (&s[0]) as u64, 4)
+    var k: u32 = 0
+    while k < ast.b_len(t, i) {
+        chars(b, 32)
+        print_stmt(t, it, b, ast.slist_at(t, ast.b_off(t, i) + k), sm)
+        k = k + 1
+    }
+    chars(b, 41)
+}
+
+fn print_stmt(t: *mut ast.Tree, it: *mut intern.Interner, b: *mut rt.Buf, i: u32, sm: u64) {
+    let a: u32 = ast.s_kind(t, i)
+    if a == ast.S_LET || a == ast.S_VAR {
+        if a == ast.S_LET {
+            var s: [u8; 5] = "(let "
+            write(b, (&s[0]) as u64, 5)
+        } else {
+            var s2: [u8; 5] = "(var "
+            write(b, (&s2[0]) as u64, 5)
+        }
+        name_out(it, b, ast.s_a(t, i))
+        chars(b, 32)
+        print_ty(t, it, b, ast.s_b(t, i))
+        chars(b, 32)
+        print_expr(t, it, b, ast.s_c(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    // ROUND 70 (ast_canon.rs): the compound assignment and the step keep
+    // their OWN shape -- a canonical form that printed `x += 1` as
+    // `x = x + 1` would hide exactly the difference this round is about.
+    if a == ast.S_ZUWOP {
+        var so: [u8; 10] = "(opassign "
+        write(b, (&so[0]) as u64, 10)
+        print_binop(b, ast.s_c(t, i))
+        chars(b, 32)
+        print_expr(t, it, b, ast.s_a(t, i), sm)
+        chars(b, 32)
+        print_expr(t, it, b, ast.s_b(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_STEP {
+        var st: [u8; 6] = "(step "
+        write(b, (&st[0]) as u64, 6)
+        if ast.s_b(t, i) == 1 {
+            chars(b, 43)
+            chars(b, 43)
+        } else {
+            chars(b, 45)
+            chars(b, 45)
+        }
+        chars(b, 32)
+        print_expr(t, it, b, ast.s_a(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_ZUW {
+        var s: [u8; 5] = "(zuw "
+        write(b, (&s[0]) as u64, 5)
+        print_expr(t, it, b, ast.s_a(t, i), sm)
+        chars(b, 32)
+        print_expr(t, it, b, ast.s_b(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_IF {
+        var s: [u8; 4] = "(if "
+        write(b, (&s[0]) as u64, 4)
+        print_expr(t, it, b, ast.s_a(t, i), sm)
+        chars(b, 32)
+        print_block(t, it, b, ast.s_b(t, i), sm)
+        chars(b, 32)
+        if ast.s_c(t, i) == ast.NOTHING {
+            chars(b, 45)
+        } else {
+            print_stmt(t, it, b, ast.s_c(t, i), sm)
+        }
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_WHILE {
+        var s: [u8; 7] = "(while "
+        write(b, (&s[0]) as u64, 7)
+        print_expr(t, it, b, ast.s_a(t, i), sm)
+        chars(b, 32)
+        print_block(t, it, b, ast.s_b(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_RET {
+        var s: [u8; 5] = "(ret "
+        write(b, (&s[0]) as u64, 5)
+        if ast.s_a(t, i) == ast.NOTHING {
+            chars(b, 45)
+        } else {
+            print_expr(t, it, b, ast.s_a(t, i), sm)
+        }
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_FOR {
+        var s: [u8; 5] = "(for "
+        write(b, (&s[0]) as u64, 5)
+        name_out(it, b, ast.s_a(t, i))
+        chars(b, 32)
+        print_expr(t, it, b, ast.s_b(t, i), sm)
+        chars(b, 32)
+        print_expr(t, it, b, ast.s_c(t, i), sm)
+        chars(b, 32)
+        print_block(t, it, b, ast.s_d(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_BREAK {
+        var s: [u8; 7] = "(break)"
+        write(b, (&s[0]) as u64, 7)
+        return
+    }
+    if a == ast.S_CONT {
+        var s: [u8; 10] = "(continue)"
+        write(b, (&s[0]) as u64, 10)
+        return
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        if a == ast.S_DEFER {
+            var s: [u8; 7] = "(defer "
+            write(b, (&s[0]) as u64, 7)
+        } else {
+            var s2: [u8; 10] = "(errdefer "
+            write(b, (&s2[0]) as u64, 10)
+        }
+        print_stmt(t, it, b, ast.s_a(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    if a == ast.S_EXPR {
+        var s: [u8; 6] = "(expr "
+        write(b, (&s[0]) as u64, 6)
+        print_expr(t, it, b, ast.s_a(t, i), sm)
+        chars(b, 41)
+        return
+    }
+    var s: [u8; 7] = "(block "
+    write(b, (&s[0]) as u64, 7)
+    print_block(t, it, b, ast.s_a(t, i), sm)
+    chars(b, 41)
+}
+
+// ------------------------------------------------------------------- program
+
+fn print_program(t: *mut ast.Tree, it: *mut intern.Interner, b: *mut rt.Buf, sm: u64) {
+    var header: [u8; 9] = "(program\n"
+    write(b, (&header[0]) as u64, 9)
+    if ast.prof(t) != ast.NOTHING {
+        var s: [u8; 11] = "  (profile "
+        write(b, (&s[0]) as u64, 11)
+        name_out(it, b, ast.prof(t))
+        var e: [u8; 2] = ")\n"
+        write(b, (&e[0]) as u64, 2)
+    }
+    var i: usize = 0
+    while i < ast.imp_count(t) {
+        var s: [u8; 10] = "  (import "
+        write(b, (&s[0]) as u64, 10)
+        name_out(it, b, ast.imp_path(t, i))
+        chars(b, 32)
+        name_out(it, b, ast.imp_alias(t, i))
+        var e: [u8; 2] = ")\n"
+        write(b, (&e[0]) as u64, 2)
+        i = i + 1
+    }
+    i = 0
+    while i < ast.exp_count(t) {
+        var s: [u8; 10] = "  (export "
+        write(b, (&s[0]) as u64, 10)
+        name_out(it, b, ast.exp_name(t, i))
+        var e: [u8; 2] = ")\n"
+        write(b, (&e[0]) as u64, 2)
+        i = i + 1
+    }
+    i = 0
+    while i < ast.const_count(t) {
+        var s: [u8; 9] = "  (const "
+        write(b, (&s[0]) as u64, 9)
+        name_out(it, b, ast.const_name(t, i))
+        chars(b, 32)
+        print_ty(t, it, b, ast.const_ty(t, i))
+        chars(b, 32)
+        print_expr(t, it, b, ast.const_value(t, i), sm)
+        var e: [u8; 2] = ")\n"
+        write(b, (&e[0]) as u64, 2)
+        i = i + 1
+    }
+    i = 0
+    while i < ast.structure_count(t) {
+        var s: [u8; 10] = "  (struct "
+        write(b, (&s[0]) as u64, 10)
+        name_out(it, b, ast.structure_name(t, i))
+        var k: u32 = 0
+        while k < ast.structure_flen(t, i) {
+            var f: [u8; 8] = " (field "
+            write(b, (&f[0]) as u64, 8)
+            name_out(it, b, ast.field_name(t, ast.structure_foff(t, i) + k))
+            chars(b, 32)
+            print_ty(t, it, b, ast.field_ty(t, ast.structure_foff(t, i) + k))
+            chars(b, 41)
+            k = k + 1
+        }
+        var e: [u8; 2] = ")\n"
+        write(b, (&e[0]) as u64, 2)
+        i = i + 1
+    }
+    i = 0
+    while i < ast.fn_count(t) {
+        // ROUND 58 (fnval.rs): the generated function of a closure does not
+        // stand at top level in the source text -- it is printed AT the
+        // literal, so that both compilers render the same tree.
+        if is_closure_name(it, ast.fn_name(t, i)) {
+            i = i + 1
+            continue
+        }
+        var s: [u8; 6] = "  (fn "
+        write(b, (&s[0]) as u64, 6)
+        name_out(it, b, ast.fn_name(t, i))
+        var o: [u8; 2] = " ("
+        write(b, (&o[0]) as u64, 2)
+        var k: u32 = 0
+        while k < ast.fn_plen(t, i) {
+            if k > 0 {
+                chars(b, 32)
+            }
+            var pp: [u8; 7] = "(param "
+            write(b, (&pp[0]) as u64, 7)
+            name_out(it, b, ast.param_name(t, ast.fn_poff(t, i) + k))
+            chars(b, 32)
+            print_ty(t, it, b, ast.param_ty(t, ast.fn_poff(t, i) + k))
+            chars(b, 41)
+            k = k + 1
+        }
+        var c: [u8; 2] = ") "
+        write(b, (&c[0]) as u64, 2)
+        print_ty(t, it, b, ast.fn_ret(t, i))
+        chars(b, 32)
+        print_block(t, it, b, ast.fn_body(t, i), sm)
+        var e: [u8; 2] = ")\n"
+        write(b, (&e[0]) as u64, 2)
+        i = i + 1
+    }
+    var closing: [u8; 2] = ")\n"
+    write(b, (&closing[0]) as u64, 2)
+}

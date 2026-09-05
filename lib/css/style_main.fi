@@ -1,0 +1,533 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/css/style_main.fi -- the driver of the whole CSS path (root file).
+//
+// HTML in, COMPUTED STYLE PER NODE out -- the step that comes before layout
+// and painting. In one run it does:
+//
+//   1. HTML -> DOM            (lib/browser/, round 54)
+//   2. CSS  -> stylesheet     (lib/css/tok.fi + cv.fi, round 60)
+//   3. selectors -> matcher   (lib/css/sel.fi)
+//   4. cascade + inheritance  (lib/css/cascade.fi)
+//
+// The style table is a `GcMap` from node to `Style` and thereby lies, like
+// the DOM and the stylesheet, completely in the GC heap: dropping the
+// document releases everything, and the soak run (lib/css/soak_style.fi)
+// proves it.
+//
+// The job format (little-endian, see tools/css/LOG.md):
+//     u32  hover        the element index for `:hover`, 0xFFFFFFFF = none
+//     u32  n ; u8[n]    the HTML document (WTF-8)
+//     u32  n ; u8[n]    the user agent stylesheet   (origin 0)
+//     u32  n ; u8[n]    the user stylesheet         (origin 1)
+//     u32  n ; u8[n]    the author stylesheet       (origin 2)
+//     u32  n ; u8[n]    the selectors to test, one per line
+//
+// The output per job:
+//     E <index> <parent> <tag> <attributes>     one line per element
+//     M <selector> <count> <index>...           the matches per selector
+//     P <selector> <a> <b> <c>                  the specificity, or `invalid`
+//     S <index> ...                             the computed style
+//     #END
+//
+// Compile with:  firnc -o build/cssstyle lib/css/style_main.fi
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+
+const NO_HOVER: u32 = 0xFFFFFFFF
+
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn byte_at(base: u64, total: usize, k: usize) -> u32 {
+    if k >= total {
+        return 0 as u32
+    }
+    return (*((base + k as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn decode_wtf8(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    let base: u64 = mem.buf_ptr(b) as u64
+    let total: usize = mem.buf_len(b)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = byte_at(base, total, off + i)
+        if c0 < 0x80 as u32 {
+            mem.cp_push(out, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 {
+            mem.cp_push(out, ((c0 & 0x07 as u32) << 18) |
+                ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 12) |
+                ((byte_at(base, total, off + i + 2) & 0x3F as u32) << 6) |
+                (byte_at(base, total, off + i + 3) & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 {
+            mem.cp_push(out, ((c0 & 0x0F as u32) << 12) |
+                ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 6) |
+                (byte_at(base, total, off + i + 2) & 0x3F as u32))
+            i = i + 3
+        } else {
+            mem.cp_push(out, ((c0 & 0x1F as u32) << 6) |
+                (byte_at(base, total, off + i + 1) & 0x3F as u32))
+            i = i + 2
+        }
+    }
+}
+
+// ------------------------------------------------------------ The output
+
+#[no_gc]
+fn lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn hex_digit(v: u32) -> u8 {
+    if v < 10 as u32 {
+        return (48 as u32 + v) as u8
+    }
+    return (87 as u32 + v) as u8
+}
+
+// Percent encoding: everything outside 0x21..0x7E and the percent sign
+// itself becomes %XX. So a value never contains a space or a newline and
+// the runner can split lines without a quoting rule.
+#[no_gc]
+fn out_escaped_byte(out: *mut mem.Buf, b: u32) {
+    if b >= 0x21 as u32 && b <= 0x7E as u32 && b != 37 as u32 {
+        mem.buf_push(out, b as u8)
+        return
+    }
+    mem.buf_push(out, 37 as u8)
+    mem.buf_push(out, hex_digit((b >> 4) & 15 as u32))
+    mem.buf_push(out, hex_digit(b & 15 as u32))
+}
+
+#[no_gc]
+fn out_escaped_cp(out: *mut mem.Buf, c: u32) {
+    if c < 0x80 as u32 {
+        out_escaped_byte(out, c)
+    } else if c < 0x800 as u32 {
+        out_escaped_byte(out, 0xC0 as u32 | (c >> 6))
+        out_escaped_byte(out, 0x80 as u32 | (c & 0x3F as u32))
+    } else if c < 0x10000 as u32 {
+        out_escaped_byte(out, 0xE0 as u32 | (c >> 12))
+        out_escaped_byte(out, 0x80 as u32 | ((c >> 6) & 0x3F as u32))
+        out_escaped_byte(out, 0x80 as u32 | (c & 0x3F as u32))
+    } else {
+        out_escaped_byte(out, 0xF0 as u32 | (c >> 18))
+        out_escaped_byte(out, 0x80 as u32 | ((c >> 12) & 0x3F as u32))
+        out_escaped_byte(out, 0x80 as u32 | ((c >> 6) & 0x3F as u32))
+        out_escaped_byte(out, 0x80 as u32 | (c & 0x3F as u32))
+    }
+}
+
+fn out_chain_escaped(out: *mut mem.Buf, k: Gc[Chain]) {
+    if k == gc_null[Chain]() {
+        return
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            out_escaped_cp(out, s.chars[i])
+            i = i + 1
+        }
+        s = s.next
+    }
+}
+
+#[no_gc]
+fn out_name(out: *mut mem.Buf, nm: *mut names.Names, id: u32) {
+    let p: *mut u8 = names.names_ptr(nm, id)
+    let n: usize = names.names_length(nm, id)
+    if n == 0 {
+        mem.buf_push(out, 63 as u8)
+        return
+    }
+    var i: usize = 0
+    while i < n {
+        out_escaped_byte(out, (*((p as u64 + i as u64) as *mut u8)) as u32)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn out_space(out: *mut mem.Buf) {
+    mem.buf_push(out, 32 as u8)
+}
+
+#[no_gc]
+fn out_nl(out: *mut mem.Buf) {
+    mem.buf_push(out, 10 as u8)
+}
+
+#[no_gc]
+fn out_i64(out: *mut mem.Buf, v: i64) {
+    if v < 0 {
+        mem.buf_push(out, 45 as u8)
+        mem.buf_push_dec(out, (0 - v) as u64)
+    } else {
+        mem.buf_push_dec(out, v as u64)
+    }
+}
+
+// A number with three decimal places -- enough for computed lengths and
+// free of a shortest round-trip printer, which Firn does not have.
+#[no_gc]
+fn out_fixed(out: *mut mem.Buf, v: f64) {
+    var x: f64 = v
+    var negative: bool = false
+    if x < 0.0 {
+        negative = true
+        x = 0.0 - x
+    }
+    let scaled: i64 = (x * 1000.0 + 0.5) as i64
+    if negative && scaled != 0 {
+        mem.buf_push(out, 45 as u8)
+    }
+    mem.buf_push_dec(out, (scaled / 1000) as u64)
+    mem.buf_push(out, 46 as u8)
+    let rest: i64 = scaled % 1000
+    mem.buf_push(out, (48 + rest / 100) as u8)
+    mem.buf_push(out, (48 + (rest / 10) % 10) as u8)
+    mem.buf_push(out, (48 + rest % 10) as u8)
+}
+
+#[no_gc]
+fn out_hex8(out: *mut mem.Buf, v: u32) {
+    var i: i64 = 7
+    while i >= 0 {
+        mem.buf_push(out, hex_digit((v >> (i as u32 * 4 as u32)) & 15 as u32))
+        i = i - 1
+    }
+}
+
+// ---------------------------------------------------------- The DOM walk
+
+// The next node in document order.
+fn next_in_order(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+// ------------------------------------------------------------ The job
+
+fn parse_sheet(text: *mut mem.CpBuf, t: *mut tok.Tokens) -> AllocError!Gc[Cv] {
+    tok.tokenize(t, text)
+    var p: cv.Parser = cv.parser_new(t)
+    return try cv.parse_stylesheet(&p)
+}
+
+fn chain_last(r: Gc[Rule]) -> Gc[Rule] {
+    var x: Gc[Rule] = r
+    while x != gc_null[Rule]() && x.next != gc_null[Rule]() {
+        x = x.next
+    }
+    return x
+}
+
+fn add_sheet(head: Gc[Rule], sheet: Gc[Cv], origin: u32, order: *mut u32,
+    nm: *mut names.Names, tmp: *mut mem.CpBuf) -> AllocError!Gc[Rule] {
+    var next_order: u32 = *order
+    let part = try cascade.collect_rules(sheet, origin, next_order, nm, tmp, &next_order)
+    *order = next_order
+    if part == gc_null[Rule]() {
+        return head
+    }
+    if head == gc_null[Rule]() {
+        return part
+    }
+    let last: Gc[Rule] = chain_last(head)
+    last.next = part
+    return head
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    // Everything with `Gc` fields lies in the frame of `main` -- the stack
+    // scan is conservative (SPEC 3.5.3).
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var text: mem.CpBuf = mem.cp_new()
+    var tmp: mem.CpBuf = mem.cp_new()
+    var cx: sel.Ctx = sel.ctx_new(driver.run_names(&run))
+    sel.ctx_init(&cx)
+    var w: cascade.Winner = cascade.winner_new()
+
+    var ins: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&ins)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+
+    let total: usize = mem.buf_len(&ins)
+    var off: usize = 0
+    while off + 24 <= total {
+        let hover_index: u32 = read_u32(&ins, off)
+        let n_html: usize = read_u32(&ins, off + 4) as usize
+        let o_html: usize = off + 8
+        let n_ua: usize = read_u32(&ins, o_html + n_html) as usize
+        let o_ua: usize = o_html + n_html + 4
+        let n_user: usize = read_u32(&ins, o_ua + n_ua) as usize
+        let o_user: usize = o_ua + n_ua + 4
+        let n_author: usize = read_u32(&ins, o_user + n_user) as usize
+        let o_author: usize = o_user + n_user + 4
+        let n_sel: usize = read_u32(&ins, o_author + n_author) as usize
+        let o_sel: usize = o_author + n_author + 4
+        off = o_sel + n_sel
+
+        // ---- 1. HTML -> DOM
+        driver.run_text_out_bytes(&run, ((mem.buf_ptr(&ins) as u64) + o_html as u64) as *mut u8,
+            n_html)
+        let rc: u32 = driver.run_document_build(&run)
+        if rc != 0 as u32 {
+            var broken: [u8; 8] = "#BROKEN "
+            lit(&out, (&broken[0]) as u64, 8)
+            mem.buf_push_dec(&out, rc as u64)
+            out_nl(&out)
+        }
+        let doc: Gc[Document] = driver.run_document(&run)
+        let nm: *mut names.Names = driver.run_names(&run)
+
+        // ---- 2. the three stylesheets
+        var rules: Gc[Rule] = gc_null[Rule]()
+        var order: u32 = 0
+        decode_wtf8(&ins, o_ua, n_ua, &text)
+        let ua = parse_sheet(&text, &t) catch gc_null[Cv]()
+        rules = add_sheet(rules, ua, cascade.ORIGIN_UA, &order, nm, &tmp)
+        catch gc_null[Rule]()
+        decode_wtf8(&ins, o_user, n_user, &text)
+        let user = parse_sheet(&text, &t) catch gc_null[Cv]()
+        rules = add_sheet(rules, user, cascade.ORIGIN_USER, &order, nm, &tmp)
+        catch gc_null[Rule]()
+        decode_wtf8(&ins, o_author, n_author, &text)
+        let author = parse_sheet(&text, &t) catch gc_null[Cv]()
+        rules = add_sheet(rules, author, cascade.ORIGIN_AUTHOR, &order, nm, &tmp)
+        catch gc_null[Rule]()
+
+        // ---- 3. the element table
+        var index: Gc[GcMap] = gcmap_new(true, false) catch gc_null[GcMap]()
+        var styles: Gc[GcMap] = gcmap_new(true, true) catch gc_null[GcMap]()
+        var count: u64 = 0
+        var k: Gc[Node] = doc
+        while k != gc_null[Node]() {
+            if k.kind == node.K_ELEM {
+                let ok: bool = gcmap_set(index, k as u64, count + 1) catch false
+                count = count + 1
+            }
+            k = next_in_order(k, doc)
+        }
+        var hover: Gc[Node] = gc_null[Node]()
+        k = doc
+        var walk: u64 = 0
+        while k != gc_null[Node]() {
+            if k.kind == node.K_ELEM {
+                var e0: [u8; 2] = "E "
+                lit(&out, (&e0[0]) as u64, 2)
+                mem.buf_push_dec(&out, walk)
+                out_space(&out)
+                let parent: Gc[Node] = k.parent
+                var pi: u64 = 0
+                if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                    pi = gcmap_get(index, parent as u64, 0)
+                }
+                if pi == 0 {
+                    out_i64(&out, -1)
+                } else {
+                    mem.buf_push_dec(&out, pi - 1)
+                }
+                out_space(&out)
+                out_name(&out, nm, node.elem_name(k))
+                let e: Gc[Elem] = node.node_as_elem(k)
+                var a: Gc[Attr] = node.attr_first(e)
+                while a != gc_null[Attr]() {
+                    out_space(&out)
+                    out_name(&out, nm, a.name)
+                    mem.buf_push(&out, 61 as u8)
+                    out_chain_escaped(&out, a.value)
+                    a = a.next
+                }
+                out_nl(&out)
+                if hover_index != NO_HOVER && walk == hover_index as u64 {
+                    hover = k
+                }
+                walk = walk + 1
+            }
+            k = next_in_order(k, doc)
+        }
+        sel.ctx_set_hover(&cx, hover)
+
+        // ---- 4. the selectors under test
+        var line_from: usize = o_sel
+        var line_i: usize = o_sel
+        var sel_no: u64 = 0
+        let sel_end: usize = o_sel + n_sel
+        while line_i <= sel_end {
+            let at_end: bool = line_i == sel_end
+            var newline: bool = at_end
+            if !at_end {
+                newline = mem.buf_at(&ins, line_i) == 10 as u8
+            }
+            if newline {
+                if line_i > line_from {
+                    decode_wtf8(&ins, line_from, line_i - line_from, &text)
+                    tok.tokenize(&t, &text)
+                    var pp: cv.Parser = cv.parser_new(&t)
+                    let values = cv.parse_component_value_list(&pp) catch gc_null[Cv]()
+                    let s = sel.sel_parse(values, nm, &tmp) catch gc_null[Sel]()
+                    var pm: [u8; 2] = "P "
+                    lit(&out, (&pm[0]) as u64, 2)
+                    mem.buf_push_dec(&out, sel_no)
+                    out_space(&out)
+                    if s == gc_null[Sel]() {
+                        var inv: [u8; 7] = "invalid"
+                        lit(&out, (&inv[0]) as u64, 7)
+                        out_nl(&out)
+                    } else {
+                        var x: Gc[Sel] = s
+                        var first: bool = true
+                        while x != gc_null[Sel]() {
+                            if !first {
+                                mem.buf_push(&out, 44 as u8)
+                            }
+                            first = false
+                            mem.buf_push_dec(&out, sel.spec_a(x.spec) as u64)
+                            mem.buf_push(&out, 45 as u8)
+                            mem.buf_push_dec(&out, sel.spec_b(x.spec) as u64)
+                            mem.buf_push(&out, 45 as u8)
+                            mem.buf_push_dec(&out, sel.spec_c(x.spec) as u64)
+                            x = x.next
+                        }
+                        out_nl(&out)
+                        var mm: [u8; 2] = "M "
+                        lit(&out, (&mm[0]) as u64, 2)
+                        mem.buf_push_dec(&out, sel_no)
+                        var hits: u64 = 0
+                        var k2: Gc[Node] = doc
+                        var idx: u64 = 0
+                        while k2 != gc_null[Node]() {
+                            if k2.kind == node.K_ELEM {
+                                if sel.sel_matches(s, k2, &cx) {
+                                    out_space(&out)
+                                    mem.buf_push_dec(&out, idx)
+                                    hits = hits + 1
+                                }
+                                idx = idx + 1
+                            }
+                            k2 = next_in_order(k2, doc)
+                        }
+                        out_nl(&out)
+                    }
+                    sel_no = sel_no + 1
+                }
+                line_from = line_i + 1
+            }
+            line_i = line_i + 1
+        }
+
+        // ---- 5. the cascade per element
+        let root_style = cascade.style_root() catch gc_null[Style]()
+        k = doc
+        var si: u64 = 0
+        while k != gc_null[Node]() {
+            if k.kind == node.K_ELEM {
+                var parent_style: Gc[Style] = root_style
+                let parent: Gc[Node] = k.parent
+                if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                    let found: Gc[Style] = gcmap_get_value[Style](styles, parent as u64)
+                    if found != gc_null[Style]() {
+                        parent_style = found
+                    }
+                }
+                let s = cascade.cascade_elem(rules, k, parent_style, &cx, &w)
+                catch gc_null[Style]()
+                if s != gc_null[Style]() {
+                    let ok: bool = gcmap_set_value[Style](styles, k as u64, s) catch false
+                    var sm: [u8; 2] = "S "
+                    lit(&out, (&sm[0]) as u64, 2)
+                    mem.buf_push_dec(&out, si)
+                    out_space(&out)
+                    mem.buf_push_dec(&out, cascade.style_display(s) as u64)
+                    out_space(&out)
+                    out_hex8(&out, cascade.style_color(s, 0))
+                    out_space(&out)
+                    out_fixed(&out, cascade.style_font_size(s))
+                    var li: usize = 0
+                    while li < 12 {
+                        out_space(&out)
+                        if cascade.style_unit(s, li) == cascade.U_AUTO {
+                            var au: [u8; 4] = "auto"
+                            lit(&out, (&au[0]) as u64, 4)
+                        } else {
+                            out_fixed(&out, cascade.style_length(s, li))
+                            if cascade.style_unit(s, li) == cascade.U_PERCENT {
+                                mem.buf_push(&out, 37 as u8)
+                            }
+                        }
+                        li = li + 1
+                    }
+                    var bi: usize = 0
+                    while bi < 4 {
+                        out_space(&out)
+                        mem.buf_push_dec(&out, cascade.style_border_style(s, bi) as u64)
+                        bi = bi + 1
+                    }
+                    var ci: usize = 1
+                    while ci < 5 {
+                        out_space(&out)
+                        out_hex8(&out, cascade.style_color(s, ci))
+                        ci = ci + 1
+                    }
+                    out_nl(&out)
+                }
+                si = si + 1
+            }
+            k = next_in_order(k, doc)
+        }
+
+        var tail: [u8; 5] = "#END\n"
+        lit(&out, (&tail[0]) as u64, 5)
+        if mem.buf_len(&out) > 65536 {
+            mem.buf_flush(&out, 1)
+        }
+        driver.run_tree_release(&run)
+    }
+    mem.buf_flush(&out, 1)
+    return 0
+}

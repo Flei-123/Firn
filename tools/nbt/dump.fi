@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/nbt/dump.fi -- an NBT file as CANONICAL TEXT (round 76).
+//
+// The point of this program is that a second, entirely foreign parser can
+// produce exactly the same text. `tools/nbt/check.py` does that in Python,
+// and the comparison is `diff`: every tag, every name, every value, in
+// order. That is what "field for field" means here -- not "the file has the
+// right size".
+//
+// THE FORMAT, one line per tag:
+//
+//     <depth>|<type number>|<name as hex>|<value>
+//
+// and the value, per type:
+//
+//     byte/short/int/long   the decimal number, signed
+//     float                 f<the 32 bit pattern as an unsigned decimal>
+//     double                d<the 64 bit pattern as an unsigned decimal>
+//     string                <length>:<the octets as hex>
+//     byte/int/long array   n=<count> fnv=<FNV-1a-64 over the raw octets>
+//     list                  elem=<type> n=<count>
+//     compound              -
+//
+// WHY BIT PATTERNS FOR FLOATS: a decimal rendering would compare two
+// dtoa implementations, not two NBT parsers. The bit pattern is the value.
+//
+// WHY HEX FOR NAMES: names contain spaces, brackets, parentheses and
+// non-ASCII octets (bigtest has all of them). Hex has no quoting problem.
+//
+// Argument 1: the file. Argument 2 (optional): "anon" -- root compound
+// without a name, the network form since 1.20.2.
+import std.nbt
+import std.bytes
+import std.rt
+
+fn push_dec_i64(o: *mut rt.Buf, v: i64) {
+    rt.buf_push_dec_i64(o, v)
+}
+
+fn push_hex_span(o: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_hex_u64(o, rt.ld8(p, i) as u64, 2)
+        i = i + 1
+    }
+}
+
+// FNV-1a, 64 bit. Chosen because it is four lines and every language has
+// it; the point is a value both sides compute the same way, not a good hash.
+fn fnv(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < n {
+        h = h ^ (rt.ld8(p, i) as u64)
+        h = h *% (1099511628211 as u64)
+        i = i + 1
+    }
+    return h
+}
+
+fn bar(o: *mut rt.Buf) {
+    rt.buf_push(o, 124 as u8) // '|'
+}
+
+fn nl(o: *mut rt.Buf) {
+    rt.buf_push(o, 10 as u8)
+}
+
+// The header of a line: depth, type, name.
+fn head(o: *mut rt.Buf, depth: i32, t: u8, name: u64, name_n: usize) {
+    rt.buf_push_dec_u64(o, depth as u64)
+    bar(o)
+    rt.buf_push_dec_u64(o, t as u64)
+    bar(o)
+    push_hex_span(o, name, name_n)
+    bar(o)
+}
+
+// One payload. Returns false when the octets ran out or a tag was bad --
+// the caller stops then, and the missing lines make the `diff` fail, which
+// is the point.
+fn value(b: *mut bytes.Bytes, o: *mut rt.Buf, t: u8, depth: i32) -> bool {
+    // The same limit as the library (`nbt.NBT_MAX_DEPTH`), and for the same
+    // reason: this function recurses per nesting level, and its frame under
+    // the optimiser is 25,904 octets. Without the check a file with 400
+    // opening compounds ends in a segmentation fault instead of an error
+    // message -- measured, see docs/ROUND76.md.
+    if depth > nbt.NBT_MAX_DEPTH {
+        return false
+    }
+    if t == nbt.TAG_BYTE {
+        let v: i8 = nbt.nbt_read_i8(b) catch 0 as i8
+        push_dec_i64(o, v as i64)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_SHORT {
+        let v: i16 = nbt.nbt_read_i16(b) catch 0 as i16
+        push_dec_i64(o, v as i64)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_INT {
+        let v: i32 = nbt.nbt_read_i32(b) catch 0
+        push_dec_i64(o, v as i64)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_LONG {
+        let v: i64 = nbt.nbt_read_i64(b) catch 0
+        push_dec_i64(o, v)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_FLOAT {
+        // the 32 bit pattern -- read as an integer, so no rounding can
+        // happen on the way to the text
+        let v: i32 = nbt.nbt_read_i32(b) catch 0
+        rt.buf_push(o, 102 as u8) // 'f'
+        rt.buf_push_dec_u64(o, (v as u32) as u64)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_DOUBLE {
+        let v: i64 = nbt.nbt_read_i64(b) catch 0
+        rt.buf_push(o, 100 as u8) // 'd'
+        rt.buf_push_dec_u64(o, v as u64)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_STRING {
+        var n: usize = 0
+        let p: u64 = nbt.nbt_read_string(b, &n) catch 0
+        if p == 0 && n != 0 {
+            return false
+        }
+        rt.buf_push_dec_u64(o, n as u64)
+        rt.buf_push(o, 58 as u8) // ':'
+        push_hex_span(o, p, n)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_BYTE_ARRAY || t == nbt.TAG_INT_ARRAY || t == nbt.TAG_LONG_ARRAY {
+        var width: usize = 1
+        if t == nbt.TAG_INT_ARRAY {
+            width = 4
+        }
+        if t == nbt.TAG_LONG_ARRAY {
+            width = 8
+        }
+        let n: i32 = nbt.nbt_read_array_len(b, width) catch 0 - 1
+        if n < 0 {
+            return false
+        }
+        let p: u64 = bytes.get_span(b, (n as usize) * width) catch 0
+        if p == 0 && n != 0 {
+            return false
+        }
+        var t_n: [u8; 3] = "n=\0"
+        var t_f: [u8; 6] = " fnv=\0"
+        rt.buf_push_bytes(o, (&t_n[0]) as u64, 2)
+        rt.buf_push_dec_u64(o, n as u64)
+        rt.buf_push_bytes(o, (&t_f[0]) as u64, 5)
+        rt.buf_push_hex_u64(o, fnv(p, (n as usize) * width), 16)
+        nl(o)
+        return true
+    }
+    if t == nbt.TAG_LIST {
+        var elem: u8 = 0 as u8
+        var n: i32 = 0
+        let ok: bool = nbt.nbt_read_list_header(b, &elem, &n) catch false
+        if !ok {
+            return false
+        }
+        var t_e: [u8; 6] = "elem=\0"
+        var t_n: [u8; 4] = " n=\0"
+        rt.buf_push_bytes(o, (&t_e[0]) as u64, 5)
+        rt.buf_push_dec_u64(o, elem as u64)
+        rt.buf_push_bytes(o, (&t_n[0]) as u64, 3)
+        rt.buf_push_dec_u64(o, n as u64)
+        nl(o)
+        // The elements: NO type octet, NO name -- exactly the place where a
+        // wrong reader falls apart.
+        var i: i32 = 0
+        while i < n {
+            head(o, depth + 1, elem, 0, 0)
+            if !value(b, o, elem, depth + 1) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if t == nbt.TAG_COMPOUND {
+        rt.buf_push(o, 45 as u8) // '-'
+        nl(o)
+        return compound(b, o, depth + 1)
+    }
+    return false
+}
+
+// The entries of a compound up to its TAG_End.
+fn compound(b: *mut bytes.Bytes, o: *mut rt.Buf, depth: i32) -> bool {
+    if depth > nbt.NBT_MAX_DEPTH {
+        return false
+    }
+    var running: bool = true
+    while running {
+        let t: u8 = nbt.nbt_read_type(b) catch 255 as u8
+        if t == 255 as u8 {
+            return false
+        }
+        if t == nbt.TAG_END {
+            head(o, depth, t, 0, 0)
+            rt.buf_push(o, 45 as u8)
+            nl(o)
+            running = false
+        } else {
+            var n: usize = 0
+            let p: u64 = nbt.nbt_read_name(b, &n) catch 0
+            if p == 0 && n != 0 {
+                return false
+            }
+            head(o, depth, t, p, n)
+            if !value(b, o, t, depth) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        return 2
+    }
+    var src: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&src)
+    if !rt.read_file(rt.arg_ptr(start, 1), &src) {
+        return 3
+    }
+    var anon: bool = false
+    if rt.arg_count(start) > 2 {
+        var a: [u8; 5] = "anon\0"
+        let p2: u64 = rt.arg_ptr(start, 2)
+        if rt.c_length(p2) == 4 && rt.mem_eq(p2, (&a[0]) as u64, 4) {
+            anon = true
+        }
+    }
+
+    // The octets already lie in memory -- a `Bytes` over them, without a
+    // second copy.
+    var b: bytes.Bytes = bytes.bytes_with_capacity(rt.buf_len(&src) + 16)
+    defer bytes.bytes_free(&b)
+    bytes.put_raw(&b, rt.buf_ptr(&src), rt.buf_len(&src))
+    bytes.bytes_reset(&b)
+
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+
+    var name: u64 = 0
+    var name_n: usize = 0
+    if anon {
+        let ok: bool = nbt.nbt_read_root_anon(&b) catch false
+        if !ok {
+            return 4
+        }
+    } else {
+        name = nbt.nbt_read_root(&b, &name_n) catch 0
+        if name == 0 && name_n != 0 {
+            return 4
+        }
+    }
+    head(&out, 0, nbt.TAG_COMPOUND, name, name_n)
+    rt.buf_push(&out, 45 as u8)
+    nl(&out)
+    if !compound(&b, &out, 1) {
+        rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+        return 5
+    }
+    // Nothing may be left over. A parser that stops one tag early would
+    // otherwise produce a shorter but consistent looking dump.
+    if bytes.bytes_remaining(&b) != 0 {
+        rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+        return 6
+    }
+    rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+    return 0
+}

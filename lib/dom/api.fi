@@ -1,0 +1,619 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/dom/api.fi -- the DOM as a browser uses it (round B1).
+//
+// WHERE THE NODES COME FROM: the node classes themselves stand in
+// `lib/browser/node.fi` -- `Node`, `Elem`, `Attr`, `Text`, `Comment`,
+// `Doctype`, `Document`, `Fragment`, with parent/child links, attributes
+// and namespaces. They stand there and not here because the tree
+// construction (`lib/browser/tree.fi`) builds them, and a DOM whose node
+// type is not the one the parser produces would be a second DOM.
+//
+// WHAT WAS MISSING and stands here: the ACCESS. A tree without
+// `getElementById`, `querySelector`, `textContent` and `innerHTML` is a
+// data structure, not a DOM. This file is that layer:
+//
+//   walking      dom_next, dom_first_elem, dom_next_elem,
+//                dom_elem_count, dom_elem_at
+//   finding      dom_by_id, dom_by_tag, dom_by_class,
+//                dom_query, dom_query_all       (over lib/css/sel.fi)
+//   text         dom_text_content
+//   markup       dom_inner_html, dom_outer_html (reading, the HTML
+//                fragment serialisation algorithm)
+//   attributes   dom_attr_get, dom_attr_has, dom_attr_set_text,
+//                dom_attr_remove, dom_attr_ns, dom_attr_prefix
+//
+// `lib/dom/dom.fi` stays untouched next to this: that is the GC proof of
+// round 53 (cyclic object graphs), a different thing with a different job.
+//
+// THE COLLECTIONS ARE SNAPSHOTS. `dom_by_tag` and friends fill a `GcVec`
+// and hand it out. A live `HTMLCollection` would have to hang on the node
+// and be invalidated on every change -- that belongs to the DOM events
+// round, not here, and a snapshot is what `querySelectorAll` returns
+// anyway.
+
+import html.mem
+import browser.node
+import browser.names
+import browser.tag
+import css.sel
+
+export {
+    dom_next, dom_next_elem, dom_first_elem, dom_elem_count,
+    dom_elem_at, dom_child_elem_count, dom_child_elem_at,
+    dom_by_id, dom_by_tag, dom_by_class, dom_query, dom_query_all,
+    dom_text_content, dom_inner_html, dom_outer_html,
+    dom_attr_get, dom_attr_has, dom_attr_remove, dom_attr_set_text,
+    dom_chain_equal_cp, dom_class_has,
+    dom_is_void, dom_is_raw_text,
+}
+
+// ------------------------------------------------------------- The walk
+
+// The next node in document order, staying inside `root`.
+fn dom_next(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k == gc_null[Node]() {
+        return gc_null[Node]()
+    }
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+// The next ELEMENT in document order.
+fn dom_next_elem(k: Gc[Node], root: Gc[Node]) -> Gc[Elem] {
+    var c: Gc[Node] = dom_next(k, root)
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            return c.as?[Elem]
+        }
+        c = dom_next(c, root)
+    }
+    return gc_null[Elem]()
+}
+
+// The first element AT or below `root`.
+fn dom_first_elem(root: Gc[Node]) -> Gc[Elem] {
+    if root == gc_null[Node]() {
+        return gc_null[Elem]()
+    }
+    if root.kind == node.K_ELEM {
+        return root.as?[Elem]
+    }
+    return dom_next_elem(root, root)
+}
+
+fn dom_elem_count(root: Gc[Node]) -> u64 {
+    var n: u64 = 0
+    var e: Gc[Elem] = dom_first_elem(root)
+    while e != gc_null[Elem]() {
+        n = n + 1
+        e = dom_next_elem(e, root)
+    }
+    return n
+}
+
+fn dom_elem_at(root: Gc[Node], i: u64) -> Gc[Elem] {
+    var n: u64 = 0
+    var e: Gc[Elem] = dom_first_elem(root)
+    while e != gc_null[Elem]() {
+        if n == i {
+            return e
+        }
+        n = n + 1
+        e = dom_next_elem(e, root)
+    }
+    return gc_null[Elem]()
+}
+
+// `Element.children` -- only the direct element children.
+fn dom_child_elem_count(k: Gc[Node]) -> u64 {
+    if k == gc_null[Node]() {
+        return 0
+    }
+    var n: u64 = 0
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            n = n + 1
+        }
+        c = c.next
+    }
+    return n
+}
+
+fn dom_child_elem_at(k: Gc[Node], i: u64) -> Gc[Elem] {
+    if k == gc_null[Node]() {
+        return gc_null[Elem]()
+    }
+    var n: u64 = 0
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            if n == i {
+                return c.as?[Elem]
+            }
+            n = n + 1
+        }
+        c = c.next
+    }
+    return gc_null[Elem]()
+}
+
+// -------------------------------------------------------------- Finding
+
+// Compares a chain with a code point buffer, byte for byte.
+fn dom_chain_equal_cp(k: Gc[Chain], want: *mut mem.CpBuf) -> bool {
+    if k == gc_null[Chain]() {
+        return mem.cp_len(want) == 0
+    }
+    if node.chain_len(k) != mem.cp_len(want) as u64 {
+        return false
+    }
+    var i: u64 = 0
+    let n: u64 = node.chain_len(k)
+    while i < n {
+        if node.chain_at(k, i) != mem.cp_at(want, i as usize) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// `document.getElementById`. The first element in document order whose
+// `id` matches -- the standard says nothing else happens with duplicates.
+fn dom_by_id(root: Gc[Node], id_attr: u32, want: *mut mem.CpBuf) -> Gc[Elem] {
+    var e: Gc[Elem] = dom_first_elem(root)
+    while e != gc_null[Elem]() {
+        let v: Gc[Chain] = node.attr_value(e, id_attr, 0)
+        if v != gc_null[Chain]() && dom_chain_equal_cp(v, want) {
+            return e
+        }
+        e = dom_next_elem(e, root)
+    }
+    return gc_null[Elem]()
+}
+
+// `getElementsByTagName`. `name` is an atom; 0 means "every element"
+// (that is the `*` of the standard).
+fn dom_by_tag(root: Gc[Node], name: u32) -> AllocError!Gc[GcVec] {
+    let out = try gcvec_new()
+    var e: Gc[Elem] = dom_first_elem(root)
+    while e != gc_null[Elem]() {
+        if name == 0 as u32 || e.name == name {
+            let ok: bool = try gcvec_append[Elem](out, e)
+        }
+        e = dom_next_elem(e, root)
+    }
+    return out
+}
+
+fn is_space(c: u32) -> bool {
+    return c == 9 as u32 || c == 10 as u32 || c == 12 as u32 ||
+    c == 13 as u32 || c == 32 as u32
+}
+
+// Is `want` one of the whitespace separated words of the class attribute?
+fn dom_class_has(v: Gc[Chain], want: *mut mem.CpBuf) -> bool {
+    if v == gc_null[Chain]() {
+        return false
+    }
+    let m: usize = mem.cp_len(want)
+    if m == 0 {
+        return false
+    }
+    let n: u64 = node.chain_len(v)
+    var i: u64 = 0
+    while i < n {
+        while i < n && is_space(node.chain_at(v, i)) {
+            i = i + 1
+        }
+        var j: u64 = i
+        while j < n && !is_space(node.chain_at(v, j)) {
+            j = j + 1
+        }
+        if j - i == m as u64 {
+            var k: u64 = 0
+            var same: bool = true
+            while k < m as u64 {
+                if node.chain_at(v, i + k) != mem.cp_at(want, k as usize) {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                return true
+            }
+        }
+        i = j
+    }
+    return false
+}
+
+fn dom_by_class(root: Gc[Node], class_attr: u32,
+    want: *mut mem.CpBuf) -> AllocError!Gc[GcVec] {
+    let out = try gcvec_new()
+    var e: Gc[Elem] = dom_first_elem(root)
+    while e != gc_null[Elem]() {
+        if dom_class_has(node.attr_value(e, class_attr, 0), want) {
+            let ok: bool = try gcvec_append[Elem](out, e)
+        }
+        e = dom_next_elem(e, root)
+    }
+    return out
+}
+
+// `querySelector` -- the first element in document order that the
+// selector group fits. The matcher is the one of lib/css/sel.fi.
+fn dom_query(root: Gc[Node], s: Gc[Sel], cx: *mut sel.Ctx) -> Gc[Elem] {
+    if s == gc_null[Sel]() {
+        return gc_null[Elem]()
+    }
+    var e: Gc[Elem] = dom_first_elem(root)
+    while e != gc_null[Elem]() {
+        if sel.sel_matches(s, e, cx) {
+            return e
+        }
+        e = dom_next_elem(e, root)
+    }
+    return gc_null[Elem]()
+}
+
+fn dom_query_all(root: Gc[Node], s: Gc[Sel],
+    cx: *mut sel.Ctx) -> AllocError!Gc[GcVec] {
+    let out = try gcvec_new()
+    if s == gc_null[Sel]() {
+        return out
+    }
+    var e: Gc[Elem] = dom_first_elem(root)
+    while e != gc_null[Elem]() {
+        if sel.sel_matches(s, e, cx) {
+            let ok: bool = try gcvec_append[Elem](out, e)
+        }
+        e = dom_next_elem(e, root)
+    }
+    return out
+}
+
+// ----------------------------------------------------------- textContent
+
+// `Node.textContent` (DOM 4.4): the text of all descendants, comments and
+// processing instructions left out. For a text node it is its own data.
+fn dom_text_content(k: Gc[Node]) -> AllocError!Gc[Chain] {
+    let out = try node.chain_new()
+    if k == gc_null[Node]() {
+        return out
+    }
+    if k.kind == node.K_TEXT {
+        let t: Gc[Text] = k.as?[Text]
+        let ok: bool = try chain_after(out, t.data)
+        return out
+    }
+    if k.kind == node.K_COMMENT {
+        let c: Gc[Comment] = k.as?[Comment]
+        let ok: bool = try chain_after(out, c.data)
+        return out
+    }
+    var c2: Gc[Node] = dom_next(k, k)
+    while c2 != gc_null[Node]() {
+        if c2.kind == node.K_TEXT {
+            let t2: Gc[Text] = c2.as?[Text]
+            let ok: bool = try chain_after(out, t2.data)
+        }
+        c2 = dom_next(c2, k)
+    }
+    return out
+}
+
+fn chain_after(out: Gc[Chain], src: Gc[Chain]) -> AllocError!bool {
+    if src == gc_null[Chain]() {
+        return true
+    }
+    var s: Gc[Strand] = src.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            let ok: bool = try node.chain_push(out, s.chars[i])
+            i = i + 1
+        }
+        s = s.next
+    }
+    return true
+}
+
+// ------------------------------------------------------------ innerHTML
+
+// The void elements: they get no end tag in the serialisation.
+fn dom_is_void(name: u32, ns: u32) -> bool {
+    if ns != node.NS_HTML {
+        return false
+    }
+    return name == tag.M_AREA || name == tag.M_BASE || name == tag.M_BR ||
+    name == tag.M_COL || name == tag.M_EMBED || name == tag.M_HR ||
+    name == tag.M_IMG || name == tag.M_INPUT || name == tag.M_LINK ||
+    name == tag.M_META || name == tag.M_PARAM || name == tag.M_SOURCE ||
+    name == tag.M_TRACK || name == tag.M_WBR || name == tag.M_KEYGEN
+}
+
+// The elements whose content is NOT escaped when serialised.
+fn dom_is_raw_text(name: u32, ns: u32) -> bool {
+    if ns != node.NS_HTML {
+        return false
+    }
+    return name == tag.M_STYLE || name == tag.M_SCRIPT || name == tag.M_XMP ||
+    name == tag.M_IFRAME || name == tag.M_NOEMBED || name == tag.M_NOFRAMES ||
+    name == tag.M_PLAINTEXT
+}
+
+#[no_gc]
+fn cp_out(out: *mut mem.Buf, c: u32) {
+    if c < 0x80 as u32 {
+        mem.buf_push(out, c as u8)
+    } else if c < 0x800 as u32 {
+        mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else if c < 0x10000 as u32 {
+        mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else {
+        mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    }
+}
+
+#[no_gc]
+fn lit_out(out: *mut mem.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// "escaping a string" of the HTML fragment serialisation algorithm.
+// In an attribute `&`, U+00A0 and `"` are replaced, outside one `&`,
+// U+00A0, `<` and `>`.
+#[no_gc]
+fn escaped_cp(out: *mut mem.Buf, c: u32, in_attribute: bool) {
+    if c == 38 as u32 {
+        var l: [u8; 5] = "&amp;"
+        lit_out(out, &l[0], 5)
+        return
+    }
+    if c == 0xA0 as u32 {
+        var l: [u8; 6] = "&nbsp;"
+        lit_out(out, &l[0], 6)
+        return
+    }
+    if in_attribute && c == 34 as u32 {
+        var l: [u8; 6] = "&quot;"
+        lit_out(out, &l[0], 6)
+        return
+    }
+    if !in_attribute && c == 60 as u32 {
+        var l: [u8; 4] = "&lt;"
+        lit_out(out, &l[0], 4)
+        return
+    }
+    if !in_attribute && c == 62 as u32 {
+        var l: [u8; 4] = "&gt;"
+        lit_out(out, &l[0], 4)
+        return
+    }
+    cp_out(out, c)
+}
+
+fn chain_out(out: *mut mem.Buf, k: Gc[Chain], escape: bool, in_attribute: bool) {
+    if k == gc_null[Chain]() {
+        return
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            if escape {
+                escaped_cp(out, s.chars[i], in_attribute)
+            } else {
+                cp_out(out, s.chars[i])
+            }
+            i = i + 1
+        }
+        s = s.next
+    }
+}
+
+#[no_gc]
+fn name_out(out: *mut mem.Buf, nm: *mut names.Names, id: u32) {
+    let p: *mut u8 = names.names_ptr(nm, id)
+    let n: usize = names.names_length(nm, id)
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// The qualified attribute name of the serialisation: `xlink:href`,
+// `xmlns`, `xml:lang` -- prefix and local name joined by a colon again.
+fn attr_name_out(out: *mut mem.Buf, nm: *mut names.Names, a: Gc[Attr]) {
+    if a.prefix != 0 as u32 {
+        name_out(out, nm, a.prefix)
+        mem.buf_push(out, 58 as u8)
+    }
+    name_out(out, nm, a.name)
+}
+
+fn node_out(out: *mut mem.Buf, nm: *mut names.Names, k: Gc[Node]) {
+    if k == gc_null[Node]() {
+        return
+    }
+    let kind: u32 = k.kind
+    if kind == node.K_TEXT {
+        let t: Gc[Text] = k.as?[Text]
+        var raw: bool = false
+        let parent: Gc[Node] = k.parent
+        if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+            let pe: Gc[Elem] = parent.as?[Elem]
+            raw = dom_is_raw_text(pe.name, pe.ns)
+        }
+        chain_out(out, t.data, !raw, false)
+        return
+    }
+    if kind == node.K_COMMENT {
+        let c: Gc[Comment] = k.as?[Comment]
+        var l1: [u8; 4] = "<!--"
+        lit_out(out, &l1[0], 4)
+        chain_out(out, c.data, false, false)
+        var l2: [u8; 3] = "-->"
+        lit_out(out, &l2[0], 3)
+        return
+    }
+    if kind == node.K_DOCTYPE {
+        let d: Gc[Doctype] = k.as?[Doctype]
+        var l1: [u8; 10] = "<!DOCTYPE "
+        lit_out(out, &l1[0], 10)
+        chain_out(out, d.name, false, false)
+        mem.buf_push(out, 62 as u8)
+        return
+    }
+    if kind != node.K_ELEM {
+        // A document or a fragment: only the children.
+        var c2: Gc[Node] = k.first_child
+        while c2 != gc_null[Node]() {
+            node_out(out, nm, c2)
+            c2 = c2.next
+        }
+        return
+    }
+    let e: Gc[Elem] = k.as?[Elem]
+    mem.buf_push(out, 60 as u8) // <
+    name_out(out, nm, e.name)
+    var a: Gc[Attr] = e.first_attr
+    while a != gc_null[Attr]() {
+        mem.buf_push(out, 32 as u8)
+        attr_name_out(out, nm, a)
+        mem.buf_push(out, 61 as u8) // =
+        mem.buf_push(out, 34 as u8) // "
+        chain_out(out, a.value, true, true)
+        mem.buf_push(out, 34 as u8)
+        a = a.next
+    }
+    mem.buf_push(out, 62 as u8) // >
+    if dom_is_void(e.name, e.ns) {
+        return
+    }
+    // A `template` serialises its CONTENT, not its (empty) child list.
+    var first: Gc[Node] = e.first_child
+    if e.name == tag.M_TEMPLATE && e.ns == node.NS_HTML {
+        let f: Gc[Fragment] = node.elem_content_read(e)
+        if f != gc_null[Fragment]() {
+            first = f.first_child
+        }
+    }
+    var c: Gc[Node] = first
+    while c != gc_null[Node]() {
+        node_out(out, nm, c)
+        c = c.next
+    }
+    mem.buf_push(out, 60 as u8)
+    mem.buf_push(out, 47 as u8) // /
+    name_out(out, nm, e.name)
+    mem.buf_push(out, 62 as u8)
+}
+
+// `Element.innerHTML` (reading): the children serialised.
+fn dom_inner_html(k: Gc[Node], nm: *mut names.Names, out: *mut mem.Buf) {
+    if k == gc_null[Node]() {
+        return
+    }
+    var first: Gc[Node] = k.first_child
+    if k.kind == node.K_ELEM {
+        let e: Gc[Elem] = k.as?[Elem]
+        if e.name == tag.M_TEMPLATE && e.ns == node.NS_HTML {
+            let f: Gc[Fragment] = node.elem_content_read(e)
+            if f != gc_null[Fragment]() {
+                first = f.first_child
+            }
+        }
+    }
+    var c: Gc[Node] = first
+    while c != gc_null[Node]() {
+        node_out(out, nm, c)
+        c = c.next
+    }
+}
+
+// `Element.outerHTML` (reading): the element itself included.
+fn dom_outer_html(k: Gc[Node], nm: *mut names.Names, out: *mut mem.Buf) {
+    node_out(out, nm, k)
+}
+
+// ----------------------------------------------------------- Attributes
+
+fn dom_attr_get(e: Gc[Elem], name: u32, ns: u32) -> Gc[Chain] {
+    return node.attr_value(e, name, ns)
+}
+
+fn dom_attr_has(e: Gc[Elem], name: u32, ns: u32) -> bool {
+    return node.attr_find(e, name, ns) != gc_null[Attr]()
+}
+
+// Sets an attribute, overwriting an existing one -- `attr_set` of
+// lib/browser/node.fi deliberately does NOT overwrite (the parser rule for
+// duplicate attributes on one tag), and setting it from the DOM is the
+// other case.
+fn dom_attr_set_text(e: Gc[Elem], name: u32, ns: u32, prefix: u32,
+    value: *mut mem.CpBuf) -> AllocError!bool {
+    let k = try node.chain_new()
+    var i: usize = 0
+    let n: usize = mem.cp_len(value)
+    while i < n {
+        let ok: bool = try node.chain_push(k, mem.cp_at(value, i))
+        i = i + 1
+    }
+    let old: Gc[Attr] = node.attr_find(e, name, ns)
+    if old != gc_null[Attr]() {
+        old.value = k
+        return true
+    }
+    return try node.attr_set_full(e, name, ns, prefix, k)
+}
+
+fn dom_attr_remove(e: Gc[Elem], name: u32, ns: u32) -> bool {
+    if e == gc_null[Elem]() {
+        return false
+    }
+    var a: Gc[Attr] = e.first_attr
+    var before: Gc[Attr] = gc_null[Attr]()
+    while a != gc_null[Attr]() {
+        if a.name == name && a.ns == ns {
+            if before == gc_null[Attr]() {
+                e.first_attr = a.next
+            } else {
+                before.next = a.next
+            }
+            if e.last_attr == a {
+                e.last_attr = before
+            }
+            e.nattr = e.nattr - 1
+            return true
+        }
+        before = a
+        a = a.next
+    }
+    return false
+}

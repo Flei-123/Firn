@@ -1,0 +1,4482 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/parser.fi -- THE FIRN PARSER, WRITTEN IN FIRN.
+//
+// Recursive descent, no generator -- exactly like `compiler/src/parser.rs`.
+// It builds into `ast.Tree`: nodes are addressed by `Vec` index rather than by
+// pointer (docs/SELF_HOSTING.md section 2.4).
+//
+// SCOPE: the CORE LANGUAGE. Anything that keeps its tree outside `Program` --
+// `enum`/`match`, error unions, generic templates, `gc class`, attributes,
+// `comptime` -- is out of scope. Such files are counted and skipped in the
+// comparison, not silently ignored.
+//
+// OUT OF SCOPE AS WELL: error recovery. `firnc0` collects up to forty
+// messages and keeps reading; this parser reports the first one and stops.
+// That is honestly less -- and it does not matter for the comparison, because
+// it only ever runs on sources that `firnc0` reads without errors.
+//
+// A RULE THAT IS EASILY MISSED: an operator at the START OF A LINE does NOT
+// continue the expression while no bracket is open (`next()`).
+// That is why
+//     a
+//     - b
+// parses as two statements, not as a subtraction.
+
+import rt
+import vec
+import intern
+import lexer
+import ast
+import mono
+import pattern
+import err
+import gc
+import iface
+
+export { Parser, par_new, par_new_module, par_free, par_run, par_error, par_tree,
+    par_file_set,
+    par_not_core, par_tree_take, par_gen_set, par_mu_set,
+    par_fe_set, par_time_set, par_gc_set, par_if_set }
+
+// token kinds from lexer.fi (in the same order as in compiler/src/lexer.rs)
+// "no value"
+const NONE: u32 = 4294967295
+
+const A_INT: u32 = 0
+const A_IDENT: u32 = 1
+const A_FLOAT: u32 = 2
+// ROUND 71 (lexer.fi): the float literal with the suffix `f`.
+const A_FLOATF32: u32 = 83
+const A_STR: u32 = 3
+const A_KWFN: u32 = 4
+const A_KWLET: u32 = 5
+const A_KWVAR: u32 = 6
+const A_KWIF: u32 = 7
+const A_KWELSE: u32 = 8
+const A_KWWHILE: u32 = 9
+const A_KWRETURN: u32 = 10
+const A_KWSTRUCT: u32 = 11
+const A_KWCONST: u32 = 12
+const A_KWPROFILE: u32 = 13
+const A_KWAS: u32 = 14
+const A_KWMUT: u32 = 15
+const A_KWTRUE: u32 = 16
+const A_KWFALSE: u32 = 17
+const A_KWSYSCALL: u32 = 18
+const A_KWEXTERN: u32 = 19
+const A_KWBREAK: u32 = 20
+const A_KWCONTINUE: u32 = 21
+const A_KWDEFER: u32 = 22
+const A_KWERRDEFER: u32 = 23
+const A_KWCOMPTIME: u32 = 24
+const A_KWFOR: u32 = 25
+const A_KWIN: u32 = 26
+const A_KWIMPORT: u32 = 27
+const A_KWEXPORT: u32 = 28
+const A_KWENUM: u32 = 29
+const A_KWMATCH: u32 = 30
+const A_KWERROR: u32 = 31
+const A_KWTRY: u32 = 32
+const A_KWCATCH: u32 = 33
+const A_LPAREN: u32 = 34
+const A_RPAREN: u32 = 35
+const A_LBRACE: u32 = 36
+const A_RBRACE: u32 = 37
+const A_LBRACKET: u32 = 38
+const A_RBRACKET: u32 = 39
+const A_COMMA: u32 = 40
+const A_COLON: u32 = 41
+const A_SEMI: u32 = 42
+const A_DOT: u32 = 43
+const A_DOTDOT: u32 = 44
+const A_ARROW: u32 = 45
+const A_ASSIGN: u32 = 46
+const A_PLUS: u32 = 47
+const A_MINUS: u32 = 48
+const A_STAR: u32 = 49
+const A_SLASH: u32 = 50
+const A_PERCENT: u32 = 51
+const A_AMP: u32 = 52
+const A_PIPE: u32 = 53
+const A_CARET: u32 = 54
+const A_SHL: u32 = 55
+const A_SHR: u32 = 56
+const A_ANDAND: u32 = 57
+const A_OROR: u32 = 58
+const A_NOT: u32 = 59
+const A_QUESTION: u32 = 60
+const A_HASH: u32 = 61
+const A_EQEQ: u32 = 62
+const A_NOTEQ: u32 = 63
+const A_LT: u32 = 64
+const A_LE: u32 = 65
+const A_GT: u32 = 66
+const A_GE: u32 = 67
+const A_EOF: u32 = 68
+const A_FSTR: u32 = 69
+// ROUND 68: `~`, the bitwise complement.
+const A_TILDE: u32 = 70
+// ROUND 70 (lexer.fi): the compound assignments and the two step operators.
+const A_PLUSEQ: u32 = 71
+const A_MINUSEQ: u32 = 72
+const A_STAREQ: u32 = 73
+const A_SLASHEQ: u32 = 74
+const A_PERCENTEQ: u32 = 75
+const A_AMPEQ: u32 = 76
+const A_PIPEEQ: u32 = 77
+const A_CARETEQ: u32 = 78
+const A_SHLEQ: u32 = 79
+const A_SHREQ: u32 = 80
+const A_PLUSPLUS: u32 = 81
+const A_MINUSMINUS: u32 = 82
+// ROUND 72 (lexer.fi): `+% -% *%` and `+| -| *|` -- SPEC 13, item L9.
+const A_PLUSPERCENT: u32 = 84
+const A_MINUSPERCENT: u32 = 85
+const A_STARPERCENT: u32 = 86
+const A_PLUSPIPE: u32 = 87
+const A_MINUSPIPE: u32 = 88
+const A_STARPIPE: u32 = 89
+// ROUND 89 (SPEC 14.1.statics) -- see lexer.fi for why 90 and not 34.
+const A_KWSTATIC: u32 = 90
+
+// binary operators -- in the same order as `ast::BinOp`.
+const B_ADD: u32 = 0
+const B_SUB: u32 = 1
+const B_MUL: u32 = 2
+const B_DIV: u32 = 3
+const B_REM: u32 = 4
+const B_AND: u32 = 5
+const B_OR: u32 = 6
+const B_XOR: u32 = 7
+const B_SHL: u32 = 8
+const B_SHR: u32 = 9
+const B_EQ: u32 = 10
+const B_NE: u32 = 11
+const B_LT: u32 = 12
+const B_LE: u32 = 13
+const B_GT: u32 = 14
+const B_GE: u32 = 15
+const B_LAND: u32 = 16
+const B_LOR: u32 = 17
+// ROUND 72 (ast.rs::BinOp) -- the explicit forms that are NEVER checked,
+// in any build level. `+% -% *%` keep the low order bits, `+| -| *|` clamp
+// to the type's own MIN/MAX. Same precedence as the operators they are
+// spelled after: `+%`/`-%`/`+|`/`-|` bind like `+`, `*%`/`*|` like `*`.
+const B_ADDWRAP: u32 = 18
+const B_SUBWRAP: u32 = 19
+const B_MULWRAP: u32 = 20
+const B_ADDSAT: u32 = 21
+const B_SUBSAT: u32 = 22
+const B_MULSAT: u32 = 23
+
+// unary operators
+const U_NEG: u32 = 0
+const U_NOT: u32 = 1
+const U_ADDR: u32 = 2
+const U_DEREF: u32 = 3
+// ROUND 68: `~x`, the bitwise complement. Deliberately NOT the same
+// operator as `!`: `!` negates a bool, `~` flips every bit.
+const U_BITNOT: u32 = 4
+
+struct Parser {
+    lx: u64, // pointer to the lexer
+    pos: usize,
+    n: usize,
+    tree: ast.Tree,
+    // MODULE SYSTEM. If `alias` is set, this file is not the root file:
+    // every identifier it declares ITSELF at the top level is prefixed with `alias__`.
+    // That way all files live in ONE tree without two functions that happen to
+    // share a name getting in each other's way. `firnc0` does the same in
+    // `modules.rs`, only after parsing rather than during it.
+    alias: u32,
+    own: Vec[u32], // top level names declared by this file
+    foreign: u64, // shared tree (0 = we use our own)
+    module: Vec[u32], // intern numbers of the module aliases (for `module.x`)
+    scratch: rt.Buf, // builds up qualified names
+    parens: usize, // open parentheses (for `next()`)
+    no_slit: usize, // > 0: no struct literal at the top level
+    err: usize,
+    not_core: bool, // file uses an extension that is not ported
+    // GENERIC TEMPLATES. The store sits OUTSIDE the parser because it has to be
+    // shared by all files of a translation: the root file may use `Vec[i32]`
+    // while `Vec[T]` is declared in some module.
+    // 0 = no registry; then generics count as an extension that is not ported.
+    gen: u64,
+    // Registry of enumerations and pattern matches (round 32). Built like
+    // `gen`: the store sits outside the parser because it has to be shared by
+    // all files of a translation.
+    // 0 = no registry; then `enum`/`match` are not ported.
+    mu: u64,
+    // Registry of the error sets and unions (round 33). Built like `mu`:
+    // one store for all files of the translation.
+    // 0 = no registry; then `error`/`try`/`catch` are not ported.
+    feh: u64,
+    // ROUND 35: `comptime { ... }` is recognised. No registry outside the tree
+    // is needed -- the blocks are held as block numbers in the tree itself
+    // (`ast.ct_block`), and the interpreter lives in time.fi. Only the FLAG belongs
+    // here, because `extensions_search` has to know before parsing whether the
+    // keyword is core language (the same handover as in rounds 31-33).
+    time: bool,
+    // ROUND 34: registry of the gc classes (`gc.fi`). Built like `mu`/`feh`:
+    // one store for all files of the translation, because class names are
+    // visible program wide. 0 = no registry; then
+    // `gc class`, `Gc[T]`, `x.as?[C]` and `#[no_gc]` are not ported.
+    gcr: u64,
+    // ROUND 46: registry of the interfaces (`iface.fi`). Built the same way
+    // as `gcr`. 0 = no registry; then `interface` blocks are still parsed
+    // correctly, but they are not kept -- which is enough for
+    // `bin/astdump.fi`, whose reference (`ast_canon.rs`) does not print them
+    // either.
+    ifr: u64,
+    // The `#[no_gc]` attribute in front of the next function declaration.
+    nogc_pending: u32,
+    // ROUND 52: `#[interrupt]` in front of the next function (SPEC 2).
+    int_pending: u32,
+    // ROUND 89: `#[panic_handler]` seen, waiting for the function it belongs to.
+    ph_pending: u32,
+    // The `#[must_consume]` attribute in front of the next fn or struct
+    // declaration (round 36, attrs.rs -- Target::Both).
+    mc_pending: u32,
+    // ROUND 75 (SPEC 14.5): the interned argument of `#[link_name(...)]`
+    // in front of the next 'extern fn'; MEANINGFUL only when
+    // `link_pending_set` is true (0 is a perfectly ordinary intern number,
+    // not a sentinel -- see `codegen.fi`'s `extern_link_of`).
+    link_pending: u32,
+    link_pending_set: bool,
+    // ROUND 75 (SPEC 14.5): `#[export_c]` in front of the next fn.
+    export_pending: u32,
+    tpoff: u32, // start of the current type parameter list
+    // Intern number of `size_of`, or -1. `size_of` is NOT a keyword
+    // (sizeof.rs) -- it can only be recognised by its spelling.
+    sonr: i64,
+    // LOCAL NAMES, as a stack of scopes. A parameter or a local variable
+    // SHADOWS an entry of the same name in the same file.
+    local: Vec[u32],
+    llimit: Vec[u32],
+    // ROUND 39, interpolation: the hidden `let _fsegK_N` bindings for the
+    // text segments -- `block` hoists them in front of the next statement.
+    hoist: Vec[u32],
+    // > 0: an interpolation is already running -- nesting is not supported yet.
+    interp: u32,
+    // ROUND 79: the number of the file being parsed, in the file table of
+    // the TREE (`ast.file_add`). It goes into the packed position of every
+    // node this parser makes, so that a message out of a module names the
+    // module and not the root file.
+    file: u32,
+    // ROUND 79: `#[allow_escape]` in front of the next function (attrs.rs).
+    esc_pending: u32,
+    // ROUND ARM-FREESTANDING: `#[arch(...)]` in front of the next function
+    // (archsel.rs in firnc0). 0 = nothing said, 1 = this machine, 2 = another
+    // machine, so the declaration is parsed and THROWN AWAY. This stage
+    // generates x86-64 and nothing else, so 1 means `x86_64` -- and that is
+    // written down here rather than assumed, because the day this file grows
+    // an A64 code generator is the day the constant has to move.
+    arch_pending: u32,
+    // ROUND 79: `[T; _]` is only allowed where an initializer follows that
+    // the length can be taken from -- the type of a `let`/`var`. `let_stmt`
+    // switches this on around exactly that call; everywhere else a `_` is
+    // refused right here, so `ast.LEN_INFER` never leaves the parser.
+    infer_len_ok: bool,
+}
+
+fn par_new(lx: u64) -> Parser {
+    var p: Parser = Parser {
+        lx: lx, pos: 0, n: 0,
+        tree: ast.tree_new(),
+        alias: NONE, own: vec_new[u32](), foreign: 0,
+        module: vec_new[u32](),
+        scratch: rt.buf_new(),
+        parens: 0, no_slit: 0, err: 0, not_core: false,
+        gen: 0, mu: 0, feh: 0, time: false, gcr: 0, ifr: 0, nogc_pending: 0, int_pending: 0, ph_pending: 0, mc_pending: 0,
+        link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1,
+        local: vec_new[u32](), llimit: vec_new[u32](),
+        hoist: vec_new[u32](), interp: 0,
+        file: 0, esc_pending: 0, arch_pending: 0, infer_len_ok: false,
+    }
+    p.n = lexer.lex_count(lx as *mut lexer.Lexer)
+    // ROUND 83: a parser that owns its tree registers the file it is about
+    // to read, right here. `firnc1.fi` does it itself for the modules of a
+    // real translation (`par_file_set`, round 79), but the small drivers --
+    // `bin/firdump.fi`, `bin/astdump.fi` and their kind -- never did, and
+    // since the checked arithmetic bakes the file name into the panic
+    // message at LOWERING time, a tree without a file table made
+    // `firdump` print `at :13:13` while `firnc0` printed the path
+    // (found by tools/atomic/run.sh, which compares the two FIR texts
+    // octet for octet). Round 72 could not run into this: it carried the
+    // intern number of the name in the position itself.
+    var nb: rt.Buf = rt.buf_new()
+    lexer.lex_file_name(lx as *mut lexer.Lexer, &nb)
+    p.file = ast.file_add(&p.tree, rt.buf_ptr(&nb), rt.buf_len(&nb))
+    rt.buf_free(&nb)
+    return p
+}
+
+// Like `par_new`, but into a SHARED tree and with a module alias.
+// `alias == NONE` means the root file (no renaming).
+fn par_new_module(lx: u64, tree: u64, alias: u32) -> Parser {
+    var p: Parser = par_new(lx)
+    p.foreign = tree
+    p.alias = alias
+    return p
+}
+
+// ROUND 79: which file of the tree's file table this parser reads. Again
+// BEFORE `par_run`.
+fn par_file_set(p: *mut Parser, f: u32) { (*p).file = f }
+
+// The packed position of the token `k` ahead (round 79). At the end of the
+// stream the position of the last token, so that a message never loses its
+// place.
+fn at_pos(p: *mut Parser, k: usize) -> u64 {
+    var i: usize = (*p).pos + k
+    if i >= (*p).n {
+        if (*p).n == 0 {
+            return ast.pos_pack((*p).file, 1, 1)
+        }
+        i = (*p).n - 1
+    }
+    return ast.pos_pack((*p).file, lexer.lex_line(lx(p), i), lexer.lex_col(lx(p), i))
+}
+
+// Register the store for the generic templates. MUST happen before `par_run`.
+fn par_gen_set(p: *mut Parser, g: u64) { (*p).gen = g }
+
+// Register the store for enumerations and matches. Again BEFORE `par_run`.
+fn par_mu_set(p: *mut Parser, m: u64) { (*p).mu = m }
+
+// Register the store for the error unions. Again BEFORE `par_run`.
+fn par_fe_set(p: *mut Parser, f: u64) { (*p).feh = f }
+
+fn gn(p: *mut Parser) -> *mut mono.Gen { return (*p).gen as *mut mono.Gen }
+fn has_gen(p: *mut Parser) -> bool { return (*p).gen != 0 }
+fn mn(p: *mut Parser) -> *mut pattern.Pat { return (*p).mu as *mut pattern.Pat }
+fn has_mu(p: *mut Parser) -> bool { return (*p).mu != 0 }
+fn fh(p: *mut Parser) -> *mut err.Error { return (*p).feh as *mut err.Error }
+fn has_fe(p: *mut Parser) -> bool { return (*p).feh != 0 }
+
+// ROUND 35: register `comptime` blocks.
+fn par_time_set(p: *mut Parser) { (*p).time = true }
+fn has_time(p: *mut Parser) -> bool { return (*p).time }
+
+// ROUND 34: register the gc registry. Again BEFORE `par_run`.
+fn par_gc_set(p: *mut Parser, g: u64) { (*p).gcr = g }
+fn par_if_set(p: *mut Parser, f: u64) { (*p).ifr = f }
+fn ifr(p: *mut Parser) -> *mut iface.If { return (*p).ifr as *mut iface.If }
+fn has_if(p: *mut Parser) -> bool { return (*p).ifr != 0 }
+fn gr(p: *mut Parser) -> *mut gc.Gc { return (*p).gcr as *mut gc.Gc }
+fn has_gc(p: *mut Parser) -> bool { return (*p).gcr != 0 }
+
+fn par_tree_take(p: *mut Parser) -> *mut ast.Tree {
+    return par_tree(p)
+}
+
+fn par_free(p: *mut Parser) {
+    // A SHARED tree belongs to the caller.
+    if (*p).foreign == 0 {
+        ast.tree_free(&(*p).tree)
+    }
+    vec_free[u32](&(*p).module)
+    vec_free[u32](&(*p).own)
+    rt.buf_free(&(*p).scratch)
+    vec_free[u32](&(*p).local)
+    vec_free[u32](&(*p).llimit)
+    vec_free[u32](&(*p).hoist)
+}
+
+fn par_error(p: *mut Parser) -> usize { return (*p).err }
+fn par_tree(p: *mut Parser) -> *mut ast.Tree {
+    if (*p).foreign != 0 {
+        return (*p).foreign as *mut ast.Tree
+    }
+    return &(*p).tree
+}
+fn par_not_core(p: *mut Parser) -> bool { return (*p).not_core }
+
+fn lx(p: *mut Parser) -> *mut lexer.Lexer { return (*p).lx as *mut lexer.Lexer }
+
+// ------------------------------------------------------------- token access
+
+fn kind(p: *mut Parser, k: usize) -> u32 {
+    if (*p).pos + k >= (*p).n {
+        return A_EOF
+    }
+    return lexer.lex_kind(lx(p), (*p).pos + k)
+}
+
+fn tok_nr(p: *mut Parser, k: usize) -> u32 {
+    if (*p).pos + k >= (*p).n {
+        return 0
+    }
+    return lexer.lex_nr(lx(p), (*p).pos + k)
+}
+
+fn number(p: *mut Parser) -> u64 {
+    if (*p).pos >= (*p).n {
+        return 0
+    }
+    return lexer.lex_number(lx(p), (*p).pos)
+}
+
+fn line(p: *mut Parser, i: usize) -> u32 {
+    if i >= (*p).n {
+        return 0
+    }
+    return lexer.lex_line(lx(p), i)
+}
+
+// ROUND 72 (parser.rs::span/join) -- WHERE an expression begins.
+//
+// `firnc0` carries a span on every AST node and builds a compound node's
+// span with `join(left, right)`, whose BOTH branches keep the left
+// operand's file, line and column. So the rule the tree needs is exactly
+// this: a leaf takes the token it starts at, a compound takes its left
+// (or base) operand, and `( e )` is transparent because the parenthesised
+// form returns the inner node itself. `pos_default` writes only into a
+// node that has none yet, which is what makes the parenthesis case fall
+// out for free.
+fn pos_now(p: *mut Parser) -> u64 {
+    return at_pos(p, 0)
+}
+
+fn pos_default(p: *mut Parser, e: u32, v: u64) {
+    if e == NONE {
+        return
+    }
+    let b: *mut ast.Tree = par_tree(p)
+    if e as usize >= ast.expr_count(b) {
+        return
+    }
+    if ast.pos_line(ast.expr_pos(b, e)) == 0 {
+        ast.expr_pos_set(b, e, v)
+    }
+}
+
+// A compound node takes the position of the operand it is built on.
+fn pos_from(p: *mut Parser, e: u32, source: u32) {
+    if e == NONE || source == NONE {
+        return
+    }
+    let b: *mut ast.Tree = par_tree(p)
+    if e as usize >= ast.expr_count(b) || source as usize >= ast.expr_count(b) {
+        return
+    }
+    ast.expr_pos_set(b, e, ast.expr_pos(b, source))
+}
+
+fn at_end(p: *mut Parser) -> bool { return kind(p, 0) == A_EOF }
+
+fn actual(p: *mut Parser, a: u32) -> bool { return kind(p, 0) == a }
+
+fn next_bump(p: *mut Parser) {
+    if (*p).pos < (*p).n {
+        (*p).pos = (*p).pos + 1
+    }
+}
+
+fn eat(p: *mut Parser, a: u32) -> bool {
+    if actual(p, a) {
+        next_bump(p)
+        return true
+    }
+    return false
+}
+
+// Is the current token at the START OF A LINE?
+fn line_start(p: *mut Parser) -> bool {
+    if (*p).pos == 0 {
+        return true
+    }
+    if (*p).pos >= (*p).n {
+        return true
+    }
+    return line(p, (*p).pos) > line(p, (*p).pos - 1)
+}
+
+// ROUND 68 -- the tokens that carry an expression over a line break.
+// Every one of them is INFIX ONLY: no statement of the language may begin
+// with it, so the reading is unambiguous. `*`, `(` and `[` are deliberately
+// NOT in the list -- a line may legitimately begin with `*p = 0`, with
+// `(*p).f = 0` or with an index, and none of those may silently become a
+// multiplication, a call or an index belonging to the line before.
+fn continues_line(a: u32) -> bool {
+    if a == A_PLUS || a == A_MINUS || a == A_SLASH || a == A_PERCENT {
+        return true
+    }
+    if a == A_AMP || a == A_PIPE || a == A_CARET || a == A_SHL || a == A_SHR {
+        return true
+    }
+    if a == A_ANDAND || a == A_OROR {
+        return true
+    }
+    if a == A_EQEQ || a == A_NOTEQ || a == A_LT || a == A_LE || a == A_GT || a == A_GE {
+        return true
+    }
+    if a == A_DOT || a == A_KWAS {
+        return true
+    }
+    return false
+}
+
+// May the expression continue with the current token?
+fn next(p: *mut Parser) -> bool {
+    if (*p).parens > 0 {
+        return true
+    }
+    if !line_start(p) {
+        return true
+    }
+    return continues_line(kind(p, 0))
+}
+
+fn complain(p: *mut Parser) {
+    (*p).err = (*p).err + 1
+}
+
+fn expect(p: *mut Parser, a: u32) -> bool {
+    if eat(p, a) {
+        return true
+    }
+    complain(p)
+    return false
+}
+
+// -------------------------------------------------------------------- names
+
+// Joins two names with a separator and interns the result.
+fn join(p: *mut Parser, a: u32, sep: u64, tn: usize, b: u32) -> u32 {
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    rt.buf_clear(&(*p).scratch)
+    rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it, a), intern.intern_length(it, a))
+    rt.buf_push_bytes(&(*p).scratch, sep, tn)
+    rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it, b), intern.intern_length(it, b))
+    return intern.intern_number(it, rt.buf_ptr(&(*p).scratch), rt.buf_len(&(*p).scratch)) as u32
+}
+
+// Is `nr` an identifier that THIS file declares at the top level?
+fn is_own(p: *mut Parser, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).own) {
+        if vec_at[u32](&(*p).own, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Rename an identifier of this file to `alias__name`. In the root file
+// everything stays as it is.
+// ------------------------------------------------------------- local names
+//
+// `fn par_new(lx: u64)` in a file that has `fn lx(..)` too: inside the body
+// `lx` is the PARAMETER. Without this list it was renamed to `parser__lx`
+// and was gone -- which only showed up during self compilation in
+// round 31, because until then no module had a parameter named like one of
+// its own functions. `modules.rs::Renamer` keeps the same list.
+//
+// ONLY VALUES are shadowed. A call `lx(p)` still means the function
+// (`Renamer::resolve` with `is_value = false`), and a TYPE NAME
+// always does.
+fn loc_on(p: *mut Parser) {
+    vec_push[u32](&(*p).llimit, vec_len[u32](&(*p).local) as u32)
+}
+
+fn loc_off(p: *mut Parser) {
+    if vec_len[u32](&(*p).llimit) == 0 {
+        return
+    }
+    let g: u32 = vec_pop[u32](&(*p).llimit)
+    while vec_len[u32](&(*p).local) > g as usize {
+        vec_pop[u32](&(*p).local)
+    }
+}
+
+fn loc_add(p: *mut Parser, nr: u32) { vec_push[u32](&(*p).local, nr) }
+
+fn is_local(p: *mut Parser, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).local) {
+        if vec_at[u32](&(*p).local, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn renamed(p: *mut Parser, nr: u32) -> u32 {
+    if (*p).alias == NONE {
+        return nr
+    }
+    if !is_own(p, nr) {
+        return nr
+    }
+    var tr: [u8; 2] = "__"
+    return join(p, (*p).alias, (&tr[0]) as u64, 2, nr)
+}
+
+// Builds `module.x` and interns it.
+// `module.x` becomes the SINGLE identifier `module.x` (root mode, so that the
+// comparison against `firnc0 --emit=ast-canon` holds), or `module__x` once
+// several files are really being compiled. Both express the same idea:
+// two pieces become one unambiguous identifier.
+fn qualify(p: *mut Parser, module: u32, name: u32) -> u32 {
+    if (*p).foreign != 0 {
+        var tr: [u8; 2] = "__"
+        return join(p, module, (&tr[0]) as u64, 2, name)
+    }
+    var pt: [u8; 1] = "."
+    return join(p, module, (&pt[0]) as u64, 1, name)
+}
+
+fn is_module(p: *mut Parser, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).module) {
+        if vec_at[u32](&(*p).module, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The identifier has already been read; if it is a module alias followed by
+// a `.`, this builds `module.member` from it.
+fn renamed_value(p: *mut Parser, nr: u32, value: bool) -> u32 {
+    if value {
+        if is_local(p, nr) {
+            return nr
+        }
+    }
+    return renamed(p, nr)
+}
+
+fn maybe_qualified(p: *mut Parser, nr: u32, value: bool) -> u32 {
+    if !is_module(p, nr) {
+        return renamed_value(p, nr, value)
+    }
+    if !actual(p, A_DOT) {
+        return renamed_value(p, nr, value)
+    }
+    if kind(p, 1) != A_IDENT {
+        return renamed_value(p, nr, value)
+    }
+    let m: u32 = tok_nr(p, 1)
+    next_bump(p)
+    next_bump(p)
+    return qualify(p, nr, m)
+}
+
+// ------------------------------------------------------------- generics
+//
+// `[T, U: Int]` at the DECLARATION, `[i32, u8]` at the USE. Square brackets
+// instead of angle brackets, so that `<` stays unambiguous (SPEC 12).
+
+// Type parameter list of a template. The parameters go into the registry;
+// all that is returned here is whether it worked.
+fn ty_param_list(p: *mut Parser) -> bool {
+    if !expect(p, A_LBRACKET) {
+        return false
+    }
+    let off: u32 = mono.gen_tp_start(gn(p))
+    (*p).tpoff = off
+    while true {
+        if actual(p, A_RBRACKET) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            return false
+        }
+        let name: u32 = tok_nr(p, 0)
+        next_bump(p)
+        if mono.gen_tp_duplicate(gn(p), off, name) {
+            complain(p)
+            return false
+        }
+        mono.gen_tp_add(gn(p), name)
+        // ROUND 50: `T: A + B + C` -- the bounds are chained with `+` and
+        // all of them hold at once. An unknown identifier is not a mistake,
+        // it is the name of an interface;
+        // it is checked at instantiation time.
+        if eat(p, A_COLON) {
+            while true {
+                if !actual(p, A_IDENT) {
+                    complain(p)
+                    return false
+                }
+                let snr: u32 = tok_nr(p, 0)
+                let sa: u32 = mono.gen_bound(gn(p), snr)
+                if !mono.gen_tp_bound_add(gn(p), sa, snr) {
+                    // the same bound appears twice
+                    complain(p)
+                    return false
+                }
+                next_bump(p)
+                if !eat(p, A_PLUS) {
+                    break
+                }
+            }
+        }
+        if !eat(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    if !expect(p, A_RBRACKET) {
+        return false
+    }
+    if mono.gen_tp_start(gn(p)) == off {
+        complain(p)
+        return false
+    }
+    return true
+}
+
+// Type arguments at a use site: `[i32, *mut u8]`.
+fn ty_args(p: *mut Parser, out: *mut Vec[u32]) -> bool {
+    if !expect(p, A_LBRACKET) {
+        return false
+    }
+    while true {
+        if actual(p, A_RBRACKET) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        let t: u32 = ty(p)
+        if t == ast.NOTHING {
+            return false
+        }
+        vec_push[u32](out, t)
+        if !eat(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    if !expect(p, A_RBRACKET) {
+        return false
+    }
+    if vec_len[u32](out) == 0 {
+        complain(p)
+        return false
+    }
+    return true
+}
+
+// -------------------------------------------------------------------- types
+
+fn ty(p: *mut Parser) -> u32 {
+    // ROUND 58 (fnval.rs): `fn(T1, T2) -> R`, the type of a function VALUE.
+    // Unambiguous: in a type position the keyword `fn` can mean nothing
+    // else, and a declaration always carries a name after it.
+    if actual(p, A_KWFN) {
+        next_bump(p)
+        if !expect(p, A_LPAREN) {
+            return ast.NOTHING
+        }
+        var par: Vec[u32] = vec_new[u32]()
+        var ok: bool = true
+        if !actual(p, A_RPAREN) {
+            var more: bool = true
+            while more {
+                let pt: u32 = ty(p)
+                if pt == ast.NOTHING {
+                    ok = false
+                    more = false
+                } else {
+                    vec_push[u32](&par, pt)
+                    if actual(p, A_COMMA) {
+                        next_bump(p)
+                        if actual(p, A_RPAREN) {
+                            more = false
+                        }
+                    } else {
+                        more = false
+                    }
+                }
+            }
+        }
+        if !ok {
+            vec_free[u32](&par)
+            return ast.NOTHING
+        }
+        if !expect(p, A_RPAREN) {
+            vec_free[u32](&par)
+            return ast.NOTHING
+        }
+        var ret: u32 = ast.NOTHING
+        if actual(p, A_ARROW) {
+            next_bump(p)
+            ret = ty(p)
+            if ret == ast.NOTHING {
+                vec_free[u32](&par)
+                return ast.NOTHING
+            }
+        }
+        // The parameter types have to lie WITHOUT GAPS in `children`; a
+        // nested function type would otherwise push its own list in
+        // between, which is why they were collected first.
+        let off: u32 = ast.child_start(par_tree(p))
+        var k: usize = 0
+        while k < vec_len[u32](&par) {
+            ast.child_add(par_tree(p), vec_at[u32](&par, k))
+            k = k + 1
+        }
+        let cnt: u64 = vec_len[u32](&par) as u64
+        vec_free[u32](&par)
+        return ast.ty_new(par_tree(p), ast.T_FN, ret, ((off as u64) << 32) | cnt)
+    }
+    if actual(p, A_STAR) {
+        next_bump(p)
+        var m: u64 = 0
+        if eat(p, A_KWMUT) {
+            m = 1
+        }
+        let inner: u32 = ty(p)
+        if inner == ast.NOTHING {
+            return ast.NOTHING
+        }
+        return ast.ty_new(par_tree(p), ast.T_PTR, inner, m)
+    }
+    if actual(p, A_LBRACKET) {
+        next_bump(p)
+        let elem: u32 = ty(p)
+        if elem == ast.NOTHING {
+            return ast.NOTHING
+        }
+        if !expect(p, A_SEMI) {
+            return ast.NOTHING
+        }
+        // ROUND 79 (gap 10 of docs/ROUND66.md): `[u8; _]` -- the length comes
+        // out of the initializer. `let_stmt` fills it in as soon as it has
+        // read the initializer, so `LEN_INFER` never reaches the type
+        // resolution.
+        var len: u64 = ast.LEN_INFER
+        if actual(p, A_IDENT) {
+            var us: [u8; 1] = "_"
+            let itn: *mut intern.Interner = lexer.lex_names(lx(p))
+            if !intern.intern_equal(itn, tok_nr(p, 0), (&us[0]) as u64, 1) {
+                complain(p)
+                return ast.NOTHING
+            }
+            // Only where an initializer follows -- a parameter, a field and
+            // a `const` have to write the number out.
+            if !(*p).infer_len_ok {
+                complain(p)
+                return ast.NOTHING
+            }
+        } else {
+            if !actual(p, A_INT) {
+                complain(p)
+                return ast.NOTHING
+            }
+            len = number(p)
+        }
+        next_bump(p)
+        if !expect(p, A_RBRACKET) {
+            return ast.NOTHING
+        }
+        return ast.ty_new(par_tree(p), ast.T_ARR, elem, len)
+    }
+    if actual(p, A_IDENT) {
+        let nr: u32 = tok_nr(p, 0)
+        next_bump(p)
+        // ROUND 34 (gc.rs::hook_type): `Gc[C]` and `GcWeak[C]`. The type sits
+        // in the tree as the placeholder `__gc#p:C` / `__gc#w:C` and is
+        // resolved only during type resolution. Class names are visible
+        // program wide -- so NO module renaming.
+        if has_gc(p) && actual(p, A_LBRACKET) {
+            var kind_nr: u32 = 0
+            var g1: [u8; 2] = "Gc"
+            var g2: [u8; 6] = "GcWeak"
+            let it2: *mut intern.Interner = lexer.lex_names(lx(p))
+            if intern.intern_equal(it2, nr, (&g1[0]) as u64, 2) {
+                kind_nr = 1
+            }
+            if intern.intern_equal(it2, nr, (&g2[0]) as u64, 6) {
+                kind_nr = 2
+            }
+            // ROUND 53 (gc.rs::hook_type): `GcVec[E]` and `GcMap[K,V]`.
+            // Both are pointers to the runtime classes `GcVec`/`GcMap`
+            // (lib/gc/gcvec.fi, lib/gc/gcmap.fi) -- `GcVec[Gc[Node]]` is
+            // therefore exactly `Gc[GcVec]`. The type arguments are parsed in
+            // FULL (a typo should still be caught) and then thrown away:
+            // stage 0 has no generic `gc class`; the element type is checked at
+            // each access, not at the container.
+            var g3: [u8; 5] = "GcVec"
+            var g4: [u8; 5] = "GcMap"
+            if intern.intern_equal(it2, nr, (&g3[0]) as u64, 5) {
+                kind_nr = 3
+            }
+            if intern.intern_equal(it2, nr, (&g4[0]) as u64, 5) {
+                kind_nr = 4
+            }
+            if kind_nr == 3 || kind_nr == 4 {
+                next_bump(p)
+                var arg_count: u32 = 0
+                var next: bool = true
+                while next {
+                    let ta: u32 = ty(p)
+                    if ta == ast.NOTHING {
+                        return ast.NOTHING
+                    }
+                    arg_count = arg_count + 1
+                    if actual(p, A_COMMA) {
+                        next_bump(p)
+                    } else {
+                        next = false
+                    }
+                }
+                var should: u32 = 1
+                if kind_nr == 4 {
+                    should = 2
+                }
+                if arg_count != should {
+                    complain(p)
+                    return ast.NOTHING
+                }
+                if !expect(p, A_RBRACKET) {
+                    return ast.NOTHING
+                }
+                rt.buf_clear(&(*p).scratch)
+                var px5: [u8; 7] = "__gc#p:"
+                rt.buf_push_bytes(&(*p).scratch, (&px5[0]) as u64, 7)
+                if kind_nr == 3 {
+                    rt.buf_push_bytes(&(*p).scratch, (&g3[0]) as u64, 5)
+                } else {
+                    rt.buf_push_bytes(&(*p).scratch, (&g4[0]) as u64, 5)
+                }
+                let pn5: u32 = intern.intern_number(it2, rt.buf_ptr(&(*p).scratch),
+                    rt.buf_len(&(*p).scratch)) as u32
+                return ast.ty_new(par_tree(p), ast.T_NAME, pn5, 0)
+            }
+            if kind_nr != 0 {
+                next_bump(p)
+                if !actual(p, A_IDENT) {
+                    complain(p)
+                    return ast.NOTHING
+                }
+                let kn: u32 = tok_nr(p, 0)
+                next_bump(p)
+                if !expect(p, A_RBRACKET) {
+                    return ast.NOTHING
+                }
+                rt.buf_clear(&(*p).scratch)
+                if kind_nr == 1 {
+                    var px1: [u8; 7] = "__gc#p:"
+                    rt.buf_push_bytes(&(*p).scratch, (&px1[0]) as u64, 7)
+                } else {
+                    var px2: [u8; 7] = "__gc#w:"
+                    rt.buf_push_bytes(&(*p).scratch, (&px2[0]) as u64, 7)
+                }
+                rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it2, kn),
+                    intern.intern_length(it2, kn))
+                let pn: u32 = intern.intern_number(it2, rt.buf_ptr(&(*p).scratch),
+                    rt.buf_len(&(*p).scratch)) as u32
+                return ast.ty_new(par_tree(p), ast.T_NAME, pn, 0)
+            }
+        }
+        // `E!T` -- an error union (errors.rs::hook_type). The parser puts the
+        // entry into the registry and a placeholder `__eu#<n>` into the tree;
+        // the type checker resolves it later. The order matters: `!` comes
+        // BEFORE the `[` of the generics, exactly as in stage 0
+        // (`hook_type` runs before `hook_generic_type`).
+        if has_fe(p) && actual(p, A_NOT) {
+            next_bump(p)
+            let inner: u32 = ty(p)
+            if inner == ast.NOTHING {
+                return ast.NOTHING
+            }
+            let pi: u32 = err.error_pending_add(fh(p), nr, inner)
+            let it: *mut intern.Interner = lexer.lex_names(lx(p))
+            rt.buf_clear(&(*p).scratch)
+            var eu: [u8; 5] = "__eu#"
+            rt.buf_push_bytes(&(*p).scratch, (&eu[0]) as u64, 5)
+            rt.buf_push_dec_u64(&(*p).scratch, pi as u64)
+            let pn: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+                rt.buf_len(&(*p).scratch)) as u32
+            return ast.ty_new(par_tree(p), ast.T_NAME, pn, 0)
+        }
+        // A `[` after a type name is a generic instantiation.
+        if actual(p, A_LBRACKET) {
+            var generic: bool = false
+            if has_gen(p) {
+                generic = mono.gen_is_struct(gn(p), nr)
+            }
+            if !generic {
+                (*p).not_core = true
+                complain(p)
+                return ast.NOTHING
+            }
+            var targs: Vec[u32] = vec_new[u32]()
+            let ok: bool = ty_args(p, &targs)
+            if !ok {
+                vec_free[u32](&targs)
+                return ast.NOTHING
+            }
+            let m: u32 = mono.gen_instance(gn(p), nr, &targs, false)
+            vec_free[u32](&targs)
+            return ast.ty_new(par_tree(p), ast.T_NAME, m, 0)
+        }
+        // ROUND 46 (iface.rs::hook_type): `dyn I` -- the interface value.
+        // It becomes a SINGLE identifier containing a space; type resolution
+        // sorts it out later. Interface names are visible program wide and
+        // are NOT renamed.
+        var dw: [u8; 3] = "dyn"
+        let itd: *mut intern.Interner = lexer.lex_names(lx(p))
+        if intern.intern_equal(itd, nr, (&dw[0]) as u64, 3) && actual(p, A_IDENT) {
+            let inr: u32 = tok_nr(p, 0)
+            next_bump(p)
+            rt.buf_clear(&(*p).scratch)
+            var dw2: [u8; 4] = "dyn "
+            rt.buf_push_bytes(&(*p).scratch, (&dw2[0]) as u64, 4)
+            rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(itd, inr),
+                intern.intern_length(itd, inr))
+            let dn: u32 = intern.intern_number(itd, rt.buf_ptr(&(*p).scratch),
+                rt.buf_len(&(*p).scratch)) as u32
+            return ast.ty_new(par_tree(p), ast.T_NAME, dn, 0)
+        }
+        let q: u32 = maybe_qualified(p, nr, false)
+        return ast.ty_new(par_tree(p), ast.T_NAME, q, 0)
+    }
+    complain(p)
+    return ast.NOTHING
+}
+
+// -------------------------------------------------------------- expressions
+
+fn expr(p: *mut Parser) -> u32 {
+    var e: u32 = or_expr(p)
+    // `expr catch fallback` or `expr catch |f| fallback` -- binds more
+    // WEAKLY than any operator and is left associative; the fallback is
+    // an or expression (errors.rs::hook_catch). The tree holds a call
+    // `__catch#` with two arguments; the binding itself lives in the
+    // registry.
+    if has_fe(p) {
+        while actual(p, A_KWCATCH) {
+            next_bump(p)
+            var bind: u32 = NONE
+            if actual(p, A_PIPE) {
+                next_bump(p)
+                if !actual(p, A_IDENT) {
+                    complain(p)
+                    return e
+                }
+                bind = tok_nr(p, 0)
+                next_bump(p)
+                if !expect(p, A_PIPE) {
+                    return e
+                }
+            }
+            // The binding is a LOCAL name -- visible only inside the fallback
+            // and left out of the module renaming, just like the binding of a
+            // pattern (round 32).
+            if bind != NONE {
+                loc_on(p)
+                loc_add(p, bind)
+            }
+            let rhs: u32 = or_expr(p)
+            if bind != NONE {
+                loc_off(p)
+            }
+            var tmp: Vec[u32] = vec_new[u32]()
+            vec_push[u32](&tmp, e)
+            vec_push[u32](&tmp, rhs)
+            let off: u32 = list_store(p, &tmp)
+            vec_free[u32](&tmp)
+            var cn: [u8; 8] = "__catch#"
+            let it: *mut intern.Interner = lexer.lex_names(lx(p))
+            let name: u32 = intern.intern_number(it, (&cn[0]) as u64, 8) as u32
+            let old_e: u32 = e
+            e = ast.expr_new(par_tree(p), ast.E_CALL, name, off, 2, 0)
+            pos_from(p, e, old_e)
+            if bind != NONE {
+                err.error_cb_set(fh(p), e, bind)
+            }
+        }
+    }
+    return e
+}
+
+// Expression without a struct literal at the top level (conditions).
+fn cond_expr(p: *mut Parser) -> u32 {
+    (*p).no_slit = (*p).no_slit + 1
+    let e: u32 = expr(p)
+    (*p).no_slit = (*p).no_slit - 1
+    return e
+}
+
+// Expression in parentheses or arguments: struct literals are allowed there.
+fn inner_expr(p: *mut Parser) -> u32 {
+    let remembered: usize = (*p).no_slit
+    (*p).no_slit = 0
+    (*p).parens = (*p).parens + 1
+    let e: u32 = expr(p)
+    (*p).parens = (*p).parens - 1
+    (*p).no_slit = remembered
+    return e
+}
+
+fn or_expr(p: *mut Parser) -> u32 {
+    var left: u32 = and_expr(p)
+    while actual(p, A_OROR) && next(p) {
+        next_bump(p)
+        let right: u32 = and_expr(p)
+        let old_left: u32 = left
+        left = ast.expr_new(par_tree(p), ast.E_BIN, B_LOR, left, right, 0)
+        pos_from(p, left, old_left)
+    }
+    return left
+}
+
+fn and_expr(p: *mut Parser) -> u32 {
+    var left: u32 = cmp_expr(p)
+    while actual(p, A_ANDAND) && next(p) {
+        next_bump(p)
+        let right: u32 = cmp_expr(p)
+        let old_left: u32 = left
+        left = ast.expr_new(par_tree(p), ast.E_BIN, B_LAND, left, right, 0)
+        pos_from(p, left, old_left)
+    }
+    return left
+}
+
+// -1 = no comparison operator
+fn cmp_op(a: u32) -> i32 {
+    if a == A_EQEQ { return B_EQ as i32 }
+    if a == A_NOTEQ { return B_NE as i32 }
+    if a == A_LT { return B_LT as i32 }
+    if a == A_LE { return B_LE as i32 }
+    if a == A_GT { return B_GT as i32 }
+    if a == A_GE { return B_GE as i32 }
+    return -1
+}
+
+// Comparisons are NOT associative (SPEC 10.1: exactly one comparison).
+fn cmp_expr(p: *mut Parser) -> u32 {
+    let left: u32 = add_expr(p)
+    let op: i32 = cmp_op(kind(p, 0))
+    if op < 0 || !next(p) {
+        return left
+    }
+    next_bump(p)
+    let right: u32 = add_expr(p)
+    var e: u32 = ast.expr_new(par_tree(p), ast.E_BIN, op as u32, left, right, 0)
+    pos_from(p, e, left)
+    while cmp_op(kind(p, 0)) >= 0 && next(p) {
+        complain(p)
+        let op2: i32 = cmp_op(kind(p, 0))
+        next_bump(p)
+        let r2: u32 = add_expr(p)
+        let old_e: u32 = e
+        e = ast.expr_new(par_tree(p), ast.E_BIN, op2 as u32, e, r2, 0)
+        pos_from(p, e, old_e)
+    }
+    return e
+}
+
+fn add_op(a: u32) -> i32 {
+    if a == A_PLUS { return B_ADD as i32 }
+    if a == A_MINUS { return B_SUB as i32 }
+    if a == A_PIPE { return B_OR as i32 }
+    if a == A_CARET { return B_XOR as i32 }
+    // ROUND 72: explicit wrap/saturate, same precedence as `+`/`-`.
+    if a == A_PLUSPERCENT { return B_ADDWRAP as i32 }
+    if a == A_MINUSPERCENT { return B_SUBWRAP as i32 }
+    if a == A_PLUSPIPE { return B_ADDSAT as i32 }
+    if a == A_MINUSPIPE { return B_SUBSAT as i32 }
+    return -1
+}
+
+fn add_expr(p: *mut Parser) -> u32 {
+    var left: u32 = mul_expr(p)
+    while add_op(kind(p, 0)) >= 0 && next(p) {
+        let op: i32 = add_op(kind(p, 0))
+        next_bump(p)
+        let right: u32 = mul_expr(p)
+        let old_left: u32 = left
+        left = ast.expr_new(par_tree(p), ast.E_BIN, op as u32, left, right, 0)
+        pos_from(p, left, old_left)
+    }
+    return left
+}
+
+fn mul_op(a: u32) -> i32 {
+    if a == A_STAR { return B_MUL as i32 }
+    if a == A_SLASH { return B_DIV as i32 }
+    if a == A_PERCENT { return B_REM as i32 }
+    if a == A_AMP { return B_AND as i32 }
+    if a == A_SHL { return B_SHL as i32 }
+    if a == A_SHR { return B_SHR as i32 }
+    // ROUND 72: explicit wrap/saturate multiply, same precedence as `*`.
+    if a == A_STARPERCENT { return B_MULWRAP as i32 }
+    if a == A_STARPIPE { return B_MULSAT as i32 }
+    return -1
+}
+
+fn mul_expr(p: *mut Parser) -> u32 {
+    var left: u32 = un_expr(p)
+    while mul_op(kind(p, 0)) >= 0 && next(p) {
+        let op: i32 = mul_op(kind(p, 0))
+        next_bump(p)
+        let right: u32 = un_expr(p)
+        let old_left: u32 = left
+        left = ast.expr_new(par_tree(p), ast.E_BIN, op as u32, left, right, 0)
+        pos_from(p, left, old_left)
+    }
+    return left
+}
+
+// ROUND 79 -- the position of every OPERAND. `un_expr` is the point every
+// operand of an expression goes through, so one wrapper here gives `&x`,
+// `f(a)`, `x` and every literal the place of its FIRST token -- exactly
+// what `Expr::span` is in `firnc0`. Binary nodes get none and need none:
+// no message of the escape analysis points at one.
+fn un_expr(p: *mut Parser) -> u32 {
+    let at: u64 = at_pos(p, 0)
+    let e: u32 = un_expr_inner(p)
+    if ast.expr_pos(par_tree(p), e) == 0 {
+        ast.expr_pos_set(par_tree(p), e, at)
+    }
+    return e
+}
+
+fn un_expr_inner(p: *mut Parser) -> u32 {
+    let a: u32 = kind(p, 0)
+    var op: i32 = -1
+    if a == A_MINUS { op = U_NEG as i32 }
+    else if a == A_NOT { op = U_NOT as i32 }
+    else if a == A_AMP { op = U_ADDR as i32 }
+    else if a == A_STAR { op = U_DEREF as i32 }
+    else if a == A_TILDE { op = U_BITNOT as i32 }
+    if op < 0 {
+        return after_expr(p)
+    }
+    next_bump(p)
+    let inner: u32 = un_expr(p)
+    return ast.expr_new(par_tree(p), ast.E_UN, op as u32, inner, 0, 0)
+}
+
+// COLLECT into a scratch list first, then move it into `children` in one go.
+//
+// The obvious way -- appending each argument straight away -- breaks as soon
+// as an argument contains a call of its own: its arguments then land
+// RIGHT IN THE MIDDLE of the outer list. That is what happened on the first
+// attempt: `f(a, g(b))` came out as `f(a, b, g(b))`. Child lists have to be
+// contiguous, so the inner list is finished first.
+fn list_store(p: *mut Parser, tmp: *mut Vec[u32]) -> u32 {
+    let off: u32 = ast.child_start(par_tree(p))
+    var i: usize = 0
+    while i < vec_len[u32](tmp) {
+        ast.child_add(par_tree(p), vec_at[u32](tmp, i))
+        i = i + 1
+    }
+    return off
+}
+
+// Argument list, the '(' already consumed. The arguments go into a SCRATCH
+// BUFFER and are moved into `children` in one go -- a nested call would
+// otherwise drop its own list in between (the same lesson as in
+// `list_store`). For a method call the receiver is already in there.
+fn call_args_in(p: *mut Parser, tmp: *mut Vec[u32]) {
+    while true {
+        if actual(p, A_RPAREN) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        let e: u32 = inner_expr(p)
+        vec_push[u32](tmp, e)
+        if !eat(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RPAREN)
+}
+
+fn call_args(p: *mut Parser) -> u32 {
+    var tmp: Vec[u32] = vec_new[u32]()
+    call_args_in(p, &tmp)
+    let off: u32 = list_store(p, &tmp)
+    vec_free[u32](&tmp)
+    return off
+}
+
+// ROUND 45 (impls.rs): `"method " ++ <ident>` -- the callee of a method call
+// that is not resolved yet. The space makes it an identifier that nothing in
+// the source text can ever collide with.
+fn method_call_name(p: *mut Parser, nr: u32) -> u32 {
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    rt.buf_clear(&(*p).scratch)
+    var w: [u8; 7] = "method "
+    rt.buf_push_bytes(&(*p).scratch, (&w[0]) as u64, 7)
+    rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it, nr),
+        intern.intern_length(it, nr))
+    return intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+}
+
+fn after_expr(p: *mut Parser) -> u32 {
+    var e: u32 = basic_expr(p)
+    // ROUND 72: every postfix form -- field, index, call, method call,
+    // `as` -- has `join(e.span, ...)` as its span in `firnc0`, which is
+    // the BASE expression's start. It never moves along the chain, so one
+    // word read once is enough.
+    let base_pos: u64 = ast.expr_pos(par_tree(p), e)
+    while true {
+        if !next(p) {
+            return e
+        }
+        let a: u32 = kind(p, 0)
+        if a == A_DOT {
+            next_bump(p)
+            // ROUND 34 (gc.rs::hook_postfix): `x.as?[C]` -- the checked
+            // downcast. In the tree it is a call `__gc#as:C`.
+            if has_gc(p) && actual(p, A_KWAS) && kind(p, 1) == A_QUESTION {
+                next_bump(p)
+                next_bump(p)
+                if !expect(p, A_LBRACKET) {
+                    return e
+                }
+                if !actual(p, A_IDENT) {
+                    complain(p)
+                    return e
+                }
+                let kn: u32 = tok_nr(p, 0)
+                next_bump(p)
+                if !expect(p, A_RBRACKET) {
+                    return e
+                }
+                let it4: *mut intern.Interner = lexer.lex_names(lx(p))
+                rt.buf_clear(&(*p).scratch)
+                var px5: [u8; 8] = "__gc#as:"
+                rt.buf_push_bytes(&(*p).scratch, (&px5[0]) as u64, 8)
+                rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it4, kn),
+                    intern.intern_length(it4, kn))
+                let an: u32 = intern.intern_number(it4, rt.buf_ptr(&(*p).scratch),
+                    rt.buf_len(&(*p).scratch)) as u32
+                var tmp4: Vec[u32] = vec_new[u32]()
+                vec_push[u32](&tmp4, e)
+                let off4: u32 = list_store(p, &tmp4)
+                vec_free[u32](&tmp4)
+                e = ast.expr_new(par_tree(p), ast.E_CALL, an, off4, 1, 0)
+                pos_default(p, e, base_pos)
+                continue
+            }
+            if !actual(p, A_IDENT) {
+                complain(p)
+                return e
+            }
+            let nr: u32 = tok_nr(p, 0)
+            next_bump(p)
+            // ROUND 45 (impls.rs::hook_method_call): if a parenthesis
+            // follows, this is a METHOD CALL. The receiver becomes the
+            // first argument; which function is meant is decided by the
+            // type checker, from the receiver type.
+            // The parenthesis has to be on the SAME line (`next`) -- otherwise
+            // a following statement that starts with `(` would turn into
+            // a method call on the field access before it.
+            if next(p) && actual(p, A_LPAREN) {
+                next_bump(p)
+                var mtmp: Vec[u32] = vec_new[u32]()
+                vec_push[u32](&mtmp, e)
+                call_args_in(p, &mtmp)
+                let mname: u32 = method_call_name(p, nr)
+                let mlaen: u32 = vec_len[u32](&mtmp) as u32
+                let moff: u32 = list_store(p, &mtmp)
+                vec_free[u32](&mtmp)
+                e = ast.expr_new(par_tree(p), ast.E_CALL, mname, moff, mlaen, 0)
+                pos_default(p, e, base_pos)
+                continue
+            }
+            e = ast.expr_new(par_tree(p), ast.E_FIELD, e, nr, 0, 0)
+            pos_default(p, e, base_pos)
+        } else if a == A_LBRACKET {
+            // `sum[i32](a, b)` -- a call of a generic template. This is
+            // the only place where a `[` after an expression does NOT mean
+            // indexing; the IDENTIFIER decides.
+            var template: bool = false
+            if has_gen(p) && ast.e_kind(par_tree(p), e) == ast.E_ID {
+                template = mono.gen_is_fn(gn(p), ast.e_a(par_tree(p), e))
+            }
+            if template {
+                let base: u32 = ast.e_a(par_tree(p), e)
+                var targs: Vec[u32] = vec_new[u32]()
+                let ok: bool = ty_args(p, &targs)
+                if !ok {
+                    vec_free[u32](&targs)
+                    return e
+                }
+                let m: u32 = mono.gen_instance(gn(p), base, &targs, true)
+                vec_free[u32](&targs)
+                if !expect(p, A_LPAREN) {
+                    return e
+                }
+                let off: u32 = call_args(p)
+                let len: u32 = ast.child_count(par_tree(p)) - off
+                e = ast.expr_new(par_tree(p), ast.E_CALL, m, off, len, 0)
+                pos_default(p, e, base_pos)
+            } else {
+                next_bump(p)
+                let idx: u32 = inner_expr(p)
+                expect(p, A_RBRACKET)
+                e = ast.expr_new(par_tree(p), ast.E_IDX, e, idx, 0, 0)
+                pos_default(p, e, base_pos)
+            }
+        } else if a == A_LPAREN {
+            // Only direct function names can be called (stage 0).
+            if ast.e_kind(par_tree(p), e) != ast.E_ID {
+                complain(p)
+                return e
+            }
+            let name: u32 = ast.e_a(par_tree(p), e)
+            next_bump(p)
+            let off: u32 = call_args(p)
+            let len: u32 = ast.child_count(par_tree(p)) - off
+            e = ast.expr_new(par_tree(p), ast.E_CALL, name, off, len, 0)
+            pos_default(p, e, base_pos)
+        } else if a == A_KWAS {
+            next_bump(p)
+            let t: u32 = ty(p)
+            if t == ast.NOTHING {
+                return e
+            }
+            e = ast.expr_new(par_tree(p), ast.E_AS, e, t, 0, 0)
+            pos_default(p, e, base_pos)
+        } else {
+            return e
+        }
+    }
+    return e
+}
+
+// `Type{ field: value, ... }` -- the '{' has not been consumed yet.
+fn struct_literal(p: *mut Parser, name: u32) -> u32 {
+    next_bump(p)
+    var tmp: Vec[u32] = vec_new[u32]()
+    while true {
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let fname: u32 = tok_nr(p, 0)
+        next_bump(p)
+        if !expect(p, A_COLON) {
+            break
+        }
+        let value: u32 = inner_expr(p)
+        vec_push[u32](&tmp, fname)
+        vec_push[u32](&tmp, value)
+        if !eat(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+    let len: u32 = vec_len[u32](&tmp) as u32 / 2
+    let off: u32 = list_store(p, &tmp)
+    vec_free[u32](&tmp)
+    return ast.expr_new(par_tree(p), ast.E_SLIT, name, off, len, 0)
+}
+
+// A string literal becomes an ARRAY LITERAL of integers -- exactly as in
+// `firnc0`. Its type is therefore `[u8; N]` or `[u16; N]`, and type checker
+// and lowering need nothing special. The routine reads from the lexer it is
+// handed, so that interpolation can reuse it for its own text segments
+// (round 39).
+fn alit_out_lit(p: *mut Parser, lx2: *mut lexer.Lexer, k: usize) -> u32 {
+    let la: u32 = lexer.lex_lit_kind(lx2, k)
+    let n: usize = lexer.lex_lit_len(lx2, k)
+    var tmp: Vec[u32] = vec_new[u32]()
+    var i: usize = 0
+    while i < n {
+        var w: u64 = 0
+        if la == 2 {
+            w = lexer.lex_lit_unit(lx2, k, i) as u64
+        } else {
+            w = lexer.lex_lit_byte(lx2, k, i) as u64
+        }
+        vec_push[u32](&tmp, ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, w))
+        i = i + 1
+    }
+    let off: u32 = list_store(p, &tmp)
+    vec_free[u32](&tmp)
+    return ast.expr_new(par_tree(p), ast.E_ALIT, 0, off, n as u32, 0)
+}
+
+// -------------------------------------------------------- inline assembly
+//
+// ROUND 52 (compiler/src/core.rs). Grammar:
+//
+//   asm_expr     = "asm" "(" str_lit { "," asm_op } ")" ;
+//   asm_op       = "in"      "(" str_lit ")" expr
+//                | "out"     "(" str_lit ")"            (ROUND 52: the value)
+//                | "out"     "(" str_lit ")" expr       (ROUND 68: memory)
+//                | "clobber" "(" str_lit ")" ;
+//
+// The tree holds a call `asm$<number>` with the INPUT EXPRESSIONS as its
+// arguments; template, registers and clobbers live in the tree registry
+// (`ast.asm_add`). `firnc0` splits it exactly the same way, which is why
+// `--emit=ast-canon` prints the same text on both sides.
+
+// The string literal at the current position, as an interned number.
+fn lit_intern(p: *mut Parser) -> u32 {
+    let k: usize = tok_nr(p, 0) as usize
+    let n: usize = lexer.lex_lit_len(lx(p), k)
+    rt.buf_clear(&(*p).scratch)
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&(*p).scratch, lexer.lex_lit_byte(lx(p), k, i))
+        i = i + 1
+    }
+    next_bump(p)
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    return intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+}
+
+fn asm_block(p: *mut Parser) -> u32 {
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    next_bump(p)
+    next_bump(p)
+    let template: u32 = lit_intern(p)
+    var out: u32 = ast.NOTHING
+    var regs: Vec[u32] = vec_new[u32]()
+    var clobs: Vec[u32] = vec_new[u32]()
+    var args: Vec[u32] = vec_new[u32]()
+    // ROUND 68: the MEMORY outputs. Their address expressions go into the
+    // SAME argument list, behind the inputs -- type check and lowering
+    // split the list at the number of inputs.
+    var oregs: Vec[u32] = vec_new[u32]()
+    var oargs: Vec[u32] = vec_new[u32]()
+    var ow: [u8; 3] = "out"
+    var cw: [u8; 7] = "clobber"
+    while eat(p, A_COMMA) {
+        if actual(p, A_RPAREN) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        var which: u32 = 3
+        if actual(p, A_KWIN) {
+            next_bump(p)
+            which = 0
+        } else if actual(p, A_IDENT) && intern.intern_equal(it, tok_nr(p, 0), (&ow[0]) as u64, 3) {
+            next_bump(p)
+            which = 1
+        } else if actual(p, A_IDENT) && intern.intern_equal(it, tok_nr(p, 0), (&cw[0]) as u64, 7) {
+            next_bump(p)
+            which = 2
+        }
+        if which == 3 {
+            complain(p)
+            break
+        }
+        if !expect(p, A_LPAREN) {
+            break
+        }
+        if !actual(p, A_STR) {
+            complain(p)
+            break
+        }
+        let reg: u32 = lit_intern(p)
+        if !expect(p, A_RPAREN) {
+            break
+        }
+        if which == 0 {
+            vec_push[u32](&regs, reg)
+            vec_push[u32](&args, inner_expr(p))
+        } else if which == 1 {
+            // ROUND 68: `out("rdx") p` -- with an expression behind it the
+            // register goes into `*p`, and of those there may be any
+            // number. Without one it stays the VALUE of the expression,
+            // and of those there is still at most one.
+            if actual(p, A_COMMA) || actual(p, A_RPAREN) || at_end(p) {
+                if out != ast.NOTHING {
+                    complain(p)
+                }
+                out = reg
+            } else {
+                vec_push[u32](&oregs, reg)
+                vec_push[u32](&oargs, inner_expr(p))
+            }
+        } else {
+            vec_push[u32](&clobs, reg)
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RPAREN)
+    var oi: usize = 0
+    while oi < vec_len[u32](&oargs) {
+        vec_push[u32](&args, vec_at[u32](&oargs, oi))
+        oi = oi + 1
+    }
+    vec_free[u32](&oargs)
+    let blk: u32 = ast.asm_add(par_tree(p), template, out, &regs, &oregs, &clobs)
+    vec_free[u32](&regs)
+    vec_free[u32](&oregs)
+    vec_free[u32](&clobs)
+    rt.buf_clear(&(*p).scratch)
+    var pw: [u8; 4] = "asm$"
+    rt.buf_push_bytes(&(*p).scratch, (&pw[0]) as u64, 4)
+    rt.buf_push_dec_u64(&(*p).scratch, blk as u64)
+    let name: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    let off: u32 = list_store(p, &args)
+    let len: u32 = vec_len[u32](&args) as u32
+    vec_free[u32](&args)
+    return ast.expr_new(par_tree(p), ast.E_CALL, name, off, len, 0)
+}
+
+// ROUND 70 (parser.rs::compound_op) -- which arithmetic operator does this
+// compound assignment carry? NONE for every other token.
+//
+// The numbers are the ones of `E_BIN` (add sub mul div rem and or xor shl
+// shr = 0..9). The table is the whole definition: `x op= e` is exactly
+// `x = x op e`.
+fn compound_op(k: u32) -> u32 {
+    if k == A_PLUSEQ { return 0 }
+    if k == A_MINUSEQ { return 1 }
+    if k == A_STAREQ { return 2 }
+    if k == A_SLASHEQ { return 3 }
+    if k == A_PERCENTEQ { return 4 }
+    if k == A_AMPEQ { return 5 }
+    if k == A_PIPEEQ { return 6 }
+    if k == A_CARETEQ { return 7 }
+    if k == A_SHLEQ { return 8 }
+    if k == A_SHREQ { return 9 }
+    return NONE
+}
+
+fn text_literal(p: *mut Parser) -> u32 {
+    let k: usize = tok_nr(p, 0) as usize
+    let wide: u32 = lexer.lex_lit_kind(lx(p), k)
+    next_bump(p)
+    // ROUND 70 (strtype.rs): the empty literal is no longer an error HERE --
+    // `""` is a valid, empty `str`. Where an array is wanted the same
+    // message comes from the type check, which is the only place that knows
+    // the context.
+    let alit: u32 = alit_out_lit(p, lx(p), k)
+    var w: u32 = 0
+    if wide == 2 {
+        w = 1
+    }
+    return ast.expr_new(par_tree(p), ast.E_TEXT, alit, w, 0, 0)
+}
+
+// ------------------------------------------------------------ interpolation
+//
+// `f"..."` (round 39): AT COMPILE TIME the parser splits the body into a
+// chain of calls on the Fmt builder from `std.io` -- no varargs and no
+// parsing at run time. The same translation as in firnc0
+// (`parser.rs::interpolation`): `f"x = {x}!"` turns into
+// `io.fmt_text(io.fmt_number(io.fmt_text(io.fmt_new(), &_fseg0_0[0], 6),
+//                       (x) as i64), &_fseg0_1[0], 1)`.
+// The text segments are hoisted in front of the enclosing statement as hidden
+// `let _fsegK_N: [u8; N]` (`block` drains `hoist`). Anyone writing `f"..."`
+// needs `import std.io`.
+
+// Name of a hidden text segment: `_fseg<node count>`. `firnc0` numbers them
+// by its `ExprId` (`_fseg{next_id}`); here the node count of the shared
+// tree is the same number -- and that keeps the canonical trees of both
+// compilers character identical (tools/parser_compare.sh).
+fn interp_seg_name(p: *mut Parser, state: usize) -> u32 {
+    var b: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&b)
+    var t: [u8; 5] = "_fseg"
+    rt.buf_push_bytes(&b, (&t[0]) as u64, 5)
+    rt.buf_push_dec_u64(&b, state as u64)
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    return intern.intern_number(it, rt.buf_ptr(&b), rt.buf_len(&b)) as u32
+}
+
+// A text segment: lex `"` + body + `"` again (by construction the decoding
+// is the same as for a handwritten literal), register it as a hidden
+// `let _fsegK_N: [u8; N]` and append
+// `io.fmt_text(chain, &_fsegK_N[0] as u64, N)` to the chain.
+fn interp_text(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to: usize) -> u32 {
+    var source: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&source)
+    rt.buf_push(&source, 34 as u8)
+    var i: usize = of
+    while i < to {
+        rt.buf_push(&source, lexer.lex_lit_byte(lx(p), k, i))
+        i = i + 1
+    }
+    rt.buf_push(&source, 34 as u8)
+    var dname: [u8; 9] = "<segment>"
+    var l2: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&source), rt.buf_len(&source),
+        lexer.lex_kw_ptr(lx(p)), lexer.lex_kw_len(lx(p)), (&dname[0]) as u64, 9)
+    lexer.lex_names_set(&l2, lexer.lex_names(lx(p)) as u64)
+    lexer.lex_run(&l2)
+    if lexer.lex_error(&l2) > 0 {
+        complain(p)
+        lexer.lex_free(&l2)
+        return chain
+    }
+    let state: usize = vec_len[u32](&(*par_tree(p)).e_kind)
+    let alit: u32 = alit_out_lit(p, (&l2) as *mut lexer.Lexer, 0)
+    lexer.lex_free(&l2)
+    let elen: u32 = ast.e_c(par_tree(p), alit)
+    if elen == 0 {
+        return chain
+    }
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let seg_name: u32 = interp_seg_name(p, state)
+    var u8t: [u8; 2] = "u8"
+    let u8nr: u32 = intern.intern_number(it, (&u8t[0]) as u64, 2) as u32
+    let u8typ: u32 = ast.ty_new(par_tree(p), ast.T_NAME, u8nr, 0)
+    let arrtyp: u32 = ast.ty_new(par_tree(p), ast.T_ARR, u8typ, elen as u64)
+    let var_s: u32 = ast.stmt_new(par_tree(p), ast.S_LET, seg_name, arrtyp, alit, 0)
+    vec_push[u32](&(*p).hoist, var_s)
+    let id: u32 = ast.expr_new(par_tree(p), ast.E_ID, seg_name, 0, 0, 0)
+    let null: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    let idx: u32 = ast.expr_new(par_tree(p), ast.E_IDX, id, null, 0, 0)
+    let addr: u32 = ast.expr_new(par_tree(p), ast.E_UN, U_ADDR, idx, 0, 0)
+    var u64t: [u8; 3] = "u64"
+    let u64nr: u32 = intern.intern_number(it, (&u64t[0]) as u64, 3) as u32
+    let u64typ: u32 = ast.ty_new(par_tree(p), ast.T_NAME, u64nr, 0)
+    let ptr: u32 = ast.expr_new(par_tree(p), ast.E_AS, addr, u64typ, 0, 0)
+    let len: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, elen as u64)
+    var ft: [u8; 8] = "fmt_text"
+    let text_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&ft[0]) as u64, 8) as u32)
+    let aoff: u32 = ast.child_start(par_tree(p))
+    ast.child_add(par_tree(p), chain)
+    ast.child_add(par_tree(p), ptr)
+    ast.child_add(par_tree(p), len)
+    return ast.expr_new(par_tree(p), ast.E_CALL, text_nr, aoff, 3, 0)
+}
+
+// An expression segment: lex the fragment again, parse ONE expression from
+// it with a copy of the parser (same tree, same registries, same intern
+// table, same local names) and append it to the chain as
+// `io.fmt_number(chain, (expr) as i64)`.
+fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to: usize) -> u32 {
+    var source: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&source)
+    var i: usize = of
+    while i < to {
+        rt.buf_push(&source, lexer.lex_lit_byte(lx(p), k, i))
+        i = i + 1
+    }
+    var dname: [u8; 12] = "<expression>"
+    var l2: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&source), rt.buf_len(&source),
+        lexer.lex_kw_ptr(lx(p)), lexer.lex_kw_len(lx(p)), (&dname[0]) as u64, 12)
+    lexer.lex_names_set(&l2, lexer.lex_names(lx(p)) as u64)
+    lexer.lex_run(&l2)
+    if lexer.lex_error(&l2) > 0 {
+        complain(p)
+        lexer.lex_free(&l2)
+        return chain
+    }
+    // The copy shares everything that expressions need (tree, registries,
+    // modules, local names); `interp = 1` blocks nesting.
+    // The tree is shared THROUGH `foreign`: in root mode (foreign == 0, the
+    // dump tools) `par_tree` would otherwise point at the COPY's own tree --
+    // the expression nodes would sit in a stack frame and be dead after the
+    // return (segfault in astdump on `f"{x}"`).
+    var sub: Parser = (*p)
+    sub.foreign = par_tree(p) as u64
+    sub.lx = (&l2) as u64
+    sub.pos = 0
+    sub.n = lexer.lex_count(&l2)
+    sub.parens = 0
+    sub.no_slit = 0
+    sub.interp = 1
+    let e: u32 = inner_expr(&sub)
+    (*p).err = sub.err
+    if sub.not_core {
+        (*p).not_core = true
+    }
+    let whole: bool = actual(&sub, A_EOF)
+    lexer.lex_free(&l2)
+    if !whole {
+        complain(p)
+        return chain
+    }
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    // ROUND 70 -- NO `as i64` any more. Which builder step is right depends
+    // on the TYPE of the expression, and only the type check knows that.
+    // `io.fmt_value` is the placeholder that the type check and the lowering
+    // both resolve, out of the same material (sema::fmt_target).
+    var fz: [u8; 9] = "fmt_value"
+    let number_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&fz[0]) as u64, 9) as u32)
+    let aoff: u32 = ast.child_start(par_tree(p))
+    ast.child_add(par_tree(p), chain)
+    ast.child_add(par_tree(p), e)
+    return ast.expr_new(par_tree(p), ast.E_CALL, number_nr, aoff, 2, 0)
+}
+
+fn interpolation(p: *mut Parser) -> u32 {
+    let k: usize = tok_nr(p, 0) as usize
+    let n: usize = lexer.lex_lit_len(lx(p), k)
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    if (*p).interp > 0 {
+        // An f"..." inside the expression of an f"..." -- not yet (round 39).
+        complain(p)
+        next_bump(p)
+        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    var io_t: [u8; 2] = "io"
+    let io_nr: u32 = intern.intern_number(it, (&io_t[0]) as u64, 2) as u32
+    if !is_module(p, io_nr) {
+        // Without `import std.io` the building blocks do not exist -- the same
+        // situation as a handwritten `io.` without the import.
+        complain(p)
+    }
+    var fn_t: [u8; 7] = "fmt_new"
+    let new_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&fn_t[0]) as u64, 7) as u32)
+    var chain: u32 = ast.expr_new(par_tree(p), ast.E_CALL, new_nr, ast.child_start(par_tree(p)), 0, 0)
+    var i: usize = 0
+    var text_of: usize = 0
+    while i < n {
+        let b: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+        if b == 125 {
+            // '}' without '{'
+            complain(p)
+            break
+        }
+        if b == 92 {
+            // escaping belongs to the text segment
+            i = i + 2
+            continue
+        }
+        if b != 123 {
+            i = i + 1
+            continue
+        }
+        if i > text_of {
+            chain = interp_text(p, chain, io_nr, k, text_of, i)
+        }
+        var j: usize = i + 1
+        var closed: bool = false
+        while j < n {
+            let b2: u32 = lexer.lex_lit_byte(lx(p), k, j) as u32
+            if b2 == 123 {
+                // '{' inside the expression -- core version: no nesting
+                complain(p)
+                break
+            }
+            if b2 == 125 {
+                closed = true
+                break
+            }
+            j = j + 1
+        }
+        if !closed {
+            complain(p)
+            break
+        }
+        chain = interp_expr(p, chain, io_nr, k, i + 1, j)
+        i = j + 1
+        text_of = i
+    }
+    if text_of < n {
+        chain = interp_text(p, chain, io_nr, k, text_of, n)
+    }
+    next_bump(p)
+    return chain
+}
+
+// `size_of[TypeName]()` -- `size_of` has been read, the `[` is next.
+//
+// DELIBERATELY ONLY A TYPE NAME, not a full type expression, as in `sizeof.rs`.
+fn size_of_expr(p: *mut Parser) -> u32 {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    let tn: u32 = tok_nr(p, 0)
+    next_bump(p)
+    if !expect(p, A_RBRACKET) {
+        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    if !expect(p, A_LPAREN) {
+        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    if !expect(p, A_RPAREN) {
+        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    let t: u32 = ast.ty_new(par_tree(p), ast.T_NAME, tn, 0)
+    let name: u32 = mono.gen_size_of_name(gn(p), t)
+    return ast.expr_new(par_tree(p), ast.E_CALL, name, 0, 0, (t as u64) + 1)
+}
+
+// ROUND 72: a leaf expression starts at the token it is read from. A
+// parenthesised expression returns the INNER node, which already has its
+// own position -- `pos_default` leaves that one alone, which is exactly
+// why `(b as u64) - (a as u64)` reports the column of `b` and not of `(`.
+fn basic_expr(p: *mut Parser) -> u32 {
+    let start: u64 = pos_now(p)
+    let e: u32 = basic_expr_at(p)
+    pos_default(p, e, start)
+    return e
+}
+
+fn basic_expr_at(p: *mut Parser) -> u32 {
+    let a: u32 = kind(p, 0)
+    // `try expr` -- the operand is a UNARY expression, and the call is
+    // named `__try#` (errors.rs::hook_primary, TRY_NAME).
+    if a == A_KWTRY && has_fe(p) {
+        next_bump(p)
+        let inner: u32 = un_expr(p)
+        let off: u32 = ast.child_start(par_tree(p))
+        ast.child_add(par_tree(p), inner)
+        var tn: [u8; 6] = "__try#"
+        let it: *mut intern.Interner = lexer.lex_names(lx(p))
+        let name: u32 = intern.intern_number(it, (&tn[0]) as u64, 6) as u32
+        return ast.expr_new(par_tree(p), ast.E_CALL, name, off, 1, 0)
+    }
+    if a == A_INT {
+        let v: u64 = number(p)
+        next_bump(p)
+        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, v)
+    }
+    if a == A_FLOAT {
+        let v: u64 = number(p)
+        // ROUND 71: field `a` carries the binary32 pattern of the same text.
+        // The canonical printing keeps showing `number` alone, so the tree
+        // dump stays what it was (print.fi, ast_canon.rs).
+        let single: u32 = lexer.lex_nr(lx(p), (*p).pos)
+        next_bump(p)
+        return ast.expr_new(par_tree(p), ast.E_FLOAT, single, 0, 0, v)
+    }
+    if a == A_FLOATF32 {
+        let v: u64 = number(p)
+        next_bump(p)
+        return ast.expr_new(par_tree(p), ast.E_FLOAT32, 0, 0, 0, v)
+    }
+    if a == A_STR {
+        return text_literal(p)
+    }
+    if a == A_FSTR {
+        return interpolation(p)
+    }
+    if a == A_KWTRUE {
+        next_bump(p)
+        return ast.expr_new(par_tree(p), ast.E_BOOL, 1, 0, 0, 0)
+    }
+    if a == A_KWFALSE {
+        next_bump(p)
+        return ast.expr_new(par_tree(p), ast.E_BOOL, 0, 0, 0, 0)
+    }
+    if a == A_LPAREN {
+        next_bump(p)
+        let e: u32 = inner_expr(p)
+        expect(p, A_RPAREN)
+        return e
+    }
+    if a == A_LBRACKET {
+        next_bump(p)
+        var tmp: Vec[u32] = vec_new[u32]()
+        var done: bool = false
+        if !actual(p, A_RBRACKET) && !at_end(p) {
+            let first: u32 = inner_expr(p)
+            if actual(p, A_SEMI) {
+                next_bump(p)
+                let count: u32 = inner_expr(p)
+                expect(p, A_RBRACKET)
+                vec_free[u32](&tmp)
+                return ast.expr_new(par_tree(p), ast.E_AWDH, first, count, 0, 0)
+            }
+            vec_push[u32](&tmp, first)
+            if !eat(p, A_COMMA) {
+                expect(p, A_RBRACKET)
+                done = true
+            }
+        }
+        while !done {
+            if actual(p, A_RBRACKET) || at_end(p) {
+                break
+            }
+            let before: usize = (*p).pos
+            let e: u32 = inner_expr(p)
+            vec_push[u32](&tmp, e)
+            if !eat(p, A_COMMA) {
+                break
+            }
+            if (*p).pos == before {
+                next_bump(p)
+            }
+        }
+        if !done {
+            expect(p, A_RBRACKET)
+        }
+        let len: u32 = vec_len[u32](&tmp) as u32
+        let off: u32 = list_store(p, &tmp)
+        vec_free[u32](&tmp)
+        return ast.expr_new(par_tree(p), ast.E_ALIT, 0, off, len, 0)
+    }
+    // ROUND 58 (fnval.rs): the closure literal. `fn(` in an expression can
+    // be nothing else -- a DECLARATION always carries a name after `fn`.
+    if a == A_KWFN {
+        return lambda(p, false)
+    }
+    if a == A_KWSYSCALL {
+        next_bump(p)
+        expect(p, A_LPAREN)
+        let off: u32 = call_args(p)
+        let len: u32 = ast.child_count(par_tree(p)) - off
+        return ast.expr_new(par_tree(p), ast.E_SYSCALL, 0, off, len, 0)
+    }
+    if a == A_IDENT {
+        // ROUND 52 (core.rs::hook_primary): `asm("...", in("dx") p, out("rax"),
+        // clobber("memory"))`. ONLY if `asm` is directly followed by `(` and a
+        // string literal -- otherwise `asm` stays an ordinary identifier
+        // and no new keyword is introduced.
+        var asmw: [u8; 3] = "asm"
+        let is_asm: bool = intern.intern_equal(lexer.lex_names(lx(p)), tok_nr(p, 0), (&asmw[0]) as u64, 3)
+        if is_asm && kind(p, 1) == A_LPAREN && kind(p, 2) == A_STR {
+            return asm_block(p)
+        }
+        let nr: u32 = tok_nr(p, 0)
+        next_bump(p)
+        // ROUND 34 (gc.rs::hook_primary): `gc C{ ... }`, `gc_null[C]()` and
+        // `weak_null[C]()`.
+        if has_gc(p) {
+            let it3: *mut intern.Interner = lexer.lex_names(lx(p))
+            var gw2: [u8; 2] = "gc"
+            if intern.intern_equal(it3, nr, (&gw2[0]) as u64, 2) {
+                // ROUND 58: `gc fn(...) { ... }` -- the capturing closure.
+                if actual(p, A_KWFN) {
+                    return lambda(p, true)
+                }
+                if actual(p, A_IDENT) && kind(p, 1) == A_LBRACE {
+                    var cw2: [u8; 5] = "class"
+                    if !intern.intern_equal(it3, tok_nr(p, 0), (&cw2[0]) as u64, 5) {
+                        let kn: u32 = tok_nr(p, 0)
+                        next_bump(p)
+                        // "gc C" -- with a space, so it can never be an
+                        // identifier from the source text.
+                        var tr2: [u8; 1] = " "
+                        let whole: u32 = join(p, nr, (&tr2[0]) as u64, 1, kn)
+                        // no_slit does not apply here: the brace belongs to
+                        // the allocation, not to the control structure.
+                        let lit: u32 = struct_literal(p, whole)
+                        var tmp2: Vec[u32] = vec_new[u32]()
+                        vec_push[u32](&tmp2, lit)
+                        let off2: u32 = list_store(p, &tmp2)
+                        vec_free[u32](&tmp2)
+                        return ast.expr_new(par_tree(p), ast.E_CALL, whole, off2, 1, 0)
+                    }
+                }
+            }
+            var gn1: [u8; 7] = "gc_null"
+            var gn2: [u8; 9] = "weak_null"
+            let is_gnull: bool = intern.intern_equal(it3, nr, (&gn1[0]) as u64, 7)
+            let is_wnull: bool = intern.intern_equal(it3, nr, (&gn2[0]) as u64, 9)
+            if (is_gnull || is_wnull) && actual(p, A_LBRACKET) {
+                next_bump(p)
+                if !actual(p, A_IDENT) {
+                    complain(p)
+                    return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                let kn: u32 = tok_nr(p, 0)
+                next_bump(p)
+                if !expect(p, A_RBRACKET) {
+                    return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                if !expect(p, A_LPAREN) {
+                    return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                if !expect(p, A_RPAREN) {
+                    return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                if is_gnull {
+                    // `0 as Gc[C]` -- the null value is the null pointer.
+                    rt.buf_clear(&(*p).scratch)
+                    var px3: [u8; 7] = "__gc#p:"
+                    rt.buf_push_bytes(&(*p).scratch, (&px3[0]) as u64, 7)
+                    rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it3, kn),
+                        intern.intern_length(it3, kn))
+                    let tn: u32 = intern.intern_number(it3, rt.buf_ptr(&(*p).scratch),
+                        rt.buf_len(&(*p).scratch)) as u32
+                    let tn2: u32 = ast.ty_new(par_tree(p), ast.T_NAME, tn, 0)
+                    let null: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+                    return ast.expr_new(par_tree(p), ast.E_AS, null, tn2, 0, 0)
+                }
+                // `GcWeak[C]{ __p: 0, __s: 0 }` -- the empty weak reference.
+                rt.buf_clear(&(*p).scratch)
+                var px4: [u8; 7] = "GcWeak["
+                rt.buf_push_bytes(&(*p).scratch, (&px4[0]) as u64, 7)
+                rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it3, kn),
+                    intern.intern_length(it3, kn))
+                rt.buf_push(&(*p).scratch, 93 as u8)
+                let wn: u32 = intern.intern_number(it3, rt.buf_ptr(&(*p).scratch),
+                    rt.buf_len(&(*p).scratch)) as u32
+                var wp2: [u8; 3] = "__p"
+                var ws2: [u8; 3] = "__s"
+                let wp_n: u32 = intern.intern_number(it3, (&wp2[0]) as u64, 3) as u32
+                let ws_n: u32 = intern.intern_number(it3, (&ws2[0]) as u64, 3) as u32
+                let n1: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+                let n2: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+                var tmp3: Vec[u32] = vec_new[u32]()
+                vec_push[u32](&tmp3, wp_n)
+                vec_push[u32](&tmp3, n1)
+                vec_push[u32](&tmp3, ws_n)
+                vec_push[u32](&tmp3, n2)
+                let off3: u32 = list_store(p, &tmp3)
+                vec_free[u32](&tmp3)
+                return ast.expr_new(par_tree(p), ast.E_SLIT, wn, off3, 2, 0)
+            }
+        }
+        // `size_of[T]()` -- the type text goes into the CALLEE NAME
+        // (`size_of$i32`, sizeof.rs) and the type node into `e_number` as
+        // well; both are resolved only in the type checker, which knows the
+        // struct table.
+        if (*p).sonr >= 0 && nr as i64 == (*p).sonr && actual(p, A_LBRACKET) {
+            return size_of_expr(p)
+        }
+        // `Vec[i32]{ ... }` -- a literal of a generic struct.
+        var gstruct: bool = false
+        if has_gen(p) && actual(p, A_LBRACKET) {
+            gstruct = mono.gen_is_struct(gn(p), nr)
+        }
+        if gstruct {
+            var targs: Vec[u32] = vec_new[u32]()
+            let ok: bool = ty_args(p, &targs)
+            if !ok {
+                vec_free[u32](&targs)
+                return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+            }
+            let m: u32 = mono.gen_instance(gn(p), nr, &targs, false)
+            vec_free[u32](&targs)
+            if actual(p, A_LBRACE) && (*p).no_slit == 0 {
+                return struct_literal(p, m)
+            }
+            complain(p)
+            return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+        }
+        // `Enum::Variant(..)` -- the enum constructor. Recognised by its
+        // SHAPE (`IDENT :: IDENT`), not through a registry -- exactly like
+        // `sema_match.rs::hook_primary`. `::` is TWO colon tokens; there is
+        // no token of its own for it.
+        if actual(p, A_COLON) && kind(p, 1) == A_COLON {
+            if !has_mu(p) {
+                (*p).not_core = true
+                complain(p)
+                return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+            }
+            next_bump(p)
+            next_bump(p)
+            if !actual(p, A_IDENT) {
+                complain(p)
+                return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+            }
+            let vn: u32 = tok_nr(p, 0)
+            next_bump(p)
+            // The whole `Enum::Variant` becomes ONE identifier. NO renaming:
+            // enum names are visible program wide (SPEC 14.1).
+            var dp: [u8; 2] = "::"
+            let full: u32 = join(p, nr, (&dp[0]) as u64, 2, vn)
+            var aoff: u32 = 0
+            var alen: u32 = 0
+            if actual(p, A_LPAREN) {
+                next_bump(p)
+                aoff = call_args(p)
+                alen = ast.child_count(par_tree(p)) - aoff
+            }
+            return ast.expr_new(par_tree(p), ast.E_CALL, full, aoff, alen, 0)
+        }
+        // If a `(` follows, this is a CALLEE NAME -- a local variable does
+        // not shadow it (`Renamer::resolve`, is_value = false).
+        let q: u32 = maybe_qualified(p, nr, !actual(p, A_LPAREN))
+        if actual(p, A_LBRACE) && (*p).no_slit == 0 {
+            return struct_literal(p, q)
+        }
+        return ast.expr_new(par_tree(p), ast.E_ID, q, 0, 0, 0)
+    }
+    complain(p)
+    next_bump(p)
+    return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+}
+
+// --------------------------------------------------------------- statements
+
+// End of statement: ';', a line break or '}'.
+fn end_stmt(p: *mut Parser) {
+    var had: bool = false
+    while actual(p, A_SEMI) {
+        next_bump(p)
+        had = true
+    }
+    if had || actual(p, A_RBRACE) || at_end(p) || line_start(p) {
+        return
+    }
+    complain(p)
+}
+
+fn block(p: *mut Parser) -> u32 {
+    if !expect(p, A_LBRACE) {
+        return ast.block_new(par_tree(p), 0, 0)
+    }
+    loc_on(p)
+    // The statement numbers are collected first and moved into `slist` only
+    // at the end -- nested blocks would otherwise cut in between.
+    var own: Vec[u32] = vec_new[u32]()
+    while true {
+        if actual(p, A_RBRACE) {
+            break
+        }
+        if at_end(p) {
+            complain(p)
+            break
+        }
+        if eat(p, A_SEMI) {
+            continue
+        }
+        if (*p).err > 0 {
+            break
+        }
+        let before: usize = (*p).pos
+        let s: u32 = stmt(p)
+        // The hidden text segments of an interpolation go BEFORE the
+        // statement that contains it (round 39).
+        var hi: usize = 0
+        while hi < vec_len[u32](&(*p).hoist) {
+            vec_push[u32](&own, vec_at[u32](&(*p).hoist, hi))
+            hi = hi + 1
+        }
+        vec_clear[u32](&(*p).hoist)
+        vec_push[u32](&own, s)
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    // ROUND 79: the closing brace is where the frame of this block dies --
+    // the escape analysis has to name that place.
+    let closing: u64 = at_pos(p, 0)
+    eat(p, A_RBRACE)
+    let off: u32 = vec_len[u32](&(*par_tree(p)).slist) as u32
+    var i: usize = 0
+    while i < vec_len[u32](&own) {
+        vec_push[u32](&(*par_tree(p)).slist, vec_at[u32](&own, i))
+        i = i + 1
+    }
+    let len: u32 = vec_len[u32](&own) as u32
+    vec_free[u32](&own)
+    loc_off(p)
+    let bi: u32 = ast.block_new(par_tree(p), off, len)
+    ast.block_end_set(par_tree(p), bi, closing)
+    return bi
+}
+
+fn let_stmt(p: *mut Parser) -> u32 {
+    var kind_s: u32 = ast.S_LET
+    if actual(p, A_KWVAR) {
+        kind_s = ast.S_VAR
+    }
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let name: u32 = tok_nr(p, 0)
+    next_bump(p)
+    var t: u32 = ast.NOTHING
+    if eat(p, A_COLON) {
+        // ROUND 79: `[T; _]` is allowed HERE and only here.
+        (*p).infer_len_ok = true
+        t = ty(p)
+        (*p).infer_len_ok = false
+        if t == ast.NOTHING {
+            return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+        }
+    }
+    if !expect(p, A_ASSIGN) {
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let init: u32 = expr(p)
+    end_stmt(p)
+    // ROUND 79: `[T; _]` -- now that the initializer has been read, the
+    // length is known. Only the OUTERMOST one; `[[u8; _]; 3]` stays an error.
+    if t != ast.NOTHING {
+        let b: *mut ast.Tree = par_tree(p)
+        if ast.t_kind(b, t) == ast.T_ARR && ast.t_b(b, t) == ast.LEN_INFER {
+            let n: u64 = literal_length(p, init)
+            if n == ast.LEN_INFER {
+                complain(p)
+                return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+            }
+            ast.ty_b_set(b, t, n)
+        }
+    }
+    // Visible ONLY FROM NOW ON: `let x = x + 1` means the outer `x` on the right.
+    loc_add(p, name)
+    return ast.stmt_new(par_tree(p), kind_s, name, t, init, 0)
+}
+
+// ROUND 79: how many elements does this initializer have? `LEN_INFER` means
+// "not a literal". Twin of `Parser::literal_length` in
+// `compiler/src/parser.rs`.
+fn literal_length(p: *mut Parser, e: u32) -> u64 {
+    let b: *mut ast.Tree = par_tree(p)
+    let a: u32 = ast.e_kind(b, e)
+    // A text literal carries its array literal of octets inside (round 70);
+    // its length is the one that counts, a written `\0` included.
+    if a == ast.E_TEXT {
+        return literal_length(p, ast.e_a(b, e))
+    }
+    if a == ast.E_ALIT {
+        return ast.e_c(b, e) as u64
+    }
+    if a == ast.E_AWDH {
+        let n: u32 = ast.e_b(b, e)
+        if ast.e_kind(b, n) == ast.E_INT {
+            return ast.e_number(b, n)
+        }
+        return ast.LEN_INFER
+    }
+    return ast.LEN_INFER
+}
+
+fn if_stmt(p: *mut Parser) -> u32 {
+    next_bump(p)
+    let cond: u32 = cond_expr(p)
+    let then: u32 = block(p)
+    var els: u32 = ast.NOTHING
+    if actual(p, A_KWELSE) {
+        next_bump(p)
+        if actual(p, A_KWIF) {
+            els = stmt(p)
+        } else {
+            let b: u32 = block(p)
+            els = ast.stmt_new(par_tree(p), ast.S_BLOCK, b, 0, 0, 0)
+        }
+    }
+    return ast.stmt_new(par_tree(p), ast.S_IF, cond, then, els, 0)
+}
+
+fn while_stmt(p: *mut Parser) -> u32 {
+    next_bump(p)
+    let cond: u32 = cond_expr(p)
+    let body: u32 = block(p)
+    return ast.stmt_new(par_tree(p), ast.S_WHILE, cond, body, 0, 0)
+}
+
+fn for_stmt(p: *mut Parser) -> u32 {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let name: u32 = tok_nr(p, 0)
+    next_bump(p)
+    if !expect(p, A_KWIN) {
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let of: u32 = cond_expr(p)
+    if !expect(p, A_DOTDOT) {
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let to: u32 = cond_expr(p)
+    loc_on(p)
+    loc_add(p, name)
+    let body: u32 = block(p)
+    loc_off(p)
+    return ast.stmt_new(par_tree(p), ast.S_FOR, name, of, to, body)
+}
+
+fn return_stmt(p: *mut Parser) -> u32 {
+    next_bump(p)
+    var value: u32 = ast.NOTHING
+    var has: bool = true
+    if actual(p, A_SEMI) || actual(p, A_RBRACE) || at_end(p) || line_start(p) {
+        has = false
+    }
+    if has {
+        value = expr(p)
+    }
+    end_stmt(p)
+    return ast.stmt_new(par_tree(p), ast.S_RET, value, 0, 0, 0)
+}
+
+// ROUND 79 -- the position of every statement, taken at its FIRST token.
+// `Stmt::span` in `firnc0` is the same place (`Parser::join` starts there),
+// so `return &x` gets reported at the `return` in both compilers.
+fn stmt(p: *mut Parser) -> u32 {
+    let at: u64 = at_pos(p, 0)
+    let s: u32 = stmt_inner(p)
+    ast.stmt_pos_set(par_tree(p), s, at)
+    return s
+}
+
+fn stmt_inner(p: *mut Parser) -> u32 {
+    let a: u32 = kind(p, 0)
+    if a == A_KWLET || a == A_KWVAR {
+        return let_stmt(p)
+    }
+    if a == A_KWIF {
+        return if_stmt(p)
+    }
+    if a == A_KWWHILE {
+        return while_stmt(p)
+    }
+    if a == A_KWFOR {
+        return for_stmt(p)
+    }
+    if a == A_KWBREAK {
+        next_bump(p)
+        end_stmt(p)
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    if a == A_KWCONTINUE {
+        next_bump(p)
+        end_stmt(p)
+        return ast.stmt_new(par_tree(p), ast.S_CONT, 0, 0, 0, 0)
+    }
+    if a == A_KWDEFER || a == A_KWERRDEFER {
+        var kind_s: u32 = ast.S_DEFER
+        if a == A_KWERRDEFER {
+            kind_s = ast.S_ERRDEFER
+        }
+        next_bump(p)
+        let inner: u32 = stmt(p)
+        return ast.stmt_new(par_tree(p), kind_s, inner, 0, 0, 0)
+    }
+    if a == A_KWRETURN {
+        return return_stmt(p)
+    }
+    if a == A_LBRACE {
+        let b: u32 = block(p)
+        return ast.stmt_new(par_tree(p), ast.S_BLOCK, b, 0, 0, 0)
+    }
+    if a == A_KWMATCH {
+        if !has_mu(p) {
+            (*p).not_core = true
+            complain(p)
+            return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+        }
+        return match_stmt(p)
+    }
+    if a == A_KWCATCH {
+        // `catch` never starts a statement -- so this is an ordinary syntax
+        // error, just as in stage 0. (`try` goes down the expression path.)
+        complain(p)
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let e: u32 = expr(p)
+    // ROUND 70 (parser.rs): `x += e` and `x++`. Both are STATEMENTS -- the
+    // parser sees them only here, and that is exactly why there is no
+    // `y = x++`.
+    let cop: u32 = compound_op(kind(p, 0))
+    if cop != NONE {
+        next_bump(p)
+        let cv: u32 = expr(p)
+        end_stmt(p)
+        return ast.stmt_new(par_tree(p), ast.S_ZUWOP, e, cv, cop, 0)
+    }
+    if actual(p, A_PLUSPLUS) || actual(p, A_MINUSMINUS) {
+        var up: u32 = 0
+        if actual(p, A_PLUSPLUS) {
+            up = 1
+        }
+        next_bump(p)
+        end_stmt(p)
+        return ast.stmt_new(par_tree(p), ast.S_STEP, e, up, 0, 0)
+    }
+    if actual(p, A_ASSIGN) {
+        next_bump(p)
+        let v: u32 = expr(p)
+        end_stmt(p)
+        return ast.stmt_new(par_tree(p), ast.S_ZUW, e, v, 0, 0)
+    }
+    end_stmt(p)
+    return ast.stmt_new(par_tree(p), ast.S_EXPR, e, 0, 0, 0)
+}
+
+// --------------------------------------------------------------- declarations
+
+// ROUND 58 (fnval.rs) -- the closure literal.
+//
+//   fn(a: i32) -> i32 { ... }        captures nothing, record in .rodata
+//   gc fn(a: i32) -> i32 { ... }     captures, record in the GC heap
+//
+// The body becomes a FUNCTION OF THE TREE straight away (`__closure#N`),
+// whose LAST parameter is the record. That way the type resolution, the
+// lowering and the code generator walk over it like over any other
+// function; only the type check runs the body a second time, in place, and
+// works out from that what is captured.
+fn lambda(p: *mut Parser, heap: bool) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    // The name: `__closure#<number>`. The `#` is no identifier character,
+    // so no source text can ever write it.
+    rt.buf_clear(&(*p).scratch)
+    var cw: [u8; 10] = "__closure#"
+    rt.buf_push_bytes(&(*p).scratch, (&cw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.fn_count(b) as u64)
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let cname: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    next_bump(p)
+    if !expect(p, A_LPAREN) {
+        return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    }
+    loc_on(p)
+    let poff: u32 = param_list(p)
+    expect(p, A_RPAREN)
+    let plen: u32 = ast.param_start(b) - poff
+    var ret: u32 = ast.NOTHING
+    if actual(p, A_ARROW) {
+        next_bump(p)
+        ret = ty(p)
+        if ret == ast.NOTHING {
+            loc_off(p)
+            return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+        }
+    }
+    if !actual(p, A_LBRACE) {
+        complain(p)
+        loc_off(p)
+        return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    }
+    // The record arrives as the LAST parameter, typed `*mut u8`. It has to
+    // sit directly behind the closure parameters -- they lie contiguously
+    // in `pa_*`, and the body is parsed only afterwards.
+    var uw: [u8; 2] = "u8"
+    let unr: u32 = intern.intern_number(it, (&uw[0]) as u64, 2) as u32
+    let uty: u32 = ast.ty_new(b, ast.T_NAME, unr, 0)
+    let pty: u32 = ast.ty_new(b, ast.T_PTR, uty, 1)
+    rt.buf_clear(&(*p).scratch)
+    var ew: [u8; 6] = "__env#"
+    rt.buf_push_bytes(&(*p).scratch, (&ew[0]) as u64, 6)
+    let ename: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    ast.param_add(b, ename, pty)
+    loc_add(p, ename)
+    // The body: a struct literal state of the surrounding condition must
+    // not reach into it.
+    let saved: usize = (*p).no_slit
+    (*p).no_slit = 0
+    let body: u32 = block(p)
+    (*p).no_slit = saved
+    loc_off(p)
+    ast.fn_add(b, cname, poff, plen + 1, ret, body, 0, 0, 0, 0, 0, 0, 0)
+    var packed: u64 = 0
+    if ret != ast.NOTHING {
+        packed = (ret as u64 + 1) << 1
+    }
+    if heap {
+        packed = packed | 1
+    }
+    return ast.expr_new(b, ast.E_LAMBDA, cname, poff, plen, packed)
+}
+
+fn param_list(p: *mut Parser) -> u32 {
+    let off: u32 = vec_len[u32](&(*par_tree(p)).pa_name) as u32
+    while true {
+        if actual(p, A_RPAREN) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let name: u32 = tok_nr(p, 0)
+        // ROUND 79 (escape.fi): where the parameter stands. Its slot lies in
+        // the frame like any local, so `&p` can escape too.
+        let pat: u64 = at_pos(p, 0)
+        next_bump(p)
+        if !expect(p, A_COLON) {
+            break
+        }
+        let t: u32 = ty(p)
+        if t == ast.NOTHING {
+            break
+        }
+        let pidx: u32 = ast.param_add(par_tree(p), name, t)
+        ast.param_pos_set(par_tree(p), pidx, pat)
+        loc_add(p, name)
+        if !eat(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    return off
+}
+
+// `fn IDENT[T: Int](..) -> R { .. }`
+//
+// THE NAME STAYS UNCHANGED, even inside a module: generic names are visible
+// program wide and are used unqualified (`vec_push[i32](..)`).
+// That is why `own_search` keeps them out of the renaming list as well.
+//
+// The template does NOT go into the function list of the tree -- the type
+// checker would trip over `T` and `--emit=ast-canon` would print it, which
+// `firnc0` does not. Its nodes are in the tree; only the entry points are
+// recorded.
+fn fn_template(p: *mut Parser, name: u32) {
+    if !ty_param_list(p) {
+        return
+    }
+    let toff: u32 = (*p).tpoff
+    let tlen: u32 = mono.gen_tp_start(gn(p)) - toff
+    if !expect(p, A_LPAREN) {
+        return
+    }
+    // While the body is parsed, all instantiations are ABSTRACT: `Vec[T]` is
+    // not work yet, it is a rule.
+    mono.gen_depth_on(gn(p))
+    loc_on(p)
+    let poff: u32 = param_list(p)
+    expect(p, A_RPAREN)
+    let plen: u32 = ast.param_start(par_tree(p)) - poff
+    var ret: u32 = ast.NOTHING
+    if eat(p, A_ARROW) {
+        ret = ty(p)
+        if ret == ast.NOTHING {
+            loc_off(p)
+            mono.gen_depth_off(gn(p))
+            return
+        }
+    }
+    let body: u32 = block(p)
+    loc_off(p)
+    mono.gen_depth_off(gn(p))
+    mono.gen_fn_template(gn(p), name, toff, tlen, poff, plen, ret, body)
+}
+
+// `struct IDENT[T] { field: T, .. }`
+fn struct_template(p: *mut Parser, name: u32) {
+    if !ty_param_list(p) {
+        return
+    }
+    let toff: u32 = (*p).tpoff
+    let tlen: u32 = mono.gen_tp_start(gn(p)) - toff
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    mono.gen_depth_on(gn(p))
+    let off: u32 = ast.field_start(par_tree(p))
+    while true {
+        while eat(p, A_COMMA) || eat(p, A_SEMI) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let fname: u32 = tok_nr(p, 0)
+        next_bump(p)
+        if !expect(p, A_COLON) {
+            break
+        }
+        let t: u32 = ty(p)
+        if t == ast.NOTHING {
+            break
+        }
+        ast.field_add(par_tree(p), fname, t)
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+    mono.gen_depth_off(gn(p))
+    let flen: u32 = ast.field_start(par_tree(p)) - off
+    mono.gen_struct_template(gn(p), name, toff, tlen, off, flen)
+}
+
+fn fn_decl(p: *mut Parser) {
+    // ROUND 75 (SPEC 14.5): 'extern fn' -- a declaration WITHOUT a body,
+    // closed with ';' instead of a block.
+    let is_extern: bool = actual(p, A_KWEXTERN)
+    if is_extern {
+        next_bump(p)
+    }
+    if !expect(p, A_KWFN) {
+        return
+    }
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    let raw: u32 = tok_nr(p, 0)
+    next_bump(p)
+    // A type parameter list turns it into a generic TEMPLATE.
+    if actual(p, A_LBRACKET) {
+        if !has_gen(p) {
+            (*p).not_core = true
+            complain(p)
+            return
+        }
+        if is_extern {
+            // 'extern fn name[T](...)' does not exist -- an extern
+            // declaration names a concrete, foreign symbol, and there is
+            // nothing to monomorphize. Treated as a plain syntax error,
+            // the same shape every other place here uses.
+            complain(p)
+            return
+        }
+        fn_template(p, raw)
+        return
+    }
+    let name: u32 = renamed(p, raw)
+    if !expect(p, A_LPAREN) {
+        return
+    }
+    loc_on(p)
+    let poff: u32 = param_list(p)
+    expect(p, A_RPAREN)
+    let plen: u32 = vec_len[u32](&(*par_tree(p)).pa_name) as u32 - poff
+    var ret: u32 = ast.NOTHING
+    if eat(p, A_ARROW) {
+        ret = ty(p)
+        if ret == ast.NOTHING {
+            loc_off(p)
+            return
+        }
+    }
+    if is_extern {
+        loc_off(p)
+        expect(p, A_SEMI)
+        let empty_body: u32 = ast.block_new(par_tree(p), 0, 0)
+        var ls: u32 = 0
+        if (*p).link_pending_set { ls = 1 }
+        // ROUND ARM-FREESTANDING: `#[arch(...)]` for another machine. The
+        // declaration was PARSED (so a syntax error in it is still an error
+        // on both machines) and is now simply not added to the tree.
+        if (*p).arch_pending != 2 {
+            ast.fn_add(par_tree(p), name, poff, plen, ret, empty_body, 0, 0, 0,
+                1, (*p).link_pending, ls, 0)
+        }
+        (*p).arch_pending = 0
+        (*p).link_pending = 0
+        (*p).link_pending_set = false
+        (*p).nogc_pending = 0
+        (*p).mc_pending = 0
+        (*p).int_pending = 0
+        (*p).ph_pending = 0
+        (*p).export_pending = 0
+        (*p).esc_pending = 0
+        return
+    }
+    let body: u32 = block(p)
+    loc_off(p)
+    // ROUND ARM-FREESTANDING: the body of another machine's variant is
+    // parsed and then dropped. Parsing it is not wasted work -- it is what
+    // makes a syntax error in the A64 version an error on x86 too, so that
+    // one machine cannot rot while the other is green.
+    if (*p).arch_pending == 2 {
+        (*p).arch_pending = 0
+        (*p).esc_pending = 0
+        (*p).nogc_pending = 0
+        (*p).mc_pending = 0
+        (*p).int_pending = 0
+        (*p).ph_pending = 0
+        (*p).export_pending = 0
+        (*p).link_pending = 0
+        (*p).link_pending_set = false
+        return
+    }
+    (*p).arch_pending = 0
+    ast.fn_add(par_tree(p), name, poff, plen, ret, body, (*p).nogc_pending,
+        (*p).mc_pending, (*p).int_pending, 0, 0, 0, (*p).export_pending)
+    // ROUND 89: this function ends every panic (SPEC 13). The name is the
+    // one AFTER module renaming, which is the symbol the code generator
+    // emits it under.
+    if (*p).ph_pending == 1 {
+        ast.panic_handler_set(par_tree(p), name)
+        (*p).ph_pending = 0
+    }
+    // ROUND 79 (escape.fi): the way out and the place the frame dies.
+    let fi: usize = ast.fn_count(par_tree(p)) - 1
+    ast.fn_esc_set(par_tree(p), fi, (*p).esc_pending)
+    ast.fn_end_set(par_tree(p), fi, ast.block_end(par_tree(p), body))
+    (*p).esc_pending = 0
+    (*p).nogc_pending = 0
+    (*p).mc_pending = 0
+    (*p).int_pending = 0
+    (*p).export_pending = 0
+    if (*p).link_pending_set {
+        // '#[link_name(...)]' in front of a function WITH a body: caught
+        // here rather than in the prescan, since only fn_decl knows
+        // whether the declaration turned out to be 'extern'.
+        complain(p)
+        (*p).link_pending = 0
+        (*p).link_pending_set = false
+    }
+}
+
+fn struct_decl(p: *mut Parser) {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    let raw: u32 = tok_nr(p, 0)
+    next_bump(p)
+    if actual(p, A_LBRACKET) {
+        if !has_gen(p) {
+            (*p).not_core = true
+            complain(p)
+            return
+        }
+        struct_template(p, raw)
+        return
+    }
+    let name: u32 = renamed(p, raw)
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    let off: u32 = vec_len[u32](&(*par_tree(p)).fd_name) as u32
+    while true {
+        while eat(p, A_COMMA) || eat(p, A_SEMI) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let fname: u32 = tok_nr(p, 0)
+        next_bump(p)
+        if !expect(p, A_COLON) {
+            break
+        }
+        let t: u32 = ty(p)
+        if t == ast.NOTHING {
+            break
+        }
+        ast.field_add(par_tree(p), fname, t)
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+    let len: u32 = vec_len[u32](&(*par_tree(p)).fd_name) as u32 - off
+    ast.structure_add(par_tree(p), name, off, len, (*p).mc_pending)
+    (*p).mc_pending = 0
+}
+
+fn const_decl(p: *mut Parser) {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    let name: u32 = renamed(p, tok_nr(p, 0))
+    next_bump(p)
+    if !expect(p, A_COLON) {
+        return
+    }
+    let t: u32 = ty(p)
+    if t == ast.NOTHING {
+        return
+    }
+    if !expect(p, A_ASSIGN) {
+        return
+    }
+    let w: u32 = expr(p)
+    end_stmt(p)
+    ast.const_add(par_tree(p), name, t, w)
+}
+
+// ROUND 89 -- `static NAME: T = value` / `static mut NAME: T = value`
+// (SPEC 14.1.statics). The same shape as `const_decl` above with exactly
+// one extra token; what differs is what the back end does with it, not the
+// syntax.
+fn static_decl(p: *mut Parser) {
+    next_bump(p)
+    let m: bool = eat(p, A_KWMUT)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    let name: u32 = renamed(p, tok_nr(p, 0))
+    next_bump(p)
+    if !expect(p, A_COLON) {
+        return
+    }
+    let t: u32 = ty(p)
+    if t == ast.NOTHING {
+        return
+    }
+    if !expect(p, A_ASSIGN) {
+        return
+    }
+    let w: u32 = expr(p)
+    end_stmt(p)
+    ast.static_add(par_tree(p), name, t, w, m)
+}
+
+fn import_decl(p: *mut Parser) {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    rt.buf_clear(&(*p).scratch)
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    var last: u32 = tok_nr(p, 0)
+    rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it, last), intern.intern_length(it, last))
+    next_bump(p)
+    while actual(p, A_DOT) && kind(p, 1) == A_IDENT {
+        next_bump(p)
+        last = tok_nr(p, 0)
+        rt.buf_push(&(*p).scratch, 46 as u8)
+        rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it, last), intern.intern_length(it, last))
+        next_bump(p)
+    }
+    let path: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch), rt.buf_len(&(*p).scratch)) as u32
+    ast.imp_add(par_tree(p), path, last)
+    vec_push[u32](&(*p).module, last)
+    end_stmt(p)
+}
+
+fn export_decl(p: *mut Parser) {
+    next_bump(p)
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    while true {
+        while eat(p, A_COMMA) || eat(p, A_SEMI) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        ast.exp_add(par_tree(p), tok_nr(p, 0))
+        next_bump(p)
+    }
+    expect(p, A_RBRACE)
+}
+
+fn profile_decl(p: *mut Parser) {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    ast.profile_set(par_tree(p), tok_nr(p, 0))
+    next_bump(p)
+    end_stmt(p)
+}
+
+// ------------------------------------------------------ enum and match
+//
+// Port of the parser hooks from `sema_match.rs`. The ARMS of a `match` are
+// NOT in the tree but in the pattern registry (`pattern.fi`); the tree
+// only holds a call `__match#<number>` without arguments. That way a
+// generic template can substitute the arms per instantiation as well, and
+// `--emit=ast-canon` prints exactly what stage 0 prints.
+
+// `::` is two colon tokens directly after one another.
+fn colon(p: *mut Parser, k: usize) -> bool {
+    return kind(p, k) == A_COLON && kind(p, k + 1) == A_COLON
+}
+
+// `enum IDENT { A, B(i32), C(Point, bool) }`
+fn enum_decl(p: *mut Parser) {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    // NO renaming: enum names are visible program wide (SPEC 14.1).
+    let name: u32 = tok_nr(p, 0)
+    next_bump(p)
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    let ei: u32 = pattern.pat_enum_add(mn(p), name)
+    while true {
+        while eat(p, A_COMMA) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let vname: u32 = tok_nr(p, 0)
+        next_bump(p)
+        let toff: u32 = pattern.pat_vt_start(mn(p))
+        var tlen: u32 = 0
+        if eat(p, A_LPAREN) {
+            while true {
+                if actual(p, A_RPAREN) || at_end(p) {
+                    break
+                }
+                let vor2: usize = (*p).pos
+                let t: u32 = ty(p)
+                if t == ast.NOTHING {
+                    break
+                }
+                pattern.pat_vt_add(mn(p), t)
+                tlen = tlen + 1
+                if !eat(p, A_COMMA) {
+                    break
+                }
+                if (*p).pos == vor2 {
+                    next_bump(p)
+                }
+            }
+            expect(p, A_RPAREN)
+        }
+        pattern.pat_variant_add(mn(p), ei, vname, toff, tlen)
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+    if pattern.pat_e_vlen(mn(p), ei) == 0 {
+        // An enum without a variant is an error (as in stage 0).
+        complain(p)
+    }
+}
+
+// `error IDENT { A, B, C }` -- an error set (errors.rs::errors_decl).
+// The name is NOT renamed: error sets are visible program wide, just like
+// enum names (SPEC 14.1). Codes start at 1, in order of declaration.
+fn error_decl(p: *mut Parser) {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    let name: u32 = tok_nr(p, 0)
+    next_bump(p)
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    let mi: u32 = err.error_set_add(fh(p), name)
+    if mi == NONE {
+        // this error set is already declared
+        complain(p)
+    }
+    var n: u32 = 0
+    while true {
+        while eat(p, A_COMMA) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let vn: u32 = tok_nr(p, 0)
+        next_bump(p)
+        // A variant declared twice is an error (as in stage 0).
+        if mi != NONE {
+            if !err.error_variant_add(fh(p), mi, vn) {
+                complain(p)
+            }
+        }
+        n = n + 1
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+    if n == 0 {
+        // An error set without a variant is an error (as in stage 0).
+        complain(p)
+    }
+}
+
+// An integer in a pattern, optionally signed.
+fn pattern_int(p: *mut Parser, good: *mut bool) -> i64 {
+    var neg: bool = false
+    if eat(p, A_MINUS) {
+        neg = true
+    }
+    if !actual(p, A_INT) {
+        complain(p)
+        *good = false
+        return 0
+    }
+    let v: u64 = number(p)
+    next_bump(p)
+    if neg {
+        return 0 - (v as i64)
+    }
+    return v as i64
+}
+
+// A pattern (SPEC 6.3). Bindings are registered as local names right
+// away -- the body of the arm is parsed afterwards and has to see them.
+fn pattern(p: *mut Parser, depth: u32) -> u32 {
+    if depth > 32 {
+        complain(p)
+        return ast.NOTHING
+    }
+    let a: u32 = kind(p, 0)
+    if a == A_KWTRUE {
+        next_bump(p)
+        return pattern.pat_mu_add(mn(p), pattern.MU_BOOL, 1, 0, 0, 0, 0, 0)
+    }
+    if a == A_KWFALSE {
+        next_bump(p)
+        return pattern.pat_mu_add(mn(p), pattern.MU_BOOL, 0, 0, 0, 0, 0, 0)
+    }
+    if a == A_INT || a == A_MINUS {
+        var good: bool = true
+        let lo: i64 = pattern_int(p, &good)
+        if !good {
+            return ast.NOTHING
+        }
+        if actual(p, A_DOTDOT) {
+            next_bump(p)
+            var incl: u32 = 0
+            if eat(p, A_ASSIGN) {
+                incl = 1
+            }
+            let hi: i64 = pattern_int(p, &good)
+            if !good {
+                return ast.NOTHING
+            }
+            // An empty range is an error (as in stage 0).
+            if incl == 1 {
+                if hi < lo {
+                    complain(p)
+                    return ast.NOTHING
+                }
+            } else {
+                if hi <= lo {
+                    complain(p)
+                    return ast.NOTHING
+                }
+            }
+            return pattern.pat_mu_add(mn(p), pattern.MU_RANGE, incl, 0, lo, hi, 0, 0)
+        }
+        return pattern.pat_mu_add(mn(p), pattern.MU_INT, 0, 0, lo, 0, 0, 0)
+    }
+    if a == A_IDENT {
+        let nr: u32 = tok_nr(p, 0)
+        next_bump(p)
+        let it: *mut intern.Interner = lexer.lex_names(lx(p))
+        var us: [u8; 1] = "_"
+        if intern.intern_equal(it, nr, (&us[0]) as u64, 1) {
+            return pattern.pat_mu_add(mn(p), pattern.MU_WILD, 0, 0, 0, 0, 0, 0)
+        }
+        if colon(p, 0) {
+            next_bump(p)
+            next_bump(p)
+            return variants_pattern(p, nr, depth)
+        }
+        // binding of the whole value
+        loc_add(p, nr)
+        return pattern.pat_mu_add(mn(p), pattern.MU_BIND, nr, 0, 0, 0, 0, 0)
+    }
+    if colon(p, 0) {
+        // `::Variant` -- the enum part is missing and is taken from the
+        // type of the subject.
+        next_bump(p)
+        next_bump(p)
+        return variants_pattern(p, ast.NOTHING, depth)
+    }
+    complain(p)
+    return ast.NOTHING
+}
+
+// `Variant(subpattern, ..)` -- the variant name has not been consumed yet.
+fn variants_pattern(p: *mut Parser, ename: u32, depth: u32) -> u32 {
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return ast.NOTHING
+    }
+    let vname: u32 = tok_nr(p, 0)
+    next_bump(p)
+    var soff: u32 = 0
+    var slen: u32 = 0
+    if eat(p, A_LPAREN) {
+        var tmp: Vec[u32] = vec_new[u32]()
+        while true {
+            if actual(p, A_RPAREN) || at_end(p) {
+                break
+            }
+            let before: usize = (*p).pos
+            let sub: u32 = pattern(p, depth + 1)
+            if sub == ast.NOTHING {
+                break
+            }
+            vec_push[u32](&tmp, sub)
+            if !eat(p, A_COMMA) {
+                break
+            }
+            if (*p).pos == before {
+                next_bump(p)
+            }
+        }
+        expect(p, A_RPAREN)
+        // COLLECT first, then store in one go -- the inner patterns have
+        // already stored children of their own.
+        soff = pattern.pat_children_start(mn(p))
+        var i: usize = 0
+        while i < vec_len[u32](&tmp) {
+            pattern.pat_child_add(mn(p), vec_at[u32](&tmp, i))
+            i = i + 1
+        }
+        slen = vec_len[u32](&tmp) as u32
+        vec_free[u32](&tmp)
+    }
+    return pattern.pat_mu_add(mn(p), pattern.MU_VARIANT, ename, vname, 0, 0, soff, slen)
+}
+
+// `match subject { pattern => { .. } .. }` as a statement. It becomes the
+// call `__match#<number>` without arguments; the arms live in the registry.
+fn match_stmt(p: *mut Parser) -> u32 {
+    next_bump(p)
+    // `match` inside a generic template is not supported -- the arms live
+    // in the registry, and a template could not substitute them per
+    // instantiation (an error in stage 0 as well).
+    if has_gen(p) {
+        if mono.gen_in_template(gn(p)) {
+            (*p).not_core = true
+            complain(p)
+        }
+    }
+    // The subject may not contain a struct literal at the top level --
+    // otherwise `match X { .. }` could not be told from the block.
+    let subj: u32 = cond_expr(p)
+    if !expect(p, A_LBRACE) {
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let mi: u32 = pattern.pat_match_add(mn(p), subj)
+    while true {
+        while eat(p, A_COMMA) || eat(p, A_SEMI) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        // The bindings of the pattern are visible in the body -- and only there.
+        loc_on(p)
+        let pat: u32 = pattern(p, 0)
+        if pat == ast.NOTHING {
+            loc_off(p)
+            break
+        }
+        // `=>` is two tokens: `=` and `>`.
+        if !(actual(p, A_ASSIGN) && kind(p, 1) == A_GT) {
+            complain(p)
+            loc_off(p)
+            break
+        }
+        next_bump(p)
+        next_bump(p)
+        if !actual(p, A_LBRACE) {
+            complain(p)
+            loc_off(p)
+            break
+        }
+        let body: u32 = block(p)
+        loc_off(p)
+        pattern.pat_arm_add(mn(p), mi, pat, body)
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+    if pattern.pat_m_alen(mn(p), mi) == 0 {
+        complain(p)
+    }
+    // The callee name carries the number: `__match#<mi>`.
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    rt.buf_clear(&(*p).scratch)
+    var pfx: [u8; 8] = "__match#"
+    rt.buf_push_bytes(&(*p).scratch, (&pfx[0]) as u64, 8)
+    rt.buf_push_dec_u64(&(*p).scratch, mi as u64)
+    let name: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    let e: u32 = ast.expr_new(par_tree(p), ast.E_CALL, name, 0, 0, 0)
+    return ast.stmt_new(par_tree(p), ast.S_EXPR, e, 0, 0, 0)
+}
+
+// Prescan: collect all `import` aliases so that `module.x` is recognised
+// from the FIRST line onwards. `firnc0` does the same.
+fn module_upfront(p: *mut Parser) {
+    var i: usize = 0
+    while i + 1 < (*p).n {
+        if lexer.lex_kind(lx(p), i) == A_KWIMPORT {
+            var j: usize = i + 1
+            var last: u32 = ast.NOTHING
+            while j < (*p).n {
+                if lexer.lex_kind(lx(p), j) != A_IDENT {
+                    break
+                }
+                last = lexer.lex_nr(lx(p), j)
+                j = j + 1
+                if j >= (*p).n {
+                    break
+                }
+                if lexer.lex_kind(lx(p), j) != A_DOT {
+                    break
+                }
+                j = j + 1
+            }
+            if last != ast.NOTHING {
+                vec_push[u32](&(*p).module, last)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ROUND 82: is this identifier one of the vector/crypto names of round 82,
+// or the type name `v128`? Matched by PREFIX, so that the list does not have
+// to be repeated here every time an intrinsic is added -- the prefixes are
+// reserved for them (SPEC 8.6).
+fn simd_word(p: *mut Parser, nr: u32) -> bool {
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    var w_ty: [u8; 4] = "v128"
+    if intern.intern_equal(it, nr, (&w_ty[0]) as u64, 4) {
+        return true
+    }
+    var p1: [u8; 7] = "__v128_"
+    var p2: [u8; 5] = "__aes"
+    var p3: [u8; 8] = "__sha256"
+    var p4: [u8; 11] = "__pclmulqdq"
+    var p5: [u8; 8] = "__crc32_"
+    var p6: [u8; 14] = "__cpu_features"
+    return intern.intern_prefix(it, nr, (&p1[0]) as u64, 7)
+    || intern.intern_prefix(it, nr, (&p2[0]) as u64, 5)
+    || intern.intern_prefix(it, nr, (&p3[0]) as u64, 8)
+    || intern.intern_prefix(it, nr, (&p4[0]) as u64, 11)
+    || intern.intern_prefix(it, nr, (&p5[0]) as u64, 8)
+    || intern.intern_prefix(it, nr, (&p6[0]) as u64, 14)
+}
+
+// Prescan for extensions that this parser does NOT understand.
+//
+// Better here than in the middle of the descent: this way it is settled before
+// the first node whether the file is core language at all, and the comparison
+// counts it cleanly as "not core" instead of as a deviation. In the TOKEN STREAM:
+//
+//   enum | match | error | try | catch | comptime | '#'   keywords
+//   '?'                                                    `x.as?[C]`
+//   '::'                                                   `Enum::Variant`
+//   IDENT '['  after 'fn'/'struct'  generic template -- an extension ONLY
+//                                   while no template registry has been
+//                                   registered (round 31)
+//   IDENT '!'                                              error union `E!T`
+//   the identifier `gc`                                    `gc class`, `gc C{}`
+fn extensions_search(p: *mut Parser) {
+    // Intern number of the identifier "gc" -- if it appears in the text at all.
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    var gc_word: [u8; 2] = "gc"
+    let gc_nr: i64 = intern.intern_find(it, (&gc_word[0]) as u64, 2)
+    // The constant time intrinsics (`ct.rs`, SPEC 9.2/9.3) are ordinary
+    // identifiers, not keywords -- they can only be recognised by their
+    // SPELLING. Anyone who writes a `select` function of their own falls
+    // out here by mistake; that is the cautious direction.
+    var ct1: [u8; 6] = "select"
+    var ct2: [u8; 7] = "barrier"
+    var ct3: [u8; 11] = "secure_zero"
+    let ct1_nr: i64 = intern.intern_find(it, (&ct1[0]) as u64, 6)
+    let ct2_nr: i64 = intern.intern_find(it, (&ct2[0]) as u64, 7)
+    let ct3_nr: i64 = intern.intern_find(it, (&ct3[0]) as u64, 11)
+
+    var i: usize = 0
+    while i < (*p).n {
+        let a: u32 = lexer.lex_kind(lx(p), i)
+        if a == A_KWENUM || a == A_KWMATCH {
+            // Belongs to the core language AS SOON AS the pattern registry is
+            // registered -- the same handover as for the generic templates
+            // (round 31).
+            if !has_mu(p) {
+                (*p).not_core = true
+                return
+            }
+        }
+        if a == A_KWERROR || a == A_KWTRY || a == A_KWCATCH {
+            // Belongs to the core language AS SOON AS the error registry
+            // is registered -- the same handover as for `enum`/`match`
+            // (round 32).
+            if !has_fe(p) {
+                (*p).not_core = true
+                return
+            }
+        }
+        if a == A_KWERRDEFER {
+            // ROUND 36: belongs to the core language as soon as the error
+            // registry is registered -- the error path comes from
+            // `err.fi`/`lower.fi` (`ret_term_error`), the same
+            // handover as for `error`/`try`/`catch` (round 33).
+            if !has_fe(p) {
+                (*p).not_core = true
+                return
+            }
+        }
+        if a == A_KWCOMPTIME {
+            // ROUND 35: belongs to the core language as soon as `par_time_set`
+            // has run -- the same handover as in rounds 31-33.
+            if !has_time(p) {
+                (*p).not_core = true
+                return
+            }
+        }
+        if a == A_HASH {
+            // ROUND 34: `#[no_gc]` belongs to the core language as soon as the
+            // gc registry is registered -- every OTHER attribute
+            // (`#[must_consume]`, ...) stays an extension that is not
+            // ported, as before.
+            var ok_attr: bool = false
+            if has_gc(p) && i + 3 < (*p).n {
+                if lexer.lex_kind(lx(p), i + 1) == A_LBRACKET && lexer.lex_kind(lx(p), i + 3) == A_RBRACKET {
+                    if lexer.lex_kind(lx(p), i + 2) == A_IDENT {
+                        var an: [u8; 5] = "no_gc"
+                        var mc: [u8; 12] = "must_consume"
+                        // Round 36: both attributes implemented (attrs.rs).
+                        // Round 52: plus `#[interrupt]` and `#[allow_fp]`.
+                        var iw: [u8; 9] = "interrupt"
+                        var fw: [u8; 8] = "allow_fp"
+                        // Round 75: plus `#[export_c]` (`#[link_name(...)]`
+                        // has one argument and is shaped differently --
+                        // checked separately below).
+                        var ec: [u8; 8] = "export_c"
+                        // Round 79: plus `#[allow_escape]` (escape.fi).
+                        var esw: [u8; 12] = "allow_escape"
+                        // Round 89: plus `#[panic_handler]` (SPEC 13).
+                        var phw: [u8; 13] = "panic_handler"
+                        // ROUND 94: plus `#[test]` (attrs.rs, testrun.rs). The
+                        // attribute is KNOWN here so that a file full of test
+                        // cases counts as core language for both compilers;
+                        // the runner itself (`--test`) is firnc0's, and this
+                        // stage compiles a marked function as an ordinary one.
+                        var tw: [u8; 4] = "test"
+                        let anr: u32 = lexer.lex_nr(lx(p), i + 2)
+                        let itn: *mut intern.Interner = lexer.lex_names(lx(p))
+                        ok_attr = intern.intern_equal(itn, anr, (&an[0]) as u64, 5) ||
+                        intern.intern_equal(itn, anr, (&mc[0]) as u64, 12) ||
+                        intern.intern_equal(itn, anr, (&iw[0]) as u64, 9) ||
+                        intern.intern_equal(itn, anr, (&fw[0]) as u64, 8) ||
+                        intern.intern_equal(itn, anr, (&esw[0]) as u64, 12) ||
+                        intern.intern_equal(itn, anr, (&phw[0]) as u64, 13) ||
+                        intern.intern_equal(itn, anr, (&tw[0]) as u64, 4) ||
+                        intern.intern_equal(itn, anr, (&ec[0]) as u64, 8)
+                    }
+                }
+            }
+            // Round 75: `#[link_name(c_symbol)]` -- '#' '[' IDENT '(' IDENT ')' ']',
+            // six tokens instead of four.
+            if !ok_attr && has_gc(p) && i + 6 < (*p).n {
+                if lexer.lex_kind(lx(p), i + 1) == A_LBRACKET
+                && lexer.lex_kind(lx(p), i + 2) == A_IDENT
+                && lexer.lex_kind(lx(p), i + 3) == A_LPAREN
+                && lexer.lex_kind(lx(p), i + 4) == A_IDENT
+                && lexer.lex_kind(lx(p), i + 5) == A_RPAREN
+                && lexer.lex_kind(lx(p), i + 6) == A_RBRACKET
+                {
+                    var ln: [u8; 9] = "link_name"
+                    // ROUND ARM-FREESTANDING: `#[arch(x86_64)]` has the same
+                    // six token shape (archsel.rs).
+                    var arw: [u8; 4] = "arch"
+                    let anr: u32 = lexer.lex_nr(lx(p), i + 2)
+                    let itn: *mut intern.Interner = lexer.lex_names(lx(p))
+                    ok_attr = intern.intern_equal(itn, anr, (&ln[0]) as u64, 9) ||
+                    intern.intern_equal(itn, anr, (&arw[0]) as u64, 4)
+                }
+            }
+            if !ok_attr {
+                (*p).not_core = true
+                return
+            }
+        }
+        if a == A_QUESTION {
+            // ROUND 34: `?` belongs only to `x.as?[C]` -- core with registry.
+            if !has_gc(p) {
+                (*p).not_core = true
+                return
+            }
+        }
+        if a == A_COLON && i + 1 < (*p).n {
+            if lexer.lex_kind(lx(p), i + 1) == A_COLON {
+                if !has_mu(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+        }
+        if a == A_IDENT {
+            let nr: i64 = lexer.lex_nr(lx(p), i) as i64
+            // ROUND 82: the vector and crypto instructions
+            // (compiler/src/simd.rs). This parser knows neither the type
+            // `v128` nor the 42 `__v128_*` / `__aes*` / `__sha256*` /
+            // `__pclmulqdq` / `__crc32_*` / `__cpu_features` intrinsics, and
+            // `codegen.fi` could not emit them either -- it has no register
+            // allocation and no xmm class. Recognised by their SPELLING here,
+            // so that a file like `tests/1613_crypto.fi` counts cleanly as
+            // "not core" in `tools/self_compare.sh` instead of appearing as a
+            // FAULTY -- which is exactly what it did before this line
+            // existed. Porting it belongs to the round that gives
+            // `lib/firnc1` a code generator with registers.
+            if simd_word(p, lexer.lex_nr(lx(p), i)) {
+                (*p).not_core = true
+                return
+            }
+            if gc_nr >= 0 && nr == gc_nr {
+                // ROUND 34: `gc`/`gc class`/`gc C{}` belong to the core language
+                // as soon as the gc registry is registered (the same
+                // handover as in rounds 31-33, 35).
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if ct1_nr >= 0 && nr == ct1_nr {
+                // ROUND 36: `select(b, a, b)` is ported (ct.rs) -- the same
+                // handover as for `barrier`: core as soon as the gc
+                // registry is registered; the dump tools stay
+                // at "not core", because their stage 0 side prints
+                // `Op::Select`.
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if ct2_nr >= 0 && nr == ct2_nr {
+                // ROUND 34: `barrier(x)` is the opaque barrier from
+                // ct.rs -- for the behaviour (and this stage has no
+                // optimizer) it is the identity. It belongs to the
+                // core language as soon as the gc registry is registered:
+                // that registry needs it (tests/modules/dom.fi), and only the
+                // real compiler registers it -- the dump tools
+                // stay at "not core", because their stage 0 side prints
+                // the opaque part (`Op::Barrier`).
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if ct3_nr >= 0 && nr == ct3_nr {
+                // ROUND 36: `secure_zero(p, n)` is ported (ct.rs) --
+                // the same handover as for `select`.
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if i + 1 < (*p).n && lexer.lex_kind(lx(p), i + 1) == A_NOT {
+                // `E!T` -- an error union is IDENT followed by `!`.
+                if !has_fe(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if i > 0 && i + 1 < (*p).n && !has_gen(p) {
+                let before: u32 = lexer.lex_kind(lx(p), i - 1)
+                if before == A_KWFN || before == A_KWSTRUCT {
+                    if lexer.lex_kind(lx(p), i + 1) == A_LBRACKET {
+                        (*p).not_core = true
+                        return
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Collects the names that this file declares at the top level. Only those
+// are renamed -- a use from another module is written qualified there
+// anyway.
+fn own_search(p: *mut Parser) {
+    if (*p).alias == NONE {
+        return
+    }
+    var i: usize = 0
+    while i + 1 < (*p).n {
+        // ROUND 45: the methods of an `impl` block are called `Type__method`
+        // and never appear under their short name in the module. `firnc0`
+        // collects the names only AFTER parsing (modules.rs) and does not
+        // see them either -- without this skip the two would drift apart.
+        if is_impl_at(p, i) {
+            i = impl_end(p, i)
+            continue
+        }
+        // ROUND 46: the same for `interface I { fn ... }`. The methods of an
+        // interface are not names of the module -- `firnc0` never sees them
+        // either (the block does not even end up in the tree).
+        if is_interface_at(p, i) {
+            i = impl_end(p, i)
+            continue
+        }
+        let a: u32 = lexer.lex_kind(lx(p), i)
+        // ROUND 89: `static mut NAME` puts one token between the keyword
+        // and the name; `static NAME` does not. Everything else in this
+        // scan has the name at i+1.
+        if a == A_KWSTATIC {
+            var at: usize = i + 1
+            if lexer.lex_kind(lx(p), at) == A_KWMUT { at = at + 1 }
+            if at < (*p).n && lexer.lex_kind(lx(p), at) == A_IDENT {
+                vec_push[u32](&(*p).own, lexer.lex_nr(lx(p), at))
+            }
+            i = i + 1
+            continue
+        }
+        if a == A_KWFN || a == A_KWSTRUCT || a == A_KWCONST {
+            if lexer.lex_kind(lx(p), i + 1) == A_IDENT {
+                // A generic template keeps its name: generic names are
+                // visible PROGRAM WIDE and are used
+                // unqualified. Renaming them would make `vec_push[i32](..)`
+                // impossible to find from the root file.
+                var generic: bool = false
+                if a != A_KWCONST && i + 2 < (*p).n {
+                    generic = lexer.lex_kind(lx(p), i + 2) == A_LBRACKET
+                }
+                if !generic {
+                    vec_push[u32](&(*p).own, lexer.lex_nr(lx(p), i + 1))
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ROUND 35: `comptime { ... }` at the top level. The body is an
+// ordinary block -- the same statements, the same shadowing of
+// local names, the same module renaming. The block does NOT go into
+// a function but into `ast.ct_block` as a number; the interpreter in
+// time.fi runs it before the type check (after compiler/src/comptime.rs).
+fn comptime_decl(p: *mut Parser) {
+    next_bump(p)
+    let b: u32 = block(p)
+    ast.ct_add(par_tree(p), b)
+}
+
+// ROUND 34: is there a `gc class` at this position? (hook_item in gc.rs)
+fn is_gc_class(p: *mut Parser) -> bool {
+    if !actual(p, A_IDENT) {
+        return false
+    }
+    var gw: [u8; 2] = "gc"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    if !intern.intern_equal(it, tok_nr(p, 0), (&gw[0]) as u64, 2) {
+        return false
+    }
+    if kind(p, 1) != A_IDENT {
+        return false
+    }
+    var cw: [u8; 5] = "class"
+    return intern.intern_equal(it, tok_nr(p, 1), (&cw[0]) as u64, 5)
+}
+
+// ROUND 45 (impls.rs::hook_item): is there an `impl Type {` at this position?
+// `impl` is NOT a keyword but an identifier in a position where
+// nothing else may appear -- the same trick as for `gc class`.
+fn is_impl(p: *mut Parser) -> bool {
+    if !actual(p, A_IDENT) {
+        return false
+    }
+    var iw: [u8; 4] = "impl"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    if !intern.intern_equal(it, tok_nr(p, 0), (&iw[0]) as u64, 4) {
+        return false
+    }
+    if kind(p, 1) != A_IDENT {
+        return false
+    }
+    if kind(p, 2) == A_LBRACE {
+        return true
+    }
+    // ROUND 46: `impl Interface for Type {`. `for` is a keyword
+    // and makes the shape unambiguous.
+    if kind(p, 2) != A_KWFOR {
+        return false
+    }
+    if kind(p, 3) != A_IDENT {
+        return false
+    }
+    return kind(p, 4) == A_LBRACE
+}
+
+// ROUND 46 (iface.rs::hook_item): an `interface IDENT {` at this position?
+fn is_interface(p: *mut Parser) -> bool {
+    if !actual(p, A_IDENT) {
+        return false
+    }
+    var iw: [u8; 9] = "interface"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    if !intern.intern_equal(it, tok_nr(p, 0), (&iw[0]) as u64, 9) {
+        return false
+    }
+    if kind(p, 1) != A_IDENT {
+        return false
+    }
+    return kind(p, 2) == A_LBRACE
+}
+
+// The same, but at an ABSOLUTE token position (for the prescan).
+fn is_interface_at(p: *mut Parser, i: usize) -> bool {
+    if i + 2 >= (*p).n {
+        return false
+    }
+    if lexer.lex_kind(lx(p), i) != A_IDENT {
+        return false
+    }
+    var iw: [u8; 9] = "interface"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    if !intern.intern_equal(it, lexer.lex_nr(lx(p), i), (&iw[0]) as u64, 9) {
+        return false
+    }
+    if lexer.lex_kind(lx(p), i + 1) != A_IDENT {
+        return false
+    }
+    return lexer.lex_kind(lx(p), i + 2) == A_LBRACE
+}
+
+// The same, but at an ABSOLUTE token position (for the prescan).
+fn is_impl_at(p: *mut Parser, i: usize) -> bool {
+    if i + 2 >= (*p).n {
+        return false
+    }
+    if lexer.lex_kind(lx(p), i) != A_IDENT {
+        return false
+    }
+    var iw: [u8; 4] = "impl"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    if !intern.intern_equal(it, lexer.lex_nr(lx(p), i), (&iw[0]) as u64, 4) {
+        return false
+    }
+    if lexer.lex_kind(lx(p), i + 1) != A_IDENT {
+        return false
+    }
+    if lexer.lex_kind(lx(p), i + 2) == A_LBRACE {
+        return true
+    }
+    if i + 4 >= (*p).n {
+        return false
+    }
+    if lexer.lex_kind(lx(p), i + 2) != A_KWFOR {
+        return false
+    }
+    if lexer.lex_kind(lx(p), i + 3) != A_IDENT {
+        return false
+    }
+    return lexer.lex_kind(lx(p), i + 4) == A_LBRACE
+}
+
+// The position AFTER the closing brace of the block at `i`. The search
+// starts at the FIRST brace -- `impl T {` and `impl I for T {` (and
+// `interface I {` too) are therefore the same case.
+fn impl_end(p: *mut Parser, i: usize) -> usize {
+    var k: usize = i + 2
+    while k < (*p).n {
+        if lexer.lex_kind(lx(p), k) == A_LBRACE {
+            break
+        }
+        k = k + 1
+    }
+    var depth: usize = 0
+    while k < (*p).n {
+        let a: u32 = lexer.lex_kind(lx(p), k)
+        if a == A_LBRACE {
+            depth = depth + 1
+        }
+        if a == A_RBRACE {
+            depth = depth - 1
+            if depth == 0 {
+                return k + 1
+            }
+        }
+        k = k + 1
+    }
+    return k
+}
+
+// The receiver of a method: `self`, `*self` or `*mut self`.
+// Firn has no references -- the receiver is written like any other
+// parameter of the language (impls.rs, section "The receiver").
+fn self_param(p: *mut Parser, tname0: u32) -> bool {
+    var sw: [u8; 4] = "self"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let snr: u32 = intern.intern_number(it, (&sw[0]) as u64, 4) as u32
+    // ROUND 46: for a `gc class` the receiver carries the INTERNAL struct
+    // name `"gc K"` -- `*self` therefore becomes exactly `Gc[K]`. Whether `K`
+    // is a class is known from the registry, which is filled during
+    // parsing, so `gc class K` has to come BEFORE the `impl` block
+    // (docs/ROUND46.md section 9). Literally as in impls.rs::self_param.
+    var tname: u32 = tname0
+    var class: bool = false
+    if has_gc(p) && gc.gc_is_class(gr(p), tname0) {
+        class = true
+        rt.buf_clear(&(*p).scratch)
+        var gw: [u8; 3] = "gc "
+        rt.buf_push_bytes(&(*p).scratch, (&gw[0]) as u64, 3)
+        rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it, tname0),
+            intern.intern_length(it, tname0))
+        tname = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+            rt.buf_len(&(*p).scratch)) as u32
+    }
+    if actual(p, A_IDENT) && tok_nr(p, 0) == snr {
+        if class {
+            // a 'gc class' value only ever lives on the GC heap
+            complain(p)
+            return false
+        }
+        next_bump(p)
+        let t: u32 = ast.ty_new(par_tree(p), ast.T_NAME, tname, 0)
+        ast.param_add(par_tree(p), snr, t)
+        loc_add(p, snr)
+        return true
+    }
+    if actual(p, A_STAR) {
+        var m: u64 = 0
+        var k: usize = 1
+        if kind(p, 1) == A_KWMUT {
+            m = 1
+            k = 2
+        }
+        if kind(p, k) == A_IDENT && tok_nr(p, k) == snr {
+            next_bump(p)
+            if m == 1 {
+                next_bump(p)
+            }
+            next_bump(p)
+            let inner: u32 = ast.ty_new(par_tree(p), ast.T_NAME, tname, 0)
+            let t: u32 = ast.ty_new(par_tree(p), ast.T_PTR, inner, m)
+            ast.param_add(par_tree(p), snr, t)
+            loc_add(p, snr)
+            return true
+        }
+    }
+    complain(p)
+    return false
+}
+
+// A method becomes the ordinary function `Type__method`. After that it is
+// nothing special any more -- the same type check, the same lowering.
+fn methods_decl(p: *mut Parser, tname: u32) {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    let mnr: u32 = tok_nr(p, 0)
+    next_bump(p)
+    if actual(p, A_LBRACKET) {
+        complain(p)
+        return
+    }
+    var tr: [u8; 2] = "__"
+    let name: u32 = join(p, tname, (&tr[0]) as u64, 2, mnr)
+    if !expect(p, A_LPAREN) {
+        return
+    }
+    loc_on(p)
+    let poff: u32 = ast.param_start(par_tree(p))
+    if !self_param(p, tname) {
+        loc_off(p)
+        return
+    }
+    if eat(p, A_COMMA) {
+        param_list(p)
+    }
+    expect(p, A_RPAREN)
+    let plen: u32 = ast.param_start(par_tree(p)) - poff
+    var ret: u32 = ast.NOTHING
+    if eat(p, A_ARROW) {
+        ret = ty(p)
+        if ret == ast.NOTHING {
+            loc_off(p)
+            return
+        }
+    }
+    let body: u32 = block(p)
+    loc_off(p)
+    ast.fn_add(par_tree(p), name, poff, plen, ret, body, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// ROUND 46 (iface.rs::interface_decl): `interface I { fn m(*self) -> T ... }`.
+// The block goes into the registry (`iface.fi`), NOT into the tree --
+// interface names are visible program wide and are not renamed. Without a
+// registry (astdump) the block is parsed correctly and then discarded.
+fn interface_decl(p: *mut Parser) {
+    next_bump(p)
+    let name: u32 = tok_nr(p, 0)
+    next_bump(p)
+    var ii: u32 = NONE
+    if has_if(p) {
+        ii = iface.if_add(ifr(p), lexer.lex_names(lx(p)), name)
+        if ii == NONE {
+            // this interface is already declared
+            complain(p)
+            return
+        }
+    }
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    while true {
+        while eat(p, A_SEMI) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        if (*p).err > 0 {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_KWFN) {
+            complain(p)
+            break
+        }
+        if !interfaces_method(p, ii) {
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+}
+
+// A method of the interface: `fn m(<receiver>[, param...]) [-> T]`
+// -- WITHOUT a body. The receiver MUST be a pointer: through the table
+// only the data pointer is available.
+fn interfaces_method(p: *mut Parser, ii: u32) -> bool {
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return false
+    }
+    let mnr: u32 = tok_nr(p, 0)
+    next_bump(p)
+    if actual(p, A_LBRACKET) {
+        complain(p)
+        return false
+    }
+    if !expect(p, A_LPAREN) {
+        return false
+    }
+    var sw: [u8; 4] = "self"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let snr: u32 = intern.intern_number(it, (&sw[0]) as u64, 4) as u32
+    if !actual(p, A_STAR) {
+        complain(p)
+        return false
+    }
+    var k: usize = 1
+    if kind(p, 1) == A_KWMUT {
+        k = 2
+    }
+    if kind(p, k) != A_IDENT || tok_nr(p, k) != snr {
+        complain(p)
+        return false
+    }
+    next_bump(p)
+    if k == 2 {
+        next_bump(p)
+    }
+    next_bump(p)
+    var ptypes: Vec[u32] = vec_new[u32]()
+    if eat(p, A_COMMA) {
+        while true {
+            if actual(p, A_RPAREN) || at_end(p) {
+                break
+            }
+            let before: usize = (*p).pos
+            if !actual(p, A_IDENT) {
+                complain(p)
+                vec_free[u32](&ptypes)
+                return false
+            }
+            next_bump(p)
+            if !expect(p, A_COLON) {
+                vec_free[u32](&ptypes)
+                return false
+            }
+            let pt: u32 = ty(p)
+            if pt == ast.NOTHING {
+                vec_free[u32](&ptypes)
+                return false
+            }
+            vec_push[u32](&ptypes, pt)
+            if !eat(p, A_COMMA) {
+                break
+            }
+            if (*p).pos == before {
+                next_bump(p)
+            }
+        }
+    }
+    if !expect(p, A_RPAREN) {
+        vec_free[u32](&ptypes)
+        return false
+    }
+    var ret: u32 = ast.NOTHING
+    if eat(p, A_ARROW) {
+        ret = ty(p)
+        if ret == ast.NOTHING {
+            vec_free[u32](&ptypes)
+            return false
+        }
+    }
+    if actual(p, A_LBRACE) {
+        // an interface method has no body
+        complain(p)
+        vec_free[u32](&ptypes)
+        return false
+    }
+    // ROUND 50: does the signature mention `Self`? Then its types depend on
+    // the implementing type and are resolved per implementation.
+    var has_self: bool = false
+    var hi: usize = 0
+    while hi < vec_len[u32](&ptypes) {
+        if iface.if_names_self(par_tree(p), lexer.lex_names(lx(p)),
+            vec_at[u32](&ptypes, hi)) {
+            has_self = true
+        }
+        hi = hi + 1
+    }
+    if iface.if_names_self(par_tree(p), lexer.lex_names(lx(p)), ret) {
+        has_self = true
+    }
+    if ii != NONE {
+        if !iface.if_method_add(ifr(p), ii, mnr, &ptypes, ret, has_self) {
+            // this interface already has that method
+            complain(p)
+            vec_free[u32](&ptypes)
+            return false
+        }
+    }
+    vec_free[u32](&ptypes)
+    return true
+}
+
+// ROUND 70 (impls.rs::impl_decl): `impl Ord for int` means
+// `impl Ord for i32`. Only the SECOND spelling of a primitive type is
+// folded onto the canonical one, so that exactly ONE method name
+// (`i32__less`) can come into being; everything else passes through
+// untouched. The two tables stand in the same order -- entry k of the one
+// is entry k of the other (types.fi::alias_ty).
+//
+// ROUND 88: `string` is entry 13 and stands for `str`. This pair does NOT
+// belong to `types.fi::alias_ty` (that one hands out primitive kinds, and
+// `str` is a struct), but it belongs HERE: `impl Ord for string` has to
+// create the same method as `impl Ord for str`, and this table works on
+// NAMES, not on kind numbers. The empty places 8..10 (`usize`, `isize`,
+// `bool`) keep their meaning -- a name is never empty, so they can never
+// be hit.
+fn canon_alias(p: *mut Parser, nr: u32) -> u32 {
+    var from: [u8; 66] = "sbyte|short|int|long|byte|ushort|uint|ulong||||double|float|string"
+    var to: [u8; 58] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32|str"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let q: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    var k: i32 = 0
+    var start: usize = 0
+    while i <= 66 {
+        var end: bool = i == 66
+        if !end {
+            end = from[i] == 124 as u8
+        }
+        if end {
+            if i - start == n && n > 0 {
+                if rt.mem_eq((&from[start]) as u64, q, n) {
+                    return canon_at(it, k)
+                }
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return nr
+}
+
+// The k-th name of the canonical table as an interner number.
+fn canon_at(it: *mut intern.Interner, k: i32) -> u32 {
+    var to: [u8; 58] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32|str"
+    var j: usize = 0
+    var m: i32 = 0
+    var start: usize = 0
+    while j <= 58 {
+        var end: bool = j == 58
+        if !end {
+            end = to[j] == 124 as u8
+        }
+        if end {
+            if m == k {
+                return intern.intern_number(it, (&to[start]) as u64, j - start) as u32
+            }
+            m = m + 1
+            start = j + 1
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+fn impl_decl(p: *mut Parser) {
+    next_bump(p)
+    let first: u32 = tok_nr(p, 0)
+    next_bump(p)
+    // ROUND 46 (iface.rs): `impl Interface for Type`. The block creates
+    // THE SAME functions as `impl Type` -- the interface merely states
+    // in addition what has to be there. The registry stores the type
+    // name exactly as it appears in the source text (without a module
+    // prefix): `firnc0` only has the raw name at this point either.
+    var raw: u32 = first
+    var is_for: bool = false
+    if actual(p, A_KWFOR) {
+        next_bump(p)
+        if !actual(p, A_IDENT) {
+            complain(p)
+            return
+        }
+        raw = tok_nr(p, 0)
+        next_bump(p)
+        is_for = true
+    }
+    // ROUND 70: `int` -> `i32` BEFORE the module renaming.
+    raw = canon_alias(p, raw)
+    let tname: u32 = renamed(p, raw)
+    if is_for && has_if(p) {
+        iface.if_impl_add(ifr(p), first, raw)
+    }
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    while true {
+        while eat(p, A_SEMI) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        if (*p).err > 0 {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_KWFN) {
+            complain(p)
+            break
+        }
+        methods_decl(p, tname)
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+}
+
+// `#[no_gc]`, `#[must_consume]`, `#[link_name(...)]` and `#[export_c]` --
+// the implemented attributes (attrs.rs). `no_gc`/`must_consume`/
+// `interrupt`/`allow_fp` take 0 arguments (parentheses are an error);
+// `link_name` takes exactly 1 (an identifier); `export_c` takes 0.
+// Any other name is caught by the prescan as not core beforehand.
+fn attr(p: *mut Parser) {
+    next_bump(p)
+    if !expect(p, A_LBRACKET) {
+        return
+    }
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    var an: [u8; 5] = "no_gc"
+    var mc: [u8; 12] = "must_consume"
+    // ROUND 52 (attrs.rs): `#[interrupt]` and `#[allow_fp]` (SPEC 2).
+    var iw: [u8; 9] = "interrupt"
+    var fw: [u8; 8] = "allow_fp"
+    // ROUND 75 (attrs.rs, SPEC 14.5): `#[link_name(...)]` and `#[export_c]`.
+    var ln: [u8; 9] = "link_name"
+    var ec: [u8; 8] = "export_c"
+    // ROUND 79 (attrs.rs): `#[allow_escape]` -- the way out of the escape
+    // analysis, 0 arguments.
+    var esw: [u8; 12] = "allow_escape"
+    // ROUND 89 (attrs.rs, SPEC 13): `#[panic_handler]` -- this function
+    // ends every panic, 0 arguments.
+    var phw: [u8; 13] = "panic_handler"
+    // ROUND 94 (attrs.rs, testrun.rs): `#[test]` -- a test case, 0 arguments.
+    var tw: [u8; 4] = "test"
+    // ROUND ARM-FREESTANDING (archsel.rs): `#[arch(x86_64)]` -- this
+    // definition belongs to ONE machine. Exactly one argument, an identifier.
+    var arw: [u8; 4] = "arch"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let is_nogc: bool = intern.intern_equal(it, tok_nr(p, 0), (&an[0]) as u64, 5)
+    let is_mc: bool = intern.intern_equal(it, tok_nr(p, 0), (&mc[0]) as u64, 12)
+    let is_int: bool = intern.intern_equal(it, tok_nr(p, 0), (&iw[0]) as u64, 9)
+    let is_fp: bool = intern.intern_equal(it, tok_nr(p, 0), (&fw[0]) as u64, 8)
+    let is_link: bool = intern.intern_equal(it, tok_nr(p, 0), (&ln[0]) as u64, 9)
+    let is_export: bool = intern.intern_equal(it, tok_nr(p, 0), (&ec[0]) as u64, 8)
+    let is_esc: bool = intern.intern_equal(it, tok_nr(p, 0), (&esw[0]) as u64, 12)
+    let is_ph: bool = intern.intern_equal(it, tok_nr(p, 0), (&phw[0]) as u64, 13)
+    let is_test: bool = intern.intern_equal(it, tok_nr(p, 0), (&tw[0]) as u64, 4)
+    let is_arch: bool = intern.intern_equal(it, tok_nr(p, 0), (&arw[0]) as u64, 4)
+    if !is_nogc && !is_mc && !is_int && !is_fp && !is_link && !is_export && !is_esc && !is_ph
+    && !is_test && !is_arch {
+        complain(p)
+        return
+    }
+    next_bump(p)
+    if is_arch {
+        if !expect(p, A_LPAREN) {
+            return
+        }
+        if !actual(p, A_IDENT) {
+            complain(p)
+            return
+        }
+        // The name of THIS machine. Everything else is another machine and
+        // the declaration behind it is thrown away in `fn_decl`.
+        var xw: [u8; 6] = "x86_64"
+        var aw: [u8; 7] = "aarch64"
+        let mine: bool = intern.intern_equal(it, tok_nr(p, 0), (&xw[0]) as u64, 6)
+        let other: bool = intern.intern_equal(it, tok_nr(p, 0), (&aw[0]) as u64, 7)
+        if !mine && !other {
+            // An unknown machine name is an ERROR and not a silent removal
+            // -- the same rule firnc0 follows (archsel.rs).
+            complain(p)
+            return
+        }
+        if mine {
+            (*p).arch_pending = 1
+        } else {
+            (*p).arch_pending = 2
+        }
+        next_bump(p)
+        if !expect(p, A_RPAREN) {
+            return
+        }
+    } else if is_link {
+        if !expect(p, A_LPAREN) {
+            return
+        }
+        if !actual(p, A_IDENT) {
+            complain(p)
+            return
+        }
+        (*p).link_pending = tok_nr(p, 0)
+        (*p).link_pending_set = true
+        next_bump(p)
+        if !expect(p, A_RPAREN) {
+            return
+        }
+    } else if actual(p, A_LPAREN) {
+        complain(p)
+        return
+    }
+    if !expect(p, A_RBRACKET) {
+        return
+    }
+    if is_mc {
+        (*p).mc_pending = 1
+    } else if is_int {
+        (*p).int_pending = 1
+    } else if is_ph {
+        (*p).ph_pending = 1
+    } else if is_test {
+        // ROUND 94: `#[test]` marks a case for `firnc --test`. This stage has
+        // no test mode, so nothing of it is left in the tree -- the function
+        // is compiled like any other.
+        (*p).nogc_pending = (*p).nogc_pending
+    } else if is_fp {
+        // `#[allow_fp]` allows floating point in the kernel profile; nothing
+        // of it is left in the tree, because this stage does not enforce the
+        // profile bans (docs/ROUND52.md, "Open points").
+        (*p).nogc_pending = (*p).nogc_pending
+    } else if is_link {
+        // `link_pending` is already set above.
+    } else if is_export {
+        (*p).export_pending = 1
+    } else if is_esc {
+        (*p).esc_pending = 1
+    } else {
+        (*p).nogc_pending = 1
+    }
+}
+
+// `gc class IDENT [extends Base] { field: Type, ... }` (gc_class_decl in
+// gc.rs). The class goes into the registry (`gc.fi`), NOT into the
+// tree -- class names are visible program wide and are not renamed.
+fn gc_class_decl(p: *mut Parser) {
+    next_bump(p)
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return
+    }
+    let name: u32 = tok_nr(p, 0)
+    next_bump(p)
+    var base: u32 = 0
+    if actual(p, A_IDENT) {
+        var ew: [u8; 7] = "extends"
+        let it: *mut intern.Interner = lexer.lex_names(lx(p))
+        if intern.intern_equal(it, tok_nr(p, 0), (&ew[0]) as u64, 7) {
+            next_bump(p)
+            if !actual(p, A_IDENT) {
+                complain(p)
+                return
+            }
+            base = tok_nr(p, 0)
+            next_bump(p)
+            if actual(p, A_COMMA) {
+                // multiple inheritance is not allowed (SPEC 4.4)
+                complain(p)
+                return
+            }
+        }
+    }
+    if !expect(p, A_LBRACE) {
+        return
+    }
+    let ki: u32 = gc.gc_class_add(gr(p), name)
+    if ki == NONE {
+        // this 'gc class ...' is already declared
+        complain(p)
+        return
+    }
+    if base != 0 {
+        gc.gc_base_set(gr(p), ki, base)
+    }
+    while true {
+        while eat(p, A_COMMA) {}
+        if actual(p, A_RBRACE) || at_end(p) {
+            break
+        }
+        let before: usize = (*p).pos
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let fname: u32 = tok_nr(p, 0)
+        next_bump(p)
+        if !expect(p, A_COLON) {
+            break
+        }
+        let ft: u32 = ty(p)
+        if ft == ast.NOTHING {
+            break
+        }
+        if !gc.gc_field_add(gr(p), ki, fname, ft) {
+            // this field is already declared
+            complain(p)
+        }
+        if !eat(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    expect(p, A_RBRACE)
+}
+
+fn par_run(p: *mut Parser) {
+    if has_gen(p) {
+        var so: [u8; 7] = "size_of"
+        (*p).sonr = intern.intern_find(lexer.lex_names(lx(p)), (&so[0]) as u64, 7)
+    }
+    extensions_search(p)
+    own_search(p)
+    if (*p).not_core {
+        return
+    }
+    module_upfront(p)
+    while true {
+        while eat(p, A_SEMI) {}
+        if at_end(p) {
+            break
+        }
+        if (*p).err > 0 {
+            break
+        }
+        let before: usize = (*p).pos
+        let a: u32 = kind(p, 0)
+        // `#[no_gc]` belongs in front of a FUNCTION (attrs.rs, Target::Func),
+        // `#[must_consume]` in front of either (attrs.rs, Target::Both), round 36.
+        if (*p).nogc_pending == 1 && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
+            complain(p)
+            (*p).nogc_pending = 0
+        }
+        if (*p).mc_pending == 1 && a != A_KWFN && a != A_KWEXTERN && a != A_KWSTRUCT && a != A_HASH {
+            complain(p)
+            (*p).mc_pending = 0
+        }
+        // ROUND 75: `#[link_name(...)]` and `#[export_c]` belong in front
+        // of a function (or another attribute) exactly like `#[no_gc]`.
+        if (*p).link_pending_set && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
+            complain(p)
+            (*p).link_pending = 0
+            (*p).link_pending_set = false
+        }
+        if (*p).export_pending == 1 && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
+            complain(p)
+            (*p).export_pending = 0
+        }
+        // ROUND ARM-FREESTANDING: `#[arch(...)]` belongs in front of a
+        // function, exactly like `#[no_gc]` (attrs.rs: Target::Func).
+        if (*p).arch_pending > 0 && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
+            complain(p)
+            (*p).arch_pending = 0
+        }
+        if a == A_HASH && has_gc(p) {
+            // `#[no_gc]` in front of a function (round 34, SPEC 3.5.4),
+            // `#[must_consume]` in front of a function or struct (round 36).
+            // Other attributes are caught by the prescan as not core.
+            attr(p)
+        } else if a == A_IDENT && has_gc(p) && is_gc_class(p) {
+            gc_class_decl(p)
+        } else if a == A_IDENT && is_interface(p) {
+            interface_decl(p)
+        } else if a == A_IDENT && is_impl(p) {
+            impl_decl(p)
+        } else if a == A_KWFN || a == A_KWEXTERN {
+            fn_decl(p)
+        } else if a == A_KWSTRUCT {
+            struct_decl(p)
+        } else if a == A_KWENUM && has_mu(p) {
+            enum_decl(p)
+        } else if a == A_KWERROR && has_fe(p) {
+            error_decl(p)
+        } else if a == A_KWCOMPTIME && has_time(p) {
+            comptime_decl(p)
+        } else if a == A_KWCONST {
+            const_decl(p)
+        } else if a == A_KWSTATIC {
+            static_decl(p)
+        } else if a == A_KWPROFILE {
+            profile_decl(p)
+        } else if a == A_KWIMPORT {
+            import_decl(p)
+        } else if a == A_KWEXPORT {
+            export_decl(p)
+        } else {
+            // Everything left over is one of the extensions that are not
+            // ported (`enum`, `error`, `gc class`, `comptime`, attributes) or is
+            // simply wrong.
+            // An IDENTIFIER at the top level can only be a hook in
+            // stage 0 -- `gc class C { ... }`. Like `enum`, `error`,
+            // `comptime` and the attributes, it is one of the extensions
+            // that are not ported.
+            if a == A_KWENUM || a == A_KWERROR || a == A_KWCOMPTIME || a == A_HASH || a == A_IDENT {
+                (*p).not_core = true
+            }
+            complain(p)
+            break
+        }
+        if (*p).pos == before {
+            next_bump(p)
+        }
+    }
+    if vec_len[u32](&(*p).hoist) > 0 {
+        // f"..." at ITEM level (say inside a `const`): there is no
+        // statement in front of which the text segments could be hoisted.
+        complain(p)
+    }
+}

@@ -1,0 +1,403 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/ast.fi -- the syntax tree of the JavaScript parser, in the shape of
+// ESTree (the form acorn/espree/esprima produce and every tool in that
+// world reads).
+//
+// THE STORAGE is columnar, not one object per node. A node is an index into
+// eight parallel `u32` columns; `0` is the null node and belongs to nobody.
+// The reasons are the same as in the HTML and CSS tokenizers of the earlier
+// rounds:
+//
+//   * a node costs 32 octets and no heap block. A large source file makes
+//     hundreds of thousands of nodes; as GC objects they would be the
+//     largest single graph in the process, and the collector would have to
+//     walk them at every cycle although nothing in a syntax tree ever
+//     changes after it has been built.
+//   * the tree stays OUTSIDE the GC heap on purpose. A closure refers to
+//     its function by NUMBER (an index into these columns), so the
+//     collector never sees the syntax tree at all -- exactly the separation
+//     the round asks for: the JS OBJECTS belong to the collector, the
+//     program text does not.
+//
+// Lists of children (statements of a block, arguments of a call, elements
+// of an array) lie one after another in the `list` column; a node names the
+// offset and the count. They are built with a stack (`ast_mark` /
+// `ast_close`), so nesting costs nothing.
+//
+// Values: the numbers of the literals lie as IEEE 754 bit patterns in
+// `nums`, the texts as UTF-16 code units in `str`.
+import html.mem
+
+export {
+    Ast, ast_new, ast_init, ast_free,
+    ast_node, ast_count,
+    ast_kind, ast_a, ast_b, ast_c, ast_d, ast_e, ast_f, ast_g, ast_h,
+    ast_line,
+    ast_set_kind, ast_set_a, ast_set_b, ast_set_c, ast_set_d,
+    ast_set_e, ast_set_f, ast_set_g, ast_set_h,
+    ast_mark, ast_push, ast_close, ast_pending_count, ast_pending_at,
+    ast_list_at, ast_list_len, ast_list_set,
+    ast_num_add, ast_num_at,
+    ast_str_add_from, ast_str_at, ast_str_len, ast_str_pool,
+    ast_str_equal_ascii,
+    N_NONE, N_PROGRAM, N_IDENT, N_PRIVATE_NAME, N_NUM, N_STR, N_BOOL,
+    N_NULL, N_REGEXP, N_THIS, N_SUPER, N_ARRAY, N_OBJECT, N_PROPERTY,
+    N_SPREAD, N_REST, N_TEMPLATE, N_TEMPLATE_ELEM, N_TAGGED, N_FUNC,
+    N_CALL, N_NEW, N_MEMBER, N_UNARY, N_UPDATE, N_BINARY, N_LOGICAL,
+    N_ASSIGN, N_COND, N_SEQUENCE, N_CLASS, N_METHOD, N_FIELD, N_CHAIN,
+    N_META, N_EXPR_STMT, N_BLOCK, N_EMPTY, N_DEBUGGER, N_VAR_DECL,
+    N_DECLARATOR, N_IF, N_FOR, N_FORIN, N_FOROF, N_WHILE, N_DOWHILE,
+    N_RETURN, N_BREAK, N_CONTINUE, N_LABELED, N_SWITCH, N_CASE, N_THROW,
+    N_TRY, N_CATCH, N_WITH, N_ARRAY_PAT, N_OBJECT_PAT, N_ASSIGN_PAT,
+    N_IMPORT, N_EXPORT_NAMED, N_EXPORT_DEFAULT, N_EXPORT_ALL,
+    N_IMPORT_SPEC, N_IMPORT_DEFAULT, N_IMPORT_NS, N_EXPORT_SPEC,
+    N_STATIC_BLOCK, N_YIELD, N_AWAIT, N_BIGINT,
+    U_MINUS, U_PLUS, U_NOT, U_BITNOT, U_TYPEOF, U_VOID, U_DELETE,
+    OP_IN, OP_INSTANCEOF,
+    D_VAR, D_LET, D_CONST,
+    FN_ARROW, FN_EXPRESSION_BODY, FN_DECLARATION, FN_METHOD, FN_GETTER,
+    FN_SETTER, FN_STRICT, FN_GENERATOR, FN_ASYNC, FN_CONSTRUCTOR,
+    FN_SIMPLE_PARAMS, FN_USES_ARGUMENTS, FN_ANALYZED, FN_CLASS_CTOR,
+    FN_DERIVED_CTOR, FOR_AWAIT,
+    PR_COMPUTED, PR_SHORTHAND, PR_METHOD, PR_GET, PR_SET, PR_STATIC,
+    PR_PROTO,
+    MB_COMPUTED, MB_OPTIONAL, CL_OPTIONAL,
+}
+
+// ---------------------------------------------------------- The node kinds
+
+const N_NONE: u32 = 0
+const N_PROGRAM: u32 = 1
+const N_IDENT: u32 = 2
+const N_PRIVATE_NAME: u32 = 3
+const N_NUM: u32 = 4
+const N_STR: u32 = 5
+const N_BOOL: u32 = 6
+const N_NULL: u32 = 7
+const N_REGEXP: u32 = 8
+const N_THIS: u32 = 9
+const N_SUPER: u32 = 10
+const N_ARRAY: u32 = 11
+const N_OBJECT: u32 = 12
+const N_PROPERTY: u32 = 13
+const N_SPREAD: u32 = 14
+const N_REST: u32 = 15
+const N_TEMPLATE: u32 = 16
+const N_TEMPLATE_ELEM: u32 = 17
+const N_TAGGED: u32 = 18
+const N_FUNC: u32 = 19
+const N_CALL: u32 = 20
+const N_NEW: u32 = 21
+const N_MEMBER: u32 = 22
+const N_UNARY: u32 = 23
+const N_UPDATE: u32 = 24
+const N_BINARY: u32 = 25
+const N_LOGICAL: u32 = 26
+const N_ASSIGN: u32 = 27
+const N_COND: u32 = 28
+const N_SEQUENCE: u32 = 29
+const N_CLASS: u32 = 30
+const N_METHOD: u32 = 31
+const N_FIELD: u32 = 32
+const N_CHAIN: u32 = 33
+const N_META: u32 = 34
+const N_EXPR_STMT: u32 = 40
+const N_BLOCK: u32 = 41
+const N_EMPTY: u32 = 42
+const N_DEBUGGER: u32 = 43
+const N_VAR_DECL: u32 = 44
+const N_DECLARATOR: u32 = 45
+const N_IF: u32 = 46
+const N_FOR: u32 = 47
+const N_FORIN: u32 = 48
+const N_FOROF: u32 = 49
+const N_WHILE: u32 = 50
+const N_DOWHILE: u32 = 51
+const N_RETURN: u32 = 52
+const N_BREAK: u32 = 53
+const N_CONTINUE: u32 = 54
+const N_LABELED: u32 = 55
+const N_SWITCH: u32 = 56
+const N_CASE: u32 = 57
+const N_THROW: u32 = 58
+const N_TRY: u32 = 59
+const N_CATCH: u32 = 60
+const N_WITH: u32 = 61
+const N_ARRAY_PAT: u32 = 62
+const N_OBJECT_PAT: u32 = 63
+const N_ASSIGN_PAT: u32 = 64
+const N_STATIC_BLOCK: u32 = 65
+// Round 66: the suspension points and the second numeric type.
+const N_YIELD: u32 = 66 // a = argument, b = 1 for `yield*`
+const N_AWAIT: u32 = 67 // a = argument
+const N_BIGINT: u32 = 68 // a = offset in the string pool, b = length
+const N_IMPORT: u32 = 70
+const N_EXPORT_NAMED: u32 = 71
+const N_EXPORT_DEFAULT: u32 = 72
+const N_EXPORT_ALL: u32 = 73
+const N_IMPORT_SPEC: u32 = 74
+const N_IMPORT_DEFAULT: u32 = 75
+const N_IMPORT_NS: u32 = 76
+const N_EXPORT_SPEC: u32 = 77
+
+// ------------------------------------------------------- Operator numbers
+//
+// The binary and the assignment operators keep the punctuator codes of the
+// lexer (lib/js/lex.fi) -- one numbering instead of two that have to be
+// kept in step. Only the unary operators get their own, because `+`, `-`
+// and `!` exist in both roles.
+
+const U_MINUS: u32 = 1
+const U_PLUS: u32 = 2
+const U_NOT: u32 = 3
+const U_BITNOT: u32 = 4
+const U_TYPEOF: u32 = 5
+const U_VOID: u32 = 6
+const U_DELETE: u32 = 7
+
+// `in` and `instanceof` are KEYWORDS; their lexer numbers collide with
+// those of the punctuators (`K_IN` is 21 and so is `P_MUL`). They therefore
+// get numbers of their own here, out of the way of both tables.
+const OP_IN: u32 = 200
+const OP_INSTANCEOF: u32 = 201
+
+const D_VAR: u32 = 0
+const D_LET: u32 = 1
+const D_CONST: u32 = 2
+
+// ------------------------------------------------------------ Node flags
+
+const FN_ARROW: u32 = 1
+const FN_EXPRESSION_BODY: u32 = 2
+const FN_DECLARATION: u32 = 4
+const FN_METHOD: u32 = 8
+const FN_GETTER: u32 = 16
+const FN_SETTER: u32 = 32
+const FN_STRICT: u32 = 64
+const FN_GENERATOR: u32 = 128
+const FN_ASYNC: u32 = 256
+const FN_CONSTRUCTOR: u32 = 512
+const FN_SIMPLE_PARAMS: u32 = 1024
+const FN_USES_ARGUMENTS: u32 = 2048
+const FN_ANALYZED: u32 = 4096
+const FN_CLASS_CTOR: u32 = 8192
+const FN_DERIVED_CTOR: u32 = 16384
+// `for await (... of ...)` sits in the `d` column of N_FOROF.
+const FOR_AWAIT: u32 = 1
+
+const PR_COMPUTED: u32 = 1
+const PR_SHORTHAND: u32 = 2
+const PR_METHOD: u32 = 4
+const PR_GET: u32 = 8
+const PR_SET: u32 = 16
+const PR_STATIC: u32 = 32
+const PR_PROTO: u32 = 64
+
+const MB_COMPUTED: u32 = 1
+const MB_OPTIONAL: u32 = 2
+const CL_OPTIONAL: u32 = 2
+
+// ============================================================= The storage
+
+struct Ast {
+    kind: mem.CpBuf,
+    a: mem.CpBuf,
+    b: mem.CpBuf,
+    c: mem.CpBuf,
+    d: mem.CpBuf,
+    e: mem.CpBuf,
+    f: mem.CpBuf,
+    g: mem.CpBuf,
+    h: mem.CpBuf,
+    line: mem.CpBuf,
+    list: mem.CpBuf,
+    pending: mem.CpBuf,
+    nums: mem.Buf,
+    str: mem.CpBuf,
+}
+
+fn ast_new() -> Ast {
+    return Ast {
+        kind: mem.cp_new(), a: mem.cp_new(), b: mem.cp_new(), c: mem.cp_new(),
+        d: mem.cp_new(), e: mem.cp_new(), f: mem.cp_new(), g: mem.cp_new(),
+        h: mem.cp_new(), line: mem.cp_new(), list: mem.cp_new(),
+        pending: mem.cp_new(), nums: mem.buf_new(), str: mem.cp_new(),
+    }
+}
+
+fn ast_init(t: *mut Ast) {
+    mem.cp_init(&(*t).kind)
+    mem.cp_init(&(*t).a)
+    mem.cp_init(&(*t).b)
+    mem.cp_init(&(*t).c)
+    mem.cp_init(&(*t).d)
+    mem.cp_init(&(*t).e)
+    mem.cp_init(&(*t).f)
+    mem.cp_init(&(*t).g)
+    mem.cp_init(&(*t).h)
+    mem.cp_init(&(*t).line)
+    mem.cp_init(&(*t).list)
+    mem.cp_init(&(*t).pending)
+    mem.buf_init(&(*t).nums)
+    mem.cp_init(&(*t).str)
+    // Node 0 is the null node.
+    ast_node(t, N_NONE, 0)
+}
+
+fn ast_free(t: *mut Ast) {
+    mem.cp_free(&(*t).kind)
+    mem.cp_free(&(*t).a)
+    mem.cp_free(&(*t).b)
+    mem.cp_free(&(*t).c)
+    mem.cp_free(&(*t).d)
+    mem.cp_free(&(*t).e)
+    mem.cp_free(&(*t).f)
+    mem.cp_free(&(*t).g)
+    mem.cp_free(&(*t).h)
+    mem.cp_free(&(*t).line)
+    mem.cp_free(&(*t).list)
+    mem.cp_free(&(*t).pending)
+    mem.buf_free(&(*t).nums)
+    mem.cp_free(&(*t).str)
+}
+
+fn ast_node(t: *mut Ast, kind: u32, line: u32) -> u32 {
+    let i: usize = mem.cp_len(&(*t).kind)
+    mem.cp_push(&(*t).kind, kind)
+    mem.cp_push(&(*t).a, 0 as u32)
+    mem.cp_push(&(*t).b, 0 as u32)
+    mem.cp_push(&(*t).c, 0 as u32)
+    mem.cp_push(&(*t).d, 0 as u32)
+    mem.cp_push(&(*t).e, 0 as u32)
+    mem.cp_push(&(*t).f, 0 as u32)
+    mem.cp_push(&(*t).g, 0 as u32)
+    mem.cp_push(&(*t).h, 0 as u32)
+    mem.cp_push(&(*t).line, line)
+    return i as u32
+}
+
+fn ast_count(t: *mut Ast) -> usize {
+    return mem.cp_len(&(*t).kind)
+}
+
+fn ast_kind(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).kind, i as usize) }
+fn ast_a(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).a, i as usize) }
+fn ast_b(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).b, i as usize) }
+fn ast_c(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).c, i as usize) }
+fn ast_d(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).d, i as usize) }
+fn ast_e(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).e, i as usize) }
+fn ast_f(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).f, i as usize) }
+fn ast_g(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).g, i as usize) }
+fn ast_h(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).h, i as usize) }
+fn ast_line(t: *mut Ast, i: u32) -> u32 { return mem.cp_at(&(*t).line, i as usize) }
+
+fn ast_set_kind(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).kind, i as usize, v) }
+fn ast_set_a(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).a, i as usize, v) }
+fn ast_set_b(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).b, i as usize, v) }
+fn ast_set_c(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).c, i as usize, v) }
+fn ast_set_d(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).d, i as usize, v) }
+fn ast_set_e(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).e, i as usize, v) }
+fn ast_set_f(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).f, i as usize, v) }
+fn ast_set_g(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).g, i as usize, v) }
+fn ast_set_h(t: *mut Ast, i: u32, v: u32) { mem.cp_set(&(*t).h, i as usize, v) }
+
+// ---------------------------------------------------------- Children lists
+
+fn ast_mark(t: *mut Ast) -> usize {
+    return mem.cp_len(&(*t).pending)
+}
+
+fn ast_push(t: *mut Ast, node: u32) {
+    mem.cp_push(&(*t).pending, node)
+}
+
+fn ast_pending_count(t: *mut Ast, mark: usize) -> usize {
+    return mem.cp_len(&(*t).pending) - mark
+}
+
+fn ast_pending_at(t: *mut Ast, i: usize) -> u32 {
+    return mem.cp_at(&(*t).pending, i)
+}
+
+// Move everything above `mark` into the list column; returns the offset.
+fn ast_close(t: *mut Ast, mark: usize) -> u32 {
+    let off: usize = mem.cp_len(&(*t).list)
+    var i: usize = mark
+    while i < mem.cp_len(&(*t).pending) {
+        mem.cp_push(&(*t).list, mem.cp_at(&(*t).pending, i))
+        i = i + 1
+    }
+    mem.cp_truncate(&(*t).pending, mark)
+    return off as u32
+}
+
+fn ast_list_at(t: *mut Ast, off: u32, i: usize) -> u32 {
+    return mem.cp_at(&(*t).list, off as usize + i)
+}
+
+fn ast_list_set(t: *mut Ast, off: u32, i: usize, v: u32) {
+    mem.cp_set(&(*t).list, off as usize + i, v)
+}
+
+fn ast_list_len(t: *mut Ast) -> usize {
+    return mem.cp_len(&(*t).list)
+}
+
+// -------------------------------------------------------- Literal values
+
+fn ast_num_add(t: *mut Ast, bits: u64) -> u32 {
+    let i: usize = mem.buf_len(&(*t).nums) / 8
+    var k: u64 = 0
+    while k < 8 {
+        mem.buf_push(&(*t).nums, ((bits >> (k * 8)) & 255) as u8)
+        k = k + 1
+    }
+    return i as u32
+}
+
+fn ast_num_at(t: *mut Ast, i: u32) -> u64 {
+    var v: u64 = 0
+    var k: usize = 0
+    while k < 8 {
+        v = v | ((mem.buf_at(&(*t).nums, i as usize * 8 + k) as u64) << (k as u64 * 8))
+        k = k + 1
+    }
+    return v
+}
+
+// Copy `len` code units out of a foreign pool into the string pool.
+fn ast_str_add_from(t: *mut Ast, src: *mut mem.CpBuf, off: usize, len: usize) -> u32 {
+    let at: usize = mem.cp_len(&(*t).str)
+    var i: usize = 0
+    while i < len {
+        mem.cp_push(&(*t).str, mem.cp_at(src, off + i))
+        i = i + 1
+    }
+    return at as u32
+}
+
+fn ast_str_at(t: *mut Ast, off: u32, i: usize) -> u32 {
+    return mem.cp_at(&(*t).str, off as usize + i)
+}
+
+fn ast_str_len(t: *mut Ast) -> usize {
+    return mem.cp_len(&(*t).str)
+}
+
+fn ast_str_pool(t: *mut Ast) -> *mut mem.CpBuf {
+    return &(*t).str
+}
+
+fn ast_str_equal_ascii(t: *mut Ast, off: u32, len: usize, p: *mut u8, n: usize) -> bool {
+    if len != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if ast_str_at(t, off, i) != (*((p as usize + i) as *mut u8)) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

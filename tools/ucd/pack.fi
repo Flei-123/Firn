@@ -1,0 +1,702 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/ucd/pack.fi -- ACCEPTANCE ITEM 6, the packing half.
+//
+// Reads on standard input what the COMPILER read out of the Unicode
+// Character Database at compile time (`tools/ucd/gen_ucd.fi`, one line per
+// entry) and writes `generated/unicode_tables.fi` to standard output.
+//
+// WHY A SECOND PROGRAM AND NOT MORE `comptime`: `comptime` has integers and
+// bools and nothing else -- no arrays, no memory (SPEC 14.1.comptime, and
+// `compiler/src/comptime.rs` says so in its head comment). A table with
+// DEDUPLICATED blocks cannot be built there: it needs a 1,114,112 octet
+// array and a search over the blocks already kept. Reading the UCD is what
+// the acceptance item asks of the compiler, and that happens in
+// `gen_ucd.fi`; the packing is arithmetic over what was read, and it
+// happens here -- in Firn, in the build step, with no Python in the path.
+//
+// THE SHAPE OF THE TABLE. A flat list of ranges costs a binary search per
+// code point (the JavaScript lexer does 10 to 11 probes for one character
+// today, `lib/js/unicode_id.fi`). This is a THREE STAGE table instead, with
+// deduplicated blocks -- the shape every serious Unicode library uses:
+//
+//   level 1   cp >> 9          2,176 entries, one octet each -> a level 2 block
+//   level 2   (cp >> 4) & 31   32 entries per block, two octets -> a level 3 block
+//   level 3   cp & 15          16 entries per block, one octet: THE CLASS
+//
+// Three loads, no branch, no loop -- the same cost for every code point.
+// Blocks that are equal octet for octet are stored ONCE; the unassigned
+// planes 4 to 13 therefore cost almost nothing.
+//
+// THE CLASS OCTET holds three answers at once:
+//   bits 0..4   the general category as a number (0 = Cn, see cat_id)
+//   bit 5       ID_Start
+//   bit 6       ID_Continue
+//
+// THE CASE MAPPINGS are a different shape, because they are sparse: 1,505
+// upper and 1,488 lower mappings over the whole of Unicode. They become
+// RUNS -- `lo`, `hi`, a stride of 1 or 2 and a delta -- because that is what
+// the UCD is made of (`0x100..0x12E step 2, delta +1` is one line of Latin
+// Extended-A). One run fits into one u64. An index by `cp >> 10` says where
+// to start looking, so a lookup reads one index entry and then one or two
+// runs.
+//
+// Usage:  ./pack < dump.txt > generated/unicode_tables.fi
+import rt.rt
+
+const MAXCP: usize = 1114112
+// MAXCP / 16 level 3 blocks, of those 32 per level 2 block.
+const N3: usize = 69632
+const N2: usize = 2176
+const IDX_SHIFT: usize = 10
+const IDX_LEN: usize = 128
+const NONE: usize = 0xFFFFFFFF
+// Room for the runs of the case mappings (measured: 204 + 186).
+const RUNMAX: usize = 4096
+
+// ------------------------------------------------------------- categories
+
+// The 30 general categories of the UCD as a number. 0 = Cn (not assigned),
+// so that a code point the file does not mention needs no entry at all.
+fn cat_id(a: u8, b: u8) -> u8 {
+    if a == 76 as u8 {
+        if b == 117 as u8 {
+            return 1 as u8
+        }
+        if b == 108 as u8 {
+            return 2 as u8
+        }
+        if b == 116 as u8 {
+            return 3 as u8
+        }
+        if b == 109 as u8 {
+            return 4 as u8
+        }
+        if b == 111 as u8 {
+            return 5 as u8
+        }
+        return 0 as u8
+    }
+    if a == 77 as u8 {
+        if b == 110 as u8 {
+            return 6 as u8
+        }
+        if b == 99 as u8 {
+            return 7 as u8
+        }
+        if b == 101 as u8 {
+            return 8 as u8
+        }
+        return 0 as u8
+    }
+    if a == 78 as u8 {
+        if b == 100 as u8 {
+            return 9 as u8
+        }
+        if b == 108 as u8 {
+            return 10 as u8
+        }
+        if b == 111 as u8 {
+            return 11 as u8
+        }
+        return 0 as u8
+    }
+    if a == 80 as u8 {
+        if b == 99 as u8 {
+            return 12 as u8
+        }
+        if b == 100 as u8 {
+            return 13 as u8
+        }
+        if b == 115 as u8 {
+            return 14 as u8
+        }
+        if b == 101 as u8 {
+            return 15 as u8
+        }
+        if b == 105 as u8 {
+            return 16 as u8
+        }
+        if b == 102 as u8 {
+            return 17 as u8
+        }
+        if b == 111 as u8 {
+            return 18 as u8
+        }
+        return 0 as u8
+    }
+    if a == 83 as u8 {
+        if b == 109 as u8 {
+            return 19 as u8
+        }
+        if b == 99 as u8 {
+            return 20 as u8
+        }
+        if b == 107 as u8 {
+            return 21 as u8
+        }
+        if b == 111 as u8 {
+            return 22 as u8
+        }
+        return 0 as u8
+    }
+    if a == 90 as u8 {
+        if b == 115 as u8 {
+            return 23 as u8
+        }
+        if b == 108 as u8 {
+            return 24 as u8
+        }
+        if b == 112 as u8 {
+            return 25 as u8
+        }
+        return 0 as u8
+    }
+    if a == 67 as u8 {
+        if b == 99 as u8 {
+            return 26 as u8
+        }
+        if b == 102 as u8 {
+            return 27 as u8
+        }
+        if b == 115 as u8 {
+            return 28 as u8
+        }
+        if b == 111 as u8 {
+            return 29 as u8
+        }
+        return 0 as u8
+    }
+    return 0 as u8
+}
+
+// ------------------------------------------------------------- the input
+
+struct Reader {
+    p: u64,
+    n: usize,
+    i: usize,
+}
+
+fn at(r: *mut Reader) -> u8 {
+    if (*r).i >= (*r).n {
+        return 0 as u8
+    }
+    return rt.ld8((*r).p, (*r).i)
+}
+
+fn skip_blank(r: *mut Reader) {
+    while (*r).i < (*r).n {
+        if at(r) != 32 as u8 {
+            return
+        }
+        (*r).i = (*r).i + 1
+    }
+}
+
+fn number(r: *mut Reader) -> i64 {
+    var v: i64 = 0
+    while (*r).i < (*r).n {
+        let c: u8 = at(r)
+        if c < 48 as u8 {
+            break
+        }
+        if c > 57 as u8 {
+            break
+        }
+        v = v * 10 + (c as i64 - 48)
+        (*r).i = (*r).i + 1
+    }
+    return v
+}
+
+fn to_line_end(r: *mut Reader) {
+    while (*r).i < (*r).n {
+        if at(r) == 10 as u8 {
+            (*r).i = (*r).i + 1
+            return
+        }
+        (*r).i = (*r).i + 1
+    }
+}
+
+// ------------------------------------------------------------- the output
+
+// `w(p, <i>, 0x<v>)` -- one line of the generated table.
+fn emit_word(b: *mut rt.Buf, i: usize, v: u64) {
+    var t: [u8; 8] = "    w(p,"
+    rt.buf_push_bytes(b, (&t) as u64, 8)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_dec_u64(b, i as u64)
+    rt.buf_push(b, 44 as u8)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push(b, 48 as u8)
+    rt.buf_push(b, 120 as u8)
+    rt.buf_push_hex_u64(b, v, 1)
+    rt.buf_push(b, 41 as u8)
+    rt.buf_push(b, 10 as u8)
+}
+
+// `const NAME: usize = <v>`
+fn emit_const(b: *mut rt.Buf, name: u64, nlen: usize, v: usize) {
+    var t: [u8; 6] = "const "
+    rt.buf_push_bytes(b, (&t) as u64, 6)
+    rt.buf_push_bytes(b, name, nlen)
+    var t2: [u8; 10] = ": usize = "
+    rt.buf_push_bytes(b, (&t2) as u64, 10)
+    rt.buf_push_dec_u64(b, v as u64)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn header(b: *mut rt.Buf, bytes: usize, o1: usize, o2: usize, o3: usize,
+    oui: usize, ou: usize, oli: usize, ol: usize, l2n: usize, l3n: usize,
+    upr: usize, lor: usize) {
+    var n0: [u8; 5] = "BYTES"
+    emit_const(b, (&n0) as u64, 5, bytes)
+    var n1: [u8; 6] = "OFF_L1"
+    emit_const(b, (&n1) as u64, 6, o1)
+    var n2: [u8; 6] = "OFF_L2"
+    emit_const(b, (&n2) as u64, 6, o2)
+    var n3: [u8; 6] = "OFF_L3"
+    emit_const(b, (&n3) as u64, 6, o3)
+    var n4: [u8; 9] = "OFF_UPIDX"
+    emit_const(b, (&n4) as u64, 9, oui)
+    var n5: [u8; 6] = "OFF_UP"
+    emit_const(b, (&n5) as u64, 6, ou)
+    var n6: [u8; 9] = "OFF_LOIDX"
+    emit_const(b, (&n6) as u64, 9, oli)
+    var n7: [u8; 7] = "OFF_LOW"
+    emit_const(b, (&n7) as u64, 7, ol)
+    var n8: [u8; 6] = "L1_LEN"
+    emit_const(b, (&n8) as u64, 6, N2)
+    var n9: [u8; 9] = "L2_BLOCKS"
+    emit_const(b, (&n9) as u64, 9, l2n)
+    var na: [u8; 9] = "L3_BLOCKS"
+    emit_const(b, (&na) as u64, 9, l3n)
+    var nb: [u8; 7] = "UP_RUNS"
+    emit_const(b, (&nb) as u64, 7, upr)
+    var nc: [u8; 8] = "LOW_RUNS"
+    emit_const(b, (&nc) as u64, 8, lor)
+    var nd: [u8; 9] = "IDX_SHIFT"
+    emit_const(b, (&nd) as u64, 9, IDX_SHIFT)
+    var ne: [u8; 7] = "IDX_LEN"
+    emit_const(b, (&ne) as u64, 7, IDX_LEN)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn part_head(b: *mut rt.Buf, k: usize) {
+    var t: [u8; 16] = "#[no_gc]\nfn part"
+    rt.buf_push_bytes(b, (&t) as u64, 16)
+    rt.buf_push_dec_u64(b, k as u64)
+    var t2: [u8; 15] = "(p: *mut u8) {\n"
+    rt.buf_push_bytes(b, (&t2) as u64, 15)
+}
+
+fn part_foot(b: *mut rt.Buf) {
+    var t: [u8; 2] = "}\n"
+    rt.buf_push_bytes(b, (&t) as u64, 2)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn footer(b: *mut rt.Buf, parts: usize, words: usize) {
+    var t: [u8; 22] = "fn load(p: *mut u8) {\n"
+    rt.buf_push_bytes(b, (&t) as u64, 22)
+    var k: usize = 0
+    while k < parts {
+        var t2: [u8; 8] = "    part"
+        rt.buf_push_bytes(b, (&t2) as u64, 8)
+        rt.buf_push_dec_u64(b, k as u64)
+        var t3: [u8; 4] = "(p)\n"
+        rt.buf_push_bytes(b, (&t3) as u64, 4)
+        k = k + 1
+    }
+    var t4: [u8; 2] = "}\n"
+    rt.buf_push_bytes(b, (&t4) as u64, 2)
+}
+
+fn main() -> i32 {
+    var input: rt.Buf = rt.buf_new()
+    if !rt.read_stdin(&input) {
+        return 2
+    }
+    var r: Reader = Reader { p: input.ptr, n: input.len, i: 0 }
+
+    // The class octet per code point. mmap hands out zeroed pages, so
+    // everything the UCD does not mention is Cn without an entry.
+    let cls: u64 = rt.heap_alloc(MAXCP)
+    if cls == 0 {
+        return 3
+    }
+    // The case mappings, as they stand in the file: code point and target.
+    let upcp: u64 = rt.heap_alloc(4096 * 8)
+    let uptg: u64 = rt.heap_alloc(4096 * 8)
+    let locp: u64 = rt.heap_alloc(4096 * 8)
+    let lotg: u64 = rt.heap_alloc(4096 * 8)
+    if upcp == 0 {
+        return 3
+    }
+    if uptg == 0 {
+        return 3
+    }
+    if locp == 0 {
+        return 3
+    }
+    if lotg == 0 {
+        return 3
+    }
+    var upn: usize = 0
+    var lon: usize = 0
+    var cranges: usize = 0
+    var sranges: usize = 0
+    var iranges: usize = 0
+
+    while r.i < r.n {
+        let tag: u8 = at(&r)
+        r.i = r.i + 1
+        skip_blank(&r)
+        let a: i64 = number(&r)
+        skip_blank(&r)
+        let b: i64 = number(&r)
+        if tag == 67 as u8 {
+            // C lo hi Xy
+            skip_blank(&r)
+            let c1: u8 = at(&r)
+            r.i = r.i + 1
+            let c2: u8 = at(&r)
+            r.i = r.i + 1
+            let id: u8 = cat_id(c1, c2)
+            if id == 0 as u8 {
+                return 4
+            }
+            var x: usize = a as usize
+            while x <= b as usize {
+                rt.st8(cls, x, rt.ld8(cls, x) | id)
+                x = x + 1
+            }
+            cranges = cranges + 1
+        } else if tag == 83 as u8 {
+            var x2: usize = a as usize
+            while x2 <= b as usize {
+                rt.st8(cls, x2, rt.ld8(cls, x2) | 32 as u8)
+                x2 = x2 + 1
+            }
+            sranges = sranges + 1
+        } else if tag == 73 as u8 {
+            var x3: usize = a as usize
+            while x3 <= b as usize {
+                rt.st8(cls, x3, rt.ld8(cls, x3) | 64 as u8)
+                x3 = x3 + 1
+            }
+            iranges = iranges + 1
+        } else if tag == 85 as u8 {
+            if upn >= 4096 {
+                return 5
+            }
+            rt.st64(upcp, upn, a as u64)
+            rt.st64(uptg, upn, b as u64)
+            upn = upn + 1
+        } else if tag == 76 as u8 {
+            if lon >= 4096 {
+                return 5
+            }
+            rt.st64(locp, lon, a as u64)
+            rt.st64(lotg, lon, b as u64)
+            lon = lon + 1
+        } else {
+            return 6
+        }
+        to_line_end(&r)
+    }
+    if cranges == 0 {
+        return 7
+    }
+    if sranges == 0 {
+        return 7
+    }
+    if iranges == 0 {
+        return 7
+    }
+    if upn == 0 {
+        return 7
+    }
+    if lon == 0 {
+        return 7
+    }
+
+    // ------------------------------------------------- level 3: 16 octets
+    let l3data: u64 = rt.heap_alloc(N3 * 16)
+    let l3idx: u64 = rt.heap_alloc(N3 * 2)
+    if l3data == 0 {
+        return 3
+    }
+    if l3idx == 0 {
+        return 3
+    }
+    var l3n: usize = 0
+    var blk: usize = 0
+    while blk < N3 {
+        let w0: u64 = rt.ld64(cls, blk * 2)
+        let w1: u64 = rt.ld64(cls, blk * 2 + 1)
+        var found: usize = NONE
+        var k: usize = 0
+        while k < l3n {
+            if rt.ld64(l3data, k * 2) == w0 {
+                if rt.ld64(l3data, k * 2 + 1) == w1 {
+                    found = k
+                    break
+                }
+            }
+            k = k + 1
+        }
+        if found == NONE {
+            rt.st64(l3data, l3n * 2, w0)
+            rt.st64(l3data, l3n * 2 + 1, w1)
+            found = l3n
+            l3n = l3n + 1
+        }
+        rt.st16(l3idx, blk, found as u16)
+        blk = blk + 1
+    }
+
+    // ------------------------------- level 2: 32 level 3 numbers per block
+    let l2data: u64 = rt.heap_alloc(N2 * 32 * 2)
+    let l1: u64 = rt.heap_alloc(N2)
+    if l2data == 0 {
+        return 3
+    }
+    if l1 == 0 {
+        return 3
+    }
+    var l2n: usize = 0
+    var blk2: usize = 0
+    while blk2 < N2 {
+        var found2: usize = NONE
+        var k2: usize = 0
+        while k2 < l2n {
+            var same: bool = true
+            var j: usize = 0
+            while j < 32 {
+                if rt.ld16(l2data, k2 * 32 + j) != rt.ld16(l3idx, blk2 * 32 + j) {
+                    same = false
+                    break
+                }
+                j = j + 1
+            }
+            if same {
+                found2 = k2
+                break
+            }
+            k2 = k2 + 1
+        }
+        if found2 == NONE {
+            var j2: usize = 0
+            while j2 < 32 {
+                rt.st16(l2data, l2n * 32 + j2, rt.ld16(l3idx, blk2 * 32 + j2))
+                j2 = j2 + 1
+            }
+            found2 = l2n
+            l2n = l2n + 1
+        }
+        rt.st8(l1, blk2, found2 as u8)
+        blk2 = blk2 + 1
+    }
+    // The first level holds ONE octet per entry. If the deduplication ever
+    // leaves more than 256 level 2 blocks, the layout is wrong -- and this
+    // program says so instead of writing a silently truncated table.
+    if l2n > 256 {
+        return 8
+    }
+
+    // ------------------------------------------------ the case mapping runs
+    let uprun: u64 = rt.heap_alloc(RUNMAX * 8)
+    let lorun: u64 = rt.heap_alloc(RUNMAX * 8)
+    if uprun == 0 {
+        return 3
+    }
+    if lorun == 0 {
+        return 3
+    }
+    let upruns: usize = build_runs(upcp, uptg, upn, uprun)
+    let loruns: usize = build_runs(locp, lotg, lon, lorun)
+    if upruns == 0 {
+        return 9
+    }
+    if loruns == 0 {
+        return 9
+    }
+    // The index by `cp >> 10` only covers the region in which mappings
+    // exist at all. If a future UCD maps above it, the table has to grow --
+    // and again: say so, do not truncate.
+    if rt.ld64(upcp, upn - 1) >= (IDX_LEN << IDX_SHIFT) as u64 {
+        return 10
+    }
+    if rt.ld64(locp, lon - 1) >= (IDX_LEN << IDX_SHIFT) as u64 {
+        return 10
+    }
+    let upidx: u64 = rt.heap_alloc(IDX_LEN * 2)
+    let loidx: u64 = rt.heap_alloc(IDX_LEN * 2)
+    if upidx == 0 {
+        return 3
+    }
+    if loidx == 0 {
+        return 3
+    }
+    build_index(uprun, upruns, upidx)
+    build_index(lorun, loruns, loidx)
+
+    // ------------------------------------------------------- the layout
+    let off_l1: usize = 0
+    let off_l2: usize = align8(off_l1 + N2)
+    let off_l3: usize = align8(off_l2 + l2n * 32 * 2)
+    let off_upidx: usize = align8(off_l3 + l3n * 16)
+    let off_up: usize = align8(off_upidx + IDX_LEN * 2)
+    let off_loidx: usize = align8(off_up + upruns * 8)
+    let off_low: usize = align8(off_loidx + IDX_LEN * 2)
+    let bytes: usize = align8(off_low + loruns * 8)
+
+    let region: u64 = rt.heap_alloc(bytes)
+    if region == 0 {
+        return 3
+    }
+    var q: usize = 0
+    while q < N2 {
+        rt.st8(region, off_l1 + q, rt.ld8(l1, q))
+        q = q + 1
+    }
+    q = 0
+    while q < l2n * 32 {
+        rt.st16(region + off_l2 as u64, q, rt.ld16(l2data, q))
+        q = q + 1
+    }
+    q = 0
+    while q < l3n * 16 {
+        rt.st8(region, off_l3 + q, rt.ld8(l3data, q))
+        q = q + 1
+    }
+    q = 0
+    while q < IDX_LEN {
+        rt.st16(region + off_upidx as u64, q, rt.ld16(upidx, q))
+        rt.st16(region + off_loidx as u64, q, rt.ld16(loidx, q))
+        q = q + 1
+    }
+    q = 0
+    while q < upruns {
+        rt.st64(region + off_up as u64, q, rt.ld64(uprun, q))
+        q = q + 1
+    }
+    q = 0
+    while q < loruns {
+        rt.st64(region + off_low as u64, q, rt.ld64(lorun, q))
+        q = q + 1
+    }
+
+    // ------------------------------------------------------- the writing
+    var o: rt.Buf = rt.buf_new()
+    header(&o, bytes, off_l1, off_l2, off_l3, off_upidx, off_up, off_loidx,
+        off_low, l2n, l3n, upruns, loruns)
+    var words: usize = 0
+    var part: usize = 0
+    var inpart: usize = 0
+    var open: bool = false
+    var wi: usize = 0
+    while wi < bytes / 8 {
+        let v: u64 = rt.ld64(region, wi)
+        if v != 0 {
+            if !open {
+                part_head(&o, part)
+                open = true
+                inpart = 0
+            }
+            emit_word(&o, wi, v)
+            words = words + 1
+            inpart = inpart + 1
+            if inpart >= 400 {
+                part_foot(&o)
+                open = false
+                part = part + 1
+            }
+        }
+        wi = wi + 1
+    }
+    if open {
+        part_foot(&o)
+        part = part + 1
+    }
+    footer(&o, part, words)
+    if !rt.write_everything(1, o.ptr, o.len) {
+        return 11
+    }
+    return 0
+}
+
+fn align8(n: usize) -> usize {
+    return (n + 7) / 8 * 8
+}
+
+// Greedy runs over the sorted mappings: stride 1 or stride 2, whichever
+// reaches further. One run per u64:
+//   bits  0..20  lo
+//   bits 21..41  hi
+//   bit  42      0 = stride 1, 1 = stride 2
+//   bits 43..63  delta + 0x100000
+fn build_runs(cp: u64, tg: u64, n: usize, out: u64) -> usize {
+    var i: usize = 0
+    var runs: usize = 0
+    while i < n {
+        let base: u64 = rt.ld64(cp, i)
+        let delta: i64 = rt.ld64(tg, i) as i64 - base as i64
+        var e1: usize = i
+        while e1 + 1 < n {
+            if rt.ld64(cp, e1 + 1) != rt.ld64(cp, e1) + 1 {
+                break
+            }
+            if rt.ld64(tg, e1 + 1) as i64 - rt.ld64(cp, e1 + 1) as i64 != delta {
+                break
+            }
+            e1 = e1 + 1
+        }
+        var e2: usize = i
+        while e2 + 1 < n {
+            if rt.ld64(cp, e2 + 1) != rt.ld64(cp, e2) + 2 {
+                break
+            }
+            if rt.ld64(tg, e2 + 1) as i64 - rt.ld64(cp, e2 + 1) as i64 != delta {
+                break
+            }
+            e2 = e2 + 1
+        }
+        var last: usize = e1
+        var stride: u64 = 0
+        if e2 > e1 {
+            last = e2
+            stride = 1
+        }
+        if runs >= RUNMAX {
+            return 0
+        }
+        let hi: u64 = rt.ld64(cp, last)
+        let d: u64 = (delta + 1048576) as u64
+        rt.st64(out, runs, base | (hi << 21) | (stride << 42) | (d << 43))
+        runs = runs + 1
+        i = last + 1
+    }
+    return runs
+}
+
+// For every window of 2^IDX_SHIFT code points: the first run that can still
+// reach into it.
+fn build_index(runs: u64, n: usize, idx: u64) {
+    var w: usize = 0
+    var k: usize = 0
+    while w < IDX_LEN {
+        let base: u64 = (w << IDX_SHIFT) as u64
+        while k < n {
+            let hi: u64 = (rt.ld64(runs, k) >> 21) & 0x1FFFFF
+            if hi >= base {
+                break
+            }
+            k = k + 1
+        }
+        rt.st16(idx, w, k as u16)
+        w = w + 1
+    }
+}

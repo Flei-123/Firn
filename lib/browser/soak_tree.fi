@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/soak_tree.fi -- THE ENDURANCE RUN: build real DOM trees and
+// drop them, without the memory growing.
+//
+// WHAT IT IS ABOUT (acceptance point 2, SPEC 3.5.5): a DOM tree is the kind
+// of cycle a reference count fails at. Every node holds its parent STRONGLY
+// and its children STRONGLY; on top of that come the sibling pointers in
+// both directions. A tree of n nodes thereby has roughly 2n cycles. Once it
+// becomes unreachable, a reference count releases NOTHING.
+//
+// Unlike lib/dom/soak_gc.fi (the prototype from round 4), this program
+// builds no artificial sets of cycles but drives the REAL tree construction
+// from lib/browser/tree.fi over a real piece of HTML -- with a table,
+// formatting elements, attributes, raw text and a comment. Whatever is not
+// collected here would be a leak in an engine.
+//
+// The input (stdin, 12 bytes): u32 rounds, u32 budget_ms, u32 leak.
+// If it is missing, the defaults below apply.
+//
+// `leak != 0` turns the COUNTER CHECK on: every tree built is HELD ONTO in
+// a GC chain. Then the consumption MUST rise. A measurement that cannot
+// show a leak is worthless -- which is why it is driven along on every run
+// (tools/html/gc_tree.sh aborts when the counter check stays
+// green).
+//
+// The output: TSV on stdout, one line per SAMPLE rounds:
+//     t_ms  runden  knoten  rss_kib  lebende  laeufe  heap_bytes  pause_max_ns
+
+import html.mem
+import browser.node
+import browser.driver
+import dom.meas
+
+const DEFAULT_ROUNDS: u64 = 20000
+const DEFAULT_BUDGET_MS: i64 = 10000
+const SAMPLE: u64 = 500
+const SOURCE_LEN: usize = 432
+
+// The piece of HTML that becomes a tree in each round. Deliberately with
+// everything that produces nodes in the tree construction: a doctype, a
+// head, raw text (RCDATA and RAWTEXT, so two switch overs of the tokenizer),
+// a table, nested formatting with an adoption agency case, attributes, a comment, a select.
+#[no_gc]
+fn source(out: *mut mem.Buf) {
+    var t: [u8; 432] = "<!DOCTYPE html><html><head><title>soak</title><style>b{x:1}</style></head><body id=\"w\" class=\"k\"><h1>Head</h1><p>A <b>bold <i>and italic</i></b> paragraph with <a href=\"/x\">link</a>.</p><!--comment--><table><caption>Tab</caption><tr><td>a<td><b>b</b><tr><td colspan=\"2\">c</table><ul><li>one<li>two<li>three</ul><div><div><div><span>deep</span></div></div></div><p>a<b>b<i>c</p>d</i>e<select><option>1<option>2</select></body></html>"
+    mem.buf_clear(out)
+    var i: usize = 0
+    while i < SOURCE_LEN {
+        mem.buf_push(out, t[i])
+        i = i + 1
+    }
+}
+
+// Holds a tree fast -- for the counter check only.
+gc class Holder {
+    doc: Gc[Document],
+    next: Gc[Holder],
+}
+
+fn node_count(k: Gc[Node]) -> u64 {
+    if k == gc_null[Node]() {
+        return 0
+    }
+    var n: u64 = 1
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        n = n + node_count(c)
+        c = c.next
+    }
+    return n
+}
+
+// Lays a deep, nulled frame over the abandoned stack frames of the last
+// round. The stack scan is CONSERVATIVE (SPEC 3.5.3) -- an old pointer in a
+// dead frame would otherwise keep a whole tree alive. The self call keeps
+// the function out of the inliner, otherwise the nulled frames would lie in
+// the LIVE frame of the caller.
+fn scrub_deep(n: u64) {
+    var buffer: [u64; 512] = [0; 512]
+    var i: usize = 0
+    while i < 512 {
+        buffer[i] = 0
+        i = i + 1
+    }
+    barrier(&buffer)
+    if n > 0 {
+        scrub_deep(n - 1)
+    }
+}
+
+fn line(t_ms: u64, rounds: u64, node: u64, rss: u64, live: u64,
+    runs: u64, heap: u64, pause: u64) {
+    meas.meas_u64(t_ms)
+    meas.meas_tab()
+    meas.meas_u64(rounds)
+    meas.meas_tab()
+    meas.meas_u64(node)
+    meas.meas_tab()
+    meas.meas_u64(rss)
+    meas.meas_tab()
+    meas.meas_u64(live)
+    meas.meas_tab()
+    meas.meas_u64(runs)
+    meas.meas_tab()
+    meas.meas_u64(heap)
+    meas.meas_tab()
+    meas.meas_u64(pause)
+    meas.meas_nl()
+}
+
+fn text_out(p: u64, n: i64) {
+    meas.meas_write(p, n)
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 2
+    }
+    var rounds_max: u64 = DEFAULT_ROUNDS
+    var budget: i64 = DEFAULT_BUDGET_MS
+    var leak: bool = false
+    var ins: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&ins)
+    if mem.buf_len(&ins) >= 8 {
+        var v: u64 = 0
+        var i: usize = 0
+        while i < 4 {
+            v = v | ((mem.buf_at(&ins, i) as u64) << (8 * i as u64))
+            i = i + 1
+        }
+        if v > 0 {
+            rounds_max = v
+        }
+        var w: u64 = 0
+        i = 0
+        while i < 4 {
+            w = w | ((mem.buf_at(&ins, 4 + i) as u64) << (8 * i as u64))
+            i = i + 1
+        }
+        if w > 0 {
+            budget = w as i64
+        }
+        if mem.buf_len(&ins) >= 12 {
+            var lw: u64 = 0
+            i = 0
+            while i < 4 {
+                lw = lw | ((mem.buf_at(&ins, 8 + i) as u64) << (8 * i as u64))
+                i = i + 1
+            }
+            leak = lw != 0
+        }
+    }
+    mem.buf_free(&ins)
+
+    var header: [u8; 91] = "# firn-tree-soak v1\n# columns: t_ms\trounds\tnodes\trss_kib\tlive\truns\theap_bytes\tpause_max_ns\n"
+    text_out((&header) as u64, 91)
+
+    var src: mem.Buf = mem.buf_new()
+    mem.buf_init(&src)
+    source(&src)
+
+    // The `Run` lies in the frame of `main` (the conservative stack scan).
+    var l: driver.Run = driver.run_new()
+    if !driver.run_init(&l) {
+        return 3
+    }
+
+    let t0: u64 = meas.meas_now_ms()
+    var rounds: u64 = 0
+    var node_per_round: u64 = 0
+    var chain: Gc[Holder] = gc_null[Holder]()
+    while rounds < rounds_max {
+        driver.run_text_out_bytes(&l, mem.buf_ptr(&src), mem.buf_len(&src))
+        let rc: u32 = driver.run_document_build(&l)
+        if rc != 0 as u32 {
+            var f: [u8; 19] = "# error in a round\n"
+            text_out((&f) as u64, 19)
+            return 4
+        }
+        let n: u64 = node_count(driver.run_document(&l))
+        if node_per_round == 0 {
+            node_per_round = n
+        } else if node_per_round != n {
+            var f2: [u8; 25] = "# the node count wobbles\n"
+            text_out((&f2) as u64, 25)
+            return 5
+        }
+        if leak {
+            let h = gc Holder { doc: driver.run_document(&l), next: chain } catch gc_null[Holder]()
+            if h == gc_null[Holder]() {
+                var fo: [u8; 21] = "# out of memory (gc)\n"
+                text_out((&fo) as u64, 21)
+                return 6
+            }
+            chain = h
+        }
+        rounds = rounds + 1
+        if rounds % SAMPLE == 0 {
+            // The tree of the LAST round still hangs on the state; only here
+            // is it let go and the stack cleaned.
+            tree_release_and_clean(&l)
+            let t: u64 = meas.meas_now_ms() - t0
+            line(t, rounds, node_per_round, meas.meas_rss_kib(),
+                gc_live_objects(), gc_collections(), gc_heap_bytes(),
+                gc_pause_ns_max())
+            if t as i64 >= budget {
+                break
+            }
+        }
+    }
+    var ez: [u8; 10] = "# created="
+    text_out((&ez) as u64, 10)
+    meas.meas_u64(gc_diag(6))
+    var ez2: [u8; 6] = " live="
+    text_out((&ez2) as u64, 6)
+    meas.meas_u64(gc_live_objects())
+    var ez3: [u8; 6] = " leak="
+    text_out((&ez3) as u64, 6)
+    if leak {
+        meas.meas_u64(1)
+    } else {
+        meas.meas_u64(0)
+    }
+    meas.meas_nl()
+    // The chain must not be optimized away up to this point.
+    if leak && chain == gc_null[Holder]() {
+        return 7
+    }
+    var e: [u8; 7] = "# done\n"
+    text_out((&e) as u64, 7)
+    driver.run_free(&l)
+    return 0
+}
+
+fn tree_release_and_clean(l: *mut driver.Run) {
+    driver.run_tree_release(l)
+    scrub_deep(3)
+}

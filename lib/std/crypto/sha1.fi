@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/sha1.fi -- SHA-1 (FIPS 180-4), round 81.
+//
+// WHAT IT IS FOR, AND WHAT IT IS NOT FOR. SHA-1 is BROKEN as a collision
+// resistant hash: SHAttered (2017) produced two different PDFs with the
+// same digest, and the cost has only gone down since. Nobody may sign
+// anything with it, and nobody may use it to tell two files apart when
+// somebody has an interest in them being confused.
+//
+// It is here for the two places where a protocol PRESCRIBES it and where
+// the property it needs is not collision resistance:
+//
+//   * MINECRAFT'S ONLINE MODE. The client and the server each compute
+//     `sha1(serverId + sharedSecret + serverPublicKey)`, render it as a
+//     Java `BigInteger.toString(16)` -- signed, two's complement, which is
+//     why such hashes famously sometimes start with a minus sign -- and the
+//     client sends that to `sessionserver.mojang.com`. The server asks the
+//     same server whether that name has that hash. Whoever gets this
+//     function wrong cannot let a single online-mode player in.
+//   * HMAC-SHA1, which is still what a pile of deployed systems speak, and
+//     for which SHA-1's collisions do not translate into forgeries.
+//
+// THE IMPLEMENTATION follows FIPS 180-4 6.1.2 directly: 80 rounds over a
+// 512 bit block, the message schedule expanded from 16 to 80 words with a
+// rotate by one. EVERYTHING RUNS IN u64 AND IS MASKED to 32 bits. `u32`
+// arithmetic would be right too, and its overflow behaviour depends on the
+// build mode (SPEC 13) -- a hash that comes out differently in `--debug`
+// than in `--release-fast` is the worst kind of bug, so the width is made
+// explicit instead of inherited.
+//
+// PROVEN, not claimed: `tools/stdlib81/run.sh` runs the NIST CAVP byte
+// vectors (`SHA1ShortMsg.rsp`, `SHA1LongMsg.rsp` -- 128 messages from 0 to
+// 8,192 bits) out of `testdata/crypto/`, plus `python3 hashlib` over random
+// inputs.
+import std.rt
+
+export { Sha1, sha1_new, sha1_update, sha1_final, sha1, SHA1_SIZE,
+    SHA1_BLOCK }
+
+const SHA1_SIZE: usize = 20
+const SHA1_BLOCK: usize = 64
+const M32: u64 = 4294967295
+
+struct Sha1 {
+    h: [u64; 5],
+    block: [u8; 64],
+    used: usize, // octets in `block`
+    total: u64, // octets fed in altogether
+}
+
+fn rotl32(x: u64, n: u64) -> u64 {
+    return ((x << n) | ((x & M32) >> (32 as u64 - n))) & M32
+}
+
+fn sha1_new() -> Sha1 {
+    return Sha1 {
+        h: [1732584193, 4023233417, 2562383102, 271733878, 3285377520],
+        block: [0; 64], used: 0, total: 0 }
+}
+
+fn sha1_block(s: *mut Sha1, p: u64) {
+    var w: [u64; 80] = [0; 80]
+    var i: usize = 0
+    while i < 16 {
+        // BIG ENDIAN -- the one place where a copy of the machine's order
+        // would produce a digest that is wrong everywhere.
+        w[i] = ((rt.ld8(p, i * 4) as u64) << 24)
+        | ((rt.ld8(p, i * 4 + 1) as u64) << 16)
+        | ((rt.ld8(p, i * 4 + 2) as u64) << 8)
+        | (rt.ld8(p, i * 4 + 3) as u64)
+        i = i + 1
+    }
+    while i < 80 {
+        w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1)
+        i = i + 1
+    }
+    var a: u64 = (*s).h[0]
+    var b: u64 = (*s).h[1]
+    var c: u64 = (*s).h[2]
+    var d: u64 = (*s).h[3]
+    var e: u64 = (*s).h[4]
+    i = 0
+    while i < 80 {
+        var f: u64 = 0
+        var k: u64 = 0
+        if i < 20 {
+            f = (b & c) | ((b ^ M32) & d)
+            k = 1518500249
+        } else if i < 40 {
+            f = b ^ c ^ d
+            k = 1859775393
+        } else if i < 60 {
+            f = (b & c) | (b & d) | (c & d)
+            k = 2400959708
+        } else {
+            f = b ^ c ^ d
+            k = 3395469782
+        }
+        let t: u64 = (rotl32(a, 5) + f + e + k + w[i]) & M32
+        e = d
+        d = c
+        c = rotl32(b, 30)
+        b = a
+        a = t
+        i = i + 1
+    }
+    (*s).h[0] = ((*s).h[0] + a) & M32
+    (*s).h[1] = ((*s).h[1] + b) & M32
+    (*s).h[2] = ((*s).h[2] + c) & M32
+    (*s).h[3] = ((*s).h[3] + d) & M32
+    (*s).h[4] = ((*s).h[4] + e) & M32
+}
+
+// Incremental on purpose: HMAC needs to hash a key block and a message
+// without joining them in memory first, and a file does not want to be read
+// into one buffer to be hashed.
+fn sha1_update(s: *mut Sha1, p: u64, n: usize) {
+    (*s).total = (*s).total + n as u64
+    var at: usize = 0
+    if (*s).used > 0 {
+        while at < n && (*s).used < 64 {
+            (*s).block[(*s).used] = rt.ld8(p, at)
+            (*s).used = (*s).used + 1
+            at = at + 1
+        }
+        if (*s).used == 64 {
+            sha1_block(s, (&(*s).block[0]) as u64)
+            (*s).used = 0
+        }
+    }
+    while n - at >= 64 {
+        sha1_block(s, p + at as u64)
+        at = at + 64
+    }
+    while at < n {
+        (*s).block[(*s).used] = rt.ld8(p, at)
+        (*s).used = (*s).used + 1
+        at = at + 1
+    }
+}
+
+// The padding: one 0x80 octet, zeros, and the length in BITS as a 64 bit
+// big endian number.
+fn sha1_final(s: *mut Sha1, out: u64) {
+    let bits: u64 = (*s).total * 8
+    var pad: [u8; 72] = [0; 72]
+    pad[0] = 128 as u8
+    var padlen: usize = 1
+    while ((*s).used + padlen) % 64 != 56 {
+        padlen = padlen + 1
+    }
+    var i: usize = 0
+    while i < 8 {
+        pad[padlen + i] = ((bits >> ((7 - i) as u64 * 8)) & 255 as u64) as u8
+        i = i + 1
+    }
+    // `sha1_update` must not count the padding into `total`, so it is put
+    // back afterwards.
+    let keep: u64 = (*s).total
+    sha1_update(s, (&pad[0]) as u64, padlen + 8)
+    (*s).total = keep
+    i = 0
+    while i < 5 {
+        var j: usize = 0
+        while j < 4 {
+            rt.st8(out, i * 4 + j,
+                (((*s).h[i] >> ((3 - j) as u64 * 8)) & 255 as u64) as u8)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn sha1(p: u64, n: usize, out: u64) {
+    var s: Sha1 = sha1_new()
+    sha1_update(&s, p, n)
+    sha1_final(&s, out)
+}

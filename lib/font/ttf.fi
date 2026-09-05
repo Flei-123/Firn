@@ -1,0 +1,890 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/font/ttf.fi -- THE TRUETYPE READER. A font file in, outlines and
+// advance widths out.
+//
+// Up to round B2 this engine measured text with a made-up font: every
+// character exactly one em wide, the ascent 0.8 em, the descent 0.2 em.
+// That is the Ahem font of the CSS working group, and it is exactly right
+// for a layout test written against Ahem -- and wrong for every real
+// letter, because an `i` is not as wide as an `m`. As long as nothing was
+// ever DRAWN, nobody could see it. This file is what ends that.
+//
+// ------------------------------------------------------- WHAT IS READ
+//
+//   head   unitsPerEm, and whether `loca` holds shorts or longs
+//   hhea   ascender, descender, lineGap, numberOfHMetrics
+//   maxp   numGlyphs
+//   hmtx   the advance width and left side bearing of every glyph
+//   cmap   character -> glyph. Formats 4 (BMP) and 12 (the full range)
+//   loca   glyph -> offset into `glyf`
+//   glyf   the outlines themselves, simple and COMPOSITE
+//   kern   format 0 pair kerning
+//
+// WHAT IS NOT READ, and it is named rather than hidden: `CFF ` -- an
+// OpenType font with cubic PostScript outlines instead of quadratic
+// TrueType ones is refused, not silently drawn empty. `GPOS` -- modern
+// fonts put their kerning there and leave `kern` out; this reader then
+// finds no kerning and says so (`font_has_kern`). No hinting: the
+// instructions in `fpgm`/`prep`/`glyf` are skipped. Hinting moves outlines
+// onto the pixel grid at small sizes and nothing else here depends on it.
+//
+// ------------------------------------------------ NOT ONE ALLOCATION
+//
+// The reader never allocates. It is handed the file as octets and a
+// SCRATCH BUFFER for the points of one glyph, and it writes its outlines
+// straight into a `raster.Raster`. That is what makes it usable from the
+// Osum window server (round K10, the other repository), which has no heap
+// while it is drawing -- and it costs nothing here.
+//
+// ------------------------------------------------------- THE OCTET ORDER
+//
+// Everything in a font file is BIG ENDIAN, including on a little endian
+// machine, and every signed field is two's complement in 16 bits. The
+// readers below do the shifts by hand instead of casting a pointer; a
+// `*(p as *mut u16)` would read the machine's order and would be right on
+// nothing.
+import font.raster
+
+export {
+    Font,
+    font_new, font_init, font_ok,
+    font_upem, font_ascent, font_descent, font_line_gap, font_num_glyphs,
+    font_glyph_for, font_advance, font_lsb, font_kern, font_has_kern,
+    font_glyph_bbox, font_outline, font_scratch_needed,
+    font_cmap_format,
+}
+
+const MAX_DEPTH: i32 = 6
+
+struct Font {
+    data: *mut u8,
+    len: usize,
+    ok: usize,
+    upem: u32,
+    num_glyphs: u32,
+    loca_off: usize,
+    loca_len: usize,
+    loca_long: usize,
+    glyf_off: usize,
+    glyf_len: usize,
+    hmtx_off: usize,
+    hmtx_len: usize,
+    num_hmetrics: u32,
+    cmap_off: usize,
+    cmap_fmt: u32,
+    kern_off: usize,
+    kern_len: usize,
+    ascent: i32,
+    descent: i32,
+    line_gap: i32,
+}
+
+// ------------------------------------------------------- Big endian reads
+
+#[no_gc]
+fn rd8(f: *mut Font, off: usize) -> u32 {
+    if off >= (*f).len {
+        return 0 as u32
+    }
+    let v: u8 = *(((*f).data as u64 + off as u64) as *mut u8)
+    return v as u32
+}
+
+#[no_gc]
+fn rd16(f: *mut Font, off: usize) -> u32 {
+    return (rd8(f, off) << 8) | rd8(f, off + 1)
+}
+
+// A 16 bit two's complement number. Written out rather than cast: an
+// `as i16 as i32` chain is checked since round 72 and would panic on
+// exactly the values this has to accept.
+#[no_gc]
+fn rds16(f: *mut Font, off: usize) -> i32 {
+    let v: u32 = rd16(f, off)
+    if v >= 32768 as u32 {
+        return (v as i32) - 65536
+    }
+    return v as i32
+}
+
+#[no_gc]
+fn rd32(f: *mut Font, off: usize) -> u32 {
+    return (rd16(f, off) << 16) | rd16(f, off + 2)
+}
+
+// ------------------------------------------------------------- Opening
+
+#[no_gc]
+fn font_new() -> Font {
+    return Font {
+        data: 0 as *mut u8,
+        len: 0,
+        ok: 0,
+        upem: 1000,
+        num_glyphs: 0,
+        loca_off: 0,
+        loca_len: 0,
+        loca_long: 0,
+        glyf_off: 0,
+        glyf_len: 0,
+        hmtx_off: 0,
+        hmtx_len: 0,
+        num_hmetrics: 0,
+        cmap_off: 0,
+        cmap_fmt: 0,
+        kern_off: 0,
+        kern_len: 0,
+        ascent: 800,
+        descent: 200,
+        line_gap: 0,
+    }
+}
+
+#[no_gc]
+fn tag_eq(f: *mut Font, off: usize, a: u32, b: u32, c: u32, d: u32) -> bool {
+    return rd8(f, off) == a && rd8(f, off + 1) == b &&
+    rd8(f, off + 2) == c && rd8(f, off + 3) == d
+}
+
+// The table directory. A `ttcf` collection is refused on purpose: picking
+// font 0 out of one silently is the kind of helpfulness that hides a
+// configuration mistake.
+#[no_gc]
+fn find_table(f: *mut Font, a: u32, b: u32, c: u32, d: u32,
+    off: *mut usize, len: *mut usize) -> bool {
+    let n: u32 = rd16(f, 4)
+    var i: u32 = 0
+    while i < n {
+        let rec: usize = 12 + (i as usize) * 16
+        if tag_eq(f, rec, a, b, c, d) {
+            let o: usize = rd32(f, rec + 8) as usize
+            let l: usize = rd32(f, rec + 12) as usize
+            if o >= (*f).len {
+                return false
+            }
+            *off = o
+            *len = l
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+#[no_gc]
+fn font_init(f: *mut Font, data: *mut u8, len: usize) -> bool {
+    (*f).data = data
+    (*f).len = len
+    (*f).ok = 0
+    if len < 12 {
+        return false
+    }
+    let ver: u32 = rd32(f, 0)
+    // 0x00010000 = TrueType outlines, 'true' = the old Apple spelling.
+    // 'OTTO' is CFF and is refused: those outlines are cubic and live in
+    // a completely different table.
+    if ver != 0x00010000 as u32 && ver != 0x74727565 as u32 {
+        return false
+    }
+    var o: usize = 0
+    var l: usize = 0
+    if !find_table(f, 104, 101, 97, 100, &o, &l) {
+        return false // head
+    }
+    (*f).upem = rd16(f, o + 18)
+    if (*f).upem == 0 as u32 {
+        (*f).upem = 1000
+    }
+    (*f).loca_long = rds16(f, o + 50) as usize
+    if !find_table(f, 104, 104, 101, 97, &o, &l) {
+        return false // hhea
+    }
+    (*f).ascent = rds16(f, o + 4)
+    (*f).descent = 0 - rds16(f, o + 6) // stored negative, kept positive
+    (*f).line_gap = rds16(f, o + 8)
+    (*f).num_hmetrics = rd16(f, o + 34)
+    if !find_table(f, 109, 97, 120, 112, &o, &l) {
+        return false // maxp
+    }
+    (*f).num_glyphs = rd16(f, o + 4)
+    if !find_table(f, 104, 109, 116, 120, &o, &l) {
+        return false // hmtx
+    }
+    (*f).hmtx_off = o
+    (*f).hmtx_len = l
+    if !find_table(f, 108, 111, 99, 97, &o, &l) {
+        return false // loca
+    }
+    (*f).loca_off = o
+    (*f).loca_len = l
+    if !find_table(f, 103, 108, 121, 102, &o, &l) {
+        return false // glyf
+    }
+    (*f).glyf_off = o
+    (*f).glyf_len = l
+    if find_table(f, 107, 101, 114, 110, &o, &l) {
+        (*f).kern_off = o
+        (*f).kern_len = l
+    }
+    if find_table(f, 99, 109, 97, 112, &o, &l) {
+        pick_cmap(f, o)
+    }
+    (*f).ok = 1
+    return true
+}
+
+// The `cmap` a browser wants, in the order a browser wants it: the full
+// Unicode range first, the Basic Multilingual Plane second, and a symbol
+// font's private-use table only if there is nothing else.
+#[no_gc]
+fn pick_cmap(f: *mut Font, cm: usize) {
+    let n: u32 = rd16(f, cm + 2)
+    var best: usize = 0
+    var best_score: u32 = 0
+    var i: u32 = 0
+    while i < n {
+        let rec: usize = cm + 4 + (i as usize) * 8
+        let plat: u32 = rd16(f, rec)
+        let enc: u32 = rd16(f, rec + 2)
+        let sub: usize = cm + rd32(f, rec + 4) as usize
+        let fmt: u32 = rd16(f, sub)
+        var score: u32 = 0
+        if plat == 3 as u32 && enc == 10 as u32 && fmt == 12 as u32 {
+            score = 5
+        } else if plat == 0 as u32 && fmt == 12 as u32 {
+            score = 4
+        } else if plat == 3 as u32 && enc == 1 as u32 && fmt == 4 as u32 {
+            score = 3
+        } else if plat == 0 as u32 && fmt == 4 as u32 {
+            score = 3
+        } else if plat == 3 as u32 && enc == 0 as u32 {
+            score = 1
+        }
+        if score > best_score {
+            best_score = score
+            best = sub
+            (*f).cmap_fmt = fmt
+        }
+        i = i + 1
+    }
+    (*f).cmap_off = best
+}
+
+#[no_gc]
+fn font_ok(f: *mut Font) -> bool {
+    return (*f).ok != 0
+}
+
+#[no_gc]
+fn font_upem(f: *mut Font) -> u32 {
+    return (*f).upem
+}
+
+#[no_gc]
+fn font_ascent(f: *mut Font) -> i32 {
+    return (*f).ascent
+}
+
+#[no_gc]
+fn font_descent(f: *mut Font) -> i32 {
+    return (*f).descent
+}
+
+#[no_gc]
+fn font_line_gap(f: *mut Font) -> i32 {
+    return (*f).line_gap
+}
+
+#[no_gc]
+fn font_num_glyphs(f: *mut Font) -> u32 {
+    return (*f).num_glyphs
+}
+
+#[no_gc]
+fn font_cmap_format(f: *mut Font) -> u32 {
+    return (*f).cmap_fmt
+}
+
+#[no_gc]
+fn font_has_kern(f: *mut Font) -> bool {
+    return (*f).kern_len != 0
+}
+
+// ------------------------------------------------------------ Characters
+
+#[no_gc]
+fn font_glyph_for(f: *mut Font, cp: u32) -> u32 {
+    if (*f).ok == 0 || (*f).cmap_off == 0 {
+        return 0 as u32
+    }
+    let sub: usize = (*f).cmap_off
+    let fmt: u32 = rd16(f, sub)
+    if fmt == 4 as u32 {
+        return cmap4(f, sub, cp)
+    }
+    if fmt == 12 as u32 {
+        return cmap12(f, sub, cp)
+    }
+    if fmt == 6 as u32 {
+        let first: u32 = rd16(f, sub + 6)
+        let count: u32 = rd16(f, sub + 8)
+        if cp < first || cp >= first + count {
+            return 0 as u32
+        }
+        return rd16(f, sub + 10 + ((cp - first) as usize) * 2)
+    }
+    if fmt == 0 as u32 {
+        if cp > 255 as u32 {
+            return 0 as u32
+        }
+        return rd8(f, sub + 6 + cp as usize)
+    }
+    return 0 as u32
+}
+
+// Format 4 -- the segmented mapping every BMP font has, and the one whose
+// `idRangeOffset` arithmetic is famously easy to get wrong: the offset is
+// counted from the POSITION OF THE FIELD ITSELF, not from the start of
+// the table.
+#[no_gc]
+fn cmap4(f: *mut Font, sub: usize, cp: u32) -> u32 {
+    if cp > 0xFFFF as u32 {
+        return 0 as u32
+    }
+    let segx2: usize = rd16(f, sub + 6) as usize
+    let segs: usize = segx2 / 2
+    let ends: usize = sub + 14
+    let starts: usize = ends + segx2 + 2
+    let deltas: usize = starts + segx2
+    let ranges: usize = deltas + segx2
+    var lo: usize = 0
+    var hi: usize = segs
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        if rd16(f, ends + mid * 2) < cp {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo >= segs {
+        return 0 as u32
+    }
+    let start: u32 = rd16(f, starts + lo * 2)
+    if cp < start {
+        return 0 as u32
+    }
+    let ro: u32 = rd16(f, ranges + lo * 2)
+    var g: u32 = 0
+    if ro == 0 as u32 {
+        g = cp
+    } else {
+        let addr: usize = ranges + lo * 2 + (ro as usize) +
+        ((cp - start) as usize) * 2
+        g = rd16(f, addr)
+        if g == 0 as u32 {
+            return 0 as u32
+        }
+    }
+    let delta: u32 = rd16(f, deltas + lo * 2)
+    return (g +% delta) & 0xFFFF as u32
+}
+
+// Format 12 -- flat groups, and the only format that reaches past the
+// BMP. A binary search, because a font with emoji has thousands of them.
+#[no_gc]
+fn cmap12(f: *mut Font, sub: usize, cp: u32) -> u32 {
+    let n: usize = rd32(f, sub + 12) as usize
+    var lo: usize = 0
+    var hi: usize = n
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let g: usize = sub + 16 + mid * 12
+        if rd32(f, g + 4) < cp {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo >= n {
+        return 0 as u32
+    }
+    let g: usize = sub + 16 + lo * 12
+    let s: u32 = rd32(f, g)
+    if cp < s {
+        return 0 as u32
+    }
+    return rd32(f, g + 8) + (cp - s)
+}
+
+// ------------------------------------------------------------- Metrics
+
+// The advance width in FONT UNITS. The last entry of `hmtx` repeats for
+// every glyph beyond `numberOfHMetrics` -- that is how a monospaced font
+// stores one number for 3000 glyphs, and forgetting it gives every glyph
+// after the first few a width of zero.
+#[no_gc]
+fn font_advance(f: *mut Font, gid: u32) -> i32 {
+    if (*f).ok == 0 || (*f).num_hmetrics == 0 as u32 {
+        return 0
+    }
+    var g: u32 = gid
+    if g >= (*f).num_hmetrics {
+        g = (*f).num_hmetrics - 1
+    }
+    return rd16(f, (*f).hmtx_off + (g as usize) * 4) as i32
+}
+
+#[no_gc]
+fn font_lsb(f: *mut Font, gid: u32) -> i32 {
+    if (*f).ok == 0 {
+        return 0
+    }
+    if gid < (*f).num_hmetrics {
+        return rds16(f, (*f).hmtx_off + (gid as usize) * 4 + 2)
+    }
+    let base: usize = (*f).hmtx_off + ((*f).num_hmetrics as usize) * 4
+    let idx: usize = (gid - (*f).num_hmetrics) as usize
+    return rds16(f, base + idx * 2)
+}
+
+// Pair kerning out of the `kern` table, format 0. Returns font units,
+// zero when there is no `kern` table or no pair.
+#[no_gc]
+fn font_kern(f: *mut Font, left: u32, right: u32) -> i32 {
+    if (*f).kern_len == 0 {
+        return 0
+    }
+    let ntab: u32 = rd16(f, (*f).kern_off + 2)
+    var t: u32 = 0
+    var off: usize = (*f).kern_off + 4
+    while t < ntab {
+        let length: usize = rd16(f, off + 2) as usize
+        let coverage: u32 = rd16(f, off + 4)
+        // bit 0 = horizontal, bits 8..15 = the format
+        if (coverage & 1 as u32) != 0 as u32 && (coverage >> 8) == 0 as u32 {
+            let npairs: usize = rd16(f, off + 6) as usize
+            let pairs: usize = off + 14
+            let want: u32 = (left << 16) | right
+            var lo: usize = 0
+            var hi: usize = npairs
+            while lo < hi {
+                let mid: usize = (lo + hi) / 2
+                let key: u32 = (rd16(f, pairs + mid * 6) << 16) |
+                rd16(f, pairs + mid * 6 + 2)
+                if key < want {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            if lo < npairs {
+                let key: u32 = (rd16(f, pairs + lo * 6) << 16) |
+                rd16(f, pairs + lo * 6 + 2)
+                if key == want {
+                    return rds16(f, pairs + lo * 6 + 4)
+                }
+            }
+        }
+        if length == 0 {
+            return 0
+        }
+        off = off + length
+        t = t + 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------------- Outlines
+
+#[no_gc]
+fn glyph_range(f: *mut Font, gid: u32, off: *mut usize,
+    len: *mut usize) -> bool {
+    if (*f).ok == 0 || gid >= (*f).num_glyphs {
+        return false
+    }
+    var a: usize = 0
+    var b: usize = 0
+    if (*f).loca_long != 0 {
+        a = rd32(f, (*f).loca_off + (gid as usize) * 4) as usize
+        b = rd32(f, (*f).loca_off + (gid as usize) * 4 + 4) as usize
+    } else {
+        a = (rd16(f, (*f).loca_off + (gid as usize) * 2) as usize) * 2
+        b = (rd16(f, (*f).loca_off + (gid as usize) * 2 + 2) as usize) * 2
+    }
+    if b <= a {
+        return false // an empty glyph: a space, and it is not an error
+    }
+    *off = (*f).glyf_off + a
+    *len = b - a
+    return true
+}
+
+// The bounding box in font units. `false` for a glyph without an outline.
+#[no_gc]
+fn font_glyph_bbox(f: *mut Font, gid: u32, x0: *mut i32, y0: *mut i32,
+    x1: *mut i32, y1: *mut i32) -> bool {
+    var o: usize = 0
+    var l: usize = 0
+    if !glyph_range(f, gid, &o, &l) {
+        return false
+    }
+    *x0 = rds16(f, o + 2)
+    *y0 = rds16(f, o + 4)
+    *x1 = rds16(f, o + 6)
+    *y1 = rds16(f, o + 8)
+    return true
+}
+
+// How much scratch the point decoder needs for a glyph with `n` points
+// and `c` contours: 4 octets per contour end plus 12 per point.
+#[no_gc]
+fn font_scratch_needed(points: usize, contours: usize) -> usize {
+    return contours * 4 + points * 12
+}
+
+#[no_gc]
+fn sc_seti(p: u64, i: usize, v: i32) {
+    *((p + (i * 4) as u64) as *mut i32) = v
+}
+
+#[no_gc]
+fn sc_geti(p: u64, i: usize) -> i32 {
+    return *((p + (i * 4) as u64) as *mut i32)
+}
+
+// Draw one glyph into the rasteriser. `ox`/`oy` is the PEN, in device
+// pixels, with `oy` on the baseline; `scale` turns font units into
+// pixels. The 2x2 matrix is the composite transform of the caller and is
+// the identity at the top.
+//
+// Returns false when the glyph could not be decoded -- an empty glyph
+// (a space) returns TRUE and draws nothing, because that is not an error.
+#[no_gc]
+fn font_outline(f: *mut Font, gid: u32, r: *mut raster.Raster,
+    ox: f64, oy: f64, scale: f64,
+    sc: *mut u8, cap: usize, depth: i32) -> bool {
+    return outline_at(f, gid, r, ox, oy, scale,
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0, sc, cap, depth)
+}
+
+#[no_gc]
+fn outline_at(f: *mut Font, gid: u32, r: *mut raster.Raster,
+    ox: f64, oy: f64, scale: f64,
+    m00: f64, m01: f64, m10: f64, m11: f64, tdx: f64, tdy: f64,
+    sc: *mut u8, cap: usize, depth: i32) -> bool {
+    if depth > MAX_DEPTH {
+        return false
+    }
+    var o: usize = 0
+    var l: usize = 0
+    if !glyph_range(f, gid, &o, &l) {
+        return true // no outline: a space
+    }
+    let nc: i32 = rds16(f, o)
+    if nc < 0 {
+        return composite(f, o + 10, r, ox, oy, scale,
+            m00, m01, m10, m11, tdx, tdy, sc, cap, depth)
+    }
+    return simple(f, o, nc as usize, r, ox, oy, scale,
+        m00, m01, m10, m11, tdx, tdy, sc, cap)
+}
+
+#[no_gc]
+fn simple(f: *mut Font, o: usize, ncont: usize, r: *mut raster.Raster,
+    ox: f64, oy: f64, scale: f64,
+    m00: f64, m01: f64, m10: f64, m11: f64, tdx: f64, tdy: f64,
+    sc: *mut u8, cap: usize) -> bool {
+    if ncont == 0 {
+        return true
+    }
+    let ends: usize = o + 10
+    let npts: usize = (rd16(f, ends + (ncont - 1) * 2) as usize) + 1
+    if font_scratch_needed(npts, ncont) > cap {
+        return false
+    }
+    let base: u64 = sc as u64
+    // [0 .. ncont) contour ends, then 3 i32 per point: x, y, flag
+    var i: usize = 0
+    while i < ncont {
+        sc_seti(base, i, rd16(f, ends + i * 2) as i32)
+        i = i + 1
+    }
+    let pbase: u64 = base + (ncont * 4) as u64
+    let ilen: usize = rd16(f, ends + ncont * 2) as usize
+    var p: usize = ends + ncont * 2 + 2 + ilen
+    // ---- the flags, with their run length encoding
+    var n: usize = 0
+    while n < npts {
+        let fl: u32 = rd8(f, p)
+        p = p + 1
+        sc_seti(pbase, n * 3 + 2, fl as i32)
+        n = n + 1
+        if (fl & 8 as u32) != 0 as u32 {
+            var rep: u32 = rd8(f, p)
+            p = p + 1
+            while rep > 0 as u32 && n < npts {
+                sc_seti(pbase, n * 3 + 2, fl as i32)
+                n = n + 1
+                rep = rep - 1
+            }
+        }
+    }
+    // ---- x, as deltas
+    var x: i32 = 0
+    n = 0
+    while n < npts {
+        let fl: i32 = sc_geti(pbase, n * 3 + 2)
+        if (fl & 2) != 0 {
+            let d: i32 = rd8(f, p) as i32
+            p = p + 1
+            if (fl & 16) != 0 {
+                x = x + d
+            } else {
+                x = x - d
+            }
+        } else if (fl & 16) == 0 {
+            x = x + rds16(f, p)
+            p = p + 2
+        }
+        sc_seti(pbase, n * 3, x)
+        n = n + 1
+    }
+    // ---- y, as deltas
+    var y: i32 = 0
+    n = 0
+    while n < npts {
+        let fl: i32 = sc_geti(pbase, n * 3 + 2)
+        if (fl & 4) != 0 {
+            let d: i32 = rd8(f, p) as i32
+            p = p + 1
+            if (fl & 32) != 0 {
+                y = y + d
+            } else {
+                y = y - d
+            }
+        } else if (fl & 32) == 0 {
+            y = y + rds16(f, p)
+            p = p + 2
+        }
+        sc_seti(pbase, n * 3 + 1, y)
+        n = n + 1
+    }
+    // ---- the contours
+    var c: usize = 0
+    var start: usize = 0
+    while c < ncont {
+        let last: usize = sc_geti(base, c) as usize
+        if last >= start && last < npts {
+            emit_contour(f, r, pbase, start, last, ox, oy, scale,
+                m00, m01, m10, m11, tdx, tdy)
+        }
+        start = last + 1
+        c = c + 1
+    }
+    return true
+}
+
+#[no_gc]
+fn devx(px: f64, py: f64, ox: f64, scale: f64,
+    m00: f64, m10: f64, tdx: f64) -> f64 {
+    return ox + (px * m00 + py * m10 + tdx) * scale
+}
+
+#[no_gc]
+fn devy(px: f64, py: f64, oy: f64, scale: f64,
+    m01: f64, m11: f64, tdy: f64) -> f64 {
+    // The y axis of a font points UP, the y axis of a screen points DOWN.
+    return oy - (px * m01 + py * m11 + tdy) * scale
+}
+
+// ONE CONTOUR. This is where the quadratic outline of TrueType is turned
+// into something the rasteriser understands, and where the format's one
+// real subtlety lives: TWO OFF-CURVE POINTS IN A ROW imply an on-curve
+// point exactly in the middle of them. A font that draws a circle with
+// four off-curve points and no on-curve point at all between them is
+// perfectly legal, and an implementation that does not insert the implied
+// midpoints draws a diamond.
+//
+// The second subtlety is the START. A contour may begin with an off-curve
+// point; then the starting point is either the last point (if that one is
+// on-curve) or the midpoint of the two.
+#[no_gc]
+fn emit_contour(f: *mut Font, r: *mut raster.Raster, pb: u64,
+    first: usize, last: usize, ox: f64, oy: f64, scale: f64,
+    m00: f64, m01: f64, m10: f64, m11: f64, tdx: f64, tdy: f64) {
+    let n: usize = last - first + 1
+    if n < 2 {
+        return
+    }
+    var sx: f64 = 0.0
+    var sy: f64 = 0.0
+    var startoff: usize = 0
+    if (sc_geti(pb, first * 3 + 2) & 1) != 0 {
+        sx = sc_geti(pb, first * 3) as f64
+        sy = sc_geti(pb, first * 3 + 1) as f64
+        startoff = 1
+    } else if (sc_geti(pb, last * 3 + 2) & 1) != 0 {
+        sx = sc_geti(pb, last * 3) as f64
+        sy = sc_geti(pb, last * 3 + 1) as f64
+        startoff = 0
+    } else {
+        sx = 0.5 * ((sc_geti(pb, first * 3) as f64) +
+            (sc_geti(pb, last * 3) as f64))
+        sy = 0.5 * ((sc_geti(pb, first * 3 + 1) as f64) +
+            (sc_geti(pb, last * 3 + 1) as f64))
+        startoff = 0
+    }
+    var curx: f64 = sx
+    var cury: f64 = sy
+    var haveq: usize = 0
+    var qx: f64 = 0.0
+    var qy: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let idx: usize = first + ((i + startoff) % n)
+        let px: f64 = sc_geti(pb, idx * 3) as f64
+        let py: f64 = sc_geti(pb, idx * 3 + 1) as f64
+        let on: bool = (sc_geti(pb, idx * 3 + 2) & 1) != 0
+        if on {
+            if haveq != 0 {
+                raster.raster_quad(r,
+                    devx(curx, cury, ox, scale, m00, m10, tdx),
+                    devy(curx, cury, oy, scale, m01, m11, tdy),
+                    devx(qx, qy, ox, scale, m00, m10, tdx),
+                    devy(qx, qy, oy, scale, m01, m11, tdy),
+                    devx(px, py, ox, scale, m00, m10, tdx),
+                    devy(px, py, oy, scale, m01, m11, tdy))
+                haveq = 0
+            } else {
+                raster.raster_line(r,
+                    devx(curx, cury, ox, scale, m00, m10, tdx),
+                    devy(curx, cury, oy, scale, m01, m11, tdy),
+                    devx(px, py, ox, scale, m00, m10, tdx),
+                    devy(px, py, oy, scale, m01, m11, tdy))
+            }
+            curx = px
+            cury = py
+        } else {
+            if haveq != 0 {
+                // two control points in a row: the implied midpoint
+                let mx: f64 = 0.5 * (qx + px)
+                let my: f64 = 0.5 * (qy + py)
+                raster.raster_quad(r,
+                    devx(curx, cury, ox, scale, m00, m10, tdx),
+                    devy(curx, cury, oy, scale, m01, m11, tdy),
+                    devx(qx, qy, ox, scale, m00, m10, tdx),
+                    devy(qx, qy, oy, scale, m01, m11, tdy),
+                    devx(mx, my, ox, scale, m00, m10, tdx),
+                    devy(mx, my, oy, scale, m01, m11, tdy))
+                curx = mx
+                cury = my
+            }
+            qx = px
+            qy = py
+            haveq = 1
+        }
+        i = i + 1
+    }
+    // close the contour back onto its start
+    if haveq != 0 {
+        raster.raster_quad(r,
+            devx(curx, cury, ox, scale, m00, m10, tdx),
+            devy(curx, cury, oy, scale, m01, m11, tdy),
+            devx(qx, qy, ox, scale, m00, m10, tdx),
+            devy(qx, qy, oy, scale, m01, m11, tdy),
+            devx(sx, sy, ox, scale, m00, m10, tdx),
+            devy(sx, sy, oy, scale, m01, m11, tdy))
+    } else {
+        raster.raster_line(r,
+            devx(curx, cury, ox, scale, m00, m10, tdx),
+            devy(curx, cury, oy, scale, m01, m11, tdy),
+            devx(sx, sy, ox, scale, m00, m10, tdx),
+            devy(sx, sy, oy, scale, m01, m11, tdy))
+    }
+}
+
+// A COMPOSITE GLYPH. `e` is `e`, and `acute` is `acute`, and `eacute` is
+// the two of them with an offset -- that is how a font with 3000 glyphs
+// fits into 300 kB. The component list is walked here; every component
+// may bring a 2x2 transform of its own, which is multiplied onto the one
+// already in force.
+#[no_gc]
+fn composite(f: *mut Font, p0: usize, r: *mut raster.Raster,
+    ox: f64, oy: f64, scale: f64,
+    m00: f64, m01: f64, m10: f64, m11: f64, tdx: f64, tdy: f64,
+    sc: *mut u8, cap: usize, depth: i32) -> bool {
+    var p: usize = p0
+    var more: bool = true
+    var okall: bool = true
+    while more {
+        let flags: u32 = rd16(f, p)
+        let sub: u32 = rd16(f, p + 2)
+        p = p + 4
+        var a1: i32 = 0
+        var a2: i32 = 0
+        if (flags & 1 as u32) != 0 as u32 {
+            a1 = rds16(f, p)
+            a2 = rds16(f, p + 2)
+            p = p + 4
+        } else {
+            a1 = sbyte(rd8(f, p))
+            a2 = sbyte(rd8(f, p + 1))
+            p = p + 2
+        }
+        var s00: f64 = 1.0
+        var s01: f64 = 0.0
+        var s10: f64 = 0.0
+        var s11: f64 = 1.0
+        if (flags & 8 as u32) != 0 as u32 {
+            s00 = f2dot14(f, p)
+            s11 = s00
+            p = p + 2
+        } else if (flags & 64 as u32) != 0 as u32 {
+            s00 = f2dot14(f, p)
+            s11 = f2dot14(f, p + 2)
+            p = p + 4
+        } else if (flags & 128 as u32) != 0 as u32 {
+            s00 = f2dot14(f, p)
+            s01 = f2dot14(f, p + 2)
+            s10 = f2dot14(f, p + 4)
+            s11 = f2dot14(f, p + 6)
+            p = p + 8
+        }
+        // ARGS_ARE_XY_VALUES (bit 1). The other reading -- two point
+        // numbers to be matched up -- is rare and is not done here; a
+        // component that asks for it is placed without an offset, which
+        // is visibly wrong rather than invisibly wrong.
+        var dx: f64 = 0.0
+        var dy: f64 = 0.0
+        if (flags & 2 as u32) != 0 as u32 {
+            dx = a1 as f64
+            dy = a2 as f64
+        }
+        let n00: f64 = s00 * m00 + s01 * m10
+        let n01: f64 = s00 * m01 + s01 * m11
+        let n10: f64 = s10 * m00 + s11 * m10
+        let n11: f64 = s10 * m01 + s11 * m11
+        let ndx: f64 = tdx + dx * m00 + dy * m10
+        let ndy: f64 = tdy + dx * m01 + dy * m11
+        if !outline_at(f, sub, r, ox, oy, scale,
+            n00, n01, n10, n11, ndx, ndy, sc, cap, depth + 1) {
+            okall = false
+        }
+        more = (flags & 32 as u32) != 0 as u32
+    }
+    return okall
+}
+
+#[no_gc]
+fn sbyte(v: u32) -> i32 {
+    if v >= 128 as u32 {
+        return (v as i32) - 256
+    }
+    return v as i32
+}
+
+#[no_gc]
+fn f2dot14(f: *mut Font, off: usize) -> f64 {
+    return (rds16(f, off) as f64) / 16384.0
+}

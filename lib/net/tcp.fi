@@ -1,0 +1,1556 @@
+// SPDX-License-Identifier: GPL-2.0-only
+profile kernel
+
+// lib/net/tcp.fi -- round K3: the state machine.
+//
+// RFC 793 (and its successor 9293) in Firn, without an allocator and
+// without a global variable -- both of which SPEC forbids here (2 and
+// 14.1 item 5). Everything this module knows lives in ONE struct that
+// the caller owns; the connections are a fixed array in it and a
+// "handle" is an index into that array.
+//
+// THE SHAPE OF THE INTERFACE, and why it is a PULL. There is no callback
+// and no output queue. The layer above says
+//
+//     tcp_input(t, ip_datagram, length, now)     -- something arrived
+//     tcp_pull(t, buffer, capacity, now, &dst)   -- give me one datagram
+//
+// and `tcp_pull` decides on its own what is due: a SYN, a
+// retransmission, data, a delayed acknowledgement that has come of age,
+// a window probe, a FIN, a reset. That removes the whole question of
+// where an output queue lives and how big it has to be -- the answer is
+// that there is none.
+//
+// TIME comes in from outside, in microseconds. A kernel has no
+// `clock_gettime`; whoever calls this hands over the clock it does have.
+//
+// WHAT IS IN HERE: all eleven states including TIME_WAIT, the three way
+// handshake, sequence numbers with wrap-around, a send and a receive
+// window, reassembly of out-of-order segments, retransmission with a
+// timer measured after Jacobson/Karn, delayed acknowledgements, Nagle,
+// slow start with congestion avoidance and fast retransmit, a persist
+// timer for a zero window, silly-window avoidance on the receive side,
+// and an orderly teardown in both directions.
+//
+// WHAT IS NOT IN HERE is listed in docs/OSUM-K3.md and not glossed over
+// here: no window scaling, no timestamps, no SACK, no PAWS, no urgent
+// data, no reassembly of IP fragments, no path MTU discovery.
+
+import net.wire
+
+export {
+    Tcp, Tcb,
+    MAXCONN, SND_CAP, RCV_CAP, MSS_DEFAULT,
+    S_CLOSED, S_LISTEN, S_SYN_SENT, S_SYN_RECEIVED, S_ESTABLISHED,
+    S_FIN_WAIT_1, S_FIN_WAIT_2, S_CLOSE_WAIT, S_CLOSING, S_LAST_ACK,
+    S_TIME_WAIT,
+    E_NONE, E_RESET, E_TIMEOUT, E_REFUSED,
+    tcp_init, tcp_listen, tcp_accept, tcp_connect, tcp_close, tcp_abort,
+    tcp_send, tcp_recv, tcp_readable, tcp_writable, tcp_state, tcp_error,
+    tcp_input, tcp_pull, tcp_timers, tcp_free_slot,
+    tcp_set_nodelay, tcp_set_time_wait, tcp_set_rto_min, tcp_set_no_rexmit,
+    tcp_seen, tcp_force_iss,
+    tcp_peer_ip, tcp_peer_port, tcp_local_port,
+    tcp_stat, tcp_dbg,
+    ST_RX, ST_TX, ST_REXMIT, ST_CSUM, ST_UNACCEPTABLE, ST_OOO, ST_RST_TX,
+    ST_BAD_ACK, ST_FAST_REXMIT, ST_PROBE, ST_DELACK, ST_DUPACK,
+}
+
+// ===================================================================
+// 1. the numbers that fix the size of the whole thing
+// ===================================================================
+//
+// The two buffers are powers of two so that "sequence number modulo
+// capacity" is an AND and no division. If either of them is changed the
+// mask below has to change with it -- that is the price of the trick and
+// it is written down rather than assumed.
+
+// NOTE: an array length has to be an INTEGER LITERAL in this language
+// (SPEC 12.1: `"[" type ";" int_lit "]"`), so the numbers below appear a
+// second time in the struct declarations. They have to agree; there is no
+// way to make the compiler check that here, so they are kept next to each
+// other and named in one place.
+const MAXCONN: usize = 8
+const SND_CAP: usize = 65536
+const RCV_CAP: usize = 65536
+const SND_MASK: u32 = 65535
+const RCV_MASK: u32 = 65535
+const OOO_MAX: usize = 8
+const RST_SLOTS: usize = 4
+const MSS_DEFAULT: u32 = 1460
+
+// All times in microseconds.
+const RTO_MIN: u64 = 200000
+const RTO_MAX: u64 = 60000000
+const RTO_START: u64 = 1000000
+const DELACK: u64 = 200000
+const TIME_WAIT_US: u64 = 60000000
+const FIN_WAIT_2_US: u64 = 60000000
+const PERSIST_MIN: u64 = 200000
+const PERSIST_MAX: u64 = 5000000
+const MAX_SHIFT: u32 = 12
+
+const S_CLOSED: u32 = 0
+const S_LISTEN: u32 = 1
+const S_SYN_SENT: u32 = 2
+const S_SYN_RECEIVED: u32 = 3
+const S_ESTABLISHED: u32 = 4
+const S_FIN_WAIT_1: u32 = 5
+const S_FIN_WAIT_2: u32 = 6
+const S_CLOSE_WAIT: u32 = 7
+const S_CLOSING: u32 = 8
+const S_LAST_ACK: u32 = 9
+const S_TIME_WAIT: u32 = 10
+
+const E_NONE: i32 = 0
+const E_RESET: i32 = 1
+const E_TIMEOUT: i32 = 2
+const E_REFUSED: i32 = 3
+
+// The counters. They are the whole point of the measurement scripts:
+// a claim that something was retransmitted is worth nothing, a number is.
+const ST_RX: u32 = 0
+const ST_TX: u32 = 1
+const ST_REXMIT: u32 = 2
+const ST_CSUM: u32 = 3
+const ST_UNACCEPTABLE: u32 = 4
+const ST_OOO: u32 = 5
+const ST_RST_TX: u32 = 6
+const ST_BAD_ACK: u32 = 7
+const ST_FAST_REXMIT: u32 = 8
+const ST_PROBE: u32 = 9
+const ST_DELACK: u32 = 10
+const ST_DUPACK: u32 = 11
+const ST_COUNT: usize = 12
+
+// ===================================================================
+// 2. the state of one connection
+// ===================================================================
+
+struct Tcb {
+    used: u32,
+    state: u32,
+    lip: u32,
+    rip: u32,
+    lport: u16,
+    rport: u16,
+    listener: i32,
+    accepted: u32,
+
+    // send side
+    iss: u32,
+    snd_una: u32,
+    snd_nxt: u32,
+    // The HIGHEST sequence number ever put on the wire. `snd_nxt` is only
+    // the cursor and is wound BACK on a retransmission; `snd_max` is not.
+    // Without the distinction a stack rejects the peer's perfectly good
+    // acknowledgements as "for octets never sent" the moment it has
+    // retransmitted once -- and then the connection dies of its own
+    // recovery. That is what round K3 measured before this line existed.
+    snd_max: u32,
+    snd_end: u32,
+    snd_wnd: u32,
+    snd_wl1: u32,
+    snd_wl2: u32,
+    close_req: u32,
+    fin_sent: u32,
+    nodelay: u32,
+
+    // receive side
+    irs: u32,
+    rcv_nxt: u32,
+    rcv_rd: u32,
+    fin_rcvd: u32,
+    fin_at: u32,
+
+    // reassembly: the ranges beyond rcv_nxt that have already arrived.
+    // The octets themselves are already lying in `rcv_buf` at their own
+    // place -- only the bookkeeping of the holes is here.
+    ooo_lo: [u32; 8],
+    ooo_hi: [u32; 8],
+    ooo_n: usize,
+
+    // congestion control and the round trip time
+    mss: u32,
+    cwnd: u32,
+    ssthresh: u32,
+    dupacks: u32,
+    srtt: u64,
+    rttvar: u64,
+    rto: u64,
+    rtt_seq: u32,
+    rtt_at: u64,
+    rtt_on: u32,
+
+    // timers
+    rt_at: u64,
+    rt_on: u32,
+    rt_shift: u32,
+    ack_at: u64,
+    ack_on: u32,
+    ack_now: u32,
+    seg_since_ack: u32,
+    tw_at: u64,
+    fw2_at: u64,
+    persist_at: u64,
+    persist_on: u32,
+
+    reset_req: u32,
+    err: i32,
+
+    snd_buf: [u8; 65536],
+    rcv_buf: [u8; 65536],
+}
+
+struct Tcp {
+    c: [Tcb; 8],
+    turn: usize,
+    rand: u64,
+    ip_id: u32,
+
+    // answers to segments that fit no connection at all
+    rst_n: usize,
+    rst_lip: [u32; 4],
+    rst_rip: [u32; 4],
+    rst_lport: [u16; 4],
+    rst_rport: [u16; 4],
+    rst_seq: [u32; 4],
+    rst_ack: [u32; 4],
+    rst_flags: [u8; 4],
+
+    stat: [u64; 12],
+
+    // Every state any connection of this stack has ever ENTERED, one
+    // bit per state. A claim that a state machine has eleven states is
+    // worth nothing; 0x7FF at the end of a run is a measurement.
+    seen: u32,
+    iss_hint: u32,
+    time_wait_us: u64,
+    rto_min: u64,
+    no_rexmit: u32,
+}
+
+fn tcb(t: *mut Tcp, i: usize) -> *mut Tcb {
+    return &(*t).c[i]
+}
+
+fn bump(t: *mut Tcp, which: u32) {
+    (*t).stat[which as usize] = (*t).stat[which as usize] +% 1
+}
+
+fn tcp_stat(t: *mut Tcp, which: u32) -> u64 {
+    return (*t).stat[which as usize]
+}
+
+fn umin(a: usize, b: usize) -> usize {
+    if a < b { return a }
+    return b
+}
+
+fn u32min(a: u32, b: u32) -> u32 {
+    if a < b { return a }
+    return b
+}
+
+fn u32max(a: u32, b: u32) -> u32 {
+    if a > b { return a }
+    return b
+}
+
+// ===================================================================
+// 3. setting up and tearing down
+// ===================================================================
+
+fn tcp_init(t: *mut Tcp, seed: u64) {
+    var i: usize = 0
+    while i < MAXCONN {
+        clear(tcb(t, i))
+        i = i + 1
+    }
+    (*t).turn = 0
+    (*t).rand = wire.next_random(seed)
+    (*t).ip_id = 1
+    (*t).rst_n = 0
+    var k: usize = 0
+    while k < ST_COUNT {
+        (*t).stat[k] = 0
+        k = k + 1
+    }
+    // Every connection starts in CLOSED; the bit is honest from the start.
+    (*t).seen = 1
+    (*t).iss_hint = 0
+    (*t).time_wait_us = TIME_WAIT_US
+    (*t).rto_min = RTO_MIN
+    (*t).no_rexmit = 0
+}
+
+fn clear(c: *mut Tcb) {
+    (*c).used = 0
+    (*c).state = S_CLOSED
+    (*c).lip = 0
+    (*c).rip = 0
+    (*c).lport = 0 as u16
+    (*c).rport = 0 as u16
+    (*c).listener = 0 - 1
+    (*c).accepted = 0
+    (*c).iss = 0
+    (*c).snd_una = 0
+    (*c).snd_nxt = 0
+    (*c).snd_max = 0
+    (*c).snd_end = 0
+    (*c).snd_wnd = 0
+    (*c).snd_wl1 = 0
+    (*c).snd_wl2 = 0
+    (*c).close_req = 0
+    (*c).fin_sent = 0
+    (*c).nodelay = 0
+    (*c).irs = 0
+    (*c).rcv_nxt = 0
+    (*c).rcv_rd = 0
+    (*c).fin_rcvd = 0
+    (*c).fin_at = 0
+    (*c).ooo_n = 0
+    (*c).mss = MSS_DEFAULT
+    (*c).cwnd = MSS_DEFAULT * 10
+    (*c).ssthresh = 65535
+    (*c).dupacks = 0
+    (*c).srtt = 0
+    (*c).rttvar = 0
+    (*c).rto = RTO_START
+    (*c).rtt_seq = 0
+    (*c).rtt_at = 0
+    (*c).rtt_on = 0
+    (*c).rt_at = 0
+    (*c).rt_on = 0
+    (*c).rt_shift = 0
+    (*c).ack_at = 0
+    (*c).ack_on = 0
+    (*c).ack_now = 0
+    (*c).seg_since_ack = 0
+    (*c).tw_at = 0
+    (*c).fw2_at = 0
+    (*c).persist_at = 0
+    (*c).persist_on = 0
+    (*c).reset_req = 0
+    (*c).err = E_NONE
+}
+
+fn tcp_free_slot(t: *mut Tcp) -> i32 {
+    var i: usize = 0
+    while i < MAXCONN {
+        if (*t).c[i].used == 0 {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn new_iss(t: *mut Tcp) -> u32 {
+    if (*t).iss_hint != 0 {
+        let v: u32 = (*t).iss_hint
+        (*t).iss_hint = 0
+        return v
+    }
+    (*t).rand = wire.next_random((*t).rand)
+    return (((*t).rand >> 24) & 4294967295) as u32
+}
+
+fn tcp_listen(t: *mut Tcp, ip: u32, port: u16) -> i32 {
+    let s: i32 = tcp_free_slot(t)
+    if s < 0 { return 0 - 1 }
+    let c: *mut Tcb = tcb(t, s as usize)
+    clear(c)
+    (*c).used = 1
+    setst(t, c, S_LISTEN)
+    (*c).lip = ip
+    (*c).lport = port
+    return s
+}
+
+// A connection that came in on a listening slot and has reached
+// ESTABLISHED. The listening slot itself stays where it is and keeps
+// listening.
+fn tcp_accept(t: *mut Tcp, listener: i32) -> i32 {
+    var i: usize = 0
+    while i < MAXCONN {
+        let c: *mut Tcb = tcb(t, i)
+        if (*c).used == 1 && (*c).listener == listener && (*c).accepted == 0 {
+            if (*c).state == S_ESTABLISHED || (*c).state == S_CLOSE_WAIT {
+                (*c).accepted = 1
+                return i as i32
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn tcp_connect(t: *mut Tcp, lip: u32, lport: u16, rip: u32, rport: u16, now: u64) -> i32 {
+    let s: i32 = tcp_free_slot(t)
+    if s < 0 { return 0 - 1 }
+    let c: *mut Tcb = tcb(t, s as usize)
+    clear(c)
+    (*c).used = 1
+    (*c).accepted = 1
+    setst(t, c, S_SYN_SENT)
+    (*c).lip = lip
+    (*c).lport = lport
+    (*c).rip = rip
+    (*c).rport = rport
+    let iss: u32 = new_iss(t)
+    (*c).iss = iss
+    (*c).snd_una = iss
+    (*c).snd_nxt = iss
+    (*c).snd_max = iss
+    // The SYN occupies `iss`; the DATA space starts one further on, and
+    // `snd_end` names the end of the data space. Starting it at `iss`
+    // instead makes `snd_end -% snd_una` wrap to 2^32-1 the moment the
+    // SYN is acknowledged, and the send buffer looks full for ever.
+    (*c).snd_end = iss +% 1
+    (*c).snd_wnd = 1
+    (*c).cwnd = MSS_DEFAULT * 10
+    arm_rt(t, c, now)
+    return s
+}
+
+fn tcp_close(t: *mut Tcp, h: i32) {
+    if h < 0 { return }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if (*c).used == 0 { return }
+    if (*c).state == S_LISTEN || (*c).state == S_SYN_SENT {
+        clear(c)
+        return
+    }
+    (*c).close_req = 1
+}
+
+fn tcp_abort(t: *mut Tcp, h: i32) {
+    if h < 0 { return }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if (*c).used == 0 { return }
+    if (*c).state != S_LISTEN && (*c).state != S_CLOSED {
+        (*c).reset_req = 1
+    } else {
+        clear(c)
+    }
+}
+
+fn tcp_set_nodelay(t: *mut Tcp, h: i32, on: bool) {
+    if h < 0 { return }
+    if on { (*t).c[h as usize].nodelay = 1 } else { (*t).c[h as usize].nodelay = 0 }
+}
+
+fn tcp_set_time_wait(t: *mut Tcp, us: u64) { (*t).time_wait_us = us }
+fn tcp_set_rto_min(t: *mut Tcp, us: u64) { (*t).rto_min = us }
+fn tcp_set_no_rexmit(t: *mut Tcp, on: bool) {
+    if on { (*t).no_rexmit = 1 } else { (*t).no_rexmit = 0 }
+}
+
+fn tcp_seen(t: *mut Tcp) -> u32 { return (*t).seen }
+
+// A test hook, and it is named as one: it makes the NEXT initial
+// sequence number a chosen value, so that a transfer can be driven
+// across the 2^32 boundary on purpose instead of once every four
+// gigaoctets by accident.
+fn tcp_force_iss(t: *mut Tcp, v: u32) { (*t).iss_hint = v }
+
+fn setst(t: *mut Tcp, c: *mut Tcb, v: u32) {
+    (*c).state = v
+    (*t).seen = (*t).seen | (1 << v)
+}
+
+fn tcp_state(t: *mut Tcp, h: i32) -> u32 {
+    if h < 0 { return S_CLOSED }
+    if (*t).c[h as usize].used == 0 { return S_CLOSED }
+    return (*t).c[h as usize].state
+}
+
+fn tcp_error(t: *mut Tcp, h: i32) -> i32 {
+    if h < 0 { return E_NONE }
+    return (*t).c[h as usize].err
+}
+
+fn tcp_peer_ip(t: *mut Tcp, h: i32) -> u32 { return (*t).c[h as usize].rip }
+fn tcp_peer_port(t: *mut Tcp, h: i32) -> u16 { return (*t).c[h as usize].rport }
+fn tcp_local_port(t: *mut Tcp, h: i32) -> u16 { return (*t).c[h as usize].lport }
+
+// A window into the innards, for the measurement scripts only. A test
+// that can only see the outside cannot tell a connection that was never
+// opened from one that was opened and closed again.
+fn tcp_dbg(t: *mut Tcp, h: i32, which: u32) -> u64 {
+    if h < 0 { return 0 }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if which == 0 { return (*c).close_req as u64 }
+    if which == 1 { return (*c).fin_sent as u64 }
+    if which == 2 { return (*c).snd_una as u64 }
+    if which == 3 { return (*c).snd_nxt as u64 }
+    if which == 4 { return (*c).snd_end as u64 }
+    if which == 5 { return (*c).rcv_nxt as u64 }
+    if which == 6 { return (*c).rcv_rd as u64 }
+    if which == 7 { return (*c).snd_wnd as u64 }
+    if which == 8 { return (*c).cwnd as u64 }
+    if which == 9 { return (*c).rto }
+    if which == 10 { return (*c).srtt }
+    if which == 11 { return (*c).ooo_n as u64 }
+    if which == 12 { return (*c).rt_shift as u64 }
+    if which == 13 { return (*c).state as u64 }
+    if which == 14 { return (*c).used as u64 }
+    if which == 15 { return (*c).rttvar }
+    if which == 16 { return (*c).snd_max as u64 }
+    return 0
+}
+
+// ===================================================================
+// 4. the two ring buffers
+// ===================================================================
+//
+// Both are addressed by SEQUENCE NUMBER, not by an index of their own:
+// the octet with sequence number `s` lies at `s & MASK`. That removes
+// the whole class of head/tail bookkeeping errors -- there is no head
+// and no tail, there are only sequence numbers, and the same number
+// names the same octet on both sides of the connection.
+
+fn snd_put(c: *mut Tcb, seq: u32, src: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let idx: usize = ((seq +% i as u32) & SND_MASK) as usize
+        (*c).snd_buf[idx] = wire.ld8(src, i)
+        i = i + 1
+    }
+}
+
+fn snd_get(c: *mut Tcb, seq: u32, dst: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let idx: usize = ((seq +% i as u32) & SND_MASK) as usize
+        wire.st8(dst, i, (*c).snd_buf[idx])
+        i = i + 1
+    }
+}
+
+fn rcv_put(c: *mut Tcb, seq: u32, src: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let idx: usize = ((seq +% i as u32) & RCV_MASK) as usize
+        (*c).rcv_buf[idx] = wire.ld8(src, i)
+        i = i + 1
+    }
+}
+
+// How much room is left in the receive buffer, and what is announced as
+// the window. Two different questions: the announcement avoids the silly
+// window (RFC 1122 4.2.3.3) by saying zero rather than "three octets" --
+// a peer that believes a three octet window sends three octet segments,
+// and then the connection never recovers.
+fn rcv_free(c: *mut Tcb) -> u32 {
+    let used: u32 = (*c).rcv_nxt -% (*c).rcv_rd
+    if used >= RCV_CAP as u32 { return 0 }
+    return (RCV_CAP as u32) -% used
+}
+
+fn rcv_window(c: *mut Tcb) -> u32 {
+    var w: u32 = rcv_free(c)
+    if w < (*c).mss && w < (RCV_CAP as u32) / 2 { return 0 }
+    if w > 65535 { w = 65535 }
+    return w
+}
+
+// The FIN occupies a sequence number, but it is NOT an octet of data.
+// Counting it as one hands the application one octet more than the peer
+// ever sent -- and that octet is whatever happened to lie in the ring.
+fn rcv_avail(c: *mut Tcb) -> u32 {
+    if (*c).fin_rcvd == 1 && wire.seq_ge((*c).rcv_nxt, (*c).fin_at) {
+        return (*c).fin_at -% (*c).rcv_rd
+    }
+    return (*c).rcv_nxt -% (*c).rcv_rd
+}
+
+fn tcp_readable(t: *mut Tcp, h: i32) -> usize {
+    if h < 0 { return 0 }
+    let c: *mut Tcb = tcb(t, h as usize)
+    return rcv_avail(c) as usize
+}
+
+fn tcp_writable(t: *mut Tcp, h: i32) -> usize {
+    if h < 0 { return 0 }
+    let c: *mut Tcb = tcb(t, h as usize)
+    let queued: u32 = (*c).snd_end -% (*c).snd_una
+    if queued >= SND_CAP as u32 { return 0 }
+    return (SND_CAP - queued as usize)
+}
+
+fn tcp_send(t: *mut Tcp, h: i32, src: *mut u8, n: usize) -> usize {
+    if h < 0 { return 0 }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if (*c).used == 0 { return 0 }
+    if (*c).close_req == 1 { return 0 }
+    if (*c).state != S_ESTABLISHED && (*c).state != S_CLOSE_WAIT
+    && (*c).state != S_SYN_SENT && (*c).state != S_SYN_RECEIVED { return 0 }
+    let room: usize = tcp_writable(t, h)
+    let k: usize = umin(n, room)
+    if k == 0 { return 0 }
+    snd_put(c, (*c).snd_end, src, k)
+    (*c).snd_end = (*c).snd_end +% k as u32
+    return k
+}
+
+fn tcp_recv(t: *mut Tcp, h: i32, dst: *mut u8, cap: usize) -> usize {
+    if h < 0 { return 0 }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if (*c).used == 0 { return 0 }
+    let avail: usize = rcv_avail(c) as usize
+    let k: usize = umin(avail, cap)
+    var i: usize = 0
+    while i < k {
+        let idx: usize = (((*c).rcv_rd +% i as u32) & RCV_MASK) as usize
+        wire.st8(dst, i, (*c).rcv_buf[idx])
+        i = i + 1
+    }
+    let before: u32 = rcv_window(c)
+    (*c).rcv_rd = (*c).rcv_rd +% k as u32
+    // A window that has just gone from "closed" to "open" has to be
+    // announced, otherwise the other side sits in its persist timer.
+    if k > 0 && before == 0 && rcv_window(c) > 0 {
+        (*c).ack_now = 1
+    }
+    return k
+}
+
+// ===================================================================
+// 5. the holes in the receive stream
+// ===================================================================
+
+fn ooo_add(c: *mut Tcb, lo: u32, hi: u32) -> bool {
+    var l: u32 = lo
+    var h: u32 = hi
+    var i: usize = 0
+    while i < (*c).ooo_n {
+        let a: u32 = (*c).ooo_lo[i]
+        let b: u32 = (*c).ooo_hi[i]
+        if wire.seq_le(a, h) && wire.seq_le(l, b) {
+            if wire.seq_lt(a, l) { l = a }
+            if wire.seq_gt(b, h) { h = b }
+            (*c).ooo_lo[i] = (*c).ooo_lo[(*c).ooo_n - 1]
+            (*c).ooo_hi[i] = (*c).ooo_hi[(*c).ooo_n - 1]
+            (*c).ooo_n = (*c).ooo_n - 1
+            i = 0
+            continue
+        }
+        i = i + 1
+    }
+    if (*c).ooo_n >= OOO_MAX { return false }
+    (*c).ooo_lo[(*c).ooo_n] = l
+    (*c).ooo_hi[(*c).ooo_n] = h
+    (*c).ooo_n = (*c).ooo_n + 1
+    return true
+}
+
+// Everything that is now contiguous with `rcv_nxt` becomes readable.
+fn ooo_flush(c: *mut Tcb) {
+    var again: bool = true
+    while again {
+        again = false
+        var i: usize = 0
+        while i < (*c).ooo_n {
+            let a: u32 = (*c).ooo_lo[i]
+            let b: u32 = (*c).ooo_hi[i]
+            if wire.seq_le(a, (*c).rcv_nxt) && wire.seq_gt(b, (*c).rcv_nxt) {
+                (*c).rcv_nxt = b
+                (*c).ooo_lo[i] = (*c).ooo_lo[(*c).ooo_n - 1]
+                (*c).ooo_hi[i] = (*c).ooo_hi[(*c).ooo_n - 1]
+                (*c).ooo_n = (*c).ooo_n - 1
+                again = true
+                i = (*c).ooo_n
+            } else if wire.seq_le(b, (*c).rcv_nxt) {
+                (*c).ooo_lo[i] = (*c).ooo_lo[(*c).ooo_n - 1]
+                (*c).ooo_hi[i] = (*c).ooo_hi[(*c).ooo_n - 1]
+                (*c).ooo_n = (*c).ooo_n - 1
+                again = true
+                i = (*c).ooo_n
+            } else {
+                i = i + 1
+            }
+        }
+    }
+}
+
+// ===================================================================
+// 6. the timers
+// ===================================================================
+
+fn rto_of(t: *mut Tcp, c: *mut Tcb) -> u64 {
+    var r: u64 = (*c).rto
+    if r < (*t).rto_min { r = (*t).rto_min }
+    if r > RTO_MAX { r = RTO_MAX }
+    return r
+}
+
+fn arm_rt(t: *mut Tcp, c: *mut Tcb, now: u64) {
+    (*c).rt_on = 1
+    (*c).rt_at = now + rto_of(t, c)
+}
+
+// `srtt` and `rttvar` are smoothed averages of a measured time; they
+// cannot grow past the largest timeout there is, and clamping them here
+// is what keeps the multiplication below from ever going out of range.
+fn clamp_rtt(c: *mut Tcb) {
+    if (*c).srtt > RTO_MAX { (*c).srtt = RTO_MAX }
+    if (*c).rttvar > RTO_MAX { (*c).rttvar = RTO_MAX }
+}
+
+// Jacobson/Karn, RFC 6298. The sample is only taken when the segment it
+// belongs to was sent EXACTLY ONCE -- that is Karn's rule, and without
+// it a retransmission makes the estimate collapse: the acknowledgement
+// could belong to either of the two copies, and the wrong choice halves
+// or doubles the measured time.
+// A CLOCK IS NOT A PROMISE. `now` comes in from outside -- from a kernel
+// timer, from `clock_gettime`, from a caller that computed it once and
+// used it twice. It can stand still and it can go BACKWARDS, and when it
+// does, `now - rtt_at` is a number close to 2^64 and every checked
+// addition after it aborts the process. That is not theory: it is what
+// tools/k3net/drv.fi did on its first run against the Linux kernel, and
+// the panic came out of this function. A sample out of a clock that went
+// backwards is thrown away rather than believed.
+fn rtt_sample(now: u64, then: u64) -> u64 {
+    if now <= then { return 0 }
+    return now - then
+}
+
+fn rtt_update(t: *mut Tcp, c: *mut Tcb, sample: u64) {
+    var m: u64 = sample
+    if m == 0 { return }
+    if m > RTO_MAX { m = RTO_MAX }
+    if (*c).srtt == 0 {
+        (*c).srtt = m
+        (*c).rttvar = m / 2
+    } else {
+        var d: u64 = 0
+        if m > (*c).srtt { d = m - (*c).srtt } else { d = (*c).srtt - m }
+        (*c).rttvar = ((*c).rttvar * 3 + d) / 4
+        (*c).srtt = ((*c).srtt * 7 + m) / 8
+    }
+    clamp_rtt(c)
+    var r: u64 = (*c).srtt + 4 * (*c).rttvar
+    if r < (*t).rto_min { r = (*t).rto_min }
+    if r > RTO_MAX { r = RTO_MAX }
+    (*c).rto = r
+}
+
+// The timers that do not produce a segment: TIME_WAIT running out, the
+// FIN_WAIT_2 guard, a connection that has retransmitted itself to death.
+fn tcp_timers(t: *mut Tcp, now: u64) {
+    var i: usize = 0
+    while i < MAXCONN {
+        let c: *mut Tcb = tcb(t, i)
+        if (*c).used == 1 {
+            if (*c).state == S_TIME_WAIT && now >= (*c).tw_at {
+                clear(c)
+            } else if (*c).state == S_FIN_WAIT_2 && (*c).fw2_at != 0 && now >= (*c).fw2_at {
+                (*c).err = E_TIMEOUT
+                clear(c)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ===================================================================
+// 7. a segment arrives
+// ===================================================================
+//
+// The order is the one of RFC 793 section 3.9 ("SEGMENT ARRIVES") and it
+// is not interchangeable: acceptability first, then RST, then a SYN in
+// the window, then the acknowledgement, then the data, then the FIN. A
+// stack that looks at the data before the acknowledgement accepts octets
+// on a connection the other side has already reset.
+
+fn find_conn(t: *mut Tcp, lip: u32, lport: u16, rip: u32, rport: u16) -> i32 {
+    var i: usize = 0
+    while i < MAXCONN {
+        let c: *mut Tcb = tcb(t, i)
+        if (*c).used == 1 && (*c).state != S_LISTEN {
+            if (*c).lport == lport && (*c).rport == rport
+            && (*c).lip == lip && (*c).rip == rip {
+                return i as i32
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn find_listener(t: *mut Tcp, lip: u32, lport: u16) -> i32 {
+    var i: usize = 0
+    while i < MAXCONN {
+        let c: *mut Tcb = tcb(t, i)
+        if (*c).used == 1 && (*c).state == S_LISTEN && (*c).lport == lport {
+            if (*c).lip == 0 || (*c).lip == lip { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn queue_rst(t: *mut Tcp, lip: u32, lport: u16, rip: u32, rport: u16,
+    seq: u32, ack: u32, flags: u8) {
+    if (*t).rst_n >= RST_SLOTS { return }
+    let k: usize = (*t).rst_n
+    (*t).rst_lip[k] = lip
+    (*t).rst_lport[k] = lport
+    (*t).rst_rip[k] = rip
+    (*t).rst_rport[k] = rport
+    (*t).rst_seq[k] = seq
+    (*t).rst_ack[k] = ack
+    (*t).rst_flags[k] = flags
+    (*t).rst_n = k + 1
+}
+
+// The reply to a segment nobody wants (RFC 793 3.9, "CLOSED"). Which of
+// the two forms is right depends on whether the segment carried an
+// acknowledgement -- the other side has to be able to tell the reset
+// apart from a stray one, and only the sequence number does that.
+fn reject(t: *mut Tcp, iph: *mut u8, seg: *mut u8, seglen: usize) {
+    let fl: u8 = wire.tcp_flags(seg)
+    if (fl & wire.F_RST) != 0 { return }
+    let lip: u32 = wire.ip_dst(iph)
+    let rip: u32 = wire.ip_src(iph)
+    let lport: u16 = wire.tcp_dport(seg)
+    let rport: u16 = wire.tcp_sport(seg)
+    if (fl & wire.F_ACK) != 0 {
+        queue_rst(t, lip, lport, rip, rport, wire.tcp_ack(seg), 0, wire.F_RST)
+    } else {
+        var extra: u32 = seglen as u32
+        if (fl & wire.F_SYN) != 0 { extra = extra +% 1 }
+        if (fl & wire.F_FIN) != 0 { extra = extra +% 1 }
+        queue_rst(t, lip, lport, rip, rport, 0, wire.tcp_seq(seg) +% extra,
+            wire.F_RST | wire.F_ACK)
+    }
+}
+
+fn tcp_input(t: *mut Tcp, iph: *mut u8, iplen: usize, now: u64) {
+    let ihl: usize = wire.ip_ihl(iph)
+    let total: usize = wire.ip_total(iph)
+    if total < ihl + wire.TCP_HDR { return }
+    if total > iplen { return }
+    let seg: *mut u8 = ((iph as u64) + ihl as u64) as *mut u8
+    let seglen_all: usize = total - ihl
+
+    // THE CHECKSUM. Everything below this line believes the octets; this
+    // is the only place that decides whether it may. A wrong checksum is
+    // dropped without an answer of any kind -- an answer would tell an
+    // attacker that the port is open.
+    let src: u32 = wire.ip_src(iph)
+    let dst: u32 = wire.ip_dst(iph)
+    var acc: u64 = wire.pseudo_sum(src, dst, wire.IP_TCP, seglen_all)
+    acc = acc + wire.sum16(seg, seglen_all)
+    if wire.fold(acc) != 0 as u16 {
+        bump(t, ST_CSUM)
+        return
+    }
+    let off: usize = wire.tcp_off(seg)
+    if off < wire.TCP_HDR { return }
+    if off > seglen_all { return }
+    bump(t, ST_RX)
+
+    let dlen: usize = seglen_all - off
+    let data: *mut u8 = ((seg as u64) + off as u64) as *mut u8
+    let lport: u16 = wire.tcp_dport(seg)
+    let rport: u16 = wire.tcp_sport(seg)
+
+    let h: i32 = find_conn(t, dst, lport, src, rport)
+    if h >= 0 {
+        step(t, h, iph, seg, data, dlen, now)
+        return
+    }
+    let l: i32 = find_listener(t, dst, lport)
+    if l >= 0 {
+        listen_step(t, l, iph, seg, now)
+        return
+    }
+    reject(t, iph, seg, dlen)
+}
+
+// LISTEN. Only a SYN produces anything here; everything else is either
+// ignored (a reset) or answered with a reset.
+fn listen_step(t: *mut Tcp, l: i32, iph: *mut u8, seg: *mut u8, now: u64) {
+    let fl: u8 = wire.tcp_flags(seg)
+    if (fl & wire.F_RST) != 0 { return }
+    if (fl & wire.F_ACK) != 0 {
+        let lip: u32 = wire.ip_dst(iph)
+        queue_rst(t, lip, wire.tcp_dport(seg), wire.ip_src(iph), wire.tcp_sport(seg),
+            wire.tcp_ack(seg), 0, wire.F_RST)
+        return
+    }
+    if (fl & wire.F_SYN) == 0 { return }
+    let s: i32 = tcp_free_slot(t)
+    if s < 0 { return } // no room -- the SYN is dropped, the peer retries
+    let c: *mut Tcb = tcb(t, s as usize)
+    clear(c)
+    (*c).used = 1
+    setst(t, c, S_SYN_RECEIVED)
+    (*c).listener = l
+    (*c).lip = wire.ip_dst(iph)
+    (*c).rip = wire.ip_src(iph)
+    (*c).lport = wire.tcp_dport(seg)
+    (*c).rport = wire.tcp_sport(seg)
+    (*c).irs = wire.tcp_seq(seg)
+    (*c).rcv_nxt = (*c).irs +% 1
+    (*c).rcv_rd = (*c).rcv_nxt
+    let iss: u32 = new_iss(t)
+    (*c).iss = iss
+    (*c).snd_una = iss
+    (*c).snd_nxt = iss
+    (*c).snd_max = iss
+    (*c).snd_end = iss +% 1
+    (*c).snd_wnd = wire.tcp_wnd(seg)
+    (*c).snd_wl1 = wire.tcp_seq(seg)
+    (*c).snd_wl2 = iss
+    let m: u16 = wire.tcp_mss_option(seg, wire.tcp_off(seg))
+    if m >= 536 as u16 && m <= 1460 as u16 { (*c).mss = m as u32 }
+    (*c).cwnd = (*c).mss * 10
+    arm_rt(t, c, now)
+}
+
+// SYN_SENT (RFC 793 3.9). The interesting half is the refusal: an
+// acknowledgement for a sequence number this side never sent is not a
+// protocol detail but the whole difference between a connection and a
+// forgery.
+fn syn_sent_step(t: *mut Tcp, c: *mut Tcb, seg: *mut u8, now: u64) {
+    let fl: u8 = wire.tcp_flags(seg)
+    let ack: u32 = wire.tcp_ack(seg)
+    var ack_ok: bool = false
+    if (fl & wire.F_ACK) != 0 {
+        if wire.seq_le(ack, (*c).iss) || wire.seq_gt(ack, (*c).snd_max) {
+            bump(t, ST_BAD_ACK)
+            if (fl & wire.F_RST) == 0 {
+                queue_rst(t, (*c).lip, (*c).lport, (*c).rip, (*c).rport, ack, 0, wire.F_RST)
+            }
+            return
+        }
+        ack_ok = true
+    }
+    if (fl & wire.F_RST) != 0 {
+        // `clear` wipes `err` -- so the refusal has to go through `dead`,
+        // which is the only thing that keeps a reason readable for the
+        // owner of the handle.
+        if ack_ok { dead(t, c, E_REFUSED) }
+        return
+    }
+    if (fl & wire.F_SYN) == 0 { return }
+    (*c).irs = wire.tcp_seq(seg)
+    (*c).rcv_nxt = (*c).irs +% 1
+    (*c).rcv_rd = (*c).rcv_nxt
+    (*c).snd_wnd = wire.tcp_wnd(seg)
+    (*c).snd_wl1 = wire.tcp_seq(seg)
+    let m: u16 = wire.tcp_mss_option(seg, wire.tcp_off(seg))
+    if m >= 536 as u16 && m <= 1460 as u16 { (*c).mss = m as u32 }
+    if ack_ok {
+        (*c).snd_una = ack
+        (*c).snd_wl2 = ack
+        if wire.seq_gt((*c).snd_una, (*c).iss) {
+            setst(t, c, S_ESTABLISHED)
+            (*c).cwnd = (*c).mss * 10
+            (*c).rt_on = 0
+            if (*c).rtt_on == 1 && wire.seq_ge(ack, (*c).rtt_seq) {
+                (*c).rtt_on = 0
+                rtt_update(t, c, now - (*c).rtt_at)
+            }
+            (*c).ack_now = 1
+            return
+        }
+    }
+    // A simultaneous open: both sides sent a SYN, neither has been
+    // acknowledged yet.
+    setst(t, c, S_SYN_RECEIVED)
+    (*c).snd_nxt = (*c).iss
+    (*c).ack_now = 1
+    arm_rt(t, c, now)
+}
+
+// The acceptability window of RFC 793 page 69, written out. `seglen`
+// counts SYN and FIN as one octet each, because they occupy a sequence
+// number.
+fn acceptable(c: *mut Tcb, seq: u32, seglen: usize) -> bool {
+    let wnd: u32 = rcv_free(c)
+    let nxt: u32 = (*c).rcv_nxt
+    if seglen == 0 {
+        if wnd == 0 { return seq == nxt }
+        return wire.seq_in(seq, nxt, nxt +% wnd)
+    }
+    if wnd == 0 { return false }
+    let last: u32 = seq +% (seglen as u32 -% 1)
+    if wire.seq_in(seq, nxt, nxt +% wnd) { return true }
+    if wire.seq_in(last, nxt, nxt +% wnd) { return true }
+    return false
+}
+
+fn kill(t: *mut Tcp, c: *mut Tcb, why: i32) {
+    let e: i32 = why
+    clear(c)
+    (*c).err = e
+}
+
+// A connection that is over but whose owner still holds the handle keeps
+// its slot until he closes it -- otherwise `tcp_error` would answer for
+// a slot that is already somebody else's connection. One that was never
+// handed out (a half open connection out of a listen queue) is given
+// back at once; nobody can ask about it.
+fn dead(t: *mut Tcp, c: *mut Tcb, why: i32) {
+    if (*c).accepted == 0 {
+        clear(c)
+        return
+    }
+    setst(t, c, S_CLOSED)
+    (*c).err = why
+    (*c).rt_on = 0
+    (*c).ack_on = 0
+    (*c).ack_now = 0
+    (*c).persist_on = 0
+    (*c).close_req = 0
+    (*c).fin_sent = 0
+    (*c).reset_req = 0
+    (*c).ooo_n = 0
+}
+
+fn advance_nxt(c: *mut Tcb, v: u32) {
+    (*c).snd_nxt = v
+    if wire.seq_gt(v, (*c).snd_max) { (*c).snd_max = v }
+}
+
+fn start_rtt(c: *mut Tcb, seq: u32, now: u64) {
+    if (*c).rtt_on == 0 {
+        (*c).rtt_on = 1
+        (*c).rtt_seq = seq
+        (*c).rtt_at = now
+    }
+}
+
+fn advance_fin_state(t: *mut Tcp, c: *mut Tcb) {
+    if (*c).state == S_ESTABLISHED || (*c).state == S_SYN_RECEIVED {
+        setst(t, c, S_FIN_WAIT_1)
+    } else if (*c).state == S_CLOSE_WAIT {
+        setst(t, c, S_LAST_ACK)
+    }
+}
+
+fn take_data(t: *mut Tcp, c: *mut Tcb, seq: u32, data: *mut u8, dlen: usize) {
+    var s: u32 = seq
+    var p: *mut u8 = data
+    var n: usize = dlen
+    // Everything to the left of `rcv_nxt` has been seen before.
+    if wire.seq_lt(s, (*c).rcv_nxt) {
+        let skip: u32 = (*c).rcv_nxt -% s
+        if skip as usize >= n { return }
+        p = ((p as u64) + skip as u64) as *mut u8
+        n = n - skip as usize
+        s = (*c).rcv_nxt
+    }
+    // Everything to the right of what the buffer can hold is refused --
+    // this is the announced window taken seriously on the receive side
+    // too, not only in the number that was sent out.
+    let limit: u32 = (*c).rcv_rd +% (RCV_CAP as u32)
+    if wire.seq_ge(s, limit) { return }
+    if wire.seq_gt(s +% n as u32, limit) {
+        n = (limit -% s) as usize
+    }
+    if n == 0 { return }
+    rcv_put(c, s, p, n)
+    if s != (*c).rcv_nxt {
+        bump(t, ST_OOO)
+        (*c).ack_now = 1
+    }
+    if !ooo_add(c, s, s +% n as u32) { return }
+    ooo_flush(c)
+}
+
+fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: usize, now: u64) {
+    let c: *mut Tcb = tcb(t, h as usize)
+    let fl: u8 = wire.tcp_flags(seg)
+    let seq: u32 = wire.tcp_seq(seg)
+    let ack: u32 = wire.tcp_ack(seg)
+    let st0: u32 = (*c).state
+
+    if st0 == S_CLOSED { return }
+    if st0 == S_SYN_SENT {
+        syn_sent_step(t, c, seg, now)
+        return
+    }
+
+    // A repeated SYN in SYN_RECEIVED means the other side never saw the
+    // SYN/ACK. Rewinding `snd_nxt` is what makes the next `tcp_pull`
+    // build it again; a plain acknowledgement would not help the peer.
+    if st0 == S_SYN_RECEIVED && (fl & wire.F_SYN) != 0 && (fl & wire.F_ACK) == 0 {
+        if seq == (*c).irs {
+            (*c).snd_nxt = (*c).iss
+            return
+        }
+    }
+
+    var seglen: usize = dlen
+    if (fl & wire.F_SYN) != 0 { seglen = seglen + 1 }
+    if (fl & wire.F_FIN) != 0 { seglen = seglen + 1 }
+
+    // ---- 1. is the segment inside the window at all?
+    if !acceptable(c, seq, seglen) {
+        bump(t, ST_UNACCEPTABLE)
+        if (fl & wire.F_RST) == 0 { (*c).ack_now = 1 }
+        return
+    }
+
+    // ---- 2. a reset
+    if (fl & wire.F_RST) != 0 {
+        dead(t, c, E_RESET)
+        return
+    }
+
+    // ---- 3. a SYN inside the window is a protocol error
+    if (fl & wire.F_SYN) != 0 && seq != (*c).irs {
+        queue_rst(t, (*c).lip, (*c).lport, (*c).rip, (*c).rport, (*c).snd_nxt, 0, wire.F_RST)
+        dead(t, c, E_RESET)
+        return
+    }
+
+    // ---- 4. the acknowledgement
+    if (fl & wire.F_ACK) == 0 { return }
+
+    if (*c).state == S_SYN_RECEIVED {
+        if wire.seq_gt(ack, (*c).snd_una) && wire.seq_le(ack, (*c).snd_max) {
+            setst(t, c, S_ESTABLISHED)
+            (*c).snd_wnd = wire.tcp_wnd(seg)
+            (*c).snd_wl1 = seq
+            (*c).snd_wl2 = ack
+            (*c).cwnd = (*c).mss * 10
+        } else {
+            bump(t, ST_BAD_ACK)
+            queue_rst(t, (*c).lip, (*c).lport, (*c).rip, (*c).rport, ack, 0, wire.F_RST)
+            return
+        }
+    }
+
+    // AN ACKNOWLEDGEMENT FOR OCTETS THAT WERE NEVER SENT. This is a
+    // counter-check of the round and not a formality: a stack that
+    // believes it would move `snd_una` past `snd_nxt`, and from then on
+    // every length it computes is a wrapped difference near 2^32.
+    if wire.seq_gt(ack, (*c).snd_max) {
+        bump(t, ST_BAD_ACK)
+        (*c).ack_now = 1
+        return
+    }
+
+    if wire.seq_gt(ack, (*c).snd_una) {
+        let acked: u32 = ack -% (*c).snd_una
+        (*c).snd_una = ack
+        (*c).dupacks = 0
+        if wire.seq_lt((*c).snd_nxt, (*c).snd_una) { (*c).snd_nxt = (*c).snd_una }
+        if (*c).rtt_on == 1 && wire.seq_ge(ack, (*c).rtt_seq) {
+            (*c).rtt_on = 0
+            rtt_update(t, c, rtt_sample(now, (*c).rtt_at))
+        }
+        if (*c).cwnd < (*c).ssthresh {
+            (*c).cwnd = (*c).cwnd +% u32min(acked, (*c).mss)
+        } else {
+            let inc: u32 = ((*c).mss *% (*c).mss) / u32max((*c).cwnd, 1)
+            (*c).cwnd = (*c).cwnd +% u32max(inc, 1)
+        }
+        if (*c).cwnd > 1048576 { (*c).cwnd = 1048576 }
+        (*c).rt_shift = 0
+        clamp_rtt(c)
+        (*c).rto = (*c).srtt + 4 * (*c).rttvar
+        if (*c).rto < (*t).rto_min { (*c).rto = (*t).rto_min }
+        if (*c).rto > RTO_MAX { (*c).rto = RTO_MAX }
+        if wire.seq_lt((*c).snd_una, (*c).snd_max) {
+            arm_rt(t, c, now)
+        } else {
+            (*c).rt_on = 0
+        }
+    } else if ack == (*c).snd_una && dlen == 0
+    && (fl & (wire.F_SYN | wire.F_FIN)) == 0
+    && wire.tcp_wnd(seg) <= (*c).snd_wnd
+    && wire.seq_lt((*c).snd_una, (*c).snd_max) {
+        // Three duplicates say that segments AFTER the hole are arriving
+        // -- so the hole is a loss and not a reordering, and waiting for
+        // the timer would waste a whole RTO.
+        (*c).dupacks = (*c).dupacks +% 1
+        bump(t, ST_DUPACK)
+        if (*c).dupacks == 3 && (*t).no_rexmit == 0 {
+            let flight: u32 = (*c).snd_max -% (*c).snd_una
+            (*c).ssthresh = u32max(flight / 2, 2 * (*c).mss)
+            (*c).snd_nxt = (*c).snd_una
+            (*c).fin_sent = 0
+            (*c).cwnd = (*c).ssthresh +% 3 * (*c).mss
+            (*c).rtt_on = 0
+            bump(t, ST_FAST_REXMIT)
+            arm_rt(t, c, now)
+        }
+    }
+
+    // The window update (RFC 793 page 72): only ever from a segment that
+    // is newer than the one the current window came from.
+    if wire.seq_lt((*c).snd_wl1, seq)
+    || ((*c).snd_wl1 == seq && wire.seq_le((*c).snd_wl2, ack)) {
+        (*c).snd_wnd = wire.tcp_wnd(seg)
+        (*c).snd_wl1 = seq
+        (*c).snd_wl2 = ack
+        if (*c).snd_wnd > 0 { (*c).persist_on = 0 }
+    }
+
+    let fin_acked: bool = (*c).close_req == 1 && (*c).fin_sent == 1
+    && wire.seq_gt((*c).snd_una, (*c).snd_end)
+
+    if (*c).state == S_FIN_WAIT_1 && fin_acked {
+        setst(t, c, S_FIN_WAIT_2)
+        (*c).fw2_at = now + FIN_WAIT_2_US
+    } else if (*c).state == S_CLOSING && fin_acked {
+        setst(t, c, S_TIME_WAIT)
+        (*c).tw_at = now + (*t).time_wait_us
+        (*c).rt_on = 0
+    } else if (*c).state == S_LAST_ACK && fin_acked {
+        clear(c)
+        return
+    }
+
+    // ---- 5. the data
+    if dlen > 0 {
+        let s: u32 = (*c).state
+        if s == S_ESTABLISHED || s == S_FIN_WAIT_1 || s == S_FIN_WAIT_2 {
+            let dseq: u32 = seq
+            take_data(t, c, dseq, data, dlen)
+            (*c).seg_since_ack = (*c).seg_since_ack +% 1
+            if (*c).seg_since_ack >= 2 {
+                (*c).ack_now = 1
+            } else if (*c).ack_on == 0 && (*c).ack_now == 0 {
+                (*c).ack_on = 1
+                (*c).ack_at = now + DELACK
+            }
+        }
+    }
+
+    // ---- 6. the FIN
+    if (fl & wire.F_FIN) != 0 {
+        let fin_seq: u32 = seq +% (dlen as u32)
+        if fin_seq == (*c).rcv_nxt {
+            (*c).fin_at = (*c).rcv_nxt
+            (*c).rcv_nxt = (*c).rcv_nxt +% 1
+            (*c).fin_rcvd = 1
+            (*c).ack_now = 1
+            let s: u32 = (*c).state
+            if s == S_ESTABLISHED {
+                setst(t, c, S_CLOSE_WAIT)
+            } else if s == S_FIN_WAIT_1 {
+                if fin_acked {
+                    setst(t, c, S_TIME_WAIT)
+                    (*c).tw_at = now + (*t).time_wait_us
+                    (*c).rt_on = 0
+                } else {
+                    setst(t, c, S_CLOSING)
+                }
+            } else if s == S_FIN_WAIT_2 {
+                setst(t, c, S_TIME_WAIT)
+                (*c).tw_at = now + (*t).time_wait_us
+                (*c).rt_on = 0
+            } else if s == S_TIME_WAIT {
+                (*c).tw_at = now + (*t).time_wait_us
+            }
+        }
+    }
+
+    if (*c).state == S_TIME_WAIT { (*c).ack_now = 1 }
+}
+
+// ===================================================================
+// 8. a segment goes out
+// ===================================================================
+
+fn seg_build(t: *mut Tcp, c: *mut Tcb, buf: *mut u8, cap: usize,
+    flags: u8, seq: u32, dlen: usize, mss_opt: bool) -> usize {
+    var optlen: usize = 0
+    if mss_opt { optlen = 4 }
+    let total: usize = wire.IP_HDR + wire.TCP_HDR + optlen + dlen
+    if total > cap { return 0 }
+    (*t).ip_id = ((*t).ip_id +% 1) & 0xFFFF
+    wire.ip_build(buf, ((*t).ip_id & 0xFFFF) as u16, wire.IP_TCP, (*c).lip, (*c).rip,
+        wire.TCP_HDR + optlen + dlen)
+    let seg: *mut u8 = ((buf as u64) + wire.IP_HDR as u64) as *mut u8
+    wire.put16(seg, 0, (*c).lport)
+    wire.put16(seg, 2, (*c).rport)
+    wire.put32(seg, 4, seq)
+    if (flags & wire.F_ACK) != 0 {
+        wire.put32(seg, 8, (*c).rcv_nxt)
+    } else {
+        wire.put32(seg, 8, 0)
+    }
+    let dataoff: usize = (wire.TCP_HDR + optlen) / 4
+    wire.st8(seg, 12, ((dataoff * 16) & 0xF0) as u8)
+    wire.st8(seg, 13, flags)
+    wire.put16(seg, 14, (rcv_window(c) & 0xFFFF) as u16)
+    wire.put16(seg, 16, 0 as u16)
+    wire.put16(seg, 18, 0 as u16)
+    if mss_opt {
+        wire.st8(seg, 20, 2 as u8)
+        wire.st8(seg, 21, 4 as u8)
+        wire.put16(seg, 22, ((*c).mss & 0xFFFF) as u16)
+    }
+    if dlen > 0 {
+        snd_get(c, seq, ((seg as u64) + (wire.TCP_HDR + optlen) as u64) as *mut u8, dlen)
+    }
+    let seglen: usize = wire.TCP_HDR + optlen + dlen
+    var acc: u64 = wire.pseudo_sum((*c).lip, (*c).rip, wire.IP_TCP, seglen)
+    acc = acc + wire.sum16(seg, seglen)
+    wire.put16(seg, 16, wire.fold(acc))
+    return total
+}
+
+// The reset for a segment that belongs to no connection. It has no TCB,
+// so it is built straight out of the four numbers that were remembered.
+fn rst_build(t: *mut Tcp, buf: *mut u8, cap: usize, k: usize, dstip: *mut u32) -> usize {
+    let total: usize = wire.IP_HDR + wire.TCP_HDR
+    if total > cap { return 0 }
+    *dstip = (*t).rst_rip[k]
+    (*t).ip_id = ((*t).ip_id +% 1) & 0xFFFF
+    wire.ip_build(buf, ((*t).ip_id & 0xFFFF) as u16, wire.IP_TCP,
+        (*t).rst_lip[k], (*t).rst_rip[k], wire.TCP_HDR)
+    let seg: *mut u8 = ((buf as u64) + wire.IP_HDR as u64) as *mut u8
+    wire.put16(seg, 0, (*t).rst_lport[k])
+    wire.put16(seg, 2, (*t).rst_rport[k])
+    wire.put32(seg, 4, (*t).rst_seq[k])
+    wire.put32(seg, 8, (*t).rst_ack[k])
+    wire.st8(seg, 12, 0x50 as u8)
+    wire.st8(seg, 13, (*t).rst_flags[k])
+    wire.put16(seg, 14, 0 as u16)
+    wire.put16(seg, 16, 0 as u16)
+    wire.put16(seg, 18, 0 as u16)
+    var acc: u64 = wire.pseudo_sum((*t).rst_lip[k], (*t).rst_rip[k], wire.IP_TCP, wire.TCP_HDR)
+    acc = acc + wire.sum16(seg, wire.TCP_HDR)
+    wire.put16(seg, 16, wire.fold(acc))
+    return total
+}
+
+fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u32) -> usize {
+    let c: *mut Tcb = tcb(t, i)
+    if (*c).used == 0 { return 0 }
+    var st: u32 = (*c).state
+    if st == S_LISTEN || st == S_CLOSED { return 0 }
+    *dstip = (*c).rip
+
+    if (*c).reset_req == 1 {
+        (*c).reset_req = 0
+        let n: usize = seg_build(t, c, buf, cap, wire.F_RST, (*c).snd_nxt, 0, false)
+        bump(t, ST_RST_TX)
+        clear(c)
+        return n
+    }
+
+    // ---- the retransmission timer, for every state that has one
+    if (*c).rt_on == 1 && now >= (*c).rt_at {
+        (*c).rt_shift = (*c).rt_shift +% 1
+        if (*c).rt_shift > MAX_SHIFT {
+            dead(t, c, E_TIMEOUT)
+            return 0
+        }
+        (*c).rto = (*c).rto * 2
+        if (*c).rto > RTO_MAX { (*c).rto = RTO_MAX }
+        (*c).rtt_on = 0 // Karn: no sample out of a retransmitted segment
+        let flight: u32 = (*c).snd_max -% (*c).snd_una
+        (*c).ssthresh = u32max(flight / 2, 2 * (*c).mss)
+        (*c).cwnd = (*c).mss
+        (*c).dupacks = 0
+        if (*t).no_rexmit == 1 {
+            // THE COUNTER-CHECK. The timer is switched off and nothing
+            // goes out again. Whatever was lost stays lost -- and the
+            // measurement that proves retransmission works has to
+            // collapse here, otherwise it was never measuring it.
+            (*c).rt_on = 0
+        } else {
+            (*c).snd_nxt = (*c).snd_una
+            (*c).fin_sent = 0
+            bump(t, ST_REXMIT)
+            arm_rt(t, c, now)
+        }
+        st = (*c).state
+    }
+
+    if st == S_SYN_SENT {
+        if (*c).snd_nxt == (*c).iss {
+            let n: usize = seg_build(t, c, buf, cap, wire.F_SYN, (*c).iss, 0, true)
+            if n == 0 { return 0 }
+            advance_nxt(c, (*c).iss +% 1)
+            start_rtt(c, (*c).iss, now)
+            arm_rt(t, c, now)
+            return n
+        }
+        return 0
+    }
+
+    if st == S_SYN_RECEIVED {
+        if (*c).snd_nxt == (*c).iss {
+            let n: usize = seg_build(t, c, buf, cap, wire.F_SYN | wire.F_ACK, (*c).iss, 0, true)
+            if n == 0 { return 0 }
+            advance_nxt(c, (*c).iss +% 1)
+            (*c).ack_now = 0
+            (*c).ack_on = 0
+            (*c).seg_since_ack = 0
+            start_rtt(c, (*c).iss, now)
+            arm_rt(t, c, now)
+            return n
+        }
+    }
+
+    if st == S_TIME_WAIT {
+        if (*c).ack_now == 1 {
+            (*c).ack_now = 0
+            return seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 0, false)
+        }
+        return 0
+    }
+
+    // ---- data
+    let wnd: u32 = u32min((*c).snd_wnd, (*c).cwnd)
+    let edge: u32 = (*c).snd_una +% wnd
+    var pending: u32 = 0
+    if wire.seq_lt((*c).snd_nxt, (*c).snd_end) { pending = (*c).snd_end -% (*c).snd_nxt }
+
+    // A window of zero and something left to send: without a probe both
+    // sides would wait for each other forever, because the window update
+    // that opens it again is a pure acknowledgement and pure
+    // acknowledgements are not retransmitted.
+    if (*c).snd_wnd == 0 && pending > 0 {
+        if (*c).persist_on == 0 {
+            (*c).persist_on = 1
+            (*c).persist_at = now + PERSIST_MIN
+        } else if now >= (*c).persist_at {
+            var d: u64 = ((*c).persist_at - now) + PERSIST_MIN
+            d = PERSIST_MIN * 2
+            if d > PERSIST_MAX { d = PERSIST_MAX }
+            (*c).persist_at = now + d
+            bump(t, ST_PROBE)
+            // One octet beyond the closed window. `snd_nxt` does NOT
+            // move -- the probe is allowed to be thrown away, and the
+            // sequence numbering must not depend on whether it was --
+            // but `snd_max` DOES, because the octet really went out. If
+            // it did not, a receiver that accepts the probe (because the
+            // window opened in the meantime) acknowledges an octet this
+            // side believes it never sent, the acknowledgement is
+            // refused as a forgery, the window update inside it is never
+            // read, and both sides wait for each other for ever. That
+            // deadlock is what this line is.
+            let pn: usize = seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 1, false)
+            if wire.seq_gt((*c).snd_nxt +% 1, (*c).snd_max) {
+                (*c).snd_max = (*c).snd_nxt +% 1
+            }
+            return pn
+        }
+    }
+
+    var can: u32 = 0
+    if wire.seq_lt((*c).snd_nxt, edge) && pending > 0 {
+        let allowed: u32 = edge -% (*c).snd_nxt
+        can = u32min(pending, allowed)
+        can = u32min(can, (*c).mss)
+    }
+
+    var send_now: bool = can > 0
+    if can > 0 && can < (*c).mss && (*c).nodelay == 0 {
+        // NAGLE. A small segment waits while something is still
+        // unacknowledged -- unless it is the last one and the connection
+        // is being closed, because then nothing will ever come after it
+        // to fill it up.
+        let unacked: bool = wire.seq_lt((*c).snd_una, (*c).snd_max)
+        let all: bool = ((*c).snd_nxt +% can) == (*c).snd_end
+        if unacked {
+            if !((*c).close_req == 1 && all) { send_now = false }
+        }
+    }
+
+    if send_now {
+        var flags: u8 = wire.F_ACK
+        let seq0: u32 = (*c).snd_nxt
+        let last: bool = (seq0 +% can) == (*c).snd_end
+        if last { flags = flags | wire.F_PSH }
+        var fin: bool = false
+        if last && (*c).close_req == 1 && (*c).fin_sent == 0
+        && wire.seq_lt(seq0 +% can, edge +% 1) {
+            flags = flags | wire.F_FIN
+            fin = true
+        }
+        let n: usize = seg_build(t, c, buf, cap, flags, seq0, can as usize, false)
+        if n == 0 { return 0 }
+        advance_nxt(c, seq0 +% can)
+        if fin {
+            (*c).fin_sent = 1
+            advance_nxt(c, (*c).snd_nxt +% 1)
+            advance_fin_state(t, c)
+        }
+        start_rtt(c, (*c).snd_nxt, now)
+        arm_rt(t, c, now)
+        (*c).ack_now = 0
+        (*c).ack_on = 0
+        (*c).seg_since_ack = 0
+        return n
+    }
+
+    // THE FIN WITH AN EMPTY SEND BUFFER.
+    //
+    // This is the cliff the first attempt at this round went over, and
+    // it is worth a paragraph. There, `close` set a flag and the send
+    // loop above was the only place that could put anything on the wire.
+    // With nothing left to send, that loop produces no segment -- so the
+    // FIN was never built, the peer never learned the connection was
+    // over, the state machine stood in ESTABLISHED for twenty thousand
+    // rounds and TIME_WAIT was never reached. The measurement said
+    // "state 4" and was perfectly right.
+    //
+    // The branch below is unconditional in exactly the way the bug was
+    // not: it does not care whether there was data, whether anything was
+    // acknowledged or which of the closing states we are in. If a close
+    // was asked for, everything queued has left, and no FIN is on the
+    // wire, a FIN goes out.
+    if (*c).close_req == 1 && (*c).fin_sent == 0 && (*c).snd_nxt == (*c).snd_end {
+        let n: usize = seg_build(t, c, buf, cap, wire.F_FIN | wire.F_ACK, (*c).snd_nxt, 0, false)
+        if n == 0 { return 0 }
+        (*c).fin_sent = 1
+        advance_nxt(c, (*c).snd_nxt +% 1)
+        advance_fin_state(t, c)
+        start_rtt(c, (*c).snd_nxt, now)
+        arm_rt(t, c, now)
+        (*c).ack_now = 0
+        (*c).ack_on = 0
+        (*c).seg_since_ack = 0
+        return n
+    }
+
+    // A pure acknowledgement, at once or after the delay has run out.
+    if (*c).ack_now == 1 || ((*c).ack_on == 1 && now >= (*c).ack_at) {
+        if (*c).ack_now == 0 { bump(t, ST_DELACK) }
+        (*c).ack_now = 0
+        (*c).ack_on = 0
+        (*c).seg_since_ack = 0
+        return seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 0, false)
+    }
+    return 0
+}
+
+fn tcp_pull(t: *mut Tcp, buf: *mut u8, cap: usize, now: u64, dstip: *mut u32) -> usize {
+    if (*t).rst_n > 0 {
+        let k: usize = (*t).rst_n - 1
+        (*t).rst_n = k
+        let n: usize = rst_build(t, buf, cap, k, dstip)
+        if n > 0 {
+            bump(t, ST_RST_TX)
+            bump(t, ST_TX)
+        }
+        return n
+    }
+    var k: usize = 0
+    while k < MAXCONN {
+        let i: usize = ((*t).turn + k) % MAXCONN
+        let n: usize = emit(t, i, buf, cap, now, dstip)
+        if n > 0 {
+            (*t).turn = (i + 1) % MAXCONN
+            bump(t, ST_TX)
+            return n
+        }
+        k = k + 1
+    }
+    return 0
+}

@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-2.0-only
+profile kernel
+
+// tools/k3net/kprobe.fi -- round K3: the stack in the kernel profile.
+//
+// The point of this file is what it CANNOT do. It declares `profile
+// kernel`, so the compiler holds every rule of SPEC 2 against it and
+// against everything it imports: no allocator, no `syscall`, no runtime.
+// If `lib/net/` had a single hidden allocation in it, this file would
+// not compile -- and that is a stronger statement than any comment in
+// the library, because the compiler does not read comments.
+//
+// It really USES the stack rather than only naming it: it sets one up in
+// memory it was handed, listens, builds an ARP request by hand, feeds it
+// in, takes the answer out again and reads a checksum off it. So the
+// object file has to contain the whole library, and `nm` can say so.
+//
+// The memory comes from outside. A kernel points this at a physical
+// page; `tools/k3net/run.sh` only compiles the file and never runs it,
+// which is why the address below is a plain number.
+
+import net.wire
+import net.tcp
+import net.stack
+
+export { knet, kmain }
+
+fn knet(mem: u64) -> u64 {
+    let s: *mut stack.Stack = mem as *mut stack.Stack
+    var mac: [u8; 6] = [0 as u8; 6]
+    mac[0] = 2 as u8
+    mac[5] = 7 as u8
+    let ip: u32 = wire.ip4(10 as u8, 7 as u8, 0 as u8, 2 as u8)
+    let mask: u32 = wire.ip4(255 as u8, 255 as u8, 255 as u8, 0 as u8)
+    stack.net_init(s, ip, mask, 0, &mac[0], 5150)
+    let l: i32 = stack.net_listen(s, 80 as u16)
+    if l < 0 { return 1 }
+
+    // An ARP request for our own address, built here and pushed in.
+    var frame: [u8; 64] = [0 as u8; 64]
+    var peer: [u8; 6] = [0 as u8; 6]
+    var zero: [u8; 6] = [0 as u8; 6]
+    var bcast: [u8; 6] = [0 as u8; 6]
+    peer[0] = 2 as u8
+    peer[5] = 8 as u8
+    wire.mac_broadcast(&bcast[0])
+    wire.eth_build(&frame[0], &bcast[0], &peer[0], wire.ETYPE_ARP)
+    wire.arp_build(&frame[wire.ETH_HDR], wire.ARP_REQUEST, &peer[0],
+        wire.ip4(10 as u8, 7 as u8, 0 as u8, 1 as u8), &zero[0], ip)
+    stack.net_input(s, &frame[0], wire.ETH_HDR + wire.ARP_LEN, 1000)
+    stack.net_poll(s, 1000)
+
+    var out: [u8; 128] = [0 as u8; 128]
+    let n: usize = stack.net_output(s, &out[0], 128, 1000)
+    if n == 0 { return 2 }
+    if wire.eth_type(&out[0]) != wire.ETYPE_ARP { return 3 }
+    if wire.arp_op(&out[wire.ETH_HDR]) != wire.ARP_REPLY { return 4 }
+    if !stack.net_arp_valid(s, wire.ip4(10 as u8, 7 as u8, 0 as u8, 1 as u8), 1000) {
+        return 5
+    }
+    // And one number that only comes out if the arithmetic layer is
+    // linked in as well.
+    let c: u16 = wire.checksum(&out[0], n)
+    let t: *mut tcp.Tcp = stack.net_tcp(s)
+    if tcp.tcp_seen(t) == 0 { return 6 }
+    return (c as u64) & 0xFFFF
+}
+
+fn kmain() -> i32 {
+    return (knet(0x400000) & 0xFF) as i32
+}

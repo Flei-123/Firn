@@ -1,0 +1,247 @@
+// expect_exit: 0
+// tests/914_css_cascade.fi -- cascade, inheritance and computed values.
+//
+// The three origins are driven here in ONE program, so that the reversal
+// by `!important` is part of test.sh:
+//
+//   1. author beats user agent, specificity beats the order
+//   2. `!important` turns the order of the origins around:
+//      user !important beats author !important beats author
+//   3. inheritance: colour and font size come from the parent, the box
+//      properties do not
+//   4. computed values: `%` of the font size refers to the PARENT, `em`
+//      to the element itself, `rem` to the root
+//   5. the shorthand `margin: a b` becomes four longhands, and a later
+//      `margin-left` beats only the left one
+//
+// The return value names the first case that deviates (1..5).
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+
+const SOURCE_LEN: usize = 48
+const UA_LEN: usize = 53
+const USER_LEN: usize = 25
+const AUTHOR_LEN: usize = 118
+
+#[no_gc]
+fn source(out: *mut mem.Buf) {
+    var t: [u8; 48] = "<div id=\"a\"><p class=\"y\">one</p><p>two</p></div>"
+    mem.buf_clear(out)
+    var i: usize = 0
+    while i < SOURCE_LEN {
+        mem.buf_push(out, t[i])
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn ua_sheet(out: *mut mem.CpBuf) {
+    var t: [u8; 53] = "p{color:blue;display:block;margin:8px;font-size:12px}"
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < UA_LEN {
+        mem.cp_push(out, t[i] as u32)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn user_sheet(out: *mut mem.CpBuf) {
+    var t: [u8; 25] = "p{color:green !important}"
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < USER_LEN {
+        mem.cp_push(out, t[i] as u32)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn author_sheet(out: *mut mem.CpBuf) {
+    var t: [u8; 118] = "p{color:red;font-size:150%;margin:1em 2em}.y{color:orange;margin-left:3px}#a{color:teal;font-size:20px}p{color:purple}"
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < AUTHOR_LEN {
+        mem.cp_push(out, t[i] as u32)
+        i = i + 1
+    }
+}
+
+fn next_in_order(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+fn parse_sheet(text: *mut mem.CpBuf, t: *mut tok.Tokens) -> AllocError!Gc[Cv] {
+    tok.tokenize(t, text)
+    var p: cv.Parser = cv.parser_new(t)
+    return try cv.parse_stylesheet(&p)
+}
+
+fn chain_last(r: Gc[Rule]) -> Gc[Rule] {
+    var x: Gc[Rule] = r
+    while x != gc_null[Rule]() && x.next != gc_null[Rule]() {
+        x = x.next
+    }
+    return x
+}
+
+fn add_sheet(head: Gc[Rule], sheet: Gc[Cv], origin: u32, order: *mut u32,
+    nm: *mut names.Names, tmp: *mut mem.CpBuf) -> AllocError!Gc[Rule] {
+    var next_order: u32 = *order
+    let part = try cascade.collect_rules(sheet, origin, next_order, nm, tmp, &next_order)
+    *order = next_order
+    if part == gc_null[Rule]() {
+        return head
+    }
+    if head == gc_null[Rule]() {
+        return part
+    }
+    let last: Gc[Rule] = chain_last(head)
+    last.next = part
+    return head
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    var src: mem.Buf = mem.buf_new()
+    mem.buf_init(&src)
+    source(&src)
+    driver.run_text_out_bytes(&run, mem.buf_ptr(&src), mem.buf_len(&src))
+    if driver.run_document_build(&run) != 0 as u32 {
+        return 92
+    }
+    let doc: Gc[Document] = driver.run_document(&run)
+    let nm: *mut names.Names = driver.run_names(&run)
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var text: mem.CpBuf = mem.cp_new()
+    var tmp: mem.CpBuf = mem.cp_new()
+    var cx: sel.Ctx = sel.ctx_new(nm)
+    sel.ctx_init(&cx)
+    var w: cascade.Winner = cascade.winner_new()
+
+    var rules: Gc[Rule] = gc_null[Rule]()
+    var order: u32 = 0
+    ua_sheet(&text)
+    let ua = parse_sheet(&text, &t) catch gc_null[Cv]()
+    rules = add_sheet(rules, ua, cascade.ORIGIN_UA, &order, nm, &tmp) catch gc_null[Rule]()
+    user_sheet(&text)
+    let user = parse_sheet(&text, &t) catch gc_null[Cv]()
+    rules = add_sheet(rules, user, cascade.ORIGIN_USER, &order, nm, &tmp) catch gc_null[Rule]()
+    author_sheet(&text)
+    let author = parse_sheet(&text, &t) catch gc_null[Cv]()
+    rules = add_sheet(rules, author, cascade.ORIGIN_AUTHOR, &order, nm, &tmp)
+    catch gc_null[Rule]()
+    if cascade.rules_count(rules) != 6 as u32 {
+        return 1
+    }
+
+    // The elements: 0 html  1 head  2 body  3 div#a  4 p.y  5 p
+    let styles = gcmap_new(true, true) catch gc_null[GcMap]()
+    let root_style = cascade.style_root() catch gc_null[Style]()
+    var k: Gc[Node] = doc
+    var idx: u64 = 0
+    var div_style: Gc[Style] = gc_null[Style]()
+    var p1_style: Gc[Style] = gc_null[Style]()
+    var p2_style: Gc[Style] = gc_null[Style]()
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            var parent_style: Gc[Style] = root_style
+            let parent: Gc[Node] = k.parent
+            if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                let found: Gc[Style] = gcmap_get_value[Style](styles, parent as u64)
+                if found != gc_null[Style]() {
+                    parent_style = found
+                }
+            }
+            let s = cascade.cascade_elem(rules, k, parent_style, &cx, &w)
+            catch gc_null[Style]()
+            if s == gc_null[Style]() {
+                return 93
+            }
+            let ok: bool = gcmap_set_value[Style](styles, k as u64, s) catch false
+            if idx == 3 {
+                div_style = s
+            }
+            if idx == 4 {
+                p1_style = s
+            }
+            if idx == 5 {
+                p2_style = s
+            }
+            idx = idx + 1
+        }
+        k = next_in_order(k, doc)
+    }
+
+    // 1. the author beats the user agent; `#a` beats `p` for the div
+    if cascade.style_color(div_style, 0) != 0xFF008080 {
+        return 1
+    }
+    if cascade.style_font_size(div_style) != 20.0 {
+        return 1
+    }
+
+    // 2. `!important` in the user stylesheet beats everything of the author
+    if cascade.style_color(p1_style, 0) != 0xFF008000 {
+        return 2
+    }
+    if cascade.style_color(p2_style, 0) != 0xFF008000 {
+        return 2
+    }
+
+    // 3. inheritance: the font size of the p comes from `150%` of the div
+    if cascade.style_font_size(p1_style) != 30.0 {
+        return 3
+    }
+    // display is not inherited: the div has no rule for it
+    if cascade.style_display(div_style) != cascade.D_INLINE {
+        return 3
+    }
+    if cascade.style_display(p1_style) != cascade.D_BLOCK {
+        return 3
+    }
+
+    // 4. `1em 2em` of the p refers to ITS font size (30 px)
+    if cascade.style_length(p2_style, 0) != 30.0 {
+        return 4
+    }
+    if cascade.style_length(p2_style, 1) != 60.0 {
+        return 4
+    }
+
+    // 5. the later `margin-left: 3px` of `.y` beats only the left value
+    if cascade.style_length(p1_style, 3) != 3.0 {
+        return 5
+    }
+    if cascade.style_length(p1_style, 0) != 30.0 {
+        return 5
+    }
+    if cascade.style_length(p2_style, 3) != 60.0 {
+        return 5
+    }
+    tok.tokens_free(&t)
+    return 0
+}

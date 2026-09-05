@@ -1,0 +1,232 @@
+// expect_exit: 0
+// tests/1611_deflate.fi -- ROUND 81: `lib/std/deflate.fi` inside one
+// process.
+//
+// The real proof of this library is `tools/stdlib81/run.sh`, where zlib,
+// gzip and gunzip judge the streams -- two ends that this repository wrote
+// can be wrong in the same way and agree perfectly. What is checked HERE is
+// the part that does not need a second implementation, and it is checked in
+// all three build stages:
+//
+//   A  THE CHECKSUMS against their published values. Adler-32 and CRC-32 of
+//      "123456789" are written down in RFC 1950 and in every CRC catalogue:
+//      0x091E01DE and 0xCBF43926. If those are wrong, every frame this file
+//      writes is refused by everybody, and the round trip below would still
+//      pass.
+//   B  THE ROUND TRIP over the cases that break compressors: the EMPTY
+//      input (a stream with no data still needs a block), ONE octet, 64 KiB
+//      of ONE repeated octet (maximum match length, and the copy loop that
+//      reads octets it has just written), data with LONG matches at a
+//      distance of exactly 1, and pseudo random data that cannot be
+//      compressed at all.
+//   C  INCOMPRESSIBLE DATA MUST NOT RUN AWAY. 100,000 random octets may
+//      cost at most a few hundred more than they are -- that is what the
+//      stored block is for, and a compressor without it doubles them.
+//   D  A DISTANCE THAT REACHES BEFORE THE BEGINNING has to be REFUSED, not
+//      read out of whatever lies in front of the buffer. Same for a
+//      truncated stream and a wrong Adler-32. Without these three the whole
+//      test would pass with a decompressor that accepts anything.
+//   E  THE FRAMES: a zlib header that is not a multiple of 31 is refused, a
+//      gzip magic that is not 1f 8b is refused, and a gzip stream whose
+//      ISIZE lies is refused.
+import std.deflate
+import std.rt
+import std.io
+
+fn fill_pattern(b: *mut rt.Buf, n: usize, kind: usize) {
+    var x: u64 = 12345
+    var i: usize = 0
+    while i < n {
+        if kind == 0 {
+            rt.buf_push(b, 97 as u8) // one repeated octet
+        } else if kind == 1 {
+            // random -- incompressible
+            // ROUND 83: modulo 2^64 on purpose (SPEC 13, item L9).
+            x = x *% 6364136223846793005 +% 1442695040888963407
+            rt.buf_push(b, ((x >> 33) & 255) as u8)
+        } else {
+            // text-like: a small alphabet with long repetitions
+            rt.buf_push(b, (65 + (i / 97) % 5) as u8)
+        }
+        i = i + 1
+    }
+}
+
+fn same(a: *mut rt.Buf, b: *mut rt.Buf) -> bool {
+    if rt.buf_len(a) != rt.buf_len(b) {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(a), rt.buf_ptr(b), rt.buf_len(a))
+}
+
+// One round trip through all three frames and four levels.
+fn roundtrip(src: *mut rt.Buf, level: usize) -> i32 {
+    var packed: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&packed)
+    var back: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&back)
+
+    // raw
+    let n1: usize = deflate.deflate(rt.buf_ptr(src), rt.buf_len(src), level,
+        &packed) catch 0
+    if n1 == 0 && rt.buf_len(src) > 0 {
+        return 1
+    }
+    let m1: usize = deflate.inflate(rt.buf_ptr(&packed), rt.buf_len(&packed),
+        &back) catch 0
+    if m1 != rt.buf_len(src) || !same(src, &back) {
+        return 2
+    }
+
+    // zlib
+    rt.buf_clear(&packed)
+    rt.buf_clear(&back)
+    deflate.zlib_compress(rt.buf_ptr(src), rt.buf_len(src), level, &packed)
+    catch 0
+    let m2: usize = deflate.zlib_decompress(rt.buf_ptr(&packed),
+        rt.buf_len(&packed), &back) catch 18446744073709551615 as usize
+    if m2 != rt.buf_len(src) || !same(src, &back) {
+        return 3
+    }
+
+    // gzip
+    rt.buf_clear(&packed)
+    rt.buf_clear(&back)
+    deflate.gzip_compress(rt.buf_ptr(src), rt.buf_len(src), level, &packed)
+    catch 0
+    let m3: usize = deflate.gzip_decompress(rt.buf_ptr(&packed),
+        rt.buf_len(&packed), &back) catch 18446744073709551615 as usize
+    if m3 != rt.buf_len(src) || !same(src, &back) {
+        return 4
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    // --- A: the published checksums
+    var digits: [u8; 10] = "123456789\0"
+    if deflate.adler32((&digits[0]) as u64, 9) != 152961502 as u32 {
+        return 10 // 0x091E01DE
+    }
+    if deflate.crc32((&digits[0]) as u64, 9) != 3421780262 as u32 {
+        return 11 // 0xCBF43926
+    }
+    // the empty input: Adler starts at 1, CRC at 0
+    if deflate.adler32((&digits[0]) as u64, 0) != 1 as u32 {
+        return 12
+    }
+    if deflate.crc32((&digits[0]) as u64, 0) != 0 as u32 {
+        return 13
+    }
+
+    // --- B: the round trip over the awkward inputs
+    var kinds: [usize; 3] = [0, 1, 2]
+    var sizes: [usize; 5] = [0, 1, 100, 5000, 70000]
+    var ki: usize = 0
+    while ki < 3 {
+        var si: usize = 0
+        while si < 5 {
+            var src: rt.Buf = rt.buf_new()
+            fill_pattern(&src, sizes[si], kinds[ki])
+            var lv: usize = 0
+            while lv <= 9 {
+                let rc: i32 = roundtrip(&src, lv)
+                if rc != 0 {
+                    rt.buf_free(&src)
+                    return 20 + rc
+                }
+                lv = lv + 3
+            }
+            rt.buf_free(&src)
+            si = si + 1
+        }
+        ki = ki + 1
+    }
+
+    // --- C: incompressible data must not run away
+    var noise: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&noise)
+    fill_pattern(&noise, 100000, 1)
+    var packed: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&packed)
+    deflate.zlib_compress(rt.buf_ptr(&noise), 100000, 6, &packed) catch 0
+    if rt.buf_len(&packed) > 100400 {
+        return 30 // the stored block did not win
+    }
+
+    // --- D: broken streams have to be REFUSED
+    var back: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&back)
+    let bad_trunc: usize = deflate.zlib_decompress(rt.buf_ptr(&packed), 10,
+        &back) catch 18446744073709551615 as usize
+    if bad_trunc != 18446744073709551615 as usize {
+        return 31
+    }
+    // a wrong Adler-32: flip the last octet
+    rt.buf_clear(&back)
+    var broken: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&broken)
+    var text: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&text)
+    fill_pattern(&text, 3000, 2)
+    deflate.zlib_compress(rt.buf_ptr(&text), 3000, 6, &broken) catch 0
+    let last: usize = rt.buf_len(&broken) - 1
+    rt.st8(rt.buf_ptr(&broken), last, rt.ld8(rt.buf_ptr(&broken), last) ^ 255 as u8)
+    let bad_adler: usize = deflate.zlib_decompress(rt.buf_ptr(&broken),
+        rt.buf_len(&broken), &back) catch 18446744073709551615 as usize
+    if bad_adler != 18446744073709551615 as usize {
+        return 32
+    }
+    // a header that is not zlib
+    rt.buf_clear(&back)
+    var junk: [u8; 8] = [0; 8]
+    let bad_head: usize = deflate.zlib_decompress((&junk[0]) as u64, 8, &back)
+    catch 18446744073709551615 as usize
+    if bad_head != 18446744073709551615 as usize {
+        return 33
+    }
+    // A raw stream with a distance that reaches IN FRONT OF the output.
+    // Built by hand, bit for bit, because no compressor produces one:
+    // header 1 + 01 (final, fixed code), the literal 'A' (fixed code 0x71,
+    // 8 bits), length symbol 257 (7 bits, length 3), distance code 3
+    // (5 bits) = distance 4 -- with exactly ONE octet of output so far.
+    // Packed least significant bit first that is 0x73 0x04 0x62, and
+    // `python3 zlib` says "invalid distance too far back" to it.
+    rt.buf_clear(&back)
+    var evil: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&evil)
+    rt.buf_push(&evil, 115 as u8)
+    rt.buf_push(&evil, 4 as u8)
+    rt.buf_push(&evil, 98 as u8)
+    let bad_dist: usize = deflate.inflate(rt.buf_ptr(&evil), rt.buf_len(&evil),
+        &back) catch 18446744073709551615 as usize
+    if bad_dist != 18446744073709551615 as usize {
+        return 34
+    }
+
+    // --- E: the gzip frame
+    rt.buf_clear(&back)
+    var gz: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&gz)
+    deflate.gzip_compress(rt.buf_ptr(&text), 3000, 6, &gz) catch 0
+    // a lying ISIZE
+    let isize_at: usize = rt.buf_len(&gz) - 4
+    rt.st8(rt.buf_ptr(&gz), isize_at, rt.ld8(rt.buf_ptr(&gz), isize_at) ^ 1 as u8)
+    let bad_isize: usize = deflate.gzip_decompress(rt.buf_ptr(&gz),
+        rt.buf_len(&gz), &back) catch 18446744073709551615 as usize
+    if bad_isize != 18446744073709551615 as usize {
+        return 40
+    }
+    // a wrong magic
+    rt.st8(rt.buf_ptr(&gz), 0, 32 as u8)
+    rt.buf_clear(&back)
+    let bad_magic: usize = deflate.gzip_decompress(rt.buf_ptr(&gz),
+        rt.buf_len(&gz), &back) catch 18446744073709551615 as usize
+    if bad_magic != 18446744073709551615 as usize {
+        return 41
+    }
+
+    var out: [u8; 11] = "deflate ok\0"
+    io.print_line_bytes((&out[0]) as u64, 10)
+    return 0
+}

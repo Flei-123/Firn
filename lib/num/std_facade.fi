@@ -1,0 +1,297 @@
+// lib/num/std_facade.fi -- number <-> text for the std facade (round 42).
+//
+// ONLY for `lib/std/num.fi`: included exclusively by
+// `tools/strlib/src/std_num.fi`. lib/num (bignum/dtoa/strtod) stays
+// unchanged; whoever uses the include library without std gets not one
+// byte more code.
+//
+// ONE RULE FOR THE DIRECTION, readable off every name:
+//   * `write_*` takes a number and APPENDS its text to a `*mut Bytes`.
+//     It never clears -- several calls build up one line.
+//   * `read_*` takes text and delivers the number. The return value is the
+//     number of octets USED UP (0 = there was no number there); the value
+//     itself comes back through an output pointer. That lets the caller
+//     read on where the number ends -- every parser needs that.
+//   * `text_to_*` is the strict form: the WHOLE text has to be the number,
+//     otherwise `false`. That is what you want when evaluating an argument.
+//
+// OVERFLOW IS REPORTED, not hushed up: the `read_*` forms carry an
+// `overflow` output pointer, and the `text_to_*` forms then return
+// `false`. In stage 0 Firn has no overflow check in its arithmetic
+// (SPEC 14.1.3) -- when reading foreign input a silent wraparound would be
+// a security hole, not a cosmetic flaw.
+//
+// Floating point runs through the exact cores this module already has:
+// `dtoa` (the shortest text that reads back) and `strtod` (correctly
+// rounded). All that is new is the wrapper around them: since round 30
+// `f64` really exists, so the facade takes and returns `f64` instead of bit
+// patterns. The bit pattern forms remain alongside.
+
+// ------------------------------------------------------------------ Limits
+//
+// As functions, because `const` in stage 0 is evaluated as an integer (i64)
+// and 2^64-1 is not representable there.
+
+// ROUND 73: the reading half (digit tests, `read_*`, `text_to_*`, the bit
+// pattern helpers of f64) moved to `lib/num/core_facade.fi` -- it needs no
+// allocator and no system call and is therefore usable in the kernel
+// profile. It is included here, so that `std.num` keeps offering
+// everything it offered before.
+//#include lib/num/core_facade.fi
+
+// Unsigned in any base 2..36, without a prefix.
+// `big` selects A-Z instead of a-z.
+fn write_base(out: *mut Bytes, v: u64, base: u32, big: bool) {
+    if base < 2 || base > 36 {
+        return
+    }
+    if v == 0 {
+        bytes_push(out, 48 as u8)
+        return
+    }
+    let b: u64 = base as u64
+    var d: [u8; 64] = [0 as u8; 64]
+    var n: usize = 0
+    var x: u64 = v
+    while x > 0 {
+        let z: u64 = x % b
+        if z < 10 {
+            d[n] = z as u8 + 48 as u8
+        } else if big {
+            d[n] = z as u8 + 55 as u8
+        } else {
+            d[n] = z as u8 + 87 as u8
+        }
+        x = x / b
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        bytes_push(out, d[n])
+    }
+}
+
+fn write_u64(out: *mut Bytes, v: u64) {
+    write_base(out, v, 10, false)
+}
+
+// Signed. At the edge (i64::MIN) the magnitude does not fit in i64 -- `0 - v`
+// would wrap around there.
+fn write_i64(out: *mut Bytes, v: i64) {
+    if v < 0 {
+        bytes_push(out, 45 as u8)
+        write_base(out, (0 - (v + 1)) as u64 + 1, 10, false)
+        return
+    }
+    write_base(out, v as u64, 10, false)
+}
+
+// Hexadecimal, at least `min` digits (padded with zeros on the left).
+// No "0x" -- whoever wants it writes it in front; that keeps the function
+// usable in both worlds.
+fn write_hex(out: *mut Bytes, v: u64, min: usize) {
+    let z: usize = digit_count(v, 16)
+    var i: usize = z
+    while i < min {
+        bytes_push(out, 48 as u8)
+        i = i + 1
+    }
+    write_base(out, v, 16, false)
+}
+
+fn write_hex_big(out: *mut Bytes, v: u64, min: usize) {
+    let z: usize = digit_count(v, 16)
+    var i: usize = z
+    while i < min {
+        bytes_push(out, 48 as u8)
+        i = i + 1
+    }
+    write_base(out, v, 16, true)
+}
+
+fn write_binary(out: *mut Bytes, v: u64, min: usize) {
+    let z: usize = digit_count(v, 2)
+    var i: usize = z
+    while i < min {
+        bytes_push(out, 48 as u8)
+        i = i + 1
+    }
+    write_base(out, v, 2, false)
+}
+
+fn write_octal(out: *mut Bytes, v: u64, min: usize) {
+    let z: usize = digit_count(v, 8)
+    var i: usize = z
+    while i < min {
+        bytes_push(out, 48 as u8)
+        i = i + 1
+    }
+    write_base(out, v, 8, false)
+}
+
+// Right aligned to `width`, padded on the left with `filler`. Longer numbers
+// are NOT truncated -- a shortened number would be a wrong number.
+fn write_wide_u64(out: *mut Bytes, v: u64, width: usize, filler: u8) {
+    let z: usize = digit_count(v, 10)
+    var i: usize = z
+    while i < width {
+        bytes_push(out, filler)
+        i = i + 1
+    }
+    write_base(out, v, 10, false)
+}
+
+fn write_wide_i64(out: *mut Bytes, v: i64, width: usize, filler: u8) {
+    var abs: u64 = v as u64
+    var z: usize = 0
+    if v < 0 {
+        abs = (0 - (v + 1)) as u64 + 1
+        z = 1
+    }
+    z = z + digit_count(abs, 10)
+    var i: usize = z
+    while i < width {
+        bytes_push(out, filler)
+        i = i + 1
+    }
+    write_i64(out, v)
+}
+
+fn dtoa_work_bytes() -> usize {
+    return DTOA_WS_BYTES
+}
+
+// The bit pattern as the shortest decimal text that reads back, APPENDED.
+// `dtoa` itself clears its target -- that is why the way leads through a
+// short intermediate buffer. Return value false = out of memory.
+//
+// THE COST, honestly: one `mmap` for the scratch memory (14 KiB) and one for
+// the intermediate buffer per call. Whoever writes many numbers calls `dtoa`
+// directly with scratch memory of their own -- the facade is the convenient
+// form, not the fast one.
+fn write_f64_bits(out: *mut Bytes, bits: u64) -> bool {
+    let ws: *mut u8 = heap_alloc(DTOA_WS_BYTES)
+    if (ws as usize) == 0 {
+        return false
+    }
+    var between: Bytes = Bytes { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    dtoa(bits, &between, ws)
+    bytes_append(out, between.ptr, between.len)
+    bytes_free(&between)
+    heap_free(ws, DTOA_WS_BYTES)
+    return true
+}
+
+fn write_f64(out: *mut Bytes, x: f64) -> bool {
+    return write_f64_bits(out, f64_bits(x))
+}
+
+// ROUND 73: the four forms below fetch the scratch memory of `strtod` with
+// `mmap` and are thereby the CONVENIENT ones. They compute nothing
+// themselves any more -- they hand the memory to the `_at` forms out of
+// `lib/num/core_facade.fi`, which also serve the kernel. One core, two
+// front doors.
+
+fn read_f64_bits(p: *mut u8, n: usize, out: *mut u64) -> usize {
+    *out = 0
+    // ROUND 87: the short way of `strtod` needs no workspace at all. Only
+    // when it declines does the 12 KiB come from the operating system --
+    // before this, EVERY number paid for that mmap/munmap pair, and in a
+    // document full of floats that was the larger half of the cost.
+    var zs: usize = 0
+    if strtod_short(p, n, &zs, false, out) {
+        return zs
+    }
+    let ws: *mut u8 = heap_alloc(STRTOD_WS_BYTES)
+    if (ws as usize) == 0 {
+        return 0
+    }
+    let z: usize = read_f64_bits_at(p, n, ws, out)
+    heap_free(ws, STRTOD_WS_BYTES)
+    return z
+}
+
+fn read_f64(p: *mut u8, n: usize, out: *mut f64) -> usize {
+    var bits: u64 = 0
+    let z: usize = read_f64_bits(p, n, &bits)
+    *out = bits_f64(bits)
+    return z
+}
+
+fn text_to_f64(p: *mut u8, n: usize, out: *mut f64) -> bool {
+    let z: usize = read_f64(p, n, out)
+    return z == n && z > 0
+}
+
+fn text_to_f64_bits(p: *mut u8, n: usize, out: *mut u64) -> bool {
+    let z: usize = read_f64_bits(p, n, out)
+    return z == n && z > 0
+}
+
+// ---------------------------------------------------------- ROUND 71: f32
+//
+// The same two directions for a binary32. Writing goes through `ftoa32`
+// (lib/num/f32_text.fi): the shortest text that reads back as the same FOUR
+// octets -- not the shortest text of the double next to it. Reading goes
+// through the same correctly rounded `strtod` and one narrowing.
+//
+// The cost is the same as with `write_f64_bits`, plus the scratch memory of
+// `strtod`: `ftoa32` reads its own candidates back, and that is exactly what
+// makes the result trustworthy.
+
+#[allow_fp]
+fn write_f32_bits(out: *mut Bytes, bits: u32) -> bool {
+    let ws: *mut u8 = heap_alloc(DTOA_WS_BYTES)
+    if (ws as usize) == 0 {
+        return false
+    }
+    let sws: *mut u8 = heap_alloc(STRTOD_WS_BYTES)
+    if (sws as usize) == 0 {
+        heap_free(ws, DTOA_WS_BYTES)
+        return false
+    }
+    var between: Bytes = Bytes { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    ftoa32(bits, &between, ws, sws)
+    bytes_append(out, between.ptr, between.len)
+    bytes_free(&between)
+    heap_free(sws, STRTOD_WS_BYTES)
+    heap_free(ws, DTOA_WS_BYTES)
+    return true
+}
+
+#[allow_fp]
+fn write_f32(out: *mut Bytes, x: f32) -> bool {
+    return write_f32_bits(out, f32_bits(x))
+}
+
+#[allow_fp]
+fn read_f32(p: *mut u8, n: usize, out: *mut f32) -> usize {
+    *out = 0.0
+    let ws: *mut u8 = heap_alloc(STRTOD_WS_BYTES)
+    if (ws as usize) == 0 {
+        return 0
+    }
+    let z: usize = read_f32_at(p, n, ws, out)
+    heap_free(ws, STRTOD_WS_BYTES)
+    return z
+}
+
+#[allow_fp]
+fn read_f32_bits(p: *mut u8, n: usize, out: *mut u32) -> usize {
+    var x: f32 = 0.0
+    let z: usize = read_f32(p, n, &x)
+    *out = f32_bits(x)
+    return z
+}
+
+#[allow_fp]
+fn text_to_f32(p: *mut u8, n: usize, out: *mut f32) -> bool {
+    let z: usize = read_f32(p, n, out)
+    return z == n && z > 0
+}
+
+#[allow_fp]
+fn text_to_f32_bits(p: *mut u8, n: usize, out: *mut u32) -> bool {
+    let z: usize = read_f32_bits(p, n, out)
+    return z == n && z > 0
+}

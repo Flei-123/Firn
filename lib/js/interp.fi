@@ -1,0 +1,4712 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/interp.fi -- the INTERPRETER (ECMA-262 clauses 7, 9, 10, 13, 14).
+//
+// A tree walker over the columnar syntax tree of `lib/js/ast.fi`. What
+// makes it an ECMAScript interpreter rather than a calculator is in here:
+//
+//   * EXECUTION CONTEXTS AND SCOPE CHAINS. Every function call creates an
+//     environment record (`val.Env`); a closure keeps its defining
+//     environment, which is why the collector sees exactly the cycle the
+//     round asks about -- object -> function -> environment -> object.
+//   * `this`. Not a variable: an arrow function has none of its own and
+//     looks up the chain (10.2.1.3), an ordinary sloppy function gets the
+//     global object when it is called with `undefined`, a strict one does
+//     not.
+//   * PROTOTYPE CHAINS with property attributes, getters and setters. A
+//     property is a `Prop` with writable/enumerable/configurable, not a
+//     bare value.
+//   * THE COERCIONS of clause 7, `==` in its full ugliness included
+//     (7.2.15): null == undefined but not null == 0, a string against a
+//     number goes through ToNumber, an object through ToPrimitive.
+//   * EXCEPTIONS. Firn has error unions, not unwinding, so a completion
+//     record is carried explicitly: `ctx.comp` says normal / throw /
+//     return / break / continue, the VALUE lies in `realm.pending` -- in
+//     the GC heap, because a thrown object has to stay alive.
+//
+// `AllocError!` is the OTHER error channel and stays separate: it means the
+// heap is exhausted, not that the program threw. Whoever mixes the two
+// gets an out of memory that a `catch` block swallows.
+import html.mem
+import std.math
+import std.num
+import js.lex
+import js.ast
+import js.val
+import js.bigint
+
+export {
+    js_pow_pub, f64_to_uint16,
+    Ctx, ctx_new, ctx_init,
+    C_NORMAL, C_THROW, C_RETURN, C_BREAK, C_CONTINUE,
+    ctx_of, throw_error, throw_value, ERR_TYPE, ERR_RANGE, ERR_SYNTAX,
+    ERR_REFERENCE, ERR_EVAL, ERR_URI, ERR_PLAIN,
+    to_boolean, to_number, to_numeric_string, to_string, to_primitive,
+    ordinary_to_primitive,
+    to_object, to_property_key, to_int32, to_uint32, to_integer,
+    to_length, to_index,
+    strict_equals, loose_equals, same_value, same_value_zero,
+    number_to_string, string_to_number,
+    get_prop, get_prop_v, set_prop, has_prop, delete_prop,
+    define_own, define_value, define_accessor,
+    call_function, construct, construct_nt, call_method,
+    make_function, make_native, native_arity,
+    run_program, eval_node, hoist_declarations,
+    args_new, args_at, args_count,
+    make_error, error_message,
+    js_typeof, is_array, throw_type_here, instance_of_ordinary,
+    add_values, compare_values,
+    iterate_values,
+    // Round 66: what lib/js/gen.fi (the resumable evaluator) needs.
+    eval_statements, hoist_one, hoist_names, bind_pattern,
+    bind_pattern_init, init_binding, copy_env, loop_take, enumerate_keys,
+    assign_member, assign_name, binary_op, compound_base, static_key,
+    name_anonymous, this_of, eval_member, eval_arguments, call_internal,
+    is_strict_env, to_primitive_pub, current_native, private_key,
+    init_instance_fields,
+    make_error_str, ERR_NONE_MARK,
+    ctx_host, ctx_set_host,
+    bigint_of_ast,
+}
+
+// A marker without a meaning of its own -- it keeps the export list of this
+// module stable when a round adds a name.
+const ERR_NONE_MARK: u64 = 0
+
+// The number of the `RegExp` constructor in the native table
+// (lib/js/regexp.fi, R_CTOR). A regular expression LITERAL is evaluated
+// through it, because this file must not import the pattern engine.
+const NATIVE_REGEXP_CTOR: u64 = 3400
+
+const C_NORMAL: u32 = 0
+const C_THROW: u32 = 1
+const C_RETURN: u32 = 2
+const C_BREAK: u32 = 3
+const C_CONTINUE: u32 = 4
+
+const ERR_TYPE: u64 = 0
+const ERR_RANGE: u64 = 1
+const ERR_SYNTAX: u64 = 2
+const ERR_REFERENCE: u64 = 3
+const ERR_EVAL: u64 = 4
+const ERR_URI: u64 = 5
+const ERR_PLAIN: u64 = 6
+
+struct Ctx {
+    comp: u32,
+    label: u32,
+    depth: u32,
+    max_depth: u32,
+    native: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal],
+    arity: fn(u64) -> u32,
+    // Round 66. A generator body is not run here but handed to the
+    // resumable evaluator; `lib/js/interp.fi` must not import it (the same
+    // reason the built ins are reached through a function value), so the
+    // driver installs the two entry points.
+    gen_start: fn(Gc[Realm], Gc[JsObj], Gc[Env]) -> AllocError!Gc[JsVal],
+    gen_native: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal],
+    gen_data: *mut u8,
+    // ROUND B4 -- the same construction once more, for the DOM. The
+    // bindings (lib/browser/domjs.fi) hold a state of their own -- the
+    // wrapper table, the listeners, the timers -- and this file must not
+    // import them either. The driver puts the pointer here; whoever
+    // installs no bindings leaves it at zero.
+    host: *mut u8,
+    // The native function object that is running right now. A built in
+    // that carries state (the resolve function of a promise, a reaction,
+    // the continuation of an await) has to know WHICH object it is; the
+    // handler reads it as its first act.
+    cur_fn: Gc[JsObj],
+}
+
+// Until the driver installs the real table (lib/js/builtin.fi), the two
+// hooks point at these. They exist because a function VALUE has no null.
+fn native_stub(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 28] = "no native table installed ye"
+    return throw_type_here(r, &m[0], 28)
+}
+
+fn arity_stub(id: u64) -> u32 {
+    return 0
+}
+
+fn ctx_new() -> Ctx {
+    return Ctx {
+        comp: C_NORMAL, label: 0, depth: 0, max_depth: 380,
+        native: native_stub, arity: arity_stub,
+        gen_start: gen_stub, gen_native: native_stub,
+        gen_data: 0 as *mut u8, host: 0 as *mut u8,
+        cur_fn: gc_null[JsObj](),
+    }
+}
+
+fn gen_stub(r: Gc[Realm], f: Gc[JsObj], env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 30] = "generators are not supported h"
+    return throw_type_here(r, &m[0], 30)
+}
+
+fn ctx_init(c: *mut Ctx) {
+    (*c).comp = C_NORMAL
+    (*c).label = 0
+    (*c).depth = 0
+    (*c).max_depth = 380
+}
+
+fn ctx_of(r: Gc[Realm]) -> *mut Ctx {
+    return val.realm_ctx(r) as *mut Ctx
+}
+
+// Round B4: the state of the host bindings, or 0 when there are none.
+fn ctx_host(r: Gc[Realm]) -> *mut u8 {
+    let c: *mut Ctx = ctx_of(r)
+    return (*c).host
+}
+
+fn ctx_set_host(r: Gc[Realm], p: *mut u8) {
+    let c: *mut Ctx = ctx_of(r)
+    (*c).host = p
+}
+
+// ------------------------------------------------------------- Exceptions
+
+fn throw_value(r: Gc[Realm], v: Gc[JsVal]) -> Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    (*c).comp = C_THROW
+    r.pending = v
+    return val.realm_undefined(r)
+}
+
+// A built in error with a message of ASCII octets.
+fn make_error(r: Gc[Realm], kind: u64, msg: *mut u8,
+    n: usize) -> AllocError!Gc[JsVal] {
+    var which: u64 = val.PROTO_ERROR
+    if kind == ERR_TYPE { which = val.PROTO_TYPE_ERROR }
+    if kind == ERR_RANGE { which = val.PROTO_RANGE_ERROR }
+    if kind == ERR_SYNTAX { which = val.PROTO_SYNTAX_ERROR }
+    if kind == ERR_REFERENCE { which = val.PROTO_REFERENCE_ERROR }
+    if kind == ERR_EVAL { which = val.PROTO_EVAL_ERROR }
+    if kind == ERR_URI { which = val.PROTO_URI_ERROR }
+    let o: Gc[JsObj] = try val.obj_new_proto(r, val.realm_proto(r, which))
+    o.cls = val.CLS_ERROR
+    if n > 0 {
+        let m: Gc[JsVal] = try val.str_from_ascii(r, msg, n)
+        let k: u64 = try val.key_for_name(r, lex.N_MESSAGE)
+        let ok: bool = try define_value(r, o, k, m,
+            val.A_WRITABLE | val.A_CONFIGURABLE)
+    }
+    let v: Gc[JsVal] = o
+    return v
+}
+
+fn throw_error(r: Gc[Realm], kind: u64, msg: *mut u8,
+    n: usize) -> AllocError!Gc[JsVal] {
+    let e: Gc[JsVal] = try make_error(r, kind, msg, n)
+    return throw_value(r, e)
+}
+
+fn throw_type_here(r: Gc[Realm], msg: *mut u8, n: usize) -> AllocError!Gc[JsVal] {
+    return throw_error(r, ERR_TYPE, msg, n)
+}
+
+fn error_message(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let o: Gc[JsObj] = val.as_obj(v)
+    if (o as u64) == 0 {
+        return to_string(r, v)
+    }
+    let k: u64 = try val.key_for_name(r, lex.N_MESSAGE)
+    let m: Gc[JsVal] = try get_prop(r, v, k)
+    return to_string(r, m)
+}
+
+// ============================================================ Conversions
+
+fn to_boolean(r: Gc[Realm], v: Gc[JsVal]) -> bool {
+    let t: u64 = val.val_tag(v)
+    if t == val.TAG_UNDEF || t == val.TAG_NULL || t == val.TAG_GAP {
+        return false
+    }
+    if t == val.TAG_BOOL {
+        return val.bool_value(v)
+    }
+    if t == val.TAG_NUM {
+        let x: f64 = val.num_value(v)
+        if math.is_nan(x) {
+            return false
+        }
+        return x != 0.0
+    }
+    if t == val.TAG_STR {
+        return val.str_len(v) != 0
+    }
+    if t == val.TAG_BIGINT {
+        return !bigint.bi_is_zero(v)
+    }
+    return true
+}
+
+// 7.1.1 ToPrimitive with the OrdinaryToPrimitive fallback.
+fn to_primitive(r: Gc[Realm], v: Gc[JsVal], hint: u32) -> AllocError!Gc[JsVal] {
+    if val.val_tag(v) != val.TAG_OBJ {
+        return v
+    }
+    let c: *mut Ctx = ctx_of(r)
+    let wk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_TOPRIMITIVE)
+    if (wk as u64) != 0 {
+        let k: u64 = val.key_for_symbol(wk)
+        let f: Gc[JsVal] = try get_prop(r, v, k)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if !val.is_nullish(f) {
+            if !val.is_callable(f) {
+                var m1: [u8; 32] = "Symbol.toPrimitive is not callab"
+                return throw_type_here(r, &m1[0], 32)
+            }
+            let args: Gc[GcVec] = try args_new(r)
+            var hs: Gc[JsVal] = val.realm_undefined(r)
+            if hint == 1 {
+                var t1: [u8; 6] = "string"
+                hs = try val.str_from_ascii(r, &t1[0], 6)
+            } else if hint == 2 {
+                var t2: [u8; 6] = "number"
+                hs = try val.str_from_ascii(r, &t2[0], 6)
+            } else {
+                var t3: [u8; 7] = "default"
+                hs = try val.str_from_ascii(r, &t3[0], 7)
+            }
+            let ok: bool = try gcvec_append[JsVal](args, hs)
+            let res: Gc[JsVal] = try call_function(r, f, v, args)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            if val.val_tag(res) != val.TAG_OBJ {
+                return res
+            }
+            var m2: [u8; 34] = "Symbol.toPrimitive returned an obj"
+            return throw_type_here(r, &m2[0], 34)
+        }
+    }
+    return ordinary_to_primitive(r, v, hint)
+}
+
+// 7.1.1.1 OrdinaryToPrimitive -- without the `Symbol.toPrimitive` step.
+// `Date.prototype[Symbol.toPrimitive]` needs exactly this half; going
+// through `to_primitive` again would call itself.
+fn ordinary_to_primitive(r: Gc[Realm], v: Gc[JsVal],
+    hint: u32) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    // valueOf then toString (number hint), the other way round for the
+    // string hint.
+    var first: u32 = lex.N_VALUEOF
+    var second: u32 = lex.N_TOSTRING
+    if hint == 1 {
+        first = lex.N_TOSTRING
+        second = lex.N_VALUEOF
+    }
+    var pass: u32 = 0
+    while pass < 2 {
+        var name: u32 = first
+        if pass == 1 as u32 {
+            name = second
+        }
+        let k: u64 = try val.key_for_name(r, name)
+        let f: Gc[JsVal] = try get_prop(r, v, k)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if val.is_callable(f) {
+            let args: Gc[GcVec] = try args_new(r)
+            let res: Gc[JsVal] = try call_function(r, f, v, args)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            if val.val_tag(res) != val.TAG_OBJ {
+                return res
+            }
+        }
+        pass = pass + 1 as u32
+    }
+    var m3: [u8; 38] = "Cannot convert object to primitive val"
+    return throw_type_here(r, &m3[0], 38)
+}
+
+// NOTE (docs/ROUND63.md, gap 2): an error union over `f64` -- `E!f64` --
+// returns a WRONG value in stage 0 (proof: tests/1004_js_f64_union.fi).
+// Every conversion that can fail therefore hands back the BIT PATTERN as a
+// `u64`, exactly as `lib/num/strtod.fi` does, and the caller unpacks it.
+fn to_number(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
+    if val.is_bigint(v) {
+        let x: Gc[JsVal] = try bigint_mix_error(r)
+        return 0
+    }
+    let t: u64 = val.val_tag(v)
+    if t == val.TAG_NUM {
+        return math.math_bits(val.num_value(v))
+    }
+    if t == val.TAG_UNDEF || t == val.TAG_GAP {
+        return math.math_bits(math.math_f64(0x7FF8000000000000))
+    }
+    if t == val.TAG_NULL {
+        return math.math_bits(0.0)
+    }
+    if t == val.TAG_BOOL {
+        if val.bool_value(v) {
+            return math.math_bits(1.0)
+        }
+        return math.math_bits(0.0)
+    }
+    if t == val.TAG_STR {
+        return string_to_number(r, v)
+    }
+    if t == val.TAG_SYM {
+        var m: [u8; 34] = "Cannot convert a Symbol to a numbe"
+        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 34)
+        return math.math_bits(0.0)
+    }
+    let p: Gc[JsVal] = try to_primitive(r, v, 2)
+    let c: *mut Ctx = ctx_of(r)
+    if (*c).comp != C_NORMAL {
+        return math.math_bits(0.0)
+    }
+    return to_number(r, p)
+}
+
+// 7.1.4.1 StringToNumber: white space around it, the three radix prefixes,
+// `Infinity`, and otherwise the correctly rounded `strtod` of lib/num.
+fn string_to_number(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
+    let nan: f64 = math.math_f64(0x7FF8000000000000)
+    let n: u64 = val.str_len(v)
+    var a: u64 = 0
+    var b: u64 = n
+    while a < b && is_space_unit(val.str_at(v, a)) {
+        a = a + 1
+    }
+    while b > a && is_space_unit(val.str_at(v, b - 1)) {
+        b = b - 1
+    }
+    if a == b {
+        return math.math_bits(0.0)
+    }
+    var neg: bool = false
+    var i: u64 = a
+    let c0: u32 = val.str_at(v, i)
+    if c0 == 43 as u32 || c0 == 45 as u32 {
+        neg = c0 == 45 as u32
+        i = i + 1
+    }
+    // Infinity
+    if b - i == 8 {
+        var inf: [u8; 8] = "Infinity"
+        var same: bool = true
+        var k: u64 = 0
+        while k < 8 {
+            if val.str_at(v, i + k) != inf[k as usize] as u32 {
+                same = false
+                break
+            }
+            k = k + 1
+        }
+        if same {
+            if neg {
+                return math.math_bits(math.math_f64(0xFFF0000000000000))
+            }
+            return math.math_bits(math.math_f64(0x7FF0000000000000))
+        }
+    }
+    // The radix prefixes only without a sign.
+    if !neg && c0 != 43 as u32 && b - i > 2 && val.str_at(v, i) == 48 as u32 {
+        let c1: u32 = val.str_at(v, i + 1)
+        var radix: u32 = 0
+        if c1 == 120 as u32 || c1 == 88 as u32 { radix = 16 }
+        if c1 == 111 as u32 || c1 == 79 as u32 { radix = 8 }
+        if c1 == 98 as u32 || c1 == 66 as u32 { radix = 2 }
+        if radix != 0 as u32 {
+            var acc: f64 = 0.0
+            var k: u64 = i + 2
+            if k >= b {
+                return math.math_bits(nan)
+            }
+            while k < b {
+                let d: u32 = digit_value(val.str_at(v, k))
+                if d >= radix {
+                    return math.math_bits(nan)
+                }
+                acc = acc * (radix as f64) + (d as f64)
+                k = k + 1
+            }
+            return math.math_bits(acc)
+        }
+    }
+    // Everything else through strtod -- it wants octets.
+    var buf: mem.Buf = mem.buf_new()
+    mem.buf_init(&buf)
+    var k: u64 = a
+    while k < b {
+        let u: u32 = val.str_at(v, k)
+        if u > 127 as u32 {
+            mem.buf_free(&buf)
+            return math.math_bits(nan)
+        }
+        mem.buf_push(&buf, u as u8)
+        k = k + 1
+    }
+    var bits: u64 = 0
+    let ok: bool = num.text_to_f64_bits(mem.buf_ptr(&buf), mem.buf_len(&buf), &bits)
+    mem.buf_free(&buf)
+    if !ok {
+        return math.math_bits(nan)
+    }
+    return math.math_bits(math.math_f64(bits))
+}
+
+fn digit_value(c: u32) -> u32 {
+    if c >= 48 as u32 && c <= 57 as u32 { return c - 48 as u32 }
+    if c >= 97 as u32 && c <= 122 as u32 { return c - 87 as u32 }
+    if c >= 65 as u32 && c <= 90 as u32 { return c - 55 as u32 }
+    return 99
+}
+
+fn is_space_unit(c: u32) -> bool {
+    if c == 9 as u32 || c == 10 as u32 || c == 11 as u32 || c == 12 as u32 {
+        return true
+    }
+    if c == 13 as u32 || c == 32 as u32 || c == 0xA0 as u32 || c == 0xFEFF as u32 {
+        return true
+    }
+    if c == 0x2028 as u32 || c == 0x2029 as u32 || c == 0x1680 as u32 {
+        return true
+    }
+    if c >= 0x2000 as u32 && c <= 0x200A as u32 {
+        return true
+    }
+    return c == 0x202F as u32 || c == 0x205F as u32 || c == 0x3000 as u32
+}
+
+// 6.1.6.1.20 Number::toString -- `dtoa` of lib/num already follows exactly
+// the ECMAScript rules (the 21 digit window and the exponent form).
+fn number_to_string(r: Gc[Realm], x: f64) -> AllocError!Gc[JsVal] {
+    var out: num.Bytes = num.Bytes { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let ok: bool = num.write_f64_bits(&out, math.math_bits(x))
+    let s: Gc[JsVal] = try val.str_from_ascii(r, out.ptr, out.len)
+    num.bytes_free(&out)
+    return s
+}
+
+fn to_string(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let t: u64 = val.val_tag(v)
+    if t == val.TAG_STR {
+        return v
+    }
+    if t == val.TAG_UNDEF || t == val.TAG_GAP {
+        var m: [u8; 9] = "undefined"
+        return val.str_from_ascii(r, &m[0], 9)
+    }
+    if t == val.TAG_NULL {
+        var m: [u8; 4] = "null"
+        return val.str_from_ascii(r, &m[0], 4)
+    }
+    if t == val.TAG_BOOL {
+        if val.bool_value(v) {
+            var m: [u8; 4] = "true"
+            return val.str_from_ascii(r, &m[0], 4)
+        }
+        var m2: [u8; 5] = "false"
+        return val.str_from_ascii(r, &m2[0], 5)
+    }
+    if t == val.TAG_NUM {
+        return number_to_string(r, val.num_value(v))
+    }
+    if t == val.TAG_SYM {
+        var m: [u8; 33] = "Cannot convert a Symbol to a stri"
+        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 33)
+        return val.str_empty(r)
+    }
+    if t == val.TAG_BIGINT {
+        return bigint.bi_to_string(r, v, 10)
+    }
+    let p: Gc[JsVal] = try to_primitive(r, v, 1)
+    let c: *mut Ctx = ctx_of(r)
+    if (*c).comp != C_NORMAL {
+        return val.str_empty(r)
+    }
+    return to_string(r, p)
+}
+
+fn to_numeric_string(r: Gc[Realm], x: f64) -> AllocError!Gc[JsVal] {
+    return number_to_string(r, x)
+}
+
+fn to_object(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsObj] {
+    let t: u64 = val.val_tag(v)
+    if t == val.TAG_OBJ {
+        return val.as_obj(v)
+    }
+    if t == val.TAG_UNDEF || t == val.TAG_NULL || t == val.TAG_GAP {
+        var m: [u8; 39] = "Cannot convert undefined or null to obj"
+        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 39)
+        return gc_null[JsObj]()
+    }
+    var which: u64 = val.PROTO_OBJECT
+    var cls: u64 = val.CLS_ORDINARY
+    if t == val.TAG_STR {
+        which = val.PROTO_STRING
+        cls = val.CLS_STRING
+    }
+    if t == val.TAG_NUM {
+        which = val.PROTO_NUMBER
+        cls = val.CLS_NUMBER
+    }
+    if t == val.TAG_BIGINT {
+        which = val.PROTO_BIGINT
+    }
+    if t == val.TAG_BOOL {
+        which = val.PROTO_BOOLEAN
+        cls = val.CLS_BOOLEAN
+    }
+    if t == val.TAG_SYM {
+        which = val.PROTO_SYMBOL
+        cls = val.CLS_SYMBOL
+    }
+    let o: Gc[JsObj] = try val.obj_new_proto(r, val.realm_proto(r, which))
+    o.cls = cls
+    o.prim = v
+    if t == val.TAG_STR {
+        o.len = val.str_len(v)
+        let k: u64 = try val.key_for_name(r, lex.N_LENGTH)
+        let lv: Gc[JsVal] = try val.realm_num(r, o.len as f64)
+        let ok: bool = try define_value(r, o, k, lv, 0)
+    }
+    return o
+}
+
+fn to_property_key(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
+    let p: Gc[JsVal] = try to_primitive(r, v, 1)
+    let c: *mut Ctx = ctx_of(r)
+    if (*c).comp != C_NORMAL {
+        return 0
+    }
+    if val.val_tag(p) == val.TAG_SYM {
+        return val.key_for_symbol(p)
+    }
+    let s: Gc[JsVal] = try to_string(r, p)
+    if (*c).comp != C_NORMAL {
+        return 0
+    }
+    return val.key_for_str(r, s)
+}
+
+// 7.1.5 ToIntegerOrInfinity, 7.1.6 ToInt32, 7.1.7 ToUint32.
+fn to_integer(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
+    let x: f64 = math.math_f64(try to_number(r, v))
+    if math.is_nan(x) {
+        return math.math_bits(0.0)
+    }
+    return math.math_bits(math.trunc(x))
+}
+
+// 2^53-1 written as an integer: the decimal literal `9007199254740991.0`
+// is lexed one unit in the last place apart by the two lexers of this
+// project (docs/ROUND63.md, gap 8).
+fn max_safe_f64() -> f64 {
+    let n: u64 = 9007199254740991
+    return n as f64
+}
+
+fn to_length(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
+    let x: f64 = math.math_f64(try to_integer(r, v))
+    if x <= 0.0 {
+        return 0
+    }
+    if x > max_safe_f64() {
+        return 9007199254740991
+    }
+    return x as u64
+}
+
+fn to_index(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
+    return to_length(r, v)
+}
+
+fn f64_to_int32(x: f64) -> i32 {
+    if math.is_nan(x) || math.is_infinite(x) {
+        return 0
+    }
+    let t: f64 = math.trunc(x)
+    let m: f64 = math.fmod(t, 4294967296.0)
+    var u: f64 = m
+    if u < 0.0 {
+        u = u + 4294967296.0
+    }
+    var w: u64 = u as u64
+    w = w & 4294967295
+    if w >= 2147483648 {
+        return (w as i64 - 4294967296) as i32
+    }
+    return w as i32
+}
+
+fn to_int32(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!i32 {
+    let x: f64 = math.math_f64(try to_number(r, v))
+    return f64_to_int32(x)
+}
+
+fn to_uint32(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u32 {
+    let x: f64 = math.math_f64(try to_number(r, v))
+    let i: i32 = f64_to_int32(x)
+    // ToUint32 is a REINTERPRETATION of the 32 bits, not a value cast:
+    // -1 has to come out as 4294967295. `as` is checked and refuses that,
+    // and rightly so -- the mask through i64 is the operation the standard
+    // actually describes (ECMA-262, 7.1.7).
+    return ((i as i64) & 4294967295) as u32
+}
+
+// ======================================================== Property access
+
+fn define_value(r: Gc[Realm], o: Gc[JsObj], k: u64, v: Gc[JsVal],
+    attrs: u64) -> AllocError!bool {
+    let p: Gc[Prop] = try gc Prop { value: v, setter: gc_null[JsVal](), attrs: attrs }
+    return val.obj_put_own(o, k, p)
+}
+
+fn define_accessor(r: Gc[Realm], o: Gc[JsObj], k: u64, getter: Gc[JsVal],
+    setter: Gc[JsVal], attrs: u64) -> AllocError!bool {
+    let p: Gc[Prop] = try gc Prop {
+        value: getter, setter: setter, attrs: attrs | val.A_ACCESSOR }
+    return val.obj_put_own(o, k, p)
+}
+
+fn define_own(r: Gc[Realm], o: Gc[JsObj], k: u64, p: Gc[Prop]) -> AllocError!bool {
+    return val.obj_put_own(o, k, p)
+}
+
+// The dense element storage of an array is not in the property table; a
+// lookup therefore asks it first.
+fn array_index_get(r: Gc[Realm], o: Gc[JsObj], k: u64,
+    found: *mut bool) -> AllocError!Gc[JsVal] {
+    *found = false
+    if o.cls != val.CLS_ARRAY && o.cls != val.CLS_ARGUMENTS && o.cls != val.CLS_STRING {
+        return val.realm_undefined(r)
+    }
+    let i: i64 = val.index_of_key(r, k)
+    if i < 0 {
+        return val.realm_undefined(r)
+    }
+    if o.cls == val.CLS_STRING {
+        let s: Gc[JsVal] = o.prim
+        if (i as u64) < val.str_len(s) {
+            *found = true
+            return val.str_slice(r, s, i as u64, i as u64 + 1)
+        }
+        return val.realm_undefined(r)
+    }
+    let e: Gc[JsVal] = val.elems_get(r, o, i as u64)
+    if val.is_gap(e) {
+        return val.realm_undefined(r)
+    }
+    *found = true
+    return e
+}
+
+// 10.1.8 [[Get]] with the prototype chain and the accessors.
+fn get_prop(r: Gc[Realm], base: Gc[JsVal], k: u64) -> AllocError!Gc[JsVal] {
+    return get_prop_v(r, base, k, base)
+}
+
+fn get_prop_v(r: Gc[Realm], base: Gc[JsVal], k: u64,
+    receiver: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    var o: Gc[JsObj] = gc_null[JsObj]()
+    let t: u64 = val.val_tag(base)
+    if t == val.TAG_OBJ {
+        o = val.as_obj(base)
+    } else if t == val.TAG_STR {
+        // A string is not boxed for a read: length and index directly.
+        let lk: u64 = try val.key_for_name(r, lex.N_LENGTH)
+        if k == lk {
+            return val.realm_num(r, val.str_len(base) as f64)
+        }
+        let i: i64 = val.index_of_key(r, k)
+        if i >= 0 {
+            if (i as u64) < val.str_len(base) {
+                return val.str_slice(r, base, i as u64, i as u64 + 1)
+            }
+            return val.realm_undefined(r)
+        }
+        o = val.realm_proto(r, val.PROTO_STRING)
+    } else if t == val.TAG_NUM {
+        o = val.realm_proto(r, val.PROTO_NUMBER)
+    } else if t == val.TAG_BOOL {
+        o = val.realm_proto(r, val.PROTO_BOOLEAN)
+    } else if t == val.TAG_SYM {
+        o = val.realm_proto(r, val.PROTO_SYMBOL)
+    } else if t == val.TAG_BIGINT {
+        o = val.realm_proto(r, val.PROTO_BIGINT)
+    } else {
+        var m: [u8; 34] = "Cannot read a property of undefine"
+        return throw_type_here(r, &m[0], 35)
+    }
+    while (o as u64) != 0 {
+        var found: bool = false
+        let e: Gc[JsVal] = try array_index_get(r, o, k, &found)
+        if found {
+            return e
+        }
+        let p: Gc[Prop] = val.obj_get_own(o, k)
+        if (p as u64) != 0 {
+            if val.prop_is_accessor(p) {
+                let g: Gc[JsVal] = val.prop_value(p)
+                if !val.is_callable(g) {
+                    return val.realm_undefined(r)
+                }
+                let args: Gc[GcVec] = try args_new(r)
+                return call_function(r, g, receiver, args)
+            }
+            return val.prop_value(p)
+        }
+        // The length of an array is computed, not stored.
+        if o.cls == val.CLS_ARRAY {
+            let lk: u64 = try val.key_for_name(r, lex.N_LENGTH)
+            if k == lk {
+                return val.realm_num(r, o.len as f64)
+            }
+        }
+        o = val.obj_proto(o)
+    }
+    return val.realm_undefined(r)
+}
+
+fn has_prop(r: Gc[Realm], base: Gc[JsVal], k: u64) -> AllocError!bool {
+    var o: Gc[JsObj] = val.as_obj(base)
+    if (o as u64) == 0 {
+        return false
+    }
+    while (o as u64) != 0 {
+        var found: bool = false
+        let e: Gc[JsVal] = try array_index_get(r, o, k, &found)
+        if found {
+            return true
+        }
+        if val.obj_has_own(o, k) {
+            return true
+        }
+        if o.cls == val.CLS_ARRAY {
+            let lk: u64 = try val.key_for_name(r, lex.N_LENGTH)
+            if k == lk {
+                return true
+            }
+        }
+        o = val.obj_proto(o)
+    }
+    return false
+}
+
+// 10.1.9 [[Set]] -- looks for a setter along the chain, then writes an own
+// data property, and honours `writable` and `extensible`.
+fn set_prop(r: Gc[Realm], base: Gc[JsVal], k: u64, v: Gc[JsVal],
+    strict: bool) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    if val.val_tag(base) != val.TAG_OBJ {
+        if val.is_nullish(base) {
+            var m: [u8; 36] = "Cannot set a property of undefined o"
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 36)
+            return false
+        }
+        // A primitive receiver: a setter along the chain still runs.
+        return true
+    }
+    let o: Gc[JsObj] = val.as_obj(base)
+    var w: Gc[JsObj] = o
+    while (w as u64) != 0 {
+        let p: Gc[Prop] = val.obj_get_own(w, k)
+        if (p as u64) != 0 {
+            if val.prop_is_accessor(p) {
+                let s: Gc[JsVal] = val.prop_setter(p)
+                if !val.is_callable(s) {
+                    if strict {
+                        var m: [u8; 33] = "Cannot set a property with only a"
+                        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 33)
+                    }
+                    return false
+                }
+                let args: Gc[GcVec] = try args_new(r)
+                let ok: bool = try gcvec_append[JsVal](args, v)
+                let res: Gc[JsVal] = try call_function(r, s, base, args)
+                return true
+            }
+            if (w as u64) == (o as u64) {
+                if val.prop_attrs(p) & val.A_WRITABLE == 0 {
+                    if strict {
+                        var m: [u8; 38] = "Cannot assign to a read only property "
+                        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 39)
+                    }
+                    return false
+                }
+                val.prop_set_value(p, v)
+                return true
+            }
+            if val.prop_attrs(p) & val.A_WRITABLE == 0 {
+                if strict {
+                    var m: [u8; 38] = "Cannot assign to a read only property "
+                    let x: Gc[JsVal] = try throw_type_here(r, &m[0], 39)
+                }
+                return false
+            }
+            break
+        }
+        w = val.obj_proto(w)
+    }
+    return set_own(r, o, k, v, strict)
+}
+
+fn set_own(r: Gc[Realm], o: Gc[JsObj], k: u64, v: Gc[JsVal],
+    strict: bool) -> AllocError!bool {
+    // Arrays: the index goes into the dense storage, `length` adjusts it.
+    if o.cls == val.CLS_ARRAY {
+        let lk: u64 = try val.key_for_name(r, lex.N_LENGTH)
+        if k == lk {
+            let n: f64 = math.math_f64(try to_number(r, v))
+            let want: u64 = n as u64
+            if (want as f64) != n || math.is_nan(n) {
+                var m: [u8; 22] = "Invalid array length  "
+                let x: Gc[JsVal] = try throw_error(r, ERR_RANGE, &m[0], 20)
+                return false
+            }
+            let ok: bool = try val.array_set_length(r, o, want)
+            return true
+        }
+        let i: i64 = val.index_of_key(r, k)
+        if i >= 0 && val.elems_dense_ok(i as u64) {
+            let ok: bool = try val.elems_set(r, o, i as u64, v)
+            if (i as u64) >= o.len {
+                o.len = i as u64 + 1
+            }
+            return true
+        }
+        if i >= 0 {
+            // Beyond the dense limit: an ordinary property; `length` still
+            // moves with it.
+            if (i as u64) >= o.len {
+                o.len = i as u64 + 1
+            }
+        }
+    }
+    if o.cls == val.CLS_ARGUMENTS {
+        let i: i64 = val.index_of_key(r, k)
+        if i >= 0 && (i as u64) < val.elems_len(o) {
+            let ok: bool = try val.elems_set(r, o, i as u64, v)
+            return true
+        }
+    }
+    if o.flags & val.F_EXTENSIBLE == 0 {
+        if strict {
+            var m: [u8; 38] = "Cannot add a property, object is not e"
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 38)
+        }
+        return false
+    }
+    return define_value(r, o, k, v, val.A_DEFAULT)
+}
+
+fn delete_prop(r: Gc[Realm], base: Gc[JsVal], k: u64,
+    strict: bool) -> AllocError!bool {
+    let o: Gc[JsObj] = val.as_obj(base)
+    if (o as u64) == 0 {
+        return true
+    }
+    if o.cls == val.CLS_ARRAY || o.cls == val.CLS_ARGUMENTS {
+        let i: i64 = val.index_of_key(r, k)
+        if i >= 0 && (i as u64) < val.elems_len(o) {
+            let ok: bool = try val.elems_set(r, o, i as u64, val.realm_gap(r))
+            return true
+        }
+    }
+    let p: Gc[Prop] = val.obj_get_own(o, k)
+    if (p as u64) == 0 {
+        return true
+    }
+    if val.prop_attrs(p) & val.A_CONFIGURABLE == 0 {
+        if strict {
+            var m: [u8; 38] = "Cannot delete a non configurable prope"
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 38)
+        }
+        return false
+    }
+    return val.obj_delete_own(o, k)
+}
+
+// ---------------------------------------------------------- Argument lists
+
+fn args_new(r: Gc[Realm]) -> AllocError!Gc[GcVec] {
+    return gcvec_new()
+}
+
+fn args_count(a: Gc[GcVec]) -> u64 {
+    return gcvec_length(a)
+}
+
+fn args_at(r: Gc[Realm], a: Gc[GcVec], i: u64) -> Gc[JsVal] {
+    if i >= gcvec_length(a) {
+        return val.realm_undefined(r)
+    }
+    return gcvec_read[JsVal](a, i)
+}
+
+// ========================================================= Equality (7.2)
+
+fn strict_equals(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> bool {
+    let ta: u64 = val.val_tag(a)
+    let tb: u64 = val.val_tag(b)
+    if ta != tb {
+        return false
+    }
+    if ta == val.TAG_UNDEF || ta == val.TAG_NULL {
+        return true
+    }
+    if ta == val.TAG_NUM {
+        let x: f64 = val.num_value(a)
+        let y: f64 = val.num_value(b)
+        return x == y
+    }
+    if ta == val.TAG_STR {
+        return val.str_equal(a, b)
+    }
+    if ta == val.TAG_BOOL {
+        return val.bool_value(a) == val.bool_value(b)
+    }
+    if ta == val.TAG_BIGINT {
+        return bigint.bi_cmp(a, b) == 0
+    }
+    return (a as u64) == (b as u64)
+}
+
+// 7.2.10 SameValue -- like `===`, but NaN equals NaN and +0 does not equal -0.
+fn same_value(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> bool {
+    if val.val_tag(a) == val.TAG_NUM && val.val_tag(b) == val.TAG_NUM {
+        let xb: u64 = math.math_bits(val.num_value(a))
+        let yb: u64 = math.math_bits(val.num_value(b))
+        if math.is_nan(val.num_value(a)) && math.is_nan(val.num_value(b)) {
+            return true
+        }
+        return xb == yb
+    }
+    return strict_equals(r, a, b)
+}
+
+fn same_value_zero(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> bool {
+    if val.val_tag(a) == val.TAG_NUM && val.val_tag(b) == val.TAG_NUM {
+        if math.is_nan(val.num_value(a)) && math.is_nan(val.num_value(b)) {
+            return true
+        }
+    }
+    return strict_equals(r, a, b)
+}
+
+// 7.2.15 IsLooselyEqual -- `==` in its full ugliness, written out.
+fn loose_equals(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    let ta: u64 = val.val_tag(a)
+    let tb: u64 = val.val_tag(b)
+    if ta == tb {
+        return strict_equals(r, a, b)
+    }
+    // null and undefined are equal to each other and to nothing else.
+    if (ta == val.TAG_NULL && tb == val.TAG_UNDEF) || (ta == val.TAG_UNDEF && tb == val.TAG_NULL) {
+        return true
+    }
+    if ta == val.TAG_NULL || ta == val.TAG_UNDEF {
+        return false
+    }
+    if tb == val.TAG_NULL || tb == val.TAG_UNDEF {
+        return false
+    }
+    // 7.2.15 with a BigInt: exact against a number, parsed against a text.
+    if ta == val.TAG_BIGINT || tb == val.TAG_BIGINT {
+        var big: Gc[JsVal] = a
+        var other: Gc[JsVal] = b
+        if tb == val.TAG_BIGINT {
+            big = b
+            other = a
+        }
+        let ot: u64 = val.val_tag(other)
+        if ot == val.TAG_STR {
+            let bx: Gc[JsVal] = try bigint.bi_parse(r, other)
+            if (bx as u64) == 0 {
+                return false
+            }
+            return bigint.bi_cmp(big, bx) == 0
+        }
+        if ot == val.TAG_NUM {
+            let d: i64 = try bigint.bi_cmp_f64(r, big, val.num_value(other))
+            return d == 0
+        }
+        if ot == val.TAG_BOOL {
+            var one: u64 = 0
+            if val.bool_value(other) {
+                one = 1
+            }
+            let bb: Gc[JsVal] = try bigint.bi_from_u64(r, one, false)
+            return bigint.bi_cmp(big, bb) == 0
+        }
+        if ot == val.TAG_OBJ {
+            let po: Gc[JsVal] = try to_primitive(r, other, 0)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            return loose_equals(r, big, po)
+        }
+        return false
+    }
+    if ta == val.TAG_NUM && tb == val.TAG_STR {
+        let y: f64 = math.math_f64(try to_number(r, b))
+        return val.num_value(a) == y
+    }
+    if ta == val.TAG_STR && tb == val.TAG_NUM {
+        let x: f64 = math.math_f64(try to_number(r, a))
+        return x == val.num_value(b)
+    }
+    if ta == val.TAG_BOOL {
+        let x: f64 = math.math_f64(try to_number(r, a))
+        let xv: Gc[JsVal] = try val.realm_num(r, x)
+        return loose_equals(r, xv, b)
+    }
+    if tb == val.TAG_BOOL {
+        let y: f64 = math.math_f64(try to_number(r, b))
+        let yv: Gc[JsVal] = try val.realm_num(r, y)
+        return loose_equals(r, a, yv)
+    }
+    if (ta == val.TAG_NUM || ta == val.TAG_STR || ta == val.TAG_SYM) && tb == val.TAG_OBJ {
+        let p: Gc[JsVal] = try to_primitive(r, b, 0)
+        if (*c).comp != C_NORMAL {
+            return false
+        }
+        return loose_equals(r, a, p)
+    }
+    if ta == val.TAG_OBJ && (tb == val.TAG_NUM || tb == val.TAG_STR || tb == val.TAG_SYM) {
+        let p: Gc[JsVal] = try to_primitive(r, a, 0)
+        if (*c).comp != C_NORMAL {
+            return false
+        }
+        return loose_equals(r, p, b)
+    }
+    return false
+}
+
+// 7.2.13 IsLessThan. The result is -1 undefined (a NaN was involved),
+// 0 false, 1 true.
+fn compare_values(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal],
+    left_first: bool) -> AllocError!i32 {
+    let c: *mut Ctx = ctx_of(r)
+    var pa: Gc[JsVal] = a
+    var pb: Gc[JsVal] = b
+    if left_first {
+        pa = try to_primitive(r, a, 2)
+        if (*c).comp != C_NORMAL {
+            return -1
+        }
+        pb = try to_primitive(r, b, 2)
+    } else {
+        pb = try to_primitive(r, b, 2)
+        if (*c).comp != C_NORMAL {
+            return -1
+        }
+        pa = try to_primitive(r, a, 2)
+    }
+    if (*c).comp != C_NORMAL {
+        return -1
+    }
+    if val.val_tag(pa) == val.TAG_STR && val.val_tag(pb) == val.TAG_STR {
+        if val.str_compare(pa, pb) < 0 {
+            return 1
+        }
+        return 0
+    }
+    // 7.2.13 with a BigInt on one side: exact, without a detour through a
+    // double.
+    if val.is_bigint(pa) || val.is_bigint(pb) {
+        return compare_bigint(r, pa, pb)
+    }
+    let x: f64 = math.math_f64(try to_number(r, pa))
+    if (*c).comp != C_NORMAL {
+        return -1
+    }
+    let y: f64 = math.math_f64(try to_number(r, pb))
+    if (*c).comp != C_NORMAL {
+        return -1
+    }
+    if math.is_nan(x) || math.is_nan(y) {
+        return -1
+    }
+    if x < y {
+        return 1
+    }
+    return 0
+}
+
+// 13.15.3 ApplyStringOrNumericBinaryOperator for `+`.
+// The relational comparison with at least one BigInt: 1 = true, 0 = false,
+// -1 = undefined (a NaN is involved).
+fn compare_bigint(r: Gc[Realm], pa: Gc[JsVal], pb: Gc[JsVal]) -> AllocError!i32 {
+    let c: *mut Ctx = ctx_of(r)
+    var x: Gc[JsVal] = pa
+    var y: Gc[JsVal] = pb
+    if val.is_bigint(x) && val.is_bigint(y) {
+        if bigint.bi_cmp(x, y) < 0 {
+            return 1
+        }
+        return 0
+    }
+    if val.val_tag(x) == val.TAG_STR {
+        let bx: Gc[JsVal] = try bigint.bi_parse(r, x)
+        if (bx as u64) == 0 {
+            return -1
+        }
+        x = bx
+    }
+    if val.val_tag(y) == val.TAG_STR {
+        let by: Gc[JsVal] = try bigint.bi_parse(r, y)
+        if (by as u64) == 0 {
+            return -1
+        }
+        y = by
+    }
+    if val.is_bigint(x) && val.is_bigint(y) {
+        if bigint.bi_cmp(x, y) < 0 {
+            return 1
+        }
+        return 0
+    }
+    if val.is_bigint(x) {
+        let n: u64 = try to_number(r, y)
+        if (*c).comp != C_NORMAL {
+            return -1
+        }
+        let d: i64 = try bigint.bi_cmp_f64(r, x, math.math_f64(n))
+        if d == 2 {
+            return -1
+        }
+        if d < 0 {
+            return 1
+        }
+        return 0
+    }
+    let n: u64 = try to_number(r, x)
+    if (*c).comp != C_NORMAL {
+        return -1
+    }
+    let d: i64 = try bigint.bi_cmp_f64(r, y, math.math_f64(n))
+    if d == 2 {
+        return -1
+    }
+    if d > 0 {
+        return 1
+    }
+    return 0
+}
+
+fn add_values(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let pa: Gc[JsVal] = try to_primitive(r, a, 0)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let pb: Gc[JsVal] = try to_primitive(r, b, 0)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if val.val_tag(pa) == val.TAG_STR || val.val_tag(pb) == val.TAG_STR {
+        // A BigInt concatenates like every other value.
+    } else if val.is_bigint(pa) || val.is_bigint(pb) {
+        if !val.is_bigint(pa) || !val.is_bigint(pb) {
+            return bigint_mix_error(r)
+        }
+        return bigint.bi_add(r, pa, pb)
+    }
+    if val.val_tag(pa) == val.TAG_STR || val.val_tag(pb) == val.TAG_STR {
+        let sa: Gc[JsVal] = try to_string(r, pa)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let sb: Gc[JsVal] = try to_string(r, pb)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        return val.str_concat(r, sa, sb)
+    }
+    let x: f64 = math.math_f64(try to_number(r, pa))
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let y: f64 = math.math_f64(try to_number(r, pb))
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    return val.realm_num(r, x + y)
+}
+
+fn js_typeof(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let t: u64 = val.val_tag(v)
+    if t == val.TAG_UNDEF || t == val.TAG_GAP {
+        var m: [u8; 9] = "undefined"
+        return val.str_from_ascii(r, &m[0], 9)
+    }
+    if t == val.TAG_NULL {
+        var m: [u8; 6] = "object"
+        return val.str_from_ascii(r, &m[0], 6)
+    }
+    if t == val.TAG_BOOL {
+        var m: [u8; 7] = "boolean"
+        return val.str_from_ascii(r, &m[0], 7)
+    }
+    if t == val.TAG_NUM {
+        var m: [u8; 6] = "number"
+        return val.str_from_ascii(r, &m[0], 6)
+    }
+    if t == val.TAG_BIGINT {
+        var m: [u8; 6] = "bigint"
+        return val.str_from_ascii(r, &m[0], 6)
+    }
+    if t == val.TAG_STR {
+        var m: [u8; 6] = "string"
+        return val.str_from_ascii(r, &m[0], 6)
+    }
+    if t == val.TAG_SYM {
+        var m: [u8; 6] = "symbol"
+        return val.str_from_ascii(r, &m[0], 6)
+    }
+    if val.is_callable(v) {
+        var m: [u8; 8] = "function"
+        return val.str_from_ascii(r, &m[0], 8)
+    }
+    var m: [u8; 6] = "object"
+    return val.str_from_ascii(r, &m[0], 6)
+}
+
+fn is_array(v: Gc[JsVal]) -> bool {
+    let o: Gc[JsObj] = val.as_obj(v)
+    if (o as u64) == 0 {
+        return false
+    }
+    return o.cls == val.CLS_ARRAY
+}
+
+// ================================================================= Calls
+
+fn make_function(r: Gc[Realm], node: u32, env: Gc[Env],
+    name: u32) -> AllocError!Gc[JsObj] {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let f: Gc[JsObj] = try val.obj_new_proto(r, val.realm_proto(r, val.PROTO_FUNCTION))
+    f.cls = val.CLS_FUNCTION
+    f.node = node as u64
+    f.env = env
+    let fl: u32 = ast.ast_e(t, node)
+    var flags: u64 = val.F_EXTENSIBLE
+    if fl & ast.FN_STRICT != 0 as u32 {
+        flags = flags | val.F_STRICT
+    }
+    if fl & ast.FN_ARROW != 0 as u32 {
+        flags = flags | val.F_ARROW
+    } else if fl & (ast.FN_METHOD | ast.FN_GETTER | ast.FN_SETTER) != 0 as u32 {
+        flags = flags | val.F_METHOD
+    } else {
+        flags = flags | val.F_CTOR
+    }
+    if fl & ast.FN_CLASS_CTOR != 0 as u32 {
+        flags = flags | val.F_CLASS_CTOR | val.F_CTOR
+    }
+    if fl & ast.FN_DERIVED_CTOR != 0 as u32 {
+        flags = flags | val.F_DERIVED
+    }
+    // A generator or an async function is NOT a constructor (15.5.3), and
+    // its own prototype chain is a different one (round 66).
+    if fl & (ast.FN_GENERATOR | ast.FN_ASYNC) != 0 as u32 {
+        flags = flags & (val.F_CTOR ^ 0xFFFFFFFFFFFFFFFF)
+        var which: u64 = val.PROTO_ASYNC_FUNCTION
+        if fl & ast.FN_GENERATOR != 0 as u32 {
+            which = val.PROTO_GENERATOR_FUNCTION
+            if fl & ast.FN_ASYNC != 0 as u32 {
+                which = val.PROTO_ASYNC_GENERATOR_FUNCTION
+            }
+        }
+        let fnp: Gc[JsObj] = val.realm_proto(r, which)
+        if (fnp as u64) != 0 {
+            val.obj_set_proto(f, fnp)
+        }
+    }
+    f.flags = flags
+    // `length`: the parameters up to the first default or rest (10.2.4).
+    let poff: u32 = ast.ast_b(t, node)
+    let pcount: usize = ast.ast_c(t, node) as usize
+    var arity: u64 = 0
+    var i: usize = 0
+    while i < pcount {
+        let e: u32 = ast.ast_list_at(t, poff, i)
+        let ek: u32 = ast.ast_kind(t, e)
+        if ek == ast.N_ASSIGN_PAT || ek == ast.N_REST {
+            break
+        }
+        arity = arity + 1
+        i = i + 1
+    }
+    let lk: u64 = try val.key_for_name(r, lex.N_LENGTH)
+    let lv: Gc[JsVal] = try val.realm_num(r, arity as f64)
+    let ok1: bool = try define_value(r, f, lk, lv, val.A_CONFIGURABLE)
+    let nk: u64 = try val.key_for_name(r, lex.N_NAME)
+    var nv: Gc[JsVal] = val.str_empty(r)
+    if name != 0xFFFFFFFF as u32 {
+        nv = try val.str_of_name(r, name)
+    }
+    let ok2: bool = try define_value(r, f, nk, nv, val.A_CONFIGURABLE)
+    // A generator gets a `prototype` WITHOUT a `constructor` back pointer;
+    // it is the object the generator objects inherit from (27.5.1).
+    if fl & ast.FN_GENERATOR != 0 as u32 {
+        var gwhich: u64 = val.PROTO_GENERATOR
+        if fl & ast.FN_ASYNC != 0 as u32 {
+            gwhich = val.PROTO_ASYNC_GENERATOR
+        }
+        let base: Gc[JsObj] = val.realm_proto(r, gwhich)
+        let proto: Gc[JsObj] = try val.obj_new_proto(r, base)
+        let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+        let pv: Gc[JsVal] = proto
+        let ok3: bool = try define_value(r, f, pk, pv, val.A_WRITABLE)
+        return f
+    }
+    // Only a real constructor gets a `prototype`.
+    if flags & val.F_CTOR != 0 && flags & val.F_CLASS_CTOR == 0 {
+        let proto: Gc[JsObj] = try val.obj_new(r)
+        let ck: u64 = try val.key_for_name(r, lex.N_CONSTRUCTOR)
+        let fv: Gc[JsVal] = f
+        let ok3: bool = try define_value(r, proto, ck, fv,
+            val.A_WRITABLE | val.A_CONFIGURABLE)
+        let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+        let pv: Gc[JsVal] = proto
+        let ok4: bool = try define_value(r, f, pk, pv, val.A_WRITABLE)
+    }
+    return f
+}
+
+fn make_native(r: Gc[Realm], id: u64, arity: u64,
+    name: *mut u8, n: usize) -> AllocError!Gc[JsObj] {
+    let f: Gc[JsObj] = try val.obj_new_proto(r, val.realm_proto(r, val.PROTO_FUNCTION))
+    f.cls = val.CLS_NATIVE
+    f.native = id
+    f.flags = val.F_EXTENSIBLE | val.F_STRICT
+    let lk: u64 = try val.key_for_name(r, lex.N_LENGTH)
+    let lv: Gc[JsVal] = try val.realm_num(r, arity as f64)
+    let ok1: bool = try define_value(r, f, lk, lv, val.A_CONFIGURABLE)
+    let nk: u64 = try val.key_for_name(r, lex.N_NAME)
+    let nv: Gc[JsVal] = try val.str_from_ascii(r, name, n)
+    let ok2: bool = try define_value(r, f, nk, nv, val.A_CONFIGURABLE)
+    return f
+}
+
+fn current_native(r: Gc[Realm]) -> Gc[JsObj] {
+    let c: *mut Ctx = ctx_of(r)
+    return (*c).cur_fn
+}
+
+fn native_arity(r: Gc[Realm], id: u64) -> u32 {
+    let c: *mut Ctx = ctx_of(r)
+    let f: fn(u64) -> u32 = (*c).arity
+    return f(id)
+}
+
+fn call_method(r: Gc[Realm], base: Gc[JsVal], name: u32,
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let k: u64 = try val.key_for_name(r, name)
+    let f: Gc[JsVal] = try get_prop(r, base, k)
+    let c: *mut Ctx = ctx_of(r)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if !val.is_callable(f) {
+        var m: [u8; 20] = "not a function      "
+        return throw_type_here(r, &m[0], 14)
+    }
+    return call_function(r, f, base, args)
+}
+
+fn call_function(r: Gc[Realm], fv: Gc[JsVal], this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    return call_internal(r, fv, this, args, gc_null[JsObj]())
+}
+
+fn call_internal(r: Gc[Realm], fv: Gc[JsVal], this: Gc[JsVal], args: Gc[GcVec],
+    newtarget: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if !val.is_callable(fv) {
+        var m: [u8; 22] = "is not a function     "
+        return throw_type_here(r, &m[0], 17)
+    }
+    let f: Gc[JsObj] = val.as_obj(fv)
+    (*c).depth = (*c).depth + 1 as u32
+    if (*c).depth > (*c).max_depth {
+        (*c).depth = (*c).depth - 1 as u32
+        var m: [u8; 28] = "Maximum call stack size exce"
+        return throw_error(r, ERR_RANGE, &m[0], 28)
+    }
+    var out: Gc[JsVal] = val.realm_undefined(r)
+    if f.cls == val.CLS_DEFAULT_CTOR {
+        (*c).depth = (*c).depth - 1 as u32
+        if (newtarget as u64) == 0 {
+            var m: [u8; 44] = "Class constructor cannot be invoked without "
+            return throw_type_here(r, &m[0], 43)
+        }
+        // A derived class without a constructor forwards everything.
+        if f.flags & val.F_DERIVED != 0 && (f.extra as u64) != 0 {
+            let parent: Gc[JsVal] = f.extra
+            let res: Gc[JsVal] = try call_internal(r, parent, this, args,
+                val.as_obj(parent))
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+        }
+        let okf: bool = try init_instance_fields(r, f, this)
+        return val.realm_undefined(r)
+    }
+    if f.cls == val.CLS_NATIVE {
+        let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).native
+        (*c).cur_fn = f
+        out = try h(r, f.native, this, args, newtarget)
+    } else if f.cls == val.CLS_BOUND {
+        let target: Gc[JsVal] = f.prim
+        let bound_args: Gc[GcVec] = f.elems
+        let all: Gc[GcVec] = try args_new(r)
+        var i: u64 = 0
+        while i < gcvec_length(bound_args) {
+            let ok: bool = try gcvec_append[JsVal](all,
+                gcvec_read[JsVal](bound_args, i))
+            i = i + 1
+        }
+        i = 0
+        while i < gcvec_length(args) {
+            let ok: bool = try gcvec_append[JsVal](all, gcvec_read[JsVal](args, i))
+            i = i + 1
+        }
+        var bthis: Gc[JsVal] = f.prim
+        let bt: Gc[JsObj] = f.extra
+        var thisv: Gc[JsVal] = val.realm_undefined(r)
+        if (*c).comp == C_NORMAL {
+            let holder: Gc[Prop] = val.obj_get_own(f, 0)
+        }
+        if (newtarget as u64) != 0 {
+            out = try construct(r, target, all)
+        } else {
+            let bv: Gc[JsVal] = f.extra
+            out = try call_internal(r, target, bv, all, newtarget)
+        }
+    } else {
+        out = try call_user(r, f, this, args, newtarget)
+    }
+    (*c).depth = (*c).depth - 1 as u32
+    return out
+}
+
+// A call to a function written in JavaScript (10.2.1).
+fn call_user(r: Gc[Realm], f: Gc[JsObj], this: Gc[JsVal], args: Gc[GcVec],
+    newtarget: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let strict: bool = f.flags & val.F_STRICT != 0
+    let arrow: bool = f.flags & val.F_ARROW != 0
+    let env: Gc[Env] = try val.env_new(r, f.env, val.ENV_FUNCTION)
+    if !arrow {
+        var tv: Gc[JsVal] = this
+        if !strict {
+            if val.is_nullish(tv) {
+                let g: Gc[JsObj] = val.realm_global(r)
+                tv = g
+            } else if val.val_tag(tv) != val.TAG_OBJ {
+                let bo: Gc[JsObj] = try to_object(r, tv)
+                tv = bo
+            }
+        }
+        val.env_set_this(env, tv, f)
+        if (newtarget as u64) != 0 {
+            env.obj = newtarget
+        }
+        if (newtarget as u64) != 0 && f.flags & val.F_CLASS_CTOR != 0 && f.flags & val.F_DERIVED == 0 {
+            let okf: bool = try init_instance_fields(r, f, tv)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+        }
+    }
+    // The parameters.
+    let poff: u32 = ast.ast_b(t, node)
+    let pcount: usize = ast.ast_c(t, node) as usize
+    var i: usize = 0
+    while i < pcount {
+        let pe: u32 = ast.ast_list_at(t, poff, i)
+        if ast.ast_kind(t, pe) == ast.N_REST {
+            let rest: Gc[JsObj] = try val.array_new(r)
+            var k: u64 = i as u64
+            while k < gcvec_length(args) {
+                let ok: bool = try val.elems_push(r, rest, gcvec_read[JsVal](args, k))
+                rest.len = rest.len + 1
+                k = k + 1
+            }
+            let rv: Gc[JsVal] = rest
+            let ok2: bool = try bind_pattern(r, env, ast.ast_a(t, pe), rv, 1)
+            break
+        }
+        let av: Gc[JsVal] = args_at(r, args, i as u64)
+        let ok: bool = try bind_pattern(r, env, pe, av, 1)
+        if (*c).comp != C_NORMAL {
+            // An error while the parameters are bound REJECTS the promise
+            // of an async function (15.8.4) instead of being thrown at the
+            // caller. The hand over below does that.
+            break
+        }
+        i = i + 1
+    }
+    let fl0: u32 = ast.ast_e(t, node)
+    if (*c).comp != C_NORMAL {
+        if fl0 & ast.FN_ASYNC != 0 as u32 && fl0 & ast.FN_GENERATOR == 0 as u32 {
+            let g0: fn(Gc[Realm], Gc[JsObj], Gc[Env]) -> AllocError!Gc[JsVal] = (*c).gen_start
+            return g0(r, f, env)
+        }
+        return val.realm_undefined(r)
+    }
+    // `arguments` -- only in a non arrow function.
+    if !arrow {
+        let ak: u64 = try val.key_for_name(r, lex.N_ARGUMENTS)
+        if val.env_lookup(env, ak) < 0 {
+            let ao: Gc[JsObj] = try val.obj_new(r)
+            ao.cls = val.CLS_ARGUMENTS
+            ao.elems = try gcvec_new()
+            var k: u64 = 0
+            while k < gcvec_length(args) {
+                let ok: bool = try val.elems_push(r, ao, gcvec_read[JsVal](args, k))
+                k = k + 1
+            }
+            let lk: u64 = try val.key_for_name(r, lex.N_LENGTH)
+            let lv: Gc[JsVal] = try val.realm_num(r, gcvec_length(args) as f64)
+            let ok3: bool = try define_value(r, ao, lk, lv,
+                val.A_WRITABLE | val.A_CONFIGURABLE)
+            if !strict {
+                let ck: u64 = try val.key_for_name(r, lex.N_CALLEE)
+                let cv: Gc[JsVal] = f
+                let ok4: bool = try define_value(r, ao, ck, cv,
+                    val.A_WRITABLE | val.A_CONFIGURABLE)
+            }
+            // Round 74: an arguments object is iterable -- with
+            // %Array.prototype.values% (10.4.4.6 step 6).
+            let wk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_ITERATOR)
+            if (wk as u64) != 0 {
+                let ap: Gc[JsObj] = val.realm_proto(r, val.PROTO_ARRAY)
+                let vf: Gc[JsVal] = try get_prop(r, ap, val.key_for_symbol(wk))
+                if (*c).comp == C_NORMAL && val.is_callable(vf) {
+                    let ok5: bool = try define_value(r, ao,
+                        val.key_for_symbol(wk), vf,
+                        val.A_WRITABLE | val.A_CONFIGURABLE)
+                }
+            }
+            let slot: i64 = try val.env_declare(r, env, ak,
+                val.P_MUTABLE | val.P_INITIALIZED)
+            let av: Gc[JsVal] = ao
+            val.env_set_slot(env, slot, av)
+        }
+    }
+    // The body.
+    let body: u32 = ast.ast_d(t, node)
+    let fl: u32 = ast.ast_e(t, node)
+    // A generator or an async function does NOT run its body here: the
+    // parameters are bound, and everything after that belongs to the
+    // resumable evaluator of round 66 (lib/js/gen.fi).
+    if fl & (ast.FN_GENERATOR | ast.FN_ASYNC) != 0 as u32 {
+        let g: fn(Gc[Realm], Gc[JsObj], Gc[Env]) -> AllocError!Gc[JsVal] = (*c).gen_start
+        return g(r, f, env)
+    }
+    var out: Gc[JsVal] = val.realm_undefined(r)
+    if fl & ast.FN_EXPRESSION_BODY != 0 as u32 {
+        out = try eval_node(r, body, env)
+        if (*c).comp != C_NORMAL {
+            if (*c).comp == C_RETURN {
+                (*c).comp = C_NORMAL
+                return r.pending
+            }
+            return val.realm_undefined(r)
+        }
+        return out
+    }
+    let ok5: bool = try hoist_declarations(r, env, ast.ast_a(t, body),
+        ast.ast_b(t, body) as usize, true)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let x: Gc[JsVal] = try eval_statements(r, ast.ast_a(t, body),
+        ast.ast_b(t, body) as usize, env)
+    if (*c).comp == C_RETURN {
+        (*c).comp = C_NORMAL
+        return r.pending
+    }
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    return val.realm_undefined(r)
+}
+
+// 10.2.2 [[Construct]]
+fn construct(r: Gc[Realm], fv: Gc[JsVal], args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    return construct_nt(r, fv, args, gc_null[JsObj]())
+}
+
+// 7.3.14 Construct, with an explicit NEW TARGET. `Reflect.construct` is the
+// only caller that hands in a third object; everywhere else the new target
+// is the constructor itself.
+fn construct_nt(r: Gc[Realm], fv: Gc[JsVal], args: Gc[GcVec],
+    newt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if !val.is_callable(fv) {
+        var m: [u8; 22] = "is not a constructor  "
+        return throw_type_here(r, &m[0], 22)
+    }
+    let f: Gc[JsObj] = val.as_obj(fv)
+    if f.flags & val.F_CTOR == 0 && f.cls != val.CLS_NATIVE && f.cls != val.CLS_BOUND {
+        var m: [u8; 22] = "is not a constructor  "
+        return throw_type_here(r, &m[0], 22)
+    }
+    var nt: Gc[JsObj] = newt
+    if (nt as u64) == 0 {
+        nt = f
+    }
+    if f.cls == val.CLS_NATIVE {
+        let args2: Gc[GcVec] = args
+        let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).native
+        (*c).cur_fn = f
+        return h(r, f.native, val.realm_undefined(r), args2, nt)
+    }
+    if f.cls == val.CLS_BOUND {
+        return construct_nt(r, f.prim, args, newt)
+    }
+    // The prototype of the new object comes from the NEW TARGET.
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let ntv: Gc[JsVal] = nt
+    let pv: Gc[JsVal] = try get_prop(r, ntv, pk)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    var proto: Gc[JsObj] = val.as_obj(pv)
+    if (proto as u64) == 0 {
+        proto = val.realm_proto(r, val.PROTO_OBJECT)
+    }
+    let o: Gc[JsObj] = try val.obj_new_proto(r, proto)
+    let ov: Gc[JsVal] = o
+    let res: Gc[JsVal] = try call_internal(r, fv, ov, args, nt)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if val.val_tag(res) == val.TAG_OBJ {
+        return res
+    }
+    return ov
+}
+
+// ====================================================== Names and bindings
+
+// Find the environment record that holds `key`; the slot comes back in
+// `*slot`, an object record in `*obj`.
+fn resolve_name(r: Gc[Realm], env: Gc[Env], key: u64, slot: *mut i64,
+    obj: *mut Gc[JsObj]) -> AllocError!Gc[Env] {
+    var e: Gc[Env] = env
+    while (e as u64) != 0 {
+        let s: i64 = val.env_lookup(e, key)
+        if s >= 0 {
+            *slot = s
+            return e
+        }
+        let o: Gc[JsObj] = val.env_object(e)
+        if (o as u64) != 0 {
+            let ov: Gc[JsVal] = o
+            let has: bool = try has_prop(r, ov, key)
+            if has {
+                *slot = -1
+                *obj = o
+                return e
+            }
+        }
+        e = val.env_parent(e)
+    }
+    *slot = -1
+    return gc_null[Env]()
+}
+
+fn lookup_value(r: Gc[Realm], env: Gc[Env], key: u64) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    var slot: i64 = -1
+    var obj: Gc[JsObj] = gc_null[JsObj]()
+    let e: Gc[Env] = try resolve_name(r, env, key, &slot, &obj)
+    if (e as u64) == 0 {
+        let nm: Gc[JsVal] = val.key_name_str(r, key)
+        let msg: Gc[JsVal] = try name_error_text(r, nm)
+        let ev: Gc[JsVal] = try make_error_str(r, ERR_REFERENCE, msg)
+        return throw_value(r, ev)
+    }
+    if slot >= 0 {
+        let fl: u64 = val.env_slot_flags(e, slot)
+        if fl & val.P_INITIALIZED == 0 {
+            let nm: Gc[JsVal] = val.key_name_str(r, key)
+            let msg: Gc[JsVal] = try tdz_error_text(r, nm)
+            let ev: Gc[JsVal] = try make_error_str(r, ERR_REFERENCE, msg)
+            return throw_value(r, ev)
+        }
+        return val.env_get_slot(e, slot)
+    }
+    let ov: Gc[JsVal] = obj
+    return get_prop(r, ov, key)
+}
+
+fn make_error_str(r: Gc[Realm], kind: u64, msg: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let e: Gc[JsVal] = try make_error(r, kind, 0 as *mut u8, 0)
+    let o: Gc[JsObj] = val.as_obj(e)
+    let k: u64 = try val.key_for_name(r, lex.N_MESSAGE)
+    let ok: bool = try define_value(r, o, k, msg,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    return e
+}
+
+fn name_error_text(r: Gc[Realm], nm: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    var tail: [u8; 15] = " is not defined"
+    let t: Gc[JsVal] = try val.str_from_ascii(r, &tail[0], 14)
+    return val.str_concat(r, nm, t)
+}
+
+fn tdz_error_text(r: Gc[Realm], nm: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    var tail: [u8; 34] = " is not initialized (temporal dead"
+    let t: Gc[JsVal] = try val.str_from_ascii(r, &tail[0], 34)
+    return val.str_concat(r, nm, t)
+}
+
+fn assign_name(r: Gc[Realm], env: Gc[Env], key: u64, v: Gc[JsVal],
+    strict: bool) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    var slot: i64 = -1
+    var obj: Gc[JsObj] = gc_null[JsObj]()
+    let e: Gc[Env] = try resolve_name(r, env, key, &slot, &obj)
+    if (e as u64) == 0 {
+        if strict {
+            let nm: Gc[JsVal] = val.key_name_str(r, key)
+            let msg: Gc[JsVal] = try name_error_text(r, nm)
+            let ev: Gc[JsVal] = try make_error_str(r, ERR_REFERENCE, msg)
+            let x: Gc[JsVal] = throw_value(r, ev)
+            return false
+        }
+        // Sloppy mode: it becomes a property of the global object.
+        let g: Gc[JsObj] = val.realm_global(r)
+        let gv: Gc[JsVal] = g
+        return set_prop(r, gv, key, v, false)
+    }
+    if slot >= 0 {
+        let fl: u64 = val.env_slot_flags(e, slot)
+        if fl & val.P_INITIALIZED == 0 {
+            let nm: Gc[JsVal] = val.key_name_str(r, key)
+            let msg: Gc[JsVal] = try tdz_error_text(r, nm)
+            let ev: Gc[JsVal] = try make_error_str(r, ERR_REFERENCE, msg)
+            let x: Gc[JsVal] = throw_value(r, ev)
+            return false
+        }
+        if fl & val.P_MUTABLE == 0 {
+            var m: [u8; 25] = "Assignment to a constant "
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 25)
+            return false
+        }
+        val.env_set_slot(e, slot, v)
+        return true
+    }
+    let ov: Gc[JsVal] = obj
+    return set_prop(r, ov, key, v, strict)
+}
+
+// Bind a pattern. `mode` 1 = declare and initialize in `env`,
+// 0 = assign to already existing targets.
+fn bind_pattern(r: Gc[Realm], env: Gc[Env], pat: u32, v: Gc[JsVal],
+    mode: u32) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if pat == 0 as u32 {
+        return true
+    }
+    let k: u32 = ast.ast_kind(t, pat)
+    if k == ast.N_IDENT {
+        let key: u64 = try val.key_for_name(r, ast.ast_a(t, pat))
+        if mode == 1 as u32 {
+            let slot: i64 = try val.env_declare(r, env, key,
+                val.P_MUTABLE | val.P_INITIALIZED)
+            val.env_set_flags(env, slot, val.P_MUTABLE | val.P_INITIALIZED)
+            val.env_set_slot(env, slot, v)
+            return true
+        }
+        return assign_name(r, env, key, v, is_strict_env(r, env))
+    }
+    if k == ast.N_ASSIGN_PAT {
+        var use: Gc[JsVal] = v
+        if val.is_undefined(v) || val.is_gap(v) {
+            use = try eval_node(r, ast.ast_b(t, pat), env)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+        }
+        return bind_pattern(r, env, ast.ast_a(t, pat), use, mode)
+    }
+    if k == ast.N_MEMBER {
+        return assign_member(r, env, pat, v)
+    }
+    if k == ast.N_ARRAY_PAT {
+        let items: Gc[GcVec] = try iterate_values(r, v)
+        if (*c).comp != C_NORMAL {
+            return false
+        }
+        let off: u32 = ast.ast_a(t, pat)
+        let cnt: usize = ast.ast_b(t, pat) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if e == 0 as u32 {
+                i = i + 1
+                continue
+            }
+            if ast.ast_kind(t, e) == ast.N_REST {
+                let rest: Gc[JsObj] = try val.array_new(r)
+                var j: u64 = i as u64
+                while j < gcvec_length(items) {
+                    let ok: bool = try val.elems_push(r, rest,
+                        gcvec_read[JsVal](items, j))
+                    rest.len = rest.len + 1
+                    j = j + 1
+                }
+                let rv: Gc[JsVal] = rest
+                let ok2: bool = try bind_pattern(r, env, ast.ast_a(t, e), rv, mode)
+                break
+            }
+            var item: Gc[JsVal] = val.realm_undefined(r)
+            if (i as u64) < gcvec_length(items) {
+                item = gcvec_read[JsVal](items, i as u64)
+            }
+            let ok: bool = try bind_pattern(r, env, e, item, mode)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if k == ast.N_OBJECT_PAT {
+        if val.is_nullish(v) {
+            var m: [u8; 39] = "Cannot destructure undefined or null   "
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 35)
+            return false
+        }
+        let off: u32 = ast.ast_a(t, pat)
+        let cnt: usize = ast.ast_b(t, pat) as usize
+        var taken: Gc[GcVec] = try gcvec_new_raw()
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if ast.ast_kind(t, e) == ast.N_REST {
+                let rest: Gc[JsObj] = try val.obj_new(r)
+                let src: Gc[JsObj] = try to_object(r, v)
+                let keys: Gc[GcVec] = try val.obj_own_string_keys(r, src)
+                var j: u64 = 0
+                while j < gcvec_length(keys) {
+                    let kk: u64 = gcvec_read_raw(keys, j)
+                    var skip: bool = false
+                    var m2: u64 = 0
+                    while m2 < gcvec_length(taken) {
+                        if gcvec_read_raw(taken, m2) == kk {
+                            skip = true
+                        }
+                        m2 = m2 + 1
+                    }
+                    if !skip {
+                        let p: Gc[Prop] = val.obj_get_own(src, kk)
+                        var enumerable: bool = true
+                        if (p as u64) != 0 {
+                            enumerable = val.prop_attrs(p) & val.A_ENUMERABLE != 0
+                        }
+                        if enumerable {
+                            let pv: Gc[JsVal] = try get_prop(r, v, kk)
+                            let ok: bool = try define_value(r, rest, kk, pv,
+                                val.A_DEFAULT)
+                        }
+                    }
+                    j = j + 1
+                }
+                let rv: Gc[JsVal] = rest
+                let ok3: bool = try bind_pattern(r, env, ast.ast_a(t, e), rv, mode)
+                i = i + 1
+                continue
+            }
+            let keynode: u32 = ast.ast_a(t, e)
+            var key: u64 = 0
+            if ast.ast_c(t, e) & ast.PR_COMPUTED != 0 as u32 {
+                let kv: Gc[JsVal] = try eval_node(r, keynode, env)
+                if (*c).comp != C_NORMAL {
+                    return false
+                }
+                key = try to_property_key(r, kv)
+            } else {
+                key = try static_key(r, keynode)
+            }
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            let ok4: bool = try gcvec_append_raw(taken, key)
+            let pv: Gc[JsVal] = try get_prop(r, v, key)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            let ok5: bool = try bind_pattern(r, env, ast.ast_b(t, e), pv, mode)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    var m: [u8; 24] = "Invalid assignment targe"
+    let x: Gc[JsVal] = try throw_type_here(r, &m[0], 24)
+    return false
+}
+
+// Is the code being run right now strict? The nearest enclosing FUNCTION
+// decides; outside every function it is the program (`realm.depth` carries
+// that flag, set by the driver from the directive prologue).
+fn to_primitive_pub(r: Gc[Realm], v: Gc[JsVal], hint: u32) -> AllocError!Gc[JsVal] {
+    return to_primitive(r, v, hint)
+}
+
+fn is_strict_env(r: Gc[Realm], env: Gc[Env]) -> bool {
+    var e: Gc[Env] = env
+    while (e as u64) != 0 {
+        let f: Gc[JsObj] = val.env_func(e)
+        if (f as u64) != 0 {
+            return f.flags & val.F_STRICT != 0
+        }
+        e = val.env_parent(e)
+    }
+    return r.depth == 1
+}
+
+// The key of a non computed property name node.
+fn static_key(r: Gc[Realm], node: u32) -> AllocError!u64 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let k: u32 = ast.ast_kind(t, node)
+    if k == ast.N_PRIVATE_NAME {
+        return private_key(r, ast.ast_a(t, node))
+    }
+    if k == ast.N_IDENT {
+        return val.key_for_name(r, ast.ast_a(t, node))
+    }
+    if k == ast.N_STR {
+        let s: Gc[JsVal] = try val.str_from_ast(r, ast.ast_a(t, node),
+            ast.ast_b(t, node) as usize)
+        return val.key_for_str(r, s)
+    }
+    if k == ast.N_NUM {
+        let x: f64 = math.math_f64(ast.ast_num_at(t, ast.ast_a(t, node)))
+        let s: Gc[JsVal] = try number_to_string(r, x)
+        return val.key_for_str(r, s)
+    }
+    return 0
+}
+
+// 7.4: read an iterable into a plain vector. Arrays and strings take the
+// short path; everything else goes through the iterator protocol.
+// `#x`: a key of its own, invisible to every enumeration.
+fn private_key(r: Gc[Realm], name: u32) -> AllocError!u64 {
+    let desc: Gc[JsVal] = try val.str_of_name(r, name)
+    return val.realm_private_key(r, name, desc)
+}
+
+fn iterate_values(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[GcVec] {
+    let c: *mut Ctx = ctx_of(r)
+    let out: Gc[GcVec] = try gcvec_new()
+    if val.val_tag(v) == val.TAG_STR {
+        var i: u64 = 0
+        while i < val.str_len(v) {
+            var n: u64 = 1
+            let u: u32 = val.str_at(v, i)
+            if u >= 0xD800 as u32 && u <= 0xDBFF as u32 && i + 1 < val.str_len(v) {
+                let u2: u32 = val.str_at(v, i + 1)
+                if u2 >= 0xDC00 as u32 && u2 <= 0xDFFF as u32 {
+                    n = 2
+                }
+            }
+            let piece: Gc[JsVal] = try val.str_slice(r, v, i, i + n)
+            let ok: bool = try gcvec_append[JsVal](out, piece)
+            i = i + n
+        }
+        return out
+    }
+    let o: Gc[JsObj] = val.as_obj(v)
+    if (o as u64) != 0 && o.cls == val.CLS_ARRAY {
+        var i: u64 = 0
+        while i < o.len {
+            var e: Gc[JsVal] = val.elems_get(r, o, i)
+            if val.is_gap(e) {
+                e = val.realm_undefined(r)
+            }
+            let ok: bool = try gcvec_append[JsVal](out, e)
+            i = i + 1
+        }
+        return out
+    }
+    if val.is_nullish(v) {
+        var m: [u8; 21] = "is not iterable      "
+        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 16)
+        return out
+    }
+    // The general protocol.
+    let wk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_ITERATOR)
+    if (wk as u64) == 0 {
+        var m: [u8; 21] = "is not iterable      "
+        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 16)
+        return out
+    }
+    let ik: u64 = val.key_for_symbol(wk)
+    let f: Gc[JsVal] = try get_prop(r, v, ik)
+    if (*c).comp != C_NORMAL {
+        return out
+    }
+    if !val.is_callable(f) {
+        var m: [u8; 21] = "is not iterable      "
+        let x: Gc[JsVal] = try throw_type_here(r, &m[0], 16)
+        return out
+    }
+    let a0: Gc[GcVec] = try args_new(r)
+    let it: Gc[JsVal] = try call_function(r, f, v, a0)
+    if (*c).comp != C_NORMAL {
+        return out
+    }
+    let nk: u64 = try val.key_for_name(r, lex.N_NEXT)
+    let dk: u64 = try val.key_for_name(r, lex.N_DONE)
+    let vk: u64 = try val.key_for_name(r, lex.N_VALUE)
+    var guard: u64 = 0
+    while guard < 10000000 {
+        let nf: Gc[JsVal] = try get_prop(r, it, nk)
+        if (*c).comp != C_NORMAL {
+            return out
+        }
+        if !val.is_callable(nf) {
+            var m: [u8; 24] = "iterator.next is not a f"
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 24)
+            return out
+        }
+        let a1: Gc[GcVec] = try args_new(r)
+        let res: Gc[JsVal] = try call_function(r, nf, it, a1)
+        if (*c).comp != C_NORMAL {
+            return out
+        }
+        if val.val_tag(res) != val.TAG_OBJ {
+            var m: [u8; 30] = "iterator result is not an obje"
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 30)
+            return out
+        }
+        let d: Gc[JsVal] = try get_prop(r, res, dk)
+        if (*c).comp != C_NORMAL {
+            return out
+        }
+        if to_boolean(r, d) {
+            return out
+        }
+        let e: Gc[JsVal] = try get_prop(r, res, vk)
+        if (*c).comp != C_NORMAL {
+            return out
+        }
+        let ok: bool = try gcvec_append[JsVal](out, e)
+        guard = guard + 1
+    }
+    return out
+}
+
+// =========================================================== The evaluator
+
+// Hoisting (10.2.11 FunctionDeclarationInstantiation, 16.1.7
+// GlobalDeclarationInstantiation): `var` and function declarations come
+// into being BEFORE the first statement runs, `let`/`const` come into being
+// uninitialized (the temporal dead zone).
+fn hoist_declarations(r: Gc[Realm], env: Gc[Env], off: u32, count: usize,
+    fn_level: bool) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var i: usize = 0
+    while i < count {
+        let s: u32 = ast.ast_list_at(t, off, i)
+        let ok: bool = try hoist_one(r, env, s, fn_level)
+        i = i + 1
+    }
+    // The function declarations are created afterwards, so that they see
+    // the complete set of bindings.
+    i = 0
+    while i < count {
+        let s: u32 = ast.ast_list_at(t, off, i)
+        if ast.ast_kind(t, s) == ast.N_FUNC && ast.ast_e(t, s) & ast.FN_DECLARATION != 0 as u32 {
+            let name: u32 = ast.ast_a(t, ast.ast_a(t, s))
+            let f: Gc[JsObj] = try make_function(r, s, env, name)
+            let key: u64 = try val.key_for_name(r, name)
+            let fv: Gc[JsVal] = f
+            let slot: i64 = val.env_lookup(env, key)
+            if slot >= 0 {
+                val.env_set_flags(env, slot, val.P_MUTABLE | val.P_INITIALIZED)
+                val.env_set_slot(env, slot, fv)
+                // 16.1.7 CreateGlobalFunctionBinding: at the TOP LEVEL a
+                // function declaration is also a property of the global
+                // object -- `globalThis.f` has to find it.
+                if val.env_kind(env) == val.ENV_GLOBAL {
+                    let g0: Gc[JsObj] = val.env_object(env)
+                    if (g0 as u64) != 0 {
+                        let ok3: bool = try define_value(r, g0, key, fv,
+                            val.A_WRITABLE | val.A_ENUMERABLE)
+                    }
+                }
+            } else {
+                let g: Gc[JsObj] = val.env_object(env)
+                if (g as u64) != 0 {
+                    let gv: Gc[JsVal] = g
+                    let ok2: bool = try define_value(r, g, key, fv, val.A_DEFAULT)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hoist_one(r: Gc[Realm], env: Gc[Env], s: u32,
+    fn_level: bool) -> AllocError!bool {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if s == 0 as u32 {
+        return true
+    }
+    let k: u32 = ast.ast_kind(t, s)
+    if k == ast.N_VAR_DECL {
+        let kind: u32 = ast.ast_a(t, s)
+        let off: u32 = ast.ast_b(t, s)
+        let cnt: usize = ast.ast_c(t, s) as usize
+        var i: usize = 0
+        while i < cnt {
+            let d: u32 = ast.ast_list_at(t, off, i)
+            if kind == ast.D_VAR {
+                if fn_level {
+                    let ok: bool = try hoist_names(r, env, ast.ast_a(t, d),
+                        val.P_MUTABLE | val.P_INITIALIZED)
+                }
+            } else {
+                var fl: u64 = val.P_MUTABLE
+                if kind == ast.D_CONST {
+                    fl = 0
+                }
+                let ok: bool = try hoist_names(r, env, ast.ast_a(t, d), fl)
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if k == ast.N_FUNC && ast.ast_e(t, s) & ast.FN_DECLARATION != 0 as u32 {
+        let name: u32 = ast.ast_a(t, ast.ast_a(t, s))
+        let key: u64 = try val.key_for_name(r, name)
+        let slot: i64 = try val.env_declare(r, env, key,
+            val.P_MUTABLE | val.P_INITIALIZED)
+        return true
+    }
+    if k == ast.N_CLASS && ast.ast_a(t, s) != 0 as u32 {
+        let name: u32 = ast.ast_a(t, ast.ast_a(t, s))
+        let key: u64 = try val.key_for_name(r, name)
+        let slot: i64 = try val.env_declare(r, env, key, val.P_MUTABLE)
+        return true
+    }
+    if !fn_level {
+        return true
+    }
+    // `var` reaches through blocks up to the function boundary.
+    if k == ast.N_BLOCK {
+        return hoist_var_only(r, env, ast.ast_a(t, s), ast.ast_b(t, s) as usize)
+    }
+    if k == ast.N_IF {
+        let ok1: bool = try hoist_var_deep(r, env, ast.ast_b(t, s))
+        return hoist_var_deep(r, env, ast.ast_c(t, s))
+    }
+    if k == ast.N_WHILE || k == ast.N_LABELED {
+        return hoist_var_deep(r, env, ast.ast_b(t, s))
+    }
+    if k == ast.N_DOWHILE {
+        return hoist_var_deep(r, env, ast.ast_a(t, s))
+    }
+    if k == ast.N_FOR {
+        let ok1: bool = try hoist_var_deep(r, env, ast.ast_a(t, s))
+        return hoist_var_deep(r, env, ast.ast_d(t, s))
+    }
+    if k == ast.N_FORIN || k == ast.N_FOROF {
+        let ok1: bool = try hoist_var_deep(r, env, ast.ast_a(t, s))
+        return hoist_var_deep(r, env, ast.ast_c(t, s))
+    }
+    if k == ast.N_TRY {
+        let ok1: bool = try hoist_var_deep(r, env, ast.ast_a(t, s))
+        let h: u32 = ast.ast_b(t, s)
+        if h != 0 as u32 {
+            let ok2: bool = try hoist_var_deep(r, env, ast.ast_b(t, h))
+        }
+        return hoist_var_deep(r, env, ast.ast_c(t, s))
+    }
+    if k == ast.N_SWITCH {
+        let off: u32 = ast.ast_b(t, s)
+        let cnt: usize = ast.ast_c(t, s) as usize
+        var i: usize = 0
+        while i < cnt {
+            let cs: u32 = ast.ast_list_at(t, off, i)
+            let ok: bool = try hoist_var_only(r, env, ast.ast_b(t, cs),
+                ast.ast_c(t, cs) as usize)
+            i = i + 1
+        }
+        return true
+    }
+    if k == ast.N_WITH {
+        return hoist_var_deep(r, env, ast.ast_b(t, s))
+    }
+    return true
+}
+
+fn hoist_var_deep(r: Gc[Realm], env: Gc[Env], s: u32) -> AllocError!bool {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if s == 0 as u32 {
+        return true
+    }
+    let k: u32 = ast.ast_kind(t, s)
+    if k == ast.N_VAR_DECL {
+        if ast.ast_a(t, s) != ast.D_VAR {
+            return true
+        }
+        let off: u32 = ast.ast_b(t, s)
+        let cnt: usize = ast.ast_c(t, s) as usize
+        var i: usize = 0
+        while i < cnt {
+            let d: u32 = ast.ast_list_at(t, off, i)
+            let ok: bool = try hoist_names(r, env, ast.ast_a(t, d),
+                val.P_MUTABLE | val.P_INITIALIZED)
+            i = i + 1
+        }
+        return true
+    }
+    if k == ast.N_FUNC || k == ast.N_CLASS {
+        return true
+    }
+    return hoist_one(r, env, s, true)
+}
+
+fn hoist_var_only(r: Gc[Realm], env: Gc[Env], off: u32,
+    count: usize) -> AllocError!bool {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var i: usize = 0
+    while i < count {
+        let s: u32 = ast.ast_list_at(t, off, i)
+        let ok: bool = try hoist_var_deep(r, env, s)
+        i = i + 1
+    }
+    return true
+}
+
+fn hoist_names(r: Gc[Realm], env: Gc[Env], pat: u32,
+    flags: u64) -> AllocError!bool {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if pat == 0 as u32 {
+        return true
+    }
+    let k: u32 = ast.ast_kind(t, pat)
+    if k == ast.N_IDENT {
+        let key: u64 = try val.key_for_name(r, ast.ast_a(t, pat))
+        let have: i64 = val.env_lookup(env, key)
+        if have >= 0 {
+            if flags & val.P_INITIALIZED != 0 {
+                return true
+            }
+            val.env_set_flags(env, have, flags)
+            return true
+        }
+        let slot: i64 = try val.env_declare(r, env, key, flags)
+        // A `var` in the global record also becomes a property.
+        if flags & val.P_INITIALIZED != 0 && val.env_kind(env) == val.ENV_GLOBAL {
+            let g: Gc[JsObj] = val.env_object(env)
+            if (g as u64) != 0 && !val.obj_has_own(g, key) {
+                let ok: bool = try define_value(r, g, key,
+                    val.realm_undefined(r), val.A_WRITABLE | val.A_ENUMERABLE)
+            }
+        }
+        return true
+    }
+    if k == ast.N_ASSIGN_PAT || k == ast.N_REST {
+        return hoist_names(r, env, ast.ast_a(t, pat), flags)
+    }
+    if k == ast.N_ARRAY_PAT {
+        let off: u32 = ast.ast_a(t, pat)
+        let cnt: usize = ast.ast_b(t, pat) as usize
+        var i: usize = 0
+        while i < cnt {
+            let ok: bool = try hoist_names(r, env, ast.ast_list_at(t, off, i), flags)
+            i = i + 1
+        }
+        return true
+    }
+    if k == ast.N_OBJECT_PAT {
+        let off: u32 = ast.ast_a(t, pat)
+        let cnt: usize = ast.ast_b(t, pat) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if ast.ast_kind(t, e) == ast.N_REST {
+                let ok: bool = try hoist_names(r, env, ast.ast_a(t, e), flags)
+            } else {
+                let ok: bool = try hoist_names(r, env, ast.ast_b(t, e), flags)
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return true
+}
+
+fn eval_statements(r: Gc[Realm], off: u32, count: usize,
+    env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var last: Gc[JsVal] = val.realm_undefined(r)
+    var i: usize = 0
+    while i < count {
+        let s: u32 = ast.ast_list_at(t, off, i)
+        let v: Gc[JsVal] = try eval_node(r, s, env)
+        if !val.is_gap(v) && !val.is_undefined(v) {
+            last = v
+        }
+        if (*c).comp != C_NORMAL {
+            return last
+        }
+        i = i + 1
+    }
+    return last
+}
+
+fn assign_member(r: Gc[Realm], env: Gc[Env], node: u32,
+    v: Gc[JsVal]) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let base: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+    if (*c).comp != C_NORMAL {
+        return false
+    }
+    var key: u64 = 0
+    if ast.ast_c(t, node) & ast.MB_COMPUTED != 0 as u32 {
+        let kv: Gc[JsVal] = try eval_node(r, ast.ast_b(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return false
+        }
+        key = try to_property_key(r, kv)
+    } else {
+        key = try static_key(r, ast.ast_b(t, node))
+    }
+    if (*c).comp != C_NORMAL {
+        return false
+    }
+    return set_prop(r, base, key, v, is_strict_env(r, env))
+}
+
+// The one dispatch over the node kinds. Statements return `undefined` (or
+// the completion value of the last expression statement, which the driver
+// prints); expressions return their value.
+fn eval_node(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if node == 0 as u32 {
+        return val.realm_undefined(r)
+    }
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let k: u32 = ast.ast_kind(t, node)
+
+    // ---- literals
+    if k == ast.N_NUM {
+        return val.realm_num(r, math.math_f64(ast.ast_num_at(t, ast.ast_a(t, node))))
+    }
+    if k == ast.N_STR {
+        return val.str_from_ast(r, ast.ast_a(t, node), ast.ast_b(t, node) as usize)
+    }
+    if k == ast.N_BOOL {
+        return val.realm_bool(r, ast.ast_a(t, node) == 1 as u32)
+    }
+    if k == ast.N_NULL {
+        return val.realm_null(r)
+    }
+    if k == ast.N_IDENT {
+        let key: u64 = try val.key_for_name(r, ast.ast_a(t, node))
+        return lookup_value(r, env, key)
+    }
+    if k == ast.N_THIS {
+        return this_of(r, env)
+    }
+    if k == ast.N_TEMPLATE {
+        return eval_template(r, node, env)
+    }
+    if k == ast.N_REGEXP {
+        // Round 74: the literal becomes a real RegExp object. This file
+        // cannot import `lib/js/regexp.fi` (that one imports this one), so
+        // it goes through the native table the driver installed -- the same
+        // construction the built ins use.
+        let src: Gc[JsVal] = try val.str_from_ast(r, ast.ast_a(t, node),
+            ast.ast_b(t, node) as usize)
+        let fl: Gc[JsVal] = try val.str_from_ast(r, ast.ast_c(t, node),
+            ast.ast_d(t, node) as usize)
+        let ra: Gc[GcVec] = try args_new(r)
+        let q1: bool = try gcvec_append[JsVal](ra, src)
+        let q2: bool = try gcvec_append[JsVal](ra, fl)
+        let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).native
+        return h(r, NATIVE_REGEXP_CTOR, val.realm_undefined(r), ra,
+            gc_null[JsObj]())
+    }
+    if k == ast.N_BIGINT {
+        return bigint_of_ast(r, node)
+    }
+    if k == ast.N_YIELD || k == ast.N_AWAIT {
+        // Reached only where the resumable evaluator does not carry the
+        // expression -- an honest failure instead of a wrong value.
+        var m: [u8; 41] = "yield in this position is not supported  "
+        return throw_type_here(r, &m[0], 38)
+    }
+
+    // ---- expressions
+    if k == ast.N_ARRAY {
+        return eval_array(r, node, env)
+    }
+    if k == ast.N_OBJECT {
+        return eval_object(r, node, env)
+    }
+    if k == ast.N_FUNC {
+        if ast.ast_e(t, node) & ast.FN_DECLARATION != 0 as u32 {
+            return val.realm_undefined(r)
+        }
+        var name: u32 = 0xFFFFFFFF as u32
+        if ast.ast_a(t, node) != 0 as u32 {
+            name = ast.ast_a(t, ast.ast_a(t, node))
+        }
+        var use_env: Gc[Env] = env
+        if name != 0xFFFFFFFF as u32 {
+            // A named function expression sees its own name (10.2.11).
+            use_env = try val.env_new(r, env, val.ENV_DECL)
+        }
+        let f: Gc[JsObj] = try make_function(r, node, use_env, name)
+        let fv: Gc[JsVal] = f
+        if name != 0xFFFFFFFF as u32 {
+            let key: u64 = try val.key_for_name(r, name)
+            let slot: i64 = try val.env_declare(r, use_env, key, val.P_INITIALIZED)
+            val.env_set_slot(use_env, slot, fv)
+        }
+        return fv
+    }
+    if k == ast.N_CLASS {
+        let cv: Gc[JsVal] = try eval_class(r, node, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        // A class DECLARATION also initializes its binding (15.7.16).
+        if ast.ast_e(t, node) == 1 as u32 && ast.ast_a(t, node) != 0 as u32 {
+            let key: u64 = try val.key_for_name(r, ast.ast_a(t, ast.ast_a(t, node)))
+            let slot: i64 = val.env_lookup(env, key)
+            if slot >= 0 {
+                val.env_set_flags(env, slot, val.P_MUTABLE | val.P_INITIALIZED)
+                val.env_set_slot(env, slot, cv)
+            } else {
+                let ok: bool = try assign_name(r, env, key, cv, false)
+            }
+            return val.realm_undefined(r)
+        }
+        return cv
+    }
+    if k == ast.N_UNARY {
+        return eval_unary(r, node, env)
+    }
+    if k == ast.N_UPDATE {
+        return eval_update(r, node, env)
+    }
+    if k == ast.N_BINARY {
+        return eval_binary(r, node, env)
+    }
+    if k == ast.N_LOGICAL {
+        let op: u32 = ast.ast_a(t, node)
+        let a: Gc[JsVal] = try eval_node(r, ast.ast_b(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if op == lex.P_ANDAND {
+            if !to_boolean(r, a) {
+                return a
+            }
+        } else if op == lex.P_OROR {
+            if to_boolean(r, a) {
+                return a
+            }
+        } else {
+            if !val.is_nullish(a) {
+                return a
+            }
+        }
+        return eval_node(r, ast.ast_c(t, node), env)
+    }
+    if k == ast.N_COND {
+        let a: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if to_boolean(r, a) {
+            return eval_node(r, ast.ast_b(t, node), env)
+        }
+        return eval_node(r, ast.ast_c(t, node), env)
+    }
+    if k == ast.N_ASSIGN {
+        return eval_assign(r, node, env)
+    }
+    if k == ast.N_SEQUENCE {
+        let off: u32 = ast.ast_a(t, node)
+        let cnt: usize = ast.ast_b(t, node) as usize
+        var last: Gc[JsVal] = val.realm_undefined(r)
+        var i: usize = 0
+        while i < cnt {
+            last = try eval_node(r, ast.ast_list_at(t, off, i), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            i = i + 1
+        }
+        return last
+    }
+    if k == ast.N_MEMBER {
+        var base: Gc[JsVal] = val.realm_undefined(r)
+        return eval_member(r, node, env, &base)
+    }
+    if k == ast.N_CHAIN {
+        return eval_node(r, ast.ast_a(t, node), env)
+    }
+    if k == ast.N_CALL {
+        return eval_call(r, node, env)
+    }
+    if k == ast.N_NEW {
+        let callee: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let args: Gc[GcVec] = try eval_arguments(r, ast.ast_b(t, node),
+            ast.ast_c(t, node) as usize, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        return construct(r, callee, args)
+    }
+    if k == ast.N_META {
+        return new_target_of(r, env)
+    }
+    if k == ast.N_TAGGED {
+        return eval_tagged(r, node, env)
+    }
+    if k == ast.N_SUPER {
+        return val.realm_undefined(r)
+    }
+
+    // ---- statements
+    if k == ast.N_EXPR_STMT {
+        return eval_node(r, ast.ast_a(t, node), env)
+    }
+    if k == ast.N_VAR_DECL {
+        return eval_var_decl(r, node, env)
+    }
+    if k == ast.N_BLOCK {
+        let inner: Gc[Env] = try val.env_new(r, env, val.ENV_DECL)
+        let ok: bool = try hoist_declarations(r, inner, ast.ast_a(t, node),
+            ast.ast_b(t, node) as usize, false)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        return eval_statements(r, ast.ast_a(t, node),
+            ast.ast_b(t, node) as usize, inner)
+    }
+    if k == ast.N_EMPTY || k == ast.N_DEBUGGER {
+        return val.realm_undefined(r)
+    }
+    if k == ast.N_IF {
+        let test: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if to_boolean(r, test) {
+            return eval_node(r, ast.ast_b(t, node), env)
+        }
+        return eval_node(r, ast.ast_c(t, node), env)
+    }
+    if k == ast.N_WHILE || k == ast.N_DOWHILE {
+        return eval_while(r, node, env, k == ast.N_DOWHILE)
+    }
+    if k == ast.N_FOR {
+        return eval_for(r, node, env)
+    }
+    if k == ast.N_FORIN || k == ast.N_FOROF {
+        return eval_for_each(r, node, env, k == ast.N_FOROF)
+    }
+    if k == ast.N_RETURN {
+        var v: Gc[JsVal] = val.realm_undefined(r)
+        if ast.ast_a(t, node) != 0 as u32 {
+            v = try eval_node(r, ast.ast_a(t, node), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+        }
+        (*c).comp = C_RETURN
+        r.pending = v
+        return v
+    }
+    if k == ast.N_THROW {
+        let v: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        return throw_value(r, v)
+    }
+    if k == ast.N_BREAK {
+        (*c).comp = C_BREAK
+        (*c).label = ast.ast_a(t, node)
+        return val.realm_undefined(r)
+    }
+    if k == ast.N_CONTINUE {
+        (*c).comp = C_CONTINUE
+        (*c).label = ast.ast_a(t, node)
+        return val.realm_undefined(r)
+    }
+    if k == ast.N_LABELED {
+        let lbl: u32 = ast.ast_a(t, node) + 1 as u32
+        let v: Gc[JsVal] = try eval_labeled(r, ast.ast_b(t, node), env, lbl)
+        return v
+    }
+    if k == ast.N_TRY {
+        return eval_try(r, node, env)
+    }
+    if k == ast.N_SWITCH {
+        return eval_switch(r, node, env)
+    }
+    if k == ast.N_WITH {
+        let o: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let obj: Gc[JsObj] = try to_object(r, o)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let inner: Gc[Env] = try val.env_new(r, env, val.ENV_OBJECT)
+        inner.obj = obj
+        return eval_node(r, ast.ast_b(t, node), inner)
+    }
+    if k == ast.N_PROGRAM {
+        return eval_statements(r, ast.ast_a(t, node),
+            ast.ast_b(t, node) as usize, env)
+    }
+    if k == ast.N_IMPORT || k == ast.N_EXPORT_NAMED || k == ast.N_EXPORT_DEFAULT || k == ast.N_EXPORT_ALL {
+        var m: [u8; 34] = "modules are not linked in this eng"
+        return throw_type_here(r, &m[0], 34)
+    }
+    return val.realm_undefined(r)
+}
+
+fn this_of(r: Gc[Realm], env: Gc[Env]) -> Gc[JsVal] {
+    var e: Gc[Env] = env
+    while (e as u64) != 0 {
+        if val.env_has_this(e) {
+            return val.env_this(e)
+        }
+        e = val.env_parent(e)
+    }
+    let g: Gc[JsObj] = val.realm_global(r)
+    let gv: Gc[JsVal] = g
+    return gv
+}
+
+fn new_target_of(r: Gc[Realm], env: Gc[Env]) -> Gc[JsVal] {
+    var e: Gc[Env] = env
+    while (e as u64) != 0 {
+        if val.env_has_this(e) {
+            let o: Gc[JsObj] = val.env_object(e)
+            if (o as u64) != 0 {
+                let ov: Gc[JsVal] = o
+                return ov
+            }
+            return val.realm_undefined(r)
+        }
+        e = val.env_parent(e)
+    }
+    return val.realm_undefined(r)
+}
+
+// --------------------------------------------------------- Sub evaluators
+
+fn eval_var_decl(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let kind: u32 = ast.ast_a(t, node)
+    let off: u32 = ast.ast_b(t, node)
+    let cnt: usize = ast.ast_c(t, node) as usize
+    var i: usize = 0
+    while i < cnt {
+        let d: u32 = ast.ast_list_at(t, off, i)
+        let target: u32 = ast.ast_a(t, d)
+        let init: u32 = ast.ast_b(t, d)
+        if init != 0 as u32 {
+            var v: Gc[JsVal] = try eval_node(r, init, env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            // A function or class without a name gets the variable's name.
+            if ast.ast_kind(t, target) == ast.N_IDENT {
+                let ok0: bool = try name_anonymous(r, v, ast.ast_a(t, target))
+            }
+            let ok: bool = try init_binding(r, env, target, v, kind)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+        } else if kind != ast.D_VAR {
+            let ok: bool = try init_binding(r, env, target,
+                val.realm_undefined(r), kind)
+        }
+        i = i + 1
+    }
+    return val.realm_undefined(r)
+}
+
+fn name_anonymous(r: Gc[Realm], v: Gc[JsVal], name: u32) -> AllocError!bool {
+    let o: Gc[JsObj] = val.as_obj(v)
+    if (o as u64) == 0 {
+        return true
+    }
+    if o.cls != val.CLS_FUNCTION {
+        return true
+    }
+    let nk: u64 = try val.key_for_name(r, lex.N_NAME)
+    let p: Gc[Prop] = val.obj_get_own(o, nk)
+    if (p as u64) != 0 && val.str_len(val.prop_value(p)) != 0 {
+        return true
+    }
+    let nv: Gc[JsVal] = try val.str_of_name(r, name)
+    return define_value(r, o, nk, nv, val.A_CONFIGURABLE)
+}
+
+// A declaration initializes; an assignment writes.
+fn init_binding(r: Gc[Realm], env: Gc[Env], target: u32, v: Gc[JsVal],
+    kind: u32) -> AllocError!bool {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if ast.ast_kind(t, target) == ast.N_IDENT {
+        let key: u64 = try val.key_for_name(r, ast.ast_a(t, target))
+        if kind == ast.D_VAR {
+            return assign_name(r, env, key, v, false)
+        }
+        var e: Gc[Env] = env
+        let slot: i64 = val.env_lookup(e, key)
+        if slot >= 0 {
+            var fl: u64 = val.P_INITIALIZED
+            if kind != ast.D_CONST {
+                fl = fl | val.P_MUTABLE
+            }
+            val.env_set_flags(e, slot, fl)
+            val.env_set_slot(e, slot, v)
+            return true
+        }
+        return assign_name(r, env, key, v, false)
+    }
+    // A pattern: `var` assigns, `let`/`const` initialize.
+    if kind == ast.D_VAR {
+        return bind_pattern(r, env, target, v, 0)
+    }
+    return bind_pattern_init(r, env, target, v, kind)
+}
+
+fn bind_pattern_init(r: Gc[Realm], env: Gc[Env], pat: u32, v: Gc[JsVal],
+    kind: u32) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if pat == 0 as u32 {
+        return true
+    }
+    let k: u32 = ast.ast_kind(t, pat)
+    if k == ast.N_IDENT {
+        return init_binding(r, env, pat, v, kind)
+    }
+    if k == ast.N_ASSIGN_PAT {
+        var use: Gc[JsVal] = v
+        if val.is_undefined(v) || val.is_gap(v) {
+            use = try eval_node(r, ast.ast_b(t, pat), env)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+        }
+        return bind_pattern_init(r, env, ast.ast_a(t, pat), use, kind)
+    }
+    if k == ast.N_ARRAY_PAT {
+        let items: Gc[GcVec] = try iterate_values(r, v)
+        if (*c).comp != C_NORMAL {
+            return false
+        }
+        let off: u32 = ast.ast_a(t, pat)
+        let cnt: usize = ast.ast_b(t, pat) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if e == 0 as u32 {
+                i = i + 1
+                continue
+            }
+            if ast.ast_kind(t, e) == ast.N_REST {
+                let rest: Gc[JsObj] = try val.array_new(r)
+                var j: u64 = i as u64
+                while j < gcvec_length(items) {
+                    let ok: bool = try val.elems_push(r, rest,
+                        gcvec_read[JsVal](items, j))
+                    rest.len = rest.len + 1
+                    j = j + 1
+                }
+                let rv: Gc[JsVal] = rest
+                let ok2: bool = try bind_pattern_init(r, env, ast.ast_a(t, e),
+                    rv, kind)
+                break
+            }
+            var item: Gc[JsVal] = val.realm_undefined(r)
+            if (i as u64) < gcvec_length(items) {
+                item = gcvec_read[JsVal](items, i as u64)
+            }
+            let ok: bool = try bind_pattern_init(r, env, e, item, kind)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if k == ast.N_OBJECT_PAT {
+        if val.is_nullish(v) {
+            var m: [u8; 36] = "Cannot destructure undefined or null"
+            let x: Gc[JsVal] = try throw_type_here(r, &m[0], 35)
+            return false
+        }
+        let off: u32 = ast.ast_a(t, pat)
+        let cnt: usize = ast.ast_b(t, pat) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if ast.ast_kind(t, e) == ast.N_REST {
+                let ok0: bool = try bind_pattern(r, env, e, v, 1)
+                i = i + 1
+                continue
+            }
+            var key: u64 = 0
+            if ast.ast_c(t, e) & ast.PR_COMPUTED != 0 as u32 {
+                let kv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, e), env)
+                if (*c).comp != C_NORMAL {
+                    return false
+                }
+                key = try to_property_key(r, kv)
+            } else {
+                key = try static_key(r, ast.ast_a(t, e))
+            }
+            let pv: Gc[JsVal] = try get_prop(r, v, key)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            let ok: bool = try bind_pattern_init(r, env, ast.ast_b(t, e), pv, kind)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return bind_pattern(r, env, pat, v, 0)
+}
+
+fn eval_array(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let a: Gc[JsObj] = try val.array_new(r)
+    let off: u32 = ast.ast_a(t, node)
+    let cnt: usize = ast.ast_b(t, node) as usize
+    var i: usize = 0
+    while i < cnt {
+        let e: u32 = ast.ast_list_at(t, off, i)
+        if e == 0 as u32 {
+            let ok: bool = try val.elems_push(r, a, val.realm_gap(r))
+            a.len = a.len + 1
+            i = i + 1
+            continue
+        }
+        if ast.ast_kind(t, e) == ast.N_SPREAD {
+            let sv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, e), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            let items: Gc[GcVec] = try iterate_values(r, sv)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            var j: u64 = 0
+            while j < gcvec_length(items) {
+                let ok: bool = try val.elems_push(r, a, gcvec_read[JsVal](items, j))
+                a.len = a.len + 1
+                j = j + 1
+            }
+            i = i + 1
+            continue
+        }
+        let v: Gc[JsVal] = try eval_node(r, e, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let ok: bool = try val.elems_push(r, a, v)
+        a.len = a.len + 1
+        i = i + 1
+    }
+    let av: Gc[JsVal] = a
+    return av
+}
+
+fn eval_object(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let o: Gc[JsObj] = try val.obj_new(r)
+    let off: u32 = ast.ast_a(t, node)
+    let cnt: usize = ast.ast_b(t, node) as usize
+    var i: usize = 0
+    while i < cnt {
+        let e: u32 = ast.ast_list_at(t, off, i)
+        if ast.ast_kind(t, e) == ast.N_SPREAD {
+            let sv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, e), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            if !val.is_nullish(sv) {
+                let src: Gc[JsObj] = try to_object(r, sv)
+                let keys: Gc[GcVec] = try val.obj_own_string_keys(r, src)
+                var j: u64 = 0
+                while j < gcvec_length(keys) {
+                    let kk: u64 = gcvec_read_raw(keys, j)
+                    let pv: Gc[JsVal] = try get_prop(r, sv, kk)
+                    if (*c).comp != C_NORMAL {
+                        return val.realm_undefined(r)
+                    }
+                    let ok: bool = try define_value(r, o, kk, pv, val.A_DEFAULT)
+                    j = j + 1
+                }
+            }
+            i = i + 1
+            continue
+        }
+        let flags: u32 = ast.ast_c(t, e)
+        var key: u64 = 0
+        if flags & ast.PR_COMPUTED != 0 as u32 {
+            let kv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, e), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            key = try to_property_key(r, kv)
+        } else {
+            key = try static_key(r, ast.ast_a(t, e))
+        }
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if flags & (ast.PR_GET | ast.PR_SET) != 0 as u32 {
+            let f: Gc[JsObj] = try make_function(r, ast.ast_b(t, e), env,
+                0xFFFFFFFF as u32)
+            let fv: Gc[JsVal] = f
+            var getter: Gc[JsVal] = val.realm_undefined(r)
+            var setter: Gc[JsVal] = val.realm_undefined(r)
+            let old: Gc[Prop] = val.obj_get_own(o, key)
+            if (old as u64) != 0 && val.prop_is_accessor(old) {
+                getter = val.prop_value(old)
+                setter = val.prop_setter(old)
+            }
+            if flags & ast.PR_GET != 0 as u32 {
+                getter = fv
+            } else {
+                setter = fv
+            }
+            let ok: bool = try define_accessor(r, o, key, getter, setter,
+                val.A_ENUMERABLE | val.A_CONFIGURABLE)
+            i = i + 1
+            continue
+        }
+        let v: Gc[JsVal] = try eval_node(r, ast.ast_b(t, e), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        // `__proto__: v` sets the prototype instead of a property (B.3.1).
+        if flags & ast.PR_PROTO != 0 as u32 {
+            if val.val_tag(v) == val.TAG_OBJ {
+                val.obj_set_proto(o, val.as_obj(v))
+            } else if val.is_null(v) {
+                val.obj_set_proto(o, gc_null[JsObj]())
+            }
+            i = i + 1
+            continue
+        }
+        if !val.key_is_symbol(key) {
+            let ks: Gc[JsVal] = val.key_name_str(r, key)
+            let ok0: bool = try name_anonymous_str(r, v, ks)
+        }
+        let ok: bool = try define_value(r, o, key, v, val.A_DEFAULT)
+        i = i + 1
+    }
+    let ov: Gc[JsVal] = o
+    return ov
+}
+
+fn name_anonymous_str(r: Gc[Realm], v: Gc[JsVal],
+    name: Gc[JsVal]) -> AllocError!bool {
+    let o: Gc[JsObj] = val.as_obj(v)
+    if (o as u64) == 0 || o.cls != val.CLS_FUNCTION {
+        return true
+    }
+    let nk: u64 = try val.key_for_name(r, lex.N_NAME)
+    let p: Gc[Prop] = val.obj_get_own(o, nk)
+    if (p as u64) != 0 && val.str_len(val.prop_value(p)) != 0 {
+        return true
+    }
+    return define_value(r, o, nk, name, val.A_CONFIGURABLE)
+}
+
+fn eval_unary(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let op: u32 = ast.ast_a(t, node)
+    let arg: u32 = ast.ast_b(t, node)
+    if op == ast.U_TYPEOF {
+        // `typeof undeclared` must NOT throw (13.5.1.1).
+        if ast.ast_kind(t, arg) == ast.N_IDENT {
+            let key: u64 = try val.key_for_name(r, ast.ast_a(t, arg))
+            var slot: i64 = -1
+            var obj: Gc[JsObj] = gc_null[JsObj]()
+            let e: Gc[Env] = try resolve_name(r, env, key, &slot, &obj)
+            if (e as u64) == 0 {
+                var m: [u8; 9] = "undefined"
+                return val.str_from_ascii(r, &m[0], 9)
+            }
+        }
+        let v: Gc[JsVal] = try eval_node(r, arg, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        return js_typeof(r, v)
+    }
+    if op == ast.U_DELETE {
+        if ast.ast_kind(t, arg) == ast.N_MEMBER {
+            let base: Gc[JsVal] = try eval_node(r, ast.ast_a(t, arg), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            var key: u64 = 0
+            if ast.ast_c(t, arg) & ast.MB_COMPUTED != 0 as u32 {
+                let kv: Gc[JsVal] = try eval_node(r, ast.ast_b(t, arg), env)
+                if (*c).comp != C_NORMAL {
+                    return val.realm_undefined(r)
+                }
+                key = try to_property_key(r, kv)
+            } else {
+                key = try static_key(r, ast.ast_b(t, arg))
+            }
+            if val.is_nullish(base) {
+                var m: [u8; 32] = "Cannot delete on undefined/null "
+                return throw_type_here(r, &m[0], 31)
+            }
+            let ok: bool = try delete_prop(r, base, key, is_strict_env(r, env))
+            return val.realm_bool(r, ok)
+        }
+        if ast.ast_kind(t, arg) == ast.N_IDENT {
+            let key: u64 = try val.key_for_name(r, ast.ast_a(t, arg))
+            var slot: i64 = -1
+            var obj: Gc[JsObj] = gc_null[JsObj]()
+            let e: Gc[Env] = try resolve_name(r, env, key, &slot, &obj)
+            if (e as u64) == 0 {
+                return val.realm_bool(r, true)
+            }
+            if slot >= 0 {
+                return val.realm_bool(r, false)
+            }
+            let ov: Gc[JsVal] = obj
+            let ok: bool = try delete_prop(r, ov, key, false)
+            return val.realm_bool(r, ok)
+        }
+        let v: Gc[JsVal] = try eval_node(r, arg, env)
+        return val.realm_bool(r, true)
+    }
+    let v: Gc[JsVal] = try eval_node(r, arg, env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if op == ast.U_VOID {
+        return val.realm_undefined(r)
+    }
+    if op == ast.U_NOT {
+        return val.realm_bool(r, !to_boolean(r, v))
+    }
+    if op == ast.U_PLUS {
+        let x: f64 = math.math_f64(try to_number(r, v))
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        return val.realm_num(r, x)
+    }
+    if op == ast.U_MINUS {
+        if val.is_bigint(v) {
+            return bigint.bi_neg(r, v)
+        }
+        let x: f64 = math.math_f64(try to_number(r, v))
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        // Firn has no unary minus for f64 (docs/ROUND63.md, gap 1); the
+        // sign bit is flipped, which is exact and produces -0 correctly.
+        return val.realm_num(r, math.math_f64(math.math_bits(x) ^ 0x8000000000000000))
+    }
+    if op == ast.U_BITNOT {
+        if val.is_bigint(v) {
+            return bigint.bi_not(r, v)
+        }
+        let i: i32 = try to_int32(r, v)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let w: i32 = (0 - i) - 1
+        return val.realm_num(r, w as f64)
+    }
+    return val.realm_undefined(r)
+}
+
+fn eval_update(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let op: u32 = ast.ast_a(t, node)
+    let target: u32 = ast.ast_b(t, node)
+    let prefix: bool = ast.ast_c(t, node) == 1 as u32
+    let old: Gc[JsVal] = try eval_node(r, target, env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if val.is_bigint(old) {
+        let one: Gc[JsVal] = try bigint.bi_from_u64(r, 1, false)
+        var nvb: Gc[JsVal] = try bigint.bi_add(r, old, one)
+        if op == lex.P_DEC {
+            nvb = try bigint.bi_sub(r, old, one)
+        }
+        if ast.ast_kind(t, target) == ast.N_IDENT {
+            let key: u64 = try val.key_for_name(r, ast.ast_a(t, target))
+            let ok: bool = try assign_name(r, env, key, nvb, is_strict_env(r, env))
+        } else {
+            let ok: bool = try assign_member(r, env, target, nvb)
+        }
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if prefix {
+            return nvb
+        }
+        return old
+    }
+    let x: f64 = math.math_f64(try to_number(r, old))
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    var nw: f64 = x + 1.0
+    if op == lex.P_DEC {
+        nw = x - 1.0
+    }
+    let nv: Gc[JsVal] = try val.realm_num(r, nw)
+    let ov: Gc[JsVal] = try val.realm_num(r, x)
+    if ast.ast_kind(t, target) == ast.N_IDENT {
+        let key: u64 = try val.key_for_name(r, ast.ast_a(t, target))
+        let ok: bool = try assign_name(r, env, key, nv, is_strict_env(r, env))
+    } else {
+        let ok: bool = try assign_member(r, env, target, nv)
+    }
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if prefix {
+        return nv
+    }
+    return ov
+}
+
+fn eval_binary(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let t0: *mut ast.Ast = val.realm_ast(r)
+    if ast.ast_a(t0, node) == ast.OP_IN && ast.ast_kind(t0, ast.ast_b(t0, node)) == ast.N_PRIVATE_NAME {
+        // 13.10.1: `#x in obj` -- the brand check, without a lookup up the
+        // prototype chain.
+        let c0: *mut Ctx = ctx_of(r)
+        let o: Gc[JsVal] = try eval_node(r, ast.ast_c(t0, node), env)
+        if (*c0).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if val.val_tag(o) != val.TAG_OBJ {
+            var m: [u8; 32] = "the right side is not an object "
+            return throw_type_here(r, &m[0], 31)
+        }
+        let k: u64 = try private_key(r, ast.ast_a(t0, ast.ast_b(t0, node)))
+        var have: bool = val.obj_has_own(val.as_obj(o), k)
+        if !have {
+            // A private METHOD lies on the prototype in this engine.
+            var pr: Gc[JsObj] = val.obj_proto(val.as_obj(o))
+            if (pr as u64) != 0 && val.obj_has_own(pr, k) {
+                have = true
+            }
+        }
+        return val.realm_bool(r, have)
+    }
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let op: u32 = ast.ast_a(t, node)
+    let a: Gc[JsVal] = try eval_node(r, ast.ast_b(t, node), env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let b: Gc[JsVal] = try eval_node(r, ast.ast_c(t, node), env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    return binary_op(r, op, a, b)
+}
+
+fn binary_op(r: Gc[Realm], op: u32, a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if op == lex.P_ADD {
+        return add_values(r, a, b)
+    }
+    if op == lex.P_SEQ {
+        return val.realm_bool(r, strict_equals(r, a, b))
+    }
+    if op == lex.P_SNE {
+        return val.realm_bool(r, !strict_equals(r, a, b))
+    }
+    if op == lex.P_EQ {
+        let e: bool = try loose_equals(r, a, b)
+        return val.realm_bool(r, e)
+    }
+    if op == lex.P_NE {
+        let e: bool = try loose_equals(r, a, b)
+        return val.realm_bool(r, !e)
+    }
+    if op == lex.P_LT {
+        let x: i32 = try compare_values(r, a, b, true)
+        return val.realm_bool(r, x == 1)
+    }
+    if op == lex.P_GT {
+        let x: i32 = try compare_values(r, b, a, false)
+        return val.realm_bool(r, x == 1)
+    }
+    if op == lex.P_LE {
+        let x: i32 = try compare_values(r, b, a, false)
+        return val.realm_bool(r, x == 0)
+    }
+    if op == lex.P_GE {
+        let x: i32 = try compare_values(r, a, b, true)
+        return val.realm_bool(r, x == 0)
+    }
+    if op == ast.OP_IN {
+        if val.val_tag(b) != val.TAG_OBJ {
+            var m: [u8; 33] = "'in' needs an object on the right"
+            return throw_type_here(r, &m[0], 32)
+        }
+        let k: u64 = try to_property_key(r, a)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let h: bool = try has_prop(r, b, k)
+        return val.realm_bool(r, h)
+    }
+    if op == ast.OP_INSTANCEOF {
+        return instance_of(r, a, b)
+    }
+    if val.is_bigint(a) || val.is_bigint(b) {
+        return bigint_binary(r, op, a, b)
+    }
+    // The bit operations and the shifts.
+    if op == lex.P_AND || op == lex.P_OR || op == lex.P_XOR {
+        let x: i32 = try to_int32(r, a)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let y: i32 = try to_int32(r, b)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        var w: i32 = 0
+        if op == lex.P_AND {
+            w = x & y
+        } else if op == lex.P_OR {
+            w = x | y
+        } else {
+            w = x ^ y
+        }
+        return val.realm_num(r, w as f64)
+    }
+    if op == lex.P_SHL || op == lex.P_SHR {
+        let x: i32 = try to_int32(r, a)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let s: u32 = try to_uint32(r, b)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let n: u32 = s & 31 as u32
+        if op == lex.P_SHL {
+            let w: i32 = ((x as u32) << n) as i32
+            return val.realm_num(r, w as f64)
+        }
+        let w: i32 = x >> n
+        return val.realm_num(r, w as f64)
+    }
+    if op == lex.P_USHR {
+        let x: u32 = try to_uint32(r, a)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let s: u32 = try to_uint32(r, b)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let w: u32 = x >> (s & 31 as u32)
+        return val.realm_num(r, w as f64)
+    }
+    // The arithmetic.
+    let x: f64 = math.math_f64(try to_number(r, a))
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let y: f64 = math.math_f64(try to_number(r, b))
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if op == lex.P_SUB {
+        return val.realm_num(r, x - y)
+    }
+    if op == lex.P_MUL {
+        return val.realm_num(r, x * y)
+    }
+    if op == lex.P_DIV {
+        return val.realm_num(r, x / y)
+    }
+    if op == lex.P_MOD {
+        return val.realm_num(r, math.fmod(x, y))
+    }
+    if op == lex.P_POW {
+        return val.realm_num(r, js_pow(x, y))
+    }
+    return val.realm_undefined(r)
+}
+
+// 6.1.6.1.3 Number::exponentiate -- the special cases first, because
+// `powf` of std.math is an approximation over exp/ln.
+// 6.1.6.2: mixing a BigInt with a Number is a TypeError, always.
+fn bigint_mix_error(r: Gc[Realm]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 44] = "cannot mix a BigInt with another type       "
+    return throw_type_here(r, &m[0], 38)
+}
+
+// The arithmetic, the bit operations and the shifts on two BigInts.
+fn bigint_binary(r: Gc[Realm], op: u32, a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if !val.is_bigint(a) || !val.is_bigint(b) {
+        return bigint_mix_error(r)
+    }
+    if op == lex.P_SUB {
+        return bigint.bi_sub(r, a, b)
+    }
+    if op == lex.P_MUL {
+        return bigint.bi_mul(r, a, b)
+    }
+    if op == lex.P_DIV || op == lex.P_MOD {
+        if bigint.bi_is_zero(b) {
+            var m: [u8; 23] = "division by zero       "
+            return throw_error(r, ERR_RANGE, &m[0], 16)
+        }
+        if op == lex.P_DIV {
+            return bigint.bi_div(r, a, b)
+        }
+        return bigint.bi_rem(r, a, b)
+    }
+    if op == lex.P_POW {
+        if bigint.bi_is_neg(b) {
+            var m: [u8; 27] = "a negative exponent        "
+            return throw_error(r, ERR_RANGE, &m[0], 19)
+        }
+        return bigint.bi_pow(r, a, b)
+    }
+    if op == lex.P_AND {
+        return bigint.bi_and(r, a, b)
+    }
+    if op == lex.P_OR {
+        return bigint.bi_or(r, a, b)
+    }
+    if op == lex.P_XOR {
+        return bigint.bi_xor(r, a, b)
+    }
+    if op == lex.P_SHL || op == lex.P_SHR {
+        let bits: f64 = bigint.bi_to_f64(b)
+        var n: u64 = 0
+        if bits < 0.0 {
+            n = (0.0 - bits) as u64
+        } else {
+            n = bits as u64
+        }
+        if n > 1000000 {
+            var m: [u8; 31] = "the shift is much too large    "
+            return throw_error(r, ERR_RANGE, &m[0], 27)
+        }
+        var left: bool = op == lex.P_SHL
+        if bigint.bi_is_neg(b) {
+            left = !left
+        }
+        return bigint.bi_shl(r, a, n, left)
+    }
+    if op == lex.P_USHR {
+        var m: [u8; 43] = "BigInts have no unsigned right shift       "
+        return throw_type_here(r, &m[0], 36)
+    }
+    return val.realm_undefined(r)
+}
+
+fn js_pow(x: f64, y: f64) -> f64 {
+    let nan: f64 = math.math_f64(0x7FF8000000000000)
+    if math.is_nan(y) {
+        return nan
+    }
+    if y == 0.0 {
+        return 1.0
+    }
+    if math.is_nan(x) {
+        return nan
+    }
+    // Integer exponents exactly by squaring -- that keeps 2**53 exact.
+    if math.trunc(y) == y && y >= 0.0 - 1024.0 && y <= 1024.0 && !math.is_infinite(y) {
+        var n: i64 = y as i64
+        var neg: bool = false
+        if n < 0 {
+            neg = true
+            n = 0 - n
+        }
+        var acc: f64 = 1.0
+        var base: f64 = x
+        while n > 0 {
+            if n & 1 == 1 {
+                acc = acc * base
+            }
+            base = base * base
+            n = n >> 1
+        }
+        if neg {
+            return 1.0 / acc
+        }
+        return acc
+    }
+    if math.is_infinite(x) || math.is_infinite(y) || x < 0.0 {
+        // The approximation over exp/ln does not converge here.
+        if math.is_infinite(y) {
+            let a: f64 = math.fabs(x)
+            if a == 1.0 {
+                return nan
+            }
+            if (a > 1.0) == (y > 0.0) {
+                return math.math_f64(0x7FF0000000000000)
+            }
+            return 0.0
+        }
+        if math.is_infinite(x) {
+            if y > 0.0 {
+                return math.fabs(x)
+            }
+            return 0.0
+        }
+        return nan
+    }
+    if x == 0.0 {
+        if y > 0.0 {
+            return 0.0
+        }
+        return math.math_f64(0x7FF0000000000000)
+    }
+    return math.powf(x, y)
+}
+
+// 13.10.2 InstanceofOperator. Round 74: `Symbol.hasInstance` comes first;
+// what is left over is OrdinaryHasInstance, which is also what
+// `Function.prototype[Symbol.hasInstance]` itself does.
+fn instance_of(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if val.val_tag(b) != val.TAG_OBJ {
+        var m: [u8; 40] = "Right hand side of 'instanceof' is not c"
+        return throw_type_here(r, &m[0], 40)
+    }
+    let wk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_HASINSTANCE)
+    if (wk as u64) != 0 {
+        let hf: Gc[JsVal] = try get_prop(r, b, val.key_for_symbol(wk))
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if !val.is_nullish(hf) {
+            if !val.is_callable(hf) {
+                var m: [u8; 39] = "Symbol.hasInstance is not a function   "
+                return throw_type_here(r, &m[0], 34)
+            }
+            let ca: Gc[GcVec] = try args_new(r)
+            let ok: bool = try gcvec_append[JsVal](ca, a)
+            let res: Gc[JsVal] = try call_function(r, hf, b, ca)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            return val.realm_bool(r, to_boolean(r, res))
+        }
+    }
+    return instance_of_ordinary(r, a, b)
+}
+
+fn instance_of_ordinary(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if !val.is_callable(b) {
+        var m: [u8; 40] = "Right hand side of 'instanceof' is not c"
+        return throw_type_here(r, &m[0], 40)
+    }
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let pv: Gc[JsVal] = try get_prop(r, b, pk)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let proto: Gc[JsObj] = val.as_obj(pv)
+    if (proto as u64) == 0 {
+        var m: [u8; 34] = "prototype of the constructor is no"
+        return throw_type_here(r, &m[0], 34)
+    }
+    var o: Gc[JsObj] = val.as_obj(a)
+    if (o as u64) == 0 {
+        return val.realm_bool(r, false)
+    }
+    o = val.obj_proto(o)
+    while (o as u64) != 0 {
+        if (o as u64) == (proto as u64) {
+            return val.realm_bool(r, true)
+        }
+        o = val.obj_proto(o)
+    }
+    return val.realm_bool(r, false)
+}
+
+fn eval_assign(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let op: u32 = ast.ast_a(t, node)
+    let target: u32 = ast.ast_b(t, node)
+    let rhs: u32 = ast.ast_c(t, node)
+    if op == lex.P_ASSIGN {
+        var v: Gc[JsVal] = try eval_node(r, rhs, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if ast.ast_kind(t, target) == ast.N_IDENT {
+            let ok0: bool = try name_anonymous(r, v, ast.ast_a(t, target))
+        }
+        let ok: bool = try bind_pattern(r, env, target, v, 0)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        return v
+    }
+    // The short circuiting compound assignments (13.15.2).
+    if op == lex.P_ANDANDA || op == lex.P_ORORA || op == lex.P_COALESCEA {
+        let old: Gc[JsVal] = try eval_node(r, target, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        var go: bool = false
+        if op == lex.P_ANDANDA {
+            go = to_boolean(r, old)
+        } else if op == lex.P_ORORA {
+            go = !to_boolean(r, old)
+        } else {
+            go = val.is_nullish(old)
+        }
+        if !go {
+            return old
+        }
+        let v: Gc[JsVal] = try eval_node(r, rhs, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let ok: bool = try bind_pattern(r, env, target, v, 0)
+        return v
+    }
+    let old: Gc[JsVal] = try eval_node(r, target, env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let b: Gc[JsVal] = try eval_node(r, rhs, env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let bop: u32 = compound_base(op)
+    let v: Gc[JsVal] = try binary_op(r, bop, old, b)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if ast.ast_kind(t, target) == ast.N_IDENT {
+        let key: u64 = try val.key_for_name(r, ast.ast_a(t, target))
+        let ok: bool = try assign_name(r, env, key, v, is_strict_env(r, env))
+    } else {
+        let ok: bool = try assign_member(r, env, target, v)
+    }
+    return v
+}
+
+fn compound_base(op: u32) -> u32 {
+    if op == lex.P_ADDA { return lex.P_ADD }
+    if op == lex.P_SUBA { return lex.P_SUB }
+    if op == lex.P_MULA { return lex.P_MUL }
+    if op == lex.P_DIVA { return lex.P_DIV }
+    if op == lex.P_MODA { return lex.P_MOD }
+    if op == lex.P_POWA { return lex.P_POW }
+    if op == lex.P_SHLA { return lex.P_SHL }
+    if op == lex.P_SHRA { return lex.P_SHR }
+    if op == lex.P_USHRA { return lex.P_USHR }
+    if op == lex.P_ANDA { return lex.P_AND }
+    if op == lex.P_ORA { return lex.P_OR }
+    if op == lex.P_XORA { return lex.P_XOR }
+    return lex.P_ADD
+}
+
+// The home object of the method that is running -- `super` hangs on it
+// (10.2.9 / 13.3.7). It is not `this`: `super.m()` looks the method up on
+// the PROTOTYPE OF THE OBJECT THE METHOD WAS DEFINED IN, and calls it with
+// the current `this`.
+fn home_of(r: Gc[Realm], env: Gc[Env]) -> Gc[JsObj] {
+    var e: Gc[Env] = env
+    while (e as u64) != 0 {
+        let f: Gc[JsObj] = val.env_func(e)
+        if (f as u64) != 0 {
+            return f.extra
+        }
+        e = val.env_parent(e)
+    }
+    return gc_null[JsObj]()
+}
+
+fn eval_member(r: Gc[Realm], node: u32, env: Gc[Env],
+    base_out: *mut Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if ast.ast_kind(t, ast.ast_a(t, node)) == ast.N_SUPER {
+        let this: Gc[JsVal] = this_of(r, env)
+        *base_out = this
+        let home: Gc[JsObj] = home_of(r, env)
+        if (home as u64) == 0 {
+            var m: [u8; 27] = "'super' outside of a method"
+            return throw_type_here(r, &m[0], 27)
+        }
+        var key: u64 = 0
+        if ast.ast_c(t, node) & ast.MB_COMPUTED != 0 as u32 {
+            let kv: Gc[JsVal] = try eval_node(r, ast.ast_b(t, node), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            key = try to_property_key(r, kv)
+        } else {
+            key = try static_key(r, ast.ast_b(t, node))
+        }
+        let proto: Gc[JsObj] = val.obj_proto(home)
+        if (proto as u64) == 0 {
+            return val.realm_undefined(r)
+        }
+        let pv: Gc[JsVal] = proto
+        return get_prop_v(r, pv, key, this)
+    }
+    let base: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+    *base_out = base
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if ast.ast_c(t, node) & ast.MB_OPTIONAL != 0 as u32 && val.is_nullish(base) {
+        return val.realm_undefined(r)
+    }
+    var key: u64 = 0
+    if ast.ast_c(t, node) & ast.MB_COMPUTED != 0 as u32 {
+        let kv: Gc[JsVal] = try eval_node(r, ast.ast_b(t, node), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        // The fast path for `a[0]` on an array: no key string at all.
+        if val.val_tag(kv) == val.TAG_NUM && val.val_tag(base) == val.TAG_OBJ {
+            let o: Gc[JsObj] = val.as_obj(base)
+            if o.cls == val.CLS_ARRAY {
+                let x: f64 = val.num_value(kv)
+                let i: u64 = x as u64
+                if (i as f64) == x && i < o.len {
+                    let e: Gc[JsVal] = val.elems_get(r, o, i)
+                    if !val.is_gap(e) {
+                        return e
+                    }
+                }
+            }
+        }
+        key = try to_property_key(r, kv)
+    } else {
+        key = try static_key(r, ast.ast_b(t, node))
+    }
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if val.is_nullish(base) {
+        // ROUND B4: the NAME in the message. "Cannot read a property of
+        // undefined" is true and useless; in a page with five thousand
+        // lines of somebody else's JavaScript it is the difference
+        // between a minute and an afternoon.
+        var m: [u8; 25] = "Cannot read a property ' "
+        var m2: [u8; 22] = "' of undefined or null"
+        let a: Gc[JsVal] = try val.str_from_ascii(r, &m[0], 24)
+        let nmv: Gc[JsVal] = val.key_name_str(r, key)
+        var text: Gc[JsVal] = a
+        if val.val_tag(nmv) == val.TAG_STR {
+            text = try val.str_concat(r, a, nmv)
+        }
+        let b: Gc[JsVal] = try val.str_from_ascii(r, &m2[0], 22)
+        text = try val.str_concat(r, text, b)
+        let e: Gc[JsVal] = try make_error_str(r, ERR_TYPE, text)
+        return throw_value(r, e)
+    }
+    return get_prop(r, base, key)
+}
+
+fn eval_arguments(r: Gc[Realm], off: u32, count: usize,
+    env: Gc[Env]) -> AllocError!Gc[GcVec] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let args: Gc[GcVec] = try args_new(r)
+    var i: usize = 0
+    while i < count {
+        let e: u32 = ast.ast_list_at(t, off, i)
+        if ast.ast_kind(t, e) == ast.N_SPREAD {
+            let sv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, e), env)
+            if (*c).comp != C_NORMAL {
+                return args
+            }
+            let items: Gc[GcVec] = try iterate_values(r, sv)
+            if (*c).comp != C_NORMAL {
+                return args
+            }
+            var j: u64 = 0
+            while j < gcvec_length(items) {
+                let ok: bool = try gcvec_append[JsVal](args,
+                    gcvec_read[JsVal](items, j))
+                j = j + 1
+            }
+        } else {
+            let v: Gc[JsVal] = try eval_node(r, e, env)
+            if (*c).comp != C_NORMAL {
+                return args
+            }
+            let ok: bool = try gcvec_append[JsVal](args, v)
+        }
+        i = i + 1
+    }
+    return args
+}
+
+fn eval_call(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let calleen: u32 = ast.ast_a(t, node)
+    var this: Gc[JsVal] = val.realm_undefined(r)
+    var f: Gc[JsVal] = val.realm_undefined(r)
+    // `super(...)` -- call the parent constructor on the object that is
+    // being built (13.3.7.1).
+    if ast.ast_kind(t, calleen) == ast.N_SUPER {
+        let args0: Gc[GcVec] = try eval_arguments(r, ast.ast_b(t, node),
+            ast.ast_c(t, node) as usize, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        var e: Gc[Env] = env
+        var me: Gc[JsObj] = gc_null[JsObj]()
+        while (e as u64) != 0 {
+            let ff: Gc[JsObj] = val.env_func(e)
+            if (ff as u64) != 0 {
+                me = ff
+                break
+            }
+            e = val.env_parent(e)
+        }
+        if (me as u64) == 0 || (me.extra as u64) == 0 {
+            var m: [u8; 32] = "'super' call outside a construct"
+            return throw_type_here(r, &m[0], 32)
+        }
+        let parent: Gc[JsVal] = me.extra
+        let this0: Gc[JsVal] = this_of(r, env)
+        let res: Gc[JsVal] = try call_internal(r, parent, this0, args0,
+            val.as_obj(parent))
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        // 15.7.15: the fields of THIS class come right after `super()`.
+        let okf: bool = try init_instance_fields(r, me, this0)
+        return val.realm_undefined(r)
+    }
+    if ast.ast_kind(t, calleen) == ast.N_MEMBER {
+        f = try eval_member(r, calleen, env, &this)
+    } else {
+        f = try eval_node(r, calleen, env)
+    }
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if ast.ast_d(t, node) & ast.CL_OPTIONAL != 0 as u32 && val.is_nullish(f) {
+        return val.realm_undefined(r)
+    }
+    let args: Gc[GcVec] = try eval_arguments(r, ast.ast_b(t, node),
+        ast.ast_c(t, node) as usize, env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if !val.is_callable(f) {
+        let name: Gc[JsVal] = try callee_text(r, calleen)
+        var tail: [u8; 18] = " is not a function"
+        let tv: Gc[JsVal] = try val.str_from_ascii(r, &tail[0], 18)
+        let msg: Gc[JsVal] = try val.str_concat(r, name, tv)
+        let ev: Gc[JsVal] = try make_error_str(r, ERR_TYPE, msg)
+        return throw_value(r, ev)
+    }
+    return call_function(r, f, this, args)
+}
+
+fn callee_text(r: Gc[Realm], node: u32) -> AllocError!Gc[JsVal] {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if ast.ast_kind(t, node) == ast.N_IDENT {
+        return val.str_of_name(r, ast.ast_a(t, node))
+    }
+    if ast.ast_kind(t, node) == ast.N_MEMBER && ast.ast_c(t, node) & ast.MB_COMPUTED == 0 as u32 {
+        let p: u32 = ast.ast_b(t, node)
+        if ast.ast_kind(t, p) == ast.N_IDENT {
+            return val.str_of_name(r, ast.ast_a(t, p))
+        }
+    }
+    var m: [u8; 10] = "expression"
+    return val.str_from_ascii(r, &m[0], 10)
+}
+
+fn eval_template(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let qoff: u32 = ast.ast_a(t, node)
+    let qn: usize = ast.ast_b(t, node) as usize
+    let eoff: u32 = ast.ast_c(t, node)
+    let en: usize = ast.ast_d(t, node) as usize
+    var out: Gc[JsVal] = val.str_empty(r)
+    var i: usize = 0
+    while i < qn {
+        let q: u32 = ast.ast_list_at(t, qoff, i)
+        let piece: Gc[JsVal] = try val.str_from_ast(r, ast.ast_a(t, q),
+            ast.ast_b(t, q) as usize)
+        out = try val.str_concat(r, out, piece)
+        if i < en {
+            let v: Gc[JsVal] = try eval_node(r, ast.ast_list_at(t, eoff, i), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            let s: Gc[JsVal] = try to_string(r, v)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            out = try val.str_concat(r, out, s)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn eval_tagged(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let tagn: u32 = ast.ast_a(t, node)
+    var this: Gc[JsVal] = val.realm_undefined(r)
+    var f: Gc[JsVal] = val.realm_undefined(r)
+    if ast.ast_kind(t, tagn) == ast.N_MEMBER {
+        f = try eval_member(r, tagn, env, &this)
+    } else {
+        f = try eval_node(r, tagn, env)
+    }
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let q: u32 = ast.ast_b(t, node)
+    let qoff: u32 = ast.ast_a(t, q)
+    let qn: usize = ast.ast_b(t, q) as usize
+    let eoff: u32 = ast.ast_c(t, q)
+    let en: usize = ast.ast_d(t, q) as usize
+    let strings: Gc[JsObj] = try val.array_new(r)
+    let raws: Gc[JsObj] = try val.array_new(r)
+    var i: usize = 0
+    while i < qn {
+        let qe: u32 = ast.ast_list_at(t, qoff, i)
+        var cooked: Gc[JsVal] = val.realm_undefined(r)
+        if ast.ast_e(t, qe) == 1 as u32 {
+            cooked = try val.str_from_ast(r, ast.ast_a(t, qe),
+                ast.ast_b(t, qe) as usize)
+        }
+        let raw: Gc[JsVal] = try val.str_from_ast(r, ast.ast_c(t, qe),
+            ast.ast_d(t, qe) as usize)
+        let ok1: bool = try val.elems_push(r, strings, cooked)
+        strings.len = strings.len + 1
+        let ok2: bool = try val.elems_push(r, raws, raw)
+        raws.len = raws.len + 1
+        i = i + 1
+    }
+    let rk: u64 = try val.key_for_name(r, lex.N_RAW)
+    let rv: Gc[JsVal] = raws
+    let ok3: bool = try define_value(r, strings, rk, rv, val.A_DEFAULT)
+    let args: Gc[GcVec] = try args_new(r)
+    let sv: Gc[JsVal] = strings
+    let ok4: bool = try gcvec_append[JsVal](args, sv)
+    i = 0
+    while i < en {
+        let v: Gc[JsVal] = try eval_node(r, ast.ast_list_at(t, eoff, i), env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        let ok: bool = try gcvec_append[JsVal](args, v)
+        i = i + 1
+    }
+    if !val.is_callable(f) {
+        var m: [u8; 24] = "tag is not a function   "
+        return throw_type_here(r, &m[0], 21)
+    }
+    return call_function(r, f, this, args)
+}
+
+// ---------------------------------------------------------------- Loops
+//
+// `break` and `continue` are carried in the completion (`ctx.comp`) plus a
+// label. A loop swallows the completion when the label is its own or none;
+// otherwise it passes it on.
+
+fn loop_take(r: Gc[Realm], mylabel: u32, brk: *mut bool) -> bool {
+    let c: *mut Ctx = ctx_of(r)
+    *brk = false
+    if (*c).comp == C_NORMAL {
+        return true
+    }
+    if (*c).comp == C_CONTINUE {
+        if (*c).label == 0 as u32 || (*c).label == mylabel {
+            (*c).comp = C_NORMAL
+            (*c).label = 0
+            return true
+        }
+        return false
+    }
+    if (*c).comp == C_BREAK {
+        if (*c).label == 0 as u32 || (*c).label == mylabel {
+            (*c).comp = C_NORMAL
+            (*c).label = 0
+            *brk = true
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+// The label of the statement being entered right now.
+fn current_label(r: Gc[Realm]) -> u32 {
+    let c: *mut Ctx = ctx_of(r)
+    return (*c).label
+}
+
+fn eval_labeled(r: Gc[Realm], body: u32, env: Gc[Env],
+    label: u32) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let k: u32 = ast.ast_kind(t, body)
+    var v: Gc[JsVal] = val.realm_undefined(r)
+    if k == ast.N_WHILE || k == ast.N_DOWHILE {
+        v = try eval_while_labeled(r, body, env, k == ast.N_DOWHILE, label)
+    } else if k == ast.N_FOR {
+        v = try eval_for_labeled(r, body, env, label)
+    } else if k == ast.N_FORIN || k == ast.N_FOROF {
+        v = try eval_for_each_labeled(r, body, env, k == ast.N_FOROF, label)
+    } else {
+        v = try eval_node(r, body, env)
+    }
+    if (*c).comp == C_BREAK && (*c).label == label {
+        (*c).comp = C_NORMAL
+        (*c).label = 0
+    }
+    return v
+}
+
+fn eval_while(r: Gc[Realm], node: u32, env: Gc[Env],
+    is_do: bool) -> AllocError!Gc[JsVal] {
+    return eval_while_labeled(r, node, env, is_do, 0)
+}
+
+fn eval_while_labeled(r: Gc[Realm], node: u32, env: Gc[Env], is_do: bool,
+    label: u32) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var testn: u32 = ast.ast_a(t, node)
+    var bodyn: u32 = ast.ast_b(t, node)
+    if is_do {
+        testn = ast.ast_b(t, node)
+        bodyn = ast.ast_a(t, node)
+    }
+    var out: Gc[JsVal] = val.realm_undefined(r)
+    var first: bool = true
+    while true {
+        if !is_do || !first {
+            if !is_do {
+                let tv: Gc[JsVal] = try eval_node(r, testn, env)
+                if (*c).comp != C_NORMAL {
+                    return out
+                }
+                if !to_boolean(r, tv) {
+                    return out
+                }
+            }
+        }
+        first = false
+        let v: Gc[JsVal] = try eval_node(r, bodyn, env)
+        if !val.is_undefined(v) {
+            out = v
+        }
+        var brk: bool = false
+        if !loop_take(r, label, &brk) {
+            return out
+        }
+        if brk {
+            return out
+        }
+        if is_do {
+            let tv: Gc[JsVal] = try eval_node(r, testn, env)
+            if (*c).comp != C_NORMAL {
+                return out
+            }
+            if !to_boolean(r, tv) {
+                return out
+            }
+        }
+    }
+    return out
+}
+
+fn eval_for(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    return eval_for_labeled(r, node, env, 0)
+}
+
+fn eval_for_labeled(r: Gc[Realm], node: u32, env: Gc[Env],
+    label: u32) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let initn: u32 = ast.ast_a(t, node)
+    let testn: u32 = ast.ast_b(t, node)
+    let updn: u32 = ast.ast_c(t, node)
+    let bodyn: u32 = ast.ast_d(t, node)
+    var loop_env: Gc[Env] = env
+    var per_iteration: bool = false
+    if initn != 0 as u32 && ast.ast_kind(t, initn) == ast.N_VAR_DECL && ast.ast_a(t, initn) != ast.D_VAR {
+        loop_env = try val.env_new(r, env, val.ENV_DECL)
+        per_iteration = ast.ast_a(t, initn) == ast.D_LET
+        let ok: bool = try hoist_one(r, loop_env, initn, false)
+    }
+    if initn != 0 as u32 {
+        let x: Gc[JsVal] = try eval_node(r, initn, loop_env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+    }
+    var out: Gc[JsVal] = val.realm_undefined(r)
+    // 14.7.4.3 ForBodyEvaluation: the per iteration copy is made ONCE
+    // before the loop and then again BEFORE THE INCREMENT -- not before
+    // the test. That is exactly what makes the closures of
+    // `for (let i = 0; ...)` see 0, 1, 2 instead of three times the last
+    // value.
+    if per_iteration {
+        loop_env = try copy_env(r, loop_env, env)
+    }
+    while true {
+        if testn != 0 as u32 {
+            let tv: Gc[JsVal] = try eval_node(r, testn, loop_env)
+            if (*c).comp != C_NORMAL {
+                return out
+            }
+            if !to_boolean(r, tv) {
+                return out
+            }
+        }
+        let v: Gc[JsVal] = try eval_node(r, bodyn, loop_env)
+        if !val.is_undefined(v) {
+            out = v
+        }
+        var brk: bool = false
+        if !loop_take(r, label, &brk) {
+            return out
+        }
+        if brk {
+            return out
+        }
+        if per_iteration {
+            loop_env = try copy_env(r, loop_env, env)
+        }
+        if updn != 0 as u32 {
+            let x: Gc[JsVal] = try eval_node(r, updn, loop_env)
+            if (*c).comp != C_NORMAL {
+                return out
+            }
+        }
+    }
+    return out
+}
+
+// A copy of the bindings of one record -- for the per iteration environment
+// of a `for (let ...)`.
+fn copy_env(r: Gc[Realm], src: Gc[Env], parent: Gc[Env]) -> AllocError!Gc[Env] {
+    let e: Gc[Env] = try val.env_new(r, parent, val.ENV_DECL)
+    let n: u64 = gcmap_capacity(src.names)
+    var i: u64 = 0
+    while i < n {
+        if gcmap_slot_used(src.names, i) {
+            let key: u64 = gcmap_slot_key(src.names, i)
+            let slot: u64 = gcmap_slot_value(src.names, i)
+            let ns: i64 = try val.env_declare(r, e, key,
+                val.env_slot_flags(src, slot as i64))
+            val.env_set_slot(e, ns, val.env_get_slot(src, slot as i64))
+        }
+        i = i + 1
+    }
+    return e
+}
+
+fn eval_for_each(r: Gc[Realm], node: u32, env: Gc[Env],
+    of_form: bool) -> AllocError!Gc[JsVal] {
+    return eval_for_each_labeled(r, node, env, of_form, 0)
+}
+
+fn eval_for_each_labeled(r: Gc[Realm], node: u32, env: Gc[Env], of_form: bool,
+    label: u32) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let leftn: u32 = ast.ast_a(t, node)
+    let rightn: u32 = ast.ast_b(t, node)
+    let bodyn: u32 = ast.ast_c(t, node)
+    let src: Gc[JsVal] = try eval_node(r, rightn, env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    var items: Gc[GcVec] = gc_null[GcVec]()
+    if of_form {
+        items = try iterate_values(r, src)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+    } else {
+        if val.is_nullish(src) {
+            return val.realm_undefined(r)
+        }
+        items = try enumerate_keys(r, src)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+    }
+    var out: Gc[JsVal] = val.realm_undefined(r)
+    var i: u64 = 0
+    while i < gcvec_length(items) {
+        let item: Gc[JsVal] = gcvec_read[JsVal](items, i)
+        var body_env: Gc[Env] = env
+        if ast.ast_kind(t, leftn) == ast.N_VAR_DECL {
+            let kind: u32 = ast.ast_a(t, leftn)
+            let d: u32 = ast.ast_list_at(t, ast.ast_b(t, leftn), 0)
+            let target: u32 = ast.ast_a(t, d)
+            if kind != ast.D_VAR {
+                body_env = try val.env_new(r, env, val.ENV_DECL)
+                let ok0: bool = try hoist_names(r, body_env, target, 0)
+                let ok1: bool = try bind_pattern_init(r, body_env, target,
+                    item, kind)
+            } else {
+                let ok1: bool = try init_binding(r, body_env, target, item, kind)
+            }
+        } else {
+            let ok1: bool = try bind_pattern(r, env, leftn, item, 0)
+        }
+        if (*c).comp != C_NORMAL {
+            return out
+        }
+        let v: Gc[JsVal] = try eval_node(r, bodyn, body_env)
+        if !val.is_undefined(v) {
+            out = v
+        }
+        var brk: bool = false
+        if !loop_take(r, label, &brk) {
+            return out
+        }
+        if brk {
+            return out
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 14.7.5.9 EnumerateObjectProperties: the own enumerable string keys plus
+// those of the prototypes, without duplicates.
+fn enumerate_keys(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try gcvec_new()
+    let seen: Gc[GcVec] = try gcvec_new_raw()
+    if val.val_tag(v) == val.TAG_STR {
+        var i: u64 = 0
+        while i < val.str_len(v) {
+            let ks: Gc[JsVal] = try index_string(r, i)
+            let ok: bool = try gcvec_append[JsVal](out, ks)
+            i = i + 1
+        }
+        return out
+    }
+    var o: Gc[JsObj] = val.as_obj(v)
+    if (o as u64) == 0 {
+        let bo: Gc[JsObj] = try to_object(r, v)
+        o = bo
+    }
+    while (o as u64) != 0 {
+        let keys: Gc[GcVec] = try val.obj_own_string_keys(r, o)
+        var i: u64 = 0
+        while i < gcvec_length(keys) {
+            let k: u64 = gcvec_read_raw(keys, i)
+            var dup: bool = false
+            var j: u64 = 0
+            while j < gcvec_length(seen) {
+                if gcvec_read_raw(seen, j) == k {
+                    dup = true
+                    break
+                }
+                j = j + 1
+            }
+            if !dup {
+                let ok0: bool = try gcvec_append_raw(seen, k)
+                var enumerable: bool = true
+                let p: Gc[Prop] = val.obj_get_own(o, k)
+                if (p as u64) != 0 {
+                    enumerable = val.prop_attrs(p) & val.A_ENUMERABLE != 0
+                }
+                if enumerable {
+                    let ks: Gc[JsVal] = val.key_name_str(r, k)
+                    let ok: bool = try gcvec_append[JsVal](out, ks)
+                }
+            }
+            i = i + 1
+        }
+        o = val.obj_proto(o)
+    }
+    return out
+}
+
+fn index_string(r: Gc[Realm], i: u64) -> AllocError!Gc[JsVal] {
+    let k: u64 = try val.key_for_index(r, i)
+    return val.key_name_str(r, k)
+}
+
+fn eval_try(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var out: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+    let handler: u32 = ast.ast_b(t, node)
+    if (*c).comp == C_THROW && handler != 0 as u32 {
+        let thrown: Gc[JsVal] = r.pending
+        (*c).comp = C_NORMAL
+        let cenv: Gc[Env] = try val.env_new(r, env, val.ENV_DECL)
+        let param: u32 = ast.ast_a(t, handler)
+        if param != 0 as u32 {
+            let ok0: bool = try hoist_names(r, cenv, param, val.P_MUTABLE)
+            let ok: bool = try bind_pattern_init(r, cenv, param, thrown, ast.D_LET)
+        }
+        if (*c).comp == C_NORMAL {
+            out = try eval_node(r, ast.ast_b(t, handler), cenv)
+        }
+    }
+    let fin: u32 = ast.ast_c(t, node)
+    if fin != 0 as u32 {
+        // The finally block runs with a saved completion; only its own
+        // abrupt completion overrides it (14.15.3).
+        let saved_comp: u32 = (*c).comp
+        let saved_label: u32 = (*c).label
+        let saved_val: Gc[JsVal] = r.pending
+        (*c).comp = C_NORMAL
+        (*c).label = 0
+        let fv: Gc[JsVal] = try eval_node(r, fin, env)
+        if (*c).comp == C_NORMAL {
+            (*c).comp = saved_comp
+            (*c).label = saved_label
+            r.pending = saved_val
+        }
+    }
+    return out
+}
+
+fn eval_switch(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let disc: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    let off: u32 = ast.ast_b(t, node)
+    let cnt: usize = ast.ast_c(t, node) as usize
+    let inner: Gc[Env] = try val.env_new(r, env, val.ENV_DECL)
+    var i: usize = 0
+    while i < cnt {
+        let cs: u32 = ast.ast_list_at(t, off, i)
+        let ok: bool = try hoist_declarations(r, inner, ast.ast_b(t, cs),
+            ast.ast_c(t, cs) as usize, false)
+        i = i + 1
+    }
+    var start: usize = cnt
+    var deflt: usize = cnt
+    i = 0
+    while i < cnt {
+        let cs: u32 = ast.ast_list_at(t, off, i)
+        if ast.ast_a(t, cs) == 0 as u32 {
+            deflt = i
+        } else {
+            let tv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, cs), inner)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            if strict_equals(r, disc, tv) {
+                start = i
+                break
+            }
+        }
+        i = i + 1
+    }
+    if start == cnt {
+        start = deflt
+    }
+    var out: Gc[JsVal] = val.realm_undefined(r)
+    i = start
+    while i < cnt {
+        let cs: u32 = ast.ast_list_at(t, off, i)
+        let v: Gc[JsVal] = try eval_statements(r, ast.ast_b(t, cs),
+            ast.ast_c(t, cs) as usize, inner)
+        if !val.is_undefined(v) {
+            out = v
+        }
+        if (*c).comp == C_BREAK && (*c).label == 0 as u32 {
+            (*c).comp = C_NORMAL
+            return out
+        }
+        if (*c).comp != C_NORMAL {
+            return out
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ================================================================ Classes
+//
+// 15.7: a class is a constructor function plus a prototype object. The
+// methods are non enumerable, the class body is strict code, and a derived
+// class hands its `extends` value through to the prototype chain of BOTH
+// objects -- the prototype for the instances and the constructor itself for
+// the static side.
+fn eval_class(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var name: u32 = 0xFFFFFFFF as u32
+    if ast.ast_a(t, node) != 0 as u32 {
+        name = ast.ast_a(t, ast.ast_a(t, node))
+    }
+    // The environment in which the class body stands sees the class name.
+    let cenv: Gc[Env] = try val.env_new(r, env, val.ENV_DECL)
+    var parent_proto: Gc[JsObj] = val.realm_proto(r, val.PROTO_OBJECT)
+    var parent_ctor: Gc[JsObj] = val.realm_proto(r, val.PROTO_FUNCTION)
+    let supern: u32 = ast.ast_b(t, node)
+    var derived: bool = false
+    if supern != 0 as u32 {
+        derived = true
+        let sv: Gc[JsVal] = try eval_node(r, supern, cenv)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if val.is_null(sv) {
+            parent_proto = gc_null[JsObj]()
+        } else {
+            if !val.is_callable(sv) {
+                var m: [u8; 33] = "Class extends value is not a ctor"
+                return throw_type_here(r, &m[0], 32)
+            }
+            let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+            let pv: Gc[JsVal] = try get_prop(r, sv, pk)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            parent_proto = val.as_obj(pv)
+            parent_ctor = val.as_obj(sv)
+        }
+    }
+    let proto: Gc[JsObj] = try val.obj_new_proto(r, parent_proto)
+    // Find the constructor.
+    let boff: u32 = ast.ast_c(t, node)
+    let bcount: usize = ast.ast_d(t, node) as usize
+    var ctor_node: u32 = 0
+    var i: usize = 0
+    while i < bcount {
+        let m: u32 = ast.ast_list_at(t, boff, i)
+        if ast.ast_kind(t, m) == ast.N_METHOD && ast.ast_d(t, m) & ast.FN_CONSTRUCTOR != 0 as u32 {
+            ctor_node = ast.ast_b(t, m)
+        }
+        i = i + 1
+    }
+    var ctor: Gc[JsObj] = gc_null[JsObj]()
+    if ctor_node != 0 as u32 {
+        ctor = try make_function(r, ctor_node, cenv, name)
+    } else {
+        // An implicit constructor: the parser leaves no node behind for it,
+        // so a native one takes over that only forwards (15.7.14).
+        var cn: [u8; 11] = "constructor"
+        ctor = try make_native(r, 9000, 0, &cn[0], 11)
+        ctor.cls = val.CLS_DEFAULT_CTOR
+        ctor.native = 9000
+        var nv: Gc[JsVal] = val.str_empty(r)
+        if name != 0xFFFFFFFF as u32 {
+            nv = try val.str_of_name(r, name)
+        }
+        let nk: u64 = try val.key_for_name(r, lex.N_NAME)
+        let okn: bool = try define_value(r, ctor, nk, nv, val.A_CONFIGURABLE)
+    }
+    ctor.flags = ctor.flags | val.F_CTOR | val.F_CLASS_CTOR | val.F_STRICT
+    if derived {
+        ctor.flags = ctor.flags | val.F_DERIVED
+    }
+    // The class node, so that `new` can run the instance fields; `len` is
+    // unused on a function object.
+    ctor.len = node as u64 + 1
+    if (ctor.env as u64) == 0 {
+        ctor.env = cenv
+    }
+    ctor.extra = parent_ctor
+    if (parent_ctor as u64) != 0 {
+        val.obj_set_proto(ctor, parent_ctor)
+    }
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let pv: Gc[JsVal] = proto
+    let ok1: bool = try define_value(r, ctor, pk, pv, 0)
+    let ck: u64 = try val.key_for_name(r, lex.N_CONSTRUCTOR)
+    let cv: Gc[JsVal] = ctor
+    let ok2: bool = try define_value(r, proto, ck, cv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    // The class name binding, so that methods can see it.
+    if name != 0xFFFFFFFF as u32 {
+        let key: u64 = try val.key_for_name(r, name)
+        let slot: i64 = try val.env_declare(r, cenv, key, val.P_INITIALIZED)
+        val.env_set_slot(cenv, slot, cv)
+    }
+    // The methods.
+    i = 0
+    while i < bcount {
+        let m: u32 = ast.ast_list_at(t, boff, i)
+        if ast.ast_kind(t, m) != ast.N_METHOD {
+            i = i + 1
+            continue
+        }
+        if ast.ast_d(t, m) & ast.FN_CONSTRUCTOR != 0 as u32 {
+            i = i + 1
+            continue
+        }
+        let pflags: u32 = ast.ast_c(t, m)
+        var target: Gc[JsObj] = proto
+        if pflags & ast.PR_STATIC != 0 as u32 {
+            target = ctor
+        }
+        var key: u64 = 0
+        if pflags & ast.PR_COMPUTED != 0 as u32 {
+            let kv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, m), cenv)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            key = try to_property_key(r, kv)
+        } else {
+            key = try static_key(r, ast.ast_a(t, m))
+        }
+        var mname: u32 = 0xFFFFFFFF as u32
+        if pflags & ast.PR_COMPUTED == 0 as u32 && ast.ast_kind(t, ast.ast_a(t, m)) == ast.N_IDENT {
+            mname = ast.ast_a(t, ast.ast_a(t, m))
+        }
+        let f: Gc[JsObj] = try make_function(r, ast.ast_b(t, m), cenv, mname)
+        f.extra = target
+        let fv: Gc[JsVal] = f
+        if pflags & (ast.PR_GET | ast.PR_SET) != 0 as u32 {
+            var getter: Gc[JsVal] = val.realm_undefined(r)
+            var setter: Gc[JsVal] = val.realm_undefined(r)
+            let old: Gc[Prop] = val.obj_get_own(target, key)
+            if (old as u64) != 0 && val.prop_is_accessor(old) {
+                getter = val.prop_value(old)
+                setter = val.prop_setter(old)
+            }
+            if pflags & ast.PR_GET != 0 as u32 {
+                getter = fv
+            } else {
+                setter = fv
+            }
+            let ok: bool = try define_accessor(r, target, key, getter, setter,
+                val.A_CONFIGURABLE)
+        } else {
+            let ok: bool = try define_value(r, target, key, fv,
+                val.A_WRITABLE | val.A_CONFIGURABLE)
+        }
+        i = i + 1
+    }
+    // The static part runs in source order: a static field and a static
+    // block may depend on each other (15.7.14).
+    i = 0
+    while i < bcount {
+        let m: u32 = ast.ast_list_at(t, boff, i)
+        if ast.ast_kind(t, m) == ast.N_STATIC_BLOCK {
+            let benv: Gc[Env] = try val.env_new(r, cenv, val.ENV_FUNCTION)
+            val.env_set_this(benv, cv, ctor)
+            let okh: bool = try hoist_declarations(r, benv, ast.ast_a(t, m),
+                ast.ast_b(t, m) as usize, true)
+            let xv: Gc[JsVal] = try eval_statements(r, ast.ast_a(t, m),
+                ast.ast_b(t, m) as usize, benv)
+            if (*c).comp == C_RETURN {
+                (*c).comp = C_NORMAL
+            }
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+        }
+        if ast.ast_kind(t, m) == ast.N_FIELD && ast.ast_c(t, m) & ast.PR_STATIC != 0 as u32 {
+            var key: u64 = 0
+            if ast.ast_c(t, m) & ast.PR_COMPUTED != 0 as u32 {
+                let kv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, m), cenv)
+                key = try to_property_key(r, kv)
+            } else {
+                key = try static_key(r, ast.ast_a(t, m))
+            }
+            var fv2: Gc[JsVal] = val.realm_undefined(r)
+            if ast.ast_b(t, m) != 0 as u32 {
+                let senv: Gc[Env] = try val.env_new(r, cenv, val.ENV_FUNCTION)
+                val.env_set_this(senv, cv, ctor)
+                fv2 = try eval_node(r, ast.ast_b(t, m), senv)
+                if (*c).comp != C_NORMAL {
+                    return val.realm_undefined(r)
+                }
+            }
+            let ok: bool = try define_value(r, ctor, key, fv2, val.A_DEFAULT)
+        }
+        i = i + 1
+    }
+    return cv
+}
+
+// ============================================================== Programs
+
+// 15.7.15 InitializeInstanceElements: every non static field of the class
+// gets its value on the new object -- before the constructor body of a base
+// class, and directly after `super()` in a derived one.
+fn init_instance_fields(r: Gc[Realm], ctor: Gc[JsObj],
+    this_val: Gc[JsVal]) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    if (ctor as u64) == 0 || ctor.len == 0 {
+        return true
+    }
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = (ctor.len - 1) as u32
+    if ast.ast_kind(t, node) != ast.N_CLASS {
+        return true
+    }
+    let o: Gc[JsObj] = val.as_obj(this_val)
+    if (o as u64) == 0 {
+        return true
+    }
+    let boff: u32 = ast.ast_c(t, node)
+    let bcount: usize = ast.ast_d(t, node) as usize
+    var i: usize = 0
+    while i < bcount {
+        let m: u32 = ast.ast_list_at(t, boff, i)
+        if ast.ast_kind(t, m) == ast.N_FIELD && ast.ast_c(t, m) & ast.PR_STATIC == 0 as u32 {
+            var key: u64 = 0
+            if ast.ast_c(t, m) & ast.PR_COMPUTED != 0 as u32 {
+                let kv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, m), ctor.env)
+                if (*c).comp != C_NORMAL {
+                    return false
+                }
+                key = try to_property_key(r, kv)
+            } else {
+                key = try static_key(r, ast.ast_a(t, m))
+            }
+            var v: Gc[JsVal] = val.realm_undefined(r)
+            if ast.ast_b(t, m) != 0 as u32 {
+                let fenv: Gc[Env] = try val.env_new(r, ctor.env, val.ENV_FUNCTION)
+                val.env_set_this(fenv, this_val, ctor)
+                v = try eval_node(r, ast.ast_b(t, m), fenv)
+                if (*c).comp != C_NORMAL {
+                    return false
+                }
+                if ast.ast_kind(t, ast.ast_a(t, m)) == ast.N_IDENT {
+                    let okn: bool = try name_anonymous(r, v,
+                        ast.ast_a(t, ast.ast_a(t, m)))
+                }
+            }
+            let ok: bool = try define_value(r, o, key, v, val.A_DEFAULT)
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn run_program(r: Gc[Realm], prog: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let ok: bool = try hoist_declarations(r, env, ast.ast_a(t, prog),
+        ast.ast_b(t, prog) as usize, true)
+    if (*c).comp != C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    return eval_statements(r, ast.ast_a(t, prog),
+        ast.ast_b(t, prog) as usize, env)
+}
+
+// `Math.pow` needs the same exponentiation as the `**` operator.
+// A BigInt literal: the digits stand in the string pool of the tree.
+fn bigint_of_ast(r: Gc[Realm], node: u32) -> AllocError!Gc[JsVal] {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let s: Gc[JsVal] = try val.str_from_ast(r, ast.ast_a(t, node),
+        ast.ast_b(t, node) as usize)
+    let v: Gc[JsVal] = try bigint.bi_parse(r, s)
+    if (v as u64) == 0 {
+        var m: [u8; 26] = "a bad BigInt literal      "
+        return throw_error(r, ERR_SYNTAX, &m[0], 20)
+    }
+    return v
+}
+
+fn js_pow_pub(x: f64, y: f64) -> f64 {
+    return js_pow(x, y)
+}
+
+// 7.1.8 ToUint16 -- `String.fromCharCode` needs it.
+fn f64_to_uint16(x: f64) -> u16 {
+    if math.is_nan(x) || math.is_infinite(x) {
+        return 0
+    }
+    let t: f64 = math.trunc(x)
+    var m: f64 = math.fmod(t, 65536.0)
+    if m < 0.0 {
+        m = m + 65536.0
+    }
+    return (m as u64 & 65535) as u16
+}

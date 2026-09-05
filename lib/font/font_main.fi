@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/font/font_main.fi -- the measuring bench for the TrueType reader and
+// the glyph rasteriser (root file of round B3).
+//
+// It reads a font and a script off stdin and answers in text -- except for
+// a rendered glyph, which comes back as raw octets, one per pixel. The
+// point of the program is that everything it says can be held against
+// somebody else's answer: `tools/paintb3/font_check.py` asks fontTools for
+// the same numbers and asks an independent, deliberately dumb polygon
+// filler for the same pixels.
+//
+// The job on stdin:
+//     u32  n ; u8[n]     the font file
+//     the rest           the script, one command per line, ASCII
+//
+// The commands:
+//     M                          the metrics of the font
+//     G <cp>                     glyph id, advance, side bearing, box
+//     K <cp1> <cp2>              the kerning of the pair, in font units
+//     T <size1000> <w> <h> <penx1000> <peny1000> <kern> <n> <cp>...
+//                                render, greyscale, w*h octets
+//
+// Compile with:  firnc -o build/fontb3 lib/font/font_main.fi
+import html.mem
+import font.raster
+import font.ttf
+
+const SCRATCH: usize = 1 << 20
+const RASTER_CAP: usize = 24 << 20
+
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn out_i64(out: *mut mem.Buf, v: i64) {
+    if v < 0 {
+        mem.buf_push(out, 45 as u8)
+        mem.buf_push_dec(out, (0 - v) as u64)
+    } else {
+        mem.buf_push_dec(out, v as u64)
+    }
+}
+
+#[no_gc]
+fn sp(out: *mut mem.Buf) {
+    mem.buf_push(out, 32 as u8)
+}
+
+#[no_gc]
+fn nl(out: *mut mem.Buf) {
+    mem.buf_push(out, 10 as u8)
+}
+
+// ------------------------------------------------------- The script reader
+
+struct Cur {
+    b: *mut mem.Buf,
+    i: usize,
+    n: usize,
+}
+
+#[no_gc]
+fn at(c: *mut Cur, k: usize) -> u32 {
+    if k >= (*c).n {
+        return 0 as u32
+    }
+    return mem.buf_at((*c).b, k) as u32
+}
+
+#[no_gc]
+fn skip_spaces(c: *mut Cur) {
+    while (*c).i < (*c).n {
+        let ch: u32 = at(c, (*c).i)
+        if ch != 32 as u32 && ch != 9 as u32 && ch != 13 as u32 {
+            return
+        }
+        (*c).i = (*c).i + 1
+    }
+}
+
+// A whole number, with an optional minus. -1 when there is none left on
+// this line.
+#[no_gc]
+fn next_int(c: *mut Cur) -> i64 {
+    skip_spaces(c)
+    if (*c).i >= (*c).n {
+        return 0 - 1
+    }
+    var neg: bool = false
+    if at(c, (*c).i) == 45 as u32 {
+        neg = true
+        (*c).i = (*c).i + 1
+    }
+    var got: bool = false
+    var v: i64 = 0
+    while (*c).i < (*c).n {
+        let ch: u32 = at(c, (*c).i)
+        if ch < 48 as u32 || ch > 57 as u32 {
+            break
+        }
+        v = v * 10 + ((ch - 48 as u32) as i64)
+        got = true
+        (*c).i = (*c).i + 1
+    }
+    if !got {
+        return 0 - 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+#[no_gc]
+fn skip_line(c: *mut Cur) {
+    while (*c).i < (*c).n && at(c, (*c).i) != 10 as u32 {
+        (*c).i = (*c).i + 1
+    }
+    if (*c).i < (*c).n {
+        (*c).i = (*c).i + 1
+    }
+}
+
+// -------------------------------------------------------------- Rendering
+
+// The one place where a size in pixels becomes a scale. `size` is the em
+// size: 16 px means one em is 16 pixels, so the factor is 16 / unitsPerEm.
+#[no_gc]
+fn scale_of(f: *mut ttf.Font, size: f64) -> f64 {
+    return size / (ttf.font_upem(f) as f64)
+}
+
+fn main() -> i32 {
+    var inb: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&inb)
+    let total: usize = mem.buf_len(&inb)
+    if total < 4 {
+        return 1
+    }
+    let flen: usize = read_u32(&inb, 0) as usize
+    if 4 + flen > total {
+        return 1
+    }
+    let fdata: *mut u8 = (mem.buf_ptr(&inb) as u64 + 4) as *mut u8
+    var f: ttf.Font = ttf.font_new()
+    var out: mem.Buf = mem.buf_new()
+    if !ttf.font_init(&f, fdata, flen) {
+        var bad: [u8; 9] = "FONT-BAD\n"
+        lit(&out, (&bad[0]) as u64, 9)
+        mem.buf_flush(&out, 1)
+        return 2
+    }
+
+    let scratch: *mut u8 = mem.heap_alloc(SCRATCH)
+    let racc: *mut u8 = mem.heap_alloc(RASTER_CAP)
+    var r: raster.Raster = raster.raster_new()
+    raster.raster_attach(&r, racc, RASTER_CAP)
+
+    var c: Cur = Cur { b: &inb, i: 4 + flen, n: total }
+    while c.i < total {
+        skip_spaces(&c)
+        if c.i >= total {
+            break
+        }
+        let cmd: u32 = at(&c, c.i)
+        if cmd == 10 as u32 {
+            c.i = c.i + 1
+            continue
+        }
+        c.i = c.i + 1
+        if cmd == 77 as u32 {
+            // M -- the metrics of the whole font
+            var t1: [u8; 2] = "M "
+            lit(&out, (&t1[0]) as u64, 2)
+            mem.buf_push_dec(&out, ttf.font_upem(&f) as u64)
+            sp(&out)
+            out_i64(&out, ttf.font_ascent(&f) as i64)
+            sp(&out)
+            out_i64(&out, ttf.font_descent(&f) as i64)
+            sp(&out)
+            out_i64(&out, ttf.font_line_gap(&f) as i64)
+            sp(&out)
+            mem.buf_push_dec(&out, ttf.font_num_glyphs(&f) as u64)
+            sp(&out)
+            mem.buf_push_dec(&out, ttf.font_cmap_format(&f) as u64)
+            sp(&out)
+            if ttf.font_has_kern(&f) {
+                mem.buf_push_dec(&out, 1)
+            } else {
+                mem.buf_push_dec(&out, 0)
+            }
+            nl(&out)
+            skip_line(&c)
+        } else if cmd == 71 as u32 {
+            // G <cp>
+            let cp: i64 = next_int(&c)
+            let gid: u32 = ttf.font_glyph_for(&f, cp as u32)
+            var x0: i32 = 0
+            var y0: i32 = 0
+            var x1: i32 = 0
+            var y1: i32 = 0
+            var has: i64 = 0
+            if ttf.font_glyph_bbox(&f, gid, &x0, &y0, &x1, &y1) {
+                has = 1
+            }
+            var t2: [u8; 2] = "G "
+            lit(&out, (&t2[0]) as u64, 2)
+            out_i64(&out, cp)
+            sp(&out)
+            mem.buf_push_dec(&out, gid as u64)
+            sp(&out)
+            out_i64(&out, ttf.font_advance(&f, gid) as i64)
+            sp(&out)
+            out_i64(&out, ttf.font_lsb(&f, gid) as i64)
+            sp(&out)
+            out_i64(&out, has)
+            sp(&out)
+            out_i64(&out, x0 as i64)
+            sp(&out)
+            out_i64(&out, y0 as i64)
+            sp(&out)
+            out_i64(&out, x1 as i64)
+            sp(&out)
+            out_i64(&out, y1 as i64)
+            nl(&out)
+            skip_line(&c)
+        } else if cmd == 75 as u32 {
+            // K <cp1> <cp2>
+            let a: i64 = next_int(&c)
+            let b: i64 = next_int(&c)
+            let ga: u32 = ttf.font_glyph_for(&f, a as u32)
+            let gb: u32 = ttf.font_glyph_for(&f, b as u32)
+            var t3: [u8; 2] = "K "
+            lit(&out, (&t3[0]) as u64, 2)
+            out_i64(&out, ttf.font_kern(&f, ga, gb) as i64)
+            nl(&out)
+            skip_line(&c)
+        } else if cmd == 84 as u32 {
+            // T <size1000> <w> <h> <penx1000> <peny1000> <kern> <n> <cp>...
+            let size1000: i64 = next_int(&c)
+            let w: i64 = next_int(&c)
+            let h: i64 = next_int(&c)
+            let penx1000: i64 = next_int(&c)
+            let peny1000: i64 = next_int(&c)
+            let kern: i64 = next_int(&c)
+            let ncp: i64 = next_int(&c)
+            let size: f64 = (size1000 as f64) / 1000.0
+            let sc: f64 = scale_of(&f, size)
+            var penx: f64 = (penx1000 as f64) / 1000.0
+            let peny: f64 = (peny1000 as f64) / 1000.0
+            raster.raster_begin(&r, 0.0, 0.0, w as usize, h as usize)
+            var k: i64 = 0
+            var prev: u32 = 0
+            while k < ncp {
+                let cp: i64 = next_int(&c)
+                if cp < 0 {
+                    break
+                }
+                let gid: u32 = ttf.font_glyph_for(&f, cp as u32)
+                if kern != 0 && k > 0 {
+                    penx = penx +
+                    (ttf.font_kern(&f, prev, gid) as f64) * sc
+                }
+                ttf.font_outline(&f, gid, &r, penx, peny, sc,
+                    scratch, SCRATCH, 0)
+                penx = penx + (ttf.font_advance(&f, gid) as f64) * sc
+                prev = gid
+                k = k + 1
+            }
+            raster.raster_finish(&r)
+            var t4: [u8; 2] = "T "
+            lit(&out, (&t4[0]) as u64, 2)
+            out_i64(&out, w)
+            sp(&out)
+            out_i64(&out, h)
+            sp(&out)
+            out_i64(&out, w * h)
+            nl(&out)
+            var y: usize = 0
+            while y < h as usize {
+                var x: usize = 0
+                while x < w as usize {
+                    let v: f64 = raster.raster_cov(&r, x, y)
+                    var q: f64 = v * 255.0 + 0.5
+                    if q < 0.0 {
+                        q = 0.0
+                    }
+                    if q > 255.0 {
+                        q = 255.0
+                    }
+                    mem.buf_push(&out, (q as i64) as u8)
+                    x = x + 1
+                }
+                y = y + 1
+            }
+            nl(&out)
+            skip_line(&c)
+            if mem.buf_len(&out) > 1 << 20 {
+                mem.buf_flush(&out, 1)
+            }
+        } else {
+            skip_line(&c)
+        }
+    }
+    mem.buf_flush(&out, 1)
+    mem.heap_free(scratch, SCRATCH)
+    mem.heap_free(racc, RASTER_CAP)
+    return 0
+}

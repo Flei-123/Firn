@@ -1,0 +1,1130 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/html/tokens.fi -- the token model and the html5lib JSON output (in Firn).
+//
+// THE CONTRACT (used by lib/html/tokenizer.fi, see PLAN.md 4):
+// The state machine builds exactly ONE "current token" inside the `Sink` and
+// then emits it. Characters are collected and merged into ONE character
+// token at the next non character token or at the end -- exactly the way
+// the html5lib expectations demand it.
+//
+// The output format (html5lib tokenizer JSON), ASCII only, every character
+// outside 0x20..0x7E as \uXXXX (code points > 0xFFFF as a surrogate pair):
+//   ["Character","abc"]
+//   ["StartTag","div",{"a":"b"}]        or [... ,true] when self-closing
+//   ["EndTag","div"]
+//   ["Comment","text"]
+//   ["DOCTYPE","html",null,null,true]
+// The token stream of a case is a JSON array of these tokens; EOF produces
+// NO token (html5lib does not list EOF in `output`).
+import mem
+import error_codes
+
+export {
+    Attr, Sink,
+    sink_new, sink_init, sink_free, sink_begin, sink_end, sink_abort, sink_flush_out,
+    sink_emit_char, sink_flush_chars,
+    tok_start, tok_start_tag, tok_end_tag, tok_comment, tok_doctype,
+    tok_name_push, tok_comment_push, tok_doctype_name_push,
+    tok_pubid_start, tok_pubid_push, tok_sysid_start, tok_sysid_push,
+    tok_set_force_quirks, tok_set_self_closing,
+    tok_attr_start, tok_attr_name_push, tok_attr_value_push, tok_attr_finish,
+    tok_emit, tok_is_appropriate_end_tag,
+    sink_set_last_start_tag_cp, sink_set_xml_mode,
+    sink_set_count_mode, sink_token_count,
+    sink_error, sink_error_at, sink_error_count,
+    tok_attr_was_duplicate, tok_is_endtag, tok_has_attribute, tok_is_self_closing,
+    sink_entities, sink_set_entities, sink_entities_tries, sink_set_entities_tries,
+    // ROUND 54 (the tree construction, lib/browser/): the source position per
+    // token and the binary token protocol the tree construction reads it with.
+    tok_emit_at, sink_pos,
+    sink_set_tree_mode, sink_tree_mode, sink_aborted,
+    sink_out_ptr, sink_out_len, sink_out_clear,
+    TB_START, TB_END, TB_COMMENT, TB_DOCTYPE, TB_CHARACTER,
+    TB_F_SELF_CLOSING, TB_F_FORCE_QUIRKS, TB_F_HAS_NAME, TB_F_HAS_PUBID, TB_F_HAS_SYSID,
+}
+
+// ----------------------------------------- The binary token protocol (R54)
+//
+// The tree construction (lib/browser/tree.fi) creates GC objects and must
+// therefore NOT be called out of the tokenizer: the whole tokenizer is
+// `#[no_gc]` (SPEC 3.5.4), and that promise holds transitively. So the way
+// leads through a BUFFER: the tokenizer writes its tokens as compact
+// records, and the tree construction reads them afterwards.
+//
+// The layout of a record (all numbers u32, little-endian, inside `out`):
+//     u32 kind      TB_START | TB_END | TB_COMMENT | TB_DOCTYPE | TB_CHARACTER
+//     u32 flags     TB_F_*
+//     u32 pos       the source position (in code points) RIGHT BEHIND the token
+//     u32 nattr     the number of attributes (TB_START only, otherwise 0)
+//     after it, depending on the kind, strings in the form  u32 length, length * u32:
+//       TB_START      name, then nattr times (name, value)
+//       TB_END        name
+//       TB_COMMENT    data
+//       TB_DOCTYPE    name, pubid, sysid
+//       TB_CHARACTER  data
+//
+// `pos` is the reason why this protocol exists and not the JSON: at
+// `<title>`, `<style>`, `<script>` and `<plaintext>` the tree construction
+// has to send the tokenizer into a different start state (WHATWG: "generic
+// raw text element parsing algorithm"). For that it needs the place where
+// things carry on. Duplicate attributes are NOT in the record -- the
+// standard discards them, and the tree construction should not even see them.
+const TB_START: u32 = 1
+const TB_END: u32 = 2
+const TB_COMMENT: u32 = 3
+const TB_DOCTYPE: u32 = 4
+const TB_CHARACTER: u32 = 5
+
+const TB_F_SELF_CLOSING: u32 = 1
+const TB_F_FORCE_QUIRKS: u32 = 2
+const TB_F_HAS_NAME: u32 = 4
+const TB_F_HAS_PUBID: u32 = 8
+const TB_F_HAS_SYSID: u32 = 16
+
+// The token kinds of the current token.
+const TOK_NONE: u32 = 0
+const TOK_START: u32 = 1
+const TOK_END: u32 = 2
+const TOK_COMMENT: u32 = 3
+const TOK_DOCTYPE: u32 = 4
+
+const MAX_ATTRS: usize = 256
+
+struct Attr {
+    name: mem.CpBuf,
+    value: mem.CpBuf,
+    duplicate: bool,
+}
+
+struct Sink {
+    out: mem.Buf, // the JSON output (buffered)
+    chars: mem.CpBuf, // the characters collected
+    first: bool, // no token in the current array yet?
+    kind: u32, // the current token
+    name: mem.CpBuf,
+    data: mem.CpBuf, // the comment text
+    pubid: mem.CpBuf,
+    sysid: mem.CpBuf,
+    has_pubid: bool,
+    has_sysid: bool,
+    has_name: bool,
+    force_quirks: bool,
+    self_closing: bool,
+    attrs: *mut Attr,
+    nattr: usize,
+    last_starttag: mem.CpBuf,
+    mark: usize, // the state of the output buffer at the start of the case
+    xml_mode: bool, // the XML adjustment ("Coercing an HTML DOM into an infoset")
+    err: mem.CpBuf, // the parse errors of the case: groups of three (code, line, column)
+    p_scanned: usize, // the position cache: lines have been counted up to here
+    p_line: u32, // the line of `p_scanned` (1 based)
+    p_line_start: usize, // the index of the first character of this line
+    p_units: u32, // UTF-16 code units from the start of the line to p_scanned
+    p_only_bmp: bool, // does the line contain only BMP characters up to here?
+    last_duplicate: bool, // did `tok_attr_finish` spot a duplicate attribute?
+    ent_tab: *mut u8, // the name table of the character references (lib/html/entities.fi)
+    ent_tries: bool, // has the build of the table been tried already?
+    // MEASURING MODE (tools/tokenizer/throughput.sh): produce no JSON, only
+    // count tokens. The comparison partner html5ever counts nothing else --
+    // measured (callgrind), 14.7 % of the instructions otherwise went into an
+    // output the other side does not write at all.
+    only_count: bool,
+    token_count: u64,
+    // ROUND 54: the source position of the token emitted last, and the
+    // mode "binary token protocol instead of JSON" (see above).
+    pos: usize,
+    tree_mode: bool,
+    aborted: bool,
+}
+
+#[no_gc]
+fn attr_ptr(s: *mut Sink, i: usize) -> *mut Attr {
+    return ((*s).attrs as usize + i * 56) as *mut Attr
+}
+
+// An empty sink (stage 0 has no constructors); after it comes `sink_init`.
+#[no_gc]
+fn sink_new() -> Sink {
+    return Sink {
+        out: mem.buf_new(),
+        chars: mem.cp_new(),
+        first: true,
+        kind: TOK_NONE,
+        name: mem.cp_new(),
+        data: mem.cp_new(),
+        pubid: mem.cp_new(),
+        sysid: mem.cp_new(),
+        has_pubid: false,
+        has_sysid: false,
+        has_name: false,
+        force_quirks: false,
+        self_closing: false,
+        attrs: 0 as *mut Attr,
+        nattr: 0,
+        last_starttag: mem.cp_new(),
+        mark: 0,
+        xml_mode: false,
+        err: mem.cp_new(),
+        p_scanned: 0,
+        p_line: 1,
+        p_line_start: 0,
+        p_units: 0,
+        p_only_bmp: true,
+        last_duplicate: false,
+        ent_tab: 0 as *mut u8,
+        ent_tries: false,
+        only_count: false,
+        token_count: 0,
+        pos: 0,
+        tree_mode: false,
+        aborted: false,
+    }
+}
+
+#[no_gc]
+fn sink_init(s: *mut Sink) {
+    mem.buf_init(&(*s).out)
+    mem.cp_init(&(*s).chars)
+    mem.cp_init(&(*s).name)
+    mem.cp_init(&(*s).data)
+    mem.cp_init(&(*s).pubid)
+    mem.cp_init(&(*s).sysid)
+    mem.cp_init(&(*s).last_starttag)
+    (*s).first = true
+    (*s).kind = TOK_NONE
+    (*s).has_pubid = false
+    (*s).has_sysid = false
+    (*s).has_name = false
+    (*s).force_quirks = false
+    (*s).self_closing = false
+    (*s).nattr = 0
+    (*s).xml_mode = false
+    mem.cp_init(&(*s).err)
+    (*s).p_scanned = 0
+    (*s).p_line = 1
+    (*s).p_line_start = 0
+    (*s).p_units = 0
+    (*s).p_only_bmp = true
+    (*s).last_duplicate = false
+    (*s).ent_tab = 0 as *mut u8
+    (*s).ent_tries = false
+    (*s).pos = 0
+    (*s).aborted = false
+    (*s).attrs = mem.heap_alloc(MAX_ATTRS * 56) as *mut Attr
+    var i: usize = 0
+    while i < MAX_ATTRS {
+        let a: *mut Attr = attr_ptr(s, i)
+        mem.cp_init(&(*a).name)
+        mem.cp_init(&(*a).value)
+        (*a).duplicate = false
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn sink_free(s: *mut Sink) {
+    var i: usize = 0
+    while i < MAX_ATTRS {
+        let a: *mut Attr = attr_ptr(s, i)
+        mem.cp_free(&(*a).name)
+        mem.cp_free(&(*a).value)
+        i = i + 1
+    }
+    mem.heap_free((*s).attrs as *mut u8, MAX_ATTRS * 56)
+    mem.buf_free(&(*s).out)
+    mem.cp_free(&(*s).chars)
+    mem.cp_free(&(*s).name)
+    mem.cp_free(&(*s).data)
+    mem.cp_free(&(*s).pubid)
+    mem.cp_free(&(*s).sysid)
+    mem.cp_free(&(*s).last_starttag)
+    mem.cp_free(&(*s).err)
+}
+
+// ------------------------------------------------------------ JSON helpers
+
+#[no_gc]
+fn out_ascii(s: *mut Sink, c: u32) {
+    mem.buf_push(&(*s).out, c as u8)
+}
+
+#[no_gc]
+fn hex_digit(v: u32) -> u8 {
+    if v < 10 as u32 {
+        return (48 as u32 + v) as u8
+    }
+    return (87 as u32 + v) as u8 // 'a' = 97 = 87 + 10
+}
+
+#[no_gc]
+fn out_u16_escape(s: *mut Sink, v: u32) {
+    out_ascii(s, 92 as u32) // '\'
+    out_ascii(s, 117 as u32) // 'u'
+    mem.buf_push(&(*s).out, hex_digit((v >> 12) & 15 as u32))
+    mem.buf_push(&(*s).out, hex_digit((v >> 8) & 15 as u32))
+    mem.buf_push(&(*s).out, hex_digit((v >> 4) & 15 as u32))
+    mem.buf_push(&(*s).out, hex_digit(v & 15 as u32))
+}
+
+// A code point as a JSON character. Everything outside the printable ASCII
+// is written as \uXXXX; that makes the output pure ASCII and Python reads
+// even unpaired surrogates back.
+#[no_gc]
+fn out_json_cp(s: *mut Sink, cp: u32) {
+    if cp == 34 as u32 || cp == 92 as u32 {
+        out_ascii(s, 92 as u32)
+        out_ascii(s, cp)
+    } else if cp >= 32 as u32 && cp < 127 as u32 {
+        out_ascii(s, cp)
+    } else if cp <= 0xFFFF as u32 {
+        out_u16_escape(s, cp)
+    } else {
+        let v: u32 = cp - 0x10000 as u32
+        out_u16_escape(s, 0xD800 as u32 + (v >> 10))
+        out_u16_escape(s, 0xDC00 as u32 + (v & 0x3FF as u32))
+    }
+}
+
+#[no_gc]
+fn out_json_cpbuf(s: *mut Sink, c: *mut mem.CpBuf) {
+    out_ascii(s, 34 as u32)
+    var i: usize = 0
+    while i < mem.cp_len(c) {
+        out_json_cp(s, mem.cp_at(c, i))
+        i = i + 1
+    }
+    out_ascii(s, 34 as u32)
+}
+
+// ------------------------------------------- The XML adjustment (optional)
+//
+// Only active when `xml_mode` is set (job flag bit 0, see
+// tools/tokenizer/LOG.md). What is implemented are the adjustments from the
+// section "Coercing an HTML DOM into an infoset" of the HTML standard, as
+// far as they concern the token stream:
+//   * characters XML 1.0 does not know (C0 control characters except TAB/LF,
+//     unpaired surrogates, the non characters U+FFFE/U+FFFF per plane) are
+//     replaced by U+FFFD -- in text, attribute values and comments.
+//   * U+000C (FORM FEED) becomes U+0020 (SPACE) instead of U+FFFD.
+//   * In comments a U+0020 is inserted between two consecutive U+002D;
+//     if the comment ends on a U+002D, a U+0020 follows.
+// Element, attribute and DOCTYPE names stay untouched: adjusting those
+// concerns the DOM construction, not the token stream.
+#[no_gc]
+fn xml_cp(cp: u32) -> u32 {
+    if cp == 12 as u32 {
+        return 32 as u32 // FORM FEED -> SPACE
+    }
+    if cp < 32 as u32 && cp != 9 as u32 && cp != 10 as u32 {
+        return 0xFFFD as u32
+    }
+    if cp >= 0xD800 as u32 && cp <= 0xDFFF as u32 {
+        return 0xFFFD as u32
+    }
+    if (cp & 0xFFFF as u32) >= 0xFFFE as u32 {
+        return 0xFFFD as u32
+    }
+    return cp
+}
+
+// Text and attribute values: adjusted character by character in XML mode.
+#[no_gc]
+fn out_json_cpbuf_text(s: *mut Sink, c: *mut mem.CpBuf) {
+    if !(*s).xml_mode {
+        out_json_cpbuf(s, c)
+        return
+    }
+    out_ascii(s, 34 as u32)
+    var i: usize = 0
+    while i < mem.cp_len(c) {
+        out_json_cp(s, xml_cp(mem.cp_at(c, i)))
+        i = i + 1
+    }
+    out_ascii(s, 34 as u32)
+}
+
+// The comment text: additionally the hyphen adjustment.
+#[no_gc]
+fn out_json_comment(s: *mut Sink, c: *mut mem.CpBuf) {
+    if !(*s).xml_mode {
+        out_json_cpbuf(s, c)
+        return
+    }
+    out_ascii(s, 34 as u32)
+    var before_dash: bool = false
+    var i: usize = 0
+    while i < mem.cp_len(c) {
+        let cp: u32 = xml_cp(mem.cp_at(c, i))
+        if cp == 45 as u32 {
+            if before_dash {
+                out_json_cp(s, 32 as u32)
+            }
+            before_dash = true
+        } else {
+            before_dash = false
+        }
+        out_json_cp(s, cp)
+        i = i + 1
+    }
+    if before_dash {
+        out_json_cp(s, 32 as u32)
+    }
+    out_ascii(s, 34 as u32)
+}
+
+#[no_gc]
+fn out_null(s: *mut Sink) {
+    out_ascii(s, 110 as u32) // n
+    out_ascii(s, 117 as u32) // u
+    out_ascii(s, 108 as u32) // l
+    out_ascii(s, 108 as u32) // l
+}
+
+#[no_gc]
+fn out_bool(s: *mut Sink, v: bool) {
+    if v {
+        out_ascii(s, 116 as u32) // true
+        out_ascii(s, 114 as u32)
+        out_ascii(s, 117 as u32)
+        out_ascii(s, 101 as u32)
+    } else {
+        out_ascii(s, 102 as u32) // false
+        out_ascii(s, 97 as u32)
+        out_ascii(s, 108 as u32)
+        out_ascii(s, 115 as u32)
+        out_ascii(s, 101 as u32)
+    }
+}
+
+// An identifier word in quotes; a 0 ends the word.
+// (Stage 0 has no string literals -- SPEC 14.1.str S1.)
+#[no_gc]
+fn out_word(s: *mut Sink, a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32, i: u32) {
+    out_ascii(s, 34 as u32)
+    if a != 0 as u32 { out_ascii(s, a) }
+    if b != 0 as u32 { out_ascii(s, b) }
+    if c != 0 as u32 { out_ascii(s, c) }
+    if d != 0 as u32 { out_ascii(s, d) }
+    if e != 0 as u32 { out_ascii(s, e) }
+    if f != 0 as u32 { out_ascii(s, f) }
+    if g != 0 as u32 { out_ascii(s, g) }
+    if h != 0 as u32 { out_ascii(s, h) }
+    if i != 0 as u32 { out_ascii(s, i) }
+    out_ascii(s, 34 as u32)
+}
+
+#[no_gc]
+fn comma_if_needed(s: *mut Sink) {
+    if (*s).first {
+        (*s).first = false
+    } else {
+        out_ascii(s, 44 as u32)
+    }
+}
+
+// ------------------------------------------------------------ Parse errors
+
+// One parse error of the case: the WHATWG code name (a constant from
+// lib/html/error_codes.fi) with the line and the column of the triggering
+// character (both 1 based, the column in code points of the normalized input).
+#[no_gc]
+fn sink_error(s: *mut Sink, code: u32, line: u32, col: u32) {
+    mem.cp_push(&(*s).err, code)
+    mem.cp_push(&(*s).err, line)
+    mem.cp_push(&(*s).err, col)
+}
+
+// The width of a code point in UTF-16 code units. html5lib-tests count
+// columns in code units, not in code points.
+#[no_gc]
+fn units(cp: u32) -> u32 {
+    if cp > 0xFFFF as u32 {
+        return 2
+    }
+    return 1
+}
+
+// Reports a parse error at the character with the index `idx` of the input
+// (`idx == cp_len(input)` stands for EOF). The line and the column are
+// determined from a running cache: the forward pass over the input costs
+// O(n) in total, while a backward jump across a line boundary makes the
+// counter start over.
+#[no_gc]
+fn sink_error_at(s: *mut Sink, code: u32, input: *mut mem.CpBuf, idx: usize) {
+    if idx < (*s).p_line_start {
+        (*s).p_scanned = 0
+        (*s).p_line = 1
+        (*s).p_line_start = 0
+        (*s).p_units = 0
+        (*s).p_only_bmp = true
+    }
+    while (*s).p_scanned < idx {
+        let cp: u32 = mem.cp_at(input, (*s).p_scanned)
+        if cp == 10 as u32 {
+            (*s).p_line = (*s).p_line + 1 as u32
+            (*s).p_line_start = (*s).p_scanned + 1
+            (*s).p_units = 0
+            (*s).p_only_bmp = true
+        } else {
+            (*s).p_units = (*s).p_units + units(cp)
+            if cp > 0xFFFF as u32 {
+                (*s).p_only_bmp = false
+            }
+        }
+        (*s).p_scanned = (*s).p_scanned + 1
+    }
+    var col: u32 = (*s).p_units + 1 as u32
+    if idx < (*s).p_scanned {
+        // A look back inside the same line.
+        if (*s).p_only_bmp {
+            col = (idx - (*s).p_line_start) as u32 + 1 as u32
+        } else {
+            var e: u32 = 0
+            var k: usize = (*s).p_line_start
+            while k < idx {
+                e = e + units(mem.cp_at(input, k))
+                k = k + 1
+            }
+            col = e + 1 as u32
+        }
+    }
+    sink_error(s, code, (*s).p_line, col)
+}
+
+// The number of parse errors reported for this case so far.
+#[no_gc]
+fn sink_error_count(s: *mut Sink) -> usize {
+    return mem.cp_len(&(*s).err) / 3
+}
+
+// Writes the code name as a JSON string (the chunks from error_codes).
+#[no_gc]
+fn out_error_name(s: *mut Sink, code: u32) {
+    out_ascii(s, 34 as u32)
+    var i: usize = 0
+    var runs: bool = true
+    while runs && i < error_codes.STUECKE_MAX {
+        let st: u64 = error_codes.name_chunk(code, i)
+        if st == 0 as u64 {
+            runs = false
+        } else {
+            var k: usize = 0
+            while k < 8 && runs {
+                let b: u32 = ((st >> (8 * k as u64)) & 0xFF as u64) as u32
+                if b == 0 as u32 {
+                    runs = false
+                } else {
+                    out_ascii(s, b)
+                    k = k + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    out_ascii(s, 34 as u32)
+}
+
+// The error list of the case in the html5lib format:
+//   [{"code":"eof-in-tag","line":1,"col":5}, ...]
+#[no_gc]
+fn out_error_list(s: *mut Sink) {
+    out_ascii(s, 91 as u32) // [
+    var i: usize = 0
+    let n: usize = mem.cp_len(&(*s).err)
+    while i + 2 < n {
+        if i > 0 {
+            out_ascii(s, 44 as u32) // ,
+        }
+        out_ascii(s, 123 as u32) // {
+        // "code":
+        out_word(s, 99 as u32, 111 as u32, 100 as u32, 101 as u32, 0 as u32, 0 as u32,
+            0 as u32, 0 as u32, 0 as u32)
+        out_ascii(s, 58 as u32)
+        out_error_name(s, mem.cp_at(&(*s).err, i))
+        out_ascii(s, 44 as u32)
+        // "line":
+        out_word(s, 108 as u32, 105 as u32, 110 as u32, 101 as u32, 0 as u32, 0 as u32,
+            0 as u32, 0 as u32, 0 as u32)
+        out_ascii(s, 58 as u32)
+        mem.buf_push_dec(&(*s).out, mem.cp_at(&(*s).err, i + 1) as u64)
+        out_ascii(s, 44 as u32)
+        // "col":
+        out_word(s, 99 as u32, 111 as u32, 108 as u32, 0 as u32, 0 as u32, 0 as u32,
+            0 as u32, 0 as u32, 0 as u32)
+        out_ascii(s, 58 as u32)
+        mem.buf_push_dec(&(*s).out, mem.cp_at(&(*s).err, i + 2) as u64)
+        out_ascii(s, 125 as u32) // }
+        i = i + 3
+    }
+    out_ascii(s, 93 as u32) // ]
+}
+
+// --------------------------------------- The table of character references
+
+// The name table of the character references lies at an ARBITRARY address
+// (mmap without MAP_FIXED). Because stage 0 knows no global mutables, the
+// pointer is held in the Sink here and passed through the tokenizer that way.
+// `ent_tries` tells "not built yet" apart from "the build failed";
+// a failed build leads to the unsupported marker, never to silently
+// wrong tokenization.
+#[no_gc]
+fn sink_entities(s: *mut Sink) -> *mut u8 {
+    return (*s).ent_tab
+}
+
+#[no_gc]
+fn sink_set_entities(s: *mut Sink, p: *mut u8) {
+    (*s).ent_tab = p
+}
+
+#[no_gc]
+fn sink_entities_tries(s: *mut Sink) -> bool {
+    return (*s).ent_tries
+}
+
+#[no_gc]
+fn sink_set_entities_tries(s: *mut Sink, v: bool) {
+    (*s).ent_tries = v
+}
+
+// ----------------------------------------------------- The frame of a case
+
+// Begins the token list of a test case.
+#[no_gc]
+fn sink_begin(s: *mut Sink) {
+    mem.cp_clear(&(*s).chars)
+    mem.cp_clear(&(*s).err)
+    (*s).p_scanned = 0
+    (*s).p_line = 1
+    (*s).p_line_start = 0
+    (*s).p_units = 0
+    (*s).p_only_bmp = true
+    (*s).last_duplicate = false
+    (*s).first = true
+    (*s).kind = TOK_NONE
+    (*s).nattr = 0
+    (*s).mark = mem.buf_len(&(*s).out)
+    (*s).pos = 0
+    (*s).aborted = false
+    if (*s).only_count || (*s).tree_mode {
+        return
+    }
+    out_ascii(s, 91 as u32) // [
+}
+
+// The case could not be tokenized to the end: the output produced for this
+// case so far is discarded and replaced by the unsupported marker.
+// The harness counts something like that as a FAILURE.
+#[no_gc]
+fn sink_abort(s: *mut Sink) {
+    mem.buf_set_len(&(*s).out, (*s).mark)
+    mem.cp_clear(&(*s).chars)
+    (*s).kind = TOK_NONE
+    if (*s).tree_mode {
+        // The tree construction does not get half a protocol: the records of this
+        // job are gone and the abort marker stands.
+        (*s).aborted = true
+        mem.cp_clear(&(*s).err)
+        return
+    }
+    if (*s).only_count {
+        mem.cp_clear(&(*s).err)
+        return
+    }
+    out_ascii(s, 91 as u32) // [
+    // the unsupported marker, byte by byte
+    out_ascii(s, 34 as u32)
+    out_ascii(s, 78 as u32)
+    out_ascii(s, 73 as u32)
+    out_ascii(s, 67 as u32)
+    out_ascii(s, 72 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 45 as u32)
+    out_ascii(s, 85 as u32)
+    out_ascii(s, 78 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 69 as u32)
+    out_ascii(s, 82 as u32)
+    out_ascii(s, 83 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 85 as u32)
+    out_ascii(s, 69 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 90 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 34 as u32)
+    out_ascii(s, 93 as u32) // ]
+    out_ascii(s, 9 as u32) // Tab: the separator to the error field
+    out_ascii(s, 91 as u32) // [
+    out_ascii(s, 93 as u32) // ]
+    out_ascii(s, 10 as u32)
+    mem.cp_clear(&(*s).err)
+}
+
+// Closes the token list (characters are merged beforehand).
+#[no_gc]
+fn sink_end(s: *mut Sink) {
+    sink_flush_chars(s)
+    if (*s).tree_mode {
+        mem.cp_clear(&(*s).err)
+        return
+    }
+    if (*s).only_count {
+        // The errors were collected (html5ever does that too), only the
+        // JSON output is left out.
+        mem.cp_clear(&(*s).err)
+        return
+    }
+    out_ascii(s, 93 as u32) // ]
+    out_ascii(s, 9 as u32) // Tab: the separator to the error field
+    out_error_list(s)
+    out_ascii(s, 10 as u32) // \n
+    if mem.buf_len(&(*s).out) > 65536 {
+        mem.buf_flush(&(*s).out, 1)
+    }
+}
+
+#[no_gc]
+fn sink_flush_out(s: *mut Sink) {
+    mem.buf_flush(&(*s).out, 1)
+}
+
+#[no_gc]
+fn sink_set_last_start_tag_cp(s: *mut Sink, c: *mut mem.CpBuf) {
+    mem.cp_copy_from(&(*s).last_starttag, c)
+}
+
+// Measuring mode: produce no JSON, only count tokens (lib/html/tokenize_bench.fi).
+#[no_gc]
+fn sink_set_count_mode(s: *mut Sink, an: bool) {
+    (*s).only_count = an
+}
+
+#[no_gc]
+fn sink_token_count(s: *mut Sink) -> u64 {
+    return (*s).token_count
+}
+
+// Turns the XML adjustment on or off for the following cases.
+#[no_gc]
+fn sink_set_xml_mode(s: *mut Sink, v: bool) {
+    (*s).xml_mode = v
+}
+
+// -------------------------------------------------------------- Characters
+
+#[no_gc]
+fn sink_emit_char(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).chars, cp)
+}
+
+#[no_gc]
+fn sink_flush_chars(s: *mut Sink) {
+    if mem.cp_len(&(*s).chars) == 0 {
+        return
+    }
+    if (*s).only_count {
+        (*s).token_count = (*s).token_count + 1
+        mem.cp_clear(&(*s).chars)
+        return
+    }
+    if (*s).tree_mode {
+        tb_header(s, TB_CHARACTER, 0, 0)
+        tb_chain(s, &(*s).chars)
+        mem.cp_clear(&(*s).chars)
+        return
+    }
+    comma_if_needed(s)
+    out_ascii(s, 91 as u32)
+    // "Character"
+    out_word(s, 67 as u32, 104 as u32, 97 as u32, 114 as u32, 97 as u32, 99 as u32, 116 as u32,
+        101 as u32, 114 as u32)
+    out_ascii(s, 44 as u32)
+    out_json_cpbuf_text(s, &(*s).chars)
+    out_ascii(s, 93 as u32)
+    mem.cp_clear(&(*s).chars)
+}
+
+// ------------------------------------------------------- the current token
+
+#[no_gc]
+fn tok_start(s: *mut Sink, kind: u32) {
+    (*s).kind = kind
+    mem.cp_clear(&(*s).name)
+    mem.cp_clear(&(*s).data)
+    mem.cp_clear(&(*s).pubid)
+    mem.cp_clear(&(*s).sysid)
+    (*s).has_pubid = false
+    (*s).has_sysid = false
+    (*s).has_name = false
+    (*s).force_quirks = false
+    (*s).self_closing = false
+    (*s).nattr = 0
+}
+
+#[no_gc]
+fn tok_start_tag(s: *mut Sink) { tok_start(s, TOK_START) }
+#[no_gc]
+fn tok_end_tag(s: *mut Sink) { tok_start(s, TOK_END) }
+#[no_gc]
+fn tok_comment(s: *mut Sink) { tok_start(s, TOK_COMMENT) }
+#[no_gc]
+fn tok_doctype(s: *mut Sink) { tok_start(s, TOK_DOCTYPE) }
+
+#[no_gc]
+fn tok_name_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).name, cp)
+}
+
+#[no_gc]
+fn tok_comment_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).data, cp)
+}
+
+#[no_gc]
+fn tok_doctype_name_push(s: *mut Sink, cp: u32) {
+    (*s).has_name = true
+    mem.cp_push(&(*s).name, cp)
+}
+
+#[no_gc]
+fn tok_pubid_start(s: *mut Sink) {
+    (*s).has_pubid = true
+    mem.cp_clear(&(*s).pubid)
+}
+
+#[no_gc]
+fn tok_pubid_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).pubid, cp)
+}
+
+#[no_gc]
+fn tok_sysid_start(s: *mut Sink) {
+    (*s).has_sysid = true
+    mem.cp_clear(&(*s).sysid)
+}
+
+#[no_gc]
+fn tok_sysid_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).sysid, cp)
+}
+
+#[no_gc]
+fn tok_set_force_quirks(s: *mut Sink, v: bool) {
+    (*s).force_quirks = v
+}
+
+#[no_gc]
+fn tok_set_self_closing(s: *mut Sink, v: bool) {
+    (*s).self_closing = v
+}
+
+// Create a new attribute; the name and the value are empty at first.
+#[no_gc]
+fn tok_attr_start(s: *mut Sink) {
+    if (*s).nattr >= MAX_ATTRS {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr)
+    mem.cp_clear(&(*a).name)
+    mem.cp_clear(&(*a).value)
+    (*a).duplicate = false
+    (*s).nattr = (*s).nattr + 1
+}
+
+#[no_gc]
+fn tok_attr_name_push(s: *mut Sink, cp: u32) {
+    if (*s).nattr == 0 {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr - 1)
+    mem.cp_push(&(*a).name, cp)
+}
+
+#[no_gc]
+fn tok_attr_value_push(s: *mut Sink, cp: u32) {
+    if (*s).nattr == 0 {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr - 1)
+    mem.cp_push(&(*a).value, cp)
+}
+
+// Duplicate attribute names: the later occurrence is discarded (HTML standard).
+#[no_gc]
+fn tok_attr_finish(s: *mut Sink) {
+    (*s).last_duplicate = false
+    if (*s).nattr < 2 {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr - 1)
+    var i: usize = 0
+    while i + 1 < (*s).nattr {
+        let b: *mut Attr = attr_ptr(s, i)
+        if !(*b).duplicate && mem.cp_eq_cp(&(*a).name, &(*b).name) {
+            (*a).duplicate = true
+            (*s).last_duplicate = true
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Did the last `tok_attr_finish` spot a duplicate attribute name?
+#[no_gc]
+fn tok_attr_was_duplicate(s: *mut Sink) -> bool {
+    return (*s).last_duplicate
+}
+
+// The features of the current token (for end-tag-with-attributes and
+// end-tag-with-trailing-solidus).
+#[no_gc]
+fn tok_is_endtag(s: *mut Sink) -> bool {
+    return (*s).kind == TOK_END
+}
+
+#[no_gc]
+fn tok_has_attribute(s: *mut Sink) -> bool {
+    return (*s).nattr > 0
+}
+
+#[no_gc]
+fn tok_is_self_closing(s: *mut Sink) -> bool {
+    return (*s).self_closing
+}
+
+// Does the current EndTag match the StartTag emitted last?
+#[no_gc]
+fn tok_is_appropriate_end_tag(s: *mut Sink) -> bool {
+    return mem.cp_eq_cp(&(*s).name, &(*s).last_starttag)
+}
+
+// Emits the current token.
+#[no_gc]
+fn tok_emit(s: *mut Sink) {
+    sink_flush_chars(s)
+    if (*s).kind == TOK_NONE {
+        return
+    }
+    if (*s).only_count {
+        (*s).token_count = (*s).token_count + 1
+        // The last start tag is needed in measuring mode too: whether an end tag is
+        // "appropriate" depends on it (RCDATA/RAWTEXT/Script).
+        if (*s).kind == TOK_START {
+            mem.cp_copy_from(&(*s).last_starttag, &(*s).name)
+        }
+        (*s).kind = TOK_NONE
+        return
+    }
+    if (*s).tree_mode {
+        tb_emit(s)
+        return
+    }
+    comma_if_needed(s)
+    out_ascii(s, 91 as u32) // [
+    if (*s).kind == TOK_START {
+        // "StartTag"
+        out_word(s, 83 as u32, 116 as u32, 97 as u32, 114 as u32, 116 as u32, 84 as u32, 97 as u32,
+            103 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        out_json_cpbuf(s, &(*s).name)
+        out_ascii(s, 44 as u32)
+        out_ascii(s, 123 as u32) // {
+        var i: usize = 0
+        var first_attr: bool = true
+        while i < (*s).nattr {
+            let a: *mut Attr = attr_ptr(s, i)
+            if !(*a).duplicate {
+                if first_attr {
+                    first_attr = false
+                } else {
+                    out_ascii(s, 44 as u32)
+                }
+                out_json_cpbuf(s, &(*a).name)
+                out_ascii(s, 58 as u32)
+                out_json_cpbuf_text(s, &(*a).value)
+            }
+            i = i + 1
+        }
+        out_ascii(s, 125 as u32) // }
+        if (*s).self_closing {
+            out_ascii(s, 44 as u32)
+            out_bool(s, true)
+        }
+        mem.cp_copy_from(&(*s).last_starttag, &(*s).name)
+    } else if (*s).kind == TOK_END {
+        // "EndTag"
+        out_word(s, 69 as u32, 110 as u32, 100 as u32, 84 as u32, 97 as u32, 103 as u32, 0 as u32,
+            0 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        out_json_cpbuf(s, &(*s).name)
+    } else if (*s).kind == TOK_COMMENT {
+        // "Comment"
+        out_word(s, 67 as u32, 111 as u32, 109 as u32, 109 as u32, 101 as u32, 110 as u32, 116 as u32,
+            0 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        out_json_comment(s, &(*s).data)
+    } else {
+        // "DOCTYPE"
+        out_word(s, 68 as u32, 79 as u32, 67 as u32, 84 as u32, 89 as u32, 80 as u32, 69 as u32,
+            0 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        if (*s).has_name {
+            out_json_cpbuf(s, &(*s).name)
+        } else {
+            out_null(s)
+        }
+        out_ascii(s, 44 as u32)
+        if (*s).has_pubid {
+            out_json_cpbuf(s, &(*s).pubid)
+        } else {
+            out_null(s)
+        }
+        out_ascii(s, 44 as u32)
+        if (*s).has_sysid {
+            out_json_cpbuf(s, &(*s).sysid)
+        } else {
+            out_null(s)
+        }
+        out_ascii(s, 44 as u32)
+        out_bool(s, !(*s).force_quirks)
+    }
+    out_ascii(s, 93 as u32) // ]
+    (*s).kind = TOK_NONE
+}
+
+// ----------------------------------------- The binary token protocol (R54)
+//
+// Everything here runs ONLY in tree mode (`sink_set_tree_mode`). The JSON
+// path and the measuring mode are untouched by it: they see not one extra
+// word, only a branch that is never taken for them.
+
+#[no_gc]
+fn tb_u32(s: *mut Sink, v: u32) {
+    mem.buf_push(&(*s).out, (v & 0xFF as u32) as u8)
+    mem.buf_push(&(*s).out, ((v >> 8) & 0xFF as u32) as u8)
+    mem.buf_push(&(*s).out, ((v >> 16) & 0xFF as u32) as u8)
+    mem.buf_push(&(*s).out, ((v >> 24) & 0xFF as u32) as u8)
+}
+
+#[no_gc]
+fn tb_header(s: *mut Sink, kind: u32, flags: u32, nattr: u32) {
+    tb_u32(s, kind)
+    tb_u32(s, flags)
+    tb_u32(s, (*s).pos as u32)
+    tb_u32(s, nattr)
+}
+
+#[no_gc]
+fn tb_chain(s: *mut Sink, c: *mut mem.CpBuf) {
+    let n: usize = mem.cp_len(c)
+    tb_u32(s, n as u32)
+    var i: usize = 0
+    while i < n {
+        tb_u32(s, mem.cp_at(c, i))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn tb_emit(s: *mut Sink) {
+    if (*s).kind == TOK_START {
+        var f: u32 = 0
+        if (*s).self_closing {
+            f = f | TB_F_SELF_CLOSING
+        }
+        // Duplicate attributes are discarded (HTML standard); so they do not
+        // even enter the record in the first place.
+        var real: u32 = 0
+        var i: usize = 0
+        while i < (*s).nattr {
+            let a: *mut Attr = attr_ptr(s, i)
+            if !(*a).duplicate {
+                real = real + 1
+            }
+            i = i + 1
+        }
+        tb_header(s, TB_START, f, real)
+        tb_chain(s, &(*s).name)
+        i = 0
+        while i < (*s).nattr {
+            let a: *mut Attr = attr_ptr(s, i)
+            if !(*a).duplicate {
+                tb_chain(s, &(*a).name)
+                tb_chain(s, &(*a).value)
+            }
+            i = i + 1
+        }
+        mem.cp_copy_from(&(*s).last_starttag, &(*s).name)
+    } else if (*s).kind == TOK_END {
+        tb_header(s, TB_END, 0, 0)
+        tb_chain(s, &(*s).name)
+    } else if (*s).kind == TOK_COMMENT {
+        tb_header(s, TB_COMMENT, 0, 0)
+        tb_chain(s, &(*s).data)
+    } else {
+        var f: u32 = 0
+        if (*s).force_quirks {
+            f = f | TB_F_FORCE_QUIRKS
+        }
+        if (*s).has_name {
+            f = f | TB_F_HAS_NAME
+        }
+        if (*s).has_pubid {
+            f = f | TB_F_HAS_PUBID
+        }
+        if (*s).has_sysid {
+            f = f | TB_F_HAS_SYSID
+        }
+        tb_header(s, TB_DOCTYPE, f, 0)
+        tb_chain(s, &(*s).name)
+        tb_chain(s, &(*s).pubid)
+        tb_chain(s, &(*s).sysid)
+    }
+    (*s).kind = TOK_NONE
+}
+
+// Like `tok_emit`, but it remembers the source position RIGHT BEHIND the
+// token. The tokenizer calls only this version; `tok_emit` remains as the
+// way without a position (then `pos` is the value set last).
+#[no_gc]
+fn tok_emit_at(s: *mut Sink, pos: usize) {
+    (*s).pos = pos
+    tok_emit(s)
+}
+
+#[no_gc]
+fn sink_pos(s: *mut Sink) -> usize {
+    return (*s).pos
+}
+
+#[no_gc]
+fn sink_set_tree_mode(s: *mut Sink, an: bool) {
+    (*s).tree_mode = an
+}
+
+#[no_gc]
+fn sink_tree_mode(s: *mut Sink) -> bool {
+    return (*s).tree_mode
+}
+
+#[no_gc]
+fn sink_aborted(s: *mut Sink) -> bool {
+    return (*s).aborted
+}
+
+#[no_gc]
+fn sink_out_ptr(s: *mut Sink) -> *mut u8 {
+    return mem.buf_ptr(&(*s).out)
+}
+
+#[no_gc]
+fn sink_out_len(s: *mut Sink) -> usize {
+    return mem.buf_len(&(*s).out)
+}
+
+#[no_gc]
+fn sink_out_clear(s: *mut Sink) {
+    mem.buf_clear(&(*s).out)
+    (*s).mark = 0
+}

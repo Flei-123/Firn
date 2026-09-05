@@ -1,0 +1,1105 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/mono.fi -- GENERIC TEMPLATES AND THEIR MONOMORPHIZATION, IN FIRN.
+//
+// Port of `compiler/src/sema_generic.rs` (collection, naming scheme)
+// and `compiler/src/mono.rs` (instantiation). The last step before the
+// fixpoint: `lexer.fi`, `parser.fi` and `sema.fi` use `Vec[T]` and
+// `Map[K,V]`, and without generics `firnc1` cannot read its own
+// sources.
+//
+// METHOD: no type erasure, no dictionaries -- for every used
+// type combination a separate, fully concrete function or struct is
+// created. The type checker afterwards sees only ordinary code.
+//
+// NAMING SCHEME (a contract, as in `sema_generic.rs`):
+//
+//     name__T1_T2      e.g.  vec_push__i32, Vec__ptrmut_u8, Map__u32_i64
+//
+// WHERE THE TEMPLATES LIVE: not in the declaration lists of `ast.Tree` --
+// the type checker would otherwise trip over `T` and `--emit=ast-canon` would
+// print them, which `firnc0` does not. Their nodes are in the tree
+// (parameters, body, fields); only the entry points are kept here.
+//
+// A RULE NOBODY CAN GUESS: when a subtree is rebuilt, child, parameter,
+// field and statement lists have to sit WITHOUT GAPS. So build the
+// children first, collect them, and then store them in one go --
+// exactly the bug that turned `f(a, g(b))` into `f(a, b, g(b))` in the parser.
+
+import rt
+import vec
+import intern
+import lexer
+import ast
+import types
+import iface
+
+export { Gen, gen_new, gen_free, gen_upfront, gen_is_fn, gen_is_struct,
+    gen_depth_on, gen_depth_off, gen_in_template,
+    gen_bound, gen_tp_start, gen_tp_add, gen_tp_duplicate,
+    gen_tp_bound_add, gen_if_set,
+    gen_fn_template, gen_struct_template, gen_instance,
+    gen_size_of_name, gen_run, gen_error,
+    gen_fn_count, gen_struct_count, gen_inst_count, gen_generated }
+
+const NONE: u32 = 4294967295
+
+// Bounds on a type parameter (`T: Int`, `T: Ord`, `T: Int + Ord`).
+//
+// ROUND 50: `Any`, `Int` and `Scalar` are the three BUILTIN bounds;
+// every other name is the name of an INTERFACE. Whether it exists is not
+// decided while parsing (an `interface` declaration may come further
+// down) -- the check happens at INSTANTIATION time.
+const BOUND_ANY: u32 = 0
+const BOUND_INT: u32 = 1
+const BOUND_SCALAR: u32 = 2
+const BOUND_IFACE: u32 = 3
+
+// Upper limit against endless instantiation chains (`Vec[Vec[Vec[..]]]`).
+const MAX_AUSPRAEGUNGEN: usize = 4096
+
+struct Gen {
+    b: u64, // *mut ast.Tree
+    it: u64, // *mut intern.Interner
+
+    // Prescan: which names are generic at all? Additive across all
+    // files, so that a template stays usable even BEFORE its declaration.
+    gfn: Vec[u32],
+    gst: Vec[u32],
+
+    // Type parameters of all templates, one after another.
+    tp_name: Vec[u32],
+    tp_soff: Vec[u32], // bounds of this parameter: range in sk_*
+    tp_slen: Vec[u32],
+    sk_kind: Vec[u32], // BOUND_ANY/INT/SCALAR/IFACE
+    sk_name: Vec[u32], // for IFACE: name of the interface
+
+    ifr: u64, // *mut iface.If (0 = no registry)
+
+    // function templates
+    fv_name: Vec[u32], fv_toff: Vec[u32], fv_tlen: Vec[u32],
+    fv_poff: Vec[u32], fv_plen: Vec[u32], fv_ret: Vec[u32], fv_body: Vec[u32],
+
+    // struct templates
+    sv_name: Vec[u32], sv_toff: Vec[u32], sv_tlen: Vec[u32],
+    sv_foff: Vec[u32], sv_flen: Vec[u32],
+
+    // instantiations (`Vec[i32]`, `sum[u8]`)
+    iv_name: Vec[u32], // expanded name (`Vec__i32`)
+    iv_base: Vec[u32],
+    iv_aoff: Vec[u32], iv_alen: Vec[u32],
+    iv_abstract: Vec[u32], // written inside a template (mentions `T`)
+    iv_isfn: Vec[u32],
+    iargs: Vec[u32], // type nodes of the type arguments
+
+    // work list and what has been done already
+    stack: Vec[u32],
+    done: Vec[u32],
+
+    // binding type parameter -> type node during ONE instantiation
+    bd_name: Vec[u32], bd_ty: Vec[u32],
+
+    depth: usize, // > 0: the body of a template is being parsed
+    generated: usize, // how many instantiations were really created
+    err: usize,
+    scratch: rt.Buf,
+}
+
+fn gen_new(b: u64, it: u64) -> Gen {
+    return Gen {
+        b: b, it: it,
+        gfn: vec_new[u32](), gst: vec_new[u32](),
+        tp_name: vec_new[u32](), tp_soff: vec_new[u32](), tp_slen: vec_new[u32](),
+        sk_kind: vec_new[u32](), sk_name: vec_new[u32](), ifr: 0,
+        fv_name: vec_new[u32](), fv_toff: vec_new[u32](), fv_tlen: vec_new[u32](),
+        fv_poff: vec_new[u32](), fv_plen: vec_new[u32](), fv_ret: vec_new[u32](),
+        fv_body: vec_new[u32](),
+        sv_name: vec_new[u32](), sv_toff: vec_new[u32](), sv_tlen: vec_new[u32](),
+        sv_foff: vec_new[u32](), sv_flen: vec_new[u32](),
+        iv_name: vec_new[u32](), iv_base: vec_new[u32](),
+        iv_aoff: vec_new[u32](), iv_alen: vec_new[u32](),
+        iv_abstract: vec_new[u32](), iv_isfn: vec_new[u32](),
+        iargs: vec_new[u32](),
+        stack: vec_new[u32](), done: vec_new[u32](),
+        bd_name: vec_new[u32](), bd_ty: vec_new[u32](),
+        depth: 0, generated: 0, err: 0,
+        scratch: rt.buf_new(),
+    }
+}
+
+fn gen_free(g: *mut Gen) {
+    vec_free[u32](&(*g).gfn)
+    vec_free[u32](&(*g).gst)
+    vec_free[u32](&(*g).tp_name)
+    vec_free[u32](&(*g).tp_soff)
+    vec_free[u32](&(*g).tp_slen)
+    vec_free[u32](&(*g).sk_kind)
+    vec_free[u32](&(*g).sk_name)
+    vec_free[u32](&(*g).fv_name)
+    vec_free[u32](&(*g).fv_toff)
+    vec_free[u32](&(*g).fv_tlen)
+    vec_free[u32](&(*g).fv_poff)
+    vec_free[u32](&(*g).fv_plen)
+    vec_free[u32](&(*g).fv_ret)
+    vec_free[u32](&(*g).fv_body)
+    vec_free[u32](&(*g).sv_name)
+    vec_free[u32](&(*g).sv_toff)
+    vec_free[u32](&(*g).sv_tlen)
+    vec_free[u32](&(*g).sv_foff)
+    vec_free[u32](&(*g).sv_flen)
+    vec_free[u32](&(*g).iv_name)
+    vec_free[u32](&(*g).iv_base)
+    vec_free[u32](&(*g).iv_aoff)
+    vec_free[u32](&(*g).iv_alen)
+    vec_free[u32](&(*g).iv_abstract)
+    vec_free[u32](&(*g).iv_isfn)
+    vec_free[u32](&(*g).iargs)
+    vec_free[u32](&(*g).stack)
+    vec_free[u32](&(*g).done)
+    vec_free[u32](&(*g).bd_name)
+    vec_free[u32](&(*g).bd_ty)
+    rt.buf_free(&(*g).scratch)
+}
+
+fn gtree(g: *mut Gen) -> *mut ast.Tree { return (*g).b as *mut ast.Tree }
+fn gnames(g: *mut Gen) -> *mut intern.Interner { return (*g).it as *mut intern.Interner }
+
+fn gen_error(g: *mut Gen) -> usize { return (*g).err }
+fn gen_fn_count(g: *mut Gen) -> usize { return vec_len[u32](&(*g).fv_name) }
+fn gen_struct_count(g: *mut Gen) -> usize { return vec_len[u32](&(*g).sv_name) }
+fn gen_inst_count(g: *mut Gen) -> usize { return vec_len[u32](&(*g).iv_name) }
+fn gen_generated(g: *mut Gen) -> usize { return (*g).generated }
+
+fn gen_depth_on(g: *mut Gen) { (*g).depth = (*g).depth + 1 }
+fn gen_depth_off(g: *mut Gen) { (*g).depth = (*g).depth - 1 }
+fn gen_in_template(g: *mut Gen) -> bool { return (*g).depth > 0 }
+
+// ---------------------------------------------------------------- prescan
+//
+// `fn IDENT [` and `struct IDENT [` in the TOKEN STREAM. The names of all
+// files have to come together BEFORE the first file is parsed -- otherwise
+// the root file does not see the templates of its modules (blocker B1, round 17).
+
+fn gen_upfront(g: *mut Gen, lxp: u64) {
+    let l: *mut lexer.Lexer = lxp as *mut lexer.Lexer
+    let n: usize = lexer.lex_count(l)
+    var i: usize = 0
+    while i + 2 < n {
+        let a: u32 = lexer.lex_kind(l, i)
+        var is_fn: bool = a == 4
+        var is_st: bool = a == 11
+        if !is_fn {
+            if !is_st {
+                i = i + 1
+                continue
+            }
+        }
+        if lexer.lex_kind(l, i + 1) != 1 {
+            i = i + 1
+            continue
+        }
+        if lexer.lex_kind(l, i + 2) != 38 {
+            i = i + 1
+            continue
+        }
+        let nr: u32 = lexer.lex_nr(l, i + 1)
+        if is_fn {
+            if !gen_is_fn(g, nr) {
+                vec_push[u32](&(*g).gfn, nr)
+            }
+        } else {
+            if !gen_is_struct(g, nr) {
+                vec_push[u32](&(*g).gst, nr)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn gen_is_fn(g: *mut Gen, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).gfn) {
+        if vec_at[u32](&(*g).gfn, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn gen_is_struct(g: *mut Gen, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).gst) {
+        if vec_at[u32](&(*g).gst, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ----------------------------------------------------- type parameter list
+
+// Pass the interface registry through (round 50): without it an
+// interface bound cannot be checked.
+fn gen_if_set(g: *mut Gen, f: u64) { (*g).ifr = f }
+
+// Name of a bound -> kind. An unknown name is NOT an error, it is the
+// name of an interface (round 50).
+fn gen_bound(g: *mut Gen, nr: u32) -> u32 {
+    let it: *mut intern.Interner = gnames(g)
+    var w1: [u8; 3] = "Any"
+    var w2: [u8; 3] = "Int"
+    var w3: [u8; 6] = "Scalar"
+    if intern.intern_equal(it, nr, (&w1[0]) as u64, 3) {
+        return BOUND_ANY
+    }
+    if intern.intern_equal(it, nr, (&w2[0]) as u64, 3) {
+        return BOUND_INT
+    }
+    if intern.intern_equal(it, nr, (&w3[0]) as u64, 6) {
+        return BOUND_SCALAR
+    }
+    return BOUND_IFACE
+}
+
+fn gen_tp_start(g: *mut Gen) -> u32 { return vec_len[u32](&(*g).tp_name) as u32 }
+
+fn gen_tp_add(g: *mut Gen, name: u32) {
+    vec_push[u32](&(*g).tp_name, name)
+    vec_push[u32](&(*g).tp_soff, vec_len[u32](&(*g).sk_kind) as u32)
+    vec_push[u32](&(*g).tp_slen, 0)
+}
+
+// Attach a bound to the type parameter created LAST.
+// `false` = that bound is already there.
+fn gen_tp_bound_add(g: *mut Gen, kind: u32, name: u32) -> bool {
+    let tp: usize = vec_len[u32](&(*g).tp_name) - 1
+    let off: u32 = vec_at[u32](&(*g).tp_soff, tp)
+    let len: u32 = vec_at[u32](&(*g).tp_slen, tp)
+    var i: u32 = 0
+    while i < len {
+        if vec_at[u32](&(*g).sk_kind, (off + i) as usize) == kind {
+            if kind != BOUND_IFACE {
+                return false
+            }
+            if vec_at[u32](&(*g).sk_name, (off + i) as usize) == name {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    vec_push[u32](&(*g).sk_kind, kind)
+    vec_push[u32](&(*g).sk_name, name)
+    vec_set[u32](&(*g).tp_slen, tp, len + 1)
+    return true
+}
+
+// Is the name already in the current type parameter list?
+fn gen_tp_duplicate(g: *mut Gen, off: u32, name: u32) -> bool {
+    var i: usize = off as usize
+    while i < vec_len[u32](&(*g).tp_name) {
+        if vec_at[u32](&(*g).tp_name, i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// -------------------------------------------------------------- templates
+
+fn gen_fn_template(g: *mut Gen, name: u32, toff: u32, tlen: u32,
+    poff: u32, plen: u32, ret: u32, body: u32) {
+    if fn_template_find(g, name) != NONE {
+        (*g).err = (*g).err + 1
+        return
+    }
+    vec_push[u32](&(*g).fv_name, name)
+    vec_push[u32](&(*g).fv_toff, toff)
+    vec_push[u32](&(*g).fv_tlen, tlen)
+    vec_push[u32](&(*g).fv_poff, poff)
+    vec_push[u32](&(*g).fv_plen, plen)
+    vec_push[u32](&(*g).fv_ret, ret)
+    vec_push[u32](&(*g).fv_body, body)
+}
+
+fn gen_struct_template(g: *mut Gen, name: u32, toff: u32, tlen: u32,
+    foff: u32, flen: u32) {
+    if struct_template_find(g, name) != NONE {
+        (*g).err = (*g).err + 1
+        return
+    }
+    vec_push[u32](&(*g).sv_name, name)
+    vec_push[u32](&(*g).sv_toff, toff)
+    vec_push[u32](&(*g).sv_tlen, tlen)
+    vec_push[u32](&(*g).sv_foff, foff)
+    vec_push[u32](&(*g).sv_flen, flen)
+}
+
+fn fn_template_find(g: *mut Gen, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).fv_name) {
+        if vec_at[u32](&(*g).fv_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn struct_template_find(g: *mut Gen, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).sv_name) {
+        if vec_at[u32](&(*g).sv_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// --------------------------------------------------------- naming scheme
+
+// Text form of a type for `name__T1_T2`.
+fn tag_build(g: *mut Gen, out: *mut rt.Buf, t: u32) {
+    let b: *mut ast.Tree = gtree(g)
+    let it: *mut intern.Interner = gnames(g)
+    let a: u32 = ast.t_kind(b, t)
+    if a == ast.T_NAME {
+        let nr: u32 = ast.t_a(b, t)
+        rt.buf_push_bytes(out, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+        return
+    }
+    // ROUND 58: a function type in the naming scheme. Round brackets and
+    // arrows are no identifier characters, so the shape gets spelled out:
+    // `fn2_i32_i32_to_bool`.
+    if a == ast.T_FN {
+        let packed: u64 = ast.t_b(b, t)
+        let off: u32 = (packed >> 32) as u32
+        let cnt: u32 = (packed & 4294967295) as u32
+        var fw: [u8; 2] = "fn"
+        rt.buf_push_bytes(out, (&fw[0]) as u64, 2)
+        rt.buf_push_dec_u64(out, cnt as u64)
+        var k2: u32 = 0
+        while k2 < cnt {
+            rt.buf_push(out, 95 as u8)
+            tag_build(g, out, ast.child_at(b, off + k2))
+            k2 = k2 + 1
+        }
+        var tw: [u8; 4] = "_to_"
+        rt.buf_push_bytes(out, (&tw[0]) as u64, 4)
+        if ast.t_a(b, t) == ast.NOTHING {
+            var vw: [u8; 4] = "void"
+            rt.buf_push_bytes(out, (&vw[0]) as u64, 4)
+        } else {
+            tag_build(g, out, ast.t_a(b, t))
+        }
+        return
+    }
+    if a == ast.T_PTR {
+        if ast.t_b(b, t) != 0 {
+            var m: [u8; 7] = "ptrmut_"
+            rt.buf_push_bytes(out, (&m[0]) as u64, 7)
+        } else {
+            var k: [u8; 4] = "ptr_"
+            rt.buf_push_bytes(out, (&k[0]) as u64, 4)
+        }
+        tag_build(g, out, ast.t_a(b, t))
+        return
+    }
+    var ar: [u8; 3] = "arr"
+    rt.buf_push_bytes(out, (&ar[0]) as u64, 3)
+    rt.buf_push_dec_u64(out, ast.t_b(b, t))
+    rt.buf_push(out, 95 as u8)
+    tag_build(g, out, ast.t_a(b, t))
+}
+
+// `base__tag1_tag2`. The type nodes start at `aoff` in `iargs`.
+fn spell_out(g: *mut Gen, base: u32, aoff: u32, alen: u32) -> u32 {
+    let it: *mut intern.Interner = gnames(g)
+    rt.buf_clear(&(*g).scratch)
+    rt.buf_push_bytes(&(*g).scratch, intern.intern_ptr(it, base),
+        intern.intern_length(it, base))
+    var us: [u8; 2] = "__"
+    rt.buf_push_bytes(&(*g).scratch, (&us[0]) as u64, 2)
+    var k: u32 = 0
+    while k < alen {
+        if k > 0 {
+            rt.buf_push(&(*g).scratch, 95 as u8)
+        }
+        tag_build(g, &(*g).scratch, vec_at[u32](&(*g).iargs, (aoff + k) as usize))
+        k = k + 1
+    }
+    return intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+        rt.buf_len(&(*g).scratch)) as u32
+}
+
+// `size_of$i32` -- the type text sits in the CALLEE NAME, as `sizeof.rs` does it.
+fn gen_size_of_name(g: *mut Gen, t: u32) -> u32 {
+    let it: *mut intern.Interner = gnames(g)
+    rt.buf_clear(&(*g).scratch)
+    var before: [u8; 8] = "size_of$"
+    rt.buf_push_bytes(&(*g).scratch, (&before[0]) as u64, 8)
+    tag_build(g, &(*g).scratch, t)
+    return intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+        rt.buf_len(&(*g).scratch)) as u32
+}
+
+// ----------------------------------------------------------- instantiations
+
+fn inst_find(g: *mut Gen, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).iv_name) {
+        if vec_at[u32](&(*g).iv_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// Registers a use and returns the expanded name.
+// `work` means it came up during propagation and still has to be
+// processed.
+fn register(g: *mut Gen, base: u32, args: *mut Vec[u32], isfn: bool,
+    work: bool) -> u32 {
+    let aoff: u32 = vec_len[u32](&(*g).iargs) as u32
+    var k: usize = 0
+    while k < vec_len[u32](args) {
+        vec_push[u32](&(*g).iargs, vec_at[u32](args, k))
+        k = k + 1
+    }
+    let alen: u32 = vec_len[u32](args) as u32
+    let name: u32 = spell_out(g, base, aoff, alen)
+    let old: u32 = inst_find(g, name)
+    if old != NONE {
+        if work {
+            vec_push[u32](&(*g).stack, old)
+        }
+        return name
+    }
+    let new: u32 = vec_len[u32](&(*g).iv_name) as u32
+    vec_push[u32](&(*g).iv_name, name)
+    vec_push[u32](&(*g).iv_base, base)
+    vec_push[u32](&(*g).iv_aoff, aoff)
+    vec_push[u32](&(*g).iv_alen, alen)
+    var abs: u32 = 0
+    if (*g).depth > 0 {
+        abs = 1
+    }
+    if work {
+        abs = 0
+    }
+    vec_push[u32](&(*g).iv_abstract, abs)
+    var f: u32 = 0
+    if isfn {
+        f = 1
+    }
+    vec_push[u32](&(*g).iv_isfn, f)
+    if work {
+        vec_push[u32](&(*g).stack, new)
+    }
+    return name
+}
+
+// Called from the parser.
+fn gen_instance(g: *mut Gen, base: u32, args: *mut Vec[u32], isfn: bool) -> u32 {
+    return register(g, base, args, isfn, false)
+}
+
+// ------------------------------------------------------------- binding
+
+// `__gc#p:T` -> `__gc#p:i32` (round 53). Returns `nr` unchanged if the
+// name is not a Gc placeholder or its type argument is not bound.
+//
+// It can only be bound to a NAMED type: `Gc[*mut u8]` does not exist, and
+// the parser allows nothing but a name after `Gc[` anyway.
+fn subst_gc_name(g: *mut Gen, nr: u32) -> u32 {
+    let it: *mut intern.Interner = gnames(g)
+    var px1: [u8; 7] = "__gc#p:"
+    var px2: [u8; 7] = "__gc#w:"
+    var is_p: bool = intern.intern_prefix(it, nr, (&px1[0]) as u64, 7)
+    var is_w: bool = false
+    if !is_p {
+        is_w = intern.intern_prefix(it, nr, (&px2[0]) as u64, 7)
+    }
+    if !is_p && !is_w {
+        return nr
+    }
+    let rest: u32 = intern.intern_ab(it, nr, 7)
+    let bound: u32 = binding_find(g, rest)
+    if bound == NONE {
+        return nr
+    }
+    let b: *mut ast.Tree = gtree(g)
+    if ast.t_kind(b, bound) != ast.T_NAME {
+        return nr
+    }
+    let kn: u32 = ast.t_a(b, bound)
+    var kl: rt.Buf = rt.buf_new()
+    if is_p {
+        rt.buf_push_bytes(&kl, (&px1[0]) as u64, 7)
+    } else {
+        rt.buf_push_bytes(&kl, (&px2[0]) as u64, 7)
+    }
+    rt.buf_push_bytes(&kl, intern.intern_ptr(it, kn), intern.intern_length(it, kn))
+    let new: u32 = intern.intern_number(it, rt.buf_ptr(&kl), rt.buf_len(&kl)) as u32
+    rt.buf_free(&kl)
+    return new
+}
+
+fn binding_find(g: *mut Gen, nr: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).bd_name) {
+        if vec_at[u32](&(*g).bd_name, i) == nr {
+            return vec_at[u32](&(*g).bd_ty, i)
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// Does the type fulfil ALL bounds of the type parameter `tp`?
+// (mono.rs::bind_params -- the first violated one is reported.)
+fn satisfied_all(g: *mut Gen, t: u32, tp: u32) -> bool {
+    let off: u32 = vec_at[u32](&(*g).tp_soff, tp as usize)
+    let len: u32 = vec_at[u32](&(*g).tp_slen, tp as usize)
+    var i: u32 = 0
+    while i < len {
+        let kind: u32 = vec_at[u32](&(*g).sk_kind, (off + i) as usize)
+        if kind == BOUND_IFACE {
+            if !satisfied_iface(g, t, vec_at[u32](&(*g).sk_name, (off + i) as usize)) {
+                return false
+            }
+        } else {
+            if !satisfied(g, t, kind) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// `T: I` -- the type has to implement the interface (iface.rs::bound_check).
+// An interface is implemented by a NAMED type; a pointer or array
+// type has no name that could carry `impl` blocks.
+fn satisfied_iface(g: *mut Gen, t: u32, iname: u32) -> bool {
+    if (*g).ifr == 0 {
+        return false
+    }
+    let f: *mut iface.If = (*g).ifr as *mut iface.If
+    if iface.if_index(f, iname) == NONE {
+        return false
+    }
+    let b: *mut ast.Tree = gtree(g)
+    if ast.t_kind(b, t) != ast.T_NAME {
+        return false
+    }
+    return iface.if_impl_da(f, gnames(g), iname, ast.t_a(b, t))
+}
+
+// Does the type satisfy a BUILTIN bound? (mono.rs::satisfies)
+fn satisfied(g: *mut Gen, t: u32, bound: u32) -> bool {
+    if bound == BOUND_ANY {
+        return true
+    }
+    let b: *mut ast.Tree = gtree(g)
+    let a: u32 = ast.t_kind(b, t)
+    if a == ast.T_ARR {
+        return false
+    }
+    if a == ast.T_PTR {
+        return bound == BOUND_SCALAR
+    }
+    // ROUND 58: a function value is one word wide, so it is a scalar.
+    if a == ast.T_FN {
+        return bound == BOUND_SCALAR
+    }
+    let k: i32 = types.base_ty(gnames(g), ast.t_a(b, t))
+    if k < 0 {
+        return false
+    }
+    let ku: u32 = k as u32
+    if ku == types.K_F64 || ku == types.K_F32 {
+        return false
+    }
+    if ku == types.K_BOOL {
+        return bound == BOUND_SCALAR
+    }
+    return true
+}
+
+// Binds the type parameters [toff, toff+tlen) to the arguments [aoff, aoff+alen).
+fn bind(g: *mut Gen, toff: u32, tlen: u32, aoff: u32, alen: u32) -> bool {
+    vec_clear[u32](&(*g).bd_name)
+    vec_clear[u32](&(*g).bd_ty)
+    if tlen != alen {
+        (*g).err = (*g).err + 1
+        return false
+    }
+    var k: u32 = 0
+    while k < tlen {
+        let arg: u32 = vec_at[u32](&(*g).iargs, (aoff + k) as usize)
+        if !satisfied_all(g, arg, toff + k) {
+            (*g).err = (*g).err + 1
+            return false
+        }
+        vec_push[u32](&(*g).bd_name, vec_at[u32](&(*g).tp_name, (toff + k) as usize))
+        vec_push[u32](&(*g).bd_ty, arg)
+        k = k + 1
+    }
+    return true
+}
+
+// --------------------------------------------------------- substitution
+//
+// A type node is immutable; if it does not change, it is REUSED
+// instead of copied. That does not only save space, it keeps the
+// comparison stable.
+
+fn subst_ty(g: *mut Gen, t: u32) -> u32 {
+    if t == ast.NOTHING {
+        return t
+    }
+    let b: *mut ast.Tree = gtree(g)
+    let a: u32 = ast.t_kind(b, t)
+    if a == ast.T_PTR {
+        let inn: u32 = subst_ty(g, ast.t_a(b, t))
+        if inn == ast.t_a(b, t) {
+            return t
+        }
+        return ast.ty_new(b, ast.T_PTR, inn, ast.t_b(b, t))
+    }
+    if a == ast.T_ARR {
+        let el: u32 = subst_ty(g, ast.t_a(b, t))
+        if el == ast.t_a(b, t) {
+            return t
+        }
+        return ast.ty_new(b, ast.T_ARR, el, ast.t_b(b, t))
+    }
+    // ROUND 58 (fnval.rs): `fn(T1, T2) -> R` inside a template. The
+    // parameter list has to be rebuilt WITHOUT GAPS -- which is why the new
+    // types are collected first and stored afterwards.
+    if a == ast.T_FN {
+        let packed: u64 = ast.t_b(b, t)
+        let off: u32 = (packed >> 32) as u32
+        let cnt: u32 = (packed & 4294967295) as u32
+        var neu: Vec[u32] = vec_new[u32]()
+        var change: bool = false
+        var k: u32 = 0
+        while k < cnt {
+            let old2: u32 = ast.child_at(b, off + k)
+            let n2: u32 = subst_ty(g, old2)
+            if n2 != old2 {
+                change = true
+            }
+            vec_push[u32](&neu, n2)
+            k = k + 1
+        }
+        var ret: u32 = ast.t_a(b, t)
+        if ret != ast.NOTHING {
+            let r2: u32 = subst_ty(g, ret)
+            if r2 != ret {
+                change = true
+                ret = r2
+            }
+        }
+        if !change {
+            vec_free[u32](&neu)
+            return t
+        }
+        let noff: u32 = ast.child_start(b)
+        var q: usize = 0
+        while q < vec_len[u32](&neu) {
+            ast.child_add(b, vec_at[u32](&neu, q))
+            q = q + 1
+        }
+        vec_free[u32](&neu)
+        return ast.ty_new(b, ast.T_FN, ret, ((noff as u64) << 32) | cnt as u64)
+    }
+    let nr: u32 = ast.t_a(b, t)
+    // ROUND 53 (mono.rs::subst_name): `Gc[T]` and `GcWeak[T]` INSIDE A
+    // TEMPLATE. The parser has turned them into the names `__gc#p:T` / `__gc#w:T`;
+    // without this place the type resolution would later look for a
+    // gc class called `T`. Generic functions over Gc pointers would then
+    // be impossible -- and they are exactly the type safe surface of
+    // `GcVec`/`GcMap` (`gcvec_append[T]`).
+    let gcnew: u32 = subst_gc_name(g, nr)
+    if gcnew != nr {
+        return ast.ty_new(b, ast.T_NAME, gcnew, 0)
+    }
+    let bound: u32 = binding_find(g, nr)
+    if bound != NONE {
+        return bound
+    }
+    let new: u32 = inst_rewrite(g, nr)
+    if new == nr {
+        return t
+    }
+    return ast.ty_new(b, ast.T_NAME, new, 0)
+}
+
+// `Vec__T` -> `Vec__i32` (and registers the new instantiation). If the
+// name is not an instantiation, it stays as it is.
+fn inst_rewrite(g: *mut Gen, nr: u32) -> u32 {
+    let ii: u32 = inst_find(g, nr)
+    if ii == NONE {
+        return nr
+    }
+    let aoff: u32 = vec_at[u32](&(*g).iv_aoff, ii as usize)
+    let alen: u32 = vec_at[u32](&(*g).iv_alen, ii as usize)
+    let base: u32 = vec_at[u32](&(*g).iv_base, ii as usize)
+    var isfn: bool = vec_at[u32](&(*g).iv_isfn, ii as usize) != 0
+    var tmp: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < alen {
+        vec_push[u32](&tmp, subst_ty(g, vec_at[u32](&(*g).iargs, (aoff + k) as usize)))
+        k = k + 1
+    }
+    let name: u32 = register(g, base, &tmp, isfn, true)
+    vec_free[u32](&tmp)
+    return name
+}
+
+// ------------------------------------------------- rebuilding a subtree
+
+fn copy_block(g: *mut Gen, blk: u32) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    let off: u32 = ast.b_off(b, blk)
+    let len: u32 = ast.b_len(b, blk)
+    var tmp: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < len {
+        vec_push[u32](&tmp, copy_stmt(g, ast.slist_at(b, off + k)))
+        k = k + 1
+    }
+    let new: u32 = ast.slist_start(b)
+    var i: usize = 0
+    while i < vec_len[u32](&tmp) {
+        ast.slist_add(b, vec_at[u32](&tmp, i))
+        i = i + 1
+    }
+    vec_free[u32](&tmp)
+    let nb: u32 = ast.block_new(b, new, len)
+    ast.block_end_set(b, nb, ast.block_end(b, blk))
+    return nb
+}
+
+// ROUND 79: a node built from a template inherits the POSITION of the
+// template node. Without it every message out of an instantiated generic
+// would stand at line 0 -- and `lib/std/vec.fi` is one big template.
+fn copy_stmt(g: *mut Gen, s: u32) -> u32 {
+    let b0: *mut ast.Tree = gtree(g)
+    let at: u64 = ast.stmt_pos(b0, s)
+    let out: u32 = copy_stmt_inner(g, s)
+    ast.stmt_pos_set(gtree(g), out, at)
+    return out
+}
+
+fn copy_stmt_inner(g: *mut Gen, s: u32) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    let a: u32 = ast.s_kind(b, s)
+    if a == ast.S_LET || a == ast.S_VAR {
+        let t: u32 = subst_ty(g, ast.s_b(b, s))
+        let init: u32 = copy_expr(g, ast.s_c(b, s))
+        return ast.stmt_new(b, a, ast.s_a(b, s), t, init, 0)
+    }
+    if a == ast.S_ZUW {
+        let target: u32 = copy_expr(g, ast.s_a(b, s))
+        let value: u32 = copy_expr(g, ast.s_b(b, s))
+        return ast.stmt_new(b, a, target, value, 0, 0)
+    }
+    // ROUND 70: the compound assignment carries the operator in `c`, the
+    // step the direction in `b`.
+    if a == ast.S_ZUWOP {
+        let target2: u32 = copy_expr(g, ast.s_a(b, s))
+        let value2: u32 = copy_expr(g, ast.s_b(b, s))
+        return ast.stmt_new(b, a, target2, value2, ast.s_c(b, s), 0)
+    }
+    if a == ast.S_STEP {
+        let target3: u32 = copy_expr(g, ast.s_a(b, s))
+        return ast.stmt_new(b, a, target3, ast.s_b(b, s), 0, 0)
+    }
+    if a == ast.S_IF {
+        let cond: u32 = copy_expr(g, ast.s_a(b, s))
+        let then: u32 = copy_block(g, ast.s_b(b, s))
+        var els: u32 = ast.NOTHING
+        if ast.s_c(b, s) != ast.NOTHING {
+            els = copy_stmt(g, ast.s_c(b, s))
+        }
+        return ast.stmt_new(b, a, cond, then, els, 0)
+    }
+    if a == ast.S_WHILE {
+        let cond: u32 = copy_expr(g, ast.s_a(b, s))
+        let body: u32 = copy_block(g, ast.s_b(b, s))
+        return ast.stmt_new(b, a, cond, body, 0, 0)
+    }
+    if a == ast.S_FOR {
+        let of: u32 = copy_expr(g, ast.s_b(b, s))
+        let to: u32 = copy_expr(g, ast.s_c(b, s))
+        let body: u32 = copy_block(g, ast.s_d(b, s))
+        return ast.stmt_new(b, a, ast.s_a(b, s), of, to, body)
+    }
+    if a == ast.S_RET {
+        var w: u32 = ast.NOTHING
+        if ast.s_a(b, s) != ast.NOTHING {
+            w = copy_expr(g, ast.s_a(b, s))
+        }
+        return ast.stmt_new(b, a, w, 0, 0, 0)
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        let inner: u32 = copy_stmt(g, ast.s_a(b, s))
+        return ast.stmt_new(b, a, inner, 0, 0, 0)
+    }
+    if a == ast.S_EXPR {
+        let e: u32 = copy_expr(g, ast.s_a(b, s))
+        return ast.stmt_new(b, a, e, 0, 0, 0)
+    }
+    if a == ast.S_BLOCK {
+        let blk: u32 = copy_block(g, ast.s_a(b, s))
+        return ast.stmt_new(b, a, blk, 0, 0, 0)
+    }
+    // S_BREAK, S_CONT
+    return ast.stmt_new(b, a, 0, 0, 0, 0)
+}
+
+// Copy the child list [off, off+count) and store it again WITHOUT GAPS.
+fn copy_children(g: *mut Gen, off: u32, cnt: u32) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    var tmp: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < cnt {
+        vec_push[u32](&tmp, copy_expr(g, ast.child_at(b, off + k)))
+        k = k + 1
+    }
+    let new: u32 = ast.child_start(b)
+    var i: usize = 0
+    while i < vec_len[u32](&tmp) {
+        ast.child_add(b, vec_at[u32](&tmp, i))
+        i = i + 1
+    }
+    vec_free[u32](&tmp)
+    return new
+}
+
+// Struct literal: the list holds PAIRS (field name, value).
+fn copy_fields(g: *mut Gen, off: u32, cnt: u32) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    var tmp: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < cnt {
+        vec_push[u32](&tmp, ast.child_at(b, off + k * 2))
+        vec_push[u32](&tmp, copy_expr(g, ast.child_at(b, off + k * 2 + 1)))
+        k = k + 1
+    }
+    let new: u32 = ast.child_start(b)
+    var i: usize = 0
+    while i < vec_len[u32](&tmp) {
+        ast.child_add(b, vec_at[u32](&tmp, i))
+        i = i + 1
+    }
+    vec_free[u32](&tmp)
+    return new
+}
+
+// ROUND 72: an instantiated template keeps the TEMPLATE's own source
+// position, exactly as `firnc0`'s clone of the syntax tree does -- a
+// checked overflow inside `Vec[T]::push` names the line in the template,
+// not the line that happened to instantiate it.
+fn copy_expr(g: *mut Gen, e: u32) -> u32 {
+    let b0: *mut ast.Tree = gtree(g)
+    let at: u64 = ast.expr_pos(b0, e)
+    let out: u32 = copy_expr_inner(g, e)
+    ast.expr_pos_set(gtree(g), out, at)
+    return out
+}
+
+fn copy_expr_inner(g: *mut Gen, e: u32) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT || a == ast.E_FLOAT || a == ast.E_FLOAT32 {
+        return ast.expr_new(b, a, 0, 0, 0, ast.e_number(b, e))
+    }
+    if a == ast.E_BOOL || a == ast.E_ID {
+        return ast.expr_new(b, a, ast.e_a(b, e), 0, 0, 0)
+    }
+    if a == ast.E_UN {
+        let inn: u32 = copy_expr(g, ast.e_b(b, e))
+        return ast.expr_new(b, a, ast.e_a(b, e), inn, 0, 0)
+    }
+    if a == ast.E_BIN {
+        let li: u32 = copy_expr(g, ast.e_b(b, e))
+        let re: u32 = copy_expr(g, ast.e_c(b, e))
+        return ast.expr_new(b, a, ast.e_a(b, e), li, re, 0)
+    }
+    if a == ast.E_FIELD {
+        let base: u32 = copy_expr(g, ast.e_a(b, e))
+        return ast.expr_new(b, a, base, ast.e_b(b, e), 0, 0)
+    }
+    if a == ast.E_IDX {
+        let base: u32 = copy_expr(g, ast.e_a(b, e))
+        let idx: u32 = copy_expr(g, ast.e_b(b, e))
+        return ast.expr_new(b, a, base, idx, 0, 0)
+    }
+    if a == ast.E_AS {
+        let inn: u32 = copy_expr(g, ast.e_a(b, e))
+        let t: u32 = subst_ty(g, ast.e_b(b, e))
+        return ast.expr_new(b, a, inn, t, 0, 0)
+    }
+    if a == ast.E_CALL {
+        // `size_of[T]()`: the type sits in `e_number` (node + 1) AND in the
+        // name. Both have to be replaced, otherwise the type checker
+        // reports "unknown type 'T'" (mono.rs::subst_call_name).
+        let z: u64 = ast.e_number(b, e)
+        if z != 0 {
+            let t2: u32 = subst_ty(g, (z - 1) as u32)
+            let n2: u32 = gen_size_of_name(g, t2)
+            return ast.expr_new(b, a, n2, 0, 0, (t2 as u64) + 1)
+        }
+        let name: u32 = inst_rewrite(g, ast.e_a(b, e))
+        let off: u32 = copy_children(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.expr_new(b, a, name, off, ast.e_c(b, e), 0)
+    }
+    if a == ast.E_SYSCALL {
+        let off: u32 = copy_children(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.expr_new(b, a, 0, off, ast.e_c(b, e), 0)
+    }
+    if a == ast.E_SLIT {
+        let name: u32 = inst_rewrite(g, ast.e_a(b, e))
+        let off: u32 = copy_fields(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.expr_new(b, a, name, off, ast.e_c(b, e), 0)
+    }
+    if a == ast.E_ALIT {
+        let off: u32 = copy_children(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.expr_new(b, a, 0, off, ast.e_c(b, e), 0)
+    }
+    // ROUND 70 (strtype.rs): the text literal carries its array literal
+    // inside; only that one has to be copied.
+    if a == ast.E_TEXT {
+        let inner: u32 = copy_expr(g, ast.e_a(b, e))
+        return ast.expr_new(b, a, inner, ast.e_b(b, e), 0, 0)
+    }
+    // E_AWDH
+    let value: u32 = copy_expr(g, ast.e_a(b, e))
+    let cnt: u32 = copy_expr(g, ast.e_b(b, e))
+    return ast.expr_new(b, a, value, cnt, 0, 0)
+}
+
+// ------------------------------------------------------------ propagation
+
+fn already_done(g: *mut Gen, name: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).done) {
+        if vec_at[u32](&(*g).done, i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn fn_instantiate(g: *mut Gen, ii: u32) {
+    let b: *mut ast.Tree = gtree(g)
+    let base: u32 = vec_at[u32](&(*g).iv_base, ii as usize)
+    let name: u32 = vec_at[u32](&(*g).iv_name, ii as usize)
+    let vi: u32 = fn_template_find(g, base)
+    if vi == NONE {
+        (*g).err = (*g).err + 1
+        return
+    }
+    let ok: bool = bind(g, vec_at[u32](&(*g).fv_toff, vi as usize),
+        vec_at[u32](&(*g).fv_tlen, vi as usize),
+        vec_at[u32](&(*g).iv_aoff, ii as usize),
+        vec_at[u32](&(*g).iv_alen, ii as usize))
+    if !ok {
+        return
+    }
+    // The parameters have to sit WITHOUT GAPS -- `subst_ty` creates only
+    // type nodes, so it is safe to work without a scratch buffer here.
+    let old_off: u32 = vec_at[u32](&(*g).fv_poff, vi as usize)
+    let plen: u32 = vec_at[u32](&(*g).fv_plen, vi as usize)
+    let new_off: u32 = ast.param_start(b)
+    var k: u32 = 0
+    while k < plen {
+        let pn: u32 = ast.param_name(b, old_off + k)
+        let pt: u32 = subst_ty(g, ast.param_ty(b, old_off + k))
+        ast.param_add(b, pn, pt)
+        k = k + 1
+    }
+    var ret: u32 = ast.NOTHING
+    if vec_at[u32](&(*g).fv_ret, vi as usize) != ast.NOTHING {
+        ret = subst_ty(g, vec_at[u32](&(*g).fv_ret, vi as usize))
+    }
+    let body: u32 = copy_block(g, vec_at[u32](&(*g).fv_body, vi as usize))
+    ast.fn_add(b, name, new_off, plen, ret, body, 0, 0, 0, 0, 0, 0, 0)
+    // ROUND 79: the instance inherits the end of the template's body, so
+    // that the escape analysis can name where the frame dies.
+    ast.fn_end_set(b, ast.fn_count(b) - 1, ast.block_end(b, body))
+    (*g).generated = (*g).generated + 1
+}
+
+fn struct_instantiate(g: *mut Gen, ii: u32) {
+    let b: *mut ast.Tree = gtree(g)
+    let base: u32 = vec_at[u32](&(*g).iv_base, ii as usize)
+    let name: u32 = vec_at[u32](&(*g).iv_name, ii as usize)
+    let vi: u32 = struct_template_find(g, base)
+    if vi == NONE {
+        (*g).err = (*g).err + 1
+        return
+    }
+    let ok: bool = bind(g, vec_at[u32](&(*g).sv_toff, vi as usize),
+        vec_at[u32](&(*g).sv_tlen, vi as usize),
+        vec_at[u32](&(*g).iv_aoff, ii as usize),
+        vec_at[u32](&(*g).iv_alen, ii as usize))
+    if !ok {
+        return
+    }
+    let old_off: u32 = vec_at[u32](&(*g).sv_foff, vi as usize)
+    let flen: u32 = vec_at[u32](&(*g).sv_flen, vi as usize)
+    let new_off: u32 = ast.field_start(b)
+    var k: u32 = 0
+    while k < flen {
+        let fname: u32 = ast.field_name(b, old_off + k)
+        let ft: u32 = subst_ty(g, ast.field_ty(b, old_off + k))
+        ast.field_add(b, fname, ft)
+        k = k + 1
+    }
+    ast.structure_add(b, name, new_off, flen, 0)
+    (*g).generated = (*g).generated + 1
+}
+
+// Propagate all concrete uses until nothing new comes up.
+//
+// ORDER AS IN `mono.rs`: the uses found while parsing go onto the
+// stack REVERSED, so that they are processed in the order in which
+// they appeared; anything that comes up in between is handled right
+// afterwards.
+fn gen_run(g: *mut Gen) {
+    var i: usize = vec_len[u32](&(*g).iv_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*g).iv_abstract, i) == 0 {
+            vec_push[u32](&(*g).stack, i as u32)
+        }
+    }
+    var number: usize = 0
+    while vec_len[u32](&(*g).stack) > 0 {
+        let ii: u32 = vec_pop[u32](&(*g).stack)
+        let name: u32 = vec_at[u32](&(*g).iv_name, ii as usize)
+        if already_done(g, name) {
+            continue
+        }
+        vec_push[u32](&(*g).done, name)
+        number = number + 1
+        if number > MAX_AUSPRAEGUNGEN {
+            (*g).err = (*g).err + 1
+            return
+        }
+        if vec_at[u32](&(*g).iv_isfn, ii as usize) != 0 {
+            fn_instantiate(g, ii)
+        } else {
+            struct_instantiate(g, ii)
+        }
+    }
+}

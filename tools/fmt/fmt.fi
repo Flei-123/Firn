@@ -1,0 +1,821 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/fmt/fmt.fi -- THE FIRN FORMATTER, WRITTEN IN FIRN.
+//
+// Round 64, point 1. The first serious Firn program outside the compiler,
+// and therefore itself a piece of evidence for the language: no Python, no
+// foreign library, only `lib/rt`.
+//
+// WHAT IT IS. `firnfmt` reads a source text and writes it back in a
+// CANONICAL shape. Canonical means: the shape is a function of the token
+// stream and of the line structure alone -- two texts that differ only in
+// blanks come out the same, and a second run changes nothing (idempotence).
+//
+// WHAT IT DELIBERATELY DOES NOT DO, AND WHY. It does not re-break lines.
+// That is not laziness but the grammar: in Firn a line break ENDS a
+// statement (`parser.rs::at_line_start`, `parser.fi::line_start`). An
+// expression may only run over several lines while a bracket is open
+// (`fn next`: `parens > 0 || !line_start`). A formatter that moved line
+// breaks around would therefore not change the layout but the PROGRAM. So
+// firnfmt keeps every line break of the author and normalises everything
+// else:
+//
+//   * indentation: four blanks per open bracket, a line that begins with a
+//     closing bracket sits one step further out
+//   * blanks between tokens: exactly one or none, following the table in
+//     `need_space`
+//   * empty lines: at most one in a row, none right after `{`, none right
+//     before `}`, none at the beginning or at the end of the file
+//   * blanks at the end of a line: gone
+//   * exactly one line ending at the end of the file
+//
+// THE STRONGEST GUARANTEE comes out of the method: the output is built
+// ONLY out of verbatim pieces of the input (every token is copied byte for
+// byte out of the source text) plus blanks and line breaks. The token
+// stream can therefore not change -- and `tools/fmt/run.sh` proves exactly
+// that against `firnc0 --emit=tokens` and against `--emit=ast-canon`.
+//
+// LAYOUT: struct of arrays, like the lexer. A token is six numbers, and
+// they live in six byte buffers with four octets each -- `Vec[T]` is not
+// needed for that, and the formatter stays free of generics.
+import rt.rt
+
+export { Form, form_new, form_free, form_scan, form_render, form_broken,
+    form_count }
+
+// ------------------------------------------------------------- token kinds
+const K_WORD: u32 = 1 // identifier or keyword
+const K_NUMBER: u32 = 2
+const K_TEXT: u32 = 3 // "..." b"..." u"..." f"..."
+const K_LINE_NOTE: u32 = 4 // `// ...` up to the end of the line
+const K_BLOCK_NOTE: u32 = 5 // `/* ... */`, nestable
+const K_SIGN: u32 = 6 // everything punctuation
+
+// --------------------------------------------------------- punctuation ids
+// The two character forms come first, because the scanner tries them first.
+// `::` and `=>` are NOT single tokens of the language (the lexer produces
+// two colons resp. `=` and `>`); the formatter groups them all the same, so
+// that a path and a match arm do not fall apart into blanks. That changes no
+// octet of the output -- only where a blank may go.
+const S_UNKNOWN: u32 = 0
+const S_LPAREN: u32 = 1
+const S_RPAREN: u32 = 2
+const S_LBRACE: u32 = 3
+const S_RBRACE: u32 = 4
+const S_LBRACKET: u32 = 5
+const S_RBRACKET: u32 = 6
+const S_COMMA: u32 = 7
+const S_COLON: u32 = 8
+const S_SEMI: u32 = 9
+const S_DOT: u32 = 10
+const S_DOTDOT: u32 = 11
+const S_ARROW: u32 = 12
+const S_ASSIGN: u32 = 13
+const S_PLUS: u32 = 14
+const S_MINUS: u32 = 15
+const S_STAR: u32 = 16
+const S_SLASH: u32 = 17
+const S_PERCENT: u32 = 18
+const S_AMP: u32 = 19
+const S_PIPE: u32 = 20
+const S_CARET: u32 = 21
+const S_SHL: u32 = 22
+const S_SHR: u32 = 23
+const S_ANDAND: u32 = 24
+const S_OROR: u32 = 25
+const S_NOT: u32 = 26
+const S_QUESTION: u32 = 27
+const S_HASH: u32 = 28
+const S_EQEQ: u32 = 29
+const S_NOTEQ: u32 = 30
+const S_LT: u32 = 31
+const S_LE: u32 = 32
+const S_GT: u32 = 33
+const S_GE: u32 = 34
+const S_COLONCOLON: u32 = 35
+const S_FATARROW: u32 = 36
+// ROUND 68: `~`, the bitwise complement. Always a PREFIX operator --
+// there is no binary `~`, so nothing ever follows it with a blank.
+const S_TILDE: u32 = 37
+// ROUND 70: the compound assignments and the two step operators. Without
+// them the scanner would split `+=` into `+` and `=` and print `x + = 1` --
+// which is a DIFFERENT token stream and would not scan any more.
+const S_PLUSEQ: u32 = 38
+const S_MINUSEQ: u32 = 39
+const S_STAREQ: u32 = 40
+const S_SLASHEQ: u32 = 41
+const S_PERCENTEQ: u32 = 42
+const S_AMPEQ: u32 = 43
+const S_PIPEEQ: u32 = 44
+const S_CARETEQ: u32 = 45
+const S_SHLEQ: u32 = 46
+const S_SHREQ: u32 = 47
+const S_PLUSPLUS: u32 = 48
+const S_MINUSMINUS: u32 = 49
+// ROUND 72: the explicit wrap and saturate operators (SPEC 13, item L9).
+// Without them the scanner would split `h *% 1099511628211` into `*` and
+// `%` and print `h * % 1099511628211` -- a DIFFERENT token stream, which
+// no longer scans.
+const S_PLUSPERCENT: u32 = 50
+const S_MINUSPERCENT: u32 = 51
+const S_STARPERCENT: u32 = 52
+const S_PLUSPIPE: u32 = 53
+const S_MINUSPIPE: u32 = 54
+const S_STARPIPE: u32 = 55
+
+const STEP: usize = 4 // blanks per indentation step
+
+struct Form {
+    q: u64, // the source text
+    n: usize,
+    p: usize, // read position
+    line: u32, // line of the read position, 1 based
+    kind: rt.Buf,
+    sign: rt.Buf,
+    start: rt.Buf,
+    length: rt.Buf,
+    at_line: rt.Buf, // line on which the token begins
+    end_line: rt.Buf, // line on which it ends (block comments)
+    broken: u32, // 1 = the source text does not scan cleanly
+}
+
+fn form_new(q: u64, n: usize) -> Form {
+    return Form {
+        q: q, n: n, p: 0, line: 1,
+        kind: rt.buf_new(), sign: rt.buf_new(), start: rt.buf_new(),
+        length: rt.buf_new(), at_line: rt.buf_new(), end_line: rt.buf_new(),
+        broken: 0,
+    }
+}
+
+fn form_free(f: *mut Form) {
+    rt.buf_free(&(*f).kind)
+    rt.buf_free(&(*f).sign)
+    rt.buf_free(&(*f).start)
+    rt.buf_free(&(*f).length)
+    rt.buf_free(&(*f).at_line)
+    rt.buf_free(&(*f).end_line)
+}
+
+fn form_broken(f: *mut Form) -> bool {
+    return (*f).broken != 0
+}
+
+// ------------------------------------------------------------ the columns
+//
+// A column is a byte buffer with four octets per entry. `rt.ld32` reads
+// them back in one go, so a column costs no allocator call per element.
+
+fn col_push(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 24) & 255) as u8)
+}
+
+fn col_at(b: *mut rt.Buf, i: usize) -> u32 {
+    return rt.ld32(rt.buf_ptr(b), i)
+}
+
+fn form_count(f: *mut Form) -> usize {
+    return rt.buf_len(&(*f).kind) / 4
+}
+
+fn tok_kind(f: *mut Form, i: usize) -> u32 { return col_at(&(*f).kind, i) }
+fn tok_sign(f: *mut Form, i: usize) -> u32 { return col_at(&(*f).sign, i) }
+fn tok_start(f: *mut Form, i: usize) -> usize { return col_at(&(*f).start, i) as usize }
+fn tok_length(f: *mut Form, i: usize) -> usize { return col_at(&(*f).length, i) as usize }
+fn tok_line(f: *mut Form, i: usize) -> u32 { return col_at(&(*f).at_line, i) }
+fn tok_end_line(f: *mut Form, i: usize) -> u32 { return col_at(&(*f).end_line, i) }
+
+// Is token `i` the punctuation mark `s`?
+fn is_sign(f: *mut Form, i: usize, s: u32) -> bool {
+    return tok_kind(f, i) == K_SIGN && tok_sign(f, i) == s
+}
+
+// ------------------------------------------------------------- the scanner
+
+fn is_digit(c: u32) -> bool { return c >= 48 && c <= 57 }
+fn is_letter(c: u32) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+fn is_blank(c: u32) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+// The octet `k` places further on, or 256 at the end of the text.
+fn ch(f: *mut Form, k: usize) -> u32 {
+    let i: usize = (*f).p + k
+    if i >= (*f).n {
+        return 256
+    }
+    return rt.ld8((*f).q, i) as u32
+}
+
+// One octet further; counts the line along the way.
+fn step(f: *mut Form) {
+    if (*f).p >= (*f).n {
+        return
+    }
+    if rt.ld8((*f).q, (*f).p) == 10 as u8 {
+        (*f).line = (*f).line + 1
+    }
+    (*f).p = (*f).p + 1
+}
+
+fn add(f: *mut Form, kind: u32, sign: u32, start: usize, line0: u32) {
+    col_push(&(*f).kind, kind)
+    col_push(&(*f).sign, sign)
+    col_push(&(*f).start, start as u32)
+    col_push(&(*f).length, ((*f).p - start) as u32)
+    col_push(&(*f).at_line, line0)
+    col_push(&(*f).end_line, (*f).line)
+}
+
+fn skip_blanks(f: *mut Form) {
+    while (*f).p < (*f).n {
+        if !is_blank(ch(f, 0)) {
+            return
+        }
+        step(f)
+    }
+}
+
+fn line_note(f: *mut Form) {
+    let st: usize = (*f).p
+    let l0: u32 = (*f).line
+    while (*f).p < (*f).n {
+        if ch(f, 0) == 10 {
+            break
+        }
+        step(f)
+    }
+    add(f, K_LINE_NOTE, 0, st, l0)
+}
+
+// Block comments nest -- like in the lexer (`lexer.fi::skip`).
+fn block_note(f: *mut Form) {
+    let st: usize = (*f).p
+    let l0: u32 = (*f).line
+    step(f)
+    step(f)
+    var depth: usize = 1
+    while depth > 0 {
+        if (*f).p >= (*f).n {
+            (*f).broken = 1
+            break
+        }
+        if ch(f, 0) == 47 && ch(f, 1) == 42 {
+            step(f)
+            step(f)
+            depth = depth + 1
+        } else if ch(f, 0) == 42 && ch(f, 1) == 47 {
+            step(f)
+            step(f)
+            depth = depth - 1
+        } else {
+            step(f)
+        }
+    }
+    add(f, K_BLOCK_NOTE, 0, st, l0)
+}
+
+// A text literal starts with `"` or with one of the prefixes b/u/f in
+// front of it. It ends at the closing quote; a line break inside it is an
+// error, exactly as in the lexer.
+fn text_lit(f: *mut Form) {
+    let st: usize = (*f).p
+    let l0: u32 = (*f).line
+    if ch(f, 0) != 34 {
+        step(f)
+    }
+    step(f)
+    var closed: bool = false
+    while (*f).p < (*f).n {
+        let c: u32 = ch(f, 0)
+        if c == 92 {
+            step(f)
+            if (*f).p >= (*f).n {
+                break
+            }
+            if ch(f, 0) == 10 {
+                break
+            }
+            step(f)
+            continue
+        }
+        if c == 34 {
+            step(f)
+            closed = true
+            break
+        }
+        if c == 10 {
+            break
+        }
+        step(f)
+    }
+    if !closed {
+        (*f).broken = 1
+    }
+    add(f, K_TEXT, 0, st, l0)
+}
+
+fn text_ahead(f: *mut Form) -> bool {
+    let c: u32 = ch(f, 0)
+    if c == 34 {
+        return true
+    }
+    if c == 98 || c == 117 || c == 102 {
+        return ch(f, 1) == 34
+    }
+    return false
+}
+
+// Numbers follow `lexer.fi::lex_int`: base prefix, digits with `_`,
+// fraction and exponent only for base ten. What matters here is only where
+// the number ENDS -- `1e308` must not fall apart into `1` and `e308`.
+fn number_lit(f: *mut Form) {
+    let st: usize = (*f).p
+    let l0: u32 = (*f).line
+    var base: u32 = 10
+    if ch(f, 0) == 48 {
+        let c2: u32 = ch(f, 1)
+        if c2 == 120 || c2 == 88 {
+            base = 16
+        } else if c2 == 98 || c2 == 66 {
+            base = 2
+        }
+        if base != 10 {
+            step(f)
+            step(f)
+        }
+    }
+    while (*f).p < (*f).n {
+        let c: u32 = ch(f, 0)
+        if c == 95 {
+            step(f)
+            continue
+        }
+        if !(is_digit(c) || is_letter(c)) {
+            break
+        }
+        if base == 10 && (c == 101 || c == 69) {
+            let c2: u32 = ch(f, 1)
+            if is_digit(c2) || c2 == 43 || c2 == 45 {
+                break
+            }
+        }
+        step(f)
+    }
+    if base == 10 {
+        if ch(f, 0) == 46 && is_digit(ch(f, 1)) {
+            step(f)
+            while (*f).p < (*f).n {
+                let c: u32 = ch(f, 0)
+                if !(is_digit(c) || c == 95) {
+                    break
+                }
+                step(f)
+            }
+        }
+        let e: u32 = ch(f, 0)
+        if e == 101 || e == 69 {
+            let c2: u32 = ch(f, 1)
+            if is_digit(c2) || c2 == 43 || c2 == 45 {
+                step(f)
+                let sg: u32 = ch(f, 0)
+                if sg == 43 || sg == 45 {
+                    step(f)
+                }
+                while (*f).p < (*f).n {
+                    let c: u32 = ch(f, 0)
+                    if !(is_digit(c) || c == 95) {
+                        break
+                    }
+                    step(f)
+                }
+            }
+        }
+        // ROUND 71: the suffix `f` belongs to the number (`1.5f`, `1e3f`).
+        // Without this line the formatter would tear `2.5f` into `2.5` and
+        // `f` and write `2.5 f` back -- a formatter that changes the token
+        // stream is worse than none. (`2f` is already covered above: the
+        // first loop takes letters along.)
+        if ch(f, 0) == 102 {
+            let after: u32 = ch(f, 1)
+            if !(is_letter(after) || is_digit(after) || after == 95) {
+                step(f)
+            }
+        }
+    }
+    add(f, K_NUMBER, 0, st, l0)
+}
+
+fn word_tok(f: *mut Form) {
+    let st: usize = (*f).p
+    let l0: u32 = (*f).line
+    while (*f).p < (*f).n {
+        let c: u32 = ch(f, 0)
+        if !(c == 95 || is_letter(c) || is_digit(c)) {
+            break
+        }
+        step(f)
+    }
+    add(f, K_WORD, 0, st, l0)
+}
+
+fn sign_tok(f: *mut Form) {
+    let st: usize = (*f).p
+    let l0: u32 = (*f).line
+    let c: u32 = ch(f, 0)
+    let d: u32 = ch(f, 1)
+    var s: u32 = S_UNKNOWN
+    var w: usize = 1
+    // ROUND 70: THREE characters first -- `<<=` and `>>=`.
+    let e2: u32 = ch(f, 2)
+    if c == 60 && d == 60 && e2 == 61 { s = S_SHLEQ; w = 3 }
+    else if c == 62 && d == 62 && e2 == 61 { s = S_SHREQ; w = 3 }
+    else if c == 45 && d == 62 { s = S_ARROW; w = 2 }
+    // ROUND 70: the compound assignments and the two step operators.
+    else if c == 43 && d == 61 { s = S_PLUSEQ; w = 2 }
+    else if c == 45 && d == 61 { s = S_MINUSEQ; w = 2 }
+    else if c == 42 && d == 61 { s = S_STAREQ; w = 2 }
+    else if c == 47 && d == 61 { s = S_SLASHEQ; w = 2 }
+    else if c == 37 && d == 61 { s = S_PERCENTEQ; w = 2 }
+    else if c == 38 && d == 61 { s = S_AMPEQ; w = 2 }
+    else if c == 124 && d == 61 { s = S_PIPEEQ; w = 2 }
+    else if c == 94 && d == 61 { s = S_CARETEQ; w = 2 }
+    else if c == 43 && d == 43 { s = S_PLUSPLUS; w = 2 }
+    else if c == 45 && d == 45 { s = S_MINUSMINUS; w = 2 }
+    // ROUND 72: `+% -% *%` and `+| -| *|`, greedily, before the single
+    // character forms below.
+    else if c == 43 && d == 37 { s = S_PLUSPERCENT; w = 2 }
+    else if c == 45 && d == 37 { s = S_MINUSPERCENT; w = 2 }
+    else if c == 42 && d == 37 { s = S_STARPERCENT; w = 2 }
+    else if c == 43 && d == 124 { s = S_PLUSPIPE; w = 2 }
+    else if c == 45 && d == 124 { s = S_MINUSPIPE; w = 2 }
+    else if c == 42 && d == 124 { s = S_STARPIPE; w = 2 }
+    else if c == 61 && d == 62 { s = S_FATARROW; w = 2 }
+    else if c == 58 && d == 58 { s = S_COLONCOLON; w = 2 }
+    else if c == 46 && d == 46 { s = S_DOTDOT; w = 2 }
+    else if c == 60 && d == 60 { s = S_SHL; w = 2 }
+    else if c == 62 && d == 62 { s = S_SHR; w = 2 }
+    else if c == 38 && d == 38 { s = S_ANDAND; w = 2 }
+    else if c == 124 && d == 124 { s = S_OROR; w = 2 }
+    else if c == 61 && d == 61 { s = S_EQEQ; w = 2 }
+    else if c == 33 && d == 61 { s = S_NOTEQ; w = 2 }
+    else if c == 60 && d == 61 { s = S_LE; w = 2 }
+    else if c == 62 && d == 61 { s = S_GE; w = 2 }
+    else if c == 40 { s = S_LPAREN }
+    else if c == 41 { s = S_RPAREN }
+    else if c == 123 { s = S_LBRACE }
+    else if c == 125 { s = S_RBRACE }
+    else if c == 91 { s = S_LBRACKET }
+    else if c == 93 { s = S_RBRACKET }
+    else if c == 44 { s = S_COMMA }
+    else if c == 58 { s = S_COLON }
+    else if c == 59 { s = S_SEMI }
+    else if c == 46 { s = S_DOT }
+    else if c == 61 { s = S_ASSIGN }
+    else if c == 43 { s = S_PLUS }
+    else if c == 45 { s = S_MINUS }
+    else if c == 42 { s = S_STAR }
+    else if c == 47 { s = S_SLASH }
+    else if c == 37 { s = S_PERCENT }
+    else if c == 38 { s = S_AMP }
+    else if c == 124 { s = S_PIPE }
+    else if c == 94 { s = S_CARET }
+    else if c == 35 { s = S_HASH }
+    else if c == 33 { s = S_NOT }
+    else if c == 126 { s = S_TILDE }
+    else if c == 63 { s = S_QUESTION }
+    else if c == 60 { s = S_LT }
+    else if c == 62 { s = S_GT }
+    else { (*f).broken = 1 }
+    var k: usize = 0
+    while k < w {
+        step(f)
+        k = k + 1
+    }
+    add(f, K_SIGN, s, st, l0)
+}
+
+// Do the brackets balance? Only then does the indentation mean anything --
+// a `(` that is never closed would push every following line one step to
+// the right for the rest of the file. So a source text with unbalanced
+// brackets is REFUSED, not silently reshaped. Two of the negative tests
+// (`bad_call.fi`, `two_errors.fi`) are exactly that case, and they are
+// meant to be.
+fn nesting_ok(f: *mut Form) -> bool {
+    var depth: i64 = 0
+    var i: usize = 0
+    let cnt: usize = form_count(f)
+    while i < cnt {
+        if tok_kind(f, i) == K_SIGN {
+            let s: u32 = tok_sign(f, i)
+            if s == S_LBRACE || s == S_LPAREN || s == S_LBRACKET {
+                depth = depth + 1
+            }
+            if s == S_RBRACE || s == S_RPAREN || s == S_RBRACKET {
+                depth = depth - 1
+                if depth < 0 {
+                    return false
+                }
+            }
+        }
+        i = i + 1
+    }
+    return depth == 0
+}
+
+fn form_scan(f: *mut Form) {
+    while true {
+        skip_blanks(f)
+        if (*f).p >= (*f).n {
+            break
+        }
+        let c: u32 = ch(f, 0)
+        if c == 47 && ch(f, 1) == 47 {
+            line_note(f)
+        } else if c == 47 && ch(f, 1) == 42 {
+            block_note(f)
+        } else if text_ahead(f) {
+            text_lit(f)
+        } else if is_digit(c) {
+            number_lit(f)
+        } else if c == 95 || is_letter(c) {
+            word_tok(f)
+        } else {
+            sign_tok(f)
+        }
+    }
+    if !nesting_ok(f) {
+        (*f).broken = 1
+    }
+}
+
+// -------------------------------------------------------- word comparison
+
+// Is token `i` the word that starts at `p` and is `n` octets long?
+fn word_equals(f: *mut Form, i: usize, p: u64, n: usize) -> bool {
+    if tok_kind(f, i) != K_WORD {
+        return false
+    }
+    if tok_length(f, i) != n {
+        return false
+    }
+    return rt.mem_eq((*f).q + tok_start(f, i) as u64, p, n)
+}
+
+// Is token `i` one of the words in the table `p`, separated by `|`?
+fn word_in_table(f: *mut Form, i: usize, p: u64, n: usize) -> bool {
+    if tok_kind(f, i) != K_WORD {
+        return false
+    }
+    var of: usize = 0
+    var k: usize = 0
+    while k <= n {
+        if k == n || rt.ld8(p, k) == 124 as u8 {
+            if word_equals(f, i, p + of as u64, k - of) {
+                return true
+            }
+            of = k + 1
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// The words after which a `(` is NOT a call, a `[` is NOT an index and
+// `-`/`*`/`&` are prefixes. `true`, `false` and `syscall` are deliberately
+// NOT in here: they end an operand (`syscall(...)` is a call).
+//
+// ONLY RESERVED WORDS belong in here, plus `gc` (`gc fn(...)`, `gc C{...}`).
+// `impl`, `interface`, `class` and `dyn` are CONTEXTUAL in Firn and may be
+// ordinary names -- `class` really is one in `lib/gc/gc.fi`, where
+// `class * 8` would otherwise have turned into `class *8`.
+fn keyword(f: *mut Form, i: usize) -> bool {
+    var kw: [u8; 153] = "fn|let|var|if|else|while|return|struct|const|profile|as|mut|extern|break|continue|defer|errdefer|comptime|for|import|export|enum|match|error|try|catch|gc"
+    return word_in_table(f, i, (&kw[0]) as u64, 153)
+}
+
+// Does token `i` end an operand? That decides unary against binary.
+fn operand_end(f: *mut Form, i: usize) -> bool {
+    let k: u32 = tok_kind(f, i)
+    if k == K_NUMBER || k == K_TEXT {
+        return true
+    }
+    if k == K_WORD {
+        return !keyword(f, i)
+    }
+    if k == K_SIGN {
+        let s: u32 = tok_sign(f, i)
+        return s == S_RPAREN || s == S_RBRACKET || s == S_RBRACE || s == S_QUESTION
+    }
+    return false
+}
+
+// Does token `i` begin a line of its own?
+fn line_head(f: *mut Form, i: usize) -> bool {
+    if i == 0 {
+        return true
+    }
+    return tok_line(f, i) > tok_end_line(f, i - 1)
+}
+
+// Is token `i` a PREFIX operator? `-1`, `*p`, `&x`, `!ok` -- as opposed to
+// `a - 1`, `a * b`, `a & b`.
+//
+// AT THE BEGINNING OF A LINE it is always a prefix, and that is not a guess
+// but the grammar: outside a bracket a line break ends the statement
+// (`parser.fi::end_stmt`), so `*p = ...` on a fresh line is a store through a
+// pointer and not the continuation of the line above. Inside a bracket the
+// expression may run on -- there the decision can be cosmetically wrong, but
+// never wrong in substance: it only decides about ONE blank, never about a
+// token.
+fn prefix_op(f: *mut Form, i: usize) -> bool {
+    if tok_kind(f, i) != K_SIGN {
+        return false
+    }
+    let s: u32 = tok_sign(f, i)
+    if s != S_MINUS && s != S_PLUS && s != S_STAR && s != S_AMP && s != S_NOT
+    && s != S_TILDE {
+        return false
+    }
+    if line_head(f, i) {
+        return true
+    }
+    return !operand_end(f, i - 1)
+}
+
+// -------------------------------------------------------- the blank table
+//
+// Does a blank belong BETWEEN token `i-1` and token `i`? The order of the
+// rules is the rule: the first one that fits decides.
+fn need_space(f: *mut Form, i: usize) -> bool {
+    let pk: u32 = tok_kind(f, i - 1)
+    let ps: u32 = tok_sign(f, i - 1)
+    let ck: u32 = tok_kind(f, i)
+    let cs: u32 = tok_sign(f, i)
+
+    if pk == K_SIGN {
+        // Nothing follows an opening bracket, a dot, a path or a `#`
+        // directly.
+        if ps == S_LPAREN || ps == S_LBRACKET {
+            return false
+        }
+        if ps == S_DOT || ps == S_DOTDOT || ps == S_COLONCOLON || ps == S_HASH {
+            return false
+        }
+        // `!` is either the negation (`!ok`) or the error union in a type
+        // (`AllocError!bool`) -- nothing follows either of them.
+        if ps == S_NOT {
+            return false
+        }
+        // ROUND 68: `~x` -- the complement always sticks to its operand.
+        if ps == S_TILDE {
+            return false
+        }
+        if prefix_op(f, i - 1) {
+            return false
+        }
+        // An empty block stays `{}`.
+        if ps == S_LBRACE && ck == K_SIGN && cs == S_RBRACE {
+            return false
+        }
+    }
+    if ck == K_SIGN {
+        // ROUND 70: `x++` and `x--` stick to their operand -- they are the
+        // ONE place where a sign follows a name without a blank. `x += 1`
+        // on the other hand gets blanks on both sides, exactly like `=`.
+        if cs == S_PLUSPLUS || cs == S_MINUSMINUS {
+            return !operand_end(f, i - 1)
+        }
+        if cs == S_COMMA || cs == S_SEMI {
+            return false
+        }
+        if cs == S_RPAREN || cs == S_RBRACKET {
+            return false
+        }
+        if cs == S_DOT || cs == S_DOTDOT || cs == S_COLONCOLON {
+            return false
+        }
+        if cs == S_COLON || cs == S_QUESTION {
+            return false
+        }
+        if cs == S_NOT && operand_end(f, i - 1) {
+            return false
+        }
+        // `a[i]`, `Vec[u32]`, `f()[k]` versus `: [u8; 4]`
+        if cs == S_LBRACKET {
+            return !operand_end(f, i - 1)
+        }
+        // `f(x)`, `(g)(x)` versus `if (x)`; `fn(i32) -> i32` is a type.
+        if cs == S_LPAREN {
+            if operand_end(f, i - 1) {
+                return false
+            }
+            var fw: [u8; 2] = "fn"
+            if word_equals(f, i - 1, (&fw[0]) as u64, 2) {
+                return false
+            }
+            return true
+        }
+    }
+    return true
+}
+
+// ------------------------------------------------------------- the printer
+
+fn blanks(out: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(out, 32 as u8)
+        i = i + 1
+    }
+}
+
+// The token verbatim out of the source text. Only in a line comment the
+// blanks at the end fall away -- everything else stays octet for octet, and
+// that is what makes the token stream unchangeable.
+fn emit(f: *mut Form, out: *mut rt.Buf, i: usize) {
+    let st: usize = tok_start(f, i)
+    var ln: usize = tok_length(f, i)
+    if tok_kind(f, i) == K_LINE_NOTE {
+        while ln > 0 {
+            let c: u8 = rt.ld8((*f).q, st + ln - 1)
+            if c != 32 as u8 && c != 9 as u8 && c != 13 as u8 {
+                break
+            }
+            ln = ln - 1
+        }
+    }
+    rt.buf_push_bytes(out, (*f).q + st as u64, ln)
+}
+
+fn opener(f: *mut Form, i: usize) -> bool {
+    if tok_kind(f, i) != K_SIGN {
+        return false
+    }
+    let s: u32 = tok_sign(f, i)
+    return s == S_LBRACE || s == S_LPAREN || s == S_LBRACKET
+}
+
+fn closer(f: *mut Form, i: usize) -> bool {
+    if tok_kind(f, i) != K_SIGN {
+        return false
+    }
+    let s: u32 = tok_sign(f, i)
+    return s == S_RBRACE || s == S_RPAREN || s == S_RBRACKET
+}
+
+fn form_render(f: *mut Form, out: *mut rt.Buf) {
+    let cnt: usize = form_count(f)
+    var depth: i64 = 0
+    var i: usize = 0
+    while i < cnt {
+        var fresh: bool = true
+        if i > 0 {
+            fresh = tok_line(f, i) > tok_end_line(f, i - 1)
+        }
+        if fresh {
+            if i > 0 {
+                rt.buf_push(out, 10 as u8)
+                var gap: u32 = tok_line(f, i) - tok_end_line(f, i - 1) - 1
+                if gap > 1 {
+                    gap = 1
+                }
+                if is_sign(f, i - 1, S_LBRACE) {
+                    gap = 0
+                }
+                if is_sign(f, i, S_RBRACE) {
+                    gap = 0
+                }
+                while gap > 0 {
+                    rt.buf_push(out, 10 as u8)
+                    gap = gap - 1
+                }
+            }
+            var d: i64 = depth
+            if closer(f, i) {
+                d = d - 1
+            }
+            if d < 0 {
+                d = 0
+            }
+            blanks(out, d as usize * STEP)
+        } else {
+            if need_space(f, i) {
+                rt.buf_push(out, 32 as u8)
+            }
+        }
+        emit(f, out, i)
+        if opener(f, i) {
+            depth = depth + 1
+        }
+        if closer(f, i) {
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    if cnt > 0 {
+        rt.buf_push(out, 10 as u8)
+    }
+}

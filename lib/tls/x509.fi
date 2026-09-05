@@ -1,0 +1,1243 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/tls/x509.fi -- certificates, the chain and the trust store, round B5.
+//
+// THIS FILE IS WHAT MAKES THE PADLOCK MEAN ANYTHING. The TLS handshake in
+// `handshake.fi` proves that the peer holds the private key belonging to
+// the certificate it sent. That is worth exactly nothing on its own --
+// anybody can generate a key and a certificate saying they are
+// `example.com`. What turns it into a statement about WHO is on the other
+// end is here: a chain from that certificate up to a key this machine
+// already trusts, every link signed, every certificate inside its validity
+// period, and the name on the leaf matching the name that was typed.
+//
+// A verifier that returns "trusted" for everything passes every test made
+// of real certificates. So the acceptance run of this round
+// (`tools/tlsb5/cert_check.py`) is built the other way round: it generates
+// certificates that MUST be refused -- expired, not yet valid, the wrong
+// name, an unknown issuer, a signature over a modified body, a leaf used
+// as an issuer, a chain that does not reach a root -- and counts the
+// refusals. `verify_chain` therefore returns a REASON and not a bool, so
+// that a test can demand not just "refused" but "refused for the right
+// reason".
+//
+// ============================================================== THE CHAIN
+//
+// The peer sends a list: its own certificate first, then whatever
+// intermediates it thinks are needed (RFC 8446 4.4.2 says in order, and
+// says a receiver MUST NOT rely on it). This file therefore does not trust
+// the order: it starts at the leaf and, at every step, looks for the
+// certificate whose SUBJECT equals the current ISSUER -- first among the
+// ones the peer sent, then in the trust store. The comparison is over the
+// RAW DER OCTETS of the name. That is the strict reading (RFC 5280 7.1
+// allows a normalising comparison), and it is the one where two
+// implementations cannot disagree.
+//
+// The walk stops at a certificate whose issuer is in the store, and that
+// last signature is checked like every other. A "root" that is present but
+// whose signature does not verify is not a root.
+//
+// ================================================================ THE NAME
+//
+// RFC 6125 6.4.4 and RFC 2818 as it is really practised: if the
+// certificate has a subjectAltName, ONLY that is looked at, and the common
+// name is ignored entirely. A leading `*.` wildcard matches exactly one
+// label and never the leftmost of a two-label name (`*.com` matches
+// nothing here). The comparison is case-insensitive over ASCII.
+//
+// Falling back to the common name when there is no subjectAltName is what
+// every browser did until about 2017 and what none does now. This file
+// keeps the fallback, because certificates without a SAN still exist on
+// internal networks, and it says so here rather than hiding it.
+//
+// ==================================================================== HONEST
+//
+// X1 NO REVOCATION. No CRL, no OCSP, no stapling. A certificate that was
+//    withdrawn this morning still verifies here. That is a real hole and
+//    it is named rather than papered over; it needs a fetch of its own
+//    (CRL) or a TLS extension (OCSP stapling) and belongs in a later
+//    round.
+// X2 NO NAME CONSTRAINTS, no policy constraints, no policy mapping. A
+//    certificate authority that is only allowed to issue for `.example`
+//    is treated here as one that may issue for anything.
+// X3 CRITICAL EXTENSIONS ARE NOT ALL UNDERSTOOD, and RFC 5280 4.2 says an
+//    unrecognised CRITICAL extension must make the certificate
+//    unacceptable. This file enforces that only for the ones it knows
+//    (basicConstraints, keyUsage, subjectAltName, extKeyUsage); a
+//    critical extension it has never heard of is REFUSED, which is the
+//    standard's rule and costs a few certificates in the wild.
+// X4 RSA, P-256 AND P-384 ONLY. `sha1WithRSA` is accepted for a chain link only
+//    where the signature is over an intermediate the store itself
+//    contains. P-521, Ed25519 and DSA come back `UNSUPPORTED`, which is a
+//    refusal and not an acceptance.
+// X5 THE VALIDITY IS CHECKED AGAINST THE SYSTEM CLOCK. A machine whose
+//    clock is wrong rejects good certificates and, if it is wrong the
+//    other way, accepts expired ones. There is no alternative without a
+//    trusted time source.
+import std.rt
+import std.crypto.sha256
+import std.crypto.sha1
+import std.crypto.sha512
+import std.crypto.rsa
+import std.crypto.ecdsa
+import tls.der
+
+export {
+    Cert, Store, VerifyResult,
+    cert_new, cert_parse, cert_name_matches, cert_time_ok,
+    cert_is_ca, cert_subject_off, cert_subject_len,
+    cert_issuer_off, cert_issuer_len, cert_key_alg, cert_sig_alg,
+    cert_not_before, cert_not_after,
+    cert_mod_ptr, cert_mod_len, cert_exp_ptr, cert_exp_len, cert_ec_ptr,
+    ecdsa_der_split,
+    store_new, store_free, store_load_pem, store_count,
+    verify_signature_by, verify_chain,
+    base64_decode,
+    V_OK, V_PARSE, V_EXPIRED, V_NOT_YET, V_NAME, V_UNKNOWN_ISSUER,
+    V_BAD_SIGNATURE, V_NOT_CA, V_UNSUPPORTED, V_TOO_LONG, V_CRITICAL,
+    KEY_RSA, KEY_P256, KEY_P384,
+    SIG_RSA_SHA256, SIG_RSA_SHA384, SIG_RSA_SHA512, SIG_RSA_SHA1,
+    SIG_RSA_PSS, SIG_ECDSA_SHA256, SIG_ECDSA_SHA384, SIG_UNKNOWN,
+}
+
+const V_OK: u32 = 0
+const V_PARSE: u32 = 1
+const V_EXPIRED: u32 = 2
+const V_NOT_YET: u32 = 3
+const V_NAME: u32 = 4
+const V_UNKNOWN_ISSUER: u32 = 5
+const V_BAD_SIGNATURE: u32 = 6
+const V_NOT_CA: u32 = 7
+const V_UNSUPPORTED: u32 = 8
+const V_TOO_LONG: u32 = 9
+const V_CRITICAL: u32 = 10
+
+const KEY_NONE: u32 = 0
+const KEY_RSA: u32 = 1
+const KEY_P256: u32 = 2
+const KEY_P384: u32 = 3
+
+const SIG_UNKNOWN: u32 = 0
+const SIG_RSA_SHA256: u32 = 1
+const SIG_RSA_SHA384: u32 = 2
+const SIG_RSA_SHA512: u32 = 3
+const SIG_RSA_SHA1: u32 = 4
+const SIG_RSA_PSS: u32 = 5
+const SIG_ECDSA_SHA256: u32 = 6
+const SIG_ECDSA_SHA384: u32 = 7
+
+const MAX_STORE: usize = 256
+const MAX_CHAIN: usize = 10
+
+struct Cert {
+    base: u64,
+    len: usize,
+    tbs_off: usize,
+    tbs_len: usize,
+    tbs_all_off: usize, // including the tag and length -- what is hashed
+    tbs_all_len: usize,
+    sig_alg: u32,
+    sig_off: usize,
+    sig_len: usize,
+    issuer_off: usize,
+    issuer_len: usize,
+    subject_off: usize,
+    subject_len: usize,
+    not_before: u64,
+    not_after: u64,
+    key_alg: u32,
+    mod_off: usize,
+    mod_len: usize,
+    exp_off: usize,
+    exp_len: usize,
+    ec_off: usize, // the uncompressed point, 04 || X || Y
+    ec_len: usize,
+    san_off: usize,
+    san_len: usize,
+    has_san: bool,
+    cn_off: usize,
+    cn_len: usize,
+    has_cn: bool,
+    is_ca: bool,
+    has_bc: bool,
+    ok: bool,
+}
+
+struct Store {
+    blob: rt.Buf, // every root certificate, one after the other
+    off: [usize; 256],
+    len: [usize; 256],
+    n: usize,
+}
+
+// ------------------------------------------------------------------ OIDs
+
+// Compares the contents of an OID TLV with a literal.
+fn oid_is(base: u64, off: usize, len: usize, lit: u64, ln: usize) -> bool {
+    if len != ln {
+        return false
+    }
+    var i: usize = 0
+    while i < len {
+        if rt.ld8(base, off + i) != rt.ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn sig_alg_of(base: u64, off: usize, len: usize) -> u32 {
+    // 1.2.840.113549.1.1.x -- the PKCS#1 family
+    var pkcs: [u8; 9] = [42, 134, 72, 134, 247, 13, 1, 1, 11]
+    if len == 9 {
+        var same: bool = true
+        var i: usize = 0
+        while i < 8 {
+            if rt.ld8(base, off + i) != pkcs[i] {
+                same = false
+            }
+            i = i + 1
+        }
+        if same {
+            let last: u8 = rt.ld8(base, off + 8)
+            if last == 11 as u8 {
+                return SIG_RSA_SHA256
+            }
+            if last == 12 as u8 {
+                return SIG_RSA_SHA384
+            }
+            if last == 13 as u8 {
+                return SIG_RSA_SHA512
+            }
+            if last == 5 as u8 {
+                return SIG_RSA_SHA1
+            }
+            if last == 10 as u8 {
+                return SIG_RSA_PSS
+            }
+        }
+    }
+    // 1.2.840.10045.4.3.x -- ecdsa-with-SHA2
+    var ec: [u8; 8] = [42, 134, 72, 206, 61, 4, 3, 2]
+    if len == 8 {
+        var same: bool = true
+        var i: usize = 0
+        while i < 7 {
+            if rt.ld8(base, off + i) != ec[i] {
+                same = false
+            }
+            i = i + 1
+        }
+        if same {
+            let last: u8 = rt.ld8(base, off + 7)
+            if last == 2 as u8 {
+                return SIG_ECDSA_SHA256
+            }
+            if last == 3 as u8 {
+                return SIG_ECDSA_SHA384
+            }
+        }
+    }
+    return SIG_UNKNOWN
+}
+
+// --------------------------------------------------------------- The time
+
+fn digits2(base: u64, off: usize) -> i64 {
+    let a: u8 = rt.ld8(base, off)
+    let b: u8 = rt.ld8(base, off + 1)
+    if a < 48 as u8 || a > 57 as u8 || b < 48 as u8 || b > 57 as u8 {
+        return 0 - 1
+    }
+    return ((a - 48 as u8) as i64) * 10 + ((b - 48 as u8) as i64)
+}
+
+// Howard Hinnant's shift of the year start to March: the leap day becomes
+// the last day of the year and the leap rule is three divisions with no
+// case distinction. The same trick `lib/net/httpstate.fi` uses for HTTP
+// dates -- and it is written out again here rather than imported, because
+// this file must not depend on the HTTP client.
+fn days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    var y: i64 = y0
+    if m <= 2 {
+        y = y - 1
+    }
+    var era: i64 = y / 400
+    if y < 0 {
+        era = (y - 399) / 400
+    }
+    let yoe: i64 = y - era * 400
+    var mp: i64 = m + 9
+    if m > 2 {
+        mp = m - 3
+    }
+    let doy: i64 = (153 * mp + 2) / 5 + d - 1
+    let doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// UTCTime (YYMMDDhhmmssZ) and GeneralizedTime (YYYYMMDDhhmmssZ), which are
+// the only two forms RFC 5280 4.1.2.5 allows. The two-digit year rule is
+// the standard's: 50 and above is 19xx, below 50 is 20xx.
+fn parse_time(base: u64, off: usize, len: usize, tag: u32,
+    out: *mut u64) -> bool {
+    var at: usize = off
+    var year: i64 = 0
+    if tag == der.T_UTCTIME {
+        if len != 13 || rt.ld8(base, off + 12) != 90 as u8 {
+            return false
+        }
+        let yy: i64 = digits2(base, at)
+        if yy < 0 {
+            return false
+        }
+        if yy >= 50 {
+            year = 1900 + yy
+        } else {
+            year = 2000 + yy
+        }
+        at = at + 2
+    } else if tag == der.T_GENTIME {
+        if len != 15 || rt.ld8(base, off + 14) != 90 as u8 {
+            return false
+        }
+        let hi: i64 = digits2(base, at)
+        let lo: i64 = digits2(base, at + 2)
+        if hi < 0 || lo < 0 {
+            return false
+        }
+        year = hi * 100 + lo
+        at = at + 4
+    } else {
+        return false
+    }
+    let mon: i64 = digits2(base, at)
+    let day: i64 = digits2(base, at + 2)
+    let hh: i64 = digits2(base, at + 4)
+    let mi: i64 = digits2(base, at + 6)
+    let ss: i64 = digits2(base, at + 8)
+    if mon < 1 || mon > 12 || day < 1 || day > 31 || hh > 23 || mi > 59
+    || ss > 60 {
+        return false
+    }
+    let days: i64 = days_from_civil(year, mon, day)
+    let secs: i64 = days * 86400 + hh * 3600 + mi * 60 + ss
+    if secs < 0 {
+        return false
+    }
+    *out = secs as u64
+    return true
+}
+
+// ------------------------------------------------------------- The parse
+
+fn cert_new() -> Cert {
+    return Cert { base: 0, len: 0, tbs_off: 0, tbs_len: 0,
+        tbs_all_off: 0, tbs_all_len: 0, sig_alg: SIG_UNKNOWN,
+        sig_off: 0, sig_len: 0, issuer_off: 0, issuer_len: 0,
+        subject_off: 0, subject_len: 0, not_before: 0, not_after: 0,
+        key_alg: KEY_NONE, mod_off: 0, mod_len: 0, exp_off: 0, exp_len: 0,
+        ec_off: 0, ec_len: 0, san_off: 0, san_len: 0, has_san: false,
+        cn_off: 0, cn_len: 0, has_cn: false, is_ca: false, has_bc: false,
+        ok: false }
+}
+
+// The common name out of a Name: the LAST RDN whose type is 2.5.4.3, which
+// is what every implementation takes when there are several.
+fn find_cn(c: *mut Cert, off: usize, len: usize) {
+    var d: der.Der = der.der_open((*c).base, off, len)
+    while !der.der_done(&d) {
+        var rdn: der.Der = der.der_open((*c).base, 0, 0)
+        if !der.der_enter(&d, der.T_SET, &rdn) {
+            return
+        }
+        while !der.der_done(&rdn) {
+            var atv: der.Der = der.der_open((*c).base, 0, 0)
+            if !der.der_enter(&rdn, der.T_SEQ, &atv) {
+                return
+            }
+            var tag: u32 = 0
+            var o: usize = 0
+            var l: usize = 0
+            if !der.der_read(&atv, &tag, &o, &l) {
+                return
+            }
+            var cn: [u8; 3] = [85, 4, 3]
+            let is_cn: bool = tag == der.T_OID
+            && oid_is((*c).base, o, l, (&cn[0]) as u64, 3)
+            if !der.der_read(&atv, &tag, &o, &l) {
+                return
+            }
+            if is_cn {
+                (*c).cn_off = o
+                (*c).cn_len = l
+                (*c).has_cn = true
+            }
+        }
+    }
+}
+
+fn parse_spki(c: *mut Cert, off: usize, len: usize) -> bool {
+    var d: der.Der = der.der_open((*c).base, off, len)
+    var alg: der.Der = der.der_open((*c).base, 0, 0)
+    if !der.der_enter(&d, der.T_SEQ, &alg) {
+        return false
+    }
+    var tag: u32 = 0
+    var o: usize = 0
+    var l: usize = 0
+    if !der.der_read(&alg, &tag, &o, &l) || tag != der.T_OID {
+        return false
+    }
+    var rsa_oid: [u8; 9] = [42, 134, 72, 134, 247, 13, 1, 1, 1]
+    var ec_oid: [u8; 7] = [42, 134, 72, 206, 61, 2, 1]
+    var p256_oid: [u8; 8] = [42, 134, 72, 206, 61, 3, 1, 7]
+    var p384_oid: [u8; 5] = [43, 129, 4, 0, 34]
+    var is_rsa: bool = oid_is((*c).base, o, l, (&rsa_oid[0]) as u64, 9)
+    var is_ec: bool = oid_is((*c).base, o, l, (&ec_oid[0]) as u64, 7)
+    var curve: u32 = KEY_NONE
+    if is_ec {
+        // the named curve. A curve this file does not know is NOT a parse
+        // failure -- the certificate is read to the end and its key
+        // algorithm stays KEY_NONE, so a chain that needs it comes back
+        // UNSUPPORTED and not PARSE. The difference matters: one says
+        // "this is not a certificate", the other says "this is a
+        // certificate I cannot check", and only the second is true.
+        var t2: u32 = 0
+        var o2: usize = 0
+        var l2: usize = 0
+        if !der.der_read(&alg, &t2, &o2, &l2) || t2 != der.T_OID {
+            return false
+        }
+        if oid_is((*c).base, o2, l2, (&p256_oid[0]) as u64, 8) {
+            curve = KEY_P256
+        } else if oid_is((*c).base, o2, l2, (&p384_oid[0]) as u64, 5) {
+            curve = KEY_P384
+        }
+    }
+    // the key itself, in a BIT STRING whose first octet is the number of
+    // unused bits -- which for a key is always zero.
+    var bt: u32 = 0
+    var bo: usize = 0
+    var bl: usize = 0
+    if !der.der_read(&d, &bt, &bo, &bl) || bt != der.T_BITSTRING || bl < 2 {
+        return false
+    }
+    if rt.ld8((*c).base, bo) != 0 as u8 {
+        return false
+    }
+    let ko: usize = bo + 1
+    let kl: usize = bl - 1
+    if !is_rsa && !is_ec {
+        (*c).key_alg = KEY_NONE
+        return true
+    }
+    if is_ec {
+        var want: usize = 0
+        if curve == KEY_P256 {
+            want = 65
+        } else if curve == KEY_P384 {
+            want = 97
+        } else {
+            (*c).key_alg = KEY_NONE
+            return true
+        }
+        if kl != want || rt.ld8((*c).base, ko) != 4 as u8 {
+            return false // E2: uncompressed only
+        }
+        (*c).ec_off = ko + 1
+        (*c).ec_len = want - 1
+        (*c).key_alg = curve
+        return true
+    }
+    var kd: der.Der = der.der_open((*c).base, ko, kl)
+    var seq: der.Der = der.der_open((*c).base, 0, 0)
+    if !der.der_enter(&kd, der.T_SEQ, &seq) {
+        return false
+    }
+    var mt: u32 = 0
+    var mo: usize = 0
+    var ml: usize = 0
+    if !der.der_read(&seq, &mt, &mo, &ml) || mt != der.T_INT {
+        return false
+    }
+    // A DER INTEGER carries a leading zero octet when the top bit is set;
+    // the modulus is a magnitude and the zero is not part of it.
+    if ml > 1 && rt.ld8((*c).base, mo) == 0 as u8 {
+        mo = mo + 1
+        ml = ml - 1
+    }
+    var et: u32 = 0
+    var eo: usize = 0
+    var el: usize = 0
+    if !der.der_read(&seq, &et, &eo, &el) || et != der.T_INT {
+        return false
+    }
+    if el > 1 && rt.ld8((*c).base, eo) == 0 as u8 {
+        eo = eo + 1
+        el = el - 1
+    }
+    (*c).mod_off = mo
+    (*c).mod_len = ml
+    (*c).exp_off = eo
+    (*c).exp_len = el
+    (*c).key_alg = KEY_RSA
+    return true
+}
+
+fn parse_extensions(c: *mut Cert, off: usize, len: usize) -> bool {
+    var outer: der.Der = der.der_open((*c).base, off, len)
+    var list: der.Der = der.der_open((*c).base, 0, 0)
+    if !der.der_enter(&outer, der.T_SEQ, &list) {
+        return false
+    }
+    while !der.der_done(&list) {
+        var ext: der.Der = der.der_open((*c).base, 0, 0)
+        if !der.der_enter(&list, der.T_SEQ, &ext) {
+            return false
+        }
+        var tag: u32 = 0
+        var o: usize = 0
+        var l: usize = 0
+        if !der.der_read(&ext, &tag, &o, &l) || tag != der.T_OID {
+            return false
+        }
+        let oid_o: usize = o
+        let oid_l: usize = l
+        var critical: bool = false
+        if der.der_peek(&ext) == der.T_BOOL {
+            var bt: u32 = 0
+            var bo: usize = 0
+            var bl: usize = 0
+            if !der.der_read(&ext, &bt, &bo, &bl) || bl != 1 {
+                return false
+            }
+            critical = rt.ld8((*c).base, bo) != 0 as u8
+        }
+        var vt: u32 = 0
+        var vo: usize = 0
+        var vl: usize = 0
+        if !der.der_read(&ext, &vt, &vo, &vl) || vt != der.T_OCTETSTRING {
+            return false
+        }
+        var bc: [u8; 3] = [85, 29, 19]
+        var san: [u8; 3] = [85, 29, 17]
+        var ku: [u8; 3] = [85, 29, 15]
+        var eku: [u8; 3] = [85, 29, 37]
+        var ski: [u8; 3] = [85, 29, 14]
+        var aki: [u8; 3] = [85, 29, 35]
+        var cp: [u8; 3] = [85, 29, 32]
+        var known: bool = false
+        if oid_is((*c).base, oid_o, oid_l, (&bc[0]) as u64, 3) {
+            known = true
+            var bd: der.Der = der.der_open((*c).base, vo, vl)
+            var inner: der.Der = der.der_open((*c).base, 0, 0)
+            if !der.der_enter(&bd, der.T_SEQ, &inner) {
+                return false
+            }
+            (*c).has_bc = true
+            if der.der_peek(&inner) == der.T_BOOL {
+                var t2: u32 = 0
+                var o2: usize = 0
+                var l2: usize = 0
+                if !der.der_read(&inner, &t2, &o2, &l2) || l2 != 1 {
+                    return false
+                }
+                (*c).is_ca = rt.ld8((*c).base, o2) != 0 as u8
+            }
+        } else if oid_is((*c).base, oid_o, oid_l, (&san[0]) as u64, 3) {
+            known = true
+            (*c).san_off = vo
+            (*c).san_len = vl
+            (*c).has_san = true
+        } else if oid_is((*c).base, oid_o, oid_l, (&ku[0]) as u64, 3) {
+            known = true
+        } else if oid_is((*c).base, oid_o, oid_l, (&eku[0]) as u64, 3) {
+            known = true
+        } else if oid_is((*c).base, oid_o, oid_l, (&ski[0]) as u64, 3) {
+            known = true
+        } else if oid_is((*c).base, oid_o, oid_l, (&aki[0]) as u64, 3) {
+            known = true
+        } else if oid_is((*c).base, oid_o, oid_l, (&cp[0]) as u64, 3) {
+            known = true
+        }
+        if critical && !known {
+            return false // X3
+        }
+    }
+    return true
+}
+
+fn cert_parse(c: *mut Cert, p: u64, n: usize) -> bool {
+    *c = cert_new()
+    (*c).base = p
+    (*c).len = n
+    var top: der.Der = der.der_open(p, 0, n)
+    var cert: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&top, der.T_SEQ, &cert) {
+        return false
+    }
+    // tbsCertificate, and we need its OCTETS including the header, because
+    // that is what the signature is over.
+    let tbs_start: usize = cert.at
+    var tbs: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&cert, der.T_SEQ, &tbs) {
+        return false
+    }
+    (*c).tbs_all_off = tbs_start
+    (*c).tbs_all_len = cert.at - tbs_start
+    (*c).tbs_off = tbs.at
+    (*c).tbs_len = tbs.end - tbs.at
+    // signatureAlgorithm
+    var sa: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&cert, der.T_SEQ, &sa) {
+        return false
+    }
+    var t: u32 = 0
+    var o: usize = 0
+    var l: usize = 0
+    if !der.der_read(&sa, &t, &o, &l) || t != der.T_OID {
+        return false
+    }
+    (*c).sig_alg = sig_alg_of(p, o, l)
+    // signatureValue
+    if !der.der_read(&cert, &t, &o, &l) || t != der.T_BITSTRING || l < 2 {
+        return false
+    }
+    if rt.ld8(p, o) != 0 as u8 {
+        return false
+    }
+    (*c).sig_off = o + 1
+    (*c).sig_len = l - 1
+    // ---- inside the tbsCertificate
+    if der.der_peek(&tbs) == der.T_CONTEXT + der.T_CONSTRUCTED {
+        if !der.der_skip(&tbs) {
+            return false // version
+        }
+    }
+    if !der.der_skip(&tbs) {
+        return false // serialNumber
+    }
+    if !der.der_skip(&tbs) {
+        return false // signature (must equal signatureAlgorithm)
+    }
+    if !der.der_read(&tbs, &t, &o, &l) || t != der.T_SEQ {
+        return false
+    }
+    (*c).issuer_off = o
+    (*c).issuer_len = l
+    var val: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&tbs, der.T_SEQ, &val) {
+        return false
+    }
+    var nbt: u32 = 0
+    var nbo: usize = 0
+    var nbl: usize = 0
+    if !der.der_read(&val, &nbt, &nbo, &nbl) {
+        return false
+    }
+    if !parse_time(p, nbo, nbl, nbt, &(*c).not_before) {
+        return false
+    }
+    var nat: u32 = 0
+    var nao: usize = 0
+    var nal: usize = 0
+    if !der.der_read(&val, &nat, &nao, &nal) {
+        return false
+    }
+    if !parse_time(p, nao, nal, nat, &(*c).not_after) {
+        return false
+    }
+    if !der.der_read(&tbs, &t, &o, &l) || t != der.T_SEQ {
+        return false
+    }
+    (*c).subject_off = o
+    (*c).subject_len = l
+    find_cn(c, o, l)
+    if !der.der_read(&tbs, &t, &o, &l) || t != der.T_SEQ {
+        return false
+    }
+    if !parse_spki(c, o, l) {
+        return false
+    }
+    // the optional tails: [1] and [2] implicit, [3] explicit extensions
+    while !der.der_done(&tbs) {
+        let peek: u32 = der.der_peek(&tbs)
+        if peek == 163 as u32 { // [3] constructed
+            var et: u32 = 0
+            var eo: usize = 0
+            var el: usize = 0
+            if !der.der_read(&tbs, &et, &eo, &el) {
+                return false
+            }
+            if !parse_extensions(c, eo, el) {
+                return false
+            }
+        } else {
+            if !der.der_skip(&tbs) {
+                return false
+            }
+        }
+    }
+    (*c).ok = true
+    return true
+}
+
+fn cert_is_ca(c: *mut Cert) -> bool {
+    return (*c).is_ca
+}
+
+fn cert_subject_off(c: *mut Cert) -> usize {
+    return (*c).subject_off
+}
+
+fn cert_subject_len(c: *mut Cert) -> usize {
+    return (*c).subject_len
+}
+
+fn cert_issuer_off(c: *mut Cert) -> usize {
+    return (*c).issuer_off
+}
+
+fn cert_issuer_len(c: *mut Cert) -> usize {
+    return (*c).issuer_len
+}
+
+fn cert_key_alg(c: *mut Cert) -> u32 {
+    return (*c).key_alg
+}
+
+fn cert_sig_alg(c: *mut Cert) -> u32 {
+    return (*c).sig_alg
+}
+
+fn cert_not_before(c: *mut Cert) -> u64 {
+    return (*c).not_before
+}
+
+fn cert_not_after(c: *mut Cert) -> u64 {
+    return (*c).not_after
+}
+
+// The public key, for a caller that has to verify something that is NOT a
+// certificate -- the CertificateVerify of the handshake, for instance.
+fn cert_mod_ptr(c: *mut Cert) -> u64 {
+    return (*c).base + (*c).mod_off as u64
+}
+
+fn cert_mod_len(c: *mut Cert) -> usize {
+    return (*c).mod_len
+}
+
+fn cert_exp_ptr(c: *mut Cert) -> u64 {
+    return (*c).base + (*c).exp_off as u64
+}
+
+fn cert_exp_len(c: *mut Cert) -> usize {
+    return (*c).exp_len
+}
+
+fn cert_ec_ptr(c: *mut Cert) -> u64 {
+    return (*c).base + (*c).ec_off as u64
+}
+
+fn cert_time_ok(c: *mut Cert, now: u64) -> u32 {
+    if now < (*c).not_before {
+        return V_NOT_YET
+    }
+    if now > (*c).not_after {
+        return V_EXPIRED
+    }
+    return V_OK
+}
+
+// ---------------------------------------------------------------- The name
+
+fn low(ch: u8) -> u8 {
+    if ch >= 65 as u8 && ch <= 90 as u8 {
+        return ch + 32 as u8
+    }
+    return ch
+}
+
+fn ci_same(a: u64, ao: usize, an: usize, b: u64, bo: usize,
+    bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if low(rt.ld8(a, ao + i)) != low(rt.ld8(b, bo + i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// One dNSName against the host. A leading `*.` matches exactly one label
+// and the name must still have at least two labels left -- so `*.com`
+// matches nothing, which is the rule that stops a wildcard certificate for
+// a public suffix.
+fn dns_match(base: u64, off: usize, len: usize, host: u64,
+    hn: usize) -> bool {
+    if len == 0 || hn == 0 {
+        return false
+    }
+    if len >= 2 && rt.ld8(base, off) == 42 as u8
+    && rt.ld8(base, off + 1) == 46 as u8 {
+        // count the dots in the remainder: at least one is needed
+        var dots: usize = 0
+        var i: usize = 2
+        while i < len {
+            if rt.ld8(base, off + i) == 46 as u8 {
+                dots = dots + 1
+            }
+            i = i + 1
+        }
+        if dots < 1 {
+            return false
+        }
+        // the host must have a first label, and the rest must match
+        var k: usize = 0
+        while k < hn && rt.ld8(host, k) != 46 as u8 {
+            k = k + 1
+        }
+        if k >= hn {
+            return false // no dot in the host at all
+        }
+        return ci_same(base, off + 1, len - 1, host, k, hn - k)
+    }
+    return ci_same(base, off, len, host, 0, hn)
+}
+
+fn cert_name_matches(c: *mut Cert, host: u64, hn: usize) -> bool {
+    if (*c).has_san {
+        var d: der.Der = der.der_open((*c).base, (*c).san_off, (*c).san_len)
+        var list: der.Der = der.der_open((*c).base, 0, 0)
+        if !der.der_enter(&d, der.T_SEQ, &list) {
+            return false
+        }
+        while !der.der_done(&list) {
+            var t: u32 = 0
+            var o: usize = 0
+            var l: usize = 0
+            if !der.der_read(&list, &t, &o, &l) {
+                return false
+            }
+            // [2] IMPLICIT IA5String = dNSName
+            if t == 130 as u32 {
+                if dns_match((*c).base, o, l, host, hn) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+    if (*c).has_cn {
+        return dns_match((*c).base, (*c).cn_off, (*c).cn_len, host, hn)
+    }
+    return false
+}
+
+// ---------------------------------------------------------- The signature
+
+fn hash_for(alg: u32) -> u32 {
+    if alg == SIG_RSA_SHA256 || alg == SIG_ECDSA_SHA256
+    || alg == SIG_RSA_PSS {
+        return rsa.RSA_SHA256
+    }
+    if alg == SIG_RSA_SHA384 || alg == SIG_ECDSA_SHA384 {
+        return rsa.RSA_SHA384
+    }
+    if alg == SIG_RSA_SHA512 {
+        return rsa.RSA_SHA512
+    }
+    if alg == SIG_RSA_SHA1 {
+        return rsa.RSA_SHA1
+    }
+    return 0 as u32
+}
+
+// The ECDSA signature in a certificate is a DER SEQUENCE of two INTEGERs,
+// not the fixed 64 octets TLS uses. Both are turned into 32 octet
+// big-endian values here; a value that does not fit is a refusal.
+fn ecdsa_split(base: u64, off: usize, len: usize, r: u64, s: u64,
+    half: usize) -> bool {
+    var d: der.Der = der.der_open(base, off, len)
+    var seq: der.Der = der.der_open(base, 0, 0)
+    if !der.der_enter(&d, der.T_SEQ, &seq) {
+        return false
+    }
+    var i: usize = 0
+    while i < 2 {
+        var t: u32 = 0
+        var o: usize = 0
+        var l: usize = 0
+        if !der.der_read(&seq, &t, &o, &l) || t != der.T_INT || l == 0 {
+            return false
+        }
+        if (rt.ld8(base, o) & 128 as u8) != 0 as u8 {
+            return false // negative
+        }
+        while l > 1 && rt.ld8(base, o) == 0 as u8 {
+            o = o + 1
+            l = l - 1
+        }
+        if l > half {
+            return false
+        }
+        var dst: u64 = r
+        if i == 1 {
+            dst = s
+        }
+        var k: usize = 0
+        while k < half {
+            rt.st8(dst, k, 0 as u8)
+            k = k + 1
+        }
+        k = 0
+        while k < l {
+            rt.st8(dst, half - l + k, rt.ld8(base, o + k))
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Was `child` really signed by the key in `parent`?
+// The same splitter, for a signature that did not come out of a
+// certificate. `half` is the coordinate size of the curve.
+fn ecdsa_der_split(sig: u64, siglen: usize, r: u64, s: u64,
+    half: usize) -> bool {
+    return ecdsa_split(sig, 0, siglen, r, s, half)
+}
+
+fn verify_signature_by(child: *mut Cert, parent: *mut Cert) -> u32 {
+    let halg: u32 = hash_for((*child).sig_alg)
+    if halg == 0 as u32 {
+        return V_UNSUPPORTED
+    }
+    var digest: [u8; 64] = [0; 64]
+    let hlen: usize = rsa.hash_size(halg)
+    if halg == rsa.RSA_SHA1 {
+        sha1.sha1((*child).base + (*child).tbs_all_off as u64,
+            (*child).tbs_all_len, (&digest[0]) as u64)
+    } else if !rsa.hash_of(halg, (*child).base + (*child).tbs_all_off as u64,
+        (*child).tbs_all_len, (&digest[0]) as u64) {
+        return V_UNSUPPORTED
+    }
+    if (*child).sig_alg == SIG_ECDSA_SHA256
+    || (*child).sig_alg == SIG_ECDSA_SHA384 {
+        var curve: ecdsa.Curve = ecdsa.curve_new_p256()
+        var half: usize = 32
+        if (*parent).key_alg == KEY_P256 {
+            ecdsa.curve_p256(&curve)
+            half = 32
+        } else if (*parent).key_alg == KEY_P384 {
+            ecdsa.curve_p384(&curve)
+            half = 48
+        } else {
+            return V_UNSUPPORTED
+        }
+        var r: [u8; 48] = [0; 48]
+        var s: [u8; 48] = [0; 48]
+        if !ecdsa_split((*child).base, (*child).sig_off, (*child).sig_len,
+            (&r[0]) as u64, (&s[0]) as u64, half) {
+            return V_BAD_SIGNATURE
+        }
+        if ecdsa.ecdsa_verify_curve(&curve,
+            (*parent).base + (*parent).ec_off as u64,
+            (*parent).base + ((*parent).ec_off + half) as u64,
+            (&r[0]) as u64, (&s[0]) as u64, (&digest[0]) as u64, hlen) {
+            return V_OK
+        }
+        return V_BAD_SIGNATURE
+    }
+    if (*parent).key_alg != KEY_RSA {
+        return V_UNSUPPORTED
+    }
+    var good: bool = false
+    if (*child).sig_alg == SIG_RSA_PSS {
+        good = rsa.rsa_verify_pss(
+            (*parent).base + (*parent).mod_off as u64, (*parent).mod_len,
+            (*parent).base + (*parent).exp_off as u64, (*parent).exp_len,
+            (*child).base + (*child).sig_off as u64, (*child).sig_len,
+            (&digest[0]) as u64, halg)
+    } else {
+        good = rsa.rsa_verify_pkcs1(
+            (*parent).base + (*parent).mod_off as u64, (*parent).mod_len,
+            (*parent).base + (*parent).exp_off as u64, (*parent).exp_len,
+            (*child).base + (*child).sig_off as u64, (*child).sig_len,
+            (&digest[0]) as u64, halg)
+    }
+    if good {
+        return V_OK
+    }
+    return V_BAD_SIGNATURE
+}
+
+// ------------------------------------------------------------- The store
+
+fn store_new() -> Store {
+    return Store { blob: rt.buf_new(), off: [0; 256], len: [0; 256], n: 0 }
+}
+
+fn store_free(s: *mut Store) {
+    rt.buf_free(&(*s).blob)
+    (*s).n = 0
+}
+
+fn store_count(s: *mut Store) -> usize {
+    return (*s).n
+}
+
+fn b64_value(ch: u8) -> i32 {
+    if ch >= 65 as u8 && ch <= 90 as u8 {
+        return (ch - 65 as u8) as i32
+    }
+    if ch >= 97 as u8 && ch <= 122 as u8 {
+        return (ch - 97 as u8) as i32 + 26
+    }
+    if ch >= 48 as u8 && ch <= 57 as u8 {
+        return (ch - 48 as u8) as i32 + 52
+    }
+    if ch == 43 as u8 {
+        return 62
+    }
+    if ch == 47 as u8 {
+        return 63
+    }
+    return 0 - 1
+}
+
+// Base64 with whitespace allowed between the groups, as PEM writes it.
+// Anything else -- including a `=` that is not at the end -- is a refusal.
+fn base64_decode(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var acc: u64 = 0
+    var bits: usize = 0
+    var pad: usize = 0
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        i = i + 1
+        if ch == 10 as u8 || ch == 13 as u8 || ch == 32 as u8
+        || ch == 9 as u8 {
+            continue
+        }
+        if ch == 61 as u8 {
+            pad = pad + 1
+            continue
+        }
+        if pad > 0 {
+            return false
+        }
+        let v: i32 = b64_value(ch)
+        if v < 0 {
+            return false
+        }
+        acc = (acc << 6) | (v as u64)
+        bits = bits + 6
+        if bits >= 8 {
+            bits = bits - 8
+            rt.buf_push(out, ((acc >> (bits as u64)) & 255 as u64) as u8)
+        }
+    }
+    return pad <= 2
+}
+
+// A PEM bundle: every `-----BEGIN CERTIFICATE-----` block is decoded and
+// appended. Blocks of any other kind are skipped, so a file with a private
+// key in it does not confuse the store.
+fn store_load_pem(s: *mut Store, p: u64, n: usize) -> usize {
+    var begin: [u8; 27] = "-----BEGIN CERTIFICATE-----"
+    var end: [u8; 25] = "-----END CERTIFICATE-----"
+    var i: usize = 0
+    var taken: usize = 0
+    while i < n && (*s).n < MAX_STORE {
+        // find the next BEGIN
+        var found: bool = false
+        while i + 27 <= n {
+            var same: bool = true
+            var k: usize = 0
+            while k < 27 {
+                if rt.ld8(p, i + k) != begin[k] {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                found = true
+                break
+            }
+            i = i + 1
+        }
+        if !found {
+            break
+        }
+        let body: usize = i + 27
+        var j: usize = body
+        var stop: usize = n
+        var have_end: bool = false
+        while j + 25 <= n {
+            var same: bool = true
+            var k: usize = 0
+            while k < 25 {
+                if rt.ld8(p, j + k) != end[k] {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                stop = j
+                have_end = true
+                break
+            }
+            j = j + 1
+        }
+        if !have_end {
+            break
+        }
+        let before: usize = (*s).blob.len
+        if base64_decode(p + body as u64, stop - body, &(*s).blob) {
+            (*s).off[(*s).n] = before
+            (*s).len[(*s).n] = (*s).blob.len - before
+            (*s).n = (*s).n + 1
+            taken = taken + 1
+        } else {
+            rt.buf_set_len(&(*s).blob, before)
+        }
+        i = stop + 25
+    }
+    return taken
+}
+
+// ------------------------------------------------------------- The chain
+
+fn same_name(a: u64, ao: usize, an: usize, b: u64, bo: usize,
+    bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if rt.ld8(a, ao + i) != rt.ld8(b, bo + i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+struct VerifyResult {
+    reason: u32,
+    depth: usize, // how many links were walked
+    anchor: usize, // which root in the store ended it, when it did
+}
+
+// `certs` is the list the peer sent, `n` of them, the leaf first. `host`
+// is the name that was asked for. Returns V_OK or the FIRST reason it
+// refused -- see the head of the file for why the reason matters.
+fn verify_chain(store: *mut Store, certs: *mut [Cert; 10], n: usize,
+    host: u64, hn: usize, now: u64, out: *mut VerifyResult) -> u32 {
+    (*out).reason = V_PARSE
+    (*out).depth = 0
+    (*out).anchor = 0
+    if n == 0 || n > MAX_CHAIN {
+        return V_PARSE
+    }
+    var leaf: *mut Cert = &(*certs)[0]
+    if !(*leaf).ok {
+        return V_PARSE
+    }
+    if !cert_name_matches(leaf, host, hn) {
+        (*out).reason = V_NAME
+        return V_NAME
+    }
+    var cur: usize = 0
+    var depth: usize = 0
+    var used: [bool; 10] = [false; 10]
+    used[0] = true
+    while depth < MAX_CHAIN {
+        var child: *mut Cert = &(*certs)[cur]
+        let t: u32 = cert_time_ok(child, now)
+        if t != V_OK {
+            (*out).reason = t
+            return t
+        }
+        // is the issuer a root we already trust?
+        var ri: usize = 0
+        var found_root: bool = false
+        var root: Cert = cert_new()
+        while ri < (*store).n {
+            var cand: Cert = cert_new()
+            if cert_parse(&cand, (*store).blob.ptr + (*store).off[ri] as u64,
+                (*store).len[ri]) {
+                if same_name(cand.base, cand.subject_off, cand.subject_len,
+                    (*child).base, (*child).issuer_off,
+                    (*child).issuer_len) {
+                    root = cand
+                    found_root = true
+                    break
+                }
+            }
+            ri = ri + 1
+        }
+        if found_root {
+            if !root.is_ca && root.has_bc {
+                (*out).reason = V_NOT_CA
+                return V_NOT_CA
+            }
+            let v: u32 = verify_signature_by(child, &root)
+            if v != V_OK {
+                (*out).reason = v
+                return v
+            }
+            let rt2: u32 = cert_time_ok(&root, now)
+            if rt2 != V_OK {
+                (*out).reason = rt2
+                return rt2
+            }
+            (*out).reason = V_OK
+            (*out).depth = depth + 1
+            (*out).anchor = ri
+            return V_OK
+        }
+        // otherwise: is the issuer one of the certificates the peer sent?
+        var k: usize = 0
+        var next: usize = n
+        while k < n {
+            if !used[k] && (*certs)[k].ok {
+                if same_name((*certs)[k].base, (*certs)[k].subject_off,
+                    (*certs)[k].subject_len, (*child).base,
+                    (*child).issuer_off, (*child).issuer_len) {
+                    next = k
+                    break
+                }
+            }
+            k = k + 1
+        }
+        if next >= n {
+            (*out).reason = V_UNKNOWN_ISSUER
+            return V_UNKNOWN_ISSUER
+        }
+        var parent: *mut Cert = &(*certs)[next]
+        if !(*parent).is_ca {
+            (*out).reason = V_NOT_CA
+            return V_NOT_CA
+        }
+        let v2: u32 = verify_signature_by(child, parent)
+        if v2 != V_OK {
+            (*out).reason = v2
+            return v2
+        }
+        used[next] = true
+        cur = next
+        depth = depth + 1
+    }
+    (*out).reason = V_TOO_LONG
+    return V_TOO_LONG
+}

@@ -1,0 +1,2998 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/codegen.fi -- FROM THE FIR TO x86-64, WRITTEN IN FIRN.
+//
+// Ninth part of stage 1 and the last one before the fixpoint. With it the
+// Firn version translates a program front to back: text -> tokens -> tree ->
+// types -> FIR -> assembly.
+//
+// DELIBERATELY WITHOUT REGISTER ALLOCATION. `firnc0` has `regalloc.rs` for
+// that, with liveness analysis and coalescing; here EVERY FIR value gets its
+// own slot in the frame, and every instruction loads its operands, computes
+// and writes back. That is slow code -- but more correct, and it can be
+// followed in an afternoon. That is why the comparison does NOT run on the
+// assembly text but on the BEHAVIOUR: compile,
+// assemble, link, run, compare return value and output.
+// For a code generator that is the more honest yardstick anyway.
+//
+// FRAME: `[rbp - 8*(v+1)]` is the slot of value `%v`. Behind them sit the
+// `alloca` ranges. A value is always stored as a full 64 bit word, suitably
+// extended (sign or zero extended) -- that is why `normalize` has to run after
+// every computation.
+//
+// FLOATING POINT goes through `xmm0`/`xmm1`. An `f64` value sits in the frame
+// like any other -- as eight bytes; only the arithmetic runs through the
+// SSE instructions. There is no classification of its own at the function
+// boundary: stage 0 passes `f64` in integer registers (SPEC 14.1, a
+// deliberate deviation from System V), and this code generator does the same.
+//
+// MORE THAN SIX ARGUMENTS go on the stack as System V requires, in
+// REVERSE order. At the call `rsp` has to be 16 byte aligned -- for an
+// odd number of stack arguments a filler word is pushed in front of
+// them. The called function finds them at `[rbp+16]`, `[rbp+24]`, ...;
+// below them sit the saved return address and the saved `rbp`.
+
+import rt
+import vec
+import intern
+import fir
+import gc
+import iface
+import core
+import ast
+import sema
+
+export { Cg, cg_new, cg_free, cg_run, cg_unsuitable, cg_text, cg_gc_set,
+    cg_freestanding_set,
+    cg_if_set, cg_tree_set, cg_sema_set }
+
+const NONE: u32 = 4294967295
+
+struct Cg {
+    f: u64 // pointer to the Fir
+    it: u64 // interner
+    out: rt.Buf
+    slot: Vec[u64] // offset per value (positive, to subtract from rbp)
+    aslot: Vec[u64] // offset of the alloca range per value, 0 = none
+    frame: u64
+    unsuitable: bool
+    gcr: u64 // gc registry (round 34), 0 = no classes
+    ifr: u64 // interfaces (round 46), 0 = none
+    free: bool // ROUND 52: freestanding -- no `_start`, no exit
+    // ROUND 75 (SPEC 14.5): the AST tree, so that `sym` can look up
+    // `extern fn` / `#[link_name(...)]` / `#[export_c]` by function name --
+    // the same shape as `gcr`/`ifr` (a registry set once, read many times).
+    tr: u64,
+    // Scratch output of `extern_link_of`/`export_c_of`: the intern number
+    // to write out when either of them answers `true`. A found/not-found
+    // BOOLEAN return plus this side channel, rather than packing both into
+    // one `u32` with 0 as "not found" -- 0 is an ordinary intern number.
+    ext_out: u32,
+    // ROUND 72 (panic_rt.rs, SPEC 13 item L9): the panic messages of the
+    // checked operations, interned once each, in the order of their first
+    // appearance. The index in here IS the `.Lpanicmsg<n>` label. Empty
+    // means the program contains no checked operation at all and pays not
+    // one octet for the feature.
+    pmsg: Vec[u32]
+    // ROUND 89 (statics.rs): the type checker, so that the data section
+    // of the global variables can be written -- their finished octets live
+    // there (`sema.sema_static_*`). 0 = not registered.
+    sm: u64,
+    // ROUND 89: has this object file a bounds check in it? Only then is
+    // the second trampoline entry point written out.
+    idx_used: bool,
+    // Label counter of the CURRENT function. Value numbers restart at 0 in
+    // every function, so a label built from them alone collides across
+    // functions -- the function's own name is folded in as well.
+    site: u64
+}
+
+fn cg_new(f: u64, it: u64) -> Cg {
+    return Cg {
+        f: f, it: it,
+        out: rt.buf_new(),
+        slot: vec_new[u64](), aslot: vec_new[u64](),
+        frame: 0, unsuitable: false, gcr: 0, ifr: 0, free: false,
+        tr: 0, ext_out: 0,
+        pmsg: vec_new[u32](), site: 0, sm: 0, idx_used: false,
+    }
+}
+
+// ROUND 75 (SPEC 14.5): register the AST tree, so `sym` can resolve
+// `extern fn` / `#[export_c]` link names.
+fn cg_tree_set(c: *mut Cg, t: u64) { (*c).tr = t }
+
+// ROUND 89 (statics.rs): register the type checker -- the initial values of
+// the global variables are finished octets there.
+fn cg_sema_set(c: *mut Cg, s: u64) { (*c).sm = s }
+fn cgsm(c: *mut Cg) -> *mut sema.Sema { return (*c).sm as *mut sema.Sema }
+fn has_statics(c: *mut Cg) -> bool {
+    if (*c).sm == 0 {
+        return false
+    }
+    return sema.sema_static_count(cgsm(c)) > 0
+}
+
+// Register the gc registry (round 34): it carries size, type tag
+// and field offsets of every class -- the collector's type table grows out of it.
+fn cg_gc_set(c: *mut Cg, g: u64) { (*c).gcr = g }
+
+// ROUND 52 (SPEC 2): compile freestanding -- NO `_start`, no
+// runtime preamble, no `exit`. The result is an object file that a
+// boot loader or a linker script puts together.
+fn cg_freestanding_set(c: *mut Cg, v: bool) { (*c).free = v }
+
+// Register the interface registry (round 46): the method tables
+// in `.rodata` are built from it.
+fn cg_if_set(c: *mut Cg, f: u64) { (*c).ifr = f }
+fn ifg(c: *mut Cg) -> *mut iface.If { return (*c).ifr as *mut iface.If }
+fn has_if(c: *mut Cg) -> bool {
+    if (*c).ifr == 0 {
+        return false
+    }
+    return iface.if_has(ifg(c))
+}
+fn gcg(c: *mut Cg) -> *mut gc.Gc { return (*c).gcr as *mut gc.Gc }
+fn has_gc(c: *mut Cg) -> bool {
+    if (*c).gcr == 0 {
+        return false
+    }
+    // Round 49: even without `gc class` a program with threads needs the
+    // state block (gc.rs: `has_classes() || runtime_active()`).
+    if gc.gc_runtime(gcg(c)) != 0 as usize {
+        return true
+    }
+    return gc.gc_has_classes(gcg(c))
+}
+
+fn cg_free(c: *mut Cg) {
+    rt.buf_free(&(*c).out)
+    vec_free[u64](&(*c).slot)
+    vec_free[u64](&(*c).aslot)
+    vec_free[u32](&(*c).pmsg)
+}
+
+fn cg_unsuitable(c: *mut Cg) -> bool { return (*c).unsuitable }
+fn cg_text(c: *mut Cg) -> *mut rt.Buf { return &(*c).out }
+fn ff(c: *mut Cg) -> *mut fir.Fir { return (*c).f as *mut fir.Fir }
+fn it(c: *mut Cg) -> *mut intern.Interner { return (*c).it as *mut intern.Interner }
+
+// ------------------------------------------------------------- text output
+
+fn t(c: *mut Cg, p: u64, n: usize) {
+    rt.buf_push_bytes(&(*c).out, p, n)
+}
+
+fn nl(c: *mut Cg) {
+    rt.buf_push(&(*c).out, 10 as u8)
+}
+
+fn number(c: *mut Cg, v: u64) {
+    rt.buf_push_dec_u64(&(*c).out, v)
+}
+
+fn inum(c: *mut Cg, v: i64) {
+    rt.buf_push_dec_i64(&(*c).out, v)
+}
+
+// ROUND 75 (SPEC 14.5) -- is `nr` (an internal call/function name) an
+// `extern fn`? If so, the interned LINK NAME to write out instead (its own
+// name if `#[link_name(...)]` was not given). Returns `intern.NONE`-style
+// 0 when `nr` is not an extern declaration at all (0 can never be a valid
+// intern number -- `intern.intern_new` starts counting at 1, the same
+// convention `ast.NOTHING` relies on elsewhere in this compiler).
+// **Round 75, the intern-number-0 trap.** `intern.intern_number` hands out
+// numbers starting at 0 (`Interner.cnt` before the first insertion) -- so
+// intern number 0 is a perfectly ordinary, valid name whenever it happens
+// to be the FIRST identifier ever interned in the whole program (which it
+// very often is: `strlen` in a one-function test file, for instance). A
+// single `u32` return value with "0 means not found" is therefore UNSOUND
+// here, unlike `ast.NOTHING` (4294967295) elsewhere in this compiler, which
+// intern numbers can never collide with. `(*c).ext_found`/`(*c).ext_out`
+// carry the two pieces of information SEPARATELY instead of packing them
+// into one sentinel-prone value.
+fn extern_link_of(c: *mut Cg, nr: u32) -> bool {
+    if (*c).tr == 0 {
+        return false
+    }
+    let b: *mut ast.Tree = (*c).tr as *mut ast.Tree
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        if ast.fn_name(b, i) == nr && ast.fn_extern(b, i) != 0 {
+            // `ast.fn_link_set` (round 75) answers "was `#[link_name(...)]`
+            // written at all", SEPARATELY from the link name's own intern
+            // number -- because that number can legitimately be 0.
+            if ast.fn_link_set(b, i) {
+                (*c).ext_out = ast.fn_link(b, i)
+            } else {
+                (*c).ext_out = nr
+            }
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ROUND 75 (SPEC 14.5) -- is `nr` marked `#[export_c]`? (found/not-found,
+// same reasoning as `extern_link_of` above.)
+fn export_c_of(c: *mut Cg, nr: u32) -> bool {
+    if (*c).tr == 0 {
+        return false
+    }
+    let b: *mut ast.Tree = (*c).tr as *mut ast.Tree
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        if ast.fn_name(b, i) == nr && ast.fn_export(b, i) != 0 {
+            (*c).ext_out = nr
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Writes the RAW (unmangled) spelling of intern number `nr` -- used by both
+// escape hatches below, and nowhere else (an ordinary symbol always goes
+// through the `_F1.` prefix).
+fn sym_raw(c: *mut Cg, nr: u32) {
+    let q: u64 = intern.intern_ptr(it(c), nr)
+    let n: usize = intern.intern_length(it(c), nr)
+    rt.buf_push_bytes(&(*c).out, q, n)
+}
+
+// Symbol name of a function: prefixed with `_F1.`, so that nothing collides
+// with the operating system or with `firnc0`.
+//
+// **ROUND 75** (SPEC 14.5) -- two escape hatches from the `_F1.` scheme,
+// both resolved through the AST tree registered with `cg_tree_set`:
+//   * `nr` is an `extern fn` -- a CALLER reaches here wanting the symbol
+//     the foreign definition uses, unmangled (`#[link_name]` or the bare
+//     name).
+//   * `nr` carries `#[export_c]` -- the function itself is being emitted
+//     here and has to come out under its bare Firn name so C can call it.
+// Every other name keeps going through the `_F1.` prefix exactly as
+// before -- this is additive, nothing about the existing scheme changed.
+fn sym(c: *mut Cg, nr: u32) {
+    if extern_link_of(c, nr) {
+        sym_raw(c, (*c).ext_out)
+        return
+    }
+    if export_c_of(c, nr) {
+        sym_raw(c, (*c).ext_out)
+        return
+    }
+    var p: [u8; 4] = "_F1."
+    t(c, (&p[0]) as u64, 4)
+    // ROUND 58: the generated functions of the closures carry a `#` in their
+    // name, so that no source text can ever write them (fnval.rs). The
+    // assembler does not accept the character -- it becomes a dot, which the
+    // naming scheme uses anyway.
+    let q: u64 = intern.intern_ptr(it(c), nr)
+    let n: usize = intern.intern_length(it(c), nr)
+    var k: usize = 0
+    while k < n {
+        var ch: u8 = *((q + k as u64) as *mut u8)
+        if ch == 35 as u8 {
+            ch = 46 as u8
+        }
+        rt.buf_push(&(*c).out, ch)
+        k = k + 1
+    }
+}
+
+fn blocklabel(c: *mut Cg, fnr: u32, bb: u32) {
+    var p: [u8; 2] = ".L"
+    t(c, (&p[0]) as u64, 2)
+    sym(c, fnr)
+    var q: [u8; 4] = "__bb"
+    t(c, (&q[0]) as u64, 4)
+    number(c, bb as u64)
+}
+
+// --------------------------------------------------------- register names
+// 0=rax 1=rcx 2=rdx 3=rsi 4=rdi 5=r8 6=r9 7=r10 8=rbp 9=rsp
+const R_AX: u32 = 0
+const R_CX: u32 = 1
+const R_DX: u32 = 2
+
+fn reg64(c: *mut Cg, r: u32) {
+    var tab: [u8; 29] = "rax|rcx|rdx|rsi|rdi|r8|r9|r10"
+    piece(c, (&tab[0]) as u64, 29, r)
+}
+
+// Write field `nr` of a '|' separated table.
+fn piece(c: *mut Cg, p: u64, n: usize, nr: u32) {
+    var i: usize = 0
+    var k: u32 = 0
+    var start: usize = 0
+    while i <= n {
+        var end: bool = i == n
+        if !end {
+            end = rt.ld8(p, i) == 124 as u8
+        }
+        if end {
+            if k == nr {
+                t(c, p + start as u64, i - start)
+                return
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// Register name of width `bits` (8/16/32/64) for rax/rcx/rdx.
+fn regb(c: *mut Cg, r: u32, bits: u32) {
+    var t8: [u8; 8] = "al|cl|dl"
+    var t16: [u8; 8] = "ax|cx|dx"
+    var t32: [u8; 11] = "eax|ecx|edx"
+    if bits == 8 {
+        piece(c, (&t8[0]) as u64, 8, r)
+        return
+    }
+    if bits == 16 {
+        piece(c, (&t16[0]) as u64, 8, r)
+        return
+    }
+    if bits == 32 {
+        piece(c, (&t32[0]) as u64, 11, r)
+        return
+    }
+    reg64(c, r)
+}
+
+fn word_size(c: *mut Cg, bits: u32) {
+    var b: [u8; 5] = "byte "
+    var w: [u8; 5] = "word "
+    var d: [u8; 6] = "dword "
+    var q: [u8; 6] = "qword "
+    if bits == 8 {
+        t(c, (&b[0]) as u64, 5)
+        return
+    }
+    if bits == 16 {
+        t(c, (&w[0]) as u64, 5)
+        return
+    }
+    if bits == 32 {
+        t(c, (&d[0]) as u64, 6)
+        return
+    }
+    t(c, (&q[0]) as u64, 6)
+}
+
+// `  ` at the start of the line
+fn ins(c: *mut Cg) {
+    var s: [u8; 4] = "    "
+    t(c, (&s[0]) as u64, 4)
+}
+
+fn w(c: *mut Cg, p: u64, n: usize) {
+    t(c, p, n)
+}
+
+// `mov <reg>, qword ptr [rbp-<off>]`
+fn load_slot(c: *mut Cg, r: u32, off: u64) {
+    ins(c)
+    var m: [u8; 4] = "mov "
+    w(c, (&m[0]) as u64, 4)
+    reg64(c, r)
+    var s: [u8; 17] = ", qword ptr [rbp-"
+    w(c, (&s[0]) as u64, 17)
+    number(c, off)
+    var e: [u8; 1] = "]"
+    w(c, (&e[0]) as u64, 1)
+    nl(c)
+}
+
+fn store_slot(c: *mut Cg, off: u64, r: u32) {
+    ins(c)
+    var m: [u8; 19] = "mov qword ptr [rbp-"
+    w(c, (&m[0]) as u64, 19)
+    number(c, off)
+    var s: [u8; 3] = "], "
+    w(c, (&s[0]) as u64, 3)
+    reg64(c, r)
+    nl(c)
+}
+
+fn slot_of(c: *mut Cg, v: u32) -> u64 {
+    return vec_at[u64](&(*c).slot, v as usize)
+}
+
+fn load_value(c: *mut Cg, r: u32, v: u32) {
+    load_slot(c, r, slot_of(c, v))
+}
+
+// A value is always held in the frame as a full 64 bit word, suitably extended.
+// That has to be restored after every computation.
+fn normalize(c: *mut Cg, r: u32, ty: u32) {
+    let bits: u32 = fir.fty_bits(ty)
+    if bits >= 64 || bits == 0 {
+        return
+    }
+    let sign: bool = ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32
+    if bits == 32 && !sign {
+        // `movzx r64, r/m32` does not exist -- a `mov exx, exx` zeroes the
+        // upper 32 bit by itself.
+        ins(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        regb(c, r, 32)
+        var k: [u8; 2] = ", "
+        w(c, (&k[0]) as u64, 2)
+        regb(c, r, 32)
+        nl(c)
+        return
+    }
+    ins(c)
+    if sign {
+        var m2: [u8; 6] = "movsx "
+        w(c, (&m2[0]) as u64, 6)
+    } else {
+        var m3: [u8; 6] = "movzx "
+        w(c, (&m3[0]) as u64, 6)
+    }
+    reg64(c, r)
+    var k2: [u8; 2] = ", "
+    w(c, (&k2[0]) as u64, 2)
+    regb(c, r, bits)
+    nl(c)
+}
+
+// A simple instruction with two register operands: `<op> <a>, <b>`
+fn op2(c: *mut Cg, name: u64, n: usize, a: u32, b: u32) {
+    ins(c)
+    w(c, name, n)
+    var s: [u8; 1] = " "
+    w(c, (&s[0]) as u64, 1)
+    reg64(c, a)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    reg64(c, b)
+    nl(c)
+}
+
+fn op1(c: *mut Cg, name: u64, n: usize, a: u32) {
+    ins(c)
+    w(c, name, n)
+    var s: [u8; 1] = " "
+    w(c, (&s[0]) as u64, 1)
+    reg64(c, a)
+    nl(c)
+}
+
+fn raw(c: *mut Cg, p: u64, n: usize) {
+    ins(c)
+    w(c, p, n)
+    nl(c)
+}
+
+// ------------------------------------------------------------- instructions
+
+fn is_sign(ty: u32) -> bool {
+    return ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32 || ty == fir.T_I64
+}
+
+// `movsd xmm<n>, qword ptr [rbp-<off>]`, or `movss` for a binary32.
+// ROUND 71: `movss` loads FOUR bytes and zeroes the rest of the register --
+// so what stands there is exactly the bit pattern and nothing else.
+fn load_xmm_w(c: *mut Cg, n: u32, v: u32, single: bool) {
+    ins(c)
+    if single {
+        var m1: [u8; 9] = "movss xmm"
+        w(c, (&m1[0]) as u64, 9)
+        number(c, n as u64)
+        var s1: [u8; 17] = ", dword ptr [rbp-"
+        w(c, (&s1[0]) as u64, 17)
+        number(c, slot_of(c, v))
+        var e1: [u8; 1] = "]"
+        w(c, (&e1[0]) as u64, 1)
+        nl(c)
+        return
+    }
+    var m: [u8; 9] = "movsd xmm"
+    w(c, (&m[0]) as u64, 9)
+    number(c, n as u64)
+    var s: [u8; 17] = ", qword ptr [rbp-"
+    w(c, (&s[0]) as u64, 17)
+    number(c, slot_of(c, v))
+    var e: [u8; 1] = "]"
+    w(c, (&e[0]) as u64, 1)
+    nl(c)
+}
+
+fn load_xmm(c: *mut Cg, n: u32, v: u32) {
+    load_xmm_w(c, n, v, false)
+}
+
+// The way back. For an `f32` through `movd`/`eax`: that zeroes the upper
+// half of the word, so the slot holds a DEFINED value and not the leftovers
+// of an earlier instruction.
+fn store_xmm_w(c: *mut Cg, off: u64, n: u32, single: bool) {
+    if single {
+        ins(c)
+        var d1: [u8; 13] = "movd eax, xmm"
+        w(c, (&d1[0]) as u64, 13)
+        number(c, n as u64)
+        nl(c)
+        store_slot(c, off, R_AX)
+        return
+    }
+    ins(c)
+    var m: [u8; 21] = "movsd qword ptr [rbp-"
+    w(c, (&m[0]) as u64, 21)
+    number(c, off)
+    var s: [u8; 6] = "], xmm"
+    w(c, (&s[0]) as u64, 6)
+    number(c, n as u64)
+    nl(c)
+}
+
+fn store_xmm(c: *mut Cg, off: u64, n: u32) {
+    store_xmm_w(c, off, n, false)
+}
+
+fn emit_bin_float(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    if op > 3 {
+        // `%` and the bit operations are undefined for floating point --
+        // the type checker does not let them through at all.
+        (*c).unsuitable = true
+        return
+    }
+    let single: bool = ty == fir.T_F32
+    load_xmm_w(c, 0, a, single)
+    load_xmm_w(c, 1, b, single)
+    ins(c)
+    // ROUND 71: the scalar single instructions sit right next to the double
+    // ones -- same encoding family, one letter apart.
+    if single {
+        var t2: [u8; 23] = "addss|subss|mulss|divss"
+        piece(c, (&t2[0]) as u64, 23, op)
+    } else {
+        var tab: [u8; 23] = "addsd|subsd|mulsd|divsd"
+        piece(c, (&tab[0]) as u64, 23, op)
+    }
+    var r: [u8; 11] = " xmm0, xmm1"
+    w(c, (&r[0]) as u64, 11)
+    nl(c)
+    store_xmm_w(c, slot_of(c, dst), 0, single)
+}
+
+// Comparison of two `f64`. `comisd` sets the flags like an
+// UNSIGNED comparison, and NaN sets PF as well. Under IEEE-754 every
+// comparison with NaN is false -- except `!=`, which has to be true.
+fn emit_cmp_float(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    let single: bool = ty == fir.T_F32
+    load_xmm_w(c, 0, a, single)
+    load_xmm_w(c, 1, b, single)
+    if single {
+        var cs: [u8; 17] = "comiss xmm0, xmm1"
+        raw(c, (&cs[0]) as u64, 17)
+    } else {
+        var cm: [u8; 17] = "comisd xmm0, xmm1"
+        raw(c, (&cm[0]) as u64, 17)
+    }
+    ins(c)
+    var set: [u8; 3] = "set"
+    w(c, (&set[0]) as u64, 3)
+    var names: [u8; 14] = "e|ne|b|be|a|ae"
+    piece(c, (&names[0]) as u64, 14, op)
+    var al: [u8; 3] = " al"
+    w(c, (&al[0]) as u64, 3)
+    nl(c)
+    // NaN: PF is set. For `==` the result then has to be 0, for `!=`
+    // it has to be 1, for the four ordering comparisons 0.
+    if op == 1 {
+        var sp: [u8; 7] = "setp cl"
+        raw(c, (&sp[0]) as u64, 7)
+        var o: [u8; 9] = "or al, cl"
+        raw(c, (&o[0]) as u64, 9)
+    } else {
+        var snp: [u8; 8] = "setnp cl"
+        raw(c, (&snp[0]) as u64, 8)
+        var an: [u8; 10] = "and al, cl"
+        raw(c, (&an[0]) as u64, 10)
+    }
+    var mz: [u8; 13] = "movzx rax, al"
+    raw(c, (&mz[0]) as u64, 13)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    if fir.is_float_ty(ty) {
+        emit_bin_float(c, ty, op, a, b, dst)
+        return
+    }
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    if op == 0 {
+        var n: [u8; 3] = "add"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+    else if op == 1 {
+        var n: [u8; 3] = "sub"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+    else if op == 2 {
+        var n: [u8; 4] = "imul"
+        op2(c, (&n[0]) as u64, 4, R_AX, R_CX)
+    }
+    else if op == 3 || op == 4 {
+        // Division and remainder: `idiv`/`div` divide rdx:rax.
+        if is_sign(ty) {
+            var q: [u8; 3] = "cqo"
+            raw(c, (&q[0]) as u64, 3)
+            var d: [u8; 4] = "idiv"
+            op1(c, (&d[0]) as u64, 4, R_CX)
+        } else {
+            var z: [u8; 12] = "xor edx, edx"
+            raw(c, (&z[0]) as u64, 12)
+            var d2: [u8; 3] = "div"
+            op1(c, (&d2[0]) as u64, 3, R_CX)
+        }
+        if op == 4 {
+            var m: [u8; 12] = "mov rax, rdx"
+            raw(c, (&m[0]) as u64, 12)
+        }
+    }
+    else if op == 5 {
+        var n: [u8; 3] = "and"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+    else if op == 6 {
+        var n: [u8; 2] = "or"
+        op2(c, (&n[0]) as u64, 2, R_AX, R_CX)
+    }
+    else if op == 7 {
+        var n: [u8; 3] = "xor"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+    else if op == 8 {
+        var n: [u8; 11] = "shl rax, cl"
+        raw(c, (&n[0]) as u64, 11)
+    }
+    else {
+        if is_sign(ty) {
+            var n: [u8; 11] = "sar rax, cl"
+            raw(c, (&n[0]) as u64, 11)
+        } else {
+            var n2: [u8; 11] = "shr rax, cl"
+            raw(c, (&n2[0]) as u64, 11)
+        }
+    }
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_cmp(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    if fir.is_float_ty(ty) {
+        emit_cmp_float(c, ty, op, a, b, dst)
+        return
+    }
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    var cm: [u8; 3] = "cmp"
+    op2(c, (&cm[0]) as u64, 3, R_AX, R_CX)
+    ins(c)
+    var set: [u8; 3] = "set"
+    w(c, (&set[0]) as u64, 3)
+    // eq ne lt le gt ge -- signed or unsigned
+    var vz: [u8; 14] = "e|ne|l|le|g|ge"
+    var oz: [u8; 14] = "e|ne|b|be|a|ae"
+    if is_sign(ty) {
+        piece(c, (&vz[0]) as u64, 14, op)
+    } else {
+        piece(c, (&oz[0]) as u64, 14, op)
+    }
+    var al: [u8; 3] = " al"
+    w(c, (&al[0]) as u64, 3)
+    nl(c)
+    var mz: [u8; 13] = "movzx rax, al"
+    raw(c, (&mz[0]) as u64, 13)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_const(c: *mut Cg, ty: u32, raw_value: u64, dst: u32) {
+    ins(c)
+    var m: [u8; 7] = "movabs "
+    w(c, (&m[0]) as u64, 7)
+    reg64(c, R_AX)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    if is_sign(ty) {
+        inum(c, raw_value as i64)
+    } else {
+        number(c, raw_value)
+    }
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// Memory access: `mov <reg>, <size> ptr [rax]` and the other way round.
+fn emit_load(c: *mut Cg, ty: u32, addr: u32, dst: u32) {
+    load_value(c, R_AX, addr)
+    let bits: u32 = fir.fty_bits(ty)
+    ins(c)
+    if bits >= 64 {
+        var m: [u8; 24] = "mov rax, qword ptr [rax]"
+        w(c, (&m[0]) as u64, 24)
+    } else {
+        if is_sign(ty) {
+            var m2: [u8; 6] = "movsx "
+            w(c, (&m2[0]) as u64, 6)
+        } else {
+            var m3: [u8; 6] = "movzx "
+            w(c, (&m3[0]) as u64, 6)
+        }
+        if bits == 32 && !is_sign(ty) {
+            // the special case again: `mov eax, dword ptr [rax]`
+            rt.buf_set_len(&(*c).out, rt.buf_len(&(*c).out) - 6)
+            var m4: [u8; 4] = "mov "
+            w(c, (&m4[0]) as u64, 4)
+            regb(c, R_AX, 32)
+        } else {
+            reg64(c, R_AX)
+        }
+        var k: [u8; 2] = ", "
+        w(c, (&k[0]) as u64, 2)
+        word_size(c, bits)
+        var p: [u8; 9] = "ptr [rax]"
+        w(c, (&p[0]) as u64, 9)
+    }
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_store(c: *mut Cg, ty: u32, addr: u32, val: u32) {
+    load_value(c, R_AX, addr)
+    load_value(c, R_CX, val)
+    let bits: u32 = fir.fty_bits(ty)
+    ins(c)
+    var m: [u8; 4] = "mov "
+    w(c, (&m[0]) as u64, 4)
+    word_size(c, bits)
+    var p: [u8; 11] = "ptr [rax], "
+    w(c, (&p[0]) as u64, 11)
+    regb(c, R_CX, bits)
+    nl(c)
+}
+
+// --------------------------------------------------------- frame and blocks
+
+fn round_up(v: u64, on: u64) -> u64 {
+    let r: u64 = v % on
+    if r == 0 { return v }
+    return v + on - r
+}
+
+// Creates a slot for every value and after them the `alloca` ranges.
+fn frame_build(c: *mut Cg, fnr: u32) {
+    let f: *mut fir.Fir = ff(c)
+    let n: u32 = fir.value_count(f, fnr)
+    vec_clear[u64](&(*c).slot)
+    vec_clear[u64](&(*c).aslot)
+    var cursor: u64 = 0
+    var v: u32 = 0
+    while v < n {
+        cursor = cursor + 8
+        vec_push[u64](&(*c).slot, cursor)
+        vec_push[u64](&(*c).aslot, 0)
+        v = v + 1
+    }
+    // Only the entry block contains `alloca` -- that is a guarantee of the
+    // FIR, and it is relied on here.
+    let bb0: u32 = 0
+    var k: u32 = 0
+    while k < fir.inst_count(f, fnr, bb0) {
+        let i: u32 = fir.inst_at(f, fnr, bb0, k)
+        if fir.i_kind_of(f, i) == fir.O_ALLOCA {
+            var au: u64 = fir.i_alen_of(f, i) as u64
+            if au == 0 { au = 1 }
+            if au > 16 { au = 16 }
+            var gr: u64 = fir.i_number_of(f, i)
+            if gr < 1 { gr = 1 }
+            cursor = round_up(cursor + gr, au)
+            vec_set[u64](&(*c).aslot, fir.i_dst_of(f, i) as usize, cursor)
+        }
+        k = k + 1
+    }
+    (*c).frame = round_up(cursor, 16)
+}
+
+fn emit_alloca(c: *mut Cg, dst: u32) {
+    ins(c)
+    var m: [u8; 14] = "lea rax, [rbp-"
+    w(c, (&m[0]) as u64, 14)
+    number(c, vec_at[u64](&(*c).aslot, dst as usize))
+    var e: [u8; 1] = "]"
+    w(c, (&e[0]) as u64, 1)
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_ptradd(c: *mut Cg, base: u32, off: u32, dst: u32) {
+    load_value(c, R_AX, base)
+    load_value(c, R_CX, off)
+    var a: [u8; 3] = "add"
+    op2(c, (&a[0]) as u64, 3, R_AX, R_CX)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32) {
+    if fir.is_float_ty(of) && fir.is_float_ty(after) {
+        if of == after {
+            load_value(c, R_AX, src)
+            store_slot(c, slot_of(c, dst), R_AX)
+            return
+        }
+        // ROUND 71: the two widths among each other. Neither direction is a
+        // reinterpretation -- `cvtsd2ss` really rounds.
+        load_xmm_w(c, 0, src, of == fir.T_F32)
+        if after == fir.T_F64 {
+            var u1: [u8; 19] = "cvtss2sd xmm0, xmm0"
+            raw(c, (&u1[0]) as u64, 19)
+        } else {
+            var u2: [u8; 19] = "cvtsd2ss xmm0, xmm0"
+            raw(c, (&u2[0]) as u64, 19)
+        }
+        store_xmm_w(c, slot_of(c, dst), 0, after == fir.T_F32)
+        return
+    }
+    if after == fir.T_F32 {
+        // Integer -> f32, the same reservation as with `cvtsi2sd`.
+        load_value(c, R_AX, src)
+        var c3: [u8; 18] = "cvtsi2ss xmm0, rax"
+        raw(c, (&c3[0]) as u64, 18)
+        store_xmm_w(c, slot_of(c, dst), 0, true)
+        return
+    }
+    if of == fir.T_F32 {
+        // f32 -> integer, truncating toward zero (as in C).
+        load_xmm_w(c, 0, src, true)
+        var c4: [u8; 19] = "cvttss2si rax, xmm0"
+        raw(c, (&c4[0]) as u64, 19)
+        normalize(c, R_AX, after)
+        store_slot(c, slot_of(c, dst), R_AX)
+        return
+    }
+    if after == fir.T_F64 {
+        // Integer -> f64. `cvtsi2sd` computes SIGNED; the value
+        // is already stored suitably extended in the frame, so this holds
+        // for unsigned types up to 2^63 too.
+        load_value(c, R_AX, src)
+        var cv: [u8; 18] = "cvtsi2sd xmm0, rax"
+        raw(c, (&cv[0]) as u64, 18)
+        store_xmm(c, slot_of(c, dst), 0)
+        return
+    }
+    if of == fir.T_F64 {
+        // f64 -> integer, truncating toward zero (as in C).
+        load_xmm(c, 0, src)
+        var cv2: [u8; 19] = "cvttsd2si rax, xmm0"
+        raw(c, (&cv2[0]) as u64, 19)
+        normalize(c, R_AX, after)
+        store_slot(c, slot_of(c, dst), R_AX)
+        return
+    }
+    load_value(c, R_AX, src)
+    normalize(c, R_AX, after)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_un(c: *mut Cg, ty: u32, op: u32, a: u32, dst: u32) {
+    if fir.is_float_ty(ty) {
+        // ROUND 68: `-x` on a floating point value flips exactly the SIGN
+        // BIT. `neg` would read the whole bit pattern as two's complement --
+        // and `-0.0` would be the first thing to come out wrong. `!`/`~` do
+        // not exist for floating point; the type checker refuses them.
+        if op != 0 {
+            (*c).unsuitable = true
+            return
+        }
+        load_value(c, R_AX, a)
+        if ty == fir.T_F32 {
+            // ROUND 71: for a binary32 the sign is bit 31. The 32 bit `xor`
+            // zeroes the upper half of `rax` by itself.
+            var m3: [u8; 20] = "mov ecx, -2147483648"
+            raw(c, (&m3[0]) as u64, 20)
+            var x3: [u8; 12] = "xor eax, ecx"
+            raw(c, (&x3[0]) as u64, 12)
+        } else {
+            var mv: [u8; 29] = "mov rcx, -9223372036854775808"
+            raw(c, (&mv[0]) as u64, 29)
+            var xo: [u8; 12] = "xor rax, rcx"
+            raw(c, (&xo[0]) as u64, 12)
+        }
+        store_slot(c, slot_of(c, dst), R_AX)
+        return
+    }
+    load_value(c, R_AX, a)
+    if op == 0 {
+        var n: [u8; 3] = "neg"
+        op1(c, (&n[0]) as u64, 3, R_AX)
+    } else {
+        if ty == fir.T_BOOL {
+            var x: [u8; 10] = "xor eax, 1"
+            raw(c, (&x[0]) as u64, 10)
+        } else {
+            var n2: [u8; 3] = "not"
+            op1(c, (&n2[0]) as u64, 3, R_AX)
+        }
+    }
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// The argument registers of System V.
+fn argreg(c: *mut Cg, k: u32) {
+    var tab: [u8; 21] = "rdi|rsi|rdx|rcx|r8|r9"
+    piece(c, (&tab[0]) as u64, 21, k)
+}
+
+// ROUND 71 (codegen_x86.rs::place_args) -- WHERE does argument number `k`
+// sit?
+//
+// System V hands out two register files independently of each other:
+// integer words go to `rdi, rsi, rdx, rcx, r8, r9`, floating point words to
+// `xmm0`-`xmm7`. Anything for which no register of ITS class is left travels
+// on the stack. The FIR type of the argument decides the class, and nothing
+// else -- that is what makes a `{ f32, f32 }` land in `xmm0` all by itself.
+fn arg_is_sse(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> bool {
+    return fir.is_float_ty(fir.val_ty(f, fnr, fir.arg_at(f, aoff + k)))
+}
+
+fn arg_is_single(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> bool {
+    return fir.val_ty(f, fnr, fir.arg_at(f, aoff + k)) == fir.T_F32
+}
+
+// How many of the arguments before `k` belong to the SSE class?
+fn sse_before(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> u32 {
+    var n: u32 = 0
+    var j: u32 = 0
+    while j < k {
+        if arg_is_sse(f, fnr, aoff, j) {
+            n = n + 1
+        }
+        j = j + 1
+    }
+    return n
+}
+
+// Number of the register within its class, or NONE for the stack.
+fn arg_regnum(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> u32 {
+    let sn: u32 = sse_before(f, fnr, aoff, k)
+    if arg_is_sse(f, fnr, aoff, k) {
+        if sn < 8 {
+            return sn
+        }
+        return fir.NONE
+    }
+    let inr: u32 = k - sn
+    if inr < 6 {
+        return inr
+    }
+    return fir.NONE
+}
+
+// How many arguments end up on the stack in all?
+fn stack_args(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) -> u32 {
+    var n: u32 = 0
+    var j: u32 = 0
+    while j < alen {
+        if arg_regnum(f, fnr, aoff, j) == fir.NONE {
+            n = n + 1
+        }
+        j = j + 1
+    }
+    return n
+}
+
+// The stack arguments in REVERSE order, so that the first of them ends up
+// at [rsp+0] after the pushes.
+fn push_stack_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) {
+    var j: u32 = alen
+    while j > 0 {
+        j = j - 1
+        if arg_regnum(f, fnr, aoff, j) != fir.NONE {
+            continue
+        }
+        ins(c)
+        var m: [u8; 20] = "push qword ptr [rbp-"
+        w(c, (&m[0]) as u64, 20)
+        number(c, slot_of(c, fir.arg_at(f, aoff + j)))
+        var e: [u8; 1] = "]"
+        w(c, (&e[0]) as u64, 1)
+        nl(c)
+    }
+}
+
+// The arguments that DO get a register. SSE first, so that `rax`, which
+// `store_xmm_w` uses as a ferry, cannot overwrite an integer argument that
+// is already in place.
+fn load_reg_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) {
+    var k: u32 = 0
+    while k < alen {
+        let r: u32 = arg_regnum(f, fnr, aoff, k)
+        if r != fir.NONE && arg_is_sse(f, fnr, aoff, k) {
+            load_xmm_w(c, r, fir.arg_at(f, aoff + k), arg_is_single(f, fnr, aoff, k))
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < alen {
+        let r2: u32 = arg_regnum(f, fnr, aoff, k)
+        if r2 != fir.NONE && !arg_is_sse(f, fnr, aoff, k) {
+            ins(c)
+            var m: [u8; 4] = "mov "
+            w(c, (&m[0]) as u64, 4)
+            argreg(c, r2)
+            var s: [u8; 17] = ", qword ptr [rbp-"
+            w(c, (&s[0]) as u64, 17)
+            number(c, slot_of(c, fir.arg_at(f, aoff + k)))
+            var e: [u8; 1] = "]"
+            w(c, (&e[0]) as u64, 1)
+            nl(c)
+        }
+        k = k + 1
+    }
+}
+
+// The result of a call: `rax`, or `xmm0` for a floating point type.
+fn call_result(c: *mut Cg, ty: u32, dst: u32) {
+    if fir.is_float_ty(ty) {
+        store_xmm_w(c, slot_of(c, dst), 0, ty == fir.T_F32)
+        return
+    }
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
+    let aoff: u32 = fir.i_aoff_of(f, i)
+    let alen: u32 = fir.i_alen_of(f, i)
+    // Stack arguments: push them in reverse, with a filler word in front if needed.
+    let stack: u32 = stack_args(f, fnr, aoff, alen)
+    var fill: u32 = 0
+    if stack % 2 == 1 {
+        fill = 1
+        var sp: [u8; 10] = "sub rsp, 8"
+        raw(c, (&sp[0]) as u64, 10)
+    }
+    push_stack_args(c, f, fnr, aoff, alen)
+    load_reg_args(c, f, fnr, aoff, alen)
+    ins(c)
+    var cl: [u8; 5] = "call "
+    w(c, (&cl[0]) as u64, 5)
+    sym(c, fir.i_a_of(f, i))
+    nl(c)
+    if stack + fill > 0 {
+        ins(c)
+        var ad: [u8; 9] = "add rsp, "
+        w(c, (&ad[0]) as u64, 9)
+        number(c, (stack + fill) as u64 * 8)
+        nl(c)
+    }
+    let dst: u32 = fir.i_dst_of(f, i)
+    if dst != fir.NONE {
+        call_result(c, fir.i_ty_of(f, i), dst)
+    }
+}
+
+// Dynamic dispatch (iface.rs, round 46): like `emit_call`, only the
+// target sits in a value instead of in a symbol. It is loaded LAST into
+// `rax` -- here `rax` is pure scratch and not an argument register.
+fn emit_calli(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
+    let aoff: u32 = fir.i_aoff_of(f, i)
+    let alen: u32 = fir.i_alen_of(f, i)
+    let stack: u32 = stack_args(f, fnr, aoff, alen)
+    var fill: u32 = 0
+    if stack % 2 == 1 {
+        fill = 1
+        var sp: [u8; 10] = "sub rsp, 8"
+        raw(c, (&sp[0]) as u64, 10)
+    }
+    push_stack_args(c, f, fnr, aoff, alen)
+    load_reg_args(c, f, fnr, aoff, alen)
+    load_slot(c, R_AX, slot_of(c, fir.i_a_of(f, i)))
+    var cl: [u8; 8] = "call rax"
+    raw(c, (&cl[0]) as u64, 8)
+    if stack + fill > 0 {
+        ins(c)
+        var ad: [u8; 9] = "add rsp, "
+        w(c, (&ad[0]) as u64, 9)
+        number(c, (stack + fill) as u64 * 8)
+        nl(c)
+    }
+    let dst: u32 = fir.i_dst_of(f, i)
+    if dst != fir.NONE {
+        call_result(c, fir.i_ty_of(f, i), dst)
+    }
+}
+
+// Address of a method table: `lea rax, [rip + .L__iface.<I>.<T>]`.
+fn emit_vtab(c: *mut Cg, iname: u32, tname: u32, dst: u32) {
+    ins(c)
+    var le: [u8; 20] = "lea rax, [rip + .L__"
+    w(c, (&le[0]) as u64, 20)
+    var ifw: [u8; 6] = "iface."
+    w(c, (&ifw[0]) as u64, 6)
+    rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), iname),
+        intern.intern_length(it(c), iname))
+    rt.buf_push(&(*c).out, 46 as u8)
+    rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), tname),
+        intern.intern_length(it(c), tname))
+    var too: [u8; 1] = "]"
+    w(c, (&too[0]) as u64, 1)
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 58 (fnval.rs): a named function AS A VALUE -- the address of its
+// function record.
+fn emit_fnref(c: *mut Cg, nr: u32, dst: u32) {
+    ins(c)
+    var le: [u8; 20] = "lea rax, [rip + .L__"
+    w(c, (&le[0]) as u64, 20)
+    var fw: [u8; 4] = "fnv."
+    w(c, (&fw[0]) as u64, 4)
+    sym(c, nr)
+    var too: [u8; 1] = "]"
+    w(c, (&too[0]) as u64, 1)
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 89 (statics.rs) -- `.Lstatic_<name>`.
+fn static_label(c: *mut Cg, nr: u32) {
+    var p: [u8; 8] = ".Lstatic"
+    t(c, (&p[0]) as u64, 8)
+    rt.buf_push(&(*c).out, 95 as u8)
+    let q: u64 = intern.intern_ptr(it(c), nr)
+    let n: usize = intern.intern_length(it(c), nr)
+    var k: usize = 0
+    while k < n {
+        var ch: u8 = rt.ld8(q, k)
+        if ch == 35 as u8 {
+            ch = 46 as u8
+        }
+        rt.buf_push(&(*c).out, ch)
+        k = k + 1
+    }
+}
+
+// The address of a global variable -- a link time constant, exactly like a
+// function record (round 89, SPEC 14.1.statics).
+fn emit_global(c: *mut Cg, nr: u32, dst: u32) {
+    ins(c)
+    var le: [u8; 16] = "lea rax, [rip + "
+    w(c, (&le[0]) as u64, 16)
+    static_label(c, nr)
+    rt.buf_push(&(*c).out, 93 as u8)
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// The DATA SECTION of the global variables (round 89, SPEC 14.1.statics).
+//
+//   `mut` and all zero  -> `.bss`     (`.zero n`, no space in the file)
+//   `mut` and a value   -> `.data`
+//   without `mut`       -> `.rodata`  (the loader maps it read-only)
+//
+// An immutable all-zero `static` deliberately does NOT go to `.bss`:
+// `.bss` is writable, and putting a value there that the program promised
+// not to change would give away the guarantee the missing `mut` buys.
+fn statics_data(c: *mut Cg) {
+    let s: *mut sema.Sema = cgsm(c)
+    var i: usize = 0
+    while i < sema.sema_static_count(s) {
+        let p: u64 = sema.sema_static_bytes(s, i)
+        let n: usize = sema.sema_static_size(s, i)
+        var zero: bool = true
+        var k: usize = 0
+        while k < n {
+            if rt.ld8(p, k) != 0 as u8 {
+                zero = false
+            }
+            k = k + 1
+        }
+        let writable: bool = sema.sema_static_mut(s, i)
+        if !writable {
+            var sr: [u8; 17] = ".section .rodata\n"
+            t(c, (&sr[0]) as u64, 17)
+        } else if zero {
+            var sb: [u8; 27] = ".section .bss,\"aw\",@nobits\n"
+            t(c, (&sb[0]) as u64, 27)
+        } else {
+            var sd: [u8; 15] = ".section .data\n"
+            t(c, (&sd[0]) as u64, 15)
+        }
+        var al: [u8; 13] = "    .p2align "
+        t(c, (&al[0]) as u64, 13)
+        var a: u64 = sema.sema_static_align(s, i)
+        var e: u64 = 0
+        var v: u64 = 1
+        while v < a && e < 16 {
+            v = v * 2
+            e = e + 1
+        }
+        number(c, e)
+        nl(c)
+        static_label(c, sema.sema_static_name(s, i))
+        rt.buf_push(&(*c).out, 58 as u8)
+        nl(c)
+        if writable && zero {
+            var zw: [u8; 10] = "    .zero "
+            t(c, (&zw[0]) as u64, 10)
+            var nn: usize = n
+            if nn == 0 { nn = 1 }
+            number(c, nn as u64)
+            nl(c)
+        } else if n == 0 {
+            var zw2: [u8; 12] = "    .zero 1\n"
+            t(c, (&zw2[0]) as u64, 12)
+        } else {
+            var q: usize = 0
+            while q < n {
+                var bw: [u8; 10] = "    .byte "
+                t(c, (&bw[0]) as u64, 10)
+                var col: usize = 0
+                while col < 16 && q < n {
+                    if col > 0 {
+                        var cm: [u8; 2] = ", "
+                        t(c, (&cm[0]) as u64, 2)
+                    }
+                    number(c, rt.ld8(p, q) as u64)
+                    col = col + 1
+                    q = q + 1
+                }
+                nl(c)
+            }
+        }
+        i = i + 1
+    }
+    var tx: [u8; 6] = ".text\n"
+    t(c, (&tx[0]) as u64, 6)
+}
+
+// The FUNCTION RECORDS (`.rodata`, round 58). One word per function that is
+// taken as a value somewhere: the address of its machine code. Which ones
+// those are is read off the FIR itself -- every `O_FNREF` names one -- so
+// no side table is needed between lowering and code generation.
+fn fnval_records(c: *mut Cg) {
+    let f: *mut fir.Fir = ff(c)
+    var names: Vec[u32] = vec_new[u32]()
+    var fi: u32 = 0
+    while fi < fir.fn_count(f) as u32 {
+        var bb: u32 = 0
+        while bb < fir.block_count(f, fi) {
+            var n: u32 = 0
+            while n < fir.inst_count(f, fi, bb) {
+                let i: u32 = fir.inst_at(f, fi, bb, n)
+                if fir.i_kind_of(f, i) == fir.O_FNREF {
+                    let nr: u32 = fir.i_a_of(f, i)
+                    var seen: bool = false
+                    var q: usize = 0
+                    while q < vec_len[u32](&names) {
+                        if vec_at[u32](&names, q) == nr {
+                            seen = true
+                        }
+                        q = q + 1
+                    }
+                    if !seen {
+                        vec_push[u32](&names, nr)
+                    }
+                }
+                n = n + 1
+            }
+            bb = bb + 1
+        }
+        fi = fi + 1
+    }
+    if vec_len[u32](&names) == 0 {
+        vec_free[u32](&names)
+        return
+    }
+    var sec: [u8; 16] = ".section .rodata"
+    t(c, (&sec[0]) as u64, 16)
+    nl(c)
+    var al: [u8; 8] = ".align 8"
+    t(c, (&al[0]) as u64, 8)
+    nl(c)
+    var q2: usize = 0
+    while q2 < vec_len[u32](&names) {
+        let nr: u32 = vec_at[u32](&names, q2)
+        var lb: [u8; 8] = ".L__fnv."
+        t(c, (&lb[0]) as u64, 8)
+        sym(c, nr)
+        rt.buf_push(&(*c).out, 58 as u8)
+        nl(c)
+        ins(c)
+        var qd: [u8; 6] = ".quad "
+        w(c, (&qd[0]) as u64, 6)
+        sym(c, nr)
+        nl(c)
+        q2 = q2 + 1
+    }
+    vec_free[u32](&names)
+}
+
+// The method tables (`.rodata`) -- one per complete implementation. The
+// format is defined in iface.rs (`tables_asm`): pointers to the methods, in
+// the order of the interface.
+fn if_tables(c: *mut Cg) {
+    let g: *mut iface.If = ifg(c)
+    var da: bool = false
+    var u: usize = 0
+    while u < iface.if_u_count(g) {
+        if iface.if_u_ok(g, u) && iface.if_u_sidx(g, u) != NONE {
+            da = true
+        }
+        u = u + 1
+    }
+    if !da {
+        return
+    }
+    var sec: [u8; 16] = ".section .rodata"
+    t(c, (&sec[0]) as u64, 16)
+    nl(c)
+    var al: [u8; 8] = ".align 8"
+    t(c, (&al[0]) as u64, 8)
+    nl(c)
+    u = 0
+    while u < iface.if_u_count(g) {
+        // A table exists only per STRUCT implementation. For a primitive type
+        // (round 50) there would be no `dyn` value that could use it.
+        if iface.if_u_ok(g, u) && iface.if_u_sidx(g, u) != NONE {
+            let iname: u32 = iface.if_u_if(g, u)
+            let pfx: u32 = iface.if_u_pre(g, u)
+            var lb: [u8; 10] = ".L__iface."
+            t(c, (&lb[0]) as u64, 10)
+            rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), iname),
+                intern.intern_length(it(c), iname))
+            rt.buf_push(&(*c).out, 46 as u8)
+            rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), pfx),
+                intern.intern_length(it(c), pfx))
+            rt.buf_push(&(*c).out, 58 as u8)
+            nl(c)
+            let ii: u32 = iface.if_index(g, iname)
+            var k: u32 = 0
+            while k < iface.if_mlen(g, ii as usize) {
+                ins(c)
+                var q: [u8; 6] = ".quad "
+                w(c, (&q[0]) as u64, 6)
+                var pre: [u8; 4] = "_F1."
+                w(c, (&pre[0]) as u64, 4)
+                rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), pfx),
+                    intern.intern_length(it(c), pfx))
+                var tr: [u8; 2] = "__"
+                w(c, (&tr[0]) as u64, 2)
+                let mn: u32 = iface.if_mname(g, ii as usize, k)
+                rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), mn),
+                    intern.intern_length(it(c), mn))
+                nl(c)
+                k = k + 1
+            }
+        }
+        u = u + 1
+    }
+}
+
+fn emit_syscall(c: *mut Cg, f: *mut fir.Fir, i: u32) {
+    let aoff: u32 = fir.i_aoff_of(f, i)
+    let alen: u32 = fir.i_alen_of(f, i)
+    if alen > 7 {
+        (*c).unsuitable = true
+        return
+    }
+    // rax = syscall number, then rdi rsi rdx r10 r8 r9
+    var tab: [u8; 25] = "rax|rdi|rsi|rdx|r10|r8|r9"
+    var k: u32 = 0
+    while k < alen {
+        ins(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        piece(c, (&tab[0]) as u64, 25, k)
+        var s: [u8; 17] = ", qword ptr [rbp-"
+        w(c, (&s[0]) as u64, 17)
+        number(c, slot_of(c, fir.arg_at(f, aoff + k)))
+        var e: [u8; 1] = "]"
+        w(c, (&e[0]) as u64, 1)
+        nl(c)
+        k = k + 1
+    }
+    var sc: [u8; 7] = "syscall"
+    raw(c, (&sc[0]) as u64, 7)
+    let dst: u32 = fir.i_dst_of(f, i)
+    if dst != fir.NONE {
+        store_slot(c, slot_of(c, dst), R_AX)
+    }
+}
+
+// `Op::Select` (ct.rs, ROUND 36): data independent choice as `cmov` --
+// NO branch (SPEC 9.2). Every value sits in the frame as a full 64 bit
+// word, so the 64 bit form is enough for every width (there is no
+// 8 bit `cmov` anyway).
+fn emit_select(c: *mut Cg, cond: u32, a: u32, bv: u32, dst: u32) {
+    load_value(c, R_AX, bv)
+    load_value(c, R_DX, a)
+    load_value(c, R_CX, cond)
+    var t1: [u8; 13] = "test rcx, rcx"
+    raw(c, (&t1[0]) as u64, 13)
+    var t2: [u8; 15] = "cmovne rax, rdx"
+    raw(c, (&t2[0]) as u64, 15)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// `Op::SecureZero` (ct.rs, ROUND 36): zeroes and NEVER counts as dead code
+// (SPEC 9.3, C3) -- `rep stosb`, as in stage 0.
+fn emit_seczero(c: *mut Cg, addr: u32, size: u32) {
+    load_slot(c, 4, slot_of(c, addr))
+    load_value(c, R_CX, size)
+    var x: [u8; 12] = "xor eax, eax"
+    raw(c, (&x[0]) as u64, 12)
+    var r: [u8; 9] = "rep stosb"
+    raw(c, (&r[0]) as u64, 9)
+}
+
+// `Op::AtomicAdd` (atomic.rs, ROUND 47): ONE instruction with `lock` prefix,
+// the result is the OLD value. Exactly as in stage 0 (regalloc.rs/codegen_x86.rs).
+fn emit_atomadd(c: *mut Cg, addr: u32, val: u32, dst: u32) {
+    load_value(c, R_CX, addr)
+    load_value(c, R_AX, val)
+    var x: [u8; 30] = "lock xadd qword ptr [rcx], rax"
+    raw(c, (&x[0]) as u64, 30)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ----------------------------------------------- inline assembly and MMIO
+//
+// ROUND 52 (compiler/src/core.rs, codegen_x86.rs). ALWAYS volatile: the
+// lines are emitted exactly once and exactly here.
+
+// Write an interned string into the assembly text.
+fn iname(c: *mut Cg, nr: u32) {
+    rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), nr),
+        intern.intern_length(it(c), nr))
+}
+
+fn emit_asm(c: *mut Cg, f: *mut fir.Fir, i: u32, dst: u32) {
+    let template: u32 = fir.i_a_of(f, i)
+    let out: u32 = fir.i_b_of(f, i)
+    let aoff: u32 = fir.i_aoff_of(f, i)
+    let alen: u32 = fir.i_alen_of(f, i)
+    var kom: [u8; 51] = "# asm (volatile): must be neither removed nor moved"
+    raw(c, (&kom[0]) as u64, 51)
+    // Put the inputs into their registers. The narrow names are views of
+    // the same 64 bit register, so the whole word always goes in.
+    var k: u32 = 0
+    while k < alen {
+        let rn: u32 = fir.arg_at(f, aoff + k * 2)
+        let v: u32 = fir.arg_at(f, aoff + k * 2 + 1)
+        ins(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        iname(c, core.reg_stem(it(c), rn))
+        var s: [u8; 17] = ", qword ptr [rbp-"
+        w(c, (&s[0]) as u64, 17)
+        number(c, slot_of(c, v))
+        var kl: [u8; 1] = "]"
+        w(c, (&kl[0]) as u64, 1)
+        nl(c)
+        k = k + 1
+    }
+    // The template line by line, verbatim.
+    let p: u64 = intern.intern_ptr(it(c), template)
+    let n: usize = intern.intern_length(it(c), template)
+    var start: usize = 0
+    var j: usize = 0
+    while j <= n {
+        var end: bool = j == n
+        if !end {
+            end = rt.ld8(p, j) == 10 as u8
+        }
+        if end {
+            ins(c)
+            w(c, p + start as u64, j - start)
+            nl(c)
+            start = j + 1
+        }
+        j = j + 1
+    }
+    // The VALUE form goes into its frame slot FIRST. That is a plain
+    // `mov [rbp-N], reg` and needs no scratch register -- only after it are
+    // rax and rcx free for the memory outputs below.
+    if out != fir.NONE {
+        ins(c)
+        var m2: [u8; 19] = "mov qword ptr [rbp-"
+        w(c, (&m2[0]) as u64, 19)
+        number(c, slot_of(c, dst))
+        var s2: [u8; 3] = "], "
+        w(c, (&s2[0]) as u64, 3)
+        iname(c, core.reg_stem(it(c), out))
+        nl(c)
+    }
+    // ROUND 68 -- the memory outputs. Every result register goes on the
+    // STACK first; only then are rax/rcx used to write them out. The other
+    // way round would destroy a result that is still to be written: an
+    // address has to be loaded into a register, and that register may
+    // itself be an output.
+    let n_out: u32 = (fir.i_number_of(f, i) >> 32) as u32
+    if n_out > 0 {
+        var ko: u32 = 0
+        while ko < n_out {
+            let orn: u32 = fir.arg_at(f, aoff + alen * 2 + ko * 2)
+            ins(c)
+            var pu: [u8; 5] = "push "
+            w(c, (&pu[0]) as u64, 5)
+            iname(c, core.reg_stem(it(c), orn))
+            nl(c)
+            ko = ko + 1
+        }
+        var kb: u32 = n_out
+        while kb > 0 {
+            kb = kb - 1
+            var po: [u8; 7] = "pop rax"
+            raw(c, (&po[0]) as u64, 7)
+            let oad: u32 = fir.arg_at(f, aoff + alen * 2 + kb * 2 + 1)
+            load_value(c, R_CX, oad)
+            var st: [u8; 24] = "mov qword ptr [rcx], rax"
+            raw(c, (&st[0]) as u64, 24)
+        }
+    }
+}
+
+fn emit_mmio_load(c: *mut Cg, ty: u32, addr: u32, dst: u32) {
+    load_value(c, R_CX, addr)
+    let bits: u32 = fir.fty_bits(ty)
+    ins(c)
+    if bits >= 64 {
+        var m: [u8; 24] = "mov rax, qword ptr [rcx]"
+        w(c, (&m[0]) as u64, 24)
+    } else if bits == 32 {
+        var m2: [u8; 24] = "mov eax, dword ptr [rcx]"
+        w(c, (&m2[0]) as u64, 24)
+    } else {
+        var m3: [u8; 11] = "movzx eax, "
+        w(c, (&m3[0]) as u64, 11)
+        word_size(c, bits)
+        var p2: [u8; 9] = "ptr [rcx]"
+        w(c, (&p2[0]) as u64, 9)
+    }
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_mmio_store(c: *mut Cg, ty: u32, addr: u32, val: u32) {
+    load_value(c, R_CX, addr)
+    load_value(c, R_AX, val)
+    let bits: u32 = fir.fty_bits(ty)
+    ins(c)
+    var m: [u8; 4] = "mov "
+    w(c, (&m[0]) as u64, 4)
+    word_size(c, bits)
+    var p: [u8; 11] = "ptr [rcx], "
+    w(c, (&p[0]) as u64, 11)
+    regb(c, R_AX, bits)
+    nl(c)
+}
+
+// `Op::AtomicCas` (thread.rs, ROUND 49): `lock cmpxchg [rcx], rdx` -- one
+// instruction. rax holds the expected value and afterwards the one found.
+fn emit_atomcas(c: *mut Cg, addr: u32, erw: u32, new: u32, dst: u32) {
+    load_value(c, R_CX, addr)
+    load_value(c, R_DX, new)
+    load_value(c, R_AX, erw)
+    var x: [u8; 33] = "lock cmpxchg qword ptr [rcx], rdx"
+    raw(c, (&x[0]) as u64, 33)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// `Op::ThreadSelf` (thread.rs, ROUND 49): this thread's block from `fs:0`.
+// Before `arch_prctl(ARCH_SET_FS)` this reads address 0 -- but the
+// runtime sets the base before it ever reads the value (lib/gc/gc.fi).
+fn emit_tls(c: *mut Cg, dst: u32) {
+    var x: [u8; 23] = "mov rax, qword ptr fs:0"
+    raw(c, (&x[0]) as u64, 23)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// `Op::ThreadSpawn` (thread.rs, ROUND 49): `clone(2)` with a trampoline. The
+// same sequence as in stage 0 (compiler/src/thread.rs::spawn_sequence), down
+// to the word; only the entry symbol carries the prefix of this stage.
+//
+// `1:` is a NUMERIC assembler label -- `jnz 1f` jumps forward to the
+// next `1:`. That way the sequence needs no counter and may appear
+// as often as it likes in the same module.
+fn emit_spawn(c: *mut Cg, arg: u32, stack: u32, ctid: u32, dst: u32) {
+    load_value(c, 4, arg)
+    load_value(c, 3, stack)
+    load_value(c, R_DX, ctid)
+    var z1: [u8; 11] = "sub rsi, 16"
+    raw(c, (&z1[0]) as u64, 11)
+    var z2: [u8; 24] = "mov qword ptr [rsi], rdi"
+    raw(c, (&z2[0]) as u64, 24)
+    var z3: [u8; 12] = "mov r10, rdx"
+    raw(c, (&z3[0]) as u64, 12)
+    var z4: [u8; 16] = "mov rdi, 3477248"
+    raw(c, (&z4[0]) as u64, 16)
+    var z5: [u8; 12] = "xor r8d, r8d"
+    raw(c, (&z5[0]) as u64, 12)
+    var z6: [u8; 11] = "mov eax, 56"
+    raw(c, (&z6[0]) as u64, 11)
+    var z7: [u8; 7] = "syscall"
+    raw(c, (&z7[0]) as u64, 7)
+    var z8: [u8; 13] = "test rax, rax"
+    raw(c, (&z8[0]) as u64, 13)
+    var z9: [u8; 6] = "jnz 1f"
+    raw(c, (&z9[0]) as u64, 6)
+    var za: [u8; 24] = "mov rdi, qword ptr [rsp]"
+    raw(c, (&za[0]) as u64, 24)
+    var zb: [u8; 11] = "add rsp, 16"
+    raw(c, (&zb[0]) as u64, 11)
+    var zc: [u8; 12] = "xor ebp, ebp"
+    raw(c, (&zc[0]) as u64, 12)
+    var zd: [u8; 23] = "call _F1.__thread_entry"
+    raw(c, (&zd[0]) as u64, 23)
+    var ze: [u8; 12] = "mov edi, eax"
+    raw(c, (&ze[0]) as u64, 12)
+    var zf: [u8; 11] = "mov eax, 60"
+    raw(c, (&zf[0]) as u64, 11)
+    raw(c, (&z7[0]) as u64, 7)
+    var zg: [u8; 3] = "ud2"
+    raw(c, (&zg[0]) as u64, 3)
+    var zh: [u8; 2] = "1:"
+    w(c, (&zh[0]) as u64, 2)
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_copymem(c: *mut Cg, target: u32, source: u32, size: u64) {
+    load_slot(c, 4, slot_of(c, target))
+    load_slot(c, 3, slot_of(c, source))
+    ins(c)
+    var m: [u8; 9] = "mov rcx, "
+    w(c, (&m[0]) as u64, 9)
+    number(c, size)
+    nl(c)
+    var r: [u8; 9] = "rep movsb"
+    raw(c, (&r[0]) as u64, 9)
+}
+
+// ---------------------------------------------------------------- the run
+
+// `Op::GcAddr` -- address of the collector's state block in `rax`.
+// With regs=1 the callee-saved registers are saved into the block first
+// (offset 3968, gc.rs REG_SAVE_OFF), otherwise the promise "conservative
+// stack AND register scan" (SPEC 3.5.3) would be false. This stage has no
+// register allocation; the saving is the same nevertheless -- it costs six
+// `mov` and keeps the contract word for word.
+fn emit_gcaddr(c: *mut Cg, regs: u64, dst: u32) {
+    ins(c)
+    var m: [u8; 29] = "lea rax, [rip + .L__gc_state]"
+    w(c, (&m[0]) as u64, 29)
+    nl(c)
+    if regs == 1 {
+        var tab: [u8; 23] = "rbx|rbp|r12|r13|r14|r15"
+        var k: u32 = 0
+        while k < 6 {
+            ins(c)
+            var mv: [u8; 19] = "mov qword ptr [rax+"
+            w(c, (&mv[0]) as u64, 19)
+            number(c, 3968 + k as u64 * 8)
+            var mm: [u8; 3] = "], "
+            w(c, (&mm[0]) as u64, 3)
+            piece(c, (&tab[0]) as u64, 23, k)
+            nl(c)
+            k = k + 1
+        }
+    }
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// The collector type table generated by the compiler (`.rodata`) and the
+// state block (`.data`) -- the format is defined in gc.rs (`ty_table_asm`)
+// and is binding, because the runtime reads it:
+//   word 0: n_types;  entry(tid) = table + 8 + (tid-1)*64
+//   +0 size | +8 base tid | +16 n strong | +24 offset list |
+//   +32 n weak | +40 offset list | +48 tid | +56 reserved
+fn gc_table(c: *mut Cg) {
+    let g: *mut gc.Gc = gcg(c)
+    var sec: [u8; 16] = ".section .rodata"
+    t(c, (&sec[0]) as u64, 16)
+    nl(c)
+    var al: [u8; 8] = ".align 8"
+    t(c, (&al[0]) as u64, 8)
+    nl(c)
+    var lab: [u8; 17] = ".L__gc_typetable:"
+    t(c, (&lab[0]) as u64, 17)
+    nl(c)
+    ins(c)
+    var q: [u8; 6] = ".quad "
+    w(c, (&q[0]) as u64, 6)
+    number(c, gc.gc_count(g) as u64)
+    nl(c)
+    var i: u32 = 0
+    while i < gc.gc_count(g) as u32 {
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, gc.gc_size(g, i))
+        nl(c)
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, gc.gc_base_tid(g, i))
+        nl(c)
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, gc.gc_strong_count(g, i) as u64)
+        nl(c)
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        var ls: [u8; 18] = ".L__gc_typetable.s"
+        w(c, (&ls[0]) as u64, 18)
+        number(c, gc.gc_tid(g, i))
+        nl(c)
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, gc.gc_weak_count(g, i) as u64)
+        nl(c)
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        var lw: [u8; 18] = ".L__gc_typetable.w"
+        w(c, (&lw[0]) as u64, 18)
+        number(c, gc.gc_tid(g, i))
+        nl(c)
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, gc.gc_tid(g, i))
+        nl(c)
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, 0)
+        nl(c)
+        i = i + 1
+    }
+    i = 0
+    while i < gc.gc_count(g) as u32 {
+        var ls2: [u8; 18] = ".L__gc_typetable.s"
+        t(c, (&ls2[0]) as u64, 18)
+        number(c, gc.gc_tid(g, i))
+        var dp: [u8; 1] = ":"
+        t(c, (&dp[0]) as u64, 1)
+        nl(c)
+        var j: u32 = 0
+        while j < gc.gc_strong_count(g, i) {
+            ins(c)
+            w(c, (&q[0]) as u64, 6)
+            number(c, gc.gc_strong_off(g, i, j))
+            nl(c)
+            j = j + 1
+        }
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, 0)
+        nl(c)
+        var lw2: [u8; 18] = ".L__gc_typetable.w"
+        t(c, (&lw2[0]) as u64, 18)
+        number(c, gc.gc_tid(g, i))
+        t(c, (&dp[0]) as u64, 1)
+        nl(c)
+        j = 0
+        while j < gc.gc_weak_count(g, i) {
+            ins(c)
+            w(c, (&q[0]) as u64, 6)
+            number(c, gc.gc_weak_off(g, i, j))
+            nl(c)
+            j = j + 1
+        }
+        ins(c)
+        w(c, (&q[0]) as u64, 6)
+        number(c, 0)
+        nl(c)
+        i = i + 1
+    }
+    // State block: writable, word 0 points to the type table.
+    var sd: [u8; 14] = ".section .data"
+    t(c, (&sd[0]) as u64, 14)
+    nl(c)
+    var a16: [u8; 9] = ".align 16"
+    t(c, (&a16[0]) as u64, 9)
+    nl(c)
+    var zl: [u8; 13] = ".L__gc_state:"
+    t(c, (&zl[0]) as u64, 13)
+    nl(c)
+    ins(c)
+    w(c, (&q[0]) as u64, 6)
+    var lt: [u8; 16] = ".L__gc_typetable"
+    w(c, (&lt[0]) as u64, 16)
+    nl(c)
+    ins(c)
+    var zz: [u8; 6] = ".zero "
+    w(c, (&zz[0]) as u64, 6)
+    number(c, 4088)
+    nl(c)
+    var st: [u8; 14] = ".section .text"
+    t(c, (&st[0]) as u64, 14)
+    nl(c)
+}
+
+// ------------------------------------------- ROUND 72: checked arithmetic
+//
+// The port of `compiler/src/panic_rt.rs` (SPEC 13, item L9). Same shape,
+// same ending, same message: one shared out-of-line trampoline per object
+// file, entered with
+//   rdi = message address, esi = its length, rdx = the first operand,
+//   rcx = the second, r8 = the panic kind, r9 = 1 when the two numbers
+//   are to be read as UNSIGNED.
+// In `profile kernel` there is no runtime to fall back on and the
+// trampoline hands off to the external symbol `osum_panic`, which the
+// kernel author defines (`demos/freestanding/start.s` has a minimal one).
+//
+// The assembly text does NOT have to match `firnc0`'s -- it never did
+// (`tools/self_compare.sh` explains why: no register allocation here).
+// What has to match is the BEHAVIOUR and the message, octet for octet.
+
+const PANIC_ADD: u64 = 1
+const PANIC_SUB: u64 = 2
+const PANIC_MUL: u64 = 3
+const PANIC_DIV0: u64 = 4
+const PANIC_DIV_OVERFLOW: u64 = 5
+const PANIC_CAST: u64 = 6
+// ROUND 89 -- an array index outside `0 .. len` (SPEC 13, item L9).
+const PANIC_INDEX: u64 = 7
+
+fn panic_msg_index(c: *mut Cg, id: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*c).pmsg) {
+        if vec_at[u32](&(*c).pmsg, i) == id {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn panic_msg_add(c: *mut Cg, id: u32) {
+    if panic_msg_index(c, id) == NONE {
+        vec_push[u32](&(*c).pmsg, id)
+    }
+}
+
+// Every message the program really uses, in the order of its first
+// appearance -- the index IS the `.Lpanicmsg<n>` label. A program without
+// a single checked operation ends up with an empty list and gets neither
+// the table nor the trampoline.
+fn panic_collect(c: *mut Cg) {
+    let f: *mut fir.Fir = ff(c)
+    var fi: u32 = 0
+    while fi < fir.fn_count(f) as u32 {
+        var bb: u32 = 0
+        while bb < fir.block_count(f, fi) {
+            var n: u32 = 0
+            while n < fir.inst_count(f, fi, bb) {
+                let i: u32 = fir.inst_at(f, fi, bb, n)
+                let k: u32 = fir.i_kind_of(f, i)
+                if k == fir.O_CHECKEDBIN || k == fir.O_CHECKEDCAST
+                || k == fir.O_CHECKEDIDX {
+                    panic_msg_add(c, fir.i_number_of(f, i) as u32)
+                }
+                if k == fir.O_CHECKEDDIV {
+                    let both: u64 = fir.i_number_of(f, i)
+                    panic_msg_add(c, (both & 4294967295) as u32)
+                    panic_msg_add(c, (both >> 32) as u32)
+                }
+                n = n + 1
+            }
+            bb = bb + 1
+        }
+        fi = fi + 1
+    }
+}
+
+fn has_panic(c: *mut Cg) -> bool {
+    return vec_len[u32](&(*c).pmsg) > 0
+}
+
+// `.Lpanicmsg<n>`
+fn panic_label(c: *mut Cg, k: u32) {
+    var p: [u8; 10] = ".Lpanicmsg"
+    t(c, (&p[0]) as u64, 10)
+    number(c, k as u64)
+}
+
+// The message text, escaped for `.ascii` exactly like the assembly
+// template of an `asm` block (fir.rs::asm_escape) -- four characters and
+// no table, so that both compilers write the same octets.
+fn ascii_masked(c: *mut Cg, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let z: u8 = rt.ld8(p, i)
+        if z == 92 as u8 || z == 34 as u8 {
+            rt.buf_push(&(*c).out, 92 as u8)
+            rt.buf_push(&(*c).out, z)
+        } else if z == 10 as u8 {
+            rt.buf_push(&(*c).out, 92 as u8)
+            rt.buf_push(&(*c).out, 110 as u8)
+        } else if z == 9 as u8 {
+            rt.buf_push(&(*c).out, 92 as u8)
+            rt.buf_push(&(*c).out, 116 as u8)
+        } else {
+            rt.buf_push(&(*c).out, z)
+        }
+        i = i + 1
+    }
+}
+
+// `.rodata`: every distinct message as raw octets, no NUL terminator --
+// the length travels in `esi` (SPEC 8, the `Str` convention).
+fn panic_rodata(c: *mut Cg) {
+    var sec: [u8; 17] = ".section .rodata\n"
+    t(c, (&sec[0]) as u64, 17)
+    var k: u32 = 0
+    while k < vec_len[u32](&(*c).pmsg) as u32 {
+        panic_label(c, k)
+        var dp: [u8; 2] = ":\n"
+        t(c, (&dp[0]) as u64, 2)
+        var asc: [u8; 12] = "    .ascii \""
+        t(c, (&asc[0]) as u64, 12)
+        let id: u32 = vec_at[u32](&(*c).pmsg, k as usize)
+        ascii_masked(c, intern.intern_ptr(it(c), id), intern.intern_length(it(c), id))
+        var e: [u8; 2] = "\"\n"
+        t(c, (&e[0]) as u64, 2)
+        k = k + 1
+    }
+    var tx: [u8; 6] = ".text\n"
+    t(c, (&tx[0]) as u64, 6)
+}
+
+// ROUND 89 -- the octets of one literal word into the buffer at `[rbx]`,
+// then `add rbx, <n>`. Generated instead of written out so that the two
+// entry points cannot say different things about the same buffer.
+fn lit_store(c: *mut Cg, p: u64, n: usize) {
+    var k: usize = 0
+    while k < n {
+        ins(c)
+        var mb: [u8; 17] = "mov byte ptr [rbx"
+        w(c, (&mb[0]) as u64, 17)
+        if k > 0 {
+            rt.buf_push(&(*c).out, 43 as u8)
+            number(c, k as u64)
+        }
+        var cl: [u8; 3] = "], "
+        w(c, (&cl[0]) as u64, 3)
+        number(c, rt.ld8(p, k) as u64)
+        nl(c)
+        k = k + 1
+    }
+    ins(c)
+    var ar: [u8; 9] = "add rbx, "
+    w(c, (&ar[0]) as u64, 9)
+    number(c, n as u64)
+    nl(c)
+}
+
+// ROUND 89 -- ONE entry point of the trampoline. `open`/`mid` are the two
+// literal words it differs in: `" (a="`/`" b="` for the arithmetic one,
+// `" (index="`/`" len="` for the bounds one.
+fn panic_entry(c: *mut Cg, label: u64, labeln: usize, open: u64, openn: usize,
+    mid: u64, midn: usize) {
+    t(c, label, labeln)
+    var h1: [u8; 101] = ":\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    mov r12, rdi\n    mov r13, rsi\n"
+    t(c, (&h1[0]) as u64, 101)
+    var h2: [u8; 67] = "    mov r14, rcx\n    mov r15, r9\n    sub rsp, 160\n    mov rbx, rsp\n"
+    t(c, (&h2[0]) as u64, 67)
+    lit_store(c, open, openn)
+    var h3: [u8; 42] = "    mov rax, rdx\n    call .Lpanic_i64_dec\n"
+    t(c, (&h3[0]) as u64, 42)
+    lit_store(c, mid, midn)
+    var h4: [u8; 42] = "    mov rax, r14\n    call .Lpanic_i64_dec\n"
+    t(c, (&h4[0]) as u64, 42)
+    var cls: [u8; 2] = ")\n"
+    lit_store(c, (&cls[0]) as u64, 2)
+    var h5: [u8; 106] = "    mov rax, 1\n    mov rdi, 2\n    mov rsi, r12\n    mov rdx, r13\n    syscall\n    mov rax, 1\n    mov rdi, 2\n"
+    t(c, (&h5[0]) as u64, 106)
+    var h6: [u8; 143] = "    lea rsi, [rsp]\n    mov rdx, rbx\n    sub rdx, rsp\n    syscall\n    pop r15\n    pop r14\n    mov rax, 231\n    mov rdi, 101\n    syscall\n    hlt\n"
+    t(c, (&h6[0]) as u64, 143)
+}
+
+fn panic_trampoline(c: *mut Cg) {
+    var la: [u8; 13] = ".Lpanic_arith"
+    var li: [u8; 13] = ".Lpanic_index"
+    var wa: [u8; 4] = " (a="
+    var wb: [u8; 3] = " b="
+    var wi: [u8; 8] = " (index="
+    var wl: [u8; 5] = " len="
+    // ROUND 89 -- a program that brought its OWN ending. Both entry points
+    // hand over to it; nothing of the formatter below is written at all
+    // then. The trampoline's register convention (rdi, rsi, rdx, rcx, r8)
+    // IS the System V one for five arguments, so there is nothing to
+    // shuffle: the handler receives the message (which already carries
+    // file, line and column -- that is how round 72 built it), its length,
+    // the two numbers and the panic kind code.
+    let ph: u32 = panic_handler_name(c)
+    if ph != NONE {
+        panic_handoff(c, (&la[0]) as u64, 13, ph)
+        if (*c).idx_used {
+            panic_handoff(c, (&li[0]) as u64, 13, ph)
+        }
+        return
+    }
+    if (*c).free {
+        // No runtime at all. Somebody else decides what a panic means --
+        // exactly the SPEC 2 promise ("osum_panic, configurable"). An
+        // undefined reference at link time is the honest outcome for a
+        // kernel that never defines it. ROUND 89 gives a kernel the nicer
+        // option of a `#[panic_handler]` written in Firn (above); this
+        // stays for the kernels that already define the symbol.
+        panic_extern(c, (&la[0]) as u64, 13)
+        if (*c).idx_used {
+            panic_extern(c, (&li[0]) as u64, 13)
+        }
+        return
+    }
+    // `app`: build "<message> (a=<N> b=<M>)\n" on the stack, write it to
+    // file descriptor 2 and call exit_group(101). No allocator, no `std.*`
+    // -- this has to run inside a program that imports nothing at all.
+    panic_entry(c, (&la[0]) as u64, 13, (&wa[0]) as u64, 4, (&wb[0]) as u64, 3)
+    if (*c).idx_used {
+        panic_entry(c, (&li[0]) as u64, 13, (&wi[0]) as u64, 8, (&wl[0]) as u64, 5)
+    }
+    // The decimal writer: append the text of `rax` at `[rbx]` and move
+    // `rbx` past it. An UNSIGNED type (r15 != 0) never has a minus sign
+    // and never negates -- its bit pattern IS the number. For a signed one
+    // two's complement makes `neg` on i64::MIN produce the right MAGNITUDE
+    // as an unsigned pattern, so the unsigned `div` afterwards is correct
+    // for every possible i64, that one included. ONE copy, shared by both
+    // entry points.
+    var d1: [u8; 178] = ".Lpanic_i64_dec:\n    test r15, r15\n    jnz .Lpanic_dec_nonneg\n    test rax, rax\n    jns .Lpanic_dec_nonneg\n    mov byte ptr [rbx], 45\n    inc rbx\n    neg rax\n.Lpanic_dec_nonneg:\n"
+    t(c, (&d1[0]) as u64, 178)
+    var d2: [u8; 174] = "    mov r8, rbx\n    mov rcx, 10\n    test rax, rax\n    jnz .Lpanic_dec_loop\n    mov byte ptr [rbx], 48\n    inc rbx\n    jmp .Lpanic_dec_rev\n.Lpanic_dec_loop:\n    test rax, rax\n"
+    t(c, (&d2[0]) as u64, 174)
+    var d3: [u8; 178] = "    jz .Lpanic_dec_rev\n    xor rdx, rdx\n    div rcx\n    add rdx, 48\n    mov byte ptr [rbx], dl\n    inc rbx\n    jmp .Lpanic_dec_loop\n.Lpanic_dec_rev:\n    mov rcx, rbx\n    dec rcx\n"
+    t(c, (&d3[0]) as u64, 178)
+    var d4: [u8; 245] = ".Lpanic_dec_revloop:\n    cmp r8, rcx\n    jge .Lpanic_dec_done\n    mov al, byte ptr [r8]\n    mov dl, byte ptr [rcx]\n    mov byte ptr [r8], dl\n    mov byte ptr [rcx], al\n    inc r8\n    dec rcx\n    jmp .Lpanic_dec_revloop\n.Lpanic_dec_done:\n    ret\n"
+    t(c, (&d4[0]) as u64, 245)
+}
+
+// The interned name of the `#[panic_handler]`, or NONE.
+fn panic_handler_name(c: *mut Cg) -> u32 {
+    if (*c).tr == 0 {
+        return NONE
+    }
+    return ast.panic_handler((*c).tr as *mut ast.Tree)
+}
+
+// One entry point that hands over to a `#[panic_handler]` written in Firn.
+fn panic_handoff(c: *mut Cg, label: u64, labeln: usize, ph: u32) {
+    t(c, label, labeln)
+    var dp: [u8; 2] = ":\n"
+    t(c, (&dp[0]) as u64, 2)
+    ins(c)
+    var cw: [u8; 5] = "call "
+    w(c, (&cw[0]) as u64, 5)
+    sym(c, ph)
+    nl(c)
+    if (*c).free {
+        var kt: [u8; 4] = "ud2\n"
+        ins(c)
+        t(c, (&kt[0]) as u64, 4)
+    } else {
+        // It came back anyway. The program said something has gone wrong;
+        // carrying on as if it had not is the one answer that is certainly
+        // false.
+        var ex: [u8; 54] = "    mov rax, 231\n    mov rdi, 101\n    syscall\n    hlt\n"
+        t(c, (&ex[0]) as u64, 54)
+    }
+}
+
+// One entry point that hands over to the external symbol `osum_panic`.
+fn panic_extern(c: *mut Cg, label: u64, labeln: usize) {
+    t(c, label, labeln)
+    var kt: [u8; 133] = ":\n    call osum_panic\n    # osum_panic is not supposed to come back; running\n    # into .text below would be silently wrong.\n    ud2\n"
+    t(c, (&kt[0]) as u64, 133)
+}
+
+// `.L<tag><function>_<n>` -- unique inside the function through the
+// counter and across functions through the name, the same rule
+// `blocklabel` already follows. ROUND 58's `#` in a generated closure name
+// is a COMMENT character to the assembler; `sym` turns it into a dot.
+fn sitelabel(c: *mut Cg, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    var p: [u8; 2] = ".L"
+    t(c, (&p[0]) as u64, 2)
+    t(c, tag, tagn)
+    sym(c, fnr)
+    rt.buf_push(&(*c).out, 95 as u8)
+    number(c, uid)
+}
+
+// `<mnemonic> .L<tag><function>_<n>`
+fn site_jump(c: *mut Cg, mn: u64, mnn: usize, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    ins(c)
+    w(c, mn, mnn)
+    rt.buf_push(&(*c).out, 32 as u8)
+    sitelabel(c, tag, tagn, fnr, uid)
+    nl(c)
+}
+
+fn site_here(c: *mut Cg, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    sitelabel(c, tag, tagn, fnr, uid)
+    rt.buf_push(&(*c).out, 58 as u8)
+    nl(c)
+}
+
+// Into the trampoline with the calling convention it expects. `rdx`/`rcx`
+// already hold the two original values.
+fn trampoline_jump(c: *mut Cg, code: u64, msgid: u32, unsigned: bool) {
+    ins(c)
+    var le: [u8; 16] = "lea rdi, [rip + "
+    w(c, (&le[0]) as u64, 16)
+    panic_label(c, panic_msg_index(c, msgid))
+    rt.buf_push(&(*c).out, 93 as u8)
+    nl(c)
+    ins(c)
+    var ms: [u8; 9] = "mov esi, "
+    w(c, (&ms[0]) as u64, 9)
+    number(c, intern.intern_length(it(c), msgid) as u64)
+    nl(c)
+    ins(c)
+    var m8: [u8; 8] = "mov r8, "
+    w(c, (&m8[0]) as u64, 8)
+    number(c, code)
+    nl(c)
+    ins(c)
+    var m9: [u8; 8] = "mov r9, "
+    w(c, (&m9[0]) as u64, 8)
+    if unsigned {
+        number(c, 1)
+    } else {
+        number(c, 0)
+    }
+    nl(c)
+    var jp: [u8; 17] = "jmp .Lpanic_arith"
+    raw(c, (&jp[0]) as u64, 17)
+}
+
+// ROUND 89 -- into the SECOND entry point of the trampoline, the one that
+// prints `(index=<N> len=<M>)` instead of `(a=<N> b=<M>)`. The alternative
+// was to hand `a` and `b` to the reader of a bounds panic and let them
+// guess which is which, which is not an alternative.
+fn trampoline_jump_index(c: *mut Cg, msgid: u32) {
+    ins(c)
+    var le: [u8; 16] = "lea rdi, [rip + "
+    w(c, (&le[0]) as u64, 16)
+    panic_label(c, panic_msg_index(c, msgid))
+    rt.buf_push(&(*c).out, 93 as u8)
+    nl(c)
+    ins(c)
+    var ms: [u8; 9] = "mov esi, "
+    w(c, (&ms[0]) as u64, 9)
+    number(c, intern.intern_length(it(c), msgid) as u64)
+    nl(c)
+    ins(c)
+    var m8: [u8; 8] = "mov r8, "
+    w(c, (&m8[0]) as u64, 8)
+    number(c, PANIC_INDEX)
+    nl(c)
+    var m9: [u8; 9] = "mov r9, 1"
+    raw(c, (&m9[0]) as u64, 9)
+    var jp2: [u8; 17] = "jmp .Lpanic_index"
+    raw(c, (&jp2[0]) as u64, 17)
+}
+
+// ROUND 89 -- the checked ARRAY INDEX (SPEC 13, item L9).
+//
+// Two instructions when nothing is wrong -- one `cmp` and one not-taken
+// `jb`. That is the whole run time cost of the promise; `docs/ROUND89.md`
+// measures what it comes to in a hot loop. The index is left in `rax` and
+// stored exactly as an unchecked one would be.
+//
+// The comparison is UNSIGNED: an index is a `usize`, so "below zero" is
+// not a state it can be in and one comparison decides both ends.
+fn emit_checked_idx(c: *mut Cg, ty: u32, idx: u32, len: u64, dst: u32,
+    msgid: u32, fnr: u32) {
+    (*c).idx_used = true
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tok: [u8; 6] = "chkidx"
+    load_value(c, R_AX, idx)
+    normalize(c, R_AX, ty)
+    ins(c)
+    var mc: [u8; 9] = "mov rcx, "
+    w(c, (&mc[0]) as u64, 9)
+    number(c, len)
+    nl(c)
+    var cm: [u8; 12] = "cmp rax, rcx"
+    raw(c, (&cm[0]) as u64, 12)
+    var jb: [u8; 2] = "jb"
+    site_jump(c, (&jb[0]) as u64, 2, (&tok[0]) as u64, 6, fnr, uid)
+    var md: [u8; 12] = "mov rdx, rax"
+    raw(c, (&md[0]) as u64, 12)
+    trampoline_jump_index(c, msgid)
+    site_here(c, (&tok[0]) as u64, 6, fnr, uid)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// `<op> <a>, <b>` at the width of `bits` (8/16/32/64).
+fn op2_bits(c: *mut Cg, name: u64, n: usize, a: u32, b: u32, bits: u32) {
+    ins(c)
+    w(c, name, n)
+    rt.buf_push(&(*c).out, 32 as u8)
+    regb(c, a, bits)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    regb(c, b, bits)
+    nl(c)
+}
+
+// The smallest value of a signed FIR type, the largest of any of them.
+fn ty_min(ty: u32) -> i64 {
+    if ty == fir.T_I8 { return 0 - 128 }
+    if ty == fir.T_I16 { return 0 - 32768 }
+    if ty == fir.T_I32 { return 0 - 2147483648 }
+    if ty == fir.T_I64 { return -9223372036854775808 }
+    return 0
+}
+
+fn ty_max_u(ty: u32) -> u64 {
+    if ty == fir.T_I8 { return 127 }
+    if ty == fir.T_I16 { return 32767 }
+    if ty == fir.T_I32 { return 2147483647 }
+    if ty == fir.T_I64 { return 9223372036854775807 }
+    if ty == fir.T_U8 { return 255 }
+    if ty == fir.T_U16 { return 65535 }
+    if ty == fir.T_U32 { return 4294967295 }
+    return 18446744073709551615
+}
+
+// `movabs <reg>, <v>` -- the only form that carries a full 64 bit literal.
+fn movabs_u(c: *mut Cg, r: u32, v: u64) {
+    ins(c)
+    var m: [u8; 7] = "movabs "
+    w(c, (&m[0]) as u64, 7)
+    reg64(c, r)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    number(c, v)
+    nl(c)
+}
+
+fn movabs_i(c: *mut Cg, r: u32, v: i64) {
+    ins(c)
+    var m: [u8; 7] = "movabs "
+    w(c, (&m[0]) as u64, 7)
+    reg64(c, r)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    inum(c, v)
+    nl(c)
+}
+
+// The multiplication of a checked or saturating `*`. `imul r, r/m` (the
+// two operand form) exists for 16, 32 and 64 bits ONLY -- at 8 bits the
+// ONE operand form is the answer: `imul cl` computes ax = al * cl and sets
+// OF exactly when the product does not fit back into al.
+fn emit_mul_flagged(c: *mut Cg, ty: u32, bits: u32) {
+    if is_sign(ty) {
+        if bits == 8 {
+            var i1: [u8; 7] = "imul cl"
+            raw(c, (&i1[0]) as u64, 7)
+            return
+        }
+        var i2: [u8; 4] = "imul"
+        op2_bits(c, (&i2[0]) as u64, 4, R_AX, R_CX, bits)
+        return
+    }
+    // Unsigned: the one operand `mul` puts the FULL product in the upper
+    // half as well and sets CF=OF exactly when that half is not zero.
+    ins(c)
+    var m: [u8; 4] = "mul "
+    w(c, (&m[0]) as u64, 4)
+    regb(c, R_CX, bits)
+    nl(c)
+}
+
+// `add`/`sub` set OF for the SIGNED reading only; an unsigned type that
+// leaves its width sets CF instead (`200u8 + 100u8` sets CF and leaves OF
+// clear -- as i8 that sum still fits). The one operand `mul` sets CF and
+// OF together, so CF is the right question for every unsigned operation.
+fn overflow_jump(c: *mut Cg, ty: u32, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    var js: [u8; 2] = "jo"
+    var ju: [u8; 2] = "jc"
+    if is_sign(ty) {
+        site_jump(c, (&js[0]) as u64, 2, tag, tagn, fnr, uid)
+    } else {
+        site_jump(c, (&ju[0]) as u64, 2, tag, tagn, fnr, uid)
+    }
+}
+
+fn panic_code_of(op: u32) -> u64 {
+    if op == 0 { return PANIC_ADD }
+    if op == 1 { return PANIC_SUB }
+    return PANIC_MUL
+}
+
+// ROUND 72 -- checked `+ - *` (SPEC 13, item L9). The two operands sit in
+// their frame slots already extended to a full 64 bits; the arithmetic
+// runs at the TYPE's own width, so the flag means what the type means and
+// a value that only fits into 8 or 16 bits is caught as well.
+fn emit_checked_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32, msgid: u32, fnr: u32) {
+    let bits: u32 = fir.fty_bits(ty)
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tsite: [u8; 7] = "chksite"
+    var tok: [u8; 5] = "chkok"
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    // The two ORIGINAL values go on the STACK: the panic path needs them
+    // for the message, and the arithmetic below overwrites rax.
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    var pc: [u8; 8] = "push rcx"
+    raw(c, (&pc[0]) as u64, 8)
+    if op == 0 {
+        var n: [u8; 3] = "add"
+        op2_bits(c, (&n[0]) as u64, 3, R_AX, R_CX, bits)
+    } else if op == 1 {
+        var n2: [u8; 3] = "sub"
+        op2_bits(c, (&n2[0]) as u64, 3, R_AX, R_CX, bits)
+    } else {
+        emit_mul_flagged(c, ty, bits)
+    }
+    overflow_jump(c, ty, (&tsite[0]) as u64, 7, fnr, uid)
+    var drop: [u8; 11] = "add rsp, 16"
+    raw(c, (&drop[0]) as u64, 11)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&tok[0]) as u64, 5, fnr, uid)
+    site_here(c, (&tsite[0]) as u64, 7, fnr, uid)
+    var poc: [u8; 7] = "pop rcx"
+    raw(c, (&poc[0]) as u64, 7)
+    var pod: [u8; 7] = "pop rdx"
+    raw(c, (&pod[0]) as u64, 7)
+    trampoline_jump(c, panic_code_of(op), msgid, !is_sign(ty))
+    site_here(c, (&tok[0]) as u64, 5, fnr, uid)
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 72 -- checked `/` and `%`: division by zero, and for a SIGNED type
+// the `MIN / -1` case that would otherwise raise SIGFPE with no message of
+// our own at all.
+fn emit_checked_div(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32,
+    mzero: u32, mrange: u32, fnr: u32) {
+    var bits: u32 = fir.fty_bits(ty)
+    if bits < 32 {
+        bits = 32
+    }
+    let wide: bool = fir.fty_bits(ty) > 32
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tz: [u8; 7] = "chkdivz"
+    var tr: [u8; 7] = "chkdivr"
+    var sz: [u8; 8] = "chksitez"
+    var sr: [u8; 8] = "chksiter"
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    var pc: [u8; 8] = "push rcx"
+    raw(c, (&pc[0]) as u64, 8)
+    var ts: [u8; 4] = "test"
+    op2_bits(c, (&ts[0]) as u64, 4, R_CX, R_CX, bits)
+    var jz: [u8; 2] = "jz"
+    site_jump(c, (&jz[0]) as u64, 2, (&sz[0]) as u64, 8, fnr, uid)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&tz[0]) as u64, 7, fnr, uid)
+    site_here(c, (&sz[0]) as u64, 8, fnr, uid)
+    var poc: [u8; 7] = "pop rcx"
+    raw(c, (&poc[0]) as u64, 7)
+    var pod: [u8; 7] = "pop rdx"
+    raw(c, (&pod[0]) as u64, 7)
+    trampoline_jump(c, PANIC_DIV0, mzero, !is_sign(ty))
+    site_here(c, (&tz[0]) as u64, 7, fnr, uid)
+    if is_sign(ty) {
+        // MIN / -1: two comparisons with a shared "definitely fine" target.
+        // `cmp r64, imm32` is the only immediate FORM a 64 bit register
+        // compare has, and a sign extended 32 bit literal cannot represent
+        // i64::MIN at all -- hence the detour through rdx, which is free
+        // scratch here (the rescued pair still sits untouched on the stack).
+        if wide {
+            movabs_i(c, R_DX, ty_min(ty))
+            var cm: [u8; 3] = "cmp"
+            op2(c, (&cm[0]) as u64, 3, R_AX, R_DX)
+        } else {
+            ins(c)
+            var cm2: [u8; 4] = "cmp "
+            w(c, (&cm2[0]) as u64, 4)
+            regb(c, R_AX, bits)
+            var k: [u8; 2] = ", "
+            w(c, (&k[0]) as u64, 2)
+            inum(c, ty_min(ty))
+            nl(c)
+        }
+        var jn: [u8; 3] = "jne"
+        site_jump(c, (&jn[0]) as u64, 3, (&tr[0]) as u64, 7, fnr, uid)
+        ins(c)
+        var cm3: [u8; 4] = "cmp "
+        w(c, (&cm3[0]) as u64, 4)
+        regb(c, R_CX, bits)
+        var mo: [u8; 4] = ", -1"
+        w(c, (&mo[0]) as u64, 4)
+        nl(c)
+        site_jump(c, (&jn[0]) as u64, 3, (&tr[0]) as u64, 7, fnr, uid)
+        site_jump(c, (&jm[0]) as u64, 3, (&sr[0]) as u64, 8, fnr, uid)
+        site_here(c, (&sr[0]) as u64, 8, fnr, uid)
+        raw(c, (&poc[0]) as u64, 7)
+        raw(c, (&pod[0]) as u64, 7)
+        trampoline_jump(c, PANIC_DIV_OVERFLOW, mrange, false)
+    }
+    site_here(c, (&tr[0]) as u64, 7, fnr, uid)
+    var drop: [u8; 11] = "add rsp, 16"
+    raw(c, (&drop[0]) as u64, 11)
+    if is_sign(ty) {
+        if wide {
+            var q: [u8; 3] = "cqo"
+            raw(c, (&q[0]) as u64, 3)
+            var d: [u8; 8] = "idiv rcx"
+            raw(c, (&d[0]) as u64, 8)
+        } else {
+            var q2: [u8; 3] = "cdq"
+            raw(c, (&q2[0]) as u64, 3)
+            var d2: [u8; 8] = "idiv ecx"
+            raw(c, (&d2[0]) as u64, 8)
+        }
+    } else {
+        var z: [u8; 12] = "xor edx, edx"
+        raw(c, (&z[0]) as u64, 12)
+        if wide {
+            var d3: [u8; 7] = "div rcx"
+            raw(c, (&d3[0]) as u64, 7)
+        } else {
+            var d4: [u8; 7] = "div ecx"
+            raw(c, (&d4[0]) as u64, 7)
+        }
+    }
+    if op == 4 {
+        var m: [u8; 12] = "mov rax, rdx"
+        raw(c, (&m[0]) as u64, 12)
+    }
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 72 -- a checked (narrowing) `as`. Narrow into the target width,
+// widen the result BACK the way the value arrived and compare against the
+// untouched original: any difference means the conversion lost something.
+fn emit_checked_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32, msgid: u32, fnr: u32) {
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tok: [u8; 8] = "chkcastk"
+    var ts: [u8; 8] = "chksitec"
+    load_value(c, R_AX, src)
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    normalize(c, R_AX, after)
+    if fir.fty_bits(of) > fir.fty_bits(after) {
+        normalize(c, R_AX, of)
+    }
+    var cm: [u8; 24] = "cmp qword ptr [rsp], rax"
+    raw(c, (&cm[0]) as u64, 24)
+    var je: [u8; 2] = "je"
+    site_jump(c, (&je[0]) as u64, 2, (&tok[0]) as u64, 8, fnr, uid)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&ts[0]) as u64, 8, fnr, uid)
+    site_here(c, (&ts[0]) as u64, 8, fnr, uid)
+    var pod: [u8; 7] = "pop rdx"
+    raw(c, (&pod[0]) as u64, 7)
+    var mc: [u8; 12] = "mov rcx, rdx"
+    raw(c, (&mc[0]) as u64, 12)
+    trampoline_jump(c, PANIC_CAST, msgid, !is_sign(of))
+    site_here(c, (&tok[0]) as u64, 8, fnr, uid)
+    // Nothing was lost: take the ORIGINAL back off the stack (the
+    // comparison above widened it past the target width again) and narrow
+    // it once more, cleanly.
+    var poa: [u8; 7] = "pop rax"
+    raw(c, (&poa[0]) as u64, 7)
+    normalize(c, R_AX, after)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 72 -- `+% -% *%` and `+| -| *|`. Wrapping needs nothing at all
+// beyond plain arithmetic: two's complement wrapping IS what `add`/`sub`/
+// `imul` already do when nobody looks at the flag. Saturating clamps the
+// wrapped result back into range when the flag did fire.
+fn emit_wrapsat(c: *mut Cg, ty: u32, kind: u64, op: u32, a: u32, b: u32, dst: u32, fnr: u32) {
+    if kind == fir.WS_WRAP {
+        emit_bin(c, ty, op, a, b, dst)
+        return
+    }
+    let bits: u32 = fir.fty_bits(ty)
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tcl: [u8; 8] = "satclamp"
+    var tdn: [u8; 7] = "satdone"
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    var pc: [u8; 8] = "push rcx"
+    raw(c, (&pc[0]) as u64, 8)
+    if op == 0 {
+        var n: [u8; 3] = "add"
+        op2_bits(c, (&n[0]) as u64, 3, R_AX, R_CX, bits)
+    } else if op == 1 {
+        var n2: [u8; 3] = "sub"
+        op2_bits(c, (&n2[0]) as u64, 3, R_AX, R_CX, bits)
+    } else {
+        emit_mul_flagged(c, ty, bits)
+    }
+    overflow_jump(c, ty, (&tcl[0]) as u64, 8, fnr, uid)
+    var drop: [u8; 11] = "add rsp, 16"
+    raw(c, (&drop[0]) as u64, 11)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&tdn[0]) as u64, 7, fnr, uid)
+    site_here(c, (&tcl[0]) as u64, 8, fnr, uid)
+    // The two ORIGINAL operands back, for the sign tests below.
+    var poc: [u8; 7] = "pop rcx"
+    raw(c, (&poc[0]) as u64, 7)
+    var poa: [u8; 7] = "pop rax"
+    raw(c, (&poa[0]) as u64, 7)
+    if !is_sign(ty) {
+        // Unsigned: `+`/`*` overflowing means "too big" (clamp to MAX),
+        // `-` overflowing means "went below zero" (clamp to 0).
+        if op == 1 {
+            movabs_u(c, R_AX, 0)
+        } else {
+            movabs_u(c, R_AX, ty_max_u(ty))
+        }
+    } else {
+        // Signed: the sign of ONE original operand (`+`/`-`) or the XOR of
+        // both (`*`) says which bound was crossed.
+        if op == 2 {
+            var xr: [u8; 3] = "xor"
+            op2(c, (&xr[0]) as u64, 3, R_AX, R_CX)
+        }
+        ins(c)
+        if op == 1 {
+            var c1: [u8; 10] = "cmp rcx, 0"
+            w(c, (&c1[0]) as u64, 10)
+        } else {
+            var c2: [u8; 10] = "cmp rax, 0"
+            w(c, (&c2[0]) as u64, 10)
+        }
+        nl(c)
+        if op == 1 {
+            movabs_i(c, R_AX, ty_min(ty))
+            movabs_u(c, R_DX, ty_max_u(ty))
+        } else {
+            movabs_u(c, R_AX, ty_max_u(ty))
+            movabs_i(c, R_DX, ty_min(ty))
+        }
+        var cv: [u8; 14] = "cmovl rax, rdx"
+        raw(c, (&cv[0]) as u64, 14)
+    }
+    site_here(c, (&tdn[0]) as u64, 7, fnr, uid)
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
+    let f: *mut fir.Fir = ff(c)
+    let kind: u32 = fir.i_kind_of(f, i)
+    let ty: u32 = fir.i_ty_of(f, i)
+    let dst: u32 = fir.i_dst_of(f, i)
+    if kind == fir.O_CONST {
+        emit_const(c, ty, fir.i_number_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_BIN {
+        emit_bin(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
+        return
+    }
+    // ROUND 72 (SPEC 13, item L9) -- checked and explicitly unchecked
+    // integer arithmetic.
+    if kind == fir.O_BINWRAPSAT {
+        emit_wrapsat(c, ty, fir.i_number_of(f, i), fir.i_c_of(f, i),
+            fir.i_a_of(f, i), fir.i_b_of(f, i), dst, fir.f_name_of(f, fnr))
+        return
+    }
+    if kind == fir.O_CHECKEDBIN {
+        emit_checked_bin(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i),
+            dst, fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
+        return
+    }
+    if kind == fir.O_CHECKEDDIV {
+        let both: u64 = fir.i_number_of(f, i)
+        emit_checked_div(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i),
+            dst, (both & 4294967295) as u32, (both >> 32) as u32,
+            fir.f_name_of(f, fnr))
+        return
+    }
+    if kind == fir.O_CHECKEDCAST {
+        emit_checked_cast(c, fir.i_c_of(f, i), ty, fir.i_a_of(f, i), dst,
+            fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
+        return
+    }
+    // ROUND 89 -- the checked ARRAY INDEX (SPEC 13, item L9).
+    if kind == fir.O_CHECKEDIDX {
+        emit_checked_idx(c, ty, fir.i_a_of(f, i), fir.i_c_of(f, i) as u64, dst,
+            fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
+        return
+    }
+    if kind == fir.O_CMP {
+        emit_cmp(c, fir.i_number_of(f, i) as u32, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_UN {
+        emit_un(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_CAST {
+        emit_cast(c, fir.i_c_of(f, i), ty, fir.i_a_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_ALLOCA {
+        emit_alloca(c, dst)
+        return
+    }
+    if kind == fir.O_LOAD {
+        emit_load(c, ty, fir.i_a_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_STORE {
+        emit_store(c, ty, fir.i_a_of(f, i), fir.i_b_of(f, i))
+        return
+    }
+    if kind == fir.O_PTRADD {
+        emit_ptradd(c, fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_CALL {
+        emit_call(c, f, i, fnr)
+        return
+    }
+    if kind == fir.O_SYSCALL {
+        emit_syscall(c, f, i)
+        return
+    }
+    if kind == fir.O_COPYMEM {
+        emit_copymem(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_number_of(f, i))
+        return
+    }
+    if kind == fir.O_GCADDR {
+        emit_gcaddr(c, fir.i_number_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_SELECT {
+        emit_select(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_c_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_SECZERO {
+        emit_seczero(c, fir.i_a_of(f, i), fir.i_b_of(f, i))
+        return
+    }
+    if kind == fir.O_ATOMADD {
+        emit_atomadd(c, fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_ATOMCAS {
+        emit_atomcas(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_c_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_SPAWN {
+        emit_spawn(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_c_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_TLS {
+        emit_tls(c, dst)
+        return
+    }
+    if kind == fir.O_CALLI {
+        emit_calli(c, f, i, fnr)
+        return
+    }
+    if kind == fir.O_VTAB {
+        emit_vtab(c, fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_FNREF {
+        emit_fnref(c, fir.i_a_of(f, i), dst)
+        return
+    }
+    // ROUND 89 (statics.rs): the address of a global variable.
+    if kind == fir.O_GLOBAL {
+        emit_global(c, fir.i_a_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_ASM {
+        emit_asm(c, f, i, dst)
+        return
+    }
+    if kind == fir.O_MMIOLD {
+        emit_mmio_load(c, ty, fir.i_a_of(f, i), dst)
+        return
+    }
+    if kind == fir.O_MMIOST {
+        emit_mmio_store(c, ty, fir.i_a_of(f, i), fir.i_b_of(f, i))
+        return
+    }
+    (*c).unsuitable = true
+}
+
+fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
+    let f: *mut fir.Fir = ff(c)
+    let kind: u32 = fir.b_term_of(f, fnr, bb)
+    if kind == fir.TERM_BR {
+        ins(c)
+        var j: [u8; 4] = "jmp "
+        w(c, (&j[0]) as u64, 4)
+        blocklabel(c, fir.f_name_of(f, fnr), fir.b_t1_of(f, fnr, bb))
+        nl(c)
+        return
+    }
+    if kind == fir.TERM_BRCOND {
+        load_value(c, R_AX, fir.b_t1_of(f, fnr, bb))
+        var tst: [u8; 11] = "test eax, 1"
+        raw(c, (&tst[0]) as u64, 11)
+        ins(c)
+        var jn: [u8; 4] = "jne "
+        w(c, (&jn[0]) as u64, 4)
+        blocklabel(c, fir.f_name_of(f, fnr), fir.b_t2_of(f, fnr, bb))
+        nl(c)
+        ins(c)
+        var jm: [u8; 4] = "jmp "
+        w(c, (&jm[0]) as u64, 4)
+        blocklabel(c, fir.f_name_of(f, fnr), fir.b_t3_of(f, fnr, bb))
+        nl(c)
+        return
+    }
+    if kind == fir.TERM_SWITCH {
+        // COMPARISON CHAIN, no jump table: `codegen_switch.rs` builds a table
+        // in `.rodata` from eight dense keys upwards; both methods behave
+        // the same, and behaviour is the yardstick of this stage.
+        // The value sits normalised in the frame as a full 64 bit word, so a
+        // `cmp rax, <key>` works for every key width.
+        let val: u32 = fir.b_t1_of(f, fnr, bb)
+        let def: u32 = fir.b_t2_of(f, fnr, bb)
+        let off: u32 = fir.b_t3_of(f, fnr, bb)
+        let len: u32 = fir.b_t4_of(f, fnr, bb)
+        if len == 0 {
+            ins(c)
+            var j0: [u8; 4] = "jmp "
+            w(c, (&j0[0]) as u64, 4)
+            blocklabel(c, fir.f_name_of(f, fnr), def)
+            nl(c)
+            return
+        }
+        load_value(c, R_AX, val)
+        var k: u32 = 0
+        while k < len {
+            ins(c)
+            var cm: [u8; 9] = "cmp rax, "
+            w(c, (&cm[0]) as u64, 9)
+            inum(c, fir.sw_key_at(f, off + k))
+            nl(c)
+            ins(c)
+            var per: [u8; 3] = "je "
+            w(c, (&per[0]) as u64, 3)
+            blocklabel(c, fir.f_name_of(f, fnr), fir.sw_target(f, off + k))
+            nl(c)
+            k = k + 1
+        }
+        ins(c)
+        var j9: [u8; 4] = "jmp "
+        w(c, (&j9[0]) as u64, 4)
+        blocklabel(c, fir.f_name_of(f, fnr), def)
+        nl(c)
+        return
+    }
+    let v: u32 = fir.b_t1_of(f, fnr, bb)
+    if v != fir.NONE {
+        // ROUND 71: a floating point result goes into `xmm0`, as System V
+        // prescribes -- and as every other compiler on this platform
+        // expects it.
+        let rty: u32 = fir.f_ret_of(f, fnr)
+        if fir.is_float_ty(rty) {
+            load_xmm_w(c, 0, v, rty == fir.T_F32)
+        } else {
+            load_value(c, R_AX, v)
+        }
+    }
+    var lv: [u8; 5] = "leave"
+    raw(c, (&lv[0]) as u64, 5)
+    // ROUND 52: an `#[interrupt]` function restores all registers first
+    // and ends with `iretq` -- only that instruction restores rflags, cs
+    // and rsp of the interrupted thread.
+    if fir.f_int_of(f, fnr) == 1 {
+        int_register(c, true)
+        var iq: [u8; 5] = "iretq"
+        raw(c, (&iq[0]) as u64, 5)
+        return
+    }
+    var rt2: [u8; 3] = "ret"
+    raw(c, (&rt2[0]) as u64, 3)
+}
+
+// ROUND 52: the registers an `#[interrupt]` function saves -- all general
+// purpose registers except `rsp` (the processor) and `rbp` (the ordinary
+// prologue). `back = true` reverses the order and writes `pop`.
+fn int_register(c: *mut Cg, back: bool) {
+    var tab: [u8; 53] = "rax|rcx|rdx|rbx|rsi|rdi|r8|r9|r10|r11|r12|r13|r14|r15"
+    var k: u32 = 0
+    while k < 14 {
+        var nr: u32 = k
+        if back {
+            nr = 13 - k
+        }
+        ins(c)
+        if back {
+            var po: [u8; 4] = "pop "
+            w(c, (&po[0]) as u64, 4)
+        } else {
+            var pu: [u8; 5] = "push "
+            w(c, (&pu[0]) as u64, 5)
+        }
+        piece(c, (&tab[0]) as u64, 53, nr)
+        nl(c)
+        k = k + 1
+    }
+}
+
+fn cg_run(c: *mut Cg) {
+    let f: *mut fir.Fir = ff(c)
+    // ROUND 72: which panic messages does this program need? Collected
+    // BEFORE the first instruction is written, because a checked site
+    // refers to its message by the label the table gives it.
+    panic_collect(c)
+    var header: [u8; 29] = ".intel_syntax noprefix\n.text\n"
+    t(c, (&header[0]) as u64, 29)
+    if !(*c).free {
+        var st: [u8; 39] = ".globl _start\n_start:\n    xor rbp, rbp\n"
+        t(c, (&st[0]) as u64, 39)
+        // HOOK gc (ROUND 88, codegen_x86.rs): THE COLLECTOR STARTS ITSELF.
+        // Whoever joins two pieces of text allocates on the GC heap; up to
+        // round 87 the program then died with exit code 70 and
+        // `firn-gc: gc_init() was not called`. Where the runtime is part of
+        // the program (the same condition as for the state block above), the
+        // setup is written here -- as the first instruction of the process,
+        // before the first instruction of the user, exactly once. `gc_init`
+        // is idempotent, so an explicit call in the source text keeps
+        // working. Under the kernel profile there is no `_start` at all.
+        if gc.gc_runtime(gcg(c)) != 0 as usize {
+            var gi: [u8; 21] = "    call _F1.gc_init\n"
+            t(c, (&gi[0]) as u64, 21)
+        }
+        var st1: [u8; 52] = "    mov rdi, rsp\n    and rsp, -16\n    call _F1.main\n"
+        t(c, (&st1[0]) as u64, 52)
+        var st2: [u8; 53] = "    mov edi, eax\n    mov eax, 60\n    syscall\n    hlt\n"
+        t(c, (&st2[0]) as u64, 53)
+    }
+
+    var fi: u32 = 0
+    while fi < fir.fn_count(f) as u32 {
+        frame_build(c, fi)
+        // ROUND 72: one label counter per function (panic_rt.rs::SiteCounter).
+        (*c).site = 0
+        nl(c)
+        var g: [u8; 7] = ".globl "
+        t(c, (&g[0]) as u64, 7)
+        sym(c, fir.f_name_of(f, fi))
+        nl(c)
+        sym(c, fir.f_name_of(f, fi))
+        var dp: [u8; 1] = ":"
+        t(c, (&dp[0]) as u64, 1)
+        nl(c)
+        if fir.f_int_of(f, fi) == 1 {
+            var ik: [u8; 51] = "    # interrupt: save all general purpose registers"
+            t(c, (&ik[0]) as u64, 51)
+            nl(c)
+            int_register(c, false)
+        }
+        var pr: [u8; 30] = "    push rbp\n    mov rbp, rsp\n"
+        t(c, (&pr[0]) as u64, 30)
+        if (*c).frame > 0 {
+            ins(c)
+            var sb: [u8; 9] = "sub rsp, "
+            w(c, (&sb[0]) as u64, 9)
+            number(c, (*c).frame)
+            nl(c)
+        }
+        // Save the parameters from the argument registers into their slots.
+        let plen: u32 = fir.f_plen_of(f, fi)
+        // ROUND 71: the same placement rule as at the call site, read from
+        // the other side. The parameters ARE the first values of the
+        // function, so `arg_regnum` can be asked with the parameter numbers.
+        let poff: u32 = fir.f_poff_of(f, fi)
+        var stack_i: u32 = 0
+        var k: u32 = 0
+        while k < plen {
+            let pty: u32 = fir.p_ty_of(f, poff + k)
+            let sse: bool = fir.is_float_ty(pty)
+            var sn: u32 = 0
+            var j: u32 = 0
+            while j < k {
+                if fir.is_float_ty(fir.p_ty_of(f, poff + j)) {
+                    sn = sn + 1
+                }
+                j = j + 1
+            }
+            var rnum: u32 = fir.NONE
+            if sse {
+                if sn < 8 { rnum = sn }
+            } else {
+                if k - sn < 6 { rnum = k - sn }
+            }
+            if rnum == fir.NONE {
+                // From the caller's stack: [rbp+16], [rbp+24], ...
+                ins(c)
+                var m2: [u8; 24] = "mov rax, qword ptr [rbp+"
+                w(c, (&m2[0]) as u64, 24)
+                number(c, 16 + stack_i as u64 * 8)
+                var e2: [u8; 1] = "]"
+                w(c, (&e2[0]) as u64, 1)
+                nl(c)
+                stack_i = stack_i + 1
+                store_slot(c, slot_of(c, k), R_AX)
+            } else if sse {
+                store_xmm_w(c, slot_of(c, k), rnum, pty == fir.T_F32)
+            } else {
+                ins(c)
+                var m: [u8; 19] = "mov qword ptr [rbp-"
+                w(c, (&m[0]) as u64, 19)
+                number(c, slot_of(c, k))
+                var s: [u8; 3] = "], "
+                w(c, (&s[0]) as u64, 3)
+                argreg(c, rnum)
+                nl(c)
+            }
+            k = k + 1
+        }
+        var bb: u32 = 0
+        while bb < fir.block_count(f, fi) {
+            blocklabel(c, fir.f_name_of(f, fi), bb)
+            var dp2: [u8; 1] = ":"
+            t(c, (&dp2[0]) as u64, 1)
+            nl(c)
+            var n: u32 = 0
+            while n < fir.inst_count(f, fi, bb) {
+                emit_inst(c, fi, fir.inst_at(f, fi, bb, n))
+                if (*c).unsuitable {
+                    return
+                }
+                n = n + 1
+            }
+            emit_term(c, fi, bb)
+            bb = bb + 1
+        }
+        fi = fi + 1
+    }
+    // HOOK gc: type table (.rodata) and state block (.data) of the collector --
+    // only if the program really contains a `gc class` (gc.rs).
+    if has_gc(c) {
+        gc_table(c)
+    }
+    // HOOK iface: the method tables (.rodata) -- only when the program
+    // really implements an interface (iface.rs, round 46).
+    if has_if(c) {
+        if_tables(c)
+    }
+    // HOOK fnval: the function records (.rodata) -- only when the program
+    // takes a function as a value at all (fnval.rs, round 58).
+    fnval_records(c)
+    // HOOK panic_rt: the message table (.rodata) and the shared out of line
+    // trampoline (round 72, SPEC 13) -- only if the program really contains
+    // a checked operation. `--opt-level=release-fast`, or a program that
+    // never reaches a checked path, carries not one octet of it.
+    if has_panic(c) {
+        panic_rodata(c)
+        panic_trampoline(c)
+    }
+    // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
+    // (round 89, SPEC 14.1.statics) -- only when the program declares a
+    // `static` at all.
+    if has_statics(c) {
+        statics_data(c)
+    }
+    var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
+    t(c, (&gnu[0]) as u64, 38)
+}

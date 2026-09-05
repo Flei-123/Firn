@@ -1,0 +1,226 @@
+// expect_exit: 0
+// tests/913_css_selectors.fi -- selectors: parsing, specificity, matching.
+//
+// The complete cross-check against cssselect2 on real pages runs in
+// tools/css/run.sh. What is checked here is what the cascade rests on:
+//
+//   1. specificity by the standard: ids, classes, types
+//   2. what is NOT supported is INVALID -- a pseudo-element or a namespace
+//      makes the whole selector fail, and with it its rule. A selector
+//      that silently matches nothing would quietly change the cascade.
+//   3. matching from right to left over all four combinators
+//   4. `:nth-child`, `:not` and `:hover`
+//
+// The return value names the first case that deviates (1..9).
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+
+const SOURCE_LEN: usize = 119
+
+#[no_gc]
+fn source(out: *mut mem.Buf) {
+    var t: [u8; 119] = "<div id=\"a\" class=\"x y\"><p class=\"x\">1</p><p>2</p><span>3</span></div><ul><li>a</li><li class=\"s\">b</li><li>c</li></ul>"
+    mem.buf_clear(out)
+    var i: usize = 0
+    while i < SOURCE_LEN {
+        mem.buf_push(out, t[i])
+        i = i + 1
+    }
+}
+
+fn parse_selector(text: *mut mem.CpBuf, t: *mut tok.Tokens, nm: *mut names.Names,
+    tmp: *mut mem.CpBuf, p: u64, n: usize) -> Gc[Sel] {
+    mem.cp_clear(text)
+    var i: usize = 0
+    while i < n {
+        mem.cp_push(text, (*((p + i as u64) as *mut u8)) as u32)
+        i = i + 1
+    }
+    tok.tokenize(t, text)
+    var pp: cv.Parser = cv.parser_new(t)
+    let values = cv.parse_component_value_list(&pp) catch gc_null[Cv]()
+    return sel.sel_parse(values, nm, tmp) catch gc_null[Sel]()
+}
+
+fn next_in_order(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+// The indices of the elements that match, packed as a bit mask.
+fn hits(s: Gc[Sel], doc: Gc[Node], cx: *mut sel.Ctx) -> u64 {
+    var mask: u64 = 0
+    var bit: u64 = 1
+    var k: Gc[Node] = doc
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            if sel.sel_matches(s, k, cx) {
+                mask = mask | bit
+            }
+            bit = bit * 2
+        }
+        k = next_in_order(k, doc)
+    }
+    return mask
+}
+
+fn elem_at(doc: Gc[Node], want: u64) -> Gc[Node] {
+    var i: u64 = 0
+    var k: Gc[Node] = doc
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            if i == want {
+                return k
+            }
+            i = i + 1
+        }
+        k = next_in_order(k, doc)
+    }
+    return gc_null[Node]()
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    var src: mem.Buf = mem.buf_new()
+    mem.buf_init(&src)
+    source(&src)
+    driver.run_text_out_bytes(&run, mem.buf_ptr(&src), mem.buf_len(&src))
+    if driver.run_document_build(&run) != 0 as u32 {
+        return 92
+    }
+    let doc: Gc[Document] = driver.run_document(&run)
+    let nm: *mut names.Names = driver.run_names(&run)
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var text: mem.CpBuf = mem.cp_new()
+    var tmp: mem.CpBuf = mem.cp_new()
+    var cx: sel.Ctx = sel.ctx_new(nm)
+    sel.ctx_init(&cx)
+
+    // The elements in document order:
+    //  0 html  1 head  2 body  3 div#a.x.y  4 p.x  5 p  6 span
+    //  7 ul  8 li  9 li.s  10 li
+
+    // 1. specificity
+    var q1: [u8; 7] = "#a .x p"
+    let s1: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q1[0]) as u64, 7)
+    if s1 == gc_null[Sel]() {
+        return 1
+    }
+    if sel.spec_a(s1.spec) != 1 as u32 {
+        return 1
+    }
+    if sel.spec_b(s1.spec) != 1 as u32 {
+        return 1
+    }
+    if sel.spec_c(s1.spec) != 1 as u32 {
+        return 1
+    }
+
+    // 2. a pseudo-element is not supported -> invalid
+    var q2: [u8; 9] = "p::before"
+    if parse_selector(&text, &t, nm, &tmp, (&q2[0]) as u64, 9) != gc_null[Sel]() {
+        return 2
+    }
+    // a namespace is not supported either
+    var q2b: [u8; 4] = "ns|a"
+    if parse_selector(&text, &t, nm, &tmp, (&q2b[0]) as u64, 4) != gc_null[Sel]() {
+        return 2
+    }
+    // an unknown pseudo-class as well
+    var q2c: [u8; 9] = "p:checked"
+    if parse_selector(&text, &t, nm, &tmp, (&q2c[0]) as u64, 9) != gc_null[Sel]() {
+        return 2
+    }
+
+    // 3. descendant and child
+    var q3: [u8; 5] = "div p"
+    let s3: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q3[0]) as u64, 5)
+    if hits(s3, doc, &cx) != 48 { // 2^4 + 2^5
+        return 3
+    }
+    var q3b: [u8; 7] = "body>ul"
+    let s3b: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q3b[0]) as u64, 7)
+    if hits(s3b, doc, &cx) != 128 { // 2^7
+        return 3
+    }
+
+    // 4. the sibling combinators
+    var q4: [u8; 6] = "p+span"
+    let s4: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q4[0]) as u64, 6)
+    if hits(s4, doc, &cx) != 64 { // 2^6
+        return 4
+    }
+    var q4b: [u8; 6] = "p~span"
+    let s4b: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q4b[0]) as u64, 6)
+    if hits(s4b, doc, &cx) != 64 {
+        return 4
+    }
+
+    // 5. class and id
+    var q5: [u8; 2] = ".x"
+    let s5: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q5[0]) as u64, 2)
+    if hits(s5, doc, &cx) != 24 { // 2^3 + 2^4
+        return 5
+    }
+    var q5b: [u8; 2] = "#a"
+    let s5b: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q5b[0]) as u64, 2)
+    if hits(s5b, doc, &cx) != 8 {
+        return 5
+    }
+
+    // 6. nth-child
+    var q6: [u8; 18] = "li:nth-child(2n+1)"
+    let s6: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q6[0]) as u64, 18)
+    if hits(s6, doc, &cx) != 1280 { // 2^8 + 2^10
+        return 6
+    }
+
+    // 7. not
+    var q7: [u8; 10] = "li:not(.s)"
+    let s7: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q7[0]) as u64, 10)
+    if hits(s7, doc, &cx) != 1280 {
+        return 7
+    }
+
+    // 8. a group of selectors
+    var q8: [u8; 8] = "span, ul"
+    let s8: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q8[0]) as u64, 8)
+    if hits(s8, doc, &cx) != 192 { // 2^6 + 2^7
+        return 8
+    }
+
+    // 9. hover fits the whole path to the root
+    var q9: [u8; 6] = ":hover"
+    let s9: Gc[Sel] = parse_selector(&text, &t, nm, &tmp, (&q9[0]) as u64, 6)
+    if hits(s9, doc, &cx) != 0 {
+        return 9
+    }
+    sel.ctx_set_hover(&cx, elem_at(doc, 4))
+    // html(0), body(2), div(3), p(4) -- head(1) is not on the path
+    if hits(s9, doc, &cx) != 29 {
+        return 9
+    }
+    tok.tokens_free(&t)
+    return 0
+}

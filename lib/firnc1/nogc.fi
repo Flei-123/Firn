@@ -1,0 +1,366 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/nogc.fi -- the `#[no_gc]` promise for hot paths, checked
+// transitively (SPEC 3.5.4). Fifteenth part of stage 1: the port of
+// `compiler/src/nogc.rs` (round 34).
+//
+// Inside a `#[no_gc]` function these are forbidden:
+//  1. GC allocation (and every call that could trigger a collection),
+//  2. calling a function WITHOUT `#[no_gc]`,
+//  3. writing a `Gc[T]`/`GcWeak[T]` pointer into a field or array
+//     element (insertion barrier).
+//
+// Because every called function has to carry `#[no_gc]` itself, the promise
+// holds for the whole call tree -- across module boundaries as well (by
+// then the names have been rewritten to `module__name`, and the checker
+// sees a flat tree). The GC queries (1 and 3) come from `gc.fi` -- exactly
+// the two contract functions whose signatures stage 0 fixes.
+//
+// Scope, honestly stated (like stage 0):
+//  * Every call in the body is checked, INCLUDING the body blocks
+//    of `match` arms -- they do not sit in the tree but in the
+//    registry of `pattern.fi`.
+//  * Callee names produced by the compiler (`__match#N`, `__try#`, `__catch#`,
+//    `Enum::Variant`) are not function calls; their arguments are
+//    searched through all the same.
+//  * Calls of names that do not exist at all are reported by the type
+//    check itself -- there is no second error for them here.
+
+import rt
+import vec
+import intern
+import ast
+import types
+import pattern
+import gc
+import sema
+
+export { nogc_check }
+
+const NONE: u32 = 4294967295
+
+// Deepest nesting level of `match` arms that is still inspected
+// (a second safeguard against runaway recursion, as in stage 0).
+const MAX_DEPTH: u32 = 256
+
+struct Checker {
+    sm: u64, // the type checker (type table of the expressions)
+    mu: u64, // pattern registry
+    gcr: u64, // GC registry
+    it: u64, // interner
+    m_name: Vec[u32], // function names ->
+    m_flag: Vec[u32], // 1 = has `#[no_gc]`
+    err: usize,
+    depth: u32, // nesting depth of the `match` body blocks
+}
+
+fn names(p: *mut Checker) -> *mut intern.Interner { return (*p).it as *mut intern.Interner }
+fn gcr(p: *mut Checker) -> *mut gc.Gc { return (*p).gcr as *mut gc.Gc }
+fn table(p: *mut Checker) -> *mut types.Types {
+    return sema.sema_types((*p).sm as *mut sema.Sema)
+}
+fn mul(p: *mut Checker) -> *mut pattern.Pat { return (*p).mu as *mut pattern.Pat }
+
+// 0 = unknown (reported by the type check itself), 1 = marked, 2 = cold.
+fn marking(p: *mut Checker, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).m_name) {
+        if vec_at[u32](&(*p).m_name, i) == name {
+            if vec_at[u32](&(*p).m_flag, i) == 1 {
+                return 1
+            }
+            return 2
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// A callee name produced by the compiler itself: it contains `#` or `::`,
+// so it can never come from a source text identifier.
+fn is_method_call(it: *mut intern.Interner, name: u32) -> bool {
+    var w: [u8; 7] = "method "
+    return intern.intern_prefix(it, name, (&w[0]) as u64, 7)
+}
+
+fn is_interner_name(it: *mut intern.Interner, nr: u32) -> bool {
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    while i < n {
+        let b: u8 = rt.ld8(p, i)
+        if b == 35 as u8 {
+            return true
+        }
+        if b == 58 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 58 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The actual pass. Returns the number of violations.
+fn nogc_check(sm: u64, mu: u64, gcr2: u64, it: u64) -> usize {
+    var p: Checker = Checker {
+        sm: sm, mu: mu, gcr: gcr2, it: it,
+        m_name: vec_new[u32](), m_flag: vec_new[u32](),
+        err: 0, depth: 0,
+    }
+    let b: *mut ast.Tree = sema.sema_tree(p.sm as *mut sema.Sema)
+    // Collect the markings. For names declared twice (which the type
+    // check reports as an error of its own) the stricter entry wins: marked
+    // stays marked.
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        let nm: u32 = ast.fn_name(b, i)
+        let fl: u32 = ast.fn_nogc(b, i)
+        var j: usize = 0
+        var hit: bool = false
+        while j < vec_len[u32](&p.m_name) {
+            if vec_at[u32](&p.m_name, j) == nm {
+                if fl == 1 {
+                    vec_set[u32](&p.m_flag, j, 1)
+                }
+                hit = true
+            }
+            j = j + 1
+        }
+        if !hit {
+            vec_push[u32](&p.m_name, nm)
+            vec_push[u32](&p.m_flag, fl)
+        }
+        i = i + 1
+    }
+    var a: bool = false
+    i = 0
+    while i < vec_len[u32](&p.m_flag) {
+        if vec_at[u32](&p.m_flag, i) == 1 {
+            a = true
+        }
+        i = i + 1
+    }
+    if a {
+        i = 0
+        while i < ast.fn_count(b) {
+            if ast.fn_nogc(b, i) == 1 {
+                check_block(&p, b, ast.fn_body(b, i))
+            }
+            i = i + 1
+        }
+    }
+    let out: usize = p.err
+    vec_free[u32](&p.m_name)
+    vec_free[u32](&p.m_flag)
+    return out
+}
+
+fn check_block(p: *mut Checker, b: *mut ast.Tree, bi: u32) {
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        check_stmt(p, b, ast.slist_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+}
+
+fn check_stmt(p: *mut Checker, b: *mut ast.Tree, i: u32) {
+    let a: u32 = ast.s_kind(b, i)
+    if a == ast.S_LET || a == ast.S_VAR {
+        check_expr(p, b, ast.s_c(b, i))
+        return
+    }
+    if a == ast.S_ZUW || a == ast.S_ZUWOP {
+        check_write_target(p, b, ast.s_a(b, i))
+        check_expr(p, b, ast.s_a(b, i))
+        check_expr(p, b, ast.s_b(b, i))
+        return
+    }
+    // ROUND 70: the step writes into the target as well, and has no value.
+    if a == ast.S_STEP {
+        check_write_target(p, b, ast.s_a(b, i))
+        check_expr(p, b, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_IF {
+        check_expr(p, b, ast.s_a(b, i))
+        check_block(p, b, ast.s_b(b, i))
+        if ast.s_c(b, i) != ast.NOTHING {
+            check_stmt(p, b, ast.s_c(b, i))
+        }
+        return
+    }
+    if a == ast.S_WHILE {
+        check_expr(p, b, ast.s_a(b, i))
+        check_block(p, b, ast.s_b(b, i))
+        return
+    }
+    if a == ast.S_FOR {
+        check_expr(p, b, ast.s_b(b, i))
+        check_expr(p, b, ast.s_c(b, i))
+        check_block(p, b, ast.s_d(b, i))
+        return
+    }
+    if a == ast.S_RET {
+        if ast.s_a(b, i) != ast.NOTHING {
+            check_expr(p, b, ast.s_a(b, i))
+        }
+        return
+    }
+    if a == ast.S_EXPR {
+        check_expr(p, b, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_BLOCK {
+        check_block(p, b, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        // The deferred body runs in the same frame and follows
+        // the same rules.
+        check_stmt(p, b, ast.s_a(b, i))
+        return
+    }
+    // S_BREAK / S_CONT: no calls.
+}
+
+// Rule 3: writing a GC pointer into a field (or into an array element).
+// A plain assignment to a local variable stays on the
+// stack, needs no insertion barrier and is allowed.
+fn check_write_target(p: *mut Checker, b: *mut ast.Tree, target: u32) {
+    let ty: u32 = sema.sema_ty((*p).sm as *mut sema.Sema, target)
+    if !gc.gc_is_gc_ref(gcr(p), table(p), ty) {
+        return
+    }
+    let a: u32 = ast.e_kind(b, target)
+    if a == ast.E_FIELD {
+        (*p).err = (*p).err + 1
+        return
+    }
+    if a == ast.E_IDX {
+        // `local_array[i]` lives on the stack -- allowed.
+        if ast.e_kind(b, ast.e_a(b, target)) == ast.E_ID {
+            return
+        }
+        (*p).err = (*p).err + 1
+        return
+    }
+    if a == ast.E_UN && ast.e_a(b, target) == 3 {
+        (*p).err = (*p).err + 1
+        return
+    }
+}
+
+fn check_expr(p: *mut Checker, b: *mut ast.Tree, e: u32) {
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_CALL {
+        let name: u32 = ast.e_a(b, e)
+        check_call(p, name)
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            check_expr(p, b, ast.child_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        check_match_cases(p, name)
+        return
+    }
+    if a == ast.E_UN {
+        check_expr(p, b, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_BIN {
+        check_expr(p, b, ast.e_b(b, e))
+        check_expr(p, b, ast.e_c(b, e))
+        return
+    }
+    if a == ast.E_FIELD {
+        check_expr(p, b, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_IDX {
+        check_expr(p, b, ast.e_a(b, e))
+        check_expr(p, b, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_SYSCALL || a == ast.E_ALIT {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            check_expr(p, b, ast.child_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        return
+    }
+    // ROUND 70 (strtype.rs): the text literal carries its array literal inside.
+    if a == ast.E_TEXT {
+        check_expr(p, b, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_AS {
+        check_expr(p, b, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_SLIT {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            check_expr(p, b, ast.child_at(b, ast.e_b(b, e) + k * 2 + 1))
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_AWDH {
+        check_expr(p, b, ast.e_a(b, e))
+        check_expr(p, b, ast.e_b(b, e))
+        return
+    }
+    // E_INT / E_FLOAT / E_BOOL / E_ID: leaves.
+}
+
+fn check_call(p: *mut Checker, name: u32) {
+    // Rule 1: GC allocation -- can trigger a collection.
+    if gc.gc_is_alloc_call(gcr(p), names(p), name) {
+        (*p).err = (*p).err + 1
+        return
+    }
+    // ROUND 45 (nogc.rs): a method call cannot be resolved here --
+    // which function is behind it is known only from the type of the receiver.
+    // Reject it explicitly instead of stepping over it silently: a hole
+    // in a promise would be worse than a missing convenience.
+    if is_method_call(names(p), name) {
+        (*p).err = (*p).err + 1
+        return
+    }
+    if is_interner_name(names(p), name) {
+        return
+    }
+    // Rule 2: call without #[no_gc] -- breaks the chain.
+    if marking(p, name) == 2 {
+        (*p).err = (*p).err + 1
+        return
+    }
+}
+
+// `match` sits in the tree as the call `__match#N`; the body blocks of
+// the arms live in the registry of `pattern.fi`. Without this descent
+// every state machine would be a blind spot (tests/541, tests/neg/nogc_match_case).
+fn check_match_cases(p: *mut Checker, name: u32) {
+    if (*p).mu == 0 {
+        return
+    }
+    if !pattern.pat_is_matchname(names(p), name) {
+        return
+    }
+    let mi: u32 = pattern.pat_match_number(names(p), name)
+    let m: *mut pattern.Pat = mul(p)
+    let b: *mut ast.Tree = sema.sema_tree((*p).sm as *mut sema.Sema)
+    if (*p).depth >= MAX_DEPTH {
+        return
+    }
+    (*p).depth = (*p).depth + 1
+    check_expr(p, b, pattern.pat_m_subj(m, mi))
+    let aoff: u32 = pattern.pat_m_aoff(m, mi)
+    let alen: u32 = pattern.pat_m_alen(m, mi)
+    var k: u32 = 0
+    while k < alen {
+        check_block(p, b, pattern.pat_a_block(m, aoff + k))
+        k = k + 1
+    }
+    (*p).depth = (*p).depth - 1
+}

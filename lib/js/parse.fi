@@ -1,0 +1,3537 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/parse.fi -- the ECMAScript PARSER (ECMA-262, clauses 13-16) in
+// Firn. Recursive descent, one token of state, no backtracking except for
+// the two places where the grammar itself demands it (the cover grammar of
+// the arrow function and the parenthesized expression).
+//
+// THE THREE HARD PARTS, and how they are solved here:
+//
+//   1. THE SLASH. `/` is a division operator or the start of a regular
+//      expression depending on the goal symbol (12.1). The parser does not
+//      guess: it scans everything as `InputElementDiv`, and at exactly the
+//      place where a PRIMARY EXPRESSION may begin it re-scans a `/` or `/=`
+//      as a regular expression (`lex_regexp_from`). That is exact, because
+//      the parser -- and only the parser -- knows whether an expression may
+//      begin here.
+//   2. THE CLOSING BRACE OF A TEMPLATE. Same construction: after the
+//      expression of a substitution the parser calls `lex_template_continue`
+//      on the brace instead of taking the brace as a punctuator.
+//   3. AUTOMATIC SEMICOLON INSERTION (11.9). It hangs on ONE bit that the
+//      lexer records: was there a line terminator before this token. The
+//      three rules (offending token `}`, line terminator before it, end of
+//      input) plus the restricted productions (`return`, `throw`, `break`,
+//      `continue`, postfix `++`/`--`, `=>`) are in `p_semicolon` and in the
+//      places marked with "no LineTerminator here".
+//
+// THE COVER GRAMMAR. `(a, b)` is either a parenthesized expression or the
+// parameter list of an arrow function, and which one is only known at the
+// `=>`. The parser reads it as an EXPRESSION and turns it into a parameter
+// list afterwards (`to_pattern`) -- the same trick the specification uses
+// with CoverParenthesizedExpressionAndArrowParameterList. Object and array
+// literals become destructuring patterns the same way.
+//
+// EARLY ERRORS. A parser that only builds a tree is worth little for
+// test262: a large part of the suite consists of programs that MUST NOT
+// parse. What is checked is in `docs/ROUND63.md`; among them strict mode
+// (octal literals, `with`, assignment to `eval`/`arguments`, duplicate
+// parameters), the assignment target, duplicate lexical declarations,
+// `new.target` outside a function, labels, and rest elements.
+import html.mem
+import js.lex
+import js.ast
+
+export {
+    Parser, parser_new, parser_init, parser_free,
+    parse_program, parse_error, parse_error_line, parse_error_code,
+    ERR_NONE, ERR_SYNTAX, ERR_STRICT, ERR_ASSIGN_TARGET, ERR_DUPLICATE,
+    ERR_LABEL, ERR_UNSUPPORTED,
+}
+
+const ERR_NONE: u32 = 0
+const ERR_SYNTAX: u32 = 1
+const ERR_STRICT: u32 = 2
+const ERR_ASSIGN_TARGET: u32 = 3
+const ERR_DUPLICATE: u32 = 4
+const ERR_LABEL: u32 = 5
+const ERR_UNSUPPORTED: u32 = 6
+
+// The kinds of a binding in the scope stack.
+const B_VAR: u32 = 1
+const B_LEX: u32 = 2
+const B_PARAM: u32 = 3
+const B_FUNC: u32 = 4
+
+struct Parser {
+    l: *mut lex.Lexer,
+    t: *mut ast.Ast,
+    nm: *mut lex.Names,
+    // the current token
+    kind: u32,
+    code: u32,
+    start: usize,
+    end: usize,
+    line: u32,
+    nl: bool,
+    name: u32,
+    numbits: u64,
+    soff: usize,
+    slen: usize,
+    roff: usize,
+    rlen: usize,
+    tflags: u32,
+    // the state of the parser
+    strict: bool,
+    module: bool,
+    in_func: u32,
+    in_iter: u32,
+    in_switch: u32,
+    in_class: u32,
+    in_method: u32,
+    in_derived: u32,
+    // Round 66: the two context parameters [Yield] and [Await] of the
+    // grammar, plus the three places that forbid a suspension point.
+    in_gen: u32,
+    in_async: u32,
+    in_params: u32,
+    in_field: u32,
+    in_static_block: u32,
+    saw_use_strict: u32,
+    // error
+    err: u32,
+    errline: u32,
+    // the scope stack for the duplicate check
+    scope_name: mem.CpBuf,
+    scope_kind: mem.CpBuf,
+    scope_mark: mem.CpBuf,
+    scope_fn: mem.CpBuf,
+    // the label stack
+    labels: mem.CpBuf,
+    label_iter: mem.CpBuf,
+    // The private names of the open classes plus the references that are
+    // not resolved YET -- a reference may stand before its declaration.
+    priv_name: mem.CpBuf,
+    priv_kind: mem.CpBuf,
+    priv_mark: mem.CpBuf,
+    priv_ref: mem.CpBuf,
+    priv_refmark: mem.CpBuf,
+}
+
+// The kinds of a private class element, for the duplicate check (15.7.1).
+const PV_FIELD: u32 = 1
+const PV_GET: u32 = 2
+const PV_SET: u32 = 4
+const PV_STATIC: u32 = 8
+
+fn parser_new() -> Parser {
+    return Parser {
+        l: 0 as *mut lex.Lexer, t: 0 as *mut ast.Ast, nm: 0 as *mut lex.Names,
+        kind: 0, code: 0, start: 0, end: 0, line: 1, nl: false, name: 0,
+        numbits: 0, soff: 0, slen: 0, roff: 0, rlen: 0, tflags: 0,
+        strict: false, module: false, in_func: 0, in_iter: 0, in_switch: 0,
+        in_class: 0, in_method: 0, in_derived: 0,
+        in_gen: 0, in_async: 0, in_params: 0, in_field: 0,
+        in_static_block: 0, saw_use_strict: 0,
+        err: ERR_NONE, errline: 0,
+        scope_name: mem.cp_new(), scope_kind: mem.cp_new(),
+        scope_mark: mem.cp_new(), scope_fn: mem.cp_new(),
+        labels: mem.cp_new(), label_iter: mem.cp_new(),
+        priv_name: mem.cp_new(), priv_kind: mem.cp_new(),
+        priv_mark: mem.cp_new(), priv_ref: mem.cp_new(),
+        priv_refmark: mem.cp_new(),
+    }
+}
+
+fn parser_init(p: *mut Parser, l: *mut lex.Lexer, t: *mut ast.Ast,
+    nm: *mut lex.Names) {
+    (*p).l = l
+    (*p).t = t
+    (*p).nm = nm
+    mem.cp_init(&(*p).scope_name)
+    mem.cp_init(&(*p).scope_kind)
+    mem.cp_init(&(*p).scope_mark)
+    mem.cp_init(&(*p).scope_fn)
+    mem.cp_init(&(*p).labels)
+    mem.cp_init(&(*p).label_iter)
+    mem.cp_init(&(*p).priv_name)
+    mem.cp_init(&(*p).priv_kind)
+    mem.cp_init(&(*p).priv_mark)
+    mem.cp_init(&(*p).priv_ref)
+    mem.cp_init(&(*p).priv_refmark)
+}
+
+fn parser_free(p: *mut Parser) {
+    mem.cp_free(&(*p).scope_name)
+    mem.cp_free(&(*p).scope_kind)
+    mem.cp_free(&(*p).scope_mark)
+    mem.cp_free(&(*p).scope_fn)
+    mem.cp_free(&(*p).labels)
+    mem.cp_free(&(*p).label_iter)
+    mem.cp_free(&(*p).priv_name)
+    mem.cp_free(&(*p).priv_kind)
+    mem.cp_free(&(*p).priv_mark)
+    mem.cp_free(&(*p).priv_ref)
+    mem.cp_free(&(*p).priv_refmark)
+}
+
+fn parse_error(p: *mut Parser) -> u32 { return (*p).err }
+fn parse_error_line(p: *mut Parser) -> u32 { return (*p).errline }
+fn parse_error_code(p: *mut Parser) -> u32 { return (*p).err }
+
+fn fail(p: *mut Parser, code: u32) {
+    if (*p).err == ERR_NONE {
+        (*p).err = code
+        (*p).errline = (*p).line
+    }
+}
+
+// ------------------------------------------------------------- The token
+
+fn take(p: *mut Parser) {
+    let l: *mut lex.Lexer = (*p).l
+    (*p).kind = (*l).kind
+    (*p).code = (*l).code
+    (*p).start = (*l).start
+    (*p).end = (*l).end
+    (*p).line = (*l).tline
+    (*p).nl = (*l).nl
+    (*p).name = (*l).name
+    (*p).numbits = (*l).numbits
+    (*p).soff = (*l).soff
+    (*p).slen = (*l).slen
+    (*p).roff = (*l).roff
+    (*p).rlen = (*l).rlen
+    (*p).tflags = (*l).flags
+    if (*l).kind == lex.T_ERROR {
+        fail(p, ERR_SYNTAX)
+        (*p).errline = (*l).errline
+        if (*l).err == lex.E_BIGINT {
+            (*p).err = ERR_UNSUPPORTED
+        }
+    }
+}
+
+fn advance(p: *mut Parser) {
+    lex.lex_next((*p).l, lex.GOAL_DIV)
+    take(p)
+}
+
+// Re-read the current token as a regular expression. Called exactly where
+// a primary expression may begin.
+fn regexp_here(p: *mut Parser) {
+    lex.lex_regexp_from((*p).l, (*p).start, (*p).line)
+    take(p)
+}
+
+fn is_punct(p: *mut Parser, c: u32) -> bool {
+    return (*p).kind == lex.T_PUNCT && (*p).code == c
+}
+
+// A reserved word only counts as a keyword when it was written WITHOUT a
+// unicode escape (12.7.2: `\u0069f` is not `if`). As a property name an
+// escape is allowed, which is why the check sits here and not in the lexer.
+fn is_kw(p: *mut Parser, c: u32) -> bool {
+    return (*p).kind == lex.T_KEYWORD && (*p).code == c && (*p).tflags & lex.F_ESCAPED == 0 as u32
+}
+
+// A contextual keyword: an identifier with exactly this name and without an
+// escape (12.7.2 -- `async` is not `async`).
+fn is_name(p: *mut Parser, id: u32) -> bool {
+    return (*p).kind == lex.T_IDENT && (*p).name == id && (*p).tflags & lex.F_ESCAPED == 0 as u32
+}
+
+fn eat_punct(p: *mut Parser, c: u32) -> bool {
+    if is_punct(p, c) {
+        advance(p)
+        return true
+    }
+    return false
+}
+
+fn expect_punct(p: *mut Parser, c: u32) {
+    if !eat_punct(p, c) {
+        fail(p, ERR_SYNTAX)
+    }
+}
+
+fn eat_kw(p: *mut Parser, c: u32) -> bool {
+    if is_kw(p, c) {
+        advance(p)
+        return true
+    }
+    return false
+}
+
+// 11.9: the semicolon that may be missing.
+fn semicolon(p: *mut Parser) {
+    if is_punct(p, lex.P_SEMI) {
+        advance(p)
+        return
+    }
+    if is_punct(p, lex.P_RBRACE) || (*p).kind == lex.T_EOF || (*p).nl {
+        return
+    }
+    fail(p, ERR_SYNTAX)
+}
+
+// ------------------------------------------------------------- The scopes
+
+fn scope_enter(p: *mut Parser, fn_boundary: bool) {
+    mem.cp_push(&(*p).scope_mark, mem.cp_len(&(*p).scope_name) as u32)
+    var v: u32 = 0
+    if fn_boundary {
+        v = 1
+    }
+    mem.cp_push(&(*p).scope_fn, v)
+}
+
+fn scope_leave(p: *mut Parser) {
+    let n: usize = mem.cp_len(&(*p).scope_mark)
+    let mark: usize = mem.cp_at(&(*p).scope_mark, n - 1) as usize
+    mem.cp_truncate(&(*p).scope_name, mark)
+    mem.cp_truncate(&(*p).scope_kind, mark)
+    mem.cp_truncate(&(*p).scope_mark, n - 1)
+    mem.cp_truncate(&(*p).scope_fn, n - 1)
+}
+
+fn scope_top_mark(p: *mut Parser) -> usize {
+    let n: usize = mem.cp_len(&(*p).scope_mark)
+    if n == 0 {
+        return 0
+    }
+    return mem.cp_at(&(*p).scope_mark, n - 1) as usize
+}
+
+// Declare `name`. Reports the early errors of 14.2.1 / 14.3.1: two lexical
+// declarations of the same name in one scope, and a `var` that collides
+// with a lexical declaration on the way to the function boundary.
+fn declare(p: *mut Parser, name: u32, kind: u32) {
+    if name == 0xFFFFFFFF as u32 {
+        return
+    }
+    let mark: usize = scope_top_mark(p)
+    let top: usize = mem.cp_len(&(*p).scope_name)
+    if kind == B_LEX || kind == B_PARAM {
+        var i: usize = mark
+        while i < top {
+            if mem.cp_at(&(*p).scope_name, i) == name {
+                fail(p, ERR_DUPLICATE)
+                return
+            }
+            i = i + 1
+        }
+    } else if kind == B_FUNC {
+        var i: usize = mark
+        while i < top {
+            if mem.cp_at(&(*p).scope_name, i) == name && mem.cp_at(&(*p).scope_kind, i) == B_LEX {
+                fail(p, ERR_DUPLICATE)
+                return
+            }
+            i = i + 1
+        }
+    } else {
+        // var: look for a lexical declaration up to the function boundary
+        var s: usize = mem.cp_len(&(*p).scope_mark)
+        var hi: usize = top
+        while s > 0 {
+            let lo: usize = mem.cp_at(&(*p).scope_mark, s - 1) as usize
+            var i: usize = lo
+            while i < hi {
+                if mem.cp_at(&(*p).scope_name, i) == name && mem.cp_at(&(*p).scope_kind, i) == B_LEX {
+                    fail(p, ERR_DUPLICATE)
+                    return
+                }
+                i = i + 1
+            }
+            if mem.cp_at(&(*p).scope_fn, s - 1) == 1 as u32 {
+                break
+            }
+            hi = lo
+            s = s - 1
+        }
+    }
+    mem.cp_push(&(*p).scope_name, name)
+    mem.cp_push(&(*p).scope_kind, kind)
+}
+
+// ------------------------------------------------------- The private names
+//
+// `#x` may be USED before it is declared (`class C { m() { return this.#y }
+//  #y = 1 }`), so one pass cannot decide at the place of use. Every use is
+// therefore remembered; at the end of a class body the uses of that body
+// are held against ITS declarations, and whatever stays open belongs to an
+// enclosing class. What is still open when the outermost class closes is
+// the early error of 13.3.2.1 (AllPrivateIdentifiersValid).
+
+fn priv_enter(p: *mut Parser) {
+    mem.cp_push(&(*p).priv_mark, mem.cp_len(&(*p).priv_name) as u32)
+    mem.cp_push(&(*p).priv_refmark, mem.cp_len(&(*p).priv_ref) as u32)
+}
+
+fn priv_declare(p: *mut Parser, name: u32, kind: u32) {
+    let n: usize = mem.cp_len(&(*p).priv_mark)
+    if n == 0 {
+        return
+    }
+    if name == lex.N_CONSTRUCTOR {
+        // `#constructor` is not a valid private name (15.7.1).
+        fail(p, ERR_SYNTAX)
+        return
+    }
+    let mark: usize = mem.cp_at(&(*p).priv_mark, n - 1) as usize
+    var i: usize = mark
+    while i < mem.cp_len(&(*p).priv_name) {
+        if mem.cp_at(&(*p).priv_name, i) == name {
+            let other: u32 = mem.cp_at(&(*p).priv_kind, i)
+            // Only a getter and a setter of the same staticness may share
+            // a name -- everything else is a duplicate.
+            let both: u32 = other | kind
+            if both != (PV_GET | PV_SET) && both != (PV_GET | PV_SET | PV_STATIC) {
+                fail(p, ERR_DUPLICATE)
+                return
+            }
+            if other & PV_STATIC != kind & PV_STATIC {
+                fail(p, ERR_DUPLICATE)
+                return
+            }
+        }
+        i = i + 1
+    }
+    mem.cp_push(&(*p).priv_name, name)
+    mem.cp_push(&(*p).priv_kind, kind)
+}
+
+fn priv_use(p: *mut Parser, name: u32) {
+    mem.cp_push(&(*p).priv_ref, name)
+}
+
+fn priv_leave(p: *mut Parser) {
+    let n: usize = mem.cp_len(&(*p).priv_mark)
+    if n == 0 {
+        return
+    }
+    let mark: usize = mem.cp_at(&(*p).priv_mark, n - 1) as usize
+    let rmark: usize = mem.cp_at(&(*p).priv_refmark, n - 1) as usize
+    // Keep every reference this class does not declare -- it belongs to a
+    // class further out.
+    var keep: usize = rmark
+    var i: usize = rmark
+    while i < mem.cp_len(&(*p).priv_ref) {
+        let name: u32 = mem.cp_at(&(*p).priv_ref, i)
+        var found: bool = false
+        var k: usize = mark
+        while k < mem.cp_len(&(*p).priv_name) {
+            if mem.cp_at(&(*p).priv_name, k) == name {
+                found = true
+            }
+            k = k + 1
+        }
+        if !found {
+            mem.cp_set(&(*p).priv_ref, keep, name)
+            keep = keep + 1
+        }
+        i = i + 1
+    }
+    mem.cp_truncate(&(*p).priv_ref, keep)
+    mem.cp_truncate(&(*p).priv_name, mark)
+    mem.cp_truncate(&(*p).priv_kind, mark)
+    mem.cp_truncate(&(*p).priv_mark, n - 1)
+    mem.cp_truncate(&(*p).priv_refmark, n - 1)
+    if mem.cp_len(&(*p).priv_mark) == 0 && mem.cp_len(&(*p).priv_ref) > 0 {
+        fail(p, ERR_SYNTAX)
+        mem.cp_truncate(&(*p).priv_ref, 0)
+    }
+}
+
+// ----------------------------------------------------- Identifier checks
+
+// 12.7.2: the words that are reserved only in strict mode.
+fn is_strict_reserved(id: u32) -> bool {
+    return id == lex.N_IMPLEMENTS || id == lex.N_INTERFACE || id == lex.N_PACKAGE || id == lex.N_PRIVATE || id == lex.N_PROTECTED || id == lex.N_PUBLIC || id == lex.N_STATIC || id == lex.N_LET
+}
+
+fn check_binding_name(p: *mut Parser, id: u32, line: u32) {
+    if (*p).strict {
+        if id == lex.N_EVAL || id == lex.N_ARGUMENTS || is_strict_reserved(id) {
+            fail(p, ERR_STRICT)
+        }
+    }
+    if id == lex.K_YIELD && ((*p).strict || (*p).module || (*p).in_gen != 0 as u32) {
+        fail(p, ERR_STRICT)
+    }
+    if id == lex.K_AWAIT && ((*p).module || (*p).in_async != 0 as u32) {
+        fail(p, ERR_STRICT)
+    }
+}
+
+// An IdentifierReference / BindingIdentifier out of the current token.
+fn ident_name_here(p: *mut Parser) -> u32 {
+    if (*p).kind == lex.T_IDENT {
+        return (*p).name
+    }
+    if (*p).kind == lex.T_KEYWORD {
+        // `yield` and `await` are identifiers outside their contexts: in a
+        // generator body `yield` is a keyword, in an async body `await` is,
+        // and in module code `await` always is.
+        if (*p).code == lex.K_YIELD && !(*p).strict && !(*p).module && (*p).in_gen == 0 as u32 {
+            return (*p).name
+        }
+        if (*p).code == lex.K_AWAIT && !(*p).module && (*p).in_async == 0 as u32 {
+            return (*p).name
+        }
+    }
+    return 0xFFFFFFFF as u32
+}
+
+fn parse_binding_ident(p: *mut Parser) -> u32 {
+    let id: u32 = ident_name_here(p)
+    if id == 0xFFFFFFFF as u32 {
+        fail(p, ERR_SYNTAX)
+        advance(p)
+        return 0
+    }
+    check_binding_name(p, id, (*p).line)
+    let n: u32 = ast.ast_node((*p).t, ast.N_IDENT, (*p).line)
+    ast.ast_set_a((*p).t, n, id)
+    advance(p)
+    return n
+}
+
+// Every name is allowed as a property name, keywords included (13.2.5.1).
+fn property_name_id(p: *mut Parser) -> u32 {
+    if (*p).kind == lex.T_IDENT || (*p).kind == lex.T_KEYWORD {
+        return (*p).name
+    }
+    return 0xFFFFFFFF as u32
+}
+
+// ========================================================== The entry point
+
+fn parse_program(p: *mut Parser, module: bool) -> u32 {
+    (*p).module = module
+    if module {
+        (*p).strict = true
+        // Module code is [+Await]: `await` at the top level is an
+        // expression, not an identifier (ES2022).
+        (*p).in_async = 1
+    }
+    let t: *mut ast.Ast = (*p).t
+    let prog: u32 = ast.ast_node(t, ast.N_PROGRAM, 1)
+    lex.lex_reset((*p).l)
+    advance(p)
+    scope_enter(p, true)
+    let mark: usize = ast.ast_mark(t)
+    // The directive prologue decides strictness BEFORE the body is read.
+    parse_directives(p, mark, true)
+    while (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        let s: u32 = parse_statement_top(p)
+        ast.ast_push(t, s)
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    let off: u32 = ast.ast_close(t, mark)
+    scope_leave(p)
+    ast.ast_set_a(t, prog, off)
+    ast.ast_set_b(t, prog, count as u32)
+    var fl: u32 = 0
+    if (*p).strict {
+        fl = fl | ast.FN_STRICT
+    }
+    ast.ast_set_d(t, prog, fl)
+    return prog
+}
+
+// 11.2.1: a prologue of string literal statements. It sets strict mode and
+// -- important -- an octal literal inside the prologue is an error as soon
+// as a later directive switches strict mode on.
+fn parse_directives(p: *mut Parser, mark: usize, allow: bool) {
+    let t: *mut ast.Ast = (*p).t
+    var octal_line: u32 = 0
+    var saw_octal: bool = false
+    while (*p).kind == lex.T_STRING && (*p).err == ERR_NONE {
+        let line: u32 = (*p).line
+        let soff: usize = (*p).soff
+        let slen: usize = (*p).slen
+        let had_octal: bool = (*p).tflags & lex.F_OCT_ESCAPE != 0 as u32
+        // Only a directive if the literal really stands alone.
+        let n: u32 = ast.ast_node(t, ast.N_STR, line)
+        let at: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l), soff, slen)
+        ast.ast_set_a(t, n, at)
+        ast.ast_set_b(t, n, slen as u32)
+        let raw_use_strict: bool = str_is_use_strict(t, at, slen)
+        advance(p)
+        if !is_directive_end(p) {
+            // Not a directive after all -- carry on as an expression.
+            let full: u32 = continue_expression(p, n)
+            semicolon(p)
+            let st: u32 = ast.ast_node(t, ast.N_EXPR_STMT, line)
+            ast.ast_set_a(t, st, full)
+            ast.ast_push(t, st)
+            return
+        }
+        semicolon(p)
+        let st: u32 = ast.ast_node(t, ast.N_EXPR_STMT, line)
+        ast.ast_set_a(t, st, n)
+        ast.ast_set_b(t, st, 1)
+        ast.ast_push(t, st)
+        if had_octal && !saw_octal {
+            saw_octal = true
+            octal_line = line
+        }
+        if raw_use_strict && allow {
+            (*p).strict = true
+            (*p).saw_use_strict = 1
+        }
+    }
+    if saw_octal && (*p).strict {
+        fail(p, ERR_STRICT)
+        (*p).errline = octal_line
+    }
+}
+
+fn str_is_use_strict(t: *mut ast.Ast, off: u32, len: usize) -> bool {
+    var lit: [u8; 10] = "use strict"
+    return ast.ast_str_equal_ascii(t, off, len, &lit[0], 10)
+}
+
+// A directive ends where a statement ends.
+fn is_directive_end(p: *mut Parser) -> bool {
+    if is_punct(p, lex.P_SEMI) || is_punct(p, lex.P_RBRACE) {
+        return true
+    }
+    if (*p).kind == lex.T_EOF {
+        return true
+    }
+    return (*p).nl
+}
+
+// ============================================================= Statements
+
+fn parse_statement_top(p: *mut Parser) -> u32 {
+    if (*p).module {
+        if is_kw(p, lex.K_IMPORT) && !next_is_call_or_dot(p) {
+            return parse_import(p)
+        }
+        if is_kw(p, lex.K_EXPORT) {
+            return parse_export(p)
+        }
+    }
+    return parse_statement(p, true)
+}
+
+// `import(` and `import.` are expressions, `import x from ...` is a
+// declaration -- one look ahead decides.
+fn next_is_call_or_dot(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    var r: bool = false
+    if (*l).kind == lex.T_PUNCT && ((*l).code == lex.P_LPAREN || (*l).code == lex.P_DOT) {
+        r = true
+    }
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+// `decl_ok` says whether a DECLARATION may stand here. The body of an
+// `if`, a loop, a `with` or a label is a Statement, not a StatementListItem
+// (14.4 - 14.7) -- `if (x) class C {}` and `while (0) const y = 1` are
+// early errors. Annex B.3.3 leaves the function declaration in the `if`
+// branch allowed in sloppy code, and only there.
+fn parse_statement(p: *mut Parser, decl_ok: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    if (*p).err != ERR_NONE {
+        return 0
+    }
+    if !decl_ok {
+        if is_kw(p, lex.K_CLASS) || is_kw(p, lex.K_CONST) {
+            fail(p, ERR_SYNTAX)
+            return 0
+        }
+        if is_name(p, lex.N_LET) && let_starts_declaration(p) {
+            fail(p, ERR_SYNTAX)
+            return 0
+        }
+        if is_kw(p, lex.K_FUNCTION) && ((*p).strict || star_follows(p)) {
+            // Annex B.3.3 leaves the PLAIN function declaration allowed in
+            // sloppy code; a generator is never allowed here.
+            fail(p, ERR_SYNTAX)
+            return 0
+        }
+    }
+    if (*p).kind == lex.T_PUNCT {
+        let c: u32 = (*p).code
+        if c == lex.P_LBRACE {
+            return parse_block(p)
+        }
+        if c == lex.P_SEMI {
+            advance(p)
+            return ast.ast_node(t, ast.N_EMPTY, line)
+        }
+    }
+    if (*p).kind == lex.T_KEYWORD && (*p).tflags & lex.F_ESCAPED == 0 as u32 {
+        let c: u32 = (*p).code
+        if c == lex.K_VAR {
+            advance(p)
+            let d: u32 = parse_var_decl(p, ast.D_VAR, false)
+            semicolon(p)
+            return d
+        }
+        if c == lex.K_CONST {
+            advance(p)
+            let d: u32 = parse_var_decl(p, ast.D_CONST, false)
+            semicolon(p)
+            return d
+        }
+        if c == lex.K_FUNCTION {
+            advance(p)
+            return parse_function(p, ast.FN_DECLARATION, line)
+        }
+        if c == lex.K_CLASS {
+            advance(p)
+            return parse_class(p, true, line)
+        }
+        if c == lex.K_IF {
+            return parse_if(p)
+        }
+        if c == lex.K_FOR {
+            return parse_for(p)
+        }
+        if c == lex.K_WHILE {
+            return parse_while(p)
+        }
+        if c == lex.K_DO {
+            return parse_do(p)
+        }
+        if c == lex.K_RETURN {
+            advance(p)
+            if (*p).in_func == 0 as u32 {
+                fail(p, ERR_SYNTAX)
+            }
+            let n: u32 = ast.ast_node(t, ast.N_RETURN, line)
+            if !is_punct(p, lex.P_SEMI) && !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && !(*p).nl {
+                ast.ast_set_a(t, n, parse_expression(p))
+            }
+            semicolon(p)
+            return n
+        }
+        if c == lex.K_THROW {
+            advance(p)
+            if (*p).nl {
+                fail(p, ERR_SYNTAX)
+            }
+            let n: u32 = ast.ast_node(t, ast.N_THROW, line)
+            ast.ast_set_a(t, n, parse_expression(p))
+            semicolon(p)
+            return n
+        }
+        if c == lex.K_BREAK || c == lex.K_CONTINUE {
+            let is_break: bool = c == lex.K_BREAK
+            advance(p)
+            var kindn: u32 = ast.N_CONTINUE
+            if is_break {
+                kindn = ast.N_BREAK
+            }
+            let n: u32 = ast.ast_node(t, kindn, line)
+            if !(*p).nl {
+                let id: u32 = ident_name_here(p)
+                if id != 0xFFFFFFFF as u32 {
+                    if !label_known(p, id, !is_break) {
+                        fail(p, ERR_LABEL)
+                    }
+                    ast.ast_set_a(t, n, id + 1 as u32)
+                    advance(p)
+                }
+            }
+            if ast.ast_a(t, n) == 0 as u32 {
+                if is_break {
+                    if (*p).in_iter == 0 as u32 && (*p).in_switch == 0 as u32 {
+                        fail(p, ERR_LABEL)
+                    }
+                } else {
+                    if (*p).in_iter == 0 as u32 {
+                        fail(p, ERR_LABEL)
+                    }
+                }
+            }
+            semicolon(p)
+            return n
+        }
+        if c == lex.K_TRY {
+            return parse_try(p)
+        }
+        if c == lex.K_SWITCH {
+            return parse_switch(p)
+        }
+        if c == lex.K_WITH {
+            if (*p).strict {
+                fail(p, ERR_STRICT)
+            }
+            advance(p)
+            expect_punct(p, lex.P_LPAREN)
+            let obj: u32 = parse_expression(p)
+            expect_punct(p, lex.P_RPAREN)
+            let n: u32 = ast.ast_node(t, ast.N_WITH, line)
+            ast.ast_set_a(t, n, obj)
+            ast.ast_set_b(t, n, parse_statement(p, false))
+            return n
+        }
+        if c == lex.K_DEBUGGER {
+            advance(p)
+            semicolon(p)
+            return ast.ast_node(t, ast.N_DEBUGGER, line)
+        }
+    }
+    // `async function f() {}` -- a declaration of its own (15.8).
+    if is_name(p, lex.N_ASYNC) && async_function_follows(p) {
+        if !decl_ok {
+            fail(p, ERR_SYNTAX)
+            return 0
+        }
+        advance(p)
+        advance(p)
+        return parse_function(p, ast.FN_DECLARATION | ast.FN_ASYNC, line)
+    }
+    // `let` as a declaration only in front of a binding start.
+    if is_name(p, lex.N_LET) && let_starts_declaration(p) {
+        advance(p)
+        let d: u32 = parse_var_decl(p, ast.D_LET, false)
+        semicolon(p)
+        return d
+    }
+    // A labelled statement: identifier followed by a colon.
+    if ((*p).kind == lex.T_IDENT || (*p).kind == lex.T_KEYWORD) && colon_follows(p) {
+        let id: u32 = ident_name_here(p)
+        if id != 0xFFFFFFFF as u32 {
+            advance(p)
+            advance(p)
+            var i: usize = 0
+            while i < mem.cp_len(&(*p).labels) {
+                if mem.cp_at(&(*p).labels, i) == id {
+                    fail(p, ERR_LABEL)
+                }
+                i = i + 1
+            }
+            let iter: bool = starts_iteration(p)
+            mem.cp_push(&(*p).labels, id)
+            var v: u32 = 0
+            if iter {
+                v = 1
+            }
+            mem.cp_push(&(*p).label_iter, v)
+            let body: u32 = parse_statement(p, false)
+            mem.cp_truncate(&(*p).labels, mem.cp_len(&(*p).labels) - 1)
+            mem.cp_truncate(&(*p).label_iter, mem.cp_len(&(*p).label_iter) - 1)
+            let n: u32 = ast.ast_node(t, ast.N_LABELED, line)
+            ast.ast_set_a(t, n, id)
+            ast.ast_set_b(t, n, body)
+            return n
+        }
+    }
+    let e: u32 = parse_expression(p)
+    semicolon(p)
+    let n: u32 = ast.ast_node(t, ast.N_EXPR_STMT, line)
+    ast.ast_set_a(t, n, e)
+    return n
+}
+
+// Does a `*` follow `function`? Then it is a generator declaration.
+fn star_follows(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    let r: bool = (*l).kind == lex.T_PUNCT && (*l).code == lex.P_MUL
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+fn label_known(p: *mut Parser, id: u32, need_iter: bool) -> bool {
+    var i: usize = 0
+    while i < mem.cp_len(&(*p).labels) {
+        if mem.cp_at(&(*p).labels, i) == id {
+            if !need_iter {
+                return true
+            }
+            return mem.cp_at(&(*p).label_iter, i) == 1 as u32
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn starts_iteration(p: *mut Parser) -> bool {
+    if (*p).kind != lex.T_KEYWORD {
+        return false
+    }
+    return (*p).code == lex.K_FOR || (*p).code == lex.K_WHILE || (*p).code == lex.K_DO
+}
+
+fn colon_follows(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    let r: bool = (*l).kind == lex.T_PUNCT && (*l).code == lex.P_COLON
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+// `let` is a declaration when an identifier, `[` or `{` follows.
+fn let_starts_declaration(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    var r: bool = false
+    if (*l).kind == lex.T_IDENT {
+        r = true
+    } else if (*l).kind == lex.T_PUNCT && ((*l).code == lex.P_LBRACK || (*l).code == lex.P_LBRACE) {
+        r = true
+    } else if (*l).kind == lex.T_KEYWORD && ((*l).code == lex.K_YIELD || (*l).code == lex.K_AWAIT) {
+        r = true
+    }
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+fn parse_block(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    expect_punct(p, lex.P_LBRACE)
+    scope_enter(p, false)
+    let mark: usize = ast.ast_mark(t)
+    while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        ast.ast_push(t, parse_statement(p, true))
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    let off: u32 = ast.ast_close(t, mark)
+    scope_leave(p)
+    expect_punct(p, lex.P_RBRACE)
+    let n: u32 = ast.ast_node(t, ast.N_BLOCK, line)
+    ast.ast_set_a(t, n, off)
+    ast.ast_set_b(t, n, count as u32)
+    return n
+}
+
+fn parse_var_decl(p: *mut Parser, kind: u32, no_in: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    let n: u32 = ast.ast_node(t, ast.N_VAR_DECL, line)
+    ast.ast_set_a(t, n, kind)
+    let mark: usize = ast.ast_mark(t)
+    var bkind: u32 = B_VAR
+    if kind != ast.D_VAR {
+        bkind = B_LEX
+    }
+    while true {
+        let dline: u32 = (*p).line
+        let target: u32 = parse_binding_target(p, bkind)
+        let d: u32 = ast.ast_node(t, ast.N_DECLARATOR, dline)
+        ast.ast_set_a(t, d, target)
+        if eat_punct(p, lex.P_ASSIGN) {
+            ast.ast_set_b(t, d, parse_assignment(p, no_in))
+        } else {
+            if kind == ast.D_CONST && !no_in {
+                fail(p, ERR_SYNTAX)
+            }
+            if ast.ast_kind(t, target) != ast.N_IDENT && !no_in {
+                fail(p, ERR_SYNTAX)
+            }
+        }
+        ast.ast_push(t, d)
+        if !eat_punct(p, lex.P_COMMA) {
+            break
+        }
+        if (*p).err != ERR_NONE {
+            break
+        }
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    ast.ast_set_b(t, n, ast.ast_close(t, mark))
+    ast.ast_set_c(t, n, count as u32)
+    return n
+}
+
+// A binding: an identifier or a destructuring pattern.
+fn parse_binding_target(p: *mut Parser, bkind: u32) -> u32 {
+    if is_punct(p, lex.P_LBRACK) || is_punct(p, lex.P_LBRACE) {
+        let e: u32 = parse_primary(p)
+        let pat: u32 = to_pattern(p, e, true)
+        declare_pattern(p, pat, bkind)
+        return pat
+    }
+    let n: u32 = parse_binding_ident(p)
+    if n != 0 as u32 {
+        if bkind == B_LEX && ast.ast_a((*p).t, n) == lex.N_LET {
+            fail(p, ERR_SYNTAX)
+        }
+        declare(p, ast.ast_a((*p).t, n), bkind)
+    }
+    return n
+}
+
+// Walk a pattern and declare every name in it.
+fn declare_pattern(p: *mut Parser, node: u32, bkind: u32) {
+    let t: *mut ast.Ast = (*p).t
+    if node == 0 as u32 {
+        return
+    }
+    let k: u32 = ast.ast_kind(t, node)
+    if k == ast.N_IDENT {
+        let id: u32 = ast.ast_a(t, node)
+        check_binding_name(p, id, ast.ast_line(t, node))
+        if bkind == B_LEX && id == lex.N_LET {
+            fail(p, ERR_SYNTAX)
+        }
+        declare(p, id, bkind)
+        return
+    }
+    if k == ast.N_ARRAY_PAT {
+        let off: u32 = ast.ast_a(t, node)
+        let cnt: usize = ast.ast_b(t, node) as usize
+        var i: usize = 0
+        while i < cnt {
+            declare_pattern(p, ast.ast_list_at(t, off, i), bkind)
+            i = i + 1
+        }
+        return
+    }
+    if k == ast.N_OBJECT_PAT {
+        let off: u32 = ast.ast_a(t, node)
+        let cnt: usize = ast.ast_b(t, node) as usize
+        var i: usize = 0
+        while i < cnt {
+            let pr: u32 = ast.ast_list_at(t, off, i)
+            if ast.ast_kind(t, pr) == ast.N_REST {
+                declare_pattern(p, ast.ast_a(t, pr), bkind)
+            } else {
+                declare_pattern(p, ast.ast_b(t, pr), bkind)
+            }
+            i = i + 1
+        }
+        return
+    }
+    if k == ast.N_ASSIGN_PAT {
+        declare_pattern(p, ast.ast_a(t, node), bkind)
+        return
+    }
+    if k == ast.N_REST {
+        declare_pattern(p, ast.ast_a(t, node), bkind)
+        return
+    }
+}
+
+fn parse_if(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    expect_punct(p, lex.P_LPAREN)
+    let test: u32 = parse_expression(p)
+    expect_punct(p, lex.P_RPAREN)
+    let n: u32 = ast.ast_node(t, ast.N_IF, line)
+    ast.ast_set_a(t, n, test)
+    ast.ast_set_b(t, n, parse_statement(p, false))
+    if eat_kw(p, lex.K_ELSE) {
+        ast.ast_set_c(t, n, parse_statement(p, false))
+    }
+    return n
+}
+
+fn parse_while(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    expect_punct(p, lex.P_LPAREN)
+    let test: u32 = parse_expression(p)
+    expect_punct(p, lex.P_RPAREN)
+    let n: u32 = ast.ast_node(t, ast.N_WHILE, line)
+    ast.ast_set_a(t, n, test)
+    (*p).in_iter = (*p).in_iter + 1 as u32
+    ast.ast_set_b(t, n, parse_statement(p, false))
+    (*p).in_iter = (*p).in_iter - 1 as u32
+    return n
+}
+
+fn parse_do(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_DOWHILE, line)
+    (*p).in_iter = (*p).in_iter + 1 as u32
+    ast.ast_set_a(t, n, parse_statement(p, false))
+    (*p).in_iter = (*p).in_iter - 1 as u32
+    if !eat_kw(p, lex.K_WHILE) {
+        fail(p, ERR_SYNTAX)
+        return n
+    }
+    expect_punct(p, lex.P_LPAREN)
+    ast.ast_set_b(t, n, parse_expression(p))
+    expect_punct(p, lex.P_RPAREN)
+    // 14.7.2: the semicolon after `do ... while (...)` may always be left out.
+    if is_punct(p, lex.P_SEMI) {
+        advance(p)
+    }
+    return n
+}
+
+fn parse_try(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_TRY, line)
+    if !is_punct(p, lex.P_LBRACE) {
+        fail(p, ERR_SYNTAX)
+        return n
+    }
+    ast.ast_set_a(t, n, parse_block(p))
+    var any: bool = false
+    if is_kw(p, lex.K_CATCH) {
+        let cline: u32 = (*p).line
+        advance(p)
+        let c: u32 = ast.ast_node(t, ast.N_CATCH, cline)
+        scope_enter(p, false)
+        if eat_punct(p, lex.P_LPAREN) {
+            ast.ast_set_a(t, c, parse_binding_target(p, B_LEX))
+            expect_punct(p, lex.P_RPAREN)
+        }
+        if !is_punct(p, lex.P_LBRACE) {
+            fail(p, ERR_SYNTAX)
+        }
+        ast.ast_set_b(t, c, parse_block(p))
+        scope_leave(p)
+        ast.ast_set_b(t, n, c)
+        any = true
+    }
+    if eat_kw(p, lex.K_FINALLY) {
+        if !is_punct(p, lex.P_LBRACE) {
+            fail(p, ERR_SYNTAX)
+        }
+        ast.ast_set_c(t, n, parse_block(p))
+        any = true
+    }
+    if !any {
+        fail(p, ERR_SYNTAX)
+    }
+    return n
+}
+
+fn parse_switch(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    expect_punct(p, lex.P_LPAREN)
+    let disc: u32 = parse_expression(p)
+    expect_punct(p, lex.P_RPAREN)
+    let n: u32 = ast.ast_node(t, ast.N_SWITCH, line)
+    ast.ast_set_a(t, n, disc)
+    expect_punct(p, lex.P_LBRACE)
+    scope_enter(p, false)
+    (*p).in_switch = (*p).in_switch + 1 as u32
+    let mark: usize = ast.ast_mark(t)
+    var seen_default: bool = false
+    while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        let cline: u32 = (*p).line
+        let c: u32 = ast.ast_node(t, ast.N_CASE, cline)
+        if eat_kw(p, lex.K_CASE) {
+            ast.ast_set_a(t, c, parse_expression(p))
+        } else if eat_kw(p, lex.K_DEFAULT) {
+            if seen_default {
+                fail(p, ERR_SYNTAX)
+            }
+            seen_default = true
+        } else {
+            fail(p, ERR_SYNTAX)
+            break
+        }
+        expect_punct(p, lex.P_COLON)
+        let bmark: usize = ast.ast_mark(t)
+        while !is_punct(p, lex.P_RBRACE) && !is_kw(p, lex.K_CASE) && !is_kw(p, lex.K_DEFAULT) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+            ast.ast_push(t, parse_statement(p, true))
+        }
+        let bcount: usize = ast.ast_pending_count(t, bmark)
+        ast.ast_set_b(t, c, ast.ast_close(t, bmark))
+        ast.ast_set_c(t, c, bcount as u32)
+        ast.ast_push(t, c)
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    ast.ast_set_b(t, n, ast.ast_close(t, mark))
+    ast.ast_set_c(t, n, count as u32)
+    (*p).in_switch = (*p).in_switch - 1 as u32
+    scope_leave(p)
+    expect_punct(p, lex.P_RBRACE)
+    return n
+}
+
+// 14.7.4/14.7.5: `for`, `for-in` and `for-of` share a head that is only
+// decided once the parser has read the left hand side.
+fn parse_for(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    // `for await (x of it)` -- only in an async context (14.7.5).
+    var is_await: bool = false
+    if is_kw(p, lex.K_AWAIT) {
+        if (*p).in_async == 0 as u32 || (*p).in_static_block != 0 as u32 {
+            fail(p, ERR_SYNTAX)
+            return 0
+        }
+        advance(p)
+        is_await = true
+    }
+    expect_punct(p, lex.P_LPAREN)
+    scope_enter(p, false)
+    var init: u32 = 0
+    var is_decl: bool = false
+    var decl_kind: u32 = ast.D_VAR
+    if is_punct(p, lex.P_SEMI) {
+        init = 0
+    } else if is_kw(p, lex.K_VAR) || is_kw(p, lex.K_CONST) || (is_name(p, lex.N_LET) && let_starts_declaration(p)) {
+        is_decl = true
+        if is_kw(p, lex.K_VAR) {
+            decl_kind = ast.D_VAR
+        } else if is_kw(p, lex.K_CONST) {
+            decl_kind = ast.D_CONST
+        } else {
+            decl_kind = ast.D_LET
+        }
+        advance(p)
+        init = parse_var_decl(p, decl_kind, true)
+    } else {
+        init = parse_expression_no_in(p)
+    }
+    if (*p).err != ERR_NONE {
+        scope_leave(p)
+        return 0
+    }
+    // for-in / for-of
+    var of_form: bool = false
+    var in_form: bool = false
+    if is_kw(p, lex.K_IN) {
+        in_form = true
+    } else if is_name(p, lex.N_OF) {
+        of_form = true
+    }
+    if is_await && !of_form {
+        fail(p, ERR_SYNTAX)
+        scope_leave(p)
+        return 0
+    }
+    if in_form || of_form {
+        var left: u32 = init
+        if is_decl {
+            if ast.ast_c(t, init) != 1 as u32 {
+                fail(p, ERR_SYNTAX)
+            }
+            let d: u32 = ast.ast_list_at(t, ast.ast_b(t, init), 0)
+            if ast.ast_b(t, d) != 0 as u32 {
+                // `for (var x = 1 in o)` is only tolerated in sloppy mode.
+                if of_form || (*p).strict || decl_kind != ast.D_VAR || ast.ast_kind(t, ast.ast_a(t, d)) != ast.N_IDENT {
+                    fail(p, ERR_SYNTAX)
+                }
+            }
+        } else {
+            left = to_pattern(p, init, false)
+            if !is_valid_target(t, left) {
+                fail(p, ERR_ASSIGN_TARGET)
+            }
+        }
+        advance(p)
+        var right: u32 = 0
+        if of_form {
+            right = parse_assignment(p, false)
+        } else {
+            right = parse_expression(p)
+        }
+        expect_punct(p, lex.P_RPAREN)
+        var kindn: u32 = ast.N_FORIN
+        if of_form {
+            kindn = ast.N_FOROF
+        }
+        let n: u32 = ast.ast_node(t, kindn, line)
+        ast.ast_set_a(t, n, left)
+        ast.ast_set_b(t, n, right)
+        if is_await {
+            ast.ast_set_d(t, n, ast.FOR_AWAIT)
+        }
+        (*p).in_iter = (*p).in_iter + 1 as u32
+        ast.ast_set_c(t, n, parse_statement(p, false))
+        (*p).in_iter = (*p).in_iter - 1 as u32
+        scope_leave(p)
+        return n
+    }
+    if is_await {
+        fail(p, ERR_SYNTAX)
+        scope_leave(p)
+        return 0
+    }
+    // The plain three part head.
+    if is_decl && decl_kind == ast.D_CONST {
+        let off: u32 = ast.ast_b(t, init)
+        let cnt: usize = ast.ast_c(t, init) as usize
+        var i: usize = 0
+        while i < cnt {
+            if ast.ast_b(t, ast.ast_list_at(t, off, i)) == 0 as u32 {
+                fail(p, ERR_SYNTAX)
+            }
+            i = i + 1
+        }
+    }
+    if is_decl {
+        let off: u32 = ast.ast_b(t, init)
+        let cnt: usize = ast.ast_c(t, init) as usize
+        var i: usize = 0
+        while i < cnt {
+            let d: u32 = ast.ast_list_at(t, off, i)
+            if ast.ast_b(t, d) == 0 as u32 && ast.ast_kind(t, ast.ast_a(t, d)) != ast.N_IDENT {
+                fail(p, ERR_SYNTAX)
+            }
+            i = i + 1
+        }
+    }
+    expect_punct(p, lex.P_SEMI)
+    let n: u32 = ast.ast_node(t, ast.N_FOR, line)
+    ast.ast_set_a(t, n, init)
+    if !is_punct(p, lex.P_SEMI) {
+        ast.ast_set_b(t, n, parse_expression(p))
+    }
+    expect_punct(p, lex.P_SEMI)
+    if !is_punct(p, lex.P_RPAREN) {
+        ast.ast_set_c(t, n, parse_expression(p))
+    }
+    expect_punct(p, lex.P_RPAREN)
+    (*p).in_iter = (*p).in_iter + 1 as u32
+    ast.ast_set_d(t, n, parse_statement(p, false))
+    (*p).in_iter = (*p).in_iter - 1 as u32
+    scope_leave(p)
+    return n
+}
+
+// ============================================================== Functions
+
+fn parse_function(p: *mut Parser, flags: u32, line: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    var fl: u32 = flags
+    if is_punct(p, lex.P_MUL) {
+        advance(p)
+        fl = fl | ast.FN_GENERATOR
+    }
+    let n: u32 = ast.ast_node(t, ast.N_FUNC, line)
+    var id: u32 = 0
+    // The NAME of a function expression stands inside the new function:
+    // `(function* yield(){})` and `(async function await(){})` are early
+    // errors, the same names as a DECLARATION are not.
+    let name_gen: u32 = (*p).in_gen
+    let name_async: u32 = (*p).in_async
+    if fl & ast.FN_DECLARATION == 0 as u32 {
+        (*p).in_gen = 0
+        (*p).in_async = 0
+        if fl & ast.FN_GENERATOR != 0 as u32 {
+            (*p).in_gen = 1
+        }
+        if fl & ast.FN_ASYNC != 0 as u32 {
+            (*p).in_async = 1
+        }
+    }
+    if (*p).kind == lex.T_IDENT || (*p).kind == lex.T_KEYWORD {
+        if !(is_punct(p, lex.P_LPAREN)) {
+            let nm: u32 = ident_name_here(p)
+            if nm != 0xFFFFFFFF as u32 {
+                id = parse_binding_ident(p)
+                if fl & ast.FN_DECLARATION != 0 as u32 {
+                    var bk: u32 = B_FUNC
+                    if (*p).in_func != 0 as u32 || (*p).strict {
+                        bk = B_FUNC
+                    }
+                    declare(p, ast.ast_a(t, id), bk)
+                }
+            }
+        }
+    }
+    (*p).in_gen = name_gen
+    (*p).in_async = name_async
+    if id == 0 as u32 && fl & ast.FN_DECLARATION != 0 as u32 {
+        fail(p, ERR_SYNTAX)
+    }
+    ast.ast_set_a(t, n, id)
+    parse_function_rest(p, n, fl)
+    return n
+}
+
+// Parameters and body. `n` is the already created N_FUNC node.
+fn parse_function_rest(p: *mut Parser, n: u32, flags: u32) {
+    let t: *mut ast.Ast = (*p).t
+    let outer_strict: bool = (*p).strict
+    let outer_func: u32 = (*p).in_func
+    let outer_iter: u32 = (*p).in_iter
+    let outer_switch: u32 = (*p).in_switch
+    let outer_labels: usize = mem.cp_len(&(*p).labels)
+    let outer_gen: u32 = (*p).in_gen
+    let outer_async: u32 = (*p).in_async
+    let outer_params: u32 = (*p).in_params
+    let outer_field: u32 = (*p).in_field
+    let outer_block: u32 = (*p).in_static_block
+    (*p).in_func = 1
+    (*p).in_iter = 0
+    (*p).in_switch = 0
+    (*p).in_gen = 0
+    (*p).in_async = 0
+    (*p).in_field = 0
+    (*p).in_static_block = 0
+    if flags & ast.FN_GENERATOR != 0 as u32 {
+        (*p).in_gen = 1
+    }
+    if flags & ast.FN_ASYNC != 0 as u32 {
+        (*p).in_async = 1
+    }
+    mem.cp_truncate(&(*p).labels, 0)
+    mem.cp_truncate(&(*p).label_iter, 0)
+    scope_enter(p, true)
+    var fl: u32 = flags
+    let pmark: usize = ast.ast_mark(t)
+    var simple: bool = true
+    // A `yield` or an `await` inside the parameter list is an early error
+    // (15.5.1 / 15.8.1) -- the flag says where we are.
+    (*p).in_params = 1
+    expect_punct(p, lex.P_LPAREN)
+    while !is_punct(p, lex.P_RPAREN) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        if is_punct(p, lex.P_ELLIPSIS) {
+            let rline: u32 = (*p).line
+            advance(p)
+            let r: u32 = ast.ast_node(t, ast.N_REST, rline)
+            ast.ast_set_a(t, r, parse_binding_target(p, B_PARAM))
+            ast.ast_push(t, r)
+            simple = false
+            if is_punct(p, lex.P_COMMA) {
+                fail(p, ERR_SYNTAX)
+            }
+            break
+        }
+        let target: u32 = parse_binding_target(p, B_PARAM)
+        if ast.ast_kind(t, target) != ast.N_IDENT {
+            simple = false
+        }
+        if is_punct(p, lex.P_ASSIGN) {
+            advance(p)
+            let dline: u32 = ast.ast_line(t, target)
+            let d: u32 = ast.ast_node(t, ast.N_ASSIGN_PAT, dline)
+            ast.ast_set_a(t, d, target)
+            ast.ast_set_b(t, d, parse_assignment(p, false))
+            ast.ast_push(t, d)
+            simple = false
+        } else {
+            ast.ast_push(t, target)
+        }
+        if !eat_punct(p, lex.P_COMMA) {
+            break
+        }
+    }
+    let pcount: usize = ast.ast_pending_count(t, pmark)
+    let poff: u32 = ast.ast_close(t, pmark)
+    expect_punct(p, lex.P_RPAREN)
+    (*p).in_params = 0
+    ast.ast_set_b(t, n, poff)
+    ast.ast_set_c(t, n, pcount as u32)
+    if simple {
+        fl = fl | ast.FN_SIMPLE_PARAMS
+    }
+    // The body.
+    expect_punct(p, lex.P_LBRACE)
+    let bmark: usize = ast.ast_mark(t)
+    let before: bool = (*p).strict
+    (*p).saw_use_strict = 0
+    parse_directives(p, bmark, true)
+    // 15.2.1: a "use strict" directive in a function with a NON-SIMPLE
+    // parameter list is an early error -- whether or not the code around
+    // it was strict already. The check is purely syntactic.
+    if (*p).saw_use_strict != 0 as u32 && !simple {
+        fail(p, ERR_STRICT)
+    }
+    if !before && (*p).strict {
+        recheck_params(p, poff, pcount)
+    }
+    if (*p).strict {
+        check_duplicate_params(p, poff, pcount)
+    } else if !simple {
+        check_duplicate_params(p, poff, pcount)
+    }
+    while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        ast.ast_push(t, parse_statement(p, true))
+    }
+    let bcount: usize = ast.ast_pending_count(t, bmark)
+    let boff: u32 = ast.ast_close(t, bmark)
+    expect_punct(p, lex.P_RBRACE)
+    let body: u32 = ast.ast_node(t, ast.N_BLOCK, ast.ast_line(t, n))
+    ast.ast_set_a(t, body, boff)
+    ast.ast_set_b(t, body, bcount as u32)
+    ast.ast_set_d(t, n, body)
+    if (*p).strict {
+        fl = fl | ast.FN_STRICT
+    }
+    ast.ast_set_e(t, n, fl)
+    scope_leave(p)
+    (*p).strict = outer_strict
+    (*p).in_func = outer_func
+    (*p).in_iter = outer_iter
+    (*p).in_switch = outer_switch
+    (*p).in_gen = outer_gen
+    (*p).in_async = outer_async
+    (*p).in_params = outer_params
+    (*p).in_field = outer_field
+    (*p).in_static_block = outer_block
+    mem.cp_truncate(&(*p).labels, outer_labels)
+    mem.cp_truncate(&(*p).label_iter, outer_labels)
+}
+
+// After a "use strict" the parameter names have to obey the strict rules.
+fn recheck_params(p: *mut Parser, off: u32, count: usize) {
+    let t: *mut ast.Ast = (*p).t
+    var i: usize = 0
+    while i < count {
+        recheck_param_node(p, ast.ast_list_at(t, off, i))
+        i = i + 1
+    }
+}
+
+fn recheck_param_node(p: *mut Parser, node: u32) {
+    let t: *mut ast.Ast = (*p).t
+    if node == 0 as u32 {
+        return
+    }
+    let k: u32 = ast.ast_kind(t, node)
+    if k == ast.N_IDENT {
+        let id: u32 = ast.ast_a(t, node)
+        if id == lex.N_EVAL || id == lex.N_ARGUMENTS || is_strict_reserved(id) || id == lex.K_YIELD {
+            fail(p, ERR_STRICT)
+        }
+        return
+    }
+    if k == ast.N_ASSIGN_PAT || k == ast.N_REST {
+        recheck_param_node(p, ast.ast_a(t, node))
+        return
+    }
+    if k == ast.N_ARRAY_PAT || k == ast.N_OBJECT_PAT {
+        let off: u32 = ast.ast_a(t, node)
+        let cnt: usize = ast.ast_b(t, node) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if k == ast.N_OBJECT_PAT && ast.ast_kind(t, e) == ast.N_PROPERTY {
+                recheck_param_node(p, ast.ast_b(t, e))
+            } else {
+                recheck_param_node(p, e)
+            }
+            i = i + 1
+        }
+    }
+}
+
+// Collect the names of a parameter list and look for duplicates.
+fn check_duplicate_params(p: *mut Parser, off: u32, count: usize) {
+    let t: *mut ast.Ast = (*p).t
+    var seen: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&seen)
+    var i: usize = 0
+    while i < count {
+        collect_param_names(p, ast.ast_list_at(t, off, i), &seen)
+        i = i + 1
+    }
+    var a: usize = 0
+    while a < mem.cp_len(&seen) {
+        var b: usize = a + 1
+        while b < mem.cp_len(&seen) {
+            if mem.cp_at(&seen, a) == mem.cp_at(&seen, b) {
+                fail(p, ERR_DUPLICATE)
+                mem.cp_free(&seen)
+                return
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    mem.cp_free(&seen)
+}
+
+fn collect_param_names(p: *mut Parser, node: u32, out: *mut mem.CpBuf) {
+    let t: *mut ast.Ast = (*p).t
+    if node == 0 as u32 {
+        return
+    }
+    let k: u32 = ast.ast_kind(t, node)
+    if k == ast.N_IDENT {
+        mem.cp_push(out, ast.ast_a(t, node))
+        return
+    }
+    if k == ast.N_ASSIGN_PAT || k == ast.N_REST {
+        collect_param_names(p, ast.ast_a(t, node), out)
+        return
+    }
+    if k == ast.N_ARRAY_PAT || k == ast.N_OBJECT_PAT {
+        let off: u32 = ast.ast_a(t, node)
+        let cnt: usize = ast.ast_b(t, node) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if k == ast.N_OBJECT_PAT && ast.ast_kind(t, e) == ast.N_PROPERTY {
+                collect_param_names(p, ast.ast_b(t, e), out)
+            } else {
+                collect_param_names(p, e, out)
+            }
+            i = i + 1
+        }
+    }
+}
+
+// ================================================================ Classes
+//
+// A class body is strict code (15.7.1), whatever stands around it.
+fn parse_class(p: *mut Parser, is_decl: bool, line: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let outer_strict: bool = (*p).strict
+    (*p).strict = true
+    let n: u32 = ast.ast_node(t, ast.N_CLASS, line)
+    if is_decl {
+        ast.ast_set_e(t, n, 1)
+    }
+    var id: u32 = 0
+    if (*p).kind == lex.T_IDENT || is_kw(p, lex.K_YIELD) || is_kw(p, lex.K_AWAIT) {
+        if !is_name(p, lex.N_IMPLEMENTS) || is_decl {
+            id = parse_binding_ident(p)
+        }
+    }
+    if is_decl {
+        if id == 0 as u32 {
+            fail(p, ERR_SYNTAX)
+        } else {
+            (*p).strict = outer_strict
+            declare(p, ast.ast_a(t, id), B_LEX)
+            (*p).strict = true
+        }
+    }
+    ast.ast_set_a(t, n, id)
+    if eat_kw(p, lex.K_EXTENDS) {
+        ast.ast_set_b(t, n, parse_unary_postfix_chain(p))
+        (*p).in_derived = (*p).in_derived + 1 as u32
+    }
+    let derived: bool = ast.ast_b(t, n) != 0 as u32
+    expect_punct(p, lex.P_LBRACE)
+    let mark: usize = ast.ast_mark(t)
+    (*p).in_class = (*p).in_class + 1 as u32
+    priv_enter(p)
+    var seen_ctor: bool = false
+    while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        if eat_punct(p, lex.P_SEMI) {
+            continue
+        }
+        let m: u32 = parse_class_member(p, derived)
+        if m != 0 as u32 {
+            if ast.ast_kind(t, m) == ast.N_METHOD && ast.ast_d(t, m) & ast.FN_CONSTRUCTOR != 0 as u32 {
+                if seen_ctor {
+                    fail(p, ERR_DUPLICATE)
+                }
+                seen_ctor = true
+            }
+            ast.ast_push(t, m)
+        }
+    }
+    (*p).in_class = (*p).in_class - 1 as u32
+    priv_leave(p)
+    if derived {
+        (*p).in_derived = (*p).in_derived - 1 as u32
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    ast.ast_set_c(t, n, ast.ast_close(t, mark))
+    ast.ast_set_d(t, n, count as u32)
+    expect_punct(p, lex.P_RBRACE)
+    (*p).strict = outer_strict
+    return n
+}
+
+fn parse_class_member(p: *mut Parser, derived: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    var pflags: u32 = 0
+    if is_name(p, lex.N_STATIC) && !next_ends_member(p) {
+        advance(p)
+        pflags = pflags | ast.PR_STATIC
+        if is_punct(p, lex.P_LBRACE) {
+            return parse_static_block(p, line)
+        }
+    }
+    var fnflags: u32 = ast.FN_METHOD
+    if is_name(p, lex.N_GET) && !next_ends_member(p) {
+        advance(p)
+        pflags = pflags | ast.PR_GET
+        fnflags = fnflags | ast.FN_GETTER
+    } else if is_name(p, lex.N_SET) && !next_ends_member(p) {
+        advance(p)
+        pflags = pflags | ast.PR_SET
+        fnflags = fnflags | ast.FN_SETTER
+    } else if is_punct(p, lex.P_MUL) {
+        advance(p)
+        fnflags = fnflags | ast.FN_GENERATOR
+    } else if is_name(p, lex.N_ASYNC) && !next_ends_member(p) && !(*p).nl {
+        advance(p)
+        fnflags = fnflags | ast.FN_ASYNC
+        if is_punct(p, lex.P_MUL) {
+            advance(p)
+            fnflags = fnflags | ast.FN_GENERATOR
+        }
+    }
+    var key: u32 = 0
+    var computed: bool = false
+    var key_name: u32 = 0xFFFFFFFF as u32
+    key = parse_property_key(p, &computed, &key_name)
+    if computed {
+        pflags = pflags | ast.PR_COMPUTED
+    }
+    if is_punct(p, lex.P_LPAREN) {
+        let is_ctor: bool = !computed && pflags & ast.PR_STATIC == 0 as u32 && pflags & (ast.PR_GET | ast.PR_SET) == 0 as u32 && key_name == lex.N_CONSTRUCTOR
+        if is_ctor {
+            // A constructor is neither a generator nor async nor an
+            // accessor (15.7.1).
+            if fnflags & (ast.FN_GENERATOR | ast.FN_ASYNC) != 0 as u32 {
+                fail(p, ERR_SYNTAX)
+            }
+            fnflags = fnflags | ast.FN_CONSTRUCTOR | ast.FN_CLASS_CTOR
+            if derived {
+                fnflags = fnflags | ast.FN_DERIVED_CTOR
+            }
+        }
+        if !computed && pflags & ast.PR_STATIC != 0 as u32 && key_name == lex.N_PROTOTYPE {
+            fail(p, ERR_SYNTAX)
+        }
+        if ast.ast_kind(t, key) == ast.N_PRIVATE_NAME {
+            var pk: u32 = PV_FIELD
+            if pflags & ast.PR_GET != 0 as u32 {
+                pk = PV_GET
+            } else if pflags & ast.PR_SET != 0 as u32 {
+                pk = PV_SET
+            }
+            if pflags & ast.PR_STATIC != 0 as u32 {
+                pk = pk | PV_STATIC
+            }
+            priv_declare(p, key_name, pk)
+        }
+        let f: u32 = ast.ast_node(t, ast.N_FUNC, line)
+        let outer_method: u32 = (*p).in_method
+        (*p).in_method = 1
+        parse_function_rest(p, f, fnflags | ast.FN_STRICT)
+        (*p).in_method = outer_method
+        check_accessor_arity(p, f, fnflags)
+        let m: u32 = ast.ast_node(t, ast.N_METHOD, line)
+        ast.ast_set_a(t, m, key)
+        ast.ast_set_b(t, m, f)
+        ast.ast_set_c(t, m, pflags)
+        ast.ast_set_d(t, m, fnflags)
+        return m
+    }
+    // A field.
+    if pflags & (ast.PR_GET | ast.PR_SET) != 0 as u32 {
+        fail(p, ERR_SYNTAX)
+        return 0
+    }
+    if !computed && key_name == lex.N_CONSTRUCTOR {
+        fail(p, ERR_SYNTAX)
+    }
+    if !computed && pflags & ast.PR_STATIC != 0 as u32 && key_name == lex.N_PROTOTYPE {
+        fail(p, ERR_SYNTAX)
+    }
+    if ast.ast_kind(t, key) == ast.N_PRIVATE_NAME {
+        var pk: u32 = PV_FIELD
+        if pflags & ast.PR_STATIC != 0 as u32 {
+            pk = pk | PV_STATIC
+        }
+        priv_declare(p, key_name, pk)
+    }
+    let fd: u32 = ast.ast_node(t, ast.N_FIELD, line)
+    ast.ast_set_a(t, fd, key)
+    if eat_punct(p, lex.P_ASSIGN) {
+        // The initializer is a function body of its own: no `arguments`,
+        // and `yield`/`await` are plain identifiers again (15.7.1).
+        let outer_method: u32 = (*p).in_method
+        let outer_field: u32 = (*p).in_field
+        let outer_gen: u32 = (*p).in_gen
+        let outer_async: u32 = (*p).in_async
+        let outer_params: u32 = (*p).in_params
+        (*p).in_method = 1
+        (*p).in_field = 1
+        (*p).in_gen = 0
+        (*p).in_async = 0
+        (*p).in_params = 0
+        ast.ast_set_b(t, fd, parse_assignment(p, false))
+        (*p).in_method = outer_method
+        (*p).in_field = outer_field
+        (*p).in_gen = outer_gen
+        (*p).in_async = outer_async
+        (*p).in_params = outer_params
+    }
+    ast.ast_set_c(t, fd, pflags)
+    semicolon(p)
+    return fd
+}
+
+// 15.7: `static { ... }` -- a block that runs once when the class is set
+// up. `return` does not exist in it, `await` and `arguments` are forbidden,
+// and `super.x` works because it counts as a method body.
+fn parse_static_block(p: *mut Parser, line: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let outer_strict: bool = (*p).strict
+    let outer_func: u32 = (*p).in_func
+    let outer_iter: u32 = (*p).in_iter
+    let outer_switch: u32 = (*p).in_switch
+    let outer_labels: usize = mem.cp_len(&(*p).labels)
+    let outer_gen: u32 = (*p).in_gen
+    let outer_async: u32 = (*p).in_async
+    let outer_params: u32 = (*p).in_params
+    let outer_field: u32 = (*p).in_field
+    let outer_block: u32 = (*p).in_static_block
+    let outer_method: u32 = (*p).in_method
+    (*p).strict = true
+    (*p).in_func = 0
+    (*p).in_iter = 0
+    (*p).in_switch = 0
+    (*p).in_gen = 0
+    (*p).in_async = 1
+    (*p).in_params = 0
+    (*p).in_field = 0
+    (*p).in_static_block = 1
+    (*p).in_method = 1
+    mem.cp_truncate(&(*p).labels, 0)
+    mem.cp_truncate(&(*p).label_iter, 0)
+    scope_enter(p, true)
+    advance(p)
+    let mark: usize = ast.ast_mark(t)
+    while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        ast.ast_push(t, parse_statement(p, true))
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    let off: u32 = ast.ast_close(t, mark)
+    expect_punct(p, lex.P_RBRACE)
+    scope_leave(p)
+    let n: u32 = ast.ast_node(t, ast.N_STATIC_BLOCK, line)
+    ast.ast_set_a(t, n, off)
+    ast.ast_set_b(t, n, count as u32)
+    (*p).strict = outer_strict
+    (*p).in_func = outer_func
+    (*p).in_iter = outer_iter
+    (*p).in_switch = outer_switch
+    (*p).in_gen = outer_gen
+    (*p).in_async = outer_async
+    (*p).in_params = outer_params
+    (*p).in_field = outer_field
+    (*p).in_static_block = outer_block
+    (*p).in_method = outer_method
+    mem.cp_truncate(&(*p).labels, outer_labels)
+    mem.cp_truncate(&(*p).label_iter, outer_labels)
+    return n
+}
+
+// A getter takes no parameter, a setter exactly one and no rest (15.4.1).
+fn check_accessor_arity(p: *mut Parser, f: u32, fnflags: u32) {
+    let t: *mut ast.Ast = (*p).t
+    let cnt: usize = ast.ast_c(t, f) as usize
+    if fnflags & ast.FN_GETTER != 0 as u32 && cnt != 0 {
+        fail(p, ERR_SYNTAX)
+    }
+    if fnflags & ast.FN_SETTER != 0 as u32 {
+        if cnt != 1 {
+            fail(p, ERR_SYNTAX)
+        } else {
+            let e: u32 = ast.ast_list_at(t, ast.ast_b(t, f), 0)
+            if ast.ast_kind(t, e) == ast.N_REST {
+                fail(p, ERR_SYNTAX)
+            }
+        }
+    }
+}
+
+// Does a `(`, `=`, `;`, `}` or a line break follow? Then `static`/`get`/
+// `set` was the member name itself.
+fn next_ends_member(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    var r: bool = false
+    if (*l).kind == lex.T_PUNCT {
+        let c: u32 = (*l).code
+        if c == lex.P_LPAREN || c == lex.P_ASSIGN || c == lex.P_SEMI || c == lex.P_RBRACE || c == lex.P_COLON || c == lex.P_COMMA {
+            r = true
+        }
+    }
+    if (*l).kind == lex.T_EOF {
+        r = true
+    }
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+// A property name: identifier, string, number, computed or a private name.
+fn parse_property_key(p: *mut Parser, computed: *mut bool, name: *mut u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    *computed = false
+    *name = 0xFFFFFFFF as u32
+    if is_punct(p, lex.P_LBRACK) {
+        advance(p)
+        let e: u32 = parse_assignment(p, false)
+        expect_punct(p, lex.P_RBRACK)
+        *computed = true
+        return e
+    }
+    if (*p).kind == lex.T_PRIVATE {
+        let n: u32 = ast.ast_node(t, ast.N_PRIVATE_NAME, line)
+        ast.ast_set_a(t, n, (*p).name)
+        *name = (*p).name
+        advance(p)
+        return n
+    }
+    if (*p).kind == lex.T_STRING {
+        let n: u32 = ast.ast_node(t, ast.N_STR, line)
+        let at: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l), (*p).soff, (*p).slen)
+        ast.ast_set_a(t, n, at)
+        ast.ast_set_b(t, n, (*p).slen as u32)
+        if (*p).strict && (*p).tflags & lex.F_OCT_ESCAPE != 0 as u32 {
+            fail(p, ERR_STRICT)
+        }
+        advance(p)
+        return n
+    }
+    if (*p).kind == lex.T_NUM {
+        let n: u32 = ast.ast_node(t, ast.N_NUM, line)
+        ast.ast_set_a(t, n, ast.ast_num_add(t, (*p).numbits))
+        check_number_strict(p)
+        advance(p)
+        return n
+    }
+    if (*p).kind == lex.T_BIGINT {
+        return parse_bigint_literal(p)
+    }
+    let id: u32 = property_name_id(p)
+    if id == 0xFFFFFFFF as u32 {
+        fail(p, ERR_SYNTAX)
+        advance(p)
+        return 0
+    }
+    let n: u32 = ast.ast_node(t, ast.N_IDENT, line)
+    ast.ast_set_a(t, n, id)
+    *name = id
+    advance(p)
+    return n
+}
+
+fn check_number_strict(p: *mut Parser) {
+    if (*p).strict && (*p).tflags & (lex.F_LEGACY_OCT | lex.F_LEGACY_DEC) != 0 as u32 {
+        fail(p, ERR_STRICT)
+    }
+}
+
+// ================================================================ Modules
+
+fn parse_import(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_IMPORT, line)
+    let mark: usize = ast.ast_mark(t)
+    if (*p).kind == lex.T_STRING {
+        ast.ast_set_c(t, n, parse_string_literal(p))
+        ast.ast_set_a(t, n, ast.ast_close(t, mark))
+        semicolon(p)
+        return n
+    }
+    var need_from: bool = true
+    if (*p).kind == lex.T_IDENT {
+        let s: u32 = ast.ast_node(t, ast.N_IMPORT_DEFAULT, (*p).line)
+        ast.ast_set_a(t, s, parse_binding_target(p, B_LEX))
+        ast.ast_push(t, s)
+        if !eat_punct(p, lex.P_COMMA) {
+            need_from = true
+        }
+    }
+    if is_punct(p, lex.P_MUL) {
+        advance(p)
+        if !is_name(p, lex.N_AS) {
+            fail(p, ERR_SYNTAX)
+        } else {
+            advance(p)
+        }
+        let s: u32 = ast.ast_node(t, ast.N_IMPORT_NS, (*p).line)
+        ast.ast_set_a(t, s, parse_binding_target(p, B_LEX))
+        ast.ast_push(t, s)
+    } else if is_punct(p, lex.P_LBRACE) {
+        advance(p)
+        while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+            let sline: u32 = (*p).line
+            let s: u32 = ast.ast_node(t, ast.N_IMPORT_SPEC, sline)
+            let ext: u32 = property_name_id(p)
+            if ext == 0xFFFFFFFF as u32 && (*p).kind != lex.T_STRING {
+                fail(p, ERR_SYNTAX)
+                break
+            }
+            ast.ast_set_a(t, s, ext)
+            advance(p)
+            if is_name(p, lex.N_AS) {
+                advance(p)
+                ast.ast_set_b(t, s, parse_binding_target(p, B_LEX))
+            } else {
+                let idn: u32 = ast.ast_node(t, ast.N_IDENT, sline)
+                ast.ast_set_a(t, idn, ext)
+                check_binding_name(p, ext, sline)
+                declare(p, ext, B_LEX)
+                ast.ast_set_b(t, s, idn)
+            }
+            ast.ast_push(t, s)
+            if !eat_punct(p, lex.P_COMMA) {
+                break
+            }
+        }
+        expect_punct(p, lex.P_RBRACE)
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    ast.ast_set_a(t, n, ast.ast_close(t, mark))
+    ast.ast_set_b(t, n, count as u32)
+    if need_from {
+        if !is_name(p, lex.N_FROM) {
+            fail(p, ERR_SYNTAX)
+        } else {
+            advance(p)
+        }
+        if (*p).kind != lex.T_STRING {
+            fail(p, ERR_SYNTAX)
+        } else {
+            ast.ast_set_c(t, n, parse_string_literal(p))
+        }
+    }
+    semicolon(p)
+    return n
+}
+
+// `123n` -- the digits go into the string pool unchanged; the value is
+// built at run time, because it does not fit into a double.
+fn parse_bigint_literal(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let n: u32 = ast.ast_node(t, ast.N_BIGINT, (*p).line)
+    let at: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l), (*p).soff,
+        (*p).slen)
+    ast.ast_set_a(t, n, at)
+    ast.ast_set_b(t, n, (*p).slen as u32)
+    advance(p)
+    return n
+}
+
+fn parse_string_literal(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let n: u32 = ast.ast_node(t, ast.N_STR, (*p).line)
+    let at: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l), (*p).soff, (*p).slen)
+    ast.ast_set_a(t, n, at)
+    ast.ast_set_b(t, n, (*p).slen as u32)
+    advance(p)
+    return n
+}
+
+fn parse_export(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    if is_kw(p, lex.K_DEFAULT) {
+        advance(p)
+        let n: u32 = ast.ast_node(t, ast.N_EXPORT_DEFAULT, line)
+        if is_kw(p, lex.K_FUNCTION) {
+            advance(p)
+            ast.ast_set_a(t, n, parse_function(p, ast.FN_DECLARATION, line))
+        } else if is_kw(p, lex.K_CLASS) {
+            advance(p)
+            ast.ast_set_a(t, n, parse_class(p, true, line))
+        } else {
+            ast.ast_set_a(t, n, parse_assignment(p, false))
+            semicolon(p)
+        }
+        return n
+    }
+    if is_punct(p, lex.P_MUL) {
+        advance(p)
+        let n: u32 = ast.ast_node(t, ast.N_EXPORT_ALL, line)
+        if is_name(p, lex.N_AS) {
+            advance(p)
+            ast.ast_set_b(t, n, property_name_id(p))
+            advance(p)
+        }
+        if !is_name(p, lex.N_FROM) {
+            fail(p, ERR_SYNTAX)
+        } else {
+            advance(p)
+        }
+        if (*p).kind != lex.T_STRING {
+            fail(p, ERR_SYNTAX)
+        } else {
+            ast.ast_set_a(t, n, parse_string_literal(p))
+        }
+        semicolon(p)
+        return n
+    }
+    let n: u32 = ast.ast_node(t, ast.N_EXPORT_NAMED, line)
+    if is_punct(p, lex.P_LBRACE) {
+        advance(p)
+        let mark: usize = ast.ast_mark(t)
+        while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+            let s: u32 = ast.ast_node(t, ast.N_EXPORT_SPEC, (*p).line)
+            let loc: u32 = property_name_id(p)
+            ast.ast_set_a(t, s, loc)
+            ast.ast_set_b(t, s, loc)
+            advance(p)
+            if is_name(p, lex.N_AS) {
+                advance(p)
+                ast.ast_set_b(t, s, property_name_id(p))
+                advance(p)
+            }
+            ast.ast_push(t, s)
+            if !eat_punct(p, lex.P_COMMA) {
+                break
+            }
+        }
+        let count: usize = ast.ast_pending_count(t, mark)
+        ast.ast_set_b(t, n, ast.ast_close(t, mark))
+        ast.ast_set_c(t, n, count as u32)
+        expect_punct(p, lex.P_RBRACE)
+        if is_name(p, lex.N_FROM) {
+            advance(p)
+            if (*p).kind != lex.T_STRING {
+                fail(p, ERR_SYNTAX)
+            } else {
+                ast.ast_set_d(t, n, parse_string_literal(p))
+            }
+        }
+        semicolon(p)
+        return n
+    }
+    if is_kw(p, lex.K_VAR) || is_kw(p, lex.K_CONST) || is_name(p, lex.N_LET) {
+        var k: u32 = ast.D_VAR
+        if is_kw(p, lex.K_CONST) {
+            k = ast.D_CONST
+        } else if is_name(p, lex.N_LET) {
+            k = ast.D_LET
+        }
+        advance(p)
+        ast.ast_set_a(t, n, parse_var_decl(p, k, false))
+        semicolon(p)
+        return n
+    }
+    if is_kw(p, lex.K_FUNCTION) {
+        advance(p)
+        ast.ast_set_a(t, n, parse_function(p, ast.FN_DECLARATION, line))
+        return n
+    }
+    if is_kw(p, lex.K_CLASS) {
+        advance(p)
+        ast.ast_set_a(t, n, parse_class(p, true, line))
+        return n
+    }
+    fail(p, ERR_SYNTAX)
+    return n
+}
+
+// ============================================================ Expressions
+
+fn parse_expression(p: *mut Parser) -> u32 {
+    return parse_expression_in(p, false)
+}
+
+fn parse_expression_no_in(p: *mut Parser) -> u32 {
+    return parse_expression_in(p, true)
+}
+
+fn parse_expression_in(p: *mut Parser, no_in: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    let first: u32 = parse_assignment(p, no_in)
+    if !is_punct(p, lex.P_COMMA) {
+        return first
+    }
+    let mark: usize = ast.ast_mark(t)
+    ast.ast_push(t, first)
+    while eat_punct(p, lex.P_COMMA) {
+        ast.ast_push(t, parse_assignment(p, no_in))
+        if (*p).err != ERR_NONE {
+            break
+        }
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    let n: u32 = ast.ast_node(t, ast.N_SEQUENCE, line)
+    ast.ast_set_a(t, n, ast.ast_close(t, mark))
+    ast.ast_set_b(t, n, count as u32)
+    return n
+}
+
+// Used by the directive prologue when a string literal turns out not to be
+// a directive after all.
+fn continue_expression(p: *mut Parser, left: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    var e: u32 = parse_call_tail(p, left, false)
+    e = parse_binary_from(p, e, 0, false)
+    e = parse_conditional_from(p, e, false)
+    if is_punct(p, lex.P_COMMA) {
+        let line: u32 = ast.ast_line(t, e)
+        let mark: usize = ast.ast_mark(t)
+        ast.ast_push(t, e)
+        while eat_punct(p, lex.P_COMMA) {
+            ast.ast_push(t, parse_assignment(p, false))
+        }
+        let count: usize = ast.ast_pending_count(t, mark)
+        let n: u32 = ast.ast_node(t, ast.N_SEQUENCE, line)
+        ast.ast_set_a(t, n, ast.ast_close(t, mark))
+        ast.ast_set_b(t, n, count as u32)
+        return n
+    }
+    return e
+}
+
+fn is_assign_op(code: u32) -> bool {
+    if code == lex.P_ASSIGN || code == lex.P_ADDA || code == lex.P_SUBA {
+        return true
+    }
+    if code == lex.P_MULA || code == lex.P_MODA || code == lex.P_POWA {
+        return true
+    }
+    if code == lex.P_DIVA || code == lex.P_SHLA || code == lex.P_SHRA {
+        return true
+    }
+    if code == lex.P_USHRA || code == lex.P_ANDA || code == lex.P_ORA {
+        return true
+    }
+    if code == lex.P_XORA || code == lex.P_ANDANDA || code == lex.P_ORORA {
+        return true
+    }
+    return code == lex.P_COALESCEA
+}
+
+fn parse_assignment(p: *mut Parser, no_in: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    if (*p).err != ERR_NONE {
+        return 0
+    }
+    // A YieldExpression -- only inside a generator body (15.5).
+    if is_kw(p, lex.K_YIELD) && (*p).in_gen != 0 as u32 {
+        return parse_yield(p, no_in)
+    }
+    if is_kw(p, lex.K_YIELD) && ((*p).strict || (*p).module) {
+        fail(p, ERR_STRICT)
+        return 0
+    }
+    // Arrow with a single parameter: `x => ...`
+    let id: u32 = ident_name_here(p)
+    if id != 0xFFFFFFFF as u32 && arrow_follows(p) {
+        let pline: u32 = (*p).line
+        check_binding_name(p, id, pline)
+        let pn: u32 = ast.ast_node(t, ast.N_IDENT, pline)
+        ast.ast_set_a(t, pn, id)
+        advance(p)
+        return finish_arrow_single(p, pn, line, 0)
+    }
+    // `async x => ...`
+    if is_name(p, lex.N_ASYNC) && async_arrow_follows(p) {
+        advance(p)
+        let pline: u32 = (*p).line
+        let aid: u32 = ident_name_here(p)
+        if aid == 0xFFFFFFFF as u32 {
+            fail(p, ERR_SYNTAX)
+            return 0
+        }
+        if aid == lex.K_AWAIT {
+            fail(p, ERR_STRICT)
+        }
+        check_binding_name(p, aid, pline)
+        let pn: u32 = ast.ast_node(t, ast.N_IDENT, pline)
+        ast.ast_set_a(t, pn, aid)
+        advance(p)
+        return finish_arrow_single(p, pn, line, ast.FN_ASYNC)
+    }
+    let left: u32 = parse_conditional(p, no_in)
+    // CoverCallExpressionAndAsyncArrowHead (15.9): `async (a, b) => c` is
+    // read as a CALL of `async` and only turned into a parameter list at
+    // the arrow -- exactly the way the specification covers it.
+    if is_punct(p, lex.P_ARROW) && !(*p).nl && ast.ast_kind(t, left) == ast.N_CALL {
+        let callee: u32 = ast.ast_a(t, left)
+        if ast.ast_kind(t, callee) == ast.N_IDENT && ast.ast_a(t, callee) == lex.N_ASYNC && ast.ast_d(t, left) == 0 as u32 {
+            let off: u32 = ast.ast_b(t, left)
+            let cnt: usize = ast.ast_c(t, left) as usize
+            var simple: bool = true
+            var i: usize = 0
+            while i < cnt {
+                let e: u32 = ast.ast_list_at(t, off, i)
+                var conv: u32 = e
+                if ast.ast_kind(t, e) == ast.N_SPREAD {
+                    conv = ast.ast_node(t, ast.N_REST, ast.ast_line(t, e))
+                    ast.ast_set_a(t, conv, to_pattern(p, ast.ast_a(t, e), true))
+                    simple = false
+                } else {
+                    conv = to_pattern(p, e, true)
+                    if ast.ast_kind(t, conv) != ast.N_IDENT {
+                        simple = false
+                    }
+                }
+                ast.ast_list_set(t, off, i, conv)
+                i = i + 1
+            }
+            return finish_arrow(p, off, cnt, line, simple, ast.FN_ASYNC)
+        }
+    }
+    if (*p).kind == lex.T_PUNCT && is_assign_op((*p).code) {
+        let op: u32 = (*p).code
+        var target: u32 = left
+        if op == lex.P_ASSIGN {
+            target = to_pattern(p, left, false)
+        }
+        if !is_valid_target(t, target) {
+            fail(p, ERR_ASSIGN_TARGET)
+        }
+        if op != lex.P_ASSIGN && ast.ast_kind(t, target) != ast.N_IDENT && ast.ast_kind(t, target) != ast.N_MEMBER {
+            fail(p, ERR_ASSIGN_TARGET)
+        }
+        check_assign_strict(p, target)
+        advance(p)
+        let n: u32 = ast.ast_node(t, ast.N_ASSIGN, line)
+        ast.ast_set_a(t, n, op)
+        ast.ast_set_b(t, n, target)
+        ast.ast_set_c(t, n, parse_assignment(p, no_in))
+        return n
+    }
+    return left
+}
+
+// 15.5: `yield`, `yield x` and `yield* x`. The argument is optional and is
+// governed by a restricted production -- a line terminator after `yield`
+// ends the expression, `yield *` may not be broken across lines.
+fn parse_yield(p: *mut Parser, no_in: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    if (*p).in_params != 0 as u32 {
+        fail(p, ERR_SYNTAX)
+        return 0
+    }
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_YIELD, line)
+    if is_punct(p, lex.P_MUL) && !(*p).nl {
+        advance(p)
+        ast.ast_set_b(t, n, 1)
+        ast.ast_set_a(t, n, parse_assignment(p, no_in))
+        return n
+    }
+    if !(*p).nl && yield_argument_follows(p) {
+        ast.ast_set_a(t, n, parse_assignment(p, no_in))
+    }
+    return n
+}
+
+// Does an AssignmentExpression begin here? Everything that can only CLOSE
+// something ends the `yield` instead.
+fn yield_argument_follows(p: *mut Parser) -> bool {
+    if (*p).kind == lex.T_EOF {
+        return false
+    }
+    if (*p).kind == lex.T_PUNCT {
+        let c: u32 = (*p).code
+        if c == lex.P_RPAREN || c == lex.P_RBRACK || c == lex.P_RBRACE {
+            return false
+        }
+        if c == lex.P_COMMA || c == lex.P_SEMI || c == lex.P_COLON {
+            return false
+        }
+    }
+    if (*p).kind == lex.T_KEYWORD && (*p).code == lex.K_IN {
+        return false
+    }
+    return true
+}
+
+// 13.15.1: in strict mode `eval` and `arguments` are no assignment targets.
+fn check_assign_strict(p: *mut Parser, target: u32) {
+    if !(*p).strict {
+        return
+    }
+    let t: *mut ast.Ast = (*p).t
+    if ast.ast_kind(t, target) == ast.N_IDENT {
+        let id: u32 = ast.ast_a(t, target)
+        if id == lex.N_EVAL || id == lex.N_ARGUMENTS {
+            fail(p, ERR_STRICT)
+        }
+    }
+}
+
+fn arrow_follows(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    let r: bool = (*l).kind == lex.T_PUNCT && (*l).code == lex.P_ARROW && !(*l).nl
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+// `async x => ...`: an identifier without a line break in front of it, and
+// an arrow behind it. Two tokens of lookahead, then the lexer is put back.
+fn async_arrow_follows(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    var r: bool = false
+    if !(*l).nl && (*l).kind == lex.T_IDENT {
+        lex.lex_next(l, lex.GOAL_DIV)
+        if (*l).kind == lex.T_PUNCT && (*l).code == lex.P_ARROW && !(*l).nl {
+            r = true
+        }
+    }
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+// `async function` -- no line break between the two words (15.8).
+fn async_function_follows(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    let r: bool = (*l).kind == lex.T_KEYWORD && (*l).code == lex.K_FUNCTION && !(*l).nl
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+fn finish_arrow_single(p: *mut Parser, param: u32, line: u32,
+    extra: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let mark: usize = ast.ast_mark(t)
+    ast.ast_push(t, param)
+    let off: u32 = ast.ast_close(t, mark)
+    return finish_arrow(p, off, 1, line, true, extra)
+}
+
+// The body of an arrow function -- a block or a single expression.
+fn finish_arrow(p: *mut Parser, poff: u32, pcount: usize, line: u32,
+    simple: bool, extra: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    if !is_punct(p, lex.P_ARROW) || (*p).nl {
+        fail(p, ERR_SYNTAX)
+        return 0
+    }
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_FUNC, line)
+    ast.ast_set_b(t, n, poff)
+    ast.ast_set_c(t, n, pcount as u32)
+    var fl: u32 = ast.FN_ARROW | extra
+    if simple {
+        fl = fl | ast.FN_SIMPLE_PARAMS
+    }
+    let outer_strict: bool = (*p).strict
+    let outer_func: u32 = (*p).in_func
+    let outer_iter: u32 = (*p).in_iter
+    let outer_switch: u32 = (*p).in_switch
+    let outer_labels: usize = mem.cp_len(&(*p).labels)
+    let outer_gen: u32 = (*p).in_gen
+    let outer_async: u32 = (*p).in_async
+    let outer_params: u32 = (*p).in_params
+    let outer_field: u32 = (*p).in_field
+    let outer_block: u32 = (*p).in_static_block
+    (*p).in_func = 1
+    (*p).in_iter = 0
+    (*p).in_switch = 0
+    // ConciseBody is [~Yield, ~Await]; only an ASYNC arrow keeps [+Await].
+    (*p).in_gen = 0
+    (*p).in_async = 0
+    (*p).in_params = 0
+    (*p).in_field = 0
+    (*p).in_static_block = 0
+    if extra & ast.FN_ASYNC != 0 as u32 {
+        (*p).in_async = 1
+    }
+    mem.cp_truncate(&(*p).labels, 0)
+    mem.cp_truncate(&(*p).label_iter, 0)
+    scope_enter(p, true)
+    var i: usize = 0
+    while i < pcount {
+        declare_pattern(p, ast.ast_list_at(t, poff, i), B_PARAM)
+        i = i + 1
+    }
+    if is_punct(p, lex.P_LBRACE) {
+        advance(p)
+        let bmark: usize = ast.ast_mark(t)
+        let before: bool = (*p).strict
+        (*p).saw_use_strict = 0
+        parse_directives(p, bmark, true)
+        if (*p).saw_use_strict != 0 as u32 && !simple {
+            fail(p, ERR_STRICT)
+        }
+        if !before && (*p).strict {
+            recheck_params(p, poff, pcount)
+        }
+        check_duplicate_params(p, poff, pcount)
+        while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+            ast.ast_push(t, parse_statement(p, false))
+        }
+        let bcount: usize = ast.ast_pending_count(t, bmark)
+        let boff: u32 = ast.ast_close(t, bmark)
+        expect_punct(p, lex.P_RBRACE)
+        let body: u32 = ast.ast_node(t, ast.N_BLOCK, line)
+        ast.ast_set_a(t, body, boff)
+        ast.ast_set_b(t, body, bcount as u32)
+        ast.ast_set_d(t, n, body)
+    } else {
+        check_duplicate_params(p, poff, pcount)
+        ast.ast_set_d(t, n, parse_assignment(p, false))
+        fl = fl | ast.FN_EXPRESSION_BODY
+    }
+    if (*p).strict {
+        fl = fl | ast.FN_STRICT
+    }
+    ast.ast_set_e(t, n, fl)
+    scope_leave(p)
+    (*p).strict = outer_strict
+    (*p).in_func = outer_func
+    (*p).in_iter = outer_iter
+    (*p).in_switch = outer_switch
+    (*p).in_gen = outer_gen
+    (*p).in_async = outer_async
+    (*p).in_params = outer_params
+    (*p).in_field = outer_field
+    (*p).in_static_block = outer_block
+    mem.cp_truncate(&(*p).labels, outer_labels)
+    mem.cp_truncate(&(*p).label_iter, outer_labels)
+    return n
+}
+
+fn parse_conditional(p: *mut Parser, no_in: bool) -> u32 {
+    let e: u32 = parse_binary(p, no_in)
+    return parse_conditional_from(p, e, no_in)
+}
+
+fn parse_conditional_from(p: *mut Parser, test: u32, no_in: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    if !is_punct(p, lex.P_QUESTION) {
+        return test
+    }
+    let line: u32 = (*p).line
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_COND, line)
+    ast.ast_set_a(t, n, test)
+    ast.ast_set_b(t, n, parse_assignment(p, false))
+    expect_punct(p, lex.P_COLON)
+    ast.ast_set_c(t, n, parse_assignment(p, no_in))
+    return n
+}
+
+// The precedence of the binary operators (13.5 - 13.14). 0 = not one.
+fn bin_prec(p: *mut Parser, no_in: bool) -> u32 {
+    if (*p).kind == lex.T_KEYWORD && (*p).tflags & lex.F_ESCAPED != 0 as u32 {
+        return 0
+    }
+    if (*p).kind == lex.T_KEYWORD {
+        if (*p).code == lex.K_INSTANCEOF {
+            return 8
+        }
+        if (*p).code == lex.K_IN {
+            if no_in {
+                return 0
+            }
+            return 8
+        }
+        return 0
+    }
+    if (*p).kind != lex.T_PUNCT {
+        return 0
+    }
+    let c: u32 = (*p).code
+    if c == lex.P_COALESCE { return 1 }
+    if c == lex.P_OROR { return 2 }
+    if c == lex.P_ANDAND { return 3 }
+    if c == lex.P_OR { return 4 }
+    if c == lex.P_XOR { return 5 }
+    if c == lex.P_AND { return 6 }
+    if c == lex.P_EQ || c == lex.P_NE || c == lex.P_SEQ || c == lex.P_SNE { return 7 }
+    if c == lex.P_LT || c == lex.P_GT || c == lex.P_LE || c == lex.P_GE { return 8 }
+    if c == lex.P_SHL || c == lex.P_SHR || c == lex.P_USHR { return 9 }
+    if c == lex.P_ADD || c == lex.P_SUB { return 10 }
+    if c == lex.P_MUL || c == lex.P_DIV || c == lex.P_MOD { return 11 }
+    if c == lex.P_POW { return 12 }
+    return 0
+}
+
+fn parse_binary(p: *mut Parser, no_in: bool) -> u32 {
+    let left: u32 = parse_unary(p)
+    return parse_binary_from(p, left, 0, no_in)
+}
+
+fn parse_binary_from(p: *mut Parser, left0: u32, min: u32, no_in: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    var left: u32 = left0
+    while true {
+        if (*p).err != ERR_NONE {
+            return left
+        }
+        let prec: u32 = bin_prec(p, no_in)
+        if prec == 0 as u32 || prec < min {
+            return left
+        }
+        var op: u32 = (*p).code
+        if (*p).kind == lex.T_KEYWORD {
+            if op == lex.K_IN {
+                op = ast.OP_IN
+            } else {
+                op = ast.OP_INSTANCEOF
+            }
+        }
+        let line: u32 = (*p).line
+        var logical: bool = false
+        if op == lex.P_ANDAND || op == lex.P_OROR || op == lex.P_COALESCE {
+            logical = true
+        }
+        if op == lex.P_COALESCE && is_unparenthesized_logical(t, left) {
+            fail(p, ERR_SYNTAX)
+        }
+        // `**` is right associative; its left operand must not be a
+        // UnaryExpression (13.6.1).
+        if op == lex.P_POW && is_unary_node(t, left) {
+            fail(p, ERR_SYNTAX)
+        }
+        advance(p)
+        var next_min: u32 = prec + 1 as u32
+        if op == lex.P_POW {
+            next_min = prec
+        }
+        let right0: u32 = parse_unary(p)
+        let right: u32 = parse_binary_from(p, right0, next_min, no_in)
+        if op == lex.P_COALESCE && is_unparenthesized_logical(t, right) {
+            fail(p, ERR_SYNTAX)
+        }
+        var kindn: u32 = ast.N_BINARY
+        if logical {
+            kindn = ast.N_LOGICAL
+        }
+        let n: u32 = ast.ast_node(t, kindn, line)
+        ast.ast_set_a(t, n, op)
+        ast.ast_set_b(t, n, left)
+        ast.ast_set_c(t, n, right)
+        left = n
+    }
+    return left
+}
+
+fn is_unparenthesized_logical(t: *mut ast.Ast, n: u32) -> bool {
+    if ast.ast_kind(t, n) != ast.N_LOGICAL {
+        return false
+    }
+    if ast.ast_h(t, n) == 1 as u32 {
+        return false
+    }
+    let op: u32 = ast.ast_a(t, n)
+    return op == lex.P_ANDAND || op == lex.P_OROR
+}
+
+fn is_unary_node(t: *mut ast.Ast, n: u32) -> bool {
+    if ast.ast_h(t, n) == 1 as u32 {
+        return false
+    }
+    let k: u32 = ast.ast_kind(t, n)
+    return k == ast.N_UNARY || k == ast.N_UPDATE
+}
+
+fn parse_unary(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    if (*p).err != ERR_NONE {
+        return 0
+    }
+    var uop: u32 = 0
+    if (*p).kind == lex.T_PUNCT {
+        let c: u32 = (*p).code
+        if c == lex.P_SUB { uop = ast.U_MINUS }
+        if c == lex.P_ADD { uop = ast.U_PLUS }
+        if c == lex.P_NOT { uop = ast.U_NOT }
+        if c == lex.P_TILDE { uop = ast.U_BITNOT }
+        if c == lex.P_INC || c == lex.P_DEC {
+            let op: u32 = c
+            advance(p)
+            let arg: u32 = parse_unary(p)
+            if !is_simple_target(t, arg) {
+                fail(p, ERR_ASSIGN_TARGET)
+            }
+            check_assign_strict(p, arg)
+            let n: u32 = ast.ast_node(t, ast.N_UPDATE, line)
+            ast.ast_set_a(t, n, op)
+            ast.ast_set_b(t, n, arg)
+            ast.ast_set_c(t, n, 1)
+            return n
+        }
+    } else if (*p).kind == lex.T_KEYWORD && (*p).tflags & lex.F_ESCAPED == 0 as u32 {
+        let c: u32 = (*p).code
+        if c == lex.K_TYPEOF { uop = ast.U_TYPEOF }
+        if c == lex.K_VOID { uop = ast.U_VOID }
+        if c == lex.K_DELETE { uop = ast.U_DELETE }
+        if c == lex.K_AWAIT && (*p).in_async != 0 as u32 {
+            // 15.8: an AwaitExpression, but not in a parameter list and
+            // not inside a class static block.
+            if (*p).in_params != 0 as u32 || (*p).in_static_block != 0 as u32 {
+                fail(p, ERR_SYNTAX)
+                return 0
+            }
+            advance(p)
+            let n: u32 = ast.ast_node(t, ast.N_AWAIT, line)
+            ast.ast_set_a(t, n, parse_unary(p))
+            return n
+        }
+        if c == lex.K_AWAIT && (*p).module {
+            fail(p, ERR_SYNTAX)
+            return 0
+        }
+    }
+    if uop != 0 as u32 {
+        advance(p)
+        let arg: u32 = parse_unary(p)
+        if uop == ast.U_DELETE && (*p).strict {
+            if ast.ast_kind(t, arg) == ast.N_IDENT {
+                fail(p, ERR_STRICT)
+            }
+        }
+        if uop == ast.U_DELETE && ast.ast_kind(t, arg) == ast.N_MEMBER {
+            if ast.ast_kind(t, ast.ast_b(t, arg)) == ast.N_PRIVATE_NAME {
+                fail(p, ERR_SYNTAX)
+            }
+        }
+        let n: u32 = ast.ast_node(t, ast.N_UNARY, line)
+        ast.ast_set_a(t, n, uop)
+        ast.ast_set_b(t, n, arg)
+        return n
+    }
+    let e: u32 = parse_lhs(p)
+    // Postfix -- restricted production: no line terminator in front.
+    if ((*p).kind == lex.T_PUNCT) && ((*p).code == lex.P_INC || (*p).code == lex.P_DEC) && !(*p).nl {
+        let op: u32 = (*p).code
+        if !is_simple_target(t, e) {
+            fail(p, ERR_ASSIGN_TARGET)
+        }
+        check_assign_strict(p, e)
+        advance(p)
+        let n: u32 = ast.ast_node(t, ast.N_UPDATE, ast.ast_line(t, e))
+        ast.ast_set_a(t, n, op)
+        ast.ast_set_b(t, n, e)
+        ast.ast_set_c(t, n, 0)
+        return n
+    }
+    return e
+}
+
+// Only for `extends`: a LeftHandSideExpression.
+fn parse_unary_postfix_chain(p: *mut Parser) -> u32 {
+    return parse_lhs(p)
+}
+
+// ------------------------------------------- Calls, members, `new` (13.3)
+
+fn parse_lhs(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    var e: u32 = 0
+    if is_kw(p, lex.K_NEW) {
+        e = parse_new(p)
+    } else {
+        e = parse_primary(p)
+    }
+    return parse_call_tail(p, e, false)
+}
+
+fn parse_new(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    if is_punct(p, lex.P_DOT) {
+        advance(p)
+        if !is_name(p, lex.N_TARGET) {
+            fail(p, ERR_SYNTAX)
+        } else {
+            advance(p)
+        }
+        if (*p).in_func == 0 as u32 {
+            fail(p, ERR_SYNTAX)
+        }
+        let n: u32 = ast.ast_node(t, ast.N_META, line)
+        ast.ast_set_a(t, n, lex.K_NEW)
+        ast.ast_set_b(t, n, lex.N_TARGET)
+        return n
+    }
+    var callee: u32 = 0
+    if is_kw(p, lex.K_NEW) {
+        callee = parse_new(p)
+    } else {
+        callee = parse_primary(p)
+    }
+    // Member accesses bind to the callee, calls do not.
+    callee = parse_member_tail(p, callee)
+    let n: u32 = ast.ast_node(t, ast.N_NEW, line)
+    ast.ast_set_a(t, n, callee)
+    if is_punct(p, lex.P_LPAREN) {
+        var count: usize = 0
+        let off: u32 = parse_arguments(p, &count)
+        ast.ast_set_b(t, n, off)
+        ast.ast_set_c(t, n, count as u32)
+    }
+    return n
+}
+
+// Only `.x`, `[x]` and a tagged template -- no call.
+fn parse_member_tail(p: *mut Parser, start: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    var e: u32 = start
+    while (*p).err == ERR_NONE {
+        if is_punct(p, lex.P_DOT) {
+            advance(p)
+            e = make_member(p, e, false)
+        } else if is_punct(p, lex.P_LBRACK) {
+            advance(p)
+            let idx: u32 = parse_expression(p)
+            expect_punct(p, lex.P_RBRACK)
+            let n: u32 = ast.ast_node(t, ast.N_MEMBER, ast.ast_line(t, e))
+            ast.ast_set_a(t, n, e)
+            ast.ast_set_b(t, n, idx)
+            ast.ast_set_c(t, n, ast.MB_COMPUTED)
+            e = n
+        } else if (*p).kind == lex.T_TEMPLATE {
+            e = parse_tagged(p, e)
+        } else {
+            return e
+        }
+    }
+    return e
+}
+
+fn make_member(p: *mut Parser, obj: u32, optional: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = ast.ast_line(t, obj)
+    var prop: u32 = 0
+    if (*p).kind == lex.T_PRIVATE {
+        if (*p).in_class == 0 as u32 {
+            fail(p, ERR_SYNTAX)
+        }
+        priv_use(p, (*p).name)
+        prop = ast.ast_node(t, ast.N_PRIVATE_NAME, (*p).line)
+        ast.ast_set_a(t, prop, (*p).name)
+        advance(p)
+    } else {
+        let id: u32 = property_name_id(p)
+        if id == 0xFFFFFFFF as u32 {
+            fail(p, ERR_SYNTAX)
+            return obj
+        }
+        prop = ast.ast_node(t, ast.N_IDENT, (*p).line)
+        ast.ast_set_a(t, prop, id)
+        advance(p)
+    }
+    let n: u32 = ast.ast_node(t, ast.N_MEMBER, line)
+    ast.ast_set_a(t, n, obj)
+    ast.ast_set_b(t, n, prop)
+    var fl: u32 = 0
+    if optional {
+        fl = fl | ast.MB_OPTIONAL
+    }
+    ast.ast_set_c(t, n, fl)
+    return n
+}
+
+fn parse_call_tail(p: *mut Parser, start: u32, in_chain: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    var e: u32 = start
+    var optional_seen: bool = in_chain
+    while (*p).err == ERR_NONE {
+        if is_punct(p, lex.P_OPTCHAIN) {
+            advance(p)
+            optional_seen = true
+            if is_punct(p, lex.P_LPAREN) {
+                var count: usize = 0
+                let off: u32 = parse_arguments(p, &count)
+                let n: u32 = ast.ast_node(t, ast.N_CALL, ast.ast_line(t, e))
+                ast.ast_set_a(t, n, e)
+                ast.ast_set_b(t, n, off)
+                ast.ast_set_c(t, n, count as u32)
+                ast.ast_set_d(t, n, ast.CL_OPTIONAL)
+                e = n
+            } else if is_punct(p, lex.P_LBRACK) {
+                advance(p)
+                let idx: u32 = parse_expression(p)
+                expect_punct(p, lex.P_RBRACK)
+                let n: u32 = ast.ast_node(t, ast.N_MEMBER, ast.ast_line(t, e))
+                ast.ast_set_a(t, n, e)
+                ast.ast_set_b(t, n, idx)
+                ast.ast_set_c(t, n, ast.MB_COMPUTED | ast.MB_OPTIONAL)
+                e = n
+            } else if (*p).kind == lex.T_TEMPLATE {
+                fail(p, ERR_SYNTAX)
+                return e
+            } else {
+                e = make_member(p, e, true)
+            }
+        } else if is_punct(p, lex.P_DOT) {
+            advance(p)
+            e = make_member(p, e, false)
+        } else if is_punct(p, lex.P_LBRACK) {
+            advance(p)
+            let idx: u32 = parse_expression(p)
+            expect_punct(p, lex.P_RBRACK)
+            let n: u32 = ast.ast_node(t, ast.N_MEMBER, ast.ast_line(t, e))
+            ast.ast_set_a(t, n, e)
+            ast.ast_set_b(t, n, idx)
+            ast.ast_set_c(t, n, ast.MB_COMPUTED)
+            e = n
+        } else if is_punct(p, lex.P_LPAREN) {
+            var count: usize = 0
+            let off: u32 = parse_arguments(p, &count)
+            let n: u32 = ast.ast_node(t, ast.N_CALL, ast.ast_line(t, e))
+            ast.ast_set_a(t, n, e)
+            ast.ast_set_b(t, n, off)
+            ast.ast_set_c(t, n, count as u32)
+            e = n
+        } else if (*p).kind == lex.T_TEMPLATE {
+            if optional_seen {
+                fail(p, ERR_SYNTAX)
+                return e
+            }
+            e = parse_tagged(p, e)
+        } else {
+            break
+        }
+    }
+    if optional_seen && !in_chain {
+        let n: u32 = ast.ast_node(t, ast.N_CHAIN, ast.ast_line(t, e))
+        ast.ast_set_a(t, n, e)
+        return n
+    }
+    return e
+}
+
+fn parse_arguments(p: *mut Parser, count: *mut usize) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    expect_punct(p, lex.P_LPAREN)
+    let mark: usize = ast.ast_mark(t)
+    while !is_punct(p, lex.P_RPAREN) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        if is_punct(p, lex.P_ELLIPSIS) {
+            let line: u32 = (*p).line
+            advance(p)
+            let s: u32 = ast.ast_node(t, ast.N_SPREAD, line)
+            ast.ast_set_a(t, s, parse_assignment(p, false))
+            ast.ast_push(t, s)
+        } else {
+            ast.ast_push(t, parse_assignment(p, false))
+        }
+        if !eat_punct(p, lex.P_COMMA) {
+            break
+        }
+    }
+    *count = ast.ast_pending_count(t, mark)
+    let off: u32 = ast.ast_close(t, mark)
+    expect_punct(p, lex.P_RPAREN)
+    return off
+}
+
+// ------------------------------------------------------------- Templates
+
+fn parse_template(p: *mut Parser, tagged: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    let n: u32 = ast.ast_node(t, ast.N_TEMPLATE, line)
+    let qmark: usize = ast.ast_mark(t)
+    var quasis: usize = 0
+    var exprs: usize = 0
+    var emark: usize = 0
+    // The pieces and the expressions go into two lists; the second one is
+    // collected in a scratch buffer, because both grow at the same time.
+    var elist: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&elist)
+    while true {
+        if (*p).kind != lex.T_TEMPLATE {
+            fail(p, ERR_SYNTAX)
+            break
+        }
+        let q: u32 = ast.ast_node(t, ast.N_TEMPLATE_ELEM, (*p).line)
+        if (*p).tflags & lex.F_BAD_ESCAPE != 0 as u32 && !tagged {
+            // ES2018: an invalid escape only stays allowed in a TAGGED
+            // template, where the cooked value becomes `undefined`.
+            fail(p, ERR_SYNTAX)
+            break
+        }
+        if (*p).tflags & lex.F_BAD_ESCAPE == 0 as u32 {
+            let at: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l),
+                (*p).soff, (*p).slen)
+            ast.ast_set_a(t, q, at)
+            ast.ast_set_b(t, q, (*p).slen as u32)
+            ast.ast_set_e(t, q, 1)
+        }
+        let rat: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l),
+            (*p).roff, (*p).rlen)
+        ast.ast_set_c(t, q, rat)
+        ast.ast_set_d(t, q, (*p).rlen as u32)
+        ast.ast_push(t, q)
+        quasis = quasis + 1
+        let tail: bool = (*p).tflags & lex.F_TPL_TAIL != 0 as u32
+        if tail {
+            advance(p)
+            break
+        }
+        advance(p)
+        let e: u32 = parse_expression(p)
+        mem.cp_push(&elist, e)
+        exprs = exprs + 1
+        if !is_punct(p, lex.P_RBRACE) {
+            fail(p, ERR_SYNTAX)
+            break
+        }
+        lex.lex_template_continue((*p).l, (*p).start)
+        take(p)
+        if (*p).err != ERR_NONE {
+            break
+        }
+    }
+    let qoff: u32 = ast.ast_close(t, qmark)
+    let emark2: usize = ast.ast_mark(t)
+    var i: usize = 0
+    while i < mem.cp_len(&elist) {
+        ast.ast_push(t, mem.cp_at(&elist, i))
+        i = i + 1
+    }
+    let eoff: u32 = ast.ast_close(t, emark2)
+    mem.cp_free(&elist)
+    ast.ast_set_a(t, n, qoff)
+    ast.ast_set_b(t, n, quasis as u32)
+    ast.ast_set_c(t, n, eoff)
+    ast.ast_set_d(t, n, exprs as u32)
+    return n
+}
+
+fn parse_tagged(p: *mut Parser, tag: u32) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = ast.ast_line(t, tag)
+    let q: u32 = parse_template(p, true)
+    let n: u32 = ast.ast_node(t, ast.N_TAGGED, line)
+    ast.ast_set_a(t, n, tag)
+    ast.ast_set_b(t, n, q)
+    return n
+}
+
+// ------------------------------------------------------------- Primaries
+
+fn parse_primary(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    if (*p).err != ERR_NONE {
+        return 0
+    }
+    // Exactly here a regular expression may begin (12.1).
+    if is_punct(p, lex.P_DIV) || is_punct(p, lex.P_DIVA) {
+        regexp_here(p)
+    }
+    if (*p).kind == lex.T_NUM {
+        let n: u32 = ast.ast_node(t, ast.N_NUM, line)
+        ast.ast_set_a(t, n, ast.ast_num_add(t, (*p).numbits))
+        check_number_strict(p)
+        advance(p)
+        return n
+    }
+    if (*p).kind == lex.T_BIGINT {
+        return parse_bigint_literal(p)
+    }
+    if (*p).kind == lex.T_STRING {
+        if (*p).strict && (*p).tflags & lex.F_OCT_ESCAPE != 0 as u32 {
+            fail(p, ERR_STRICT)
+        }
+        return parse_string_literal(p)
+    }
+    if (*p).kind == lex.T_TEMPLATE {
+        return parse_template(p, false)
+    }
+    if (*p).kind == lex.T_REGEXP {
+        let n: u32 = ast.ast_node(t, ast.N_REGEXP, line)
+        let s: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l), (*p).soff, (*p).slen)
+        let f: u32 = ast.ast_str_add_from(t, lex.lex_pool_ptr((*p).l), (*p).roff, (*p).rlen)
+        ast.ast_set_a(t, n, s)
+        ast.ast_set_b(t, n, (*p).slen as u32)
+        ast.ast_set_c(t, n, f)
+        ast.ast_set_d(t, n, (*p).rlen as u32)
+        advance(p)
+        return n
+    }
+    if (*p).kind == lex.T_PRIVATE {
+        // `#x in obj` -- only allowed inside a class body.
+        if (*p).in_class == 0 as u32 {
+            fail(p, ERR_SYNTAX)
+        }
+        priv_use(p, (*p).name)
+        let n: u32 = ast.ast_node(t, ast.N_PRIVATE_NAME, line)
+        ast.ast_set_a(t, n, (*p).name)
+        advance(p)
+        return n
+    }
+    if (*p).kind == lex.T_KEYWORD && (*p).tflags & lex.F_ESCAPED == 0 as u32 {
+        let c: u32 = (*p).code
+        if c == lex.K_TRUE || c == lex.K_FALSE {
+            let n: u32 = ast.ast_node(t, ast.N_BOOL, line)
+            var v: u32 = 0
+            if c == lex.K_TRUE {
+                v = 1
+            }
+            ast.ast_set_a(t, n, v)
+            advance(p)
+            return n
+        }
+        if c == lex.K_NULL {
+            advance(p)
+            return ast.ast_node(t, ast.N_NULL, line)
+        }
+        if c == lex.K_THIS {
+            advance(p)
+            return ast.ast_node(t, ast.N_THIS, line)
+        }
+        if c == lex.K_SUPER {
+            advance(p)
+            if (*p).in_method == 0 as u32 {
+                fail(p, ERR_SYNTAX)
+            }
+            if !is_punct(p, lex.P_DOT) && !is_punct(p, lex.P_LBRACK) && !is_punct(p, lex.P_LPAREN) {
+                fail(p, ERR_SYNTAX)
+            }
+            return ast.ast_node(t, ast.N_SUPER, line)
+        }
+        if c == lex.K_FUNCTION {
+            advance(p)
+            return parse_function(p, 0, line)
+        }
+        if c == lex.K_CLASS {
+            advance(p)
+            return parse_class(p, false, line)
+        }
+        if c == lex.K_IMPORT {
+            fail(p, ERR_UNSUPPORTED)
+            advance(p)
+            return 0
+        }
+        if c == lex.K_NEW {
+            return parse_new(p)
+        }
+    }
+    if is_punct(p, lex.P_LBRACK) {
+        return parse_array_literal(p)
+    }
+    if is_punct(p, lex.P_LBRACE) {
+        return parse_object_literal(p)
+    }
+    if is_punct(p, lex.P_LPAREN) {
+        return parse_paren_or_arrow(p)
+    }
+    // `async function () {}` as an expression.
+    if is_name(p, lex.N_ASYNC) && async_function_follows(p) {
+        advance(p)
+        advance(p)
+        return parse_function(p, ast.FN_ASYNC, line)
+    }
+    let id: u32 = ident_name_here(p)
+    if id != 0xFFFFFFFF as u32 {
+        if (*p).strict && is_strict_reserved(id) {
+            fail(p, ERR_STRICT)
+        }
+        // 15.7.1: inside a field initializer and inside a static block
+        // `arguments` does not exist.
+        if id == lex.N_ARGUMENTS && ((*p).in_field != 0 as u32 || (*p).in_static_block != 0 as u32) {
+            fail(p, ERR_SYNTAX)
+        }
+        let n: u32 = ast.ast_node(t, ast.N_IDENT, line)
+        ast.ast_set_a(t, n, id)
+        advance(p)
+        return n
+    }
+    fail(p, ERR_SYNTAX)
+    advance(p)
+    return 0
+}
+
+fn parse_array_literal(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_ARRAY, line)
+    let mark: usize = ast.ast_mark(t)
+    while !is_punct(p, lex.P_RBRACK) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        if is_punct(p, lex.P_COMMA) {
+            advance(p)
+            ast.ast_push(t, 0)
+            continue
+        }
+        if is_punct(p, lex.P_ELLIPSIS) {
+            let sline: u32 = (*p).line
+            advance(p)
+            let s: u32 = ast.ast_node(t, ast.N_SPREAD, sline)
+            ast.ast_set_a(t, s, parse_assignment(p, false))
+            ast.ast_push(t, s)
+        } else {
+            ast.ast_push(t, parse_assignment(p, false))
+        }
+        if !is_punct(p, lex.P_RBRACK) {
+            if !eat_punct(p, lex.P_COMMA) {
+                fail(p, ERR_SYNTAX)
+                break
+            }
+        }
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    ast.ast_set_a(t, n, ast.ast_close(t, mark))
+    ast.ast_set_b(t, n, count as u32)
+    expect_punct(p, lex.P_RBRACK)
+    return n
+}
+
+fn parse_object_literal(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    let n: u32 = ast.ast_node(t, ast.N_OBJECT, line)
+    let mark: usize = ast.ast_mark(t)
+    var proto_count: u32 = 0
+    while !is_punct(p, lex.P_RBRACE) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        if is_punct(p, lex.P_ELLIPSIS) {
+            let sline: u32 = (*p).line
+            advance(p)
+            let s: u32 = ast.ast_node(t, ast.N_SPREAD, sline)
+            ast.ast_set_a(t, s, parse_assignment(p, false))
+            ast.ast_push(t, s)
+            if !eat_punct(p, lex.P_COMMA) {
+                break
+            }
+            continue
+        }
+        let pline: u32 = (*p).line
+        var pflags: u32 = 0
+        var fnflags: u32 = ast.FN_METHOD
+        var accessor: bool = false
+        if (is_name(p, lex.N_GET) || is_name(p, lex.N_SET)) && !next_ends_member(p) {
+            if is_name(p, lex.N_GET) {
+                pflags = pflags | ast.PR_GET
+                fnflags = fnflags | ast.FN_GETTER
+            } else {
+                pflags = pflags | ast.PR_SET
+                fnflags = fnflags | ast.FN_SETTER
+            }
+            accessor = true
+            advance(p)
+        } else if is_punct(p, lex.P_MUL) {
+            advance(p)
+            fnflags = fnflags | ast.FN_GENERATOR
+        } else if is_name(p, lex.N_ASYNC) && !next_ends_member(p) && !(*p).nl {
+            advance(p)
+            fnflags = fnflags | ast.FN_ASYNC
+            if is_punct(p, lex.P_MUL) {
+                advance(p)
+                fnflags = fnflags | ast.FN_GENERATOR
+            }
+        }
+        var computed: bool = false
+        var key_name: u32 = 0xFFFFFFFF as u32
+        let key: u32 = parse_property_key(p, &computed, &key_name)
+        if computed {
+            pflags = pflags | ast.PR_COMPUTED
+        }
+        let prop: u32 = ast.ast_node(t, ast.N_PROPERTY, pline)
+        ast.ast_set_a(t, prop, key)
+        if accessor {
+            let f: u32 = ast.ast_node(t, ast.N_FUNC, pline)
+            let outer_method: u32 = (*p).in_method
+            (*p).in_method = 1
+            parse_function_rest(p, f, fnflags)
+            (*p).in_method = outer_method
+            check_accessor_arity(p, f, fnflags)
+            ast.ast_set_b(t, prop, f)
+            ast.ast_set_c(t, prop, pflags)
+        } else if is_punct(p, lex.P_LPAREN) {
+            let f: u32 = ast.ast_node(t, ast.N_FUNC, pline)
+            let outer_method: u32 = (*p).in_method
+            (*p).in_method = 1
+            parse_function_rest(p, f, fnflags)
+            (*p).in_method = outer_method
+            ast.ast_set_b(t, prop, f)
+            ast.ast_set_c(t, prop, pflags | ast.PR_METHOD)
+        } else if fnflags & (ast.FN_GENERATOR | ast.FN_ASYNC) != 0 as u32 {
+            fail(p, ERR_SYNTAX)
+            break
+        } else if is_punct(p, lex.P_COLON) {
+            advance(p)
+            ast.ast_set_b(t, prop, parse_assignment(p, false))
+            ast.ast_set_c(t, prop, pflags)
+            if !computed && key_name == lex.N_DUNDER_PROTO {
+                proto_count = proto_count + 1 as u32
+                ast.ast_set_c(t, prop, pflags | ast.PR_PROTO)
+            }
+        } else {
+            // Shorthand -- and `a = 1` only inside a destructuring pattern.
+            if computed || key_name == 0xFFFFFFFF as u32 || ast.ast_kind(t, key) != ast.N_IDENT {
+                fail(p, ERR_SYNTAX)
+                break
+            }
+            if key_name < lex.KW_COUNT && key_name != lex.K_YIELD && key_name != lex.K_AWAIT {
+                fail(p, ERR_SYNTAX)
+                break
+            }
+            if (*p).strict && (is_strict_reserved(key_name) || key_name == lex.N_EVAL || key_name == lex.N_ARGUMENTS) {
+                fail(p, ERR_STRICT)
+            }
+            let v: u32 = ast.ast_node(t, ast.N_IDENT, pline)
+            ast.ast_set_a(t, v, key_name)
+            if is_punct(p, lex.P_ASSIGN) {
+                advance(p)
+                let d: u32 = ast.ast_node(t, ast.N_ASSIGN_PAT, pline)
+                ast.ast_set_a(t, d, v)
+                ast.ast_set_b(t, d, parse_assignment(p, false))
+                ast.ast_set_b(t, prop, d)
+                ast.ast_set_h(t, prop, 1)
+            } else {
+                ast.ast_set_b(t, prop, v)
+            }
+            ast.ast_set_c(t, prop, pflags | ast.PR_SHORTHAND)
+        }
+        ast.ast_push(t, prop)
+        if !eat_punct(p, lex.P_COMMA) {
+            break
+        }
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    ast.ast_set_a(t, n, ast.ast_close(t, mark))
+    ast.ast_set_b(t, n, count as u32)
+    ast.ast_set_c(t, n, proto_count)
+    if proto_count > 1 as u32 {
+        // 13.2.5.1: two `__proto__: v` data properties in ONE object
+        // literal are an early error. A shorthand, a method or a computed
+        // key does not count -- which is why only the colon form is added
+        // up above.
+        fail(p, ERR_DUPLICATE)
+    }
+    expect_punct(p, lex.P_RBRACE)
+    return n
+}
+
+// `(` ... `)` -- either a parenthesized expression or the parameter list of
+// an arrow function. It is read as an expression list and only turned into
+// a parameter list at the `=>` (the cover grammar of 13.2).
+fn parse_paren_or_arrow(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let line: u32 = (*p).line
+    advance(p)
+    let mark: usize = ast.ast_mark(t)
+    var arrow_only: bool = false
+    var simple: bool = true
+    if is_punct(p, lex.P_RPAREN) {
+        arrow_only = true
+    }
+    while !is_punct(p, lex.P_RPAREN) && (*p).kind != lex.T_EOF && (*p).err == ERR_NONE {
+        if is_punct(p, lex.P_ELLIPSIS) {
+            let rline: u32 = (*p).line
+            advance(p)
+            let r: u32 = ast.ast_node(t, ast.N_REST, rline)
+            var inner: u32 = 0
+            if is_punct(p, lex.P_LBRACK) || is_punct(p, lex.P_LBRACE) {
+                inner = to_pattern(p, parse_primary(p), true)
+            } else {
+                inner = parse_binding_ident_no_declare(p)
+            }
+            ast.ast_set_a(t, r, inner)
+            ast.ast_push(t, r)
+            arrow_only = true
+            simple = false
+            break
+        }
+        ast.ast_push(t, parse_assignment(p, false))
+        if !eat_punct(p, lex.P_COMMA) {
+            break
+        }
+        if is_punct(p, lex.P_RPAREN) {
+            arrow_only = true
+            break
+        }
+    }
+    let count: usize = ast.ast_pending_count(t, mark)
+    if !is_punct(p, lex.P_RPAREN) {
+        fail(p, ERR_SYNTAX)
+    }
+    let is_arrow: bool = arrow_follows_rparen(p)
+    let off: u32 = ast.ast_close(t, mark)
+    expect_punct(p, lex.P_RPAREN)
+    if is_arrow {
+        var i: usize = 0
+        while i < count {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            let pat: u32 = to_pattern(p, e, true)
+            if ast.ast_kind(t, pat) != ast.N_IDENT {
+                simple = false
+            }
+            ast.ast_list_set(t, off, i, pat)
+            i = i + 1
+        }
+        return finish_arrow(p, off, count, line, simple, 0)
+    }
+    if arrow_only {
+        fail(p, ERR_SYNTAX)
+        return 0
+    }
+    if count == 0 {
+        fail(p, ERR_SYNTAX)
+        return 0
+    }
+    if count == 1 {
+        let e: u32 = ast.ast_list_at(t, off, 0)
+        ast.ast_set_h(t, e, 1)
+        return e
+    }
+    let n: u32 = ast.ast_node(t, ast.N_SEQUENCE, line)
+    ast.ast_set_a(t, n, off)
+    ast.ast_set_b(t, n, count as u32)
+    ast.ast_set_h(t, n, 1)
+    return n
+}
+
+fn parse_binding_ident_no_declare(p: *mut Parser) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    let id: u32 = ident_name_here(p)
+    if id == 0xFFFFFFFF as u32 {
+        fail(p, ERR_SYNTAX)
+        advance(p)
+        return 0
+    }
+    let n: u32 = ast.ast_node(t, ast.N_IDENT, (*p).line)
+    ast.ast_set_a(t, n, id)
+    advance(p)
+    return n
+}
+
+fn arrow_follows_rparen(p: *mut Parser) -> bool {
+    let l: *mut lex.Lexer = (*p).l
+    let save: usize = (*l).pos
+    let saveline: u32 = (*l).line
+    lex.lex_next(l, lex.GOAL_DIV)
+    let r: bool = (*l).kind == lex.T_PUNCT && (*l).code == lex.P_ARROW && !(*l).nl
+    lex.lex_restore(l, save, saveline)
+    return r
+}
+
+// ------------------------------- Expression -> pattern (the cover grammar)
+//
+// `[a, b] = c` and `({x} = y)` are parsed as an ARRAY and an OBJECT
+// literal, because at the opening bracket nobody knows yet what will come.
+// This is where they turn into patterns -- exactly as the specification
+// describes it in 13.15.5 (Runtime Semantics: DestructuringAssignment).
+// `binding` says whether the names are being declared (then only
+// identifiers and patterns are allowed) or assigned to (then member
+// expressions are allowed as well).
+fn to_pattern(p: *mut Parser, node: u32, binding: bool) -> u32 {
+    let t: *mut ast.Ast = (*p).t
+    if node == 0 as u32 {
+        return 0
+    }
+    let k: u32 = ast.ast_kind(t, node)
+    if k == ast.N_IDENT {
+        if binding {
+            check_binding_name(p, ast.ast_a(t, node), ast.ast_line(t, node))
+        }
+        return node
+    }
+    if k == ast.N_MEMBER {
+        if binding {
+            fail(p, ERR_ASSIGN_TARGET)
+        }
+        return node
+    }
+    if k == ast.N_ARRAY {
+        let off: u32 = ast.ast_a(t, node)
+        let cnt: usize = ast.ast_b(t, node) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if e == 0 as u32 {
+                i = i + 1
+                continue
+            }
+            if ast.ast_kind(t, e) == ast.N_SPREAD {
+                if i + 1 != cnt {
+                    fail(p, ERR_SYNTAX)
+                }
+                let inner: u32 = to_pattern(p, ast.ast_a(t, e), binding)
+                if ast.ast_kind(t, inner) == ast.N_ASSIGN_PAT {
+                    fail(p, ERR_SYNTAX)
+                }
+                ast.ast_set_kind(t, e, ast.N_REST)
+                ast.ast_set_a(t, e, inner)
+            } else {
+                ast.ast_list_set(t, off, i, to_pattern(p, e, binding))
+            }
+            i = i + 1
+        }
+        ast.ast_set_kind(t, node, ast.N_ARRAY_PAT)
+        return node
+    }
+    if k == ast.N_OBJECT {
+        let off: u32 = ast.ast_a(t, node)
+        let cnt: usize = ast.ast_b(t, node) as usize
+        var i: usize = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i)
+            if ast.ast_kind(t, e) == ast.N_SPREAD {
+                if i + 1 != cnt {
+                    fail(p, ERR_SYNTAX)
+                }
+                let inner: u32 = to_pattern(p, ast.ast_a(t, e), binding)
+                if ast.ast_kind(t, inner) != ast.N_IDENT && ast.ast_kind(t, inner) != ast.N_MEMBER {
+                    fail(p, ERR_SYNTAX)
+                }
+                ast.ast_set_kind(t, e, ast.N_REST)
+                ast.ast_set_a(t, e, inner)
+            } else {
+                let fl: u32 = ast.ast_c(t, e)
+                if fl & (ast.PR_GET | ast.PR_SET | ast.PR_METHOD) != 0 as u32 {
+                    fail(p, ERR_SYNTAX)
+                }
+                ast.ast_set_b(t, e, to_pattern(p, ast.ast_b(t, e), binding))
+            }
+            i = i + 1
+        }
+        ast.ast_set_kind(t, node, ast.N_OBJECT_PAT)
+        return node
+    }
+    if k == ast.N_ASSIGN {
+        if ast.ast_a(t, node) != lex.P_ASSIGN {
+            fail(p, ERR_ASSIGN_TARGET)
+            return node
+        }
+        let left: u32 = to_pattern(p, ast.ast_b(t, node), binding)
+        ast.ast_set_kind(t, node, ast.N_ASSIGN_PAT)
+        ast.ast_set_a(t, node, left)
+        ast.ast_set_b(t, node, ast.ast_c(t, node))
+        return node
+    }
+    if k == ast.N_ASSIGN_PAT || k == ast.N_ARRAY_PAT || k == ast.N_OBJECT_PAT || k == ast.N_REST {
+        return node
+    }
+    fail(p, ERR_ASSIGN_TARGET)
+    return node
+}
+
+// Is this node allowed to stand on the left of `=`?
+fn is_valid_target(t: *mut ast.Ast, n: u32) -> bool {
+    if n == 0 as u32 {
+        return false
+    }
+    let k: u32 = ast.ast_kind(t, n)
+    if k == ast.N_IDENT || k == ast.N_MEMBER {
+        return true
+    }
+    return k == ast.N_ARRAY_PAT || k == ast.N_OBJECT_PAT
+}
+
+// `++`/`--` and the compound assignments need a SIMPLE target.
+fn is_simple_target(t: *mut ast.Ast, n: u32) -> bool {
+    if n == 0 as u32 {
+        return false
+    }
+    let k: u32 = ast.ast_kind(t, n)
+    return k == ast.N_IDENT || k == ast.N_MEMBER
+}

@@ -1,0 +1,3286 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/gen.fi -- the RESUMABLE EVALUATOR of round 66: generators,
+// `yield`, `yield*`, async functions, `await`, promises and the job queue.
+//
+// THE DECISION, and why it is this one (docs/ROUND66.md 1):
+// `lib/js/interp.fi` is a tree walker over the Firn call stack. A generator
+// has to give its execution context UP in the middle of an expression and
+// take it back later, and a Firn frame cannot be given up. So the body of a
+// generator does not run on the machine stack at all: it runs on an
+// EXPLICIT STACK OF FRAMES IN THE GC HEAP (`val.GenFrame`). One frame is
+// one node of the syntax tree plus the state inside that node.
+//
+// The consequence is exactly what the round asks for: a generator that
+// nobody holds any more is collected like every other object -- no second
+// stack the collector would have to scan, no pinning, no external root. And
+// a suspended generator costs a handful of small objects, not a megabyte of
+// stack.
+//
+// THE SECOND HALF OF THE DECISION, and the reason the file is not three
+// times as long: only a subtree that REALLY CONTAINS a suspension point is
+// carried by these frames. `susp_has` marks the nodes that contain a
+// `yield` or an `await`; everything else -- the overwhelming majority of
+// every generator body -- is handed to the ordinary `interp.eval_node` and
+// runs on the machine stack at full speed.
+import html.mem
+import std.math
+import js.lex
+import js.ast
+import js.val
+import js.interp
+import js.bigint
+
+export {
+    Susp, susp_new, susp_init, susp_free, susp_has,
+    gen_start, gen_native, gen_arity, GEN_BASE,
+    install_gen, run_jobs, promise_resolve_value, make_promise,
+    settle_promise, new_promise,
+}
+
+// The natives of this file start here; `builtin.native_dispatch` hands
+// everything from this number on over.
+const GEN_BASE: u64 = 30000
+
+const GN_NEXT: u64 = 30000
+const GN_RETURN: u64 = 30001
+const GN_THROW: u64 = 30002
+const GN_ITER_SELF: u64 = 30003
+const GN_ASYNC_NEXT: u64 = 30004
+const GN_ASYNC_RETURN: u64 = 30005
+const GN_ASYNC_THROW: u64 = 30006
+const GN_ASYNC_ITER_SELF: u64 = 30007
+
+const GN_PROMISE_CTOR: u64 = 30010
+const GN_P_RESOLVE: u64 = 30011
+const GN_P_REJECT: u64 = 30012
+const GN_P_THEN: u64 = 30013
+const GN_P_CATCH: u64 = 30014
+const GN_P_FINALLY: u64 = 30015
+const GN_P_ALL: u64 = 30016
+const GN_P_RACE: u64 = 30017
+const GN_P_ALLSETTLED: u64 = 30018
+const GN_P_ANY: u64 = 30019
+
+// The instance bound helpers: the two resolving functions of a promise, the
+// reaction job, the continuation of an `await` and the element helpers of
+// `Promise.all`.
+const GN_RESOLVE_FN: u64 = 30030
+const GN_REJECT_FN: u64 = 30031
+const GN_REACTION: u64 = 30032
+const GN_AWAIT_OK: u64 = 30033
+const GN_AWAIT_ERR: u64 = 30034
+const GN_ALL_SLOT: u64 = 30035
+const GN_THENABLE_JOB: u64 = 30036
+const GN_FINALLY_OK: u64 = 30037
+const GN_FINALLY_ERR: u64 = 30038
+const GN_SETTLED_OK: u64 = 30039
+const GN_SETTLED_ERR: u64 = 30040
+const GN_ANY_SLOT: u64 = 30041
+const GN_VALUE_THUNK: u64 = 30042
+const GN_THROWER: u64 = 30043
+
+const GN_BIGINT_CTOR: u64 = 30050
+const GN_BI_TOSTRING: u64 = 30051
+const GN_BI_VALUEOF: u64 = 30052
+const GN_BI_ASINTN: u64 = 30053
+const GN_BI_ASUINTN: u64 = 30054
+const GN_BI_TOLOCALE: u64 = 30055
+
+// The kinds of a frame.
+const FK_NODE: u64 = 0
+const FK_AWAIT: u64 = 1
+const FK_STMTS: u64 = 2
+
+// How a suspended body is woken up again.
+const RM_NEXT: u64 = 0
+const RM_THROW: u64 = 1
+const RM_RETURN: u64 = 2
+
+// What one step of the machine has produced.
+const ST_DONE: u64 = 0
+const ST_YIELD: u64 = 1
+const ST_AWAIT: u64 = 2
+
+// What a handler answers.
+const ACT_GO: u32 = 0 // go round again
+const ACT_SUSPEND: u32 = 1 // give the machine back to the caller
+
+// ===================================================== The suspension bits
+//
+// Two bits per node: 0 = not looked at yet, 1 = free of suspension points,
+// 2 = contains one. The buffer lies OUTSIDE the GC heap, like the syntax
+// tree it belongs to.
+
+struct Susp {
+    bits: mem.CpBuf,
+}
+
+fn susp_new() -> Susp {
+    return Susp { bits: mem.cp_new() }
+}
+
+fn susp_init(s: *mut Susp) {
+    mem.cp_init(&(*s).bits)
+}
+
+fn susp_free(s: *mut Susp) {
+    mem.cp_free(&(*s).bits)
+}
+
+fn susp_of(r: Gc[Realm]) -> *mut Susp {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    return (*c).gen_data as *mut Susp
+}
+
+fn susp_get(s: *mut Susp, i: u32) -> u32 {
+    if i as usize >= mem.cp_len(&(*s).bits) {
+        return 0
+    }
+    return mem.cp_at(&(*s).bits, i as usize)
+}
+
+fn susp_set(s: *mut Susp, i: u32, v: u32) {
+    while mem.cp_len(&(*s).bits) <= i as usize {
+        mem.cp_push(&(*s).bits, 0)
+    }
+    mem.cp_set(&(*s).bits, i as usize, v)
+}
+
+// Does the subtree of `node` contain a `yield` or an `await` that belongs
+// to THIS body? A nested function has its own body and does not count --
+// except for the PARAMETER LIST of an arrow function, which is parsed in
+// the enclosing context and may really hold a `yield` of this generator.
+fn susp_has(r: Gc[Realm], node: u32) -> bool {
+    if node == 0 as u32 {
+        return false
+    }
+    let sp: *mut Susp = susp_of(r)
+    if (sp as u64) == 0 {
+        return false
+    }
+    let cached: u32 = susp_get(sp, node)
+    if cached != 0 as u32 {
+        return cached == 2 as u32
+    }
+    // Mark it as "free" first, so that a cycle (there is none in a tree,
+    // but a node may be visited twice) cannot loop.
+    susp_set(sp, node, 1)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let k: u32 = ast.ast_kind(t, node)
+    var yes: bool = false
+    if k == ast.N_YIELD || k == ast.N_AWAIT {
+        yes = true
+    } else if k == ast.N_FOROF && ast.ast_d(t, node) & ast.FOR_AWAIT != 0 as u32 {
+        // `for await` awaits in every round, even when nothing inside it
+        // does -- the loop belongs to the resumable evaluator.
+        yes = true
+    } else if k == ast.N_FUNC {
+        // Only the parameters of an ARROW belong to the enclosing context.
+        if ast.ast_e(t, node) & ast.FN_ARROW != 0 as u32 {
+            let off: u32 = ast.ast_b(t, node)
+            let cnt: usize = ast.ast_c(t, node) as usize
+            var i: usize = 0
+            while i < cnt {
+                if susp_has(r, ast.ast_list_at(t, off, i)) {
+                    yes = true
+                }
+                i = i + 1
+            }
+        }
+    } else {
+        if susp_child(r, ast.ast_a(t, node), k, 0) {
+            yes = true
+        }
+        if susp_child(r, ast.ast_b(t, node), k, 1) {
+            yes = true
+        }
+        if susp_child(r, ast.ast_c(t, node), k, 2) {
+            yes = true
+        }
+        if susp_child(r, ast.ast_d(t, node), k, 3) {
+            yes = true
+        }
+        // The children that lie in the list column.
+        if k == ast.N_PROGRAM || k == ast.N_BLOCK || k == ast.N_STATIC_BLOCK {
+            if susp_list(r, ast.ast_a(t, node), ast.ast_b(t, node) as usize) {
+                yes = true
+            }
+        } else if k == ast.N_ARRAY || k == ast.N_OBJECT || k == ast.N_SEQUENCE {
+            if susp_list(r, ast.ast_a(t, node), ast.ast_b(t, node) as usize) {
+                yes = true
+            }
+        } else if k == ast.N_CALL || k == ast.N_NEW || k == ast.N_SWITCH || k == ast.N_VAR_DECL || k == ast.N_TEMPLATE || k == ast.N_CLASS {
+            if susp_list(r, ast.ast_b(t, node), ast.ast_c(t, node) as usize) {
+                yes = true
+            }
+        } else if k == ast.N_CASE {
+            if susp_list(r, ast.ast_b(t, node), ast.ast_c(t, node) as usize) {
+                yes = true
+            }
+        } else if k == ast.N_TAGGED {
+            if susp_has(r, ast.ast_b(t, node)) {
+                yes = true
+            }
+        }
+    }
+    if yes {
+        susp_set(sp, node, 2)
+        return true
+    }
+    susp_set(sp, node, 1)
+    return false
+}
+
+// The `a`..`d` columns hold node numbers for most kinds but plain numbers
+// for a few (an operator, a flag, a list offset). Those must not be walked.
+fn susp_child(r: Gc[Realm], child: u32, kind: u32, which: u32) -> bool {
+    if child == 0 as u32 {
+        return false
+    }
+    if kind == ast.N_UNARY && which == 0 as u32 {
+        return false
+    }
+    if kind == ast.N_UPDATE && which == 0 as u32 {
+        return false
+    }
+    if kind == ast.N_BINARY && which == 0 as u32 {
+        return false
+    }
+    if kind == ast.N_LOGICAL && which == 0 as u32 {
+        return false
+    }
+    if kind == ast.N_ASSIGN && which == 0 as u32 {
+        return false
+    }
+    if kind == ast.N_LABELED && which == 0 as u32 {
+        return false
+    }
+    if kind == ast.N_BREAK || kind == ast.N_CONTINUE {
+        return false
+    }
+    if kind == ast.N_VAR_DECL {
+        return false
+    }
+    if kind == ast.N_IDENT || kind == ast.N_PRIVATE_NAME || kind == ast.N_NUM || kind == ast.N_STR || kind == ast.N_BOOL || kind == ast.N_BIGINT || kind == ast.N_REGEXP || kind == ast.N_TEMPLATE_ELEM || kind == ast.N_META {
+        return false
+    }
+    if kind == ast.N_PROGRAM || kind == ast.N_BLOCK || kind == ast.N_STATIC_BLOCK || kind == ast.N_ARRAY || kind == ast.N_OBJECT || kind == ast.N_SEQUENCE {
+        return false
+    }
+    if kind == ast.N_SWITCH && which != 0 as u32 {
+        return false
+    }
+    if kind == ast.N_CASE && which != 0 as u32 {
+        return false
+    }
+    if kind == ast.N_CALL && which != 0 as u32 {
+        return false
+    }
+    if kind == ast.N_NEW && which != 0 as u32 {
+        return false
+    }
+    if kind == ast.N_TEMPLATE {
+        return false
+    }
+    if kind == ast.N_CLASS && which != 1 as u32 {
+        return false
+    }
+    if kind == ast.N_MEMBER && which == 2 as u32 {
+        return false
+    }
+    if kind == ast.N_METHOD && which > 1 as u32 {
+        return false
+    }
+    if kind == ast.N_FIELD && which == 2 as u32 {
+        return false
+    }
+    if kind == ast.N_PROPERTY && which > 1 as u32 {
+        return false
+    }
+    if kind == ast.N_FOROF && which == 3 as u32 {
+        return false
+    }
+    return susp_has(r, child)
+}
+
+fn susp_list(r: Gc[Realm], off: u32, count: usize) -> bool {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var i: usize = 0
+    var yes: bool = false
+    while i < count {
+        if susp_has(r, ast.ast_list_at(t, off, i)) {
+            yes = true
+        }
+        i = i + 1
+    }
+    return yes
+}
+
+// ============================================================== The frames
+
+fn push_node(r: Gc[Realm], gs: Gc[GenState], node: u32,
+    env: Gc[Env]) -> AllocError!bool {
+    let f: Gc[GenFrame] = try val.frame_new(r, node, env, gs.frame)
+    gs.frame = f
+    return true
+}
+
+fn push_stmts(r: Gc[Realm], gs: Gc[GenState], off: u32, count: u64,
+    env: Gc[Env]) -> AllocError!bool {
+    let f: Gc[GenFrame] = try val.frame_new(r, off, env, gs.frame)
+    f.fk = FK_STMTS
+    f.n = count
+    gs.frame = f
+    return true
+}
+
+fn push_await(r: Gc[Realm], gs: Gc[GenState], v: Gc[JsVal],
+    env: Gc[Env]) -> AllocError!bool {
+    let f: Gc[GenFrame] = try val.frame_new(r, 0, env, gs.frame)
+    f.fk = FK_AWAIT
+    f.a = v
+    gs.frame = f
+    return true
+}
+
+fn finish(gs: Gc[GenState], v: Gc[JsVal]) {
+    gs.result = v
+    gs.frame = gs.frame.next
+}
+
+// Evaluate a sub expression. If it holds no suspension point it runs on the
+// machine stack right here; otherwise a frame is pushed and the caller has
+// to go round again.
+fn eval_sub(r: Gc[Realm], gs: Gc[GenState], node: u32,
+    env: Gc[Env]) -> AllocError!bool {
+    if node == 0 as u32 {
+        gs.result = val.realm_undefined(r)
+        return false
+    }
+    if susp_has(r, node) {
+        let ok: bool = try push_node(r, gs, node, env)
+        return true
+    }
+    gs.result = try interp.eval_node(r, node, env)
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    if (*c).comp != interp.C_NORMAL {
+        // The subtree ran on the machine stack and came back ABRUPT. The
+        // caller must go back to the machine loop at once, so that the
+        // unwinding starts with ITS frame on top -- otherwise a `finally`
+        // would be skipped and a `break` would leave the wrong loop.
+        return true
+    }
+    return false
+}
+
+// ============================================================ The machine
+
+fn machine_run(r: Gc[Realm], gs: Gc[GenState]) -> AllocError!u64 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    var guard: u64 = 0
+    while true {
+        guard = guard + 1
+        if (gs.frame as u64) == 0 {
+            gs.status = val.G_COMPLETED
+            return ST_DONE
+        }
+        let f: Gc[GenFrame] = gs.frame
+        if (*c).comp != interp.C_NORMAL {
+            let taken: bool = try unwind(r, gs, f)
+            if !taken {
+                gs.frame = f.next
+            }
+            continue
+        }
+        var act: u32 = ACT_GO
+        if f.fk == FK_AWAIT {
+            act = try st_await_frame(r, gs, f)
+        } else if f.fk == FK_STMTS {
+            act = try st_stmts(r, gs, f)
+        } else {
+            act = try st_node(r, gs, f)
+        }
+        if act == ACT_SUSPEND {
+            if gs.status == val.G_COMPLETED {
+                return ST_DONE
+            }
+            if gs.mode == RM_RETURN {
+                return ST_AWAIT
+            }
+            return gs.done
+        }
+    }
+    return ST_DONE
+}
+
+// An abrupt completion arrived at the top frame. Does this frame take it?
+fn unwind(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    if f.fk != FK_NODE {
+        return false
+    }
+    let node: u32 = f.node as u32
+    let k: u32 = ast.ast_kind(t, node)
+    if k == ast.N_TRY {
+        return unwind_try(r, gs, f)
+    }
+    if k == ast.N_WHILE || k == ast.N_DOWHILE || k == ast.N_FOR || k == ast.N_FORIN || k == ast.N_FOROF {
+        // Only a break or a continue for THIS loop is taken.
+        if (*c).comp == interp.C_CONTINUE {
+            if (*c).label == 0 as u32 || (*c).label == f.flag as u32 {
+                (*c).comp = interp.C_NORMAL
+                (*c).label = 0
+                f.state = loop_continue_state(k)
+                return true
+            }
+            return close_iter(r, gs, f)
+        }
+        if (*c).comp == interp.C_BREAK {
+            if (*c).label == 0 as u32 || (*c).label == f.flag as u32 {
+                (*c).comp = interp.C_NORMAL
+                (*c).label = 0
+                let ok: bool = try close_iter(r, gs, f)
+                finish(gs, val.realm_undefined(r))
+                return true
+            }
+        }
+        return close_iter(r, gs, f)
+    }
+    if k == ast.N_SWITCH {
+        if (*c).comp == interp.C_BREAK && ((*c).label == 0 as u32 || (*c).label == f.flag as u32) {
+            (*c).comp = interp.C_NORMAL
+            (*c).label = 0
+            finish(gs, val.realm_undefined(r))
+            return true
+        }
+        return false
+    }
+    if k == ast.N_LABELED {
+        let lbl: u32 = ast.ast_a(t, node) + 1 as u32
+        if (*c).comp == interp.C_BREAK && (*c).label == lbl {
+            (*c).comp = interp.C_NORMAL
+            (*c).label = 0
+            finish(gs, val.realm_undefined(r))
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+// Where a loop goes on after a `continue`.
+fn loop_continue_state(k: u32) -> u64 {
+    if k == ast.N_FOR {
+        return 4
+    }
+    if k == ast.N_FORIN || k == ast.N_FOROF {
+        return 6
+    }
+    return 3
+}
+
+// A `for ... of` that leaves early has to close its iterator (7.4.9).
+fn close_iter(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    if (f.obj as u64) == 0 {
+        return false
+    }
+    let it: Gc[JsObj] = f.obj
+    f.obj = gc_null[JsObj]()
+    let saved: u32 = (*c).comp
+    let savedv: Gc[JsVal] = r.pending
+    let savedl: u32 = (*c).label
+    (*c).comp = interp.C_NORMAL
+    let itv: Gc[JsVal] = it
+    let rk: u64 = try val.key_for_name(r, lex.K_RETURN)
+    let m: Gc[JsVal] = try interp.get_prop(r, itv, rk)
+    if (*c).comp == interp.C_NORMAL && val.is_callable(m) {
+        let a0: Gc[GcVec] = try interp.args_new(r)
+        let x: Gc[JsVal] = try interp.call_function(r, m, itv, a0)
+    }
+    (*c).comp = saved
+    (*c).label = savedl
+    r.pending = savedv
+    return false
+}
+
+fn unwind_try(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let handler: u32 = ast.ast_b(t, node)
+    let fin: u32 = ast.ast_c(t, node)
+    if f.state == 1 && (*c).comp == interp.C_THROW && handler != 0 as u32 {
+        let thrown: Gc[JsVal] = r.pending
+        (*c).comp = interp.C_NORMAL
+        let cenv: Gc[Env] = try val.env_new(r, f.env, val.ENV_DECL)
+        let param: u32 = ast.ast_a(t, handler)
+        if param != 0 as u32 {
+            let ok0: bool = try interp.hoist_names(r, cenv, param, val.P_MUTABLE)
+            let ok1: bool = try interp.bind_pattern_init(r, cenv, param, thrown,
+                ast.D_LET)
+        }
+        if (*c).comp != interp.C_NORMAL {
+            return false
+        }
+        f.state = 2
+        let ok2: bool = try push_node(r, gs, ast.ast_b(t, handler), cenv)
+        return true
+    }
+    if f.state < 3 && fin != 0 as u32 {
+        // The finally block runs with the completion saved; only its own
+        // abrupt completion overrides it (14.15.3).
+        f.a = r.pending
+        f.i = (*c).comp as u64
+        f.n = (*c).label as u64
+        (*c).comp = interp.C_NORMAL
+        (*c).label = 0
+        f.state = 3
+        let ok: bool = try push_node(r, gs, fin, f.env)
+        return true
+    }
+    return false
+}
+
+// ------------------------------------------------------ A statement list
+
+fn st_stmts(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let off: u32 = f.node as u32
+    while f.i < f.n {
+        let s: u32 = ast.ast_list_at(t, off, f.i as usize)
+        f.i = f.i + 1
+        if s != 0 as u32 {
+            if try eval_sub(r, gs, s, f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    finish(gs, val.realm_undefined(r))
+    return ACT_GO
+}
+
+// --------------------------------------------------------- An await frame
+
+fn st_await_frame(r: Gc[Realm], gs: Gc[GenState],
+    f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    if f.state == 0 {
+        f.state = 1
+        // 27.7.5.3 Await: the value goes through PromiseResolve, and the
+        // continuation is hung on it. Then the body gives up control.
+        let p: Gc[JsVal] = try promise_resolve_value(r, f.a)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        let ok: Gc[JsObj] = try resume_fn(r, gs, GN_AWAIT_OK)
+        let err: Gc[JsObj] = try resume_fn(r, gs, GN_AWAIT_ERR)
+        let okv: Gc[JsVal] = ok
+        let errv: Gc[JsVal] = err
+        let ok2: bool = try perform_then(r, p, okv, errv, gc_null[JsObj]())
+        gs.status = val.G_SUSPENDED_YIELD
+        gs.done = ST_AWAIT
+        return ACT_SUSPEND
+    }
+    // Resumed: `gs.sent` carries the value, `gs.mode` says how.
+    let v: Gc[JsVal] = gs.sent
+    gs.sent = val.realm_undefined(r)
+    if gs.mode == RM_THROW {
+        gs.mode = RM_NEXT
+        let x: Gc[JsVal] = interp.throw_value(r, v)
+        return ACT_GO
+    }
+    if gs.mode == RM_RETURN {
+        gs.mode = RM_NEXT
+        (*c).comp = interp.C_RETURN
+        r.pending = v
+        return ACT_GO
+    }
+    finish(gs, v)
+    return ACT_GO
+}
+
+// A native function that wakes this body up again.
+fn resume_fn(r: Gc[Realm], gs: Gc[GenState], id: u64) -> AllocError!Gc[JsObj] {
+    var nm: [u8; 1] = " "
+    let f: Gc[JsObj] = try interp.make_native(r, id, 1, &nm[0], 0)
+    let holder: Gc[JsGenObj] = try val.genobj_new(r, gc_null[JsObj]())
+    holder.gs = gs
+    f.extra = holder
+    return f
+}
+
+// ==================================================== One node of the tree
+
+fn st_node(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let k: u32 = ast.ast_kind(t, node)
+    if k == ast.N_BLOCK || k == ast.N_STATIC_BLOCK {
+        return st_block(r, gs, f)
+    }
+    if k == ast.N_EXPR_STMT {
+        return st_one_child(r, gs, f, ast.ast_a(t, node), true)
+    }
+    if k == ast.N_IF {
+        return st_if(r, gs, f)
+    }
+    if k == ast.N_WHILE || k == ast.N_DOWHILE {
+        return st_while(r, gs, f, k == ast.N_DOWHILE)
+    }
+    if k == ast.N_FOR {
+        return st_for(r, gs, f)
+    }
+    if k == ast.N_FOROF || k == ast.N_FORIN {
+        return st_for_each(r, gs, f, k == ast.N_FOROF)
+    }
+    if k == ast.N_RETURN {
+        return st_return(r, gs, f)
+    }
+    if k == ast.N_THROW {
+        return st_throw(r, gs, f)
+    }
+    if k == ast.N_TRY {
+        return st_try(r, gs, f)
+    }
+    if k == ast.N_SWITCH {
+        return st_switch(r, gs, f)
+    }
+    if k == ast.N_LABELED {
+        return st_labeled(r, gs, f)
+    }
+    if k == ast.N_VAR_DECL {
+        return st_var_decl(r, gs, f)
+    }
+    if k == ast.N_YIELD {
+        return st_yield(r, gs, f)
+    }
+    if k == ast.N_AWAIT {
+        return st_await(r, gs, f)
+    }
+    if k == ast.N_ASSIGN {
+        return st_assign(r, gs, f)
+    }
+    if k == ast.N_BINARY {
+        return st_binary(r, gs, f)
+    }
+    if k == ast.N_LOGICAL {
+        return st_logical(r, gs, f)
+    }
+    if k == ast.N_COND {
+        return st_cond(r, gs, f)
+    }
+    if k == ast.N_SEQUENCE {
+        return st_sequence(r, gs, f)
+    }
+    if k == ast.N_UNARY {
+        return st_unary(r, gs, f)
+    }
+    if k == ast.N_ARRAY {
+        return st_array(r, gs, f)
+    }
+    if k == ast.N_OBJECT {
+        return st_object(r, gs, f)
+    }
+    if k == ast.N_CALL || k == ast.N_NEW {
+        return st_call(r, gs, f, k == ast.N_NEW)
+    }
+    if k == ast.N_MEMBER {
+        return st_member(r, gs, f)
+    }
+    if k == ast.N_TEMPLATE {
+        return st_template(r, gs, f)
+    }
+    if k == ast.N_SPREAD {
+        return st_one_child(r, gs, f, ast.ast_a(t, node), false)
+    }
+    if k == ast.N_CHAIN {
+        return st_one_child(r, gs, f, ast.ast_a(t, node), false)
+    }
+    // Everything without a suspension point inside runs on the machine
+    // stack; a kind that is not carried here says so instead of guessing.
+    if !susp_has(r, node) {
+        let v: Gc[JsVal] = try interp.eval_node(r, node, f.env)
+        finish(gs, v)
+        return ACT_GO
+    }
+    var m: [u8; 48] = "yield or await in this position is not supported"
+    let x: Gc[JsVal] = try interp.throw_type_here(r, &m[0], 47)
+    return ACT_GO
+}
+
+// A node with exactly one child whose value is passed on (or dropped).
+fn st_one_child(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame], child: u32,
+    drop: bool) -> AllocError!u32 {
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, child, f.env) {
+            return ACT_GO
+        }
+    }
+    if drop {
+        finish(gs, val.realm_undefined(r))
+    } else {
+        finish(gs, gs.result)
+    }
+    return ACT_GO
+}
+
+fn st_block(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        let inner: Gc[Env] = try val.env_new(r, f.env, val.ENV_DECL)
+        let ok: bool = try interp.hoist_declarations(r, inner,
+            ast.ast_a(t, node), ast.ast_b(t, node) as usize, false)
+        let ok2: bool = try push_stmts(r, gs, ast.ast_a(t, node),
+            ast.ast_b(t, node) as u64, inner)
+        return ACT_GO
+    }
+    finish(gs, val.realm_undefined(r))
+    return ACT_GO
+}
+
+fn st_if(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        f.state = 2
+        var branch: u32 = ast.ast_c(t, node)
+        if interp.to_boolean(r, gs.result) {
+            branch = ast.ast_b(t, node)
+        }
+        if branch != 0 as u32 {
+            if try eval_sub(r, gs, branch, f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    finish(gs, val.realm_undefined(r))
+    return ACT_GO
+}
+
+// state 1 = test, 2 = body, 3 = after the body
+fn st_while(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame],
+    is_do: bool) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    var testn: u32 = ast.ast_a(t, node)
+    var bodyn: u32 = ast.ast_b(t, node)
+    if is_do {
+        testn = ast.ast_b(t, node)
+        bodyn = ast.ast_a(t, node)
+    }
+    if f.state == 0 {
+        f.state = 1
+        if is_do {
+            f.state = 2
+        }
+    }
+    while true {
+        if f.state == 1 {
+            f.state = 5
+            if try eval_sub(r, gs, testn, f.env) {
+                return ACT_GO
+            }
+        }
+        if f.state == 5 {
+            if !interp.to_boolean(r, gs.result) {
+                finish(gs, val.realm_undefined(r))
+                return ACT_GO
+            }
+            f.state = 2
+        }
+        if f.state == 2 {
+            f.state = 3
+            if try eval_sub(r, gs, bodyn, f.env) {
+                return ACT_GO
+            }
+        }
+        if f.state == 3 {
+            f.state = 1
+        }
+    }
+    return ACT_GO
+}
+
+// state 1 = init, 2 = test, 3 = body, 4 = after the body, 5 = update
+fn st_for(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let initn: u32 = ast.ast_a(t, node)
+    let testn: u32 = ast.ast_b(t, node)
+    let updn: u32 = ast.ast_c(t, node)
+    let bodyn: u32 = ast.ast_d(t, node)
+    if f.state == 0 {
+        var loop_env: Gc[Env] = f.env
+        if initn != 0 as u32 && ast.ast_kind(t, initn) == ast.N_VAR_DECL && ast.ast_a(t, initn) != ast.D_VAR {
+            loop_env = try val.env_new(r, f.env, val.ENV_DECL)
+            if ast.ast_a(t, initn) == ast.D_LET {
+                f.n = 1
+            }
+            let ok: bool = try interp.hoist_one(r, loop_env, initn, false)
+        }
+        f.obj = gc_null[JsObj]()
+        f.b = f.a
+        f.state = 1
+        // The loop environment is kept in the frame's own env slot; the
+        // original one stays reachable over the parent chain.
+        f.c = val.realm_undefined(r)
+        f.env = loop_env
+        if initn != 0 as u32 {
+            if try eval_sub(r, gs, initn, loop_env) {
+                return ACT_GO
+            }
+        }
+    }
+    if f.state == 1 {
+        if f.n == 1 {
+            f.env = try interp.copy_env(r, f.env, val.env_parent(f.env))
+        }
+        f.state = 2
+    }
+    while true {
+        if f.state == 2 {
+            f.state = 6
+            if testn != 0 as u32 {
+                if try eval_sub(r, gs, testn, f.env) {
+                    return ACT_GO
+                }
+            } else {
+                gs.result = val.realm_bool(r, true)
+            }
+        }
+        if f.state == 6 {
+            if !interp.to_boolean(r, gs.result) {
+                finish(gs, val.realm_undefined(r))
+                return ACT_GO
+            }
+            f.state = 3
+        }
+        if f.state == 3 {
+            f.state = 4
+            if try eval_sub(r, gs, bodyn, f.env) {
+                return ACT_GO
+            }
+        }
+        if f.state == 4 {
+            if f.n == 1 {
+                f.env = try interp.copy_env(r, f.env, val.env_parent(f.env))
+            }
+            f.state = 5
+            if updn != 0 as u32 {
+                if try eval_sub(r, gs, updn, f.env) {
+                    return ACT_GO
+                }
+            }
+        }
+        if f.state == 5 {
+            f.state = 2
+        }
+    }
+    return ACT_GO
+}
+
+// `for (x of it)`, `for await (x of it)` and `for (x in o)`.
+// state 1 = the source, 2 = ask the iterator, 3 = await the result,
+// 4 = read done/value, 5 = the body, 6 = after the body
+fn st_for_each(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame],
+    of_form: bool) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let leftn: u32 = ast.ast_a(t, node)
+    let bodyn: u32 = ast.ast_c(t, node)
+    let is_await: bool = ast.ast_d(t, node) & ast.FOR_AWAIT != 0 as u32
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_b(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        let src: Gc[JsVal] = gs.result
+        if !of_form {
+            if val.is_nullish(src) {
+                finish(gs, val.realm_undefined(r))
+                return ACT_GO
+            }
+            f.list = try interp.enumerate_keys(r, src)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            f.i = 0
+            f.n = 3
+            f.state = 9
+        } else {
+            var mode: u64 = 0
+            var m: Gc[JsVal] = val.realm_undefined(r)
+            if is_await {
+                let ak: u64 = val.key_for_symbol(val.realm_well_known(r,
+                        val.WELL_KNOWN_ASYNCITERATOR))
+                m = try interp.get_prop(r, src, ak)
+                if (*c).comp != interp.C_NORMAL {
+                    return ACT_GO
+                }
+                if val.is_callable(m) {
+                    mode = 1
+                } else {
+                    mode = 2
+                }
+            }
+            if mode != 1 {
+                let ik: u64 = val.key_for_symbol(val.realm_well_known(r,
+                        val.WELL_KNOWN_ITERATOR))
+                m = try interp.get_prop(r, src, ik)
+                if (*c).comp != interp.C_NORMAL {
+                    return ACT_GO
+                }
+            }
+            if !val.is_callable(m) {
+                // An array and a string are iterated WITHOUT the protocol
+                // in this engine (round 63); take the values as they are.
+                f.list = try interp.iterate_values(r, src)
+                if (*c).comp != interp.C_NORMAL {
+                    return ACT_GO
+                }
+                f.i = 0
+                f.n = 3
+                if is_await {
+                    f.n = 4
+                }
+                f.state = 9
+            } else {
+                let a0: Gc[GcVec] = try interp.args_new(r)
+                let it: Gc[JsVal] = try interp.call_function(r, m, src, a0)
+                if (*c).comp != interp.C_NORMAL {
+                    return ACT_GO
+                }
+                if val.val_tag(it) != val.TAG_OBJ {
+                    var msg2: [u8; 25] = "iterator is not an object"
+                    let x: Gc[JsVal] = try interp.throw_type_here(r, &msg2[0], 25)
+                    return ACT_GO
+                }
+                f.obj = val.as_obj(it)
+                f.n = mode
+                f.state = 2
+            }
+        }
+    }
+    while true {
+        if f.state == 2 {
+            let itv: Gc[JsVal] = f.obj
+            let nk: u64 = try val.key_for_name(r, lex.N_NEXT)
+            let nf: Gc[JsVal] = try interp.get_prop(r, itv, nk)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            if !val.is_callable(nf) {
+                var msg3: [u8; 28] = "iterator.next is not a funct"
+                let x: Gc[JsVal] = try interp.throw_type_here(r, &msg3[0], 28)
+                return ACT_GO
+            }
+            let a1: Gc[GcVec] = try interp.args_new(r)
+            let res: Gc[JsVal] = try interp.call_function(r, nf, itv, a1)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            gs.result = res
+            f.state = 4
+            if f.n == 1 {
+                f.state = 3
+                let ok: bool = try push_await(r, gs, res, f.env)
+                return ACT_GO
+            }
+        }
+        if f.state == 3 {
+            f.state = 4
+        }
+        if f.state == 4 {
+            let res: Gc[JsVal] = gs.result
+            if val.val_tag(res) != val.TAG_OBJ {
+                var msg4: [u8; 32] = "iterator result is not an object"
+                let x: Gc[JsVal] = try interp.throw_type_here(r, &msg4[0], 31)
+                return ACT_GO
+            }
+            let dk: u64 = try val.key_for_name(r, lex.N_DONE)
+            let d: Gc[JsVal] = try interp.get_prop(r, res, dk)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            if interp.to_boolean(r, d) {
+                f.obj = gc_null[JsObj]()
+                finish(gs, val.realm_undefined(r))
+                return ACT_GO
+            }
+            let vk: u64 = try val.key_for_name(r, lex.N_VALUE)
+            let v: Gc[JsVal] = try interp.get_prop(r, res, vk)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            gs.result = v
+            f.state = 5
+            if f.n == 2 {
+                // `for await` over a SYNC iterable: the VALUE is awaited.
+                let ok: bool = try push_await(r, gs, v, f.env)
+                return ACT_GO
+            }
+        }
+        if f.state == 9 {
+            if f.i >= gcvec_length(f.list) {
+                finish(gs, val.realm_undefined(r))
+                return ACT_GO
+            }
+            gs.result = gcvec_read[JsVal](f.list, f.i)
+            f.i = f.i + 1
+            f.state = 5
+            if f.n == 4 {
+                let ok: bool = try push_await(r, gs, gs.result, f.env)
+                return ACT_GO
+            }
+        }
+        if f.state == 5 {
+            let item: Gc[JsVal] = gs.result
+            var body_env: Gc[Env] = f.env
+            if ast.ast_kind(t, leftn) == ast.N_VAR_DECL {
+                let kind: u32 = ast.ast_a(t, leftn)
+                let d: u32 = ast.ast_list_at(t, ast.ast_b(t, leftn), 0)
+                let target: u32 = ast.ast_a(t, d)
+                if kind != ast.D_VAR {
+                    body_env = try val.env_new(r, f.env, val.ENV_DECL)
+                    let ok0: bool = try interp.hoist_names(r, body_env, target, 0)
+                    let ok1: bool = try interp.bind_pattern_init(r, body_env,
+                        target, item, kind)
+                } else {
+                    let ok1: bool = try interp.init_binding(r, body_env, target,
+                        item, kind)
+                }
+            } else {
+                let ok1: bool = try interp.bind_pattern(r, f.env, leftn, item, 0)
+            }
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            f.state = 6
+            if try eval_sub(r, gs, bodyn, body_env) {
+                return ACT_GO
+            }
+        }
+        if f.state == 6 {
+            f.state = 2
+            if f.n >= 3 {
+                f.state = 9
+            }
+        }
+    }
+    return ACT_GO
+}
+
+fn st_return(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        gs.result = val.realm_undefined(r)
+        if ast.ast_a(t, node) != 0 as u32 {
+            if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    r.pending = gs.result
+    (*c).comp = interp.C_RETURN
+    return ACT_GO
+}
+
+fn st_throw(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    let x: Gc[JsVal] = interp.throw_value(r, gs.result)
+    return ACT_GO
+}
+
+// state 1 = the block, 2 = the catch body, 3 = the finally block
+fn st_try(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let fin: u32 = ast.ast_c(t, node)
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 || f.state == 2 {
+        if fin != 0 as u32 {
+            f.a = r.pending
+            f.i = interp.C_NORMAL as u64
+            f.n = 0
+            f.state = 3
+            if try eval_sub(r, gs, fin, f.env) {
+                return ACT_GO
+            }
+        } else {
+            finish(gs, val.realm_undefined(r))
+            return ACT_GO
+        }
+    }
+    if f.state == 3 {
+        // The saved completion comes back unless the finalizer itself was
+        // abrupt -- and that case never reaches this line.
+        if f.i != interp.C_NORMAL as u64 {
+            (*c).comp = f.i as u32
+            (*c).label = f.n as u32
+            r.pending = f.a
+        }
+        finish(gs, val.realm_undefined(r))
+        return ACT_GO
+    }
+    finish(gs, val.realm_undefined(r))
+    return ACT_GO
+}
+
+// state 1 = the discriminant, 2 = the case tests, 3 = the statements
+fn st_switch(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let off: u32 = ast.ast_b(t, node)
+    let cnt: u64 = ast.ast_c(t, node) as u64
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        f.a = gs.result
+        let inner: Gc[Env] = try val.env_new(r, f.env, val.ENV_DECL)
+        var i: u64 = 0
+        while i < cnt {
+            let cs: u32 = ast.ast_list_at(t, off, i as usize)
+            let ok: bool = try interp.hoist_declarations(r, inner,
+                ast.ast_b(t, cs), ast.ast_c(t, cs) as usize, false)
+            i = i + 1
+        }
+        f.env = inner
+        f.i = 0
+        f.n = cnt
+        f.state = 2
+    }
+    while true {
+        if f.state == 2 {
+            // Look for the matching case; `default` is remembered.
+            while f.i < cnt {
+                let cs: u32 = ast.ast_list_at(t, off, f.i as usize)
+                let testn: u32 = ast.ast_a(t, cs)
+                if testn == 0 as u32 {
+                    f.n = f.i
+                    f.i = f.i + 1
+                } else {
+                    f.state = 4
+                    f.i = f.i + 1
+                    if try eval_sub(r, gs, testn, f.env) {
+                        return ACT_GO
+                    }
+                    break
+                }
+            }
+            if f.i >= cnt && f.state == 2 {
+                f.i = f.n
+                f.state = 3
+                if f.i >= cnt {
+                    finish(gs, val.realm_undefined(r))
+                    return ACT_GO
+                }
+            }
+        }
+        if f.state == 4 {
+            if interp.strict_equals(r, f.a, gs.result) {
+                f.i = f.i - 1
+                f.state = 3
+            } else {
+                f.state = 2
+            }
+        }
+        if f.state == 3 {
+            if f.i >= cnt {
+                finish(gs, val.realm_undefined(r))
+                return ACT_GO
+            }
+            let cs: u32 = ast.ast_list_at(t, off, f.i as usize)
+            f.i = f.i + 1
+            let ok: bool = try push_stmts(r, gs, ast.ast_b(t, cs),
+                ast.ast_c(t, cs) as u64, f.env)
+            return ACT_GO
+        }
+    }
+    return ACT_GO
+}
+
+fn st_labeled(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        let body: u32 = ast.ast_b(t, node)
+        let lbl: u32 = ast.ast_a(t, node) + 1 as u32
+        if susp_has(r, body) {
+            let ok: bool = try push_node(r, gs, body, f.env)
+            gs.frame.flag = lbl as u64
+            return ACT_GO
+        }
+        gs.result = try interp.eval_node(r, node, f.env)
+        let c: *mut interp.Ctx = interp.ctx_of(r)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+    }
+    finish(gs, val.realm_undefined(r))
+    return ACT_GO
+}
+
+fn st_var_decl(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let kind: u32 = ast.ast_a(t, node)
+    let off: u32 = ast.ast_b(t, node)
+    let cnt: u64 = ast.ast_c(t, node) as u64
+    while true {
+        if f.state == 1 {
+            // The value of declarator i-1 has arrived.
+            let d: u32 = ast.ast_list_at(t, off, (f.i - 1) as usize)
+            let target: u32 = ast.ast_a(t, d)
+            var v: Gc[JsVal] = gs.result
+            if ast.ast_kind(t, target) == ast.N_IDENT {
+                let ok: bool = try interp.name_anonymous(r, v, ast.ast_a(t, target))
+            }
+            let ok2: bool = try interp.init_binding(r, f.env, target, v, kind)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            f.state = 0
+        }
+        if f.i >= cnt {
+            finish(gs, val.realm_undefined(r))
+            return ACT_GO
+        }
+        let d: u32 = ast.ast_list_at(t, off, f.i as usize)
+        f.i = f.i + 1
+        let init: u32 = ast.ast_b(t, d)
+        if init == 0 as u32 {
+            if kind != ast.D_VAR {
+                let ok: bool = try interp.init_binding(r, f.env,
+                    ast.ast_a(t, d), val.realm_undefined(r), kind)
+            }
+            continue
+        }
+        f.state = 1
+        if try eval_sub(r, gs, init, f.env) {
+            return ACT_GO
+        }
+    }
+    return ACT_GO
+}
+
+// ------------------------------------------------------- The expressions
+
+fn st_yield(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let delegate: bool = ast.ast_b(t, node) == 1 as u32
+    if f.state == 0 {
+        f.state = 1
+        gs.result = val.realm_undefined(r)
+        if ast.ast_a(t, node) != 0 as u32 {
+            if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    if delegate {
+        return st_yield_star(r, gs, f)
+    }
+    if f.state == 1 {
+        f.state = 2
+        // An async generator awaits the yielded value first (27.6.3.8).
+        if gs.kind == val.GK_ASYNC_GEN {
+            f.state = 5
+            let ok: bool = try push_await(r, gs, gs.result, f.env)
+            return ACT_GO
+        }
+    }
+    if f.state == 5 {
+        f.state = 2
+    }
+    if f.state == 2 {
+        f.state = 3
+        gs.status = val.G_SUSPENDED_YIELD
+        gs.done = ST_YIELD
+        return ACT_SUSPEND
+    }
+    // Resumed.
+    let v: Gc[JsVal] = gs.sent
+    gs.sent = val.realm_undefined(r)
+    if gs.mode == RM_THROW {
+        gs.mode = RM_NEXT
+        let x: Gc[JsVal] = interp.throw_value(r, v)
+        return ACT_GO
+    }
+    if gs.mode == RM_RETURN {
+        gs.mode = RM_NEXT
+        r.pending = v
+        (*c).comp = interp.C_RETURN
+        return ACT_GO
+    }
+    finish(gs, v)
+    return ACT_GO
+}
+
+// `yield* it` (27.5.3.7): the whole iterator protocol, forwarded.
+// state 1 = the operand, 2 = ask, 3 = check the answer, 4 = suspended
+fn st_yield_star(r: Gc[Realm], gs: Gc[GenState],
+    f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    if f.state == 1 {
+        let src: Gc[JsVal] = gs.result
+        var m: Gc[JsVal] = val.realm_undefined(r)
+        if gs.kind == val.GK_ASYNC_GEN {
+            let ak: u64 = val.key_for_symbol(val.realm_well_known(r,
+                    val.WELL_KNOWN_ASYNCITERATOR))
+            m = try interp.get_prop(r, src, ak)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+        }
+        if !val.is_callable(m) {
+            let ik: u64 = val.key_for_symbol(val.realm_well_known(r,
+                    val.WELL_KNOWN_ITERATOR))
+            m = try interp.get_prop(r, src, ik)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+        }
+        if !val.is_callable(m) {
+            var msg: [u8; 20] = "is not iterable     "
+            let x: Gc[JsVal] = try interp.throw_type_here(r, &msg[0], 16)
+            return ACT_GO
+        }
+        let a0: Gc[GcVec] = try interp.args_new(r)
+        let it: Gc[JsVal] = try interp.call_function(r, m, src, a0)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        if val.val_tag(it) != val.TAG_OBJ {
+            var msg2: [u8; 28] = "iterator is not an object   "
+            let x: Gc[JsVal] = try interp.throw_type_here(r, &msg2[0], 25)
+            return ACT_GO
+        }
+        f.obj = val.as_obj(it)
+        f.b = val.realm_undefined(r)
+        f.i = RM_NEXT
+        f.state = 2
+    }
+    while true {
+        if f.state == 2 {
+            let itv: Gc[JsVal] = f.obj
+            var name: u32 = lex.N_NEXT
+            if f.i == RM_THROW {
+                name = lex.K_THROW
+            } else if f.i == RM_RETURN {
+                name = lex.K_RETURN
+            }
+            let mk: u64 = try val.key_for_name(r, name)
+            let mf: Gc[JsVal] = try interp.get_prop(r, itv, mk)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            if !val.is_callable(mf) {
+                if f.i == RM_RETURN {
+                    // No `return` on the iterator: the generator itself
+                    // returns the value.
+                    r.pending = f.b
+                    (*c).comp = interp.C_RETURN
+                    return ACT_GO
+                }
+                if f.i == RM_THROW {
+                    let ok: bool = try close_iter(r, gs, f)
+                    var msg3: [u8; 32] = "iterator has no throw method    "
+                    let x: Gc[JsVal] = try interp.throw_type_here(r, &msg3[0], 28)
+                    return ACT_GO
+                }
+                var msg4: [u8; 28] = "iterator.next is not a funct"
+                let x: Gc[JsVal] = try interp.throw_type_here(r, &msg4[0], 28)
+                return ACT_GO
+            }
+            let a1: Gc[GcVec] = try interp.args_new(r)
+            let ok1: bool = try gcvec_append[JsVal](a1, f.b)
+            let res: Gc[JsVal] = try interp.call_function(r, mf, itv, a1)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            gs.result = res
+            f.state = 3
+            if gs.kind == val.GK_ASYNC_GEN {
+                f.state = 6
+                let ok: bool = try push_await(r, gs, res, f.env)
+                return ACT_GO
+            }
+        }
+        if f.state == 6 {
+            f.state = 3
+        }
+        if f.state == 3 {
+            let res: Gc[JsVal] = gs.result
+            if val.val_tag(res) != val.TAG_OBJ {
+                var msg5: [u8; 32] = "iterator result is not an object"
+                let x: Gc[JsVal] = try interp.throw_type_here(r, &msg5[0], 31)
+                return ACT_GO
+            }
+            let dk: u64 = try val.key_for_name(r, lex.N_DONE)
+            let d: Gc[JsVal] = try interp.get_prop(r, res, dk)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            let vk: u64 = try val.key_for_name(r, lex.N_VALUE)
+            let v: Gc[JsVal] = try interp.get_prop(r, res, vk)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            if interp.to_boolean(r, d) {
+                let was: u64 = f.i
+                f.obj = gc_null[JsObj]()
+                if was == RM_RETURN {
+                    r.pending = v
+                    (*c).comp = interp.C_RETURN
+                    return ACT_GO
+                }
+                finish(gs, v)
+                return ACT_GO
+            }
+            gs.result = v
+            f.state = 4
+            gs.status = val.G_SUSPENDED_YIELD
+            gs.done = ST_YIELD
+            return ACT_SUSPEND
+        }
+        if f.state == 4 {
+            f.b = gs.sent
+            gs.sent = val.realm_undefined(r)
+            f.i = gs.mode
+            gs.mode = RM_NEXT
+            f.state = 2
+        }
+    }
+    return ACT_GO
+}
+
+fn st_await(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        f.state = 2
+        let ok: bool = try push_await(r, gs, gs.result, f.env)
+        return ACT_GO
+    }
+    finish(gs, gs.result)
+    return ACT_GO
+}
+
+fn st_assign(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let op: u32 = ast.ast_a(t, node)
+    let target: u32 = ast.ast_b(t, node)
+    let rhs: u32 = ast.ast_c(t, node)
+    if f.state == 0 {
+        if susp_has(r, target) {
+            var m: [u8; 48] = "yield in an assignment target is not supported  "
+            let x: Gc[JsVal] = try interp.throw_type_here(r, &m[0], 46)
+            return ACT_GO
+        }
+        if op == lex.P_ANDANDA || op == lex.P_ORORA || op == lex.P_COALESCEA {
+            let old: Gc[JsVal] = try interp.eval_node(r, target, f.env)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            var go: bool = false
+            if op == lex.P_ANDANDA {
+                go = interp.to_boolean(r, old)
+            } else if op == lex.P_ORORA {
+                go = !interp.to_boolean(r, old)
+            } else {
+                go = val.is_nullish(old)
+            }
+            if !go {
+                finish(gs, old)
+                return ACT_GO
+            }
+            f.state = 1
+            if try eval_sub(r, gs, rhs, f.env) {
+                return ACT_GO
+            }
+        } else if op != lex.P_ASSIGN {
+            let old: Gc[JsVal] = try interp.eval_node(r, target, f.env)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            f.a = old
+            f.state = 2
+            if try eval_sub(r, gs, rhs, f.env) {
+                return ACT_GO
+            }
+        } else {
+            f.state = 1
+            if try eval_sub(r, gs, rhs, f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    if f.state == 2 {
+        let bop: u32 = interp.compound_base(op)
+        let v: Gc[JsVal] = try interp.binary_op(r, bop, f.a, gs.result)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        if ast.ast_kind(t, target) == ast.N_IDENT {
+            let key: u64 = try val.key_for_name(r, ast.ast_a(t, target))
+            let ok: bool = try interp.assign_name(r, f.env, key, v,
+                interp.is_strict_env(r, f.env))
+        } else {
+            let ok: bool = try interp.assign_member(r, f.env, target, v)
+        }
+        finish(gs, v)
+        return ACT_GO
+    }
+    let v: Gc[JsVal] = gs.result
+    if ast.ast_kind(t, target) == ast.N_IDENT {
+        let ok0: bool = try interp.name_anonymous(r, v, ast.ast_a(t, target))
+    }
+    let ok: bool = try interp.bind_pattern(r, f.env, target, v, 0)
+    if (*c).comp != interp.C_NORMAL {
+        return ACT_GO
+    }
+    finish(gs, v)
+    return ACT_GO
+}
+
+fn st_binary(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_b(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        f.a = gs.result
+        f.state = 2
+        if try eval_sub(r, gs, ast.ast_c(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    let v: Gc[JsVal] = try interp.binary_op(r, ast.ast_a(t, node), f.a, gs.result)
+    finish(gs, v)
+    return ACT_GO
+}
+
+fn st_logical(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let op: u32 = ast.ast_a(t, node)
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_b(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        let left: Gc[JsVal] = gs.result
+        var go: bool = false
+        if op == lex.P_ANDAND {
+            go = interp.to_boolean(r, left)
+        } else if op == lex.P_OROR {
+            go = !interp.to_boolean(r, left)
+        } else {
+            go = val.is_nullish(left)
+        }
+        if !go {
+            finish(gs, left)
+            return ACT_GO
+        }
+        f.state = 2
+        if try eval_sub(r, gs, ast.ast_c(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    finish(gs, gs.result)
+    return ACT_GO
+}
+
+fn st_cond(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        f.state = 2
+        var branch: u32 = ast.ast_c(t, node)
+        if interp.to_boolean(r, gs.result) {
+            branch = ast.ast_b(t, node)
+        }
+        if try eval_sub(r, gs, branch, f.env) {
+            return ACT_GO
+        }
+    }
+    finish(gs, gs.result)
+    return ACT_GO
+}
+
+fn st_sequence(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let off: u32 = ast.ast_a(t, node)
+    let cnt: u64 = ast.ast_b(t, node) as u64
+    while f.i < cnt {
+        let e: u32 = ast.ast_list_at(t, off, f.i as usize)
+        f.i = f.i + 1
+        if try eval_sub(r, gs, e, f.env) {
+            return ACT_GO
+        }
+    }
+    finish(gs, gs.result)
+    return ACT_GO
+}
+
+fn st_unary(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let op: u32 = ast.ast_a(t, node)
+    if op == ast.U_DELETE {
+        var m: [u8; 40] = "yield inside delete is not supported    "
+        let x: Gc[JsVal] = try interp.throw_type_here(r, &m[0], 39)
+        return ACT_GO
+    }
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_b(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    let v: Gc[JsVal] = gs.result
+    if op == ast.U_VOID {
+        finish(gs, val.realm_undefined(r))
+        return ACT_GO
+    }
+    if op == ast.U_TYPEOF {
+        let s: Gc[JsVal] = try interp.js_typeof(r, v)
+        finish(gs, s)
+        return ACT_GO
+    }
+    if op == ast.U_NOT {
+        finish(gs, val.realm_bool(r, !interp.to_boolean(r, v)))
+        return ACT_GO
+    }
+    if op == ast.U_MINUS {
+        if val.is_bigint(v) {
+            let b: Gc[JsVal] = try bigint.bi_neg(r, v)
+            finish(gs, b)
+            return ACT_GO
+        }
+        let bits: u64 = try interp.to_number(r, v)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        let x: Gc[JsVal] = try val.realm_num(r,
+            math.math_f64(bits ^ 0x8000000000000000))
+        finish(gs, x)
+        return ACT_GO
+    }
+    if op == ast.U_PLUS {
+        if val.is_bigint(v) {
+            var m2: [u8; 40] = "cannot convert a BigInt to a number     "
+            let x: Gc[JsVal] = try interp.throw_type_here(r, &m2[0], 36)
+            return ACT_GO
+        }
+        let bits: u64 = try interp.to_number(r, v)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        let x: Gc[JsVal] = try val.realm_num(r, math.math_f64(bits))
+        finish(gs, x)
+        return ACT_GO
+    }
+    if val.is_bigint(v) {
+        let b: Gc[JsVal] = try bigint.bi_not(r, v)
+        finish(gs, b)
+        return ACT_GO
+    }
+    let i: i32 = try interp.to_int32(r, v)
+    if (*c).comp != interp.C_NORMAL {
+        return ACT_GO
+    }
+    let x: Gc[JsVal] = try val.realm_num(r, ((i ^ (0 - 1)) as i64) as f64)
+    finish(gs, x)
+    return ACT_GO
+}
+
+fn st_array(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let off: u32 = ast.ast_a(t, node)
+    let cnt: u64 = ast.ast_b(t, node) as u64
+    if f.state == 0 {
+        f.state = 1
+        f.obj = try val.array_new(r)
+    }
+    while true {
+        if f.state == 2 {
+            // The value of element i-1 has arrived.
+            let e: u32 = ast.ast_list_at(t, off, (f.i - 1) as usize)
+            if ast.ast_kind(t, e) == ast.N_SPREAD {
+                let items: Gc[GcVec] = try interp.iterate_values(r, gs.result)
+                if (*c).comp != interp.C_NORMAL {
+                    return ACT_GO
+                }
+                var j: u64 = 0
+                while j < gcvec_length(items) {
+                    let ok: bool = try val.elems_push(r, f.obj,
+                        gcvec_read[JsVal](items, j))
+                    f.obj.len = f.obj.len + 1
+                    j = j + 1
+                }
+            } else {
+                let ok: bool = try val.elems_push(r, f.obj, gs.result)
+                f.obj.len = f.obj.len + 1
+            }
+            f.state = 1
+        }
+        if f.i >= cnt {
+            let av: Gc[JsVal] = f.obj
+            finish(gs, av)
+            return ACT_GO
+        }
+        let e: u32 = ast.ast_list_at(t, off, f.i as usize)
+        f.i = f.i + 1
+        if e == 0 as u32 {
+            let ok: bool = try val.elems_push(r, f.obj, val.realm_gap(r))
+            f.obj.len = f.obj.len + 1
+            continue
+        }
+        f.state = 2
+        var sub: u32 = e
+        if ast.ast_kind(t, e) == ast.N_SPREAD {
+            sub = ast.ast_a(t, e)
+        }
+        if try eval_sub(r, gs, sub, f.env) {
+            return ACT_GO
+        }
+    }
+    return ACT_GO
+}
+
+fn st_member(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    if f.state == 0 {
+        f.state = 1
+        if try eval_sub(r, gs, ast.ast_a(t, node), f.env) {
+            return ACT_GO
+        }
+    }
+    if f.state == 1 {
+        f.a = gs.result
+        f.state = 2
+        if ast.ast_c(t, node) & ast.MB_OPTIONAL != 0 as u32 && val.is_nullish(f.a) {
+            finish(gs, val.realm_undefined(r))
+            return ACT_GO
+        }
+        if ast.ast_c(t, node) & ast.MB_COMPUTED != 0 as u32 {
+            if try eval_sub(r, gs, ast.ast_b(t, node), f.env) {
+                return ACT_GO
+            }
+        } else {
+            f.i = try interp.static_key(r, ast.ast_b(t, node))
+            f.state = 3
+        }
+    }
+    if f.state == 2 {
+        f.i = try interp.to_property_key(r, gs.result)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        f.state = 3
+    }
+    let v: Gc[JsVal] = try interp.get_prop(r, f.a, f.i)
+    finish(gs, v)
+    return ACT_GO
+}
+
+fn st_template(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let qoff: u32 = ast.ast_a(t, node)
+    let qn: u64 = ast.ast_b(t, node) as u64
+    let eoff: u32 = ast.ast_c(t, node)
+    let en: u64 = ast.ast_d(t, node) as u64
+    if f.state == 0 {
+        f.a = val.str_empty(r)
+        f.state = 1
+    }
+    while true {
+        if f.state == 2 {
+            let s: Gc[JsVal] = try interp.to_string(r, gs.result)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            f.a = try val.str_concat(r, f.a, s)
+            f.state = 1
+        }
+        if f.i >= qn {
+            finish(gs, f.a)
+            return ACT_GO
+        }
+        let q: u32 = ast.ast_list_at(t, qoff, f.i as usize)
+        let piece: Gc[JsVal] = try val.str_from_ast(r, ast.ast_a(t, q),
+            ast.ast_b(t, q) as usize)
+        f.a = try val.str_concat(r, f.a, piece)
+        let idx: u64 = f.i
+        f.i = f.i + 1
+        if idx < en {
+            f.state = 2
+            if try eval_sub(r, gs, ast.ast_list_at(t, eoff, idx as usize), f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    return ACT_GO
+}
+
+// A call or a `new`. state 1..3 = the callee, 4/5 = the arguments,
+// 6 = the call itself.
+fn st_call(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame],
+    is_new: bool) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let calleen: u32 = ast.ast_a(t, node)
+    let off: u32 = ast.ast_b(t, node)
+    let cnt: u64 = ast.ast_c(t, node) as u64
+    if f.state == 0 {
+        f.a = val.realm_undefined(r)
+        if !is_new && ast.ast_kind(t, calleen) == ast.N_MEMBER && susp_has(r, calleen) {
+            f.state = 1
+            if try eval_sub(r, gs, ast.ast_a(t, calleen), f.env) {
+                return ACT_GO
+            }
+        } else if !is_new && ast.ast_kind(t, calleen) == ast.N_MEMBER {
+            var base: Gc[JsVal] = val.realm_undefined(r)
+            f.b = try interp.eval_member(r, calleen, f.env, &base)
+            f.a = base
+            f.state = 4
+        } else if ast.ast_kind(t, calleen) == ast.N_SUPER {
+            var m: [u8; 44] = "yield in a super call is not supported      "
+            let x: Gc[JsVal] = try interp.throw_type_here(r, &m[0], 41)
+            return ACT_GO
+        } else {
+            f.state = 5
+            if try eval_sub(r, gs, calleen, f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    if f.state == 5 {
+        f.b = gs.result
+        f.state = 4
+    }
+    if f.state == 1 {
+        f.a = gs.result
+        f.state = 3
+        if ast.ast_c(t, calleen) & ast.MB_COMPUTED != 0 as u32 {
+            f.state = 2
+            if try eval_sub(r, gs, ast.ast_b(t, calleen), f.env) {
+                return ACT_GO
+            }
+        } else {
+            f.i = try interp.static_key(r, ast.ast_b(t, calleen))
+        }
+    }
+    if f.state == 2 {
+        f.i = try interp.to_property_key(r, gs.result)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        f.state = 3
+    }
+    if f.state == 3 {
+        f.b = try interp.get_prop(r, f.a, f.i)
+        if (*c).comp != interp.C_NORMAL {
+            return ACT_GO
+        }
+        f.state = 4
+    }
+    if f.state == 4 {
+        f.list = try interp.args_new(r)
+        f.state = 6
+        f.i = 0
+    }
+    while true {
+        if f.state == 7 {
+            // The value of argument i-1 has arrived.
+            let e: u32 = ast.ast_list_at(t, off, (f.i - 1) as usize)
+            if ast.ast_kind(t, e) == ast.N_SPREAD {
+                let items: Gc[GcVec] = try interp.iterate_values(r, gs.result)
+                if (*c).comp != interp.C_NORMAL {
+                    return ACT_GO
+                }
+                var j: u64 = 0
+                while j < gcvec_length(items) {
+                    let ok: bool = try gcvec_append[JsVal](f.list,
+                        gcvec_read[JsVal](items, j))
+                    j = j + 1
+                }
+            } else {
+                let ok: bool = try gcvec_append[JsVal](f.list, gs.result)
+            }
+            f.state = 6
+        }
+        if f.state == 6 {
+            if f.i >= cnt {
+                break
+            }
+            let e: u32 = ast.ast_list_at(t, off, f.i as usize)
+            f.i = f.i + 1
+            f.state = 7
+            var sub: u32 = e
+            if ast.ast_kind(t, e) == ast.N_SPREAD {
+                sub = ast.ast_a(t, e)
+            }
+            if try eval_sub(r, gs, sub, f.env) {
+                return ACT_GO
+            }
+        }
+    }
+    if ast.ast_d(t, node) & ast.CL_OPTIONAL != 0 as u32 && val.is_nullish(f.b) {
+        finish(gs, val.realm_undefined(r))
+        return ACT_GO
+    }
+    if is_new {
+        let v: Gc[JsVal] = try interp.construct(r, f.b, f.list)
+        finish(gs, v)
+        return ACT_GO
+    }
+    if !val.is_callable(f.b) {
+        var m2: [u8; 20] = "is not a function   "
+        let x: Gc[JsVal] = try interp.throw_type_here(r, &m2[0], 17)
+        return ACT_GO
+    }
+    let v: Gc[JsVal] = try interp.call_function(r, f.b, f.a, f.list)
+    finish(gs, v)
+    return ACT_GO
+}
+
+// An object literal. A method, a getter or a setter inside a literal that
+// ALSO holds a suspension point is not carried (docs/ROUND66.md 6).
+fn st_object(r: Gc[Realm], gs: Gc[GenState], f: Gc[GenFrame]) -> AllocError!u32 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let off: u32 = ast.ast_a(t, node)
+    let cnt: u64 = ast.ast_b(t, node) as u64
+    if f.state == 0 {
+        var i: u64 = 0
+        while i < cnt {
+            let e: u32 = ast.ast_list_at(t, off, i as usize)
+            if ast.ast_kind(t, e) == ast.N_PROPERTY {
+                let fl: u32 = ast.ast_c(t, e)
+                if fl & (ast.PR_GET | ast.PR_SET | ast.PR_METHOD) != 0 as u32 {
+                    var m: [u8; 48] = "yield beside a method in an object literal: no  "
+                    let x: Gc[JsVal] = try interp.throw_type_here(r, &m[0], 46)
+                    return ACT_GO
+                }
+            }
+            i = i + 1
+        }
+        f.obj = try val.obj_new(r)
+        f.state = 1
+    }
+    while true {
+        if f.state == 2 {
+            // The KEY of property i-1 has arrived.
+            f.i = try interp.to_property_key(r, gs.result)
+            if (*c).comp != interp.C_NORMAL {
+                return ACT_GO
+            }
+            f.state = 3
+        }
+        if f.state == 3 {
+            let e: u32 = ast.ast_list_at(t, off, (f.n - 1) as usize)
+            f.state = 4
+            if try eval_sub(r, gs, ast.ast_b(t, e), f.env) {
+                return ACT_GO
+            }
+        }
+        if f.state == 4 {
+            let e: u32 = ast.ast_list_at(t, off, (f.n - 1) as usize)
+            let fl: u32 = ast.ast_c(t, e)
+            if fl & ast.PR_PROTO != 0 as u32 {
+                if val.val_tag(gs.result) == val.TAG_OBJ {
+                    val.obj_set_proto(f.obj, val.as_obj(gs.result))
+                } else if val.is_null(gs.result) {
+                    val.obj_set_proto(f.obj, gc_null[JsObj]())
+                }
+            } else {
+                let ok: bool = try interp.define_value(r, f.obj, f.i, gs.result,
+                    val.A_DEFAULT)
+            }
+            f.state = 1
+        }
+        if f.state == 5 {
+            // A spread has arrived.
+            let sv: Gc[JsVal] = gs.result
+            if !val.is_nullish(sv) {
+                let src: Gc[JsObj] = try interp.to_object(r, sv)
+                let keys: Gc[GcVec] = try val.obj_own_string_keys(r, src)
+                var j: u64 = 0
+                while j < gcvec_length(keys) {
+                    let kk: u64 = gcvec_read_raw(keys, j)
+                    let pv: Gc[JsVal] = try interp.get_prop(r, sv, kk)
+                    if (*c).comp != interp.C_NORMAL {
+                        return ACT_GO
+                    }
+                    let ok: bool = try interp.define_value(r, f.obj, kk, pv,
+                        val.A_DEFAULT)
+                    j = j + 1
+                }
+            }
+            f.state = 1
+        }
+        if f.n >= cnt {
+            let ov: Gc[JsVal] = f.obj
+            finish(gs, ov)
+            return ACT_GO
+        }
+        let e: u32 = ast.ast_list_at(t, off, f.n as usize)
+        f.n = f.n + 1
+        if ast.ast_kind(t, e) == ast.N_SPREAD {
+            f.state = 5
+            if try eval_sub(r, gs, ast.ast_a(t, e), f.env) {
+                return ACT_GO
+            }
+            continue
+        }
+        let fl: u32 = ast.ast_c(t, e)
+        if fl & ast.PR_COMPUTED != 0 as u32 {
+            f.state = 2
+            if try eval_sub(r, gs, ast.ast_a(t, e), f.env) {
+                return ACT_GO
+            }
+            continue
+        }
+        f.i = try interp.static_key(r, ast.ast_a(t, e))
+        f.state = 3
+    }
+    return ACT_GO
+}
+
+// ============================================================= Promises
+//
+// 27.2, without the species lookup: a promise is an object with a state, a
+// value and two reaction lists. A REACTION is itself a small object -- the
+// handler, the promise it settles and which side it is -- and it becomes
+// the JOB unchanged when the promise settles.
+
+fn new_promise(r: Gc[Realm]) -> AllocError!Gc[JsPromise] {
+    return val.promise_new(r, val.realm_proto(r, val.PROTO_PROMISE))
+}
+
+fn make_promise(r: Gc[Realm]) -> AllocError!Gc[JsObj] {
+    let p: Gc[JsPromise] = try new_promise(r)
+    let o: Gc[JsObj] = p
+    return o
+}
+
+fn make_reaction(r: Gc[Realm], handler: Gc[JsVal], cap: Gc[JsObj],
+    kind: u64) -> AllocError!Gc[JsObj] {
+    var nm: [u8; 1] = " "
+    let f: Gc[JsObj] = try interp.make_native(r, GN_REACTION, 1, &nm[0], 0)
+    f.prim = handler
+    f.extra = cap
+    f.len = kind
+    f.elems = try gcvec_new()
+    let ok: bool = try gcvec_append[JsVal](f.elems, val.realm_undefined(r))
+    return f
+}
+
+fn schedule(r: Gc[Realm], reaction: Gc[JsObj],
+    v: Gc[JsVal]) -> AllocError!bool {
+    let ok: bool = gcvec_set[JsVal](reaction.elems, 0, v)
+    let rv: Gc[JsVal] = reaction
+    return val.realm_job_push(r, rv)
+}
+
+fn settle_promise(r: Gc[Realm], p: Gc[JsPromise], v: Gc[JsVal],
+    state: u64) -> AllocError!bool {
+    if p.pstate != val.P_PENDING {
+        return true
+    }
+    p.value = v
+    p.pstate = state
+    var list: Gc[GcVec] = p.on_ok
+    if state == val.P_REJECTED {
+        list = p.on_err
+    }
+    var i: u64 = 0
+    while i < gcvec_length(list) {
+        let rc: Gc[JsVal] = gcvec_read[JsVal](list, i)
+        let ok: bool = try schedule(r, val.as_obj(rc), v)
+        i = i + 1
+    }
+    p.on_ok = try gcvec_new()
+    p.on_err = try gcvec_new()
+    return true
+}
+
+// 27.2.1.3.2 -- the resolve function, with the thenable case.
+fn resolve_promise(r: Gc[Realm], p: Gc[JsPromise],
+    x: Gc[JsVal]) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let pv: Gc[JsVal] = p
+    if (val.as_obj(x) as u64) != 0 && (val.as_obj(x) as u64) == (val.as_obj(pv) as u64) {
+        var m: [u8; 32] = "a promise cannot resolve itself "
+        let e: Gc[JsVal] = try interp.make_error(r, interp.ERR_TYPE, &m[0], 31)
+        return settle_promise(r, p, e, val.P_REJECTED)
+    }
+    if val.val_tag(x) != val.TAG_OBJ {
+        return settle_promise(r, p, x, val.P_FULFILLED)
+    }
+    let tk: u64 = try key_of(r, 4)
+    let then: Gc[JsVal] = try interp.get_prop(r, x, tk)
+    if (*c).comp != interp.C_NORMAL {
+        (*c).comp = interp.C_NORMAL
+        let e: Gc[JsVal] = r.pending
+        return settle_promise(r, p, e, val.P_REJECTED)
+    }
+    if !val.is_callable(then) {
+        return settle_promise(r, p, x, val.P_FULFILLED)
+    }
+    var nm: [u8; 1] = " "
+    let job: Gc[JsObj] = try interp.make_native(r, GN_THENABLE_JOB, 0, &nm[0], 0)
+    job.prim = x
+    job.extra = p
+    job.elems = try gcvec_new()
+    let ok: bool = try gcvec_append[JsVal](job.elems, then)
+    let jv: Gc[JsVal] = job
+    return val.realm_job_push(r, jv)
+}
+
+// The two resolving functions of a promise (27.2.1.3).
+fn resolving_fn(r: Gc[Realm], p: Gc[JsPromise], id: u64) -> AllocError!Gc[JsObj] {
+    var nm: [u8; 1] = " "
+    let f: Gc[JsObj] = try interp.make_native(r, id, 1, &nm[0], 0)
+    f.extra = p
+    return f
+}
+
+// 27.2.5.4 PerformPromiseThen.
+fn perform_then(r: Gc[Realm], pv: Gc[JsVal], on_ok: Gc[JsVal],
+    on_err: Gc[JsVal], cap: Gc[JsObj]) -> AllocError!bool {
+    let p: Gc[JsPromise] = val.as_promise(pv)
+    if (p as u64) == 0 {
+        var m: [u8; 28] = "not a promise               "
+        let x: Gc[JsVal] = try interp.throw_type_here(r, &m[0], 13)
+        return false
+    }
+    let ra: Gc[JsObj] = try make_reaction(r, on_ok, cap, 1)
+    let rb: Gc[JsObj] = try make_reaction(r, on_err, cap, 2)
+    if p.pstate == val.P_PENDING {
+        let av: Gc[JsVal] = ra
+        let bv: Gc[JsVal] = rb
+        let ok1: bool = try gcvec_append[JsVal](p.on_ok, av)
+        let ok2: bool = try gcvec_append[JsVal](p.on_err, bv)
+        return true
+    }
+    if p.pstate == val.P_FULFILLED {
+        return schedule(r, ra, p.value)
+    }
+    return schedule(r, rb, p.value)
+}
+
+// 27.2.4.7 PromiseResolve: a promise stays itself, everything else is
+// wrapped.
+fn promise_resolve_value(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let p: Gc[JsPromise] = val.as_promise(v)
+    if (p as u64) != 0 {
+        return v
+    }
+    let np: Gc[JsPromise] = try new_promise(r)
+    let ok: bool = try resolve_promise(r, np, v)
+    let pv: Gc[JsVal] = np
+    return pv
+}
+
+// The microtask queue (9.5). It is drained after the script and after every
+// job that adds new ones.
+fn run_jobs(r: Gc[Realm]) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    var guard: u64 = 0
+    while gcvec_length(val.realm_jobs(r)) > 0 && guard < 2000000 {
+        guard = guard + 1
+        let job: Gc[JsVal] = val.realm_job_shift(r)
+        let saved: u32 = (*c).comp
+        (*c).comp = interp.C_NORMAL
+        let a0: Gc[GcVec] = try interp.args_new(r)
+        let x: Gc[JsVal] = try interp.call_function(r, job,
+            val.realm_undefined(r), a0)
+        // An exception inside a job does not reach the program.
+        (*c).comp = saved
+    }
+    return true
+}
+
+// A few names this file needs that are not in the fixed table.
+fn key_of(r: Gc[Realm], which: u64) -> AllocError!u64 {
+    var t1: [u8; 4] = "then"
+    var t2: [u8; 7] = "resolve"
+    var t3: [u8; 6] = "reject"
+    var t4: [u8; 7] = "promise"
+    var t5: [u8; 6] = "status"
+    var t6: [u8; 9] = "fulfilled"
+    var t7: [u8; 8] = "rejected"
+    var t8: [u8; 6] = "reason"
+    var t9: [u8; 6] = "errors"
+    if which == 4 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t1[0], 4)
+        return val.key_for_str(r, s)
+    }
+    if which == 0 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t2[0], 7)
+        return val.key_for_str(r, s)
+    }
+    if which == 1 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t3[0], 6)
+        return val.key_for_str(r, s)
+    }
+    if which == 2 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t4[0], 7)
+        return val.key_for_str(r, s)
+    }
+    if which == 5 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t5[0], 6)
+        return val.key_for_str(r, s)
+    }
+    if which == 6 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t6[0], 9)
+        return val.key_for_str(r, s)
+    }
+    if which == 7 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t7[0], 8)
+        return val.key_for_str(r, s)
+    }
+    if which == 8 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r, &t8[0], 6)
+        return val.key_for_str(r, s)
+    }
+    let s: Gc[JsVal] = try val.str_from_ascii(r, &t9[0], 6)
+    return val.key_for_str(r, s)
+}
+
+// ==================================================== The generator object
+
+fn iter_result(r: Gc[Realm], v: Gc[JsVal], done: bool) -> AllocError!Gc[JsVal] {
+    let o: Gc[JsObj] = try val.obj_new(r)
+    let vk: u64 = try val.key_for_name(r, lex.N_VALUE)
+    let dk: u64 = try val.key_for_name(r, lex.N_DONE)
+    let ok1: bool = try interp.define_value(r, o, vk, v, val.A_DEFAULT)
+    let ok2: bool = try interp.define_value(r, o, dk, val.realm_bool(r, done),
+        val.A_DEFAULT)
+    let ov: Gc[JsVal] = o
+    return ov
+}
+
+// The entry point out of `interp.call_user`: the parameters are bound, the
+// body has not started.
+fn gen_start(r: Gc[Realm], f: Gc[JsObj], env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = f.node as u32
+    let fl: u32 = ast.ast_e(t, node)
+    let body: u32 = ast.ast_d(t, node)
+    var kind: u64 = val.GK_SYNC
+    if fl & ast.FN_ASYNC != 0 as u32 {
+        kind = val.GK_ASYNC
+        if fl & ast.FN_GENERATOR != 0 as u32 {
+            kind = val.GK_ASYNC_GEN
+        }
+    }
+    if (*c).comp != interp.C_NORMAL && kind == val.GK_ASYNC {
+        // The parameters already went wrong: the promise is rejected and
+        // the body never starts (15.8.4). This has to happen BEFORE the
+        // hoisting, which would swallow the completion.
+        let p0: Gc[JsPromise] = try new_promise(r)
+        let e: Gc[JsVal] = r.pending
+        (*c).comp = interp.C_NORMAL
+        let okr: bool = try settle_promise(r, p0, e, val.P_REJECTED)
+        let pv0: Gc[JsVal] = p0
+        return pv0
+    }
+    let gs: Gc[GenState] = try val.genstate_new(r, f, env, body, kind)
+    if fl & ast.FN_EXPRESSION_BODY != 0 as u32 {
+        // An async arrow with an expression body: wrap it in a return.
+        gs.body = body as u64
+        gs.running = 1
+    } else {
+        let ok: bool = try interp.hoist_declarations(r, env, ast.ast_a(t, body),
+            ast.ast_b(t, body) as usize, true)
+        if (*c).comp != interp.C_NORMAL {
+            return val.realm_undefined(r)
+        }
+    }
+    if kind == val.GK_ASYNC {
+        let p: Gc[JsPromise] = try new_promise(r)
+        gs.cap = p
+        let st: u64 = try resume_machine(r, gs, val.realm_undefined(r), RM_NEXT)
+        let ok: bool = try after_async(r, gs, st)
+        let pv: Gc[JsVal] = p
+        return pv
+    }
+    // A generator object with the prototype out of `f.prototype`.
+    var proto: Gc[JsObj] = val.realm_proto(r, val.PROTO_GENERATOR)
+    if kind == val.GK_ASYNC_GEN {
+        proto = val.realm_proto(r, val.PROTO_ASYNC_GENERATOR)
+    }
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let fv: Gc[JsVal] = f
+    let pp: Gc[JsVal] = try interp.get_prop(r, fv, pk)
+    if val.val_tag(pp) == val.TAG_OBJ {
+        proto = val.as_obj(pp)
+    }
+    let g: Gc[JsGenObj] = try val.genobj_new(r, proto)
+    g.gs = gs
+    gs.queue = try gcvec_new()
+    let gv: Gc[JsVal] = g
+    return gv
+}
+
+// Put the body on the frame stack for the first step.
+fn start_frames(r: Gc[Realm], gs: Gc[GenState]) -> AllocError!bool {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let body: u32 = gs.body as u32
+    if gs.running == 1 {
+        // An expression body: its value is the return value.
+        let f: Gc[GenFrame] = try val.frame_new(r, body, gs.env, gs.frame)
+        gs.frame = f
+        f.fk = FK_NODE
+        f.state = 0
+        gs.running = 2
+        return true
+    }
+    return push_stmts(r, gs, ast.ast_a(t, body), ast.ast_b(t, body) as u64,
+        gs.env)
+}
+
+fn resume_machine(r: Gc[Realm], gs: Gc[GenState], v: Gc[JsVal],
+    mode: u64) -> AllocError!u64 {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    gs.sent = v
+    gs.mode = mode
+    gs.status = val.G_EXECUTING
+    if (gs.frame as u64) == 0 {
+        let ok: bool = try start_frames(r, gs)
+        if mode == RM_THROW {
+            gs.frame = gc_null[GenFrame]()
+            gs.status = val.G_COMPLETED
+            let x: Gc[JsVal] = interp.throw_value(r, v)
+            return ST_DONE
+        }
+        if mode == RM_RETURN {
+            gs.frame = gc_null[GenFrame]()
+            gs.status = val.G_COMPLETED
+            (*c).comp = interp.C_RETURN
+            r.pending = v
+            return ST_DONE
+        }
+    }
+    let st: u64 = try machine_run(r, gs)
+    if st == ST_DONE {
+        gs.status = val.G_COMPLETED
+        gs.frame = gc_null[GenFrame]()
+    }
+    return st
+}
+
+// What comes out of the machine for a plain generator.
+fn gen_resume(r: Gc[Realm], this: Gc[JsVal], v: Gc[JsVal],
+    mode: u64) -> AllocError!Gc[JsVal] {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let g: Gc[JsGenObj] = val.as_genobj(this)
+    if (g as u64) == 0 || (g.gs as u64) == 0 {
+        var m: [u8; 28] = "not a generator object      "
+        return interp.throw_type_here(r, &m[0], 22)
+    }
+    let gs: Gc[GenState] = g.gs
+    if gs.kind != val.GK_SYNC {
+        var m2: [u8; 32] = "not a synchronous generator     "
+        return interp.throw_type_here(r, &m2[0], 28)
+    }
+    if gs.status == val.G_EXECUTING {
+        var m3: [u8; 32] = "the generator is already running"
+        return interp.throw_type_here(r, &m3[0], 31)
+    }
+    if gs.status == val.G_COMPLETED {
+        if mode == RM_THROW {
+            return interp.throw_value(r, v)
+        }
+        return iter_result(r, v, true)
+    }
+    if gs.status == val.G_SUSPENDED_START && mode != RM_NEXT {
+        gs.status = val.G_COMPLETED
+        gs.frame = gc_null[GenFrame]()
+        if mode == RM_THROW {
+            return interp.throw_value(r, v)
+        }
+        return iter_result(r, v, true)
+    }
+    let st: u64 = try resume_machine(r, gs, v, mode)
+    if st == ST_YIELD {
+        return iter_result(r, gs.result, false)
+    }
+    gs.status = val.G_COMPLETED
+    gs.frame = gc_null[GenFrame]()
+    if (*c).comp == interp.C_RETURN {
+        (*c).comp = interp.C_NORMAL
+        let rv: Gc[JsVal] = r.pending
+        return iter_result(r, rv, true)
+    }
+    if (*c).comp != interp.C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    return iter_result(r, val.realm_undefined(r), true)
+}
+
+// The outcome of an async function body.
+fn after_async(r: Gc[Realm], gs: Gc[GenState], st: u64) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    if st == ST_AWAIT {
+        return true
+    }
+    let p: Gc[JsPromise] = val.as_promise(gs.cap)
+    if (p as u64) == 0 {
+        return true
+    }
+    if (*c).comp == interp.C_THROW {
+        (*c).comp = interp.C_NORMAL
+        let e: Gc[JsVal] = r.pending
+        return settle_promise(r, p, e, val.P_REJECTED)
+    }
+    var v: Gc[JsVal] = val.realm_undefined(r)
+    if (*c).comp == interp.C_RETURN {
+        v = r.pending
+    } else if gs.running == 2 {
+        v = gs.result
+    }
+    (*c).comp = interp.C_NORMAL
+    return resolve_promise(r, p, v)
+}
+
+// ------------------------------------------------- The async generators
+
+fn async_gen_request(r: Gc[Realm], this: Gc[JsVal], v: Gc[JsVal],
+    mode: u64) -> AllocError!Gc[JsVal] {
+    let cap: Gc[JsPromise] = try new_promise(r)
+    let capv: Gc[JsVal] = cap
+    let g: Gc[JsGenObj] = val.as_genobj(this)
+    if (g as u64) == 0 || (g.gs as u64) == 0 || g.gs.kind != val.GK_ASYNC_GEN {
+        var m: [u8; 32] = "not an async generator object   "
+        let e: Gc[JsVal] = try interp.make_error(r, interp.ERR_TYPE, &m[0], 29)
+        let ok: bool = try settle_promise(r, cap, e, val.P_REJECTED)
+        return capv
+    }
+    let gs: Gc[GenState] = g.gs
+    var nm: [u8; 1] = " "
+    let req: Gc[JsObj] = try interp.make_native(r, GN_VALUE_THUNK, 0, &nm[0], 0)
+    req.prim = v
+    req.extra = cap
+    req.len = mode
+    let rv: Gc[JsVal] = req
+    let ok2: bool = try gcvec_append[JsVal](gs.queue, rv)
+    let ok3: bool = try async_gen_drain(r, gs)
+    return capv
+}
+
+fn settle_front(r: Gc[Realm], gs: Gc[GenState], st: u64) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    if gcvec_length(gs.queue) == 0 {
+        return true
+    }
+    let req: Gc[JsObj] = val.as_obj(gcvec_read[JsVal](gs.queue, 0))
+    let cap: Gc[JsPromise] = val.as_promise(req.extra)
+    let ok0: bool = gcvec_remove(gs.queue, 0)
+    if st == ST_YIELD {
+        let ir: Gc[JsVal] = try iter_result(r, gs.result, false)
+        return resolve_promise(r, cap, ir)
+    }
+    if (*c).comp == interp.C_THROW {
+        (*c).comp = interp.C_NORMAL
+        let e: Gc[JsVal] = r.pending
+        return settle_promise(r, cap, e, val.P_REJECTED)
+    }
+    var v: Gc[JsVal] = val.realm_undefined(r)
+    if (*c).comp == interp.C_RETURN {
+        v = r.pending
+    }
+    (*c).comp = interp.C_NORMAL
+    let ir: Gc[JsVal] = try iter_result(r, v, true)
+    return resolve_promise(r, cap, ir)
+}
+
+fn async_gen_drain(r: Gc[Realm], gs: Gc[GenState]) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    var guard: u64 = 0
+    while gcvec_length(gs.queue) > 0 && guard < 1000000 {
+        guard = guard + 1
+        if gs.status == val.G_EXECUTING {
+            return true
+        }
+        let req: Gc[JsObj] = val.as_obj(gcvec_read[JsVal](gs.queue, 0))
+        let mode: u64 = req.len
+        let v: Gc[JsVal] = req.prim
+        if gs.status == val.G_COMPLETED || (gs.status == val.G_SUSPENDED_START && mode != RM_NEXT) {
+            gs.status = val.G_COMPLETED
+            gs.frame = gc_null[GenFrame]()
+            if mode == RM_THROW {
+                (*c).comp = interp.C_THROW
+                r.pending = v
+            } else if mode == RM_RETURN {
+                (*c).comp = interp.C_RETURN
+                r.pending = v
+            }
+            let ok: bool = try settle_front(r, gs, ST_DONE)
+            continue
+        }
+        let st: u64 = try resume_machine(r, gs, v, mode)
+        if st == ST_AWAIT {
+            return true
+        }
+        let ok2: bool = try settle_front(r, gs, st)
+    }
+    return true
+}
+
+// The continuation after an `await`: the body goes on.
+fn async_after(r: Gc[Realm], gs: Gc[GenState], st: u64) -> AllocError!bool {
+    if gs.kind == val.GK_ASYNC_GEN {
+        if st == ST_AWAIT {
+            return true
+        }
+        let ok: bool = try settle_front(r, gs, st)
+        return async_gen_drain(r, gs)
+    }
+    return after_async(r, gs, st)
+}
+
+// ========================================================== The natives
+
+fn gen_arity(id: u64) -> u32 {
+    return 1
+}
+
+fn gen_native(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    var a0: Gc[JsVal] = val.realm_undefined(r)
+    if gcvec_length(args) > 0 {
+        a0 = gcvec_read[JsVal](args, 0)
+    }
+    if id == GN_NEXT {
+        return gen_resume(r, this, a0, RM_NEXT)
+    }
+    if id == GN_RETURN {
+        return gen_resume(r, this, a0, RM_RETURN)
+    }
+    if id == GN_THROW {
+        return gen_resume(r, this, a0, RM_THROW)
+    }
+    if id == GN_ASYNC_NEXT {
+        return async_gen_request(r, this, a0, RM_NEXT)
+    }
+    if id == GN_ASYNC_RETURN {
+        return async_gen_request(r, this, a0, RM_RETURN)
+    }
+    if id == GN_ASYNC_THROW {
+        return async_gen_request(r, this, a0, RM_THROW)
+    }
+    if id == GN_ITER_SELF || id == GN_ASYNC_ITER_SELF {
+        return this
+    }
+    if id == GN_VALUE_THUNK {
+        return val.realm_undefined(r)
+    }
+    if id >= GN_BIGINT_CTOR && id <= GN_BI_TOLOCALE {
+        return bigint_native(r, id, this, args, nt)
+    }
+    let self: Gc[JsObj] = interp.current_native(r)
+    return promise_native(r, id, this, args, nt, a0, self)
+}
+
+fn promise_native(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj], a0: Gc[JsVal], self: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    var a1: Gc[JsVal] = val.realm_undefined(r)
+    if gcvec_length(args) > 1 {
+        a1 = gcvec_read[JsVal](args, 1)
+    }
+    if id == GN_PROMISE_CTOR {
+        if (nt as u64) == 0 {
+            var m: [u8; 40] = "Promise must be called with new         "
+            return interp.throw_type_here(r, &m[0], 35)
+        }
+        if !val.is_callable(a0) {
+            var m2: [u8; 32] = "the executor is not a function  "
+            return interp.throw_type_here(r, &m2[0], 30)
+        }
+        let p: Gc[JsPromise] = try new_promise(r)
+        let res: Gc[JsObj] = try resolving_fn(r, p, GN_RESOLVE_FN)
+        let rej: Gc[JsObj] = try resolving_fn(r, p, GN_REJECT_FN)
+        let ar: Gc[GcVec] = try interp.args_new(r)
+        let rv: Gc[JsVal] = res
+        let jv: Gc[JsVal] = rej
+        let ok1: bool = try gcvec_append[JsVal](ar, rv)
+        let ok2: bool = try gcvec_append[JsVal](ar, jv)
+        let x: Gc[JsVal] = try interp.call_function(r, a0,
+            val.realm_undefined(r), ar)
+        if (*c).comp == interp.C_THROW {
+            (*c).comp = interp.C_NORMAL
+            let e: Gc[JsVal] = r.pending
+            let ok3: bool = try settle_promise(r, p, e, val.P_REJECTED)
+        }
+        let pv: Gc[JsVal] = p
+        return pv
+    }
+    if id == GN_RESOLVE_FN || id == GN_REJECT_FN {
+        let p: Gc[JsPromise] = val.as_promise(self.extra)
+        if (p as u64) == 0 || p.handled == 1 {
+            return val.realm_undefined(r)
+        }
+        p.handled = 1
+        if id == GN_RESOLVE_FN {
+            let ok: bool = try resolve_promise(r, p, a0)
+        } else {
+            let ok: bool = try settle_promise(r, p, a0, val.P_REJECTED)
+        }
+        return val.realm_undefined(r)
+    }
+    if id == GN_REACTION {
+        return run_reaction(r, self)
+    }
+    if id == GN_THENABLE_JOB {
+        let job: Gc[JsObj] = self
+        let p: Gc[JsPromise] = val.as_promise(job.extra)
+        let then: Gc[JsVal] = gcvec_read[JsVal](job.elems, 0)
+        let res: Gc[JsObj] = try resolving_fn(r, p, GN_RESOLVE_FN)
+        let rej: Gc[JsObj] = try resolving_fn(r, p, GN_REJECT_FN)
+        let ar: Gc[GcVec] = try interp.args_new(r)
+        let rv: Gc[JsVal] = res
+        let jv: Gc[JsVal] = rej
+        let ok1: bool = try gcvec_append[JsVal](ar, rv)
+        let ok2: bool = try gcvec_append[JsVal](ar, jv)
+        let x: Gc[JsVal] = try interp.call_function(r, then, job.prim, ar)
+        if (*c).comp == interp.C_THROW {
+            (*c).comp = interp.C_NORMAL
+            let e: Gc[JsVal] = r.pending
+            let ok3: bool = try settle_promise(r, p, e, val.P_REJECTED)
+        }
+        return val.realm_undefined(r)
+    }
+    if id == GN_AWAIT_OK || id == GN_AWAIT_ERR {
+        let hg: Gc[JsGenObj] = val.as_genobj(self.extra)
+        if (hg as u64) == 0 {
+            return val.realm_undefined(r)
+        }
+        let gs: Gc[GenState] = hg.gs
+        var mode: u64 = RM_NEXT
+        if id == GN_AWAIT_ERR {
+            mode = RM_THROW
+        }
+        let st: u64 = try resume_machine(r, gs, a0, mode)
+        let ok: bool = try async_after(r, gs, st)
+        return val.realm_undefined(r)
+    }
+    if id == GN_P_THEN {
+        return promise_then(r, this, a0, a1)
+    }
+    if id == GN_P_CATCH {
+        return promise_then(r, this, val.realm_undefined(r), a0)
+    }
+    if id == GN_P_FINALLY {
+        return promise_finally(r, this, a0)
+    }
+    if id == GN_P_RESOLVE {
+        return promise_resolve_value(r, a0)
+    }
+    if id == GN_P_REJECT {
+        let p: Gc[JsPromise] = try new_promise(r)
+        let ok: bool = try settle_promise(r, p, a0, val.P_REJECTED)
+        let pv: Gc[JsVal] = p
+        return pv
+    }
+    if id == GN_P_ALL || id == GN_P_RACE || id == GN_P_ALLSETTLED || id == GN_P_ANY {
+        return promise_combine(r, id, a0)
+    }
+    if id == GN_ALL_SLOT || id == GN_SETTLED_OK || id == GN_SETTLED_ERR || id == GN_ANY_SLOT {
+        return combine_slot(r, id, self, a0)
+    }
+    if id == GN_FINALLY_OK || id == GN_FINALLY_ERR {
+        let cb: Gc[JsVal] = self.prim
+        let a: Gc[GcVec] = try interp.args_new(r)
+        let x: Gc[JsVal] = try interp.call_function(r, cb,
+            val.realm_undefined(r), a)
+        if (*c).comp != interp.C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if id == GN_FINALLY_ERR {
+            return interp.throw_value(r, a0)
+        }
+        return a0
+    }
+    if id == GN_THROWER {
+        return interp.throw_value(r, a0)
+    }
+    return val.realm_undefined(r)
+}
+
+fn run_reaction(r: Gc[Realm], rc: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let handler: Gc[JsVal] = rc.prim
+    let cap: Gc[JsPromise] = val.as_promise(rc.extra)
+    let v: Gc[JsVal] = gcvec_read[JsVal](rc.elems, 0)
+    if !val.is_callable(handler) {
+        if (cap as u64) == 0 {
+            return val.realm_undefined(r)
+        }
+        if rc.len == 1 {
+            let ok: bool = try resolve_promise(r, cap, v)
+        } else {
+            let ok: bool = try settle_promise(r, cap, v, val.P_REJECTED)
+        }
+        return val.realm_undefined(r)
+    }
+    let a: Gc[GcVec] = try interp.args_new(r)
+    let ok0: bool = try gcvec_append[JsVal](a, v)
+    let out: Gc[JsVal] = try interp.call_function(r, handler,
+        val.realm_undefined(r), a)
+    if (*c).comp == interp.C_THROW {
+        (*c).comp = interp.C_NORMAL
+        let e: Gc[JsVal] = r.pending
+        if (cap as u64) != 0 {
+            let ok: bool = try settle_promise(r, cap, e, val.P_REJECTED)
+        }
+        return val.realm_undefined(r)
+    }
+    if (*c).comp != interp.C_NORMAL {
+        return val.realm_undefined(r)
+    }
+    if (cap as u64) != 0 {
+        let ok: bool = try resolve_promise(r, cap, out)
+    }
+    return val.realm_undefined(r)
+}
+
+fn promise_then(r: Gc[Realm], this: Gc[JsVal], on_ok: Gc[JsVal],
+    on_err: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let p: Gc[JsPromise] = val.as_promise(this)
+    if (p as u64) == 0 {
+        var m: [u8; 23] = "not a promise          "
+        return interp.throw_type_here(r, &m[0], 13)
+    }
+    let cap: Gc[JsPromise] = try new_promise(r)
+    let capo: Gc[JsObj] = cap
+    let ok: bool = try perform_then(r, this, on_ok, on_err, capo)
+    let cv: Gc[JsVal] = cap
+    return cv
+}
+
+fn promise_finally(r: Gc[Realm], this: Gc[JsVal],
+    cb: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    if !val.is_callable(cb) {
+        return promise_then(r, this, cb, cb)
+    }
+    var nm: [u8; 1] = " "
+    let okf: Gc[JsObj] = try interp.make_native(r, GN_FINALLY_OK, 1, &nm[0], 0)
+    let errf: Gc[JsObj] = try interp.make_native(r, GN_FINALLY_ERR, 1, &nm[0], 0)
+    okf.prim = cb
+    errf.prim = cb
+    let a: Gc[JsVal] = okf
+    let b: Gc[JsVal] = errf
+    return promise_then(r, this, a, b)
+}
+
+// Promise.all / race / allSettled / any (27.2.4). The shared state -- the
+// result array, the counter and the capability -- lives in ONE object that
+// every helper keeps a reference to.
+fn promise_combine(r: Gc[Realm], id: u64,
+    iterable: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let cap: Gc[JsPromise] = try new_promise(r)
+    let capv: Gc[JsVal] = cap
+    let items: Gc[GcVec] = try interp.iterate_values(r, iterable)
+    if (*c).comp != interp.C_NORMAL {
+        (*c).comp = interp.C_NORMAL
+        let e: Gc[JsVal] = r.pending
+        let ok: bool = try settle_promise(r, cap, e, val.P_REJECTED)
+        return capv
+    }
+    let n: u64 = gcvec_length(items)
+    var nm: [u8; 1] = " "
+    let state: Gc[JsObj] = try interp.make_native(r, GN_VALUE_THUNK, 0, &nm[0], 0)
+    state.extra = cap
+    state.elems = try gcvec_new()
+    state.len = n
+    state.node = id
+    // `make_native` puts the number of the native into `native`; here the
+    // field counts the elements that have answered.
+    state.native = 0
+    var i: u64 = 0
+    while i < n {
+        let ok: bool = try gcvec_append[JsVal](state.elems,
+            val.realm_undefined(r))
+        i = i + 1
+    }
+    if n == 0 {
+        if id == GN_P_ALL || id == GN_P_ALLSETTLED {
+            let arr: Gc[JsObj] = try val.array_new(r)
+            let av: Gc[JsVal] = arr
+            let ok: bool = try resolve_promise(r, cap, av)
+        } else if id == GN_P_ANY {
+            var m: [u8; 23] = "all promises were rejec"
+            let e: Gc[JsVal] = try interp.make_error(r, interp.ERR_TYPE, &m[0], 23)
+            let ok: bool = try settle_promise(r, cap, e, val.P_REJECTED)
+        }
+        return capv
+    }
+    i = 0
+    while i < n {
+        let item: Gc[JsVal] = gcvec_read[JsVal](items, i)
+        let p: Gc[JsVal] = try promise_resolve_value(r, item)
+        if (*c).comp != interp.C_NORMAL {
+            (*c).comp = interp.C_NORMAL
+            let e: Gc[JsVal] = r.pending
+            let ok: bool = try settle_promise(r, cap, e, val.P_REJECTED)
+            return capv
+        }
+        var on_ok: Gc[JsVal] = val.realm_undefined(r)
+        var on_err: Gc[JsVal] = val.realm_undefined(r)
+        if id == GN_P_RACE {
+            let res: Gc[JsObj] = try resolving_fn(r, cap, GN_RESOLVE_FN)
+            let rej: Gc[JsObj] = try resolving_fn(r, cap, GN_REJECT_FN)
+            // A race settles the capability directly, and every element may
+            // do it -- so the "already resolved" flag must not be set here.
+            on_ok = res
+            on_err = rej
+        } else if id == GN_P_ALL {
+            on_ok = try slot_fn(r, GN_ALL_SLOT, state, i)
+            let rej: Gc[JsObj] = try resolving_fn(r, cap, GN_REJECT_FN)
+            on_err = rej
+        } else if id == GN_P_ALLSETTLED {
+            on_ok = try slot_fn(r, GN_SETTLED_OK, state, i)
+            on_err = try slot_fn(r, GN_SETTLED_ERR, state, i)
+        } else {
+            let res: Gc[JsObj] = try resolving_fn(r, cap, GN_RESOLVE_FN)
+            on_ok = res
+            on_err = try slot_fn(r, GN_ANY_SLOT, state, i)
+        }
+        let ok2: bool = try perform_then(r, p, on_ok, on_err, gc_null[JsObj]())
+        i = i + 1
+    }
+    return capv
+}
+
+fn slot_fn(r: Gc[Realm], id: u64, state: Gc[JsObj],
+    index: u64) -> AllocError!Gc[JsVal] {
+    var nm: [u8; 1] = " "
+    let f: Gc[JsObj] = try interp.make_native(r, id, 1, &nm[0], 0)
+    f.extra = state
+    f.len = index
+    let v: Gc[JsVal] = f
+    return v
+}
+
+fn combine_slot(r: Gc[Realm], id: u64, self: Gc[JsObj],
+    v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let state: Gc[JsObj] = self.extra
+    let cap: Gc[JsPromise] = val.as_promise(state.extra)
+    let idx: u64 = self.len
+    if self.node == 1 {
+        // Already used -- a helper settles only once.
+        return val.realm_undefined(r)
+    }
+    self.node = 1
+    var entry: Gc[JsVal] = v
+    if id == GN_SETTLED_OK || id == GN_SETTLED_ERR {
+        let o: Gc[JsObj] = try val.obj_new(r)
+        let sk: u64 = try key_of(r, 5)
+        var tf: [u8; 9] = "fulfilled"
+        var tr: [u8; 8] = "rejected"
+        if id == GN_SETTLED_OK {
+            let s: Gc[JsVal] = try val.str_from_ascii(r, &tf[0], 9)
+            let ok1: bool = try interp.define_value(r, o, sk, s, val.A_DEFAULT)
+            let vk: u64 = try val.key_for_name(r, lex.N_VALUE)
+            let ok2: bool = try interp.define_value(r, o, vk, v, val.A_DEFAULT)
+        } else {
+            let s: Gc[JsVal] = try val.str_from_ascii(r, &tr[0], 8)
+            let ok1: bool = try interp.define_value(r, o, sk, s, val.A_DEFAULT)
+            let rk: u64 = try key_of(r, 8)
+            let ok2: bool = try interp.define_value(r, o, rk, v, val.A_DEFAULT)
+        }
+        entry = o
+    }
+    let ok: bool = gcvec_set[JsVal](state.elems, idx, entry)
+    state.native = state.native + 1
+    if state.native < state.len {
+        return val.realm_undefined(r)
+    }
+    if id == GN_ANY_SLOT {
+        var m: [u8; 23] = "all promises were rejec"
+        let e: Gc[JsVal] = try interp.make_error(r, interp.ERR_TYPE, &m[0], 23)
+        let eo: Gc[JsObj] = val.as_obj(e)
+        let ek: u64 = try key_of(r, 9)
+        let arr0: Gc[JsVal] = try array_of(r, state.elems)
+        let ok3: bool = try interp.define_value(r, eo, ek, arr0,
+            val.A_WRITABLE | val.A_CONFIGURABLE)
+        let ok4: bool = try settle_promise(r, cap, e, val.P_REJECTED)
+        return val.realm_undefined(r)
+    }
+    let arr: Gc[JsVal] = try array_of(r, state.elems)
+    let ok2: bool = try resolve_promise(r, cap, arr)
+    return val.realm_undefined(r)
+}
+
+fn array_of(r: Gc[Realm], items: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let a: Gc[JsObj] = try val.array_new(r)
+    var i: u64 = 0
+    while i < gcvec_length(items) {
+        let ok: bool = try val.elems_push(r, a, gcvec_read[JsVal](items, i))
+        a.len = a.len + 1
+        i = i + 1
+    }
+    let av: Gc[JsVal] = a
+    return av
+}
+
+// ------------------------------------------------------ The BigInt object
+
+fn bigint_native(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    var a0: Gc[JsVal] = val.realm_undefined(r)
+    if gcvec_length(args) > 0 {
+        a0 = gcvec_read[JsVal](args, 0)
+    }
+    if id == GN_BIGINT_CTOR {
+        if (nt as u64) != 0 {
+            var m: [u8; 36] = "BigInt is not a constructor         "
+            return interp.throw_type_here(r, &m[0], 26)
+        }
+        let prim: Gc[JsVal] = try interp.to_primitive_pub(r, a0, 1)
+        if (*c).comp != interp.C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if val.is_bigint(prim) {
+            return prim
+        }
+        if val.val_tag(prim) == val.TAG_NUM {
+            let x: f64 = val.num_value(prim)
+            let i: f64 = trunc_of(x)
+            if i != x || x != x || is_inf(x) {
+                var m2: [u8; 40] = "the number is not an integer            "
+                return interp.throw_error(r, interp.ERR_RANGE, &m2[0], 31)
+            }
+            return bigint.bi_from_f64(r, x)
+        }
+        if val.val_tag(prim) == val.TAG_BOOL {
+            var one: u64 = 0
+            if val.bool_value(prim) {
+                one = 1
+            }
+            return bigint.bi_from_u64(r, one, false)
+        }
+        if val.val_tag(prim) == val.TAG_STR {
+            let b: Gc[JsVal] = try bigint.bi_parse(r, prim)
+            if (b as u64) == 0 {
+                var m3: [u8; 32] = "cannot convert the text to a Big"
+                return interp.throw_error(r, interp.ERR_SYNTAX, &m3[0], 32)
+            }
+            return b
+        }
+        var m4: [u8; 36] = "cannot convert this to a BigInt     "
+        return interp.throw_type_here(r, &m4[0], 31)
+    }
+    if id == GN_BI_ASINTN || id == GN_BI_ASUINTN {
+        var a1: Gc[JsVal] = val.realm_undefined(r)
+        if gcvec_length(args) > 1 {
+            a1 = gcvec_read[JsVal](args, 1)
+        }
+        let bits: u64 = try interp.to_index(r, a0)
+        if (*c).comp != interp.C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if !val.is_bigint(a1) {
+            var m8: [u8; 12] = "not a BigInt"
+            return interp.throw_type_here(r, &m8[0], 12)
+        }
+        if id == GN_BI_ASINTN {
+            return bigint.bi_as_int_n(r, bits, a1)
+        }
+        return bigint.bi_as_uint_n(r, bits, a1)
+    }
+    // The prototype methods want a BigInt as `this`.
+    var self: Gc[JsVal] = this
+    if !val.is_bigint(self) {
+        let o: Gc[JsObj] = val.as_obj(this)
+        if (o as u64) != 0 && val.is_bigint(o.prim) {
+            self = o.prim
+        } else {
+            var m5: [u8; 23] = "not a BigInt           "
+            return interp.throw_type_here(r, &m5[0], 12)
+        }
+    }
+    if id == GN_BI_VALUEOF {
+        return self
+    }
+    if id == GN_BI_TOSTRING || id == GN_BI_TOLOCALE {
+        var radix: u64 = 10
+        if gcvec_length(args) > 0 && !val.is_undefined(a0) {
+            let bits: u64 = try interp.to_number(r, a0)
+            let x: f64 = math.math_f64(bits)
+            radix = x as u64
+            if radix < 2 || radix > 36 {
+                var m6: [u8; 23] = "the radix is out of ran"
+                return interp.throw_error(r, interp.ERR_RANGE, &m6[0], 23)
+            }
+        }
+        return bigint.bi_to_string(r, self, radix)
+    }
+    return val.realm_undefined(r)
+}
+
+fn trunc_of(x: f64) -> f64 {
+    if x >= 4503599627370496.0 || x <= 0.0 - 4503599627370496.0 {
+        return x
+    }
+    let i: i64 = x as i64
+    return i as f64
+}
+
+fn is_inf(x: f64) -> bool {
+    let b: u64 = math.math_bits(x)
+    return (b & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000
+}
+
+// ========================================================== The setting up
+//
+// Called by the driver AFTER `builtin.install`: the prototypes of round 66
+// hang under the objects that already exist.
+
+fn install_gen(r: Gc[Realm]) -> AllocError!bool {
+    let op: Gc[JsObj] = val.realm_proto(r, val.PROTO_OBJECT)
+    let g: Gc[JsObj] = val.realm_global(r)
+    // Symbol.asyncIterator, next to the well known symbols of round 63.
+    var sa: [u8; 20] = "Symbol.asyncIterator"
+    let sad: Gc[JsVal] = try val.str_from_ascii(r, &sa[0], 20)
+    let syma: Gc[JsVal] = try val.sym_new(r, sad)
+    val.realm_set_well_known(r, val.WELL_KNOWN_ASYNCITERATOR, syma)
+
+    var syn: [u8; 6] = "Symbol"
+    let sk: u64 = try key_ascii(r, &syn[0], 6)
+    let symobj: Gc[JsVal] = try interp.get_prop(r, g, sk)
+    if val.val_tag(symobj) == val.TAG_OBJ {
+        var an: [u8; 13] = "asyncIterator"
+        let akk: u64 = try key_ascii(r, &an[0], 13)
+        let ok: bool = try interp.define_value(r, val.as_obj(symobj), akk,
+            syma, 0)
+    }
+    // %IteratorPrototype% and %AsyncIteratorPrototype%.
+    let itp: Gc[JsObj] = val.realm_proto(r, val.PROTO_ITERATOR)
+    val.obj_set_proto(itp, op)
+    let ik: u64 = val.key_for_symbol(val.realm_well_known(r,
+            val.WELL_KNOWN_ITERATOR))
+    var nm0: [u8; 18] = "[Symbol.iterator] "
+    let selff: Gc[JsObj] = try interp.make_native(r, GN_ITER_SELF, 0, &nm0[0], 17)
+    let selfv: Gc[JsVal] = selff
+    let ok0: bool = try interp.define_value(r, itp, ik, selfv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    let aitp: Gc[JsObj] = val.realm_proto(r, val.PROTO_ASYNC_ITERATOR)
+    val.obj_set_proto(aitp, op)
+    let ak: u64 = val.key_for_symbol(syma)
+    let aselff: Gc[JsObj] = try interp.make_native(r, GN_ASYNC_ITER_SELF, 0,
+        &nm0[0], 17)
+    let aselfv: Gc[JsVal] = aselff
+    let ok1: bool = try interp.define_value(r, aitp, ak, aselfv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+
+    // %GeneratorPrototype%: next / return / throw.
+    var n1: [u8; 4] = "next"
+    var n2: [u8; 6] = "return"
+    var n3: [u8; 5] = "throw"
+    let gp: Gc[JsObj] = val.realm_proto(r, val.PROTO_GENERATOR)
+    val.obj_set_proto(gp, itp)
+    let ok2: bool = try nat_on(r, gp, &n1[0], 4, GN_NEXT, 1)
+    let ok3: bool = try nat_on(r, gp, &n2[0], 6, GN_RETURN, 1)
+    let ok4: bool = try nat_on(r, gp, &n3[0], 5, GN_THROW, 1)
+    var tg: [u8; 9] = "Generator"
+    let ok5: bool = try tostringtag(r, gp, &tg[0], 9)
+
+    // %AsyncGeneratorPrototype%.
+    let agp: Gc[JsObj] = val.realm_proto(r, val.PROTO_ASYNC_GENERATOR)
+    val.obj_set_proto(agp, aitp)
+    let ok6: bool = try nat_on(r, agp, &n1[0], 4, GN_ASYNC_NEXT, 1)
+    let ok7: bool = try nat_on(r, agp, &n2[0], 6, GN_ASYNC_RETURN, 1)
+    let ok8: bool = try nat_on(r, agp, &n3[0], 5, GN_ASYNC_THROW, 1)
+    var atg: [u8; 14] = "AsyncGenerator"
+    let ok9: bool = try tostringtag(r, agp, &atg[0], 14)
+
+    // %GeneratorFunction.prototype% -- the [[Prototype]] of a generator
+    // FUNCTION object; its `prototype` property is %GeneratorPrototype%.
+    let fp: Gc[JsObj] = val.realm_proto(r, val.PROTO_FUNCTION)
+    let gfp: Gc[JsObj] = val.realm_proto(r, val.PROTO_GENERATOR_FUNCTION)
+    val.obj_set_proto(gfp, fp)
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let gpv: Gc[JsVal] = gp
+    let ok10: bool = try interp.define_value(r, gfp, pk, gpv, val.A_CONFIGURABLE)
+    var gftg: [u8; 17] = "GeneratorFunction"
+    let ok11: bool = try tostringtag(r, gfp, &gftg[0], 17)
+    let agfp: Gc[JsObj] = val.realm_proto(r, val.PROTO_ASYNC_GENERATOR_FUNCTION)
+    val.obj_set_proto(agfp, fp)
+    let agpv: Gc[JsVal] = agp
+    let ok12: bool = try interp.define_value(r, agfp, pk, agpv, val.A_CONFIGURABLE)
+    var agftg: [u8; 22] = "AsyncGeneratorFunction"
+    let ok13: bool = try tostringtag(r, agfp, &agftg[0], 22)
+    let afp: Gc[JsObj] = val.realm_proto(r, val.PROTO_ASYNC_FUNCTION)
+    val.obj_set_proto(afp, fp)
+    var aftg: [u8; 13] = "AsyncFunction"
+    let ok14: bool = try tostringtag(r, afp, &aftg[0], 13)
+
+    // Promise.
+    let pp: Gc[JsObj] = val.realm_proto(r, val.PROTO_PROMISE)
+    val.obj_set_proto(pp, op)
+    var pn: [u8; 7] = "Promise"
+    let pc: Gc[JsObj] = try interp.make_native(r, GN_PROMISE_CTOR, 1, &pn[0], 7)
+    pc.flags = pc.flags | val.F_CTOR
+    let pcv: Gc[JsVal] = pc
+    let ppv: Gc[JsVal] = pp
+    let ok15: bool = try interp.define_value(r, pc, pk, ppv, 0)
+    let ck: u64 = try val.key_for_name(r, lex.N_CONSTRUCTOR)
+    let ok16: bool = try interp.define_value(r, pp, ck, pcv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    let gk: u64 = try key_ascii(r, &pn[0], 7)
+    let ok17: bool = try interp.define_value(r, g, gk, pcv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    var t1: [u8; 4] = "then"
+    var t2: [u8; 5] = "catch"
+    var t3: [u8; 7] = "finally"
+    var t4: [u8; 7] = "resolve"
+    var t5: [u8; 6] = "reject"
+    var t6: [u8; 3] = "all"
+    var t7: [u8; 4] = "race"
+    var t8: [u8; 10] = "allSettled"
+    var t9: [u8; 3] = "any"
+    let ok18: bool = try nat_on(r, pp, &t1[0], 4, GN_P_THEN, 2)
+    let ok19: bool = try nat_on(r, pp, &t2[0], 5, GN_P_CATCH, 1)
+    let ok20: bool = try nat_on(r, pp, &t3[0], 7, GN_P_FINALLY, 1)
+    let ok21: bool = try nat_on(r, pc, &t4[0], 7, GN_P_RESOLVE, 1)
+    let ok22: bool = try nat_on(r, pc, &t5[0], 6, GN_P_REJECT, 1)
+    let ok23: bool = try nat_on(r, pc, &t6[0], 3, GN_P_ALL, 1)
+    let ok24: bool = try nat_on(r, pc, &t7[0], 4, GN_P_RACE, 1)
+    let ok25: bool = try nat_on(r, pc, &t8[0], 10, GN_P_ALLSETTLED, 1)
+    let ok26: bool = try nat_on(r, pc, &t9[0], 3, GN_P_ANY, 1)
+    var ptg: [u8; 7] = "Promise"
+    let ok27: bool = try tostringtag(r, pp, &ptg[0], 7)
+
+    // BigInt.
+    let bp: Gc[JsObj] = val.realm_proto(r, val.PROTO_BIGINT)
+    val.obj_set_proto(bp, op)
+    var bn: [u8; 6] = "BigInt"
+    let bc: Gc[JsObj] = try interp.make_native(r, GN_BIGINT_CTOR, 1, &bn[0], 6)
+    let bcv: Gc[JsVal] = bc
+    let bpv: Gc[JsVal] = bp
+    let ok28: bool = try interp.define_value(r, bc, pk, bpv, 0)
+    let ok29: bool = try interp.define_value(r, bp, ck, bcv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    let bk: u64 = try key_ascii(r, &bn[0], 6)
+    let ok30: bool = try interp.define_value(r, g, bk, bcv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    var b1: [u8; 8] = "toString"
+    var b2: [u8; 7] = "valueOf"
+    var b3: [u8; 14] = "toLocaleString"
+    var b4: [u8; 6] = "asIntN"
+    var b5: [u8; 7] = "asUintN"
+    let ok31: bool = try nat_on(r, bp, &b1[0], 8, GN_BI_TOSTRING, 0)
+    let ok32: bool = try nat_on(r, bp, &b2[0], 7, GN_BI_VALUEOF, 0)
+    let ok33: bool = try nat_on(r, bp, &b3[0], 14, GN_BI_TOLOCALE, 0)
+    let ok34: bool = try nat_on(r, bc, &b4[0], 6, GN_BI_ASINTN, 2)
+    let ok35: bool = try nat_on(r, bc, &b5[0], 7, GN_BI_ASUINTN, 2)
+    var btg: [u8; 6] = "BigInt"
+    let ok36: bool = try tostringtag(r, bp, &btg[0], 6)
+    return true
+}
+
+fn key_ascii(r: Gc[Realm], p: *mut u8, n: usize) -> AllocError!u64 {
+    let s: Gc[JsVal] = try val.str_from_ascii(r, p, n)
+    return val.key_for_str(r, s)
+}
+
+fn nat_on(r: Gc[Realm], target: Gc[JsObj], name: *mut u8, n: usize, id: u64,
+    arity: u64) -> AllocError!bool {
+    let f: Gc[JsObj] = try interp.make_native(r, id, arity, name, n)
+    let k: u64 = try key_ascii(r, name, n)
+    let fv: Gc[JsVal] = f
+    return interp.define_value(r, target, k, fv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+}
+
+fn tostringtag(r: Gc[Realm], o: Gc[JsObj], p: *mut u8,
+    n: usize) -> AllocError!bool {
+    let sym: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_TOSTRINGTAG)
+    if (sym as u64) == 0 {
+        return true
+    }
+    let k: u64 = val.key_for_symbol(sym)
+    let s: Gc[JsVal] = try val.str_from_ascii(r, p, n)
+    return interp.define_value(r, o, k, s, val.A_CONFIGURABLE)
+}

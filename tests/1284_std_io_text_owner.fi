@@ -1,0 +1,156 @@
+// expect_out: r69 owner: text 5 empty 0 lines 200 stable 0/0 checks 9 ok
+// tests/1284_std_io_text_owner.fi -- who owns the octets (round 69).
+//
+// The comfort layer answers the ownership question OUT LOUD, because Firn
+// answers it neither with a garbage collector nor with a hidden buffer
+// (stage 0 has no global variables, SPEC 14.1 item 5):
+//
+//     `Text` OWNS. `Span` is a VIEW into a `Text` and lives exactly as long
+//     as that `Text` lives and is not written to again.
+//
+// What is checked:
+//   * the contract itself -- length, `is_ok`, the view, freeing, freeing
+//     twice, and that a freed `Text` is empty afterwards instead of
+//     pointing at released memory,
+//   * that the layer really RELEASES. `rt.heap_alloc`/`heap_free` are
+//     mmap/munmap; if a `Text` were leaked, every round would need a new
+//     mapping and the address would wander off. Two thousand rounds of
+//     `text_of`/`free` and two hundred rounds of `read_line`/`free` have to
+//     land on the SAME address as the first one. That is the cheap
+//     indicator that runs in every test run -- the real proof with RSS over
+//     a long run is tools/strlib/input_soak.sh.
+import std.io
+import std.rt
+import std.str
+
+const SYS_DUP: i64 = 32
+const SYS_DUP2: i64 = 33
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const O_ONLY_READ: i64 = 0
+
+// The distance between two addresses, without a signed subtraction.
+fn away(a: u64, b: u64) -> u64 {
+    if a > b {
+        return a - b
+    }
+    return b - a
+}
+
+fn main() -> i32 {
+    var checks: usize = 0
+
+    // --- 1. the contract
+    var t: io.Text = io.text_of(f"hello")
+    if !t.is_ok() || t.length() != 5 {
+        return 10
+    }
+    checks = checks + 1
+    var wanted: io.Text = io.text_of(f"hello")
+    if !str.equal(t.span(), wanted.span()) {
+        return 11
+    }
+    wanted.free()
+    checks = checks + 1
+    // the view survives as long as the owner does
+    let view: str.Span = t.span()
+    if view.length() != 5 || view.chars(0) != 104 as u8 {
+        return 12
+    }
+    checks = checks + 1
+    // the free function and the method are the same thing
+    io.text_free(&t)
+    if t.is_ok() || t.length() != 0 || io.text_span(&t).length() != 0 {
+        return 13
+    }
+    checks = checks + 1
+    // freeing twice is allowed -- `buf_free` empties the buffer
+    t.free()
+    checks = checks + 1
+    // a fresh, empty text is not "ok": nothing was read into it
+    var fresh: io.Text = io.text_new()
+    let empty_length: usize = fresh.length()
+    if fresh.is_ok() || empty_length != 0 {
+        return 14
+    }
+    fresh.free()
+    checks = checks + 1
+
+    // --- 2. two thousand rounds have to land on the same address
+    var first: u64 = 0
+    var last: u64 = 0
+    var i: usize = 0
+    while i < 2000 {
+        var one: io.Text = io.text_of(f"a line as it comes out of stdin")
+        let here: u64 = rt.addr_of(one.span().p)
+        if i == 0 {
+            first = here
+        }
+        last = here
+        one.free()
+        i = i + 1
+    }
+    let text_drift: u64 = away(first, last)
+    if text_drift >= 65536 {
+        return 20
+    }
+    checks = checks + 1
+
+    // --- 3. the same for the reader: 200 lines out of a file
+    var path: [u8; 22] = "/tmp/firn1284_in.txt\0\0"
+    var block: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < 200 {
+        rt.buf_push_dec_u64(&block, k as u64)
+        rt.buf_push(&block, 10 as u8)
+        k = k + 1
+    }
+    if !io.write_file(rt.addr_of(&path[0]), rt.buf_ptr(&block),
+        rt.buf_len(&block)) {
+        return 30
+    }
+    rt.buf_free(&block)
+
+    let saved: i64 = syscall(SYS_DUP, 0, 0, 0, 0, 0, 0)
+    let fd: i64 = syscall(SYS_OPEN, rt.addr_of(&path[0]) as i64, O_ONLY_READ,
+        0, 0, 0, 0)
+    if fd < 0 {
+        return 31
+    }
+    syscall(SYS_DUP2, fd, 0, 0, 0, 0, 0)
+    var lines: usize = 0
+    var rfirst: u64 = 0
+    var rlast: u64 = 0
+    var running: bool = true
+    while running {
+        var line: io.Text = io.read_text()
+        if line.is_ok() {
+            let here: u64 = rt.addr_of(line.span().p)
+            if lines == 0 {
+                rfirst = here
+            }
+            rlast = here
+            lines = lines + 1
+        } else {
+            running = false
+        }
+        line.free()
+    }
+    syscall(SYS_DUP2, saved, 0, 0, 0, 0, 0)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    syscall(SYS_CLOSE, saved, 0, 0, 0, 0, 0)
+
+    if lines != 200 {
+        return 32
+    }
+    checks = checks + 1
+    let read_drift: u64 = away(rfirst, rlast)
+    if read_drift >= 65536 {
+        return 33
+    }
+    checks = checks + 1
+
+    io.fmt_print(f"r69 owner: text 5 empty {empty_length} lines {lines} ")
+    io.fmt_print_line(f"stable {text_drift}/{read_drift} checks {checks} ok")
+    return 0
+}

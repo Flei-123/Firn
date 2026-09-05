@@ -1,0 +1,341 @@
+// lib/num/dtoa.fi -- double -> shortest text WITH A ROUND TRIP GUARANTEE
+// (SPEC 8.4, requirement Z6).
+//
+// Method: Dragon4 in free format (Steele/White, Burger/Dybvig) in exact big
+// number arithmetic. It produces exactly as many digits as are needed to
+// pin the double down uniquely -- never more, never fewer. That makes
+// strtod(dtoa(x)) == x hold for EVERY finite double, and the digit sequence
+// is the same one Ryu/Grisu produce.
+//
+// The text form follows ECMAScript `Number.prototype.toString` (section
+// 6.1.6.1.20): 0.1 -> "0.1", 1e21 -> "1e+21", 5e-324 -> "5e-324".
+//
+// The input is the bit pattern of the double as a u64 (stage 0 has no f64
+// yet, see the header of strtod.fi).
+//
+// Include:  //#include lib/num/dtoa.fi  (needs alloc.fi, bytes.fi, bignum.fi)
+
+const DTOA_WS_BYTES: usize = 7 * 512 * 4
+
+// ROUND 73: the six bit tests moved to lib/num/core_bits.fi -- the number
+// reader of `lib/std/core.fi` needs them and must not drag `dtoa` (which
+// writes into a Bytes) along with them.
+//#include lib/num/core_bits.fi
+
+// Approximation of ceil(log10(2^e * m)); the correction step catches the misses.
+fn dtoa_est_k(bitlen: usize, e2: i64) -> i64 {
+    let x: i64 = bitlen as i64 + e2 - 1
+    // log10(2) * 2^18 = 78913
+    var k: i64 = (x * 78913) >> 18
+    if x > 0 {
+        k = k + 1
+    }
+    return k
+}
+
+// The shortest digit sequence. `digits` receives ASCII digits, `k10` the
+// exponent n with  value = 0.d1d2...dk * 10^n. Return value: the digit count.
+// `ws` needs DTOA_WS_BYTES bytes. For finite values != 0 only.
+fn dtoa_digits(bits: u64, digits: *mut u8, k10: *mut i64, ws: *mut u8) -> usize {
+    var num: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var the: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var mp: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var mm: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var t1: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var t2: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    let stride: usize = BN_LIMBS * 4
+    bn_init(&num, ws, BN_LIMBS)
+    bn_init(&the, (ws as usize + stride) as *mut u8, BN_LIMBS)
+    bn_init(&mp, (ws as usize + stride * 2) as *mut u8, BN_LIMBS)
+    bn_init(&mm, (ws as usize + stride * 3) as *mut u8, BN_LIMBS)
+    bn_init(&t1, (ws as usize + stride * 4) as *mut u8, BN_LIMBS)
+    bn_init(&t2, (ws as usize + stride * 5) as *mut u8, BN_LIMBS)
+
+    let be: u64 = dtoa_biased_exp(bits)
+    let mf: u64 = dtoa_frac(bits)
+    var m: u64 = 0
+    var e2: i64 = 0
+    if be == 0 {
+        m = mf
+        e2 = -1074
+    } else {
+        m = mf + D_TWO52
+        e2 = be as i64 - 1075
+    }
+    // The lower bound is closer when the mantissa is a power of two.
+    let closer: bool = mf == 0 && be > 1
+    let even: bool = m % 2 == 0
+
+    if e2 >= 0 {
+        bn_set_u64(&num, m)
+        if closer {
+            bn_shl(&num, (e2 + 2) as usize)
+            bn_set_u64(&the, 4)
+            bn_set_u64(&mp, 1)
+            bn_shl(&mp, (e2 + 1) as usize)
+            bn_set_u64(&mm, 1)
+            bn_shl(&mm, e2 as usize)
+        } else {
+            bn_shl(&num, (e2 + 1) as usize)
+            bn_set_u64(&the, 2)
+            bn_set_u64(&mp, 1)
+            bn_shl(&mp, e2 as usize)
+            bn_set_u64(&mm, 1)
+            bn_shl(&mm, e2 as usize)
+        }
+    } else {
+        bn_set_u64(&num, m)
+        if closer {
+            bn_shl(&num, 2)
+            bn_set_u64(&the, 1)
+            bn_shl(&the, (2 - e2) as usize)
+            bn_set_u64(&mp, 2)
+            bn_set_u64(&mm, 1)
+        } else {
+            bn_shl(&num, 1)
+            bn_set_u64(&the, 1)
+            bn_shl(&the, (1 - e2) as usize)
+            bn_set_u64(&mp, 1)
+            bn_set_u64(&mm, 1)
+        }
+    }
+
+    var k: i64 = dtoa_est_k(u64_bitlen(m), e2)
+    if k >= 0 {
+        bn_mul_pow10(&the, k as usize)
+    } else {
+        let sc: usize = (0 - k) as usize
+        bn_mul_pow10(&num, sc)
+        bn_mul_pow10(&mp, sc)
+        bn_mul_pow10(&mm, sc)
+    }
+
+    // Correction upwards: num + mp has to stay below the denominator.
+    var fixed: bool = false
+    while !fixed {
+        bn_copy(&t1, &num)
+        bn_add(&t1, &mp)
+        let c: i32 = bn_cmp(&t1, &the)
+        var too_big: bool = c > 0
+        if even && c == 0 {
+            too_big = true
+        }
+        if too_big {
+            bn_mul_small(&the, 10 as u32)
+            k = k + 1
+        } else {
+            fixed = true
+        }
+    }
+    // Correction downwards: the leading digit must not be 0.
+    fixed = false
+    while !fixed {
+        bn_copy(&t1, &num)
+        bn_add(&t1, &mp)
+        bn_mul_small(&t1, 10 as u32)
+        let c: i32 = bn_cmp(&t1, &the)
+        var too_small: bool = c < 0
+        if even && c == 0 {
+            too_small = true
+        }
+        if too_small {
+            bn_mul_small(&num, 10 as u32)
+            bn_mul_small(&mp, 10 as u32)
+            bn_mul_small(&mm, 10 as u32)
+            k = k - 1
+        } else {
+            fixed = true
+        }
+    }
+    // Produce digits until the value is pinned down uniquely.
+    var n: usize = 0
+    var run: bool = true
+    while run {
+        bn_mul_small(&num, 10 as u32)
+        bn_mul_small(&mp, 10 as u32)
+        bn_mul_small(&mm, 10 as u32)
+        var dg: u32 = bn_div_digit(&num, &the)
+
+        let cl: i32 = bn_cmp(&num, &mm)
+        var low: bool = cl < 0
+        if even && cl == 0 {
+            low = true
+        }
+        bn_copy(&t2, &num)
+        bn_add(&t2, &mp)
+        let ch: i32 = bn_cmp(&t2, &the)
+        var high: bool = ch > 0
+        if even && ch == 0 {
+            high = true
+        }
+
+        if !low && !high {
+            st8(digits, n, (48 as u32 + dg) as u8)
+            n = n + 1
+        } else {
+            var on: bool = false
+            if low && high {
+                // Both bounds allow a digit: the one closer to the value
+                // wins. At EXACTLY equal distance ECMAScript
+                // (6.1.6.1.20, item 5) takes the larger one -- hence
+                // `>=` and not `>`.
+                bn_copy(&t2, &num)
+                bn_shl(&t2, 1)
+                if bn_cmp(&t2, &the) >= 0 {
+                    on = true
+                }
+            } else if high {
+                on = true
+            }
+            if on {
+                dg = dg + 1 as u32
+            }
+            st8(digits, n, (48 as u32 + dg) as u8)
+            n = n + 1
+            run = false
+        }
+        if n >= 20 {
+            run = false
+        }
+    }
+
+    // Carry: the rounded up digit can become 10 (classically at 1e23).
+    // It then carries forward; if every digit overflows, the result is a
+    // plain power of ten.
+    var pos: usize = n
+    var carry: bool = true
+    while carry && pos > 0 {
+        pos = pos - 1
+        if ld8(digits, pos) > 57 as u8 {
+            st8(digits, pos, 48 as u8)
+            if pos > 0 {
+                st8(digits, pos - 1, ld8(digits, pos - 1) + 1 as u8)
+            }
+        } else {
+            carry = false
+        }
+    }
+    if carry {
+        st8(digits, 0, 49 as u8)
+        n = 1
+        k = k + 1
+    }
+    // trailing zeros are not part of the shortest representation
+    while n > 1 && ld8(digits, n - 1) == 48 as u8 {
+        n = n - 1
+    }
+    *k10 = k
+    return n
+}
+
+fn dtoa_push_digits(out: *mut Bytes, digits: *mut u8, of: usize, to: usize) {
+    var i: usize = of
+    while i < to {
+        bytes_push(out, ld8(digits, i))
+        i = i + 1
+    }
+}
+
+fn dtoa_push_zeros(out: *mut Bytes, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        bytes_push(out, 48 as u8)
+        i = i + 1
+    }
+}
+
+fn dtoa_push_int(out: *mut Bytes, v: i64) {
+    var x: u64 = v as u64
+    if v < 0 {
+        bytes_push(out, 45 as u8)
+        x = (0 - v) as u64
+    }
+    var buf: [u8; 24] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
+    var n: usize = 0
+    if x == 0 {
+        buf[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 {
+        buf[n] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        bytes_push(out, buf[n])
+    }
+}
+
+// The complete text output following the ECMAScript rules.
+fn dtoa(bits: u64, out: *mut Bytes, ws: *mut u8) {
+    bytes_clear(out)
+    if dtoa_is_nan(bits) {
+        bytes_push(out, 78 as u8) // N
+        bytes_push(out, 97 as u8) // a
+        bytes_push(out, 78 as u8) // N
+        return
+    }
+    if dtoa_sign(bits) && !dtoa_is_zero(bits) {
+        bytes_push(out, 45 as u8) // -
+    }
+    if dtoa_is_inf(bits) {
+        bytes_push(out, 73 as u8) // I
+        bytes_push(out, 110 as u8)
+        bytes_push(out, 102 as u8)
+        bytes_push(out, 105 as u8)
+        bytes_push(out, 110 as u8)
+        bytes_push(out, 105 as u8)
+        bytes_push(out, 116 as u8)
+        bytes_push(out, 121 as u8)
+        return
+    }
+    if dtoa_is_zero(bits) {
+        bytes_push(out, 48 as u8) // ECMAScript: even -0 becomes "0"
+        return
+    }
+    var digits: [u8; 32] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
+    var n10: i64 = 0
+    let k: usize = dtoa_digits(bits, &digits[0], &n10, ws)
+    dtoa_write(out, &digits[0], k, n10)
+}
+
+// ROUND 71 -- the text output following the ECMAScript rules, for a digit
+// string that somebody else produced.
+//
+// It stood inside `dtoa` up to round 71 and had to come out: `ftoa32`
+// (lib/num/f32_text.fi) shortens the digits of the widened double until the
+// text reads back as the SAME binary32, and then it wants exactly this
+// formatting -- one set of rules for both widths, not two that drift apart.
+fn dtoa_write(out: *mut Bytes, digits: *mut u8, k: usize, n10: i64) {
+    let ki: i64 = k as i64
+    if ki <= n10 && n10 <= 21 {
+        dtoa_push_digits(out, digits, 0, k)
+        dtoa_push_zeros(out, n10 - ki)
+    } else if 0 < n10 && n10 <= 21 {
+        dtoa_push_digits(out, digits, 0, n10 as usize)
+        bytes_push(out, 46 as u8)
+        dtoa_push_digits(out, digits, n10 as usize, k)
+    } else if -6 < n10 && n10 <= 0 {
+        bytes_push(out, 48 as u8)
+        bytes_push(out, 46 as u8)
+        dtoa_push_zeros(out, 0 - n10)
+        dtoa_push_digits(out, digits, 0, k)
+    } else {
+        dtoa_push_digits(out, digits, 0, 1)
+        if k > 1 {
+            bytes_push(out, 46 as u8)
+            dtoa_push_digits(out, digits, 1, k)
+        }
+        bytes_push(out, 101 as u8) // e
+        if n10 - 1 >= 0 {
+            bytes_push(out, 43 as u8)
+        }
+        dtoa_push_int(out, n10 - 1)
+    }
+}

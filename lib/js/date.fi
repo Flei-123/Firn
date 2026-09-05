@@ -1,0 +1,1258 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/date.fi -- DATES (ECMA-262 clause 21.4), in Firn.
+//
+// The whole clause rests on ONE number: the milliseconds since
+// 1970-01-01T00:00:00Z, and on the calendar arithmetic that turns it into
+// year, month and day and back. That arithmetic is written out here --
+// there is no `libc`, no `mktime`, no table of days.
+//
+// THE TIME ZONE. This engine runs freestanding and has no zone database.
+// The local time is therefore UTC: `getTimezoneOffset` answers 0 and the
+// local getters agree with their UTC counterparts. The specification
+// allows any local time zone (21.4.1.7 "an implementation-defined
+// algorithm"), so this is a CHOICE, not a bug -- it is written down in
+// docs/ROUND74.md so that nobody reads more into a `getHours` than is in
+// it.
+//
+// The clock itself is the one system call this file makes,
+// `clock_gettime(CLOCK_REALTIME)`. Without it `Date.now` would have to
+// lie.
+import html.mem
+import std.math
+import js.lex
+import js.ast
+import js.val
+import js.interp
+
+export { DATE_BASE, DATE_END, date_dispatch, install_date }
+
+const DATE_BASE: u64 = 4000
+const DATE_END: u64 = 4300
+
+const D_CTOR: u64 = 4000
+const D_NOW: u64 = 4001
+const D_PARSE: u64 = 4002
+const D_UTC: u64 = 4003
+const D_TOSTRING: u64 = 4004
+const D_TOISO: u64 = 4005
+const D_TOUTC: u64 = 4006
+const D_TODATE: u64 = 4007
+const D_TOTIME: u64 = 4008
+const D_TOJSON: u64 = 4009
+const D_VALUEOF: u64 = 4010
+const D_TOPRIMITIVE: u64 = 4011
+const D_TOLOCALE: u64 = 4012
+const D_TOLOCALEDATE: u64 = 4013
+const D_TOLOCALETIME: u64 = 4014
+const D_TOGMT: u64 = 4015
+
+// The getters get consecutive numbers; the UTC variant is the same field.
+const D_GET: u64 = 4030
+const G_TIME: u64 = 0
+const G_FULLYEAR: u64 = 1
+const G_MONTH: u64 = 2
+const G_DATE: u64 = 3
+const G_DAY: u64 = 4
+const G_HOURS: u64 = 5
+const G_MINUTES: u64 = 6
+const G_SECONDS: u64 = 7
+const G_MS: u64 = 8
+const G_TZOFF: u64 = 9
+const G_YEAR: u64 = 10
+const G_COUNT: u64 = 11
+
+const D_SET: u64 = 4060
+const S_TIME: u64 = 0
+const S_FULLYEAR: u64 = 1
+const S_MONTH: u64 = 2
+const S_DATE: u64 = 3
+const S_HOURS: u64 = 4
+const S_MINUTES: u64 = 5
+const S_SECONDS: u64 = 6
+const S_MS: u64 = 7
+const S_YEAR: u64 = 8
+const S_COUNT: u64 = 9
+
+const SYS_CLOCK_GETTIME: i64 = 228
+const CLOCK_REALTIME: i64 = 0
+
+// A `const` can only be an integer in stage 0 (SPEC 14.1), so the length
+// of a day is a function.
+fn MS_DAY() -> f64 {
+    return 86400000.0
+}
+
+fn nan() -> f64 {
+    return math.math_f64(0x7FF8000000000000)
+}
+
+fn negf(x: f64) -> f64 {
+    return math.math_f64(math.math_bits(x) ^ 0x8000000000000000)
+}
+
+fn now_ms() -> f64 {
+    var ts: [u64; 2] = [0; 2]
+    let p: u64 = (&ts) as u64
+    syscall(SYS_CLOCK_GETTIME, CLOCK_REALTIME, p as i64, 0, 0, 0, 0)
+    return (ts[0] as f64) * 1000.0 + math.floor((ts[1] as f64) / 1000000.0)
+}
+
+// ------------------------------------------------- The calendar arithmetic
+
+// The day number of a time value; the floor division matters for the
+// negative side of the epoch.
+fn day_of(t: f64) -> f64 {
+    return math.floor(t / MS_DAY())
+}
+
+fn time_in_day(t: f64) -> f64 {
+    var m: f64 = math.fmod(t, MS_DAY())
+    if m < 0.0 {
+        m = m + MS_DAY()
+    }
+    return m
+}
+
+fn is_leap(y: i64) -> bool {
+    if y % 4 != 0 {
+        return false
+    }
+    if y % 100 != 0 {
+        return true
+    }
+    return y % 400 == 0
+}
+
+fn days_in_year(y: i64) -> i64 {
+    if is_leap(y) {
+        return 366
+    }
+    return 365
+}
+
+// The day number of the first of January of `y` since the epoch.
+fn day_from_year(y: i64) -> f64 {
+    let a: i64 = y - 1970
+    var d: i64 = 365 * a
+    // The leap days between 1970 and y, with the floor division that also
+    // works below 1970.
+    d = d + fdiv(y - 1, 4) - fdiv(1969, 4)
+    d = d - fdiv(y - 1, 100) + fdiv(1969, 100)
+    d = d + fdiv(y - 1, 400) - fdiv(1969, 400)
+    return d as f64
+}
+
+fn fdiv(a: i64, b: i64) -> i64 {
+    var q: i64 = a / b
+    if a % b != 0 && ((a < 0) != (b < 0)) {
+        q = q - 1
+    }
+    return q
+}
+
+fn month_days(m: i64, leap: bool) -> i64 {
+    if m == 0 {
+        return 31
+    }
+    if m == 1 {
+        if leap {
+            return 29
+        }
+        return 28
+    }
+    if m == 3 || m == 5 || m == 8 || m == 10 {
+        return 30
+    }
+    return 31
+}
+
+// The year of a day number, plus the day inside it in `*yd`.
+fn year_of_day(d: f64, yd: *mut i64) -> i64 {
+    var y: i64 = 1970 + ((d / 365.2425) as i64)
+    // Correct in both directions -- at most two steps.
+    var guard: i64 = 0
+    while guard < 8 {
+        let start: f64 = day_from_year(y)
+        if d < start {
+            y = y - 1
+            guard = guard + 1
+            continue
+        }
+        let next: f64 = start + (days_in_year(y) as f64)
+        if d >= next {
+            y = y + 1
+            guard = guard + 1
+            continue
+        }
+        *yd = (d - start) as i64
+        return y
+    }
+    *yd = 0
+    return y
+}
+
+struct Parts {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+    ms: i64,
+    weekday: i64,
+}
+
+fn split_time(t: f64, out: *mut Parts) {
+    let d: f64 = day_of(t)
+    var yd: i64 = 0
+    let y: i64 = year_of_day(d, &yd)
+    (*out).year = y
+    let leap: bool = is_leap(y)
+    var m: i64 = 0
+    var rest: i64 = yd
+    while m < 11 {
+        let dm: i64 = month_days(m, leap)
+        if rest < dm {
+            break
+        }
+        rest = rest - dm
+        m = m + 1
+    }
+    (*out).month = m
+    (*out).day = rest + 1
+    let tid: f64 = time_in_day(t)
+    (*out).hour = (math.floor(tid / 3600000.0)) as i64
+    (*out).min = (math.floor(math.fmod(tid / 60000.0, 60.0))) as i64
+    (*out).sec = (math.floor(math.fmod(tid / 1000.0, 60.0))) as i64
+    (*out).ms = (math.fmod(tid, 1000.0)) as i64
+    var wd: i64 = ((math.fmod(d + 4.0, 7.0)) as i64)
+    if wd < 0 {
+        wd = wd + 7
+    }
+    (*out).weekday = wd
+}
+
+// MakeDay + MakeTime + MakeDate of 21.4.1.
+fn make_time_value(year: f64, month: f64, day: f64, hour: f64, minute: f64,
+    sec: f64, ms: f64) -> f64 {
+    if !fin(year) || !fin(month) || !fin(day) || !fin(hour) || !fin(minute) || !fin(sec) || !fin(ms) {
+        return nan()
+    }
+    let y: f64 = math.trunc(year)
+    let m: f64 = math.trunc(month)
+    let dt: f64 = math.trunc(day)
+    var ym: f64 = y + math.floor(m / 12.0)
+    var mn: f64 = math.fmod(m, 12.0)
+    if mn < 0.0 {
+        mn = mn + 12.0
+    }
+    if math.fabs(ym) > 400000.0 {
+        return nan()
+    }
+    var d: f64 = day_from_year(ym as i64)
+    let leap: bool = is_leap(ym as i64)
+    var i: i64 = 0
+    while i < (mn as i64) {
+        d = d + (month_days(i, leap) as f64)
+        i = i + 1
+    }
+    d = d + dt - 1.0
+    let tm: f64 = math.trunc(hour) * 3600000.0 + math.trunc(minute) * 60000.0 + math.trunc(sec) * 1000.0 + math.trunc(ms)
+    return clip(d * MS_DAY() + tm)
+}
+
+fn fin(x: f64) -> bool {
+    return !math.is_nan(x) && !math.is_infinite(x)
+}
+
+// TimeClip (21.4.1.31): 8.64e15 is the outer limit.
+fn clip(t: f64) -> f64 {
+    if !fin(t) {
+        return nan()
+    }
+    if math.fabs(t) > 8640000000000000.0 {
+        return nan()
+    }
+    return math.trunc(t)
+}
+
+// ------------------------------------------------------------ The object
+
+fn date_value(this: Gc[JsVal]) -> f64 {
+    let o: Gc[JsObj] = val.as_obj(this)
+    if (o as u64) == 0 || o.cls != val.CLS_DATE {
+        return nan()
+    }
+    return math.math_f64(o.len)
+}
+
+fn is_date(this: Gc[JsVal]) -> bool {
+    let o: Gc[JsObj] = val.as_obj(this)
+    return (o as u64) != 0 && o.cls == val.CLS_DATE
+}
+
+fn set_date_value(this: Gc[JsVal], t: f64) {
+    let o: Gc[JsObj] = val.as_obj(this)
+    o.len = math.math_bits(t)
+}
+
+fn arg(r: Gc[Realm], args: Gc[GcVec], i: u64) -> Gc[JsVal] {
+    return interp.args_at(r, args, i)
+}
+
+fn thrown(r: Gc[Realm]) -> bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    return (*c).comp != interp.C_NORMAL
+}
+
+fn numarg(r: Gc[Realm], args: Gc[GcVec], i: u64) -> AllocError!u64 {
+    return interp.to_number(r, arg(r, args, i))
+}
+
+fn key_ascii(r: Gc[Realm], name: *mut u8, n: usize) -> AllocError!u64 {
+    let s: Gc[JsVal] = try val.str_from_ascii(r, name, n)
+    return val.key_for_str(r, s)
+}
+
+fn not_a_date(r: Gc[Realm]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 26] = "the receiver is not a Date"
+    return interp.throw_type_here(r, &m[0], 26)
+}
+
+fn date_dispatch(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    if id == D_CTOR {
+        return date_ctor(r, this, args, nt)
+    }
+    if id == D_NOW {
+        return val.realm_num(r, math.trunc(now_ms()))
+    }
+    if id == D_PARSE {
+        let s: Gc[JsVal] = try interp.to_string(r, arg(r, args, 0))
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        return val.realm_num(r, parse_date(s))
+    }
+    if id == D_UTC {
+        return val.realm_num(r, math.math_f64(try from_args(r, args)))
+    }
+    if id >= D_GET && id < D_GET + G_COUNT {
+        if !is_date(this) {
+            return not_a_date(r)
+        }
+        return getter_value(r, id - D_GET, date_value(this))
+    }
+    if id >= D_SET && id < D_SET + S_COUNT {
+        if !is_date(this) {
+            return not_a_date(r)
+        }
+        return setter_value(r, id - D_SET, this, args)
+    }
+    if id == D_TOPRIMITIVE {
+        return to_primitive(r, this, args)
+    }
+    if !is_date(this) {
+        if id == D_TOJSON {
+            // toJSON is generic (21.4.4.37).
+            return to_json(r, this)
+        }
+        return not_a_date(r)
+    }
+    let t: f64 = date_value(this)
+    if id == D_VALUEOF {
+        return val.realm_num(r, t)
+    }
+    if id == D_TOJSON {
+        return to_json(r, this)
+    }
+    if id == D_TOISO {
+        if math.is_nan(t) {
+            var m: [u8; 31] = "an invalid date has no ISO form"
+            return interp.throw_error(r, interp.ERR_RANGE, &m[0], 31)
+        }
+        return format_iso(r, t)
+    }
+    return format_date(r, t, id)
+}
+
+fn date_ctor(r: Gc[Realm], this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    if (nt as u64) == 0 {
+        // Called as a function: the CURRENT time as a text (21.4.2.2).
+        return format_date(r, math.trunc(now_ms()), D_TOSTRING)
+    }
+    var t: f64 = 0.0
+    if gcvec_length(args) == 0 {
+        t = math.trunc(now_ms())
+    } else if gcvec_length(args) == 1 {
+        let v: Gc[JsVal] = arg(r, args, 0)
+        if is_date(v) {
+            t = date_value(v)
+        } else {
+            let p: Gc[JsVal] = try interp.to_primitive_pub(r, v, 0)
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            if val.val_tag(p) == val.TAG_STR {
+                t = parse_date(p)
+            } else {
+                let x: f64 = math.math_f64(try interp.to_number(r, p))
+                if thrown(r) {
+                    return val.realm_undefined(r)
+                }
+                t = clip(x)
+            }
+        }
+    } else {
+        t = math.math_f64(try from_args(r, args))
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+    }
+    var proto: Gc[JsObj] = val.realm_proto(r, val.PROTO_DATE)
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let ntv: Gc[JsVal] = nt
+    let pv: Gc[JsVal] = try interp.get_prop(r, ntv, pk)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    if val.val_tag(pv) == val.TAG_OBJ {
+        proto = val.as_obj(pv)
+    }
+    let o: Gc[JsObj] = try val.obj_new_proto(r, proto)
+    o.cls = val.CLS_DATE
+    o.len = math.math_bits(t)
+    let ov: Gc[JsVal] = o
+    return ov
+}
+
+// The seven argument form. The answer is the BIT PATTERN of the time
+// value: an error union over `f64` hands back a wrong number in stage 0
+// (docs/ROUND63.md, gap 2), and that cost this round half an hour again.
+fn from_args(r: Gc[Realm], args: Gc[GcVec]) -> AllocError!u64 {
+    var v: [f64; 7] = [0.0; 7]
+    v[2] = 1.0
+    var i: u64 = 0
+    while i < 7 {
+        if i < gcvec_length(args) {
+            v[i as usize] = math.math_f64(try numarg(r, args, i))
+            if thrown(r) {
+                return math.math_bits(nan())
+            }
+        } else if i == 2 {
+            v[2] = 1.0
+        } else {
+            v[i as usize] = 0.0
+        }
+        i = i + 1
+    }
+    var y: f64 = v[0]
+    if !math.is_nan(y) && math.trunc(y) >= 0.0 && math.trunc(y) <= 99.0 {
+        y = 1900.0 + math.trunc(y)
+    }
+    return math.math_bits(make_time_value(y, v[1], v[2], v[3], v[4], v[5],
+            v[6]))
+}
+
+fn getter_value(r: Gc[Realm], which: u64, t: f64) -> AllocError!Gc[JsVal] {
+    if which == G_TIME {
+        return val.realm_num(r, t)
+    }
+    if which == G_TZOFF {
+        if math.is_nan(t) {
+            return val.realm_num(r, nan())
+        }
+        return val.realm_num(r, 0.0)
+    }
+    if math.is_nan(t) {
+        return val.realm_num(r, nan())
+    }
+    var p: Parts = Parts { year: 0, month: 0, day: 0, hour: 0, min: 0,
+        sec: 0, ms: 0, weekday: 0 }
+    split_time(t, &p)
+    if which == G_FULLYEAR {
+        return val.realm_num(r, p.year as f64)
+    }
+    if which == G_YEAR {
+        return val.realm_num(r, (p.year - 1900) as f64)
+    }
+    if which == G_MONTH {
+        return val.realm_num(r, p.month as f64)
+    }
+    if which == G_DATE {
+        return val.realm_num(r, p.day as f64)
+    }
+    if which == G_DAY {
+        return val.realm_num(r, p.weekday as f64)
+    }
+    if which == G_HOURS {
+        return val.realm_num(r, p.hour as f64)
+    }
+    if which == G_MINUTES {
+        return val.realm_num(r, p.min as f64)
+    }
+    if which == G_SECONDS {
+        return val.realm_num(r, p.sec as f64)
+    }
+    return val.realm_num(r, p.ms as f64)
+}
+
+fn setter_value(r: Gc[Realm], which: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let t: f64 = date_value(this)
+    if which == S_TIME {
+        let x: f64 = math.math_f64(try numarg(r, args, 0))
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        let nt: f64 = clip(x)
+        set_date_value(this, nt)
+        return val.realm_num(r, nt)
+    }
+    var p: Parts = Parts { year: 0, month: 0, day: 0, hour: 0, min: 0,
+        sec: 0, ms: 0, weekday: 0 }
+    var base: f64 = t
+    if math.is_nan(base) {
+        // The setters that only touch the time need a valid date; the ones
+        // that set the year start from the epoch (21.4.4.21).
+        if which == S_FULLYEAR || which == S_YEAR {
+            base = 0.0
+        }
+    }
+    if math.is_nan(base) {
+        split_time(0.0, &p)
+    } else {
+        split_time(base, &p)
+    }
+    var y: f64 = p.year as f64
+    var mo: f64 = p.month as f64
+    var d: f64 = p.day as f64
+    var h: f64 = p.hour as f64
+    var mi: f64 = p.min as f64
+    var s: f64 = p.sec as f64
+    var ms: f64 = p.ms as f64
+    var count: u64 = gcvec_length(args)
+    var vals: [f64; 4] = [0.0; 4]
+    var need: u64 = 1
+    if which == S_FULLYEAR || which == S_HOURS {
+        need = 4
+    }
+    if which == S_MONTH || which == S_MINUTES {
+        need = 3
+    }
+    if which == S_DATE || which == S_MS {
+        need = 1
+    }
+    if which == S_SECONDS {
+        need = 2
+    }
+    if which == S_YEAR {
+        need = 1
+    }
+    if which == S_HOURS {
+        need = 4
+    }
+    var i: u64 = 0
+    while i < need {
+        vals[i as usize] = nan()
+        if i < count {
+            vals[i as usize] = math.math_f64(try numarg(r, args, i))
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+        }
+        i = i + 1
+    }
+    if which == S_FULLYEAR {
+        y = vals[0]
+        if count > 1 {
+            mo = vals[1]
+        }
+        if count > 2 {
+            d = vals[2]
+        }
+    } else if which == S_YEAR {
+        y = math.trunc(vals[0])
+        if !math.is_nan(y) && y >= 0.0 && y <= 99.0 {
+            y = y + 1900.0
+        }
+    } else if which == S_MONTH {
+        mo = vals[0]
+        if count > 1 {
+            d = vals[1]
+        }
+    } else if which == S_DATE {
+        d = vals[0]
+    } else if which == S_HOURS {
+        h = vals[0]
+        if count > 1 {
+            mi = vals[1]
+        }
+        if count > 2 {
+            s = vals[2]
+        }
+        if count > 3 {
+            ms = vals[3]
+        }
+    } else if which == S_MINUTES {
+        mi = vals[0]
+        if count > 1 {
+            s = vals[1]
+        }
+        if count > 2 {
+            ms = vals[2]
+        }
+    } else if which == S_SECONDS {
+        s = vals[0]
+        if count > 1 {
+            ms = vals[1]
+        }
+    } else {
+        ms = vals[0]
+    }
+    var nt: f64 = nan()
+    if !math.is_nan(base) || which == S_FULLYEAR || which == S_YEAR {
+        nt = make_time_value(y, mo, d, h, mi, s, ms)
+    }
+    set_date_value(this, nt)
+    return val.realm_num(r, nt)
+}
+
+fn to_json(r: Gc[Realm], this: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let o: Gc[JsObj] = try interp.to_object(r, this)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    let ov: Gc[JsVal] = o
+    let p: Gc[JsVal] = try interp.to_primitive_pub(r, ov, 1)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    if val.val_tag(p) == val.TAG_NUM {
+        let x: f64 = val.num_value(p)
+        if math.is_nan(x) || math.is_infinite(x) {
+            return val.realm_null(r)
+        }
+    }
+    var n: [u8; 11] = "toISOString"
+    let k: u64 = try key_ascii(r, &n[0], 11)
+    let f: Gc[JsVal] = try interp.get_prop(r, ov, k)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    if !val.is_callable(f) {
+        var m: [u8; 29] = "toISOString is not a function"
+        return interp.throw_type_here(r, &m[0], 29)
+    }
+    let ca: Gc[GcVec] = try interp.args_new(r)
+    return interp.call_function(r, f, ov, ca)
+}
+
+fn to_primitive(r: Gc[Realm], this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    if val.val_tag(this) != val.TAG_OBJ {
+        var m: [u8; 29] = "the receiver is not an object"
+        return interp.throw_type_here(r, &m[0], 29)
+    }
+    let hv: Gc[JsVal] = arg(r, args, 0)
+    if val.val_tag(hv) != val.TAG_STR {
+        var m: [u8; 23] = "the hint must be a text"
+        return interp.throw_type_here(r, &m[0], 23)
+    }
+    var hs: [u8; 6] = "number"
+    let ns: Gc[JsVal] = try val.str_from_ascii(r, &hs[0], 6)
+    var want: u32 = 1
+    if val.str_equal(hv, ns) {
+        want = 2
+    } else {
+        var d1: [u8; 6] = "string"
+        var d2: [u8; 7] = "default"
+        let s1: Gc[JsVal] = try val.str_from_ascii(r, &d1[0], 6)
+        let s2: Gc[JsVal] = try val.str_from_ascii(r, &d2[0], 7)
+        if !val.str_equal(hv, s1) && !val.str_equal(hv, s2) {
+            var m: [u8; 23] = "the hint is not allowed"
+            return interp.throw_type_here(r, &m[0], 23)
+        }
+    }
+    return interp.ordinary_to_primitive(r, this, want)
+}
+
+// -------------------------------------------------------- The text forms
+
+fn push2(out: Gc[JsStr], v: i64) -> AllocError!bool {
+    let o1: bool = try val.str_push(out, (48 + (v / 10) % 10) as u32)
+    let o2: bool = try val.str_push(out, (48 + v % 10) as u32)
+    return true
+}
+
+fn push_num(out: Gc[JsStr], v: i64, width0: i64) -> AllocError!bool {
+    var width: i64 = width0
+    var buf: [u8; 24] = [0 as u8; 24]
+    var x: i64 = v
+    var neg: bool = false
+    if x < 0 {
+        neg = true
+        x = 0 - x
+    }
+    var n: usize = 0
+    if x == 0 {
+        buf[0] = 0 as u8
+        n = 1
+    }
+    while x > 0 {
+        buf[n] = (x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    if neg {
+        let o: bool = try val.str_push(out, 45 as u32)
+    }
+    while (n as i64) < width {
+        let o: bool = try val.str_push(out, 48 as u32)
+        width = width - 1
+    }
+    while n > 0 {
+        n = n - 1
+        let o: bool = try val.str_push(out, (48 + (buf[n] as u32)) as u32)
+    }
+    return true
+}
+
+fn format_iso(r: Gc[Realm], t: f64) -> AllocError!Gc[JsVal] {
+    var p: Parts = Parts { year: 0, month: 0, day: 0, hour: 0, min: 0,
+        sec: 0, ms: 0, weekday: 0 }
+    split_time(t, &p)
+    let out: Gc[JsStr] = try val.str_new(r)
+    if p.year < 0 {
+        let o: bool = try val.str_push(out, 45 as u32)
+        let o2: bool = try push_num(out, 0 - p.year, 6)
+    } else if p.year > 9999 {
+        let o: bool = try val.str_push(out, 43 as u32)
+        let o2: bool = try push_num(out, p.year, 6)
+    } else {
+        let o: bool = try push_num(out, p.year, 4)
+    }
+    let d1: bool = try val.str_push(out, 45 as u32)
+    let m1: bool = try push2(out, p.month + 1)
+    let d2: bool = try val.str_push(out, 45 as u32)
+    let m2: bool = try push2(out, p.day)
+    let tt: bool = try val.str_push(out, 84 as u32)
+    let h1: bool = try push2(out, p.hour)
+    let c1: bool = try val.str_push(out, 58 as u32)
+    let h2: bool = try push2(out, p.min)
+    let c2: bool = try val.str_push(out, 58 as u32)
+    let h3: bool = try push2(out, p.sec)
+    let dot: bool = try val.str_push(out, 46 as u32)
+    let ms: bool = try push_num(out, p.ms, 3)
+    let z: bool = try val.str_push(out, 90 as u32)
+    let ov: Gc[JsVal] = out
+    return ov
+}
+
+fn push_ascii(out: Gc[JsStr], p: *mut u8, n: usize) -> AllocError!bool {
+    var i: usize = 0
+    while i < n {
+        let b: u8 = *((p as usize + i) as *mut u8)
+        let o: bool = try val.str_push(out, b as u32)
+        i = i + 1
+    }
+    return true
+}
+
+fn format_date(r: Gc[Realm], t: f64, id: u64) -> AllocError!Gc[JsVal] {
+    if math.is_nan(t) {
+        var m: [u8; 12] = "Invalid Date"
+        return val.str_from_ascii(r, &m[0], 12)
+    }
+    var p: Parts = Parts { year: 0, month: 0, day: 0, hour: 0, min: 0,
+        sec: 0, ms: 0, weekday: 0 }
+    split_time(t, &p)
+    var wd: [u8; 21] = "SunMonTueWedThuFriSat"
+    var mo: [u8; 36] = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    let out: Gc[JsStr] = try val.str_new(r)
+    let want_date: bool = id != D_TOTIME && id != D_TOLOCALETIME
+    let want_time: bool = id != D_TODATE && id != D_TOLOCALEDATE
+    if id == D_TOUTC || id == D_TOGMT {
+        let o1: bool = try push_ascii(out, &wd[(p.weekday as usize) * 3], 3)
+        let c1: bool = try val.str_push(out, 44 as u32)
+        let c2: bool = try val.str_push(out, 32 as u32)
+        let o3: bool = try push2(out, p.day)
+        let c3: bool = try val.str_push(out, 32 as u32)
+        let o4: bool = try push_ascii(out, &mo[(p.month as usize) * 3], 3)
+        let c4: bool = try val.str_push(out, 32 as u32)
+        let o5: bool = try push_num(out, p.year, 4)
+        let c5: bool = try val.str_push(out, 32 as u32)
+        let o6: bool = try push2(out, p.hour)
+        let c6: bool = try val.str_push(out, 58 as u32)
+        let o7: bool = try push2(out, p.min)
+        let c7: bool = try val.str_push(out, 58 as u32)
+        let o8: bool = try push2(out, p.sec)
+        var g: [u8; 4] = " GMT"
+        let o9: bool = try push_ascii(out, &g[0], 4)
+        let ov: Gc[JsVal] = out
+        return ov
+    }
+    if want_date {
+        let o1: bool = try push_ascii(out, &wd[(p.weekday as usize) * 3], 3)
+        let c1: bool = try val.str_push(out, 32 as u32)
+        let o2: bool = try push_ascii(out, &mo[(p.month as usize) * 3], 3)
+        let c2: bool = try val.str_push(out, 32 as u32)
+        let o3: bool = try push2(out, p.day)
+        let c3: bool = try val.str_push(out, 32 as u32)
+        let o4: bool = try push_num(out, p.year, 4)
+    }
+    if want_date && want_time {
+        let c: bool = try val.str_push(out, 32 as u32)
+    }
+    if want_time {
+        let o5: bool = try push2(out, p.hour)
+        let c5: bool = try val.str_push(out, 58 as u32)
+        let o6: bool = try push2(out, p.min)
+        let c6: bool = try val.str_push(out, 58 as u32)
+        let o7: bool = try push2(out, p.sec)
+        var g: [u8; 38] = " GMT+0000 (Coordinated Universal Time)"
+        let o8: bool = try push_ascii(out, &g[0], 38)
+    }
+    let ov: Gc[JsVal] = out
+    return ov
+}
+
+// 21.4.3.2 Date.parse: the ISO form of 21.4.1.32 plus the text that
+// `toString` and `toUTCString` produce, so that the round trip holds.
+fn parse_date(s: Gc[JsVal]) -> f64 {
+    let n: u64 = val.str_len(s)
+    var i: u64 = 0
+    while i < n && val.str_at(s, i) == 32 as u32 {
+        i = i + 1
+    }
+    // The ISO form.
+    var sign: f64 = 1.0
+    var ydigits: u64 = 4
+    if i < n && (val.str_at(s, i) == 43 as u32 || val.str_at(s, i) == 45 as u32) {
+        if val.str_at(s, i) == 45 as u32 {
+            sign = negf(1.0)
+        }
+        ydigits = 6
+        i = i + 1
+    }
+    var y: i64 = 0
+    var k: u64 = 0
+    while k < ydigits {
+        let c: u32 = dat(s, i + k)
+        if c < 48 as u32 || c > 57 as u32 {
+            return parse_legacy(s)
+        }
+        y = y * 10 + ((c - 48 as u32) as i64)
+        k = k + 1
+    }
+    i = i + ydigits
+    var mo: i64 = 1
+    var d: i64 = 1
+    var h: i64 = 0
+    var mi: i64 = 0
+    var se: i64 = 0
+    var ms: i64 = 0
+    var off: i64 = 0
+    var has_off: bool = false
+    var utc: bool = true
+    if i < n && val.str_at(s, i) == 45 as u32 {
+        i = i + 1
+        if !two(s, i, &mo) {
+            return nan()
+        }
+        i = i + 2
+        if i < n && val.str_at(s, i) == 45 as u32 {
+            i = i + 1
+            if !two(s, i, &d) {
+                return nan()
+            }
+            i = i + 2
+        }
+    }
+    if i < n && (val.str_at(s, i) == 84 as u32 || val.str_at(s, i) == 116 as u32) {
+        i = i + 1
+        utc = false
+        if !two(s, i, &h) {
+            return nan()
+        }
+        i = i + 2
+        if i >= n || val.str_at(s, i) != 58 as u32 {
+            return nan()
+        }
+        i = i + 1
+        if !two(s, i, &mi) {
+            return nan()
+        }
+        i = i + 2
+        if i < n && val.str_at(s, i) == 58 as u32 {
+            i = i + 1
+            if !two(s, i, &se) {
+                return nan()
+            }
+            i = i + 2
+            if i < n && val.str_at(s, i) == 46 as u32 {
+                i = i + 1
+                var got: u64 = 0
+                var acc: i64 = 0
+                while got < 3 {
+                    let c: u32 = dat(s, i)
+                    if c < 48 as u32 || c > 57 as u32 {
+                        break
+                    }
+                    acc = acc * 10 + ((c - 48 as u32) as i64)
+                    i = i + 1
+                    got = got + 1
+                }
+                if got == 0 {
+                    return nan()
+                }
+                while got < 3 {
+                    acc = acc * 10
+                    got = got + 1
+                }
+                while i < n && dat(s, i) >= 48 as u32 && dat(s, i) <= 57 as u32 {
+                    i = i + 1
+                }
+                ms = acc
+            }
+        }
+        if i < n && (val.str_at(s, i) == 90 as u32 || val.str_at(s, i) == 122 as u32) {
+            i = i + 1
+            has_off = true
+        } else if i < n && (val.str_at(s, i) == 43 as u32 || val.str_at(s, i) == 45 as u32) {
+            let neg: bool = val.str_at(s, i) == 45 as u32
+            i = i + 1
+            var oh: i64 = 0
+            var om: i64 = 0
+            if !two(s, i, &oh) {
+                return nan()
+            }
+            i = i + 2
+            if i < n && val.str_at(s, i) == 58 as u32 {
+                i = i + 1
+            }
+            if !two(s, i, &om) {
+                return nan()
+            }
+            i = i + 2
+            off = oh * 60 + om
+            if neg {
+                off = 0 - off
+            }
+            has_off = true
+        }
+    }
+    while i < n && val.str_at(s, i) == 32 as u32 {
+        i = i + 1
+    }
+    if i != n {
+        return nan()
+    }
+    if mo < 1 || mo > 12 || d < 1 || d > 31 || h > 24 || mi > 59 || se > 59 {
+        return nan()
+    }
+    let yv: f64 = sign * (y as f64)
+    var t: f64 = make_time_value(yv, (mo - 1) as f64, d as f64, h as f64,
+        mi as f64, se as f64, ms as f64)
+    if has_off {
+        t = t - (off as f64) * 60000.0
+    }
+    return clip(t)
+}
+
+fn dat(s: Gc[JsVal], i: u64) -> u32 {
+    if i >= val.str_len(s) {
+        return 0
+    }
+    return val.str_at(s, i)
+}
+
+fn two(s: Gc[JsVal], i: u64, out: *mut i64) -> bool {
+    let a: u32 = dat(s, i)
+    let b: u32 = dat(s, i + 1)
+    if a < 48 as u32 || a > 57 as u32 || b < 48 as u32 || b > 57 as u32 {
+        return false
+    }
+    *out = ((a - 48 as u32) as i64) * 10 + ((b - 48 as u32) as i64)
+    return true
+}
+
+// The form that `toString` produces: "Wed Jan 01 2020 00:00:00 GMT+0000".
+fn parse_legacy(s: Gc[JsVal]) -> f64 {
+    var mo: [u8; 36] = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    let n: u64 = val.str_len(s)
+    var month: i64 = -1
+    var at: u64 = 0
+    var i: u64 = 0
+    while i + 2 < n {
+        var k: i64 = 0
+        while k < 12 {
+            if val.str_at(s, i) == mo[(k as usize) * 3] as u32 && val.str_at(s, i + 1) == mo[(k as usize) * 3 + 1] as u32 && val.str_at(s, i + 2) == mo[(k as usize) * 3 + 2] as u32 {
+                month = k
+                at = i
+                break
+            }
+            k = k + 1
+        }
+        if month >= 0 {
+            break
+        }
+        i = i + 1
+    }
+    if month < 0 {
+        return nan()
+    }
+    // Collect every run of digits after the month name.
+    var nums: [i64; 8] = [0; 8]
+    var cnt: usize = 0
+    i = 0
+    var day: i64 = -1
+    // A day may stand BEFORE the month ("01 Jan 2020").
+    while i < at && cnt < 8 {
+        if val.str_at(s, i) >= 48 as u32 && val.str_at(s, i) <= 57 as u32 {
+            var v: i64 = 0
+            while i < n && val.str_at(s, i) >= 48 as u32 && val.str_at(s, i) <= 57 as u32 {
+                v = v * 10 + ((val.str_at(s, i) - 48 as u32) as i64)
+                i = i + 1
+            }
+            nums[cnt] = v
+            cnt = cnt + 1
+            continue
+        }
+        i = i + 1
+    }
+    if cnt > 0 {
+        day = nums[0]
+    }
+    cnt = 0
+    i = at + 3
+    while i < n && cnt < 8 {
+        if val.str_at(s, i) >= 48 as u32 && val.str_at(s, i) <= 57 as u32 {
+            var v: i64 = 0
+            while i < n && val.str_at(s, i) >= 48 as u32 && val.str_at(s, i) <= 57 as u32 {
+                v = v * 10 + ((val.str_at(s, i) - 48 as u32) as i64)
+                i = i + 1
+            }
+            nums[cnt] = v
+            cnt = cnt + 1
+            continue
+        }
+        i = i + 1
+    }
+    var k: usize = 0
+    var year: i64 = -1
+    var h: i64 = 0
+    var mi: i64 = 0
+    var se: i64 = 0
+    if day < 0 && cnt > 0 {
+        day = nums[0]
+        k = 1
+    }
+    if k < cnt {
+        year = nums[k]
+        k = k + 1
+    }
+    if k < cnt {
+        h = nums[k]
+        k = k + 1
+    }
+    if k < cnt {
+        mi = nums[k]
+        k = k + 1
+    }
+    if k < cnt {
+        se = nums[k]
+        k = k + 1
+    }
+    if year < 0 || day < 0 {
+        return nan()
+    }
+    return clip(make_time_value(year as f64, month as f64, day as f64,
+            h as f64, mi as f64, se as f64, 0.0))
+}
+
+// ----------------------------------------------------------- The install
+
+fn nat(r: Gc[Realm], target: Gc[JsObj], name: *mut u8, n: usize, id: u64,
+    arity: u64) -> AllocError!bool {
+    let f: Gc[JsObj] = try interp.make_native(r, id, arity, name, n)
+    let k: u64 = try key_ascii(r, name, n)
+    let fv: Gc[JsVal] = f
+    return interp.define_value(r, target, k, fv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+}
+
+fn install_date(r: Gc[Realm], g: Gc[JsObj]) -> AllocError!bool {
+    let dp: Gc[JsObj] = val.realm_proto(r, val.PROTO_DATE)
+    var nm: [u8; 4] = "Date"
+    let c: Gc[JsObj] = try interp.make_native(r, D_CTOR, 7, &nm[0], 4)
+    c.flags = c.flags | val.F_CTOR
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let pv: Gc[JsVal] = dp
+    let o1: bool = try interp.define_value(r, c, pk, pv, 0)
+    let ck: u64 = try val.key_for_name(r, lex.N_CONSTRUCTOR)
+    let cv: Gc[JsVal] = c
+    let o2: bool = try interp.define_value(r, dp, ck, cv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    let gk: u64 = try key_ascii(r, &nm[0], 4)
+    let o3: bool = try interp.define_value(r, g, gk, cv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    var s1: [u8; 3] = "now"
+    var s2: [u8; 5] = "parse"
+    var s3: [u8; 3] = "UTC"
+    let k1: bool = try nat(r, c, &s1[0], 3, D_NOW, 0)
+    let k2: bool = try nat(r, c, &s2[0], 5, D_PARSE, 1)
+    let k3: bool = try nat(r, c, &s3[0], 3, D_UTC, 7)
+    // The getters, local and UTC. The local ones ARE the UTC ones here.
+    var gn: [u8; 73] = "TimeFullYearMonthDateDayHoursMinutesSecondsMillisecondsTimezoneOffsetYear"
+    var glen: [u64; 11] = [0; 11]
+    glen[0] = 4
+    glen[1] = 8
+    glen[2] = 5
+    glen[3] = 4
+    glen[4] = 3
+    glen[5] = 5
+    glen[6] = 7
+    glen[7] = 7
+    glen[8] = 12
+    glen[9] = 14
+    glen[10] = 4
+    var goff: [u64; 11] = [0; 11]
+    var acc: u64 = 0
+    var gi: usize = 0
+    while gi < 11 {
+        goff[gi] = acc
+        acc = acc + glen[gi]
+        gi = gi + 1
+    }
+    var i: u64 = 0
+    while i < G_COUNT {
+        var name: [u8; 24] = [0 as u8; 24]
+        name[0] = 103 as u8
+        name[1] = 101 as u8
+        name[2] = 116 as u8
+        var w: usize = 3
+        var j: u64 = 0
+        while j < glen[i as usize] {
+            name[w] = gn[(goff[i as usize] + j) as usize]
+            w = w + 1
+            j = j + 1
+        }
+        let ok: bool = try nat(r, dp, &name[0], w, D_GET + i, 0)
+        // The UTC form: getUTCFullYear ...
+        if i != G_TZOFF && i != G_YEAR && i != G_TIME {
+            var un: [u8; 24] = [0 as u8; 24]
+            un[0] = 103 as u8
+            un[1] = 101 as u8
+            un[2] = 116 as u8
+            un[3] = 85 as u8
+            un[4] = 84 as u8
+            un[5] = 67 as u8
+            var w2: usize = 6
+            j = 0
+            while j < glen[i as usize] {
+                un[w2] = gn[(goff[i as usize] + j) as usize]
+                w2 = w2 + 1
+                j = j + 1
+            }
+            let ok2: bool = try nat(r, dp, &un[0], w2, D_GET + i, 0)
+        }
+        i = i + 1
+    }
+    var sn: [u8; 56] = "TimeFullYearMonthDateHoursMinutesSecondsMillisecondsYear"
+    var slen: [u64; 9] = [0; 9]
+    slen[0] = 4
+    slen[1] = 8
+    slen[2] = 5
+    slen[3] = 4
+    slen[4] = 5
+    slen[5] = 7
+    slen[6] = 7
+    slen[7] = 12
+    slen[8] = 4
+    var sarity: [u64; 9] = [0; 9]
+    sarity[0] = 1
+    sarity[1] = 3
+    sarity[2] = 2
+    sarity[3] = 1
+    sarity[4] = 4
+    sarity[5] = 3
+    sarity[6] = 2
+    sarity[7] = 1
+    sarity[8] = 1
+    var soff: [u64; 9] = [0; 9]
+    acc = 0
+    var si: usize = 0
+    while si < 9 {
+        soff[si] = acc
+        acc = acc + slen[si]
+        si = si + 1
+    }
+    i = 0
+    while i < S_COUNT {
+        var name: [u8; 24] = [0 as u8; 24]
+        name[0] = 115 as u8
+        name[1] = 101 as u8
+        name[2] = 116 as u8
+        var w: usize = 3
+        var j: u64 = 0
+        while j < slen[i as usize] {
+            name[w] = sn[(soff[i as usize] + j) as usize]
+            w = w + 1
+            j = j + 1
+        }
+        let ok: bool = try nat(r, dp, &name[0], w, D_SET + i, sarity[i as usize])
+        if i != S_TIME && i != S_YEAR {
+            var un: [u8; 24] = [0 as u8; 24]
+            un[0] = 115 as u8
+            un[1] = 101 as u8
+            un[2] = 116 as u8
+            un[3] = 85 as u8
+            un[4] = 84 as u8
+            un[5] = 67 as u8
+            var w2: usize = 6
+            j = 0
+            while j < slen[i as usize] {
+                un[w2] = sn[(soff[i as usize] + j) as usize]
+                w2 = w2 + 1
+                j = j + 1
+            }
+            let ok2: bool = try nat(r, dp, &un[0], w2, D_SET + i,
+                sarity[i as usize])
+        }
+        i = i + 1
+    }
+    var t01: [u8; 8] = "toString"
+    var t02: [u8; 11] = "toISOString"
+    var t03: [u8; 11] = "toUTCString"
+    var t04: [u8; 12] = "toDateString"
+    var t05: [u8; 12] = "toTimeString"
+    var t06: [u8; 6] = "toJSON"
+    var t07: [u8; 7] = "valueOf"
+    var t08: [u8; 14] = "toLocaleString"
+    var t09: [u8; 18] = "toLocaleDateString"
+    var t10: [u8; 18] = "toLocaleTimeString"
+    var t11: [u8; 11] = "toGMTString"
+    let m01: bool = try nat(r, dp, &t01[0], 8, D_TOSTRING, 0)
+    let m02: bool = try nat(r, dp, &t02[0], 11, D_TOISO, 0)
+    let m03: bool = try nat(r, dp, &t03[0], 11, D_TOUTC, 0)
+    let m04: bool = try nat(r, dp, &t04[0], 12, D_TODATE, 0)
+    let m05: bool = try nat(r, dp, &t05[0], 12, D_TOTIME, 0)
+    let m06: bool = try nat(r, dp, &t06[0], 6, D_TOJSON, 1)
+    let m07: bool = try nat(r, dp, &t07[0], 7, D_VALUEOF, 0)
+    let m08: bool = try nat(r, dp, &t08[0], 14, D_TOLOCALE, 0)
+    let m09: bool = try nat(r, dp, &t09[0], 18, D_TOLOCALEDATE, 0)
+    let m10: bool = try nat(r, dp, &t10[0], 18, D_TOLOCALETIME, 0)
+    let m11: bool = try nat(r, dp, &t11[0], 11, D_TOGMT, 0)
+    let tp: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_TOPRIMITIVE)
+    if (tp as u64) != 0 {
+        var pn: [u8; 20] = "[Symbol.toPrimitive]"
+        let f: Gc[JsObj] = try interp.make_native(r, D_TOPRIMITIVE, 1,
+            &pn[0], 20)
+        let fv: Gc[JsVal] = f
+        let ok: bool = try interp.define_value(r, dp,
+            val.key_for_symbol(tp), fv, val.A_CONFIGURABLE)
+    }
+    return true
+}

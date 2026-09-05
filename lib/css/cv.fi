@@ -1,0 +1,788 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/css/cv.fi -- the CSS PARSER (css-syntax-3, section 5) in Firn.
+//
+// The tokenizer (lib/css/tok.fi) delivers a flat token stream; this file
+// builds the tree of COMPONENT VALUES, RULES and DECLARATIONS out of it --
+// and it does so in the GC HEAP: every node is a `gc class Cv`, every list
+// of children is a `GcVec` (SPEC 3.5.2). A stylesheet is therefore a
+// cyclic-capable object graph like the DOM, and it is collected the same
+// way; nothing hangs on an arena that has to be released by hand.
+//
+// THE ENTRY POINTS of section 5.3, one per test file of the official suite:
+//   parse a list of component values   (component_value_list.json)
+//   parse a component value            (one_component_value.json)
+//   parse a list of declarations       (declaration_list.json)
+//   parse a block's contents           (blocks_contents.json)
+//   parse a declaration                (one_declaration.json)
+//   parse a rule                       (one_rule.json)
+//   parse a list of rules              (rule_list.json)
+//   parse a stylesheet                 (stylesheet.json, stylesheet_bytes.json)
+//
+// ERROR TOLERANCE: nothing here ever stops. Where the standard says
+// "this is a parse error", a node of kind `CV_ERROR` with a code takes the
+// place of the value -- the same way tinycss2 and cssparser keep the error
+// in the tree instead of throwing it away. That is what makes the quota
+// against the foreign test data measurable at all.
+//
+// TWO DETAILS THAT ARE EASY TO GET WRONG, and which the test data check:
+//
+//  1. `!important` does NOT trim whitespace afterwards. The declaration
+//     value keeps every token; when the important flag is recognized, the
+//     value is TRUNCATED at the position of the `!`. `foo: 9000  !x` and
+//     `foo: 9000  !important` therefore differ in exactly one place.
+//  2. A declaration whose value contains a top-level {}-block together with
+//     other content is INVALID inside a block's contents -- that is the
+//     only reason `a:hover {c:1}` is a qualified rule and not a
+//     declaration with the value `hover {c:1}`.
+import html.mem
+import browser.node
+import css.tok
+
+export {
+    Cv, Parser,
+    CV_CURLY, CV_SQUARE, CV_ROUND, CV_FUNCTION,
+    CV_AT_RULE, CV_QUALIFIED_RULE, CV_DECLARATION, CV_ERROR, CV_LIST,
+    F_IMPORTANT, F_HAS_BLOCK,
+    E_INVALID, E_EMPTY, E_EXTRA_INPUT, E_BAD_STRING, E_EOF_IN_STRING,
+    E_BAD_URL, E_EOF_IN_URL, E_CLOSE_CURLY, E_CLOSE_SQUARE, E_CLOSE_ROUND,
+    parser_new,
+    parse_component_value_list, parse_one_component_value,
+    parse_declaration_list, parse_block_contents, parse_one_declaration,
+    parse_one_rule, parse_rule_list, parse_stylesheet,
+    cv_new, cv_kids_count, cv_kid, cv_extra_count, cv_extra,
+    cv_append, cv_truncate, cv_extra_as_list,
+    chain_from_pool, chain_from_ascii,
+}
+
+// The nesting limit. A file of nothing but opening brackets must not
+// exhaust the stack -- beyond this depth the parser stops opening blocks
+// and reports an error node.
+const MAX_DEPTH: u32 = 400
+
+// The node kinds above the token kinds of lib/css/tok.fi. Preserved tokens
+// keep THEIR kind (tok.T_IDENT, tok.T_NUMBER, ...), so a component value
+// never needs a translation table.
+const CV_CURLY: u32 = 40 // {} block
+const CV_SQUARE: u32 = 41 // [] block
+const CV_ROUND: u32 = 42 // () block
+const CV_FUNCTION: u32 = 43 // name(...)
+const CV_AT_RULE: u32 = 44
+const CV_QUALIFIED_RULE: u32 = 45
+const CV_DECLARATION: u32 = 46
+const CV_ERROR: u32 = 47
+// A pure container: the entry points that deliver a LIST use it, and so
+// does the value of a declaration. It never turns up as a component value.
+const CV_LIST: u32 = 48
+
+// The flags on top of the token flags (tok.F_INTEGER, tok.F_HASH_ID).
+const F_IMPORTANT: u32 = 4
+const F_HAS_BLOCK: u32 = 8
+
+// The error codes. Their names in the output are the ones the official
+// test data use.
+const E_INVALID: u32 = 1
+const E_EMPTY: u32 = 2
+const E_EXTRA_INPUT: u32 = 3
+const E_BAD_STRING: u32 = 4
+const E_EOF_IN_STRING: u32 = 5
+const E_BAD_URL: u32 = 6
+const E_EOF_IN_URL: u32 = 7
+const E_CLOSE_CURLY: u32 = 8
+const E_CLOSE_SQUARE: u32 = 9
+const E_CLOSE_ROUND: u32 = 10
+
+// ------------------------------------------------------------- The node
+
+// One node of the parse tree. `kids` is the list of children: the content
+// of a block, the arguments of a function, the prelude of a rule or the
+// value of a declaration. `extra` is the SECOND list a rule needs: its
+// block. A preserved token has neither.
+gc class Cv {
+    kids: GcVec[Gc[Cv]],
+    extra: GcVec[Gc[Cv]],
+    text: Gc[Chain],
+    unit: Gc[Chain],
+    kind: u32,
+    flags: u32,
+    r0: u32,
+    r1: u32,
+}
+
+// The reading position in the token stream.
+struct Parser {
+    t: *mut tok.Tokens,
+    i: usize,
+    n: usize,
+    depth: u32,
+}
+
+#[no_gc]
+fn parser_new(t: *mut tok.Tokens) -> Parser {
+    return Parser { t: t, i: 0, n: tok.tok_count(t), depth: 0 }
+}
+
+#[no_gc]
+fn kind_at(p: *mut Parser) -> u32 {
+    if (*p).i >= (*p).n {
+        return tok.T_EOF
+    }
+    return tok.tok_kind((*p).t, (*p).i)
+}
+
+#[no_gc]
+fn at_end(p: *mut Parser) -> bool {
+    return (*p).i >= (*p).n
+}
+
+#[no_gc]
+fn step(p: *mut Parser) {
+    (*p).i = (*p).i + 1
+}
+
+#[no_gc]
+fn skip_whitespace(p: *mut Parser) {
+    while !at_end(p) && kind_at(p) == tok.T_WHITESPACE {
+        step(p)
+    }
+}
+
+// ------------------------------------------------------------ Text pieces
+
+fn chain_from_pool(t: *mut tok.Tokens, off: usize, n: usize) -> AllocError!Gc[Chain] {
+    let k = try node.chain_new()
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try node.chain_push(k, tok.tok_pool_at(t, off + i))
+        if !ok {
+            return k
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn chain_from_ascii(p: u64, n: usize) -> AllocError!Gc[Chain] {
+    let k = try node.chain_new()
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try node.chain_push(k, (*((p + i as u64) as *mut u8)) as u32)
+        if !ok {
+            return k
+        }
+        i = i + 1
+    }
+    return k
+}
+
+// ------------------------------------------------------- Building nodes
+
+fn cv_new(kind: u32) -> AllocError!Gc[Cv] {
+    return try gc Cv {
+        kids: gc_null[GcVec](),
+        extra: gc_null[GcVec](),
+        text: gc_null[Chain](),
+        unit: gc_null[Chain](),
+        kind: kind,
+        flags: 0,
+        r0: 0,
+        r1: 0,
+    }
+}
+
+fn cv_error(code: u32) -> AllocError!Gc[Cv] {
+    let c = try cv_new(CV_ERROR)
+    c.r0 = code
+    return c
+}
+
+fn kids_append(owner: Gc[Cv], x: Gc[Cv]) -> AllocError!bool {
+    if owner.kids == gc_null[GcVec]() {
+        owner.kids = try gcvec_new()
+    }
+    return try gcvec_append[Cv](owner.kids, x)
+}
+
+fn extra_append(owner: Gc[Cv], x: Gc[Cv]) -> AllocError!bool {
+    if owner.extra == gc_null[GcVec]() {
+        owner.extra = try gcvec_new()
+    }
+    return try gcvec_append[Cv](owner.extra, x)
+}
+
+fn cv_kids_count(c: Gc[Cv]) -> u64 {
+    if c == gc_null[Cv]() || c.kids == gc_null[GcVec]() {
+        return 0
+    }
+    return gcvec_length(c.kids)
+}
+
+fn cv_kid(c: Gc[Cv], i: u64) -> Gc[Cv] {
+    if c == gc_null[Cv]() || c.kids == gc_null[GcVec]() {
+        return gc_null[Cv]()
+    }
+    return gcvec_read[Cv](c.kids, i)
+}
+
+fn cv_extra_count(c: Gc[Cv]) -> u64 {
+    if c == gc_null[Cv]() || c.extra == gc_null[GcVec]() {
+        return 0
+    }
+    return gcvec_length(c.extra)
+}
+
+fn cv_extra(c: Gc[Cv], i: u64) -> Gc[Cv] {
+    if c == gc_null[Cv]() || c.extra == gc_null[GcVec]() {
+        return gc_null[Cv]()
+    }
+    return gcvec_read[Cv](c.extra, i)
+}
+
+// A list node: `kids` holds the entries. Used wherever an entry point
+// returns a LIST (component values, rules, declarations).
+fn list_new() -> AllocError!Gc[Cv] {
+    return try cv_new(CV_LIST)
+}
+
+// Appends a value to a list node -- the way in for everyone outside.
+fn cv_append(owner: Gc[Cv], x: Gc[Cv]) -> AllocError!bool {
+    return try kids_append(owner, x)
+}
+
+// Shortens a list to `n` entries.
+fn cv_truncate(owner: Gc[Cv], n: u64) {
+    while cv_kids_count(owner) > n {
+        gcvec_remove(owner.kids, cv_kids_count(owner) - 1)
+    }
+}
+
+// The BLOCK of a rule as a list node. The `GcVec` is shared, not copied --
+// the block of a rule exists exactly once.
+fn cv_extra_as_list(r: Gc[Cv]) -> AllocError!Gc[Cv] {
+    let l = try cv_new(CV_LIST)
+    l.kids = r.extra
+    return l
+}
+
+// ------------------------------------------- Preserved tokens as values
+
+// Turns the token at the reading position into a node and steps over it.
+// The four broken-token kinds of the tokenizer become error nodes here --
+// that is the place where "the tokenizer never stops" turns into "the
+// parser reports what was wrong".
+fn preserved_token(p: *mut Parser) -> AllocError!Gc[Cv] {
+    let t: *mut tok.Tokens = (*p).t
+    let i: usize = (*p).i
+    let k: u32 = tok.tok_kind(t, i)
+    step(p)
+    if k == tok.T_BAD_STRING {
+        return try cv_error(E_BAD_STRING)
+    }
+    if k == tok.T_EOF_IN_STRING {
+        return try cv_error(E_EOF_IN_STRING)
+    }
+    if k == tok.T_BAD_URL {
+        return try cv_error(E_BAD_URL)
+    }
+    if k == tok.T_EOF_IN_URL {
+        return try cv_error(E_EOF_IN_URL)
+    }
+    if k == tok.T_CLOSE_CURLY {
+        return try cv_error(E_CLOSE_CURLY)
+    }
+    if k == tok.T_CLOSE_SQUARE {
+        return try cv_error(E_CLOSE_SQUARE)
+    }
+    if k == tok.T_CLOSE_ROUND {
+        return try cv_error(E_CLOSE_ROUND)
+    }
+    let c = try cv_new(k)
+    c.flags = tok.tok_flags(t, i)
+    if k == tok.T_UNICODE_RANGE {
+        c.r0 = tok.tok_range_start(t, i)
+        c.r1 = tok.tok_range_end(t, i)
+        return c
+    }
+    if tok.tok_value_len(t, i) > 0 || k == tok.T_IDENT || k == tok.T_STRING ||
+    k == tok.T_URL || k == tok.T_HASH || k == tok.T_AT_KEYWORD ||
+    k == tok.T_NUMBER || k == tok.T_PERCENTAGE || k == tok.T_DIMENSION ||
+    k == tok.T_DELIM {
+        c.text = try chain_from_pool(t, tok.tok_value_off(t, i), tok.tok_value_len(t, i))
+    }
+    if k == tok.T_DIMENSION {
+        c.unit = try chain_from_pool(t, tok.tok_unit_off(t, i), tok.tok_unit_len(t, i))
+    }
+    return c
+}
+
+// ----------------------------------------------- Section 5.4.7/5.4.8 blocks
+
+fn closing_of(open: u32) -> u32 {
+    if open == tok.T_OPEN_CURLY {
+        return tok.T_CLOSE_CURLY
+    }
+    if open == tok.T_OPEN_SQUARE {
+        return tok.T_CLOSE_SQUARE
+    }
+    return tok.T_CLOSE_ROUND
+}
+
+fn block_kind_of(open: u32) -> u32 {
+    if open == tok.T_OPEN_CURLY {
+        return CV_CURLY
+    }
+    if open == tok.T_OPEN_SQUARE {
+        return CV_SQUARE
+    }
+    return CV_ROUND
+}
+
+// "consume a simple block". The opening token is already consumed.
+fn consume_simple_block(p: *mut Parser, open: u32) -> AllocError!Gc[Cv] {
+    let close: u32 = closing_of(open)
+    let b = try cv_new(block_kind_of(open))
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if kind_at(p) == close {
+            step(p)
+            next = false
+        } else {
+            let v = try consume_component_value(p)
+            let ok: bool = try kids_append(b, v)
+            if !ok {
+                next = false
+            }
+        }
+    }
+    return b
+}
+
+// "consume a function". The function token is already consumed; `i` names it.
+fn consume_function(p: *mut Parser, at: usize) -> AllocError!Gc[Cv] {
+    let t: *mut tok.Tokens = (*p).t
+    let f = try cv_new(CV_FUNCTION)
+    f.text = try chain_from_pool(t, tok.tok_value_off(t, at), tok.tok_value_len(t, at))
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if kind_at(p) == tok.T_CLOSE_ROUND {
+            step(p)
+            next = false
+        } else {
+            let v = try consume_component_value(p)
+            let ok: bool = try kids_append(f, v)
+            if !ok {
+                next = false
+            }
+        }
+    }
+    return f
+}
+
+// "consume a component value" (section 5.4.6).
+fn consume_component_value(p: *mut Parser) -> AllocError!Gc[Cv] {
+    let k: u32 = kind_at(p)
+    if k == tok.T_OPEN_CURLY || k == tok.T_OPEN_SQUARE || k == tok.T_OPEN_ROUND {
+        if (*p).depth >= MAX_DEPTH {
+            step(p)
+            return try cv_error(E_INVALID)
+        }
+        step(p)
+        (*p).depth = (*p).depth + 1
+        let b = try consume_simple_block(p, k)
+        (*p).depth = (*p).depth - 1
+        return b
+    }
+    if k == tok.T_FUNCTION {
+        if (*p).depth >= MAX_DEPTH {
+            step(p)
+            return try cv_error(E_INVALID)
+        }
+        let at: usize = (*p).i
+        step(p)
+        (*p).depth = (*p).depth + 1
+        let f = try consume_function(p, at)
+        (*p).depth = (*p).depth - 1
+        return f
+    }
+    return try preserved_token(p)
+}
+
+// ------------------------------------------------------- Section 5.4.1/5.4.2
+
+// "consume an at-rule". The at-keyword is at `(*p).i`.
+fn consume_at_rule(p: *mut Parser, nested: bool) -> AllocError!Gc[Cv] {
+    let t: *mut tok.Tokens = (*p).t
+    let at: usize = (*p).i
+    step(p)
+    let r = try cv_new(CV_AT_RULE)
+    r.text = try chain_from_pool(t, tok.tok_value_off(t, at), tok.tok_value_len(t, at))
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if kind_at(p) == tok.T_SEMICOLON {
+            step(p)
+            next = false
+        } else if kind_at(p) == tok.T_OPEN_CURLY {
+            step(p)
+            (*p).depth = (*p).depth + 1
+            let b = try consume_simple_block(p, tok.T_OPEN_CURLY)
+            (*p).depth = (*p).depth - 1
+            r.extra = b.kids
+            r.flags = r.flags | F_HAS_BLOCK
+            next = false
+        } else if nested && kind_at(p) == tok.T_CLOSE_CURLY {
+            next = false
+        } else {
+            let v = try consume_component_value(p)
+            let ok: bool = try kids_append(r, v)
+            if !ok {
+                next = false
+            }
+        }
+    }
+    return r
+}
+
+// "consume a qualified rule". Returns an error node when the rule stays
+// unfinished (EOF before the block) -- the standard drops it, the test
+// data want it named.
+fn consume_qualified_rule(p: *mut Parser, nested: bool) -> AllocError!Gc[Cv] {
+    let r = try cv_new(CV_QUALIFIED_RULE)
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            return try cv_error(E_INVALID)
+        }
+        if nested && kind_at(p) == tok.T_SEMICOLON {
+            step(p)
+            return try cv_error(E_INVALID)
+        }
+        if nested && kind_at(p) == tok.T_CLOSE_CURLY {
+            return try cv_error(E_INVALID)
+        }
+        if kind_at(p) == tok.T_OPEN_CURLY {
+            step(p)
+            (*p).depth = (*p).depth + 1
+            let b = try consume_simple_block(p, tok.T_OPEN_CURLY)
+            (*p).depth = (*p).depth - 1
+            r.extra = b.kids
+            r.flags = r.flags | F_HAS_BLOCK
+            next = false
+        } else {
+            let v = try consume_component_value(p)
+            let ok: bool = try kids_append(r, v)
+            if !ok {
+                next = false
+            }
+        }
+    }
+    return r
+}
+
+// ------------------------------------------------- Section 5.4.4 declaration
+
+fn is_bang(c: Gc[Cv]) -> bool {
+    if c.kind != tok.T_DELIM {
+        return false
+    }
+    var lit: [u8; 1] = "!"
+    return node.chain_equal_ascii(c.text, &lit[0], 1)
+}
+
+fn is_important_ident(c: Gc[Cv]) -> bool {
+    if c.kind != tok.T_IDENT {
+        return false
+    }
+    var lit: [u8; 9] = "important"
+    return node.chain_equal_ascii_small(c.text, &lit[0], 9)
+}
+
+// "consume a declaration". `(*p).i` stands on the ident token.
+//
+//   nested = true   the value ends at a top-level `;` or `}`
+//   nested = false  the value runs to the end of the input
+//   block_rule      the {}-block rule of "consume a block's contents"
+//
+// Returns the null pointer when the token sequence is not a declaration.
+fn consume_declaration(p: *mut Parser, nested: bool, block_rule: bool) -> AllocError!Gc[Cv] {
+    let t: *mut tok.Tokens = (*p).t
+    if kind_at(p) != tok.T_IDENT {
+        return gc_null[Cv]()
+    }
+    let name_at: usize = (*p).i
+    step(p)
+    skip_whitespace(p)
+    if kind_at(p) != tok.T_COLON {
+        return gc_null[Cv]()
+    }
+    step(p)
+    let d = try cv_new(CV_DECLARATION)
+    d.text = try chain_from_pool(t, tok.tok_value_off(t, name_at), tok.tok_value_len(t, name_at))
+    // The value. `state` follows the important recognition: 0 = ordinary,
+    // 1 = a `!` was seen, 2 = `!important` complete. `bang` remembers how
+    // many values stood in front of the `!`.
+    var state: u32 = 0
+    var bang: u64 = 0
+    var curly: u32 = 0 // top-level {} blocks in the value
+    var other: u32 = 0 // other values that are not whitespace
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if nested && (kind_at(p) == tok.T_SEMICOLON || kind_at(p) == tok.T_CLOSE_CURLY) {
+            next = false
+        } else {
+            let v = try consume_component_value(p)
+            if state == 0 && is_bang(v) {
+                state = 1
+                bang = cv_kids_count(d)
+            } else if state == 1 && is_important_ident(v) {
+                state = 2
+            } else if v.kind != tok.T_WHITESPACE {
+                state = 0
+            }
+            if v.kind == CV_CURLY {
+                curly = curly + 1
+            } else if v.kind != tok.T_WHITESPACE {
+                other = other + 1
+            }
+            let ok: bool = try kids_append(d, v)
+            if !ok {
+                next = false
+            }
+        }
+    }
+    if state == 2 {
+        d.flags = d.flags | F_IMPORTANT
+        // TRUNCATE at the `!`, do not trim afterwards. `foo: 1  !important`
+        // therefore keeps the space in front of the `!`.
+        while cv_kids_count(d) > bang {
+            gcvec_remove(d.kids, cv_kids_count(d) - 1)
+        }
+        // The `!important` counts as content of the value for the rule below.
+        if other >= 2 {
+            other = other - 2
+        } else {
+            other = 0
+        }
+    }
+    if block_rule && curly > 0 && (other > 0 || curly > 1) {
+        return gc_null[Cv]()
+    }
+    return d
+}
+
+// Skips everything up to the next top-level `;` -- the recovery path of
+// "consume the remnants of a bad declaration".
+fn skip_bad_declaration(p: *mut Parser, nested: bool) -> AllocError!bool {
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if kind_at(p) == tok.T_SEMICOLON {
+            step(p)
+            next = false
+        } else if nested && kind_at(p) == tok.T_CLOSE_CURLY {
+            next = false
+        } else {
+            let ignored = try consume_component_value(p)
+            if ignored == gc_null[Cv]() {
+                next = false
+            }
+        }
+    }
+    return true
+}
+
+// ------------------------------------------------------- The entry points
+
+// Section 5.3.9 "parse a list of component values".
+fn parse_component_value_list(p: *mut Parser) -> AllocError!Gc[Cv] {
+    let out = try list_new()
+    while !at_end(p) {
+        let v = try consume_component_value(p)
+        let ok: bool = try kids_append(out, v)
+        if !ok {
+            return out
+        }
+    }
+    return out
+}
+
+// Section 5.3.10 "parse a component value".
+fn parse_one_component_value(p: *mut Parser) -> AllocError!Gc[Cv] {
+    skip_whitespace(p)
+    if at_end(p) {
+        return try cv_error(E_EMPTY)
+    }
+    let v = try consume_component_value(p)
+    skip_whitespace(p)
+    if !at_end(p) {
+        return try cv_error(E_EXTRA_INPUT)
+    }
+    return v
+}
+
+// Section 5.3.7 "parse a list of declarations" (the 2021 form: only
+// declarations and at-rules, a qualified rule is invalid).
+fn parse_declaration_list(p: *mut Parser) -> AllocError!Gc[Cv] {
+    let out = try list_new()
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if kind_at(p) == tok.T_WHITESPACE || kind_at(p) == tok.T_SEMICOLON {
+            step(p)
+        } else if kind_at(p) == tok.T_AT_KEYWORD {
+            let r = try consume_at_rule(p, false)
+            let ok: bool = try kids_append(out, r)
+            if !ok {
+                next = false
+            }
+        } else {
+            let mark: usize = (*p).i
+            let d = try consume_declaration(p, true, false)
+            if d == gc_null[Cv]() {
+                (*p).i = mark
+                let ignored = try skip_bad_declaration(p, false)
+                let e = try cv_error(E_INVALID)
+                let ok: bool = try kids_append(out, e)
+                if !ok {
+                    next = false
+                }
+            } else {
+                let ok: bool = try kids_append(out, d)
+                if !ok {
+                    next = false
+                }
+            }
+        }
+    }
+    return out
+}
+
+// "parse a block's contents": declarations, at-rules AND qualified rules.
+fn parse_block_contents(p: *mut Parser) -> AllocError!Gc[Cv] {
+    let out = try list_new()
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if kind_at(p) == tok.T_WHITESPACE || kind_at(p) == tok.T_SEMICOLON {
+            step(p)
+        } else if kind_at(p) == tok.T_CLOSE_CURLY {
+            next = false
+        } else if kind_at(p) == tok.T_AT_KEYWORD {
+            let r = try consume_at_rule(p, true)
+            let ok: bool = try kids_append(out, r)
+            if !ok {
+                next = false
+            }
+        } else {
+            let mark: usize = (*p).i
+            let d = try consume_declaration(p, true, true)
+            if d == gc_null[Cv]() {
+                (*p).i = mark
+                let r = try consume_qualified_rule(p, true)
+                let ok: bool = try kids_append(out, r)
+                if !ok {
+                    next = false
+                }
+            } else {
+                let ok: bool = try kids_append(out, d)
+                if !ok {
+                    next = false
+                }
+            }
+        }
+    }
+    return out
+}
+
+// Section 5.3.8 "parse a declaration".
+fn parse_one_declaration(p: *mut Parser) -> AllocError!Gc[Cv] {
+    skip_whitespace(p)
+    if at_end(p) {
+        return try cv_error(E_EMPTY)
+    }
+    if kind_at(p) != tok.T_IDENT {
+        return try cv_error(E_INVALID)
+    }
+    let d = try consume_declaration(p, false, false)
+    if d == gc_null[Cv]() {
+        return try cv_error(E_INVALID)
+    }
+    return d
+}
+
+// Section 5.3.5 "parse a rule".
+fn parse_one_rule(p: *mut Parser) -> AllocError!Gc[Cv] {
+    skip_whitespace(p)
+    if at_end(p) {
+        return try cv_error(E_EMPTY)
+    }
+    var r: Gc[Cv] = gc_null[Cv]()
+    if kind_at(p) == tok.T_AT_KEYWORD {
+        r = try consume_at_rule(p, false)
+    } else {
+        r = try consume_qualified_rule(p, false)
+    }
+    if r.kind == CV_ERROR {
+        return try cv_error(E_INVALID)
+    }
+    skip_whitespace(p)
+    if !at_end(p) {
+        return try cv_error(E_EXTRA_INPUT)
+    }
+    return r
+}
+
+// Section 5.3.3 "consume a list of rules". `top_level` discards CDO/CDC.
+fn parse_rules(p: *mut Parser, top_level: bool) -> AllocError!Gc[Cv] {
+    let out = try list_new()
+    var next: bool = true
+    while next {
+        if at_end(p) {
+            next = false
+        } else if kind_at(p) == tok.T_WHITESPACE {
+            step(p)
+        } else if kind_at(p) == tok.T_CDO || kind_at(p) == tok.T_CDC {
+            if top_level {
+                step(p)
+            } else {
+                let r = try consume_qualified_rule(p, false)
+                let ok: bool = try kids_append(out, r)
+                if !ok {
+                    next = false
+                }
+            }
+        } else if kind_at(p) == tok.T_AT_KEYWORD {
+            let r = try consume_at_rule(p, false)
+            let ok: bool = try kids_append(out, r)
+            if !ok {
+                next = false
+            }
+        } else {
+            let r = try consume_qualified_rule(p, false)
+            let ok: bool = try kids_append(out, r)
+            if !ok {
+                next = false
+            }
+        }
+    }
+    return out
+}
+
+// Section 5.3.4 "parse a list of rules" (top-level flag unset).
+fn parse_rule_list(p: *mut Parser) -> AllocError!Gc[Cv] {
+    return try parse_rules(p, false)
+}
+
+// Section 5.3.2 "parse a stylesheet" (top-level flag set).
+fn parse_stylesheet(p: *mut Parser) -> AllocError!Gc[Cv] {
+    return try parse_rules(p, true)
+}

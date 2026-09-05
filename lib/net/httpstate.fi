@@ -1,0 +1,944 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/net/httpstate.fi -- what a client REMEMBERS between two requests
+// (round B4): the cookie jar, the response cache, and the date format both
+// of them need.
+//
+// Split out of `lib/net/http.fi` for one reason: this half has no socket in
+// it. It can be tested without a server, and it is the half that has to be
+// portable when the browser core is lifted out as a library -- a jar and a
+// cache are policy, and policy is what an embedder wants to replace.
+//
+// NO GC. Both stores are flat octet buffers with FIXED record sizes and
+// hand-written field offsets, exactly like the connection table of
+// `tools/net/echo.fi`. A hash map would be nicer to read and would need an
+// allocator in a file that is meant to survive without one.
+//
+// THE LIMITS, named rather than hidden:
+//   * 64 cookies, 128 octets of name, 320 of value, 128 of domain and of
+//     path. A cookie that does not fit is DROPPED, not truncated -- half a
+//     session cookie is worse than none.
+//   * 32 cache entries, least-recently-used thrown out first.
+//   * no public suffix list. `Domain=co.uk` is refused only by the crude
+//     rule "at least one dot and not an exact suffix of nothing"; a real
+//     browser needs Mozilla's list, and that is a data file, not a rule.
+import std.rt
+
+export {
+    Jar, Cache,
+    COOKIE_BYTES, CACHE_BYTES, MAX_COOKIES, MAX_CACHE,
+    jar_new, jar_init, jar_free, jar_clear, jar_count, jar_live,
+    jar_set_cookie, jar_header,
+    cache_new, cache_init, cache_free, cache_clear,
+    cache_lookup, cache_store, cache_touch_304,
+    cache_body_ptr, cache_body_len, cache_status, cache_etag_ptr,
+    cache_etag_len, cache_count,
+    http_date, now_unix,
+}
+
+const MAX_COOKIES: usize = 64
+const COOKIE_BYTES: usize = 768
+const C_FLAGS: usize = 0
+const C_EXPIRES: usize = 8
+const C_NAME_N: usize = 16
+const C_VAL_N: usize = 24
+const C_DOM_N: usize = 32
+const C_PATH_N: usize = 40
+const C_SEQ: usize = 48
+const C_NAME: usize = 64
+const C_VAL: usize = 192
+const C_DOM: usize = 512
+const C_PATH: usize = 640
+const NAME_CAP: usize = 128
+const VAL_CAP: usize = 320
+const DOM_CAP: usize = 128
+const PATH_CAP: usize = 128
+
+const F_USED: u64 = 1
+const F_SECURE: u64 = 2
+const F_HOSTONLY: u64 = 4
+const F_SESSION: u64 = 8
+
+const MAX_CACHE: usize = 32
+const CACHE_BYTES: usize = 1280
+const E_USED: usize = 0
+const E_STATUS: usize = 8
+const E_STORED: usize = 16
+const E_MAXAGE: usize = 24
+const E_BODY_P: usize = 32
+const E_BODY_N: usize = 40
+const E_BODY_C: usize = 48
+const E_URL_N: usize = 56
+const E_ETAG_N: usize = 64
+const E_CT_N: usize = 72
+const E_LM_N: usize = 80
+const E_LAST: usize = 88
+const E_URL: usize = 96
+const E_ETAG: usize = 864
+const E_CT: usize = 992
+const E_LM: usize = 1120
+const URL_CAP: usize = 768
+const ETAG_CAP: usize = 128
+const CT_CAP: usize = 128
+const LM_CAP: usize = 64
+
+const NO_MAXAGE: u64 = 18446744073709551615 as u64
+
+struct Jar {
+    b: rt.Buf,
+    seq: u64,
+    dropped: u64,
+}
+
+struct Cache {
+    b: rt.Buf,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+    stores: u64,
+    revalidated: u64,
+    evicted: u64,
+}
+
+// ------------------------------------------------------------ small tools
+
+fn low(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn ci_eq(a: u64, na: usize, b: u64, nb: usize) -> bool {
+    if na != nb {
+        return false
+    }
+    var i: usize = 0
+    while i < na {
+        if low(rt.ld8(a, i)) != low(rt.ld8(b, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn copy_in(rec: u64, off: usize, cap: usize, p: u64, n: usize) -> bool {
+    if n > cap {
+        return false
+    }
+    rt.mem_copy(rec + off as u64, p, n)
+    return true
+}
+
+fn ld(rec: u64, off: usize) -> u64 { return rt.ld64(rec, off / 8) }
+fn st(rec: u64, off: usize, v: u64) { rt.st64(rec, off / 8, v) }
+
+// The wall clock in seconds. CLOCK_REALTIME (0), because cookie and cache
+// lifetimes are stated in calendar time and a monotonic clock cannot be
+// compared with a `Date:` header.
+fn now_unix() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] as u64
+}
+
+// ------------------------------------------------------------- HTTP dates
+
+fn dec2(p: u64, n: usize, i: usize) -> i64 {
+    if i + 1 >= n {
+        return -1
+    }
+    let a: u8 = rt.ld8(p, i)
+    let b: u8 = rt.ld8(p, i + 1)
+    if a < 48 as u8 || a > 57 as u8 || b < 48 as u8 || b > 57 as u8 {
+        return -1
+    }
+    return (a - 48 as u8) as i64 * 10 + (b - 48 as u8) as i64
+}
+
+fn dec4(p: u64, n: usize, i: usize) -> i64 {
+    let a: i64 = dec2(p, n, i)
+    let b: i64 = dec2(p, n, i + 2)
+    if a < 0 || b < 0 {
+        return -1
+    }
+    return a * 100 + b
+}
+
+fn month_of(p: u64, n: usize, i: usize) -> i64 {
+    var names: [u8; 36] = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    if i + 2 >= n {
+        return -1
+    }
+    var m: usize = 0
+    while m < 12 {
+        if low(rt.ld8(p, i)) == low(names[m * 3]) &&
+        low(rt.ld8(p, i + 1)) == low(names[m * 3 + 1]) &&
+        low(rt.ld8(p, i + 2)) == low(names[m * 3 + 2]) {
+            return m as i64 + 1
+        }
+        m = m + 1
+    }
+    return -1
+}
+
+// Howard Hinnant's days_from_civil -- the shift of the year start to March
+// makes the leap day the LAST day of the year, and then the leap rule is
+// three plain divisions with no case distinction.
+fn days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    var y: i64 = y0
+    if m <= 2 {
+        y = y - 1
+    }
+    var era: i64 = y / 400
+    if y < 0 {
+        era = (y - 399) / 400
+    }
+    let yoe: i64 = y - era * 400
+    var mp: i64 = m + 9
+    if m > 2 {
+        mp = m - 3
+    }
+    let doy: i64 = (153 * mp + 2) / 5 + d - 1
+    let doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// The three formats RFC 9110 5.6.7 makes a recipient accept:
+//   IMF-fixdate    Sun, 06 Nov 1994 08:49:37 GMT
+//   RFC 850        Sunday, 06-Nov-94 08:49:37 GMT
+//   asctime        Sun Nov  6 08:49:37 1994
+// Returns unix seconds, or 0 when it is none of them. A two digit year is
+// read as the standard says: 70..99 is 19xx, everything else 20xx.
+fn http_date(p: u64, n: usize) -> u64 {
+    var i: usize = 0
+    while i < n && rt.ld8(p, i) == 32 as u8 {
+        i = i + 1
+    }
+    // over the weekday name to the first comma or space
+    var j: usize = i
+    while j < n && rt.ld8(p, j) != 32 as u8 && rt.ld8(p, j) != 44 as u8 {
+        j = j + 1
+    }
+    var day: i64 = -1
+    var mon: i64 = -1
+    var year: i64 = -1
+    var hh: i64 = -1
+    var mm: i64 = -1
+    var ss: i64 = -1
+    if j < n && rt.ld8(p, j) == 44 as u8 {
+        // IMF-fixdate or RFC 850
+        var k: usize = j + 1
+        while k < n && rt.ld8(p, k) == 32 as u8 {
+            k = k + 1
+        }
+        day = dec2(p, n, k)
+        if day < 0 {
+            return 0
+        }
+        var sep: usize = k + 2
+        if sep < n && (rt.ld8(p, sep) == 32 as u8 ||
+            rt.ld8(p, sep) == 45 as u8) {
+            mon = month_of(p, n, sep + 1)
+            var yat: usize = sep + 4
+            if yat < n && (rt.ld8(p, yat) == 32 as u8 ||
+                rt.ld8(p, yat) == 45 as u8) {
+                yat = yat + 1
+            }
+            var two: bool = false
+            if yat + 2 < n {
+                let c2: u8 = rt.ld8(p, yat + 2)
+                two = c2 < 48 as u8 || c2 > 57 as u8
+            }
+            if two {
+                // a two digit year (RFC 850)
+                year = dec2(p, n, yat)
+                if year < 0 {
+                    return 0
+                }
+                if year >= 70 {
+                    year = year + 1900
+                } else {
+                    year = year + 2000
+                }
+                hh = dec2(p, n, yat + 3)
+                mm = dec2(p, n, yat + 6)
+                ss = dec2(p, n, yat + 9)
+            } else {
+                year = dec4(p, n, yat)
+                hh = dec2(p, n, yat + 5)
+                mm = dec2(p, n, yat + 8)
+                ss = dec2(p, n, yat + 11)
+            }
+        }
+    } else {
+        // asctime: Sun Nov  6 08:49:37 1994
+        var k: usize = j
+        while k < n && rt.ld8(p, k) == 32 as u8 {
+            k = k + 1
+        }
+        mon = month_of(p, n, k)
+        var d0: usize = k + 4
+        while d0 < n && rt.ld8(p, d0) == 32 as u8 {
+            d0 = d0 + 1
+        }
+        if d0 + 1 < n && rt.ld8(p, d0 + 1) == 32 as u8 {
+            day = (rt.ld8(p, d0) - 48 as u8) as i64
+            d0 = d0 + 2
+        } else {
+            day = dec2(p, n, d0)
+            d0 = d0 + 3
+        }
+        hh = dec2(p, n, d0)
+        mm = dec2(p, n, d0 + 3)
+        ss = dec2(p, n, d0 + 6)
+        year = dec4(p, n, d0 + 9)
+    }
+    if day < 1 || day > 31 || mon < 1 || year < 1601 {
+        return 0
+    }
+    if hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 60 {
+        return 0
+    }
+    let d: i64 = days_from_civil(year, mon, day)
+    let t: i64 = d * 86400 + hh * 3600 + mm * 60 + ss
+    if t < 0 {
+        return 0
+    }
+    return t as u64
+}
+
+// ================================================================== The jar
+
+fn jar_new() -> Jar {
+    return Jar { b: rt.buf_new(), seq: 0, dropped: 0 }
+}
+
+fn jar_init(j: *mut Jar) -> bool {
+    rt.buf_reserve(&(*j).b, MAX_COOKIES * COOKIE_BYTES)
+    if (*j).b.cap < MAX_COOKIES * COOKIE_BYTES {
+        return false
+    }
+    rt.buf_set_len(&(*j).b, MAX_COOKIES * COOKIE_BYTES)
+    rt.mem_set((*j).b.ptr, 0 as u8, MAX_COOKIES * COOKIE_BYTES)
+    (*j).seq = 0
+    (*j).dropped = 0
+    return true
+}
+
+fn jar_free(j: *mut Jar) {
+    rt.buf_free(&(*j).b)
+}
+
+fn jar_clear(j: *mut Jar) {
+    if (*j).b.ptr != 0 {
+        rt.mem_set((*j).b.ptr, 0 as u8, MAX_COOKIES * COOKIE_BYTES)
+    }
+    (*j).seq = 0
+}
+
+fn jar_slot(j: *mut Jar, i: usize) -> u64 {
+    return (*j).b.ptr + (i * COOKIE_BYTES) as u64
+}
+
+fn jar_count(j: *mut Jar) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < MAX_COOKIES {
+        if (ld(jar_slot(j, i), C_FLAGS) & F_USED) != 0 as u64 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// The cookies that are still valid right now -- the counter-check for the
+// expiry rule needs a number that CHANGES when a cookie dies.
+fn jar_live(j: *mut Jar, now: u64) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < MAX_COOKIES {
+        let r: u64 = jar_slot(j, i)
+        let f: u64 = ld(r, C_FLAGS)
+        if (f & F_USED) != 0 as u64 {
+            if (f & F_SESSION) != 0 as u64 || ld(r, C_EXPIRES) > now {
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Is `host` covered by `domain` (RFC 6265, 5.1.3)? Either the same, or
+// `host` ends in `.domain`.
+fn domain_matches(host: u64, nh: usize, dom: u64, nd: usize) -> bool {
+    if nd == 0 {
+        return false
+    }
+    if ci_eq(host, nh, dom, nd) {
+        return true
+    }
+    if nh <= nd {
+        return false
+    }
+    if rt.ld8(host, nh - nd - 1) != 46 as u8 {
+        return false
+    }
+    return ci_eq(host + (nh - nd) as u64, nd, dom, nd)
+}
+
+// RFC 6265, 5.1.4: the "cookie path" of a request, and whether a cookie's
+// path covers it.
+fn path_matches(req: u64, nr: usize, cp: u64, nc: usize) -> bool {
+    if nc == 0 {
+        return true
+    }
+    if nr < nc {
+        return false
+    }
+    var i: usize = 0
+    while i < nc {
+        if rt.ld8(req, i) != rt.ld8(cp, i) {
+            return false
+        }
+        i = i + 1
+    }
+    if nr == nc {
+        return true
+    }
+    if rt.ld8(cp, nc - 1) == 47 as u8 {
+        return true
+    }
+    return rt.ld8(req, nc) == 47 as u8
+}
+
+fn jar_find(j: *mut Jar, name: u64, nn: usize, dom: u64, nd: usize,
+    path: u64, np: usize) -> i64 {
+    var i: usize = 0
+    while i < MAX_COOKIES {
+        let r: u64 = jar_slot(j, i)
+        if (ld(r, C_FLAGS) & F_USED) != 0 as u64 {
+            if ci_eq(r + C_NAME as u64, ld(r, C_NAME_N) as usize, name, nn) &&
+            ci_eq(r + C_DOM as u64, ld(r, C_DOM_N) as usize, dom, nd) &&
+            ci_eq(r + C_PATH as u64, ld(r, C_PATH_N) as usize, path, np) {
+                return i as i64
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn jar_free_slot(j: *mut Jar) -> i64 {
+    var i: usize = 0
+    while i < MAX_COOKIES {
+        if (ld(jar_slot(j, i), C_FLAGS) & F_USED) == 0 as u64 {
+            return i as i64
+        }
+        i = i + 1
+    }
+    // full: throw the oldest one out
+    var oldest: usize = 0
+    var best: u64 = 18446744073709551615 as u64
+    var k: usize = 0
+    while k < MAX_COOKIES {
+        let s: u64 = ld(jar_slot(j, k), C_SEQ)
+        if s < best {
+            best = s
+            oldest = k
+        }
+        k = k + 1
+    }
+    return oldest as i64
+}
+
+fn skip_ws(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = i
+    while k < n && (rt.ld8(p, k) == 32 as u8 || rt.ld8(p, k) == 9 as u8) {
+        k = k + 1
+    }
+    return k
+}
+
+// One `Set-Cookie` value. `host` and `path` are those of the request the
+// answer came back on -- without them the default domain and the default
+// path cannot be worked out, and a cookie without a domain is not a cookie.
+// Returns true when something was stored (or deleted).
+fn jar_set_cookie(j: *mut Jar, v: u64, n: usize, host: u64, nh: usize,
+    reqpath: u64, nrp: usize, now: u64) -> bool {
+    // name=value up to the first ';'
+    var e: usize = 0
+    while e < n && rt.ld8(v, e) != 59 as u8 {
+        e = e + 1
+    }
+    var eq: usize = e
+    var k: usize = 0
+    while k < e {
+        if rt.ld8(v, k) == 61 as u8 {
+            eq = k
+            break
+        }
+        k = k + 1
+    }
+    if eq >= e {
+        return false // a cookie without '=' is ignored (5.2, step 3)
+    }
+    var ns: usize = skip_ws(v, n, 0)
+    var ne: usize = eq
+    while ne > ns && rt.ld8(v, ne - 1) == 32 as u8 {
+        ne = ne - 1
+    }
+    var vs: usize = skip_ws(v, n, eq + 1)
+    var ve: usize = e
+    while ve > vs && (rt.ld8(v, ve - 1) == 32 as u8 ||
+        rt.ld8(v, ve - 1) == 9 as u8) {
+        ve = ve - 1
+    }
+    if ne == ns {
+        return false
+    }
+    // A quoted value keeps its quotes in the jar and on the wire -- RFC
+    // 6265 4.1.1 makes them part of the value, not a wrapper.
+    var flags: u64 = F_USED | F_SESSION | F_HOSTONLY
+    var expires: u64 = 0
+    var dom: u64 = host
+    var nd: usize = nh
+    // the default path (5.1.4): everything up to the last '/', or "/"
+    var slash: usize = 0
+    var q: usize = 0
+    while q < nrp {
+        let c: u8 = rt.ld8(reqpath, q)
+        if c == 63 as u8 {
+            break
+        }
+        if c == 47 as u8 {
+            slash = q
+        }
+        q = q + 1
+    }
+    var pathp: u64 = reqpath
+    var npath: usize = slash
+    if npath == 0 {
+        npath = 1 // "/"
+    }
+    var have_maxage: bool = false
+    // --- the attributes
+    var at: usize = e
+    while at < n {
+        at = at + 1
+        var ae: usize = at
+        while ae < n && rt.ld8(v, ae) != 59 as u8 {
+            ae = ae + 1
+        }
+        var as0: usize = skip_ws(v, n, at)
+        var aeq: usize = ae
+        var m: usize = as0
+        while m < ae {
+            if rt.ld8(v, m) == 61 as u8 {
+                aeq = m
+                break
+            }
+            m = m + 1
+        }
+        var an: usize = aeq - as0
+        var avs: usize = skip_ws(v, n, aeq + 1)
+        var ave: usize = ae
+        while ave > avs && rt.ld8(v, ave - 1) == 32 as u8 {
+            ave = ave - 1
+        }
+        var lit_exp: [u8; 7] = "Expires"
+        var lit_max: [u8; 7] = "Max-Age"
+        var lit_dom: [u8; 6] = "Domain"
+        var lit_path: [u8; 4] = "Path"
+        var lit_sec: [u8; 6] = "Secure"
+        if ci_eq(v + as0 as u64, an, (&lit_max[0]) as u64, 7) && aeq < ae {
+            var neg: bool = false
+            var i2: usize = avs
+            if i2 < ave && rt.ld8(v, i2) == 45 as u8 {
+                neg = true
+                i2 = i2 + 1
+            }
+            var secs: u64 = 0
+            var any: bool = false
+            while i2 < ave {
+                let c: u8 = rt.ld8(v, i2)
+                if c < 48 as u8 || c > 57 as u8 {
+                    any = false
+                    break
+                }
+                any = true
+                secs = secs * 10 as u64 + (c - 48 as u8) as u64
+                i2 = i2 + 1
+            }
+            if any {
+                have_maxage = true
+                flags = flags & (18446744073709551615 as u64 - F_SESSION)
+                if neg || secs == 0 as u64 {
+                    expires = 0 // already dead: delete
+                } else {
+                    expires = now + secs
+                }
+            }
+        } else if ci_eq(v + as0 as u64, an, (&lit_exp[0]) as u64, 7) &&
+        aeq < ae && !have_maxage {
+            let t: u64 = http_date(v + avs as u64, ave - avs)
+            flags = flags & (18446744073709551615 as u64 - F_SESSION)
+            expires = t
+        } else if ci_eq(v + as0 as u64, an, (&lit_dom[0]) as u64, 6) &&
+        aeq < ae {
+            var ds: usize = avs
+            if ds < ave && rt.ld8(v, ds) == 46 as u8 {
+                ds = ds + 1
+            }
+            if ave > ds {
+                // A `Domain` that does not cover the host is refused
+                // (5.3, step 6) -- otherwise any site could set a cookie
+                // for any other.
+                if domain_matches(host, nh, v + ds as u64, ave - ds) {
+                    dom = v + ds as u64
+                    nd = ave - ds
+                    flags = flags & (18446744073709551615 as u64 - F_HOSTONLY)
+                } else {
+                    return false
+                }
+            }
+        } else if ci_eq(v + as0 as u64, an, (&lit_path[0]) as u64, 4) &&
+        aeq < ae {
+            if ave > avs && rt.ld8(v, avs) == 47 as u8 {
+                pathp = v + avs as u64
+                npath = ave - avs
+            }
+        } else if ci_eq(v + as0 as u64, an, (&lit_sec[0]) as u64, 6) {
+            flags = flags | F_SECURE
+        }
+        at = ae
+    }
+    var root: [u8; 1] = "/"
+    if npath == 1 && pathp == reqpath {
+        pathp = (&root[0]) as u64
+    }
+    let idx: i64 = jar_find(j, v + ns as u64, ne - ns, dom, nd, pathp, npath)
+    // a cookie already dead deletes instead of storing (5.3, step 11)
+    if (flags & F_SESSION) == 0 as u64 && expires <= now {
+        if idx >= 0 {
+            st(jar_slot(j, idx as usize), C_FLAGS, 0)
+        }
+        return true
+    }
+    var slot: i64 = idx
+    var keep_seq: u64 = 0
+    if slot < 0 {
+        slot = jar_free_slot(j)
+    } else {
+        // RFC 6265, 5.3 step 11: a cookie that REPLACES another keeps the
+        // other one's creation time. Without that a page that refreshes
+        // its session cookie moves it to the end of the `Cookie` header
+        // every time, and 5.4 makes that order observable.
+        keep_seq = ld(jar_slot(j, slot as usize), C_SEQ)
+    }
+    let r: u64 = jar_slot(j, slot as usize)
+    rt.mem_set(r, 0 as u8, COOKIE_BYTES)
+    if !copy_in(r, C_NAME, NAME_CAP, v + ns as u64, ne - ns) ||
+    !copy_in(r, C_VAL, VAL_CAP, v + vs as u64, ve - vs) ||
+    !copy_in(r, C_DOM, DOM_CAP, dom, nd) ||
+    !copy_in(r, C_PATH, PATH_CAP, pathp, npath) {
+        rt.mem_set(r, 0 as u8, COOKIE_BYTES)
+        (*j).dropped = (*j).dropped + 1
+        return false
+    }
+    st(r, C_FLAGS, flags)
+    st(r, C_EXPIRES, expires)
+    st(r, C_NAME_N, (ne - ns) as u64)
+    st(r, C_VAL_N, (ve - vs) as u64)
+    st(r, C_DOM_N, nd as u64)
+    st(r, C_PATH_N, npath as u64)
+    (*j).seq = (*j).seq + 1
+    if keep_seq != 0 as u64 {
+        st(r, C_SEQ, keep_seq)
+    } else {
+        st(r, C_SEQ, (*j).seq)
+    }
+    return true
+}
+
+// The `Cookie:` value for one request, without the header name. RFC 6265
+// 5.4 asks for longer paths first; equal path length keeps creation order.
+// Returns the number of cookies written.
+fn jar_header(j: *mut Jar, host: u64, nh: usize, path: u64, np: usize,
+    secure: bool, now: u64, out: *mut rt.Buf) -> usize {
+    var picked: [usize; 64] = [0; 64]
+    var count: usize = 0
+    var i: usize = 0
+    while i < MAX_COOKIES {
+        let r: u64 = jar_slot(j, i)
+        let f: u64 = ld(r, C_FLAGS)
+        if (f & F_USED) != 0 as u64 {
+            var alive: bool = (f & F_SESSION) != 0 as u64
+            if !alive {
+                alive = ld(r, C_EXPIRES) > now
+            }
+            if !alive {
+                st(r, C_FLAGS, 0)
+            } else {
+                var fits: bool = true
+                if (f & F_SECURE) != 0 as u64 && !secure {
+                    fits = false
+                }
+                let nd: usize = ld(r, C_DOM_N) as usize
+                if fits && (f & F_HOSTONLY) != 0 as u64 {
+                    fits = ci_eq(host, nh, r + C_DOM as u64, nd)
+                } else if fits {
+                    fits = domain_matches(host, nh, r + C_DOM as u64, nd)
+                }
+                if fits {
+                    fits = path_matches(path, np, r + C_PATH as u64,
+                        ld(r, C_PATH_N) as usize)
+                }
+                if fits {
+                    picked[count] = i
+                    count = count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    // insertion sort: path length falling, then sequence rising
+    var a: usize = 1
+    while a < count {
+        let cur: usize = picked[a]
+        let clen: u64 = ld(jar_slot(j, cur), C_PATH_N)
+        let cseq: u64 = ld(jar_slot(j, cur), C_SEQ)
+        var b: usize = a
+        while b > 0 {
+            let prev: usize = picked[b - 1]
+            let plen: u64 = ld(jar_slot(j, prev), C_PATH_N)
+            let pseq: u64 = ld(jar_slot(j, prev), C_SEQ)
+            var swap: bool = plen < clen
+            if plen == clen && pseq > cseq {
+                swap = true
+            }
+            if !swap {
+                break
+            }
+            picked[b] = prev
+            b = b - 1
+        }
+        picked[b] = cur
+        a = a + 1
+    }
+    var w: usize = 0
+    while w < count {
+        let r: u64 = jar_slot(j, picked[w])
+        if w > 0 {
+            rt.buf_push(out, 59 as u8)
+            rt.buf_push(out, 32 as u8)
+        }
+        rt.buf_push_bytes(out, r + C_NAME as u64, ld(r, C_NAME_N) as usize)
+        rt.buf_push(out, 61 as u8)
+        rt.buf_push_bytes(out, r + C_VAL as u64, ld(r, C_VAL_N) as usize)
+        w = w + 1
+    }
+    return count
+}
+
+// ================================================================ The cache
+
+fn cache_new() -> Cache {
+    return Cache { b: rt.buf_new(), clock: 0, hits: 0, misses: 0,
+        stores: 0, revalidated: 0, evicted: 0 }
+}
+
+fn cache_init(c: *mut Cache) -> bool {
+    rt.buf_reserve(&(*c).b, MAX_CACHE * CACHE_BYTES)
+    if (*c).b.cap < MAX_CACHE * CACHE_BYTES {
+        return false
+    }
+    rt.buf_set_len(&(*c).b, MAX_CACHE * CACHE_BYTES)
+    rt.mem_set((*c).b.ptr, 0 as u8, MAX_CACHE * CACHE_BYTES)
+    return true
+}
+
+fn cache_slot(c: *mut Cache, i: usize) -> u64 {
+    return (*c).b.ptr + (i * CACHE_BYTES) as u64
+}
+
+fn cache_clear(c: *mut Cache) {
+    var i: usize = 0
+    while i < MAX_CACHE {
+        let r: u64 = cache_slot(c, i)
+        let p: u64 = ld(r, E_BODY_P)
+        if p != 0 as u64 {
+            rt.heap_free(p, ld(r, E_BODY_C) as usize)
+        }
+        rt.mem_set(r, 0 as u8, CACHE_BYTES)
+        i = i + 1
+    }
+}
+
+fn cache_free(c: *mut Cache) {
+    if (*c).b.ptr != 0 {
+        cache_clear(c)
+    }
+    rt.buf_free(&(*c).b)
+}
+
+fn cache_count(c: *mut Cache) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < MAX_CACHE {
+        if ld(cache_slot(c, i), E_USED) != 0 as u64 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn cache_find(c: *mut Cache, url: u64, n: usize) -> i64 {
+    var i: usize = 0
+    while i < MAX_CACHE {
+        let r: u64 = cache_slot(c, i)
+        if ld(r, E_USED) != 0 as u64 {
+            let un: usize = ld(r, E_URL_N) as usize
+            if un == n && rt.mem_eq(r + E_URL as u64, url, n) {
+                return i as i64
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// The entry for a URL, or -1. `fresh` says whether it may be used WITHOUT
+// asking the server; when it is false but the entry exists, the caller
+// should revalidate with `If-None-Match`/`If-Modified-Since`.
+fn cache_lookup(c: *mut Cache, url: u64, n: usize, now: u64,
+    fresh: *mut bool) -> i64 {
+    *fresh = false
+    let i: i64 = cache_find(c, url, n)
+    if i < 0 {
+        (*c).misses = (*c).misses + 1
+        return -1
+    }
+    let r: u64 = cache_slot(c, i as usize)
+    (*c).clock = (*c).clock + 1
+    st(r, E_LAST, (*c).clock)
+    let ma: u64 = ld(r, E_MAXAGE)
+    if ma != NO_MAXAGE {
+        if now < ld(r, E_STORED) + ma {
+            *fresh = true
+            (*c).hits = (*c).hits + 1
+            return i
+        }
+    }
+    return i
+}
+
+fn cache_victim(c: *mut Cache) -> usize {
+    var i: usize = 0
+    while i < MAX_CACHE {
+        if ld(cache_slot(c, i), E_USED) == 0 as u64 {
+            return i
+        }
+        i = i + 1
+    }
+    var best: u64 = 18446744073709551615 as u64
+    var pick: usize = 0
+    var k: usize = 0
+    while k < MAX_CACHE {
+        let t: u64 = ld(cache_slot(c, k), E_LAST)
+        if t < best {
+            best = t
+            pick = k
+        }
+        k = k + 1
+    }
+    (*c).evicted = (*c).evicted + 1
+    return pick
+}
+
+// Stores an answer. `max_age` = NO_MAXAGE means "no lifetime given"; the
+// entry is then kept but never used without asking.
+fn cache_store(c: *mut Cache, url: u64, nu: usize, status: u64,
+    body: u64, nb: usize, etag: u64, ne: usize, ctype: u64, nc: usize,
+    lastmod: u64, nl: usize, max_age: u64, now: u64) -> bool {
+    if nu > URL_CAP || ne > ETAG_CAP || nc > CT_CAP || nl > LM_CAP {
+        return false
+    }
+    var idx: i64 = cache_find(c, url, nu)
+    var slot: usize = 0
+    if idx >= 0 {
+        slot = idx as usize
+    } else {
+        slot = cache_victim(c)
+    }
+    let r: u64 = cache_slot(c, slot)
+    let old: u64 = ld(r, E_BODY_P)
+    if old != 0 as u64 {
+        rt.heap_free(old, ld(r, E_BODY_C) as usize)
+    }
+    rt.mem_set(r, 0 as u8, CACHE_BYTES)
+    var p: u64 = 0
+    if nb > 0 {
+        p = rt.heap_alloc(nb)
+        if p == 0 as u64 {
+            return false
+        }
+        rt.mem_copy(p, body, nb)
+    }
+    st(r, E_USED, 1)
+    st(r, E_STATUS, status)
+    st(r, E_STORED, now)
+    st(r, E_MAXAGE, max_age)
+    st(r, E_BODY_P, p)
+    st(r, E_BODY_N, nb as u64)
+    st(r, E_BODY_C, nb as u64)
+    st(r, E_URL_N, nu as u64)
+    st(r, E_ETAG_N, ne as u64)
+    st(r, E_CT_N, nc as u64)
+    st(r, E_LM_N, nl as u64)
+    (*c).clock = (*c).clock + 1
+    st(r, E_LAST, (*c).clock)
+    rt.mem_copy(r + E_URL as u64, url, nu)
+    if ne > 0 {
+        rt.mem_copy(r + E_ETAG as u64, etag, ne)
+    }
+    if nc > 0 {
+        rt.mem_copy(r + E_CT as u64, ctype, nc)
+    }
+    if nl > 0 {
+        rt.mem_copy(r + E_LM as u64, lastmod, nl)
+    }
+    (*c).stores = (*c).stores + 1
+    return true
+}
+
+// A 304 came back: the body stays, the clock starts again.
+fn cache_touch_304(c: *mut Cache, i: usize, max_age: u64, now: u64) {
+    let r: u64 = cache_slot(c, i)
+    st(r, E_STORED, now)
+    st(r, E_MAXAGE, max_age)
+    (*c).revalidated = (*c).revalidated + 1
+}
+
+fn cache_body_ptr(c: *mut Cache, i: usize) -> u64 {
+    return ld(cache_slot(c, i), E_BODY_P)
+}
+
+fn cache_body_len(c: *mut Cache, i: usize) -> usize {
+    return ld(cache_slot(c, i), E_BODY_N) as usize
+}
+
+fn cache_status(c: *mut Cache, i: usize) -> u64 {
+    return ld(cache_slot(c, i), E_STATUS)
+}
+
+fn cache_etag_ptr(c: *mut Cache, i: usize) -> u64 {
+    return cache_slot(c, i) + E_ETAG as u64
+}
+
+fn cache_etag_len(c: *mut Cache, i: usize) -> usize {
+    return ld(cache_slot(c, i), E_ETAG_N) as usize
+}

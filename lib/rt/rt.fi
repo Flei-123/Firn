@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: MIT
+// lib/rt/rt.fi -- the runtime core, written in Firn.
+//
+// PURPOSE: `docs/SELF_HOSTING.md` 4 lists three points that block the road
+// to stage 1 the hardest:
+//
+//   1. heap allocator          -- without it no `Vec`, no AST, no table
+//   5. text formatting         -- every diagnostic, the whole assembler text
+//  12. file access             -- read the source, write the `.s`
+//
+// All three live here. Before, they existed THREE TIMES over and slightly
+// differently -- in `lib/html/mem.fi`, `lib/str/alloc.fi` and `lib/gc/gc.fi`.
+// This file is the shared version; the existing modules stay where they are
+// for now (rebuilding them would be a step of its own with a risk of its own
+// and is listed as open in `docs/SELF_HOSTING.md`).
+//
+// NO libc. Everything goes straight through `syscall`.
+
+export {
+    Buf,
+    heap_alloc, heap_free, mem_copy, mem_set, mem_eq,
+    buf_new, buf_free, buf_clear, buf_reserve, buf_push, buf_push_bytes,
+    buf_len, buf_at, buf_ptr, buf_data, buf_set_len,
+    buf_push_dec_u64, buf_push_dec_i64, buf_push_hex_u64,
+    write_everything, read_file, read_stdin, finish,
+    arg_count, arg_ptr, c_length,
+    write_file, run, run3,
+    ld8, st8, ld16, st16, ld32, st32, ld64, st64,
+    // round 69 -- the address as a type
+    addr_of, ptr_of,
+}
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_MMAP: i64 = 9
+const SYS_MUNMAP: i64 = 11
+const SYS_EXIT_GROUP: i64 = 231
+
+const PROT_RW: i64 = 3
+const MAP_PRIVATE_ANON: i64 = 34
+const PAGE: usize = 4096
+
+// -------------------------------------------------------------- Raw access
+
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn st8(p: u64, i: usize, v: u8) {
+    *((p + i as u64) as *mut u8) = v
+}
+
+fn ld16(p: u64, i: usize) -> u16 {
+    return *((p + i as u64 * 2) as *mut u16)
+}
+
+fn st16(p: u64, i: usize, v: u16) {
+    *((p + i as u64 * 2) as *mut u16) = v
+}
+
+fn ld32(p: u64, i: usize) -> u32 {
+    return *((p + i as u64 * 4) as *mut u32)
+}
+
+fn st32(p: u64, i: usize, v: u32) {
+    *((p + i as u64 * 4) as *mut u32) = v
+}
+
+fn ld64(p: u64, i: usize) -> u64 {
+    return *((p + i as u64 * 8) as *mut u64)
+}
+
+fn st64(p: u64, i: usize, v: u64) {
+    *((p + i as u64 * 8) as *mut u64) = v
+}
+
+// ------------------------------------------------------------------ Memory
+
+fn pages_on(n: usize) -> usize {
+    return (n + PAGE - 1) / PAGE * PAGE
+}
+
+// n bytes from the operating system, zero initialized. 0 = failed.
+//
+// WITHOUT a fixed address, without MAP_FIXED -- an allocator that picks its
+// own address will sooner or later collide with something else.
+fn heap_alloc(n: usize) -> u64 {
+    if n == 0 {
+        return 0
+    }
+    let len: usize = pages_on(n)
+    let r: i64 = syscall(SYS_MMAP, 0, len as i64, PROT_RW, MAP_PRIVATE_ANON, -1, 0)
+    // mmap reports failure as -1 .. -4095
+    if r < 0 && r > 0 - 4096 {
+        return 0
+    }
+    if r == 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn heap_free(p: u64, n: usize) {
+    if p == 0 {
+        return
+    }
+    syscall(SYS_MUNMAP, p as i64, pages_on(n) as i64, 0, 0, 0, 0)
+}
+
+fn mem_copy(target: u64, source: u64, n: usize) {
+    // Word by word for as long as possible -- that is the common case for buffers.
+    var i: usize = 0
+    while i + 8 <= n {
+        st64(target, i / 8, ld64(source, i / 8))
+        i = i + 8
+    }
+    while i < n {
+        st8(target, i, ld8(source, i))
+        i = i + 1
+    }
+}
+
+fn mem_set(target: u64, value: u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        st8(target, i, value)
+        i = i + 1
+    }
+}
+
+fn mem_eq(a: u64, b: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if ld8(a, i) != ld8(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------------ Buffer
+
+// A growing byte array -- the basis for everything that is called `Vec` in stage 1.
+struct Buf {
+    ptr: u64,
+    len: usize,
+    cap: usize,
+}
+
+fn buf_new() -> Buf {
+    return Buf { ptr: 0, len: 0, cap: 0 }
+}
+
+fn buf_free(b: *mut Buf) {
+    heap_free((*b).ptr, (*b).cap)
+    (*b).ptr = 0
+    (*b).len = 0
+    (*b).cap = 0
+}
+
+fn buf_clear(b: *mut Buf) {
+    (*b).len = 0
+}
+
+fn buf_len(b: *mut Buf) -> usize {
+    return (*b).len
+}
+
+// ------------------------------------------- The address as a TYPE (round 69)
+//
+// `rt` came into being before `str` and carries an address as a bare `u64`;
+// `str` and `num` carry it as `*mut u8`. OUTWARD there is now exactly one
+// form, and it is `*mut u8` (the reasons are in docs/ROUND69.md). The three
+// functions here are the whole bridge -- they compute nothing, they only
+// give the same address its honest type.
+//
+// `buf_ptr` STAYS and becomes a thin shell over `buf_data`: every existing
+// caller keeps working, and there is no second place where the address of a
+// buffer is read.
+
+// A bare number as a typed address.
+fn ptr_of(a: u64) -> *mut u8 {
+    return a as *mut u8
+}
+
+// A typed address as a bare number -- for the `u64` forms of `rt` and for
+// `syscall`, which knows numbers only.
+fn addr_of(p: *mut u8) -> u64 {
+    return p as u64
+}
+
+// The contents of a buffer as a TYPED address: the form `str` and `num`
+// expect. Whoever uses this never writes `as *mut u8` again.
+fn buf_data(b: *mut Buf) -> *mut u8 {
+    return ptr_of((*b).ptr)
+}
+
+fn buf_ptr(b: *mut Buf) -> u64 {
+    return addr_of(buf_data(b))
+}
+
+fn buf_set_len(b: *mut Buf, n: usize) {
+    if n <= (*b).cap {
+        (*b).len = n
+    }
+}
+
+fn buf_at(b: *mut Buf, i: usize) -> u8 {
+    if i >= (*b).len {
+        return 0 as u8
+    }
+    return ld8((*b).ptr, i)
+}
+
+// Growing doubles the size -- that keeps the number of copies logarithmic.
+fn buf_grow(b: *mut Buf, needed: usize) {
+    var cap: usize = (*b).cap
+    if cap == 0 {
+        cap = 64
+    }
+    while cap < needed {
+        cap = cap * 2
+    }
+    let new: u64 = heap_alloc(cap)
+    if new == 0 {
+        return
+    }
+    if (*b).len > 0 {
+        mem_copy(new, (*b).ptr, (*b).len)
+    }
+    heap_free((*b).ptr, (*b).cap)
+    (*b).ptr = new
+    (*b).cap = cap
+}
+
+fn buf_reserve(b: *mut Buf, needed: usize) {
+    if (*b).cap >= needed {
+        return
+    }
+    buf_grow(b, needed)
+}
+
+// THE FAST PATH ON TOP: only the comparison lives here, the growing is a
+// function of its own. That keeps `buf_push` small enough to inline -- measured
+// during round 6, the capacity checks otherwise made up 33 % of all
+// instructions of the tokenizer.
+fn buf_push(b: *mut Buf, v: u8) {
+    if (*b).len >= (*b).cap {
+        buf_grow(b, (*b).len + 1)
+    }
+    if (*b).len < (*b).cap {
+        st8((*b).ptr, (*b).len, v)
+        (*b).len = (*b).len + 1
+    }
+}
+
+fn buf_push_bytes(b: *mut Buf, p: u64, n: usize) {
+    buf_reserve(b, (*b).len + n)
+    if (*b).len + n > (*b).cap {
+        return
+    }
+    mem_copy((*b).ptr + (*b).len as u64, p, n)
+    (*b).len = (*b).len + n
+}
+
+// ---------------------------------------------------------- Number -> text
+
+fn buf_push_dec_u64(b: *mut Buf, v: u64) {
+    if v == 0 {
+        buf_push(b, 48 as u8)
+        return
+    }
+    var d: [u8; 20] = [0 as u8; 20]
+    var n: usize = 0
+    var x: u64 = v
+    while x > 0 {
+        d[n] = (x % 10) as u8 + 48 as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        buf_push(b, d[n])
+    }
+}
+
+fn buf_push_dec_i64(b: *mut Buf, v: i64) {
+    if v < 0 {
+        buf_push(b, 45 as u8)
+        // Careful at the edge: `-(i64::MIN)` does not fit into an i64, the detour
+        // over u64 does.
+        buf_push_dec_u64(b, (0 - (v + 1)) as u64 + 1)
+        return
+    }
+    buf_push_dec_u64(b, v as u64)
+}
+
+fn buf_push_hex_u64(b: *mut Buf, v: u64, min: usize) {
+    var d: [u8; 16] = [0 as u8; 16]
+    var n: usize = 0
+    var x: u64 = v
+    while x > 0 {
+        let z: u64 = x & 15
+        if z < 10 {
+            d[n] = z as u8 + 48 as u8
+        } else {
+            d[n] = z as u8 + 87 as u8
+        }
+        x = x >> 4
+        n = n + 1
+    }
+    while n < min {
+        d[n] = 48 as u8
+        n = n + 1
+    }
+    if n == 0 {
+        buf_push(b, 48 as u8)
+        return
+    }
+    while n > 0 {
+        n = n - 1
+        buf_push(b, d[n])
+    }
+}
+
+// ------------------------------------------------------------ Input/output
+
+// Writes completely -- one `write` may write less than asked for.
+fn write_everything(fd: i64, p: u64, n: usize) -> bool {
+    var written: usize = 0
+    while written < n {
+        let r: i64 = syscall(
+            SYS_WRITE,
+            fd,
+            (p + written as u64) as i64,
+            (n - written) as i64,
+            0,
+            0,
+            0,
+        )
+        if r <= 0 {
+            return false
+        }
+        written = written + r as usize
+    }
+    return true
+}
+
+// Reads a file descriptor to the end into the buffer.
+fn read_fd(fd: i64, out: *mut Buf) -> bool {
+    var runs: bool = true
+    while runs {
+        buf_reserve(out, buf_len(out) + 65536)
+        if buf_len(out) + 65536 > (*out).cap {
+            return false
+        }
+        let r: i64 = syscall(
+            SYS_READ,
+            fd,
+            (buf_ptr(out) + buf_len(out) as u64) as i64,
+            65536,
+            0,
+            0,
+            0,
+        )
+        if r < 0 {
+            return false
+        }
+        if r == 0 {
+            runs = false
+        } else {
+            (*out).len = (*out).len + r as usize
+        }
+    }
+    return true
+}
+
+fn read_stdin(out: *mut Buf) -> bool {
+    return read_fd(0, out)
+}
+
+// Reads a whole file. `path` points at a null terminated sequence.
+fn read_file(path: u64, out: *mut Buf) -> bool {
+    let fd: i64 = syscall(SYS_OPEN, path as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    let ok: bool = read_fd(fd, out)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return ok
+}
+
+fn finish(code: i64) {
+    syscall(SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}
+
+// ---------------------------------------------------------- Call arguments
+//
+// `fn main(start: u64) -> i32` receives the START BLOCK of the process in
+// `rdi` (`_start` puts `rsp` there, codegen_x86.rs). The block looks like this:
+//
+//     [argc][argv0][argv1]..[argvN][0][envp0]..[0][auxv..]
+//
+// Every string is terminated by a null octet -- exactly the form that
+// `read_file` expects. That lets a Firn program open a file whose name it
+// received on the command line.
+
+fn arg_count(start: u64) -> usize {
+    if start == 0 {
+        return 0
+    }
+    return ld64(start, 0) as usize
+}
+
+// Argument `i` (0 = the program name itself). 0 if there is none.
+fn arg_ptr(start: u64, i: usize) -> u64 {
+    if start == 0 || i >= arg_count(start) {
+        return 0
+    }
+    return ld64(start, 1 + i)
+}
+
+// The length of a null terminated string.
+fn c_length(p: u64) -> usize {
+    if p == 0 {
+        return 0
+    }
+    var n: usize = 0
+    while ld8(p, n) != 0 as u8 {
+        n = n + 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------- Writing a file
+//
+// `open` with O_WRONLY|O_CREAT|O_TRUNC and mode 0755 -- with it the compiler
+// creates both the `.s` file and (through `ld`) the result.
+
+const O_WRITE: i64 = 577 // O_WRONLY|O_CREAT|O_TRUNC
+const RECHTE: i64 = 493 // 0755
+
+fn write_file(path: u64, p: u64, n: usize) -> bool {
+    let fd: i64 = syscall(SYS_OPEN, path as i64, O_WRITE, RECHTE, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    let ok: bool = write_everything(fd, p, n)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return ok
+}
+
+// ------------------------------------------------------ Starting a process
+//
+// Point 11 of the list in `docs/SELF_HOSTING.md`: without `fork`/`execve` a
+// compiler cannot call `as` and `ld` -- and then it is not a compiler but a
+// text tool.
+//
+// On x86-64 `fork` is `clone` with the same flags as
+// `SIGCHLD` -- but the system call `fork` (57) still exists and is
+// the simpler way here.
+//
+// Return value: the EXIT STATUS of the child (0 = fine), or -1.
+
+const SYS_FORK: i64 = 57
+const SYS_EXECVE: i64 = 59
+const SYS_WAIT4: i64 = 61
+
+fn run(path: u64, argv: u64) -> i64 {
+    let kind: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+    if kind < 0 {
+        return -1
+    }
+    if kind == 0 {
+        // Inside the child: replace our own program by `path`. If `execve` comes
+        // back, it failed -- and then the child must NOT keep running, otherwise
+        // the compiler would exist twice.
+        syscall(SYS_EXECVE, path as i64, argv as i64, 0, 0, 0, 0)
+        finish(127)
+    }
+    var status: i32 = 0
+    let r: i64 = syscall(SYS_WAIT4, kind, (&status) as i64, 0, 0, 0, 0)
+    if r < 0 {
+        return -1
+    }
+    // A normal exit: the upper eight bit of the lower word are the code.
+    if (status & 127) == 0 {
+        return ((status >> 8) & 255) as i64
+    }
+    return -1
+}
+
+// A convenient call with up to three arguments after the program name.
+// Every pointer has to point at a NULL TERMINATED string.
+fn run3(path: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    // argv is a null terminated array of pointers.
+    var field: [u64; 5] = [0; 5]
+    field[0] = path
+    var n: usize = 1
+    if a1 != 0 {
+        field[n] = a1
+        n = n + 1
+    }
+    if a2 != 0 {
+        field[n] = a2
+        n = n + 1
+    }
+    if a3 != 0 {
+        field[n] = a3
+        n = n + 1
+    }
+    field[n] = 0
+    return run(path, (&field[0]) as u64)
+}

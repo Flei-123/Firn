@@ -1,0 +1,1227 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/tls/tls.fi -- a TLS 1.3 client (RFC 8446), round B5.
+//
+// Round B4 refused `https://` on purpose and wrote down what it would
+// take. This is that: the record layer, the handshake, and the point where
+// the certificate chain of `x509.fi` is actually consulted.
+//
+// ============================================================== THE SHAPE
+//
+// TLS 1.3 is one round trip. The client sends everything it can offer at
+// once -- versions, cipher suites, groups, AND a key share for the group it
+// expects to be chosen. The server answers with its own share, and from
+// that moment on EVERYTHING is encrypted, including the server's
+// certificate. Compare TLS 1.2, where the certificate travelled in the
+// clear and a passive observer learned which site was being visited from
+// it; here they learn it only from the SNI in the ClientHello, which is
+// the one thing still in the open.
+//
+//     -> ClientHello            + key_share
+//     <- ServerHello            + key_share
+//        --- from here on encrypted with the handshake keys ---
+//     <- EncryptedExtensions
+//     <- Certificate
+//     <- CertificateVerify      the proof that the peer holds the key
+//     <- Finished               the proof that the transcript was not touched
+//     -> Finished
+//        --- from here on encrypted with the application keys ---
+//
+// THE TWO SIGNATURES DO DIFFERENT JOBS and both are checked here:
+//   * the certificate chain says WHO the key belongs to
+//     (`x509.verify_chain`);
+//   * `CertificateVerify` says the peer HOLDS that key, by signing the
+//     transcript so far. Without it, anybody could replay a certificate
+//     they picked up somewhere.
+//   * `Finished` says the whole transcript arrived unmodified, keyed with
+//     a secret that only the two ends have. That is what makes a downgrade
+//     impossible: a man in the middle who strips a cipher suite out of the
+//     ClientHello changes the transcript, and the MAC no longer matches.
+//
+// ========================================================== WHAT IS OFFERED
+//
+// Two cipher suites -- `TLS_AES_128_GCM_SHA256` (mandatory, RFC 8446 9.1)
+// and `TLS_CHACHA20_POLY1305_SHA256` -- and one group, X25519. That is a
+// deliberately narrow offer. Every group and suite in a ClientHello is a
+// code path that has to be right; three groups and five suites would be
+// fifteen combinations to test and one of them would be wrong. X25519 is
+// supported by every TLS 1.3 server there is, so the narrow offer costs
+// nothing measurable and the acceptance run says so: it drives this client
+// against `openssl s_server` AND against real hosts on the public
+// internet.
+//
+// ==================================================================== HONEST
+//
+// T1 NO SESSION RESUMPTION, no 0-RTT, no PSK. Every connection is a full
+//    handshake. `NewSessionTicket` is read and thrown away.
+// T2 NO KEY UPDATE (see `keys.fi` K2). A `key_update` from the server ends
+//    the connection with an alert instead of being ignored.
+// T3 NO CLIENT CERTIFICATE. A `CertificateRequest` is answered with an
+//    empty Certificate message, which is what a client without one must
+//    do -- not with an alert, because plenty of servers ask optionally.
+// T4 NO HELLO RETRY REQUEST. It is DETECTED (the magic random of
+//    RFC 8446 4.1.3) and reported as `Retry`, not misread as a
+//    ServerHello. Since only X25519 is offered and every server has it,
+//    the only reason left is a cookie, which no ordinary web server
+//    sends.
+// T5 THE RECORD LAYER DOES NOT PAD. Outgoing records carry exactly their
+//    content plus the one type octet. Padding would hide the length of a
+//    request from a passive observer; not padding is what every browser
+//    does today and what this round measures.
+// T6 A CLOSE WITHOUT `close_notify` is reported as a clean end of stream
+//    for the body, because a large part of the web does exactly that and
+//    treating it as an error means failing on pages that work everywhere
+//    else. It is noted in `tls_truncated` so that a caller who cares --
+//    one that has a Content-Length, say -- can tell the difference.
+import std.rt
+import std.net
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.rsa
+import std.crypto.ecdsa
+import tls.keys
+import tls.x509
+
+export {
+    TlsError, Tls,
+    tls_new, tls_init, tls_free, tls_handshake, tls_read, tls_write,
+    tls_close, tls_established, tls_verify_reason, tls_suite,
+    tls_alpn_ptr, tls_alpn_len, tls_truncated, tls_records_in,
+    tls_records_out, tls_handshake_bytes, tls_peer_cert_count,
+    tls_alert_desc, tls_chain_depth, tls_err_num, tls_err_name,
+    tls_fail_into, tls_fail_len,
+    SUITE_AES128GCM, SUITE_CHACHA20,
+}
+
+error TlsError {
+    Io, // the socket failed
+    Closed, // the peer went away in the middle of the handshake
+    Protocol, // a message this client cannot make sense of
+    Version, // the server did not choose TLS 1.3
+    Group, // the server chose a group that was not offered
+    Suite, // ... or a cipher suite that was not offered
+    Retry, // HelloRetryRequest -- see T4
+    Alert, // the server sent a fatal alert
+    Certificate, // the chain did not verify; the reason is in `verify`
+    Signature, // CertificateVerify did not check out
+    Finished, // the transcript MAC did not match
+    Decrypt, // a record did not authenticate
+    Unsupported, // an algorithm this round does not have
+    TooLarge,
+    Random, // the kernel would not give randomness
+}
+
+const SUITE_AES128GCM: u32 = 4865 // 0x1301
+const SUITE_CHACHA20: u32 = 4867 // 0x1303
+
+const REC_CHANGE_CIPHER: u32 = 20
+const REC_ALERT: u32 = 21
+const REC_HANDSHAKE: u32 = 22
+const REC_APPDATA: u32 = 23
+
+const HS_CLIENT_HELLO: u32 = 1
+const HS_SERVER_HELLO: u32 = 2
+const HS_NEW_TICKET: u32 = 4
+const HS_ENCRYPTED_EXT: u32 = 8
+const HS_CERTIFICATE: u32 = 11
+const HS_CERT_REQUEST: u32 = 13
+const HS_CERT_VERIFY: u32 = 15
+const HS_FINISHED: u32 = 20
+const HS_KEY_UPDATE: u32 = 24
+
+const MAX_RECORD: usize = 16640 // 2^14 plus the AEAD expansion
+const MAX_HANDSHAKE: usize = 65536
+const MAX_CERTS: usize = 10
+
+struct Tls {
+    conn: *mut net.Conn,
+    store: *mut x509.Store,
+    rbuf: rt.Buf, // raw octets from the socket
+    rpos: usize,
+    rec: rt.Buf, // the current record, decrypted
+    hsin: rt.Buf, // handshake octets not yet cut into messages
+    hspos: usize,
+    // The Certificate message, copied out of `hsin` and kept still. The
+    // `Cert` structures point INTO it, and `hsin` is compacted and
+    // reallocated while the rest of the handshake arrives -- so parsing
+    // the certificates where they landed leaves every one of those
+    // pointers dangling. That is not a hypothetical: it is what made the
+    // first run of this client report `Signature` on a handshake whose
+    // signature was perfectly good.
+    certbuf: rt.Buf,
+    tr: rt.Buf, // the transcript: every handshake message, in order
+    app: rt.Buf, // decrypted application data waiting for the caller
+    apos: usize,
+    host: [u8; 256],
+    hostlen: usize,
+    alpn: [u8; 32],
+    alpnlen: usize,
+    suite: u32,
+    keylen: usize,
+    ckey: [u8; 32],
+    civ: [u8; 12],
+    cseq: u64,
+    skey: [u8; 32],
+    siv: [u8; 12],
+    sseq: u64,
+    have_keys: bool,
+    hs_secret: [u8; 32],
+    ms_secret: [u8; 32],
+    c_hs_secret: [u8; 32],
+    s_hs_secret: [u8; 32],
+    priv: [u8; 32],
+    pub_key: [u8; 32],
+    established: bool,
+    truncated: bool,
+    closed: bool,
+    verify: u32,
+    chain_depth: usize,
+    ncerts: usize,
+    alert_desc: u32,
+    now: u64,
+    records_in: usize,
+    records_out: usize,
+    hs_bytes: usize,
+}
+
+fn tls_new() -> Tls {
+    return Tls { conn: 0 as *mut net.Conn, store: 0 as *mut x509.Store,
+        rbuf: rt.buf_new(), rpos: 0, rec: rt.buf_new(),
+        hsin: rt.buf_new(), hspos: 0, certbuf: rt.buf_new(),
+        tr: rt.buf_new(), app: rt.buf_new(),
+        apos: 0, host: [0; 256], hostlen: 0, alpn: [0; 32], alpnlen: 0,
+        suite: 0, keylen: 0, ckey: [0; 32], civ: [0; 12], cseq: 0,
+        skey: [0; 32], siv: [0; 12], sseq: 0, have_keys: false,
+        hs_secret: [0; 32], ms_secret: [0; 32], c_hs_secret: [0; 32],
+        s_hs_secret: [0; 32], priv: [0; 32], pub_key: [0; 32],
+        established: false, truncated: false, closed: false,
+        verify: x509.V_PARSE, chain_depth: 0, ncerts: 0, alert_desc: 0,
+        now: 0, records_in: 0, records_out: 0, hs_bytes: 0 }
+}
+
+fn tls_init(t: *mut Tls, conn: *mut net.Conn, store: *mut x509.Store,
+    host: u64, hostlen: usize, now: u64) -> bool {
+    if hostlen > 255 {
+        return false
+    }
+    (*t).conn = conn
+    (*t).store = store
+    var i: usize = 0
+    while i < hostlen {
+        (*t).host[i] = rt.ld8(host, i)
+        i = i + 1
+    }
+    (*t).hostlen = hostlen
+    (*t).now = now
+    return true
+}
+
+fn tls_free(t: *mut Tls) {
+    rt.buf_free(&(*t).rbuf)
+    rt.buf_free(&(*t).rec)
+    rt.buf_free(&(*t).hsin)
+    rt.buf_free(&(*t).certbuf)
+    rt.buf_free(&(*t).tr)
+    rt.buf_free(&(*t).app)
+}
+
+fn tls_established(t: *mut Tls) -> bool {
+    return (*t).established
+}
+
+fn tls_verify_reason(t: *mut Tls) -> u32 {
+    return (*t).verify
+}
+
+fn tls_chain_depth(t: *mut Tls) -> usize {
+    return (*t).chain_depth
+}
+
+fn tls_peer_cert_count(t: *mut Tls) -> usize {
+    return (*t).ncerts
+}
+
+fn tls_suite(t: *mut Tls) -> u32 {
+    return (*t).suite
+}
+
+fn tls_alpn_ptr(t: *mut Tls) -> u64 {
+    return (&(*t).alpn[0]) as u64
+}
+
+fn tls_alpn_len(t: *mut Tls) -> usize {
+    return (*t).alpnlen
+}
+
+fn tls_truncated(t: *mut Tls) -> bool {
+    return (*t).truncated
+}
+
+fn tls_records_in(t: *mut Tls) -> usize {
+    return (*t).records_in
+}
+
+fn tls_records_out(t: *mut Tls) -> usize {
+    return (*t).records_out
+}
+
+fn tls_handshake_bytes(t: *mut Tls) -> usize {
+    return (*t).hs_bytes
+}
+
+fn tls_alert_desc(t: *mut Tls) -> u32 {
+    return (*t).alert_desc
+}
+
+// ------------------------------------------------------------- The socket
+
+const RD_ERR: usize = 18446744073709551615
+
+// Ensures at least `need` octets stand at `rpos`. False at a clean end of
+// stream; `err` tells a failure apart from an end.
+fn fill(t: *mut Tls, need: usize, err: *mut bool) -> bool {
+    *err = false
+    while (*t).rbuf.len - (*t).rpos < need {
+        // compact, so that a long connection does not grow the buffer
+        if (*t).rpos > 0 && (*t).rpos == (*t).rbuf.len {
+            rt.buf_clear(&(*t).rbuf)
+            (*t).rpos = 0
+        }
+        let have: usize = (*t).rbuf.len
+        rt.buf_reserve(&(*t).rbuf, have + MAX_RECORD)
+        if (*t).rbuf.cap < have + MAX_RECORD {
+            *err = true
+            return false
+        }
+        let k: usize = net.read((*t).conn, (*t).rbuf.ptr + have as u64,
+            MAX_RECORD) catch RD_ERR
+        if k == RD_ERR {
+            *err = true
+            return false
+        }
+        if k == 0 {
+            return false
+        }
+        rt.buf_set_len(&(*t).rbuf, have + k)
+    }
+    return true
+}
+
+fn send_raw(t: *mut Tls, p: u64, n: usize) -> bool {
+    let k: usize = net.write_all((*t).conn, p, n) catch RD_ERR
+    return k == n
+}
+
+// -------------------------------------------------------- The record layer
+
+fn be16(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 8) | (rt.ld8(p, off + 1) as u32)
+}
+
+fn be24(p: u64, off: usize) -> usize {
+    return ((rt.ld8(p, off) as usize) << 16)
+    | ((rt.ld8(p, off + 1) as usize) << 8) | (rt.ld8(p, off + 2) as usize)
+}
+
+fn push16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn push24(b: *mut rt.Buf, v: usize) {
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, (v & 255) as u8)
+}
+
+// The per-record nonce: the static IV xored with the sequence number,
+// right-aligned (RFC 8446 5.3). The sequence number is NEVER sent -- both
+// ends count, and a record that arrives out of order simply fails to
+// decrypt, which is what makes a replay impossible.
+fn make_nonce(iv: u64, seq: u64, out: u64) {
+    var i: usize = 0
+    while i < 12 {
+        rt.st8(out, i, rt.ld8(iv, i))
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        let sh: u64 = ((7 - i) as u64) * 8
+        let b: u8 = ((seq >> sh) & 255 as u64) as u8
+        rt.st8(out, 4 + i, rt.ld8(out, 4 + i) ^ b)
+        i = i + 1
+    }
+}
+
+fn aead_open_suite(t: *mut Tls, nonce: u64, aad: u64, na: usize,
+    ct: u64, n: usize, out: u64) -> bool {
+    if (*t).suite == SUITE_CHACHA20 {
+        return chacha.aead_open((&(*t).skey[0]) as u64, nonce, aad, na,
+            ct, n, out)
+    }
+    return gcm.gcm_open((&(*t).skey[0]) as u64, (*t).keylen, nonce, aad, na,
+        ct, n, out)
+}
+
+fn aead_seal_suite(t: *mut Tls, nonce: u64, aad: u64, na: usize,
+    plain: u64, n: usize, out: u64) -> bool {
+    if (*t).suite == SUITE_CHACHA20 {
+        chacha.aead_seal((&(*t).ckey[0]) as u64, nonce, aad, na, plain, n,
+            out)
+        return true
+    }
+    return gcm.gcm_seal((&(*t).ckey[0]) as u64, (*t).keylen, nonce, aad, na,
+        plain, n, out)
+}
+
+// Reads ONE record. `kind` comes back as the real content type (after
+// decryption, that is the last non-zero octet of the inner plaintext), and
+// the contents land in `t.rec`.
+fn read_record(t: *mut Tls, kind: *mut u32) -> TlsError!bool {
+    var err: bool = false
+    if !fill(t, 5, &err) {
+        if err {
+            return TlsError::Io
+        }
+        return TlsError::Closed
+    }
+    let base: u64 = (*t).rbuf.ptr + (*t).rpos as u64
+    let ctype: u32 = rt.ld8(base, 0) as u32
+    let len: usize = be16(base, 3) as usize
+    if len > MAX_RECORD {
+        return TlsError::TooLarge
+    }
+    if !fill(t, 5 + len, &err) {
+        if err {
+            return TlsError::Io
+        }
+        return TlsError::Closed
+    }
+    let body: u64 = (*t).rbuf.ptr + ((*t).rpos + 5) as u64
+    let head: u64 = (*t).rbuf.ptr + (*t).rpos as u64
+    (*t).records_in = (*t).records_in + 1
+    rt.buf_clear(&(*t).rec)
+    if !(*t).have_keys || ctype != REC_APPDATA {
+        // A change_cipher_spec in the middle of a TLS 1.3 handshake is
+        // "middlebox compatibility" and means nothing (RFC 8446 5). It is
+        // dropped here rather than passed on.
+        rt.buf_push_bytes(&(*t).rec, body, len)
+        *kind = ctype
+        (*t).rpos = (*t).rpos + 5 + len
+        return true
+    }
+    if len < 17 {
+        return TlsError::Decrypt
+    }
+    var nonce: [u8; 12] = [0; 12]
+    make_nonce((&(*t).siv[0]) as u64, (*t).sseq, (&nonce[0]) as u64)
+    rt.buf_reserve(&(*t).rec, len)
+    if (*t).rec.cap < len {
+        return TlsError::TooLarge
+    }
+    if !aead_open_suite(t, (&nonce[0]) as u64, head, 5, body, len,
+        (*t).rec.ptr) {
+        return TlsError::Decrypt
+    }
+    (*t).sseq = (*t).sseq + 1 as u64
+    var plen: usize = len - 16
+    rt.buf_set_len(&(*t).rec, plen)
+    // the inner content type is the last octet that is not zero padding
+    while plen > 0 && rt.ld8((*t).rec.ptr, plen - 1) == 0 as u8 {
+        plen = plen - 1
+    }
+    if plen == 0 {
+        return TlsError::Protocol
+    }
+    *kind = rt.ld8((*t).rec.ptr, plen - 1) as u32
+    rt.buf_set_len(&(*t).rec, plen - 1)
+    (*t).rpos = (*t).rpos + 5 + len
+    return true
+}
+
+fn write_record(t: *mut Tls, kind: u32, p: u64, n: usize) -> bool {
+    var out: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    if !(*t).have_keys {
+        rt.buf_push(&out, kind as u8)
+        push16(&out, 771 as u32) // legacy_record_version 0x0303
+        push16(&out, n as u32)
+        rt.buf_push_bytes(&out, p, n)
+        ok = send_raw(t, out.ptr, out.len)
+    } else {
+        var inner: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&inner, p, n)
+        rt.buf_push(&inner, kind as u8) // T5: no padding after it
+        var head: [u8; 5] = [0; 5]
+        head[0] = REC_APPDATA as u8
+        head[1] = 3 as u8
+        head[2] = 3 as u8
+        let clen: usize = inner.len + 16
+        head[3] = ((clen >> 8) & 255) as u8
+        head[4] = (clen & 255) as u8
+        var nonce: [u8; 12] = [0; 12]
+        make_nonce((&(*t).civ[0]) as u64, (*t).cseq, (&nonce[0]) as u64)
+        rt.buf_push_bytes(&out, (&head[0]) as u64, 5)
+        let at: usize = out.len
+        rt.buf_reserve(&out, at + clen)
+        rt.buf_set_len(&out, at + clen)
+        if !aead_seal_suite(t, (&nonce[0]) as u64, (&head[0]) as u64, 5,
+            inner.ptr, inner.len, out.ptr + at as u64) {
+            ok = false
+        }
+        rt.buf_free(&inner)
+        if ok {
+            (*t).cseq = (*t).cseq + 1 as u64
+            ok = send_raw(t, out.ptr, out.len)
+        }
+    }
+    rt.buf_free(&out)
+    if ok {
+        (*t).records_out = (*t).records_out + 1
+    }
+    return ok
+}
+
+// --------------------------------------------------- The handshake stream
+
+// Reads records until a whole handshake message stands in `t.hsin`, then
+// hands back where its BODY is. The message including its four octet
+// header goes into the transcript.
+fn next_handshake(t: *mut Tls, htype: *mut u32, off: *mut usize,
+    len: *mut usize) -> TlsError!bool {
+    while true {
+        let have: usize = (*t).hsin.len - (*t).hspos
+        if have >= 4 {
+            let base: u64 = (*t).hsin.ptr + (*t).hspos as u64
+            let body: usize = be24(base, 1)
+            if body > MAX_HANDSHAKE {
+                return TlsError::TooLarge
+            }
+            if have >= 4 + body {
+                *htype = rt.ld8(base, 0) as u32
+                rt.buf_push_bytes(&(*t).tr, base, 4 + body)
+                (*t).hs_bytes = (*t).hs_bytes + 4 + body
+                *off = (*t).hspos + 4
+                *len = body
+                (*t).hspos = (*t).hspos + 4 + body
+                return true
+            }
+        }
+        // compact what has been consumed
+        if (*t).hspos > 0 {
+            let rest: usize = (*t).hsin.len - (*t).hspos
+            var k: usize = 0
+            while k < rest {
+                rt.st8((*t).hsin.ptr, k,
+                    rt.ld8((*t).hsin.ptr, (*t).hspos + k))
+                k = k + 1
+            }
+            rt.buf_set_len(&(*t).hsin, rest)
+            (*t).hspos = 0
+        }
+        var kind: u32 = 0
+        let got: bool = try read_record(t, &kind)
+        if kind == REC_CHANGE_CIPHER {
+            continue
+        }
+        if kind == REC_ALERT {
+            if (*t).rec.len >= 2 {
+                (*t).alert_desc = rt.ld8((*t).rec.ptr, 1) as u32
+            }
+            return TlsError::Alert
+        }
+        if kind != REC_HANDSHAKE {
+            return TlsError::Protocol
+        }
+        rt.buf_push_bytes(&(*t).hsin, (*t).rec.ptr, (*t).rec.len)
+    }
+    return TlsError::Protocol
+}
+
+// ------------------------------------------------------------ ClientHello
+
+fn build_client_hello(t: *mut Tls, out: *mut rt.Buf) -> bool {
+    var rnd: [u8; 32] = [0; 32]
+    var sid: [u8; 32] = [0; 32]
+    if !random.random_bytes((&rnd[0]) as u64, 32) {
+        return false
+    }
+    if !random.random_bytes((&sid[0]) as u64, 32) {
+        return false
+    }
+    var body: rt.Buf = rt.buf_new()
+    push16(&body, 771 as u32) // legacy_version TLS 1.2, per RFC 8446 4.1.2
+    rt.buf_push_bytes(&body, (&rnd[0]) as u64, 32)
+    rt.buf_push(&body, 32 as u8) // legacy_session_id -- 32 octets for the
+    rt.buf_push_bytes(&body, (&sid[0]) as u64, 32) // middlebox compat mode
+    push16(&body, 4 as u32) // two cipher suites
+    push16(&body, SUITE_AES128GCM)
+    push16(&body, SUITE_CHACHA20)
+    rt.buf_push(&body, 1 as u8) // legacy_compression_methods
+    rt.buf_push(&body, 0 as u8)
+
+    var ext: rt.Buf = rt.buf_new()
+    // server_name (0) -- and it is the ONE thing still sent in the clear
+    push16(&ext, 0 as u32)
+    push16(&ext, ((*t).hostlen + 5) as u32)
+    push16(&ext, ((*t).hostlen + 3) as u32)
+    rt.buf_push(&ext, 0 as u8) // host_name
+    push16(&ext, (*t).hostlen as u32)
+    rt.buf_push_bytes(&ext, (&(*t).host[0]) as u64, (*t).hostlen)
+    // supported_groups (10)
+    push16(&ext, 10 as u32)
+    push16(&ext, 4 as u32)
+    push16(&ext, 2 as u32)
+    push16(&ext, 29 as u32) // x25519
+    // signature_algorithms (13)
+    push16(&ext, 13 as u32)
+    push16(&ext, 16 as u32)
+    push16(&ext, 14 as u32)
+    push16(&ext, 2052 as u32) // rsa_pss_rsae_sha256
+    push16(&ext, 2053 as u32) // rsa_pss_rsae_sha384
+    push16(&ext, 2054 as u32) // rsa_pss_rsae_sha512
+    push16(&ext, 1027 as u32) // ecdsa_secp256r1_sha256
+    push16(&ext, 1283 as u32) // ecdsa_secp384r1_sha384
+    push16(&ext, 1025 as u32) // rsa_pkcs1_sha256 -- certificates only
+    push16(&ext, 1281 as u32) // rsa_pkcs1_sha384
+    // supported_versions (43)
+    push16(&ext, 43 as u32)
+    push16(&ext, 3 as u32)
+    rt.buf_push(&ext, 2 as u8)
+    push16(&ext, 772 as u32) // 0x0304 = TLS 1.3
+    // key_share (51)
+    push16(&ext, 51 as u32)
+    push16(&ext, 38 as u32)
+    push16(&ext, 36 as u32)
+    push16(&ext, 29 as u32)
+    push16(&ext, 32 as u32)
+    rt.buf_push_bytes(&ext, (&(*t).pub_key[0]) as u64, 32)
+    // application_layer_protocol_negotiation (16)
+    var http11: [u8; 8] = "http/1.1"
+    push16(&ext, 16 as u32)
+    push16(&ext, 11 as u32)
+    push16(&ext, 9 as u32)
+    rt.buf_push(&ext, 8 as u8)
+    rt.buf_push_bytes(&ext, (&http11[0]) as u64, 8)
+
+    push16(&body, ext.len as u32)
+    rt.buf_push_bytes(&body, ext.ptr, ext.len)
+    rt.buf_free(&ext)
+
+    rt.buf_push(out, HS_CLIENT_HELLO as u8)
+    push24(out, body.len)
+    rt.buf_push_bytes(out, body.ptr, body.len)
+    rt.buf_free(&body)
+    return true
+}
+
+// The magic random of RFC 8446 4.1.3 -- SHA-256 of "HelloRetryRequest".
+fn is_retry(p: u64, off: usize) -> bool {
+    var magic: [u8; 32] = [207, 33, 173, 116, 229, 154, 97, 17, 190, 29,
+        140, 2, 30, 101, 184, 145, 194, 162, 17, 22, 122, 187, 140, 94,
+        7, 158, 9, 226, 200, 168, 51, 156]
+    var i: usize = 0
+    while i < 32 {
+        if rt.ld8(p, off + i) != magic[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn parse_server_hello(t: *mut Tls, p: u64, off: usize, len: usize,
+    share: *mut usize) -> TlsError!bool {
+    if len < 38 {
+        return TlsError::Protocol
+    }
+    var at: usize = off + 2
+    if is_retry(p, at) {
+        return TlsError::Retry // T4
+    }
+    at = at + 32
+    let sidlen: usize = rt.ld8(p, at) as usize
+    at = at + 1 + sidlen
+    if at + 3 > off + len {
+        return TlsError::Protocol
+    }
+    let suite: u32 = be16(p, at)
+    at = at + 2
+    at = at + 1 // legacy_compression_method
+    if suite != SUITE_AES128GCM && suite != SUITE_CHACHA20 {
+        return TlsError::Suite
+    }
+    (*t).suite = suite
+    if suite == SUITE_CHACHA20 {
+        (*t).keylen = 32
+    } else {
+        (*t).keylen = 16
+    }
+    if at + 2 > off + len {
+        return TlsError::Protocol
+    }
+    let elen: usize = be16(p, at) as usize
+    at = at + 2
+    let eend: usize = at + elen
+    if eend > off + len {
+        return TlsError::Protocol
+    }
+    var saw_version: bool = false
+    var saw_share: bool = false
+    while at + 4 <= eend {
+        let etype: u32 = be16(p, at)
+        let elen2: usize = be16(p, at + 2) as usize
+        at = at + 4
+        if at + elen2 > eend {
+            return TlsError::Protocol
+        }
+        if etype == 43 as u32 {
+            if elen2 != 2 || be16(p, at) != 772 as u32 {
+                return TlsError::Version
+            }
+            saw_version = true
+        } else if etype == 51 as u32 {
+            if elen2 < 4 {
+                return TlsError::Protocol
+            }
+            if be16(p, at) != 29 as u32 {
+                return TlsError::Group
+            }
+            let klen: usize = be16(p, at + 2) as usize
+            if klen != 32 || at + 4 + klen > eend {
+                return TlsError::Group
+            }
+            *share = at + 4
+            saw_share = true
+        }
+        at = at + elen2
+    }
+    // Without supported_versions this is a TLS 1.2 ServerHello, and a
+    // TLS 1.3 client must NOT carry on with it (RFC 8446 4.1.3).
+    if !saw_version {
+        return TlsError::Version
+    }
+    if !saw_share {
+        return TlsError::Group
+    }
+    return true
+}
+
+// ------------------------------------------------------------ The keys
+
+fn install_handshake_keys(t: *mut Tls, secret_hash: u64) -> bool {
+    var early: [u8; 32] = [0; 32]
+    keys.key_schedule_early((&early[0]) as u64)
+    var shared: [u8; 32] = [0; 32]
+    if !x25519.x25519((&(*t).priv[0]) as u64, secret_hash,
+        (&shared[0]) as u64) {
+        return false
+    }
+    if !keys.key_schedule_handshake((&early[0]) as u64,
+        (&shared[0]) as u64, 32, (&(*t).hs_secret[0]) as u64) {
+        return false
+    }
+    var lc: [u8; 12] = "c hs traffic"
+    var ls: [u8; 12] = "s hs traffic"
+    if !keys.derive_secret((&(*t).hs_secret[0]) as u64, (&lc[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&(*t).c_hs_secret[0]) as u64) {
+        return false
+    }
+    if !keys.derive_secret((&(*t).hs_secret[0]) as u64, (&ls[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&(*t).s_hs_secret[0]) as u64) {
+        return false
+    }
+    if !keys.traffic_keys((&(*t).c_hs_secret[0]) as u64, (*t).keylen,
+        (&(*t).ckey[0]) as u64, (&(*t).civ[0]) as u64) {
+        return false
+    }
+    if !keys.traffic_keys((&(*t).s_hs_secret[0]) as u64, (*t).keylen,
+        (&(*t).skey[0]) as u64, (&(*t).siv[0]) as u64) {
+        return false
+    }
+    (*t).cseq = 0
+    (*t).sseq = 0
+    (*t).have_keys = true
+    return true
+}
+
+fn install_application_keys(t: *mut Tls) -> bool {
+    if !keys.key_schedule_master((&(*t).hs_secret[0]) as u64,
+        (&(*t).ms_secret[0]) as u64) {
+        return false
+    }
+    var lc: [u8; 12] = "c ap traffic"
+    var ls: [u8; 12] = "s ap traffic"
+    var cs: [u8; 32] = [0; 32]
+    var ss: [u8; 32] = [0; 32]
+    if !keys.derive_secret((&(*t).ms_secret[0]) as u64, (&lc[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&cs[0]) as u64) {
+        return false
+    }
+    if !keys.derive_secret((&(*t).ms_secret[0]) as u64, (&ls[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&ss[0]) as u64) {
+        return false
+    }
+    if !keys.traffic_keys((&cs[0]) as u64, (*t).keylen,
+        (&(*t).ckey[0]) as u64, (&(*t).civ[0]) as u64) {
+        return false
+    }
+    if !keys.traffic_keys((&ss[0]) as u64, (*t).keylen,
+        (&(*t).skey[0]) as u64, (&(*t).siv[0]) as u64) {
+        return false
+    }
+    (*t).cseq = 0
+    (*t).sseq = 0
+    return true
+}
+
+// -------------------------------------------------- Certificate, and proof
+
+fn parse_certificate(t: *mut Tls, p: u64, off: usize, len: usize,
+    certs: *mut [x509.Cert; 10], n: *mut usize) -> TlsError!bool {
+    var at: usize = off
+    let ctxlen: usize = rt.ld8(p, at) as usize
+    at = at + 1 + ctxlen
+    if at + 3 > off + len {
+        return TlsError::Protocol
+    }
+    let listlen: usize = be24(p, at)
+    at = at + 3
+    let lend: usize = at + listlen
+    if lend > off + len {
+        return TlsError::Protocol
+    }
+    var count: usize = 0
+    while at + 3 <= lend && count < MAX_CERTS {
+        let clen: usize = be24(p, at)
+        at = at + 3
+        if at + clen > lend {
+            return TlsError::Protocol
+        }
+        if !x509.cert_parse(&(*certs)[count], p + at as u64, clen) {
+            return TlsError::Certificate
+        }
+        at = at + clen
+        count = count + 1
+        if at + 2 > lend {
+            break
+        }
+        let exlen: usize = be16(p, at) as usize
+        at = at + 2 + exlen
+    }
+    if count == 0 {
+        return TlsError::Certificate
+    }
+    *n = count
+    return true
+}
+
+// RFC 8446 4.4.3: what the server actually signed.
+fn certverify_content(t: *mut Tls, upto: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < 64 {
+        rt.buf_push(out, 32 as u8)
+        i = i + 1
+    }
+    var lit: [u8; 33] = "TLS 1.3, server CertificateVerify"
+    rt.buf_push_bytes(out, (&lit[0]) as u64, 33)
+    rt.buf_push(out, 0 as u8)
+    var th: [u8; 32] = [0; 32]
+    keys.transcript((*t).tr.ptr, upto, (&th[0]) as u64)
+    rt.buf_push_bytes(out, (&th[0]) as u64, 32)
+}
+
+fn verify_certverify(t: *mut Tls, leaf: *mut x509.Cert, alg: u32,
+    sig: u64, siglen: usize, upto: usize) -> TlsError!bool {
+    var msg: rt.Buf = rt.buf_new()
+    certverify_content(t, upto, &msg)
+    var digest: [u8; 64] = [0; 64]
+    var good: bool = false
+    var known: bool = true
+    if alg == 2052 as u32 || alg == 2057 as u32 { // rsa_pss_*_sha256
+        rsa.hash_of(rsa.RSA_SHA256, msg.ptr, msg.len, (&digest[0]) as u64)
+        good = rsa.rsa_verify_pss(leaf_mod(leaf), leaf_modlen(leaf),
+            leaf_exp(leaf), leaf_explen(leaf), sig, siglen,
+            (&digest[0]) as u64, rsa.RSA_SHA256)
+    } else if alg == 2053 as u32 || alg == 2058 as u32 {
+        rsa.hash_of(rsa.RSA_SHA384, msg.ptr, msg.len, (&digest[0]) as u64)
+        good = rsa.rsa_verify_pss(leaf_mod(leaf), leaf_modlen(leaf),
+            leaf_exp(leaf), leaf_explen(leaf), sig, siglen,
+            (&digest[0]) as u64, rsa.RSA_SHA384)
+    } else if alg == 2054 as u32 || alg == 2059 as u32 {
+        rsa.hash_of(rsa.RSA_SHA512, msg.ptr, msg.len, (&digest[0]) as u64)
+        good = rsa.rsa_verify_pss(leaf_mod(leaf), leaf_modlen(leaf),
+            leaf_exp(leaf), leaf_explen(leaf), sig, siglen,
+            (&digest[0]) as u64, rsa.RSA_SHA512)
+    } else if alg == 1027 as u32 { // ecdsa_secp256r1_sha256
+        rsa.hash_of(rsa.RSA_SHA256, msg.ptr, msg.len, (&digest[0]) as u64)
+        good = ecdsa_from_der(leaf, (&digest[0]) as u64, 32, sig, siglen,
+            32)
+    } else if alg == 1283 as u32 { // ecdsa_secp384r1_sha384
+        rsa.hash_of(rsa.RSA_SHA384, msg.ptr, msg.len, (&digest[0]) as u64)
+        good = ecdsa_from_der(leaf, (&digest[0]) as u64, 48, sig, siglen,
+            48)
+    } else {
+        // RFC 8446 4.2.3: rsa_pkcs1_* MUST NOT appear here. Anything else
+        // is an algorithm this round does not have.
+        known = false
+    }
+    rt.buf_free(&msg)
+    if !known {
+        return TlsError::Unsupported
+    }
+    if !good {
+        return TlsError::Signature
+    }
+    return true
+}
+
+fn leaf_mod(c: *mut x509.Cert) -> u64 {
+    return x509.cert_mod_ptr(c)
+}
+
+fn leaf_modlen(c: *mut x509.Cert) -> usize {
+    return x509.cert_mod_len(c)
+}
+
+fn leaf_exp(c: *mut x509.Cert) -> u64 {
+    return x509.cert_exp_ptr(c)
+}
+
+fn leaf_explen(c: *mut x509.Cert) -> usize {
+    return x509.cert_exp_len(c)
+}
+
+fn ecdsa_from_der(leaf: *mut x509.Cert, digest: u64, hlen: usize,
+    sig: u64, siglen: usize, half: usize) -> bool {
+    var r: [u8; 48] = [0; 48]
+    var s: [u8; 48] = [0; 48]
+    if !x509.ecdsa_der_split(sig, siglen, (&r[0]) as u64, (&s[0]) as u64,
+        half) {
+        return false
+    }
+    var curve: ecdsa.Curve = ecdsa.curve_new_p256()
+    if x509.cert_key_alg(leaf) == x509.KEY_P384 {
+        ecdsa.curve_p384(&curve)
+        if half != 48 {
+            return false
+        }
+    } else if x509.cert_key_alg(leaf) == x509.KEY_P256 {
+        if half != 32 {
+            return false
+        }
+    } else {
+        return false
+    }
+    return ecdsa.ecdsa_verify_curve(&curve, x509.cert_ec_ptr(leaf),
+        x509.cert_ec_ptr(leaf) + half as u64, (&r[0]) as u64,
+        (&s[0]) as u64, digest, hlen)
+}
+
+// ------------------------------------------------------------ The handshake
+
+fn tls_handshake(t: *mut Tls) -> TlsError!bool {
+    if !random.random_bytes((&(*t).priv[0]) as u64, 32) {
+        return TlsError::Random
+    }
+    if !x25519.x25519_base((&(*t).priv[0]) as u64,
+        (&(*t).pub_key[0]) as u64) {
+        return TlsError::Random
+    }
+    var ch: rt.Buf = rt.buf_new()
+    if !build_client_hello(t, &ch) {
+        rt.buf_free(&ch)
+        return TlsError::Random
+    }
+    rt.buf_push_bytes(&(*t).tr, ch.ptr, ch.len)
+    (*t).hs_bytes = (*t).hs_bytes + ch.len
+    let sent: bool = write_record(t, REC_HANDSHAKE, ch.ptr, ch.len)
+    rt.buf_free(&ch)
+    if !sent {
+        return TlsError::Io
+    }
+    // the middlebox compatibility record (RFC 8446 D.4)
+    var ccs: [u8; 1] = [1; 1]
+    let ok_ccs: bool = write_record(t, REC_CHANGE_CIPHER,
+        (&ccs[0]) as u64, 1)
+
+    var htype: u32 = 0
+    var hoff: usize = 0
+    var hlen: usize = 0
+    let got: bool = try next_handshake(t, &htype, &hoff, &hlen)
+    if htype != HS_SERVER_HELLO {
+        return TlsError::Protocol
+    }
+    var share: usize = 0
+    let okh: bool = try parse_server_hello(t, (*t).hsin.ptr, hoff, hlen,
+        &share)
+    if !install_handshake_keys(t, (*t).hsin.ptr + share as u64) {
+        return TlsError::Protocol
+    }
+
+    var certs: [x509.Cert; 10] = [x509.cert_new(); 10]
+    var ncerts: usize = 0
+    var have_cert: bool = false
+    var verified: bool = false
+    var saw_finished: bool = false
+    while !saw_finished {
+        var ht: u32 = 0
+        var ho: usize = 0
+        var hl: usize = 0
+        // The transcript up to but NOT including this message -- the
+        // CertificateVerify and the Finished are each computed over
+        // everything BEFORE themselves.
+        let before: usize = (*t).tr.len
+        let g2: bool = try next_handshake(t, &ht, &ho, &hl)
+        if ht == HS_ENCRYPTED_EXT {
+            parse_encrypted_extensions(t, (*t).hsin.ptr, ho, hl)
+        } else if ht == HS_CERT_REQUEST {
+            // T3: noted, and answered with an empty Certificate below.
+            have_cert = have_cert
+        } else if ht == HS_CERTIFICATE {
+            rt.buf_clear(&(*t).certbuf)
+            rt.buf_push_bytes(&(*t).certbuf, (*t).hsin.ptr + ho as u64, hl)
+            let g3: bool = try parse_certificate(t, (*t).certbuf.ptr, 0, hl,
+                &certs, &ncerts)
+            (*t).ncerts = ncerts
+            var res: x509.VerifyResult = x509.VerifyResult { reason: 0,
+                depth: 0, anchor: 0 }
+            (*t).verify = x509.verify_chain((*t).store, &certs, ncerts,
+                (&(*t).host[0]) as u64, (*t).hostlen, (*t).now, &res)
+            (*t).chain_depth = res.depth
+            if (*t).verify != x509.V_OK {
+                send_alert(t, 2 as u32, 48 as u32) // unknown_ca
+                return TlsError::Certificate
+            }
+            have_cert = true
+        } else if ht == HS_CERT_VERIFY {
+            if !have_cert || hl < 4 {
+                return TlsError::Protocol
+            }
+            let alg: u32 = be16((*t).hsin.ptr, ho)
+            let slen: usize = be16((*t).hsin.ptr, ho + 2) as usize
+            if 4 + slen > hl {
+                return TlsError::Protocol
+            }
+            let g4: bool = try verify_certverify(t, &certs[0], alg,
+                (*t).hsin.ptr + (ho + 4) as u64, slen, before)
+            verified = true
+        } else if ht == HS_FINISHED {
+            if !verified {
+                return TlsError::Signature
+            }
+            var fkey: [u8; 32] = [0; 32]
+            if !keys.finished_key((&(*t).s_hs_secret[0]) as u64,
+                (&fkey[0]) as u64) {
+                return TlsError::Protocol
+            }
+            var want: [u8; 32] = [0; 32]
+            keys.finished_mac((&fkey[0]) as u64, (*t).tr.ptr, before,
+                (&want[0]) as u64)
+            if hl != 32 || !chacha.tag_equal((&want[0]) as u64,
+                (*t).hsin.ptr + ho as u64, 32) {
+                return TlsError::Finished
+            }
+            saw_finished = true
+        } else if ht == HS_KEY_UPDATE {
+            send_alert(t, 2 as u32, 40 as u32) // handshake_failure -- T2
+            return TlsError::Unsupported
+        }
+    }
+
+    // the client's own Finished, over the transcript INCLUDING the
+    // server's Finished
+    var cfkey: [u8; 32] = [0; 32]
+    if !keys.finished_key((&(*t).c_hs_secret[0]) as u64,
+        (&cfkey[0]) as u64) {
+        return TlsError::Protocol
+    }
+    var vd: [u8; 32] = [0; 32]
+    keys.finished_mac((&cfkey[0]) as u64, (*t).tr.ptr, (*t).tr.len,
+        (&vd[0]) as u64)
+    var fin: rt.Buf = rt.buf_new()
+    rt.buf_push(&fin, HS_FINISHED as u8)
+    push24(&fin, 32)
+    rt.buf_push_bytes(&fin, (&vd[0]) as u64, 32)
+    let sent2: bool = write_record(t, REC_HANDSHAKE, fin.ptr, fin.len)
+    rt.buf_free(&fin)
+    if !sent2 {
+        return TlsError::Io
+    }
+    if !install_application_keys(t) {
+        return TlsError::Protocol
+    }
+    (*t).established = true
+    return true
+}
+
+fn parse_encrypted_extensions(t: *mut Tls, p: u64, off: usize,
+    len: usize) {
+    if len < 2 {
+        return
+    }
+    let elen: usize = be16(p, off) as usize
+    var at: usize = off + 2
+    let eend: usize = at + elen
+    if eend > off + len {
+        return
+    }
+    while at + 4 <= eend {
+        let etype: u32 = be16(p, at)
+        let elen2: usize = be16(p, at + 2) as usize
+        at = at + 4
+        if at + elen2 > eend {
+            return
+        }
+        if etype == 16 as u32 && elen2 >= 3 {
+            let nlen: usize = rt.ld8(p, at + 2) as usize
+            if nlen <= 32 && at + 3 + nlen <= eend {
+                var i: usize = 0
+                while i < nlen {
+                    (*t).alpn[i] = rt.ld8(p, at + 3 + i)
+                    i = i + 1
+                }
+                (*t).alpnlen = nlen
+            }
+        }
+        at = at + elen2
+    }
+}
+
+fn send_alert(t: *mut Tls, level: u32, desc: u32) {
+    var a: [u8; 2] = [0; 2]
+    a[0] = level as u8
+    a[1] = desc as u8
+    let ok: bool = write_record(t, REC_ALERT, (&a[0]) as u64, 2)
+}
+
+// ------------------------------------------------------ Application data
+
+fn tls_write(t: *mut Tls, p: u64, n: usize) -> TlsError!bool {
+    if !(*t).established {
+        return TlsError::Protocol
+    }
+    var at: usize = 0
+    while at < n {
+        var chunk: usize = n - at
+        if chunk > 16384 {
+            chunk = 16384
+        }
+        if !write_record(t, REC_APPDATA, p + at as u64, chunk) {
+            return TlsError::Io
+        }
+        at = at + chunk
+    }
+    return true
+}
+
+// Up to `max` octets of plaintext. 0 means the peer is done.
+fn tls_read(t: *mut Tls, out: u64, max: usize) -> TlsError!usize {
+    if (*t).closed {
+        return 0
+    }
+    while (*t).app.len - (*t).apos == 0 {
+        rt.buf_clear(&(*t).app)
+        (*t).apos = 0
+        var kind: u32 = 0
+        var err: bool = false
+        // A clean end of stream without close_notify -- see T6.
+        if !fill(t, 5, &err) {
+            (*t).closed = true
+            if err {
+                return TlsError::Io
+            }
+            (*t).truncated = true
+            return 0
+        }
+        let got: bool = try read_record(t, &kind)
+        if kind == REC_ALERT {
+            if (*t).rec.len >= 2 {
+                (*t).alert_desc = rt.ld8((*t).rec.ptr, 1) as u32
+            }
+            (*t).closed = true
+            if (*t).alert_desc == 0 as u32 {
+                return 0 // close_notify
+            }
+            return TlsError::Alert
+        }
+        if kind == REC_HANDSHAKE {
+            // NewSessionTicket after the handshake -- T1, thrown away.
+            continue
+        }
+        if kind == REC_CHANGE_CIPHER {
+            continue
+        }
+        if kind != REC_APPDATA {
+            return TlsError::Protocol
+        }
+        rt.buf_push_bytes(&(*t).app, (*t).rec.ptr, (*t).rec.len)
+    }
+    var n: usize = (*t).app.len - (*t).apos
+    if n > max {
+        n = max
+    }
+    rt.mem_copy(out, (*t).app.ptr + (*t).apos as u64, n)
+    (*t).apos = (*t).apos + n
+    return n
+}
+
+fn tls_close(t: *mut Tls) {
+    if (*t).established && !(*t).closed {
+        send_alert(t, 1 as u32, 0 as u32) // warning, close_notify
+    }
+    (*t).closed = true
+}
+
+// The driver cannot name the error TYPE of an imported module, so the
+// mapping lives here -- the same shape `lib/net/http.fi` uses.
+fn tls_err_num(e: TlsError) -> u32 {
+    if e == TlsError::Io { return 1 as u32 }
+    if e == TlsError::Closed { return 2 as u32 }
+    if e == TlsError::Protocol { return 3 as u32 }
+    if e == TlsError::Version { return 4 as u32 }
+    if e == TlsError::Group { return 5 as u32 }
+    if e == TlsError::Suite { return 6 as u32 }
+    if e == TlsError::Retry { return 7 as u32 }
+    if e == TlsError::Alert { return 8 as u32 }
+    if e == TlsError::Certificate { return 9 as u32 }
+    if e == TlsError::Signature { return 10 as u32 }
+    if e == TlsError::Finished { return 11 as u32 }
+    if e == TlsError::Decrypt { return 12 as u32 }
+    if e == TlsError::Unsupported { return 13 as u32 }
+    if e == TlsError::TooLarge { return 14 as u32 }
+    return 15 as u32
+}
+
+fn tls_err_name(e: TlsError, out: *mut rt.Buf) {
+    var t: [u8; 103] = "IoClosedProtocolVersionGroupSuiteRetryAlertCertificateSignatureFinishedDecryptUnsupportedTooLargeRandom"
+    var offs: [usize; 16] = [0, 0, 2, 8, 16, 23, 28, 33, 38, 43, 54, 63,
+        71, 78, 89, 97]
+    var lens: [usize; 16] = [0, 2, 6, 8, 7, 5, 5, 5, 5, 11, 9, 8, 7, 11,
+        8, 6]
+    let k: u32 = tls_err_num(e)
+    var i: usize = k as usize
+    if i > 15 {
+        i = 15
+    }
+    rt.buf_push_bytes(out, (&t[0]) as u64 + offs[i] as u64, lens[i])
+}
+
+// `catch |x| tls.tls_fail_into(&out, x, &failed)` -- a driver cannot name
+// the error TYPE of an imported module, so the whole handler lives here.
+fn tls_fail_into(out: *mut rt.Buf, e: TlsError, failed: *mut bool) -> bool {
+    *failed = true
+    var m: [u8; 3] = "ERR"
+    rt.buf_push_bytes(out, (&m[0]) as u64, 3)
+    tls_err_name(e, out)
+    rt.buf_push(out, 10 as u8)
+    return false
+}
+
+fn tls_fail_len(out: *mut rt.Buf, e: TlsError, failed: *mut bool) -> usize {
+    let ok: bool = tls_fail_into(out, e, failed)
+    return 0
+}

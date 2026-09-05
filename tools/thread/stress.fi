@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/thread/stress.fi -- SOAK RUN WITH SEVERAL THREADS AND A RUNNING COLLECTOR.
+//
+// The proof that round 49 owes: several threads allocate
+// at the same time from the same GC heap, the collector runs while they do, and that over
+// minutes -- without a crash, without memory drift, with a deterministic result.
+//
+// Every thread builds a chain of KETTE links with predictable values in an
+// endless loop, RECOMPUTES IT and discards it again. A single
+// wrongly collected link sets the error word -- and that is the
+// real point: the collector runs while that happens, led by an
+// ARBITRARY one of the threads, and still has to see every other stack.
+//
+// In addition a mutex section and a purely atomic counter run in every round.
+// At the end both have to match the number of rounds exactly; a third
+// counter WITHOUT a lock has to have LOST in contrast -- otherwise the threads did
+// not really run at the same time and the whole run proves nothing.
+//
+// Output (one line per sample, TAB separated):
+//   S <t_ms> <rss_kib> <rounds> <runs> <stw> <heap_bytes> <live> <stw_max_ns>
+//   Q <code> <value>   final values
+// Codes: 0 error word * 1 rounds in total * 2 mutex counter * 3 atomic counter *
+//        4 counter without a lock * 5 RSS at the end * 6 collections * 7 STW runs
+//        8 longest wait until the world stood still (ns)
+//        9 longest time with the world standing still (ns)
+import meas
+
+gc class Node {
+    next: Gc[Node],
+    value: u64,
+}
+
+// Changed over by tools/thread/stress.sh.
+const BUDGET_MS: i64 = 20000 // STRESS_BUDGET_MS
+const THREADS: u64 = 4 // STRESS_THREADS
+const LOCAL: u64 = 0 // STRESS_LOCAL
+const CHAIN: u64 = 200
+const STICH_MS: u64 = 2000
+
+const ST_SYS_MMAP: i64 = 9
+
+const Z_STOPP: u64 = 0
+const Z_MUTEX: u64 = 8
+const Z_WITH: u64 = 16
+const Z_ATOM: u64 = 24
+const Z_WITHOUT: u64 = 32
+const Z_ROUNDS: u64 = 40
+const Z_ERROR: u64 = 48
+
+fn page() -> u64 {
+    let r: i64 = syscall(ST_SYS_MMAP, 0, 4096, 3, 34, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+// Sleeping as BLOCKED -- otherwise every stopping of the world waits for this
+// thread until it wakes up by itself (see thread_blocking_an in gc.fi).
+fn sleep_ms(ms: u64) {
+    thread_sleep(ms)
+}
+
+fn chain_build(mark: u64) -> AllocError!Gc[Node] {
+    var header: Gc[Node] = gc_null[Node]()
+    var i: u64 = 0
+    while i < CHAIN {
+        let n: Gc[Node] = try gc Node { next: header, value: mark + i }
+        header = n
+        i = i + 1
+    }
+    return header
+}
+
+fn chain_check(header: Gc[Node], mark: u64) -> bool {
+    var p: Gc[Node] = header
+    var i: u64 = CHAIN
+    while i > 0 {
+        i = i - 1
+        if p == gc_null[Node]() {
+            return false
+        }
+        if p.value != mark + i {
+            return false
+        }
+        p = p.next
+    }
+    return true
+}
+
+fn round(arg: u64, mark: u64) -> AllocError!bool {
+    let header: Gc[Node] = try chain_build(mark)
+    if !chain_check(header, mark) {
+        return false
+    }
+    thread_lock((arg + Z_MUTEX) as *mut u64)
+    st(arg, Z_WITH, ld(arg, Z_WITH) + 1)
+    thread_unlock((arg + Z_MUTEX) as *mut u64)
+    __atomic_add((arg + Z_ATOM) as *mut u64, 1)
+    // Counter-check: the same increment WITHOUT a lock and WITHOUT an atomic
+    // instruction, with a deliberately wide window between reading and
+    // writing. It MUST lose -- otherwise the threads did not really run
+    // at the same time and the whole soak run proves nothing.
+    let v: u64 = ld(arg, Z_WITHOUT)
+    var d: u64 = 0
+    while d < 64 {
+        d = d + 1
+    }
+    st(arg, Z_WITHOUT, v + 1)
+    __atomic_add((arg + Z_ROUNDS) as *mut u64, 1)
+    return true
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    var rounds: u64 = 0
+    while ld(arg, Z_STOPP) == 0 {
+        let mark: u64 = kind * 1000000 + (rounds % 977) * 1000
+        let ok: bool = round(arg, mark) catch false
+        if !ok {
+            __atomic_add((arg + Z_ERROR) as *mut u64, 1)
+            return rounds
+        }
+        rounds = rounds + 1
+        // From time to time force a full run -- otherwise this
+        // soak run sees almost only incremental slices.
+        if rounds % 512 == 0 {
+            gc_collect()
+        }
+    }
+    return rounds
+}
+
+fn q(code: u64, value: u64) {
+    meas.meas_char(81)
+    meas.meas_tab()
+    meas.meas_u64(code)
+    meas.meas_tab()
+    meas.meas_u64(value)
+    meas.meas_nl()
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    if !thread_init() {
+        return 91
+    }
+    if LOCAL != 0 {
+        gc_set_local(1)
+    }
+    let z: u64 = page()
+    if z == 0 {
+        return 92
+    }
+    var h: [u64; 16] = [0; 16]
+    var i: u64 = 0
+    while i < THREADS {
+        h[i as usize] = thread_start(i + 1, z)
+        if h[i as usize] == 0 {
+            return 93
+        }
+        i = i + 1
+    }
+
+    let t0: u64 = meas.meas_now_ms()
+    var t: u64 = 0
+    while t < BUDGET_MS as u64 {
+        sleep_ms(STICH_MS)
+        thread_safepoint()
+        t = meas.meas_now_ms() - t0
+        meas.meas_char(83)
+        meas.meas_tab()
+        meas.meas_u64(t)
+        meas.meas_tab()
+        meas.meas_u64(meas.meas_rss_kib())
+        meas.meas_tab()
+        meas.meas_u64(ld(z, Z_ROUNDS))
+        meas.meas_tab()
+        meas.meas_u64(gc_collections())
+        meas.meas_tab()
+        meas.meas_u64(gc_stw_runs())
+        meas.meas_tab()
+        meas.meas_u64(gc_heap_bytes())
+        meas.meas_tab()
+        meas.meas_u64(gc_live_objects())
+        meas.meas_tab()
+        meas.meas_u64(gc_stw_wait_max())
+        meas.meas_nl()
+    }
+    st(z, Z_STOPP, 1)
+
+    var sum: u64 = 0
+    i = 0
+    while i < THREADS {
+        sum = sum + thread_wait(h[i as usize])
+        i = i + 1
+    }
+    q(0, ld(z, Z_ERROR))
+    q(1, sum)
+    q(2, ld(z, Z_WITH))
+    q(3, ld(z, Z_ATOM))
+    q(4, ld(z, Z_WITHOUT))
+    q(5, meas.meas_rss_kib())
+    q(6, gc_collections())
+    q(7, gc_stw_runs())
+    q(8, gc_stw_wait_max())
+    q(9, gc_stw_work_max())
+    if ld(z, Z_ERROR) != 0 {
+        return 1
+    }
+    if sum != ld(z, Z_ROUNDS) {
+        return 2
+    }
+    if ld(z, Z_WITH) != sum {
+        return 3
+    }
+    if ld(z, Z_ATOM) != sum {
+        return 4
+    }
+    if thread_count() != 1 {
+        return 5
+    }
+    return 0
+}

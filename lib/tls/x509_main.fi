@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/tls/x509_main.fi -- the certificate check as a PROGRAM (root file).
+//
+// Argument 1 is the trust store, a PEM bundle. Standard input is a
+// sequence of jobs; a job begins with
+//
+//     #JOB <host> <unix time>
+//
+// and is followed by the PEM blocks of the chain, the leaf first. One line
+// of answer per job:
+//
+//     OK depth=<n> anchor=<i>       or       EXPIRED / NAME / ...
+//
+// The other side is `tools/tlsb5/cert_check.py`, which builds the
+// certificates with Python's `cryptography` -- including the ones that
+// MUST be refused.
+import std.rt
+import tls.x509
+
+const MAX_CHAIN: usize = 10
+
+fn name_of(r: u32, out: *mut rt.Buf) {
+    var s_ok: [u8; 2] = "OK"
+    var s_parse: [u8; 5] = "PARSE"
+    var s_exp: [u8; 7] = "EXPIRED"
+    var s_not: [u8; 7] = "NOT_YET"
+    var s_name: [u8; 4] = "NAME"
+    var s_unk: [u8; 14] = "UNKNOWN_ISSUER"
+    var s_sig: [u8; 13] = "BAD_SIGNATURE"
+    var s_ca: [u8; 6] = "NOT_CA"
+    var s_uns: [u8; 11] = "UNSUPPORTED"
+    var s_long: [u8; 8] = "TOO_LONG"
+    var s_crit: [u8; 8] = "CRITICAL"
+    if r == x509.V_OK {
+        rt.buf_push_bytes(out, (&s_ok[0]) as u64, 2)
+    } else if r == x509.V_PARSE {
+        rt.buf_push_bytes(out, (&s_parse[0]) as u64, 5)
+    } else if r == x509.V_EXPIRED {
+        rt.buf_push_bytes(out, (&s_exp[0]) as u64, 7)
+    } else if r == x509.V_NOT_YET {
+        rt.buf_push_bytes(out, (&s_not[0]) as u64, 7)
+    } else if r == x509.V_NAME {
+        rt.buf_push_bytes(out, (&s_name[0]) as u64, 4)
+    } else if r == x509.V_UNKNOWN_ISSUER {
+        rt.buf_push_bytes(out, (&s_unk[0]) as u64, 14)
+    } else if r == x509.V_BAD_SIGNATURE {
+        rt.buf_push_bytes(out, (&s_sig[0]) as u64, 13)
+    } else if r == x509.V_NOT_CA {
+        rt.buf_push_bytes(out, (&s_ca[0]) as u64, 6)
+    } else if r == x509.V_UNSUPPORTED {
+        rt.buf_push_bytes(out, (&s_uns[0]) as u64, 11)
+    } else if r == x509.V_TOO_LONG {
+        rt.buf_push_bytes(out, (&s_long[0]) as u64, 8)
+    } else {
+        rt.buf_push_bytes(out, (&s_crit[0]) as u64, 8)
+    }
+}
+
+fn line_end(p: u64, from: usize, n: usize) -> usize {
+    var e: usize = from
+    while e < n && rt.ld8(p, e) != 10 as u8 {
+        e = e + 1
+    }
+    return e
+}
+
+fn is_job_line(p: u64, at: usize, n: usize) -> bool {
+    var lit: [u8; 5] = "#JOB "
+    if at + 5 > n {
+        return false
+    }
+    var i: usize = 0
+    while i < 5 {
+        if rt.ld8(p, at + i) != lit[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main(start: u64) -> i32 {
+    var out: rt.Buf = rt.buf_new()
+    var storebuf: rt.Buf = rt.buf_new()
+    var store: x509.Store = x509.store_new()
+    if rt.arg_count(start) > 1 {
+        if rt.read_file(rt.arg_ptr(start, 1), &storebuf) {
+            let taken: usize = x509.store_load_pem(&store, storebuf.ptr,
+                storebuf.len)
+        }
+    }
+    var inb: rt.Buf = rt.buf_new()
+    rt.read_stdin(&inb)
+    let p: u64 = inb.ptr
+    let n: usize = inb.len
+    var i: usize = 0
+    // find the first job
+    while i < n && !is_job_line(p, i, n) {
+        i = line_end(p, i, n) + 1
+    }
+    while i < n {
+        let hdr_end: usize = line_end(p, i, n)
+        // "#JOB <host> <now>"
+        var at: usize = i + 5
+        var host_off: usize = at
+        while at < hdr_end && rt.ld8(p, at) != 32 as u8 {
+            at = at + 1
+        }
+        let host_len: usize = at - host_off
+        var now: u64 = 0
+        at = at + 1
+        while at < hdr_end {
+            let ch: u8 = rt.ld8(p, at)
+            if ch >= 48 as u8 && ch <= 57 as u8 {
+                now = now * 10 as u64 + (ch - 48 as u8) as u64
+            }
+            at = at + 1
+        }
+        // the body runs to the next job line or to the end
+        var body: usize = hdr_end + 1
+        var stop: usize = body
+        while stop < n && !is_job_line(p, stop, n) {
+            stop = line_end(p, stop, n) + 1
+        }
+        var chain_store: x509.Store = x509.store_new()
+        let got: usize = x509.store_load_pem(&chain_store, p + body as u64,
+            stop - body)
+        var certs: [x509.Cert; 10] = [x509.cert_new(); 10]
+        var k: usize = 0
+        var parsed: usize = 0
+        var bad: bool = false
+        while k < got && k < MAX_CHAIN {
+            if !x509.cert_parse(&certs[k],
+                chain_store.blob.ptr + chain_store.off[k] as u64,
+                chain_store.len[k]) {
+                bad = true
+            }
+            parsed = parsed + 1
+            k = k + 1
+        }
+        var res: x509.VerifyResult = x509.VerifyResult { reason: 0,
+            depth: 0, anchor: 0 }
+        var r: u32 = x509.V_PARSE
+        if !bad && parsed > 0 {
+            r = x509.verify_chain(&store, &certs, parsed,
+                p + host_off as u64, host_len, now, &res)
+        }
+        name_of(r, &out)
+        if r == x509.V_OK {
+            var d: [u8; 7] = " depth="
+            rt.buf_push_bytes(&out, (&d[0]) as u64, 7)
+            rt.buf_push_dec_u64(&out, res.depth as u64)
+            var a: [u8; 8] = " anchor="
+            rt.buf_push_bytes(&out, (&a[0]) as u64, 8)
+            rt.buf_push_dec_u64(&out, res.anchor as u64)
+        }
+        rt.buf_push(&out, 10 as u8)
+        x509.store_free(&chain_store)
+        i = stop
+    }
+    rt.write_everything(1, out.ptr, out.len)
+    rt.buf_free(&out)
+    rt.buf_free(&inb)
+    rt.buf_free(&storebuf)
+    x509.store_free(&store)
+    return 0
+}

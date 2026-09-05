@@ -1,0 +1,559 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/k3net/drv.fi -- round K3: lib/net/ against the Linux kernel.
+//
+// The stack in lib/net/ knows nothing about Linux, about sockets or about
+// this program. It has two doors -- a frame in, a frame out -- and this
+// file is forty lines of glue that puts a raw Ethernet socket behind
+// them. Everything above the Ethernet header is the Firn stack's own
+// work: ARP, IPv4, ICMP, UDP, TCP.
+//
+// WHY A RAW SOCKET AND NOT A TAP DEVICE. `/dev/net/tun` does not exist in
+// the container this repository is measured in and cannot be created
+// there (`mknod: Operation not permitted`, the `tun` module is not in the
+// kernel of the host). `AF_PACKET` needs no device node; a veth pair in
+// two network namespaces gives the same thing: on one side the Linux
+// kernel with an address, on the other side an interface WITHOUT an
+// address that nobody but this program answers for. tools/k3net/run.sh
+// builds it and takes it down again.
+//
+//     drv <interface> <own ip> <netmask> <mode> [arguments]
+//
+//     idle   <seconds>                 answer ARP and ICMP, nothing else
+//     sink   <port> <octets>           take a connection, swallow octets,
+//                                      report the throughput
+//     serve  <port> <octets>           take a connection and echo
+//     http   <port>                    one HTTP/1.1 answer, then close
+//     send   <ip> <port> <octets>      connect ACTIVELY, send, read the
+//                                      echo back and compare
+//
+// Every mode prints lines of the form `key value`, so that run.sh can
+// read numbers rather than prose out of it.
+
+import std.io
+import std.rt
+import net.wire
+import net.tcp
+import net.stack
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_CLOSE: i64 = 3
+const SYS_POLL: i64 = 7
+const SYS_IOCTL: i64 = 16
+const SYS_SOCKET: i64 = 41
+const SYS_SETSOCKOPT: i64 = 54
+const SYS_BIND: i64 = 49
+const SYS_FCNTL: i64 = 72
+const SYS_CLOCK_GETTIME: i64 = 228
+
+const AF_PACKET: i64 = 17
+const SOCK_RAW: i64 = 3
+const ETH_P_ALL_BE: i64 = 768 // htons(0x0003)
+const SIOCGIFINDEX: i64 = 0x8933
+const SIOCGIFHWADDR: i64 = 0x8927
+const SOL_PACKET: i64 = 263
+const PACKET_IGNORE_OUTGOING: i64 = 23
+const F_GETFL: i64 = 3
+const F_SETFL: i64 = 4
+const O_NONBLOCK: i64 = 2048
+const POLLIN: u16 = 1
+const CLOCK_MONOTONIC: i64 = 1
+
+const BUFCAP: usize = 262144
+const HEAD_LEN: usize = 101
+const BODY_LEN: usize = 40
+
+struct Drv {
+    s: stack.Stack,
+    fd: i64,
+    ifindex: i64,
+    frame: [u8; 2048],
+    buf: [u8; 262144],
+    cmp: [u8; 262144],
+    ifr: [u8; 64],
+    sll: [u8; 32],
+    ts: [u8; 32],
+    pfd: [u8; 16],
+}
+
+// -------------------------------------------------------------- text
+
+fn parse_dec(p: u64, n: usize, fallback: i64) -> i64 {
+    if n == 0 { return fallback }
+    var v: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 { return fallback }
+        v = v * 10 + (c - 48 as u8) as i64
+        i = i + 1
+    }
+    return v
+}
+
+fn parse_ip(p: u64) -> u32 {
+    var out: u32 = 0
+    var part: u32 = 0
+    var seen: u32 = 0
+    var i: usize = 0
+    let n: usize = rt.c_length(p)
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 46 as u8 {
+            out = (out << 8) | (part & 0xFF)
+            part = 0
+            seen = seen + 1
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            part = part * 10 + (c - 48 as u8) as u32
+        }
+        i = i + 1
+    }
+    out = (out << 8) | (part & 0xFF)
+    if seen != 3 { return 0 }
+    return out
+}
+
+fn say(k: str, v: u64) {
+    var f: io.Fmt = io.fmt_new()
+    f = io.fmt_str(f, k)
+    f = io.fmt_str(f, " ")
+    f = io.fmt_u64(f, v)
+    io.fmt_print_line(f)
+    io.fmt_free(f)
+}
+
+fn saytext(k: str) {
+    io.print_line(k)
+}
+
+// -------------------------------------------------------- the clock
+
+fn now_us(d: *mut Drv) -> u64 {
+    let r: i64 = syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (&(*d).ts[0]) as i64, 0, 0, 0, 0)
+    if r != 0 { return 0 }
+    let sec: u64 = rt.ld64((&(*d).ts[0]) as u64, 0)
+    let nsec: u64 = rt.ld64((&(*d).ts[0]) as u64, 1)
+    return sec *% 1000000 +% (nsec / 1000)
+}
+
+// ------------------------------------------------------- the socket
+
+fn open_link(d: *mut Drv, ifname: u64) -> bool {
+    let fd: i64 = syscall(SYS_SOCKET, AF_PACKET, SOCK_RAW, ETH_P_ALL_BE, 0, 0, 0)
+    if fd < 0 { return false }
+    (*d).fd = fd
+
+    // The interface number, asked of the kernel rather than guessed.
+    wire.blank(&(*d).ifr[0], 64)
+    let ln: usize = rt.c_length(ifname)
+    if ln > 15 { return false }
+    var i: usize = 0
+    while i < ln {
+        (*d).ifr[i] = rt.ld8(ifname, i)
+        i = i + 1
+    }
+    if syscall(SYS_IOCTL, fd, SIOCGIFINDEX, (&(*d).ifr[0]) as i64, 0, 0, 0) != 0 {
+        return false
+    }
+    (*d).ifindex = rt.ld32((&(*d).ifr[0]) as u64, 4) as i64
+
+    // The hardware address of the interface -- the stack answers with it
+    // and it has to be the real one, otherwise the switch (here: the veth
+    // partner) drops the frames.
+    if syscall(SYS_IOCTL, fd, SIOCGIFHWADDR, (&(*d).ifr[0]) as i64, 0, 0, 0) != 0 {
+        return false
+    }
+
+    // sockaddr_ll: family, protocol, ifindex -- the rest stays zero.
+    wire.blank(&(*d).sll[0], 32)
+    rt.st16((&(*d).sll[0]) as u64, 0, AF_PACKET as u16)
+    rt.st16((&(*d).sll[0]) as u64, 1, ETH_P_ALL_BE as u16)
+    rt.st32((&(*d).sll[0]) as u64, 1, (*d).ifindex as u32)
+    if syscall(SYS_BIND, fd, (&(*d).sll[0]) as i64, 20, 0, 0, 0) != 0 {
+        return false
+    }
+
+    // Our own frames come back on a packet socket; the stack throws them
+    // away because the destination address is not ours, but asking the
+    // kernel not to send them at all saves the whole round. Linux 4.20
+    // and up; a failure here is not one.
+    var one: [u8; 4] = [0 as u8; 4]
+    one[0] = 1 as u8
+    syscall(SYS_SETSOCKOPT, fd, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+        (&one[0]) as i64, 4, 0)
+
+    let fl: i64 = syscall(SYS_FCNTL, fd, F_GETFL, 0, 0, 0, 0)
+    if fl >= 0 {
+        syscall(SYS_FCNTL, fd, F_SETFL, fl | O_NONBLOCK, 0, 0, 0)
+    }
+    return true
+}
+
+fn mac_of_ifr(d: *mut Drv) -> *mut u8 {
+    // struct ifreq: 16 octets of name, then sa_family (2), then the address.
+    return &(*d).ifr[18]
+}
+
+fn wait_ready(d: *mut Drv, ms: i64) {
+    rt.st32((&(*d).pfd[0]) as u64, 0, (*d).fd as u32)
+    rt.st16((&(*d).pfd[0]) as u64, 2, POLLIN)
+    rt.st16((&(*d).pfd[0]) as u64, 3, 0 as u16)
+    syscall(SYS_POLL, (&(*d).pfd[0]) as i64, 1, ms, 0, 0, 0)
+}
+
+// One turn of the wheel: everything that has arrived goes in, the clock
+// goes forward, everything that wants out goes out. The number returned
+// is how much moved -- zero means it is worth sleeping.
+fn turn(d: *mut Drv, now: u64) -> usize {
+    var moved: usize = 0
+    var guard: usize = 0
+    while guard < 256 {
+        let n: i64 = syscall(SYS_READ, (*d).fd, (&(*d).frame[0]) as i64, 2048, 0, 0, 0)
+        if n <= 0 { guard = 256 } else {
+            stack.net_input(&(*d).s, &(*d).frame[0], n as usize, now)
+            moved = moved + 1
+            guard = guard + 1
+        }
+    }
+    stack.net_poll(&(*d).s, now)
+    guard = 0
+    while guard < 256 {
+        let m: usize = stack.net_output(&(*d).s, &(*d).frame[0], 2048, now)
+        if m == 0 { guard = 256 } else {
+            syscall(SYS_WRITE, (*d).fd, (&(*d).frame[0]) as i64, m as i64, 0, 0, 0)
+            moved = moved + 1
+            guard = guard + 1
+        }
+    }
+    return moved
+}
+
+// ---------------------------------------------------------- the modes
+
+fn mode_idle(d: *mut Drv, seconds: u64) -> i32 {
+    let t0: u64 = now_us(d)
+    var now: u64 = t0
+    while now - t0 < seconds * 1000000 {
+        if turn(d, now) == 0 { wait_ready(d, 5) }
+        now = now_us(d)
+    }
+    say("icmp_echo_answered", stack.net_stat(&(*d).s, stack.NS_ICMP))
+    say("arp_replies", stack.net_stat(&(*d).s, stack.NS_ARP_TX))
+    say("frames_in", stack.net_stat(&(*d).s, stack.NS_RX))
+    say("frames_out", stack.net_stat(&(*d).s, stack.NS_TX))
+    say("udp_in", stack.net_stat(&(*d).s, stack.NS_UDP_RX))
+    return 0
+}
+
+// Reads until the peer closes, and gives the throughput. `expect` is
+// only there so that the exit code says whether it was reached.
+// UDP against Linux: whatever arrives goes back to where it came from,
+// reversed, so that the answer cannot be an echo of the wire.
+fn mode_udpecho(d: *mut Drv, port: u16, limit_us: u64) -> i32 {
+    let h: i32 = stack.udp_bind(&(*d).s, port)
+    var seen: usize = 0
+    var back: usize = 0
+    let t0: u64 = now_us(d)
+    var now: u64 = t0
+    while now - t0 < limit_us {
+        var sip: u32 = 0
+        var sport: u16 = 0
+        let n: usize = stack.udp_recv(&(*d).s, h, &(*d).buf[0], 1472, &sip, &sport)
+        if n > 0 {
+            seen = seen + 1
+            var i: usize = 0
+            while i < n {
+                (*d).cmp[i] = (*d).buf[n - 1 - i]
+                i = i + 1
+            }
+            if stack.udp_send(&(*d).s, port, sip, sport, &(*d).cmp[0], n, now) {
+                back = back + 1
+            }
+        }
+        if turn(d, now) + n == 0 { wait_ready(d, 2) }
+        now = now_us(d)
+    }
+    say("udp_datagrams", seen as u64)
+    say("udp_answered", back as u64)
+    say("udp_refused", stack.net_stat(&(*d).s, stack.NS_UDP_BAD))
+    if back > 0 { return 0 }
+    return 1
+}
+
+fn mode_sink(d: *mut Drv, port: u16, expect: usize, echo: bool, limit_us: u64) -> i32 {
+    let l: i32 = stack.net_listen(&(*d).s, port)
+    var c: i32 = 0 - 1
+    var got: usize = 0
+    var back: usize = 0
+    var t_first: u64 = 0
+    var t_last: u64 = 0
+    let t0: u64 = now_us(d)
+    var now: u64 = t0
+    var fin: bool = false
+    // A flag, not `now = t0 + limit_us`: the last line of the loop reads
+    // the clock again and would throw that away. Every mode in this file
+    // ran to its full time limit because of it, and a run of
+    // tools/k3net/run.sh took five minutes instead of one.
+    var done: bool = false
+    while !done && now - t0 < limit_us {
+        if c < 0 { c = stack.net_accept(&(*d).s, l) }
+        var busy: usize = 0
+        if c >= 0 {
+            let n: usize = stack.net_recv(&(*d).s, c, &(*d).buf[0], BUFCAP)
+            if n > 0 {
+                if t_first == 0 { t_first = now }
+                t_last = now
+                got = got + n
+                busy = busy + n
+                if echo {
+                    var off: usize = 0
+                    while off < n {
+                        let k: usize = stack.net_send(&(*d).s, c, &(*d).buf[off], n - off)
+                        if k == 0 {
+                            now = now_us(d)
+                            turn(d, now)
+                        } else {
+                            off = off + k
+                            back = back + k
+                        }
+                    }
+                }
+            }
+            let st: u32 = stack.net_state(&(*d).s, c)
+            if st == tcp.S_CLOSE_WAIT && stack.net_readable(&(*d).s, c) == 0 {
+                if !echo || back >= got {
+                    stack.net_close(&(*d).s, c)
+                    fin = true
+                }
+            }
+            if (st == tcp.S_CLOSED || st == tcp.S_TIME_WAIT) && fin { done = true }
+        }
+        if turn(d, now) + busy == 0 { wait_ready(d, 2) }
+        now = now_us(d)
+    }
+    var us: u64 = 1
+    if t_last > t_first { us = t_last - t_first }
+    say("octets", got as u64)
+    say("echoed", back as u64)
+    say("micros", us)
+    say("kb_per_s", (got as u64) * 1000 / us)
+    say("frames_in", stack.net_stat(&(*d).s, stack.NS_RX))
+    say("frames_out", stack.net_stat(&(*d).s, stack.NS_TX))
+    say("rexmit", tcp.tcp_stat(stack.net_tcp(&(*d).s), tcp.ST_REXMIT))
+    say("fast_rexmit", tcp.tcp_stat(stack.net_tcp(&(*d).s), tcp.ST_FAST_REXMIT))
+    say("csum_refused", tcp.tcp_stat(stack.net_tcp(&(*d).s), tcp.ST_CSUM))
+    say("out_of_order", tcp.tcp_stat(stack.net_tcp(&(*d).s), tcp.ST_OOO))
+    say("states", tcp.tcp_seen(stack.net_tcp(&(*d).s)) as u64)
+    say("closed_cleanly", fin as u64)
+    if got >= expect { return 0 }
+    return 1
+}
+
+fn mode_http(d: *mut Drv, port: u16, limit_us: u64) -> i32 {
+    let l: i32 = stack.net_listen(&(*d).s, port)
+    var c: i32 = 0 - 1
+    var answered: bool = false
+    var request: usize = 0
+    var done: bool = false
+    let t0: u64 = now_us(d)
+    var now: u64 = t0
+    var body: [u8; _] = "firn lib/net answering over its own tcp\n"
+    var head: [u8; _] = "HTTP/1.1 200 OK\r\nServer: firn-k3\r\nContent-Type: text/plain\r\nContent-Length: 40\r\nConnection: close\r\n\r\n"
+    while !done && now - t0 < limit_us {
+        if c < 0 { c = stack.net_accept(&(*d).s, l) }
+        if c >= 0 {
+            let n: usize = stack.net_recv(&(*d).s, c, &(*d).buf[0], BUFCAP)
+            if n > 0 { request = request + n }
+            if request > 0 && !answered {
+                var sent: usize = 0
+                while sent < HEAD_LEN {
+                    let k: usize = stack.net_send(&(*d).s, c, &head[sent], HEAD_LEN - sent)
+                    if k == 0 { now = now_us(d); turn(d, now) } else { sent = sent + k }
+                }
+                sent = 0
+                while sent < BODY_LEN {
+                    let k: usize = stack.net_send(&(*d).s, c, &body[sent], BODY_LEN - sent)
+                    if k == 0 { now = now_us(d); turn(d, now) } else { sent = sent + k }
+                }
+                answered = true
+                stack.net_close(&(*d).s, c)
+            }
+            let sc: u32 = stack.net_state(&(*d).s, c)
+            if answered && (sc == tcp.S_CLOSED || sc == tcp.S_TIME_WAIT) {
+                done = true
+            }
+        }
+        if turn(d, now) == 0 { wait_ready(d, 2) }
+        now = now_us(d)
+    }
+    say("request_octets", request as u64)
+    say("answered", answered as u64)
+    say("states", tcp.tcp_seen(stack.net_tcp(&(*d).s)) as u64)
+    if answered { return 0 }
+    return 1
+}
+
+fn fill(p: *mut u8, n: usize, seed: u64) -> u64 {
+    var s: u64 = seed
+    var i: usize = 0
+    while i < n {
+        s = s *% 6364136223846793005 +% 1442695040888963407
+        wire.st8(p, i, ((s >> 33) & 0xFF) as u8)
+        i = i + 1
+    }
+    return s
+}
+
+// The active side: this stack opens the connection to a server the Linux
+// kernel is carrying, pushes `total` octets through it and compares what
+// comes back.
+fn mode_send(d: *mut Drv, dip: u32, port: u16, total: usize, limit_us: u64) -> i32 {
+    let t0: u64 = now_us(d)
+    var now: u64 = t0
+    let c: i32 = stack.net_connect(&(*d).s, dip, port, now)
+    var sent: usize = 0
+    var got: usize = 0
+    var wrong: usize = 0
+    var seed_s: u64 = 4242
+    var seed_r: u64 = 4242
+    var closed: bool = false
+    var established: bool = false
+    var done: bool = false
+    while !done && now - t0 < limit_us {
+        let st: u32 = stack.net_state(&(*d).s, c)
+        if st == tcp.S_ESTABLISHED { established = true }
+        if established && sent < total {
+            var chunk: usize = total - sent
+            if chunk > 32768 { chunk = 32768 }
+            let room: usize = stack.net_writable(&(*d).s, c)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                seed_s = fill(&(*d).buf[0], chunk, seed_s)
+                sent = sent + stack.net_send(&(*d).s, c, &(*d).buf[0], chunk)
+            }
+        }
+        let n: usize = stack.net_recv(&(*d).s, c, &(*d).buf[0], BUFCAP)
+        if n > 0 {
+            seed_r = fill(&(*d).cmp[0], n, seed_r)
+            var i: usize = 0
+            while i < n {
+                if (*d).buf[i] != (*d).cmp[i] { wrong = wrong + 1 }
+                i = i + 1
+            }
+            got = got + n
+        }
+        if sent == total && got >= total && !closed {
+            stack.net_close(&(*d).s, c)
+            closed = true
+        }
+        // TIME_WAIT is a finished close. Sitting out its two minutes would
+        // add two minutes to every run and prove nothing that
+        // tools/k3net/unit.fi does not already prove with a clock it owns.
+        let sc: u32 = stack.net_state(&(*d).s, c)
+        if closed && (sc == tcp.S_CLOSED || sc == tcp.S_TIME_WAIT) { done = true }
+        if turn(d, now) + n == 0 { wait_ready(d, 2) }
+        now = now_us(d)
+    }
+    say("sent", sent as u64)
+    say("echoed_back", got as u64)
+    say("wrong_octets", wrong as u64)
+    say("established", established as u64)
+    say("closed", closed as u64)
+    say("rexmit", tcp.tcp_stat(stack.net_tcp(&(*d).s), tcp.ST_REXMIT))
+    say("fast_rexmit", tcp.tcp_stat(stack.net_tcp(&(*d).s), tcp.ST_FAST_REXMIT))
+    say("states", tcp.tcp_seen(stack.net_tcp(&(*d).s)) as u64)
+    if sent == total && got == total && wrong == 0 { return 0 }
+    return 1
+}
+
+// A switch that only the counter-checks use: with it the stack sends
+// nothing a second time. Every measurement that claims retransmission
+// works has to collapse when it is set -- otherwise it was measuring
+// something else.
+fn wants_no_rexmit(start: u64) -> bool {
+    var t: [u8; _] = "norexmit\0"
+    var i: usize = 1
+    while i < rt.arg_count(start) {
+        let p: u64 = rt.arg_ptr(start, i)
+        if rt.c_length(p) == 8 && rt.mem_eq(p, (&t[0]) as u64, 8) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 5 {
+        saytext("drv <interface> <ip> <mask> <mode> [arguments]")
+        return 2
+    }
+    let p: u64 = rt.heap_alloc(size_of[Drv]())
+    if p == 0 { return 3 }
+    let d: *mut Drv = p as *mut Drv
+    (*d).fd = 0 - 1
+
+    let ifname: u64 = rt.arg_ptr(start, 1)
+    let ip: u32 = parse_ip(rt.arg_ptr(start, 2))
+    let mask: u32 = parse_ip(rt.arg_ptr(start, 3))
+    let mode: u64 = rt.arg_ptr(start, 4)
+
+    if !open_link(d, ifname) {
+        saytext("link failed")
+        return 4
+    }
+    stack.net_init(&(*d).s, ip, mask, 0, mac_of_ifr(d), now_us(d) +% 0x5150)
+    // The default smallest retransmission timeout of 200 ms is the one
+    // Linux uses and it stays in place for every measurement against the
+    // Linux kernel -- nothing here is tuned to make a number look better.
+    if wants_no_rexmit(start) {
+        tcp.tcp_set_no_rexmit(stack.net_tcp(&(*d).s), true)
+    }
+    say("no_rexmit", wants_no_rexmit(start) as u64)
+
+    var t_idle: [u8; 5] = "idle\0"
+    var t_sink: [u8; 5] = "sink\0"
+    var t_serve: [u8; 6] = "serve\0"
+    var t_http: [u8; 5] = "http\0"
+    var t_send: [u8; 5] = "send\0"
+    var t_udp: [u8; 8] = "udpecho\0"
+    let ml: usize = rt.c_length(mode)
+
+    say("ifindex", (*d).ifindex as u64)
+    say("ip", ip as u64)
+    saytext("ready")
+
+    if ml == 4 && rt.mem_eq(mode, (&t_idle[0]) as u64, 4) {
+        let sec: u64 = parse_dec(rt.arg_ptr(start, 5), rt.c_length(rt.arg_ptr(start, 5)), 5) as u64
+        return mode_idle(d, sec)
+    }
+    if ml == 4 && rt.mem_eq(mode, (&t_sink[0]) as u64, 4) {
+        let port: u16 = parse_dec(rt.arg_ptr(start, 5), rt.c_length(rt.arg_ptr(start, 5)), 4711) as u16
+        let ex: usize = parse_dec(rt.arg_ptr(start, 6), rt.c_length(rt.arg_ptr(start, 6)), 0) as usize
+        let lim: u64 = parse_dec(rt.arg_ptr(start, 7), rt.c_length(rt.arg_ptr(start, 7)), 60) as u64
+        return mode_sink(d, port, ex, false, lim * 1000000)
+    }
+    if ml == 5 && rt.mem_eq(mode, (&t_serve[0]) as u64, 5) {
+        let port: u16 = parse_dec(rt.arg_ptr(start, 5), rt.c_length(rt.arg_ptr(start, 5)), 4711) as u16
+        let ex: usize = parse_dec(rt.arg_ptr(start, 6), rt.c_length(rt.arg_ptr(start, 6)), 0) as usize
+        let lim: u64 = parse_dec(rt.arg_ptr(start, 7), rt.c_length(rt.arg_ptr(start, 7)), 60) as u64
+        return mode_sink(d, port, ex, true, lim * 1000000)
+    }
+    if ml == 4 && rt.mem_eq(mode, (&t_http[0]) as u64, 4) {
+        let port: u16 = parse_dec(rt.arg_ptr(start, 5), rt.c_length(rt.arg_ptr(start, 5)), 8080) as u16
+        let lim: u64 = parse_dec(rt.arg_ptr(start, 6), rt.c_length(rt.arg_ptr(start, 6)), 30) as u64
+        return mode_http(d, port, lim * 1000000)
+    }
+    if ml == 7 && rt.mem_eq(mode, (&t_udp[0]) as u64, 7) {
+        let port: u16 = parse_dec(rt.arg_ptr(start, 5), rt.c_length(rt.arg_ptr(start, 5)), 53) as u16
+        let lim: u64 = parse_dec(rt.arg_ptr(start, 6), rt.c_length(rt.arg_ptr(start, 6)), 10) as u64
+        return mode_udpecho(d, port, lim * 1000000)
+    }
+    if ml == 4 && rt.mem_eq(mode, (&t_send[0]) as u64, 4) {
+        let dip: u32 = parse_ip(rt.arg_ptr(start, 5))
+        let port: u16 = parse_dec(rt.arg_ptr(start, 6), rt.c_length(rt.arg_ptr(start, 6)), 9000) as u16
+        let n: usize = parse_dec(rt.arg_ptr(start, 7), rt.c_length(rt.arg_ptr(start, 7)), 65536) as usize
+        let lim: u64 = parse_dec(rt.arg_ptr(start, 8), rt.c_length(rt.arg_ptr(start, 8)), 60) as u64
+        return mode_send(d, dip, port, n, lim * 1000000)
+    }
+    saytext("unknown mode")
+    return 5
+}

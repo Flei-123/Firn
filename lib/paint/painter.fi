@@ -1,0 +1,1235 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/paint/painter.fi -- THE PAINTER. The display list becomes pixels.
+//
+// Everything a page can put on a screen with this engine happens here:
+// round corners, borders in eight styles, two kinds of gradient, box and
+// text shadows with a real blur, transparency, the separable blend modes,
+// clipping, and the letters themselves. No foreign library; the only two
+// things underneath are `font.raster` (coverage per pixel) and
+// `paint.canvas` (one blended pixel).
+//
+// ------------------------------------------- THREE RASTERISERS, NOT ONE
+//
+// The painter keeps three coverage windows, and each has a reason:
+//
+//   `ra`  the shape being drawn
+//   `rb`  the shape being SUBTRACTED from it -- the inner edge of a
+//         border ring, the border box that an outer shadow must not be
+//         painted under
+//   `rc`  the blur working area
+//
+// A border is not a shape but the DIFFERENCE of two shapes, and the
+// difference has to be taken on the coverage and not on the pixels: doing
+// it on the pixels means drawing the outer rectangle and then drawing the
+// inner one in the background colour, which is visibly wrong the moment
+// anything is behind the box.
+//
+// ---------------------------------------------- THE ARITHMETIC OF ROUND 72
+//
+// `+`, `-` and `*` panic on overflow. Every index here is computed in
+// `i64`, clamped against the canvas, and only then cast; every coordinate
+// that may be negative (a shadow with a negative offset, a glyph that
+// reaches left of its pen) stays in `f64` until it has been clipped.
+import html.mem
+import std.math
+import browser.node
+import css.cascade
+import layout.box
+import font.raster
+import font.ttf
+import font.metrics
+import paint.canvas
+import paint.display
+import paint.png
+
+export {
+    Painter,
+    painter_new, painter_init, painter_free, painter_ok,
+    painter_run, painter_canvas, painter_set_font,
+    paint_rounded_rect, painter_glyph_ink,
+}
+
+const GLYPH_SCRATCH: usize = 1 << 20
+
+// The magic number of the circle: a quarter circle drawn as a cubic
+// Bezier needs its control points at 4/3 * (sqrt(2) - 1) of the radius.
+// A FUNCTION and not a `const`, because stage 0 evaluates constants as
+// integers (SPEC 12).
+#[no_gc]
+fn kappa() -> f64 {
+    return 0.5522847498307936
+}
+
+// The three functions of `std.math` this file needs in a `#[no_gc]`
+// context. Same guard as in lib/font/raster.fi: `as i64` is checked.
+#[no_gc]
+fn ffloor(x: f64) -> f64 {
+    if x != x || x > 9.0e15 || x < 0.0 - 9.0e15 {
+        return 0.0
+    }
+    let t: f64 = (x as i64) as f64
+    if t > x {
+        return t - 1.0
+    }
+    return t
+}
+
+#[no_gc]
+fn fabs2(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+#[no_gc]
+fn fsqrt2(x: f64) -> f64 {
+    if x != x || x <= 0.0 {
+        return 0.0
+    }
+    var g: f64 = 1.0
+    while g * g < x {
+        g = g * 2.0
+    }
+    var i: i32 = 0
+    while i < 8 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+struct Painter {
+    cv: canvas.Canvas,
+    ra: raster.Raster,
+    rb: raster.Raster,
+    rc: raster.Raster,
+    abuf: *mut u8,
+    bbuf: *mut u8,
+    cbuf: *mut u8,
+    tmp: *mut u8, // one row for the blur
+    scratch: *mut u8, // the point buffer of the TrueType decoder
+    rcap: usize,
+    tmpcap: usize,
+    fm: u64,
+    ok: usize,
+    ink: u64, // how many pixels a glyph really set -- the round K7B guard
+}
+
+#[no_gc]
+fn painter_new() -> Painter {
+    return Painter {
+        cv: canvas.canvas_new(),
+        ra: raster.raster_new(),
+        rb: raster.raster_new(),
+        rc: raster.raster_new(),
+        abuf: 0 as *mut u8,
+        bbuf: 0 as *mut u8,
+        cbuf: 0 as *mut u8,
+        tmp: 0 as *mut u8,
+        scratch: 0 as *mut u8,
+        rcap: 0,
+        tmpcap: 0,
+        fm: 0,
+        ok: 0,
+        ink: 0,
+    }
+}
+
+#[no_gc]
+fn painter_init(p: *mut Painter, w: usize, h: usize) -> bool {
+    if !canvas.canvas_init(&(*p).cv, w, h) {
+        return false
+    }
+    let need: usize = raster.raster_bytes_needed(w, h)
+    (*p).rcap = need
+    (*p).abuf = mem.heap_alloc(need)
+    (*p).bbuf = mem.heap_alloc(need)
+    (*p).cbuf = mem.heap_alloc(need)
+    (*p).tmpcap = (w + h + 8) * 8
+    (*p).tmp = mem.heap_alloc((*p).tmpcap)
+    (*p).scratch = mem.heap_alloc(GLYPH_SCRATCH)
+    if (*p).abuf as usize == 0 || (*p).bbuf as usize == 0 ||
+    (*p).cbuf as usize == 0 || (*p).tmp as usize == 0 ||
+    (*p).scratch as usize == 0 {
+        return false
+    }
+    raster.raster_attach(&(*p).ra, (*p).abuf, need)
+    raster.raster_attach(&(*p).rb, (*p).bbuf, need)
+    raster.raster_attach(&(*p).rc, (*p).cbuf, need)
+    (*p).ok = 1
+    return true
+}
+
+#[no_gc]
+fn painter_free(p: *mut Painter) {
+    canvas.canvas_free(&(*p).cv)
+    mem.heap_free((*p).abuf, (*p).rcap)
+    mem.heap_free((*p).bbuf, (*p).rcap)
+    mem.heap_free((*p).cbuf, (*p).rcap)
+    mem.heap_free((*p).tmp, (*p).tmpcap)
+    mem.heap_free((*p).scratch, GLYPH_SCRATCH)
+    (*p).ok = 0
+}
+
+#[no_gc]
+fn painter_ok(p: *mut Painter) -> bool {
+    return (*p).ok != 0
+}
+
+#[no_gc]
+fn painter_canvas(p: *mut Painter) -> *mut canvas.Canvas {
+    return &(*p).cv
+}
+
+#[no_gc]
+fn painter_set_font(p: *mut Painter, fm: u64) {
+    (*p).fm = fm
+}
+
+#[no_gc]
+fn painter_glyph_ink(p: *mut Painter) -> u64 {
+    return (*p).ink
+}
+
+// ------------------------------------------------------------ Geometry
+
+#[no_gc]
+fn clampi(v: f64, lo: i64, hi: i64) -> i64 {
+    if v != v {
+        return lo
+    }
+    if v < (lo as f64) {
+        return lo
+    }
+    if v > (hi as f64) {
+        return hi
+    }
+    return v as i64
+}
+
+// The window a shape needs: its bounding box, grown by one pixel for the
+// anti-aliasing and cut down to the canvas.
+#[no_gc]
+fn window(p: *mut Painter, x0: f64, y0: f64, x1: f64, y1: f64,
+    ox: *mut i64, oy: *mut i64, w: *mut usize, h: *mut usize) -> bool {
+    let cw: i64 = canvas.canvas_width(&(*p).cv) as i64
+    let ch: i64 = canvas.canvas_height(&(*p).cv) as i64
+    let a: i64 = clampi(x0 - 1.0, 0, cw)
+    let b: i64 = clampi(y0 - 1.0, 0, ch)
+    let c: i64 = clampi(x1 + 2.0, 0, cw)
+    let d: i64 = clampi(y1 + 2.0, 0, ch)
+    if c <= a || d <= b {
+        return false
+    }
+    *ox = a
+    *oy = b
+    *w = (c - a) as usize
+    *h = (d - b) as usize
+    return true
+}
+
+// A quarter of an ellipse as a cubic. `sx`/`sy` and `ex`/`ey` lie on the
+// two axes, `cx`/`cy` is the corner they turn around.
+#[no_gc]
+fn arc(r: *mut raster.Raster, sx: f64, sy: f64, cx: f64, cy: f64,
+    ex: f64, ey: f64) {
+    raster.raster_cubic(r,
+        sx, sy,
+        sx + (cx - sx) * kappa(), sy + (cy - sy) * kappa(),
+        ex + (cx - ex) * kappa(), ey + (cy - ey) * kappa(),
+        ex, ey)
+}
+
+#[no_gc]
+fn rad_at(rad: *mut f64, i: usize) -> f64 {
+    return *((rad as u64 + (i * 8) as u64) as *mut f64)
+}
+
+// The path of a rounded rectangle, clockwise. With all eight radii zero
+// this is four straight lines, and the two horizontal ones cost nothing
+// (a horizontal edge changes no coverage).
+#[no_gc]
+fn path_round_rect(r: *mut raster.Raster, x0: f64, y0: f64, x1: f64,
+    y1: f64, rad: *mut f64) {
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+    let tlh: f64 = rad_at(rad, 0)
+    let tlv: f64 = rad_at(rad, 1)
+    let trh: f64 = rad_at(rad, 2)
+    let trv: f64 = rad_at(rad, 3)
+    let brh: f64 = rad_at(rad, 4)
+    let brv: f64 = rad_at(rad, 5)
+    let blh: f64 = rad_at(rad, 6)
+    let blv: f64 = rad_at(rad, 7)
+    raster.raster_line(r, x0 + tlh, y0, x1 - trh, y0)
+    if trh > 0.0 || trv > 0.0 {
+        arc(r, x1 - trh, y0, x1, y0, x1, y0 + trv)
+    }
+    raster.raster_line(r, x1, y0 + trv, x1, y1 - brv)
+    if brh > 0.0 || brv > 0.0 {
+        arc(r, x1, y1 - brv, x1, y1, x1 - brh, y1)
+    }
+    raster.raster_line(r, x1 - brh, y1, x0 + blh, y1)
+    if blh > 0.0 || blv > 0.0 {
+        arc(r, x0 + blh, y1, x0, y1, x0, y1 - blv)
+    }
+    raster.raster_line(r, x0, y1 - blv, x0, y0 + tlv)
+    if tlh > 0.0 || tlv > 0.0 {
+        arc(r, x0, y0 + tlv, x0, y0, x0 + tlh, y0)
+    }
+}
+
+// The radii of the INNER edge of a border ring. A corner whose radius is
+// smaller than the border is square on the inside -- that is why the
+// inside of a thick, slightly rounded box has sharp corners, and it is
+// not a bug.
+#[no_gc]
+fn inner_radii(rad: *mut f64, bt: f64, br: f64, bb: f64, bl: f64,
+    out: *mut f64) {
+    st(out, 0, sub0(rad_at(rad, 0), bl))
+    st(out, 1, sub0(rad_at(rad, 1), bt))
+    st(out, 2, sub0(rad_at(rad, 2), br))
+    st(out, 3, sub0(rad_at(rad, 3), bt))
+    st(out, 4, sub0(rad_at(rad, 4), br))
+    st(out, 5, sub0(rad_at(rad, 5), bb))
+    st(out, 6, sub0(rad_at(rad, 6), bl))
+    st(out, 7, sub0(rad_at(rad, 7), bb))
+}
+
+#[no_gc]
+fn st(p: *mut f64, i: usize, v: f64) {
+    *((p as u64 + (i * 8) as u64) as *mut f64) = v
+}
+
+#[no_gc]
+fn sub0(a: f64, b: f64) -> f64 {
+    if a <= b {
+        return 0.0
+    }
+    return a - b
+}
+
+// A rounded rectangle in one colour, the whole point of the exercise.
+#[no_gc]
+fn paint_rounded_rect(p: *mut Painter, x0: f64, y0: f64, x1: f64, y1: f64,
+    rad: *mut f64, col: u32, alpha: f64) {
+    if (col >> 24) == 0 as u32 || alpha <= 0.0 {
+        return
+    }
+    var any: bool = false
+    var i: usize = 0
+    while i < 8 {
+        if rad_at(rad, i) > 0.0 {
+            any = true
+        }
+        i = i + 1
+    }
+    if !any {
+        // The fast path, and it is not a micro-optimisation: on an
+        // ordinary page nine out of ten shapes are a plain rectangle, and
+        // this one needs no coverage buffer and no clearing of it.
+        canvas.canvas_fill_rect(&(*p).cv, x0, y0, x1, y1, with_alpha(col, alpha))
+        return
+    }
+    var ox: i64 = 0
+    var oy: i64 = 0
+    var w: usize = 0
+    var h: usize = 0
+    if !window(p, x0, y0, x1, y1, &ox, &oy, &w, &h) {
+        return
+    }
+    if !raster.raster_begin(&(*p).ra, ox as f64, oy as f64, w, h) {
+        return
+    }
+    path_round_rect(&(*p).ra, x0, y0, x1, y1, rad)
+    raster.raster_finish(&(*p).ra)
+    canvas.canvas_fill_raster(&(*p).cv, &(*p).ra, ox as usize, oy as usize,
+        with_alpha(col, alpha))
+}
+
+#[no_gc]
+fn with_alpha(col: u32, alpha: f64) -> u32 {
+    if alpha >= 1.0 {
+        return col
+    }
+    var a: f64 = ((col >> 24) & 255 as u32) as f64 * alpha
+    if a < 0.0 {
+        a = 0.0
+    }
+    if a > 255.0 {
+        a = 255.0
+    }
+    return ((a as i64) as u32 << 24) | (col & 0x00FFFFFF as u32)
+}
+
+// ------------------------------------------------------------- Borders
+
+#[no_gc]
+fn shade(col: u32, f: f64) -> u32 {
+    let a: u32 = (col >> 24) & 255 as u32
+    let r: u32 = scale8((col >> 16) & 255 as u32, f)
+    let g: u32 = scale8((col >> 8) & 255 as u32, f)
+    let b: u32 = scale8(col & 255 as u32, f)
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+#[no_gc]
+fn scale8(v: u32, f: f64) -> u32 {
+    var x: f64 = (v as f64) * f
+    if x < 0.0 {
+        x = 0.0
+    }
+    if x > 255.0 {
+        x = 255.0
+    }
+    return (x as i64) as u32
+}
+
+// WHICH SIDE DOES THIS PIXEL BELONG TO? The mitre rule: the corner of a
+// border is cut along the line from the outer corner to the inner one, so
+// the pixel goes to whichever side it is RELATIVELY nearest to. Dividing
+// by the width of the side is what makes a 1 px top and a 20 px left meet
+// at the right angle instead of at 45 degrees.
+#[no_gc]
+fn which_side(px: f64, py: f64, x0: f64, y0: f64, x1: f64, y1: f64,
+    bt: f64, br: f64, bb: f64, bl: f64) -> u32 {
+    var best: f64 = 1.0e30
+    var side: u32 = 0
+    if bt > 0.0 {
+        let d: f64 = (py - y0) / bt
+        if d < best {
+            best = d
+            side = 0
+        }
+    }
+    if br > 0.0 {
+        let d: f64 = (x1 - px) / br
+        if d < best {
+            best = d
+            side = 1
+        }
+    }
+    if bb > 0.0 {
+        let d: f64 = (y1 - py) / bb
+        if d < best {
+            best = d
+            side = 2
+        }
+    }
+    if bl > 0.0 {
+        let d: f64 = (px - x0) / bl
+        if d < best {
+            best = d
+            side = 3
+        }
+    }
+    return side
+}
+
+// The dash pattern along a side. 1.0 = draw, 0.0 = leave. Not
+// anti-aliased along the dash: browsers do not either, and a soft edge on
+// a dash is more visible than a hard one.
+#[no_gc]
+fn dash_on(style: u32, side: u32, px: f64, py: f64, bw: f64) -> bool {
+    if style != cascade.BS_DOTTED && style != cascade.BS_DASHED {
+        return true
+    }
+    if bw <= 0.0 {
+        return true
+    }
+    var t: f64 = px
+    if side == 1 || side == 3 {
+        t = py
+    }
+    var period: f64 = bw * 2.0
+    var on: f64 = bw
+    if style == cascade.BS_DASHED {
+        period = bw * 3.0
+        on = bw * 2.0
+    }
+    var m: f64 = t - ffloor(t / period) * period
+    return m < on
+}
+
+// One ring between two rounded rectangles, coloured side by side.
+#[no_gc]
+fn paint_ring(p: *mut Painter, ox0: f64, oy0: f64, ox1: f64, oy1: f64,
+    orad: *mut f64, ix0: f64, iy0: f64, ix1: f64, iy1: f64, irad: *mut f64,
+    bt: f64, br: f64, bb: f64, bl: f64,
+    ct: u32, cr: u32, cb: u32, cl: u32,
+    st_: u32, sr: u32, sb: u32, sl: u32,
+    x0: f64, y0: f64, x1: f64, y1: f64, alpha: f64) {
+    var wx: i64 = 0
+    var wy: i64 = 0
+    var w: usize = 0
+    var h: usize = 0
+    if !window(p, ox0, oy0, ox1, oy1, &wx, &wy, &w, &h) {
+        return
+    }
+    if !raster.raster_begin(&(*p).ra, wx as f64, wy as f64, w, h) {
+        return
+    }
+    path_round_rect(&(*p).ra, ox0, oy0, ox1, oy1, orad)
+    raster.raster_finish(&(*p).ra)
+    if !raster.raster_begin(&(*p).rb, wx as f64, wy as f64, w, h) {
+        return
+    }
+    path_round_rect(&(*p).rb, ix0, iy0, ix1, iy1, irad)
+    raster.raster_finish(&(*p).rb)
+    var yy: usize = 0
+    while yy < h {
+        var xx: usize = 0
+        while xx < w {
+            let a: f64 = raster.raster_cov(&(*p).ra, xx, yy)
+            if a > 0.0 {
+                let bcov: f64 = raster.raster_cov(&(*p).rb, xx, yy)
+                var v: f64 = a - bcov
+                if v > 0.0 {
+                    let px: f64 = (wx + xx as i64) as f64 + 0.5
+                    let py: f64 = (wy + yy as i64) as f64 + 0.5
+                    let side: u32 = which_side(px, py, x0, y0, x1, y1,
+                        bt, br, bb, bl)
+                    var col: u32 = ct
+                    var sty: u32 = st_
+                    var bw: f64 = bt
+                    if side == 1 {
+                        col = cr
+                        sty = sr
+                        bw = br
+                    } else if side == 2 {
+                        col = cb
+                        sty = sb
+                        bw = bb
+                    } else if side == 3 {
+                        col = cl
+                        sty = sl
+                        bw = bl
+                    }
+                    if sty != cascade.BS_NONE && sty != cascade.BS_HIDDEN &&
+                    dash_on(sty, side, px, py, bw) {
+                        canvas.canvas_blend(&(*p).cv,
+                            (wx + xx as i64) as usize,
+                            (wy + yy as i64) as usize,
+                            with_alpha(col, alpha), v)
+                    }
+                }
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// The 3D border styles. `inset` lights the bottom and the right,
+// `outset` the top and the left, `groove` and `ridge` are the two of them
+// one inside the other.
+#[no_gc]
+fn side_shade(style: u32, side: u32, outer_half: bool) -> f64 {
+    if style == cascade.BS_INSET || style == cascade.BS_OUTSET ||
+    style == cascade.BS_GROOVE || style == cascade.BS_RIDGE {
+        var dark_top: bool = true
+        if style == cascade.BS_OUTSET {
+            dark_top = false
+        } else if style == cascade.BS_GROOVE {
+            dark_top = outer_half
+        } else if style == cascade.BS_RIDGE {
+            dark_top = !outer_half
+        }
+        let is_top: bool = side == 0 || side == 3
+        if is_top == dark_top {
+            return 0.5
+        }
+        return 1.0
+    }
+    return 1.0
+}
+
+fn paint_border(p: *mut Painter, c: Gc[Cmd]) {
+    let b: Gc[Box] = c.src
+    let s: Gc[Style] = c.style
+    let x0: f64 = c.x
+    let y0: f64 = c.y
+    let x1: f64 = c.x + c.w
+    let y1: f64 = c.y + c.h
+    var orad: [f64; 8] = [0.0; 8]
+    var i: usize = 0
+    while i < 8 {
+        orad[i] = c.rad[i]
+        i = i + 1
+    }
+    let stt: u32 = cascade.style_border_style(s, 0)
+    let str_: u32 = cascade.style_border_style(s, 1)
+    let stb: u32 = cascade.style_border_style(s, 2)
+    let stl: u32 = cascade.style_border_style(s, 3)
+    var ct: u32 = cascade.style_color(s, 1)
+    var cr: u32 = cascade.style_color(s, 2)
+    var cb: u32 = cascade.style_color(s, 3)
+    var cl: u32 = cascade.style_color(s, 4)
+    // `double` is TWO rings with a gap of a third in between.
+    let dbl: bool = stt == cascade.BS_DOUBLE || str_ == cascade.BS_DOUBLE ||
+    stb == cascade.BS_DOUBLE || stl == cascade.BS_DOUBLE
+    let three_d: bool = stt == cascade.BS_GROOVE || stt == cascade.BS_RIDGE ||
+    str_ == cascade.BS_GROOVE || str_ == cascade.BS_RIDGE ||
+    stb == cascade.BS_GROOVE || stb == cascade.BS_RIDGE ||
+    stl == cascade.BS_GROOVE || stl == cascade.BS_RIDGE
+    if stt == cascade.BS_INSET || stt == cascade.BS_OUTSET {
+        ct = shade(ct, side_shade(stt, 0, true))
+    }
+    if str_ == cascade.BS_INSET || str_ == cascade.BS_OUTSET {
+        cr = shade(cr, side_shade(str_, 1, true))
+    }
+    if stb == cascade.BS_INSET || stb == cascade.BS_OUTSET {
+        cb = shade(cb, side_shade(stb, 2, true))
+    }
+    if stl == cascade.BS_INSET || stl == cascade.BS_OUTSET {
+        cl = shade(cl, side_shade(stl, 3, true))
+    }
+    if dbl || three_d {
+        paint_border_split(p, c, b, s, x0, y0, x1, y1, &orad[0],
+            stt, str_, stb, stl, dbl)
+        return
+    }
+    var irad: [f64; 8] = [0.0; 8]
+    inner_radii(&orad[0], b.bt, b.br, b.bb, b.bl, &irad[0])
+    paint_ring(p, x0, y0, x1, y1, &orad[0],
+        x0 + b.bl, y0 + b.bt, x1 - b.br, y1 - b.bb, &irad[0],
+        b.bt, b.br, b.bb, b.bl, ct, cr, cb, cl,
+        stt, str_, stb, stl, x0, y0, x1, y1, c.alpha)
+}
+
+// `double`, `groove` and `ridge`: the ring is drawn twice, once for the
+// outer third or half and once for the inner one.
+fn paint_border_split(p: *mut Painter, c: Gc[Cmd], b: Gc[Box],
+    s: Gc[Style], x0: f64, y0: f64, x1: f64, y1: f64, orad: *mut f64,
+    stt: u32, str_: u32, stb: u32, stl: u32, dbl: bool) {
+    var f1: f64 = 0.5
+    var f2: f64 = 0.5
+    if dbl {
+        f1 = 1.0 / 3.0
+        f2 = 2.0 / 3.0
+    }
+    var half: u32 = 0
+    while half < 2 {
+        var a0: f64 = 0.0
+        var a1: f64 = f1
+        if half == 1 as u32 {
+            a0 = f2
+            a1 = 1.0
+        }
+        let ot: f64 = b.bt * a0
+        let orr: f64 = b.br * a0
+        let ob: f64 = b.bb * a0
+        let ol: f64 = b.bl * a0
+        let it: f64 = b.bt * a1
+        let ir: f64 = b.br * a1
+        let ib: f64 = b.bb * a1
+        let il: f64 = b.bl * a1
+        var ra: [f64; 8] = [0.0; 8]
+        var rb2: [f64; 8] = [0.0; 8]
+        inner_radii(orad, ot, orr, ob, ol, &ra[0])
+        inner_radii(orad, it, ir, ib, il, &rb2[0])
+        let outer_half: bool = half == 0 as u32
+        let ct: u32 = shade(cascade.style_color(s, 1),
+            side_shade(stt, 0, outer_half))
+        let cr: u32 = shade(cascade.style_color(s, 2),
+            side_shade(str_, 1, outer_half))
+        let cb: u32 = shade(cascade.style_color(s, 3),
+            side_shade(stb, 2, outer_half))
+        let cl: u32 = shade(cascade.style_color(s, 4),
+            side_shade(stl, 3, outer_half))
+        paint_ring(p, x0 + ol, y0 + ot, x1 - orr, y1 - ob, &ra[0],
+            x0 + il, y0 + it, x1 - ir, y1 - ib, &rb2[0],
+            b.bt, b.br, b.bb, b.bl, ct, cr, cb, cl,
+            stt, str_, stb, stl, x0, y0, x1, y1, c.alpha)
+        half = half + 1 as u32
+    }
+}
+
+// ----------------------------------------------------------- Gradients
+
+// The colour at position `t` (0..1) of the stop list. Stops without a
+// position are spread evenly between the ones that have one -- the rule
+// of css-images-3, 3.4.2, and the reason
+// `linear-gradient(red, green, blue)` gives a green stripe in the middle.
+fn gradient_color(s: Gc[Style], t: f64, size: f64) -> u32 {
+    let n: u32 = cascade.style_gradient_count(s)
+    if n == 0 as u32 {
+        return 0
+    }
+    var tt: f64 = t
+    if tt < 0.0 {
+        tt = 0.0
+    }
+    if tt > 1.0 {
+        tt = 1.0
+    }
+    var prev_pos: f64 = 0.0
+    var prev_col: u32 = cascade.style_gradient_color(s, 0)
+    var i: u32 = 0
+    while i < n {
+        var pos: f64 = stop_pos(s, i, n, size)
+        let col: u32 = cascade.style_gradient_color(s, i as usize)
+        if pos < prev_pos {
+            pos = prev_pos
+        }
+        if tt <= pos {
+            if pos <= prev_pos {
+                return col
+            }
+            let f: f64 = (tt - prev_pos) / (pos - prev_pos)
+            return mix(prev_col, col, f)
+        }
+        prev_pos = pos
+        prev_col = col
+        i = i + 1 as u32
+    }
+    return prev_col
+}
+
+fn stop_pos(s: Gc[Style], i: u32, n: u32, size: f64) -> f64 {
+    let raw: f64 = cascade.style_gradient_pos(s, i as usize)
+    if raw >= 0.0 {
+        if raw > 1.0 && size > 0.0 {
+            return raw / size // a length, not a fraction
+        }
+        return raw
+    }
+    if n <= 1 as u32 {
+        return 0.0
+    }
+    return (i as f64) / ((n - 1 as u32) as f64)
+}
+
+#[no_gc]
+fn mix(a: u32, b: u32, f: f64) -> u32 {
+    return (chan(a, 24, b, f) << 24) | (chan(a, 16, b, f) << 16) |
+    (chan(a, 8, b, f) << 8) | chan(a, 0, b, f)
+}
+
+#[no_gc]
+fn chan(a: u32, sh: u32, b: u32, f: f64) -> u32 {
+    let av: f64 = ((a >> sh) & 255 as u32) as f64
+    let bv: f64 = ((b >> sh) & 255 as u32) as f64
+    var v: f64 = av + (bv - av) * f
+    if v < 0.0 {
+        v = 0.0
+    }
+    if v > 255.0 {
+        v = 255.0
+    }
+    return (v as i64) as u32
+}
+
+// ROUND B5: a decoded bitmap scaled into the content box of a replaced
+// element. Nearest neighbour, and that is a deliberate choice with a
+// price: an image shown SMALLER than it is aliases visibly, where a
+// browser would take a box filter. What it buys is that the picture is
+// exactly the picture when the box is its intrinsic size, which is the
+// case the acceptance run of this round measures pixel for pixel.
+// A better filter is a change to this one function and to nothing else.
+fn paint_image(p: *mut Painter, c: Gc[Cmd]) {
+    let im: *mut png.Image = (c.a as u64) as *mut png.Image
+    if im == 0 as *mut png.Image {
+        return
+    }
+    let iw: usize = png.image_width(im)
+    let ih: usize = png.image_height(im)
+    if iw == 0 || ih == 0 || c.w <= 0.0 || c.h <= 0.0 {
+        return
+    }
+    let x0: f64 = c.x
+    let y0: f64 = c.y
+    var yy: usize = 0
+    let outh: usize = (c.h + 0.5) as usize
+    let outw: usize = (c.w + 0.5) as usize
+    while yy < outh {
+        var xx: usize = 0
+        while xx < outw {
+            var sx: usize = (((xx as f64) + 0.5) * (iw as f64) / c.w)
+            as usize
+            var sy: usize = (((yy as f64) + 0.5) * (ih as f64) / c.h)
+            as usize
+            if sx >= iw {
+                sx = iw - 1
+            }
+            if sy >= ih {
+                sy = ih - 1
+            }
+            let px: u32 = png.image_pixel(im, sx, sy)
+            let a: f64 = ((px >> 24) & 255 as u32) as f64 / 255.0
+            if a > 0.0 {
+                canvas.canvas_blend(&(*p).cv, ((x0 + (xx as f64)) as usize),
+                    ((y0 + (yy as f64)) as usize),
+                    px | 4278190080 as u32, a * c.alpha)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+fn paint_gradient(p: *mut Painter, c: Gc[Cmd]) {
+    let s: Gc[Style] = c.style
+    let x0: f64 = c.x
+    let y0: f64 = c.y
+    let x1: f64 = c.x + c.w
+    let y1: f64 = c.y + c.h
+    var wx: i64 = 0
+    var wy: i64 = 0
+    var w: usize = 0
+    var h: usize = 0
+    if !window(p, x0, y0, x1, y1, &wx, &wy, &w, &h) {
+        return
+    }
+    var rad: [f64; 8] = [0.0; 8]
+    var i: usize = 0
+    var any: bool = false
+    while i < 8 {
+        rad[i] = c.rad[i]
+        if rad[i] > 0.0 {
+            any = true
+        }
+        i = i + 1
+    }
+    if !raster.raster_begin(&(*p).ra, wx as f64, wy as f64, w, h) {
+        return
+    }
+    path_round_rect(&(*p).ra, x0, y0, x1, y1, &rad[0])
+    raster.raster_finish(&(*p).ra)
+    let kind: u32 = cascade.style_gradient_kind(s)
+    let ang: f64 = cascade.style_gradient_angle(s)
+    let cx: f64 = (x0 + x1) / 2.0
+    let cy: f64 = (y0 + y1) / 2.0
+    // 0 degrees points at the TOP, and the numbers grow clockwise.
+    let dx: f64 = math.sin(ang)
+    let dy: f64 = 0.0 - math.cos(ang)
+    let bw: f64 = x1 - x0
+    let bh: f64 = y1 - y0
+    var len: f64 = fabs2(bw * dx) + fabs2(bh * dy)
+    if len <= 0.0 {
+        len = 1.0
+    }
+    // The radial gradient of this engine is the default: an ellipse in
+    // the middle, reaching to the farthest corner.
+    let rx: f64 = bw / 2.0
+    let ry: f64 = bh / 2.0
+    var yy: usize = 0
+    while yy < h {
+        var xx: usize = 0
+        while xx < w {
+            let cov: f64 = raster.raster_cov(&(*p).ra, xx, yy)
+            if cov > 0.0 {
+                let px: f64 = (wx + xx as i64) as f64 + 0.5
+                let py: f64 = (wy + yy as i64) as f64 + 0.5
+                var t: f64 = 0.0
+                if kind == cascade.GR_RADIAL {
+                    var u: f64 = 0.0
+                    var v: f64 = 0.0
+                    if rx > 0.0 {
+                        u = (px - cx) / rx
+                    }
+                    if ry > 0.0 {
+                        v = (py - cy) / ry
+                    }
+                    t = fsqrt2(u * u + v * v) / 1.4142135623730951
+                } else {
+                    t = ((px - cx) * dx + (py - cy) * dy) / len + 0.5
+                }
+                let col: u32 = gradient_color(s, t, len)
+                if (col >> 24) != 0 as u32 {
+                    canvas.canvas_blend(&(*p).cv,
+                        (wx + xx as i64) as usize, (wy + yy as i64) as usize,
+                        with_alpha(col, c.alpha), cov)
+                }
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// ------------------------------------------------------------- The blur
+//
+// A Gaussian blur, done as THREE box blurs. That is not an
+// approximation out of laziness: three passes of a box filter converge
+// on a Gaussian to within a per cent, and they cost O(1) per pixel
+// instead of O(radius). The relation between the CSS blur radius and the
+// standard deviation is fixed by css-backgrounds-3, 6.2: the shadow's
+// blur radius is TWICE the standard deviation.
+#[no_gc]
+fn box_size(blur: f64) -> i64 {
+    let sigma: f64 = blur / 2.0
+    if sigma <= 0.0 {
+        return 0
+    }
+    var d: i64 = (sigma * 1.8799712059398777 + 0.5) as i64
+    if d < 1 {
+        d = 1
+    }
+    if d > 200 {
+        d = 200
+    }
+    return d
+}
+
+// One box blur pass over the coverage of `ra`, in x and then in y.
+//
+// A RUNNING SUM, not a sum per pixel. The naive form costs O(radius) per
+// pixel and turns a 40 px blur into a visible pause; adding the pixel
+// entering the window and subtracting the one leaving it costs two
+// additions whatever the radius is. It has to be done in one direction at
+// a time -- a two dimensional box filter is separable, and that IS the
+// reason a box blur is worth using at all.
+#[no_gc]
+fn blur_pass(p: *mut Painter, w: usize, h: usize, d: i64) {
+    if d <= 0 || w == 0 || h == 0 {
+        return
+    }
+    let half: i64 = d / 2
+    let denom: f64 = (2 * half + 1) as f64
+    let tmp: u64 = (*p).tmp as u64
+    let wi: i64 = w as i64
+    let hi: i64 = h as i64
+    // ---- horizontal
+    var y: usize = 0
+    while y < h {
+        let row: u64 = raster.raster_cov_row(&(*p).ra, y)
+        var sum: f64 = 0.0
+        var k: i64 = 0
+        while k <= half {
+            if k < wi {
+                sum = sum + *((row + (k * 8) as u64) as *mut f64)
+            }
+            k = k + 1
+        }
+        var x: i64 = 0
+        while x < wi {
+            *((tmp + (x * 8) as u64) as *mut f64) = sum / denom
+            let add: i64 = x + half + 1
+            let drop: i64 = x - half
+            if add < wi {
+                sum = sum + *((row + (add * 8) as u64) as *mut f64)
+            }
+            if drop >= 0 {
+                sum = sum - *((row + (drop * 8) as u64) as *mut f64)
+            }
+            x = x + 1
+        }
+        x = 0
+        while x < wi {
+            *((row + (x * 8) as u64) as *mut f64) =
+            *((tmp + (x * 8) as u64) as *mut f64)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // ---- vertical
+    let stride: u64 = (raster.raster_cov_row(&(*p).ra, 1) -
+        raster.raster_cov_row(&(*p).ra, 0))
+    let base: u64 = raster.raster_cov_row(&(*p).ra, 0)
+    var xx: i64 = 0
+    while xx < wi {
+        var sum2: f64 = 0.0
+        var k2: i64 = 0
+        while k2 <= half {
+            if k2 < hi {
+                sum2 = sum2 + *((base + (k2 as u64) * stride +
+                        (xx * 8) as u64) as *mut f64)
+            }
+            k2 = k2 + 1
+        }
+        var yy: i64 = 0
+        while yy < hi {
+            *((tmp + (yy * 8) as u64) as *mut f64) = sum2 / denom
+            let add2: i64 = yy + half + 1
+            let drop2: i64 = yy - half
+            if add2 < hi {
+                sum2 = sum2 + *((base + (add2 as u64) * stride +
+                        (xx * 8) as u64) as *mut f64)
+            }
+            if drop2 >= 0 {
+                sum2 = sum2 - *((base + (drop2 as u64) * stride +
+                        (xx * 8) as u64) as *mut f64)
+            }
+            yy = yy + 1
+        }
+        yy = 0
+        while yy < hi {
+            *((base + (yy as u64) * stride + (xx * 8) as u64) as *mut f64) =
+            *((tmp + (yy * 8) as u64) as *mut f64)
+            yy = yy + 1
+        }
+        xx = xx + 1
+    }
+}
+
+fn paint_shadow(p: *mut Painter, c: Gc[Cmd]) {
+    let b: Gc[Box] = c.src
+    let blur: f64 = c.a
+    let spread: f64 = c.b
+    let inset: bool = c.flag != 0 as u32
+    var rad: [f64; 8] = [0.0; 8]
+    var i: usize = 0
+    while i < 8 {
+        rad[i] = c.rad[i]
+        i = i + 1
+    }
+    let grow: f64 = blur + fabs2(spread) + 2.0
+    var wx: i64 = 0
+    var wy: i64 = 0
+    var w: usize = 0
+    var h: usize = 0
+    if !window(p, c.x - grow, c.y - grow, c.x + c.w + grow,
+        c.y + c.h + grow, &wx, &wy, &w, &h) {
+        return
+    }
+    if !raster.raster_begin(&(*p).ra, wx as f64, wy as f64, w, h) {
+        return
+    }
+    if inset {
+        // The inset shadow is the shape TURNED INSIDE OUT: everything
+        // inside the padding box that the shrunken, blurred shape does
+        // NOT cover.
+        var ir: [f64; 8] = [0.0; 8]
+        inner_radii(&rad[0], b.bt, b.br, b.bb, b.bl, &ir[0])
+        let px0: f64 = c.x + b.bl + spread + cascade.style_box_shadow(c.style, 0)
+        let py0: f64 = c.y + b.bt + spread + cascade.style_box_shadow(c.style, 1)
+        let px1: f64 = c.x + c.w - b.br - spread +
+        cascade.style_box_shadow(c.style, 0)
+        let py1: f64 = c.y + c.h - b.bb - spread +
+        cascade.style_box_shadow(c.style, 1)
+        path_round_rect(&(*p).ra, px0, py0, px1, py1, &ir[0])
+        raster.raster_finish(&(*p).ra)
+        let d: i64 = box_size(blur)
+        blur_pass(p, w, h, d)
+        blur_pass(p, w, h, d)
+        blur_pass(p, w, h, d)
+        // the padding box, to clip the shadow to
+        if !raster.raster_begin(&(*p).rb, wx as f64, wy as f64, w, h) {
+            return
+        }
+        var ir2: [f64; 8] = [0.0; 8]
+        inner_radii(&rad[0], b.bt, b.br, b.bb, b.bl, &ir2[0])
+        path_round_rect(&(*p).rb, c.x + b.bl, c.y + b.bt,
+            c.x + c.w - b.br, c.y + c.h - b.bb, &ir2[0])
+        raster.raster_finish(&(*p).rb)
+        var yy: usize = 0
+        while yy < h {
+            var xx: usize = 0
+            while xx < w {
+                let inside: f64 = raster.raster_cov(&(*p).rb, xx, yy)
+                if inside > 0.0 {
+                    let sh: f64 = raster.raster_cov(&(*p).ra, xx, yy)
+                    let v: f64 = inside * (1.0 - sh)
+                    if v > 0.0 {
+                        canvas.canvas_blend(&(*p).cv,
+                            (wx + xx as i64) as usize,
+                            (wy + yy as i64) as usize,
+                            with_alpha(c.color, c.alpha), v)
+                    }
+                }
+                xx = xx + 1
+            }
+            yy = yy + 1
+        }
+        return
+    }
+    // ---- an outer shadow
+    var gr: [f64; 8] = [0.0; 8]
+    i = 0
+    while i < 8 {
+        var v: f64 = rad[i] + spread
+        if v < 0.0 {
+            v = 0.0
+        }
+        gr[i] = v
+        i = i + 1
+    }
+    path_round_rect(&(*p).ra, c.x - spread, c.y - spread,
+        c.x + c.w + spread, c.y + c.h + spread, &gr[0])
+    raster.raster_finish(&(*p).ra)
+    let d: i64 = box_size(blur)
+    blur_pass(p, w, h, d)
+    blur_pass(p, w, h, d)
+    blur_pass(p, w, h, d)
+    // An outer shadow is NOT painted under its own border box
+    // (css-backgrounds-3, 6.2) -- otherwise a half transparent box would
+    // show its own shadow through itself.
+    if !raster.raster_begin(&(*p).rb, wx as f64, wy as f64, w, h) {
+        return
+    }
+    path_round_rect(&(*p).rb, b.x, b.y, b.x + b.w, b.y + b.h, &rad[0])
+    raster.raster_finish(&(*p).rb)
+    var yy: usize = 0
+    while yy < h {
+        var xx: usize = 0
+        while xx < w {
+            let sh: f64 = raster.raster_cov(&(*p).ra, xx, yy)
+            if sh > 0.0 {
+                let v: f64 = sh * (1.0 - raster.raster_cov(&(*p).rb, xx, yy))
+                if v > 0.0 {
+                    canvas.canvas_blend(&(*p).cv,
+                        (wx + xx as i64) as usize, (wy + yy as i64) as usize,
+                        with_alpha(c.color, c.alpha), v)
+                }
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// ---------------------------------------------------------------- Text
+
+// The character at index `k` of a text node, walked over the STRANDS.
+// `chain_at` would be O(n / 28) per character and would turn painting a
+// paragraph into O(n^2).
+fn chain_char(t: Gc[Text], k: u32) -> u32 {
+    var s: Gc[Strand] = t.data.first
+    var seen: u32 = 0
+    while s != gc_null[Strand]() {
+        let n: u32 = s.len as u32
+        if k < seen + n {
+            return s.chars[(k - seen) as usize]
+        }
+        seen = seen + n
+        s = s.next
+    }
+    return 0 as u32
+}
+
+fn paint_text(p: *mut Painter, c: Gc[Cmd]) {
+    let tr: Gc[TextRun] = c.run
+    if tr == gc_null[TextRun]() || tr.n == 0 as u32 {
+        return
+    }
+    let s: Gc[Style] = c.style
+    let size: f64 = cascade.style_font_size(s)
+    let fm: u64 = (*p).fm
+    if !metrics.fm_present(fm) {
+        return
+    }
+    let fs: *mut metrics.FontSet = fm as *mut metrics.FontSet
+    let f: *mut ttf.Font = &(*fs).f
+    let up: f64 = ttf.font_upem(f) as f64
+    let scale: f64 = size / up
+    let shadow: bool = c.flag != 0 as u32
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var blur: f64 = 0.0
+    if shadow {
+        dx = c.x
+        dy = c.y
+        blur = c.a
+    }
+    let asc: f64 = box.font_ascent_fm(fm, size)
+    let desc: f64 = box.font_descent_fm(fm, size)
+    let grow: f64 = blur + 2.0
+    var wx: i64 = 0
+    var wy: i64 = 0
+    var w: usize = 0
+    var h: usize = 0
+    if !window(p, tr.x + dx - grow - size, tr.y + dy - asc - grow,
+        tr.x + dx + tr.w + grow + size, tr.y + dy + desc + grow,
+        &wx, &wy, &w, &h) {
+        return
+    }
+    if !raster.raster_begin(&(*p).ra, wx as f64, wy as f64, w, h) {
+        return
+    }
+    let t: Gc[Text] = tr.src.elem as Gc[Text]
+    var pen: f64 = tr.x + dx
+    var k: u32 = 0
+    var prev: u32 = 0
+    while k < tr.n {
+        let cp: u32 = chain_char(t, tr.first + k)
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        if prev != 0 as u32 {
+            pen = pen + (ttf.font_kern(f, prev, gid) as f64) * scale
+        }
+        let okg: bool = ttf.font_outline(f, gid, &(*p).ra, pen, tr.y + dy,
+            scale, (*p).scratch, GLYPH_SCRATCH, 0)
+        pen = pen + (ttf.font_advance(f, gid) as f64) * scale
+        prev = gid
+        k = k + 1 as u32
+    }
+    raster.raster_finish(&(*p).ra)
+    if blur > 0.0 {
+        let d: i64 = box_size(blur)
+        blur_pass(p, w, h, d)
+        blur_pass(p, w, h, d)
+        blur_pass(p, w, h, d)
+    }
+    var yy: usize = 0
+    while yy < h {
+        var xx: usize = 0
+        while xx < w {
+            let v: f64 = raster.raster_cov(&(*p).ra, xx, yy)
+            if v > 0.0 {
+                // THE ROUND K7B GUARD. The ink is counted per glyph run
+                // and not per picture -- a picture that is 87 per cent
+                // right can still be missing every letter.
+                if v > 0.5 {
+                    (*p).ink = (*p).ink + 1
+                }
+                canvas.canvas_blend(&(*p).cv,
+                    (wx + xx as i64) as usize, (wy + yy as i64) as usize,
+                    with_alpha(c.color, c.alpha), v)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// ------------------------------------------------------------ The loop
+
+fn painter_run(p: *mut Painter, d: Gc[DisplayList]) -> u64 {
+    var i: u64 = 0
+    let n: u64 = display.dl_count(d)
+    while i < n {
+        let c: Gc[Cmd] = display.dl_at(d, i)
+        // The clip is per COMMAND and not a bracket around a subtree: the
+        // paint order is flat, so there is no subtree left to bracket by
+        // the time anything is drawn. Every command carries the rectangle
+        // its clipping ancestors left over (`box_stamp_clip`).
+        var clipped: bool = false
+        if c.cx0 > 0.0 - 1.0e8 || c.cy0 > 0.0 - 1.0e8 ||
+        c.cx1 < 1.0e8 || c.cy1 < 1.0e8 {
+            clipped = canvas.clip_push_rect(&(*p).cv, c.cx0, c.cy0,
+                c.cx1, c.cy1)
+        }
+        if c.kind == display.CMD_RECT {
+            var rad: [f64; 8] = [0.0; 8]
+            var k: usize = 0
+            while k < 8 {
+                rad[k] = c.rad[k]
+                k = k + 1
+            }
+            paint_rounded_rect(p, c.x, c.y, c.x + c.w, c.y + c.h, &rad[0],
+                c.color, c.alpha)
+        } else if c.kind == display.CMD_GRADIENT {
+            paint_gradient(p, c)
+        } else if c.kind == display.CMD_BORDER {
+            paint_border(p, c)
+        } else if c.kind == display.CMD_SHADOW {
+            paint_shadow(p, c)
+        } else if c.kind == display.CMD_TEXT {
+            paint_text(p, c)
+        } else if c.kind == display.CMD_IMAGE {
+            paint_image(p, c)
+        } else if c.kind == display.CMD_CLIP_PUSH {
+            let ok: bool = canvas.clip_push_rect(&(*p).cv, c.x, c.y,
+                c.x + c.w, c.y + c.h)
+        } else if c.kind == display.CMD_CLIP_POP {
+            canvas.clip_pop(&(*p).cv)
+        }
+        if clipped {
+            canvas.clip_pop(&(*p).cv)
+        }
+        i = i + 1
+    }
+    return n
+}

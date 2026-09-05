@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/images.fi -- the pictures of a page, round B5.
+//
+// Three things that look like one:
+//
+//   1. A STORE. Decoded pictures keyed by the URL they came from, so that
+//      the same logo in forty places on a page is decoded once. It holds
+//      raw `paint.png.Image` values and hands out an ADDRESS, because a
+//      picture outlives any one layout and must not be a managed object
+//      that the collector can move or free while a box points at it (the
+//      same reasoning as `Box.fm` in round B3).
+//   2. THE ATTACHMENT. A walk over the finished box tree that finds every
+//      `<img>`, looks its `src` up in the store, and stamps the intrinsic
+//      size onto the box. From then on the layout of round B2 does the
+//      rest -- `box.replaced_size` is CSS 2.1 10.3.2 and it needed no
+//      knowledge of what a picture is.
+//   3. THE LIST OF WHAT IS STILL MISSING, which is what the driver
+//      fetches.
+//
+// ============================================================= WHY IT MOVES
+//
+// A page whose pictures have no size laid out at zero and then jumped when
+// each one arrived. That is the single most visible layout bug on the web,
+// and the fix is not "wait for the pictures": it is to take the size from
+// the `width` and `height` ATTRIBUTES when the picture is not there yet
+// (HTML 4.10.20.7 -- they are "dimension attributes" and give the box an
+// intrinsic size and ratio before a single octet of the image has
+// arrived). `attach` therefore has three sources, in this order:
+//
+//   the decoded picture  >  the width/height attributes  >  nothing
+//
+// and only the third leaves an empty box.
+//
+// =============================================================== LAZY
+//
+// `loading="lazy"` (HTML 4.10.20.3.4) says the picture need not be fetched
+// until it is near the viewport. `pending_list` therefore takes the
+// viewport height and skips a lazy image whose box begins more than one
+// viewport below the bottom of it. That is a MODEL of the standard -- a
+// real browser re-evaluates on every scroll and this one on every layout
+// -- and the difference is written here rather than discovered later.
+//
+// The counter-check that makes the number mean anything is in
+// `tools/tlsb5/img_check.py`: the same page with the same pictures, once
+// with `loading="lazy"` and once without, and the lazy one has to ask for
+// FEWER of them.
+import std.rt
+import html.mem
+import paint.png
+import paint.jpeg
+import browser.node
+import browser.names
+import layout.box
+
+export {
+    ImgStore, img_store_new, img_store_free, img_store_add,
+    img_store_find, img_store_count, img_store_decoded,
+    img_width, img_height, img_at,
+    attach_images, pending_count, pending_at, collect_pending,
+}
+
+const MAX_IMAGES: usize = 64
+const URL_MAX: usize = 1024
+
+struct ImgStore {
+    im: [png.Image; 64],
+    off: [usize; 64], // where the URL of picture i starts in `urls`
+    len: [usize; 64],
+    urls: mem.Buf,
+    ok: [bool; 64], // did it decode?
+    n: usize,
+    // the list of URLs the page still wants
+    pend_off: [usize; 64],
+    pend_len: [usize; 64],
+    pend: mem.Buf,
+    np: usize,
+}
+
+fn img_store_new() -> ImgStore {
+    return ImgStore { im: [png.image_new(); 64], off: [0; 64],
+        len: [0; 64], urls: mem.buf_new(), ok: [false; 64], n: 0,
+        pend_off: [0; 64], pend_len: [0; 64], pend: mem.buf_new(), np: 0 }
+}
+
+fn img_store_free(s: *mut ImgStore) {
+    var i: usize = 0
+    while i < (*s).n {
+        png.image_free(&(*s).im[i])
+        i = i + 1
+    }
+    (*s).n = 0
+}
+
+fn img_store_count(s: *mut ImgStore) -> usize {
+    return (*s).n
+}
+
+fn img_store_decoded(s: *mut ImgStore) -> usize {
+    var i: usize = 0
+    var k: usize = 0
+    while i < (*s).n {
+        if (*s).ok[i] {
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn same_url(s: *mut ImgStore, i: usize, url: u64, n: usize) -> bool {
+    if (*s).len[i] != n {
+        return false
+    }
+    let p: u64 = mem.buf_ptr(&(*s).urls) as u64 + (*s).off[i] as u64
+    var k: usize = 0
+    while k < n {
+        if rt.ld8(p, k) != rt.ld8(url, k) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// The index of the picture with this URL, or -1.
+fn img_store_find(s: *mut ImgStore, url: u64, n: usize) -> i32 {
+    var i: usize = 0
+    while i < (*s).n {
+        if same_url(s, i, url, n) {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Decodes `bytes` -- PNG or JPEG, by what the first octets say -- and puts
+// it under `url`. Returns the index, or -1 when there is no room.
+// A picture that does NOT decode is still stored, with `ok` false: asking
+// for it again would fetch and fail again.
+fn img_store_add(s: *mut ImgStore, url: u64, un: usize, bytes: u64,
+    n: usize) -> i32 {
+    let had: i32 = img_store_find(s, url, un)
+    if had >= 0 {
+        return had
+    }
+    if (*s).n >= MAX_IMAGES || un > URL_MAX {
+        return 0 - 1
+    }
+    let i: usize = (*s).n
+    (*s).off[i] = mem.buf_len(&(*s).urls)
+    (*s).len[i] = un
+    var k: usize = 0
+    while k < un {
+        mem.buf_push(&(*s).urls, rt.ld8(url, k))
+        k = k + 1
+    }
+    (*s).im[i] = png.image_new()
+    var good: bool = false
+    if jpeg.jpeg_sniff(bytes, n) {
+        var why: u32 = 0
+        good = jpeg.decode_jpeg(bytes, n, &(*s).im[i], &why)
+    } else {
+        good = png.decode_png(bytes, n, &(*s).im[i])
+    }
+    (*s).ok[i] = good
+    (*s).n = i + 1
+    return i as i32
+}
+
+fn img_width(s: *mut ImgStore, i: usize) -> usize {
+    if i >= (*s).n || !(*s).ok[i] {
+        return 0
+    }
+    return png.image_width(&(*s).im[i])
+}
+
+fn img_height(s: *mut ImgStore, i: usize) -> usize {
+    if i >= (*s).n || !(*s).ok[i] {
+        return 0
+    }
+    return png.image_height(&(*s).im[i])
+}
+
+fn img_at(s: *mut ImgStore, i: usize) -> u64 {
+    if i >= (*s).n || !(*s).ok[i] {
+        return 0
+    }
+    return (&(*s).im[i]) as u64
+}
+
+// ------------------------------------------------------- The attachment
+
+// An attribute value is a chain of code points; a URL is ASCII. Anything
+// above 127 is written as a single 0xFF, which cannot occur in a URL and
+// therefore cannot make two different values compare equal.
+fn chain_into(k: Gc[Chain], out: *mut mem.Buf) {
+    mem.buf_clear(out)
+    if k == gc_null[Chain]() {
+        return
+    }
+    let n: u64 = node.chain_len(k)
+    var i: u64 = 0
+    while i < n {
+        let cp: u32 = node.chain_at(k, i)
+        if cp < 128 as u32 {
+            mem.buf_push(out, cp as u8)
+        } else {
+            mem.buf_push(out, 255 as u8)
+        }
+        i = i + 1
+    }
+}
+
+fn attr_text(e: Gc[Elem], id: u32, out: *mut mem.Buf) -> bool {
+    if id == 0 as u32 {
+        return false
+    }
+    let v: Gc[Chain] = node.attr_value(e, id, 0 as u32)
+    if v == gc_null[Chain]() {
+        return false
+    }
+    chain_into(v, out)
+    return true
+}
+
+fn dec_of(p: u64, n: usize) -> f64 {
+    var v: f64 = 0.0
+    var i: usize = 0
+    var any: bool = false
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            break
+        }
+        v = v * 10.0 + ((ch - 48 as u8) as f64)
+        any = true
+        i = i + 1
+    }
+    if !any {
+        return 0.0
+    }
+    return v
+}
+
+// The walk. `nm` is where `img`, `src`, `width`, `height` and `loading`
+// are looked up as atoms -- one comparison instead of a string compare per
+// element.
+fn attach_images(b: Gc[Box], s: *mut ImgStore, nm: *mut names.Names,
+    counted: *mut usize) {
+    if b == gc_null[Box]() {
+        return
+    }
+    var lit_img: [u8; 3] = "img"
+    var lit_src: [u8; 3] = "src"
+    var lit_w: [u8; 5] = "width"
+    var lit_h: [u8; 6] = "height"
+    let a_img: u32 = names.names_find_bytes(nm, (&lit_img[0]) as *mut u8, 3)
+    let a_src: u32 = names.names_find_bytes(nm, (&lit_src[0]) as *mut u8, 3)
+    let a_w: u32 = names.names_find_bytes(nm, (&lit_w[0]) as *mut u8, 5)
+    let a_h: u32 = names.names_find_bytes(nm, (&lit_h[0]) as *mut u8, 6)
+    attach_walk(b, s, a_img, a_src, a_w, a_h, counted)
+}
+
+fn attach_walk(b: Gc[Box], s: *mut ImgStore, a_img: u32, a_src: u32,
+    a_w: u32, a_h: u32, counted: *mut usize) {
+    if b == gc_null[Box]() {
+        return
+    }
+    let e: Gc[Node] = b.elem
+    if e != gc_null[Node]() && e.kind == node.K_ELEM {
+        let el: Gc[Elem] = e as Gc[Elem]
+        if el.name == a_img && a_img != 0 as u32 {
+            var buf: mem.Buf = mem.buf_new()
+            mem.buf_init(&buf)
+            var iw: f64 = 0.0
+            var ih: f64 = 0.0
+            var handle: u64 = 0
+            if attr_text(el, a_src, &buf) {
+                let idx: i32 = img_store_find(s,
+                    mem.buf_ptr(&buf) as u64, mem.buf_len(&buf))
+                if idx >= 0 {
+                    handle = img_at(s, idx as usize)
+                    iw = img_width(s, idx as usize) as f64
+                    ih = img_height(s, idx as usize) as f64
+                }
+            }
+            if iw <= 0.0 || ih <= 0.0 {
+                // the dimension attributes -- see the head of the file
+                var aw: f64 = 0.0
+                var ah: f64 = 0.0
+                if attr_text(el, a_w, &buf) {
+                    aw = dec_of(mem.buf_ptr(&buf) as u64,
+                        mem.buf_len(&buf))
+                }
+                if attr_text(el, a_h, &buf) {
+                    ah = dec_of(mem.buf_ptr(&buf) as u64,
+                        mem.buf_len(&buf))
+                }
+                if aw > 0.0 && ah > 0.0 {
+                    iw = aw
+                    ih = ah
+                }
+            }
+            if iw > 0.0 && ih > 0.0 {
+                b.iw = iw
+                b.ih = ih
+                // ROUND B6: the natural RATIO is now a field of its own
+                // and no longer `ih / iw` computed where it is needed. A
+                // picture has both -- a `<video>` with nothing playing has
+                // the fallback size and NO ratio, and only a separate
+                // field can tell those two apart. Forgetting this line
+                // cost five cases of `tools/tlsb5/img_check.py`: an
+                // `<img width="80">` of a 40 x 30 picture came out 80 x 30
+                // instead of 80 x 60.
+                b.ratio = iw / ih
+                b.img = handle
+                b.flags = b.flags | box.F_REPLACED
+                b.int_ok = 0 as u32
+                *counted = *counted + 1
+            }
+            mem.buf_free(&buf)
+        }
+    }
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        attach_walk(box.box_kid(b, i), s, a_img, a_src, a_w, a_h, counted)
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------ What still has to come
+
+fn pending_count(s: *mut ImgStore) -> usize {
+    return (*s).np
+}
+
+fn pending_at(s: *mut ImgStore, i: usize, out: *mut usize) -> u64 {
+    if i >= (*s).np {
+        *out = 0
+        return 0
+    }
+    *out = (*s).pend_len[i]
+    return mem.buf_ptr(&(*s).pend) as u64 + (*s).pend_off[i] as u64
+}
+
+// Every `src` in the tree that is not in the store yet. `viewport_h` is
+// the height of the window and `limit_y` the bottom of what a lazy image
+// is still fetched for; a box below that is left for later -- see LAZY in
+// the head.
+fn collect_pending(b: Gc[Box], s: *mut ImgStore, nm: *mut names.Names,
+    limit_y: f64) {
+    (*s).np = 0
+    mem.buf_clear(&(*s).pend)
+    var lit_img: [u8; 3] = "img"
+    var lit_src: [u8; 3] = "src"
+    var lit_l: [u8; 7] = "loading"
+    let a_img: u32 = names.names_find_bytes(nm, (&lit_img[0]) as *mut u8, 3)
+    let a_src: u32 = names.names_find_bytes(nm, (&lit_src[0]) as *mut u8, 3)
+    let a_l: u32 = names.names_find_bytes(nm, (&lit_l[0]) as *mut u8, 7)
+    collect_walk(b, s, a_img, a_src, a_l, limit_y, 0.0)
+}
+
+fn is_lazy(el: Gc[Elem], a_l: u32) -> bool {
+    if a_l == 0 as u32 {
+        return false
+    }
+    var buf: mem.Buf = mem.buf_new()
+    mem.buf_init(&buf)
+    var lazy: bool = false
+    if attr_text(el, a_l, &buf) {
+        if mem.buf_len(&buf) == 4 {
+            let p: u64 = mem.buf_ptr(&buf) as u64
+            lazy = rt.ld8(p, 0) == 108 as u8 && rt.ld8(p, 1) == 97 as u8
+            && rt.ld8(p, 2) == 122 as u8 && rt.ld8(p, 3) == 121 as u8
+        }
+    }
+    mem.buf_free(&buf)
+    return lazy
+}
+
+fn collect_walk(b: Gc[Box], s: *mut ImgStore, a_img: u32, a_src: u32,
+    a_l: u32, limit_y: f64, base_y: f64) {
+    if b == gc_null[Box]() {
+        return
+    }
+    let e: Gc[Node] = b.elem
+    if e != gc_null[Node]() && e.kind == node.K_ELEM {
+        let el: Gc[Elem] = e as Gc[Elem]
+        if el.name == a_img && a_img != 0 as u32 {
+            var buf: mem.Buf = mem.buf_new()
+            mem.buf_init(&buf)
+            if attr_text(el, a_src, &buf) && mem.buf_len(&buf) > 0 {
+                let idx: i32 = img_store_find(s, mem.buf_ptr(&buf) as u64,
+                    mem.buf_len(&buf))
+                var want: bool = idx < 0
+                if want && is_lazy(el, a_l) && b.y > limit_y {
+                    want = false
+                }
+                if want && (*s).np < MAX_IMAGES {
+                    let k: usize = (*s).np
+                    (*s).pend_off[k] = mem.buf_len(&(*s).pend)
+                    (*s).pend_len[k] = mem.buf_len(&buf)
+                    var q: usize = 0
+                    while q < mem.buf_len(&buf) {
+                        mem.buf_push(&(*s).pend,
+                            rt.ld8(mem.buf_ptr(&buf) as u64, q))
+                        q = q + 1
+                    }
+                    (*s).np = k + 1
+                }
+            }
+            mem.buf_free(&buf)
+        }
+    }
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        collect_walk(box.box_kid(b, i), s, a_img, a_src, a_l, limit_y,
+            base_y)
+        i = i + 1
+    }
+}

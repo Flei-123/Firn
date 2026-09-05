@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: MIT
+// demos/mcserver/world.fi -- the world, and the bit fiddling it costs
+// (round 76).
+//
+// A superflat: bedrock at y = -64, two layers of dirt, grass on top at
+// y = -61. Everything above is air. That is four layers in a world 384
+// blocks high -- and it is exactly enough for a player to stand on
+// something and see the sky.
+//
+// -------------------------------------------------- THE SHAPE OF A CHUNK
+//
+// A chunk in 1.20 is 24 SECTIONS of 16x16x16, from y = -64 to y = 320. The
+// number is not free: it follows from `min_y` and `height` of the dimension
+// type, and if the server sends a different number of sections than the
+// dimension announced, the client reads the section data past its end,
+// takes the next field for a section and drops the connection somewhere in
+// the middle of the packet. The two numbers live in
+// `registry.fi::dimension_type` and here, and `tools/mcserver/harness.py`
+// checks that the sections consume EXACTLY the announced octets.
+//
+// Every section is
+//
+//     [i16 non air block count]
+//     [block state palette container]
+//     [biome palette container]
+//
+// and a palette container is
+//
+//     [u8 bits per entry]
+//     [the palette, depending on the number of bits]
+//     [VarInt: number of 64 bit words] [the words]
+//
+// with THREE forms that differ in the first octet:
+//
+//   0 bits    SINGLE VALUED. One VarInt with the id, and NO data at all --
+//             the whole section is one block. That is what the 23 air
+//             sections use, and it is why a chunk here is 2 KiB and not
+//             100 KiB.
+//   4..8 bits INDIRECT. A VarInt palette, and 4096 indices packed into
+//             words. The floor section uses it.
+//   15 bits   DIRECT, the block state id itself. Not used here.
+//
+// ------------------------------------------- THE PACKING, AND ITS ONE TRAP
+//
+// The indices are packed into 64 bit words WITHOUT STRADDLING a word
+// boundary. At 4 bits that is 16 per word and 4096/16 = 256 words exactly;
+// at 5 bits it would be 12 per word with 4 bits left over UNUSED. Whoever
+// packs densely -- the obvious thing, and what a bit stream normally does
+// -- produces a chunk that the client reads as noise. Since 1.16 the
+// padding is prescribed, and this is the single most common mistake in
+// third party chunk code.
+//
+// The order inside a section is y, then z, then x:
+// `index = (y * 16 + z) * 16 + x`. Getting that wrong builds the world on
+// its side, which at least is visible.
+//
+// ------------------------------------------------------------ THE LIGHT
+//
+// The client does NOT compute light itself; what the server does not send
+// stays black. So sky light 15 goes out for all 26 light sections (24 plus
+// one below and one above -- the light arrays cover one section MORE at
+// each end than the chunk does, another number that has to be right).
+// 26 * 2048 = 53,248 octets per chunk, which is why the light and not the
+// blocks decides how big a chunk packet is here.
+
+import std.bytes
+import std.nbt
+
+export {
+    SECTIONS, MIN_Y, WORLD_HEIGHT, LIGHT_SECTIONS,
+    FLOOR_TOP, SPAWN_Y,
+    BLOCK_AIR, BLOCK_STONE, BLOCK_GRASS, BLOCK_DIRT, BLOCK_BEDROCK,
+    write_chunk, chunk_block_at,
+}
+
+const SECTIONS: i32 = 24
+const MIN_Y: i32 = 0 - 64
+const WORLD_HEIGHT: i32 = 384
+const LIGHT_SECTIONS: i32 = 26
+
+// Block state ids of 1.20.4 (from the block state table of the version --
+// they are STATE ids, not block ids: `grass_block` is block 8 but its
+// default state is 9, because the block has a `snowy` property).
+const BLOCK_AIR: i32 = 0
+const BLOCK_STONE: i32 = 1
+const BLOCK_GRASS: i32 = 9
+const BLOCK_DIRT: i32 = 10
+const BLOCK_BEDROCK: i32 = 79
+
+// The highest solid block, and where a player therefore stands.
+const FLOOR_TOP: i32 = 0 - 61
+const SPAWN_Y: i32 = 0 - 60
+
+// The palette index of a block at absolute height `y`, in the palette
+// [air, bedrock, dirt, grass].
+fn palette_index(y: i32) -> u64 {
+    if y == 0 - 64 {
+        return 1
+    }
+    if y == 0 - 63 || y == 0 - 62 {
+        return 2
+    }
+    if y == 0 - 61 {
+        return 3
+    }
+    return 0
+}
+
+// What is at absolute height `y` -- the block state id. Used by the test to
+// check the world against the packet.
+fn chunk_block_at(y: i32) -> i32 {
+    let p: u64 = palette_index(y)
+    if p == 1 {
+        return BLOCK_BEDROCK
+    }
+    if p == 2 {
+        return BLOCK_DIRT
+    }
+    if p == 3 {
+        return BLOCK_GRASS
+    }
+    return BLOCK_AIR
+}
+
+// A palette container with 0 bits: one value for the whole section.
+fn single_valued(b: *mut bytes.Bytes, id: i32) {
+    bytes.put_u8(b, 0 as u8)
+    bytes.put_varint(b, id)
+    bytes.put_varint(b, 0) // no data words at all
+}
+
+// The floor section: four palette entries, four bits per index, sixteen
+// indices per word, 256 words. No index straddles a word.
+fn floor_section(b: *mut bytes.Bytes, section: i32) {
+    bytes.put_u8(b, 4 as u8)
+    bytes.put_varint(b, 4)
+    bytes.put_varint(b, BLOCK_AIR)
+    bytes.put_varint(b, BLOCK_BEDROCK)
+    bytes.put_varint(b, BLOCK_DIRT)
+    bytes.put_varint(b, BLOCK_GRASS)
+    bytes.put_varint(b, 256)
+    let base: i32 = MIN_Y + section * 16
+    var w: usize = 0
+    while w < 256 {
+        var word: u64 = 0
+        var k: usize = 0
+        while k < 16 {
+            // index = (y * 16 + z) * 16 + x  ->  y = index / 256
+            let index: usize = w * 16 + k
+            let y: i32 = base + (index / 256) as i32
+            word = word | (palette_index(y) << ((k as u64) * 4))
+            k = k + 1
+        }
+        bytes.put_u64(b, word)
+        w = w + 1
+    }
+}
+
+// The MOTION_BLOCKING heightmap: 256 columns, 9 bits each (ceil(log2(385))),
+// SEVEN per 64 bit word with one bit left over -- the same padding rule as
+// the block data. 37 words for 256 entries.
+//
+// The value is "the y of the highest blocking block, plus one, minus
+// min_y", so for a floor whose top is at -61 it is 4 everywhere. A wrong
+// heightmap does not disconnect the client; it makes rain fall inside the
+// ground and mobs spawn in the wrong place, and it is the kind of thing
+// nobody finds later.
+fn heightmaps(b: *mut bytes.Bytes) {
+    var k_mb: [u8; 16] = "MOTION_BLOCKING\0"
+    var words: [i64; 37] = [0; 37]
+    let value: u64 = (FLOOR_TOP + 1 - MIN_Y) as u64
+    var i: usize = 0
+    while i < 256 {
+        let wi: usize = i / 7
+        let sh: u64 = ((i % 7) as u64) * 9
+        words[wi] = (words[wi] as u64 | (value << sh)) as i64
+        i = i + 1
+    }
+    nbt.nbt_root_begin_anon(b)
+    nbt.nbt_c_long_array(b, (&k_mb[0]) as u64, (&words[0]) as u64, 37)
+    nbt.nbt_end(b)
+}
+
+// A complete Chunk Data and Update Light packet body (0x25).
+// `scratch` is a buffer of the caller: the section data has to be measured
+// before it can be written, because a VarInt length stands in front of it.
+fn write_chunk(b: *mut bytes.Bytes, scratch: *mut bytes.Bytes, cx: i32, cz: i32) {
+    bytes.put_i32(b, cx)
+    bytes.put_i32(b, cz)
+    heightmaps(b)
+
+    // --- the sections ------------------------------------------------------
+    bytes.bytes_clear(scratch)
+    var s: i32 = 0
+    while s < SECTIONS {
+        let base: i32 = MIN_Y + s * 16
+        if base == MIN_Y {
+            // 4 layers * 256 blocks = 1024 that are not air
+            bytes.put_i16(scratch, 1024 as i16)
+            floor_section(scratch, s)
+        } else {
+            bytes.put_i16(scratch, 0 as i16)
+            single_valued(scratch, BLOCK_AIR)
+        }
+        // the biomes: one value for the section, number 0 of the registry
+        single_valued(scratch, 0)
+        s = s + 1
+    }
+    bytes.put_varint(b, bytes.bytes_len(scratch) as i32)
+    bytes.put_bytes(b, scratch)
+
+    // --- block entities ----------------------------------------------------
+    bytes.put_varint(b, 0)
+
+    // --- the light ---------------------------------------------------------
+    // Four BitSets: sky present, block present, sky known empty, block known
+    // empty. A BitSet is a VarInt with the number of 64 bit words and then
+    // the words. 26 bits set = one word.
+    let all: u64 = (1 as u64 << 26 as u64) - 1 as u64
+    bytes.put_varint(b, 1)
+    bytes.put_u64(b, all) // sky light present everywhere
+    bytes.put_varint(b, 0) // no block light
+    bytes.put_varint(b, 0) // nothing empty on the sky side
+    bytes.put_varint(b, 1)
+    bytes.put_u64(b, all) // block light empty everywhere
+
+    // 26 arrays of 2048 octets, one nibble per block, 15 everywhere.
+    var full: [u8; 256] = [255; 256]
+    bytes.put_varint(b, LIGHT_SECTIONS)
+    var l: i32 = 0
+    while l < LIGHT_SECTIONS {
+        bytes.put_varint(b, 2048)
+        var r: usize = 0
+        while r < 8 {
+            bytes.put_raw(b, (&full[0]) as u64, 256)
+            r = r + 1
+        }
+        l = l + 1
+    }
+    bytes.put_varint(b, 0) // no block light arrays
+}

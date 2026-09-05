@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/fpz_main.fi -- the driver of chapter Z (round B6).
+//
+// It exists so that the defence can be MEASURED from the outside, by a
+// program that shares no line of code with it: `tools/fpz/fp_check.py`
+// asks the same question twice with the same session and once with
+// another, holds the answers against each other, and computes the
+// deviation of every colour channel itself.
+//
+// One job per run, on standard input, little-endian:
+//
+//     u32  op      1 = read a canvas back (farbled)
+//                  2 = the `navigator` fields
+//                  3 = a clock reading
+//                  4 = read a canvas back RAW -- the counter-check
+//     u64  session seed
+//     u32  n ; u8[n]   the origin
+//     then, by op:
+//       1, 4:  u32 pixels ; u8[pixels * 4]   the canvas (RGBA)
+//       3:     u64 microseconds
+//
+// Out comes text, one field per line, so that nothing has to be decoded
+// on the other side:
+//
+//     TOUCHED <n>            (op 1 and 4)
+//     PIXELS <hex>           (op 1 and 4)
+//     HWC <n>  MEM <x>  UA <string>   (op 2)
+//     CLOCK <n>              (op 3)
+//
+// Compile with:  firnc -o build/fpz lib/browser/fpz_main.fi
+import std.rt
+import html.mem
+import browser.fpz
+
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn read_u64(b: *mut mem.Buf, off: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < 8 {
+        v = v | ((mem.buf_at(b, off + i) as u64) << (8 * i as u64))
+        i = i + 1
+    }
+    return v
+}
+
+fn put_lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, rt.ld8(p, i))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn hex_digit(v: u64) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (87 + v) as u8
+}
+
+fn main() -> i32 {
+    var inb: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&inb)
+    let total: usize = mem.buf_len(&inb)
+    if total < 16 {
+        return 1
+    }
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+
+    let op: u32 = read_u32(&inb, 0)
+    let seed: u64 = read_u64(&inb, 4)
+    let olen: usize = read_u32(&inb, 12) as usize
+    let obase: u64 = mem.buf_ptr(&inb) as u64 + 16
+    var pos: usize = 16 + olen
+
+    var session: fpz.FpKey = fpz.FpKey { b: [0; 32] }
+    fpz.fp_session_fixed(&session, seed)
+    var key: fpz.FpKey = fpz.FpKey { b: [0; 32] }
+    fpz.fp_key_for_origin(&session, obase, olen, &key)
+
+    if op == 1 as u32 || op == 4 as u32 {
+        let npx: usize = read_u32(&inb, pos) as usize
+        pos = pos + 4
+        let src: u64 = mem.buf_ptr(&inb) as u64 + pos as u64
+        let bytes: usize = npx * 4
+        let dst: u64 = rt.heap_alloc(bytes) as u64
+        if dst == 0 {
+            return 2
+        }
+        var touched: usize = 0
+        if op == 1 as u32 {
+            touched = fpz.fp_canvas_read(&key, src, dst, npx)
+        } else {
+            // THE COUNTER-CHECK. The same path without the farbling: if
+            // this one ALSO gave a different answer per origin, the
+            // measurement would be showing something other than the
+            // defence.
+            var i: usize = 0
+            while i < bytes {
+                rt.st8(dst, i, rt.ld8(src, i))
+                i = i + 1
+            }
+        }
+        var t: [u8; 8] = "TOUCHED "
+        put_lit(&out, (&t[0]) as u64, 8)
+        mem.buf_push_dec(&out, touched as u64)
+        mem.buf_push(&out, 10 as u8)
+        var p: [u8; 7] = "PIXELS "
+        put_lit(&out, (&p[0]) as u64, 7)
+        var j: usize = 0
+        while j < bytes {
+            let v: u64 = rt.ld8(dst, j) as u64
+            mem.buf_push(&out, hex_digit(v >> 4))
+            mem.buf_push(&out, hex_digit(v & 15))
+            j = j + 1
+        }
+        mem.buf_push(&out, 10 as u8)
+        rt.heap_free(dst, bytes)
+    } else if op == 2 as u32 {
+        var h: [u8; 4] = "HWC "
+        put_lit(&out, (&h[0]) as u64, 4)
+        mem.buf_push_dec(&out, fpz.fp_hardware_concurrency(&key, 12) as u64)
+        mem.buf_push(&out, 10 as u8)
+        var m: [u8; 4] = "MEM "
+        put_lit(&out, (&m[0]) as u64, 4)
+        // The six legal values are all whole numbers here (0.25 and 0.5
+        // are left out on purpose, see `fpz.fp_device_memory`), so a
+        // decimal is enough and no float has to be printed.
+        mem.buf_push_dec(&out, fpz.fp_device_memory(&key) as u64)
+        mem.buf_push(&out, 10 as u8)
+        var sc: [u8; 7] = "SCREEN "
+        put_lit(&out, (&sc[0]) as u64, 7)
+        mem.buf_push_dec(&out, fpz.fp_screen_round(1366) as u64)
+        mem.buf_push(&out, 10 as u8)
+        var u: [u8; 3] = "UA "
+        put_lit(&out, (&u[0]) as u64, 3)
+        var uab: [u8; 96] = [0; 96]
+        let ualen: usize = fpz.fp_user_agent((&uab[0]) as u64)
+        put_lit(&out, (&uab[0]) as u64, ualen)
+        mem.buf_push(&out, 10 as u8)
+    } else if op == 3 as u32 {
+        let real: u64 = read_u64(&inb, pos)
+        var c: [u8; 6] = "CLOCK "
+        put_lit(&out, (&c[0]) as u64, 6)
+        mem.buf_push_dec(&out, fpz.fp_clock_us(&key, real))
+        mem.buf_push(&out, 10 as u8)
+    } else {
+        return 3
+    }
+    mem.buf_flush(&out, 1)
+    return 0
+}

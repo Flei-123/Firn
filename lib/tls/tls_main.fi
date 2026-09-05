@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/tls/tls_main.fi -- the TLS client as a PROGRAM (root file).
+//
+//     tls_main <ip> <port> <hostname> <trust-store> [<path> [<dump>]]
+//
+// Opens a TCP connection to the numeric address, runs a TLS 1.3 handshake
+// with `<hostname>` as the SNI and as the name the certificate must carry,
+// and prints what happened -- one `KEY value` per line, so that
+// `tools/tlsb5/tls_check.py` can compare it against what `openssl` says
+// about the same connection.
+//
+// With a path it also sends a plain HTTP/1.1 GET over the connection and
+// reports the status line, the number of octets and the SHA-256 of the
+// body. That last number is the point of the whole round: it can be
+// compared with what `curl` fetched from the same URL, and if the two
+// agree then every layer underneath -- X25519, the key schedule, the
+// record layer, the AEAD -- is right. With a sixth argument the raw
+// response is written to that file, so that the comparison can be made
+// octet for octet and not only over a digest.
+import std.rt
+import std.net
+import std.crypto.sha256
+import tls.tls
+import tls.x509
+
+fn put(out: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(out, p, n)
+}
+
+fn line(out: *mut rt.Buf) {
+    rt.buf_push(out, 10 as u8)
+}
+
+fn say_num(out: *mut rt.Buf, key: u64, kn: usize, v: u64) {
+    put(out, key, kn)
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_dec_u64(out, v)
+    line(out)
+}
+
+fn say_text(out: *mut rt.Buf, key: u64, kn: usize, p: u64, n: usize) {
+    put(out, key, kn)
+    rt.buf_push(out, 32 as u8)
+    put(out, p, n)
+    line(out)
+}
+
+fn parse_u32(p: u64) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while true {
+        let ch: u8 = rt.ld8(p, i)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            break
+        }
+        v = v * 10 as u32 + (ch - 48 as u8) as u32
+        i = i + 1
+    }
+    return v
+}
+
+fn parse_ip(p: u64) -> u32 {
+    var parts: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var v: u32 = 0
+    var i: usize = 0
+    while true {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 0 as u8 {
+            break
+        }
+        if ch == 46 as u8 {
+            parts[k] = v
+            k = k + 1
+            v = 0
+        } else {
+            v = v * 10 as u32 + (ch - 48 as u8) as u32
+        }
+        i = i + 1
+    }
+    parts[k] = v
+    return net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8,
+        parts[3] as u8)
+}
+
+fn reason_name(r: u32, out: *mut rt.Buf) {
+    var s_ok: [u8; 2] = "OK"
+    var s_parse: [u8; 5] = "PARSE"
+    var s_exp: [u8; 7] = "EXPIRED"
+    var s_not: [u8; 7] = "NOT_YET"
+    var s_name: [u8; 4] = "NAME"
+    var s_unk: [u8; 14] = "UNKNOWN_ISSUER"
+    var s_sig: [u8; 13] = "BAD_SIGNATURE"
+    var s_ca: [u8; 6] = "NOT_CA"
+    var s_uns: [u8; 11] = "UNSUPPORTED"
+    var s_long: [u8; 8] = "TOO_LONG"
+    if r == x509.V_OK {
+        put(out, (&s_ok[0]) as u64, 2)
+    } else if r == x509.V_PARSE {
+        put(out, (&s_parse[0]) as u64, 5)
+    } else if r == x509.V_EXPIRED {
+        put(out, (&s_exp[0]) as u64, 7)
+    } else if r == x509.V_NOT_YET {
+        put(out, (&s_not[0]) as u64, 7)
+    } else if r == x509.V_NAME {
+        put(out, (&s_name[0]) as u64, 4)
+    } else if r == x509.V_UNKNOWN_ISSUER {
+        put(out, (&s_unk[0]) as u64, 14)
+    } else if r == x509.V_BAD_SIGNATURE {
+        put(out, (&s_sig[0]) as u64, 13)
+    } else if r == x509.V_NOT_CA {
+        put(out, (&s_ca[0]) as u64, 6)
+    } else if r == x509.V_UNSUPPORTED {
+        put(out, (&s_uns[0]) as u64, 11)
+    } else {
+        put(out, (&s_long[0]) as u64, 8)
+    }
+}
+
+fn main(start: u64) -> i32 {
+    var out: rt.Buf = rt.buf_new()
+    if rt.arg_count(start) < 5 {
+        var u: [u8; 5] = "USAGE"
+        put(&out, (&u[0]) as u64, 5)
+        line(&out)
+        rt.write_everything(1, out.ptr, out.len)
+        return 2
+    }
+    let addr: u32 = parse_ip(rt.arg_ptr(start, 1))
+    let port: u32 = parse_u32(rt.arg_ptr(start, 2))
+    let hostp: u64 = rt.arg_ptr(start, 3)
+    let hostn: usize = rt.c_length(hostp)
+    var storebuf: rt.Buf = rt.buf_new()
+    var store: x509.Store = x509.store_new()
+    if rt.read_file(rt.arg_ptr(start, 4), &storebuf) {
+        let taken: usize = x509.store_load_pem(&store, storebuf.ptr,
+            storebuf.len)
+        var k_roots: [u8; 5] = "ROOTS"
+        say_num(&out, (&k_roots[0]) as u64, 5, taken as u64)
+    }
+    var bad: bool = false
+    var c: net.Conn = net.connect_tcp(addr, port as u16)
+    catch | e | fail_conn(&bad)
+    if bad {
+        var x: [u8; 10] = "ERRCONNECT"
+        put(&out, (&x[0]) as u64, 10)
+        line(&out)
+        rt.write_everything(1, out.ptr, out.len)
+        return 1
+    }
+    let okt: bool = net.set_timeout(&c, 15000 as u64) catch false
+    var t: tls.Tls = tls.tls_new()
+    let oki: bool = tls.tls_init(&t, &c, &store, hostp, hostn,
+        now_seconds())
+    var failed: bool = false
+    let ok: bool = tls.tls_handshake(&t)
+    catch | e | tls.tls_fail_into(&out, e, &failed)
+    if failed {
+        // Why the chain was refused, when that is why. A test that can
+        // only see "the handshake failed" cannot tell an expired
+        // certificate from a wrong name, and those are different bugs.
+        var k_al: [u8; 5] = "ALERT"
+        say_num(&out, (&k_al[0]) as u64, 5, tls.tls_alert_desc(&t) as u64)
+        var k_ver0: [u8; 6] = "VERIFY"
+        put(&out, (&k_ver0[0]) as u64, 6)
+        rt.buf_push(&out, 32 as u8)
+        reason_name(tls.tls_verify_reason(&t), &out)
+        line(&out)
+        net.close(&c)
+        rt.write_everything(1, out.ptr, out.len)
+        return 1
+    }
+    var k_suite: [u8; 5] = "SUITE"
+    say_num(&out, (&k_suite[0]) as u64, 5, tls.tls_suite(&t) as u64)
+    var k_alpn: [u8; 4] = "ALPN"
+    say_text(&out, (&k_alpn[0]) as u64, 4, tls.tls_alpn_ptr(&t),
+        tls.tls_alpn_len(&t))
+    var k_ver: [u8; 6] = "VERIFY"
+    put(&out, (&k_ver[0]) as u64, 6)
+    rt.buf_push(&out, 32 as u8)
+    reason_name(tls.tls_verify_reason(&t), &out)
+    line(&out)
+    var k_depth: [u8; 5] = "DEPTH"
+    say_num(&out, (&k_depth[0]) as u64, 5, tls.tls_chain_depth(&t) as u64)
+    var k_certs: [u8; 5] = "CERTS"
+    say_num(&out, (&k_certs[0]) as u64, 5,
+        tls.tls_peer_cert_count(&t) as u64)
+
+    if rt.arg_count(start) > 5 {
+        var req: rt.Buf = rt.buf_new()
+        var g: [u8; 4] = "GET "
+        rt.buf_push_bytes(&req, (&g[0]) as u64, 4)
+        let pathp: u64 = rt.arg_ptr(start, 5)
+        rt.buf_push_bytes(&req, pathp, rt.c_length(pathp))
+        var h: [u8; 17] = " HTTP/1.1\r\nHost: "
+        rt.buf_push_bytes(&req, (&h[0]) as u64, 17)
+        rt.buf_push_bytes(&req, hostp, hostn)
+        var tail: [u8; 44] =
+        "\r\nConnection: close\r\nUser-Agent: firn-b5\r\n\r\n"
+        rt.buf_push_bytes(&req, (&tail[0]) as u64, 44)
+        var werr: bool = false
+        let okw: bool = tls.tls_write(&t, req.ptr, req.len)
+        catch | e | tls.tls_fail_into(&out, e, &werr)
+        rt.buf_free(&req)
+        if !werr {
+            var body: rt.Buf = rt.buf_new()
+            var chunk: [u8; 8192] = [0; 8192]
+            var rerr: bool = false
+            while true {
+                let n: usize = tls.tls_read(&t, (&chunk[0]) as u64, 8192)
+                catch | e | tls.tls_fail_len(&out, e, &rerr)
+                if rerr || n == 0 {
+                    break
+                }
+                rt.buf_push_bytes(&body, (&chunk[0]) as u64, n)
+            }
+            var k_bytes: [u8; 5] = "BYTES"
+            say_num(&out, (&k_bytes[0]) as u64, 5, body.len as u64)
+            var dg: [u8; 32] = [0; 32]
+            sha256.sha256(body.ptr, body.len, (&dg[0]) as u64)
+            var k_sha: [u8; 6] = "SHA256"
+            put(&out, (&k_sha[0]) as u64, 6)
+            rt.buf_push(&out, 32 as u8)
+            var i: usize = 0
+            while i < 32 {
+                rt.buf_push_hex_u64(&out, dg[i] as u64, 2)
+                i = i + 1
+            }
+            line(&out)
+            // the status line, up to the first CR
+            var e: usize = 0
+            while e < body.len && rt.ld8(body.ptr, e) != 13 as u8 {
+                e = e + 1
+            }
+            var k_st: [u8; 6] = "STATUS"
+            say_text(&out, (&k_st[0]) as u64, 6, body.ptr, e)
+            if rt.arg_count(start) > 6 {
+                let okf: bool = rt.write_file(rt.arg_ptr(start, 6),
+                    body.ptr, body.len)
+            }
+            rt.buf_free(&body)
+        }
+    }
+    var k_ri: [u8; 8] = "RECORDIN"
+    say_num(&out, (&k_ri[0]) as u64, 8, tls.tls_records_in(&t) as u64)
+    var k_ro: [u8; 9] = "RECORDOUT"
+    say_num(&out, (&k_ro[0]) as u64, 9, tls.tls_records_out(&t) as u64)
+    var k_hb: [u8; 8] = "HSOCTETS"
+    say_num(&out, (&k_hb[0]) as u64, 8,
+        tls.tls_handshake_bytes(&t) as u64)
+    tls.tls_close(&t)
+    tls.tls_free(&t)
+    net.close(&c)
+    rt.write_everything(1, out.ptr, out.len)
+    return 0
+}
+
+fn fail_conn(bad: *mut bool) -> net.Conn {
+    *bad = true
+    return net.Conn { fd: -1, err: 0, peer: 0 as u32, peer_port: 0 as u16 }
+}
+
+// CLOCK_REALTIME, because a certificate's validity is calendar time.
+fn now_seconds() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] as u64
+}

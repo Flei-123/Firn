@@ -1,0 +1,442 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/dom/soak_leak.fi -- THE COUNTER CHECK to the endurance run: the same
+// set of DOM cycles, but with REFERENCE COUNTS instead of `Gc[T]`.
+//
+// This version MUST leak. It is the proof that the measurement in
+// tools/dom_soak/run.sh measures anything at all: if it stays green, the
+// measuring method is broken and run.sh aborts. An endurance run that checks
+// only the desired version is no measurement but a claim.
+//
+// Self contained: a reference count heap of its own over mmap(2), NO `import`
+// of lib/rc and NO gc class -- so that the collector runtime is not pulled in
+// in the first place (compiler/src/modules.rs pulls it in only at `gc class`).
+// That way two memory models really are compared.
+//
+// The counting is CORRECT: acyclic garbage does get released (the collection
+// in the set has no back reference and disappears every time). Only the
+// cycles remain -- exactly the case for which Gecko had to retrofit its
+// cycle collector and which DESIGN_GOALS/SPEC 3.5 name as the reason for the
+// tracing GC.
+//
+// The object layout (128 bytes, round 53). The set reproduces the GC set
+// from lib/dom/dom.fi OBJECT BY OBJECT -- the collections and their slot
+// buffers too, otherwise it would no longer be the same two graphs:
+//   [0]   counter
+//   [8]   parent        [16]  children list [24]  buffer of the children list
+//   [32]  element 0     [40]  element 1     [48]  element 2
+//   [56]  listener list [64]  wrapper       [72]  root
+//   [80]  target        [88]  attr table    [96]  attr value (Str)
+//   [104] next          [112] reserved      [120] free list chaining
+// Every column from [8] to [112] is a REFERENCE and is let go generically
+// on release -- which is why a new column costs no new
+// line in `lk_let` here.
+
+import meas
+
+const BUDGET_MS: i64 = 600000 // SOAK_BUDGET_MS
+const CYCLES_MAX: i64 = 100000000 // SOAK_CYCLES_MAX
+const SAMPLE: i64 = 1000 // SOAK_SAMPLE
+
+const SYS_MMAP: i64 = 9
+const PROT_RW: i64 = 3
+const MAP_PRIVATE_ANON: i64 = 34
+
+const OBJ_BYTES: u64 = 128
+const CHUNK_BYTES: u64 = 1048576
+
+// The state block of the heap
+const H_CHUNKS: u64 = 0
+const H_BUMP: u64 = 8
+const H_END: u64 = 16
+const H_FREE: u64 = 24
+const H_LIVE: u64 = 32
+const H_BYTES: u64 = 40
+
+// The object fields
+const F_COUNTER: u64 = 0
+const F_PARENT: u64 = 8
+const F_CHILDREN: u64 = 16
+const F_BUFFER: u64 = 24
+const F_E0: u64 = 32
+const F_E1: u64 = 40
+const F_E2: u64 = 48
+const F_LISTENER: u64 = 56
+const F_WRAPPER: u64 = 64
+const F_ROOT: u64 = 72
+const F_TARGET: u64 = 80
+const F_ATTRS: u64 = 88
+const F_VALUE: u64 = 96
+const F_NEXT: u64 = 104
+const F_FREE: u64 = 120
+// The reference columns: [F_SLOT0, F_SLOT0 + F_SLOTS*8)
+const F_SLOT0: u64 = 8
+const F_SLOTS: u64 = 14
+
+fn lk_ld(a: u64) -> u64 {
+    return *(a as *mut u64)
+}
+
+fn lk_st(a: u64, v: u64) {
+    *(a as *mut u64) = v
+}
+
+// Without a fixed address, without MAP_FIXED; a failure is visible (0).
+fn lk_mmap(n: u64) -> u64 {
+    let len: u64 = (n + 4095) / 4096 * 4096
+    let r: i64 = syscall(SYS_MMAP, 0, len as i64, PROT_RW, MAP_PRIVATE_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    if r == 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn lk_heap_new() -> u64 {
+    return lk_mmap(64)
+}
+
+fn lk_chunk_new(h: u64) -> bool {
+    let c: u64 = lk_mmap(CHUNK_BYTES)
+    if c == 0 {
+        return false
+    }
+    lk_st(c, lk_ld(h + H_CHUNKS))
+    lk_st(h + H_CHUNKS, c)
+    lk_st(h + H_BUMP, c + 64)
+    lk_st(h + H_END, c + CHUNK_BYTES)
+    lk_st(h + H_BYTES, lk_ld(h + H_BYTES) + CHUNK_BYTES)
+    return true
+}
+
+// A new object with counter 1 (the reference of the caller). 0 = out of memory.
+fn lk_alloc(h: u64) -> u64 {
+    var o: u64 = lk_ld(h + H_FREE)
+    if o != 0 {
+        lk_st(h + H_FREE, lk_ld(o + F_FREE))
+    } else {
+        if lk_ld(h + H_BUMP) + OBJ_BYTES > lk_ld(h + H_END) {
+            if !lk_chunk_new(h) {
+                return 0
+            }
+        }
+        o = lk_ld(h + H_BUMP)
+        lk_st(h + H_BUMP, o + OBJ_BYTES)
+    }
+    var i: u64 = 0
+    while i < OBJ_BYTES {
+        lk_st(o + i, 0)
+        i = i + 8
+    }
+    lk_st(o + F_COUNTER, 1)
+    lk_st(h + H_LIVE, lk_ld(h + H_LIVE) + 1)
+    return o
+}
+
+fn lk_hold(o: u64) {
+    if o == 0 {
+        return
+    }
+    lk_st(o + F_COUNTER, lk_ld(o + F_COUNTER) + 1)
+}
+
+// Counter down; at 0, let go of the references held and give the block
+// back. Exactly that never reaches a cycle.
+fn lk_let(h: u64, o: u64) {
+    if o == 0 {
+        return
+    }
+    let z: u64 = lk_ld(o + F_COUNTER)
+    if z > 1 {
+        lk_st(o + F_COUNTER, z - 1)
+        return
+    }
+    lk_st(o + F_COUNTER, 0)
+    // First save and null ALL columns, then let go: while letting go, this
+    // object can be entered again.
+    var saved: [u64; 14] = [0; 14]
+    var i: u64 = 0
+    while i < F_SLOTS {
+        saved[i as usize] = lk_ld(o + F_SLOT0 + i * 8)
+        lk_st(o + F_SLOT0 + i * 8, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < F_SLOTS {
+        lk_let(h, saved[i as usize])
+        i = i + 1
+    }
+    lk_st(o + F_FREE, lk_ld(h + H_FREE))
+    lk_st(h + H_FREE, o)
+    lk_st(h + H_LIVE, lk_ld(h + H_LIVE) - 1)
+}
+
+// A strong assignment: first hold, then write, then let go of the old one.
+fn lk_set(h: u64, o: u64, field: u64, value: u64) {
+    let old: u64 = lk_ld(o + field)
+    lk_hold(value)
+    lk_st(o + field, value)
+    lk_let(h, old)
+}
+
+// A complete set of cycles, built OBJECT BY OBJECT identically to
+// dom.dom_cycle_build() (round 53, 14 objects):
+//   1 root
+//   3 attribute table + its buffer + one value object (Str)
+//   3 children with a strong parent reference
+//   2 children list + its buffer
+//   3 listener list + its buffer + the listener
+//   1 collection
+//   1 wrapper
+// It returns the number of objects created, 0 on lack of memory.
+fn lk_set_build(h: u64) -> u64 {
+    let root: u64 = lk_alloc(h)
+    if root == 0 {
+        return 0
+    }
+
+    // --- Attributes: table -> buffer -> value (cycle 2 without a back reference)
+    let at: u64 = lk_alloc(h)
+    if at == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, root, F_ATTRS, at)
+    lk_let(h, at)
+    let ap: u64 = lk_alloc(h)
+    if ap == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, at, F_BUFFER, ap)
+    lk_let(h, ap)
+    let av: u64 = lk_alloc(h)
+    if av == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, ap, F_VALUE, av)
+    lk_let(h, av)
+
+    // --- Children: root -> children list -> buffer -> child -> root.
+    // Exactly this cycle runs over a GcVec in the GC version.
+    let kl: u64 = lk_alloc(h)
+    if kl == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, root, F_CHILDREN, kl)
+    lk_let(h, kl)
+    let kp: u64 = lk_alloc(h)
+    if kp == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, kl, F_BUFFER, kp)
+    lk_let(h, kp)
+    var i: u64 = 0
+    while i < 3 {
+        let k: u64 = lk_alloc(h)
+        if k == 0 {
+            lk_let(h, root)
+            return 0
+        }
+        lk_set(h, k, F_PARENT, root)
+        lk_set(h, kp, F_E0 + i * 8, k)
+        lk_let(h, k)
+        i = i + 1
+    }
+
+    // --- Listeners: root -> listener list -> buffer -> listener -> root
+    let ll: u64 = lk_alloc(h)
+    if ll == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, root, F_LISTENER, ll)
+    lk_let(h, ll)
+    let lp: u64 = lk_alloc(h)
+    if lp == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, ll, F_BUFFER, lp)
+    lk_let(h, lp)
+    let l: u64 = lk_alloc(h)
+    if l == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, l, F_TARGET, root)
+    lk_set(h, lp, F_E0, l)
+    lk_let(h, l)
+
+    // --- Collection: NO back reference, it disappears again right away.
+    let s: u64 = lk_alloc(h)
+    if s == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, s, F_ROOT, root)
+    lk_let(h, s)
+
+    // --- Wrapper
+    let w: u64 = lk_alloc(h)
+    if w == 0 {
+        lk_let(h, root)
+        return 0
+    }
+    lk_set(h, w, F_TARGET, root)
+    lk_set(h, root, F_WRAPPER, w)
+    lk_let(h, w)
+
+    // The last local reference to the root is given up. A tracing collector
+    // would collect the whole set now; the counter cannot: the child holds the
+    // parent, the parent holds its children list, and the children list holds
+    // the child.
+    lk_let(h, root)
+    return 14
+}
+
+// Header line 1 of the protocol
+fn t_head1() {
+    var t: [u8; 33] = [
+        35, 32, 102, 105, 114, 110, 45, 100, 111, 109, 45, 115, 111, 97, 107,
+        32, 118, 49, 32, 118, 97, 114, 105, 97, 110, 116, 101, 61, 108, 101,
+        99, 107, 10,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 33)
+}
+// Header line 2: the column names
+fn t_head2() {
+    var t: [u8; 76] = [
+        35, 32, 115, 112, 97, 108, 116, 101, 110, 58, 32, 116, 95, 109, 115,
+        9, 122, 121, 107, 108, 101, 110, 9, 114, 115, 115, 95, 107, 105, 98,
+        9, 108, 101, 98, 101, 110, 100, 101, 9, 115, 97, 109, 109, 101, 108,
+        108, 97, 101, 117, 102, 101, 9, 104, 101, 97, 112, 95, 98, 121, 116,
+        101, 115, 9, 112, 97, 117, 115, 101, 95, 109, 97, 120, 95, 110, 115,
+        10,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 76)
+}
+// The final line, part 1
+fn t_done() {
+    var t: [u8; 16] = [
+        35, 32, 102, 101, 114, 116, 105, 103, 32, 122, 121, 107, 108, 101, 110,
+        61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 16)
+}
+// The final line, part 2
+fn t_tms() {
+    var t: [u8; 6] = [
+        32, 116, 95, 109, 115, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 6)
+}
+// The final line, part 3
+fn t_runs() {
+    var t: [u8; 14] = [
+        32, 115, 97, 109, 109, 101, 108, 108, 97, 101, 117, 102, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 14)
+}
+// The final line, part 4
+fn t_rss() {
+    var t: [u8; 9] = [
+        32, 114, 115, 115, 95, 107, 105, 98, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 9)
+}
+// The error line
+fn t_error() {
+    var t: [u8; 14] = [
+        35, 32, 102, 101, 104, 108, 101, 114, 32, 99, 111, 100, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 14)
+}
+
+// One data line of the protocol. The column `sammellaeufe` is always 0 here
+// -- this version has no collector. `rss_kib` is NEVER 0: that is exactly
+// where the leak becomes visible.
+fn line(t_ms: u64, cycles: u64, rss: u64, live: u64, runs: u64, heap: u64, pause: u64) {
+    meas.meas_u64(t_ms)
+    meas.meas_tab()
+    meas.meas_u64(cycles)
+    meas.meas_tab()
+    meas.meas_u64(rss)
+    meas.meas_tab()
+    meas.meas_u64(live)
+    meas.meas_tab()
+    meas.meas_u64(runs)
+    meas.meas_tab()
+    meas.meas_u64(heap)
+    meas.meas_tab()
+    meas.meas_u64(pause)
+    meas.meas_nl()
+}
+
+fn err(code: u64) -> i32 {
+    t_error()
+    meas.meas_u64(code)
+    meas.meas_nl()
+    return code as i32
+}
+
+fn main() -> i32 {
+    let h: u64 = lk_heap_new()
+    if h == 0 {
+        return err(2)
+    }
+    t_head1()
+    t_head2()
+    let rss0: u64 = meas.meas_rss_kib()
+    if rss0 == 0 {
+        return err(3)
+    }
+    let t0: u64 = meas.meas_now_ms()
+    line(0, 0, rss0, lk_ld(h + H_LIVE), 0, lk_ld(h + H_BYTES), 0)
+
+    var cycles: u64 = 0
+    var since: i64 = 0
+    var t: u64 = 0
+    var run: bool = true
+    while run {
+        let n: u64 = lk_set_build(h)
+        if n != 14 {
+            return err(4)
+        }
+        cycles = cycles + 1
+        since = since + 1
+        if since >= SAMPLE {
+            since = 0
+            t = meas.meas_now_ms() - t0
+            let rss: u64 = meas.meas_rss_kib()
+            if rss == 0 {
+                return err(5)
+            }
+            line(t, cycles, rss, lk_ld(h + H_LIVE), 0, lk_ld(h + H_BYTES), 0)
+            if t >= BUDGET_MS as u64 || cycles >= CYCLES_MAX as u64 {
+                run = false
+            }
+        }
+    }
+    t_done()
+    meas.meas_u64(cycles)
+    t_tms()
+    meas.meas_u64(t)
+    t_runs()
+    meas.meas_u64(0)
+    t_rss()
+    meas.meas_u64(meas.meas_rss_kib())
+    meas.meas_nl()
+    return 0
+}

@@ -1,0 +1,555 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/css/write.fi -- the parse tree in the JSON format of css-parsing-tests.
+//
+// Deliberately EXACTLY the representation the foreign test data use
+// (testdata/css-parsing-tests/README.rst, section "Result representation"),
+// and no format of our own: that way the runner
+// (tools/css/harness_syntax.py) contains no parser logic at all -- it
+// compares JSON against JSON.
+//
+// The output is pure ASCII: every code point above U+007E is written as
+// \uXXXX, astral ones as a surrogate pair. So the comparison never depends
+// on an encoding step in between.
+//
+// THE NUMBER VALUE: the third entry of a number/percentage/dimension is
+// the VALUE. It is written here out of the REPRESENTATION, normalized into
+// a JSON number (leading `+` gone, a digit before the point, no leading
+// zeros). That is exact -- the value of a CSS number is by definition the
+// value of its decimal representation, and both sides of the comparison
+// are read by the same JSON parser. What is deliberately NOT done: a
+// detour through a binary double and back, which would need a shortest
+// round-trip printer (Ryu) that Firn does not have.
+import html.mem
+import browser.node
+import css.tok
+import css.cv
+
+export { write_result, write_value, write_value_list, out_json_chain, out_lit }
+
+#[no_gc]
+fn out_ascii(out: *mut mem.Buf, c: u32) {
+    mem.buf_push(out, c as u8)
+}
+
+#[no_gc]
+fn out_lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn hex_digit(v: u32) -> u8 {
+    if v < 10 as u32 {
+        return (48 as u32 + v) as u8
+    }
+    return (87 as u32 + v) as u8
+}
+
+#[no_gc]
+fn out_u16_escape(out: *mut mem.Buf, v: u32) {
+    mem.buf_push(out, 92 as u8)
+    mem.buf_push(out, 117 as u8)
+    mem.buf_push(out, hex_digit((v >> 12) & 15 as u32))
+    mem.buf_push(out, hex_digit((v >> 8) & 15 as u32))
+    mem.buf_push(out, hex_digit((v >> 4) & 15 as u32))
+    mem.buf_push(out, hex_digit(v & 15 as u32))
+}
+
+// One code point inside a JSON string.
+#[no_gc]
+fn out_json_cp(out: *mut mem.Buf, c: u32) {
+    if c == 34 as u32 || c == 92 as u32 {
+        mem.buf_push(out, 92 as u8)
+        mem.buf_push(out, c as u8)
+        return
+    }
+    if c >= 32 as u32 && c < 127 as u32 {
+        mem.buf_push(out, c as u8)
+        return
+    }
+    if c <= 0xFFFF as u32 {
+        out_u16_escape(out, c)
+        return
+    }
+    let v: u32 = c - 0x10000 as u32
+    out_u16_escape(out, 0xD800 as u32 + (v >> 10))
+    out_u16_escape(out, 0xDC00 as u32 + (v & 0x3FF as u32))
+}
+
+fn out_json_chain(out: *mut mem.Buf, k: Gc[Chain]) {
+    mem.buf_push(out, 34 as u8)
+    if k != gc_null[Chain]() {
+        var s: Gc[Strand] = k.first
+        while s != gc_null[Strand]() {
+            var i: usize = 0
+            let n: usize = s.len as usize
+            while i < n {
+                out_json_cp(out, s.chars[i])
+                i = i + 1
+            }
+            s = s.next
+        }
+    }
+    mem.buf_push(out, 34 as u8)
+}
+
+// ------------------------------------------------------- The number value
+
+fn is_digit_cp(c: u32) -> bool {
+    return c >= 48 as u32 && c <= 57 as u32
+}
+
+// Writes the value of a number as a JSON number, out of its representation.
+fn out_number_value(out: *mut mem.Buf, k: Gc[Chain]) {
+    let n: u64 = node.chain_len(k)
+    var i: u64 = 0
+    var negative: bool = false
+    if i < n {
+        let c: u32 = node.chain_at(k, i)
+        if c == 45 as u32 {
+            negative = true
+            i = i + 1
+        } else if c == 43 as u32 {
+            i = i + 1
+        }
+    }
+    let int_from: u64 = i
+    while i < n && is_digit_cp(node.chain_at(k, i)) {
+        i = i + 1
+    }
+    let int_to: u64 = i
+    var frac_from: u64 = 0
+    var frac_to: u64 = 0
+    if i < n && node.chain_at(k, i) == 46 as u32 {
+        i = i + 1
+        frac_from = i
+        while i < n && is_digit_cp(node.chain_at(k, i)) {
+            i = i + 1
+        }
+        frac_to = i
+    }
+    var exp_negative: bool = false
+    var exp_from: u64 = 0
+    var exp_to: u64 = 0
+    if i < n {
+        let e: u32 = node.chain_at(k, i)
+        if e == 101 as u32 || e == 69 as u32 {
+            i = i + 1
+            if i < n && node.chain_at(k, i) == 45 as u32 {
+                exp_negative = true
+                i = i + 1
+            } else if i < n && node.chain_at(k, i) == 43 as u32 {
+                i = i + 1
+            }
+            exp_from = i
+            while i < n && is_digit_cp(node.chain_at(k, i)) {
+                i = i + 1
+            }
+            exp_to = i
+        }
+    }
+    if negative {
+        mem.buf_push(out, 45 as u8)
+    }
+    // The integer part without leading zeros; JSON does not allow them.
+    var a: u64 = int_from
+    while a + 1 < int_to && node.chain_at(k, a) == 48 as u32 {
+        a = a + 1
+    }
+    if a >= int_to {
+        mem.buf_push(out, 48 as u8)
+    } else {
+        while a < int_to {
+            mem.buf_push(out, node.chain_at(k, a) as u8)
+            a = a + 1
+        }
+    }
+    if frac_to > frac_from {
+        mem.buf_push(out, 46 as u8)
+        var b: u64 = frac_from
+        while b < frac_to {
+            mem.buf_push(out, node.chain_at(k, b) as u8)
+            b = b + 1
+        }
+    }
+    if exp_to > exp_from {
+        mem.buf_push(out, 101 as u8)
+        if exp_negative {
+            mem.buf_push(out, 45 as u8)
+        }
+        var c: u64 = exp_from
+        while c + 1 < exp_to && node.chain_at(k, c) == 48 as u32 {
+            c = c + 1
+        }
+        while c < exp_to {
+            mem.buf_push(out, node.chain_at(k, c) as u8)
+            c = c + 1
+        }
+    }
+}
+
+fn out_number_type(out: *mut mem.Buf, flags: u32) {
+    if (flags & tok.F_INTEGER) != 0 as u32 {
+        var w: [u8; 9] = "\"integer\""
+        out_lit(out, (&w[0]) as u64, 9)
+    } else {
+        var w2: [u8; 8] = "\"number\""
+        out_lit(out, (&w2[0]) as u64, 8)
+    }
+}
+
+// ------------------------------------------------------------ Error names
+
+fn out_error(out: *mut mem.Buf, code: u32) {
+    var head: [u8; 10] = "[\"error\", "
+    out_lit(out, (&head[0]) as u64, 10)
+    if code == cv.E_INVALID {
+        var w: [u8; 9] = "\"invalid\""
+        out_lit(out, (&w[0]) as u64, 9)
+    } else if code == cv.E_EMPTY {
+        var w2: [u8; 7] = "\"empty\""
+        out_lit(out, (&w2[0]) as u64, 7)
+    } else if code == cv.E_EXTRA_INPUT {
+        var w3: [u8; 13] = "\"extra-input\""
+        out_lit(out, (&w3[0]) as u64, 13)
+    } else if code == cv.E_BAD_STRING {
+        var w4: [u8; 12] = "\"bad-string\""
+        out_lit(out, (&w4[0]) as u64, 12)
+    } else if code == cv.E_EOF_IN_STRING {
+        var w5: [u8; 15] = "\"eof-in-string\""
+        out_lit(out, (&w5[0]) as u64, 15)
+    } else if code == cv.E_BAD_URL {
+        var w6: [u8; 9] = "\"bad-url\""
+        out_lit(out, (&w6[0]) as u64, 9)
+    } else if code == cv.E_EOF_IN_URL {
+        var w7: [u8; 12] = "\"eof-in-url\""
+        out_lit(out, (&w7[0]) as u64, 12)
+    } else if code == cv.E_CLOSE_CURLY {
+        var w8: [u8; 3] = "\"}\""
+        out_lit(out, (&w8[0]) as u64, 3)
+    } else if code == cv.E_CLOSE_SQUARE {
+        var w9: [u8; 3] = "\"]\""
+        out_lit(out, (&w9[0]) as u64, 3)
+    } else {
+        var w10: [u8; 3] = "\")\""
+        out_lit(out, (&w10[0]) as u64, 3)
+    }
+    mem.buf_push(out, 93 as u8)
+}
+
+// ------------------------------------------------------- The values
+
+fn out_comma(out: *mut mem.Buf) {
+    mem.buf_push(out, 44 as u8)
+    mem.buf_push(out, 32 as u8)
+}
+
+// The children of a node, comma separated, WITHOUT brackets.
+fn out_kids_inner(out: *mut mem.Buf, c: Gc[Cv], first: bool) {
+    var f: bool = first
+    let n: u64 = cv.cv_kids_count(c)
+    var i: u64 = 0
+    while i < n {
+        if !f {
+            out_comma(out)
+        }
+        f = false
+        write_value(out, cv.cv_kid(c, i))
+        i = i + 1
+    }
+}
+
+fn out_kids_list(out: *mut mem.Buf, c: Gc[Cv]) {
+    mem.buf_push(out, 91 as u8)
+    out_kids_inner(out, c, true)
+    mem.buf_push(out, 93 as u8)
+}
+
+fn out_extra_list(out: *mut mem.Buf, c: Gc[Cv]) {
+    mem.buf_push(out, 91 as u8)
+    let n: u64 = cv.cv_extra_count(c)
+    var i: u64 = 0
+    while i < n {
+        if i > 0 {
+            out_comma(out)
+        }
+        write_value(out, cv.cv_extra(c, i))
+        i = i + 1
+    }
+    mem.buf_push(out, 93 as u8)
+}
+
+fn out_tagged_text(out: *mut mem.Buf, p: u64, n: usize, k: Gc[Chain]) {
+    mem.buf_push(out, 91 as u8)
+    out_lit(out, p, n)
+    out_comma(out)
+    out_json_chain(out, k)
+    mem.buf_push(out, 93 as u8)
+}
+
+fn out_numeric(out: *mut mem.Buf, c: Gc[Cv], p: u64, n: usize) {
+    mem.buf_push(out, 91 as u8)
+    out_lit(out, p, n)
+    out_comma(out)
+    out_json_chain(out, c.text)
+    out_comma(out)
+    out_number_value(out, c.text)
+    out_comma(out)
+    out_number_type(out, c.flags)
+    if c.kind == tok.T_DIMENSION {
+        out_comma(out)
+        out_json_chain(out, c.unit)
+    }
+    mem.buf_push(out, 93 as u8)
+}
+
+fn out_block(out: *mut mem.Buf, c: Gc[Cv], p: u64, n: usize) {
+    mem.buf_push(out, 91 as u8)
+    out_lit(out, p, n)
+    if cv.cv_kids_count(c) > 0 {
+        out_comma(out)
+    }
+    out_kids_inner(out, c, true)
+    mem.buf_push(out, 93 as u8)
+}
+
+fn out_u64(out: *mut mem.Buf, v: u64) {
+    mem.buf_push_dec(out, v)
+}
+
+// One component value, rule or declaration.
+fn write_value(out: *mut mem.Buf, c: Gc[Cv]) {
+    if c == gc_null[Cv]() {
+        var w: [u8; 4] = "null"
+        out_lit(out, (&w[0]) as u64, 4)
+        return
+    }
+    let k: u32 = c.kind
+    if k == cv.CV_ERROR {
+        out_error(out, c.r0)
+        return
+    }
+    if k == tok.T_IDENT {
+        var w: [u8; 7] = "\"ident\""
+        out_tagged_text(out, (&w[0]) as u64, 7, c.text)
+        return
+    }
+    if k == tok.T_AT_KEYWORD {
+        var w: [u8; 12] = "\"at-keyword\""
+        out_tagged_text(out, (&w[0]) as u64, 12, c.text)
+        return
+    }
+    if k == tok.T_STRING {
+        var w: [u8; 8] = "\"string\""
+        out_tagged_text(out, (&w[0]) as u64, 8, c.text)
+        return
+    }
+    if k == tok.T_URL {
+        var w: [u8; 5] = "\"url\""
+        out_tagged_text(out, (&w[0]) as u64, 5, c.text)
+        return
+    }
+    if k == tok.T_HASH {
+        var w: [u8; 6] = "\"hash\""
+        mem.buf_push(out, 91 as u8)
+        out_lit(out, (&w[0]) as u64, 6)
+        out_comma(out)
+        out_json_chain(out, c.text)
+        out_comma(out)
+        if (c.flags & tok.F_HASH_ID) != 0 as u32 {
+            var w2: [u8; 4] = "\"id\""
+            out_lit(out, (&w2[0]) as u64, 4)
+        } else {
+            var w3: [u8; 14] = "\"unrestricted\""
+            out_lit(out, (&w3[0]) as u64, 14)
+        }
+        mem.buf_push(out, 93 as u8)
+        return
+    }
+    if k == tok.T_NUMBER {
+        var w: [u8; 8] = "\"number\""
+        out_numeric(out, c, (&w[0]) as u64, 8)
+        return
+    }
+    if k == tok.T_PERCENTAGE {
+        var w: [u8; 12] = "\"percentage\""
+        out_numeric(out, c, (&w[0]) as u64, 12)
+        return
+    }
+    if k == tok.T_DIMENSION {
+        var w: [u8; 11] = "\"dimension\""
+        out_numeric(out, c, (&w[0]) as u64, 11)
+        return
+    }
+    if k == tok.T_UNICODE_RANGE {
+        var w: [u8; 16] = "[\"unicode-range\""
+        out_lit(out, (&w[0]) as u64, 16)
+        out_comma(out)
+        out_u64(out, c.r0 as u64)
+        out_comma(out)
+        out_u64(out, c.r1 as u64)
+        mem.buf_push(out, 93 as u8)
+        return
+    }
+    if k == tok.T_DELIM {
+        out_json_chain(out, c.text)
+        return
+    }
+    if k == tok.T_WHITESPACE {
+        var w: [u8; 3] = "\" \""
+        out_lit(out, (&w[0]) as u64, 3)
+        return
+    }
+    if k == tok.T_COLON {
+        var w: [u8; 3] = "\":\""
+        out_lit(out, (&w[0]) as u64, 3)
+        return
+    }
+    if k == tok.T_SEMICOLON {
+        var w: [u8; 3] = "\";\""
+        out_lit(out, (&w[0]) as u64, 3)
+        return
+    }
+    if k == tok.T_COMMA {
+        var w: [u8; 3] = "\",\""
+        out_lit(out, (&w[0]) as u64, 3)
+        return
+    }
+    if k == tok.T_CDO {
+        var w: [u8; 6] = "\"<!--\""
+        out_lit(out, (&w[0]) as u64, 6)
+        return
+    }
+    if k == tok.T_CDC {
+        var w: [u8; 5] = "\"-->\""
+        out_lit(out, (&w[0]) as u64, 5)
+        return
+    }
+    if k == tok.T_INCLUDE_MATCH {
+        var w: [u8; 4] = "\"~=\""
+        out_lit(out, (&w[0]) as u64, 4)
+        return
+    }
+    if k == tok.T_DASH_MATCH {
+        var w: [u8; 4] = "\"|=\""
+        out_lit(out, (&w[0]) as u64, 4)
+        return
+    }
+    if k == tok.T_PREFIX_MATCH {
+        var w: [u8; 4] = "\"^=\""
+        out_lit(out, (&w[0]) as u64, 4)
+        return
+    }
+    if k == tok.T_SUFFIX_MATCH {
+        var w: [u8; 4] = "\"$=\""
+        out_lit(out, (&w[0]) as u64, 4)
+        return
+    }
+    if k == tok.T_SUBSTRING_MATCH {
+        var w: [u8; 4] = "\"*=\""
+        out_lit(out, (&w[0]) as u64, 4)
+        return
+    }
+    if k == tok.T_COLUMN {
+        var w: [u8; 4] = "\"||\""
+        out_lit(out, (&w[0]) as u64, 4)
+        return
+    }
+    if k == cv.CV_CURLY {
+        var w: [u8; 4] = "\"{}\""
+        out_block(out, c, (&w[0]) as u64, 4)
+        return
+    }
+    if k == cv.CV_SQUARE {
+        var w: [u8; 4] = "\"[]\""
+        out_block(out, c, (&w[0]) as u64, 4)
+        return
+    }
+    if k == cv.CV_ROUND {
+        var w: [u8; 4] = "\"()\""
+        out_block(out, c, (&w[0]) as u64, 4)
+        return
+    }
+    if k == cv.CV_FUNCTION {
+        var w: [u8; 10] = "\"function\""
+        mem.buf_push(out, 91 as u8)
+        out_lit(out, (&w[0]) as u64, 10)
+        out_comma(out)
+        out_json_chain(out, c.text)
+        if cv.cv_kids_count(c) > 0 {
+            out_comma(out)
+        }
+        out_kids_inner(out, c, true)
+        mem.buf_push(out, 93 as u8)
+        return
+    }
+    if k == cv.CV_AT_RULE {
+        var w: [u8; 9] = "\"at-rule\""
+        mem.buf_push(out, 91 as u8)
+        out_lit(out, (&w[0]) as u64, 9)
+        out_comma(out)
+        out_json_chain(out, c.text)
+        out_comma(out)
+        out_kids_list(out, c)
+        out_comma(out)
+        if (c.flags & cv.F_HAS_BLOCK) != 0 as u32 {
+            out_extra_list(out, c)
+        } else {
+            var w2: [u8; 4] = "null"
+            out_lit(out, (&w2[0]) as u64, 4)
+        }
+        mem.buf_push(out, 93 as u8)
+        return
+    }
+    if k == cv.CV_QUALIFIED_RULE {
+        var w: [u8; 16] = "\"qualified rule\""
+        mem.buf_push(out, 91 as u8)
+        out_lit(out, (&w[0]) as u64, 16)
+        out_comma(out)
+        out_kids_list(out, c)
+        out_comma(out)
+        out_extra_list(out, c)
+        mem.buf_push(out, 93 as u8)
+        return
+    }
+    if k == cv.CV_DECLARATION {
+        var w: [u8; 13] = "\"declaration\""
+        mem.buf_push(out, 91 as u8)
+        out_lit(out, (&w[0]) as u64, 13)
+        out_comma(out)
+        out_json_chain(out, c.text)
+        out_comma(out)
+        out_kids_list(out, c)
+        out_comma(out)
+        if (c.flags & cv.F_IMPORTANT) != 0 as u32 {
+            var w2: [u8; 4] = "true"
+            out_lit(out, (&w2[0]) as u64, 4)
+        } else {
+            var w3: [u8; 5] = "false"
+            out_lit(out, (&w3[0]) as u64, 5)
+        }
+        mem.buf_push(out, 93 as u8)
+        return
+    }
+    var unknown: [u8; 4] = "null"
+    out_lit(out, (&unknown[0]) as u64, 4)
+}
+
+// A list node (the result of the list entry points).
+fn write_value_list(out: *mut mem.Buf, c: Gc[Cv]) {
+    out_kids_list(out, c)
+}
+
+// The result of one job: a list is printed as a list, everything else as
+// a single value.
+fn write_result(out: *mut mem.Buf, c: Gc[Cv], list: bool) {
+    if list {
+        write_value_list(out, c)
+    } else {
+        write_value(out, c)
+    }
+    mem.buf_push(out, 10 as u8)
+}

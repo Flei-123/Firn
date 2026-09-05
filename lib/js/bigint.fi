@@ -1,0 +1,904 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/bigint.fi -- BIGINT (ECMA-262 clause 6.1.27 and 21.2), written in
+// Firn, from scratch.
+//
+// THE REPRESENTATION. The magnitude lies as limbs of 32 bits in a RAW
+// vector of the GC heap, least significant limb first, without leading zero
+// limbs. A raw vector holds no pointers, so the collector walks it without
+// looking inside -- exactly what a number wants. The sign is a separate
+// field: 0 means positive or zero, 1 means negative. Zero has NO limbs, so
+// there is no negative zero, which is what the specification demands.
+//
+// WHY 32 BITS and not 64: a multiplication of two limbs has to fit into one
+// machine word without a carry that cannot be seen. With 32 bit limbs the
+// product of two limbs plus two carries fits into a `u64` -- no 128 bit
+// arithmetic, no assembly, no trick.
+//
+// THE OPERATIONS are the schoolbook ones: addition and subtraction of the
+// magnitudes with a carry, multiplication limb by limb, division as a
+// binary long division (shift the divisor, subtract, one bit of quotient
+// per step). The bitwise operations go over the TWO'S COMPLEMENT of a fixed
+// width -- one limb wider than the wider operand, which makes the sign
+// extension correct.
+import html.mem
+import std.math
+import js.val
+
+export {
+    bi_zero, bi_from_u64, bi_from_i64, bi_is_zero, bi_is_neg,
+    bi_add, bi_sub, bi_mul, bi_div, bi_rem, bi_pow, bi_neg,
+    bi_and, bi_or, bi_xor, bi_not, bi_shl, bi_shr,
+    bi_cmp, bi_cmp_f64, bi_to_string, bi_to_f64, bi_from_f64,
+    bi_parse, bi_as_int_n, bi_as_uint_n,
+    BI_BAD,
+}
+
+// The answer of `bi_parse` when the text is not a BigInt.
+const BI_BAD: u64 = 0
+
+// ------------------------------------------------------------ The limbs
+
+const LIMB_MASK: u64 = 4294967295
+
+fn limbs_new() -> AllocError!Gc[GcVec] {
+    return gcvec_new_raw()
+}
+
+fn limbs_len(v: Gc[GcVec]) -> u64 {
+    if (v as u64) == 0 {
+        return 0
+    }
+    return gcvec_length(v)
+}
+
+fn limb_at(v: Gc[GcVec], i: u64) -> u64 {
+    if (v as u64) == 0 || i >= gcvec_length(v) {
+        return 0
+    }
+    return gcvec_read_raw(v, i)
+}
+
+// Strip the leading zero limbs -- the invariant of the representation.
+fn limbs_trim(v: Gc[GcVec]) {
+    var n: u64 = limbs_len(v)
+    while n > 0 {
+        if gcvec_read_raw(v, n - 1) != 0 {
+            break
+        }
+        let ok: bool = gcvec_remove(v, n - 1)
+        n = n - 1
+    }
+}
+
+fn make(r: Gc[Realm], v: Gc[GcVec], sign: u64) -> AllocError!Gc[JsVal] {
+    limbs_trim(v)
+    var sg: u64 = sign
+    if limbs_len(v) == 0 {
+        sg = 0
+    }
+    return val.bigint_new(r, v, sg)
+}
+
+fn bi_zero(r: Gc[Realm]) -> AllocError!Gc[JsVal] {
+    let v: Gc[GcVec] = try limbs_new()
+    return val.bigint_new(r, v, 0)
+}
+
+fn bi_from_u64(r: Gc[Realm], x: u64, neg: bool) -> AllocError!Gc[JsVal] {
+    let v: Gc[GcVec] = try limbs_new()
+    var t: u64 = x
+    while t != 0 {
+        let ok: bool = try gcvec_append_raw(v, t & LIMB_MASK)
+        t = t >> 32
+    }
+    var sg: u64 = 0
+    if neg {
+        sg = 1
+    }
+    return make(r, v, sg)
+}
+
+fn bi_from_i64(r: Gc[Realm], x: i64) -> AllocError!Gc[JsVal] {
+    if x < 0 {
+        return bi_from_u64(r, (0 - x) as u64, true)
+    }
+    return bi_from_u64(r, x as u64, false)
+}
+
+fn bi_is_zero(a: Gc[JsVal]) -> bool {
+    return limbs_len(val.bigint_limbs(a)) == 0
+}
+
+fn bi_is_neg(a: Gc[JsVal]) -> bool {
+    return val.bigint_sign(a) == 1
+}
+
+// --------------------------------------------------- The magnitudes alone
+
+fn mag_cmp(a: Gc[GcVec], b: Gc[GcVec]) -> i64 {
+    let na: u64 = limbs_len(a)
+    let nb: u64 = limbs_len(b)
+    if na != nb {
+        if na > nb {
+            return 1
+        }
+        return 0 - 1
+    }
+    var i: u64 = na
+    while i > 0 {
+        let x: u64 = limb_at(a, i - 1)
+        let y: u64 = limb_at(b, i - 1)
+        if x != y {
+            if x > y {
+                return 1
+            }
+            return 0 - 1
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+fn mag_add(a: Gc[GcVec], b: Gc[GcVec]) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    var n: u64 = limbs_len(a)
+    if limbs_len(b) > n {
+        n = limbs_len(b)
+    }
+    var carry: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        let s: u64 = limb_at(a, i) + limb_at(b, i) + carry
+        let ok: bool = try gcvec_append_raw(out, s & LIMB_MASK)
+        carry = s >> 32
+        i = i + 1
+    }
+    if carry != 0 {
+        let ok: bool = try gcvec_append_raw(out, carry)
+    }
+    return out
+}
+
+// `a` has to be at least as large as `b`.
+fn mag_sub(a: Gc[GcVec], b: Gc[GcVec]) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    let n: u64 = limbs_len(a)
+    var borrow: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        let x: u64 = limb_at(a, i)
+        let y: u64 = limb_at(b, i) + borrow
+        var d: u64 = 0
+        if x >= y {
+            d = x - y
+            borrow = 0
+        } else {
+            d = x + 4294967296 - y
+            borrow = 1
+        }
+        let ok: bool = try gcvec_append_raw(out, d & LIMB_MASK)
+        i = i + 1
+    }
+    limbs_trim(out)
+    return out
+}
+
+fn mag_mul(a: Gc[GcVec], b: Gc[GcVec]) -> AllocError!Gc[GcVec] {
+    let na: u64 = limbs_len(a)
+    let nb: u64 = limbs_len(b)
+    let out: Gc[GcVec] = try limbs_new()
+    if na == 0 || nb == 0 {
+        return out
+    }
+    var i: u64 = 0
+    while i < na + nb {
+        let ok: bool = try gcvec_append_raw(out, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < na {
+        var carry: u64 = 0
+        let x: u64 = limb_at(a, i)
+        var k: u64 = 0
+        while k < nb {
+            let cur: u64 = gcvec_read_raw(out, i + k)
+            let s: u64 = cur + x * limb_at(b, k) + carry
+            let ok: bool = gcvec_set_raw(out, i + k, s & LIMB_MASK)
+            carry = s >> 32
+            k = k + 1
+        }
+        var at: u64 = i + nb
+        while carry != 0 {
+            let cur: u64 = gcvec_read_raw(out, at)
+            let s: u64 = cur + carry
+            let ok: bool = gcvec_set_raw(out, at, s & LIMB_MASK)
+            carry = s >> 32
+            at = at + 1
+        }
+        i = i + 1
+    }
+    limbs_trim(out)
+    return out
+}
+
+// A shift of the MAGNITUDE by whole bits.
+fn mag_shl(a: Gc[GcVec], bits: u64) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    if limbs_len(a) == 0 {
+        return out
+    }
+    let words: u64 = bits / 32
+    let rest: u64 = bits % 32
+    var i: u64 = 0
+    while i < words {
+        let ok: bool = try gcvec_append_raw(out, 0)
+        i = i + 1
+    }
+    var carry: u64 = 0
+    i = 0
+    while i < limbs_len(a) {
+        let x: u64 = limb_at(a, i)
+        var s: u64 = carry
+        if rest == 0 {
+            s = s | x
+            carry = 0
+        } else {
+            s = s | ((x << rest) & LIMB_MASK)
+            carry = x >> (32 - rest)
+        }
+        let ok: bool = try gcvec_append_raw(out, s)
+        i = i + 1
+    }
+    if carry != 0 {
+        let ok: bool = try gcvec_append_raw(out, carry)
+    }
+    limbs_trim(out)
+    return out
+}
+
+fn mag_shr(a: Gc[GcVec], bits: u64) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    let words: u64 = bits / 32
+    let rest: u64 = bits % 32
+    let n: u64 = limbs_len(a)
+    if words >= n {
+        return out
+    }
+    var i: u64 = words
+    while i < n {
+        var x: u64 = limb_at(a, i) >> rest
+        if rest != 0 && i + 1 < n {
+            x = x | ((limb_at(a, i + 1) << (32 - rest)) & LIMB_MASK)
+        }
+        let ok: bool = try gcvec_append_raw(out, x)
+        i = i + 1
+    }
+    limbs_trim(out)
+    return out
+}
+
+fn mag_bit_len(a: Gc[GcVec]) -> u64 {
+    let n: u64 = limbs_len(a)
+    if n == 0 {
+        return 0
+    }
+    var top: u64 = limb_at(a, n - 1)
+    var bits: u64 = 0
+    while top != 0 {
+        bits = bits + 1
+        top = top >> 1
+    }
+    return (n - 1) * 32 + bits
+}
+
+fn mag_bit(a: Gc[GcVec], i: u64) -> u64 {
+    return (limb_at(a, i / 32) >> (i % 32)) & 1
+}
+
+// Binary long division: one bit of quotient per step. `q` and `rem` come
+// back through the two out parameters.
+fn mag_divmod(a: Gc[GcVec], b: Gc[GcVec], q: *mut Gc[GcVec],
+    rem: *mut Gc[GcVec]) -> AllocError!bool {
+    let quo: Gc[GcVec] = try limbs_new()
+    var rest: Gc[GcVec] = try limbs_new()
+    let bits: u64 = mag_bit_len(a)
+    var i: u64 = 0
+    while i < (bits + 31) / 32 {
+        let ok: bool = try gcvec_append_raw(quo, 0)
+        i = i + 1
+    }
+    var k: u64 = bits
+    while k > 0 {
+        k = k - 1
+        // rest = rest * 2 + bit k of a
+        rest = try mag_shl(rest, 1)
+        if mag_bit(a, k) == 1 {
+            if limbs_len(rest) == 0 {
+                let ok: bool = try gcvec_append_raw(rest, 1)
+            } else {
+                let ok: bool = gcvec_set_raw(rest, 0, gcvec_read_raw(rest, 0) | 1)
+            }
+        }
+        if mag_cmp(rest, b) >= 0 {
+            rest = try mag_sub(rest, b)
+            let w: u64 = k / 32
+            let ok: bool = gcvec_set_raw(quo, w, gcvec_read_raw(quo, w) | (1 << (k % 32)))
+        }
+    }
+    limbs_trim(quo)
+    limbs_trim(rest)
+    *q = quo
+    *rem = rest
+    return true
+}
+
+// ------------------------------------------------------- The operations
+
+fn bi_add(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let la: Gc[GcVec] = val.bigint_limbs(a)
+    let lb: Gc[GcVec] = val.bigint_limbs(b)
+    let sa: u64 = val.bigint_sign(a)
+    let sb: u64 = val.bigint_sign(b)
+    if sa == sb {
+        let m: Gc[GcVec] = try mag_add(la, lb)
+        return make(r, m, sa)
+    }
+    let cmp: i64 = mag_cmp(la, lb)
+    if cmp == 0 {
+        return bi_zero(r)
+    }
+    if cmp > 0 {
+        let m: Gc[GcVec] = try mag_sub(la, lb)
+        return make(r, m, sa)
+    }
+    let m: Gc[GcVec] = try mag_sub(lb, la)
+    return make(r, m, sb)
+}
+
+fn bi_neg(r: Gc[Realm], a: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    if bi_is_zero(a) {
+        return bi_zero(r)
+    }
+    var s: u64 = 1
+    if val.bigint_sign(a) == 1 {
+        s = 0
+    }
+    let v: Gc[GcVec] = try limbs_copy(val.bigint_limbs(a))
+    return make(r, v, s)
+}
+
+fn limbs_copy(a: Gc[GcVec]) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    var i: u64 = 0
+    while i < limbs_len(a) {
+        let ok: bool = try gcvec_append_raw(out, limb_at(a, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn bi_sub(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let nb: Gc[JsVal] = try bi_neg(r, b)
+    return bi_add(r, a, nb)
+}
+
+fn bi_mul(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let m: Gc[GcVec] = try mag_mul(val.bigint_limbs(a), val.bigint_limbs(b))
+    var s: u64 = 0
+    if val.bigint_sign(a) != val.bigint_sign(b) {
+        s = 1
+    }
+    return make(r, m, s)
+}
+
+// The quotient truncates towards zero, the remainder keeps the sign of the
+// dividend (21.2.3 -- like the `%` of the language, not a modulo).
+fn bi_div(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    var q: Gc[GcVec] = gc_null[GcVec]()
+    var rest: Gc[GcVec] = gc_null[GcVec]()
+    let ok: bool = try mag_divmod(val.bigint_limbs(a), val.bigint_limbs(b),
+        &q, &rest)
+    var s: u64 = 0
+    if val.bigint_sign(a) != val.bigint_sign(b) {
+        s = 1
+    }
+    return make(r, q, s)
+}
+
+fn bi_rem(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    var q: Gc[GcVec] = gc_null[GcVec]()
+    var rest: Gc[GcVec] = gc_null[GcVec]()
+    let ok: bool = try mag_divmod(val.bigint_limbs(a), val.bigint_limbs(b),
+        &q, &rest)
+    return make(r, rest, val.bigint_sign(a))
+}
+
+fn bi_pow(r: Gc[Realm], a: Gc[JsVal],
+    e: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    // Square and multiply over the bits of the exponent.
+    var result: Gc[JsVal] = try bi_from_u64(r, 1, false)
+    if bi_is_zero(e) {
+        return result
+    }
+    let el: Gc[GcVec] = val.bigint_limbs(e)
+    let bits: u64 = mag_bit_len(el)
+    var base: Gc[JsVal] = a
+    var i: u64 = 0
+    while i < bits {
+        if mag_bit(el, i) == 1 {
+            result = try bi_mul(r, result, base)
+        }
+        i = i + 1
+        if i < bits {
+            base = try bi_mul(r, base, base)
+        }
+    }
+    return result
+}
+
+fn bi_cmp(a: Gc[JsVal], b: Gc[JsVal]) -> i64 {
+    let sa: u64 = val.bigint_sign(a)
+    let sb: u64 = val.bigint_sign(b)
+    if sa != sb {
+        if sa == 1 {
+            return 0 - 1
+        }
+        return 1
+    }
+    let c: i64 = mag_cmp(val.bigint_limbs(a), val.bigint_limbs(b))
+    if sa == 1 {
+        return 0 - c
+    }
+    return c
+}
+
+// ------------------------------------------------------ The bitwise part
+//
+// Over the two's complement of a fixed width: one limb more than the wider
+// operand, so that the sign extension of both is inside the window.
+
+fn twos(a: Gc[JsVal], n: u64) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    let la: Gc[GcVec] = val.bigint_limbs(a)
+    var i: u64 = 0
+    while i < n {
+        let ok: bool = try gcvec_append_raw(out, limb_at(la, i))
+        i = i + 1
+    }
+    if val.bigint_sign(a) == 1 {
+        // ~x + 1
+        i = 0
+        while i < n {
+            let ok: bool = gcvec_set_raw(out, i, (gcvec_read_raw(out, i) ^ LIMB_MASK) & LIMB_MASK)
+            i = i + 1
+        }
+        var carry: u64 = 1
+        i = 0
+        while i < n && carry != 0 {
+            let s: u64 = gcvec_read_raw(out, i) + carry
+            let ok: bool = gcvec_set_raw(out, i, s & LIMB_MASK)
+            carry = s >> 32
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn from_twos(r: Gc[Realm], v: Gc[GcVec], n: u64) -> AllocError!Gc[JsVal] {
+    if n == 0 {
+        return bi_zero(r)
+    }
+    let top: u64 = gcvec_read_raw(v, n - 1)
+    if (top >> 31) & 1 == 0 {
+        return make(r, v, 0)
+    }
+    var i: u64 = 0
+    while i < n {
+        let ok: bool = gcvec_set_raw(v, i, (gcvec_read_raw(v, i) ^ LIMB_MASK) & LIMB_MASK)
+        i = i + 1
+    }
+    var carry: u64 = 1
+    i = 0
+    while i < n && carry != 0 {
+        let s: u64 = gcvec_read_raw(v, i) + carry
+        let ok: bool = gcvec_set_raw(v, i, s & LIMB_MASK)
+        carry = s >> 32
+        i = i + 1
+    }
+    return make(r, v, 1)
+}
+
+fn bit_width(a: Gc[JsVal], b: Gc[JsVal]) -> u64 {
+    var n: u64 = limbs_len(val.bigint_limbs(a))
+    let m: u64 = limbs_len(val.bigint_limbs(b))
+    if m > n {
+        n = m
+    }
+    return n + 1
+}
+
+fn bi_and(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let n: u64 = bit_width(a, b)
+    let x: Gc[GcVec] = try twos(a, n)
+    let y: Gc[GcVec] = try twos(b, n)
+    var i: u64 = 0
+    while i < n {
+        let ok: bool = gcvec_set_raw(x, i, gcvec_read_raw(x, i) & gcvec_read_raw(y, i))
+        i = i + 1
+    }
+    return from_twos(r, x, n)
+}
+
+fn bi_or(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let n: u64 = bit_width(a, b)
+    let x: Gc[GcVec] = try twos(a, n)
+    let y: Gc[GcVec] = try twos(b, n)
+    var i: u64 = 0
+    while i < n {
+        let ok: bool = gcvec_set_raw(x, i, gcvec_read_raw(x, i) | gcvec_read_raw(y, i))
+        i = i + 1
+    }
+    return from_twos(r, x, n)
+}
+
+fn bi_xor(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let n: u64 = bit_width(a, b)
+    let x: Gc[GcVec] = try twos(a, n)
+    let y: Gc[GcVec] = try twos(b, n)
+    var i: u64 = 0
+    while i < n {
+        let ok: bool = gcvec_set_raw(x, i, gcvec_read_raw(x, i) ^ gcvec_read_raw(y, i))
+        i = i + 1
+    }
+    return from_twos(r, x, n)
+}
+
+// `~x` is `-x - 1`.
+fn bi_not(r: Gc[Realm], a: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let one: Gc[JsVal] = try bi_from_u64(r, 1, false)
+    let n: Gc[JsVal] = try bi_neg(r, a)
+    return bi_sub(r, n, one)
+}
+
+fn bi_shl(r: Gc[Realm], a: Gc[JsVal], bits: u64,
+    left: bool) -> AllocError!Gc[JsVal] {
+    if left {
+        let m: Gc[GcVec] = try mag_shl(val.bigint_limbs(a), bits)
+        return make(r, m, val.bigint_sign(a))
+    }
+    // A right shift rounds towards MINUS infinity, so a negative number
+    // whose shifted out bits are not all zero gets one subtracted.
+    let m: Gc[GcVec] = try mag_shr(val.bigint_limbs(a), bits)
+    let res: Gc[JsVal] = try make(r, m, val.bigint_sign(a))
+    if val.bigint_sign(a) == 1 {
+        var lost: bool = false
+        var i: u64 = 0
+        while i < bits {
+            if mag_bit(val.bigint_limbs(a), i) == 1 {
+                lost = true
+            }
+            i = i + 1
+        }
+        if lost {
+            let one: Gc[JsVal] = try bi_from_u64(r, 1, false)
+            return bi_sub(r, res, one)
+        }
+    }
+    return res
+}
+
+fn bi_shr(r: Gc[Realm], a: Gc[JsVal],
+    bits: u64) -> AllocError!Gc[JsVal] {
+    return bi_shl(r, a, bits, false)
+}
+
+// 21.2.2.1 BigInt.asIntN / asUintN.
+fn bi_as_uint_n(r: Gc[Realm], bits: u64,
+    a: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let n: u64 = (bits + 31) / 32
+    let x: Gc[GcVec] = try twos(a, n + 1)
+    let out: Gc[GcVec] = try limbs_new()
+    var i: u64 = 0
+    while i < n {
+        var w: u64 = limb_at(x, i)
+        let hi: u64 = (i + 1) * 32
+        if hi > bits {
+            let keep: u64 = bits - i * 32
+            if keep == 0 {
+                w = 0
+            } else {
+                w = w & ((1 << keep) - 1)
+            }
+        }
+        let ok: bool = try gcvec_append_raw(out, w)
+        i = i + 1
+    }
+    return make(r, out, 0)
+}
+
+fn bi_as_int_n(r: Gc[Realm], bits: u64,
+    a: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    if bits == 0 {
+        return bi_zero(r)
+    }
+    let u: Gc[JsVal] = try bi_as_uint_n(r, bits, a)
+    // Is the top bit set? Then subtract 2^bits.
+    if mag_bit(val.bigint_limbs(u), bits - 1) == 1 {
+        let two: Gc[GcVec] = try limbs_new()
+        let ok: bool = try gcvec_append_raw(two, 1)
+        let sh: Gc[GcVec] = try mag_shl(two, bits)
+        let p: Gc[JsVal] = try make(r, sh, 0)
+        return bi_sub(r, u, p)
+    }
+    return u
+}
+
+// ------------------------------------------------------------ Text <-> value
+
+fn digit_of(c: u32) -> u64 {
+    if c >= 48 as u32 && c <= 57 as u32 {
+        return (c - 48 as u32) as u64
+    }
+    if c >= 97 as u32 && c <= 122 as u32 {
+        return (c - 97 as u32) as u64 + 10
+    }
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return (c - 65 as u32) as u64 + 10
+    }
+    return 99
+}
+
+fn mag_mul_small(a: Gc[GcVec], m: u64) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    var carry: u64 = 0
+    var i: u64 = 0
+    while i < limbs_len(a) {
+        let s: u64 = limb_at(a, i) * m + carry
+        let ok: bool = try gcvec_append_raw(out, s & LIMB_MASK)
+        carry = s >> 32
+        i = i + 1
+    }
+    while carry != 0 {
+        let ok: bool = try gcvec_append_raw(out, carry & LIMB_MASK)
+        carry = carry >> 32
+    }
+    limbs_trim(out)
+    return out
+}
+
+fn mag_add_small(a: Gc[GcVec], x: u64) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_copy(a)
+    var carry: u64 = x
+    var i: u64 = 0
+    while carry != 0 {
+        if i < limbs_len(out) {
+            let s: u64 = gcvec_read_raw(out, i) + carry
+            let ok: bool = gcvec_set_raw(out, i, s & LIMB_MASK)
+            carry = s >> 32
+        } else {
+            let ok: bool = try gcvec_append_raw(out, carry & LIMB_MASK)
+            carry = carry >> 32
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Divide the magnitude by a small number; the remainder comes back.
+fn mag_div_small(a: Gc[GcVec], d: u64, rem: *mut u64) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try limbs_new()
+    var i: u64 = limbs_len(a)
+    while i > 0 {
+        let ok: bool = try gcvec_append_raw(out, 0)
+        i = i - 1
+    }
+    var rest: u64 = 0
+    i = limbs_len(a)
+    while i > 0 {
+        i = i - 1
+        let cur: u64 = (rest << 32) | limb_at(a, i)
+        let ok: bool = gcvec_set_raw(out, i, cur / d)
+        rest = cur % d
+    }
+    *rem = rest
+    limbs_trim(out)
+    return out
+}
+
+// The value of a text: the digits of a literal (with `0x`, `0o`, `0b`) or
+// of `BigInt("...")`. `gc_null` means: not a BigInt.
+fn bi_parse(r: Gc[Realm], s: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let n: u64 = val.str_len(s)
+    var i: u64 = 0
+    // Leading and trailing white space is allowed in the STRING form.
+    while i < n && is_space(val.str_at(s, i)) {
+        i = i + 1
+    }
+    var stop: u64 = n
+    while stop > i && is_space(val.str_at(s, stop - 1)) {
+        stop = stop - 1
+    }
+    if i >= stop {
+        return bi_zero(r)
+    }
+    var neg: bool = false
+    var radix: u64 = 10
+    let c0: u32 = val.str_at(s, i)
+    if c0 == 43 as u32 || c0 == 45 as u32 {
+        neg = c0 == 45 as u32
+        i = i + 1
+    } else if c0 == 48 as u32 && i + 1 < stop {
+        let c1: u32 = val.str_at(s, i + 1)
+        if c1 == 120 as u32 || c1 == 88 as u32 {
+            radix = 16
+            i = i + 2
+        } else if c1 == 111 as u32 || c1 == 79 as u32 {
+            radix = 8
+            i = i + 2
+        } else if c1 == 98 as u32 || c1 == 66 as u32 {
+            radix = 2
+            i = i + 2
+        }
+    }
+    if i >= stop {
+        return gc_null[JsVal]()
+    }
+    var mag: Gc[GcVec] = try limbs_new()
+    while i < stop {
+        let d: u64 = digit_of(val.str_at(s, i))
+        if d >= radix {
+            return gc_null[JsVal]()
+        }
+        mag = try mag_mul_small(mag, radix)
+        mag = try mag_add_small(mag, d)
+        i = i + 1
+    }
+    var sg: u64 = 0
+    if neg {
+        sg = 1
+    }
+    return make(r, mag, sg)
+}
+
+fn is_space(c: u32) -> bool {
+    if c == 32 as u32 || c == 9 as u32 || c == 10 as u32 || c == 13 as u32 {
+        return true
+    }
+    if c == 11 as u32 || c == 12 as u32 || c == 0xA0 as u32 || c == 0xFEFF as u32 {
+        return true
+    }
+    return false
+}
+
+fn dig_char(d: u64) -> u32 {
+    if d < 10 {
+        return (48 + d) as u32
+    }
+    return (87 + d) as u32
+}
+
+fn bi_to_string(r: Gc[Realm], a: Gc[JsVal],
+    radix: u64) -> AllocError!Gc[JsVal] {
+    let out: Gc[JsStr] = try val.str_new(r)
+    if bi_is_zero(a) {
+        let ok: bool = try val.str_push(out, 48 as u32)
+        let z: Gc[JsVal] = out
+        return z
+    }
+    // Collect the digits backwards, then turn them round.
+    var digits: Gc[GcVec] = try limbs_new()
+    var mag: Gc[GcVec] = try limbs_copy(val.bigint_limbs(a))
+    while limbs_len(mag) > 0 {
+        var rest: u64 = 0
+        mag = try mag_div_small(mag, radix, &rest)
+        let ok: bool = try gcvec_append_raw(digits, rest)
+    }
+    if val.bigint_sign(a) == 1 {
+        let ok: bool = try val.str_push(out, 45 as u32)
+    }
+    var i: u64 = limbs_len(digits)
+    while i > 0 {
+        i = i - 1
+        let ok: bool = try val.str_push(out, dig_char(gcvec_read_raw(digits, i)))
+    }
+    let v: Gc[JsVal] = out
+    return v
+}
+
+// The nearest double (7.1.13 ToNumber applied to a BigInt is a TypeError,
+// but `Number(bigint)` and the relational comparison need the value).
+fn bi_to_f64(a: Gc[JsVal]) -> f64 {
+    let l: Gc[GcVec] = val.bigint_limbs(a)
+    var x: f64 = 0.0
+    var i: u64 = limbs_len(l)
+    while i > 0 {
+        i = i - 1
+        x = x * 4294967296.0 + (limb_at(l, i) as f64)
+    }
+    if val.bigint_sign(a) == 1 {
+        return math.math_f64(math.math_bits(x) ^ 0x8000000000000000)
+    }
+    return x
+}
+
+// The other direction; only for a double that IS an integer. The mantissa
+// and the exponent are read out of the BIT PATTERN, so nothing is lost: a
+// double is exactly `mantissa * 2^exponent`.
+fn bi_from_f64(r: Gc[Realm], x: f64) -> AllocError!Gc[JsVal] {
+    let bits: u64 = math.math_bits(x)
+    let neg: bool = (bits >> 63) == 1
+    let biased: u64 = (bits >> 52) & 2047
+    var mant: u64 = bits & 4503599627370495
+    if biased == 0 {
+        // A subnormal is smaller than one -- and an integer, so it is zero.
+        return bi_zero(r)
+    }
+    mant = mant | 4503599627370496
+    let e: i64 = (biased as i64) - 1075
+    let base: Gc[GcVec] = try limbs_new()
+    var t: u64 = mant
+    while t != 0 {
+        let ok: bool = try gcvec_append_raw(base, t & LIMB_MASK)
+        t = t >> 32
+    }
+    var mag: Gc[GcVec] = base
+    if e > 0 {
+        mag = try mag_shl(base, e as u64)
+    } else if e < 0 {
+        mag = try mag_shr(base, (0 - e) as u64)
+    }
+    var sg: u64 = 0
+    if neg {
+        sg = 1
+    }
+    return make(r, mag, sg)
+}
+
+fn trunc_f64(x: f64) -> f64 {
+    if x >= 4503599627370496.0 || x <= 0.0 - 4503599627370496.0 {
+        return x
+    }
+    let i: i64 = x as i64
+    return i as f64
+}
+
+// The comparison of a BigInt with a Number (7.2.14). The answer 2 means
+// "not comparable" -- that is what NaN gives. Everything else is exact: the
+// double is turned INTO a BigInt, so no rounding decides the outcome.
+fn bi_cmp_f64(r: Gc[Realm], a: Gc[JsVal], x: f64) -> AllocError!i64 {
+    if x != x {
+        return 2
+    }
+    let inf: f64 = math.math_f64(0x7FF0000000000000)
+    if x == inf {
+        return 0 - 1
+    }
+    if x == math.math_f64(0xFFF0000000000000) {
+        return 1
+    }
+    let fl: f64 = trunc_f64(x)
+    let whole: Gc[JsVal] = try bi_from_f64(r, fl)
+    let c: i64 = bi_cmp(a, whole)
+    if c != 0 {
+        return c
+    }
+    // Equal up to the whole part -- the fraction decides.
+    if fl != x {
+        if x > 0.0 || (x < 0.0 && fl == 0.0) {
+            return 0 - 1
+        }
+        if x > fl {
+            return 0 - 1
+        }
+        return 1
+    }
+    return 0
+}

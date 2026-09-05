@@ -1,0 +1,645 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/ast.fi -- THE FIRN SYNTAX TREE, WRITTEN IN FIRN.
+//
+// Third part of stage 1. `docs/SELF_HOSTING.md` section 2.4 says how it has
+// to be built: **recursive trees over `Vec` indices instead of pointers.**
+// The reason is not convenience but bookkeeping -- a node that
+// refers to another one by index needs no allocator per node, no
+// free order and no destructor. The whole tree is freed by
+// `tree_free` in one go.
+//
+// LAYOUT: struct of arrays, like the lexer. Every node kind has fixed slots:
+//
+//   expression  e_kind | e_a | e_b | e_c | e_number
+//   statement   s_kind | s_a | s_b | s_c | s_d
+//   type        t_kind | t_a | t_b
+//   block       b_off | b_len  ->  range in `slist`
+//
+// Child lists of variable length (call arguments, array elements,
+// struct fields) sit one after another in `children`; the node only keeps
+// offset and length. That way the whole tree gets by with thirteen `Vec`.
+
+import rt
+import vec
+
+export { Tree, tree_new, tree_free,
+    NOTHING,
+    T_NAME, T_PTR, T_ARR, T_FN,
+    E_INT, E_FLOAT, E_FLOAT32, E_BOOL, E_ID, E_UN, E_BIN, E_FIELD, E_IDX, E_CALL,
+    E_SYSCALL, E_AS, E_SLIT, E_ALIT, E_AWDH, E_LAMBDA, E_TEXT,
+    S_LET, S_VAR, S_ZUW, S_IF, S_WHILE, S_RET, S_FOR, S_BREAK, S_CONT,
+    S_DEFER, S_ERRDEFER, S_EXPR, S_BLOCK, S_ZUWOP, S_STEP,
+    ty_new, ty_b_set, LEN_INFER, expr_new, stmt_new, block_new,
+    child_start, child_add, child_count, expr_count,
+    param_start, field_start, slist_start, slist_add,
+    t_kind, t_a, t_b, e_kind, e_a, e_b, e_c, e_number,
+    s_kind, s_a, s_b, s_c, s_d, b_off, b_len, child_at, slist_at,
+    imp_add, exp_add, const_add, structure_add, fn_add, profile_set,
+    // ROUND 79 (escape.fi) -- source positions and the closing brace.
+    pos_pack, pos_file, pos_line, pos_col,
+    expr_pos, expr_pos_set, stmt_pos, stmt_pos_set,
+    block_end, block_end_set, fn_end, fn_end_set, fn_esc, fn_esc_set,
+    file_add, file_count, file_ptr, file_length,
+    param_pos, param_pos_set,
+    imp_count, imp_path, imp_alias, exp_count, exp_name,
+    const_count, const_name, const_ty, const_value,
+    // ROUND 89 -- global variables (`static` / `static mut`, SPEC 14.1.statics).
+    static_add, static_count, static_name, static_ty, static_value, static_mut,
+    // ROUND 89 -- `#[panic_handler]` (SPEC 13).
+    panic_handler, panic_handler_set,
+    structure_count, structure_name, structure_foff, structure_flen, structure_mc,
+    field_name, field_ty, field_add,
+    fn_count, fn_name, fn_poff, fn_plen, fn_ret, fn_body, fn_nogc, fn_mc,
+    fn_int,
+    fn_extern, fn_link, fn_link_set, fn_export,
+    param_name, param_ty, param_add, prof,
+    ct_add, ct_count, ct_block,
+    asm_add, asm_count, asm_template, asm_out, asm_in_count,
+    asm_in_reg, asm_out_count, asm_out_reg, asm_clob_count, asm_clob }
+
+// "no value" -- a real node number will never be this.
+const NOTHING: u32 = 4294967295
+
+// ROUND 79 (gap 10 of docs/ROUND66.md): the array length written as `_`. The
+// parser replaces it with the real one as soon as it has seen the
+// initializer, so it can never reach the type resolution. Same value as
+// `ast::LEN_INFER` in `compiler/src/ast.rs`.
+const LEN_INFER: u64 = 18446744073709551615
+
+// type kinds
+const T_NAME: u32 = 0
+const T_PTR: u32 = 1
+const T_ARR: u32 = 2
+// ROUND 58 (fnval.rs): `fn(T1, T2) -> R` -- a function as a VALUE.
+//   t_a = the result type node, NOTHING for a function without a result
+//   t_b = (offset << 32) | count over `children` -- the parameter types
+const T_FN: u32 = 3
+
+// expression kinds
+const E_INT: u32 = 0
+const E_FLOAT: u32 = 1
+const E_BOOL: u32 = 2
+const E_ID: u32 = 3
+const E_UN: u32 = 4
+const E_BIN: u32 = 5
+const E_FIELD: u32 = 6
+const E_IDX: u32 = 7
+const E_CALL: u32 = 8
+const E_SYSCALL: u32 = 9
+const E_AS: u32 = 10
+const E_SLIT: u32 = 11
+const E_ALIT: u32 = 12
+const E_AWDH: u32 = 13
+// ROUND 58 (fnval.rs): a closure literal `fn(a: i32) -> i32 { ... }` and
+// its capturing form `gc fn(...) { ... }`.
+//   e_a      = the name of the generated function (`__closure#N`)
+//   e_b      = start of the parameters in pa_*, e_c = their number
+//   e_number = ((result type node + 1) << 1) | 1 for `gc fn`
+// The body sits in the generated function, which the parser adds to the
+// tree straight away -- that way the lowering walks it like any other.
+const E_LAMBDA: u32 = 14
+// ROUND 70 (strtype.rs): a TEXT LITERAL. `a` = the array literal of its
+// octets, `b` = 1 for `u"..."` (elements of type u16). The node lets the
+// CONTEXT decide: with an array type wanted it is that array literal,
+// otherwise it is a `str`.
+const E_TEXT: u32 = 15
+// ROUND 71 (ast.rs::ExprKind::FloatF32): a float literal WITH the suffix
+// `f`, as the bit pattern of an IEEE-754 binary32. It is always an `f32`,
+// no matter what the context says; without a suffix `E_FLOAT` holds and
+// the context decides.
+const E_FLOAT32: u32 = 16
+
+// statement kinds
+const S_LET: u32 = 0
+const S_VAR: u32 = 1
+const S_ZUW: u32 = 2
+const S_IF: u32 = 3
+const S_WHILE: u32 = 4
+const S_RET: u32 = 5
+const S_FOR: u32 = 6
+const S_BREAK: u32 = 7
+const S_CONT: u32 = 8
+const S_DEFER: u32 = 9
+const S_ERRDEFER: u32 = 10
+const S_EXPR: u32 = 11
+const S_BLOCK: u32 = 12
+// ROUND 70 (ast.rs): the compound assignment `x op= e` -- `a` target,
+// `b` value, `c` the operator in the numbering of `E_BIN`. It is its OWN
+// statement and not a rewrite into `x = x op e`, because the left side may
+// be evaluated only ONCE.
+const S_ZUWOP: u32 = 13
+// ROUND 70: `x++` / `x--` -- `a` target, `b` = 1 for `++`. A STATEMENT,
+// never an expression.
+const S_STEP: u32 = 14
+
+struct Tree {
+    t_kind: Vec[u32], t_a: Vec[u32], t_b: Vec[u64],
+    e_kind: Vec[u32], e_a: Vec[u32], e_b: Vec[u32], e_c: Vec[u32], e_number: Vec[u64],
+    children: Vec[u32],
+    s_kind: Vec[u32], s_a: Vec[u32], s_b: Vec[u32], s_c: Vec[u32], s_d: Vec[u32],
+    b_off: Vec[u32], b_len: Vec[u32], slist: Vec[u32],
+    // ROUND 79 -- SOURCE POSITIONS. Until this round the tree carried none:
+    // the parser reported its own errors straight out of the token stream
+    // and nothing later ever had to name a place. The escape analysis
+    // (`escape.fi`, the twin of `compiler/src/escape.rs`) is the first pass
+    // AFTER the parser that has to produce a message with a line and a
+    // column -- three of them, in fact: where the address is taken, where
+    // the local is declared and where its frame dies.
+    //
+    // One packed `u64` per node (see `pos_pack`), 0 = unknown. Only the
+    // nodes that a message can point at get one: every operand
+    // (`un_expr` in the parser) and every statement. Binary nodes and
+    // nodes the monomorphization builds from a template inherit what
+    // their source node had.
+    //
+    // ROUND 72/83 -- the checked arithmetic of round 72 is the SECOND
+    // reader of the same vector, and the harder one: its panic message is
+    // printed at RUN time and has to name the place `firnc0` names, down
+    // to the column, because `tools/checked/run.sh` compares the text
+    // octet for octet. The rule both rounds arrived at is the same one
+    // (parser.rs::join): a compound expression takes the position of its
+    // LEFT operand, and `( e )` is transparent, because the parenthesised
+    // form returns the inner node -- `(b as u64) - (a as u64)` reports the
+    // column of `b`, not of the parenthesis.
+    e_pos: Vec[u64], s_pos: Vec[u64],
+    // The closing brace of a block -- the place where a frame dies.
+    b_end: Vec[u64],
+    // declarations
+    i_path: Vec[u32], i_alias: Vec[u32],
+    x_name: Vec[u32],
+    c_name: Vec[u32], c_ty: Vec[u32], c_value: Vec[u32],
+    // ROUND 89: `static NAME: T = value`. Same three vectors as a `const`
+    // plus the one bit that makes the difference -- a `const` is a number
+    // folded into every use site, a `static` is a PLACE that `g_mut` says
+    // may be written to.
+    g_name: Vec[u32], g_ty: Vec[u32], g_value: Vec[u32], g_mut: Vec[u32],
+    st_name: Vec[u32], st_off: Vec[u32], st_len: Vec[u32], st_mc: Vec[u32],
+    fd_name: Vec[u32], fd_ty: Vec[u32],
+    f_name: Vec[u32], f_poff: Vec[u32], f_plen: Vec[u32], f_ret: Vec[u32], f_body: Vec[u32],
+    f_nogc: Vec[u32], f_mc: Vec[u32],
+    // ROUND 52: 1 = the function has `#[interrupt]` (SPEC 2, core.rs).
+    f_int: Vec[u32],
+    // ROUND 75 (SPEC 14.5): 1 = 'extern fn' (no body). f_link is the
+    // interned link name from `#[link_name(...)]`; f_link_set says
+    // whether that attribute was written AT ALL -- kept as its OWN flag
+    // rather than reading "f_link == 0" as absent, because 0 is a
+    // perfectly ordinary intern number (whichever identifier happens to
+    // be interned FIRST in the whole program gets it).
+    f_extern: Vec[u32], f_link: Vec[u32], f_link_set: Vec[u32],
+    // ROUND 75 (SPEC 14.5): 1 = `#[export_c]` (bare-name C export).
+    f_export: Vec[u32],
+    // ROUND 79: 1 = `#[allow_escape]` -- the address of a local may leave
+    // this frame (escape.fi, attrs.rs). The closing brace of the body, so
+    // that the message can say where the frame dies.
+    f_esc: Vec[u32], f_end: Vec[u64],
+    // ROUND 79: the file names of this translation. The tree spans several
+    // files since the module system, and a position without a file name is
+    // half a position. `firnc1.fi` registers every file here before it
+    // parses it; the number goes into the packed position of every node of
+    // that file.
+    fitext: rt.Buf, fi_off: Vec[u32], fi_len: Vec[u32],
+    pa_name: Vec[u32], pa_ty: Vec[u32],
+    // ROUND 79: where the parameter is written. A parameter slot lies in
+    // the frame like any local, so `&p` can escape just as `&x` can -- and
+    // the message has to be able to say where `p` is declared.
+    pa_pos: Vec[u64],
+    prof: u32,
+    // ROUND 89: the interned name of the `#[panic_handler]` (NOTHING = none).
+    ph: u32,
+    // top level `comptime { ... }` blocks: only the block numbers.
+    // They belong to no function; the interpreter in time.fi (round 35)
+    // runs them BEFORE the type check.
+    ct_block: Vec[u32],
+    // ROUND 52 (compiler/src/core.rs): the `asm` blocks. The tree holds only
+    // a call `asm$<number>` with the INPUT EXPRESSIONS as arguments --
+    // just like `__match#N` (pattern.fi). That way monomorphization,
+    // the `#[no_gc]` check and the canonical printing walk over it
+    // unchanged. Template, registers and clobbers live here:
+    //   as_vorl  template (interned)
+    //   as_out   output register (interned) or NOTHING
+    //   as_roff/as_rlen   range in `as_regs` (input registers, in order)
+    //   as_coff/as_clen   range in `as_clobs`
+    //   as_ooff/as_olen   range in `as_oregs` (ROUND 68: the MEMORY
+    //                     outputs `out("rdx") p`, in order; their ADDRESS
+    //                     expressions stand in the argument list of the
+    //                     call, behind the inputs)
+    as_vorl: Vec[u32], as_out: Vec[u32],
+    as_roff: Vec[u32], as_rlen: Vec[u32],
+    as_coff: Vec[u32], as_clen: Vec[u32],
+    as_ooff: Vec[u32], as_olen: Vec[u32],
+    as_regs: Vec[u32], as_clobs: Vec[u32], as_oregs: Vec[u32],
+}
+
+fn tree_new() -> Tree {
+    return Tree {
+        t_kind: vec_new[u32](), t_a: vec_new[u32](), t_b: vec_new[u64](),
+        e_kind: vec_new[u32](), e_a: vec_new[u32](), e_b: vec_new[u32](),
+        e_c: vec_new[u32](), e_number: vec_new[u64](),
+        children: vec_new[u32](),
+        s_kind: vec_new[u32](), s_a: vec_new[u32](), s_b: vec_new[u32](),
+        s_c: vec_new[u32](), s_d: vec_new[u32](),
+        b_off: vec_new[u32](), b_len: vec_new[u32](), slist: vec_new[u32](),
+        e_pos: vec_new[u64](), s_pos: vec_new[u64](), b_end: vec_new[u64](),
+        i_path: vec_new[u32](), i_alias: vec_new[u32](),
+        x_name: vec_new[u32](),
+        c_name: vec_new[u32](), c_ty: vec_new[u32](), c_value: vec_new[u32](),
+        g_name: vec_new[u32](), g_ty: vec_new[u32](), g_value: vec_new[u32](),
+        g_mut: vec_new[u32](),
+        st_name: vec_new[u32](), st_off: vec_new[u32](), st_len: vec_new[u32](),
+        st_mc: vec_new[u32](),
+        fd_name: vec_new[u32](), fd_ty: vec_new[u32](),
+        f_name: vec_new[u32](), f_poff: vec_new[u32](), f_plen: vec_new[u32](),
+        f_ret: vec_new[u32](), f_body: vec_new[u32](), f_nogc: vec_new[u32](),
+        f_mc: vec_new[u32](), f_int: vec_new[u32](),
+        f_extern: vec_new[u32](), f_link: vec_new[u32](), f_link_set: vec_new[u32](),
+        f_export: vec_new[u32](),
+        f_esc: vec_new[u32](), f_end: vec_new[u64](),
+        fitext: rt.buf_new(), fi_off: vec_new[u32](), fi_len: vec_new[u32](),
+        pa_name: vec_new[u32](), pa_ty: vec_new[u32](),
+        pa_pos: vec_new[u64](),
+        prof: NOTHING,
+        ph: NOTHING,
+        ct_block: vec_new[u32](),
+        as_vorl: vec_new[u32](), as_out: vec_new[u32](),
+        as_roff: vec_new[u32](), as_rlen: vec_new[u32](),
+        as_coff: vec_new[u32](), as_clen: vec_new[u32](),
+        as_ooff: vec_new[u32](), as_olen: vec_new[u32](),
+        as_regs: vec_new[u32](), as_clobs: vec_new[u32](),
+        as_oregs: vec_new[u32](),
+    }
+}
+
+// Register an `asm` block; returns its number (the one that turns up
+// in the `asm$N` name). `regs` and `clobs` are taken over VERBATIM.
+fn asm_add(b: *mut Tree, template: u32, out: u32, regs: *mut Vec[u32],
+    oregs: *mut Vec[u32], clobs: *mut Vec[u32]) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).as_vorl) as u32
+    vec_push[u32](&(*b).as_vorl, template)
+    vec_push[u32](&(*b).as_out, out)
+    vec_push[u32](&(*b).as_roff, vec_len[u32](&(*b).as_regs) as u32)
+    vec_push[u32](&(*b).as_rlen, vec_len[u32](regs) as u32)
+    var k: usize = 0
+    while k < vec_len[u32](regs) {
+        vec_push[u32](&(*b).as_regs, vec_at[u32](regs, k))
+        k = k + 1
+    }
+    vec_push[u32](&(*b).as_ooff, vec_len[u32](&(*b).as_oregs) as u32)
+    vec_push[u32](&(*b).as_olen, vec_len[u32](oregs) as u32)
+    var o: usize = 0
+    while o < vec_len[u32](oregs) {
+        vec_push[u32](&(*b).as_oregs, vec_at[u32](oregs, o))
+        o = o + 1
+    }
+    vec_push[u32](&(*b).as_coff, vec_len[u32](&(*b).as_clobs) as u32)
+    vec_push[u32](&(*b).as_clen, vec_len[u32](clobs) as u32)
+    var j: usize = 0
+    while j < vec_len[u32](clobs) {
+        vec_push[u32](&(*b).as_clobs, vec_at[u32](clobs, j))
+        j = j + 1
+    }
+    return i
+}
+
+fn asm_count(b: *mut Tree) -> u32 { return vec_len[u32](&(*b).as_vorl) as u32 }
+fn asm_template(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).as_vorl, i as usize) }
+fn asm_out(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).as_out, i as usize) }
+fn asm_in_count(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).as_rlen, i as usize) }
+fn asm_in_reg(b: *mut Tree, i: u32, k: u32) -> u32 {
+    return vec_at[u32](&(*b).as_regs, (vec_at[u32](&(*b).as_roff, i as usize) + k) as usize)
+}
+fn asm_out_count(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).as_olen, i as usize) }
+fn asm_out_reg(b: *mut Tree, i: u32, k: u32) -> u32 {
+    return vec_at[u32](&(*b).as_oregs, (vec_at[u32](&(*b).as_ooff, i as usize) + k) as usize)
+}
+fn asm_clob_count(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).as_clen, i as usize) }
+fn asm_clob(b: *mut Tree, i: u32, k: u32) -> u32 {
+    return vec_at[u32](&(*b).as_clobs, (vec_at[u32](&(*b).as_coff, i as usize) + k) as usize)
+}
+
+fn tree_free(b: *mut Tree) {
+    vec_free[u32](&(*b).t_kind)
+    vec_free[u32](&(*b).t_a)
+    vec_free[u64](&(*b).t_b)
+    vec_free[u32](&(*b).e_kind)
+    vec_free[u32](&(*b).e_a)
+    vec_free[u32](&(*b).e_b)
+    vec_free[u32](&(*b).e_c)
+    vec_free[u64](&(*b).e_number)
+    vec_free[u32](&(*b).children)
+    vec_free[u32](&(*b).s_kind)
+    vec_free[u32](&(*b).s_a)
+    vec_free[u32](&(*b).s_b)
+    vec_free[u32](&(*b).s_c)
+    vec_free[u32](&(*b).s_d)
+    vec_free[u32](&(*b).b_off)
+    vec_free[u32](&(*b).b_len)
+    vec_free[u32](&(*b).slist)
+    vec_free[u64](&(*b).e_pos)
+    vec_free[u64](&(*b).s_pos)
+    vec_free[u64](&(*b).b_end)
+    vec_free[u32](&(*b).i_path)
+    vec_free[u32](&(*b).i_alias)
+    vec_free[u32](&(*b).x_name)
+    vec_free[u32](&(*b).g_name)
+    vec_free[u32](&(*b).g_ty)
+    vec_free[u32](&(*b).g_value)
+    vec_free[u32](&(*b).g_mut)
+    vec_free[u32](&(*b).c_name)
+    vec_free[u32](&(*b).c_ty)
+    vec_free[u32](&(*b).c_value)
+    vec_free[u32](&(*b).st_name)
+    vec_free[u32](&(*b).st_off)
+    vec_free[u32](&(*b).st_len)
+    vec_free[u32](&(*b).st_mc)
+    vec_free[u32](&(*b).fd_name)
+    vec_free[u32](&(*b).fd_ty)
+    vec_free[u32](&(*b).f_name)
+    vec_free[u32](&(*b).f_poff)
+    vec_free[u32](&(*b).f_plen)
+    vec_free[u32](&(*b).f_ret)
+    vec_free[u32](&(*b).f_body)
+    vec_free[u32](&(*b).f_nogc)
+    vec_free[u32](&(*b).f_mc)
+    vec_free[u32](&(*b).f_int)
+    vec_free[u32](&(*b).f_extern)
+    vec_free[u32](&(*b).f_link)
+    vec_free[u32](&(*b).f_link_set)
+    vec_free[u32](&(*b).f_export)
+    vec_free[u32](&(*b).f_esc)
+    vec_free[u64](&(*b).f_end)
+    rt.buf_free(&(*b).fitext)
+    vec_free[u32](&(*b).fi_off)
+    vec_free[u32](&(*b).fi_len)
+    vec_free[u32](&(*b).pa_name)
+    vec_free[u32](&(*b).pa_ty)
+    vec_free[u64](&(*b).pa_pos)
+    vec_free[u32](&(*b).ct_block)
+    vec_free[u32](&(*b).as_vorl)
+    vec_free[u32](&(*b).as_out)
+    vec_free[u32](&(*b).as_roff)
+    vec_free[u32](&(*b).as_rlen)
+    vec_free[u32](&(*b).as_coff)
+    vec_free[u32](&(*b).as_clen)
+    vec_free[u32](&(*b).as_ooff)
+    vec_free[u32](&(*b).as_olen)
+    vec_free[u32](&(*b).as_regs)
+    vec_free[u32](&(*b).as_clobs)
+    vec_free[u32](&(*b).as_oregs)
+}
+
+// --------------------------------------------------------------- creating
+
+fn ty_new(b: *mut Tree, kind: u32, a: u32, z: u64) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).t_kind) as u32
+    vec_push[u32](&(*b).t_kind, kind)
+    vec_push[u32](&(*b).t_a, a)
+    vec_push[u64](&(*b).t_b, z)
+    return i
+}
+
+fn expr_new(b: *mut Tree, kind: u32, a: u32, c: u32, d: u32, z: u64) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).e_kind) as u32
+    vec_push[u32](&(*b).e_kind, kind)
+    vec_push[u32](&(*b).e_a, a)
+    vec_push[u32](&(*b).e_b, c)
+    vec_push[u32](&(*b).e_c, d)
+    vec_push[u64](&(*b).e_number, z)
+    vec_push[u64](&(*b).e_pos, 0)
+    return i
+}
+
+fn stmt_new(b: *mut Tree, kind: u32, a: u32, c: u32, d: u32, e: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).s_kind) as u32
+    vec_push[u64](&(*b).s_pos, 0)
+    vec_push[u32](&(*b).s_kind, kind)
+    vec_push[u32](&(*b).s_a, a)
+    vec_push[u32](&(*b).s_b, c)
+    vec_push[u32](&(*b).s_c, d)
+    vec_push[u32](&(*b).s_d, e)
+    return i
+}
+
+// A block built from a range that already sits in `slist`.
+fn block_new(b: *mut Tree, off: u32, len: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).b_off) as u32
+    vec_push[u64](&(*b).b_end, 0)
+    vec_push[u32](&(*b).b_off, off)
+    vec_push[u32](&(*b).b_len, len)
+    return i
+}
+
+fn child_start(b: *mut Tree) -> u32 { return vec_len[u32](&(*b).children) as u32 }
+fn child_add(b: *mut Tree, v: u32) { vec_push[u32](&(*b).children, v) }
+fn child_count(b: *mut Tree) -> u32 { return vec_len[u32](&(*b).children) as u32 }
+fn expr_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).e_kind) }
+fn child_at(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).children, i as usize) }
+
+// Start of the next contiguous list. Needed by the
+// monomorphization, which rebuilds whole subtrees: child, parameter,
+// field and statement lists have to sit WITHOUT GAPS, so they are first
+// collected and then stored in one go (the same lesson as in the parser).
+fn param_start(b: *mut Tree) -> u32 { return vec_len[u32](&(*b).pa_name) as u32 }
+fn field_start(b: *mut Tree) -> u32 { return vec_len[u32](&(*b).fd_name) as u32 }
+fn slist_start(b: *mut Tree) -> u32 { return vec_len[u32](&(*b).slist) as u32 }
+fn slist_add(b: *mut Tree, v: u32) { vec_push[u32](&(*b).slist, v) }
+fn slist_at(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).slist, i as usize) }
+
+// ---------------------------------------------------------------- reading
+
+// ROUND 79: patch the length of an array type node afterwards -- `[T; _]`
+// is only known once the initializer has been read (`let_stmt`).
+fn ty_b_set(b: *mut Tree, i: u32, v: u64) { vec_set[u64](&(*b).t_b, i as usize, v) }
+
+fn t_kind(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).t_kind, i as usize) }
+fn t_a(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).t_a, i as usize) }
+fn t_b(b: *mut Tree, i: u32) -> u64 { return vec_at[u64](&(*b).t_b, i as usize) }
+fn e_kind(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).e_kind, i as usize) }
+fn e_a(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).e_a, i as usize) }
+fn e_b(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).e_b, i as usize) }
+fn e_c(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).e_c, i as usize) }
+fn e_number(b: *mut Tree, i: u32) -> u64 { return vec_at[u64](&(*b).e_number, i as usize) }
+fn s_kind(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).s_kind, i as usize) }
+fn s_a(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).s_a, i as usize) }
+fn s_b(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).s_b, i as usize) }
+fn s_c(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).s_c, i as usize) }
+fn s_d(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).s_d, i as usize) }
+fn b_off(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).b_off, i as usize) }
+fn b_len(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).b_len, i as usize) }
+
+// ------------------------------------------------------------ declarations
+
+fn profile_set(b: *mut Tree, n: u32) { (*b).prof = n }
+fn prof(b: *mut Tree) -> u32 { return (*b).prof }
+
+fn imp_add(b: *mut Tree, path: u32, alias: u32) {
+    vec_push[u32](&(*b).i_path, path)
+    vec_push[u32](&(*b).i_alias, alias)
+}
+fn imp_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).i_path) }
+fn imp_path(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).i_path, i) }
+fn imp_alias(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).i_alias, i) }
+
+fn exp_add(b: *mut Tree, n: u32) { vec_push[u32](&(*b).x_name, n) }
+fn exp_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).x_name) }
+fn exp_name(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).x_name, i) }
+
+fn const_add(b: *mut Tree, n: u32, t: u32, w: u32) {
+    vec_push[u32](&(*b).c_name, n)
+    vec_push[u32](&(*b).c_ty, t)
+    vec_push[u32](&(*b).c_value, w)
+}
+fn const_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).c_name) }
+fn const_name(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).c_name, i) }
+fn const_ty(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).c_ty, i) }
+fn const_value(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).c_value, i) }
+
+// ROUND 89 -- one global variable (SPEC 14.1.statics).
+fn static_add(b: *mut Tree, n: u32, t: u32, w: u32, m: bool) {
+    vec_push[u32](&(*b).g_name, n)
+    vec_push[u32](&(*b).g_ty, t)
+    vec_push[u32](&(*b).g_value, w)
+    var f: u32 = 0
+    if m { f = 1 }
+    vec_push[u32](&(*b).g_mut, f)
+}
+fn static_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).g_name) }
+fn static_name(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).g_name, i) }
+fn static_ty(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).g_ty, i) }
+fn static_value(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).g_value, i) }
+fn static_mut(b: *mut Tree, i: usize) -> bool { return vec_at[u32](&(*b).g_mut, i) == 1 }
+
+// ROUND 89 -- the interned name of the `#[panic_handler]`, or NOTHING.
+// A program has exactly one ending, so one slot is enough.
+fn panic_handler(b: *mut Tree) -> u32 { return (*b).ph }
+fn panic_handler_set(b: *mut Tree, n: u32) { (*b).ph = n }
+
+fn field_add(b: *mut Tree, n: u32, t: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).fd_name) as u32
+    vec_push[u32](&(*b).fd_name, n)
+    vec_push[u32](&(*b).fd_ty, t)
+    return i
+}
+fn field_name(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).fd_name, i as usize) }
+fn field_ty(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).fd_ty, i as usize) }
+
+fn structure_add(b: *mut Tree, n: u32, off: u32, len: u32, mc: u32) {
+    vec_push[u32](&(*b).st_name, n)
+    vec_push[u32](&(*b).st_off, off)
+    vec_push[u32](&(*b).st_len, len)
+    vec_push[u32](&(*b).st_mc, mc)
+}
+fn structure_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).st_name) }
+fn structure_name(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).st_name, i) }
+fn structure_foff(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).st_off, i) }
+fn structure_flen(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).st_len, i) }
+// 1 = the type has `#[must_consume]` (round 36, SPEC 3.3/5.1).
+fn structure_mc(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).st_mc, i) }
+
+fn param_add(b: *mut Tree, n: u32, t: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).pa_name) as u32
+    vec_push[u64](&(*b).pa_pos, 0)
+    vec_push[u32](&(*b).pa_name, n)
+    vec_push[u32](&(*b).pa_ty, t)
+    return i
+}
+fn param_name(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).pa_name, i as usize) }
+fn param_ty(b: *mut Tree, i: u32) -> u32 { return vec_at[u32](&(*b).pa_ty, i as usize) }
+// ROUND 79: where the parameter stands (escape.fi).
+fn param_pos(b: *mut Tree, i: u32) -> u64 { return vec_at[u64](&(*b).pa_pos, i as usize) }
+fn param_pos_set(b: *mut Tree, i: u32, p: u64) { vec_set[u64](&(*b).pa_pos, i as usize, p) }
+
+fn fn_add(b: *mut Tree, n: u32, poff: u32, plen: u32, ret: u32, body: u32,
+    nogc: u32, mc: u32, intr: u32, is_extern: u32, link: u32, link_set: u32,
+    is_export: u32) {
+    vec_push[u32](&(*b).f_name, n)
+    vec_push[u32](&(*b).f_poff, poff)
+    vec_push[u32](&(*b).f_plen, plen)
+    vec_push[u32](&(*b).f_ret, ret)
+    vec_push[u32](&(*b).f_body, body)
+    vec_push[u32](&(*b).f_nogc, nogc)
+    vec_push[u32](&(*b).f_mc, mc)
+    vec_push[u32](&(*b).f_int, intr)
+    vec_push[u32](&(*b).f_extern, is_extern)
+    vec_push[u32](&(*b).f_link, link)
+    vec_push[u32](&(*b).f_link_set, link_set)
+    vec_push[u32](&(*b).f_export, is_export)
+    vec_push[u32](&(*b).f_esc, 0)
+    vec_push[u64](&(*b).f_end, 0)
+}
+
+// --------------------------------------------------- ROUND 79: positions
+//
+// One `u64` per node instead of three numbers: the tree is a struct of
+// arrays and every extra `Vec` costs a growth step per node. The layout is
+//
+//     file (16 bits) | line (24 bits) | column (24 bits)
+//
+// and it holds for every file a human writes: sixteen million lines and
+// columns, sixty-five thousand files. 0 means "no position" -- a real one
+// always has a line >= 1 and can therefore never be 0.
+fn pos_pack(file: u32, line: u32, col: u32) -> u64 {
+    return ((file as u64) << 48) | ((line as u64) << 24) | (col as u64)
+}
+fn pos_file(p: u64) -> u32 { return (p >> 48) as u32 }
+fn pos_line(p: u64) -> u32 { return ((p >> 24) & 16777215) as u32 }
+fn pos_col(p: u64) -> u32 { return (p & 16777215) as u32 }
+
+fn expr_pos(b: *mut Tree, i: u32) -> u64 { return vec_at[u64](&(*b).e_pos, i as usize) }
+fn expr_pos_set(b: *mut Tree, i: u32, p: u64) {
+    vec_set[u64](&(*b).e_pos, i as usize, p)
+}
+fn stmt_pos(b: *mut Tree, i: u32) -> u64 { return vec_at[u64](&(*b).s_pos, i as usize) }
+fn stmt_pos_set(b: *mut Tree, i: u32, p: u64) {
+    vec_set[u64](&(*b).s_pos, i as usize, p)
+}
+fn block_end(b: *mut Tree, i: u32) -> u64 { return vec_at[u64](&(*b).b_end, i as usize) }
+fn block_end_set(b: *mut Tree, i: u32, p: u64) {
+    vec_set[u64](&(*b).b_end, i as usize, p)
+}
+fn fn_end(b: *mut Tree, i: usize) -> u64 { return vec_at[u64](&(*b).f_end, i) }
+fn fn_end_set(b: *mut Tree, i: usize, p: u64) { vec_set[u64](&(*b).f_end, i, p) }
+// ROUND 79: 1 = the function has `#[allow_escape]` (attrs.rs).
+fn fn_esc(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_esc, i) }
+fn fn_esc_set(b: *mut Tree, i: usize, v: u32) { vec_set[u32](&(*b).f_esc, i, v) }
+
+// The file name table. Returns the number of the newly registered file.
+fn file_add(b: *mut Tree, p: u64, n: usize) -> u32 {
+    let i: u32 = vec_len[u32](&(*b).fi_off) as u32
+    vec_push[u32](&(*b).fi_off, rt.buf_len(&(*b).fitext) as u32)
+    vec_push[u32](&(*b).fi_len, n as u32)
+    rt.buf_push_bytes(&(*b).fitext, p, n)
+    return i
+}
+fn file_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).fi_off) }
+fn file_ptr(b: *mut Tree, i: u32) -> u64 {
+    return rt.buf_ptr(&(*b).fitext) + vec_at[u32](&(*b).fi_off, i as usize) as u64
+}
+fn file_length(b: *mut Tree, i: u32) -> usize {
+    return vec_at[u32](&(*b).fi_len, i as usize) as usize
+}
+fn fn_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).f_name) }
+fn fn_name(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_name, i) }
+fn fn_poff(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_poff, i) }
+fn fn_plen(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_plen, i) }
+fn fn_ret(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_ret, i) }
+fn fn_body(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_body, i) }
+// 1 = the function has `#[no_gc]` (round 34, SPEC 3.5.4).
+fn fn_nogc(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_nogc, i) }
+// 1 = the function has `#[must_consume]` (round 36, SPEC 3.3/5.1).
+fn fn_mc(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_mc, i) }
+// 1 = the function has `#[interrupt]` (round 52, SPEC 2).
+fn fn_int(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_int, i) }
+// ROUND 75 (SPEC 14.5): 1 = 'extern fn'.
+fn fn_extern(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_extern, i) }
+// The interned link name from #[link_name(...)], 0 = none (use the bare name).
+fn fn_link(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_link, i) }
+// Was `#[link_name(...)]` written at all? (see the field comment above)
+fn fn_link_set(b: *mut Tree, i: usize) -> bool { return vec_at[u32](&(*b).f_link_set, i) != 0 }
+// ROUND 75 (SPEC 14.5): 1 = `#[export_c]`.
+fn fn_export(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).f_export, i) }
+
+// -------------------------------------------------------- `comptime` blocks
+
+fn ct_add(b: *mut Tree, block: u32) { vec_push[u32](&(*b).ct_block, block) }
+fn ct_count(b: *mut Tree) -> usize { return vec_len[u32](&(*b).ct_block) }
+fn ct_block(b: *mut Tree, i: usize) -> u32 { return vec_at[u32](&(*b).ct_block, i) }

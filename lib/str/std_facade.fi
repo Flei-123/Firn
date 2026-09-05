@@ -1,0 +1,209 @@
+// lib/str/std_facade.fi -- the text work of the std facade (round 42).
+//
+// ONLY for `lib/std/str.fi`: this file is included exclusively by
+// `tools/strlib/src/std_str.fi`, not by the generated tests 300-308.
+// The include library lib/str itself (alloc/bytes/str16/utf8/atom) thus
+// stays unchanged -- whoever uses it without std gets not one byte more
+// code than before.
+//
+// WHAT IS HERE: everything C# keeps under `string` and `char`, as far as it
+// works without changing the language -- comparing, searching, trimming,
+// splitting, joining, replacing, ASCII upper/lower case, padding and a
+// UTF-8 SAFE iteration.
+//
+// TWO TYPES, ONE RULE:
+//   * `Span` (pointer + length) is the READING view. It owns nothing,
+//     allocates nothing and is passed around by value -- like
+//     `ReadOnlySpan<byte>`. Every question about text takes a `Span`.
+//   * `Bytes` (from lib/str/bytes.fi) is the OWNING buffer. Every
+//     function that PRODUCES text writes into a `*mut Bytes`.
+// So every signature tells you who holds memory, and there is no hidden
+// allocation.
+//
+// THE HONEST LIMITS, collected:
+//   * Upper/lower case is ASCII (A-Z / a-z). Unicode case mapping needs the
+//     UCD tables; those live in the comptime branch (tests/602_comptime_ucd.fi)
+//     and do not belong in the core facade.
+//   * The producing functions (`replace`, `after_big`, ...) require that
+//     `out` does NOT lie inside the memory of the source. They clear `out`
+//     first; an overlap would mean reading from a buffer that has just been
+//     overwritten. Whoever wants to work in place takes the `_here` forms.
+//   * `npos()` (all bits set) means "not found" -- Firn has no option
+//     values, and a sentinel is more honest than a 0 that could equally mean
+//     "hit at position 0".
+//   * Numbers do NOT live here but in `std.num` (text <-> integer,
+//     text <-> f64). Two parsers would be two truths.
+
+// "not found" / "no index". A function, because `const` in stage 0 is
+// evaluated as an integer and 2^64-1 is not representable there.
+
+// ROUND 73: the reading half (Span, character classes, comparing,
+// searching, trimming, splitting, UTF-8 reading) moved to
+// `lib/str/core_facade.fi`, because it needs neither an allocator nor a
+// system call and is therefore usable in the kernel profile. It is
+// included here, so that `std.str` keeps offering everything it offered
+// before -- not one caller has to change.
+//#include lib/str/core_facade.fi
+
+// A view of the contents of a buffer. Valid only as long as the buffer does
+// not grow -- `bytes_push` may move it.
+fn span_of_bytes(b: *mut Bytes) -> Span {
+    return Span { p: (*b).ptr, n: (*b).len }
+}
+
+// ----------------------------------------------------------- Building text
+//
+// Everything here appends to a `*mut Bytes` or replaces its contents.
+// `_here` means: in place, without a second buffer.
+
+fn append(out: *mut Bytes, s: Span) {
+    bytes_append(out, s.p, s.n)
+}
+
+fn append_char(out: *mut Bytes, c: u8) {
+    bytes_push(out, c)
+}
+
+fn set(out: *mut Bytes, s: Span) {
+    bytes_clear(out)
+    bytes_append(out, s.p, s.n)
+}
+
+fn repeat(out: *mut Bytes, s: Span, times: usize) {
+    var i: usize = 0
+    while i < times {
+        bytes_append(out, s.p, s.n)
+        i = i + 1
+    }
+}
+
+// Joining: append `part`, and the separator before it -- but only if there
+// is already something there. That makes the whole loop the caller's:
+//
+//     while str.divisor_next(&t, &p) { str.join_part(&out, p, sep) }
+fn join_part(out: *mut Bytes, part: Span, sep: Span) {
+    if bytes_len(out) > 0 {
+        bytes_append(out, sep.p, sep.n)
+    }
+    bytes_append(out, part.p, part.n)
+}
+
+// Right align to `width` (pad on the left). If the text is already longer
+// it is NOT truncated.
+fn fill_left(out: *mut Bytes, s: Span, width: usize, filler: u8) {
+    var i: usize = s.n
+    while i < width {
+        bytes_push(out, filler)
+        i = i + 1
+    }
+    bytes_append(out, s.p, s.n)
+}
+
+fn fill_right(out: *mut Bytes, s: Span, width: usize, filler: u8) {
+    bytes_append(out, s.p, s.n)
+    var i: usize = s.n
+    while i < width {
+        bytes_push(out, filler)
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------- Upper and lower case
+
+fn after_big(out: *mut Bytes, s: Span) {
+    bytes_clear(out)
+    var i: usize = 0
+    while i < s.n {
+        bytes_push(out, big_char(ld8(s.p, i)))
+        i = i + 1
+    }
+}
+
+fn after_small(out: *mut Bytes, s: Span) {
+    bytes_clear(out)
+    var i: usize = 0
+    while i < s.n {
+        bytes_push(out, small_char(ld8(s.p, i)))
+        i = i + 1
+    }
+}
+
+fn big_here(b: *mut Bytes) {
+    var i: usize = 0
+    while i < (*b).len {
+        st8((*b).ptr, i, big_char(ld8((*b).ptr, i)))
+        i = i + 1
+    }
+}
+
+fn small_here(b: *mut Bytes) {
+    var i: usize = 0
+    while i < (*b).len {
+        st8((*b).ptr, i, small_char(ld8((*b).ptr, i)))
+        i = i + 1
+    }
+}
+
+// --------------------------------------------------------------- Replacing
+
+// Every non overlapping occurrence. Return value: how often it replaced.
+// `out` is cleared and must lie outside `s`, `old` and `new`.
+fn replace(out: *mut Bytes, s: Span, old: Span, new: Span) -> usize {
+    bytes_clear(out)
+    if old.n == 0 || old.n > s.n {
+        bytes_append(out, s.p, s.n)
+        return 0
+    }
+    var n: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        let f: usize = find_ab(s, old, i)
+        if f == npos() {
+            bytes_append(out, (s.p as usize + i) as *mut u8, s.n - i)
+            return n
+        }
+        bytes_append(out, (s.p as usize + i) as *mut u8, f - i)
+        bytes_append(out, new.p, new.n)
+        n = n + 1
+        i = f + old.n
+    }
+    return n
+}
+
+fn replace_first(out: *mut Bytes, s: Span, old: Span, new: Span) -> bool {
+    bytes_clear(out)
+    if old.n == 0 {
+        bytes_append(out, s.p, s.n)
+        return false
+    }
+    let f: usize = find(s, old)
+    if f == npos() {
+        bytes_append(out, s.p, s.n)
+        return false
+    }
+    bytes_append(out, s.p, f)
+    bytes_append(out, new.p, new.n)
+    let ab: usize = f + old.n
+    bytes_append(out, (s.p as usize + ab) as *mut u8, s.n - ab)
+    return true
+}
+
+// Octet by octet, in place -- the length does not change.
+fn replace_char_here(b: *mut Bytes, old: u8, new: u8) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*b).len {
+        if ld8((*b).ptr, i) == old {
+            st8((*b).ptr, i, new)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Append a code point to a `Bytes` (a wrapper around utf8_push_cp, so that
+// the facade can do a full round trip: reading and writing).
+fn utf8_append(out: *mut Bytes, cp: u32) {
+    utf8_push_cp(out, cp)
+}

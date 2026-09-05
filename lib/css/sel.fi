@@ -1,0 +1,1045 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/css/sel.fi -- SELECTORS (selectors-4, the usual part) in Firn:
+// parsing and the matcher against the DOM of lib/browser/node.fi.
+//
+// WHAT IS IMPLEMENTED
+//   type selector, `*`, `.class`, `#id`,
+//   attributes `[a]`, `[a=v]`, `[a~=v]`, `[a|=v]`, `[a^=v]`, `[a$=v]`,
+//   `[a*=v]`, each with the case-insensitivity flag `i`,
+//   the combinators descendant (whitespace), child `>`, next sibling `+`
+//   and later sibling `~`, grouping with commas,
+//   the pseudo-classes `:hover`, `:first-child`, `:last-child`,
+//   `:only-child`, `:nth-child(An+B)`, `:nth-last-child(An+B)`, `:root`
+//   and `:not(...)`.
+//
+// WHAT IS NOT, and is therefore an INVALID selector (not a silently
+// non-matching one -- an invalid selector makes its whole rule invalid,
+// and that difference is measurable):
+//   namespaces (`ns|a`), pseudo-elements (`::before`), `:nth-of-type` and
+//   relatives, `:has()`, `:is()`, `:where()`, `:empty`, `:checked` and the
+//   rest of the state pseudo-classes except `:hover`.
+//
+// THE MATCHER RUNS FROM RIGHT TO LEFT, the way every engine does it: the
+// rightmost compound selector is tested against the element first, and
+// only if it fits does the walk to the left over the combinators start.
+// For `div p` that is one test instead of a search over the subtree.
+// The chain therefore points to the LEFT (`Cpd.left`), which is why the
+// selector `a > b c` is stored as `c` -> (descendant) `b` -> (child) `a`.
+//
+// `:hover` has no bit on the node. The context carries the hovered node,
+// and `:hover` fits every element on the path from it to the root -- that
+// is exactly what a browser does.
+import html.mem
+import browser.node
+import browser.names
+import css.tok
+import css.cv
+import css.anb
+
+export {
+    Sim, Cpd, Sel, Ctx,
+    SIM_TYPE, SIM_UNIVERSAL, SIM_CLASS, SIM_ID, SIM_ATTR,
+    SIM_HOVER, SIM_FIRST_CHILD, SIM_LAST_CHILD, SIM_ONLY_CHILD,
+    SIM_NTH_CHILD, SIM_NTH_LAST_CHILD, SIM_NOT, SIM_ROOT,
+    CB_NONE, CB_DESCENDANT, CB_CHILD, CB_NEXT, CB_LATER,
+    OP_EXISTS, OP_EQ, OP_INCLUDES, OP_DASH, OP_PREFIX, OP_SUFFIX, OP_SUBSTRING,
+    ctx_new, ctx_init, ctx_free, ctx_set_hover,
+    sel_parse, sel_specificity, sel_next,
+    sel_matches, sel_matches_one,
+    spec_pack, spec_a, spec_b, spec_c,
+}
+
+const SIM_TYPE: u32 = 1
+const SIM_UNIVERSAL: u32 = 2
+const SIM_CLASS: u32 = 3
+const SIM_ID: u32 = 4
+const SIM_ATTR: u32 = 5
+const SIM_HOVER: u32 = 6
+const SIM_FIRST_CHILD: u32 = 7
+const SIM_LAST_CHILD: u32 = 8
+const SIM_ONLY_CHILD: u32 = 9
+const SIM_NTH_CHILD: u32 = 10
+const SIM_NTH_LAST_CHILD: u32 = 11
+const SIM_NOT: u32 = 12
+const SIM_ROOT: u32 = 13
+
+const CB_NONE: u32 = 0
+const CB_DESCENDANT: u32 = 1
+const CB_CHILD: u32 = 2
+const CB_NEXT: u32 = 3
+const CB_LATER: u32 = 4
+
+const OP_EXISTS: u32 = 0
+const OP_EQ: u32 = 1
+const OP_INCLUDES: u32 = 2
+const OP_DASH: u32 = 3
+const OP_PREFIX: u32 = 4
+const OP_SUFFIX: u32 = 5
+const OP_SUBSTRING: u32 = 6
+
+const ATTR_FOLD: u32 = 1
+
+// ---------------------------------------------------------- The structures
+
+gc class Sim {
+    next: Gc[Sim],
+    text: Gc[Chain],
+    sub: Gc[Sel],
+    kind: u32,
+    name: u32,
+    op: u32,
+    flags: u32,
+    a: i64,
+    b: i64,
+}
+
+gc class Cpd {
+    first: Gc[Sim],
+    left: Gc[Cpd],
+    combinator: u32,
+}
+
+gc class Sel {
+    right: Gc[Cpd],
+    next: Gc[Sel],
+    spec: u32,
+}
+
+// The context of a match: the name table (atoms), two scratch buffers for
+// text comparisons and the hovered node.
+struct Ctx {
+    nm: *mut names.Names,
+    sa: mem.CpBuf,
+    sb: mem.CpBuf,
+    class_atom: u32,
+    id_atom: u32,
+    hover: Gc[Node],
+}
+
+fn ctx_new(nm: *mut names.Names) -> Ctx {
+    return Ctx {
+        nm: nm,
+        sa: mem.cp_new(),
+        sb: mem.cp_new(),
+        class_atom: 0,
+        id_atom: 0,
+        hover: gc_null[Node](),
+    }
+}
+
+#[no_gc]
+fn ctx_init(c: *mut Ctx) {
+    mem.cp_init(&(*c).sa)
+    mem.cp_init(&(*c).sb)
+    var cls: [u8; 5] = "class"
+    var idn: [u8; 2] = "id"
+    (*c).class_atom = names.names_of_bytes((*c).nm, &cls[0], 5)
+    (*c).id_atom = names.names_of_bytes((*c).nm, &idn[0], 2)
+}
+
+#[no_gc]
+fn ctx_free(c: *mut Ctx) {
+    mem.cp_free(&(*c).sa)
+    mem.cp_free(&(*c).sb)
+}
+
+fn ctx_set_hover(c: *mut Ctx, k: Gc[Node]) {
+    (*c).hover = k
+}
+
+// ------------------------------------------------------------ Specificity
+
+#[no_gc]
+fn spec_pack(a: u32, b: u32, c: u32) -> u32 {
+    var x: u32 = a
+    var y: u32 = b
+    var z: u32 = c
+    if x > 1023 as u32 {
+        x = 1023 as u32
+    }
+    if y > 1023 as u32 {
+        y = 1023 as u32
+    }
+    if z > 1023 as u32 {
+        z = 1023 as u32
+    }
+    return (x << 20) | (y << 10) | z
+}
+
+#[no_gc]
+fn spec_a(s: u32) -> u32 {
+    return (s >> 20) & 1023 as u32
+}
+
+#[no_gc]
+fn spec_b(s: u32) -> u32 {
+    return (s >> 10) & 1023 as u32
+}
+
+#[no_gc]
+fn spec_c(s: u32) -> u32 {
+    return s & 1023 as u32
+}
+
+fn sel_specificity(s: Gc[Sel]) -> u32 {
+    return s.spec
+}
+
+fn sel_next(s: Gc[Sel]) -> Gc[Sel] {
+    return s.next
+}
+
+// -------------------------------------------------------- The parser state
+
+struct SelParse {
+    list: Gc[Cv],
+    i: u64,
+    n: u64,
+    nm: *mut names.Names,
+    tmp: *mut mem.CpBuf,
+    ok: bool,
+    sa: u32,
+    sb: u32,
+    sc: u32,
+}
+
+fn sp_kind(p: *mut SelParse) -> u32 {
+    if (*p).i >= (*p).n {
+        return tok.T_EOF
+    }
+    return cv.cv_kid((*p).list, (*p).i).kind
+}
+
+fn sp_node(p: *mut SelParse) -> Gc[Cv] {
+    if (*p).i >= (*p).n {
+        return gc_null[Cv]()
+    }
+    return cv.cv_kid((*p).list, (*p).i)
+}
+
+fn sp_step(p: *mut SelParse) {
+    (*p).i = (*p).i + 1
+}
+
+fn sp_end(p: *mut SelParse) -> bool {
+    return (*p).i >= (*p).n
+}
+
+// Skips whitespace and reports whether there was any.
+fn sp_skip_ws(p: *mut SelParse) -> bool {
+    var saw: bool = false
+    while !sp_end(p) && sp_kind(p) == tok.T_WHITESPACE {
+        saw = true
+        sp_step(p)
+    }
+    return saw
+}
+
+fn is_delim_char(c: Gc[Cv], want: u32) -> bool {
+    if c == gc_null[Cv]() || c.kind != tok.T_DELIM {
+        return false
+    }
+    if node.chain_len(c.text) != 1 {
+        return false
+    }
+    return node.chain_at(c.text, 0) == want
+}
+
+// The atom of a chain, ASCII lowercased when `fold` is set.
+fn atom_of_chain(p: *mut SelParse, k: Gc[Chain], fold: bool) -> u32 {
+    mem.cp_clear((*p).tmp)
+    node.chain_after_cpbuf(k, (*p).tmp)
+    if fold {
+        var i: usize = 0
+        while i < mem.cp_len((*p).tmp) {
+            mem.cp_set((*p).tmp, i, tok.ascii_lower(mem.cp_at((*p).tmp, i)))
+            i = i + 1
+        }
+    }
+    return names.names_of_cp((*p).nm, (*p).tmp)
+}
+
+fn sim_new(kind: u32) -> AllocError!Gc[Sim] {
+    return try gc Sim {
+        next: gc_null[Sim](),
+        text: gc_null[Chain](),
+        sub: gc_null[Sel](),
+        kind: kind,
+        name: 0,
+        op: OP_EXISTS,
+        flags: 0,
+        a: 0,
+        b: 0,
+    }
+}
+
+// ------------------------------------------------------- Attribute selector
+
+fn parse_attribute(p: *mut SelParse, block: Gc[Cv]) -> AllocError!Gc[Sim] {
+    // The content of the [] block is a list of component values.
+    var i: u64 = 0
+    let n: u64 = cv.cv_kids_count(block)
+    while i < n && cv.cv_kid(block, i).kind == tok.T_WHITESPACE {
+        i = i + 1
+    }
+    if i >= n {
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    let name_node: Gc[Cv] = cv.cv_kid(block, i)
+    if name_node.kind != tok.T_IDENT {
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    i = i + 1
+    let s = try sim_new(SIM_ATTR)
+    s.name = atom_of_chain(p, name_node.text, true)
+    while i < n && cv.cv_kid(block, i).kind == tok.T_WHITESPACE {
+        i = i + 1
+    }
+    if i >= n {
+        s.op = OP_EXISTS
+        return s
+    }
+    let op_node: Gc[Cv] = cv.cv_kid(block, i)
+    if is_delim_char(op_node, 61 as u32) {
+        s.op = OP_EQ
+    } else if op_node.kind == tok.T_INCLUDE_MATCH {
+        s.op = OP_INCLUDES
+    } else if op_node.kind == tok.T_DASH_MATCH {
+        s.op = OP_DASH
+    } else if op_node.kind == tok.T_PREFIX_MATCH {
+        s.op = OP_PREFIX
+    } else if op_node.kind == tok.T_SUFFIX_MATCH {
+        s.op = OP_SUFFIX
+    } else if op_node.kind == tok.T_SUBSTRING_MATCH {
+        s.op = OP_SUBSTRING
+    } else {
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    i = i + 1
+    while i < n && cv.cv_kid(block, i).kind == tok.T_WHITESPACE {
+        i = i + 1
+    }
+    if i >= n {
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    let value_node: Gc[Cv] = cv.cv_kid(block, i)
+    if value_node.kind != tok.T_IDENT && value_node.kind != tok.T_STRING {
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    s.text = value_node.text
+    i = i + 1
+    while i < n && cv.cv_kid(block, i).kind == tok.T_WHITESPACE {
+        i = i + 1
+    }
+    if i < n {
+        let flag_node: Gc[Cv] = cv.cv_kid(block, i)
+        if flag_node.kind != tok.T_IDENT {
+            (*p).ok = false
+            return gc_null[Sim]()
+        }
+        var fi: [u8; 1] = "i"
+        if !node.chain_equal_ascii_small(flag_node.text, &fi[0], 1) {
+            (*p).ok = false
+            return gc_null[Sim]()
+        }
+        s.flags = s.flags | ATTR_FOLD
+        i = i + 1
+        while i < n && cv.cv_kid(block, i).kind == tok.T_WHITESPACE {
+            i = i + 1
+        }
+    }
+    if i < n {
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    return s
+}
+
+// ------------------------------------------------------------- Pseudo class
+
+fn parse_nth(p: *mut SelParse, fn_node: Gc[Cv], s: Gc[Sim]) -> bool {
+    // The argument of nth-child is An+B -- a grammar over the TOKENS.
+    // The component values are turned back into a token stream for it;
+    // that is exactly what a browser does with the token list of the
+    // function.
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    mem.cp_clear((*p).tmp)
+    cv_write_tokens(fn_node, (*p).tmp)
+    tok.tokenize(&t, (*p).tmp)
+    var a: anb.Anb = anb.anb_new()
+    let good: bool = anb.anb_parse(&t, &a)
+    tok.tokens_free(&t)
+    if !good {
+        return false
+    }
+    s.a = a.a
+    s.b = a.b
+    return true
+}
+
+// Writes the component values of a node back as text (only what a
+// selector argument may contain).
+fn cv_write_tokens(c: Gc[Cv], out: *mut mem.CpBuf) {
+    let n: u64 = cv.cv_kids_count(c)
+    var i: u64 = 0
+    while i < n {
+        let k: Gc[Cv] = cv.cv_kid(c, i)
+        if k.kind == tok.T_WHITESPACE {
+            mem.cp_push(out, 32 as u32)
+        } else if k.kind == tok.T_IDENT || k.kind == tok.T_NUMBER ||
+        k.kind == tok.T_DIMENSION || k.kind == tok.T_DELIM {
+            node.chain_after_cpbuf(k.text, out)
+            if k.kind == tok.T_DIMENSION {
+                node.chain_after_cpbuf(k.unit, out)
+            }
+        } else if k.kind == tok.T_PERCENTAGE {
+            node.chain_after_cpbuf(k.text, out)
+            mem.cp_push(out, 37 as u32)
+        } else {
+            // Anything else cannot stand in An+B; a marker makes the
+            // parse fail instead of quietly dropping the value.
+            mem.cp_push(out, 33 as u32)
+        }
+        i = i + 1
+    }
+}
+
+fn parse_pseudo(p: *mut SelParse) -> AllocError!Gc[Sim] {
+    sp_step(p) // the colon
+    if sp_end(p) {
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    let n: Gc[Cv] = sp_node(p)
+    if n.kind == tok.T_COLON {
+        // `::before` -- a pseudo-element. Not supported, so invalid.
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    if n.kind == tok.T_IDENT {
+        sp_step(p)
+        var w1: [u8; 5] = "hover"
+        var w2: [u8; 11] = "first-child"
+        var w3: [u8; 10] = "last-child"
+        var w4: [u8; 10] = "only-child"
+        var w5: [u8; 4] = "root"
+        if node.chain_equal_ascii_small(n.text, &w1[0], 5) {
+            (*p).sb = (*p).sb + 1 as u32
+            return try sim_new(SIM_HOVER)
+        }
+        if node.chain_equal_ascii_small(n.text, &w2[0], 11) {
+            (*p).sb = (*p).sb + 1 as u32
+            return try sim_new(SIM_FIRST_CHILD)
+        }
+        if node.chain_equal_ascii_small(n.text, &w3[0], 10) {
+            (*p).sb = (*p).sb + 1 as u32
+            return try sim_new(SIM_LAST_CHILD)
+        }
+        if node.chain_equal_ascii_small(n.text, &w4[0], 10) {
+            (*p).sb = (*p).sb + 1 as u32
+            return try sim_new(SIM_ONLY_CHILD)
+        }
+        if node.chain_equal_ascii_small(n.text, &w5[0], 4) {
+            (*p).sb = (*p).sb + 1 as u32
+            return try sim_new(SIM_ROOT)
+        }
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    if n.kind == cv.CV_FUNCTION {
+        sp_step(p)
+        var f1: [u8; 9] = "nth-child"
+        var f2: [u8; 14] = "nth-last-child"
+        var f3: [u8; 3] = "not"
+        if node.chain_equal_ascii_small(n.text, &f1[0], 9) {
+            let s = try sim_new(SIM_NTH_CHILD)
+            if !parse_nth(p, n, s) {
+                (*p).ok = false
+                return gc_null[Sim]()
+            }
+            (*p).sb = (*p).sb + 1 as u32
+            return s
+        }
+        if node.chain_equal_ascii_small(n.text, &f2[0], 14) {
+            let s = try sim_new(SIM_NTH_LAST_CHILD)
+            if !parse_nth(p, n, s) {
+                (*p).ok = false
+                return gc_null[Sim]()
+            }
+            (*p).sb = (*p).sb + 1 as u32
+            return s
+        }
+        if node.chain_equal_ascii_small(n.text, &f3[0], 3) {
+            let s = try sim_new(SIM_NOT)
+            // The specificity of `:not()` is the one of its most specific
+            // argument -- so the inner list is parsed with counters of its
+            // own.
+            var inner: SelParse = SelParse {
+                list: n, i: 0, n: cv.cv_kids_count(n),
+                nm: (*p).nm, tmp: (*p).tmp, ok: true, sa: 0, sb: 0, sc: 0,
+            }
+            let sub = try parse_selector_list(&inner, true)
+            if !inner.ok || sub == gc_null[Sel]() {
+                (*p).ok = false
+                return gc_null[Sim]()
+            }
+            s.sub = sub
+            var best: u32 = 0
+            var x: Gc[Sel] = sub
+            while x != gc_null[Sel]() {
+                if x.spec > best {
+                    best = x.spec
+                }
+                x = x.next
+            }
+            (*p).sa = (*p).sa + spec_a(best)
+            (*p).sb = (*p).sb + spec_b(best)
+            (*p).sc = (*p).sc + spec_c(best)
+            return s
+        }
+        (*p).ok = false
+        return gc_null[Sim]()
+    }
+    (*p).ok = false
+    return gc_null[Sim]()
+}
+
+// ---------------------------------------------------- Compound and complex
+
+fn parse_compound(p: *mut SelParse) -> AllocError!Gc[Cpd] {
+    let c = try gc Cpd {
+        first: gc_null[Sim](),
+        left: gc_null[Cpd](),
+        combinator: CB_NONE,
+    }
+    var last: Gc[Sim] = gc_null[Sim]()
+    var count: u32 = 0
+    var next: bool = true
+    while next && (*p).ok {
+        let k: u32 = sp_kind(p)
+        var s: Gc[Sim] = gc_null[Sim]()
+        if k == tok.T_IDENT {
+            let n: Gc[Cv] = sp_node(p)
+            sp_step(p)
+            s = try sim_new(SIM_TYPE)
+            s.name = atom_of_chain(p, n.text, true)
+            // ROUND B1: the name AS WRITTEN stays as well. Inside HTML a
+            // type selector is ASCII case insensitive (hence the folded
+            // atom), outside it is CASE SENSITIVE -- `clipPath` in SVG is
+            // not `clippath`.
+            s.text = n.text
+            (*p).sc = (*p).sc + 1 as u32
+        } else if is_delim_char(sp_node(p), 42 as u32) {
+            sp_step(p)
+            s = try sim_new(SIM_UNIVERSAL)
+        } else if is_delim_char(sp_node(p), 46 as u32) {
+            sp_step(p)
+            if sp_kind(p) != tok.T_IDENT {
+                (*p).ok = false
+                return gc_null[Cpd]()
+            }
+            let n: Gc[Cv] = sp_node(p)
+            sp_step(p)
+            s = try sim_new(SIM_CLASS)
+            s.text = n.text
+            (*p).sb = (*p).sb + 1 as u32
+        } else if k == tok.T_HASH {
+            let n: Gc[Cv] = sp_node(p)
+            if (n.flags & tok.F_HASH_ID) == 0 as u32 {
+                (*p).ok = false
+                return gc_null[Cpd]()
+            }
+            sp_step(p)
+            s = try sim_new(SIM_ID)
+            s.text = n.text
+            (*p).sa = (*p).sa + 1 as u32
+        } else if k == cv.CV_SQUARE {
+            let n: Gc[Cv] = sp_node(p)
+            sp_step(p)
+            s = try parse_attribute(p, n)
+            if !(*p).ok {
+                return gc_null[Cpd]()
+            }
+            (*p).sb = (*p).sb + 1 as u32
+        } else if k == tok.T_COLON {
+            s = try parse_pseudo(p)
+            if !(*p).ok {
+                return gc_null[Cpd]()
+            }
+        } else {
+            next = false
+        }
+        if next {
+            if last == gc_null[Sim]() {
+                c.first = s
+            } else {
+                last.next = s
+            }
+            last = s
+            count = count + 1 as u32
+        }
+    }
+    if count == 0 as u32 {
+        (*p).ok = false
+        return gc_null[Cpd]()
+    }
+    return c
+}
+
+// One complex selector. Returns its RIGHTMOST compound; the chain points
+// to the left.
+fn parse_complex(p: *mut SelParse, simple_only: bool) -> AllocError!Gc[Cpd] {
+    let ignored: bool = sp_skip_ws(p)
+    var right: Gc[Cpd] = gc_null[Cpd]()
+    var combinator: u32 = CB_NONE
+    var next: bool = true
+    while next && (*p).ok {
+        let c = try parse_compound(p)
+        if !(*p).ok {
+            return gc_null[Cpd]()
+        }
+        c.left = right
+        c.combinator = combinator
+        right = c
+        let saw: bool = sp_skip_ws(p)
+        if sp_end(p) || sp_kind(p) == tok.T_COMMA {
+            next = false
+        } else if is_delim_char(sp_node(p), 62 as u32) {
+            combinator = CB_CHILD
+            sp_step(p)
+            let i2: bool = sp_skip_ws(p)
+        } else if is_delim_char(sp_node(p), 43 as u32) {
+            combinator = CB_NEXT
+            sp_step(p)
+            let i3: bool = sp_skip_ws(p)
+        } else if is_delim_char(sp_node(p), 126 as u32) {
+            combinator = CB_LATER
+            sp_step(p)
+            let i4: bool = sp_skip_ws(p)
+        } else if saw {
+            combinator = CB_DESCENDANT
+        } else {
+            (*p).ok = false
+            return gc_null[Cpd]()
+        }
+        if next && simple_only && combinator != CB_NONE {
+            // Inside `:not()` this build allows no combinators.
+            (*p).ok = false
+            return gc_null[Cpd]()
+        }
+    }
+    return right
+}
+
+fn parse_selector_list(p: *mut SelParse, simple_only: bool) -> AllocError!Gc[Sel] {
+    var first: Gc[Sel] = gc_null[Sel]()
+    var last: Gc[Sel] = gc_null[Sel]()
+    var next: bool = true
+    while next && (*p).ok {
+        (*p).sa = 0
+        (*p).sb = 0
+        (*p).sc = 0
+        let right = try parse_complex(p, simple_only)
+        if !(*p).ok {
+            return gc_null[Sel]()
+        }
+        let s = try gc Sel {
+            right: right,
+            next: gc_null[Sel](),
+            spec: spec_pack((*p).sa, (*p).sb, (*p).sc),
+        }
+        if last == gc_null[Sel]() {
+            first = s
+        } else {
+            last.next = s
+        }
+        last = s
+        if sp_end(p) {
+            next = false
+        } else if sp_kind(p) == tok.T_COMMA {
+            sp_step(p)
+        } else {
+            (*p).ok = false
+            return gc_null[Sel]()
+        }
+    }
+    return first
+}
+
+// Parses the prelude of a rule (a list of component values) as a selector
+// list. The null pointer means: invalid selector -- and with it the whole
+// rule is invalid.
+fn sel_parse(list: Gc[Cv], nm: *mut names.Names, tmp: *mut mem.CpBuf) -> AllocError!Gc[Sel] {
+    var p: SelParse = SelParse {
+        list: list, i: 0, n: cv.cv_kids_count(list),
+        nm: nm, tmp: tmp, ok: true, sa: 0, sb: 0, sc: 0,
+    }
+    if p.n == 0 {
+        return gc_null[Sel]()
+    }
+    let s = try parse_selector_list(&p, false)
+    if !p.ok {
+        return gc_null[Sel]()
+    }
+    return s
+}
+
+// --------------------------------------------------------- Text comparison
+
+fn fold_cp(c: u32, fold: bool) -> u32 {
+    if fold {
+        return tok.ascii_lower(c)
+    }
+    return c
+}
+
+fn cp_equal_range(a: *mut mem.CpBuf, from: usize, to: usize,
+    b: *mut mem.CpBuf, fold: bool) -> bool {
+    if to - from != mem.cp_len(b) {
+        return false
+    }
+    var i: usize = 0
+    while i < mem.cp_len(b) {
+        if fold_cp(mem.cp_at(a, from + i), fold) != fold_cp(mem.cp_at(b, i), fold) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn cp_is_space(c: u32) -> bool {
+    return c == 32 as u32 || c == 9 as u32 || c == 10 as u32 || c == 12 as u32 || c == 13 as u32
+}
+
+// `~=`: one whitespace separated word of `a` equals `b`.
+fn cp_has_word(a: *mut mem.CpBuf, b: *mut mem.CpBuf, fold: bool) -> bool {
+    let bn: usize = mem.cp_len(b)
+    if bn == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < bn {
+        if cp_is_space(mem.cp_at(b, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    let an: usize = mem.cp_len(a)
+    var k: usize = 0
+    while k < an {
+        while k < an && cp_is_space(mem.cp_at(a, k)) {
+            k = k + 1
+        }
+        var e: usize = k
+        while e < an && !cp_is_space(mem.cp_at(a, e)) {
+            e = e + 1
+        }
+        if e > k && cp_equal_range(a, k, e, b, fold) {
+            return true
+        }
+        k = e
+    }
+    return false
+}
+
+fn cp_starts(a: *mut mem.CpBuf, b: *mut mem.CpBuf, fold: bool) -> bool {
+    let bn: usize = mem.cp_len(b)
+    if bn == 0 || bn > mem.cp_len(a) {
+        return false
+    }
+    return cp_equal_range(a, 0, bn, b, fold)
+}
+
+fn cp_ends(a: *mut mem.CpBuf, b: *mut mem.CpBuf, fold: bool) -> bool {
+    let bn: usize = mem.cp_len(b)
+    let an: usize = mem.cp_len(a)
+    if bn == 0 || bn > an {
+        return false
+    }
+    return cp_equal_range(a, an - bn, an, b, fold)
+}
+
+fn cp_contains(a: *mut mem.CpBuf, b: *mut mem.CpBuf, fold: bool) -> bool {
+    let bn: usize = mem.cp_len(b)
+    let an: usize = mem.cp_len(a)
+    if bn == 0 || bn > an {
+        return false
+    }
+    var i: usize = 0
+    while i + bn <= an {
+        if cp_equal_range(a, i, i + bn, b, fold) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// `|=`: equal, or the value followed by a hyphen.
+fn cp_dash(a: *mut mem.CpBuf, b: *mut mem.CpBuf, fold: bool) -> bool {
+    let bn: usize = mem.cp_len(b)
+    let an: usize = mem.cp_len(a)
+    if bn > an {
+        return false
+    }
+    if !cp_equal_range(a, 0, bn, b, fold) {
+        return false
+    }
+    if an == bn {
+        return true
+    }
+    return mem.cp_at(a, bn) == 45 as u32
+}
+
+// ------------------------------------------------------------ The matcher
+
+fn elem_index(e: Gc[Node], from_end: bool) -> i64 {
+    let parent: Gc[Node] = e.parent
+    if parent == gc_null[Node]() {
+        return 1
+    }
+    var i: i64 = 0
+    var c: Gc[Node] = parent.first_child
+    if from_end {
+        c = parent.last_child
+    }
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            i = i + 1
+            if c == e {
+                return i
+            }
+        }
+        if from_end {
+            c = c.previous
+        } else {
+            c = c.next
+        }
+    }
+    return i
+}
+
+fn previous_elem(e: Gc[Node]) -> Gc[Node] {
+    var c: Gc[Node] = e.previous
+    while c != gc_null[Node]() && c.kind != node.K_ELEM {
+        c = c.previous
+    }
+    return c
+}
+
+// The name of an element against the text of the selector, byte for byte.
+fn name_equal_exact(cx: *mut Ctx, id: u32, text: Gc[Chain]) -> bool {
+    if text == gc_null[Chain]() {
+        return false
+    }
+    mem.cp_clear(&(*cx).sa)
+    names.names_after_cpbuf((*cx).nm, id, &(*cx).sa)
+    let n: usize = mem.cp_len(&(*cx).sa)
+    if node.chain_len(text) != n as u64 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if node.chain_at(text, i as u64) != mem.cp_at(&(*cx).sa, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn attribute_value(cx: *mut Ctx, e: Gc[Elem], atom: u32, out: *mut mem.CpBuf) -> bool {
+    let a: Gc[Attr] = node.attr_find(e, atom, 0)
+    mem.cp_clear(out)
+    if a == gc_null[Attr]() {
+        return false
+    }
+    node.chain_after_cpbuf(a.value, out)
+    return true
+}
+
+fn match_simple(s: Gc[Sim], k: Gc[Node], cx: *mut Ctx) -> bool {
+    let kind: u32 = s.kind
+    if kind == SIM_UNIVERSAL {
+        return true
+    }
+    let e: Gc[Elem] = node.node_as_elem(k)
+    if e == gc_null[Elem]() {
+        return false
+    }
+    if kind == SIM_TYPE {
+        // A type selector without a namespace prefix matches in EVERY
+        // namespace (selectors-4 5.1: with no default namespace declared).
+        // Round 60 restricted it to HTML; since round B1 the tree really
+        // does carry SVG and MathML elements, and `svg { display: block }`
+        // out of the default stylesheet has to reach them.
+        if e.ns == node.NS_HTML {
+            return e.name == s.name
+        }
+        return name_equal_exact(cx, e.name, s.text)
+    }
+    if kind == SIM_CLASS {
+        if !attribute_value(cx, e, (*cx).class_atom, &(*cx).sa) {
+            return false
+        }
+        mem.cp_clear(&(*cx).sb)
+        node.chain_after_cpbuf(s.text, &(*cx).sb)
+        return cp_has_word(&(*cx).sa, &(*cx).sb, false)
+    }
+    if kind == SIM_ID {
+        if !attribute_value(cx, e, (*cx).id_atom, &(*cx).sa) {
+            return false
+        }
+        mem.cp_clear(&(*cx).sb)
+        node.chain_after_cpbuf(s.text, &(*cx).sb)
+        return cp_equal_range(&(*cx).sa, 0, mem.cp_len(&(*cx).sa), &(*cx).sb, false)
+    }
+    if kind == SIM_ATTR {
+        if !attribute_value(cx, e, s.name, &(*cx).sa) {
+            return false
+        }
+        if s.op == OP_EXISTS {
+            return true
+        }
+        mem.cp_clear(&(*cx).sb)
+        node.chain_after_cpbuf(s.text, &(*cx).sb)
+        let fold: bool = (s.flags & ATTR_FOLD) != 0 as u32
+        if s.op == OP_EQ {
+            return cp_equal_range(&(*cx).sa, 0, mem.cp_len(&(*cx).sa), &(*cx).sb, fold)
+        }
+        if s.op == OP_INCLUDES {
+            return cp_has_word(&(*cx).sa, &(*cx).sb, fold)
+        }
+        if s.op == OP_DASH {
+            return cp_dash(&(*cx).sa, &(*cx).sb, fold)
+        }
+        if s.op == OP_PREFIX {
+            return cp_starts(&(*cx).sa, &(*cx).sb, fold)
+        }
+        if s.op == OP_SUFFIX {
+            return cp_ends(&(*cx).sa, &(*cx).sb, fold)
+        }
+        return cp_contains(&(*cx).sa, &(*cx).sb, fold)
+    }
+    if kind == SIM_HOVER {
+        if (*cx).hover == gc_null[Node]() {
+            return false
+        }
+        return node.node_ancestor_is((*cx).hover, k)
+    }
+    if kind == SIM_ROOT {
+        let parent: Gc[Node] = k.parent
+        if parent == gc_null[Node]() {
+            return false
+        }
+        return parent.kind == node.K_DOCUMENT
+    }
+    if kind == SIM_FIRST_CHILD {
+        return elem_index(k, false) == 1
+    }
+    if kind == SIM_LAST_CHILD {
+        return elem_index(k, true) == 1
+    }
+    if kind == SIM_ONLY_CHILD {
+        return elem_index(k, false) == 1 && elem_index(k, true) == 1
+    }
+    if kind == SIM_NTH_CHILD {
+        return anb.anb_matches(s.a, s.b, elem_index(k, false))
+    }
+    if kind == SIM_NTH_LAST_CHILD {
+        return anb.anb_matches(s.a, s.b, elem_index(k, true))
+    }
+    if kind == SIM_NOT {
+        var x: Gc[Sel] = s.sub
+        while x != gc_null[Sel]() {
+            if match_complex(x.right, k, cx) {
+                return false
+            }
+            x = x.next
+        }
+        return true
+    }
+    return false
+}
+
+fn match_compound(c: Gc[Cpd], k: Gc[Node], cx: *mut Ctx) -> bool {
+    var s: Gc[Sim] = c.first
+    while s != gc_null[Sim]() {
+        if !match_simple(s, k, cx) {
+            return false
+        }
+        s = s.next
+    }
+    return true
+}
+
+// The walk from right to left. `c` is the compound that has to fit `k`.
+fn match_complex(c: Gc[Cpd], k: Gc[Node], cx: *mut Ctx) -> bool {
+    if !match_compound(c, k, cx) {
+        return false
+    }
+    let left: Gc[Cpd] = c.left
+    if left == gc_null[Cpd]() {
+        return true
+    }
+    let cb: u32 = c.combinator
+    if cb == CB_CHILD {
+        let parent: Gc[Node] = k.parent
+        if parent == gc_null[Node]() || parent.kind != node.K_ELEM {
+            return false
+        }
+        return match_complex(left, parent, cx)
+    }
+    if cb == CB_DESCENDANT {
+        var a: Gc[Node] = k.parent
+        while a != gc_null[Node]() && a.kind == node.K_ELEM {
+            if match_complex(left, a, cx) {
+                return true
+            }
+            a = a.parent
+        }
+        return false
+    }
+    if cb == CB_NEXT {
+        let prev: Gc[Node] = previous_elem(k)
+        if prev == gc_null[Node]() {
+            return false
+        }
+        return match_complex(left, prev, cx)
+    }
+    if cb == CB_LATER {
+        var prev: Gc[Node] = previous_elem(k)
+        while prev != gc_null[Node]() {
+            if match_complex(left, prev, cx) {
+                return true
+            }
+            prev = previous_elem(prev)
+        }
+        return false
+    }
+    return false
+}
+
+// Does ONE complex selector fit?
+fn sel_matches_one(s: Gc[Sel], k: Gc[Node], cx: *mut Ctx) -> bool {
+    return match_complex(s.right, k, cx)
+}
+
+// Does any selector of the group fit?
+fn sel_matches(s: Gc[Sel], k: Gc[Node], cx: *mut Ctx) -> bool {
+    var x: Gc[Sel] = s
+    while x != gc_null[Sel]() {
+        if match_complex(x.right, k, cx) {
+            return true
+        }
+        x = x.next
+    }
+    return false
+}

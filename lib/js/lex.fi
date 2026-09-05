@@ -1,0 +1,1862 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/lex.fi -- the ECMAScript LEXER (ECMA-262, clause 12) in Firn.
+//
+// It scans ON DEMAND, one token per call, because that is the only honest
+// way to do it: ECMAScript has no context free lexical grammar. The same
+// slash is a division operator or the start of a regular expression
+// depending on which goal symbol the SYNTACTIC grammar is currently asking
+// for (12.1: InputElementDiv vs InputElementRegExp), and the closing brace
+// of a template substitution is only a brace if the parser is not inside a
+// template. Everything that pretends otherwise -- a token array produced in
+// advance plus a heuristic over the previous token -- gets `a = b
+// /hi/g.exec(c)` wrong. So `lex_next` takes the goal as a parameter, and
+// the parser is the one that knows it.
+//
+// WHAT IS IN HERE
+//   * white space and line terminators including the Unicode Zs class,
+//     both comment forms, and the record whether a LINE TERMINATOR stood
+//     before a token -- that single bit is what automatic semicolon
+//     insertion (11.9) is decided on later, in the parser.
+//   * identifiers over the real Unicode properties ID_Start/ID_Continue
+//     (lib/js/unicode_id.fi, generated), with `\uXXXX` and `\u{...}`
+//     escapes and the record that an escape was used (an escaped reserved
+//     word is a syntax error, 12.7.2).
+//   * all numeric forms of 12.9.3: decimal, hexadecimal, octal, binary,
+//     numeric separators, the legacy octal form and the legacy decimal form
+//     `08` -- the latter two marked, because they are errors in strict mode
+//     only. The value of a decimal literal comes from `strtod`
+//     (lib/num/strtod.fi, correctly rounded); the values of the
+//     power-of-two radices are computed here BIT EXACTLY with round to
+//     nearest even, not by repeated multiplication.
+//   * string literals with every escape of 12.9.4 including line
+//     continuations, `\xHH`, `\u{...}` and the legacy octal escapes.
+//   * template literals: head, middle and tail as separate tokens, with the
+//     cooked AND the raw text, and the ES2018 rule that an invalid escape
+//     only kills the COOKED value (in a tagged template it becomes
+//     `undefined`) instead of being a syntax error.
+//   * regular expression literals as a token including the character class
+//     rule (a `/` inside `[...]` does not end the literal) and the flag
+//     check.
+//
+// STORAGE. The scanner keeps ONE token in the `Lexer` structure; text
+// (identifier names, string values, raw text) goes into pools of UTF-16
+// code units. Identifiers are INTERNED right away -- from then on a name is
+// a `u32` and every comparison is an integer comparison. The keywords are
+// interned first and in a fixed order, so `id < KW_COUNT` decides in one
+// comparison whether a name is a reserved word.
+import html.mem
+import std.num
+import std.math
+import str.ucd
+
+export {
+    Names, names_init, names_free, names_intern, names_intern_ascii,
+    names_len, names_off, names_at, names_count, names_equal_ascii,
+    Lexer, lex_new, lex_init, lex_free, lex_source, lex_reset,
+    lex_set_ascii, lex_set_utf8,
+    lex_next, lex_template_continue, lex_regexp_from,
+    lex_save, lex_restore,
+    lex_pool_at, lex_pool_ptr,
+    T_EOF, T_IDENT, T_PRIVATE, T_NUM, T_BIGINT, T_STRING, T_TEMPLATE,
+    T_REGEXP, T_PUNCT, T_KEYWORD, T_ERROR,
+    GOAL_DIV, GOAL_REGEXP,
+    P_LBRACE, P_RBRACE, P_LPAREN, P_RPAREN, P_LBRACK, P_RBRACK, P_DOT,
+    P_ELLIPSIS, P_SEMI, P_COMMA, P_LT, P_GT, P_LE, P_GE, P_EQ, P_NE,
+    P_SEQ, P_SNE, P_ADD, P_SUB, P_MUL, P_MOD, P_POW, P_INC, P_DEC,
+    P_SHL, P_SHR, P_USHR, P_AND, P_OR, P_XOR, P_NOT, P_TILDE, P_ANDAND,
+    P_OROR, P_COALESCE, P_QUESTION, P_COLON, P_ASSIGN, P_ADDA, P_SUBA,
+    P_MULA, P_MODA, P_POWA, P_SHLA, P_SHRA, P_USHRA, P_ANDA, P_ORA,
+    P_XORA, P_ANDANDA, P_ORORA, P_COALESCEA, P_ARROW, P_DIV, P_DIVA,
+    P_OPTCHAIN,
+    K_AWAIT, K_BREAK, K_CASE, K_CATCH, K_CLASS, K_CONST, K_CONTINUE,
+    K_DEBUGGER, K_DEFAULT, K_DELETE, K_DO, K_ELSE, K_ENUM, K_EXPORT,
+    K_EXTENDS, K_FALSE, K_FINALLY, K_FOR, K_FUNCTION, K_IF, K_IMPORT,
+    K_IN, K_INSTANCEOF, K_NEW, K_NULL, K_RETURN, K_SUPER, K_SWITCH,
+    K_THIS, K_THROW, K_TRUE, K_TRY, K_TYPEOF, K_VAR, K_VOID, K_WHILE,
+    K_WITH, K_YIELD, KW_COUNT,
+    N_LET, N_STATIC, N_IMPLEMENTS, N_INTERFACE, N_PACKAGE, N_PRIVATE,
+    N_PROTECTED, N_PUBLIC, N_AS, N_ASYNC, N_FROM, N_GET, N_SET, N_OF,
+    N_TARGET, N_ARGUMENTS, N_EVAL, N_UNDEFINED, N_NAN, N_INFINITY,
+    N_CONSTRUCTOR, N_PROTOTYPE, N_DUNDER_PROTO, N_LENGTH, N_NAME,
+    N_VALUE, N_WRITABLE, N_ENUMERABLE, N_CONFIGURABLE, N_MESSAGE,
+    N_TOSTRING, N_VALUEOF, N_CALLEE, N_RAW, N_SIZE, N_INDEX, N_INPUT,
+    N_EMPTY, N_ANONYMOUS, N_STACK, N_TOPRIMITIVE, N_ITERATOR, N_NEXT,
+    N_DONE, N_DESCRIPTION, N_GLOBALTHIS, N_ARGS_COUNT,
+    F_ESCAPED, F_LEGACY_OCT, F_LEGACY_DEC, F_TPL_HEAD, F_TPL_TAIL,
+    F_BAD_ESCAPE, F_OCT_ESCAPE, F_HAS_DOT_OR_EXP,
+    E_NONE, E_UNTERMINATED_STRING, E_UNTERMINATED_COMMENT,
+    E_UNTERMINATED_TEMPLATE, E_UNTERMINATED_REGEXP, E_BAD_ESCAPE,
+    E_BAD_NUMBER, E_BAD_CHARACTER, E_BIGINT, E_BAD_FLAGS,
+    E_BAD_SEPARATOR, E_IDENT_AFTER_NUMBER,
+}
+
+// ------------------------------------------------------------ Token kinds
+
+const T_EOF: u32 = 0
+const T_IDENT: u32 = 1
+const T_PRIVATE: u32 = 2 // `#name` inside a class
+const T_NUM: u32 = 3
+const T_STRING: u32 = 4
+const T_TEMPLATE: u32 = 5
+const T_REGEXP: u32 = 6
+const T_PUNCT: u32 = 7
+const T_KEYWORD: u32 = 8
+const T_ERROR: u32 = 9
+const T_BIGINT: u32 = 10 // `123n` -- the digits lie in the pool
+
+// The goal symbol the parser asks for (ECMA-262 12.1).
+const GOAL_DIV: u32 = 0
+const GOAL_REGEXP: u32 = 1
+
+// -------------------------------------------------------- Punctuator codes
+
+const P_LBRACE: u32 = 1
+const P_RBRACE: u32 = 2
+const P_LPAREN: u32 = 3
+const P_RPAREN: u32 = 4
+const P_LBRACK: u32 = 5
+const P_RBRACK: u32 = 6
+const P_DOT: u32 = 7
+const P_ELLIPSIS: u32 = 8
+const P_SEMI: u32 = 9
+const P_COMMA: u32 = 10
+const P_LT: u32 = 11
+const P_GT: u32 = 12
+const P_LE: u32 = 13
+const P_GE: u32 = 14
+const P_EQ: u32 = 15
+const P_NE: u32 = 16
+const P_SEQ: u32 = 17
+const P_SNE: u32 = 18
+const P_ADD: u32 = 19
+const P_SUB: u32 = 20
+const P_MUL: u32 = 21
+const P_MOD: u32 = 22
+const P_POW: u32 = 23
+const P_INC: u32 = 24
+const P_DEC: u32 = 25
+const P_SHL: u32 = 26
+const P_SHR: u32 = 27
+const P_USHR: u32 = 28
+const P_AND: u32 = 29
+const P_OR: u32 = 30
+const P_XOR: u32 = 31
+const P_NOT: u32 = 32
+const P_TILDE: u32 = 33
+const P_ANDAND: u32 = 34
+const P_OROR: u32 = 35
+const P_COALESCE: u32 = 36
+const P_QUESTION: u32 = 37
+const P_COLON: u32 = 38
+const P_ASSIGN: u32 = 39
+const P_ADDA: u32 = 40
+const P_SUBA: u32 = 41
+const P_MULA: u32 = 42
+const P_MODA: u32 = 43
+const P_POWA: u32 = 44
+const P_SHLA: u32 = 45
+const P_SHRA: u32 = 46
+const P_USHRA: u32 = 47
+const P_ANDA: u32 = 48
+const P_ORA: u32 = 49
+const P_XORA: u32 = 50
+const P_ANDANDA: u32 = 51
+const P_ORORA: u32 = 52
+const P_COALESCEA: u32 = 53
+const P_ARROW: u32 = 54
+const P_DIV: u32 = 55
+const P_DIVA: u32 = 56
+const P_OPTCHAIN: u32 = 57
+
+// ------------------------------------------------ The names, in fixed order
+//
+// `names_init` interns exactly this order, so the numbers below ARE the
+// identifiers of those names. The first `KW_COUNT` are the reserved words
+// of 12.7.2; everything after that is a contextual keyword or a name the
+// interpreter needs often enough to want it as a number.
+
+const K_AWAIT: u32 = 0
+const K_BREAK: u32 = 1
+const K_CASE: u32 = 2
+const K_CATCH: u32 = 3
+const K_CLASS: u32 = 4
+const K_CONST: u32 = 5
+const K_CONTINUE: u32 = 6
+const K_DEBUGGER: u32 = 7
+const K_DEFAULT: u32 = 8
+const K_DELETE: u32 = 9
+const K_DO: u32 = 10
+const K_ELSE: u32 = 11
+const K_ENUM: u32 = 12
+const K_EXPORT: u32 = 13
+const K_EXTENDS: u32 = 14
+const K_FALSE: u32 = 15
+const K_FINALLY: u32 = 16
+const K_FOR: u32 = 17
+const K_FUNCTION: u32 = 18
+const K_IF: u32 = 19
+const K_IMPORT: u32 = 20
+const K_IN: u32 = 21
+const K_INSTANCEOF: u32 = 22
+const K_NEW: u32 = 23
+const K_NULL: u32 = 24
+const K_RETURN: u32 = 25
+const K_SUPER: u32 = 26
+const K_SWITCH: u32 = 27
+const K_THIS: u32 = 28
+const K_THROW: u32 = 29
+const K_TRUE: u32 = 30
+const K_TRY: u32 = 31
+const K_TYPEOF: u32 = 32
+const K_VAR: u32 = 33
+const K_VOID: u32 = 34
+const K_WHILE: u32 = 35
+const K_WITH: u32 = 36
+const K_YIELD: u32 = 37
+const KW_COUNT: u32 = 38
+
+const N_LET: u32 = 38
+const N_STATIC: u32 = 39
+const N_IMPLEMENTS: u32 = 40
+const N_INTERFACE: u32 = 41
+const N_PACKAGE: u32 = 42
+const N_PRIVATE: u32 = 43
+const N_PROTECTED: u32 = 44
+const N_PUBLIC: u32 = 45
+const N_AS: u32 = 46
+const N_ASYNC: u32 = 47
+const N_FROM: u32 = 48
+const N_GET: u32 = 49
+const N_SET: u32 = 50
+const N_OF: u32 = 51
+const N_TARGET: u32 = 52
+const N_ARGUMENTS: u32 = 53
+const N_EVAL: u32 = 54
+const N_UNDEFINED: u32 = 55
+const N_NAN: u32 = 56
+const N_INFINITY: u32 = 57
+const N_CONSTRUCTOR: u32 = 58
+const N_PROTOTYPE: u32 = 59
+const N_DUNDER_PROTO: u32 = 60
+const N_LENGTH: u32 = 61
+const N_NAME: u32 = 62
+const N_VALUE: u32 = 63
+const N_WRITABLE: u32 = 64
+const N_ENUMERABLE: u32 = 65
+const N_CONFIGURABLE: u32 = 66
+const N_MESSAGE: u32 = 67
+const N_TOSTRING: u32 = 68
+const N_VALUEOF: u32 = 69
+const N_CALLEE: u32 = 70
+const N_RAW: u32 = 71
+const N_SIZE: u32 = 72
+const N_INDEX: u32 = 73
+const N_INPUT: u32 = 74
+const N_EMPTY: u32 = 75
+const N_ANONYMOUS: u32 = 76
+const N_STACK: u32 = 77
+const N_TOPRIMITIVE: u32 = 78
+const N_ITERATOR: u32 = 79
+const N_NEXT: u32 = 80
+const N_DONE: u32 = 81
+const N_DESCRIPTION: u32 = 82
+const N_GLOBALTHIS: u32 = 83
+const N_ARGS_COUNT: u32 = 84
+
+// The names above as ONE text, separated by a single space. `names_init`
+// splits it and interns the parts in exactly this order.
+const NAMES_TEXT_LEN: usize = 598
+
+// ------------------------------------------------------------- Token flags
+
+const F_ESCAPED: u32 = 1 // the identifier contained \u
+const F_LEGACY_OCT: u32 = 2 // 0123 -- forbidden in strict mode
+const F_LEGACY_DEC: u32 = 4 // 08, 09 -- forbidden in strict mode
+const F_TPL_HEAD: u32 = 8 // the template piece starts with `
+const F_TPL_TAIL: u32 = 16 // the template piece ends with `
+const F_BAD_ESCAPE: u32 = 32 // template: no cooked value (ES2018)
+const F_OCT_ESCAPE: u32 = 64 // string with \nnn or \8 \9
+const F_HAS_DOT_OR_EXP: u32 = 128 // the number is not a plain integer
+
+// ------------------------------------------------------------ Error codes
+
+const E_NONE: u32 = 0
+const E_UNTERMINATED_STRING: u32 = 1
+const E_UNTERMINATED_COMMENT: u32 = 2
+const E_UNTERMINATED_TEMPLATE: u32 = 3
+const E_UNTERMINATED_REGEXP: u32 = 4
+const E_BAD_ESCAPE: u32 = 5
+const E_BAD_NUMBER: u32 = 6
+const E_BAD_CHARACTER: u32 = 7
+const E_BIGINT: u32 = 8
+const E_BAD_FLAGS: u32 = 9
+const E_BAD_SEPARATOR: u32 = 10
+const E_IDENT_AFTER_NUMBER: u32 = 11
+
+const EOF_CP: u32 = 0xFFFFFFFF
+
+// =========================================================== The name table
+//
+// Open addressing over a power of two, the id stored as id+1 so that 0 can
+// mean "free". The text of all names lies in ONE pool of UTF-16 code units.
+
+struct Names {
+    pool: mem.CpBuf,
+    off: mem.CpBuf,
+    len: mem.CpBuf,
+    hash: mem.CpBuf,
+    buckets: mem.CpBuf,
+    mask: usize,
+    n: usize,
+}
+
+fn names_hash_range(pool: *mut mem.CpBuf, off: usize, len: usize) -> u32 {
+    // FNV-1a over the code units.
+    var h: u32 = 2166136261 as u32
+    var i: usize = 0
+    while i < len {
+        h = h ^ mem.cp_at(pool, off + i)
+        h = h *% 16777619 as u32 // ROUND 72: FNV-1a wraps on purpose, *% says so
+        i = i + 1
+    }
+    return h
+}
+
+fn names_init(nm: *mut Names) {
+    mem.cp_init(&(*nm).pool)
+    mem.cp_init(&(*nm).off)
+    mem.cp_init(&(*nm).len)
+    mem.cp_init(&(*nm).hash)
+    mem.cp_init(&(*nm).buckets)
+    (*nm).mask = 2047
+    (*nm).n = 0
+    var i: usize = 0
+    while i < 2048 {
+        mem.cp_push(&(*nm).buckets, 0 as u32)
+        i = i + 1
+    }
+    names_seed(nm)
+}
+
+fn names_free(nm: *mut Names) {
+    mem.cp_free(&(*nm).pool)
+    mem.cp_free(&(*nm).off)
+    mem.cp_free(&(*nm).len)
+    mem.cp_free(&(*nm).hash)
+    mem.cp_free(&(*nm).buckets)
+}
+
+fn names_count(nm: *mut Names) -> usize {
+    return (*nm).n
+}
+
+fn names_off(nm: *mut Names, id: u32) -> usize {
+    return mem.cp_at(&(*nm).off, id as usize) as usize
+}
+
+fn names_len(nm: *mut Names, id: u32) -> usize {
+    return mem.cp_at(&(*nm).len, id as usize) as usize
+}
+
+// The i-th code unit of the name `id`.
+fn names_at(nm: *mut Names, id: u32, i: usize) -> u32 {
+    return mem.cp_at(&(*nm).pool, names_off(nm, id) + i)
+}
+
+fn names_grow(nm: *mut Names) {
+    let newmask: usize = (*nm).mask * 2 + 1
+    var fresh: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&fresh)
+    var i: usize = 0
+    while i <= newmask {
+        mem.cp_push(&fresh, 0 as u32)
+        i = i + 1
+    }
+    var id: usize = 0
+    while id < (*nm).n {
+        let h: u32 = mem.cp_at(&(*nm).hash, id)
+        var slot: usize = (h as usize) & newmask
+        while mem.cp_at(&fresh, slot) != 0 as u32 {
+            slot = (slot + 1) & newmask
+        }
+        mem.cp_set(&fresh, slot, (id + 1) as u32)
+        id = id + 1
+    }
+    mem.cp_free(&(*nm).buckets)
+    (*nm).buckets = fresh
+    (*nm).mask = newmask
+}
+
+// Intern the code units src[from..to). The result is the name id.
+fn names_intern(nm: *mut Names, src: *mut mem.CpBuf, from: usize, to: usize) -> u32 {
+    let len: usize = to - from
+    var h: u32 = 2166136261 as u32
+    var i: usize = 0
+    while i < len {
+        h = h ^ mem.cp_at(src, from + i)
+        h = h *% 16777619 as u32 // ROUND 72: FNV-1a wraps on purpose, *% says so
+        i = i + 1
+    }
+    var slot: usize = (h as usize) & (*nm).mask
+    while true {
+        let e: u32 = mem.cp_at(&(*nm).buckets, slot)
+        if e == 0 as u32 {
+            break
+        }
+        let id: usize = (e as usize) - 1
+        if mem.cp_at(&(*nm).hash, id) == h && names_len(nm, id as u32) == len {
+            let o: usize = names_off(nm, id as u32)
+            var k: usize = 0
+            var same: bool = true
+            while k < len {
+                if mem.cp_at(&(*nm).pool, o + k) != mem.cp_at(src, from + k) {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                return id as u32
+            }
+        }
+        slot = (slot + 1) & (*nm).mask
+    }
+    let id: usize = (*nm).n
+    let off: usize = mem.cp_len(&(*nm).pool)
+    var k: usize = 0
+    while k < len {
+        mem.cp_push(&(*nm).pool, mem.cp_at(src, from + k))
+        k = k + 1
+    }
+    mem.cp_push(&(*nm).off, off as u32)
+    mem.cp_push(&(*nm).len, len as u32)
+    mem.cp_push(&(*nm).hash, h)
+    mem.cp_set(&(*nm).buckets, slot, (id + 1) as u32)
+    (*nm).n = id + 1
+    if (*nm).n * 4 > ((*nm).mask + 1) * 3 {
+        names_grow(nm)
+    }
+    return id as u32
+}
+
+// Intern `len` ASCII octets. Used for names that stand in the source text
+// of the engine itself.
+fn names_intern_ascii(nm: *mut Names, p: *mut u8, len: usize) -> u32 {
+    var tmp: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&tmp)
+    var i: usize = 0
+    while i < len {
+        mem.cp_push(&tmp, (*((p as usize + i) as *mut u8)) as u32)
+        i = i + 1
+    }
+    let id: u32 = names_intern(nm, &tmp, 0, len)
+    mem.cp_free(&tmp)
+    return id
+}
+
+fn names_equal_ascii(nm: *mut Names, id: u32, p: *mut u8, len: usize) -> bool {
+    if names_len(nm, id) != len {
+        return false
+    }
+    let o: usize = names_off(nm, id)
+    var i: usize = 0
+    while i < len {
+        if mem.cp_at(&(*nm).pool, o + i) != (*((p as usize + i) as *mut u8)) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The fixed order of the names. Every id above is a position in this list.
+fn names_seed(nm: *mut Names) {
+    var t: [u8; 598] = "await break case catch class const continue debugger default delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with yield let static implements interface package private protected public as async from get set of target arguments eval undefined NaN Infinity constructor prototype __proto__ length name value writable enumerable configurable message toString valueOf callee raw size index input empty anonymous stack Symbol.toPrimitive Symbol.iterator next done description globalThis __args__"
+    var i: usize = 0
+    while i < NAMES_TEXT_LEN {
+        var j: usize = i
+        while j < NAMES_TEXT_LEN && t[j] != 32 as u8 {
+            j = j + 1
+        }
+        let id: u32 = names_intern_ascii(nm, &t[i], j - i)
+        i = j + 1
+    }
+}
+
+// ================================================================ The lexer
+
+struct Lexer {
+    src: mem.CpBuf,
+    n: usize,
+    pos: usize,
+    line: u32,
+    // the current token
+    kind: u32,
+    code: u32,
+    start: usize,
+    end: usize,
+    tline: u32,
+    nl: bool,
+    name: u32,
+    numbits: u64,
+    soff: usize,
+    slen: usize,
+    roff: usize,
+    rlen: usize,
+    flags: u32,
+    err: u32,
+    errline: u32,
+    errpos: usize,
+    pool: mem.CpBuf,
+    // The generated Unicode table (generated/unicode_tables.fi, round 95).
+    // Stage 0 has no global variables, so the pointer lives here -- the way
+    // the two range buffers used to.
+    ucdtab: u64,
+    nm: *mut Names,
+    scratch: mem.Buf,
+}
+
+fn lex_init(l: *mut Lexer, nm: *mut Names) {
+    mem.cp_init(&(*l).src)
+    mem.cp_init(&(*l).pool)
+    mem.buf_init(&(*l).scratch)
+    (*l).ucdtab = ucd.ucd_map()
+    (*l).nm = nm
+    (*l).n = 0
+    (*l).pos = 0
+    (*l).line = 1
+    (*l).kind = T_EOF
+    (*l).code = 0
+    (*l).start = 0
+    (*l).end = 0
+    (*l).tline = 1
+    (*l).nl = false
+    (*l).name = 0
+    (*l).numbits = 0
+    (*l).soff = 0
+    (*l).slen = 0
+    (*l).roff = 0
+    (*l).rlen = 0
+    (*l).flags = 0
+    (*l).err = E_NONE
+    (*l).errline = 0
+    (*l).errpos = 0
+}
+
+fn lex_free(l: *mut Lexer) {
+    mem.cp_free(&(*l).src)
+    mem.cp_free(&(*l).pool)
+    ucd.ucd_free((*l).ucdtab)
+    (*l).ucdtab = 0
+    mem.buf_free(&(*l).scratch)
+}
+
+fn lex_source(l: *mut Lexer) -> *mut mem.CpBuf {
+    return &(*l).src
+}
+
+fn lex_pool_at(l: *mut Lexer, i: usize) -> u32 {
+    return mem.cp_at(&(*l).pool, i)
+}
+
+fn lex_pool_ptr(l: *mut Lexer) -> *mut mem.CpBuf {
+    return &(*l).pool
+}
+
+// A `Lexer` value for a `let` binding -- stage 0 has no constructors that
+// return an aggregate without naming every field (SPEC 14.1 S4).
+fn lex_new() -> Lexer {
+    return Lexer {
+        src: mem.cp_new(), n: 0, pos: 0, line: 1,
+        kind: T_EOF, code: 0, start: 0, end: 0, tline: 1, nl: false,
+        name: 0, numbits: 0, soff: 0, slen: 0, roff: 0, rlen: 0,
+        flags: 0, err: E_NONE, errline: 0, errpos: 0,
+        pool: mem.cp_new(), ucdtab: 0,
+        nm: 0 as *mut Names, scratch: mem.buf_new(),
+    }
+}
+
+// Put ASCII octets into the source buffer.
+fn lex_set_ascii(l: *mut Lexer, p: *mut u8, len: usize) {
+    mem.cp_clear(&(*l).src)
+    var i: usize = 0
+    while i < len {
+        mem.cp_push(&(*l).src, (*((p as usize + i) as *mut u8)) as u32)
+        i = i + 1
+    }
+    lex_reset(l)
+}
+
+// Decode UTF-8 octets into code points. Malformed sequences become
+// U+FFFD, so that a broken input can never make the lexer run off.
+fn lex_set_utf8(l: *mut Lexer, p: *mut u8, len: usize) {
+    mem.cp_clear(&(*l).src)
+    let base: usize = p as usize
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = (*((base + i) as *mut u8)) as u32
+        if c0 < 0x80 as u32 {
+            mem.cp_push(&(*l).src, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 && i + 3 < len {
+            mem.cp_push(&(*l).src, ((c0 & 0x07 as u32) << 18)
+                | (((*((base + i + 1) as *mut u8)) as u32 & 0x3F as u32) << 12)
+                | (((*((base + i + 2) as *mut u8)) as u32 & 0x3F as u32) << 6)
+                | ((*((base + i + 3) as *mut u8)) as u32 & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 && i + 2 < len {
+            mem.cp_push(&(*l).src, ((c0 & 0x0F as u32) << 12)
+                | (((*((base + i + 1) as *mut u8)) as u32 & 0x3F as u32) << 6)
+                | ((*((base + i + 2) as *mut u8)) as u32 & 0x3F as u32))
+            i = i + 3
+        } else if c0 >= 0xC0 as u32 && i + 1 < len {
+            mem.cp_push(&(*l).src, ((c0 & 0x1F as u32) << 6)
+                | ((*((base + i + 1) as *mut u8)) as u32 & 0x3F as u32))
+            i = i + 2
+        } else {
+            mem.cp_push(&(*l).src, 0xFFFD as u32)
+            i = i + 1
+        }
+    }
+    lex_reset(l)
+}
+
+// Start over on the source text that already lies in `l.src`.
+fn lex_reset(l: *mut Lexer) {
+    (*l).n = mem.cp_len(&(*l).src)
+    (*l).pos = 0
+    (*l).line = 1
+    (*l).err = E_NONE
+    (*l).nl = false
+    mem.cp_clear(&(*l).pool)
+}
+
+fn lex_save(l: *mut Lexer) -> usize {
+    return (*l).pos
+}
+
+fn lex_restore(l: *mut Lexer, pos: usize, line: u32) {
+    (*l).pos = pos
+    (*l).line = line
+}
+
+fn lex_at(l: *mut Lexer, i: usize) -> u32 {
+    if i >= (*l).n {
+        return EOF_CP
+    }
+    return mem.cp_at(&(*l).src, i)
+}
+
+fn lex_fail(l: *mut Lexer, code: u32, pos: usize) {
+    if (*l).err == E_NONE {
+        (*l).err = code
+        (*l).errline = (*l).line
+        (*l).errpos = pos
+    }
+    (*l).kind = T_ERROR
+}
+
+// ------------------------------------------------------ Character classes
+
+fn is_line_terminator(c: u32) -> bool {
+    return c == 10 as u32 || c == 13 as u32 || c == 0x2028 as u32 || c == 0x2029 as u32
+}
+
+fn is_space(l: *mut Lexer, c: u32) -> bool {
+    if c == 9 as u32 || c == 11 as u32 || c == 12 as u32 || c == 32 as u32 {
+        return true
+    }
+    if c == 0xFEFF as u32 {
+        return true
+    }
+    if c < 0x80 as u32 {
+        return false
+    }
+    // ECMA-262 12.2: <USP> is the general category Zs, and since round 95
+    // that comes out of the generated table instead of a hand written list.
+    return ucd.ucd_category((*l).ucdtab, c) == ucd.CAT_ZS
+}
+
+fn is_digit(c: u32) -> bool {
+    return c >= 48 as u32 && c <= 57 as u32
+}
+
+fn is_hex(c: u32) -> bool {
+    if is_digit(c) {
+        return true
+    }
+    if c >= 97 as u32 && c <= 102 as u32 {
+        return true
+    }
+    return c >= 65 as u32 && c <= 70 as u32
+}
+
+fn hex_value(c: u32) -> u32 {
+    if c <= 57 as u32 {
+        return c - 48 as u32
+    }
+    if c >= 97 as u32 {
+        return c - 87 as u32
+    }
+    return c - 55 as u32
+}
+
+fn lex_id_start(l: *mut Lexer, c: u32) -> bool {
+    if c >= 97 as u32 && c <= 122 as u32 {
+        return true
+    }
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return true
+    }
+    if c == 36 as u32 || c == 95 as u32 {
+        return true
+    }
+    if c < 0x80 as u32 {
+        return false
+    }
+    return ucd.ucd_is_id_start((*l).ucdtab, c)
+}
+
+fn lex_id_cont(l: *mut Lexer, c: u32) -> bool {
+    if c >= 97 as u32 && c <= 122 as u32 {
+        return true
+    }
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return true
+    }
+    if is_digit(c) {
+        return true
+    }
+    if c == 36 as u32 || c == 95 as u32 {
+        return true
+    }
+    if c < 0x80 as u32 {
+        return false
+    }
+    // ECMA-262 12.7.1 adds ZWNJ and ZWJ to ID_Continue; the Unicode
+    // property does not have them, and the table stays pure Unicode.
+    if c == 0x200C as u32 || c == 0x200D as u32 {
+        return true
+    }
+    return ucd.ucd_is_id_continue((*l).ucdtab, c)
+}
+
+// ------------------------------------------------- White space and comments
+
+// Returns true if a line terminator was passed.
+fn lex_skip_trivia(l: *mut Lexer) -> bool {
+    var saw_nl: bool = false
+    while true {
+        let c: u32 = lex_at(l, (*l).pos)
+        if c == EOF_CP {
+            return saw_nl
+        }
+        if is_line_terminator(c) {
+            saw_nl = true
+            if c == 13 as u32 && lex_at(l, (*l).pos + 1) == 10 as u32 {
+                (*l).pos = (*l).pos + 1
+            }
+            (*l).pos = (*l).pos + 1
+            (*l).line = (*l).line + 1 as u32
+        } else if is_space(l, c) {
+            (*l).pos = (*l).pos + 1
+        } else if c == 47 as u32 && lex_at(l, (*l).pos + 1) == 47 as u32 {
+            (*l).pos = (*l).pos + 2
+            while (*l).pos < (*l).n && !is_line_terminator(lex_at(l, (*l).pos)) {
+                (*l).pos = (*l).pos + 1
+            }
+        } else if c == 47 as u32 && lex_at(l, (*l).pos + 1) == 42 as u32 {
+            let open: usize = (*l).pos
+            (*l).pos = (*l).pos + 2
+            var closed: bool = false
+            while (*l).pos < (*l).n {
+                let d: u32 = lex_at(l, (*l).pos)
+                if d == 42 as u32 && lex_at(l, (*l).pos + 1) == 47 as u32 {
+                    (*l).pos = (*l).pos + 2
+                    closed = true
+                    break
+                }
+                if is_line_terminator(d) {
+                    saw_nl = true
+                    if d == 13 as u32 && lex_at(l, (*l).pos + 1) == 10 as u32 {
+                        (*l).pos = (*l).pos + 1
+                    }
+                    (*l).line = (*l).line + 1 as u32
+                }
+                (*l).pos = (*l).pos + 1
+            }
+            if !closed {
+                lex_fail(l, E_UNTERMINATED_COMMENT, open)
+                return saw_nl
+            }
+        } else {
+            return saw_nl
+        }
+    }
+    return saw_nl
+}
+
+// ------------------------------------------------------------- Identifiers
+
+// Reads a `\uXXXX` or `\u{...}` escape at `pos` (which points at the `\`).
+// Returns the code point, sets `*after` behind the escape.
+fn lex_unicode_escape(l: *mut Lexer, pos: usize, after: *mut usize) -> u32 {
+    *after = pos
+    if lex_at(l, pos + 1) != 117 as u32 {
+        return EOF_CP
+    }
+    if lex_at(l, pos + 2) == 123 as u32 {
+        var i: usize = pos + 3
+        var v: u32 = 0
+        var any: bool = false
+        while is_hex(lex_at(l, i)) {
+            v = v * 16 as u32 + hex_value(lex_at(l, i))
+            if v > 0x10FFFF as u32 {
+                return EOF_CP
+            }
+            any = true
+            i = i + 1
+        }
+        if !any || lex_at(l, i) != 125 as u32 {
+            return EOF_CP
+        }
+        *after = i + 1
+        return v
+    }
+    var v: u32 = 0
+    var k: usize = 0
+    while k < 4 {
+        let c: u32 = lex_at(l, pos + 2 + k)
+        if !is_hex(c) {
+            return EOF_CP
+        }
+        v = v * 16 as u32 + hex_value(c)
+        k = k + 1
+    }
+    *after = pos + 6
+    return v
+}
+
+// Appends a code point to the pool as UTF-16 code units.
+fn pool_push_cp(l: *mut Lexer, c: u32) {
+    if c >= 0x10000 as u32 {
+        let v: u32 = c - 0x10000 as u32
+        mem.cp_push(&(*l).pool, 0xD800 as u32 + (v >> 10))
+        mem.cp_push(&(*l).pool, 0xDC00 as u32 + (v & 0x3FF as u32))
+    } else {
+        mem.cp_push(&(*l).pool, c)
+    }
+}
+
+fn lex_ident(l: *mut Lexer) {
+    let begin: usize = (*l).pos
+    let unit0: usize = mem.cp_len(&(*l).pool)
+    var escaped: bool = false
+    var first: bool = true
+    while (*l).pos < (*l).n {
+        let c: u32 = lex_at(l, (*l).pos)
+        if c == 92 as u32 {
+            var after: usize = 0
+            let cp: u32 = lex_unicode_escape(l, (*l).pos, &after)
+            if cp == EOF_CP {
+                lex_fail(l, E_BAD_ESCAPE, (*l).pos)
+                return
+            }
+            var okc: bool = false
+            if first {
+                okc = lex_id_start(l, cp)
+            } else {
+                okc = lex_id_cont(l, cp)
+            }
+            if !okc {
+                lex_fail(l, E_BAD_ESCAPE, (*l).pos)
+                return
+            }
+            pool_push_cp(l, cp)
+            escaped = true
+            (*l).pos = after
+        } else {
+            var okc: bool = false
+            if first {
+                okc = lex_id_start(l, c)
+            } else {
+                okc = lex_id_cont(l, c)
+            }
+            if !okc {
+                break
+            }
+            pool_push_cp(l, c)
+            (*l).pos = (*l).pos + 1
+        }
+        first = false
+    }
+    let unit1: usize = mem.cp_len(&(*l).pool)
+    let id: u32 = names_intern((*l).nm, &(*l).pool, unit0, unit1)
+    // The pool copy is only the raw material for interning.
+    mem.cp_truncate(&(*l).pool, unit0)
+    (*l).name = id
+    (*l).start = begin
+    (*l).end = (*l).pos
+    if escaped {
+        (*l).flags = (*l).flags | F_ESCAPED
+    }
+    if id < KW_COUNT {
+        (*l).kind = T_KEYWORD
+        (*l).code = id
+    } else {
+        (*l).kind = T_IDENT
+        (*l).code = id
+    }
+}
+
+// ------------------------------------------------------------------ Numbers
+
+// Value of a literal in a power-of-two radix, BIT EXACT. `bits` is the
+// number of bits a digit carries (1, 3 or 4). Repeated `v = v * radix + d`
+// in floating point would round twice; here the mantissa is collected as an
+// integer, everything below is folded into a sticky bit, and rounding
+// happens exactly once, to nearest, ties to even.
+fn radix_value(l: *mut Lexer, from: usize, to: usize, bits: u32) -> u64 {
+    var m: u64 = 0
+    var shift: i64 = 0
+    var sticky: bool = false
+    var started: bool = false
+    var i: usize = from
+    let limit: u64 = 1 << (63 - bits as u64)
+    while i < to {
+        let c: u32 = lex_at(l, i)
+        i = i + 1
+        if c == 95 as u32 {
+            continue
+        }
+        let d: u64 = hex_value(c) as u64
+        if !started && d == 0 {
+            continue
+        }
+        started = true
+        if m < limit {
+            m = (m << (bits as u64)) | d
+        } else {
+            shift = shift + bits as i64
+            if d != 0 {
+                sticky = true
+            }
+        }
+    }
+    if !started {
+        return 0
+    }
+    // Normalize the mantissa to at most 53 bits.
+    var len: i64 = 0
+    var t: u64 = m
+    while t != 0 {
+        t = t >> 1
+        len = len + 1
+    }
+    if len > 53 {
+        let drop: u64 = (len - 53) as u64
+        let lost: u64 = m & ((1 << drop) - 1)
+        let half: u64 = 1 << (drop - 1)
+        var q: u64 = m >> drop
+        if lost > half || (lost == half && (sticky || (q & 1) == 1)) {
+            q = q + 1
+        }
+        if lost != 0 {
+            sticky = true
+        }
+        m = q
+        shift = shift + (drop as i64)
+    }
+    let base: f64 = m as f64
+    return math.math_bits(math.ldexp(base, shift))
+}
+
+fn lex_number(l: *mut Lexer) {
+    let begin: usize = (*l).pos
+    (*l).kind = T_NUM
+    (*l).start = begin
+    var c0: u32 = lex_at(l, (*l).pos)
+    if c0 == 48 as u32 {
+        let c1: u32 = lex_at(l, (*l).pos + 1)
+        if c1 == 120 as u32 || c1 == 88 as u32 {
+            (*l).pos = (*l).pos + 2
+            let ds: usize = (*l).pos
+            if !lex_radix_digits(l, 16) {
+                return
+            }
+            (*l).numbits = radix_value(l, ds, (*l).pos, 4)
+            lex_number_end(l, begin)
+            return
+        }
+        if c1 == 111 as u32 || c1 == 79 as u32 {
+            (*l).pos = (*l).pos + 2
+            let ds: usize = (*l).pos
+            if !lex_radix_digits(l, 8) {
+                return
+            }
+            (*l).numbits = radix_value(l, ds, (*l).pos, 3)
+            lex_number_end(l, begin)
+            return
+        }
+        if c1 == 98 as u32 || c1 == 66 as u32 {
+            (*l).pos = (*l).pos + 2
+            let ds: usize = (*l).pos
+            if !lex_radix_digits(l, 2) {
+                return
+            }
+            (*l).numbits = radix_value(l, ds, (*l).pos, 1)
+            lex_number_end(l, begin)
+            return
+        }
+        // LegacyOctalIntegerLiteral / NonOctalDecimalIntegerLiteral
+        if is_digit(c1) {
+            var all_octal: bool = true
+            var i: usize = (*l).pos + 1
+            while is_digit(lex_at(l, i)) {
+                if lex_at(l, i) > 55 as u32 {
+                    all_octal = false
+                }
+                i = i + 1
+            }
+            if all_octal && lex_at(l, i) != 46 as u32 && lex_at(l, i) != 101 as u32 && lex_at(l, i) != 69 as u32 {
+                let ds: usize = (*l).pos + 1
+                (*l).pos = i
+                (*l).numbits = radix_value(l, ds, i, 3)
+                (*l).flags = (*l).flags | F_LEGACY_OCT
+                lex_number_end(l, begin)
+                return
+            }
+            (*l).flags = (*l).flags | F_LEGACY_DEC
+        }
+    }
+    // Decimal. Collect the octets for strtod, without the separators.
+    mem.buf_clear(&(*l).scratch)
+    var seen_dot: bool = false
+    var seen_exp: bool = false
+    var last_sep: bool = false
+    var any_digit: bool = false
+    while (*l).pos < (*l).n {
+        let c: u32 = lex_at(l, (*l).pos)
+        if is_digit(c) {
+            mem.buf_push(&(*l).scratch, c as u8)
+            any_digit = true
+            last_sep = false
+            (*l).pos = (*l).pos + 1
+        } else if c == 95 as u32 {
+            if !any_digit || last_sep || (*l).flags & F_LEGACY_OCT != 0 as u32 {
+                lex_fail(l, E_BAD_SEPARATOR, (*l).pos)
+                return
+            }
+            last_sep = true
+            (*l).pos = (*l).pos + 1
+        } else if c == 46 as u32 && !seen_dot && !seen_exp {
+            if last_sep {
+                lex_fail(l, E_BAD_SEPARATOR, (*l).pos)
+                return
+            }
+            seen_dot = true
+            (*l).flags = (*l).flags | F_HAS_DOT_OR_EXP
+            mem.buf_push(&(*l).scratch, 46 as u8)
+            (*l).pos = (*l).pos + 1
+        } else if (c == 101 as u32 || c == 69 as u32) && !seen_exp && any_digit {
+            let d: u32 = lex_at(l, (*l).pos + 1)
+            var k: usize = (*l).pos + 1
+            if d == 43 as u32 || d == 45 as u32 {
+                k = k + 1
+            }
+            if !is_digit(lex_at(l, k)) {
+                break
+            }
+            if last_sep {
+                lex_fail(l, E_BAD_SEPARATOR, (*l).pos)
+                return
+            }
+            seen_exp = true
+            (*l).flags = (*l).flags | F_HAS_DOT_OR_EXP
+            mem.buf_push(&(*l).scratch, 101 as u8)
+            if d == 43 as u32 || d == 45 as u32 {
+                mem.buf_push(&(*l).scratch, d as u8)
+            }
+            (*l).pos = k
+        } else {
+            break
+        }
+    }
+    if last_sep {
+        lex_fail(l, E_BAD_SEPARATOR, (*l).pos - 1)
+        return
+    }
+    if !any_digit && !seen_dot {
+        lex_fail(l, E_BAD_NUMBER, begin)
+        return
+    }
+    if mem.buf_len(&(*l).scratch) == 0 {
+        lex_fail(l, E_BAD_NUMBER, begin)
+        return
+    }
+    var bits: u64 = 0
+    let used: usize = num.read_f64_bits(mem.buf_ptr(&(*l).scratch),
+        mem.buf_len(&(*l).scratch), &bits)
+    if used != mem.buf_len(&(*l).scratch) {
+        lex_fail(l, E_BAD_NUMBER, begin)
+        return
+    }
+    (*l).numbits = bits
+    lex_number_end(l, begin)
+}
+
+// Digits of a power-of-two radix with separators. Returns false on an error.
+fn lex_radix_digits(l: *mut Lexer, radix: u32) -> bool {
+    var any: bool = false
+    var last_sep: bool = false
+    while (*l).pos < (*l).n {
+        let c: u32 = lex_at(l, (*l).pos)
+        if c == 95 as u32 {
+            if !any || last_sep {
+                lex_fail(l, E_BAD_SEPARATOR, (*l).pos)
+                return false
+            }
+            last_sep = true
+            (*l).pos = (*l).pos + 1
+            continue
+        }
+        var ok: bool = false
+        if radix == 16 as u32 {
+            ok = is_hex(c)
+        } else if radix == 8 as u32 {
+            ok = c >= 48 as u32 && c <= 55 as u32
+        } else {
+            ok = c == 48 as u32 || c == 49 as u32
+        }
+        if !ok {
+            break
+        }
+        any = true
+        last_sep = false
+        (*l).pos = (*l).pos + 1
+    }
+    if !any || last_sep {
+        lex_fail(l, E_BAD_NUMBER, (*l).pos)
+        return false
+    }
+    return true
+}
+
+// 12.9.3: a numeric literal must not be followed directly by an identifier
+// start or a decimal digit. A trailing `n` makes the literal a BigInt
+// (round 66): the DIGITS go into the pool -- the value itself is built at
+// run time, because it does not fit into a double.
+fn lex_number_end(l: *mut Lexer, begin: usize) {
+    let c: u32 = lex_at(l, (*l).pos)
+    if c == 110 as u32 {
+        lex_bigint_end(l, begin)
+        return
+    }
+    if is_digit(c) || lex_id_start(l, c) || c == 92 as u32 {
+        lex_fail(l, E_IDENT_AFTER_NUMBER, (*l).pos)
+        return
+    }
+    (*l).start = begin
+    (*l).end = (*l).pos
+}
+
+// The `n` suffix of a BigInt (12.9.3). A fraction, an exponent and both
+// legacy forms are forbidden in front of it; `0n` is allowed, `00n` and
+// `01n` are not. The digits (without the separators, with the radix prefix)
+// are copied into the pool, so that the parser can hand them on unchanged.
+fn lex_bigint_end(l: *mut Lexer, begin: usize) {
+    if (*l).flags & (F_HAS_DOT_OR_EXP | F_LEGACY_OCT | F_LEGACY_DEC) != 0 as u32 {
+        lex_fail(l, E_BAD_NUMBER, (*l).pos)
+        return
+    }
+    let stop: usize = (*l).pos
+    if stop - begin > 1 && lex_at(l, begin) == 48 as u32 {
+        let c1: u32 = lex_at(l, begin + 1)
+        if c1 != 120 as u32 && c1 != 88 as u32 && c1 != 111 as u32 && c1 != 79 as u32 && c1 != 98 as u32 && c1 != 66 as u32 {
+            lex_fail(l, E_BAD_NUMBER, (*l).pos)
+            return
+        }
+    }
+    let off: usize = mem.cp_len(&(*l).pool)
+    var i: usize = begin
+    while i < stop {
+        let u: u32 = lex_at(l, i)
+        if u != 95 as u32 {
+            mem.cp_push(&(*l).pool, u)
+        }
+        i = i + 1
+    }
+    (*l).soff = off
+    (*l).slen = mem.cp_len(&(*l).pool) - off
+    (*l).pos = (*l).pos + 1
+    let after: u32 = lex_at(l, (*l).pos)
+    if is_digit(after) || lex_id_start(l, after) || after == 92 as u32 {
+        lex_fail(l, E_IDENT_AFTER_NUMBER, (*l).pos)
+        return
+    }
+    (*l).kind = T_BIGINT
+    (*l).start = begin
+    (*l).end = (*l).pos
+}
+
+// -------------------------------------------------------- String literals
+
+fn lex_string(l: *mut Lexer, quote: u32) {
+    let begin: usize = (*l).pos
+    (*l).pos = (*l).pos + 1
+    let off: usize = mem.cp_len(&(*l).pool)
+    while true {
+        if (*l).pos >= (*l).n {
+            lex_fail(l, E_UNTERMINATED_STRING, begin)
+            return
+        }
+        let c: u32 = lex_at(l, (*l).pos)
+        if c == quote {
+            (*l).pos = (*l).pos + 1
+            break
+        }
+        if c == 10 as u32 || c == 13 as u32 {
+            lex_fail(l, E_UNTERMINATED_STRING, begin)
+            return
+        }
+        if c == 92 as u32 {
+            if !lex_escape(l, false) {
+                return
+            }
+        } else {
+            mem.cp_push(&(*l).pool, c)
+            (*l).pos = (*l).pos + 1
+        }
+    }
+    (*l).kind = T_STRING
+    (*l).start = begin
+    (*l).end = (*l).pos
+    (*l).soff = off
+    (*l).slen = mem.cp_len(&(*l).pool) - off
+}
+
+// Handles one escape sequence at `l.pos` (which points at the backslash)
+// and appends the result to the pool. In a template an invalid escape is
+// not an error but sets F_BAD_ESCAPE (ES2018) -- `in_template` says so.
+fn lex_escape(l: *mut Lexer, in_template: bool) -> bool {
+    let bs: usize = (*l).pos
+    (*l).pos = (*l).pos + 1
+    let c: u32 = lex_at(l, (*l).pos)
+    if c == EOF_CP {
+        lex_fail(l, E_UNTERMINATED_STRING, bs)
+        return false
+    }
+    if is_line_terminator(c) {
+        // LineContinuation -- contributes nothing to the value.
+        if c == 13 as u32 && lex_at(l, (*l).pos + 1) == 10 as u32 {
+            (*l).pos = (*l).pos + 1
+        }
+        (*l).pos = (*l).pos + 1
+        (*l).line = (*l).line + 1 as u32
+        return true
+    }
+    (*l).pos = (*l).pos + 1
+    if c == 110 as u32 {
+        mem.cp_push(&(*l).pool, 10 as u32)
+        return true
+    }
+    if c == 116 as u32 {
+        mem.cp_push(&(*l).pool, 9 as u32)
+        return true
+    }
+    if c == 114 as u32 {
+        mem.cp_push(&(*l).pool, 13 as u32)
+        return true
+    }
+    if c == 98 as u32 {
+        mem.cp_push(&(*l).pool, 8 as u32)
+        return true
+    }
+    if c == 102 as u32 {
+        mem.cp_push(&(*l).pool, 12 as u32)
+        return true
+    }
+    if c == 118 as u32 {
+        mem.cp_push(&(*l).pool, 11 as u32)
+        return true
+    }
+    if c == 48 as u32 && !is_digit(lex_at(l, (*l).pos)) {
+        mem.cp_push(&(*l).pool, 0 as u32)
+        return true
+    }
+    if c == 120 as u32 {
+        let h1: u32 = lex_at(l, (*l).pos)
+        let h2: u32 = lex_at(l, (*l).pos + 1)
+        if !is_hex(h1) || !is_hex(h2) {
+            if in_template {
+                (*l).flags = (*l).flags | F_BAD_ESCAPE
+                return true
+            }
+            lex_fail(l, E_BAD_ESCAPE, bs)
+            return false
+        }
+        mem.cp_push(&(*l).pool, hex_value(h1) * 16 as u32 + hex_value(h2))
+        (*l).pos = (*l).pos + 2
+        return true
+    }
+    if c == 117 as u32 {
+        var after: usize = 0
+        let cp: u32 = lex_unicode_escape(l, bs, &after)
+        if cp == EOF_CP {
+            if in_template {
+                (*l).flags = (*l).flags | F_BAD_ESCAPE
+                return true
+            }
+            lex_fail(l, E_BAD_ESCAPE, bs)
+            return false
+        }
+        pool_push_cp(l, cp)
+        (*l).pos = after
+        return true
+    }
+    if c >= 48 as u32 && c <= 55 as u32 {
+        // LegacyOctalEscapeSequence -- a syntax error in strict mode and in
+        // templates, so it is only marked here.
+        if in_template {
+            (*l).flags = (*l).flags | F_BAD_ESCAPE
+            return true
+        }
+        var v: u32 = c - 48 as u32
+        var count: u32 = 1
+        var maxd: u32 = 3
+        if c > 51 as u32 {
+            maxd = 2
+        }
+        while count < maxd {
+            let d: u32 = lex_at(l, (*l).pos)
+            if d < 48 as u32 || d > 55 as u32 {
+                break
+            }
+            v = v * 8 as u32 + (d - 48 as u32)
+            (*l).pos = (*l).pos + 1
+            count = count + 1 as u32
+        }
+        mem.cp_push(&(*l).pool, v)
+        (*l).flags = (*l).flags | F_OCT_ESCAPE
+        return true
+    }
+    if c == 56 as u32 || c == 57 as u32 {
+        // NonOctalDecimalEscapeSequence \8 \9
+        if in_template {
+            (*l).flags = (*l).flags | F_BAD_ESCAPE
+            return true
+        }
+        mem.cp_push(&(*l).pool, c)
+        (*l).flags = (*l).flags | F_OCT_ESCAPE
+        return true
+    }
+    // Any other character stands for itself.
+    pool_push_cp(l, c)
+    return true
+}
+
+// ------------------------------------------------------------- Templates
+
+// Scans a template piece starting at `l.pos`, which points either at the
+// backtick (head) or at the closing brace of a substitution (middle/tail).
+fn lex_template_piece(l: *mut Lexer, head: bool) {
+    let begin: usize = (*l).pos
+    (*l).pos = (*l).pos + 1
+    let coff: usize = mem.cp_len(&(*l).pool)
+    (*l).flags = (*l).flags & (0xFFFFFFFF as u32 - F_BAD_ESCAPE)
+    var tail: bool = false
+    // The cooked value comes first, the raw text after it -- both in the
+    // same pool, one behind the other.
+    let raw_from: usize = (*l).pos
+    var raw_to: usize = (*l).pos
+    while true {
+        if (*l).pos >= (*l).n {
+            lex_fail(l, E_UNTERMINATED_TEMPLATE, begin)
+            return
+        }
+        let c: u32 = lex_at(l, (*l).pos)
+        if c == 96 as u32 {
+            raw_to = (*l).pos
+            (*l).pos = (*l).pos + 1
+            tail = true
+            break
+        }
+        if c == 36 as u32 && lex_at(l, (*l).pos + 1) == 123 as u32 {
+            raw_to = (*l).pos
+            (*l).pos = (*l).pos + 2
+            tail = false
+            break
+        }
+        if c == 92 as u32 {
+            if !lex_escape(l, true) {
+                return
+            }
+        } else if c == 13 as u32 {
+            // Normalization (12.9.6): CR and CRLF become LF, in the cooked
+            // value AND in the raw text.
+            mem.cp_push(&(*l).pool, 10 as u32)
+            if lex_at(l, (*l).pos + 1) == 10 as u32 {
+                (*l).pos = (*l).pos + 1
+            }
+            (*l).pos = (*l).pos + 1
+            (*l).line = (*l).line + 1 as u32
+        } else {
+            if is_line_terminator(c) {
+                (*l).line = (*l).line + 1 as u32
+            }
+            mem.cp_push(&(*l).pool, c)
+            (*l).pos = (*l).pos + 1
+        }
+    }
+    let clen: usize = mem.cp_len(&(*l).pool) - coff
+    let roff: usize = mem.cp_len(&(*l).pool)
+    var i: usize = raw_from
+    while i < raw_to {
+        let c: u32 = lex_at(l, i)
+        if c == 13 as u32 {
+            mem.cp_push(&(*l).pool, 10 as u32)
+            if i + 1 < raw_to && lex_at(l, i + 1) == 10 as u32 {
+                i = i + 1
+            }
+        } else {
+            mem.cp_push(&(*l).pool, c)
+        }
+        i = i + 1
+    }
+    (*l).kind = T_TEMPLATE
+    (*l).start = begin
+    (*l).end = (*l).pos
+    (*l).soff = coff
+    (*l).slen = clen
+    (*l).roff = roff
+    (*l).rlen = mem.cp_len(&(*l).pool) - roff
+    if head {
+        (*l).flags = (*l).flags | F_TPL_HEAD
+    }
+    if tail {
+        (*l).flags = (*l).flags | F_TPL_TAIL
+    }
+}
+
+// The parser calls this instead of `lex_next` when a `}` has to close a
+// template substitution. `at` is the position of that brace.
+fn lex_template_continue(l: *mut Lexer, at: usize) {
+    (*l).pos = at
+    (*l).flags = 0
+    (*l).nl = false
+    (*l).tline = (*l).line
+    lex_template_piece(l, false)
+}
+
+// -------------------------------------------------- Regular expressions
+
+fn lex_regexp(l: *mut Lexer) {
+    let begin: usize = (*l).pos
+    (*l).pos = (*l).pos + 1
+    var in_class: bool = false
+    let body_from: usize = (*l).pos
+    while true {
+        if (*l).pos >= (*l).n {
+            lex_fail(l, E_UNTERMINATED_REGEXP, begin)
+            return
+        }
+        let c: u32 = lex_at(l, (*l).pos)
+        if is_line_terminator(c) {
+            lex_fail(l, E_UNTERMINATED_REGEXP, begin)
+            return
+        }
+        if c == 92 as u32 {
+            if is_line_terminator(lex_at(l, (*l).pos + 1)) || (*l).pos + 1 >= (*l).n {
+                lex_fail(l, E_UNTERMINATED_REGEXP, begin)
+                return
+            }
+            (*l).pos = (*l).pos + 2
+            continue
+        }
+        if c == 91 as u32 {
+            in_class = true
+        } else if c == 93 as u32 {
+            in_class = false
+        } else if c == 47 as u32 && !in_class {
+            break
+        }
+        (*l).pos = (*l).pos + 1
+    }
+    let body_to: usize = (*l).pos
+    (*l).pos = (*l).pos + 1
+    let flags_from: usize = (*l).pos
+    var seen: u32 = 0
+    while (*l).pos < (*l).n {
+        let c: u32 = lex_at(l, (*l).pos)
+        if c == 92 as u32 || !lex_id_cont(l, c) {
+            break
+        }
+        var bit: u32 = 0
+        if c == 100 as u32 {
+            bit = 1
+        } else if c == 103 as u32 {
+            bit = 2
+        } else if c == 105 as u32 {
+            bit = 4
+        } else if c == 109 as u32 {
+            bit = 8
+        } else if c == 115 as u32 {
+            bit = 16
+        } else if c == 117 as u32 {
+            bit = 32
+        } else if c == 118 as u32 {
+            bit = 64
+        } else if c == 121 as u32 {
+            bit = 128
+        } else {
+            lex_fail(l, E_BAD_FLAGS, (*l).pos)
+            return
+        }
+        if seen & bit != 0 as u32 {
+            lex_fail(l, E_BAD_FLAGS, (*l).pos)
+            return
+        }
+        seen = seen | bit
+        (*l).pos = (*l).pos + 1
+    }
+    if seen & 32 as u32 != 0 as u32 && seen & 64 as u32 != 0 as u32 {
+        lex_fail(l, E_BAD_FLAGS, flags_from)
+        return
+    }
+    // The body goes into the pool as the source, the flags after it.
+    let soff: usize = mem.cp_len(&(*l).pool)
+    var i: usize = body_from
+    while i < body_to {
+        mem.cp_push(&(*l).pool, lex_at(l, i))
+        i = i + 1
+    }
+    let roff: usize = mem.cp_len(&(*l).pool)
+    var k: usize = flags_from
+    while k < (*l).pos {
+        mem.cp_push(&(*l).pool, lex_at(l, k))
+        k = k + 1
+    }
+    (*l).kind = T_REGEXP
+    (*l).start = begin
+    (*l).end = (*l).pos
+    (*l).soff = soff
+    (*l).slen = body_to - body_from
+    (*l).roff = roff
+    (*l).rlen = (*l).pos - flags_from
+}
+
+// The parser calls this when it has already read a `/` or `/=` as a
+// punctuator and now knows that a regular expression belongs there.
+fn lex_regexp_from(l: *mut Lexer, at: usize, line: u32) {
+    (*l).pos = at
+    (*l).line = line
+    (*l).flags = 0
+    (*l).tline = line
+    lex_regexp(l)
+}
+
+// --------------------------------------------------------- The main entry
+
+fn lex_next(l: *mut Lexer, goal: u32) {
+    (*l).flags = 0
+    let saw_nl: bool = lex_skip_trivia(l)
+    (*l).nl = saw_nl
+    (*l).tline = (*l).line
+    (*l).start = (*l).pos
+    (*l).end = (*l).pos
+    if (*l).err != E_NONE {
+        (*l).kind = T_ERROR
+        return
+    }
+    if (*l).pos >= (*l).n {
+        (*l).kind = T_EOF
+        (*l).code = 0
+        return
+    }
+    let c: u32 = lex_at(l, (*l).pos)
+
+    if c == 34 as u32 || c == 39 as u32 {
+        lex_string(l, c)
+        return
+    }
+    if c == 96 as u32 {
+        lex_template_piece(l, true)
+        return
+    }
+    if is_digit(c) {
+        lex_number(l)
+        return
+    }
+    if c == 46 as u32 && is_digit(lex_at(l, (*l).pos + 1)) {
+        lex_number(l)
+        return
+    }
+    if c == 35 as u32 {
+        // A private name `#x`.
+        let begin: usize = (*l).pos
+        (*l).pos = (*l).pos + 1
+        if !lex_id_start(l, lex_at(l, (*l).pos)) && lex_at(l, (*l).pos) != 92 as u32 {
+            lex_fail(l, E_BAD_CHARACTER, begin)
+            return
+        }
+        lex_ident(l)
+        if (*l).kind == T_ERROR {
+            return
+        }
+        (*l).kind = T_PRIVATE
+        (*l).start = begin
+        return
+    }
+    if lex_id_start(l, c) || c == 92 as u32 {
+        lex_ident(l)
+        return
+    }
+    if c == 47 as u32 {
+        if goal == GOAL_REGEXP {
+            lex_regexp(l)
+            return
+        }
+        if lex_at(l, (*l).pos + 1) == 61 as u32 {
+            lex_punct(l, P_DIVA, 2)
+            return
+        }
+        lex_punct(l, P_DIV, 1)
+        return
+    }
+    lex_operator(l, c)
+}
+
+fn lex_punct(l: *mut Lexer, code: u32, len: usize) {
+    (*l).kind = T_PUNCT
+    (*l).code = code
+    (*l).start = (*l).pos
+    (*l).pos = (*l).pos + len
+    (*l).end = (*l).pos
+}
+
+fn lex_operator(l: *mut Lexer, c: u32) {
+    let c1: u32 = lex_at(l, (*l).pos + 1)
+    let c2: u32 = lex_at(l, (*l).pos + 2)
+    let c3: u32 = lex_at(l, (*l).pos + 3)
+    if c == 123 as u32 {
+        lex_punct(l, P_LBRACE, 1)
+        return
+    }
+    if c == 125 as u32 {
+        lex_punct(l, P_RBRACE, 1)
+        return
+    }
+    if c == 40 as u32 {
+        lex_punct(l, P_LPAREN, 1)
+        return
+    }
+    if c == 41 as u32 {
+        lex_punct(l, P_RPAREN, 1)
+        return
+    }
+    if c == 91 as u32 {
+        lex_punct(l, P_LBRACK, 1)
+        return
+    }
+    if c == 93 as u32 {
+        lex_punct(l, P_RBRACK, 1)
+        return
+    }
+    if c == 59 as u32 {
+        lex_punct(l, P_SEMI, 1)
+        return
+    }
+    if c == 44 as u32 {
+        lex_punct(l, P_COMMA, 1)
+        return
+    }
+    if c == 126 as u32 {
+        lex_punct(l, P_TILDE, 1)
+        return
+    }
+    if c == 58 as u32 {
+        lex_punct(l, P_COLON, 1)
+        return
+    }
+    if c == 46 as u32 {
+        if c1 == 46 as u32 && c2 == 46 as u32 {
+            lex_punct(l, P_ELLIPSIS, 3)
+            return
+        }
+        lex_punct(l, P_DOT, 1)
+        return
+    }
+    if c == 63 as u32 {
+        if c1 == 46 as u32 && !is_digit(c2) {
+            lex_punct(l, P_OPTCHAIN, 2)
+            return
+        }
+        if c1 == 63 as u32 {
+            if c2 == 61 as u32 {
+                lex_punct(l, P_COALESCEA, 3)
+                return
+            }
+            lex_punct(l, P_COALESCE, 2)
+            return
+        }
+        lex_punct(l, P_QUESTION, 1)
+        return
+    }
+    if c == 60 as u32 {
+        if c1 == 60 as u32 {
+            if c2 == 61 as u32 {
+                lex_punct(l, P_SHLA, 3)
+                return
+            }
+            lex_punct(l, P_SHL, 2)
+            return
+        }
+        if c1 == 61 as u32 {
+            lex_punct(l, P_LE, 2)
+            return
+        }
+        lex_punct(l, P_LT, 1)
+        return
+    }
+    if c == 62 as u32 {
+        if c1 == 62 as u32 {
+            if c2 == 62 as u32 {
+                if c3 == 61 as u32 {
+                    lex_punct(l, P_USHRA, 4)
+                    return
+                }
+                lex_punct(l, P_USHR, 3)
+                return
+            }
+            if c2 == 61 as u32 {
+                lex_punct(l, P_SHRA, 3)
+                return
+            }
+            lex_punct(l, P_SHR, 2)
+            return
+        }
+        if c1 == 61 as u32 {
+            lex_punct(l, P_GE, 2)
+            return
+        }
+        lex_punct(l, P_GT, 1)
+        return
+    }
+    if c == 61 as u32 {
+        if c1 == 61 as u32 {
+            if c2 == 61 as u32 {
+                lex_punct(l, P_SEQ, 3)
+                return
+            }
+            lex_punct(l, P_EQ, 2)
+            return
+        }
+        if c1 == 62 as u32 {
+            lex_punct(l, P_ARROW, 2)
+            return
+        }
+        lex_punct(l, P_ASSIGN, 1)
+        return
+    }
+    if c == 33 as u32 {
+        if c1 == 61 as u32 {
+            if c2 == 61 as u32 {
+                lex_punct(l, P_SNE, 3)
+                return
+            }
+            lex_punct(l, P_NE, 2)
+            return
+        }
+        lex_punct(l, P_NOT, 1)
+        return
+    }
+    if c == 43 as u32 {
+        if c1 == 43 as u32 {
+            lex_punct(l, P_INC, 2)
+            return
+        }
+        if c1 == 61 as u32 {
+            lex_punct(l, P_ADDA, 2)
+            return
+        }
+        lex_punct(l, P_ADD, 1)
+        return
+    }
+    if c == 45 as u32 {
+        if c1 == 45 as u32 {
+            lex_punct(l, P_DEC, 2)
+            return
+        }
+        if c1 == 61 as u32 {
+            lex_punct(l, P_SUBA, 2)
+            return
+        }
+        lex_punct(l, P_SUB, 1)
+        return
+    }
+    if c == 42 as u32 {
+        if c1 == 42 as u32 {
+            if c2 == 61 as u32 {
+                lex_punct(l, P_POWA, 3)
+                return
+            }
+            lex_punct(l, P_POW, 2)
+            return
+        }
+        if c1 == 61 as u32 {
+            lex_punct(l, P_MULA, 2)
+            return
+        }
+        lex_punct(l, P_MUL, 1)
+        return
+    }
+    if c == 37 as u32 {
+        if c1 == 61 as u32 {
+            lex_punct(l, P_MODA, 2)
+            return
+        }
+        lex_punct(l, P_MOD, 1)
+        return
+    }
+    if c == 38 as u32 {
+        if c1 == 38 as u32 {
+            if c2 == 61 as u32 {
+                lex_punct(l, P_ANDANDA, 3)
+                return
+            }
+            lex_punct(l, P_ANDAND, 2)
+            return
+        }
+        if c1 == 61 as u32 {
+            lex_punct(l, P_ANDA, 2)
+            return
+        }
+        lex_punct(l, P_AND, 1)
+        return
+    }
+    if c == 124 as u32 {
+        if c1 == 124 as u32 {
+            if c2 == 61 as u32 {
+                lex_punct(l, P_ORORA, 3)
+                return
+            }
+            lex_punct(l, P_OROR, 2)
+            return
+        }
+        if c1 == 61 as u32 {
+            lex_punct(l, P_ORA, 2)
+            return
+        }
+        lex_punct(l, P_OR, 1)
+        return
+    }
+    if c == 94 as u32 {
+        if c1 == 61 as u32 {
+            lex_punct(l, P_XORA, 2)
+            return
+        }
+        lex_punct(l, P_XOR, 1)
+        return
+    }
+    lex_fail(l, E_BAD_CHARACTER, (*l).pos)
+}

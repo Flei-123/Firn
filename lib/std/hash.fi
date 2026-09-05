@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: MIT
+// lib/std/hash.fi -- hash functions over octets (round 81).
+//
+// `lib/std/map.fi` has had a hash since round 39, and it hashes exactly one
+// thing: a SCALAR. `splitmix64` over a 64 bit word is the right answer for
+// a pointer or an index and it is not an answer at all for "the name of a
+// player", "an NBT key" or "a HTTP header": those are octet SEQUENCES of
+// arbitrary length, and up to this round the only way to put one into a map
+// was to intern it first and hash the interner's number instead
+// (`lib/std/intern.fi`). That works, it is what the compiler does, and it
+// costs a second data structure plus a lookup for every string that is only
+// ever seen once.
+//
+// This file is the missing half: a hash over a SPAN of octets. Two of them,
+// on purpose.
+//
+// ROUND 83 -- every arithmetic operation of this file that WRAPS on
+// purpose says so with `*%` / `+%` / `-%` (SPEC 13, item L9). A hash IS
+// arithmetic modulo 2^64: the multiplications of FNV, xxHash and
+// splitmix64 leave the range on almost every octet, and that is the
+// definition of the function, not an accident. Round 81 wrote this file
+// while the checked arithmetic of round 72 sat on an unmerged branch, so
+// it was spelled with the plain operators; under a checking build level
+// (dev, dev-fast, release-safe) every one of them aborted the program.
+// `tests/1610_hash_map.fi` was the first to say so out loud.
+
+// ------------------------------------------------------------------ FNV-1a
+//
+// Four lines, no table, no state. It is here because it is the hash
+// everybody can check: the constants are in the specification (FNV offset
+// basis and prime), every language has an implementation, and its published
+// vectors -- `""` -> cbf29ce484222325, `"a"` -> af63dc4c8601ec8c,
+// `"foobar"` -> 85944171f73967e8 -- pin the whole function down. Whoever
+// wants to know whether THIS repository computes the same thing as the rest
+// of the world checks those three numbers.
+//
+// What it is not is fast: one multiplication per OCTET, and the
+// multiplication is on the critical path, so a modern core runs it at about
+// one octet per five cycles no matter how wide it is.
+//
+// ------------------------------------------------------------------ xxHash64
+//
+// The one the map really uses. It reads the input in 32 octet stripes into
+// FOUR independent accumulators, which is the whole trick: four
+// multiplication chains that do not depend on each other fill the pipeline,
+// and the throughput stops being bound by the latency of one multiply.
+// MEASURED on this machine (tools/stdlib81/run.sh, section "hash"), not
+// claimed -- the numbers are in docs/ROUND81.md.
+//
+// The implementation follows the reference (Yann Collet, XXH64) exactly,
+// including the ODD-LOOKING PARTS, because they are what make the published
+// vectors come out:
+//
+//   * the four accumulators start at seed+P1+P2, seed+P2, seed and seed-P1
+//     -- the last one UNDERFLOWS for seed 0, which is intended and is why
+//     everything here is unsigned 64 bit wrap-around arithmetic;
+//   * the tail is processed 8, then 4, then 1 octet at a time with three
+//     DIFFERENT mixing steps;
+//   * the final avalanche is three xor-shifts around two multiplications.
+//
+// The empty input with seed 0 has to give ef46db3751d8e999. That single
+// number catches almost every possible transcription error at once, because
+// it exercises the seed setup, the tail path with zero octets and the
+// avalanche.
+//
+// ------------------------------------------------------- LITTLE ENDIAN, ON PURPOSE
+//
+// xxHash is DEFINED on little endian words: `XXH_readLE64`. Reading the
+// input with `*(p as *mut u64)` on x86 is therefore not a shortcut here, it
+// is the specification -- and `lib/std/bytes.fi` writing its integers big
+// endian is not a contradiction, it is a different format. The unaligned
+// load is deliberate too: x86_64 allows it, and forcing alignment would
+// mean copying every input.
+//
+// ------------------------------------------------------------------ HONEST
+//
+// H1 NEITHER OF THESE IS A CRYPTOGRAPHIC HASH. They are not collision
+//    RESISTANT against somebody who is trying: given a seed, xxHash64
+//    collisions can be constructed. A map that is filled from the network
+//    with attacker chosen keys wants a seed the attacker does not know
+//    (`hash_seed_from_time`) or SipHash, which this round does not build.
+//    For a compiler's symbol table, an NBT key or a JSON object this is a
+//    non-issue and paying four times the cost for it would be silly.
+// H2 THE 32 BIT VARIANTS ARE NOT HERE. `fnv1a32` exists because CRC-like
+//    32 bit table keys turn up in file formats; XXH32 does not, because
+//    nothing in this repository needs it and an untested implementation is
+//    worse than a missing one.
+// H3 NO INCREMENTAL (streaming) INTERFACE. Everything here hashes one span
+//    in one call. A streaming xxHash needs a 32 octet carry buffer in a
+//    state struct; when something in this repository hashes a stream it
+//    will be built then and measured then.
+import rt
+
+export {
+    fnv1a64, fnv1a64_seed, fnv1a64_more, fnv1a32,
+    xx64, xx64_seed,
+    hash_u64, hash_mix64, hash_bytes,
+    hash_seed_from_time,
+    FNV_OFFSET, FNV_PRIME,
+}
+
+// The FNV parameters (Fowler/Noll/Vo, 64 bit): the offset basis and the
+// prime 2^40 + 2^8 + 0xb3.
+const FNV_OFFSET: u64 = 14695981039346656037 as u64
+const FNV_PRIME: u64 = 1099511628211 as u64
+
+// The five xxHash64 primes.
+const P1: u64 = 11400714785074694791 as u64
+const P2: u64 = 14029467366897019727 as u64
+const P3: u64 = 1609587929392839161 as u64
+const P4: u64 = 9650029242287828579 as u64
+const P5: u64 = 2870177450012600261 as u64
+
+// ---------------------------------------------------------------- helpers
+
+fn rotl64(x: u64, n: u64) -> u64 {
+    // n is never 0 or 64 here -- `x >> 64` would be masked to `x >> 0` by
+    // the machine and quietly give the wrong answer.
+    return (x << n) | (x >> (64 as u64 - n))
+}
+
+// An unaligned little endian load. See the header: this is what xxHash is
+// defined on.
+fn ld64le(p: u64) -> u64 {
+    return *(p as *mut u64)
+}
+
+fn ld32le(p: u64) -> u32 {
+    return *(p as *mut u32)
+}
+
+// ------------------------------------------------------------------ FNV-1a
+
+// XOR first, THEN multiply -- that is the -1a variant, and the order is the
+// whole difference to FNV-1, which produces different values.
+fn fnv1a64_seed(p: u64, n: usize, seed: u64) -> u64 {
+    var h: u64 = seed
+    var i: usize = 0
+    while i < n {
+        h = h ^ (rt.ld8(p, i) as u64)
+        h = h *% FNV_PRIME
+        i = i + 1
+    }
+    return h
+}
+
+fn fnv1a64(p: u64, n: usize) -> u64 {
+    return fnv1a64_seed(p, n, FNV_OFFSET)
+}
+
+// Continue a running FNV over another span -- FNV is a pure fold over the
+// octets, so a stream costs nothing but passing the accumulator along.
+fn fnv1a64_more(h: u64, p: u64, n: usize) -> u64 {
+    return fnv1a64_seed(p, n, h)
+}
+
+// 32 bit FNV-1a: offset basis 2166136261, prime 16777619. Computed in u64
+// and masked, so that the result cannot depend on the build mode
+// (SPEC 13 -- u32 overflow is checked in `--debug` and wraps in
+// `--release-fast`; a hash that differs between the two would be the worst
+// kind of bug).
+fn fnv1a32(p: u64, n: usize) -> u32 {
+    var h: u64 = 2166136261
+    var i: usize = 0
+    while i < n {
+        h = h ^ (rt.ld8(p, i) as u64)
+        h = (h * 16777619) & 4294967295 as u64
+        i = i + 1
+    }
+    return h as u32
+}
+
+// ---------------------------------------------------------------- xxHash64
+
+fn xx_round(acc: u64, input: u64) -> u64 {
+    return rotl64(acc +% input *% P2, 31) *% P1
+}
+
+fn xx_merge(acc: u64, val: u64) -> u64 {
+    let v: u64 = xx_round(0, val)
+    return ((acc ^ v) *% P1) +% P4
+}
+
+fn xx_avalanche(h0: u64) -> u64 {
+    var h: u64 = h0
+    h = h ^ (h >> 33)
+    h = h *% P2
+    h = h ^ (h >> 29)
+    h = h *% P3
+    h = h ^ (h >> 32)
+    return h
+}
+
+fn xx64_seed(p: u64, n: usize, seed: u64) -> u64 {
+    var h: u64 = 0
+    var off: usize = 0
+
+    if n >= 32 {
+        var v1: u64 = seed +% P1 +% P2
+        var v2: u64 = seed +% P2
+        var v3: u64 = seed
+        var v4: u64 = seed -% P1 // underflows for seed 0 -- intended, and now spelled so
+        let limit: usize = n - 31
+        while off < limit {
+            v1 = xx_round(v1, ld64le(p + off as u64))
+            v2 = xx_round(v2, ld64le(p + off as u64 + 8))
+            v3 = xx_round(v3, ld64le(p + off as u64 + 16))
+            v4 = xx_round(v4, ld64le(p + off as u64 + 24))
+            off = off + 32
+        }
+        h = rotl64(v1, 1) +% rotl64(v2, 7) +% rotl64(v3, 12) +% rotl64(v4, 18)
+        h = xx_merge(h, v1)
+        h = xx_merge(h, v2)
+        h = xx_merge(h, v3)
+        h = xx_merge(h, v4)
+    } else {
+        h = seed +% P5
+    }
+
+    h = h +% n as u64
+
+    // The tail, in three different mixing steps -- 8, then 4, then 1.
+    while n - off >= 8 {
+        let k: u64 = xx_round(0, ld64le(p + off as u64))
+        h = ((rotl64(h ^ k, 27) *% P1)) +% P4
+        off = off + 8
+    }
+    if n - off >= 4 {
+        h = h ^ ((ld32le(p + off as u64) as u64) *% P1)
+        h = (rotl64(h, 23) *% P2) +% P3
+        off = off + 4
+    }
+    while off < n {
+        h = h ^ ((rt.ld8(p, off) as u64) *% P5)
+        h = rotl64(h, 11) *% P1
+        off = off + 1
+    }
+
+    return xx_avalanche(h)
+}
+
+fn xx64(p: u64, n: usize) -> u64 {
+    return xx64_seed(p, n, 0)
+}
+
+// The hash the maps use. One name, so that a change of mind here does not
+// mean editing every call site.
+fn hash_bytes(p: u64, n: usize) -> u64 {
+    return xx64_seed(p, n, 0)
+}
+
+// ------------------------------------------------------------- scalar mixing
+
+// splitmix64's finalizer -- the same one `map_hash` in lib/std/map.fi uses,
+// written down once more here so that a caller who has a 64 bit key and no
+// map can still spread it. Two shift/xor rounds around two multiplications
+// with odd constants; every input bit reaches every output bit.
+fn hash_mix64(k: u64) -> u64 {
+    var x: u64 = k
+    x = x ^ (x >> 33)
+    x = x *% 14181476777654086739 as u64
+    x = x ^ (x >> 29)
+    x = x *% 12297829382473034411 as u64
+    x = x ^ (x >> 32)
+    return x
+}
+
+fn hash_u64(k: u64) -> u64 {
+    return hash_mix64(k)
+}
+
+// A seed that is not the same on every run. `clock_gettime(CLOCK_MONOTONIC)`
+// through the raw system call -- see H1: a map fed from the network wants
+// one of these. It is NOT cryptographic randomness (that is
+// `std.crypto.random`), it is a number an attacker cannot guess from
+// outside without measuring the machine's uptime.
+fn hash_seed_from_time() -> u64 {
+    var ts: [u64; 2] = [0; 2]
+    // SYS_clock_gettime = 228, CLOCK_MONOTONIC = 1
+    syscall(228, 1, (&ts[0]) as u64)
+    return hash_mix64(ts[0] *% 1000000000 +% ts[1])
+}

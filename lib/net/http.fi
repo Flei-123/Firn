@@ -1,0 +1,1570 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/net/http.fi -- an HTTP/1.1 CLIENT in Firn (round B4).
+//
+// Everything the browser of rounds B1..B3 was missing on the way in: until
+// now a document had to be handed to it on standard input. This file is the
+// other end of that -- a client that speaks RFC 9110/9112 to a server that
+// is not this repository.
+//
+// WHAT IS IN HERE
+//   * GET and POST, with a request body and a `Content-Type`
+//   * the header block, read case-insensitively, folded values refused
+//   * `Transfer-Encoding: chunked`, including chunk extensions and trailers
+//   * `Content-Encoding: gzip` and `deflate`, through lib/std/deflate.fi
+//   * redirects 301/302/303/307/308 with the METHOD RULES of RFC 9110 15.4
+//     (303 turns into GET and drops the body, 307/308 keep both), a hop
+//     limit and loop detection
+//   * `Content-Type` split into media type and charset
+//   * persistent connections: a second request to the same origin reuses
+//     the socket, and the number of sockets opened is counted so that the
+//     claim can be checked
+//   * a response cache with `max-age`, `no-store`, `no-cache` and
+//     revalidation through `If-None-Match`/`If-Modified-Since` (304)
+//   * cookies (lib/net/httpstate.fi)
+//
+// WHAT IS NOT, AND WHY IT IS SAID HERE RATHER THAN FOUND OUT LATER
+//
+//   TLS. `https://` is REFUSED with `HttpError::Tls` -- it is not silently
+//   downgraded to `http://` and not silently failed. TLS 1.3 is a record
+//   layer, X25519, AES-GCM or ChaCha20-Poly1305, HKDF, SHA-256, ASN.1/DER,
+//   a certificate chain and a trust store; it is a round of its own, and
+//   anything less than all of it would be a lie in the address bar. The
+//   boundary is one function, `scheme_ok`, and the test suite drives a real
+//   `https://` URL into it and demands the refusal.
+//
+//   HTTP/2 and HTTP/3. One version, stated in the request line.
+//
+//   No `Content-Length` mismatch tolerance: a body shorter than announced
+//   is `HttpError::Body`, not a truncated page.
+//
+// THE HOST BOUNDARY, for the day the browser core is lifted out as a
+// library (docs/ROUNDB4.md 6): this file touches the operating system in
+// exactly two places -- `lib/std/net.fi` for the socket and `now_unix()`
+// in lib/net/httpstate.fi for the clock. Nothing else here is a system
+// call.
+import std.rt
+import std.net
+import std.deflate
+import net.url
+import net.httpstate
+import net.dns
+import tls.tls
+import tls.x509
+
+export {
+    HttpError, Client, Response,
+    client_new, client_init, client_free,
+    client_set_timeout, client_set_cache, client_set_gzip,
+    client_set_keepalive, client_set_max_redirects,
+    client_jar, client_cache,
+    client_sockets, client_reused, client_requests, client_redirects,
+    client_load_trust, client_trust_count, client_tls_reason,
+    client_tls_handshakes, client_last_suite, client_set_now,
+    resp_new, resp_init, resp_free, resp_reset,
+    resp_status, resp_body_ptr, resp_body_len, resp_header,
+    resp_media_ptr, resp_media_len, resp_charset_ptr, resp_charset_len,
+    resp_final_url_ptr, resp_final_url_len, resp_hops, resp_from_cache,
+    resp_wire_len, resp_chunks, resp_header_count,
+    http_get, http_post, http_fetch, err_num, err_name_of, fail_into,
+    HDR_MAX, BODY_MAX,
+}
+
+error HttpError {
+    Url, // the address cannot be read
+    Scheme, // a scheme this client does not fetch
+    Tls, // https -- the named boundary of this round
+    Resolve, // a host that is not a numeric address
+    Connect,
+    Send,
+    Recv,
+    Closed, // the peer went away in the middle of a message
+    Status, // the status line is not HTTP/1.x <code>
+    Header, // the header block is malformed or too large
+    Body, // the framing does not add up
+    Encoding, // a `Content-Encoding` this client cannot undo
+    TooManyRedirects,
+    RedirectLoop,
+    TooLarge,
+    OutOfMemory,
+}
+
+const HDR_MAX: usize = 65536
+const BODY_MAX: usize = 33554432
+const IDX_MAX: usize = 128
+const RD_ERR: usize = 18446744073709551615 as usize
+const NO_MAXAGE: u64 = 18446744073709551615 as u64
+
+struct Client {
+    jar: httpstate.Jar,
+    cache: httpstate.Cache,
+    conn: net.Conn,
+    // ROUND B5: the same connection, seen through TLS. `sec` says which
+    // of the two `pump`/`send_all` talk to; everything above them --
+    // framing, chunking, redirects, the cache, the cookie jar -- does not
+    // know the difference and did not have to change.
+    sec: tls.Tls,
+    store: x509.Store,
+    use_tls: bool, // is the CURRENT connection a TLS one?
+    ctls: bool, // ... and was the one it may be reused for?
+    trust_loaded: bool,
+    tls_reason: u32, // why the last chain was refused
+    handshakes: u64,
+    last_suite: u32,
+    rbuf: rt.Buf, // what was read and not yet consumed
+    rpos: usize,
+    chost: [u8; 256],
+    nchost: usize,
+    cport: u16,
+    have_conn: bool,
+    timeout_ms: u64,
+    use_cache: bool,
+    use_gzip: bool,
+    keep_alive: bool,
+    max_redirects: u32,
+    sockets: u64, // sockets really opened
+    reused: u64, // requests that found one already open
+    requests: u64,
+    redirects: u64,
+    now_fixed: u64, // 0 = ask the clock; otherwise a frozen "now"
+}
+
+struct Response {
+    status: u32,
+    raw: rt.Buf, // the header block, as it came in
+    idx: rt.Buf, // 4 x u32 per header: name off/len, value off/len
+    nh: usize,
+    body: rt.Buf,
+    media: [u8; 128],
+    nmedia: usize,
+    charset: [u8; 64],
+    ncharset: usize,
+    final_url: [u8; 768],
+    nfinal: usize,
+    hops: u32,
+    chunks: u32,
+    wire: usize, // body octets as they arrived, before gunzip
+    from_cache: bool,
+    keep: bool, // may the connection stay open?
+}
+
+// ---------------------------------------------------------------- Octets
+
+fn low(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn ci_eq(a: u64, na: usize, b: u64, nb: usize) -> bool {
+    if na != nb {
+        return false
+    }
+    var i: usize = 0
+    while i < na {
+        if low(rt.ld8(a, i)) != low(rt.ld8(b, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8
+}
+
+fn u32_at(p: u64, i: usize) -> u32 {
+    return *((p + (i * 4) as u64) as *mut u32)
+}
+
+fn u32_put(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+// ================================================================ Response
+
+fn resp_new() -> Response {
+    return Response {
+        status: 0, raw: rt.buf_new(), idx: rt.buf_new(), nh: 0,
+        body: rt.buf_new(), media: [0; 128], nmedia: 0,
+        charset: [0; 64], ncharset: 0, final_url: [0; 768], nfinal: 0,
+        hops: 0, chunks: 0, wire: 0, from_cache: false, keep: false,
+    }
+}
+
+fn resp_init(r: *mut Response) {
+    resp_reset(r)
+}
+
+fn resp_reset(r: *mut Response) {
+    (*r).status = 0
+    rt.buf_clear(&(*r).raw)
+    rt.buf_clear(&(*r).idx)
+    rt.buf_clear(&(*r).body)
+    (*r).nh = 0
+    (*r).nmedia = 0
+    (*r).ncharset = 0
+    (*r).hops = 0
+    (*r).chunks = 0
+    (*r).wire = 0
+    (*r).from_cache = false
+    (*r).keep = false
+}
+
+fn resp_free(r: *mut Response) {
+    rt.buf_free(&(*r).raw)
+    rt.buf_free(&(*r).idx)
+    rt.buf_free(&(*r).body)
+}
+
+fn resp_status(r: *mut Response) -> u32 { return (*r).status }
+fn resp_body_ptr(r: *mut Response) -> u64 { return (*r).body.ptr }
+fn resp_body_len(r: *mut Response) -> usize { return (*r).body.len }
+fn resp_hops(r: *mut Response) -> u32 { return (*r).hops }
+fn resp_chunks(r: *mut Response) -> u32 { return (*r).chunks }
+fn resp_wire_len(r: *mut Response) -> usize { return (*r).wire }
+fn resp_from_cache(r: *mut Response) -> bool { return (*r).from_cache }
+fn resp_header_count(r: *mut Response) -> usize { return (*r).nh }
+fn resp_media_ptr(r: *mut Response) -> u64 { return (&(*r).media[0]) as u64 }
+fn resp_media_len(r: *mut Response) -> usize { return (*r).nmedia }
+fn resp_charset_ptr(r: *mut Response) -> u64 {
+    return (&(*r).charset[0]) as u64
+}
+fn resp_charset_len(r: *mut Response) -> usize { return (*r).ncharset }
+fn resp_final_url_ptr(r: *mut Response) -> u64 {
+    return (&(*r).final_url[0]) as u64
+}
+fn resp_final_url_len(r: *mut Response) -> usize { return (*r).nfinal }
+
+// The LAST header of that name -- `Set-Cookie` is the one case where every
+// occurrence matters, and it is read through the index instead.
+// Returns the length; 0 and `*at = 0` when it is not there.
+fn resp_header(r: *mut Response, name: u64, n: usize, at: *mut u64) -> usize {
+    *at = 0
+    var found: usize = 0
+    var i: usize = 0
+    while i < (*r).nh {
+        let noff: u32 = u32_at((*r).idx.ptr, i * 4)
+        let nlen: u32 = u32_at((*r).idx.ptr, i * 4 + 1)
+        if ci_eq((*r).raw.ptr + noff as u64, nlen as usize, name, n) {
+            *at = (*r).raw.ptr + u32_at((*r).idx.ptr, i * 4 + 2) as u64
+            found = u32_at((*r).idx.ptr, i * 4 + 3) as usize
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// ================================================================== Client
+
+fn client_new() -> Client {
+    return Client {
+        jar: httpstate.jar_new(),
+        cache: httpstate.cache_new(),
+        conn: net.Conn { fd: -1, err: 0, peer: 0 as u32, peer_port: 0 as u16 },
+        sec: tls.tls_new(), store: x509.store_new(),
+        use_tls: false, ctls: false, trust_loaded: false,
+        tls_reason: x509.V_OK, handshakes: 0, last_suite: 0,
+        rbuf: rt.buf_new(), rpos: 0,
+        chost: [0; 256], nchost: 0, cport: 0 as u16, have_conn: false,
+        timeout_ms: 10000, use_cache: true, use_gzip: true,
+        keep_alive: true, max_redirects: 20,
+        sockets: 0, reused: 0, requests: 0, redirects: 0, now_fixed: 0,
+    }
+}
+
+fn client_init(c: *mut Client) -> bool {
+    if !httpstate.jar_init(&(*c).jar) {
+        return false
+    }
+    if !httpstate.cache_init(&(*c).cache) {
+        return false
+    }
+    return true
+}
+
+fn client_free(c: *mut Client) {
+    drop_conn(c)
+    httpstate.jar_free(&(*c).jar)
+    httpstate.cache_free(&(*c).cache)
+    x509.store_free(&(*c).store)
+    rt.buf_free(&(*c).rbuf)
+}
+
+// ROUND B5: the roots. A client with no trust store cannot fetch
+// `https://` at all -- every chain comes back UNKNOWN_ISSUER -- and that
+// is the right behaviour: a browser that falls back to "trust it anyway"
+// when it has no roots has no security at all.
+fn client_load_trust(c: *mut Client, path: u64) -> usize {
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &b) {
+        rt.buf_free(&b)
+        return 0
+    }
+    let n: usize = x509.store_load_pem(&(*c).store, b.ptr, b.len)
+    // The store keeps its own copy of the octets, so the file may go.
+    rt.buf_free(&b)
+    (*c).trust_loaded = n > 0
+    return n
+}
+
+fn client_trust_count(c: *mut Client) -> usize {
+    return x509.store_count(&(*c).store)
+}
+
+fn client_tls_reason(c: *mut Client) -> u32 {
+    return (*c).tls_reason
+}
+
+fn client_tls_handshakes(c: *mut Client) -> u64 {
+    return (*c).handshakes
+}
+
+fn client_last_suite(c: *mut Client) -> u32 {
+    return (*c).last_suite
+}
+
+// A frozen clock, so that a test can put the machine at any date it likes
+// -- which is how the counter-check for an expired certificate is made.
+fn client_set_now(c: *mut Client, t: u64) {
+    (*c).now_fixed = t
+}
+
+fn client_set_timeout(c: *mut Client, ms: u64) { (*c).timeout_ms = ms }
+fn client_set_cache(c: *mut Client, on: bool) { (*c).use_cache = on }
+fn client_set_gzip(c: *mut Client, on: bool) { (*c).use_gzip = on }
+fn client_set_keepalive(c: *mut Client, on: bool) { (*c).keep_alive = on }
+fn client_set_max_redirects(c: *mut Client, n: u32) { (*c).max_redirects = n }
+fn client_jar(c: *mut Client) -> *mut httpstate.Jar { return &(*c).jar }
+fn client_cache(c: *mut Client) -> *mut httpstate.Cache { return &(*c).cache }
+fn client_sockets(c: *mut Client) -> u64 { return (*c).sockets }
+fn client_reused(c: *mut Client) -> u64 { return (*c).reused }
+fn client_requests(c: *mut Client) -> u64 { return (*c).requests }
+fn client_redirects(c: *mut Client) -> u64 { return (*c).redirects }
+
+fn client_now(c: *mut Client) -> u64 {
+    if (*c).now_fixed != 0 as u64 {
+        return (*c).now_fixed
+    }
+    return httpstate.now_unix()
+}
+
+// ----------------------------------------------------------- The socket
+
+fn drop_conn(c: *mut Client) {
+    if (*c).have_conn {
+        if (*c).use_tls {
+            tls.tls_close(&(*c).sec)
+            tls.tls_free(&(*c).sec)
+            (*c).sec = tls.tls_new()
+        }
+        net.close(&(*c).conn)
+        (*c).have_conn = false
+        (*c).use_tls = false
+    }
+    (*c).nchost = 0
+    (*c).cport = 0 as u16
+    rt.buf_clear(&(*c).rbuf)
+    (*c).rpos = 0
+}
+
+fn addr_of_host(p: u64, n: usize, out: *mut u32) -> bool {
+    var lh: [u8; 9] = "localhost"
+    if ci_eq(p, n, (&lh[0]) as u64, 9) {
+        *out = net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8)
+        return true
+    }
+    if !url.host_is_ip4(p, n) {
+        // ROUND B5: a name, and there is a resolver now. `lib/net/dns.fi`
+        // asks the machine's own nameserver over TCP; its limits (A
+        // records only, no cache) are in the head of that file.
+        var got: u32 = 0
+        var ok: bool = dns.resolve_a(p, n, &got) catch false
+        if !ok {
+            return false
+        }
+        *out = got
+        return true
+    }
+    var parts: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 46 as u8 {
+            parts[k] = v
+            k = k + 1
+            v = 0
+        } else {
+            v = v * 10 as u32 + (ch - 48 as u8) as u32
+        }
+        i = i + 1
+    }
+    parts[k] = v
+    *out = net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8,
+        parts[3] as u8)
+    return true
+}
+
+fn want_conn(c: *mut Client, u: *mut url.Url) -> HttpError!bool {
+    let hp: u64 = url.url_host_ptr(u)
+    let hn: usize = url.url_host_len(u)
+    let want_tls: bool = url.url_is_https(u)
+    if (*c).have_conn {
+        // The SCHEME is part of the identity of a connection. Without
+        // that test a redirect from `https://x/` to `http://x/` on the
+        // same port would reuse the TLS socket and send the next request
+        // in the clear -- or the other way round, which is worse.
+        if (*c).cport == url.url_port(u) && (*c).ctls == want_tls &&
+        ci_eq((&(*c).chost[0]) as u64, (*c).nchost, hp, hn) {
+            (*c).reused = (*c).reused + 1
+            return true
+        }
+        drop_conn(c)
+    }
+    var addr: u32 = 0
+    if !addr_of_host(hp, hn, &addr) {
+        return HttpError::Resolve
+    }
+    var bad: bool = false
+    let cn: net.Conn = net.connect_tcp(addr, url.url_port(u))
+    catch | e | conn_fail(&bad)
+    if bad {
+        return HttpError::Connect
+    }
+    (*c).conn = cn
+    (*c).have_conn = true
+    (*c).sockets = (*c).sockets + 1
+    let okt: bool = net.set_timeout(&(*c).conn, (*c).timeout_ms) catch false
+    let okn: bool = net.set_no_delay(&(*c).conn, true) catch false
+    if hn <= 256 {
+        rt.mem_copy((&(*c).chost[0]) as u64, hp, hn)
+        (*c).nchost = hn
+    } else {
+        (*c).nchost = 0
+    }
+    (*c).cport = url.url_port(u)
+    (*c).ctls = want_tls
+    rt.buf_clear(&(*c).rbuf)
+    (*c).rpos = 0
+    if want_tls {
+        if !tls.tls_init(&(*c).sec, &(*c).conn, &(*c).store, hp, hn,
+            client_now(c)) {
+            drop_conn(c)
+            return HttpError::Tls
+        }
+        var failed: bool = false
+        let okh: bool = tls.tls_handshake(&(*c).sec)
+        catch | e | tls_note(&failed)
+        (*c).tls_reason = tls.tls_verify_reason(&(*c).sec)
+        if failed {
+            drop_conn(c)
+            return HttpError::Tls
+        }
+        (*c).use_tls = true
+        (*c).handshakes = (*c).handshakes + 1 as u64
+        (*c).last_suite = tls.tls_suite(&(*c).sec)
+    }
+    return true
+}
+
+fn tls_note(failed: *mut bool) -> bool {
+    *failed = true
+    return false
+}
+
+fn conn_fail(bad: *mut bool) -> net.Conn {
+    *bad = true
+    return net.Conn { fd: -1, err: 0, peer: 0 as u32, peer_port: 0 as u16 }
+}
+
+// One more helping of octets into the read buffer. Returns false at a
+// clean end of stream, and sets `err` on a real failure.
+fn pump(c: *mut Client, err: *mut bool) -> bool {
+    *err = false
+    let want: usize = 16384
+    let have: usize = (*c).rbuf.len
+    rt.buf_reserve(&(*c).rbuf, have + want)
+    if (*c).rbuf.cap < have + want {
+        *err = true
+        return false
+    }
+    var k: usize = 0
+    if (*c).use_tls {
+        var bad: bool = false
+        k = tls.tls_read(&(*c).sec, (*c).rbuf.ptr + have as u64, want)
+        catch | e | tls_note_len(&bad)
+        if bad {
+            k = RD_ERR
+        }
+    } else {
+        k = net.read(&(*c).conn, (*c).rbuf.ptr + have as u64, want)
+        catch RD_ERR
+    }
+    if k == RD_ERR {
+        *err = true
+        return false
+    }
+    if k == 0 {
+        return false
+    }
+    rt.buf_set_len(&(*c).rbuf, have + k)
+    return true
+}
+
+fn send_all(c: *mut Client, p: u64, n: usize) -> bool {
+    if (*c).use_tls {
+        var bad: bool = false
+        let ok: bool = tls.tls_write(&(*c).sec, p, n)
+        catch | e | tls_note(&bad)
+        return !bad
+    }
+    let k: usize = net.write_all(&(*c).conn, p, n) catch RD_ERR
+    return k == n
+}
+
+fn tls_note_len(failed: *mut bool) -> usize {
+    *failed = true
+    return 0
+}
+
+// ------------------------------------------------------- The request line
+
+fn push_lit(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(b, p, n)
+}
+
+fn crlf(b: *mut rt.Buf) {
+    rt.buf_push(b, 13 as u8)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn header(b: *mut rt.Buf, name: u64, nn: usize, val: u64, nv: usize) {
+    rt.buf_push_bytes(b, name, nn)
+    rt.buf_push(b, 58 as u8)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_bytes(b, val, nv)
+    crlf(b)
+}
+
+fn build_request(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
+    body: u64, nb: usize, ctype: u64, nct: usize,
+    inm: u64, ninm: usize, ims: u64, nims: usize, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, method, nm)
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_bytes(out, url.url_path_ptr(u), url.url_path_len(u))
+    var ver: [u8; 9] = " HTTP/1.1"
+    push_lit(out, (&ver[0]) as u64, 9)
+    crlf(out)
+    var h_host: [u8; 4] = "Host"
+    rt.buf_push_bytes(out, (&h_host[0]) as u64, 4)
+    rt.buf_push(out, 58 as u8)
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_bytes(out, url.url_host_ptr(u), url.url_host_len(u))
+    if url.url_port(u) != url.url_default_port(u) {
+        rt.buf_push(out, 58 as u8)
+        rt.buf_push_dec_u64(out, url.url_port(u) as u64)
+    }
+    crlf(out)
+    var h_ua: [u8; 10] = "User-Agent"
+    var v_ua: [u8; 7] = "Firn/B4"
+    header(out, (&h_ua[0]) as u64, 10, (&v_ua[0]) as u64, 7)
+    var h_acc: [u8; 6] = "Accept"
+    var v_acc: [u8; 3] = "*/*"
+    header(out, (&h_acc[0]) as u64, 6, (&v_acc[0]) as u64, 3)
+    if (*c).use_gzip {
+        var h_ae: [u8; 15] = "Accept-Encoding"
+        var v_ae: [u8; 4] = "gzip"
+        header(out, (&h_ae[0]) as u64, 15, (&v_ae[0]) as u64, 4)
+    }
+    if ninm > 0 {
+        var h_inm: [u8; 13] = "If-None-Match"
+        header(out, (&h_inm[0]) as u64, 13, inm, ninm)
+    }
+    if nims > 0 {
+        var h_ims: [u8; 17] = "If-Modified-Since"
+        header(out, (&h_ims[0]) as u64, 17, ims, nims)
+    }
+    // the cookies of the jar for exactly this host and path
+    var ck: rt.Buf = rt.buf_new()
+    let ncookie: usize = httpstate.jar_header(&(*c).jar,
+        url.url_host_ptr(u), url.url_host_len(u),
+        url.url_path_ptr(u), url.url_path_len(u),
+        url.url_is_https(u), client_now(c), &ck)
+    if ncookie > 0 {
+        var h_ck: [u8; 6] = "Cookie"
+        header(out, (&h_ck[0]) as u64, 6, ck.ptr, ck.len)
+    }
+    rt.buf_free(&ck)
+    if nb > 0 {
+        var h_cl: [u8; 14] = "Content-Length"
+        rt.buf_push_bytes(out, (&h_cl[0]) as u64, 14)
+        rt.buf_push(out, 58 as u8)
+        rt.buf_push(out, 32 as u8)
+        rt.buf_push_dec_u64(out, nb as u64)
+        crlf(out)
+        if nct > 0 {
+            var h_ct: [u8; 12] = "Content-Type"
+            header(out, (&h_ct[0]) as u64, 12, ctype, nct)
+        }
+    }
+    var h_conn: [u8; 10] = "Connection"
+    if (*c).keep_alive {
+        var v_ka: [u8; 10] = "keep-alive"
+        header(out, (&h_conn[0]) as u64, 10, (&v_ka[0]) as u64, 10)
+    } else {
+        var v_cl: [u8; 5] = "close"
+        header(out, (&h_conn[0]) as u64, 10, (&v_cl[0]) as u64, 5)
+    }
+    crlf(out)
+    if nb > 0 {
+        rt.buf_push_bytes(out, body, nb)
+    }
+}
+
+// ------------------------------------------------------ The header block
+
+// Reads until CRLF CRLF. The block is copied into `r.raw`; everything
+// after it stays in the client's read buffer -- with a persistent
+// connection those octets are already the body, and throwing them away is
+// the classic way to lose the first kilobyte of a page.
+fn read_head(c: *mut Client, r: *mut Response) -> HttpError!usize {
+    var searched: usize = 0
+    var end: usize = 0
+    var found: bool = false
+    while !found {
+        let avail: usize = (*c).rbuf.len - (*c).rpos
+        let base: u64 = (*c).rbuf.ptr + (*c).rpos as u64
+        var i: usize = searched
+        while i + 3 < avail {
+            if rt.ld8(base, i) == 13 as u8 && rt.ld8(base, i + 1) == 10 as u8 &&
+            rt.ld8(base, i + 2) == 13 as u8 && rt.ld8(base, i + 3) == 10 as u8 {
+                end = i + 4
+                found = true
+                break
+            }
+            i = i + 1
+        }
+        if found {
+            break
+        }
+        if avail > 3 {
+            searched = avail - 3
+        }
+        if avail > HDR_MAX {
+            return HttpError::Header
+        }
+        var err: bool = false
+        if !pump(c, &err) {
+            if err {
+                return HttpError::Recv
+            }
+            return HttpError::Closed
+        }
+    }
+    rt.buf_push_bytes(&(*r).raw, (*c).rbuf.ptr + (*c).rpos as u64, end)
+    (*c).rpos = (*c).rpos + end
+    return end
+}
+
+// The status line and the headers out of `r.raw`.
+fn parse_head(r: *mut Response) -> HttpError!bool {
+    let p: u64 = (*r).raw.ptr
+    let n: usize = (*r).raw.len
+    var lit: [u8; 7] = "HTTP/1."
+    if n < 12 || !ci_eq(p, 7, (&lit[0]) as u64, 7) {
+        return HttpError::Status
+    }
+    let minor: u8 = rt.ld8(p, 7)
+    if minor < 48 as u8 || minor > 57 as u8 {
+        return HttpError::Status
+    }
+    var i: usize = 8
+    while i < n && is_ws(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    var code: u32 = 0
+    var digits: usize = 0
+    while i < n && digits < 3 {
+        let ch: u8 = rt.ld8(p, i)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            break
+        }
+        code = code * 10 as u32 + (ch - 48 as u8) as u32
+        digits = digits + 1
+        i = i + 1
+    }
+    if digits != 3 {
+        return HttpError::Status
+    }
+    (*r).status = code
+    // to the end of the status line
+    while i < n && rt.ld8(p, i) != 10 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    (*r).nh = 0
+    while i < n {
+        if rt.ld8(p, i) == 13 as u8 || rt.ld8(p, i) == 10 as u8 {
+            break // the empty line: the block is over
+        }
+        // Obsolete line folding (a continuation starting with space) is
+        // REFUSED, not joined: RFC 9112 5.2 says a recipient of a
+        // non-message/http body must reject it, and a folded `Set-Cookie`
+        // is a known request smuggling lever.
+        if is_ws(rt.ld8(p, i)) {
+            return HttpError::Header
+        }
+        let noff: usize = i
+        while i < n && rt.ld8(p, i) != 58 as u8 && rt.ld8(p, i) != 10 as u8 {
+            i = i + 1
+        }
+        if i >= n || rt.ld8(p, i) != 58 as u8 {
+            return HttpError::Header
+        }
+        let nlen: usize = i - noff
+        if nlen == 0 {
+            return HttpError::Header
+        }
+        i = i + 1
+        while i < n && is_ws(rt.ld8(p, i)) {
+            i = i + 1
+        }
+        let voff: usize = i
+        while i < n && rt.ld8(p, i) != 13 as u8 && rt.ld8(p, i) != 10 as u8 {
+            i = i + 1
+        }
+        var vend: usize = i
+        while vend > voff && is_ws(rt.ld8(p, vend - 1)) {
+            vend = vend - 1
+        }
+        if (*r).nh < IDX_MAX {
+            u32_put(&(*r).idx, noff as u32)
+            u32_put(&(*r).idx, nlen as u32)
+            u32_put(&(*r).idx, voff as u32)
+            u32_put(&(*r).idx, (vend - voff) as u32)
+            (*r).nh = (*r).nh + 1
+        }
+        if i < n && rt.ld8(p, i) == 13 as u8 {
+            i = i + 1
+        }
+        if i < n && rt.ld8(p, i) == 10 as u8 {
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// --------------------------------------------------------------- The body
+
+fn take_from_buffer(c: *mut Client, want: usize, out: *mut rt.Buf) -> usize {
+    var avail: usize = (*c).rbuf.len - (*c).rpos
+    var k: usize = want
+    if avail < k {
+        k = avail
+    }
+    if k > 0 {
+        rt.buf_push_bytes(out, (*c).rbuf.ptr + (*c).rpos as u64, k)
+        (*c).rpos = (*c).rpos + k
+    }
+    return k
+}
+
+fn read_exact_body(c: *mut Client, n: usize, out: *mut rt.Buf) -> HttpError!bool {
+    if n > BODY_MAX {
+        return HttpError::TooLarge
+    }
+    var done: usize = take_from_buffer(c, n, out)
+    while done < n {
+        var err: bool = false
+        if !pump(c, &err) {
+            if err {
+                return HttpError::Recv
+            }
+            return HttpError::Body // shorter than announced
+        }
+        done = done + take_from_buffer(c, n - done, out)
+    }
+    return true
+}
+
+fn read_until_close(c: *mut Client, out: *mut rt.Buf) -> HttpError!bool {
+    var done: usize = take_from_buffer(c, BODY_MAX, out)
+    var more: bool = true
+    while more {
+        var err: bool = false
+        if !pump(c, &err) {
+            if err {
+                return HttpError::Recv
+            }
+            more = false
+        } else {
+            done = done + take_from_buffer(c, BODY_MAX - done, out)
+            if done >= BODY_MAX {
+                return HttpError::TooLarge
+            }
+        }
+    }
+    return true
+}
+
+// One line out of the stream, without CRLF. `HttpError::Body` when it never
+// ends.
+fn read_line(c: *mut Client, out: *mut rt.Buf) -> HttpError!bool {
+    rt.buf_clear(out)
+    var more: bool = true
+    while more {
+        let avail: usize = (*c).rbuf.len - (*c).rpos
+        let base: u64 = (*c).rbuf.ptr + (*c).rpos as u64
+        var i: usize = 0
+        while i < avail {
+            if rt.ld8(base, i) == 10 as u8 {
+                var e: usize = i
+                if e > 0 && rt.ld8(base, e - 1) == 13 as u8 {
+                    e = e - 1
+                }
+                rt.buf_push_bytes(out, base, e)
+                (*c).rpos = (*c).rpos + i + 1
+                return true
+            }
+            i = i + 1
+        }
+        if (*out).len + avail > 8192 {
+            return HttpError::Body
+        }
+        var err: bool = false
+        if !pump(c, &err) {
+            if err {
+                return HttpError::Recv
+            }
+            return HttpError::Body
+        }
+    }
+    return HttpError::Body
+}
+
+fn hex_value(ch: u8) -> i32 {
+    if ch >= 48 as u8 && ch <= 57 as u8 {
+        return (ch - 48 as u8) as i32
+    }
+    if ch >= 97 as u8 && ch <= 102 as u8 {
+        return (ch - 97 as u8) as i32 + 10
+    }
+    if ch >= 65 as u8 && ch <= 70 as u8 {
+        return (ch - 65 as u8) as i32 + 10
+    }
+    return -1
+}
+
+// `Transfer-Encoding: chunked` (RFC 9112, 7.1). Chunk extensions after a
+// ';' are read and thrown away; the trailer section after the last chunk
+// is read to the end, because on a persistent connection whatever is left
+// unread is the beginning of the NEXT answer.
+fn read_chunked(c: *mut Client, r: *mut Response) -> HttpError!bool {
+    var line: rt.Buf = rt.buf_new()
+    var total: usize = 0
+    var running: bool = true
+    while running {
+        let okl: bool = try read_line(c, &line)
+        var size: usize = 0
+        var any: bool = false
+        var i: usize = 0
+        while i < line.len {
+            let ch: u8 = rt.ld8(line.ptr, i)
+            if ch == 59 as u8 || is_ws(ch) {
+                break
+            }
+            let v: i32 = hex_value(ch)
+            if v < 0 {
+                rt.buf_free(&line)
+                return HttpError::Body
+            }
+            any = true
+            size = size * 16 + v as usize
+            if size > BODY_MAX {
+                rt.buf_free(&line)
+                return HttpError::TooLarge
+            }
+            i = i + 1
+        }
+        if !any {
+            rt.buf_free(&line)
+            return HttpError::Body
+        }
+        if size == 0 {
+            running = false
+        } else {
+            (*r).chunks = (*r).chunks + 1 as u32
+            let okb: bool = read_exact_body(c, size, &(*r).body)
+            catch | e | chunk_fail(&line)
+            if !okb {
+                rt.buf_free(&line)
+                return HttpError::Body
+            }
+            total = total + size
+            // the CRLF behind the chunk
+            let ok2: bool = try read_line(c, &line)
+            if line.len != 0 {
+                rt.buf_free(&line)
+                return HttpError::Body
+            }
+        }
+    }
+    // the trailer section, up to the empty line
+    var guard: u32 = 0
+    var reading: bool = true
+    while reading && guard < 64 as u32 {
+        guard = guard + 1 as u32
+        let okt: bool = try read_line(c, &line)
+        if line.len == 0 {
+            reading = false
+        }
+    }
+    rt.buf_free(&line)
+    (*r).wire = total
+    return true
+}
+
+fn chunk_fail(line: *mut rt.Buf) -> bool {
+    return false
+}
+
+// ------------------------------------------------------- Content-Encoding
+
+fn undo_encoding(r: *mut Response, enc: u64, ne: usize) -> HttpError!bool {
+    var gz: [u8; 4] = "gzip"
+    var xgz: [u8; 6] = "x-gzip"
+    var df: [u8; 7] = "deflate"
+    var id: [u8; 8] = "identity"
+    if ne == 0 || ci_eq(enc, ne, (&id[0]) as u64, 8) {
+        return true
+    }
+    var out: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    if ci_eq(enc, ne, (&gz[0]) as u64, 4) || ci_eq(enc, ne, (&xgz[0]) as u64, 6) {
+        let n: usize = deflate.gzip_decompress((*r).body.ptr, (*r).body.len,
+            &out) catch 18446744073709551615 as usize
+        ok = n != 18446744073709551615 as usize
+    } else if ci_eq(enc, ne, (&df[0]) as u64, 7) {
+        // RFC 9110 8.4.1.2 says zlib; servers in the wild send raw
+        // DEFLATE. Both are tried, zlib first.
+        var n: usize = deflate.zlib_decompress((*r).body.ptr, (*r).body.len,
+            &out) catch 18446744073709551615 as usize
+        if n == 18446744073709551615 as usize {
+            rt.buf_clear(&out)
+            n = deflate.inflate((*r).body.ptr, (*r).body.len, &out)
+            catch 18446744073709551615 as usize
+        }
+        ok = n != 18446744073709551615 as usize
+    } else {
+        rt.buf_free(&out)
+        return HttpError::Encoding
+    }
+    if !ok {
+        rt.buf_free(&out)
+        return HttpError::Encoding
+    }
+    rt.buf_clear(&(*r).body)
+    rt.buf_push_bytes(&(*r).body, out.ptr, out.len)
+    rt.buf_free(&out)
+    return true
+}
+
+// ---------------------------------------------------- Content-Type/charset
+
+fn split_content_type(r: *mut Response) {
+    var h_ct: [u8; 12] = "Content-Type"
+    var at: u64 = 0
+    let n: usize = resp_header(r, (&h_ct[0]) as u64, 12, &at)
+    (*r).nmedia = 0
+    (*r).ncharset = 0
+    if n == 0 {
+        return
+    }
+    var e: usize = 0
+    while e < n && rt.ld8(at, e) != 59 as u8 {
+        e = e + 1
+    }
+    var m: usize = e
+    while m > 0 && is_ws(rt.ld8(at, m - 1)) {
+        m = m - 1
+    }
+    if m > 128 {
+        m = 128
+    }
+    rt.mem_copy((&(*r).media[0]) as u64, at, m)
+    (*r).nmedia = m
+    // the parameters
+    var i: usize = e
+    while i < n {
+        i = i + 1
+        var pe: usize = i
+        while pe < n && rt.ld8(at, pe) != 59 as u8 {
+            pe = pe + 1
+        }
+        var s: usize = i
+        while s < pe && is_ws(rt.ld8(at, s)) {
+            s = s + 1
+        }
+        var eq: usize = pe
+        var k: usize = s
+        while k < pe {
+            if rt.ld8(at, k) == 61 as u8 {
+                eq = k
+                break
+            }
+            k = k + 1
+        }
+        var cs: [u8; 7] = "charset"
+        if eq < pe && ci_eq(at + s as u64, eq - s, (&cs[0]) as u64, 7) {
+            var vs: usize = eq + 1
+            var ve: usize = pe
+            while vs < ve && is_ws(rt.ld8(at, vs)) {
+                vs = vs + 1
+            }
+            while ve > vs && is_ws(rt.ld8(at, ve - 1)) {
+                ve = ve - 1
+            }
+            if ve > vs && rt.ld8(at, vs) == 34 as u8 {
+                vs = vs + 1
+                if ve > vs && rt.ld8(at, ve - 1) == 34 as u8 {
+                    ve = ve - 1
+                }
+            }
+            var len: usize = ve - vs
+            if len > 64 {
+                len = 64
+            }
+            var q: usize = 0
+            while q < len {
+                (*r).charset[q] = low(rt.ld8(at, vs + q))
+                q = q + 1
+            }
+            (*r).ncharset = len
+        }
+        i = pe
+    }
+}
+
+// ------------------------------------------------------------ Cache-Control
+
+// Reads `max-age`, `no-store` and `no-cache` out of a `Cache-Control`
+// value. Returns the lifetime in seconds, or NO_MAXAGE when none was
+// given; `store` and `must_ask` come back through the pointers.
+fn cache_control(v: u64, n: usize, store: *mut bool,
+    must_ask: *mut bool) -> u64 {
+    var age: u64 = NO_MAXAGE
+    var i: usize = 0
+    while i <= n {
+        var e: usize = i
+        while e < n && rt.ld8(v, e) != 44 as u8 {
+            e = e + 1
+        }
+        var s: usize = i
+        while s < e && is_ws(rt.ld8(v, s)) {
+            s = s + 1
+        }
+        var q: usize = e
+        while q > s && is_ws(rt.ld8(v, q - 1)) {
+            q = q - 1
+        }
+        var eq: usize = q
+        var k: usize = s
+        while k < q {
+            if rt.ld8(v, k) == 61 as u8 {
+                eq = k
+                break
+            }
+            k = k + 1
+        }
+        var l_ma: [u8; 7] = "max-age"
+        var l_ns: [u8; 8] = "no-store"
+        var l_nc: [u8; 8] = "no-cache"
+        if ci_eq(v + s as u64, eq - s, (&l_ns[0]) as u64, 8) {
+            *store = false
+        } else if ci_eq(v + s as u64, eq - s, (&l_nc[0]) as u64, 8) {
+            *must_ask = true
+        } else if eq < q && ci_eq(v + s as u64, eq - s, (&l_ma[0]) as u64, 7) {
+            var acc: u64 = 0
+            var any: bool = false
+            var d: usize = eq + 1
+            while d < q {
+                let ch: u8 = rt.ld8(v, d)
+                if ch < 48 as u8 || ch > 57 as u8 {
+                    any = false
+                    break
+                }
+                any = true
+                acc = acc * 10 as u64 + (ch - 48 as u8) as u64
+                d = d + 1
+            }
+            if any {
+                age = acc
+            }
+        }
+        if e >= n {
+            break
+        }
+        i = e + 1
+    }
+    return age
+}
+
+// Every `Set-Cookie` of the answer into the jar. The header may occur many
+// times, so the index is walked instead of `resp_header`.
+fn harvest_cookies(c: *mut Client, r: *mut Response, u: *mut url.Url) -> usize {
+    var h_sc: [u8; 10] = "Set-Cookie"
+    var taken: usize = 0
+    var i: usize = 0
+    while i < (*r).nh {
+        let noff: u32 = u32_at((*r).idx.ptr, i * 4)
+        let nlen: u32 = u32_at((*r).idx.ptr, i * 4 + 1)
+        if ci_eq((*r).raw.ptr + noff as u64, nlen as usize,
+            (&h_sc[0]) as u64, 10) {
+            let voff: u32 = u32_at((*r).idx.ptr, i * 4 + 2)
+            let vlen: u32 = u32_at((*r).idx.ptr, i * 4 + 3)
+            if httpstate.jar_set_cookie(&(*c).jar, (*r).raw.ptr + voff as u64,
+                vlen as usize, url.url_host_ptr(u), url.url_host_len(u),
+                url.url_path_ptr(u), url.url_path_len(u), client_now(c)) {
+                taken = taken + 1
+            }
+        }
+        i = i + 1
+    }
+    return taken
+}
+
+fn scheme_ok(u: *mut url.Url) -> HttpError!bool {
+    // ROUND B5: `https` is no longer the boundary -- `want_conn` runs a
+    // TLS 1.3 handshake and checks the certificate chain. What is still
+    // refused is every OTHER scheme.
+    if url.url_is_https(u) || url.url_is_http(u) {
+        return true
+    }
+    return HttpError::Scheme
+}
+
+fn status_is_redirect(s: u32) -> bool {
+    return s == 301 as u32 || s == 302 as u32 || s == 303 as u32 ||
+    s == 307 as u32 || s == 308 as u32
+}
+
+// ------------------------------------------------------------ One exchange
+
+fn exchange(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
+    body: u64, nb: usize, ctype: u64, nct: usize,
+    inm: u64, ninm: usize, ims: u64, nims: usize,
+    r: *mut Response) -> HttpError!bool {
+    let oks: bool = try scheme_ok(u)
+    let okc: bool = try want_conn(c, u)
+    var req: rt.Buf = rt.buf_new()
+    build_request(c, u, method, nm, body, nb, ctype, nct, inm, ninm,
+        ims, nims, &req)
+    var sent: bool = send_all(c, req.ptr, req.len)
+    if !sent && (*c).reused > 0 as u64 {
+        // A connection the server closed while it stood idle fails on the
+        // FIRST write and on no other. One retry on a fresh socket, and
+        // exactly one: a second failure is a real failure.
+        drop_conn(c)
+        let ok2: bool = try want_conn(c, u)
+        sent = send_all(c, req.ptr, req.len)
+    }
+    rt.buf_free(&req)
+    if !sent {
+        drop_conn(c)
+        return HttpError::Send
+    }
+    (*c).requests = (*c).requests + 1
+
+    let hn: usize = try read_head(c, r)
+    let okp: bool = try parse_head(r)
+
+    // --- how long is the body? RFC 9112, 6.3, in its order.
+    var h_te: [u8; 17] = "Transfer-Encoding"
+    var h_cl: [u8; 14] = "Content-Length"
+    var h_ce: [u8; 16] = "Content-Encoding"
+    var h_cn: [u8; 10] = "Connection"
+    var at: u64 = 0
+    let nte: usize = resp_header(r, (&h_te[0]) as u64, 17, &at)
+    var chunked: bool = false
+    if nte > 0 {
+        var ck: [u8; 7] = "chunked"
+        // `chunked` has to be the LAST coding; anything else is refused.
+        if nte >= 7 && ci_eq(at + (nte - 7) as u64, 7, (&ck[0]) as u64, 7) {
+            chunked = true
+        } else {
+            return HttpError::Body
+        }
+    }
+    var clen: usize = 0
+    var have_clen: bool = false
+    var atc: u64 = 0
+    let ncl: usize = resp_header(r, (&h_cl[0]) as u64, 14, &atc)
+    if ncl > 0 {
+        var acc: usize = 0
+        var any: bool = false
+        var i: usize = 0
+        while i < ncl {
+            let ch: u8 = rt.ld8(atc, i)
+            if ch < 48 as u8 || ch > 57 as u8 {
+                any = false
+                break
+            }
+            any = true
+            acc = acc * 10 + (ch - 48 as u8) as usize
+            i = i + 1
+        }
+        if !any {
+            return HttpError::Header
+        }
+        clen = acc
+        have_clen = true
+    }
+    // 1xx, 204 and 304 never carry a body, whatever they announce.
+    let bodyless: bool = (*r).status < 200 as u32 ||
+    (*r).status == 204 as u32 || (*r).status == 304 as u32
+    var head_req: bool = false
+    var hm: [u8; 4] = "HEAD"
+    if ci_eq(method, nm, (&hm[0]) as u64, 4) {
+        head_req = true
+    }
+    (*r).keep = true
+    var atn: u64 = 0
+    let ncn: usize = resp_header(r, (&h_cn[0]) as u64, 10, &atn)
+    if ncn > 0 {
+        var cl: [u8; 5] = "close"
+        if ci_eq(atn, ncn, (&cl[0]) as u64, 5) {
+            (*r).keep = false
+        }
+    }
+    if bodyless || head_req {
+        (*r).wire = 0
+    } else if chunked {
+        let okb: bool = try read_chunked(c, r)
+    } else if have_clen {
+        let okb: bool = try read_exact_body(c, clen, &(*r).body)
+        (*r).wire = clen
+    } else {
+        // No framing at all: the body ends when the connection does. That
+        // makes the connection unusable afterwards, by definition.
+        let okb: bool = try read_until_close(c, &(*r).body)
+        (*r).wire = (*r).body.len
+        (*r).keep = false
+    }
+    if !(*c).keep_alive {
+        (*r).keep = false
+    }
+    var atE: u64 = 0
+    let nce: usize = resp_header(r, (&h_ce[0]) as u64, 16, &atE)
+    if nce > 0 && (*r).body.len > 0 {
+        let oke: bool = try undo_encoding(r, atE, nce)
+    }
+    split_content_type(r)
+    let ncook: usize = harvest_cookies(c, r, u)
+    if !(*r).keep {
+        drop_conn(c)
+    } else if (*c).rpos >= (*c).rbuf.len {
+        rt.buf_clear(&(*c).rbuf)
+        (*c).rpos = 0
+    }
+    return true
+}
+
+// ------------------------------------------------------------- The fetch
+
+// The whole thing: cache, request, redirects, cache again. `method` is
+// "GET" or "POST"; the body may be empty.
+fn http_fetch(c: *mut Client, method: u64, nm: usize, urltext: u64,
+    nurl: usize, body: u64, nb: usize, ctype: u64, nct: usize,
+    r: *mut Response) -> HttpError!bool {
+    resp_reset(r)
+    var cur: url.Url = url.url_new()
+    if !url.url_parse(urltext, nurl, &cur) {
+        return HttpError::Url
+    }
+    var key: rt.Buf = rt.buf_new()
+    var chain: rt.Buf = rt.buf_new()
+    var meth: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&meth, method, nm)
+    var bp: u64 = body
+    var bn: usize = nb
+    var hops: u32 = 0
+    var out_ok: bool = false
+    var failed: u32 = 0
+    var running: bool = true
+    while running {
+        rt.buf_clear(&key)
+        url.url_write(&cur, &key)
+        // --- the redirect loop guard: has this exact URL been here before?
+        var seen: usize = 0
+        var i: usize = 0
+        while i + 4 <= chain.len {
+            let l: usize = rt.ld8(chain.ptr, i) as usize |
+            ((rt.ld8(chain.ptr, i + 1) as usize) << 8)
+            if l == key.len &&
+            rt.mem_eq(chain.ptr + (i + 4) as u64, key.ptr, l) {
+                seen = seen + 1
+            }
+            i = i + 4 + l
+        }
+        if seen > 0 {
+            failed = 2
+            running = false
+            break
+        }
+        rt.buf_push(&chain, (key.len & 255) as u8)
+        rt.buf_push(&chain, ((key.len >> 8) & 255) as u8)
+        rt.buf_push(&chain, 0 as u8)
+        rt.buf_push(&chain, 0 as u8)
+        rt.buf_push_bytes(&chain, key.ptr, key.len)
+
+        // --- the cache, for GET only (a POST is not idempotent)
+        var is_get: bool = false
+        var gm: [u8; 3] = "GET"
+        if ci_eq(meth.ptr, meth.len, (&gm[0]) as u64, 3) {
+            is_get = true
+        }
+        var ent: i64 = -1
+        var fresh: bool = false
+        if is_get && (*c).use_cache {
+            ent = httpstate.cache_lookup(&(*c).cache, key.ptr, key.len,
+                client_now(c), &fresh)
+        }
+        if ent >= 0 && fresh {
+            rt.buf_push_bytes(&(*r).body,
+                httpstate.cache_body_ptr(&(*c).cache, ent as usize),
+                httpstate.cache_body_len(&(*c).cache, ent as usize))
+            (*r).status = httpstate.cache_status(&(*c).cache,
+                ent as usize) as u32
+            (*r).from_cache = true
+            (*r).hops = hops
+            out_ok = true
+            running = false
+            break
+        }
+        var inm: u64 = 0
+        var ninm: usize = 0
+        if ent >= 0 {
+            ninm = httpstate.cache_etag_len(&(*c).cache, ent as usize)
+            inm = httpstate.cache_etag_ptr(&(*c).cache, ent as usize)
+        }
+        resp_reset(r)
+        let ok: bool = exchange(c, &cur, meth.ptr, meth.len, bp, bn,
+            ctype, nct, inm, ninm, 0 as u64, 0, r) catch | e | note(&failed, e)
+        if failed != 0 as u32 {
+            running = false
+            break
+        }
+        // --- 304: what is in the cache is still good
+        if (*r).status == 304 as u32 && ent >= 0 {
+            var h_cc0: [u8; 13] = "Cache-Control"
+            var atc0: u64 = 0
+            let ncc0: usize = resp_header(r, (&h_cc0[0]) as u64, 13, &atc0)
+            var store0: bool = true
+            var ask0: bool = false
+            var age0: u64 = NO_MAXAGE
+            if ncc0 > 0 {
+                age0 = cache_control(atc0, ncc0, &store0, &ask0)
+            }
+            httpstate.cache_touch_304(&(*c).cache, ent as usize, age0,
+                client_now(c))
+            rt.buf_clear(&(*r).body)
+            rt.buf_push_bytes(&(*r).body,
+                httpstate.cache_body_ptr(&(*c).cache, ent as usize),
+                httpstate.cache_body_len(&(*c).cache, ent as usize))
+            (*r).status = httpstate.cache_status(&(*c).cache,
+                ent as usize) as u32
+            (*r).from_cache = true
+            (*r).hops = hops
+            out_ok = true
+            running = false
+            break
+        }
+        // --- a redirect?
+        if status_is_redirect((*r).status) {
+            var h_loc: [u8; 8] = "Location"
+            var atl: u64 = 0
+            let nloc: usize = resp_header(r, (&h_loc[0]) as u64, 8, &atl)
+            if nloc == 0 {
+                out_ok = true
+                running = false
+                break
+            }
+            if hops >= (*c).max_redirects {
+                failed = 1
+                running = false
+                break
+            }
+            var next: url.Url = url.url_new()
+            if !url.url_parse_rel(&cur, atl, nloc, &next) {
+                failed = 3
+                running = false
+                break
+            }
+            // RFC 9110 15.4: 303 becomes a GET without a body; 301 and 302
+            // are turned into GET by every browser there is, and this one
+            // does the same and says so; 307/308 keep method and body.
+            if (*r).status == 303 as u32 || (*r).status == 301 as u32 ||
+            (*r).status == 302 as u32 {
+                var pm: [u8; 4] = "POST"
+                if ci_eq(meth.ptr, meth.len, (&pm[0]) as u64, 4) {
+                    rt.buf_clear(&meth)
+                    rt.buf_push_bytes(&meth, (&gm[0]) as u64, 3)
+                    bp = 0
+                    bn = 0
+                }
+            }
+            cur = next
+            hops = hops + 1 as u32
+            (*c).redirects = (*c).redirects + 1
+            continue
+        }
+        // --- store it?
+        if is_get && (*c).use_cache && (*r).status == 200 as u32 {
+            var h_cc: [u8; 13] = "Cache-Control"
+            var h_et: [u8; 4] = "ETag"
+            var h_lm: [u8; 13] = "Last-Modified"
+            var atc: u64 = 0
+            let ncc: usize = resp_header(r, (&h_cc[0]) as u64, 13, &atc)
+            var store: bool = true
+            var ask: bool = false
+            var age: u64 = NO_MAXAGE
+            if ncc > 0 {
+                age = cache_control(atc, ncc, &store, &ask)
+            }
+            if ask {
+                age = 0
+            }
+            var ate: u64 = 0
+            let net_: usize = resp_header(r, (&h_et[0]) as u64, 4, &ate)
+            var atm: u64 = 0
+            let nlm: usize = resp_header(r, (&h_lm[0]) as u64, 13, &atm)
+            if store {
+                let oks: bool = httpstate.cache_store(&(*c).cache, key.ptr,
+                    key.len, (*r).status as u64, (*r).body.ptr, (*r).body.len,
+                    ate, net_, (&(*r).media[0]) as u64, (*r).nmedia,
+                    atm, nlm, age, client_now(c))
+            }
+        }
+        out_ok = true
+        running = false
+    }
+    (*r).hops = hops
+    if out_ok {
+        var fl: usize = key.len
+        if fl > 768 {
+            fl = 768
+        }
+        rt.mem_copy((&(*r).final_url[0]) as u64, key.ptr, fl)
+        (*r).nfinal = fl
+    }
+    rt.buf_free(&key)
+    rt.buf_free(&chain)
+    rt.buf_free(&meth)
+    if failed == 1 as u32 {
+        return HttpError::TooManyRedirects
+    }
+    if failed == 2 as u32 {
+        return HttpError::RedirectLoop
+    }
+    if failed == 3 as u32 {
+        return HttpError::Url
+    }
+    if failed >= 10 as u32 {
+        return err_of(failed - 10 as u32)
+    }
+    return out_ok
+}
+
+// `catch |e|` needs a value of the success type; the error is parked in a
+// number and turned back into an error union at the end of the loop. That
+// detour exists because a `catch` cannot `return` in stage 0.
+fn note(slot: *mut u32, e: HttpError) -> bool {
+    *slot = 10 as u32 + err_num(e)
+    return false
+}
+
+fn err_num(e: HttpError) -> u32 {
+    if e == HttpError::Url { return 1 as u32 }
+    if e == HttpError::Scheme { return 2 as u32 }
+    if e == HttpError::Tls { return 3 as u32 }
+    if e == HttpError::Resolve { return 4 as u32 }
+    if e == HttpError::Connect { return 5 as u32 }
+    if e == HttpError::Send { return 6 as u32 }
+    if e == HttpError::Recv { return 7 as u32 }
+    if e == HttpError::Closed { return 8 as u32 }
+    if e == HttpError::Status { return 9 as u32 }
+    if e == HttpError::Header { return 10 as u32 }
+    if e == HttpError::Body { return 11 as u32 }
+    if e == HttpError::Encoding { return 12 as u32 }
+    if e == HttpError::TooManyRedirects { return 13 as u32 }
+    if e == HttpError::RedirectLoop { return 14 as u32 }
+    if e == HttpError::TooLarge { return 15 as u32 }
+    return 16 as u32
+}
+
+fn err_of(n: u32) -> HttpError {
+    if n == 1 as u32 { return HttpError::Url }
+    if n == 2 as u32 { return HttpError::Scheme }
+    if n == 3 as u32 { return HttpError::Tls }
+    if n == 4 as u32 { return HttpError::Resolve }
+    if n == 5 as u32 { return HttpError::Connect }
+    if n == 6 as u32 { return HttpError::Send }
+    if n == 7 as u32 { return HttpError::Recv }
+    if n == 8 as u32 { return HttpError::Closed }
+    if n == 9 as u32 { return HttpError::Status }
+    if n == 10 as u32 { return HttpError::Header }
+    if n == 11 as u32 { return HttpError::Body }
+    if n == 12 as u32 { return HttpError::Encoding }
+    if n == 13 as u32 { return HttpError::TooManyRedirects }
+    if n == 14 as u32 { return HttpError::RedirectLoop }
+    if n == 15 as u32 { return HttpError::TooLarge }
+    return HttpError::OutOfMemory
+}
+
+fn http_get(c: *mut Client, u: u64, n: usize,
+    r: *mut Response) -> HttpError!bool {
+    var m: [u8; 3] = "GET"
+    return http_fetch(c, (&m[0]) as u64, 3, u, n, 0 as u64, 0,
+        0 as u64, 0, r)
+}
+
+fn http_post(c: *mut Client, u: u64, n: usize, body: u64, nb: usize,
+    ctype: u64, nct: usize, r: *mut Response) -> HttpError!bool {
+    var m: [u8; 4] = "POST"
+    return http_fetch(c, (&m[0]) as u64, 4, u, n, body, nb, ctype, nct, r)
+}
+
+// The name of an error, for a report. It lives here and not in the driver
+// because an error variant of an imported module cannot be named from
+// outside it in stage 0 -- `http.HttpError::Tls` is not a form the parser
+// takes, and a number the caller has to decode again would be worse.
+fn err_name_of(e: HttpError, out: *mut rt.Buf) {
+    var t: [u8; 111] = "UrlSchemeTlsResolveConnectSendRecvClosedStatusHeaderBodyEncodingTooManyRedirectsRedirectLoopTooLargeOutOfMemory"
+    var offs: [usize; 17] = [0, 0, 3, 9, 12, 19, 26, 30, 34, 40, 46, 52, 56,
+        64, 80, 92, 100]
+    var lens: [usize; 17] = [0, 3, 6, 3, 7, 7, 4, 4, 6, 6, 6, 4, 8, 16, 12,
+        8, 11]
+    let k: u32 = err_num(e)
+    var i: usize = k as usize
+    if i > 16 {
+        i = 16
+    }
+    rt.buf_push_bytes(out, (&t[0]) as u64 + offs[i] as u64, lens[i])
+}
+
+// `catch |x| http.fail_into(&out, x)` -- the driver cannot name the error
+// TYPE of an imported module either, so the whole handler lives here.
+fn fail_into(out: *mut rt.Buf, e: HttpError) -> bool {
+    var m: [u8; 4] = "ERR "
+    rt.buf_push_bytes(out, (&m[0]) as u64, 4)
+    err_name_of(e, out)
+    rt.buf_push(out, 10 as u8)
+    return false
+}

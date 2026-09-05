@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/hkdf.fi -- HKDF (RFC 5869), round B5.
+//
+// A key exchange produces one number. A TLS connection needs eight keys
+// out of it -- two traffic keys, two initialisation vectors, two finished
+// keys, an exporter and a resumption secret -- and they must be
+// independent: an attacker who learns one must learn nothing about the
+// others. Cutting a hash output into pieces does not have that property,
+// and neither does hashing the secret with a counter.
+//
+// HKDF is the construction that does, and it is deliberately TWO steps:
+//
+//   EXTRACT  PRK = HMAC(salt, IKM)
+//     turns whatever entropy the input has into a fixed-size, uniformly
+//     random key. The input of a Diffie-Hellman exchange is NOT uniform --
+//     it is a point on a curve, and its octets have structure. The salt is
+//     not secret; its job is to separate deployments.
+//
+//   EXPAND   OKM = T(1) | T(2) | ...  with  T(i) = HMAC(PRK, T(i-1)|info|i)
+//     stretches that key to as many octets as are wanted, with `info`
+//     binding each output to what it is FOR. Two different `info` strings
+//     give two outputs that are independent even though they came from one
+//     secret. That is the whole point, and it is why TLS 1.3 puts the name
+//     of the key in `info` (RFC 8446 7.1).
+//
+// The counter is ONE OCTET and it starts at 1, so the longest output is
+// 255 hash lengths = 8160 octets for SHA-256. `hkdf_expand` refuses more
+// rather than wrapping the counter, which would silently repeat T(1).
+//
+// PROVEN: the seven test vectors of RFC 5869 appendix A (including the
+// zero-length salt and info cases, and case 3 where the salt is empty --
+// which is where an implementation that confuses "no salt" with "no
+// HMAC key" goes wrong), in `tools/tlsb5/crypto_check.py` against
+// Python's `cryptography.hazmat.primitives.kdf.hkdf`.
+import std.rt
+import std.crypto.hmac
+import std.crypto.sha256
+
+export { hkdf_extract, hkdf_expand, hkdf, HKDF_HASH }
+
+const HKDF_HASH: usize = 32
+
+// PRK = HMAC-SHA256(salt, IKM). An EMPTY salt is not "no HMAC": RFC 5869
+// says a salt that is not given is `HashLen` zero octets, and that is a
+// different key from a zero-length one only because HMAC pads a short key
+// with zeros anyway -- so the two agree, and this is the one place where
+// two different readings of the standard happen to give the same answer.
+fn hkdf_extract(salt: u64, saltlen: usize, ikm: u64, ikmlen: usize,
+    prk: u64) {
+    hmac.hmac_sha256(salt, saltlen, ikm, ikmlen, prk)
+}
+
+fn hkdf_expand(prk: u64, prklen: usize, info: u64, infolen: usize,
+    out: u64, outlen: usize) -> bool {
+    if outlen > 255 * HKDF_HASH {
+        return false
+    }
+    var t: [u8; 32] = [0; 32]
+    var block: rt.Buf = rt.buf_new()
+    var done: usize = 0
+    var counter: usize = 1
+    while done < outlen {
+        rt.buf_clear(&block)
+        if counter > 1 {
+            rt.buf_push_bytes(&block, (&t[0]) as u64, HKDF_HASH)
+        }
+        rt.buf_push_bytes(&block, info, infolen)
+        rt.buf_push(&block, (counter & 255) as u8)
+        hmac.hmac_sha256(prk, prklen, block.ptr, block.len, (&t[0]) as u64)
+        var i: usize = 0
+        while i < HKDF_HASH && done < outlen {
+            rt.st8(out, done, t[i])
+            done = done + 1
+            i = i + 1
+        }
+        counter = counter + 1
+    }
+    rt.buf_free(&block)
+    return true
+}
+
+// Both steps in one call, for callers that have no use for the PRK.
+fn hkdf(salt: u64, saltlen: usize, ikm: u64, ikmlen: usize,
+    info: u64, infolen: usize, out: u64, outlen: usize) -> bool {
+    var prk: [u8; 32] = [0; 32]
+    hkdf_extract(salt, saltlen, ikm, ikmlen, (&prk[0]) as u64)
+    return hkdf_expand((&prk[0]) as u64, HKDF_HASH, info, infolen,
+        out, outlen)
+}

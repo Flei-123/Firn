@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/net/dns.fi -- turning a name into an address (RFC 1035), round B5.
+//
+// Round B4 named this as its second boundary: "there is no name resolver.
+// `lib/std/net.fi` takes a numeric address, so `addr_of_host` accepts a
+// dotted quad and `localhost` and refuses everything else." With TLS in
+// place that boundary became the one thing still stopping the browser from
+// opening a real page, so it goes here.
+//
+// ================================================== OVER TCP, NOT OVER UDP
+//
+// DNS is normally UDP on port 53, and this file uses TCP on port 53
+// instead. That is a deliberate trade and it is worth being clear about:
+//
+//   * TCP DNS is in the standard from the beginning (RFC 1035 4.2.2) and
+//     every resolver worth the name answers on it -- it is what a resolver
+//     falls back to for answers larger than 512 octets anyway.
+//   * it needs NO new system call. `lib/std/net.fi` has `connect_tcp`,
+//     `read` and `write_all`, and that is the whole transport. A UDP path
+//     means `sendto`/`recvfrom` with an address structure, a timeout that
+//     is not the socket's, and a retry loop -- a second network stack in
+//     the round that already has TLS in it.
+//   * the cost is one round trip more per lookup and a resolver that
+//     blocks TCP is a resolver this browser cannot use. Both are written
+//     down here rather than discovered later.
+//
+// The message is the same either way, with a two octet length in front
+// (RFC 1035 4.2.2).
+//
+// ================================================================ THE PARSE
+//
+// A DNS answer is the classic hostile input: it comes from the network,
+// the parser runs before anything is checked, and it has COMPRESSION
+// POINTERS -- a name can say "the rest of me is at offset N", and N may
+// point backwards, forwards, or at itself. A parser that follows them
+// naively loops forever on a message an attacker writes in four octets.
+//
+// So: every pointer must point STRICTLY BACKWARDS from where it stands,
+// and at most `MAX_JUMPS` of them are followed. Both conditions are
+// checked, not one -- the backward rule alone still allows a chain of
+// 16000 single-octet hops through a 64 KiB message.
+//
+// ==================================================================== HONEST
+//
+// D1 A RECORDS ONLY, so IPv4 only. There is no AAAA lookup and no IPv6
+//    socket in `lib/std/net.fi` to use one with (its own limit N3). A host
+//    that is only reachable over IPv6 cannot be reached.
+// D2 NO CACHE, and therefore no TTL handling. Every fetch of every URL
+//    resolves again. A browser needs a cache; this round measures the
+//    resolver, not the cache.
+// D3 NO DNSSEC, no DNS over TLS, no DNS over HTTPS. The answer is trusted
+//    as far as the operating system's resolver is trusted -- which is
+//    exactly as far as every other program on the machine trusts it. The
+//    TLS certificate check is what makes a forged answer useless, and that
+//    is the real defence.
+// D4 THE FIRST `nameserver` LINE of /etc/resolv.conf wins. No search
+//    list, no `options`, no `ndots`. A name is looked up as it stands.
+import std.rt
+import std.net
+
+export { DnsError, resolve_a, resolve_with, read_resolv_conf }
+
+error DnsError {
+    NoServer, // /etc/resolv.conf has no usable nameserver line
+    Connect,
+    Io,
+    Format, // the answer contradicts RFC 1035
+    NotFound, // the name has no A record
+    TooLong,
+}
+
+const MAX_MSG: usize = 4096
+const MAX_JUMPS: usize = 16
+const MAX_NAME: usize = 255
+
+// The first `nameserver <dotted quad>` of /etc/resolv.conf. Returns 0 when
+// there is none.
+fn read_resolv_conf() -> u32 {
+    var path: [u8; 17] = "/etc/resolv.conf\0"
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file((&path[0]) as u64, &b) {
+        rt.buf_free(&b)
+        return 0 as u32
+    }
+    var key: [u8; 10] = "nameserver"
+    let p: u64 = b.ptr
+    let n: usize = b.len
+    var i: usize = 0
+    var found: u32 = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        if e - i > 11 {
+            var same: bool = true
+            var k: usize = 0
+            while k < 10 {
+                if rt.ld8(p, i + k) != key[k] {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same && rt.ld8(p, i + 10) == 32 as u8 {
+                var at: usize = i + 11
+                while at < e && rt.ld8(p, at) == 32 as u8 {
+                    at = at + 1
+                }
+                var parts: [u32; 4] = [0; 4]
+                var pi: usize = 0
+                var v: u32 = 0
+                var digits: usize = 0
+                var bad: bool = false
+                while at < e {
+                    let ch: u8 = rt.ld8(p, at)
+                    if ch == 46 as u8 {
+                        if pi >= 3 || digits == 0 {
+                            bad = true
+                            break
+                        }
+                        parts[pi] = v
+                        pi = pi + 1
+                        v = 0
+                        digits = 0
+                    } else if ch >= 48 as u8 && ch <= 57 as u8 {
+                        v = v * 10 as u32 + (ch - 48 as u8) as u32
+                        digits = digits + 1
+                        if v > 255 as u32 {
+                            bad = true
+                            break
+                        }
+                    } else {
+                        break
+                    }
+                    at = at + 1
+                }
+                if !bad && pi == 3 && digits > 0 {
+                    parts[3] = v
+                    found = net.ipv4(parts[0] as u8, parts[1] as u8,
+                        parts[2] as u8, parts[3] as u8)
+                    break
+                }
+            }
+        }
+        i = e + 1
+    }
+    rt.buf_free(&b)
+    return found
+}
+
+// The QNAME form: every label with its length in front, terminated by a
+// zero octet. A label above 63 octets or a name above 255 is refused --
+// those are the limits of RFC 1035 2.3.4 and an encoder that ignores them
+// writes a message no resolver will read.
+fn push_qname(b: *mut rt.Buf, host: u64, n: usize) -> bool {
+    if n == 0 || n > MAX_NAME {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(host, e) != 46 as u8 {
+            e = e + 1
+        }
+        let len: usize = e - i
+        if len == 0 || len > 63 {
+            return false
+        }
+        rt.buf_push(b, len as u8)
+        rt.buf_push_bytes(b, host + i as u64, len)
+        i = e + 1
+    }
+    rt.buf_push(b, 0 as u8)
+    return true
+}
+
+// Walks over a name at `at` and returns the offset just past it -- the
+// caller needs that to find the next field, and a compressed name is TWO
+// octets long however many labels it stands for.
+fn skip_name(p: u64, n: usize, at: usize, out: *mut usize) -> bool {
+    var i: usize = at
+    var jumps: usize = 0
+    var ended: bool = false
+    while i < n {
+        let len: u8 = rt.ld8(p, i)
+        if (len & 192 as u8) == 192 as u8 {
+            if i + 1 >= n {
+                return false
+            }
+            if !ended {
+                *out = i + 2
+                ended = true
+            }
+            let target: usize = (((len & 63 as u8) as usize) << 8)
+            | (rt.ld8(p, i + 1) as usize)
+            // strictly backwards, and only so many times -- see the head
+            if target >= i {
+                return false
+            }
+            jumps = jumps + 1
+            if jumps > MAX_JUMPS {
+                return false
+            }
+            i = target
+            continue
+        }
+        if len == 0 as u8 {
+            if !ended {
+                *out = i + 1
+            }
+            return true
+        }
+        if (len & 192 as u8) != 0 as u8 {
+            return false // the other two label types are not in use
+        }
+        i = i + 1 + (len as usize)
+    }
+    return false
+}
+
+fn be16at(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 8) | (rt.ld8(p, off + 1) as u32)
+}
+
+// Asks `server` for the A record of `host`. `out` gets the address in the
+// same form `net.ipv4` produces.
+fn resolve_with(server: u32, host: u64, hn: usize, out: *mut u32)
+-> DnsError!bool {
+    var q: rt.Buf = rt.buf_new()
+    // The transaction id does not have to be unpredictable here: the
+    // answer arrives over a TCP connection this process opened, so there
+    // is nobody to spoof it who could not simply read the socket.
+    rt.buf_push(&q, 0 as u8)
+    rt.buf_push(&q, 0 as u8)
+    rt.buf_push(&q, 1 as u8) // recursion desired
+    rt.buf_push(&q, 0 as u8)
+    rt.buf_push(&q, 0 as u8)
+    rt.buf_push(&q, 1 as u8) // one question
+    var z: usize = 0
+    while z < 6 {
+        rt.buf_push(&q, 0 as u8)
+        z = z + 1
+    }
+    if !push_qname(&q, host, hn) {
+        rt.buf_free(&q)
+        return DnsError::TooLong
+    }
+    rt.buf_push(&q, 0 as u8)
+    rt.buf_push(&q, 1 as u8) // QTYPE = A
+    rt.buf_push(&q, 0 as u8)
+    rt.buf_push(&q, 1 as u8) // QCLASS = IN
+    var framed: rt.Buf = rt.buf_new()
+    rt.buf_push(&framed, ((q.len >> 8) & 255) as u8)
+    rt.buf_push(&framed, (q.len & 255) as u8)
+    rt.buf_push_bytes(&framed, q.ptr, q.len)
+    rt.buf_free(&q)
+
+    var bad: bool = false
+    var c: net.Conn = net.connect_tcp(server, 53 as u16)
+    catch | e | conn_fail(&bad)
+    if bad {
+        rt.buf_free(&framed)
+        return DnsError::Connect
+    }
+    let okt: bool = net.set_timeout(&c, 5000 as u64) catch false
+    let sent: usize = net.write_all(&c, framed.ptr, framed.len) catch 0
+    rt.buf_free(&framed)
+    if sent == 0 {
+        net.close(&c)
+        return DnsError::Io
+    }
+    var resp: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&resp, MAX_MSG)
+    var have: usize = 0
+    var need: usize = 2
+    while have < need {
+        let k: usize = net.read(&c, resp.ptr + have as u64,
+            MAX_MSG - have) catch 0
+        if k == 0 {
+            net.close(&c)
+            rt.buf_free(&resp)
+            return DnsError::Io
+        }
+        have = have + k
+        if have >= 2 {
+            need = 2 + (((rt.ld8(resp.ptr, 0) as usize) << 8)
+                | (rt.ld8(resp.ptr, 1) as usize))
+            if need > MAX_MSG {
+                net.close(&c)
+                rt.buf_free(&resp)
+                return DnsError::TooLong
+            }
+        }
+    }
+    net.close(&c)
+    let p: u64 = resp.ptr + 2
+    let n: usize = need - 2
+    if n < 12 {
+        rt.buf_free(&resp)
+        return DnsError::Format
+    }
+    let flags: u32 = be16at(p, 2)
+    if (flags & 15 as u32) != 0 as u32 {
+        rt.buf_free(&resp)
+        return DnsError::NotFound // RCODE != 0
+    }
+    let qd: u32 = be16at(p, 4)
+    let an: u32 = be16at(p, 6)
+    var at: usize = 12
+    var i: u32 = 0
+    while i < qd {
+        var nxt: usize = 0
+        if !skip_name(p, n, at, &nxt) {
+            rt.buf_free(&resp)
+            return DnsError::Format
+        }
+        at = nxt + 4
+        i = i + 1 as u32
+    }
+    i = 0
+    var found: bool = false
+    while i < an && at + 10 <= n {
+        var nxt: usize = 0
+        if !skip_name(p, n, at, &nxt) {
+            rt.buf_free(&resp)
+            return DnsError::Format
+        }
+        at = nxt
+        if at + 10 > n {
+            break
+        }
+        let rtype: u32 = be16at(p, at)
+        let rdlen: usize = be16at(p, at + 8) as usize
+        at = at + 10
+        if at + rdlen > n {
+            rt.buf_free(&resp)
+            return DnsError::Format
+        }
+        if rtype == 1 as u32 && rdlen == 4 && !found {
+            // A CNAME earlier in the same answer needs no following: a
+            // resolver that answers a recursive query puts the A record
+            // for the target in the SAME message (RFC 1034 4.3.2).
+            *out = net.ipv4(rt.ld8(p, at), rt.ld8(p, at + 1),
+                rt.ld8(p, at + 2), rt.ld8(p, at + 3))
+            found = true
+        }
+        at = at + rdlen
+        i = i + 1 as u32
+    }
+    rt.buf_free(&resp)
+    if !found {
+        return DnsError::NotFound
+    }
+    return true
+}
+
+fn conn_fail(bad: *mut bool) -> net.Conn {
+    *bad = true
+    return net.Conn { fd: -1, err: 0, peer: 0 as u32, peer_port: 0 as u16 }
+}
+
+// The same with the machine's own resolver.
+fn resolve_a(host: u64, hn: usize, out: *mut u32) -> DnsError!bool {
+    let server: u32 = read_resolv_conf()
+    if server == 0 as u32 {
+        return DnsError::NoServer
+    }
+    return resolve_with(server, host, hn, out)
+}

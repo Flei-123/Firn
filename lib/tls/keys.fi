@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/tls/keys.fi -- the TLS 1.3 key schedule (RFC 8446 7.1), round B5.
+//
+// One shared secret comes out of X25519. Out of it come, in this order:
+// two handshake traffic secrets, two application traffic secrets, two
+// finished keys, and from each traffic secret a key and an
+// initialisation vector. Eleven values from one, and the whole point is
+// that knowing any of them tells you nothing about the others.
+//
+// ============================================================== THE LADDER
+//
+//              0
+//              |
+//              v
+//    PSK ->  HKDF-Extract  = Early Secret
+//              |
+//              +-> Derive-Secret(., "derived", "")
+//              |                 |
+//              v                 v
+//   (EC)DHE -> HKDF-Extract = Handshake Secret
+//              |
+//              +-> Derive-Secret(., "c hs traffic", ClientHello..ServerHello)
+//              +-> Derive-Secret(., "s hs traffic", ClientHello..ServerHello)
+//              |
+//              +-> Derive-Secret(., "derived", "")
+//              |                 |
+//              v                 v
+//    0      -> HKDF-Extract = Master Secret
+//              |
+//              +-> Derive-Secret(., "c ap traffic", ClientHello..server Fin)
+//              +-> Derive-Secret(., "s ap traffic", ClientHello..server Fin)
+//
+// EVERY STEP TAKES A TRANSCRIPT HASH. That is what binds the keys to the
+// exact messages that were exchanged: an attacker who changes one octet of
+// the ClientHello -- to remove a cipher suite, say -- changes every key
+// that comes afterwards, and the connection fails instead of silently
+// running with the weaker choice. This is the fix for the whole family of
+// downgrade attacks that TLS 1.2 needed a separate mechanism for.
+//
+// This round has NO pre-shared key and no early data, so the PSK input is
+// the all-zero string of hash length. That is not a shortcut, it is what
+// RFC 8446 7.1 prescribes when there is no PSK.
+//
+// ======================================================= HKDF-EXPAND-LABEL
+//
+//     struct {
+//         uint16 length;
+//         opaque label<7..255> = "tls13 " + Label;
+//         opaque context<0..255>;
+//     } HkdfLabel;
+//
+// The `"tls13 "` prefix is domain separation: it makes it impossible for a
+// value derived here to collide with one derived by any other protocol
+// that also uses HKDF with the same secret. The lengths are one octet
+// each and are what make the encoding unambiguous -- two different
+// (label, context) pairs cannot produce the same octets.
+//
+// ==================================================================== HONEST
+//
+// K1 SHA-256 ONLY. Both suites this round offers
+//    (`TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`) have
+//    SHA-256 as their hash, so the whole schedule is 32 octets wide. A
+//    SHA-384 suite would need this file to be generic over the hash, and
+//    `lib/tls/tls.fi` does not offer one.
+// K2 NO KEY UPDATE. RFC 8446 4.6.3 lets either side rotate its traffic
+//    key mid-connection. A `key_update` from the server is answered with
+//    a fatal alert here rather than ignored, because ignoring it means
+//    decrypting with the wrong key from that point on and reporting a
+//    corrupt page.
+// K3 NO RESUMPTION, NO EARLY DATA, NO EXPORTER. Those are three more
+//    branches of the same ladder and none of them is reachable from a
+//    browser that opens one connection and closes it.
+import std.rt
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.hkdf
+
+export { HASH_LEN, expand_label, derive_secret, transcript,
+    key_schedule_early, key_schedule_handshake, key_schedule_master,
+    traffic_keys, finished_key, finished_mac }
+
+const HASH_LEN: usize = 32
+
+// HKDF-Expand-Label(Secret, Label, Context, Length).
+fn expand_label(secret: u64, label: u64, llen: usize, ctx: u64,
+    clen: usize, out: u64, outlen: usize) -> bool {
+    if llen + 6 > 255 || clen > 255 {
+        return false
+    }
+    var info: rt.Buf = rt.buf_new()
+    rt.buf_push(&info, ((outlen >> 8) & 255) as u8)
+    rt.buf_push(&info, (outlen & 255) as u8)
+    var prefix: [u8; 6] = "tls13 "
+    rt.buf_push(&info, (llen + 6) as u8)
+    rt.buf_push_bytes(&info, (&prefix[0]) as u64, 6)
+    rt.buf_push_bytes(&info, label, llen)
+    rt.buf_push(&info, clen as u8)
+    if clen > 0 {
+        rt.buf_push_bytes(&info, ctx, clen)
+    }
+    let ok: bool = hkdf.hkdf_expand(secret, HASH_LEN, info.ptr, info.len,
+        out, outlen)
+    rt.buf_free(&info)
+    return ok
+}
+
+// Derive-Secret(Secret, Label, Messages) -- the context is the TRANSCRIPT
+// HASH of the messages, not the messages.
+fn derive_secret(secret: u64, label: u64, llen: usize, msgs: u64,
+    mlen: usize, out: u64) -> bool {
+    var th: [u8; 32] = [0; 32]
+    sha256.sha256(msgs, mlen, (&th[0]) as u64)
+    return expand_label(secret, label, llen, (&th[0]) as u64, HASH_LEN,
+        out, HASH_LEN)
+}
+
+fn transcript(msgs: u64, mlen: usize, out: u64) {
+    sha256.sha256(msgs, mlen, out)
+}
+
+// Early Secret = HKDF-Extract(0, 0) when there is no PSK.
+fn key_schedule_early(out: u64) {
+    var zero: [u8; 32] = [0; 32]
+    var salt: [u8; 32] = [0; 32]
+    hkdf.hkdf_extract((&salt[0]) as u64, HASH_LEN, (&zero[0]) as u64,
+        HASH_LEN, out)
+}
+
+// Handshake Secret = HKDF-Extract(Derive-Secret(Early, "derived", ""), DHE)
+fn key_schedule_handshake(early: u64, dhe: u64, dhelen: usize, out: u64)
+-> bool {
+    var derived: [u8; 32] = [0; 32]
+    var lit: [u8; 7] = "derived"
+    var empty: [u8; 1] = [0; 1]
+    if !derive_secret(early, (&lit[0]) as u64, 7, (&empty[0]) as u64, 0,
+        (&derived[0]) as u64) {
+        return false
+    }
+    hkdf.hkdf_extract((&derived[0]) as u64, HASH_LEN, dhe, dhelen, out)
+    return true
+}
+
+// Master Secret = HKDF-Extract(Derive-Secret(Handshake, "derived", ""), 0)
+fn key_schedule_master(handshake: u64, out: u64) -> bool {
+    var derived: [u8; 32] = [0; 32]
+    var lit: [u8; 7] = "derived"
+    var empty: [u8; 1] = [0; 1]
+    if !derive_secret(handshake, (&lit[0]) as u64, 7, (&empty[0]) as u64, 0,
+        (&derived[0]) as u64) {
+        return false
+    }
+    var zero: [u8; 32] = [0; 32]
+    hkdf.hkdf_extract((&derived[0]) as u64, HASH_LEN, (&zero[0]) as u64,
+        HASH_LEN, out)
+    return true
+}
+
+// key = HKDF-Expand-Label(secret, "key", "", keylen)
+// iv  = HKDF-Expand-Label(secret, "iv",  "", 12)
+fn traffic_keys(secret: u64, keylen: usize, key: u64, iv: u64) -> bool {
+    var lk: [u8; 3] = "key"
+    var li: [u8; 2] = "iv"
+    var empty: [u8; 1] = [0; 1]
+    if !expand_label(secret, (&lk[0]) as u64, 3, (&empty[0]) as u64, 0,
+        key, keylen) {
+        return false
+    }
+    return expand_label(secret, (&li[0]) as u64, 2, (&empty[0]) as u64, 0,
+        iv, 12)
+}
+
+fn finished_key(secret: u64, out: u64) -> bool {
+    var lit: [u8; 8] = "finished"
+    var empty: [u8; 1] = [0; 1]
+    return expand_label(secret, (&lit[0]) as u64, 8, (&empty[0]) as u64, 0,
+        out, HASH_LEN)
+}
+
+// verify_data = HMAC(finished_key, Transcript-Hash(messages))
+fn finished_mac(fkey: u64, msgs: u64, mlen: usize, out: u64) {
+    var th: [u8; 32] = [0; 32]
+    sha256.sha256(msgs, mlen, (&th[0]) as u64)
+    hmac.hmac_sha256(fkey, HASH_LEN, (&th[0]) as u64, HASH_LEN, out)
+}

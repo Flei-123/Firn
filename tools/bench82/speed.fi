@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/bench82/speed.fi -- the stopwatch of round 82.
+//
+//     speed <what> <megabytes> <out>
+//
+// Writes ONE number to `<out>`: the microseconds the work took. Everything
+// else -- the throughput, the comparison against `openssl speed` and `gzip`,
+// the regression limits -- happens in `run.sh`, which is where it belongs:
+// this program must not be able to talk its own numbers up.
+//
+// `what` is one of:
+//
+//     sha256        SHA-256, whatever the processor can do (SHA-NI here)
+//     sha256-soft   SHA-256, the scalar path, forced
+//     aes           AES-128-CBC encryption, hardware path
+//     aes-soft      AES-128-CBC encryption, scalar path, forced
+//     aesd          AES-128-CBC decryption, hardware path
+//     aesd-soft     AES-128-CBC decryption, scalar path
+//     cfb8          AES-128-CFB8 encryption, hardware path
+//     cfb8-soft     AES-128-CFB8 encryption, scalar path
+//     deflate6      DEFLATE level 6 (against `gzip -6`)
+//     inflate       the other direction, over the level 6 output
+//     crc32         CRC-32 of `lib/std/deflate.fi` (table driven, scalar)
+//     dump          not a measurement: writes the DEFLATE test data to
+//                   `<out>`, so that `gzip -6` gets the same octets
+//
+// THE INPUT IS THE SAME EVERY TIME: a linear congruential sequence with a
+// fixed seed. Random data is the honest case for a cipher and the hostile
+// case for a compressor, so the DEFLATE measurement additionally folds the
+// stream down onto a small alphabet -- pure noise would measure the "stored
+// block" path and nothing else.
+//
+// WHAT IS MEASURED and what is not: the clock starts after the buffer is
+// filled and the key schedule is built, and stops before anything is freed.
+// `clock_gettime(CLOCK_MONOTONIC)` through the raw system call, as in
+// `tools/stdlib81/crypto_cli.fi`.
+import std.crypto.sha256
+import std.crypto.aes
+import std.deflate
+import std.rt
+import std.io
+
+fn eq_c(p: u64, lit: u64) -> bool {
+    let a: usize = rt.c_length(p)
+    let b: usize = rt.c_length(lit)
+    if a != b {
+        return false
+    }
+    return rt.mem_eq(p, lit, a)
+}
+
+fn dec_u64(p: u64) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    let n: usize = rt.c_length(p)
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            v = v * 10 + (c - 48 as u8) as usize
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn now_ns() -> u64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return ts[0] * 1000000000 + ts[1]
+}
+
+// The test data. `alphabet` = 0 gives full noise, otherwise the octets are
+// folded onto that many distinct values -- that is what makes a compressor
+// do work instead of giving up.
+fn fill(p: u64, n: usize, alphabet: usize) {
+    var x: u64 = 88172645463325252
+    var i: usize = 0
+    while i < n {
+        x = x * 6364136223846793005 + 1442695040888963407
+        var b: u64 = x >> 33
+        if alphabet > 0 {
+            b = b % (alphabet as u64)
+            // A little structure on top: every 64th octet starts a run of
+            // eight equal ones, so that the match finder has something to
+            // find. Without it DEFLATE measures its hash table and nothing
+            // else.
+            if (i % 64) < 8 {
+                b = 65
+            }
+        }
+        rt.st8(p, i, b as u8)
+        i = i + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 4 {
+        return 2
+    }
+    let what: u64 = rt.arg_ptr(start, 1)
+    let mb: usize = dec_u64(rt.arg_ptr(start, 2))
+    if mb == 0 {
+        return 2
+    }
+    let n: usize = mb * 1048576
+
+    var w_sha: [u8; 7] = "sha256\0"
+    var w_shas: [u8; 12] = "sha256-soft\0"
+    var w_aes: [u8; 4] = "aes\0"
+    var w_aess: [u8; 9] = "aes-soft\0"
+    var w_aesd: [u8; 5] = "aesd\0"
+    var w_aesds: [u8; 10] = "aesd-soft\0"
+    var w_cfb: [u8; 5] = "cfb8\0"
+    var w_cfbs: [u8; 10] = "cfb8-soft\0"
+    var w_def: [u8; 9] = "deflate6\0"
+    var w_inf: [u8; 8] = "inflate\0"
+    var w_crc: [u8; 6] = "crc32\0"
+    var w_dump: [u8; 5] = "dump\0"
+
+    let compressing: bool = eq_c(what, (&w_def[0]) as u64)
+    || eq_c(what, (&w_inf[0]) as u64)
+    || eq_c(what, (&w_dump[0]) as u64)
+    var alphabet: usize = 0
+    if compressing {
+        alphabet = 40
+    }
+
+    let p: u64 = rt.heap_alloc(n)
+    let q: u64 = rt.heap_alloc(n + 4096)
+    if p == 0 || q == 0 {
+        return 7
+    }
+    fill(p, n, alphabet)
+
+    var digest: [u8; 32] = [0; 32]
+    var key: [u8; 16] = [0; 16]
+    var iv: [u8; 16] = [0; 16]
+    var i: usize = 0
+    while i < 16 {
+        key[i] = (i * 7 + 1) as u8
+        iv[i] = (i * 3 + 2) as u8
+        i = i + 1
+    }
+    let blocks: usize = n - (n % 16)
+    let bad: usize = 18446744073709551615 as usize
+
+    var us: u64 = 0
+
+    // `dump` writes the DEFLATE test data itself, so that `gzip -6` chews on
+    // exactly the same octets. A comparison against a different input is not
+    // a comparison.
+    if eq_c(what, (&w_dump[0]) as u64) {
+        let wok: bool = rt.write_file(rt.arg_ptr(start, 3), p, n)
+        rt.heap_free(p, n)
+        rt.heap_free(q, n + 4096)
+        if !wok {
+            return 6
+        }
+        return 0
+    }
+
+    if eq_c(what, (&w_sha[0]) as u64) {
+        let t0: u64 = now_ns()
+        sha256.sha256(p, n, (&digest[0]) as u64)
+        us = (now_ns() - t0) / 1000
+    } else if eq_c(what, (&w_shas[0]) as u64) {
+        let t0: u64 = now_ns()
+        sha256.sha256_soft(p, n, (&digest[0]) as u64)
+        us = (now_ns() - t0) / 1000
+    } else if eq_c(what, (&w_aes[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new((&key[0]) as u64)
+        let t0: u64 = now_ns()
+        let ok: bool = aes.aes_cbc_encrypt(&k, (&iv[0]) as u64, p, blocks, q)
+        us = (now_ns() - t0) / 1000
+        if !ok {
+            return 5
+        }
+    } else if eq_c(what, (&w_aess[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new_soft((&key[0]) as u64)
+        let t0: u64 = now_ns()
+        let ok: bool = aes.aes_cbc_encrypt(&k, (&iv[0]) as u64, p, blocks, q)
+        us = (now_ns() - t0) / 1000
+        if !ok {
+            return 5
+        }
+    } else if eq_c(what, (&w_aesd[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new((&key[0]) as u64)
+        let t0: u64 = now_ns()
+        let ok: bool = aes.aes_cbc_decrypt(&k, (&iv[0]) as u64, p, blocks, q)
+        us = (now_ns() - t0) / 1000
+        if !ok {
+            return 5
+        }
+    } else if eq_c(what, (&w_aesds[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new_soft((&key[0]) as u64)
+        let t0: u64 = now_ns()
+        let ok: bool = aes.aes_cbc_decrypt(&k, (&iv[0]) as u64, p, blocks, q)
+        us = (now_ns() - t0) / 1000
+        if !ok {
+            return 5
+        }
+    } else if eq_c(what, (&w_cfb[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new((&key[0]) as u64)
+        let t0: u64 = now_ns()
+        aes.aes_cfb8_encrypt(&k, (&iv[0]) as u64, p, n, q)
+        us = (now_ns() - t0) / 1000
+    } else if eq_c(what, (&w_cfbs[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new_soft((&key[0]) as u64)
+        let t0: u64 = now_ns()
+        aes.aes_cfb8_encrypt(&k, (&iv[0]) as u64, p, n, q)
+        us = (now_ns() - t0) / 1000
+    } else if eq_c(what, (&w_def[0]) as u64) {
+        var out: rt.Buf = rt.buf_new()
+        let t0: u64 = now_ns()
+        let r: usize = deflate.deflate(p, n, 6, &out) catch bad
+        us = (now_ns() - t0) / 1000
+        if r == bad {
+            return 5
+        }
+        rt.buf_free(&out)
+    } else if eq_c(what, (&w_inf[0]) as u64) {
+        var packed: rt.Buf = rt.buf_new()
+        let r0: usize = deflate.deflate(p, n, 6, &packed) catch bad
+        var out: rt.Buf = rt.buf_new()
+        let t0: u64 = now_ns()
+        let r: usize = deflate.inflate(rt.buf_ptr(&packed), rt.buf_len(&packed), &out) catch bad
+        us = (now_ns() - t0) / 1000
+        if r0 == bad || r == bad {
+            return 5
+        }
+        rt.buf_free(&packed)
+        rt.buf_free(&out)
+    } else if eq_c(what, (&w_crc[0]) as u64) {
+        var t: deflate.CrcTable = deflate.crc_table()
+        let t0: u64 = now_ns()
+        let c: u32 = deflate.crc32_more(&t, 0 as u32, p, n)
+        us = (now_ns() - t0) / 1000
+    } else {
+        return 3
+    }
+
+    var out: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&out, us)
+    rt.buf_push(&out, 10 as u8)
+    let ok: bool = rt.write_file(rt.arg_ptr(start, 3), rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    rt.heap_free(p, n)
+    rt.heap_free(q, n + 4096)
+    if !ok {
+        return 6
+    }
+    return 0
+}

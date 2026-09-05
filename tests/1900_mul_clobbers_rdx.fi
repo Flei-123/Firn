@@ -1,0 +1,186 @@
+// expect_exit: 0
+// ROUND 90 -- INSTRUCTIONS THAT WRITE REGISTERS THEY DO NOT NAME.
+//
+// `--opt-level=release-safe` produced WRONG CODE, and only that level.
+// Reported by the osum kernel: its bitmap frame allocator failed 19 of its
+// own 23 cases on `release-safe` and was flawless on every other level
+// (karstos, tests/firn-fehler/rdx-klobber.fi). The disassembly:
+//
+//     a6:  mov  %rcx,%rdx      # the fourth parameter lives in rdx from here
+//     df:  mul  %rcx           # <-- writes RDX:RAX. rdx is gone.
+//     e2:  jb   ea             # the overflow arm of a CHECKED multiplication
+//
+// x86's one-operand `mul` puts the full product in `rdx:rax` without
+// mentioning either register. The register allocator hands `rdx` out as a
+// value register and did not know. It takes BOTH halves at once to see it:
+// checked arithmetic (which is what emits `mul` in the first place -- an
+// unchecked `* 8` is a `shl`) AND register allocation (`dev`/`dev-fast`
+// keep every value in the frame, where there is nothing to destroy).
+// `release-safe` is the only level with both -- and the one you ship.
+//
+// The cause was not the `mul`. It was that the allocator asked the
+// question "what gets destroyed while this value is alive" in two places
+// with two different lists of instructions (round 49's and round 72's),
+// and round 87 made the incomplete one the one that counts. Since round 90
+// there is ONE list, `inst_clobbers` in regalloc.rs.
+//
+// Every case here is built the same way: a value that must survive a loop,
+// and inside the loop the instruction that quietly writes `rdx`. Each
+// section returns its own exit code.
+//
+//   A  checked `*` (unsigned)      -- `mul rcx`, the reported bug
+//   B  checked `/` and `%`         -- `cqo`/`div`, remainder in rdx
+//   C  saturating `*|` and `+|`    -- `mul` and the `cmov` clamp
+//   D  checked `as`                -- must NOT be treated as a clobber
+//   E  the same shape once more, but with the survivor read INSIDE the
+//      loop as well, so a wrong register shows up as a wrong sum and not
+//      only as a wrong final field
+
+struct S {
+    a: u64,
+    b: u64,
+    c: u64,
+}
+
+// The written function of the report: `frames` is a parameter that lives
+// ACROSS the loop and is only used afterwards.
+fn side_effect(p: u64, w: u64, v: u64) {
+    *((p + w * 8) as *mut u64) = v
+}
+
+fn init(s: *mut S, bits: u64, words: u64, frames: u64) {
+    var w: u64 = 0
+    while w < words {
+        side_effect(bits, w, 0xFFFFFFFFFFFFFFFF)
+        w = w + 1
+    }
+    (*s).a = bits
+    (*s).b = frames
+    (*s).c = frames
+}
+
+// B: a division in the loop, a value that has to survive it. This is the
+// shape that killed `digit_count` in round 72 (`lib/std/core.fi`).
+fn digits_and_base(x: u64, base: u64, out: *mut u64) -> u64 {
+    var n: u64 = 0
+    var v: u64 = x
+    while v > 0 {
+        v = v / base
+        n = n + 1
+    }
+    *out = base
+    return n
+}
+
+// C: saturating arithmetic. `*|` on an unsigned type multiplies through the
+// same one-operand `mul`; the signed clamp parks its bound in rdx and
+// picks it with `cmov`.
+fn sat_run(n: u64, keep: u64, keep2: i64) -> u64 {
+    var acc: u64 = 1
+    var i: u64 = 0
+    var sacc: i64 = 1
+    while i < n {
+        acc = acc *| 3
+        sacc = sacc *| 3
+        i = i + 1
+    }
+    if sacc < 0 {
+        return 0
+    }
+    if keep2 != 7 {
+        return 0
+    }
+    return acc + keep
+}
+
+// D: a checked cast is NOT allowed to count as an rdx clobber -- it writes
+// nothing but rax. If it did, this would still be right, only slower; the
+// section is here so that a wrong ANSWER in the other direction (treating
+// a real clobber as harmless) has a partner that proves the model was not
+// simply made maximally conservative.
+fn cast_run(n: u64, keep: u64) -> u64 {
+    var i: u64 = 0
+    var s: u64 = 0
+    while i < n {
+        let small: u8 = (i % 200) as u8
+        s = s + small as u64
+        i = i + 1
+    }
+    return s + keep
+}
+
+// E: the survivor is read inside the loop too.
+fn mixed(p: u64, words: u64, stride: u64) -> u64 {
+    var w: u64 = 0
+    var sum: u64 = 0
+    while w < words {
+        *((p + w * 8) as *mut u64) = w * stride
+        sum = sum + stride
+        w = w + 1
+    }
+    return sum
+}
+
+fn main() -> i32 {
+    // ---- A ----------------------------------------------------------
+    var words: [u64; 4] = [0 as u64; 4]
+    var s: S = S { a: 0, b: 0, c: 0 }
+    let p: u64 = (&words[0]) as u64
+    init(&s, p, 4, 256)
+    if s.a != p {
+        return 1
+    }
+    if s.b != 256 {
+        return 2
+    }
+    if s.c != 256 {
+        return 3
+    }
+    var k: usize = 0
+    while k < 4 {
+        if words[k] != 0xFFFFFFFFFFFFFFFF {
+            return 4
+        }
+        k = k + 1
+    }
+
+    // ---- B ----------------------------------------------------------
+    var base_back: u64 = 0
+    if digits_and_base(999, 10, &base_back) != 3 {
+        return 5
+    }
+    if base_back != 10 {
+        return 6
+    }
+    if digits_and_base(65535, 2, &base_back) != 16 {
+        return 7
+    }
+    if base_back != 2 {
+        return 8
+    }
+
+    // ---- C ----------------------------------------------------------
+    // 3^5 = 243, plus the value that had to survive the loop.
+    if sat_run(5, 1000, 7) != 1243 {
+        return 9
+    }
+    // 3^41 does not fit in u64 (3^40 still does): the last step saturates.
+    if sat_run(41, 0, 7) != 0xFFFFFFFFFFFFFFFF {
+        return 10
+    }
+
+    // ---- D ----------------------------------------------------------
+    if cast_run(10, 5) != 50 {
+        return 11
+    }
+
+    // ---- E ----------------------------------------------------------
+    if mixed(p, 4, 7) != 28 {
+        return 12
+    }
+    if words[3] != 21 {
+        return 13
+    }
+
+    return 0
+}

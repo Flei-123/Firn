@@ -1,0 +1,668 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/b4_main.fi -- THE PAGE COMES ALIVE (root file of round B4).
+//
+// Rounds B1 to B3 were a pipeline: markup in, picture out, once. This
+// programme is the loop:
+//
+//   1. HTML -> DOM                       (lib/browser/, round 54/B1)
+//   2. the stylesheets, the cascade      (lib/css/, rounds 60/B1)
+//   3. the box tree and its geometry     (lib/layout/, round B2)
+//   4. THE SCRIPTS RUN                   (lib/browser/domjs.fi)   <- new
+//   5. what they changed is recomputed   (lib/browser/live.fi)    <- new
+//   6. the timers fire, and 5 again
+//   7. a picture, or a report
+//
+// THE ORDER OF THE SCRIPTS is the part of step 4 that is easy to get
+// wrong and impossible to see afterwards. HTML 8.1.3.1 gives three groups:
+//
+//   * a classic script WITHOUT `defer` and WITHOUT `async` blocks the
+//     parser and runs at the point it stands, in document order;
+//   * `async` (only meaningful with `src`) runs as soon as it has
+//     arrived, in no fixed relation to the others;
+//   * `defer` runs after the document is parsed, in document order,
+//     before `DOMContentLoaded`.
+//
+// This programme fetches over HTTP synchronously, so "as soon as it has
+// arrived" collapses to "in the order they were started". It therefore
+// runs: parser-blocking in document order, then async in document order,
+// then defer in document order, then `DOMContentLoaded`, then the timers,
+// then `load`. That is a MODEL of the standard, not the standard, and the
+// difference is written down here rather than discovered later. What it
+// does keep exactly: `defer` after everything else, `async` never blocking
+// an earlier script, and both after every parser-blocking one.
+//
+// The job on standard input, little endian:
+//     u32 viewport width      u32 viewport height
+//     u32 n ; u8[n]   the HTML document (WTF-8)
+//     u32 n ; u8[n]   the user agent stylesheet
+//     u32 n ; u8[n]   the author stylesheet
+//     u32 n ; u8[n]   the address of the document (for `location` and for
+//                     resolving `src`; may be empty)
+//     u32 flags       1 = do NOT narrow the recomputation
+//                     2 = check every update against a full layout
+//                     4 = fetch `<script src>` over HTTP
+//     u32 ms          how far the clock is moved on afterwards, for the
+//                     timers (0 = do not run any)
+//
+// On standard output: whatever `print()` wrote, then a report:
+//     SCRIPTS <n> BLOCKING <n> ASYNC <n> DEFER <n> ERRORS <n>
+//     EVENTS <n> LISTENERS <n> TIMERS <n>
+//     STYLED <n> LAID <n> BOXES <n> UPDATES <n> BAD <n>
+//     TEXT <the textContent of the body, one line>
+import std.rt
+import html.mem
+import browser.node
+import browser.names
+import browser.tag
+import browser.driver
+import browser.live
+import browser.domjs
+import dom.api
+import css.cascade
+import js.lex
+import js.ast
+import js.parse
+import js.val
+import js.interp
+import js.builtin
+import js.gen
+import net.url
+import net.http
+
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+fn lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+fn kv(out: *mut mem.Buf, p: u64, n: usize, v: u64) {
+    lit(out, p, n)
+    mem.buf_push(out, 32 as u8)
+    mem.buf_push_dec(out, v)
+    mem.buf_push(out, 32 as u8)
+}
+
+fn __gc_finalize(kind: u64, p: *mut u8) {
+}
+
+// How a `<script>` is classified, and its text.
+const SC_BLOCKING: u32 = 0
+const SC_ASYNC: u32 = 1
+const SC_DEFER: u32 = 2
+
+fn has_attr(h: *mut names.Names, e: Gc[Elem], p: *mut u8, n: usize) -> bool {
+    let a: u32 = names.names_find_bytes(h, p, n)
+    if a == 0 as u32 {
+        return false
+    }
+    return node.attr_find(e, a, 0) != gc_null[Attr]()
+}
+
+fn attr_chain(h: *mut names.Names, e: Gc[Elem], p: *mut u8,
+    n: usize) -> Gc[Chain] {
+    let a: u32 = names.names_find_bytes(h, p, n)
+    if a == 0 as u32 {
+        return gc_null[Chain]()
+    }
+    return node.attr_value(e, a, 0)
+}
+
+// Is this a script the engine has to run at all? A `type` that is not
+// empty, not `text/javascript` and not `module` marks a data block
+// (HTML 4.12.1) -- `<script type="application/json">` is not code.
+fn is_js(nm: *mut names.Names, e: Gc[Elem], tmp: *mut mem.CpBuf) -> bool {
+    var lit_t: [u8; 4] = "type"
+    let c: Gc[Chain] = attr_chain(nm, e, &lit_t[0], 4)
+    if c == gc_null[Chain]() || node.chain_len(c) == 0 {
+        return true
+    }
+    mem.cp_clear(tmp)
+    node.chain_after_cpbuf(c, tmp)
+    var known: [u8; 15] = "text/javascript"
+    if mem.cp_len(tmp) == 15 {
+        var i: usize = 0
+        var same: bool = true
+        while i < 15 {
+            var x: u32 = mem.cp_at(tmp, i)
+            if x >= 65 as u32 && x <= 90 as u32 {
+                x = x + 32 as u32
+            }
+            if x != known[i] as u32 {
+                same = false
+            }
+            i = i + 1
+        }
+        return same
+    }
+    var mod: [u8; 6] = "module"
+    if mem.cp_len(tmp) == 6 {
+        var i: usize = 0
+        var same: bool = true
+        while i < 6 {
+            if mem.cp_at(tmp, i) != mod[i] as u32 {
+                same = false
+            }
+            i = i + 1
+        }
+        return same
+    }
+    return false
+}
+
+// Runs ONE piece of source in the realm that is already there. Returns
+// false on a parse error or an uncaught exception; the message goes to
+// standard error.
+fn run_source(r: Gc[Realm], l: *mut lex.Lexer, p: *mut parse.Parser,
+    t: *mut ast.Ast, src: *mut u8, n: usize,
+    out: *mut mem.Buf) -> AllocError!bool {
+    lex.lex_set_utf8(l, src, n)
+    let prog: u32 = parse.parse_program(p, false)
+    let err: u32 = parse.parse_error(p)
+    if err != parse.ERR_NONE {
+        var head: [u8; 12] = "SCRIPT-PARSE"
+        lit(out, (&head[0]) as u64, 12)
+        mem.buf_push(out, 32 as u8)
+        mem.buf_push_dec(out, err as u64)
+        mem.buf_push(out, 32 as u8)
+        mem.buf_push_dec(out, parse.parse_error_line(p) as u64)
+        mem.buf_push(out, 10 as u8)
+        return false
+    }
+    r.depth = 0
+    if ast.ast_d(t, prog) & ast.FN_STRICT != 0 as u32 {
+        r.depth = 1
+    }
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    (*c).comp = interp.C_NORMAL
+    let v: Gc[JsVal] = try interp.run_program(r, prog, r.global_env)
+    if (*c).comp == interp.C_THROW {
+        var head: [u8; 12] = "SCRIPT-THROW"
+        lit(out, (&head[0]) as u64, 12)
+        mem.buf_push(out, 32 as u8)
+        let tv: Gc[JsVal] = r.pending
+        (*c).comp = interp.C_NORMAL
+        let msg: Gc[JsVal] = try interp.to_string(r, tv)
+        let ok: bool = try write_utf8(out, msg)
+        mem.buf_push(out, 10 as u8)
+        (*c).comp = interp.C_NORMAL
+        return false
+    }
+    // the microtask queue, or a promise would never settle (9.5)
+    let okj: bool = try gen.run_jobs(r)
+    (*c).comp = interp.C_NORMAL
+    return true
+}
+
+fn write_utf8(out: *mut mem.Buf, s: Gc[JsVal]) -> AllocError!bool {
+    var i: u64 = 0
+    let n: u64 = val.str_len(s)
+    while i < n {
+        var c: u32 = val.str_at(s, i)
+        i = i + 1
+        if c >= 0xD800 as u32 && c <= 0xDBFF as u32 && i < n {
+            let c2: u32 = val.str_at(s, i)
+            if c2 >= 0xDC00 as u32 && c2 <= 0xDFFF as u32 {
+                c = 0x10000 as u32 + ((c - 0xD800 as u32) << 10) +
+                (c2 - 0xDC00 as u32)
+                i = i + 1
+            }
+        }
+        if c < 0x80 as u32 {
+            mem.buf_push(out, c as u8)
+        } else if c < 0x800 as u32 {
+            mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else if c < 0x10000 as u32 {
+            mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else {
+            mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        }
+    }
+    return true
+}
+
+// ROUND 79 -- the realm is a GC object and is handed the addresses of
+// `ctx`, `t`, `nm`, `host` and `lv`, all of which lie in THIS frame. It is
+// sound here and only here: everything comes into being in this call,
+// nothing outside gets hold of it, and it is all garbage the moment this
+// function returns. The escape analysis cannot see that, so the exception
+// is said out loud instead of the check being weakened (ROUND79.md 3).
+#[allow_escape]
+fn page(inb: *mut mem.Buf, out: *mut mem.Buf) -> AllocError!i32 {
+    let total: usize = mem.buf_len(inb)
+    if total < 8 {
+        return 1
+    }
+    let vw: f64 = read_u32(inb, 0) as f64
+    let vh: f64 = read_u32(inb, 4) as f64
+    var off: usize = 8
+    let html_n: usize = read_u32(inb, off) as usize
+    let html_at: usize = off + 4
+    off = html_at + html_n
+    let ua_n: usize = read_u32(inb, off) as usize
+    let ua_at: usize = off + 4
+    off = ua_at + ua_n
+    let au_n: usize = read_u32(inb, off) as usize
+    let au_at: usize = off + 4
+    off = au_at + au_n
+    let loc_n: usize = read_u32(inb, off) as usize
+    let loc_at: usize = off + 4
+    off = loc_at + loc_n
+    let flags: u32 = read_u32(inb, off)
+    let ms: u32 = read_u32(inb, off + 4)
+    let base: u64 = mem.buf_ptr(inb) as u64
+
+    // ---- 1. HTML -> DOM
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    driver.run_scripting_set(&run, true)
+    let nm: *mut names.Names = driver.run_names(&run)
+    driver.run_text_out_bytes(&run, (base + html_at as u64) as *mut u8,
+        html_n)
+    let rc: u32 = driver.run_document_build(&run)
+    let doc: Gc[Node] = driver.run_document(&run)
+
+    // The SECOND parser, for `innerHTML`. It has to be a second one: a
+    // `Run` holds the whole tree construction state, and a fragment parsed
+    // with the state of the document being parsed would corrupt both.
+    var frag: driver.Run = driver.run_new()
+    if !driver.run_init(&frag) {
+        return 91
+    }
+    driver.run_scripting_set(&frag, true)
+
+    // ---- 2./3. the styles, the boxes, the geometry
+    var lv: live.Live = live.live_new(nm)
+    if !live.live_init(&lv) {
+        return 92
+    }
+    live.live_set_viewport(&lv, vw, vh)
+    live.live_set_scoped(&lv, (flags & 1 as u32) == 0 as u32)
+    let oku: bool = live.live_add_ua(&lv, (base + ua_at as u64) as *mut u8,
+        ua_n) catch false
+    let oka: bool = live.live_add_sheet(&lv, cascade.ORIGIN_AUTHOR,
+        (base + au_at as u64) as *mut u8, au_n) catch false
+    if !live.live_load(&lv, doc) {
+        return 93
+    }
+
+    // ---- 4. the engine, with the DOM in it
+    var host: domjs.Host = domjs.host_new()
+    if !domjs.host_init(&host, nm) {
+        return 94
+    }
+    domjs.host_set_live(&host, &lv)
+    domjs.host_set_document(&host, doc)
+    domjs.host_set_fragment_parser(&host, &frag)
+    domjs.host_set_location(&host, (base + loc_at as u64) as *mut u8, loc_n)
+
+    var jnm: lex.Names = lex.Names { pool: mem.cp_new(), off: mem.cp_new(),
+        len: mem.cp_new(), hash: mem.cp_new(), buckets: mem.cp_new(),
+        mask: 0, n: 0 }
+    lex.names_init(&jnm)
+    var l: lex.Lexer = lex.lex_new()
+    lex.lex_init(&l, &jnm)
+    var t: ast.Ast = ast.ast_new()
+    ast.ast_init(&t)
+    var p: parse.Parser = parse.parser_new()
+    parse.parser_init(&p, &l, &t, &jnm)
+    var ctx: interp.Ctx = interp.ctx_new()
+    ctx.native = builtin.native_dispatch
+    ctx.arity = builtin.native_arity_of
+    ctx.gen_start = gen.gen_start
+    // THE CHAIN: builtin -> dom -> generators. `domjs.dom_native` hands
+    // everything below 40000 straight to `gen.gen_native`, so round 66 did
+    // not have to learn about round B4.
+    ctx.gen_native = domjs.dom_native
+    var sp: gen.Susp = gen.susp_new()
+    gen.susp_init(&sp)
+    ctx.gen_data = (&sp) as *mut u8
+    ctx.host = (&host) as *mut u8
+    let r: Gc[Realm] = try val.realm_new()
+    val.realm_set_ctx(r, (&ctx) as *mut u8)
+    val.realm_set_ast(r, &t, &jnm)
+    let g: Gc[JsObj] = try builtin.install(r)
+    let okg: bool = try gen.install_gen(r)
+    let okd: bool = try domjs.install_dom(&host, r)
+
+    // ---- the scripts, in the three groups
+    var cl: http.Client = http.client_new()
+    var have_http: bool = false
+    if (flags & 4 as u32) != 0 as u32 {
+        have_http = http.client_init(&cl)
+    }
+    var docurl: url.Url = url.url_new()
+    let have_base: bool = url.url_parse(base + loc_at as u64, loc_n, &docurl)
+    var resp: http.Response = http.resp_new()
+    http.resp_init(&resp)
+
+    var n_script: u64 = 0
+    var n_block: u64 = 0
+    var n_async: u64 = 0
+    var n_defer: u64 = 0
+    var n_err: u64 = 0
+    var tmp: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&tmp)
+    var src: mem.Buf = mem.buf_new()
+    mem.buf_init(&src)
+
+    var group: u32 = 0
+    while group < 3 as u32 {
+        var k: Gc[Node] = doc
+        while k != gc_null[Node]() {
+            if k.kind == node.K_ELEM {
+                let e: Gc[Elem] = node.node_as_elem(k)
+                if e.ns == node.NS_HTML && e.name == tag.M_SCRIPT &&
+                is_js(nm, e, &tmp) {
+                    var lit_src: [u8; 3] = "src"
+                    var lit_def: [u8; 5] = "defer"
+                    var lit_asy: [u8; 5] = "async"
+                    let sc: Gc[Chain] = attr_chain(nm, e, &lit_src[0], 3)
+                    let external: bool = sc != gc_null[Chain]() &&
+                    node.chain_len(sc) > 0
+                    var kind: u32 = SC_BLOCKING
+                    if external {
+                        // `defer` and `async` mean nothing on an INLINE
+                        // script (HTML 4.12.1) -- a fact that is easy to
+                        // get wrong and impossible to see afterwards.
+                        if has_attr(nm, e, &lit_asy[0], 5) {
+                            kind = SC_ASYNC
+                        } else if has_attr(nm, e, &lit_def[0], 5) {
+                            kind = SC_DEFER
+                        }
+                    }
+                    if kind == group {
+                        if group == 0 as u32 {
+                            n_script = n_script + 1
+                        }
+                        var ran: bool = false
+                        mem.buf_clear(&src)
+                        if external {
+                            if have_http && have_base {
+                                mem.cp_clear(&tmp)
+                                node.chain_after_cpbuf(sc, &tmp)
+                                var raw: mem.Buf = mem.buf_new()
+                                mem.buf_init(&raw)
+                                var q: usize = 0
+                                while q < mem.cp_len(&tmp) {
+                                    mem.buf_push(&raw,
+                                        mem.cp_at(&tmp, q) as u8)
+                                    q = q + 1
+                                }
+                                var su: url.Url = url.url_new()
+                                if url.url_parse_rel(&docurl,
+                                    mem.buf_ptr(&raw) as u64,
+                                    mem.buf_len(&raw), &su) {
+                                    var full: rt.Buf = rt.buf_new()
+                                    url.url_write(&su, &full)
+                                    let okf: bool = http.http_get(&cl,
+                                        full.ptr, full.len, &resp)
+                                    catch | x | fetch_failed()
+                                    if okf {
+                                        var z: usize = 0
+                                        let bp: u64 = http.resp_body_ptr(&resp)
+                                        let bn: usize = http.resp_body_len(&resp)
+                                        while z < bn {
+                                            mem.buf_push(&src,
+                                                *((bp + z as u64) as *mut u8))
+                                            z = z + 1
+                                        }
+                                        ran = true
+                                    }
+                                    rt.buf_free(&full)
+                                }
+                                mem.buf_free(&raw)
+                            }
+                        } else {
+                            let text = try api.dom_text_content(k)
+                            mem.cp_clear(&tmp)
+                            node.chain_after_cpbuf(text, &tmp)
+                            var q: usize = 0
+                            while q < mem.cp_len(&tmp) {
+                                cp_out(&src, mem.cp_at(&tmp, q))
+                                q = q + 1
+                            }
+                            ran = true
+                        }
+                        if ran {
+                            if group == 0 as u32 {
+                                n_block = n_block + 1
+                            } else if group == 1 as u32 {
+                                n_async = n_async + 1
+                                n_script = n_script + 1
+                            } else {
+                                n_defer = n_defer + 1
+                                n_script = n_script + 1
+                            }
+                            let ok: bool = try run_source(r, &l, &p, &t,
+                                mem.buf_ptr(&src), mem.buf_len(&src), out)
+                            if !ok {
+                                n_err = n_err + 1
+                            }
+                            // A script that changed something is paid for
+                            // ONCE, here -- not per DOM call.
+                            let oku2: bool = live.live_update(&lv)
+                        } else if external {
+                            n_err = n_err + 1
+                        }
+                    }
+                }
+            }
+            k = api.dom_next(k, doc)
+        }
+        group = group + 1 as u32
+    }
+
+    // ---- DOMContentLoaded, the timers, load
+    // The order of HTML 8.1.7.4: `DOMContentLoaded` when the document is
+    // parsed and the deferred scripts have run, `load` when everything
+    // else has, and only THEN the clock is allowed to move -- a timer
+    // that a load handler sets has to be able to fire, which it cannot if
+    // the timers run first.
+    var ev1: [u8; 16] = "DOMContentLoaded"
+    let d1: bool = try domjs.host_dispatch_named(&host, r, doc, &ev1[0], 16,
+        true, false)
+    let j1: bool = try gen.run_jobs(r)
+    let u1: bool = live.live_update(&lv)
+    var ev2: [u8; 4] = "load"
+    let d2: bool = try domjs.host_dispatch_named(&host, r, doc, &ev2[0], 4,
+        false, false)
+    let j2: bool = try gen.run_jobs(r)
+    var timers_ran: u64 = 0
+    if ms > 0 as u32 {
+        // The clock is moved in ONE step and every timer that has come of
+        // age runs, earliest first. A `setInterval` that a timer restarts
+        // is bounded by the limit, not by the clock.
+        let due: u64 = domjs.host_advance(&host, ms as u64)
+        timers_ran = try domjs.host_run_timers(&host, r, 10000)
+        let okj: bool = try gen.run_jobs(r)
+    }
+    if domjs.host_timer_errors(&host) > 0 as u64 {
+        var head: [u8; 11] = "TIMER-THROW"
+        lit(out, (&head[0]) as u64, 11)
+        mem.buf_push(out, 32 as u8)
+        mem.buf_push_dec(out, domjs.host_timer_errors(&host))
+        mem.buf_push(out, 32 as u8)
+        let tv: Gc[JsVal] = domjs.host_last_throw(&host)
+        if tv != gc_null[JsVal]() {
+            let c2: *mut interp.Ctx = interp.ctx_of(r)
+            (*c2).comp = interp.C_NORMAL
+            let msg: Gc[JsVal] = try interp.to_string(r, tv)
+            let okm: bool = try write_utf8(out, msg)
+            (*c2).comp = interp.C_NORMAL
+        }
+        mem.buf_push(out, 10 as u8)
+    }
+    let u3: bool = live.live_update(&lv)
+    var bad: u64 = 0
+    if (flags & 2 as u32) != 0 as u32 {
+        bad = live.live_verify(&lv)
+    }
+
+    // ---- the report
+    var k_s: [u8; 7] = "SCRIPTS"
+    var k_b: [u8; 8] = "BLOCKING"
+    var k_a: [u8; 5] = "ASYNC"
+    var k_d: [u8; 5] = "DEFER"
+    var k_e: [u8; 6] = "ERRORS"
+    var k_ev: [u8; 6] = "EVENTS"
+    var k_li: [u8; 9] = "LISTENERS"
+    var k_ti: [u8; 6] = "TIMERS"
+    var k_st: [u8; 6] = "STYLED"
+    var k_la: [u8; 4] = "LAID"
+    var k_bo: [u8; 5] = "BOXES"
+    var k_ba: [u8; 3] = "BAD"
+    kv(out, (&k_s[0]) as u64, 7, n_script)
+    kv(out, (&k_b[0]) as u64, 8, n_block)
+    kv(out, (&k_a[0]) as u64, 5, n_async)
+    kv(out, (&k_d[0]) as u64, 5, n_defer)
+    kv(out, (&k_e[0]) as u64, 6, n_err)
+    mem.buf_push(out, 10 as u8)
+    kv(out, (&k_ev[0]) as u64, 6, domjs.host_events_fired(&host))
+    kv(out, (&k_li[0]) as u64, 9, domjs.host_listeners_run(&host))
+    kv(out, (&k_ti[0]) as u64, 6, timers_ran)
+    mem.buf_push(out, 10 as u8)
+    kv(out, (&k_st[0]) as u64, 6, live.live_styled(&lv))
+    kv(out, (&k_la[0]) as u64, 4, live.live_laid(&lv))
+    kv(out, (&k_bo[0]) as u64, 5, live.live_total_boxes(&lv))
+    kv(out, (&k_ba[0]) as u64, 3, bad)
+    mem.buf_push(out, 10 as u8)
+    var k_t: [u8; 5] = "TEXT "
+    lit(out, (&k_t[0]) as u64, 5)
+    let body: Gc[Node] = body_of(doc)
+    if body != gc_null[Node]() {
+        let txt = try api.dom_text_content(body)
+        mem.cp_clear(&tmp)
+        node.chain_after_cpbuf(txt, &tmp)
+        var q: usize = 0
+        while q < mem.cp_len(&tmp) {
+            let c: u32 = mem.cp_at(&tmp, q)
+            if c == 10 as u32 || c == 13 as u32 {
+                mem.buf_push(out, 32 as u8)
+            } else {
+                cp_out(out, c)
+            }
+            q = q + 1
+        }
+    }
+    mem.buf_push(out, 10 as u8)
+    var k_h: [u8; 5] = "HTML "
+    lit(out, (&k_h[0]) as u64, 5)
+    if body != gc_null[Node]() {
+        var hb: mem.Buf = mem.buf_new()
+        mem.buf_init(&hb)
+        api.dom_inner_html(body, nm, &hb)
+        var q: usize = 0
+        while q < mem.buf_len(&hb) {
+            let c: u8 = mem.buf_at(&hb, q)
+            if c == 10 as u8 || c == 13 as u8 {
+                mem.buf_push(out, 32 as u8)
+            } else {
+                mem.buf_push(out, c)
+            }
+            q = q + 1
+        }
+        mem.buf_free(&hb)
+    }
+    mem.buf_push(out, 10 as u8)
+
+    mem.cp_free(&tmp)
+    mem.buf_free(&src)
+    http.resp_free(&resp)
+    if have_http {
+        http.client_free(&cl)
+    }
+    gen.susp_free(&sp)
+    parse.parser_free(&p)
+    ast.ast_free(&t)
+    lex.lex_free(&l)
+    lex.names_free(&jnm)
+    domjs.host_free(&host)
+    live.live_free(&lv)
+    driver.run_tree_release(&frag)
+    driver.run_tree_release(&run)
+    return 0
+}
+
+fn fetch_failed() -> bool {
+    return false
+}
+
+fn cp_out(out: *mut mem.Buf, c: u32) {
+    if c < 0x80 as u32 {
+        mem.buf_push(out, c as u8)
+    } else if c < 0x800 as u32 {
+        mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else if c < 0x10000 as u32 {
+        mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else {
+        mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    }
+}
+
+fn body_of(doc: Gc[Node]) -> Gc[Node] {
+    var root: Gc[Node] = gc_null[Node]()
+    var k: Gc[Node] = doc.first_child
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            root = k
+            break
+        }
+        k = k.next
+    }
+    if root == gc_null[Node]() {
+        return gc_null[Node]()
+    }
+    var c: Gc[Node] = root.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            let e: Gc[Elem] = node.node_as_elem(c)
+            if e.ns == node.NS_HTML && e.name == tag.M_BODY {
+                return c
+            }
+        }
+        c = c.next
+    }
+    return root
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    gc_set_max_bytes(1 << 31)
+    var inb: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&inb)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    let rc: i32 = page(&inb, &out) catch 95
+    mem.buf_flush(&out, 1)
+    mem.buf_free(&out)
+    mem.buf_free(&inb)
+    return rc
+}

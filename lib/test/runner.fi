@@ -1,0 +1,490 @@
+// SPDX-License-Identifier: MIT
+// lib/test/runner.fi -- the runtime half of `firnc --test` (ROUND 94).
+//
+// The compiler finds every `#[test]` function, writes a `main` that names
+// them one by one (compiler/src/testrun.rs) and puts THIS file in front of
+// it. Both halves are compiled in the same run, so a test binary needs
+// nothing that is not in the repository.
+//
+// WHY A PROCESS PER TEST. A test that dereferences a null pointer, runs off
+// the end of an array or overflows an `i32` does not return -- it dies. A
+// runner that calls its cases directly dies with the first one and reports
+// nothing about the rest, which is the opposite of what a runner is for.
+// Every case therefore runs in a CHILD of its own (`fork`), and the parent
+// only ever looks at the exit status. Whatever the child does to itself, the
+// report survives it.
+//
+//   * everything the child writes goes through a PIPE and is captured, so
+//     the report on standard output stays machine readable even when a case
+//     prints;
+//   * `alarm` gives every case a time limit -- a test that hangs is killed
+//     and counts as a failure, it does not hang the run;
+//   * the position of a failure is read out of the child's own panic
+//     message, which has carried `file:line:column` since round 72. If there
+//     is none (a segmentation fault has no message), the position of the
+//     `fn` declaration is reported, which the compiler knew when it wrote
+//     the case list.
+//
+// No import, no allocation, no collector: only system calls and static
+// storage. That is deliberate -- the runner must not be able to disturb what
+// it measures, and it has to work in a program that brings its own GC
+// settings.
+
+// ------------------------------------------------------------ system calls
+const __test_SYS_READ: i64 = 0
+const __test_SYS_WRITE: i64 = 1
+const __test_SYS_CLOSE: i64 = 3
+const __test_SYS_DUP2: i64 = 33
+const __test_SYS_ALARM: i64 = 37
+const __test_SYS_FORK: i64 = 57
+const __test_SYS_EXIT: i64 = 60
+const __test_SYS_WAIT4: i64 = 61
+const __test_SYS_CLOCK: i64 = 228
+const __test_SYS_PIPE2: i64 = 293
+
+const __test_CAP_MAX: i64 = 3072
+
+static mut __test_total: i64 = 0
+static mut __test_passed: i64 = 0
+static mut __test_failed: i64 = 0
+static mut __test_index: i64 = 0
+// 0 = JSON, 1 = TAP
+static mut __test_format: i64 = 0
+// seconds; 0 = no limit
+static mut __test_limit: i64 = 30
+static mut __test_cap: [u8; 3072] = [0; 3072]
+static mut __test_caplen: i64 = 0
+// the position read out of the child's panic message
+static mut __test_w_ok: bool = false
+static mut __test_w_off: i64 = 0
+static mut __test_w_len: i64 = 0
+static mut __test_w_line: i64 = 0
+static mut __test_w_col: i64 = 0
+
+// ------------------------------------------------------------------ output
+fn __test_write(p: u64, n: i64) {
+    if n <= 0 {
+        return
+    }
+    syscall(__test_SYS_WRITE, 1, p as i64, n, 0, 0, 0)
+}
+
+fn __test_ch(c: i64) {
+    var b: [u8; 1] = [0; 1]
+    b[0] = c as u8
+    __test_write((&b[0]) as u64, 1)
+}
+
+// A number in decimal.
+fn __test_num(v: i64) {
+    if v < 0 {
+        __test_ch(45)
+        __test_num(0 - v)
+        return
+    }
+    if v >= 10 {
+        __test_num(v / 10)
+    }
+    __test_ch(48 + (v % 10))
+}
+
+// `v` with exactly `w` digits, zero padded (the three decimals of the rate).
+fn __test_pad(v: i64, w: i64) {
+    var scale: i64 = 1
+    var i: i64 = 1
+    while i < w {
+        scale = scale * 10
+        i = i + 1
+    }
+    while scale > 0 {
+        __test_ch(48 + ((v / scale) % 10))
+        scale = scale / 10
+    }
+}
+
+fn __test_byte(p: u64, i: i64) -> i64 {
+    let q: *mut u8 = ((p as i64) + i) as *mut u8
+    return (*q) as i64
+}
+
+// Text between quotes, escaped the way JSON needs it.
+fn __test_quoted(p: u64, n: i64) {
+    __test_ch(34)
+    var i: i64 = 0
+    while i < n {
+        let c: i64 = __test_byte(p, i)
+        if c == 34 {
+            __test_ch(92)
+            __test_ch(34)
+        } else {
+            if c == 92 {
+                __test_ch(92)
+                __test_ch(92)
+            } else {
+                if c == 10 {
+                    __test_ch(92)
+                    __test_ch(110)
+                } else {
+                    if c == 9 {
+                        __test_ch(92)
+                        __test_ch(116)
+                    } else {
+                        if c < 32 {
+                            __test_ch(32)
+                        } else {
+                            __test_ch(c)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    __test_ch(34)
+}
+
+// The same text without quotes and without escapes (TAP).
+fn __test_plain(p: u64, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        let c: i64 = __test_byte(p, i)
+        if c < 32 {
+            __test_ch(32)
+        } else {
+            __test_ch(c)
+        }
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------- clock
+fn __test_now() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(__test_SYS_CLOCK, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000000 + ts[1] / 1000
+}
+
+// ------------------------------------------- the position out of the output
+//
+// A panic message ends in ` at <file>:<line>:<column>` -- round 72 put it
+// there and `tools/checked/run.sh` holds both compilers to it. The runner
+// reads it back out instead of guessing.
+fn __test_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn __test_at(i: i64) -> i64 {
+    return (__test_cap[i as usize]) as i64
+}
+
+fn __test_scan_where() {
+    __test_w_ok = false
+    let n: i64 = __test_caplen
+    var start: i64 = 0 - 1
+    var i: i64 = 0
+    // the LAST " at " in the captured output
+    while i + 4 < n {
+        if __test_at(i) == 32 && __test_at(i + 1) == 97 && __test_at(i + 2) == 116
+        && __test_at(i + 3) == 32 {
+            start = i + 4
+        }
+        i = i + 1
+    }
+    if start < 0 {
+        return
+    }
+    var end: i64 = start
+    while end < n && __test_at(end) != 32 && __test_at(end) != 10 && __test_at(end) != 0 {
+        end = end + 1
+    }
+    // the last two colons split file : line : column
+    var c2: i64 = 0 - 1
+    var c1: i64 = 0 - 1
+    var k: i64 = start
+    while k < end {
+        if __test_at(k) == 58 {
+            c1 = c2
+            c2 = k
+        }
+        k = k + 1
+    }
+    if c1 < 0 || c2 < 0 {
+        return
+    }
+    if c1 <= start || c2 <= c1 + 1 || end <= c2 + 1 {
+        return
+    }
+    var line: i64 = 0
+    var j: i64 = c1 + 1
+    while j < c2 {
+        if !__test_digit(__test_at(j)) {
+            return
+        }
+        line = line * 10 + (__test_at(j) - 48)
+        j = j + 1
+    }
+    var col: i64 = 0
+    j = c2 + 1
+    while j < end {
+        if !__test_digit(__test_at(j)) {
+            return
+        }
+        col = col * 10 + (__test_at(j) - 48)
+        j = j + 1
+    }
+    __test_w_ok = true
+    __test_w_off = start
+    __test_w_len = c1 - start
+    __test_w_line = line
+    __test_w_col = col
+}
+
+// The first line of the captured output -- the reason, in short.
+fn __test_reason_len() -> i64 {
+    var i: i64 = 0
+    while i < __test_caplen && __test_at(i) != 10 {
+        i = i + 1
+    }
+    return i
+}
+
+// --------------------------------------------------------------- the cases
+fn __test_begin(total: i64, format: i64, limit: i64) {
+    __test_total = total
+    __test_format = format
+    __test_limit = limit
+    __test_passed = 0
+    __test_failed = 0
+    __test_index = 0
+    if format == 0 {
+        var a: [u8; 16] = "{\"suite\":\"firn\","
+        __test_write((&a[0]) as u64, 16)
+        var b: [u8; 8] = "\"total\":"
+        __test_write((&b[0]) as u64, 8)
+        __test_num(total)
+        var c: [u8; 10] = ",\"cases\":["
+        __test_write((&c[0]) as u64, 10)
+    } else {
+        var t: [u8; 15] = "TAP version 13\n"
+        __test_write((&t[0]) as u64, 15)
+        var u: [u8; 3] = "1.."
+        __test_write((&u[0]) as u64, 3)
+        __test_num(total)
+        __test_ch(10)
+    }
+}
+
+// One case. `f` is the test function itself, `file`/`line`/`col` are the
+// position of its `fn` declaration -- the fallback for when the child dies
+// without a message of its own.
+fn __test_case(name: u64, nlen: i64, f: fn(), file: u64, flen: i64, line: i64, col: i64) {
+    __test_index = __test_index + 1
+    __test_caplen = 0
+    var fds: [i32; 2] = [0; 2]
+    if syscall(__test_SYS_PIPE2, (&fds[0]) as i64, 0, 0, 0, 0, 0) != 0 {
+        fds[0] = 0 - 1
+        fds[1] = 0 - 1
+    }
+    let t0: i64 = __test_now()
+    let pid: i64 = syscall(__test_SYS_FORK, 0, 0, 0, 0, 0, 0)
+    if pid == 0 {
+        // The child IS the test. Everything it says goes into the pipe.
+        if fds[1] >= 0 {
+            syscall(__test_SYS_CLOSE, fds[0] as i64, 0, 0, 0, 0, 0)
+            syscall(__test_SYS_DUP2, fds[1] as i64, 1, 0, 0, 0, 0)
+            syscall(__test_SYS_DUP2, fds[1] as i64, 2, 0, 0, 0, 0)
+            syscall(__test_SYS_CLOSE, fds[1] as i64, 0, 0, 0, 0, 0)
+        }
+        if __test_limit > 0 {
+            syscall(__test_SYS_ALARM, __test_limit, 0, 0, 0, 0, 0)
+        }
+        f()
+        syscall(__test_SYS_EXIT, 0, 0, 0, 0, 0, 0)
+    }
+    var status: i32 = 0
+    if pid > 0 {
+        if fds[1] >= 0 {
+            syscall(__test_SYS_CLOSE, fds[1] as i64, 0, 0, 0, 0, 0)
+            var run: bool = true
+            while run {
+                let space: i64 = __test_CAP_MAX - __test_caplen
+                if space <= 0 {
+                    run = false
+                } else {
+                    let r: i64 = syscall(__test_SYS_READ, fds[0] as i64,
+                        ((&__test_cap[0]) as i64) + __test_caplen, space, 0, 0, 0)
+                    if r <= 0 {
+                        run = false
+                    } else {
+                        __test_caplen = __test_caplen + r
+                    }
+                }
+            }
+            syscall(__test_SYS_CLOSE, fds[0] as i64, 0, 0, 0, 0, 0)
+        }
+        syscall(__test_SYS_WAIT4, pid, (&status) as i64, 0, 0, 0, 0)
+    }
+    let us: i64 = __test_now() - t0
+    var signal: i64 = (status & 127) as i64
+    var code: i64 = 0
+    var good: bool = false
+    if pid < 0 {
+        signal = 0
+        code = 0 - 1
+    } else {
+        if signal == 0 {
+            code = ((status >> 8) & 255) as i64
+            good = code == 0
+        }
+    }
+    if good {
+        __test_passed = __test_passed + 1
+    } else {
+        __test_failed = __test_failed + 1
+    }
+    __test_scan_where()
+    var wfile: u64 = file
+    var wflen: i64 = flen
+    var wline: i64 = line
+    var wcol: i64 = col
+    if !good && __test_w_ok {
+        wfile = (((&__test_cap[0]) as i64) + __test_w_off) as u64
+        wflen = __test_w_len
+        wline = __test_w_line
+        wcol = __test_w_col
+    }
+    if __test_format == 0 {
+        __test_json_case(name, nlen, good, us, wfile, wflen, wline, wcol, signal, code)
+    } else {
+        __test_tap_case(name, nlen, good, us, wfile, wflen, wline, wcol, signal, code)
+    }
+}
+
+fn __test_json_case(name: u64, nlen: i64, good: bool, us: i64, file: u64, flen: i64,
+    line: i64, col: i64, signal: i64, code: i64) {
+    if __test_index > 1 {
+        __test_ch(44)
+    }
+    __test_ch(10)
+    var a: [u8; 10] = "  {\"name\":"
+    __test_write((&a[0]) as u64, 10)
+    __test_quoted(name, nlen)
+    var b: [u8; 10] = ",\"status\":"
+    __test_write((&b[0]) as u64, 10)
+    if good {
+        var p: [u8; 6] = "\"pass\""
+        __test_write((&p[0]) as u64, 6)
+    } else {
+        var q: [u8; 6] = "\"fail\""
+        __test_write((&q[0]) as u64, 6)
+    }
+    var c: [u8; 6] = ",\"us\":"
+    __test_write((&c[0]) as u64, 6)
+    __test_num(us)
+    var d: [u8; 8] = ",\"file\":"
+    __test_write((&d[0]) as u64, 8)
+    __test_quoted(file, flen)
+    var e: [u8; 8] = ",\"line\":"
+    __test_write((&e[0]) as u64, 8)
+    __test_num(line)
+    var g: [u8; 7] = ",\"col\":"
+    __test_write((&g[0]) as u64, 7)
+    __test_num(col)
+    if !good {
+        var h: [u8; 10] = ",\"signal\":"
+        __test_write((&h[0]) as u64, 10)
+        __test_num(signal)
+        var i: [u8; 8] = ",\"exit\":"
+        __test_write((&i[0]) as u64, 8)
+        __test_num(code)
+        var j: [u8; 10] = ",\"reason\":"
+        __test_write((&j[0]) as u64, 10)
+        __test_quoted((&__test_cap[0]) as u64, __test_reason_len())
+    }
+    __test_ch(125)
+}
+
+fn __test_tap_case(name: u64, nlen: i64, good: bool, us: i64, file: u64, flen: i64,
+    line: i64, col: i64, signal: i64, code: i64) {
+    if good {
+        var a: [u8; 3] = "ok "
+        __test_write((&a[0]) as u64, 3)
+    } else {
+        var b: [u8; 7] = "not ok "
+        __test_write((&b[0]) as u64, 7)
+    }
+    __test_num(__test_index)
+    var c: [u8; 3] = " - "
+    __test_write((&c[0]) as u64, 3)
+    __test_plain(name, nlen)
+    var d: [u8; 6] = " # us="
+    __test_write((&d[0]) as u64, 6)
+    __test_num(us)
+    __test_ch(10)
+    if !good {
+        var e: [u8; 6] = "  ---\n"
+        __test_write((&e[0]) as u64, 6)
+        var g: [u8; 12] = "  location: "
+        __test_write((&g[0]) as u64, 12)
+        __test_plain(file, flen)
+        __test_ch(58)
+        __test_num(line)
+        __test_ch(58)
+        __test_num(col)
+        __test_ch(10)
+        var h: [u8; 10] = "  signal: "
+        __test_write((&h[0]) as u64, 10)
+        __test_num(signal)
+        __test_ch(10)
+        var i: [u8; 8] = "  exit: "
+        __test_write((&i[0]) as u64, 8)
+        __test_num(code)
+        __test_ch(10)
+        if __test_reason_len() > 0 {
+            var j: [u8; 10] = "  reason: "
+            __test_write((&j[0]) as u64, 10)
+            __test_plain((&__test_cap[0]) as u64, __test_reason_len())
+            __test_ch(10)
+        }
+        var k: [u8; 6] = "  ...\n"
+        __test_write((&k[0]) as u64, 6)
+    }
+}
+
+// The footer, and the exit code the whole run gets: 0 only when every case
+// passed. That is what makes it usable in CI.
+fn __test_finish() -> i32 {
+    if __test_format == 0 {
+        var a: [u8; 3] = "\n],"
+        __test_write((&a[0]) as u64, 3)
+        var b: [u8; 9] = "\"passed\":"
+        __test_write((&b[0]) as u64, 9)
+        __test_num(__test_passed)
+        var c: [u8; 10] = ",\"failed\":"
+        __test_write((&c[0]) as u64, 10)
+        __test_num(__test_failed)
+        var d: [u8; 8] = ",\"rate\":"
+        __test_write((&d[0]) as u64, 8)
+        var per: i64 = 0
+        if __test_total > 0 {
+            per = (__test_passed * 1000) / __test_total
+        }
+        __test_num(per / 1000)
+        __test_ch(46)
+        __test_pad(per % 1000, 3)
+        var e: [u8; 2] = "}\n"
+        __test_write((&e[0]) as u64, 2)
+    } else {
+        var f: [u8; 9] = "# passed "
+        __test_write((&f[0]) as u64, 9)
+        __test_num(__test_passed)
+        var g: [u8; 9] = ", failed "
+        __test_write((&g[0]) as u64, 9)
+        __test_num(__test_failed)
+        __test_ch(10)
+    }
+    if __test_failed > 0 {
+        return 1
+    }
+    return 0
+}

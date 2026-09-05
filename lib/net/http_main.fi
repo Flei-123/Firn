@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/net/http_main.fi -- the HTTP client as a program (root file, B4).
+//
+// One job per line on standard input; one report block per job on standard
+// output, terminated by a line with a single dot.
+//
+//   G <url>                 GET
+//   P <url> <content-type> <body>   POST
+//   C 0|1                   cache off/on          K 0|1  keep-alive off/on
+//   Z 0|1                   gzip off/on           R <n>  redirect limit
+//   X                       empty the cache       J      empty the cookie jar
+//   S                       print the counters
+//   T <path>                ROUND B5: load a PEM trust store (prints ROOTS)
+//   N <unix seconds>        ROUND B5: freeze the clock (0 = ask it again)
+//
+// The report:
+//   STATUS <n>        HOPS <n>       CACHE 0|1     WIRE <n>    BODY <n>
+//   CHUNKS <n>        MEDIA <t>      CHARSET <t>   FINAL <url>
+//   HDR <name> <value>   (one per asked header, see `H` below)
+//   BODYTEXT <n> <the body, one line, control characters escaped>
+//   ERR <name>        instead of everything, when the fetch failed
+//
+// The counter-check lives in the job list, not in this file: the same URL
+// twice with `C 1` has to come back with `CACHE 1` the second time, and
+// with `C 0` it must not.
+import std.rt
+import net.url
+import net.http
+import net.httpstate
+
+fn word(p: u64, n: usize, from: usize, e: *mut usize) -> usize {
+    var i: usize = from
+    while i < n && rt.ld8(p, i) == 32 as u8 {
+        i = i + 1
+    }
+    var k: usize = i
+    while k < n && rt.ld8(p, k) != 32 as u8 {
+        k = k + 1
+    }
+    *e = k
+    return i
+}
+
+fn say(out: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(out, p, n)
+}
+
+fn line_kv(out: *mut rt.Buf, key: u64, nk: usize, v: u64, nv: usize) {
+    say(out, key, nk)
+    rt.buf_push(out, 32 as u8)
+    say(out, v, nv)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn line_kn(out: *mut rt.Buf, key: u64, nk: usize, v: u64) {
+    say(out, key, nk)
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_dec_u64(out, v)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn report(out: *mut rt.Buf, r: *mut http.Response) {
+    var k_st: [u8; 6] = "STATUS"
+    var k_hp: [u8; 4] = "HOPS"
+    var k_ca: [u8; 5] = "CACHE"
+    var k_wi: [u8; 4] = "WIRE"
+    var k_bo: [u8; 4] = "BODY"
+    var k_ch: [u8; 6] = "CHUNKS"
+    var k_me: [u8; 5] = "MEDIA"
+    var k_cs: [u8; 7] = "CHARSET"
+    var k_fi: [u8; 5] = "FINAL"
+    var k_nh: [u8; 7] = "HEADERS"
+    line_kn(out, (&k_st[0]) as u64, 6, http.resp_status(r) as u64)
+    line_kn(out, (&k_hp[0]) as u64, 4, http.resp_hops(r) as u64)
+    var cf: u64 = 0
+    if http.resp_from_cache(r) {
+        cf = 1
+    }
+    line_kn(out, (&k_ca[0]) as u64, 5, cf)
+    line_kn(out, (&k_wi[0]) as u64, 4, http.resp_wire_len(r) as u64)
+    line_kn(out, (&k_bo[0]) as u64, 4, http.resp_body_len(r) as u64)
+    line_kn(out, (&k_ch[0]) as u64, 6, http.resp_chunks(r) as u64)
+    line_kn(out, (&k_nh[0]) as u64, 7, http.resp_header_count(r) as u64)
+    line_kv(out, (&k_me[0]) as u64, 5, http.resp_media_ptr(r),
+        http.resp_media_len(r))
+    line_kv(out, (&k_cs[0]) as u64, 7, http.resp_charset_ptr(r),
+        http.resp_charset_len(r))
+    line_kv(out, (&k_fi[0]) as u64, 5, http.resp_final_url_ptr(r),
+        http.resp_final_url_len(r))
+    // the body, escaped so that it stays one line
+    var k_bt: [u8; 9] = "BODYTEXT "
+    say(out, (&k_bt[0]) as u64, 9)
+    let p: u64 = http.resp_body_ptr(r)
+    let n: usize = http.resp_body_len(r)
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 10 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 110 as u8)
+        } else if ch == 13 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 114 as u8)
+        } else if ch == 92 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 92 as u8)
+        } else if ch < 32 as u8 {
+            rt.buf_push(out, 63 as u8)
+        } else {
+            rt.buf_push(out, ch)
+        }
+        i = i + 1
+    }
+    rt.buf_push(out, 10 as u8)
+}
+
+fn main() -> i32 {
+    var inb: rt.Buf = rt.buf_new()
+    rt.read_stdin(&inb)
+    var out: rt.Buf = rt.buf_new()
+    var c: http.Client = http.client_new()
+    if !http.client_init(&c) {
+        return 2
+    }
+    var r: http.Response = http.resp_new()
+    http.resp_init(&r)
+    let p: u64 = inb.ptr
+    let n: usize = inb.len
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        if e > i {
+            let cmd: u8 = rt.ld8(p, i)
+            var ue: usize = 0
+            let us: usize = word(p, e, i + 1, &ue)
+            if cmd == 71 as u8 { // G
+                let ok: bool = http.http_get(&c, p + us as u64, ue - us, &r)
+                catch | x | http.fail_into(&out, x)
+                if ok {
+                    report(&out, &r)
+                }
+            } else if cmd == 80 as u8 { // P url ctype body
+                var te: usize = 0
+                let ts: usize = word(p, e, ue, &te)
+                var bs: usize = te
+                while bs < e && rt.ld8(p, bs) == 32 as u8 {
+                    bs = bs + 1
+                }
+                let ok: bool = http.http_post(&c, p + us as u64, ue - us,
+                    p + bs as u64, e - bs, p + ts as u64, te - ts, &r)
+                catch | x | http.fail_into(&out, x)
+                if ok {
+                    report(&out, &r)
+                }
+            } else if cmd == 67 as u8 { // C
+                http.client_set_cache(&c, rt.ld8(p, us) == 49 as u8)
+            } else if cmd == 75 as u8 { // K
+                http.client_set_keepalive(&c, rt.ld8(p, us) == 49 as u8)
+            } else if cmd == 90 as u8 { // Z
+                http.client_set_gzip(&c, rt.ld8(p, us) == 49 as u8)
+            } else if cmd == 82 as u8 { // R
+                var v: u32 = 0
+                var q: usize = us
+                while q < ue {
+                    v = v * 10 as u32 + (rt.ld8(p, q) - 48 as u8) as u32
+                    q = q + 1
+                }
+                http.client_set_max_redirects(&c, v)
+            } else if cmd == 88 as u8 { // X
+                httpstate.cache_clear(http.client_cache(&c))
+            } else if cmd == 74 as u8 { // J
+                httpstate.jar_clear(http.client_jar(&c))
+            } else if cmd == 84 as u8 { // T <path to a PEM bundle>
+                var path: [u8; 512] = [0; 512]
+                var q: usize = 0
+                while q < ue - us && q < 511 {
+                    path[q] = rt.ld8(p, us + q)
+                    q = q + 1
+                }
+                path[q] = 0 as u8
+                let got: usize = http.client_load_trust(&c,
+                    (&path[0]) as u64)
+                var kr: [u8; 5] = "ROOTS"
+                line_kn(&out, (&kr[0]) as u64, 5, got as u64)
+            } else if cmd == 78 as u8 { // N <unix seconds>
+                var t: u64 = 0
+                var q: usize = us
+                while q < ue {
+                    t = t * 10 as u64 + (rt.ld8(p, q) - 48 as u8) as u64
+                    q = q + 1
+                }
+                http.client_set_now(&c, t)
+            } else if cmd == 83 as u8 { // S
+                var k1: [u8; 7] = "SOCKETS"
+                var k2: [u8; 6] = "REUSED"
+                var k3: [u8; 8] = "REQUESTS"
+                var k4: [u8; 9] = "REDIRECTS"
+                var k5: [u8; 7] = "COOKIES"
+                var k6: [u8; 6] = "CACHED"
+                var k7: [u8; 10] = "HANDSHAKES"
+                var k8: [u8; 5] = "SUITE"
+                var k9: [u8; 9] = "TLSREASON"
+                line_kn(&out, (&k1[0]) as u64, 7, http.client_sockets(&c))
+                line_kn(&out, (&k2[0]) as u64, 6, http.client_reused(&c))
+                line_kn(&out, (&k3[0]) as u64, 8, http.client_requests(&c))
+                line_kn(&out, (&k4[0]) as u64, 9, http.client_redirects(&c))
+                line_kn(&out, (&k5[0]) as u64, 7,
+                    httpstate.jar_count(http.client_jar(&c)) as u64)
+                line_kn(&out, (&k6[0]) as u64, 6,
+                    httpstate.cache_count(http.client_cache(&c)) as u64)
+                line_kn(&out, (&k7[0]) as u64, 10,
+                    http.client_tls_handshakes(&c))
+                line_kn(&out, (&k8[0]) as u64, 5,
+                    http.client_last_suite(&c) as u64)
+                line_kn(&out, (&k9[0]) as u64, 9,
+                    http.client_tls_reason(&c) as u64)
+            }
+            rt.buf_push(&out, 46 as u8)
+            rt.buf_push(&out, 10 as u8)
+            rt.write_everything(1, out.ptr, out.len)
+            rt.buf_clear(&out)
+        }
+        i = e + 1
+    }
+    http.resp_free(&r)
+    http.client_free(&c)
+    rt.buf_free(&out)
+    rt.buf_free(&inb)
+    return 0
+}

@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/sha256.fi -- SHA-256 (FIPS 180-4), round 81.
+//
+// The one that is NOT broken. Where SHA-1 is here because two protocols
+// demand it (see `sha1.fi`), this is the hash to reach for when there is a
+// choice: content addressing, HMAC keys, a checksum an adversary must not
+// be able to forge, the key derivation of a session.
+//
+// THE STRUCTURE, and why it looks like that: 64 rounds over a 512 bit
+// block, eight 32 bit words of state, and a message schedule that expands
+// 16 input words to 64 with two different sigma functions. The 64 round
+// constants are "the first 32 bits of the fractional parts of the cube
+// roots of the first 64 primes" -- nothing-up-my-sleeve numbers, chosen so
+// that nobody can suspect them of hiding a trapdoor. They are written out
+// here as they stand in FIPS 180-4 4.2.2; a program that computed them
+// would be cleverer and would prove less.
+//
+// AS IN `sha1.fi`, everything runs in u64 and is masked to 32 bits, so that
+// the digest cannot depend on the build mode.
+//
+// PROVEN: the NIST CAVP byte vectors (`SHA256ShortMsg.rsp`,
+// `SHA256LongMsg.rsp`, 128 messages) in `tools/stdlib81/run.sh`, plus
+// `python3 hashlib` over random inputs.
+//
+// ROUND 82 -- THE SECOND PATH. On a processor with SHA-NI
+// (`sha256rnds2`/`sha256msg1`/`sha256msg2`) the block function of
+// `lib/std/crypto/accel.fi` runs instead: two rounds per instruction rather
+// than some twenty. The choice is made ONCE, in `sha256_new`, by asking
+// `cpuid` -- the same binary keeps running on a machine without it, over the
+// code below, which is not dead weight but the fallback.
+//
+// `sha256_soft` forces the scalar path. It exists so that
+// `tools/bench82/run.sh` can send the SAME NIST vectors through BOTH
+// implementations and demand the same answer; a fast hash that is wrong is
+// worth nothing.
+import std.rt
+import std.crypto.accel
+
+export { Sha256, sha256_new, sha256_new_soft, sha256_update, sha256_final,
+    sha256, sha256_soft,
+    SHA256_SIZE, SHA256_BLOCK }
+
+const SHA256_SIZE: usize = 32
+const SHA256_BLOCK: usize = 64
+const M32: u64 = 4294967295
+
+struct Sha256 {
+    h: [u64; 8],
+    // The 64 round constants live in the STATE, not in the block function.
+    // As a local array literal they were written out again for every 64
+    // octets of input, and that alone cost the difference between 9.8 and
+    // 22.6 MiB/s -- measured on this machine, both numbers in
+    // docs/ROUND81.md.
+    k: [u64; 64],
+    block: [u8; 64],
+    used: usize,
+    total: u64,
+    // ROUND 82: does this processor have SHA-NI, and may it be used? Asked
+    // once in `sha256_new`, never in the hot loop.
+    ni: bool,
+}
+
+fn rotr32(x: u64, n: u64) -> u64 {
+    return (((x & M32) >> n) | (x << (32 as u64 - n))) & M32
+}
+
+fn k_table() -> [u64; 64] {
+    var k: [u64; 64] = [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
+        2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
+        1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
+        264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
+        113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+        1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
+        3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+        1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
+        2428436474, 2756734187, 3204031479, 3329325298
+    ]
+    return k
+}
+
+fn sha256_new() -> Sha256 {
+    return Sha256 {
+        h: [1779033703, 3144134277, 1013904242, 2773480762,
+            1359893119, 2600822924, 528734635, 1541459225],
+        k: k_table(), block: [0; 64], used: 0, total: 0,
+        ni: accel.accel_sha() }
+}
+
+// The same state with the hardware path switched OFF -- the cross-check of
+// `tools/bench82/run.sh` runs on this.
+fn sha256_new_soft() -> Sha256 {
+    var s: Sha256 = sha256_new()
+    s.ni = false
+    return s
+}
+
+// `nb` blocks of 64 octets at `p`. ONE decision, then a loop -- not a
+// decision per block. The state travels as eight 32 bit words for the
+// hardware path, which is the layout FIPS 180-4 prescribes; `h` keeps its
+// u64 form so that nothing about the scalar path changes.
+fn sha256_blocks(s: *mut Sha256, p: u64, nb: usize) {
+    if (*s).ni {
+        var h32: [u32; 8] = [0; 8]
+        var i: usize = 0
+        while i < 8 {
+            h32[i] = (*s).h[i] as u32
+            i = i + 1
+        }
+        accel.sha256_ni_blocks((&h32[0]) as u64, p, nb)
+        i = 0
+        while i < 8 {
+            (*s).h[i] = h32[i] as u64
+            i = i + 1
+        }
+        return
+    }
+    var b: usize = 0
+    while b < nb {
+        sha256_block(s, p + (b as u64) * 64)
+        b = b + 1
+    }
+}
+
+fn sha256_block(s: *mut Sha256, p: u64) {
+    var w: [u64; 64] = [0; 64]
+    var i: usize = 0
+    while i < 16 {
+        w[i] = ((rt.ld8(p, i * 4) as u64) << 24)
+        | ((rt.ld8(p, i * 4 + 1) as u64) << 16)
+        | ((rt.ld8(p, i * 4 + 2) as u64) << 8)
+        | (rt.ld8(p, i * 4 + 3) as u64)
+        i = i + 1
+    }
+    while i < 64 {
+        let s0: u64 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18)
+        ^ ((w[i - 15] & M32) >> 3)
+        let s1: u64 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19)
+        ^ ((w[i - 2] & M32) >> 10)
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & M32
+        i = i + 1
+    }
+    var a: u64 = (*s).h[0]
+    var b: u64 = (*s).h[1]
+    var c: u64 = (*s).h[2]
+    var d: u64 = (*s).h[3]
+    var e: u64 = (*s).h[4]
+    var f: u64 = (*s).h[5]
+    var g: u64 = (*s).h[6]
+    var hh: u64 = (*s).h[7]
+    i = 0
+    while i < 64 {
+        let S1: u64 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+        let ch: u64 = (e & f) ^ ((e ^ M32) & g)
+        let t1: u64 = (hh + S1 + ch + (*s).k[i] + w[i]) & M32
+        let S0: u64 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+        let maj: u64 = (a & b) ^ (a & c) ^ (b & c)
+        let t2: u64 = (S0 + maj) & M32
+        hh = g
+        g = f
+        f = e
+        e = (d + t1) & M32
+        d = c
+        c = b
+        b = a
+        a = (t1 + t2) & M32
+        i = i + 1
+    }
+    (*s).h[0] = ((*s).h[0] + a) & M32
+    (*s).h[1] = ((*s).h[1] + b) & M32
+    (*s).h[2] = ((*s).h[2] + c) & M32
+    (*s).h[3] = ((*s).h[3] + d) & M32
+    (*s).h[4] = ((*s).h[4] + e) & M32
+    (*s).h[5] = ((*s).h[5] + f) & M32
+    (*s).h[6] = ((*s).h[6] + g) & M32
+    (*s).h[7] = ((*s).h[7] + hh) & M32
+}
+
+fn sha256_update(s: *mut Sha256, p: u64, n: usize) {
+    (*s).total = (*s).total + n as u64
+    var at: usize = 0
+    if (*s).used > 0 {
+        while at < n && (*s).used < 64 {
+            (*s).block[(*s).used] = rt.ld8(p, at)
+            (*s).used = (*s).used + 1
+            at = at + 1
+        }
+        if (*s).used == 64 {
+            sha256_blocks(s, (&(*s).block[0]) as u64, 1)
+            (*s).used = 0
+        }
+    }
+    // ROUND 82: ALL full blocks in ONE call. That is what makes the state
+    // conversion of the hardware path amortise -- it happens once per
+    // `sha256_update`, not once per 64 octets.
+    let full: usize = (n - at) / 64
+    if full > 0 {
+        sha256_blocks(s, p + at as u64, full)
+        at = at + full * 64
+    }
+    while at < n {
+        (*s).block[(*s).used] = rt.ld8(p, at)
+        (*s).used = (*s).used + 1
+        at = at + 1
+    }
+}
+
+fn sha256_final(s: *mut Sha256, out: u64) {
+    let bits: u64 = (*s).total * 8
+    var pad: [u8; 72] = [0; 72]
+    pad[0] = 128 as u8
+    var padlen: usize = 1
+    while ((*s).used + padlen) % 64 != 56 {
+        padlen = padlen + 1
+    }
+    var i: usize = 0
+    while i < 8 {
+        pad[padlen + i] = ((bits >> ((7 - i) as u64 * 8)) & 255 as u64) as u8
+        i = i + 1
+    }
+    let keep: u64 = (*s).total
+    sha256_update(s, (&pad[0]) as u64, padlen + 8)
+    (*s).total = keep
+    i = 0
+    while i < 8 {
+        var j: usize = 0
+        while j < 4 {
+            rt.st8(out, i * 4 + j,
+                (((*s).h[i] >> ((3 - j) as u64 * 8)) & 255 as u64) as u8)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn sha256(p: u64, n: usize, out: u64) {
+    var s: Sha256 = sha256_new()
+    sha256_update(&s, p, n)
+    sha256_final(&s, out)
+}
+
+// The scalar path, whatever the processor can do.
+fn sha256_soft(p: u64, n: usize, out: u64) {
+    var s: Sha256 = sha256_new_soft()
+    sha256_update(&s, p, n)
+    sha256_final(&s, out)
+}

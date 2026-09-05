@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/token_stream.fi -- the reader of the binary token protocol.
+//
+// The counterpart to `tb_*` in lib/html/tokens.fi. The tokenizer writes its
+// tokens as records into a byte buffer, and this reader walks them.
+//
+// WHY A BUFFER AND NO CALLBACK: the tokenizer is completely
+// `#[no_gc]` (SPEC 3.5.4) -- it must not call a function that requests GC
+// memory. The tree construction does exactly that (every node is a GC
+// object). So something that knows no pointers to GC objects MUST stand
+// between the two. That is this buffer.
+//
+// The reader holds nothing but offsets into the buffer; it copies nothing.
+// Every access goes through `chain_*`, so that the tree construction can
+// shovel the characters straight into a GC chain, without an intermediate buffer.
+
+import html.mem
+import html.tokens
+
+export {
+    Stream,
+    stream_new, stream_set, stream_next, stream_am_end,
+    stream_kind, stream_flags, stream_pos, stream_nattr,
+    stream_name, stream_attr_first, stream_data,
+    stream_doctype_pubid, stream_doctype_sysid,
+    chain_length, chain_cp, chain_end,
+    stream_back,
+}
+
+struct Stream {
+    p: *mut u8,
+    n: usize,
+    i: usize, // the next unread byte offset
+    set: usize, // the start of the CURRENT record
+    kind: u32,
+    flags: u32,
+    pos: usize,
+    nattr: u32,
+}
+
+#[no_gc]
+fn stream_new() -> Stream {
+    return Stream {
+        p: 0 as *mut u8,
+        n: 0,
+        i: 0,
+        set: 0,
+        kind: 0,
+        flags: 0,
+        pos: 0,
+        nattr: 0,
+    }
+}
+
+#[no_gc]
+fn stream_set(s: *mut Stream, p: *mut u8, n: usize) {
+    (*s).p = p
+    (*s).n = n
+    (*s).i = 0
+    (*s).set = 0
+    (*s).kind = 0
+    (*s).flags = 0
+    (*s).pos = 0
+    (*s).nattr = 0
+}
+
+#[no_gc]
+fn u32_at(s: *mut Stream, off: usize) -> u32 {
+    if off + 4 > (*s).n {
+        return 0
+    }
+    let b: u64 = (*s).p as u64 + off as u64
+    return (*(b as *mut u8)) as u32 |
+    (((*((b + 1) as *mut u8)) as u32) << 8) |
+    (((*((b + 2) as *mut u8)) as u32) << 16) |
+    (((*((b + 3) as *mut u8)) as u32) << 24)
+}
+
+// The length of the chain that begins at `off` (in code points).
+#[no_gc]
+fn chain_length(s: *mut Stream, off: usize) -> usize {
+    return u32_at(s, off) as usize
+}
+
+// The code point `i` of the chain at `off`.
+#[no_gc]
+fn chain_cp(s: *mut Stream, off: usize, i: usize) -> u32 {
+    return u32_at(s, off + 4 + i * 4)
+}
+
+// The offset directly BEHIND the chain at `off` -- that is how you walk attribute pairs.
+#[no_gc]
+fn chain_end(s: *mut Stream, off: usize) -> usize {
+    return off + 4 + chain_length(s, off) * 4
+}
+
+#[no_gc]
+fn stream_am_end(s: *mut Stream) -> bool {
+    return (*s).i >= (*s).n
+}
+
+// Reads the next record. `false` = the stream is at its end.
+#[no_gc]
+fn stream_next(s: *mut Stream) -> bool {
+    if (*s).i + 16 > (*s).n {
+        return false
+    }
+    (*s).set = (*s).i
+    (*s).kind = u32_at(s, (*s).i)
+    (*s).flags = u32_at(s, (*s).i + 4)
+    (*s).pos = u32_at(s, (*s).i + 8) as usize
+    (*s).nattr = u32_at(s, (*s).i + 12)
+    var off: usize = (*s).i + 16
+    if (*s).kind == tokens.TB_START {
+        off = chain_end(s, off)
+        var k: u32 = 0
+        while k < (*s).nattr {
+            off = chain_end(s, off)
+            off = chain_end(s, off)
+            k = k + 1
+        }
+    } else if (*s).kind == tokens.TB_DOCTYPE {
+        off = chain_end(s, off)
+        off = chain_end(s, off)
+        off = chain_end(s, off)
+    } else {
+        off = chain_end(s, off)
+    }
+    (*s).i = off
+    return true
+}
+
+// Sets the reader back to the start of the record read last. The tree
+// construction needs that when a token has to be processed AGAIN in another
+// insertion mode ("reprocess the token") and the mode must not push the
+// stream on in between.
+#[no_gc]
+fn stream_back(s: *mut Stream) {
+    (*s).i = (*s).set
+}
+
+#[no_gc]
+fn stream_kind(s: *mut Stream) -> u32 {
+    return (*s).kind
+}
+
+#[no_gc]
+fn stream_flags(s: *mut Stream) -> u32 {
+    return (*s).flags
+}
+
+#[no_gc]
+fn stream_pos(s: *mut Stream) -> usize {
+    return (*s).pos
+}
+
+#[no_gc]
+fn stream_nattr(s: *mut Stream) -> u32 {
+    return (*s).nattr
+}
+
+// The offset of the name chain of the current record (start/end tag, DOCTYPE).
+#[no_gc]
+fn stream_name(s: *mut Stream) -> usize {
+    return (*s).set + 16
+}
+
+// The offset of the first attribute chain (the name of the first attribute).
+#[no_gc]
+fn stream_attr_first(s: *mut Stream) -> usize {
+    return chain_end(s, (*s).set + 16)
+}
+
+// The offset of the data chain (a comment, characters).
+#[no_gc]
+fn stream_data(s: *mut Stream) -> usize {
+    return (*s).set + 16
+}
+
+#[no_gc]
+fn stream_doctype_pubid(s: *mut Stream) -> usize {
+    return chain_end(s, (*s).set + 16)
+}
+
+#[no_gc]
+fn stream_doctype_sysid(s: *mut Stream) -> usize {
+    return chain_end(s, chain_end(s, (*s).set + 16))
+}

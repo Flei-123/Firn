@@ -1,0 +1,453 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/crypto_main.fi -- the primitives of round B5 as a
+// PROGRAM, so that somebody else's implementation can be asked the same
+// questions (root file).
+//
+// One job per line on standard input, one answer per line on standard
+// output. Everything that is not a name is lower case hexadecimal.
+//
+//   BIGMOD    a m                a mod m
+//   BIGMODEXP b e m              b^e mod m
+//   BIGMULMOD a b m              a*b mod m
+//   X25519    scalar u           the RFC 7748 function
+//   X25519B   scalar             scalar * base point
+//   CHACHA20  key nonce counter plaintext
+//   POLY1305  key message
+//   AEADCC    key nonce aad plaintext        seal, ChaCha20-Poly1305
+//   AEADCCOPEN key nonce aad ciphertext      open, or ERR
+//   AEADGCM   key nonce aad plaintext        seal, AES-128-GCM
+//   AEADGCMOPEN key nonce aad ciphertext     open, or ERR
+//   SHA384    message
+//   SHA512    message
+//   HKDFEXT   salt ikm           HKDF-Extract, SHA-256
+//   HKDFEXP   prk info length    HKDF-Expand, SHA-256
+//   RSAPKCS   n e sig hash       PKCS#1 v1.5 verify -> OK / BAD
+//   RSAPSS    n e sig hash       RSA-PSS verify -> OK / BAD
+//   P256      qx qy r s hash     ECDSA verify -> OK / BAD
+//
+// The other side is `tools/tlsb5/crypto_check.py`, which asks Python's
+// `cryptography`, `hashlib` and `openssl` the same thing.
+import std.rt
+import std.crypto.big
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.sha512
+import std.crypto.hkdf
+import std.crypto.rsa
+import std.crypto.ecdsa
+
+const MAXF: usize = 8
+const FLD: usize = 9000
+
+struct Job {
+    // up to MAXF fields, each decoded from hex into `raw`
+    off: [usize; 8],
+    len: [usize; 8],
+    nf: usize,
+    raw: rt.Buf,
+}
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 97 as u8) as i32 + 10
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 65 as u8) as i32 + 10
+    }
+    return 0 - 1
+}
+
+fn put_hex(out: *mut rt.Buf, p: u64, n: usize) {
+    var digits: [u8; 16] = "0123456789abcdef"
+    var i: usize = 0
+    while i < n {
+        let v: u8 = rt.ld8(p, i)
+        rt.buf_push(out, digits[(v >> 4) as usize])
+        rt.buf_push(out, digits[(v & 15 as u8) as usize])
+        i = i + 1
+    }
+}
+
+fn field_ptr(j: *mut Job, i: usize) -> u64 {
+    return (*j).raw.ptr + (*j).off[i] as u64
+}
+
+fn field_len(j: *mut Job, i: usize) -> usize {
+    return (*j).len[i]
+}
+
+// The decimal value of a field that is a plain number, not hex.
+fn field_dec(j: *mut Job, i: usize) -> u64 {
+    let p: u64 = field_ptr(j, i)
+    let n: usize = field_len(j, i)
+    var v: u64 = 0
+    var k: usize = 0
+    // The field was decoded as hex; decode the digits back. A length is
+    // written as hex too, so "20" is 32.
+    while k < n {
+        v = v * 256 as u64 + rt.ld8(p, k) as u64
+        k = k + 1
+    }
+    return v
+}
+
+fn say(out: *mut rt.Buf, p: u64, n: usize) {
+    var lit: [u8; 3] = "ERR"
+    if n == 0 {
+        rt.buf_push_bytes(out, (&lit[0]) as u64, 3)
+    } else {
+        put_hex(out, p, n)
+    }
+    rt.buf_push(out, 10 as u8)
+}
+
+fn say_word(out: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(out, p, n)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn ok_bad(out: *mut rt.Buf, good: bool) {
+    var yes: [u8; 2] = "OK"
+    var no: [u8; 3] = "BAD"
+    if good {
+        say_word(out, (&yes[0]) as u64, 2)
+    } else {
+        say_word(out, (&no[0]) as u64, 3)
+    }
+}
+
+fn name_is(p: u64, n: usize, lit: u64, ln: usize) -> bool {
+    if n != ln {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != rt.ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------- Big number jobs
+
+fn do_big(kind: u32, j: *mut Job, out: *mut rt.Buf) {
+    var a: big.Big = big.big_new()
+    var b: big.Big = big.big_new()
+    var m: big.Big = big.big_new()
+    var r: big.Big = big.big_new()
+    if kind == 0 as u32 {
+        let o1: bool = big.big_from_be(&a, field_ptr(j, 1), field_len(j, 1))
+        let o2: bool = big.big_from_be(&m, field_ptr(j, 2), field_len(j, 2))
+        let o3: bool = big.big_mod(&r, &a, &m)
+        var buf: [u8; 544] = [0; 544]
+        let nb: usize = field_len(j, 2)
+        let o4: bool = big.big_to_be(&r, (&buf[0]) as u64, nb)
+        say(out, (&buf[0]) as u64, nb)
+        return
+    }
+    let o1: bool = big.big_from_be(&a, field_ptr(j, 1), field_len(j, 1))
+    let o2: bool = big.big_from_be(&b, field_ptr(j, 2), field_len(j, 2))
+    let o3: bool = big.big_from_be(&m, field_ptr(j, 3), field_len(j, 3))
+    var mc: big.Mont = big.mont_new()
+    if !big.mont_init(&mc, &m) {
+        say(out, 0 as u64, 0)
+        return
+    }
+    var am: big.Big = big.big_new()
+    var ar: big.Big = big.big_new()
+    let o5: bool = big.big_mod(&ar, &a, &m)
+    big.mont_to(&mc, &am, &ar)
+    if kind == 1 as u32 {
+        var res: big.Big = big.big_new()
+        big.mont_pow(&mc, &res, &am, &b)
+        big.mont_from(&mc, &r, &res)
+    } else {
+        var bm: big.Big = big.big_new()
+        var br: big.Big = big.big_new()
+        let o6: bool = big.big_mod(&br, &b, &m)
+        big.mont_to(&mc, &bm, &br)
+        var res: big.Big = big.big_new()
+        big.mont_mul(&mc, &res, &am, &bm)
+        big.mont_from(&mc, &r, &res)
+    }
+    var buf: [u8; 544] = [0; 544]
+    let nb: usize = field_len(j, 3)
+    let o7: bool = big.big_to_be(&r, (&buf[0]) as u64, nb)
+    say(out, (&buf[0]) as u64, nb)
+}
+
+// ---------------------------------------------------------------- The run
+
+fn run_job(j: *mut Job, out: *mut rt.Buf) {
+    let np: u64 = field_ptr(j, 0)
+    let nn: usize = field_len(j, 0)
+    var n_bigmod: [u8; 6] = "BIGMOD"
+    var n_bigexp: [u8; 9] = "BIGMODEXP"
+    var n_bigmul: [u8; 9] = "BIGMULMOD"
+    var n_x: [u8; 6] = "X25519"
+    var n_xb: [u8; 7] = "X25519B"
+    var n_cc: [u8; 8] = "CHACHA20"
+    var n_poly: [u8; 8] = "POLY1305"
+    var n_acc: [u8; 6] = "AEADCC"
+    var n_acco: [u8; 10] = "AEADCCOPEN"
+    var n_agcm: [u8; 7] = "AEADGCM"
+    var n_agcmo: [u8; 11] = "AEADGCMOPEN"
+    var n_384: [u8; 6] = "SHA384"
+    var n_512: [u8; 6] = "SHA512"
+    var n_hext: [u8; 7] = "HKDFEXT"
+    var n_hexp: [u8; 7] = "HKDFEXP"
+    var n_rsap: [u8; 7] = "RSAPKCS"
+    var n_rsas: [u8; 6] = "RSAPSS"
+    var n_p256: [u8; 4] = "P256"
+    if name_is(np, nn, (&n_bigmod[0]) as u64, 6) {
+        do_big(0 as u32, j, out)
+        return
+    }
+    if name_is(np, nn, (&n_bigexp[0]) as u64, 9) {
+        do_big(1 as u32, j, out)
+        return
+    }
+    if name_is(np, nn, (&n_bigmul[0]) as u64, 9) {
+        do_big(2 as u32, j, out)
+        return
+    }
+    if name_is(np, nn, (&n_x[0]) as u64, 6) {
+        var o: [u8; 32] = [0; 32]
+        let ok: bool = x25519.x25519(field_ptr(j, 1), field_ptr(j, 2),
+            (&o[0]) as u64)
+        if !ok {
+            say(out, 0 as u64, 0)
+        } else {
+            say(out, (&o[0]) as u64, 32)
+        }
+        return
+    }
+    if name_is(np, nn, (&n_xb[0]) as u64, 7) {
+        var o: [u8; 32] = [0; 32]
+        let ok: bool = x25519.x25519_base(field_ptr(j, 1), (&o[0]) as u64)
+        say(out, (&o[0]) as u64, 32)
+        return
+    }
+    if name_is(np, nn, (&n_cc[0]) as u64, 8) {
+        let n: usize = field_len(j, 4)
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&o, n + 1)
+        rt.buf_set_len(&o, n)
+        chacha.chacha20(field_ptr(j, 1), field_ptr(j, 2),
+            field_dec(j, 3) as u32, field_ptr(j, 4), n, o.ptr)
+        say(out, o.ptr, n)
+        rt.buf_free(&o)
+        return
+    }
+    if name_is(np, nn, (&n_poly[0]) as u64, 8) {
+        var tag: [u8; 16] = [0; 16]
+        chacha.poly1305(field_ptr(j, 1), field_ptr(j, 2), field_len(j, 2),
+            (&tag[0]) as u64)
+        say(out, (&tag[0]) as u64, 16)
+        return
+    }
+    if name_is(np, nn, (&n_acc[0]) as u64, 6) {
+        let n: usize = field_len(j, 4)
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&o, n + 17)
+        rt.buf_set_len(&o, n + 16)
+        chacha.aead_seal(field_ptr(j, 1), field_ptr(j, 2), field_ptr(j, 3),
+            field_len(j, 3), field_ptr(j, 4), n, o.ptr)
+        say(out, o.ptr, n + 16)
+        rt.buf_free(&o)
+        return
+    }
+    if name_is(np, nn, (&n_acco[0]) as u64, 10) {
+        let n: usize = field_len(j, 4)
+        if n < 16 {
+            say(out, 0 as u64, 0)
+            return
+        }
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&o, n + 1)
+        rt.buf_set_len(&o, n)
+        let ok: bool = chacha.aead_open(field_ptr(j, 1), field_ptr(j, 2),
+            field_ptr(j, 3), field_len(j, 3), field_ptr(j, 4), n, o.ptr)
+        if ok {
+            say(out, o.ptr, n - 16)
+        } else {
+            say(out, 0 as u64, 0)
+        }
+        rt.buf_free(&o)
+        return
+    }
+    if name_is(np, nn, (&n_agcm[0]) as u64, 7) {
+        let n: usize = field_len(j, 4)
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&o, n + 17)
+        rt.buf_set_len(&o, n + 16)
+        gcm.gcm_seal(field_ptr(j, 1), field_len(j, 1), field_ptr(j, 2),
+            field_ptr(j, 3), field_len(j, 3), field_ptr(j, 4), n, o.ptr)
+        say(out, o.ptr, n + 16)
+        rt.buf_free(&o)
+        return
+    }
+    if name_is(np, nn, (&n_agcmo[0]) as u64, 11) {
+        let n: usize = field_len(j, 4)
+        if n < 16 {
+            say(out, 0 as u64, 0)
+            return
+        }
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&o, n + 1)
+        rt.buf_set_len(&o, n)
+        let ok: bool = gcm.gcm_open(field_ptr(j, 1), field_len(j, 1),
+            field_ptr(j, 2), field_ptr(j, 3), field_len(j, 3),
+            field_ptr(j, 4), n, o.ptr)
+        if ok {
+            say(out, o.ptr, n - 16)
+        } else {
+            say(out, 0 as u64, 0)
+        }
+        rt.buf_free(&o)
+        return
+    }
+    if name_is(np, nn, (&n_384[0]) as u64, 6) {
+        var o: [u8; 48] = [0; 48]
+        sha512.sha384(field_ptr(j, 1), field_len(j, 1), (&o[0]) as u64)
+        say(out, (&o[0]) as u64, 48)
+        return
+    }
+    if name_is(np, nn, (&n_512[0]) as u64, 6) {
+        var o: [u8; 64] = [0; 64]
+        sha512.sha512(field_ptr(j, 1), field_len(j, 1), (&o[0]) as u64)
+        say(out, (&o[0]) as u64, 64)
+        return
+    }
+    if name_is(np, nn, (&n_hext[0]) as u64, 7) {
+        var o: [u8; 32] = [0; 32]
+        hkdf.hkdf_extract(field_ptr(j, 1), field_len(j, 1),
+            field_ptr(j, 2), field_len(j, 2), (&o[0]) as u64)
+        say(out, (&o[0]) as u64, 32)
+        return
+    }
+    if name_is(np, nn, (&n_hexp[0]) as u64, 7) {
+        let want: usize = field_dec(j, 3) as usize
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&o, want + 1)
+        rt.buf_set_len(&o, want)
+        let ok: bool = hkdf.hkdf_expand(field_ptr(j, 1), field_len(j, 1),
+            field_ptr(j, 2), field_len(j, 2), o.ptr, want)
+        if ok {
+            say(out, o.ptr, want)
+        } else {
+            say(out, 0 as u64, 0)
+        }
+        rt.buf_free(&o)
+        return
+    }
+    if name_is(np, nn, (&n_rsap[0]) as u64, 7) {
+        let good: bool = rsa.rsa_verify_pkcs1_sha256(field_ptr(j, 1),
+            field_len(j, 1), field_ptr(j, 2), field_len(j, 2),
+            field_ptr(j, 3), field_len(j, 3), field_ptr(j, 4))
+        ok_bad(out, good)
+        return
+    }
+    if name_is(np, nn, (&n_rsas[0]) as u64, 6) {
+        let good: bool = rsa.rsa_verify_pss_sha256(field_ptr(j, 1),
+            field_len(j, 1), field_ptr(j, 2), field_len(j, 2),
+            field_ptr(j, 3), field_len(j, 3), field_ptr(j, 4))
+        ok_bad(out, good)
+        return
+    }
+    if name_is(np, nn, (&n_p256[0]) as u64, 4) {
+        let good: bool = ecdsa.ecdsa_verify(field_ptr(j, 1), field_ptr(j, 2),
+            field_ptr(j, 3), field_ptr(j, 4), field_ptr(j, 5),
+            field_len(j, 5))
+        ok_bad(out, good)
+        return
+    }
+    say(out, 0 as u64, 0)
+}
+
+// Splits a line into fields at the spaces and decodes every field from
+// hex. Field 0 is the name, which is left as it stands.
+fn split_line(p: u64, from: usize, to: usize, j: *mut Job) -> bool {
+    rt.buf_clear(&(*j).raw)
+    (*j).nf = 0
+    var i: usize = from
+    while i < to && (*j).nf < MAXF {
+        while i < to && rt.ld8(p, i) == 32 as u8 {
+            i = i + 1
+        }
+        if i >= to {
+            break
+        }
+        var e: usize = i
+        while e < to && rt.ld8(p, e) != 32 as u8 {
+            e = e + 1
+        }
+        let idx: usize = (*j).nf
+        (*j).off[idx] = (*j).raw.len
+        if idx == 0 {
+            rt.buf_push_bytes(&(*j).raw, p + i as u64, e - i)
+            (*j).len[idx] = e - i
+        } else if e == i + 1 && rt.ld8(p, i) == 46 as u8 {
+            // "." is how a job writes a field of zero octets; a run of
+            // spaces cannot say it, because the splitter skips those.
+            (*j).len[idx] = 0
+        } else {
+            var k: usize = i
+            var cnt: usize = 0
+            while k + 1 < e + 1 && k < e {
+                let hi: i32 = hexval(rt.ld8(p, k))
+                if k + 1 >= e {
+                    return false
+                }
+                let lo: i32 = hexval(rt.ld8(p, k + 1))
+                if hi < 0 || lo < 0 {
+                    return false
+                }
+                rt.buf_push(&(*j).raw, ((hi * 16 + lo) as u64 & 255 as u64)
+                    as u8)
+                cnt = cnt + 1
+                k = k + 2
+            }
+            (*j).len[idx] = cnt
+        }
+        (*j).nf = (*j).nf + 1
+        i = e
+    }
+    return (*j).nf > 0
+}
+
+fn main() -> i32 {
+    var inb: rt.Buf = rt.buf_new()
+    rt.read_stdin(&inb)
+    var out: rt.Buf = rt.buf_new()
+    var j: Job = Job { off: [0; 8], len: [0; 8], nf: 0, raw: rt.buf_new() }
+    let p: u64 = inb.ptr
+    let n: usize = inb.len
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        if e > i {
+            if split_line(p, i, e, &j) {
+                run_job(&j, &out)
+            } else {
+                var bad: [u8; 3] = "ERR"
+                say_word(&out, (&bad[0]) as u64, 3)
+            }
+        }
+        i = e + 1
+    }
+    rt.write_everything(1, out.ptr, out.len)
+    rt.buf_free(&out)
+    rt.buf_free(&inb)
+    rt.buf_free(&j.raw)
+    return 0
+}

@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/run_main.fi -- the DRIVER of the engine (root file).
+//
+// It reads a stream of jobs from standard input and answers one block per
+// job on standard output. The job format is little-endian:
+//
+//     u32  mode        0 = script, 1 = module (parse only), 2 = script + GC report
+//     u32  n ; u8[n]   the source text (UTF-8)
+//
+// The answer per job, terminated by a line with a single NUL:
+//
+//     the output of `print(...)`, then one status line
+//         OK
+//         PARSE <code> <line>
+//         THROW <text>            an uncaught exception
+//         OOM                     the heap is exhausted
+//
+// The engine is built anew for every job -- a fresh realm, a fresh global
+// object -- but the SAME collector heap. That is deliberate: it is what
+// makes the endurance run measure something (tools/js/soak.sh).
+//
+// Compile with:  firnc -o build/jsrun lib/js/run_main.fi
+import html.mem
+import std.math
+import js.lex
+import js.ast
+import js.parse
+import js.val
+import js.interp
+import js.builtin
+import js.gen
+
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+fn put_ascii(out: *mut mem.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as usize + i) as *mut u8))
+        i = i + 1
+    }
+}
+
+// The GC dispatcher the runtime needs as soon as `gc class` occurs.
+fn __gc_finalize(kind: u64, p: *mut u8) {
+}
+
+fn run_one(r: Gc[Realm], prog: u32, out: *mut mem.Buf) -> AllocError!bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    let genv: Gc[Env] = r.global_env
+    let v: Gc[JsVal] = try interp.run_program(r, prog, genv)
+    // 9.5: the microtask queue is drained after the script -- that is what
+    // makes a promise settle at all.
+    if (*c).comp == interp.C_NORMAL {
+        let okj: bool = try gen.run_jobs(r)
+    }
+    if (*c).comp == interp.C_THROW {
+        var head: [u8; 6] = "THROW "
+        put_ascii(out, &head[0], 6)
+        let t: Gc[JsVal] = r.pending
+        var text: Gc[JsVal] = val.str_empty(r)
+        (*c).comp = interp.C_NORMAL
+        let o: Gc[JsObj] = val.as_obj(t)
+        if (o as u64) != 0 && o.cls == val.CLS_ERROR {
+            let args: Gc[GcVec] = try interp.args_new(r)
+            text = try interp.call_method(r, t, lex.N_TOSTRING, args)
+        } else {
+            text = try interp.to_string(r, t)
+        }
+        (*c).comp = interp.C_NORMAL
+        let ok: bool = try write_utf8(out, text)
+        mem.buf_push(out, 10 as u8)
+        return true
+    }
+    var okw: [u8; 3] = "OK\n"
+    put_ascii(out, &okw[0], 3)
+    return true
+}
+
+fn write_utf8(out: *mut mem.Buf, s: Gc[JsVal]) -> AllocError!bool {
+    var i: u64 = 0
+    let n: u64 = val.str_len(s)
+    while i < n {
+        var c: u32 = val.str_at(s, i)
+        i = i + 1
+        if c >= 0xD800 as u32 && c <= 0xDBFF as u32 && i < n {
+            let c2: u32 = val.str_at(s, i)
+            if c2 >= 0xDC00 as u32 && c2 <= 0xDFFF as u32 {
+                c = 0x10000 as u32 + ((c - 0xD800 as u32) << 10) + (c2 - 0xDC00 as u32)
+                i = i + 1
+            }
+        }
+        if c < 0x80 as u32 {
+            mem.buf_push(out, c as u8)
+        } else if c < 0x800 as u32 {
+            mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else if c < 0x10000 as u32 {
+            mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else {
+            mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        }
+    }
+    return true
+}
+
+// ROUND 79 -- the realm is a GC object and is handed the addresses of `ctx`,
+// `t` and `nm`, which lie in THIS frame. It is sound here and only here: the
+// realm comes into being in this call, nothing outside gets hold of it, and
+// it is garbage the moment this function returns. The escape analysis
+// (compiler/src/escape.rs) cannot see that, so the exception is said out
+// loud instead of the check being weakened (docs/ROUND79.md 3).
+#[allow_escape]
+fn job(input: *mut mem.Buf, off: usize, n: usize, mode: u32,
+    nm: *mut lex.Names, out: *mut mem.Buf) -> AllocError!bool {
+    var l: lex.Lexer = lex.lex_new()
+    lex.lex_init(&l, nm)
+    var t: ast.Ast = ast.ast_new()
+    ast.ast_init(&t)
+    var p: parse.Parser = parse.parser_new()
+    parse.parser_init(&p, &l, &t, nm)
+    lex.lex_set_utf8(&l, (mem.buf_ptr(input) as usize + off) as *mut u8, n)
+    let prog: u32 = parse.parse_program(&p, mode == 1 as u32)
+    let err: u32 = parse.parse_error(&p)
+    if err != parse.ERR_NONE {
+        var head: [u8; 6] = "PARSE "
+        put_ascii(out, &head[0], 6)
+        mem.buf_push_dec(out, err as u64)
+        mem.buf_push(out, 32 as u8)
+        mem.buf_push_dec(out, parse.parse_error_line(&p) as u64)
+        mem.buf_push(out, 10 as u8)
+        parse.parser_free(&p)
+        ast.ast_free(&t)
+        lex.lex_free(&l)
+        return true
+    }
+    var ctx: interp.Ctx = interp.ctx_new()
+    ctx.native = builtin.native_dispatch
+    ctx.arity = builtin.native_arity_of
+    ctx.gen_start = gen.gen_start
+    ctx.gen_native = gen.gen_native
+    var sp: gen.Susp = gen.susp_new()
+    gen.susp_init(&sp)
+    ctx.gen_data = (&sp) as *mut u8
+    let r: Gc[Realm] = try val.realm_new()
+    val.realm_set_ctx(r, (&ctx) as *mut u8)
+    val.realm_set_ast(r, &t, nm)
+    // The strictness of the program itself (the directive prologue).
+    r.depth = 0
+    if ast.ast_d(&t, prog) & ast.FN_STRICT != 0 as u32 {
+        r.depth = 1
+    }
+    let g: Gc[JsObj] = try builtin.install(r)
+    let okg: bool = try gen.install_gen(r)
+    let ok: bool = try run_one(r, prog, out)
+    parse.parser_free(&p)
+    ast.ast_free(&t)
+    lex.lex_free(&l)
+    gen.susp_free(&sp)
+    return true
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 9
+    }
+    // A generous limit: the interpreter allocates a lot per step.
+    gc_set_max_bytes(1 << 31)
+    var input: mem.Buf = mem.buf_new()
+    mem.buf_init(&input)
+    mem.read_all_stdin(&input)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    var nm: lex.Names = lex.Names { pool: mem.cp_new(), off: mem.cp_new(),
+        len: mem.cp_new(), hash: mem.cp_new(), buckets: mem.cp_new(),
+        mask: 0, n: 0 }
+    lex.names_init(&nm)
+    let total: usize = mem.buf_len(&input)
+    var off: usize = 0
+    while off + 8 <= total {
+        let mode: u32 = read_u32(&input, off)
+        let n: usize = read_u32(&input, off + 4) as usize
+        off = off + 8
+        if off + n > total {
+            break
+        }
+        let ok: bool = job(&input, off, n, mode, &nm, &out) catch oom(&out)
+        // The terminator of the block.
+        mem.buf_push(&out, 0 as u8)
+        mem.buf_push(&out, 10 as u8)
+        off = off + n
+        mem.buf_flush(&out, 1)
+    }
+    mem.buf_flush(&out, 1)
+    mem.buf_free(&out)
+    mem.buf_free(&input)
+    lex.names_free(&nm)
+    return 0
+}
+
+fn oom(out: *mut mem.Buf) -> bool {
+    var m: [u8; 4] = "OOM\n"
+    put_ascii(out, &m[0], 4)
+    return false
+}

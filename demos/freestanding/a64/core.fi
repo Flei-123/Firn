@@ -1,0 +1,163 @@
+// demos/freestanding/a64/core.fi -- A TINY KERNEL FOR AArch64, ENTIRELY IN FIRN.
+//
+// ROUND ARM-FREESTANDING. The A64 twin of `demos/freestanding/core.fi`, and
+// the measurement the whole round stands on: if no character comes out of
+// this program over the serial line of a `qemu-system-aarch64 -M virt`, the
+// round has produced nothing usable, whatever the unit tests say.
+//
+// NOTE THE FIRST LINE THAT IS NOT THERE. This file does NOT say
+// `profile kernel`. It does not have to: it is compiled with
+//
+//     firnc --target=aarch64-none -o core.o demos/freestanding/a64/core.fi
+//
+// and a target whose name ends in `-none` has no operating system under it,
+// which is the whole content of the kernel profile (compiler/src/target.rs,
+// compiler/src/prof.rs). That is what makes the target worth having --
+// the same source can be built for a machine WITH an operating system by
+// changing the command line, not by editing line 1.
+//
+// What is in it, and why each piece is in it:
+//
+//   * the PL011 serial port of the `virt` machine, through MMIO
+//     (`__mmio_read32` / `__mmio_write32`) -- volatile, so the wait loop on
+//     the transmit register may not be optimised away;
+//   * INLINE ASSEMBLER on A64, which round 80 could not do at all:
+//     `mrs`/`msr` on system registers (CurrentEL, VBAR_EL1) and a
+//     deliberate `svc #0`;
+//   * an `#[interrupt]` function, which round 80 could not do either: it
+//     is entered out of the exception vector table and leaves with `eret`;
+//   * CHECKED arithmetic, so that the object file really contains the
+//     `osum_panic` hand-off of `panic_rt_a64.rs` (`start.s` defines that
+//     symbol; leaving it undefined would be a link error, which is the
+//     point).
+//
+// What is NOT in it: paging, a GIC, a timer, a frame allocator. Those
+// belong to a kernel, and the kernel that grows out of this is `osum`. This
+// file stays the smallest thing that can PROVE the compiler produces
+// working freestanding A64.
+
+// ------------------------------------------------------- the PL011 serial port
+//
+// `qemu-system-aarch64 -M virt` puts a PL011 at 0x0900_0000. Two registers
+// are enough to print: the data register at +0x00 and the flag register at
+// +0x18, whose bit 5 (TXFF) says the transmit FIFO is full. QEMU's model
+// comes up usable without a baud rate being programmed, so there is no
+// initialisation sequence here -- unlike the 16550 of the x86 twin, which
+// needs seven writes before it says anything.
+
+const UART: u64 = 150994944
+const UART_FR: u64 = 150994968
+const TXFF: u32 = 32
+
+fn uart_ready() -> bool {
+    return (__mmio_read32(UART_FR as *mut u32) & TXFF) == 0
+}
+
+fn uart_char(z: u8) {
+    while !uart_ready() {
+    }
+    __mmio_write32(UART as *mut u32, z as u32)
+}
+
+fn uart_text(p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        uart_char(*((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+fn uart_line(p: u64, n: usize) {
+    uart_text(p, n)
+    uart_char(10 as u8)
+}
+
+// One hexadecimal digit, so a register value can be shown without a
+// formatter -- there is no standard library here.
+fn uart_hex4(v: u64) {
+    let d: u64 = v & 15
+    if d < 10 {
+        uart_char((48 + d) as u8)
+    } else {
+        uart_char((87 + d) as u8)
+    }
+}
+
+// --------------------------------------------------------- system registers
+//
+// THE QUESTION THIS ROUND HAD TO ANSWER: does reading a system register need
+// a form of its own in the language (something like `sysreg("vbar_el1")`),
+// or does the ordinary inline assembler carry it?
+//
+// It carries it, and the two functions below are the proof. The system
+// register NAME is part of the assembler TEXT -- GNU as owns the table of
+// which names exist at which exception level and refuses `mrs x0, not_a_reg`
+// by itself. What the compiler has to supply is only the GENERAL PURPOSE
+// register the value travels in, and `in("x0")` / `out("x0")` are exactly
+// that. A second form would have meant copying ARM's system register table
+// into the compiler and keeping it in step with every architecture revision,
+// in exchange for nothing.
+
+fn current_el() -> u64 {
+    // CurrentEL holds the exception level in bits 3:2.
+    return asm("mrs x0, currentel", out("x0")) >> 2
+}
+
+fn set_vbar(p: u64) {
+    asm("msr vbar_el1, x0\nisb", in("x0") p)
+}
+
+// ------------------------------------------------------ the exception entry
+//
+// Entered from `start.s`'s vector table, not called. A64 saves NOTHING by
+// itself -- not one general purpose register -- so `#[interrupt]` is what
+// puts the whole corruptible set on the stack and takes it off again, and
+// the function ends with `eret` rather than `ret` (compiler/src/codegen_a64.rs,
+// `INT_SAVE_A64`).
+//
+// ELR_EL1 already points BEHIND the `svc`, so nothing has to be advanced
+// here; an undefined instruction would be the case where it does.
+
+#[interrupt]
+fn sync_handler() {
+    uart_char(33 as u8)
+    // CHECKED arithmetic inside the handler, exactly as the x86 twin has it:
+    // this is what puts the `osum_panic` hand-off of `panic_rt_a64.rs` into
+    // the object file, so that the link step really has to resolve it.
+    let old: u16 = 7 as u16
+    let z: u16 = (old + 1 as u16) & 255 as u16
+    uart_hex4(z as u64)
+}
+
+// ------------------------------------------------------------------ entry
+//
+// This is where `start.s` jumps (`KERN_START` at the link step). No `_start`,
+// no arguments, no return.
+
+fn core_start() {
+    var greeting: [u8; 29] = "FIRN: freestanding aarch64 is"
+    var greet2: [u8; 6] = "alive."
+    uart_line((&greeting[0]) as u64, 29)
+    uart_line((&greet2[0]) as u64, 6)
+
+    var elw: [u8; 3] = "EL="
+    uart_text((&elw[0]) as u64, 3)
+    uart_hex4(current_el())
+    uart_char(10 as u8)
+
+    // Install the vector table and take a real exception. `start.s` exports
+    // the table address as `VECTORS`.
+    let v: u64 = asm("adrp x0, VECTORS\nadd x0, x0, :lo12:VECTORS", out("x0"))
+    set_vbar(v)
+    var trapw: [u8; 6] = "trap: "
+    uart_text((&trapw[0]) as u64, 6)
+    asm("svc #0")
+    uart_char(10 as u8)
+
+    var bye: [u8; 15] = "back from eret."
+    uart_line((&bye[0]) as u64, 15)
+
+    while true {
+        asm("wfe")
+    }
+}
