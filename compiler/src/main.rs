@@ -1195,9 +1195,23 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
                 return Err(3);
             }
         };
-        let res = match t {
-            target::Target::X86_64 => asm_x86::assemble_to_object(&text),
-            target::Target::Aarch64 => asm_a64::assemble_to_object(&text),
+        // RUNDE SAMMELN: der Kodierer entscheidet nach dem BEFEHLSSATZ, nicht
+        // nach dem Ziel. Auf seiner eigenen Linie gab es nur zwei Ziele; die
+        // Linie von BILLIG bringt drei weitere mit (x86_64-none,
+        // aarch64-none, x86_64-windows). Freistehend ist eine ELF-Datei wie
+        // Linux auch -- dieselben Oktette, nur kein Betriebssystem darunter,
+        // also derselbe Kodierer. Windows ist es NICHT: elfobj.rs schreibt
+        // ELF, dort wird PE/COFF gebraucht.
+        let res = if t.is_windows() {
+            Err(String::from(
+                "der eigene Kodierer schreibt ELF-Objekte; x86_64-windows \
+                 braucht PE/COFF und bleibt auf dem Vorgabepfad ueber `as`",
+            ))
+        } else {
+            match t.arch() {
+                target::Arch::X86_64 => asm_x86::assemble_to_object(&text),
+                target::Arch::Aarch64 => asm_a64::assemble_to_object(&text),
+            }
         };
         return match res {
             Ok(bytes) => match std::fs::write(obj, &bytes) {
