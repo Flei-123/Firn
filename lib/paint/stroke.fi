@@ -1,0 +1,833 @@
+// lib/paint/stroke.fi -- THE STROKE. A line becomes an area.
+//
+// ROUND FIRN-LUECKEN. Until this round `lib/paint` could FILL and nothing
+// else: `grep stroke lib/` found not a single hit, and every caller that
+// wanted an outline built it by hand. The map in `demos/choropleth`
+// stamped a QUADRILATERAL per segment -- four `raster_line` calls for
+// every edge of every one of its rings.
+//
+// WHAT IS REALLY WRONG WITH THAT, MEASURED AND NOT ASSUMED. Certus says of
+// the same construction (`lib/svg/strich.fi`) that the overlap of two
+// neighbouring quadrilaterals is counted twice by the rasteriser and gives
+// a hard seam on the inside of every bend. That is true of the arithmetic
+// -- and on the shapes this map has it is not measurable, which is worth
+// writing down as plainly as the rest:
+//
+//   * A ring of 400 segments, 0.7 pixels wide (a coastline, exactly the
+//     case here): quadrilaterals 140.74 square pixels, one outline 140.74,
+//     exact value `2*pi*r*w` = 140.74. No difference at all.
+//   * A zigzag of ten sharp bends, 3 pixels wide, compared per pixel
+//     against the SAME shape at eight times the resolution: worst pixel
+//     0.304 with quadrilaterals, 0.282 with one outline; 40 pixels off by
+//     more than 2 % in both cases. Better, but not by much -- because the
+//     single outline crosses ITSELF at the inside of a bend, and that
+//     little loop double counts in exactly the same way.
+//
+// What IS measurably different is the other side of the bend: the union of
+// two quadrilaterals leaves the outer wedge EMPTY, because a quadrilateral
+// has no join. On that same zigzag that is 3.9 square pixels over ten
+// bends, and it grows with the square of the width -- at 0.7 pixels it is
+// invisible, at 8 pixels the outline of a symbol falls apart into
+// separate strokes.
+//
+// And beyond geometry there is what quadrilaterals cannot do at all: a
+// cap, a miter limit, a stroke that sits INSIDE its outline, a width that
+// gives way on a shape too small for it. Those four are why this file
+// exists; the seam is the fifth reason and the smallest one.
+//
+// So: ONE SINGLE OUTLINE per subpath. The left and the right offset line
+// are walked, joined at the ends by caps and at the bends by joins, and
+// closed once.
+//
+// -------------------------------------------------------- SELF INTERSECTION
+//
+// `font.raster` takes the ABSOLUTE value of the winding number and clips it
+// at one. A loop that appears at a tight corner has winding 2 or -1 --
+// both become full coverage, and that is exactly what a stroke wants: the
+// loop belongs to the stroke. With the even-odd rule there would be a hole
+// there. For a CLOSED ring there are two contours, and the inner one runs
+// THE OTHER WAY -- then the winding numbers cancel in the hole and the ring
+// stays a ring.
+//
+// ------------------------------------------------------------- ALIGNMENT
+//
+// A stroke that sits centred on the contour eats half its width out of the
+// fill. On Malta -- eleven pixels across on the map -- 0.7 pixels of border
+// per side left nothing of the colour, and the demo had to draw the island
+// WITHOUT a border. That is not a property of small islands, it is the
+// missing choice: `ALIGN_INNER` and `ALIGN_OUTER` put the whole band on one
+// side of the contour, so the fill keeps everything the border does not
+// cover, and the border covers the same width everywhere.
+//
+// The alignment needs an inside, so it only applies to a CLOSED ring; an
+// open polyline is always stroked centred. Which side is the inside is read
+// off the signed area of the ring, not asked of the caller: the caller
+// would have to know the winding direction of a GeoJSON ring, and it does
+// not.
+//
+// -------------------------------------------------------------- ONE FILE
+//
+// Certus has the same problem twice over: `lib/svg/strich.fi` (711 lines)
+// strokes SVG paths including `stroke-dasharray`, and the toolbar symbols
+// of the browser go through it. The numbers here are ITS numbers --
+// `CAP_BUTT/ROUND/SQUARE` are 0/1/2 like `K_STUMPF/K_RUND/K_ECKIG`,
+// `JOIN_MITER/ROUND/BEVEL` are 0/1/2 like `S_GEHRUNG/S_RUND/S_ABGE`, the
+// miter limit is SVG's, and the geometry is the same construction. What is
+// different is the customer: `strich.fi` writes a `svg.pfad.Pfad` and needs
+// `html.mem`; this file writes STRAIGHT INTO THE RASTERISER and allocates
+// nothing at all, so it works from a kernel as well -- the same discipline
+// `lib/font/raster.fi` follows and for the same reason.
+//
+// NOT DONE in this round, and named so it is not mistaken for done:
+// `lib/svg/strich.fi` in Certus still exists side by side with this file.
+// The dash pattern lives there, and moving it needs a round in that
+// repository.
+import font.raster
+
+export {
+    Stroke,
+    CAP_BUTT, CAP_ROUND, CAP_SQUARE,
+    JOIN_MITER, JOIN_ROUND, JOIN_BEVEL,
+    ALIGN_CENTER, ALIGN_INNER, ALIGN_OUTER,
+    stroke_new, stroke_attach, stroke_free, stroke_bytes_needed,
+    stroke_set_width, stroke_set_cap, stroke_set_join, stroke_set_miter,
+    stroke_set_align, stroke_set_fit, stroke_width_of,
+    stroke_begin, stroke_point, stroke_count, stroke_ok, stroke_end,
+    stroke_line,
+}
+
+// The three ends of an open subpath, SVG 1.1 `stroke-linecap`.
+const CAP_BUTT: u32 = 0
+const CAP_ROUND: u32 = 1
+const CAP_SQUARE: u32 = 2
+
+// The three bends, SVG 1.1 `stroke-linejoin`.
+const JOIN_MITER: u32 = 0
+const JOIN_ROUND: u32 = 1
+const JOIN_BEVEL: u32 = 2
+
+// Where the band sits relative to the contour. Only a closed ring has an
+// inside; an open polyline is always `ALIGN_CENTER`.
+const ALIGN_CENTER: u32 = 0
+const ALIGN_INNER: u32 = 1
+const ALIGN_OUTER: u32 = 2
+
+// ROUND FIRN-LUECKEN: `const` can carry floating point numbers since this
+// round -- before it, this line had to be a function (`fn miter_default()
+// -> f64`), and Certus says so in a comment of its own.
+const MITER_DEFAULT: f64 = 4.0
+
+// Two points closer together than this are the same point. The value is
+// not a guess: a coordinate in this library is a PIXEL, and a difference
+// of a millionth of a pixel carries no direction any more -- the normal
+// computed from it would be noise.
+const TINY: f64 = 0.000001
+
+struct Stroke {
+    pt: *mut u8, // 16 octets per point, x then y
+    room: usize, // octets really available behind `pt`
+    n: usize, // points written
+    closed: usize,
+    width: f64,
+    ends: u32,
+    join: u32,
+    miter: f64,
+    align: u32,
+    // ROUND FIRN-LUECKEN -- THE SECOND HALF OF THE SMALL ISLAND PROBLEM.
+    //
+    // Putting the band inside the outline stops it from spilling OUT of
+    // the shape. It does not stop it from filling the shape completely:
+    // Malta is 17 square pixels on this map with a circumference of 17, so
+    // a border of 0.7 covers about twelve of those seventeen and the
+    // colour is gone anyway.
+    //
+    // `fit` is the answer, and it is a rule and not a special case: the
+    // border may take at most this FRACTION OF THE AREA. An inner band of
+    // width `w` along a circumference `P` covers about `P * w`, so
+    // `P * w <= fit * A` gives `w <= fit * A / P`. For Germany (35642
+    // square pixels, circumference 1161) that allows 15 pixels and changes
+    // nothing; for Gozo (4.3 and 8.1) it allows 0.27, and half the island
+    // keeps its colour.
+    //
+    // 0.0 switches it off, and off is the default -- a caller who asks for
+    // a width gets that width.
+    fit: f64,
+    ok: usize, // 0 as soon as a point did not fit
+}
+
+// ------------------------------------------------- The arithmetic, in house
+//
+// Same reason as in `lib/font/raster.fi`: `std.math` is not `#[no_gc]`, and
+// a kernel has no `std`. Three lines of arithmetic are cheaper than the
+// dependency.
+
+#[no_gc]
+fn fis_nan(x: f64) -> bool {
+    return x != x
+}
+
+#[no_gc]
+fn ffabs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// Newton from a doubled guess -- called once per segment, not once per
+// pixel.
+#[no_gc]
+fn fsqrt(x: f64) -> f64 {
+    if fis_nan(x) || x <= 0.0 {
+        return 0.0
+    }
+    var g: f64 = 1.0
+    while g * g < x {
+        g = g * 2.0
+    }
+    var i: i32 = 0
+    while i < 8 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+// ------------------------------------------------------------- The tool
+
+#[no_gc]
+fn stroke_new() -> Stroke {
+    return Stroke {
+        pt: 0 as *mut u8,
+        room: 0,
+        n: 0,
+        closed: 0,
+        width: 1.0,
+        ends: CAP_BUTT,
+        join: JOIN_MITER,
+        miter: MITER_DEFAULT,
+        align: ALIGN_CENTER,
+        fit: 0.0,
+        ok: 1,
+    }
+}
+
+// How many octets a polyline of `points` points needs. A caller with its
+// own memory -- a kernel, for instance -- asks this first and then calls
+// `stroke_attach`.
+#[no_gc]
+fn stroke_bytes_needed(points: usize) -> usize {
+    return points * 16
+}
+
+#[no_gc]
+fn stroke_attach(s: *mut Stroke, p: *mut u8, room: usize) {
+    (*s).pt = p
+    (*s).room = room
+    (*s).n = 0
+    (*s).ok = 1
+}
+
+#[no_gc]
+fn stroke_free(s: *mut Stroke) {
+    (*s).pt = 0 as *mut u8
+    (*s).room = 0
+    (*s).n = 0
+}
+
+#[no_gc]
+fn stroke_set_width(s: *mut Stroke, w: f64) {
+    (*s).width = w
+}
+
+#[no_gc]
+fn stroke_width_of(s: *mut Stroke) -> f64 {
+    return (*s).width
+}
+
+#[no_gc]
+fn stroke_set_cap(s: *mut Stroke, k: u32) {
+    (*s).ends = k
+}
+
+#[no_gc]
+fn stroke_set_join(s: *mut Stroke, j: u32) {
+    (*s).join = j
+}
+
+#[no_gc]
+fn stroke_set_miter(s: *mut Stroke, m: f64) {
+    if m >= 1.0 {
+        (*s).miter = m
+    }
+}
+
+#[no_gc]
+fn stroke_set_align(s: *mut Stroke, a: u32) {
+    (*s).align = a
+}
+
+// At most this fraction of the ring's area may become border. 0 switches
+// the limit off. Only a closed ring has an area, so only a closed ring is
+// affected.
+#[no_gc]
+fn stroke_set_fit(s: *mut Stroke, f: f64) {
+    (*s).fit = f
+}
+
+#[no_gc]
+fn stroke_ok(s: *mut Stroke) -> bool {
+    return (*s).ok != 0
+}
+
+#[no_gc]
+fn stroke_count(s: *mut Stroke) -> usize {
+    return (*s).n
+}
+
+// Start a subpath. `closed` decides between a ring (two contours, no caps)
+// and a polyline (one contour, two caps).
+#[no_gc]
+fn stroke_begin(s: *mut Stroke, closed: bool) {
+    (*s).n = 0
+    (*s).ok = 1
+    if closed {
+        (*s).closed = 1
+    } else {
+        (*s).closed = 0
+    }
+}
+
+#[no_gc]
+fn point_x(s: *mut Stroke, i: usize) -> f64 {
+    return *(((*s).pt as u64 + (i * 16) as u64) as *mut f64)
+}
+
+#[no_gc]
+fn point_y(s: *mut Stroke, i: usize) -> f64 {
+    return *(((*s).pt as u64 + (i * 16 + 8) as u64) as *mut f64)
+}
+
+// Append a point. A point that repeats its predecessor is dropped: it
+// carries no direction, and a normal computed from it would be noise.
+#[no_gc]
+fn stroke_point(s: *mut Stroke, x: f64, y: f64) {
+    if (*s).pt as usize == 0 {
+        (*s).ok = 0
+        return
+    }
+    if fis_nan(x) || fis_nan(y) {
+        return
+    }
+    if (*s).n > 0 {
+        let lx: f64 = point_x(s, (*s).n - 1)
+        let ly: f64 = point_y(s, (*s).n - 1)
+        if ffabs(x - lx) < TINY && ffabs(y - ly) < TINY {
+            return
+        }
+    }
+    if ((*s).n + 1) * 16 > (*s).room {
+        // The buffer is full. The stroke that comes out is the piece that
+        // fitted, and `stroke_ok` says so -- silently drawing something
+        // else would be worse.
+        (*s).ok = 0
+        return
+    }
+    *(((*s).pt as u64 + ((*s).n * 16) as u64) as *mut f64) = x
+    *(((*s).pt as u64 + ((*s).n * 16 + 8) as u64) as *mut f64) = y
+    (*s).n = (*s).n + 1
+}
+
+// ------------------------------------------------------------- The pen
+//
+// Everything below writes ONE contour, point by point, into the rasteriser.
+// The pen holds where it stands and where the contour began, so `close`
+// really closes and no caller has to remember the first point.
+
+struct Pen {
+    r: *mut raster.Raster,
+    cx: f64,
+    cy: f64,
+    sx: f64,
+    sy: f64,
+    on: usize,
+}
+
+#[no_gc]
+fn pen_new(r: *mut raster.Raster) -> Pen {
+    return Pen { r: r, cx: 0.0, cy: 0.0, sx: 0.0, sy: 0.0, on: 0 }
+}
+
+#[no_gc]
+fn pen_to(p: *mut Pen, x: f64, y: f64) {
+    if (*p).on == 0 {
+        (*p).sx = x
+        (*p).sy = y
+        (*p).cx = x
+        (*p).cy = y
+        (*p).on = 1
+        return
+    }
+    raster.raster_line((*p).r, (*p).cx, (*p).cy, x, y)
+    (*p).cx = x
+    (*p).cy = y
+}
+
+#[no_gc]
+fn pen_close(p: *mut Pen) {
+    if (*p).on == 0 {
+        return
+    }
+    raster.raster_line((*p).r, (*p).cx, (*p).cy, (*p).sx, (*p).sy)
+    (*p).on = 0
+}
+
+// ---------------------------------------------------------------- Arcs
+//
+// A circular arc WITHOUT sine and cosine: the midpoint of two vectors of
+// equal length, normalised back to that length, lies on the circle. Halving
+// again gives four, then eight pieces -- and the deviation falls by four
+// with every step, so the depth is a logarithm and not a loop over degrees.
+//
+// The depth is not guessed: the sagitta of a chord over the angle `a` is
+// `R * (1 - cos(a/2))`, about `R * a^2 / 8`. For a quarter circle split
+// `2^d` times that is `R * 2.47 / 4^d`, and it has to stay under a
+// twentieth of a pixel -- which is what the anti-aliasing of the next step
+// can still show. That gives `4^d >= 12.3 * R`.
+#[no_gc]
+fn arc_depth(rad: f64) -> i32 {
+    var d: i32 = 1
+    var q: f64 = 4.0
+    while q < 12.3 * rad && d < 8 {
+        q = q * 4.0
+        d = d + 1
+    }
+    return d
+}
+
+#[no_gc]
+fn arc_bisect(p: *mut Pen, cx: f64, cy: f64, ux: f64, uy: f64, vx: f64,
+    vy: f64, rad: f64, depth: i32) {
+    if depth <= 0 {
+        pen_to(p, cx + vx, cy + vy)
+        return
+    }
+    var mx: f64 = ux + vx
+    var my: f64 = uy + vy
+    let l: f64 = fsqrt(mx * mx + my * my)
+    if l < TINY {
+        // Exactly opposite: there is no shorter way round, and inventing
+        // one would turn the arc the wrong way. The straight line is the
+        // honest answer, and the caller (a round join) never asks for more
+        // than half a turn.
+        pen_to(p, cx + vx, cy + vy)
+        return
+    }
+    mx = mx / l * rad
+    my = my / l * rad
+    arc_bisect(p, cx, cy, ux, uy, mx, my, rad, depth - 1)
+    arc_bisect(p, cx, cy, mx, my, vx, vy, rad, depth - 1)
+}
+
+// The arc from `u` to `v` around (cx, cy); both vectors have length `rad`.
+// The pen already stands at `c + u`.
+#[no_gc]
+fn arc_to(p: *mut Pen, cx: f64, cy: f64, ux: f64, uy: f64, vx: f64, vy: f64,
+    rad: f64) {
+    arc_bisect(p, cx, cy, ux, uy, vx, vy, rad, arc_depth(rad))
+}
+
+// ------------------------------------------------------------- The join
+//
+// The pen stands at `A = v + t * n0`, the end of the offset segment that
+// arrives. It has to reach `B = v + t * n1`, the start of the one that
+// leaves.
+//
+// WHICH SIDE IS THE OUTER ONE. `c = n0 x n1` is positive for a left turn.
+// On a left turn the LEFT side (t > 0) is the inner one: there the two
+// offset lines overlap, and the straight connection is right -- the little
+// loop it makes has winding 1 and the rasteriser reads it as full coverage.
+// The outer side is the one where the two offset lines leave a wedge open,
+// and that is exactly `c * t < 0`.
+#[no_gc]
+fn join_at(p: *mut Pen, s: *mut Stroke, vx: f64, vy: f64, n0x: f64, n0y: f64,
+    n1x: f64, n1y: f64, t: f64) {
+    let bx: f64 = vx + t * n1x
+    let by: f64 = vy + t * n1y
+    let c: f64 = n0x * n1y - n0y * n1x
+    if ffabs(c) < TINY {
+        // Straight on (or a full reversal): nothing to join.
+        pen_to(p, bx, by)
+        return
+    }
+    if c * t > 0.0 {
+        // The inner side. The overlap is resolved by the winding rule.
+        pen_to(p, bx, by)
+        return
+    }
+    if (*s).join == JOIN_BEVEL {
+        pen_to(p, bx, by)
+        return
+    }
+    if (*s).join == JOIN_ROUND {
+        let rad: f64 = ffabs(t)
+        arc_to(p, vx, vy, t * n0x, t * n0y, t * n1x, t * n1y, rad)
+        return
+    }
+    // MITER. The two offset lines meet at `v + t * (n0 + n1) / (1 + n0.n1)`
+    // -- one line of algebra: that vector's projection onto n0 and onto n1
+    // is 1 each, so it lies on both offset lines.
+    //
+    // The limit is SVG's: `miterLength / stroke-width = 1 / sin(theta/2)`,
+    // and with `d = n0.n1` that is `sqrt(2 / (1 + d))`. Above the limit the
+    // spike is cut off -- which is a bevel, and not a shortened spike:
+    // SVG 1.1 says the same.
+    let d: f64 = n0x * n1x + n0y * n1y
+    let k: f64 = 1.0 + d
+    if k < TINY {
+        pen_to(p, bx, by)
+        return
+    }
+    let ratio: f64 = fsqrt(2.0 / k)
+    if ratio > (*s).miter {
+        pen_to(p, bx, by)
+        return
+    }
+    pen_to(p, vx + t * (n0x + n1x) / k, vy + t * (n0y + n1y) / k)
+    pen_to(p, bx, by)
+}
+
+// ------------------------------------------------------------- The sides
+//
+// `back` walks the points from the end; the left normal of the reversed
+// direction is the negated left normal of the forward direction, so ONE
+// walk covers both sides of the stroke. `t` is always "to the left of the
+// direction I am walking in".
+
+#[no_gc]
+fn idx_of(s: *mut Stroke, i: usize, back: bool) -> usize {
+    if back {
+        return (*s).n - 1 - i
+    }
+    return i
+}
+
+// The unit normal to the left of the segment from point `a` to point `b`.
+// Returns false if the two points are the same after all.
+#[no_gc]
+fn normal_of(s: *mut Stroke, a: usize, b: usize, nx: *mut f64, ny: *mut f64)
+    -> bool {
+    let dx: f64 = point_x(s, b) - point_x(s, a)
+    let dy: f64 = point_y(s, b) - point_y(s, a)
+    let l: f64 = fsqrt(dx * dx + dy * dy)
+    if l < TINY {
+        return false
+    }
+    *nx = (0.0 - dy) / l
+    *ny = dx / l
+    return true
+}
+
+// One closed contour at offset `t`: every segment, every bend, and the
+// bend at the point where the ring closes.
+#[no_gc]
+fn ring_side(s: *mut Stroke, p: *mut Pen, t: f64, back: bool) {
+    let n: usize = (*s).n
+    if n < 2 {
+        return
+    }
+    var have_prev: bool = false
+    var pnx: f64 = 0.0
+    var pny: f64 = 0.0
+    var f0x: f64 = 0.0
+    var f0y: f64 = 0.0
+    var have_first: bool = false
+    var i: usize = 0
+    while i < n {
+        var j: usize = i + 1
+        if j == n {
+            j = 0
+        }
+        let a: usize = idx_of(s, i, back)
+        let b: usize = idx_of(s, j, back)
+        var nx: f64 = 0.0
+        var ny: f64 = 0.0
+        if normal_of(s, a, b, &nx, &ny) {
+            let ax: f64 = point_x(s, a)
+            let ay: f64 = point_y(s, a)
+            if have_prev {
+                join_at(p, s, ax, ay, pnx, pny, nx, ny, t)
+            } else {
+                pen_to(p, ax + t * nx, ay + t * ny)
+            }
+            pen_to(p, point_x(s, b) + t * nx, point_y(s, b) + t * ny)
+            if !have_first {
+                f0x = nx
+                f0y = ny
+                have_first = true
+            }
+            pnx = nx
+            pny = ny
+            have_prev = true
+        }
+        i = i + 1
+    }
+    if have_prev && have_first {
+        // The bend at the start point closes the ring: from the last
+        // segment into the first.
+        let sx: f64 = point_x(s, idx_of(s, 0, back))
+        let sy: f64 = point_y(s, idx_of(s, 0, back))
+        join_at(p, s, sx, sy, pnx, pny, f0x, f0y, t)
+    }
+    pen_close(p)
+}
+
+// One side of an OPEN polyline at offset `t`, without caps. The pen stays
+// where the last point left it -- the caller puts the cap there.
+#[no_gc]
+fn line_side(s: *mut Stroke, p: *mut Pen, t: f64, back: bool) {
+    let n: usize = (*s).n
+    if n < 2 {
+        return
+    }
+    var have_prev: bool = false
+    var pnx: f64 = 0.0
+    var pny: f64 = 0.0
+    var i: usize = 0
+    while i + 1 < n {
+        let a: usize = idx_of(s, i, back)
+        let b: usize = idx_of(s, i + 1, back)
+        var nx: f64 = 0.0
+        var ny: f64 = 0.0
+        if normal_of(s, a, b, &nx, &ny) {
+            let ax: f64 = point_x(s, a)
+            let ay: f64 = point_y(s, a)
+            if have_prev {
+                join_at(p, s, ax, ay, pnx, pny, nx, ny, t)
+            } else {
+                pen_to(p, ax + t * nx, ay + t * ny)
+            }
+            pen_to(p, point_x(s, b) + t * nx, point_y(s, b) + t * ny)
+            pnx = nx
+            pny = ny
+            have_prev = true
+        }
+        i = i + 1
+    }
+}
+
+// The cap at the end of a side: from `v + h * n` (where the pen stands)
+// round to `v - h * n`, where the walk back begins. `dx/dy` is the unit
+// direction the line was running in.
+#[no_gc]
+fn cap_at(p: *mut Pen, s: *mut Stroke, vx: f64, vy: f64, nx: f64, ny: f64,
+    dx: f64, dy: f64, h: f64) {
+    if (*s).ends == CAP_SQUARE {
+        pen_to(p, vx + h * nx + h * dx, vy + h * ny + h * dy)
+        pen_to(p, vx - h * nx + h * dx, vy - h * ny + h * dy)
+        pen_to(p, vx - h * nx, vy - h * ny)
+        return
+    }
+    if (*s).ends == CAP_ROUND {
+        // Half a turn: two quarter arcs, because two opposite vectors have
+        // no midpoint. The way round is the one that passes the direction
+        // of travel -- that is the outside of the line end.
+        arc_to(p, vx, vy, h * nx, h * ny, h * dx, h * dy, h)
+        arc_to(p, vx, vy, h * dx, h * dy, 0.0 - h * nx, 0.0 - h * ny, h)
+        return
+    }
+    pen_to(p, vx - h * nx, vy - h * ny)
+}
+
+// The signed area of the ring. Positive means: the left normal (-dy, dx)
+// points INTO the ring. That holds in the rasteriser's coordinates as well,
+// where y grows downwards -- the shoelace formula does not care which way
+// the axis points, only that both do the same.
+#[no_gc]
+fn signed_area(s: *mut Stroke) -> f64 {
+    let n: usize = (*s).n
+    if n < 3 {
+        return 0.0
+    }
+    var a: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var j: usize = i + 1
+        if j == n {
+            j = 0
+        }
+        a = a + point_x(s, i) * point_y(s, j) - point_x(s, j) * point_y(s, i)
+        i = i + 1
+    }
+    return a * 0.5
+}
+
+// The circumference of the ring -- the second half of the `fit` rule.
+#[no_gc]
+fn perimeter(s: *mut Stroke) -> f64 {
+    let n: usize = (*s).n
+    if n < 2 {
+        return 0.0
+    }
+    var p: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var j: usize = i + 1
+        if j == n {
+            j = 0
+        }
+        let dx: f64 = point_x(s, j) - point_x(s, i)
+        let dy: f64 = point_y(s, j) - point_y(s, i)
+        p = p + fsqrt(dx * dx + dy * dy)
+        i = i + 1
+    }
+    return p
+}
+
+// A single point with a round or square cap is a dot; with a butt cap it is
+// nothing. SVG says the same.
+#[no_gc]
+fn dot_at(p: *mut Pen, s: *mut Stroke, h: f64) {
+    let x: f64 = point_x(s, 0)
+    let y: f64 = point_y(s, 0)
+    if (*s).ends == CAP_SQUARE {
+        pen_to(p, x - h, y - h)
+        pen_to(p, x + h, y - h)
+        pen_to(p, x + h, y + h)
+        pen_to(p, x - h, y + h)
+        pen_close(p)
+        return
+    }
+    if (*s).ends == CAP_ROUND {
+        pen_to(p, x + h, y)
+        arc_to(p, x, y, h, 0.0, 0.0, h, h)
+        arc_to(p, x, y, 0.0, h, 0.0 - h, 0.0, h)
+        arc_to(p, x, y, 0.0 - h, 0.0, 0.0, 0.0 - h, h)
+        arc_to(p, x, y, 0.0, 0.0 - h, h, 0.0, h)
+        pen_close(p)
+    }
+}
+
+// ----------------------------------------------------------- The outline
+//
+// Everything above meets here. Afterwards the rasteriser holds the stroke
+// as an area, and `raster_finish` plus `canvas_fill_raster` turn it into
+// pixels -- the same path a fill takes, so a border and its fill are
+// anti-aliased by exactly the same arithmetic.
+#[no_gc]
+fn stroke_end(s: *mut Stroke, r: *mut raster.Raster) {
+    let n: usize = (*s).n
+    if n == 0 || (*s).width <= 0.0 || fis_nan((*s).width) {
+        return
+    }
+    if !raster.raster_ok(r) {
+        return
+    }
+    var p: Pen = pen_new(r)
+    var wid: f64 = (*s).width
+    // The area limit, for a closed ring and only if one was asked for.
+    if (*s).closed != 0 && (*s).fit > 0.0 && n >= 3 {
+        let per: f64 = perimeter(s)
+        if per > TINY {
+            let lim: f64 = (*s).fit * ffabs(signed_area(s)) / per
+            if wid > lim {
+                wid = lim
+            }
+        }
+    }
+    let h: f64 = wid * 0.5
+    if n == 1 {
+        dot_at(&p, s, h)
+        return
+    }
+    if (*s).closed != 0 {
+        // The two offsets. Centred it is -h and +h; inner and outer put the
+        // whole width on one side, and which side that is comes from the
+        // signed area.
+        var lo: f64 = 0.0 - h
+        var hi: f64 = h
+        if (*s).align != ALIGN_CENTER {
+            let inward: bool = signed_area(s) > 0.0
+            var plus: bool = inward
+            if (*s).align == ALIGN_OUTER {
+                plus = !inward
+            }
+            if plus {
+                lo = 0.0
+                hi = wid
+            } else {
+                lo = 0.0 - wid
+                hi = 0.0
+            }
+        }
+        // Two contours. The second one runs backwards, so the hole between
+        // them keeps winding zero and the ring stays a ring. Walking
+        // backwards flips the left normal, hence the minus.
+        ring_side(s, &p, hi, false)
+        ring_side(s, &p, 0.0 - lo, true)
+        return
+    }
+    // An open polyline: one contour, out along the left side, cap, back
+    // along the right side, cap, close.
+    line_side(s, &p, h, false)
+    var ex: f64 = 0.0
+    var ey: f64 = 0.0
+    if normal_of(s, n - 2, n - 1, &ex, &ey) {
+        cap_at(&p, s, point_x(s, n - 1), point_y(s, n - 1), ex, ey,
+            ey, 0.0 - ex, h)
+    }
+    line_side(s, &p, h, true)
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    if normal_of(s, 1, 0, &bx, &by) {
+        cap_at(&p, s, point_x(s, 0), point_y(s, 0), bx, by,
+            by, 0.0 - bx, h)
+    }
+    pen_close(&p)
+}
+
+// The short way for the commonest case: one straight line. Needs no point
+// buffer -- the four corners are known.
+#[no_gc]
+fn stroke_line(s: *mut Stroke, r: *mut raster.Raster, ax: f64, ay: f64,
+    bx: f64, by: f64) {
+    if !raster.raster_ok(r) || (*s).width <= 0.0 {
+        return
+    }
+    let dx: f64 = bx - ax
+    let dy: f64 = by - ay
+    let l: f64 = fsqrt(dx * dx + dy * dy)
+    let h: f64 = (*s).width * 0.5
+    var p: Pen = pen_new(r)
+    if l < TINY {
+        // A zero length line is a dot; `dot_at` reads the point buffer, and
+        // this entry point has none, so the four arcs stand here once more.
+        let ux: f64 = ax
+        let uy: f64 = ay
+        if (*s).ends == CAP_ROUND {
+            pen_to(&p, ux + h, uy)
+            arc_to(&p, ux, uy, h, 0.0, 0.0, h, h)
+            arc_to(&p, ux, uy, 0.0, h, 0.0 - h, 0.0, h)
+            arc_to(&p, ux, uy, 0.0 - h, 0.0, 0.0, 0.0 - h, h)
+            arc_to(&p, ux, uy, 0.0, 0.0 - h, h, 0.0, h)
+            pen_close(&p)
+        } else if (*s).ends == CAP_SQUARE {
+            pen_to(&p, ux - h, uy - h)
+            pen_to(&p, ux + h, uy - h)
+            pen_to(&p, ux + h, uy + h)
+            pen_to(&p, ux - h, uy + h)
+            pen_close(&p)
+        }
+        return
+    }
+    let nx: f64 = (0.0 - dy) / l
+    let ny: f64 = dx / l
+    let ux: f64 = dx / l
+    let uy: f64 = dy / l
+    pen_to(&p, ax + h * nx, ay + h * ny)
+    pen_to(&p, bx + h * nx, by + h * ny)
+    cap_at(&p, s, bx, by, nx, ny, ux, uy, h)
+    pen_to(&p, ax - h * nx, ay - h * ny)
+    cap_at(&p, s, ax, ay, 0.0 - nx, 0.0 - ny, 0.0 - ux, 0.0 - uy, h)
+    pen_close(&p)
+}

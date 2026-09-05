@@ -42,7 +42,8 @@ true try two type types u unit units unknown up use used user value var vec
 version via void was way weak while width with word write yes zero
 rax rbx rcx rdx rsi rdi rsp rbp rip eax ebx ecx edx esi edi esp ebp ax bx cx dx
 al bl cl dl spl bpl sil dil qword dword byteptr ptr mov movzx movsx movsb stosb
-rep lea push pop jmp jne jle jge call ret leave hlt iretq syscall xor and shl
+rep lea push pop jmp jne jle jge ja jae jb jbe jc jz jnz js jns jo jno jp jl jg
+call ret leave hlt iretq syscall xor and shl
 shr sar imul idiv cqo cdq cmp test sete setne cmovne cmove xadd cmpxchg lock
 section text rodata data bss globl intel syntax noprefix progbits gnu stack
 note align quad long short zero_ fs gs cfi endbr nop neg not sub add div mul

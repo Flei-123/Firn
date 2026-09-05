@@ -160,7 +160,15 @@ pub fn data_asm() -> String {
             let section = if !s.mutable {
                 ".section .rodata"
             } else if zero {
-                ".section .bss,\"aw\",@nobits"
+                // ROUND WINDOWS: `@nobits` and the flag letters are ELF's
+                // spelling. COFF says the same thing with `b` (uninitialised
+                // data) and `w` (writable) -- and it means the same thing:
+                // the octets take up no room in the file.
+                if crate::target::windows() {
+                    ".section .bss,\"bw\""
+                } else {
+                    ".section .bss,\"aw\",@nobits"
+                }
             } else {
                 ".section .data"
             };

@@ -175,7 +175,7 @@ impl Emitter {
     ///     difference to round 64, where the whole line table was switched
     ///     off as soon as the optimizer ran.
     pub(crate) fn loc_at(&mut self, l: crate::fir::Loc) {
-        if l.is_none() {
+        if l.is_none() || !dwarf::with_lines() {
             return;
         }
         self.here = l;
@@ -249,6 +249,15 @@ impl Emitter {
 /// before — this is additive, nothing about the existing scheme changed.
 pub(crate) fn label(name: &str) -> String {
     if let Some(link) = crate::extfn::extern_link_name(name) {
+        // ROUND WINDOWS: a call that LEAVES the program has to speak Win64,
+        // and it does so through the thunk `win.rs` writes for it. The
+        // symbol of the DLL function itself never appears in a `call` --
+        // it lives in the import address table.
+        if crate::target::windows() {
+            if let Some(t) = crate::win::note(&link) {
+                return t;
+            }
+        }
         return link;
     }
     if let Some(export) = crate::extfn::export_link_name(name) {
@@ -289,7 +298,24 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // a linker script pulls in — `_start`, setting up `rsp` and the
     // `exit` system call would be wrong there.
     let freestanding = crate::prof::is_kernel();
-    if !freestanding {
+    // ROUND WINDOWS: the entry point is a different one. The loader hands
+    // over no stack block, `exit` is not a system call, and the standard
+    // handles have to be fetched before anything can report an error --
+    // `win.rs::start_asm` writes the four calls that do it.
+    if !freestanding && crate::target::windows() {
+        let gc = if crate::gc::runtime_active() {
+            Some(label(crate::gc::FN_INIT))
+        } else {
+            None
+        };
+        e.raw(&crate::win::start_asm(
+            gc.as_deref(),
+            &label(crate::win_seam::INIT_FN),
+            &label(crate::win_seam::ARGV_FN),
+            &label("main"),
+        ));
+    }
+    if !freestanding && !crate::target::windows() {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
@@ -405,7 +431,13 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(&info);
         e.raw(".text");
     }
-    e.raw(".section .note.GNU-stack,\"\",@progbits");
+    if crate::target::windows() {
+        // The thunks, the stack probe and the import table -- everything the
+        // PE image needs and nothing that a Linux build would carry.
+        e.raw(&crate::win::runtime_asm());
+    } else {
+        e.raw(".section .note.GNU-stack,\"\",@progbits");
+    }
     Ok(e.out)
 }
 
@@ -424,6 +456,31 @@ pub(crate) fn emit_gc_addr(e: &mut Emitter, regs: bool) {
     for (i, r) in ["rbx", "rbp", "r12", "r13", "r14", "r15"].iter().enumerate() {
         e.line(&format!("mov qword ptr [rax+{}], {}", off + 8 * i as u64, r));
     }
+}
+
+/// **The frame — and on Windows the walk down to it.**
+///
+/// `sub rsp, N` is all a Linux frame needs: the kernel grows the stack at
+/// the first touch, wherever that touch lands. Windows does not. A thread
+/// stack there is reserved address space with a PAGE_GUARD page at its
+/// lower end; only touching THAT page commits one more and moves the guard
+/// down. A function that drops `rsp` by 40 KiB in one instruction and then
+/// writes at the bottom of its frame steps clean over the guard into
+/// reserved memory, and the process dies at a place that has nothing to do
+/// with the mistake.
+///
+/// So every frame of a page or more walks down page by page first
+/// (`win.rs::chkstk_asm`). This is not a corner case: `let buf: [u8; 8192]`
+/// is one, and every parser in this repository has one.
+pub(crate) fn emit_frame(e: &mut Emitter, size: u64) {
+    if crate::target::windows() && size >= crate::win::PAGE {
+        crate::win::note_probe();
+        // `rax` is free here: the arguments are in the argument registers
+        // and no value has been placed yet.
+        e.line(&format!("mov rax, {}", size));
+        e.line(&format!("call {}", crate::win::CHKSTK));
+    }
+    e.line(&format!("sub rsp, {}", size));
 }
 
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
@@ -456,7 +513,7 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     e.line("push rbp");
     e.line("mov rbp, rsp");
     if fr.size > 0 {
-        e.line(&format!("sub rsp, {}", fr.size));
+        emit_frame(e, fr.size);
     }
     // Save the parameters into their slots: the first six integer words come
     // from the argument registers, all further ones off the stack of the
@@ -1181,6 +1238,31 @@ fn emit_inst(
             if args.len() > 7 {
                 return Err("syscall with more than 6 arguments".to_string());
             }
+            // ROUND WINDOWS: there is no `syscall` instruction a program may
+            // use here. The very same seven values become an ordinary call
+            // to the seam (`win_seam.rs`), which does the work over Win32.
+            if crate::target::windows() {
+                e.line("sub rsp, 16");
+                if args.len() >= 7 {
+                    load_full(e, fr, "rax", args[6]);
+                } else {
+                    e.line("xor eax, eax");
+                }
+                e.line("mov qword ptr [rsp], rax");
+                for k in 0..ARG_REGS.len() {
+                    if k < args.len() {
+                        load_full(e, fr, ARG_REGS[k], args[k]);
+                    } else {
+                        e.line(&format!("mov {}, 0", ARG_REGS[k]));
+                    }
+                }
+                e.line(&format!("call {}", label(crate::win_seam::SYSCALL_FN)));
+                e.line("add rsp, 16");
+                if let Some(d) = i.dst {
+                    store_dst(e, fr, d, "rax");
+                }
+                return Ok(());
+            }
             for (k, a) in args.iter().skip(1).enumerate() {
                 load_full(e, fr, SYS_REGS[k], *a);
             }
@@ -1249,6 +1331,25 @@ fn emit_inst(
             store_dst(e, fr, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
+            // ROUND WINDOWS: `clone(2)` has no Win32 equivalent this round
+            // can honour -- `CreateThread` hands the child a stack of its
+            // own and a different entry convention, and the collector's
+            // thread table (lib/gc/gc.fi) is built on the Linux shape.
+            //
+            // A COMPILE ERROR would be the wrong answer, and the round
+            // measured why: `lib/gc/gc.fi` CONTAINS a spawn, so every
+            // program that links the collector would be refused -- 93 of
+            // 309 cases, almost none of which ever start a thread. So the
+            // instruction becomes what the seam does with a system call it
+            // cannot serve: `-38` (ENOSYS), the value `thread_spawn`
+            // already knows as a failure.
+            if crate::target::windows() {
+                crate::thread::spawn_unsupported(e);
+                if let Some(d) = i.dst {
+                    store_dst(e, fr, d, "rax");
+                }
+                return Ok(());
+            }
             crate::simd::xflush(e, fr);
             let d = i.dst.ok_or("internal error: spawn without target")?;
             load_full(e, fr, "rdi", *arg);

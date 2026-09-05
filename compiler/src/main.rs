@@ -16,7 +16,14 @@ mod attrs;
 mod codegen_a64;
 mod codegen_switch;
 mod codegen_x86;
+mod x86enc;
+mod asm_intern;
+mod asm_x86;
+mod a64enc;
+mod asm_a64;
+mod elfobj;
 mod comptime;
+mod env;
 mod config;
 mod checkmode;
 mod ct;
@@ -56,6 +63,7 @@ mod package_world;
 mod prof;
 mod parser;
 mod regalloc;
+mod regalloc_a64;
 mod sema;
 mod simd;
 mod simd_a64;
@@ -71,6 +79,8 @@ mod syscalls;
 mod archsel;
 mod target;
 mod types;
+mod win;
+mod win_seam;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -125,6 +135,13 @@ struct Options {
     test_limit: u32,
     /// `--no-run`: build the test binary, do not start it.
     no_run: bool,
+    /// **ROUND FIRN-ENV** — `--env-allow=<prefix>`: which environment
+    /// variables `__env_or`/`__env_has` may read. Adds to the default
+    /// prefix `FIRN_`; may be given several times and may carry a comma
+    /// separated list (env.rs).
+    env_allow: Vec<String>,
+    /// `--env-log`: print every variable read at build time, with its value.
+    env_log: bool,
 }
 
 /// **ROUND 82** — the wall clock per compiler phase (`--timings`).
@@ -208,12 +225,18 @@ fn usage() -> String {
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
                               | x86_64-none | aarch64-none (freestanding:\n  \
                               no operating system, ELF object, no syscall)\n  \
+                              | x86_64-windows (round WINDOWS: PE/COFF .exe,\n  \
+                              Win64 at the boundary, syscall over Win32)\n  \
+         --pic              position independent (shared library, round MOBIL)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
          --no-pass=<name>   switch off a single optimization pass\n  \
          --list-passes      print the pass register with its labels\n  \
          --list-attrs       print the known attributes and their state\n  \
+         --env-allow=<pre>  permit build time environment variables with this\n  \
+                              prefix (__env_or/__env_has; default: FIRN_)\n  \
+         --env-log          print which environment variables were read\n  \
          --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
          --stats            print the size of the FIR (instructions/blocks)\n  \
          --timings          wall clock per compiler phase (ROUND 82)\n  \
@@ -250,6 +273,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut test_format = testrun::Format::Json;
     let mut test_limit: u32 = 30;
     let mut no_run = false;
+    let mut env_allow: Vec<String> = Vec::new();
+    let mut env_log = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -322,12 +347,20 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             // ROUND 80: the second machine. Without this option nothing
             // changes -- `target::active()` answers `x86_64-linux` and every
             // path below is the one that has always been walked.
+            // ROUND MOBIL (Certus): position independent code for a
+            // shared library. Without the flag every output stays
+            // character for character what it was.
+            "--pic" => target::pic_set(true),
             _ if a.starts_with("--target=") => {
                 if let Err(e) = target::flag_set(&a["--target=".len()..]) {
                     return Err(e);
                 }
             }
             "--keep-asm" => keep_asm = true,
+            // RUNDE KODIERER: den eigenen Binaerkodierer statt `as` benutzen.
+            // Vorgabe bleibt `as`, bis die Gegenprobe ueber den ganzen Baum
+            // oktettgleich ist (tools/kodierer/run.sh).
+            "--asm-intern" => asm_intern::set(true),
             "--stats" => stats = true,
             "--timings" => timings = true,
             "--test" => test_mode = true,
@@ -345,6 +378,18 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     Ok(n) => test_limit = n,
                     Err(_) => return Err(format!("'--test-limit={}' is no number", v)),
                 }
+            }
+            // ROUND FIRN-ENV: the allow list of the build time environment
+            // (env.rs). Deliberately an option of the BUILD and not of the
+            // program: the environment belongs to whoever translates, so
+            // the permission does too.
+            "--env-log" => env_log = true,
+            _ if a.starts_with("--env-allow=") => {
+                let v = &a["--env-allow=".len()..];
+                if v.is_empty() {
+                    return Err("--env-allow expects a prefix, e.g. --env-allow=FV_".to_string());
+                }
+                env_allow.push(v.to_string());
             }
             "-o" => {
                 i += 1;
@@ -409,6 +454,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         return Err(format!("no input file given (.{})", config::FILE_EXT));
     }
     Ok(Options {
+        env_allow,
+        env_log,
         input,
         output,
         lock: lock_write,
@@ -441,6 +488,14 @@ fn main() {
     if args.len() == 1 && args[0] == "--lsp" {
         std::process::exit(lsp::serve());
     }
+    // RUNDE KODIERER: `--nur-obj` nimmt eine fertige .s-Datei und macht
+    // daraus eine Objektdatei -- der Weg, den `tools/kodierer/vergleich.py`
+    // benutzt, um denselben Text einmal durch `as` und einmal durch den
+    // eigenen Kodierer zu schicken. Ohne Sprachvorderteil, damit der
+    // Vergleich wirklich nur den Kodierer misst.
+    if args.iter().any(|a| a == "--nur-obj") {
+        std::process::exit(nur_obj(&args));
+    }
     let opts = match parse_args(&args) {
         Ok(o) => o,
         Err(e) => {
@@ -449,7 +504,52 @@ fn main() {
             std::process::exit(2);
         }
     };
-    std::process::exit(run(&opts));
+    let rc = run(&opts);
+    // ROUND FIRN-ENV: the manifest stands HERE and not inside `run`, so that
+    // it is printed on every path -- also when the translation stops with an
+    // error. Which variables were read is exactly the question one asks when
+    // two builds came out different.
+    if opts.env_log {
+        eprint!("{}", env::manifest());
+    }
+    std::process::exit(rc);
+}
+
+/// `--nur-obj [--asm-intern] [--target=…] -o <aus.o> <ein.s>`
+fn nur_obj(args: &[String]) -> i32 {
+    let mut out: Option<PathBuf> = None;
+    let mut inp: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--nur-obj" => {}
+            "--asm-intern" => asm_intern::set(true),
+            "-o" => {
+                i += 1;
+                out = args.get(i).map(PathBuf::from);
+            }
+            a if a.starts_with("--target=") => {
+                if let Err(e) = target::flag_set(&a["--target=".len()..]) {
+                    eprintln!("error: {}", e);
+                    return 2;
+                }
+            }
+            a if a.starts_with('-') => {}
+            a => inp = Some(PathBuf::from(a)),
+        }
+        i += 1;
+    }
+    let (inp, out) = match (inp, out) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("error: --nur-obj braucht <ein.s> und -o <aus.o>");
+            return 2;
+        }
+    };
+    match assemble(&inp, &out) {
+        Ok(()) => 0,
+        Err(c) => c,
+    }
 }
 
 fn run(opts: &Options) -> i32 {
@@ -463,6 +563,10 @@ fn run(opts: &Options) -> i32 {
     // integer arithmetic? Set once, read by `lower.rs` for every "+ - * /"
     // and narrowing "as".
     crate::checkmode::set_from_level(opts.optcfg.level);
+    // ROUND FIRN-ENV (env.rs): WHICH environment variables this translation
+    // may read, and whether it says so. Set once, before the first file is
+    // parsed -- the parser is where `__env_or` is resolved.
+    crate::env::configure(&opts.env_allow, opts.env_log);
     // The sentence stands here and not in `parse_args`, because `firnc1`
     // has to write it CHARACTER FOR CHARACTER and has no `--help` remark
     // there (round 48).
@@ -780,6 +884,44 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    // --- ROUND WINDOWS: the system seam -------------------------------
+    //
+    // The same shape as the `comptime` injection above and the `--test`
+    // one: source text that arises DURING the compilation is lexed,
+    // parsed and appended, after which the type checker sees no
+    // difference to hand written text.
+    //
+    // What is injected is `win_seam.rs` -- the layer that answers a
+    // `syscall(...)` over Win32, written in Firn. It goes in whenever the
+    // target is Windows, because `_start` itself calls into it (the
+    // standard handles, the command line) even in a program that never
+    // says `syscall` at all.
+    if target::windows() && !dg.has_errors() {
+        let src = win_seam::source();
+        let file = dg.add_file("<windows seam>", &src);
+        dwarf::add_file("<windows seam>");
+        let toks = lexer::lex_file(&src, file, &mut dg);
+        // `parser::parse` would call `reset_hooks` and thereby throw away
+        // everything the MAIN parse registered -- the `gc class`es, the
+        // interfaces, the error sets, the builtin `str` of round 70. The
+        // seam declares none of those, so it is parsed as a further MODULE
+        // of the same compilation, which is what it is.
+        let mut extra = parser::parse_module(&toks, &mut dg, file, 0);
+        let mut next = prog.expr_count;
+        for f in extra.funcs.iter_mut() {
+            crate::mono::renumber_block(&mut f.body, &mut next);
+        }
+        for c in extra.consts.iter_mut() {
+            crate::mono::renumber_expr(&mut c.value, &mut next);
+        }
+        prog.expr_count = next;
+        prog.funcs.extend(extra.funcs);
+        prog.structs.extend(extra.structs);
+        prog.consts.extend(extra.consts);
+        prog.statics.extend(extra.statics);
+        win::note_baseline();
+    }
+
     tm.mark("comptime");
     // ROUND ARM-FREESTANDING: `#[arch(...)]` -- throw away every function
     // that belongs to another machine, BEFORE anything has looked at a type
@@ -1037,12 +1179,59 @@ fn default_output(input: &Path) -> PathBuf {
     if p.as_os_str().is_empty() {
         p = PathBuf::from("a.out");
     }
+    // ROUND WINDOWS: an image without `.exe` is not startable there, and a
+    // name without a suffix would collide with the Linux build in the same
+    // directory.
+    if target::windows() {
+        p.set_extension("exe");
+    }
     p
 }
 
 /// Assemble only (`as --64 -o x.o x.s`) — the freestanding output.
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     let t = target::active();
+    // RUNDE KODIERER: der eigene Weg -- kein Prozess, kein `as`.
+    if asm_intern::get() {
+        let text = match std::fs::read_to_string(asm) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {}", asm.display(), e);
+                return Err(3);
+            }
+        };
+        // RUNDE SAMMELN: der Kodierer entscheidet nach dem BEFEHLSSATZ, nicht
+        // nach dem Ziel. Auf seiner eigenen Linie gab es nur zwei Ziele; die
+        // Linie von BILLIG bringt drei weitere mit (x86_64-none,
+        // aarch64-none, x86_64-windows). Freistehend ist eine ELF-Datei wie
+        // Linux auch -- dieselben Oktette, nur kein Betriebssystem darunter,
+        // also derselbe Kodierer. Windows ist es NICHT: elfobj.rs schreibt
+        // ELF, dort wird PE/COFF gebraucht.
+        let res = if t.is_windows() {
+            Err(String::from(
+                "der eigene Kodierer schreibt ELF-Objekte; x86_64-windows \
+                 braucht PE/COFF und bleibt auf dem Vorgabepfad ueber `as`",
+            ))
+        } else {
+            match t.arch() {
+                target::Arch::X86_64 => asm_x86::assemble_to_object(&text),
+                target::Arch::Aarch64 => asm_a64::assemble_to_object(&text),
+            }
+        };
+        return match res {
+            Ok(bytes) => match std::fs::write(obj, &bytes) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("error: cannot write '{}': {}", obj.display(), e);
+                    Err(3)
+                }
+            },
+            Err(e) => {
+                eprintln!("error: interner Kodierer: {}", e);
+                Err(3)
+            }
+        };
+    }
     // ROUND 93 (reproducibility, ACCEPTANCE item 5): `as` builds a
     // `.debug_line` out of our `.file`/`.loc` directives and puts ITS OWN
     // working directory into it as `DW_AT_comp_dir`. Two checkouts at
@@ -1094,7 +1283,17 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     // page aligned segments, everything else stays bit for bit what it was
     // (`tools/repro`).
     let mut cmd = Command::new(t.linker());
-    if !crate::statics::any() {
+    if t.is_windows() {
+        // ROUND WINDOWS. The linker gets exactly three things and no
+        // library at all: the entry point (ours, `_start`), the subsystem
+        // (a console program, so that stdout is a console and not a
+        // window), and a fixed image base so that no relocation section is
+        // needed. The import table comes out of our own object file
+        // (`win.rs::idata_asm`) -- `-lkernel32` never appears here, and no
+        // foreign object file enters the image.
+        cmd.arg("-e").arg("_start");
+        cmd.arg("--subsystem").arg("console");
+    } else if !crate::statics::any() {
         cmd.arg("-n");
     }
     let st = cmd.arg("-o").arg(out).arg(obj).status();
