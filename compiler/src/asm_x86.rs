@@ -180,6 +180,8 @@ pub struct Asm {
     /// „jetzt sofort" hinausschreibt (`dwarf2_directive_loc`). Deshalb
     /// liegen drei `.loc` hintereinander alle auf derselben Adresse.
     pending_loc: Option<(u32, u32, u32)>,
+    /// Die zuletzt genannte Spalte — `.loc` darf sie weglassen.
+    loc_col: u32,
 }
 
 impl Default for Asm {
@@ -199,6 +201,7 @@ impl Asm {
             line_no: 0,
             files: Vec::new(),
             pending_loc: None,
+            loc_col: 0,
         }
     }
 
@@ -344,9 +347,35 @@ impl Asm {
             // `.loc <datei> <zeile> <spalte>`
             ".loc" => {
                 let mut it = rest.split_whitespace();
-                let f: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                let l: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                let c: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                let f: u32 = match it.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return Err(self.err("`.loc` ohne Dateinummer")),
+                };
+                let l: u32 = match it.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return Err(self.err("`.loc` ohne Zeilennummer")),
+                };
+                // Die Spalte ist FREIWILLIG; fehlt sie, behaelt `as` die
+                // vorige (`current` in `dwarf2_directive_loc` ist statisch).
+                // Alles Weitere sind Fahnen (`is_stmt`, `basic_block`,
+                // `prologue_end`, `epilogue_begin`, `isa`, `discriminator`,
+                // `view`). Die bildet dieser Zerteiler NICHT nach — und
+                // still eine falsche Zeilentabelle zu schreiben waere
+                // schlimmer als abzubrechen. Der Codeerzeuger schreibt
+                // keine; wer sie in einem `asm`-Block von Hand hinschreibt,
+                // bekommt eine klare Meldung statt einer stummen Luege.
+                for t in it {
+                    match t.parse::<u32>() {
+                        Ok(v) => self.loc_col = v,
+                        Err(_) => {
+                            return Err(self.err(format!(
+                                "`.loc`-Zusatz `{}` wird nicht nachgebildet (nur Datei, Zeile, Spalte)",
+                                t
+                            )))
+                        }
+                    }
+                }
+                let c = self.loc_col;
                 self.flush_loc();
                 // Zeile 0 heißt „hier gehört keine Quellzeile hin". `as`
                 // wirft solche Angaben weg (`dwarf2_gen_line_info`), also
