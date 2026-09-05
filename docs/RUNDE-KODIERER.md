@@ -3,6 +3,13 @@
 **Datum:** 05.09.2026 · **Auftraggeber:** Justin · **Zweig:** `kodierer`
 (Arbeitsbaum `/root/firn-kodierer`, aus `4af14c3ed`)
 
+> **NACHTRAG — RUNDE KODIERER II, selber Tag.** Der einzige Grund, warum
+> `as` nach der ersten Runde noch Vorgabe blieb, war das fehlende
+> `.debug_line`. Der ist weg: TEIL 7 baut die DWARF-Zeilentabelle selbst,
+> TEIL 8 nimmt sie ab, und seit dieser Runde ist **der eigene Kodierer die
+> Vorgabe**; `--asm-extern` ist die Rückfallebene. TEIL 9 hält die vier
+> SIMD-Befehle fest, die die Runde RASTERN gemeldet hat.
+
 ---
 
 ## DIE ANTWORT VORWEG
@@ -288,18 +295,21 @@ am Vorgabepfad nichts geändert haben.
 
 ## 3.5 Was NICHT verglichen wird — und warum
 
+> **Überholt durch RUNDE KODIERER II.** Der Absatz bleibt stehen, weil er
+> die Ausgangslage beschreibt; was er sagt, gilt seit TEIL 7 nicht mehr.
+
 **Die Fehlersuchinformation.** `as` baut aus den `.loc`/`.file`-Direktiven
-ein `.debug_line`-Programm; der interne Weg verwirft sie. Eine über den
-internen Weg gebaute Datei hat also kein DWARF — das entspricht einem Bau
+ein `.debug_line`-Programm; der interne Weg verwarf sie. Eine über den
+internen Weg gebaute Datei hatte also kein DWARF — das entsprach einem Bau
 ohne `-g`.
 
-Das ist der Hauptgrund, warum **der alte Weg Vorgabe bleibt**. Umgeschaltet
-wird mit `--asm-intern`, sonst ändert sich nichts.
+Das war der Hauptgrund, warum der alte Weg zunächst Vorgabe blieb.
 
 Der DWARF-Zeilenzähler nachzubauen ist keine große Sache (die
 Zeilenprogramm-Kodierung ist gut beschrieben), aber sie *bitgleich* zu `as`
 nachzubauen ist eine eigene Runde: `as` wählt die Spezialopcodes optimal,
-und jede andere Wahl ergibt andere Oktette bei gleicher Bedeutung.
+und jede andere Wahl ergibt andere Oktette bei gleicher Bedeutung. Genau
+das ist RUNDE KODIERER II geworden — und sie ist bitgleich geworden.
 
 ---
 
@@ -424,9 +434,9 @@ Gewinn: ein System, das sich ohne fremde Binutils übersetzen kann, hat eine
 geschlossene Kette von der Quelle bis zur Objektdatei. Bisher stand mitten
 darin ein fremdes C-Programm von rund 100 000 Zeilen.
 
-Was noch fehlt, um `as` **ganz** zu streichen: das `.debug_line` (§3.4).
-Solange Firn mit Fehlersuchinformation gebaut werden soll, braucht der
-Vorgabepfad weiter `as`.
+Was noch fehlte, um `as` **ganz** zu streichen: das `.debug_line`. Das ist
+seit RUNDE KODIERER II erledigt (TEIL 7); der Vorgabepfad ruft `as` nicht
+mehr.
 
 ## 5c Braucht es noch einen eigenen Binder?
 
@@ -469,27 +479,302 @@ weil ein Prozessstart und ein fremder Assembler weggefallen sind.
 
 ---
 
+# TEIL 7 — RUNDE KODIERER II: DIE ZEILENTABELLE
+
+## 7.1 Warum das der letzte Stein war
+
+Nach TEIL 3 war der Kodierer über 484 Millionen Oktette bitgleich zu `as` —
+und `as` lief trotzdem weiter, bei jedem Bau. Der Grund war ein einziger
+Abschnitt: `.debug_line`. `codegen_x86.rs` schreibt `.file`- und
+`.loc`-Direktiven in den Assemblertext; daraus baut `as` die
+Zeilennummerntabelle, ohne die kein `gdb`-Haltepunkt und kein `addr2line`
+funktioniert. Der interne Weg las die beiden Direktiven und warf sie weg.
+
+Eine Zeilentabelle **ohne** Fehlersuchinformation wäre kein Fortschritt
+gewesen, sondern ein Tausch: schneller übersetzen, dafür nicht mehr
+fehlersuchen können. Deshalb blieb `as` Vorgabe. Diese Runde holt das nach.
+
+## 7.2 Was eine Zeilentabelle wirklich ist
+
+Sie ist keine Tabelle. Sie ist ein **Programm**, das eine Tabelle erzeugt.
+Ein Zustandsautomat hält Adresse, Datei, Zeile, Spalte und `is_stmt`; die
+Befehle schieben die Zustände weiter, und einer davon legt eine Zeile der
+Matrix ab. Der Trick, der die Sache klein macht, ist der **Sonderopcode**:
+ein einziges Oktett, das Adresse *und* Zeile weiterschiebt *und* die Zeile
+ablegt.
+
+```
+   opcode = (Zeilenschritt − Zeilenbasis) + Zeilenspanne · Adressschritt
+            + Opcodebasis
+```
+
+mit Zeilenbasis −5, Zeilenspanne 14, Opcodebasis 13. Damit deckt ein Oktett
+Zeilenschritte von −5 bis +8 und Adressschritte von 0 bis 17 ab. Alles
+andere braucht Vorspann: `DW_LNS_const_add_pc` (schiebt um genau 17),
+`DW_LNS_advance_pc` (LEB128), `DW_LNS_advance_line` (vorzeichenbehaftete
+LEB128).
+
+## 7.3 Bitgleich, nicht nur gleichwertig — und warum das die Mühe wert war
+
+Der Auftrag erlaubte ausdrücklich, die Tabelle *anders zu kodieren*, solange
+die **ausgewertete** Tabelle gleich ist. Das wäre der bequeme Weg gewesen.
+Ich habe den unbequemen genommen und **oktettgleich** gebaut, aus einem
+Grund, der nichts mit Eitelkeit zu tun hat:
+
+> **Bitgleichheit ist ein Prüfstand, Gleichwertigkeit ist eine Meinung.**
+
+Wer nur die dekodierten Tabellen vergleicht, vergleicht durch die Brille des
+Werkzeugs, das dekodiert. `readelf` normalisiert, fasst zusammen und
+verschweigt, was es nicht versteht. Eine falsch gesetzte LEB128, die
+zufällig dieselbe Zeile ergibt, fällt dabei nicht auf — bis eines Tages ein
+anderer Leser (LLDB, ein Profiler, ein Absturzsammler) sie anders liest.
+Oktettvergleich hat diese Lücke nicht.
+
+Der Preis: `as` muss **genau** nachgebaut werden, bis in die
+Reihenfolge der Entscheidungen. Diese Runde hat dafür `gas/dwarf2dbg.c`
+(binutils 2.40) gelesen statt zu raten — dieselbe Regel wie in TEIL 2, wo
+die Intel-Referenz die Grundlage war. Was daraus übernommen wurde und im
+Quelltext auch so benannt ist:
+
+* **`emit_inc_line_addr()`** — die Reihenfolge Sonderopcode →
+  `const_add_pc` + Sonderopcode → `advance_pc` + Opcode. Warum erst
+  `const_add_pc` versuchen? Weil es zwei Oktette braucht statt drei. Warum
+  nicht immer? Weil es nur um genau 17 schiebt.
+* **„Prettier, I think":** bei Zeilenschritt 0 und Adressschritt 0 schreibt
+  `as` `DW_LNS_copy` statt des gleichwertigen Sonderopcodes 13. Ein reiner
+  Geschmacksentscheid im fremden Quelltext — und ein Oktett Unterschied.
+* **`process_entries()`** — erst `DW_LNS_set_file`, dann
+  `DW_LNS_set_column`. Andersherum käme dieselbe Tabelle heraus.
+* **`dwarf2_directive_loc()`** — *„If we see two .loc directives in a row,
+  force the first one to be output now."* Deshalb liegen drei
+  aufeinanderfolgende `.loc` alle auf **derselben** Adresse, nämlich der des
+  nächsten Befehls. Das ist die Regel, die man beim Nachbauen mit Sicherheit
+  falsch rät, und der Codeerzeuger von Firn erzeugt sie ständig
+  (`.loc 1 7 17` / `.loc 1 7 20` / `.loc 1 7 13` vor einem einzigen `mov`).
+* **`dwarf2_gen_line_info()`** — eine `.loc` mit **Zeile 0** erzeugt gar
+  keine Zeile. `panic_rt.rs` schreibt genau das vor die geteilte
+  Absturzbehandlung, damit `gdb` sie keiner Quellzeile zuordnet.
+* **`get_basename()`/`get_directory_table_entry()`** — die Aufteilung eines
+  Pfades in Verzeichnis und Namen, mit dem Sonderfall `/a.fi`: der letzte
+  Schrägstrich ganz vorn heißt *kein* Verzeichnis, sonst wäre es die leere
+  Zeichenkette. Und: Steckplatz 0 der Verzeichnistabelle bleibt frei, der
+  erste echte Eintrag ist die 1.
+* **`scale_addr_delta()`** — auf ARM64 ist die kleinste Befehlslänge 4, und
+  Adressschritte zählen in **Befehlen**. Ein Sonderopcode deckt dort also
+  68 Oktette ab statt 17.
+* **`remap_debug_filename()`** — `--debug-prefix-map <cwd>=.`, das
+  `main.rs` seit Runde 93 an `as` übergibt, damit zwei Arbeitskopien an
+  verschiedenen Orten gleiche Ergebnisse liefern. Der interne Weg muss
+  dieselbe Abbildung selbst machen, sonst stünde plötzlich wieder ein
+  absoluter Pfad im Ergebnis.
+
+## 7.4 Die kleine Übersetzungseinheit, die niemand bestellt hat
+
+`.debug_line` allein nützt nichts. `gdb` und `addr2line` gehen **über**
+`.debug_info`: sie suchen die Übersetzungseinheit und folgen deren
+`DW_AT_stmt_list` zur Zeilentabelle. `as` weiß das und legt, wenn das
+Programm keine eigene `.debug_info` mitbringt, still eine winzige an —
+`.debug_info`, `.debug_abbrev`, `.debug_aranges`, `.debug_str`, zusammen
+knapp 130 Oktette.
+
+Also legen wir sie auch an, mit denselben Oktetten. **Eine** Abweichung ist
+Absicht und steht auch so im Quelltext: `DW_AT_producer` sagt `firnc 0.1.0`
+und nicht `GNU AS 2.40`. Der Übersetzer soll nicht behaupten, ein anderes
+Programm zu sein. Die Zeichenkette steht am **Ende** von `.debug_str`, also
+verschiebt sie nichts — `.debug_info`, `.debug_abbrev` und
+`.debug_aranges` bleiben oktettgleich, und die Gegenprobe prüft `.debug_str`
+bis genau vor diese eine Zeichenkette (`pruefe_debug_str` in
+`vergleich.py`).
+
+Baut Firn **mit** `--no-opt`, schreibt der Übersetzer seit Runde 64 seine
+eigene `.debug_info` mit Namen, Typen und Variablen. Dann legt `as` keine
+an — und wir auch nicht. Auch dieser Zweig steckt in der Abnahme (die
+Baustufe `no-opt` in `run.sh`).
+
+## 7.5 Was der interne Assembler dafür lernen musste
+
+Bis dahin kannte er fünf Abschnitte. Jetzt sind es zehn: die fünf
+`.debug_*` kommen dazu — zwei davon (`.debug_abbrev`, `.debug_info`) als
+Oktette aus dem Text, drei erzeugt er selbst. Dazu ein neues Stück
+`Piece::Loc`, null Oktette lang: **die Adresse, an der es steht, ist sein
+ganzer Inhalt**. Es geht durch dieselbe Fixpunkt-Iteration wie alles andere,
+und deshalb sind die Adressen der Zeilentabelle die *endgültigen* — nach der
+Sprung-Relaxation, nicht davor. Das war die Stelle, an der ein
+selbstgebauter Zeilenzähler sonst schiefgeht.
+
+---
+
+# TEIL 8 — DIE ABNAHME DER ZEILENTABELLE
+
+## 8.1 Drei Prüfungen übereinander
+
+1. **Oktettweise** gegen `as`: `.debug_line`, `.debug_info`,
+   `.debug_abbrev`, `.debug_aranges` — Inhalt *und* Umsetzungen.
+   `.debug_str` bis vor die Erzeugerangabe.
+2. **Die ausgewertete Tabelle:** beide Objektdateien durch
+   `readelf --debug-dump=decodedline`, Zeile für Zeile verglichen
+   (Datei, Zeilennummer, Adresse, Sicht, `is_stmt`). Das ist die Prüfung,
+   die der Auftrag verlangt hat. Sie ist **schwächer** als die erste und
+   steht trotzdem daneben: sie prüft, ob ich den Automaten *verstanden*
+   habe, nicht nur, ob ich `as` abgeschrieben habe.
+3. **Gestreute Quellstellen** (`tools/kodierer/loc_streuer.py`). Der
+   Codeerzeuger schreibt `.loc` nur in einem schmalen Muster: aufsteigende
+   Zeilen aus einer Datei, kleine Spalten, nie ein Sprung über die Spanne
+   des Sonderopcodes hinaus. Also nimmt der Prüfstand echten Assemblertext
+   und streut zusätzliche `.loc` hinein — Rücksprünge, Sprünge über 300
+   Zeilen, drei Dateien, Zeile 0, mehrere `.loc` auf derselben Adresse.
+   Beide Wege bekommen **denselben** Text.
+
+Punkt 3 ist auf ARM64 die **einzige** Deckung, und das ist ein Befund für
+sich: `codegen_a64.rs` schreibt bis heute überhaupt keine `.loc`
+(Runde 80 hat das ausdrücklich offengelassen). Auf der ARM64-Seite gibt es
+also gar keine Fehlersuchinformation zu erzeugen — weder über `as` noch
+über den eigenen Weg. Der Kodierer *kann* es, geprüft an gestreuten
+Quellstellen mit 4-Oktett-Schrittweite; der Codeerzeuger liefert ihm nur
+nichts. Das ist eine offene Baustelle von Runde 80, nicht von dieser.
+
+## 8.2 Das Ergebnis
+
+```
+                                        x86-64          ARM64
+   Übersetzungseinheiten                 1 705         A64ZAHL
+   bitgleich gegen `as`                  1 705         A64GUT     (100 %)
+   verglichene Oktette             424 702 304        A64BYTES
+   verglichene Umsetzungen           3 568 565        A64RELOC
+   davon Fehlersuch-Oktette        123 562 840        A64DWARF
+   verglichene Tabellenzeilen       23 225 373        A64ROWS
+   Abweichungen                              0               0
+```
+
+Fünf Baustufen je Quelle statt vorher drei: `dev-fast`, `release-fast`,
+`release-safe`, `no-opt` (eigene `.debug_info`) und `streu` (gestreute
+Quellstellen).
+
+## 8.3 Die praktische Gegenprobe: `gdb` und `addr2line`
+
+Ein Programm mit drei ineinander verschachtelten Funktionen, einmal über
+`as` und einmal über den eigenen Kodierer gebaut, dann derselbe
+`gdb`-Ablauf: Haltepunkt auf `g.fi:5`, `run`, `bt`, `info line`,
+`continue`, `bt`.
+
+**Die Ausgabe ist zeichengleich.** Haltepunktadresse, Quellzeilentext,
+Rücksprungspur mit allen Rahmen, `Line 5 of "g.fi" starts at address … and
+ends at …` — identisch, sowohl mit `--no-opt` als auch optimiert.
+`addr2line` liefert für `tief`, `mitte` und `main` dieselben Datei- und
+Zeilenangaben. Und `readelf --debug-dump=decodedline` ist auf beiden
+Ergebnissen Zeile für Zeile dasselbe.
+
+Das ist die Prüfung, die zählt: nicht „die Oktette sehen richtig aus",
+sondern „der Fehlersucher tut dasselbe".
+
+## 8.4 Was das für die Fahne heißt
+
+`--asm-intern` ist **Vorgabe**. `--asm-extern` ruft `as` und bleibt als
+Rückfallebene erhalten — und als Vergleichsmaß, denn ohne `as` gäbe es
+keinen Prüfstand mehr. `tools/kodierer/vorgabe_unveraendert.sh` prüft
+weiterhin, dass diese Rückfallebene oktettgleich zum unberührten Übersetzer
+ist.
+
+---
+
+# TEIL 9 — DIE VIER SIMD-BEFEHLE AUS DER RUNDE RASTERN
+
+Die Runde RASTERN hat gemessen und gemeldet: Firn hat 29 Vektorbefehle,
+aber weder eine Ganzzahl-Multiplikation noch ein Packen/Auspacken 8↔16.
+Damit ist Alphaüberblenden im Vektor unmöglich — und genau das kostet auf
+`xoffi.ai` rund 180 ms in der Farbberechnung der Verläufe.
+
+Warum diese vier zusammengehören: Überblenden rechnet je Farbanteil
+`(vorn·α + hinten·(255−α))/255`. Acht Oktette gleichzeitig geht nur über
+16 Bit — also **auspacken** (8→16), **multiplizieren** (16-Bit-Produkt,
+unten und oben), **zurückpacken** (16→8, gesättigt).
+
+| Firn | x86-64 | ARM64 |
+|---|---|---|
+| `__v128_unpacklo8(a,b)` | `punpcklbw` | `zip1 .16b` |
+| `__v128_mullo16(a,b)` | `pmullw` | `mul .8h` |
+| `__v128_mulhi16u(a,b)` | `pmulhuw` | `umull` + `umull2` + `uzp2 .8h` |
+| `__v128_packus16(a,b)` | `packuswb` | `sqxtun` + `sqxtun2` |
+
+Zwei davon haben auf ARM64 **kein** Gegenstück in einem Befehl:
+
+* **`pmulhuw`** will die oberen 16 Bit von acht 16×16-Produkten. ARM rechnet
+  die Produkte breit (`umull` für die unteren vier Halbwörter, `umull2` für
+  die oberen) und greift sich die oberen Hälften mit `uzp2 .8h` heraus —
+  bei kleinem Ende sind das genau die ungeraden Halbwörter.
+* **`packuswb`** verengt 8+8 vorzeichenbehaftete Halbwörter auf 16
+  vorzeichenlos gesättigte Oktette. `sqxtun` macht die untere Hälfte,
+  `sqxtun2` schreibt die obere in **dasselbe** Zielregister — die
+  Reihenfolge ist damit erzwungen.
+
+**Wie sie geprüft sind.** Genau wie die 42 Befehle der Runde 82:
+
+1. Der Kodierer beider Maschinen bekam sie dazu (x86: `pmullw` D5,
+   `pmulhuw` E4, `packuswb` 67, dazu `pmulhw`, `packsswb`, `punpckhbw`,
+   `punpcklwd`, `punpckhwd`, weil sie im selben Opcodeblock liegen und
+   nichts kosten; ARM64: `mul` auf Vektoren, `umull`/`umull2`/`smull`/
+   `smull2`, `sqxtun`/`sqxtn`/`uqxtn`/`xtn` samt ihren `2`-Formen).
+   Jede Form ist oktettweise gegen `as` geprüft.
+2. `tests/1614_simd_ops.fi` — Abschnitt I — rechnet jeden der vier gegen
+   eine **skalare Fassung in Firn**, in derselben Datei. Dazu ein
+   ausdrücklicher Sättigungsfall (negatives Halbwort → 0, zu großes → 255,
+   die Vorgabewerte treffen das nicht sicher) und ein ganzes
+   Alphaüberblenden über acht Oktette.
+3. Dasselbe Programm läuft auf **beiden** Maschinen — x86-64 nativ,
+   ARM64 unter `qemu-aarch64` — und gibt dasselbe aus. Ein Gegenstück, das
+   nur auf ARM64 falsch ist, fiele hier auf.
+
+**So ruft man sie:**
+
+```firn
+let zero  = __v128_zero()
+let vorn  = __v128_unpacklo8(pixel, zero)      // 8 Oktette -> 8 Halbwörter
+let mix   = __v128_mullo16(vorn, alpha)        // untere 16 Bit
+let hoch  = __v128_mulhi16u(vorn, alpha)       // obere 16 Bit
+let zrk   = __v128_packus16(mix_lo, mix_hi)    // 16 Halbwörter -> 16 Oktette
+```
+
+Das Blending in Certus baut diese Runde **nicht** — das gehört zu RASTERN.
+Hier steht nur: die Befehle sind da, auf beiden Maschinen, und sie rechnen
+das Richtige.
+
+*Nachbarschaft, falls RASTERN sie braucht:* `punpckhbw` (die obere Hälfte
+auspacken) ist im Kodierer schon drin und bräuchte nur noch einen Namen in
+`simd.rs` — vier Zeilen, ARM64-Gegenstück `zip2 .16b`. Sie wurde nicht
+hinzugefügt, weil der Auftrag ausdrücklich vier Befehle nannte.
+
+
+---
+
 # ANHANG
 
 ## A.1 Was wo liegt
 
 ```
    compiler/src/x86enc.rs     1747 Zeilen   der x86-64-Kodierer (rein)
-   compiler/src/asm_x86.rs    1791 Zeilen   Zerteiler, Marken, Relaxation
+   compiler/src/asm_x86.rs    2004 Zeilen   Zerteiler, Marken, Relaxation
    compiler/src/a64enc.rs      334 Zeilen   ARM64-Sofortwerte, Ausbesserungen
-   compiler/src/asm_a64.rs    2079 Zeilen   ARM64-Zerteiler und Befehlssatz
-   compiler/src/elfobj.rs      403 Zeilen   ELF64-Objektschreiber
-   compiler/src/asm_intern.rs   21 Zeilen   die Fahne
-   tools/kodierer/            ~560 Zeilen   Abnahme, Probe, Messung
+   compiler/src/asm_a64.rs    2304 Zeilen   ARM64-Zerteiler und Befehlssatz
+   compiler/src/dwarf_line.rs  737 Zeilen   die DWARF-Zeilentabelle (II)
+   compiler/src/elfobj.rs      449 Zeilen   ELF64-Objektschreiber
+   compiler/src/asm_intern.rs   32 Zeilen   die Fahne
+   tools/kodierer/             911 Zeilen   Abnahme, Streuer, Probe, Messung
    -----------------------------------------------------------------
-                              6934 Zeilen   gesamt
+                              8518 Zeilen   gesamt (beide Runden)
 ```
+
+`x86enc.rs`, `a64enc.rs` und `dwarf_line.rs` sind **rein**: keine
+Ein-/Ausgabe, kein Zustand, keine Abhängigkeit vom Rest des Übersetzers.
+Wer eines Tages einen JIT baut, kann sie unverändert benutzen — auch die
+Zeilentabelle, die ein Laufzeitprofiler genauso braucht wie ein
+Fehlersucher.
 
 ## A.2 Die Fahne
 
 ```
-   firnc datei.fi                 der alte Weg über `as` (VORGABE)
-   firnc --asm-intern datei.fi    der eigene Kodierer
+   firnc datei.fi                 der eigene Kodierer (VORGABE seit
+                                  RUNDE KODIERER II)
+   firnc --asm-extern datei.fi    der alte Weg über `as` (Rückfallebene)
    firnc --nur-obj [-o x.o] x.s   nur assemblieren (für die Gegenprobe)
 ```
 
@@ -499,7 +784,8 @@ weil ein Prozessstart und ein fremder Assembler weggefallen sind.
    bash tools/kodierer/run.sh              # x86-64, ganzer Baum
    bash tools/kodierer/run.sh --a64        # ARM64
    bash tools/kodierer/ende_zu_ende.sh     # bauen UND laufen lassen
-   bash tools/kodierer/vorgabe_unveraendert.sh   # Vorgabepfad unberuehrt?
+   bash tools/kodierer/vorgabe_unveraendert.sh   # Rueckfallebene unberuehrt?
+   bash tools/kodierer/probe.sh tests/1613_crypto.fi   # kleine Stichprobe
    RUNS=5 bash tools/kodierer/messung.sh bin/firnc1.fi
 ```
 
@@ -507,9 +793,10 @@ weil ein Prozessstart und ein fremder Assembler weggefallen sind.
 
 * **Nichts über JIT.** Kein Laufzeitcode, keine ausführbaren Seiten, keine
   Deoptimierung. Die Studie bleibt in ihrer Empfehlung unverändert gültig.
-* **Nichts über DWARF.** Der interne Weg erzeugt keine
-  Fehlersuchinformation; verglichen wurden nur `.text`, `.data`, `.rodata`
-  und `.bss`.
+* ~~**Nichts über DWARF.**~~ *Überholt: RUNDE KODIERER II vergleicht
+  zusätzlich `.debug_line`, `.debug_info`, `.debug_abbrev` und
+  `.debug_aranges` oktettweise sowie die ausgewertete Zeilentabelle
+  Zeile für Zeile (TEIL 8).*
 * **Die Reihenfolge der Umsetzungen** wurde als *Menge* verglichen, nicht
   als Folge. `as` schreibt sie in seiner internen Reihenfolge; für den
   Binder ist das ohne Bedeutung.
