@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/net/echo.fi -- a server for the OUTSIDE (round 76).
+//
+// `tests/1600_net_echo.fi` proves that `lib/std/net.fi` agrees with itself:
+// a server thread and a client in the same process, 1 MiB, byte for byte.
+// That is necessary and it is not enough. A socket has two ends, and both
+// of them being this repository is exactly the situation in which a shared
+// misunderstanding stays invisible.
+//
+// So this program is the end that `nc` and `curl` talk to. Two modes:
+//
+//   echo   whatever comes in goes back out, until the peer closes. `nc`
+//          pushes a megabyte through it and compares the checksums.
+//   http   a fixed HTTP/1.1 answer with Content-Length and Connection:
+//          close. `curl` is a client nobody here wrote, it knows what an
+//          HTTP answer has to look like, and it says so when it is wrong.
+//
+// One thread per connection, blocking sockets -- the same shape as
+// `demos/mcserver`.
+//
+//     echo.fi <port> <connections> [http]
+//
+// Port 0 means: the kernel picks one and the program prints it. That is
+// what makes the test runnable twice at the same time.
+
+import std.net
+import std.rt
+import std.bytes
+
+const G_MODE_HTTP: u64 = 0
+const G_LEFT: u64 = 8
+const G_BYTES: u64 = 16
+const G_SLOTS: u64 = 64
+const SLOT_BYTES: u64 = 32
+const SLOT_FD: u64 = 0
+const SLOT_USED: u64 = 8
+const SLOT_BASE: u64 = 16
+const SLOT_HANDLE: u64 = 24
+// 63, not 64: the main thread holds the first entry of the runtime's thread
+// table (lib/gc/gc.fi, THREAD_MAX).
+const MAX_CONN: u64 = 63
+const CHUNK: usize = 65536
+
+fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
+fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
+
+fn parse_dec(p: u64, n: usize, fallback: i64) -> i64 {
+    if n == 0 {
+        return fallback
+    }
+    var v: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return fallback
+        }
+        v = v * 10 + (c - 48 as u8) as i64
+        i = i + 1
+    }
+    return v
+}
+
+// A finished thread has to be collected, or the 64th connection finds no
+// free entry in the thread table -- `__thread_slot_new` only hands out
+// entries that `thread_wait` has released. See demos/mcserver/main.fi and
+// docs/ROUND76.md 4.5.
+fn reap(base: u64) {
+    var k: u64 = 0
+    while k < MAX_CONN {
+        let slot: u64 = base + G_SLOTS + k * SLOT_BYTES
+        if ld(slot, SLOT_USED) == 0 as u64 && ld(slot, SLOT_HANDLE) != 0 as u64 {
+            thread_wait(ld(slot, SLOT_HANDLE))
+            st(slot, SLOT_HANDLE, 0)
+        }
+        k = k + 1
+    }
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind != 1 {
+        return 0
+    }
+    let base: u64 = ld(arg, SLOT_BASE)
+    var c: net.Conn = net.conn_from_fd(ld(arg, SLOT_FD) as i32)
+    var total: u64 = 0
+
+    if ld(base, G_MODE_HTTP) != 0 {
+        // Read the request head -- just far enough to see the blank line, so
+        // that curl does not get a RST while it is still writing.
+        let buf: u64 = rt.heap_alloc(CHUNK)
+        if buf != 0 {
+            thread_blocking_an()
+            net.read(&c, buf, CHUNK) catch 0 as usize
+            thread_blocking_out()
+            rt.heap_free(buf, CHUNK)
+        }
+        var head: [u8; 85] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\n\0"
+        var body: [u8; 25] = "a socket written in Firn\0"
+        var out: bytes.Bytes = bytes.bytes_with_capacity(256)
+        bytes.put_c(&out, (&head[0]) as u64)
+        bytes.put_c(&out, (&body[0]) as u64)
+        thread_blocking_an()
+        net.write_all(&c, bytes.bytes_ptr(&out), bytes.bytes_len(&out)) catch 0 as usize
+        thread_blocking_out()
+        total = bytes.bytes_len(&out) as u64
+        bytes.bytes_free(&out)
+    } else {
+        let buf: u64 = rt.heap_alloc(CHUNK)
+        if buf != 0 {
+            var running: bool = true
+            while running {
+                thread_blocking_an()
+                let k: usize = net.read(&c, buf, CHUNK) catch 0 as usize
+                thread_blocking_out()
+                if k == 0 {
+                    running = false
+                } else {
+                    thread_blocking_an()
+                    let w: usize = net.write_all(&c, buf, k) catch 0 as usize
+                    thread_blocking_out()
+                    if w != k {
+                        running = false
+                    }
+                    total = total + k as u64
+                }
+            }
+            rt.heap_free(buf, CHUNK)
+        }
+    }
+    __atomic_add((base + G_BYTES) as *mut u64, total)
+    // The half close first: the peer should see the end of the stream
+    // before the descriptor goes.
+    net.shutdown_write(&c)
+    net.close(&c)
+    st(arg, SLOT_FD, 0)
+    st(arg, SLOT_USED, 0)
+    return total
+}
+
+fn main(start: u64) -> i32 {
+    var t_port: [u8; 6] = "port \0"
+    var t_nl: [u8; 2] = "\n\0"
+    var t_done: [u8; 7] = "bytes \0"
+    var t_fail: [u8; 12] = "bind failed\0"
+
+    var port: u16 = 0 as u16
+    var left: i64 = 1
+    var http: bool = false
+    if rt.arg_count(start) > 1 {
+        let p: u64 = rt.arg_ptr(start, 1)
+        port = parse_dec(p, rt.c_length(p), 0) as u16
+    }
+    if rt.arg_count(start) > 2 {
+        let p: u64 = rt.arg_ptr(start, 2)
+        left = parse_dec(p, rt.c_length(p), 1)
+    }
+    if rt.arg_count(start) > 3 {
+        var h: [u8; 5] = "http\0"
+        let p: u64 = rt.arg_ptr(start, 3)
+        if rt.c_length(p) == 4 && rt.mem_eq(p, (&h[0]) as u64, 4) {
+            http = true
+        }
+    }
+
+    if !thread_init() {
+        return 90
+    }
+    let base: u64 = rt.heap_alloc((G_SLOTS + MAX_CONN * SLOT_BYTES) as usize)
+    if base == 0 {
+        return 91
+    }
+    st(base, G_BYTES, 0)
+    if http {
+        st(base, G_MODE_HTTP, 1)
+    } else {
+        st(base, G_MODE_HTTP, 0)
+    }
+
+    var l: net.Listener = net.listen_tcp(net.ADDR_ANY, port) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&l) {
+        rt.write_everything(2, (&t_fail[0]) as u64, 11)
+        return 1
+    }
+    // The port goes to standard output IMMEDIATELY and unbuffered -- the
+    // script that starts this program reads the line and only then connects.
+    var out: bytes.Bytes = bytes.bytes_new()
+    bytes.put_c(&out, (&t_port[0]) as u64)
+    var p10: u64 = net.listener_port(&l) as u64
+    var digits: [u8; 8] = [0; 8]
+    var nd: usize = 0
+    while p10 > 0 as u64 {
+        digits[nd] = 48 as u8 + (p10 % 10 as u64) as u8
+        p10 = p10 / 10 as u64
+        nd = nd + 1
+    }
+    while nd > 0 {
+        nd = nd - 1
+        bytes.put_u8(&out, digits[nd])
+    }
+    bytes.put_c(&out, (&t_nl[0]) as u64)
+    rt.write_everything(1, bytes.bytes_ptr(&out), bytes.bytes_len(&out))
+    bytes.bytes_free(&out)
+
+    var served: i64 = 0
+    while served < left {
+        thread_blocking_an()
+        var conn: net.Conn = net.accept(&l) catch net.conn_from_fd(0 - 1)
+        thread_blocking_out()
+        if !net.conn_is_open(&conn) {
+            served = left
+        } else {
+            reap(base)
+            var k: u64 = 0
+            var placed: bool = false
+            while k < MAX_CONN && !placed {
+                let slot: u64 = base + G_SLOTS + k * SLOT_BYTES
+                if __atomic_swap((slot + SLOT_USED) as *mut u64, 0 as u64, 1 as u64) == 0 as u64 {
+                    st(slot, SLOT_FD, net.conn_fd(&conn) as u64)
+                    st(slot, SLOT_BASE, base)
+                    st(slot, SLOT_HANDLE, 0)
+                    let h: u64 = thread_start(1, slot)
+                    if h == 0 {
+                        st(slot, SLOT_USED, 0)
+                        net.close(&conn)
+                    } else {
+                        st(slot, SLOT_HANDLE, h)
+                    }
+                    placed = true
+                }
+                k = k + 1
+            }
+            if !placed {
+                net.close(&conn)
+            }
+            served = served + 1
+        }
+    }
+    // Wait for every worker: without the join the process would exit while
+    // a thread is still writing, and `nc` would see a truncated stream.
+    var k2: u64 = 0
+    while k2 < MAX_CONN {
+        let slot: u64 = base + G_SLOTS + k2 * SLOT_BYTES
+        if ld(slot, SLOT_HANDLE) != 0 as u64 {
+            thread_wait(ld(slot, SLOT_HANDLE))
+            st(slot, SLOT_HANDLE, 0)
+        }
+        k2 = k2 + 1
+    }
+    net.close_listener(&l)
+
+    var fin: bytes.Bytes = bytes.bytes_new()
+    bytes.put_c(&fin, (&t_done[0]) as u64)
+    var n10: u64 = ld(base, G_BYTES)
+    var d2: [u8; 24] = [0; 24]
+    var m: usize = 0
+    if n10 == 0 as u64 {
+        d2[0] = 48 as u8
+        m = 1
+    }
+    while n10 > 0 as u64 {
+        d2[m] = 48 as u8 + (n10 % 10 as u64) as u8
+        n10 = n10 / 10 as u64
+        m = m + 1
+    }
+    while m > 0 {
+        m = m - 1
+        bytes.put_u8(&fin, d2[m])
+    }
+    bytes.put_c(&fin, (&t_nl[0]) as u64)
+    rt.write_everything(1, bytes.bytes_ptr(&fin), bytes.bytes_len(&fin))
+    bytes.bytes_free(&fin)
+    return 0
+}

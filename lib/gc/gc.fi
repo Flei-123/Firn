@@ -1,0 +1,3771 @@
+// SPDX-License-Identifier: MIT
+// lib/gc/gc.fi -- the runtime of the opt-in tracing GC (SPEC 3.5).
+//
+// The compiler embeds this file with `include_str!` and pulls it in
+// automatically as an additional module as soon as a `gc class` occurs
+// inside the program (`compiler/src/gc.rs`, `compiler/src/modules.rs`). It
+// needs NO `import` and no command line option; its names live in the root
+// namespace.
+//
+// The method (SPEC 3.5.3, no deviation):
+//   * mark-sweep, non moving, collection ONLY at allocation sites and at
+//     gc_collect().
+//   * PRECISE tracing of the heap through the compiler generated type table
+//     (field offsets per class, produced from the field layout).
+//   * CONSERVATIVE scan of the stack AND the registers. The callee saved
+//     registers are saved into the state block by the code generator before
+//     the scan (`__gc_save_regs`), otherwise the promise would be false.
+//   * NO compaction (addresses stay valid -- a prerequisite for the
+//     conservative scan), a size class allocator against fragmentation.
+//   * One heap per thread (SPEC 7): the state block is meant to be thread
+//     local; stage 0 has only one thread.
+//   * mmap WITHOUT a fixed address, without MAP_FIXED; a failed mmap is
+//     visible (gc_init() -> false, or AllocError::OutOfMemory).
+//
+// The layout of a block (a 16 byte header, the payload behind it):
+//   [0..4)   u32 type id (0 = free)
+//   [4..8)   u32 state word -- round 47:
+//              bits 0..1  mark (0 white, 1 grey, 2 black)
+//              bit  2     F_FIN    the object has a finalizer
+//              bit  3     F_WART   it sits in the finalization queue
+//              bit  4     F_GETAN  its finalizer has run
+//              bits 8..31 finalizer kind (24 bit, 0 = none)
+//   [8..16)  u64 serial number (for GcWeak; 0 = free). While a block hangs
+//              in the finalization queue, this word carries the link to the
+//              next waiting block instead of the serial number -- which is
+//              why the queue needs no memory of its own.
+//   [16..)   the payload -- that is the address a `Gc[T]` carries.
+//
+// The layout of a chunk (a 64 byte header):
+//   [0]  next chunk        [8]  size in bytes    [16] block size
+//   [24] number of blocks  [32] data start (64)  [40] size class
+//   [48] empty hysteresis  (1 = it was already empty at the last sweep)
+
+const GC_SYS_WRITE: i64 = 1
+const GC_SYS_OPEN: i64 = 2
+const GC_SYS_CLOSE: i64 = 3
+const GC_SYS_MMAP: i64 = 9
+const GC_SYS_MUNMAP: i64 = 11
+const GC_SYS_READ: i64 = 0
+const GC_SYS_EXIT_GROUP: i64 = 231
+const GC_SYS_CLOCK_GETTIME: i64 = 228
+const GC_PROT_RW: i64 = 3
+const GC_MAP_PRIVATE_ANON: i64 = 34
+const GC_CLOCK_MONOTONIC: i64 = 1
+// Round 44: the CPU time of THIS thread. With it a long pause that the
+// collector really caused can be told apart from one where the machine
+// merely preempted the process (parallel rounds on the same machine --
+// the wrong finding of round 40).
+const GC_CLOCK_THREAD_CPUTIME: i64 = 3
+
+// The state block: offsets in bytes (see compiler/src/gc.rs).
+const S_TABLE: u64 = 0
+const S_INIT: u64 = 8
+const S_CHUNKS: u64 = 16
+const S_BOTTOM: u64 = 24
+const S_RUNS: u64 = 32
+const S_LIVE: u64 = 40
+const S_HEAP: u64 = 48
+const S_LIVEBYTES: u64 = 56
+const S_PAUSE_LAST: u64 = 64
+const S_PAUSE_MAX: u64 = 72
+const S_PAUSE_TOTAL: u64 = 80
+const S_SINCE: u64 = 88
+const S_LIMIT: u64 = 96
+const S_SERIES: u64 = 104
+const S_MSTACK: u64 = 112
+const S_MKAP: u64 = 120
+const S_MLEN: u64 = 128
+const S_OVERFLOW: u64 = 136
+const S_BARRIEREN: u64 = 144
+const S_TIME: u64 = 152
+const S_FREE: u64 = 168
+const S_TOTAL: u64 = 296
+const S_BLOCKGROESSE: u64 = 304
+const S_MAXHEAP: u64 = 312
+// The incremental cycle (round 38): phase 0 idle, 1 marking, 2 sweeping.
+const S_PHASE: u64 = 320
+// Bookmarks of the sliced sweep: current chunk, previous one, and the
+// accumulators for live objects/bytes (taken over at the end of the cycle).
+const S_SWC: u64 = 328
+const S_SWV: u64 = 336
+const S_SWLEB: u64 = 344
+const S_SWLEBB: u64 = 352
+// The white parity: 0 or 2. Grey is always 1, black is 2 - white.
+// At the end of the cycle the parity is flipped: everything that survived is
+// then black_old = white_new -- the next cycle starts without resetting marks.
+const S_PAR: u64 = 360
+// A diagnostic of round 38: the longest pause per slice type.
+const S_PMAX_START: u64 = 368
+const S_PMAX_MARK: u64 = 376
+const S_PMAX_SWEEP: u64 = 384
+const S_PMAX_END: u64 = 392
+const S_PMAX_FULL: u64 = 400
+// A one entry chunk cache for __gc_block_of: write barriers usually hit the
+// same chunk several times in a row.
+const S_CHUNK_CACHE: u64 = 408
+// The last slice at this value of S_SINCE (slices are coupled to bytes).
+const S_SCHRT: u64 = 416
+// The longest slice of the running cycle -- it is taken over into
+// S_PAUSE_LAST at the end of the cycle, so that the histogram sees the most
+// noticeable interruption per cycle (instead of only the last slice).
+const S_PZYK: u64 = 424
+// A diagnostic: how often did the mark stack overflow (an atomic catch up run).
+const S_NOV: u64 = 432
+// A diagnostic (round 41): how many collection runs were FULL stop-the-world
+// runs (the build up phase below INCR_FROM, or the exhaustion fallback).
+const S_FULL: u64 = 440
+// A histogram of the INDIVIDUAL slices (round 41): 16 buckets, doubling
+// from 1 us on. Bucket 0 = below 1 us, bucket k = [2^(k-1) us, 2^k us),
+// bucket 15 = everything from 16.384 ms on. Until now the measuring tool
+// could only see the longest slice PER CYCLE (S_PZYK) -- with that, single
+// maxima made too much noise to compare slice sizes. Here every slice counts.
+const S_HIST: u64 = 448
+const HIST_FAECHER: u64 = 16
+// Round 44: eight types instead of seven. Type 7 is the WHOLE interruption
+// at an allocation site (start + marking + sweeping + end, as far as they
+// fall into THE SAME call) -- the number a frame really sees. Types 0..5
+// measure single sections only and therefore understate as soon as one call
+// contains several sections. S_HIST occupies 8*16*8 = 1024 bytes.
+const HIST_TYPES: u64 = 8
+// The longest whole interruption (type 7).
+const S_STOPMAX: u64 = 1472
+// A diagnostic of round 44: WHERE does heap growth come from and how many
+// slices run at all. The state block is 4096 bytes (compiler/src/gc.rs,
+// STATE_SIZE), the register save area starts at 3968 -- from 1344 there is room.
+const S_D_CN_RUHE: u64 = 1480
+const S_D_CN_MARK: u64 = 1488
+const S_D_CN_SWEEP: u64 = 1496
+const S_D_SCH_MARK: u64 = 1504
+const S_D_SCH_SWEEP: u64 = 1512
+const S_D_GRAU: u64 = 1520
+const S_D_ALLOK: u64 = 1528
+// Round 44: the switch over threshold at run time (default INCR_FROM). That
+// lets the atomic path be measured against the incremental one IN THE SAME
+// PROCESS and with BIT IDENTICAL code -- without differences in code layout,
+// which otherwise swamp everything at measurements in the percent range.
+const S_INKRAB: u64 = 1536
+// Sweeping: one flag per size class saying whether its free list has already
+// been emptied during THIS sweep run (13 classes, 1544..1648).
+const S_SWKL: u64 = 1544
+// A histogram of the whole interruption in PURE CPU TIME (16 buckets like
+// S_HIST), its maximum, and the switch for it (0 = off, no extra clock;
+// only measuring programs turn it on).
+const S_CHIST: u64 = 1704
+const S_CSTOPMAX: u64 = 1832
+const S_CPUUHR: u64 = 1840
+// ---------------------------------------------------------------- Round 47
+// Finalizers: head and length of the queue, counters, longest finalizer
+// slice. Weak fields: how many of them were nulled out in total.
+// External root areas: array, capacity, occupancy.
+const S_FINQ: u64 = 1848
+const S_FINQ_N: u64 = 1856
+const S_FIN_RUNS: u64 = 1864
+const S_FIN_NS: u64 = 1872
+const S_FIN_MAX: u64 = 1880
+const S_FIN_REG: u64 = 1888
+const S_WEAK_NULL: u64 = 1896
+const S_WROOT_P: u64 = 1904
+const S_WROOT_CAP: u64 = 1912
+const S_WROOT_N: u64 = 1920
+const S_PMAX_FIN: u64 = 1928
+// 1 = at least one class has a GcWeak field. Determined once at startup from
+// the type table, so that sweeping does not make a single extra table access
+// for programs without weak fields.
+const S_HATWEAK: u64 = 1936
+// A clock per INDIVIDUAL finalizer (0 = off). It costs two system calls per
+// finalizer -- with close to a million finalizers in three seconds that is a
+// measured ~3 % of the run time. The slice time (S_PMAX_FIN) is ALWAYS
+// measured, it costs only two calls per slice. As with S_CPUUHR, only
+// measuring programs turn this one on.
+const S_FINUHR: u64 = 1944
+// A bitmask of the type ids WITH a weak field (bit i = type id i+1).
+// With it the question "does this object have a GcWeak field at all?" costs
+// one shift and one and during sweeping, instead of four dependent memory
+// accesses into the type table. Measured, exactly that pushed the throughput
+// loss of the round from 3.0 % down to 0.4 % (docs/ROUND47.md).
+// More than 64 classes: then bit 63 stands for "could be" and it is looked
+// up -- it stays correct always, just no longer quite as cheap.
+const S_WEAKMASK: u64 = 1952
+// ---------------------------------------------------------------- Round 49
+// The save area of the callee saved registers. It lies at the END of the
+// state block (compiler/src/gc.rs, REG_SAVE_OFF = 3968).
+//
+// THE FINDING OF ROUND 49: up to here `__gc_collect_now` contained
+// `__gc_scan(regs, regs + 48)` with `regs = __gc_save_regs()` -- and
+// `__gc_save_regs()` returns the address of the BLOCK, not the one of the
+// save area. So what got scanned were the first 48 octets of the state block
+// (type table, S_INIT, chunk list, stack bottom, two counters) instead of
+// the registers. The CONSERVATIVE REGISTER SCAN from SPEC 3.5.3 was thereby
+// running into nothing. It shows up here because this round needs the same
+// mechanism per thread; the line is repaired and the proof stands in
+// tools/thread/run.sh.
+const S_REGS: u64 = 3968
+// The thread table: pointer, number of slots, live threads, threads started.
+const S_THREAD_TAB: u64 = 1960
+const S_THREAD_MAX: u64 = 1968
+const S_THREAD_N: u64 = 1976
+const S_THREAD_TOTAL: u64 = 1984
+// 1 = there is (or was) more than one thread. THE switch of the hot path:
+// as long as it is 0, the whole of round 49 costs nothing but one memory
+// access and one always correctly predicted branch.
+const S_MULTI: u64 = 1992
+// The futex word: 1 = the world is stopping.
+const S_STOPP: u64 = 2000
+// The GC lock. Whoever holds it is the only one allowed to stop the world (R1).
+const S_LOCK: u64 = 2008
+// A spin lock around the ONE register save area.
+const S_REGSPERRE: u64 = 2016
+// A lock around the thread table.
+const S_TSPERRE: u64 = 2024
+const S_MAIN: u64 = 2032
+const S_STAPELN: u64 = 2040
+// A diagnostic of the stopping.
+const S_STW_N: u64 = 2048
+const S_STW_MAX: u64 = 2056
+const S_STW_WAIT: u64 = 2064
+const S_STW_NS: u64 = 2072
+const S_STW_T0: u64 = 2080
+const S_STW_WORK_MAX: u64 = 2088
+const S_SPERR_W: u64 = 2096
+// 1 = free lists per thread (variant B), 0 = everything under the GC lock (A).
+const S_LOCAL: u64 = 2104
+const S_LOCAL_N: u64 = 2112
+// This many blocks a thread fetches at once into its own free list.
+const SCHWUNG: u64 = 32
+
+// ---------------------------------------------------------------- Round 53
+// MERGE R49+R53: the three slots originally lay at 1960/1968/1976 -- exactly
+// where round 49 put its thread table. Both branches handed out the numbers
+// independently and did not see each other. Round 53 moves to
+// 2120/2128/2136 (free, below REG_SAVE_OFF = 3968).
+// The type id of the slot buffer (lib/gc/gcvec.fi sets it once per process).
+const S_SLOTS_TID: u64 = 2120
+// Slice size and time budget of the marking, adjustable AT RUN TIME;
+// 0 = the default (SLICE_TRACE and TIME_BUDGET_NS respectively).
+//
+// WHAT FOR: the critical case of round 53 is a collection that grows WHILE
+// a marking is running. How often it happens by itself has been measured
+// and is sobering: out of 200,000 appends, 526 fell into phase 1 and NOT A
+// SINGLE one made the buffer grow (0.26 %). A test that waits for it checks
+// nothing. With `gc_set_slice(1)` one slice traces exactly ONE object --
+// the marking phase then stretches over as many allocations as there are
+// live objects, and the critical case becomes the normal case. The same
+// trick as S_CPUUHR and S_INKRAB: bit identical code, only a different
+// state.
+const S_SLICE: u64 = 2128
+const S_ZBUDGET: u64 = 2136
+// ROUND 70: the type tag of `StrBytes`, determined once (`__str_tid`).
+// 0 = not yet determined.
+const S_STR_TID: u64 = 2144
+
+// The state word of a block header (see the comment at the top).
+const M_MARK: u32 = 3
+const M_WITHOUT_MARK: u32 = 4294967292
+const F_FIN: u32 = 4
+const F_WART: u32 = 8
+const F_GETAN: u32 = 16
+// ---------------------------------------------------------------- Round 53
+// THE SLOT BUFFER: instead of fixed fields the block carries an ARRAY of
+// elements whose count is known only at run time (`GcVec`, `GcMap` --
+// lib/gc/gcvec.fi, lib/gc/gcmap.fi). The compiler generated type table
+// cannot describe such a thing, it knows fixed offsets only. This bit in the
+// state word switches the tracing over to `__gc_trace_slots`. It costs
+// NOTHING: the word is read and written in `__gc_trace` anyway. Bits 5..7
+// were free (0..1 mark, 2 F_FIN, 3 F_WART, 4 F_GETAN, 8..31 finalizer kind).
+const F_SLOTS: u32 = 32
+// The header of a slot buffer, in bytes (payload, not block header):
+//   [0..8)   u64 n         the number of elements that are traced
+//   [8..16)  u64 desc      step | (mask << 8)
+//   [16..24) u64 progress  the resume point of the marking
+//   [24..32) u64 cap       the capacity in elements
+//   [32..)   the elements
+// 32 bytes, so that the elements lie 16 byte aligned.
+const SLOT_HEADER: u64 = 32
+// Elements per marking slice of a slot buffer. See __gc_trace_slots: a
+// buffer with millions of elements must not blow the time budget of a slice
+// (TIME_BUDGET_NS), otherwise the pause promise of round 44 is gone. The
+// clock is read in __gc_cycle_step only every TIME_PROBE objects, so the
+// worst stretch without a clock is TIME_PROBE * SLOT_SLICE markings. At
+// 16 * 64 = 1024 it stays in the same order of magnitude as an ordinary
+// object with eight pointer fields.
+const SLOT_SLICE: u64 = 64
+const KIND_MAX: u64 = 16777215
+// The initial size of the array of external root areas (entries of 16 bytes).
+const WROOT_START: u64 = 256
+// Slice sizes: this many objects to trace, or chunks to sweep, per allocation.
+const SLICE_TRACE: u64 = 512
+// Round 41: the time budget of a marking slice (ns). The object count alone
+// is no good as a measure -- an object with many pointer fields costs a
+// multiple of a text node, which is why the slices spread over three orders
+// of magnitude in the histogram. The clock is read only every TIME_PROBE
+// objects (clock_gettime itself costs ~25 ns).
+const TIME_BUDGET_NS: u64 = 100000
+const TIME_PROBE: u64 = 16
+// Chunks per time probe during sweeping (round 44). Since round 44 sweeping
+// hangs on TIME_BUDGET_NS just like marking; this number only says after how
+// many chunks the clock is asked.
+const SLICE_SWEEP: u64 = 2
+// The default of the atomic/incremental switch over threshold in heap bytes.
+// Adjustable at run time with gc_set_incr_ab().
+//
+// ROUND 44 -- WHY IT IS 0 NOW (always incremental):
+// Up to round 43 this said 8 MiB. Below the threshold an ATOMIC full cycle
+// ran, and in the BUILD UP PHASE (the heap grows from 0 to its size) those
+// were, measured, three stop-the-world runs of 0.88 / 2.90 / 11.81 ms
+// (tools/gc_meas/build.fi, 120,000 live nodes). For a 16 ms frame the last
+// value alone is already too much.
+//
+// The reasoning behind the threshold (round 38: purely incremental cost 8 to
+// 26 % throughput on a small heap) was MEASURED CORRECTLY, but the cause did
+// not lie in the incremental method, it lay in __gc_sweep_init(): it emptied
+// ALL free lists in one go, and because sweeping runs in slices, every
+// allocation up to the end of the sweep then fell onto an empty list and had
+// to mmap a fresh chunk. Measured: 113 out of 119 new chunks came into being
+// during sweeping, the heap doubled (1.5 -> 3.7 MiB), and because
+// __gc_block_of scans the chunk list linearly, every marking got more
+// expensive with it. Since the free lists are emptied per class only at the
+// first chunk of their class and sweeping has a time budget, the heap stays
+// as large as on the atomic path, and at 2000 live nodes the incremental
+// cycle still costs 2 % throughput (A/B in the same process,
+// tools/gc_meas/ab.fi) instead of 26 %.
+const INCR_FROM: u64 = 0
+
+const HEADER: u64 = 16
+const CHUNK_HEADER: u64 = 64
+const CHUNK_BYTES: u64 = 262144
+const CLASSES: u64 = 13
+const MARK_BYTES: u64 = 1048576
+const MIN_LIMIT: u64 = 1048576
+// The largest distance between two collection runs (in freshly allocated
+// bytes): the memory overhead above the live set thereby always stays
+// smaller than this amount -- no matter how large the heap once was.
+const MAX_LIMIT: u64 = 4194304
+const WEAK_XOR: u64 = 6510615555426900570
+
+// ------------------------------------------------------------------ Memory
+
+fn __gc_ld64(a: u64) -> u64 {
+    return *(a as *mut u64)
+}
+
+fn __gc_st64(a: u64, v: u64) {
+    *(a as *mut u64) = v
+}
+
+fn __gc_ld32(a: u64) -> u32 {
+    return *(a as *mut u32)
+}
+
+fn __gc_st32(a: u64, v: u32) {
+    *(a as *mut u32) = v
+}
+
+// n bytes from the operating system, zero initialized. 0 = failed.
+// WITHOUT a fixed address, without MAP_FIXED.
+fn __gc_mmap(n: u64) -> u64 {
+    let len: u64 = (n + 4095) / 4096 * 4096
+    let r: i64 = syscall(GC_SYS_MMAP, 0, len as i64, GC_PROT_RW, GC_MAP_PRIVATE_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    if r == 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn __gc_munmap(p: u64, n: u64) {
+    let len: u64 = (n + 4095) / 4096 * 4096
+    syscall(GC_SYS_MUNMAP, p as i64, len as i64, 0, 0, 0, 0)
+}
+
+fn __gc_cpu_ns() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let buf: u64 = st + S_TIME
+    __gc_st64(buf, 0)
+    __gc_st64(buf + 8, 0)
+    syscall(GC_SYS_CLOCK_GETTIME, GC_CLOCK_THREAD_CPUTIME, buf as i64, 0, 0, 0, 0)
+    return __gc_ld64(buf) * 1000000000 + __gc_ld64(buf + 8)
+}
+
+fn __gc_now_ns() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let buf: u64 = st + S_TIME
+    __gc_st64(buf, 0)
+    __gc_st64(buf + 8, 0)
+    syscall(GC_SYS_CLOCK_GETTIME, GC_CLOCK_MONOTONIC, buf as i64, 0, 0, 0, 0)
+    return __gc_ld64(buf) * 1000000000 + __gc_ld64(buf + 8)
+}
+
+// Visible failure instead of a silently wrong answer.
+fn __gc_abort(code: i64) {
+    var m: [u8; 34] = "firn-gc: gc_init() was not called\n"
+    let p: u64 = (&m) as u64
+    syscall(GC_SYS_WRITE, 2, p as i64, 34, 0, 0, 0)
+    syscall(GC_SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}
+
+// Round 47: the same rule for the three violations of the finalizer
+// contract. A finalizer that allocates, collects or resurrects would take
+// the collector apart from the inside -- that MUST abort visibly and must
+// not keep running quietly.
+fn __gc_write(p: u64, n: i64, code: i64) {
+    syscall(GC_SYS_WRITE, 2, p as i64, n, 0, 0, 0)
+    syscall(GC_SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}
+
+fn __gc_error_fin_alloc() {
+    var m: [u8; 55] = "firn-gc: allocation during a finalizer (SPEC 3.5.3 S4)\n"
+    __gc_write((&m) as u64, 55, 71)
+}
+
+fn __gc_error_fin_collect() {
+    var m: [u8; 57] = "firn-gc: gc_collect() during a finalizer (SPEC 3.5.3 S4)\n"
+    __gc_write((&m) as u64, 57, 72)
+}
+
+fn __gc_error_fin_again() {
+    var m: [u8; 53] = "firn-gc: resurrection in a finalizer (SPEC 3.5.3 S4)\n"
+    __gc_write((&m) as u64, 53, 73)
+}
+
+// ------------------------------------------------ Finding the stack bottom
+
+// ROUND 47 -- THE STACK BOTTOM FROM /proc/self/maps.
+//
+// Field 28 of /proc/self/stat is the start address of the stack as the
+// kernel noted it when the program started. That is EXACT as long as the
+// program runs on exactly this stack -- but NOT under valgrind: there the
+// client runs on a stack provided by valgrind, while field 28 still names
+// the original one. The conservative scan then ran from its stack pointer to
+// an address that does not belong to it at all, and the program died with a
+// segmentation fault.
+//
+// The consequence, up to this round: NO program with `gc class` could be
+// measured under callgrind (no more so with the compiler of round 44 -- it
+// is not a new bug, only one that had not been named). So of all things, the
+// collector lacked the one measuring tool that does not scatter.
+//
+// Now /proc/self/maps is read FIRST and the mapping is searched in which our
+// own stack pointer really lies; its end is the bottom. That holds on both
+// ways. If it fails, field 28 remains as the fallback.
+fn __gc_hex_digit(c: u8) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c as i64 - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c as i64 - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c as i64 - 55
+    }
+    return -1
+}
+
+fn __gc_stack_bottom_maps(sp: u64) -> u64 {
+    var path: [u8; 16] = "/proc/self/maps\0"
+    let cap: u64 = 262144
+    let buffer: u64 = __gc_mmap(cap)
+    if buffer == 0 {
+        return 0
+    }
+    let pp: u64 = (&path) as u64
+    let fd: i64 = syscall(GC_SYS_OPEN, pp as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        __gc_munmap(buffer, cap)
+        return 0
+    }
+    var len: u64 = 0
+    var next: bool = true
+    while next {
+        let n: i64 = syscall(GC_SYS_READ, fd, (buffer + len) as i64,
+            (cap - len - 1) as i64, 0, 0, 0)
+        if n <= 0 {
+            next = false
+        } else {
+            len = len + n as u64
+            if len + 1 >= cap {
+                next = false
+            }
+        }
+    }
+    syscall(GC_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if len == 0 {
+        __gc_munmap(buffer, cap)
+        return 0
+    }
+    // Lines of the form "7ffd0a1b2000-7ffd0a1d3000 rw-p ..." -- wanted is the
+    // one `sp` lies in; its end is the stack bottom.
+    var i: u64 = 0
+    var hit: u64 = 0
+    while i < len {
+        var of: u64 = 0
+        var digits: u64 = 0
+        while i < len {
+            let z: i64 = __gc_hex_digit(*((buffer + i) as *mut u8))
+            if z < 0 {
+                break
+            }
+            of = of * 16 + z as u64
+            digits = digits + 1
+            i = i + 1
+        }
+        var to: u64 = 0
+        if digits > 0 && i < len && *((buffer + i) as *mut u8) == 45 {
+            i = i + 1
+            var st2: u64 = 0
+            while i < len {
+                let z2: i64 = __gc_hex_digit(*((buffer + i) as *mut u8))
+                if z2 < 0 {
+                    break
+                }
+                to = to * 16 + z2 as u64
+                st2 = st2 + 1
+                i = i + 1
+            }
+            if st2 > 0 && sp >= of && sp < to {
+                hit = to
+            }
+        }
+        // Skip the rest of the line.
+        while i < len && *((buffer + i) as *mut u8) != 10 {
+            i = i + 1
+        }
+        if i < len {
+            i = i + 1
+        }
+        if hit != 0 {
+            i = len
+        }
+    }
+    __gc_munmap(buffer, cap)
+    return hit
+}
+
+// Field 28 of /proc/self/stat is the start address of the stack. The
+// fallback for when /proc/self/maps yields nothing.
+fn __gc_stack_bottom() -> u64 {
+    var path: [u8; 16] = "/proc/self/stat\0"
+    let buffer: u64 = __gc_mmap(8192)
+    if buffer == 0 {
+        return 0
+    }
+    let pp: u64 = (&path) as u64
+    let fd: i64 = syscall(GC_SYS_OPEN, pp as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        __gc_munmap(buffer, 8192)
+        return 0
+    }
+    let n: i64 = syscall(GC_SYS_READ, fd, buffer as i64, 8000, 0, 0, 0)
+    syscall(GC_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if n <= 0 {
+        __gc_munmap(buffer, 8192)
+        return 0
+    }
+    let len: u64 = n as u64
+    // The command name stands in parentheses and may contain spaces:
+    // field 3 begins after the LAST ')'.
+    var paren: u64 = 0
+    var i: u64 = 0
+    while i < len {
+        if *((buffer + i) as *mut u8) == 41 {
+            paren = i
+        }
+        i = i + 1
+    }
+    if paren == 0 {
+        __gc_munmap(buffer, 8192)
+        return 0
+    }
+    // Field 28 = the 26th field behind the parenthesis.
+    var pos: u64 = paren + 1
+    var field: u64 = 0
+    var value: u64 = 0
+    while field < 26 {
+        while pos < len && *((buffer + pos) as *mut u8) == 32 {
+            pos = pos + 1
+        }
+        value = 0
+        var digits: u64 = 0
+        while pos < len {
+            let c: u8 = *((buffer + pos) as *mut u8)
+            if c < 48 || c > 57 {
+                break
+            }
+            value = value * 10 + (c as u64 - 48)
+            digits = digits + 1
+            pos = pos + 1
+        }
+        // Skip non numeric fields
+        while pos < len && *((buffer + pos) as *mut u8) != 32 {
+            pos = pos + 1
+        }
+        if digits == 0 {
+            value = 0
+        }
+        field = field + 1
+    }
+    __gc_munmap(buffer, 8192)
+    return value
+}
+
+// ------------------------------------------------------------ Size classes
+
+fn __gc_diag_inc(off: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + off, __gc_ld64(st + off) + 1)
+}
+
+// Diagnostics 0..6: new chunks while idle/marking/sweeping, mark slices,
+// sweep slices, grey (made during a cycle) allocations, allocations in total.
+fn gc_diag(i: u64) -> u64 {
+    if i > 6 {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_D_CN_RUHE + i * 8)
+}
+
+fn __gc_classes_bytes(k: u64) -> u64 {
+    if k == 0 {
+        return 32
+    }
+    if k == 1 {
+        return 48
+    }
+    if k == 2 {
+        return 64
+    }
+    if k == 3 {
+        return 96
+    }
+    if k == 4 {
+        return 128
+    }
+    if k == 5 {
+        return 192
+    }
+    if k == 6 {
+        return 256
+    }
+    if k == 7 {
+        return 384
+    }
+    if k == 8 {
+        return 512
+    }
+    if k == 9 {
+        return 768
+    }
+    if k == 10 {
+        return 1024
+    }
+    if k == 11 {
+        return 2048
+    }
+    return 4096
+}
+
+fn __gc_class_for(size: u64) -> u64 {
+    var k: u64 = 0
+    while k < CLASSES {
+        if size <= __gc_classes_bytes(k) {
+            return k
+        }
+        k = k + 1
+    }
+    return CLASSES
+}
+
+// ------------------------------------------------------------------ Chunks
+
+fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var block: u64 = 0
+    var total: u64 = 0
+    if class < CLASSES {
+        block = HEADER + __gc_classes_bytes(class)
+        total = CHUNK_BYTES
+    } else {
+        block = HEADER + (payload + 15) / 16 * 16
+        total = CHUNK_HEADER + block
+    }
+    // The memory limit per heap (the basis for a limit per tab, S6).
+    let max: u64 = __gc_ld64(st + S_MAXHEAP)
+    if max != 0 && __gc_ld64(st + S_HEAP) + total > max {
+        return 0
+    }
+    let p: u64 = __gc_mmap(total)
+    if p == 0 {
+        return 0
+    }
+    let real: u64 = (total + 4095) / 4096 * 4096
+    let count: u64 = (real - CHUNK_HEADER) / block
+    __gc_st64(p, __gc_ld64(st + S_CHUNKS))
+    __gc_st64(p + 8, real)
+    __gc_st64(p + 16, block)
+    __gc_st64(p + 24, count)
+    __gc_st64(p + 32, CHUNK_HEADER)
+    __gc_st64(p + 40, class)
+    __gc_st64(st + S_CHUNKS, p)
+    __gc_st64(st + S_HEAP, __gc_ld64(st + S_HEAP) + real)
+    // All blocks into the free list of the class
+    if class < CLASSES {
+        let header: u64 = st + S_FREE + class * 8
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = p + CHUNK_HEADER + i * block
+            __gc_st64(b + HEADER, __gc_ld64(header))
+            __gc_st64(header, b)
+            i = i + 1
+        }
+    }
+    let ph: u64 = __gc_ld64(st + S_PHASE)
+    if ph == 0 {
+        __gc_diag_inc(S_D_CN_RUHE)
+    } else {
+        if ph == 1 {
+            __gc_diag_inc(S_D_CN_MARK)
+        } else {
+            __gc_diag_inc(S_D_CN_SWEEP)
+        }
+    }
+    return p
+}
+
+// Which block does the address belong to? 0 = not a heap address.
+// Interior pointers are expressly allowed (the conservative scan).
+fn __gc_block_of(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
+    if cc != 0 {
+        let data0: u64 = cc + CHUNK_HEADER
+        let end0: u64 = data0 + __gc_ld64(cc + 16) * __gc_ld64(cc + 24)
+        if a >= data0 && a < end0 {
+            return data0 + (a - data0) / __gc_ld64(cc + 16) * __gc_ld64(cc + 16)
+        }
+    }
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        let end: u64 = data + block * count
+        if a >= data && a < end {
+            __gc_st64(st + S_CHUNK_CACHE, c)
+            let idx: u64 = (a - data) / block
+            return data + idx * block
+        }
+        c = __gc_ld64(c)
+    }
+    return 0
+}
+
+// Which chunk does the address belong to? 0 = not a heap address. It is
+// needed only rarely (releasing after a finalizer), which is why it has no
+// cache.
+fn __gc_chunk_of(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    // The same one entry cache as in __gc_block_of: consecutive finalizers
+    // almost always hit the same chunk.
+    let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
+    if cc != 0 {
+        let d0: u64 = cc + CHUNK_HEADER
+        let e0: u64 = d0 + __gc_ld64(cc + 16) * __gc_ld64(cc + 24)
+        if a >= d0 && a < e0 {
+            return cc
+        }
+    }
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let data: u64 = c + CHUNK_HEADER
+        let end: u64 = data + __gc_ld64(c + 16) * __gc_ld64(c + 24)
+        if a >= data && a < end {
+            __gc_st64(st + S_CHUNK_CACHE, c)
+            return c
+        }
+        c = __gc_ld64(c)
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------- Marking
+
+fn __gc_mark_push(obj: u64) {
+    let st: u64 = __gc_state() as u64
+    let len: u64 = __gc_ld64(st + S_MLEN)
+    let cap: u64 = __gc_ld64(st + S_MKAP)
+    if len >= cap {
+        __gc_st64(st + S_OVERFLOW, 1)
+        __gc_st64(st + S_NOV, __gc_ld64(st + S_NOV) + 1)
+        return
+    }
+    __gc_st64(__gc_ld64(st + S_MSTACK) + len * 8, obj)
+    __gc_st64(st + S_MLEN, len + 1)
+}
+
+// Mark a candidate (an interior pointer too).
+fn __gc_mark(a: u64) {
+    if a == 0 {
+        return
+    }
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return
+    }
+    if __gc_ld32(b) == 0 {
+        return
+    }
+    let st: u64 = __gc_state() as u64
+    // Round 47: the mark is only the lowest two bits now.
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & M_MARK) != __gc_ld64(st + S_PAR) as u32 {
+        return
+    }
+    __gc_st32(b + 4, (zw & M_WITHOUT_MARK) | 1)
+    __gc_mark_push(b + HEADER)
+}
+
+// ---------------------------------------------------------------- Round 53
+// The tracing of a SLOT BUFFER: the block in which `GcVec`/`GcMap` keep
+// their elements. For the layout see SLOT_HEADER.
+//
+// `desc = step | (mask << 8)`: `step` is the number of words per element,
+// and bit `j` of the mask says that word `j` of an element is a Gc pointer.
+// With that, a single buffer type covers everything that is needed --
+// `GcVec[Gc[T]]` (1/1), `GcVec[u64]` (1/0), `GcMap[Gc[K],Gc[V]]` (2/3),
+// `GcMap[u64,Gc[V]]` (2/2).
+//
+// SLICING: a buffer can carry millions of elements. Traced in one go it
+// would blow the time budget of a marking slice and with it the pause
+// promise of round 44. So at most SLOT_SLICE elements per call, a resume
+// point INSIDE the buffer, and the buffer puts itself back onto the mark
+// stack. If the mark stack overflows while doing so, `__gc_catchup` finds
+// it again as a grey block and carries on -- so completeness does not hang
+// on the stack.
+//
+// Return value: true = fully traced (the caller colors it black),
+//               false = work still open (the buffer stays grey).
+fn __gc_trace_slots(obj: u64) -> bool {
+    let n: u64 = __gc_ld64(obj)
+    let desc: u64 = __gc_ld64(obj + 8)
+    let mask: u64 = desc >> 8
+    var i: u64 = __gc_ld64(obj + 16)
+    if mask == 0 || i >= n {
+        __gc_st64(obj + 16, 0)
+        return true
+    }
+    let step: u64 = desc & 255
+    let base: u64 = obj + SLOT_HEADER
+    var rest: u64 = SLOT_SLICE
+    if step == 1 {
+        // The common case (GcVec[Gc[T]]) without an inner loop.
+        while i < n && rest > 0 {
+            let v: u64 = __gc_ld64(base + i * 8)
+            if v != 0 {
+                __gc_mark(v)
+            }
+            i = i + 1
+            rest = rest - 1
+        }
+    } else {
+        while i < n && rest > 0 {
+            let e: u64 = base + i * step * 8
+            var j: u64 = 0
+            while j < step {
+                if ((mask >> j) & 1) != 0 {
+                    let v: u64 = __gc_ld64(e + j * 8)
+                    if v != 0 {
+                        __gc_mark(v)
+                    }
+                }
+                j = j + 1
+            }
+            i = i + 1
+            rest = rest - 1
+        }
+    }
+    if i >= n {
+        __gc_st64(obj + 16, 0)
+        return true
+    }
+    __gc_st64(obj + 16, i)
+    __gc_mark_push(obj)
+    return false
+}
+
+// Precise tracing of an object through the compiler generated type table.
+fn __gc_trace(obj: u64) {
+    let st: u64 = __gc_state() as u64
+    let b: u64 = obj - HEADER
+    let zw: u32 = __gc_ld32(b + 4)
+    let black: u32 = (2 - __gc_ld64(st + S_PAR)) as u32
+    // Round 53: collections of variable length. A slot buffer is traced piece
+    // by piece and stays GREY until it is through -- grey means exactly "not
+    // finished yet". The test costs no memory access, the state word is read
+    // here anyway.
+    if (zw & F_SLOTS) != 0 {
+        if __gc_trace_slots(obj) {
+            __gc_st32(b + 4, (zw & M_WITHOUT_MARK) | black)
+        }
+        return
+    }
+    __gc_st32(b + 4, (zw & M_WITHOUT_MARK) | black)
+    let tid: u64 = __gc_ld32(b) as u64
+    let tab: u64 = __gc_ld64(st + S_TABLE)
+    if tid == 0 || tid > __gc_ld64(tab) {
+        return
+    }
+    let entry: u64 = tab + 8 + (tid - 1) * 64
+    let n: u64 = __gc_ld64(entry + 16)
+    let offs: u64 = __gc_ld64(entry + 24)
+    var i: u64 = 0
+    while i < n {
+        let kind: u64 = __gc_ld64(obj + __gc_ld64(offs + i * 8))
+        if kind != 0 {
+            __gc_mark(kind)
+        }
+        i = i + 1
+    }
+}
+
+fn __gc_drain() {
+    let st: u64 = __gc_state() as u64
+    while __gc_ld64(st + S_MLEN) > 0 {
+        let len: u64 = __gc_ld64(st + S_MLEN) - 1
+        __gc_st64(st + S_MLEN, len)
+        let obj: u64 = __gc_ld64(__gc_ld64(st + S_MSTACK) + len * 8)
+        __gc_trace(obj)
+    }
+}
+
+// After an overflow of the mark stack: find every grey block in the heap and
+// catch up on it. That makes the marking complete even without an unbounded
+// stack.
+fn __gc_catchup() {
+    let st: u64 = __gc_state() as u64
+    var next: bool = true
+    while next {
+        next = false
+        if __gc_ld64(st + S_OVERFLOW) == 0 {
+            return
+        }
+        __gc_st64(st + S_OVERFLOW, 0)
+        var c: u64 = __gc_ld64(st + S_CHUNKS)
+        while c != 0 {
+            let data: u64 = c + CHUNK_HEADER
+            let block: u64 = __gc_ld64(c + 16)
+            let count: u64 = __gc_ld64(c + 24)
+            var i: u64 = 0
+            while i < count {
+                let b: u64 = data + i * block
+                if __gc_ld32(b) != 0 && (__gc_ld32(b + 4) & M_MARK) == 1 {
+                    __gc_trace(b + HEADER)
+                    __gc_drain()
+                    next = true
+                }
+                i = i + 1
+            }
+            c = __gc_ld64(c)
+        }
+    }
+}
+
+// A conservative scan of a memory area (the stack, or the register save area).
+fn __gc_scan(lo: u64, hi: u64) {
+    var a: u64 = (lo + 7) / 8 * 8
+    while a + 8 <= hi {
+        __gc_mark(__gc_ld64(a))
+        a = a + 8
+    }
+}
+
+// ------------------------------------------------------------------- Sweep
+
+// The start of the sliced sweep: empty the free lists, set the bookmarks.
+fn __gc_sweep_init() {
+    let st: u64 = __gc_state() as u64
+    // Round 44: the free lists are NOT emptied here any more, but only when the
+    // first chunk of the class in question is swept (S_SWKL).
+    //
+    // WHY: sweeping runs in slices, and between the slices the program keeps
+    // allocating. If all free lists were emptied in one go, EVERY allocation up
+    // to the end of the sweep fell onto an empty list and had to mmap a fresh
+    // chunk. Measured (round 44, small run with 2000 live nodes, 200,000
+    // rounds): 113 out of 119 new chunks came into being during the sweep, the
+    // heap doubled from 1.5 to 3.7 MiB and the collection time rose from 23 to
+    // 61 ms. That was exactly the reason why the incremental cycle looked
+    // expensive on a small heap.
+    //
+    // It is safe because the list is emptied at the FIRST chunk of its class:
+    // after that it holds only blocks of chunks of the same class that have
+    // already been swept. A block of a chunk that has not been swept yet cannot
+    // be handed out twice -- it falls out of the list when it is emptied and
+    // comes back in only once its chunk has been swept.
+    // Round 49: the blocks in the free lists of the individual threads go back
+    // into the global lists. Such a block is free (type id 0) and would land in
+    // a list a second time during the sweep -- it would then stand in two of
+    // them and be handed out twice. The world is stopped here.
+    __thread_lists_all_back()
+    var k: u64 = 0
+    while k < CLASSES {
+        __gc_st64(st + S_SWKL + k * 8, 0)
+        k = k + 1
+    }
+    __gc_st64(st + S_SWC, __gc_ld64(st + S_CHUNKS))
+    __gc_st64(st + S_SWV, 0)
+    __gc_st64(st + S_SWLEB, 0)
+    __gc_st64(st + S_SWLEBB, 0)
+}
+
+// One sweep slice: at most SLICE_SWEEP chunks from the bookmark on.
+// Return value 1 = done (bookmark at the end), 0 = there are chunks left.
+fn __gc_sweep_step(t0: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let white: u32 = __gc_ld64(st + S_PAR) as u32
+    var live: u64 = __gc_ld64(st + S_SWLEB)
+    var live_bytes: u64 = __gc_ld64(st + S_SWLEBB)
+    var before: u64 = __gc_ld64(st + S_SWV)
+    var c: u64 = __gc_ld64(st + S_SWC)
+    let weakmask: u64 = __gc_ld64(st + S_WEAKMASK)
+    var probe: u64 = SLICE_SWEEP
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        let class: u64 = __gc_ld64(c + 40)
+        // The first chunk of this class in this run: empty the free list.
+        if class < CLASSES {
+            if __gc_ld64(st + S_SWKL + class * 8) == 0 {
+                __gc_st64(st + S_SWKL + class * 8, 1)
+                __gc_st64(st + S_FREE + class * 8, 0)
+            }
+        }
+        var dead: u64 = 0
+        var i: u64 = 0
+        // Remember the list head BEFORE this chunk: the dead blocks are
+        // linked in right away; if the chunk is given back to the OS
+        // afterwards, a single reset of the head cuts its (contiguous)
+        // segment off again -- no second pass needed.
+        let header_addr: u64 = st + S_FREE + class * 8
+        let old_header: u64 = __gc_ld64(header_addr)
+        while i < count {
+            let b: u64 = data + i * block
+            let tid: u32 = __gc_ld32(b)
+            // The state word is read ONLY once the block is used at all:
+            // by far the most visited blocks are free (tid == 0). The
+            // counter check was measured -- reading the type id twice
+            // instead of binding it was 0.3 million instructions WORSE
+            // (docs/ROUND47.md).
+            if tid != 0 && (__gc_ld32(b + 4) & M_MARK) != white {
+                // Alive (grey or black). The mark STAYS -- flipping the white
+                // parity at the end of the cycle turns every survivor white
+                // again in one go, without this block ever being touched
+                // again.
+                live = live + 1
+                live_bytes = live_bytes + block
+                // Round 47: weak fields of this live object whose target dies
+                // in THIS run are really nulled out here (SPEC 3.5.3 S3) --
+                // not only at the next `strong()`. One shift, one and, one
+                // branch. At weakmask == 0 (a program without weak fields)
+                // the result is always 0 -- then the whole promise costs
+                // NOTHING.
+                if (weakmask >> ((tid as u64) - 1)) & 1 != 0 {
+                    __gc_weak_clean(b, white)
+                }
+            } else {
+                if tid != 0 {
+                    // The finalizer case lives in a function of its own:
+                    // inside the sweep loop every instruction counts (it runs
+                    // over EVERY block of the heap per collection run).
+                    if (__gc_ld32(b + 4) & F_FIN) != 0 {
+                        if __gc_fin_enqueue(b) != 0 {
+                            live = live + 1
+                            live_bytes = live_bytes + block
+                            i = i + 1
+                            continue
+                        }
+                    }
+                    __gc_st32(b, 0)
+                    __gc_st64(b + 8, 0)
+                }
+                dead = dead + 1
+                if class < CLASSES {
+                    __gc_st64(b + HEADER, __gc_ld64(header_addr))
+                    __gc_st64(header_addr, b)
+                }
+            }
+            i = i + 1
+        }
+        // Hysteresis: an empty chunk is given back only once it has been
+        // empty for TWO sweeps in a row (a flag in the chunk header, offset 48).
+        // Otherwise a phased workload oscillates between munmap and mmap.
+        var away: u64 = 0
+        if dead == count {
+            if __gc_ld64(c + 48) != 0 {
+                away = 1
+            } else {
+                __gc_st64(c + 48, 1)
+            }
+        } else {
+            __gc_st64(c + 48, 0)
+        }
+        if away == 1 {
+            if class < CLASSES {
+                __gc_st64(header_addr, old_header)
+            }
+            let bytes: u64 = __gc_ld64(c + 8)
+            if before == 0 {
+                __gc_st64(st + S_CHUNKS, next)
+            } else {
+                __gc_st64(before, next)
+            }
+            __gc_st64(st + S_HEAP, __gc_ld64(st + S_HEAP) - bytes)
+            if __gc_ld64(st + S_CHUNK_CACHE) == c {
+                __gc_st64(st + S_CHUNK_CACHE, 0)
+            }
+            __gc_munmap(c, bytes)
+        } else {
+            before = c
+        }
+        c = next
+        // Round 44: sweeping no longer hangs on a fixed chunk count but on
+        // the same time budget as marking (round 41). A small heap is
+        // thereby finished in ONE slice -- and only then does the
+        // triggering allocation see full free lists again.
+        // t0 == 0 means: no time limit (an atomic full sweep).
+        probe = probe - 1
+        if probe == 0 {
+            probe = SLICE_SWEEP
+            if t0 != 0 {
+                var budget: u64 = __gc_ld64(st + S_ZBUDGET)
+                if budget == 0 {
+                    budget = TIME_BUDGET_NS
+                }
+                if __gc_now_ns() - t0 >= budget {
+                    break
+                }
+            }
+        }
+    }
+    __gc_st64(st + S_SWC, c)
+    __gc_st64(st + S_SWV, before)
+    __gc_st64(st + S_SWLEB, live)
+    __gc_st64(st + S_SWLEBB, live_bytes)
+    if c == 0 {
+        return 1
+    }
+    return 0
+}
+
+// The whole sweep at once (a manual full cycle, the exhaustion fallback).
+fn __gc_sweep() {
+    __gc_sweep_init()
+    while __gc_sweep_step(0) == 0 {
+    }
+    // Round 47: the finalizers first, the bookkeeping after -- they release
+    // their blocks and still change S_SWLEB/S_SWLEBB.
+    __gc_fin_all()
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_LIVE, __gc_ld64(st + S_SWLEB))
+    __gc_st64(st + S_LIVEBYTES, __gc_ld64(st + S_SWLEBB))
+}
+
+// ------------------------------------------------------ The collection run
+
+// Null out the dead stack area below the current frame.
+//
+// WHY: the stack scan is CONSERVATIVE. The frames of calls that have already
+// returned still hold old pointers; the frames of the collector are laid
+// down next to them and inherit their content in cells they do not write.
+// Without this nulling, a single random value keeps an object that has long
+// been unreachable alive -- demonstrable at a GcWeak target that does not
+// get collected. That is the honest price of the conservative scan; here it
+// is paid instead of being kept quiet.
+// The self call is deliberate: a recursive function is NEVER inlined
+// (inline.rs), and only that way do the nulled frames really lie BELOW the
+// caller -- inlined they would be part of its own frame and would clean
+// nothing at all.
+fn __gc_scrub_deep(n: u64) {
+    var buffer: [u64; 512] = [0; 512]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 512 {
+        __gc_st64(p + i * 8, 0)
+        i = i + 1
+    }
+    if n > 0 {
+        __gc_scrub_deep(n - 1)
+    }
+}
+
+fn __gc_scrub() {
+    __gc_scrub_deep(3)
+}
+
+// ROUND 49 -- THE SAME THING, BUT FROM THE CALLER.
+//
+// `__gc_scrub()` runs out of the frame of `gc_collect` and therefore cleans
+// only what lies BELOW that frame. But the dead frames the program left
+// behind immediately before the collection run lie EXACTLY WHERE
+// `gc_collect` puts its own frame -- and whatever it does not overwrite
+// stays there and keeps dead objects alive as a chance hit of the
+// conservative scan.
+//
+// A test that wants to show that a weak reference does NOT hold its target
+// therefore hangs on the frame layout of the collector: if the runtime
+// grows, it tips over. That is exactly what happened in round 47
+// (tests/520, 535) and again in round 49 (tests/833, lib/dom). Whoever
+// wants to rule that out calls this HERE -- from their own frame, BEFORE
+// `gc_collect()`.
+// This is not a trick but the honest condition: a conservative collector is
+// allowed to keep dead objects. Whoever wants to prove the opposite has to
+// make sure first that really no bit pattern points at them any more.
+fn gc_stack_clean() {
+    __gc_scrub_deep(3)
+}
+
+// ROUND 49 -- AN ADDRESS BELOW OUR OWN FRAME.
+//
+// THE FINDING: up to here the conservative stack scan began at the address
+// of a LOCAL variable (`var anchor`). That is NOT the lower edge of the
+// frame. The register allocation (regalloc.rs::layout) lays out the save
+// slots of the callee saved registers LAST -- so they get the largest
+// distances from `rbp` and thereby lie BELOW every alloca, below `anchor`
+// too. But exactly there stands the `rbx`/`r12`...`r15` of the CALLER, and
+// if its only reference to an object lay in such a register, the object was
+// invisible to the collector and got collected although it was still in
+// use.
+//
+// It became visible in round 49 at tests/820 (only `release-fast`, so only
+// with register allocation): a rearrangement in `gc_collect` shifted the
+// allocation, and the program died with a segmentation fault. The bug is
+// OLDER than this round; it just had not been triggered before.
+//
+// The self call is deliberate -- a recursive function is NEVER inlined
+// (inline.rs), so its frame really lies BELOW the one of the caller. The same
+// technique is what `__gc_scrub_deep` has used since round 4.
+// The stack bottom of THIS thread. Without threads that is the one of the
+// main thread (S_BOTTOM). With threads exactly that would be wrong: a thread
+// that leads the collection would then scan from ITS stack pointer to the
+// bottom of the MAIN thread -- straight through unmapped memory. Measured:
+// a segmentation fault at the first cycle a side thread starts.
+fn __gc_own_bottom(st: u64) -> u64 {
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return __gc_ld64(st + S_BOTTOM)
+    }
+    let b: u64 = __gc_ld64(tcb + FT_BOTTOM)
+    if b == 0 {
+        return __gc_ld64(st + S_BOTTOM)
+    }
+    return b
+}
+
+// ROUND 79 -- THE address of a local, and on purpose. This is how the
+// collector finds the current stack pointer without inline assembly: the
+// address of a frame slot of the innermost frame is a lower BOUND for the
+// live part of the stack. It is used as a bound for the conservative scan
+// and never dereferenced (SPEC 3.5.3). The escape analysis of round 79
+// cannot see that and says so; the exception is written down here rather
+// than the check being weakened (docs/ROUND79.md 3).
+#[allow_escape]
+fn __gc_sp_below(n: u64) -> u64 {
+    var a: u64 = 0
+    if n > 0 {
+        return __gc_sp_below(n - 1)
+    }
+    return (&a) as u64
+}
+
+fn __gc_collect_now() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_INIT) != 1 {
+        return 0
+    }
+    let t0: u64 = __gc_now_ns()
+    __gc_st64(st + S_MLEN, 0)
+    __gc_st64(st + S_OVERFLOW, 0)
+    // Roots 1: the callee saved registers (saved by the code generator).
+    // Round 49: under the spin lock, because there is only ONE save area and a
+    // parking thread writes into the same one -- and from `+ S_REGS` on,
+    // because `__gc_save_regs()` returns the address of the block, not the one
+    // of the area (the finding stands at S_REGS).
+    __thread_lock_raw(st + S_REGSPERRE)
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __thread_unlock_raw(st + S_REGSPERRE)
+    // Roots 2: the stack, conservatively, from here to the stack bottom.
+    let sp: u64 = __gc_sp_below(0)
+    __gc_scan(sp, __gc_own_bottom(st))
+    // Roots 3 (round 47): registered areas outside the GC heap.
+    __gc_roots_scan()
+    // Roots 4 (round 49): EVERY other thread -- its saved registers and its
+    // stack. The world is stopped here.
+    __gc_threads_scan()
+    __gc_drain()
+    __gc_catchup()
+    __gc_sweep()
+    // Flip the white parity: every survivor (black) is white from now on -- the
+    // next cycle starts without resetting marks in the heap.
+    __gc_st64(st + S_PAR, 2 - __gc_ld64(st + S_PAR))
+    let t1: u64 = __gc_now_ns()
+    var duration: u64 = 0
+    if t1 > t0 {
+        duration = t1 - t0
+    }
+    __gc_st64(st + S_RUNS, __gc_ld64(st + S_RUNS) + 1)
+    __gc_st64(st + S_PAUSE_LAST, duration)
+    if duration > __gc_ld64(st + S_PAUSE_MAX) {
+        __gc_st64(st + S_PAUSE_MAX, duration)
+    }
+    __gc_st64(st + S_PAUSE_TOTAL, __gc_ld64(st + S_PAUSE_TOTAL) + duration)
+    // Round 41: the FULL run is type 4. Before, it only booked into
+    // S_PAUSE_MAX and turned up in no slice class -- which made the global
+    // maximum (11.8 ms) larger than every per type maximum (3.6 ms) and
+    // nobody could see where it came from.
+    let tf: u64 = st + S_PMAX_START + 4 * 8
+    if duration > __gc_ld64(tf) {
+        __gc_st64(tf, duration)
+    }
+    __gc_st64(st + S_FULL, __gc_ld64(st + S_FULL) + 1)
+    __gc_st64(st + S_SINCE, 0)
+    // The next collection run when as much has been allocated since as is
+    // alive (at least MIN_LIMIT) -- that keeps the consumption bounded.
+    // Capped at the top (MAX_LIMIT): if the live set is collapsing right now
+    // (a phase change), the old limit was huge and there was NEVER another
+    // collection -- the dead chunks of the old phase stayed mapped (measured
+    // in the phase test: 300 rounds, 3.8 MiB allocated, 0 runs).
+    var limit: u64 = __gc_ld64(st + S_LIVEBYTES)
+    if limit < MIN_LIMIT {
+        limit = MIN_LIMIT
+    }
+    if limit > MAX_LIMIT {
+        limit = MAX_LIMIT
+    }
+    __gc_st64(st + S_LIMIT, limit)
+    return duration
+}
+
+// --------------------------------------------------- The incremental cycle
+
+// Book one slice: the pause counters now measure the longest INTERRUPTION
+// (one slice), no longer the whole cycle.
+fn __gc_bucket(duration: u64) -> u64 {
+    var i: u64 = 0
+    var g: u64 = 1000
+    while i + 1 < HIST_FAECHER {
+        if duration < g {
+            break
+        }
+        g = g * 2
+        i = i + 1
+    }
+    return i
+}
+
+// The same interruption, but booked in pure CPU time of the thread.
+fn __gc_chist_record(duration: u64) {
+    let st: u64 = __gc_state() as u64
+    let f: u64 = st + S_CHIST + __gc_bucket(duration) * 8
+    __gc_st64(f, __gc_ld64(f) + 1)
+    if duration > __gc_ld64(st + S_CSTOPMAX) {
+        __gc_st64(st + S_CSTOPMAX, duration)
+    }
+}
+
+fn __gc_hist_record(duration: u64, ty: u64) {
+    let st: u64 = __gc_state() as u64
+    let i: u64 = __gc_bucket(duration)
+    let f: u64 = st + S_HIST + (ty * HIST_FAECHER + i) * 8
+    __gc_st64(f, __gc_ld64(f) + 1)
+    // Type 6 is the sum of the SLICES; the whole interruption (type 7)
+    // contains the same time once more and must not count twice there.
+    if ty < 6 {
+        let g2: u64 = st + S_HIST + (6 * HIST_FAECHER + i) * 8
+        __gc_st64(g2, __gc_ld64(g2) + 1)
+    }
+    if ty == 7 {
+        if duration > __gc_ld64(st + S_STOPMAX) {
+            __gc_st64(st + S_STOPMAX, duration)
+        }
+    }
+}
+
+// A diagnostic: how many INDIVIDUAL slices fell into bucket `i` (see S_HIST).
+// ty 0..4 as in gc_pause_max_ty, ty 5 = catching up after a mark stack
+// overflow (in the pause maximum it sits under type 1), ty 6 = all slices
+// together.
+fn gc_hist(ty: u64, i: u64) -> u64 {
+    if i >= HIST_FAECHER {
+        return 0
+    }
+    if ty >= HIST_TYPES {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_HIST + (ty * HIST_FAECHER + i) * 8)
+}
+
+// Null the histogram (measurements without the build up phase).
+fn gc_hist_reset() {
+    let st: u64 = __gc_state() as u64
+    var i: u64 = 0
+    while i < HIST_FAECHER * HIST_TYPES {
+        __gc_st64(st + S_HIST + i * 8, 0)
+        i = i + 1
+    }
+    __gc_st64(st + S_STOPMAX, 0)
+    var j: u64 = 0
+    while j < HIST_FAECHER {
+        __gc_st64(st + S_CHIST + j * 8, 0)
+        j = j + 1
+    }
+    __gc_st64(st + S_CSTOPMAX, 0)
+}
+
+// A histogram of the whole interruption in PURE CPU TIME (buckets as in
+// gc_hist). Only filled when gc_set_cpu_clock(1) has been set.
+fn gc_chist(i: u64) -> u64 {
+    if i >= HIST_FAECHER {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_CHIST + i * 8)
+}
+
+fn gc_cpu_stop_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_CSTOPMAX)
+}
+
+// Turn the second clock on (CPU time instead of wall clock). It costs two
+// extra system calls per allocation site WITH collector work, which is why
+// it is off by default.
+fn gc_set_cpu_clock(an: u64) {
+    __gc_st64(__gc_state() as u64 + S_CPUUHR, an)
+}
+
+// The longest WHOLE interruption at an allocation site (type 7).
+fn gc_stop_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STOPMAX)
+}
+
+fn __gc_pause_record(t0: u64, ty: u64) {
+    __gc_pause_record_h(t0, ty, ty)
+}
+
+// Like __gc_pause_record, but the histogram books onto `htyp` -- so that
+// the catch up (type 1 in the maxima) becomes separately visible there.
+fn __gc_pause_record_h(t0: u64, ty: u64, htyp: u64) {
+    let st: u64 = __gc_state() as u64
+    let t1: u64 = __gc_now_ns()
+    var duration: u64 = 0
+    if t1 > t0 {
+        duration = t1 - t0
+    }
+    __gc_st64(st + S_PAUSE_LAST, duration)
+    if duration > __gc_ld64(st + S_PZYK) {
+        __gc_st64(st + S_PZYK, duration)
+    }
+    if duration > __gc_ld64(st + S_PAUSE_MAX) {
+        __gc_st64(st + S_PAUSE_MAX, duration)
+    }
+    __gc_st64(st + S_PAUSE_TOTAL, __gc_ld64(st + S_PAUSE_TOTAL) + duration)
+    let tfield: u64 = st + S_PMAX_START + ty * 8
+    if duration > __gc_ld64(tfield) {
+        __gc_st64(tfield, duration)
+    }
+    __gc_hist_record(duration, htyp)
+}
+
+// Round 47: one finalizer slice. It gets no bucket of its own in the per
+// type maxima (only the five collector sections stand there) but a field of
+// its own, S_PMAX_FIN -- and in the histogram it counts under type 6
+// ("all slices"), because it is one.
+fn __gc_pause_record_fin(t0: u64) {
+    let st: u64 = __gc_state() as u64
+    let t1: u64 = __gc_now_ns()
+    var duration: u64 = 0
+    if t1 > t0 {
+        duration = t1 - t0
+    }
+    __gc_st64(st + S_PAUSE_LAST, duration)
+    if duration > __gc_ld64(st + S_PZYK) {
+        __gc_st64(st + S_PZYK, duration)
+    }
+    if duration > __gc_ld64(st + S_PAUSE_MAX) {
+        __gc_st64(st + S_PAUSE_MAX, duration)
+    }
+    __gc_st64(st + S_PAUSE_TOTAL, __gc_ld64(st + S_PAUSE_TOTAL) + duration)
+    if duration > __gc_ld64(st + S_PMAX_FIN) {
+        __gc_st64(st + S_PMAX_FIN, duration)
+    }
+    __gc_hist_record(duration, 6)
+}
+
+// Diagnostic access: the longest pause per slice type (0 start, 1 mark,
+// 2 sweep, 3 end, 4 full).
+fn gc_overflows() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_NOV)
+}
+
+// The number of FULL collection runs (round 41).
+fn gc_full_runs() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FULL)
+}
+
+fn gc_pause_max_ty(ty: u64) -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PMAX_START + ty * 8)
+}
+
+// Begin a cycle: the only atomic root work -- scan the registers and the
+// stack, fill the grey set. That is the shortest conceivable pause; the
+// tracing and sweeping proper run in slices after it.
+fn __gc_cycle_start() {
+    let st: u64 = __gc_state() as u64
+    let t0: u64 = __gc_now_ns()
+    __gc_st64(st + S_MLEN, 0)
+    __gc_st64(st + S_OVERFLOW, 0)
+    __gc_scrub()
+    __thread_lock_raw(st + S_REGSPERRE)
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __thread_unlock_raw(st + S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_scan(sp, __gc_own_bottom(st))
+    // Roots 3 (round 47): registered areas outside the GC heap.
+    __gc_roots_scan()
+    // Roots 4 (round 49): EVERY other thread. The world is stopped here.
+    __gc_threads_scan()
+    __gc_st64(st + S_SCHRT, __gc_ld64(st + S_SINCE))
+    __gc_st64(st + S_PZYK, 0)
+    __gc_st64(st + S_PHASE, 1)
+    __gc_pause_record(t0, 0)
+}
+
+// Finish a cycle (after the last sweep step): trace the remaining grey ones
+// -- created by insertion barriers and fresh allocations during the sweep --
+// take over the counters, flip the parity, set a new limit.
+fn __gc_cycle_end() {
+    let st: u64 = __gc_state() as u64
+    let t0: u64 = __gc_now_ns()
+    __gc_drain()
+    __gc_catchup()
+    __gc_drain()
+    __gc_st64(st + S_LIVE, __gc_ld64(st + S_SWLEB))
+    __gc_st64(st + S_LIVEBYTES, __gc_ld64(st + S_SWLEBB))
+    var limit: u64 = __gc_ld64(st + S_LIVEBYTES)
+    if limit < MIN_LIMIT {
+        limit = MIN_LIMIT
+    }
+    if limit > MAX_LIMIT {
+        limit = MAX_LIMIT
+    }
+    __gc_st64(st + S_LIMIT, limit)
+    __gc_st64(st + S_SINCE, 0)
+    __gc_st64(st + S_SCHRT, 0)
+    __gc_st64(st + S_RUNS, __gc_ld64(st + S_RUNS) + 1)
+    __gc_st64(st + S_PAR, 2 - __gc_ld64(st + S_PAR))
+    __gc_st64(st + S_PHASE, 0)
+    __gc_pause_record(t0, 3)
+    __gc_st64(st + S_PAUSE_LAST, __gc_ld64(st + S_PZYK))
+}
+
+// One step of the running cycle, called at an allocation site.
+// ROUND 91 -- THE RESCAN OF THE ROOTS BEFORE THE SWEEP.
+//
+// The incremental cycle scans the stack and the registers ONCE, at
+// `__gc_cycle_start`. The Dijkstra insertion barrier then keeps the
+// invariant for everything that is WRITTEN into a heap field afterwards.
+// It does NOT keep it for the other direction, and that is the hole this
+// function closes:
+//
+//   1. object X is white and hangs only in the heap field F
+//   2. the mutator READS X out of F -- X now lives in a register or in a
+//      stack slot, and neither is looked at again during this cycle
+//   3. the mutator overwrites F (or removes the element from the vector)
+//   4. nothing has been written INTO a heap field, so no barrier fired;
+//      X stays white and the sweep releases it -- while the mutator is
+//      still working with it
+//
+// `lib/js/gen.fi` does exactly this in `realm_job_shift`: it reads the
+// reaction out of `r.jobs` and removes it from the vector in the next
+// line. Under load, three runs in ten died of it (a `Gc[JsObj]` whose
+// block had already been handed out again, so `as?` was reading a type id
+// of 4).
+//
+// The fix is the one every incremental collector with a conservative stack
+// needs: at the END of the marking phase, once the mark stack has run
+// empty, look at the roots A SECOND TIME and trace what turned up. The
+// world stands still here (both callers run between `__gc_stw_an` and
+// `__gc_stw_out`), so one pass is enough -- the stack cannot change under
+// us. It costs one stack scan per cycle, not one per pointer write, which
+// is why this is cheaper than the deletion barrier (Yuasa) that would be
+// the other way to close the same hole.
+fn __gc_roots_rescan() {
+    let st: u64 = __gc_state() as u64
+    __thread_lock_raw(st + S_REGSPERRE)
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __thread_unlock_raw(st + S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_scan(sp, __gc_own_bottom(st))
+    __gc_roots_scan()
+    __gc_threads_scan()
+    __gc_drain()
+    __gc_catchup()
+}
+
+fn __gc_cycle_step() {
+    let st: u64 = __gc_state() as u64
+    let phase: u64 = __gc_ld64(st + S_PHASE)
+    if phase == 1 {
+        // A marking slice: trace up to SLICE_TRACE objects.
+        __gc_diag_inc(S_D_SCH_MARK)
+        let t0: u64 = __gc_now_ns()
+        var n: u64 = __gc_ld64(st + S_SLICE)
+        if n == 0 {
+            n = SLICE_TRACE
+        }
+        var budget: u64 = __gc_ld64(st + S_ZBUDGET)
+        if budget == 0 {
+            budget = TIME_BUDGET_NS
+        }
+        var probe: u64 = TIME_PROBE
+        while __gc_ld64(st + S_MLEN) > 0 && n > 0 {
+            let len: u64 = __gc_ld64(st + S_MLEN) - 1
+            __gc_st64(st + S_MLEN, len)
+            let obj: u64 = __gc_ld64(__gc_ld64(st + S_MSTACK) + len * 8)
+            __gc_trace(obj)
+            n = n - 1
+            probe = probe - 1
+            if probe == 0 {
+                probe = TIME_PROBE
+                if __gc_now_ns() - t0 >= budget {
+                    n = 0
+                }
+            }
+        }
+        __gc_pause_record(t0, 1)
+        if __gc_ld64(st + S_MLEN) == 0 {
+            // An overflow of the mark stack: catch up on the grey blocks in the heap
+            // (atomic, but only when the stack overflowed -- rare).
+            if __gc_ld64(st + S_OVERFLOW) != 0 {
+                let t1: u64 = __gc_now_ns()
+                __gc_catchup()
+                __gc_pause_record_h(t1, 1, 5)
+            }
+            if __gc_ld64(st + S_MLEN) == 0 {
+                // ROUND 91: the roots a second time before anything is
+                // released -- see __gc_roots_rescan.
+                __gc_roots_rescan()
+            }
+            if __gc_ld64(st + S_MLEN) == 0 {
+                __gc_sweep_init()
+                __gc_st64(st + S_PHASE, 2)
+            }
+        }
+        return
+    }
+    if phase == 2 {
+        __gc_diag_inc(S_D_SCH_SWEEP)
+        let t0: u64 = __gc_now_ns()
+        let done: u64 = __gc_sweep_step(t0)
+        __gc_pause_record(t0, 2)
+        if done == 1 {
+            // Round 47: if finalizers are waiting, its own phase 3 comes in between.
+            if __gc_ld64(st + S_FINQ) != 0 {
+                __gc_st64(st + S_PHASE, 3)
+            } else {
+                __gc_cycle_end()
+            }
+        }
+        return
+    }
+    if phase == 3 {
+        if __gc_fin_slice() == 1 {
+            __gc_cycle_end()
+        }
+        return
+    }
+}
+
+// End a running cycle in one go (the exhaustion fallback and gc_collect):
+// marking done, sweeping done, wrap up.
+fn __gc_cycle_done() {
+    let st: u64 = __gc_state() as u64
+    let phase: u64 = __gc_ld64(st + S_PHASE)
+    if phase == 1 {
+        __gc_drain()
+        __gc_catchup()
+        // ROUND 91: same place, the other way into the sweep.
+        __gc_roots_rescan()
+        __gc_sweep_init()
+        __gc_st64(st + S_PHASE, 2)
+    }
+    if __gc_ld64(st + S_PHASE) == 2 {
+        while __gc_sweep_step(0) == 0 {
+        }
+        __gc_st64(st + S_PHASE, 3)
+    }
+    if __gc_ld64(st + S_PHASE) == 3 {
+        __gc_fin_all()
+        __gc_cycle_end()
+    }
+}
+
+// -------------------------------------------------------------- Allocation
+
+// The cold branch of the allocation. It lives in a function of its OWN so
+// that `__gc_alloc_raw` gets exactly one extra block and not two: measured,
+// the two blocks there cost 3.3 million instructions, because the register
+// allocation tipped over in the hottest function of the collector.
+fn __gc_alloc_locked(st: u64) {
+    if __gc_ld64(st + S_INIT) == 0 {
+        __gc_abort(70)
+    }
+    __gc_error_fin_alloc()
+}
+
+// Returns the payload address (= the value of a `Gc[T]`) or 0.
+// On exhaustion: FIRST a collection run, THEN the failure.
+fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
+    let st: u64 = __gc_state() as u64
+    // S_INIT: 0 = gc_init() is missing, 1 = ready, 2 = a finalizer is running.
+    // The lock sits DELIBERATELY inside this one check, which is there
+    // anyway -- a finalizer that allocates would start a collection run out
+    // of a collection run (reentrancy), and otherwise it costs every
+    // allocation path one extra memory access.
+    if __gc_ld64(st + S_INIT) != 1 {
+        __gc_alloc_locked(st)
+        return 0 as *mut u8
+    }
+    // ROUND 49. Single threaded this costs exactly one call that returns
+    // immediately (one memory access, one branch). Multi threaded it contains
+    // the safepoint and EITHER a finished block from the free list of this
+    // thread (then we are done already, entirely without a lock) OR the GC lock
+    // once taken. The body below stays line for line the old one --
+    // deliberately: it determines the frame layout, and that determines, under
+    // the conservative scan, which dead objects survive by chance.
+    let upfront: u64 = __gc_alloc_in(st, tid, size)
+    if upfront != 0 {
+        return upfront as *mut u8
+    }
+    let class: u64 = __gc_class_for(size)
+    // Round 44: measure the WHOLE interruption at this allocation site.
+    // A frame does not see the single slice but the sum of what runs here
+    // one after another (cycle start AND slice AND wrap up).
+    // The clock is read only when there is collector work at all.
+    var tstop: u64 = 0
+    var tcpu: u64 = 0
+    if __gc_ld64(st + S_PHASE) == 0 && __gc_ld64(st + S_SINCE) >= __gc_ld64(st + S_LIMIT) {
+        tstop = __gc_now_ns()
+        if __gc_ld64(st + S_CPUUHR) != 0 {
+            tcpu = __gc_cpu_ns()
+        }
+        __gc_stw_an()
+        if __gc_ld64(st + S_HEAP) < __gc_ld64(st + S_INKRAB) {
+            __gc_scrub()
+            __gc_collect_now()
+        } else {
+            __gc_cycle_start()
+        }
+        __gc_stw_out()
+    }
+    if __gc_ld64(st + S_PHASE) != 0 {
+        if tstop == 0 {
+            tstop = __gc_now_ns()
+            if __gc_ld64(st + S_CPUUHR) != 0 {
+                tcpu = __gc_cpu_ns()
+            }
+        }
+        __gc_stw_an()
+        __gc_cycle_step()
+        __gc_stw_out()
+    }
+    var b: u64 = __gc_get_block(class, size)
+    if b == 0 {
+        // Collect first, fail after (DESIGN_GOALS 2): bring a running cycle to
+        // an end, otherwise force a complete run.
+        if tstop == 0 {
+            tstop = __gc_now_ns()
+            if __gc_ld64(st + S_CPUUHR) != 0 {
+                tcpu = __gc_cpu_ns()
+            }
+        }
+        __gc_stw_an()
+        if __gc_ld64(st + S_PHASE) != 0 {
+            __gc_cycle_done()
+        } else {
+            __gc_scrub()
+            __gc_collect_now()
+        }
+        __gc_stw_out()
+        b = __gc_get_block(class, size)
+    }
+    if tstop != 0 {
+        let te: u64 = __gc_now_ns()
+        var dstop: u64 = 0
+        if te > tstop {
+            dstop = te - tstop
+        }
+        __gc_hist_record(dstop, 7)
+        if tcpu != 0 {
+            let ce: u64 = __gc_cpu_ns()
+            var dcpu: u64 = 0
+            if ce > tcpu {
+                dcpu = ce - tcpu
+            }
+            __gc_chist_record(dcpu)
+        }
+    }
+    if b == 0 {
+        __gc_alloc_out(st)
+        return 0 as *mut u8
+    }
+    let series: u64 = __gc_ld64(st + S_SERIES) + 1
+    __gc_st64(st + S_SERIES, series)
+    __gc_st32(b, tid as u32)
+    // Objects freshly allocated during a cycle are GREY and go onto the mark
+    // stack: the stack is not scanned again, otherwise an object that lives
+    // only on the stack could be swept before it was ever attached to a heap
+    // field. While idle: the current white.
+    __gc_diag_inc(S_D_ALLOK)
+    if __gc_ld64(st + S_PHASE) == 0 {
+        __gc_st32(b + 4, __gc_ld64(st + S_PAR) as u32)
+    } else {
+        __gc_diag_inc(S_D_GRAU)
+        __gc_st32(b + 4, 1)
+        __gc_mark_push(b + HEADER)
+    }
+    __gc_st64(b + 8, series)
+    // Null the payload: a half filled object has to be traceable at any moment
+    // (a field initialization can itself allocate again).
+    let obj: u64 = b + HEADER
+    var i: u64 = 0
+    while i < size {
+        __gc_st64(obj + i, 0)
+        i = i + 8
+    }
+    let block: u64 = __gc_ld64(st + S_BLOCKGROESSE)
+    __gc_st64(st + S_SINCE, __gc_ld64(st + S_SINCE) + block)
+    __gc_st64(st + S_TOTAL, __gc_ld64(st + S_TOTAL) + block)
+    __gc_alloc_out(st)
+    return obj as *mut u8
+}
+
+// Entering the allocation (round 49).
+//   single threaded -> 0, nothing else
+//   multi threaded  -> a safepoint; after it either a FINISHED block from
+//                 the free list of this thread (return value != 0, NO lock
+//                 taken) or the GC lock once taken (return value 0).
+fn __gc_alloc_in(st: u64, tid: u64, size: u64) -> u64 {
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return 0
+    }
+    __thread_safepoint()
+    if __gc_ld64(st + S_LOCAL) != 0 {
+        let p: u64 = __gc_alloc_local(st, tid, size)
+        if p != 0 {
+            return p
+        }
+    }
+    __thread_lock(st + S_LOCK)
+    return 0
+}
+
+fn __gc_alloc_out(st: u64) {
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    __thread_unlock(st + S_LOCK)
+}
+
+// ROUND 49, variant B -- the allocation WITHOUT a lock.
+//
+// It is allowed exactly when no collector work is pending: phase 0, and the
+// allocation limit has not been reached yet. The block comes from the free
+// list of THIS thread, otherwise it would not be its property.
+//
+// Why that is right even with other threads running: a phase changes ONLY
+// while the world is stopped, and the world stops only when no thread is
+// RUNNING any more. This thread is RUNNING throughout the whole function --
+// so between the check and the finished block no phase can change and no
+// white parity can flip. An object created here is white and hangs on the
+// stack or in a register of this thread; both are scanned at the next stop,
+// because the collector waits until this thread parks and scans it ONLY
+// THEN.
+//
+// The three shared counters (serial number, bytes since the last run, total
+// bytes) run atomically. Without that the numbers would simply be wrong
+// under concurrency.
+fn __gc_alloc_local(st: u64, tid: u64, size: u64) -> u64 {
+    if __gc_ld64(st + S_PHASE) != 0 {
+        return 0
+    }
+    if __gc_ld64(st + S_SINCE) >= __gc_ld64(st + S_LIMIT) {
+        return 0
+    }
+    let class: u64 = __gc_class_for(size)
+    if class >= CLASSES {
+        return 0
+    }
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return 0
+    }
+    let b: u64 = __thread_block_local(tcb, class)
+    if b == 0 {
+        return 0
+    }
+    let series: u64 = __atomic_add((st + S_SERIES) as *mut u64, 1) + 1
+    __gc_st32(b, tid as u32)
+    __gc_st32(b + 4, __gc_ld64(st + S_PAR) as u32)
+    __gc_st64(b + 8, series)
+    let obj: u64 = b + HEADER
+    var i: u64 = 0
+    while i < size {
+        __gc_st64(obj + i, 0)
+        i = i + 8
+    }
+    let block: u64 = HEADER + __gc_classes_bytes(class)
+    __atomic_add((st + S_SINCE) as *mut u64, block)
+    __atomic_add((st + S_TOTAL) as *mut u64, block)
+    __gc_diag_inc(S_D_ALLOK)
+    return obj
+}
+
+fn __gc_get_block(class: u64, size: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    // Round 49, variant B: while the lock is being held anyway, fetch a
+    // BATCH of blocks into the free list of this thread. The next call is then
+    // served without a lock in __gc_alloc_local.
+    if __gc_ld64(st + S_LOCAL) != 0 && __gc_ld64(st + S_MULTI) != 0 {
+        let bl: u64 = __gc_get_block_local(st, class, size)
+        if bl != 0 {
+            return bl
+        }
+    }
+    if class >= CLASSES {
+        let c: u64 = __gc_chunk_new(class, size)
+        if c == 0 {
+            return 0
+        }
+        __gc_st64(st + S_BLOCKGROESSE, __gc_ld64(c + 16))
+        return c + CHUNK_HEADER
+    }
+    let header: u64 = st + S_FREE + class * 8
+    var b: u64 = __gc_ld64(header)
+    if b == 0 {
+        if __gc_chunk_new(class, size) == 0 {
+            return 0
+        }
+        b = __gc_ld64(header)
+        if b == 0 {
+            return 0
+        }
+    }
+    __gc_st64(header, __gc_ld64(b + HEADER))
+    __gc_st64(st + S_BLOCKGROESSE, HEADER + __gc_classes_bytes(class))
+    return b
+}
+
+// Refill and deliver a block right away (variant B). 0 = not possible.
+fn __gc_get_block_local(st: u64, class: u64, size: u64) -> u64 {
+    if class >= CLASSES || __gc_ld64(st + S_PHASE) != 0 {
+        return 0
+    }
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return 0
+    }
+    __thread_refill(tcb, class, size)
+    let b: u64 = __thread_block_local(tcb, class)
+    if b == 0 {
+        return 0
+    }
+    __gc_st64(st + S_BLOCKGROESSE, HEADER + __gc_classes_bytes(class))
+    return b
+}
+
+// --------------------------------------------------------- Weak references
+
+struct GcWeakRaw {
+    __p: u64,
+    __s: u64,
+}
+
+// `weak(g)`: store the pointer OBSCURED, so that the conservative stack scan
+// does not read it as a strong root, plus the serial number of the target block.
+fn __gc_weak_raw(p: *mut u8) -> GcWeakRaw {
+    let a: u64 = p as u64
+    if a == 0 {
+        return GcWeakRaw { __p: 0, __s: 0 }
+    }
+    return GcWeakRaw { __p: a ^ WEAK_XOR, __s: __gc_ld64(a - HEADER + 8) }
+}
+
+// `strong(w)`: the upgrade. The null value if the target was collected -- the
+// serial number guards against a block that has been reused in the meantime.
+fn __gc_strong_raw(w: GcWeakRaw) -> *mut u8 {
+    if w.__p == 0 {
+        return 0 as *mut u8
+    }
+    let a: u64 = w.__p ^ WEAK_XOR
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return 0 as *mut u8
+    }
+    if b + HEADER != a {
+        return 0 as *mut u8
+    }
+    if __gc_ld32(b) == 0 {
+        return 0 as *mut u8
+    }
+    // Round 47: a block that waits for its finalizer or is running through it
+    // right now is DEAD. It must never become strong again -- otherwise
+    // `strong()` would be the back door to resurrection.
+    if (__gc_ld32(b + 4) & F_WART) != 0 {
+        return 0 as *mut u8
+    }
+    if __gc_ld64(b + 8) != w.__s {
+        return 0 as *mut u8
+    }
+    return a as *mut u8
+}
+
+// -------------------------------------------------------- Checked downcast
+
+fn __gc_as_raw(p: *mut u8, target: u64) -> *mut u8 {
+    let a: u64 = p as u64
+    if a == 0 {
+        return 0 as *mut u8
+    }
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABLE)
+    var tid: u64 = __gc_ld32(a - HEADER) as u64
+    var depth: u64 = 0
+    while tid != 0 && depth < 64 {
+        if tid == target {
+            return p
+        }
+        if tid > __gc_ld64(tab) {
+            return 0 as *mut u8
+        }
+        tid = __gc_ld64(tab + 8 + (tid - 1) * 64 + 8)
+        depth = depth + 1
+    }
+    return 0 as *mut u8
+}
+
+// --------------------------------------------------- The insertion barrier
+
+// The insertion barrier sits at exactly this place: the write of a Gc
+// pointer into a heap field. The collector of this stage stops the world
+// (mark-sweep, not incremental), so nothing has to be colored here; it is
+// counted anyway, so that the path is provably taken (gc_barriers()).
+fn __gc_barrier(field: *mut u8, value: *mut u8) {
+    let st: u64 = __gc_state() as u64
+    if (field as u64) == 0 && (value as u64) == 0 {
+        return
+    }
+    __gc_st64(st + S_BARRIEREN, __gc_ld64(st + S_BARRIEREN) + 1)
+    // The incremental cycle: a Dijkstra insertion barrier. If a pointer is
+    // written into a heap field during marking/sweeping, the target turns
+    // grey -- otherwise a white object could disappear behind an already
+    // traced (black) one without ever having been seen.
+    if __gc_ld64(st + S_PHASE) != 0 {
+        __gc_barrier_cycle(st, value)
+    }
+}
+
+// The part of the barrier that runs ONLY during a cycle. It lives in a
+// function of its own so that `__gc_barrier` stays small enough to be
+// inlined (measured: otherwise every pointer write costs a real
+// call).
+//
+// RESURRECTION: while a finalizer runs, S_INIT stands at 2. A Gc pointer
+// that is written into a heap field now could pull the object that is
+// dying right then back into the live graph -- but the block is about to
+// be released. So: no silent pointer into nothing, but a visible
+// abort.
+fn __gc_barrier_cycle(st: u64, value: *mut u8) {
+    if __gc_ld64(st + S_INIT) != 1 {
+        __gc_error_fin_again()
+    }
+    // Round 49: coloring means reading the chunk list and pushing onto the mark
+    // stack -- both belong under the GC lock as soon as there is more than one
+    // thread. The check on S_INIT stands DELIBERATELY in front of it: during a
+    // finalizer this thread already holds the lock, and taking it a second time
+    // would be a self deadlock. So the abort comes before the locking.
+    if __gc_ld64(st + S_MULTI) != 0 {
+        __thread_lock(st + S_LOCK)
+        __gc_mark(value as u64)
+        __thread_unlock(st + S_LOCK)
+        return
+    }
+    __gc_mark(value as u64)
+}
+
+// -------------------------------------------------------------- Finalizers
+//
+// THE SEMANTICS (binding; the reasoning is in docs/ROUND47.md, SPEC 3.5.3 `S4`):
+//
+//  1. REGISTRATION per OBJECT, not per class: `gc_finalizer_set(p, kind)`
+//     enters a CLEANUP KIND (1..16777215) into the state word of the block
+//     header. No side table, no allocation, not one extra byte per object --
+//     and recognizing it during the sweep costs only the test of a bit that
+//     is read there anyway.
+//
+//  2. WHAT GETS CALLED: the function `__gc_finalize(kind: u64, p: *mut u8)`.
+//     If the program declares it in its ROOT FILE itself, the compiler takes
+//     that one; otherwise it adds an empty default (`gc.rs::runtime_source`).
+//     In stage 0 Firn has no function pointers -- a dispatch function with an
+//     id is the honest equivalent and needs no indirect call in the code
+//     generator.
+//
+//  3. THE MOMENT: AFTER the collector has recognized the object as
+//     unreachable. The cycle has a phase 3 of its own for it, which runs in
+//     slices like marking and sweeping. A finalizer itself is NOT interrupted
+//     -- its run time belongs to the program, not to the collector
+//     (`gc_fin_ns_max()` reports it separately).
+//
+//  4. RESURRECTION IS IMPOSSIBLE -- enforced, not merely requested:
+//       * before the call, ALL `Gc[T]` and `GcWeak[T]` fields of the object
+//         are nulled. A finalizer never sees a pointer to a neighbor object
+//         that may already have been collected in the same run;
+//       * `strong(w)` on the dying object returns 0 (flag F_WART);
+//       * a GC allocation inside a finalizer aborts visibly (code 71),
+//         `gc_collect()` likewise (72) -- so a finalizer cannot tear the
+//         collector open reentrantly;
+//       * writing a Gc pointer into a heap field aborts (73);
+//       * the block is released AS SOON AS the finalizer returns --
+//         no matter what it did.
+//     So there is no Java style resurrection with a second cycle. The price
+//     is named: a finalizer cannot buy its object a longer life, not even
+//     on purpose.
+//
+//  5. THE ORDER: no promise between two objects. The queue follows the sweep
+//     order (chunk list, and inside a chunk from back to front, because new
+//     entries are linked in at the front). Whoever needs an order does not
+//     use a finalizer.
+//
+//  6. AT MOST ONCE per object (flag F_GETAN).
+//
+//  7. A program that registers no finalizer at all pays NOTHING: the branch
+//     in the sweep is entered only when a block really dies AND carries
+//     F_FIN.
+
+fn gc_finalizer_set(p: *mut u8, kind: u64) -> bool {
+    let a: u64 = p as u64
+    if a == 0 {
+        return false
+    }
+    if kind == 0 || kind > KIND_MAX {
+        return false
+    }
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return false
+    }
+    if b + HEADER != a {
+        return false
+    }
+    if __gc_ld32(b) == 0 {
+        return false
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) != 0 {
+        return false
+    }
+    __gc_st32(b + 4, (zw & M_MARK) | F_FIN | ((kind as u32) << 8))
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_FIN_REG, __gc_ld64(st + S_FIN_REG) + 1)
+    return true
+}
+
+// 0 = no finalizer (or it has already run).
+fn gc_finalizer_kind(p: *mut u8) -> u64 {
+    let a: u64 = p as u64
+    if a == 0 {
+        return 0
+    }
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return 0
+    }
+    if b + HEADER != a {
+        return 0
+    }
+    if __gc_ld32(b) == 0 {
+        return 0
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) == 0 {
+        return 0
+    }
+    if (zw & F_GETAN) != 0 {
+        return 0
+    }
+    return (zw as u64) >> 8
+}
+
+// Take the registration back. false if there was none or if the object is
+// already in the queue -- then it is too late, and that is said out loud.
+fn gc_finalizer_delete(p: *mut u8) -> bool {
+    let a: u64 = p as u64
+    if a == 0 {
+        return false
+    }
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return false
+    }
+    if b + HEADER != a {
+        return false
+    }
+    if __gc_ld32(b) == 0 {
+        return false
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) == 0 {
+        return false
+    }
+    if (zw & F_WART) != 0 {
+        return false
+    }
+    __gc_st32(b + 4, zw & M_MARK)
+    return true
+}
+
+// Null every pointer field of the object before its finalizer runs.
+fn __gc_fields_zeros(b: u64) {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABLE)
+    let tid: u64 = __gc_ld32(b) as u64
+    if tid == 0 || tid > __gc_ld64(tab) {
+        return
+    }
+    let obj: u64 = b + HEADER
+    let entry: u64 = tab + 8 + (tid - 1) * 64
+    let ns: u64 = __gc_ld64(entry + 16)
+    let os: u64 = __gc_ld64(entry + 24)
+    var i: u64 = 0
+    while i < ns {
+        __gc_st64(obj + __gc_ld64(os + i * 8), 0)
+        i = i + 1
+    }
+    let nw: u64 = __gc_ld64(entry + 32)
+    let ow: u64 = __gc_ld64(entry + 40)
+    var j: u64 = 0
+    while j < nw {
+        let wp: u64 = obj + __gc_ld64(ow + j * 8)
+        __gc_st64(wp, 0)
+        __gc_st64(wp + 8, 0)
+        j = j + 1
+    }
+}
+
+// Really release a block that has been finalized.
+fn __gc_block_free(b: u64) {
+    let st: u64 = __gc_state() as u64
+    let c: u64 = __gc_chunk_of(b)
+    __gc_st32(b, 0)
+    __gc_st32(b + 4, 0)
+    __gc_st64(b + 8, 0)
+    if c == 0 {
+        return
+    }
+    let class: u64 = __gc_ld64(c + 40)
+    if class < CLASSES {
+        let header: u64 = st + S_FREE + class * 8
+        __gc_st64(b + HEADER, __gc_ld64(header))
+        __gc_st64(header, b)
+    }
+    // During the sweep the waiting block was counted as used (and it WAS) --
+    // now it is not any more.
+    let bl: u64 = __gc_ld64(c + 16)
+    let live: u64 = __gc_ld64(st + S_SWLEB)
+    if live > 0 {
+        __gc_st64(st + S_SWLEB, live - 1)
+    }
+    let lbb: u64 = __gc_ld64(st + S_SWLEBB)
+    if lbb >= bl {
+        __gc_st64(st + S_SWLEBB, lbb - bl)
+    }
+}
+
+// Work off exactly one waiting block. 1 = one ran, 0 = the queue is empty.
+fn __gc_fin_a() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let b: u64 = __gc_ld64(st + S_FINQ)
+    if b == 0 {
+        return 0
+    }
+    __gc_st64(st + S_FINQ, __gc_ld64(b + 8))
+    __gc_st64(st + S_FINQ_N, __gc_ld64(st + S_FINQ_N) - 1)
+    let zw: u32 = __gc_ld32(b + 4)
+    let kind: u64 = (zw as u64) >> 8
+    // F_WART stays set as long as the finalizer runs: `strong()` on this
+    // object therefore keeps returning 0. F_GETAN is added so that it never
+    // comes up a second time, not even after an abort.
+    __gc_st32(b + 4, zw | F_GETAN)
+    __gc_st64(b + 8, 0)
+    __gc_fields_zeros(b)
+    __gc_st64(st + S_INIT, 2)
+    var t0: u64 = 0
+    if __gc_ld64(st + S_FINUHR) != 0 {
+        t0 = __gc_now_ns()
+    }
+    __gc_finalize(kind, (b + HEADER) as *mut u8)
+    if t0 != 0 {
+        let t1: u64 = __gc_now_ns()
+        var d: u64 = 0
+        if t1 > t0 {
+            d = t1 - t0
+        }
+        __gc_st64(st + S_FIN_NS, __gc_ld64(st + S_FIN_NS) + d)
+        if d > __gc_ld64(st + S_FIN_MAX) {
+            __gc_st64(st + S_FIN_MAX, d)
+        }
+    }
+    __gc_st64(st + S_INIT, 1)
+    __gc_st64(st + S_FIN_RUNS, __gc_ld64(st + S_FIN_RUNS) + 1)
+    __gc_block_free(b)
+    return 1
+}
+
+// One finalizer slice (phase 3). 1 = the queue is empty.
+fn __gc_fin_slice() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let t0: u64 = __gc_now_ns()
+    var n: u64 = 0
+    while __gc_fin_a() == 1 {
+        n = n + 1
+        if __gc_now_ns() - t0 >= TIME_BUDGET_NS {
+            break
+        }
+    }
+    if n > 0 {
+        __gc_pause_record_fin(t0)
+    }
+    if __gc_ld64(st + S_FINQ) == 0 {
+        return 1
+    }
+    return 0
+}
+
+// Every waiting block in one go (the atomic path and gc_collect).
+fn __gc_fin_all() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_FINQ) == 0 {
+        return
+    }
+    let ph: u64 = __gc_ld64(st + S_PHASE)
+    __gc_st64(st + S_PHASE, 3)
+    let t0: u64 = __gc_now_ns()
+    var n: u64 = 0
+    while __gc_fin_a() == 1 {
+        n = n + 1
+    }
+    if n > 0 {
+        __gc_pause_record_fin(t0)
+    }
+    __gc_st64(st + S_PHASE, ph)
+}
+
+fn gc_fin_runs() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_RUNS)
+}
+
+fn gc_fin_waiting() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FINQ_N)
+}
+
+fn gc_fin_registered() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_REG)
+}
+
+fn gc_fin_ns_total() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_NS)
+}
+
+fn gc_fin_ns_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_MAX)
+}
+
+// Turn on the clock per individual finalizer (off by default, see
+// S_FINUHR). Without it gc_fin_ns_max/_total stay 0.
+fn gc_set_fin_clock(an: u64) {
+    __gc_st64(__gc_state() as u64 + S_FINUHR, an)
+}
+
+// The longest finalizer slice (collector work plus the finalizers that ran
+// in THE SAME slice).
+fn gc_pause_ns_fin_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PMAX_FIN)
+}
+
+// ----------------------------------------------------- Nulling weak fields
+//
+// SPEC 3.5.3 `S3` demands that a weak reference becomes empty when its
+// target is collected. Up to round 46 that was only APPARENTLY so:
+// `strong(w)` returned 0 because the serial number no longer matched -- but
+// the field still held the old (obscured) bit pattern. Since round 47 the
+// sweep really nulls the weak fields of LIVE objects.
+//
+// What this can NOT do, named openly: a `GcWeak[T]` in a local variable
+// or in an ordinary `struct` outside the GC heap is not touched -- the
+// collector knows the stack only conservatively and has no field map
+// there. The serial number keeps protecting there, and
+// `strong()` returns 0.
+fn __gc_weak_present() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABLE)
+    if tab == 0 {
+        return 0
+    }
+    let n: u64 = __gc_ld64(tab)
+    var i: u64 = 0
+    while i < n {
+        if __gc_ld64(tab + 8 + i * 64 + 32) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// A bitmask of the classes with a weak field (see S_WEAKMASK).
+fn __gc_weak_mask() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABLE)
+    if tab == 0 {
+        return 0
+    }
+    let n: u64 = __gc_ld64(tab)
+    var m: u64 = 0
+    var i: u64 = 0
+    var many: bool = false
+    while i < n {
+        if __gc_ld64(tab + 8 + i * 64 + 32) != 0 {
+            if i < 64 {
+                m = m | (1 << i)
+            } else {
+                many = true
+            }
+        }
+        i = i + 1
+    }
+    // More than 64 classes with a weak field: the mask can no longer represent
+    // that, so every object is looked up (correct, just no longer quite as
+    // cheap). All bits set means: the shift in the sweep always yields 1, no
+    // matter how far it shifts.
+    if many {
+        return 18446744073709551615
+    }
+    return m
+}
+
+// Round 47: put an unreachable block that has a finalizer into the queue.
+// 1 = enqueued (the block stays), 0 = nothing to do.
+// The chaining goes through the serial number word of the dead block -- so
+// the queue needs no memory of its own and cannot
+// overflow.
+fn __gc_fin_enqueue(b: u64) -> u64 {
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_GETAN) != 0 {
+        return 0
+    }
+    let st: u64 = __gc_state() as u64
+    __gc_st32(b + 4, zw | F_WART)
+    __gc_st64(b + 8, __gc_ld64(st + S_FINQ))
+    __gc_st64(st + S_FINQ, b)
+    __gc_st64(st + S_FINQ_N, __gc_ld64(st + S_FINQ_N) + 1)
+    return 1
+}
+
+// Is the target of a weak reference dead in this run?
+fn __gc_weak_dead(a: u64, series: u64, white: u32) -> bool {
+    let tb: u64 = __gc_block_of(a)
+    if tb == 0 {
+        return true
+    }
+    if tb + HEADER != a {
+        return true
+    }
+    if __gc_ld32(tb) == 0 {
+        return true
+    }
+    if __gc_ld64(tb + 8) != series {
+        return true
+    }
+    let zw: u32 = __gc_ld32(tb + 4)
+    if (zw & F_WART) != 0 {
+        return true
+    }
+    if (zw & M_MARK) == white {
+        return true
+    }
+    return false
+}
+
+fn __gc_weak_clean(b: u64, white: u32) {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABLE)
+    let tid: u64 = __gc_ld32(b) as u64
+    if tid == 0 || tid > __gc_ld64(tab) {
+        return
+    }
+    let entry: u64 = tab + 8 + (tid - 1) * 64
+    let nw: u64 = __gc_ld64(entry + 32)
+    if nw == 0 {
+        return
+    }
+    let ow: u64 = __gc_ld64(entry + 40)
+    let obj: u64 = b + HEADER
+    var j: u64 = 0
+    while j < nw {
+        let wp: u64 = obj + __gc_ld64(ow + j * 8)
+        let pv: u64 = __gc_ld64(wp)
+        if pv != 0 {
+            if __gc_weak_dead(pv ^ WEAK_XOR, __gc_ld64(wp + 8), white) {
+                __gc_st64(wp, 0)
+                __gc_st64(wp + 8, 0)
+                __gc_st64(st + S_WEAK_NULL, __gc_ld64(st + S_WEAK_NULL) + 1)
+            }
+        }
+        j = j + 1
+    }
+}
+
+fn gc_weak_zeroed() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_WEAK_NULL)
+}
+
+// ----------------------------------------------------- External root areas
+//
+// A memory area OUTSIDE the GC heap that is allowed to contain `Gc[T]`
+// pointers. Registered areas are scanned conservatively at EVERY cycle
+// start, exactly like the stack.
+//
+// WHAT FOR (round 47): `Arc[T]` puts its value on a heap of its own which
+// the collector does not know. Without registration a `Gc[T]` inside an
+// Arc value would be invisible to the collector and its target would be
+// collected although it is still in use. With registration the division of
+// labor is clear: the counter decides about the ARC BLOCK, the collector
+// about the GC OBJECTS -- neither releases what belongs to the other.
+//
+// THE PRICE, named openly: the start pause of a cycle grows with the total
+// registered size (a conservative scan, 8 bytes per word).
+fn __gc_wroot_slot() -> bool {
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    let cap: u64 = __gc_ld64(st + S_WROOT_CAP)
+    if n < cap {
+        return true
+    }
+    var new: u64 = cap * 2
+    if new == 0 {
+        new = WROOT_START
+    }
+    let p: u64 = __gc_mmap(new * 16)
+    if p == 0 {
+        return false
+    }
+    let old: u64 = __gc_ld64(st + S_WROOT_P)
+    if old != 0 {
+        var i: u64 = 0
+        while i < n * 2 {
+            __gc_st64(p + i * 8, __gc_ld64(old + i * 8))
+            i = i + 1
+        }
+        __gc_munmap(old, cap * 16)
+    }
+    __gc_st64(st + S_WROOT_P, p)
+    __gc_st64(st + S_WROOT_CAP, new)
+    return true
+}
+
+// Round 49: registering and unregistering change the root array and
+// therefore run under the GC lock. Both are rare (once per Arc with Gc content).
+fn gc_root_register(p: *mut u8, bytes: u64) -> bool {
+    let a: u64 = p as u64
+    if a == 0 || bytes == 0 {
+        return false
+    }
+    if !__gc_wroot_slot() {
+        return false
+    }
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    let t: u64 = __gc_ld64(st + S_WROOT_P) + n * 16
+    __gc_st64(t, a)
+    __gc_st64(t + 8, bytes)
+    __gc_st64(st + S_WROOT_N, n + 1)
+    return true
+}
+
+fn gc_root_unregister(p: *mut u8) -> bool {
+    let a: u64 = p as u64
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    let f: u64 = __gc_ld64(st + S_WROOT_P)
+    if f == 0 {
+        return false
+    }
+    var i: u64 = 0
+    while i < n {
+        if __gc_ld64(f + i * 16) == a {
+            __gc_st64(f + i * 16, __gc_ld64(f + (n - 1) * 16))
+            __gc_st64(f + i * 16 + 8, __gc_ld64(f + (n - 1) * 16 + 8))
+            __gc_st64(st + S_WROOT_N, n - 1)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn gc_roots() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_WROOT_N)
+}
+
+fn __gc_roots_scan() {
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    if n == 0 {
+        return
+    }
+    let f: u64 = __gc_ld64(st + S_WROOT_P)
+    var i: u64 = 0
+    while i < n {
+        let a: u64 = __gc_ld64(f + i * 16)
+        __gc_scan(a, a + __gc_ld64(f + i * 16 + 8))
+        i = i + 1
+    }
+}
+
+// ----------------------------------------------------------- The interface
+
+// Once, as the first thing in main: prepare the heap, remember the stack
+// bottom. false = mmap or the stack bottom failed; the caller MUST then
+// fail visibly.
+fn gc_init() -> bool {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_INIT) != 0 {
+        return true
+    }
+    var anchor0: u64 = 0
+    let sp0: u64 = (&anchor0) as u64
+    anchor0 = 0
+    var bottom: u64 = __gc_stack_bottom_maps(sp0)
+    if bottom == 0 {
+        bottom = __gc_stack_bottom()
+    }
+    if bottom == 0 || bottom <= sp0 {
+        return false
+    }
+    let ms: u64 = __gc_mmap(MARK_BYTES)
+    if ms == 0 {
+        return false
+    }
+    __gc_st64(st + S_BOTTOM, bottom)
+    __gc_st64(st + S_MSTACK, ms)
+    __gc_st64(st + S_MKAP, MARK_BYTES / 8)
+    __gc_st64(st + S_MLEN, 0)
+    __gc_st64(st + S_LIMIT, MIN_LIMIT)
+    __gc_st64(st + S_INKRAB, INCR_FROM)
+    // Round 47: determine once whether any class has a weak field at all.
+    // Programs without GcWeak then pay nothing for the nulling.
+    __gc_st64(st + S_HATWEAK, __gc_weak_present())
+    __gc_st64(st + S_WEAKMASK, __gc_weak_mask())
+    __gc_st64(st + S_INIT, 1)
+    return true
+}
+
+// Round 44: set the switch over threshold (heap bytes) between the atomic
+// and the incremental cycle at run time. 0 = always incremental. It serves
+// the measurement and can be set for special cases; the default is INCR_FROM.
+fn gc_set_incr_ab(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_INKRAB, n)
+}
+
+fn gc_incr_ab() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_INKRAB)
+}
+
+// The upper limit of the heap in bytes; 0 = unlimited. When the limit is
+// reached, the collector collects first and reports AllocError::OutOfMemory after.
+fn gc_set_max_bytes(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_MAXHEAP, n)
+}
+
+fn gc_max_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_MAXHEAP)
+}
+
+fn gc_collect() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_INIT) != 1 {
+        if __gc_ld64(st + S_INIT) == 2 {
+            __gc_error_fin_collect()
+        }
+        return 0
+    }
+    let multi: u64 = __gc_ld64(st + S_MULTI)
+    if multi != 0 {
+        __thread_safepoint()
+        __thread_lock(st + S_LOCK)
+        __gc_stw_an()
+    }
+    if __gc_ld64(st + S_PHASE) != 0 {
+        __gc_cycle_done()
+    }
+    __gc_scrub()
+    let d: u64 = __gc_collect_now()
+    if multi != 0 {
+        __gc_stw_out()
+        __thread_unlock(st + S_LOCK)
+    }
+    return d
+}
+
+// ROUND 70: the collection threshold in octets since the last cycle. Set to
+// the largest u64 it means "never start a cycle again" -- the counter-check
+// of tools/strsoak needs exactly that switch, so a green endurance run can
+// be told apart from a broken measurement.
+fn gc_set_limit(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_LIMIT, n)
+}
+
+fn gc_limit() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LIMIT)
+}
+
+fn gc_collections() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_RUNS)
+}
+
+fn gc_live_objects() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LIVE)
+}
+
+fn gc_heap_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_HEAP)
+}
+
+fn gc_live_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LIVEBYTES)
+}
+
+fn gc_pause_ns_last() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PAUSE_LAST)
+}
+
+fn gc_pause_ns_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PAUSE_MAX)
+}
+
+fn gc_pause_ns_total() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PAUSE_TOTAL)
+}
+
+// ROUND 95: null the pause MAXIMA (not the totals, not the counters).
+//
+// A run of a day reports one number per window instead of one number for
+// the whole run. Without this a single outlier during the warm-up hides
+// everything that follows it, and the question the endurance run actually
+// asks -- do the pauses get longer as the hours go by? -- cannot be
+// answered from a monotone maximum at all. `gc_hist_reset` does the same
+// for the histogram; this is the piece that was missing next to it.
+fn gc_pause_reset() {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_PAUSE_MAX, 0)
+    __gc_st64(st + S_PZYK, 0)
+    __gc_st64(st + S_STOPMAX, 0)
+    __gc_st64(st + S_CSTOPMAX, 0)
+    var i: u64 = 0
+    while i < 5 {
+        __gc_st64(st + S_PMAX_START + i * 8, 0)
+        i = i + 1
+    }
+    __gc_st64(st + S_PMAX_FIN, 0)
+}
+
+// Round 53: the phase of the running cycle (0 idle, 1 marking, 2 sweeping,
+// 3 finalizers). Read only -- measuring programs need it to PROVE that an
+// entry really fell into a running marking, instead of claiming it
+// (tests/841_gcvec_incremental.fi).
+// Round 53: set the slice size (objects per marking slice) and the time
+// budget (ns). 0 = the default. ONLY for tests and measuring programs; in
+// normal operation both stay 0 and the code is bit identical to before.
+fn gc_set_slice(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_SLICE, n)
+}
+
+fn gc_set_time_budget(ns: u64) {
+    __gc_st64(__gc_state() as u64 + S_ZBUDGET, ns)
+}
+
+fn gc_phase() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PHASE)
+}
+
+fn gc_barriers() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_BARRIEREN)
+}
+
+fn gc_total_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_TOTAL)
+}
+
+// ==========================================================================
+// ROUND 49 -- THREADS
+// ==========================================================================
+//
+// This half of the file is the runtime of the concurrency. It stands HERE
+// deliberately and not in a module of its own: it needs the same static
+// state block as the collector (stage 0 has no mutable global variables --
+// which is exactly why the block exists at all), and the collector in turn
+// needs it to see every thread stack as roots. Two separate blocks would be
+// two truths about the same state.
+//
+// THE DESIGN IN ONE PARAGRAPH
+//
+//   A thread comes into being with `clone(2)` (`__thread_start`,
+//   compiler/src/thread.rs), gets an mmap stack of its own with a guard page
+//   (TCB) its `fs` register points at. The collector keeps a table of
+//   these blocks. A thread is RUNNING, PARKED (it stands in a
+//   safepoint) or BLOCKED (it waits on a lock/a futex and its stack lies
+//   still). Collector work is always done by only ONE thread, namely the
+//   holder of the GC lock; before it starts, it stops the world (S_STOPP=1)
+//   and waits until no other thread is RUNNING any more. Then it scans EVERY
+//   thread stack and the registers saved per thread.
+//
+// THE TWO RULES THE FREEDOM FROM DEADLOCK FOLLOWS FROM
+//
+//   R1  Only the holder of the GC lock stops the world.
+//   R2  Whoever waits on a lock or a futex reports as BLOCKED beforehand
+//       (stack + registers published).
+//
+//   From R2 it follows that a thread waiting for the GC lock is already
+//   "standing still" for the purposes of the stop. From R1 it follows that
+//   while the world stands, no second thread can begin a stop. Without R2
+//   the collector would wait for a thread that waits for it -- the classic deadlock.
+//
+// WHAT THIS STAGE CANNOT DO (honestly, see docs/ROUND49.md 7)
+//
+//   * A thread that NEITHER allocates NOR blocks (a pure compute loop)
+//     reaches no safepoint. The world then does not stop. The remedy:
+//     `thread_safepoint()` by hand in such loops. A safepoint at every back
+//     edge would be the complete solution and would cost the single threaded
+//     case -- that is a code generator round, not this one.
+//   * `Gc[T]` across thread boundaries is NOT promised (SPEC 7). The
+//     collector is thread safe now, but the LANGUAGE still has no
+//     `#[sendable]` marking that would check it.
+
+const GC_SYS_MPROTECT: i64 = 10
+const GC_SYS_SCHED_YIELD: i64 = 24
+const SYS_GETTID: i64 = 186
+const SYS_ARCH_PRCTL: i64 = 158
+const SYS_FUTEX: i64 = 202
+const SYS_NANOSLEEP: i64 = 35
+const ARCH_SET_FS: i64 = 4098
+// FUTEX_WAIT/FUTEX_WAKE, each with FUTEX_PRIVATE_FLAG (128): the futex
+// belongs to this process only, and the kernel saves itself the mapping onto
+// a global key object.
+const FUTEX_WAIT: i64 = 128
+const FUTEX_WAKE: i64 = 129
+// The two's complement of 1 (decrementing is adding it, as in arc.fi).
+const THREAD_MINUS1: u64 = 18446744073709551615
+
+// The thread block (TCB), 512 bytes. Offset 0 is its own address: `fs:0`
+// thus yields the block in ONE instruction (compiler/src/thread.rs, Op::ThreadSelf).
+const FT_SELF: u64 = 0
+const FT_STATE: u64 = 8
+// The thread id. The kernel WRITES it at the start (CLONE_PARENT_SETTID)
+// and NULLS it when the thread ends (CLONE_CHILD_CLEARTID) -- on exactly
+// this word `thread_wait` waits. It is a 32 bit word (the kernel writes an
+// `int`) but lies in a 64 bit slot.
+const FT_TID: u64 = 16
+const FT_STACK: u64 = 24
+const FT_STAPELN: u64 = 32
+const FT_BOTTOM: u64 = 40
+const FT_SP: u64 = 48
+const FT_ARG: u64 = 56
+const FT_KIND: u64 = 64
+const FT_RES: u64 = 72
+// 6 callee saved registers (rbx, rbp, r12..r15), per thread.
+const FT_REGS: u64 = 80
+// The free lists of this thread (variant B, `gc_set_local(1)`): one list per
+// size class, plus the number of blocks lying in it.
+const FT_FREE: u64 = 128
+const FT_FREIN: u64 = 240
+const FT_BYTES: u64 = 512
+const THREAD_MAX: u64 = 64
+// The default stack size per thread (1 MiB, of which 4 KiB is a guard page).
+const STACK_BYTES: u64 = 1048576
+
+const Z_FREE: u64 = 0
+const Z_LAUFEND: u64 = 1
+const Z_GEPARKT: u64 = 2
+const Z_BLOCKED: u64 = 3
+const Z_DEAD: u64 = 4
+
+// --------------------------------------------------------- System services
+
+fn __thread_gettid() -> u64 {
+    return syscall(SYS_GETTID, 0, 0, 0, 0, 0, 0) as u64
+}
+
+fn __thread_yield() {
+    syscall(GC_SYS_SCHED_YIELD, 0, 0, 0, 0, 0, 0)
+}
+
+fn __thread_futex_wait(a: u64, v: u64) {
+    syscall(SYS_FUTEX, a as i64, FUTEX_WAIT, v as i64, 0, 0, 0)
+}
+
+// Waiting WITHOUT FUTEX_PRIVATE_FLAG. That is no cosmetic flaw but a
+// requirement for exactly ONE case: the TID word. The KERNEL itself wakes it
+// when the thread ends (CLONE_CHILD_CLEARTID) and uses the SHARED futex key
+// for that. A private waiter hangs on a different key and never gets woken
+// -- measured: `thread_wait` stood still forever although the thread had
+// long since finished.
+fn __thread_futex_wait_split(a: u64, v: u64) {
+    syscall(SYS_FUTEX, a as i64, 0, v as i64, 0, 0, 0)
+}
+
+fn __thread_futex_wake(a: u64, n: u64) {
+    syscall(SYS_FUTEX, a as i64, FUTEX_WAKE, n as i64, 0, 0, 0)
+}
+
+// -------------------------------------------------------- The thread block
+
+// Our own thread block -- 0 as long as no thread table exists. The check on
+// the table is NOT decoration: without `arch_prctl(ARCH_SET_FS)` the `fs`
+// base is 0 and `fs:0` would be an access to address 0.
+fn __thread_tcb() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_THREAD_TAB) == 0 {
+        return 0
+    }
+    return __thread_self() as u64
+}
+
+// ------------------------------------------------------------------- Locks
+//
+// A mutex after Drepper ("Futexes are Tricky"), with three states:
+//   0 = free | 1 = taken, no waiter | 2 = taken, at least one waiter
+// In the uncontended case taking and giving cost ONE atomic instruction each
+// and NO system call.
+
+// A swap without a primitive of its own. `xchg` would be one instruction;
+// that would have needed a fourth opcode (docs/ROUND49.md 2.3 -- rejected,
+// because the loop runs only in the contended case).
+fn __thread_swap(a: u64, new: u64) -> u64 {
+    var old: u64 = __gc_ld64(a)
+    var done: bool = false
+    while !done {
+        let g: u64 = __atomic_swap(a as *mut u64, old, new)
+        if g == old {
+            done = true
+        } else {
+            old = g
+        }
+    }
+    return old
+}
+
+// A pure spin lock WITHOUT a state report. Only for very short sections that
+// are themselves part of the state report (otherwise there would be a recursion).
+fn __thread_lock_raw(a: u64) {
+    var i: u64 = 0
+    var g: u64 = __atomic_swap(a as *mut u64, 0, 1)
+    while g != 0 {
+        i = i + 1
+        if i > 64 {
+            __thread_yield()
+        }
+        g = __atomic_swap(a as *mut u64, 0, 1)
+    }
+}
+
+fn __thread_unlock_raw(a: u64) {
+    __atomic_add(a as *mut u64, THREAD_MINUS1)
+}
+
+fn __thread_lock(a: u64) {
+    let g: u64 = __atomic_swap(a as *mut u64, 0, 1)
+    if g == 0 {
+        return
+    }
+    __thread_lock_slow(a)
+}
+
+fn __thread_lock_slow(a: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_SPERR_W, __gc_ld64(st + S_SPERR_W) + 1)
+    // RULE R2: whoever waits reports as BLOCKED. Without that the world cannot
+    // stop while a thread waits for the GC lock.
+    __thread_blocked_an()
+    var c: u64 = __thread_swap(a, 2)
+    while c != 0 {
+        __thread_futex_wait(a, 2)
+        c = __thread_swap(a, 2)
+    }
+    __thread_blocked_out()
+}
+
+fn __thread_unlock(a: u64) {
+    // The result is the OLD value: if it was 1, there was no waiter and the word
+    // now stands at 0. If it was 2, it has to be set to 0 and woken.
+    let old: u64 = __atomic_add(a as *mut u64, THREAD_MINUS1)
+    if old != 1 {
+        __gc_st64(a, 0)
+        __thread_futex_wake(a, 1)
+    }
+}
+
+// Public: a mutex is a nulled u64 word, nothing more.
+fn thread_lock(a: *mut u64) {
+    __thread_lock(a as u64)
+}
+
+fn thread_unlock(a: *mut u64) {
+    __thread_unlock(a as u64)
+}
+
+// ---------------------------------------------------- Publishing the state
+
+// The thread makes its stack and its registers readable for the collector
+// and goes into state `z`.
+//
+// WHY THE REGISTERS GO THROUGH THE GLOBAL AREA: `__gc_save_regs()` is a
+// compiler intrinsic that is INLINED at its call site and writes the callee
+// saved registers into the state block -- there is exactly one such area.
+// Two threads saving at the same time would overwrite each other; hence the
+// short spin lock. The area is copied into our own thread block right away,
+// and only that copy is scanned.
+//
+// And why at all: a `Gc[T]` that stands only in `rbx` lies on NO stack.
+// Without this saving, the promise of a "conservative stack AND register
+// scan" (SPEC 3.5.3) would be false for every thread except the collector.
+fn __thread_state_report(z: u64) {
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return
+    }
+    let st: u64 = __gc_state() as u64
+    __thread_lock_raw(st + S_REGSPERRE)
+    let g: u64 = __gc_save_regs() as u64
+    var i: u64 = 0
+    while i < 6 {
+        __gc_st64(tcb + FT_REGS + i * 8, __gc_ld64(g + S_REGS + i * 8))
+        i = i + 1
+    }
+    __thread_unlock_raw(st + S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_st64(tcb + FT_SP, sp)
+    __gc_st64(tcb + FT_STATE, z)
+}
+
+fn __thread_blocked_an() {
+    __thread_state_report(Z_BLOCKED)
+}
+
+// Back into state RUNNING. The order matters: FIRST make it visible that we
+// are computing again, THEN check whether the world stands. In the reverse
+// order a stop could begin between the check and the state change, and this
+// thread would keep running during the root scan.
+fn __thread_blocked_out() {
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return
+    }
+    __gc_st64(tcb + FT_STATE, Z_LAUFEND)
+    __thread_safepoint()
+}
+
+// --------------------------------------------------------------- Safepoint
+
+fn __thread_safepoint() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_STOPP) == 0 {
+        return
+    }
+    __thread_park()
+}
+
+fn __thread_park() {
+    let st: u64 = __gc_state() as u64
+    __thread_state_report(Z_GEPARKT)
+    while __gc_ld64(st + S_STOPP) != 0 {
+        __thread_futex_wait(st + S_STOPP, 1)
+    }
+    let tcb: u64 = __thread_tcb()
+    if tcb != 0 {
+        __gc_st64(tcb + FT_STATE, Z_LAUFEND)
+    }
+}
+
+// Public: this belongs into a long compute loop without allocation,
+// otherwise a collection run waits for this thread (see the top comment).
+fn thread_safepoint() {
+    __thread_safepoint()
+}
+
+// Public: around EVERY blocking system call a thread makes itself (reading,
+// writing, sleeping, waiting). In between its stack counts as standing
+// still, the collector may scan it and does not have to wait for it.
+//
+// WHY THIS IS NECESSARY -- measured, not guessed: the first endurance run of
+// this round managed 112 rounds in 20 seconds instead of hundreds of
+// thousands. The main thread slept between the samples in `nanosleep` and
+// counted as RUNNING while doing so; every stop of the world waited for it
+// until it woke up by itself. The longest wait until the world stood was
+// 19.997 s -- practically the whole run. With these two calls around the
+// sleep it is microseconds.
+fn thread_blocking_an() {
+    __thread_blocked_an()
+}
+
+fn thread_blocking_out() {
+    __thread_blocked_out()
+}
+
+// Sleep and count as blocked while doing so. `ms` in milliseconds.
+fn thread_sleep(ms: u64) {
+    var ts: [i64; 2] = [0; 2]
+    ts[0] = (ms / 1000) as i64
+    ts[1] = ((ms % 1000) * 1000000) as i64
+    __thread_blocked_an()
+    syscall(SYS_NANOSLEEP, (&ts) as i64, 0, 0, 0, 0, 0)
+    __thread_blocked_out()
+}
+
+// ------------------------------------------------------ Stopping the world
+
+// Precondition: the caller HOLDS the GC lock (rule R1).
+fn __gc_stw_an() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let t0: u64 = __gc_now_ns()
+    __gc_st64(st + S_STOPP, 1)
+    let slf: u64 = __thread_tcb()
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    var i: u64 = 0
+    while i < THREAD_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        if t != slf {
+            var n: u64 = 0
+            while __gc_ld64(t + FT_STATE) == Z_LAUFEND {
+                n = n + 1
+                if n > 16 {
+                    __thread_yield()
+                }
+            }
+        }
+        i = i + 1
+    }
+    let t1: u64 = __gc_now_ns()
+    var d: u64 = 0
+    if t1 > t0 {
+        d = t1 - t0
+    }
+    __gc_st64(st + S_STW_N, __gc_ld64(st + S_STW_N) + 1)
+    __gc_st64(st + S_STW_WAIT, __gc_ld64(st + S_STW_WAIT) + d)
+    if d > __gc_ld64(st + S_STW_MAX) {
+        __gc_st64(st + S_STW_MAX, d)
+    }
+    __gc_st64(st + S_STW_T0, t1)
+}
+
+fn __gc_stw_out() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let t1: u64 = __gc_now_ns()
+    let t0: u64 = __gc_st_t0(st)
+    if t1 > t0 {
+        let d: u64 = t1 - t0
+        __gc_st64(st + S_STW_NS, __gc_ld64(st + S_STW_NS) + d)
+        if d > __gc_ld64(st + S_STW_WORK_MAX) {
+            __gc_st64(st + S_STW_WORK_MAX, d)
+        }
+    }
+    __gc_st64(st + S_STOPP, 0)
+    __thread_futex_wake(st + S_STOPP, THREAD_MAX)
+}
+
+fn __gc_st_t0(st: u64) -> u64 {
+    return __gc_ld64(st + S_STW_T0)
+}
+
+// -------------------------------------------------- Thread stacks as roots
+
+// Scan every OTHER thread conservatively: first its saved registers, then
+// its stack from the pointer it published when the world stopped, up to its
+// stack bottom. Precondition: the world stands.
+//
+// A dead thread (Z_DEAD) is no longer scanned over its stack -- it no longer
+// has one that could hold anything. But its RESULT WORD is scanned: it
+// stands in its block until the `thread_wait` and would otherwise be the one
+// place in the whole system where a value could vanish unnoticed.
+fn __gc_threads_scan() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    if tab == 0 {
+        return
+    }
+    let slf: u64 = __thread_tcb()
+    var i: u64 = 0
+    while i < THREAD_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        let z: u64 = __gc_ld64(t + FT_STATE)
+        if t != slf && z != Z_FREE {
+            __gc_scan(t + FT_REGS, t + FT_REGS + 48)
+            __gc_scan(t + FT_RES, t + FT_RES + 8)
+            if z != Z_DEAD {
+                let sp: u64 = __gc_ld64(t + FT_SP)
+                let bottom: u64 = __gc_ld64(t + FT_BOTTOM)
+                if sp != 0 && bottom > sp {
+                    __gc_scan(sp, bottom)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// -------------------------------------------------------- The thread table
+
+fn __thread_slot_new(st: u64) -> u64 {
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    var i: u64 = 1
+    while i < THREAD_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        if __gc_ld64(t + FT_STATE) == Z_FREE {
+            return t
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Once, before the first `thread_start`. It registers the MAIN THREAD --
+// without that the collector would know nothing of its stack as soon as
+// there is a second thread. Idempotent.
+fn thread_init() -> bool {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_THREAD_TAB) != 0 {
+        return true
+    }
+    if __gc_ld64(st + S_INIT) != 1 {
+        if !gc_init() {
+            return false
+        }
+    }
+    let tab: u64 = __gc_mmap(THREAD_MAX * FT_BYTES)
+    if tab == 0 {
+        return false
+    }
+    __gc_st64(tab + FT_SELF, tab)
+    __gc_st64(tab + FT_STATE, Z_LAUFEND)
+    __gc_st64(tab + FT_BOTTOM, __gc_ld64(st + S_BOTTOM))
+    __gc_st64(tab + FT_TID, __thread_gettid())
+    __gc_st64(st + S_MAIN, tab)
+    __gc_st64(st + S_THREAD_MAX, THREAD_MAX)
+    __gc_st64(st + S_THREAD_N, 1)
+    if __gc_ld64(st + S_STAPELN) == 0 {
+        __gc_st64(st + S_STAPELN, STACK_BYTES)
+    }
+    // FIRST set the `fs` base, THEN enter it into the table: `__thread_tcb()`
+    // reads `fs:0` as soon as the table stands. The other way round, an access
+    // to address 0 would be possible between the two lines.
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tab as i64, 0, 0, 0, 0)
+    __gc_st64(st + S_THREAD_TAB, tab)
+    return true
+}
+
+// The stack size per thread in bytes (to be set before the first `thread_start`).
+fn thread_stack_set(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_STAPELN, n)
+}
+
+// Start a thread. `kind` and `arg` go unchanged to the dispatcher
+// `__thread_work(kind, arg)` of the program -- the same solution as with the
+// dispatcher of the finalizers (round 47), because stage 0 has no function
+// pointers. Return value: the handle (1..63) for `thread_wait`, 0 = failed.
+fn thread_start(kind: u64, arg: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_THREAD_TAB) == 0 {
+        if !thread_init() {
+            return 0
+        }
+    }
+    __thread_safepoint()
+    __thread_lock(st + S_TSPERRE)
+    let tcb: u64 = __thread_slot_new(st)
+    if tcb == 0 {
+        __thread_unlock(st + S_TSPERRE)
+        return 0
+    }
+    let n: u64 = __gc_ld64(st + S_STAPELN)
+    let sp: u64 = __gc_mmap(n)
+    if sp == 0 {
+        __thread_unlock(st + S_TSPERRE)
+        return 0
+    }
+    // A guard page right at the bottom: a stack overflow ends with a clean
+    // segmentation fault instead of silently destroying foreign memory.
+    syscall(GC_SYS_MPROTECT, sp as i64, 4096, 0, 0, 0, 0)
+    __gc_st64(tcb + FT_SELF, tcb)
+    __gc_st64(tcb + FT_STACK, sp)
+    __gc_st64(tcb + FT_STAPELN, n)
+    __gc_st64(tcb + FT_BOTTOM, sp + n)
+    __gc_st64(tcb + FT_SP, sp + n)
+    __gc_st64(tcb + FT_ARG, arg)
+    __gc_st64(tcb + FT_KIND, kind)
+    __gc_st64(tcb + FT_RES, 0)
+    __gc_st64(tcb + FT_TID, 0)
+    __gc_st64(tcb + FT_FREIN, 0)
+    var i: u64 = 0
+    while i < 6 {
+        __gc_st64(tcb + FT_REGS + i * 8, 0)
+        i = i + 1
+    }
+    var k: u64 = 0
+    while k < CLASSES {
+        __gc_st64(tcb + FT_FREE + k * 8, 0)
+        k = k + 1
+    }
+    // The slot counts as a running thread FROM NOW ON. The other way round, a
+    // stop of the world could fall between the `clone` and the first report of
+    // the child, and its stack would stay unscanned.
+    __gc_st64(tcb + FT_STATE, Z_LAUFEND)
+    __gc_st64(st + S_THREAD_N, __gc_ld64(st + S_THREAD_N) + 1)
+    __gc_st64(st + S_THREAD_TOTAL, __gc_ld64(st + S_THREAD_TOTAL) + 1)
+    // From here on the collector runs in multi threaded mode. The switch NEVER
+    // goes back: a change during a running cycle would be a race without a
+    // benefit (docs/ROUND49.md 4.2).
+    __gc_st64(st + S_MULTI, 1)
+    let r: i64 = __thread_start(tcb, sp + n, (tcb + FT_TID) as *mut u8)
+    if r <= 0 {
+        __gc_st64(tcb + FT_STATE, Z_FREE)
+        __gc_st64(st + S_THREAD_N, __gc_ld64(st + S_THREAD_N) - 1)
+        __gc_munmap(sp, n)
+        __thread_unlock(st + S_TSPERRE)
+        return 0
+    }
+    __thread_unlock(st + S_TSPERRE)
+    return (tcb - __gc_ld64(st + S_THREAD_TAB)) / FT_BYTES
+}
+
+// The entry point the child calls out of the `clone` sequence
+// (compiler/src/thread.rs, `ENTRY`). The argument is the thread block.
+fn __thread_entry(tcb: u64) -> i32 {
+    // The very first thing is our own `fs` base: before that `__thread_self()`
+    // returns the one of the creator, and the thread would write into foreign state.
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tcb as i64, 0, 0, 0, 0)
+    __gc_st64(tcb + FT_STATE, Z_LAUFEND)
+    let r: u64 = __thread_work(__gc_ld64(tcb + FT_KIND), __gc_ld64(tcb + FT_ARG))
+    __gc_st64(tcb + FT_RES, r)
+    // Give the local free lists back, otherwise their blocks would be neither
+    // free nor used until the next sweep.
+    __thread_lists_back(tcb)
+    __gc_st64(tcb + FT_STATE, Z_DEAD)
+    let st: u64 = __gc_state() as u64
+    __atomic_add((st + S_THREAD_N) as *mut u64, THREAD_MINUS1)
+    return 0
+}
+
+// Wait for the end of a thread and fetch its result. The kernel nulls the
+// TID word when the thread ends and wakes on it -- exactly the mechanism
+// `pthread_join` works with too, only without pthread.
+fn thread_wait(h: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    if tab == 0 || h == 0 || h >= THREAD_MAX {
+        return 0
+    }
+    let tcb: u64 = tab + h * FT_BYTES
+    __thread_blocked_an()
+    var t: u32 = __gc_ld32(tcb + FT_TID)
+    while t != 0 {
+        __thread_futex_wait_split(tcb + FT_TID, t as u64)
+        t = __gc_ld32(tcb + FT_TID)
+    }
+    __thread_blocked_out()
+    let r: u64 = __gc_ld64(tcb + FT_RES)
+    let sp: u64 = __gc_ld64(tcb + FT_STACK)
+    let n: u64 = __gc_ld64(tcb + FT_STAPELN)
+    __gc_st64(tcb + FT_STACK, 0)
+    __gc_st64(tcb + FT_SP, 0)
+    __gc_st64(tcb + FT_BOTTOM, 0)
+    __gc_st64(tcb + FT_RES, 0)
+    __gc_st64(tcb + FT_STATE, Z_FREE)
+    if sp != 0 {
+        __gc_munmap(sp, n)
+    }
+    return r
+}
+
+fn thread_count() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_THREAD_N)
+}
+
+fn thread_started() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_THREAD_TOTAL)
+}
+
+fn thread_multi_threaded() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_MULTI)
+}
+
+fn thread_tid() -> u64 {
+    return __thread_gettid()
+}
+
+// A diagnostic: attempts, longest wait until the world stood, longest time
+// with the world standing, the sum, lock maintenance.
+fn gc_stw_runs() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_N)
+}
+
+fn gc_stw_wait_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_MAX)
+}
+
+fn gc_stw_work_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_WORK_MAX)
+}
+
+fn gc_stw_ns_total() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_NS)
+}
+
+fn gc_lock_maintenance() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_SPERR_W)
+}
+
+fn gc_local_refills() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LOCAL_N)
+}
+
+// ----------------------------------------------- Free lists per thread (B)
+//
+// Variant B of the allocation: instead of taking the GC lock for EVERY
+// allocation, a thread fetches a BATCH of blocks into its own list under the
+// lock and serves itself from there without a lock. The measurement of which
+// of the two variants wins stands in docs/ROUND49.md 5 -- which is why both
+// are there and switchable at run time (`gc_set_local`), in the same process
+// and with bit identical code.
+
+fn gc_set_local(an: u64) {
+    __gc_st64(__gc_state() as u64 + S_LOCAL, an)
+}
+
+fn gc_local() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LOCAL)
+}
+
+// A block from our own list; 0 = empty.
+fn __thread_block_local(tcb: u64, class: u64) -> u64 {
+    let header: u64 = tcb + FT_FREE + class * 8
+    let b: u64 = __gc_ld64(header)
+    if b == 0 {
+        return 0
+    }
+    __gc_st64(header, __gc_ld64(b + HEADER))
+    __gc_st64(tcb + FT_FREIN, __gc_ld64(tcb + FT_FREIN) - 1)
+    return b
+}
+
+// Refill: under the GC lock, hang up to SCHWUNG blocks from the global list
+// into our own.
+fn __thread_refill(tcb: u64, class: u64, size: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let source: u64 = st + S_FREE + class * 8
+    let target: u64 = tcb + FT_FREE + class * 8
+    var n: u64 = 0
+    while n < SCHWUNG {
+        var b: u64 = __gc_ld64(source)
+        if b == 0 {
+            if __gc_chunk_new(class, size) == 0 {
+                n = SCHWUNG
+            } else {
+                b = __gc_ld64(source)
+            }
+        }
+        if b != 0 {
+            __gc_st64(source, __gc_ld64(b + HEADER))
+            __gc_st64(b + HEADER, __gc_ld64(target))
+            __gc_st64(target, b)
+            __gc_st64(tcb + FT_FREIN, __gc_ld64(tcb + FT_FREIN) + 1)
+            n = n + 1
+        } else {
+            n = SCHWUNG
+        }
+    }
+    __gc_st64(st + S_LOCAL_N, __gc_ld64(st + S_LOCAL_N) + 1)
+    return __gc_ld64(target)
+}
+
+// All local lists of a thread back into the global ones. The caller either
+// holds the GC lock or the world stands.
+fn __thread_lists_back(tcb: u64) {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(tcb + FT_FREIN) == 0 {
+        return
+    }
+    var k: u64 = 0
+    while k < CLASSES {
+        let header: u64 = tcb + FT_FREE + k * 8
+        var b: u64 = __gc_ld64(header)
+        while b != 0 {
+            let n: u64 = __gc_ld64(b + HEADER)
+            __gc_st64(b + HEADER, __gc_ld64(st + S_FREE + k * 8))
+            __gc_st64(st + S_FREE + k * 8, b)
+            b = n
+        }
+        __gc_st64(header, 0)
+        k = k + 1
+    }
+    __gc_st64(tcb + FT_FREIN, 0)
+}
+
+// Before the sweep: dissolve the local lists of ALL threads. A block in a
+// local list is free (type id 0) and would come into the global list again
+// during the sweep -- it would then stand in two lists. The world stops here.
+fn __thread_lists_all_back() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    if tab == 0 {
+        return
+    }
+    var i: u64 = 0
+    while i < THREAD_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        if __gc_ld64(t + FT_STATE) != Z_FREE {
+            __thread_lists_back(t)
+        }
+        i = i + 1
+    }
+}
+
+// ----------------------------------------------------------------- Channel
+//
+// A bounded ring buffer for u64 values, with a lock and a futex.
+// Deliberately the simplest form that is correct: ONE futex word (the
+// occupancy) and a wake of ALL waiters. A channel with separate queues for
+// senders and receivers would be faster; that is not the question of this
+// round and stands as an open point in docs/ROUND49.md 8.
+//
+//   +0 lock | +8 capacity | +16 head | +24 tail | +32 used | +40 bytes
+//   +48 data
+const KA_LOCK: u64 = 0
+const KA_CAP: u64 = 8
+const KA_HEADER: u64 = 16
+const KA_TAIL: u64 = 24
+const KA_USED: u64 = 32
+const KA_BYTES: u64 = 40
+const KA_DATA: u64 = 48
+
+fn thread_channel_new(cap: u64) -> u64 {
+    if cap == 0 {
+        return 0
+    }
+    let bytes: u64 = KA_DATA + cap * 8
+    let k: u64 = __gc_mmap(bytes)
+    if k == 0 {
+        return 0
+    }
+    __gc_st64(k + KA_CAP, cap)
+    __gc_st64(k + KA_BYTES, bytes)
+    return k
+}
+
+fn thread_channel_free(k: u64) {
+    if k == 0 {
+        return
+    }
+    __gc_munmap(k, __gc_ld64(k + KA_BYTES))
+}
+
+fn thread_channel_send(k: u64, v: u64) {
+    let cap: u64 = __gc_ld64(k + KA_CAP)
+    var done: bool = false
+    while !done {
+        __thread_lock(k + KA_LOCK)
+        if __gc_ld64(k + KA_USED) < cap {
+            let s: u64 = __gc_ld64(k + KA_TAIL)
+            __gc_st64(k + KA_DATA + s * 8, v)
+            __gc_st64(k + KA_TAIL, (s + 1) % cap)
+            __gc_st64(k + KA_USED, __gc_ld64(k + KA_USED) + 1)
+            __thread_unlock(k + KA_LOCK)
+            __thread_futex_wake(k + KA_USED, THREAD_MAX)
+            done = true
+        } else {
+            __thread_unlock(k + KA_LOCK)
+            __thread_blocked_an()
+            __thread_futex_wait(k + KA_USED, cap)
+            __thread_blocked_out()
+        }
+    }
+}
+
+fn thread_channel_receive(k: u64) -> u64 {
+    let cap: u64 = __gc_ld64(k + KA_CAP)
+    var out: u64 = 0
+    var done: bool = false
+    while !done {
+        __thread_lock(k + KA_LOCK)
+        if __gc_ld64(k + KA_USED) > 0 {
+            let h: u64 = __gc_ld64(k + KA_HEADER)
+            out = __gc_ld64(k + KA_DATA + h * 8)
+            __gc_st64(k + KA_HEADER, (h + 1) % cap)
+            __gc_st64(k + KA_USED, __gc_ld64(k + KA_USED) - 1)
+            __thread_unlock(k + KA_LOCK)
+            __thread_futex_wake(k + KA_USED, THREAD_MAX)
+            done = true
+        } else {
+            __thread_unlock(k + KA_LOCK)
+            __thread_blocked_an()
+            __thread_futex_wait(k + KA_USED, 0)
+            __thread_blocked_out()
+        }
+    }
+    return out
+}
+
+fn thread_channel_used(k: u64) -> u64 {
+    return __gc_ld64(k + KA_USED)
+}
+
+// =====================================================================
+// ROUND 70 -- `str` (compiler/src/strtype.rs)
+//
+// A `str` is two words: `p` (the octets) and `n` (how many). It is
+// IMMUTABLE -- nothing here writes into the octets of an existing `str`;
+// `__str_concat` only ever fills a block that nobody else knows yet.
+//
+// WHY THIS LIVES HERE: the result of `a + b` outlives both operands, so it
+// needs an owner. The only owner in this language that nobody has to name
+// is the collector. The octets therefore land in the GC heap, the
+// conservative stack scan keeps them alive as long as a `str` in a frame
+// points at them, and the sweep takes them back afterwards. That is
+// exactly what the endurance run in tools/strsoak measures.
+// =====================================================================
+
+// The class of a block of octets. It has no field of pointer type, so the
+// collector traces NOTHING inside such a block -- which is right, because
+// there are octets in there, not references.
+gc class StrBytes {
+    unused: u64,
+}
+
+// The type tag of `StrBytes`, determined once and kept in the state block.
+// The same trick as `__gcslots_tid` in gcvec.fi: allocate one template
+// object, read its tag out of the header, remember it. On failure 0 -- the
+// caller then yields the empty `str`.
+fn __str_tid() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let t: u64 = __gc_ld64(st + S_STR_TID)
+    if t != 0 {
+        return t
+    }
+    let template: Gc[StrBytes] = gc StrBytes { unused: 0 } catch gc_null[StrBytes]()
+    if (template as u64) == 0 {
+        return 0
+    }
+    let new: u64 = __gc_ld32((template as u64) - HEADER) as u64
+    __gc_st64(st + S_STR_TID, new)
+    return new
+}
+
+// Content comparison. Two `str` are equal when they are of the same length
+// and every octet matches. Equal ADDRESSES are the quick way out and no
+// requirement -- `"ab" == "ab"` is true even though both literals sit in
+// different places.
+fn __str_eq(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    if (a.p as u64) == (b.p as u64) {
+        return true
+    }
+    var i: usize = 0
+    while i < a.n {
+        if *(((a.p as usize) + i) as *mut u8) != *(((b.p as usize) + i) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// A COPY in the GC heap. Whoever holds octets in a buffer of their own and
+// wants a `str` that outlives that buffer takes this. Unlike `__str_concat`
+// it copies even when one side is empty -- that is the whole point of it.
+fn __str_copy(a: str) -> str {
+    if a.n == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let tid: u64 = __str_tid()
+    if tid == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let p: *mut u8 = __gc_alloc_raw(tid, a.n as u64)
+    if (p as u64) == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    var i: usize = 0
+    while i < a.n {
+        *(((p as usize) + i) as *mut u8) = *(((a.p as usize) + i) as *mut u8)
+        i = i + 1
+    }
+    return str { p: p, n: a.n }
+}
+
+// Concatenation. The result is a NEW block in the GC heap; both operands
+// stay untouched (`str` is immutable). If one side is empty, the other one
+// is handed back unchanged -- that costs no allocation and is allowed
+// exactly because nobody can write into it.
+fn __str_concat(a: str, b: str) -> str {
+    if a.n == 0 {
+        return b
+    }
+    if b.n == 0 {
+        return a
+    }
+    let tid: u64 = __str_tid()
+    if tid == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let n: usize = a.n + b.n
+    let p: *mut u8 = __gc_alloc_raw(tid, n as u64)
+    if (p as u64) == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    var i: usize = 0
+    while i < a.n {
+        *(((p as usize) + i) as *mut u8) = *(((a.p as usize) + i) as *mut u8)
+        i = i + 1
+    }
+    var k: usize = 0
+    while k < b.n {
+        *(((p as usize) + a.n + k) as *mut u8) = *(((b.p as usize) + k) as *mut u8)
+        k = k + 1
+    }
+    return str { p: p, n: n }
+}

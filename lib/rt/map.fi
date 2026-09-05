@@ -1,0 +1,1222 @@
+// SPDX-License-Identifier: MIT
+// lib/rt/map.fi -- `Map[K, V]`: a hash map with open addressing.
+//
+// `docs/SELF_HOSTING.md` 4 lists this as point 3 of the blocker list, right
+// behind the allocator and `Vec[T]`. The compiler needs it everywhere a name
+// points at something: `fns`, `consts`, `structs`, the scope chains of the
+// name resolver, the label table of the code generator.
+//
+// STRUCTURE -- open addressing with linear probing, not chaining:
+//   * three separate arrays (keys, values, state) instead of one array of
+//     pairs. That saves the alignment holes that `struct { K, V }` produces
+//     when the sizes differ, and the state lies densely packed -- the probe
+//     loop reads only one byte per step.
+//   * the capacity is always a power of two, so that `hash & (cap-1)` takes
+//     the place of the modulo (one bitwise and instead of a division).
+//   * a load limit of 3/4. Above it the table doubles and is rehashed.
+//
+// THE STATE per slot: 0 = empty (never used), 1 = used, 2 = deleted.
+// The difference between 0 and 2 matters: a lookup must NOT stop at 2,
+// otherwise it loses entries that sit behind a deletion. At 0 it may stop --
+// nothing was ever there.
+//
+// THE HONEST LIMITS:
+//   * `K` and `V` are scalars. Strings as keys go through their internal
+//     number (`Map[u32, ...]`) -- that is exactly how the Rust compiler does
+//     it with `Interner` too.
+//   * There is no protection against the null value: for a missing key
+//     `map_get` returns `0 as V`. Whoever has to tell 0 from "missing" puts
+//     `map_has` in front of it.
+//   * Firn has no destructors -- `map_free` is mandatory, ideally with
+//     `defer` right behind `map_new`.
+
+// THE IMPORT PATHS ARE WRITTEN BARE, and that is not a matter of taste.
+// This file lies in `lib/rt/` and is reached through TWO symlinks
+// (`lib/std/map.fi` and `tests/modules/map.fi`), so every module it imports
+// has to be reachable from both places -- which is why `hash.fi` and
+// `str.fi` are linked into `tests/modules/` as well.
+//
+// The qualified form (`import std.hash`) would resolve from anywhere and is
+// still WRONG here: `firnc1` deduplicates imports BY THE PATH STRING
+// (round 39, and the comment about `vec` further down says the same). With
+// `std.rt` in one module and `rt` in another, the same file comes in twice
+// and the assembler stops at `symbol _F1.rt__ld8 is already defined`.
+// Measured, not feared: that is exactly how `tools/self_compare.sh` failed
+// on `tests/650_map_module.fi` in this round.
+import rt
+import hash
+import str
+
+export { Map, map_new, map_free, map_clear, map_set, map_get, map_has,
+    map_delete, map_len, map_cap, map_reserve,
+    map_slot_used, map_slot_key, map_slot_value, map_hash,
+    // round 42
+    map_is_empty, map_dead, map_next, map_first, map_get_or,
+    map_get_if, map_value_address, map_set_if_new, map_increase,
+    map_take, map_cleanup,
+    // round 81 -- the collision measurement
+    map_probe_of, map_probe_max, map_probe_total, map_load_permille,
+    // round 81 -- a set of scalars
+    Set, set_new, set_free, set_clear, set_add, set_has, set_remove,
+    set_len, set_cap, set_is_empty, set_next, set_first, set_slot_key,
+    // round 81 -- octet sequences as keys
+    BMap, bmap_new, bmap_free, bmap_clear, bmap_reserve, bmap_len,
+    bmap_cap, bmap_dead, bmap_is_empty, bmap_memory,
+    bmap_set, bmap_get, bmap_get_or, bmap_get_if, bmap_has, bmap_delete,
+    bmap_take, bmap_increase, bmap_set_if_new, bmap_value_address,
+    bmap_next, bmap_first, bmap_slot_used, bmap_key_ptr, bmap_key_len,
+    bmap_slot_value, bmap_slot_set_value, bmap_cleanup,
+    bmap_probe_of, bmap_probe_max, bmap_probe_total, bmap_load_permille,
+    bmap_set_span, bmap_get_span, bmap_get_span_or, bmap_has_span,
+    bmap_delete_span, bmap_key_span, bmap_set_c, bmap_get_c, bmap_has_c,
+    // round 81 -- a set of octet sequences
+    BSet, bset_new, bset_free, bset_clear, bset_add, bset_has, bset_remove,
+    bset_add_span, bset_has_span, bset_remove_span,
+    bset_len, bset_is_empty, bset_next, bset_first, bset_key_ptr,
+    bset_key_len, bset_key_span, bset_cap, bset_probe_max }
+
+struct Map[K, V] {
+    key: u64, // array of K, `cap` entries
+    values: u64, // array of V, `cap` entries
+    state: u64, // array of u8, `cap` entries
+    cap: usize, // always a power of two, or 0
+    len: usize, // used slots
+    dead: usize, // deleted slots (tombstones)
+}
+
+// Hashing modelled on splitmix64: two shift/xor rounds around one
+// multiplication with an odd constant.
+//
+// MEASURED, not claimed (20,000 keys, 32,768 slots, load 0.61;
+// average probe steps per insertion / longest chain):
+//
+//   key pattern             with hashing      without (key = slot)
+//   consecutive k            1.80 /  38          1.00 /      1
+//   k * 1024 (pointers)      1.76 /  37        313.00 /    625
+//   k * 65536                1.62 /  39      10000.50 /  20000
+//   k << 32 (high bits)      1.80 /  53      10000.50 /  20000
+//
+// So the hashing is NOT free: on consecutive numbers it costs 0.8 probe
+// steps compared to the ideal case. What it buys is the guarantee that the
+// table does not degenerate into a linear scan for keys that differ only in
+// their high bits -- pointers, aligned addresses, shifted numbers.
+// 0.8 against 10,000 is not a close call.
+fn map_hash[K: Scalar](k: K) -> u64 {
+    var x: u64 = k as u64
+    x = x ^ (x >> 33)
+    x = x *% 14181476777654086739 as u64 // ROUND 72: MurmurHash3 mix wraps on purpose, *% says so
+    x = x ^ (x >> 29)
+    x = x *% 12297829382473034411 as u64 // ROUND 72: MurmurHash3 mix wraps on purpose, *% says so
+    x = x ^ (x >> 32)
+    return x
+}
+
+fn map_new[K: Scalar, V: Scalar]() -> Map[K, V] {
+    return Map[K, V] { key: 0, values: 0, state: 0, cap: 0, len: 0, dead: 0 }
+}
+
+fn map_free[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
+    if (*m).cap > 0 {
+        rt.heap_free((*m).key, (*m).cap * size_of[K]())
+        rt.heap_free((*m).values, (*m).cap * size_of[V]())
+        rt.heap_free((*m).state, (*m).cap)
+    }
+    (*m).key = 0
+    (*m).values = 0
+    (*m).state = 0
+    (*m).cap = 0
+    (*m).len = 0
+    (*m).dead = 0
+}
+
+// Keeps the memory, only sets every slot to `empty`. For a scope table that
+// is filled anew per function this is the right way -- no mmap per
+// function.
+fn map_clear[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
+    if (*m).cap > 0 {
+        rt.mem_set((*m).state, 0 as u8, (*m).cap)
+    }
+    (*m).len = 0
+    (*m).dead = 0
+}
+
+fn map_len[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
+    return (*m).len
+}
+
+fn map_cap[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
+    return (*m).cap
+}
+
+fn map_slot_used[K: Scalar, V: Scalar](m: *mut Map[K, V], i: usize) -> bool {
+    if i >= (*m).cap {
+        return false
+    }
+    return rt.ld8((*m).state, i) == 1 as u8
+}
+
+fn map_slot_key[K: Scalar, V: Scalar](m: *mut Map[K, V], i: usize) -> K {
+    if i >= (*m).cap {
+        return 0 as K
+    }
+    let addr: u64 = (*m).key + i as u64 * size_of[K]() as u64
+    return *(addr as *mut K)
+}
+
+fn map_slot_value[K: Scalar, V: Scalar](m: *mut Map[K, V], i: usize) -> V {
+    if i >= (*m).cap {
+        return 0 as V
+    }
+    let addr: u64 = (*m).values + i as u64 * size_of[V]() as u64
+    return *(addr as *mut V)
+}
+
+// Looks for the slot of a key. Return value `cap` = not present.
+// It stops at state 0 and runs across state 2.
+fn map_find[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> usize {
+    if (*m).cap == 0 {
+        return 0
+    }
+    let mask: u64 = (*m).cap as u64 - 1
+    var i: u64 = map_hash[K](k) & mask
+    var steps: usize = 0
+    while steps < (*m).cap {
+        let z: u8 = rt.ld8((*m).state, i as usize)
+        if z == 0 as u8 {
+            return (*m).cap
+        }
+        if z == 1 as u8 {
+            let addr: u64 = (*m).key + i * size_of[K]() as u64
+            if *(addr as *mut K) == k {
+                return i as usize
+            }
+        }
+        i = (i + 1) & mask
+        steps = steps + 1
+    }
+    return (*m).cap
+}
+
+fn map_has[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> bool {
+    return map_find[K, V](m, k) < (*m).cap
+}
+
+fn map_get[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> V {
+    let i: usize = map_find[K, V](m, k)
+    if i >= (*m).cap {
+        return 0 as V
+    }
+    let addr: u64 = (*m).values + i as u64 * size_of[V]() as u64
+    return *(addr as *mut V)
+}
+
+// Stores a pair without any check. Only for `map_grow`, where it is known
+// that the key is new and that there is room.
+fn map_raw_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) {
+    let mask: u64 = (*m).cap as u64 - 1
+    var i: u64 = map_hash[K](k) & mask
+    while rt.ld8((*m).state, i as usize) == 1 as u8 {
+        i = (i + 1) & mask
+    }
+    let ka: u64 = (*m).key + i * size_of[K]() as u64
+    *(ka as *mut K) = k
+    let va: u64 = (*m).values + i * size_of[V]() as u64
+    *(va as *mut V) = v
+    rt.st8((*m).state, i as usize, 1 as u8)
+}
+
+// Rebuilds the table with `new_cap` slots. In doing so it clears away every
+// tombstone -- which is why it rebuilds even when the capacity stays the
+// same and only `dead` has grown too large.
+fn map_grow[K: Scalar, V: Scalar](m: *mut Map[K, V], new_cap: usize) -> bool {
+    var cap: usize = 8
+    while cap < new_cap {
+        cap = cap * 2
+    }
+    let sk: u64 = rt.heap_alloc(cap * size_of[K]())
+    if sk == 0 {
+        return false
+    }
+    let sw: u64 = rt.heap_alloc(cap * size_of[V]())
+    if sw == 0 {
+        rt.heap_free(sk, cap * size_of[K]())
+        return false
+    }
+    let sz: u64 = rt.heap_alloc(cap)
+    if sz == 0 {
+        rt.heap_free(sk, cap * size_of[K]())
+        rt.heap_free(sw, cap * size_of[V]())
+        return false
+    }
+    rt.mem_set(sz, 0 as u8, cap)
+
+    // Remember the old table, hang in the new one, then rehash.
+    let old_k: u64 = (*m).key
+    let old_v: u64 = (*m).values
+    let old_z: u64 = (*m).state
+    let old_cap: usize = (*m).cap
+
+    (*m).key = sk
+    (*m).values = sw
+    (*m).state = sz
+    (*m).cap = cap
+    (*m).len = 0
+    (*m).dead = 0
+
+    var i: usize = 0
+    while i < old_cap {
+        if rt.ld8(old_z, i) == 1 as u8 {
+            let ka: u64 = old_k + i as u64 * size_of[K]() as u64
+            let va: u64 = old_v + i as u64 * size_of[V]() as u64
+            map_raw_set[K, V](m, *(ka as *mut K), *(va as *mut V))
+            (*m).len = (*m).len + 1
+        }
+        i = i + 1
+    }
+
+    if old_cap > 0 {
+        rt.heap_free(old_k, old_cap * size_of[K]())
+        rt.heap_free(old_v, old_cap * size_of[V]())
+        rt.heap_free(old_z, old_cap)
+    }
+    return true
+}
+
+fn map_reserve[K: Scalar, V: Scalar](m: *mut Map[K, V], n: usize) -> bool {
+    // Load limit 3/4: for `n` entries at least 4n/3 slots are needed.
+    if (*m).cap * 3 >= (n + (*m).len) * 4 {
+        return true
+    }
+    return map_grow[K, V](m, (n + (*m).len) * 4 / 3 + 1)
+}
+
+// Stores or overwrites. `false` means: out of memory.
+fn map_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) -> bool {
+    // An existing key first -- then nothing grows.
+    let da: usize = map_find[K, V](m, k)
+    if da < (*m).cap {
+        let va: u64 = (*m).values + da as u64 * size_of[V]() as u64
+        *(va as *mut V) = v
+        return true
+    }
+    // Load limit 3/4, tombstones count too: they occupy a slot the probe loop
+    // has to walk through. Without that, a table that is constantly inserted
+    // into and deleted from degenerates into a linear scan.
+    if ((*m).len + (*m).dead + 1) * 4 > (*m).cap * 3 {
+        if !map_grow[K, V](m, (*m).len * 2 + 8) {
+            return false
+        }
+    }
+    let mask: u64 = (*m).cap as u64 - 1
+    var i: u64 = map_hash[K](k) & mask
+    while rt.ld8((*m).state, i as usize) == 1 as u8 {
+        i = (i + 1) & mask
+    }
+    // A tombstone gets overwritten -- afterwards it no longer counts as dead.
+    if rt.ld8((*m).state, i as usize) == 2 as u8 {
+        (*m).dead = (*m).dead - 1
+    }
+    let ka: u64 = (*m).key + i * size_of[K]() as u64
+    *(ka as *mut K) = k
+    let va: u64 = (*m).values + i * size_of[V]() as u64
+    *(va as *mut V) = v
+    rt.st8((*m).state, i as usize, 1 as u8)
+    (*m).len = (*m).len + 1
+    return true
+}
+
+// `true` if something really was removed.
+fn map_delete[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> bool {
+    let i: usize = map_find[K, V](m, k)
+    if i >= (*m).cap {
+        return false
+    }
+    rt.st8((*m).state, i, 2 as u8)
+    (*m).len = (*m).len - 1
+    (*m).dead = (*m).dead + 1
+    return true
+}
+
+// =====================================================================
+// Round 42 -- the build out. As with `Vec[T]`, everything is GENERIC and
+// becomes code only when a program uses it.
+//
+// ITERATION WITHOUT `Vec`: `lib/rt/map.fi` deliberately does not import
+// `vec` -- a second import inside a module the compiler itself uses is
+// weight without a return, and `firnc1` deduplicates import paths as
+// strings (round 39). Instead of "give me every key as an array" there is
+// a CURSOR over the slots:
+//
+//     var i: usize = map_next[K, V](&m, 0)
+//     while i < map_cap[K, V](&m) {
+//         let k: K = map_slot_key[K, V](&m, i)
+//         let w: V = map_slot_value[K, V](&m, i)
+//         i = map_next[K, V](&m, i + 1)
+//     }
+//
+// Whoever does want the keys as an array pushes them into a `Vec[K]` inside
+// this loop -- then the import sits at the caller, where it belongs.
+//
+// A WARNING that holds for every open addressing scheme: do NOT insert
+// while iterating. An insertion can rehash the table, and then the cursor
+// points somewhere random. Deleting is harmless.
+// =====================================================================
+
+fn map_is_empty[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> bool {
+    return (*m).len == 0
+}
+
+// The number of tombstones. A diagnostic: if it keeps climbing,
+// `map_cleanup` helps.
+fn map_dead[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
+    return (*m).dead
+}
+
+// The first used slot with index >= `ab`; `cap` if none follows.
+fn map_next[K: Scalar, V: Scalar](m: *mut Map[K, V], ab: usize) -> usize {
+    var i: usize = ab
+    while i < (*m).cap {
+        if rt.ld8((*m).state, i) == 1 as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return (*m).cap
+}
+
+fn map_first[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
+    return map_next[K, V](m, 0)
+}
+
+// The value or a default. The difference to `map_get`: there the null value
+// is the answer to "missing", here the caller picks it.
+fn map_get_or[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, default: V) -> V {
+    let i: usize = map_find[K, V](m, k)
+    if i >= (*m).cap {
+        return default
+    }
+    let addr: u64 = (*m).values + i as u64 * size_of[V]() as u64
+    return *(addr as *mut V)
+}
+
+// Fetch and know at the same time whether it was there -- that saves the
+// second probe which `map_has` + `map_get` costs.
+fn map_get_if[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, out: *mut V) -> bool {
+    let i: usize = map_find[K, V](m, k)
+    if i >= (*m).cap {
+        return false
+    }
+    let addr: u64 = (*m).values + i as u64 * size_of[V]() as u64
+    *out = *(addr as *mut V)
+    return true
+}
+
+// The address of the value, 0 if the key is missing. With it a value can be
+// changed IN PLACE without probing twice.
+// VALID ONLY until the table grows the next time.
+fn map_value_address[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> u64 {
+    let i: usize = map_find[K, V](m, k)
+    if i >= (*m).cap {
+        return 0
+    }
+    return (*m).values + i as u64 * size_of[V]() as u64
+}
+
+// Insert only if the key is new. `inserted` says whether something really
+// was added; the return value says (as everywhere here) whether memory ran
+// out.
+fn map_set_if_new[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V,
+    inserted: *mut bool) -> bool {
+    *inserted = false
+    if map_find[K, V](m, k) < (*m).cap {
+        return true
+    }
+    if !map_set[K, V](m, k, v) {
+        return false
+    }
+    *inserted = true
+    return true
+}
+
+// The counting pattern in one call: if the key is missing, `delta` is
+// entered, otherwise `delta` is added on top. The return value is the NEW value.
+// On lack of memory the table stays unchanged and the answer is the old
+// value (or the null value).
+fn map_increase[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, delta: V) -> V {
+    let addr: u64 = map_value_address[K, V](m, k)
+    if addr != 0 {
+        let new: V = *(addr as *mut V) + delta
+        *(addr as *mut V) = new
+        return new
+    }
+    if !map_set[K, V](m, k, delta) {
+        return 0 as V
+    }
+    return delta
+}
+
+// Fetch and remove in one step.
+fn map_take[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, out: *mut V) -> bool {
+    if !map_get_if[K, V](m, k, out) {
+        return false
+    }
+    return map_delete[K, V](m, k)
+}
+
+// Clear away the tombstones, keep the capacity. After many deletions the
+// probing otherwise gets longer and longer without the table growing.
+fn map_cleanup[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> bool {
+    if (*m).dead == 0 || (*m).cap == 0 {
+        return true
+    }
+    return map_grow[K, V](m, (*m).cap)
+}
+
+// =====================================================================
+// ROUND 81 -- WHAT THIS MAP COULD NOT DO
+//
+// Everything above hashes a SCALAR. That covers the compiler, which turns
+// every name into an interner number before it ever reaches a table
+// (`lib/std/intern.fi`), and it covers nothing else: a JSON object, an NBT
+// compound, a HTTP header set and a player list are all maps from an OCTET
+// SEQUENCE to something, and interning them first means keeping a second
+// table alive for keys most of which are seen exactly once.
+//
+// Three things come in here, and the last one is the one that makes the
+// first two honest:
+//
+//   1. `Set[K]` -- the map without values. It is a wrapper around
+//      `Map[K, u8]` and not a copy of it; the wrapper costs nothing at run
+//      time (the value array is one octet per slot and the calls inline),
+//      and a copy would be a second probe loop to keep correct.
+//   2. `BMap[V]` -- OCTET SEQUENCES as keys. The keys are COPIED into a
+//      blob the map owns, so a caller may free or overwrite the octets it
+//      inserted from; the slots hold an OFFSET into that blob, not a
+//      pointer, so the blob can be reallocated without touching the table.
+//      Every slot also holds the full 64 bit hash: a probe step compares
+//      the hash first and only touches the key octets when it matches,
+//      which turns a long chain of same-bucket keys from a memcmp storm
+//      into a compare of one word.
+//   3. THE MEASUREMENT. `bmap_probe_max`/`bmap_probe_total` (and the same
+//      pair for `Map`) walk the whole table and report the LONGEST probe
+//      chain and their sum. Open addressing dies of long chains and dies
+//      silently; a table that quietly degenerated into a linear scan
+//      behaves correctly and is a thousand times slower. Round 81 measures
+//      it with a million entries (`tools/stdlib81/run.sh`), and the numbers
+//      are in `docs/ROUND81.md`.
+//
+// THE HASH is `hash.hash_bytes` = xxHash64 (see lib/std/hash.fi). A key of
+// zero length is allowed and hashes like any other.
+//
+// HONEST, for `BMap`:
+//   M1 THE BLOB ONLY SHRINKS ON A REHASH. `bmap_delete` leaves the key
+//      octets where they are -- reclaiming them would mean moving every
+//      offset behind them. The next rehash (which a deletion-heavy table
+//      reaches through the tombstone limit) rebuilds the blob with the live
+//      keys only, so the growth is bounded, not unbounded. `bmap_cleanup`
+//      forces it.
+//   M2 KEYS ARE LIMITED TO 4 GiB each (the length lives in a u32 per slot).
+//   M3 NO ORDER. Iteration follows the slots, so it depends on the hash and
+//      on the insertion history. Whoever needs an order sorts.
+// =====================================================================
+
+// ------------------------------------------------- the collision measurement
+
+// How many probe steps the lookup of `k` costs: 0 = the key sits in the
+// slot its hash points at. `cap` if the key is not there at all.
+fn map_probe_of[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> usize {
+    if (*m).cap == 0 {
+        return 0
+    }
+    let mask: u64 = (*m).cap as u64 - 1
+    let start: u64 = map_hash[K](k) & mask
+    var i: u64 = start
+    var steps: usize = 0
+    while steps < (*m).cap {
+        let z: u8 = rt.ld8((*m).state, i as usize)
+        if z == 0 as u8 {
+            return (*m).cap
+        }
+        if z == 1 as u8 {
+            let addr: u64 = (*m).key + i * size_of[K]() as u64
+            if *(addr as *mut K) == k {
+                return steps
+            }
+        }
+        i = (i + 1) & mask
+        steps = steps + 1
+    }
+    return (*m).cap
+}
+
+// The longest probe chain over every key in the table. O(n) -- a
+// diagnostic, not something a lookup path calls.
+fn map_probe_max[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
+    var worst: usize = 0
+    var i: usize = 0
+    while i < (*m).cap {
+        if rt.ld8((*m).state, i) == 1 as u8 {
+            let addr: u64 = (*m).key + i as u64 * size_of[K]() as u64
+            let s: usize = map_probe_of[K, V](m, *(addr as *mut K))
+            if s < (*m).cap && s > worst {
+                worst = s
+            }
+        }
+        i = i + 1
+    }
+    return worst
+}
+
+// The sum of all probe chains -- divided by `map_len` that is the average
+// cost of a lookup, which is the number that decides whether a hash is
+// good enough.
+fn map_probe_total[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> u64 {
+    var sum: u64 = 0
+    var i: usize = 0
+    while i < (*m).cap {
+        if rt.ld8((*m).state, i) == 1 as u8 {
+            let addr: u64 = (*m).key + i as u64 * size_of[K]() as u64
+            let s: usize = map_probe_of[K, V](m, *(addr as *mut K))
+            if s < (*m).cap {
+                sum = sum + s as u64
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// The load in parts per thousand -- integers only, this language has no
+// business dividing in a diagnostic.
+fn map_load_permille[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
+    if (*m).cap == 0 {
+        return 0
+    }
+    return (*m).len * 1000 / (*m).cap
+}
+
+// -------------------------------------------------------------- Set[K]
+
+struct Set[K] {
+    m: Map[K, u8],
+}
+
+fn set_new[K: Scalar]() -> Set[K] {
+    return Set[K] { m: map_new[K, u8]() }
+}
+
+fn set_free[K: Scalar](s: *mut Set[K]) {
+    map_free[K, u8](&(*s).m)
+}
+
+fn set_clear[K: Scalar](s: *mut Set[K]) {
+    map_clear[K, u8](&(*s).m)
+}
+
+// `true` on success; `added` says whether the element was NEW.
+fn set_add[K: Scalar](s: *mut Set[K], k: K, added: *mut bool) -> bool {
+    return map_set_if_new[K, u8](&(*s).m, k, 1 as u8, added)
+}
+
+fn set_has[K: Scalar](s: *mut Set[K], k: K) -> bool {
+    return map_has[K, u8](&(*s).m, k)
+}
+
+fn set_remove[K: Scalar](s: *mut Set[K], k: K) -> bool {
+    return map_delete[K, u8](&(*s).m, k)
+}
+
+fn set_len[K: Scalar](s: *mut Set[K]) -> usize {
+    return map_len[K, u8](&(*s).m)
+}
+
+fn set_cap[K: Scalar](s: *mut Set[K]) -> usize {
+    return map_cap[K, u8](&(*s).m)
+}
+
+fn set_is_empty[K: Scalar](s: *mut Set[K]) -> bool {
+    return map_is_empty[K, u8](&(*s).m)
+}
+
+fn set_next[K: Scalar](s: *mut Set[K], ab: usize) -> usize {
+    return map_next[K, u8](&(*s).m, ab)
+}
+
+fn set_first[K: Scalar](s: *mut Set[K]) -> usize {
+    return map_first[K, u8](&(*s).m)
+}
+
+fn set_slot_key[K: Scalar](s: *mut Set[K], i: usize) -> K {
+    return map_slot_key[K, u8](&(*s).m, i)
+}
+
+// ------------------------------------------------------------- BMap[V]
+
+struct BMap[V] {
+    hashes: u64, // u64 per slot -- the full hash, compared before the key
+    koff: u64, // u64 per slot -- offset of the key inside `blob`
+    klen: u64, // u32 per slot -- length of the key
+    values: u64, // V per slot
+    state: u64, // u8 per slot: 0 empty, 1 used, 2 deleted
+    blob: u64,
+    blob_len: usize,
+    blob_cap: usize,
+    cap: usize,
+    len: usize,
+    dead: usize,
+}
+
+fn bmap_new[V: Scalar]() -> BMap[V] {
+    return BMap[V] { hashes: 0, koff: 0, klen: 0, values: 0, state: 0,
+        blob: 0, blob_len: 0, blob_cap: 0, cap: 0, len: 0, dead: 0 }
+}
+
+fn bmap_free[V: Scalar](m: *mut BMap[V]) {
+    if (*m).cap > 0 {
+        rt.heap_free((*m).hashes, (*m).cap * 8)
+        rt.heap_free((*m).koff, (*m).cap * 8)
+        rt.heap_free((*m).klen, (*m).cap * 4)
+        rt.heap_free((*m).values, (*m).cap * size_of[V]())
+        rt.heap_free((*m).state, (*m).cap)
+    }
+    if (*m).blob_cap > 0 {
+        rt.heap_free((*m).blob, (*m).blob_cap)
+    }
+    (*m).hashes = 0
+    (*m).koff = 0
+    (*m).klen = 0
+    (*m).values = 0
+    (*m).state = 0
+    (*m).blob = 0
+    (*m).blob_len = 0
+    (*m).blob_cap = 0
+    (*m).cap = 0
+    (*m).len = 0
+    (*m).dead = 0
+}
+
+// Keeps every allocation, throws away the content -- including the key
+// octets, which is the difference to `map_clear`: the blob starts at 0
+// again.
+fn bmap_clear[V: Scalar](m: *mut BMap[V]) {
+    if (*m).cap > 0 {
+        rt.mem_set((*m).state, 0 as u8, (*m).cap)
+    }
+    (*m).len = 0
+    (*m).dead = 0
+    (*m).blob_len = 0
+}
+
+fn bmap_len[V: Scalar](m: *mut BMap[V]) -> usize { return (*m).len }
+fn bmap_cap[V: Scalar](m: *mut BMap[V]) -> usize { return (*m).cap }
+fn bmap_dead[V: Scalar](m: *mut BMap[V]) -> usize { return (*m).dead }
+fn bmap_is_empty[V: Scalar](m: *mut BMap[V]) -> bool { return (*m).len == 0 }
+
+// Every octet this map holds: the five slot arrays plus the key blob. For
+// the soak measurement -- a table that grows where it should not shows up
+// here.
+fn bmap_memory[V: Scalar](m: *mut BMap[V]) -> usize {
+    return (*m).cap * (8 + 8 + 4 + size_of[V]() + 1) + (*m).blob_cap
+}
+
+fn bmap_slot_used[V: Scalar](m: *mut BMap[V], i: usize) -> bool {
+    if i >= (*m).cap {
+        return false
+    }
+    return rt.ld8((*m).state, i) == 1 as u8
+}
+
+fn bmap_key_ptr[V: Scalar](m: *mut BMap[V], i: usize) -> u64 {
+    if i >= (*m).cap {
+        return 0
+    }
+    return (*m).blob + rt.ld64((*m).koff, i)
+}
+
+fn bmap_key_len[V: Scalar](m: *mut BMap[V], i: usize) -> usize {
+    if i >= (*m).cap {
+        return 0
+    }
+    return rt.ld32((*m).klen, i) as usize
+}
+
+fn bmap_key_span[V: Scalar](m: *mut BMap[V], i: usize) -> str.Span {
+    return str.span(bmap_key_ptr[V](m, i) as *mut u8, bmap_key_len[V](m, i))
+}
+
+fn bmap_slot_value[V: Scalar](m: *mut BMap[V], i: usize) -> V {
+    if i >= (*m).cap {
+        return 0 as V
+    }
+    return *(((*m).values + i as u64 * size_of[V]() as u64) as *mut V)
+}
+
+fn bmap_slot_set_value[V: Scalar](m: *mut BMap[V], i: usize, v: V) {
+    if i >= (*m).cap {
+        return
+    }
+    *(((*m).values + i as u64 * size_of[V]() as u64) as *mut V) = v
+}
+
+fn bmap_next[V: Scalar](m: *mut BMap[V], ab: usize) -> usize {
+    var i: usize = ab
+    while i < (*m).cap {
+        if rt.ld8((*m).state, i) == 1 as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return (*m).cap
+}
+
+fn bmap_first[V: Scalar](m: *mut BMap[V]) -> usize {
+    return bmap_next[V](m, 0)
+}
+
+// Room for `n` more octets of key material.
+fn bmap_blob_reserve[V: Scalar](m: *mut BMap[V], n: usize) -> bool {
+    let need: usize = (*m).blob_len + n
+    if need <= (*m).blob_cap {
+        return true
+    }
+    var want: usize = (*m).blob_cap
+    if want == 0 {
+        want = 256
+    }
+    while want < need {
+        want = want * 2
+    }
+    let p: u64 = rt.heap_alloc(want)
+    if p == 0 {
+        return false
+    }
+    if (*m).blob_len > 0 {
+        rt.mem_copy(p, (*m).blob, (*m).blob_len)
+    }
+    if (*m).blob_cap > 0 {
+        rt.heap_free((*m).blob, (*m).blob_cap)
+    }
+    (*m).blob = p
+    (*m).blob_cap = want
+    return true
+}
+
+// The slot of a key, `cap` if it is not there. Stops at state 0, runs
+// across state 2 -- the same rule as `map_find`, for the same reason.
+// THE HASH IS COMPARED FIRST: only a full 64 bit match reaches the octets.
+fn bmap_find[V: Scalar](m: *mut BMap[V], p: u64, n: usize, h: u64) -> usize {
+    if (*m).cap == 0 {
+        return 0
+    }
+    let mask: u64 = (*m).cap as u64 - 1
+    var i: u64 = h & mask
+    var steps: usize = 0
+    while steps < (*m).cap {
+        let z: u8 = rt.ld8((*m).state, i as usize)
+        if z == 0 as u8 {
+            return (*m).cap
+        }
+        if z == 1 as u8 && rt.ld64((*m).hashes, i as usize) == h {
+            let kn: usize = rt.ld32((*m).klen, i as usize) as usize
+            if kn == n {
+                if n == 0 {
+                    return i as usize
+                }
+                if rt.mem_eq((*m).blob + rt.ld64((*m).koff, i as usize), p, n) {
+                    return i as usize
+                }
+            }
+        }
+        i = (i + 1) & mask
+        steps = steps + 1
+    }
+    return (*m).cap
+}
+
+// Writes a pair into a table that is known to have room and not to hold the
+// key. Only for `bmap_grow` and `bmap_set`; it appends the key octets to
+// the blob.
+fn bmap_raw_set[V: Scalar](m: *mut BMap[V], p: u64, n: usize, h: u64, v: V) -> bool {
+    if !bmap_blob_reserve[V](m, n) {
+        return false
+    }
+    let off: usize = (*m).blob_len
+    if n > 0 {
+        rt.mem_copy((*m).blob + off as u64, p, n)
+    }
+    (*m).blob_len = off + n
+
+    let mask: u64 = (*m).cap as u64 - 1
+    var i: u64 = h & mask
+    while rt.ld8((*m).state, i as usize) == 1 as u8 {
+        i = (i + 1) & mask
+    }
+    if rt.ld8((*m).state, i as usize) == 2 as u8 {
+        (*m).dead = (*m).dead - 1
+    }
+    rt.st64((*m).hashes, i as usize, h)
+    rt.st64((*m).koff, i as usize, off as u64)
+    rt.st32((*m).klen, i as usize, n as u32)
+    *(((*m).values + i * size_of[V]() as u64) as *mut V) = v
+    rt.st8((*m).state, i as usize, 1 as u8)
+    (*m).len = (*m).len + 1
+    return true
+}
+
+// Rebuilds the table AND the blob: the new blob holds the live keys only,
+// which is what bounds the growth of a table that is deleted from (M1).
+fn bmap_grow[V: Scalar](m: *mut BMap[V], new_cap: usize) -> bool {
+    var cap: usize = 8
+    while cap < new_cap {
+        cap = cap * 2
+    }
+    let a_h: u64 = rt.heap_alloc(cap * 8)
+    let a_o: u64 = rt.heap_alloc(cap * 8)
+    let a_l: u64 = rt.heap_alloc(cap * 4)
+    let a_v: u64 = rt.heap_alloc(cap * size_of[V]())
+    let a_s: u64 = rt.heap_alloc(cap)
+    if a_h == 0 || a_o == 0 || a_l == 0 || a_v == 0 || a_s == 0 {
+        if a_h != 0 { rt.heap_free(a_h, cap * 8) }
+        if a_o != 0 { rt.heap_free(a_o, cap * 8) }
+        if a_l != 0 { rt.heap_free(a_l, cap * 4) }
+        if a_v != 0 { rt.heap_free(a_v, cap * size_of[V]()) }
+        if a_s != 0 { rt.heap_free(a_s, cap) }
+        return false
+    }
+    rt.mem_set(a_s, 0 as u8, cap)
+
+    // How many octets the live keys really need.
+    var live: usize = 0
+    var i: usize = 0
+    while i < (*m).cap {
+        if rt.ld8((*m).state, i) == 1 as u8 {
+            live = live + rt.ld32((*m).klen, i) as usize
+        }
+        i = i + 1
+    }
+    var bcap: usize = 256
+    while bcap < live + 1 {
+        bcap = bcap * 2
+    }
+    let a_b: u64 = rt.heap_alloc(bcap)
+    if a_b == 0 {
+        rt.heap_free(a_h, cap * 8)
+        rt.heap_free(a_o, cap * 8)
+        rt.heap_free(a_l, cap * 4)
+        rt.heap_free(a_v, cap * size_of[V]())
+        rt.heap_free(a_s, cap)
+        return false
+    }
+
+    let old_h: u64 = (*m).hashes
+    let old_o: u64 = (*m).koff
+    let old_l: u64 = (*m).klen
+    let old_v: u64 = (*m).values
+    let old_s: u64 = (*m).state
+    let old_b: u64 = (*m).blob
+    let old_cap: usize = (*m).cap
+    let old_bcap: usize = (*m).blob_cap
+
+    (*m).hashes = a_h
+    (*m).koff = a_o
+    (*m).klen = a_l
+    (*m).values = a_v
+    (*m).state = a_s
+    (*m).blob = a_b
+    (*m).blob_cap = bcap
+    (*m).blob_len = 0
+    (*m).cap = cap
+    (*m).len = 0
+    (*m).dead = 0
+
+    i = 0
+    while i < old_cap {
+        if rt.ld8(old_s, i) == 1 as u8 {
+            let kp: u64 = old_b + rt.ld64(old_o, i)
+            let kn: usize = rt.ld32(old_l, i) as usize
+            let hv: u64 = rt.ld64(old_h, i)
+            let vv: V = *((old_v + i as u64 * size_of[V]() as u64) as *mut V)
+            bmap_raw_set[V](m, kp, kn, hv, vv)
+        }
+        i = i + 1
+    }
+
+    if old_cap > 0 {
+        rt.heap_free(old_h, old_cap * 8)
+        rt.heap_free(old_o, old_cap * 8)
+        rt.heap_free(old_l, old_cap * 4)
+        rt.heap_free(old_v, old_cap * size_of[V]())
+        rt.heap_free(old_s, old_cap)
+    }
+    if old_bcap > 0 {
+        rt.heap_free(old_b, old_bcap)
+    }
+    return true
+}
+
+fn bmap_reserve[V: Scalar](m: *mut BMap[V], n: usize) -> bool {
+    if (*m).cap * 3 >= (n + (*m).len) * 4 {
+        return true
+    }
+    return bmap_grow[V](m, (n + (*m).len) * 4 / 3 + 1)
+}
+
+fn bmap_set[V: Scalar](m: *mut BMap[V], p: u64, n: usize, v: V) -> bool {
+    let h: u64 = hash.hash_bytes(p, n)
+    let at: usize = bmap_find[V](m, p, n, h)
+    if at < (*m).cap {
+        *(((*m).values + at as u64 * size_of[V]() as u64) as *mut V) = v
+        return true
+    }
+    // Load limit 3/4, tombstones included -- they cost probe steps.
+    if ((*m).len + (*m).dead + 1) * 4 > (*m).cap * 3 {
+        if !bmap_grow[V](m, (*m).len * 2 + 8) {
+            return false
+        }
+    }
+    return bmap_raw_set[V](m, p, n, h, v)
+}
+
+fn bmap_get[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> V {
+    let at: usize = bmap_find[V](m, p, n, hash.hash_bytes(p, n))
+    if at >= (*m).cap {
+        return 0 as V
+    }
+    return *(((*m).values + at as u64 * size_of[V]() as u64) as *mut V)
+}
+
+fn bmap_get_or[V: Scalar](m: *mut BMap[V], p: u64, n: usize, default: V) -> V {
+    let at: usize = bmap_find[V](m, p, n, hash.hash_bytes(p, n))
+    if at >= (*m).cap {
+        return default
+    }
+    return *(((*m).values + at as u64 * size_of[V]() as u64) as *mut V)
+}
+
+fn bmap_get_if[V: Scalar](m: *mut BMap[V], p: u64, n: usize, out: *mut V) -> bool {
+    let at: usize = bmap_find[V](m, p, n, hash.hash_bytes(p, n))
+    if at >= (*m).cap {
+        return false
+    }
+    *out = *(((*m).values + at as u64 * size_of[V]() as u64) as *mut V)
+    return true
+}
+
+fn bmap_has[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> bool {
+    return bmap_find[V](m, p, n, hash.hash_bytes(p, n)) < (*m).cap
+}
+
+// VALID ONLY until the table grows the next time -- same contract as
+// `map_value_address`.
+fn bmap_value_address[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> u64 {
+    let at: usize = bmap_find[V](m, p, n, hash.hash_bytes(p, n))
+    if at >= (*m).cap {
+        return 0
+    }
+    return (*m).values + at as u64 * size_of[V]() as u64
+}
+
+fn bmap_delete[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> bool {
+    let at: usize = bmap_find[V](m, p, n, hash.hash_bytes(p, n))
+    if at >= (*m).cap {
+        return false
+    }
+    rt.st8((*m).state, at, 2 as u8)
+    (*m).len = (*m).len - 1
+    (*m).dead = (*m).dead + 1
+    return true
+}
+
+fn bmap_take[V: Scalar](m: *mut BMap[V], p: u64, n: usize, out: *mut V) -> bool {
+    if !bmap_get_if[V](m, p, n, out) {
+        return false
+    }
+    return bmap_delete[V](m, p, n)
+}
+
+fn bmap_set_if_new[V: Scalar](m: *mut BMap[V], p: u64, n: usize, v: V,
+    inserted: *mut bool) -> bool {
+    *inserted = false
+    if bmap_has[V](m, p, n) {
+        return true
+    }
+    if !bmap_set[V](m, p, n, v) {
+        return false
+    }
+    *inserted = true
+    return true
+}
+
+// The counting pattern -- what a word frequency count is made of.
+fn bmap_increase[V: Scalar](m: *mut BMap[V], p: u64, n: usize, delta: V) -> V {
+    let addr: u64 = bmap_value_address[V](m, p, n)
+    if addr != 0 {
+        let new: V = *(addr as *mut V) + delta
+        *(addr as *mut V) = new
+        return new
+    }
+    if !bmap_set[V](m, p, n, delta) {
+        return 0 as V
+    }
+    return delta
+}
+
+fn bmap_cleanup[V: Scalar](m: *mut BMap[V]) -> bool {
+    if (*m).dead == 0 || (*m).cap == 0 {
+        return true
+    }
+    return bmap_grow[V](m, (*m).cap)
+}
+
+// ------------------------------------------- the measurement, for BMap
+
+fn bmap_probe_of[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> usize {
+    if (*m).cap == 0 {
+        return 0
+    }
+    let h: u64 = hash.hash_bytes(p, n)
+    let mask: u64 = (*m).cap as u64 - 1
+    var i: u64 = h & mask
+    var steps: usize = 0
+    while steps < (*m).cap {
+        let z: u8 = rt.ld8((*m).state, i as usize)
+        if z == 0 as u8 {
+            return (*m).cap
+        }
+        if z == 1 as u8 && rt.ld64((*m).hashes, i as usize) == h {
+            let kn: usize = rt.ld32((*m).klen, i as usize) as usize
+            if kn == n && (n == 0
+                || rt.mem_eq((*m).blob + rt.ld64((*m).koff, i as usize), p, n)) {
+                return steps
+            }
+        }
+        i = (i + 1) & mask
+        steps = steps + 1
+    }
+    return (*m).cap
+}
+
+fn bmap_probe_max[V: Scalar](m: *mut BMap[V]) -> usize {
+    var worst: usize = 0
+    var i: usize = 0
+    while i < (*m).cap {
+        if rt.ld8((*m).state, i) == 1 as u8 {
+            let s: usize = bmap_probe_of[V](m, bmap_key_ptr[V](m, i),
+                bmap_key_len[V](m, i))
+            if s < (*m).cap && s > worst {
+                worst = s
+            }
+        }
+        i = i + 1
+    }
+    return worst
+}
+
+fn bmap_probe_total[V: Scalar](m: *mut BMap[V]) -> u64 {
+    var sum: u64 = 0
+    var i: usize = 0
+    while i < (*m).cap {
+        if rt.ld8((*m).state, i) == 1 as u8 {
+            let s: usize = bmap_probe_of[V](m, bmap_key_ptr[V](m, i),
+                bmap_key_len[V](m, i))
+            if s < (*m).cap {
+                sum = sum + s as u64
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+fn bmap_load_permille[V: Scalar](m: *mut BMap[V]) -> usize {
+    if (*m).cap == 0 {
+        return 0
+    }
+    return (*m).len * 1000 / (*m).cap
+}
+
+// ------------------------------------------------ the same, with `str.Span`
+//
+// A `Span` IS a pointer and a length (SPEC 8.1), so these are not a second
+// implementation -- they are the spelling a caller who works with text
+// wants, without having to take `.p` and `.n` apart by hand.
+
+fn bmap_set_span[V: Scalar](m: *mut BMap[V], s: str.Span, v: V) -> bool {
+    return bmap_set[V](m, s.p as u64, s.n, v)
+}
+
+fn bmap_get_span[V: Scalar](m: *mut BMap[V], s: str.Span) -> V {
+    return bmap_get[V](m, s.p as u64, s.n)
+}
+
+fn bmap_get_span_or[V: Scalar](m: *mut BMap[V], s: str.Span, default: V) -> V {
+    return bmap_get_or[V](m, s.p as u64, s.n, default)
+}
+
+fn bmap_has_span[V: Scalar](m: *mut BMap[V], s: str.Span) -> bool {
+    return bmap_has[V](m, s.p as u64, s.n)
+}
+
+fn bmap_delete_span[V: Scalar](m: *mut BMap[V], s: str.Span) -> bool {
+    return bmap_delete[V](m, s.p as u64, s.n)
+}
+
+// A null terminated literal as a key -- `bmap_set_c(&m, (&name[0]) as u64, 1)`.
+fn bmap_set_c[V: Scalar](m: *mut BMap[V], p: u64, v: V) -> bool {
+    return bmap_set[V](m, p, rt.c_length(p), v)
+}
+
+fn bmap_get_c[V: Scalar](m: *mut BMap[V], p: u64) -> V {
+    return bmap_get[V](m, p, rt.c_length(p))
+}
+
+fn bmap_has_c[V: Scalar](m: *mut BMap[V], p: u64) -> bool {
+    return bmap_has[V](m, p, rt.c_length(p))
+}
+
+// ---------------------------------------------------------------- BSet
+
+struct BSet {
+    m: BMap[u8],
+}
+
+fn bset_new() -> BSet {
+    return BSet { m: bmap_new[u8]() }
+}
+
+fn bset_free(s: *mut BSet) { bmap_free[u8](&(*s).m) }
+fn bset_clear(s: *mut BSet) { bmap_clear[u8](&(*s).m) }
+
+fn bset_add(s: *mut BSet, p: u64, n: usize, added: *mut bool) -> bool {
+    return bmap_set_if_new[u8](&(*s).m, p, n, 1 as u8, added)
+}
+
+fn bset_has(s: *mut BSet, p: u64, n: usize) -> bool {
+    return bmap_has[u8](&(*s).m, p, n)
+}
+
+fn bset_remove(s: *mut BSet, p: u64, n: usize) -> bool {
+    return bmap_delete[u8](&(*s).m, p, n)
+}
+
+fn bset_add_span(s: *mut BSet, t: str.Span, added: *mut bool) -> bool {
+    return bset_add(s, t.p as u64, t.n, added)
+}
+
+fn bset_has_span(s: *mut BSet, t: str.Span) -> bool {
+    return bset_has(s, t.p as u64, t.n)
+}
+
+fn bset_remove_span(s: *mut BSet, t: str.Span) -> bool {
+    return bset_remove(s, t.p as u64, t.n)
+}
+
+fn bset_len(s: *mut BSet) -> usize { return bmap_len[u8](&(*s).m) }
+fn bset_cap(s: *mut BSet) -> usize { return bmap_cap[u8](&(*s).m) }
+fn bset_is_empty(s: *mut BSet) -> bool { return bmap_is_empty[u8](&(*s).m) }
+fn bset_next(s: *mut BSet, ab: usize) -> usize { return bmap_next[u8](&(*s).m, ab) }
+fn bset_first(s: *mut BSet) -> usize { return bmap_first[u8](&(*s).m) }
+fn bset_key_ptr(s: *mut BSet, i: usize) -> u64 { return bmap_key_ptr[u8](&(*s).m, i) }
+fn bset_key_len(s: *mut BSet, i: usize) -> usize { return bmap_key_len[u8](&(*s).m, i) }
+fn bset_key_span(s: *mut BSet, i: usize) -> str.Span { return bmap_key_span[u8](&(*s).m, i) }
+fn bset_probe_max(s: *mut BSet) -> usize { return bmap_probe_max[u8](&(*s).m) }

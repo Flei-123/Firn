@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: MIT
+// demos/mcserver/proto.fi -- packet framing for the Minecraft protocol
+// (round 76).
+//
+// TARGET VERSION: 1.20.4, PROTOCOL 765. Fixed, written down, and checked in
+// one place (`PROTOCOL_VERSION`). Everything else in this demo -- the packet
+// numbers, the field order, the registries -- belongs to exactly this
+// version; a protocol number is not a version range.
+//
+// ------------------------------------------------------------- THE FRAMING
+//
+// Without compression a packet is
+//
+//     [VarInt: length of everything that follows] [VarInt: packet id] [data]
+//
+// and that is the whole framing. Three things about it decide whether a
+// server works:
+//
+//   * THE LENGTH DOES NOT INCLUDE ITSELF. It counts the id and the data.
+//   * THE LENGTH HAS TO BE READ ONE OCTET AT A TIME. A VarInt is one to
+//     five octets, and until the octet without the continuation bit has
+//     arrived nobody knows how long it is. There is no peeking on a socket,
+//     so the reader asks for exactly one octet up to five times. That is
+//     five system calls in the worst case and one in the common one; the
+//     alternative -- reading ahead into a buffer of one's own -- would need
+//     a ring buffer and is what round 77 can do if it ever matters.
+//   * TCP HAS NO MESSAGE BOUNDARIES. A `read` may return three octets where
+//     a packet of 300 was sent, and it may return two packets at once. The
+//     length prefix is the only thing that says where a packet ends, and
+//     `net.read_full` is what makes the reader honour it. A server that
+//     treats one `read` as one packet works on localhost and breaks over a
+//     real connection -- which is why the counter-check in
+//     `tools/mcserver/harness.py` deliberately dribbles its login packet
+//     out one octet at a time.
+//
+// SINCE 1.20.2 the login handshake ends in a CONFIGURATION state, and the
+// packet numbers there are different from the ones in play. The state is
+// therefore not decoration; it decides how a number is read.
+//
+// COMPRESSION IS OFF (`network-compression-threshold: -1`). That is a
+// deliberate choice of this round: with compression on, every packet gains
+// a second length field and a zlib stream, and this repository has no
+// deflate. The client only compresses when the server has asked it to with
+// Set Compression -- so not asking is a complete, correct configuration and
+// not a shortcut.
+
+import std.net
+import std.bytes
+
+export {
+    ProtoError,
+    PROTOCOL_VERSION, VERSION_NAME,
+    ST_HANDSHAKE, ST_STATUS, ST_LOGIN, ST_CONFIG, ST_PLAY,
+    MAX_PACKET,
+    read_packet, write_packet, write_raw_packet, packet_id,
+    read_varint_socket,
+}
+
+// 1.20.4. Everything in this demo is written against exactly this number.
+const PROTOCOL_VERSION: i32 = 765
+// The name the client shows in the server list next to the ping.
+const VERSION_NAME: i32 = 0 // only a marker; the text stands in main.fi
+
+const ST_HANDSHAKE: i32 = 0
+const ST_STATUS: i32 = 1
+const ST_LOGIN: i32 = 2
+const ST_CONFIG: i32 = 3
+const ST_PLAY: i32 = 4
+
+// The vanilla server refuses anything above 2 MiB. A limit is not optional:
+// without it a peer announces a length of 2,000,000,000 and the server
+// reserves it.
+const MAX_PACKET: usize = 2097152
+
+error ProtoError {
+    Closed, // the peer closed cleanly
+    Broken, // the socket failed
+    TooBig, // a length above MAX_PACKET
+    Malformed, // a length <= 0, or a VarInt that does not end
+}
+
+// One VarInt, octet by octet, straight off the socket. See the header for
+// why there is no cheaper way without a buffer of one's own.
+//
+// A VarInt CARRIES A SIGNED 32 BIT VALUE. `ff ff ff ff 0f` is -1, not
+// 4294967295, and a peer is free to send it -- `read_packet` answers a
+// length of -1 with `Malformed` and drops the connection. The octets are
+// collected in a `u32` and then REINTERPRETED, which is what
+// `bytes.bits_i32` is for: round 72 made `as` a checked value cast, so
+// `result as i32` panics on precisely the bit patterns this function
+// exists to accept. `lib/std/bytes.fi` got `bits_i32` at the time; this
+// reader is a copy of it that reads off the socket instead of a buffer,
+// and the copy kept the `as`.
+fn read_varint_socket(c: *mut net.Conn) -> ProtoError!i32 {
+    var result: u32 = 0
+    var shift: u32 = 0
+    var n: usize = 0
+    var one: [u8; 1] = [0]
+    while n < 5 {
+        let got: usize = net.read(c, (&one[0]) as u64, 1) catch 9999 as usize
+        if got == 9999 {
+            return ProtoError::Broken
+        }
+        if got == 0 {
+            return ProtoError::Closed
+        }
+        let by: u8 = one[0]
+        result = result | (((by & 127 as u8) as u32) << shift)
+        n = n + 1
+        if (by & 128 as u8) == 0 as u8 {
+            return bytes.bits_i32(result)
+        }
+        shift = shift + 7 as u32
+    }
+    return ProtoError::Malformed
+}
+
+// The next packet into `b`. Afterwards `b` holds the BODY -- the read
+// cursor stands behind the packet id, which is returned. `b` is reused, so
+// a connection needs one buffer, not one per packet.
+fn read_packet(c: *mut net.Conn, b: *mut bytes.Bytes) -> ProtoError!i32 {
+    let len: i32 = try read_varint_socket(c)
+    if len <= 0 {
+        return ProtoError::Malformed
+    }
+    if len as usize > MAX_PACKET {
+        return ProtoError::TooBig
+    }
+    bytes.bytes_clear(b)
+    bytes.bytes_reserve(b, len as usize)
+    if !bytes.bytes_ok(b) {
+        return ProtoError::TooBig
+    }
+    // `read_full`, not `read`: the length says how many octets belong to
+    // this packet, and TCP says nothing about how they arrive.
+    let got: usize = net.read_full(c, bytes.bytes_ptr(b), len as usize) catch 0
+    if got != len as usize {
+        return ProtoError::Closed
+    }
+    bytes.bytes_set_len(b, len as usize)
+    let id: i32 = bytes.get_varint(b) catch 0 - 1
+    if id < 0 {
+        return ProtoError::Malformed
+    }
+    return id
+}
+
+// Reads the packet id out of a body that is already in memory (the harness
+// uses it; the server gets the id from `read_packet`).
+fn packet_id(b: *mut bytes.Bytes) -> ProtoError!i32 {
+    let id: i32 = bytes.get_varint(b) catch 0 - 1
+    if id < 0 {
+        return ProtoError::Malformed
+    }
+    return id
+}
+
+// id + body, framed, in ONE `write_all`. Not three writes: with TCP_NODELAY
+// on, three writes are three segments, and a handshake of eight packets
+// then costs eight round trips more than it has to.
+//
+// `frame` is a scratch buffer of the caller -- so no allocation per packet.
+fn write_packet(c: *mut net.Conn, id: i32, body: *mut bytes.Bytes,
+    frame: *mut bytes.Bytes) -> ProtoError!usize {
+    let idn: usize = bytes.varint_size(id)
+    let total: usize = idn + bytes.bytes_len(body)
+    bytes.bytes_clear(frame)
+    bytes.bytes_reserve(frame, total + 5)
+    bytes.put_varint(frame, total as i32)
+    bytes.put_varint(frame, id)
+    bytes.put_bytes(frame, body)
+    if !bytes.bytes_ok(frame) {
+        return ProtoError::TooBig
+    }
+    let w: usize = net.write_all(c, bytes.bytes_ptr(frame), bytes.bytes_len(frame)) catch 0
+    if w != bytes.bytes_len(frame) {
+        return ProtoError::Broken
+    }
+    return w
+}
+
+// A packet without a body -- Login Acknowledged, Finish Configuration,
+// Status Request. The length is then the length of the id alone.
+fn write_raw_packet(c: *mut net.Conn, id: i32, frame: *mut bytes.Bytes) -> ProtoError!usize {
+    bytes.bytes_clear(frame)
+    bytes.put_varint(frame, bytes.varint_size(id) as i32)
+    bytes.put_varint(frame, id)
+    let w: usize = net.write_all(c, bytes.bytes_ptr(frame), bytes.bytes_len(frame)) catch 0
+    if w != bytes.bytes_len(frame) {
+        return ProtoError::Broken
+    }
+    return w
+}

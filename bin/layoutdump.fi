@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// bin/layoutdump.fi -- memory layout and calling convention in the format
+// of `firnc0 --emit=layout`.
+//
+// The yardstick for `lib/firnc1/types.fi`. Return values as for astdump:
+// 0 = output * 1 = error * 3 = not core language.
+
+import rt
+import vec
+import intern
+import lexer
+import ast
+import parser
+import types
+
+fn write(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(b, p, n)
+}
+
+fn name_out(it: *mut intern.Interner, b: *mut rt.Buf, nr: u32) {
+    rt.buf_push_bytes(b, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+}
+
+fn word(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(b, p, n)
+}
+
+fn print_ty_name(t: *mut types.Types, it: *mut intern.Interner, b: *mut rt.Buf, i: u32) {
+    let k: u32 = types.ty_kind(t, i)
+    if k == types.K_PTR {
+        var s: [u8; 5] = "(ptr "
+        write(b, (&s[0]) as u64, 5)
+        if types.ty_n(t, i) == 1 {
+            var m: [u8; 4] = "mut "
+            write(b, (&m[0]) as u64, 4)
+        } else {
+            var m2: [u8; 6] = "const "
+            write(b, (&m2[0]) as u64, 6)
+        }
+        print_ty_name(t, it, b, types.ty_a(t, i))
+        rt.buf_push(b, 41 as u8)
+        return
+    }
+    if k == types.K_ARR {
+        var s: [u8; 5] = "(arr "
+        write(b, (&s[0]) as u64, 5)
+        rt.buf_push_dec_u64(b, types.ty_n(t, i))
+        rt.buf_push(b, 32 as u8)
+        print_ty_name(t, it, b, types.ty_a(t, i))
+        rt.buf_push(b, 41 as u8)
+        return
+    }
+    if k == types.K_STRUCT {
+        name_out(it, b, types.st_name(t, types.ty_a(t, i) as usize))
+        return
+    }
+    if k == types.K_FN {
+        // ROUND 58: `(fn (T1 T2) R)` -- like layout_canon.rs.
+        var s: [u8; 4] = "(fn "
+        write(b, (&s[0]) as u64, 4)
+        rt.buf_push(b, 40 as u8)
+        var k2: u32 = 0
+        while k2 < types.fn_ty_len(t, i) {
+            if k2 > 0 {
+                rt.buf_push(b, 32 as u8)
+            }
+            print_ty_name(t, it, b, types.fn_ty_param(t, i, k2))
+            k2 = k2 + 1
+        }
+        rt.buf_push(b, 41 as u8)
+        rt.buf_push(b, 32 as u8)
+        print_ty_name(t, it, b, types.ty_a(t, i))
+        rt.buf_push(b, 41 as u8)
+        return
+    }
+    if k == types.K_VOID {
+        var s: [u8; 4] = "void"
+        write(b, (&s[0]) as u64, 4)
+        return
+    }
+    if k == types.K_ERROR {
+        rt.buf_push(b, 63 as u8)
+        return
+    }
+    // primitive types in the order of their kind numbers
+    var tab: [u8; 54] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32"
+    var idx: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while idx <= 54 {
+        var end: bool = idx == 54
+        if !end {
+            end = tab[idx] == 124 as u8
+        }
+        if end {
+            if nr == k {
+                write(b, (&tab[start]) as u64, idx - start)
+                return
+            }
+            nr = nr + 1
+            start = idx + 1
+        }
+        idx = idx + 1
+    }
+}
+
+// ROUND 71 (layout_canon.rs::class): the class is written per eightbyte.
+// `int1`/`int2` keep their old spelling on purpose, so that every dump of a
+// program without floating point stays character for character what it was;
+// only where an SSE eightbyte really occurs does a new word appear.
+fn print_class(b: *mut rt.Buf, t: *mut types.Types, i: u32) {
+    let kl: u32 = types.class_of(t, i)
+    if kl == types.CLASS_MEM {
+        var m: [u8; 3] = "mem"
+        write(b, (&m[0]) as u64, 3)
+        return
+    }
+    var all_int: bool = true
+    var k: u32 = 0
+    while k < kl {
+        if types.word_class(t, i, k as u64) == types.W_SSE {
+            all_int = false
+        }
+        k = k + 1
+    }
+    if all_int {
+        var s: [u8; 3] = "int"
+        write(b, (&s[0]) as u64, 3)
+        rt.buf_push_dec_u64(b, kl as u64)
+        return
+    }
+    k = 0
+    while k < kl {
+        if k > 0 {
+            rt.buf_push(b, 43 as u8)
+        }
+        if types.word_class(t, i, k as u64) == types.W_SSE {
+            var s2: [u8; 3] = "sse"
+            write(b, (&s2[0]) as u64, 3)
+        } else {
+            var s3: [u8; 3] = "int"
+            write(b, (&s3[0]) as u64, 3)
+        }
+        k = k + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    var source: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&source)
+    var name: u64 = 0
+    var name_n: usize = 0
+    if rt.arg_count(start) > 1 {
+        name = rt.arg_ptr(start, 1)
+        name_n = rt.c_length(name)
+        if !rt.read_file(name, &source) {
+            return 2
+        }
+    } else {
+        var sn: [u8; 7] = "<stdin>"
+        name = (&sn[0]) as u64
+        name_n = 7
+        if !rt.read_stdin(&source) {
+            return 2
+        }
+    }
+
+    var kwtxt: [u8; 179] = "fn|let|var|if|else|while|return|struct|const|profile|as|mut|true|false|syscall|extern|break|continue|defer|errdefer|comptime|for|in|import|export|enum|match|error|try|catch|static"
+    var l: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&source), rt.buf_len(&source),
+        (&kwtxt[0]) as u64, 179, name, name_n)
+    defer lexer.lex_free(&l)
+    lexer.lex_run(&l)
+    if lexer.lex_error(&l) > 0 {
+        return 1
+    }
+    var p: parser.Parser = parser.par_new((&l) as u64)
+    defer parser.par_free(&p)
+    parser.par_run(&p)
+    if parser.par_not_core(&p) {
+        return 3
+    }
+    if parser.par_error(&p) > 0 {
+        return 1
+    }
+
+    let tree: *mut ast.Tree = parser.par_tree(&p)
+    let it: *mut intern.Interner = lexer.lex_names(&l)
+    var ty: types.Types = types.types_new()
+    defer types.types_free(&ty)
+    types.types_resolve(&ty, tree, it)
+
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    var header: [u8; 8] = "(layout\n"
+    write(&out, (&header[0]) as u64, 8)
+
+    var i: usize = 0
+    while i < types.st_count(&ty) {
+        var s1: [u8; 10] = "  (struct "
+        write(&out, (&s1[0]) as u64, 10)
+        name_out(it, &out, types.st_name(&ty, i))
+        var s2: [u8; 6] = " size "
+        write(&out, (&s2[0]) as u64, 6)
+        rt.buf_push_dec_u64(&out, types.st_size(&ty, i))
+        var s3: [u8; 7] = " align "
+        write(&out, (&s3[0]) as u64, 7)
+        rt.buf_push_dec_u64(&out, types.st_alignment(&ty, i))
+        var k: u32 = 0
+        while k < types.st_flen(&ty, i) {
+            let fi: u32 = types.st_foff(&ty, i) + k
+            var f1: [u8; 8] = " (field "
+            write(&out, (&f1[0]) as u64, 8)
+            name_out(it, &out, types.sf_name(&ty, fi))
+            var f2: [u8; 8] = " offset "
+            write(&out, (&f2[0]) as u64, 8)
+            rt.buf_push_dec_u64(&out, types.sf_offset(&ty, fi))
+            write(&out, (&s2[0]) as u64, 6)
+            rt.buf_push_dec_u64(&out, types.size_of(&ty, types.sf_ty(&ty, fi)))
+            write(&out, (&s3[0]) as u64, 7)
+            rt.buf_push_dec_u64(&out, types.alignment_of(&ty, types.sf_ty(&ty, fi)))
+            var f3: [u8; 6] = " type "
+            write(&out, (&f3[0]) as u64, 6)
+            print_ty_name(&ty, it, &out, types.sf_ty(&ty, fi))
+            rt.buf_push(&out, 41 as u8)
+            k = k + 1
+        }
+        var e: [u8; 2] = ")\n"
+        write(&out, (&e[0]) as u64, 2)
+        i = i + 1
+    }
+
+    i = 0
+    while i < ast.fn_count(tree) {
+        // ROUND 58 (fnval.rs): the generated function of a closure does not
+        // stand at top level in the source text -- `firnc0` builds it only
+        // during lowering. Leaving it out here keeps the two layout
+        // renderings comparable.
+        var cw: [u8; 10] = "__closure#"
+        if intern.intern_prefix(it, ast.fn_name(tree, i), (&cw[0]) as u64, 10) {
+            i = i + 1
+            continue
+        }
+        var s4: [u8; 6] = "  (fn "
+        write(&out, (&s4[0]) as u64, 6)
+        name_out(it, &out, ast.fn_name(tree, i))
+        var k: u32 = 0
+        while k < ast.fn_plen(tree, i) {
+            let pt: u32 = types.param_ty_resolved(&ty, i, k)
+            var a1: [u8; 6] = " (arg "
+            write(&out, (&a1[0]) as u64, 6)
+            print_ty_name(&ty, it, &out, pt)
+            var s2b: [u8; 6] = " size "
+            write(&out, (&s2b[0]) as u64, 6)
+            rt.buf_push_dec_u64(&out, types.size_of(&ty, pt))
+            var a2: [u8; 7] = " class "
+            write(&out, (&a2[0]) as u64, 7)
+            print_class(&out, &ty, pt)
+            rt.buf_push(&out, 41 as u8)
+            k = k + 1
+        }
+        let rt2: u32 = types.ret_ty_the_func(&ty, i)
+        var r1: [u8; 6] = " (ret "
+        write(&out, (&r1[0]) as u64, 6)
+        print_ty_name(&ty, it, &out, rt2)
+        var s2c: [u8; 6] = " size "
+        write(&out, (&s2c[0]) as u64, 6)
+        rt.buf_push_dec_u64(&out, types.size_of(&ty, rt2))
+        var a3: [u8; 7] = " class "
+        write(&out, (&a3[0]) as u64, 7)
+        print_class(&out, &ty, rt2)
+        var a4: [u8; 6] = " sret "
+        write(&out, (&a4[0]) as u64, 6)
+        if types.needs_sret(&ty, rt2) {
+            rt.buf_push(&out, 49 as u8)
+        } else {
+            rt.buf_push(&out, 48 as u8)
+        }
+        rt.buf_push(&out, 41 as u8)
+        var e2: [u8; 2] = ")\n"
+        write(&out, (&e2[0]) as u64, 2)
+        i = i + 1
+    }
+
+    var closing: [u8; 2] = ")\n"
+    write(&out, (&closing[0]) as u64, 2)
+    if !rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out)) {
+        return 2
+    }
+    return 0
+}

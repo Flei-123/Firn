@@ -1,0 +1,702 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/x11.fi -- a window, by speaking X11 (round B5).
+//
+// The browser has had a canvas since round B3 and a network since B4. What
+// it has never had is a WINDOW: something a person can type an address
+// into, scroll, and press Back in. This file is that, and it is
+// deliberately the whole X11 client -- no Xlib, no xcb, no C library at
+// all, because Firn has none of those and the point of the language is
+// that it does not need them.
+//
+// ============================================================= THE PROTOCOL
+//
+// X11 is a byte protocol over a stream socket and it is small. The client
+// sends requests of 4-octet units; the server sends 32-octet replies,
+// errors and events. What this file uses is eight requests:
+//
+//   CreateWindow(1)  CreateGC(55)  MapWindow(8)  PutImage(72)
+//   PolyFillRectangle(70)  ChangeProperty(18)  QueryExtension -- no.
+//   GetKeyboardMapping(101)  ImageText8(76)
+//
+// and four events: Expose(12), KeyPress(2), ButtonPress(4),
+// ConfigureNotify(22).
+//
+// THE CONNECTION SETUP is the part with no second chance. The first thing
+// the client sends is twelve octets plus the authorisation, and the
+// server answers with a block that contains everything else: the resource
+// id base and mask (which is where every id the client invents has to come
+// from), the root window, the visual, and the format list. Getting the
+// PADDING of that block wrong gives a client that connects and then draws
+// nothing, which is the failure this file was written twice to avoid.
+//
+// THE AUTHORISATION comes out of `~/.Xauthority` -- a list of
+// (family, address, display, name, data) records. Without it a normal X
+// server closes the connection immediately, and "MIT-MAGIC-COOKIE-1" plus
+// sixteen octets is what every desktop uses. The file is read here rather
+// than shelling out to `xauth`, because there is no shell.
+//
+// ============================================================== HONEST
+//
+// U1 ONE VISUAL DEPTH: 24 bits in a 32 bit pixel, which is what every
+//    server on a machine made this century offers. A depth this file does
+//    not know is a refusal with a reason, not a black window.
+// U2 NO WINDOW MANAGER PROTOCOL beyond the window name. No WM_DELETE, no
+//    resize hints; closing the window with the mouse kills the process
+//    with an I/O error, which is what a bare X client does.
+// U3 THE WHOLE CANVAS IS SENT ON EVERY DRAW. PutImage of a 1200x800
+//    window is 3.8 MB over a Unix socket, and at a few hundred frames a
+//    second that is not the bottleneck -- the layout is. A damage
+//    rectangle would be the obvious next step.
+// U4 NO SHARED MEMORY (MIT-SHM). It would remove the copy of U3 and it
+//    needs a second transport with file descriptor passing.
+// U5 THE KEYBOARD IS THE US MAPPING, read from the server with
+//    GetKeyboardMapping and used for the ASCII range only. That is enough
+//    for an address bar and it is not enough for text in a page.
+import std.rt
+import std.net
+
+export {
+    X11, x11_new, x11_open, x11_close, x11_ok,
+    x11_create_window, x11_map, x11_put_image, x11_flush,
+    x11_next_event, x11_pending,
+    x11_width, x11_height, x11_set_title, x11_fill,
+    x11_open_font, x11_text, x11_key_ascii,
+    EV_NONE, EV_EXPOSE, EV_KEY, EV_BUTTON, EV_CONFIGURE, EV_CLOSED,
+}
+
+const EV_NONE: u32 = 0
+const EV_EXPOSE: u32 = 1
+const EV_KEY: u32 = 2
+const EV_BUTTON: u32 = 3
+const EV_CONFIGURE: u32 = 4
+const EV_CLOSED: u32 = 5
+
+const RD_ERR: usize = 18446744073709551615
+
+struct X11 {
+    c: net.Conn,
+    open: bool,
+    root: u32,
+    id_base: u32,
+    id_mask: u32,
+    next_id: u32,
+    visual: u32,
+    depth: u32,
+    win: u32,
+    gc: u32,
+    font: u32,
+    w: usize,
+    h: usize,
+    seq: u32,
+    // the reply/event buffer
+    rb: rt.Buf,
+    rpos: usize,
+    // the last event
+    ev_kind: u32,
+    ev_a: u32, // key code / button
+    ev_x: u32,
+    ev_y: u32,
+    ev_state: u32,
+    // the keyboard map, for the ASCII range
+    keys: [u32; 256],
+    min_key: u32,
+    per_key: u32,
+    fail: u32,
+}
+
+fn x11_new() -> X11 {
+    return X11 { c: net.Conn { fd: -1, err: 0, peer: 0 as u32,
+            peer_port: 0 as u16 }, open: false, root: 0, id_base: 0,
+        id_mask: 0, next_id: 0, visual: 0, depth: 0, win: 0, gc: 0,
+        font: 0,
+        w: 0, h: 0, seq: 0, rb: rt.buf_new(), rpos: 0, ev_kind: 0,
+        ev_a: 0, ev_x: 0, ev_y: 0, ev_state: 0, keys: [0; 256],
+        min_key: 8, per_key: 1, fail: 0 }
+}
+
+fn x11_ok(x: *mut X11) -> bool {
+    return (*x).open
+}
+
+fn x11_width(x: *mut X11) -> usize {
+    return (*x).w
+}
+
+fn x11_height(x: *mut X11) -> usize {
+    return (*x).h
+}
+
+fn put32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn put16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+}
+
+fn ld32le(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+    | ((rt.ld8(p, off + 2) as u32) << 16)
+    | ((rt.ld8(p, off + 3) as u32) << 24)
+}
+
+fn ld16le(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+}
+
+fn send(x: *mut X11, p: u64, n: usize) -> bool {
+    let k: usize = net.write_all(&(*x).c, p, n) catch RD_ERR
+    return k == n
+}
+
+// Reads until at least `need` octets stand at `rpos`.
+fn want(x: *mut X11, need: usize) -> bool {
+    while (*x).rb.len - (*x).rpos < need {
+        if (*x).rpos > 0 && (*x).rpos == (*x).rb.len {
+            rt.buf_clear(&(*x).rb)
+            (*x).rpos = 0
+        }
+        let have: usize = (*x).rb.len
+        rt.buf_reserve(&(*x).rb, have + 65536)
+        if (*x).rb.cap < have + 65536 {
+            return false
+        }
+        let k: usize = net.read(&(*x).c, (*x).rb.ptr + have as u64, 65536)
+        catch RD_ERR
+        if k == RD_ERR || k == 0 {
+            (*x).open = false
+            return false
+        }
+        rt.buf_set_len(&(*x).rb, have + k)
+    }
+    return true
+}
+
+// ~/.Xauthority, the MIT-MAGIC-COOKIE-1 record for this display. The file
+// is a list of big-endian counted strings; the first cookie of the right
+// name is taken, which is what a client with one display does.
+fn read_auth(name: *mut rt.Buf, data: *mut rt.Buf) -> bool {
+    var path: [u8; 256] = [0; 256]
+    var home: [u8; 6] = "/root\0"
+    // The environment is not reachable from `rt`, so the two places an
+    // Xauthority realistically is are tried by name.
+    var tried: usize = 0
+    var b: rt.Buf = rt.buf_new()
+    var got: bool = false
+    var p1: [u8; 18] = "/root/.Xauthority\0"
+    if rt.read_file((&p1[0]) as u64, &b) {
+        got = true
+    }
+    if !got {
+        rt.buf_free(&b)
+        return false
+    }
+    let p: u64 = b.ptr
+    let n: usize = b.len
+    var at: usize = 0
+    var found: bool = false
+    while at + 2 <= n {
+        // family(2) address(2+n) number(2+n) name(2+n) data(2+n), all
+        // big-endian counts
+        at = at + 2
+        var i: usize = 0
+        var lens: [usize; 4] = [0; 4]
+        var offs: [usize; 4] = [0; 4]
+        var bad: bool = false
+        while i < 4 {
+            if at + 2 > n {
+                bad = true
+                break
+            }
+            let l: usize = ((rt.ld8(p, at) as usize) << 8)
+            | (rt.ld8(p, at + 1) as usize)
+            at = at + 2
+            offs[i] = at
+            lens[i] = l
+            at = at + l
+            if at > n {
+                bad = true
+                break
+            }
+            i = i + 1
+        }
+        if bad {
+            break
+        }
+        if lens[2] == 18 {
+            rt.buf_clear(name)
+            rt.buf_push_bytes(name, p + offs[2] as u64, lens[2])
+            rt.buf_clear(data)
+            rt.buf_push_bytes(data, p + offs[3] as u64, lens[3])
+            found = true
+            break
+        }
+    }
+    rt.buf_free(&b)
+    return found
+}
+
+fn pad4(n: usize) -> usize {
+    return (4 - (n % 4)) % 4
+}
+
+// Opens display `:<num>` over the Unix socket. `false` and `fail` says
+// where it stopped.
+fn x11_open(x: *mut X11, display: usize) -> bool {
+    var path: [u8; 20] = "/tmp/.X11-unix/X0   "
+    var plen: usize = 17
+    if display < 10 {
+        path[16] = (48 + display) as u8
+    } else {
+        path[16] = (48 + (display / 10) % 10) as u8
+        path[17] = (48 + (display % 10)) as u8
+        plen = 18
+    }
+    var bad: bool = false
+    let c: net.Conn = net.connect_unix((&path[0]) as u64, plen)
+    catch | e | conn_fail(&bad)
+    if bad {
+        (*x).fail = 1
+        return false
+    }
+    (*x).c = c
+    var name: rt.Buf = rt.buf_new()
+    var data: rt.Buf = rt.buf_new()
+    let have_auth: bool = read_auth(&name, &data)
+    var req: rt.Buf = rt.buf_new()
+    rt.buf_push(&req, 108 as u8) // 'l' -- little endian
+    rt.buf_push(&req, 0 as u8)
+    put16(&req, 11 as u32) // protocol major
+    put16(&req, 0 as u32) // minor
+    if have_auth {
+        put16(&req, name.len as u32)
+        put16(&req, data.len as u32)
+    } else {
+        put16(&req, 0 as u32)
+        put16(&req, 0 as u32)
+    }
+    put16(&req, 0 as u32) // unused
+    if have_auth {
+        rt.buf_push_bytes(&req, name.ptr, name.len)
+        var q: usize = 0
+        let pn: usize = pad4(name.len)
+        while q < pn {
+            rt.buf_push(&req, 0 as u8)
+            q = q + 1
+        }
+        rt.buf_push_bytes(&req, data.ptr, data.len)
+        q = 0
+        let pd: usize = pad4(data.len)
+        while q < pd {
+            rt.buf_push(&req, 0 as u8)
+            q = q + 1
+        }
+    }
+    let sent: bool = send(x, req.ptr, req.len)
+    rt.buf_free(&req)
+    rt.buf_free(&name)
+    rt.buf_free(&data)
+    if !sent {
+        (*x).fail = 2
+        return false
+    }
+    (*x).open = true
+    if !want(x, 8) {
+        (*x).fail = 3
+        return false
+    }
+    let base: u64 = (*x).rb.ptr + (*x).rpos as u64
+    let status: u8 = rt.ld8(base, 0)
+    let extra: usize = (ld16le(base, 6) as usize) * 4
+    if !want(x, 8 + extra) {
+        (*x).fail = 4
+        return false
+    }
+    if status != 1 as u8 {
+        (*x).fail = 5 // refused -- almost always the authorisation
+        (*x).open = false
+        return false
+    }
+    let b2: u64 = (*x).rb.ptr + (*x).rpos as u64
+    (*x).id_base = ld32le(b2, 12)
+    (*x).id_mask = ld32le(b2, 16)
+    let vendor_len: usize = ld16le(b2, 24) as usize
+    let nformats: usize = rt.ld8(b2, 29) as usize
+    var at: usize = 40 + vendor_len + pad4(vendor_len) + nformats * 8
+    // the first screen
+    (*x).root = ld32le(b2, at)
+    (*x).depth = rt.ld8(b2, at + 38) as u32
+    // the first depth of the first screen, and its first visual
+    let ndepths: usize = rt.ld8(b2, at + 39) as usize
+    var dat: usize = at + 40
+    var vis: u32 = 0
+    var vdepth: u32 = 0
+    var di: usize = 0
+    while di < ndepths {
+        let dep: u32 = rt.ld8(b2, dat) as u32
+        let nvis: usize = ld16le(b2, dat + 2) as usize
+        if dep == 24 as u32 && nvis > 0 {
+            vis = ld32le(b2, dat + 8)
+            vdepth = 24
+            break
+        }
+        dat = dat + 8 + nvis * 24
+        di = di + 1
+    }
+    if vis == 0 as u32 {
+        (*x).fail = 6 // U1: no 24 bit visual
+        (*x).open = false
+        return false
+    }
+    (*x).visual = vis
+    (*x).depth = vdepth
+    (*x).next_id = 0
+    (*x).rpos = (*x).rpos + 8 + extra
+    return true
+}
+
+fn conn_fail(bad: *mut bool) -> net.Conn {
+    *bad = true
+    return net.Conn { fd: -1, err: 0, peer: 0 as u32, peer_port: 0 as u16 }
+}
+
+fn new_id(x: *mut X11) -> u32 {
+    let id: u32 = (*x).id_base | ((*x).next_id & (*x).id_mask)
+    (*x).next_id = (*x).next_id + 1 as u32
+    return id
+}
+
+fn x11_create_window(x: *mut X11, w: usize, h: usize) -> bool {
+    (*x).win = new_id(x)
+    (*x).gc = new_id(x)
+    (*x).w = w
+    (*x).h = h
+    var r: rt.Buf = rt.buf_new()
+    // CreateWindow
+    rt.buf_push(&r, 1 as u8)
+    rt.buf_push(&r, (*x).depth as u8)
+    put16(&r, 10 as u32) // length in 4-octet units, with two values
+    put32(&r, (*x).win)
+    put32(&r, (*x).root)
+    put16(&r, 0 as u32) // x
+    put16(&r, 0 as u32) // y
+    put16(&r, w as u32)
+    put16(&r, h as u32)
+    put16(&r, 0 as u32) // border width
+    put16(&r, 1 as u32) // InputOutput
+    put32(&r, (*x).visual)
+    put32(&r, 2050 as u32) // background-pixel (2) | event-mask (2048)
+    put32(&r, 16777215 as u32) // white
+    // Exposure | KeyPress | ButtonPress | StructureNotify
+    put32(&r, 32769 as u32 | 4 as u32 | 131072 as u32)
+    // CreateGC
+    rt.buf_push(&r, 55 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, (*x).win)
+    put32(&r, 0 as u32) // no value mask
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+fn x11_set_title(x: *mut X11, p: u64, n: usize) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 18 as u8) // ChangeProperty
+    rt.buf_push(&r, 0 as u8) // Replace
+    put16(&r, (6 + (n + pad4(n)) / 4) as u32)
+    put32(&r, (*x).win)
+    put32(&r, 39 as u32) // WM_NAME
+    put32(&r, 31 as u32) // STRING
+    rt.buf_push(&r, 8 as u8)
+    rt.buf_push(&r, 0 as u8)
+    rt.buf_push(&r, 0 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put32(&r, n as u32)
+    rt.buf_push_bytes(&r, p, n)
+    var q: usize = 0
+    while q < pad4(n) {
+        rt.buf_push(&r, 0 as u8)
+        q = q + 1
+    }
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+fn x11_map(x: *mut X11) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 8 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 2 as u32)
+    put32(&r, (*x).win)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+fn x11_fill(x: *mut X11, px: u32, x0: usize, y0: usize, w: usize,
+    h: usize) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    // ChangeGC: foreground
+    rt.buf_push(&r, 56 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, 4 as u32) // GCForeground
+    put32(&r, px)
+    rt.buf_push(&r, 70 as u8) // PolyFillRectangle
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 5 as u32)
+    put32(&r, (*x).win)
+    put32(&r, (*x).gc)
+    put16(&r, x0 as u32)
+    put16(&r, y0 as u32)
+    put16(&r, w as u32)
+    put16(&r, h as u32)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// The canvas, as BGRX in a 32 bit pixel -- which is what a normal X server
+// with a 24 bit TrueColor visual wants. A whole PutImage may not be longer
+// than the server's maximum request, so the picture goes up in bands.
+fn x11_put_image(x: *mut X11, px: u64, w: usize, h: usize, dx: usize,
+    dy: usize) -> bool {
+    let per_row: usize = w * 4
+    if per_row == 0 {
+        return true
+    }
+    // 256 KiB of pixels per request keeps well inside every server's
+    // maximum request length (which is at least 256 KiB in units of four).
+    var rows: usize = 65536 / per_row
+    if rows == 0 {
+        rows = 1
+    }
+    var y: usize = 0
+    var r: rt.Buf = rt.buf_new()
+    while y < h {
+        var band: usize = h - y
+        if band > rows {
+            band = rows
+        }
+        rt.buf_clear(&r)
+        let bytes: usize = band * per_row
+        rt.buf_push(&r, 72 as u8) // PutImage
+        rt.buf_push(&r, 2 as u8) // ZPixmap
+        put16(&r, (6 + bytes / 4) as u32)
+        put32(&r, (*x).win)
+        put32(&r, (*x).gc)
+        put16(&r, w as u32)
+        put16(&r, band as u32)
+        put16(&r, dx as u32)
+        put16(&r, (dy + y) as u32)
+        rt.buf_push(&r, 0 as u8) // left-pad
+        rt.buf_push(&r, (*x).depth as u8)
+        rt.buf_push(&r, 0 as u8)
+        rt.buf_push(&r, 0 as u8)
+        rt.buf_push_bytes(&r, px + (y * per_row) as u64, bytes)
+        if !send(x, r.ptr, r.len) {
+            rt.buf_free(&r)
+            return false
+        }
+        y = y + band
+    }
+    rt.buf_free(&r)
+    return true
+}
+
+// The server's own bitmap font, so that the address bar has letters in it
+// without the browser's font machinery being dragged into the chrome.
+// "fixed" is the one font every X server has had since 1987.
+fn x11_open_font(x: *mut X11) -> bool {
+    var nm: [u8; 5] = "fixed"
+    (*x).font = new_id(x)
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 45 as u8) // OpenFont
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, (3 + (5 + pad4(5)) / 4) as u32)
+    put32(&r, (*x).font)
+    put16(&r, 5 as u32)
+    put16(&r, 0 as u32)
+    rt.buf_push_bytes(&r, (&nm[0]) as u64, 5)
+    var q: usize = 0
+    while q < pad4(5) {
+        rt.buf_push(&r, 0 as u8)
+        q = q + 1
+    }
+    // ChangeGC: font
+    rt.buf_push(&r, 56 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, 16384 as u32) // GCFont
+    put32(&r, (*x).font)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// ImageText8: the octets are drawn with the background filled in, which is
+// what an address bar wants -- no flicker and no leftovers from the last
+// URL.
+fn x11_text(x: *mut X11, px: u32, bg: u32, tx: usize, ty: usize, p: u64,
+    n: usize) -> bool {
+    var m: usize = n
+    if m > 254 {
+        m = 254
+    }
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 56 as u8) // ChangeGC
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 5 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, 12 as u32) // GCForeground | GCBackground
+    put32(&r, px)
+    put32(&r, bg)
+    rt.buf_push(&r, 76 as u8) // ImageText8
+    rt.buf_push(&r, m as u8)
+    put16(&r, (4 + (m + pad4(m)) / 4) as u32)
+    put32(&r, (*x).win)
+    put32(&r, (*x).gc)
+    put16(&r, tx as u32)
+    put16(&r, ty as u32)
+    rt.buf_push_bytes(&r, p, m)
+    var q: usize = 0
+    while q < pad4(m) {
+        rt.buf_push(&r, 0 as u8)
+        q = q + 1
+    }
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// The US keyboard as every X server hands it out, for the ASCII range
+// only -- see U5. Keycode 9 is Escape, 22 Backspace, 36 Return; the
+// letters and digits sit in two runs that have not moved since the IBM PC.
+fn x11_key_ascii(code: u32, shift: bool) -> u32 {
+    var row1: [u8; 12] = "1234567890-="
+    var row1s: [u8; 12] = "!@#$%^&*()_+"
+    var row2: [u8; 12] = "qwertyuiop[]"
+    var row3: [u8; 11] = "asdfghjkl;'"
+    var row4: [u8; 10] = "zxcvbnm,./"
+    if code >= 10 as u32 && code <= 21 as u32 {
+        let i: usize = (code - 10 as u32) as usize
+        if shift {
+            return row1s[i] as u32
+        }
+        return row1[i] as u32
+    }
+    if code >= 24 as u32 && code <= 35 as u32 {
+        let i: usize = (code - 24 as u32) as usize
+        var ch: u32 = row2[i] as u32
+        if shift && ch >= 97 as u32 && ch <= 122 as u32 {
+            ch = ch - 32 as u32
+        }
+        return ch
+    }
+    if code >= 38 as u32 && code <= 48 as u32 {
+        let i: usize = (code - 38 as u32) as usize
+        var ch: u32 = row3[i] as u32
+        if shift && ch >= 97 as u32 && ch <= 122 as u32 {
+            ch = ch - 32 as u32
+        }
+        return ch
+    }
+    if code >= 52 as u32 && code <= 61 as u32 {
+        let i: usize = (code - 52 as u32) as usize
+        var ch: u32 = row4[i] as u32
+        if shift && ch >= 97 as u32 && ch <= 122 as u32 {
+            ch = ch - 32 as u32
+        }
+        return ch
+    }
+    if code == 65 as u32 {
+        return 32 as u32 // space
+    }
+    if code == 61 as u32 {
+        return 47 as u32 // slash
+    }
+    return 0 as u32
+}
+
+fn x11_flush(x: *mut X11) -> bool {
+    // Nothing is buffered on this side; a request is written as it is
+    // built. GetInputFocus is the classic round trip that makes the
+    // server work through everything before it answers.
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 43 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 1 as u32)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// Is at least one 32 octet message already here?
+fn x11_pending(x: *mut X11) -> bool {
+    return (*x).rb.len - (*x).rpos >= 32
+}
+
+// The next event, BLOCKING. Replies and errors are counted and dropped --
+// this client asks no question whose answer it needs.
+fn x11_next_event(x: *mut X11) -> u32 {
+    while true {
+        if !want(x, 32) {
+            (*x).ev_kind = EV_CLOSED
+            return EV_CLOSED
+        }
+        let p: u64 = (*x).rb.ptr + (*x).rpos as u64
+        let code: u8 = rt.ld8(p, 0) & 127 as u8
+        var consume: usize = 32
+        if code == 1 as u8 {
+            // a reply: 32 octets plus the length field in units of four
+            let extra: usize = (ld32le(p, 4) as usize) * 4
+            if !want(x, 32 + extra) {
+                (*x).ev_kind = EV_CLOSED
+                return EV_CLOSED
+            }
+            consume = 32 + extra
+        }
+        (*x).rpos = (*x).rpos + consume
+        if code == 12 as u8 { // Expose
+            (*x).ev_kind = EV_EXPOSE
+            return EV_EXPOSE
+        }
+        if code == 2 as u8 { // KeyPress
+            (*x).ev_a = rt.ld8(p, 1) as u32
+            (*x).ev_state = ld16le(p, 28)
+            (*x).ev_kind = EV_KEY
+            return EV_KEY
+        }
+        if code == 4 as u8 { // ButtonPress
+            (*x).ev_a = rt.ld8(p, 1) as u32
+            (*x).ev_x = ld16le(p, 24)
+            (*x).ev_y = ld16le(p, 26)
+            (*x).ev_kind = EV_BUTTON
+            return EV_BUTTON
+        }
+        if code == 22 as u8 { // ConfigureNotify
+            (*x).w = ld16le(p, 20) as usize
+            (*x).h = ld16le(p, 22) as usize
+            (*x).ev_kind = EV_CONFIGURE
+            return EV_CONFIGURE
+        }
+    }
+    return EV_NONE
+}
+
+fn x11_close(x: *mut X11) {
+    if (*x).open {
+        net.close(&(*x).c)
+        (*x).open = false
+    }
+    rt.buf_free(&(*x).rb)
+}

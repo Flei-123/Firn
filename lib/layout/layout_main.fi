@@ -1,0 +1,484 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/layout/layout_main.fi -- the driver of the whole layout path (root file).
+//
+// HTML plus CSS in, ONE RECTANGLE PER ELEMENT out. In one run it does:
+//
+//   1. HTML -> DOM             (lib/browser/, round 54)
+//   2. CSS  -> stylesheet      (lib/css/, round 60)
+//   3. cascade + inheritance   (lib/css/cascade.fi)
+//   4. DOM  -> box tree        (lib/layout/build.fi, round 61)
+//   5. box tree -> geometry    (lib/layout/flow.fi, round 61)
+//
+// The job format (little-endian, see tools/layout/LOG.md):
+//     u32  viewport width in px
+//     u32  viewport height in px
+//     u32  n ; u8[n]   the HTML document (WTF-8)
+//     u32  n ; u8[n]   the user agent stylesheet   (origin 0)
+//     u32  n ; u8[n]   the author stylesheet       (origin 2)
+//
+// The output per job:
+//     E <index> <parent> <tag>              one line per elem
+//     B <index> <x> <y> <width> <height>    the BORDER box, viewport coords
+//     #END
+//
+// `B` is deliberately the same thing `getBoundingClientRect()` of a
+// browser returns, so that the cross-check in tools/layout/ can subtract
+// the two without a conversion in between.
+//
+// Compile with:  firnc -o build/layout lib/layout/layout_main.fi
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+import layout.box
+import layout.build
+import layout.flow
+import layout.stack
+
+#[no_gc]
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn byte_at(base: u64, total: usize, k: usize) -> u32 {
+    if k >= total {
+        return 0 as u32
+    }
+    return (*((base + k as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn decode_wtf8(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    let base: u64 = mem.buf_ptr(b) as u64
+    let total: usize = mem.buf_len(b)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = byte_at(base, total, off + i)
+        if c0 < 0x80 as u32 {
+            mem.cp_push(out, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 {
+            mem.cp_push(out, ((c0 & 0x07 as u32) << 18) |
+                ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 12) |
+                ((byte_at(base, total, off + i + 2) & 0x3F as u32) << 6) |
+                (byte_at(base, total, off + i + 3) & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 {
+            mem.cp_push(out, ((c0 & 0x0F as u32) << 12) |
+                ((byte_at(base, total, off + i + 1) & 0x3F as u32) << 6) |
+                (byte_at(base, total, off + i + 2) & 0x3F as u32))
+            i = i + 3
+        } else {
+            mem.cp_push(out, ((c0 & 0x1F as u32) << 6) |
+                (byte_at(base, total, off + i + 1) & 0x3F as u32))
+            i = i + 2
+        }
+    }
+}
+
+// ------------------------------------------------------------ The output
+
+#[no_gc]
+fn lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn out_nl(out: *mut mem.Buf) {
+    mem.buf_push(out, 10 as u8)
+}
+
+#[no_gc]
+fn out_space(out: *mut mem.Buf) {
+    mem.buf_push(out, 32 as u8)
+}
+
+#[no_gc]
+fn out_i64(out: *mut mem.Buf, v: i64) {
+    if v < 0 {
+        mem.buf_push(out, 45 as u8)
+        mem.buf_push_dec(out, (0 - v) as u64)
+    } else {
+        mem.buf_push_dec(out, v as u64)
+    }
+}
+
+// Four decimal places. A browser computes in 1/64 px, so the fourth place
+// is already below anything that could be a real difference -- and a
+// shortest round-trip printer for f64 is not needed for that.
+#[no_gc]
+fn out_fixed(out: *mut mem.Buf, v: f64) {
+    var x: f64 = v
+    var negative: bool = false
+    if x < 0.0 {
+        negative = true
+        x = 0.0 - x
+    }
+    let scaled: i64 = (x * 10000.0 + 0.5) as i64
+    if negative && scaled != 0 {
+        mem.buf_push(out, 45 as u8)
+    }
+    mem.buf_push_dec(out, (scaled / 10000) as u64)
+    mem.buf_push(out, 46 as u8)
+    var rest: i64 = scaled % 10000
+    mem.buf_push(out, (48 + rest / 1000) as u8)
+    mem.buf_push(out, (48 + (rest / 100) % 10) as u8)
+    mem.buf_push(out, (48 + (rest / 10) % 10) as u8)
+    mem.buf_push(out, (48 + rest % 10) as u8)
+}
+
+#[no_gc]
+fn out_name(out: *mut mem.Buf, nm: *mut names.Names, id: u32) {
+    let p: *mut u8 = names.names_ptr(nm, id)
+    let n: usize = names.names_length(nm, id)
+    if n == 0 {
+        mem.buf_push(out, 63 as u8)
+        return
+    }
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// ------------------------------------------- Stylesheets INSIDE the document
+
+// The text of an elem, concatenated over its text children. A `<style>`
+// elem holds raw text, so one level is enough.
+fn elem_text(k: Gc[Node], out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_TEXT {
+            let t: Gc[Text] = c as Gc[Text]
+            node.chain_after_cpbuf(t.data, out)
+        }
+        c = c.next
+    }
+}
+
+fn chain_to_cpbuf(k: Gc[Chain], out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    if k == gc_null[Chain]() {
+        return
+    }
+    node.chain_after_cpbuf(k, out)
+}
+
+// ---------------------------------------------------------- The DOM walk
+
+fn next_in_order(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+// Every box that belongs to an elem is entered into the table. An
+// inline box carries the UNION of its fragments -- exactly what
+// `getBoundingClientRect()` of a browser reports for an inline elem
+// broken over several lines.
+fn index_boxes(b: Gc[Box], table: Gc[GcMap]) -> AllocError!bool {
+    if b.elem != gc_null[Node]() && b.elem.kind == node.K_ELEM {
+        let ok: bool = try gcmap_set_value[Box](table, b.elem as u64, b)
+    }
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        let ok2: bool = try index_boxes(box.box_kid(b, i), table)
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ The job
+
+fn parse_sheet(text: *mut mem.CpBuf, t: *mut tok.Tokens) -> AllocError!Gc[Cv] {
+    tok.tokenize(t, text)
+    var p: cv.Parser = cv.parser_new(t)
+    return try cv.parse_stylesheet(&p)
+}
+
+fn chain_last(r: Gc[Rule]) -> Gc[Rule] {
+    var x: Gc[Rule] = r
+    while x != gc_null[Rule]() && x.next != gc_null[Rule]() {
+        x = x.next
+    }
+    return x
+}
+
+fn add_sheet(head: Gc[Rule], sheet: Gc[Cv], origin: u32, order: *mut u32,
+    nm: *mut names.Names, tmp: *mut mem.CpBuf) -> AllocError!Gc[Rule] {
+    var next_order: u32 = *order
+    let part = try cascade.collect_rules(sheet, origin, next_order, nm, tmp,
+        &next_order)
+    *order = next_order
+    if part == gc_null[Rule]() {
+        return head
+    }
+    if head == gc_null[Rule]() {
+        return part
+    }
+    let last: Gc[Rule] = chain_last(head)
+    last.next = part
+    return head
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var text: mem.CpBuf = mem.cp_new()
+    var tmp: mem.CpBuf = mem.cp_new()
+    var cx: sel.Ctx = sel.ctx_new(driver.run_names(&run))
+    sel.ctx_init(&cx)
+    var w: cascade.Winner = cascade.winner_new()
+
+    var ins: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&ins)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+
+    var style_word: [u8; 5] = "style"
+    let style_attr: u32 = names.names_of_bytes(driver.run_names(&run),
+        &style_word[0], 5)
+
+    let total: usize = mem.buf_len(&ins)
+    var off: usize = 0
+    while off + 20 <= total {
+        let vw: f64 = read_u32(&ins, off) as f64
+        let vh: f64 = read_u32(&ins, off + 4) as f64
+        let n_html: usize = read_u32(&ins, off + 8) as usize
+        let o_html: usize = off + 12
+        let n_ua: usize = read_u32(&ins, o_html + n_html) as usize
+        let o_ua: usize = o_html + n_html + 4
+        let n_author: usize = read_u32(&ins, o_ua + n_ua) as usize
+        let o_author: usize = o_ua + n_ua + 4
+        // A length that does not fit into what is left is a BROKEN job,
+        // not something to read past the end of the buffer for.
+        if o_html + n_html > total || o_ua + n_ua > total ||
+        o_author + n_author > total {
+            off = total
+            break
+        }
+        off = o_author + n_author
+
+        // ---- 1. HTML -> DOM
+        driver.run_text_out_bytes(&run,
+            ((mem.buf_ptr(&ins) as u64) + o_html as u64) as *mut u8, n_html)
+        let rc: u32 = driver.run_document_build(&run)
+        if rc != 0 as u32 {
+            var broken: [u8; 8] = "#BROKEN "
+            lit(&out, (&broken[0]) as u64, 8)
+            mem.buf_push_dec(&out, rc as u64)
+            out_nl(&out)
+        }
+        let doc: Gc[Document] = driver.run_document(&run)
+        let nm: *mut names.Names = driver.run_names(&run)
+
+        // ---- 2. the stylesheets
+        var rules: Gc[Rule] = gc_null[Rule]()
+        var order: u32 = 0
+        decode_wtf8(&ins, o_ua, n_ua, &text)
+        let ua = parse_sheet(&text, &t) catch gc_null[Cv]()
+        rules = add_sheet(rules, ua, cascade.ORIGIN_UA, &order, nm, &tmp)
+        catch gc_null[Rule]()
+        decode_wtf8(&ins, o_author, n_author, &text)
+        let author = parse_sheet(&text, &t) catch gc_null[Cv]()
+        rules = add_sheet(rules, author, cascade.ORIGIN_AUTHOR, &order, nm, &tmp)
+        catch gc_null[Rule]()
+        // Every `<style>` elem of the document, in document order --
+        // without them a page brings no rules of its own at all.
+        var sk: Gc[Node] = doc
+        while sk != gc_null[Node]() {
+            if sk.kind == node.K_ELEM &&
+            names.names_equal_ascii(nm, node.elem_name(sk), &style_word[0], 5) {
+                elem_text(sk, &text)
+                let inner = parse_sheet(&text, &t) catch gc_null[Cv]()
+                rules = add_sheet(rules, inner, cascade.ORIGIN_AUTHOR, &order,
+                    nm, &tmp) catch gc_null[Rule]()
+            }
+            sk = next_in_order(sk, doc)
+        }
+
+        // ---- 3. the cascade per elem
+        var styles: Gc[GcMap] = gcmap_new(true, true) catch gc_null[GcMap]()
+        let root_style = cascade.style_root() catch gc_null[Style]()
+        sel.ctx_set_hover(&cx, gc_null[Node]())
+        var k: Gc[Node] = doc
+        while k != gc_null[Node]() {
+            if k.kind == node.K_ELEM {
+                var parent_style: Gc[Style] = root_style
+                let parent: Gc[Node] = k.parent
+                if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                    let found: Gc[Style] = gcmap_get_value[Style](styles,
+                        parent as u64)
+                    if found != gc_null[Style]() {
+                        parent_style = found
+                    }
+                }
+                // The `style` attribute: parsed per elem, and it
+                // beats every selector of the author origin.
+                var inline_decls: Gc[GcVec] = gc_null[GcVec]()
+                let e: Gc[Elem] = node.node_as_elem(k)
+                let av: Gc[Chain] = node.attr_value(e, style_attr, 0)
+                if av != gc_null[Chain]() && node.chain_len(av) > 0 {
+                    chain_to_cpbuf(av, &tmp)
+                    tok.tokenize(&t, &tmp)
+                    var ip: cv.Parser = cv.parser_new(&t)
+                    let values = cv.parse_component_value_list(&ip)
+                    catch gc_null[Cv]()
+                    if values != gc_null[Cv]() {
+                        inline_decls = cascade.parse_inline_declarations(values)
+                        catch gc_null[GcVec]()
+                    }
+                }
+                let s = cascade.cascade_elem_inline(rules, k, parent_style,
+                    &cx, &w, inline_decls)
+                catch gc_null[Style]()
+                if s != gc_null[Style]() {
+                    let ok: bool = gcmap_set_value[Style](styles, k as u64, s)
+                    catch false
+                }
+            }
+            k = next_in_order(k, doc)
+        }
+
+        // ---- 4. DOM -> box tree -> geometry
+        let root: Gc[Box] = build.build_document(doc, styles, root_style, nm)
+        catch gc_null[Box]()
+        var table: Gc[GcMap] = gcmap_new(true, true) catch gc_null[GcMap]()
+        if root != gc_null[Box]() {
+            let okl: bool = flow.layout_document(root, vw, vh) catch false
+            let oki: bool = index_boxes(root, table) catch false
+        }
+
+        // ---- 5. the report, in document order
+        k = doc
+        var walk: u64 = 0
+        var index: Gc[GcMap] = gcmap_new(true, false) catch gc_null[GcMap]()
+        var count: u64 = 0
+        while k != gc_null[Node]() {
+            if k.kind == node.K_ELEM {
+                let ok2: bool = gcmap_set(index, k as u64, count + 1) catch false
+                count = count + 1
+            }
+            k = next_in_order(k, doc)
+        }
+        k = doc
+        while k != gc_null[Node]() {
+            if k.kind == node.K_ELEM {
+                var e0: [u8; 2] = "E "
+                lit(&out, (&e0[0]) as u64, 2)
+                mem.buf_push_dec(&out, walk)
+                out_space(&out)
+                let parent: Gc[Node] = k.parent
+                var pi: u64 = 0
+                if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                    pi = gcmap_get(index, parent as u64, 0)
+                }
+                if pi == 0 {
+                    out_i64(&out, 0 - 1)
+                } else {
+                    mem.buf_push_dec(&out, pi - 1)
+                }
+                out_space(&out)
+                out_name(&out, nm, node.elem_name(k))
+                out_nl(&out)
+
+                var b0: [u8; 2] = "B "
+                lit(&out, (&b0[0]) as u64, 2)
+                mem.buf_push_dec(&out, walk)
+                let bx: Gc[Box] = gcmap_get_value[Box](table, k as u64)
+                out_space(&out)
+                if bx == gc_null[Box]() {
+                    // No box at all: `display: none`. A browser answers
+                    // the same question with four zeros.
+                    out_fixed(&out, 0.0)
+                    out_space(&out)
+                    out_fixed(&out, 0.0)
+                    out_space(&out)
+                    out_fixed(&out, 0.0)
+                    out_space(&out)
+                    out_fixed(&out, 0.0)
+                } else {
+                    out_fixed(&out, bx.x)
+                    out_space(&out)
+                    out_fixed(&out, bx.y)
+                    out_space(&out)
+                    out_fixed(&out, bx.w)
+                    out_space(&out)
+                    out_fixed(&out, bx.h)
+                }
+                out_nl(&out)
+                walk = walk + 1
+            }
+            k = next_in_order(k, doc)
+        }
+
+        // ---- 5b. THE PAINT ORDER, one line of element numbers, back to
+        // front. It is not geometry and cannot be got out of a rectangle;
+        // tools/layout/stack.py holds it against what
+        // `document.elementFromPoint` answers in a real browser.
+        if root != gc_null[Box]() {
+            let order: Gc[GcVec] = stack.paint_order(root) catch gc_null[GcVec]()
+            if order != gc_null[GcVec]() {
+                var p0: [u8; 2] = "P "
+                lit(&out, (&p0[0]) as u64, 2)
+                var oi: u64 = 0
+                let on: u64 = gcvec_length(order)
+                while oi < on {
+                    let ob: Gc[Box] = gcvec_read[Box](order, oi)
+                    let idx: u64 = gcmap_get(index, ob.elem as u64, 0)
+                    if idx != 0 {
+                        if oi > 0 {
+                            out_space(&out)
+                        }
+                        mem.buf_push_dec(&out, idx - 1)
+                    }
+                    oi = oi + 1
+                }
+                out_nl(&out)
+            }
+        }
+
+        var tail: [u8; 5] = "#END\n"
+        lit(&out, (&tail[0]) as u64, 5)
+        if mem.buf_len(&out) > 65536 {
+            mem.buf_flush(&out, 1)
+        }
+        driver.run_tree_release(&run)
+    }
+    mem.buf_flush(&out, 1)
+    return 0
+}

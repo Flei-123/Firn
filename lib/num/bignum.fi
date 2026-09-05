@@ -1,0 +1,298 @@
+// lib/num/bignum.fi -- big numbers (unsigned) for strtod/dtoa.
+//
+// Representation: a sequence of u32 digits, least significant first, in a
+// block of memory provided by the caller. `n` is the number of digits in
+// use (leading zero digits are cut off), `cap` is the capacity.
+// Every computation is exact -- that is exactly what a correctly rounded
+// strtod and the shortest output need.
+//
+// Include:  //#include lib/num/bignum.fi   (needs lib/str/alloc.fi)
+
+const BN_LIMBS: usize = 512 // 512 * 32 bit = 16384 bit, enough for
+// 10^400 * 10^780 including the shifts
+
+struct Bn {
+    d: *mut u8,
+    n: usize,
+    cap: usize,
+}
+
+fn bn_init(b: *mut Bn, mem: *mut u8, cap: usize) {
+    (*b).d = mem
+    (*b).n = 0
+    (*b).cap = cap
+}
+
+fn bn_limb(b: *mut Bn, i: usize) -> u32 {
+    if i >= (*b).n {
+        return 0 as u32
+    }
+    return ld32((*b).d, i)
+}
+
+fn bn_setlimb(b: *mut Bn, i: usize, v: u32) {
+    if i >= (*b).cap {
+        return
+    }
+    st32((*b).d, i, v)
+    if i >= (*b).n {
+        var k: usize = (*b).n
+        while k < i {
+            st32((*b).d, k, 0 as u32)
+            k = k + 1
+        }
+        (*b).n = i + 1
+    }
+}
+
+fn bn_norm(b: *mut Bn) {
+    while (*b).n > 0 {
+        if ld32((*b).d, (*b).n - 1) != 0 as u32 {
+            return
+        }
+        (*b).n = (*b).n - 1
+    }
+}
+
+fn bn_zero(b: *mut Bn) {
+    (*b).n = 0
+}
+
+fn bn_is_zero(b: *mut Bn) -> bool {
+    return (*b).n == 0
+}
+
+fn bn_set_u64(b: *mut Bn, v: u64) {
+    (*b).n = 0
+    if v == 0 {
+        return
+    }
+    st32((*b).d, 0, (v & 0xFFFFFFFF) as u32)
+    (*b).n = 1
+    if v >= 4294967296 {
+        st32((*b).d, 1, (v >> 32) as u32)
+        (*b).n = 2
+    }
+}
+
+fn bn_copy(dst: *mut Bn, src: *mut Bn) {
+    var i: usize = 0
+    while i < (*src).n {
+        st32((*dst).d, i, ld32((*src).d, i))
+        i = i + 1
+    }
+    (*dst).n = (*src).n
+}
+
+fn bn_cmp(a: *mut Bn, b: *mut Bn) -> i32 {
+    if (*a).n != (*b).n {
+        if (*a).n < (*b).n {
+            return -1
+        }
+        return 1
+    }
+    var i: usize = (*a).n
+    while i > 0 {
+        i = i - 1
+        let x: u32 = ld32((*a).d, i)
+        let y: u32 = ld32((*b).d, i)
+        if x != y {
+            if x < y {
+                return -1
+            }
+            return 1
+        }
+    }
+    return 0
+}
+
+// a += b
+fn bn_add(a: *mut Bn, b: *mut Bn) {
+    var carry: u64 = 0
+    var i: usize = 0
+    var m: usize = (*a).n
+    if (*b).n > m {
+        m = (*b).n
+    }
+    while i < m || carry != 0 {
+        if i >= (*a).cap {
+            return
+        }
+        let s: u64 = bn_limb(a, i) as u64 + bn_limb(b, i) as u64 + carry
+        bn_setlimb(a, i, (s & 0xFFFFFFFF) as u32)
+        carry = s >> 32
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+// a -= b, precondition a >= b
+fn bn_sub(a: *mut Bn, b: *mut Bn) {
+    var borrow: u64 = 0
+    var i: usize = 0
+    while i < (*a).n {
+        let x: u64 = bn_limb(a, i) as u64
+        let y: u64 = bn_limb(b, i) as u64 + borrow
+        if x >= y {
+            st32((*a).d, i, (x - y) as u32)
+            borrow = 0
+        } else {
+            st32((*a).d, i, (x + 4294967296 - y) as u32)
+            borrow = 1
+        }
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+// a *= m
+fn bn_mul_small(a: *mut Bn, m: u32) {
+    if m == 0 as u32 {
+        bn_zero(a)
+        return
+    }
+    var carry: u64 = 0
+    var i: usize = 0
+    let n: usize = (*a).n
+    while i < n {
+        let p: u64 = ld32((*a).d, i) as u64 * m as u64 + carry
+        st32((*a).d, i, (p & 0xFFFFFFFF) as u32)
+        carry = p >> 32
+        i = i + 1
+    }
+    while carry != 0 {
+        bn_setlimb(a, i, (carry & 0xFFFFFFFF) as u32)
+        carry = carry >> 32
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+// a += v
+fn bn_add_small(a: *mut Bn, v: u32) {
+    var carry: u64 = v as u64
+    var i: usize = 0
+    while carry != 0 {
+        let s: u64 = bn_limb(a, i) as u64 + carry
+        bn_setlimb(a, i, (s & 0xFFFFFFFF) as u32)
+        carry = s >> 32
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+fn bn_bitlen(a: *mut Bn) -> usize {
+    if (*a).n == 0 {
+        return 0
+    }
+    var v: u32 = ld32((*a).d, (*a).n - 1)
+    var bits: usize = 0
+    while v != 0 as u32 {
+        v = v >> 1
+        bits = bits + 1
+    }
+    return ((*a).n - 1) * 32 + bits
+}
+
+// a <<= bits
+fn bn_shl(a: *mut Bn, bits: usize) {
+    if (*a).n == 0 || bits == 0 {
+        return
+    }
+    let words: usize = bits / 32
+    let sh: usize = bits % 32
+    var i: usize = (*a).n
+    if sh == 0 {
+        while i > 0 {
+            i = i - 1
+            bn_setlimb(a, i + words, ld32((*a).d, i))
+        }
+    } else {
+        // the new top digit first
+        let top: u32 = ld32((*a).d, (*a).n - 1) >> (32 - sh)
+        if top != 0 as u32 {
+            bn_setlimb(a, (*a).n + words, top)
+        }
+        while i > 0 {
+            i = i - 1
+            var v: u32 = ld32((*a).d, i) << sh
+            if i > 0 {
+                v = v + (ld32((*a).d, i - 1) >> (32 - sh))
+            }
+            bn_setlimb(a, i + words, v)
+        }
+    }
+    var k: usize = 0
+    while k < words {
+        st32((*a).d, k, 0 as u32)
+        k = k + 1
+    }
+    bn_norm(a)
+}
+
+// a *= 10^e
+fn bn_mul_pow10(a: *mut Bn, e: usize) {
+    var r: usize = e
+    while r >= 9 {
+        bn_mul_small(a, 1000000000 as u32)
+        r = r - 9
+    }
+    var m: u32 = 1 as u32
+    var k: usize = 0
+    while k < r {
+        m = m * 10 as u32
+        k = k + 1
+    }
+    if m != 1 as u32 {
+        bn_mul_small(a, m)
+    }
+}
+
+// dst = 10^e
+fn bn_pow10(dst: *mut Bn, e: usize) {
+    bn_set_u64(dst, 1)
+    bn_mul_pow10(dst, e)
+}
+
+// Integer division: returns the floor of num/`the` as a u64 and leaves the
+// remainder in `num`. Precondition: the quotient fits in 64 bit (the caller
+// scales beforehand). `tmp` is scratch memory.
+fn bn_div_q(num: *mut Bn, the: *mut Bn, tmp: *mut Bn) -> u64 {
+    if bn_cmp(num, the) < 0 {
+        return 0
+    }
+    let bn: usize = bn_bitlen(num)
+    let bd: usize = bn_bitlen(the)
+    var k: usize = bn - bd
+    if k > 63 {
+        // The caller scaled wrongly; a clean 0 is better than a
+        // silently wrong answer.
+        return 0
+    }
+    var q: u64 = 0
+    var i: usize = k + 1
+    while i > 0 {
+        i = i - 1
+        bn_copy(tmp, the)
+        bn_shl(tmp, i)
+        if bn_cmp(num, tmp) >= 0 {
+            bn_sub(num, tmp)
+            q = q + (1 << i)
+        }
+    }
+    return q
+}
+
+// One decimal digit: the floor of num/`the` (0..9); the rest stays in `num`.
+// Precondition: num < 10 * `the`.
+fn bn_div_digit(num: *mut Bn, the: *mut Bn) -> u32 {
+    var d: u32 = 0
+    while bn_cmp(num, the) >= 0 {
+        bn_sub(num, the)
+        d = d + 1 as u32
+        if d > 10 as u32 {
+            return d
+        }
+    }
+    return d
+}

@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/names.fi -- the ATOM TABLE for element and attribute names.
+//
+// SPEC 8.3 (`Z4`) names atoms as a string type of their own: a `u32` id into
+// a global table, meant exactly for tag, attribute and property names.
+// This file is the implementation for the tree construction.
+//
+// WHY THIS IS THE MOST IMPORTANT DECISION OF THE TREE CONSTRUCTION: the
+// WHATWG tree construction consists to a large part of questions of the form
+// "is the name of the current node one out of this list of 40 names".
+// With strings every such question would be a pile of `memcmp`. With atoms
+// it is an integer comparison, and because the 123 known names have a FIXED
+// id (lib/browser/tag.fi, generated), the values compared against are
+// compile time constants.
+//
+// The storage:
+//   * `text`  -- all names one after another, WTF-8. WTF-8 and not UTF-8,
+//               because a tag name may contain unpaired surrogates (the
+//               tokenizer passes them through, SPEC 8.2).
+//   * `off`/`length` -- one pair per id. The id 0 is "no name".
+//   * `hash` -- open addressing with linear probing, the capacity always a
+//               power of two, load limit 1/2. The values are ids, 0 = empty.
+//
+// This file is completely `#[no_gc]`: it gets by without the collector and
+// may therefore be called from hot paths too (SPEC 3.5.4).
+
+import html.mem
+import browser.tag
+
+export {
+    Names,
+    names_new, names_init, names_free,
+    names_of_bytes, names_of_cp, names_find_bytes,
+    names_ptr, names_length, names_count,
+    names_after_cpbuf, names_equal_ascii,
+    cp_after_wtf8,
+}
+
+const HASH_START: usize = 512
+
+struct Names {
+    text: mem.Buf, // all names one after another (WTF-8)
+    off: *mut u32, // per id: the start in `text`
+    length: *mut u32, // per id: the length in bytes
+    cap: usize, // the slots in off/length
+    n: usize, // the ids handed out (1..n)
+    hash: *mut u32, // the hash table, the values are ids (0 = empty)
+    skap: usize, // a power of two
+    tmp: mem.Buf, // the work buffer for the WTF-8 encoding
+    ok: bool, // did the build succeed?
+}
+
+#[no_gc]
+fn names_new() -> Names {
+    return Names {
+        text: mem.buf_new(),
+        off: 0 as *mut u32,
+        length: 0 as *mut u32,
+        cap: 0,
+        n: 0,
+        hash: 0 as *mut u32,
+        skap: 0,
+        tmp: mem.buf_new(),
+        ok: false,
+    }
+}
+
+#[no_gc]
+fn u32_at(p: *mut u32, i: usize) -> u32 {
+    return *((p as u64 + i as u64 * 4) as *mut u32)
+}
+
+#[no_gc]
+fn u32_set(p: *mut u32, i: usize, v: u32) {
+    *((p as u64 + i as u64 * 4) as *mut u32) = v
+}
+
+// FNV-1a over the bytes. Small, fast, and for names of this length
+// (1..20 bytes) entirely sufficient.
+#[no_gc]
+fn hashvalue(p: *mut u8, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < n {
+        h = h ^ ((*((p as u64 + i as u64) as *mut u8)) as u64)
+        h = h *% 1099511628211 // ROUND 72: FNV-1a wraps on purpose, *% says so
+        i = i + 1
+    }
+    return h
+}
+
+#[no_gc]
+fn bytes_equal(a: *mut u8, b: *mut u8, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if *((a as u64 + i as u64) as *mut u8) != *((b as u64 + i as u64) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+#[no_gc]
+fn entries_grow(t: *mut Names) -> bool {
+    var new: usize = (*t).cap * 2
+    if new == 0 {
+        new = 256
+    }
+    let po: *mut u8 = mem.heap_alloc(new * 4)
+    let pl: *mut u8 = mem.heap_alloc(new * 4)
+    if po as u64 == 0 || pl as u64 == 0 {
+        return false
+    }
+    if (*t).cap > 0 {
+        mem.mem_copy(po, (*t).off as *mut u8, (*t).cap * 4)
+        mem.mem_copy(pl, (*t).length as *mut u8, (*t).cap * 4)
+        mem.heap_free((*t).off as *mut u8, (*t).cap * 4)
+        mem.heap_free((*t).length as *mut u8, (*t).cap * 4)
+    }
+    (*t).off = po as *mut u32
+    (*t).length = pl as *mut u32
+    (*t).cap = new
+    return true
+}
+
+#[no_gc]
+fn hash_insert_raw(t: *mut Names, id: u32) {
+    let p: *mut u8 = names_ptr(t, id)
+    let n: usize = names_length(t, id)
+    let mask: u64 = (*t).skap as u64 - 1
+    var i: u64 = hashvalue(p, n) & mask
+    while u32_at((*t).hash, i as usize) != 0 as u32 {
+        i = (i + 1) & mask
+    }
+    u32_set((*t).hash, i as usize, id)
+}
+
+#[no_gc]
+fn hash_grow(t: *mut Names) -> bool {
+    var new: usize = (*t).skap * 2
+    if new == 0 {
+        new = HASH_START
+    }
+    let p: *mut u8 = mem.heap_alloc(new * 4)
+    if p as u64 == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < new {
+        u32_set(p as *mut u32, i, 0)
+        i = i + 1
+    }
+    let old: *mut u32 = (*t).hash
+    let oldcap: usize = (*t).skap
+    (*t).hash = p as *mut u32
+    (*t).skap = new
+    var id: u32 = 1
+    while id as usize <= (*t).n {
+        hash_insert_raw(t, id)
+        id = id + 1
+    }
+    if oldcap > 0 {
+        mem.heap_free(old as *mut u8, oldcap * 4)
+    }
+    return true
+}
+
+// The id of a name; it creates it if it is new. 0 = out of memory.
+#[no_gc]
+fn names_of_bytes(t: *mut Names, p: *mut u8, n: usize) -> u32 {
+    let present: u32 = names_find_bytes(t, p, n)
+    if present != 0 as u32 {
+        return present
+    }
+    if (*t).n + 1 >= (*t).cap {
+        if !entries_grow(t) {
+            return 0
+        }
+    }
+    // Load limit 1/2: with more filling the probe steps rise noticeably.
+    if ((*t).n + 1) * 2 >= (*t).skap {
+        if !hash_grow(t) {
+            return 0
+        }
+    }
+    let start: usize = mem.buf_len(&(*t).text)
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(&(*t).text, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+    let id: u32 = ((*t).n + 1) as u32
+    u32_set((*t).off, id as usize, start as u32)
+    u32_set((*t).length, id as usize, n as u32)
+    (*t).n = (*t).n + 1
+    hash_insert_raw(t, id)
+    return id
+}
+
+// The id of a name, without creating it. 0 = unknown.
+#[no_gc]
+fn names_find_bytes(t: *mut Names, p: *mut u8, n: usize) -> u32 {
+    if (*t).skap == 0 {
+        return 0
+    }
+    let mask: u64 = (*t).skap as u64 - 1
+    var i: u64 = hashvalue(p, n) & mask
+    while true {
+        let id: u32 = u32_at((*t).hash, i as usize)
+        if id == 0 as u32 {
+            return 0
+        }
+        if names_length(t, id) == n && bytes_equal(names_ptr(t, id), p, n) {
+            return id
+        }
+        i = (i + 1) & mask
+    }
+    return 0
+}
+
+// Code points -> WTF-8 into `out`. Unpaired surrogates are preserved as a
+// three byte sequence (that is the difference to UTF-8, SPEC 8.2).
+#[no_gc]
+fn cp_after_wtf8(b: *mut mem.CpBuf, out: *mut mem.Buf) {
+    mem.buf_clear(out)
+    let n: usize = mem.cp_len(b)
+    var i: usize = 0
+    while i < n {
+        let c: u32 = mem.cp_at(b, i)
+        if c < 0x80 as u32 {
+            mem.buf_push(out, c as u8)
+        } else if c < 0x800 as u32 {
+            mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else if c < 0x10000 as u32 {
+            mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else {
+            mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        }
+        i = i + 1
+    }
+}
+
+// The id of a name out of a code point buffer of the tokenizer.
+#[no_gc]
+fn names_of_cp(t: *mut Names, b: *mut mem.CpBuf) -> u32 {
+    cp_after_wtf8(b, &(*t).tmp)
+    return names_of_bytes(t, mem.buf_ptr(&(*t).tmp), mem.buf_len(&(*t).tmp))
+}
+
+#[no_gc]
+fn names_ptr(t: *mut Names, id: u32) -> *mut u8 {
+    if id == 0 as u32 || id as usize > (*t).n {
+        return 0 as *mut u8
+    }
+    return (mem.buf_ptr(&(*t).text) as u64 + u32_at((*t).off, id as usize) as u64) as *mut u8
+}
+
+#[no_gc]
+fn names_length(t: *mut Names, id: u32) -> usize {
+    if id == 0 as u32 || id as usize > (*t).n {
+        return 0
+    }
+    return u32_at((*t).length, id as usize) as usize
+}
+
+#[no_gc]
+fn names_count(t: *mut Names) -> usize {
+    return (*t).n
+}
+
+// Appends the name as code points to a buffer (the output path).
+// The storage is WTF-8, so it is decoded here.
+#[no_gc]
+fn names_after_cpbuf(t: *mut Names, id: u32, out: *mut mem.CpBuf) {
+    let p: *mut u8 = names_ptr(t, id)
+    let n: usize = names_length(t, id)
+    var i: usize = 0
+    while i < n {
+        let c0: u32 = (*((p as u64 + i as u64) as *mut u8)) as u32
+        var cp: u32 = c0
+        var width: usize = 1
+        if c0 >= 0xF0 as u32 {
+            width = 4
+            cp = ((c0 & 0x07 as u32) << 18) |
+            ((byte_at(p, n, i + 1) & 0x3F as u32) << 12) |
+            ((byte_at(p, n, i + 2) & 0x3F as u32) << 6) |
+            (byte_at(p, n, i + 3) & 0x3F as u32)
+        } else if c0 >= 0xE0 as u32 {
+            width = 3
+            cp = ((c0 & 0x0F as u32) << 12) |
+            ((byte_at(p, n, i + 1) & 0x3F as u32) << 6) |
+            (byte_at(p, n, i + 2) & 0x3F as u32)
+        } else if c0 >= 0xC0 as u32 {
+            width = 2
+            cp = ((c0 & 0x1F as u32) << 6) | (byte_at(p, n, i + 1) & 0x3F as u32)
+        }
+        mem.cp_push(out, cp)
+        i = i + width
+    }
+}
+
+#[no_gc]
+fn byte_at(p: *mut u8, n: usize, i: usize) -> u32 {
+    if i >= n {
+        return 0
+    }
+    return (*((p as u64 + i as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn names_equal_ascii(t: *mut Names, id: u32, p: *mut u8, n: usize) -> bool {
+    if names_length(t, id) != n {
+        return false
+    }
+    return bytes_equal(names_ptr(t, id), p, n)
+}
+
+// Creates the fixed table: the 123 known names get the ids
+// 1..123, in the order of lib/browser/tag.fi. `false` = out of
+// memory; the caller MUST then fail visibly.
+#[no_gc]
+fn names_init(t: *mut Names) -> bool {
+    mem.buf_init(&(*t).text)
+    mem.buf_init(&(*t).tmp)
+    (*t).off = 0 as *mut u32
+    (*t).length = 0 as *mut u32
+    (*t).cap = 0
+    (*t).n = 0
+    (*t).hash = 0 as *mut u32
+    (*t).skap = 0
+    (*t).ok = false
+
+    var raw: mem.Buf = mem.buf_new()
+    mem.buf_init(&raw)
+    tag.tab_bytes(&raw)
+    let total: usize = mem.buf_len(&raw)
+    let base: *mut u8 = mem.buf_ptr(&raw)
+    var i: usize = 0
+    var number: u32 = 0
+    while i < total {
+        var j: usize = i
+        while j < total && *((base as u64 + j as u64) as *mut u8) != 32 as u8 {
+            j = j + 1
+        }
+        if j > i {
+            let id: u32 = names_of_bytes(t, (base as u64 + i as u64) as *mut u8, j - i)
+            if id == 0 as u32 {
+                mem.buf_free(&raw)
+                return false
+            }
+            number = number + 1
+            // The order MUST be right, otherwise every constant
+            // from tag.fi points into nothing. Better to fail visibly here.
+            if id != number {
+                mem.buf_free(&raw)
+                return false
+            }
+        }
+        i = j + 1
+    }
+    mem.buf_free(&raw)
+    if number != tag.M_LAST_FIXED {
+        return false
+    }
+    (*t).ok = true
+    return true
+}
+
+#[no_gc]
+fn names_free(t: *mut Names) {
+    mem.buf_free(&(*t).text)
+    mem.buf_free(&(*t).tmp)
+    if (*t).cap > 0 {
+        mem.heap_free((*t).off as *mut u8, (*t).cap * 4)
+        mem.heap_free((*t).length as *mut u8, (*t).cap * 4)
+        (*t).off = 0 as *mut u32
+        (*t).length = 0 as *mut u32
+        (*t).cap = 0
+    }
+    if (*t).skap > 0 {
+        mem.heap_free((*t).hash as *mut u8, (*t).skap * 4)
+        (*t).hash = 0 as *mut u32
+        (*t).skap = 0
+    }
+    (*t).n = 0
+    (*t).ok = false
+}

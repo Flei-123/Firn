@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/f32data/probe.fi -- REAL DATA, read with `f32` (round 71).
+//
+// The program reads a file from standard input, recognises it by its magic
+// number and writes every 32-bit float in it as decimal text, one per line.
+// `tools/f32data/run.sh` holds those lines against the ones Python produces
+// from the SAME octets.
+//
+// That is the point of the exercise. A test in which a program writes a
+// number and reads it back again proves nothing about a file format: it only
+// proves that the program agrees with itself. Here the octets come from
+// somebody else, they lie in the order that WAV and glTF prescribe, and the
+// yardstick is a second implementation.
+//
+//   RIFF....WAVE   a WAV with format tag 3 (IEEE float, 32 bit). The `data`
+//                  chunk holds the samples.
+//   glTF           a binary glTF (GLB): a 12 byte header, then chunks; the
+//                  vertex positions are float32 VEC3 in the BIN chunk.
+//
+// No JSON parser is needed for the GLB: the chunk structure is binary, and
+// what the JSON chunk says about it (`"componentType":5126` is float32,
+// `"type":"VEC3"`) is checked here as TEXT -- that is exactly the amount of
+// glTF that this test is about.
+
+import std.io
+import std.num
+import std.str
+
+// Four octets at `p + i`, little endian, as the bit pattern of a binary32.
+fn le32(p: *mut u8, i: usize) -> u32 {
+    let a: u32 = num.ld8(p, i) as u32
+    let b: u32 = num.ld8(p, i + 1) as u32
+    let c: u32 = num.ld8(p, i + 2) as u32
+    let d: u32 = num.ld8(p, i + 3) as u32
+    return a + (b << 8) + (c << 16) + (d << 24)
+}
+
+// A text literal as a `Span` -- `str` carries pointer and length itself.
+fn text(s: str) -> str.Span {
+    return str.span(s.p, s.n)
+}
+
+fn tag(p: *mut u8, i: usize, a: u8, b: u8, c: u8, d: u8) -> bool {
+    if num.ld8(p, i) != a { return false }
+    if num.ld8(p, i + 1) != b { return false }
+    if num.ld8(p, i + 2) != c { return false }
+    if num.ld8(p, i + 3) != d { return false }
+    return true
+}
+
+// One value per line, in the shortest text that reads back (round 71).
+fn show(x: f32) {
+    var b: num.Bytes = num.bytes_new()
+    if num.write_f32(&b, x) {
+        io.print_bytes(b.ptr as u64, b.len)
+    }
+    io.new_line()
+    num.bytes_free(&b)
+}
+
+fn show_all(p: *mut u8, of: usize, n: usize) {
+    var i: usize = 0
+    while i < n {
+        show(num.bits_f32(le32(p, of + i * 4)))
+        i = i + 1
+    }
+}
+
+// --------------------------------------------------------------------- WAV
+
+fn read_wav(p: *mut u8, n: usize) -> i32 {
+    if n < 12 {
+        return 2
+    }
+    if !tag(p, 8, 87 as u8, 65 as u8, 86 as u8, 69 as u8) { // WAVE
+        return 3
+    }
+    var i: usize = 12
+    var format: u32 = 0
+    var bits: u32 = 0
+    while i + 8 <= n {
+        let size: u32 = le32(p, i + 4)
+        let body: usize = i + 8
+        if tag(p, i, 102 as u8, 109 as u8, 116 as u8, 32 as u8) { // "fmt "
+            if body + 16 > n {
+                return 4
+            }
+            format = (num.ld8(p, body) as u32) + ((num.ld8(p, body + 1) as u32) << 8)
+            bits = (num.ld8(p, body + 14) as u32)
+            +((num.ld8(p, body + 15) as u32) << 8)
+        }
+        if tag(p, i, 100 as u8, 97 as u8, 116 as u8, 97 as u8) { // "data"
+            // Format tag 3 is IEEE float; 32 bit per sample means f32.
+            if format != 3 {
+                return 5
+            }
+            if bits != 32 {
+                return 6
+            }
+            if body + size as usize > n {
+                return 7
+            }
+            show_all(p, body, size as usize / 4)
+            return 0
+        }
+        var step: usize = size as usize
+        if step % 2 == 1 {
+            step = step + 1
+        }
+        i = body + step
+    }
+    return 8
+}
+
+// --------------------------------------------------------------------- GLB
+
+fn read_glb(p: *mut u8, n: usize) -> i32 {
+    if n < 20 {
+        return 2
+    }
+    if le32(p, 4) != 2 {
+        return 3
+    }
+    var i: usize = 12
+    var json_at: usize = 0
+    var json_len: usize = 0
+    while i + 8 <= n {
+        let size: usize = le32(p, i) as usize
+        let kind: u32 = le32(p, i + 4)
+        let body: usize = i + 8
+        if body + size > n {
+            return 4
+        }
+        if kind == 1313821514 { // "JSON"
+            json_at = body
+            json_len = size
+        }
+        if kind == 5130562 { // "BIN\0"
+            // What the JSON chunk claims about the buffer is checked as
+            // text -- 5126 is GL_FLOAT, and VEC3 makes three of them per
+            // vertex.
+            let js: str.Span = str.span((p as usize + json_at) as *mut u8, json_len)
+            if !str.contains(js, text("\"componentType\":5126")) {
+                return 5
+            }
+            if !str.contains(js, text("\"type\":\"VEC3\"")) {
+                return 6
+            }
+            if !str.contains(js, text("\"POSITION\"")) {
+                return 7
+            }
+            show_all(p, body, size / 4)
+            return 0
+        }
+        i = body + size
+    }
+    return 8
+}
+
+fn main() -> i32 {
+    var t: io.Text = io.read_all()
+    if !io.text_is_ok(&t) {
+        io.text_free(&t)
+        return 1
+    }
+    let s: str.Span = io.text_span(&t)
+    var rc: i32 = 9
+    if s.n >= 4 {
+        if tag(s.p, 0, 82 as u8, 73 as u8, 70 as u8, 70 as u8) { // RIFF
+            rc = read_wav(s.p, s.n)
+        } else if tag(s.p, 0, 103 as u8, 108 as u8, 84 as u8, 70 as u8) { // glTF
+            rc = read_glb(s.p, s.n)
+        }
+    }
+    io.text_free(&t)
+    return rc
+}

@@ -1,0 +1,1217 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/fir.fi -- THE INTERMEDIATE REPRESENTATION, WRITTEN IN FIRN.
+//
+// Seventh part of stage 1: the port of `compiler/src/fir.rs`.
+// The same guarantees as there (docs/FIR.md):
+//
+//   * typed -- every instruction has a result type
+//   * SSA like -- every instruction defines at most ONE value `%n`
+//   * basic blocks with EXACTLY ONE terminator at the end
+//   * NO phi nodes: mutable variables live in `alloca` slots
+//     and are reached through `load`/`store`
+//
+// LAYOUT as everywhere in stage 1: struct of arrays. Because the blocks are
+// filled ALTERNATELY while lowering runs, the instruction list of a block
+// cannot simply be a range in one shared array.
+// It is one anyway -- it moves to the end whenever it grows. That costs
+// copies, but keeps everything in a single `Vec` and needs no
+// linked list.
+//
+// THE TEXT FORM IS A CONTRACT: byte for byte like `firnc0 --emit=fir-raw`.
+
+import rt
+import vec
+import intern
+
+export { Fir, fir_new, fir_free,
+    T_I8, T_I16, T_I32, T_I64, T_U8, T_U16, T_U32, T_U64,
+    T_BOOL, T_F64, T_F32, T_PTR, T_VOID, val_ty, is_float_ty,
+    O_CONST, O_BIN, O_CMP, O_UN, O_CAST, O_ALLOCA, O_LOAD, O_STORE,
+    O_PTRADD, O_CALL, O_SYSCALL, O_COPYMEM, O_GCADDR, O_SELECT, O_SECZERO,
+    O_ATOMADD, O_CALLI, O_VTAB, O_ASM, O_MMIOLD, O_MMIOST, O_FNREF,
+    O_SPAWN, O_TLS, O_ATOMCAS,
+    O_BINWRAPSAT, O_CHECKEDBIN, O_CHECKEDDIV, O_CHECKEDCAST, O_CHECKEDIDX,
+    O_GLOBAL,
+    WS_WRAP, WS_SAT,
+    TERM_UNSET, TERM_BR, TERM_BRCOND, TERM_RET, TERM_SWITCH, NONE,
+    fn_new, fn_count, block_new, block_count,
+    inst_add, inst_void_add, alloca_add, arg_add, arg_start,
+    term_set, is_terminated,
+    value_count, param_value, fir_text, fty_bytes, fty_bits, fty_name,
+    inst_count, inst_at, arg_at, i_kind_of, i_ty_of, i_dst_of,
+    i_a_of, i_b_of, i_c_of, i_number_of, i_aoff_of, i_alen_of,
+    b_term_of, b_t1_of, b_t2_of, b_t3_of, f_ret_of, f_plen_of,
+    f_poff_of, p_ty_of, f_name_of, f_int_of, f_int_set,
+    term_switch, sw_start, sw_add, b_t4_of, b_t5_of,
+    sw_key_at, sw_target }
+
+const T_I8: u32 = 0
+const T_I16: u32 = 1
+const T_I32: u32 = 2
+const T_I64: u32 = 3
+const T_U8: u32 = 4
+const T_U16: u32 = 5
+const T_U32: u32 = 6
+const T_U64: u32 = 7
+const T_BOOL: u32 = 8
+const T_F64: u32 = 9
+// ROUND 71 (fir.rs): IEEE-754 binary32. The value of an `O_CONST` is the
+// BIT PATTERN as u32, exactly as with `T_F64`.
+const T_F32: u32 = 10
+const T_PTR: u32 = 11
+const T_VOID: u32 = 12
+
+const O_CONST: u32 = 0
+const O_BIN: u32 = 1
+const O_CMP: u32 = 2
+const O_UN: u32 = 3
+const O_CAST: u32 = 4
+const O_ALLOCA: u32 = 5
+const O_LOAD: u32 = 6
+const O_STORE: u32 = 7
+const O_PTRADD: u32 = 8
+const O_CALL: u32 = 9
+const O_SYSCALL: u32 = 10
+const O_COPYMEM: u32 = 11
+// Round 34: address of the GC state block (i_number: 1 = save the
+// callee-saved registers there first -- `Op::GcAddr { regs }` in stage 0).
+const O_GCADDR: u32 = 12
+// Round 36 (ct.rs, SPEC 9.2/9.3): data independent choice (`cmov`, no
+// branch) and the zeroing that must never be optimized away (`rep stosb`).
+const O_SELECT: u32 = 13
+const O_SECZERO: u32 = 14
+// Round 47 (atomic.rs): atomic read-add-write, `lock xadd`.
+// i_a = address, i_b = addend, the result is the OLD value. Always 64 bit.
+const O_ATOMADD: u32 = 15
+// Round 46 (iface.rs): the dynamic dispatch. `O_CALLI` calls through a
+// POINTER (i_a = target, arguments as with `O_CALL`), `O_VTAB` yields the
+// address of a method table (i_a = interface name, i_b = type
+// name; the symbol reads `.L__iface.<I>.<T>`).
+const O_CALLI: u32 = 16
+const O_VTAB: u32 = 17
+// Round 52 (core.rs, SPEC 2): inline assembly. ALWAYS volatile -- no
+// pass may remove, duplicate, merge or move it.
+//   i_a      = template (interned)
+//   i_b      = output register (interned) or NONE
+//   i_number = number of clobbers
+//   i_aoff   = start of the argument block, i_alen = number of INPUTS
+// The argument block holds `i_alen` pairs (register text, value) first and
+// after that the `i_number` clobber names -- all as interned numbers.
+const O_ASM: u32 = 50
+// Round 52: MMIO. Like load/store, but volatile; the width sits in the
+// instruction type. i_a = address, for O_MMIOST additionally i_b = value.
+const O_MMIOLD: u32 = 51
+const O_MMIOST: u32 = 52
+// ROUND 58 (fnval.rs): the address of a FUNCTION RECORD. `i_a` is the
+// interned name of the function; word 0 of the record holds the code
+// address, and the record sits in `.rodata`. That is how a named function
+// becomes a value. The numbers 53 to 59 belong to this round.
+const O_FNREF: u32 = 53
+// Round 49 (thread.rs) -- the numbers 20 to 29 are reserved for that
+// round; 18 and 19 stay free for the rounds running alongside it.
+//   O_SPAWN   i_a = argument, i_b = upper stack address, i_c = TID word.
+//             Result: thread handle (> 0) or a negative error value.
+//   O_TLS     no operand. Result: this thread's block from `fs:0`.
+//   O_ATOMCAS i_a = address, i_b = expected value, i_c = new value.
+//             Result: the value FOUND there.
+const O_SPAWN: u32 = 20
+const O_TLS: u32 = 21
+const O_ATOMCAS: u32 = 22
+
+// ROUND 72 (fir.rs, SPEC 13 item L9) -- checked and explicitly unchecked
+// integer arithmetic.
+//
+//   O_BINWRAPSAT   i_a = a, i_b = b, i_c = the operation (0 add, 1 sub,
+//                  2 mul), i_number = WS_WRAP or WS_SAT. Never checked,
+//                  never panics -- that is the point of writing `+%`/`+|`
+//                  out instead of relying on the build level.
+//   O_CHECKEDBIN   i_a = a, i_b = b, i_c = the operation (0/1/2),
+//                  i_number = the intern number of the ready made message.
+//   O_CHECKEDDIV   i_a = a, i_b = b, i_c = the operation (3 div, 4 rem),
+//                  i_number = the message for "divided by zero" in the low
+//                  word, the one for MIN / -1 in the high word.
+//   O_CHECKEDCAST  i_a = src, i_c = the SOURCE type, i_number = message.
+//
+// THE MESSAGE IS TEXT, not a position: FIR carries no source positions at
+// all (docs/FIR.md), so the sentence is built once during lowering and
+// travels as an interned string, exactly as in `firnc0`.
+const O_BINWRAPSAT: u32 = 23
+const O_CHECKEDBIN: u32 = 24
+const O_CHECKEDDIV: u32 = 25
+const O_CHECKEDCAST: u32 = 26
+
+// ROUND 89 (fir.rs, SPEC 13 item L9) -- the checked ARRAY INDEX.
+//   O_CHECKEDIDX   i_a = the index, i_c = the LENGTH of the array,
+//                  i_number = the intern number of the ready made message.
+// Hands the index back unchanged when it is below the length and panics
+// otherwise. The comparison is UNSIGNED: an index is a `usize`, so
+// "below zero" is not a state it can be in and one comparison decides
+// both ends.
+const O_CHECKEDIDX: u32 = 27
+
+// ROUND 89 (statics.rs, SPEC 14.1.statics) -- the ADDRESS of a global
+// variable. `i_a` is the interned name; the place itself sits in `.bss`,
+// `.data` or `.rodata`. Pure and without operands, exactly like O_FNREF:
+// the address is a link time constant.
+const O_GLOBAL: u32 = 28
+
+const WS_WRAP: u64 = 0
+const WS_SAT: u64 = 1
+
+const TERM_UNSET: u32 = 0
+const TERM_BR: u32 = 1
+const TERM_BRCOND: u32 = 2
+const TERM_RET: u32 = 3
+// `switch` (round 32, `Term::Switch` in fir.rs): b_t1 = key value,
+// b_t2 = default block, b_t3 = start of the case list in `sw_key`/`sw_target`,
+// b_t4 = length, b_t5 = key type. The case list is flat, because otherwise
+// a terminator would have only three fields.
+const TERM_SWITCH: u32 = 4
+
+const NONE: u32 = 4294967295
+
+struct Fir {
+    f_name: Vec[u32]
+    // ROUND 52: 1 = `#[interrupt]` (a calling convention of its own, `iretq`).
+    f_int: Vec[u32]
+    f_ret: Vec[u32]
+    f_poff: Vec[u32]
+    f_plen: Vec[u32]
+    f_boff: Vec[u32]
+    f_blen: Vec[u32]
+    f_values: Vec[u32]
+    // ROUND 71: the type of EVERY value, per function (fir.rs::val_types).
+    // The code generator reads the register class off it -- an argument of
+    // type f32/f64 goes into an xmm register, everything else into an
+    // integer register. `f_vbase` is where the function's values start in
+    // `v_ty`.
+    f_vbase: Vec[u32]
+    v_ty: Vec[u32]
+    p_ty: Vec[u32]
+    b_ioff: Vec[u32]
+    b_ilen: Vec[u32]
+    b_term: Vec[u32]
+    b_t1: Vec[u32]
+    b_t2: Vec[u32]
+    b_t3: Vec[u32]
+    b_t4: Vec[u32]
+    b_t5: Vec[u32]
+    b_ilist: Vec[u32]
+    i_kind: Vec[u32]
+    i_ty: Vec[u32]
+    i_dst: Vec[u32]
+    i_a: Vec[u32]
+    i_b: Vec[u32]
+    i_c: Vec[u32]
+    i_number: Vec[u64]
+    i_aoff: Vec[u32]
+    i_alen: Vec[u32]
+    i_args: Vec[u32]
+    // case lists of all `switch` terminators, one after another
+    sw_key: Vec[i64]
+    sw_target: Vec[u32]
+}
+
+fn fir_new() -> Fir {
+    return Fir {
+        f_name: vec_new[u32](), f_int: vec_new[u32](), f_ret: vec_new[u32](),
+        f_poff: vec_new[u32](), f_plen: vec_new[u32](),
+        f_boff: vec_new[u32](), f_blen: vec_new[u32](), f_values: vec_new[u32](),
+        f_vbase: vec_new[u32](), v_ty: vec_new[u32](),
+        p_ty: vec_new[u32](),
+        b_ioff: vec_new[u32](), b_ilen: vec_new[u32](),
+        b_term: vec_new[u32](), b_t1: vec_new[u32](), b_t2: vec_new[u32](), b_t3: vec_new[u32](),
+        b_t4: vec_new[u32](), b_t5: vec_new[u32](),
+        b_ilist: vec_new[u32](),
+        i_kind: vec_new[u32](), i_ty: vec_new[u32](), i_dst: vec_new[u32](),
+        i_a: vec_new[u32](), i_b: vec_new[u32](), i_c: vec_new[u32](),
+        i_number: vec_new[u64](), i_aoff: vec_new[u32](), i_alen: vec_new[u32](),
+        i_args: vec_new[u32](),
+        sw_key: vec_new[i64](), sw_target: vec_new[u32](),
+    }
+}
+
+fn fir_free(f: *mut Fir) {
+    vec_free[u32](&(*f).f_name)
+    vec_free[u32](&(*f).f_int)
+    vec_free[u32](&(*f).f_ret)
+    vec_free[u32](&(*f).f_poff)
+    vec_free[u32](&(*f).f_plen)
+    vec_free[u32](&(*f).f_boff)
+    vec_free[u32](&(*f).f_blen)
+    vec_free[u32](&(*f).f_values)
+    vec_free[u32](&(*f).f_vbase)
+    vec_free[u32](&(*f).v_ty)
+    vec_free[u32](&(*f).p_ty)
+    vec_free[u32](&(*f).b_ioff)
+    vec_free[u32](&(*f).b_ilen)
+    vec_free[u32](&(*f).b_term)
+    vec_free[u32](&(*f).b_t1)
+    vec_free[u32](&(*f).b_t2)
+    vec_free[u32](&(*f).b_t3)
+    vec_free[u32](&(*f).b_t4)
+    vec_free[u32](&(*f).b_t5)
+    vec_free[u32](&(*f).b_ilist)
+    vec_free[u32](&(*f).i_kind)
+    vec_free[u32](&(*f).i_ty)
+    vec_free[u32](&(*f).i_dst)
+    vec_free[u32](&(*f).i_a)
+    vec_free[u32](&(*f).i_b)
+    vec_free[u32](&(*f).i_c)
+    vec_free[u64](&(*f).i_number)
+    vec_free[u32](&(*f).i_aoff)
+    vec_free[u32](&(*f).i_alen)
+    vec_free[u32](&(*f).i_args)
+    vec_free[i64](&(*f).sw_key)
+    vec_free[u32](&(*f).sw_target)
+}
+
+fn fty_bits(t: u32) -> u32 {
+    if t == T_I8 || t == T_U8 || t == T_BOOL { return 8 }
+    if t == T_I16 || t == T_U16 { return 16 }
+    if t == T_I32 || t == T_U32 || t == T_F32 { return 32 }
+    if t == T_VOID { return 0 }
+    return 64
+}
+
+fn fty_bytes(t: u32) -> u64 {
+    return (fty_bits(t) / 8) as u64
+}
+
+fn fty_name(b: *mut rt.Buf, t: u32) {
+    var tab: [u8; 51] = "i8|i16|i32|i64|u8|u16|u32|u64|bool|f64|f32|ptr|void"
+    var i: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while i <= 51 {
+        var end: bool = i == 51
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if nr == t {
+                rt.buf_push_bytes(b, (&tab[start]) as u64, i - start)
+                return
+            }
+            nr = nr + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// -------------------------------------------------------------- creating
+
+fn arg_start(f: *mut Fir) -> u32 { return vec_len[u32](&(*f).i_args) as u32 }
+fn arg_add(f: *mut Fir, v: u32) { vec_push[u32](&(*f).i_args, v) }
+
+fn fn_new(f: *mut Fir, name: u32, ret: u32, poff: u32, plen: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*f).f_name) as u32
+    vec_push[u32](&(*f).f_name, name)
+    vec_push[u32](&(*f).f_int, 0)
+    vec_push[u32](&(*f).f_ret, ret)
+    vec_push[u32](&(*f).f_poff, poff)
+    vec_push[u32](&(*f).f_plen, plen)
+    vec_push[u32](&(*f).f_boff, vec_len[u32](&(*f).b_term) as u32)
+    vec_push[u32](&(*f).f_blen, 0)
+    vec_push[u32](&(*f).f_values, plen)
+    // The parameter values are the first values of the function; their
+    // types are already known here.
+    vec_push[u32](&(*f).f_vbase, vec_len[u32](&(*f).v_ty) as u32)
+    var k: u32 = 0
+    while k < plen {
+        vec_push[u32](&(*f).v_ty, vec_at[u32](&(*f).p_ty, (poff + k) as usize))
+        k = k + 1
+    }
+    block_new(f, i)
+    return i
+}
+
+// ROUND 71: the type of value `v` in function `fi`.
+fn val_ty(f: *mut Fir, fi: u32, v: u32) -> u32 {
+    let base: usize = vec_at[u32](&(*f).f_vbase, fi as usize) as usize
+    let i: usize = base + v as usize
+    if i >= vec_len[u32](&(*f).v_ty) {
+        return T_I64
+    }
+    return vec_at[u32](&(*f).v_ty, i)
+}
+
+fn is_float_ty(t: u32) -> bool {
+    return t == T_F32 || t == T_F64
+}
+
+fn fn_count(f: *mut Fir) -> usize { return vec_len[u32](&(*f).f_name) }
+
+fn param_value(f: *mut Fir, fi: u32, k: u32) -> u32 { return k }
+
+fn block_new(f: *mut Fir, fi: u32) -> u32 {
+    let nr: u32 = vec_at[u32](&(*f).f_blen, fi as usize)
+    vec_push[u32](&(*f).b_ioff, vec_len[u32](&(*f).b_ilist) as u32)
+    vec_push[u32](&(*f).b_ilen, 0)
+    vec_push[u32](&(*f).b_term, TERM_UNSET)
+    vec_push[u32](&(*f).b_t1, NONE)
+    vec_push[u32](&(*f).b_t2, NONE)
+    vec_push[u32](&(*f).b_t3, NONE)
+    vec_push[u32](&(*f).b_t4, NONE)
+    vec_push[u32](&(*f).b_t5, NONE)
+    vec_set[u32](&(*f).f_blen, fi as usize, nr + 1)
+    return nr
+}
+
+fn block_count(f: *mut Fir, fi: u32) -> u32 { return vec_at[u32](&(*f).f_blen, fi as usize) }
+fn value_count(f: *mut Fir, fi: u32) -> u32 { return vec_at[u32](&(*f).f_values, fi as usize) }
+
+fn new_value(f: *mut Fir, fi: u32) -> u32 {
+    let v: u32 = vec_at[u32](&(*f).f_values, fi as usize)
+    vec_set[u32](&(*f).f_values, fi as usize, v + 1)
+    return v
+}
+
+// ROUND 71: hold the type of the new value. The functions are lowered one
+// after another, so the values of a function lie CONTIGUOUSLY behind its
+// base; the loop closes a gap should one ever come about.
+fn value_ty_note(f: *mut Fir, fi: u32, v: u32, ty: u32) {
+    let base: usize = vec_at[u32](&(*f).f_vbase, fi as usize) as usize
+    while vec_len[u32](&(*f).v_ty) < base + v as usize {
+        vec_push[u32](&(*f).v_ty, T_I64)
+    }
+    if vec_len[u32](&(*f).v_ty) == base + v as usize {
+        vec_push[u32](&(*f).v_ty, ty)
+        return
+    }
+    vec_set[u32](&(*f).v_ty, base + v as usize, ty)
+}
+
+fn inst_create(f: *mut Fir, kind: u32, ty: u32, dst: u32, a: u32, b: u32, c: u32,
+    number: u64, aoff: u32, alen: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*f).i_kind) as u32
+    vec_push[u32](&(*f).i_kind, kind)
+    vec_push[u32](&(*f).i_ty, ty)
+    vec_push[u32](&(*f).i_dst, dst)
+    vec_push[u32](&(*f).i_a, a)
+    vec_push[u32](&(*f).i_b, b)
+    vec_push[u32](&(*f).i_c, c)
+    vec_push[u64](&(*f).i_number, number)
+    vec_push[u32](&(*f).i_aoff, aoff)
+    vec_push[u32](&(*f).i_alen, alen)
+    return i
+}
+
+// Appends `nr` to the instruction list of block `g` (global block number).
+fn list_append(f: *mut Fir, g: u32, nr: u32) {
+    let off: u32 = vec_at[u32](&(*f).b_ioff, g as usize)
+    let len: u32 = vec_at[u32](&(*f).b_ilen, g as usize)
+    let end: u32 = vec_len[u32](&(*f).b_ilist) as u32
+    if off + len == end {
+        vec_push[u32](&(*f).b_ilist, nr)
+        vec_set[u32](&(*f).b_ilen, g as usize, len + 1)
+        return
+    }
+    let new: u32 = end
+    var k: u32 = 0
+    while k < len {
+        vec_push[u32](&(*f).b_ilist, vec_at[u32](&(*f).b_ilist, (off + k) as usize))
+        k = k + 1
+    }
+    vec_push[u32](&(*f).b_ilist, nr)
+    vec_set[u32](&(*f).b_ioff, g as usize, new)
+    vec_set[u32](&(*f).b_ilen, g as usize, len + 1)
+}
+
+fn global(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).f_boff, fi as usize) + bb
+}
+
+fn inst_add(f: *mut Fir, fi: u32, bb: u32, kind: u32, ty: u32,
+    a: u32, b: u32, c: u32, number: u64, aoff: u32, alen: u32) -> u32 {
+    let v: u32 = new_value(f, fi)
+    value_ty_note(f, fi, v, ty)
+    let nr: u32 = inst_create(f, kind, ty, v, a, b, c, number, aoff, alen)
+    list_append(f, global(f, fi, bb), nr)
+    return v
+}
+
+fn inst_void_add(f: *mut Fir, fi: u32, bb: u32, kind: u32, ty: u32,
+    a: u32, b: u32, c: u32, number: u64, aoff: u32, alen: u32) {
+    let nr: u32 = inst_create(f, kind, ty, NONE, a, b, c, number, aoff, alen)
+    list_append(f, global(f, fi, bb), nr)
+}
+
+// An alloca ALWAYS belongs in the entry block, after the allocas
+// that are already there. The NUMBER still follows the order of
+// creation -- which is why the printed order does not match the
+// numbers, and `firnc0` does it exactly the same way.
+fn alloca_add(f: *mut Fir, fi: u32, size: u64, align: u64) -> u32 {
+    let v: u32 = new_value(f, fi)
+    value_ty_note(f, fi, v, T_PTR)
+    let nr: u32 = inst_create(f, O_ALLOCA, T_PTR, v, 0, 0, 0, size, 0, align as u32)
+    let g: u32 = global(f, fi, 0)
+    let off: u32 = vec_at[u32](&(*f).b_ioff, g as usize)
+    let len: u32 = vec_at[u32](&(*f).b_ilen, g as usize)
+    var n: u32 = 0
+    while n < len {
+        let inr: u32 = vec_at[u32](&(*f).b_ilist, (off + n) as usize)
+        if vec_at[u32](&(*f).i_kind, inr as usize) != O_ALLOCA {
+            break
+        }
+        n = n + 1
+    }
+    let new: u32 = vec_len[u32](&(*f).b_ilist) as u32
+    var k: u32 = 0
+    while k < n {
+        vec_push[u32](&(*f).b_ilist, vec_at[u32](&(*f).b_ilist, (off + k) as usize))
+        k = k + 1
+    }
+    vec_push[u32](&(*f).b_ilist, nr)
+    k = n
+    while k < len {
+        vec_push[u32](&(*f).b_ilist, vec_at[u32](&(*f).b_ilist, (off + k) as usize))
+        k = k + 1
+    }
+    vec_set[u32](&(*f).b_ioff, g as usize, new)
+    vec_set[u32](&(*f).b_ilen, g as usize, len + 1)
+    return v
+}
+
+// The FIRST terminator set wins -- just like `Func::set_term`.
+fn term_set(f: *mut Fir, fi: u32, bb: u32, kind: u32, t1: u32, t2: u32, t3: u32) {
+    let g: u32 = global(f, fi, bb)
+    if vec_at[u32](&(*f).b_term, g as usize) != TERM_UNSET {
+        return
+    }
+    vec_set[u32](&(*f).b_term, g as usize, kind)
+    vec_set[u32](&(*f).b_t1, g as usize, t1)
+    vec_set[u32](&(*f).b_t2, g as usize, t2)
+    vec_set[u32](&(*f).b_t3, g as usize, t3)
+}
+
+fn is_terminated(f: *mut Fir, fi: u32, bb: u32) -> bool {
+    return vec_at[u32](&(*f).b_term, global(f, fi, bb) as usize) != TERM_UNSET
+}
+
+// Set a `switch` terminator (the FIRST terminator wins, as always).
+// `off`/`len` point into the flat case lists `sw_key`/`sw_target`.
+fn term_switch(f: *mut Fir, fi: u32, bb: u32, val: u32, ty: u32, def: u32,
+    off: u32, len: u32) {
+    let g: u32 = global(f, fi, bb)
+    if vec_at[u32](&(*f).b_term, g as usize) != TERM_UNSET {
+        return
+    }
+    vec_set[u32](&(*f).b_term, g as usize, TERM_SWITCH)
+    vec_set[u32](&(*f).b_t1, g as usize, val)
+    vec_set[u32](&(*f).b_t2, g as usize, def)
+    vec_set[u32](&(*f).b_t3, g as usize, off)
+    vec_set[u32](&(*f).b_t4, g as usize, len)
+    vec_set[u32](&(*f).b_t5, g as usize, ty)
+}
+
+fn sw_start(f: *mut Fir) -> u32 { return vec_len[i64](&(*f).sw_key) as u32 }
+fn sw_add(f: *mut Fir, key: i64, target: u32) {
+    vec_push[i64](&(*f).sw_key, key)
+    vec_push[u32](&(*f).sw_target, target)
+}
+fn sw_key_at(f: *mut Fir, i: u32) -> i64 { return vec_at[i64](&(*f).sw_key, i as usize) }
+fn sw_target(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).sw_target, i as usize) }
+
+// ------------------------------------------------------------- text form
+//
+// CONTRACT: byte for byte like `fir::Module::to_text`.
+
+fn value(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, 37 as u8)
+    rt.buf_push_dec_u64(b, v as u64)
+}
+
+fn word_list(f: *mut Fir, b: *mut rt.Buf, off: u32, len: u32) {
+    var k: u32 = 0
+    while k < len {
+        if k > 0 {
+            rt.buf_push(b, 44 as u8)
+            rt.buf_push(b, 32 as u8)
+        }
+        value(b, vec_at[u32](&(*f).i_args, (off + k) as usize))
+        k = k + 1
+    }
+}
+
+fn binop_name(b: *mut rt.Buf, op: u32) {
+    var tab: [u8; 38] = "add|sub|mul|div|rem|and|or|xor|shl|shr"
+    var i: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while i <= 38 {
+        var end: bool = i == 38
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if nr == op {
+                rt.buf_push_bytes(b, (&tab[start]) as u64, i - start)
+                return
+            }
+            nr = nr + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+fn cmpop_name(b: *mut rt.Buf, op: u32) {
+    var tab: [u8; 17] = "eq|ne|lt|le|gt|ge"
+    var i: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while i <= 17 {
+        var end: bool = i == 17
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if nr == op {
+                rt.buf_push_bytes(b, (&tab[start]) as u64, i - start)
+                return
+            }
+            nr = nr + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// Escaping of the assembly template in the FIR text form. ONLY these
+// four characters -- that way both compilers write the same text without
+// a table (fir.rs::asm_escape).
+fn asm_masked(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let z: u8 = rt.ld8(p, i)
+        if z == 92 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 92 as u8)
+        } else if z == 34 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 34 as u8)
+        } else if z == 10 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 110 as u8)
+        } else if z == 9 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 116 as u8)
+        } else {
+            rt.buf_push(b, z)
+        }
+        i = i + 1
+    }
+}
+
+// ROUND 72: an interned text in quotation marks, escaped like an assembly
+// template (`asm_masked`) -- the panic messages of the checked operations
+// travel through the FIR text this way.
+fn quoted(b: *mut rt.Buf, it: *mut intern.Interner, nr: u32) {
+    rt.buf_push(b, 34 as u8)
+    asm_masked(b, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+    rt.buf_push(b, 34 as u8)
+}
+
+fn dot_ty(b: *mut rt.Buf, t: u32) {
+    rt.buf_push(b, 46 as u8)
+    fty_name(b, t)
+}
+
+fn print_inst(f: *mut Fir, it: *mut intern.Interner, b: *mut rt.Buf, nr: u32) {
+    let kind: u32 = vec_at[u32](&(*f).i_kind, nr as usize)
+    let ty: u32 = vec_at[u32](&(*f).i_ty, nr as usize)
+    let dst: u32 = vec_at[u32](&(*f).i_dst, nr as usize)
+    var two: [u8; 2] = "  "
+    rt.buf_push_bytes(b, (&two[0]) as u64, 2)
+    if dst != NONE {
+        value(b, dst)
+        var gl: [u8; 3] = " = "
+        rt.buf_push_bytes(b, (&gl[0]) as u64, 3)
+    }
+    let a: u32 = vec_at[u32](&(*f).i_a, nr as usize)
+    let c: u32 = vec_at[u32](&(*f).i_b, nr as usize)
+    if kind == O_CONST {
+        var w: [u8; 5] = "const"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 5)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        // A SIGN ONLY FOR SIGNED TYPES. `const.u64` with the
+        // largest value has to read 18446744073709551615, not -1 -- the Rust
+        // compiler holds an i128 there, and that prints the value as it is.
+        let raw: u64 = vec_at[u64](&(*f).i_number, nr as usize)
+        if ty == T_I8 || ty == T_I16 || ty == T_I32 || ty == T_I64 {
+            rt.buf_push_dec_i64(b, raw as i64)
+        } else {
+            rt.buf_push_dec_u64(b, raw)
+        }
+        return
+    }
+    if kind == O_BIN {
+        binop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        return
+    }
+    // ROUND 72 -- `add_wrap.u64 %1, %2` / `mul_sat.i32 %1, %2`
+    // (fir.rs::fmt_inst).
+    if kind == O_BINWRAPSAT {
+        binop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        rt.buf_push(b, 95 as u8)
+        if vec_at[u64](&(*f).i_number, nr as usize) == WS_SAT {
+            var ws: [u8; 3] = "sat"
+            rt.buf_push_bytes(b, (&ws[0]) as u64, 3)
+        } else {
+            var ww: [u8; 4] = "wrap"
+            rt.buf_push_bytes(b, (&ww[0]) as u64, 4)
+        }
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        return
+    }
+    // ROUND 72 -- `checked_add.i32 %5, %6 "panic: ..."` (fir.rs::fmt_inst).
+    if kind == O_CHECKEDBIN {
+        var wc: [u8; 8] = "checked_"
+        rt.buf_push_bytes(b, (&wc[0]) as u64, 8)
+        binop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, vec_at[u64](&(*f).i_number, nr as usize) as u32)
+        return
+    }
+    // ROUND 72 -- `checked_div.i32 %5, %6 "zero" "range"`.
+    if kind == O_CHECKEDDIV {
+        var wc: [u8; 8] = "checked_"
+        rt.buf_push_bytes(b, (&wc[0]) as u64, 8)
+        binop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        let both: u64 = vec_at[u64](&(*f).i_number, nr as usize)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, (both & 4294967295) as u32)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, (both >> 32) as u32)
+        return
+    }
+    // ROUND 72 -- `checked_cast.i32.u8 %5 "panic: ..."`.
+    if kind == O_CHECKEDCAST {
+        var wc: [u8; 12] = "checked_cast"
+        rt.buf_push_bytes(b, (&wc[0]) as u64, 12)
+        dot_ty(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, vec_at[u64](&(*f).i_number, nr as usize) as u32)
+        return
+    }
+    // ROUND 89 -- `checked_idx.u64 %5, len=4 "panic: ..."`.
+    if kind == O_CHECKEDIDX {
+        var wi: [u8; 11] = "checked_idx"
+        rt.buf_push_bytes(b, (&wi[0]) as u64, 11)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var cl: [u8; 6] = ", len="
+        rt.buf_push_bytes(b, (&cl[0]) as u64, 6)
+        rt.buf_push_dec_u64(b, vec_at[u32](&(*f).i_c, nr as usize) as u64)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, vec_at[u64](&(*f).i_number, nr as usize) as u32)
+        return
+    }
+    if kind == O_CMP {
+        var w: [u8; 3] = "cmp"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 3)
+        rt.buf_push(b, 46 as u8)
+        cmpop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, vec_at[u64](&(*f).i_number, nr as usize) as u32)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        return
+    }
+    if kind == O_UN {
+        if vec_at[u32](&(*f).i_c, nr as usize) == 0 {
+            var w: [u8; 3] = "neg"
+            rt.buf_push_bytes(b, (&w[0]) as u64, 3)
+        } else {
+            var w2: [u8; 3] = "not"
+            rt.buf_push_bytes(b, (&w2[0]) as u64, 3)
+        }
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        return
+    }
+    if kind == O_CAST {
+        var w: [u8; 4] = "cast"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 4)
+        dot_ty(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        return
+    }
+    if kind == O_ALLOCA {
+        var w: [u8; 16] = "alloca.ptr size="
+        rt.buf_push_bytes(b, (&w[0]) as u64, 16)
+        rt.buf_push_dec_u64(b, vec_at[u64](&(*f).i_number, nr as usize))
+        var w2: [u8; 7] = " align="
+        rt.buf_push_bytes(b, (&w2[0]) as u64, 7)
+        rt.buf_push_dec_u64(b, vec_at[u32](&(*f).i_alen, nr as usize) as u64)
+        return
+    }
+    if kind == O_LOAD {
+        var w: [u8; 4] = "load"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 4)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        return
+    }
+    if kind == O_STORE {
+        var w: [u8; 5] = "store"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 5)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, c)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, a)
+        return
+    }
+    if kind == O_PTRADD {
+        var w: [u8; 11] = "ptradd.ptr "
+        rt.buf_push_bytes(b, (&w[0]) as u64, 11)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        return
+    }
+    if kind == O_CALL {
+        var w: [u8; 4] = "call"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 4)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        rt.buf_push(b, 64 as u8)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, a), intern.intern_length(it, a))
+        rt.buf_push(b, 40 as u8)
+        word_list(f, b, vec_at[u32](&(*f).i_aoff, nr as usize),
+            vec_at[u32](&(*f).i_alen, nr as usize))
+        rt.buf_push(b, 41 as u8)
+        return
+    }
+    if kind == O_CALLI {
+        // `calli.<ty> %target(%a, %b)` -- like Op::CallIndirect in stage 0.
+        var wci: [u8; 5] = "calli"
+        rt.buf_push_bytes(b, (&wci[0]) as u64, 5)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        rt.buf_push(b, 40 as u8)
+        word_list(f, b, vec_at[u32](&(*f).i_aoff, nr as usize),
+            vec_at[u32](&(*f).i_alen, nr as usize))
+        rt.buf_push(b, 41 as u8)
+        return
+    }
+    if kind == O_VTAB {
+        // `vtab.ptr @<interface>.<type>` -- like Op::VtabAddr in stage 0.
+        var wvt: [u8; 10] = "vtab.ptr @"
+        rt.buf_push_bytes(b, (&wvt[0]) as u64, 10)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, a), intern.intern_length(it, a))
+        rt.buf_push(b, 46 as u8)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, c), intern.intern_length(it, c))
+        return
+    }
+    if kind == O_FNREF {
+        // `fnref.ptr @<name>` -- like Op::FnRef in stage 0 (round 58).
+        var wfr: [u8; 11] = "fnref.ptr @"
+        rt.buf_push_bytes(b, (&wfr[0]) as u64, 11)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, a), intern.intern_length(it, a))
+        return
+    }
+    if kind == O_GLOBAL {
+        // `globaladdr.ptr @<name>` -- like Op::GlobalAddr in stage 0 (round 89).
+        var wgl: [u8; 16] = "globaladdr.ptr @"
+        rt.buf_push_bytes(b, (&wgl[0]) as u64, 16)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, a), intern.intern_length(it, a))
+        return
+    }
+    if kind == O_SYSCALL {
+        var w: [u8; 7] = "syscall"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 7)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        word_list(f, b, vec_at[u32](&(*f).i_aoff, nr as usize),
+            vec_at[u32](&(*f).i_alen, nr as usize))
+        return
+    }
+    if kind == O_SELECT {
+        // `select.<ty> %cond, %a, %b` -- like Op::Select in stage 0.
+        var wsel: [u8; 6] = "select"
+        rt.buf_push_bytes(b, (&wsel[0]) as u64, 6)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var ks: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&ks[0]) as u64, 2)
+        value(b, c)
+        rt.buf_push_bytes(b, (&ks[0]) as u64, 2)
+        value(b, vec_at[u32](&(*f).i_c, nr as usize))
+        return
+    }
+    if kind == O_SECZERO {
+        // `secure_zero %addr, %size` -- like Op::SecureZero in stage 0.
+        var wsz: [u8; 12] = "secure_zero "
+        rt.buf_push_bytes(b, (&wsz[0]) as u64, 12)
+        value(b, a)
+        var ks2: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&ks2[0]) as u64, 2)
+        value(b, c)
+        return
+    }
+    if kind == O_ATOMADD {
+        // `atomadd.<ty> %addr, %val` -- like Op::AtomicAdd in stage 0.
+        var wat: [u8; 7] = "atomadd"
+        rt.buf_push_bytes(b, (&wat[0]) as u64, 7)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var ka: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&ka[0]) as u64, 2)
+        value(b, c)
+        return
+    }
+    if kind == O_ASM {
+        // `asm.<ty> "template" [out=reg] [in=[reg %v, ...]] [clobber=[a, b]]`
+        var wa: [u8; 3] = "asm"
+        rt.buf_push_bytes(b, (&wa[0]) as u64, 3)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        rt.buf_push(b, 34 as u8)
+        asm_masked(b, intern.intern_ptr(it, a), intern.intern_length(it, a))
+        rt.buf_push(b, 34 as u8)
+        if c != NONE {
+            var wo: [u8; 5] = " out="
+            rt.buf_push_bytes(b, (&wo[0]) as u64, 5)
+            rt.buf_push_bytes(b, intern.intern_ptr(it, c), intern.intern_length(it, c))
+        }
+        let aoff: u32 = vec_at[u32](&(*f).i_aoff, nr as usize)
+        let alen: u32 = vec_at[u32](&(*f).i_alen, nr as usize)
+        var ks3: [u8; 2] = ", "
+        // ROUND 68: the MEMORY outputs, behind the value form.
+        let onum: u32 = (vec_at[u64](&(*f).i_number, nr as usize) >> 32) as u32
+        if onum > 0 {
+            var wo2: [u8; 6] = " out=["
+            rt.buf_push_bytes(b, (&wo2[0]) as u64, 6)
+            var ko: u32 = 0
+            while ko < onum {
+                if ko > 0 {
+                    rt.buf_push_bytes(b, (&ks3[0]) as u64, 2)
+                }
+                let orn: u32 = arg_at(f, aoff + alen * 2 + ko * 2)
+                rt.buf_push_bytes(b, intern.intern_ptr(it, orn), intern.intern_length(it, orn))
+                rt.buf_push(b, 32 as u8)
+                value(b, arg_at(f, aoff + alen * 2 + ko * 2 + 1))
+                ko = ko + 1
+            }
+            rt.buf_push(b, 93 as u8)
+        }
+        if alen > 0 {
+            var wi: [u8; 5] = " in=["
+            rt.buf_push_bytes(b, (&wi[0]) as u64, 5)
+            var k: u32 = 0
+            while k < alen {
+                if k > 0 {
+                    rt.buf_push_bytes(b, (&ks3[0]) as u64, 2)
+                }
+                let rn: u32 = arg_at(f, aoff + k * 2)
+                rt.buf_push_bytes(b, intern.intern_ptr(it, rn), intern.intern_length(it, rn))
+                rt.buf_push(b, 32 as u8)
+                value(b, arg_at(f, aoff + k * 2 + 1))
+                k = k + 1
+            }
+            rt.buf_push(b, 93 as u8)
+        }
+        let znum: u64 = vec_at[u64](&(*f).i_number, nr as usize)
+        // ROUND 72: `znum as u32` is a NARROWING cast and would now
+        // (correctly) panic -- the upper half really is set, it holds
+        // `n_out`. Masking first says "the low half, on purpose" in a way
+        // the checked `as` can agree with; there is no `as%`.
+        let cz: u32 = (znum & 4294967295) as u32
+        // ROUND 68: the count of the MEMORY outputs sits in the upper half.
+        let n_out: u32 = (znum >> 32) as u32
+        if cz > 0 {
+            var wc: [u8; 10] = " clobber=["
+            rt.buf_push_bytes(b, (&wc[0]) as u64, 10)
+            var k2: u32 = 0
+            while k2 < cz {
+                if k2 > 0 {
+                    rt.buf_push_bytes(b, (&ks3[0]) as u64, 2)
+                }
+                let cn: u32 = arg_at(f, aoff + alen * 2 + n_out * 2 + k2)
+                rt.buf_push_bytes(b, intern.intern_ptr(it, cn), intern.intern_length(it, cn))
+                k2 = k2 + 1
+            }
+            rt.buf_push(b, 93 as u8)
+        }
+        return
+    }
+    if kind == O_MMIOLD {
+        var wml: [u8; 9] = "mmio_load"
+        rt.buf_push_bytes(b, (&wml[0]) as u64, 9)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        return
+    }
+    if kind == O_MMIOST {
+        var wms: [u8; 10] = "mmio_store"
+        rt.buf_push_bytes(b, (&wms[0]) as u64, 10)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, c)
+        var kms: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&kms[0]) as u64, 2)
+        value(b, a)
+        return
+    }
+    if kind == O_ATOMCAS {
+        // `atomcas.<ty> %addr, %expected, %new` -- like Op::AtomicCas in stage 0.
+        var wacs: [u8; 7] = "atomcas"
+        rt.buf_push_bytes(b, (&wacs[0]) as u64, 7)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var kcs: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&kcs[0]) as u64, 2)
+        value(b, c)
+        rt.buf_push_bytes(b, (&kcs[0]) as u64, 2)
+        value(b, vec_at[u32](&(*f).i_c, nr as usize))
+        return
+    }
+    if kind == O_SPAWN {
+        // `spawn.<ty> %arg, %stack, %ctid` -- like Op::ThreadSpawn in stage 0.
+        var wsp: [u8; 5] = "spawn"
+        rt.buf_push_bytes(b, (&wsp[0]) as u64, 5)
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var ksp: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&ksp[0]) as u64, 2)
+        value(b, c)
+        rt.buf_push_bytes(b, (&ksp[0]) as u64, 2)
+        value(b, vec_at[u32](&(*f).i_c, nr as usize))
+        return
+    }
+    if kind == O_TLS {
+        // `threadself.<ty>` -- like Op::ThreadSelf in stage 0.
+        var wtl: [u8; 10] = "threadself"
+        rt.buf_push_bytes(b, (&wtl[0]) as u64, 10)
+        dot_ty(b, ty)
+        return
+    }
+    if kind == O_GCADDR {
+        var wg: [u8; 12] = "gc_state.ptr"
+        rt.buf_push_bytes(b, (&wg[0]) as u64, 12)
+        if vec_at[u64](&(*f).i_number, nr as usize) == 1 {
+            var rg: [u8; 6] = " regs="
+            rt.buf_push_bytes(b, (&rg[0]) as u64, 6)
+            rt.buf_push_dec_u64(b, 1)
+        }
+        return
+    }
+    // copymem
+    var w: [u8; 8] = "copymem "
+    rt.buf_push_bytes(b, (&w[0]) as u64, 8)
+    value(b, a)
+    var comma: [u8; 2] = ", "
+    rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+    value(b, c)
+    var w2: [u8; 7] = ", size="
+    rt.buf_push_bytes(b, (&w2[0]) as u64, 7)
+    rt.buf_push_dec_u64(b, vec_at[u64](&(*f).i_number, nr as usize))
+}
+
+fn print_term(f: *mut Fir, b: *mut rt.Buf, g: u32) {
+    var two: [u8; 2] = "  "
+    rt.buf_push_bytes(b, (&two[0]) as u64, 2)
+    let kind: u32 = vec_at[u32](&(*f).b_term, g as usize)
+    let t1: u32 = vec_at[u32](&(*f).b_t1, g as usize)
+    if kind == TERM_BR {
+        var w: [u8; 5] = "br bb"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 5)
+        rt.buf_push_dec_u64(b, t1 as u64)
+        return
+    }
+    if kind == TERM_BRCOND {
+        var w: [u8; 7] = "brcond "
+        rt.buf_push_bytes(b, (&w[0]) as u64, 7)
+        value(b, t1)
+        var w2: [u8; 4] = ", bb"
+        rt.buf_push_bytes(b, (&w2[0]) as u64, 4)
+        rt.buf_push_dec_u64(b, vec_at[u32](&(*f).b_t2, g as usize) as u64)
+        rt.buf_push_bytes(b, (&w2[0]) as u64, 4)
+        rt.buf_push_dec_u64(b, vec_at[u32](&(*f).b_t3, g as usize) as u64)
+        return
+    }
+    if kind == TERM_SWITCH {
+        // `switch.u32 %17 [0 => bb6, 1 => bb7] default bb5` -- the text form from
+        // fir.rs, character for character.
+        var w: [u8; 7] = "switch."
+        rt.buf_push_bytes(b, (&w[0]) as u64, 7)
+        fty_name(b, vec_at[u32](&(*f).b_t5, g as usize))
+        rt.buf_push(b, 32 as u8)
+        value(b, t1)
+        var w2: [u8; 2] = " ["
+        rt.buf_push_bytes(b, (&w2[0]) as u64, 2)
+        let off: u32 = vec_at[u32](&(*f).b_t3, g as usize)
+        let len: u32 = vec_at[u32](&(*f).b_t4, g as usize)
+        var k: u32 = 0
+        while k < len {
+            if k > 0 {
+                var comma: [u8; 2] = ", "
+                rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+            }
+            rt.buf_push_dec_i64(b, sw_key_at(f, off + k))
+            var w3: [u8; 6] = " => bb"
+            rt.buf_push_bytes(b, (&w3[0]) as u64, 6)
+            rt.buf_push_dec_u64(b, sw_target(f, off + k) as u64)
+            k = k + 1
+        }
+        var w4: [u8; 12] = "] default bb"
+        rt.buf_push_bytes(b, (&w4[0]) as u64, 12)
+        rt.buf_push_dec_u64(b, vec_at[u32](&(*f).b_t2, g as usize) as u64)
+        return
+    }
+    var w: [u8; 3] = "ret"
+    rt.buf_push_bytes(b, (&w[0]) as u64, 3)
+    if t1 != NONE {
+        rt.buf_push(b, 32 as u8)
+        value(b, t1)
+    }
+}
+
+fn fir_text(f: *mut Fir, it: *mut intern.Interner, b: *mut rt.Buf) {
+    var header: [u8; 9] = "; FIR v0\n"
+    rt.buf_push_bytes(b, (&header[0]) as u64, 9)
+    var fi: usize = 0
+    while fi < fn_count(f) {
+        var w: [u8; 4] = "fn @"
+        rt.buf_push_bytes(b, (&w[0]) as u64, 4)
+        let nm: u32 = vec_at[u32](&(*f).f_name, fi)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, nm), intern.intern_length(it, nm))
+        rt.buf_push(b, 40 as u8)
+        let poff: u32 = vec_at[u32](&(*f).f_poff, fi)
+        let plen: u32 = vec_at[u32](&(*f).f_plen, fi)
+        var k: u32 = 0
+        while k < plen {
+            if k > 0 {
+                var comma: [u8; 2] = ", "
+                rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+            }
+            value(b, k)
+            var dp: [u8; 2] = ": "
+            rt.buf_push_bytes(b, (&dp[0]) as u64, 2)
+            fty_name(b, vec_at[u32](&(*f).p_ty, (poff + k) as usize))
+            k = k + 1
+        }
+        var pf: [u8; 5] = ") -> "
+        rt.buf_push_bytes(b, (&pf[0]) as u64, 5)
+        fty_name(b, vec_at[u32](&(*f).f_ret, fi))
+        var on: [u8; 3] = " {\n"
+        rt.buf_push_bytes(b, (&on[0]) as u64, 3)
+        let boff: u32 = vec_at[u32](&(*f).f_boff, fi)
+        var bb: u32 = 0
+        while bb < vec_at[u32](&(*f).f_blen, fi) {
+            let g: u32 = boff + bb
+            var bw: [u8; 2] = "bb"
+            rt.buf_push_bytes(b, (&bw[0]) as u64, 2)
+            rt.buf_push_dec_u64(b, bb as u64)
+            var dz: [u8; 2] = ":\n"
+            rt.buf_push_bytes(b, (&dz[0]) as u64, 2)
+            let ioff: u32 = vec_at[u32](&(*f).b_ioff, g as usize)
+            var n: u32 = 0
+            while n < vec_at[u32](&(*f).b_ilen, g as usize) {
+                print_inst(f, it, b, vec_at[u32](&(*f).b_ilist, (ioff + n) as usize))
+                rt.buf_push(b, 10 as u8)
+                n = n + 1
+            }
+            print_term(f, b, g)
+            rt.buf_push(b, 10 as u8)
+            bb = bb + 1
+        }
+        var cbrace: [u8; 2] = "}\n"
+        rt.buf_push_bytes(b, (&cbrace[0]) as u64, 2)
+        fi = fi + 1
+    }
+}
+
+// -------------------------------------------------- access for the code gen
+
+fn inst_count(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).b_ilen, global(f, fi, bb) as usize)
+}
+
+fn inst_at(f: *mut Fir, fi: u32, bb: u32, k: u32) -> u32 {
+    let g: u32 = global(f, fi, bb)
+    return vec_at[u32](&(*f).b_ilist, (vec_at[u32](&(*f).b_ioff, g as usize) + k) as usize)
+}
+
+fn f_int_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).f_int, i as usize) }
+fn f_int_set(f: *mut Fir, i: u32, v: u32) { vec_set[u32](&(*f).f_int, i as usize, v) }
+fn arg_at(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_args, i as usize) }
+fn i_kind_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_kind, i as usize) }
+fn i_ty_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_ty, i as usize) }
+fn i_dst_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_dst, i as usize) }
+fn i_a_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_a, i as usize) }
+fn i_b_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_b, i as usize) }
+fn i_c_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_c, i as usize) }
+fn i_number_of(f: *mut Fir, i: u32) -> u64 { return vec_at[u64](&(*f).i_number, i as usize) }
+fn i_aoff_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_aoff, i as usize) }
+fn i_alen_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_alen, i as usize) }
+
+fn b_term_of(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).b_term, global(f, fi, bb) as usize)
+}
+fn b_t1_of(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).b_t1, global(f, fi, bb) as usize)
+}
+fn b_t2_of(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).b_t2, global(f, fi, bb) as usize)
+}
+fn b_t3_of(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).b_t3, global(f, fi, bb) as usize)
+}
+fn b_t4_of(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).b_t4, global(f, fi, bb) as usize)
+}
+fn b_t5_of(f: *mut Fir, fi: u32, bb: u32) -> u32 {
+    return vec_at[u32](&(*f).b_t5, global(f, fi, bb) as usize)
+}
+fn f_ret_of(f: *mut Fir, fi: u32) -> u32 { return vec_at[u32](&(*f).f_ret, fi as usize) }
+fn f_plen_of(f: *mut Fir, fi: u32) -> u32 { return vec_at[u32](&(*f).f_plen, fi as usize) }
+fn f_poff_of(f: *mut Fir, fi: u32) -> u32 { return vec_at[u32](&(*f).f_poff, fi as usize) }
+fn p_ty_of(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).p_ty, i as usize) }
+fn f_name_of(f: *mut Fir, fi: u32) -> u32 { return vec_at[u32](&(*f).f_name, fi as usize) }

@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/gc_frag/frag.fi -- ACCEPTANCE ITEM 2, the open half:
+// FRAGMENTATION WITH CHANGING OBJECT SIZES.
+//
+// What the DOM soak run (tools/dom_soak/run.sh) does NOT show: it always
+// builds the same set of objects, so every allocation lands in the same size
+// class. That is the friendly case, and `ACCEPTANCE.md` has said so since
+// round 3 ("the soak test always uses the same set, which is the friendly
+// case").
+//
+// This program does the opposite. The collector is non moving (SPEC 3.5.3,
+// conservative stack scan -- so no compaction is possible), and it defends
+// itself against fragmentation with SIZE CLASSES: 13 of them, from 16 to
+// 4,096 octets (`lib/gc/gc.fi`, `CLASSES`, `__gc_classes_bytes`), plus a
+// path of its own for larger objects that gets a chunk to itself. Chunks are
+// 256 KiB and are given back to the kernel when they have been empty for two
+// sweeps in a row (the hysteresis in the sweep).
+//
+// The question this program asks: what happens when the workload keeps
+// CHANGING size class? A size class allocator can only give memory back per
+// chunk. If a phase fills 256 KiB chunks of class 3 and the next phase only
+// wants class 11, the class 3 chunks are useless -- and if they are not
+// given back, the heap grows with every phase change even though the live
+// set stays the same. That is exactly what fragmentation means here.
+//
+// The load: five phases that repeat, each PHASE_ROUNDS rounds long.
+//
+//   phase 0   tiny        1 .. 8 words         classes 0-2
+//   phase 1   large       512 .. 1,535 words   the large object path
+//   phase 2   mixed       1 .. 2,048 words     everything at once
+//   phase 3   powers      1, 2, 4, ... 2,048   every class in turn
+//   phase 4   medium      4 .. 67 words        classes 2-6
+//
+// The working set stays CONSTANT: SLOTS live vectors. Every round produces
+// one new vector and overwrites a slot chosen by a pseudo random number --
+// so exactly one object dies per round, and it is almost never the same size
+// as the one that is born. The live set therefore hardly moves, while the
+// SIZES of the objects in it change all the time.
+//
+// MODE decides what happens with the new object:
+//   0  replace -- the working set stays at SLOTS objects. The heap MUST stay
+//      bounded; that is the claim under test.
+//   1  keep -- nothing is overwritten, everything is appended. The heap MUST
+//      grow. Without this counter-check a flat curve would prove nothing:
+//      a measurement that cannot strike is worth nothing.
+//
+// The output is TSV on standard output, one line per SAMPLE rounds:
+//   t_ms  rounds  rss_kib  live  heap_bytes  live_bytes  collections
+//   pause_ns_max  asked
+// tools/gc_frag/run.sh evaluates it.
+//
+// The four constants stand here verbatim so that run.sh can rewrite them
+// with `sed` into a working copy -- the same trick as tools/dom_soak/run.sh.
+
+import dom.meas
+
+const BUDGET_MS: i64 = 60000 // FRAG_BUDGET_MS
+const ROUNDS_MAX: i64 = 100000000 // FRAG_ROUNDS_MAX
+const SAMPLE: i64 = 500 // FRAG_SAMPLE
+const MODE: i64 = 0 // FRAG_MODE
+
+// How many vectors stay alive at the same time, and how long a phase lasts.
+const SLOTS: u64 = 384
+const PHASE_ROUNDS: u64 = 4000
+const PHASES: u64 = 5
+
+// ------------------------------------------------------------ pseudo random
+// xorshift64, so that the sequence is the same on every machine and the
+// measurement is repeatable. No `rand`, no clock, no /dev/urandom.
+fn next_random(s: u64) -> u64 {
+    var x: u64 = s
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    return x
+}
+
+// The number of words the vector of this round gets.
+fn size_for(phase: u64, r: u64) -> u64 {
+    if phase == 0 {
+        return 1 + r % 8
+    }
+    if phase == 1 {
+        return 512 + r % 1024
+    }
+    if phase == 2 {
+        return 1 + r % 2048
+    }
+    if phase == 3 {
+        var n: u64 = 1
+        var k: u64 = r % 12
+        while k > 0 {
+            n = n * 2
+            k = k - 1
+        }
+        return n
+    }
+    return 4 + r % 64
+}
+
+// Wipe the dead stack area below this frame. The scan is CONSERVATIVE
+// (SPEC 3.5.3): old pointers still stand in frames that have been left, and
+// every one of them keeps a whole vector plus its buffer alive. Without this
+// the measurement would report a leak that is a measuring artefact.
+fn scrub() {
+    var buffer: [u64; 512] = [0; 512]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 512 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+}
+
+fn head() {
+    var t: [u8; 60] = "# firn-gc-frag v1 mode=0 (0=replace/flat, 1=keep/must grow)\n"
+    let p: u64 = (&t) as u64
+    // The mode really stands in the line -- otherwise the two files could be
+    // mixed up during the evaluation.
+    *((p + 23) as *mut u8) = 48 + MODE as u8
+    meas.meas_write(p, 60)
+    var c: [u8; 89] = "# columns: t_ms rounds rss_kib live heap_bytes live_bytes collections pause_ns_max asked\n"
+    meas.meas_write((&c) as u64, 89)
+}
+
+fn line(t_ms: u64, rounds: u64, rss: u64, live: u64, heap: u64, livebytes: u64,
+    runs: u64, pause: u64, asked: u64) {
+    meas.meas_u64(t_ms)
+    meas.meas_tab()
+    meas.meas_u64(rounds)
+    meas.meas_tab()
+    meas.meas_u64(rss)
+    meas.meas_tab()
+    meas.meas_u64(live)
+    meas.meas_tab()
+    meas.meas_u64(heap)
+    meas.meas_tab()
+    meas.meas_u64(livebytes)
+    meas.meas_tab()
+    meas.meas_u64(runs)
+    meas.meas_tab()
+    meas.meas_u64(pause)
+    meas.meas_tab()
+    meas.meas_u64(asked)
+    meas.meas_nl()
+}
+
+fn err(code: u64) -> i32 {
+    var t: [u8; 13] = "# error code="
+    meas.meas_write((&t) as u64, 13)
+    meas.meas_u64(code)
+    meas.meas_nl()
+    return code as i32
+}
+
+// One vector of `words` words, really allocated and really zeroed
+// (the payload is nulled by the allocator -- so the pages are touched and
+// the RSS tells the truth), with up to four words written into it so that
+// the object is not merely reserved but used.
+// The working set holds `Cell`s, not `GcVec`s directly: `GcVec` is a class
+// of the collector runtime and cannot be named as a type argument from
+// outside (`gcvec_append[GcVec]` does not parse). One indirection more, and
+// the cell is a small object next to a large one -- which suits the point of
+// this measurement.
+gc class Cell {
+    data: Gc[GcVec],
+    words: u64,
+}
+
+fn make(words: u64) -> AllocError!Gc[Cell] {
+    let v: Gc[GcVec] = try gcvec_new_raw()
+    let ok: bool = try gcvec_slot(v, words)
+    var i: u64 = 0
+    var n: u64 = 4
+    if words < 4 {
+        n = words
+    }
+    while i < n {
+        let a: bool = try gcvec_append_raw(v, 1 + i)
+        i = i + 1
+    }
+    return try gc Cell { data: v, words: words }
+}
+
+// The whole run. It returns an error union, so `try` is available -- stage 0
+// has no `catch` with a block (SPEC 14.1), and a sentinel value per call
+// site would only hide the reason.
+fn work() -> AllocError!i32 {
+    if !gc_init() {
+        return err(2)
+    }
+    head()
+    let rss0: u64 = meas.meas_rss_kib()
+    if rss0 == 0 {
+        return err(3)
+    }
+    let t0: u64 = meas.meas_now_ms()
+
+    // The working set. One vector of pointers, filled with SLOTS vectors.
+    let set: Gc[GcVec] = try gcvec_new()
+    var i: u64 = 0
+    while i < SLOTS {
+        let v: Gc[Cell] = try make(1 + i % 8)
+        let ok: bool = try gcvec_append[Cell](set, v)
+        i = i + 1
+    }
+    line(0, 0, meas.meas_rss_kib(), gc_live_objects(), gc_heap_bytes(),
+        gc_live_bytes(), gc_collections(), gc_pause_ns_max(), 0)
+
+    var rounds: u64 = 0
+    var since: i64 = 0
+    var seed: u64 = 88172645463325252
+    var asked: u64 = 0
+    var t: u64 = 0
+    var run: bool = true
+    while run {
+        seed = next_random(seed)
+        let phase: u64 = rounds / PHASE_ROUNDS % PHASES
+        let words: u64 = size_for(phase, seed)
+        asked = asked + words * 8
+        let v: Gc[Cell] = try make(words)
+        if MODE == 0 {
+            let slot: u64 = seed % SLOTS
+            let ok: bool = gcvec_set[Cell](set, slot, v)
+            if !ok {
+                return err(8)
+            }
+        } else {
+            let ok: bool = try gcvec_append[Cell](set, v)
+        }
+        rounds = rounds + 1
+        since = since + 1
+        if since >= SAMPLE {
+            since = 0
+            scrub()
+            t = meas.meas_now_ms() - t0
+            let rss: u64 = meas.meas_rss_kib()
+            if rss == 0 {
+                return err(10)
+            }
+            line(t, rounds, rss, gc_live_objects(), gc_heap_bytes(),
+                gc_live_bytes(), gc_collections(), gc_pause_ns_max(), asked)
+            if t >= BUDGET_MS as u64 || rounds >= ROUNDS_MAX as u64 {
+                run = false
+            }
+        }
+    }
+
+    var d: [u8; 14] = "# done rounds="
+    meas.meas_write((&d) as u64, 14)
+    meas.meas_u64(rounds)
+    var d2: [u8; 6] = " t_ms="
+    meas.meas_write((&d2) as u64, 6)
+    meas.meas_u64(t)
+    var d3: [u8; 7] = " asked="
+    meas.meas_write((&d3) as u64, 7)
+    meas.meas_u64(asked)
+    var d4: [u8; 9] = " rss_kib="
+    meas.meas_write((&d4) as u64, 9)
+    meas.meas_u64(meas.meas_rss_kib())
+    var d5: [u8; 5] = " len="
+    meas.meas_write((&d5) as u64, 5)
+    meas.meas_u64(gcvec_length(set))
+    meas.meas_nl()
+    return 0
+}
+
+fn main() -> i32 {
+    // 11 = the memory ran out -- it is a result too, and it says so.
+    return work() catch 11
+}

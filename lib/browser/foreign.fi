@@ -1,0 +1,415 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/foreign.fi -- the name corrections of foreign content (round B1).
+//
+// HTML is case insensitive, SVG and MathML are NOT. The tokenizer lowers
+// every tag and attribute name to ASCII lower case, so `<clipPath>` arrives
+// as `clippath` and `attributeName=` as `attributename`. Inside SVG that is
+// wrong: the DOM has to carry `clipPath` and `attributeName`, otherwise
+// neither a selector nor an SVG renderer finds the element again.
+//
+// WHATWG 13.2.6.5 therefore has four tables, and this file is nothing but
+// those four tables, resolved into ATOMS once:
+//
+//   1. SVG element names       clippath      -> clipPath        (37)
+//   2. SVG attribute names     attributename -> attributeName   (58)
+//   3. MathML attribute names  definitionurl -> definitionURL    (1)
+//   4. foreign attributes      xlink:href    -> prefix `xlink`,
+//                              local name `href`, namespace XLink (11)
+//
+// The word lists themselves stand in the generated `foreign_data.fi`.
+//
+// WHY ATOMS AND NOT STRINGS: the correction runs for every element and every
+// attribute inside SVG/MathML. As atoms one entry is a `u32` comparison; the
+// tables are small enough (37/58/11) that a straight scan beats a hash table
+// including its computation. Everything here is `#[no_gc]` -- the collector
+// never sees this file.
+
+import html.mem
+import browser.names
+import browser.node
+import browser.foreign_data
+
+export {
+    Adjust,
+    adjust_new, adjust_init, adjust_ready,
+    svg_tag_fix, svg_attr_fix, math_attr_fix,
+    foreign_attr_find, foreign_attr_prefix, foreign_attr_local, foreign_attr_ns,
+    a_encoding, a_color, a_face, a_size,
+    a_sub, a_sup, a_var, a_span,
+    a_text_html, a_xhtml_xml, a_mglyph, a_malignmark,
+    svg_tag_low,
+}
+
+const MAX_TAG: usize = 48
+const MAX_SATTR: usize = 72
+const MAX_MATTR: usize = 8
+const MAX_FA: usize = 16
+
+// All fields are plain numbers -- no `Gc[...]`, so an `Adjust` may lie
+// anywhere, including on the heap.
+struct Adjust {
+    tag_low: [u32; 48],
+    tag_fix: [u32; 48],
+    n_tag: usize,
+
+    sattr_low: [u32; 72],
+    sattr_fix: [u32; 72],
+    n_sattr: usize,
+
+    mattr_low: [u32; 8],
+    mattr_fix: [u32; 8],
+    n_mattr: usize,
+
+    fa_full: [u32; 16],
+    fa_prefix: [u32; 16],
+    fa_local: [u32; 16],
+    fa_ns: [u32; 16],
+    n_fa: usize,
+
+    // Single names the foreign rules ask for by name.
+    n_encoding: u32,
+    n_color: u32,
+    n_face: u32,
+    n_size: u32,
+    n_sub: u32,
+    n_sup: u32,
+    n_var: u32,
+    n_span: u32,
+    n_text_html: u32,
+    n_xhtml_xml: u32,
+    n_mglyph: u32,
+    n_malignmark: u32,
+
+    ready: bool,
+}
+
+#[no_gc]
+fn adjust_new() -> Adjust {
+    return Adjust {
+        tag_low: [0; 48],
+        tag_fix: [0; 48],
+        n_tag: 0,
+        sattr_low: [0; 72],
+        sattr_fix: [0; 72],
+        n_sattr: 0,
+        mattr_low: [0; 8],
+        mattr_fix: [0; 8],
+        n_mattr: 0,
+        fa_full: [0; 16],
+        fa_prefix: [0; 16],
+        fa_local: [0; 16],
+        fa_ns: [0; 16],
+        n_fa: 0,
+        n_encoding: 0,
+        n_color: 0,
+        n_face: 0,
+        n_size: 0,
+        n_sub: 0,
+        n_sup: 0,
+        n_var: 0,
+        n_span: 0,
+        n_text_html: 0,
+        n_xhtml_xml: 0,
+        n_mglyph: 0,
+        n_malignmark: 0,
+        ready: false,
+    }
+}
+
+#[no_gc]
+fn adjust_ready(a: *mut Adjust) -> bool {
+    return (*a).ready
+}
+
+// The number of words in `raw`, and the id of word number `k`. The word
+// lists are short and are walked exactly once, at startup -- a scan is
+// enough, an index would only be more code.
+#[no_gc]
+fn word_id(nm: *mut names.Names, raw: *mut mem.Buf, k: usize) -> u32 {
+    let total: usize = mem.buf_len(raw)
+    let base: *mut u8 = mem.buf_ptr(raw)
+    var i: usize = 0
+    var number: usize = 0
+    while i < total {
+        var j: usize = i
+        while j < total && *((base as u64 + j as u64) as *mut u8) != 32 as u8 {
+            j = j + 1
+        }
+        if j > i {
+            if number == k {
+                return names.names_of_bytes(nm, (base as u64 + i as u64) as *mut u8, j - i)
+            }
+            number = number + 1
+        }
+        i = j + 1
+    }
+    return 0
+}
+
+// A word list of PAIRS into two parallel arrays.
+#[no_gc]
+fn pairs_read(nm: *mut names.Names, raw: *mut mem.Buf,
+    low: *mut u32, fix: *mut u32, want: usize) -> bool {
+    var k: usize = 0
+    while k < want {
+        let a: u32 = word_id(nm, raw, k * 2)
+        let c: u32 = word_id(nm, raw, k * 2 + 1)
+        if a == 0 as u32 || c == 0 as u32 {
+            return false
+        }
+        *((low as u64 + k as u64 * 4) as *mut u32) = a
+        *((fix as u64 + k as u64 * 4) as *mut u32) = c
+        k = k + 1
+    }
+    return true
+}
+
+// ONCE per program run. `false` = out of memory in the atom table.
+#[no_gc]
+fn adjust_init(a: *mut Adjust, nm: *mut names.Names) -> bool {
+    if (*a).ready {
+        return true
+    }
+    var raw: mem.Buf = mem.buf_new()
+    mem.buf_init(&raw)
+
+    foreign_data.svg_tag_bytes(&raw)
+    if !pairs_read(nm, &raw, &(*a).tag_low[0], &(*a).tag_fix[0],
+        foreign_data.SVG_TAG_COUNT) {
+        mem.buf_free(&raw)
+        return false
+    }
+    (*a).n_tag = foreign_data.SVG_TAG_COUNT
+
+    mem.buf_clear(&raw)
+    foreign_data.svg_attr_bytes(&raw)
+    if !pairs_read(nm, &raw, &(*a).sattr_low[0], &(*a).sattr_fix[0],
+        foreign_data.SVG_ATTR_COUNT) {
+        mem.buf_free(&raw)
+        return false
+    }
+    (*a).n_sattr = foreign_data.SVG_ATTR_COUNT
+
+    mem.buf_clear(&raw)
+    foreign_data.math_attr_bytes(&raw)
+    if !pairs_read(nm, &raw, &(*a).mattr_low[0], &(*a).mattr_fix[0],
+        foreign_data.MATH_ATTR_COUNT) {
+        mem.buf_free(&raw)
+        return false
+    }
+    (*a).n_mattr = foreign_data.MATH_ATTR_COUNT
+
+    mem.buf_clear(&raw)
+    foreign_data.foreign_attr_bytes(&raw)
+    var k: usize = 0
+    while k < foreign_data.FOREIGN_ATTR_COUNT {
+        let full: u32 = word_id(nm, &raw, k * 4)
+        let prefix: u32 = word_id(nm, &raw, k * 4 + 1)
+        let local: u32 = word_id(nm, &raw, k * 4 + 2)
+        let ns: u32 = word_id(nm, &raw, k * 4 + 3)
+        if full == 0 as u32 || local == 0 as u32 {
+            mem.buf_free(&raw)
+            return false
+        }
+        (*a).fa_full[k] = full
+        // "-" means: no prefix. The atom of "-" would be a name of its own,
+        // so it is turned into 0 here, and the output path (write.fi) then
+        // prints nothing in front of the name.
+        var p: u32 = prefix
+        if names.names_length(nm, prefix) == 1 &&
+        *(names.names_ptr(nm, prefix)) == 45 as u8 {
+            p = 0
+        }
+        (*a).fa_prefix[k] = p
+        (*a).fa_local[k] = local
+        // The namespace stands in the list as a decimal digit.
+        (*a).fa_ns[k] = digits_read(nm, ns)
+        k = k + 1
+    }
+    (*a).n_fa = foreign_data.FOREIGN_ATTR_COUNT
+
+    mem.buf_clear(&raw)
+    foreign_data.extra_bytes(&raw)
+    (*a).n_sub = word_id(nm, &raw, 0)
+    (*a).n_sup = word_id(nm, &raw, 1)
+    (*a).n_var = word_id(nm, &raw, 2)
+    (*a).n_span = word_id(nm, &raw, 3)
+    (*a).n_encoding = word_id(nm, &raw, 4)
+    (*a).n_color = word_id(nm, &raw, 5)
+    (*a).n_face = word_id(nm, &raw, 6)
+    (*a).n_size = word_id(nm, &raw, 7)
+    // word 8 is "definitionurl" -- it already stands in mattr_low.
+    (*a).n_text_html = word_id(nm, &raw, 9)
+    (*a).n_xhtml_xml = word_id(nm, &raw, 10)
+    (*a).n_mglyph = word_id(nm, &raw, 11)
+    (*a).n_malignmark = word_id(nm, &raw, 12)
+    mem.buf_free(&raw)
+
+    if (*a).n_span == 0 as u32 || (*a).n_encoding == 0 as u32 {
+        return false
+    }
+    (*a).ready = true
+    return true
+}
+
+// The decimal number an atom spells out ("4" -> 4).
+#[no_gc]
+fn digits_read(nm: *mut names.Names, id: u32) -> u32 {
+    let p: *mut u8 = names.names_ptr(nm, id)
+    let n: usize = names.names_length(nm, id)
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = *((p as u64 + i as u64) as *mut u8)
+        if c < 48 as u8 || c > 57 as u8 {
+            return 0
+        }
+        v = v * 10 as u32 + (c as u32 - 48 as u32)
+        i = i + 1
+    }
+    return v
+}
+
+// ----------------------------------------------------------- The questions
+
+// The correct spelling of an SVG element name; the name itself if the table
+// does not know it.
+#[no_gc]
+fn svg_tag_fix(a: *mut Adjust, name: u32) -> u32 {
+    var i: usize = 0
+    while i < (*a).n_tag {
+        if (*a).tag_low[i] == name {
+            return (*a).tag_fix[i]
+        }
+        i = i + 1
+    }
+    return name
+}
+
+#[no_gc]
+fn svg_attr_fix(a: *mut Adjust, name: u32) -> u32 {
+    var i: usize = 0
+    while i < (*a).n_sattr {
+        if (*a).sattr_low[i] == name {
+            return (*a).sattr_fix[i]
+        }
+        i = i + 1
+    }
+    return name
+}
+
+#[no_gc]
+fn math_attr_fix(a: *mut Adjust, name: u32) -> u32 {
+    var i: usize = 0
+    while i < (*a).n_mattr {
+        if (*a).mattr_low[i] == name {
+            return (*a).mattr_fix[i]
+        }
+        i = i + 1
+    }
+    return name
+}
+
+// The index in the foreign attribute table, or -1.
+#[no_gc]
+fn foreign_attr_find(a: *mut Adjust, name: u32) -> i64 {
+    var i: usize = 0
+    while i < (*a).n_fa {
+        if (*a).fa_full[i] == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+#[no_gc]
+fn foreign_attr_prefix(a: *mut Adjust, i: i64) -> u32 {
+    return (*a).fa_prefix[i as usize]
+}
+
+#[no_gc]
+fn foreign_attr_local(a: *mut Adjust, i: i64) -> u32 {
+    return (*a).fa_local[i as usize]
+}
+
+#[no_gc]
+fn foreign_attr_ns(a: *mut Adjust, i: i64) -> u32 {
+    return (*a).fa_ns[i as usize]
+}
+
+#[no_gc]
+fn a_encoding(a: *mut Adjust) -> u32 {
+    return (*a).n_encoding
+}
+
+#[no_gc]
+fn a_color(a: *mut Adjust) -> u32 {
+    return (*a).n_color
+}
+
+#[no_gc]
+fn a_face(a: *mut Adjust) -> u32 {
+    return (*a).n_face
+}
+
+#[no_gc]
+fn a_size(a: *mut Adjust) -> u32 {
+    return (*a).n_size
+}
+
+#[no_gc]
+fn a_sub(a: *mut Adjust) -> u32 {
+    return (*a).n_sub
+}
+
+#[no_gc]
+fn a_sup(a: *mut Adjust) -> u32 {
+    return (*a).n_sup
+}
+
+#[no_gc]
+fn a_var(a: *mut Adjust) -> u32 {
+    return (*a).n_var
+}
+
+#[no_gc]
+fn a_span(a: *mut Adjust) -> u32 {
+    return (*a).n_span
+}
+
+#[no_gc]
+fn a_text_html(a: *mut Adjust) -> u32 {
+    return (*a).n_text_html
+}
+
+#[no_gc]
+fn a_xhtml_xml(a: *mut Adjust) -> u32 {
+    return (*a).n_xhtml_xml
+}
+
+#[no_gc]
+fn a_mglyph(a: *mut Adjust) -> u32 {
+    return (*a).n_mglyph
+}
+
+#[no_gc]
+fn a_malignmark(a: *mut Adjust) -> u32 {
+    return (*a).n_malignmark
+}
+
+// The other direction: the lower case spelling of an SVG element name. An
+// end tag arrives lower case from the tokenizer, the element in the tree
+// carries the correct spelling -- WHATWG compares the two "converted to
+// ASCII lowercase", and this is that conversion, done as a table lookup.
+#[no_gc]
+fn svg_tag_low(a: *mut Adjust, name: u32) -> u32 {
+    var i: usize = 0
+    while i < (*a).n_tag {
+        if (*a).tag_fix[i] == name {
+            return (*a).tag_low[i]
+        }
+        i = i + 1
+    }
+    return name
+}

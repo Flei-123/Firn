@@ -1,0 +1,1547 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/html/tokenizer.fi -- the HTML5 tokenizer (WHATWG standard, 13.2.5) in Firn.
+//
+// THE STATES IMPLEMENTED (module `tokenizer-core`):
+//   Data, PLAINTEXT, RCDATA (+ LessThanSign/EndTagOpen/EndTagName),
+//   RAWTEXT (+ ditto), Script data (+ ditto, + Escaped/DoubleEscaped in all
+//   14 substates), CDATA section (+ Bracket/End),
+//   TagOpen, EndTagOpen, TagName, BeforeAttributeName, AttributeName,
+//   AfterAttributeName, BeforeAttributeValue, AttributeValue(Double/Single/
+//   Unquoted), AfterAttributeValueQuoted, SelfClosingStartTag,
+//   BogusComment, MarkupDeclarationOpen, CommentStart, CommentStartDash,
+//   Comment, CommentLessThanSign(+Bang/BangDash/BangDashDash), CommentEndDash,
+//   CommentEnd, CommentEndBang,
+//   DOCTYPE, BeforeDOCTYPEName, DOCTYPEName, AfterDOCTYPEName,
+//   AfterDOCTYPEPublicKeyword, BeforeDOCTYPEPublicIdentifier,
+//   DOCTYPEPublicIdentifier(Double/Single), AfterDOCTYPEPublicIdentifier,
+//   BetweenDOCTYPEPublicAndSystemIdentifiers, AfterDOCTYPESystemKeyword,
+//   BeforeDOCTYPESystemIdentifier, DOCTYPESystemIdentifier(Double/Single),
+//   AfterDOCTYPESystemIdentifier, BogusDOCTYPE.
+//
+// CharacterReference runs through `lib/html/entities.fi` (module
+// `tokenizer-text`, contract PLAN.md 2.3).
+//
+// HONESTY: a state this tokenizer does not know makes the case count as
+// unsupported and ABORTS it. The harness then counts the case as a
+// FAILURE -- never as skipped (see tools/tokenizer/run.sh).
+import mem
+import tokens
+import entities
+import error_codes
+
+export { State, tokenize, EOF, ZST_DATA, ZST_PLAINTEXT, ZST_RCDATA, ZST_RAWTEXT, ZST_SCRIPT, ZST_CDATA }
+
+// The codes of the start states in the job protocol (tools/tokenizer/LOG.md).
+const ZST_DATA: u32 = 0
+const ZST_PLAINTEXT: u32 = 1
+const ZST_RCDATA: u32 = 2
+const ZST_RAWTEXT: u32 = 3
+const ZST_SCRIPT: u32 = 4
+const ZST_CDATA: u32 = 5
+
+// The end of the input.
+const EOF: u32 = 0xFFFFFFFF
+
+// The return value of `ref_process` when `entities` violates the contract.
+const REF_ERROR: usize = 0xFFFFFFFFFFFFFFFF
+
+enum State {
+    Data,
+    Plaintext,
+    Rcdata,
+    Rawtext,
+    ScriptData,
+    CdataSection,
+    CdataSectionBracket,
+    CdataSectionEnd,
+    TagOpen,
+    EndTagOpen,
+    TagName,
+    RcdataLessThanSign,
+    RcdataEndTagOpen,
+    RcdataEndTagName,
+    RawtextLessThanSign,
+    RawtextEndTagOpen,
+    RawtextEndTagName,
+    ScriptDataLessThanSign,
+    ScriptDataEndTagOpen,
+    ScriptDataEndTagName,
+    ScriptDataEscapeStart,
+    ScriptDataEscapeStartDash,
+    ScriptDataEscaped,
+    ScriptDataEscapedDash,
+    ScriptDataEscapedDashDash,
+    ScriptDataEscapedLessThanSign,
+    ScriptDataEscapedEndTagOpen,
+    ScriptDataEscapedEndTagName,
+    ScriptDataDoubleEscapeStart,
+    ScriptDataDoubleEscaped,
+    ScriptDataDoubleEscapedDash,
+    ScriptDataDoubleEscapedDashDash,
+    ScriptDataDoubleEscapedLessThanSign,
+    ScriptDataDoubleEscapeEnd,
+    BeforeAttributeName,
+    AttributeName,
+    AfterAttributeName,
+    BeforeAttributeValue,
+    AttributeValueDouble,
+    AttributeValueSingle,
+    AttributeValueUnquoted,
+    AfterAttributeValueQuoted,
+    SelfClosingStartTag,
+    BogusComment,
+    MarkupDeclarationOpen,
+    CommentStart,
+    CommentStartDash,
+    Comment,
+    CommentLessThanSign,
+    CommentLessThanSignBang,
+    CommentLessThanSignBangDash,
+    CommentLessThanSignBangDashDash,
+    CommentEndDash,
+    CommentEnd,
+    CommentEndBang,
+    Doctype,
+    BeforeDoctypeName,
+    DoctypeName,
+    AfterDoctypeName,
+    AfterDoctypePublicKeyword,
+    BeforeDoctypePublicIdentifier,
+    DoctypePublicIdentifierDouble,
+    DoctypePublicIdentifierSingle,
+    AfterDoctypePublicIdentifier,
+    BetweenDoctypePublicAndSystem,
+    AfterDoctypeSystemKeyword,
+    BeforeDoctypeSystemIdentifier,
+    DoctypeSystemIdentifierDouble,
+    DoctypeSystemIdentifierSingle,
+    AfterDoctypeSystemIdentifier,
+    BogusDoctype,
+    Done,
+    NotSupported,
+}
+
+#[no_gc]
+fn is_space(c: u32) -> bool {
+    return c == 9 as u32 || c == 10 as u32 || c == 12 as u32 || c == 32 as u32
+}
+
+#[no_gc]
+fn is_ascii_alpha(c: u32) -> bool {
+    return (c >= 65 as u32 && c <= 90 as u32) || (c >= 97 as u32 && c <= 122 as u32)
+}
+
+#[no_gc]
+fn small(c: u32) -> u32 {
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return c + 32 as u32
+    }
+    return c
+}
+
+// A NULL character in text is replaced by U+FFFD and reported as the parse
+// error `unexpected-null-character` (WHATWG-HTML 13.2.5).
+#[no_gc]
+fn null_replacement(c: u32, s: *mut tokens.Sink, input: *mut mem.CpBuf, idx: usize) -> u32 {
+    if c == 0 as u32 {
+        tokens.sink_error_at(s, error_codes.F_UNEXPECTED_NULL_CHARACTER, input, idx)
+        return 0xFFFD as u32
+    }
+    return c
+}
+
+// Errors of the input stream (WHATWG-HTML 13.2.3.5 "preprocessing"): every
+// character is checked EXACTLY ONCE, even when it is looked at again later
+// ("reconsume").
+#[no_gc]
+fn input_check(s: *mut tokens.Sink, input: *mut mem.CpBuf, idx: usize, c: u32) {
+    // The fast path (round 40): 0x20..0x7E is the normal case of real pages and
+    // NEVER an error of the input stream -- one range test instead of twelve
+    // comparisons. Measured with callgrind on the corpus realweb.
+    if c >= 0x20 as u32 && c < 0x7F as u32 {
+        return
+    }
+    if c == 0 as u32 {
+        return
+    }
+    if c == 9 as u32 || c == 10 as u32 || c == 12 as u32 || c == 13 as u32 {
+        return
+    }
+    if c < 0x20 as u32 || (c >= 0x7F as u32 && c <= 0x9F as u32) {
+        tokens.sink_error_at(s, error_codes.F_CONTROL_CHARACTER_IN_INPUT_STREAM, input, idx)
+        return
+    }
+    if c >= 0xD800 as u32 && c <= 0xDFFF as u32 {
+        tokens.sink_error_at(s, error_codes.F_SURROGATE_IN_INPUT_STREAM, input, idx)
+        return
+    }
+    if c >= 0xFDD0 as u32 && c <= 0xFDEF as u32 {
+        tokens.sink_error_at(s, error_codes.F_NONCHARACTER_IN_INPUT_STREAM, input, idx)
+        return
+    }
+    let below: u32 = c & 0xFFFF as u32
+    if below == 0xFFFE as u32 || below == 0xFFFF as u32 {
+        tokens.sink_error_at(s, error_codes.F_NONCHARACTER_IN_INPUT_STREAM, input, idx)
+    }
+}
+
+// An end tag may carry neither attributes nor a slash.
+#[no_gc]
+fn endtag_check(s: *mut tokens.Sink, input: *mut mem.CpBuf, idx: usize) {
+    if !tokens.tok_is_endtag(s) {
+        return
+    }
+    if tokens.tok_has_attribute(s) {
+        tokens.sink_error_at(s, error_codes.F_END_TAG_WITH_ATTRIBUTES, input, idx)
+    }
+    if tokens.tok_is_self_closing(s) {
+        tokens.sink_error_at(s, error_codes.F_END_TAG_WITH_TRAILING_SOLIDUS, input, idx)
+    }
+}
+
+// Give a character back ("reconsume"); at the end of the input nothing happens.
+#[no_gc]
+fn back(pos: usize, c: u32) -> usize {
+    if c != EOF {
+        return pos - 1
+    }
+    return pos
+}
+
+// The character at position `i`, or EOF behind the end.
+#[no_gc]
+fn cp_at(input: *mut mem.CpBuf, i: usize) -> u32 {
+    if i < mem.cp_len(input) {
+        return mem.cp_at(input, i)
+    }
+    return EOF
+}
+
+#[no_gc]
+fn is_dd(input: *mut mem.CpBuf, p: usize) -> bool {
+    return cp_at(input, p) == 45 as u32 && cp_at(input, p + 1) == 45 as u32
+}
+
+// "DOCTYPE" from `p` on, ignoring upper/lower case.
+#[no_gc]
+fn is_doctype(input: *mut mem.CpBuf, p: usize) -> bool {
+    return small(cp_at(input, p)) == 100 as u32 &&
+    small(cp_at(input, p + 1)) == 111 as u32 &&
+    small(cp_at(input, p + 2)) == 99 as u32 &&
+    small(cp_at(input, p + 3)) == 116 as u32 &&
+    small(cp_at(input, p + 4)) == 121 as u32 &&
+    small(cp_at(input, p + 5)) == 112 as u32 &&
+    small(cp_at(input, p + 6)) == 101 as u32
+}
+
+// "[CDATA[" from `p` on, written exactly like that.
+#[no_gc]
+fn is_cdata(input: *mut mem.CpBuf, p: usize) -> bool {
+    return cp_at(input, p) == 91 as u32 &&
+    cp_at(input, p + 1) == 67 as u32 &&
+    cp_at(input, p + 2) == 68 as u32 &&
+    cp_at(input, p + 3) == 65 as u32 &&
+    cp_at(input, p + 4) == 84 as u32 &&
+    cp_at(input, p + 5) == 65 as u32 &&
+    cp_at(input, p + 6) == 91 as u32
+}
+
+// "PUBLIC" from `p` on, ignoring upper/lower case.
+#[no_gc]
+fn is_public(input: *mut mem.CpBuf, p: usize) -> bool {
+    return small(cp_at(input, p)) == 112 as u32 &&
+    small(cp_at(input, p + 1)) == 117 as u32 &&
+    small(cp_at(input, p + 2)) == 98 as u32 &&
+    small(cp_at(input, p + 3)) == 108 as u32 &&
+    small(cp_at(input, p + 4)) == 105 as u32 &&
+    small(cp_at(input, p + 5)) == 99 as u32
+}
+
+// "SYSTEM" from `p` on, ignoring upper/lower case.
+#[no_gc]
+fn is_system(input: *mut mem.CpBuf, p: usize) -> bool {
+    return small(cp_at(input, p)) == 115 as u32 &&
+    small(cp_at(input, p + 1)) == 121 as u32 &&
+    small(cp_at(input, p + 2)) == 115 as u32 &&
+    small(cp_at(input, p + 3)) == 116 as u32 &&
+    small(cp_at(input, p + 4)) == 101 as u32 &&
+    small(cp_at(input, p + 5)) == 109 as u32
+}
+
+// The temporary buffer holds exactly "script" (in lower case).
+#[no_gc]
+fn tmp_is_script(t: *mut mem.CpBuf) -> bool {
+    if mem.cp_len(t) != 6 {
+        return false
+    }
+    return mem.cp_at(t, 0) == 115 as u32 && mem.cp_at(t, 1) == 99 as u32 &&
+    mem.cp_at(t, 2) == 114 as u32 && mem.cp_at(t, 3) == 105 as u32 &&
+    mem.cp_at(t, 4) == 112 as u32 && mem.cp_at(t, 5) == 116 as u32
+}
+
+// Emit the temporary buffer as characters (the "anything else" case of the
+// EndTagName states).
+#[no_gc]
+fn emit_tmp(s: *mut tokens.Sink, t: *mut mem.CpBuf) {
+    var i: usize = 0
+    while i < mem.cp_len(t) {
+        tokens.sink_emit_char(s, mem.cp_at(t, i))
+        i = i + 1
+    }
+}
+
+// A character reference (`&...`) through `lib/html/entities.fi` (contract PLAN.md 2.3).
+// `pos` points behind the '&'; back comes the new position in the input.
+// The return value is checked against the contract: it has to lie between
+// `pos` and the end of the input. If `entities` does not keep the contract,
+// this function returns REF_ERROR -- the case then aborts and counts as a
+// FAILURE instead of running into an endless loop.
+#[no_gc]
+fn ref_process(input: *mut mem.CpBuf, pos: usize, in_attr: bool, s: *mut tokens.Sink) -> usize {
+    let np: usize = entities.char_ref(input, pos, in_attr, s)
+    if np < pos || np > mem.cp_len(input) {
+        return REF_ERROR
+    }
+    return np
+}
+
+// Tokenizes `input` (code points) from the start state `start_state` on.
+// Returns false when a state that is not implemented yet was reached;
+// the case then counts as a FAILURE.
+#[no_gc]
+fn tokenize(input: *mut mem.CpBuf, start_state: u32, s: *mut tokens.Sink) -> bool {
+    var pos: usize = 0
+    let n: usize = mem.cp_len(input)
+    var state: State = State::Data
+    if start_state == ZST_PLAINTEXT {
+        state = State::Plaintext
+    } else if start_state == ZST_RCDATA {
+        state = State::Rcdata
+    } else if start_state == ZST_RAWTEXT {
+        state = State::Rawtext
+    } else if start_state == ZST_SCRIPT {
+        state = State::ScriptData
+    } else if start_state == ZST_CDATA {
+        state = State::CdataSection
+    }
+    var tmp: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&tmp)
+    var ok: bool = true
+    var runs: bool = true
+    // The index of the character being looked at (n = EOF) and the boundary up
+    // to which the errors of the input stream have been reported already.
+    var idx: usize = n
+    var reported_to: usize = 0
+    while runs {
+        var c: u32 = EOF
+        idx = n
+        if pos < n {
+            c = mem.cp_at(input, pos)
+            idx = pos
+            pos = pos + 1
+            if idx >= reported_to {
+                reported_to = idx + 1
+                // The fast path AT THE CALL SITE (round 40): for 0x20..0x7E
+                // there is nothing to report -- that saves the call itself on
+                // real pages, not only its body. input_check
+                // keeps the same test, so that every other caller stays
+                // safe. Callgrind realweb: 1,427 -> 1,297 billion Ir (-9.1 %).
+                if c < 0x20 as u32 || c >= 0x7F as u32 {
+                    input_check(s, input, idx, c)
+                }
+            }
+        }
+        match state {
+            State::Data => {
+                if c == EOF {
+                    state = State::Done
+                } else if c == 60 as u32 { // '<'
+                    state = State::TagOpen
+                } else if c == 38 as u32 { // '&'
+                    let np: usize = ref_process(input, pos, false, s)
+                    if np == REF_ERROR {
+                        ok = false
+                        state = State::NotSupported
+                    } else {
+                        pos = np
+                    }
+                } else {
+                    // Data state: U+0000 is NOT replaced (a parse error,
+                    // but the character itself is emitted).
+                    if c == 0 as u32 {
+                        tokens.sink_error_at(s, error_codes.F_UNEXPECTED_NULL_CHARACTER, input, idx)
+                    }
+                    tokens.sink_emit_char(s, c)
+                }
+            }
+            State::Plaintext => {
+                if c == EOF {
+                    state = State::Done
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::Rcdata => {
+                if c == EOF {
+                    state = State::Done
+                } else if c == 60 as u32 {
+                    state = State::RcdataLessThanSign
+                } else if c == 38 as u32 {
+                    let np: usize = ref_process(input, pos, false, s)
+                    if np == REF_ERROR {
+                        ok = false
+                        state = State::NotSupported
+                    } else {
+                        pos = np
+                    }
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::Rawtext => {
+                if c == EOF {
+                    state = State::Done
+                } else if c == 60 as u32 {
+                    state = State::RawtextLessThanSign
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::ScriptData => {
+                if c == EOF {
+                    state = State::Done
+                } else if c == 60 as u32 {
+                    state = State::ScriptDataLessThanSign
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::CdataSection => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_CDATA, input, idx)
+                    state = State::Done
+                } else if c == 93 as u32 { // ']'
+                    state = State::CdataSectionBracket
+                } else {
+                    tokens.sink_emit_char(s, c)
+                }
+            }
+            State::CdataSectionBracket => {
+                if c == 93 as u32 {
+                    state = State::CdataSectionEnd
+                } else {
+                    tokens.sink_emit_char(s, 93 as u32)
+                    pos = back(pos, c)
+                    state = State::CdataSection
+                }
+            }
+            State::CdataSectionEnd => {
+                if c == 93 as u32 {
+                    tokens.sink_emit_char(s, 93 as u32)
+                } else if c == 62 as u32 { // '>'
+                    state = State::Data
+                } else {
+                    tokens.sink_emit_char(s, 93 as u32)
+                    tokens.sink_emit_char(s, 93 as u32)
+                    pos = back(pos, c)
+                    state = State::CdataSection
+                }
+            }
+            State::TagOpen => {
+                if c == 33 as u32 { // '!'
+                    state = State::MarkupDeclarationOpen
+                } else if c == 47 as u32 { // '/'
+                    state = State::EndTagOpen
+                } else if is_ascii_alpha(c) {
+                    tokens.tok_start_tag(s)
+                    pos = pos - 1
+                    state = State::TagName
+                } else if c == 63 as u32 { // '?'
+                    tokens.sink_error_at(s, error_codes.F_UNEXPECTED_QUESTION_MARK_INSTEAD_OF_TAG_NAME, input, idx)
+                    tokens.tok_comment(s)
+                    pos = pos - 1
+                    state = State::BogusComment
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_BEFORE_TAG_NAME, input, idx)
+                    tokens.sink_emit_char(s, 60 as u32)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_INVALID_FIRST_CHARACTER_OF_TAG_NAME, input, idx)
+                    tokens.sink_emit_char(s, 60 as u32)
+                    pos = back(pos, c)
+                    state = State::Data
+                }
+            }
+            State::EndTagOpen => {
+                if is_ascii_alpha(c) {
+                    tokens.tok_end_tag(s)
+                    pos = pos - 1
+                    state = State::TagName
+                } else if c == 62 as u32 { // '>'
+                    tokens.sink_error_at(s, error_codes.F_MISSING_END_TAG_NAME, input, idx)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_BEFORE_TAG_NAME, input, idx)
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_INVALID_FIRST_CHARACTER_OF_TAG_NAME, input, idx)
+                    tokens.tok_comment(s)
+                    pos = pos - 1
+                    state = State::BogusComment
+                }
+            }
+            State::TagName => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_TAG, input, idx)
+                    state = State::Done
+                } else if is_space(c) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 {
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else {
+                    tokens.tok_name_push(s, small(null_replacement(c, s, input, idx)))
+                }
+            }
+
+            // ------------------------------------------------------ RCDATA
+            State::RcdataLessThanSign => {
+                if c == 47 as u32 {
+                    mem.cp_clear(&tmp)
+                    state = State::RcdataEndTagOpen
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    pos = back(pos, c)
+                    state = State::Rcdata
+                }
+            }
+            State::RcdataEndTagOpen => {
+                if is_ascii_alpha(c) {
+                    tokens.tok_end_tag(s)
+                    pos = pos - 1
+                    state = State::RcdataEndTagName
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    pos = back(pos, c)
+                    state = State::Rcdata
+                }
+            }
+            State::RcdataEndTagName => {
+                if is_space(c) && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if is_ascii_alpha(c) {
+                    tokens.tok_name_push(s, small(c))
+                    mem.cp_push(&tmp, c)
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    emit_tmp(s, &tmp)
+                    pos = back(pos, c)
+                    state = State::Rcdata
+                }
+            }
+
+            // ----------------------------------------------------- RAWTEXT
+            State::RawtextLessThanSign => {
+                if c == 47 as u32 {
+                    mem.cp_clear(&tmp)
+                    state = State::RawtextEndTagOpen
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    pos = back(pos, c)
+                    state = State::Rawtext
+                }
+            }
+            State::RawtextEndTagOpen => {
+                if is_ascii_alpha(c) {
+                    tokens.tok_end_tag(s)
+                    pos = pos - 1
+                    state = State::RawtextEndTagName
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    pos = back(pos, c)
+                    state = State::Rawtext
+                }
+            }
+            State::RawtextEndTagName => {
+                if is_space(c) && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if is_ascii_alpha(c) {
+                    tokens.tok_name_push(s, small(c))
+                    mem.cp_push(&tmp, c)
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    emit_tmp(s, &tmp)
+                    pos = back(pos, c)
+                    state = State::Rawtext
+                }
+            }
+
+            // ------------------------------------------------- Script data
+            State::ScriptDataLessThanSign => {
+                if c == 47 as u32 {
+                    mem.cp_clear(&tmp)
+                    state = State::ScriptDataEndTagOpen
+                } else if c == 33 as u32 {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 33 as u32)
+                    state = State::ScriptDataEscapeStart
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    pos = back(pos, c)
+                    state = State::ScriptData
+                }
+            }
+            State::ScriptDataEndTagOpen => {
+                if is_ascii_alpha(c) {
+                    tokens.tok_end_tag(s)
+                    pos = pos - 1
+                    state = State::ScriptDataEndTagName
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    pos = back(pos, c)
+                    state = State::ScriptData
+                }
+            }
+            State::ScriptDataEndTagName => {
+                if is_space(c) && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if is_ascii_alpha(c) {
+                    tokens.tok_name_push(s, small(c))
+                    mem.cp_push(&tmp, c)
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    emit_tmp(s, &tmp)
+                    pos = back(pos, c)
+                    state = State::ScriptData
+                }
+            }
+            State::ScriptDataEscapeStart => {
+                if c == 45 as u32 { // '-'
+                    tokens.sink_emit_char(s, 45 as u32)
+                    state = State::ScriptDataEscapeStartDash
+                } else {
+                    pos = back(pos, c)
+                    state = State::ScriptData
+                }
+            }
+            State::ScriptDataEscapeStartDash => {
+                if c == 45 as u32 {
+                    tokens.sink_emit_char(s, 45 as u32)
+                    state = State::ScriptDataEscapedDashDash
+                } else {
+                    pos = back(pos, c)
+                    state = State::ScriptData
+                }
+            }
+            State::ScriptDataEscaped => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
+                    state = State::Done
+                } else if c == 45 as u32 {
+                    tokens.sink_emit_char(s, 45 as u32)
+                    state = State::ScriptDataEscapedDash
+                } else if c == 60 as u32 {
+                    state = State::ScriptDataEscapedLessThanSign
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::ScriptDataEscapedDash => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
+                    state = State::Done
+                } else if c == 45 as u32 {
+                    tokens.sink_emit_char(s, 45 as u32)
+                    state = State::ScriptDataEscapedDashDash
+                } else if c == 60 as u32 {
+                    state = State::ScriptDataEscapedLessThanSign
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                    state = State::ScriptDataEscaped
+                }
+            }
+            State::ScriptDataEscapedDashDash => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
+                    state = State::Done
+                } else if c == 45 as u32 {
+                    tokens.sink_emit_char(s, 45 as u32)
+                } else if c == 60 as u32 {
+                    state = State::ScriptDataEscapedLessThanSign
+                } else if c == 62 as u32 {
+                    tokens.sink_emit_char(s, 62 as u32)
+                    state = State::ScriptData
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                    state = State::ScriptDataEscaped
+                }
+            }
+            State::ScriptDataEscapedLessThanSign => {
+                if c == 47 as u32 {
+                    mem.cp_clear(&tmp)
+                    state = State::ScriptDataEscapedEndTagOpen
+                } else if is_ascii_alpha(c) {
+                    mem.cp_clear(&tmp)
+                    tokens.sink_emit_char(s, 60 as u32)
+                    pos = pos - 1
+                    state = State::ScriptDataDoubleEscapeStart
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    pos = back(pos, c)
+                    state = State::ScriptDataEscaped
+                }
+            }
+            State::ScriptDataEscapedEndTagOpen => {
+                if is_ascii_alpha(c) {
+                    tokens.tok_end_tag(s)
+                    pos = pos - 1
+                    state = State::ScriptDataEscapedEndTagName
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    pos = back(pos, c)
+                    state = State::ScriptDataEscaped
+                }
+            }
+            State::ScriptDataEscapedEndTagName => {
+                if is_space(c) && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if is_ascii_alpha(c) {
+                    tokens.tok_name_push(s, small(c))
+                    mem.cp_push(&tmp, c)
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    emit_tmp(s, &tmp)
+                    pos = back(pos, c)
+                    state = State::ScriptDataEscaped
+                }
+            }
+            State::ScriptDataDoubleEscapeStart => {
+                if is_space(c) || c == 47 as u32 || c == 62 as u32 {
+                    if tmp_is_script(&tmp) {
+                        state = State::ScriptDataDoubleEscaped
+                    } else {
+                        state = State::ScriptDataEscaped
+                    }
+                    tokens.sink_emit_char(s, c)
+                } else if is_ascii_alpha(c) {
+                    mem.cp_push(&tmp, small(c))
+                    tokens.sink_emit_char(s, c)
+                } else {
+                    pos = back(pos, c)
+                    state = State::ScriptDataEscaped
+                }
+            }
+            State::ScriptDataDoubleEscaped => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
+                    state = State::Done
+                } else if c == 45 as u32 {
+                    tokens.sink_emit_char(s, 45 as u32)
+                    state = State::ScriptDataDoubleEscapedDash
+                } else if c == 60 as u32 {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    state = State::ScriptDataDoubleEscapedLessThanSign
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::ScriptDataDoubleEscapedDash => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
+                    state = State::Done
+                } else if c == 45 as u32 {
+                    tokens.sink_emit_char(s, 45 as u32)
+                    state = State::ScriptDataDoubleEscapedDashDash
+                } else if c == 60 as u32 {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    state = State::ScriptDataDoubleEscapedLessThanSign
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                    state = State::ScriptDataDoubleEscaped
+                }
+            }
+            State::ScriptDataDoubleEscapedDashDash => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
+                    state = State::Done
+                } else if c == 45 as u32 {
+                    tokens.sink_emit_char(s, 45 as u32)
+                } else if c == 60 as u32 {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    state = State::ScriptDataDoubleEscapedLessThanSign
+                } else if c == 62 as u32 {
+                    tokens.sink_emit_char(s, 62 as u32)
+                    state = State::ScriptData
+                } else {
+                    tokens.sink_emit_char(s, null_replacement(c, s, input, idx))
+                    state = State::ScriptDataDoubleEscaped
+                }
+            }
+            State::ScriptDataDoubleEscapedLessThanSign => {
+                if c == 47 as u32 {
+                    mem.cp_clear(&tmp)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    state = State::ScriptDataDoubleEscapeEnd
+                } else {
+                    pos = back(pos, c)
+                    state = State::ScriptDataDoubleEscaped
+                }
+            }
+            State::ScriptDataDoubleEscapeEnd => {
+                if is_space(c) || c == 47 as u32 || c == 62 as u32 {
+                    if tmp_is_script(&tmp) {
+                        state = State::ScriptDataEscaped
+                    } else {
+                        state = State::ScriptDataDoubleEscaped
+                    }
+                    tokens.sink_emit_char(s, c)
+                } else if is_ascii_alpha(c) {
+                    mem.cp_push(&tmp, small(c))
+                    tokens.sink_emit_char(s, c)
+                } else {
+                    pos = back(pos, c)
+                    state = State::ScriptDataDoubleEscaped
+                }
+            }
+
+            // -------------------------------------------------- Attributes
+            State::BeforeAttributeName => {
+                if is_space(c) {
+                    // skip
+                } else if c == 47 as u32 || c == 62 as u32 || c == EOF {
+                    pos = back(pos, c)
+                    state = State::AfterAttributeName
+                } else if c == 61 as u32 { // '=' : a parse error
+                    tokens.sink_error_at(s, error_codes.F_UNEXPECTED_EQUALS_SIGN_BEFORE_ATTRIBUTE_NAME, input, idx)
+                    tokens.tok_attr_start(s)
+                    tokens.tok_attr_name_push(s, c)
+                    state = State::AttributeName
+                } else {
+                    tokens.tok_attr_start(s)
+                    pos = pos - 1
+                    state = State::AttributeName
+                }
+            }
+            State::AttributeName => {
+                if is_space(c) || c == 47 as u32 || c == 62 as u32 || c == EOF {
+                    tokens.tok_attr_finish(s)
+                    if tokens.tok_attr_was_duplicate(s) {
+                        tokens.sink_error_at(s, error_codes.F_DUPLICATE_ATTRIBUTE, input, idx)
+                    }
+                    pos = back(pos, c)
+                    state = State::AfterAttributeName
+                } else if c == 61 as u32 {
+                    tokens.tok_attr_finish(s)
+                    if tokens.tok_attr_was_duplicate(s) {
+                        tokens.sink_error_at(s, error_codes.F_DUPLICATE_ATTRIBUTE, input, idx)
+                    }
+                    state = State::BeforeAttributeValue
+                } else {
+                    if c == 34 as u32 || c == 39 as u32 || c == 60 as u32 {
+                        tokens.sink_error_at(s, error_codes.F_UNEXPECTED_CHARACTER_IN_ATTRIBUTE_NAME, input, idx)
+                    }
+                    tokens.tok_attr_name_push(s, small(null_replacement(c, s, input, idx)))
+                }
+            }
+            State::AfterAttributeName => {
+                if is_space(c) {
+                    // skip
+                } else if c == 47 as u32 {
+                    state = State::SelfClosingStartTag
+                } else if c == 61 as u32 {
+                    state = State::BeforeAttributeValue
+                } else if c == 62 as u32 {
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_TAG, input, idx)
+                    state = State::Done
+                } else {
+                    tokens.tok_attr_start(s)
+                    pos = pos - 1
+                    state = State::AttributeName
+                }
+            }
+            State::BeforeAttributeValue => {
+                if is_space(c) {
+                    // skip
+                } else if c == 34 as u32 {
+                    state = State::AttributeValueDouble
+                } else if c == 39 as u32 {
+                    state = State::AttributeValueSingle
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_ATTRIBUTE_VALUE, input, idx)
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else {
+                    pos = back(pos, c)
+                    state = State::AttributeValueUnquoted
+                }
+            }
+            State::AttributeValueDouble => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_TAG, input, idx)
+                    state = State::Done
+                } else if c == 34 as u32 {
+                    tokens.tok_attr_finish(s)
+                    state = State::AfterAttributeValueQuoted
+                } else if c == 38 as u32 { // '&' -- module `entities`
+                    let np: usize = ref_process(input, pos, true, s)
+                    if np == REF_ERROR {
+                        ok = false
+                        state = State::NotSupported
+                    } else {
+                        pos = np
+                    }
+                } else {
+                    tokens.tok_attr_value_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::AttributeValueSingle => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_TAG, input, idx)
+                    state = State::Done
+                } else if c == 39 as u32 {
+                    tokens.tok_attr_finish(s)
+                    state = State::AfterAttributeValueQuoted
+                } else if c == 38 as u32 {
+                    let np: usize = ref_process(input, pos, true, s)
+                    if np == REF_ERROR {
+                        ok = false
+                        state = State::NotSupported
+                    } else {
+                        pos = np
+                    }
+                } else {
+                    tokens.tok_attr_value_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::AttributeValueUnquoted => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_TAG, input, idx)
+                    state = State::Done
+                } else if is_space(c) {
+                    tokens.tok_attr_finish(s)
+                    state = State::BeforeAttributeName
+                } else if c == 62 as u32 {
+                    tokens.tok_attr_finish(s)
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == 38 as u32 {
+                    let np: usize = ref_process(input, pos, true, s)
+                    if np == REF_ERROR {
+                        ok = false
+                        state = State::NotSupported
+                    } else {
+                        pos = np
+                    }
+                } else {
+                    if c == 34 as u32 || c == 39 as u32 || c == 60 as u32 ||
+                    c == 61 as u32 || c == 96 as u32 {
+                        tokens.sink_error_at(s, error_codes.F_UNEXPECTED_CHARACTER_IN_UNQUOTED_ATTRIBUTE_VALUE, input, idx)
+                    }
+                    tokens.tok_attr_value_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::AfterAttributeValueQuoted => {
+                if is_space(c) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 {
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_TAG, input, idx)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_BETWEEN_ATTRIBUTES, input, idx)
+                    pos = pos - 1
+                    state = State::BeforeAttributeName
+                }
+            }
+            State::SelfClosingStartTag => {
+                if c == 62 as u32 {
+                    tokens.tok_set_self_closing(s, true)
+                    endtag_check(s, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_TAG, input, idx)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_UNEXPECTED_SOLIDUS_IN_TAG, input, idx)
+                    pos = pos - 1
+                    state = State::BeforeAttributeName
+                }
+            }
+
+            // ---------------------------------------------------- Comments
+            State::BogusComment => {
+                if c == EOF {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else {
+                    tokens.tok_comment_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::MarkupDeclarationOpen => {
+                pos = back(pos, c)
+                if is_dd(input, pos) {
+                    pos = pos + 2
+                    tokens.tok_comment(s)
+                    state = State::CommentStart
+                } else if is_doctype(input, pos) {
+                    pos = pos + 7
+                    state = State::Doctype
+                } else if is_cdata(input, pos) {
+                    // Without a tree there is no "adjusted current node" --
+                    // so the tokenizer produces a bogus comment
+                    // "[CDATA[" (the behavior of html5lib outside of
+                    // foreign content).
+                    pos = pos + 7
+                    tokens.sink_error_at(s, error_codes.F_CDATA_IN_HTML_CONTENT, input, pos - 1)
+                    tokens.tok_comment(s)
+                    tokens.tok_comment_push(s, 91 as u32)
+                    tokens.tok_comment_push(s, 67 as u32)
+                    tokens.tok_comment_push(s, 68 as u32)
+                    tokens.tok_comment_push(s, 65 as u32)
+                    tokens.tok_comment_push(s, 84 as u32)
+                    tokens.tok_comment_push(s, 65 as u32)
+                    tokens.tok_comment_push(s, 91 as u32)
+                    state = State::BogusComment
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_INCORRECTLY_OPENED_COMMENT, input, pos)
+                    tokens.tok_comment(s)
+                    state = State::BogusComment
+                }
+            }
+            State::CommentStart => {
+                if c == 45 as u32 {
+                    state = State::CommentStartDash
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_ABRUPT_CLOSING_OF_EMPTY_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else {
+                    pos = back(pos, c)
+                    state = State::Comment
+                }
+            }
+            State::CommentStartDash => {
+                if c == 45 as u32 {
+                    state = State::CommentEnd
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_ABRUPT_CLOSING_OF_EMPTY_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_comment_push(s, 45 as u32)
+                    pos = pos - 1
+                    state = State::Comment
+                }
+            }
+            State::Comment => {
+                if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else if c == 60 as u32 {
+                    tokens.tok_comment_push(s, 60 as u32)
+                    state = State::CommentLessThanSign
+                } else if c == 45 as u32 {
+                    state = State::CommentEndDash
+                } else {
+                    tokens.tok_comment_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::CommentLessThanSign => {
+                if c == 33 as u32 {
+                    tokens.tok_comment_push(s, 33 as u32)
+                    state = State::CommentLessThanSignBang
+                } else if c == 60 as u32 {
+                    tokens.tok_comment_push(s, 60 as u32)
+                } else {
+                    pos = back(pos, c)
+                    state = State::Comment
+                }
+            }
+            State::CommentLessThanSignBang => {
+                if c == 45 as u32 {
+                    state = State::CommentLessThanSignBangDash
+                } else {
+                    pos = back(pos, c)
+                    state = State::Comment
+                }
+            }
+            State::CommentLessThanSignBangDash => {
+                if c == 45 as u32 {
+                    state = State::CommentLessThanSignBangDashDash
+                } else {
+                    pos = back(pos, c)
+                    state = State::CommentEndDash
+                }
+            }
+            State::CommentLessThanSignBangDashDash => {
+                // '>' and EOF carry on regularly, everything else is a
+                // parse error -- in both cases it is given back.
+                if c != 62 as u32 && c != EOF {
+                    tokens.sink_error_at(s, error_codes.F_NESTED_COMMENT, input, idx)
+                }
+                pos = back(pos, c)
+                state = State::CommentEnd
+            }
+            State::CommentEndDash => {
+                if c == 45 as u32 {
+                    state = State::CommentEnd
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_comment_push(s, 45 as u32)
+                    pos = pos - 1
+                    state = State::Comment
+                }
+            }
+            State::CommentEnd => {
+                if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == 33 as u32 {
+                    state = State::CommentEndBang
+                } else if c == 45 as u32 {
+                    tokens.tok_comment_push(s, 45 as u32)
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_comment_push(s, 45 as u32)
+                    tokens.tok_comment_push(s, 45 as u32)
+                    pos = pos - 1
+                    state = State::Comment
+                }
+            }
+            State::CommentEndBang => {
+                if c == 45 as u32 {
+                    tokens.tok_comment_push(s, 45 as u32)
+                    tokens.tok_comment_push(s, 45 as u32)
+                    tokens.tok_comment_push(s, 33 as u32)
+                    state = State::CommentEndDash
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_INCORRECTLY_CLOSED_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_COMMENT, input, idx)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_comment_push(s, 45 as u32)
+                    tokens.tok_comment_push(s, 45 as u32)
+                    tokens.tok_comment_push(s, 33 as u32)
+                    pos = pos - 1
+                    state = State::Comment
+                }
+            }
+
+            // ----------------------------------------------------- DOCTYPE
+            State::Doctype => {
+                if is_space(c) {
+                    state = State::BeforeDoctypeName
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_doctype(s)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else if c == 62 as u32 {
+                    // '>' goes into the state "before DOCTYPE name" without an error
+                    // (WHATWG-HTML 13.2.5.53).
+                    pos = pos - 1
+                    state = State::BeforeDoctypeName
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_BEFORE_DOCTYPE_NAME,
+                        input, idx)
+                    pos = pos - 1
+                    state = State::BeforeDoctypeName
+                }
+            }
+            State::BeforeDoctypeName => {
+                if is_space(c) {
+                    // skip
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_DOCTYPE_NAME, input, idx)
+                    tokens.tok_doctype(s)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_doctype(s)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_doctype(s)
+                    tokens.tok_doctype_name_push(s, small(null_replacement(c, s, input, idx)))
+                    state = State::DoctypeName
+                }
+            }
+            State::DoctypeName => {
+                if is_space(c) {
+                    state = State::AfterDoctypeName
+                } else if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_doctype_name_push(s, small(null_replacement(c, s, input, idx)))
+                }
+            }
+            State::AfterDoctypeName => {
+                if is_space(c) {
+                    // skip
+                } else if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    pos = pos - 1
+                    if is_public(input, pos) {
+                        pos = pos + 6
+                        state = State::AfterDoctypePublicKeyword
+                    } else if is_system(input, pos) {
+                        pos = pos + 6
+                        state = State::AfterDoctypeSystemKeyword
+                    } else {
+                        tokens.sink_error_at(s, error_codes.F_INVALID_CHARACTER_SEQUENCE_AFTER_DOCTYPE_NAME, input, idx)
+                        tokens.tok_set_force_quirks(s, true)
+                        state = State::BogusDoctype
+                    }
+                }
+            }
+            State::AfterDoctypePublicKeyword => {
+                if is_space(c) {
+                    state = State::BeforeDoctypePublicIdentifier
+                } else if c == 34 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_PUBLIC_KEYWORD, input, idx)
+                    tokens.tok_pubid_start(s)
+                    state = State::DoctypePublicIdentifierDouble
+                } else if c == 39 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_PUBLIC_KEYWORD, input, idx)
+                    tokens.tok_pubid_start(s)
+                    state = State::DoctypePublicIdentifierSingle
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    pos = pos - 1
+                    state = State::BogusDoctype
+                }
+            }
+            State::BeforeDoctypePublicIdentifier => {
+                if is_space(c) {
+                    // skip
+                } else if c == 34 as u32 {
+                    tokens.tok_pubid_start(s)
+                    state = State::DoctypePublicIdentifierDouble
+                } else if c == 39 as u32 {
+                    tokens.tok_pubid_start(s)
+                    state = State::DoctypePublicIdentifierSingle
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    pos = pos - 1
+                    state = State::BogusDoctype
+                }
+            }
+            State::DoctypePublicIdentifierDouble => {
+                if c == 34 as u32 {
+                    state = State::AfterDoctypePublicIdentifier
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_ABRUPT_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_pubid_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::DoctypePublicIdentifierSingle => {
+                if c == 39 as u32 {
+                    state = State::AfterDoctypePublicIdentifier
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_ABRUPT_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_pubid_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::AfterDoctypePublicIdentifier => {
+                if is_space(c) {
+                    state = State::BetweenDoctypePublicAndSystem
+                } else if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == 34 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_BETWEEN_DOCTYPE_PUBLIC_AND_SYSTEM_IDENTIFIERS, input, idx)
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierDouble
+                } else if c == 39 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_BETWEEN_DOCTYPE_PUBLIC_AND_SYSTEM_IDENTIFIERS, input, idx)
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierSingle
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    pos = pos - 1
+                    state = State::BogusDoctype
+                }
+            }
+            State::BetweenDoctypePublicAndSystem => {
+                if is_space(c) {
+                    // skip
+                } else if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == 34 as u32 {
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierDouble
+                } else if c == 39 as u32 {
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierSingle
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    pos = pos - 1
+                    state = State::BogusDoctype
+                }
+            }
+            State::AfterDoctypeSystemKeyword => {
+                if is_space(c) {
+                    state = State::BeforeDoctypeSystemIdentifier
+                } else if c == 34 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_SYSTEM_KEYWORD, input, idx)
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierDouble
+                } else if c == 39 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_SYSTEM_KEYWORD, input, idx)
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierSingle
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    pos = pos - 1
+                    state = State::BogusDoctype
+                }
+            }
+            State::BeforeDoctypeSystemIdentifier => {
+                if is_space(c) {
+                    // skip
+                } else if c == 34 as u32 {
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierDouble
+                } else if c == 39 as u32 {
+                    tokens.tok_sysid_start(s)
+                    state = State::DoctypeSystemIdentifierSingle
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    pos = pos - 1
+                    state = State::BogusDoctype
+                }
+            }
+            State::DoctypeSystemIdentifierDouble => {
+                if c == 34 as u32 {
+                    state = State::AfterDoctypeSystemIdentifier
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_ABRUPT_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_sysid_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::DoctypeSystemIdentifierSingle => {
+                if c == 39 as u32 {
+                    state = State::AfterDoctypeSystemIdentifier
+                } else if c == 62 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_ABRUPT_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.tok_sysid_push(s, null_replacement(c, s, input, idx))
+                }
+            }
+            State::AfterDoctypeSystemIdentifier => {
+                if is_space(c) {
+                    // skip
+                } else if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_error_at(s, error_codes.F_EOF_IN_DOCTYPE, input, idx)
+                    tokens.tok_set_force_quirks(s, true)
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else {
+                    tokens.sink_error_at(s, error_codes.F_UNEXPECTED_CHARACTER_AFTER_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
+                    pos = pos - 1
+                    state = State::BogusDoctype
+                }
+            }
+            State::BogusDoctype => {
+                if c == 62 as u32 {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.tok_emit_at(s, pos)
+                    state = State::Done
+                } else if c == 0 as u32 {
+                    tokens.sink_error_at(s, error_codes.F_UNEXPECTED_NULL_CHARACTER, input, idx)
+                }
+                // everything else is discarded
+            }
+
+            State::NotSupported => {
+                runs = false
+            }
+            State::Done => {
+                runs = false
+            }
+        }
+    }
+    mem.cp_free(&tmp)
+    return ok
+}

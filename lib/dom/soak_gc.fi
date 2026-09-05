@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/dom/soak_gc.fi -- the endurance run of the DOM prototype with the opt-in tracing GC.
+//
+// ACCEPTANCE POINT 2 (FIRN-ANFORDERUNGEN.md 13): "a DOM prototype with
+// parent/child back references and listener cycles that does not leak in an
+// endurance run." In a loop this program builds ever new complete sets of
+// cycles (lib/dom/dom.fi) and lets them become unreachable. A reference
+// count would keep EVERY set; the collector has to keep the consumption flat.
+//
+// The counter check is lib/dom/soak_leak.fi: the same setup, but with
+// reference counts instead of `Gc[T]`. It MUST leak -- otherwise the
+// measurement measures nothing. Both are evaluated by tools/dom_soak/run.sh.
+//
+// The output protocol: TSV on standard output, one data line per
+// SAMPLE cycles. The three constants stand there verbatim so that
+// run.sh can rewrite them with sed into a working copy.
+
+import dom
+import meas
+
+const BUDGET_MS: i64 = 600000 // SOAK_BUDGET_MS
+const CYCLES_MAX: i64 = 100000000 // SOAK_CYCLES_MAX
+const SAMPLE: i64 = 1000 // SOAK_SAMPLE
+
+// Header line 1 of the protocol
+fn t_head1() {
+    var t: [u8; 31] = [
+        35, 32, 102, 105, 114, 110, 45, 100, 111, 109, 45, 115, 111, 97, 107,
+        32, 118, 49, 32, 118, 97, 114, 105, 97, 110, 116, 101, 61, 103, 99,
+        10,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 31)
+}
+// Header line 2: the column names
+fn t_head2() {
+    var t: [u8; 76] = [
+        35, 32, 115, 112, 97, 108, 116, 101, 110, 58, 32, 116, 95, 109, 115,
+        9, 122, 121, 107, 108, 101, 110, 9, 114, 115, 115, 95, 107, 105, 98,
+        9, 108, 101, 98, 101, 110, 100, 101, 9, 115, 97, 109, 109, 101, 108,
+        108, 97, 101, 117, 102, 101, 9, 104, 101, 97, 112, 95, 98, 121, 116,
+        101, 115, 9, 112, 97, 117, 115, 101, 95, 109, 97, 120, 95, 110, 115,
+        10,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 76)
+}
+// The final line, part 1
+fn t_done() {
+    var t: [u8; 16] = [
+        35, 32, 102, 101, 114, 116, 105, 103, 32, 122, 121, 107, 108, 101, 110,
+        61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 16)
+}
+// The final line, part 2
+fn t_tms() {
+    var t: [u8; 6] = [
+        32, 116, 95, 109, 115, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 6)
+}
+// The final line, part 3
+fn t_runs() {
+    var t: [u8; 14] = [
+        32, 115, 97, 109, 109, 101, 108, 108, 97, 101, 117, 102, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 14)
+}
+// The final line, part 4
+fn t_rss() {
+    var t: [u8; 9] = [
+        32, 114, 115, 115, 95, 107, 105, 98, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 9)
+}
+// The error line
+fn t_error() {
+    var t: [u8; 14] = [
+        35, 32, 102, 101, 104, 108, 101, 114, 32, 99, 111, 100, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    meas.meas_write(p, 14)
+}
+
+// One data line of the protocol.
+fn line(t_ms: u64, cycles: u64, rss: u64, live: u64, runs: u64, heap: u64, pause: u64) {
+    meas.meas_u64(t_ms)
+    meas.meas_tab()
+    meas.meas_u64(cycles)
+    meas.meas_tab()
+    meas.meas_u64(rss)
+    meas.meas_tab()
+    meas.meas_u64(live)
+    meas.meas_tab()
+    meas.meas_u64(runs)
+    meas.meas_tab()
+    meas.meas_u64(heap)
+    meas.meas_tab()
+    meas.meas_u64(pause)
+    meas.meas_nl()
+}
+
+fn err(code: u64) -> i32 {
+    t_error()
+    meas.meas_u64(code)
+    meas.meas_nl()
+    return code as i32
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return err(2)
+    }
+    t_head1()
+    t_head2()
+    let rss0: u64 = meas.meas_rss_kib()
+    if rss0 == 0 {
+        return err(3)
+    }
+    let t0: u64 = meas.meas_now_ms()
+    line(0, 0, rss0, gc_live_objects(), gc_collections(), gc_heap_bytes(), gc_pause_ns_max())
+
+    var cycles: u64 = 0
+    var since: i64 = 0
+    var t: u64 = 0
+    var run: bool = true
+    while run {
+        let n: u64 = dom.dom_cycle_build() catch 0
+        if n != dom.DOM_OBJECTS_PER_SET {
+            return err(4)
+        }
+        cycles = cycles + 1
+        since = since + 1
+        if since >= SAMPLE {
+            since = 0
+            // Overwrite old pointers in abandoned frames: the
+            // stack scan is conservative (SPEC 3.5.3).
+            dom.dom_cycle_discard()
+            t = meas.meas_now_ms() - t0
+            let rss: u64 = meas.meas_rss_kib()
+            if rss == 0 {
+                return err(5)
+            }
+            line(t, cycles, rss, gc_live_objects(), gc_collections(), gc_heap_bytes(), gc_pause_ns_max())
+            if t >= BUDGET_MS as u64 || cycles >= CYCLES_MAX as u64 {
+                run = false
+            }
+        }
+    }
+    t_done()
+    meas.meas_u64(cycles)
+    t_tms()
+    meas.meas_u64(t)
+    t_runs()
+    meas.meas_u64(gc_collections())
+    t_rss()
+    meas.meas_u64(meas.meas_rss_kib())
+    meas.meas_nl()
+    return 0
+}

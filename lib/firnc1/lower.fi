@@ -1,0 +1,3552 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/lower.fi -- FROM THE CHECKED TREE TO THE FIR, IN FIRN.
+//
+// Eighth part of stage 1: the port of `compiler/src/lower.rs`.
+//
+// SCOPE: the scalar core, the aggregates AND `defer`/`errdefer`.
+//
+// DEFERRED STATEMENTS (SPEC 5.1) form a stack per BLOCK LEVEL. When a
+// block is left, its own ones run in reverse order; at `return`
+// all levels of the function run, at `break`/`continue` only those declared
+// INSIDE the loop. `errdefer` runs only on the ERROR PATH
+// (`return E::Variant`, `try`) -- since round 36 through
+// `defer_to_error` (`ret_term_error` in stage 0, SPEC 5.1).
+//
+// AGGREGATES NEVER TRAVEL AS A VALUE, always through ADDRESSES. There are
+// exactly two routes: `write_after(addr, e)` stores an expression at an
+// address, `address(e)` takes the address of an aggregate that exists. A
+// struct literal is written field by field, an aggregate from elsewhere is
+// copied with `copymem`.
+//
+// AT THE FUNCTION BOUNDARY `abi` decides (SPEC 13, 14.1):
+//   up to 16 bytes -> one or two INTEGER WORDS
+//   larger         -> a hidden pointer to a copy made by the caller
+//   return > 8     -> hidden pointer in `rdi` (`sret`)
+//
+// TWO THINGS NOBODY CAN GUESS, and which are therefore rebuilt exactly:
+//
+//  1. The VALUE NUMBERS follow the order of CREATION, not the printed
+//     order: every `alloca` is moved to the start of the entry
+//     block. `%0 = alloca` and `%2 = alloca` can therefore end up
+//     next to each other although `%1` was created in between.
+//  2. After `return`, `break` and `continue` a NEW, unreachable
+//     block is opened. It stays in the text (bb7, bb8 ...) -- only the
+//     later cleanup pass removes it. Leaving it out gives a
+//     different text.
+
+import rt
+import vec
+import intern
+import ast
+import types
+import sema
+import fir
+import pattern
+import err
+import gc
+import iface
+import core
+
+export { Lower, low_new, low_free, low_run, low_error, low_fir, low_unsuitable,
+    low_mu_set, low_fe_set, low_gc_set, low_if_set, low_checked_set }
+
+const NONE: u32 = 4294967295
+
+struct Lower {
+    // ROUND 70: an lvalue whose address is already computed (`pin_set`).
+    // The compound assignment on `str` puts its target in here so that the
+    // address is computed exactly once.
+    pin_node: u32,
+    pin_addr: u32,
+    b: u64 // tree
+    it: u64 // interner
+    sm: u64 // sema
+    f: fir.Fir
+    fi: u32 // current function
+    cur: u32 // current block
+    v_name: Vec[u32] // scopes: identifier -> slot
+    v_slot: Vec[u32]
+    // ROUND 58 (fnval.rs): the source type of a local. `call_full` reads it
+    // to tell a CALL OF A FUNCTION VALUE apart from a direct call.
+    v_ty: Vec[u32]
+    b_limit: Vec[u32]
+    l_break: Vec[u32] // loop targets
+    l_cont: Vec[u32]
+    l_depth: Vec[u32] // stack depth of the deferred statements per loop
+    d_stmt: Vec[u32] // deferred statements, in order of declaration
+    d_err: Vec[u32] // 1 = `errdefer`
+    d_limit: Vec[u32] // bounds per block level
+    sret: u32
+    mu: u64 // registry of enumerations/pattern matches (0 = none)
+    feh: u64 // registry of error sets/unions (0 = none)
+    gcr: u64 // registry of the gc classes (round 34; 0 = none)
+    ifr: u64 // registry of the interfaces (round 46; 0 = none)
+    err: usize
+    unsuitable: bool // aggregate or `defer` found
+    // ROUND 72 (checkmode.rs, SPEC 13 item L9): does THIS build level check
+    // `+ - * / %` and a narrowing `as`? `dev`, `dev-fast` and
+    // `release-safe` do, `release-fast` does not. Set once by the driver
+    // before lowering starts, read for every arithmetic expression.
+    checked: bool
+    // The current file, for the panic message. It comes out of the
+    // expression's own position (`ast.expr_pos`), so nothing needs to be
+    // tracked here -- only the scratch buffer that builds the sentence.
+    msg: rt.Buf
+}
+
+fn low_new(b: u64, it: u64, sm: u64) -> Lower {
+    return Lower {
+        b: b, it: it, sm: sm,
+        f: fir.fir_new(),
+        fi: 0, cur: 0,
+        v_name: vec_new[u32](), v_slot: vec_new[u32](), v_ty: vec_new[u32](),
+        b_limit: vec_new[u32](),
+        l_break: vec_new[u32](), l_cont: vec_new[u32](), l_depth: vec_new[u32](),
+        d_stmt: vec_new[u32](), d_err: vec_new[u32](), d_limit: vec_new[u32](),
+        sret: NONE, mu: 0, feh: 0, gcr: 0, ifr: 0, err: 0, unsuitable: false,
+        pin_node: NONE, pin_addr: 0,
+        checked: true, msg: rt.buf_new(),
+    }
+}
+
+// ROUND 72: `firnc1 --opt-level=release-fast` switches the checks off, every
+// other level leaves them on -- the same table as `checkmode.rs`.
+fn low_checked_set(l: *mut Lower, v: bool) { (*l).checked = v }
+
+fn low_free(l: *mut Lower) {
+    fir.fir_free(&(*l).f)
+    vec_free[u32](&(*l).v_name)
+    vec_free[u32](&(*l).v_slot)
+    vec_free[u32](&(*l).v_ty)
+    vec_free[u32](&(*l).b_limit)
+    vec_free[u32](&(*l).l_break)
+    vec_free[u32](&(*l).l_cont)
+    vec_free[u32](&(*l).l_depth)
+    vec_free[u32](&(*l).d_stmt)
+    vec_free[u32](&(*l).d_err)
+    vec_free[u32](&(*l).d_limit)
+    rt.buf_free(&(*l).msg)
+}
+
+fn low_error(l: *mut Lower) -> usize { return (*l).err }
+
+// Register the pattern registry. MUST happen before `low_run`.
+fn low_mu_set(l: *mut Lower, m: u64) { (*l).mu = m }
+
+fn mul(l: *mut Lower) -> *mut pattern.Pat { return (*l).mu as *mut pattern.Pat }
+fn has_mu(l: *mut Lower) -> bool { return (*l).mu != 0 }
+
+// Register the error registry. MUST happen before `low_run`.
+fn low_fe_set(l: *mut Lower, f: u64) { (*l).feh = f }
+
+// Register the gc registry (round 34). MUST happen before `low_run`.
+fn low_gc_set(l: *mut Lower, g: u64) { (*l).gcr = g }
+
+// Register the interface registry (round 46). MUST happen before
+// `low_run`.
+fn low_if_set(l: *mut Lower, f: u64) { (*l).ifr = f }
+
+fn fel(l: *mut Lower) -> *mut err.Error { return (*l).feh as *mut err.Error }
+fn has_fe(l: *mut Lower) -> bool { return (*l).feh != 0 }
+fn gcl(l: *mut Lower) -> *mut gc.Gc { return (*l).gcr as *mut gc.Gc }
+fn has_gc(l: *mut Lower) -> bool { return (*l).gcr != 0 }
+fn ifl(l: *mut Lower) -> *mut iface.If { return (*l).ifr as *mut iface.If }
+fn has_if(l: *mut Lower) -> bool { return (*l).ifr != 0 }
+fn low_unsuitable(l: *mut Lower) -> bool { return (*l).unsuitable }
+fn low_fir(l: *mut Lower) -> *mut fir.Fir { return &(*l).f }
+
+fn tree(l: *mut Lower) -> *mut ast.Tree { return (*l).b as *mut ast.Tree }
+fn sm(l: *mut Lower) -> *mut sema.Sema { return (*l).sm as *mut sema.Sema }
+fn tf(l: *mut Lower) -> *mut types.Types { return sema.sema_types(sm(l)) }
+fn names(l: *mut Lower) -> *mut intern.Interner { return (*l).it as *mut intern.Interner }
+
+fn give_up(l: *mut Lower) {
+    (*l).unsuitable = true
+}
+
+// ------------------------------------------------- types: source -> FIR
+
+fn is_aggregate(l: *mut Lower, t: u32) -> bool {
+    let k: u32 = types.ty_kind(tf(l), t)
+    return k == types.K_ARR || k == types.K_STRUCT
+}
+
+// FIR type of a scalar source type; fir.NONE for an aggregate.
+fn fty(l: *mut Lower, t: u32) -> u32 {
+    let k: u32 = types.ty_kind(tf(l), t)
+    if k == types.K_I8 { return fir.T_I8 }
+    if k == types.K_I16 { return fir.T_I16 }
+    if k == types.K_I32 { return fir.T_I32 }
+    if k == types.K_I64 { return fir.T_I64 }
+    if k == types.K_ISIZE { return fir.T_I64 }
+    if k == types.K_U8 { return fir.T_U8 }
+    if k == types.K_U16 { return fir.T_U16 }
+    if k == types.K_U32 { return fir.T_U32 }
+    if k == types.K_U64 { return fir.T_U64 }
+    if k == types.K_USIZE { return fir.T_U64 }
+    if k == types.K_BOOL { return fir.T_BOOL }
+    if k == types.K_F64 { return fir.T_F64 }
+    if k == types.K_F32 { return fir.T_F32 }
+    if k == types.K_PTR { return fir.T_PTR }
+    // ROUND 58: a function value is the pointer to its function record.
+    if k == types.K_FN { return fir.T_PTR }
+    if k == types.K_VOID { return fir.T_VOID }
+    return fir.NONE
+}
+
+fn e_fty(l: *mut Lower, e: u32) -> u32 {
+    return fty(l, sema.sema_ty(sm(l), e))
+}
+
+// ROUND 71 (lower.rs::out_ty) -- the type an expression HANDS OUT.
+//
+// That is its own type, except where the one implicit conversion applies:
+// an `f32` in a place that wants an `f64` hands out an `f64`. `e_fty` keeps
+// giving the OWN type on purpose -- the value is built at its own width
+// first and only converted after; reading an `f32` variable as if it were
+// eight bytes wide would reach beyond its storage.
+fn out_ty(l: *mut Lower, e: u32) -> u32 {
+    if sema.sema_widen32(sm(l), e) {
+        return types.new_ty(tf(l), types.K_F64, 0, 0)
+    }
+    return sema.sema_ty(sm(l), e)
+}
+
+fn out_fty(l: *mut Lower, e: u32) -> u32 {
+    if sema.sema_widen32(sm(l), e) {
+        return fir.T_F64
+    }
+    return e_fty(l, e)
+}
+
+// ------------------------------------------------------- building blocks
+
+fn push(l: *mut Lower, kind: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff: u32, alen: u32) -> u32 {
+    return fir.inst_add(&(*l).f, (*l).fi, (*l).cur, kind, ty, a, b, c, z, aoff, alen)
+}
+
+fn push_void(l: *mut Lower, kind: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff: u32, alen: u32) {
+    fir.inst_void_add(&(*l).f, (*l).fi, (*l).cur, kind, ty, a, b, c, z, aoff, alen)
+}
+
+// --------------------------------------------- ROUND 72: panic messages
+//
+// The sentence a checked operation prints when it goes out of range
+// (SPEC 13, item L9). It is built HERE, during lowering, because this is
+// the last place that knows where in the source the operation stood --
+// FIR carries no positions at all (docs/FIR.md). It has to read octet for
+// octet like the one `lower.rs` builds: `tools/fir_compare.sh` compares
+// the two intermediate representations as TEXT, and the message is part
+// of it.
+
+// The spelling of an `ast::BinOp` -- only the five that ever reach a
+// checked operation (`ast.rs::BinOp::text`).
+fn op_text(b: *mut rt.Buf, op: u32) {
+    var tab: [u8; 9] = "+|-|*|/|%"
+    var i: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while i <= 9 {
+        var end: bool = i == 9
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if nr == op {
+                rt.buf_push_bytes(b, (&tab[start]) as u64, i - start)
+                return
+            }
+            nr = nr + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// ` at <file>:<line>:<column>`, closing every one of the four messages.
+fn msg_at(l: *mut Lower, pos: u64) {
+    var at: [u8; 4] = " at "
+    rt.buf_push_bytes(&(*l).msg, (&at[0]) as u64, 4)
+    // ROUND 83: the file number is the one of the TREE's file table
+    // (round 79, `ast.file_add`) -- `firnc1.fi` registers every file there
+    // under the same name `firnc0` prints, and the parser packs THAT number
+    // into every position. Round 72 carried the intern number of the name
+    // instead; two meanings in the same twelve bits is one too many.
+    let b0: *mut ast.Tree = tree(l)
+    let fnr: u32 = ast.pos_file(pos)
+    if (fnr as usize) < ast.file_count(b0) {
+        rt.buf_push_bytes(&(*l).msg, ast.file_ptr(b0, fnr), ast.file_length(b0, fnr))
+    }
+    rt.buf_push(&(*l).msg, 58 as u8)
+    rt.buf_push_dec_u64(&(*l).msg, ast.pos_line(pos) as u64)
+    rt.buf_push(&(*l).msg, 58 as u8)
+    rt.buf_push_dec_u64(&(*l).msg, ast.pos_col(pos) as u64)
+}
+
+fn msg_keep(l: *mut Lower) -> u32 {
+    return intern.intern_number(names(l), rt.buf_ptr(&(*l).msg),
+        rt.buf_len(&(*l).msg)) as u32
+}
+
+// `panic: integer overflow in 'i32 + i32' at file:line:column`
+fn overflow_msg(l: *mut Lower, pos: u64, op: u32, ft: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 28] = "panic: integer overflow in '"
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 28)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    op_text(&(*l).msg, op)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 39 as u8)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// ROUND 89 -- `panic: index out of bounds in '[i32; 4]' at file:line:column`
+// The two NUMBERS (the index and the length) are appended by the back end
+// at the panic site, under the words `index=` and `len=`.
+fn index_msg(l: *mut Lower, pos: u64, arr: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 31] = "panic: index out of bounds in '"
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 31)
+    types.name_of(tf(l), names(l), &(*l).msg, arr)
+    rt.buf_push(&(*l).msg, 39 as u8)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// `panic: division by zero in 'i32 / i32' at file:line:column`
+fn div_zero_msg(l: *mut Lower, pos: u64, op: u32, ft: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 28] = "panic: division by zero in '"
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 28)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    op_text(&(*l).msg, op)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 39 as u8)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// `panic: integer overflow (i32 MIN / -1) at file:line:column`
+fn div_range_msg(l: *mut Lower, pos: u64, op: u32, ft: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 25] = "panic: integer overflow ("
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 25)
+    fir.fty_name(&(*l).msg, ft)
+    var mi: [u8; 5] = " MIN "
+    rt.buf_push_bytes(&(*l).msg, (&mi[0]) as u64, 5)
+    op_text(&(*l).msg, op)
+    var e1: [u8; 4] = " -1)"
+    rt.buf_push_bytes(&(*l).msg, (&e1[0]) as u64, 4)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// `panic: integer overflow casting 'i32 as u8' at file:line:column`
+fn cast_msg(l: *mut Lower, pos: u64, from: u32, to: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 33] = "panic: integer overflow casting '"
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 33)
+    fir.fty_name(&(*l).msg, from)
+    var asw: [u8; 4] = " as "
+    rt.buf_push_bytes(&(*l).msg, (&asw[0]) as u64, 4)
+    fir.fty_name(&(*l).msg, to)
+    rt.buf_push(&(*l).msg, 39 as u8)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// Is a value of THIS type checked at all? Floating point overflow is a
+// defined IEEE-754 value (infinity, SPEC 14.1), and `bool`/`ptr` never
+// reach `+ - * / %` through the parser in the first place.
+fn checkable(l: *mut Lower, ft: u32) -> bool {
+    if !(*l).checked {
+        return false
+    }
+    if ft == fir.T_BOOL || ft == fir.T_PTR || ft == fir.T_VOID {
+        return false
+    }
+    return !fir.is_float_ty(ft)
+}
+
+fn constant(l: *mut Lower, ty: u32, v: u64) -> u32 {
+    return push(l, fir.O_CONST, ty, 0, 0, 0, v, 0, 0)
+}
+
+fn load(l: *mut Lower, ty: u32, addr: u32) -> u32 {
+    return push(l, fir.O_LOAD, ty, addr, 0, 0, 0, 0, 0)
+}
+
+fn store(l: *mut Lower, ty: u32, addr: u32, value: u32) {
+    push_void(l, fir.O_STORE, ty, addr, value, 0, 0, 0, 0)
+}
+
+fn alloca(l: *mut Lower, size: u64, align: u64) -> u32 {
+    return fir.alloca_add(&(*l).f, (*l).fi, size, align)
+}
+
+fn new_block(l: *mut Lower) -> u32 {
+    return fir.block_new(&(*l).f, (*l).fi)
+}
+
+fn term(l: *mut Lower, kind: u32, t1: u32, t2: u32, t3: u32) {
+    fir.term_set(&(*l).f, (*l).fi, (*l).cur, kind, t1, t2, t3)
+}
+
+fn terminated(l: *mut Lower) -> bool {
+    return fir.is_terminated(&(*l).f, (*l).fi, (*l).cur)
+}
+
+// --------------------------------------------------------------- scopes
+
+fn range_on(l: *mut Lower) {
+    vec_push[u32](&(*l).b_limit, vec_len[u32](&(*l).v_name) as u32)
+}
+
+fn range_off(l: *mut Lower) {
+    let g: u32 = vec_last[u32](&(*l).b_limit)
+    vec_pop[u32](&(*l).b_limit)
+    while vec_len[u32](&(*l).v_name) > g as usize {
+        vec_pop[u32](&(*l).v_name)
+        vec_pop[u32](&(*l).v_slot)
+        vec_pop[u32](&(*l).v_ty)
+    }
+}
+
+fn create(l: *mut Lower, name: u32, slot: u32) {
+    create_ty(l, name, slot, NONE)
+}
+
+// ROUND 58: declaration WITH the source type (see `Lower::v_ty`).
+fn create_ty(l: *mut Lower, name: u32, slot: u32, t: u32) {
+    vec_push[u32](&(*l).v_name, name)
+    vec_push[u32](&(*l).v_slot, slot)
+    vec_push[u32](&(*l).v_ty, t)
+}
+
+// ROUND 58: the type of a local, or NONE.
+fn local_ty(l: *mut Lower, name: u32) -> u32 {
+    var i: usize = vec_len[u32](&(*l).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*l).v_name, i) == name {
+            return vec_at[u32](&(*l).v_ty, i)
+        }
+    }
+    return NONE
+}
+
+// ------------------------------------------------- deferred statements
+
+fn defer_level_on(l: *mut Lower) {
+    vec_push[u32](&(*l).d_limit, vec_len[u32](&(*l).d_stmt) as u32)
+}
+
+// Runs the deferred statements of this level (in reverse order)
+// and then drops the level.
+fn defer_level_off(l: *mut Lower) {
+    let g: u32 = vec_last[u32](&(*l).d_limit)
+    vec_pop[u32](&(*l).d_limit)
+    var i: usize = vec_len[u32](&(*l).d_stmt)
+    while i > g as usize {
+        i = i - 1
+        // `errdefer` does NOT run when the block is left normally.
+        if vec_at[u32](&(*l).d_err, i) == 0 {
+            stmt(l, vec_at[u32](&(*l).d_stmt, i))
+        }
+    }
+    while vec_len[u32](&(*l).d_stmt) > g as usize {
+        vec_pop[u32](&(*l).d_stmt)
+        vec_pop[u32](&(*l).d_err)
+    }
+}
+
+// Runs all deferred statements ABOVE `depth` -- innermost
+// level first, in reverse order within a level. The stack stays
+// UNCHANGED: `defer_level_off` drops its own level. Anything produced
+// afterwards lands in the unreachable block behind the jump.
+fn defer_to_mf(l: *mut Lower, depth: u32, with_error: bool) {
+    var e: usize = vec_len[u32](&(*l).d_limit)
+    var end: usize = vec_len[u32](&(*l).d_stmt)
+    while e > depth as usize {
+        e = e - 1
+        let g: u32 = vec_at[u32](&(*l).d_limit, e)
+        var i: usize = end
+        while i > g as usize {
+            i = i - 1
+            // `errdefer` runs ONLY on the error path (SPEC 5.1) --
+            // `lower_defers_to(depth, with_error)` in stage 0.
+            if vec_at[u32](&(*l).d_err, i) == 0 || with_error {
+                stmt(l, vec_at[u32](&(*l).d_stmt, i))
+            }
+        }
+        end = g as usize
+    }
+}
+
+fn defer_to(l: *mut Lower, depth: u32) {
+    defer_to_mf(l, depth, false)
+}
+
+// Return on the ERROR PATH: the `errdefer` statements run as
+// well (`ret_term_error`, round 36).
+fn defer_to_error(l: *mut Lower) {
+    defer_to_mf(l, 0, true)
+}
+
+// Is there an active `errdefer` in this function? (`has_errdefer`)
+fn has_errdefer(l: *mut Lower) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*l).d_err) {
+        if vec_at[u32](&(*l).d_err, i) == 1 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn search(l: *mut Lower, name: u32) -> u32 {
+    var i: usize = vec_len[u32](&(*l).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*l).v_name, i) == name {
+            return vec_at[u32](&(*l).v_slot, i)
+        }
+    }
+    return NONE
+}
+
+// -------------------------------------------------------------- addresses
+
+// Address of an assignable expression.
+// ROUND 70 (lower.rs) -- the address of an lvalue that has already been
+// computed.
+//
+// The compound assignment on `str` passes its target as an ARGUMENT
+// (`__str_concat(s, x)`) and writes the result back into the same place.
+// Without this pin the address would be computed a second time for the
+// argument -- and with `a[f()] += "x"` `f()` would run twice.
+fn pin_set(l: *mut Lower, e: u32, addr: u32) {
+    (*l).pin_node = e
+    (*l).pin_addr = addr
+}
+
+fn pin_clear(l: *mut Lower) {
+    (*l).pin_node = NONE
+}
+
+fn address(l: *mut Lower, e: u32) -> u32 {
+    if (*l).pin_node != NONE && (*l).pin_node == e {
+        return (*l).pin_addr
+    }
+    return address_inner(l, e)
+}
+
+fn address_inner(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let a: u32 = ast.e_kind(b, e)
+    // HOOK error unions (lower_errors.rs::hook_addr): an expression with a
+    // recorded conversion sits in memory as a finished union.
+    if has_fe(l) {
+        let cu: u32 = err.error_coerce_open(fel(l), e)
+        if cu != NONE {
+            let us: usize = err.error_u_sidx(fel(l), cu) as usize
+            var g: u64 = types.st_size(tf(l), us)
+            if g < 1 { g = 1 }
+            var al: u64 = types.st_alignment(tf(l), us)
+            if al < 1 { al = 1 }
+            let slot: u32 = alloca(l, g, al)
+            union_write(l, slot, e, cu)
+            return slot
+        }
+    }
+    if a == ast.E_ID {
+        let slot: u32 = search(l, ast.e_a(b, e))
+        if slot != NONE {
+            return slot
+        }
+        // ROUND 89 (statics.fi/statics.rs): a `static` HAS an address, and
+        // it is the same one everywhere -- a link time constant, not a
+        // stack slot. From here on every path that already worked for a
+        // local (field, index, assignment, `&x`) works for a global.
+        if sema.sema_static_index(sm(l), ast.e_a(b, e)) != NONE {
+            return push(l, fir.O_GLOBAL, fir.T_PTR, ast.e_a(b, e), 0, 0, 0, 0, 0)
+        }
+        give_up(l)
+        return 0
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 3 {
+        return value(l, ast.e_b(b, e))
+    }
+    if a == ast.E_FIELD {
+        let bt: u32 = sema.sema_ty(sm(l), ast.e_a(b, e))
+        var si: usize = 0
+        var base: u32 = 0
+        if types.ty_kind(tf(l), bt) == types.K_STRUCT {
+            si = types.ty_a(tf(l), bt) as usize
+            base = address(l, ast.e_a(b, e))
+        } else if types.ty_kind(tf(l), bt) == types.K_PTR {
+            // `p.f` on a pointer to a struct: dereference automatically.
+            let inner: u32 = types.ty_a(tf(l), bt)
+            if types.ty_kind(tf(l), inner) != types.K_STRUCT {
+                give_up(l)
+                return 0
+            }
+            si = types.ty_a(tf(l), inner) as usize
+            base = value(l, ast.e_a(b, e))
+        } else {
+            give_up(l)
+            return 0
+        }
+        return ptradd_const(l, base, field_offset(l, si, ast.e_b(b, e)))
+    }
+    if a == ast.E_IDX {
+        let bt: u32 = sema.sema_ty(sm(l), ast.e_a(b, e))
+        var elem: u32 = 0
+        var base: u32 = 0
+        if types.ty_kind(tf(l), bt) == types.K_ARR {
+            elem = types.ty_a(tf(l), bt)
+            base = address(l, ast.e_a(b, e))
+        } else if types.ty_kind(tf(l), bt) == types.K_PTR {
+            elem = types.ty_a(tf(l), bt)
+            base = value(l, ast.e_a(b, e))
+        } else {
+            give_up(l)
+            return 0
+        }
+        let gr: u64 = q_size(l, elem)
+        let ift: u32 = e_fty(l, ast.e_b(b, e))
+        var iv: u32 = value(l, ast.e_b(b, e))
+        // ROUND 89 -- the checked index (SPEC 13, item L9). Only a FIXED
+        // SIZE ARRAY gets one: a `*T` carries no length, so there is
+        // nothing to compare against and this compiler does not invent
+        // one. The check sits HERE and not in `elem_address`, so that the
+        // array literals and struct copies the compiler builds for itself
+        // (whose indices it just computed and knows to be inside) do not
+        // pay for it.
+        if types.ty_kind(tf(l), bt) == types.K_ARR && (*l).checked {
+            let m: u32 = index_msg(l, ast.expr_pos(b, ast.e_b(b, e)), bt)
+            iv = push(l, fir.O_CHECKEDIDX, ift, iv, 0,
+                types.ty_n(tf(l), bt) as u32, m as u64, 0, 0)
+        }
+        return elem_address(l, base, iv, ift, gr)
+    }
+    if a == ast.E_SLIT || a == ast.E_ALIT || a == ast.E_AWDH || a == ast.E_TEXT {
+        let t: u32 = sema.sema_ty(sm(l), e)
+        let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+        write_after(l, slot, e)
+        return slot
+    }
+    // HOOK str: `a + b` on `str` is an aggregate and needs a place of its
+    // own (strtype.rs, round 70).
+    if a == ast.E_BIN && ast.e_a(b, e) == 0 {
+        let tb: u32 = sema.sema_ty(sm(l), e)
+        if types.str_like(tf(l), tb) {
+            let slot2: u32 = alloca(l, q_size(l, tb), q_align(l, tb))
+            write_after(l, slot2, e)
+            return slot2
+        }
+    }
+    // HOOK fnval: `gc fn(...)` yields an error union -- an aggregate, so it
+    // needs a place of its own (fnval.rs, round 58).
+    if a == ast.E_LAMBDA {
+        let tl: u32 = sema.sema_ty(sm(l), e)
+        if is_aggregate(l, tl) {
+            let slot3: u32 = alloca(l, q_size(l, tl), q_align(l, tl))
+            write_after(l, slot3, e)
+            return slot3
+        }
+    }
+    // HOOK iface: `((&x) as dyn I).m()` -- the interface value gets a
+    // scratch slot, and its address is the result here (iface.fi).
+    if a == ast.E_AS {
+        let t2: u32 = sema.sema_ty(sm(l), e)
+        if is_dyn_ty(l, t2) {
+            let slot2: u32 = alloca(l, q_size(l, t2), q_align(l, t2))
+            write_after(l, slot2, e)
+            return slot2
+        }
+    }
+    if a == ast.E_CALL {
+        // HOOK error unions (lower_errors.rs::hook_addr): `try`, `catch`
+        // and the bare error value create their slot themselves.
+        if has_fe(l) && ast.e_number(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            if err.error_is_tryname(names(l), nm) {
+                return try_address(l, e)
+            }
+            if err.error_is_catchname(names(l), nm) {
+                return catch_slot(l, e)
+            }
+            let cc: i64 = err.error_ctor_code((*l).feh, names(l), nm)
+            if cc >= 0 {
+                return ctor_address(l, e, cc as u64)
+            }
+        }
+        // HOOK enum (lower_match.rs): the constructor creates the value itself.
+        if has_mu(l) && ast.e_number(b, e) == 0 {
+            if pattern.pat_is_ctorname(names(l), ast.e_a(b, e)) {
+                let t: u32 = sema.sema_ty(sm(l), e)
+                let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+                ctor_write(l, e, slot)
+                return slot
+            }
+        }
+        // A call that returns an aggregate writes into a scratch
+        // slot; its address is the result (SPEC 14.1).
+        let t: u32 = sema.sema_ty(sm(l), e)
+        if !is_aggregate(l, t) {
+            give_up(l)
+            return 0
+        }
+        let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+        call_with_target(l, e, slot)
+        return slot
+    }
+    give_up(l)
+    return 0
+}
+
+// ---------------------------------------------------- storing at an address
+
+// Is `t` an interface value (`dyn I`)?
+fn is_dyn_ty(l: *mut Lower, t: u32) -> bool {
+    if !has_if(l) {
+        return false
+    }
+    if types.ty_kind(tf(l), t) != types.K_STRUCT {
+        return false
+    }
+    let nm: u32 = types.st_name(tf(l), types.ty_a(tf(l), t) as usize)
+    return iface.if_of_dyn(ifl(l), nm) != NONE
+}
+
+// HOOK iface (iface.rs::lower_cast_into): `p as dyn I` -- two words.
+// The data pointer is NOT changed (no offset, no
+// obfuscation); only then does the conservative stack scan of the collector
+// find the object behind it (SPEC 3.5.3).
+fn interface_write(l: *mut Lower, addr: u32, e: u32, t: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let dn: u32 = types.st_name(tf(l), types.ty_a(tf(l), t) as usize)
+    let ii: u32 = iface.if_of_dyn(ifl(l), dn)
+    if ii == NONE {
+        give_up(l)
+        return
+    }
+    let inner: u32 = ast.e_a(b, e)
+    let qt: u32 = sema.sema_ty(sm(l), inner)
+    if types.ty_kind(tf(l), qt) != types.K_PTR {
+        give_up(l)
+        return
+    }
+    let qi: u32 = types.ty_a(tf(l), qt)
+    if types.ty_kind(tf(l), qi) != types.K_STRUCT {
+        give_up(l)
+        return
+    }
+    let pre: u32 = iface.if_table(ifl(l), ii, types.ty_a(tf(l), qi))
+    if pre == NONE {
+        give_up(l)
+        return
+    }
+    let pv: u32 = value(l, inner)
+    store(l, fir.T_PTR, ptradd_const(l, addr, 0), pv)
+    let tv: u32 = push(l, fir.O_VTAB, fir.T_PTR,
+        iface.if_name(ifl(l), ii as usize), pre, 0, 0, 0, 0)
+    store(l, fir.T_PTR, ptradd_const(l, addr, 8), tv)
+}
+
+fn write_after(l: *mut Lower, addr: u32, e: u32) {
+    if (*l).unsuitable {
+        return
+    }
+    let b: *mut ast.Tree = tree(l)
+    let a: u32 = ast.e_kind(b, e)
+    let t: u32 = sema.sema_ty(sm(l), e)
+
+    // HOOK error unions (lower_errors.rs::hook_write_into): the implicit
+    // conversion, the bare error value and `try`/`catch` write themselves.
+    if has_fe(l) {
+        let cu: u32 = err.error_coerce_open(fel(l), e)
+        if cu != NONE {
+            union_write(l, addr, e, cu)
+            return
+        }
+        if a == ast.E_CALL && ast.e_number(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            let cc: i64 = err.error_ctor_code((*l).feh, names(l), nm)
+            if cc >= 0 {
+                let cv: u32 = constant(l, fir.T_U32, cc as u64)
+                store(l, fir.T_U32, addr, cv)
+                return
+            }
+            var is_res: bool = err.error_is_tryname(names(l), nm)
+            if !is_res {
+                is_res = err.error_is_catchname(names(l), nm)
+            }
+            if is_res {
+                var src: u32 = 0
+                if err.error_is_tryname(names(l), nm) {
+                    src = try_address(l, e)
+                } else {
+                    src = catch_slot(l, e)
+                }
+                copy_value(l, addr, src, t)
+                return
+            }
+        }
+    }
+
+    if a == ast.E_SLIT {
+        let si: usize = types.ty_a(tf(l), t) as usize
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            let fname: u32 = ast.child_at(b, ast.e_b(b, e) + k * 2)
+            let fexpr: u32 = ast.child_at(b, ast.e_b(b, e) + k * 2 + 1)
+            let fa: u32 = ptradd_const(l, addr, field_offset(l, si, fname))
+            write_after(l, fa, fexpr)
+            k = k + 1
+        }
+        return
+    }
+    // HOOK str: THE text literal (strtype.rs, round 70).
+    //
+    // Where an array is wanted, the inner array literal is written --
+    // literally the code of round 39. Where a `str` is wanted, the octets
+    // get a place in the frame and the two words p/n are written into the
+    // target. The empty literal `""` needs no place at all.
+    if a == ast.E_TEXT {
+        let inner: u32 = ast.e_a(b, e)
+        if types.ty_kind(tf(l), t) == types.K_ARR {
+            write_after(l, addr, inner)
+            return
+        }
+        let n: u32 = ast.e_c(b, inner)
+        var p: u32 = 0
+        if n == 0 {
+            p = constant(l, fir.T_PTR, 0)
+        } else {
+            let bytes: u32 = alloca(l, n as u64, 1)
+            write_after(l, bytes, inner)
+            p = bytes
+        }
+        store(l, fir.T_PTR, addr, p)
+        let na: u32 = ptradd_const(l, addr, 8)
+        store(l, fir.T_U64, na, constant(l, fir.T_U64, n as u64))
+        return
+    }
+    // HOOK str: `a + b` on `str` -- the result comes from the collector.
+    if a == ast.E_BIN && ast.e_a(b, e) == 0 && types.str_like(tf(l), t) {
+        var cargs: Vec[u32] = vec_new[u32]()
+        vec_push[u32](&cargs, ast.e_b(b, e))
+        vec_push[u32](&cargs, ast.e_c(b, e))
+        str_call(l, str_fn(l, 1), &cargs, addr)
+        vec_free[u32](&cargs)
+        return
+    }
+    if a == ast.E_ALIT {
+        let esz: u64 = q_size(l, types.ty_a(tf(l), t))
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            let ea: u32 = elem_address_const(l, addr, esz, k as u64)
+            write_after(l, ea, ast.child_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_AWDH {
+        repeat(l, addr, ast.e_a(b, e), types.ty_a(tf(l), t), types.ty_n(tf(l), t))
+        return
+    }
+    // HOOK fnval: `gc fn(...)` -- allocate the record and write the captured
+    // values into it (fnval.rs, round 58). A closure WITHOUT captures is a
+    // plain word and goes through `value` like every other scalar.
+    if a == ast.E_LAMBDA && is_aggregate(l, t) {
+        closure_lower(l, e, addr)
+        return
+    }
+    if a == ast.E_CALL && has_mu(l) && ast.e_number(b, e) == 0 {
+        // HOOK enum (lower_match.rs): the constructor writes into the target directly.
+        if pattern.pat_is_ctorname(names(l), ast.e_a(b, e)) {
+            ctor_write(l, e, addr)
+            return
+        }
+    }
+    if a == ast.E_CALL && is_aggregate(l, t) {
+        call_with_target(l, e, addr)
+        return
+    }
+    // HOOK iface: `p as dyn I` writes data pointer and table (iface.fi).
+    if a == ast.E_AS && is_dyn_ty(l, t) {
+        interface_write(l, addr, e, t)
+        return
+    }
+    if is_aggregate(l, t) {
+        let src: u32 = address(l, e)
+        copymem(l, addr, src, types.size_of(tf(l), t))
+        return
+    }
+    // ROUND 71: the store uses the type that comes OUT of the expression --
+    // a widened `f32` is eight bytes wide by then.
+    let ft: u32 = out_fty(l, e)
+    let v: u32 = value(l, e)
+    store(l, ft, addr, v)
+}
+
+// Write `[value; N]` to `addr`. The value is evaluated EXACTLY ONCE and
+// then replicated -- unrolled up to eight elements, larger as a loop.
+fn repeat(l: *mut Lower, addr: u32, val: u32, et: u32, n: u64) {
+    let esz: u64 = q_size(l, et)
+    let scalar: bool = !is_aggregate(l, et)
+    var sv: u32 = 0
+    var sft: u32 = 0
+    var saddr: u32 = 0
+    if scalar {
+        sft = fty(l, et)
+        sv = value(l, val)
+    } else {
+        saddr = address(l, val)
+    }
+    if n <= 8 {
+        var i: u64 = 0
+        while i < n {
+            let ea: u32 = elem_address_const(l, addr, esz, i)
+            if scalar {
+                store(l, sft, ea, sv)
+            } else {
+                copymem(l, ea, saddr, esz)
+            }
+            i = i + 1
+        }
+        return
+    }
+    let islot: u32 = alloca(l, 8, 8)
+    let null: u32 = constant(l, fir.T_U64, 0)
+    store(l, fir.T_U64, islot, null)
+    let header: u32 = new_block(l)
+    let body: u32 = new_block(l)
+    let end: u32 = new_block(l)
+    term(l, fir.TERM_BR, header, 0, 0)
+
+    (*l).cur = header
+    let iv: u32 = load(l, fir.T_U64, islot)
+    let nv: u32 = constant(l, fir.T_U64, n)
+    let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, iv, nv, 2, fir.T_U64 as u64, 0, 0)
+    term(l, fir.TERM_BRCOND, c, body, end)
+
+    (*l).cur = body
+    let iv2: u32 = load(l, fir.T_U64, islot)
+    let ea: u32 = elem_address(l, addr, iv2, fir.T_U64, esz)
+    if scalar {
+        store(l, sft, ea, sv)
+    } else {
+        copymem(l, ea, saddr, esz)
+    }
+    // The index that was already loaded is REUSED -- a second `load`
+    // would be one instruction too many and would shift every value number.
+    let one: u32 = constant(l, fir.T_U64, 1)
+    let inc: u32 = push(l, fir.O_BIN, fir.T_U64, iv2, one, 0, 0, 0, 0)
+    store(l, fir.T_U64, islot, inc)
+    term(l, fir.TERM_BR, header, 0, 0)
+
+    (*l).cur = end
+}
+
+fn q_size(l: *mut Lower, t: u32) -> u64 {
+    var g: u64 = types.size_of(tf(l), t)
+    if g < 1 { g = 1 }
+    return g
+}
+
+fn q_align(l: *mut Lower, t: u32) -> u64 {
+    var a: u64 = types.alignment_of(tf(l), t)
+    if a < 1 { a = 1 }
+    return a
+}
+
+// Offset of a field in the struct `si`.
+fn field_offset(l: *mut Lower, si: usize, fname: u32) -> u64 {
+    var k: u32 = 0
+    while k < types.st_flen(tf(l), si) {
+        let fnr: u32 = types.st_foff(tf(l), si) + k
+        if types.sf_name(tf(l), fnr) == fname {
+            return types.sf_offset(tf(l), fnr)
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+fn field_ty_of(l: *mut Lower, si: usize, fname: u32) -> u32 {
+    return types.st_field_ty(tf(l), si, fname)
+}
+
+fn ptradd_const(l: *mut Lower, base: u32, off: u64) -> u32 {
+    if off == 0 {
+        return base
+    }
+    let o: u32 = constant(l, fir.T_I64, off)
+    return push(l, fir.O_PTRADD, fir.T_PTR, base, o, 0, 0, 0, 0)
+}
+
+// Address of an element with a COMPUTED index. The index is converted to
+// `u64` first -- in exactly this order, otherwise the value numbers do
+// not match (layout.rs::elem_addr).
+fn elem_address(l: *mut Lower, base: u32, idx: u32, ift: u32, gr: u64) -> u32 {
+    var idx64: u32 = idx
+    if ift != fir.T_U64 {
+        idx64 = push(l, fir.O_CAST, fir.T_U64, idx, 0, ift, 0, 0, 0)
+    }
+    let g: u32 = constant(l, fir.T_U64, gr)
+    let off: u32 = push(l, fir.O_BIN, fir.T_U64, idx64, g, 2, 0, 0, 0)
+    return push(l, fir.O_PTRADD, fir.T_PTR, base, off, 0, 0, 0, 0)
+}
+
+fn elem_address_const(l: *mut Lower, base: u32, gr: u64, i: u64) -> u32 {
+    return ptradd_const(l, base, gr * i)
+}
+
+fn copymem(l: *mut Lower, target: u32, source: u32, size: u64) {
+    push_void(l, fir.O_COPYMEM, fir.T_VOID, target, source, 0, size, 0, 0)
+}
+
+// ------------------------------------------------------------ expressions
+
+fn value(l: *mut Lower, e: u32) -> u32 {
+    let v: u32 = value_inner(l, e)
+    // ROUND 71 -- the counterpart to the widening in `sema::expr`. The type
+    // checker has noted THAT it happens, here it really happens:
+    // `cvtss2sd`. One place for it, so that no context can lose it.
+    if sema.sema_widen32(sm(l), e) {
+        if (*l).unsuitable {
+            return v
+        }
+        return push(l, fir.O_CAST, fir.T_F64, v, 0, fir.T_F32, 0, 0, 0)
+    }
+    return v
+}
+
+fn value_inner(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let t: u32 = sema.sema_ty(sm(l), e)
+    if is_aggregate(l, t) {
+        give_up(l)
+        return 0
+    }
+    let a: u32 = ast.e_kind(b, e)
+    let ft: u32 = e_fty(l, e)
+
+    if a == ast.E_INT {
+        return constant(l, ft, ast.e_number(b, e))
+    }
+    // ROUND 71: WHICH bit pattern is decided by the type checker. In an
+    // `f32` context the binary64 of the lexer is narrowed here, once,
+    // correctly rounded -- exactly the value `1.5f` would have produced.
+    if a == ast.E_FLOAT {
+        if ft == fir.T_F32 {
+            // ROUND 71: the CORRECTLY ROUNDED binary32, computed in the
+            // lexer on the text. Narrowing the binary64 here would be one
+            // rounding too many (lexer.fi::float32_bits).
+            return constant(l, fir.T_F32, ast.e_a(b, e) as u64)
+        }
+        return constant(l, fir.T_F64, ast.e_number(b, e))
+    }
+    if a == ast.E_FLOAT32 {
+        return constant(l, fir.T_F32, ast.e_number(b, e))
+    }
+    if a == ast.E_BOOL {
+        return constant(l, fir.T_BOOL, ast.e_a(b, e) as u64)
+    }
+    if a == ast.E_ID {
+        let slot: u32 = search(l, ast.e_a(b, e))
+        if slot != NONE {
+            return load(l, ft, slot)
+        }
+        // ROUND 58 (fnval.rs): a named function AS A VALUE. The value is
+        // the address of its function record, one word in `.rodata`
+        // holding the code address.
+        if types.ty_kind(tf(l), t) == types.K_FN && fn_number(l, ast.e_a(b, e)) != NONE {
+            return push(l, fir.O_FNREF, fir.T_PTR, ast.e_a(b, e), 0, 0, 0, 0, 0)
+        }
+        // ROUND 89: read a global variable -- its address, then a load,
+        // exactly as for a local.
+        if sema.sema_static_index(sm(l), ast.e_a(b, e)) != NONE {
+            let ga: u32 = push(l, fir.O_GLOBAL, fir.T_PTR, ast.e_a(b, e), 0, 0, 0, 0, 0)
+            return load(l, ft, ga)
+        }
+        // Constant: the type checker already holds the value.
+        return constant(l, ft, sema_const(l, ast.e_a(b, e)))
+    }
+    // HOOK fnval: a closure WITHOUT captures -- its record is one word in
+    // `.rodata`, exactly like that of a named function (fnval.rs, round 58).
+    if a == ast.E_LAMBDA {
+        return push(l, fir.O_FNREF, fir.T_PTR, ast.e_a(b, e), 0, 0, 0, 0, 0)
+    }
+    if a == ast.E_UN {
+        let op: u32 = ast.e_a(b, e)
+        if op == 2 {
+            return address(l, ast.e_b(b, e))
+        }
+        if op == 3 {
+            let addr: u32 = value(l, ast.e_b(b, e))
+            return load(l, ft, addr)
+        }
+        let v: u32 = value(l, ast.e_b(b, e))
+        var un: u32 = 0
+        // ROUND 68: `!b` and `~x` become the SAME FIR operation; the
+        // instruction type decides between `xor eax, 1` and `not`.
+        if op == 1 || op == 4 {
+            un = 1
+        }
+        return push(l, fir.O_UN, ft, v, 0, un, 0, 0, 0)
+    }
+    if a == ast.E_BIN {
+        return binary(l, e)
+    }
+    if a == ast.E_FIELD || a == ast.E_IDX {
+        let addr: u32 = address(l, e)
+        return load(l, ft, addr)
+    }
+    if a == ast.E_CALL {
+        // HOOK error unions (lower_errors.rs::hook_value): the SCALAR
+        // result of `try`/`catch` (aggregates go through `address`).
+        if has_fe(l) && ast.e_number(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            if err.error_is_tryname(names(l), nm) {
+                let sa: u32 = try_address(l, e)
+                return load(l, ft, sa)
+            }
+            if err.error_is_catchname(names(l), nm) {
+                let sa: u32 = catch_slot(l, e)
+                return load(l, ft, sa)
+            }
+        }
+        return call(l, e, ft)
+    }
+    if a == ast.E_SYSCALL {
+        // EVERY syscall argument is passed as `i64` -- anything that is not
+        // i64 already is converted. Pointers too, otherwise a `cast` is missing.
+        var tmp: Vec[u32] = vec_new[u32]()
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            let arg: u32 = ast.child_at(b, ast.e_b(b, e) + k)
+            let aft: u32 = e_fty(l, arg)
+            let v: u32 = value(l, arg)
+            if aft == fir.T_I64 {
+                vec_push[u32](&tmp, v)
+            } else {
+                vec_push[u32](&tmp, push(l, fir.O_CAST, fir.T_I64, v, 0, aft, 0, 0, 0))
+            }
+            k = k + 1
+        }
+        let off: u32 = args_store(l, &tmp)
+        vec_free[u32](&tmp)
+        return push(l, fir.O_SYSCALL, fir.T_I64, 0, 0, 0, 0, off, ast.e_c(b, e))
+    }
+    if a == ast.E_AS {
+        let of: u32 = out_fty(l, ast.e_a(b, e))
+        let after: u32 = ft
+        let src: u32 = value(l, ast.e_a(b, e))
+        if of == after {
+            return src
+        }
+        if after == fir.T_BOOL {
+            let z: u32 = constant(l, of, 0)
+            return push(l, fir.O_CMP, fir.T_BOOL, src, z, 1, of as u64, 0, 0)
+        }
+        // ROUND 72 -- a checked narrowing `as` (SPEC 13, item L9). Only a
+        // narrowing between two INTEGER types is checked: fewer bits can
+        // lose the value outright, and the same width with a signedness
+        // flip can too (`i32 as u32` on a negative value). A WIDENING cast
+        // is lossless and stays `O_CAST`; so does every float on either
+        // side (SPEC 14.1 defines that one as truncating, not checked).
+        if checkable(l, of) && checkable(l, after)
+        && fir.fty_bits(after) <= fir.fty_bits(of) {
+            let m: u32 = cast_msg(l, ast.expr_pos(b, e), of, after)
+            return push(l, fir.O_CHECKEDCAST, after, src, 0, of, m as u64, 0, 0)
+        }
+        return push(l, fir.O_CAST, after, src, 0, of, 0, 0, 0)
+    }
+    give_up(l)
+    return 0
+}
+
+// The value of a constant, taken from the type checker.
+fn sema_const(l: *mut Lower, name: u32) -> u64 {
+    return sema.sema_const_value(sm(l), name)
+}
+
+fn binary(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let op: u32 = ast.e_a(b, e)
+    let li: u32 = ast.e_b(b, e)
+    let re: u32 = ast.e_c(b, e)
+
+    if op == 16 || op == 17 {
+        return short_circuit(l, op, li, re)
+    }
+    // HOOK str: `==`/`!=` compare the CONTENT -- one call into the collector
+    // runtime, the same shape as in stage 0 (strtype.rs, round 70).
+    if op == 10 || op == 11 {
+        let lt0: u32 = sema.sema_ty(sm(l), li)
+        if types.str_like(tf(l), lt0) {
+            var eargs: Vec[u32] = vec_new[u32]()
+            vec_push[u32](&eargs, li)
+            vec_push[u32](&eargs, re)
+            let v: u32 = str_call(l, str_fn(l, 0), &eargs, NONE)
+            vec_free[u32](&eargs)
+            if op == 11 {
+                return push(l, fir.O_UN, fir.T_BOOL, v, 0, 1, 0, 0, 0)
+            }
+            return v
+        }
+    }
+    if op >= 10 && op <= 15 {
+        // HOOK error unions (lower_errors.rs::hook_binary): comparing two error
+        // values means comparing their codes (u32 at the start).
+        if has_fe(l) && (op == 10 || op == 11) {
+            let lty: u32 = sema.sema_ty(sm(l), li)
+            let rty: u32 = sema.sema_ty(sm(l), re)
+            if err.error_set_of_ty(fel(l), tf(l), lty) != NONE {
+                if err.error_set_of_ty(fel(l), tf(l), rty) != NONE {
+                    let aa: u32 = address(l, li)
+                    let av: u32 = load(l, fir.T_U32, aa)
+                    let ba: u32 = address(l, re)
+                    let bv: u32 = load(l, fir.T_U32, ba)
+                    return push(l, fir.O_CMP, fir.T_BOOL, av, bv, op - 10,
+                        fir.T_U32 as u64, 0, 0)
+                }
+            }
+        }
+        // ROUND 71: after the widening BOTH operands are `f64`. The
+        // comparison type has to be the one the values really carry.
+        let ty: u32 = out_fty(l, li)
+        let av: u32 = value(l, li)
+        let bv: u32 = value(l, re)
+        return push(l, fir.O_CMP, fir.T_BOOL, av, bv, op - 10, ty as u64, 0, 0)
+    }
+    let ft: u32 = e_fty(l, e)
+    // in the order of `ast::BinOp`: add sub mul div rem and or xor shl shr
+    let bop: u32 = op
+    let av: u32 = value(l, li)
+    var bv: u32 = value(l, re)
+    if op == 8 || op == 9 {
+        let bt: u32 = e_fty(l, re)
+        if bt != ft {
+            bv = push(l, fir.O_CAST, ft, bv, 0, bt, 0, 0, 0)
+        }
+    }
+    // ROUND 72 -- the explicit `+% -% *%` / `+| -| *|` (SPEC 13, item L9).
+    // NEVER checked, whatever the build level says: these spellings exist
+    // exactly so that overflow can be opted INTO where it is the point
+    // (a hash function's multiplication, a checksum, a counter that rolls
+    // over), instead of forcing a program to switch checking off
+    // everywhere else to get that one line.
+    if op >= 18 {
+        var fbop: u32 = 0
+        var wkind: u64 = fir.WS_WRAP
+        if op == 19 || op == 22 {
+            fbop = 1
+        }
+        if op == 20 || op == 23 {
+            fbop = 2
+        }
+        if op >= 21 {
+            wkind = fir.WS_SAT
+        }
+        return push(l, fir.O_BINWRAPSAT, ft, av, bv, fbop, wkind, 0, 0)
+    }
+    // ROUND 72 -- checked `+ - *` and `/ %`.
+    if checkable(l, ft) {
+        let pos: u64 = ast.expr_pos(b, e)
+        if op <= 2 {
+            let m: u32 = overflow_msg(l, pos, op, ft)
+            return push(l, fir.O_CHECKEDBIN, ft, av, bv, op, m as u64, 0, 0)
+        }
+        if op == 3 || op == 4 {
+            let mz: u32 = div_zero_msg(l, pos, op, ft)
+            let mr: u32 = div_range_msg(l, pos, op, ft)
+            return push(l, fir.O_CHECKEDDIV, ft, av, bv, op,
+                (mz as u64) | ((mr as u64) << 32), 0, 0)
+        }
+    }
+    return push(l, fir.O_BIN, ft, av, bv, bop, 0, 0, 0)
+}
+
+// `&&` / `||` short circuiting: result slot + branch.
+fn short_circuit(l: *mut Lower, op: u32, li: u32, re: u32) -> u32 {
+    let slot: u32 = alloca(l, 1, 1)
+    let av: u32 = value(l, li)
+    store(l, fir.T_BOOL, slot, av)
+    let rhs: u32 = new_block(l)
+    let join: u32 = new_block(l)
+    var then: u32 = rhs
+    var els: u32 = join
+    if op == 17 {
+        then = join
+        els = rhs
+    }
+    term(l, fir.TERM_BRCOND, av, then, els)
+    (*l).cur = rhs
+    let bv: u32 = value(l, re)
+    store(l, fir.T_BOOL, slot, bv)
+    if !terminated(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+    (*l).cur = join
+    return load(l, fir.T_BOOL, slot)
+}
+
+// Class of a type at the function boundary: the number of integer words,
+// or `fir.NONE` for the memory class.
+fn abi_class(l: *mut Lower, t: u32) -> u32 {
+    let k: u32 = types.class_of(tf(l), t)
+    if k == types.CLASS_MEM {
+        return fir.NONE
+    }
+    return k
+}
+
+fn abi_sret(l: *mut Lower, t: u32) -> bool {
+    return types.needs_sret(tf(l), t)
+}
+
+// Loads an aggregate as `n` integer words. If the size is not a multiple
+// of eight, it goes through a padded scratch buffer -- otherwise the last
+// `load` would reach partly BEYOND the object.
+// ROUND 71 (lower.rs::word_fty) -- the FIR type of ONE ABI eightbyte.
+// `f64` is not the truth about the CONTENT (an SSE eightbyte can hold two
+// `f32`), it is the truth about the REGISTER: the code generator only needs
+// to know "integer register or xmm register", and it reads exactly that.
+fn word_fty(l: *mut Lower, t: u32, which: u64) -> u32 {
+    if types.word_class(tf(l), t, which) == types.W_SSE {
+        return fir.T_F64
+    }
+    return fir.T_I64
+}
+
+// Like `words_load`, but every eightbyte keeps its CLASS. That is not
+// decoration: this is what makes a `{ f32, f32 }` land in `xmm0` instead of
+// in `rdi`.
+fn words_load_cls(l: *mut Lower, addr: u32, size: u64, n: u32, t: u32, out: *mut Vec[u32]) {
+    var source: u32 = addr
+    if size % 8 != 0 {
+        let tmp: u32 = alloca(l, n as u64 * 8, 8)
+        copymem(l, tmp, addr, size)
+        source = tmp
+    }
+    var i: u32 = 0
+    while i < n {
+        let a: u32 = ptradd_const(l, source, i as u64 * 8)
+        vec_push[u32](out, load(l, word_fty(l, t, i as u64), a))
+        i = i + 1
+    }
+}
+
+fn words_load(l: *mut Lower, addr: u32, size: u64, n: u32, out: *mut Vec[u32]) {
+    var source: u32 = addr
+    if size % 8 != 0 {
+        let t: u32 = alloca(l, n as u64 * 8, 8)
+        copymem(l, t, addr, size)
+        source = t
+    }
+    var i: u32 = 0
+    while i < n {
+        let a: u32 = ptradd_const(l, source, i as u64 * 8)
+        vec_push[u32](out, load(l, fir.T_I64, a))
+        i = i + 1
+    }
+}
+
+fn words_store(l: *mut Lower, target: u32, size: u64, w: u32) {
+    if size % 8 != 0 {
+        let t: u32 = alloca(l, 8, 8)
+        store(l, fir.T_I64, t, w)
+        copymem(l, target, t, size)
+        return
+    }
+    store(l, fir.T_I64, target, w)
+}
+
+// The arguments have to sit CONTIGUOUSLY. An argument that contains a
+// call of its own would otherwise drop its arguments RIGHT INTO the
+// outer list -- the same bug as in the parser (round 22). So collect
+// first, then store in one go.
+fn args_store(l: *mut Lower, tmp: *mut Vec[u32]) -> u32 {
+    let off: u32 = fir.arg_start(&(*l).f)
+    var i: usize = 0
+    while i < vec_len[u32](tmp) {
+        fir.arg_add(&(*l).f, vec_at[u32](tmp, i))
+        i = i + 1
+    }
+    return off
+}
+
+// ------------------------------------------------- gc (gc_lower.rs, round 34)
+//
+// `gc C{ ... }` -- call into the runtime (`__gc_alloc_raw`), then build
+// the error union `AllocError!Gc[C]` at `target` and write the fields.
+// The collection happens inside `__gc_alloc_raw`: collect FIRST, THEN
+// `AllocError::OutOfMemory` (DESIGN_GOALS 2).
+fn gc_alloc_lower(l: *mut Lower, e: u32, target: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let ki_i: i64 = gc.gc_class_out_new(gcl(l), names(l), ast.e_a(b, e))
+    if ki_i < 0 {
+        give_up(l)
+        return
+    }
+    let ki: u32 = ki_i as u32
+    let sidx: u32 = gc.gc_sidx(gcl(l), ki)
+    // Position of `__val` in the error union.
+    let ui: u32 = gc.gc_union(gcl(l), ki)
+    if ui == 0 {
+        give_up(l)
+        return
+    }
+    let voff: u64 = err.error_u_voff(fel(l), ui - 1)
+    var ae: [u8; 10] = "AllocError"
+    let aen: u32 = intern.intern_number(names(l), (&ae[0]) as u64, 10) as u32
+    let sm2: u32 = err.error_set_find(fel(l), aen)
+    var om: [u8; 11] = "OutOfMemory"
+    let omn: u32 = intern.intern_number(names(l), (&om[0]) as u64, 11) as u32
+    let code: u32 = err.error_code_of(fel(l), sm2, omn)
+    if code == 0 {
+        give_up(l)
+        return
+    }
+    var ar: [u8; 14] = "__gc_alloc_raw"
+    let arn: u32 = intern.intern_number(names(l), (&ar[0]) as u64, 14) as u32
+
+    let tidv: u32 = constant(l, fir.T_U64, gc.gc_tid(gcl(l), ki))
+    let sizev: u32 = constant(l, fir.T_U64, gc.gc_size(gcl(l), ki))
+    var tmp: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&tmp, tidv)
+    vec_push[u32](&tmp, sizev)
+    let aoff: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+    let p: u32 = push(l, fir.O_CALL, fir.T_PTR, arn, 0, 0, 0, aoff, 2)
+    let null: u32 = constant(l, fir.T_PTR, 0)
+    // 1 = not equal (in the order of `ast::BinOp`: eq ne lt le gt ge)
+    let ok: u32 = push(l, fir.O_CMP, fir.T_BOOL, p, null, 1, fir.T_PTR as u64, 0, 0)
+    let ok_bb: u32 = new_block(l)
+    let fail_bb: u32 = new_block(l)
+    let join: u32 = new_block(l)
+    term(l, fir.TERM_BRCOND, ok, ok_bb, fail_bb)
+
+    // Error case: the runtime has already collected, so this really is the end.
+    (*l).cur = fail_bb
+    let cv: u32 = constant(l, fir.T_U32, code as u64)
+    store(l, fir.T_U32, target, cv)
+    let va1: u32 = ptradd_const(l, target, voff)
+    let z0: u32 = constant(l, fir.T_PTR, 0)
+    store(l, fir.T_PTR, va1, z0)
+    term(l, fir.TERM_BR, join, 0, 0)
+
+    // Success case: fill in the error union (so that the pointer is a root on
+    // the stack straight away), then write the fields.
+    (*l).cur = ok_bb
+    let z32: u32 = constant(l, fir.T_U32, 0)
+    store(l, fir.T_U32, target, z32)
+    let va2: u32 = ptradd_const(l, target, voff)
+    store(l, fir.T_PTR, va2, p)
+    if ast.e_c(b, e) == 1 {
+        let slit: u32 = ast.child_at(b, ast.e_b(b, e))
+        if ast.e_kind(b, slit) == ast.E_SLIT {
+            let off: u32 = ast.e_b(b, slit)
+            let cnt: u32 = ast.e_c(b, slit)
+            var k: u32 = 0
+            while k < cnt {
+                let fname: u32 = ast.child_at(b, off + k * 2)
+                let fexpr: u32 = ast.child_at(b, off + k * 2 + 1)
+                let fa: u32 = ptradd_const(l, p, field_offset(l, sidx as usize, fname))
+                write_after(l, fa, fexpr)
+                k = k + 1
+            }
+        }
+    }
+    if !terminated(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+    (*l).cur = join
+}
+
+// The insertion barrier (hook_assign in gc_lower.rs): AFTER writing a
+// `Gc[T]` pointer into a heap field. Only writes INTO the heap need it;
+// a local variable lives on the stack.
+// ROUND 58 (fnval.rs::lower_closure) -- `gc fn(...)`.
+//
+// The same shape as `gc C{ ... }`: allocate, on failure write
+// `AllocError::OutOfMemory` into the union, on success write the record
+// into the union FIRST (so that the pointer is a root on the stack straight
+// away) and only then fill in the code address and the captured values.
+fn closure_lower(l: *mut Lower, e: u32, target: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let cname: u32 = ast.e_a(b, e)
+    let ci: u32 = sema.sema_closure_index(sm(l), cname)
+    if ci == NONE || !has_gc(l) || !has_fe(l) {
+        give_up(l)
+        return
+    }
+    let t: u32 = sema.sema_ty(sm(l), e)
+    let ui: u32 = err.error_union_of_ty(fel(l), tf(l), t)
+    if ui == NONE {
+        give_up(l)
+        return
+    }
+    let voff: u64 = err.error_u_voff(fel(l), ui)
+    var ae: [u8; 10] = "AllocError"
+    let aen: u32 = intern.intern_number(names(l), (&ae[0]) as u64, 10) as u32
+    let sm2: u32 = err.error_set_find(fel(l), aen)
+    var om: [u8; 11] = "OutOfMemory"
+    let omn: u32 = intern.intern_number(names(l), (&om[0]) as u64, 11) as u32
+    let code: u32 = err.error_code_of(fel(l), sm2, omn)
+    if code == 0 {
+        give_up(l)
+        return
+    }
+    var ar: [u8; 14] = "__gc_alloc_raw"
+    let arn: u32 = intern.intern_number(names(l), (&ar[0]) as u64, 14) as u32
+    let tidv: u32 = constant(l, fir.T_U64, sema.sema_closure_tid(sm(l), ci))
+    let sizev: u32 = constant(l, fir.T_U64, sema.sema_closure_size(sm(l), ci))
+    var tmp: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&tmp, tidv)
+    vec_push[u32](&tmp, sizev)
+    let aoff: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+    let p: u32 = push(l, fir.O_CALL, fir.T_PTR, arn, 0, 0, 0, aoff, 2)
+    let null: u32 = constant(l, fir.T_PTR, 0)
+    let ok: u32 = push(l, fir.O_CMP, fir.T_BOOL, p, null, 1, fir.T_PTR as u64, 0, 0)
+    let ok_bb: u32 = new_block(l)
+    let fail_bb: u32 = new_block(l)
+    let join: u32 = new_block(l)
+    term(l, fir.TERM_BRCOND, ok, ok_bb, fail_bb)
+
+    (*l).cur = fail_bb
+    let cv: u32 = constant(l, fir.T_U32, code as u64)
+    store(l, fir.T_U32, target, cv)
+    let va1: u32 = ptradd_const(l, target, voff)
+    let z0: u32 = constant(l, fir.T_PTR, 0)
+    store(l, fir.T_PTR, va1, z0)
+    term(l, fir.TERM_BR, join, 0, 0)
+
+    (*l).cur = ok_bb
+    let z32: u32 = constant(l, fir.T_U32, 0)
+    store(l, fir.T_U32, target, z32)
+    let va2: u32 = ptradd_const(l, target, voff)
+    store(l, fir.T_PTR, va2, p)
+    // Word 0: the code address of the generated function.
+    let rec: u32 = push(l, fir.O_FNREF, fir.T_PTR, cname, 0, 0, 0, 0, 0)
+    let cp: u32 = load(l, fir.T_PTR, rec)
+    store(l, fir.T_PTR, p, cp)
+    // The captured values, in the order of the class fields.
+    var k: u32 = 0
+    while k < sema.sema_closure_caps(sm(l), ci) {
+        let nm: u32 = sema.sema_capture_name(sm(l), ci, k)
+        let ct: u32 = sema.sema_capture_ty(sm(l), ci, k)
+        let slot: u32 = search(l, nm)
+        if slot == NONE {
+            give_up(l)
+            return
+        }
+        let cft: u32 = fty(l, ct)
+        if cft == fir.NONE || cft == fir.T_VOID {
+            give_up(l)
+            return
+        }
+        let v: u32 = load(l, cft, slot)
+        let a2: u32 = ptradd_const(l, p, 8 + k as u64 * 8)
+        store(l, cft, a2, v)
+        k = k + 1
+    }
+    if !terminated(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+    (*l).cur = join
+}
+
+fn gc_barrier(l: *mut Lower, target: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let t: u32 = sema.sema_ty(sm(l), target)
+    if !gc.gc_is_gc_ptr(gcl(l), tf(l), t) {
+        return
+    }
+    var ins_heap: bool = false
+    let a: u32 = ast.e_kind(b, target)
+    if a == ast.E_FIELD {
+        let bt: u32 = sema.sema_ty(sm(l), ast.e_a(b, target))
+        if gc.gc_is_gc_ptr(gcl(l), tf(l), bt) {
+            ins_heap = true
+        }
+        if types.ty_kind(tf(l), bt) == types.K_PTR {
+            ins_heap = true
+        }
+    }
+    if a == ast.E_IDX {
+        let bt: u32 = sema.sema_ty(sm(l), ast.e_a(b, target))
+        if types.ty_kind(tf(l), bt) == types.K_PTR {
+            ins_heap = true
+        }
+    }
+    if a == ast.E_UN && ast.e_a(b, target) == 3 {
+        ins_heap = true
+    }
+    if !ins_heap {
+        return
+    }
+    var bn: [u8; 12] = "__gc_barrier"
+    let bnn: u32 = intern.intern_number(names(l), (&bn[0]) as u64, 12) as u32
+    let addr: u32 = address(l, target)
+    let val: u32 = load(l, fir.T_PTR, addr)
+    var tmp: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&tmp, addr)
+    vec_push[u32](&tmp, val)
+    let aoff: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+    push_void(l, fir.O_CALL, fir.T_VOID, bnn, 0, 0, 0, aoff, 2)
+}
+
+// A call following the calling convention. `target` is the destination
+// address if the function returns an aggregate (otherwise `fir.NONE`).
+// Returns the scalar value, or 0.
+// -------------------------------------------------------- ROUND 45: methods
+// The same resolution as in sema.fi -- from the same material, so that the
+// two cannot drift apart (impls.rs::target_of).
+
+fn is_method_call(it: *mut intern.Interner, name: u32) -> bool {
+    var w: [u8; 7] = "method "
+    return intern.intern_prefix(it, name, (&w[0]) as u64, 7)
+}
+
+// ROUND 50: like `sema.fi::recv_struct` -- a primitive type has methods too.
+// Both sides compute from the same material, so that they cannot drift
+// apart.
+fn recv_struct_l(l: *mut Lower, t: u32) -> u32 {
+    var i: u32 = t
+    if types.ty_kind(tf(l), i) == types.K_PTR {
+        i = types.ty_a(tf(l), i)
+    }
+    let a: u32 = types.ty_kind(tf(l), i)
+    if a == types.K_STRUCT {
+        return types.st_name(tf(l), types.ty_a(tf(l), i) as usize)
+    }
+    return types.base_ty_name(names(l), a)
+}
+
+// ROUND 68 (impls.rs::field_fn): the struct INDEX behind a receiver, and
+// the type of a FIELD holding a function value. NONE when there is none.
+fn recv_struct_index(l: *mut Lower, t: u32) -> u32 {
+    var i: u32 = t
+    if types.ty_kind(tf(l), i) == types.K_PTR {
+        i = types.ty_a(tf(l), i)
+    }
+    if types.ty_kind(tf(l), i) != types.K_STRUCT {
+        return NONE
+    }
+    return types.ty_a(tf(l), i)
+}
+
+fn field_fn_ty_l(l: *mut Lower, t: u32, m: u32) -> u32 {
+    let si: u32 = recv_struct_index(l, t)
+    if si == NONE {
+        return NONE
+    }
+    let ft: u32 = types.st_field_ty(tf(l), si as usize, m)
+    if ft == NONE {
+        return NONE
+    }
+    if types.ty_kind(tf(l), ft) != types.K_FN {
+        return NONE
+    }
+    return ft
+}
+
+fn method_func_l(l: *mut Lower, sn: u32, m: u32) -> u32 {
+    let it: *mut intern.Interner = names(l)
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, intern.intern_ptr(it, sn), intern.intern_length(it, sn))
+    var tr: [u8; 2] = "__"
+    rt.buf_push_bytes(&b, (&tr[0]) as u64, 2)
+    rt.buf_push_bytes(&b, intern.intern_ptr(it, m), intern.intern_length(it, m))
+    let nr: u32 = intern.intern_number(it, rt.buf_ptr(&b), rt.buf_len(&b)) as u32
+    rt.buf_free(&b)
+    return nr
+}
+
+// **ROUND 88** (sema.fi::method_target) -- the NAME of the function behind
+// `x.m()`. `Type__m` first; if there is nothing there and the receiver is
+// the builtin `str`, the views (`str.Span`) get their turn, in the order in
+// which they were declared. The lowering computes from the same material as
+// the type check, so the two cannot drift apart.
+fn method_target_l(l: *mut Lower, sn: u32, m: u32, et: u32) -> u32 {
+    let direct: u32 = method_func_l(l, sn, m)
+    if fn_number(l, direct) != NONE {
+        return direct
+    }
+    if !types.str_is_builtin(tf(l), et) {
+        return direct
+    }
+    var vi: usize = 0
+    while vi < types.st_count(tf(l)) {
+        if vi != types.STR_INDEX as usize {
+            if types.str_is_view(tf(l), vi as u32) {
+                let cand: u32 = method_func_l(l, types.st_name(tf(l), vi), m)
+                if fn_number(l, cand) != NONE {
+                    return cand
+                }
+            }
+        }
+        vi = vi + 1
+    }
+    return direct
+}
+
+// ----------------------------------------------- inline assembly and MMIO
+//
+// ROUND 52 (compiler/src/core.rs::lower_hook).
+
+fn mmio_fty(w: u32) -> u32 {
+    if w == 0 {
+        return fir.T_U8
+    }
+    if w == 1 {
+        return fir.T_U16
+    }
+    if w == 2 {
+        return fir.T_U32
+    }
+    return fir.T_U64
+}
+
+fn asm_lower(l: *mut Lower, blk: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    // Evaluate the inputs in source order and widen them to 64 bit: a register
+    // always takes the whole word anyway.
+    let n_in: u32 = ast.asm_in_count(b, blk)
+    let n_out: u32 = ast.asm_out_count(b, blk)
+    var values: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < n_in && k < cnt {
+        let arg: u32 = ast.child_at(b, off + k)
+        var v: u32 = value(l, arg)
+        let ft: u32 = e_fty(l, arg)
+        if ft != fir.T_U64 && ft != fir.T_I64 && ft != fir.T_PTR {
+            v = push(l, fir.O_CAST, fir.T_U64, v, 0, ft, 0, 0, 0)
+        }
+        vec_push[u32](&values, v)
+        k = k + 1
+    }
+    // ROUND 68: the output operands are ADDRESSES -- in source order as
+    // well, after the inputs.
+    var oaddr: Vec[u32] = vec_new[u32]()
+    var ko: u32 = n_in
+    while ko < cnt {
+        vec_push[u32](&oaddr, value(l, ast.child_at(b, off + ko)))
+        ko = ko + 1
+    }
+    // Argument block: first the (input register, value) pairs, then the
+    // (output register, address) pairs, then the clobbers.
+    let aoff: u32 = fir.arg_start(&(*l).f)
+    var k2: u32 = 0
+    while k2 < n_in {
+        fir.arg_add(&(*l).f, ast.asm_in_reg(b, blk, k2))
+        fir.arg_add(&(*l).f, vec_at[u32](&values, k2 as usize))
+        k2 = k2 + 1
+    }
+    vec_free[u32](&values)
+    var k5: u32 = 0
+    while k5 < n_out {
+        fir.arg_add(&(*l).f, ast.asm_out_reg(b, blk, k5))
+        fir.arg_add(&(*l).f, vec_at[u32](&oaddr, k5 as usize))
+        k5 = k5 + 1
+    }
+    vec_free[u32](&oaddr)
+    let cz: u32 = ast.asm_clob_count(b, blk)
+    var k3: u32 = 0
+    while k3 < cz {
+        fir.arg_add(&(*l).f, ast.asm_clob(b, blk, k3))
+        k3 = k3 + 1
+    }
+    let template: u32 = ast.asm_template(b, blk)
+    var out: u32 = ast.asm_out(b, blk)
+    if out == ast.NOTHING {
+        out = fir.NONE
+    }
+    // The instruction has room for one number: the clobber count in the
+    // lower half, the ROUND 68 output count in the upper one.
+    let znum: u64 = cz as u64 | ((n_out as u64) << 32)
+    if out == fir.NONE {
+        push_void(l, fir.O_ASM, fir.T_VOID, template, out, 0, znum, aoff, n_in)
+        return 0
+    }
+    return push(l, fir.O_ASM, fir.T_U64, template, out, 0, znum, aoff, n_in)
+}
+
+// ROUND 70 (lower::fmt_target) -- the SAME resolution as in the type check,
+// derived from the same material: the type of the interpolated expression.
+// Returns the new name or NONE.
+fn fmt_target(l: *mut Lower, name: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let it: *mut intern.Interner = names(l)
+    var vw: [u8; 9] = "fmt_value"
+    let n: usize = intern.intern_length(it, name)
+    if n < 9 {
+        return NONE
+    }
+    let p: u64 = intern.intern_ptr(it, name)
+    if !rt.mem_eq(p + (n - 9) as u64, (&vw[0]) as u64, 9) {
+        return NONE
+    }
+    if ast.e_c(b, e) != 2 {
+        return NONE
+    }
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+    let t: u32 = sema.sema_ty(sm(l), arg)
+    if types.str_like(tf(l), t) {
+        var w1: [u8; 7] = "fmt_str"
+        return fmt_join(l, p, n - 9, (&w1[0]) as u64, 7)
+    }
+    if types.ty_kind(tf(l), t) == types.K_BOOL {
+        var w2: [u8; 8] = "fmt_bool"
+        return fmt_join(l, p, n - 9, (&w2[0]) as u64, 8)
+    }
+    if types.ty_kind(tf(l), t) == types.K_F64 {
+        var w3: [u8; 7] = "fmt_f64"
+        return fmt_join(l, p, n - 9, (&w3[0]) as u64, 7)
+    }
+    if types.ty_kind(tf(l), t) == types.K_F32 {
+        var w6: [u8; 7] = "fmt_f32"
+        return fmt_join(l, p, n - 9, (&w6[0]) as u64, 7)
+    }
+    if !types.is_int(tf(l), t) {
+        return NONE
+    }
+    if !types.is_sign(tf(l), t) {
+        var w4: [u8; 7] = "fmt_u64"
+        return fmt_join(l, p, n - 9, (&w4[0]) as u64, 7)
+    }
+    var w5: [u8; 10] = "fmt_number"
+    return fmt_join(l, p, n - 9, (&w5[0]) as u64, 10)
+}
+
+fn fmt_join(l: *mut Lower, head: u64, hn: usize, step: u64, sn: usize) -> u32 {
+    var b2: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&b2)
+    rt.buf_push_bytes(&b2, head, hn)
+    rt.buf_push_bytes(&b2, step, sn)
+    return intern.intern_number(names(l), rt.buf_ptr(&b2), rt.buf_len(&b2)) as u32
+}
+
+// ROUND 70 -- a call of a `str` runtime function.
+//
+// Both signatures are known and simple: two `str` (16 octets, System V
+// class INTEGER with two words each) go in, either a `bool` comes out
+// (`__str_eq`) or a `str` through the hidden pointer (`__str_concat`,
+// aggregate over 8 octets -> sret). The sequence is EXACTLY the one
+// `lower_call` in stage 0 produces, so the FIR of both compilers matches.
+fn str_call(l: *mut Lower, name: u32, args: *mut Vec[u32], dest: u32) -> u32 {
+    var tmp: Vec[u32] = vec_new[u32]()
+    if dest != NONE {
+        vec_push[u32](&tmp, dest)
+    }
+    var i: usize = 0
+    while i < vec_len[u32](args) {
+        let addr: u32 = address(l, vec_at[u32](args, i))
+        words_load(l, addr, 16, 2, &tmp)
+        i = i + 1
+    }
+    let cnt: u32 = vec_len[u32](&tmp) as u32
+    let off: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+    if dest != NONE {
+        push(l, fir.O_CALL, fir.T_PTR, name, 0, 0, 0, off, cnt)
+        return 0
+    }
+    return push(l, fir.O_CALL, fir.T_BOOL, name, 0, 0, 0, off, cnt)
+}
+
+// ROUND 70 -- the runtime function of the `str` operators.
+fn str_fn(l: *mut Lower, which: u32) -> u32 {
+    var eqw: [u8; 8] = "__str_eq"
+    var caw: [u8; 12] = "__str_concat"
+    if which == 0 {
+        return intern.intern_number(names(l), (&eqw[0]) as u64, 8) as u32
+    }
+    return intern.intern_number(names(l), (&caw[0]) as u64, 12) as u32
+}
+
+fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    var name: u32 = ast.e_a(b, e)
+    // HOOK str: `f"{x}"` -- the step is derived from the type of the
+    // argument, exactly as in the type check (round 70).
+    let fmt_real: u32 = fmt_target(l, name, e)
+    if fmt_real != NONE {
+        name = fmt_real
+    }
+    // HOOK gc (gc_lower.rs::hook_call): allocation, intrinsics, `as?` -- and
+    // `weak`/`strong` are runtime functions (`real_name`).
+    // ROUND 52 (core.rs): inline assembly and MMIO.
+    let anr: u32 = core.asm_number(names(l), name)
+    if anr != core.NO_NUMBER {
+        return asm_lower(l, anr, e)
+    }
+    if fn_number(l, name) == NONE {
+        let wl: u32 = core.mmio_read_width(names(l), name)
+        if wl != core.NO_WIDTH {
+            let ad: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+            return push(l, fir.O_MMIOLD, mmio_fty(wl), ad, 0, 0, 0, 0, 0)
+        }
+        let ws: u32 = core.mmio_write_width(names(l), name)
+        if ws != core.NO_WIDTH {
+            let ad2: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+            let wv: u32 = value(l, ast.child_at(b, ast.e_b(b, e) + 1))
+            push_void(l, fir.O_MMIOST, mmio_fty(ws), ad2, wv, 0, 0, 0, 0)
+            return 0
+        }
+    }
+    // ROUND 49 (thread.rs): create thread, TLS self pointer, compare and swap.
+    var fstw: [u8; 14] = "__thread_start"
+    if intern.intern_equal(names(l), name, (&fstw[0]) as u64, 14) && fn_number(l, name) == NONE {
+        let arg0: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+        let arg1: u32 = value(l, ast.child_at(b, ast.e_b(b, e) + 1))
+        let arg2: u32 = value(l, ast.child_at(b, ast.e_b(b, e) + 2))
+        return push(l, fir.O_SPAWN, fir.T_I64, arg0, arg1, arg2, 0, 0, 0)
+    }
+    var fslw: [u8; 13] = "__thread_self"
+    if intern.intern_equal(names(l), name, (&fslw[0]) as u64, 13) && fn_number(l, name) == NONE {
+        return push(l, fir.O_TLS, fir.T_PTR, 0, 0, 0, 0, 0, 0)
+    }
+    var atcw: [u8; 13] = "__atomic_swap"
+    if intern.intern_equal(names(l), name, (&atcw[0]) as u64, 13) && fn_number(l, name) == NONE {
+        let cp: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+        let cea: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+        let cna: u32 = ast.child_at(b, ast.e_b(b, e) + 2)
+        var ce: u32 = value(l, cea)
+        var cn: u32 = value(l, cna)
+        let cet: u32 = e_fty(l, cea)
+        if cet != fir.T_U64 && cet != fir.T_I64 {
+            ce = push(l, fir.O_CAST, fir.T_U64, ce, 0, cet, 0, 0, 0)
+        }
+        let cnt: u32 = e_fty(l, cna)
+        if cnt != fir.T_U64 && cnt != fir.T_I64 {
+            cn = push(l, fir.O_CAST, fir.T_U64, cn, 0, cnt, 0, 0, 0)
+        }
+        return push(l, fir.O_ATOMCAS, fir.T_U64, cp, ce, cn, 0, 0, 0)
+    }
+    // `__atomic_add(p, delta)` (atomic.rs, ROUND 47): Op::AtomicAdd.
+    var atw: [u8; 12] = "__atomic_add"
+    if intern.intern_equal(names(l), name, (&atw[0]) as u64, 12) && fn_number(l, name) == NONE {
+        let padr: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+        let darg: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+        var dv: u32 = value(l, darg)
+        let dft: u32 = e_fty(l, darg)
+        if dft != fir.T_U64 && dft != fir.T_I64 {
+            dv = push(l, fir.O_CAST, fir.T_U64, dv, 0, dft, 0, 0, 0)
+        }
+        return push(l, fir.O_ATOMADD, fir.T_U64, padr, dv, 0, 0, 0, 0)
+    }
+    if has_gc(l) && ast.e_number(b, e) == 0 {
+        if gc.gc_has_new_prefix(names(l), name) {
+            var z: u32 = target
+            if z == fir.NONE {
+                let t: u32 = sema.sema_ty(sm(l), e)
+                z = alloca(l, q_size(l, t), q_align(l, t))
+            }
+            gc_alloc_lower(l, e, z)
+            return 0
+        }
+        let zn: u32 = gc.gc_state_name(names(l), name)
+        if zn != 0 {
+            var regs: u64 = 0
+            if zn == 2 {
+                regs = 1
+            }
+            return push(l, fir.O_GCADDR, fir.T_PTR, 0, 0, 0, regs, 0, 0)
+        }
+        if gc.gc_has_as_prefix(names(l), name) {
+            let ki_i: i64 = gc.gc_class_out_as(gcl(l), names(l), name)
+            if ki_i < 0 {
+                give_up(l)
+                return 0
+            }
+            let arg: u32 = ast.child_at(b, ast.e_b(b, e))
+            let pv: u32 = value(l, arg)
+            let tidv: u32 = constant(l, fir.T_U64, gc.gc_tid(gcl(l), ki_i as u32))
+            var an: [u8; 11] = "__gc_as_raw"
+            let ann: u32 = intern.intern_number(names(l), (&an[0]) as u64, 11) as u32
+            var tmp: Vec[u32] = vec_new[u32]()
+            vec_push[u32](&tmp, pv)
+            vec_push[u32](&tmp, tidv)
+            let aoff: u32 = args_store(l, &tmp)
+            vec_free[u32](&tmp)
+            return push(l, fir.O_CALL, fir.T_PTR, ann, 0, 0, 0, aoff, 2)
+        }
+        // `barrier(x)` (ct.rs): opaque for the optimizer -- this stage
+        // has none, so it stays the identity.
+        var bw: [u8; 7] = "barrier"
+        if intern.intern_equal(names(l), name, (&bw[0]) as u64, 7) && fn_number(l, name) == NONE {
+            return value(l, ast.child_at(b, ast.e_b(b, e)))
+        }
+        // `select(condition, a, b)` (ct.rs::lower_ct_call, ROUND 36): the
+        // FIR instruction Op::Select -- the code generator makes a `cmov`
+        // out of it, not a branch (SPEC 9.2).
+        var sw2: [u8; 6] = "select"
+        if intern.intern_equal(names(l), name, (&sw2[0]) as u64, 6) && fn_number(l, name) == NONE {
+            let aa: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+            let sty: u32 = e_fty(l, aa)
+            let cond: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+            let av: u32 = value(l, aa)
+            let bv: u32 = value(l, ast.child_at(b, ast.e_b(b, e) + 2))
+            return push(l, fir.O_SELECT, sty, cond, av, bv, 0, 0, 0)
+        }
+        // `secure_zero(pointer, count)` (ct.rs, ROUND 36): Op::SecureZero;
+        // the byte count is needed as u64 (a `cast` -- narrower integers
+        // are sign extended correctly).
+        var sz: [u8; 11] = "secure_zero"
+        if intern.intern_equal(names(l), name, (&sz[0]) as u64, 11) && fn_number(l, name) == NONE {
+            let narg: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+            let zadr: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+            var nv: u32 = value(l, narg)
+            let nft: u32 = e_fty(l, narg)
+            if nft != fir.T_U64 && nft != fir.T_I64 {
+                nv = push(l, fir.O_CAST, fir.T_U64, nv, 0, nft, 0, 0, 0)
+            }
+            push_void(l, fir.O_SECZERO, fir.T_VOID, zadr, nv, 0, 0, 0, 0)
+            return 0
+        }
+        // `weak`/`strong` -- a USER function of the same name wins.
+        if fn_number(l, name) == NONE {
+            if gc.gc_is_weak_name(names(l), name) {
+                var wn: [u8; 13] = "__gc_weak_raw"
+                name = intern.intern_number(names(l), (&wn[0]) as u64, 13) as u32
+            }
+            if gc.gc_is_strong_name(names(l), name) {
+                var sn2: [u8; 15] = "__gc_strong_raw"
+                name = intern.intern_number(names(l), (&sn2[0]) as u64, 15) as u32
+            }
+        }
+    }
+    // HOOK impl (impls.rs, round 45): `x.m(a)` sits in the tree as
+    // `"method m"`. The target is derived AGAIN here -- from the type of the
+    // receiver and the method name, exactly as in the type checker. There is
+    // deliberately no side table between the phases.
+    var recv_addr: bool = false
+    // ROUND 58 (fnval.rs): the callee sits in a VARIABLE of function type.
+    // Word 0 of the function record is the code address; the record itself
+    // goes in as the LAST argument, so that a closure body finds its
+    // captured values there (a named function never reads it). ROUND 68
+    // fills the same three variables when the callee sits in a FIELD.
+    var indirect: bool = false
+    var v_code: u32 = 0
+    var v_rec: u32 = 0
+    var v_fnty: u32 = NONE
+    // ROUND 68: with a function value out of a field the receiver drops out
+    // of the argument list -- it is only the place the value is read from.
+    var skip_recv: bool = false
+    // HOOK iface (iface.rs::lower_dispatch, round 46): `f.m(a)` on a
+    // `dyn I`. `target` holds the address from the method table, `data` the
+    // pointer to the value; everything else -- aggregates, hidden
+    // return pointer, stack arguments -- then runs through exactly the same
+    // code as an ordinary call.
+    var dispatch: bool = false
+    var v_target: u32 = 0
+    var v_data: u32 = 0
+    var v_rt: u32 = 0
+    if has_if(l) && is_method_call(names(l), name) {
+        let recv0: u32 = ast.child_at(b, ast.e_b(b, e))
+        let et0: u32 = sema.sema_ty(sm(l), recv0)
+        let sn0: u32 = recv_struct_l(l, et0)
+        if sn0 != NONE {
+            let ii: u32 = iface.if_of_dyn(ifl(l), sn0)
+            if ii != NONE {
+                let m0: u32 = intern.intern_ab(names(l), name, 7)
+                let mk: u32 = iface.if_slot(ifl(l), ii as usize, m0)
+                if mk == NONE {
+                    give_up(l)
+                    return 0
+                }
+                let base: u32 = address(l, recv0)
+                v_data = load(l, fir.T_PTR, ptradd_const(l, base, 0))
+                let table: u32 = load(l, fir.T_PTR, ptradd_const(l, base, 8))
+                v_target = load(l, fir.T_PTR, ptradd_const(l, table, 8 * mk as u64))
+                v_rt = iface.if_rtyp(ifl(l), ii as usize, mk)
+                dispatch = true
+            }
+        }
+    }
+    if !dispatch && is_method_call(names(l), name) {
+        let recv: u32 = ast.child_at(b, ast.e_b(b, e))
+        let et: u32 = sema.sema_ty(sm(l), recv)
+        let sn: u32 = recv_struct_l(l, et)
+        if sn == NONE {
+            give_up(l)
+            return 0
+        }
+        let m: u32 = intern.intern_ab(names(l), name, 7)
+        name = method_target_l(l, sn, m, et)
+        let mf: u32 = fn_number(l, name)
+        if mf == NONE {
+            // ROUND 68 (impls.rs::field_fn): a FIELD of the receiver
+            // holding a function value. The receiver is evaluated FIRST --
+            // the same order as for an ordinary method call.
+            let fv: u32 = field_fn_ty_l(l, et, m)
+            if fv == NONE {
+                give_up(l)
+                return 0
+            }
+            let si: u32 = recv_struct_index(l, et)
+            var base2: u32 = 0
+            if types.is_ptr(tf(l), et) {
+                base2 = value(l, recv)
+            } else {
+                base2 = address(l, recv)
+            }
+            let fa: u32 = ptradd_const(l, base2, field_offset(l, si as usize, m))
+            v_rec = load(l, fir.T_PTR, fa)
+            v_code = load(l, fir.T_PTR, v_rec)
+            v_fnty = fv
+            indirect = true
+            skip_recv = true
+        } else if ast.fn_plen(b, mf as usize) > 0 {
+            let p0: u32 = types.param_ty_resolved(tf(l), mf as usize, 0)
+            recv_addr = types.is_ptr(tf(l), p0) && !types.is_ptr(tf(l), et)
+        }
+    }
+    var rt2: u32 = 0
+    if dispatch {
+        rt2 = v_rt
+    } else if indirect {
+        rt2 = types.ty_a(tf(l), v_fnty)
+    } else {
+        let lt: u32 = local_ty(l, name)
+        if lt != NONE && lt != 0 {
+            if types.ty_kind(tf(l), lt) == types.K_FN {
+                let fslot: u32 = search(l, name)
+                if fslot == NONE {
+                    give_up(l)
+                    return 0
+                }
+                v_rec = load(l, fir.T_PTR, fslot)
+                v_code = load(l, fir.T_PTR, v_rec)
+                v_fnty = lt
+                indirect = true
+                rt2 = types.ty_a(tf(l), lt)
+            }
+        }
+        if !indirect {
+            let fnr: u32 = fn_number(l, name)
+            if fnr == NONE {
+                give_up(l)
+                return 0
+            }
+            rt2 = types.ret_ty_the_func(tf(l), fnr as usize)
+        }
+    }
+    let ret_agg: bool = is_aggregate(l, rt2)
+    let sret: bool = abi_sret(l, rt2)
+
+    var tmp: Vec[u32] = vec_new[u32]()
+    var agg_slot: u32 = fir.NONE
+    if ret_agg {
+        if target != fir.NONE {
+            agg_slot = target
+        } else {
+            agg_slot = alloca(l, q_size(l, rt2), q_align(l, rt2))
+        }
+    }
+    if sret {
+        vec_push[u32](&tmp, agg_slot)
+    }
+    var k: u32 = 0
+    while k < ast.e_c(b, e) {
+        let arg: u32 = ast.child_at(b, ast.e_b(b, e) + k)
+        // ROUND 68: the receiver of a function value out of a field is no
+        // argument -- it has already been read above.
+        if k == 0 && skip_recv {
+            k = k + 1
+            continue
+        }
+        // HOOK iface: the receiver is the data pointer from the fat
+        // pointer -- it has already been read above (iface.fi).
+        if k == 0 && dispatch {
+            vec_push[u32](&tmp, v_data)
+            k = k + 1
+            continue
+        }
+        // HOOK impl: the receiver goes there as ADDRESS (impls.rs).
+        if k == 0 && recv_addr {
+            vec_push[u32](&tmp, address(l, arg))
+            k = k + 1
+            continue
+        }
+        var at: u32 = sema.sema_ty(sm(l), arg)
+        // HOOK error unions (lower_errors.rs::hook_arg_type): an implicitly
+        // converted argument crosses the boundary as an aggregate.
+        if has_fe(l) {
+            let cu: u32 = err.error_coerce_open(fel(l), arg)
+            if cu != NONE {
+                at = err.error_union_ty(fel(l), tf(l), cu)
+            }
+        }
+        if !is_aggregate(l, at) {
+            var v: u32 = value(l, arg)
+            // ROUND 70: a narrower integer is widened to the width of the
+            // parameter. Until now argument and parameter always had the
+            // same type; `f"{x}"` with an i32 is the first place where an
+            // i32 meets an i64 parameter (`io.fmt_number`).
+            if !indirect && !dispatch {
+                let fnw: u32 = fn_number(l, name)
+                if fnw != NONE && k < ast.fn_plen(b, fnw as usize) {
+                    let pt: u32 = types.param_ty_resolved(tf(l), fnw as usize, k)
+                    if types.is_int(tf(l), at) && types.is_int(tf(l), pt) {
+                        if types.bits_of(tf(l), pt) > types.bits_of(tf(l), at) {
+                            let want: u32 = fty(l, pt)
+                            let have: u32 = fty(l, at)
+                            if want != fir.NONE && have != fir.NONE && want != have {
+                                v = push(l, fir.O_CAST, want, v, 0, have, 0, 0, 0)
+                            }
+                        }
+                    }
+                }
+            }
+            vec_push[u32](&tmp, v)
+            k = k + 1
+            continue
+        }
+        let gr: u64 = q_size(l, at)
+        let kl: u32 = abi_class(l, at)
+        if kl != fir.NONE {
+            let addr: u32 = address(l, arg)
+            words_load_cls(l, addr, gr, kl, at, &tmp)
+        } else {
+            // Memory class: a hidden pointer to a copy made by the caller.
+            let t: u32 = alloca(l, gr, q_align(l, at))
+            write_after(l, t, arg)
+            vec_push[u32](&tmp, t)
+        }
+        k = k + 1
+    }
+    if indirect {
+        vec_push[u32](&tmp, v_rec)
+    }
+    let cnt: u32 = vec_len[u32](&tmp) as u32
+    let off: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+
+    var call_kind: u32 = fir.O_CALL
+    var call_target: u32 = name
+    if dispatch {
+        call_kind = fir.O_CALLI
+        call_target = v_target
+    }
+    if indirect {
+        call_kind = fir.O_CALLI
+        call_target = v_code
+    }
+    if ret_agg {
+        let gr: u64 = types.size_of(tf(l), rt2)
+        if sret {
+            push(l, call_kind, fir.T_PTR, call_target, 0, 0, 0, off, cnt)
+        } else {
+            // ROUND 71: an aggregate of at most 8 bytes comes back in
+            // `rax` -- or in `xmm0`, if its eightbyte is of the SSE class.
+            let w: u32 = push(l, call_kind, word_fty(l, rt2, 0), call_target, 0, 0, 0, off, cnt)
+            words_store(l, agg_slot, gr, w)
+        }
+        return 0
+    }
+    let ft: u32 = fty(l, rt2)
+    if ft == fir.T_VOID {
+        push_void(l, call_kind, ft, call_target, 0, 0, 0, off, cnt)
+        return 0
+    }
+    return push(l, call_kind, ft, call_target, 0, 0, 0, off, cnt)
+}
+
+fn call_with_target(l: *mut Lower, e: u32, target: u32) {
+    call_full(l, e, target)
+}
+
+fn call(l: *mut Lower, e: u32, ft: u32) -> u32 {
+    // `size_of[T]()` leaves NOTHING at run time: it is a constant.
+    let z: u64 = ast.e_number(tree(l), e)
+    if z != 0 {
+        let t: u32 = types.resolve(tf(l), tree(l), names(l), (z - 1) as u32)
+        return constant(l, fir.T_U64, types.size_of(tf(l), t))
+    }
+    return call_full(l, e, fir.NONE)
+}
+
+fn fn_number(l: *mut Lower, name: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        if ast.fn_name(b, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// -------------------------------------------------------------- statements
+
+fn stmt(l: *mut Lower, i: u32) {
+    if (*l).unsuitable {
+        return
+    }
+    let b: *mut ast.Tree = tree(l)
+    let a: u32 = ast.s_kind(b, i)
+
+    if a == ast.S_LET || a == ast.S_VAR {
+        let init: u32 = ast.s_c(b, i)
+        // HOOK error unions (lower_errors.rs::hook_let): the implicit
+        // conversion writes the union into the new slot itself.
+        if has_fe(l) {
+            let cu: u32 = err.error_coerce_open(fel(l), init)
+            if cu != NONE {
+                let us: usize = err.error_u_sidx(fel(l), cu) as usize
+                var g: u64 = types.st_size(tf(l), us)
+                if g < 1 { g = 1 }
+                var al: u64 = types.st_alignment(tf(l), us)
+                if al < 1 { al = 1 }
+                let slot: u32 = alloca(l, g, al)
+                union_write(l, slot, init, cu)
+                create(l, ast.s_a(b, i), slot)
+                return
+            }
+        }
+        // ROUND 71: `let w: f64 = x_f32` makes an f64 variable, not a four
+        // byte one -- the initialiser hands out an f64.
+        let t: u32 = out_ty(l, init)
+        if !is_aggregate(l, t) {
+            let ft: u32 = fty(l, t)
+            if ft == fir.NONE || ft == fir.T_VOID {
+                give_up(l)
+                return
+            }
+        }
+        let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+        write_after(l, slot, init)
+        create_ty(l, ast.s_a(b, i), slot, t)
+        return
+    }
+    if a == ast.S_ZUW {
+        let addr: u32 = address(l, ast.s_a(b, i))
+        write_after(l, addr, ast.s_b(b, i))
+        // HOOK gc (gc_lower.rs::hook_assign): the insertion barrier AFTER
+        // writing a Gc pointer into a heap field.
+        if has_gc(l) {
+            gc_barrier(l, ast.s_a(b, i))
+        }
+        return
+    }
+    // ROUND 70 (lower.rs) -- `x op= e`.
+    //
+    // THE POINT OF THE WHOLE THING stands in the first line: the address of
+    // the target is computed EXACTLY ONCE. With `a[f()] += 1` a rewrite into
+    // `a[f()] = a[f()] + 1` would run `f()` twice.
+    //
+    // Everything after that is what `x = x op e` produces anyway: load, the
+    // same FIR operation, store.
+    if a == ast.S_ZUWOP {
+        let target: u32 = ast.s_a(b, i)
+        let value: u32 = ast.s_b(b, i)
+        let op: u32 = ast.s_c(b, i)
+        let addr: u32 = address(l, target)
+        let t: u32 = sema.sema_ty(sm(l), target)
+        // `s += x` on `str`: the collector builds the new octets. The
+        // target is PINNED, so that passing it as an argument does not
+        // compute its address a second time.
+        if types.str_like(tf(l), t) {
+            pin_set(l, target, addr)
+            var cargs: Vec[u32] = vec_new[u32]()
+            vec_push[u32](&cargs, target)
+            vec_push[u32](&cargs, value)
+            str_call(l, str_fn(l, 1), &cargs, addr)
+            vec_free[u32](&cargs)
+            pin_clear(l)
+            return
+        }
+        let ft: u32 = e_fty(l, target)
+        let cur: u32 = load(l, ft, addr)
+        var rhs: u32 = value(l, value)
+        if op == 8 || op == 9 {
+            // The shift amount is brought to the width of the left operand
+            // -- the same line as in `binary`.
+            let bt: u32 = e_fty(l, value)
+            if bt != ft {
+                rhs = push(l, fir.O_CAST, ft, rhs, 0, bt, 0, 0, 0)
+            }
+        }
+        let res: u32 = push(l, fir.O_BIN, ft, cur, rhs, op, 0, 0, 0)
+        store(l, ft, addr, res)
+        if has_gc(l) {
+            gc_barrier(l, target)
+        }
+        return
+    }
+    // ROUND 70 -- `x++` / `x--`: load, plus/minus one, store. The address is
+    // computed once here as well.
+    if a == ast.S_STEP {
+        let target: u32 = ast.s_a(b, i)
+        let addr: u32 = address(l, target)
+        let ft: u32 = e_fty(l, target)
+        let cur: u32 = load(l, ft, addr)
+        let one: u32 = constant(l, ft, 1)
+        var bop: u32 = 1
+        if ast.s_b(b, i) == 1 {
+            bop = 0
+        }
+        let res: u32 = push(l, fir.O_BIN, ft, cur, one, bop, 0, 0, 0)
+        store(l, ft, addr, res)
+        return
+    }
+    if a == ast.S_EXPR {
+        let e: u32 = ast.s_a(b, i)
+        let ea: u32 = ast.e_kind(b, e)
+        // HOOK error unions (lower_errors.rs::hook_stmt): `try`/`catch`/
+        // error value as a statement -- the value is discarded, the path
+        // to it stays.
+        if ea == ast.E_CALL && has_fe(l) && ast.e_number(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            if err.error_is_tryname(names(l), nm) {
+                try_address(l, e)
+                return
+            }
+            if err.error_is_catchname(names(l), nm) {
+                catch_slot(l, e)
+                return
+            }
+            let cc: i64 = err.error_ctor_code((*l).feh, names(l), nm)
+            if cc >= 0 {
+                let t: u32 = sema.sema_ty(sm(l), e)
+                let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+                let cv: u32 = constant(l, fir.T_U32, cc as u64)
+                store(l, fir.T_U32, slot, cv)
+                return
+            }
+        }
+        if ea == ast.E_CALL && has_mu(l) && ast.e_number(b, e) == 0 {
+            // HOOK enum/match (lower_match.rs::lower_types_stmt).
+            let nm: u32 = ast.e_a(b, e)
+            if pattern.pat_is_matchname(names(l), nm) {
+                match_lower(l, pattern.pat_match_number(names(l), nm))
+                return
+            }
+            if pattern.pat_is_ctorname(names(l), nm) {
+                // The value is discarded but still needs a slot.
+                let t: u32 = sema.sema_ty(sm(l), e)
+                let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+                ctor_write(l, e, slot)
+                return
+            }
+        }
+        if ea == ast.E_CALL {
+            let t: u32 = sema.sema_ty(sm(l), e)
+            if is_aggregate(l, t) {
+                // The result is discarded but still needs a slot.
+                let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+                call_with_target(l, e, slot)
+                return
+            }
+            call(l, e, fty(l, t))
+            return
+        }
+        if ea == ast.E_SYSCALL {
+            value(l, e)
+            return
+        }
+        value(l, e)
+        return
+    }
+    if a == ast.S_BLOCK {
+        block(l, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_RET {
+        let wv: u32 = ast.s_a(b, i)
+        if wv == ast.NOTHING {
+            defer_to(l, 0)
+            term(l, fir.TERM_RET, NONE, 0, 0)
+        } else {
+            // HONEST LIMIT (SPEC 14.1 F5, lower.rs): returning a FINISHED
+            // error union while an `errdefer` is active -- only at run time
+            // would it be settled whether this is the error path.
+            // Rejected rather than quietly ignored. With a conversion
+            // (`return E::Variant`, `return value`) the type of `wv` is the
+            // SOURCE type and this condition does not fire.
+            if has_fe(l) && has_errdefer(l) {
+                let rt0: u32 = sema.sema_ty(sm(l), wv)
+                if err.error_union_of_ty(fel(l), tf(l), rt0) != NONE {
+                    (*l).err = (*l).err + 1
+                    return
+                }
+            }
+            // HOOK error unions (lower_errors.rs::hook_return): the
+            // implicit conversion at 'return'.
+            var converted: bool = false
+            if has_fe(l) {
+                let cu: u32 = err.error_coerce_open(fel(l), wv)
+                if cu != NONE {
+                    error_return(l, wv, cu)
+                    converted = true
+                }
+            }
+            if !converted {
+                let t: u32 = sema.sema_ty(sm(l), wv)
+                if is_aggregate(l, t) {
+                    // Aggregate return per `abi`: through the hidden pointer
+                    // or in ONE word.
+                    let gr: u64 = types.size_of(tf(l), t)
+                    if (*l).sret != NONE {
+                        write_after(l, (*l).sret, wv)
+                        defer_to(l, 0)
+                        term(l, fir.TERM_RET, (*l).sret, 0, 0)
+                    } else {
+                        let addr: u32 = address(l, wv)
+                        var w: Vec[u32] = vec_new[u32]()
+                        // ROUND 71: the single eightbyte keeps its class.
+                        words_load_cls(l, addr, gr, 1, t, &w)
+                        let w0: u32 = vec_at[u32](&w, 0)
+                        vec_free[u32](&w)
+                        defer_to(l, 0)
+                        term(l, fir.TERM_RET, w0, 0, 0)
+                    }
+                } else {
+                    let v: u32 = value(l, wv)
+                    defer_to(l, 0)
+                    term(l, fir.TERM_RET, v, 0, 0)
+                }
+            }
+        }
+        // Everything after this is unreachable: open a new block, so that the
+        // guarantee "one terminator per block" holds.
+        (*l).cur = new_block(l)
+        return
+    }
+    if a == ast.S_IF {
+        let c: u32 = value(l, ast.s_a(b, i))
+        let then: u32 = new_block(l)
+        let els: u32 = new_block(l)
+        let join: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, c, then, els)
+        (*l).cur = then
+        block(l, ast.s_b(b, i))
+        if !terminated(l) {
+            term(l, fir.TERM_BR, join, 0, 0)
+        }
+        (*l).cur = els
+        if ast.s_c(b, i) != ast.NOTHING {
+            stmt(l, ast.s_c(b, i))
+        }
+        if !terminated(l) {
+            term(l, fir.TERM_BR, join, 0, 0)
+        }
+        (*l).cur = join
+        return
+    }
+    if a == ast.S_WHILE {
+        let header: u32 = new_block(l)
+        let body: u32 = new_block(l)
+        let end: u32 = new_block(l)
+        term(l, fir.TERM_BR, header, 0, 0)
+        (*l).cur = header
+        let c: u32 = value(l, ast.s_a(b, i))
+        term(l, fir.TERM_BRCOND, c, body, end)
+        (*l).cur = body
+        vec_push[u32](&(*l).l_break, end)
+        vec_push[u32](&(*l).l_cont, header)
+        vec_push[u32](&(*l).l_depth, vec_len[u32](&(*l).d_limit) as u32)
+        block(l, ast.s_b(b, i))
+        vec_pop[u32](&(*l).l_break)
+        vec_pop[u32](&(*l).l_cont)
+        vec_pop[u32](&(*l).l_depth)
+        if !terminated(l) {
+            term(l, fir.TERM_BR, header, 0, 0)
+        }
+        (*l).cur = end
+        return
+    }
+    if a == ast.S_FOR {
+        let t: u32 = sema.sema_ty(sm(l), ast.s_b(b, i))
+        let ft: u32 = fty(l, t)
+        if ft == fir.NONE || ft == fir.T_VOID {
+            give_up(l)
+            return
+        }
+        var bytes: u64 = fir.fty_bytes(ft)
+        if bytes < 1 { bytes = 1 }
+        let islot: u32 = alloca(l, bytes, bytes)
+        let sv: u32 = value(l, ast.s_b(b, i))
+        store(l, ft, islot, sv)
+        // The upper bound is evaluated ONCE.
+        let eslot: u32 = alloca(l, bytes, bytes)
+        let ev: u32 = value(l, ast.s_c(b, i))
+        store(l, ft, eslot, ev)
+
+        let header: u32 = new_block(l)
+        let body: u32 = new_block(l)
+        let step: u32 = new_block(l)
+        let end: u32 = new_block(l)
+        term(l, fir.TERM_BR, header, 0, 0)
+
+        (*l).cur = header
+        let iv: u32 = load(l, ft, islot)
+        let lim: u32 = load(l, ft, eslot)
+        let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, iv, lim, 2, ft as u64, 0, 0)
+        term(l, fir.TERM_BRCOND, c, body, end)
+
+        (*l).cur = body
+        range_on(l)
+        create(l, ast.s_a(b, i), islot)
+        vec_push[u32](&(*l).l_break, end)
+        vec_push[u32](&(*l).l_cont, step)
+        vec_push[u32](&(*l).l_depth, vec_len[u32](&(*l).d_limit) as u32)
+        block(l, ast.s_d(b, i))
+        vec_pop[u32](&(*l).l_break)
+        vec_pop[u32](&(*l).l_cont)
+        vec_pop[u32](&(*l).l_depth)
+        range_off(l)
+        if !terminated(l) {
+            term(l, fir.TERM_BR, step, 0, 0)
+        }
+
+        (*l).cur = step
+        let iv2: u32 = load(l, ft, islot)
+        let one: u32 = constant(l, ft, 1)
+        let inc: u32 = push(l, fir.O_BIN, ft, iv2, one, 0, 0, 0, 0)
+        store(l, ft, islot, inc)
+        term(l, fir.TERM_BR, header, 0, 0)
+
+        (*l).cur = end
+        return
+    }
+    if a == ast.S_BREAK {
+        defer_to(l, vec_last[u32](&(*l).l_depth))
+        term(l, fir.TERM_BR, vec_last[u32](&(*l).l_break), 0, 0)
+        (*l).cur = new_block(l)
+        return
+    }
+    if a == ast.S_CONT {
+        defer_to(l, vec_last[u32](&(*l).l_depth))
+        term(l, fir.TERM_BR, vec_last[u32](&(*l).l_cont), 0, 0)
+        (*l).cur = new_block(l)
+        return
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        // Only RECORD it -- it runs when the block is left.
+        vec_push[u32](&(*l).d_stmt, ast.s_a(b, i))
+        if a == ast.S_ERRDEFER {
+            vec_push[u32](&(*l).d_err, 1)
+        } else {
+            vec_push[u32](&(*l).d_err, 0)
+        }
+        return
+    }
+}
+
+fn block(l: *mut Lower, bi: u32) {
+    let b: *mut ast.Tree = tree(l)
+    range_on(l)
+    defer_level_on(l)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        stmt(l, ast.slist_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+    // The deferred statements run BEFORE the scope is closed,
+    // so that the names of the block are still visible.
+    defer_level_off(l)
+    range_off(l)
+}
+
+// ------------------------------------------- enum/match (lower_match.rs)
+//
+// Port of the lowering of `match` and the enum constructors.
+// The result is a `switch` on the variant number (or on the integer
+// value); subpatterns are checked as a chain of comparisons BEHIND the
+// jump. The order of the produced instructions and blocks
+// is part of the contract -- `tools/fir_compare.sh` compares byte for byte.
+
+// Range patterns up to this width are expanded into single switch
+// keys; wider ones are checked with comparisons (MAX_RANGE_KEYS).
+const MAX_RANGE_MARKS: i64 = 256
+
+// Writes `Enum::Variant(a, b)` directly to the address `addr`.
+fn ctor_write(l: *mut Lower, e: u32, addr: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let m: *mut pattern.Pat = mul(l)
+    let t: u32 = sema.sema_ty(sm(l), e)
+    if types.ty_kind(tf(l), t) != types.K_STRUCT {
+        (*l).err = (*l).err + 1
+        return
+    }
+    let ei: u32 = pattern.pat_enum_at_struct(m, types.ty_a(tf(l), t))
+    if ei == NONE {
+        (*l).err = (*l).err + 1
+        return
+    }
+    // The variant name from the callee (after the first `::`).
+    let it: *mut intern.Interner = names(l)
+    let zp: u64 = intern.intern_ptr(it, ast.e_a(b, e))
+    let zn: usize = intern.intern_length(it, ast.e_a(b, e))
+    var vname: u32 = NONE
+    var i: usize = 0
+    while i + 1 < zn {
+        if rt.ld8(zp, i) == 58 as u8 && rt.ld8(zp, i + 1) == 58 as u8 {
+            vname = intern.intern_number(it, zp + (i + 2) as u64, zn - i - 2) as u32
+            break
+        }
+        i = i + 1
+    }
+    let vi: u32 = pattern.pat_variant_find(m, ei, vname)
+    if vi == NONE {
+        (*l).err = (*l).err + 1
+        return
+    }
+    // First the variant number, then the payload fields.
+    let tk: u32 = constant(l, fir.T_U32, pattern.pat_v_tag(m, vi) as u64)
+    store(l, fir.T_U32, addr, tk)
+    let roff: u32 = pattern.pat_v_roff(m, vi)
+    let cnt: u32 = ast.e_c(b, e)
+    var k: u32 = 0
+    while k < cnt {
+        let off: u64 = pattern.pat_rf_off(m, roff + k)
+        let ad: u32 = ptradd_const(l, addr, off)
+        write_after(l, ad, ast.child_at(b, ast.e_b(b, e) + k))
+        k = k + 1
+    }
+}
+
+// What an arm contributes to a key (ArmPlan in lower_match.rs):
+// pl_has = 0 means "a candidate for EVERY key", pl_test = 1 means
+// "more comparisons are needed after the key". The keys of an arm
+// are stored flat in `pk`.
+fn plan_arm(l: *mut Lower, pat: u32, sj_ei: u32,
+    pl_has: *mut Vec[u32], pl_test: *mut Vec[u32],
+    pl_off: *mut Vec[u32], pl_len: *mut Vec[u32], pk: *mut Vec[i64]) {
+    let m: *mut pattern.Pat = mul(l)
+    let a: u32 = pattern.pat_mu_kind(m, pat)
+    vec_push[u32](pl_off, vec_len[i64](pk) as u32)
+    if a == pattern.MU_WILD || a == pattern.MU_BIND {
+        vec_push[u32](pl_has, 0)
+        vec_push[u32](pl_test, 0)
+        vec_push[u32](pl_len, 0)
+        return
+    }
+    if a == pattern.MU_INT {
+        vec_push[u32](pl_has, 1)
+        vec_push[u32](pl_test, 0)
+        vec_push[i64](pk, pattern.pat_mu_lo(m, pat))
+        vec_push[u32](pl_len, 1)
+        return
+    }
+    if a == pattern.MU_BOOL {
+        vec_push[u32](pl_has, 1)
+        vec_push[u32](pl_test, 0)
+        vec_push[i64](pk, pattern.pat_mu_a(m, pat) as i64)
+        vec_push[u32](pl_len, 1)
+        return
+    }
+    if a == pattern.MU_RANGE {
+        let lo: i64 = pattern.pat_mu_lo(m, pat)
+        var last: i64 = pattern.pat_mu_hi(m, pat)
+        if pattern.pat_mu_a(m, pat) == 0 {
+            last = last - 1
+        }
+        let extent: i64 = last - lo + 1
+        if extent > 0 && extent <= MAX_RANGE_MARKS {
+            vec_push[u32](pl_has, 1)
+            vec_push[u32](pl_test, 0)
+            var v: i64 = lo
+            var n: u32 = 0
+            while v <= last {
+                vec_push[i64](pk, v)
+                n = n + 1
+                v = v + 1
+            }
+            vec_push[u32](pl_len, n)
+        } else {
+            vec_push[u32](pl_has, 0)
+            vec_push[u32](pl_test, 1)
+            vec_push[u32](pl_len, 0)
+        }
+        return
+    }
+    // MU_VARIANT: the key is the variant number; a further test if a
+    // subpattern is refutable.
+    let vi: u32 = pattern.pat_variant_find(m, sj_ei, pattern.pat_mu_b(m, pat))
+    var tag: i64 = 0 - 1
+    if vi != NONE {
+        tag = pattern.pat_v_tag(m, vi) as i64
+    }
+    vec_push[u32](pl_has, 1)
+    vec_push[i64](pk, tag)
+    vec_push[u32](pl_len, 1)
+    var test: u32 = 0
+    let soff: u32 = pattern.pat_mu_soff(m, pat)
+    let slen: u32 = pattern.pat_mu_slen(m, pat)
+    var k: u32 = 0
+    while k < slen {
+        if !pattern.pat_irrefutable(m, pattern.pat_mu_child(m, soff + k)) {
+            test = 1
+        }
+        k = k + 1
+    }
+    vec_push[u32](pl_test, test)
+}
+
+// The arms that are candidates for `key` (or for the catch all chain) --
+// in source order; after the first arm without a further test it stops.
+fn candidates(l: *mut Lower, pl_has: *mut Vec[u32], pl_test: *mut Vec[u32],
+    pl_off: *mut Vec[u32], pl_len: *mut Vec[u32], pk: *mut Vec[i64],
+    alen: u32, has_key: bool, key: i64, out: *mut Vec[u32]) {
+    var i: u32 = 0
+    while i < alen {
+        var fits: bool = false
+        if vec_at[u32](pl_has, i as usize) == 0 {
+            fits = true
+        } else if has_key {
+            let off: u32 = vec_at[u32](pl_off, i as usize)
+            let len: u32 = vec_at[u32](pl_len, i as usize)
+            var k: u32 = 0
+            while k < len {
+                if vec_at[i64](pk, (off + k) as usize) == key {
+                    fits = true
+                }
+                k = k + 1
+            }
+        }
+        if fits {
+            vec_push[u32](out, i)
+            if vec_at[u32](pl_test, i as usize) == 0 {
+                return
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Test of ONE subpattern at the address `addr`. On success control
+// falls through, on failure it jumps to `fail`.
+fn under_test(l: *mut Lower, addr: u32, pat: u32, ty: u32, fail: u32) {
+    let m: *mut pattern.Pat = mul(l)
+    let a: u32 = pattern.pat_mu_kind(m, pat)
+    if a == pattern.MU_WILD || a == pattern.MU_BIND {
+        return
+    }
+    if a == pattern.MU_INT {
+        let ft: u32 = fty(l, ty)
+        let av: u32 = load(l, ft, addr)
+        let bv: u32 = constant(l, ft, pattern.pat_mu_lo(m, pat) as u64)
+        let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, bv, 0, ft as u64, 0, 0)
+        let nb: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, c, nb, fail)
+        (*l).cur = nb
+        return
+    }
+    if a == pattern.MU_BOOL {
+        let av: u32 = load(l, fir.T_BOOL, addr)
+        let bv: u32 = constant(l, fir.T_BOOL, pattern.pat_mu_a(m, pat) as u64)
+        let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, bv, 0, fir.T_BOOL as u64, 0, 0)
+        let nb: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, c, nb, fail)
+        (*l).cur = nb
+        return
+    }
+    if a == pattern.MU_RANGE {
+        let ft: u32 = fty(l, ty)
+        var last: i64 = pattern.pat_mu_hi(m, pat)
+        if pattern.pat_mu_a(m, pat) == 0 {
+            last = last - 1
+        }
+        let av: u32 = load(l, ft, addr)
+        let k1: u32 = constant(l, ft, pattern.pat_mu_lo(m, pat) as u64)
+        let c1: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, k1, 5, ft as u64, 0, 0)
+        let nb: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, c1, nb, fail)
+        (*l).cur = nb
+        let k2: u32 = constant(l, ft, last as u64)
+        let c2: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, k2, 3, ft as u64, 0, 0)
+        let nb2: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, c2, nb2, fail)
+        (*l).cur = nb2
+        return
+    }
+    // MU_VARIANT: first the variant number, then the subpatterns.
+    if types.ty_kind(tf(l), ty) != types.K_STRUCT {
+        (*l).err = (*l).err + 1
+        return
+    }
+    let ei: u32 = pattern.pat_enum_at_struct(m, types.ty_a(tf(l), ty))
+    if ei == NONE {
+        (*l).err = (*l).err + 1
+        return
+    }
+    let vi: u32 = pattern.pat_variant_find(m, ei, pattern.pat_mu_b(m, pat))
+    if vi == NONE {
+        (*l).err = (*l).err + 1
+        return
+    }
+    let av: u32 = load(l, fir.T_U32, addr)
+    let bv: u32 = constant(l, fir.T_U32, pattern.pat_v_tag(m, vi) as u64)
+    let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, bv, 0, fir.T_U32 as u64, 0, 0)
+    let nb: u32 = new_block(l)
+    term(l, fir.TERM_BRCOND, c, nb, fail)
+    (*l).cur = nb
+    let soff: u32 = pattern.pat_mu_soff(m, pat)
+    let slen: u32 = pattern.pat_mu_slen(m, pat)
+    let roff: u32 = pattern.pat_v_roff(m, vi)
+    var k: u32 = 0
+    while k < slen {
+        let sub: u32 = pattern.pat_mu_child(m, soff + k)
+        if !pattern.pat_irrefutable(m, sub) {
+            let off: u64 = pattern.pat_rf_off(m, roff + k)
+            let ft: u32 = pattern.pat_rf_ty(m, roff + k)
+            let sa: u32 = ptradd_const(l, addr, off)
+            under_test(l, sa, sub, ft, fail)
+        }
+        k = k + 1
+    }
+}
+
+// The remaining tests of a pattern at the top level (emit_tests).
+fn pattern_tests(l: *mut Lower, base: u32, pat: u32, sj_ei: u32,
+    schl: u32, kft: u32, fail: u32) {
+    let m: *mut pattern.Pat = mul(l)
+    let a: u32 = pattern.pat_mu_kind(m, pat)
+    if a == pattern.MU_WILD || a == pattern.MU_BIND || a == pattern.MU_INT {
+        return
+    }
+    if a == pattern.MU_BOOL {
+        return
+    }
+    if a == pattern.MU_RANGE {
+        var last: i64 = pattern.pat_mu_hi(m, pat)
+        if pattern.pat_mu_a(m, pat) == 0 {
+            last = last - 1
+        }
+        // Compare the key directly (no load -- it is already there).
+        let k1: u32 = constant(l, kft, pattern.pat_mu_lo(m, pat) as u64)
+        let c1: u32 = push(l, fir.O_CMP, fir.T_BOOL, schl, k1, 5, kft as u64, 0, 0)
+        let nb: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, c1, nb, fail)
+        (*l).cur = nb
+        let k2: u32 = constant(l, kft, last as u64)
+        let c2: u32 = push(l, fir.O_CMP, fir.T_BOOL, schl, k2, 3, kft as u64, 0, 0)
+        let nb2: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, c2, nb2, fail)
+        (*l).cur = nb2
+        return
+    }
+    // MU_VARIANT: the key (the variant number) has already been checked;
+    // here only the subpatterns that are refutable.
+    let vi: u32 = pattern.pat_variant_find(m, sj_ei, pattern.pat_mu_b(m, pat))
+    if vi == NONE {
+        (*l).err = (*l).err + 1
+        return
+    }
+    let soff: u32 = pattern.pat_mu_soff(m, pat)
+    let slen: u32 = pattern.pat_mu_slen(m, pat)
+    let roff: u32 = pattern.pat_v_roff(m, vi)
+    var k: u32 = 0
+    while k < slen {
+        let sub: u32 = pattern.pat_mu_child(m, soff + k)
+        if !pattern.pat_irrefutable(m, sub) {
+            let off: u64 = pattern.pat_rf_off(m, roff + k)
+            let ft: u32 = pattern.pat_rf_ty(m, roff + k)
+            let sa: u32 = ptradd_const(l, base, off)
+            under_test(l, sa, sub, ft, fail)
+        }
+        k = k + 1
+    }
+}
+
+// The test chain for a key (emit_chain): tries the candidates in
+// source order; the last resort is `fallthrough`.
+fn chain(l: *mut Lower, mi: u32, cands: *mut Vec[u32],
+    pl_test: *mut Vec[u32], base: u32, schl: u32, kft: u32,
+    sj_ei: u32, body: *mut Vec[u32], fallthrough: u32) -> u32 {
+    let m: *mut pattern.Pat = mul(l)
+    let entry: u32 = new_block(l)
+    (*l).cur = entry
+    var ci: usize = 0
+    while ci < vec_len[u32](cands) {
+        let ai: u32 = vec_at[u32](cands, ci)
+        let body_bb: u32 = vec_at[u32](body, ai as usize)
+        if vec_at[u32](pl_test, ai as usize) == 0 {
+            term(l, fir.TERM_BR, body_bb, 0, 0)
+            return entry
+        }
+        let fail: u32 = new_block(l)
+        let aoff: u32 = pattern.pat_m_aoff(m, mi)
+        pattern_tests(l, base, pattern.pat_a_pat(m, aoff + ai), sj_ei, schl, kft, fail)
+        term(l, fir.TERM_BR, body_bb, 0, 0)
+        (*l).cur = fail
+        ci = ci + 1
+    }
+    term(l, fir.TERM_BR, fallthrough, 0, 0)
+    return entry
+}
+
+// Bindings of a pattern: every binding is the ADDRESS of the value
+// that matched (enum values live in memory).
+fn pattern_bind(l: *mut Lower, addr: u32, pat: u32, ty: u32, sj_ei: u32) {
+    let m: *mut pattern.Pat = mul(l)
+    let a: u32 = pattern.pat_mu_kind(m, pat)
+    if a == pattern.MU_BIND {
+        create(l, pattern.pat_mu_a(m, pat), addr)
+        return
+    }
+    if a == pattern.MU_VARIANT {
+        var ei: u32 = sj_ei
+        if ei == NONE {
+            if types.ty_kind(tf(l), ty) == types.K_STRUCT {
+                ei = pattern.pat_enum_at_struct(m, types.ty_a(tf(l), ty))
+            }
+        }
+        if ei == NONE {
+            return
+        }
+        let vi: u32 = pattern.pat_variant_find(m, ei, pattern.pat_mu_b(m, pat))
+        if vi == NONE {
+            return
+        }
+        let soff: u32 = pattern.pat_mu_soff(m, pat)
+        let slen: u32 = pattern.pat_mu_slen(m, pat)
+        let roff: u32 = pattern.pat_v_roff(m, vi)
+        var k: u32 = 0
+        while k < slen {
+            let off: u64 = pattern.pat_rf_off(m, roff + k)
+            let ft: u32 = pattern.pat_rf_ty(m, roff + k)
+            let sa: u32 = ptradd_const(l, addr, off)
+            pattern_bind(l, sa, pattern.pat_mu_child(m, soff + k), ft, NONE)
+            k = k + 1
+        }
+        return
+    }
+}
+
+// Lower the `match` with the number `mi` (lower_match in lower_match.rs).
+fn match_lower(l: *mut Lower, mi: u32) {
+    let m: *mut pattern.Pat = mul(l)
+    let b: *mut ast.Tree = tree(l)
+    if mi as usize >= pattern.pat_match_count(m) {
+        (*l).err = (*l).err + 1
+        return
+    }
+    let subj: u32 = pattern.pat_m_subj(m, mi)
+    let sty: u32 = sema.sema_ty(sm(l), subj)
+    var sj_ei: u32 = NONE
+    if types.ty_kind(tf(l), sty) == types.K_STRUCT {
+        sj_ei = pattern.pat_enum_at_struct(m, types.ty_a(tf(l), sty))
+    }
+
+    // Work out the key value and the address of the subject. An enum
+    // lives in memory: the key is the loaded variant number (u32).
+    // Otherwise the value itself is the key, and the address is a
+    // scratch slot for possible bindings.
+    var base: u32 = 0
+    var schl: u32 = 0
+    var kft: u32 = fir.T_U32
+    if sj_ei != NONE {
+        base = address(l, subj)
+        schl = load(l, fir.T_U32, base)
+    } else {
+        kft = e_fty(l, subj)
+        let v: u32 = value(l, subj)
+        base = alloca(l, q_size(l, sty), q_align(l, sty))
+        store(l, kft, base, v)
+        schl = v
+    }
+    let start: u32 = (*l).cur
+
+    let aoff: u32 = pattern.pat_m_aoff(m, mi)
+    let alen: u32 = pattern.pat_m_alen(m, mi)
+
+    var pl_has: Vec[u32] = vec_new[u32]()
+    var pl_test: Vec[u32] = vec_new[u32]()
+    var pl_off: Vec[u32] = vec_new[u32]()
+    var pl_len: Vec[u32] = vec_new[u32]()
+    var pk: Vec[i64] = vec_new[i64]()
+    var body: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&pl_has)
+    defer vec_free[u32](&pl_test)
+    defer vec_free[u32](&pl_off)
+    defer vec_free[u32](&pl_len)
+    defer vec_free[i64](&pk)
+    defer vec_free[u32](&body)
+
+    var ai: u32 = 0
+    while ai < alen {
+        plan_arm(l, pattern.pat_a_pat(m, aoff + ai), sj_ei,
+            &pl_has, &pl_test, &pl_off, &pl_len, &pk)
+        vec_push[u32](&body, new_block(l))
+        ai = ai + 1
+    }
+    let join: u32 = new_block(l)
+
+    // Collect the keys: ascending and without duplicates.
+    var keys: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&keys)
+    ai = 0
+    while ai < alen {
+        if vec_at[u32](&pl_has, ai as usize) != 0 {
+            let off: u32 = vec_at[u32](&pl_off, ai as usize)
+            let len: u32 = vec_at[u32](&pl_len, ai as usize)
+            var k: u32 = 0
+            while k < len {
+                let key: i64 = vec_at[i64](&pk, (off + k) as usize)
+                var da: bool = false
+                var x: usize = 0
+                while x < vec_len[i64](&keys) {
+                    if vec_at[i64](&keys, x) == key {
+                        da = true
+                    }
+                    x = x + 1
+                }
+                if !da {
+                    vec_push[i64](&keys, key)
+                }
+                k = k + 1
+            }
+        }
+        ai = ai + 1
+    }
+    // Sort ascending (the list is short -- insertion sort).
+    var i1: usize = 1
+    while i1 < vec_len[i64](&keys) {
+        let v: i64 = vec_at[i64](&keys, i1)
+        var j: usize = i1
+        while j > 0 {
+            if vec_at[i64](&keys, j - 1) <= v {
+                break
+            }
+            vec_set[i64](&keys, j, vec_at[i64](&keys, j - 1))
+            j = j - 1
+        }
+        vec_set[i64](&keys, j, v)
+        i1 = i1 + 1
+    }
+
+    // Catch all chain FIRST (its block numbers come before the key chains),
+    // then the candidate chain per key.
+    var cands: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&cands)
+    candidates(l, &pl_has, &pl_test, &pl_off, &pl_len, &pk, alen, false, 0, &cands)
+    let catch_bb: u32 = chain(l, mi, &cands, &pl_test, base, schl, kft,
+        sj_ei, &body, join)
+
+    let sw_off: u32 = fir.sw_start(&(*l).f)
+    var sw_len: u32 = 0
+    var ki: usize = 0
+    while ki < vec_len[i64](&keys) {
+        let key: i64 = vec_at[i64](&keys, ki)
+        vec_clear[u32](&cands)
+        candidates(l, &pl_has, &pl_test, &pl_off, &pl_len, &pk, alen, true, key, &cands)
+        let bb: u32 = chain(l, mi, &cands, &pl_test, base, schl, kft,
+            sj_ei, &body, catch_bb)
+        fir.sw_add(&(*l).f, key, bb)
+        sw_len = sw_len + 1
+        ki = ki + 1
+    }
+    if sw_len == 0 {
+        fir.term_set(&(*l).f, (*l).fi, start, fir.TERM_BR, catch_bb, 0, 0)
+    } else {
+        fir.term_switch(&(*l).f, (*l).fi, start, schl, kft, catch_bb, sw_off, sw_len)
+    }
+
+    // Body of every arm.
+    ai = 0
+    while ai < alen {
+        (*l).cur = vec_at[u32](&body, ai as usize)
+        range_on(l)
+        pattern_bind(l, base, pattern.pat_a_pat(m, aoff + ai), sty, sj_ei)
+        block(l, pattern.pat_a_block(m, aoff + ai))
+        range_off(l)
+        if !terminated(l) {
+            term(l, fir.TERM_BR, join, 0, 0)
+        }
+        ai = ai + 1
+    }
+    (*l).cur = join
+}
+
+// ---------------------------------------------------------------- the run
+
+// --------------------------------------- error unions (lower_errors.rs)
+//
+// Port of the lowering of `try`, `catch`, `Set::Variant` and of the
+// implicit conversion. An error union is an ordinary struct
+// (`{ __err: u32, __val: T }`, 0 = success) -- it needs no new
+// FIR instruction, only load/store, a comparison and a branch.
+// The order of the instructions and blocks is part of the contract,
+// `tools/fir_compare.sh` compares byte for byte.
+//
+// ROUND 36: `ret_term_error` is ported -- the error path
+// (`return E::Variant`, `try`) runs the `errdefer` statements
+// as well (`defer_to_error`).
+
+// Writes the error union to `addr` -- success value or error code
+// (`write_union`). BUSY stops the raw value access from running into
+// the conversion again.
+fn union_write(l: *mut Lower, addr: u32, e: u32, cu: u32) {
+    err.error_busy_on(fel(l), e)
+    let kind: u32 = err.error_coerce_kind(fel(l), e)
+    if kind == err.ERROR_OUT_VALUE {
+        let zero: u32 = constant(l, fir.T_U32, 0)
+        store(l, fir.T_U32, addr, zero)
+        let va: u32 = ptradd_const(l, addr, err.error_u_voff(fel(l), cu))
+        write_after(l, va, e)
+    } else {
+        let code: u32 = error_code(l, e)
+        store(l, fir.T_U32, addr, code)
+    }
+    err.error_busy_off(fel(l), e)
+}
+
+// Error code of an expression whose type is an error set (`error_code`):
+// for a variant the constant, otherwise the loaded code.
+fn error_code(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    if ast.e_kind(b, e) == ast.E_CALL && ast.e_number(b, e) == 0 {
+        let cc: i64 = err.error_ctor_code((*l).feh, names(l), ast.e_a(b, e))
+        if cc >= 0 {
+            return constant(l, fir.T_U32, cc as u64)
+        }
+    }
+    let a: u32 = address(l, e)
+    return load(l, fir.T_U32, a)
+}
+
+// `Set::Variant` as a value: a slot holding the code (`ctor_addr`).
+fn ctor_address(l: *mut Lower, e: u32, code: u64) -> u32 {
+    let t: u32 = sema.sema_ty(sm(l), e)
+    let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
+    let c: u32 = constant(l, fir.T_U32, code)
+    store(l, fir.T_U32, slot, c)
+    return slot
+}
+
+// Copies a value of type `t` from `src` to `dst` (`copy_value`).
+fn copy_value(l: *mut Lower, dst: u32, src: u32, t: u32) {
+    if is_aggregate(l, t) {
+        copymem(l, dst, src, types.size_of(tf(l), t))
+        return
+    }
+    // ROUND 68: up to round 67 `f64` was skipped here -- deliberately, to
+    // stay bug compatible with `scalar_fty` in lower_errors.rs, which had
+    // lost the type. Copying nothing was WRONG on both sides; the value of
+    // an `E!f64` never reached its slot (docs/ROUND63.md, gap 2). Both
+    // compilers copy it now.
+    let ft: u32 = fty(l, t)
+    if ft == fir.NONE || ft == fir.T_VOID {
+        return
+    }
+    let v: u32 = load(l, ft, src)
+    store(l, ft, dst, v)
+}
+
+// `return` with implicit conversion into the error union of the function
+// (`do_return`).
+fn error_return(l: *mut Lower, v: u32, cu: u32) {
+    // `return E::Variant` is the error path, `return value` the
+    // success path -- the type checker decided that (`coerce_kind`).
+    let error_path: bool = err.error_coerce_kind(fel(l), v) == err.ERROR_OUT_ERROR
+    if (*l).sret != NONE {
+        union_write(l, (*l).sret, v, cu)
+        if error_path {
+            defer_to_error(l)
+        } else {
+            defer_to(l, 0)
+        }
+        term(l, fir.TERM_RET, (*l).sret, 0, 0)
+        return
+    }
+    // Up to 8 bytes the error union travels in one word in `rax` (abi). The
+    // scratch slot is zeroed so that the padding bytes hold the same value
+    // in every build stage.
+    let slot: u32 = alloca(l, 8, 8)
+    let zero: u32 = constant(l, fir.T_I64, 0)
+    store(l, fir.T_I64, slot, zero)
+    union_write(l, slot, v, cu)
+    let w: u32 = load(l, fir.T_I64, slot)
+    if error_path {
+        defer_to_error(l)
+    } else {
+        defer_to(l, 0)
+    }
+    term(l, fir.TERM_RET, w, 0, 0)
+}
+
+// Leaves the function with the error code `code` (`return_error`) --
+// ALWAYS the error path: here the `errdefer` statements run too.
+fn error_leave(l: *mut Lower, code: u32) {
+    if (*l).sret != NONE {
+        store(l, fir.T_U32, (*l).sret, code)
+        defer_to_error(l)
+        term(l, fir.TERM_RET, (*l).sret, 0, 0)
+        return
+    }
+    let slot: u32 = alloca(l, 8, 8)
+    let zero: u32 = constant(l, fir.T_I64, 0)
+    store(l, fir.T_I64, slot, zero)
+    store(l, fir.T_U32, slot, code)
+    let w: u32 = load(l, fir.T_I64, slot)
+    defer_to_error(l)
+    term(l, fir.TERM_RET, w, 0, 0)
+}
+
+// `try a` -- yields the address of the success value; on error the
+// function returns with the same code (`try_value_addr`).
+fn try_address(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let u: u32 = err.error_try(fel(l), e)
+    if u == NONE {
+        give_up(l)
+        return 0
+    }
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e))
+    let src: u32 = address(l, arg)
+    let code: u32 = load(l, fir.T_U32, src)
+    let zero: u32 = constant(l, fir.T_U32, 0)
+    let bad: u32 = push(l, fir.O_CMP, fir.T_BOOL, code, zero, 1,
+        fir.T_U32 as u64, 0, 0)
+    let fail: u32 = new_block(l)
+    let cont: u32 = new_block(l)
+    term(l, fir.TERM_BRCOND, bad, fail, cont)
+    (*l).cur = fail
+    error_leave(l, code)
+    (*l).cur = cont
+    return ptradd_const(l, src, err.error_u_voff(fel(l), u))
+}
+
+// `a catch b` -- yields the address of the result (success value or
+// fallback) in a slot of its own (`catch_slot`).
+fn catch_slot(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let u: u32 = err.error_catch(fel(l), e)
+    if u == NONE {
+        give_up(l)
+        return 0
+    }
+    let lhs: u32 = ast.child_at(b, ast.e_b(b, e))
+    let rhs: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+    let vt: u32 = err.error_u_valty(fel(l), u)
+    let slot: u32 = alloca(l, q_size(l, vt), q_align(l, vt))
+    let src: u32 = address(l, lhs)
+    let code: u32 = load(l, fir.T_U32, src)
+    let zero: u32 = constant(l, fir.T_U32, 0)
+    let good: u32 = push(l, fir.O_CMP, fir.T_BOOL, code, zero, 0,
+        fir.T_U32 as u64, 0, 0)
+    let ok_bb: u32 = new_block(l)
+    let old_bb: u32 = new_block(l)
+    let join: u32 = new_block(l)
+    term(l, fir.TERM_BRCOND, good, ok_bb, old_bb)
+
+    (*l).cur = ok_bb
+    let va: u32 = ptradd_const(l, src, err.error_u_voff(fel(l), u))
+    copy_value(l, slot, va, vt)
+    if !terminated(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+
+    (*l).cur = old_bb
+    // `catch |f| ...`: the error value is a variable inside the fallback.
+    let bind: u32 = err.error_cb(fel(l), e)
+    if bind != NONE {
+        range_on(l)
+        let eslot: u32 = alloca(l, 4, 4)
+        store(l, fir.T_U32, eslot, code)
+        create(l, bind, eslot)
+    }
+    write_after(l, slot, rhs)
+    if bind != NONE {
+        range_off(l)
+    }
+    if !terminated(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+
+    (*l).cur = join
+    return slot
+}
+
+fn low_run(l: *mut Lower) {
+    let b: *mut ast.Tree = tree(l)
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        // **Round 75** (SPEC 14.5) -- `extern fn` has no Firn body: there
+        // is nothing to lower to FIR. Its signature is still registered by
+        // `sema` (so every CALLER of it type-checks normally); codegen
+        // resolves the call name through the extern/link tables instead of
+        // expecting a `fir.Func` with this name to exist.
+        if ast.fn_extern(b, i) != 0 {
+            i = i + 1
+            continue
+        }
+        let rt2: u32 = types.ret_ty_the_func(tf(l), i)
+        let ret_agg: bool = is_aggregate(l, rt2)
+        let sret: bool = abi_sret(l, rt2)
+        // FIR return type: aggregates through the hidden pointer, otherwise
+        // one word in `rax`.
+        var rf: u32 = 0
+        if ret_agg {
+            if sret {
+                rf = fir.T_PTR
+            } else {
+                // ROUND 71: `rax`, or `xmm0` for an SSE eightbyte.
+                rf = word_fty(l, rt2, 0)
+            }
+        } else {
+            rf = fty(l, rt2)
+            if rf == fir.NONE {
+                give_up(l)
+                return
+            }
+        }
+        // FIR parameters from the calling convention.
+        let poff: u32 = vec_len[u32](&(*l).f.p_ty) as u32
+        if sret {
+            vec_push[u32](&(*l).f.p_ty, fir.T_PTR)
+        }
+        // Kind per source parameter: >=0 number of words | NONE pointer | else scalar
+        var kind: Vec[u32] = vec_new[u32]()
+        var k: u32 = 0
+        while k < ast.fn_plen(b, i) {
+            let pt: u32 = types.param_ty_resolved(tf(l), i, k)
+            if is_aggregate(l, pt) {
+                let kl: u32 = abi_class(l, pt)
+                if kl != fir.NONE {
+                    var w: u32 = 0
+                    while w < kl {
+                        // ROUND 71: the class per eightbyte, exactly as at
+                        // the call site.
+                        vec_push[u32](&(*l).f.p_ty, word_fty(l, pt, w as u64))
+                        w = w + 1
+                    }
+                    vec_push[u32](&kind, kl)
+                } else {
+                    vec_push[u32](&(*l).f.p_ty, fir.T_PTR)
+                    vec_push[u32](&kind, NONE)
+                }
+            } else {
+                let pf: u32 = fty(l, pt)
+                if pf == fir.NONE || pf == fir.T_VOID {
+                    give_up(l)
+                    vec_free[u32](&kind)
+                    return
+                }
+                vec_push[u32](&(*l).f.p_ty, pf)
+                vec_push[u32](&kind, NONE - 1)
+            }
+            k = k + 1
+        }
+        let plen: u32 = vec_len[u32](&(*l).f.p_ty) as u32 - poff
+        (*l).fi = fir.fn_new(&(*l).f, ast.fn_name(b, i), rf, poff, plen)
+        // ROUND 52 (core.rs): `#[interrupt]` -- calling convention of its own.
+        if ast.fn_int(b, i) != 0 {
+            fir.f_int_set(&(*l).f, (*l).fi, 1)
+        }
+        (*l).cur = 0
+        (*l).sret = NONE
+        var next: u32 = 0
+        if sret {
+            (*l).sret = fir.param_value(&(*l).f, (*l).fi, 0)
+            next = 1
+        }
+        range_on(l)
+        // Parameters get a slot and are stored in the entry block.
+        k = 0
+        while k < ast.fn_plen(b, i) {
+            let pt: u32 = types.param_ty_resolved(tf(l), i, k)
+            let ak: u32 = vec_at[u32](&kind, k as usize)
+            let pname: u32 = ast.param_name(b, ast.fn_poff(b, i) + k)
+            if ak == NONE - 1 {
+                let pf: u32 = vec_at[u32](&(*l).f.p_ty, (poff + next) as usize)
+                var by: u64 = fir.fty_bytes(pf)
+                if by < 1 { by = 1 }
+                let slot: u32 = alloca(l, by, by)
+                store(l, pf, slot, fir.param_value(&(*l).f, (*l).fi, next))
+                next = next + 1
+                create_ty(l, pname, slot, pt)
+            } else if ak == NONE {
+                // The caller has already made a copy; its address
+                // IS the parameter slot.
+                create(l, pname, fir.param_value(&(*l).f, (*l).fi, next))
+                next = next + 1
+            } else {
+                // The slot is padded to whole words, so that the
+                // stores stay completely inside the object.
+                var gr: u64 = q_size(l, pt)
+                if gr < ak as u64 * 8 {
+                    gr = ak as u64 * 8
+                }
+                var au: u64 = q_align(l, pt)
+                if au < 8 {
+                    au = 8
+                }
+                let slot: u32 = alloca(l, gr, au)
+                var w: u32 = 0
+                while w < ak {
+                    let a2: u32 = ptradd_const(l, slot, w as u64 * 8)
+                    store(l, fir.T_I64, a2, fir.param_value(&(*l).f, (*l).fi, next + w))
+                    w = w + 1
+                }
+                next = next + ak
+                create(l, pname, slot)
+            }
+            k = k + 1
+        }
+        vec_free[u32](&kind)
+        // HOOK fnval: inside a closure body the captured values are
+        // ordinary names -- they lie in the record, which arrived as the
+        // last parameter (fnval.rs, round 58).
+        let ci2: u32 = sema.sema_closure_index(sm(l), ast.fn_name(b, i))
+        if ci2 != NONE {
+            var ew2: [u8; 6] = "__env#"
+            let enr: u32 = intern.intern_number(names(l), (&ew2[0]) as u64, 6) as u32
+            let eslot: u32 = search(l, enr)
+            if eslot == NONE {
+                give_up(l)
+                return
+            }
+            let env: u32 = load(l, fir.T_PTR, eslot)
+            var ck2: u32 = 0
+            while ck2 < sema.sema_closure_caps(sm(l), ci2) {
+                let ca: u32 = ptradd_const(l, env, 8 + ck2 as u64 * 8)
+                create_ty(l, sema.sema_capture_name(sm(l), ci2, ck2), ca,
+                    sema.sema_capture_ty(sm(l), ci2, ck2))
+                ck2 = ck2 + 1
+            }
+        }
+        block(l, ast.fn_body(b, i))
+        range_off(l)
+        if (*l).unsuitable {
+            return
+        }
+        // Close the open (unreachable) blocks.
+        var bb: u32 = 0
+        while bb < fir.block_count(&(*l).f, (*l).fi) {
+            if !fir.is_terminated(&(*l).f, (*l).fi, bb) {
+                (*l).cur = bb
+                if rf == fir.T_VOID {
+                    term(l, fir.TERM_RET, NONE, 0, 0)
+                } else {
+                    let v: u32 = constant(l, rf, 0)
+                    term(l, fir.TERM_RET, v, 0, 0)
+                }
+            }
+            bb = bb + 1
+        }
+        i = i + 1
+    }
+}

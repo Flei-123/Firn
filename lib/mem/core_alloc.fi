@@ -1,0 +1,345 @@
+// lib/mem/core_alloc.fi -- THE ALLOCATOR, PASSED BY HAND (round 73).
+//
+// SPEC 2 has promised since round 52: "kernel: heap allocation only
+// through an explicitly passed `Allocator`". Until round 73 that sentence
+// stood alone -- there was no `Allocator`, neither in the compiler nor in
+// the library. This file is it.
+//
+// THE POINT, in one line: at the CALL SITE it has to be visible that a
+// call costs memory.
+//
+//     let s: core.Block = core.alloc(a, 4096, 16)   // costs memory, one sees it
+//     let n: usize = span.find(part)                // costs nothing, one sees that too
+//
+// That is the Zig route, and it is the one Justin decided on. No global
+// allocator, no hidden `mmap` behind a comfortable name, no thread local
+// "current heap". Whoever wants memory names whose memory it is.
+//
+// ------------------------------------------------------------------------
+// WHY THE INTERFACE TAKES ONLY PRIMITIVE TYPES
+//
+// `interface` holds PROGRAM WIDE in Firn (docs/ROUND46.md 9,
+// tests/821_iface_module_core.fi) -- the name of an interface is not
+// rewritten when modules are merged. A `struct` on the other hand belongs
+// to its module and becomes `core__Block`. A method signature inside
+// `interface` is therefore not allowed to name a struct of the module: at
+// the point where the interface is read, `Block` does not exist yet.
+//
+// So the interface carries the MACHINE contract -- addresses as `u64`, the
+// answer as `bool` -- and the layer above it carries the HUMAN one:
+// `alloc`/`free`/`grow` take and return a `Block`. That has a pleasant side
+// effect: an implementation CANNOT hand a null pointer back silently,
+// because there is no pointer in its return value at all. It has to say
+// `false`, and `alloc` turns that into a `Block` whose `ok` is `false`.
+//
+// ------------------------------------------------------------------------
+// THE FAILURE CASE IS A VALUE, NOT A ZERO
+//
+// `Block { p, n, ok }`. Whoever forgets `ok` gets `p == 0` and crashes at
+// the first write -- but he cannot claim he was not told: every producing
+// function of this file returns a `Block`, never a bare address.
+// `block_none()` is the one and only way to say "it did not work".
+//
+// ------------------------------------------------------------------------
+// WHAT IS IN HERE
+//
+//   * `Block`      -- the answer of an allocator
+//   * `Allocator`  -- the interface (three methods, primitive types)
+//   * alloc/free/grow/alloc_zeroed -- the checked layer over it
+//   * `Arena`      -- an implementation WITHOUT a system call: a bump
+//                     allocator over memory that somebody else holds. That
+//                     is the one a kernel can use.
+//
+// The second implementation, the one over `mmap`, sits in `lib/std/mem.fi`
+// (`PageAllocator`): it makes system calls and therefore may not stand in
+// `lib/std/core.fi`. The interface is the same one -- `impl Allocator for
+// PageAllocator` in a different module works, because `interface` holds
+// program wide.
+//
+// Include:  //#include lib/mem/core_alloc.fi  (needs lib/str/core_mem.fi)
+
+// --------------------------------------------------------------- Block
+//
+// What came back. `n` is the USABLE length, and it may be bigger than what
+// was asked for (an allocator is allowed to round up) -- whoever gives the
+// block back hands `n` back, not his wish.
+
+struct Block {
+    p: *mut u8,
+    n: usize,
+    ok: bool,
+}
+
+// "It did not work." The only spelling of failure in this library.
+fn block_none() -> Block {
+    return Block { p: 0 as *mut u8, n: 0, ok: false }
+}
+
+fn block_of(p: *mut u8, n: usize) -> Block {
+    if (p as usize) == 0 {
+        return block_none()
+    }
+    return Block { p: p, n: n, ok: true }
+}
+
+// A reading view of the block -- the bridge to the text side of `core`.
+fn block_span(b: Block) -> Span {
+    if !b.ok {
+        return span_empty()
+    }
+    return Span { p: b.p, n: b.n }
+}
+
+impl Block {
+    fn is_ok(self) -> bool { return self.ok }
+    fn length(self) -> usize { return self.n }
+    fn span(self) -> Span { return block_span(self) }
+}
+
+// ----------------------------------------------------------- Alignment
+
+fn is_power_of_two(v: usize) -> bool {
+    return v != 0 && (v & (v - 1)) == 0
+}
+
+// The next multiple of `align` at or above `v`. `align` 0 counts as 1.
+fn align_up(v: usize, align: usize) -> usize {
+    var a: usize = align
+    if a == 0 {
+        a = 1
+    }
+    return (v + a - 1) / a * a
+}
+
+// The alignment every allocator has to be able to do at least: 16 octets,
+// the alignment of the x86-64 ABI for the largest scalar type.
+fn align_default() -> usize {
+    return 16
+}
+
+// ---------------------------------------------------------- Allocator
+//
+// Three methods, addresses as `u64`, the answer as `bool`. `raw_alloc`
+// writes the address into `out` and returns `true`; on failure it returns
+// `false` and MUST NOT touch `out`.
+//
+// `raw_free` gets the size and the alignment back that `raw_alloc`
+// answered with -- an allocator without bookkeeping of its own (an arena,
+// a size class allocator) needs them, and one with bookkeeping may ignore
+// them.
+//
+// `raw_grow` is the third method and not a convenience: growing in place
+// is the difference between O(n) and O(n log n) for every buffer that
+// grows. Whoever cannot do it returns `false`; `grow` above then does the
+// honest thing (new block, copy, free).
+
+interface Allocator {
+    fn raw_alloc(*mut self, size: usize, align: usize, out: *mut u64) -> bool
+    fn raw_free(*mut self, address: u64, size: usize, align: usize)
+    fn raw_grow(*mut self, address: u64, old: usize, size: usize, align: usize,
+        out: *mut u64) -> bool
+}
+
+// ------------------------------------------------------ the checked layer
+
+// `size` octets, aligned to `align`. A size of 0 is answered with a
+// refusal and not with a block of length 0 -- a pointer that must not be
+// written to is the kind of half truth this round is here to remove.
+fn alloc(a: dyn Allocator, size: usize, align: usize) -> Block {
+    if size == 0 {
+        return block_none()
+    }
+    if !is_power_of_two(align) {
+        return block_none()
+    }
+    var address: u64 = 0
+    if !a.raw_alloc(size, align, &address) {
+        return block_none()
+    }
+    if address == 0 {
+        return block_none()
+    }
+    return block_of(address as *mut u8, size)
+}
+
+// The everyday form: 16 octets alignment.
+fn alloc_bytes(a: dyn Allocator, size: usize) -> Block {
+    return alloc(a, size, align_default())
+}
+
+// Zeroed out. An arena over used memory hands out old octets otherwise --
+// whoever wants the guarantee has to say so and pay for it.
+fn alloc_zeroed(a: dyn Allocator, size: usize, align: usize) -> Block {
+    let b: Block = alloc(a, size, align)
+    if b.ok {
+        mem_zero(b.p, b.n)
+    }
+    return b
+}
+
+// Giving back. A block that never came (`ok == false`) is silently
+// ignored -- that makes the error path of the caller one `if` shorter and
+// costs nothing, because there is nothing to give back.
+fn free(a: dyn Allocator, b: Block, align: usize) {
+    if !b.ok {
+        return
+    }
+    a.raw_free(b.p as u64, b.n, align)
+}
+
+fn free_bytes(a: dyn Allocator, b: Block) {
+    free(a, b, align_default())
+}
+
+// Growing. First the allocator is asked whether it can do it in place; if
+// not, a new block is fetched, the contents are copied and the old one is
+// given back. `size` smaller than the old length is answered with the old
+// block -- shrinking is not this round's business.
+fn grow(a: dyn Allocator, b: Block, size: usize, align: usize) -> Block {
+    if !b.ok {
+        return alloc(a, size, align)
+    }
+    if size <= b.n {
+        return b
+    }
+    var address: u64 = 0
+    if a.raw_grow(b.p as u64, b.n, size, align, &address) {
+        if address != 0 {
+            return block_of(address as *mut u8, size)
+        }
+    }
+    let fresh: Block = alloc(a, size, align)
+    if !fresh.ok {
+        return block_none()
+    }
+    mem_copy(fresh.p, b.p, b.n)
+    free(a, b, align)
+    return fresh
+}
+
+// ------------------------------------------------------------- the Arena
+//
+// A bump allocator over memory that SOMEBODY ELSE holds: `arena_new` gets
+// an address and a length and never asks for another octet. No system
+// call, no page table, no free list -- which is why it works in a kernel,
+// in an interrupt handler and in a program that has no operating system
+// underneath it.
+//
+// WHAT IT CAN DO AND WHAT IT CANNOT, said plainly:
+//   * alloc is a comparison and an addition. That is the whole cost.
+//   * free gives back exactly ONE block: the last one handed out. Anything
+//     else is accepted and does nothing. That is not a hole, it is the
+//     nature of a bump allocator -- and it is the reason `arena_reset`
+//     exists: a frame, a request, a parse run is freed IN ONE GO.
+//   * grow grows in place if the block is the last one, otherwise it says
+//     `false` and `grow` above copies.
+//   * `high` remembers the highest fill level ever reached. That is the
+//     number a soak run measures: it may not drift.
+
+struct Arena {
+    base: u64,
+    cap: usize,
+    used: usize,
+    high: usize,
+    last: usize,
+    given: u64,
+    refused: u64,
+}
+
+fn arena_new(memory: *mut u8, cap: usize) -> Arena {
+    return Arena { base: memory as u64, cap: cap, used: 0, high: 0,
+        last: npos(), given: 0, refused: 0 }
+}
+
+// Everything free again, in one instruction. The memory itself stays
+// where it is -- the arena never owned it.
+fn arena_reset(a: *mut Arena) {
+    (*a).used = 0
+    (*a).last = npos()
+}
+
+fn arena_used(a: *mut Arena) -> usize {
+    return (*a).used
+}
+
+// The highest fill level ever reached. The measurement of a leak: it has
+// to stand still.
+fn arena_high(a: *mut Arena) -> usize {
+    return (*a).high
+}
+
+fn arena_left(a: *mut Arena) -> usize {
+    return (*a).cap - (*a).used
+}
+
+fn arena_given(a: *mut Arena) -> u64 {
+    return (*a).given
+}
+
+fn arena_refused(a: *mut Arena) -> u64 {
+    return (*a).refused
+}
+
+impl Arena {
+    fn reset(*mut self) { arena_reset(self) }
+    fn used(*mut self) -> usize { return arena_used(self) }
+    fn high(*mut self) -> usize { return arena_high(self) }
+    fn left(*mut self) -> usize { return arena_left(self) }
+}
+
+impl Allocator for Arena {
+    fn raw_alloc(*mut self, size: usize, align: usize, out: *mut u64) -> bool {
+        if size == 0 {
+            (*self).refused = (*self).refused + 1
+            return false
+        }
+        let here: usize = (*self).base as usize + (*self).used
+        let start: usize = align_up(here, align)
+        let of: usize = start - (*self).base as usize
+        // The comparison runs on the OFFSET, not on the address: an
+        // address plus a length can wrap around, an offset inside a region
+        // that really exists cannot.
+        if of > (*self).cap || size > (*self).cap - of {
+            (*self).refused = (*self).refused + 1
+            return false
+        }
+        (*self).last = of
+        (*self).used = of + size
+        if (*self).used > (*self).high {
+            (*self).high = (*self).used
+        }
+        (*self).given = (*self).given + 1
+        *out = start as u64
+        return true
+    }
+
+    fn raw_free(*mut self, address: u64, size: usize, align: usize) {
+        let of: usize = address as usize - (*self).base as usize
+        if (*self).last != npos() && of == (*self).last {
+            if of + size == (*self).used {
+                (*self).used = of
+                (*self).last = npos()
+            }
+        }
+    }
+
+    fn raw_grow(*mut self, address: u64, old: usize, size: usize, align: usize,
+        out: *mut u64) -> bool {
+        let of: usize = address as usize - (*self).base as usize
+        if (*self).last == npos() || of != (*self).last {
+            return false
+        }
+        if of + old != (*self).used {
+            return false
+        }
+        if size > (*self).cap - of {
+            return false
+        }
+        (*self).used = of + size
+        if (*self).used > (*self).high {
+            (*self).high = (*self).used
+        }
+        *out = address
+        return true
+    }
+}

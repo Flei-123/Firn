@@ -1,0 +1,3070 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/regexp.fi -- REGULAR EXPRESSIONS (ECMA-262 clause 22.2), written
+// in Firn, character by character. No foreign pattern library, no PCRE, no
+// generated table: the pattern is read here, compiled here and matched
+// here.
+//
+// Round 63 named this as the largest single thing that was missing, and
+// said that it is a round of its own. It is: a pattern grammar, a compiler
+// and a backtracking matcher, plus the four SYMBOL PROTOCOLS through which
+// `String.prototype.match`, `replace`, `search` and `split` reach a regular
+// expression.
+//
+// THE SHAPE. The compiled pattern is a TREE OF NODES, not a byte code, for
+// one reason: the specification defines matching with CONTINUATIONS
+// (22.2.2.3), and a tree with an explicit continuation stack is the same
+// thing written down. A byte code with `split`/`jump` would need a second
+// mechanism for the empty loop check that 22.2.2.5 demands, and the
+// lookarounds would need a third.
+//
+//   * The nodes lie in ONE raw vector, eight `u64` columns each, outside
+//     the reach of the collector's pointer walk -- like the syntax tree of
+//     the engine, and for the same reason: a pattern never changes after it
+//     has been compiled.
+//   * The CONTINUATIONS lie on a stack of five slot records that grows and
+//     shrinks with the recursion of the matcher. `m(node, pos, k)` means
+//     "match `node` at `pos`, and when the chain runs out, go on with `k`".
+//   * The captures are one array of `i64` pairs, saved and restored around
+//     every attempt that may fail.
+//
+// WHAT IS NOT THERE is named in docs/ROUND74.md and counts as a failure in
+// the quota like everything else: the property escapes `\p{...}` only know
+// the general categories that this file lists, `v` mode has no set
+// operations, and a lookbehind is matched by trying its start positions
+// instead of running the pattern from right to left -- the same language,
+// but the captures of an ambiguous lookbehind may differ.
+import html.mem
+import str.ucd
+import std.math
+import js.lex
+import js.ast
+import js.val
+import js.interp
+
+export {
+    RE_BASE, RE_END, regexp_dispatch, install_regexp,
+    make_regexp, regexp_exec_pub, is_regexp,
+}
+
+// The natives of this file.
+const RE_BASE: u64 = 3400
+const RE_END: u64 = 3700
+
+const R_CTOR: u64 = 3400
+const R_EXEC: u64 = 3401
+const R_TEST: u64 = 3402
+const R_TOSTRING: u64 = 3403
+const R_COMPILE: u64 = 3404
+const R_SOURCE: u64 = 3405
+const R_FLAGS: u64 = 3406
+const R_GLOBAL: u64 = 3407
+const R_IGNORECASE: u64 = 3408
+const R_MULTILINE: u64 = 3409
+const R_DOTALL: u64 = 3410
+const R_UNICODE: u64 = 3411
+const R_STICKY: u64 = 3412
+const R_HASINDICES: u64 = 3413
+const R_UNICODESETS: u64 = 3414
+const R_SYM_MATCH: u64 = 3420
+const R_SYM_MATCHALL: u64 = 3421
+const R_SYM_REPLACE: u64 = 3422
+const R_SYM_SEARCH: u64 = 3423
+const R_SYM_SPLIT: u64 = 3424
+const R_STR_MATCH: u64 = 3430
+const R_STR_MATCHALL: u64 = 3431
+const R_STR_REPLACE: u64 = 3432
+const R_STR_REPLACEALL: u64 = 3433
+const R_STR_SEARCH: u64 = 3434
+const R_STR_SPLIT: u64 = 3435
+const R_STRITER_NEXT: u64 = 3440
+const R_SPECIES: u64 = 3441
+
+// The flags.
+const F_HASINDICES: u64 = 1
+const F_GLOBAL: u64 = 2
+const F_IGNORECASE: u64 = 4
+const F_MULTILINE: u64 = 8
+const F_DOTALL: u64 = 16
+const F_UNICODE: u64 = 32
+const F_STICKY: u64 = 64
+const F_UNICODESETS: u64 = 128
+
+// The node kinds.
+const K_EMPTY: u64 = 0
+const K_CHAR: u64 = 1
+const K_CLASS: u64 = 2
+const K_ANY: u64 = 3
+const K_BOL: u64 = 4
+const K_EOL: u64 = 5
+const K_WORDB: u64 = 6
+const K_GROUP: u64 = 7
+const K_ALT: u64 = 8
+const K_REPEAT: u64 = 9
+const K_BACKREF: u64 = 10
+const K_LOOK: u64 = 11
+
+// The columns of a node.
+const NW: u64 = 8
+const C_KIND: u64 = 0
+const C_A: u64 = 1
+const C_B: u64 = 2
+const C_C: u64 = 3
+const C_NEXT: u64 = 4
+const C_CHILD: u64 = 5
+const C_ALT: u64 = 6
+const C_D: u64 = 7
+
+// The kinds of a continuation.
+const KK_SEQ: u64 = 1
+const KK_GROUPEND: u64 = 2
+const KK_REPEAT: u64 = 3
+const KK_ENDAT: u64 = 4
+const KW: u64 = 5
+
+const INF: u64 = 0xFFFFFFFF
+
+// The budget of ONE match. A pattern like /(a*)*b/ against a long text is
+// exponential; the specification does not forbid it and no engine can. The
+// budget makes it a FAILURE instead of a hang, which is what the harness
+// can count.
+const STEP_BUDGET: u64 = 4000000
+const DEPTH_BUDGET: i64 = 6000
+
+// ======================================================== The compiler
+//
+// A recursive descent parser over the pattern text (22.2.1), building the
+// node tree. Errors are reported through `err`, and the caller turns them
+// into a `SyntaxError`.
+
+struct P {
+    realm: Gc[Realm],
+    src: Gc[JsVal],
+    n: i64,
+    i: i64,
+    prog: Gc[GcVec],
+    sets: Gc[GcVec],
+    ngroups: u64,
+    unicode: bool,
+    err: bool,
+    names: Gc[GcVec],
+    pass: u64,
+}
+
+fn p_at(p: *mut P, i: i64) -> u32 {
+    if i < 0 || i >= (*p).n {
+        return 0xFFFFFFFF as u32
+    }
+    return val.str_at((*p).src, i as u64)
+}
+
+fn p_cur(p: *mut P) -> u32 {
+    return p_at(p, (*p).i)
+}
+
+fn p_eat(p: *mut P, c: u32) -> bool {
+    if p_cur(p) == c {
+        (*p).i = (*p).i + 1
+        return true
+    }
+    return false
+}
+
+fn node_new(p: *mut P, kind: u64) -> AllocError!u32 {
+    let at: u64 = gcvec_length((*p).prog)
+    var i: u64 = 0
+    while i < NW {
+        let ok: bool = try gcvec_append_raw((*p).prog, 0)
+        i = i + 1
+    }
+    let ok2: bool = gcvec_set_raw((*p).prog, at + C_KIND, kind)
+    return (at / NW) as u32
+}
+
+fn nf(prog: Gc[GcVec], n: u32, col: u64) -> u64 {
+    return gcvec_read_raw(prog, (n as u64) * NW + col)
+}
+
+fn nset(prog: Gc[GcVec], n: u32, col: u64, v: u64) {
+    let ok: bool = gcvec_set_raw(prog, (n as u64) * NW + col, v)
+}
+
+fn set_add(p: *mut P, lo: u32, hi: u32) -> AllocError!bool {
+    let o1: bool = try gcvec_append_raw((*p).sets, lo as u64)
+    let o2: bool = try gcvec_append_raw((*p).sets, hi as u64)
+    return true
+}
+
+// ---- the grammar
+
+// Disjunction := Alternative ( '|' Alternative )*
+fn parse_disjunction(p: *mut P) -> AllocError!u32 {
+    let first: u32 = try parse_alternative(p)
+    if p_cur(p) != 124 as u32 {
+        return first
+    }
+    let alt: u32 = try node_new(p, K_ALT)
+    nset((*p).prog, alt, C_CHILD, first as u64)
+    var last: u32 = first
+    while p_eat(p, 124 as u32) {
+        let b: u32 = try parse_alternative(p)
+        // The branches hang on the ALT column of their heads. A branch may
+        // be empty, so an empty branch gets a node of its own.
+        var head: u32 = b
+        if head == 0 {
+            head = try node_new(p, K_EMPTY)
+        }
+        nset((*p).prog, last, C_ALT, head as u64)
+        last = head
+        if (*p).err {
+            return alt
+        }
+    }
+    if first == 0 {
+        // `(|a)` -- the first branch is empty.
+        let e: u32 = try node_new(p, K_EMPTY)
+        nset((*p).prog, e, C_ALT, nf((*p).prog, first, C_ALT))
+        nset((*p).prog, alt, C_CHILD, e as u64)
+    }
+    return alt
+}
+
+// Alternative := Term*  -- the terms are chained through C_NEXT.
+fn parse_alternative(p: *mut P) -> AllocError!u32 {
+    var head: u32 = 0
+    var tail: u32 = 0
+    while true {
+        let c: u32 = p_cur(p)
+        if c == 0xFFFFFFFF as u32 || c == 124 as u32 || c == 41 as u32 {
+            break
+        }
+        let t: u32 = try parse_term(p)
+        if (*p).err {
+            return head
+        }
+        if t == 0 {
+            continue
+        }
+        if head == 0 {
+            head = t
+        } else {
+            nset((*p).prog, tail, C_NEXT, t as u64)
+        }
+        tail = t
+        // A term may be a chain itself (a group with a quantifier is not).
+        while nf((*p).prog, tail, C_NEXT) != 0 {
+            tail = nf((*p).prog, tail, C_NEXT) as u32
+        }
+    }
+    return head
+}
+
+fn parse_term(p: *mut P) -> AllocError!u32 {
+    let c: u32 = p_cur(p)
+    // The assertions that take no quantifier.
+    if c == 94 as u32 {
+        (*p).i = (*p).i + 1
+        return node_new(p, K_BOL)
+    }
+    if c == 36 as u32 {
+        (*p).i = (*p).i + 1
+        return node_new(p, K_EOL)
+    }
+    if c == 92 as u32 && (p_at(p, (*p).i + 1) == 98 as u32 || p_at(p, (*p).i + 1) == 66 as u32) {
+        let neg: bool = p_at(p, (*p).i + 1) == 66 as u32
+        (*p).i = (*p).i + 2
+        let n: u32 = try node_new(p, K_WORDB)
+        if neg {
+            nset((*p).prog, n, C_A, 1)
+        }
+        return n
+    }
+    // The groups that lie INSIDE the atom have to be known: a repetition
+    // resets its own captures at the start of every iteration (22.2.2.5
+    // step 1), and without that `(?:(a)|(b))+` keeps the `a` of the first
+    // round.
+    let before: u64 = (*p).ngroups
+    var atom: u32 = try parse_atom(p)
+    if (*p).err || atom == 0 {
+        return atom
+    }
+    // A lookaround takes no quantifier in unicode mode; in the web reality
+    // a lookahead does, so it is allowed and a lookbehind is not.
+    return parse_quantifier(p, atom, before)
+}
+
+fn parse_quantifier(p: *mut P, atom: u32, before: u64) -> AllocError!u32 {
+    let c: u32 = p_cur(p)
+    var min: u64 = 0
+    var max: u64 = INF
+    if c == 42 as u32 {
+        (*p).i = (*p).i + 1
+    } else if c == 43 as u32 {
+        min = 1
+        (*p).i = (*p).i + 1
+    } else if c == 63 as u32 {
+        max = 1
+        (*p).i = (*p).i + 1
+    } else if c == 123 as u32 {
+        let save: i64 = (*p).i
+        (*p).i = (*p).i + 1
+        var lo: u64 = 0
+        var ndig: u64 = 0
+        while p_cur(p) >= 48 as u32 && p_cur(p) <= 57 as u32 {
+            lo = lo * 10 + ((p_cur(p) - 48 as u32) as u64)
+            if lo > 0xFFFFFFF {
+                lo = 0xFFFFFFF
+            }
+            ndig = ndig + 1
+            (*p).i = (*p).i + 1
+        }
+        if ndig == 0 {
+            (*p).i = save
+            if (*p).unicode {
+                (*p).err = true
+            }
+            return atom
+        }
+        var hi: u64 = lo
+        if p_cur(p) == 44 as u32 {
+            (*p).i = (*p).i + 1
+            if p_cur(p) == 125 as u32 {
+                hi = INF
+            } else {
+                hi = 0
+                var nd2: u64 = 0
+                while p_cur(p) >= 48 as u32 && p_cur(p) <= 57 as u32 {
+                    hi = hi * 10 + ((p_cur(p) - 48 as u32) as u64)
+                    if hi > 0xFFFFFFF {
+                        hi = 0xFFFFFFF
+                    }
+                    nd2 = nd2 + 1
+                    (*p).i = (*p).i + 1
+                }
+                if nd2 == 0 {
+                    (*p).i = save
+                    if (*p).unicode {
+                        (*p).err = true
+                    }
+                    return atom
+                }
+            }
+        }
+        if !p_eat(p, 125 as u32) {
+            (*p).i = save
+            if (*p).unicode {
+                (*p).err = true
+            }
+            return atom
+        }
+        if hi != INF && hi < lo {
+            (*p).err = true
+            return atom
+        }
+        min = lo
+        max = hi
+    } else {
+        return atom
+    }
+    // An assertion may not be quantified (22.2.1 early error).
+    let k: u64 = nf((*p).prog, atom, C_KIND)
+    if k == K_BOL || k == K_EOL || k == K_WORDB {
+        (*p).err = true
+        return atom
+    }
+    if k == K_LOOK {
+        if (*p).unicode || nf((*p).prog, atom, C_A) >= 2 {
+            (*p).err = true
+            return atom
+        }
+    }
+    var greedy: u64 = 1
+    if p_eat(p, 63 as u32) {
+        greedy = 0
+    }
+    let rep: u32 = try node_new(p, K_REPEAT)
+    nset((*p).prog, rep, C_A, min)
+    nset((*p).prog, rep, C_B, max)
+    nset((*p).prog, rep, C_C, greedy)
+    nset((*p).prog, rep, C_CHILD, atom as u64)
+    nset((*p).prog, rep, C_D, before + 1)
+    nset((*p).prog, rep, C_ALT, (*p).ngroups)
+    nset((*p).prog, atom, C_NEXT, 0)
+    return rep
+}
+
+fn parse_atom(p: *mut P) -> AllocError!u32 {
+    let c: u32 = p_cur(p)
+    if c == 46 as u32 {
+        (*p).i = (*p).i + 1
+        return node_new(p, K_ANY)
+    }
+    if c == 40 as u32 {
+        return parse_group(p)
+    }
+    if c == 91 as u32 {
+        return parse_class(p)
+    }
+    if c == 92 as u32 {
+        return parse_escape(p)
+    }
+    if c == 41 as u32 || c == 124 as u32 {
+        return 0
+    }
+    if c == 42 as u32 || c == 43 as u32 || c == 63 as u32 {
+        (*p).err = true
+        return 0
+    }
+    if c == 93 as u32 || c == 125 as u32 {
+        // In unicode mode a lone `]` or `}` is an early error.
+        if (*p).unicode {
+            (*p).err = true
+            return 0
+        }
+    }
+    if c == 0xFFFFFFFF as u32 {
+        return 0
+    }
+    (*p).i = (*p).i + 1
+    var cp: u32 = c
+    if (*p).unicode && c >= 0xD800 as u32 && c <= 0xDBFF as u32 {
+        let c2: u32 = p_cur(p)
+        if c2 >= 0xDC00 as u32 && c2 <= 0xDFFF as u32 {
+            cp = 0x10000 as u32 + ((c - 0xD800 as u32) << 10) + (c2 - 0xDC00 as u32)
+            (*p).i = (*p).i + 1
+        }
+    }
+    let n: u32 = try node_new(p, K_CHAR)
+    nset((*p).prog, n, C_A, cp as u64)
+    return n
+}
+
+fn parse_group(p: *mut P) -> AllocError!u32 {
+    (*p).i = (*p).i + 1
+    var capture: bool = true
+    var look: i64 = -1
+    var name: Gc[JsVal] = gc_null[JsVal]()
+    if p_cur(p) == 63 as u32 {
+        let c1: u32 = p_at(p, (*p).i + 1)
+        if c1 == 58 as u32 {
+            capture = false
+            (*p).i = (*p).i + 2
+        } else if c1 == 61 as u32 {
+            capture = false
+            look = 0
+            (*p).i = (*p).i + 2
+        } else if c1 == 33 as u32 {
+            capture = false
+            look = 1
+            (*p).i = (*p).i + 2
+        } else if c1 == 60 as u32 && p_at(p, (*p).i + 2) == 61 as u32 {
+            capture = false
+            look = 2
+            (*p).i = (*p).i + 3
+        } else if c1 == 60 as u32 && p_at(p, (*p).i + 2) == 33 as u32 {
+            capture = false
+            look = 3
+            (*p).i = (*p).i + 3
+        } else if c1 == 60 as u32 {
+            (*p).i = (*p).i + 2
+            name = try parse_group_name(p)
+            if (*p).err {
+                return 0
+            }
+        } else {
+            (*p).err = true
+            return 0
+        }
+    }
+    var gi: u64 = 0
+    if capture {
+        (*p).ngroups = (*p).ngroups + 1
+        gi = (*p).ngroups
+        if (*p).pass == 0 {
+            while gcvec_length((*p).names) < gi + 1 {
+                let ok: bool = try gcvec_append[JsVal]((*p).names,
+                    gc_null[JsVal]())
+            }
+            let ok2: bool = gcvec_set[JsVal]((*p).names, gi, name)
+        }
+    }
+    let body: u32 = try parse_disjunction(p)
+    if !p_eat(p, 41 as u32) {
+        (*p).err = true
+        return 0
+    }
+    if look >= 0 {
+        let n: u32 = try node_new(p, K_LOOK)
+        nset((*p).prog, n, C_A, look as u64)
+        nset((*p).prog, n, C_CHILD, body as u64)
+        return n
+    }
+    let n: u32 = try node_new(p, K_GROUP)
+    nset((*p).prog, n, C_A, gi)
+    nset((*p).prog, n, C_CHILD, body as u64)
+    return n
+}
+
+fn parse_group_name(p: *mut P) -> AllocError!Gc[JsVal] {
+    let out: Gc[JsStr] = try val.str_new(r_of(p))
+    while true {
+        let c: u32 = p_cur(p)
+        if c == 0xFFFFFFFF as u32 {
+            (*p).err = true
+            break
+        }
+        if c == 62 as u32 {
+            (*p).i = (*p).i + 1
+            break
+        }
+        let ok: bool = try val.str_push(out, c)
+        (*p).i = (*p).i + 1
+    }
+    let ov: Gc[JsVal] = out
+    return ov
+}
+
+// The realm a pattern text belongs to -- a text is allocated in the heap,
+// so the parser needs it. It travels in the source value itself.
+fn r_of(p: *mut P) -> Gc[Realm] {
+    return (*p).realm
+}
+
+fn parse_escape(p: *mut P) -> AllocError!u32 {
+    (*p).i = (*p).i + 1
+    let c: u32 = p_cur(p)
+    if c == 0xFFFFFFFF as u32 {
+        (*p).err = true
+        return 0
+    }
+    // A backreference by number.
+    if c >= 49 as u32 && c <= 57 as u32 {
+        var v: u64 = 0
+        while p_cur(p) >= 48 as u32 && p_cur(p) <= 57 as u32 {
+            v = v * 10 + ((p_cur(p) - 48 as u32) as u64)
+            (*p).i = (*p).i + 1
+        }
+        let n: u32 = try node_new(p, K_BACKREF)
+        nset((*p).prog, n, C_A, v)
+        return n
+    }
+    // A named backreference.
+    if c == 107 as u32 {
+        (*p).i = (*p).i + 1
+        if !p_eat(p, 60 as u32) {
+            (*p).err = true
+            return 0
+        }
+        let nm: Gc[JsVal] = try parse_group_name(p)
+        let n: u32 = try node_new(p, K_BACKREF)
+        nset((*p).prog, n, C_A, 0)
+        nset((*p).prog, n, C_D, try name_index(p, nm))
+        return n
+    }
+    // The class escapes are a class of their own.
+    if c == 100 as u32 || c == 68 as u32 || c == 119 as u32 || c == 87 as u32 || c == 115 as u32 || c == 83 as u32 || c == 112 as u32 || c == 80 as u32 {
+        let n: u32 = try node_new(p, K_CLASS)
+        let at: u64 = gcvec_length((*p).sets) / 2
+        var neg: u64 = 0
+        let ok: bool = try class_escape(p, &neg)
+        if (*p).err {
+            return n
+        }
+        nset((*p).prog, n, C_A, at)
+        nset((*p).prog, n, C_B, gcvec_length((*p).sets) / 2 - at)
+        nset((*p).prog, n, C_C, neg)
+        return n
+    }
+    let cp: u32 = try char_escape(p)
+    let n: u32 = try node_new(p, K_CHAR)
+    nset((*p).prog, n, C_A, cp as u64)
+    return n
+}
+
+fn name_index(p: *mut P, nm: Gc[JsVal]) -> AllocError!u64 {
+    var i: u64 = 1
+    while i < gcvec_length((*p).names) {
+        let e: Gc[JsVal] = gcvec_read[JsVal]((*p).names, i)
+        if (e as u64) != 0 && val.str_equal(e, nm) {
+            return i
+        }
+        i = i + 1
+    }
+    if (*p).pass == 1 {
+        (*p).err = true
+    }
+    return 0
+}
+
+// `\d \D \w \W \s \S \p{..} \P{..}` -- the ranges go into `sets`, the
+// negation comes back in `*neg`.
+fn class_escape(p: *mut P, neg: *mut u64) -> AllocError!bool {
+    let c: u32 = p_cur(p)
+    (*p).i = (*p).i + 1
+    if c == 100 as u32 || c == 68 as u32 {
+        let ok: bool = try set_add(p, 48 as u32, 57 as u32)
+        if c == 68 as u32 {
+            *neg = 1
+        }
+        return true
+    }
+    if c == 119 as u32 || c == 87 as u32 {
+        let o1: bool = try set_add(p, 48 as u32, 57 as u32)
+        let o2: bool = try set_add(p, 65 as u32, 90 as u32)
+        let o3: bool = try set_add(p, 95 as u32, 95 as u32)
+        let o4: bool = try set_add(p, 97 as u32, 122 as u32)
+        if c == 87 as u32 {
+            *neg = 1
+        }
+        return true
+    }
+    if c == 115 as u32 || c == 83 as u32 {
+        let ok: bool = try add_space_ranges(p)
+        if c == 83 as u32 {
+            *neg = 1
+        }
+        return true
+    }
+    // `\p{...}` / `\P{...}` -- only with the unicode flag, and only the
+    // categories this file knows (docs/ROUND74.md).
+    if !(*p).unicode {
+        (*p).err = true
+        return false
+    }
+    if c == 80 as u32 {
+        *neg = 1
+    }
+    if !p_eat(p, 123 as u32) {
+        (*p).err = true
+        return false
+    }
+    var name: [u8; 40] = [0 as u8; 40]
+    var n: usize = 0
+    while p_cur(p) != 125 as u32 && p_cur(p) != 0xFFFFFFFF as u32 {
+        if n < 40 {
+            name[n] = p_cur(p) as u8
+            n = n + 1
+        }
+        (*p).i = (*p).i + 1
+    }
+    if !p_eat(p, 125 as u32) {
+        (*p).err = true
+        return false
+    }
+    return add_property(p, &name[0], n)
+}
+
+fn add_space_ranges(p: *mut P) -> AllocError!bool {
+    let o1: bool = try set_add(p, 9 as u32, 13 as u32)
+    let o2: bool = try set_add(p, 32 as u32, 32 as u32)
+    let o3: bool = try set_add(p, 0xA0 as u32, 0xA0 as u32)
+    let o4: bool = try set_add(p, 0x1680 as u32, 0x1680 as u32)
+    let o5: bool = try set_add(p, 0x2000 as u32, 0x200A as u32)
+    let o6: bool = try set_add(p, 0x2028 as u32, 0x2029 as u32)
+    let o7: bool = try set_add(p, 0x202F as u32, 0x202F as u32)
+    let o8: bool = try set_add(p, 0x205F as u32, 0x205F as u32)
+    let o9: bool = try set_add(p, 0x3000 as u32, 0x3000 as u32)
+    let o10: bool = try set_add(p, 0xFEFF as u32, 0xFEFF as u32)
+    return true
+}
+
+fn name_is(name: *mut u8, n: usize, want: *mut u8, wn: usize) -> bool {
+    if n != wn {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if *((name as usize + i) as *mut u8) != *((want as usize + i) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The handful of properties this round carries. Everything else is an
+// honest SyntaxError instead of a wrong answer.
+fn add_property(p: *mut P, name: *mut u8, n: usize) -> AllocError!bool {
+    var w1: [u8; 3] = "Any"
+    var w2: [u8; 5] = "ASCII"
+    var w3: [u8; 1] = "L"
+    var w4: [u8; 6] = "Letter"
+    var w5: [u8; 2] = "Lu"
+    var w6: [u8; 2] = "Ll"
+    var w7: [u8; 1] = "N"
+    var w8: [u8; 2] = "Nd"
+    var w9: [u8; 11] = "White_Space"
+    var w10: [u8; 10] = "Alphabetic"
+    var w11: [u8; 15] = "ASCII_Hex_Digit"
+    if name_is(name, n, &w1[0], 3) {
+        return set_add(p, 0 as u32, 0x10FFFF as u32)
+    }
+    if name_is(name, n, &w2[0], 5) {
+        return set_add(p, 0 as u32, 0x7F as u32)
+    }
+    if name_is(name, n, &w9[0], 11) {
+        return add_space_ranges(p)
+    }
+    if name_is(name, n, &w7[0], 1) || name_is(name, n, &w8[0], 2) {
+        let o1: bool = try set_add(p, 48 as u32, 57 as u32)
+        let o2: bool = try set_add(p, 0x660 as u32, 0x669 as u32)
+        let o3: bool = try set_add(p, 0x6F0 as u32, 0x6F9 as u32)
+        let o4: bool = try set_add(p, 0x966 as u32, 0x96F as u32)
+        let o5: bool = try set_add(p, 0xFF10 as u32, 0xFF19 as u32)
+        return true
+    }
+    if name_is(name, n, &w5[0], 2) {
+        let o1: bool = try set_add(p, 65 as u32, 90 as u32)
+        let o2: bool = try set_add(p, 0xC0 as u32, 0xD6 as u32)
+        let o3: bool = try set_add(p, 0xD8 as u32, 0xDE as u32)
+        let o4: bool = try set_add(p, 0x391 as u32, 0x3A9 as u32)
+        let o5: bool = try set_add(p, 0x410 as u32, 0x42F as u32)
+        return true
+    }
+    if name_is(name, n, &w6[0], 2) {
+        let o1: bool = try set_add(p, 97 as u32, 122 as u32)
+        let o2: bool = try set_add(p, 0xDF as u32, 0xF6 as u32)
+        let o3: bool = try set_add(p, 0xF8 as u32, 0xFF as u32)
+        let o4: bool = try set_add(p, 0x3B1 as u32, 0x3C9 as u32)
+        let o5: bool = try set_add(p, 0x430 as u32, 0x44F as u32)
+        return true
+    }
+    if name_is(name, n, &w3[0], 1) || name_is(name, n, &w4[0], 6) || name_is(name, n, &w10[0], 10) {
+        let o1: bool = try set_add(p, 65 as u32, 90 as u32)
+        let o2: bool = try set_add(p, 97 as u32, 122 as u32)
+        let o3: bool = try set_add(p, 0xAA as u32, 0xAA as u32)
+        let o4: bool = try set_add(p, 0xB5 as u32, 0xB5 as u32)
+        let o5: bool = try set_add(p, 0xC0 as u32, 0x2FF as u32)
+        let o6: bool = try set_add(p, 0x370 as u32, 0x1FFF as u32)
+        let o7: bool = try set_add(p, 0x2C00 as u32, 0xD7FF as u32)
+        let o8: bool = try set_add(p, 0xF900 as u32, 0xFDCF as u32)
+        let o9: bool = try set_add(p, 0x10000 as u32, 0x10FFFF as u32)
+        return true
+    }
+    (*p).err = true
+    return false
+}
+
+// A single character escape: `\n \t \xHH \uHHHH \u{...} \cX \0`.
+fn char_escape(p: *mut P) -> AllocError!u32 {
+    let c: u32 = p_cur(p)
+    (*p).i = (*p).i + 1
+    if c == 110 as u32 {
+        return 10 as u32
+    }
+    if c == 114 as u32 {
+        return 13 as u32
+    }
+    if c == 116 as u32 {
+        return 9 as u32
+    }
+    if c == 102 as u32 {
+        return 12 as u32
+    }
+    if c == 118 as u32 {
+        return 11 as u32
+    }
+    if c == 98 as u32 {
+        return 8 as u32
+    }
+    if c == 48 as u32 {
+        if p_cur(p) >= 48 as u32 && p_cur(p) <= 57 as u32 {
+            if (*p).unicode {
+                (*p).err = true
+            }
+        }
+        return 0 as u32
+    }
+    if c == 99 as u32 {
+        let l: u32 = p_cur(p)
+        if (l >= 65 as u32 && l <= 90 as u32) || (l >= 97 as u32 && l <= 122 as u32) {
+            (*p).i = (*p).i + 1
+            return l % 32 as u32
+        }
+        if (*p).unicode {
+            (*p).err = true
+            return 0 as u32
+        }
+        return 92 as u32
+    }
+    if c == 120 as u32 {
+        let h1: i32 = hexv(p_cur(p))
+        let h2: i32 = hexv(p_at(p, (*p).i + 1))
+        if h1 < 0 || h2 < 0 {
+            if (*p).unicode {
+                (*p).err = true
+            }
+            return c
+        }
+        (*p).i = (*p).i + 2
+        return ((h1 * 16 + h2) as u32)
+    }
+    if c == 117 as u32 {
+        if p_cur(p) == 123 as u32 {
+            if !(*p).unicode {
+                return c
+            }
+            (*p).i = (*p).i + 1
+            var v: u64 = 0
+            var nd: u64 = 0
+            while hexv(p_cur(p)) >= 0 {
+                v = v * 16 + (hexv(p_cur(p)) as u64)
+                if v > 0x10FFFF {
+                    (*p).err = true
+                    return 0 as u32
+                }
+                nd = nd + 1
+                (*p).i = (*p).i + 1
+            }
+            if nd == 0 || !p_eat(p, 125 as u32) {
+                (*p).err = true
+                return 0 as u32
+            }
+            return v as u32
+        }
+        var v: u32 = 0
+        var k: i64 = 0
+        while k < 4 {
+            let h: i32 = hexv(p_at(p, (*p).i + k))
+            if h < 0 {
+                if (*p).unicode {
+                    (*p).err = true
+                }
+                return c
+            }
+            v = v * 16 as u32 + (h as u32)
+            k = k + 1
+        }
+        (*p).i = (*p).i + 4
+        // A surrogate pair written as two escapes is one code point in
+        // unicode mode.
+        if (*p).unicode && v >= 0xD800 as u32 && v <= 0xDBFF as u32 {
+            if p_cur(p) == 92 as u32 && p_at(p, (*p).i + 1) == 117 as u32 {
+                var w: u32 = 0
+                var ok: bool = true
+                k = 0
+                while k < 4 {
+                    let h: i32 = hexv(p_at(p, (*p).i + 2 + k))
+                    if h < 0 {
+                        ok = false
+                        break
+                    }
+                    w = w * 16 as u32 + (h as u32)
+                    k = k + 1
+                }
+                if ok && w >= 0xDC00 as u32 && w <= 0xDFFF as u32 {
+                    (*p).i = (*p).i + 6
+                    return 0x10000 as u32 + ((v - 0xD800 as u32) << 10) + (w - 0xDC00 as u32)
+                }
+            }
+        }
+        return v
+    }
+    // In unicode mode only the syntax characters may be escaped.
+    if (*p).unicode {
+        if !is_syntax_char(c) && c != 47 as u32 {
+            (*p).err = true
+        }
+    }
+    return c
+}
+
+fn is_syntax_char(c: u32) -> bool {
+    if c == 94 as u32 || c == 36 as u32 || c == 92 as u32 || c == 46 as u32 {
+        return true
+    }
+    if c == 42 as u32 || c == 43 as u32 || c == 63 as u32 || c == 40 as u32 {
+        return true
+    }
+    if c == 41 as u32 || c == 91 as u32 || c == 93 as u32 || c == 123 as u32 {
+        return true
+    }
+    if c == 125 as u32 || c == 124 as u32 {
+        return true
+    }
+    return false
+}
+
+fn hexv(c: u32) -> i32 {
+    if c >= 48 as u32 && c <= 57 as u32 {
+        return (c - 48 as u32) as i32
+    }
+    if c >= 65 as u32 && c <= 70 as u32 {
+        return (c - 55 as u32) as i32
+    }
+    if c >= 97 as u32 && c <= 102 as u32 {
+        return (c - 87 as u32) as i32
+    }
+    return -1
+}
+
+// `[ ... ]`
+fn parse_class(p: *mut P) -> AllocError!u32 {
+    (*p).i = (*p).i + 1
+    let n: u32 = try node_new(p, K_CLASS)
+    let at: u64 = gcvec_length((*p).sets) / 2
+    var neg: u64 = 0
+    if p_eat(p, 94 as u32) {
+        neg = 1
+    }
+    while true {
+        let c: u32 = p_cur(p)
+        if c == 0xFFFFFFFF as u32 {
+            (*p).err = true
+            break
+        }
+        if c == 93 as u32 {
+            (*p).i = (*p).i + 1
+            break
+        }
+        var lo: u32 = 0
+        var is_set: bool = false
+        if c == 92 as u32 {
+            let e: u32 = p_at(p, (*p).i + 1)
+            if e == 100 as u32 || e == 68 as u32 || e == 119 as u32 || e == 87 as u32 || e == 115 as u32 || e == 83 as u32 || e == 112 as u32 || e == 80 as u32 {
+                (*p).i = (*p).i + 1
+                var sneg: u64 = 0
+                let ok: bool = try class_escape(p, &sneg)
+                if sneg != 0 {
+                    // A negated escape inside a class: the complement is
+                    // added as the ranges around it.
+                    let ok2: bool = try invert_last(p, at)
+                }
+                is_set = true
+            } else {
+                (*p).i = (*p).i + 1
+                lo = try char_escape(p)
+            }
+        } else {
+            (*p).i = (*p).i + 1
+            lo = c
+            if (*p).unicode && c >= 0xD800 as u32 && c <= 0xDBFF as u32 {
+                let c2: u32 = p_cur(p)
+                if c2 >= 0xDC00 as u32 && c2 <= 0xDFFF as u32 {
+                    lo = 0x10000 as u32 + ((c - 0xD800 as u32) << 10) + (c2 - 0xDC00 as u32)
+                    (*p).i = (*p).i + 1
+                }
+            }
+        }
+        if (*p).err {
+            break
+        }
+        if is_set {
+            continue
+        }
+        var hi: u32 = lo
+        if p_cur(p) == 45 as u32 && p_at(p, (*p).i + 1) != 93 as u32 && p_at(p, (*p).i + 1) != 0xFFFFFFFF as u32 {
+            (*p).i = (*p).i + 1
+            let d: u32 = p_cur(p)
+            if d == 92 as u32 {
+                let e: u32 = p_at(p, (*p).i + 1)
+                if e == 100 as u32 || e == 68 as u32 || e == 119 as u32 || e == 87 as u32 || e == 115 as u32 || e == 83 as u32 {
+                    // `[a-\d]` is an early error in unicode mode.
+                    if (*p).unicode {
+                        (*p).err = true
+                        break
+                    }
+                    let ok3: bool = try set_add(p, lo, lo)
+                    let ok4: bool = try set_add(p, 45 as u32, 45 as u32)
+                    continue
+                }
+                (*p).i = (*p).i + 1
+                hi = try char_escape(p)
+            } else {
+                (*p).i = (*p).i + 1
+                hi = d
+                if (*p).unicode && d >= 0xD800 as u32 && d <= 0xDBFF as u32 {
+                    let d2: u32 = p_cur(p)
+                    if d2 >= 0xDC00 as u32 && d2 <= 0xDFFF as u32 {
+                        hi = 0x10000 as u32 + ((d - 0xD800 as u32) << 10) + (d2 - 0xDC00 as u32)
+                        (*p).i = (*p).i + 1
+                    }
+                }
+            }
+            if hi < lo {
+                (*p).err = true
+                break
+            }
+        }
+        let ok: bool = try set_add(p, lo, hi)
+    }
+    nset((*p).prog, n, C_A, at)
+    nset((*p).prog, n, C_B, gcvec_length((*p).sets) / 2 - at)
+    nset((*p).prog, n, C_C, neg)
+    return n
+}
+
+// The complement of the ranges added since `at`, in place. `[\D]` is
+// `[^0-9]` written inside a class that may hold more.
+fn invert_last(p: *mut P, at: u64) -> AllocError!bool {
+    let start: u64 = at * 2
+    let end: u64 = gcvec_length((*p).sets)
+    // Collect, complement, write back at the end.
+    var lows: [u32; 64] = [0 as u32; 64]
+    var highs: [u32; 64] = [0 as u32; 64]
+    var cnt: usize = 0
+    var i: u64 = start
+    while i + 1 < end && cnt < 64 {
+        lows[cnt] = gcvec_read_raw((*p).sets, i) as u32
+        highs[cnt] = gcvec_read_raw((*p).sets, i + 1) as u32
+        cnt = cnt + 1
+        i = i + 2
+    }
+    while gcvec_length((*p).sets) > start {
+        let ok: bool = gcvec_remove((*p).sets, gcvec_length((*p).sets) - 1)
+    }
+    // Sort by low bound (insertion, at most 64 entries).
+    var a: usize = 1
+    while a < cnt {
+        let lv: u32 = lows[a]
+        let hv: u32 = highs[a]
+        var b: usize = a
+        while b > 0 && lows[b - 1] > lv {
+            lows[b] = lows[b - 1]
+            highs[b] = highs[b - 1]
+            b = b - 1
+        }
+        lows[b] = lv
+        highs[b] = hv
+        a = a + 1
+    }
+    var pos: u32 = 0
+    var k: usize = 0
+    while k < cnt {
+        if lows[k] > pos {
+            let ok: bool = try set_add(p, pos, lows[k] - 1 as u32)
+        }
+        if highs[k] >= pos {
+            pos = highs[k] + 1 as u32
+        }
+        k = k + 1
+    }
+    if pos <= 0x10FFFF as u32 {
+        let ok: bool = try set_add(p, pos, 0x10FFFF as u32)
+    }
+    return true
+}
+
+// ========================================================== The matcher
+//
+// `m(node, pos, k)` -- match the chain that begins at `node` from `pos` on,
+// and when it runs out continue with the continuation `k`. The answer is
+// the end position or -1.
+
+struct M {
+    realm: Gc[Realm],
+    prog: Gc[GcVec],
+    sets: Gc[GcVec],
+    input: Gc[JsVal],
+    n: i64,
+    caps: *mut i64,
+    ncap: i64,
+    konts: *mut i64,
+    ktop: i64,
+    kmax: i64,
+    fbits: u64,
+    steps: u64,
+    depth: i64,
+    over: bool,
+}
+
+fn icase(st: *mut M) -> bool {
+    return (*st).fbits & F_IGNORECASE != 0
+}
+
+fn uni(st: *mut M) -> bool {
+    return (*st).fbits & F_UNICODE != 0 || (*st).fbits & F_UNICODESETS != 0
+}
+
+fn cap_get(st: *mut M, i: i64) -> i64 {
+    return *(((*st).caps as usize + (i as usize) * 8) as *mut i64)
+}
+
+fn cap_set(st: *mut M, i: i64, v: i64) {
+    *(((*st).caps as usize + (i as usize) * 8) as *mut i64) = v
+}
+
+fn k_get(st: *mut M, k: i64, col: i64) -> i64 {
+    return *(((*st).konts as usize + ((k + col) as usize) * 8) as *mut i64)
+}
+
+fn k_push(st: *mut M, kind: i64, node: i64, parent: i64, a1: i64,
+    a2: i64) -> i64 {
+    let at: i64 = (*st).ktop
+    if at + (KW as i64) >= (*st).kmax {
+        (*st).over = true
+        return 0
+    }
+    let base: usize = (*st).konts as usize + (at as usize) * 8
+    *((base) as *mut i64) = kind
+    *((base + 8) as *mut i64) = node
+    *((base + 16) as *mut i64) = parent
+    *((base + 24) as *mut i64) = a1
+    *((base + 32) as *mut i64) = a2
+    (*st).ktop = at + (KW as i64)
+    return at
+}
+
+fn k_pop(st: *mut M, at: i64) {
+    (*st).ktop = at
+}
+
+// One code point (or one code unit outside unicode mode) forwards.
+fn read_cp(st: *mut M, pos: i64, out: *mut u32) -> i64 {
+    if pos >= (*st).n {
+        return -1
+    }
+    var c: u32 = val.str_at((*st).input, pos as u64)
+    if uni(st) && c >= 0xD800 as u32 && c <= 0xDBFF as u32 && pos + 1 < (*st).n {
+        let c2: u32 = val.str_at((*st).input, (pos + 1) as u64)
+        if c2 >= 0xDC00 as u32 && c2 <= 0xDFFF as u32 {
+            *out = 0x10000 as u32 + ((c - 0xD800 as u32) << 10) + (c2 - 0xDC00 as u32)
+            return pos + 2
+        }
+    }
+    *out = c
+    return pos + 1
+}
+
+// Canonicalize (22.2.2.9), the non-`u` path, out of the generated table
+// (round 95): the simple upper case mapping, plus the rule that a
+// non-ASCII character must not turn into an ASCII one. `U+0131` (dotless
+// i) uppercases to `I` and therefore stays as it is -- the hand written
+// table this replaces mapped it to `U+0130`, which was wrong.
+//
+// WHAT IS STILL NOT THERE: for `/u` and `/v` the standard asks for the
+// SIMPLE CASE FOLDING of CaseFolding.txt, not for the upper case mapping.
+// This engine uses the upper case mapping for both, as it did before; the
+// difference shows on characters whose folding and whose upper case differ
+// (`U+00DF`, `U+1E9E`). It is written down here rather than hidden.
+fn canon(t: u64, c: u32, unicode: bool) -> u32 {
+    if c >= 97 as u32 && c <= 122 as u32 {
+        return c - 32 as u32
+    }
+    if c < 128 as u32 {
+        return c
+    }
+    let u: u32 = ucd.ucd_to_upper(t, c)
+    if u < 128 as u32 {
+        return c
+    }
+    return u
+}
+
+fn same_char(st: *mut M, a: u32, b: u32) -> bool {
+    if a == b {
+        return true
+    }
+    if !icase(st) {
+        return false
+    }
+    return canon((*st).realm.ucdtab, a, uni(st)) == canon((*st).realm.ucdtab, b, uni(st))
+}
+
+fn in_set(st: *mut M, at: u64, cnt: u64, c: u32) -> bool {
+    var i: u64 = 0
+    while i < cnt {
+        let lo: u32 = gcvec_read_raw((*st).sets, (at + i) * 2) as u32
+        let hi: u32 = gcvec_read_raw((*st).sets, (at + i) * 2 + 1) as u32
+        if c >= lo && c <= hi {
+            return true
+        }
+        if icase(st) {
+            let cc: u32 = canon((*st).realm.ucdtab, c, uni(st))
+            var w: u32 = lo
+            var guard: u64 = 0
+            // The range is walked only when it is short; a long range is
+            // covered by the direct test above and by the folded end
+            // points.
+            if hi - lo < 200 as u32 {
+                while w <= hi && guard < 256 {
+                    if canon((*st).realm.ucdtab, w, uni(st)) == cc {
+                        return true
+                    }
+                    w = w + 1 as u32
+                    guard = guard + 1
+                }
+            } else if cc >= lo && cc <= hi {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn is_word(st: *mut M, pos: i64) -> bool {
+    if pos < 0 || pos >= (*st).n {
+        return false
+    }
+    let c: u32 = val.str_at((*st).input, pos as u64)
+    if c >= 48 as u32 && c <= 57 as u32 {
+        return true
+    }
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return true
+    }
+    if c >= 97 as u32 && c <= 122 as u32 {
+        return true
+    }
+    if c == 95 as u32 {
+        return true
+    }
+    if icase(st) && uni(st) {
+        // 22.2.2.7.3: with `iu` the two Kelvin/long-s characters count.
+        if c == 0x17F as u32 || c == 0x212A as u32 {
+            return true
+        }
+    }
+    return false
+}
+
+fn is_line_terminator(c: u32) -> bool {
+    return c == 10 as u32 || c == 13 as u32 || c == 0x2028 as u32 || c == 0x2029 as u32
+}
+
+fn kont(st: *mut M, k: i64, pos: i64) -> AllocError!i64 {
+    if k == 0 {
+        return pos
+    }
+    let kind: i64 = k_get(st, k, 0)
+    let node: i64 = k_get(st, k, 1)
+    let parent: i64 = k_get(st, k, 2)
+    let a1: i64 = k_get(st, k, 3)
+    let a2: i64 = k_get(st, k, 4)
+    if kind == KK_SEQ as i64 {
+        return m(st, node as u32, pos, parent)
+    }
+    if kind == KK_ENDAT as i64 {
+        if pos != a1 {
+            return -1
+        }
+        return kont(st, parent, pos)
+    }
+    if kind == KK_GROUPEND as i64 {
+        let g: i64 = a1
+        let os: i64 = cap_get(st, g * 2)
+        let oe: i64 = cap_get(st, g * 2 + 1)
+        cap_set(st, g * 2, a2)
+        cap_set(st, g * 2 + 1, pos)
+        let res: i64 = try m(st, node as u32, pos, parent)
+        if res < 0 {
+            cap_set(st, g * 2, os)
+            cap_set(st, g * 2 + 1, oe)
+        }
+        return res
+    }
+    // KK_REPEAT: one iteration of the body is through.
+    let rnode: u32 = node as u32
+    let count: u64 = a1 as u64
+    let entry: i64 = a2
+    let min: u64 = nf((*st).prog, rnode, C_A)
+    // 22.2.2.5 step 2.b: an iteration that consumed nothing ends the loop.
+    if pos == entry && count + 1 > min {
+        return -1
+    }
+    return rep(st, rnode, pos, count + 1, parent)
+}
+
+fn rep(st: *mut M, rnode: u32, pos: i64, count: u64, k: i64) -> AllocError!i64 {
+    let min: u64 = nf((*st).prog, rnode, C_A)
+    let max: u64 = nf((*st).prog, rnode, C_B)
+    let greedy: bool = nf((*st).prog, rnode, C_C) != 0
+    let body: u32 = nf((*st).prog, rnode, C_CHILD) as u32
+    let after: u32 = nf((*st).prog, rnode, C_NEXT) as u32
+    if count >= max {
+        return m(st, after, pos, k)
+    }
+    if count >= min && !greedy {
+        let p: i64 = try m(st, after, pos, k)
+        if p >= 0 {
+            return p
+        }
+    }
+    // 22.2.2.5 step 1: the captures of the groups INSIDE the body start
+    // every iteration as `undefined` again. They are saved first, so that a
+    // failed iteration leaves nothing behind.
+    var save: [i64; 64] = [0 as i64; 64]
+    let g0: u64 = nf((*st).prog, rnode, C_D)
+    let g1: u64 = nf((*st).prog, rnode, C_ALT)
+    var gi: u64 = g0
+    while gi <= g1 && (gi as i64) * 2 + 1 < (*st).ncap && gi < 32 {
+        save[(gi * 2) as usize] = cap_get(st, (gi as i64) * 2)
+        save[(gi * 2 + 1) as usize] = cap_get(st, (gi as i64) * 2 + 1)
+        cap_set(st, (gi as i64) * 2, -1)
+        cap_set(st, (gi as i64) * 2 + 1, -1)
+        gi = gi + 1
+    }
+    let kk: i64 = k_push(st, KK_REPEAT as i64, rnode as i64, k, count as i64,
+        pos)
+    var p: i64 = -1
+    if !(*st).over {
+        p = try m(st, body, pos, kk)
+        k_pop(st, kk)
+    }
+    if p >= 0 {
+        return p
+    }
+    gi = g0
+    while gi <= g1 && (gi as i64) * 2 + 1 < (*st).ncap && gi < 32 {
+        cap_set(st, (gi as i64) * 2, save[(gi * 2) as usize])
+        cap_set(st, (gi as i64) * 2 + 1, save[(gi * 2 + 1) as usize])
+        gi = gi + 1
+    }
+    if count >= min && greedy {
+        return m(st, after, pos, k)
+    }
+    return -1
+}
+
+fn m(st: *mut M, node: u32, pos: i64, k: i64) -> AllocError!i64 {
+    (*st).steps = (*st).steps + 1
+    if (*st).steps > STEP_BUDGET || (*st).over {
+        (*st).over = true
+        return -1
+    }
+    (*st).depth = (*st).depth + 1
+    if (*st).depth > DEPTH_BUDGET {
+        (*st).depth = (*st).depth - 1
+        (*st).over = true
+        return -1
+    }
+    let out: i64 = try m_inner(st, node, pos, k)
+    (*st).depth = (*st).depth - 1
+    return out
+}
+
+fn m_inner(st: *mut M, node: u32, pos: i64, k: i64) -> AllocError!i64 {
+    if node == 0 {
+        return kont(st, k, pos)
+    }
+    let kind: u64 = nf((*st).prog, node, C_KIND)
+    let next: u32 = nf((*st).prog, node, C_NEXT) as u32
+    if kind == K_EMPTY {
+        return m(st, next, pos, k)
+    }
+    if kind == K_CHAR {
+        var c: u32 = 0
+        let np: i64 = read_cp(st, pos, &c)
+        if np < 0 {
+            return -1
+        }
+        if !same_char(st, c, nf((*st).prog, node, C_A) as u32) {
+            return -1
+        }
+        return m(st, next, np, k)
+    }
+    if kind == K_CLASS {
+        var c: u32 = 0
+        let np: i64 = read_cp(st, pos, &c)
+        if np < 0 {
+            return -1
+        }
+        let inside: bool = in_set(st, nf((*st).prog, node, C_A),
+            nf((*st).prog, node, C_B), c)
+        let neg: bool = nf((*st).prog, node, C_C) != 0
+        if inside == neg {
+            return -1
+        }
+        return m(st, next, np, k)
+    }
+    if kind == K_ANY {
+        var c: u32 = 0
+        let np: i64 = read_cp(st, pos, &c)
+        if np < 0 {
+            return -1
+        }
+        if (*st).fbits & F_DOTALL == 0 && is_line_terminator(c) {
+            return -1
+        }
+        return m(st, next, np, k)
+    }
+    if kind == K_BOL {
+        var ok: bool = pos == 0
+        if !ok && (*st).fbits & F_MULTILINE != 0 {
+            ok = is_line_terminator(val.str_at((*st).input, (pos - 1) as u64))
+        }
+        if !ok {
+            return -1
+        }
+        return m(st, next, pos, k)
+    }
+    if kind == K_EOL {
+        var ok: bool = pos == (*st).n
+        if !ok && (*st).fbits & F_MULTILINE != 0 {
+            ok = is_line_terminator(val.str_at((*st).input, pos as u64))
+        }
+        if !ok {
+            return -1
+        }
+        return m(st, next, pos, k)
+    }
+    if kind == K_WORDB {
+        let a: bool = is_word(st, pos - 1)
+        let b: bool = is_word(st, pos)
+        var at_b: bool = a != b
+        if nf((*st).prog, node, C_A) != 0 {
+            at_b = !at_b
+        }
+        if !at_b {
+            return -1
+        }
+        return m(st, next, pos, k)
+    }
+    if kind == K_GROUP {
+        let g: u64 = nf((*st).prog, node, C_A)
+        let body: u32 = nf((*st).prog, node, C_CHILD) as u32
+        if g == 0 {
+            let kk: i64 = k_push(st, KK_SEQ as i64, next as i64, k, 0, 0)
+            if (*st).over {
+                return -1
+            }
+            let p: i64 = try m(st, body, pos, kk)
+            k_pop(st, kk)
+            return p
+        }
+        let kk: i64 = k_push(st, KK_GROUPEND as i64, next as i64, k,
+            g as i64, pos)
+        if (*st).over {
+            return -1
+        }
+        let p: i64 = try m(st, body, pos, kk)
+        k_pop(st, kk)
+        return p
+    }
+    if kind == K_ALT {
+        var b: u32 = nf((*st).prog, node, C_CHILD) as u32
+        while b != 0 {
+            let kk: i64 = k_push(st, KK_SEQ as i64, next as i64, k, 0, 0)
+            if (*st).over {
+                return -1
+            }
+            let saved: i64 = (*st).ktop
+            let p: i64 = try m(st, b, pos, kk)
+            k_pop(st, kk)
+            if p >= 0 {
+                return p
+            }
+            b = nf((*st).prog, b, C_ALT) as u32
+        }
+        return -1
+    }
+    if kind == K_REPEAT {
+        return rep(st, node, pos, 0, k)
+    }
+    if kind == K_BACKREF {
+        var g: i64 = nf((*st).prog, node, C_A) as i64
+        if g == 0 {
+            g = nf((*st).prog, node, C_D) as i64
+        }
+        if g <= 0 || g * 2 + 1 >= (*st).ncap {
+            return m(st, next, pos, k)
+        }
+        let s: i64 = cap_get(st, g * 2)
+        let e: i64 = cap_get(st, g * 2 + 1)
+        if s < 0 || e < 0 {
+            return m(st, next, pos, k)
+        }
+        let ln: i64 = e - s
+        if pos + ln > (*st).n {
+            return -1
+        }
+        var i: i64 = 0
+        while i < ln {
+            let a: u32 = val.str_at((*st).input, (s + i) as u64)
+            let b: u32 = val.str_at((*st).input, (pos + i) as u64)
+            if !same_char(st, a, b) {
+                return -1
+            }
+            i = i + 1
+        }
+        return m(st, next, pos + ln, k)
+    }
+    // K_LOOK
+    let which: u64 = nf((*st).prog, node, C_A)
+    let body: u32 = nf((*st).prog, node, C_CHILD) as u32
+    // The captures of a failed lookaround are undone.
+    var save: [i64; 64] = [0 as i64; 64]
+    var i: i64 = 0
+    while i < (*st).ncap && i < 64 {
+        save[i as usize] = cap_get(st, i)
+        i = i + 1
+    }
+    var hit: bool = false
+    if which < 2 {
+        let p: i64 = try m(st, body, pos, 0)
+        hit = p >= 0
+    } else {
+        var start: i64 = pos
+        while start >= 0 {
+            let kk: i64 = k_push(st, KK_ENDAT as i64, 0, 0, pos, 0)
+            if (*st).over {
+                return -1
+            }
+            let p: i64 = try m(st, body, start, kk)
+            k_pop(st, kk)
+            if p >= 0 {
+                hit = true
+                break
+            }
+            start = start - 1
+        }
+    }
+    let positive: bool = which == 0 || which == 2
+    if hit != positive {
+        i = 0
+        while i < (*st).ncap && i < 64 {
+            cap_set(st, i, save[i as usize])
+            i = i + 1
+        }
+        return -1
+    }
+    if !positive {
+        i = 0
+        while i < (*st).ncap && i < 64 {
+            cap_set(st, i, save[i as usize])
+            i = i + 1
+        }
+    }
+    let res: i64 = try m(st, next, pos, k)
+    if res < 0 {
+        i = 0
+        while i < (*st).ncap && i < 64 {
+            cap_set(st, i, save[i as usize])
+            i = i + 1
+        }
+    }
+    return res
+}
+
+// ================================================ The RegExp object itself
+
+fn is_regexp(v: Gc[JsVal]) -> bool {
+    let o: Gc[JsObj] = val.as_obj(v)
+    return (o as u64) != 0 && o.cls == val.CLS_REGEXP
+}
+
+fn syntax_err(r: Gc[Realm]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 39] = "the regular expression does not compile"
+    return interp.throw_error(r, interp.ERR_SYNTAX, &m[0], 39)
+}
+
+fn parse_flags(r: Gc[Realm], f: Gc[JsVal], out: *mut u64) -> bool {
+    var bits: u64 = 0
+    var i: u64 = 0
+    while i < val.str_len(f) {
+        let c: u32 = val.str_at(f, i)
+        var b: u64 = 0
+        if c == 100 as u32 {
+            b = F_HASINDICES
+        } else if c == 103 as u32 {
+            b = F_GLOBAL
+        } else if c == 105 as u32 {
+            b = F_IGNORECASE
+        } else if c == 109 as u32 {
+            b = F_MULTILINE
+        } else if c == 115 as u32 {
+            b = F_DOTALL
+        } else if c == 117 as u32 {
+            b = F_UNICODE
+        } else if c == 121 as u32 {
+            b = F_STICKY
+        } else if c == 118 as u32 {
+            b = F_UNICODESETS
+        } else {
+            return false
+        }
+        if bits & b != 0 {
+            return false
+        }
+        bits = bits | b
+        i = i + 1
+    }
+    if bits & F_UNICODE != 0 && bits & F_UNICODESETS != 0 {
+        return false
+    }
+    *out = bits
+    return true
+}
+
+// Compile a pattern into a fresh RegExp object.
+fn make_regexp(r: Gc[Realm], source: Gc[JsVal],
+    flags: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    var bits: u64 = 0
+    if !parse_flags(r, flags, &bits) {
+        var m: [u8; 42] = "the regular expression flags are not valid"
+        let x: Gc[JsVal] = try interp.throw_error(r, interp.ERR_SYNTAX,
+            &m[0], 42)
+        return val.realm_undefined(r)
+    }
+    let re: Gc[JsRegExp] = try val.regexp_new(r,
+        val.realm_proto(r, val.PROTO_REGEXP))
+    re.source = source
+    re.flag_text = flags
+    re.fbits = bits
+    let unicode: bool = bits & F_UNICODE != 0 || bits & F_UNICODESETS != 0
+    // Two passes: the first counts the groups and collects their names (a
+    // named backreference may stand before its group), the second builds.
+    var pass: u64 = 0
+    while pass < 2 {
+        var p: P = P { realm: r, src: source, n: val.str_len(source) as i64,
+            i: 0, prog: re.prog, sets: re.sets, ngroups: 0,
+            unicode: unicode, err: false, names: re.group_names, pass: pass }
+        // Node 0 is never used: it is the end of a chain.
+        let dummy: u32 = try node_new(&p, K_EMPTY)
+        let root: u32 = try parse_disjunction(&p)
+        if p.i < p.n {
+            p.err = true
+        }
+        if p.err {
+            let x: Gc[JsVal] = try syntax_err(r)
+            return val.realm_undefined(r)
+        }
+        if pass == 0 {
+            re.ngroups = p.ngroups
+            re.prog = try gcvec_new_raw()
+            re.sets = try gcvec_new_raw()
+        } else {
+            re.node = root as u64
+        }
+        pass = pass + 1
+    }
+    let rv: Gc[JsVal] = re
+    let lk: u64 = try last_index_key(r)
+    let zero: Gc[JsVal] = try val.realm_num(r, 0.0)
+    let ok: bool = try interp.define_value(r, re, lk, zero, val.A_WRITABLE)
+    return rv
+}
+
+fn key_ascii(r: Gc[Realm], name: *mut u8, n: usize) -> AllocError!u64 {
+    let s: Gc[JsVal] = try val.str_from_ascii(r, name, n)
+    return val.key_for_str(r, s)
+}
+
+fn last_index_key(r: Gc[Realm]) -> AllocError!u64 {
+    var m: [u8; 9] = "lastIndex"
+    return key_ascii(r, &m[0], 9)
+}
+
+// The MATCH itself: try the pattern at `start`, hand the captures back.
+fn run_match(r: Gc[Realm], re: Gc[JsRegExp], input: Gc[JsVal], start: i64,
+    caps: *mut i64, ncap: i64, over: *mut bool) -> AllocError!bool {
+    var konts: [i64; 20005] = [0 as i64; 20005]
+    var st: M = M { realm: r, prog: re.prog, sets: re.sets, input: input,
+        n: val.str_len(input) as i64, caps: caps, ncap: ncap,
+        konts: &konts[0], ktop: 5, kmax: 20000, fbits: re.fbits, steps: 0,
+        depth: 0, over: false }
+    var i: i64 = 0
+    while i < ncap {
+        *((caps as usize + (i as usize) * 8) as *mut i64) = -1
+        i = i + 1
+    }
+    let end: i64 = try m(&st, re.node as u32, start, 0)
+    *over = st.over
+    if end < 0 {
+        return false
+    }
+    *((caps as usize) as *mut i64) = start
+    *((caps as usize + 8) as *mut i64) = end
+    return true
+}
+
+// 22.2.7.2 RegExpBuiltinExec.
+fn regexp_exec(r: Gc[Realm], rev: Gc[JsVal],
+    sv: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let re: Gc[JsRegExp] = val.as_regexp(rev)
+    if (re as u64) == 0 {
+        var m: [u8; 40] = "the receiver is not a regular expression"
+        return interp.throw_type_here(r, &m[0], 40)
+    }
+    let s: Gc[JsVal] = try interp.to_string(r, sv)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    let n: i64 = val.str_len(s) as i64
+    let global: bool = re.fbits & F_GLOBAL != 0
+    let sticky: bool = re.fbits & F_STICKY != 0
+    let lk: u64 = try last_index_key(r)
+    var start: i64 = 0
+    if global || sticky {
+        let lv: Gc[JsVal] = try interp.get_prop(r, rev, lk)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        let li: u64 = try interp.to_length(r, lv)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        start = li as i64
+    }
+    let ncap: i64 = ((re.ngroups + 1) * 2) as i64
+    var caps: [i64; 130] = [0 as i64; 130]
+    var found: bool = false
+    var over: bool = false
+    while start <= n {
+        let hit: bool = try run_match(r, re, s, start, &caps[0], ncap, &over)
+        if hit {
+            found = true
+            break
+        }
+        if over {
+            break
+        }
+        if sticky {
+            break
+        }
+        // In unicode mode the start advances by a whole code point.
+        start = start + 1
+        if re.fbits & F_UNICODE != 0 && start < n {
+            let c: u32 = val.str_at(s, (start - 1) as u64)
+            if c >= 0xD800 as u32 && c <= 0xDBFF as u32 {
+                let c2: u32 = val.str_at(s, start as u64)
+                if c2 >= 0xDC00 as u32 && c2 <= 0xDFFF as u32 {
+                    start = start + 1
+                }
+            }
+        }
+    }
+    if !found {
+        if global || sticky {
+            let z: Gc[JsVal] = try val.realm_num(r, 0.0)
+            let ok: bool = try interp.set_prop(r, rev, lk, z, true)
+        }
+        return val.realm_null(r)
+    }
+    if global || sticky {
+        let e: Gc[JsVal] = try val.realm_num(r, caps[1] as f64)
+        let ok: bool = try interp.set_prop(r, rev, lk, e, true)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+    }
+    return build_result(r, re, s, &caps[0], ncap)
+}
+
+fn thrown(r: Gc[Realm]) -> bool {
+    let c: *mut interp.Ctx = interp.ctx_of(r)
+    return (*c).comp != interp.C_NORMAL
+}
+
+fn build_result(r: Gc[Realm], re: Gc[JsRegExp], s: Gc[JsVal], caps: *mut i64,
+    ncap: i64) -> AllocError!Gc[JsVal] {
+    let a: Gc[JsObj] = try val.array_new(r)
+    var g: i64 = 0
+    while g * 2 + 1 < ncap {
+        let st: i64 = *((caps as usize + ((g * 2) as usize) * 8) as *mut i64)
+        let en: i64 = *((caps as usize + ((g * 2 + 1) as usize) * 8) as *mut i64)
+        var piece: Gc[JsVal] = val.realm_undefined(r)
+        if st >= 0 && en >= st {
+            piece = try val.str_slice(r, s, st as u64, en as u64)
+        }
+        let ok: bool = try val.elems_push(r, a, piece)
+        a.len = a.len + 1
+        g = g + 1
+    }
+    var ixn: [u8; 5] = "index"
+    var inn: [u8; 5] = "input"
+    var grn: [u8; 6] = "groups"
+    let iv: Gc[JsVal] = try val.realm_num(r,
+        (*((caps as usize) as *mut i64)) as f64)
+    let o1: bool = try putv(r, a, &ixn[0], 5, iv)
+    let o2: bool = try putv(r, a, &inn[0], 5, s)
+    var groups: Gc[JsVal] = val.realm_undefined(r)
+    var any_name: bool = false
+    var i: u64 = 1
+    while i < gcvec_length(re.group_names) {
+        if (gcvec_read[JsVal](re.group_names, i) as u64) != 0 {
+            any_name = true
+        }
+        i = i + 1
+    }
+    if any_name {
+        let go: Gc[JsObj] = try val.obj_new_proto(r, gc_null[JsObj]())
+        i = 1
+        while i < gcvec_length(re.group_names) {
+            let nm: Gc[JsVal] = gcvec_read[JsVal](re.group_names, i)
+            if (nm as u64) != 0 {
+                let k: u64 = try val.key_for_str(r, nm)
+                let st: i64 = *((caps as usize + ((i * 2) as usize) * 8) as *mut i64)
+                let en: i64 = *((caps as usize + ((i * 2 + 1) as usize) * 8) as *mut i64)
+                var piece: Gc[JsVal] = val.realm_undefined(r)
+                if st >= 0 && en >= st {
+                    piece = try val.str_slice(r, s, st as u64, en as u64)
+                }
+                let ok: bool = try interp.define_value(r, go, k, piece,
+                    val.A_DEFAULT)
+            }
+            i = i + 1
+        }
+        groups = go
+    }
+    let o3: bool = try putv(r, a, &grn[0], 6, groups)
+    if re.fbits & F_HASINDICES != 0 {
+        let ind: Gc[JsObj] = try val.array_new(r)
+        g = 0
+        while g * 2 + 1 < ncap {
+            let st: i64 = *((caps as usize + ((g * 2) as usize) * 8) as *mut i64)
+            let en: i64 = *((caps as usize + ((g * 2 + 1) as usize) * 8) as *mut i64)
+            var pair: Gc[JsVal] = val.realm_undefined(r)
+            if st >= 0 && en >= st {
+                let pa: Gc[JsObj] = try val.array_new(r)
+                let sv: Gc[JsVal] = try val.realm_num(r, st as f64)
+                let ev: Gc[JsVal] = try val.realm_num(r, en as f64)
+                let q1: bool = try val.elems_push(r, pa, sv)
+                let q2: bool = try val.elems_push(r, pa, ev)
+                pa.len = 2
+                pair = pa
+            }
+            let ok: bool = try val.elems_push(r, ind, pair)
+            ind.len = ind.len + 1
+            g = g + 1
+        }
+        let indv: Gc[JsVal] = ind
+        let o5: bool = try putv(r, a, &grn[0], 6, groups)
+        var idn: [u8; 7] = "indices"
+        let o6: bool = try putv(r, a, &idn[0], 7, indv)
+    }
+    let av: Gc[JsVal] = a
+    return av
+}
+
+fn putv(r: Gc[Realm], o: Gc[JsObj], name: *mut u8, n: usize,
+    v: Gc[JsVal]) -> AllocError!bool {
+    let k: u64 = try key_ascii(r, name, n)
+    return interp.define_value(r, o, k, v, val.A_DEFAULT)
+}
+
+fn regexp_exec_pub(r: Gc[Realm], rev: Gc[JsVal],
+    sv: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    return regexp_exec(r, rev, sv)
+}
+
+// 22.2.7.1: the `exec` of the object is used when it is callable, so that a
+// subclass can take over.
+fn exec_of(r: Gc[Realm], rev: Gc[JsVal], sv: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    var en: [u8; 4] = "exec"
+    let ek: u64 = try key_ascii(r, &en[0], 4)
+    let f: Gc[JsVal] = try interp.get_prop(r, rev, ek)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    if val.is_callable(f) && !is_builtin_exec(f) {
+        let ca: Gc[GcVec] = try interp.args_new(r)
+        let ok: bool = try gcvec_append[JsVal](ca, sv)
+        let res: Gc[JsVal] = try interp.call_function(r, f, rev, ca)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        if val.val_tag(res) != val.TAG_OBJ && val.val_tag(res) != val.TAG_NULL {
+            var m: [u8; 34] = "exec must answer an object or null"
+            return interp.throw_type_here(r, &m[0], 34)
+        }
+        return res
+    }
+    return regexp_exec(r, rev, sv)
+}
+
+fn is_builtin_exec(f: Gc[JsVal]) -> bool {
+    let o: Gc[JsObj] = val.as_obj(f)
+    return (o as u64) != 0 && o.cls == val.CLS_NATIVE && o.native == R_EXEC
+}
+
+// ================================================= The prototype and the
+// four symbol protocols
+
+fn get_flags_bits(r: Gc[Realm], rev: Gc[JsVal], out: *mut u64) -> AllocError!bool {
+    // 22.2.6.4: the flags are read as PROPERTIES, so that a subclass can
+    // change them.
+    let re: Gc[JsRegExp] = val.as_regexp(rev)
+    if (re as u64) != 0 {
+        *out = re.fbits
+        return true
+    }
+    var bits: u64 = 0
+    var n1: [u8; 6] = "global"
+    var n2: [u8; 10] = "ignoreCase"
+    var n3: [u8; 9] = "multiline"
+    var n4: [u8; 6] = "sticky"
+    var n5: [u8; 7] = "unicode"
+    var n6: [u8; 6] = "dotAll"
+    var n7: [u8; 10] = "hasIndices"
+    let b1: bool = try flag_of(r, rev, &n1[0], 6)
+    let b2: bool = try flag_of(r, rev, &n2[0], 10)
+    let b3: bool = try flag_of(r, rev, &n3[0], 9)
+    let b4: bool = try flag_of(r, rev, &n4[0], 6)
+    let b5: bool = try flag_of(r, rev, &n5[0], 7)
+    let b6: bool = try flag_of(r, rev, &n6[0], 6)
+    let b7: bool = try flag_of(r, rev, &n7[0], 10)
+    if b1 {
+        bits = bits | F_GLOBAL
+    }
+    if b2 {
+        bits = bits | F_IGNORECASE
+    }
+    if b3 {
+        bits = bits | F_MULTILINE
+    }
+    if b4 {
+        bits = bits | F_STICKY
+    }
+    if b5 {
+        bits = bits | F_UNICODE
+    }
+    if b6 {
+        bits = bits | F_DOTALL
+    }
+    if b7 {
+        bits = bits | F_HASINDICES
+    }
+    *out = bits
+    return true
+}
+
+fn flag_of(r: Gc[Realm], rev: Gc[JsVal], name: *mut u8,
+    n: usize) -> AllocError!bool {
+    let k: u64 = try key_ascii(r, name, n)
+    let v: Gc[JsVal] = try interp.get_prop(r, rev, k)
+    if thrown(r) {
+        return false
+    }
+    return interp.to_boolean(r, v)
+}
+
+fn flags_text(r: Gc[Realm], bits: u64) -> AllocError!Gc[JsVal] {
+    let out: Gc[JsStr] = try val.str_new(r)
+    if bits & F_HASINDICES != 0 {
+        let o: bool = try val.str_push(out, 100 as u32)
+    }
+    if bits & F_GLOBAL != 0 {
+        let o: bool = try val.str_push(out, 103 as u32)
+    }
+    if bits & F_IGNORECASE != 0 {
+        let o: bool = try val.str_push(out, 105 as u32)
+    }
+    if bits & F_MULTILINE != 0 {
+        let o: bool = try val.str_push(out, 109 as u32)
+    }
+    if bits & F_DOTALL != 0 {
+        let o: bool = try val.str_push(out, 115 as u32)
+    }
+    if bits & F_UNICODE != 0 {
+        let o: bool = try val.str_push(out, 117 as u32)
+    }
+    if bits & F_UNICODESETS != 0 {
+        let o: bool = try val.str_push(out, 118 as u32)
+    }
+    if bits & F_STICKY != 0 {
+        let o: bool = try val.str_push(out, 121 as u32)
+    }
+    let ov: Gc[JsVal] = out
+    return ov
+}
+
+fn this_regexp(r: Gc[Realm], this: Gc[JsVal]) -> Gc[JsRegExp] {
+    return val.as_regexp(this)
+}
+
+fn regexp_dispatch(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    if id == R_CTOR {
+        return regexp_ctor(r, args, nt)
+    }
+    if id == R_SPECIES {
+        return this
+    }
+    if id >= R_STR_MATCH && id <= R_STR_SPLIT {
+        return string_side(r, id, this, args)
+    }
+    if id == R_STRITER_NEXT {
+        return string_iter_next(r, this)
+    }
+    if id >= R_SYM_MATCH && id <= R_SYM_SPLIT {
+        return symbol_side(r, id, this, args)
+    }
+    if id == R_EXEC || id == R_TEST {
+        if !is_regexp(this) {
+            var m: [u8; 40] = "the receiver is not a regular expression"
+            return interp.throw_type_here(r, &m[0], 40)
+        }
+        let res: Gc[JsVal] = try regexp_exec(r, this, arg(r, args, 0))
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        if id == R_TEST {
+            return val.realm_bool(r, !val.is_null(res))
+        }
+        return res
+    }
+    if id == R_TOSTRING {
+        if val.val_tag(this) != val.TAG_OBJ {
+            var m: [u8; 29] = "the receiver is not an object"
+            return interp.throw_type_here(r, &m[0], 29)
+        }
+        var sn: [u8; 6] = "source"
+        var fn2: [u8; 5] = "flags"
+        let sk: u64 = try key_ascii(r, &sn[0], 6)
+        let fk: u64 = try key_ascii(r, &fn2[0], 5)
+        let sv: Gc[JsVal] = try interp.get_prop(r, this, sk)
+        let fv: Gc[JsVal] = try interp.get_prop(r, this, fk)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        let ss: Gc[JsVal] = try interp.to_string(r, sv)
+        let fs: Gc[JsVal] = try interp.to_string(r, fv)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        let out: Gc[JsStr] = try val.str_new(r)
+        let o1: bool = try val.str_push(out, 47 as u32)
+        var i: u64 = 0
+        while i < val.str_len(ss) {
+            let o: bool = try val.str_push(out, val.str_at(ss, i))
+            i = i + 1
+        }
+        let o2: bool = try val.str_push(out, 47 as u32)
+        i = 0
+        while i < val.str_len(fs) {
+            let o: bool = try val.str_push(out, val.str_at(fs, i))
+            i = i + 1
+        }
+        let ov: Gc[JsVal] = out
+        return ov
+    }
+    // The accessors of the prototype.
+    let re: Gc[JsRegExp] = this_regexp(r, this)
+    if (re as u64) == 0 {
+        // On %RegExp.prototype% itself the accessors answer `undefined`
+        // resp. the text "(?:)" (22.2.6.x note).
+        let o: Gc[JsObj] = val.as_obj(this)
+        if (o as u64) != 0 && (o as u64) == (val.realm_proto(r, val.PROTO_REGEXP) as u64) {
+            if id == R_SOURCE {
+                var e: [u8; 4] = "(?:)"
+                return val.str_from_ascii(r, &e[0], 4)
+            }
+            if id == R_FLAGS {
+                return val.str_empty(r)
+            }
+            return val.realm_undefined(r)
+        }
+        var m: [u8; 40] = "the receiver is not a regular expression"
+        return interp.throw_type_here(r, &m[0], 40)
+    }
+    if id == R_SOURCE {
+        if val.str_len(re.source) == 0 {
+            var e: [u8; 4] = "(?:)"
+            return val.str_from_ascii(r, &e[0], 4)
+        }
+        return escape_source(r, re.source)
+    }
+    if id == R_FLAGS {
+        return flags_text(r, re.fbits)
+    }
+    if id == R_GLOBAL {
+        return val.realm_bool(r, re.fbits & F_GLOBAL != 0)
+    }
+    if id == R_IGNORECASE {
+        return val.realm_bool(r, re.fbits & F_IGNORECASE != 0)
+    }
+    if id == R_MULTILINE {
+        return val.realm_bool(r, re.fbits & F_MULTILINE != 0)
+    }
+    if id == R_DOTALL {
+        return val.realm_bool(r, re.fbits & F_DOTALL != 0)
+    }
+    if id == R_UNICODE {
+        return val.realm_bool(r, re.fbits & F_UNICODE != 0)
+    }
+    if id == R_UNICODESETS {
+        return val.realm_bool(r, re.fbits & F_UNICODESETS != 0)
+    }
+    if id == R_STICKY {
+        return val.realm_bool(r, re.fbits & F_STICKY != 0)
+    }
+    if id == R_HASINDICES {
+        return val.realm_bool(r, re.fbits & F_HASINDICES != 0)
+    }
+    return val.realm_undefined(r)
+}
+
+// 22.2.6.10 EscapeRegExpPattern: a `/` and a line terminator must not end
+// the literal that `source` pretends to be.
+fn escape_source(r: Gc[Realm], s: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let out: Gc[JsStr] = try val.str_new(r)
+    var i: u64 = 0
+    var in_class: bool = false
+    while i < val.str_len(s) {
+        let c: u32 = val.str_at(s, i)
+        if c == 92 as u32 && i + 1 < val.str_len(s) {
+            let o1: bool = try val.str_push(out, c)
+            let o2: bool = try val.str_push(out, val.str_at(s, i + 1))
+            i = i + 2
+            continue
+        }
+        if c == 91 as u32 {
+            in_class = true
+        }
+        if c == 93 as u32 {
+            in_class = false
+        }
+        if c == 47 as u32 && !in_class {
+            let o1: bool = try val.str_push(out, 92 as u32)
+            let o2: bool = try val.str_push(out, c)
+            i = i + 1
+            continue
+        }
+        if c == 10 as u32 || c == 13 as u32 || c == 0x2028 as u32 || c == 0x2029 as u32 {
+            let o1: bool = try val.str_push(out, 92 as u32)
+            if c == 10 as u32 {
+                let o2: bool = try val.str_push(out, 110 as u32)
+            } else if c == 13 as u32 {
+                let o2: bool = try val.str_push(out, 114 as u32)
+            } else if c == 0x2028 as u32 {
+                var e: [u8; 5] = "u2028"
+                var k: usize = 0
+                while k < 5 {
+                    let o2: bool = try val.str_push(out, e[k] as u32)
+                    k = k + 1
+                }
+            } else {
+                var e: [u8; 5] = "u2029"
+                var k: usize = 0
+                while k < 5 {
+                    let o2: bool = try val.str_push(out, e[k] as u32)
+                    k = k + 1
+                }
+            }
+            i = i + 1
+            continue
+        }
+        let o: bool = try val.str_push(out, c)
+        i = i + 1
+    }
+    let ov: Gc[JsVal] = out
+    return ov
+}
+
+fn arg(r: Gc[Realm], args: Gc[GcVec], i: u64) -> Gc[JsVal] {
+    return interp.args_at(r, args, i)
+}
+
+fn regexp_ctor(r: Gc[Realm], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    let pv: Gc[JsVal] = arg(r, args, 0)
+    let fv: Gc[JsVal] = arg(r, args, 1)
+    var source: Gc[JsVal] = val.str_empty(r)
+    var flags: Gc[JsVal] = val.str_empty(r)
+    if is_regexp(pv) {
+        let old: Gc[JsRegExp] = val.as_regexp(pv)
+        source = old.source
+        if val.is_undefined(fv) {
+            flags = old.flag_text
+        } else {
+            flags = try interp.to_string(r, fv)
+        }
+        // `RegExp(re)` without `new` and without flags hands the same
+        // object back (22.2.4.1 step 2).
+        if (nt as u64) == 0 && val.is_undefined(fv) {
+            return pv
+        }
+    } else {
+        if !val.is_undefined(pv) {
+            source = try interp.to_string(r, pv)
+        }
+        if !val.is_undefined(fv) {
+            flags = try interp.to_string(r, fv)
+        }
+    }
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    return make_regexp(r, source, flags)
+}
+
+// ---- the four protocols of 22.2.6
+
+fn set_last_index(r: Gc[Realm], rev: Gc[JsVal], v: f64) -> AllocError!bool {
+    let lk: u64 = try last_index_key(r)
+    let nv: Gc[JsVal] = try val.realm_num(r, v)
+    return interp.set_prop(r, rev, lk, nv, true)
+}
+
+fn get_last_index(r: Gc[Realm], rev: Gc[JsVal]) -> AllocError!u64 {
+    let lk: u64 = try last_index_key(r)
+    let lv: Gc[JsVal] = try interp.get_prop(r, rev, lk)
+    if thrown(r) {
+        return 0
+    }
+    return interp.to_length(r, lv)
+}
+
+fn advance_index(s: Gc[JsVal], i: u64, unicode: bool) -> u64 {
+    if !unicode || i + 1 >= val.str_len(s) {
+        return i + 1
+    }
+    let c: u32 = val.str_at(s, i)
+    if c >= 0xD800 as u32 && c <= 0xDBFF as u32 {
+        let c2: u32 = val.str_at(s, i + 1)
+        if c2 >= 0xDC00 as u32 && c2 <= 0xDFFF as u32 {
+            return i + 2
+        }
+    }
+    return i + 1
+}
+
+fn symbol_side(r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    if val.val_tag(this) != val.TAG_OBJ {
+        var m: [u8; 29] = "the receiver is not an object"
+        return interp.throw_type_here(r, &m[0], 29)
+    }
+    let s: Gc[JsVal] = try interp.to_string(r, arg(r, args, 0))
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    var bits: u64 = 0
+    let okf: bool = try get_flags_bits(r, this, &bits)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    let global: bool = bits & F_GLOBAL != 0
+    let unicode: bool = bits & F_UNICODE != 0 || bits & F_UNICODESETS != 0
+    if id == R_SYM_SEARCH {
+        let prev: u64 = try get_last_index(r, this)
+        let o1: bool = try set_last_index(r, this, 0.0)
+        let res: Gc[JsVal] = try exec_of(r, this, s)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        let o2: bool = try set_last_index(r, this, prev as f64)
+        if val.is_null(res) {
+            return val.realm_num(r, 0.0 - 1.0)
+        }
+        var ixn: [u8; 5] = "index"
+        let ik: u64 = try key_ascii(r, &ixn[0], 5)
+        return interp.get_prop(r, res, ik)
+    }
+    if id == R_SYM_MATCHALL {
+        return make_string_iter(r, this, s, global, unicode)
+    }
+    if id == R_SYM_MATCH {
+        if !global {
+            return exec_of(r, this, s)
+        }
+        let o1: bool = try set_last_index(r, this, 0.0)
+        let items: Gc[GcVec] = try interp.args_new(r)
+        var guard: u64 = 0
+        while guard < 1000000 {
+            let res: Gc[JsVal] = try exec_of(r, this, s)
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            if val.is_null(res) {
+                break
+            }
+            let m0: Gc[JsVal] = try aget0(r, res)
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            let ms: Gc[JsVal] = try interp.to_string(r, m0)
+            let ok: bool = try gcvec_append[JsVal](items, ms)
+            if val.str_len(ms) == 0 {
+                let li: u64 = try get_last_index(r, this)
+                let o2: bool = try set_last_index(r,
+                    this, advance_index(s, li, unicode) as f64)
+            }
+            guard = guard + 1
+        }
+        if gcvec_length(items) == 0 {
+            return val.realm_null(r)
+        }
+        return new_array(r, items)
+    }
+    if id == R_SYM_SPLIT {
+        return do_split(r, this, s, arg(r, args, 1), unicode)
+    }
+    return do_replace(r, this, s, arg(r, args, 1), global, unicode)
+}
+
+fn aget0(r: Gc[Realm], res: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let k: u64 = try val.key_for_index(r, 0)
+    return interp.get_prop(r, res, k)
+}
+
+fn new_array(r: Gc[Realm], items: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let a: Gc[JsObj] = try val.array_new(r)
+    var i: u64 = 0
+    while i < gcvec_length(items) {
+        let ok: bool = try val.elems_push(r, a, gcvec_read[JsVal](items, i))
+        a.len = a.len + 1
+        i = i + 1
+    }
+    let av: Gc[JsVal] = a
+    return av
+}
+
+fn do_split(r: Gc[Realm], rev: Gc[JsVal], s: Gc[JsVal], limv: Gc[JsVal],
+    unicode: bool) -> AllocError!Gc[JsVal] {
+    var lim: u64 = 0xFFFFFFFF
+    if !val.is_undefined(limv) {
+        let l: u32 = try interp.to_uint32(r, limv)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        lim = l as u64
+    }
+    let items: Gc[GcVec] = try interp.args_new(r)
+    if lim == 0 {
+        return new_array(r, items)
+    }
+    let n: u64 = val.str_len(s)
+    // A sticky copy, so that the search really starts where it should.
+    var fl: [u8; 1] = "y"
+    var flags: Gc[JsVal] = try flags_text(r, split_bits(r, rev, unicode))
+    let sp: Gc[JsVal] = try clone_for_split(r, rev)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    if n == 0 {
+        let res: Gc[JsVal] = try exec_of(r, sp, s)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        if !val.is_null(res) {
+            return new_array(r, items)
+        }
+        let ok: bool = try gcvec_append[JsVal](items, s)
+        return new_array(r, items)
+    }
+    var p: u64 = 0
+    var q: u64 = 0
+    while q < n {
+        let ok0: bool = try set_last_index(r, sp, q as f64)
+        let res: Gc[JsVal] = try exec_of(r, sp, s)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        if val.is_null(res) {
+            q = advance_index(s, q, unicode)
+            continue
+        }
+        var e: u64 = try get_last_index(r, sp)
+        if e > n {
+            e = n
+        }
+        if e == p {
+            q = advance_index(s, q, unicode)
+            continue
+        }
+        let piece: Gc[JsVal] = try val.str_slice(r, s, p, q)
+        let o1: bool = try gcvec_append[JsVal](items, piece)
+        if gcvec_length(items) >= lim {
+            return new_array(r, items)
+        }
+        p = e
+        let ln: u64 = try alen(r, res)
+        var i: u64 = 1
+        while i < ln {
+            let k: u64 = try val.key_for_index(r, i)
+            let cap: Gc[JsVal] = try interp.get_prop(r, res, k)
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            let o2: bool = try gcvec_append[JsVal](items, cap)
+            if gcvec_length(items) >= lim {
+                return new_array(r, items)
+            }
+            i = i + 1
+        }
+        q = p
+    }
+    let rest: Gc[JsVal] = try val.str_slice(r, s, p, n)
+    let o3: bool = try gcvec_append[JsVal](items, rest)
+    return new_array(r, items)
+}
+
+fn split_bits(r: Gc[Realm], rev: Gc[JsVal], unicode: bool) -> u64 {
+    var bits: u64 = F_STICKY
+    if unicode {
+        bits = bits | F_UNICODE
+    }
+    return bits
+}
+
+fn clone_for_split(r: Gc[Realm], rev: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let re: Gc[JsRegExp] = val.as_regexp(rev)
+    if (re as u64) == 0 {
+        return rev
+    }
+    var bits: u64 = re.fbits | F_STICKY
+    bits = bits & (0xFFFFFFFFFFFFFFFF - F_GLOBAL)
+    let ft: Gc[JsVal] = try flags_text(r, bits)
+    return make_regexp(r, re.source, ft)
+}
+
+fn alen(r: Gc[Realm], o: Gc[JsVal]) -> AllocError!u64 {
+    let ob: Gc[JsObj] = val.as_obj(o)
+    if (ob as u64) != 0 && ob.cls == val.CLS_ARRAY {
+        return ob.len
+    }
+    let k: u64 = try val.key_for_name(r, lex.N_LENGTH)
+    let lv: Gc[JsVal] = try interp.get_prop(r, o, k)
+    return interp.to_length(r, lv)
+}
+
+fn do_replace(r: Gc[Realm], rev: Gc[JsVal], s: Gc[JsVal], rep: Gc[JsVal],
+    global: bool, unicode: bool) -> AllocError!Gc[JsVal] {
+    let callable: bool = val.is_callable(rep)
+    var reps: Gc[JsVal] = val.str_empty(r)
+    if !callable {
+        reps = try interp.to_string(r, rep)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+    }
+    if global {
+        let ok: bool = try set_last_index(r, rev, 0.0)
+    }
+    let out: Gc[JsStr] = try val.str_new(r)
+    var last: u64 = 0
+    var guard: u64 = 0
+    while guard < 1000000 {
+        let res: Gc[JsVal] = try exec_of(r, rev, s)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        if val.is_null(res) {
+            break
+        }
+        let ok: bool = try one_replacement(r, res, s, out, &last, reps, rep,
+            callable)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        if !global {
+            break
+        }
+        let m0: Gc[JsVal] = try aget0(r, res)
+        let ms: Gc[JsVal] = try interp.to_string(r, m0)
+        if val.str_len(ms) == 0 {
+            let li: u64 = try get_last_index(r, rev)
+            let o2: bool = try set_last_index(r, rev,
+                advance_index(s, li, unicode) as f64)
+        }
+        guard = guard + 1
+    }
+    var i: u64 = last
+    while i < val.str_len(s) {
+        let ok: bool = try val.str_push(out, val.str_at(s, i))
+        i = i + 1
+    }
+    let ov: Gc[JsVal] = out
+    return ov
+}
+
+fn one_replacement(r: Gc[Realm], res: Gc[JsVal], s: Gc[JsVal], out: Gc[JsStr],
+    last: *mut u64, reps: Gc[JsVal], rep: Gc[JsVal],
+    callable: bool) -> AllocError!bool {
+    var ixn: [u8; 5] = "index"
+    var grn: [u8; 6] = "groups"
+    let ik: u64 = try key_ascii(r, &ixn[0], 5)
+    let gk: u64 = try key_ascii(r, &grn[0], 6)
+    let iv: Gc[JsVal] = try interp.get_prop(r, res, ik)
+    if thrown(r) {
+        return false
+    }
+    var pos: u64 = try interp.to_length(r, iv)
+    if pos > val.str_len(s) {
+        pos = val.str_len(s)
+    }
+    let m0: Gc[JsVal] = try aget0(r, res)
+    let ms: Gc[JsVal] = try interp.to_string(r, m0)
+    if thrown(r) {
+        return false
+    }
+    if pos < *last {
+        pos = *last
+    }
+    var i: u64 = *last
+    while i < pos {
+        let ok: bool = try val.str_push(out, val.str_at(s, i))
+        i = i + 1
+    }
+    let ln: u64 = try alen(r, res)
+    let groups: Gc[JsVal] = try interp.get_prop(r, res, gk)
+    if callable {
+        let ca: Gc[GcVec] = try interp.args_new(r)
+        let o1: bool = try gcvec_append[JsVal](ca, ms)
+        var g: u64 = 1
+        while g < ln {
+            let k: u64 = try val.key_for_index(r, g)
+            let cv: Gc[JsVal] = try interp.get_prop(r, res, k)
+            let o2: bool = try gcvec_append[JsVal](ca, cv)
+            g = g + 1
+        }
+        let pv: Gc[JsVal] = try val.realm_num(r, pos as f64)
+        let o3: bool = try gcvec_append[JsVal](ca, pv)
+        let o4: bool = try gcvec_append[JsVal](ca, s)
+        if !val.is_undefined(groups) {
+            let o5: bool = try gcvec_append[JsVal](ca, groups)
+        }
+        let rv: Gc[JsVal] = try interp.call_function(r, rep,
+            val.realm_undefined(r), ca)
+        if thrown(r) {
+            return false
+        }
+        let rs: Gc[JsVal] = try interp.to_string(r, rv)
+        if thrown(r) {
+            return false
+        }
+        var k2: u64 = 0
+        while k2 < val.str_len(rs) {
+            let ok: bool = try val.str_push(out, val.str_at(rs, k2))
+            k2 = k2 + 1
+        }
+    } else {
+        let ok: bool = try expand_dollars(r, out, reps, s, res, ms, pos, ln,
+            groups)
+        if thrown(r) {
+            return false
+        }
+    }
+    *last = pos + val.str_len(ms)
+    return true
+}
+
+// 22.1.3.19.1 GetSubstitution.
+fn expand_dollars(r: Gc[Realm], out: Gc[JsStr], reps: Gc[JsVal],
+    s: Gc[JsVal], res: Gc[JsVal], matched: Gc[JsVal], pos: u64, ln: u64,
+    groups: Gc[JsVal]) -> AllocError!bool {
+    let n: u64 = val.str_len(reps)
+    var i: u64 = 0
+    while i < n {
+        let c: u32 = val.str_at(reps, i)
+        if c != 36 as u32 || i + 1 >= n {
+            let ok: bool = try val.str_push(out, c)
+            i = i + 1
+            continue
+        }
+        let d: u32 = val.str_at(reps, i + 1)
+        if d == 36 as u32 {
+            let ok: bool = try val.str_push(out, 36 as u32)
+            i = i + 2
+            continue
+        }
+        if d == 38 as u32 {
+            let ok: bool = try push_all(out, matched)
+            i = i + 2
+            continue
+        }
+        if d == 96 as u32 {
+            let pre: Gc[JsVal] = try val.str_slice(r, s, 0, pos)
+            let ok: bool = try push_all(out, pre)
+            i = i + 2
+            continue
+        }
+        if d == 39 as u32 {
+            let tail: u64 = pos + val.str_len(matched)
+            if tail <= val.str_len(s) {
+                let post: Gc[JsVal] = try val.str_slice(r, s, tail,
+                    val.str_len(s))
+                let ok: bool = try push_all(out, post)
+            }
+            i = i + 2
+            continue
+        }
+        if d == 60 as u32 {
+            // $<name>
+            var j: u64 = i + 2
+            let nm: Gc[JsStr] = try val.str_new(r)
+            var closed: bool = false
+            while j < n {
+                let e: u32 = val.str_at(reps, j)
+                if e == 62 as u32 {
+                    closed = true
+                    break
+                }
+                let ok: bool = try val.str_push(nm, e)
+                j = j + 1
+            }
+            if !closed || val.is_undefined(groups) {
+                let ok: bool = try val.str_push(out, c)
+                i = i + 1
+                continue
+            }
+            let nv: Gc[JsVal] = nm
+            let k: u64 = try val.key_for_str(r, nv)
+            let gv: Gc[JsVal] = try interp.get_prop(r, groups, k)
+            if thrown(r) {
+                return false
+            }
+            if !val.is_undefined(gv) {
+                let gs: Gc[JsVal] = try interp.to_string(r, gv)
+                if thrown(r) {
+                    return false
+                }
+                let ok: bool = try push_all(out, gs)
+            }
+            i = j + 1
+            continue
+        }
+        if d >= 48 as u32 && d <= 57 as u32 {
+            var num: u64 = (d - 48 as u32) as u64
+            var w: u64 = 2
+            if i + 2 < n {
+                let e: u32 = val.str_at(reps, i + 2)
+                if e >= 48 as u32 && e <= 57 as u32 {
+                    let two: u64 = num * 10 + ((e - 48 as u32) as u64)
+                    if two >= 1 && two < ln {
+                        num = two
+                        w = 3
+                    }
+                }
+            }
+            if num >= 1 && num < ln {
+                let k: u64 = try val.key_for_index(r, num)
+                let cv: Gc[JsVal] = try interp.get_prop(r, res, k)
+                if thrown(r) {
+                    return false
+                }
+                if !val.is_undefined(cv) {
+                    let cs: Gc[JsVal] = try interp.to_string(r, cv)
+                    let ok: bool = try push_all(out, cs)
+                }
+                i = i + w
+                continue
+            }
+        }
+        let ok: bool = try val.str_push(out, c)
+        i = i + 1
+    }
+    return true
+}
+
+fn push_all(out: Gc[JsStr], s: Gc[JsVal]) -> AllocError!bool {
+    var i: u64 = 0
+    while i < val.str_len(s) {
+        let ok: bool = try val.str_push(out, val.str_at(s, i))
+        i = i + 1
+    }
+    return true
+}
+
+// ---- the iterator of `matchAll`
+
+fn make_string_iter(r: Gc[Realm], rev: Gc[JsVal], s: Gc[JsVal], global: bool,
+    unicode: bool) -> AllocError!Gc[JsVal] {
+    let re: Gc[JsRegExp] = val.as_regexp(rev)
+    var copy: Gc[JsVal] = rev
+    if (re as u64) != 0 {
+        copy = try make_regexp(r, re.source, re.flag_text)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        let li: u64 = try get_last_index(r, rev)
+        let ok: bool = try set_last_index(r, copy, li as f64)
+    }
+    let o: Gc[JsObj] = try val.obj_new_proto(r,
+        val.realm_proto(r, val.PROTO_REGEXP_STRING_ITERATOR))
+    o.prim = s
+    o.extra = val.as_obj(copy)
+    o.node = 0
+    if global {
+        o.node = o.node | 1
+    }
+    if unicode {
+        o.node = o.node | 2
+    }
+    o.len = 0
+    let ov: Gc[JsVal] = o
+    return ov
+}
+
+fn string_iter_next(r: Gc[Realm], this: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let o: Gc[JsObj] = val.as_obj(this)
+    if (o as u64) == 0 || (o.extra as u64) == 0 {
+        var m: [u8; 31] = "next called on a foreign object"
+        return interp.throw_type_here(r, &m[0], 31)
+    }
+    if o.len != 0 {
+        return iter_result(r, val.realm_undefined(r), true)
+    }
+    let s: Gc[JsVal] = o.prim
+    let rev: Gc[JsVal] = o.extra
+    let res: Gc[JsVal] = try exec_of(r, rev, s)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    if val.is_null(res) {
+        o.len = 1
+        return iter_result(r, val.realm_undefined(r), true)
+    }
+    if o.node & 1 == 0 {
+        o.len = 1
+        return iter_result(r, res, false)
+    }
+    let m0: Gc[JsVal] = try aget0(r, res)
+    let ms: Gc[JsVal] = try interp.to_string(r, m0)
+    if val.str_len(ms) == 0 {
+        let li: u64 = try get_last_index(r, rev)
+        let ok: bool = try set_last_index(r, rev,
+            advance_index(s, li, o.node & 2 != 0) as f64)
+    }
+    return iter_result(r, res, false)
+}
+
+fn iter_result(r: Gc[Realm], v: Gc[JsVal], done: bool) -> AllocError!Gc[JsVal] {
+    let o: Gc[JsObj] = try val.obj_new(r)
+    let vk: u64 = try val.key_for_name(r, lex.N_VALUE)
+    let dk: u64 = try val.key_for_name(r, lex.N_DONE)
+    let o1: bool = try interp.define_value(r, o, vk, v, val.A_DEFAULT)
+    let o2: bool = try interp.define_value(r, o, dk, val.realm_bool(r, done),
+        val.A_DEFAULT)
+    let ov: Gc[JsVal] = o
+    return ov
+}
+
+// ---- the String side (22.1.3)
+
+fn string_side(r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    if val.is_nullish(this) {
+        var m: [u8; 44] = "String.prototype method on undefined or null"
+        return interp.throw_type_here(r, &m[0], 44)
+    }
+    let pat: Gc[JsVal] = arg(r, args, 0)
+    var which: u64 = val.WELL_KNOWN_MATCH
+    if id == R_STR_MATCHALL {
+        which = val.WELL_KNOWN_MATCHALL
+    }
+    if id == R_STR_REPLACE || id == R_STR_REPLACEALL {
+        which = val.WELL_KNOWN_REPLACE
+    }
+    if id == R_STR_SEARCH {
+        which = val.WELL_KNOWN_SEARCH
+    }
+    if id == R_STR_SPLIT {
+        which = val.WELL_KNOWN_SPLIT
+    }
+    if id == R_STR_MATCHALL || id == R_STR_REPLACEALL {
+        // Both demand a GLOBAL regular expression (22.1.3.14, 22.1.3.20).
+        if is_regexp(pat) {
+            var bits: u64 = 0
+            let okf: bool = try get_flags_bits(r, pat, &bits)
+            if bits & F_GLOBAL == 0 {
+                var m: [u8; 45] = "this method needs a global regular expression"
+                return interp.throw_type_here(r, &m[0], 45)
+            }
+        }
+    }
+    if !val.is_nullish(pat) {
+        let wk: Gc[JsVal] = val.realm_well_known(r, which)
+        if (wk as u64) != 0 {
+            let f: Gc[JsVal] = try interp.get_prop(r, pat,
+                val.key_for_symbol(wk))
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            if !val.is_nullish(f) {
+                let ca: Gc[GcVec] = try interp.args_new(r)
+                let o1: bool = try gcvec_append[JsVal](ca, this)
+                if id == R_STR_REPLACE || id == R_STR_REPLACEALL || id == R_STR_SPLIT {
+                    let o2: bool = try gcvec_append[JsVal](ca, arg(r, args, 1))
+                }
+                return interp.call_function(r, f, pat, ca)
+            }
+        }
+    }
+    let s: Gc[JsVal] = try interp.to_string(r, this)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    // `replace` and `replaceAll` with a TEXT pattern do not build a
+    // regular expression at all (22.1.3.19).
+    if id == R_STR_REPLACE || id == R_STR_REPLACEALL {
+        return replace_text(r, s, pat, arg(r, args, 1),
+            id == R_STR_REPLACEALL)
+    }
+    if id == R_STR_SPLIT {
+        return split_text(r, s, pat, arg(r, args, 1))
+    }
+    var flags: Gc[JsVal] = val.str_empty(r)
+    if id == R_STR_MATCHALL {
+        var gf: [u8; 1] = "g"
+        flags = try val.str_from_ascii(r, &gf[0], 1)
+    }
+    var source: Gc[JsVal] = val.str_empty(r)
+    if !val.is_undefined(pat) {
+        source = try interp.to_string(r, pat)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+    }
+    let re: Gc[JsVal] = try make_regexp(r, source, flags)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    var sid: u64 = R_SYM_MATCH
+    if id == R_STR_MATCHALL {
+        sid = R_SYM_MATCHALL
+    }
+    if id == R_STR_SEARCH {
+        sid = R_SYM_SEARCH
+    }
+    let ca: Gc[GcVec] = try interp.args_new(r)
+    let ok: bool = try gcvec_append[JsVal](ca, s)
+    return symbol_side(r, sid, re, ca)
+}
+
+fn replace_text(r: Gc[Realm], s: Gc[JsVal], pat: Gc[JsVal], rep: Gc[JsVal],
+    all: bool) -> AllocError!Gc[JsVal] {
+    let needle: Gc[JsVal] = try interp.to_string(r, pat)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    let callable: bool = val.is_callable(rep)
+    var reps: Gc[JsVal] = val.str_empty(r)
+    if !callable {
+        reps = try interp.to_string(r, rep)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+    }
+    let out: Gc[JsStr] = try val.str_new(r)
+    var from: u64 = 0
+    var guard: u64 = 0
+    while guard < 1000000 {
+        let at: i64 = val.str_index_of(s, needle, from)
+        if at < 0 {
+            break
+        }
+        let pos: u64 = at as u64
+        var i: u64 = from
+        while i < pos {
+            let ok: bool = try val.str_push(out, val.str_at(s, i))
+            i = i + 1
+        }
+        if callable {
+            let ca: Gc[GcVec] = try interp.args_new(r)
+            let o1: bool = try gcvec_append[JsVal](ca, needle)
+            let pv: Gc[JsVal] = try val.realm_num(r, pos as f64)
+            let o2: bool = try gcvec_append[JsVal](ca, pv)
+            let o3: bool = try gcvec_append[JsVal](ca, s)
+            let rv: Gc[JsVal] = try interp.call_function(r, rep,
+                val.realm_undefined(r), ca)
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            let rs: Gc[JsVal] = try interp.to_string(r, rv)
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            let ok: bool = try push_all(out, rs)
+        } else {
+            let fake: Gc[JsObj] = try val.array_new(r)
+            let ok0: bool = try val.elems_push(r, fake, needle)
+            fake.len = 1
+            let fv: Gc[JsVal] = fake
+            let ok: bool = try expand_dollars(r, out, reps, s, fv, needle,
+                pos, 1, val.realm_undefined(r))
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+        }
+        from = pos + val.str_len(needle)
+        if val.str_len(needle) == 0 {
+            if from < val.str_len(s) {
+                let ok: bool = try val.str_push(out, val.str_at(s, from))
+            }
+            from = from + 1
+        }
+        if !all {
+            break
+        }
+        if from > val.str_len(s) {
+            break
+        }
+        guard = guard + 1
+    }
+    var i: u64 = from
+    while i < val.str_len(s) {
+        let ok: bool = try val.str_push(out, val.str_at(s, i))
+        i = i + 1
+    }
+    let ov: Gc[JsVal] = out
+    return ov
+}
+
+fn split_text(r: Gc[Realm], s: Gc[JsVal], pat: Gc[JsVal],
+    limv: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    var lim: u64 = 0xFFFFFFFF
+    if !val.is_undefined(limv) {
+        let l: u32 = try interp.to_uint32(r, limv)
+        if thrown(r) {
+            return val.realm_undefined(r)
+        }
+        lim = l as u64
+    }
+    let items: Gc[GcVec] = try interp.args_new(r)
+    if lim == 0 {
+        return new_array(r, items)
+    }
+    if val.is_undefined(pat) {
+        let ok: bool = try gcvec_append[JsVal](items, s)
+        return new_array(r, items)
+    }
+    let sep: Gc[JsVal] = try interp.to_string(r, pat)
+    if thrown(r) {
+        return val.realm_undefined(r)
+    }
+    let n: u64 = val.str_len(s)
+    if val.str_len(sep) == 0 {
+        var i: u64 = 0
+        while i < n && gcvec_length(items) < lim {
+            let piece: Gc[JsVal] = try val.str_slice(r, s, i, i + 1)
+            let ok: bool = try gcvec_append[JsVal](items, piece)
+            i = i + 1
+        }
+        return new_array(r, items)
+    }
+    var from: u64 = 0
+    while gcvec_length(items) < lim {
+        let at: i64 = val.str_index_of(s, sep, from)
+        if at < 0 {
+            break
+        }
+        let piece: Gc[JsVal] = try val.str_slice(r, s, from, at as u64)
+        let ok: bool = try gcvec_append[JsVal](items, piece)
+        from = (at as u64) + val.str_len(sep)
+    }
+    if gcvec_length(items) < lim {
+        let rest: Gc[JsVal] = try val.str_slice(r, s, from, n)
+        let ok: bool = try gcvec_append[JsVal](items, rest)
+    }
+    return new_array(r, items)
+}
+
+// =========================================================== The install
+
+fn nat(r: Gc[Realm], target: Gc[JsObj], name: *mut u8, n: usize, id: u64,
+    arity: u64) -> AllocError!bool {
+    let f: Gc[JsObj] = try interp.make_native(r, id, arity, name, n)
+    let k: u64 = try key_ascii(r, name, n)
+    let fv: Gc[JsVal] = f
+    return interp.define_value(r, target, k, fv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+}
+
+fn getter(r: Gc[Realm], target: Gc[JsObj], name: *mut u8, n: usize,
+    id: u64) -> AllocError!bool {
+    let f: Gc[JsObj] = try interp.make_native(r, id, 0, name, n)
+    let fv: Gc[JsVal] = f
+    let k: u64 = try key_ascii(r, name, n)
+    return interp.define_accessor(r, target, k, fv, val.realm_undefined(r),
+        val.A_CONFIGURABLE)
+}
+
+fn sym_method(r: Gc[Realm], target: Gc[JsObj], which: u64, id: u64,
+    arity: u64, name: *mut u8, n: usize) -> AllocError!bool {
+    let wk: Gc[JsVal] = val.realm_well_known(r, which)
+    if (wk as u64) == 0 {
+        return true
+    }
+    let f: Gc[JsObj] = try interp.make_native(r, id, arity, name, n)
+    let fv: Gc[JsVal] = f
+    return interp.define_value(r, target, val.key_for_symbol(wk), fv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+}
+
+fn install_regexp(r: Gc[Realm], g: Gc[JsObj]) -> AllocError!bool {
+    let rp: Gc[JsObj] = val.realm_proto(r, val.PROTO_REGEXP)
+    var nm: [u8; 6] = "RegExp"
+    let c: Gc[JsObj] = try interp.make_native(r, R_CTOR, 2, &nm[0], 6)
+    c.flags = c.flags | val.F_CTOR
+    let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+    let pv: Gc[JsVal] = rp
+    let o1: bool = try interp.define_value(r, c, pk, pv, 0)
+    let ck: u64 = try val.key_for_name(r, lex.N_CONSTRUCTOR)
+    let cv: Gc[JsVal] = c
+    let o2: bool = try interp.define_value(r, rp, ck, cv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    let ck2: u64 = try key_ascii(r, &nm[0], 6)
+    let o3: bool = try interp.define_value(r, g, ck2, cv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+    var m1: [u8; 4] = "exec"
+    var m2: [u8; 4] = "test"
+    var m3: [u8; 8] = "toString"
+    let k1: bool = try nat(r, rp, &m1[0], 4, R_EXEC, 1)
+    let k2: bool = try nat(r, rp, &m2[0], 4, R_TEST, 1)
+    let k3: bool = try nat(r, rp, &m3[0], 8, R_TOSTRING, 0)
+    var a1: [u8; 6] = "source"
+    var a2: [u8; 5] = "flags"
+    var a3: [u8; 6] = "global"
+    var a4: [u8; 10] = "ignoreCase"
+    var a5: [u8; 9] = "multiline"
+    var a6: [u8; 6] = "dotAll"
+    var a7: [u8; 7] = "unicode"
+    var a8: [u8; 6] = "sticky"
+    var a9: [u8; 10] = "hasIndices"
+    var a10: [u8; 11] = "unicodeSets"
+    let g1: bool = try getter(r, rp, &a1[0], 6, R_SOURCE)
+    let g2: bool = try getter(r, rp, &a2[0], 5, R_FLAGS)
+    let g3: bool = try getter(r, rp, &a3[0], 6, R_GLOBAL)
+    let g4: bool = try getter(r, rp, &a4[0], 10, R_IGNORECASE)
+    let g5: bool = try getter(r, rp, &a5[0], 9, R_MULTILINE)
+    let g6: bool = try getter(r, rp, &a6[0], 6, R_DOTALL)
+    let g7: bool = try getter(r, rp, &a7[0], 7, R_UNICODE)
+    let g8: bool = try getter(r, rp, &a8[0], 6, R_STICKY)
+    let g9: bool = try getter(r, rp, &a9[0], 10, R_HASINDICES)
+    let g10: bool = try getter(r, rp, &a10[0], 11, R_UNICODESETS)
+    var s1: [u8; 14] = "[Symbol.match]"
+    var s2: [u8; 17] = "[Symbol.matchAll]"
+    var s3: [u8; 16] = "[Symbol.replace]"
+    var s4: [u8; 15] = "[Symbol.search]"
+    var s5: [u8; 14] = "[Symbol.split]"
+    let y1: bool = try sym_method(r, rp, val.WELL_KNOWN_MATCH, R_SYM_MATCH, 1,
+        &s1[0], 14)
+    let y2: bool = try sym_method(r, rp, val.WELL_KNOWN_MATCHALL,
+        R_SYM_MATCHALL, 1, &s2[0], 17)
+    let y3: bool = try sym_method(r, rp, val.WELL_KNOWN_REPLACE,
+        R_SYM_REPLACE, 2, &s3[0], 16)
+    let y4: bool = try sym_method(r, rp, val.WELL_KNOWN_SEARCH, R_SYM_SEARCH,
+        1, &s4[0], 15)
+    let y5: bool = try sym_method(r, rp, val.WELL_KNOWN_SPLIT, R_SYM_SPLIT, 2,
+        &s5[0], 14)
+    // RegExp[Symbol.species]
+    var sp: [u8; 20] = "get [Symbol.species]"
+    let spf: Gc[JsObj] = try interp.make_native(r, R_SPECIES, 0, &sp[0], 20)
+    let spv: Gc[JsVal] = spf
+    let spk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_SPECIES)
+    if (spk as u64) != 0 {
+        let y6: bool = try interp.define_accessor(r, c,
+            val.key_for_symbol(spk), spv, val.realm_undefined(r),
+            val.A_CONFIGURABLE)
+    }
+    // The string iterator of `matchAll`.
+    let sip: Gc[JsObj] = val.realm_proto(r, val.PROTO_REGEXP_STRING_ITERATOR)
+    val.obj_set_proto(sip, val.realm_proto(r, val.PROTO_ITERATOR))
+    var nn: [u8; 4] = "next"
+    let k4: bool = try nat(r, sip, &nn[0], 4, R_STRITER_NEXT, 0)
+    let tk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_TOSTRINGTAG)
+    if (tk as u64) != 0 {
+        var tg: [u8; 22] = "RegExp String Iterator"
+        let tv: Gc[JsVal] = try val.str_from_ascii(r, &tg[0], 22)
+        let y7: bool = try interp.define_value(r, sip,
+            val.key_for_symbol(tk), tv, val.A_CONFIGURABLE)
+    }
+    // The six String methods that go through a regular expression.
+    let strp: Gc[JsObj] = val.realm_proto(r, val.PROTO_STRING)
+    var t1: [u8; 5] = "match"
+    var t2: [u8; 8] = "matchAll"
+    var t3: [u8; 7] = "replace"
+    var t4: [u8; 10] = "replaceAll"
+    var t5: [u8; 6] = "search"
+    var t6: [u8; 5] = "split"
+    let z1: bool = try nat(r, strp, &t1[0], 5, R_STR_MATCH, 1)
+    let z2: bool = try nat(r, strp, &t2[0], 8, R_STR_MATCHALL, 1)
+    let z3: bool = try nat(r, strp, &t3[0], 7, R_STR_REPLACE, 2)
+    let z4: bool = try nat(r, strp, &t4[0], 10, R_STR_REPLACEALL, 2)
+    let z5: bool = try nat(r, strp, &t5[0], 6, R_STR_SEARCH, 1)
+    let z6: bool = try nat(r, strp, &t6[0], 5, R_STR_SPLIT, 2)
+    return true
+}

@@ -1,0 +1,680 @@
+// SPDX-License-Identifier: MIT
+// lib/std/bytes.fi -- a byte buffer with a read and a write cursor
+// (round 76).
+//
+// Everything this repository had read so far was either text or a format
+// somebody else had already unpacked. A wire protocol is neither: it is a
+// sequence of octets in which the meaning of position 7 depends on what
+// stood at position 3, and in which a length field decides how far one may
+// read. `rt.Buf` can grow and hold octets; it has no notion of a POSITION
+// one reads from, and no notion of "there are not that many octets left".
+// This module adds both.
+//
+// ------------------------------------------------------- BIG ENDIAN, NOT LITTLE
+//
+// x86 is little endian, the Minecraft protocol is big endian, and DEC and
+// DEC alone is why anybody ever thought network order was a matter of
+// taste. Every integer here goes out most significant octet first, and the
+// implementation writes the shifts out rather than casting a pointer -- a
+// `*(p as *mut u32) = v` would silently produce the machine's order and
+// would be right on nothing but a big endian machine.
+//
+// --------------------------------------------------------- VARINT: THE RULES
+//
+// The Minecraft VarInt is LEB128 with the continuation bit at 0x80, LOW
+// group first, and it is NOT zigzag encoded. That matters because the two
+// look identical for small positive numbers and differ for everything else:
+//
+//   value          zigzag would be      Minecraft really is
+//      0           00                   00
+//      1           02                   01
+//     -1           01                   ff ff ff ff 0f
+//
+// A negative VarInt is the two's complement pattern of the 32 bit number,
+// which is why -1 costs FIVE octets and not one. Whoever encodes an entity
+// id or a block position as a zigzag VarInt because "that is what varints
+// are" produces a stream that no client understands.
+//
+// `zigzag_encode`/`zigzag_decode` exist here all the same, because the
+// question "is a position zigzag encoded?" comes up in every protocol, and
+// the honest answer for JAVA EDITION is: no, nowhere. The `Position` type
+// is a BIT FIELD (26/26/12 in one i64, `put_position`), not a zigzag
+// value. The Bedrock protocol does use zigzag; this file does not speak it.
+//
+// ------------------------------------------- WHY READS FAIL LOUDLY AND WRITES DO NOT
+//
+// The two directions are asymmetric on purpose:
+//
+//   * READING returns `BytesError!T`. The octets come off a socket, from a
+//     peer nobody controls, and "there were only two octets where four were
+//     announced" is the normal case, not an exception. Returning 0 for it
+//     would turn a truncated packet into a valid one -- that is how parsers
+//     become security holes.
+//   * WRITING sets a STICKY flag (`bytes_ok`). A failed write means the
+//     allocator gave nothing back; there is no useful local reaction to
+//     that, and threading an error union through forty `put_*` calls in a
+//     packet builder buys nothing except forty `try`s. The flag is sticky,
+//     so ONE check after the last `put_*` catches every failure -- and once
+//     it is set, every further write is a no-op instead of writing past the
+//     end.
+//
+// ------------------------------------------------------------------ HONEST
+//
+// B1  THE CURSOR IS NOT CHECKED AGAINST THE WRITE END. `bytes_set_pos` may
+//     be put anywhere within `len`; a reader that seeks by hand can read
+//     what a writer has not written in this round.
+// B2  `get_string` DOES NOT VALIDATE UTF-8. It checks the length, hands out
+//     the span, and says so. Validation lives in `lib/std/str.fi`
+//     (`Str`, SPEC 8.1) and costs a pass over the octets; a protocol parser
+//     that only compares a channel name against a constant does not want to
+//     pay it. Whoever needs a `Str` builds one from the span.
+// B3  NO SHARED OWNERSHIP. `bytes_free` is mandatory, ideally with `defer`
+//     right after `bytes_new` -- Firn has no destructors.
+// B4  GROWTH IS DOUBLING, and the memory comes straight from `mmap`
+//     through `rt.heap_alloc`. The smallest buffer is therefore one page.
+
+import rt
+import math
+
+export {
+    BytesError,
+    Bytes, bytes_new, bytes_with_capacity, bytes_free, bytes_clear,
+    bytes_reset, bytes_len, bytes_pos, bytes_set_pos, bytes_remaining,
+    bytes_ptr, bytes_data, bytes_ok, bytes_capacity, bytes_set_len,
+    bytes_reserve, bytes_at, bytes_span_eq, bytes_skip,
+    bytes_patch_u8, bytes_patch_u32, bytes_patch_u16,
+
+    put_u8, put_i8, put_u16, put_i16, put_u32, put_i32, put_u64, put_i64,
+    put_f32, put_f64, put_bool, put_raw, put_text, put_c, put_zero,
+    put_varint, put_varlong, put_string, put_string_c, put_position,
+    put_uuid, put_bytes,
+
+    get_u8, get_i8, get_u16, get_i16, get_u32, get_i32, get_u64, get_i64,
+    get_f32, get_f64, get_bool, get_span, get_varint, get_varlong,
+    get_string, get_position, get_uuid,
+
+    varint_size, varlong_size, zigzag_encode, zigzag_decode,
+    zigzag_encode64, zigzag_decode64,
+
+    // ROUND 83: the signed/unsigned REINTERPRETATION of the wire (see the
+    // comment at `bits_u8`). Exported because every caller that builds a
+    // packet by hand needs the same thing, and each one writing its own
+    // mask is how the checked arithmetic of round 72 gets worked around
+    // instead of served.
+    bits_u8, bits_u16, bits_u32, bits_u64,
+    bits_i8, bits_i16, bits_i32, bits_i64,
+}
+
+error BytesError {
+    Underflow, // fewer octets left than the read needs
+    TooLong, // a VarInt/VarLong longer than its maximum
+    OutOfMemory, // the buffer could not grow
+    Range, // a length field that cannot be right
+}
+
+// The maximum lengths from the protocol. A VarInt covers 32 bits in groups
+// of 7 -> ceil(32/7) = 5; a VarLong covers 64 -> ceil(64/7) = 10. Anything
+// longer is a peer trying to make the reader loop.
+const VARINT_MAX: usize = 5
+const VARLONG_MAX: usize = 10
+
+struct Bytes {
+    data: u64,
+    cap: usize,
+    len: usize, // how far it has been written
+    pos: usize, // where the next read starts
+    bad: bool, // sticky: a write failed
+}
+
+// ------------------------------------------------------------- Life cycle
+
+fn bytes_new() -> Bytes {
+    return Bytes { data: 0, cap: 0, len: 0, pos: 0, bad: false }
+}
+
+fn bytes_with_capacity(n: usize) -> Bytes {
+    var b: Bytes = bytes_new()
+    bytes_reserve(&b, n)
+    return b
+}
+
+fn bytes_free(b: *mut Bytes) {
+    if (*b).data != 0 {
+        rt.heap_free((*b).data, (*b).cap)
+    }
+    (*b).data = 0
+    (*b).cap = 0
+    (*b).len = 0
+    (*b).pos = 0
+    (*b).bad = false
+}
+
+// Keeps the memory, forgets the content. That is what a connection loop
+// wants between two packets -- one buffer, not one `mmap` per packet.
+fn bytes_clear(b: *mut Bytes) {
+    (*b).len = 0
+    (*b).pos = 0
+    (*b).bad = false
+}
+
+// Only the READ cursor goes back to the beginning; the content stays. For
+// reading a buffer a second time.
+fn bytes_reset(b: *mut Bytes) {
+    (*b).pos = 0
+}
+
+fn bytes_len(b: *mut Bytes) -> usize { return (*b).len }
+fn bytes_pos(b: *mut Bytes) -> usize { return (*b).pos }
+fn bytes_capacity(b: *mut Bytes) -> usize { return (*b).cap }
+fn bytes_ptr(b: *mut Bytes) -> u64 { return (*b).data }
+fn bytes_data(b: *mut Bytes) -> u64 { return (*b).data }
+fn bytes_ok(b: *mut Bytes) -> bool { return !(*b).bad }
+
+fn bytes_remaining(b: *mut Bytes) -> usize {
+    if (*b).pos >= (*b).len {
+        return 0
+    }
+    return (*b).len - (*b).pos
+}
+
+fn bytes_set_pos(b: *mut Bytes, p: usize) {
+    if p > (*b).len {
+        (*b).pos = (*b).len
+    } else {
+        (*b).pos = p
+    }
+}
+
+// For a reader that has been handed octets from elsewhere: the length is
+// declared, the cursor starts at 0.
+fn bytes_set_len(b: *mut Bytes, n: usize) {
+    if n <= (*b).cap {
+        (*b).len = n
+        (*b).pos = 0
+    }
+}
+
+fn bytes_at(b: *mut Bytes, i: usize) -> u8 {
+    if i >= (*b).len {
+        return 0 as u8
+    }
+    return *(((*b).data + i as u64) as *mut u8)
+}
+
+fn bytes_skip(b: *mut Bytes, n: usize) -> BytesError!usize {
+    if bytes_remaining(b) < n {
+        return BytesError::Underflow
+    }
+    (*b).pos = (*b).pos + n
+    return (*b).pos
+}
+
+// Room for at least `n` MORE octets behind `len`. Doubling, so that the
+// number of copies over the life of a buffer stays logarithmic.
+fn bytes_reserve(b: *mut Bytes, n: usize) {
+    if (*b).bad {
+        return
+    }
+    let need: usize = (*b).len + n
+    if need <= (*b).cap {
+        return
+    }
+    var want: usize = (*b).cap
+    if want == 0 {
+        want = 256
+    }
+    while want < need {
+        want = want * 2
+    }
+    let p: u64 = rt.heap_alloc(want)
+    if p == 0 {
+        (*b).bad = true
+        return
+    }
+    if (*b).len > 0 {
+        rt.mem_copy(p, (*b).data, (*b).len)
+    }
+    if (*b).data != 0 {
+        rt.heap_free((*b).data, (*b).cap)
+    }
+    (*b).data = p
+    (*b).cap = want
+}
+
+// Overwrite octets that are ALREADY written. A container whose length
+// stands in front of its content -- an NBT list, a Minecraft packet -- can
+// only be built in one pass this way: write a placeholder, fill the
+// content, patch the placeholder. The alternative is building the content
+// into a second buffer and copying it, which costs a copy per container.
+//
+// Out of bounds does nothing and is not an error: `off` comes from the
+// caller's own earlier `bytes_len`, not from the network.
+fn bytes_patch_u8(b: *mut Bytes, off: usize, v: u8) {
+    if off >= (*b).len {
+        return
+    }
+    *(((*b).data + off as u64) as *mut u8) = v
+}
+
+fn bytes_patch_u16(b: *mut Bytes, off: usize, v: u16) {
+    if off + 2 > (*b).len {
+        return
+    }
+    bytes_patch_u8(b, off, (v >> 8) as u8)
+    bytes_patch_u8(b, off + 1, (v & 255 as u16) as u8)
+}
+
+fn bytes_patch_u32(b: *mut Bytes, off: usize, v: u32) {
+    if off + 4 > (*b).len {
+        return
+    }
+    bytes_patch_u8(b, off, (v >> 24) as u8)
+    bytes_patch_u8(b, off + 1, ((v >> 16) & 255 as u32) as u8)
+    bytes_patch_u8(b, off + 2, ((v >> 8) & 255 as u32) as u8)
+    bytes_patch_u8(b, off + 3, (v & 255 as u32) as u8)
+}
+
+// ------------------------------------------------------------------ Writing
+
+// ------------------------------------------- ROUND 83: the wire is BITS
+//
+// The protocol writes a signed number as its two's complement bit pattern
+// and reads it back the same way. `v as u32` says something else: SPEC 13
+// (item L9) calls a cast between two types of the SAME width and different
+// sign a narrowing one and checks it, so `-1 as u32` aborts under
+// dev/dev-fast/release-safe -- correctly, because the VALUE -1 is not a
+// `u32`. What the wire needs is the REINTERPRETATION, and the language has
+// no `as%` for that yet (docs/ROUND72.md section 7). So it is spelled once,
+// here, in arithmetic that never leaves its range, instead of at fourteen
+// call sites.
+fn bits_u8(v: i8) -> u8 { return ((v as i64) & 255) as u8 }
+fn bits_u16(v: i16) -> u16 { return ((v as i64) & 65535) as u16 }
+fn bits_u32(v: i32) -> u32 { return ((v as i64) & 4294967295) as u32 }
+fn bits_u64(v: i64) -> u64 {
+    return ((((v >> 32) & 4294967295) as u64) << 32) | ((v & 4294967295) as u64)
+}
+fn bits_i8(v: u8) -> i8 {
+    if v < 128 as u8 { return v as i8 }
+    return ((v as i64) - 256) as i8
+}
+fn bits_i16(v: u16) -> i16 {
+    if v < 32768 as u16 { return v as i16 }
+    return ((v as i64) - 65536) as i16
+}
+fn bits_i32(v: u32) -> i32 {
+    if v < 2147483648 as u32 { return v as i32 }
+    return ((v as i64) - 4294967296) as i32
+}
+fn bits_i64(v: u64) -> i64 {
+    // The top bit apart, the number is its own value; the top bit is worth
+    // exactly `i64::MIN`, and adding that to a non-negative `i64` cannot
+    // leave the range.
+    let low: i64 = (v & 9223372036854775807 as u64) as i64
+    if (v >> 63) == 0 as u64 { return low }
+    return low + (0 - 9223372036854775807 - 1)
+}
+
+fn put_u8(b: *mut Bytes, v: u8) {
+    bytes_reserve(b, 1)
+    if (*b).bad {
+        return
+    }
+    *(((*b).data + (*b).len as u64) as *mut u8) = v
+    (*b).len = (*b).len + 1
+}
+
+fn put_i8(b: *mut Bytes, v: i8) {
+    put_u8(b, bits_u8(v))
+}
+
+fn put_bool(b: *mut Bytes, v: bool) {
+    if v {
+        put_u8(b, 1 as u8)
+    } else {
+        put_u8(b, 0 as u8)
+    }
+}
+
+// BIG ENDIAN, written out. The shifts are the specification; a cast of the
+// buffer pointer to `*mut u16` would be the machine's order.
+fn put_u16(b: *mut Bytes, v: u16) {
+    put_u8(b, (v >> 8) as u8)
+    put_u8(b, (v & 255 as u16) as u8)
+}
+
+fn put_i16(b: *mut Bytes, v: i16) {
+    put_u16(b, bits_u16(v))
+}
+
+fn put_u32(b: *mut Bytes, v: u32) {
+    put_u8(b, (v >> 24) as u8)
+    put_u8(b, ((v >> 16) & 255 as u32) as u8)
+    put_u8(b, ((v >> 8) & 255 as u32) as u8)
+    put_u8(b, (v & 255 as u32) as u8)
+}
+
+fn put_i32(b: *mut Bytes, v: i32) {
+    put_u32(b, bits_u32(v))
+}
+
+fn put_u64(b: *mut Bytes, v: u64) {
+    put_u32(b, (v >> 32) as u32)
+    put_u32(b, (v & 4294967295 as u64) as u32)
+}
+
+fn put_i64(b: *mut Bytes, v: i64) {
+    put_u64(b, bits_u64(v))
+}
+
+// IEEE 754, the bit pattern in big endian -- exactly what the protocol
+// calls Float and Double.
+fn put_f32(b: *mut Bytes, v: f32) {
+    put_u32(b, math.math_bits32(v))
+}
+
+fn put_f64(b: *mut Bytes, v: f64) {
+    put_u64(b, math.math_bits(v))
+}
+
+fn put_raw(b: *mut Bytes, src: u64, n: usize) {
+    if n == 0 {
+        return
+    }
+    bytes_reserve(b, n)
+    if (*b).bad {
+        return
+    }
+    rt.mem_copy((*b).data + (*b).len as u64, src, n)
+    (*b).len = (*b).len + n
+}
+
+fn put_bytes(b: *mut Bytes, other: *mut Bytes) {
+    put_raw(b, (*other).data, (*other).len)
+}
+
+fn put_zero(b: *mut Bytes, n: usize) {
+    var i: usize = 0
+    while i < n {
+        put_u8(b, 0 as u8)
+        i = i + 1
+    }
+}
+
+// A pointer/length pair, as `lib/std/str.fi` uses everywhere.
+fn put_text(b: *mut Bytes, p: u64, n: usize) {
+    put_raw(b, p, n)
+}
+
+// A null terminated literal (`var s: [u8; 6] = "hallo\0"`), without the
+// terminator.
+fn put_c(b: *mut Bytes, p: u64) {
+    put_raw(b, p, rt.c_length(p))
+}
+
+// ----------------------------------------------------------------- VarInt
+
+// How many octets `v` will take. Needed BEFORE the value is written: a
+// Minecraft packet begins with the VarInt length of everything that
+// follows, so the length has to be known without writing it twice.
+fn varint_size(v: i32) -> usize {
+    var x: u32 = bits_u32(v)
+    var n: usize = 1
+    while x >= 128 as u32 {
+        x = x >> 7
+        n = n + 1
+    }
+    return n
+}
+
+fn varlong_size(v: i64) -> usize {
+    var x: u64 = v as u64
+    var n: usize = 1
+    while x >= 128 as u64 {
+        x = x >> 7
+        n = n + 1
+    }
+    return n
+}
+
+fn put_varint(b: *mut Bytes, v: i32) {
+    // A varint encodes the BIT PATTERN of a negative number, not its
+    // value -- `-1` is `0xFFFFFFFF` and takes five octets, which is what
+    // the protocol says (see `bits_u32` above).
+    var x: u32 = bits_u32(v)
+    var running: bool = true
+    while running {
+        if x < 128 as u32 {
+            put_u8(b, x as u8)
+            running = false
+        } else {
+            put_u8(b, ((x & 127 as u32) | 128 as u32) as u8)
+            x = x >> 7
+        }
+    }
+}
+
+fn put_varlong(b: *mut Bytes, v: i64) {
+    var x: u64 = bits_u64(v)
+    var running: bool = true
+    while running {
+        if x < 128 as u64 {
+            put_u8(b, x as u8)
+            running = false
+        } else {
+            put_u8(b, ((x & 127 as u64) | 128 as u64) as u8)
+            x = x >> 7
+        }
+    }
+}
+
+// The reader refuses at the SIXTH octet. Without that bound a peer that
+// sends nothing but 0x80 makes the reader loop until the connection buffer
+// is empty -- and with a `read_full` behind it, forever.
+fn get_varint(b: *mut Bytes) -> BytesError!i32 {
+    var result: u32 = 0
+    var shift: u32 = 0
+    var n: usize = 0
+    while n < VARINT_MAX {
+        let by: u8 = try get_u8(b)
+        result = result | (((by & 127 as u8) as u32) << shift)
+        n = n + 1
+        if (by & 128 as u8) == 0 as u8 {
+            return bits_i32(result)
+        }
+        shift = shift + 7 as u32
+    }
+    return BytesError::TooLong
+}
+
+fn get_varlong(b: *mut Bytes) -> BytesError!i64 {
+    var result: u64 = 0
+    var shift: u64 = 0
+    var n: usize = 0
+    while n < VARLONG_MAX {
+        let by: u8 = try get_u8(b)
+        result = result | (((by & 127 as u8) as u64) << shift)
+        n = n + 1
+        if (by & 128 as u8) == 0 as u8 {
+            return bits_i64(result)
+        }
+        shift = shift + 7 as u64
+    }
+    return BytesError::TooLong
+}
+
+// ZigZag -- here for the comparison, NOT used by the Java protocol. See the
+// header: Java Edition encodes negative VarInts as two's complement.
+fn zigzag_encode(v: i32) -> u32 {
+    return bits_u32(v << 1) ^ bits_u32(v >> 31)
+}
+
+fn zigzag_decode(v: u32) -> i32 {
+    return ((v >> 1) as i32) ^ (0 - ((v & 1 as u32) as i32))
+}
+
+fn zigzag_encode64(v: i64) -> u64 {
+    return bits_u64(v << 1) ^ bits_u64(v >> 63)
+}
+
+fn zigzag_decode64(v: u64) -> i64 {
+    return ((v >> 1) as i64) ^ (0 - ((v & 1 as u64) as i64))
+}
+
+// ----------------------------------------------------------------- Strings
+
+// VarInt length in OCTETS (not in code points -- that is the second trap of
+// the protocol) followed by the UTF-8 octets.
+fn put_string(b: *mut Bytes, p: u64, n: usize) {
+    put_varint(b, n as i32)
+    put_raw(b, p, n)
+}
+
+fn put_string_c(b: *mut Bytes, p: u64) {
+    put_string(b, p, rt.c_length(p))
+}
+
+// Hands out a SPAN INTO THE BUFFER, it does not copy: the caller usually
+// compares it against a constant or copies it once. `*out_n` gets the
+// length. B2: no UTF-8 validation.
+fn get_string(b: *mut Bytes, out_n: *mut usize) -> BytesError!u64 {
+    *out_n = 0
+    let n: i32 = try get_varint(b)
+    if n < 0 {
+        return BytesError::Range
+    }
+    let len: usize = n as usize
+    if bytes_remaining(b) < len {
+        return BytesError::Underflow
+    }
+    let p: u64 = (*b).data + (*b).pos as u64
+    (*b).pos = (*b).pos + len
+    *out_n = len
+    return p
+}
+
+// `n` octets, as a span. Same contract as `get_string`, without the length
+// prefix.
+fn get_span(b: *mut Bytes, n: usize) -> BytesError!u64 {
+    if bytes_remaining(b) < n {
+        return BytesError::Underflow
+    }
+    let p: u64 = (*b).data + (*b).pos as u64
+    (*b).pos = (*b).pos + n
+    return p
+}
+
+fn bytes_span_eq(a: u64, an: usize, c: u64, cn: usize) -> bool {
+    if an != cn {
+        return false
+    }
+    return rt.mem_eq(a, c, an)
+}
+
+// -------------------------------------------------------------- Position/UUID
+
+// The protocol type `Position` (since 1.14): x in the upper 26 bits, then z
+// in 26, y in the lowest 12. NOT zigzag, NOT three separate numbers.
+fn put_position(b: *mut Bytes, x: i32, y: i32, z: i32) {
+    let ux: u64 = bits_u64(x as i64) & 67108863 as u64
+    let uz: u64 = bits_u64(z as i64) & 67108863 as u64
+    let uy: u64 = bits_u64(y as i64) & 4095 as u64
+    put_u64(b, (ux << 38) | (uz << 12) | uy)
+}
+
+// The sign has to be put back by hand: the fields are 26/26/12 bits wide,
+// and a value that used the top bit of its field is negative.
+fn get_position(b: *mut Bytes, ox: *mut i32, oy: *mut i32, oz: *mut i32) -> BytesError!bool {
+    let v: u64 = try get_u64(b)
+    var x: i64 = (v >> 38) as i64
+    var z: i64 = ((v >> 12) & 67108863 as u64) as i64
+    var y: i64 = (v & 4095 as u64) as i64
+    if x >= 33554432 {
+        x = x - 67108864
+    }
+    if z >= 33554432 {
+        z = z - 67108864
+    }
+    if y >= 2048 {
+        y = y - 4096
+    }
+    *ox = x as i32
+    *oy = y as i32
+    *oz = z as i32
+    return true
+}
+
+// 128 bits, most significant half first.
+fn put_uuid(b: *mut Bytes, high: u64, low: u64) {
+    put_u64(b, high)
+    put_u64(b, low)
+}
+
+fn get_uuid(b: *mut Bytes, high: *mut u64, low: *mut u64) -> BytesError!bool {
+    *high = try get_u64(b)
+    *low = try get_u64(b)
+    return true
+}
+
+// ------------------------------------------------------------------ Reading
+
+fn get_u8(b: *mut Bytes) -> BytesError!u8 {
+    if bytes_remaining(b) < 1 {
+        return BytesError::Underflow
+    }
+    let v: u8 = *(((*b).data + (*b).pos as u64) as *mut u8)
+    (*b).pos = (*b).pos + 1
+    return v
+}
+
+fn get_i8(b: *mut Bytes) -> BytesError!i8 {
+    let v: u8 = try get_u8(b)
+    return bits_i8(v)
+}
+
+fn get_bool(b: *mut Bytes) -> BytesError!bool {
+    let v: u8 = try get_u8(b)
+    return v != 0 as u8
+}
+
+fn get_u16(b: *mut Bytes) -> BytesError!u16 {
+    let a: u8 = try get_u8(b)
+    let c: u8 = try get_u8(b)
+    return ((a as u16) << 8) | (c as u16)
+}
+
+fn get_i16(b: *mut Bytes) -> BytesError!i16 {
+    let v: u16 = try get_u16(b)
+    return bits_i16(v)
+}
+
+fn get_u32(b: *mut Bytes) -> BytesError!u32 {
+    let a: u16 = try get_u16(b)
+    let c: u16 = try get_u16(b)
+    return ((a as u32) << 16) | (c as u32)
+}
+
+fn get_i32(b: *mut Bytes) -> BytesError!i32 {
+    let v: u32 = try get_u32(b)
+    return bits_i32(v)
+}
+
+fn get_u64(b: *mut Bytes) -> BytesError!u64 {
+    let a: u32 = try get_u32(b)
+    let c: u32 = try get_u32(b)
+    return ((a as u64) << 32) | (c as u64)
+}
+
+fn get_i64(b: *mut Bytes) -> BytesError!i64 {
+    let v: u64 = try get_u64(b)
+    return bits_i64(v)
+}
+
+fn get_f32(b: *mut Bytes) -> BytesError!f32 {
+    let v: u32 = try get_u32(b)
+    return math.math_f32(v)
+}
+
+fn get_f64(b: *mut Bytes) -> BytesError!f64 {
+    let v: u64 = try get_u64(b)
+    return math.math_f64(v)
+}

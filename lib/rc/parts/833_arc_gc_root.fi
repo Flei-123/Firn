@@ -1,0 +1,252 @@
+// expect_exit: 0
+
+// ROUND 47 -- THE INTERPLAY OF `Arc[T]` AND THE TRACING GC.
+//
+// The Arc heap is an mmap area of its own; the collector knows only its own
+// chunks. So a `Gc[T]` inside the VALUE of an `Arc` is invisible to it.
+// This test shows both sides in ONE run:
+//
+//   A  WITHOUT registration the target is collected although the `Arc` holds it.
+//      That is the mistake you make when you do not know -- here it stands
+//      as a measurement, not as a warning.
+//   B  WITH `gc_root_register(arc_value_address(a), size)` it survives
+//      every collection run and stays readable.
+//   C  After `gc_root_unregister` it dies again.
+//   D  NO DOUBLE RELEASE: the counter decides about the ARC BLOCK,
+//      the collector about the GC OBJECTS. Both books balance.
+//
+// IMPORTANT FOR THE VALIDITY OF THE TEST: no `Gc[T]` and no copy of a
+// `Holder` may lie in the LIVE frame of `run` when a collection happens --
+// the stack scan is conservative (SPEC 3.5.3) and would otherwise keep the
+// object alive by itself. That is why every check helper returns only
+// `bool`/`u64` and is recursive with padding (the same technique as
+// dom_observer_lives() in lib/dom/dom.fi and as tests/820).
+
+gc class Leaf {
+    next: Gc[Leaf],
+    value: u64,
+}
+
+// The value inside the Arc carries a GC pointer -- exactly the case at issue.
+struct Holder {
+    node: Gc[Leaf],
+    number: u64,
+}
+
+fn padding() -> u64 {
+    var fill: [u64; 128] = [0; 128]
+    let fp: u64 = (&fill) as u64
+    var iq: u64 = 0
+    while iq < 128 {
+        *((fp + iq * 8) as *mut u64) = iq
+        iq = iq + 1
+    }
+    return *((fp + 8) as *mut u64)
+}
+
+fn store(h: *mut ArcHeap, out: *mut AtomicRef[Holder], wo: *mut GcWeak[Leaf],
+    depth: u64) -> AllocError!bool {
+    if padding() != 1 {
+        return false
+    }
+    if depth > 0 {
+        return try store(h, out, wo, depth - 1)
+    }
+    let k: Gc[Leaf] = try gc Leaf { next: gc_null[Leaf](), value: 4711 }
+    *wo = weak(k)
+    return try arc_new[Holder](h, Holder { node: k, number: 1 as u64 }, out)
+}
+
+// Is the target still alive? Returns a BOOL, never a Gc pointer.
+fn lives(w: GcWeak[Leaf], depth: u64) -> bool {
+    if padding() != 1 {
+        return false
+    }
+    if depth > 0 {
+        return lives(w, depth - 1)
+    }
+    return strong(w) != gc_null[Leaf]()
+}
+
+// The value of the target, 0 if it is dead. Returns a U64, never a Gc pointer.
+fn value_of(w: GcWeak[Leaf], depth: u64) -> u64 {
+    if padding() != 1 {
+        return 0
+    }
+    if depth > 0 {
+        return value_of(w, depth - 1)
+    }
+    if strong(w) == gc_null[Leaf]() {
+        return 0
+    }
+    return strong(w).value
+}
+
+// The actual read through the Arc, without a copy of the struct in the frame
+// of the caller: the address of the field is computed and the node is passed
+// on only as a number.
+fn value_in_arc(a: AtomicRef[Holder], depth: u64) -> u64 {
+    if padding() != 1 {
+        return 0
+    }
+    if depth > 0 {
+        return value_in_arc(a, depth - 1)
+    }
+    let h: Holder = arc_read[Holder](a)
+    if h.node == gc_null[Leaf]() {
+        return 0
+    }
+    return h.node.value
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 89
+    }
+    var h: ArcHeap = ArcHeap {
+        base: 0 as usize, capacity: 0 as usize, next: 0 as usize,
+        free: [0 as usize; 8], live: 0 as usize, used: 0 as usize,
+        allocations: 0 as usize, releases: 0 as usize
+    }
+    if !arc_heap_init(&h, 65536 as usize) {
+        return 90
+    }
+    let rc: i32 = run(&h) catch 91
+    arc_heap_free(&h)
+    return rc
+}
+
+fn run(h: *mut ArcHeap) -> AllocError!i32 {
+    let pattern: Holder = Holder { node: gc_null[Leaf](), number: 0 as u64 }
+    let gr: usize = arc_size_of[Holder](pattern)
+    if gr < 16 as usize {
+        return 1
+    }
+
+    // --- A: WITHOUT registration -----------------------------------------
+    var a: AtomicRef[Holder] = arc_empty[Holder]()
+    var wa: GcWeak[Leaf] = weak_null[Leaf]()
+    if !(try store(h, &a, &wa, 2)) {
+        return 2
+    }
+    if !lives(wa, 2) {
+        return 3
+    }
+    if value_in_arc(a, 2) != 4711 {
+        return 4
+    }
+    if gc_roots() != 0 {
+        return 5
+    }
+    // Round 49: clean the dead frames of `store`/`lives` BEFORE the collection
+    // run (gc.fi::gc_stack_clean). Without that, the statement of this section
+    // hangs on the frame layout of the collector -- it tipped over in round 49,
+    // when the allocation was extended for multi threaded operation.
+    gc_stack_clean()
+    gc_collect()
+    gc_collect()
+    // The collector has collected the node -- the Arc does NOT hold it.
+    if lives(wa, 2) {
+        return 6
+    }
+    // The Arc block itself lives on unchanged (separate memories).
+    if arc_heap_live(h) != 1 as usize {
+        return 7
+    }
+    if arc_strong_number[Holder](a) != 1 as u64 {
+        return 8
+    }
+    arc_free[Holder](h, &a)
+    if arc_heap_live(h) != 0 as usize {
+        return 9
+    }
+
+    // --- B: WITH registration --------------------------------------------
+    var b: AtomicRef[Holder] = arc_empty[Holder]()
+    var wb: GcWeak[Leaf] = weak_null[Leaf]()
+    if !(try store(h, &b, &wb, 2)) {
+        return 10
+    }
+    if !gc_root_register(arc_value_address[Holder](b) as *mut u8, gr as u64) {
+        return 11
+    }
+    if gc_roots() != 1 {
+        return 12
+    }
+    gc_collect()
+    gc_collect()
+    gc_collect()
+    if !lives(wb, 2) {
+        return 13
+    }
+    if value_of(wb, 2) != 4711 {
+        return 14
+    }
+    // Read THROUGH the Arc as well, the pointer is still good.
+    if value_in_arc(b, 2) != 4711 {
+        return 15
+    }
+
+    // --- the registration survives many collection runs under load -------
+    if !(try garbage_gen(2000, 2)) {
+        return 16
+    }
+    gc_collect()
+    if value_in_arc(b, 2) != 4711 {
+        return 17
+    }
+    if value_of(wb, 2) != 4711 {
+        return 18
+    }
+
+    // --- C: unregister -> the target dies --------------------------------
+    if !gc_root_unregister(arc_value_address[Holder](b) as *mut u8) {
+        return 19
+    }
+    if gc_roots() != 0 {
+        return 20
+    }
+    if gc_root_unregister(arc_value_address[Holder](b) as *mut u8) {
+        return 21
+    }
+    gc_stack_clean()
+    gc_collect()
+    gc_collect()
+    if lives(wb, 2) {
+        return 22
+    }
+
+    // --- D: the books of both sides balance ------------------------------
+    arc_free[Holder](h, &b)
+    if arc_heap_live(h) != 0 as usize {
+        return 23
+    }
+    if arc_heap_allocations(h) != arc_heap_releases(h) {
+        return 24
+    }
+    if arc_heap_used_bytes(h) != 0 as usize {
+        return 25
+    }
+    if gc_collections() == 0 {
+        return 26
+    }
+    return 0
+}
+
+fn garbage_gen(n: u64, depth: u64) -> AllocError!bool {
+    if padding() != 1 {
+        return false
+    }
+    if depth > 0 {
+        return try garbage_gen(n, depth - 1)
+    }
+    var i: u64 = 0
+    while i < n {
+        let garbage: Gc[Leaf] = try gc Leaf { next: gc_null[Leaf](), value: i }
+        if garbage == gc_null[Leaf]() {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

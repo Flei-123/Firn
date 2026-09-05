@@ -1,0 +1,274 @@
+// expect_exit: 0
+// tests/1613_crypto.fi -- ROUND 81: `lib/std/crypto/` inside one process.
+//
+// The formal proof is the 1,919 NIST CAVP vectors in
+// `tools/stdlib81/run.sh`. What stands here are the vectors of the
+// STANDARDS THEMSELVES, so that a broken build stage is caught by
+// `test.sh` even if nobody runs the tool -- plus the properties a table of
+// vectors cannot express.
+//
+//   A  FIPS 180-4 Appendix A: sha1("abc") and sha256("abc"), and the empty
+//      input for both. Those four numbers pin the padding, the byte order
+//      and the initial state at once.
+//   B  THE INCREMENTAL INTERFACE has to produce the same digest as the one
+//      shot form -- fed in one octet at a time, and split across a block
+//      boundary. That is where a hash with a broken buffer breaks, and no
+//      vector file checks it.
+//   C  RFC 2202 / RFC 4231: the HMAC cases, INCLUDING the one with a key
+//      longer than the block (the key gets hashed first) -- an
+//      implementation that truncates instead passes every short-key case.
+//   D  FIPS 197 C.1: the AES known answer test, in BOTH directions.
+//   E  CBC AND CFB8 OVER SEVERAL BLOCKS: encrypt, decrypt, get the original
+//      back. And the two must NOT produce the same octets -- a CFB8 that
+//      quietly does CBC would otherwise pass.
+//   F  `hmac_equal` says yes to equal and no to one flipped bit, at every
+//      position.
+//   G  `getrandom`: two calls do not give the same octets, and not all zero.
+import std.crypto.sha1
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.aes
+import std.crypto.random
+import std.rt
+import std.io
+
+fn hex_eq(p: u64, n: usize, lit: u64) -> bool {
+    var digits: [u8; 17] = "0123456789abcdef\0"
+    var i: usize = 0
+    while i < n {
+        let v: u8 = rt.ld8(p, i)
+        if rt.ld8(lit, i * 2) != digits[(v >> 4) as usize] {
+            return false
+        }
+        if rt.ld8(lit, i * 2 + 1) != digits[(v & 15 as u8) as usize] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    var abc: [u8; 4] = "abc\0"
+    var d20: [u8; 20] = [0; 20]
+    var d32: [u8; 32] = [0; 32]
+
+    // --- A: the vectors of FIPS 180-4
+    var v_sha1_abc: [u8; 41] = "a9993e364706816aba3e25717850c26c9cd0d89d\0"
+    var v_sha1_empty: [u8; 41] = "da39a3ee5e6b4b0d3255bfef95601890afd80709\0"
+    var v_sha256_abc: [u8; 65] =
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\0"
+    var v_sha256_empty: [u8; 65] =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\0"
+    sha1.sha1((&abc[0]) as u64, 3, (&d20[0]) as u64)
+    if !hex_eq((&d20[0]) as u64, 20, (&v_sha1_abc[0]) as u64) {
+        return 10
+    }
+    sha1.sha1((&abc[0]) as u64, 0, (&d20[0]) as u64)
+    if !hex_eq((&d20[0]) as u64, 20, (&v_sha1_empty[0]) as u64) {
+        return 11
+    }
+    sha256.sha256((&abc[0]) as u64, 3, (&d32[0]) as u64)
+    if !hex_eq((&d32[0]) as u64, 32, (&v_sha256_abc[0]) as u64) {
+        return 12
+    }
+    sha256.sha256((&abc[0]) as u64, 0, (&d32[0]) as u64)
+    if !hex_eq((&d32[0]) as u64, 32, (&v_sha256_empty[0]) as u64) {
+        return 13
+    }
+
+    // --- B: incremental == one shot, over a block boundary
+    var long: [u8; 200] = [0; 200]
+    var i: usize = 0
+    while i < 200 {
+        long[i] = ((i * 31 + 7) % 251) as u8
+        i = i + 1
+    }
+    var ref1: [u8; 20] = [0; 20]
+    var ref2: [u8; 32] = [0; 32]
+    sha1.sha1((&long[0]) as u64, 200, (&ref1[0]) as u64)
+    sha256.sha256((&long[0]) as u64, 200, (&ref2[0]) as u64)
+    // one octet at a time
+    var s1: sha1.Sha1 = sha1.sha1_new()
+    var s2: sha256.Sha256 = sha256.sha256_new()
+    i = 0
+    while i < 200 {
+        sha1.sha1_update(&s1, (&long[i]) as u64, 1)
+        sha256.sha256_update(&s2, (&long[i]) as u64, 1)
+        i = i + 1
+    }
+    sha1.sha1_final(&s1, (&d20[0]) as u64)
+    sha256.sha256_final(&s2, (&d32[0]) as u64)
+    if !rt.mem_eq((&d20[0]) as u64, (&ref1[0]) as u64, 20) {
+        return 20
+    }
+    if !rt.mem_eq((&d32[0]) as u64, (&ref2[0]) as u64, 32) {
+        return 21
+    }
+    // and split at 63/137 -- across the 64 octet boundary
+    var s3: sha1.Sha1 = sha1.sha1_new()
+    sha1.sha1_update(&s3, (&long[0]) as u64, 63)
+    sha1.sha1_update(&s3, (&long[63]) as u64, 137)
+    sha1.sha1_final(&s3, (&d20[0]) as u64)
+    if !rt.mem_eq((&d20[0]) as u64, (&ref1[0]) as u64, 20) {
+        return 22
+    }
+
+    // --- C: RFC 2202 case 1 and RFC 4231 case 1, plus a key longer than
+    // the block (RFC 2202 case 6 shape).
+    var key_b: [u8; 20] = [11; 20]
+    var msg_hi: [u8; 9] = "Hi There\0"
+    var v_h1: [u8; 41] = "b617318655057264e28bc0b6fb378c8ef146be00\0"
+    var v_h256: [u8; 65] =
+    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7\0"
+    hmac.hmac_sha1((&key_b[0]) as u64, 20, (&msg_hi[0]) as u64, 8,
+        (&d20[0]) as u64)
+    if !hex_eq((&d20[0]) as u64, 20, (&v_h1[0]) as u64) {
+        return 30
+    }
+    var key_a: [u8; 20] = [11; 20]
+    hmac.hmac_sha256((&key_a[0]) as u64, 20, (&msg_hi[0]) as u64, 8,
+        (&d32[0]) as u64)
+    if !hex_eq((&d32[0]) as u64, 32, (&v_h256[0]) as u64) {
+        return 31
+    }
+    // a key of 80 octets 0xaa with "Test Using Larger Than Block-Size Key -
+    // Hash Key First" (RFC 2202 case 6)
+    var key_big: [u8; 80] = [170; 80]
+    var msg6: [u8; 55] = "Test Using Larger Than Block-Size Key - Hash Key First\0"
+    var v_h6: [u8; 41] = "aa4ae5e15272d00e95705637ce8a3b55ed402112\0"
+    hmac.hmac_sha1((&key_big[0]) as u64, 80, (&msg6[0]) as u64, 54,
+        (&d20[0]) as u64)
+    if !hex_eq((&d20[0]) as u64, 20, (&v_h6[0]) as u64) {
+        return 32
+    }
+
+    // --- D: FIPS 197 C.1
+    var key: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    var plain: [u8; 16] = [0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170,
+        187, 204, 221, 238, 255]
+    var v_aes: [u8; 33] = "69c4e0d86a7b0430d8cdb78070b4c55a\0"
+    var cipher: [u8; 16] = [0; 16]
+    var a: aes.Aes = aes.aes128_new((&key[0]) as u64)
+    aes.aes_encrypt_block(&a, (&plain[0]) as u64, (&cipher[0]) as u64)
+    if !hex_eq((&cipher[0]) as u64, 16, (&v_aes[0]) as u64) {
+        return 40
+    }
+    var backblock: [u8; 16] = [0; 16]
+    aes.aes_decrypt_block(&a, (&cipher[0]) as u64, (&backblock[0]) as u64)
+    if !rt.mem_eq((&backblock[0]) as u64, (&plain[0]) as u64, 16) {
+        return 41
+    }
+
+    // --- E: CBC and CFB8 over several blocks
+    var data: [u8; 64] = [0; 64]
+    i = 0
+    while i < 64 {
+        data[i] = ((i * 17 + 3) % 256) as u8
+        i = i + 1
+    }
+    var iv0: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    var iv: [u8; 16] = [0; 16]
+    var enc: [u8; 64] = [0; 64]
+    var dec: [u8; 64] = [0; 64]
+    var enc2: [u8; 64] = [0; 64]
+    i = 0
+    while i < 16 { iv[i] = iv0[i]; i = i + 1 }
+    if !aes.aes_cbc_encrypt(&a, (&iv[0]) as u64, (&data[0]) as u64, 64,
+        (&enc[0]) as u64) {
+        return 50
+    }
+    i = 0
+    while i < 16 { iv[i] = iv0[i]; i = i + 1 }
+    if !aes.aes_cbc_decrypt(&a, (&iv[0]) as u64, (&enc[0]) as u64, 64,
+        (&dec[0]) as u64) {
+        return 51
+    }
+    if !rt.mem_eq((&dec[0]) as u64, (&data[0]) as u64, 64) {
+        return 52
+    }
+    // a length that is not a multiple of the block has to be refused
+    i = 0
+    while i < 16 { iv[i] = iv0[i]; i = i + 1 }
+    if aes.aes_cbc_encrypt(&a, (&iv[0]) as u64, (&data[0]) as u64, 63,
+        (&enc[0]) as u64) {
+        return 53
+    }
+    // CFB8: a stream mode, so ANY length -- and the octets must differ from
+    // the CBC ones.
+    i = 0
+    while i < 16 { iv[i] = iv0[i]; i = i + 1 }
+    aes.aes_cfb8_encrypt(&a, (&iv[0]) as u64, (&data[0]) as u64, 61,
+        (&enc2[0]) as u64)
+    i = 0
+    while i < 16 { iv[i] = iv0[i]; i = i + 1 }
+    aes.aes_cfb8_decrypt(&a, (&iv[0]) as u64, (&enc2[0]) as u64, 61,
+        (&dec[0]) as u64)
+    if !rt.mem_eq((&dec[0]) as u64, (&data[0]) as u64, 61) {
+        return 54
+    }
+    if rt.mem_eq((&enc2[0]) as u64, (&enc[0]) as u64, 16) {
+        return 55 // CFB8 produced the CBC octets
+    }
+    // the same input twice gives the same output (the IV really is reset)
+    i = 0
+    while i < 16 { iv[i] = iv0[i]; i = i + 1 }
+    aes.aes_cfb8_encrypt(&a, (&iv[0]) as u64, (&data[0]) as u64, 61,
+        (&dec[0]) as u64)
+    if !rt.mem_eq((&dec[0]) as u64, (&enc2[0]) as u64, 61) {
+        return 56
+    }
+
+    // --- F: the constant time comparison
+    var m1: [u8; 32] = [0; 32]
+    var m2: [u8; 32] = [0; 32]
+    i = 0
+    while i < 32 {
+        m1[i] = (i * 5 + 1) as u8
+        m2[i] = m1[i]
+        i = i + 1
+    }
+    if !hmac.hmac_equal((&m1[0]) as u64, (&m2[0]) as u64, 32) {
+        return 60
+    }
+    i = 0
+    while i < 32 {
+        m2[i] = m2[i] ^ 1 as u8
+        if hmac.hmac_equal((&m1[0]) as u64, (&m2[0]) as u64, 32) {
+            return 61 // a flipped bit at position i went unnoticed
+        }
+        m2[i] = m2[i] ^ 1 as u8
+        i = i + 1
+    }
+
+    // --- G: the kernel's randomness
+    var r1: [u8; 32] = [0; 32]
+    var r2: [u8; 32] = [0; 32]
+    if !random.random_bytes((&r1[0]) as u64, 32) {
+        return 70
+    }
+    if !random.random_bytes((&r2[0]) as u64, 32) {
+        return 71
+    }
+    if rt.mem_eq((&r1[0]) as u64, (&r2[0]) as u64, 32) {
+        return 72 // twice the same 32 octets is not randomness
+    }
+    var allzero: bool = true
+    i = 0
+    while i < 32 {
+        if r1[i] != 0 as u8 {
+            allzero = false
+        }
+        i = i + 1
+    }
+    if allzero {
+        return 73 // the buffer was never filled
+    }
+    if random.random_u64() == random.random_u64() {
+        return 74
+    }
+
+    var ok: [u8; 10] = "crypto ok\0"
+    io.print_line_bytes((&ok[0]) as u64, 9)
+    return 0
+}

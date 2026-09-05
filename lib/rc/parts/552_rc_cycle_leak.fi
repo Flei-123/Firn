@@ -1,0 +1,175 @@
+// expect_out: 1 1 2 128 200 12800 198 1 0
+
+// A MANDATORY PROOF for SPEC 3.4: an Rc CYCLE LEAKS. That is no bug of this
+// implementation but the documented property of reference counting -- and
+// exactly the reason why 'Rc' is expressly NOT intended for the DOM
+// (see docs/RC.md). The test makes the leak VISIBLE instead of hiding it.
+//
+// The setup: two cells a and b that hold each other strongly.
+// 'Rc' is always immutable (no RefCell equivalent), so the back reference
+// cannot be filled in through the Rc interface -- for that the test uses
+// the raw pointer from SPEC 3.6 (rc_value_address). That is exactly what an
+// interior mutability would do; with it the same cycle would be reachable
+// from ordinary application code.
+//
+// The output (one line):
+//   strong_a strong_b live used     after ONE cycle has been dropped
+//   live100 used100                    after 100 cycles created and dropped
+//   live_after_breaking_by_hand
+//   promote_empty  live_weak_variant
+
+struct Cell { partner: usize, id: i64 }
+
+fn heap_empty() -> RcHeap {
+    return RcHeap {
+        base: 0 as usize, capacity: 0 as usize, next: 0 as usize,
+        free: [0 as usize, 0 as usize, 0 as usize, 0 as usize,
+            0 as usize, 0 as usize, 0 as usize, 0 as usize],
+        live: 0 as usize, used: 0 as usize,
+        allocations: 0 as usize, releases: 0 as usize,
+    }
+}
+
+fn new_cell(h: *mut RcHeap, k: i64, out: *mut RefCount[Cell]) -> bool {
+    return rc_new[Cell](h, Cell { partner: 0 as usize, id: k }, out) catch false
+}
+
+// Fills the partner into a cell that already exists. Raw access
+// (SPEC 3.6) -- writing through 'Rc' itself is not possible, see
+// tests/neg/rc_immutable.fi.
+fn partner_set(r: RefCount[Cell], partner_block: usize) {
+    let addr: usize = rc_value_address[Cell](r)
+    *(addr as *mut usize) = partner_block
+}
+
+// Creates a real cycle a -> b -> a and drops both outer
+// handles. What remains are the two references IN the cells: the counters
+// never fall to 0.
+fn cycle_create_and_discard(h: *mut RcHeap) -> bool {
+    var a: RefCount[Cell] = rc_empty[Cell]()
+    var b: RefCount[Cell] = rc_empty[Cell]()
+    if new_cell(h, 1, &a) == false { return false }
+    if new_cell(h, 2, &b) == false { return false }
+    // a holds b strongly, b holds a strongly.
+    var a_in_b: RefCount[Cell] = rc_clone[Cell](a)
+    var b_in_a: RefCount[Cell] = rc_clone[Cell](b)
+    partner_set(a, rc_raw_address[Cell](b_in_a))
+    partner_set(b, rc_raw_address[Cell](a_in_b))
+    // The outer handles disappear (in a real program: the end of the block).
+    rc_free[Cell](h, &a)
+    rc_free[Cell](h, &b)
+    return true
+}
+
+fn print_number(buf: *mut u8, pos: usize, v: u64) -> usize {
+    var digits: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0 as usize
+    var x: u64 = v
+    if x == 0 as u64 {
+        digits[0] = 48 as u8
+        n = 1 as usize
+    }
+    while x > 0 as u64 {
+        digits[n] = (x % 10 as u64) as u8 + 48 as u8
+        x = x / 10 as u64
+        n = n + 1 as usize
+    }
+    var i: usize = 0 as usize
+    var p: usize = pos
+    while i < n {
+        *((buf as usize + p) as *mut u8) = digits[n - 1 as usize - i]
+        p = p + 1 as usize
+        i = i + 1 as usize
+    }
+    *((buf as usize + p) as *mut u8) = 32 as u8
+    return p + 1 as usize
+}
+
+fn main() -> i32 {
+    var h: RcHeap = heap_empty()
+    if rc_heap_init(&h, 1048576 as usize) == false { return 90 }
+
+    // --- Part 1: ONE cycle, both counters stay at 1 ----------------------
+    var a: RefCount[Cell] = rc_empty[Cell]()
+    var b: RefCount[Cell] = rc_empty[Cell]()
+    if new_cell(&h, 1, &a) == false { return 91 }
+    if new_cell(&h, 2, &b) == false { return 92 }
+    var a_in_b: RefCount[Cell] = rc_clone[Cell](a)
+    var b_in_a: RefCount[Cell] = rc_clone[Cell](b)
+    let addr_a: usize = rc_raw_address[Cell](a)
+    let addr_b: usize = rc_raw_address[Cell](b)
+    partner_set(a, addr_b)
+    partner_set(b, addr_a)
+    rc_free[Cell](&h, &a)
+    rc_free[Cell](&h, &b)
+    // Both counters still stand at 1 -- the cycle holds itself.
+    let strong_a: u64 = rc_ld64(addr_a + 0 as usize)
+    let strong_b: u64 = rc_ld64(addr_b + 0 as usize)
+    let live1: usize = rc_heap_live(&h)
+    let used1: usize = rc_heap_used_bytes(&h)
+
+    // --- Part 2: create and drop 100 cycles -> the consumption grows
+    var i: i64 = 0
+    while i < 99 {
+        if cycle_create_and_discard(&h) == false { return 93 }
+        i = i + 1
+    }
+    let live100: usize = rc_heap_live(&h)
+    let used100: usize = rc_heap_used_bytes(&h)
+
+    // --- Part 3: break it by hand (only that way does the memory come back) ---
+    // Stage 0 has no destructors; the references stored in the cells have to be
+    // dropped one by one. For the 99 cycles from part 2 the address is not
+    // known any more -- that is exactly the leak. So only the first cycle,
+    // whose addresses we still have, is broken.
+    var inner_a: RefCount[Cell] = rc_raw_ref[Cell](addr_a)
+    var inner_b: RefCount[Cell] = rc_raw_ref[Cell](addr_b)
+    rc_free[Cell](&h, &inner_a)
+    rc_free[Cell](&h, &inner_b)
+    let live_hand: usize = rc_heap_live(&h)
+
+    // --- Part 4: the same setup with Weak does NOT leak ------------------
+    var h2: RcHeap = heap_empty()
+    if rc_heap_init(&h2, 65536 as usize) == false { return 94 }
+    var x: RefCount[Cell] = rc_empty[Cell]()
+    var y: RefCount[Cell] = rc_empty[Cell]()
+    if new_cell(&h2, 3, &x) == false { return 95 }
+    if new_cell(&h2, 4, &y) == false { return 96 }
+    // y holds x only WEAKLY, x holds y strongly -> no cycle of strong references.
+    var w: WeakRef[Cell] = weak_of[Cell](x)
+    var y_in_x: RefCount[Cell] = rc_clone[Cell](y)
+    partner_set(x, rc_raw_address[Cell](y_in_x))
+    partner_set(y, weak_raw_address[Cell](w))
+    let addr_y: usize = rc_raw_address[Cell](y)
+    rc_free[Cell](&h2, &y)
+    rc_free[Cell](&h2, &x)
+    // x is dead: the upgrade of the weak reference visibly returns empty.
+    var on: RefCount[Cell] = promote[Cell](w)
+    var empty: u64 = 0 as u64
+    if rc_is_empty[Cell](on) {
+        empty = 1 as u64
+    }
+    // Drop the inner strong reference from x to y by hand (there is no 'drop').
+    var inner_y: RefCount[Cell] = rc_raw_ref[Cell](addr_y)
+    rc_free[Cell](&h2, &inner_y)
+    weak_free[Cell](&h2, &w)
+    let live_weak: usize = rc_heap_live(&h2)
+
+    var out: [u8; 128] = [0 as u8; 128]
+    var p: usize = 0 as usize
+    p = print_number(&out[0], p, strong_a)
+    p = print_number(&out[0], p, strong_b)
+    p = print_number(&out[0], p, live1 as u64)
+    p = print_number(&out[0], p, used1 as u64)
+    p = print_number(&out[0], p, live100 as u64)
+    p = print_number(&out[0], p, used100 as u64)
+    p = print_number(&out[0], p, live_hand as u64)
+    p = print_number(&out[0], p, empty)
+    p = print_number(&out[0], p, live_weak as u64)
+    out[p - 1 as usize] = 10 as u8
+    syscall(1, 1, &out[0], p as i64)
+
+    rc_heap_free(&h)
+    rc_heap_free(&h2)
+    return 0
+}

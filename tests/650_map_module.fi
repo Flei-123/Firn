@@ -1,0 +1,221 @@
+// expect_exit: 0
+// `Map[K, V]` FROM A LIBRARY -- item 3 of the blocker list in
+// docs/SELF_HOSTING.md 4. The compiler needs it for every name table.
+//
+// What is checked is not "it runs" but the things that really go wrong with
+// open addressing:
+//   * many insertions across several doublings
+//   * overwriting an existing key (must not change `len`)
+//   * deleting and then SEARCHING BEHIND the tombstone -- the classic bug
+//   * inserting and deleting alternately so that the tombstones pile up
+//   * two different instances with UNEQUAL key/value sizes
+import modules.map
+
+fn main() -> i32 {
+    // --- 1000 entries, several doublings
+    var m: Map[u32, i64] = map_new[u32, i64]()
+    defer map_free[u32, i64](&m)
+
+    var i: u32 = 0
+    while i < 1000 {
+        if !map_set[u32, i64](&m, i, i as i64 * 3 + 1) {
+            return 1
+        }
+        i = i + 1
+    }
+    if map_len[u32, i64](&m) != 1000 {
+        return 2
+    }
+    // Load limit kept? 1000 entries must not sit in 1024 slots -- otherwise the
+    // probe chain would be as long as the table at the end.
+    if map_cap[u32, i64](&m) < 1334 {
+        return 3
+    }
+
+    i = 0
+    while i < 1000 {
+        if map_get[u32, i64](&m, i) != i as i64 * 3 + 1 {
+            return 4
+        }
+        i = i + 1
+    }
+    if map_has[u32, i64](&m, 1000 as u32) {
+        return 5
+    }
+    if map_get[u32, i64](&m, 5000 as u32) != 0 {
+        return 6
+    }
+
+    // --- overwriting does not change `len`
+    if !map_set[u32, i64](&m, 42 as u32, 777) {
+        return 7
+    }
+    if map_len[u32, i64](&m) != 1000 {
+        return 8
+    }
+    if map_get[u32, i64](&m, 42 as u32) != 777 {
+        return 9
+    }
+
+    // --- deleting: the entry is gone, ALL others stay findable.
+    // Exactly here a search that stops at a tombstone falls over.
+    i = 0
+    while i < 500 {
+        if !map_delete[u32, i64](&m, i * 2) {
+            return 10
+        }
+        i = i + 1
+    }
+    if map_len[u32, i64](&m) != 500 {
+        return 11
+    }
+    i = 0
+    while i < 1000 {
+        let da: bool = map_has[u32, i64](&m, i)
+        if i % 2 == 0 {
+            if da {
+                return 12
+            }
+        } else {
+            if !da {
+                return 13
+            }
+            if map_get[u32, i64](&m, i) != i as i64 * 3 + 1 {
+                return 14
+            }
+        }
+        i = i + 1
+    }
+    if map_delete[u32, i64](&m, 0 as u32) {
+        return 15
+    }
+
+    // --- inserting again across the tombstones
+    i = 0
+    while i < 500 {
+        if !map_set[u32, i64](&m, i * 2, 9) {
+            return 16
+        }
+        i = i + 1
+    }
+    if map_len[u32, i64](&m) != 1000 {
+        return 17
+    }
+    if map_get[u32, i64](&m, 998 as u32) != 9 {
+        return 18
+    }
+    if map_get[u32, i64](&m, 999 as u32) != 999 * 3 + 1 {
+        return 19
+    }
+
+    // --- iteration: every occupied slot exactly once
+    var counted: usize = 0
+    var sum: i64 = 0
+    var p: usize = 0
+    while p < map_cap[u32, i64](&m) {
+        if map_slot_used[u32, i64](&m, p) {
+            counted = counted + 1
+            sum = sum + map_slot_value[u32, i64](&m, p)
+        }
+        p = p + 1
+    }
+    if counted != 1000 {
+        return 20
+    }
+    // 500 x 9 (even) + sum of the odd values, one of them set to 777
+    var erw: i64 = 500 * 9
+    i = 1
+    while i < 1000 {
+        erw = erw + i as i64 * 3 + 1
+        i = i + 2
+    }
+    if sum != erw {
+        return 21
+    }
+
+    // --- `map_clear` keeps the memory
+    let cap_before: usize = map_cap[u32, i64](&m)
+    map_clear[u32, i64](&m)
+    if map_len[u32, i64](&m) != 0 {
+        return 22
+    }
+    if map_cap[u32, i64](&m) != cap_before {
+        return 23
+    }
+    if map_has[u32, i64](&m, 999 as u32) {
+        return 24
+    }
+
+    // --- second instance, different sizes: u64 -> u8
+    var n: Map[u64, u8] = map_new[u64, u8]()
+    defer map_free[u64, u8](&n)
+    var j: u64 = 0
+    while j < 300 {
+        // Large keys far apart from each other -- they exercise the spreading
+        if !map_set[u64, u8](&n, j * 1000003 + 7, (j % 251) as u8) {
+            return 25
+        }
+        j = j + 1
+    }
+    if map_len[u64, u8](&n) != 300 {
+        return 26
+    }
+    j = 0
+    while j < 300 {
+        if map_slot_value[u64, u8](&n, 0) == 200 as u8 {
+            // only so that the expression is used
+        }
+        if map_get[u64, u8](&n, j * 1000003 + 7) != (j % 251) as u8 {
+            return 27
+        }
+        j = j + 1
+    }
+
+    // --- third instance: i32 with NEGATIVE keys.
+    // `k as u64` turns them into very large numbers -- the masking still has to
+    // land inside the field.
+    var o: Map[i32, i32] = map_new[i32, i32]()
+    defer map_free[i32, i32](&o)
+    var q: i32 = -200
+    while q < 200 {
+        if !map_set[i32, i32](&o, q, q * q) {
+            return 28
+        }
+        q = q + 1
+    }
+    if map_len[i32, i32](&o) != 400 {
+        return 29
+    }
+    if map_get[i32, i32](&o, -137) != 137 * 137 {
+        return 30
+    }
+    if map_has[i32, i32](&o, -201) {
+        return 31
+    }
+
+    // --- `map_reserve` grows in advance, without rehashing while filling
+    var r: Map[u32, u32] = map_new[u32, u32]()
+    defer map_free[u32, u32](&r)
+    if !map_reserve[u32, u32](&r, 5000) {
+        return 32
+    }
+    let cap_res: usize = map_cap[u32, u32](&r)
+    if cap_res < 6667 {
+        return 33
+    }
+    var s: u32 = 0
+    while s < 5000 {
+        if !map_set[u32, u32](&r, s, s) {
+            return 34
+        }
+        s = s + 1
+    }
+    if map_cap[u32, u32](&r) != cap_res {
+        return 35
+    }
+    if map_len[u32, u32](&r) != 5000 {
+        return 36
+    }
+
+    return 0
+}

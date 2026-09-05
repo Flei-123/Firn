@@ -1,0 +1,1057 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/gc.fi -- `gc class`, `Gc[T]`, `GcWeak[T]`, weak references and
+// the GC queries for `#[no_gc]`: THE REGISTRY, WRITTEN IN FIRN (round 34).
+//
+// Fourteenth part of stage 1: the port of the data model of
+// `compiler/src/gc.rs`. The same layout as `pattern.fi` (round 32) and
+// `err.fi` (round 33): the registry sits OUTSIDE the tree, because
+// it has to be shared by all files of a translation --
+// class names are visible program wide (in stage 0 the renamer does not
+// touch the registry entries; they are created during parsing
+// and stay as they are).
+//
+// REPRESENTATION (binding, docs/GC.md, unchanged from stage 0):
+//   gc class C { ... } -> struct "gc C", type context (prefix layout of the base)
+//   Gc[C]              -> *mut <struct "gc C">
+//   GcWeak[C]          -> struct "GcWeak[C]" { __p: u64, __s: u64 }
+//   gc C{ ... }        -> AllocError!Gc[C]
+//
+// The parser records the class here; the type names sit in the tree as the
+// placeholders `__gc#p:C` / `__gc#w:C` (a `#` can never occur in a source
+// text identifier) and are resolved in `types.resolve` through
+// `gc_ty_hook` -- the same handover as `hook_resolve_ty` in stage 0, and
+// the same import cycle as for the error unions (`types.fi` <-> `gc.fi`).
+//
+// The type tag is the declaration number counting from 1; the type table for
+// the collector is written by `codegen.fi` from these entries (ty_table_asm
+// in stage 0). The collector runtime itself is plain Firn (`lib/gc/gc.fi`)
+// and is pulled in by the driver as soon as a `gc class` appears anywhere --
+// only its NAMES sit here (for `#[no_gc]`, rule 1).
+
+import rt
+import vec
+import intern
+import lexer
+import ast
+import types
+
+export { Gc, gc_new, gc_free, gc_error, gc_count, gc_has_classes,
+    gc_class_add, gc_base_set, gc_field_add,
+    gc_runtime_set, gc_runtime,
+    gc_index_of, gc_is_class, gc_name, gc_sidx, gc_widx,
+    gc_tid, gc_size, gc_base_tid, gc_union, gc_union_set,
+    gc_class_of_struct, gc_class_of_weak, gc_is_descendant,
+    gc_register, gc_layout,
+    gc_ty_hook, gc_is_gc_ptr, gc_is_gc_weak, gc_is_gc_ref,
+    gc_is_upward, gc_is_related, gc_field_base,
+    gc_has_new_prefix, gc_class_out_new,
+    gc_has_as_prefix, gc_class_out_as,
+    gc_is_alloc_call, gc_is_weak_name, gc_is_strong_name,
+    gc_state_name, gc_probe_ty, gc_source_scan,
+    gc_strong_count, gc_strong_off, gc_weak_count, gc_weak_off,
+    gc_capture_class }
+
+const NONE: u32 = 4294967295
+
+struct Gc {
+    k_name: Vec[u32], // class name (number in the interner)
+    k_base: Vec[u32], // name of the base, 0 = none
+    k_foff: Vec[u32], k_flen: Vec[u32], // own fields: range in f_*
+    f_name: Vec[u32], f_te: Vec[u32], // field name, type node in the tree
+    k_sidx: Vec[u32], // struct "gc C", type context (NONE up to gc_register)
+    k_widx: Vec[u32], // struct "GcWeak[C]"
+    k_size: Vec[u64], // after the layout: size in bytes
+    k_btid: Vec[u64], // type tag of the base, 0 = none
+    k_union: Vec[u32], // error union AllocError!Gc[C]: index + 1 (0 = none)
+    k_done: Vec[u32], // 1 = the layout is done
+    k_soff: Vec[u32], k_slen: Vec[u32], // strong field offsets: range, s_offs
+    k_woff: Vec[u32], k_wlen: Vec[u32], // weak ones: range in w_offs
+    s_offs: Vec[u64], w_offs: Vec[u64],
+    scratch: rt.Buf,
+    err: usize,
+    // Round 49: 1 = the runtime (lib/gc/gc.fi) is part of this program,
+    // even if there is NO `gc class`. Then the state block still has to
+    // appear in the assembly -- the thread table and the locks live
+    // there (codegen.rs: `has_classes() || runtime_active()`).
+    runtime: usize,
+}
+
+fn gc_new() -> Gc {
+    return Gc {
+        k_name: vec_new[u32](), k_base: vec_new[u32](),
+        k_foff: vec_new[u32](), k_flen: vec_new[u32](),
+        f_name: vec_new[u32](), f_te: vec_new[u32](),
+        k_sidx: vec_new[u32](), k_widx: vec_new[u32](),
+        k_size: vec_new[u64](), k_btid: vec_new[u64](),
+        k_union: vec_new[u32](), k_done: vec_new[u32](),
+        k_soff: vec_new[u32](), k_slen: vec_new[u32](),
+        k_woff: vec_new[u32](), k_wlen: vec_new[u32](),
+        s_offs: vec_new[u64](), w_offs: vec_new[u64](),
+        scratch: rt.buf_new(),
+        err: 0,
+        runtime: 0,
+    }
+}
+
+fn gc_free(g: *mut Gc) {
+    vec_free[u32](&(*g).k_name)
+    vec_free[u32](&(*g).k_base)
+    vec_free[u32](&(*g).k_foff)
+    vec_free[u32](&(*g).k_flen)
+    vec_free[u32](&(*g).f_name)
+    vec_free[u32](&(*g).f_te)
+    vec_free[u32](&(*g).k_sidx)
+    vec_free[u32](&(*g).k_widx)
+    vec_free[u64](&(*g).k_size)
+    vec_free[u64](&(*g).k_btid)
+    vec_free[u32](&(*g).k_union)
+    vec_free[u32](&(*g).k_done)
+    vec_free[u32](&(*g).k_soff)
+    vec_free[u32](&(*g).k_slen)
+    vec_free[u32](&(*g).k_woff)
+    vec_free[u32](&(*g).k_wlen)
+    vec_free[u64](&(*g).s_offs)
+    vec_free[u64](&(*g).w_offs)
+    rt.buf_free(&(*g).scratch)
+}
+
+fn gc_error(g: *mut Gc) -> usize { return (*g).err }
+fn gc_count(g: *mut Gc) -> usize { return vec_len[u32](&(*g).k_name) }
+fn gc_has_classes(g: *mut Gc) -> bool { return gc_count(g) > 0 }
+
+fn gc_runtime_set(g: *mut Gc, an: usize) { (*g).runtime = an }
+
+fn gc_runtime(g: *mut Gc) -> usize { return (*g).runtime }
+
+// --------------------------------------------------------------- names
+
+// Does the interned name `nr` hold the bytes `lit` at position 0..n?
+fn name_equal(it: *mut intern.Interner, nr: u32, lit: u64, n: usize) -> bool {
+    if intern.intern_length(it, nr) != n {
+        return false
+    }
+    return rt.mem_eq(intern.intern_ptr(it, nr), lit, n)
+}
+
+// Does the name `nr` start with the bytes `lit` (length n)?
+fn name_prefix(it: *mut intern.Interner, nr: u32, lit: u64, n: usize) -> bool {
+    if intern.intern_length(it, nr) < n {
+        return false
+    }
+    return rt.mem_eq(intern.intern_ptr(it, nr), lit, n)
+}
+
+// ----------------------------------------------------------- inventory
+
+fn gc_index_of(g: *mut Gc, name: u32) -> u32 {
+    var i: usize = 0
+    while i < gc_count(g) {
+        if vec_at[u32](&(*g).k_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn gc_is_class(g: *mut Gc, name: u32) -> bool { return gc_index_of(g, name) != NONE }
+
+fn gc_name(g: *mut Gc, ki: u32) -> u32 { return vec_at[u32](&(*g).k_name, ki as usize) }
+fn gc_sidx(g: *mut Gc, ki: u32) -> u32 { return vec_at[u32](&(*g).k_sidx, ki as usize) }
+fn gc_widx(g: *mut Gc, ki: u32) -> u32 { return vec_at[u32](&(*g).k_widx, ki as usize) }
+// Type tag: counting from 1 in order of declaration (like stage 0).
+fn gc_tid(g: *mut Gc, ki: u32) -> u64 { return ki as u64 + 1 }
+fn gc_size(g: *mut Gc, ki: u32) -> u64 { return vec_at[u64](&(*g).k_size, ki as usize) }
+fn gc_base_tid(g: *mut Gc, ki: u32) -> u64 { return vec_at[u64](&(*g).k_btid, ki as usize) }
+// Error union AllocError!Gc[C]: index in the error registry + 1.
+fn gc_union(g: *mut Gc, ki: u32) -> u32 { return vec_at[u32](&(*g).k_union, ki as usize) }
+fn gc_union_set(g: *mut Gc, ki: u32, u: u32) {
+    vec_set[u32](&(*g).k_union, ki as usize, u + 1)
+}
+fn gc_strong_count(g: *mut Gc, ki: u32) -> u32 { return vec_at[u32](&(*g).k_slen, ki as usize) }
+fn gc_weak_count(g: *mut Gc, ki: u32) -> u32 { return vec_at[u32](&(*g).k_wlen, ki as usize) }
+fn gc_strong_off(g: *mut Gc, ki: u32, j: u32) -> u64 {
+    return vec_at[u64](&(*g).s_offs, (vec_at[u32](&(*g).k_soff, ki as usize) + j) as usize)
+}
+fn gc_weak_off(g: *mut Gc, ki: u32, j: u32) -> u64 {
+    return vec_at[u64](&(*g).w_offs, (vec_at[u32](&(*g).k_woff, ki as usize) + j) as usize)
+}
+
+// A new class from the parser. NONE if the name already exists --
+// the caller (the parser) reports the error itself.
+fn gc_class_add(g: *mut Gc, name: u32) -> u32 {
+    if gc_index_of(g, name) != NONE {
+        return NONE
+    }
+    let i: u32 = gc_count(g) as u32
+    vec_push[u32](&(*g).k_name, name)
+    vec_push[u32](&(*g).k_base, 0)
+    vec_push[u32](&(*g).k_foff, vec_len[u32](&(*g).f_name) as u32)
+    vec_push[u32](&(*g).k_flen, 0)
+    vec_push[u32](&(*g).k_sidx, NONE)
+    vec_push[u32](&(*g).k_widx, NONE)
+    vec_push[u64](&(*g).k_size, 0)
+    vec_push[u64](&(*g).k_btid, 0)
+    vec_push[u32](&(*g).k_union, 0)
+    vec_push[u32](&(*g).k_done, 0)
+    vec_push[u32](&(*g).k_soff, 0)
+    vec_push[u32](&(*g).k_slen, 0)
+    vec_push[u32](&(*g).k_woff, 0)
+    vec_push[u32](&(*g).k_wlen, 0)
+    return i
+}
+
+// ROUND 58 (fnval.rs) -- the class of a CAPTURE RECORD.
+//
+// The ordinary path (`gc_register`/`gc_layout`) runs over the items and is
+// long finished by the time a closure is checked: only there are the types
+// of the captured values known. So the class is built here completely, with
+// layout, type tag and traced offsets -- from then on the collector treats
+// it like any other, through the same type table.
+//
+// Word 0 of the record is the code address and is deliberately NOT traced:
+// it points into `.text`, which is no heap block.
+//
+// `name` is the interned class name, `caps` the resolved types of the
+// captured values. Yields the index of the class.
+fn gc_capture_class(g: *mut Gc, t: *mut types.Types, it: *mut intern.Interner,
+    name: u32, caps: *mut Vec[u32]) -> u32 {
+    let ki: u32 = gc_count(g) as u32
+    vec_push[u32](&(*g).k_name, name)
+    vec_push[u32](&(*g).k_base, 0)
+    vec_push[u32](&(*g).k_foff, vec_len[u32](&(*g).f_name) as u32)
+    vec_push[u32](&(*g).k_flen, 0)
+    vec_push[u32](&(*g).k_widx, NONE)
+    vec_push[u64](&(*g).k_btid, 0)
+    vec_push[u32](&(*g).k_union, 0)
+    vec_push[u32](&(*g).k_done, 1)
+    // The struct: `__code` at 0, the captured values one word apart.
+    rt.buf_clear(&(*g).scratch)
+    var p1: [u8; 3] = "gc "
+    rt.buf_push_bytes(&(*g).scratch, (&p1[0]) as u64, 3)
+    rt.buf_push_bytes(&(*g).scratch, intern.intern_ptr(it, name),
+        intern.intern_length(it, name))
+    let sn: u32 = intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+        rt.buf_len(&(*g).scratch)) as u32
+    let sidx: u32 = types.types_struct_append(t, sn)
+    vec_push[u32](&(*g).k_sidx, sidx)
+    var fnames: Vec[u32] = vec_new[u32]()
+    var ftypes: Vec[u32] = vec_new[u32]()
+    var foffs: Vec[u64] = vec_new[u64]()
+    var cn: [u8; 6] = "__code"
+    vec_push[u32](&fnames, intern.intern_number(it, (&cn[0]) as u64, 6) as u32)
+    vec_push[u32](&ftypes, types.new_ty(t, types.K_U64, 0, 0))
+    vec_push[u64](&foffs, 0)
+    let soff: u32 = vec_len[u64](&(*g).s_offs) as u32
+    var slen: u32 = 0
+    var k: usize = 0
+    while k < vec_len[u32](caps) {
+        rt.buf_clear(&(*g).scratch)
+        var p2: [u8; 3] = "__c"
+        rt.buf_push_bytes(&(*g).scratch, (&p2[0]) as u64, 3)
+        rt.buf_push_dec_u64(&(*g).scratch, k as u64)
+        let fn2: u32 = intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+            rt.buf_len(&(*g).scratch)) as u32
+        let ct: u32 = vec_at[u32](caps, k)
+        vec_push[u32](&fnames, fn2)
+        vec_push[u32](&ftypes, ct)
+        vec_push[u64](&foffs, 8 + k as u64 * 8)
+        if gc_is_gc_ptr(g, t, ct) {
+            vec_push[u64](&(*g).s_offs, 8 + k as u64 * 8)
+            slen = slen + 1
+        }
+        k = k + 1
+    }
+    let size: u64 = 8 + vec_len[u32](caps) as u64 * 8
+    types.types_struct_define(t, sidx, size, 8, &fnames, &ftypes, &foffs)
+    vec_free[u32](&fnames)
+    vec_free[u32](&ftypes)
+    vec_free[u64](&foffs)
+    vec_push[u64](&(*g).k_size, size)
+    vec_push[u32](&(*g).k_soff, soff)
+    vec_push[u32](&(*g).k_slen, slen)
+    vec_push[u32](&(*g).k_woff, vec_len[u64](&(*g).w_offs) as u32)
+    vec_push[u32](&(*g).k_wlen, 0)
+    return ki
+}
+
+fn gc_base_set(g: *mut Gc, ki: u32, base: u32) {
+    vec_set[u32](&(*g).k_base, ki as usize, base)
+}
+
+// An own field. false = duplicate (the parser reports the error).
+fn gc_field_add(g: *mut Gc, ki: u32, fname: u32, te: u32) -> bool {
+    let off: u32 = vec_at[u32](&(*g).k_foff, ki as usize)
+    let len: u32 = vec_at[u32](&(*g).k_flen, ki as usize)
+    var k: u32 = 0
+    while k < len {
+        if vec_at[u32](&(*g).f_name, (off + k) as usize) == fname {
+            return false
+        }
+        k = k + 1
+    }
+    vec_push[u32](&(*g).f_name, fname)
+    vec_push[u32](&(*g).f_te, te)
+    vec_set[u32](&(*g).k_flen, ki as usize, len + 1)
+    return true
+}
+
+// The class behind a struct index ("gc C"), or NONE.
+fn gc_class_of_struct(g: *mut Gc, sidx: u32) -> u32 {
+    var i: usize = 0
+    while i < gc_count(g) {
+        if vec_at[u32](&(*g).k_sidx, i) == sidx {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// The class behind a GcWeak struct index, or NONE.
+fn gc_class_of_weak(g: *mut Gc, widx: u32) -> u32 {
+    var i: usize = 0
+    while i < gc_count(g) {
+        if vec_at[u32](&(*g).k_widx, i) == widx {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// Does `a` derive from `b` (a proper chain, `a` itself does not count)?
+fn gc_is_descendant(g: *mut Gc, a: u32, b: u32) -> bool {
+    var cur: u32 = a
+    var steps: u32 = 0
+    while steps < 1024 {
+        let bn: u32 = vec_at[u32](&(*g).k_base, cur as usize)
+        if bn == 0 {
+            return false
+        }
+        let nxt: u32 = gc_index_of(g, bn)
+        if nxt == NONE {
+            return false
+        }
+        if nxt == b {
+            return true
+        }
+        cur = nxt
+        steps = steps + 1
+    }
+    return false
+}
+
+// ---------------------------------------------------- type questions
+
+// `Gc[T]` -- strong pointer: *mut <struct "gc T">.
+fn gc_is_gc_ptr(g: *mut Gc, t: *mut types.Types, ty: u32) -> bool {
+    if types.ty_kind(t, ty) != types.K_PTR {
+        return false
+    }
+    let inner: u32 = types.ty_a(t, ty)
+    if types.ty_kind(t, inner) != types.K_STRUCT {
+        return false
+    }
+    return gc_class_of_struct(g, types.ty_a(t, inner)) != NONE
+}
+
+// `GcWeak[T]` -- weak reference (two word struct).
+fn gc_is_gc_weak(g: *mut Gc, t: *mut types.Types, ty: u32) -> bool {
+    if types.ty_kind(t, ty) != types.K_STRUCT {
+        return false
+    }
+    return gc_class_of_weak(g, types.ty_a(t, ty)) != NONE
+}
+
+fn gc_is_gc_ref(g: *mut Gc, t: *mut types.Types, ty: u32) -> bool {
+    return gc_is_gc_ptr(g, t, ty) || gc_is_gc_weak(g, t, ty)
+}
+
+// Implicit upcast `Gc[Derived]` -> `Gc[Base]` (SPEC 4.4).
+fn gc_is_upward(g2: u64, t: *mut types.Types, got: u32, want: u32) -> bool {
+    let g: *mut Gc = g2 as *mut Gc
+    if types.ty_kind(t, got) != types.K_PTR || types.ty_kind(t, want) != types.K_PTR {
+        return false
+    }
+    let gi: u32 = types.ty_a(t, got)
+    let wi: u32 = types.ty_a(t, want)
+    if types.ty_kind(t, gi) != types.K_STRUCT || types.ty_kind(t, wi) != types.K_STRUCT {
+        return false
+    }
+    let a: u32 = gc_class_of_struct(g, types.ty_a(t, gi))
+    let b: u32 = gc_class_of_struct(g, types.ty_a(t, wi))
+    if a == NONE || b == NONE {
+        return false
+    }
+    return a == b || gc_is_descendant(g, a, b)
+}
+
+// Related in either direction (identity comparison `g == h`).
+fn gc_is_related(g2: u64, t: *mut types.Types, a: u32, b: u32) -> bool {
+    return gc_is_upward(g2, t, a, b) || gc_is_upward(g2, t, b, a)
+}
+
+// Field access through a `Gc[T]`: the struct index that is reached
+// through (hook_field_base in stage 0).
+fn gc_field_base(g: *mut Gc, t: *mut types.Types, bt: u32) -> u32 {
+    if types.ty_kind(t, bt) != types.K_PTR {
+        return NONE
+    }
+    let inner: u32 = types.ty_a(t, bt)
+    if types.ty_kind(t, inner) != types.K_STRUCT {
+        return NONE
+    }
+    let si: u32 = types.ty_a(t, inner)
+    if gc_class_of_struct(g, si) == NONE {
+        return NONE
+    }
+    return si
+}
+
+// ---------------------------------------- callee names of the language surface
+
+// Does the callee start with `gc ` ("gc C{...}")? A space can never
+// occur in a source text identifier.
+fn gc_has_new_prefix(it: *mut intern.Interner, nr: u32) -> bool {
+    var pfx: [u8; 3] = "gc "
+    return name_prefix(it, nr, (&pfx[0]) as u64, 3)
+}
+
+// The class behind "gc C", or -1.
+fn gc_class_out_new(g: *mut Gc, it: *mut intern.Interner, nr: u32) -> i64 {
+    if !gc_has_new_prefix(it, nr) {
+        return -1
+    }
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    let kn: i64 = intern.intern_find(it, p + 3, n - 3)
+    if kn < 0 {
+        return -1
+    }
+    let ki: u32 = gc_index_of(g, kn as u32)
+    if ki == NONE {
+        return -1
+    }
+    return ki as i64
+}
+
+fn gc_has_as_prefix(it: *mut intern.Interner, nr: u32) -> bool {
+    var pfx: [u8; 8] = "__gc#as:"
+    return name_prefix(it, nr, (&pfx[0]) as u64, 8)
+}
+
+// The class behind "__gc#as:C", or -1.
+fn gc_class_out_as(g: *mut Gc, it: *mut intern.Interner, nr: u32) -> i64 {
+    if !gc_has_as_prefix(it, nr) {
+        return -1
+    }
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    let kn: i64 = intern.intern_find(it, p + 8, n - 8)
+    if kn < 0 {
+        return -1
+    }
+    let ki: u32 = gc_index_of(g, kn as u32)
+    if ki == NONE {
+        return -1
+    }
+    return ki as i64
+}
+
+fn gc_is_weak_name(it: *mut intern.Interner, nr: u32) -> bool {
+    var w: [u8; 4] = "weak"
+    return name_equal(it, nr, (&w[0]) as u64, 4)
+}
+
+fn gc_is_strong_name(it: *mut intern.Interner, nr: u32) -> bool {
+    var w: [u8; 6] = "strong"
+    return name_equal(it, nr, (&w[0]) as u64, 6)
+}
+
+// The compiler intrinsics: 1 = `__gc_state`, 2 = `__gc_save_regs`, 0 = neither.
+fn gc_state_name(it: *mut intern.Interner, nr: u32) -> u32 {
+    var s1: [u8; 10] = "__gc_state"
+    if name_equal(it, nr, (&s1[0]) as u64, 10) {
+        return 1
+    }
+    var s2: [u8; 14] = "__gc_save_regs"
+    if name_equal(it, nr, (&s2[0]) as u64, 14) {
+        return 2
+    }
+    return 0
+}
+
+// -------------------------------------------- `#[no_gc]`, rule 1 (SPEC 3.5.4)
+
+// Is `nr` the name of a GC allocation, or of a collector function that
+// can trigger a collection or touches the collector state?
+// Contract for `nogc.fi` -- word for word as `is_gc_alloc_call` in gc.rs.
+fn gc_is_alloc_call(g: *mut Gc, it: *mut intern.Interner, nr: u32) -> bool {
+    if gc_has_new_prefix(it, nr) {
+        return true
+    }
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    // The tail after the LAST "__" counts as well, otherwise the
+    // promise could be dodged across module boundaries (`module__gc_init`).
+    var tail: usize = 0
+    var i: usize = 0
+    while i + 1 < n {
+        if rt.ld8(p, i) == 95 as u8 && rt.ld8(p, i + 1) == 95 as u8 {
+            tail = i + 2
+        }
+        i = i + 1
+    }
+    var n1: [u8; 7] = "gc_init"
+    var n2: [u8; 10] = "gc_collect"
+    var n3: [u8; 14] = "__gc_alloc_raw"
+    var n4: [u8; 16] = "__gc_collect_now"
+    var n5: [u8; 16] = "gc_set_max_bytes"
+    var n6: [u8; 12] = "gc_max_bytes"
+    var n7: [u8; 14] = "gc_total_bytes"
+    var n8: [u8; 14] = "gc_collections"
+    var n8b: [u8; 15] = "gc_live_objects"
+    var n9: [u8; 13] = "gc_heap_bytes"
+    var n10: [u8; 13] = "gc_live_bytes"
+    var n11: [u8; 16] = "gc_pause_ns_last"
+    var n12: [u8; 15] = "gc_pause_ns_max"
+    var n13: [u8; 17] = "gc_pause_ns_total"
+    var n14: [u8; 11] = "gc_barriers"
+    var n15: [u8; 10] = "__gc_state"
+    var n16: [u8; 14] = "__gc_save_regs"
+    var n17: [u8; 13] = "__gc_weak_raw"
+    var n18: [u8; 15] = "__gc_strong_raw"
+    var n19: [u8; 11] = "__gc_as_raw"
+    var n20: [u8; 12] = "__gc_barrier"
+    if a_of(p, n, tail, (&n1[0]) as u64, 7) { return true }
+    if a_of(p, n, tail, (&n2[0]) as u64, 10) { return true }
+    if a_of(p, n, tail, (&n3[0]) as u64, 14) { return true }
+    if a_of(p, n, tail, (&n4[0]) as u64, 16) { return true }
+    if a_of(p, n, tail, (&n5[0]) as u64, 16) { return true }
+    if a_of(p, n, tail, (&n6[0]) as u64, 12) { return true }
+    if a_of(p, n, tail, (&n7[0]) as u64, 14) { return true }
+    if a_of(p, n, tail, (&n8[0]) as u64, 14) { return true }
+    if a_of(p, n, tail, (&n8b[0]) as u64, 15) { return true }
+    if a_of(p, n, tail, (&n9[0]) as u64, 13) { return true }
+    if a_of(p, n, tail, (&n10[0]) as u64, 13) { return true }
+    if a_of(p, n, tail, (&n11[0]) as u64, 16) { return true }
+    if a_of(p, n, tail, (&n12[0]) as u64, 15) { return true }
+    if a_of(p, n, tail, (&n13[0]) as u64, 17) { return true }
+    if a_of(p, n, tail, (&n14[0]) as u64, 11) { return true }
+    if a_of(p, n, tail, (&n15[0]) as u64, 10) { return true }
+    if a_of(p, n, tail, (&n16[0]) as u64, 14) { return true }
+    if a_of(p, n, tail, (&n17[0]) as u64, 13) { return true }
+    if a_of(p, n, tail, (&n18[0]) as u64, 15) { return true }
+    if a_of(p, n, tail, (&n19[0]) as u64, 11) { return true }
+    if a_of(p, n, tail, (&n20[0]) as u64, 12) { return true }
+    return false
+}
+
+// A full match, or a match of the tail after the last "__".
+fn a_of(p: u64, n: usize, tail: usize, lit: u64, ln: usize) -> bool {
+    if n == ln && rt.mem_eq(p, lit, ln) {
+        return true
+    }
+    if tail > 0 && n - tail == ln && rt.mem_eq(p + tail as u64, lit, ln) {
+        return true
+    }
+    return false
+}
+
+// ----------------------------------------------------------- registering
+
+// `// HOOK gc` in `sema::Checker::run` (before `collect_structs`): every
+// class gets reserved as struct -- AFTER the error sets, BEFORE the structs of
+// the tree, exactly like `declare_classes` in stage 0. The layout follows
+// in `gc_layout`, once the structs of the program are known.
+fn gc_register(g2: u64, t: *mut types.Types, it: *mut intern.Interner) {
+    let g: *mut Gc = g2 as *mut Gc
+    let n: usize = gc_count(g)
+    if n == 0 {
+        return
+    }
+    var i: usize = 0
+    while i < n {
+        let name: u32 = vec_at[u32](&(*g).k_name, i)
+        if types.struct_index(t, name) >= 0 {
+            // type '...' is already declared
+            (*g).err = (*g).err + 1
+        }
+        rt.buf_clear(&(*g).scratch)
+        var p1: [u8; 3] = "gc "
+        rt.buf_push_bytes(&(*g).scratch, (&p1[0]) as u64, 3)
+        rt.buf_push_bytes(&(*g).scratch, intern.intern_ptr(it, name),
+            intern.intern_length(it, name))
+        let sn: u32 = intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+            rt.buf_len(&(*g).scratch)) as u32
+        let sidx: u32 = types.types_struct_reserve(t, sn)
+        rt.buf_clear(&(*g).scratch)
+        var p2: [u8; 7] = "GcWeak["
+        rt.buf_push_bytes(&(*g).scratch, (&p2[0]) as u64, 7)
+        rt.buf_push_bytes(&(*g).scratch, intern.intern_ptr(it, name),
+            intern.intern_length(it, name))
+        rt.buf_push(&(*g).scratch, 93 as u8)
+        let wn: u32 = intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+            rt.buf_len(&(*g).scratch)) as u32
+        let widx: u32 = types.types_struct_reserve(t, wn)
+        // The weak reference is a two word struct { __p, __s }: the
+        // pointer OBFUSCATED (so that the conservative stack scan does not
+        // read it as a strong root) and the serial number of the target block.
+        let u64t: u32 = types.new_ty(t, types.K_U64, 0, 0)
+        var wnames: Vec[u32] = vec_new[u32]()
+        var wtypes: Vec[u32] = vec_new[u32]()
+        var wvers: Vec[u64] = vec_new[u64]()
+        var wp: [u8; 3] = "__p"
+        var ws: [u8; 3] = "__s"
+        vec_push[u32](&wnames, intern.intern_number(it, (&wp[0]) as u64, 3) as u32)
+        vec_push[u32](&wtypes, u64t)
+        vec_push[u64](&wvers, 0)
+        vec_push[u32](&wnames, intern.intern_number(it, (&ws[0]) as u64, 3) as u32)
+        vec_push[u32](&wtypes, u64t)
+        vec_push[u64](&wvers, 8)
+        types.types_struct_define(t, widx, 16, 8, &wnames, &wtypes, &wvers)
+        vec_free[u32](&wnames)
+        vec_free[u32](&wtypes)
+        vec_free[u64](&wvers)
+        vec_set[u32](&(*g).k_sidx, i, sidx)
+        vec_set[u32](&(*g).k_widx, i, widx)
+        i = i + 1
+    }
+    // Check the base: it exists and has no cycles (declare_classes, step 2).
+    i = 0
+    while i < n {
+        let b: u32 = vec_at[u32](&(*g).k_base, i)
+        if b != 0 {
+            let bi: u32 = gc_index_of(g, b)
+            if bi == NONE {
+                // unknown base class
+                (*g).err = (*g).err + 1
+                vec_set[u32](&(*g).k_base, i, 0)
+            } else if circle(g, bi, i as u32) {
+                // cyclic inheritance chain
+                (*g).err = (*g).err + 1
+                vec_set[u32](&(*g).k_base, i, 0)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Does `from` reach `target` along the base chain?
+fn circle(g: *mut Gc, of: u32, target: u32) -> bool {
+    var cur: u32 = of
+    var steps: u32 = 0
+    while steps < 1024 {
+        if cur == target {
+            return true
+        }
+        let bn: u32 = vec_at[u32](&(*g).k_base, cur as usize)
+        if bn == 0 {
+            return false
+        }
+        let nxt: u32 = gc_index_of(g, bn)
+        if nxt == NONE {
+            return false
+        }
+        cur = nxt
+        steps = steps + 1
+    }
+    return true
+}
+
+// --------------------------------------------------------------- layout
+
+// `// HOOK gc` in `sema::add_items_inner` (AFTER `collect_structs`): the
+// field layout of every class, in topological order (base first).
+fn gc_layout(g2: u64, t: *mut types.Types, b: *mut ast.Tree, it: *mut intern.Interner) {
+    let g: *mut Gc = g2 as *mut Gc
+    let n: usize = gc_count(g)
+    var pass: usize = 0
+    while pass < n {
+        var progress: bool = false
+        var i: usize = 0
+        while i < n {
+            if vec_at[u32](&(*g).k_done, i) == 0 {
+                let bn: u32 = vec_at[u32](&(*g).k_base, i)
+                var wait: bool = false
+                if bn != 0 {
+                    let bi: u32 = gc_index_of(g, bn)
+                    if bi != NONE {
+                        wait = vec_at[u32](&(*g).k_done, bi as usize) == 0
+                    }
+                }
+                if !wait {
+                    put_out(g, t, b, it, i as u32)
+                    progress = true
+                }
+            }
+            i = i + 1
+        }
+        if !progress {
+            return
+        }
+        pass = pass + 1
+    }
+}
+
+// Allowed field types (field_ty_allowed in stage 0): integers, bool, f64,
+// pointers, Gc[T], GcWeak[T] and arrays of those -- no ordinary structs.
+fn field_ty_allowed(g: *mut Gc, t: *mut types.Types, ty: u32) -> bool {
+    let k: u32 = types.ty_kind(t, ty)
+    if k == types.K_ERROR {
+        return true
+    }
+    if k == types.K_ARR {
+        return field_ty_allowed(g, t, types.ty_a(t, ty))
+    }
+    if k == types.K_STRUCT {
+        return gc_is_gc_weak(g, t, ty)
+    }
+    if k == types.K_VOID {
+        return false
+    }
+    return true
+}
+
+fn put_out(g: *mut Gc, t: *mut types.Types, b: *mut ast.Tree, it: *mut intern.Interner, i: u32) {
+    var names: Vec[u32] = vec_new[u32]()
+    var types_v: Vec[u32] = vec_new[u32]()
+    // The base fields sit UP FRONT (prefix layout, implicit upcast).
+    var base_tid: u64 = 0
+    let bn: u32 = vec_at[u32](&(*g).k_base, i as usize)
+    if bn != 0 {
+        let bi: u32 = gc_index_of(g, bn)
+        if bi != NONE {
+            base_tid = gc_tid(g, bi)
+            let bsidx: u32 = vec_at[u32](&(*g).k_sidx, bi as usize)
+            var k: u32 = 0
+            while k < types.st_flen(t, bsidx as usize) {
+                let fi: u32 = types.st_foff(t, bsidx as usize) + k
+                vec_push[u32](&names, types.sf_name(t, fi))
+                vec_push[u32](&types_v, types.sf_ty(t, fi))
+                k = k + 1
+            }
+        }
+    }
+    // Own fields: an inherited name must not be declared twice.
+    let foff: u32 = vec_at[u32](&(*g).k_foff, i as usize)
+    let flen: u32 = vec_at[u32](&(*g).k_flen, i as usize)
+    var k: u32 = 0
+    while k < flen {
+        let fname: u32 = vec_at[u32](&(*g).f_name, (foff + k) as usize)
+        let fte: u32 = vec_at[u32](&(*g).f_te, (foff + k) as usize)
+        var duplicate: bool = false
+        var j: usize = 0
+        while j < vec_len[u32](&names) {
+            if vec_at[u32](&names, j) == fname {
+                duplicate = true
+            }
+            j = j + 1
+        }
+        if duplicate {
+            // the base already declares that field
+            (*g).err = (*g).err + 1
+            k = k + 1
+            continue
+        }
+        let ty: u32 = types.resolve(t, b, it, fte)
+        if !field_ty_allowed(g, t, ty) {
+            // field type is not allowed in a gc class
+            (*g).err = (*g).err + 1
+            k = k + 1
+            continue
+        }
+        vec_push[u32](&names, fname)
+        vec_push[u32](&types_v, ty)
+        k = k + 1
+    }
+    // Compute the offsets (the same computation as types.struct_layout).
+    var ver: Vec[u64] = vec_new[u64]()
+    var offset: u64 = 0
+    var max_a: u64 = 1
+    var m: usize = 0
+    while m < vec_len[u32](&names) {
+        let ty: u32 = vec_at[u32](&types_v, m)
+        var au: u64 = types.alignment_of(t, ty)
+        if au < 1 { au = 1 }
+        let gr: u64 = types.size_of(t, ty)
+        if au > max_a { max_a = au }
+        offset = types.round_up(offset, au)
+        vec_push[u64](&ver, offset)
+        offset = offset + gr
+        m = m + 1
+    }
+    let size: u64 = types.round_up(offset, max_a)
+    let sidx: u32 = vec_at[u32](&(*g).k_sidx, i as usize)
+    types.types_struct_define(t, sidx, size, max_a, &names, &types_v, &ver)
+    // Collect the offsets for the compiler generated tracing.
+    let soff: u32 = vec_len[u64](&(*g).s_offs) as u32
+    let woff: u32 = vec_len[u64](&(*g).w_offs) as u32
+    var slen: u32 = 0
+    var wlen: u32 = 0
+    m = 0
+    while m < vec_len[u32](&names) {
+        let ty: u32 = vec_at[u32](&types_v, m)
+        if gc_is_gc_ptr(g, t, ty) {
+            vec_push[u64](&(*g).s_offs, vec_at[u64](&ver, m))
+            slen = slen + 1
+        } else if gc_is_gc_weak(g, t, ty) {
+            vec_push[u64](&(*g).w_offs, vec_at[u64](&ver, m))
+            wlen = wlen + 1
+        }
+        m = m + 1
+    }
+    vec_free[u32](&names)
+    vec_free[u32](&types_v)
+    vec_free[u64](&ver)
+    vec_set[u64](&(*g).k_size, i as usize, size)
+    vec_set[u64](&(*g).k_btid, i as usize, base_tid)
+    vec_set[u32](&(*g).k_soff, i as usize, soff)
+    vec_set[u32](&(*g).k_slen, i as usize, slen)
+    vec_set[u32](&(*g).k_woff, i as usize, woff)
+    vec_set[u32](&(*g).k_wlen, i as usize, wlen)
+    vec_set[u32](&(*g).k_done, i as usize, 1)
+}
+
+// ----------------------------------------------------- type resolution
+
+// HOOK in `types.resolve` (hook_resolve_ty in gc.rs): `Gc[C]`,
+// `GcWeak[C]` and the forbidden use of a class name as an ordinary type.
+// Returning NONE means it is not a GC name and normal resolution continues.
+// Errors are COUNTED here (the type checker folds them into its own count
+// through `gc_error` -- like `err.fi`).
+fn gc_ty_hook(g2: u64, t: *mut types.Types, it: *mut intern.Interner, nr: u32) -> u32 {
+    let g: *mut Gc = g2 as *mut Gc
+    var pfx1: [u8; 7] = "__gc#p:"
+    if name_prefix(it, nr, (&pfx1[0]) as u64, 7) {
+        let p: u64 = intern.intern_ptr(it, nr)
+        let n: usize = intern.intern_length(it, nr)
+        let kn: i64 = intern.intern_find(it, p + 7, n - 7)
+        var ki: u32 = NONE
+        if kn >= 0 {
+            ki = gc_index_of(g, kn as u32)
+        }
+        if ki == NONE {
+            // unknown gc class
+            (*g).err = (*g).err + 1
+            return types.new_ty(t, types.K_ERROR, 0, 0)
+        }
+        let st: u32 = types.new_ty(t, types.K_STRUCT, gc_sidx(g, ki), 0)
+        return types.new_ty(t, types.K_PTR, st, 1)
+    }
+    var pfx2: [u8; 7] = "__gc#w:"
+    if name_prefix(it, nr, (&pfx2[0]) as u64, 7) {
+        let p: u64 = intern.intern_ptr(it, nr)
+        let n: usize = intern.intern_length(it, nr)
+        let kn: i64 = intern.intern_find(it, p + 7, n - 7)
+        var ki: u32 = NONE
+        if kn >= 0 {
+            ki = gc_index_of(g, kn as u32)
+        }
+        if ki == NONE {
+            (*g).err = (*g).err + 1
+            return types.new_ty(t, types.K_ERROR, 0, 0)
+        }
+        return types.new_ty(t, types.K_STRUCT, gc_widx(g, ki), 0)
+    }
+    // `let x: Node` -- a gc class value lives ONLY on the GC heap.
+    if gc_is_class(g, nr) {
+        // '...' is a gc class and cannot be a value
+        (*g).err = (*g).err + 1
+        return types.new_ty(t, types.K_ERROR, 0, 0)
+    }
+    return NONE
+}
+
+// ----------------------------------------------- probe (type without checking)
+
+// Type of `weak(g)`, `strong(w)` and `x.as?[C]` WITHOUT checking -- so that
+// an integer literal next to it gets its type (`probe_ty` in gc.rs).
+// `arg` is the GUESSED type of the first argument (NONE = unknown).
+fn gc_probe_ty(g: *mut Gc, t: *mut types.Types, it: *mut intern.Interner,
+    name: u32, arg: u32) -> u32 {
+    if gc_has_as_prefix(it, name) {
+        let ki: i64 = gc_class_out_as(g, it, name)
+        if ki < 0 {
+            return NONE
+        }
+        let st: u32 = types.new_ty(t, types.K_STRUCT, gc_sidx(g, ki as u32), 0)
+        return types.new_ty(t, types.K_PTR, st, 1)
+    }
+    if arg == NONE {
+        return NONE
+    }
+    if gc_is_weak_name(it, name) {
+        if types.ty_kind(t, arg) != types.K_PTR {
+            return NONE
+        }
+        let inner: u32 = types.ty_a(t, arg)
+        if types.ty_kind(t, inner) != types.K_STRUCT {
+            return NONE
+        }
+        let ki: u32 = gc_class_of_struct(g, types.ty_a(t, inner))
+        if ki == NONE {
+            return NONE
+        }
+        return types.new_ty(t, types.K_STRUCT, gc_widx(g, ki), 0)
+    }
+    if gc_is_strong_name(it, name) {
+        if types.ty_kind(t, arg) != types.K_STRUCT {
+            return NONE
+        }
+        let ki: u32 = gc_class_of_weak(g, types.ty_a(t, arg))
+        if ki == NONE {
+            return NONE
+        }
+        let st: u32 = types.new_ty(t, types.K_STRUCT, gc_sidx(g, ki), 0)
+        return types.new_ty(t, types.K_PTR, st, 1)
+    }
+    return NONE
+}
+
+// ------------------------------------------------------- source text scan
+
+// Decides from the TOKEN STREAM whether a file uses `gc class` (bit 1),
+// declares `error AllocError` itself (bit 2) or brings the finalizer
+// dispatcher `fn __gc_finalize` of its own (bit 4, round 47) --
+// `source_needs_gc`, `source_has_allocerror` and
+// `source_has_finalizer` in gc.rs. The driver then pulls the runtime in,
+// leaves out the error set if the program already has one, and adds the
+// empty default dispatcher only when it is missing.
+//
+// BIT 4 COUNTS ONLY IN THE ROOT FILE. In a module the function would be
+// called `module____gc_finalize`, and the runtime would no longer find it; the
+// driver therefore masks the module results with 3.
+// MERGE R49+R53: both branches used bit 8 -- round 53 for
+// GcVec/GcMap, round 49 for its own `__thread_work`. Bit 8 stays
+// with the collections (it is taken over from MODULES as well), the
+// thread dispatcher moves to bit 16 (which counts only in the root file).
+fn gc_source_scan(l: u64, it2: u64, gc_nr: i64, class_nr: i64, ae_nr: i64,
+    fin_nr: i64, fa_nr: i64) -> u32 {
+    let lx: *mut lexer.Lexer = l as *mut lexer.Lexer
+    let it: *mut intern.Interner = it2 as *mut intern.Interner
+    // Round 53 (gc.rs::source_needs_collections): prefix test instead of
+    // equality test -- it covers the type `GcVec[Gc[T]]` AND the call
+    // `gcvec_append[T](...)` with the very same check.
+    var s1: [u8; 5] = "GcVec"
+    var s2: [u8; 5] = "GcMap"
+    var s3: [u8; 6] = "gcvec_"
+    var s4: [u8; 6] = "gcmap_"
+    // ROUND 70 (strtype.rs::source_uses_str): `str` is GC managed --
+    // `__str_eq`, `__str_copy` and `__str_concat` live in this runtime. Two
+    // purely syntactic signals pull it in: the TYPE name `str` (an
+    // identifier not next to a `.`, so `import std.str` and `str.trim(x)`
+    // are out), and a text literal directly next to `+`, `==` or `!=`.
+    var strw: [u8; 3] = "str"
+    let str_nr: i64 = intern.intern_number(it, (&strw[0]) as u64, 3) as i64
+    // ROUND 88: `string` is the second spelling of `str` (types.fi::canon_str).
+    // The trigger reads TOKENS, so it has to know both names -- a program
+    // that only ever writes `string` needs the same runtime.
+    var strw2: [u8; 6] = "string"
+    let string_nr: i64 = intern.intern_number(it, (&strw2[0]) as u64, 6) as i64
+    var out: u32 = 0
+    var i: usize = 0
+    while i + 1 < lexer.lex_count(lx) {
+        var named_str: bool = lexer.lex_kind(lx, i) == 1
+        if named_str {
+            let this_nr: i64 = lexer.lex_nr(lx, i) as i64
+            named_str = this_nr == str_nr
+            if !named_str {
+                named_str = this_nr == string_nr
+            }
+        }
+        if named_str {
+            var alone: bool = lexer.lex_kind(lx, i + 1) != 43
+            if alone && i > 0 {
+                alone = lexer.lex_kind(lx, i - 1) != 43
+            }
+            if alone {
+                out = out | 1
+            }
+        }
+        if lexer.lex_kind(lx, i) == 3 {
+            let nx: u32 = lexer.lex_kind(lx, i + 1)
+            if nx == 47 || nx == 62 || nx == 63 {
+                out = out | 1
+            }
+            if i > 0 {
+                let pv: u32 = lexer.lex_kind(lx, i - 1)
+                if pv == 47 || pv == 62 || pv == 63 {
+                    out = out | 1
+                }
+            }
+        }
+        let a: u32 = lexer.lex_kind(lx, i)
+        if a == 1 {
+            let nr: u32 = lexer.lex_nr(lx, i)
+            var coll: bool = intern.intern_prefix(it, nr, (&s1[0]) as u64, 5)
+            if !coll {
+                coll = intern.intern_prefix(it, nr, (&s2[0]) as u64, 5)
+            }
+            if !coll {
+                coll = intern.intern_prefix(it, nr, (&s3[0]) as u64, 6)
+            }
+            if !coll {
+                coll = intern.intern_prefix(it, nr, (&s4[0]) as u64, 6)
+            }
+            if coll {
+                out = out | 8
+            }
+        }
+        if a == 1 && gc_nr >= 0 && lexer.lex_nr(lx, i) as i64 == gc_nr {
+            if lexer.lex_kind(lx, i + 1) == 1 && class_nr >= 0 {
+                if lexer.lex_nr(lx, i + 1) as i64 == class_nr {
+                    out = out | 1
+                }
+            }
+            // ROUND 58 (gc.rs::source_needs_gc): `gc fn(...)` -- a capturing
+            // closure. Its record is a GC object, so the same runtime has to
+            // be there. Two tokens are enough to see it, and a plain
+            // `fn(...)` closure (which captures nothing and allocates
+            // nothing) deliberately does NOT pull the collector in.
+            // 4 = the keyword `fn` (A_KWFN in lexer.fi).
+            if lexer.lex_kind(lx, i + 1) == 4 {
+                out = out | 1
+            }
+        }
+        // 31 = the keyword `error` (token kind from lexer.fi).
+        if a == 31 && ae_nr >= 0 && lexer.lex_kind(lx, i + 1) == 1 {
+            if lexer.lex_nr(lx, i + 1) as i64 == ae_nr {
+                out = out | 2
+            }
+        }
+        // 4 = the keyword `fn` (A_KWFN in lexer.fi).
+        if a == 4 && fin_nr >= 0 && lexer.lex_kind(lx, i + 1) == 1 {
+            if lexer.lex_nr(lx, i + 1) as i64 == fin_nr {
+                out = out | 4
+            }
+        }
+        // Round 49 (merge: bit 16 instead of 8): the root file has a
+        // `fn __thread_work` of its own (source_has_thread_work, gc.rs).
+        if a == 4 && fa_nr >= 0 && lexer.lex_kind(lx, i + 1) == 1 {
+            if lexer.lex_nr(lx, i + 1) as i64 == fa_nr {
+                out = out | 16
+            }
+        }
+        // Round 49: the runtime is pulled in by ANY identifier with the
+        // prefix `thread_` or `__thread` too -- the thread runtime lives
+        // in the same file as the collector and needs the same
+        // state block (source_needs_gc in gc.rs, word for word).
+        if a == 1 {
+            let fnr2: u32 = lexer.lex_nr(lx, i)
+            let fpz: u64 = lexer.lex_name_ptr(lx, fnr2)
+            let fpl: usize = lexer.lex_name_length(lx, fnr2)
+            var pfa: [u8; 7] = "thread_"
+            var pfb: [u8; 8] = "__thread"
+            if fpl >= 7 as usize && rt.mem_eq(fpz, (&pfa[0]) as u64, 7) {
+                out = out | 1
+            }
+            if fpl >= 8 as usize && rt.mem_eq(fpz, (&pfb[0]) as u64, 8) {
+                out = out | 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}

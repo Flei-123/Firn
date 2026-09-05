@@ -1,0 +1,376 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/stdlib81/crypto_cli.fi -- `lib/std/crypto/` as a program (round 81).
+//
+//     crypto_cli batch <jobs> <out>
+//
+// One job per line, everything in lowercase hex, the answer one line of hex
+// per job:
+//
+//     sha1     <msg>
+//     sha256   <msg>
+//     hmac1    <key> <msg>
+//     hmac256  <key> <msg>
+//     cbce     <key> <iv> <data>        CBC encrypt
+//     cbcd     <key> <iv> <data>        CBC decrypt
+//     cfb8e    <key> <iv> <data>        CFB8 encrypt
+//     cfb8d    <key> <iv> <data>        CFB8 decrypt
+//     rand     <n>                      n octets from the kernel
+//     source   <n>                      which source the octets came from
+//
+// BATCH AND NOT ONE PROCESS PER VECTOR because the NIST files have a few
+// thousand of them and a process start is a millisecond -- the point of the
+// measurement is the arithmetic, not `execve`.
+//
+//     crypto_cli file <sha1|sha256> <path> <out>
+//     crypto_cli speed <sha1|sha256|aes|cfb8> <megabytes> <out>
+import std.crypto.sha1
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.aes
+import std.crypto.random
+import std.rt
+import std.io
+
+fn eq_c(p: u64, lit: u64) -> bool {
+    let a: usize = rt.c_length(p)
+    let b: usize = rt.c_length(lit)
+    if a != b {
+        return false
+    }
+    return rt.mem_eq(p, lit, a)
+}
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 87 as u8) as i32
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 55 as u8) as i32
+    }
+    return -1
+}
+
+// `src[from..to)` as octets into `out`. Returns the number of octets, or
+// -1 when the text is not hex of even length.
+fn hex_decode(src: u64, from: usize, to: usize, out: u64) -> i32 {
+    let n: usize = to - from
+    // A single '-' is the EMPTY octet sequence. Without it an empty key
+    // would vanish between two blanks and the next field would slide into
+    // its place -- which is what happened the first time this ran, and the
+    // 'wrong' answers were HMACs of the message under the message.
+    if n == 1 && rt.ld8(src, from) == 45 as u8 {
+        return 0
+    }
+    if n % 2 != 0 {
+        return -1
+    }
+    var i: usize = 0
+    while i < n / 2 {
+        let hi: i32 = hexval(rt.ld8(src, from + i * 2))
+        let lo: i32 = hexval(rt.ld8(src, from + i * 2 + 1))
+        if hi < 0 || lo < 0 {
+            return -1
+        }
+        rt.st8(out, i, ((hi * 16) + lo) as u8)
+        i = i + 1
+    }
+    return (n / 2) as i32
+}
+
+fn hex_push(out: *mut rt.Buf, p: u64, n: usize) {
+    var hex: [u8; 17] = "0123456789abcdef\0"
+    var i: usize = 0
+    while i < n {
+        let v: u8 = rt.ld8(p, i)
+        rt.buf_push(out, hex[(v >> 4) as usize])
+        rt.buf_push(out, hex[(v & 15 as u8) as usize])
+        i = i + 1
+    }
+}
+
+fn dec_of(src: u64, from: usize, to: usize) -> usize {
+    var v: usize = 0
+    var i: usize = from
+    while i < to {
+        let c: u8 = rt.ld8(src, i)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            v = v * 10 + (c - 48 as u8) as usize
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn now_ns() -> u64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return ts[0] * 1000000000 + ts[1]
+}
+
+// The three fields of a line: `f[k]`/`t[k]` are the bounds of field k.
+struct Fields {
+    f: [usize; 4],
+    t: [usize; 4],
+    n: usize,
+}
+
+fn split_fields(src: u64, from: usize, to: usize) -> Fields {
+    var r: Fields = Fields { f: [0; 4], t: [0; 4], n: 0 }
+    var i: usize = from
+    while i < to && r.n < 4 {
+        while i < to && rt.ld8(src, i) == 32 as u8 {
+            i = i + 1
+        }
+        if i >= to {
+            break
+        }
+        let s: usize = i
+        while i < to && rt.ld8(src, i) != 32 as u8 {
+            i = i + 1
+        }
+        r.f[r.n] = s
+        r.t[r.n] = i
+        r.n = r.n + 1
+    }
+    return r
+}
+
+fn do_batch(jobs: *mut rt.Buf, out: *mut rt.Buf) -> i32 {
+    let src: u64 = rt.buf_ptr(jobs)
+    let n: usize = rt.buf_len(jobs)
+    // Room for the longest field of the NIST files (LongMsg: 1,024 octets;
+    // HMAC.rsp: 128; AES: 64) with plenty of headroom.
+    let cap: usize = 65536
+    let a: u64 = rt.heap_alloc(cap)
+    let b: u64 = rt.heap_alloc(cap)
+    let c: u64 = rt.heap_alloc(cap)
+    let res: u64 = rt.heap_alloc(cap)
+    if a == 0 || b == 0 || c == 0 || res == 0 {
+        return 7
+    }
+    var op_sha1: [u8; 5] = "sha1\0"
+    var op_sha256: [u8; 7] = "sha256\0"
+    var op_h1: [u8; 6] = "hmac1\0"
+    var op_h256: [u8; 8] = "hmac256\0"
+    var op_cbce: [u8; 5] = "cbce\0"
+    var op_cbcd: [u8; 5] = "cbcd\0"
+    var op_cfe: [u8; 6] = "cfb8e\0"
+    var op_cfd: [u8; 6] = "cfb8d\0"
+    var op_rand: [u8; 5] = "rand\0"
+    var op_src: [u8; 7] = "source\0"
+
+    var at: usize = 0
+    while at < n {
+        var eol: usize = at
+        while eol < n && rt.ld8(src, eol) != 10 as u8 {
+            eol = eol + 1
+        }
+        let fl: Fields = split_fields(src, at, eol)
+        if fl.n >= 1 {
+            let op: u64 = src + fl.f[0] as u64
+            let opn: usize = fl.t[0] - fl.f[0]
+            var handled: bool = false
+
+            if opn == 4 && rt.mem_eq(op, (&op_sha1[0]) as u64, 4) {
+                let ln: i32 = hex_decode(src, fl.f[1], fl.t[1], a)
+                if ln >= 0 {
+                    sha1.sha1(a, ln as usize, res)
+                    hex_push(out, res, sha1.SHA1_SIZE)
+                }
+                handled = true
+            } else if opn == 6 && rt.mem_eq(op, (&op_sha256[0]) as u64, 6) {
+                let ln: i32 = hex_decode(src, fl.f[1], fl.t[1], a)
+                if ln >= 0 {
+                    sha256.sha256(a, ln as usize, res)
+                    hex_push(out, res, sha256.SHA256_SIZE)
+                }
+                handled = true
+            } else if opn == 5 && rt.mem_eq(op, (&op_h1[0]) as u64, 5) {
+                let kl: i32 = hex_decode(src, fl.f[1], fl.t[1], a)
+                let ml: i32 = hex_decode(src, fl.f[2], fl.t[2], b)
+                if kl >= 0 && ml >= 0 {
+                    hmac.hmac_sha1(a, kl as usize, b, ml as usize, res)
+                    hex_push(out, res, sha1.SHA1_SIZE)
+                }
+                handled = true
+            } else if opn == 7 && rt.mem_eq(op, (&op_h256[0]) as u64, 7) {
+                let kl: i32 = hex_decode(src, fl.f[1], fl.t[1], a)
+                let ml: i32 = hex_decode(src, fl.f[2], fl.t[2], b)
+                if kl >= 0 && ml >= 0 {
+                    hmac.hmac_sha256(a, kl as usize, b, ml as usize, res)
+                    hex_push(out, res, sha256.SHA256_SIZE)
+                }
+                handled = true
+            } else if opn == 4 && rt.mem_eq(op, (&op_rand[0]) as u64, 4) {
+                let want: usize = dec_of(src, fl.f[1], fl.t[1])
+                if want <= cap && random.random_bytes(res, want) {
+                    hex_push(out, res, want)
+                }
+                handled = true
+            } else if opn == 6 && rt.mem_eq(op, (&op_src[0]) as u64, 6) {
+                let want: usize = dec_of(src, fl.f[1], fl.t[1])
+                let s: usize = random.random_source(res, want)
+                rt.buf_push_dec_u64(out, s as u64)
+                handled = true
+            } else if opn == 4 || opn == 5 {
+                // the AES modes: key, iv, data
+                let kl: i32 = hex_decode(src, fl.f[1], fl.t[1], a)
+                let il: i32 = hex_decode(src, fl.f[2], fl.t[2], b)
+                let dl: i32 = hex_decode(src, fl.f[3], fl.t[3], c)
+                if kl == 16 && il == 16 && dl >= 0 {
+                    var k: aes.Aes = aes.aes128_new(a)
+                    if opn == 4 && rt.mem_eq(op, (&op_cbce[0]) as u64, 4) {
+                        if aes.aes_cbc_encrypt(&k, b, c, dl as usize, res) {
+                            hex_push(out, res, dl as usize)
+                        }
+                        handled = true
+                    } else if opn == 4 && rt.mem_eq(op, (&op_cbcd[0]) as u64, 4) {
+                        if aes.aes_cbc_decrypt(&k, b, c, dl as usize, res) {
+                            hex_push(out, res, dl as usize)
+                        }
+                        handled = true
+                    } else if opn == 5 && rt.mem_eq(op, (&op_cfe[0]) as u64, 5) {
+                        aes.aes_cfb8_encrypt(&k, b, c, dl as usize, res)
+                        hex_push(out, res, dl as usize)
+                        handled = true
+                    } else if opn == 5 && rt.mem_eq(op, (&op_cfd[0]) as u64, 5) {
+                        aes.aes_cfb8_decrypt(&k, b, c, dl as usize, res)
+                        hex_push(out, res, dl as usize)
+                        handled = true
+                    }
+                }
+            }
+            if !handled {
+                var bad: [u8; 4] = "ERR\0"
+                rt.buf_push_bytes(out, (&bad[0]) as u64, 3)
+            }
+            rt.buf_push(out, 10 as u8)
+        }
+        at = eol + 1
+    }
+    rt.heap_free(a, cap)
+    rt.heap_free(b, cap)
+    rt.heap_free(c, cap)
+    rt.heap_free(res, cap)
+    return 0
+}
+
+fn do_speed(what: u64, mb: usize, out: *mut rt.Buf) -> i32 {
+    let n: usize = mb * 1048576
+    let p: u64 = rt.heap_alloc(n)
+    let q: u64 = rt.heap_alloc(n)
+    if p == 0 || q == 0 {
+        return 7
+    }
+    var x: u64 = 88172645463325252
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.st8(p, i, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    var digest: [u8; 32] = [0; 32]
+    var key: [u8; 16] = [0; 16]
+    var iv: [u8; 16] = [0; 16]
+    i = 0
+    while i < 16 {
+        key[i] = (i * 7 + 1) as u8
+        iv[i] = (i * 3 + 2) as u8
+        i = i + 1
+    }
+    var s1: [u8; 5] = "sha1\0"
+    var s2: [u8; 7] = "sha256\0"
+    var s3: [u8; 4] = "aes\0"
+    var s4: [u8; 5] = "cfb8\0"
+    let t0: u64 = now_ns()
+    if eq_c(what, (&s1[0]) as u64) {
+        sha1.sha1(p, n, (&digest[0]) as u64)
+    } else if eq_c(what, (&s2[0]) as u64) {
+        sha256.sha256(p, n, (&digest[0]) as u64)
+    } else if eq_c(what, (&s3[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new((&key[0]) as u64)
+        aes.aes_cbc_encrypt(&k, (&iv[0]) as u64, p, n - (n % 16), q)
+    } else if eq_c(what, (&s4[0]) as u64) {
+        var k: aes.Aes = aes.aes128_new((&key[0]) as u64)
+        aes.aes_cfb8_encrypt(&k, (&iv[0]) as u64, p, n, q)
+    } else {
+        return 3
+    }
+    let t1: u64 = now_ns()
+    rt.buf_push_dec_u64(out, (t1 - t0) / 1000)
+    rt.buf_push(out, 10 as u8)
+    rt.heap_free(p, n)
+    rt.heap_free(q, n)
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 4 {
+        return 2
+    }
+    let mode: u64 = rt.arg_ptr(start, 1)
+    var m_batch: [u8; 6] = "batch\0"
+    var m_file: [u8; 5] = "file\0"
+    var m_speed: [u8; 6] = "speed\0"
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+
+    if eq_c(mode, (&m_batch[0]) as u64) {
+        var jobs: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&jobs)
+        if !rt.read_file(rt.arg_ptr(start, 2), &jobs) {
+            return 4
+        }
+        let rc: i32 = do_batch(&jobs, &out)
+        if rc != 0 {
+            return rc
+        }
+        if !rt.write_file(rt.arg_ptr(start, 3), rt.buf_ptr(&out), rt.buf_len(&out)) {
+            return 6
+        }
+        return 0
+    }
+    if eq_c(mode, (&m_speed[0]) as u64) {
+        if rt.arg_count(start) < 5 {
+            return 2
+        }
+        let mb: usize = dec_of(rt.arg_ptr(start, 3), 0,
+            rt.c_length(rt.arg_ptr(start, 3)))
+        let rc: i32 = do_speed(rt.arg_ptr(start, 2), mb, &out)
+        if rc != 0 {
+            return rc
+        }
+        if !rt.write_file(rt.arg_ptr(start, 4), rt.buf_ptr(&out), rt.buf_len(&out)) {
+            return 6
+        }
+        return 0
+    }
+    if eq_c(mode, (&m_file[0]) as u64) {
+        if rt.arg_count(start) < 5 {
+            return 2
+        }
+        var data: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&data)
+        if !rt.read_file(rt.arg_ptr(start, 3), &data) {
+            return 4
+        }
+        var digest: [u8; 32] = [0; 32]
+        var s1: [u8; 5] = "sha1\0"
+        if eq_c(rt.arg_ptr(start, 2), (&s1[0]) as u64) {
+            sha1.sha1(rt.buf_ptr(&data), rt.buf_len(&data), (&digest[0]) as u64)
+            hex_push(&out, (&digest[0]) as u64, sha1.SHA1_SIZE)
+        } else {
+            sha256.sha256(rt.buf_ptr(&data), rt.buf_len(&data), (&digest[0]) as u64)
+            hex_push(&out, (&digest[0]) as u64, sha256.SHA256_SIZE)
+        }
+        rt.buf_push(&out, 10 as u8)
+        if !rt.write_file(rt.arg_ptr(start, 4), rt.buf_ptr(&out), rt.buf_len(&out)) {
+            return 6
+        }
+        return 0
+    }
+    return 3
+}

@@ -1,0 +1,541 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/font/raster.fi -- THE SCANLINE RASTERISER. A closed path in, a
+// coverage value per pixel out.
+//
+// This is the one piece of arithmetic that both halves of round B3 rest
+// on. A glyph of a TrueType font and the rounded corner of a `div` are
+// the same problem: a closed outline made of straight lines and quadratic
+// curves, and the question "how much of pixel (x, y) lies inside it".
+// Answering that with a yes or a no gives a staircase; answering it with a
+// FRACTION gives anti-aliasing. So the rasteriser does not return a
+// bitmap, it returns an AREA per pixel.
+//
+// WHY THIS FILE LIES UNDER lib/font/ AND NOT UNDER lib/paint/. It is used
+// by both, and the more demanding customer is the font: a `div` is a
+// rectangle and could be filled with four comparisons, a letter at 11 px
+// cannot. The Osum window server (round K10, the other repository) needs
+// exactly this pair -- outline reader plus rasteriser -- and needs it in
+// a KERNEL, without a heap and without a garbage collector. That is why
+// nothing in this file allocates by itself, why every function is
+// `#[no_gc]`, and why the only import is `std.math`.
+//
+// ------------------------------------------------------------ THE METHOD
+//
+// SIGNED AREA ACCUMULATION, the algorithm Raph Levien's `font-rs` made
+// popular. It is worth writing down why it was chosen over the classic
+// active edge table, because the classic one is what everybody starts
+// with:
+//
+//   * an active edge list sorts edges per scanline, keeps a list, and
+//     needs a second, finer subdivision inside the pixel row to get
+//     anti-aliasing at all -- typically 4 or 16 sub-scanlines, which is
+//     4 or 16 times the work and STILL only 4 or 16 grey levels.
+//   * this method walks each edge ONCE, top to bottom, and writes into
+//     each pixel it touches the exact, analytically computed area of the
+//     trapezoid the edge cuts out of that pixel, with a sign that says
+//     which way the edge runs. Nothing is sorted, no list is kept, and
+//     the result is EXACT, not sampled: a 45 degree edge through the
+//     middle of a pixel gives 0.5 and not "2 of 4 samples".
+//
+// The trick that makes it work is that the numbers written down are
+// DIFFERENCES. A cell does not hold "how much of me is covered" but "how
+// much does the coverage change here compared to the pixel on my left".
+// A running sum along the row turns the differences back into coverage,
+// and because a closed contour crosses every row an even number of times
+// the running sum returns to zero at the end of the row on its own.
+//
+// THE SIGN, and what it means for overlapping contours: the sum is taken
+// as an ABSOLUTE VALUE and clipped at one. For a letter -- an outer
+// contour clockwise, the counter of an `o` anticlockwise -- that is
+// exactly the non-zero winding rule. For a path that overlaps ITSELF in
+// the same direction it saturates at one instead of counting to two,
+// which is what non-zero means as well. What it is NOT is the even-odd
+// rule; nothing in CSS or in a TrueType glyph asks for even-odd, and the
+// day something does, it is a second `raster_finish`, not a second
+// rasteriser.
+//
+// ------------------------------------------------------ THE ARITHMETIC TRAP
+//
+// Since round 72 `+`, `-` and `*` are CHECKED and panic on overflow. A
+// rasteriser is full of coordinates that legitimately go negative (a box
+// that starts left of the window, a glyph whose outline reaches below the
+// baseline) and of index arithmetic that would underflow if it were done
+// in `usize`. The rule in this file is therefore: EVERY index computation
+// runs in `i64`, is clamped, and only then becomes a `usize`. There is no
+// `x0i - 1` on an unsigned type anywhere here, and no place where a
+// difference of two coordinates is cast before it has been checked
+// against zero.
+//
+// NO IMPORTS AT ALL. `std.math` is not `#[no_gc]`, and a kernel has no
+// `std` anyway -- the four pieces of arithmetic this file needs (floor,
+// ceil, absolute value, square root) are eleven lines and stand at the
+// top. That is the price of being usable from the other side.
+
+export {
+    Raster,
+    raster_new, raster_attach, raster_free, raster_begin, raster_finish,
+    raster_line, raster_quad, raster_cubic,
+    raster_cov, raster_cov_row, raster_bytes_needed,
+    raster_width, raster_height, raster_ok,
+}
+
+// The window a path is rasterised into. `ox`/`oy` is its top left corner
+// in the coordinate system the caller draws in, so a glyph at pen
+// position 371.5 does not have to be moved into the window by hand.
+//
+// `stride` is `w + 2` and not `w`: a cell at column `w` may still write
+// one to its right (the closing difference of an edge that leaves the
+// window), and a cell at `w + 1` is where that difference is thrown away.
+struct Raster {
+    acc: *mut u8, // (w + 2) * h cells of f64
+    cap: usize, // bytes really available behind `acc`
+    w: usize,
+    h: usize,
+    stride: usize,
+    ox: f64,
+    oy: f64,
+    ok: usize, // 0 as soon as a window did not fit into the buffer
+}
+
+// ------------------------------------------------- The arithmetic, in house
+
+#[no_gc]
+fn fis_nan(x: f64) -> bool {
+    return x != x
+}
+
+#[no_gc]
+fn ffabs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// Truncation towards zero, guarded. The guard is not decoration: `as i64`
+// is a NARROWING conversion and is checked in every build level but
+// `release-fast` (SPEC 13, L9), so a coordinate that ran away would not
+// give a wrong picture but a panic.
+#[no_gc]
+fn ftrunc(x: f64) -> f64 {
+    if fis_nan(x) {
+        return 0.0
+    }
+    if x > 9.0e15 {
+        return 9.0e15
+    }
+    if x < 0.0 - 9.0e15 {
+        return 0.0 - 9.0e15
+    }
+    return (x as i64) as f64
+}
+
+#[no_gc]
+fn ffloor(x: f64) -> f64 {
+    let t: f64 = ftrunc(x)
+    if t > x {
+        return t - 1.0
+    }
+    return t
+}
+
+#[no_gc]
+fn fceil(x: f64) -> f64 {
+    let t: f64 = ftrunc(x)
+    if t < x {
+        return t + 1.0
+    }
+    return t
+}
+
+// Newton, from a guess that is never worse than a factor of the value
+// itself. Called once per curve, not once per pixel.
+#[no_gc]
+fn fsqrt(x: f64) -> f64 {
+    if fis_nan(x) || x <= 0.0 {
+        return 0.0
+    }
+    // The guess is doubled into range first -- Newton then converges in
+    // a handful of steps instead of thirty, and this is called once per
+    // curve of every glyph on the page.
+    var g: f64 = 1.0
+    while g * g < x {
+        g = g * 2.0
+    }
+    var i: i32 = 0
+    while i < 8 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+#[no_gc]
+fn raster_new() -> Raster {
+    return Raster {
+        acc: 0 as *mut u8,
+        cap: 0,
+        w: 0,
+        h: 0,
+        stride: 0,
+        ox: 0.0,
+        oy: 0.0,
+        ok: 1,
+    }
+}
+
+// How many octets a window of `w` by `h` pixels needs. A caller with its
+// own memory -- a kernel, for instance -- asks this first and then calls
+// `raster_attach`.
+#[no_gc]
+fn raster_bytes_needed(w: usize, h: usize) -> usize {
+    return (w + 2) * h * 8
+}
+
+// Hand the rasteriser memory. It never frees it and never grows it; a
+// window that does not fit switches `ok` off instead of writing past the
+// end.
+#[no_gc]
+fn raster_attach(r: *mut Raster, p: *mut u8, cap: usize) {
+    (*r).acc = p
+    (*r).cap = cap
+}
+
+#[no_gc]
+fn raster_free(r: *mut Raster) {
+    (*r).acc = 0 as *mut u8
+    (*r).cap = 0
+}
+
+#[no_gc]
+fn raster_ok(r: *mut Raster) -> bool {
+    return (*r).ok != 0
+}
+
+#[no_gc]
+fn raster_width(r: *mut Raster) -> usize {
+    return (*r).w
+}
+
+#[no_gc]
+fn raster_height(r: *mut Raster) -> usize {
+    return (*r).h
+}
+
+// Open a window and clear it. Everything drawn afterwards is measured
+// against `ox`/`oy`; everything outside the window is clipped away, and
+// clipping it is not an approximation -- an edge that leaves to the left
+// is moved onto column zero, which is exactly where its coverage
+// contribution belongs.
+#[no_gc]
+fn raster_begin(r: *mut Raster, ox: f64, oy: f64, w: usize, h: usize) -> bool {
+    (*r).ox = ox
+    (*r).oy = oy
+    (*r).w = w
+    (*r).h = h
+    (*r).stride = w + 2
+    if w == 0 || h == 0 {
+        (*r).ok = 1
+        return true
+    }
+    let need: usize = raster_bytes_needed(w, h)
+    if need > (*r).cap {
+        (*r).ok = 0
+        return false
+    }
+    (*r).ok = 1
+    let base: u64 = (*r).acc as u64
+    var i: usize = 0
+    let cells: usize = (*r).stride * h
+    while i < cells {
+        *((base + (i * 8) as u64) as *mut f64) = 0.0
+        i = i + 1
+    }
+    return true
+}
+
+#[no_gc]
+fn cell_add(r: *mut Raster, row: usize, col: i64, v: f64) {
+    if col < 0 {
+        return
+    }
+    let c: usize = col as usize
+    if c >= (*r).stride {
+        return
+    }
+    let idx: usize = row * (*r).stride + c
+    let a: u64 = (*r).acc as u64 + (idx * 8) as u64
+    *(a as *mut f64) = *(a as *mut f64) + v
+}
+
+// The trapezoid of one edge inside ONE pixel row, spread over the columns
+// it touches. `lx` <= `rx`, both already inside [0, w]; `d` is the signed
+// height of the piece.
+#[no_gc]
+fn span(r: *mut Raster, row: usize, lx: f64, rx: f64, d: f64) {
+    let x0floor: f64 = ffloor(lx)
+    let x0i: i64 = x0floor as i64
+    let x1ceil: f64 = fceil(rx)
+    let x1i: i64 = x1ceil as i64
+    if x1i <= x0i + 1 {
+        // The whole piece lies inside one pixel: split it between that
+        // pixel and its right neighbour by where its MIDDLE sits.
+        let xmf: f64 = 0.5 * (lx + rx) - x0floor
+        cell_add(r, row, x0i, d - d * xmf)
+        cell_add(r, row, x0i + 1, d * xmf)
+        return
+    }
+    let s: f64 = 1.0 / (rx - lx)
+    let x0f: f64 = lx - x0floor
+    let a0: f64 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f)
+    let x1f: f64 = rx - x1ceil + 1.0
+    let am: f64 = 0.5 * s * x1f * x1f
+    cell_add(r, row, x0i, d * a0)
+    if x1i == x0i + 2 {
+        cell_add(r, row, x0i + 1, d * (1.0 - a0 - am))
+    } else {
+        let a1: f64 = s * (1.5 - x0f)
+        cell_add(r, row, x0i + 1, d * (a1 - a0))
+        var xi: i64 = x0i + 2
+        while xi < x1i - 1 {
+            cell_add(r, row, xi, d * s)
+            xi = xi + 1
+        }
+        let a2: f64 = a1 + ((x1i - x0i - 3) as f64) * s
+        cell_add(r, row, x1i - 1, d * (1.0 - a2 - am))
+    }
+    cell_add(r, row, x1i, d * am)
+}
+
+// ------------------------------------------------------------- One edge
+//
+// The heart of the file. `p0` to `p1` in WINDOW coordinates. Everything
+// else in this file eventually ends up here.
+#[no_gc]
+fn accumulate(r: *mut Raster, p0x: f64, p0y: f64, p1x: f64, p1y: f64) {
+    if p0y == p1y {
+        return // a horizontal edge changes no coverage anywhere
+    }
+    if fis_nan(p0x) || fis_nan(p0y) || fis_nan(p1x) ||
+    fis_nan(p1y) {
+        return
+    }
+    // Run downwards, remember which way round it really was.
+    var dir: f64 = 1.0
+    var ax: f64 = p0x
+    var ay: f64 = p0y
+    var bx: f64 = p1x
+    var by: f64 = p1y
+    if p0y > p1y {
+        dir = 0.0 - 1.0
+        ax = p1x
+        ay = p1y
+        bx = p0x
+        by = p0y
+    }
+    let hf: f64 = (*r).h as f64
+    if by <= 0.0 || ay >= hf {
+        return
+    }
+    let dxdy: f64 = (bx - ax) / (by - ay)
+    // Clip in y. `x` follows along, so the edge is not shortened but cut.
+    var ys: f64 = ay
+    var xs: f64 = ax
+    if ys < 0.0 {
+        xs = ax + dxdy * (0.0 - ay)
+        ys = 0.0
+    }
+    var ye: f64 = by
+    if ye > hf {
+        ye = hf
+    }
+    if ye <= ys {
+        return
+    }
+    let wf: f64 = (*r).w as f64
+    var x: f64 = xs
+    var yrow: i64 = ffloor(ys) as i64
+    let ylast: i64 = fceil(ye) as i64
+    while yrow < ylast {
+        let rowtop: f64 = yrow as f64
+        var ytop: f64 = rowtop
+        if ys > ytop {
+            ytop = ys
+        }
+        var ybot: f64 = rowtop + 1.0
+        if ye < ybot {
+            ybot = ye
+        }
+        let dy: f64 = ybot - ytop
+        if dy > 0.0 {
+            let xnext: f64 = x + dxdy * dy
+            if yrow >= 0 && (yrow as usize) < (*r).h {
+                let d: f64 = dy * dir
+                var lx: f64 = x
+                var rx: f64 = xnext
+                if lx > rx {
+                    lx = xnext
+                    rx = x
+                }
+                if lx < 0.0 {
+                    lx = 0.0
+                }
+                if rx < 0.0 {
+                    rx = 0.0
+                }
+                if lx > wf {
+                    lx = wf
+                }
+                if rx > wf {
+                    rx = wf
+                }
+                span(r, yrow as usize, lx, rx, d)
+            }
+            x = xnext
+        }
+        yrow = yrow + 1
+    }
+}
+
+// ---------------------------------------------------- What the caller draws
+
+#[no_gc]
+fn raster_line(r: *mut Raster, ax: f64, ay: f64, bx: f64, by: f64) {
+    if (*r).ok == 0 {
+        return
+    }
+    accumulate(r, ax - (*r).ox, ay - (*r).oy, bx - (*r).ox, by - (*r).oy)
+}
+
+// How many straight pieces a curve is cut into. Not a constant: a curve
+// that spans two pixels does not deserve sixteen segments, and one that
+// spans two hundred is a visible polygon with sixteen. The measure is the
+// length of the control polygon, which overestimates the arc by at most a
+// factor of two -- and overestimating is the safe direction here.
+//
+// THE CONSTANT 3.5 IS MEASURED, NOT GUESSED. The deviation of an
+// `n`-piece polygon from the curve falls with `1 / n^2`; for a quarter
+// circle of radius 20 (control polygon 37.7 long) it is 6.17 / n^2
+// pixels. `n = sqrt(3.5 * L) + 1` gives 12 pieces there, so 0.043 px --
+// under a twentieth of a pixel, which is below what the anti-aliasing of
+// the next step can show. Round B3 measured the same curve as an AREA:
+// 313.3 against the exact 314.16, and the missing 0.9 square pixels are
+// the inscribed polygon, not an error.
+#[no_gc]
+fn steps_for(d: f64) -> i64 {
+    if fis_nan(d) || d <= 0.0 {
+        return 1
+    }
+    var n: i64 = (fsqrt(d * 3.5) + 1.0) as i64
+    if n < 1 {
+        n = 1
+    }
+    if n > 400 {
+        n = 400
+    }
+    return n
+}
+
+// A quadratic Bezier -- the curve of a TrueType outline.
+#[no_gc]
+fn raster_quad(r: *mut Raster, x0: f64, y0: f64, cx: f64, cy: f64,
+    x1: f64, y1: f64) {
+    if (*r).ok == 0 {
+        return
+    }
+    let d: f64 = ffabs(cx - x0) + ffabs(cy - y0) +
+    ffabs(x1 - cx) + ffabs(y1 - cy)
+    let n: i64 = steps_for(d)
+    var i: i64 = 1
+    var px: f64 = x0
+    var py: f64 = y0
+    while i <= n {
+        let t: f64 = (i as f64) / (n as f64)
+        let mt: f64 = 1.0 - t
+        let qx: f64 = mt * mt * x0 + 2.0 * mt * t * cx + t * t * x1
+        let qy: f64 = mt * mt * y0 + 2.0 * mt * t * cy + t * t * y1
+        raster_line(r, px, py, qx, qy)
+        px = qx
+        py = qy
+        i = i + 1
+    }
+}
+
+// A cubic Bezier -- what a CSS path is made of, and what a quarter circle
+// is approximated with when a `border-radius` is drawn.
+#[no_gc]
+fn raster_cubic(r: *mut Raster, x0: f64, y0: f64, c1x: f64, c1y: f64,
+    c2x: f64, c2y: f64, x1: f64, y1: f64) {
+    if (*r).ok == 0 {
+        return
+    }
+    let d: f64 = ffabs(c1x - x0) + ffabs(c1y - y0) +
+    ffabs(c2x - c1x) + ffabs(c2y - c1y) +
+    ffabs(x1 - c2x) + ffabs(y1 - c2y)
+    let n: i64 = steps_for(d)
+    var i: i64 = 1
+    var px: f64 = x0
+    var py: f64 = y0
+    while i <= n {
+        let t: f64 = (i as f64) / (n as f64)
+        let mt: f64 = 1.0 - t
+        let a: f64 = mt * mt * mt
+        let b: f64 = 3.0 * mt * mt * t
+        let c: f64 = 3.0 * mt * t * t
+        let e: f64 = t * t * t
+        let qx: f64 = a * x0 + b * c1x + c * c2x + e * x1
+        let qy: f64 = a * y0 + b * c1y + c * c2y + e * y1
+        raster_line(r, px, py, qx, qy)
+        px = qx
+        py = qy
+        i = i + 1
+    }
+}
+
+// Turn the differences into coverage. Row by row: the running sum starts
+// at zero at the left edge of every row, which is the one place where a
+// closed contour is guaranteed to have balanced out.
+#[no_gc]
+fn raster_finish(r: *mut Raster) {
+    if (*r).ok == 0 {
+        return
+    }
+    let base: u64 = (*r).acc as u64
+    var y: usize = 0
+    while y < (*r).h {
+        var acc: f64 = 0.0
+        var x: usize = 0
+        let row: usize = y * (*r).stride
+        while x < (*r).w {
+            let a: u64 = base + ((row + x) * 8) as u64
+            acc = acc + *(a as *mut f64)
+            var v: f64 = acc
+            if v < 0.0 {
+                v = 0.0 - v
+            }
+            if v > 1.0 {
+                v = 1.0
+            }
+            *(a as *mut f64) = v
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// The coverage of one pixel, after `raster_finish`. 0.0 to 1.0.
+#[no_gc]
+fn raster_cov(r: *mut Raster, x: usize, y: usize) -> f64 {
+    if x >= (*r).w || y >= (*r).h || (*r).ok == 0 {
+        return 0.0
+    }
+    let idx: usize = y * (*r).stride + x
+    return *(((*r).acc as u64 + (idx * 8) as u64) as *mut f64)
+}
+
+// The address of the first cell of a row -- for a loop that does not want
+// to pay for the bounds check per pixel.
+#[no_gc]
+fn raster_cov_row(r: *mut Raster, y: usize) -> u64 {
+    return (*r).acc as u64 + ((y * (*r).stride) * 8) as u64
+}

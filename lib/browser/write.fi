@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/write.fi -- the tree output in the html5lib format.
+//
+// The format of the `tree-construction` test data of html5lib. Deliberately
+// exactly this one and no format of our own: if the original data are
+// available one day, the same runner works against them without a change.
+//
+//     | <!DOCTYPE html>
+//     | <html>
+//     |   <head>
+//     |   <body>
+//     |     <div>
+//     |       id="a"
+//     |       "Text"
+//     |       <!-- comment -->
+//
+// The rules that are easily overlooked and therefore stand here expressly:
+//   * TWO spaces per level, beginning at the children of the document
+//     (level 0 = "| ").
+//   * attributes stand BEFORE the children, one level deeper than their
+//     element, and are SORTED by name (the DOM keeps the order of the
+//     source text -- only the output sorts).
+//   * elements outside the HTML namespace get a prefix:
+//     `<svg circle>`, `<math mi>`.
+//   * text nodes stand in double quotes, without escaping -- exactly
+//     as in the original data.
+
+import html.mem
+import browser.node
+import browser.names
+
+export { tree_write, subtree_write, chain_after_buf, cp_after_buf }
+
+const MAX_ATTR_SORT: usize = 128
+
+#[no_gc]
+fn cp_after_buf(out: *mut mem.Buf, c: u32) {
+    if c < 0x80 as u32 {
+        mem.buf_push(out, c as u8)
+    } else if c < 0x800 as u32 {
+        mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else if c < 0x10000 as u32 {
+        mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else {
+        mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    }
+}
+
+fn chain_after_buf(k: Gc[Chain], out: *mut mem.Buf) {
+    if k == gc_null[Chain]() {
+        return
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            cp_after_buf(out, s.chars[i])
+            i = i + 1
+        }
+        s = s.next
+    }
+}
+
+#[no_gc]
+fn name_after_buf(nm: *mut names.Names, id: u32, out: *mut mem.Buf) {
+    let p: *mut u8 = names.names_ptr(nm, id)
+    let n: usize = names.names_length(nm, id)
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn indent(out: *mut mem.Buf, depth: u32) {
+    mem.buf_push(out, 124 as u8) // |
+    mem.buf_push(out, 32 as u8)
+    var i: u32 = 0
+    while i < depth {
+        mem.buf_push(out, 32 as u8)
+        mem.buf_push(out, 32 as u8)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn lit_after_buf(out: *mut mem.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// Compares two names as byte sequences: smaller, equal, larger.
+#[no_gc]
+fn name_less(nm: *mut names.Names, a: u32, c: u32) -> bool {
+    let pa: *mut u8 = names.names_ptr(nm, a)
+    let pc: *mut u8 = names.names_ptr(nm, c)
+    let na: usize = names.names_length(nm, a)
+    let nc: usize = names.names_length(nm, c)
+    var i: usize = 0
+    while i < na && i < nc {
+        let x: u8 = *((pa as u64 + i as u64) as *mut u8)
+        let y: u8 = *((pc as u64 + i as u64) as *mut u8)
+        if x != y {
+            return x < y
+        }
+        i = i + 1
+    }
+    return na < nc
+}
+
+fn attribute_write(nm: *mut names.Names, e: Gc[Elem], out: *mut mem.Buf, depth: u32) {
+    let n: u32 = e.nattr
+    if n == 0 as u32 {
+        return
+    }
+    var field: [Gc[Attr]; 128] = [gc_null[Attr](); 128]
+    var m: usize = 0
+    var a: Gc[Attr] = e.first_attr
+    while a != gc_null[Attr]() && m < MAX_ATTR_SORT {
+        field[m] = a
+        m = m + 1
+        a = a.next
+    }
+    // Insertion sort: attribute counts are one or two digits.
+    var i: usize = 1
+    while i < m {
+        let x: Gc[Attr] = field[i]
+        var j: usize = i
+        while j > 0 && name_less(nm, x.name, field[j - 1].name) {
+            field[j] = field[j - 1]
+            j = j - 1
+        }
+        field[j] = x
+        i = i + 1
+    }
+    i = 0
+    while i < m {
+        let at: Gc[Attr] = field[i]
+        indent(out, depth)
+        // ROUND B1: the html5lib format writes the PREFIX, not the
+        // namespace -- `xmlns="..."` has no prefix but does lie in the XMLNS
+        // namespace, `xmlns:xlink="..."` has the prefix `xmlns`.
+        if at.prefix != 0 as u32 {
+            name_after_buf(nm, at.prefix, out)
+            mem.buf_push(out, 32 as u8)
+        }
+        name_after_buf(nm, at.name, out)
+        mem.buf_push(out, 61 as u8) // =
+        mem.buf_push(out, 34 as u8) // "
+        chain_after_buf(at.value, out)
+        mem.buf_push(out, 34 as u8)
+        mem.buf_push(out, 10 as u8)
+        i = i + 1
+    }
+}
+
+fn node_write(nm: *mut names.Names, k: Gc[Node], out: *mut mem.Buf, depth: u32) {
+    if k == gc_null[Node]() {
+        return
+    }
+    let kind: u32 = k.kind
+    if kind == node.K_ELEM {
+        let e: Gc[Elem] = k.as?[Elem]
+        indent(out, depth)
+        mem.buf_push(out, 60 as u8) // <
+        if e.ns == node.NS_SVG {
+            var l: [u8; 4] = "svg "
+            lit_after_buf(out, &l[0], 4)
+        } else if e.ns == node.NS_MATHML {
+            var l: [u8; 5] = "math "
+            lit_after_buf(out, &l[0], 5)
+        }
+        name_after_buf(nm, e.name, out)
+        mem.buf_push(out, 62 as u8) // >
+        mem.buf_push(out, 10 as u8)
+        attribute_write(nm, e, out, depth + 1)
+        // ROUND B1: the template contents are a subtree of their own and are
+        // written under the line `content`, exactly as html5lib does it.
+        let f: Gc[Fragment] = node.elem_content_read(e)
+        if f != gc_null[Fragment]() {
+            indent(out, depth + 1)
+            var lc: [u8; 8] = "content\n"
+            lit_after_buf(out, &lc[0], 8)
+            var fc: Gc[Node] = f.first_child
+            while fc != gc_null[Node]() {
+                node_write(nm, fc, out, depth + 2)
+                fc = fc.next
+            }
+        }
+    } else if kind == node.K_TEXT {
+        let t: Gc[Text] = k.as?[Text]
+        indent(out, depth)
+        mem.buf_push(out, 34 as u8)
+        chain_after_buf(t.data, out)
+        mem.buf_push(out, 34 as u8)
+        mem.buf_push(out, 10 as u8)
+    } else if kind == node.K_COMMENT {
+        let c: Gc[Comment] = k.as?[Comment]
+        indent(out, depth)
+        var l1: [u8; 5] = "<!-- "
+        lit_after_buf(out, &l1[0], 5)
+        chain_after_buf(c.data, out)
+        var l2: [u8; 4] = " -->"
+        lit_after_buf(out, &l2[0], 4)
+        mem.buf_push(out, 10 as u8)
+    } else if kind == node.K_DOCTYPE {
+        let d: Gc[Doctype] = k.as?[Doctype]
+        indent(out, depth)
+        var l1: [u8; 10] = "<!DOCTYPE "
+        lit_after_buf(out, &l1[0], 10)
+        chain_after_buf(d.name, out)
+        if d.has_pubid || d.has_sysid {
+            mem.buf_push(out, 32 as u8)
+            mem.buf_push(out, 34 as u8)
+            chain_after_buf(d.pubid, out)
+            mem.buf_push(out, 34 as u8)
+            mem.buf_push(out, 32 as u8)
+            mem.buf_push(out, 34 as u8)
+            chain_after_buf(d.sysid, out)
+            mem.buf_push(out, 34 as u8)
+        }
+        mem.buf_push(out, 62 as u8) // >
+        mem.buf_push(out, 10 as u8)
+    }
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        node_write(nm, c, out, depth + 1)
+        c = c.next
+    }
+}
+
+// Writes the children of any node on level 0. That is what a FRAGMENT
+// parse hands out: not the document but the children of the root element
+// the fragment algorithm built under (WHATWG 13.2.5, last step).
+fn subtree_write(nm: *mut names.Names, root: Gc[Node], out: *mut mem.Buf) {
+    if root == gc_null[Node]() {
+        return
+    }
+    var c: Gc[Node] = root.first_child
+    while c != gc_null[Node]() {
+        node_write(nm, c, out, 0)
+        c = c.next
+    }
+}
+
+// Writes the whole tree. The children of the document stand on level 0.
+fn tree_write(nm: *mut names.Names, d: Gc[Document], out: *mut mem.Buf) {
+    var c: Gc[Node] = d.first_child
+    while c != gc_null[Node]() {
+        node_write(nm, c, out, 0)
+        c = c.next
+    }
+}

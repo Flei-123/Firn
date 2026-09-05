@@ -1,0 +1,681 @@
+// lib/str/core_facade.fi -- the READING half of the text facade (round 73).
+//
+// Cut out of `lib/str/std_facade.fi` along ONE line: everything here works
+// on memory that somebody else holds. `Span` is a pointer and a length; it
+// owns nothing, it allocates nothing, it makes no system call. That is why
+// this file may be used under `profile kernel` -- it is included by
+// `lib/std/core.fi` (the freestanding half of the library) AND by
+// `lib/std/str.fi` (the full facade), so there is exactly ONE source text
+// for the searching, comparing, trimming, splitting and UTF-8 reading of
+// text, and no second truth.
+//
+// WHAT IS NOT HERE: everything that PRODUCES text. `append`, `replace`,
+// `after_big`, `fill_left` and their kin write into a `*mut Bytes`, and a
+// `Bytes` owns memory -- they stayed behind in `lib/str/std_facade.fi`.
+//
+// Include:  //#include lib/str/core_facade.fi
+
+fn npos() -> usize {
+    // ROUND 72: 0 - 1 on an UNSIGNED type is a well-known way to spell
+    // "every bit set" (usize::MAX, the not-found sentinel) without writing
+    // the literal -- deliberate wraparound, not a mistake, `-%` says so.
+    var x: usize = 0
+    return x -% 1
+}
+
+// -------------------------------------------------------------------- Span
+
+struct Span {
+    p: *mut u8,
+    n: usize,
+}
+
+fn span(p: *mut u8, n: usize) -> Span {
+    return Span { p: p, n: n }
+}
+
+fn span_empty() -> Span {
+    return Span { p: 0 as *mut u8, n: 0 }
+}
+
+// Length of a null terminated sequence.
+fn c_length(p: *mut u8) -> usize {
+    if (p as usize) == 0 {
+        return 0
+    }
+    var n: usize = 0
+    while ld8(p, n) != 0 as u8 {
+        n = n + 1
+    }
+    return n
+}
+
+// A view of a null terminated sequence (without the null octet).
+fn span_of_c(p: *mut u8) -> Span {
+    return Span { p: p, n: c_length(p) }
+}
+
+fn is_empty(s: Span) -> bool {
+    return s.n == 0
+}
+
+fn length(s: Span) -> usize {
+    return s.n
+}
+
+// The octet at position `i`; past the end 0 -- just like `bytes_at`.
+fn chars(s: Span, i: usize) -> u8 {
+    if i >= s.n {
+        return 0 as u8
+    }
+    return ld8(s.p, i)
+}
+
+// The piece starting at `of`, at most `how_much` octets. Both bounds are
+// CLAMPED instead of reported: a view can never become invalid.
+fn span_part(s: Span, of: usize, how_much: usize) -> Span {
+    if of >= s.n {
+        return Span { p: s.p, n: 0 }
+    }
+    var rest: usize = s.n - of
+    if how_much < rest {
+        rest = how_much
+    }
+    return Span { p: (s.p as usize + of) as *mut u8, n: rest }
+}
+
+fn span_ab(s: Span, of: usize) -> Span {
+    return span_part(s, of, s.n)
+}
+
+fn span_to(s: Span, to: usize) -> Span {
+    return span_part(s, 0, to)
+}
+
+// ------------------------------------------------------- Character classes
+//
+// ASCII. `is_whitespace` follows the same set the Firn lexer treats as
+// separating: space, tab, line feed, carriage return, vertical tab,
+// form feed.
+
+fn is_whitespace(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 13 as u8 ||
+    c == 11 as u8 || c == 12 as u8
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn is_hex_digit(c: u8) -> bool {
+    return is_digit(c) || (c >= 97 as u8 && c <= 102 as u8) ||
+    (c >= 65 as u8 && c <= 70 as u8)
+}
+
+fn is_upper_letter(c: u8) -> bool {
+    return c >= 65 as u8 && c <= 90 as u8
+}
+
+fn is_lower_letter(c: u8) -> bool {
+    return c >= 97 as u8 && c <= 122 as u8
+}
+
+fn is_letter(c: u8) -> bool {
+    return is_upper_letter(c) || is_lower_letter(c)
+}
+
+fn is_alphanumeric(c: u8) -> bool {
+    return is_letter(c) || is_digit(c)
+}
+
+// The value of a hex digit, otherwise -1.
+fn hex_value(c: u8) -> i32 {
+    if is_digit(c) {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 87 as u8) as i32
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 55 as u8) as i32
+    }
+    return 0 - 1
+}
+
+fn big_char(c: u8) -> u8 {
+    if is_lower_letter(c) {
+        return c - 32 as u8
+    }
+    return c
+}
+
+fn small_char(c: u8) -> u8 {
+    if is_upper_letter(c) {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// -------------------------------------------------------------- Comparison
+
+fn equal(a: Span, b: Span) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    return mem_eq(a.p, b.p, a.n)
+}
+
+// Lexicographic over the octets; on a common prefix the length decides.
+// -1 = a before b, 0 = equal, 1 = a after b.
+fn compare(a: Span, b: Span) -> i32 {
+    var m: usize = a.n
+    if b.n < m {
+        m = b.n
+    }
+    var i: usize = 0
+    while i < m {
+        let x: u8 = ld8(a.p, i)
+        let y: u8 = ld8(b.p, i)
+        if x < y {
+            return 0 - 1
+        }
+        if x > y {
+            return 1
+        }
+        i = i + 1
+    }
+    if a.n < b.n {
+        return 0 - 1
+    }
+    if a.n > b.n {
+        return 1
+    }
+    return 0
+}
+
+fn equal_without_case(a: Span, b: Span) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        if small_char(ld8(a.p, i)) != small_char(ld8(b.p, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn compare_without_case(a: Span, b: Span) -> i32 {
+    var m: usize = a.n
+    if b.n < m {
+        m = b.n
+    }
+    var i: usize = 0
+    while i < m {
+        let x: u8 = small_char(ld8(a.p, i))
+        let y: u8 = small_char(ld8(b.p, i))
+        if x < y {
+            return 0 - 1
+        }
+        if x > y {
+            return 1
+        }
+        i = i + 1
+    }
+    if a.n < b.n {
+        return 0 - 1
+    }
+    if a.n > b.n {
+        return 1
+    }
+    return 0
+}
+
+fn starts_with(s: Span, part: Span) -> bool {
+    if part.n > s.n {
+        return false
+    }
+    return mem_eq(s.p, part.p, part.n)
+}
+
+fn ends_with(s: Span, part: Span) -> bool {
+    if part.n > s.n {
+        return false
+    }
+    return mem_eq((s.p as usize + (s.n - part.n)) as *mut u8, part.p, part.n)
+}
+
+// --------------------------------------------------------------- Searching
+
+fn find_char_ab(s: Span, c: u8, ab: usize) -> usize {
+    var i: usize = ab
+    while i < s.n {
+        if ld8(s.p, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return npos()
+}
+
+fn find_char(s: Span, c: u8) -> usize {
+    return find_char_ab(s, c, 0)
+}
+
+fn find_char_back(s: Span, c: u8) -> usize {
+    var i: usize = s.n
+    while i > 0 {
+        i = i - 1
+        if ld8(s.p, i) == c {
+            return i
+        }
+    }
+    return npos()
+}
+
+// An EMPTY needle is found at `ab` -- the same rule as in C# and Rust; it
+// turns `replace` with an empty `old` into a no-op instead of an endless
+// loop.
+fn find_ab(s: Span, part: Span, ab: usize) -> usize {
+    if part.n == 0 {
+        if ab > s.n {
+            return npos()
+        }
+        return ab
+    }
+    if part.n > s.n {
+        return npos()
+    }
+    let last: usize = s.n - part.n
+    var i: usize = ab
+    while i <= last {
+        if mem_eq((s.p as usize + i) as *mut u8, part.p, part.n) {
+            return i
+        }
+        i = i + 1
+    }
+    return npos()
+}
+
+fn find(s: Span, part: Span) -> usize {
+    return find_ab(s, part, 0)
+}
+
+fn find_back(s: Span, part: Span) -> usize {
+    if part.n == 0 {
+        return s.n
+    }
+    if part.n > s.n {
+        return npos()
+    }
+    var i: usize = s.n - part.n + 1
+    while i > 0 {
+        i = i - 1
+        if mem_eq((s.p as usize + i) as *mut u8, part.p, part.n) {
+            return i
+        }
+    }
+    return npos()
+}
+
+fn contains(s: Span, part: Span) -> bool {
+    return find(s, part) != npos()
+}
+
+fn contains_char(s: Span, c: u8) -> bool {
+    return find_char(s, c) != npos()
+}
+
+fn count_char(s: Span, c: u8) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        if ld8(s.p, i) == c {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Non overlapping occurrences. An empty needle: 0 (otherwise the answer
+// would be "infinite" or arbitrary).
+fn count_part(s: Span, part: Span) -> usize {
+    if part.n == 0 || part.n > s.n {
+        return 0
+    }
+    var n: usize = 0
+    var i: usize = 0
+    while true {
+        let f: usize = find_ab(s, part, i)
+        if f == npos() {
+            return n
+        }
+        n = n + 1
+        i = f + part.n
+        if i > s.n {
+            return n
+        }
+    }
+    return n
+}
+
+// The first octet that is NOT in `set` -- the basis of every trim with a
+// character set of your own.
+fn find_not_out(s: Span, set: Span, ab: usize) -> usize {
+    var i: usize = ab
+    while i < s.n {
+        if !contains_char(set, ld8(s.p, i)) {
+            return i
+        }
+        i = i + 1
+    }
+    return npos()
+}
+
+// ---------------------------------------------------------------- Trimming
+
+fn trim_left(s: Span) -> Span {
+    var i: usize = 0
+    while i < s.n && is_whitespace(ld8(s.p, i)) {
+        i = i + 1
+    }
+    return span_ab(s, i)
+}
+
+fn trim_right(s: Span) -> Span {
+    var e: usize = s.n
+    while e > 0 && is_whitespace(ld8(s.p, e - 1)) {
+        e = e - 1
+    }
+    return span_to(s, e)
+}
+
+fn trim(s: Span) -> Span {
+    return trim_right(trim_left(s))
+}
+
+// Trims every octet that is in `set`.
+fn trim_set(s: Span, set: Span) -> Span {
+    var a: usize = 0
+    while a < s.n && contains_char(set, ld8(s.p, a)) {
+        a = a + 1
+    }
+    var e: usize = s.n
+    while e > a && contains_char(set, ld8(s.p, e - 1)) {
+        e = e - 1
+    }
+    return span_part(s, a, e - a)
+}
+
+// Cut off a prefix/suffix if it is there -- otherwise unchanged.
+fn without_prefix(s: Span, part: Span) -> Span {
+    if starts_with(s, part) {
+        return span_ab(s, part.n)
+    }
+    return s
+}
+
+fn without_suffix(s: Span, part: Span) -> Span {
+    if ends_with(s, part) {
+        return span_to(s, s.n - part.n)
+    }
+    return s
+}
+
+// --------------------------------------------------------------- Splitting
+//
+// A CURSOR, not a list: in this module Firn has no `Vec` (lib/str is an
+// include library without module structure), and a cursor is the form that
+// allocates nothing anyway.
+//
+//     var t: str.Divisor = str.divisor_new(source, sep)
+//     var part: str.Span = str.span_empty()
+//     while str.divisor_next(&t, &part) { ... }
+//
+// Rules (like C# String.Split without RemoveEmptyEntries):
+//   * "a,b,,c" with "," yields "a", "b", "", "c"
+//   * "" yields exactly ONE empty piece
+//   * an empty separator yields exactly ONE piece: the whole source
+//   * `divisor_whitespace` collapses runs of whitespace and NEVER yields an
+//     empty piece -- that is the form you want when taking a command line
+//     apart.
+
+const DIVISOR_SEP: u32 = 0
+const DIVISOR_WHITESPACE: u32 = 1
+
+struct Divisor {
+    source: Span,
+    sep: Span,
+    i: usize,
+    mode: u32,
+    done: bool,
+}
+
+fn divisor_new(s: Span, sep: Span) -> Divisor {
+    return Divisor { source: s, sep: sep, i: 0,
+        mode: DIVISOR_SEP, done: false }
+}
+
+fn divisor_whitespace(s: Span) -> Divisor {
+    return Divisor { source: s, sep: span_empty(), i: 0,
+        mode: DIVISOR_WHITESPACE, done: false }
+}
+
+fn divisor_next(t: *mut Divisor, out: *mut Span) -> bool {
+    if (*t).done {
+        return false
+    }
+    var s: Span = (*t).source
+    if (*t).mode == DIVISOR_WHITESPACE {
+        var i: usize = (*t).i
+        while i < s.n && is_whitespace(ld8(s.p, i)) {
+            i = i + 1
+        }
+        if i >= s.n {
+            (*t).i = s.n
+            (*t).done = true
+            return false
+        }
+        let start: usize = i
+        while i < s.n && !is_whitespace(ld8(s.p, i)) {
+            i = i + 1
+        }
+        (*t).i = i
+        (*out).p = (s.p as usize + start) as *mut u8
+        (*out).n = i - start
+        return true
+    }
+    var tr: Span = (*t).sep
+    let start: usize = (*t).i
+    if tr.n == 0 {
+        (*t).done = true
+        (*out).p = s.p
+        (*out).n = s.n
+        return true
+    }
+    let f: usize = find_ab(s, tr, start)
+    if f == npos() {
+        (*t).done = true
+        var rest: Span = span_ab(s, start)
+        (*out).p = rest.p
+        (*out).n = rest.n
+        return true
+    }
+    (*out).p = (s.p as usize + start) as *mut u8
+    (*out).n = f - start
+    (*t).i = f + tr.n
+    return true
+}
+
+// How many pieces `divisor_new` is going to yield -- for the caller who
+// wants to make room beforehand.
+fn parts_count(s: Span, sep: Span) -> usize {
+    if sep.n == 0 {
+        return 1
+    }
+    return count_part(s, sep) + 1
+}
+
+// --------------------------------------------------------- UTF-8 iteration
+//
+// `utf8_is_valid` (lib/str/utf8.fi) says WHETHER a sequence is valid. Here
+// stands how to WALK over it without reaching into the middle of a character.
+//
+// `utf8_read` checks the same rules as `utf8_is_valid`: overlong encodings,
+// surrogates (U+D800..U+DFFF) and everything above U+10FFFF are INVALID.
+// An invalid octet is reported as ONE character with `valid = false`
+// (cp = U+FFFD), so that every loop is guaranteed to make progress.
+
+struct CharHit {
+    cp: u32,
+    length: usize,
+    valid: bool,
+}
+
+fn is_cont_byte(c: u8) -> bool {
+    return (c & 0xC0 as u8) == 0x80 as u8
+}
+
+fn utf8_bad_char() -> CharHit {
+    return CharHit { cp: REPLACEMENT_CP, length: 1, valid: false }
+}
+
+fn utf8_read(s: Span, i: usize) -> CharHit {
+    if i >= s.n {
+        return CharHit { cp: 0, length: 0, valid: false }
+    }
+    let c0: u8 = ld8(s.p, i)
+    if c0 < 0x80 as u8 {
+        return CharHit { cp: c0 as u32, length: 1, valid: true }
+    }
+    if c0 < 0xC2 as u8 {
+        // 0x80..0xBF are continuation octets, 0xC0/0xC1 would be overlong.
+        return utf8_bad_char()
+    }
+    if c0 < 0xE0 as u8 {
+        if i + 1 >= s.n {
+            return utf8_bad_char()
+        }
+        let c1: u8 = ld8(s.p, i + 1)
+        if !is_cont_byte(c1) {
+            return utf8_bad_char()
+        }
+        let cp: u32 = ((c0 as u32 & 0x1F) << 6) | (c1 as u32 & 0x3F)
+        return CharHit { cp: cp, length: 2, valid: true }
+    }
+    if c0 < 0xF0 as u8 {
+        if i + 2 >= s.n {
+            return utf8_bad_char()
+        }
+        let c1: u8 = ld8(s.p, i + 1)
+        let c2: u8 = ld8(s.p, i + 2)
+        if !is_cont_byte(c1) || !is_cont_byte(c2) {
+            return utf8_bad_char()
+        }
+        let cp: u32 = ((c0 as u32 & 0x0F) << 12) | ((c1 as u32 & 0x3F) << 6) |
+        (c2 as u32 & 0x3F)
+        if cp < 0x800 {
+            return utf8_bad_char()
+        }
+        if cp >= 0xD800 && cp <= 0xDFFF {
+            return utf8_bad_char()
+        }
+        return CharHit { cp: cp, length: 3, valid: true }
+    }
+    if c0 < 0xF5 as u8 {
+        if i + 3 >= s.n {
+            return utf8_bad_char()
+        }
+        let c1: u8 = ld8(s.p, i + 1)
+        let c2: u8 = ld8(s.p, i + 2)
+        let c3: u8 = ld8(s.p, i + 3)
+        if !is_cont_byte(c1) || !is_cont_byte(c2) || !is_cont_byte(c3) {
+            return utf8_bad_char()
+        }
+        let cp: u32 = ((c0 as u32 & 0x07) << 18) | ((c1 as u32 & 0x3F) << 12) |
+        ((c2 as u32 & 0x3F) << 6) | (c3 as u32 & 0x3F)
+        if cp < 0x10000 || cp > 0x10FFFF {
+            return utf8_bad_char()
+        }
+        return CharHit { cp: cp, length: 4, valid: true }
+    }
+    return utf8_bad_char()
+}
+
+// The index of the next character start. At the end: s.n.
+fn utf8_next(s: Span, i: usize) -> usize {
+    if i >= s.n {
+        return s.n
+    }
+    let z: CharHit = utf8_read(s, i)
+    var l: usize = z.length
+    if l == 0 {
+        l = 1
+    }
+    if i + l > s.n {
+        return s.n
+    }
+    return i + l
+}
+
+// The index of the previous character start. At 0 it stays 0.
+fn utf8_before(s: Span, i: usize) -> usize {
+    if i == 0 {
+        return 0
+    }
+    var j: usize = i
+    if j > s.n {
+        j = s.n
+    }
+    var k: usize = 0
+    while k < 4 {
+        if j == 0 {
+            return 0
+        }
+        j = j - 1
+        if !is_cont_byte(ld8(s.p, j)) {
+            return j
+        }
+        k = k + 1
+    }
+    return j
+}
+
+fn utf8_is_limit(s: Span, i: usize) -> bool {
+    if i == 0 || i >= s.n {
+        return true
+    }
+    return !is_cont_byte(ld8(s.p, i))
+}
+
+// The number of characters (not octets). An invalid octet counts as one.
+fn utf8_count(s: Span) -> usize {
+    var i: usize = 0
+    var n: usize = 0
+    while i < s.n {
+        i = utf8_next(s, i)
+        n = n + 1
+    }
+    return n
+}
+
+// A piece BY CHARACTER instead of by octet -- the cut therefore never lands
+// in the middle of a character.
+fn utf8_part(s: Span, of_char: usize, count: usize) -> Span {
+    var i: usize = 0
+    var z: usize = 0
+    while z < of_char && i < s.n {
+        i = utf8_next(s, i)
+        z = z + 1
+    }
+    let start: usize = i
+    var g: usize = 0
+    while g < count && i < s.n {
+        i = utf8_next(s, i)
+        g = g + 1
+    }
+    return span_part(s, start, i - start)
+}

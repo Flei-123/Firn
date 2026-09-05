@@ -1,0 +1,1196 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/k3net/unit.fi -- round K3: both ends in one process.
+//
+// The other half of the measurement lives in tools/k3net/run.sh and
+// speaks to the LINUX kernel over a veth pair. This program speaks to
+// itself -- and that is not the weaker test but a different one: here
+// the wire can be told to lose every tenth frame, to hold frames back
+// so they overtake each other and to flip an octet, and the whole thing
+// is deterministic, so a failure can be run again.
+//
+// Every case prints its numbers. A line that only says OK proves
+// nothing; what proves something is a number next to it that would look
+// different if the thing were broken. The counter-checks are in here for
+// the same reason: `no-rexmit` is the same transfer with retransmission
+// switched off, and it HAS to stay incomplete.
+
+import std.io
+import std.rt
+import net.wire
+import net.tcp
+import net.stack
+import link
+
+const IPA: u32 = 168427521 // 10.9.0.1
+const IPB: u32 = 168427522 // 10.9.0.2
+const MASK: u32 = 4294967040 // 255.255.255.0
+const PORT: u16 = 4711
+
+struct World {
+    a: stack.Stack,
+    b: stack.Stack,
+    la: link.Link,
+    lb: link.Link,
+    tmp: [u8; 2048],
+    io: [u8; 65536],
+    io2: [u8; 65536],
+}
+
+// ------------------------------------------------------------- output
+
+fn kv(f: io.Fmt, k: str, v: u64) -> io.Fmt {
+    var g: io.Fmt = f
+    g = io.fmt_str(g, " ")
+    g = io.fmt_str(g, k)
+    g = io.fmt_str(g, "=")
+    g = io.fmt_u64(g, v)
+    return g
+}
+
+fn verdict(name: str, good: bool) -> io.Fmt {
+    var f: io.Fmt = io.fmt_new()
+    if good { f = io.fmt_str(f, "  OK    ") } else { f = io.fmt_str(f, "  FAIL  ") }
+    f = io.fmt_str(f, name)
+    return f
+}
+
+fn done(f: io.Fmt) {
+    io.fmt_print_line(f)
+    io.fmt_free(f)
+}
+
+// ------------------------------------------------------- the test data
+
+fn gen(x: u64, p: *mut u8, n: usize) -> u64 {
+    var s: u64 = x
+    var i: usize = 0
+    while i < n {
+        s = s *% 6364136223846793005 +% 1442695040888963407
+        wire.st8(p, i, ((s >> 33) & 0xFF) as u8)
+        i = i + 1
+    }
+    return s
+}
+
+// ------------------------------------------------------- the two ends
+
+fn setup(w: *mut World, seed: u64, delay: u64) {
+    var maca: [u8; 6] = [0 as u8; 6]
+    var macb: [u8; 6] = [0 as u8; 6]
+    maca[0] = 2 as u8
+    maca[5] = 10 as u8
+    macb[0] = 2 as u8
+    macb[5] = 20 as u8
+    stack.net_init(&(*w).a, IPA, MASK, 0, &maca[0], seed)
+    stack.net_init(&(*w).b, IPB, MASK, 0, &macb[0], seed +% 999)
+    link.link_init(&(*w).la, seed +% 1, delay)
+    link.link_init(&(*w).lb, seed +% 2, delay)
+    // The virtual clock of this program moves in steps of 200 us and a
+    // round trip over the simulated wire takes 400 us. The default
+    // smallest retransmission timeout is 200 ms -- Linux's number, and
+    // the right one on a real network -- which would be five hundred
+    // thousand rounds per loss. Here it is set to 5 ms, twelve times the
+    // round trip time, which is the same SHAPE and runs in a minute.
+    // The Linux comparison in tools/k3net/run.sh uses the default.
+    tcp.tcp_set_rto_min(stack.net_tcp(&(*w).a), 5000)
+    tcp.tcp_set_rto_min(stack.net_tcp(&(*w).b), 5000)
+}
+
+fn move_out(w: *mut World, from: *mut stack.Stack, l: *mut link.Link, now: u64) {
+    var guard: usize = 0
+    var n: usize = stack.net_output(from, &(*w).tmp[0], 2048, now)
+    while n > 0 && guard < 64 {
+        link.link_push(l, &(*w).tmp[0], n, now)
+        guard = guard + 1
+        n = stack.net_output(from, &(*w).tmp[0], 2048, now)
+    }
+}
+
+fn deliver_one(w: *mut World, l: *mut link.Link, k: i32, to: *mut stack.Stack, now: u64) {
+    let n: usize = link.link_pump_out(l, k, &(*w).tmp[0], 2048)
+    stack.net_input(to, &(*w).tmp[0], n, now)
+}
+
+// ONE FRAME AT A TIME, and the receiver gets to answer before the next
+// one arrives. Delivering a whole burst and only then letting the
+// receiver run is not a faster simulation, it is a DIFFERENT one: the
+// duplicate acknowledgements that fast retransmit lives on all collapse
+// into a single one, and the measurement then says that fast retransmit
+// does not work when in fact it was never given the chance. A real card
+// hands over one frame per interrupt; so does this.
+fn tick(w: *mut World, now: u64) {
+    stack.net_poll(&(*w).a, now)
+    move_out(w, &(*w).a, &(*w).la, now)
+    stack.net_poll(&(*w).b, now)
+    move_out(w, &(*w).b, &(*w).lb, now)
+    var guard: usize = 0
+    var go: bool = true
+    while go && guard < 512 {
+        go = false
+        let ka: i32 = link.link_ready(&(*w).la, now)
+        if ka >= 0 {
+            deliver_one(w, &(*w).la, ka, &(*w).b, now)
+            stack.net_poll(&(*w).b, now)
+            move_out(w, &(*w).b, &(*w).lb, now)
+            go = true
+        }
+        let kb: i32 = link.link_ready(&(*w).lb, now)
+        if kb >= 0 {
+            deliver_one(w, &(*w).lb, kb, &(*w).a, now)
+            stack.net_poll(&(*w).a, now)
+            move_out(w, &(*w).a, &(*w).la, now)
+            go = true
+        }
+        guard = guard + 1
+    }
+}
+
+// ===================================================================
+// case 1 -- the handshake, data in both directions, the orderly close,
+// and TIME_WAIT: reached, held, given up again.
+// ===================================================================
+
+fn case_handshake(w: *mut World) -> bool {
+    setup(w, 20260825, 200)
+    tcp.tcp_set_time_wait(stack.net_tcp(&(*w).b), 2000000)
+    var now: u64 = 1000000
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let cb: i32 = stack.net_connect(&(*w).b, IPA, PORT, now)
+    var ca: i32 = 0 - 1
+
+    var sent: usize = 0
+    var got: usize = 0
+    var xs: u64 = 7777
+    var xr: u64 = 7777
+    var bad: usize = 0
+    var saw_tw: bool = false
+    var saw_cw: bool = false
+    var tw_freed: bool = false
+    var closed: bool = false
+    let TOTAL: usize = 40000
+
+    var r: usize = 0
+    while r < 60000 {
+        if ca < 0 { ca = stack.net_accept(&(*w).a, l) }
+
+        // B pushes 40 000 octets and then closes.
+        if ca >= 0 && sent < TOTAL {
+            let want: usize = TOTAL - sent
+            var chunk: usize = want
+            if chunk > 4096 { chunk = 4096 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                let k: usize = stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+                sent = sent + k
+            }
+        } else if ca >= 0 && sent == TOTAL && !closed {
+            stack.net_close(&(*w).b, cb)
+            closed = true
+        }
+
+        // A reads and checks octet for octet.
+        if ca >= 0 {
+            let n: usize = stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+            if n > 0 {
+                xr = gen(xr, &(*w).io[0], n)
+                var i: usize = 0
+                while i < n {
+                    if (*w).io[i] != (*w).io2[i] { bad = bad + 1 }
+                    i = i + 1
+                }
+                got = got + n
+            }
+            if stack.net_state(&(*w).a, ca) == tcp.S_CLOSE_WAIT {
+                saw_cw = true
+                stack.net_close(&(*w).a, ca)
+            }
+        }
+
+        let sb: u32 = stack.net_state(&(*w).b, cb)
+        if sb == tcp.S_TIME_WAIT { saw_tw = true }
+        if saw_tw && sb == tcp.S_CLOSED { tw_freed = true }
+
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+
+    let good: bool = got == TOTAL && bad == 0 && saw_cw && saw_tw && tw_freed
+    && stack.net_state(&(*w).a, ca) == tcp.S_CLOSED
+    var f: io.Fmt = verdict("the handshake, 40 000 octets, the close, TIME_WAIT", good)
+    f = kv(f, "sent", sent as u64)
+    f = kv(f, "got", got as u64)
+    f = kv(f, "wrong", bad as u64)
+    f = kv(f, "close_wait", saw_cw as u64)
+    f = kv(f, "time_wait", saw_tw as u64)
+    f = kv(f, "tw_freed", tw_freed as u64)
+    f = kv(f, "frames", link.link_seen(&(*w).la) + link.link_seen(&(*w).lb))
+    f = kv(f, "rexmit", tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_REXMIT))
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 2 -- a corrupted wire. The checksum has to catch it, and the
+// retransmission has to make the transfer come out right anyway.
+// ===================================================================
+
+fn case_corrupt(w: *mut World) -> bool {
+    setup(w, 4242, 200)
+    link.link_set(&(*w).la, 0, 0, 60)
+    link.link_set(&(*w).lb, 0, 0, 60)
+    var now: u64 = 1000000
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let cb: i32 = stack.net_connect(&(*w).b, IPA, PORT, now)
+    var ca: i32 = 0 - 1
+    var sent: usize = 0
+    var got: usize = 0
+    var xs: u64 = 31337
+    var xr: u64 = 31337
+    var bad: usize = 0
+    let TOTAL: usize = 200000
+
+    var r: usize = 0
+    while r < 200000 {
+        if ca < 0 { ca = stack.net_accept(&(*w).a, l) }
+        if ca >= 0 && sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 8192 { chunk = 8192 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        if ca >= 0 {
+            let n: usize = stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+            if n > 0 {
+                xr = gen(xr, &(*w).io[0], n)
+                var i: usize = 0
+                while i < n {
+                    if (*w).io[i] != (*w).io2[i] { bad = bad + 1 }
+                    i = i + 1
+                }
+                got = got + n
+            }
+        }
+        if got >= TOTAL { r = 200000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+
+    let caught: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_CSUM)
+    +tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_CSUM)
+    let ipbad: u64 = stack.net_stat(&(*w).a, stack.NS_IP_BAD)
+    +stack.net_stat(&(*w).b, stack.NS_IP_BAD)
+    let good: bool = got == TOTAL && bad == 0 && (caught + ipbad) > 0
+    var f: io.Fmt = verdict("6 % of the octets flipped: caught, and repaired", good)
+    f = kv(f, "octets", got as u64)
+    f = kv(f, "wrong", bad as u64)
+    f = kv(f, "flipped", link.link_corrupted(&(*w).la) + link.link_corrupted(&(*w).lb))
+    f = kv(f, "tcp_csum_refused", caught)
+    f = kv(f, "ip_csum_refused", ipbad)
+    f = kv(f, "rexmit", tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_REXMIT))
+    f = kv(f, "fast_rexmit", tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_FAST_REXMIT))
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 3 -- loss and reordering, a megaoctet, and the counter-check
+// with retransmission switched off.
+// ===================================================================
+
+fn transfer(w: *mut World, total: usize, loss: u32, reorder: u32,
+    no_rexmit: bool, rounds: usize) -> usize {
+    setup(w, 987654321, 200)
+    // `la` carries A -> B, that is the ACKNOWLEDGEMENTS; `lb` carries
+    // B -> A, that is the DATA. The data direction gets the higher loss,
+    // because that is what the retransmission has to survive.
+    link.link_set(&(*w).la, loss / 2, reorder, 0)
+    link.link_set(&(*w).lb, loss, reorder, 0)
+    if no_rexmit {
+        tcp.tcp_set_no_rexmit(stack.net_tcp(&(*w).a), true)
+        tcp.tcp_set_no_rexmit(stack.net_tcp(&(*w).b), true)
+    }
+    var now: u64 = 1000000
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let cb: i32 = stack.net_connect(&(*w).b, IPA, PORT, now)
+    var ca: i32 = 0 - 1
+    var sent: usize = 0
+    var got: usize = 0
+    var xs: u64 = 555
+    var xr: u64 = 555
+    var bad: usize = 0
+
+    var r: usize = 0
+    while r < rounds {
+        if ca < 0 { ca = stack.net_accept(&(*w).a, l) }
+        if ca >= 0 && sent < total {
+            var chunk: usize = total - sent
+            if chunk > 16384 { chunk = 16384 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        if ca >= 0 {
+            let n: usize = stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+            if n > 0 {
+                xr = gen(xr, &(*w).io[0], n)
+                var i: usize = 0
+                while i < n {
+                    if (*w).io[i] != (*w).io2[i] { bad = bad + 1 }
+                    i = i + 1
+                }
+                got = got + n
+            }
+        }
+        if got >= total { r = rounds } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    if bad > 0 { return 0 }
+    return got
+}
+
+fn case_loss(w: *mut World) -> bool {
+    let TOTAL: usize = 1048576
+    let with_rt: usize = transfer(w, TOTAL, 50, 30, false, 400000)
+    let ooo: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_OOO)
+    let rex: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_REXMIT)
+    let frx: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_FAST_REXMIT)
+    let good1: bool = with_rt == TOTAL && rex + frx > 0 && ooo > 0
+    var f: io.Fmt = verdict("5 % lost, 3 % reordered: a megaoctet arrives whole and in order", good1)
+    f = kv(f, "octets", with_rt as u64)
+    f = kv(f, "lost", link.link_dropped(&(*w).la) + link.link_dropped(&(*w).lb))
+    f = kv(f, "rexmit", rex)
+    f = kv(f, "fast_rexmit", frx)
+    f = kv(f, "out_of_order", ooo)
+    f = kv(f, "dupacks", tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_DUPACK))
+    done(f)
+
+    let without: usize = transfer(w, TOTAL, 50, 30, true, 200000)
+    let good2: bool = without < TOTAL
+    var g: io.Fmt = verdict("COUNTER-CHECK without retransmission it stays incomplete", good2)
+    g = kv(g, "octets", without as u64)
+    g = kv(g, "of", TOTAL as u64)
+    g = kv(g, "lost", link.link_dropped(&(*w).la) + link.link_dropped(&(*w).lb))
+    g = kv(g, "rexmit", tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_REXMIT))
+    done(g)
+    return good1 && good2
+}
+
+// ===================================================================
+// case 4 -- the sequence number goes over 2^32 in the middle of the
+// transfer. Everything in `wire` that compares sequence numbers has to
+// keep working, and every subtraction has to be a wrapping one.
+// ===================================================================
+
+fn case_wrap(w: *mut World) -> bool {
+    setup(w, 13579, 200)
+    // 40 000 octets before the wrap, the rest after it.
+    tcp.tcp_force_iss(stack.net_tcp(&(*w).b), 4294927295)
+    var now: u64 = 1000000
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let cb: i32 = stack.net_connect(&(*w).b, IPA, PORT, now)
+    var ca: i32 = 0 - 1
+    let TOTAL: usize = 300000
+    var sent: usize = 0
+    var got: usize = 0
+    var xs: u64 = 2468
+    var xr: u64 = 2468
+    var bad: usize = 0
+    var wrapped: bool = false
+    var r: usize = 0
+    while r < 200000 {
+        if ca < 0 { ca = stack.net_accept(&(*w).a, l) }
+        if ca >= 0 && sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 16384 { chunk = 16384 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        if ca >= 0 {
+            let n: usize = stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+            if n > 0 {
+                xr = gen(xr, &(*w).io[0], n)
+                var i: usize = 0
+                while i < n {
+                    if (*w).io[i] != (*w).io2[i] { bad = bad + 1 }
+                    i = i + 1
+                }
+                got = got + n
+            }
+            if tcp.tcp_dbg(stack.net_tcp(&(*w).b), cb, 2) < 100000 { wrapped = true }
+        }
+        if got >= TOTAL { r = 200000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    let good: bool = got == TOTAL && bad == 0 && wrapped
+    var f: io.Fmt = verdict("the sequence number runs over 2^32 in mid transfer", good)
+    f = kv(f, "octets", got as u64)
+    f = kv(f, "wrong", bad as u64)
+    f = kv(f, "wrapped", wrapped as u64)
+    f = kv(f, "iss", tcp.tcp_dbg(stack.net_tcp(&(*w).b), cb, 2))
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 5 -- hand built segments. Everything below here builds frames
+// octet by octet and pushes them into a stack that has no idea they did
+// not come from the other end of a real connection.
+// ===================================================================
+
+fn build_frame(f: *mut u8, smac: *mut u8, dmac: *mut u8, sip: u32, dip: u32,
+    proto: u8, payload: usize) -> usize {
+    wire.eth_build(f, dmac, smac, wire.ETYPE_IP4)
+    let h: *mut u8 = ((f as u64) + wire.ETH_HDR as u64) as *mut u8
+    wire.ip_build(h, 777 as u16, proto, sip, dip, payload)
+    return wire.ETH_HDR + wire.IP_HDR + payload
+}
+
+fn tcp_seal(f: *mut u8, dlen: usize) {
+    let h: *mut u8 = ((f as u64) + wire.ETH_HDR as u64) as *mut u8
+    let seg: *mut u8 = ((h as u64) + wire.IP_HDR as u64) as *mut u8
+    wire.put16(seg, 16, 0 as u16)
+    var acc: u64 = wire.pseudo_sum(wire.ip_src(h), wire.ip_dst(h), wire.IP_TCP,
+        wire.TCP_HDR + dlen)
+    acc = acc + wire.sum16(seg, wire.TCP_HDR + dlen)
+    wire.put16(seg, 16, wire.fold(acc))
+}
+
+fn build_tcp(f: *mut u8, smac: *mut u8, dmac: *mut u8, sip: u32, dip: u32,
+    sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, wnd: u16,
+    data: *mut u8, dlen: usize) -> usize {
+    let n: usize = build_frame(f, smac, dmac, sip, dip, wire.IP_TCP, wire.TCP_HDR + dlen)
+    let h: *mut u8 = ((f as u64) + wire.ETH_HDR as u64) as *mut u8
+    let seg: *mut u8 = ((h as u64) + wire.IP_HDR as u64) as *mut u8
+    wire.put16(seg, 0, sport)
+    wire.put16(seg, 2, dport)
+    wire.put32(seg, 4, seq)
+    wire.put32(seg, 8, ack)
+    wire.st8(seg, 12, 0x50 as u8)
+    wire.st8(seg, 13, flags)
+    wire.put16(seg, 14, wnd)
+    wire.put16(seg, 18, 0 as u16)
+    if dlen > 0 {
+        wire.copy(((seg as u64) + wire.TCP_HDR as u64) as *mut u8, data, dlen)
+    }
+    tcp_seal(f, dlen)
+    return n
+}
+
+// Brings A and B into ESTABLISHED and hands back both handles.
+fn establish(w: *mut World, seed: u64, ha: *mut i32, hb: *mut i32, nowp: *mut u64) {
+    setup(w, seed, 200)
+    var now: u64 = 1000000
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let cb: i32 = stack.net_connect(&(*w).b, IPA, PORT, now)
+    var ca: i32 = 0 - 1
+    var r: usize = 0
+    while r < 400 {
+        if ca < 0 { ca = stack.net_accept(&(*w).a, l) }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    *ha = ca
+    *hb = cb
+    *nowp = now
+}
+
+fn case_forged(w: *mut World) -> bool {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 24680, &ca, &cb, &now)
+    if ca < 0 {
+        var e: io.Fmt = verdict("forged segments: the connection did not come up", false)
+        done(e)
+        return false
+    }
+    let ta: *mut tcp.Tcp = stack.net_tcp(&(*w).a)
+    var maca: [u8; 6] = [0 as u8; 6]
+    var macb: [u8; 6] = [0 as u8; 6]
+    maca[0] = 2 as u8
+    maca[5] = 10 as u8
+    macb[0] = 2 as u8
+    macb[5] = 20 as u8
+    let bport: u16 = tcp.tcp_peer_port(ta, ca)
+    let arcv: u32 = (tcp.tcp_dbg(ta, ca, 5) & 4294967295) as u32
+    let amax: u32 = (tcp.tcp_dbg(ta, ca, 16) & 4294967295) as u32
+
+    // --- 5a. an acknowledgement for a hundred thousand octets A never sent
+    let bad0: u64 = tcp.tcp_stat(ta, tcp.ST_BAD_ACK)
+    var n: usize = build_tcp(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, bport, PORT,
+        arcv, amax +% 100000, wire.F_ACK, 65535 as u16,
+        &(*w).io[0], 0)
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let bad1: u64 = tcp.tcp_stat(ta, tcp.ST_BAD_ACK)
+    let refused: bool = bad1 == bad0 + 1 && stack.net_state(&(*w).a, ca) == tcp.S_ESTABLISHED
+
+    // --- 5b. the counter-check: the SAME segment with an honest
+    //         acknowledgement must NOT be counted as a forgery.
+    n = build_tcp(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, bport, PORT,
+        arcv, amax, wire.F_ACK, 65535 as u16, &(*w).io[0], 0)
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let bad2: u64 = tcp.tcp_stat(ta, tcp.ST_BAD_ACK)
+    let honest_ok: bool = bad2 == bad1
+
+    // --- 5c. a segment with four octets of data and a BROKEN checksum
+    let csum0: u64 = tcp.tcp_stat(ta, tcp.ST_CSUM)
+    let rcv0: u64 = tcp.tcp_dbg(ta, ca, 5)
+    (*w).io[0] = 65 as u8
+    (*w).io[1] = 66 as u8
+    (*w).io[2] = 67 as u8
+    (*w).io[3] = 68 as u8
+    n = build_tcp(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, bport, PORT,
+        arcv, amax, wire.F_ACK | wire.F_PSH, 65535 as u16, &(*w).io[0], 4)
+    // one octet of the payload flipped AFTER the checksum was computed
+    let seg: *mut u8 = &(*w).tmp[wire.ETH_HDR + wire.IP_HDR]
+    wire.st8(seg, wire.TCP_HDR, 88 as u8)
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let csum1: u64 = tcp.tcp_stat(ta, tcp.ST_CSUM)
+    let rcv1: u64 = tcp.tcp_dbg(ta, ca, 5)
+    let dropped: bool = csum1 == csum0 + 1 && rcv1 == rcv0
+
+    // --- 5d. the counter-check: the same four octets, checksum intact
+    n = build_tcp(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, bport, PORT,
+        arcv, amax, wire.F_ACK | wire.F_PSH, 65535 as u16, &(*w).io[0], 4)
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let rcv2: u64 = tcp.tcp_dbg(ta, ca, 5)
+    let taken: bool = rcv2 == rcv0 + 4
+
+    let good: bool = refused && honest_ok && dropped && taken
+    var f: io.Fmt = verdict("forged segments: a false acknowledgement and a false checksum", good)
+    f = kv(f, "false_ack_refused", refused as u64)
+    f = kv(f, "honest_ack_kept", honest_ok as u64)
+    f = kv(f, "false_csum_dropped", dropped as u64)
+    f = kv(f, "same_octets_taken", taken as u64)
+    f = kv(f, "bad_ack_total", bad2)
+    f = kv(f, "csum_total", csum1)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 6 -- ICMP echo, and an echo with a broken checksum that has to
+// stay unanswered.
+// ===================================================================
+
+fn case_icmp(w: *mut World) -> bool {
+    setup(w, 31415, 200)
+    var maca: [u8; 6] = [0 as u8; 6]
+    var macb: [u8; 6] = [0 as u8; 6]
+    maca[0] = 2 as u8
+    maca[5] = 10 as u8
+    macb[0] = 2 as u8
+    macb[5] = 20 as u8
+    let now: u64 = 1000000
+    let PAY: usize = 56
+    var i: usize = 0
+    while i < PAY + 8 {
+        (*w).io[i] = (i & 255) as u8
+        i = i + 1
+    }
+    (*w).io[0] = wire.ICMP_ECHO
+    (*w).io[1] = 0 as u8
+    wire.put16(&(*w).io[0], 2, 0 as u16)
+    wire.put16(&(*w).io[0], 4, 4660 as u16) // identifier
+    wire.put16(&(*w).io[0], 6, 7 as u16) // sequence
+    wire.put16(&(*w).io[0], 2, wire.checksum(&(*w).io[0], PAY + 8))
+
+    var n: usize = build_frame(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA,
+        wire.IP_ICMP, PAY + 8)
+    wire.copy(&(*w).tmp[wire.ETH_HDR + wire.IP_HDR], &(*w).io[0], PAY + 8)
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    // The reply needs B's hardware address; A learnt nothing about B yet,
+    // so it is put into the cache by hand -- ARP has its own case.
+    stack.net_arp_learn(&(*w).a, IPB, &macb[0], now)
+    let m: usize = stack.net_output(&(*w).a, &(*w).io2[0], 2048, now)
+    var answered: bool = false
+    var same_payload: bool = false
+    var csum_ok: bool = false
+    if m >= wire.ETH_HDR + wire.IP_HDR + 8 {
+        let h: *mut u8 = &(*w).io2[wire.ETH_HDR]
+        if wire.ip_proto(h) == wire.IP_ICMP && wire.ip_dst(h) == IPB {
+            let ic: *mut u8 = &(*w).io2[wire.ETH_HDR + wire.IP_HDR]
+            let ilen: usize = wire.ip_total(h) - wire.IP_HDR
+            answered = wire.icmp_type(ic) == wire.ICMP_ECHO_REPLY && ilen == PAY + 8
+            csum_ok = wire.checksum(ic, ilen) == 0 as u16
+            same_payload = true
+            var k: usize = 8
+            while k < PAY + 8 {
+                if wire.ld8(ic, k) != (*w).io[k] { same_payload = false }
+                k = k + 1
+            }
+            if wire.be16(ic, 4) != 4660 as u16 { same_payload = false }
+            if wire.be16(ic, 6) != 7 as u16 { same_payload = false }
+        }
+    }
+
+    // The counter-check: the same echo with one octet of the payload
+    // changed after the checksum was computed must NOT be answered.
+    let before: u64 = stack.net_stat(&(*w).a, stack.NS_ICMP)
+    n = build_frame(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, wire.IP_ICMP, PAY + 8)
+    wire.copy(&(*w).tmp[wire.ETH_HDR + wire.IP_HDR], &(*w).io[0], PAY + 8)
+    wire.st8(&(*w).tmp[wire.ETH_HDR + wire.IP_HDR], 20, 0xEE as u8)
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let after: u64 = stack.net_stat(&(*w).a, stack.NS_ICMP)
+    let silent: bool = after == before
+
+    let good: bool = answered && same_payload && csum_ok && silent
+    var f: io.Fmt = verdict("ICMP echo answered, and a broken one is not", good)
+    f = kv(f, "answered", answered as u64)
+    f = kv(f, "payload_identical", same_payload as u64)
+    f = kv(f, "checksum_valid", csum_ok as u64)
+    f = kv(f, "broken_echo_silent", silent as u64)
+    f = kv(f, "reply_octets", m as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 7 -- ARP: request, answer, cache, and the entry that expires.
+// And IPv4 that is refused: a fragment, and a broken header checksum.
+// ===================================================================
+
+fn case_arp_and_ip(w: *mut World) -> bool {
+    setup(w, 271828, 200)
+    var maca: [u8; 6] = [0 as u8; 6]
+    var macb: [u8; 6] = [0 as u8; 6]
+    maca[0] = 2 as u8
+    maca[5] = 10 as u8
+    macb[0] = 2 as u8
+    macb[5] = 20 as u8
+    var now: u64 = 1000000
+
+    // B asks who has A's address.
+    var bcast: [u8; 6] = [0 as u8; 6]
+    wire.mac_broadcast(&bcast[0])
+    var zero: [u8; 6] = [0 as u8; 6]
+    wire.eth_build(&(*w).tmp[0], &bcast[0], &macb[0], wire.ETYPE_ARP)
+    wire.arp_build(&(*w).tmp[wire.ETH_HDR], wire.ARP_REQUEST, &macb[0], IPB, &zero[0], IPA)
+    stack.net_input(&(*w).a, &(*w).tmp[0], wire.ETH_HDR + wire.ARP_LEN, now)
+    let m: usize = stack.net_output(&(*w).a, &(*w).io2[0], 2048, now)
+    var replied: bool = false
+    if m == wire.ETH_HDR + wire.ARP_LEN {
+        let a: *mut u8 = &(*w).io2[wire.ETH_HDR]
+        replied = wire.eth_type(&(*w).io2[0]) == wire.ETYPE_ARP
+        && wire.arp_op(a) == wire.ARP_REPLY
+        && wire.arp_spa(a) == IPA && wire.arp_tpa(a) == IPB
+        && wire.same(wire.arp_sha_at(a), &maca[0], 6)
+    }
+    let learnt: bool = stack.net_arp_valid(&(*w).a, IPB, now)
+
+    // The entry ages. With a lifetime of a second it is gone after two.
+    stack.net_set_arp_ttl(&(*w).a, 1000000)
+    let still: bool = stack.net_arp_valid(&(*w).a, IPB, now + 500000)
+    let expired: bool = !stack.net_arp_valid(&(*w).a, IPB, now + 2000000)
+
+    // A fragment is recognised and refused.
+    let frag0: u64 = stack.net_stat(&(*w).a, stack.NS_FRAG)
+    var n: usize = build_frame(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, wire.IP_UDP, 20)
+    let h: *mut u8 = &(*w).tmp[wire.ETH_HDR]
+    wire.put16(h, 6, 0x2000 as u16) // More Fragments
+    wire.put16(h, 10, 0 as u16)
+    wire.put16(h, 10, wire.checksum(h, wire.IP_HDR))
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let refused_frag: bool = stack.net_stat(&(*w).a, stack.NS_FRAG) == frag0 + 1
+
+    // The counter-check: the same datagram without the flag is NOT
+    // refused as a fragment.
+    n = build_frame(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, wire.IP_UDP, 20)
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let whole_ok: bool = stack.net_stat(&(*w).a, stack.NS_FRAG) == frag0 + 1
+
+    // A header checksum that is wrong by one bit.
+    let ipbad0: u64 = stack.net_stat(&(*w).a, stack.NS_IP_BAD)
+    n = build_frame(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, wire.IP_UDP, 20)
+    wire.st8(&(*w).tmp[wire.ETH_HDR], 8, 0x37 as u8) // the TTL, after the sum
+    stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+    let refused_csum: bool = stack.net_stat(&(*w).a, stack.NS_IP_BAD) == ipbad0 + 1
+
+    let good: bool = replied && learnt && still && expired && refused_frag
+    && whole_ok && refused_csum
+    var f: io.Fmt = verdict("ARP answered and aged out; a fragment and a bad IP sum refused", good)
+    f = kv(f, "arp_reply", replied as u64)
+    f = kv(f, "cached", learnt as u64)
+    f = kv(f, "alive_at_0.5s", still as u64)
+    f = kv(f, "gone_at_2s", expired as u64)
+    f = kv(f, "fragment_refused", refused_frag as u64)
+    f = kv(f, "whole_accepted", whole_ok as u64)
+    f = kv(f, "bad_ip_checksum_refused", refused_csum as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 8 -- UDP there and back, and a broken checksum that is refused.
+// ===================================================================
+
+fn case_udp(w: *mut World) -> bool {
+    setup(w, 161803, 200)
+    var maca: [u8; 6] = [0 as u8; 6]
+    var macb: [u8; 6] = [0 as u8; 6]
+    maca[0] = 2 as u8
+    maca[5] = 10 as u8
+    macb[0] = 2 as u8
+    macb[5] = 20 as u8
+    var now: u64 = 1000000
+    stack.net_arp_learn(&(*w).a, IPB, &macb[0], now)
+    stack.net_arp_learn(&(*w).b, IPA, &maca[0], now)
+    let ha: i32 = stack.udp_bind(&(*w).a, 5353 as u16)
+    let hb: i32 = stack.udp_bind(&(*w).b, 9999 as u16)
+    var x: u64 = 99
+    x = gen(x, &(*w).io[0], 800)
+    let okput: bool = stack.udp_send(&(*w).b, 9999 as u16, IPA, 5353 as u16,
+        &(*w).io[0], 800, now)
+    var r: usize = 0
+    while r < 20 {
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    var sip: u32 = 0
+    var sport: u16 = 0
+    let n: usize = stack.udp_recv(&(*w).a, ha, &(*w).io2[0], 2048, &sip, &sport)
+    var same: bool = n == 800 && sip == IPB && sport == 9999 as u16
+    var i: usize = 0
+    while i < n {
+        if (*w).io[i] != (*w).io2[i] { same = false }
+        i = i + 1
+    }
+
+    // The answer, so that both directions are measured.
+    let back: bool = stack.udp_send(&(*w).a, 5353 as u16, IPB, 9999 as u16,
+        &(*w).io2[0], 800, now)
+    r = 0
+    while r < 20 {
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    let n2: usize = stack.udp_recv(&(*w).b, hb, &(*w).io[0], 2048, &sip, &sport)
+
+    // The counter-check: a datagram whose checksum was computed and then
+    // invalidated is refused.
+    let bad0: u64 = stack.net_stat(&(*w).a, stack.NS_UDP_BAD)
+    let rx0: u64 = stack.net_stat(&(*w).a, stack.NS_UDP_RX)
+    let m: usize = build_frame(&(*w).tmp[0], &macb[0], &maca[0], IPB, IPA, wire.IP_UDP, 8 + 16)
+    let u: *mut u8 = &(*w).tmp[wire.ETH_HDR + wire.IP_HDR]
+    var k: usize = 0
+    while k < 16 {
+        wire.st8(u, 8 + k, (k + 1) as u8)
+        k = k + 1
+    }
+    wire.udp_build(u, 9999 as u16, 5353 as u16, 16, IPB, IPA)
+    wire.st8(u, 9, 0xAA as u8) // one octet of the payload, after the sum
+    stack.net_input(&(*w).a, &(*w).tmp[0], m, now)
+    let refused: bool = stack.net_stat(&(*w).a, stack.NS_UDP_BAD) == bad0 + 1
+    && stack.net_stat(&(*w).a, stack.NS_UDP_RX) == rx0
+
+    let good: bool = okput && back && same && n2 == 800 && refused
+    var f: io.Fmt = verdict("UDP there and back, and a broken checksum refused", good)
+    f = kv(f, "there", n as u64)
+    f = kv(f, "back", n2 as u64)
+    f = kv(f, "identical", same as u64)
+    f = kv(f, "from", sip as u64)
+    f = kv(f, "bad_checksum_refused", refused as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 9 -- Nagle. A thousand single octets, once with the algorithm and
+// once without. The measurement is the NUMBER OF FRAMES, and the two
+// numbers have to be far apart -- otherwise the switch does nothing.
+// ===================================================================
+
+fn dribble(w: *mut World, nodelay: bool, count: usize) -> u64 {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 5150, &ca, &cb, &now)
+    if ca < 0 { return 0 }
+    tcp.tcp_set_nodelay(stack.net_tcp(&(*w).b), cb, nodelay)
+    let before: u64 = link.link_seen(&(*w).lb)
+    var sent: usize = 0
+    var got: usize = 0
+    var r: usize = 0
+    while r < 40000 {
+        if sent < count {
+            (*w).io[0] = (sent & 255) as u8
+            if stack.net_send(&(*w).b, cb, &(*w).io[0], 1) == 1 { sent = sent + 1 }
+        }
+        got = got + stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+        if got >= count { r = 40000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    if got != count { return 0 }
+    return link.link_seen(&(*w).lb) - before
+}
+
+fn case_nagle(w: *mut World) -> bool {
+    let with_nagle: u64 = dribble(w, false, 1000)
+    let without: u64 = dribble(w, true, 1000)
+    let good: bool = with_nagle > 0 && without > 0 && without > with_nagle * 3
+    var f: io.Fmt = verdict("Nagle collects: 1000 single octets in far fewer frames", good)
+    f = kv(f, "frames_with_nagle", with_nagle)
+    f = kv(f, "frames_without", without)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 10 -- the delayed acknowledgement. A pure receiver must not
+// answer every single segment; the counter is the proof.
+// ===================================================================
+
+fn case_delack(w: *mut World) -> bool {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 8080, &ca, &cb, &now)
+    if ca < 0 { return false }
+    var sent: usize = 0
+    var got: usize = 0
+    let TOTAL: usize = 60000
+    var xs: u64 = 5
+    var r: usize = 0
+    while r < 60000 {
+        if sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 1000 { chunk = 1000 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        got = got + stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+        if got >= TOTAL { r = 60000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    let rx: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_RX)
+    let tx: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_TX)
+    let del: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_DELACK)
+    // Fewer acknowledgements than segments -- that IS the delay, and the
+    // number says by how much.
+    let good: bool = got == TOTAL && rx > 20 && tx * 3 < rx * 2
+    var f: io.Fmt = verdict("delayed acknowledgement: fewer answers than segments", good)
+    f = kv(f, "segments_in", rx)
+    f = kv(f, "answers_out", tx)
+    f = kv(f, "answers_that_waited", del)
+    f = kv(f, "octets", got as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 11 -- a window that closes. The receiver reads nothing until its
+// buffer is full; the sender has to stop, probe, and go on when the
+// window opens again.
+// ===================================================================
+
+fn case_zero_window(w: *mut World) -> bool {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 606060, &ca, &cb, &now)
+    if ca < 0 { return false }
+    let TOTAL: usize = 200000
+    var sent: usize = 0
+    var got: usize = 0
+    var xs: u64 = 17
+    var xr: u64 = 17
+    var bad: usize = 0
+    var closed_wnd: bool = false
+
+    // Phase 1: A reads NOTHING. B fills the pipe until the window is shut.
+    var r: usize = 0
+    while r < 20000 {
+        if sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 8192 { chunk = 8192 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        if tcp.tcp_dbg(stack.net_tcp(&(*w).b), cb, 7) == 0 { closed_wnd = true }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    let probes: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_PROBE)
+
+    // Phase 2: A starts reading. Everything has to arrive after all.
+    r = 0
+    while r < 200000 {
+        if sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 8192 { chunk = 8192 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        let n: usize = stack.net_recv(&(*w).a, ca, &(*w).io2[0], 4096)
+        if n > 0 {
+            xr = gen(xr, &(*w).io[0], n)
+            var i: usize = 0
+            while i < n {
+                if (*w).io[i] != (*w).io2[i] { bad = bad + 1 }
+                i = i + 1
+            }
+            got = got + n
+        }
+        if got >= TOTAL { r = 200000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    let good: bool = closed_wnd && probes > 0 && got == TOTAL && bad == 0
+    var f: io.Fmt = verdict("a window that closes: the sender waits, probes, and goes on", good)
+    f = kv(f, "window_was_shut", closed_wnd as u64)
+    f = kv(f, "probes", probes)
+    f = kv(f, "octets", got as u64)
+    f = kv(f, "wrong", bad as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 12 -- two hundred thousand random frames. Nothing may crash, and
+// the parsers have to refuse the overwhelming majority.
+// ===================================================================
+
+fn case_fuzz(w: *mut World) -> bool {
+    setup(w, 424242, 200)
+    var maca: [u8; 6] = [0 as u8; 6]
+    maca[0] = 2 as u8
+    maca[5] = 10 as u8
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let u: i32 = stack.udp_bind(&(*w).a, 53 as u16)
+    var now: u64 = 1000000
+    var x: u64 = 90210
+    let ROUNDS: usize = 200000
+    var r: usize = 0
+    while r < ROUNDS {
+        x = wire.next_random(x)
+        var n: usize = 14 + ((x >> 20) % 200) as usize
+        x = gen(x, &(*w).tmp[0], n)
+        // Half of them are addressed to us and carry a plausible
+        // ethertype, so that the deeper layers are reached at all.
+        if (x & 1) == 1 {
+            wire.copy(&(*w).tmp[0], &maca[0], 6)
+            if (x & 2) == 2 {
+                wire.put16(&(*w).tmp[0], 12, wire.ETYPE_IP4)
+                wire.st8(&(*w).tmp[0], 14, 0x45 as u8)
+                wire.put16(&(*w).tmp[0], 16, ((n - 14) & 0xFFFF) as u16)
+                if (x & 4) == 4 {
+                    wire.put16(&(*w).tmp[0], 24, 0 as u16)
+                    wire.put16(&(*w).tmp[0], 24, wire.checksum(&(*w).tmp[14], 20))
+                }
+            } else {
+                wire.put16(&(*w).tmp[0], 12, wire.ETYPE_ARP)
+            }
+        }
+        stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+        if (r & 63) == 0 {
+            stack.net_poll(&(*w).a, now)
+            var m: usize = stack.net_output(&(*w).a, &(*w).io2[0], 2048, now)
+            var g: usize = 0
+            while m > 0 && g < 64 {
+                m = stack.net_output(&(*w).a, &(*w).io2[0], 2048, now)
+                g = g + 1
+            }
+        }
+        now = now + 37
+        r = r + 1
+    }
+    let seen: u64 = stack.net_stat(&(*w).a, stack.NS_RX)
+    let accepted: u64 = stack.net_stat(&(*w).a, stack.NS_IP_RX)
+    let refused: u64 = stack.net_stat(&(*w).a, stack.NS_IP_BAD)
+    let good: bool = seen == ROUNDS as u64 && refused > 0 && stack.net_state(&(*w).a, l) == tcp.S_LISTEN
+    var f: io.Fmt = verdict("200 000 random frames: nothing falls over", good)
+    f = kv(f, "frames", seen)
+    f = kv(f, "ipv4_accepted", accepted)
+    f = kv(f, "ipv4_refused", refused)
+    f = kv(f, "arp_seen", stack.net_stat(&(*w).a, stack.NS_ARP_RX))
+    f = kv(f, "tcp_csum_refused", tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_CSUM))
+    f = kv(f, "udp_refused", stack.net_stat(&(*w).a, stack.NS_UDP_BAD))
+    f = kv(f, "listener_alive", (stack.net_state(&(*w).a, l) == tcp.S_LISTEN) as u64)
+    f = kv(f, "udp_socket", (u >= 0) as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 13 -- were all eleven states really entered? The bit set says so,
+// and a claim without it would be worth nothing.
+// ===================================================================
+
+fn simul_close(w: *mut World) {
+    // Both sides close at the same moment: that is the only way through
+    // CLOSING, and without it the state machine has a corner nobody ever
+    // walked into.
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 909090, &ca, &cb, &now)
+    if ca < 0 { return }
+    stack.net_close(&(*w).a, ca)
+    stack.net_close(&(*w).b, cb)
+    var r: usize = 0
+    while r < 4000 {
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+}
+
+fn reset_peer(w: *mut World) {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 121212, &ca, &cb, &now)
+    if ca < 0 { return }
+    stack.net_abort(&(*w).b, cb)
+    var r: usize = 0
+    while r < 400 {
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+}
+
+// One side closes, the other answers: FIN_WAIT_1 -> FIN_WAIT_2 ->
+// TIME_WAIT on one, CLOSE_WAIT -> LAST_ACK on the other.
+fn normal_close(w: *mut World) {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 343434, &ca, &cb, &now)
+    if ca < 0 { return }
+    stack.net_close(&(*w).b, cb)
+    var r: usize = 0
+    while r < 6000 {
+        if stack.net_state(&(*w).a, ca) == tcp.S_CLOSE_WAIT { stack.net_close(&(*w).a, ca) }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+}
+
+fn case_states(w: *mut World) -> bool {
+    // The two runs above leave their traces in ONE stack each, so the
+    // bit sets are collected here rather than in a single connection.
+    var seen: u32 = 0
+    normal_close(w)
+    seen = seen | tcp.tcp_seen(stack.net_tcp(&(*w).a)) | tcp.tcp_seen(stack.net_tcp(&(*w).b))
+    simul_close(w)
+    seen = seen | tcp.tcp_seen(stack.net_tcp(&(*w).a)) | tcp.tcp_seen(stack.net_tcp(&(*w).b))
+    reset_peer(w)
+    seen = seen | tcp.tcp_seen(stack.net_tcp(&(*w).a)) | tcp.tcp_seen(stack.net_tcp(&(*w).b))
+    let closing: bool = (seen & (1 << tcp.S_CLOSING)) != 0
+    // and everything the first three cases walked through
+    let good: bool = seen == 2047 && closing
+    var f: io.Fmt = verdict("all eleven states were entered, not just described", good)
+    f = kv(f, "bitset", seen as u64)
+    f = kv(f, "of", 2047)
+    f = kv(f, "closing_reached", closing as u64)
+    f = kv(f, "last_ack", ((seen & (1 << tcp.S_LAST_ACK)) != 0) as u64)
+    f = kv(f, "time_wait", ((seen & (1 << tcp.S_TIME_WAIT)) != 0) as u64)
+    f = kv(f, "fin_wait_2", ((seen & (1 << tcp.S_FIN_WAIT_2)) != 0) as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 14 -- a connection to a port nobody listens on has to be REFUSED,
+// not left hanging. Without this the whole listen path would pass with a
+// stack that answers every port.
+// ===================================================================
+
+fn case_refused(w: *mut World) -> bool {
+    setup(w, 777777, 200)
+    var now: u64 = 1000000
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let cb: i32 = stack.net_connect(&(*w).b, IPA, 4712 as u16, now)
+    var r: usize = 0
+    var refused: bool = false
+    while r < 4000 {
+        if stack.net_error(&(*w).b, cb) == tcp.E_REFUSED { refused = true }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    let rst: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_RST_TX)
+    // And the counter-check: the port that IS open comes up.
+    let cb2: i32 = stack.net_connect(&(*w).b, IPA, PORT, now)
+    var up: bool = false
+    r = 0
+    while r < 4000 {
+        if stack.net_state(&(*w).b, cb2) == tcp.S_ESTABLISHED { up = true }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    let good: bool = refused && rst > 0 && up && l >= 0
+    var f: io.Fmt = verdict("a closed port refuses, an open one answers", good)
+    f = kv(f, "refused", refused as u64)
+    f = kv(f, "resets_sent", rst)
+    f = kv(f, "open_port_established", up as u64)
+    done(f)
+    return good
+}
+
+fn main() -> i32 {
+    let p: u64 = rt.heap_alloc(size_of[World]())
+    if p == 0 {
+        io.print_line("no memory")
+        return 1
+    }
+    let w: *mut World = p as *mut World
+    var fails: i32 = 0
+    if !case_handshake(w) { fails = fails + 1 }
+    if !case_corrupt(w) { fails = fails + 1 }
+    if !case_loss(w) { fails = fails + 1 }
+    if !case_wrap(w) { fails = fails + 1 }
+    if !case_forged(w) { fails = fails + 1 }
+    if !case_icmp(w) { fails = fails + 1 }
+    if !case_arp_and_ip(w) { fails = fails + 1 }
+    if !case_udp(w) { fails = fails + 1 }
+    if !case_nagle(w) { fails = fails + 1 }
+    if !case_delack(w) { fails = fails + 1 }
+    if !case_zero_window(w) { fails = fails + 1 }
+    if !case_refused(w) { fails = fails + 1 }
+    if !case_fuzz(w) { fails = fails + 1 }
+    if !case_states(w) { fails = fails + 1 }
+    var f: io.Fmt = io.fmt_new()
+    f = io.fmt_str(f, "unit: ")
+    f = io.fmt_u64(f, fails as u64)
+    f = io.fmt_str(f, " failures")
+    done(f)
+    return fails
+}

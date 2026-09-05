@@ -1,0 +1,733 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/paint/canvas.fi -- THE PICTURE. Where the pixels really land.
+//
+// A canvas is `w * h` pixels of four octets, RGBA, PREMULTIPLIED. The
+// choice is not a detail, so it is written down here once:
+//
+//   * PREMULTIPLIED means the stored red of a half transparent red is 128
+//     and not 255. Compositing then is `dst = src + dst * (1 - a)`, one
+//     multiplication per channel; with straight alpha the same operation
+//     needs a division to get back out of it, and the division is where
+//     the rounding errors of a hundred stacked layers come from.
+//   * The page starts OPAQUE (white, alpha 255). As long as nothing turns
+//     the alpha down, premultiplied and straight are the same numbers, so
+//     the conversion at the end costs nothing in the normal case.
+//
+// THE CLIP. Two kinds, and both are needed:
+//
+//   * a RECTANGLE, kept as four `f64` -- that is `overflow: hidden` and
+//     the clip every stacking context imposes on its children. It is
+//     applied ANALYTICALLY: a clip edge at x = 10.25 lets a quarter of
+//     the pixel at column 10 through, not none of it and not all of it.
+//   * a MASK, one octet per pixel -- that is what a `border-radius` on an
+//     `overflow: hidden` box needs, and a `clip-path`. A mask is only
+//     allocated when one is really pushed.
+//
+// The two are a STACK, because a clip nests: pushing intersects with what
+// is already there, popping gives the previous state back exactly. The
+// depth is fixed at 16; a page that nests clips deeper than that gets its
+// 17th clip ignored, which is visible and honest, rather than a heap
+// allocation in the middle of painting.
+// CHAPTER Z, AND IT IS A RULE ABOUT THIS FILE (round B6)
+//
+// The pixels below are what is SHOWN. Everything a script may READ BACK
+// out of them -- `toDataURL`, `getImageData`, and whatever else arrives
+// later -- must go through `browser.fpz.fp_canvas_read` and never touch
+// `canvas_pixels` directly. That function copies and farbles: it changes
+// the low bit of about one pixel in thirty-two, chosen from a key that
+// belongs to this ORIGIN and this SESSION, so that the reading is
+// consistent with itself and useless for joining two sites together.
+//
+// It is written HERE, at the top of the file that owns the pixels, and
+// not in a document somewhere, because the mistake this prevents is the
+// one that is made by accident: a new readback path that simply returns
+// the buffer. `canvas_pixels` is exported because the PAINTER needs it; a
+// second caller in the DOM binding is a bug.
+//
+// The requirement is Z3 and Z4 of orientos-browser/REQUIREMENTS.md, the
+// measurement is `tools/fpz/run.sh`, and the reason is the AliExpress
+// case of 24 August 2026 -- see `lib/browser/fpz.fi`.
+import html.mem
+import font.raster
+
+export {
+    Canvas,
+    canvas_new, canvas_init, canvas_free, canvas_ok,
+    canvas_width, canvas_height, canvas_pixels,
+    canvas_clear, canvas_get, canvas_set_raw,
+    canvas_blend, canvas_fill_rect, canvas_fill_raster,
+    clip_push_rect, clip_push_mask, clip_pop, clip_depth,
+    clip_x0, clip_y0, clip_x1, clip_y1, clip_factor,
+    color_a, color_r, color_g, color_b, color_of,
+    BLEND_NORMAL, BLEND_MULTIPLY, BLEND_SCREEN, BLEND_OVERLAY,
+    BLEND_DARKEN, BLEND_LIGHTEN, BLEND_DIFFERENCE, BLEND_EXCLUSION,
+    canvas_set_blend, canvas_blend_mode,
+}
+
+const CLIP_MAX: usize = 16
+
+// The blend modes of css-compositing-1. `normal` is what everything uses
+// until a `mix-blend-mode` says otherwise; the other seven are the
+// separable ones that can be computed channel by channel. The three
+// non-separable ones (hue, saturation, colour, luminosity) need the whole
+// colour at once and are not here -- named in docs/ROUNDB3.md.
+const BLEND_NORMAL: u32 = 0
+const BLEND_MULTIPLY: u32 = 1
+const BLEND_SCREEN: u32 = 2
+const BLEND_OVERLAY: u32 = 3
+const BLEND_DARKEN: u32 = 4
+const BLEND_LIGHTEN: u32 = 5
+const BLEND_DIFFERENCE: u32 = 6
+const BLEND_EXCLUSION: u32 = 7
+
+struct Canvas {
+    px: *mut u8, // w * h * 4, premultiplied RGBA
+    w: usize,
+    h: usize,
+    cap: usize,
+    ok: usize,
+    depth: usize,
+    cx0: [f64; 16],
+    cy0: [f64; 16],
+    cx1: [f64; 16],
+    cy1: [f64; 16],
+    cmask: [u64; 16], // 0 or the address of a w*h octet mask
+    mode: u32,
+}
+
+#[no_gc]
+fn canvas_new() -> Canvas {
+    return Canvas {
+        px: 0 as *mut u8,
+        w: 0,
+        h: 0,
+        cap: 0,
+        ok: 0,
+        depth: 0,
+        cx0: [0.0; 16],
+        cy0: [0.0; 16],
+        cx1: [0.0; 16],
+        cy1: [0.0; 16],
+        cmask: [0; 16],
+        mode: BLEND_NORMAL,
+    }
+}
+
+#[no_gc]
+fn canvas_init(c: *mut Canvas, w: usize, h: usize) -> bool {
+    (*c).w = w
+    (*c).h = h
+    (*c).cap = w * h * 4
+    (*c).px = mem.heap_alloc((*c).cap)
+    (*c).depth = 0
+    (*c).mode = BLEND_NORMAL
+    (*c).cx0[0] = 0.0
+    (*c).cy0[0] = 0.0
+    (*c).cx1[0] = w as f64
+    (*c).cy1[0] = h as f64
+    (*c).cmask[0] = 0
+    if (*c).px as usize == 0 {
+        (*c).ok = 0
+        return false
+    }
+    (*c).ok = 1
+    return true
+}
+
+#[no_gc]
+fn canvas_free(c: *mut Canvas) {
+    var i: usize = 0
+    while i <= (*c).depth {
+        if (*c).cmask[i] != 0 {
+            mem.heap_free((*c).cmask[i] as *mut u8, (*c).w * (*c).h)
+            (*c).cmask[i] = 0
+        }
+        i = i + 1
+    }
+    mem.heap_free((*c).px, (*c).cap)
+    (*c).px = 0 as *mut u8
+    (*c).ok = 0
+}
+
+#[no_gc]
+fn canvas_ok(c: *mut Canvas) -> bool {
+    return (*c).ok != 0
+}
+
+#[no_gc]
+fn canvas_width(c: *mut Canvas) -> usize {
+    return (*c).w
+}
+
+#[no_gc]
+fn canvas_height(c: *mut Canvas) -> usize {
+    return (*c).h
+}
+
+#[no_gc]
+fn canvas_pixels(c: *mut Canvas) -> *mut u8 {
+    return (*c).px
+}
+
+#[no_gc]
+fn canvas_set_blend(c: *mut Canvas, m: u32) {
+    (*c).mode = m
+}
+
+#[no_gc]
+fn canvas_blend_mode(c: *mut Canvas) -> u32 {
+    return (*c).mode
+}
+
+// ------------------------------------------------------------- Colours
+
+// Reading one octet out of raw memory. It is a function and not written
+// out at the point of use because `*p as u32` parses as `*(p as u32)` --
+// the postfix `as` binds tighter than the unary star (SPEC 12.1). The
+// bracketing that avoids it is unreadable in an expression with four of
+// them, and forgetting it is a type error, not a silent wrong picture.
+#[no_gc]
+fn ld8(p: u64) -> u32 {
+    let v: u8 = *(p as *mut u8)
+    return v as u32
+}
+
+#[no_gc]
+fn ldf(p: u64) -> f64 {
+    let v: u8 = *(p as *mut u8)
+    return (v as f64) / 255.0
+}
+
+#[no_gc]
+fn st8(p: u64, v: u8) {
+    *(p as *mut u8) = v
+}
+
+#[no_gc]
+fn color_a(v: u32) -> u32 {
+    return (v >> 24) & 255 as u32
+}
+
+#[no_gc]
+fn color_r(v: u32) -> u32 {
+    return (v >> 16) & 255 as u32
+}
+
+#[no_gc]
+fn color_g(v: u32) -> u32 {
+    return (v >> 8) & 255 as u32
+}
+
+#[no_gc]
+fn color_b(v: u32) -> u32 {
+    return v & 255 as u32
+}
+
+#[no_gc]
+fn color_of(a: u32, r: u32, g: u32, b: u32) -> u32 {
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+// ------------------------------------------------------------ The pixels
+
+#[no_gc]
+fn canvas_clear(c: *mut Canvas, col: u32) {
+    if (*c).ok == 0 {
+        return
+    }
+    let a: u32 = color_a(col)
+    let r: u8 = ((color_r(col) * a + 127) / 255) as u8
+    let g: u8 = ((color_g(col) * a + 127) / 255) as u8
+    let b: u8 = ((color_b(col) * a + 127) / 255) as u8
+    let base: u64 = (*c).px as u64
+    var i: usize = 0
+    let n: usize = (*c).w * (*c).h
+    while i < n {
+        let p: u64 = base + (i * 4) as u64
+        st8(p, r)
+        st8(p + 1, g)
+        st8(p + 2, b)
+        st8(p + 3, a as u8)
+        i = i + 1
+    }
+}
+
+// The stored, premultiplied pixel as one u32 -- 0xAARRGGBB.
+#[no_gc]
+fn canvas_get(c: *mut Canvas, x: usize, y: usize) -> u32 {
+    if x >= (*c).w || y >= (*c).h {
+        return 0 as u32
+    }
+    let p: u64 = (*c).px as u64 + ((y * (*c).w + x) * 4) as u64
+    return (ld8(p + 3) << 24) | (ld8(p) << 16) | (ld8(p + 1) << 8) |
+    ld8(p + 2)
+}
+
+#[no_gc]
+fn canvas_set_raw(c: *mut Canvas, x: usize, y: usize, v: u32) {
+    if x >= (*c).w || y >= (*c).h {
+        return
+    }
+    let p: u64 = (*c).px as u64 + ((y * (*c).w + x) * 4) as u64
+    st8(p, ((v >> 16) & 255 as u32) as u8)
+    st8(p + 1, ((v >> 8) & 255 as u32) as u8)
+    st8(p + 2, (v & 255 as u32) as u8)
+    st8(p + 3, ((v >> 24) & 255 as u32) as u8)
+}
+
+// The separable blend functions of css-compositing-1, on 0..1.
+#[no_gc]
+fn blend_channel(mode: u32, cs: f64, cb: f64) -> f64 {
+    if mode == BLEND_MULTIPLY {
+        return cs * cb
+    }
+    if mode == BLEND_SCREEN {
+        return cs + cb - cs * cb
+    }
+    if mode == BLEND_OVERLAY {
+        if cb <= 0.5 {
+            return 2.0 * cs * cb
+        }
+        return 1.0 - 2.0 * (1.0 - cs) * (1.0 - cb)
+    }
+    if mode == BLEND_DARKEN {
+        if cs < cb {
+            return cs
+        }
+        return cb
+    }
+    if mode == BLEND_LIGHTEN {
+        if cs > cb {
+            return cs
+        }
+        return cb
+    }
+    if mode == BLEND_DIFFERENCE {
+        let d: f64 = cs - cb
+        if d < 0.0 {
+            return 0.0 - d
+        }
+        return d
+    }
+    if mode == BLEND_EXCLUSION {
+        return cs + cb - 2.0 * cs * cb
+    }
+    return cs
+}
+
+// Source over, with a coverage. `col` is a STRAIGHT colour (0xAARRGGBB);
+// `cov` is 0..1 and multiplies its alpha. This is the one place that
+// writes a pixel, so it is also the one place the blend mode is applied.
+#[no_gc]
+fn canvas_blend(c: *mut Canvas, x: usize, y: usize, col: u32, cov: f64) {
+    if (*c).ok == 0 || x >= (*c).w || y >= (*c).h {
+        return
+    }
+    var f: f64 = cov * clip_factor(c, x, y)
+    if f <= 0.0 {
+        return
+    }
+    if f > 1.0 {
+        f = 1.0
+    }
+    let sa: f64 = (color_a(col) as f64) / 255.0 * f
+    if sa <= 0.0 {
+        return
+    }
+    let p: u64 = (*c).px as u64 + ((y * (*c).w + x) * 4) as u64
+    let dr: f64 = ldf(p)
+    let dg: f64 = ldf(p + 1)
+    let db: f64 = ldf(p + 2)
+    let da: f64 = ldf(p + 3)
+    var sr: f64 = (color_r(col) as f64) / 255.0
+    var sg: f64 = (color_g(col) as f64) / 255.0
+    var sb: f64 = (color_b(col) as f64) / 255.0
+    if (*c).mode != BLEND_NORMAL && da > 0.0 {
+        // The backdrop has to be un-premultiplied for the blend function
+        // and the result is mixed back in by the backdrop's own alpha --
+        // css-compositing-1, 9.1.
+        let br: f64 = dr / da
+        let bg: f64 = dg / da
+        let bb: f64 = db / da
+        sr = (1.0 - da) * sr + da * blend_channel((*c).mode, sr, br)
+        sg = (1.0 - da) * sg + da * blend_channel((*c).mode, sg, bg)
+        sb = (1.0 - da) * sb + da * blend_channel((*c).mode, sb, bb)
+    }
+    let inv: f64 = 1.0 - sa
+    let orr: f64 = sr * sa + dr * inv
+    let og: f64 = sg * sa + dg * inv
+    let ob: f64 = sb * sa + db * inv
+    let oa: f64 = sa + da * inv
+    st8(p, to255(orr))
+    st8(p + 1, to255(og))
+    st8(p + 2, to255(ob))
+    st8(p + 3, to255(oa))
+}
+
+#[no_gc]
+fn to255(v: f64) -> u8 {
+    var x: f64 = v * 255.0 + 0.5
+    if x < 0.0 {
+        return 0 as u8
+    }
+    if x > 255.0 {
+        return 255 as u8
+    }
+    return (x as i64) as u8
+}
+
+// ------------------------------------------------------------- The clip
+
+#[no_gc]
+fn clip_depth(c: *mut Canvas) -> usize {
+    return (*c).depth
+}
+
+#[no_gc]
+fn clip_x0(c: *mut Canvas) -> f64 {
+    return (*c).cx0[(*c).depth]
+}
+
+#[no_gc]
+fn clip_y0(c: *mut Canvas) -> f64 {
+    return (*c).cy0[(*c).depth]
+}
+
+#[no_gc]
+fn clip_x1(c: *mut Canvas) -> f64 {
+    return (*c).cx1[(*c).depth]
+}
+
+#[no_gc]
+fn clip_y1(c: *mut Canvas) -> f64 {
+    return (*c).cy1[(*c).depth]
+}
+
+// How much of pixel (x, y) the current clip lets through. The rectangle
+// is treated as a real geometric rectangle, so a clip edge in the middle
+// of a pixel gives 0.5 -- without that a `overflow: hidden` box one and a
+// half pixels wide would be two pixels wide on screen.
+#[no_gc]
+fn clip_factor(c: *mut Canvas, x: usize, y: usize) -> f64 {
+    let d: usize = (*c).depth
+    let px0: f64 = x as f64
+    let py0: f64 = y as f64
+    var fx: f64 = overlap(px0, px0 + 1.0, (*c).cx0[d], (*c).cx1[d])
+    if fx <= 0.0 {
+        return 0.0
+    }
+    let fy: f64 = overlap(py0, py0 + 1.0, (*c).cy0[d], (*c).cy1[d])
+    if fy <= 0.0 {
+        return 0.0
+    }
+    var f: f64 = fx * fy
+    if (*c).cmask[d] != 0 {
+        let m: u64 = (*c).cmask[d] + (y * (*c).w + x) as u64
+        f = f * ldf(m)
+    }
+    return f
+}
+
+#[no_gc]
+fn overlap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+    var lo: f64 = a0
+    if b0 > lo {
+        lo = b0
+    }
+    var hi: f64 = a1
+    if b1 < hi {
+        hi = b1
+    }
+    if hi <= lo {
+        return 0.0
+    }
+    return hi - lo
+}
+
+// Intersect the clip with a rectangle.
+#[no_gc]
+fn clip_push_rect(c: *mut Canvas, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    let d: usize = (*c).depth
+    if d + 1 >= CLIP_MAX {
+        return false
+    }
+    var nx0: f64 = (*c).cx0[d]
+    if x0 > nx0 {
+        nx0 = x0
+    }
+    var ny0: f64 = (*c).cy0[d]
+    if y0 > ny0 {
+        ny0 = y0
+    }
+    var nx1: f64 = (*c).cx1[d]
+    if x1 < nx1 {
+        nx1 = x1
+    }
+    var ny1: f64 = (*c).cy1[d]
+    if y1 < ny1 {
+        ny1 = y1
+    }
+    (*c).cx0[d + 1] = nx0
+    (*c).cy0[d + 1] = ny0
+    (*c).cx1[d + 1] = nx1
+    (*c).cy1[d + 1] = ny1
+    // The mask is INHERITED, not copied: the level above owns it, and
+    // popping this level must not free it. A copied mask is only made
+    // where a new shape really comes in (`clip_push_mask`).
+    (*c).cmask[d + 1] = 0
+    if (*c).cmask[d] != 0 {
+        let n: usize = (*c).w * (*c).h
+        let m: *mut u8 = mem.heap_alloc(n)
+        if m as usize != 0 {
+            mem.mem_copy(m, (*c).cmask[d] as *mut u8, n)
+            (*c).cmask[d + 1] = m as u64
+        }
+    }
+    (*c).depth = d + 1
+    return true
+}
+
+// Intersect the clip with the shape a rasteriser has just finished. Used
+// for a rounded `overflow: hidden` box; the rectangle part is pushed with
+// it, so the common case still short-circuits on the rectangle.
+#[no_gc]
+fn clip_push_mask(c: *mut Canvas, r: *mut raster.Raster,
+    x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    if !clip_push_rect(c, x0, y0, x1, y1) {
+        return false
+    }
+    let d: usize = (*c).depth
+    let n: usize = (*c).w * (*c).h
+    let m: *mut u8 = mem.heap_alloc(n)
+    if m as usize == 0 {
+        return false
+    }
+    let old: u64 = (*c).cmask[d]
+    let ox: usize = ilo(clip_x0(c), (*c).w)
+    let oy: usize = ilo(clip_y0(c), (*c).h)
+    var y: usize = 0
+    while y < (*c).h {
+        var x: usize = 0
+        while x < (*c).w {
+            var v: f64 = 0.0
+            if x >= ox && y >= oy {
+                v = raster.raster_cov(r, x - ox, y - oy)
+            }
+            var o: f64 = 1.0
+            if old != 0 {
+                o = ldf(old + (y * (*c).w + x) as u64)
+            }
+            st8(m as u64 + (y * (*c).w + x) as u64, to255(v * o))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if old != 0 {
+        mem.heap_free(old as *mut u8, n)
+    }
+    (*c).cmask[d] = m as u64
+    return true
+}
+
+#[no_gc]
+fn ilo(v: f64, cap: usize) -> usize {
+    if v <= 0.0 {
+        return 0
+    }
+    let i: i64 = v as i64
+    if i < 0 {
+        return 0
+    }
+    if (i as usize) > cap {
+        return cap
+    }
+    return i as usize
+}
+
+#[no_gc]
+fn clip_pop(c: *mut Canvas) {
+    let d: usize = (*c).depth
+    if d == 0 {
+        return
+    }
+    if (*c).cmask[d] != 0 {
+        mem.heap_free((*c).cmask[d] as *mut u8, (*c).w * (*c).h)
+        (*c).cmask[d] = 0
+    }
+    (*c).depth = d - 1
+}
+
+// ----------------------------------------------------------- The two fills
+
+// An axis aligned rectangle, anti-aliased on all four edges, without ever
+// touching the rasteriser. This is the hot path: on an ordinary page
+// nine out of ten paint commands are exactly this.
+#[no_gc]
+fn canvas_fill_rect(c: *mut Canvas, x0: f64, y0: f64, x1: f64, y1: f64,
+    col: u32) {
+    if (*c).ok == 0 || x1 <= x0 || y1 <= y0 {
+        return
+    }
+    let d: usize = (*c).depth
+    var lx: f64 = x0
+    if (*c).cx0[d] > lx {
+        lx = (*c).cx0[d]
+    }
+    var ly: f64 = y0
+    if (*c).cy0[d] > ly {
+        ly = (*c).cy0[d]
+    }
+    var rx: f64 = x1
+    if (*c).cx1[d] < rx {
+        rx = (*c).cx1[d]
+    }
+    var ry: f64 = y1
+    if (*c).cy1[d] < ry {
+        ry = (*c).cy1[d]
+    }
+    if rx <= lx || ry <= ly {
+        return
+    }
+    let px0: usize = ilo(lx, (*c).w)
+    let py0: usize = ilo(ly, (*c).h)
+    let px1: usize = ihi(rx, (*c).w)
+    let py1: usize = ihi(ry, (*c).h)
+    // THE INTERIOR IS NOT ANTI-ALIASED, and that is not a shortcut: a
+    // pixel that lies WHOLLY inside the rectangle has coverage exactly
+    // one, and an opaque colour on coverage one with no mask is a STORE.
+    // On a page whose background is one rectangle of 800 by 600 that is
+    // the difference between half a million blends and half a million
+    // moves -- measured, it is the single biggest item in the raster
+    // time of an ordinary page.
+    let opaque: bool = color_a(col) == 255 as u32 && (*c).cmask[d] == 0 &&
+    (*c).mode == BLEND_NORMAL
+    let ix0: usize = ihi(lx, (*c).w)
+    let ix1: usize = ilo(rx, (*c).w)
+    let iy0: usize = ihi(ly, (*c).h)
+    let iy1: usize = ilo(ry, (*c).h)
+    let pr: u8 = (color_r(col)) as u8
+    let pg: u8 = (color_g(col)) as u8
+    let pb: u8 = (color_b(col)) as u8
+    var y: usize = py0
+    while y < py1 {
+        let fy: f64 = overlap(y as f64, (y as f64) + 1.0, ly, ry)
+        if fy > 0.0 {
+            let inside_row: bool = opaque && y >= iy0 && y < iy1 && ix1 > ix0
+            var x: usize = px0
+            while x < px1 {
+                if inside_row && x == ix0 {
+                    var q: u64 = (*c).px as u64 + ((y * (*c).w + ix0) * 4) as u64
+                    var k: usize = ix0
+                    while k < ix1 {
+                        st8(q, pr)
+                        st8(q + 1, pg)
+                        st8(q + 2, pb)
+                        st8(q + 3, 255 as u8)
+                        q = q + 4
+                        k = k + 1
+                    }
+                    x = ix1
+                    continue
+                }
+                let fx: f64 = overlap(x as f64, (x as f64) + 1.0, lx, rx)
+                if fx > 0.0 {
+                    canvas_blend_noclip_rect(c, x, y, col, fx * fy)
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+// `canvas_fill_rect` has already applied the rectangular part of the
+// clip; only the mask is left. Going through `canvas_blend` again would
+// compute the rectangle overlap a second time for every pixel.
+#[no_gc]
+fn canvas_blend_noclip_rect(c: *mut Canvas, x: usize, y: usize, col: u32,
+    cov: f64) {
+    var f: f64 = cov
+    let d: usize = (*c).depth
+    if (*c).cmask[d] != 0 {
+        let m: u64 = (*c).cmask[d] + (y * (*c).w + x) as u64
+        f = f * ldf(m)
+    }
+    if f <= 0.0 {
+        return
+    }
+    blend_raw(c, x, y, col, f)
+}
+
+#[no_gc]
+fn blend_raw(c: *mut Canvas, x: usize, y: usize, col: u32, f: f64) {
+    let sa: f64 = (color_a(col) as f64) / 255.0 * f
+    if sa <= 0.0 {
+        return
+    }
+    let p: u64 = (*c).px as u64 + ((y * (*c).w + x) * 4) as u64
+    let dr: f64 = ldf(p)
+    let dg: f64 = ldf(p + 1)
+    let db: f64 = ldf(p + 2)
+    let da: f64 = ldf(p + 3)
+    var sr: f64 = (color_r(col) as f64) / 255.0
+    var sg: f64 = (color_g(col) as f64) / 255.0
+    var sb: f64 = (color_b(col) as f64) / 255.0
+    if (*c).mode != BLEND_NORMAL && da > 0.0 {
+        let br: f64 = dr / da
+        let bg: f64 = dg / da
+        let bb: f64 = db / da
+        sr = (1.0 - da) * sr + da * blend_channel((*c).mode, sr, br)
+        sg = (1.0 - da) * sg + da * blend_channel((*c).mode, sg, bg)
+        sb = (1.0 - da) * sb + da * blend_channel((*c).mode, sb, bb)
+    }
+    let inv: f64 = 1.0 - sa
+    st8(p, to255(sr * sa + dr * inv))
+    st8(p + 1, to255(sg * sa + dg * inv))
+    st8(p + 2, to255(sb * sa + db * inv))
+    st8(p + 3, to255(sa + da * inv))
+}
+
+#[no_gc]
+fn ihi(v: f64, cap: usize) -> usize {
+    if v <= 0.0 {
+        return 0
+    }
+    let i: i64 = (v + 0.9999999) as i64
+    if i < 0 {
+        return 0
+    }
+    if (i as usize) > cap {
+        return cap
+    }
+    return i as usize
+}
+
+// Everything that is not a rectangle: the rasteriser has been filled and
+// finished, its window sits at (ox, oy) on the canvas.
+#[no_gc]
+fn canvas_fill_raster(c: *mut Canvas, r: *mut raster.Raster,
+    ox: usize, oy: usize, col: u32) {
+    if (*c).ok == 0 {
+        return
+    }
+    var y: usize = 0
+    let rh: usize = raster.raster_height(r)
+    let rw: usize = raster.raster_width(r)
+    while y < rh {
+        let cy: usize = oy + y
+        if cy < (*c).h {
+            var x: usize = 0
+            while x < rw {
+                let cx: usize = ox + x
+                if cx < (*c).w {
+                    let v: f64 = raster.raster_cov(r, x, y)
+                    if v > 0.0 {
+                        canvas_blend(c, cx, cy, col, v)
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}

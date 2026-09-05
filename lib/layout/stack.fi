@@ -1,0 +1,472 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/layout/stack.fi -- THE PAINT ORDER. Which box is drawn over which.
+//
+// Layout answers "where is this box"; this file answers the question that
+// comes right after it and that no rectangle can answer: WHO IS ON TOP.
+// Two boxes that overlap have to be painted in a defined order, and that
+// order is not the tree order. It is CSS 2.1, Appendix E, and the whole
+// of it rests on two words: STACKING CONTEXT.
+//
+// A stacking context is an atom. Everything inside it is painted
+// together, and nothing from outside can slip in between -- which is why
+// a `z-index: 1` deep inside a `z-index: 0` box can never come out over a
+// sibling of that box, no matter how large the number is. That is the
+// single most surprising rule in CSS, and it is one line of code here:
+// `paint_context` never descends into a nested context, it calls itself
+// on it.
+//
+// THE SEVEN STEPS inside one stacking context, in this order:
+//
+//   1. the background and the borders of the element that FORMS the
+//      context
+//   2. the child stacking contexts with a NEGATIVE z-index, most negative
+//      first
+//   3. the in-flow, non-inline-level, non-positioned descendants
+//   4. the non-positioned FLOATS
+//   5. the in-flow, INLINE-level, non-positioned descendants
+//   6. the positioned descendants with `z-index: auto` or `0`, in tree
+//      order
+//   7. the child stacking contexts with a POSITIVE z-index, ascending
+//
+// Steps 3 and 5 are the reason a float lies UNDER the text of the
+// paragraph beside it but OVER the background of the block it sits in,
+// and step 6 is the reason a positioned box with no z-index at all still
+// covers every ordinary block.
+//
+// WHAT IS PROVEN, and how. A paint order cannot be read out of a browser
+// -- there is no `getPaintOrder()`. But `document.elementFromPoint(x, y)`
+// answers exactly the question the order decides: which element is on top
+// AT THIS POINT. tools/layout/stack.py samples a grid of points over
+// every case, asks Chromium for the topmost element at each of them and
+// asks the same of this list, read from the back. Where the two disagree,
+// the order is wrong.
+import browser.node
+import css.cascade
+import layout.box
+
+export {
+    paint_order, forms_stacking_context, hit_test,
+    PaintOp, paint_order_ops, PH_BOX, PH_TEXT,
+}
+
+// ROUND B3 -- WHY THE ORDER HAD TO GROW A SECOND HALF.
+//
+// `paint_order` answers "which box lies over which", and round 67 proved
+// that against Chromium at 5171 probe points. For a PICTURE that is not
+// enough, because a box is not painted in one go: its background and its
+// border belong to step 3 or 4 of Appendix E, and the TEXT inside it
+// belongs to step 5 -- after the floats. A float therefore lies over the
+// background of the paragraph beside it and UNDER its letters, and an
+// order with one entry per box cannot say that.
+//
+// So `paint_order_ops` returns the same walk with a PHASE on every entry:
+// `PH_BOX` where the box's own background and border go, `PH_TEXT` where
+// its inline content goes. `paint_order` is untouched and still returns
+// exactly what it returned before -- the proof of round 67 has to keep
+// meaning what it meant.
+const PH_BOX: u32 = 0
+const PH_TEXT: u32 = 1
+
+gc class PaintOp {
+    b: Gc[Box],
+    phase: u32,
+}
+
+// The six lists of one stacking context. They are collected in ONE walk
+// and emptied in the order of Appendix E.
+gc class PaintCtx {
+    neg: Gc[GcVec], // child contexts with z-index < 0
+    blocks: Gc[GcVec], // step 3
+    floats: Gc[GcVec], // step 4
+    inlines: Gc[GcVec], // step 5
+    zero: Gc[GcVec], // step 6: positioned, z-index auto or 0
+    pos: Gc[GcVec], // step 7: child contexts with z-index > 0
+    // ROUND B3, step 5 as well: every box in this piece that put TEXT on a
+    // line. An anonymous block has no elem and never appears in
+    // `blocks`, but it is where most of the text of a page sits.
+    texts: Gc[GcVec],
+}
+
+fn paintctx_new() -> AllocError!Gc[PaintCtx] {
+    let a = try gcvec_new()
+    let b = try gcvec_new()
+    let c = try gcvec_new()
+    let d = try gcvec_new()
+    let e = try gcvec_new()
+    let f = try gcvec_new()
+    let g = try gcvec_new()
+    return try gc PaintCtx {
+        neg: a,
+        blocks: b,
+        floats: c,
+        inlines: d,
+        zero: e,
+        pos: f,
+        texts: g,
+    }
+}
+
+fn is_positioned(b: Gc[Box]) -> bool {
+    return cascade.style_position(b.style) != cascade.POS_STATIC
+}
+
+fn is_floated(b: Gc[Box]) -> bool {
+    return (b.flags & box.F_FLOAT) != 0 as u32
+}
+
+// Does this box FORM a stacking context? The list is short and every
+// entry earns its place:
+//
+//   * the root element -- there has to be a bottom to stand on.
+//   * a positioned box with a z-index that is not `auto`. `z-index: 0`
+//     and `z-index: auto` place a box in the SAME step 6, but only `0`
+//     makes a context -- the difference is invisible until something
+//     inside the box has a z-index of its own.
+//   * `position: fixed` and `position: sticky` ALWAYS, with or without a
+//     z-index (css-position-3, 6.1).
+//   * a FLEX ITEM with a z-index that is not `auto`, although it is not
+//     positioned at all (css-flexbox-1, 4.3).
+//
+// What is missing is named in docs/ROUND67.md: `opacity` below one,
+// `transform`, `filter`, `mix-blend-mode`, `isolation` and
+// `will-change`. None of them is parsed by this engine, so none of them
+// can make a context here.
+fn forms_stacking_context(b: Gc[Box], root: bool) -> bool {
+    if root {
+        return true
+    }
+    let p: u32 = cascade.style_position(b.style)
+    if p == cascade.POS_FIXED || p == cascade.POS_STICKY {
+        return true
+    }
+    if p != cascade.POS_STATIC && !cascade.style_z_auto(b.style) {
+        return true
+    }
+    if (b.flags & box.F_FLEX_ITEM) != 0 as u32 &&
+    !cascade.style_z_auto(b.style) {
+        return true
+    }
+    return false
+}
+
+// A box that takes part in the painting at all. An anonymous block and a
+// text run have no element of their own; they are painted with the box
+// they belong to, and reporting them would only make the list longer
+// without making it more true.
+fn paints(b: Gc[Box]) -> bool {
+    return b.elem != gc_null[Node]() && b.elem.kind == node.K_ELEM
+}
+
+fn z_of(b: Gc[Box]) -> f64 {
+    if cascade.style_z_auto(b.style) {
+        return 0.0
+    }
+    return cascade.style_z_index(b.style)
+}
+
+// Sorts a list of stacking contexts by z-index, ASCENDING and STABLE --
+// two boxes with the same z-index keep their tree order, and that is not
+// a detail: it is what decides which of two `z-index: 1` boxes wins.
+fn sort_by_z(v: Gc[GcVec]) {
+    let n: u64 = gcvec_length(v)
+    var k: u64 = 1
+    while k < n {
+        let cur: Gc[Box] = gcvec_read[Box](v, k)
+        let zc: f64 = z_of(cur)
+        var j: u64 = k
+        var moving: bool = true
+        while moving && j > 0 {
+            let prev: Gc[Box] = gcvec_read[Box](v, j - 1)
+            if z_of(prev) > zc {
+                let ok: bool = gcvec_set[Box](v, j, prev)
+                j = j - 1
+            } else {
+                moving = false
+            }
+        }
+        let ok2: bool = gcvec_set[Box](v, j, cur)
+        k = k + 1
+    }
+}
+
+// Puts a child that forms a stacking context into the right of the three
+// lists.
+fn file_context(ctx: Gc[PaintCtx], c: Gc[Box]) -> AllocError!bool {
+    let z: f64 = z_of(c)
+    if z < 0.0 {
+        return try gcvec_append[Box](ctx.neg, c)
+    }
+    if z > 0.0 {
+        return try gcvec_append[Box](ctx.pos, c)
+    }
+    return try gcvec_append[Box](ctx.zero, c)
+}
+
+// Walks the subtree of a box that is painted as ONE piece (a positioned
+// box with `z-index: auto`, or a float) and lifts everything out of it
+// that belongs to the PARENT stacking context: every positioned
+// descendant and every descendant that forms a context of its own
+// (CSS 2.1, E.2, step 8). Without this step a `position: absolute` inside
+// a float would be painted with the float and would disappear under a
+// later sibling.
+fn hoist(b: Gc[Box], ctx: Gc[PaintCtx]) -> AllocError!bool {
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if forms_stacking_context(c, false) {
+            let ok: bool = try file_context(ctx, c)
+        } else if is_positioned(c) {
+            let ok2: bool = try gcvec_append[Box](ctx.zero, c)
+            let ok3: bool = try hoist(c, ctx)
+        } else {
+            let ok4: bool = try hoist(c, ctx)
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The one walk that fills all six lists. It stops at every box that is
+// painted as a piece of its own -- a nested stacking context, a
+// positioned box, a float -- because those are entered again from the
+// place in the order where they belong.
+fn collect(b: Gc[Box], ctx: Gc[PaintCtx]) -> AllocError!bool {
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if forms_stacking_context(c, false) {
+            let ok: bool = try file_context(ctx, c)
+        } else if is_positioned(c) {
+            let ok2: bool = try gcvec_append[Box](ctx.zero, c)
+            let ok3: bool = try hoist(c, ctx)
+        } else if is_floated(c) {
+            let ok4: bool = try gcvec_append[Box](ctx.floats, c)
+            let ok5: bool = try hoist(c, ctx)
+        } else {
+            if box.is_inline_level(c.kind) {
+                if paints(c) {
+                    let ok6: bool = try gcvec_append[Box](ctx.inlines, c)
+                }
+            } else if paints(c) {
+                let ok7: bool = try gcvec_append[Box](ctx.blocks, c)
+            }
+            if c.runs != gc_null[GcVec]() {
+                let okt: bool = try gcvec_append[Box](ctx.texts, c)
+            }
+            let ok8: bool = try collect(c, ctx)
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn emit(out: Gc[GcVec], b: Gc[Box]) -> AllocError!bool {
+    if !paints(b) {
+        return true
+    }
+    return try gcvec_append[Box](out, b)
+}
+
+// A box that is painted as one piece but does NOT form a stacking
+// context: a float, or a positioned box with `z-index: auto`. Its own
+// background comes first, then steps 3 to 5 of its subtree. Its
+// positioned descendants are not here -- `hoist` has already given them
+// to the parent context.
+fn paint_piece(b: Gc[Box], out: Gc[GcVec]) -> AllocError!bool {
+    let ok: bool = try emit(out, b)
+    let ctx = try paintctx_new()
+    let ok2: bool = try collect(b, ctx)
+    var i: u64 = 0
+    while i < gcvec_length(ctx.blocks) {
+        let ok3: bool = try emit(out, gcvec_read[Box](ctx.blocks, i))
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.floats) {
+        let ok4: bool = try paint_piece(gcvec_read[Box](ctx.floats, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.inlines) {
+        let ok5: bool = try emit(out, gcvec_read[Box](ctx.inlines, i))
+        i = i + 1
+    }
+    return true
+}
+
+// ONE stacking context, in the seven steps of Appendix E.
+fn paint_context(b: Gc[Box], out: Gc[GcVec]) -> AllocError!bool {
+    let ok: bool = try emit(out, b)
+    let ctx = try paintctx_new()
+    let ok2: bool = try collect(b, ctx)
+    sort_by_z(ctx.neg)
+    sort_by_z(ctx.pos)
+    var i: u64 = 0
+    while i < gcvec_length(ctx.neg) {
+        let ok3: bool = try paint_context(gcvec_read[Box](ctx.neg, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.blocks) {
+        let ok4: bool = try emit(out, gcvec_read[Box](ctx.blocks, i))
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.floats) {
+        let ok5: bool = try paint_piece(gcvec_read[Box](ctx.floats, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.inlines) {
+        let ok6: bool = try emit(out, gcvec_read[Box](ctx.inlines, i))
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.zero) {
+        let c: Gc[Box] = gcvec_read[Box](ctx.zero, i)
+        if forms_stacking_context(c, false) {
+            let ok7: bool = try paint_context(c, out)
+        } else {
+            let ok8: bool = try paint_piece(c, out)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.pos) {
+        let ok9: bool = try paint_context(gcvec_read[Box](ctx.pos, i), out)
+        i = i + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------- ROUND B3: the phases
+//
+// The same two functions again, with a phase. They are written out rather
+// than folded into the ones above on purpose: `paint_order` is the thing
+// round 67 measured against a real browser, and a rewrite of it to serve
+// a second caller would make that measurement mean something else.
+
+fn emit_op(out: Gc[GcVec], b: Gc[Box], phase: u32) -> AllocError!bool {
+    if phase == PH_BOX && !paints(b) {
+        return true
+    }
+    let op = try gc PaintOp { b: b, phase: phase }
+    return try gcvec_append[PaintOp](out, op)
+}
+
+fn ops_piece(b: Gc[Box], out: Gc[GcVec]) -> AllocError!bool {
+    let ok: bool = try emit_op(out, b, PH_BOX)
+    let ctx = try paintctx_new()
+    let ok2: bool = try collect(b, ctx)
+    var i: u64 = 0
+    while i < gcvec_length(ctx.blocks) {
+        let ok3: bool = try emit_op(out, gcvec_read[Box](ctx.blocks, i), PH_BOX)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.floats) {
+        let ok4: bool = try ops_piece(gcvec_read[Box](ctx.floats, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.inlines) {
+        let ok5: bool = try emit_op(out, gcvec_read[Box](ctx.inlines, i), PH_BOX)
+        i = i + 1
+    }
+    let ok6: bool = try emit_texts(b, ctx, out)
+    return true
+}
+
+fn emit_texts(b: Gc[Box], ctx: Gc[PaintCtx], out: Gc[GcVec]) -> AllocError!bool {
+    if b.runs != gc_null[GcVec]() {
+        let ok: bool = try emit_op(out, b, PH_TEXT)
+    }
+    var i: u64 = 0
+    while i < gcvec_length(ctx.texts) {
+        let ok2: bool = try emit_op(out, gcvec_read[Box](ctx.texts, i), PH_TEXT)
+        i = i + 1
+    }
+    return true
+}
+
+fn ops_context(b: Gc[Box], out: Gc[GcVec]) -> AllocError!bool {
+    let ok: bool = try emit_op(out, b, PH_BOX)
+    let ctx = try paintctx_new()
+    let ok2: bool = try collect(b, ctx)
+    sort_by_z(ctx.neg)
+    sort_by_z(ctx.pos)
+    var i: u64 = 0
+    while i < gcvec_length(ctx.neg) {
+        let ok3: bool = try ops_context(gcvec_read[Box](ctx.neg, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.blocks) {
+        let ok4: bool = try emit_op(out, gcvec_read[Box](ctx.blocks, i), PH_BOX)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.floats) {
+        let ok5: bool = try ops_piece(gcvec_read[Box](ctx.floats, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.inlines) {
+        let ok6: bool = try emit_op(out, gcvec_read[Box](ctx.inlines, i), PH_BOX)
+        i = i + 1
+    }
+    let okt: bool = try emit_texts(b, ctx, out)
+    i = 0
+    while i < gcvec_length(ctx.zero) {
+        let c: Gc[Box] = gcvec_read[Box](ctx.zero, i)
+        if forms_stacking_context(c, false) {
+            let ok7: bool = try ops_context(c, out)
+        } else {
+            let ok8: bool = try ops_piece(c, out)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.pos) {
+        let ok9: bool = try ops_context(gcvec_read[Box](ctx.pos, i), out)
+        i = i + 1
+    }
+    return true
+}
+
+fn paint_order_ops(root: Gc[Box]) -> AllocError!Gc[GcVec] {
+    let out = try gcvec_new()
+    if root == gc_null[Box]() {
+        return out
+    }
+    let ok: bool = try ops_context(root, out)
+    return out
+}
+
+// The whole document: one vector of boxes, back to front.
+fn paint_order(root: Gc[Box]) -> AllocError!Gc[GcVec] {
+    let out = try gcvec_new()
+    if root == gc_null[Box]() {
+        return out
+    }
+    let ok: bool = try paint_context(root, out)
+    return out
+}
+
+// The box that lies on top at a point -- the paint order read from the
+// BACK. This is the answer `document.elementFromPoint` gives in a
+// browser, and it is how tools/layout/stack.py checks the order without
+// a picture.
+fn hit_test(order: Gc[GcVec], x: f64, y: f64) -> Gc[Box] {
+    var i: u64 = gcvec_length(order)
+    while i > 0 {
+        i = i - 1
+        let b: Gc[Box] = gcvec_read[Box](order, i)
+        if x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h {
+            return b
+        }
+    }
+    return gc_null[Box]()
+}

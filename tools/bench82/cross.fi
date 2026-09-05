@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/bench82/cross.fi -- the hardware path and the scalar path have to
+// agree, octet for octet (round 82).
+//
+// THE POINT OF THIS PROGRAM: `lib/std/crypto/accel.fi` is a SECOND
+// implementation of two ciphers that already existed. Two implementations of
+// the same thing are two chances to be wrong, and the fast one is the one
+// nobody reads. So it is held against the slow one -- not on a handful of
+// vectors, but on every length from 0 to 300 octets and on a few large ones,
+// with data that changes with the length.
+//
+// The lengths are not decoration. AES-CBC has to refuse anything that is not
+// a multiple of sixteen; CFB8 has a shift register that a length of exactly
+// 15, 16 or 17 octets puts under strain; SHA-256 pads over the 55/56/64
+// octet boundary, where a second block appears. Whoever tests only 1 MiB of
+// random data tests none of that.
+//
+// On top of that the FIPS 197 known answer test and the FIPS 180-4 "abc"
+// digest stand written out below -- two numbers that come from OUTSIDE this
+// repository and hold BOTH paths at once.
+//
+// Output: one line per area, `ok` or `MISMATCH ...`. Exit code 0 = all
+// agree.
+import std.rt
+import std.cpu
+import std.crypto.sha256
+import std.crypto.aes
+
+const N: usize = 4096
+
+fn fill(p: u64, n: usize, seed: u64) {
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        // ROUND 83: the generator is arithmetic modulo 2^64, the octet is
+        // the low eight bits -- both said in the operator (SPEC 13, L9).
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.st8(p, i, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn same(a: u64, b: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(a, i) != rt.ld8(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn say(out: *mut rt.Buf, text: u64, n: usize, ok: bool) {
+    rt.buf_push_bytes(out, text, n)
+    if ok {
+        var y: [u8; 4] = " ok\n"
+        rt.buf_push_bytes(out, (&y[0]) as u64, 4)
+    } else {
+        var n2: [u8; 11] = " MISMATCH\n\0"
+        rt.buf_push_bytes(out, (&n2[0]) as u64, 10)
+    }
+}
+
+fn main() -> i32 {
+    var out: rt.Buf = rt.buf_new()
+    var bad: i32 = 0
+
+    // ---------------------------------------------------------- the report
+    var head: [u8; 25] = "  processor features: 0x\0"
+    rt.buf_push_bytes(&out, (&head[0]) as u64, 24)
+    rt.buf_push_hex_u64(&out, cpu.features(), 3)
+    rt.buf_push(&out, 10 as u8)
+
+    // ------------------------------------------------- 1. FIPS 197 / 180-4
+    var key: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    var ptx: [u8; 16] = [0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187,
+        204, 221, 238, 255]
+    var want: [u8; 16] = [105, 196, 224, 216, 106, 123, 4, 48, 216, 205, 183,
+        128, 112, 180, 197, 90]
+    var got: [u8; 16] = [0; 16]
+    var a: aes.Aes = aes.aes128_new((&key[0]) as u64)
+    aes.aes_encrypt_block(&a, (&ptx[0]) as u64, (&got[0]) as u64)
+    var l1: [u8; 23] = "  FIPS 197 known answer"
+    let k1: bool = same((&got[0]) as u64, (&want[0]) as u64, 16)
+    say(&out, (&l1[0]) as u64, 23, k1)
+    if !k1 {
+        bad = 1
+    }
+
+    var abc: [u8; 3] = [97, 98, 99]
+    var dwant: [u8; 32] = [186, 120, 22, 191, 143, 1, 207, 234, 65, 65, 64,
+        222, 93, 174, 34, 35, 176, 3, 97, 163, 150, 23, 122, 156, 180, 16,
+        255, 97, 242, 0, 21, 173]
+    var d1: [u8; 32] = [0; 32]
+    var d2: [u8; 32] = [0; 32]
+    sha256.sha256((&abc[0]) as u64, 3, (&d1[0]) as u64)
+    sha256.sha256_soft((&abc[0]) as u64, 3, (&d2[0]) as u64)
+    let k2: bool = same((&d1[0]) as u64, (&dwant[0]) as u64, 32)
+    && same((&d2[0]) as u64, (&dwant[0]) as u64, 32)
+    var l2: [u8; 24] = "  FIPS 180-4 \"abc\", both"
+    say(&out, (&l2[0]) as u64, 24, k2)
+    if !k2 {
+        bad = 1
+    }
+
+    // ------------------------------------------- 2. SHA-256 over every length
+    let src: u64 = rt.heap_alloc(N)
+    let c1: u64 = rt.heap_alloc(N)
+    let c2: u64 = rt.heap_alloc(N)
+    let r1: u64 = rt.heap_alloc(N)
+    let r2: u64 = rt.heap_alloc(N)
+    if src == 0 || c1 == 0 || c2 == 0 || r1 == 0 || r2 == 0 {
+        return 7
+    }
+    var shaok: bool = true
+    var n: usize = 0
+    while n <= 300 {
+        fill(src, n, 12345 + n as u64)
+        sha256.sha256(src, n, (&d1[0]) as u64)
+        sha256.sha256_soft(src, n, (&d2[0]) as u64)
+        if !same((&d1[0]) as u64, (&d2[0]) as u64, 32) {
+            shaok = false
+        }
+        n = n + 1
+    }
+    // and a few big ones, so that the bulk loop is used
+    var big: usize = 1000
+    while big <= 4000 {
+        fill(src, big, 777 + big as u64)
+        sha256.sha256(src, big, (&d1[0]) as u64)
+        sha256.sha256_soft(src, big, (&d2[0]) as u64)
+        if !same((&d1[0]) as u64, (&d2[0]) as u64, 32) {
+            shaok = false
+        }
+        big = big + 997
+    }
+    var l3: [u8; 36] = "  SHA-256, lengths 0..300 and 1k..4k"
+    say(&out, (&l3[0]) as u64, 36, shaok)
+    if !shaok {
+        bad = 1
+    }
+
+    // ------------------------------------ 3. AES-CBC, both directions
+    var iv0: [u8; 16] = [0; 16]
+    var i: usize = 0
+    while i < 16 {
+        iv0[i] = (i * 5 + 9) as u8
+        i = i + 1
+    }
+    var cbcok: bool = true
+    var hw: aes.Aes = aes.aes128_new((&key[0]) as u64)
+    var sw: aes.Aes = aes.aes128_new_soft((&key[0]) as u64)
+    var m: usize = 0
+    while m <= 288 {
+        fill(src, m, 555 + m as u64)
+        var v1: [u8; 16] = [0; 16]
+        var v2: [u8; 16] = [0; 16]
+        i = 0
+        while i < 16 {
+            v1[i] = iv0[i]
+            v2[i] = iv0[i]
+            i = i + 1
+        }
+        let o1: bool = aes.aes_cbc_encrypt(&hw, (&v1[0]) as u64, src, m, c1)
+        let o2: bool = aes.aes_cbc_encrypt(&sw, (&v2[0]) as u64, src, m, c2)
+        if o1 != o2 {
+            cbcok = false
+        }
+        if o1 {
+            if !same(c1, c2, m) {
+                cbcok = false
+            }
+            // and the shift register has to have moved the same way
+            if !same((&v1[0]) as u64, (&v2[0]) as u64, 16) {
+                cbcok = false
+            }
+            i = 0
+            while i < 16 {
+                v1[i] = iv0[i]
+                v2[i] = iv0[i]
+                i = i + 1
+            }
+            let p1: bool = aes.aes_cbc_decrypt(&hw, (&v1[0]) as u64, c1, m, r1)
+            let p2: bool = aes.aes_cbc_decrypt(&sw, (&v2[0]) as u64, c2, m, r2)
+            if !p1 || !p2 {
+                cbcok = false
+            }
+            if !same(r1, src, m) || !same(r2, src, m) {
+                cbcok = false
+            }
+        }
+        m = m + 16
+    }
+    // a length that is NOT a multiple of sixteen has to be refused by both
+    let bad1: bool = aes.aes_cbc_encrypt(&hw, (&iv0[0]) as u64, src, 17, c1)
+    let bad2: bool = aes.aes_cbc_encrypt(&sw, (&iv0[0]) as u64, src, 17, c2)
+    if bad1 || bad2 {
+        cbcok = false
+    }
+    var l4: [u8; 39] = "  AES-128-CBC in and out, 0..288 octets"
+    say(&out, (&l4[0]) as u64, 39, cbcok)
+    if !cbcok {
+        bad = 1
+    }
+
+    // ------------------------------------------ 4. AES-CFB8, both directions
+    var cfbok: bool = true
+    var q: usize = 0
+    while q <= 200 {
+        fill(src, q, 31337 + q as u64)
+        var v1: [u8; 16] = [0; 16]
+        var v2: [u8; 16] = [0; 16]
+        i = 0
+        while i < 16 {
+            v1[i] = iv0[i]
+            v2[i] = iv0[i]
+            i = i + 1
+        }
+        aes.aes_cfb8_encrypt(&hw, (&v1[0]) as u64, src, q, c1)
+        aes.aes_cfb8_encrypt(&sw, (&v2[0]) as u64, src, q, c2)
+        if !same(c1, c2, q) || !same((&v1[0]) as u64, (&v2[0]) as u64, 16) {
+            cfbok = false
+        }
+        i = 0
+        while i < 16 {
+            v1[i] = iv0[i]
+            v2[i] = iv0[i]
+            i = i + 1
+        }
+        aes.aes_cfb8_decrypt(&hw, (&v1[0]) as u64, c1, q, r1)
+        aes.aes_cfb8_decrypt(&sw, (&v2[0]) as u64, c2, q, r2)
+        if !same(r1, src, q) || !same(r2, src, q) {
+            cfbok = false
+        }
+        q = q + 1
+    }
+    var l5: [u8; 40] = "  AES-128-CFB8 in and out, 0..200 octets"
+    say(&out, (&l5[0]) as u64, 40, cfbok)
+    if !cfbok {
+        bad = 1
+    }
+
+    rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    rt.heap_free(src, N)
+    rt.heap_free(c1, N)
+    rt.heap_free(c2, N)
+    rt.heap_free(r1, N)
+    rt.heap_free(r2, N)
+    return bad
+}

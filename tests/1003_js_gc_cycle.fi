@@ -1,0 +1,156 @@
+// expect_exit: 0
+// tests/1003_js_gc_cycle.fi -- ROUND 63: the JS OBJECTS BELONG TO THE
+// COLLECTOR, and it reaches them over the PROTOTYPE CHAIN and the SCOPE
+// CHAIN.
+//
+// This is the test the round asks for by name. The JavaScript program below
+// builds, in every round, exactly the shape that a reference count can
+// never release:
+//
+//     node ---self---> closure ---captures---> node        (a real cycle)
+//     child --[[Prototype]]--> node                        (prototype chain)
+//     child ---parent---> node                             (back reference)
+//     Map    ---key----> node,  ---value---> child         (both traced)
+//
+// The closure is the point of it: its environment record (`val.Env`) holds
+// the variable `node`, and the object holds the closure. Neither of the two
+// can be freed without tracing.
+//
+// What is checked:
+//   1. after N rounds and a collection the number of LIVE objects is back
+//      where it started (within a small tolerance for the interned strings
+//      that the run creates once),
+//   2. the COUNTER CHECK: the same program that keeps every set in a global
+//      array MUST push the number up. A test that only checks the good case
+//      cannot see a leak at all.
+//
+// The long version with an RSS measurement stands in tools/js/soak.sh.
+import html.mem
+import js.lex
+import js.ast
+import js.parse
+import js.val
+import js.interp
+import js.builtin
+
+const CLEAN_LEN: usize = 288
+const LEAK_LEN: usize = 293
+
+fn __gc_finalize(kind: u64, p: *mut u8) {
+}
+
+// Lay a deep, nulled frame over the abandoned frames: the stack scan is
+// conservative, and an old pointer in a dead frame would keep alive exactly
+// what is supposed to die here (docs/reports/dom.md).
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    var i: usize = 0
+    while i < 256 {
+        buffer[i] = 0
+        i = i + 1
+    }
+    barrier(&buffer)
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+// ROUND 79 -- the realm is a GC object and is handed the addresses of `ctx`,
+// `t` and `nm`, which lie in THIS frame. It is sound here and only here: the
+// realm comes into being in this call, nothing outside gets hold of it, and
+// it is garbage the moment this function returns. The escape analysis
+// (compiler/src/escape.rs) cannot see that, so the exception is said out
+// loud instead of the check being weakened (docs/ROUND79.md 3).
+#[allow_escape]
+fn run(src: *mut u8, len: usize, nm: *mut lex.Names) -> AllocError!u64 {
+    var l: lex.Lexer = lex.lex_new()
+    lex.lex_init(&l, nm)
+    var t: ast.Ast = ast.ast_new()
+    ast.ast_init(&t)
+    var p: parse.Parser = parse.parser_new()
+    parse.parser_init(&p, &l, &t, nm)
+    lex.lex_set_ascii(&l, src, len)
+    let prog: u32 = parse.parse_program(&p, false)
+    if parse.parse_error(&p) != parse.ERR_NONE {
+        return 1
+    }
+    var ctx: interp.Ctx = interp.ctx_new()
+    ctx.native = builtin.native_dispatch
+    ctx.arity = builtin.native_arity_of
+    let r: Gc[Realm] = try val.realm_new()
+    val.realm_set_ctx(r, (&ctx) as *mut u8)
+    val.realm_set_ast(r, &t, nm)
+    let g: Gc[JsObj] = try builtin.install(r)
+    let v: Gc[JsVal] = try interp.run_program(r, prog, r.global_env)
+    var bad: u64 = 0
+    if ctx.comp == interp.C_THROW {
+        bad = 2
+    }
+    parse.parser_free(&p)
+    ast.ast_free(&t)
+    lex.lex_free(&l)
+    return bad
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    gc_set_max_bytes(1 << 30)
+    var nm: lex.Names = lex.Names { pool: mem.cp_new(), off: mem.cp_new(),
+        len: mem.cp_new(), hash: mem.cp_new(), buckets: mem.cp_new(),
+        mask: 0, n: 0 }
+    lex.names_init(&nm)
+
+    // Round 1: the cycles are dropped.
+    var clean: [u8; 288] = "function make(i){var node={id:i,kids:[]};node.self=function(){return node.id};var child=Object.create(node);child.parent=node;node.kids.push(child);var m=new Map();m.set(node,child);m.set(child,node);node.table=m;child.table=m;return node}var s=0;for(var i=0;i<400;i++){s+=make(i).self()}"
+    // The same program, but every set stays reachable.
+    var leak: [u8; 293] = "function make(i){var node={id:i,kids:[]};node.self=function(){return node.id};var child=Object.create(node);child.parent=node;node.kids.push(child);var m=new Map();m.set(node,child);m.set(child,node);node.table=m;child.table=m;return node}var keep=[];for(var i=0;i<400;i++){keep.push(make(i))}"
+
+    // Warm up once, so that the interned names and the built ins are not
+    // counted as growth.
+    let w: u64 = run(&clean[0], CLEAN_LEN, &nm) catch 9
+    if w != 0 {
+        return 10 + w as i32
+    }
+    scrub(6)
+    gc_collect()
+    let base: u64 = gc_live_objects()
+
+    var round: u64 = 0
+    while round < 3 {
+        let e: u64 = run(&clean[0], CLEAN_LEN, &nm) catch 9
+        if e != 0 {
+            return 20 + e as i32
+        }
+        scrub(6)
+        gc_collect()
+        round = round + 1
+    }
+    let after: u64 = gc_live_objects()
+    // The tolerance covers the realm of the last run, which is still
+    // reachable from the frame of `run` at this point.
+    if after > base + 4000 {
+        return 3
+    }
+
+    // The counter check: holding on MUST show up.
+    let e2: u64 = run(&leak[0], LEAK_LEN, &nm) catch 9
+    if e2 != 0 {
+        return 30 + e2 as i32
+    }
+    let peak: u64 = gc_live_objects()
+    if peak <= after + 4000 {
+        // A leak that the measurement cannot see means the measurement is
+        // broken -- that is a failure, not a success.
+        return 4
+    }
+    scrub(6)
+    gc_collect()
+    let end: u64 = gc_live_objects()
+    if end > base + 4000 {
+        return 5
+    }
+    lex.names_free(&nm)
+    return 0
+}

@@ -1,0 +1,1375 @@
+// SPDX-License-Identifier: MIT
+// lib/std/json.fi -- JSON (RFC 8259), reader and writer (round 81).
+//
+// There is a JSON in this repository already: `lib/js/builtin.fi` has
+// `JSON.parse`/`JSON.stringify`, because a JavaScript engine has to have
+// them. That one produces JS VALUES -- garbage collected objects with
+// prototypes, property descriptors and a `this` -- and it needs the whole
+// engine (`lib/js/val.fi`, the collector, the interner) to exist before it
+// can read a single brace. For a Minecraft server that wants to read
+// `server.properties`' neighbour `whitelist.json`, or for a HTTP client
+// that gets an answer of forty octets, that is the wrong price. THIS file
+// depends on `rt`, `str` and `num` and on nothing else.
+//
+// ==================================================== WHAT THE STANDARD IS
+//
+// RFC 8259, and the interesting part of it is what it FORBIDS. A parser
+// that accepts everything is not a lenient parser, it is a broken one --
+// it accepts documents that the sender's parser would have rejected, and
+// then the two ends disagree about what was said. So:
+//
+//   * NUMBERS are `-? (0 | [1-9][0-9]*) ( . [0-9]+ )? ( [eE] [+-]? [0-9]+ )?`
+//     and nothing else. No `+1`, no `01`, no `.5`, no `5.`, no `0x10`, no
+//     `Infinity`, no `NaN`. Every one of those is in the test suite and
+//     every one of them has to be refused.
+//   * STRINGS are double quoted, and a raw control character below 0x20 in
+//     one is an ERROR, not a curiosity. The escapes are exactly
+//     `" \ / b f n r t` and `uXXXX`.
+//   * A DOCUMENT is one value; trailing anything (except whitespace) is an
+//     error. Whitespace is space, tab, CR and LF -- not a form feed, not a
+//     vertical tab, not a BOM.
+//
+// The proof is not this text: `tools/stdlib81/run.sh` runs the parser
+// against JSONTestSuite (Nicolas Seriot), the 318 files of which `y_*` must
+// be accepted and `n_*` must be refused, and reports the quota it really
+// reached. The files are IN THIS REPOSITORY (`testdata/json/`), so the
+// number does not depend on somebody's web server.
+//
+// ============================================================== THE SHAPE
+//
+// The document is a flat ARRAY OF NODES, not a tree of pointers: a node
+// holds the index of its first child and of its next sibling, and the
+// strings live in one blob. Three reasons, and the third is the one that
+// decides it:
+//
+//   * one allocation family for a whole document instead of one per value;
+//   * an index is 4 octets, a pointer 8, and a document of a million
+//     numbers is a real thing;
+//   * this language has no tagged unions across module boundaries yet, so a
+//     "JsonValue" enum with payloads would be a data structure round of its
+//     own (see `lib/std/nbt.fi`, which took the same decision for the same
+//     reason).
+//
+// A MEMBER OF AN OBJECT is not a node of its own. The value node carries
+// the key -- `koff`/`klen` next to `soff`/`slen`. That saves half the nodes
+// of every object and it is why `json_key` only means something for a child
+// of an object.
+//
+// ========================================================== WHAT IT COSTS
+//
+// J1 LOOKUP IN AN OBJECT IS LINEAR (`json_get`). For the objects JSON is
+//    used for -- a dozen members -- a scan beats a hash table, and for the
+//    ones it is not used for the caller can build a `map.BMap` over the
+//    children once and ask that. A hash table per object would cost an
+//    allocation per object.
+// J2 THE NESTING DEPTH IS LIMITED (`JSON_MAX_DEPTH`, 200). The parser
+//    recurses, a peer that sends 100,000 opening brackets would otherwise
+//    walk the process into its guard page, and the standard sets no limit
+//    at all -- so somebody has to. JSONTestSuite has exactly that file.
+// J3 A LONE SURROGATE (`"\uD800"` without its partner) is ACCEPTED and
+//    becomes U+FFFD. RFC 8259 8.2 calls such a text "not interoperable"
+//    and does not forbid it; JSONTestSuite files it under `i_`
+//    (implementation defined). What must not happen is producing invalid
+//    UTF-8 out of it, which is what a naive encoder does.
+// J4 NUMBERS THAT DO NOT FIT: an integer without a fraction and without an
+//    exponent that fits into an i64 is kept EXACTLY (`json_int`);
+//    everything else becomes the nearest f64 through `num.parse_f64`
+//    (correctly rounded, round 65). `1e400` therefore becomes +inf and is
+//    NOT an error -- the standard allows a parser to do that, and
+//    JSONTestSuite files those cases under `i_` as well.
+// J5 THE WRITER ESCAPES NON-ASCII AS \uXXXX when asked to (`ascii`), which
+//    is what `python3 -m json.tool` does by default -- that is how the two
+//    can be compared octet for octet.
+// J6 NO COMMENTS, NO TRAILING COMMAS, NO SINGLE QUOTES. That is not an
+//    omission, it is the standard.
+// J7 A DUPLICATE KEY IS KEPT, BOTH TIMES. RFC 8259 4 says the behaviour of
+//    a parser is "unpredictable" when the names in an object are not
+//    unique; most implementations keep the last. This one keeps what was
+//    sent, because throwing away part of a message is a decision the
+//    CALLER should take -- `json_get` finds the first. It is the only
+//    place where the output of this writer differs from
+//    `python3 -m json.tool` over the whole accepted part of
+//    JSONTestSuite (2 files out of 95, measured).
+// J8 INFINITY AND NAN ARE WRITTEN AS `null`. They cannot arise from a
+//    document that is inside the ranges of the format, only from one like
+//    `1e400` (J4). JSON has no notation for them; `null` is at least
+//    readable by every parser, whereas Python's `Infinity` is not JSON at
+//    all.
+import rt
+import str
+import num
+
+export {
+    JsonError, Json, JsonWriter,
+    json_new, json_free, json_parse, json_parse_span,
+    json_root, json_kind, json_count, json_child, json_child_at, json_next,
+    json_get, json_get_c, json_key, json_string, json_number, json_int,
+    json_is_int, json_bool, json_is_null, json_valid,
+    json_err_line, json_err_col, json_err_code, json_err_text,
+    json_write, json_write_pretty,
+    jw_new, jw_begin_object, jw_begin_array, jw_end, jw_key, jw_key_c,
+    jw_string, jw_string_c, jw_int, jw_number, jw_bool, jw_null, jw_ok,
+    jw_free,
+    JSON_NULL, JSON_FALSE, JSON_TRUE, JSON_NUMBER, JSON_STRING,
+    JSON_ARRAY, JSON_OBJECT, JSON_NONE, JSON_MAX_DEPTH,
+}
+
+error JsonError {
+    Syntax,
+    Depth,
+    OutOfMemory,
+}
+
+const JSON_NULL: u8 = 0
+const JSON_FALSE: u8 = 1
+const JSON_TRUE: u8 = 2
+const JSON_NUMBER: u8 = 3
+const JSON_STRING: u8 = 4
+const JSON_ARRAY: u8 = 5
+const JSON_OBJECT: u8 = 6
+
+const JSON_NONE: u32 = 4294967295
+const JSON_MAX_DEPTH: usize = 200
+
+// The error numbers `json_err_code` reports. They exist so that a caller
+// can react differently to "the document is truncated" than to "there is a
+// comma too many", without parsing a message.
+const E_NONE: usize = 0
+const E_EXPECT_VALUE: usize = 1
+const E_TRAILING: usize = 2
+const E_STRING: usize = 3
+const E_ESCAPE: usize = 4
+const E_NUMBER: usize = 5
+const E_DEPTH: usize = 6
+const E_MEMORY: usize = 7
+const E_EOF: usize = 8
+const E_COMMA: usize = 9
+const E_COLON: usize = 10
+const E_KEY: usize = 11
+const E_CONTROL: usize = 12
+const E_LITERAL: usize = 13
+
+struct Node {
+    kind: u8,
+    is_int: bool,
+    klen: u32,
+    slen: u32,
+    nchild: u32,
+    first: u32,
+    last: u32, // so that appending a child is O(1) instead of a walk
+    next: u32,
+    koff: u64,
+    soff: u64,
+    num: f64,
+    inum: i64,
+}
+
+struct Json {
+    nodes: u64, // Node[cap]
+    nsize: usize, // the size of ONE Node -- measured, see `node_size`
+    count: usize,
+    cap: usize,
+    blob: u64, // the decoded string octets
+    blob_len: usize,
+    blob_cap: usize,
+    root: u32,
+    // the parse state
+    src: u64,
+    n: usize,
+    at: usize,
+    line: usize,
+    col: usize,
+    err: usize,
+    err_line: usize,
+    err_col: usize,
+    depth: usize,
+}
+
+// LANGUAGE GAP (round 81, docs/ROUND81.md): `(*d).nsize` does not
+// compile inside a module that is IMPORTED -- the type resolution behind
+// `size_of` only knows the types of the ROOT file and answers
+// "unknown type 'Node'" for every other module. `lib/std/map.fi` gets away
+// with `size_of[K]()` because a generic parameter is substituted in the
+// CALLER's module. Until that is fixed the size is MEASURED: two nodes in
+// an array, the distance between them is the stride -- which is the truth
+// anyway, alignment included.
+fn empty_node() -> Node {
+    return Node { kind: 0 as u8, is_int: false, klen: 0 as u32,
+        slen: 0 as u32, nchild: 0 as u32, first: JSON_NONE, last: JSON_NONE,
+        next: JSON_NONE, koff: 0, soff: 0, num: 0.0, inum: 0 }
+}
+
+fn node_size() -> usize {
+    var probe: [Node; 2] = [empty_node(); 2]
+    return (((&probe[1]) as u64) - ((&probe[0]) as u64)) as usize
+}
+
+fn json_new() -> Json {
+    return Json { nodes: 0, nsize: node_size(), count: 0, cap: 0, blob: 0, blob_len: 0,
+        blob_cap: 0, root: JSON_NONE, src: 0, n: 0, at: 0, line: 1, col: 1,
+        err: E_NONE, err_line: 0, err_col: 0, depth: 0 }
+}
+
+fn json_free(d: *mut Json) {
+    if (*d).cap > 0 {
+        rt.heap_free((*d).nodes, (*d).cap * (*d).nsize)
+    }
+    if (*d).blob_cap > 0 {
+        rt.heap_free((*d).blob, (*d).blob_cap)
+    }
+    (*d).nodes = 0
+    (*d).cap = 0
+    (*d).count = 0
+    (*d).blob = 0
+    (*d).blob_cap = 0
+    (*d).blob_len = 0
+    (*d).root = JSON_NONE
+}
+
+fn node_at(d: *mut Json, i: u32) -> *mut Node {
+    return ((*d).nodes + (i as u64) * (*d).nsize as u64) as *mut Node
+}
+
+fn nodes_reserve(d: *mut Json) -> bool {
+    if (*d).count < (*d).cap {
+        return true
+    }
+    var want: usize = (*d).cap
+    if want == 0 {
+        want = 64
+    } else {
+        want = want * 2
+    }
+    let p: u64 = rt.heap_alloc(want * (*d).nsize)
+    if p == 0 {
+        return false
+    }
+    if (*d).count > 0 {
+        rt.mem_copy(p, (*d).nodes, (*d).count * (*d).nsize)
+    }
+    if (*d).cap > 0 {
+        rt.heap_free((*d).nodes, (*d).cap * (*d).nsize)
+    }
+    (*d).nodes = p
+    (*d).cap = want
+    return true
+}
+
+fn node_new(d: *mut Json, kind: u8) -> u32 {
+    if !nodes_reserve(d) {
+        (*d).err = E_MEMORY
+        return JSON_NONE
+    }
+    let i: u32 = (*d).count as u32
+    let nd: *mut Node = node_at(d, i)
+    (*nd).kind = kind
+    (*nd).is_int = false
+    (*nd).klen = 0
+    (*nd).slen = 0
+    (*nd).nchild = 0
+    (*nd).first = JSON_NONE
+    (*nd).last = JSON_NONE
+    (*nd).next = JSON_NONE
+    (*nd).koff = 0
+    (*nd).soff = 0
+    (*nd).num = 0.0
+    (*nd).inum = 0
+    (*d).count = (*d).count + 1
+    return i
+}
+
+fn blob_reserve(d: *mut Json, more: usize) -> bool {
+    let need: usize = (*d).blob_len + more
+    if need <= (*d).blob_cap {
+        return true
+    }
+    var want: usize = (*d).blob_cap
+    if want == 0 {
+        want = 256
+    }
+    while want < need {
+        want = want * 2
+    }
+    let p: u64 = rt.heap_alloc(want)
+    if p == 0 {
+        return false
+    }
+    if (*d).blob_len > 0 {
+        rt.mem_copy(p, (*d).blob, (*d).blob_len)
+    }
+    if (*d).blob_cap > 0 {
+        rt.heap_free((*d).blob, (*d).blob_cap)
+    }
+    (*d).blob = p
+    (*d).blob_cap = want
+    return true
+}
+
+fn blob_push(d: *mut Json, v: u8) -> bool {
+    if !blob_reserve(d, 1) {
+        return false
+    }
+    rt.st8((*d).blob, (*d).blob_len, v)
+    (*d).blob_len = (*d).blob_len + 1
+    return true
+}
+
+// ------------------------------------------------------------ the scanner
+
+fn peek(d: *mut Json) -> i32 {
+    if (*d).at >= (*d).n {
+        return -1
+    }
+    return rt.ld8((*d).src, (*d).at) as i32
+}
+
+fn advance(d: *mut Json) -> i32 {
+    if (*d).at >= (*d).n {
+        return -1
+    }
+    let c: u8 = rt.ld8((*d).src, (*d).at)
+    (*d).at = (*d).at + 1
+    if c == 10 as u8 {
+        (*d).line = (*d).line + 1
+        (*d).col = 1
+    } else {
+        (*d).col = (*d).col + 1
+    }
+    return c as i32
+}
+
+fn fail(d: *mut Json, code: usize) {
+    if (*d).err == E_NONE {
+        (*d).err = code
+        (*d).err_line = (*d).line
+        (*d).err_col = (*d).col
+    }
+}
+
+// RFC 8259 2: exactly these four are whitespace.
+fn skip_ws(d: *mut Json) {
+    while true {
+        let c: i32 = peek(d)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            advance(d)
+        } else {
+            return
+        }
+    }
+}
+
+fn hex4(d: *mut Json, out: *mut u32) -> bool {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        let c: i32 = advance(d)
+        if c < 0 {
+            return false
+        }
+        var x: i32 = -1
+        if c >= 48 && c <= 57 {
+            x = c - 48
+        } else if c >= 97 && c <= 102 {
+            x = c - 87
+        } else if c >= 65 && c <= 70 {
+            x = c - 55
+        } else {
+            return false
+        }
+        v = (v << 4) | (x as u32)
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+// A code point as UTF-8 into the blob. A surrogate that got here alone (J3)
+// is replaced -- writing it out raw would produce octets that are not UTF-8,
+// and a caller who hands those to a socket has a bug that shows up three
+// systems away.
+fn blob_push_cp(d: *mut Json, cp0: u32) -> bool {
+    var cp: u32 = cp0
+    if cp >= 55296 as u32 && cp <= 57343 as u32 {
+        cp = 65533 as u32
+    }
+    if cp < 128 as u32 {
+        return blob_push(d, cp as u8)
+    }
+    if cp < 2048 as u32 {
+        if !blob_push(d, (192 as u32 | (cp >> 6)) as u8) {
+            return false
+        }
+        return blob_push(d, (128 as u32 | (cp & 63 as u32)) as u8)
+    }
+    if cp < 65536 as u32 {
+        if !blob_push(d, (224 as u32 | (cp >> 12)) as u8) {
+            return false
+        }
+        if !blob_push(d, (128 as u32 | ((cp >> 6) & 63 as u32)) as u8) {
+            return false
+        }
+        return blob_push(d, (128 as u32 | (cp & 63 as u32)) as u8)
+    }
+    if !blob_push(d, (240 as u32 | (cp >> 18)) as u8) {
+        return false
+    }
+    if !blob_push(d, (128 as u32 | ((cp >> 12) & 63 as u32)) as u8) {
+        return false
+    }
+    if !blob_push(d, (128 as u32 | ((cp >> 6) & 63 as u32)) as u8) {
+        return false
+    }
+    return blob_push(d, (128 as u32 | (cp & 63 as u32)) as u8)
+}
+
+// Reads a string, decodes it into the blob and reports where it landed.
+// The opening quote has already been consumed.
+fn parse_string_raw(d: *mut Json, off: *mut u64, len: *mut u32) -> bool {
+    let start: usize = (*d).blob_len
+    while true {
+        let c: i32 = advance(d)
+        if c < 0 {
+            fail(d, E_STRING)
+            return false
+        }
+        if c == 34 { // "
+            *off = start as u64
+            *len = ((*d).blob_len - start) as u32
+            return true
+        }
+        if c == 92 { // backslash
+            let e: i32 = advance(d)
+            if e < 0 {
+                fail(d, E_ESCAPE)
+                return false
+            }
+            var ok: bool = true
+            if e == 34 {
+                ok = blob_push(d, 34 as u8)
+            } else if e == 92 {
+                ok = blob_push(d, 92 as u8)
+            } else if e == 47 {
+                ok = blob_push(d, 47 as u8)
+            } else if e == 98 {
+                ok = blob_push(d, 8 as u8)
+            } else if e == 102 {
+                ok = blob_push(d, 12 as u8)
+            } else if e == 110 {
+                ok = blob_push(d, 10 as u8)
+            } else if e == 114 {
+                ok = blob_push(d, 13 as u8)
+            } else if e == 116 {
+                ok = blob_push(d, 9 as u8)
+            } else if e == 117 {
+                var u: u32 = 0
+                if !hex4(d, &u) {
+                    fail(d, E_ESCAPE)
+                    return false
+                }
+                // A high surrogate may be followed by its partner -- and
+                // only then do the two become ONE code point.
+                if u >= 55296 as u32 && u <= 56319 as u32 {
+                    if peek(d) == 92 && (*d).at + 1 < (*d).n
+                    && rt.ld8((*d).src, (*d).at + 1) == 117 as u8 {
+                        let save: usize = (*d).at
+                        let sl: usize = (*d).line
+                        let sc: usize = (*d).col
+                        advance(d)
+                        advance(d)
+                        var lo: u32 = 0
+                        if !hex4(d, &lo) {
+                            fail(d, E_ESCAPE)
+                            return false
+                        }
+                        if lo >= 56320 as u32 && lo <= 57343 as u32 {
+                            u = 65536 as u32 + ((u - 55296 as u32) << 10)
+                            +(lo - 56320 as u32)
+                        } else {
+                            // not a partner -- both stay alone (J3)
+                            (*d).at = save
+                            (*d).line = sl
+                            (*d).col = sc
+                        }
+                    }
+                }
+                ok = blob_push_cp(d, u)
+            } else {
+                fail(d, E_ESCAPE)
+                return false
+            }
+            if !ok {
+                fail(d, E_MEMORY)
+                return false
+            }
+        } else if c < 32 {
+            // A raw control character in a string is an error (RFC 8259 7).
+            fail(d, E_CONTROL)
+            return false
+        } else {
+            if !blob_push(d, c as u8) {
+                fail(d, E_MEMORY)
+                return false
+            }
+        }
+    }
+    return false
+}
+
+// The number grammar, walked by hand. `num.parse_f64` would accept `+1`,
+// `.5`, `nan` and hexadecimal -- correct for a programming language, wrong
+// for JSON. So the SHAPE is checked here and only the value is handed over.
+fn parse_number(d: *mut Json, into: u32) -> bool {
+    let start: usize = (*d).at
+    var is_int: bool = true
+    if peek(d) == 45 {
+        advance(d)
+    }
+    let c0: i32 = peek(d)
+    if c0 == 48 {
+        advance(d)
+        // a leading zero must not be followed by a digit
+        let c: i32 = peek(d)
+        if c >= 48 && c <= 57 {
+            fail(d, E_NUMBER)
+            return false
+        }
+    } else if c0 >= 49 && c0 <= 57 {
+        while true {
+            let c: i32 = peek(d)
+            if c >= 48 && c <= 57 {
+                advance(d)
+            } else {
+                break
+            }
+        }
+    } else {
+        fail(d, E_NUMBER)
+        return false
+    }
+    if peek(d) == 46 {
+        is_int = false
+        advance(d)
+        var digits: usize = 0
+        while true {
+            let c: i32 = peek(d)
+            if c >= 48 && c <= 57 {
+                advance(d)
+                digits = digits + 1
+            } else {
+                break
+            }
+        }
+        if digits == 0 {
+            fail(d, E_NUMBER)
+            return false
+        }
+    }
+    let e: i32 = peek(d)
+    if e == 101 || e == 69 {
+        is_int = false
+        advance(d)
+        let s: i32 = peek(d)
+        if s == 43 || s == 45 {
+            advance(d)
+        }
+        var digits: usize = 0
+        while true {
+            let c: i32 = peek(d)
+            if c >= 48 && c <= 57 {
+                advance(d)
+                digits = digits + 1
+            } else {
+                break
+            }
+        }
+        if digits == 0 {
+            fail(d, E_NUMBER)
+            return false
+        }
+    }
+    let text: str.Span = str.span(((*d).src + start as u64) as *mut u8,
+        (*d).at - start)
+    let nd: *mut Node = node_at(d, into)
+    if is_int {
+        // Exactly, as long as it fits. `num.parse_i64` says itself whether
+        // it did.
+        let r: num.ParsedI64 = num.parse_i64(text)
+        if r.ok {
+            (*nd).is_int = true
+            (*nd).inum = r.value
+            (*nd).num = r.value as f64
+            return true
+        }
+    }
+    let f: num.ParsedF64 = num.parse_f64(text)
+    if !f.ok {
+        fail(d, E_NUMBER)
+        return false
+    }
+    (*nd).is_int = false
+    (*nd).num = f.value
+    (*nd).inum = 0
+    return true
+}
+
+fn literal_is(d: *mut Json, lit: u64, n: usize) -> bool {
+    if (*d).at + n > (*d).n {
+        return false
+    }
+    if !rt.mem_eq((*d).src + (*d).at as u64, lit, n) {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        advance(d)
+        i = i + 1
+    }
+    return true
+}
+
+fn append_child(d: *mut Json, parent: u32, child: u32) {
+    let p: *mut Node = node_at(d, parent)
+    if (*p).first == JSON_NONE {
+        (*p).first = child
+    } else {
+        let l: *mut Node = node_at(d, (*p).last)
+        (*l).next = child
+    }
+    (*p).last = child
+    (*p).nchild = (*p).nchild + 1 as u32
+}
+
+fn parse_value(d: *mut Json) -> u32 {
+    if (*d).err != E_NONE {
+        return JSON_NONE
+    }
+    (*d).depth = (*d).depth + 1
+    if (*d).depth > JSON_MAX_DEPTH {
+        fail(d, E_DEPTH)
+        (*d).depth = (*d).depth - 1
+        return JSON_NONE
+    }
+    skip_ws(d)
+    let c: i32 = peek(d)
+    var out: u32 = JSON_NONE
+
+    if c < 0 {
+        fail(d, E_EOF)
+    } else if c == 123 { // {
+        advance(d)
+        out = node_new(d, JSON_OBJECT)
+        if out == JSON_NONE {
+            (*d).depth = (*d).depth - 1
+            return JSON_NONE
+        }
+        skip_ws(d)
+        if peek(d) == 125 {
+            advance(d)
+        } else {
+            while true {
+                skip_ws(d)
+                if peek(d) != 34 {
+                    fail(d, E_KEY)
+                    break
+                }
+                advance(d)
+                var koff: u64 = 0
+                var klen: u32 = 0
+                if !parse_string_raw(d, &koff, &klen) {
+                    break
+                }
+                skip_ws(d)
+                if peek(d) != 58 {
+                    fail(d, E_COLON)
+                    break
+                }
+                advance(d)
+                let v: u32 = parse_value(d)
+                if v == JSON_NONE {
+                    break
+                }
+                let vn: *mut Node = node_at(d, v)
+                (*vn).koff = koff
+                (*vn).klen = klen
+                append_child(d, out, v)
+                skip_ws(d)
+                let sep: i32 = peek(d)
+                if sep == 44 {
+                    advance(d)
+                } else if sep == 125 {
+                    advance(d)
+                    break
+                } else {
+                    fail(d, E_COMMA)
+                    break
+                }
+            }
+        }
+    } else if c == 91 { // [
+        advance(d)
+        out = node_new(d, JSON_ARRAY)
+        if out == JSON_NONE {
+            (*d).depth = (*d).depth - 1
+            return JSON_NONE
+        }
+        skip_ws(d)
+        if peek(d) == 93 {
+            advance(d)
+        } else {
+            while true {
+                let v: u32 = parse_value(d)
+                if v == JSON_NONE {
+                    break
+                }
+                append_child(d, out, v)
+                skip_ws(d)
+                let sep: i32 = peek(d)
+                if sep == 44 {
+                    advance(d)
+                } else if sep == 93 {
+                    advance(d)
+                    break
+                } else {
+                    fail(d, E_COMMA)
+                    break
+                }
+            }
+        }
+    } else if c == 34 { // "
+        advance(d)
+        out = node_new(d, JSON_STRING)
+        if out != JSON_NONE {
+            var soff: u64 = 0
+            var slen: u32 = 0
+            if parse_string_raw(d, &soff, &slen) {
+                let nd: *mut Node = node_at(d, out)
+                (*nd).soff = soff
+                (*nd).slen = slen
+            }
+        }
+    } else if c == 116 { // true
+        var lit: [u8; 5] = "true\0"
+        if literal_is(d, (&lit[0]) as u64, 4) {
+            out = node_new(d, JSON_TRUE)
+        } else {
+            fail(d, E_LITERAL)
+        }
+    } else if c == 102 { // false
+        var lit: [u8; 6] = "false\0"
+        if literal_is(d, (&lit[0]) as u64, 5) {
+            out = node_new(d, JSON_FALSE)
+        } else {
+            fail(d, E_LITERAL)
+        }
+    } else if c == 110 { // null
+        var lit: [u8; 5] = "null\0"
+        if literal_is(d, (&lit[0]) as u64, 4) {
+            out = node_new(d, JSON_NULL)
+        } else {
+            fail(d, E_LITERAL)
+        }
+    } else if c == 45 || (c >= 48 && c <= 57) {
+        out = node_new(d, JSON_NUMBER)
+        if out != JSON_NONE {
+            if !parse_number(d, out) {
+                out = JSON_NONE
+            }
+        }
+    } else {
+        fail(d, E_EXPECT_VALUE)
+    }
+
+    (*d).depth = (*d).depth - 1
+    if (*d).err != E_NONE {
+        return JSON_NONE
+    }
+    return out
+}
+
+fn json_parse(d: *mut Json, p: u64, n: usize) -> JsonError!bool {
+    (*d).src = p
+    (*d).n = n
+    (*d).at = 0
+    (*d).line = 1
+    (*d).col = 1
+    (*d).err = E_NONE
+    (*d).depth = 0
+    (*d).root = JSON_NONE
+    (*d).count = 0
+    (*d).blob_len = 0
+
+    let r: u32 = parse_value(d)
+    if (*d).err == E_NONE {
+        skip_ws(d)
+        if (*d).at != n {
+            fail(d, E_TRAILING)
+        }
+    }
+    if (*d).err != E_NONE {
+        if (*d).err == E_MEMORY {
+            return JsonError::OutOfMemory
+        }
+        if (*d).err == E_DEPTH {
+            return JsonError::Depth
+        }
+        return JsonError::Syntax
+    }
+    (*d).root = r
+    return true
+}
+
+fn json_parse_span(d: *mut Json, s: str.Span) -> JsonError!bool {
+    return json_parse(d, s.p as u64, s.n)
+}
+
+// ------------------------------------------------------------- inspection
+
+fn json_valid(d: *mut Json) -> bool { return (*d).err == E_NONE && (*d).root != JSON_NONE }
+fn json_root(d: *mut Json) -> u32 { return (*d).root }
+fn json_err_line(d: *mut Json) -> usize { return (*d).err_line }
+fn json_err_col(d: *mut Json) -> usize { return (*d).err_col }
+fn json_err_code(d: *mut Json) -> usize { return (*d).err }
+
+// The message belonging to the code, as a span into a literal the caller
+// may print. Short on purpose -- line and column carry the information.
+fn json_err_text(d: *mut Json, out: *mut rt.Buf) {
+    var m1: [u8; 21] = "a value was expected\0"
+    var m2: [u8; 28] = "something follows the value\0"
+    var m3: [u8; 24] = "the string does not end\0"
+    var m4: [u8; 13] = "a bad escape\0"
+    var m5: [u8; 13] = "a bad number\0"
+    var m6: [u8; 18] = "nested too deeply\0"
+    var m7: [u8; 14] = "out of memory\0"
+    var m8: [u8; 25] = "the input ends too early\0"
+    var m9: [u8; 21] = "a comma or a bracket\0"
+    var m10: [u8; 8] = "a colon\0"
+    var m11: [u8; 23] = "a key in double quotes\0"
+    var m12: [u8; 32] = "a control character in a string\0"
+    var m13: [u8; 29] = "true, false or null expected\0"
+    var m0: [u8; 9] = "no error\0"
+    let e: usize = (*d).err
+    var p: u64 = (&m0[0]) as u64
+    if e == E_EXPECT_VALUE { p = (&m1[0]) as u64 }
+    else if e == E_TRAILING { p = (&m2[0]) as u64 }
+    else if e == E_STRING { p = (&m3[0]) as u64 }
+    else if e == E_ESCAPE { p = (&m4[0]) as u64 }
+    else if e == E_NUMBER { p = (&m5[0]) as u64 }
+    else if e == E_DEPTH { p = (&m6[0]) as u64 }
+    else if e == E_MEMORY { p = (&m7[0]) as u64 }
+    else if e == E_EOF { p = (&m8[0]) as u64 }
+    else if e == E_COMMA { p = (&m9[0]) as u64 }
+    else if e == E_COLON { p = (&m10[0]) as u64 }
+    else if e == E_KEY { p = (&m11[0]) as u64 }
+    else if e == E_CONTROL { p = (&m12[0]) as u64 }
+    else if e == E_LITERAL { p = (&m13[0]) as u64 }
+    rt.buf_push_bytes(out, p, rt.c_length(p))
+}
+
+fn json_kind(d: *mut Json, i: u32) -> u8 {
+    if i >= (*d).count as u32 {
+        return JSON_NULL
+    }
+    return (*node_at(d, i)).kind
+}
+
+fn json_count(d: *mut Json, i: u32) -> usize {
+    if i >= (*d).count as u32 {
+        return 0
+    }
+    return (*node_at(d, i)).nchild as usize
+}
+
+fn json_child(d: *mut Json, i: u32) -> u32 {
+    if i >= (*d).count as u32 {
+        return JSON_NONE
+    }
+    return (*node_at(d, i)).first
+}
+
+fn json_next(d: *mut Json, i: u32) -> u32 {
+    if i >= (*d).count as u32 {
+        return JSON_NONE
+    }
+    return (*node_at(d, i)).next
+}
+
+fn json_child_at(d: *mut Json, i: u32, k: usize) -> u32 {
+    var c: u32 = json_child(d, i)
+    var at: usize = 0
+    while c != JSON_NONE && at < k {
+        c = json_next(d, c)
+        at = at + 1
+    }
+    return c
+}
+
+// J1: linear.
+fn json_get(d: *mut Json, obj: u32, key: u64, klen: usize) -> u32 {
+    var c: u32 = json_child(d, obj)
+    while c != JSON_NONE {
+        let nd: *mut Node = node_at(d, c)
+        if (*nd).klen as usize == klen
+        && rt.mem_eq((*d).blob + (*nd).koff, key, klen) {
+            return c
+        }
+        c = json_next(d, c)
+    }
+    return JSON_NONE
+}
+
+fn json_get_c(d: *mut Json, obj: u32, key: u64) -> u32 {
+    return json_get(d, obj, key, rt.c_length(key))
+}
+
+fn json_key(d: *mut Json, i: u32) -> str.Span {
+    if i >= (*d).count as u32 {
+        return str.span_empty()
+    }
+    let nd: *mut Node = node_at(d, i)
+    return str.span(((*d).blob + (*nd).koff) as *mut u8, (*nd).klen as usize)
+}
+
+fn json_string(d: *mut Json, i: u32) -> str.Span {
+    if i >= (*d).count as u32 {
+        return str.span_empty()
+    }
+    let nd: *mut Node = node_at(d, i)
+    if (*nd).kind != JSON_STRING {
+        return str.span_empty()
+    }
+    return str.span(((*d).blob + (*nd).soff) as *mut u8, (*nd).slen as usize)
+}
+
+fn json_number(d: *mut Json, i: u32) -> f64 {
+    if i >= (*d).count as u32 {
+        return 0.0
+    }
+    return (*node_at(d, i)).num
+}
+
+fn json_int(d: *mut Json, i: u32) -> i64 {
+    if i >= (*d).count as u32 {
+        return 0
+    }
+    let nd: *mut Node = node_at(d, i)
+    if (*nd).is_int {
+        return (*nd).inum
+    }
+    return (*nd).num as i64
+}
+
+fn json_is_int(d: *mut Json, i: u32) -> bool {
+    if i >= (*d).count as u32 {
+        return false
+    }
+    return (*node_at(d, i)).is_int
+}
+
+fn json_bool(d: *mut Json, i: u32) -> bool {
+    return json_kind(d, i) == JSON_TRUE
+}
+
+fn json_is_null(d: *mut Json, i: u32) -> bool {
+    return json_kind(d, i) == JSON_NULL
+}
+
+// ================================================================ WRITING
+
+// The escaping. `ascii` decides whether everything above 127 is turned into
+// \uXXXX (J5) or handed through as UTF-8.
+fn write_escaped(out: *mut rt.Buf, p: u64, n: usize, ascii: bool) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 34 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 34 as u8)
+            i = i + 1
+        } else if c == 92 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 92 as u8)
+            i = i + 1
+        } else if c == 8 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 98 as u8)
+            i = i + 1
+        } else if c == 12 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 102 as u8)
+            i = i + 1
+        } else if c == 10 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 110 as u8)
+            i = i + 1
+        } else if c == 13 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 114 as u8)
+            i = i + 1
+        } else if c == 9 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 116 as u8)
+            i = i + 1
+        } else if c < 32 as u8 {
+            write_u_escape(out, c as u32)
+            i = i + 1
+        } else if c == 127 as u8 && ascii {
+            // DEL. The standard does not demand it (only below 0x20 must be
+            // escaped); `python3 -m json.tool` escapes it, and an invisible
+            // octet in a text file is a nuisance either way.
+            write_u_escape(out, 127 as u32)
+            i = i + 1
+        } else if c < 128 as u8 || !ascii {
+            rt.buf_push(out, c)
+            i = i + 1
+        } else {
+            // Decode the UTF-8 sequence and write it as \uXXXX -- with a
+            // surrogate pair above the BMP, which is what JSON has instead
+            // of a 21 bit escape.
+            var cp: u32 = 0
+            var take: usize = 1
+            if (c & 224 as u8) == 192 as u8 && i + 1 < n {
+                cp = ((c & 31 as u8) as u32) << 6
+                cp = cp | ((rt.ld8(p, i + 1) & 63 as u8) as u32)
+                take = 2
+            } else if (c & 240 as u8) == 224 as u8 && i + 2 < n {
+                cp = ((c & 15 as u8) as u32) << 12
+                cp = cp | (((rt.ld8(p, i + 1) & 63 as u8) as u32) << 6)
+                cp = cp | ((rt.ld8(p, i + 2) & 63 as u8) as u32)
+                take = 3
+            } else if (c & 248 as u8) == 240 as u8 && i + 3 < n {
+                cp = ((c & 7 as u8) as u32) << 18
+                cp = cp | (((rt.ld8(p, i + 1) & 63 as u8) as u32) << 12)
+                cp = cp | (((rt.ld8(p, i + 2) & 63 as u8) as u32) << 6)
+                cp = cp | ((rt.ld8(p, i + 3) & 63 as u8) as u32)
+                take = 4
+            } else {
+                cp = 65533 as u32
+                take = 1
+            }
+            if cp >= 65536 as u32 {
+                let v: u32 = cp - 65536 as u32
+                write_u_escape(out, 55296 as u32 + (v >> 10))
+                write_u_escape(out, 56320 as u32 + (v & 1023 as u32))
+            } else {
+                write_u_escape(out, cp)
+            }
+            i = i + take
+        }
+    }
+}
+
+fn write_u_escape(out: *mut rt.Buf, cp: u32) {
+    var hex: [u8; 17] = "0123456789abcdef\0"
+    rt.buf_push(out, 92 as u8)
+    rt.buf_push(out, 117 as u8)
+    rt.buf_push(out, hex[((cp >> 12) & 15 as u32) as usize])
+    rt.buf_push(out, hex[((cp >> 8) & 15 as u32) as usize])
+    rt.buf_push(out, hex[((cp >> 4) & 15 as u32) as usize])
+    rt.buf_push(out, hex[(cp & 15 as u32) as usize])
+}
+
+fn write_number(out: *mut rt.Buf, d: *mut Json, i: u32, sc: *mut num.Bytes) {
+    let nd: *mut Node = node_at(d, i)
+    if (*nd).is_int {
+        rt.buf_push_dec_i64(out, (*nd).inum)
+        return
+    }
+    // Not finite: JSON has no Infinity and no NaN (RFC 8259 6). `null` is
+    // the only thing that can be written that every parser reads back.
+    // `python3 -m json.tool` writes `Infinity` here, which is not JSON --
+    // that difference is in the report.
+    if num.f64_is_nan((*nd).num) || num.f64_is_infinite((*nd).num) {
+        var nl: [u8; 5] = "null\0"
+        rt.buf_push_bytes(out, (&nl[0]) as u64, 4)
+        return
+    }
+    // The shortest text that reads back as the same double (round 65).
+    // The scratch buffer is HANDED IN: `num.bytes_new()` per number means
+    // an `mmap` per number, and that turned a document of 20,000 floats
+    // from 0.1 s into 1.4 s -- measured, which is why it is a parameter.
+    var b: num.Bytes = *sc
+    num.bytes_clear(&b)
+    if num.write_f64(&b, (*nd).num) {
+        let at: usize = (*out).len
+        rt.buf_push_bytes(out, rt.addr_of(b.ptr), b.len)
+        // A FLOAT STAYS A FLOAT. `20e1` is 200.0, and the shortest text for
+        // it is `200` -- which reads back as an INTEGER in every language
+        // that tells the two apart. So a `.0` goes on when nothing in the
+        // text says "not an integer". That is what Python does, and it is
+        // why the comparison against `json.tool` is octet for octet.
+        var has_mark: bool = false
+        var i: usize = at
+        while i < (*out).len {
+            let c: u8 = rt.ld8((*out).ptr, i)
+            if c == 46 as u8 || c == 101 as u8 || c == 69 as u8 {
+                has_mark = true
+            }
+            i = i + 1
+        }
+        if !has_mark {
+            rt.buf_push(out, 46 as u8)
+            rt.buf_push(out, 48 as u8)
+        }
+    }
+    *sc = b
+}
+
+fn write_indent(out: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(out, 32 as u8)
+        i = i + 1
+    }
+}
+
+// `indent` 0 = compact (no blanks at all), otherwise that many blanks per
+// level -- with `indent` 4 and `ascii` true the output is what
+// `python3 -m json.tool` writes, which is how the two get compared.
+fn write_node(d: *mut Json, i: u32, out: *mut rt.Buf, indent: usize,
+    level: usize, ascii: bool, sc: *mut num.Bytes) {
+    let k: u8 = json_kind(d, i)
+    if k == JSON_NULL {
+        var s: [u8; 5] = "null\0"
+        rt.buf_push_bytes(out, (&s[0]) as u64, 4)
+    } else if k == JSON_TRUE {
+        var s: [u8; 5] = "true\0"
+        rt.buf_push_bytes(out, (&s[0]) as u64, 4)
+    } else if k == JSON_FALSE {
+        var s: [u8; 6] = "false\0"
+        rt.buf_push_bytes(out, (&s[0]) as u64, 5)
+    } else if k == JSON_NUMBER {
+        write_number(out, d, i, sc)
+    } else if k == JSON_STRING {
+        let s: str.Span = json_string(d, i)
+        rt.buf_push(out, 34 as u8)
+        write_escaped(out, s.p as u64, s.n, ascii)
+        rt.buf_push(out, 34 as u8)
+    } else if k == JSON_ARRAY {
+        if json_count(d, i) == 0 {
+            rt.buf_push(out, 91 as u8)
+            rt.buf_push(out, 93 as u8)
+            return
+        }
+        rt.buf_push(out, 91 as u8)
+        var c: u32 = json_child(d, i)
+        var first: bool = true
+        while c != JSON_NONE {
+            if !first {
+                rt.buf_push(out, 44 as u8)
+                if indent == 0 {
+                    // nothing
+                }
+            }
+            if indent > 0 {
+                rt.buf_push(out, 10 as u8)
+                write_indent(out, (level + 1) * indent)
+            }
+            write_node(d, c, out, indent, level + 1, ascii, sc)
+            first = false
+            c = json_next(d, c)
+        }
+        if indent > 0 {
+            rt.buf_push(out, 10 as u8)
+            write_indent(out, level * indent)
+        }
+        rt.buf_push(out, 93 as u8)
+    } else {
+        if json_count(d, i) == 0 {
+            rt.buf_push(out, 123 as u8)
+            rt.buf_push(out, 125 as u8)
+            return
+        }
+        rt.buf_push(out, 123 as u8)
+        var c: u32 = json_child(d, i)
+        var first: bool = true
+        while c != JSON_NONE {
+            if !first {
+                rt.buf_push(out, 44 as u8)
+            }
+            if indent > 0 {
+                rt.buf_push(out, 10 as u8)
+                write_indent(out, (level + 1) * indent)
+            }
+            let key: str.Span = json_key(d, c)
+            rt.buf_push(out, 34 as u8)
+            write_escaped(out, key.p as u64, key.n, ascii)
+            rt.buf_push(out, 34 as u8)
+            rt.buf_push(out, 58 as u8)
+            if indent > 0 {
+                rt.buf_push(out, 32 as u8)
+            }
+            write_node(d, c, out, indent, level + 1, ascii, sc)
+            first = false
+            c = json_next(d, c)
+        }
+        if indent > 0 {
+            rt.buf_push(out, 10 as u8)
+            write_indent(out, level * indent)
+        }
+        rt.buf_push(out, 125 as u8)
+    }
+}
+
+// Compact: no blank anywhere that is not inside a string.
+fn json_write(d: *mut Json, i: u32, out: *mut rt.Buf, ascii: bool) {
+    var sc: num.Bytes = num.bytes_new()
+    write_node(d, i, out, 0, 0, ascii, &sc)
+    num.bytes_free(&sc)
+}
+
+fn json_write_pretty(d: *mut Json, i: u32, out: *mut rt.Buf, indent: usize,
+    ascii: bool) {
+    var sc: num.Bytes = num.bytes_new()
+    write_node(d, i, out, indent, 0, ascii, &sc)
+    num.bytes_free(&sc)
+}
+
+// ================================================== WRITING WITHOUT A DOCUMENT
+//
+// The other direction of the file: producing JSON without building a tree
+// first. That is what a server answering a request wants -- one pass, one
+// buffer, no allocation per value.
+//
+// The writer counts the commas so the caller does not have to; the depth is
+// limited to 64 because the state is a bit per level in a fixed array, and
+// 64 levels of nesting in generated JSON is already a design mistake.
+
+struct JsonWriter {
+    out: u64, // *mut rt.Buf
+    depth: usize,
+    // per level: 0 = nothing written yet, 1 = a value has been written
+    filled: [u8; 64],
+    // per level: 0 = array, 1 = object
+    isobj: [u8; 64],
+    ascii: bool,
+    bad: bool,
+    sc: num.Bytes, // the scratch buffer for numbers, see `write_number`
+}
+
+fn jw_new(out: *mut rt.Buf, ascii: bool) -> JsonWriter {
+    return JsonWriter { out: out as u64, depth: 0, filled: [0; 64],
+        isobj: [0; 64], ascii: ascii, bad: false, sc: num.bytes_new() }
+}
+
+fn jw_ok(w: *mut JsonWriter) -> bool {
+    return !(*w).bad
+}
+
+fn jw_buf(w: *mut JsonWriter) -> *mut rt.Buf {
+    return (*w).out as *mut rt.Buf
+}
+
+// A comma if something is already there. Called before every value and
+// before every key.
+fn jw_sep(w: *mut JsonWriter) {
+    if (*w).depth == 0 {
+        return
+    }
+    if (*w).filled[(*w).depth - 1] == 1 as u8 {
+        rt.buf_push(jw_buf(w), 44 as u8)
+    }
+    (*w).filled[(*w).depth - 1] = 1 as u8
+}
+
+fn jw_push_level(w: *mut JsonWriter, obj: bool) {
+    if (*w).depth >= 64 {
+        (*w).bad = true
+        return
+    }
+    (*w).filled[(*w).depth] = 0 as u8
+    if obj {
+        (*w).isobj[(*w).depth] = 1 as u8
+    } else {
+        (*w).isobj[(*w).depth] = 0 as u8
+    }
+    (*w).depth = (*w).depth + 1
+}
+
+fn jw_begin_object(w: *mut JsonWriter) {
+    jw_sep(w)
+    rt.buf_push(jw_buf(w), 123 as u8)
+    jw_push_level(w, true)
+}
+
+fn jw_begin_array(w: *mut JsonWriter) {
+    jw_sep(w)
+    rt.buf_push(jw_buf(w), 91 as u8)
+    jw_push_level(w, false)
+}
+
+fn jw_end(w: *mut JsonWriter) {
+    if (*w).depth == 0 {
+        (*w).bad = true
+        return
+    }
+    (*w).depth = (*w).depth - 1
+    if (*w).isobj[(*w).depth] == 1 as u8 {
+        rt.buf_push(jw_buf(w), 125 as u8)
+    } else {
+        rt.buf_push(jw_buf(w), 93 as u8)
+    }
+}
+
+fn jw_key(w: *mut JsonWriter, p: u64, n: usize) {
+    jw_sep(w)
+    rt.buf_push(jw_buf(w), 34 as u8)
+    write_escaped(jw_buf(w), p, n, (*w).ascii)
+    rt.buf_push(jw_buf(w), 34 as u8)
+    rt.buf_push(jw_buf(w), 58 as u8)
+    // The value that follows must NOT get a comma in front of it.
+    if (*w).depth > 0 {
+        (*w).filled[(*w).depth - 1] = 0 as u8
+    }
+}
+
+fn jw_key_c(w: *mut JsonWriter, p: u64) {
+    jw_key(w, p, rt.c_length(p))
+}
+
+fn jw_string(w: *mut JsonWriter, p: u64, n: usize) {
+    jw_sep(w)
+    rt.buf_push(jw_buf(w), 34 as u8)
+    write_escaped(jw_buf(w), p, n, (*w).ascii)
+    rt.buf_push(jw_buf(w), 34 as u8)
+}
+
+fn jw_string_c(w: *mut JsonWriter, p: u64) {
+    jw_string(w, p, rt.c_length(p))
+}
+
+fn jw_int(w: *mut JsonWriter, v: i64) {
+    jw_sep(w)
+    rt.buf_push_dec_i64(jw_buf(w), v)
+}
+
+fn jw_number(w: *mut JsonWriter, v: f64) {
+    jw_sep(w)
+    num.bytes_clear(&(*w).sc)
+    if num.write_f64(&(*w).sc, v) {
+        rt.buf_push_bytes(jw_buf(w), rt.addr_of((*w).sc.ptr), (*w).sc.len)
+    }
+}
+
+// Firn has no destructors -- the scratch buffer of the writer has to be
+// given back by hand, exactly like `rt.buf_free`.
+fn jw_free(w: *mut JsonWriter) {
+    num.bytes_free(&(*w).sc)
+    (*w).bad = false
+}
+
+fn jw_bool(w: *mut JsonWriter, v: bool) {
+    jw_sep(w)
+    var t: [u8; 5] = "true\0"
+    var f: [u8; 6] = "false\0"
+    if v {
+        rt.buf_push_bytes(jw_buf(w), (&t[0]) as u64, 4)
+    } else {
+        rt.buf_push_bytes(jw_buf(w), (&f[0]) as u64, 5)
+    }
+}
+
+fn jw_null(w: *mut JsonWriter) {
+    jw_sep(w)
+    var s: [u8; 5] = "null\0"
+    rt.buf_push_bytes(jw_buf(w), (&s[0]) as u64, 4)
+}

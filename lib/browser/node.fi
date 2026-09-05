@@ -1,0 +1,814 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/node.fi -- the DOM CORE (round 54), in Firn.
+//
+// The data structure everything from here on builds upon: the tree
+// construction (lib/browser/tree.fi), and later CSS matching and layout. It
+// is deliberately a REAL DOM shape and no shortcut for the parser:
+//
+//   * every node knows its parent, its first/last child and both siblings.
+//     All references are STRONG -- so the tree is full of cycles, and that
+//     is exactly what the tracing collector is there for (SPEC 3.5).
+//     A reference count would NEVER release anything here.
+//   * names (element and attribute names) are ATOMS: a `u32` id into a
+//     table (lib/browser/names.fi). A comparison is an integer comparison,
+//     not a character comparison -- that is the precondition for the tree
+//     construction being able to afford its many questions about names.
+//   * text data are CHAINS of GC pieces (`Chain`/`Strand`). With that, EVERY
+//     byte of the document lives in the GC heap; there is no arena hanging
+//     on the lifetime of the document. If a JS reference later holds a
+//     single text node, exactly that text stays alive and nothing else.
+//     That is the reason for the build, and its price is named:
+//     one character costs 4 bytes (a code point), one piece holds 28 of them.
+//   * namespaces are markers (`NS_HTML`, `NS_SVG`, `NS_MATHML`, ...). They
+//     stand on the element AND on the attribute, because both need them.
+//
+// THE HONEST LIMITS (as of round 54):
+//   * `chain_at` walks the piece list -- O(n/28). For comparing two chains
+//     and for the output there are piece by piece paths that do not do
+//     that; whoever indexes character by character pays.
+//   * There are no `id`/`class` registries, no live collections and no
+//     mutation observers. The references for them are foreseen (the tree
+//     carries them without trouble), but they are not built.
+//   * No `Node.ownerDocument` on every node: the tree construction knows the
+//     document anyway, and an extra reference per node costs
+//     8 bytes that nobody needs yet.
+
+import html.mem
+
+export {
+    Node, Elem, Attr, Text, Comment, Doctype, Document, Fragment,
+    Chain, Strand,
+    NS_HTML, NS_SVG, NS_MATHML, NS_XLINK, NS_XML, NS_XMLNS,
+    K_DOCUMENT, K_ELEM, K_TEXT, K_COMMENT, K_DOCTYPE, K_FRAGMENT,
+    MODE_NO_QUIRKS, MODE_QUIRKS, MODE_LIMITED,
+    STRAND_CHAR,
+    chain_new, chain_push, chain_len, chain_at, chain_empty,
+    chain_out_cpbuf, chain_after_cpbuf, chain_push_cpbuf, chain_equal,
+    chain_equal_ascii, chain_starts_ascii_small, chain_equal_ascii_small,
+    document_new, fragment_new, elem_new, text_new, comment_new, doctype_new,
+    append_child, kind_insert_before, kind_remove, relink_children,
+    node_index, child_at, node_is_elem, node_as_elem,
+    elem_name, elem_ns, elem_is,
+    attr_set, attr_set_full, attr_find, attr_value, attr_number, attr_first,
+    elem_content, elem_content_read,
+    doc_mode_set, doc_mode,
+    node_depth, node_ancestor_is,
+    D_SELF, D_CHILD, D_LAYOUT, D_CHILD_LAYOUT, D_TEXT,
+    node_mark, node_mark_up, node_clean, node_dirty,
+}
+
+// --------------------------------------------------------------- Constants
+
+// Namespaces. As markers, not as strings -- the tree construction
+// compares them millions of times.
+const NS_HTML: u32 = 1
+const NS_SVG: u32 = 2
+const NS_MATHML: u32 = 3
+const NS_XLINK: u32 = 4
+const NS_XML: u32 = 5
+const NS_XMLNS: u32 = 6
+
+// The node kinds (`nodeType` in DOM language, our own numbers here).
+const K_DOCUMENT: u32 = 1
+const K_ELEM: u32 = 2
+const K_TEXT: u32 = 3
+const K_COMMENT: u32 = 4
+const K_DOCTYPE: u32 = 5
+const K_FRAGMENT: u32 = 6
+
+// The document mode (WHATWG "quirks mode").
+const MODE_NO_QUIRKS: u32 = 0
+const MODE_QUIRKS: u32 = 1
+const MODE_LIMITED: u32 = 2
+
+// Characters per chain piece. 28 * 4 = 112 bytes of payload + 8 (next) + 4
+// (len) = 124, rounded up 128 -- exactly one size class of the collector
+// (lib/gc/gc.fi, __gc_classes_bytes: 32/48/64/96/128/...), so no waste.
+const STRAND_CHAR: usize = 28
+
+// ------------------------------------------------------------- The classes
+
+// One piece of a string. Code points, not bytes: the tokenizer delivers code
+// points (mem.CpBuf), and unpaired surrogates have to be preserved
+// (SPEC 8.2) -- a UTF-8 storage could do that only with WTF-8.
+gc class Strand {
+    next: Gc[Strand],
+    len: u32,
+    chars: [u32; 28],
+}
+
+// The handle on a chain: head, tail and total length. The tail is the reason
+// why appending is O(1) -- the tokenizer appends characters one at a time,
+// millions of times.
+gc class Chain {
+    first: Gc[Strand],
+    last: Gc[Strand],
+    length: u64,
+}
+
+// The base node. ALL tree references are strong, in both directions.
+gc class Node {
+    parent: Gc[Node],
+    first_child: Gc[Node],
+    last_child: Gc[Node],
+    previous: Gc[Node],
+    next: Gc[Node],
+    kind: u32,
+    children: u32,
+    // ROUND B4 -- the DIRTY MARK. A script that changes one attribute must
+    // not cost a restyle of the whole document, and the only way to know
+    // what may be skipped is a mark that travels: `D_SELF`/`D_LAYOUT` are
+    // set ON the node that changed, `D_CHILD`/`D_CHILD_LAYOUT` are carried
+    // UP to the root so that a walk can turn round at the first clean
+    // branch. lib/browser/live.fi owns the rules.
+    //
+    // WHAT IT COSTS: nothing that can be measured. `Node` grows from 48 to
+    // 52 octets, and every class that extends it -- `Elem` 84 -> 88,
+    // `Text` 56 -> 60, `Document` 52 -> 56 -- stays in the SAME size class
+    // of the collector (32/48/64/96/128, lib/gc/gc.fi). Bare `Node` is
+    // never allocated; the parser only ever makes the subclasses.
+    dirty: u32,
+}
+
+// The prefix layout (SPEC 4.4): a `Gc[Elem]` is a `Gc[Node]` for free.
+gc class Elem extends Node {
+    first_attr: Gc[Attr],
+    last_attr: Gc[Attr],
+    // ROUND B1: a `template` element does NOT hold its children itself --
+    // they lie in a document fragment of their own ("template contents",
+    // WHATWG 4.12.3). For every other element this stays a null pointer.
+    content: Gc[Fragment],
+    name: u32,
+    ns: u32,
+    nattr: u32,
+}
+
+// Attributes hang on the element as a singly linked list. The ORDER matters,
+// and attribute counts are small -- a hash table per element would be more
+// expensive than the list it is meant to replace.
+// ROUND B1: an attribute in the DOM has THREE name parts -- namespace,
+// prefix and local name (DOM 4.9.2). Only the foreign attributes of
+// WHATWG 13.2.6.5 ever get a prefix: `xlink:href` becomes prefix `xlink`,
+// local name `href`, namespace XLink. `xmlns` on the other hand lies in the
+// XMLNS namespace WITHOUT a prefix -- which is exactly why the prefix
+// cannot be derived from the namespace.
+gc class Attr {
+    next: Gc[Attr],
+    value: Gc[Chain],
+    name: u32,
+    ns: u32,
+    prefix: u32,
+}
+
+gc class Text extends Node {
+    data: Gc[Chain],
+}
+
+gc class Comment extends Node {
+    data: Gc[Chain],
+}
+
+gc class Doctype extends Node {
+    name: Gc[Chain],
+    pubid: Gc[Chain],
+    sysid: Gc[Chain],
+    has_pubid: bool,
+    has_sysid: bool,
+}
+
+gc class Document extends Node {
+    mode: u32,
+}
+
+gc class Fragment extends Node {
+    host: u32,
+}
+
+// ------------------------------------------------------------------ Chains
+
+fn chain_new() -> AllocError!Gc[Chain] {
+    return try gc Chain {
+        first: gc_null[Strand](),
+        last: gc_null[Strand](),
+        length: 0,
+    }
+}
+
+fn strand_new() -> AllocError!Gc[Strand] {
+    return try gc Strand {
+        next: gc_null[Strand](),
+        len: 0,
+        chars: [0; 28],
+    }
+}
+
+// Appends a code point. O(1).
+fn chain_push(k: Gc[Chain], cp: u32) -> AllocError!bool {
+    var s: Gc[Strand] = k.last
+    if s == gc_null[Strand]() || s.len as usize >= STRAND_CHAR {
+        let new = try strand_new()
+        if k.first == gc_null[Strand]() {
+            k.first = new
+        } else {
+            k.last.next = new
+        }
+        k.last = new
+        s = new
+    }
+    let i: usize = s.len as usize
+    s.chars[i] = cp
+    s.len = s.len + 1
+    k.length = k.length + 1
+    return true
+}
+
+fn chain_len(k: Gc[Chain]) -> u64 {
+    if k == gc_null[Chain]() {
+        return 0
+    }
+    return k.length
+}
+
+fn chain_empty(k: Gc[Chain]) -> bool {
+    return chain_len(k) == 0
+}
+
+// The character at position `i`. O(i/28) -- whoever walks a chain character
+// by character had better take `chain_after_cpbuf`.
+fn chain_at(k: Gc[Chain], i: u64) -> u32 {
+    if k == gc_null[Chain]() || i >= k.length {
+        return 0
+    }
+    var rest: u64 = i
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        let n: u64 = s.len as u64
+        if rest < n {
+            return s.chars[rest as usize]
+        }
+        rest = rest - n
+        s = s.next
+    }
+    return 0
+}
+
+// Builds a chain out of a code point buffer of the tokenizer.
+fn chain_out_cpbuf(b: *mut mem.CpBuf) -> AllocError!Gc[Chain] {
+    let k = try chain_new()
+    let n: usize = mem.cp_len(b)
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try chain_push(k, mem.cp_at(b, i))
+        if !ok {
+            return k
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn chain_push_cpbuf(k: Gc[Chain], b: *mut mem.CpBuf) -> AllocError!bool {
+    let n: usize = mem.cp_len(b)
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try chain_push(k, mem.cp_at(b, i))
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Appends the content of the chain to a code point buffer (the output path).
+fn chain_after_cpbuf(k: Gc[Chain], out: *mut mem.CpBuf) {
+    if k == gc_null[Chain]() {
+        return
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            mem.cp_push(out, s.chars[i])
+            i = i + 1
+        }
+        s = s.next
+    }
+}
+
+fn chain_equal(a: Gc[Chain], b: Gc[Chain]) -> bool {
+    let la: u64 = chain_len(a)
+    if la != chain_len(b) {
+        return false
+    }
+    if la == 0 {
+        return true
+    }
+    var sa: Gc[Strand] = a.first
+    var sb: Gc[Strand] = b.first
+    var ia: usize = 0
+    var ib: usize = 0
+    var rest: u64 = la
+    while rest > 0 {
+        while sa != gc_null[Strand]() && ia >= sa.len as usize {
+            sa = sa.next
+            ia = 0
+        }
+        while sb != gc_null[Strand]() && ib >= sb.len as usize {
+            sb = sb.next
+            ib = 0
+        }
+        if sa == gc_null[Strand]() || sb == gc_null[Strand]() {
+            return false
+        }
+        if sa.chars[ia] != sb.chars[ib] {
+            return false
+        }
+        ia = ia + 1
+        ib = ib + 1
+        rest = rest - 1
+    }
+    return true
+}
+
+// A comparison with an ASCII literal (`[u8; N]` as pointer + length).
+fn chain_equal_ascii(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
+    if chain_len(k) != n as u64 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if chain_at(k, i as u64) != (*((p as u64 + i as u64) as *mut u8)) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn ascii_small(c: u32) -> u32 {
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return c + 32 as u32
+    }
+    return c
+}
+
+// Like `chain_equal_ascii`, but the chain is compared ASCII lowercased
+// (DOCTYPE identifiers are ASCII case insensitive per the standard).
+fn chain_equal_ascii_small(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
+    if chain_len(k) != n as u64 {
+        return false
+    }
+    return chain_starts_ascii_small(k, p, n)
+}
+
+// Does the chain (ASCII lowercased) start with the literal?
+fn chain_starts_ascii_small(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
+    if chain_len(k) < n as u64 {
+        return false
+    }
+    var s: Gc[Strand] = k.first
+    var i: usize = 0
+    var j: usize = 0
+    while j < n {
+        while s != gc_null[Strand]() && i >= s.len as usize {
+            s = s.next
+            i = 0
+        }
+        if s == gc_null[Strand]() {
+            return false
+        }
+        let a: u32 = ascii_small(s.chars[i])
+        let b: u32 = ascii_small((*((p as u64 + j as u64) as *mut u8)) as u32)
+        if a != b {
+            return false
+        }
+        i = i + 1
+        j = j + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------- Building nodes
+
+fn document_new() -> AllocError!Gc[Document] {
+    return try gc Document {
+        parent: gc_null[Node](),
+        first_child: gc_null[Node](),
+        last_child: gc_null[Node](),
+        previous: gc_null[Node](),
+        next: gc_null[Node](),
+        kind: K_DOCUMENT,
+        children: 0,
+        dirty: 0,
+        mode: MODE_NO_QUIRKS,
+    }
+}
+
+fn fragment_new(host: u32) -> AllocError!Gc[Fragment] {
+    return try gc Fragment {
+        parent: gc_null[Node](),
+        first_child: gc_null[Node](),
+        last_child: gc_null[Node](),
+        previous: gc_null[Node](),
+        next: gc_null[Node](),
+        kind: K_FRAGMENT,
+        children: 0,
+        dirty: 0,
+        host: host,
+    }
+}
+
+fn elem_new(name: u32, ns: u32) -> AllocError!Gc[Elem] {
+    return try gc Elem {
+        parent: gc_null[Node](),
+        first_child: gc_null[Node](),
+        last_child: gc_null[Node](),
+        previous: gc_null[Node](),
+        next: gc_null[Node](),
+        kind: K_ELEM,
+        children: 0,
+        dirty: 0,
+        first_attr: gc_null[Attr](),
+        last_attr: gc_null[Attr](),
+        content: gc_null[Fragment](),
+        name: name,
+        ns: ns,
+        nattr: 0,
+    }
+}
+
+// The template contents of an element, created on demand.
+fn elem_content(e: Gc[Elem]) -> AllocError!Gc[Fragment] {
+    if e.content != gc_null[Fragment]() {
+        return e.content
+    }
+    let f = try fragment_new(e.name)
+    e.content = f
+    return f
+}
+
+fn elem_content_read(e: Gc[Elem]) -> Gc[Fragment] {
+    if e == gc_null[Elem]() {
+        return gc_null[Fragment]()
+    }
+    return e.content
+}
+
+fn text_new(data: Gc[Chain]) -> AllocError!Gc[Text] {
+    return try gc Text {
+        parent: gc_null[Node](),
+        first_child: gc_null[Node](),
+        last_child: gc_null[Node](),
+        previous: gc_null[Node](),
+        next: gc_null[Node](),
+        kind: K_TEXT,
+        children: 0,
+        dirty: 0,
+        data: data,
+    }
+}
+
+fn comment_new(data: Gc[Chain]) -> AllocError!Gc[Comment] {
+    return try gc Comment {
+        parent: gc_null[Node](),
+        first_child: gc_null[Node](),
+        last_child: gc_null[Node](),
+        previous: gc_null[Node](),
+        next: gc_null[Node](),
+        kind: K_COMMENT,
+        children: 0,
+        dirty: 0,
+        data: data,
+    }
+}
+
+fn doctype_new(name: Gc[Chain], pubid: Gc[Chain], sysid: Gc[Chain],
+    has_pubid: bool, has_sysid: bool) -> AllocError!Gc[Doctype] {
+    return try gc Doctype {
+        parent: gc_null[Node](),
+        first_child: gc_null[Node](),
+        last_child: gc_null[Node](),
+        previous: gc_null[Node](),
+        next: gc_null[Node](),
+        kind: K_DOCTYPE,
+        children: 0,
+        dirty: 0,
+        name: name,
+        pubid: pubid,
+        sysid: sysid,
+        has_pubid: has_pubid,
+        has_sysid: has_sysid,
+    }
+}
+
+// ------------------------------------------------------ The tree structure
+
+// Appends `child` as the last child of `parent`. If `child` is already
+// hooked in somewhere, it is unhooked first -- exactly the semantics of
+// `Node.appendChild` the adoption agency algorithm relies on.
+fn append_child(parent: Gc[Node], kind: Gc[Node]) {
+    if parent == gc_null[Node]() || kind == gc_null[Node]() {
+        return
+    }
+    if kind.parent != gc_null[Node]() {
+        kind_remove(kind)
+    }
+    kind.parent = parent
+    kind.previous = parent.last_child
+    kind.next = gc_null[Node]()
+    if parent.last_child == gc_null[Node]() {
+        parent.first_child = kind
+    } else {
+        parent.last_child.next = kind
+    }
+    parent.last_child = kind
+    parent.children = parent.children + 1
+}
+
+// Inserts `child` immediately BEFORE `reference`. `reference` has to be a
+// child of `parent`; if it is the null pointer, it is appended. That is the
+// path "foster parenting" and the adoption agency algorithm need.
+fn kind_insert_before(parent: Gc[Node], kind: Gc[Node], reference: Gc[Node]) {
+    if reference == gc_null[Node]() {
+        append_child(parent, kind)
+        return
+    }
+    if parent == gc_null[Node]() || kind == gc_null[Node]() {
+        return
+    }
+    if kind.parent != gc_null[Node]() {
+        kind_remove(kind)
+    }
+    kind.parent = parent
+    kind.next = reference
+    kind.previous = reference.previous
+    if reference.previous == gc_null[Node]() {
+        parent.first_child = kind
+    } else {
+        reference.previous.next = kind
+    }
+    reference.previous = kind
+    parent.children = parent.children + 1
+}
+
+fn kind_remove(kind: Gc[Node]) {
+    if kind == gc_null[Node]() {
+        return
+    }
+    let e: Gc[Node] = kind.parent
+    if e == gc_null[Node]() {
+        return
+    }
+    if kind.previous == gc_null[Node]() {
+        e.first_child = kind.next
+    } else {
+        kind.previous.next = kind.next
+    }
+    if kind.next == gc_null[Node]() {
+        e.last_child = kind.previous
+    } else {
+        kind.next.previous = kind.previous
+    }
+    e.children = e.children - 1
+    kind.parent = gc_null[Node]()
+    kind.previous = gc_null[Node]()
+    kind.next = gc_null[Node]()
+}
+
+// Moves ALL children of `from` over to `to`, in order. The
+// adoption agency algorithm needs exactly that (step 14:
+// "Take all of the child nodes of common ancestor ...").
+fn relink_children(of: Gc[Node], after: Gc[Node]) {
+    if of == gc_null[Node]() || after == gc_null[Node]() {
+        return
+    }
+    while of.first_child != gc_null[Node]() {
+        let k: Gc[Node] = of.first_child
+        kind_remove(k)
+        append_child(after, k)
+    }
+}
+
+// The position of a child in its parent list, -1 if it has no parent.
+fn node_index(kind: Gc[Node]) -> i64 {
+    if kind == gc_null[Node]() || kind.parent == gc_null[Node]() {
+        return -1
+    }
+    var i: i64 = 0
+    var c: Gc[Node] = kind.parent.first_child
+    while c != gc_null[Node]() {
+        if c == kind {
+            return i
+        }
+        i = i + 1
+        c = c.next
+    }
+    return -1
+}
+
+fn child_at(parent: Gc[Node], i: u32) -> Gc[Node] {
+    if parent == gc_null[Node]() {
+        return gc_null[Node]()
+    }
+    var n: u32 = 0
+    var c: Gc[Node] = parent.first_child
+    while c != gc_null[Node]() {
+        if n == i {
+            return c
+        }
+        n = n + 1
+        c = c.next
+    }
+    return gc_null[Node]()
+}
+
+fn node_depth(k: Gc[Node]) -> u32 {
+    var d: u32 = 0
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c.parent != gc_null[Node]() {
+        d = d + 1
+        c = c.parent
+    }
+    return d
+}
+
+fn node_ancestor_is(k: Gc[Node], possible: Gc[Node]) -> bool {
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() {
+        if c == possible {
+            return true
+        }
+        c = c.parent
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- Elements
+
+fn node_is_elem(k: Gc[Node]) -> bool {
+    if k == gc_null[Node]() {
+        return false
+    }
+    return k.kind == K_ELEM
+}
+
+fn node_as_elem(k: Gc[Node]) -> Gc[Elem] {
+    if k == gc_null[Node]() {
+        return gc_null[Elem]()
+    }
+    return k.as?[Elem]
+}
+
+fn elem_name(k: Gc[Node]) -> u32 {
+    let e: Gc[Elem] = node_as_elem(k)
+    if e == gc_null[Elem]() {
+        return 0
+    }
+    return e.name
+}
+
+fn elem_ns(k: Gc[Node]) -> u32 {
+    let e: Gc[Elem] = node_as_elem(k)
+    if e == gc_null[Elem]() {
+        return 0
+    }
+    return e.ns
+}
+
+// Is `k` an HTML element with the name `name`? By far the most frequent
+// question of the tree construction, hence its own path without conversion.
+fn elem_is(k: Gc[Node], name: u32) -> bool {
+    if k == gc_null[Node]() || k.kind != K_ELEM {
+        return false
+    }
+    let e: Gc[Elem] = k.as?[Elem]
+    if e == gc_null[Elem]() {
+        return false
+    }
+    return e.name == name && e.ns == NS_HTML
+}
+
+// -------------------------------------------------------------- Attributes
+
+// Sets an attribute. If the name (in the same namespace) is already there,
+// NOTHING happens and the answer is `false` -- exactly the rule of the HTML
+// standard for duplicate attributes on one tag.
+fn attr_set(e: Gc[Elem], name: u32, ns: u32, value: Gc[Chain]) -> AllocError!bool {
+    return try attr_set_full(e, name, ns, 0, value)
+}
+
+fn attr_set_full(e: Gc[Elem], name: u32, ns: u32, prefix: u32,
+    value: Gc[Chain]) -> AllocError!bool {
+    var a: Gc[Attr] = e.first_attr
+    while a != gc_null[Attr]() {
+        if a.name == name && a.ns == ns {
+            return false
+        }
+        a = a.next
+    }
+    let new = try gc Attr {
+        next: gc_null[Attr](),
+        value: value,
+        name: name,
+        ns: ns,
+        prefix: prefix,
+    }
+    if e.first_attr == gc_null[Attr]() {
+        e.first_attr = new
+    } else {
+        e.last_attr.next = new
+    }
+    e.last_attr = new
+    e.nattr = e.nattr + 1
+    return true
+}
+
+fn attr_find(e: Gc[Elem], name: u32, ns: u32) -> Gc[Attr] {
+    if e == gc_null[Elem]() {
+        return gc_null[Attr]()
+    }
+    var a: Gc[Attr] = e.first_attr
+    while a != gc_null[Attr]() {
+        if a.name == name && a.ns == ns {
+            return a
+        }
+        a = a.next
+    }
+    return gc_null[Attr]()
+}
+
+fn attr_value(e: Gc[Elem], name: u32, ns: u32) -> Gc[Chain] {
+    let a: Gc[Attr] = attr_find(e, name, ns)
+    if a == gc_null[Attr]() {
+        return gc_null[Chain]()
+    }
+    return a.value
+}
+
+fn attr_number(e: Gc[Elem]) -> u32 {
+    if e == gc_null[Elem]() {
+        return 0
+    }
+    return e.nattr
+}
+
+fn attr_first(e: Gc[Elem]) -> Gc[Attr] {
+    if e == gc_null[Elem]() {
+        return gc_null[Attr]()
+    }
+    return e.first_attr
+}
+
+// ---------------------------------------------------------------- Document
+
+fn doc_mode_set(d: Gc[Document], m: u32) {
+    d.mode = m
+}
+
+fn doc_mode(d: Gc[Document]) -> u32 {
+    return d.mode
+}
+
+// ------------------------------------------------- The dirty mark (B4)
+
+const D_SELF: u32 = 1 // its computed style has to be made again
+const D_LAYOUT: u32 = 2 // its box has to be laid out again
+const D_TEXT: u32 = 4 // its text or child list changed
+const D_CHILD: u32 = 8 // ... somewhere below here
+const D_CHILD_LAYOUT: u32 = 16
+
+fn node_dirty(k: Gc[Node]) -> u32 {
+    if k == gc_null[Node]() {
+        return 0
+    }
+    return k.dirty
+}
+
+fn node_clean(k: Gc[Node]) {
+    if k != gc_null[Node]() {
+        k.dirty = 0
+    }
+}
+
+fn node_mark(k: Gc[Node], bits: u32) {
+    if k == gc_null[Node]() {
+        return
+    }
+    k.dirty = k.dirty | bits
+}
+
+// The trail to the root. It stops at the first ancestor that already
+// carries the bits -- that is what makes a thousand changes under one node
+// cost one walk and not a thousand.
+fn node_mark_up(k: Gc[Node], bits: u32) {
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() {
+        if (c.dirty & bits) == bits {
+            return
+        }
+        c.dirty = c.dirty | bits
+        c = c.parent
+    }
+}

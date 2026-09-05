@@ -1,0 +1,162 @@
+// expect_exit: 42
+// Round 59: the kernel heap of `the osum repository (kernel/mem.fi)`, as an ordinary
+// program.
+//
+// Every block carries its length and a flag; `kalloc` takes the first one
+// that fits and splits it, `kfree` merges free neighbours again. The same
+// algorithm runs in the kernel over frames of physical memory -- here
+// over a buffer, so that both compilers and all three build stages check
+// it.
+//
+// What is checked: no two blocks overlap, a freed block is used again,
+// after everything has been given back exactly ONE block is left, and a
+// request bigger than the heap is REFUSED.
+const HEADER: u64 = 16
+
+fn size_of_block(h: u64) -> u64 {
+    return __mmio_read64(h as *mut u64)
+}
+
+fn used_of_block(h: u64) -> u64 {
+    return __mmio_read64((h + 8) as *mut u64)
+}
+
+fn write_block(h: u64, size: u64, used: u64) {
+    __mmio_write64(h as *mut u64, size)
+    __mmio_write64((h + 8) as *mut u64, used)
+}
+
+fn kalloc(base: u64, end: u64, want: u64) -> u64 {
+    var need: u64 = (want + 15) / 16 * 16 + HEADER
+    if need < HEADER + 16 {
+        need = HEADER + 16
+    }
+    var h: u64 = base
+    while h < end {
+        let size: u64 = size_of_block(h)
+        if size == 0 {
+            return 0
+        }
+        if used_of_block(h) == 0 && size >= need {
+            if size - need >= HEADER + 16 {
+                write_block(h + need, size - need, 0)
+                write_block(h, need, 1)
+            } else {
+                write_block(h, size, 1)
+            }
+            return h + HEADER
+        }
+        h = h + size
+    }
+    return 0
+}
+
+fn kfree(base: u64, end: u64, p: u64) {
+    if p == 0 {
+        return
+    }
+    write_block(p - HEADER, size_of_block(p - HEADER), 0)
+    var h: u64 = base
+    while h < end {
+        let size: u64 = size_of_block(h)
+        if size == 0 {
+            return
+        }
+        if used_of_block(h) == 0 && h + size < end && used_of_block(h + size) == 0 {
+            write_block(h, size + size_of_block(h + size), 0)
+        } else {
+            h = h + size
+        }
+    }
+}
+
+fn blocks(base: u64, end: u64) -> u64 {
+    var h: u64 = base
+    var n: u64 = 0
+    while h < end {
+        let size: u64 = size_of_block(h)
+        if size == 0 {
+            return n
+        }
+        n = n + 1
+        h = h + size
+    }
+    return n
+}
+
+fn fill(p: u64, n: u64, v: u64) {
+    var i: u64 = 0
+    while i < n {
+        __mmio_write8((p + i) as *mut u8, v as u8)
+        i = i + 1
+    }
+}
+
+fn check(p: u64, n: u64, v: u64) -> bool {
+    var i: u64 = 0
+    while i < n {
+        if __mmio_read8((p + i) as *mut u8) as u64 != v {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    var buf: [u64; 136] = [0; 136]
+    // The heap starts 16-aligned; in the kernel that comes for free (a
+    // frame is 4 KiB), on the stack it has to be done by hand.
+    let base: u64 = ((&buf[0]) as u64 + 15) / 16 * 16
+    let size: u64 = 1024
+    let end: u64 = base + size
+    write_block(base, size, 0)
+
+    let p1: u64 = kalloc(base, end, 24)
+    let p2: u64 = kalloc(base, end, 100)
+    let p3: u64 = kalloc(base, end, 24)
+    if p1 == 0 || p2 == 0 || p3 == 0 {
+        return 1
+    }
+    if p1 % 16 != 0 || p2 % 16 != 0 || p3 % 16 != 0 {
+        return 2
+    }
+    if p1 + 24 > p2 || p2 + 100 > p3 {
+        return 3
+    }
+    fill(p1, 24, 0x11)
+    fill(p2, 100, 0x22)
+    fill(p3, 24, 0x33)
+    if !check(p1, 24, 0x11) || !check(p2, 100, 0x22) || !check(p3, 24, 0x33) {
+        return 4
+    }
+    // more than the heap has: refused
+    if kalloc(base, end, 4096) != 0 {
+        return 5
+    }
+    // the hole in the middle gets used again
+    kfree(base, end, p2)
+    let again: u64 = kalloc(base, end, 100)
+    if again != p2 {
+        return 6
+    }
+    if !check(p1, 24, 0x11) || !check(p3, 24, 0x33) {
+        return 7
+    }
+    // everything back: one single block again
+    kfree(base, end, p1)
+    kfree(base, end, again)
+    kfree(base, end, p3)
+    if blocks(base, end) != 1 {
+        return 8
+    }
+    if size_of_block(base) != size {
+        return 9
+    }
+    // and it can be handed out again in full
+    let all: u64 = kalloc(base, end, size - HEADER)
+    if all != base + HEADER {
+        return 10
+    }
+    return 42
+}

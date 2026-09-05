@@ -1,0 +1,340 @@
+// SPDX-License-Identifier: MIT
+// lib/gc/gcmap.fi -- `GcMap[K,V]`: the map of variable size inside the GC
+// heap (SPEC 3.5.2 `attrs: GcMap[Atom, Str]`, round 53).
+//
+// It is APPENDED to `lib/gc/gc.fi` and `lib/gc/gcvec.fi` and forms ONE
+// module with them. It uses the same slot buffer as `GcVec`, only with step
+// width 2: one key and one value per slot.
+//
+//     desc = 2 | (mask << 8),  bit 0 = the key is a Gc pointer,
+//                              bit 1 = the value is a Gc pointer
+//
+// So `__gc_trace_slots` traces KEYS AND VALUES -- both can carry cycles, and
+// both have to be able to: in the DOM the key is an atom (a raw id) while
+// the value is an object on the GC heap.
+//
+// THE METHOD: open addressing, linear probing, the capacity always a power
+// of two (`hash & (cap-1)` instead of a division), a load limit of 3/4 --
+// the same build as `lib/rt/map.fi`, so that the two behave alike.
+//
+// THE STATE per slot stands IN THE KEY, not in a side field:
+//
+//     key 0 = never used   (the lookup may stop)
+//     key 1 = deleted      (the lookup may NOT stop)
+//
+// Why that works and why it is safe here: `__gc_mark(1)` looks for the chunk
+// of address 1 through `__gc_block_of` -- there is none, so nothing happens.
+// A tombstone therefore cannot lead the collector astray.
+// The price is a promise to the outside:
+//
+//     0 and 1 are RESERVED as keys.
+//
+// For Gc pointers that is free (no address is 0 or 1), for raw ids it costs
+// the two smallest values. The alternative would be a second field per slot
+// -- a third more memory and a second memory access per probe step, for
+// nothing.
+
+const GCMAP_EMPTY: u64 = 0
+const GCMAP_TOMBSTONE: u64 = 1
+// The initial capacity in slots (a power of two).
+const GCMAP_START: u64 = 8
+
+gc class GcMap {
+    buffer: Gc[GcSlots],
+    n: u64,
+    dead: u64,
+    desc: u64,
+}
+
+// Hashing as in `lib/rt/map.fi::map_hash` -- bit identical, so that the two
+// maps of the language do not behave differently.
+fn gcmap_hash(k: u64) -> u64 {
+    var x: u64 = k
+    x = x ^ (x >> 33)
+    x = x *% 14181476777654086739 as u64 // ROUND 72: MurmurHash3 mix wraps on purpose, *% says so
+    x = x ^ (x >> 29)
+    x = x *% 12297829382473034411 as u64 // ROUND 72: MurmurHash3 mix wraps on purpose, *% says so
+    x = x ^ (x >> 32)
+    return x
+}
+
+// `k_ptr`/`w_ptr`: are the key and the value Gc pointers and therefore to be
+// traced by the collector?
+fn gcmap_new(k_ptr: bool, w_ptr: bool) -> AllocError!Gc[GcMap] {
+    var mask: u64 = 0
+    if k_ptr {
+        mask = mask + 1
+    }
+    if w_ptr {
+        mask = mask + 2
+    }
+    return try gc GcMap {
+        buffer: gc_null[GcSlots](),
+        n: 0,
+        dead: 0,
+        desc: 2 + (mask * 256),
+    }
+}
+
+fn gcmap_size(m: Gc[GcMap]) -> u64 {
+    return m.n
+}
+
+fn gcmap_capacity(m: Gc[GcMap]) -> u64 {
+    let s: Gc[GcSlots] = m.buffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    return s.cap
+}
+
+// Look for the slot of `k`. It returns either the used slot with this key or
+// the first slot into which insertion is allowed; `cap` means "full" (which
+// can only happen at load limit 1, so never).
+//
+// IMPORTANT: the FIRST tombstone is remembered, but the lookup runs on until
+// it finds the key or a slot that was never used. Only that way can an entry
+// not come into being twice when it lies behind a tombstone.
+fn __gcmap_slot(m: Gc[GcMap], k: u64) -> u64 {
+    let s: Gc[GcSlots] = m.buffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    let cap: u64 = s.cap
+    let mask: u64 = cap - 1
+    let base: u64 = (s as u64) + SLOT_HEADER
+    var i: u64 = gcmap_hash(k) & mask
+    var tombstone: u64 = cap
+    var steps: u64 = 0
+    while steps < cap {
+        let sk: u64 = __gc_ld64(base + i * 16)
+        if sk == k {
+            return i
+        }
+        if sk == GCMAP_EMPTY {
+            if tombstone < cap {
+                return tombstone
+            }
+            return i
+        }
+        if sk == GCMAP_TOMBSTONE {
+            if tombstone == cap {
+                tombstone = i
+            }
+        }
+        i = (i + 1) & mask
+        steps = steps + 1
+    }
+    if tombstone < cap {
+        return tombstone
+    }
+    return cap
+}
+
+// Create a new buffer and rehash everything into it. As with the vector the
+// allocation lies BEFORE the rehashing: during `__gcslots_new` a collector
+// slice can run, during the rehashing it cannot. The barrier on
+// `m.buffer = new` is put there by the compiler.
+fn __gcmap_grow(m: Gc[GcMap], newcap: u64) -> AllocError!bool {
+    let old: Gc[GcSlots] = m.buffer
+    var oldcap: u64 = 0
+    if (old as u64) != 0 {
+        oldcap = old.cap
+    }
+    let new: Gc[GcSlots] = try __gcslots_new(newcap, m.desc)
+    __gc_st64((new as u64), newcap)
+    let nbase: u64 = (new as u64) + SLOT_HEADER
+    let abase: u64 = (old as u64) + SLOT_HEADER
+    let nmask: u64 = newcap - 1
+    var j: u64 = 0
+    while j < oldcap {
+        let sk: u64 = __gc_ld64(abase + j * 16)
+        if sk != GCMAP_EMPTY && sk != GCMAP_TOMBSTONE {
+            let sw: u64 = __gc_ld64(abase + j * 16 + 8)
+            var i: u64 = gcmap_hash(sk) & nmask
+            while __gc_ld64(nbase + i * 16) != GCMAP_EMPTY {
+                i = (i + 1) & nmask
+            }
+            __gc_st64(nbase + i * 16, sk)
+            __gc_st64(nbase + i * 16 + 8, sw)
+        }
+        j = j + 1
+    }
+    m.dead = 0
+    m.buffer = new
+    return true
+}
+
+// The whole traced area of a map is ALWAYS the full capacity (n in the
+// slot buffer = cap), not the number of entries: the slots lie scattered
+// and not densely. Empty slots carry 0 and cost one comparison while
+// tracing.
+fn gcmap_set(m: Gc[GcMap], k: u64, w: u64) -> AllocError!bool {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
+        return false
+    }
+    var cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
+        if !(try __gcmap_grow(m, GCMAP_START)) {
+            return false
+        }
+        cap = GCMAP_START
+    }
+    // Load limit 3/4, tombstones count too -- otherwise a map into which much
+    // is deleted and inserted again runs into a full
+    // probe chain.
+    if (m.n + m.dead + 1) * 4 > cap * 3 {
+        if !(try __gcmap_grow(m, cap * 2)) {
+            return false
+        }
+        cap = cap * 2
+    }
+    let s: Gc[GcSlots] = m.buffer
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
+        return false
+    }
+    let a: u64 = (s as u64) + SLOT_HEADER + i * 16
+    let old: u64 = __gc_ld64(a)
+    let mask: u64 = s.desc >> 8
+    if old != k {
+        if old == GCMAP_TOMBSTONE {
+            m.dead = m.dead - 1
+        }
+        // The insertion barrier for the KEY (the compiler does not know
+        // the buffer, so the library calls it itself).
+        if (mask & 1) != 0 {
+            __gc_barrier(a as *mut u8, k as *mut u8)
+        }
+        __gc_st64(a, k)
+        m.n = m.n + 1
+    }
+    if (mask & 2) != 0 {
+        __gc_barrier((a + 8) as *mut u8, w as *mut u8)
+    }
+    __gc_st64(a + 8, w)
+    return true
+}
+
+fn gcmap_has(m: Gc[GcMap], k: u64) -> bool {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
+        return false
+    }
+    let cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
+        return false
+    }
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
+        return false
+    }
+    return __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16) == k
+}
+
+fn gcmap_get(m: Gc[GcMap], k: u64, missing: u64) -> u64 {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
+        return missing
+    }
+    let cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
+        return missing
+    }
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
+        return missing
+    }
+    let a: u64 = (m.buffer as u64) + SLOT_HEADER + i * 16
+    if __gc_ld64(a) != k {
+        return missing
+    }
+    return __gc_ld64(a + 8)
+}
+
+// Deleting leaves a TOMBSTONE behind. The key and the value are really
+// overwritten while doing so -- a deleted entry must not keep its object
+// alive any longer, otherwise the map would be a leak.
+fn gcmap_remove(m: Gc[GcMap], k: u64) -> bool {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
+        return false
+    }
+    let cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
+        return false
+    }
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
+        return false
+    }
+    let a: u64 = (m.buffer as u64) + SLOT_HEADER + i * 16
+    if __gc_ld64(a) != k {
+        return false
+    }
+    __gc_st64(a, GCMAP_TOMBSTONE)
+    __gc_st64(a + 8, 0)
+    m.n = m.n - 1
+    m.dead = m.dead + 1
+    return true
+}
+
+fn gcmap_clear(m: Gc[GcMap]) {
+    let s: Gc[GcSlots] = m.buffer
+    if (s as u64) == 0 {
+        return
+    }
+    let base: u64 = (s as u64) + SLOT_HEADER
+    let words: u64 = s.cap * 2
+    var i: u64 = 0
+    while i < words {
+        __gc_st64(base + i * 8, 0)
+        i = i + 1
+    }
+    m.n = 0
+    m.dead = 0
+}
+
+// --------------------------------------------------------- Walking through
+//
+// Stage 0 has no iterators. The walk is therefore the honest one: run over
+// every slot and skip the empty ones.
+//
+//     var i: u64 = 0
+//     while i < gcmap_capacity(m) {
+//         if gcmap_slot_used(m, i) { ... gcmap_slot_key(m, i) ... }
+//         i = i + 1
+//     }
+
+fn gcmap_slot_used(m: Gc[GcMap], i: u64) -> bool {
+    if i >= gcmap_capacity(m) {
+        return false
+    }
+    let sk: u64 = __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16)
+    return sk != GCMAP_EMPTY && sk != GCMAP_TOMBSTONE
+}
+
+fn gcmap_slot_key(m: Gc[GcMap], i: u64) -> u64 {
+    if i >= gcmap_capacity(m) {
+        return 0
+    }
+    return __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16)
+}
+
+fn gcmap_slot_value(m: Gc[GcMap], i: u64) -> u64 {
+    if i >= gcmap_capacity(m) {
+        return 0
+    }
+    return __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16 + 8)
+}
+
+// ---------------------------------------------------------- The typed view
+
+fn gcmap_set_value[V: Any](m: Gc[GcMap], k: u64, w: Gc[V]) -> AllocError!bool {
+    return try gcmap_set(m, k, w as u64)
+}
+
+fn gcmap_get_value[V: Any](m: Gc[GcMap], k: u64) -> Gc[V] {
+    return gcmap_get(m, k, 0) as Gc[V]
+}
+
+fn gcmap_slot_value_as[V: Any](m: Gc[GcMap], i: u64) -> Gc[V] {
+    return gcmap_slot_value(m, i) as Gc[V]
+}

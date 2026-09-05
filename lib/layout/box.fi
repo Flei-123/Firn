@@ -1,0 +1,1081 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/layout/box.fi -- THE BOX. The thing layout produces: a rectangle with
+// a position, a size and four rings of edges around the content.
+//
+// The box tree is NOT the DOM tree. Three differences decide everything
+// that follows:
+//
+//   1. `display: none` produces NO box, and neither do its descendants.
+//   2. One elem can produce SEVERAL boxes (an inline box broken over
+//      three lines is three fragments), and several elems can end up in
+//      ONE box (three text nodes in a row become one anonymous block).
+//   3. Boxes appear that belong to no elem at all: the ANONYMOUS BLOCK
+//      that a block container has to wrap around its inline children as
+//      soon as one block-level child stands among them (CSS 2.1 9.2.1.1).
+//
+// THE COORDINATES. Every box carries the geometry of its BORDER box --
+// that is the rectangle `getBoundingClientRect()` of a browser returns, so
+// the cross-check against Chromium can subtract without converting. During
+// the flow `x`/`y` are RELATIVE to the content corner of the parent; the
+// placement run (`flow.place_tree`) turns them into viewport coordinates in
+// one pass. Two passes instead of one because `position: relative` moves a
+// whole subtree afterwards, and an absolutely positioned box needs the
+// finished rectangle of its containing block.
+import html.mem
+import std.math
+import browser.node
+import css.cascade
+import font.metrics
+
+export {
+    Box, Item, Frag, FloatCtx, MarginSet, TextRun,
+    BK_BLOCK, BK_INLINE, BK_TEXT, BK_ATOMIC, BK_ANON, BK_FLEX, BK_LINE,
+    F_ABS, F_FLOAT, F_BFC, F_REPLACED, F_HAS_BLOCKS, F_COLLAPSE_THROUGH,
+    F_PLACED, F_FROZEN, F_FLEX_ITEM, F_STATIC_ABS, F_FLEX_BOX, F_H_DEPENDS,
+    F_BR, F_FILL_INLINE,
+    DEFAULT_OBJECT_W, DEFAULT_OBJECT_H, box_ratio, box_has_ratio,
+    IT_WORD, IT_SPACE, IT_ATOMIC, IT_OPEN, IT_CLOSE, IT_BREAK,
+    box_new, item_new, frag_new, round_px, reset_box_geometry,
+    replaced_size, box_is_replaced,
+    box_add, box_kid, box_kids,
+    margin_empty, margin_add, margin_value, margin_join,
+    font_ascent, font_descent, font_advance, font_xheight, used_line_height,
+    font_ascent_fm, font_descent_fm, font_advance_fm, font_xheight_fm,
+    font_kern_fm, used_line_height_fm, textrun_new, box_stamp_font,
+    box_stamp_alpha, box_stamp_clip,
+    length_px, length_is_auto, length_is_none, resolve, resolve_or_zero,
+    clamp_size, sum_h_edges, sum_v_edges, snap,
+    is_block_level, is_inline_level, is_bfc_root, establishes_ifc,
+    fmax2, fmin2,
+    floatctx_new, floatctx_init, float_left_edge, float_right_edge, float_add,
+    float_lowest, float_next_y, float_clear_y,
+    float_mark, float_shift_from,
+}
+
+// -------------------------------------------------------------- The kinds
+
+const BK_BLOCK: u32 = 0 // a block-level block container
+const BK_INLINE: u32 = 1 // an inline box (`span`) -- no own geometry pass
+const BK_TEXT: u32 = 2 // a run of text
+const BK_ATOMIC: u32 = 3 // inline-level, laid out as a block inside
+const BK_ANON: u32 = 4 // an anonymous block around inline children
+const BK_FLEX: u32 = 5 // a flex container
+const BK_LINE: u32 = 6 // a line box, made by the inline layout
+
+// The flags of a box.
+const F_ABS: u32 = 1 // out of flow, `position: absolute`
+const F_FLOAT: u32 = 2 // out of flow, floated
+const F_BFC: u32 = 4 // opens its own block formatting context
+const F_REPLACED: u32 = 8 // has an intrinsic size (img)
+const F_HAS_BLOCKS: u32 = 16 // has block-level children
+const F_COLLAPSE_THROUGH: u32 = 32 // top and bottom margin are adjoining
+const F_PLACED: u32 = 64 // the placement run has seen it
+const F_FROZEN: u32 = 128 // a flex item whose size is settled
+const F_FLEX_ITEM: u32 = 256 // a child of a flex container
+const F_STATIC_ABS: u32 = 512 // its static position is in viewport coordinates
+// A flex CONTAINER that is not a `BK_FLEX` box: `display: inline-flex`
+// makes an ATOMIC inline, and the kind of the box says "atomic" and not
+// "flex". Without this flag its children never see the flex algorithm.
+const F_FLEX_BOX: u32 = 1024
+// Somewhere under this box stands something whose size depends on the
+// CONTENT HEIGHT of this box: a percentage height, an offset from the
+// bottom, or a flex container. Decided once while the box tree is built,
+// and asked wherever a height is settled from the outside -- a flex item
+// that is stretched has to be laid out a SECOND time if the answer is
+// yes, and must not be if it is no. On a page like `rustdoc_vec.html`,
+// with flex containers three deep, that is the difference between a
+// second pass and a second pass per level.
+const F_H_DEPENDS: u32 = 2048
+// ROUND B6 -- `<br>`. Until this round it borrowed `F_REPLACED`, which
+// worked only because `box_is_replaced` also asked for an intrinsic size
+// and `<br>` has none. This round gives a replaced element a DEFAULT
+// size (300 x 150, css-images-3 5.1), so that test no longer separates
+// the two and the forced break needs a bit of its own.
+const F_BR: u32 = 4096
+// ROUND B6 -- an `<svg>` root with a `viewBox` and no `width`/`height`
+// attribute. SVG2, 8.2 says `auto` on those two means `100%`, so the box
+// fills the inline axis of its containing block and takes its height
+// from the ratio. That is a rule of SVG and not of CSS, which is why it
+// is a flag on the box and not a value in the style.
+const F_FILL_INLINE: u32 = 8192
+
+// The kinds of an inline item.
+const IT_WORD: u32 = 0
+const IT_SPACE: u32 = 1
+const IT_ATOMIC: u32 = 2
+const IT_OPEN: u32 = 3
+const IT_CLOSE: u32 = 4
+const IT_BREAK: u32 = 5 // a forced break (`<br>`, a newline in `pre`)
+
+// --------------------------------------------------------------- The box
+
+gc class Box {
+    style: Gc[Style],
+    elem: Gc[Node],
+    kids: Gc[GcVec],
+    items: Gc[GcVec], // the inline items, if this box opens an IFC
+    lines: Gc[GcVec], // the line boxes, likewise
+    frags: Gc[GcVec], // the fragments of an inline box
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    mt: f64,
+    mr: f64,
+    mb: f64,
+    ml: f64,
+    bt: f64,
+    br: f64,
+    bb: f64,
+    bl: f64,
+    pt: f64,
+    pr: f64,
+    pb: f64,
+    pl: f64,
+    baseline: f64,
+    // THE INTRINSIC CONTRIBUTION OF THIS BOX -- the one thing in the whole
+    // layout that does NOT depend on the width of the window. It is
+    // computed out of the style and the text alone (percentages count as
+    // zero there, css-sizing-3), so it survives a reflow: `int_ok` says
+    // whether the two numbers have been computed, and only a change to
+    // the box tree or to a style clears it (`flow.reset_geometry` does
+    // NOT). See docs/ROUNDB2.md, section "what a reflow has to redo".
+    int_min: f64,
+    int_max: f64,
+    static_x: f64, // where an out-of-flow box WOULD have stood
+    static_y: f64,
+    rel_x: f64, // the shift of `position: relative`
+    rel_y: f64,
+    flex_target: f64, // the working value of the flex algorithm
+    top_pos: f64, // the collapsed top margin, positive part
+    top_neg: f64,
+    thr_pos: f64, // the same WITHOUT the bottom margin: where a
+    thr_neg: f64, // box that collapses through comes to stand
+    bot_pos: f64,
+    bot_neg: f64,
+    // ROUND B3. `fm` is the address of a `font.metrics.FontSet`, or 0 for
+    // the made-up font of round B2 -- see lib/font/metrics.fi for why it
+    // is a raw address and not a managed pointer. `runs` are the pieces of
+    // TEXT this box put on its lines, and they exist for exactly one
+    // reason: up to round B2 the item list was working material and was
+    // thrown away after the last line, so nothing anywhere knew WHICH
+    // characters stood WHERE. A painter cannot be built on top of that.
+    fm: u64,
+    runs: Gc[GcVec],
+    // The product of this box's `opacity` and every ancestor's, stamped
+    // in one walk before the display list is built. The box tree has no
+    // parent pointer and the paint order is FLAT, so a command deep in
+    // the list could not work it out for itself.
+    oalpha: f64,
+    // The rectangle every ancestor with `overflow` other than `visible`
+    // leaves over, already intersected. Stamped in the same walk as
+    // `oalpha` and for the same reason: the paint order is FLAT, so a
+    // command cannot look up its ancestors when it is drawn.
+    clx0: f64,
+    cly0: f64,
+    clx1: f64,
+    cly1: f64,
+    // ROUND B5 -- the replaced box. `img` is the address of a decoded
+    // `paint.png.Image` (0 when there is none), `iw`/`ih` its intrinsic
+    // size in CSS pixels. A raw address for the same reason `fm` is one:
+    // the pictures live in a store the driver owns and outlive any one
+    // layout, and a managed pointer into them would tie the collector to
+    // the network.
+    img: u64,
+    iw: f64,
+    ih: f64,
+    // ROUND B6 -- the NATURAL RATIO, width divided by height, 0.0 when
+    // there is none. It is NOT always `iw / ih`: a `<video>` with nothing
+    // playing falls back to 300 x 150 and has, by the standard, no ratio
+    // at all, so `height: 100px` leaves its width at 300 and does not
+    // make it 200. Keeping the two apart is the whole reason this field
+    // exists.
+    ratio: f64,
+    kind: u32,
+    flags: u32,
+    int_ok: u32,
+}
+
+fn box_new(kind: u32, s: Gc[Style], e: Gc[Node]) -> AllocError!Gc[Box] {
+    let v = try gcvec_new()
+    return try gc Box {
+        style: s,
+        elem: e,
+        kids: v,
+        items: gc_null[GcVec](),
+        lines: gc_null[GcVec](),
+        frags: gc_null[GcVec](),
+        x: 0.0, y: 0.0, w: 0.0, h: 0.0,
+        mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0,
+        bt: 0.0, br: 0.0, bb: 0.0, bl: 0.0,
+        pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
+        baseline: 0.0,
+        int_min: 0.0,
+        int_max: 0.0,
+        static_x: 0.0, static_y: 0.0,
+        rel_x: 0.0, rel_y: 0.0, flex_target: 0.0,
+        top_pos: 0.0, top_neg: 0.0, thr_pos: 0.0, thr_neg: 0.0,
+        bot_pos: 0.0, bot_neg: 0.0,
+        fm: 0,
+        runs: gc_null[GcVec](),
+        oalpha: 1.0,
+        clx0: 0.0 - 1.0e9,
+        cly0: 0.0 - 1.0e9,
+        clx1: 1.0e9,
+        cly1: 1.0e9,
+        img: 0,
+        iw: 0.0,
+        ih: 0.0,
+        ratio: 0.0,
+        kind: kind,
+        flags: 0,
+        int_ok: 0,
+    }
+}
+
+// One run of text on one line: which characters, where, in what style.
+// The x is the left edge and the y the BASELINE, both in the coordinates
+// the box tree is placed in, so a painter needs nothing but this.
+gc class TextRun {
+    src: Gc[Box], // the BK_TEXT box the characters come from
+    style: Gc[Style],
+    x: f64,
+    y: f64, // the baseline
+    w: f64,
+    first: u32, // index of the first character in the text node
+    n: u32,
+}
+
+fn textrun_new(src: Gc[Box], s: Gc[Style]) -> AllocError!Gc[TextRun] {
+    return try gc TextRun {
+        src: src,
+        style: s,
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        first: 0,
+        n: 0,
+    }
+}
+
+// The inherited opacity, in one walk from the root.
+fn box_stamp_alpha(b: Gc[Box], parent: f64) {
+    if b == gc_null[Box]() {
+        return
+    }
+    b.oalpha = parent * cascade.style_opacity(b.style)
+    var i: u64 = 0
+    let n: u64 = box_kids(b)
+    while i < n {
+        box_stamp_alpha(box_kid(b, i), b.oalpha)
+        i = i + 1
+    }
+}
+
+// The clip of `overflow: hidden` / `scroll` / `auto`, handed down the
+// tree. A box clips its DESCENDANTS, not itself: its own border and its
+// own background stand outside the padding box and are not cut off by it.
+fn box_stamp_clip(b: Gc[Box], x0: f64, y0: f64, x1: f64, y1: f64) {
+    if b == gc_null[Box]() {
+        return
+    }
+    b.clx0 = x0
+    b.cly0 = y0
+    b.clx1 = x1
+    b.cly1 = y1
+    var nx0: f64 = x0
+    var ny0: f64 = y0
+    var nx1: f64 = x1
+    var ny1: f64 = y1
+    if cascade.style_overflow(b.style) != cascade.OV_VISIBLE {
+        let px0: f64 = b.x + b.bl
+        let py0: f64 = b.y + b.bt
+        let px1: f64 = b.x + b.w - b.br
+        let py1: f64 = b.y + b.h - b.bb
+        if px0 > nx0 {
+            nx0 = px0
+        }
+        if py0 > ny0 {
+            ny0 = py0
+        }
+        if px1 < nx1 {
+            nx1 = px1
+        }
+        if py1 < ny1 {
+            ny1 = py1
+        }
+    }
+    var i: u64 = 0
+    let n: u64 = box_kids(b)
+    while i < n {
+        box_stamp_clip(box_kid(b, i), nx0, ny0, nx1, ny1)
+        i = i + 1
+    }
+}
+
+// Hand the same font to every box of a tree. Done in one walk AFTER the
+// tree is built rather than in `box_new`, so that nothing in round B1 or
+// B2 has to grow a parameter it does not use.
+fn box_stamp_font(b: Gc[Box], fm: u64) {
+    if b == gc_null[Box]() {
+        return
+    }
+    b.fm = fm
+    var i: u64 = 0
+    let n: u64 = box_kids(b)
+    while i < n {
+        box_stamp_font(box_kid(b, i), fm)
+        i = i + 1
+    }
+}
+
+// EVERYTHING THE WINDOW WIDTH DECIDES, back to zero. What stays: the box
+// tree itself, the style on every box, and the intrinsic contribution
+// (`int_min`/`int_max`/`int_ok`) -- those three are the reason a reflow
+// is cheaper than a first layout. See `flow.relayout_document`.
+fn reset_box_geometry(b: Gc[Box]) {
+    b.x = 0.0
+    b.y = 0.0
+    b.w = 0.0
+    b.h = 0.0
+    b.mt = 0.0
+    b.mr = 0.0
+    b.mb = 0.0
+    b.ml = 0.0
+    b.bt = 0.0
+    b.br = 0.0
+    b.bb = 0.0
+    b.bl = 0.0
+    b.pt = 0.0
+    b.pr = 0.0
+    b.pb = 0.0
+    b.pl = 0.0
+    b.baseline = 0.0
+    b.static_x = 0.0
+    b.static_y = 0.0
+    b.rel_x = 0.0
+    b.rel_y = 0.0
+    b.flex_target = 0.0
+    b.top_pos = 0.0
+    b.top_neg = 0.0
+    b.thr_pos = 0.0
+    b.thr_neg = 0.0
+    b.bot_pos = 0.0
+    b.bot_neg = 0.0
+    b.items = gc_null[GcVec]()
+    b.lines = gc_null[GcVec]()
+    b.frags = gc_null[GcVec]()
+    b.flags = b.flags & (0xFFFFFFFF as u32 - (F_PLACED | F_STATIC_ABS |
+            F_FROZEN | F_COLLAPSE_THROUGH))
+    var i: u64 = 0
+    let n: u64 = box_kids(b)
+    while i < n {
+        reset_box_geometry(box_kid(b, i))
+        i = i + 1
+    }
+}
+
+fn box_add(parent: Gc[Box], kid: Gc[Box]) -> AllocError!bool {
+    return try gcvec_append[Box](parent.kids, kid)
+}
+
+fn box_kids(b: Gc[Box]) -> u64 {
+    return gcvec_length(b.kids)
+}
+
+fn box_kid(b: Gc[Box], i: u64) -> Gc[Box] {
+    return gcvec_read[Box](b.kids, i)
+}
+
+// ------------------------------------------------------- The inline items
+
+// One piece of an inline formatting context. The whole IFC is flattened
+// into a vector of these before a single line is broken -- that is what
+// makes the line breaker a loop over an array instead of a walk over a
+// tree with a resumable state.
+gc class Item {
+    style: Gc[Style],
+    holder: Gc[Box], // the atomic box, or the inline box being opened
+    width: f64,
+    chars: u32,
+    kind: u32,
+    first_char: u32, // the offset in the text run, for reporting
+}
+
+fn item_new(kind: u32, s: Gc[Style], b: Gc[Box]) -> AllocError!Gc[Item] {
+    return try gc Item {
+        style: s,
+        holder: b,
+        width: 0.0,
+        chars: 0,
+        kind: kind,
+        first_char: 0,
+    }
+}
+
+// One fragment of an inline box: the piece that fell on one line. An
+// inline box that runs over three lines has three of them, and
+// `getBoundingClientRect()` reports their union -- which is why they are
+// kept instead of only their union being updated.
+gc class Frag {
+    owner: Gc[Box],
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+fn frag_new(owner: Gc[Box]) -> AllocError!Gc[Frag] {
+    return try gc Frag {
+        owner: owner,
+        x: 0.0, y: 0.0, w: 0.0, h: 0.0,
+    }
+}
+
+// ------------------------------------------------------- Collapsed margins
+
+// A set of adjoining margins. Not a number: the collapsed value is the
+// LARGEST positive plus the SMALLEST negative one, so both have to be
+// carried separately (CSS 2.1, 8.3.1).
+struct MarginSet {
+    pos: f64,
+    neg: f64,
+}
+
+fn margin_empty() -> MarginSet {
+    return MarginSet { pos: 0.0, neg: 0.0 }
+}
+
+fn margin_add(m: MarginSet, v: f64) -> MarginSet {
+    if v >= 0.0 {
+        return MarginSet { pos: fmax2(m.pos, v), neg: m.neg }
+    }
+    return MarginSet { pos: m.pos, neg: fmin2(m.neg, v) }
+}
+
+fn margin_join(a: MarginSet, b: MarginSet) -> MarginSet {
+    return MarginSet { pos: fmax2(a.pos, b.pos), neg: fmin2(a.neg, b.neg) }
+}
+
+fn margin_value(m: MarginSet) -> f64 {
+    return m.pos + m.neg
+}
+
+fn fmax2(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn fmin2(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// --------------------------------------------------------- The font metric
+
+// THE ONE FONT. Firn has no font rasterizer and no OpenType reader, so the
+// engine works with ONE metric, and it is spelled out here instead of
+// hidden in a table:
+//
+//     advance   1.0 em   every character is one em wide
+//     ascent    0.8 em
+//     descent   0.2 em   -> `line-height: normal` is exactly 1.0 em
+//     x-height  0.8 em   (used by `vertical-align: middle`)
+//
+// That is not a guess: `tools/layout/make_font.py` builds a TrueType font
+// with exactly these numbers, the cases load it through `@font-face`, and
+// the browser in the cross-check therefore measures with the SAME metric.
+// What is missing is honest and named in docs/ROUND61.md: real fonts,
+// kerning, shaping.
+// The ROUNDING is not a detail. A browser reads the metrics of a font in
+// font units, scales them to the font size and rounds each one to a WHOLE
+// pixel -- so `font-size: 23.4px` gives ascent 19 and descent 5, that is
+// 24 and not 23.4. Without that rounding every case with a font size that
+// is not a whole number is off, and `1.17em` is exactly such a case
+// (`h3` in the user agent stylesheet). Measured against Chromium for
+// thirteen font sizes; see docs/ROUND61.md.
+fn round_px(v: f64) -> f64 {
+    return math.floor(v + 0.5)
+}
+
+fn font_ascent(font_size: f64) -> f64 {
+    return round_px(font_size * 0.8)
+}
+
+// ROUND B3: the same four numbers, but out of the font that will really
+// be drawn with. `fm == 0` gives the four above, bit for bit -- that is
+// what keeps the corpus of round B2 comparable.
+fn font_ascent_fm(fm: u64, font_size: f64) -> f64 {
+    return metrics.fm_ascent(fm, font_size)
+}
+
+fn font_descent_fm(fm: u64, font_size: f64) -> f64 {
+    return metrics.fm_descent(fm, font_size)
+}
+
+fn font_xheight_fm(fm: u64, font_size: f64) -> f64 {
+    return metrics.fm_xheight(fm, font_size)
+}
+
+fn font_advance_fm(fm: u64, font_size: f64, cp: u32) -> f64 {
+    return metrics.fm_advance(fm, font_size, cp)
+}
+
+fn font_kern_fm(fm: u64, font_size: f64, a: u32, b: u32) -> f64 {
+    return metrics.fm_kern(fm, font_size, a, b)
+}
+
+fn used_line_height_fm(s: Gc[Style], fm: u64) -> f64 {
+    let u: u32 = cascade.style_unit(s, cascade.S_LINE_HEIGHT)
+    let fs: f64 = cascade.style_font_size(s)
+    if u == cascade.U_NORMAL {
+        return font_ascent_fm(fm, fs) + font_descent_fm(fm, fs)
+    }
+    if u == cascade.U_NUMBER {
+        return cascade.style_length(s, cascade.S_LINE_HEIGHT) * fs
+    }
+    return cascade.style_length(s, cascade.S_LINE_HEIGHT)
+}
+
+fn font_descent(font_size: f64) -> f64 {
+    return round_px(font_size * 0.2)
+}
+
+fn font_advance(font_size: f64) -> f64 {
+    return font_size
+}
+
+fn font_xheight(font_size: f64) -> f64 {
+    return round_px(font_size * 0.8)
+}
+
+// The used value of `line-height`: a length stays, a number multiplies the
+// font size of THIS elem, `normal` is ascent plus descent.
+fn used_line_height(s: Gc[Style]) -> f64 {
+    let u: u32 = cascade.style_unit(s, cascade.S_LINE_HEIGHT)
+    let fs: f64 = cascade.style_font_size(s)
+    if u == cascade.U_NORMAL {
+        return font_ascent(fs) + font_descent(fs)
+    }
+    if u == cascade.U_NUMBER {
+        return cascade.style_length(s, cascade.S_LINE_HEIGHT) * fs
+    }
+    return cascade.style_length(s, cascade.S_LINE_HEIGHT)
+}
+
+// ------------------------------------------------------- Lengths and edges
+
+fn length_is_auto(s: Gc[Style], slot: usize) -> bool {
+    return cascade.style_unit(s, slot) == cascade.U_AUTO
+}
+
+fn length_is_none(s: Gc[Style], slot: usize) -> bool {
+    return cascade.style_unit(s, slot) == cascade.U_NONE
+}
+
+fn length_px(s: Gc[Style], slot: usize) -> f64 {
+    return cascade.style_length(s, slot)
+}
+
+// A length against a reference. Returns `false` for `auto` and `none` --
+// the caller has to decide what those mean, and there is no sensible
+// number to stand in for them.
+fn resolve(s: Gc[Style], slot: usize, reference: f64, out: *mut f64) -> bool {
+    let u: u32 = cascade.style_unit(s, slot)
+    if u == cascade.U_AUTO || u == cascade.U_NONE {
+        return false
+    }
+    // The keyword sizes of css-sizing are not lengths: only the layout
+    // knows what `max-content` is worth. Whoever asks here gets the same
+    // answer as for `auto` and has to ask `flow.keyword_size_axis`.
+    if u >= cascade.U_MIN_CONTENT {
+        return false
+    }
+    if u == cascade.U_PERCENT {
+        *out = snap(cascade.style_length(s, slot) * reference / 100.0)
+        return true
+    }
+    *out = snap(cascade.style_length(s, slot))
+    return true
+}
+
+// THE LAYOUT GRID. Every used length is snapped to a sixty-fourth of a
+// pixel, downwards. That is a decision, not a rule of the standard: CSS
+// says nothing about precision, and every engine has such a grid --
+// Blink and WebKit use 1/64 px, Gecko 1/60. Without a grid the same
+// document computes differently on different machines, and `1em` of
+// `font-size: 23.4px` becomes a number nobody can reproduce.
+//
+// It is also the reason the cross-check against Chromium comes out to the
+// last digit instead of "almost": Chromium snaps in the SAME grid, and
+// the third decimal place of a percentage is exactly where a layout
+// engine and its measurement drift apart.
+fn snap(v: f64) -> f64 {
+    return math.floor(v * 64.0) / 64.0
+}
+
+// The same, but `auto` counts as zero -- right for margins, padding and
+// border widths, wrong for everything else.
+fn resolve_or_zero(s: Gc[Style], slot: usize, reference: f64) -> f64 {
+    var v: f64 = 0.0
+    if resolve(s, slot, reference, &v) {
+        return v
+    }
+    return 0.0
+}
+
+// min/max clamping in the order the standard prescribes: the MAXIMUM
+// first, the minimum after it -- so a min larger than the max wins
+// (CSS 2.1, 10.4).
+fn clamp_size(value: f64, s: Gc[Style], min_slot: usize, max_slot: usize,
+    reference: f64, reference_valid: bool) -> f64 {
+    var v: f64 = value
+    var limit: f64 = 0.0
+    let mu: u32 = cascade.style_unit(s, max_slot)
+    if mu != cascade.U_NONE {
+        if mu != cascade.U_PERCENT || reference_valid {
+            if resolve(s, max_slot, reference, &limit) {
+                if v > limit {
+                    v = limit
+                }
+            }
+        }
+    }
+    let nu: u32 = cascade.style_unit(s, min_slot)
+    if nu != cascade.U_AUTO {
+        if nu != cascade.U_PERCENT || reference_valid {
+            if resolve(s, min_slot, reference, &limit) {
+                if v < limit {
+                    v = limit
+                }
+            }
+        }
+    }
+    return v
+}
+
+fn sum_h_edges(b: Gc[Box]) -> f64 {
+    return b.ml + b.bl + b.pl + b.pr + b.br + b.mr
+}
+
+fn sum_v_edges(b: Gc[Box]) -> f64 {
+    return b.mt + b.bt + b.pt + b.pb + b.bb + b.mb
+}
+
+// ----------------------------------------------------------- Kind questions
+
+fn is_block_level(k: u32) -> bool {
+    return k == BK_BLOCK || k == BK_ANON || k == BK_FLEX
+}
+
+fn is_inline_level(k: u32) -> bool {
+    return k == BK_INLINE || k == BK_TEXT || k == BK_ATOMIC
+}
+
+// A box that opens its own block formatting context: floats, absolutely
+// positioned boxes, inline-blocks, flex containers, anything with
+// `overflow` other than `visible`, and the root elem. Inside such a box
+// margins do not collapse outwards and floats do not stick out.
+fn is_bfc_root(b: Gc[Box]) -> bool {
+    return (b.flags & F_BFC) != 0 as u32
+}
+
+fn establishes_ifc(b: Gc[Box]) -> bool {
+    return (b.flags & F_HAS_BLOCKS) == 0 as u32
+}
+
+// ------------------------------------------------------ The float context
+
+// The floats of ONE block formatting context. They are kept in the
+// coordinates of the BFC root; `dx`/`dy` is the shift of the block
+// currently being laid out against that root, so a nested block can ask
+// "how much room is left at my y" without knowing how deep it sits.
+struct FloatCtx {
+    lefts: Gc[GcVec],
+    rights: Gc[GcVec],
+    dx: f64,
+    dy: f64,
+}
+
+// Like every state with `Gc` fields in this code base, a `FloatCtx` lives
+// in the FRAME of the caller (SPEC 3.5.3, conservative stack scan) -- so
+// `new` makes the empty shell and `init` fills it.
+fn floatctx_new() -> FloatCtx {
+    return FloatCtx {
+        lefts: gc_null[GcVec](),
+        rights: gc_null[GcVec](),
+        dx: 0.0,
+        dy: 0.0,
+    }
+}
+
+// The two vectors are made only when a float really turns up. Most
+// formatting contexts never see one, and every object that is not made is
+// one the collector does not have to walk -- on a large document that is
+// the difference between linear and quadratic (docs/ROUND61.md).
+fn floatctx_init(f: *mut FloatCtx) -> AllocError!bool {
+    (*f).lefts = gc_null[GcVec]()
+    (*f).rights = gc_null[GcVec]()
+    (*f).dx = 0.0
+    (*f).dy = 0.0
+    return true
+}
+
+// The left edge available at `y` (in the coordinates of the current block),
+// given a band of height `height`.
+fn float_left_edge(f: *mut FloatCtx, y: f64, height: f64, base: f64) -> f64 {
+    if (*f).lefts == gc_null[GcVec]() {
+        return base
+    }
+    let top: f64 = y + (*f).dy
+    let bottom: f64 = top + height
+    var edge: f64 = base + (*f).dx
+    var i: u64 = 0
+    let n: u64 = gcvec_length((*f).lefts)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).lefts, i)
+        if r.y < bottom && r.y + r.h > top {
+            if r.x + r.w > edge {
+                edge = r.x + r.w
+            }
+        } else if r.h == 0.0 && r.y <= top && r.y >= top {
+            // A float of zero height still blocks its own line.
+            if r.x + r.w > edge {
+                edge = r.x + r.w
+            }
+        }
+        i = i + 1
+    }
+    return edge - (*f).dx
+}
+
+fn float_right_edge(f: *mut FloatCtx, y: f64, height: f64, base: f64) -> f64 {
+    if (*f).rights == gc_null[GcVec]() {
+        return base
+    }
+    let top: f64 = y + (*f).dy
+    let bottom: f64 = top + height
+    var edge: f64 = base + (*f).dx
+    var i: u64 = 0
+    let n: u64 = gcvec_length((*f).rights)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).rights, i)
+        if r.y < bottom && r.y + r.h > top {
+            if r.x < edge {
+                edge = r.x
+            }
+        } else if r.h == 0.0 && r.y <= top && r.y >= top {
+            if r.x < edge {
+                edge = r.x
+            }
+        }
+        i = i + 1
+    }
+    return edge - (*f).dx
+}
+
+// Adds a float. `x`/`y` are the corner of its MARGIN box in the
+// coordinates of the current block.
+fn float_add(f: *mut FloatCtx, side: u32, x: f64, y: f64, w: f64,
+    h: f64) -> AllocError!bool {
+    if (*f).lefts == gc_null[GcVec]() {
+        (*f).lefts = try gcvec_new()
+        (*f).rights = try gcvec_new()
+    }
+    let r = try frag_new(gc_null[Box]())
+    r.x = x + (*f).dx
+    r.y = y + (*f).dy
+    r.w = w
+    r.h = h
+    if side == cascade.FLOAT_LEFT {
+        return try gcvec_append[Frag]((*f).lefts, r)
+    }
+    return try gcvec_append[Frag]((*f).rights, r)
+}
+
+// How many floats stand in the context. A caller notes the mark before it
+// descends into a block and can afterwards say exactly which floats came
+// out of that block.
+fn float_mark(f: *mut FloatCtx, side: u32) -> u64 {
+    if (*f).lefts == gc_null[GcVec]() {
+        return 0
+    }
+    if side == cascade.FLOAT_LEFT {
+        return gcvec_length((*f).lefts)
+    }
+    return gcvec_length((*f).rights)
+}
+
+// Moves every float that was entered after a mark.
+//
+// WHY THIS EXISTS. A float is placed at the y the layout ESTIMATES for the
+// block it stands in, and that estimate is made BEFORE the block is laid
+// out -- it has to be, because the float decides how wide the lines of
+// that block may be. The estimate is wrong in exactly one case: when a
+// margin escapes UPWARDS out of the block afterwards and moves the whole
+// block with it. The float box itself is put right by `place_tree`, which
+// walks the finished tree; only its RECORD in the float context stays
+// behind. And that record is what the auto height of the formatting
+// context root is read from -- so without this, a float inside a box with
+// an escaping margin makes the root element too short. Measured against
+// Chromium: 100 px instead of 150.
+fn float_shift_from(f: *mut FloatCtx, from_l: u64, from_r: u64, dy: f64) {
+    if dy == 0.0 {
+        return
+    }
+    if (*f).lefts == gc_null[GcVec]() {
+        return
+    }
+    var i: u64 = from_l
+    var n: u64 = gcvec_length((*f).lefts)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).lefts, i)
+        r.y = r.y + dy
+        i = i + 1
+    }
+    i = from_r
+    n = gcvec_length((*f).rights)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).rights, i)
+        r.y = r.y + dy
+        i = i + 1
+    }
+}
+
+// The lowest bottom edge of all floats, in the coordinates of the current
+// block. Used for the auto height of a block formatting context root.
+fn float_lowest(f: *mut FloatCtx) -> f64 {
+    if (*f).lefts == gc_null[GcVec]() {
+        return 0.0 - (*f).dy
+    }
+    var low: f64 = 0.0
+    var i: u64 = 0
+    var n: u64 = gcvec_length((*f).lefts)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).lefts, i)
+        if r.y + r.h > low {
+            low = r.y + r.h
+        }
+        i = i + 1
+    }
+    i = 0
+    n = gcvec_length((*f).rights)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).rights, i)
+        if r.y + r.h > low {
+            low = r.y + r.h
+        }
+        i = i + 1
+    }
+    return low - (*f).dy
+}
+
+// The next y at which the available width could change: the lowest bottom
+// edge of the floats that reach past `y`. That is how a line that does not
+// fit next to a float finds the place where it does.
+fn float_next_y(f: *mut FloatCtx, y: f64) -> f64 {
+    if (*f).lefts == gc_null[GcVec]() {
+        return y
+    }
+    let top: f64 = y + (*f).dy
+    var best: f64 = 0.0
+    var found: bool = false
+    var i: u64 = 0
+    var n: u64 = gcvec_length((*f).lefts)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).lefts, i)
+        let b: f64 = r.y + r.h
+        if b > top {
+            if !found || b < best {
+                best = b
+                found = true
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    n = gcvec_length((*f).rights)
+    while i < n {
+        let r: Gc[Frag] = gcvec_read[Frag]((*f).rights, i)
+        let b: f64 = r.y + r.h
+        if b > top {
+            if !found || b < best {
+                best = b
+                found = true
+            }
+        }
+        i = i + 1
+    }
+    if !found {
+        return y
+    }
+    return best - (*f).dy
+}
+
+// The y a `clear` pushes down to.
+fn float_clear_y(f: *mut FloatCtx, y: f64, which: u32) -> f64 {
+    if (*f).lefts == gc_null[GcVec]() {
+        return y
+    }
+    var result: f64 = y + (*f).dy
+    if which == cascade.CLEAR_LEFT || which == cascade.CLEAR_BOTH {
+        var i: u64 = 0
+        let n: u64 = gcvec_length((*f).lefts)
+        while i < n {
+            let r: Gc[Frag] = gcvec_read[Frag]((*f).lefts, i)
+            if r.y + r.h > result {
+                result = r.y + r.h
+            }
+            i = i + 1
+        }
+    }
+    if which == cascade.CLEAR_RIGHT || which == cascade.CLEAR_BOTH {
+        var i2: u64 = 0
+        let n2: u64 = gcvec_length((*f).rights)
+        while i2 < n2 {
+            let r: Gc[Frag] = gcvec_read[Frag]((*f).rights, i2)
+            if r.y + r.h > result {
+                result = r.y + r.h
+            }
+            i2 = i2 + 1
+        }
+    }
+    return result - (*f).dy
+}
+
+// ------------------------------------------------- The replaced element
+//
+// CSS 2.1, 10.3.2 and 10.4: a box with an INTRINSIC size and an aspect
+// ratio. The four cases, and the third and fourth are the ones that get
+// forgotten:
+//
+//   width and height given   -> both are used, the ratio is broken
+//   width given, height auto -> height = width / ratio
+//   height given, width auto -> width  = height * ratio
+//   both auto                -> the intrinsic size
+//
+// The ratio is the intrinsic one, so a picture that is 800 x 600 and gets
+// `width: 400px` is 300 high and not 600. A browser that leaves the height
+// at `auto` meaning zero makes every image-heavy page reflow when the
+// pictures arrive, which is the single most visible layout bug there is.
+// The DEFAULT OBJECT SIZE of css-images-3, 5.1. Every browser uses these
+// two numbers, and they are in the standard because a replaced element
+// that knows nothing about itself still has to be laid out somewhere.
+fn DEFAULT_OBJECT_W() -> f64 {
+    return 300.0
+}
+
+fn DEFAULT_OBJECT_H() -> f64 {
+    return 150.0
+}
+
+fn box_is_replaced(b: Gc[Box]) -> bool {
+    return (b.flags & F_REPLACED) != 0 as u32
+}
+
+// The ratio this box is sized by: the `aspect-ratio` property where it
+// says something, otherwise the natural one. `aspect-ratio: auto 2 / 1`
+// prefers a natural ratio and falls back to 2/1; a bare `2 / 1` always
+// wins (css-sizing-4, 4).
+fn box_ratio(b: Gc[Box]) -> f64 {
+    let ar: f64 = cascade.style_aspect_ratio(b.style)
+    if ar > 0.0 {
+        if cascade.style_ar_auto(b.style) && b.ratio > 0.0 {
+            return b.ratio
+        }
+        return ar
+    }
+    return b.ratio
+}
+
+fn box_has_ratio(b: Gc[Box]) -> bool {
+    return box_ratio(b) > 0.0
+}
+
+// `has_w`/`has_h` say whether the style settled that axis; `wv`/`hv` are
+// the settled content values. The answers come back in `out_w`/`out_h`.
+fn replaced_size(b: Gc[Box], has_w: bool, wv: f64, has_h: bool, hv: f64,
+    out_w: *mut f64, out_h: *mut f64) {
+    let r: f64 = box_ratio(b)
+    if has_w && has_h {
+        *out_w = wv
+        *out_h = hv
+        return
+    }
+    if has_w {
+        *out_w = wv
+        if r > 0.0 {
+            *out_h = wv / r
+        } else if b.ih > 0.0 {
+            *out_h = b.ih
+        } else {
+            *out_h = DEFAULT_OBJECT_H()
+        }
+        return
+    }
+    if has_h {
+        *out_h = hv
+        if r > 0.0 {
+            *out_w = hv * r
+        } else if b.iw > 0.0 {
+            *out_w = b.iw
+        } else {
+            *out_w = DEFAULT_OBJECT_W()
+        }
+        return
+    }
+    // Neither axis is settled. The natural size comes first; a ratio with
+    // only one natural side fills in the other; a ratio with no natural
+    // side at all is laid into the default object size so that the ratio
+    // is kept and the box CONTAINS itself -- that is the `contain`
+    // constraint of css-images-3, 5.1, and it is why a 4:1 picture of
+    // unknown size becomes 300 x 75 and not 300 x 150.
+    if r > 0.0 && b.iw > 0.0 && r != b.ratio {
+        // The `aspect-ratio` PROPERTY was given without `auto`, so it
+        // replaces the natural ratio (css-sizing-4, 4). The natural size
+        // then still says how WIDE the box is, but no longer how tall:
+        // a 50 x 25 canvas with `aspect-ratio: 1` is 50 x 50.
+        *out_w = b.iw
+        *out_h = b.iw / r
+        return
+    }
+    if b.iw > 0.0 && b.ih > 0.0 {
+        *out_w = b.iw
+        *out_h = b.ih
+        return
+    }
+    if r > 0.0 {
+        if b.iw > 0.0 {
+            *out_w = b.iw
+            *out_h = b.iw / r
+            return
+        }
+        if b.ih > 0.0 {
+            *out_h = b.ih
+            *out_w = b.ih * r
+            return
+        }
+        if DEFAULT_OBJECT_W() / r <= DEFAULT_OBJECT_H() {
+            *out_w = DEFAULT_OBJECT_W()
+            *out_h = DEFAULT_OBJECT_W() / r
+        } else {
+            *out_h = DEFAULT_OBJECT_H()
+            *out_w = DEFAULT_OBJECT_H() * r
+        }
+        return
+    }
+    if b.iw > 0.0 {
+        *out_w = b.iw
+    } else {
+        *out_w = DEFAULT_OBJECT_W()
+    }
+    if b.ih > 0.0 {
+        *out_h = b.ih
+    } else {
+        *out_h = DEFAULT_OBJECT_H()
+    }
+}

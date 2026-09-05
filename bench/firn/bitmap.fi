@@ -1,0 +1,143 @@
+// expect_out: 4398042318848
+// Microbenchmark 7: THE FRAME ALLOCATOR OF A KERNEL, bit by bit.
+//
+// This is the shape of `kernel/firn/bitmap.fi` in the osum kernel -- the
+// program whose failure on `--opt-level=release-safe` opened round 90. One
+// bit per 4 KiB page, allocate = find the first clear bit and set it, free =
+// clear it again. The inner loop is a byte load, a mask, a branch and an
+// index computation, which is why it is worth measuring: there is nothing
+// in it to hide behind.
+//
+// Counterpart: bench/rust/bitmap.rs
+fn print_u64(v: u64) {
+    var buf: [u8; 24] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var n: usize = 0
+    var x: u64 = v
+    if x == 0 {
+        buf[0] = 48
+        n = 1
+    }
+    while x > 0 {
+        buf[n] = (x % 10) as u8 + 48
+        x = x / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    while i < n / 2 {
+        let t: u8 = buf[i]
+        buf[i] = buf[n - 1 - i]
+        buf[n - 1 - i] = t
+        i = i + 1
+    }
+    buf[n] = 10
+    syscall(1, 1, &buf[0], (n + 1) as i64)
+}
+
+fn alloc(size: usize) -> usize {
+    // mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    let r: i64 = syscall(9, 0, size as i64, 3, 34, -1, 0)
+    return r as usize
+}
+
+fn ld8(p: usize, i: usize) -> u8 {
+    let q: *mut u8 = (p + i) as *mut u8
+    return *q
+}
+
+fn st8(p: usize, i: usize, v: u8) {
+    let q: *mut u8 = (p + i) as *mut u8
+    *q = v
+}
+
+fn ld64(p: usize, i: usize) -> u64 {
+    let q: *mut u64 = (p + i * 8) as *mut u64
+    return *q
+}
+
+fn st64(p: usize, i: usize, v: u64) {
+    let q: *mut u64 = (p + i * 8) as *mut u64
+    *q = v
+}
+
+fn bit_get(p: usize, i: usize) -> bool {
+    return (ld8(p, i >> 3) & (1 << (i & 7)) as u8) != 0
+}
+
+fn bit_set(p: usize, i: usize) {
+    st8(p, i >> 3, ld8(p, i >> 3) | (1 << (i & 7)) as u8)
+}
+
+fn bit_clear(p: usize, i: usize) {
+    st8(p, i >> 3, ld8(p, i >> 3) & (255 - (1 << (i & 7))) as u8)
+}
+
+// The first free frame, set and returned. `n` = number of frames.
+// Whole full octets are skipped -- that is what makes it a search and not a
+// linear scan over bits.
+fn take(p: usize, n: usize, from: usize) -> usize {
+    var f: usize = from
+    while f < n {
+        if ld8(p, f >> 3) == 255 {
+            f = (f | 7) + 1
+        } else {
+            if !bit_get(p, f) {
+                bit_set(p, f)
+                return f
+            }
+            f = f + 1
+        }
+    }
+    return n
+}
+
+fn main() -> i32 {
+    let frames: usize = 1 << 20
+    let bytes: usize = frames >> 3
+    let bm: usize = alloc(bytes)
+    var i: usize = 0
+    while i < bytes {
+        st8(bm, i, 0)
+        i = i + 1
+    }
+
+    var total: u64 = 0
+    var round: usize = 0
+    while round < 8 {
+        // fill the whole bitmap, one frame at a time
+        var got: usize = 0
+        var cursor: usize = 0
+        while got < frames {
+            let f: usize = take(bm, frames, cursor)
+            if f == frames {
+                got = frames
+            } else {
+                total = total + f as u64
+                cursor = f
+                got = got + 1
+            }
+        }
+        // free every seventh frame and take it again
+        var k: usize = 0
+        while k < frames {
+            bit_clear(bm, k)
+            k = k + 7
+        }
+        k = 0
+        while k < frames {
+            let g: usize = take(bm, frames, k)
+            if g < frames {
+                total = total + 1
+            }
+            k = k + 4096
+        }
+        // clear for the next round
+        i = 0
+        while i < bytes {
+            st8(bm, i, 0)
+            i = i + 1
+        }
+        round = round + 1
+    }
+    print_u64(total)
+    return 0
+}

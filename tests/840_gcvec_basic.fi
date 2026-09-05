@@ -1,0 +1,215 @@
+// expect_exit: 0
+// Round 53: `GcVec` -- the collection with a mutable length in the GC heap
+// (SPEC 3.5.2). Basics: append, read, set, detach,
+// remove, clear, grow -- and the two promises that matter:
+//
+//   1. the collector traces the elements EVEN after growing (that is, after
+//      copying over into a new buffer),
+//   2. a cycle that runs through a `GcVec` (node -> GcVec -> node)
+//      is collected. That is the normal case for the DOM.
+
+gc class Node {
+    children: Gc[GcVec],
+    parent: Gc[Node],
+    mark: u64,
+}
+
+fn node(mark: u64) -> AllocError!Gc[Node] {
+    return try gc Node {
+        children: try gcvec_new(),
+        parent: gc_null[Node](),
+        mark: mark,
+    }
+}
+
+// A cycle: the parent holds the children through a GcVec, every child holds
+// the parent strongly back. A reference count never frees such a thing.
+fn cycle(n: u64) -> AllocError!u64 {
+    let e: Gc[Node] = try node(1)
+    var i: u64 = 0
+    while i < n {
+        let k: Gc[Node] = try node(100 + i)
+        k.parent = e
+        let ok: bool = try gcvec_append[Node](e.children, k)
+        i = i + 1
+    }
+    return gcvec_length(e.children)
+}
+
+// Clear the dead stack area below one's own frame. The scan is
+// CONSERVATIVE: old pointers are still standing in frames that have been
+// left, and every single one keeps a whole subtree alive (a parent pulls its
+// GcVec, its buffer and 20 children along). Without the optimiser clearly
+// more of them remain than with it -- which is why the clearing belongs into
+// the test and not into the tolerance (the same build as __gc_scrub_deep).
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 256 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+
+    // --- 1. raw vector: numbers, NOT traced by the collector -------------
+    let r: Gc[GcVec] = gcvec_new_raw() catch gc_null[GcVec]()
+    if (r as u64) == 0 {
+        return 91
+    }
+    if gcvec_length(r) != 0 {
+        return 1
+    }
+    if gcvec_capacity(r) != 0 {
+        return 2
+    }
+    var i: u64 = 0
+    while i < 1000 {
+        let ok: bool = gcvec_append_raw(r, i * 3 + 1) catch false
+        if !ok {
+            return 3
+        }
+        i = i + 1
+    }
+    if gcvec_length(r) != 1000 {
+        return 4
+    }
+    // Doubling, so never more than twice the length.
+    if gcvec_capacity(r) < 1000 || gcvec_capacity(r) > 2048 {
+        return 5
+    }
+    i = 0
+    while i < 1000 {
+        if gcvec_read_raw(r, i) != i * 3 + 1 {
+            return 6
+        }
+        i = i + 1
+    }
+    // Outside: 0, no crash.
+    if gcvec_read_raw(r, 1000) != 0 {
+        return 7
+    }
+    if gcvec_set_raw(r, 1000, 5) {
+        return 8
+    }
+    if !gcvec_set_raw(r, 7, 4242) {
+        return 9
+    }
+    if gcvec_read_raw(r, 7) != 4242 {
+        return 10
+    }
+    // detach
+    if gcvec_detach_raw(r) != 999 * 3 + 1 {
+        return 11
+    }
+    if gcvec_length(r) != 999 {
+        return 12
+    }
+    // removing keeps the order
+    if !gcvec_remove(r, 0) {
+        return 13
+    }
+    if gcvec_length(r) != 998 {
+        return 14
+    }
+    if gcvec_read_raw(r, 0) != 4 {
+        return 15
+    }
+    if gcvec_read_raw(r, 6) != 4242 {
+        return 16
+    }
+    // find
+    if gcvec_find_raw(r, 4242) != 6 {
+        return 17
+    }
+    if gcvec_find_raw(r, 999999) != 998 {
+        return 18
+    }
+    gcvec_clear(r)
+    if gcvec_length(r) != 0 {
+        return 19
+    }
+    // After clearing, the buffer stays, so nothing is allocated anew.
+    if gcvec_capacity(r) < 998 {
+        return 20
+    }
+
+    // --- 2. pointer vector: elements survive the growth ------------------
+    let v: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
+    if (v as u64) == 0 {
+        return 92
+    }
+    var j: u64 = 0
+    while j < 5000 {
+        let k: Gc[Node] = node(j + 1) catch gc_null[Node]()
+        if (k as u64) == 0 {
+            return 21
+        }
+        let ok: bool = gcvec_append[Node](v, k) catch false
+        if !ok {
+            return 22
+        }
+        j = j + 1
+    }
+    // A full collection: every element has to get through it although the
+    // buffer has been copied over several times by now.
+    gc_collect()
+    gc_collect()
+    j = 0
+    while j < 5000 {
+        let k: Gc[Node] = gcvec_read[Node](v, j)
+        if (k as u64) == 0 {
+            return 23
+        }
+        if k.mark != j + 1 {
+            return 24
+        }
+        j = j + 1
+    }
+    // set with a barrier, then read again
+    let replacement: Gc[Node] = node(777777) catch gc_null[Node]()
+    if !gcvec_set[Node](v, 100, replacement) {
+        return 25
+    }
+    gc_collect()
+    if gcvec_read[Node](v, 100).mark != 777777 {
+        return 26
+    }
+    if gcvec_find[Node](v, replacement) != 100 {
+        return 27
+    }
+
+    // --- 3. a cycle through a GcVec is collected -------------------------
+    gc_collect()
+    let before: u64 = gc_live_objects()
+    // 200 sets of 1 parent + 1 GcVec + 1 buffer + 20 children with an
+    // (empty) GcVec each.
+    var s: u64 = 0
+    while s < 200 {
+        let n: u64 = cycle(20) catch 0
+        if n != 20 {
+            return 28
+        }
+        s = s + 1
+    }
+    scrub(8)
+    gc_collect()
+    gc_collect()
+    // 200 sets of 43 objects each = 8600. If more than a fraction of that
+    // is left, the collection leaks. The limit is generous, because a
+    // single accidental hit of the conservative scan holds 43 objects
+    // -- but it lies two orders of magnitude below what a real leak
+    // would give.
+    if gc_live_objects() > before + 400 {
+        return 29
+    }
+    return 0
+}

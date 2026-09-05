@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: MIT
+// lib/rt/intern.fi -- mapping strings onto numbers.
+//
+// WHY THIS BELONGS WITH `Map`: `lib/rt/map.fi` has SCALAR keys. A name table
+// of the compiler, however, has identifiers as keys. The Rust compiler solves
+// it no differently -- `Interner` hands out one number per identifier, and
+// everything after that computes with numbers. Only both building blocks
+// together add up to point 3 of the list in `docs/SELF_HOSTING.md` 4.
+//
+// Two gains that go beyond "it works too":
+//   * Comparing two identifiers is a comparison of two `u32` instead of a
+//     run through a byte loop. The name resolver does that millions of times.
+//   * Every identifier lies exactly ONCE in memory, no matter how often it
+//     occurs inside the source.
+//
+// STRUCTURE: all bytes one after another inside an `rt.Buf`, plus offset and
+// length per number inside two `Vec[u32]`. The lookup runs over a table of
+// its own with open addressing that holds numbers instead of strings -- while
+// probing, the text is compared, not the hash value. Hash collisions are
+// therefore handled CORRECTLY and not merely made unlikely.
+//
+// THE HONEST LIMITS:
+//   * There is no removal. An interner only ever grows -- for one compiler
+//     run that is right, for a long running process it is not.
+//   * `intern_ptr` is valid only until the next `intern_number`: the text
+//     buffer may move. Whoever wants to keep the pointer makes a copy.
+
+import rt
+import vec
+
+export { Interner, intern_new, intern_free, intern_number, intern_find,
+    intern_ptr, intern_length, intern_count, intern_equal,
+    intern_prefix, intern_ab, intern_hash_bytes }
+
+struct Interner {
+    text: rt.Buf, // all identifiers one after another
+    off: Vec[u32], // offset into the text per number
+    len: Vec[u32], // length per number
+    slots: u64, // array of u32: 0 = empty, otherwise number + 1
+    cap: usize, // a power of two, or 0
+    cnt: usize,
+}
+
+// FNV-1a, 64 bit. Byte by byte, no table lookup -- for identifiers (mostly
+// under 16 bytes) that beats every block wise method, because there the
+// overhead for the remainder is larger than the saving.
+fn intern_hash_bytes(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < n {
+        h = h ^ rt.ld8(p, i) as u64
+        h = h *% 1099511628211 as u64 // ROUND 72: FNV-1a wraps on purpose, *% says so
+        i = i + 1
+    }
+    return h
+}
+
+fn intern_new() -> Interner {
+    return Interner {
+        text: rt.buf_new(),
+        off: vec_new[u32](),
+        len: vec_new[u32](),
+        slots: 0,
+        cap: 0,
+        cnt: 0,
+    }
+}
+
+fn intern_free(t: *mut Interner) {
+    rt.buf_free(&(*t).text)
+    vec_free[u32](&(*t).off)
+    vec_free[u32](&(*t).len)
+    if (*t).cap > 0 {
+        rt.heap_free((*t).slots, (*t).cap * 4)
+    }
+    (*t).slots = 0
+    (*t).cap = 0
+    (*t).cnt = 0
+}
+
+fn intern_count(t: *mut Interner) -> usize {
+    return (*t).cnt
+}
+
+fn intern_length(t: *mut Interner, nr: u32) -> usize {
+    if nr as usize >= (*t).cnt {
+        return 0
+    }
+    return vec_at[u32](&(*t).len, nr as usize) as usize
+}
+
+// VALID ONLY UNTIL THE NEXT `intern_number` -- the text buffer may move.
+fn intern_ptr(t: *mut Interner, nr: u32) -> u64 {
+    if nr as usize >= (*t).cnt {
+        return 0
+    }
+    return rt.buf_ptr(&(*t).text) + vec_at[u32](&(*t).off, nr as usize) as u64
+}
+
+// ROUND 45: does the name start with these bytes? Needed for the compiler
+// internal prefixes (`"method "`) that tell a call name apart from an
+// identifier of the source text.
+fn intern_prefix(t: *mut Interner, nr: u32, p: u64, n: usize) -> bool {
+    if intern_length(t, nr) < n {
+        return false
+    }
+    return rt.mem_eq(intern_ptr(t, nr), p, n)
+}
+
+// The name FROM byte `of` onwards, as a number of its own. The text is copied
+// out FIRST: `intern_number` can make the text buffer move, and after that
+// `intern_ptr` would point at nothing (see the comment at the top of the file).
+fn intern_ab(t: *mut Interner, nr: u32, of: usize) -> u32 {
+    let len: usize = intern_length(t, nr)
+    var b: rt.Buf = rt.buf_new()
+    if of < len {
+        rt.buf_push_bytes(&b, intern_ptr(t, nr) + of as u64, len - of)
+    }
+    let r: u32 = intern_number(t, rt.buf_ptr(&b), rt.buf_len(&b)) as u32
+    rt.buf_free(&b)
+    return r
+}
+
+fn intern_equal(t: *mut Interner, nr: u32, p: u64, n: usize) -> bool {
+    if intern_length(t, nr) != n {
+        return false
+    }
+    return rt.mem_eq(intern_ptr(t, nr), p, n)
+}
+
+// Creates the probe table anew and enters every existing number into it.
+fn intern_grow(t: *mut Interner, new_cap: usize) -> bool {
+    var cap: usize = 16
+    while cap < new_cap {
+        cap = cap * 2
+    }
+    let field: u64 = rt.heap_alloc(cap * 4)
+    if field == 0 {
+        return false
+    }
+    rt.mem_set(field, 0 as u8, cap * 4)
+    let mask: u64 = cap as u64 - 1
+    var nr: usize = 0
+    while nr < (*t).cnt {
+        let p: u64 = rt.buf_ptr(&(*t).text) + vec_at[u32](&(*t).off, nr) as u64
+        let n: usize = vec_at[u32](&(*t).len, nr) as usize
+        var i: u64 = intern_hash_bytes(p, n) & mask
+        while rt.ld32(field, i as usize) != 0 as u32 {
+            i = (i + 1) & mask
+        }
+        rt.st32(field, i as usize, nr as u32 + 1)
+        nr = nr + 1
+    }
+    if (*t).cap > 0 {
+        rt.heap_free((*t).slots, (*t).cap * 4)
+    }
+    (*t).slots = field
+    (*t).cap = cap
+    return true
+}
+
+// The number of an already known text; `-1` if it is missing. Unlike
+// `intern_number` this creates NOTHING -- the name resolver needs exactly
+// that when it only asks whether an identifier occurs at all.
+fn intern_find(t: *mut Interner, p: u64, n: usize) -> i64 {
+    if (*t).cap == 0 {
+        return -1
+    }
+    let mask: u64 = (*t).cap as u64 - 1
+    var i: u64 = intern_hash_bytes(p, n) & mask
+    var steps: usize = 0
+    while steps < (*t).cap {
+        let e: u32 = rt.ld32((*t).slots, i as usize)
+        if e == 0 as u32 {
+            return -1
+        }
+        let nr: u32 = e - 1 as u32
+        if intern_equal(t, nr, p, n) {
+            return nr as i64
+        }
+        i = (i + 1) & mask
+        steps = steps + 1
+    }
+    return -1
+}
+
+// Returns the number of the text -- existing or newly created.
+// On lack of memory `-1`.
+fn intern_number(t: *mut Interner, p: u64, n: usize) -> i64 {
+    let da: i64 = intern_find(t, p, n)
+    if da >= 0 {
+        return da
+    }
+    if ((*t).cnt + 1) * 4 > (*t).cap * 3 {
+        if !intern_grow(t, (*t).cnt * 2 + 16) {
+            return -1
+        }
+    }
+    let offset: usize = rt.buf_len(&(*t).text)
+    rt.buf_push_bytes(&(*t).text, p, n)
+    if !vec_push[u32](&(*t).off, offset as u32) {
+        return -1
+    }
+    if !vec_push[u32](&(*t).len, n as u32) {
+        return -1
+    }
+    let nr: u32 = (*t).cnt as u32
+    (*t).cnt = (*t).cnt + 1
+
+    // CAREFUL: the hash has to be taken from our OWN buffer AFTER the copy
+    // -- `p` may have been lying inside that same buffer and may have moved.
+    let mask: u64 = (*t).cap as u64 - 1
+    let ep: u64 = intern_ptr(t, nr)
+    var i: u64 = intern_hash_bytes(ep, n) & mask
+    while rt.ld32((*t).slots, i as usize) != 0 as u32 {
+        i = (i + 1) & mask
+    }
+    rt.st32((*t).slots, i as usize, nr + 1 as u32)
+    return nr as i64
+}

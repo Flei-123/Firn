@@ -1,0 +1,238 @@
+// expect_exit: 0
+// tests/1600_net_echo.fi -- ROUND 76: `lib/std/net.fi`, the first socket in
+// this repository.
+//
+// WHAT IS CHECKED, and why exactly that:
+//
+//   A  `sockaddr_in` really has the layout the kernel expects. Not
+//      "the struct looks right" -- the offsets are measured against the
+//      addresses of the fields, and the byte swap is held against constants
+//      written out by hand. This is the classic place where network code is
+//      wrong for a week: with 127.0.0.1 and a palindromic port everything
+//      works, and with anything else nothing does.
+//   B  A listener on port 0 gets a REAL port from the kernel and reports
+//      it. Without that this test could not run twice at the same time and
+//      would collide with whatever else has 25565.
+//   C  A server thread and a client in the SAME process push 1 MiB through
+//      127.0.0.1 and every single octet comes back unchanged. The data is a
+//      pseudo random sequence, not a pattern -- with a pattern a mixed up
+//      chunk order would go unnoticed.
+//   D  Short reads are handled. The chunk size is deliberately larger than
+//      what one `recvfrom` has to return; `read_full` loops.
+//   E  The orderly close arrives as `read == 0`, not as an error.
+//   F  A CONNECTION TO A CLOSED PORT FAILS -- with `NetError::Connect`, not
+//      with a hang and not with a success. Without this counter check the
+//      whole test would pass even if `connect` returned a positive number
+//      for everything.
+//   G  Writing into a connection whose peer is gone does NOT kill the
+//      process. MSG_NOSIGNAL is the reason (lib/std/net.fi, NO SIGPIPE);
+//      without it the process would die of SIGPIPE and the test would not
+//      even reach its return statement.
+import std.net
+import std.rt
+
+const CHUNK: usize = 16384
+const CHUNKS: usize = 64 // 64 * 16 KiB = 1 MiB
+
+// The shared page between main thread and server thread. Stage 0 hands a
+// thread ONE `u64`; everything else travels through this block.
+const S_FD: u64 = 0 // the listening descriptor
+const S_ECHOED: u64 = 8 // octets the server echoed
+const S_FAIL: u64 = 16 // != 0: the server ran into something
+const S_PAGE: u64 = 24 // its buffer
+
+fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
+fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
+
+// A pseudo random octet sequence, reproducible on both sides. The
+// multiplier is the one from Knuth's MMIX; the point here is only that
+// consecutive octets have nothing to do with each other. ROUND 83: a
+// linear congruential generator IS arithmetic modulo 2^64 -- `*%`/`+%`
+// (SPEC 13, item L9), or a checking build level aborts on the first
+// octet.
+fn next_state(x: u64) -> u64 {
+    return x *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+}
+
+fn fill(buf: u64, n: usize, seed: u64) -> u64 {
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = next_state(x)
+        // ROUND 83: the low octet of the state, masked rather than cut
+        // by a narrowing `as` (SPEC 13, item L9).
+        *((buf + i as u64) as *mut u8) = ((x >> 33) & 255) as u8
+        i = i + 1
+    }
+    return x
+}
+
+// Compares against the same sequence. Returns the index of the first
+// difference, or n when everything matched.
+fn compare(buf: u64, n: usize, seed: u64) -> usize {
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = next_state(x)
+        if *((buf + i as u64) as *mut u8) != ((x >> 33) & 255) as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// THE SERVER THREAD. Accepts exactly one connection and echoes until the
+// peer closes. `thread_blocking_an/out` around the blocking calls is not
+// decoration: without it a collection run would wait for this thread for as
+// long as it sits in `accept` (docs/ROUND49.md).
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind != 1 {
+        return 0
+    }
+    var l: net.Listener = net.listener_from_fd(ld(arg, S_FD) as i32)
+    thread_blocking_an()
+    var c: net.Conn = net.accept(&l) catch net.conn_from_fd(0 - 1)
+    thread_blocking_out()
+    if !net.conn_is_open(&c) {
+        st(arg, S_FAIL, 1)
+        return 0
+    }
+    let buf: u64 = arg + S_PAGE
+    var total: u64 = 0
+    var running: bool = true
+    while running {
+        thread_blocking_an()
+        let k: usize = net.read(&c, buf, CHUNK) catch 0 as usize
+        thread_blocking_out()
+        if k == 0 {
+            running = false
+        } else {
+            thread_blocking_an()
+            let w: usize = net.write_all(&c, buf, k) catch 0 as usize
+            thread_blocking_out()
+            if w != k {
+                st(arg, S_FAIL, 2)
+                running = false
+            }
+            total = total + k as u64
+        }
+    }
+    st(arg, S_ECHOED, total)
+    net.close(&c)
+    return total
+}
+
+fn main() -> i32 {
+    // --- A: the layout of sockaddr_in, measured ----------------------------
+    if net.host_to_net_16(25565 as u16) != 56675 as u16 { return 1 }
+    if net.host_to_net_16(1 as u16) != 256 as u16 { return 2 }
+    if net.host_to_net_32(net.ADDR_LOCAL) != 16777343 as u32 { return 3 }
+    if net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8) != net.ADDR_LOCAL { return 4 }
+    if net.ipv4(192 as u8, 168 as u8, 3 as u8, 17 as u8) != 3232236305 as u32 { return 5 }
+    // the swap is its own inverse -- that is what the port read back relies on
+    if net.host_to_net_16(net.host_to_net_16(4711 as u16)) != 4711 as u16 { return 6 }
+
+    if !thread_init() { return 10 }
+
+    // --- B: a listener on port 0 gets a real port --------------------------
+    var l: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&l) { return 11 }
+    let port: u16 = net.listener_port(&l)
+    if port == 0 as u16 { return 12 }
+
+    // The shared block: header plus one chunk of buffer for the server.
+    let page: u64 = rt.heap_alloc(S_PAGE as usize + CHUNK)
+    if page == 0 { return 13 }
+    st(page, S_FD, net.listener_fd(&l) as u64)
+    st(page, S_ECHOED, 0)
+    st(page, S_FAIL, 0)
+
+    let h: u64 = thread_start(1, page)
+    if h == 0 { return 14 }
+
+    // --- C/D/E: 1 MiB there and back ---------------------------------------
+    var c: net.Conn = net.connect_tcp(net.ADDR_LOCAL, port) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&c) { return 15 }
+    let no_delay: bool = net.set_no_delay(&c, true) catch false
+    if !no_delay { return 16 }
+
+    let out: u64 = rt.heap_alloc(CHUNK)
+    let back: u64 = rt.heap_alloc(CHUNK)
+    if out == 0 || back == 0 { return 17 }
+
+    var seed_out: u64 = 20260821
+    var seed_back: u64 = 20260821
+    var sent: usize = 0
+    var got: usize = 0
+    var i: usize = 0
+    while i < CHUNKS {
+        seed_out = fill(out, CHUNK, seed_out)
+        let w: usize = net.write_all(&c, out, CHUNK) catch 0 as usize
+        if w != CHUNK { return 20 }
+        sent = sent + w
+        // D: read_full loops over as many short reads as it takes.
+        let r: usize = net.read_full(&c, back, CHUNK) catch 0 as usize
+        if r != CHUNK { return 21 }
+        got = got + r
+        let d: usize = compare(back, CHUNK, seed_back)
+        if d != CHUNK { return 22 }
+        seed_back = seed_out
+        i = i + 1
+    }
+    if sent != CHUNK * CHUNKS { return 23 }
+    if got != CHUNK * CHUNKS { return 24 }
+
+    // E: the orderly close. Half close first, so the server sees the end of
+    // the stream while our own reading side stays usable.
+    net.shutdown_write(&c)
+    let rest: usize = net.read(&c, back, CHUNK) catch 9999 as usize
+    if rest != 0 { return 25 }
+
+    let echoed: u64 = thread_wait(h)
+    if echoed != (CHUNK * CHUNKS) as u64 { return 26 }
+    if ld(page, S_FAIL) != 0 { return 27 }
+    net.close(&c)
+    net.close_listener(&l)
+
+    // --- F: the counter check. A closed port has to REFUSE ------------------
+    // The port was just released, so nothing listens there any more. If this
+    // succeeded, `connect_tcp` would be reporting success for everything and
+    // C above would prove nothing.
+    var dead: net.Conn = net.connect_tcp(net.ADDR_LOCAL, port) catch net.conn_from_fd(0 - 1)
+    if net.conn_is_open(&dead) { return 30 }
+
+    // --- G: writing to a gone peer does not kill us -------------------------
+    // A second listener, one connection, the server side closed hard. The
+    // first write may still succeed (it lands in the local buffer), the
+    // second gets RST. Neither may raise a SIGPIPE that ends the process --
+    // that is what MSG_NOSIGNAL is for.
+    var l2: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&l2) { return 31 }
+    var c2: net.Conn = net.connect_tcp(net.ADDR_LOCAL, net.listener_port(&l2)) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&c2) { return 32 }
+    var s2: net.Conn = net.accept(&l2) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&s2) { return 33 }
+    net.close(&s2)
+    var tries: usize = 0
+    var broke: bool = false
+    while tries < 16 && !broke {
+        let w: usize = net.write(&c2, out, 1024) catch 0 as usize
+        if w == 0 {
+            broke = true
+        }
+        tries = tries + 1
+    }
+    // We are still alive -- that is the whole point of G. Whether the break
+    // came on the first or the fourth write is up to the TCP stack, so it is
+    // not asserted; that the process reached this line is.
+    if !broke { return 34 }
+    if net.conn_error(&c2) == 0 { return 35 }
+    net.close(&c2)
+    net.close_listener(&l2)
+
+    rt.heap_free(out, CHUNK)
+    rt.heap_free(back, CHUNK)
+    rt.heap_free(page, S_PAGE as usize + CHUNK)
+    return 0
+}
