@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/js/harness_run.py -- the ENGINE against test262.
 
 Every case of the chosen subset is really executed. The rules are those of

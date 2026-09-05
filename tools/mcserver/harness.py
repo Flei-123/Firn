@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/mcserver/harness.py -- the Minecraft client that is NOT written in Firn.
 
 The server under test speaks protocol 765 (1.20.4). This file speaks it too,

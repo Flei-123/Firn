@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/stdlib81/hashvectors.py -- lib/std/hash.fi against the world.
 
 FNV-1a is recomputed here in four lines (the algorithm IS four lines, so a

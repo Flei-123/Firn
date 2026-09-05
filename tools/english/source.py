@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/english/source.py — winziger Lexer fuer .rs und .fi, der den
 # Quelltext in CODE und NICHT-CODE (Kommentar, Zeichenkette, Zeichenliteral)
 # zerlegt. Damit trifft eine Umbenennung nur echte Bezeichner und mangelt

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/phi/run.sh -- ROUND 92: THE LOOP COUNTER LEAVES THE FRAME.
 #
 # WHY THIS EXISTS.

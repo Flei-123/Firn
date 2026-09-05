@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Test runner with machine-readable output (requirement `W2`).
 //!
 //! It compiles and starts the same test programs as `test.sh`, but reports the

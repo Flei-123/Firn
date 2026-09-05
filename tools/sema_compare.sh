@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/sema_compare.sh -- the type checker in FIRN against the one in RUST.
 #
 # The YARDSTICK is `firnc0 --emit=types`: the canonical syntax tree with the TYPE at

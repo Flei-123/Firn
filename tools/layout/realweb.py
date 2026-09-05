@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """The cross-check on REAL pages -- the number that cannot be talked up.
 
 The cases in `tools/layout/cases/` are written by the same person who

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/gc_frag/run.sh -- ACCEPTANCE ITEM 2, the half that was open:
 # FRAGMENTATION WITH CHANGING OBJECT SIZES (round 85).
 #

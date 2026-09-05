@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/english/check_comments.py — MASSSTAB fuer Etappe B.
 
 Etappe A hat Bezeichner, Meldungen und Pfadnamen englisch gemacht. Etappe B

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MPL-2.0
 # Produces the Rc test programs out of the ONE implementation
 # (tests/modules/rc.fi, symlink lib/rc/rc.fi) and the test bodies in
 # lib/rc/parts/.

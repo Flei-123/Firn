@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **Round 80 — the target machine.** **Round ARM-FREESTANDING — and the
 //! machine underneath it.**
 //!

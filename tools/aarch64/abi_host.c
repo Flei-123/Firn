@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MPL-2.0 */
 /* tools/aarch64/abi_host.c -- the C side of the AAPCS64 proof. Compiled by
  * aarch64-linux-gnu-gcc, which knows nothing about Firn and follows the
  * written standard. Exit code = the number of disagreements. */

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/js/mktest.py -- turn a JavaScript program into a Firn test.
 
 The tests of the JavaScript path all have the same shape (round 63, round

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Test vectors for lib/num/dtoa.fi and lib/num/strtod.fi (module str).
 //!
 //! This tool is the WORKBENCH, not the product: it produces random

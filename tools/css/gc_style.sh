@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/css/gc_style.sh -- soak run: stylesheets and style tables, no growth.
 #
 # Every round builds the whole CSS path out of one document and one

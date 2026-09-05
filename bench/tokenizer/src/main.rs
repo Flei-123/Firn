@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Messlatte fuer den HTML5-Tokenizer aus `lib/html/` (in Firn).
 //!
 //! GETRENNT VOM COMPILER: dieses Verzeichnis ist ein eigenes Cargo-Projekt und

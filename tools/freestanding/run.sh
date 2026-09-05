@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/freestanding/run.sh -- THE PROOF THAT `profile kernel` MEANS SOMETHING.
 #
 # Round 52. What is checked is what can be READ OFF the produced file, not

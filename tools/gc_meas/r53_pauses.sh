@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/gc_meas/r53_pauses.sh -- pause measurement of round 53.
 #
 # QUESTION: have the pauses become worse through the collections? The state after

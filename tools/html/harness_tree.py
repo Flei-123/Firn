@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """Runner for the HTML tree construction from lib/browser/ (in Firn).
 
 A WORKBENCH, NOT A PRODUCT: this script contains NO parser logic. It
