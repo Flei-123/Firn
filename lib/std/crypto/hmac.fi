@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/hmac.fi -- HMAC (RFC 2104 / FIPS 198-1), round 81.
+//
+// A hash says "these octets are these octets". A MAC says "these octets
+// come from somebody who knows the key" -- and the difference is not
+// academic: `sha256(key + message)` is NOT a MAC. On a Merkle-Damgard hash
+// (which SHA-1 and SHA-256 are) an attacker who has that value can APPEND
+// to the message and compute the new value without knowing the key. That is
+// the length extension attack, it has broken real protocols (Flickr, 2009),
+// and HMAC exists to make it impossible.
+//
+// THE CONSTRUCTION, and every part of it earns its place:
+//
+//     HMAC(K, m) = H( (K' xor opad) || H( (K' xor ipad) || m ) )
+//
+//   * TWO passes over the hash: the inner one produces a digest, the outer
+//     one hashes THAT with a different key. Appending to `m` changes the
+//     inner digest, and the attacker cannot continue the outer hash without
+//     the key.
+//   * K' is the key padded to the BLOCK SIZE (64 octets here), and a key
+//     LONGER than the block is replaced by its own hash first. So a 1,000
+//     octet key and its digest give the same MAC -- that is in the standard
+//     and it is why an implementation may not simply truncate.
+//   * ipad is 0x36 repeated, opad is 0x5c. Two different constants, so that
+//     the inner and the outer key differ in many bits.
+//
+// PROVEN: RFC 2202 (HMAC-SHA1) and RFC 4231 (HMAC-SHA2) test cases, plus
+// the NIST CAVP file `HMAC.rsp` (in `testdata/crypto/`) -- and Python's
+// `hmac` module over random keys and messages, in
+// `tools/stdlib81/run.sh`.
+//
+// HONEST:
+//   H1 THE COMPARISON IS THE CALLER'S JOB, and it must be CONSTANT TIME.
+//      `hmac_equal` is here for that: it xors everything together instead
+//      of stopping at the first difference. A `mem_eq` on a MAC leaks how
+//      many leading octets an attacker guessed right, and that is enough to
+//      forge one octet at a time.
+//   H2 TRUNCATION is allowed by RFC 2104 (`hmac_sha256_trunc`), but never
+//      below 80 bits and never below half the digest.
+import std.rt
+import std.crypto.sha1
+import std.crypto.sha256
+
+export { hmac_sha1, hmac_sha256, hmac_sha256_trunc, hmac_equal,
+    HMAC_BLOCK }
+
+const HMAC_BLOCK: usize = 64
+
+fn hmac_sha1(key: u64, keylen: usize, msg: u64, msglen: usize, out: u64) {
+    var k: [u8; 64] = [0; 64]
+    var i: usize = 0
+    if keylen > HMAC_BLOCK {
+        var kd: [u8; 20] = [0; 20]
+        sha1.sha1(key, keylen, (&kd[0]) as u64)
+        while i < sha1.SHA1_SIZE {
+            k[i] = kd[i]
+            i = i + 1
+        }
+    } else {
+        while i < keylen {
+            k[i] = rt.ld8(key, i)
+            i = i + 1
+        }
+    }
+    var ipad: [u8; 64] = [0; 64]
+    var opad: [u8; 64] = [0; 64]
+    i = 0
+    while i < 64 {
+        ipad[i] = k[i] ^ 54 as u8
+        opad[i] = k[i] ^ 92 as u8
+        i = i + 1
+    }
+    var inner: [u8; 20] = [0; 20]
+    var s: sha1.Sha1 = sha1.sha1_new()
+    sha1.sha1_update(&s, (&ipad[0]) as u64, 64)
+    sha1.sha1_update(&s, msg, msglen)
+    sha1.sha1_final(&s, (&inner[0]) as u64)
+    var o: sha1.Sha1 = sha1.sha1_new()
+    sha1.sha1_update(&o, (&opad[0]) as u64, 64)
+    sha1.sha1_update(&o, (&inner[0]) as u64, sha1.SHA1_SIZE)
+    sha1.sha1_final(&o, out)
+}
+
+fn hmac_sha256(key: u64, keylen: usize, msg: u64, msglen: usize, out: u64) {
+    var k: [u8; 64] = [0; 64]
+    var i: usize = 0
+    if keylen > HMAC_BLOCK {
+        var kd: [u8; 32] = [0; 32]
+        sha256.sha256(key, keylen, (&kd[0]) as u64)
+        while i < sha256.SHA256_SIZE {
+            k[i] = kd[i]
+            i = i + 1
+        }
+    } else {
+        while i < keylen {
+            k[i] = rt.ld8(key, i)
+            i = i + 1
+        }
+    }
+    var ipad: [u8; 64] = [0; 64]
+    var opad: [u8; 64] = [0; 64]
+    i = 0
+    while i < 64 {
+        ipad[i] = k[i] ^ 54 as u8
+        opad[i] = k[i] ^ 92 as u8
+        i = i + 1
+    }
+    var inner: [u8; 32] = [0; 32]
+    var s: sha256.Sha256 = sha256.sha256_new()
+    sha256.sha256_update(&s, (&ipad[0]) as u64, 64)
+    sha256.sha256_update(&s, msg, msglen)
+    sha256.sha256_final(&s, (&inner[0]) as u64)
+    var o: sha256.Sha256 = sha256.sha256_new()
+    sha256.sha256_update(&o, (&opad[0]) as u64, 64)
+    sha256.sha256_update(&o, (&inner[0]) as u64, sha256.SHA256_SIZE)
+    sha256.sha256_final(&o, out)
+}
+
+// H2: the leading `keep` octets. Refuses anything shorter than 10 octets,
+// because a MAC one can guess in 2^40 tries is not a MAC.
+fn hmac_sha256_trunc(key: u64, keylen: usize, msg: u64, msglen: usize,
+    out: u64, keep: usize) -> bool {
+    if keep < 10 || keep > sha256.SHA256_SIZE {
+        return false
+    }
+    var full: [u8; 32] = [0; 32]
+    hmac_sha256(key, keylen, msg, msglen, (&full[0]) as u64)
+    var i: usize = 0
+    while i < keep {
+        rt.st8(out, i, full[i])
+        i = i + 1
+    }
+    return true
+}
+
+// H1: the comparison that does NOT stop early. The loop runs over the whole
+// length in every case and the result depends on the accumulated
+// difference, not on where the first one was.
+fn hmac_equal(a: u64, b: u64, n: usize) -> bool {
+    var diff: u32 = 0
+    var i: usize = 0
+    while i < n {
+        diff = diff | ((rt.ld8(a, i) ^ rt.ld8(b, i)) as u32)
+        i = i + 1
+    }
+    return diff == 0 as u32
+}

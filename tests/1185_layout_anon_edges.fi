@@ -1,0 +1,234 @@
+// expect_exit: 0
+// tests/1185_layout_anon_edges.fi -- the anonymous block, and the margin
+// that walks out of a box.
+//
+// #a has padding, a border and a margin, and it holds BOTH a run of text
+// and a block. CSS 2.1, 9.2.1.1 wraps the text in an ANONYMOUS block box
+// -- and that box has the box properties of the INITIAL style, not those
+// of #a. Round 61 handed the parent's style to it, which gave the
+// anonymous box the padding, the border and the margin of #a a SECOND
+// time and pushed everything under it down by 36 pixels. Nothing in
+// tools/layout/cases caught it, because no case there mixed text and a
+// block inside a padded box.
+//
+//   #a   margin 5, border 3, padding 10, width 300 -> border box 326
+//        high: 20 (one line of text) + 7 + 5 + 26 = 58
+//   #b   the span: at the content corner 18/18, 2 characters of 20 px
+//   #c   18 / 45 -- the content corner 18, plus the 20 px line, plus its
+//        own top margin of 7 (the anonymous box brings none)
+//   #d   93: #a ends at 63, its bottom margin of 5 and the top margin of
+//        #d of 20 are adjoining, and #d's own top margin of 20 is in turn
+//        adjoining the 30 of its first child -- so the largest of the
+//        three, 30, is what counts.
+//   #e   93 as well: its margin LEFT the box.
+//
+// The numbers are computed by hand from CSS 2.1, 8.3.1 and 9.2.1.1, and
+// were held against Chromium 141 afterwards (`getBoundingClientRect()`,
+// same document, font metric of the measuring font): identical.
+//
+// The return value names the first check that fails.
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+import layout.box
+import layout.build
+import layout.flow
+
+const SOURCE_LEN: usize = 148
+const SHEET_LEN: usize = 254
+
+#[no_gc]
+fn source(out: *mut mem.Buf) {
+    var t: [u8; 148] = "<!DOCTYPE html><html><head></head><body><div id=\"a\"><span id=\"b\">xy</span><div id=\"c\"></div></div><div id=\"d\"><div id=\"e\"></div></div></body></html>"
+    mem.buf_clear(out)
+    var i: usize = 0
+    while i < SOURCE_LEN {
+        mem.buf_push(out, t[i])
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn sheet(out: *mut mem.CpBuf) {
+    var t: [u8; 254] = "html,body,div,span{display:block;margin:0;padding:0;border:0}span{display:inline}html{font-size:20px}#a{padding:10px;border:3px solid black;margin:5px;width:300px}#c{height:5px;margin-top:7px}#d{margin-top:20px;height:50px}#e{margin-top:30px;height:10px}"
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < SHEET_LEN {
+        mem.cp_push(out, t[i] as u32)
+        i = i + 1
+    }
+}
+
+fn next_in_order(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+// The n-th elem in document order -- the same order the driver and a
+// browser walk in, so an index here means the same thing everywhere.
+fn elem_at(doc: Gc[Node], want: u64) -> Gc[Node] {
+    var k: Gc[Node] = doc
+    var i: u64 = 0
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            if i == want {
+                return k
+            }
+            i = i + 1
+        }
+        k = next_in_order(k, doc)
+    }
+    return gc_null[Node]()
+}
+
+fn find_box(b: Gc[Box], k: Gc[Node]) -> Gc[Box] {
+    if b.elem == k {
+        return b
+    }
+    var i: u64 = 0
+    while i < box.box_kids(b) {
+        let r: Gc[Box] = find_box(box.box_kid(b, i), k)
+        if r != gc_null[Box]() {
+            return r
+        }
+        i = i + 1
+    }
+    return gc_null[Box]()
+}
+
+// Equal to a thousandth of a pixel. The engine computes in a grid of
+// 1/64 px, so anything below that cannot be a difference of the algorithm.
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < 0.001
+}
+
+fn check(root: Gc[Box], doc: Gc[Node], index: u64, x: f64, y: f64,
+    w: f64, h: f64) -> bool {
+    let k: Gc[Node] = elem_at(doc, index)
+    if k == gc_null[Node]() {
+        return false
+    }
+    let b: Gc[Box] = find_box(root, k)
+    if b == gc_null[Box]() {
+        return false
+    }
+    return near(b.x, x) && near(b.y, y) && near(b.w, w) && near(b.h, h)
+}
+
+// The whole path in one call: HTML to DOM, CSS to rules, cascade, box
+// tree, layout. Exactly what lib/layout/layout_main.fi does.
+fn lay_out(l: *mut driver.Run, src: *mut mem.Buf, css: *mut mem.CpBuf,
+    t: *mut tok.Tokens, tmp: *mut mem.CpBuf, cx: *mut sel.Ctx,
+    w: *mut cascade.Winner, doc_out: *mut Gc[Node])
+-> AllocError!Gc[Box] {
+    driver.run_text_out_bytes(l, mem.buf_ptr(src), mem.buf_len(src))
+    let rc: u32 = driver.run_document_build(l)
+    if rc != 0 as u32 {
+        return gc_null[Box]()
+    }
+    let doc: Gc[Document] = driver.run_document(l)
+    let nm: *mut names.Names = driver.run_names(l)
+    tok.tokenize(t, css)
+    var p: cv.Parser = cv.parser_new(t)
+    let sheet_tree = try cv.parse_stylesheet(&p)
+    var order: u32 = 0
+    let rules = try cascade.collect_rules(sheet_tree, cascade.ORIGIN_AUTHOR, 0,
+        nm, tmp, &order)
+    let styles = try gcmap_new(true, true)
+    let root_style = try cascade.style_root()
+    var k: Gc[Node] = doc
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            var parent_style: Gc[Style] = root_style
+            let parent: Gc[Node] = k.parent
+            if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                let found: Gc[Style] = gcmap_get_value[Style](styles,
+                    parent as u64)
+                if found != gc_null[Style]() {
+                    parent_style = found
+                }
+            }
+            let s = try cascade.cascade_elem(rules, k, parent_style, cx, w)
+            let ok: bool = try gcmap_set_value[Style](styles, k as u64, s)
+        }
+        k = next_in_order(k, doc)
+    }
+    let root = try build.build_document(doc, styles, root_style, nm)
+    if root == gc_null[Box]() {
+        return gc_null[Box]()
+    }
+    let okl: bool = try flow.layout_document(root, 800.0, 600.0)
+    *doc_out = doc
+    return root
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    var src: mem.Buf = mem.buf_new()
+    mem.buf_init(&src)
+    source(&src)
+    var css: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&css)
+    sheet(&css)
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var tmp: mem.CpBuf = mem.cp_new()
+    var l: driver.Run = driver.run_new()
+    if !driver.run_init(&l) {
+        return 91
+    }
+    var cx: sel.Ctx = sel.ctx_new(driver.run_names(&l))
+    sel.ctx_init(&cx)
+    var w: cascade.Winner = cascade.winner_new()
+    var doc: Gc[Node] = gc_null[Node]()
+    let root: Gc[Box] = lay_out(&l, &src, &css, &t, &tmp, &cx, &w, &doc)
+    catch gc_null[Box]()
+    if root == gc_null[Box]() || doc == gc_null[Node]() {
+        return 92
+    }
+    // the root
+    if !check(root, doc, 0, 0.0000, 0.0000, 800.0000, 143.0000) {
+        return 1
+    }
+    // #a -- 326 wide, 58 high
+    if !check(root, doc, 3, 5.0000, 5.0000, 326.0000, 58.0000) {
+        return 2
+    }
+    // #b -- the span on the first line
+    if !check(root, doc, 4, 18.0000, 18.0000, 40.0000, 20.0000) {
+        return 3
+    }
+    // #c -- under the line, plus its own top margin
+    if !check(root, doc, 5, 18.0000, 45.0000, 300.0000, 5.0000) {
+        return 4
+    }
+    // #d -- the largest of the three adjoining margins
+    if !check(root, doc, 6, 0.0000, 93.0000, 800.0000, 50.0000) {
+        return 5
+    }
+    // #e -- its margin escaped upwards
+    if !check(root, doc, 7, 0.0000, 93.0000, 800.0000, 10.0000) {
+        return 6
+    }
+    return 0
+}

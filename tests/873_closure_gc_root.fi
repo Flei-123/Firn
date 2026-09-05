@@ -1,0 +1,127 @@
+// expect_exit: 0
+// ROUND 58 -- THE DANGEROUS PLACE: a captured value that the collector does
+// not see as a root.
+//
+// A closure that captures a `Gc[T]` holds the only reference to that object
+// after its creating frame has been left. If the collector does not trace
+// the capture record, the object is swept while the closure is still using
+// it -- and the mistake shows up much later, as a wrong value or a crash in
+// a completely different place.
+//
+// HOW IT IS PREVENTED (docs/ROUND58.md): the capture record IS an ordinary
+// GC object of a synthesised class. Its `Gc[T]` fields stand in the type
+// table of the collector, exactly like the fields of a `gc class`. So the
+// chain
+//
+//     stack (the fn value) -> capture record -> Gc[Cell] -> ...
+//
+// is traced precisely, with no special path.
+//
+// WHAT THIS TEST DOES: it creates the object in a frame that is then left,
+// scrubs that frame (so that the CONSERVATIVE stack scan cannot keep the
+// object alive by accident), collects repeatedly and allocates hard in
+// between -- a freed block would be handed out again and its content
+// overwritten. Only then does it read through the closure.
+
+gc class Cell { value: u64, next: Gc[Cell] }
+
+fn build(v: u64) -> AllocError!fn() -> u64 {
+    let c: Gc[Cell] = try gc Cell { value: v, next: gc_null[Cell]() }
+    return try gc fn() -> u64 { return c.value }
+}
+
+// A chain, so that the record has to be traced TRANSITIVELY: the closure
+// sees only the head.
+fn build_chain(n: u64) -> AllocError!fn() -> u64 {
+    var head: Gc[Cell] = try gc Cell { value: 1, next: gc_null[Cell]() }
+    var i: u64 = 1
+    while i < n {
+        head = try gc Cell { value: i + 1, next: head }
+        i = i + 1
+    }
+    return try gc fn() -> u64 {
+        var s: u64 = 0
+        var p: Gc[Cell] = head
+        while p != gc_null[Cell]() {
+            s = s + p.value
+            p = p.next
+        }
+        return s
+    }
+}
+
+// Clears the dead stack area below the own frame. The scan is CONSERVATIVE:
+// old pointers are still standing in frames that have been left, and every
+// single one keeps a whole subtree alive. Without the clearing the test
+// would measure the accident, not the tracing (the same helper as in
+// tests/840_gcvec_basic.fi).
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 256 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+// Allocation pressure: a freed block lands on the free list and is handed
+// out again straight away. If the captured object were dead, its content
+// would be overwritten here.
+fn churn(n: u64) -> AllocError!u64 {
+    var i: u64 = 0
+    var s: u64 = 0
+    while i < n {
+        let d: Gc[Cell] = try gc Cell { value: 999999, next: gc_null[Cell]() }
+        s = s + d.value
+        i = i + 1
+    }
+    return s
+}
+
+fn run() -> AllocError!i32 {
+    let read: fn() -> u64 = try build(4711)
+    let chain: fn() -> u64 = try build_chain(10)
+    scrub(4)
+    var k: u64 = 0
+    while k < 5 {
+        gc_collect()
+        let s: u64 = try churn(300)
+        if s == 0 {
+            return 1
+        }
+        gc_collect()
+        k = k + 1
+    }
+    scrub(4)
+    gc_collect()
+    gc_collect()
+    let v: u64 = read()
+    if v != 4711 {
+        return 2
+    }
+    // 1 + 2 + ... + 10
+    let c: u64 = chain()
+    if c != 55 {
+        return 3
+    }
+    // and it still works after further collections
+    gc_collect()
+    if read() != 4711 {
+        return 4
+    }
+    if chain() != 55 {
+        return 5
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    return run() catch 91
+}

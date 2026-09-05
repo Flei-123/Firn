@@ -1,0 +1,4093 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/sema.fi -- THE TYPE CHECKER, WRITTEN IN FIRN.
+//
+// Sixth part of stage 1 and the largest so far: the port of the core
+// of `compiler/src/sema.rs`. It checks what `firnc0` guarantees --
+// **every expression gets a concrete type**.
+//
+// THE METHOD IS BIDIRECTIONAL. In Firn an integer literal carries no type
+// of its own; it comes from the context:
+//
+//     let x: i32 = 5        the context makes the 5 an i32
+//     a + 1                 the 1 takes the type of `a`
+//     5                     on its own: ERROR, nothing to infer from
+//
+// There are therefore two passes over the same tree:
+//   * `probe` works out the type WITHOUT reporting and without writing to
+//     the table, so that in `a + 1` the literal gets its type from `a`;
+//   * `expr` really checks and records the type.
+// The order is part of the contract: the already typed operand first, then
+// the context. Otherwise `let x: i64 = a + 1` (a: i32) reports the error in
+// the wrong place.
+//
+// NOT PORTED (and said here plainly): the error messages. The Firn version
+// COUNTS errors, it does not describe them. The comparison only ever runs
+// on sources that `firnc0` accepts without errors -- there the number of
+// messages is zero and what matters are the types. Missing too are the
+// reachability analysis (`return` at the end), the mutability check
+// (`let` versus `var`) and the recursion check for structs.
+
+import rt
+import vec
+import intern
+import ast
+import types
+import pattern
+import err
+import gc
+import iface
+import core
+import nogc
+import escape
+
+export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
+    sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
+    sema_mu_set, sema_fe_set, sema_gc_set, sema_if_set,
+    sema_kernel_set,
+    sema_tree,
+    sema_closure_index, sema_closure_tid, sema_closure_size,
+    sema_closure_caps, sema_capture_name, sema_capture_ty,
+    sema_is_closure_name,
+    // ROUND 89 (statics.rs, SPEC 14.1.statics) -- the global variables.
+    sema_static_index, sema_static_count, sema_static_name, sema_static_mut,
+    sema_static_align, sema_static_bytes, sema_static_size }
+
+const NONE: u32 = 4294967295
+
+struct Sema {
+    b: u64, // pointer to the tree
+    it: u64, // pointer to the interner
+    ty: types.Types,
+    etyp: Vec[u32], // type per expression node
+    // ROUND 71: 1 where an `f32` expression stands in a place that wants an
+    // `f64`. The type checker has already written `f64` into `etyp` for it;
+    // the lowering puts the `cvtss2sd` in. It is the ONLY implicit
+    // conversion of the language, and it is lossless.
+    w32: Vec[u8],
+    v_name: Vec[u32], // scopes: names, types and bounds
+    v_ty: Vec[u32],
+    b_limit: Vec[u32],
+    k_name: Vec[u32], // constants
+    k_ty: Vec[u32],
+    k_value: Vec[u64],
+    // ROUND 89 -- global variables (`static`, SPEC 14.1.statics). A
+    // constant is a NUMBER and lives in `k_value`; a `static` is a PLACE
+    // and what lives here is the finished sequence of octets that goes
+    // into the object file, plus the one bit that says whether it may be
+    // written to.
+    g_name: Vec[u32], g_ty: Vec[u32], g_mut: Vec[u32],
+    g_off: Vec[u32], g_len: Vec[u32], g_align: Vec[u32],
+    g_data: rt.Buf,
+    t_bool: u32, // prebuilt types
+    t_i64: u32,
+    t_usize: u32,
+    t_void: u32,
+    t_error: u32,
+    t_f64: u32,
+    t_f32: u32,
+    // ROUND 70: the default type of an integer literal without context.
+    t_i32: u32,
+    ret: u32, // return type of the current function
+    mu: u64, // registry of enumerations/pattern matches (0 = none)
+    feh: u64, // registry of error sets/unions (0 = none)
+    gc: u64, // registry of the gc classes (round 34; 0 = none)
+    ifr: u64, // registry of the interfaces (round 46; 0 = none)
+    // `#[must_consume]` (round 36, attrs.rs/sema.rs::check_attrs): intern numbers
+    // of the marked functions and struct INDICES of the marked types.
+    mc_fname: Vec[u32],
+    mc_si: Vec[u32],
+    err: usize,
+    // ROUND 52 (SPEC 2): the kernel profile. It is resolved in
+    // `bin/firnc1.fi` (from the declaration or `--profile=`); here it is
+    // only enforced.
+    kernel: bool,
+    ct_needed: bool, // a constant needs evaluation at compile time
+    // ROUND 58 (fnval.rs): the closures of this translation. One entry per
+    // closure literal; the lowering reads the record layout off it.
+    cl_name: Vec[u32], // the generated function `__closure#N`
+    cl_tid: Vec[u64], // type tag of the capture class, 0 = no captures
+    cl_size: Vec[u64], // size of the record in bytes
+    cl_coff: Vec[u32], cl_clen: Vec[u32], // range in cc_*
+    cc_name: Vec[u32], cc_ty: Vec[u32],
+    // While a closure body is being checked: the length of the scope stack
+    // at its start. Everything found BELOW it is a capture.
+    cap_base: Vec[u32],
+    cg_name: Vec[u32], cg_ty: Vec[u32], cg_frame: Vec[u32],
+    scratch2: rt.Buf, // builds the name of a capture class
+    // ROUND 70: the arguments of an interpolation that may be widened
+    // (`f"{x}"` with an i32 into `io.fmt_number(... i64)`).
+    widen: Vec[u32],
+}
+
+fn sema_new(b: u64, it: u64) -> Sema {
+    return Sema {
+        b: b, it: it,
+        ty: types.types_new(),
+        etyp: vec_new[u32](), w32: vec_new[u8](),
+        v_name: vec_new[u32](), v_ty: vec_new[u32](), b_limit: vec_new[u32](),
+        k_name: vec_new[u32](), k_ty: vec_new[u32](), k_value: vec_new[u64](),
+        g_name: vec_new[u32](), g_ty: vec_new[u32](), g_mut: vec_new[u32](),
+        g_off: vec_new[u32](), g_len: vec_new[u32](), g_align: vec_new[u32](),
+        g_data: rt.buf_new(),
+        t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_error: 0, t_f64: 0,
+        t_f32: 0,
+        t_i32: 0,
+        ret: 0, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_new[u32](), mc_si: vec_new[u32](),
+        err: 0, kernel: false, ct_needed: false,
+        cl_name: vec_new[u32](), cl_tid: vec_new[u64](), cl_size: vec_new[u64](),
+        cl_coff: vec_new[u32](), cl_clen: vec_new[u32](),
+        cc_name: vec_new[u32](), cc_ty: vec_new[u32](),
+        cap_base: vec_new[u32](),
+        cg_name: vec_new[u32](), cg_ty: vec_new[u32](), cg_frame: vec_new[u32](),
+        scratch2: rt.buf_new(),
+        widen: vec_new[u32](),
+    }
+}
+
+fn sema_free(s: *mut Sema) {
+    vec_free[u32](&(*s).widen)
+    types.types_free(&(*s).ty)
+    vec_free[u32](&(*s).etyp)
+    vec_free[u8](&(*s).w32)
+    vec_free[u32](&(*s).v_name)
+    vec_free[u32](&(*s).v_ty)
+    vec_free[u32](&(*s).b_limit)
+    vec_free[u32](&(*s).g_name)
+    vec_free[u32](&(*s).g_ty)
+    vec_free[u32](&(*s).g_mut)
+    vec_free[u32](&(*s).g_off)
+    vec_free[u32](&(*s).g_len)
+    vec_free[u32](&(*s).g_align)
+    rt.buf_free(&(*s).g_data)
+    vec_free[u32](&(*s).k_name)
+    vec_free[u32](&(*s).k_ty)
+    vec_free[u64](&(*s).k_value)
+    vec_free[u32](&(*s).mc_fname)
+    vec_free[u32](&(*s).mc_si)
+    vec_free[u32](&(*s).cl_name)
+    vec_free[u64](&(*s).cl_tid)
+    vec_free[u64](&(*s).cl_size)
+    vec_free[u32](&(*s).cl_coff)
+    vec_free[u32](&(*s).cl_clen)
+    vec_free[u32](&(*s).cc_name)
+    vec_free[u32](&(*s).cc_ty)
+    vec_free[u32](&(*s).cap_base)
+    vec_free[u32](&(*s).cg_name)
+    vec_free[u32](&(*s).cg_ty)
+    vec_free[u32](&(*s).cg_frame)
+    rt.buf_free(&(*s).scratch2)
+}
+
+// ------------------------------------------------- closures (round 58)
+
+// Is this the name of a generated closure function?
+fn sema_is_closure_name(it: *mut intern.Interner, nr: u32) -> bool {
+    var cw: [u8; 10] = "__closure#"
+    return intern.intern_prefix(it, nr, (&cw[0]) as u64, 10)
+}
+
+// Index of a closure by the name of its generated function, or NONE.
+fn sema_closure_index(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).cl_name) {
+        if vec_at[u32](&(*s).cl_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn sema_closure_tid(s: *mut Sema, ci: u32) -> u64 { return vec_at[u64](&(*s).cl_tid, ci as usize) }
+fn sema_closure_size(s: *mut Sema, ci: u32) -> u64 { return vec_at[u64](&(*s).cl_size, ci as usize) }
+fn sema_closure_caps(s: *mut Sema, ci: u32) -> u32 { return vec_at[u32](&(*s).cl_clen, ci as usize) }
+fn sema_capture_name(s: *mut Sema, ci: u32, k: u32) -> u32 {
+    return vec_at[u32](&(*s).cc_name, (vec_at[u32](&(*s).cl_coff, ci as usize) + k) as usize)
+}
+fn sema_capture_ty(s: *mut Sema, ci: u32, k: u32) -> u32 {
+    return vec_at[u32](&(*s).cc_ty, (vec_at[u32](&(*s).cl_coff, ci as usize) + k) as usize)
+}
+
+// Records the USE of a name inside a closure body. Everything that lies
+// below the closure's own scopes is captured, ONCE, in the order of first
+// use.
+fn note_use(s: *mut Sema, name: u32) {
+    if vec_len[u32](&(*s).cap_base) == 0 {
+        return
+    }
+    var i: usize = vec_len[u32](&(*s).v_name)
+    var found: usize = 0
+    var ok: bool = false
+    while i > 0 && !ok {
+        i = i - 1
+        if vec_at[u32](&(*s).v_name, i) == name {
+            found = i
+            ok = true
+        }
+    }
+    if !ok {
+        return
+    }
+    let vt: u32 = vec_at[u32](&(*s).v_ty, found)
+    var fr: usize = 0
+    while fr < vec_len[u32](&(*s).cap_base) {
+        if (found as u32) < vec_at[u32](&(*s).cap_base, fr) {
+            var seen: bool = false
+            var q: usize = 0
+            while q < vec_len[u32](&(*s).cg_name) {
+                if vec_at[u32](&(*s).cg_name, q) == name {
+                    if vec_at[u32](&(*s).cg_frame, q) == fr as u32 {
+                        seen = true
+                    }
+                }
+                q = q + 1
+            }
+            if !seen {
+                vec_push[u32](&(*s).cg_name, name)
+                vec_push[u32](&(*s).cg_ty, vt)
+                vec_push[u32](&(*s).cg_frame, fr as u32)
+            }
+        }
+        fr = fr + 1
+    }
+}
+
+// Is this name captured by the closure currently being checked?
+fn is_captured(s: *mut Sema, name: u32) -> bool {
+    if vec_len[u32](&(*s).cap_base) == 0 {
+        return false
+    }
+    var i: usize = vec_len[u32](&(*s).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*s).v_name, i) == name {
+            let top: u32 = vec_at[u32](&(*s).cap_base, vec_len[u32](&(*s).cap_base) - 1)
+            return (i as u32) < top
+        }
+    }
+    return false
+}
+
+// The closure literal (`fnval.rs::check_lambda`).
+fn lambda_check(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let cname: u32 = ast.e_a(b, e)
+    let poff: u32 = ast.e_b(b, e)
+    let plen: u32 = ast.e_c(b, e)
+    let packed: u64 = ast.e_number(b, e)
+    let heap: bool = (packed & 1) == 1
+    var ret: u32 = (*s).t_void
+    if (packed >> 1) != 0 {
+        ret = ast_ty(s, ((packed >> 1) - 1) as u32)
+    }
+    var par: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < plen {
+        vec_push[u32](&par, ast_ty(s, ast.param_ty(b, poff + k)))
+        k = k + 1
+    }
+    let fty: u32 = types.fn_ty_new(table(s), &par, ret)
+
+    // The body is checked in a scope of its own; `note_use` records what
+    // comes out of the scopes below.
+    let base: u32 = vec_len[u32](&(*s).v_name) as u32
+    vec_push[u32](&(*s).cap_base, base)
+    let frame: u32 = vec_len[u32](&(*s).cap_base) as u32 - 1
+    range_on(s)
+    k = 0
+    while k < plen {
+        var_create(s, ast.param_name(b, poff + k), vec_at[u32](&par, k as usize))
+        k = k + 1
+    }
+    vec_free[u32](&par)
+    let saved_ret: u32 = (*s).ret
+    (*s).ret = ret
+    let fi: u32 = fn_search(s, cname)
+    if fi != NONE {
+        block(s, ast.fn_body(b, fi as usize), true)
+    }
+    (*s).ret = saved_ret
+    range_off(s)
+    vec_pop[u32](&(*s).cap_base)
+
+    // Captured values are COPIED into the record, so they have to fit into
+    // one word -- an aggregate would make the record a variable sized thing
+    // that the collector could no longer describe.
+    let coff: u32 = vec_len[u32](&(*s).cc_name) as u32
+    var clen: u32 = 0
+    var caps: Vec[u32] = vec_new[u32]()
+    var q: usize = 0
+    while q < vec_len[u32](&(*s).cg_name) {
+        if vec_at[u32](&(*s).cg_frame, q) == frame {
+            let ct: u32 = vec_at[u32](&(*s).cg_ty, q)
+            let ck: u32 = types.ty_kind(table(s), ct)
+            let too_big: bool = types.size_of(table(s), ct) > 8
+            let is_agg: bool = ck == types.K_ARR || ck == types.K_STRUCT
+            if too_big || is_agg {
+                complain(s)
+            } else {
+                vec_push[u32](&(*s).cc_name, vec_at[u32](&(*s).cg_name, q))
+                vec_push[u32](&(*s).cc_ty, ct)
+                vec_push[u32](&caps, ct)
+                clen = clen + 1
+            }
+            vec_set[u32](&(*s).cg_frame, q, NONE)
+        }
+        q = q + 1
+    }
+    vec_push[u32](&(*s).cl_name, cname)
+    vec_push[u32](&(*s).cl_coff, coff)
+    vec_push[u32](&(*s).cl_clen, clen)
+    if clen == 0 {
+        vec_free[u32](&caps)
+        vec_push[u64](&(*s).cl_tid, 0)
+        vec_push[u64](&(*s).cl_size, 8)
+        if heap {
+            // captures nothing and needs no GC record
+            complain(s)
+            return (*s).t_error
+        }
+        return fty
+    }
+    if !heap {
+        // captures and therefore needs storage: `gc fn(...)`
+        vec_free[u32](&caps)
+        vec_push[u64](&(*s).cl_tid, 0)
+        vec_push[u64](&(*s).cl_size, 0)
+        complain(s)
+        return (*s).t_error
+    }
+    if !has_gc(s) {
+        vec_free[u32](&caps)
+        vec_push[u64](&(*s).cl_tid, 0)
+        vec_push[u64](&(*s).cl_size, 0)
+        complain(s)
+        return (*s).t_error
+    }
+    rt.buf_clear(&(*s).scratch2)
+    var kw: [u8; 10] = "__capture#"
+    rt.buf_push_bytes(&(*s).scratch2, (&kw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&(*s).scratch2, vec_len[u32](&(*s).cl_name) as u64 - 1)
+    let kname: u32 = intern.intern_number(names(s), rt.buf_ptr(&(*s).scratch2),
+        rt.buf_len(&(*s).scratch2)) as u32
+    let ki: u32 = gc.gc_capture_class(gcp(s), table(s), names(s), kname, &caps)
+    vec_free[u32](&caps)
+    vec_push[u64](&(*s).cl_tid, gc.gc_tid(gcp(s), ki))
+    vec_push[u64](&(*s).cl_size, gc.gc_size(gcp(s), ki))
+    if !has_fe(s) {
+        complain(s)
+        return (*s).t_error
+    }
+    var aw: [u8; 10] = "AllocError"
+    let anr: u32 = intern.intern_number(names(s), (&aw[0]) as u64, 10) as u32
+    let sm: u32 = err.error_set_find(fe(s), anr)
+    if sm == NONE {
+        complain(s)
+        return (*s).t_error
+    }
+    return err.error_union_build(fe(s), table(s), names(s), sm, fty)
+}
+
+fn sema_error(s: *mut Sema) -> usize { return (*s).err }
+
+// Register the pattern registry. MUST happen before `sema_run`.
+fn sema_mu_set(s: *mut Sema, m: u64) { (*s).mu = m }
+
+fn mu(s: *mut Sema) -> *mut pattern.Pat { return (*s).mu as *mut pattern.Pat }
+fn has_mu(s: *mut Sema) -> bool { return (*s).mu != 0 }
+
+// Register the error registry. MUST happen before `sema_run`.
+fn sema_fe_set(s: *mut Sema, f: u64) { (*s).feh = f }
+
+fn fe(s: *mut Sema) -> *mut err.Error { return (*s).feh as *mut err.Error }
+fn has_fe(s: *mut Sema) -> bool { return (*s).feh != 0 }
+
+// Register the gc registry (round 34). MUST happen before `sema_run`.
+fn sema_gc_set(s: *mut Sema, g: u64) { (*s).gc = g }
+
+fn gcp(s: *mut Sema) -> *mut gc.Gc { return (*s).gc as *mut gc.Gc }
+fn has_gc(s: *mut Sema) -> bool { return (*s).gc != 0 }
+
+// Register the interface registry (round 46). MUST happen before
+// `sema_run`.
+fn sema_if_set(s: *mut Sema, f: u64) { (*s).ifr = f }
+
+// ROUND 52 (SPEC 2): the kernel profile has neither `syscall` (there is no
+// operating system below it) nor `gc class` (no global heap).
+fn sema_kernel_set(s: *mut Sema, v: bool) { (*s).kernel = v }
+
+fn ifp(s: *mut Sema) -> *mut iface.If { return (*s).ifr as *mut iface.If }
+fn has_if(s: *mut Sema) -> bool { return (*s).ifr != 0 }
+
+// The tree behind this run (for `nogc.fi`).
+fn sema_tree(s: *mut Sema) -> *mut ast.Tree { return (*s).b as *mut ast.Tree }
+fn sema_needs_comptime(s: *mut Sema) -> bool { return (*s).ct_needed }
+fn sema_types(s: *mut Sema) -> *mut types.Types { return &(*s).ty }
+fn sema_ty_count(s: *mut Sema) -> usize { return vec_len[u32](&(*s).etyp) }
+fn sema_ty(s: *mut Sema, i: u32) -> u32 { return vec_at[u32](&(*s).etyp, i as usize) }
+// ROUND 71: does this expression have to be widened from f32 to f64?
+fn sema_widen32(s: *mut Sema, i: u32) -> bool {
+    if i as usize >= vec_len[u8](&(*s).w32) {
+        return false
+    }
+    return vec_at[u8](&(*s).w32, i as usize) == 1 as u8
+}
+
+fn tree(s: *mut Sema) -> *mut ast.Tree { return (*s).b as *mut ast.Tree }
+fn table(s: *mut Sema) -> *mut types.Types { return &(*s).ty }
+fn names(s: *mut Sema) -> *mut intern.Interner { return (*s).it as *mut intern.Interner }
+
+fn complain(s: *mut Sema) { (*s).err = (*s).err + 1 }
+
+fn remember(s: *mut Sema, e: u32, t: u32) {
+    vec_set[u32](&(*s).etyp, e as usize, t)
+}
+
+// -------------------------------------------------------------------- scopes
+
+fn range_on(s: *mut Sema) {
+    vec_push[u32](&(*s).b_limit, vec_len[u32](&(*s).v_name) as u32)
+}
+
+fn range_off(s: *mut Sema) {
+    let g: u32 = vec_last[u32](&(*s).b_limit)
+    vec_pop[u32](&(*s).b_limit)
+    while vec_len[u32](&(*s).v_name) > g as usize {
+        vec_pop[u32](&(*s).v_name)
+        vec_pop[u32](&(*s).v_ty)
+    }
+}
+
+fn var_create(s: *mut Sema, name: u32, t: u32) {
+    vec_push[u32](&(*s).v_name, name)
+    vec_push[u32](&(*s).v_ty, t)
+}
+
+// Search from the back: the innermost scope wins.
+fn var_search(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = vec_len[u32](&(*s).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*s).v_name, i) == name {
+            return vec_at[u32](&(*s).v_ty, i)
+        }
+    }
+    return NONE
+}
+
+fn const_search(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).k_name) {
+        if vec_at[u32](&(*s).k_name, i) == name {
+            return vec_at[u32](&(*s).k_ty, i)
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn sema_const_value(s: *mut Sema, name: u32) -> u64 {
+    return const_value(s, name)
+}
+
+fn const_value(s: *mut Sema, name: u32) -> u64 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).k_name) {
+        if vec_at[u32](&(*s).k_name, i) == name {
+            return vec_at[u64](&(*s).k_value, i)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ROUND 89 -- the type of a global variable, or NONE if there is none
+// under this name (SPEC 14.1.statics).
+fn static_search(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).g_name) {
+        if vec_at[u32](&(*s).g_name, i) == name {
+            return vec_at[u32](&(*s).g_ty, i)
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn static_writable(s: *mut Sema, name: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).g_name) {
+        if vec_at[u32](&(*s).g_name, i) == name {
+            return vec_at[u32](&(*s).g_mut, i) == 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The index of a global variable, or NONE. `lower.fi` asks this to decide
+// whether a name is a place in the data section.
+fn sema_static_index(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).g_name) {
+        if vec_at[u32](&(*s).g_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn sema_static_count(s: *mut Sema) -> usize { return vec_len[u32](&(*s).g_name) }
+fn sema_static_name(s: *mut Sema, i: usize) -> u32 { return vec_at[u32](&(*s).g_name, i) }
+fn sema_static_mut(s: *mut Sema, i: usize) -> bool { return vec_at[u32](&(*s).g_mut, i) == 1 }
+fn sema_static_align(s: *mut Sema, i: usize) -> u64 { return vec_at[u32](&(*s).g_align, i) as u64 }
+fn sema_static_size(s: *mut Sema, i: usize) -> usize { return vec_at[u32](&(*s).g_len, i) as usize }
+// The first octet of the initial value of the i-th global variable.
+fn sema_static_bytes(s: *mut Sema, i: usize) -> u64 {
+    return rt.buf_ptr(&(*s).g_data) + vec_at[u32](&(*s).g_off, i) as u64
+}
+
+// ROUND 58 (fnval.rs): the TYPE of the function `fi` as a value --
+// `fn(P1, P2) -> R` out of its declared signature.
+fn fn_value_ty(s: *mut Sema, fi: u32) -> u32 {
+    var par: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < ast.fn_plen(tree(s), fi as usize) {
+        vec_push[u32](&par, types.param_ty_resolved(table(s), fi as usize, k))
+        k = k + 1
+    }
+    let r: u32 = types.fn_ty_new(table(s), &par, types.ret_ty_the_func(table(s), fi as usize))
+    vec_free[u32](&par)
+    return r
+}
+
+// Index of the function with this name, or NONE.
+fn fn_search(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < ast.fn_count(tree(s)) {
+        if ast.fn_name(tree(s), i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// --------------------------------------------------------- helper questions
+
+fn is_int(s: *mut Sema, t: u32) -> bool { return types.is_int(table(s), t) }
+fn is_error(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_ERROR }
+fn is_bool(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_BOOL }
+fn is_f64(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_F64 }
+fn is_f32(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_F32 }
+// ROUND 71: one of the two floating point types.
+fn is_float(s: *mut Sema, t: u32) -> bool { return is_f64(s, t) || is_f32(s, t) }
+
+// ROUND 71 (sema.rs::float_want) -- the wanted type of a binary operation
+// out of the two probes. SYMMETRIC: if both sides are floating point but of
+// different width, the wider one wins, so that `a_f32 + b_f64` and
+// `b_f64 + a_f32` mean the same thing.
+fn float_want(s: *mut Sema, pl: u32, pr: u32) -> u32 {
+    if pl != NONE && pr != NONE {
+        if is_float(s, pl) && is_float(s, pr) && !types.ty_equal(table(s), pl, pr) {
+            return (*s).t_f64
+        }
+    }
+    if pl != NONE {
+        return pl
+    }
+    return pr
+}
+
+// May this type take part in an `as` conversion?
+fn convertible(s: *mut Sema, t: u32) -> bool {
+    return is_int(s, t) || is_bool(s, t) || types.is_ptr(table(s), t) || is_float(s, t)
+}
+
+// Resolves a type expression of the tree.
+fn ast_ty(s: *mut Sema, te: u32) -> u32 {
+    return types.resolve(table(s), tree(s), names(s), te)
+}
+
+// ---------------------------------------------------------------- probe
+//
+// Type of an expression WITHOUT reporting and without writing to the table.
+// NONE means "cannot be inferred" -- exactly like `Option::None` in sema.rs.
+
+fn probe(s: *mut Sema, e: u32) -> u32 {
+    return probe_t(s, e, 0)
+}
+
+fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
+    if d >= 200 {
+        return NONE
+    }
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT {
+        return NONE
+    }
+    // ROUND 70: a text literal probes as `str` -- that is how the other side
+    // of `text == "quit"` gets its type (strtype.rs).
+    if a == ast.E_TEXT {
+        if ast.e_b(b, e) == 1 {
+            return NONE
+        }
+        return str_ty(s)
+    }
+    // ROUND 71: an unsuffixed float literal probes as NOTHING -- it adapts,
+    // exactly like the integer literal. Only the suffix makes it speak.
+    if a == ast.E_FLOAT {
+        return NONE
+    }
+    if a == ast.E_FLOAT32 {
+        return (*s).t_f32
+    }
+    if a == ast.E_BOOL {
+        return (*s).t_bool
+    }
+    if a == ast.E_ID {
+        let v: u32 = var_search(s, ast.e_a(b, e))
+        if v != NONE {
+            return v
+        }
+        let k0: u32 = const_search(s, ast.e_a(b, e))
+        if k0 != NONE {
+            return k0
+        }
+        // ROUND 89 -- a global variable (SPEC 14.1.statics).
+        return static_search(s, ast.e_a(b, e))
+    }
+    if a == ast.E_UN {
+        let op: u32 = ast.e_a(b, e)
+        if op == 0 || op == 4 {
+            return probe_t(s, ast.e_b(b, e), d + 1)
+        }
+        if op == 1 {
+            return (*s).t_bool
+        }
+        if op == 2 {
+            let inner: u32 = probe_t(s, ast.e_b(b, e), d + 1)
+            if inner == NONE {
+                return NONE
+            }
+            return types.new_ty(table(s), types.K_PTR, inner, 1)
+        }
+        let p: u32 = probe_t(s, ast.e_b(b, e), d + 1)
+        if p == NONE {
+            return NONE
+        }
+        if types.ty_kind(table(s), p) != types.K_PTR {
+            return NONE
+        }
+        return types.ty_a(table(s), p)
+    }
+    if a == ast.E_BIN {
+        let op: u32 = ast.e_a(b, e)
+        // ROUND 72: only 10..17 are comparisons and connectives. 18..23 are
+        // the wrap/saturate forms, and they yield the OPERAND type like
+        // every other piece of arithmetic -- without the upper bound they
+        // probed as `bool` and every `h *% k` came out wrong.
+        if op >= 10 && op <= 17 {
+            return (*s).t_bool
+        }
+        if op == 8 || op == 9 {
+            return probe_t(s, ast.e_b(b, e), d + 1)
+        }
+        // ROUND 71: the same rule as in `binary` -- with two floating point
+        // operands of different width the wider one is what comes out.
+        // Otherwise `a_f32 + b_f64` would probe as `f32` and the literal
+        // next to it would get the wrong type.
+        return float_want(s, probe_t(s, ast.e_b(b, e), d + 1),
+            probe_t(s, ast.e_c(b, e), d + 1))
+    }
+    if a == ast.E_FIELD {
+        let bt: u32 = probe_t(s, ast.e_a(b, e), d + 1)
+        if bt == NONE {
+            return NONE
+        }
+        // HOOK gc: field access through a `Gc[T]`, without reporting
+        // (sema.rs::probe_d via gc::hook_field_base).
+        if has_gc(s) {
+            let si: u32 = gc.gc_field_base(gcp(s), table(s), bt)
+            if si != NONE {
+                return types.st_field_ty(table(s), si as usize, ast.e_b(b, e))
+            }
+        }
+        if types.ty_kind(table(s), bt) != types.K_STRUCT {
+            return NONE
+        }
+        return types.st_field_ty(table(s), types.ty_a(table(s), bt) as usize, ast.e_b(b, e))
+    }
+    if a == ast.E_IDX {
+        let bt: u32 = probe_t(s, ast.e_a(b, e), d + 1)
+        if bt == NONE {
+            return NONE
+        }
+        if types.ty_kind(table(s), bt) != types.K_ARR {
+            return NONE
+        }
+        return types.ty_a(table(s), bt)
+    }
+    if a == ast.E_CALL {
+        if ast.e_number(b, e) != 0 {
+            return (*s).t_usize
+        }
+        // HOOK fnval: a call THROUGH a function value yields the result
+        // type of the signature. Without that a literal beside it would get
+        // no type -- `f(1, 2) != 13` (fnval.rs, round 58).
+        let cv: u32 = var_search(s, ast.e_a(b, e))
+        if cv != NONE {
+            if types.ty_kind(table(s), cv) == types.K_FN {
+                return types.ty_a(table(s), cv)
+            }
+        }
+        // HOOK error unions: `try a`/`a catch b` yield the success type
+        // of the error union (errors.rs::success_type via probe_d).
+        if has_fe(s) {
+            if err.error_is_resultname(names(s), ast.e_a(b, e)) {
+                if ast.e_c(b, e) == 0 {
+                    return NONE
+                }
+                let inner: u32 = probe_t(s, ast.child_at(b, ast.e_b(b, e)), d + 1)
+                if inner == NONE {
+                    return NONE
+                }
+                let u: u32 = err.error_union_of_ty(fe(s), table(s), inner)
+                if u == NONE {
+                    return NONE
+                }
+                return err.error_u_valty(fe(s), u)
+            }
+        }
+        if has_gc(s) {
+            // HOOK gc (gc.rs::probe_ty): `weak`/`strong`/`x.as?[C]` WITHOUT
+            // checking, so that an integer literal next to it still gets
+            // its type.
+            var argt: u32 = NONE
+            if ast.e_c(b, e) > 0 {
+                argt = probe_t(s, ast.child_at(b, ast.e_b(b, e)), d + 1)
+            }
+            let pt: u32 = gc.gc_probe_ty(gcp(s), table(s), names(s), ast.e_a(b, e), argt)
+            if pt != NONE {
+                return pt
+            }
+        }
+        // HOOK impl (impls.rs in sema::probe_d): the return type of the method,
+        // without reporting and without writing -- otherwise a literal next
+        // to it would get no type (`p.sum() != 42`).
+        if is_method_call(names(s), ast.e_a(b, e)) {
+            if ast.e_c(b, e) == 0 {
+                return NONE
+            }
+            let et: u32 = probe_t(s, ast.child_at(b, ast.e_b(b, e)), d + 1)
+            if et == NONE {
+                return NONE
+            }
+            let sn: u32 = recv_struct(s, et)
+            if sn == NONE {
+                return NONE
+            }
+            let m: u32 = intern.intern_ab(names(s), ast.e_a(b, e), 7)
+            // HOOK iface: for a `dyn I` the type comes from the interface,
+            // not from the function table (iface.fi).
+            if has_if(s) {
+                let ii: u32 = iface.if_of_dyn(ifp(s), sn)
+                if ii != NONE {
+                    let k: u32 = iface.if_slot(ifp(s), ii as usize, m)
+                    if k == NONE {
+                        return NONE
+                    }
+                    return iface.if_rtyp(ifp(s), ii as usize, k)
+                }
+            }
+            let mf: u32 = method_target(s, sn, m, et)
+            if mf == NONE {
+                // ROUND 68: a FIELD holding a function value -- without
+                // this a literal beside it gets no type
+                // (`c.hook(3, 4) != 12`).
+                let fv: u32 = field_fn_ty(s, et, m)
+                if fv == NONE {
+                    return NONE
+                }
+                return types.ty_a(table(s), fv)
+            }
+            return types.ret_ty_the_func(table(s), mf as usize)
+        }
+        let f: u32 = fn_search(s, ast.e_a(b, e))
+        if f == NONE {
+            return NONE
+        }
+        return types.ret_ty_the_func(table(s), f as usize)
+    }
+    if a == ast.E_SYSCALL {
+        return (*s).t_i64
+    }
+    if a == ast.E_AS {
+        return ast_ty(s, ast.e_b(b, e))
+    }
+    if a == ast.E_SLIT {
+        let si: i32 = types.struct_index(table(s), ast.e_a(b, e))
+        if si < 0 {
+            return NONE
+        }
+        return types.new_ty(table(s), types.K_STRUCT, si as u32, 0)
+    }
+    if a == ast.E_ALIT {
+        if ast.e_c(b, e) == 0 {
+            return NONE
+        }
+        let et: u32 = probe_t(s, ast.child_at(b, ast.e_b(b, e)), d + 1)
+        if et == NONE {
+            return NONE
+        }
+        return types.new_ty(table(s), types.K_ARR, et, ast.e_c(b, e) as u64)
+    }
+    return NONE
+}
+
+// -------------------------------------------------- constant evaluation
+//
+// Needed for `const` and for the length of a repeat literal -- that length
+// goes into the TYPE (`[T; N]`), so it has to be known here.
+
+fn wrap(s: *mut Sema, v: i64, t: u32) -> i64 {
+    let bits: u32 = types.bits_of(table(s), t)
+    if bits == 0 || bits >= 64 {
+        return v
+    }
+    let mask: i64 = (1 << bits as i64) - 1
+    let m: i64 = v & mask
+    if types.is_sign(table(s), t) {
+        if (m >> (bits - 1) as i64) & 1 != 0 {
+            return m - (1 << bits as i64)
+        }
+    }
+    return m
+}
+
+// ROUND 89 -- does a value of this type contain something the collector
+// owns? A `static Gc[T]` is refused for the reason in `statics.rs`.
+fn gc_reachable(s: *mut Sema, t: u32) -> bool {
+    let tt: *mut types.Types = table(s)
+    let k: u32 = types.ty_kind(tt, t)
+    if k == types.K_PTR {
+        let inner: u32 = types.ty_a(tt, t)
+        if types.ty_kind(tt, inner) == types.K_STRUCT {
+            if gc_class_struct(s, types.ty_a(tt, inner)) {
+                return true
+            }
+        }
+        return gc_reachable(s, inner)
+    }
+    if k == types.K_ARR {
+        return gc_reachable(s, types.ty_a(tt, t))
+    }
+    if k == types.K_STRUCT {
+        let si: u32 = types.ty_a(tt, t)
+        if gc_class_struct(s, si) {
+            return true
+        }
+        var n: u32 = 0
+        while n < types.st_flen(tt, si as usize) {
+            if gc_reachable(s, types.sf_ty(tt, types.st_foff(tt, si as usize) + n)) {
+                return true
+            }
+            n = n + 1
+        }
+    }
+    return false
+}
+
+// Is this struct index a `gc class`? Its name begins with "gc " -- the
+// same marker `firnc0` reads (types.rs::gc_class_name).
+fn gc_class_struct(s: *mut Sema, si: u32) -> bool {
+    let tt: *mut types.Types = table(s)
+    let nr: u32 = types.st_name(tt, si as usize)
+    let q: u64 = intern.intern_ptr(names(s), nr)
+    let n: usize = intern.intern_length(names(s), nr)
+    if n < 3 {
+        return false
+    }
+    return rt.ld8(q, 0) == 103 as u8 && rt.ld8(q, 1) == 99 as u8 && rt.ld8(q, 2) == 32 as u8
+}
+
+// ROUND 89 -- the initial value of a `static`, as the exact octets that go
+// into the object file (little endian, `size_of(t)` of them). Its own walk
+// and not a second use of `const_eval`: that one answers "which NUMBER is
+// this", which is the wrong question for an array of 256 octets or a
+// struct with three fields. The two meet at the LEAVES -- every scalar in
+// here goes through `const_eval` and through nothing else, so a `const`
+// and a `static` can never disagree about what `1 << 12` is.
+fn static_bytes(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
+    let b: *mut ast.Tree = tree(s)
+    let tt: *mut types.Types = table(s)
+    let want: usize = types.size_of(tt, t) as usize
+    let start: usize = rt.buf_len(&(*s).g_data)
+    let k: u32 = types.ty_kind(tt, t)
+    let a: u32 = ast.e_kind(b, e)
+    if k == types.K_ARR {
+        let el: u32 = types.ty_a(tt, t)
+        let n: u64 = types.ty_n(tt, t)
+        // A text literal carries the array literal of its octets inside
+        // (ast.fi::E_TEXT, round 70).
+        var lit: u32 = e
+        if a == ast.E_TEXT {
+            lit = ast.e_a(b, e)
+        }
+        let lk: u32 = ast.e_kind(b, lit)
+        if lk == ast.E_ALIT {
+            let off: u32 = ast.e_b(b, lit)
+            let cnt: u32 = ast.e_c(b, lit)
+            if cnt as u64 != n {
+                *good = false
+            } else {
+                var q: u32 = 0
+                while q < cnt {
+                    static_bytes(s, ast.child_at(b, off + q), el, good)
+                    q = q + 1
+                }
+            }
+        } else if lk == ast.E_AWDH {
+            // `[v; N]` -- the length is already IN the type; the same
+            // reading `lower.fi::write_after` uses.
+            var q2: u64 = 0
+            while q2 < n {
+                static_bytes(s, ast.e_a(b, lit), el, good)
+                q2 = q2 + 1
+            }
+        } else {
+            *good = false
+        }
+    } else if k == types.K_STRUCT {
+        if a != ast.E_SLIT {
+            *good = false
+        } else {
+            // Padding is zero, not whatever was in the buffer.
+            var z: usize = 0
+            while z < want {
+                rt.buf_push(&(*s).g_data, 0 as u8)
+                z = z + 1
+            }
+            let si: u32 = types.ty_a(tt, t)
+            let foff: u32 = types.st_foff(tt, si as usize)
+            let flen: u32 = types.st_flen(tt, si as usize)
+            let loff: u32 = ast.e_b(b, e)
+            let llen: u32 = ast.e_c(b, e)
+            var fi: u32 = 0
+            while fi < flen {
+                let fname: u32 = types.sf_name(tt, foff + fi)
+                let fty: u32 = types.sf_ty(tt, foff + fi)
+                let fpos: u64 = types.sf_offset(tt, foff + fi)
+                var found: u32 = NONE
+                var q3: u32 = 0
+                while q3 < llen {
+                    if ast.child_at(b, loff + q3 * 2) == fname {
+                        found = ast.child_at(b, loff + q3 * 2 + 1)
+                    }
+                    q3 = q3 + 1
+                }
+                if found == NONE {
+                    *good = false
+                } else {
+                    // The field's octets are built at the END of the
+                    // buffer and then copied into their place.
+                    let fstart: usize = rt.buf_len(&(*s).g_data)
+                    static_bytes(s, found, fty, good)
+                    let flen2: usize = rt.buf_len(&(*s).g_data) - fstart
+                    var q4: usize = 0
+                    while q4 < flen2 {
+                        rt.st8(rt.buf_ptr(&(*s).g_data), start + fpos as usize + q4,
+                            rt.ld8(rt.buf_ptr(&(*s).g_data), fstart + q4))
+                        q4 = q4 + 1
+                    }
+                    rt.buf_set_len(&(*s).g_data, fstart)
+                }
+                fi = fi + 1
+            }
+        }
+    } else if k == types.K_F64 || k == types.K_F32 {
+        var bits: u64 = 0
+        if !static_float(s, e, k == types.K_F32, &bits) {
+            *good = false
+        }
+        var q5: usize = 0
+        while q5 < want {
+            rt.buf_push(&(*s).g_data, ((bits >> (q5 * 8) as u64) & 255) as u8)
+            q5 = q5 + 1
+        }
+    } else if types.is_ptr(tt, t) {
+        var g3: bool = true
+        let v3: i64 = const_eval(s, e, &g3)
+        if !g3 || v3 != 0 {
+            // There is no ADDRESS at compile time; the only pointer that
+            // can be written into a data section is the null one.
+            *good = false
+        }
+        var q6: usize = 0
+        while q6 < want {
+            rt.buf_push(&(*s).g_data, 0 as u8)
+            q6 = q6 + 1
+        }
+    } else {
+        var g4: bool = true
+        let v4: i64 = const_eval(s, e, &g4)
+        if !g4 {
+            *good = false
+        }
+        let w: i64 = wrap(s, v4, t)
+        var q7: usize = 0
+        while q7 < want {
+            rt.buf_push(&(*s).g_data, ((w as u64 >> (q7 * 8) as u64) & 255) as u8)
+            q7 = q7 + 1
+        }
+    }
+    // Whatever happened, the entry is exactly `want` octets long.
+    while (rt.buf_len(&(*s).g_data) - start) < want {
+        rt.buf_push(&(*s).g_data, 0 as u8)
+    }
+    rt.buf_set_len(&(*s).g_data, start + want)
+}
+
+// The bit pattern of a floating point initial value. Only a literal, with
+// an optional minus in front: `0.1 + 0.2` at compile time would need a
+// second evaluator that is exactly IEEE-754 faithful, and one that is only
+// ALMOST right is worse than none.
+fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_FLOAT {
+        // ROUND 71: the CORRECTLY ROUNDED binary32 was computed in the
+        // lexer on the TEXT and sits in `e_a`; narrowing the binary64 here
+        // would be one rounding too many (lower.fi says the same).
+        if single {
+            *out = ast.e_a(b, e) as u64
+        } else {
+            *out = ast.e_number(b, e)
+        }
+        return true
+    }
+    if a == ast.E_FLOAT32 {
+        *out = ast.e_number(b, e)
+        return true
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 0 {
+        var inner: u64 = 0
+        if !static_float(s, ast.e_b(b, e), single, &inner) {
+            return false
+        }
+        if single {
+            *out = inner ^ 2147483648
+        } else {
+            *out = inner ^ 9223372036854775808
+        }
+        return true
+    }
+    return false
+}
+
+fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT {
+        return ast.e_number(b, e) as i64
+    }
+    if a == ast.E_BOOL {
+        if ast.e_a(b, e) == 1 {
+            return 1
+        }
+        return 0
+    }
+    if a == ast.E_ID {
+        if const_search(s, ast.e_a(b, e)) == NONE {
+            *good = false
+            return 0
+        }
+        return const_value(s, ast.e_a(b, e)) as i64
+    }
+    if a == ast.E_UN {
+        let v: i64 = const_eval(s, ast.e_b(b, e), good)
+        let op: u32 = ast.e_a(b, e)
+        if op == 0 {
+            return 0 - v
+        }
+        if op == 4 {
+            return 0 - v - 1
+        }
+        if op == 1 {
+            if v == 0 {
+                return 1
+            }
+            return 0
+        }
+        *good = false
+        return 0
+    }
+    if a == ast.E_BIN {
+        let op: u32 = ast.e_a(b, e)
+        let x: i64 = const_eval(s, ast.e_b(b, e), good)
+        let y: i64 = const_eval(s, ast.e_c(b, e), good)
+        var v: i64 = 0
+        if op == 0 { v = x + y }
+        else if op == 1 { v = x - y }
+        else if op == 2 { v = x * y }
+        else if op == 3 {
+            if y == 0 {
+                *good = false
+                return 0
+            }
+            v = x / y
+        }
+        else if op == 4 {
+            if y == 0 {
+                *good = false
+                return 0
+            }
+            v = x % y
+        }
+        else if op == 5 { v = x & y }
+        else if op == 6 { v = x | y }
+        else if op == 7 { v = x ^ y }
+        else if op == 8 { v = x << y }
+        else if op == 9 { v = x >> y }
+        else if op == 10 { if x == y { v = 1 } }
+        else if op == 11 { if x != y { v = 1 } }
+        else if op == 12 { if x < y { v = 1 } }
+        else if op == 13 { if x <= y { v = 1 } }
+        else if op == 14 { if x > y { v = 1 } }
+        else if op == 15 { if x >= y { v = 1 } }
+        else if op == 16 { if x != 0 && y != 0 { v = 1 } }
+        else if op == 17 { if x != 0 || y != 0 { v = 1 } }
+        // ROUND 72 (sema.rs) -- the explicit forms. Wrapping needs nothing
+        // beyond plain arithmetic: `wrap` right below narrows to the
+        // destination type, and THAT is two's complement wrapping.
+        else if op == 18 { v = x + y }
+        else if op == 19 { v = x - y }
+        else if op == 20 { v = x * y }
+        else {
+            // `+|`/`-|`/`*|` in a constant expression -- not supported yet
+            // (the same limit `firnc0` states in words).
+            *good = false
+            return 0
+        }
+        return wrap(s, v, sema_ty(s, e))
+    }
+    if a == ast.E_AS {
+        let v: i64 = const_eval(s, ast.e_a(b, e), good)
+        let dst: u32 = sema_ty(s, e)
+        if is_bool(s, dst) {
+            if v != 0 {
+                return 1
+            }
+            return 0
+        }
+        if types.is_ptr(table(s), dst) {
+            *good = false
+            return 0
+        }
+        return wrap(s, v, dst)
+    }
+    // A CALL in a constant expression means that `firnc0` runs the
+    // function at compile time (comptime.rs). That is not
+    // ported -- the file is counted separately, not as a deviation.
+    if a == ast.E_CALL {
+        (*s).ct_needed = true
+    }
+    *good = false
+    return 0
+}
+
+// ------------------------------------------------------------ expressions
+//
+// `note` is the context type or NONE. The result is always a concrete
+// type; on error, the error type.
+
+fn expr(s: *mut Sema, e: u32, note: u32) -> u32 {
+    let t: u32 = expr_inner(s, e, note)
+    // ROUND 71 -- THE ONE IMPLICIT CONVERSION (sema.rs::expr).
+    //
+    // `f32` -> `f64` loses nothing: every binary32 is exactly representable
+    // as a binary64. The other direction throws digits away and needs
+    // `as f32`. It sits HERE and nowhere else, because `expr` is the single
+    // funnel every expression with a wanted type passes through --
+    // declaration, assignment, argument, `return`, field, array element.
+    if note != NONE {
+        if types.ty_kind(table(s), t) == types.K_F32 {
+            if types.ty_kind(table(s), note) == types.K_F64 {
+                vec_set[u8](&(*s).w32, e as usize, 1 as u8)
+                // `etyp` keeps the OWN type. The lowering builds the value
+                // in f32 first and only then converts -- reading an f32
+                // variable as if it were eight bytes wide would reach
+                // beyond its storage.
+                remember(s, e, t)
+                return (*s).t_f64
+            }
+        }
+    }
+    // The same expression can be checked twice with different context types
+    // (probe, then the real run). Whoever does NOT widen has to take the
+    // mark back, otherwise a conversion would be left standing that nobody
+    // asked for.
+    vec_set[u8](&(*s).w32, e as usize, 0 as u8)
+    remember(s, e, t)
+    return t
+}
+
+// Gives every subexpression a concrete type, without checking the contents.
+fn infer(s: *mut Sema, e: u32) {
+    expr(s, e, (*s).t_i64)
+}
+
+fn field_ty(s: *mut Sema, bt: u32, name: u32) -> u32 {
+    // HOOK gc: field access reaching through `Gc[T]` (gc.rs::hook_field_base).
+    // A Gc pointer is followed without `(*p).field` -- it is first class.
+    if has_gc(s) {
+        let si: u32 = gc.gc_field_base(gcp(s), table(s), bt)
+        if si != NONE {
+            let st: u32 = types.new_ty(table(s), types.K_STRUCT, si, 0)
+            return field_ty(s, st, name)
+        }
+    }
+    if types.ty_kind(table(s), bt) == types.K_STRUCT {
+        let ft: u32 = types.st_field_ty(table(s), types.ty_a(table(s), bt) as usize, name)
+        if ft == NONE {
+            complain(s)
+            return (*s).t_error
+        }
+        return ft
+    }
+    if is_error(s, bt) {
+        return (*s).t_error
+    }
+    complain(s)
+    return (*s).t_error
+}
+
+fn index_ty(s: *mut Sema, bt: u32, idx: u32) -> u32 {
+    let it: u32 = expr(s, idx, (*s).t_usize)
+    if !is_error(s, it) && !types.ty_equal(table(s), it, (*s).t_usize) {
+        complain(s)
+    }
+    if types.ty_kind(table(s), bt) == types.K_ARR {
+        // ROUND 89 (SPEC 13, item L9): an index that is a NUMBER in the
+        // source and a length that is a number in the type is a question
+        // with an answer right here. It is reported at EVERY build level,
+        // `release-fast` included, where there is no run time check at all.
+        var lv: i64 = 0
+        if literal_index(s, idx, &lv) {
+            if lv < 0 || lv as u64 >= types.ty_n(table(s), bt) {
+                complain(s)
+            }
+        }
+        return types.ty_a(table(s), bt)
+    }
+    if is_error(s, bt) {
+        return (*s).t_error
+    }
+    complain(s)
+    return (*s).t_error
+}
+
+// ROUND 89 -- the index as a number, if it IS one in the source text.
+//
+// Deliberately NOT `const_eval`: that one may run a whole function at
+// compile time, and asking it about every index expression of a program
+// would make the type checker run the program. What is recognised here is
+// what a reader would call a constant index: a literal, a `const`, a cast
+// or a negation of one.
+fn literal_index(s: *mut Sema, e: u32, out: *mut i64) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT {
+        *out = ast.e_number(b, e) as i64
+        return true
+    }
+    if a == ast.E_AS {
+        return literal_index(s, ast.e_a(b, e), out)
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 0 {
+        var inner: i64 = 0
+        if !literal_index(s, ast.e_b(b, e), &inner) {
+            return false
+        }
+        *out = 0 - inner
+        return true
+    }
+    if a == ast.E_ID {
+        if const_search(s, ast.e_a(b, e)) == NONE {
+            return false
+        }
+        *out = const_value(s, ast.e_a(b, e)) as i64
+        return true
+    }
+    return false
+}
+
+// Assignable expression: yields the type or NONE.
+fn lvalue(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_ID {
+        let v: u32 = var_search(s, ast.e_a(b, e))
+        if v != NONE {
+            remember(s, e, v)
+            return v
+        }
+        let k: u32 = const_search(s, ast.e_a(b, e))
+        if k != NONE {
+            remember(s, e, k)
+            return k
+        }
+        // ROUND 89 -- a `static` IS a place, but only `static mut` may be
+        // written to (SPEC 14.1.statics).
+        let g: u32 = static_search(s, ast.e_a(b, e))
+        if g != NONE {
+            if !static_writable(s, ast.e_a(b, e)) {
+                complain(s)
+            }
+            remember(s, e, g)
+            return g
+        }
+        complain(s)
+        remember(s, e, (*s).t_error)
+        return (*s).t_error
+    }
+    if a == ast.E_FIELD {
+        let bt: u32 = lvalue(s, ast.e_a(b, e))
+        if bt == NONE {
+            return NONE
+        }
+        let t: u32 = field_ty(s, bt, ast.e_b(b, e))
+        remember(s, e, t)
+        return t
+    }
+    if a == ast.E_IDX {
+        let bt: u32 = lvalue(s, ast.e_a(b, e))
+        if bt == NONE {
+            return NONE
+        }
+        let t: u32 = index_ty(s, bt, ast.e_b(b, e))
+        remember(s, e, t)
+        return t
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 3 {
+        let t0: u32 = expr(s, ast.e_b(b, e), NONE)
+        var t: u32 = (*s).t_error
+        if types.ty_kind(table(s), t0) == types.K_PTR {
+            t = types.ty_a(table(s), t0)
+        } else if !is_error(s, t0) {
+            complain(s)
+        }
+        remember(s, e, t)
+        return t
+    }
+    infer(s, e)
+    complain(s)
+    return NONE
+}
+
+fn unary(s: *mut Sema, e: u32, note: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let op: u32 = ast.e_a(b, e)
+    let inner: u32 = ast.e_b(b, e)
+    // ROUND 68: `-x` and `~x` take almost the same path -- both want a
+    // number and yield its type unchanged. The one difference: `-x` works
+    // on `f64` as well (SPEC 14.1.f64), `~x` does not -- a floating point
+    // value has no bits to flip that would mean anything.
+    if op == 0 || op == 4 {
+        var h: u32 = probe(s, inner)
+        if h == NONE {
+            if note != NONE && is_int(s, note) {
+                h = note
+            }
+            if h == NONE && op == 0 && note != NONE {
+                if is_float(s, note) {
+                    h = note
+                }
+            }
+        }
+        let t: u32 = expr(s, inner, h)
+        if is_error(s, t) {
+            return (*s).t_error
+        }
+        var fits: bool = is_int(s, t)
+        if !fits && op == 0 {
+            fits = is_float(s, t)
+        }
+        if !fits {
+            complain(s)
+            return (*s).t_error
+        }
+        return t
+    }
+    if op == 1 {
+        let t: u32 = expr(s, inner, (*s).t_bool)
+        if is_error(s, t) {
+            return (*s).t_error
+        }
+        if !is_bool(s, t) {
+            complain(s)
+            return (*s).t_error
+        }
+        return (*s).t_bool
+    }
+    if op == 2 {
+        let t: u32 = lvalue(s, inner)
+        if t == NONE || is_error(s, t) {
+            return (*s).t_error
+        }
+        return types.new_ty(table(s), types.K_PTR, t, 1)
+    }
+    let t: u32 = expr(s, inner, NONE)
+    if types.ty_kind(table(s), t) == types.K_PTR {
+        return types.ty_a(table(s), t)
+    }
+    if is_error(s, t) {
+        return (*s).t_error
+    }
+    complain(s)
+    return (*s).t_error
+}
+
+fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let op: u32 = ast.e_a(b, e)
+    let l: u32 = ast.e_b(b, e)
+    let r: u32 = ast.e_c(b, e)
+
+    // logical connectives
+    if op == 16 || op == 17 {
+        let lt: u32 = expr(s, l, (*s).t_bool)
+        let rt: u32 = expr(s, r, (*s).t_bool)
+        if !is_error(s, lt) && !is_bool(s, lt) {
+            complain(s)
+        }
+        if !is_error(s, rt) && !is_bool(s, rt) {
+            complain(s)
+        }
+        return (*s).t_bool
+    }
+
+    // comparison
+    if op >= 10 && op <= 15 {
+        // HOOK error unions: `e == E::NotFound` compares two error values
+        // of the same set (errors.rs::hook_binary).
+        if has_fe(s) && (op == 10 || op == 11) {
+            if error_quiet_set(s, l) != NONE || error_quiet_set(s, r) != NONE {
+                let lt2: u32 = expr(s, l, NONE)
+                let rt2: u32 = expr(s, r, NONE)
+                let ls: u32 = err.error_set_of_ty(fe(s), table(s), lt2)
+                let rs: u32 = err.error_set_of_ty(fe(s), table(s), rt2)
+                if ls != NONE && rs != NONE && ls == rs {
+                    return (*s).t_bool
+                }
+                if !is_error(s, lt2) && !is_error(s, rt2) {
+                    complain(s)
+                }
+                return (*s).t_bool
+            }
+        }
+        var want: u32 = float_want(s, probe(s, l), probe(s, r))
+        if want == NONE {
+            if note != NONE && is_float(s, note) {
+                want = note
+            }
+        }
+        let lt: u32 = expr(s, l, want)
+        let rt: u32 = expr(s, r, want)
+        if is_error(s, lt) || is_error(s, rt) {
+            return (*s).t_bool
+        }
+        // HOOK gc: identity comparison of two related Gc pointers (gc.rs).
+        var same: bool = types.compatible(table(s), lt, rt)
+        if !same && has_gc(s) {
+            same = gc.gc_is_related((*s).gc, table(s), lt, rt)
+        }
+        if !same {
+            complain(s)
+            return (*s).t_bool
+        }
+        // HOOK str: `==`/`!=` compare the CONTENT (strtype.rs, round 70)
+        if str_like(s, lt) || str_like(s, rt) {
+            if op == 10 || op == 11 {
+                str_need(s, 0)
+                return (*s).t_bool
+            }
+            complain(s)
+            return (*s).t_bool
+        }
+        let only_equal: bool = op == 10 || op == 11
+        var ok: bool = is_int(s, lt) || is_float(s, lt)
+        if !ok && only_equal {
+            // ROUND 58: two function values compare like two pointers --
+            // `==` means "the same function record". Ordering does not
+            // exist for them; addresses have no meaningful order.
+            ok = is_bool(s, lt) || types.is_ptr(table(s), lt)
+            if !ok {
+                ok = types.ty_kind(table(s), lt) == types.K_FN
+            }
+        }
+        if !ok {
+            complain(s)
+        }
+        return (*s).t_bool
+    }
+
+    // shift: the left operand decides the type
+    if op == 8 || op == 9 {
+        var h: u32 = probe(s, l)
+        if h == NONE {
+            if note != NONE && is_int(s, note) {
+                h = note
+            }
+        }
+        let lt: u32 = expr(s, l, h)
+        var rh: u32 = probe(s, r)
+        if rh == NONE {
+            if is_int(s, lt) {
+                rh = lt
+            } else {
+                rh = (*s).t_i64
+            }
+        }
+        let rt: u32 = expr(s, r, rh)
+        if is_error(s, lt) {
+            return (*s).t_error
+        }
+        if is_error(s, rt) {
+            return lt
+        }
+        return binop_type(s, op, lt, rt)
+    }
+
+    // arithmetic and bit operations: the already typed operand takes
+    // PRECEDENCE over the context type.
+    // ROUND 71: with two floating point operands the WIDER one wins, and the
+    // context type may name a floating point type -- that is what makes
+    // `let x: f32 = 1.5 + 2.5` compute in f32.
+    var want: u32 = float_want(s, probe(s, l), probe(s, r))
+    if want == NONE {
+        if note != NONE && (is_int(s, note) || is_float(s, note)) {
+            want = note
+        }
+    }
+    let lt: u32 = expr(s, l, want)
+    let rt: u32 = expr(s, r, want)
+    if is_error(s, lt) || is_error(s, rt) {
+        return (*s).t_error
+    }
+    return binop_type(s, op, lt, rt)
+}
+
+// ROUND 70 (sema.rs::binop_type) -- the type rules of `a op b` with both
+// operand types already known.
+//
+// `binary` computes with it, and so does the compound assignment
+// (`x op= e`). That is the point: `x += e` has to mean EXACTLY `x = x + e`,
+// and it does, because there is only ONE place where the rules stand.
+fn binop_type(s: *mut Sema, op: u32, lt: u32, rt: u32) -> u32 {
+    // shift: both sides have to be integers, the left one decides
+    if op == 8 || op == 9 {
+        if !is_int(s, lt) || !is_int(s, rt) {
+            complain(s)
+            return (*s).t_error
+        }
+        return lt
+    }
+    // HOOK str: `+` concatenates (strtype.rs, round 70)
+    if str_like(s, lt) || str_like(s, rt) {
+        if op == 0 {
+            str_need(s, 1)
+            return str_ty(s)
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    if is_float(s, lt) || is_float(s, rt) {
+        // `%` and the bit operations are undefined for floating point.
+        let allowed: bool = op <= 3
+        if !allowed {
+            complain(s)
+            return (*s).t_error
+        }
+        if !types.ty_equal(table(s), lt, rt) {
+            complain(s)
+            return (*s).t_error
+        }
+        return lt
+    }
+    if !is_int(s, lt) || !is_int(s, rt) || !types.ty_equal(table(s), lt, rt) {
+        complain(s)
+        return (*s).t_error
+    }
+    return lt
+}
+
+// ------------------------------------------------- gc (gc.rs)
+//
+// `gc C{...}` yields `AllocError!Gc[C]` (check_new in stage 0). The callee
+// name carries the class ("gc C"), and the only argument is the struct
+// literal with the initial values.
+
+fn gc_new_check(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let name: u32 = ast.e_a(b, e)
+    var slit: u32 = NONE
+    if ast.e_c(b, e) == 1 {
+        let a0: u32 = ast.child_at(b, ast.e_b(b, e))
+        if ast.e_kind(b, a0) == ast.E_SLIT {
+            slit = a0
+        }
+    }
+    let ki_i: i64 = gc.gc_class_out_new(gcp(s), names(s), name)
+    if ki_i < 0 {
+        // unknown gc class
+        if slit != NONE {
+            var k: u32 = 0
+            while k < ast.e_c(b, slit) {
+                infer(s, ast.child_at(b, ast.e_b(b, slit) + k * 2 + 1))
+                k = k + 1
+            }
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let ki: u32 = ki_i as u32
+    let sidx: u32 = gc.gc_sidx(gcp(s), ki)
+    if slit != NONE {
+        let off: u32 = ast.e_b(b, slit)
+        let cnt: u32 = ast.e_c(b, slit)
+        var k: u32 = 0
+        while k < cnt {
+            let fname: u32 = ast.child_at(b, off + k * 2)
+            let fexpr: u32 = ast.child_at(b, off + k * 2 + 1)
+            // given twice?
+            var j: u32 = 0
+            while j < k {
+                if ast.child_at(b, off + j * 2) == fname {
+                    complain(s)
+                }
+                j = j + 1
+            }
+            let want: u32 = types.st_field_ty(table(s), sidx as usize, fname)
+            if want == NONE {
+                infer(s, fexpr)
+                complain(s)
+            } else {
+                let got: u32 = expr(s, fexpr, want)
+                if !is_error(s, got) && !types.compatible(table(s), got, want) {
+                    complain(s)
+                }
+            }
+            k = k + 1
+        }
+        // A gc allocation has to give ALL fields.
+        if cnt != types.st_flen(table(s), sidx as usize) {
+            complain(s)
+        }
+    }
+    // The fallible allocation: AllocError!Gc[C] (DESIGN_GOALS 2). The set
+    // comes in with the runtime, pulled in automatically (lib/gc/gc.fi).
+    if !has_fe(s) {
+        complain(s)
+        return (*s).t_error
+    }
+    var ae: [u8; 10] = "AllocError"
+    let aen: u32 = intern.intern_number(names(s), (&ae[0]) as u64, 10) as u32
+    let sm: u32 = err.error_set_find(fe(s), aen)
+    if sm == NONE {
+        complain(s)
+        return (*s).t_error
+    }
+    let st: u32 = types.new_ty(table(s), types.K_STRUCT, sidx, 0)
+    let val: u32 = types.new_ty(table(s), types.K_PTR, st, 1)
+    let ut: u32 = err.error_union_build(fe(s), table(s), names(s), sm, val)
+    let ui: u32 = err.error_union_of_ty(fe(s), table(s), ut)
+    if ui != NONE {
+        gc.gc_union_set(gcp(s), ki, ui)
+    }
+    // The literal node itself carries the union type (stage 0: `record`).
+    if slit != NONE {
+        remember(s, slit, ut)
+    }
+    return ut
+}
+
+// `x.as?[C]` -- the checked downcast (check_as in stage 0).
+fn gc_as_check(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let name: u32 = ast.e_a(b, e)
+    let zi: i64 = gc.gc_class_out_as(gcp(s), names(s), name)
+    if zi < 0 {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            infer(s, ast.child_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let target: u32 = zi as u32
+    if ast.e_c(b, e) == 0 {
+        complain(s)
+        return (*s).t_error
+    }
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e))
+    let at: u32 = expr(s, arg, NONE)
+    if is_error(s, at) {
+        return (*s).t_error
+    }
+    var source: u32 = NONE
+    if types.ty_kind(table(s), at) == types.K_PTR {
+        let inner: u32 = types.ty_a(table(s), at)
+        if types.ty_kind(table(s), inner) == types.K_STRUCT {
+            source = gc.gc_class_of_struct(gcp(s), types.ty_a(table(s), inner))
+        }
+    }
+    if source == NONE {
+        // '.as?[C]' expects a Gc[T]
+        complain(s)
+        return (*s).t_error
+    }
+    if source != target && !gc.gc_is_descendant(gcp(s), target, source) && !gc.gc_is_descendant(gcp(s), source, target) {
+        // the two classes are not related
+        complain(s)
+        return (*s).t_error
+    }
+    let st: u32 = types.new_ty(table(s), types.K_STRUCT, gc.gc_sidx(gcp(s), target), 0)
+    return types.new_ty(table(s), types.K_PTR, st, 1)
+}
+
+// `weak(g)` and `strong(w)` (the rest of hook_call in stage 0).
+fn gc_weak_check(s: *mut Sema, e: u32, is_weak: bool) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    if ast.e_c(b, e) != 1 {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            infer(s, ast.child_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e))
+    let at: u32 = expr(s, arg, NONE)
+    if is_error(s, at) {
+        return (*s).t_error
+    }
+    if is_weak {
+        var ki: u32 = NONE
+        if types.ty_kind(table(s), at) == types.K_PTR {
+            let inner: u32 = types.ty_a(table(s), at)
+            if types.ty_kind(table(s), inner) == types.K_STRUCT {
+                ki = gc.gc_class_of_struct(gcp(s), types.ty_a(table(s), inner))
+            }
+        }
+        if ki == NONE {
+            // 'weak' expects a Gc[T]
+            complain(s)
+            return (*s).t_error
+        }
+        return types.new_ty(table(s), types.K_STRUCT, gc.gc_widx(gcp(s), ki), 0)
+    }
+    var ki: u32 = NONE
+    if types.ty_kind(table(s), at) == types.K_STRUCT {
+        ki = gc.gc_class_of_weak(gcp(s), types.ty_a(table(s), at))
+    }
+    if ki == NONE {
+        // 'strong' expects a GcWeak[T]
+        complain(s)
+        return (*s).t_error
+    }
+    let st: u32 = types.new_ty(table(s), types.K_STRUCT, gc.gc_sidx(gcp(s), ki), 0)
+    return types.new_ty(table(s), types.K_PTR, st, 1)
+}
+
+// -------------------------------------------------------- ROUND 45: methods
+//
+// Model: compiler/src/impls.rs. `x.m(a)` sits in the tree as the call
+// `"method m"`; which function is meant is decided SOLELY by the static
+// type of the receiver. No dynamic dispatch, no vtable.
+
+fn is_method_call(it: *mut intern.Interner, name: u32) -> bool {
+    var w: [u8; 7] = "method "
+    return intern.intern_prefix(it, name, (&w[0]) as u64, 7)
+}
+
+// The prefix the methods of a receiver type live under -- value OR pointer.
+// ROUND 50: this is no longer only a struct. A PRIMITIVE TYPE can implement
+// an interface too (`impl Ord for i32`), and then its method is called
+// `i32__less`. A typeless integer literal does not belong here -- it has
+// no fixed type that could carry an `impl` block.
+fn recv_struct(s: *mut Sema, t: u32) -> u32 {
+    var i: u32 = t
+    if types.ty_kind(table(s), i) == types.K_PTR {
+        i = types.ty_a(table(s), i)
+    }
+    let a: u32 = types.ty_kind(table(s), i)
+    if a == types.K_STRUCT {
+        return types.st_name(table(s), types.ty_a(table(s), i) as usize)
+    }
+    return types.base_ty_name(names(s), a)
+}
+
+// ROUND 68 (impls.rs::field_fn): a FIELD of the receiver holding a FUNCTION
+// VALUE. `c.hook(a, b)` is not a method call -- `hook` is a field of `Ctx`
+// whose type is `fn(A, B) -> R` (round 58). The lookup runs AFTER the method
+// lookup, never before: a method of the same name keeps winning, so no
+// existing program changes its meaning. Yields the FUNCTION TYPE or NONE.
+fn field_fn_ty(s: *mut Sema, t: u32, m: u32) -> u32 {
+    var i: u32 = t
+    if types.ty_kind(table(s), i) == types.K_PTR {
+        i = types.ty_a(table(s), i)
+    }
+    if types.ty_kind(table(s), i) != types.K_STRUCT {
+        return NONE
+    }
+    let ft: u32 = types.st_field_ty(table(s), types.ty_a(table(s), i) as usize, m)
+    if ft == NONE {
+        return NONE
+    }
+    if types.ty_kind(table(s), ft) != types.K_FN {
+        return NONE
+    }
+    return ft
+}
+
+// `Type__method` -- the name of the function behind the method.
+fn method_func(s: *mut Sema, sn: u32, m: u32) -> u32 {
+    let it: *mut intern.Interner = names(s)
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, intern.intern_ptr(it, sn), intern.intern_length(it, sn))
+    var tr: [u8; 2] = "__"
+    rt.buf_push_bytes(&b, (&tr[0]) as u64, 2)
+    rt.buf_push_bytes(&b, intern.intern_ptr(it, m), intern.intern_length(it, m))
+    let nr: u32 = intern.intern_number(it, rt.buf_ptr(&b), rt.buf_len(&b)) as u32
+    rt.buf_free(&b)
+    return nr
+}
+
+// Can this expression have its address taken? The same set of cases that
+// `&x` allows (impls.rs::is_slot).
+fn is_slot(s: *mut Sema, e: u32) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_ID {
+        return true
+    }
+    if a == ast.E_FIELD {
+        return true
+    }
+    if a == ast.E_IDX {
+        return true
+    }
+    if a == ast.E_UN {
+        return ast.e_a(b, e) == 3
+    }
+    return false
+}
+
+// **ROUND 88** (impls.rs::receiver_prefixes) -- WHICH function does `x.m()`
+// mean?
+//
+// First, as before, `Type__m`. Only if there is nothing under that name AND
+// the receiver is the builtin `str` do the VIEWS get their turn: every
+// struct shaped `{ *mut u8, usize }` -- that is `str.Span` -- in the order
+// in which it was declared, so the choice is settled.
+//
+// WHY. Up to round 87 `a.length()` worked on a `str` and `a.part(0, 4)` did
+// not, and the reason was an accident: the builtin type is called `str`, the
+// module of the string library is called `str` too, so `a.length()` found
+// the FREE function `str.length(s: Span)` under exactly the name the method
+// resolution builds. `part` has no free function of that name (it is called
+// `span_part`) and therefore did not exist. SPEC 8.1 promises the whole
+// library on a `str`; so `impl Span` is really asked now.
+//
+// `Type__m` KEEPS THE FIRST PLACE -- everything that resolved yesterday
+// resolves to the same function today.
+fn method_target(s: *mut Sema, sn: u32, m: u32, et: u32) -> u32 {
+    let direct: u32 = fn_search(s, method_func(s, sn, m))
+    if direct != NONE {
+        return direct
+    }
+    if !types.str_is_builtin(table(s), et) {
+        return NONE
+    }
+    var vi: usize = 0
+    while vi < types.st_count(table(s)) {
+        if vi != types.STR_INDEX as usize {
+            if types.str_is_view(table(s), vi as u32) {
+                let f2: u32 = fn_search(s, method_func(s, types.st_name(table(s), vi), m))
+                if f2 != NONE {
+                    return f2
+                }
+            }
+        }
+        vi = vi + 1
+    }
+    return NONE
+}
+
+fn methods_call(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    if cnt < 1 {
+        complain(s)
+        return (*s).t_error
+    }
+    let m: u32 = intern.intern_ab(names(s), ast.e_a(b, e), 7)
+    let recv: u32 = ast.child_at(b, off)
+    let et: u32 = expr(s, recv, NONE)
+    var k: u32 = 1
+    if is_error(s, et) {
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        return (*s).t_error
+    }
+    let sn: u32 = recv_struct(s, et)
+    if sn == NONE {
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    // HOOK iface (iface.rs::hook_method): `f.m(args)` on a `dyn I` --
+    // DYNAMIC DISPATCH. Which function runs is known only at run time,
+    // from the method table; the check runs against the interface.
+    if has_if(s) {
+        let ii: u32 = iface.if_of_dyn(ifp(s), sn)
+        if ii != NONE {
+            return interfaces_call(s, e, ii, m, et)
+        }
+    }
+    let f: u32 = method_target(s, sn, m, et)
+    if f == NONE {
+        // ROUND 68 (impls.rs::field_fn): no method of that name -- but
+        // perhaps a FIELD holding a function value. The receiver is then
+        // only the place the value is read from and is NOT passed on.
+        let fv: u32 = field_fn_ty(s, et, m)
+        if fv != NONE {
+            let plen3: u32 = types.fn_ty_len(table(s), fv)
+            if cnt - 1 != plen3 {
+                complain(s)
+            }
+            while k < cnt {
+                let arg3: u32 = ast.child_at(b, off + k)
+                if k - 1 < plen3 {
+                    let pt3: u32 = types.fn_ty_param(table(s), fv, k - 1)
+                    if has_fe(s) && coerce_check(s, arg3, pt3) {
+                        k = k + 1
+                        continue
+                    }
+                    let t3: u32 = expr(s, arg3, pt3)
+                    if !types.compatible(table(s), t3, pt3) {
+                        complain(s)
+                    }
+                } else {
+                    infer(s, arg3)
+                }
+                k = k + 1
+            }
+            return types.ty_a(table(s), fv)
+        }
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let plen: u32 = ast.fn_plen(b, f as usize)
+    // The receiver -- the only adjustment at the call site: if the method
+    // wants a pointer and the receiver is a value, its address is taken.
+    // The other way round there is NOTHING: no automatic deref.
+    if plen > 0 {
+        let p0: u32 = types.param_ty_resolved(table(s), f as usize, 0)
+        let will_z: bool = types.is_ptr(table(s), p0)
+        let is_z: bool = types.is_ptr(table(s), et)
+        if will_z && !is_z {
+            if !is_slot(s, recv) {
+                complain(s)
+            }
+        }
+        if !will_z && is_z {
+            complain(s)
+        }
+    }
+    if cnt != plen {
+        complain(s)
+    }
+    while k < cnt {
+        let arg: u32 = ast.child_at(b, off + k)
+        if k < plen {
+            let pt: u32 = types.param_ty_resolved(table(s), f as usize, k)
+            if has_fe(s) && coerce_check(s, arg, pt) {
+                k = k + 1
+                continue
+            }
+            let t: u32 = expr(s, arg, pt)
+            if !types.compatible(table(s), t, pt) {
+                // ROUND 70: the ONE widening of the interpolation
+                // (sema.rs::check_argument).
+                var fine: bool = widen_ok(s, arg)
+                if fine {
+                    fine = is_int(s, t) && is_int(s, pt)
+                    if fine {
+                        fine = types.bits_of(table(s), pt) >= types.bits_of(table(s), t)
+                    }
+                }
+                if !fine {
+                    complain(s)
+                }
+            }
+        } else {
+            infer(s, arg)
+        }
+        k = k + 1
+    }
+    return types.ret_ty_the_func(table(s), f as usize)
+}
+
+// A call through the interface. The receiver is the fat pointer ITSELF
+// (a value); a `*dyn I` is deliberately not accepted -- `(*z).m(...)`
+// says the same thing and makes it visible that two words are being
+// read.
+fn interfaces_call(s: *mut Sema, e: u32, ii: u32, m: u32, et: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    let mk: u32 = iface.if_slot(ifp(s), ii as usize, m)
+    var k: u32 = 1
+    if mk == NONE {
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        // the interface has no method of that name
+        complain(s)
+        return (*s).t_error
+    }
+    // ROUND 50 -- OBJECT SAFETY: a signature with `Self` is unknown to the
+    // caller through `dyn I`. Which type is behind it is fixed only at run
+    // time, and `*Self` would be a different type for each. Such methods
+    // exist only statically, through a bound.
+    if iface.if_m_self(ifp(s), ii, mk) {
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    if types.is_ptr(table(s), et) {
+        // a pointer to an interface value is not one
+        complain(s)
+    }
+    let plen: u32 = iface.if_plen(ifp(s), ii as usize, mk)
+    if cnt != plen + 1 {
+        complain(s)
+    }
+    while k < cnt {
+        let arg: u32 = ast.child_at(b, off + k)
+        if k <= plen {
+            let pt: u32 = iface.if_ptyp(ifp(s), ii as usize, mk, k - 1)
+            if has_fe(s) && coerce_check(s, arg, pt) {
+                k = k + 1
+                continue
+            }
+            let t: u32 = expr(s, arg, pt)
+            if !types.compatible(table(s), t, pt) {
+                complain(s)
+            }
+        } else {
+            infer(s, arg)
+        }
+        k = k + 1
+    }
+    return iface.if_rtyp(ifp(s), ii as usize, mk)
+}
+
+// ----------------------------------------------- inline assembly and MMIO
+//
+// ROUND 52 (compiler/src/core.rs::hook_call).
+
+// Integer type to an MMIO width index (0 = u8 ... 3 = u64).
+fn mmio_ty(s: *mut Sema, w: u32) -> u32 {
+    if w == 0 {
+        return types.new_ty(table(s), types.K_U8, 0, 0)
+    }
+    if w == 1 {
+        return types.new_ty(table(s), types.K_U16, 0, 0)
+    }
+    if w == 2 {
+        return types.new_ty(table(s), types.K_U32, 0, 0)
+    }
+    return types.new_ty(table(s), types.K_U64, 0, 0)
+}
+
+// A register name in an asm block. `wo`: 0 = output, 1 = input, 2 = clobber.
+fn asm_reg_check(s: *mut Sema, reg: u32, wo: u32) -> bool {
+    if wo == 2 {
+        var mw: [u8; 6] = "memory"
+        if intern.intern_equal(names(s), reg, (&mw[0]) as u64, 6) {
+            return true
+        }
+    }
+    if core.reg_stem(names(s), reg) != core.NO_REG {
+        return true
+    }
+    complain(s)
+    return false
+}
+
+fn asm_check(s: *mut Sema, blk: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    var good: bool = true
+    let out: u32 = ast.asm_out(b, blk)
+    if out != ast.NOTHING {
+        if !asm_reg_check(s, out, 0) {
+            good = false
+        }
+    }
+    var k: u32 = 0
+    while k < ast.asm_in_count(b, blk) {
+        if !asm_reg_check(s, ast.asm_in_reg(b, blk, k), 1) {
+            good = false
+        }
+        k = k + 1
+    }
+    let onum: u32 = ast.asm_out_count(b, blk)
+    var ko: u32 = 0
+    while ko < onum {
+        if !asm_reg_check(s, ast.asm_out_reg(b, blk, ko), 0) {
+            good = false
+        }
+        ko = ko + 1
+    }
+    // ROUND 68: two outputs must not name the SAME register -- one of the
+    // two results would be lost without a word being said.
+    var kd: u32 = 0
+    while kd < onum {
+        let rr: u32 = core.reg_stem(names(s), ast.asm_out_reg(b, blk, kd))
+        var twice: bool = false
+        if out != ast.NOTHING {
+            twice = rr != core.NO_REG && rr == core.reg_stem(names(s), out)
+        }
+        var kx: u32 = 0
+        while kx < kd {
+            if rr != core.NO_REG && rr == core.reg_stem(names(s), ast.asm_out_reg(b, blk, kx)) {
+                twice = true
+            }
+            kx = kx + 1
+        }
+        if twice {
+            complain(s)
+            good = false
+        }
+        kd = kd + 1
+    }
+    // Every input value has to be scalar -- nothing else fits into a
+    // register.
+    let u64t: u32 = types.new_ty(table(s), types.K_U64, 0, 0)
+    let n_in: u32 = ast.asm_in_count(b, blk)
+    var k3: u32 = 0
+    while k3 < n_in && k3 < cnt {
+        let t: u32 = expr(s, ast.child_at(b, off + k3), u64t)
+        if is_error(s, t) {
+            good = false
+        } else if !is_int(s, t) && !is_bool(s, t) && !types.is_ptr(table(s), t) {
+            complain(s)
+            good = false
+        }
+        k3 = k3 + 1
+    }
+    // ROUND 68: an output operand is an ADDRESS. What is written there is
+    // always the WHOLE register, so the target has to be eight octets wide.
+    let pu64: u32 = types.new_ty(table(s), types.K_PTR, u64t, 1)
+    var k4: u32 = n_in
+    while k4 < cnt {
+        let t2: u32 = expr(s, ast.child_at(b, off + k4), pu64)
+        if is_error(s, t2) {
+            good = false
+        } else if !types.is_ptr(table(s), t2) {
+            complain(s)
+            good = false
+        } else {
+            let inner: u32 = types.ty_a(table(s), t2)
+            var okk: bool = is_int(s, inner) || types.is_ptr(table(s), inner)
+            if okk {
+                okk = types.size_of(table(s), inner) == 8
+            }
+            if !okk {
+                complain(s)
+                good = false
+            }
+        }
+        k4 = k4 + 1
+    }
+    if !good {
+        return (*s).t_error
+    }
+    if out != ast.NOTHING {
+        return u64t
+    }
+    return (*s).t_void
+}
+
+fn mmio_check(s: *mut Sema, w: u32, e: u32, write: bool) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    var should: u32 = 1
+    if write {
+        should = 2
+    }
+    let zt: u32 = mmio_ty(s, w)
+    if cnt != should {
+        var k: u32 = 0
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let pt: u32 = types.new_ty(table(s), types.K_PTR, zt, 1)
+    let at: u32 = expr(s, ast.child_at(b, off), pt)
+    if !is_error(s, at) && !types.is_ptr(table(s), at) {
+        complain(s)
+        return (*s).t_error
+    }
+    if is_error(s, at) {
+        return (*s).t_error
+    }
+    if !write {
+        return zt
+    }
+    let wt: u32 = expr(s, ast.child_at(b, off + 1), zt)
+    if is_error(s, wt) {
+        return (*s).t_error
+    }
+    if !is_int(s, wt) {
+        complain(s)
+        return (*s).t_error
+    }
+    return (*s).t_void
+}
+
+fn call(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    // `size_of[T]()` -- not an ordinary call but a size fixed at compile
+    // time (sizeof.rs). The parser has put the type node into `e_number`
+    // (node + 1); both are resolved only here, because the struct table
+    // is only available here.
+    if ast.e_number(b, e) != 0 {
+        let st: u32 = ast_ty(s, (ast.e_number(b, e) - 1) as u32)
+        if is_error(s, st) {
+            complain(s)
+            return (*s).t_error
+        }
+        if types.ty_kind(table(s), st) == types.K_VOID {
+            complain(s)
+            return (*s).t_error
+        }
+        return (*s).t_usize
+    }
+    var name: u32 = ast.e_a(b, e)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    // HOOK str: `f"{x}"` -- which builder step is right depends on the TYPE
+    // of x (sema::fmt_target, round 70). The name is resolved here and the
+    // ordinary check runs on the resolved one.
+    let real: u32 = fmt_target(s, name, e)
+    if real != NONE {
+        name = real
+    }
+    // HOOK impl (impls.rs::hook_call): `x.m(args)` -- method call.
+    if is_method_call(names(s), name) {
+        return methods_call(s, e)
+    }
+    // HOOK error unions (errors.rs::hook_call): `__try#`, `__catch#` and
+    // `ErrorSet::Variant`. Comes BEFORE the enum/match hook, because in
+    // stage 0 it comes first too; a set and an enum of the same name
+    // cannot both exist (the registration reports the clash).
+    if has_fe(s) {
+        if err.error_is_tryname(names(s), name) {
+            return try_check(s, e)
+        }
+        if err.error_is_catchname(names(s), name) {
+            return catch_check(s, e)
+        }
+        var en: u32 = NONE
+        var vn: u32 = NONE
+        err.error_name_split((*s).feh, names(s), name, &en, &vn)
+        if en != NONE {
+            if err.error_set_find(fe(s), en) != NONE {
+                return error_ctor_check(s, en, e)
+            }
+        }
+    }
+    // HOOK enum/match (sema_match.rs): `__match#N` is the pattern match,
+    // `Enum::Variant(..)` the constructor. Neither of them is in the
+    // function list.
+    if has_mu(s) {
+        if pattern.pat_is_matchname(names(s), name) {
+            match_check(s, pattern.pat_match_number(names(s), name))
+            return (*s).t_void
+        }
+        if pattern.pat_is_ctorname(names(s), name) {
+            return ctor_check(s, name, e)
+        }
+    }
+    // ROUND 52 (core.rs): the inline assembler and the eight MMIO names.
+    // `asm$N` cannot be a function ('$' is not an identifier character);
+    // for MMIO a user function of the same name wins.
+    let anr: u32 = core.asm_number(names(s), name)
+    if anr != core.NO_NUMBER {
+        return asm_check(s, anr, e)
+    }
+    if fn_search(s, name) == NONE {
+        let wl: u32 = core.mmio_read_width(names(s), name)
+        if wl != core.NO_WIDTH {
+            return mmio_check(s, wl, e, false)
+        }
+        let ws: u32 = core.mmio_write_width(names(s), name)
+        if ws != core.NO_WIDTH {
+            return mmio_check(s, ws, e, true)
+        }
+    }
+    // ROUND 49 (thread.rs): the three thread primitives. A user function
+    // of the same name wins, exactly as for the atomic addition.
+    var fst: [u8; 14] = "__thread_start"
+    if intern.intern_equal(names(s), name, (&fst[0]) as u64, 14) && fn_search(s, name) == NONE {
+        let u64t2: u32 = types.new_ty(table(s), types.K_U64, 0, 0)
+        let i64t2: u32 = types.new_ty(table(s), types.K_I64, 0, 0)
+        let u8t2: u32 = types.new_ty(table(s), types.K_U8, 0, 0)
+        let pu8t: u32 = types.new_ty(table(s), types.K_PTR, u8t2, 1)
+        if cnt != 3 {
+            var k3: u32 = 0
+            while k3 < cnt {
+                infer(s, ast.child_at(b, off + k3))
+                k3 = k3 + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        let ta: u32 = expr(s, ast.child_at(b, off), u64t2)
+        let ts: u32 = expr(s, ast.child_at(b, off + 1), u64t2)
+        let tc: u32 = expr(s, ast.child_at(b, off + 2), pu8t)
+        if !is_error(s, ta) && !is_int(s, ta) {
+            complain(s)
+            return (*s).t_error
+        }
+        if !is_error(s, ts) && !is_int(s, ts) {
+            complain(s)
+            return (*s).t_error
+        }
+        if !is_error(s, tc) && !types.is_ptr(table(s), tc) {
+            complain(s)
+            return (*s).t_error
+        }
+        if is_error(s, ta) || is_error(s, ts) || is_error(s, tc) {
+            return (*s).t_error
+        }
+        return i64t2
+    }
+    var fsl: [u8; 13] = "__thread_self"
+    if intern.intern_equal(names(s), name, (&fsl[0]) as u64, 13) && fn_search(s, name) == NONE {
+        let u8t3: u32 = types.new_ty(table(s), types.K_U8, 0, 0)
+        let pu8t2: u32 = types.new_ty(table(s), types.K_PTR, u8t3, 1)
+        if cnt != 0 {
+            var k4: u32 = 0
+            while k4 < cnt {
+                infer(s, ast.child_at(b, off + k4))
+                k4 = k4 + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        return pu8t2
+    }
+    var atc: [u8; 13] = "__atomic_swap"
+    if intern.intern_equal(names(s), name, (&atc[0]) as u64, 13) && fn_search(s, name) == NONE {
+        let u64t3: u32 = types.new_ty(table(s), types.K_U64, 0, 0)
+        let pu64t: u32 = types.new_ty(table(s), types.K_PTR, u64t3, 1)
+        if cnt != 3 {
+            var k5: u32 = 0
+            while k5 < cnt {
+                infer(s, ast.child_at(b, off + k5))
+                k5 = k5 + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        let tp2: u32 = expr(s, ast.child_at(b, off), pu64t)
+        let te2: u32 = expr(s, ast.child_at(b, off + 1), u64t3)
+        let tn2: u32 = expr(s, ast.child_at(b, off + 2), u64t3)
+        if !is_error(s, tp2) && !types.is_ptr(table(s), tp2) {
+            complain(s)
+            return (*s).t_error
+        }
+        if !is_error(s, te2) && !is_int(s, te2) {
+            complain(s)
+            return (*s).t_error
+        }
+        if !is_error(s, tn2) && !is_int(s, tn2) {
+            complain(s)
+            return (*s).t_error
+        }
+        if is_error(s, tp2) || is_error(s, te2) || is_error(s, tn2) {
+            return (*s).t_error
+        }
+        return u64t3
+    }
+    // `__atomic_add(p, delta)` (atomic.rs, ROUND 47): atomic
+    // read-add-write, the result is the OLD value. Basis of the
+    // reference count of `Arc[T]` (SPEC 3.4). A user function wins.
+    var atw: [u8; 12] = "__atomic_add"
+    if intern.intern_equal(names(s), name, (&atw[0]) as u64, 12) && fn_search(s, name) == NONE {
+        let u64t: u32 = types.new_ty(table(s), types.K_U64, 0, 0)
+        let pu64: u32 = types.new_ty(table(s), types.K_PTR, u64t, 1)
+        if cnt != 2 {
+            var k2: u32 = 0
+            while k2 < cnt {
+                infer(s, ast.child_at(b, off + k2))
+                k2 = k2 + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        let tp: u32 = expr(s, ast.child_at(b, off), pu64)
+        let td: u32 = expr(s, ast.child_at(b, off + 1), u64t)
+        if !is_error(s, tp) && !types.is_ptr(table(s), tp) {
+            complain(s)
+            return (*s).t_error
+        }
+        if !is_error(s, td) && !is_int(s, td) {
+            complain(s)
+            return (*s).t_error
+        }
+        if is_error(s, tp) || is_error(s, td) {
+            return (*s).t_error
+        }
+        return u64t
+    }
+    // HOOK gc (gc.rs::hook_call): `gc C{...}`, the two intrinsics,
+    // `x.as?[C]`, `weak(g)` and `strong(w)`. Runs before the function lookup,
+    // except for `weak`/`strong`: there a USER function of the same name
+    // wins (in stage 0: `ck.fns.contains_key(..)`).
+    if has_gc(s) {
+        if gc.gc_has_new_prefix(names(s), name) {
+            return gc_new_check(s, e)
+        }
+        if gc.gc_state_name(names(s), name) != 0 {
+            var k: u32 = 0
+            while k < cnt {
+                infer(s, ast.child_at(b, off + k))
+                k = k + 1
+            }
+            let u8t: u32 = types.new_ty(table(s), types.K_U8, 0, 0)
+            return types.new_ty(table(s), types.K_PTR, u8t, 1)
+        }
+        if gc.gc_has_as_prefix(names(s), name) {
+            return gc_as_check(s, e)
+        }
+        if (gc.gc_is_weak_name(names(s), name) || gc.gc_is_strong_name(names(s), name)) && fn_search(s, name) == NONE {
+            return gc_weak_check(s, e, gc.gc_is_weak_name(names(s), name))
+        }
+        // `barrier(x)` (ct.rs): the opaque barrier -- the behaviour is
+        // the identity, only scalarity is checked. A user function
+        // called `barrier` wins (ct.rs::hook_call).
+        var bw: [u8; 7] = "barrier"
+        if intern.intern_equal(names(s), name, (&bw[0]) as u64, 7) && fn_search(s, name) == NONE {
+            if cnt != 1 {
+                complain(s)
+                return (*s).t_error
+            }
+            let at: u32 = expr(s, ast.child_at(b, off), NONE)
+            if is_error(s, at) {
+                return (*s).t_error
+            }
+            if !is_int(s, at) && !is_bool(s, at) && !types.is_ptr(table(s), at) {
+                complain(s)
+                return (*s).t_error
+            }
+            return at
+        }
+        // `select(condition, a, b)` (ct.rs::check_select, ROUND 36):
+        // data independent choice -- only scalar types, both branches of
+        // the same type, no implicit conversion. A user function wins.
+        var sw2: [u8; 6] = "select"
+        if intern.intern_equal(names(s), name, (&sw2[0]) as u64, 6) && fn_search(s, name) == NONE {
+            if cnt != 3 {
+                complain(s)
+                return (*s).t_error
+            }
+            let cty: u32 = expr(s, ast.child_at(b, off), (*s).t_bool)
+            if !is_error(s, cty) && !is_bool(s, cty) {
+                complain(s)
+            }
+            let ta: u32 = expr(s, ast.child_at(b, off + 1), NONE)
+            let tb: u32 = expr(s, ast.child_at(b, off + 2), ta)
+            if is_error(s, ta) || is_error(s, tb) {
+                return (*s).t_error
+            }
+            if !is_int(s, ta) && !is_bool(s, ta) && !types.is_ptr(table(s), ta) {
+                complain(s)
+                return (*s).t_error
+            }
+            if !types.ty_equal(table(s), ta, tb) {
+                complain(s)
+                return (*s).t_error
+            }
+            return ta
+        }
+        // `secure_zero(pointer, count)` (ct.rs::check_secure_zero, ROUND 36):
+        // zeroes the buffer and must never be optimized away (SPEC 9.3, C3).
+        var sz: [u8; 11] = "secure_zero"
+        if intern.intern_equal(names(s), name, (&sz[0]) as u64, 11) && fn_search(s, name) == NONE {
+            if cnt != 2 {
+                complain(s)
+                return (*s).t_error
+            }
+            let tp: u32 = expr(s, ast.child_at(b, off), NONE)
+            if !is_error(s, tp) && !types.is_ptr(table(s), tp) {
+                complain(s)
+            }
+            let tn: u32 = expr(s, ast.child_at(b, off + 1), (*s).t_usize)
+            if !is_error(s, tn) && !is_int(s, tn) {
+                complain(s)
+            }
+            return (*s).t_void
+        }
+    }
+    // ROUND 58 (fnval.rs): the name belongs to a VARIABLE that holds a
+    // function. A variable of function type wins over a function of the
+    // same name -- that is ordinary scoping, and only that way does a
+    // parameter named like a global function stay callable.
+    note_use(s, name)
+    let vt: u32 = var_search(s, name)
+    if vt != NONE {
+        if types.ty_kind(table(s), vt) == types.K_FN {
+            let plen2: u32 = types.fn_ty_len(table(s), vt)
+            if cnt != plen2 {
+                complain(s)
+            }
+            var k2: u32 = 0
+            while k2 < cnt {
+                let arg2: u32 = ast.child_at(b, off + k2)
+                if k2 < plen2 {
+                    let pt2: u32 = types.fn_ty_param(table(s), vt, k2)
+                    if has_fe(s) && coerce_check(s, arg2, pt2) {
+                        k2 = k2 + 1
+                        continue
+                    }
+                    let t2: u32 = expr(s, arg2, pt2)
+                    if !types.compatible(table(s), t2, pt2) {
+                        complain(s)
+                    }
+                } else {
+                    infer(s, arg2)
+                }
+                k2 = k2 + 1
+            }
+            return types.ty_a(table(s), vt)
+        }
+    }
+    let f: u32 = fn_search(s, name)
+    if f == NONE {
+        var k: u32 = 0
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let plen: u32 = ast.fn_plen(b, f as usize)
+    if cnt != plen {
+        complain(s)
+    }
+    var k: u32 = 0
+    while k < cnt {
+        let arg: u32 = ast.child_at(b, off + k)
+        if k < plen {
+            let pt: u32 = types.param_ty_resolved(table(s), f as usize, k)
+            // HOOK error unions: implicit conversion of an argument
+            // (errors.rs::hook_coerce in `call`).
+            if has_fe(s) && coerce_check(s, arg, pt) {
+                k = k + 1
+                continue
+            }
+            let t: u32 = expr(s, arg, pt)
+            if !types.compatible(table(s), t, pt) {
+                // ROUND 70: the ONE widening of the interpolation
+                // (sema.rs::check_argument).
+                var fine: bool = widen_ok(s, arg)
+                if fine {
+                    fine = is_int(s, t) && is_int(s, pt)
+                    if fine {
+                        fine = types.bits_of(table(s), pt) >= types.bits_of(table(s), t)
+                    }
+                }
+                if !fine {
+                    complain(s)
+                }
+            }
+        } else {
+            infer(s, arg)
+        }
+        k = k + 1
+    }
+    return types.ret_ty_the_func(table(s), f as usize)
+}
+
+fn struct_literal(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let name: u32 = ast.e_a(b, e)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    let si: i32 = types.struct_index(table(s), name)
+    if si < 0 {
+        var k: u32 = 0
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k * 2 + 1))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    var k: u32 = 0
+    while k < cnt {
+        let fname: u32 = ast.child_at(b, off + k * 2)
+        let fexpr: u32 = ast.child_at(b, off + k * 2 + 1)
+        let ft: u32 = types.st_field_ty(table(s), si as usize, fname)
+        if ft == NONE {
+            infer(s, fexpr)
+            complain(s)
+        } else {
+            // HOOK error unions: implicit conversion of a field value.
+            var converted: bool = false
+            if has_fe(s) {
+                converted = coerce_check(s, fexpr, ft)
+            }
+            if !converted {
+                let t: u32 = expr(s, fexpr, ft)
+                if !types.compatible(table(s), t, ft) {
+                    complain(s)
+                }
+            }
+        }
+        k = k + 1
+    }
+    if cnt != types.st_flen(table(s), si as usize) {
+        complain(s)
+    }
+    return types.new_ty(table(s), types.K_STRUCT, si as u32, 0)
+}
+
+fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+
+    // ROUND 71 -- the float literal is UNTYPED. Where the context says
+    // `f32`, it is an `f32`; where nothing says anything, `f64` holds --
+    // the default type, as in C#. `1.5f` is only needed where there is no
+    // context at all.
+    if a == ast.E_FLOAT {
+        if note != NONE {
+            if types.ty_kind(table(s), note) == types.K_F32 {
+                return (*s).t_f32
+            }
+        }
+        return (*s).t_f64
+    }
+    // The suffix decides on its own and lets no context talk it out.
+    if a == ast.E_FLOAT32 {
+        return (*s).t_f32
+    }
+    if a == ast.E_INT {
+        // An integer literal carries NO type of its own -- it comes from outside.
+        if note != NONE {
+            if is_int(s, note) {
+                return note
+            }
+            if is_error(s, note) {
+                return (*s).t_error
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        // ROUND 70 -- THE DEFAULT TYPE. Nothing outside says anything, so
+        // `i32` holds (sema.rs, the `None` branch at the integer literal).
+        // The context keeps precedence: the branch above runs FIRST.
+        return (*s).t_i32
+    }
+    if a == ast.E_BOOL {
+        return (*s).t_bool
+    }
+    // HOOK str: a text literal -- array literal or `str`, the context
+    // decides (strtype.rs, round 70)
+    if a == ast.E_TEXT {
+        return text_check(s, e, note)
+    }
+    if a == ast.E_ID {
+        // HOOK fnval: a name out of the enclosing function is a capture
+        // (fnval.rs, round 58)
+        note_use(s, ast.e_a(b, e))
+        let v: u32 = var_search(s, ast.e_a(b, e))
+        if v != NONE {
+            return v
+        }
+        let k: u32 = const_search(s, ast.e_a(b, e))
+        if k != NONE {
+            return k
+        }
+        // ROUND 89 -- a global variable read as a value.
+        let g: u32 = static_search(s, ast.e_a(b, e))
+        if g != NONE {
+            return g
+        }
+        // ROUND 58 (fnval.rs): a named function AS A VALUE. The value is
+        // the address of its function record; the type is read straight off
+        // the signature.
+        let fi: u32 = fn_search(s, ast.e_a(b, e))
+        if fi != NONE {
+            return fn_value_ty(s, fi)
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    // HOOK fnval: the closure literal (fnval.rs, round 58)
+    if a == ast.E_LAMBDA {
+        return lambda_check(s, e)
+    }
+    if a == ast.E_UN {
+        return unary(s, e, note)
+    }
+    if a == ast.E_BIN {
+        return binary(s, e, note)
+    }
+    if a == ast.E_FIELD {
+        let bt: u32 = expr(s, ast.e_a(b, e), NONE)
+        return field_ty(s, bt, ast.e_b(b, e))
+    }
+    if a == ast.E_IDX {
+        let bt: u32 = expr(s, ast.e_a(b, e), NONE)
+        return index_ty(s, bt, ast.e_b(b, e))
+    }
+    if a == ast.E_CALL {
+        return call(s, e)
+    }
+    if a == ast.E_SYSCALL {
+        let off: u32 = ast.e_b(b, e)
+        let cnt: u32 = ast.e_c(b, e)
+        // ROUND 52 (prof.rs): below a freestanding kernel there is no
+        // operating system that could accept a system call.
+        if (*s).kernel {
+            complain(s)
+        }
+        if cnt == 0 || cnt > 7 {
+            complain(s)
+        }
+        var k: u32 = 0
+        while k < cnt {
+            let t: u32 = expr(s, ast.child_at(b, off + k), (*s).t_i64)
+            if !is_error(s, t) && !is_int(s, t) && !types.is_ptr(table(s), t) {
+                complain(s)
+            }
+            k = k + 1
+        }
+        return (*s).t_i64
+    }
+    if a == ast.E_AS {
+        let dst: u32 = ast_ty(s, ast.e_b(b, e))
+        // HOOK iface (iface.rs::hook_cast): `x as dyn I` -- the
+        // interface value is created EXPLICITLY (SPEC 6.2).
+        if has_if(s) && types.ty_kind(table(s), dst) == types.K_STRUCT {
+            let dn: u32 = types.st_name(table(s), types.ty_a(table(s), dst) as usize)
+            let ii: u32 = iface.if_of_dyn(ifp(s), dn)
+            if ii != NONE {
+                let src: u32 = expr(s, ast.e_a(b, e), NONE)
+                if is_error(s, src) {
+                    return dst
+                }
+                if !types.is_ptr(table(s), src) {
+                    complain(s)
+                    return (*s).t_error
+                }
+                let inner: u32 = types.ty_a(table(s), src)
+                if types.ty_kind(table(s), inner) != types.K_STRUCT {
+                    complain(s)
+                    return (*s).t_error
+                }
+                if !iface.if_impl_ok(ifp(s), ii, types.ty_a(table(s), inner)) {
+                    complain(s)
+                    return (*s).t_error
+                }
+                return dst
+            }
+        }
+        var ih: u32 = NONE
+        if is_int(s, dst) {
+            ih = dst
+        } else if is_bool(s, dst) {
+            ih = (*s).t_i64
+        } else if types.is_ptr(table(s), dst) {
+            ih = (*s).t_usize
+        }
+        let src: u32 = expr(s, ast.e_a(b, e), ih)
+        if is_error(s, src) || is_error(s, dst) {
+            return dst
+        }
+        if !convertible(s, src) || !convertible(s, dst) {
+            complain(s)
+            return (*s).t_error
+        }
+        return dst
+    }
+    if a == ast.E_SLIT {
+        return struct_literal(s, e)
+    }
+    if a == ast.E_AWDH {
+        let value: u32 = ast.e_a(b, e)
+        let count: u32 = ast.e_b(b, e)
+        let ct: u32 = expr(s, count, (*s).t_usize)
+        var n: u64 = 0
+        if is_error(s, ct) || !is_int(s, ct) {
+            if !is_error(s, ct) {
+                complain(s)
+            }
+        } else {
+            var good: bool = true
+            let v: i64 = const_eval(s, count, &good)
+            if good && v > 0 {
+                n = v as u64
+            } else {
+                complain(s)
+            }
+        }
+        var eh: u32 = NONE
+        if note != NONE {
+            if types.ty_kind(table(s), note) == types.K_ARR {
+                eh = types.ty_a(table(s), note)
+            }
+        }
+        let vt: u32 = expr(s, value, eh)
+        if n == 0 || is_error(s, vt) {
+            return (*s).t_error
+        }
+        if note != NONE {
+            if types.ty_kind(table(s), note) == types.K_ARR {
+                if !types.compatible(table(s), vt, types.ty_a(table(s), note)) {
+                    complain(s)
+                }
+                if types.ty_n(table(s), note) != n {
+                    complain(s)
+                }
+            }
+        }
+        return types.new_ty(table(s), types.K_ARR, vt, n)
+    }
+    // array literal
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    var is_arr: bool = false
+    if note != NONE {
+        is_arr = types.ty_kind(table(s), note) == types.K_ARR
+    }
+    if is_arr {
+        let et: u32 = types.ty_a(table(s), note)
+        if cnt as u64 != types.ty_n(table(s), note) {
+            complain(s)
+        }
+        var k: u32 = 0
+        while k < cnt {
+            let t: u32 = expr(s, ast.child_at(b, off + k), et)
+            if !types.compatible(table(s), t, et) {
+                complain(s)
+            }
+            k = k + 1
+        }
+        return types.new_ty(table(s), types.K_ARR, et, types.ty_n(table(s), note))
+    }
+    var k: u32 = 0
+    while k < cnt {
+        infer(s, ast.child_at(b, off + k))
+        k = k + 1
+    }
+    complain(s)
+    return (*s).t_error
+}
+
+// ------------------------------------------------- enum/match (sema_match.rs)
+//
+// Port of the type check for enums and pattern matching.
+// As everywhere in this file: errors are COUNTED, not described.
+
+// subject kinds of the pattern match (Subject in sema_match.rs).
+const SJ_BAD: u32 = 0
+const SJ_ENUM: u32 = 1
+const SJ_BOOL: u32 = 2
+const SJ_INT: u32 = 3
+
+// Check `Enum::Variant(args..)`. Yields the enum type.
+fn ctor_check(s: *mut Sema, name: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    // Split the name at the first double colon.
+    let it: *mut intern.Interner = names(s)
+    let zp: u64 = intern.intern_ptr(it, name)
+    let zn: usize = intern.intern_length(it, name)
+    var ename: u32 = NONE
+    var vname: u32 = NONE
+    var i: usize = 0
+    while i + 1 < zn {
+        if rt.ld8(zp, i) == 58 as u8 && rt.ld8(zp, i + 1) == 58 as u8 {
+            ename = intern.intern_number(it, zp, i) as u32
+            vname = intern.intern_number(it, zp + (i + 2) as u64, zn - i - 2) as u32
+            break
+        }
+        i = i + 1
+    }
+    let ei: u32 = pattern.pat_enum_find(mu(s), ename)
+    if ei == NONE {
+        // unknown enum
+        var k: u32 = 0
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let vi: u32 = pattern.pat_variant_find(mu(s), ei, vname)
+    if vi == NONE {
+        // the enum has no such variant
+        var k2: u32 = 0
+        while k2 < cnt {
+            infer(s, ast.child_at(b, off + k2))
+            k2 = k2 + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    let roff: u32 = pattern.pat_v_roff(mu(s), vi)
+    let flen: u32 = pattern.pat_v_tlen(mu(s), vi)
+    if cnt != flen {
+        complain(s)
+    }
+    var k3: u32 = 0
+    while k3 < cnt {
+        let arg: u32 = ast.child_at(b, off + k3)
+        if k3 < flen {
+            let want: u32 = pattern.pat_rf_ty(mu(s), roff + k3)
+            let got: u32 = expr(s, arg, want)
+            if !types.compatible(table(s), got, want) {
+                complain(s)
+            }
+        } else {
+            infer(s, arg)
+        }
+        k3 = k3 + 1
+    }
+    return types.new_ty(table(s), types.K_STRUCT, pattern.pat_e_sidx(mu(s), ei), 0)
+}
+
+// Does the pattern value fit into the type? (`fits` in sema_match.rs)
+fn fits_in(s: *mut Sema, v: i64, t: u32) -> bool {
+    let bits: u32 = types.bits_of(table(s), t)
+    if bits == 0 {
+        return true
+    }
+    if types.is_sign(table(s), t) {
+        if bits >= 64 {
+            return true
+        }
+        let lo: i64 = 0 - (1 << (bits - 1) as i64)
+        let hi: i64 = (1 << (bits - 1) as i64) - 1
+        return v >= lo && v <= hi
+    }
+    if v < 0 {
+        return false
+    }
+    if bits >= 64 {
+        // LIMIT: `u64` bounds above `i64::MAX` cannot be written down
+        // here (stage 0 computes with i128) -- see pattern.fi.
+        return true
+    }
+    return (v as u64) < (1 << bits as i64) as u64
+}
+
+// Checks a pattern against the expected type and creates its bindings.
+fn pattern_check(s: *mut Sema, pat: u32, ty: u32, sj_kind: u32, sj_ei: u32,
+    top: bool) {
+    let m: *mut pattern.Pat = mu(s)
+    let a: u32 = pattern.pat_mu_kind(m, pat)
+    if a == pattern.MU_WILD {
+        return
+    }
+    if a == pattern.MU_BIND {
+        var_create(s, pattern.pat_mu_a(m, pat), ty)
+        return
+    }
+    if a == pattern.MU_BOOL {
+        if !is_bool(s, ty) && !is_error(s, ty) {
+            complain(s)
+        }
+        return
+    }
+    if a == pattern.MU_INT {
+        if !is_int(s, ty) && !is_error(s, ty) {
+            complain(s)
+            return
+        }
+        if !is_error(s, ty) {
+            if !fits_in(s, pattern.pat_mu_lo(m, pat), ty) {
+                complain(s)
+            }
+        }
+        return
+    }
+    if a == pattern.MU_RANGE {
+        if !is_int(s, ty) && !is_error(s, ty) {
+            complain(s)
+            return
+        }
+        if !is_error(s, ty) {
+            if !fits_in(s, pattern.pat_mu_lo(m, pat), ty) {
+                complain(s)
+                return
+            }
+            if !fits_in(s, pattern.pat_mu_hi(m, pat), ty) {
+                complain(s)
+            }
+        }
+        return
+    }
+    // MU_VARIANT
+    let ename: u32 = pattern.pat_mu_a(m, pat)
+    var ei: u32 = NONE
+    if ename != ast.NOTHING {
+        ei = pattern.pat_enum_find(m, ename)
+        if ei == NONE {
+            complain(s)
+            return
+        }
+    } else {
+        // Without an explicit enum name it comes from the expected type.
+        if types.ty_kind(table(s), ty) == types.K_STRUCT {
+            ei = pattern.pat_enum_at_struct(m, types.ty_a(table(s), ty))
+        }
+        if ei == NONE {
+            return
+        }
+    }
+    let want: u32 = types.new_ty(table(s), types.K_STRUCT, pattern.pat_e_sidx(m, ei), 0)
+    if !is_error(s, ty) {
+        if !types.ty_equal(table(s), ty, want) {
+            complain(s)
+            return
+        }
+    }
+    if top {
+        if sj_kind == SJ_ENUM && sj_ei != ei {
+            complain(s)
+            return
+        }
+    }
+    let vi: u32 = pattern.pat_variant_find(m, ei, pattern.pat_mu_b(m, pat))
+    if vi == NONE {
+        complain(s)
+        return
+    }
+    let soff: u32 = pattern.pat_mu_soff(m, pat)
+    let slen: u32 = pattern.pat_mu_slen(m, pat)
+    let roff: u32 = pattern.pat_v_roff(m, vi)
+    let flen: u32 = pattern.pat_v_tlen(m, vi)
+    if slen != flen {
+        complain(s)
+    }
+    var k: u32 = 0
+    while k < slen {
+        if k < flen {
+            let ft: u32 = pattern.pat_rf_ty(m, roff + k)
+            pattern_check(s, pattern.pat_mu_child(m, soff + k), ft, sj_kind, sj_ei, false)
+        }
+        k = k + 1
+    }
+}
+
+// Check the `match` with the number `mi` (check_match in sema_match.rs).
+fn match_check(s: *mut Sema, mi: u32) {
+    let m: *mut pattern.Pat = mu(s)
+    if mi as usize >= pattern.pat_match_count(m) {
+        complain(s)
+        return
+    }
+    let subj: u32 = pattern.pat_m_subj(m, mi)
+    let sty: u32 = expr(s, subj, NONE)
+    // Classify the subject: enum, bool or integer -- anything else is an error.
+    var sj_kind: u32 = SJ_BAD
+    var sj_ei: u32 = NONE
+    if is_error(s, sty) {
+        sj_kind = SJ_BAD
+    } else if types.ty_kind(table(s), sty) == types.K_STRUCT {
+        let ei: u32 = pattern.pat_enum_at_struct(m, types.ty_a(table(s), sty))
+        if ei == NONE {
+            // 'match' on an ordinary struct: error.
+            complain(s)
+            sj_kind = SJ_BAD
+        } else {
+            sj_kind = SJ_ENUM
+            sj_ei = ei
+        }
+    } else if is_bool(s, sty) {
+        sj_kind = SJ_BOOL
+    } else if is_int(s, sty) {
+        sj_kind = SJ_INT
+    } else {
+        complain(s)
+        sj_kind = SJ_BAD
+    }
+    // The expected type of the patterns.
+    var mty: u32 = sty
+    if sj_kind == SJ_ENUM {
+        mty = types.new_ty(table(s), types.K_STRUCT, pattern.pat_e_sidx(m, sj_ei), 0)
+    } else if sj_kind == SJ_BOOL {
+        mty = (*s).t_bool
+    }
+    // 1. Per arm: a scope of its own, check the pattern, check the body.
+    let aoff: u32 = pattern.pat_m_aoff(m, mi)
+    let alen: u32 = pattern.pat_m_alen(m, mi)
+    var ai: u32 = 0
+    while ai < alen {
+        range_on(s)
+        pattern_check(s, pattern.pat_a_pat(m, aoff + ai), mty, sj_kind, sj_ei, true)
+        block(s, pattern.pat_a_block(m, aoff + ai), true)
+        range_off(s)
+        ai = ai + 1
+    }
+    // 2. Reachability: nothing may follow an arm that always matches.
+    var has_catch: bool = false
+    ai = 0
+    while ai < alen {
+        if has_catch {
+            complain(s)
+            break
+        }
+        if pattern.pat_irrefutable(m, pattern.pat_a_pat(m, aoff + ai)) {
+            has_catch = true
+        }
+        ai = ai + 1
+    }
+    // 3. COMPLETENESS -- a missing arm is an ERROR (SPEC 6.3).
+    if sj_kind == SJ_BAD {
+        return
+    }
+    if has_catch {
+        return
+    }
+    if sj_kind == SJ_INT {
+        // Without a catch all arm an integer match is never complete.
+        complain(s)
+        return
+    }
+    if sj_kind == SJ_BOOL {
+        var has_w: bool = false
+        var has_f: bool = false
+        ai = 0
+        while ai < alen {
+            let pat: u32 = pattern.pat_a_pat(m, aoff + ai)
+            if pattern.pat_mu_kind(m, pat) == pattern.MU_BOOL {
+                if pattern.pat_mu_a(m, pat) == 1 {
+                    has_w = true
+                } else {
+                    has_f = true
+                }
+            }
+            ai = ai + 1
+        }
+        if !has_w || !has_f {
+            complain(s)
+        }
+        return
+    }
+    // SJ_ENUM: every variant needs an arm whose subpatterns are all
+    // irrefutable.
+    let voff: u32 = pattern.pat_e_voff(m, sj_ei)
+    let vlen: u32 = pattern.pat_e_vlen(m, sj_ei)
+    var v: u32 = 0
+    while v < vlen {
+        let vname: u32 = pattern.pat_v_name(m, voff + v)
+        var covered: bool = false
+        ai = 0
+        while ai < alen {
+            let pat: u32 = pattern.pat_a_pat(m, aoff + ai)
+            if pattern.pat_mu_kind(m, pat) == pattern.MU_VARIANT {
+                if pattern.pat_mu_b(m, pat) == vname {
+                    var all_un: bool = true
+                    let soff: u32 = pattern.pat_mu_soff(m, pat)
+                    let slen: u32 = pattern.pat_mu_slen(m, pat)
+                    var k: u32 = 0
+                    while k < slen {
+                        if !pattern.pat_irrefutable(m, pattern.pat_mu_child(m, soff + k)) {
+                            all_un = false
+                        }
+                        k = k + 1
+                    }
+                    if all_un {
+                        covered = true
+                    }
+                }
+            }
+            ai = ai + 1
+        }
+        if !covered {
+            complain(s)
+        }
+        v = v + 1
+    }
+}
+
+// -------------------------------------------------------------- statements
+
+// --------------------------------------- error unions (errors.rs)
+//
+// Port of the type check for `try`, `catch`, `Set::Variant` and the
+// implicit conversion. As everywhere in this file: errors are
+// COUNTED, not described.
+
+// `try a` (check_try in errors.rs). Yields the success type of the union.
+fn try_check(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e))
+    let got: u32 = expr(s, arg, NONE)
+    let u: u32 = err.error_union_of_ty(fe(s), table(s), got)
+    if u == NONE {
+        // 'try' expects a value of an error union
+        if !is_error(s, got) {
+            complain(s)
+        }
+        return (*s).t_error
+    }
+    let val: u32 = err.error_u_valty(fe(s), u)
+    let ru: u32 = err.error_union_of_ty(fe(s), table(s), (*s).ret)
+    if ru == NONE {
+        // 'try' outside a function that returns an error union
+        complain(s)
+        return val
+    }
+    if err.error_u_set(fe(s), ru) != err.error_u_set(fe(s), u) {
+        // both error sets have to be the same
+        complain(s)
+        return val
+    }
+    err.error_try_set(fe(s), e, u)
+    return val
+}
+
+// `a catch b` (check_catch, errors.rs). Yields the success type of the union.
+fn catch_check(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let lhs: u32 = ast.child_at(b, off)
+    let rhs: u32 = ast.child_at(b, off + 1)
+    let got: u32 = expr(s, lhs, NONE)
+    let u: u32 = err.error_union_of_ty(fe(s), table(s), got)
+    if u == NONE {
+        // 'catch' expects a value of an error union on the left
+        if !is_error(s, got) {
+            complain(s)
+        }
+        infer(s, rhs)
+        return (*s).t_error
+    }
+    let want: u32 = err.error_u_valty(fe(s), u)
+    // `catch |f| fallback`: the error value is visible in the fallback --
+    // with the type of the SET (the bare error value).
+    let bind: u32 = err.error_cb(fe(s), e)
+    if bind != NONE {
+        range_on(s)
+        let st: u32 = err.error_set_ty(fe(s), table(s),
+            err.error_u_set(fe(s), u))
+        var_create(s, bind, st)
+    }
+    let rt: u32 = expr(s, rhs, want)
+    if bind != NONE {
+        range_off(s)
+    }
+    if !is_error(s, rt) && !types.compatible(table(s), rt, want) {
+        complain(s)
+    }
+    err.error_catch_set(fe(s), e, u)
+    return want
+}
+
+// `Set::Variant` -- the bare error value (the constructor branch of
+// errors.rs::hook_call). The set exists; the caller has checked that.
+fn error_ctor_check(s: *mut Sema, en: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    var k: u32 = 0
+    while k < cnt {
+        infer(s, ast.child_at(b, off + k))
+        k = k + 1
+    }
+    if cnt > 0 {
+        // the error variant has no payload
+        complain(s)
+    }
+    if err.error_ctor_code((*s).feh, names(s), ast.e_a(b, e)) < 0 {
+        // unknown variant
+        complain(s)
+        return (*s).t_error
+    }
+    return err.error_set_ty(fe(s), table(s),
+        err.error_set_find(fe(s), en))
+}
+
+// Implicit conversion into an error union at `return`/`let`/assignment/
+// argument/field (hook_coerce in errors.rs). Yields false if `want` is
+// not an error union -- then the ordinary check runs.
+fn coerce_check(s: *mut Sema, e: u32, want: u32) -> bool {
+    let u: u32 = err.error_union_of_ty(fe(s), table(s), want)
+    if u == NONE {
+        return false
+    }
+    let uv: u32 = err.error_u_valty(fe(s), u)
+    let got: u32 = expr(s, e, uv)
+    if is_error(s, got) {
+        return true
+    }
+    if types.ty_equal(table(s), got, want) {
+        // already an error union -- nothing to convert
+        return true
+    }
+    let sm: u32 = err.error_set_of_ty(fe(s), table(s), got)
+    if sm != NONE {
+        if sm == err.error_u_set(fe(s), u) {
+            err.error_coerce_set(fe(s), e, err.ERROR_OUT_ERROR, u)
+            return true
+        }
+        // error value of another set
+        complain(s)
+        return true
+    }
+    if types.compatible(table(s), got, uv) {
+        err.error_coerce_set(fe(s), e, err.ERROR_OUT_VALUE, u)
+        return true
+    }
+    complain(s)
+    return true
+}
+
+// Is the expression RECOGNISABLY an error value (`quiet_set`, errors.rs):
+// a variant `E::V` or a variable whose type is an error set.
+fn error_quiet_set(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_CALL {
+        var en: u32 = NONE
+        var vn: u32 = NONE
+        err.error_name_split((*s).feh, names(s), ast.e_a(b, e), &en, &vn)
+        if en != NONE {
+            return err.error_set_find(fe(s), en)
+        }
+        return NONE
+    }
+    if a == ast.E_ID {
+        let v: u32 = var_search(s, ast.e_a(b, e))
+        if v != NONE {
+            return err.error_set_of_ty(fe(s), table(s), v)
+        }
+    }
+    return NONE
+}
+
+fn cond(s: *mut Sema, e: u32) {
+    let t: u32 = expr(s, e, (*s).t_bool)
+    if !is_error(s, t) && !is_bool(s, t) {
+        complain(s)
+    }
+}
+
+fn stmt(s: *mut Sema, i: u32) {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.s_kind(b, i)
+
+    if a == ast.S_LET || a == ast.S_VAR {
+        let te: u32 = ast.s_b(b, i)
+        var t: u32 = 0
+        if te != ast.NOTHING {
+            let d: u32 = ast_ty(s, te)
+            // HOOK error unions: implicit conversion at 'let'.
+            var converted: bool = false
+            if has_fe(s) {
+                converted = coerce_check(s, ast.s_c(b, i), d)
+            }
+            if !converted {
+                let got: u32 = expr(s, ast.s_c(b, i), d)
+                if !types.compatible(table(s), got, d) {
+                    complain(s)
+                }
+            }
+            t = d
+        } else {
+            let got: u32 = expr(s, ast.s_c(b, i), NONE)
+            if types.ty_kind(table(s), got) == types.K_VOID {
+                complain(s)
+                t = (*s).t_error
+            } else {
+                t = got
+            }
+        }
+        var_create(s, ast.s_a(b, i), t)
+        return
+    }
+    if a == ast.S_ZUW {
+        let t: u32 = lvalue(s, ast.s_a(b, i))
+        if t == NONE {
+            expr(s, ast.s_b(b, i), (*s).t_i64)
+            return
+        }
+        // HOOK error unions: implicit conversion in an assignment.
+        if has_fe(s) && coerce_check(s, ast.s_b(b, i), t) {
+            return
+        }
+        let got: u32 = expr(s, ast.s_b(b, i), t)
+        if !types.compatible(table(s), got, t) {
+            complain(s)
+        }
+        return
+    }
+    // ROUND 70 (sema.rs): `x op= e` -- the same lvalue check as an ordinary
+    // assignment, and afterwards EXACTLY the rules of `x = x op e`
+    // (`binop_type`). `let` stays immutable, because `lvalue` says so.
+    if a == ast.S_ZUWOP {
+        let t: u32 = lvalue(s, ast.s_a(b, i))
+        if t == NONE {
+            expr(s, ast.s_b(b, i), (*s).t_i64)
+            return
+        }
+        // The right side gets the type of the left one as its hint -- exactly
+        // what `binary` would give it (`probe(l)`).
+        let rt: u32 = expr(s, ast.s_b(b, i), t)
+        if is_error(s, t) || is_error(s, rt) {
+            return
+        }
+        let got: u32 = binop_type(s, ast.s_c(b, i), t, rt)
+        if !types.compatible(table(s), got, t) {
+            complain(s)
+        }
+        return
+    }
+    // ROUND 70: `x++` / `x--`. It is exactly `x = x + 1`, so it works on the
+    // types on which `x + 1` works -- the integers.
+    if a == ast.S_STEP {
+        let t: u32 = lvalue(s, ast.s_a(b, i))
+        if t == NONE {
+            return
+        }
+        if !is_error(s, t) && !is_int(s, t) {
+            complain(s)
+        }
+        return
+    }
+    if a == ast.S_IF {
+        cond(s, ast.s_a(b, i))
+        block(s, ast.s_b(b, i), false)
+        if ast.s_c(b, i) != ast.NOTHING {
+            stmt(s, ast.s_c(b, i))
+        }
+        return
+    }
+    if a == ast.S_WHILE {
+        cond(s, ast.s_a(b, i))
+        block(s, ast.s_b(b, i), false)
+        return
+    }
+    if a == ast.S_FOR {
+        var want: u32 = probe(s, ast.s_b(b, i))
+        if want == NONE {
+            want = probe(s, ast.s_c(b, i))
+        }
+        let st: u32 = expr(s, ast.s_b(b, i), want)
+        var w2: u32 = want
+        if w2 == NONE {
+            w2 = st
+        }
+        let et: u32 = expr(s, ast.s_c(b, i), w2)
+        var t: u32 = (*s).t_error
+        if is_error(s, st) || is_error(s, et) {
+            t = (*s).t_error
+        } else if !is_int(s, st) || !is_int(s, et) || !types.ty_equal(table(s), st, et) {
+            complain(s)
+            t = (*s).t_error
+        } else {
+            t = st
+        }
+        range_on(s)
+        var_create(s, ast.s_a(b, i), t)
+        block(s, ast.s_d(b, i), true)
+        range_off(s)
+        return
+    }
+    if a == ast.S_RET {
+        let w: u32 = (*s).ret
+        if ast.s_a(b, i) == ast.NOTHING {
+            if types.ty_kind(table(s), w) != types.K_VOID && !is_error(s, w) {
+                complain(s)
+            }
+            return
+        }
+        if types.ty_kind(table(s), w) == types.K_VOID {
+            expr(s, ast.s_a(b, i), (*s).t_i64)
+            complain(s)
+            return
+        }
+        // HOOK error unions: implicit conversion at 'return'
+        // (errors.rs::hook_coerce in check_stmt).
+        if has_fe(s) && coerce_check(s, ast.s_a(b, i), w) {
+            return
+        }
+        let got: u32 = expr(s, ast.s_a(b, i), w)
+        if !types.compatible(table(s), got, w) {
+            complain(s)
+        }
+        return
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        stmt(s, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_EXPR {
+        let e2: u32 = ast.s_a(b, i)
+        let et: u32 = expr(s, e2, NONE)
+        // "the result of a call is discarded as a statement"
+        // (sema.rs::check_discard): HOOK error unions -- an `E!T` value is
+        // implicitly #[must_consume] (SPEC 5.1), and since round 36 there is
+        // the explicit marking on a function or type as well (SPEC 3.3).
+        if ast.e_kind(b, e2) == ast.E_CALL && ast.e_number(b, e2) == 0 {
+            var discarded: bool = false
+            if has_fe(s) && err.error_union_of_ty(fe(s), table(s), et) != NONE {
+                discarded = true
+            }
+            if !discarded {
+                var mj: usize = 0
+                while mj < vec_len[u32](&(*s).mc_fname) {
+                    if vec_at[u32](&(*s).mc_fname, mj) == ast.e_a(b, e2) {
+                        discarded = true
+                    }
+                    mj = mj + 1
+                }
+            }
+            if !discarded && !is_error(s, et) && types.ty_kind(table(s), et) == types.K_STRUCT {
+                var mk: usize = 0
+                while mk < vec_len[u32](&(*s).mc_si) {
+                    if vec_at[u32](&(*s).mc_si, mk) == types.ty_a(table(s), et) {
+                        discarded = true
+                    }
+                    mk = mk + 1
+                }
+            }
+            if discarded {
+                complain(s)
+            }
+        }
+        return
+    }
+    if a == ast.S_BLOCK {
+        block(s, ast.s_a(b, i), false)
+        return
+    }
+    // break / continue: the parser has already checked the position.
+}
+
+fn block(s: *mut Sema, bi: u32, range_already_open: bool) {
+    let b: *mut ast.Tree = tree(s)
+    if !range_already_open {
+        range_on(s)
+    }
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        stmt(s, ast.slist_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+    if !range_already_open {
+        range_off(s)
+    }
+}
+
+// ---------------------------------------------------------------- the run
+
+// ROUND 70 (strtype.rs::declare) -- the builtin struct `str`:
+// `{ p: *mut u8, n: usize }`, 16 octets, alignment 8. Exactly the layout of
+// `str.Span`, and that is the point of it: the string library of round 42
+// does not have to be written a second time.
+fn str_declare(s: *mut Sema) {
+    let t: *mut types.Types = table(s)
+    var w: [u8; 3] = "str"
+    let name: u32 = intern.intern_number(names(s), (&w[0]) as u64, 3) as u32
+    let idx: u32 = types.types_struct_reserve(t, name)
+    var pw: [u8; 1] = "p"
+    var nw: [u8; 1] = "n"
+    var fnames: Vec[u32] = vec_new[u32]()
+    var ftypes: Vec[u32] = vec_new[u32]()
+    var foffs: Vec[u64] = vec_new[u64]()
+    vec_push[u32](&fnames, intern.intern_number(names(s), (&pw[0]) as u64, 1) as u32)
+    vec_push[u32](&ftypes, types.new_ty(t, types.K_PTR,
+            types.new_ty(t, types.K_U8, 0, 0), 1))
+    vec_push[u64](&foffs, 0)
+    vec_push[u32](&fnames, intern.intern_number(names(s), (&nw[0]) as u64, 1) as u32)
+    vec_push[u32](&ftypes, types.new_ty(t, types.K_USIZE, 0, 0))
+    vec_push[u64](&foffs, 8)
+    types.types_struct_define(t, idx, 16, 8, &fnames, &ftypes, &foffs)
+    vec_free[u32](&fnames)
+    vec_free[u32](&ftypes)
+    vec_free[u64](&foffs)
+}
+
+// The runtime function has to be part of the program. It comes with the
+// collector (`__str_eq` / `__str_concat` in lib/gc/gc.fi); whoever gets here
+// without it gets an error, exactly as in stage 0 (strtype.rs::need).
+fn str_need(s: *mut Sema, which: u32) {
+    var eqw: [u8; 8] = "__str_eq"
+    var caw: [u8; 12] = "__str_concat"
+    var nr: u32 = 0
+    if which == 0 {
+        nr = intern.intern_number(names(s), (&eqw[0]) as u64, 8) as u32
+    } else {
+        nr = intern.intern_number(names(s), (&caw[0]) as u64, 12) as u32
+    }
+    if fn_search(s, nr) == NONE {
+        complain(s)
+    }
+}
+
+// ROUND 70 (sema::fmt_target) -- the target of ONE interpolation step.
+//
+// The parser writes `io.fmt_value(chain, x)`, because at parse time nobody
+// knows what `x` is. Here the type decides: an integer goes to `fmt_number`
+// (signed) resp. `fmt_u64` (unsigned), a `bool` to `fmt_bool`, an `f64` to
+// `fmt_f64`, a `str` to `fmt_str`. Only the LAST name segment is replaced,
+// so the module prefix stays untouched.
+//
+// Returns the new name or NONE.
+fn fmt_target(s: *mut Sema, name: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let it: *mut intern.Interner = names(s)
+    var vw: [u8; 9] = "fmt_value"
+    let n: usize = intern.intern_length(it, name)
+    if n < 9 {
+        return NONE
+    }
+    let p: u64 = intern.intern_ptr(it, name)
+    if !rt.mem_eq(p + (n - 9) as u64, (&vw[0]) as u64, 9) {
+        return NONE
+    }
+    if ast.e_c(b, e) != 2 {
+        return NONE
+    }
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+    let t: u32 = expr(s, arg, NONE)
+    if is_error(s, t) {
+        return NONE
+    }
+    var step: [u8; 10] = "fmt_number"
+    var slen: usize = 10
+    if str_like(s, t) {
+        var w1: [u8; 7] = "fmt_str"
+        return fmt_join(s, p, n - 9, (&w1[0]) as u64, 7)
+    }
+    if is_bool(s, t) {
+        var w2: [u8; 8] = "fmt_bool"
+        return fmt_join(s, p, n - 9, (&w2[0]) as u64, 8)
+    }
+    if is_f64(s, t) {
+        var w3: [u8; 7] = "fmt_f64"
+        return fmt_join(s, p, n - 9, (&w3[0]) as u64, 7)
+    }
+    if is_f32(s, t) {
+        var w4: [u8; 7] = "fmt_f32"
+        return fmt_join(s, p, n - 9, (&w4[0]) as u64, 7)
+    }
+    if !is_int(s, t) {
+        complain(s)
+        return NONE
+    }
+    // `io.fmt_number` takes an i64, `io.fmt_u64` a u64. Both are wider than
+    // or as wide as every integer that can arrive here; the lowering widens
+    // (lower.fi). The exception holds for exactly this one argument.
+    vec_push[u32](&(*s).widen, arg)
+    if !types.is_sign(table(s), t) {
+        var w4: [u8; 7] = "fmt_u64"
+        return fmt_join(s, p, n - 9, (&w4[0]) as u64, 7)
+    }
+    return fmt_join(s, p, n - 9, (&step[0]) as u64, slen)
+}
+
+// `<head><step>` as an interner number.
+fn fmt_join(s: *mut Sema, head: u64, hn: usize, step: u64, sn: usize) -> u32 {
+    rt.buf_clear(&(*s).scratch2)
+    rt.buf_push_bytes(&(*s).scratch2, head, hn)
+    rt.buf_push_bytes(&(*s).scratch2, step, sn)
+    return intern.intern_number(names(s), rt.buf_ptr(&(*s).scratch2),
+        rt.buf_len(&(*s).scratch2)) as u32
+}
+
+// Was this argument marked as widenable? (sema.rs::check_argument)
+fn widen_ok(s: *mut Sema, arg: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).widen) {
+        if vec_at[u32](&(*s).widen, i) == arg {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The type `str` itself.
+fn str_ty(s: *mut Sema) -> u32 {
+    return types.new_ty(table(s), types.K_STRUCT, types.STR_INDEX, 0)
+}
+
+// Is this type a `str` or a view of the same shape? (strtype::is_str_like)
+fn str_like(s: *mut Sema, t: u32) -> bool {
+    return types.str_like(table(s), t)
+}
+
+// HOOK str (strtype.rs::check_text): a text literal.
+//
+// THE RULE: the CONTEXT decides. Where an array type is wanted, the literal
+// is the array literal it has always been -- with the same length check.
+// Everywhere else it is a `str`. Nothing can break through that: without an
+// array context a text literal is an error today.
+fn text_check(s: *mut Sema, e: u32, note: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let inner: u32 = ast.e_a(b, e)
+    let wide: bool = ast.e_b(b, e) == 1
+    let n: u32 = ast.e_c(b, inner)
+    if note != NONE {
+        if types.ty_kind(table(s), note) == types.K_ARR {
+            if n == 0 {
+                complain(s)
+                return (*s).t_error
+            }
+            return expr(s, inner, note)
+        }
+    }
+    if wide {
+        complain(s)
+        return (*s).t_error
+    }
+    if n > 0 {
+        // The octets keep their array type -- the lowering writes them into
+        // the frame with exactly the code an array literal has always got.
+        let u8t: u32 = types.new_ty(table(s), types.K_U8, 0, 0)
+        let at: u32 = types.new_ty(table(s), types.K_ARR, u8t, n as u64)
+        expr(s, inner, at)
+    }
+    return str_ty(s)
+}
+
+fn sema_run(s: *mut Sema) {
+    let b: *mut ast.Tree = tree(s)
+    // HOOK str (strtype.rs, round 70): the builtin type `str`. It is
+    // declared BEFORE everything else -- enums, error sets, gc classes,
+    // interfaces -- so that its struct index is 0 in EVERY program
+    // (types.fi::STR_INDEX).
+    str_declare(s)
+    // 0. Enums: register the NAMES first, so that structs and signatures can
+    //    use them (before the struct layout -- exactly like `declare_enums`
+    //    before `collect_structs` in stage 0).
+    if has_mu(s) {
+        pattern.pat_register(mu(s), table(s))
+    }
+    // 0b. Error sets: register the NAMES -- after the enums, before the
+    //    structs of the tree, exactly like `declare_error_sets` in stage 0. The
+    //    type resolution gets the registry, so that it can resolve
+    //    `__eu#<n>` placeholders.
+    var fe_so_far: usize = 0
+    if has_fe(s) {
+        err.error_register((*s).feh, table(s), names(s))
+        types.types_error_set(table(s), (*s).feh)
+    }
+    // 0c. gc classes: register them as structs -- AFTER the error sets, BEFORE
+    //    the structs of the tree, exactly like `declare_classes` in stage 0. The
+    //    type resolution gets the registry, so that it can resolve `__gc#p:`/
+    //    `__gc#w:` placeholders (the same handover point as `__eu#<n>`).
+    var gc_so_far: usize = 0
+    if has_gc(s) {
+        // ROUND 52 (prof.rs): `gc class` needs the tracing collector; the
+        // kernel profile carries no GC types (SPEC 2).
+        if (*s).kernel && gc.gc_has_classes((*s).gc as *mut gc.Gc) {
+            complain(s)
+        }
+        gc.gc_register((*s).gc, table(s), names(s))
+        types.types_gc_set(table(s), (*s).gc)
+    }
+    // 0d. Interfaces: register `dyn I` as struct -- BEFORE the structs of the
+    //    tree, exactly like `declare_interfaces` in stage 0. No hook of its own
+    //    is needed in the type resolution: the struct carries the
+    //    name `"dyn I"`, and `resolve` finds it like any other.
+    var if_so_far: usize = 0
+    if has_if(s) {
+        iface.if_register((*s).ifr, table(s), names(s))
+    }
+    // 1. Struct layout and function signatures -- the same computation as
+    //    in `types.fi`, here once for everything.
+    types.types_resolve(table(s), b, names(s))
+    // 1a. Interfaces: check every implementation completely -- all methods
+    //    present, all signatures matching (`hook_check_impls` in stage 0). Runs
+    //    AFTER the signatures and BEFORE the bodies.
+    if has_if(s) {
+        let ij: usize = iface.if_check((*s).ifr, table(s), b, names(s))
+        while if_so_far < ij {
+            complain(s)
+            if_so_far = if_so_far + 1
+        }
+    }
+    // 1b. Collect `#[must_consume]` (sema.rs::check_attrs, round 36):
+    //    marked functions by their NAME, marked types by their struct
+    //    index (the type number is not stable -- `new_ty` hands out a
+    //    new one on every call).
+    var mi: usize = 0
+    while mi < ast.fn_count(b) {
+        if ast.fn_mc(b, mi) == 1 {
+            vec_push[u32](&(*s).mc_fname, ast.fn_name(b, mi))
+        }
+        mi = mi + 1
+    }
+    mi = 0
+    while mi < ast.structure_count(b) {
+        if ast.structure_mc(b, mi) == 1 {
+            let si: i32 = types.struct_index(table(s), ast.structure_name(b, mi))
+            if si >= 0 {
+                vec_push[u32](&(*s).mc_si, si as u32)
+            }
+        }
+        mi = mi + 1
+    }
+    if has_fe(s) {
+        // Count the errors from the registry too (duplicate sets,
+        // unknown sets, unions used as a field type).
+        let fj: usize = err.error_error(fe(s))
+        while fe_so_far < fj {
+            complain(s)
+            fe_so_far = fe_so_far + 1
+        }
+    }
+    // 1b. Enums: record the LAYOUTS -- after the struct layout of the
+    //    handwritten structs and before any use (`layout_enums` in
+    //    stage 0). Errors from that count too.
+    if has_mu(s) {
+        let mf: u32 = pattern.pat_layout(mu(s), table(s), b, names(s))
+        var mk: u32 = 0
+        while mk < mf {
+            complain(s)
+            mk = mk + 1
+        }
+    }
+    // 1c. gc classes: work out the field layout -- only here are the structs
+    //    of the program known (`layout_classes` in stage 0). Errors from that
+    //    (unknown base, cycles, forbidden field types) count too.
+    if has_gc(s) {
+        gc.gc_layout((*s).gc, table(s), b, names(s))
+        let gj: usize = gc.gc_error(gcp(s))
+        while gc_so_far < gj {
+            complain(s)
+            gc_so_far = gc_so_far + 1
+        }
+    }
+
+    // 2. Create the primitive types once instead of at every access.
+    (*s).t_bool = types.new_ty(table(s), types.K_BOOL, 0, 0)
+    (*s).t_i64 = types.new_ty(table(s), types.K_I64, 0, 0)
+    (*s).t_usize = types.new_ty(table(s), types.K_USIZE, 0, 0)
+    (*s).t_void = types.new_ty(table(s), types.K_VOID, 0, 0)
+    (*s).t_error = types.new_ty(table(s), types.K_ERROR, 0, 0)
+    (*s).t_f64 = types.new_ty(table(s), types.K_F64, 0, 0)
+    // ROUND 70: created LAST on purpose -- an entry in front of the
+    // existing ones would move every type number behind it.
+    (*s).t_i32 = types.new_ty(table(s), types.K_I32, 0, 0)
+    // ROUND 71: appended LAST for the same reason.
+    (*s).t_f32 = types.new_ty(table(s), types.K_F32, 0, 0)
+
+    // 3. Create the type table for all expressions.
+    var i: usize = 0
+    while i < ast.expr_count(b) {
+        vec_push[u32](&(*s).etyp, (*s).t_error)
+        vec_push[u8](&(*s).w32, 0 as u8)
+        i = i + 1
+    }
+
+    // 4. Constants one after another: a later one may use the earlier ones.
+    range_on(s)
+    i = 0
+    while i < ast.const_count(b) {
+        let t: u32 = ast_ty(s, ast.const_ty(b, i))
+        let got: u32 = expr(s, ast.const_value(b, i), t)
+        if !types.compatible(table(s), got, t) {
+            complain(s)
+        }
+        var good: bool = true
+        let v: i64 = const_eval(s, ast.const_value(b, i), &good)
+        vec_push[u32](&(*s).k_name, ast.const_name(b, i))
+        vec_push[u32](&(*s).k_ty, t)
+        if good {
+            vec_push[u64](&(*s).k_value, wrap(s, v, t) as u64)
+        } else {
+            vec_push[u64](&(*s).k_value, 0)
+            complain(s)
+        }
+        i = i + 1
+    }
+
+    // 4b. ROUND 89 -- the global variables (SPEC 14.1.statics). AFTER the
+    //     constants, because a `static`'s initial value may name a `const`
+    //     and never the other way round: a `const` is a number, a `static`
+    //     is a place, and a place has no value at compile time.
+    i = 0
+    while i < ast.static_count(b) {
+        let gt: u32 = ast_ty(s, ast.static_ty(b, i))
+        let gname: u32 = ast.static_name(b, i)
+        var bad: bool = false
+        if gc_reachable(s, gt) {
+            // The root set of the collector is the stack and the callee
+            // saved registers (SPEC 3.5.3); a data section entry is
+            // neither, so a collected value kept here would be freed under
+            // the program's feet.
+            complain(s)
+            bad = true
+        }
+        if types.size_of(table(s), gt) == 0 {
+            complain(s)
+            bad = true
+        }
+        let gv: u32 = expr(s, ast.static_value(b, i), gt)
+        if !types.compatible(table(s), gv, gt) {
+            complain(s)
+            bad = true
+        }
+        if static_search(s, gname) != NONE || const_search(s, gname) != NONE {
+            complain(s)
+            bad = true
+        }
+        let at: u32 = rt.buf_len(&(*s).g_data) as u32
+        if !bad {
+            var good2: bool = true
+            static_bytes(s, ast.static_value(b, i), gt, &good2)
+            if !good2 {
+                complain(s)
+            }
+        }
+        // Even a refused declaration keeps its NAME, so that a use of it
+        // further down does not report a second, misleading error.
+        let want: usize = types.size_of(table(s), gt) as usize
+        while (rt.buf_len(&(*s).g_data) - at as usize) < want {
+            rt.buf_push(&(*s).g_data, 0 as u8)
+        }
+        vec_push[u32](&(*s).g_name, gname)
+        vec_push[u32](&(*s).g_ty, gt)
+        var mflag: u32 = 0
+        if ast.static_mut(b, i) { mflag = 1 }
+        vec_push[u32](&(*s).g_mut, mflag)
+        vec_push[u32](&(*s).g_off, at)
+        vec_push[u32](&(*s).g_len, want as u32)
+        var al: u64 = types.alignment_of(table(s), gt)
+        if al == 0 { al = 1 }
+        vec_push[u32](&(*s).g_align, al as u32)
+        i = i + 1
+    }
+
+    // 5. Function bodies.
+    //    HOOK fnval (round 58): the generated functions of the closures are
+    //    left out here -- their bodies are checked AT the closure literal,
+    //    where the captured names are still in scope.
+    i = 0
+    while i < ast.fn_count(b) {
+        if sema_is_closure_name(names(s), ast.fn_name(b, i)) {
+            i = i + 1
+            continue
+        }
+        // **Round 75** (SPEC 14.5) -- `extern fn` has no body: nothing to
+        // type-check (there IS no body here, the function is defined
+        // elsewhere). Its signature was already collected like any other
+        // function's, so every CALLER of it still type-checks normally.
+        if ast.fn_extern(b, i) != 0 {
+            i = i + 1
+            continue
+        }
+        (*s).ret = types.ret_ty_the_func(table(s), i)
+        range_on(s)
+        var k: u32 = 0
+        while k < ast.fn_plen(b, i) {
+            var_create(s, ast.param_name(b, ast.fn_poff(b, i) + k),
+                types.param_ty_resolved(table(s), i, k))
+            k = k + 1
+        }
+        block(s, ast.fn_body(b, i), true)
+        range_off(s)
+        i = i + 1
+    }
+    range_off(s)
+    if has_fe(s) {
+        // Unions that are resolved only inside a BODY (say
+        // `let r: E!i32 = ...`) can still have counted errors there.
+        let fj: usize = err.error_error(fe(s))
+        while fe_so_far < fj {
+            complain(s)
+            fe_so_far = fe_so_far + 1
+        }
+    }
+    if has_gc(s) {
+        // gc type errors that only showed up inside a BODY (unknown
+        // class in `Gc[...]`, a class name used as a value type).
+        let gj: usize = gc.gc_error(gcp(s))
+        while gc_so_far < gj {
+            complain(s)
+            gc_so_far = gc_so_far + 1
+        }
+        // 6. Check `#[no_gc]` transitively (nogc.rs). Runs AFTER the
+        //    type check, because rule 3 (writing to a Gc[T] field) needs
+        //    the type table.
+        var mu2: u64 = 0
+        if has_mu(s) {
+            mu2 = (*s).mu
+        }
+        let nf: usize = nogc.nogc_check(s as u64, mu2, (*s).gc, (*s).it)
+        var nk: usize = 0
+        while nk < nf {
+            complain(s)
+            nk = nk + 1
+        }
+    }
+    // 7. ROUND 79: the escape analysis (escape.fi, twin of
+    //    compiler/src/escape.rs). Runs AFTER the type check as well: it has
+    //    to tell `a[i]` on an ARRAY from `p[i]` on a pointer, and only the
+    //    type table knows which is which. Unlike everything else in this
+    //    file it PRINTS its messages -- with a line, a column, the source
+    //    line and the marker, exactly like firnc0.
+    var mu3: u64 = 0
+    if has_mu(s) {
+        mu3 = (*s).mu
+    }
+    let ef: usize = escape.escape_check(s as u64, mu3, (*s).it)
+    var ek: usize = 0
+    while ek < ef {
+        complain(s)
+        ek = ek + 1
+    }
+}

@@ -1,0 +1,226 @@
+// expect_exit: 0
+// Round 53, the core piece: a collection that is changed WHILE a marking
+// is running must not lose an element.
+//
+// ----------------------------------------------------------------- Of what
+//
+// Since round 44 the collector marks in slices. A container that is
+// reachable as a root is traced early in the cycle and is BLACK
+// afterwards, while the program keeps working.
+//
+// The first guess -- "a freshly appended object disappears behind the
+// black buffer" -- is MEASURED TO BE WRONG: `__gc_alloc_raw` colours
+// every freshly allocated object grey during a cycle. The case does not
+// even exist for that reason.
+//
+// The case that REALLY exists is the MOVING of an object that is already
+// there -- that is exactly `appendChild`:
+//
+//     target already traced (black),
+//     source not traced yet (white),
+//     then `z` out of the source and into the target.
+//
+// The collector then sees `z` nowhere any more: not in the target, because
+// that is done with, not in the source, because it no longer stands there.
+// `z` stays white and is swept. The write barrier in `gcvec_append_raw`
+// prevents that by colouring `z` grey.
+//
+// -------------------------------------------------------------- How often
+//
+// By itself the case almost never happens: measured, 526 out of 200,000
+// appends fell into a running marking (0.26 %) and NOT a single
+// buffer growth. A test that waits for that checks nothing. Which is why
+// it sets the marking slice to two objects with `gc_set_slice(2)` --
+// then the marking phase stretches over as many allocations as there are
+// live objects, and the case becomes the normal case (measured: 78,762
+// moves in phase 1).
+//
+// COUNTER-CHECK (docs/ROUND53.md 4, really carried out): without the
+// `__gc_barrier` call in `gcvec_append_raw` this test reports 96 --
+// the mark sum was 81,672,010 instead of 81,926,400, 254,390 were missing.
+
+import std.io
+
+gc class Cell {
+    next: Gc[Cell],
+    mark: u64,
+}
+
+const M: u64 = 64
+const K: u64 = 200
+const ROUNDS: u64 = 4
+
+// Rubbish that nobody holds. The self call is deliberate: a recursive
+// function is not inlined, so that the dead pointers do not end up in the
+// live frame of the caller (the same reason as with `dom_observer_lives`).
+fn garbage(k: u64) -> AllocError!u64 {
+    if k == 0 {
+        return 0
+    }
+    let dead: Gc[Cell] = try gc Cell { next: gc_null[Cell](), mark: 0 }
+    return try garbage(k - 1)
+}
+
+fn build(all: Gc[GcVec]) -> AllocError!bool {
+    var j: u64 = 0
+    while j < M {
+        let v: Gc[GcVec] = try gcvec_new()
+        let ok: bool = try gcvec_append[GcVec](all, v)
+        var k: u64 = 0
+        while k < K {
+            let z: Gc[Cell] = try gc Cell {
+                next: gc_null[Cell](),
+                mark: j * K + k + 1,
+            }
+            let o2: bool = try gcvec_append[Cell](v, z)
+            k = k + 1
+        }
+        j = j + 1
+    }
+    return true
+}
+
+// Per round: start a cycle, move something WHILE marking (and push the
+// marking on with one allocation each), then bring the cycle to an end --
+// only that way does a sweep really fall into the same round.
+fn relink(all: Gc[GcVec], p1a: *mut u64) -> AllocError!bool {
+    var p1: u64 = 0
+    var r: u64 = 0
+    while r < ROUNDS {
+        var s: u64 = 0
+        while gc_phase() != 1 && s < 400000 {
+            let m: u64 = try garbage(1)
+            s = s + 1
+        }
+        let l0: u64 = gc_collections()
+        var t: u64 = 0
+        while gc_phase() == 1 && t < 60000 {
+            let j: u64 = (r * 7 + t) % M
+            let of: Gc[GcVec] = gcvec_read[GcVec](all, j)
+            let after: Gc[GcVec] = gcvec_read[GcVec](all, (j * 13 + 5) % M)
+            if gcvec_length(of) > 0 {
+                p1 = p1 + 1
+                let z: Gc[Cell] = gcvec_detach[Cell](of)
+                let ok: bool = try gcvec_append[Cell](after, z)
+            }
+            let m: u64 = try garbage(1)
+            t = t + 1
+        }
+        var g: u64 = 0
+        while gc_collections() == l0 && g < 400000 {
+            let m: u64 = try garbage(16)
+            g = g + 1
+        }
+        r = r + 1
+    }
+    *p1a = p1
+    return true
+}
+
+fn count(all: Gc[GcVec]) -> u64 {
+    var s: u64 = 0
+    var j: u64 = 0
+    while j < M {
+        s = s + gcvec_length(gcvec_read[GcVec](all, j))
+        j = j + 1
+    }
+    return s
+}
+
+fn mark_sum(all: Gc[GcVec]) -> u64 {
+    var s: u64 = 0
+    var j: u64 = 0
+    while j < M {
+        let v: Gc[GcVec] = gcvec_read[GcVec](all, j)
+        var k: u64 = 0
+        while k < gcvec_length(v) {
+            let z: Gc[Cell] = gcvec_read[Cell](v, k)
+            if (z as u64) == 0 {
+                return 0
+            }
+            s = s + z.mark
+            k = k + 1
+        }
+        j = j + 1
+    }
+    return s
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    let all: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
+    if (all as u64) == 0 {
+        return 91
+    }
+    if !(build(all) catch false) {
+        return 92
+    }
+    gc_collect()
+    let should: u64 = M * K * (M * K + 1) / 2
+
+    var p1: u64 = 0
+    gc_set_slice(2)
+    let ok: bool = relink(all, &p1) catch false
+    gc_set_slice(0)
+    if !ok {
+        return 93
+    }
+    // The test has to have really hit the critical case.
+    if p1 < 10000 {
+        return 94
+    }
+    // A wave of rubbish: a block that was released wrongly is REUSED
+    // by it. Without that a loss does not show up -- the content
+    // of a free block stays readable.
+    var w: u64 = 0
+    while w < 80 {
+        let m: u64 = garbage(2000) catch 0
+        w = w + 1
+    }
+    gc_collect()
+
+    if count(all) != M * K {
+        return 95
+    }
+    if mark_sum(all) != should {
+        return 96
+    }
+    // And in the end everything really has to be able to GO: clear the vectors,
+    // then nothing may be left of the 12,800 cells.
+    //
+    // ROUND 71 -- WHY THE ALLOWANCE IS `K + 16` AND NOT `16`.
+    //
+    // The collector scans the stack and the callee-saved registers
+    // CONSERVATIVELY (SPEC 3.5.3): everything that looks like an address is
+    // treated as one. A word left lying in a frame or in `r12`-`r15` can
+    // therefore keep an object alive that nobody can reach any more -- and
+    // if that word points at one of the M vectors, its whole chain of K
+    // cells stays with it.
+    //
+    // WHICH word that is depends on the shape of the code, and the shape of
+    // the code depends on how much else stands in the module: the inliner
+    // has a size budget, and round 71 put `f32` into `std.num`/`std.io`,
+    // so a few calls that used to be inlined now stand as calls. Measured:
+    // 0 surplus objects before, 131 after -- less than one vector, and the
+    // very same program with the OLD library gives 0 again. So it is not a
+    // leak, it is the price of a conservative scan.
+    //
+    // The allowance therefore says what it means: AT MOST ONE such root may
+    // survive. A real leak is nowhere near that -- if the clearing had no
+    // effect, all M * K = 12,800 cells would be standing there, sixty-four
+    // times the allowance.
+    let before: u64 = gc_live_objects()
+    var j: u64 = 0
+    while j < M {
+        gcvec_clear(gcvec_read[GcVec](all, j))
+        j = j + 1
+    }
+    gc_collect()
+    gc_collect()
+    if gc_live_objects() > before - M * K + K + 16 {
+        return 97
+    }
+    return 0
+}

@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// tools/stdlib81/mapbench.fi -- the load test for `BMap`/`Set` and the hash
+// throughput (round 81).
+//
+//     mapbench load <entries> <out>    insert, read back, delete, measure
+//     mapbench soak <rounds> <out>     insert/delete for ever, RSS watched
+//     mapbench hash <megabytes> <out>  FNV-1a against xxHash64
+//
+// What is measured and why exactly that:
+//
+//   * TIME per million insertions and per million lookups. A hash map that
+//     is correct and slow is a hash map nobody uses.
+//   * THE LONGEST PROBE CHAIN and the average. Open addressing degenerates
+//     into a linear scan when the hash is bad, and it does so SILENTLY: the
+//     answers stay right. A number is the only way to see it.
+//   * THE MEMORY the table holds against what the keys really need. A table
+//     that carries five times its content is a different design decision
+//     than one that carries 1.4 times.
+//   * RSS OVER TIME in the soak run. `bmap_delete` leaves the key octets in
+//     the blob (M1 in lib/std/map.fi), and the claim that the next rehash
+//     bounds that growth is exactly the kind of claim that has to be
+//     measured rather than believed.
+//
+// Every number goes to the output file as `name value`, one per line, so
+// that `run.sh` can print it and compare it against a limit.
+import std.map
+import std.hash
+import std.rt
+import std.io
+
+fn now_ns() -> u64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return ts[0] * 1000000000 + ts[1]
+}
+
+// The resident set in pages, straight out of /proc/self/statm (field 2).
+fn rss_pages() -> u64 {
+    var path: [u8; 17] = "/proc/self/statm\0"
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file((&path[0]) as u64, &b) {
+        rt.buf_free(&b)
+        return 0
+    }
+    let p: u64 = rt.buf_ptr(&b)
+    let n: usize = rt.buf_len(&b)
+    var i: usize = 0
+    var field: usize = 0
+    var v: u64 = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            if field == 1 {
+                v = v * 10 + (c - 48 as u8) as u64
+            }
+        } else {
+            if field == 1 && v > 0 {
+                rt.buf_free(&b)
+                return v
+            }
+            field = field + 1
+            if field > 2 {
+                rt.buf_free(&b)
+                return v
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_free(&b)
+    return v
+}
+
+// A key that is not a plain counter: `key<number>` with the number written
+// out backwards, so that consecutive keys differ in their FIRST octets --
+// a hash that only looks at the tail would show up.
+fn make_key(buf: u64, i: usize) -> usize {
+    rt.st8(buf, 0, 107 as u8) // k
+    rt.st8(buf, 1, 101 as u8) // e
+    rt.st8(buf, 2, 121 as u8) // y
+    var n: usize = 3
+    var x: usize = i
+    while true {
+        rt.st8(buf, n, (48 + (x % 10)) as u8)
+        n = n + 1
+        x = x / 10
+        if x == 0 {
+            break
+        }
+    }
+    return n
+}
+
+fn emit(out: *mut rt.Buf, name: u64, value: u64) {
+    rt.buf_push_bytes(out, name, rt.c_length(name))
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_dec_u64(out, value)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn do_load(n: usize, out: *mut rt.Buf) -> i32 {
+    var m: BMap[u64] = bmap_new[u64]()
+    var key: [u8; 32] = [0; 32]
+    let kp: u64 = (&key[0]) as u64
+
+    var n_ins: [u8; 10] = "insert_us\0"
+    var n_look: [u8; 10] = "lookup_us\0"
+    var n_del: [u8; 10] = "delete_us\0"
+    var n_iter: [u8; 8] = "iter_us\0"
+    var n_len: [u8; 8] = "entries\0"
+    var n_cap: [u8; 4] = "cap\0"
+    var n_pmax: [u8; 10] = "probe_max\0"
+    var n_ptot: [u8; 12] = "probe_total\0"
+    var n_mem: [u8; 10] = "map_bytes\0"
+    var n_keyb: [u8; 10] = "key_bytes\0"
+    var n_rss: [u8; 8] = "rss_kib\0"
+    var n_miss: [u8; 8] = "missing\0"
+    var n_wrong: [u8; 6] = "wrong\0"
+    var n_ghost: [u8; 6] = "ghost\0"
+    var n_seen: [u8; 9] = "iterated\0"
+    var n_after: [u8; 13] = "after_delete\0"
+
+    let t0: u64 = now_ns()
+    var i: usize = 0
+    var keybytes: u64 = 0
+    while i < n {
+        let kn: usize = make_key(kp, i)
+        keybytes = keybytes + kn as u64
+        if !bmap_set[u64](&m, kp, kn, (i * 3 + 1) as u64) {
+            return 7
+        }
+        i = i + 1
+    }
+    let t1: u64 = now_ns()
+
+    var missing: u64 = 0
+    var wrong: u64 = 0
+    i = 0
+    while i < n {
+        let kn: usize = make_key(kp, i)
+        var v: u64 = 0
+        if !bmap_get_if[u64](&m, kp, kn, &v) {
+            missing = missing + 1
+        } else if v != (i * 3 + 1) as u64 {
+            wrong = wrong + 1
+        }
+        i = i + 1
+    }
+    let t2: u64 = now_ns()
+
+    // Keys that were never inserted must not be found. Without this the
+    // whole measurement would pass with a map that answers `true` to
+    // everything.
+    var ghost: u64 = 0
+    i = 0
+    while i < 10000 {
+        let kn: usize = make_key(kp, n + i)
+        if bmap_has[u64](&m, kp, kn) {
+            ghost = ghost + 1
+        }
+        i = i + 1
+    }
+
+    let t3: u64 = now_ns()
+    var seen: u64 = 0
+    var it: usize = bmap_first[u64](&m)
+    let cap: usize = bmap_cap[u64](&m)
+    while it < cap {
+        seen = seen + 1
+        it = bmap_next[u64](&m, it + 1)
+    }
+    let t4: u64 = now_ns()
+
+    emit(out, (&n_ins[0]) as u64, (t1 - t0) / 1000)
+    emit(out, (&n_look[0]) as u64, (t2 - t1) / 1000)
+    emit(out, (&n_iter[0]) as u64, (t4 - t3) / 1000)
+    emit(out, (&n_len[0]) as u64, bmap_len[u64](&m) as u64)
+    emit(out, (&n_cap[0]) as u64, cap as u64)
+    emit(out, (&n_pmax[0]) as u64, bmap_probe_max[u64](&m) as u64)
+    emit(out, (&n_ptot[0]) as u64, bmap_probe_total[u64](&m))
+    emit(out, (&n_mem[0]) as u64, bmap_memory[u64](&m) as u64)
+    emit(out, (&n_keyb[0]) as u64, keybytes)
+    emit(out, (&n_rss[0]) as u64, rss_pages() * 4)
+    emit(out, (&n_miss[0]) as u64, missing)
+    emit(out, (&n_wrong[0]) as u64, wrong)
+    emit(out, (&n_seen[0]) as u64, seen)
+    emit(out, (&n_ghost[0]) as u64, ghost)
+
+    // Delete every second key and check that exactly the other half is left.
+    let t5: u64 = now_ns()
+    i = 0
+    while i < n {
+        let kn: usize = make_key(kp, i)
+        bmap_delete[u64](&m, kp, kn)
+        i = i + 2
+    }
+    let t6: u64 = now_ns()
+    emit(out, (&n_del[0]) as u64, (t6 - t5) / 1000)
+    emit(out, (&n_after[0]) as u64, bmap_len[u64](&m) as u64)
+    var survived: u64 = 0
+    i = 1
+    while i < n {
+        let kn: usize = make_key(kp, i)
+        if bmap_has[u64](&m, kp, kn) {
+            survived = survived + 1
+        }
+        i = i + 2
+    }
+    var n_surv: [u8; 9] = "survived\0"
+    emit(out, (&n_surv[0]) as u64, survived)
+    bmap_free[u64](&m)
+    return 0
+}
+
+// The endurance run: insert and delete for ever, look at the RSS. If the
+// blob really only grows until the next rehash, this line stops climbing.
+fn do_soak(rounds: usize, out: *mut rt.Buf) -> i32 {
+    var m: BMap[u64] = bmap_new[u64]()
+    var key: [u8; 32] = [0; 32]
+    let kp: u64 = (&key[0]) as u64
+    var n_rss0: [u8; 9] = "rss0_kib\0"
+    var n_rssn: [u8; 9] = "rssn_kib\0"
+    var n_mem: [u8; 10] = "map_bytes\0"
+    var n_len: [u8; 8] = "entries\0"
+
+    var r: usize = 0
+    var base: usize = 0
+    var rss_after_first: u64 = 0
+    while r < rounds {
+        var i: usize = 0
+        while i < 20000 {
+            let kn: usize = make_key(kp, base + i)
+            bmap_set[u64](&m, kp, kn, i as u64)
+            i = i + 1
+        }
+        i = 0
+        while i < 20000 {
+            let kn: usize = make_key(kp, base + i)
+            bmap_delete[u64](&m, kp, kn)
+            i = i + 1
+        }
+        base = base + 20000
+        if r == 0 {
+            rss_after_first = rss_pages() * 4
+        }
+        r = r + 1
+    }
+    emit(out, (&n_rss0[0]) as u64, rss_after_first)
+    emit(out, (&n_rssn[0]) as u64, rss_pages() * 4)
+    emit(out, (&n_mem[0]) as u64, bmap_memory[u64](&m) as u64)
+    emit(out, (&n_len[0]) as u64, bmap_len[u64](&m) as u64)
+    bmap_free[u64](&m)
+    return 0
+}
+
+// THE COUNTER-CHECK to `do_soak`. The same loop WITHOUT the deletions:
+// here the table really does grow, and the RSS has to climb. If this one
+// stays flat too, the measurement above is not measuring anything and its
+// result is worthless.
+fn do_leak(rounds: usize, out: *mut rt.Buf) -> i32 {
+    var m: BMap[u64] = bmap_new[u64]()
+    var key: [u8; 32] = [0; 32]
+    let kp: u64 = (&key[0]) as u64
+    var n_rss0: [u8; 9] = "rss0_kib\0"
+    var n_rssn: [u8; 9] = "rssn_kib\0"
+    var n_mem: [u8; 10] = "map_bytes\0"
+    var n_len: [u8; 8] = "entries\0"
+    var r: usize = 0
+    var base: usize = 0
+    var rss_after_first: u64 = 0
+    while r < rounds {
+        var i: usize = 0
+        while i < 20000 {
+            let kn: usize = make_key(kp, base + i)
+            bmap_set[u64](&m, kp, kn, i as u64)
+            i = i + 1
+        }
+        base = base + 20000
+        if r == 0 {
+            rss_after_first = rss_pages() * 4
+        }
+        r = r + 1
+    }
+    emit(out, (&n_rss0[0]) as u64, rss_after_first)
+    emit(out, (&n_rssn[0]) as u64, rss_pages() * 4)
+    emit(out, (&n_mem[0]) as u64, bmap_memory[u64](&m) as u64)
+    emit(out, (&n_len[0]) as u64, bmap_len[u64](&m) as u64)
+    bmap_free[u64](&m)
+    return 0
+}
+
+fn do_hash(mb: usize, out: *mut rt.Buf) -> i32 {
+    let n: usize = mb * 1048576
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return 7
+    }
+    var x: u64 = 88172645463325252
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.st8(p, i, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    var n_fnv: [u8; 7] = "fnv_us\0"
+    var n_xx: [u8; 6] = "xx_us\0"
+    var n_sum: [u8; 4] = "sum\0"
+    let t0: u64 = now_ns()
+    let a: u64 = hash.fnv1a64(p, n)
+    let t1: u64 = now_ns()
+    let b: u64 = hash.xx64(p, n)
+    let t2: u64 = now_ns()
+    emit(out, (&n_fnv[0]) as u64, (t1 - t0) / 1000)
+    emit(out, (&n_xx[0]) as u64, (t2 - t1) / 1000)
+    emit(out, (&n_sum[0]) as u64, a ^ b)
+    rt.heap_free(p, n)
+    return 0
+}
+
+fn dec_of(p: u64) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    let n: usize = rt.c_length(p)
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            v = v * 10 + (c - 48 as u8) as usize
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn eq_c(p: u64, lit: u64) -> bool {
+    let a: usize = rt.c_length(p)
+    let b: usize = rt.c_length(lit)
+    if a != b {
+        return false
+    }
+    return rt.mem_eq(p, lit, a)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 4 {
+        return 2
+    }
+    let mode: u64 = rt.arg_ptr(start, 1)
+    let arg: usize = dec_of(rt.arg_ptr(start, 2))
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    var m_load: [u8; 5] = "load\0"
+    var m_soak: [u8; 5] = "soak\0"
+    var m_hash: [u8; 5] = "hash\0"
+    var m_leak: [u8; 5] = "leak\0"
+    var rc: i32 = 3
+    if eq_c(mode, (&m_load[0]) as u64) {
+        rc = do_load(arg, &out)
+    } else if eq_c(mode, (&m_soak[0]) as u64) {
+        rc = do_soak(arg, &out)
+    } else if eq_c(mode, (&m_hash[0]) as u64) {
+        rc = do_hash(arg, &out)
+    } else if eq_c(mode, (&m_leak[0]) as u64) {
+        rc = do_leak(arg, &out)
+    }
+    if rc != 0 {
+        return rc
+    }
+    if !rt.write_file(rt.arg_ptr(start, 3), rt.buf_ptr(&out), rt.buf_len(&out)) {
+        return 6
+    }
+    return 0
+}

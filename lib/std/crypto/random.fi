@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/random.fi -- randomness from the kernel (round 81).
+//
+// EVERY OTHER RANDOM NUMBER IN THIS REPOSITORY IS THE WRONG ONE FOR A KEY.
+// `tests/1600_net_echo.fi` fills a megabyte with a linear congruential
+// generator, `hash.hash_seed_from_time` mixes the clock -- both are fine
+// for what they do and both are PREDICTABLE. An attacker who sees a few
+// outputs of an LCG can compute its state and thereby every value it will
+// ever produce again. A session key from one of those is not a key.
+//
+// The only source that is right is the KERNEL'S, and on Linux it is
+// `getrandom(2)`:
+//
+//   * it draws from the same pool as /dev/urandom,
+//   * it BLOCKS until the pool has been initialised for the first time
+//     since boot (that is the whole point of the call -- /dev/urandom
+//     silently hands out weak octets in that window, which is how embedded
+//     devices end up with identical SSH keys),
+//   * it needs no file descriptor, so it cannot fail because the process
+//     ran out of them or because /dev is not mounted.
+//
+// System call number 318 on x86_64. The FALLBACK to /dev/urandom is here
+// for kernels older than 3.17 -- and it is not silent: `random_source`
+// says which one was used, so a program can refuse to generate a long
+// lived key on a machine where the good path was missing.
+//
+// HONEST:
+//   R1 SHORT READS ARE REAL. `getrandom` may return fewer octets than
+//      asked for (it caps at 32 MiB, and a signal can cut it short). The
+//      loop here keeps asking; a caller who takes the first return value
+//      for the whole buffer gets a key that is partly zeros -- which is
+//      exactly the kind of bug that survives every test, because zeros
+//      look like octets.
+//   R2 NO USERSPACE POOL, NO CACHING. Every call goes to the kernel. That
+//      costs about a microsecond and removes a whole class of questions
+//      (fork safety, thread safety, reseeding) that a userspace generator
+//      would have to answer.
+//   R3 `random_u64` IS FOR KEYS AND NONCES, not for simulations. It is
+//      three orders of magnitude slower than an LCG and that is the price
+//      of the property.
+import std.rt
+
+export { random_bytes, random_u64, random_source, RANDOM_GETRANDOM,
+    RANDOM_URANDOM, RANDOM_NONE }
+
+const SYS_GETRANDOM: i64 = 318
+const SYS_OPEN: i64 = 2
+const SYS_READ: i64 = 0
+const SYS_CLOSE: i64 = 3
+
+const RANDOM_NONE: usize = 0
+const RANDOM_GETRANDOM: usize = 1
+const RANDOM_URANDOM: usize = 2
+
+// Fills `n` octets. `false` means: no source worked, and then the buffer
+// is NOT usable -- it is not partly filled, it is untrustworthy.
+fn random_bytes(p: u64, n: usize) -> bool {
+    return random_source(p, n) != RANDOM_NONE
+}
+
+// The same, and it says WHERE the octets came from.
+fn random_source(p: u64, n: usize) -> usize {
+    if n == 0 {
+        return RANDOM_GETRANDOM
+    }
+    var got: usize = 0
+    var tries: usize = 0
+    while got < n && tries < 64 {
+        let r: i64 = syscall(SYS_GETRANDOM, (p + got as u64) as i64,
+            (n - got) as i64, 0, 0, 0, 0)
+        if r <= 0 {
+            break
+        }
+        got = got + r as usize // R1: a short read is normal
+        tries = tries + 1
+    }
+    if got == n {
+        return RANDOM_GETRANDOM
+    }
+
+    // The fallback for a kernel without the system call.
+    var path: [u8; 13] = "/dev/urandom\0"
+    let fd: i64 = syscall(SYS_OPEN, (&path[0]) as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return RANDOM_NONE
+    }
+    got = 0
+    tries = 0
+    while got < n && tries < 1024 {
+        let r: i64 = syscall(SYS_READ, fd, (p + got as u64) as i64,
+            (n - got) as i64, 0, 0, 0)
+        if r <= 0 {
+            break
+        }
+        got = got + r as usize
+        tries = tries + 1
+    }
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if got == n {
+        return RANDOM_URANDOM
+    }
+    return RANDOM_NONE
+}
+
+// One 64 bit number. Returns 0 when no source worked -- and a caller who
+// cannot tell that from a legitimate 0 uses `random_bytes` and checks it.
+fn random_u64() -> u64 {
+    var b: [u8; 8] = [0; 8]
+    if !random_bytes((&b[0]) as u64, 8) {
+        return 0
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < 8 {
+        v = (v << 8) | (b[i] as u64)
+        i = i + 1
+    }
+    return v
+}

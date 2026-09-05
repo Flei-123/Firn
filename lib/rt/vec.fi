@@ -1,0 +1,718 @@
+// SPDX-License-Identifier: MIT
+// lib/rt/vec.fi -- `Vec[T]`: a growing array of arbitrary element types.
+//
+// `docs/SELF_HOSTING.md` 4 lists this as point 2 of the blocker list: the
+// token stream, the instruction lists, the block lists -- the whole compiler
+// consists of growing arrays. An array of FIXED size has worked since round 2
+// (`tests/211_generic_struct.fi`); for a growing one the element size was
+// missing. Since `size_of[T]()` (round 16) it is there.
+//
+// Structure: pointer, length, capacity -- the same shape as `rt.Buf`, only typed.
+// Growing happens by doubling, so that the number of copy operations stays
+// logarithmic.
+//
+// AN HONEST LIMIT: Firn has no destructors. Whoever no longer needs a
+// `Vec[T]` calls `vec_free[T]` -- if they forget, the memory stays allocated.
+// With `defer` (round 9) that is one line:
+//
+//     var v: Vec[i32] = vec_new[i32]()
+//     defer vec_free[i32](&v)
+
+import rt
+
+export { Vec, vec_new, vec_free, vec_clear, vec_reserve, vec_push, vec_at,
+    vec_set, vec_len, vec_cap, vec_ptr, vec_last, vec_pop,
+    // round 42
+    vec_is_empty, vec_shorten, vec_fill, vec_swap, vec_invert,
+    vec_index_of, vec_contains, vec_count, vec_insert,
+    vec_remove, vec_remove_fast, vec_append, vec_copy,
+    vec_equal, vec_min, vec_max, vec_sort, vec_is_sorted,
+    vec_lower_bound, vec_binary_search, vec_sorted_insert,
+    // round 50
+    Ord, vec_elem_ptr,
+    // round 58 -- ordering and predicate as a VALUE
+    vec_sort_by, vec_is_sorted_by, vec_min_by, vec_max_by,
+    vec_index_where, vec_count_where, vec_all, vec_any }
+
+// ------------------------------------------------------------ The ordering
+//
+// ROUND 50. Up to here `vec_sort` contained the character `<` -- the built in
+// comparison. That had two consequences which you only see once you put them
+// side by side:
+//
+//   * Sorting worked for scalars ONLY. A `Vec[Point]` could be created and
+//     filled, but not sorted: `<` does not exist for a struct, and the
+//     template had no way to ask for one.
+//   * The ordering lived inside the sorter, not on the type. Whoever wanted a
+//     different one copied the sorter.
+//
+// Now it lives on the type. `T: Ord` is a BOUND (SPEC 14.1 T7): the template
+// may write `a.less(b)`, and the compiler checks at instantiation time that
+// it exists -- with a message that names the missing method, instead of an
+// "unknown method" in the middle of the sorter.
+//
+// `*Self` is the point everything hangs on: an ordering compares TWO values
+// of the SAME type. Without `Self` the interface would have to name a
+// concrete type, and `Ord` would exist for exactly one type.
+//
+// THE CALL IS STATIC. There is no `dyn Ord` (and there cannot be, see `Self`
+// above) -- with a known instantiation the assembler contains `call i32__less`,
+// not a jump through a method table. Demonstrated in
+// `tools/bounds/run.sh`.
+interface Ord {
+    fn less(*self, b: *Self) -> bool
+}
+
+// The ordering of the built in integer types -- the one `<` always meant:
+// signed for `i*`, unsigned for `u*`. It lives here so that
+// `vec_sort[i32]` keeps working without the caller doing anything.
+//
+// PROGRAM WIDE: methods of a primitive type are not renamed per module
+// (`i32__less`, not `vec__i32__less`) -- after all, the type `i32` does not
+// belong to a module either.
+impl Ord for i8 { fn less(*self, b: *i8) -> bool { return *self < *b } }
+impl Ord for i16 { fn less(*self, b: *i16) -> bool { return *self < *b } }
+impl Ord for i32 { fn less(*self, b: *i32) -> bool { return *self < *b } }
+impl Ord for i64 { fn less(*self, b: *i64) -> bool { return *self < *b } }
+impl Ord for u8 { fn less(*self, b: *u8) -> bool { return *self < *b } }
+impl Ord for u16 { fn less(*self, b: *u16) -> bool { return *self < *b } }
+impl Ord for u32 { fn less(*self, b: *u32) -> bool { return *self < *b } }
+impl Ord for u64 { fn less(*self, b: *u64) -> bool { return *self < *b } }
+impl Ord for usize { fn less(*self, b: *usize) -> bool { return *self < *b } }
+impl Ord for isize { fn less(*self, b: *isize) -> bool { return *self < *b } }
+
+struct Vec[T] {
+    ptr: u64,
+    len: usize,
+    cap: usize,
+}
+
+fn vec_new[T]() -> Vec[T] {
+    return Vec[T] { ptr: 0, len: 0, cap: 0 }
+}
+
+fn vec_free[T](v: *mut Vec[T]) {
+    rt.heap_free((*v).ptr, (*v).cap * size_of[T]())
+    (*v).ptr = 0
+    (*v).len = 0
+    (*v).cap = 0
+}
+
+fn vec_clear[T](v: *mut Vec[T]) {
+    (*v).len = 0
+}
+
+fn vec_len[T](v: *mut Vec[T]) -> usize {
+    return (*v).len
+}
+
+fn vec_cap[T](v: *mut Vec[T]) -> usize {
+    return (*v).cap
+}
+
+fn vec_ptr[T](v: *mut Vec[T]) -> u64 {
+    return (*v).ptr
+}
+
+// Enlarges to at least `needed` slots. `false` = out of memory.
+fn vec_grow[T](v: *mut Vec[T], needed: usize) -> bool {
+    let gr: usize = size_of[T]()
+    var cap: usize = (*v).cap
+    if cap == 0 {
+        cap = 8
+    }
+    while cap < needed {
+        cap = cap * 2
+    }
+    let new: u64 = rt.heap_alloc(cap * gr)
+    if new == 0 {
+        return false
+    }
+    if (*v).len > 0 {
+        rt.mem_copy(new, (*v).ptr, (*v).len * gr)
+    }
+    rt.heap_free((*v).ptr, (*v).cap * gr)
+    (*v).ptr = new
+    (*v).cap = cap
+    return true
+}
+
+fn vec_reserve[T](v: *mut Vec[T], needed: usize) -> bool {
+    if (*v).cap >= needed {
+        return true
+    }
+    return vec_grow[T](v, needed)
+}
+
+// Fast path on top, growing moved out -- the same lesson as with `rt.Buf`
+// (round 6: the capacity check was 33 % of all instructions, because it
+// happened as a call).
+fn vec_push[T](v: *mut Vec[T], value: T) -> bool {
+    if (*v).len >= (*v).cap {
+        if !vec_grow[T](v, (*v).len + 1) {
+            return false
+        }
+    }
+    let addr: u64 = (*v).ptr + (*v).len as u64 * size_of[T]() as u64
+    *(addr as *mut T) = value
+    (*v).len = (*v).len + 1
+    return true
+}
+
+// A pointer to the i-th element, NULL past the end (round 50).
+//
+// Why this exists next to `vec_at`: past the end `vec_at` returns `0 as T`
+// -- and `0 as T` exists for scalars only. That is exactly what the bound
+// `T: Scalar` on `vec_at` hangs on, and exactly why a `Vec[Point]` could not
+// be sorted before. A POINTER has a null value for every element type;
+// everything that comes after (sorting, searching, swapping) therefore works
+// through this and holds for EVERY type.
+fn vec_elem_ptr[T](v: *mut Vec[T], i: usize) -> *mut T {
+    if i >= (*v).len {
+        return 0 as *mut T
+    }
+    return ((*v).ptr + i as u64 * size_of[T]() as u64) as *mut T
+}
+
+// Past the end `vec_at` returns the null value -- like `rt.buf_at`. That is a
+// deliberate decision: stage 0 has no exceptions, and a silent access into
+// nothing would be worse.
+fn vec_at[T: Scalar](v: *mut Vec[T], i: usize) -> T {
+    if i >= (*v).len {
+        return 0 as T
+    }
+    let addr: u64 = (*v).ptr + i as u64 * size_of[T]() as u64
+    return *(addr as *mut T)
+}
+
+fn vec_set[T](v: *mut Vec[T], i: usize, value: T) -> bool {
+    if i >= (*v).len {
+        return false
+    }
+    let addr: u64 = (*v).ptr + i as u64 * size_of[T]() as u64
+    *(addr as *mut T) = value
+    return true
+}
+
+fn vec_last[T: Scalar](v: *mut Vec[T]) -> T {
+    if (*v).len == 0 {
+        return 0 as T
+    }
+    return vec_at[T](v, (*v).len - 1)
+}
+
+fn vec_pop[T: Scalar](v: *mut Vec[T]) -> T {
+    if (*v).len == 0 {
+        return 0 as T
+    }
+    let w: T = vec_at[T](v, (*v).len - 1)
+    (*v).len = (*v).len - 1
+    return w
+}
+
+// =====================================================================
+// Round 42 -- the build out. Everything here is GENERIC: a template that
+// becomes code only when a program uses it for some type
+// (monomorphization, round 2). `lib/firnc1/vec.fi` is a symlink to this
+// file -- so the self hosted compiler carries not one byte of it as long as
+// it does not call the new names (measured: the fixpoint is unchanged).
+//
+// The ordering is the one of the type: `<` on `T`. For unsigned types that
+// is the unsigned ordering, for signed ones the signed one -- the core
+// language picks the right comparison, because the instantiation knows the
+// type.
+// =====================================================================
+
+fn vec_is_empty[T](v: *mut Vec[T]) -> bool {
+    return (*v).len == 0
+}
+
+// Shorten to at most `n` elements. The memory stays -- whoever wants it back
+// calls `vec_free` afterwards.
+fn vec_shorten[T](v: *mut Vec[T], n: usize) {
+    if n < (*v).len {
+        (*v).len = n
+    }
+}
+
+fn vec_fill[T](v: *mut Vec[T], value: T) {
+    var i: usize = 0
+    while i < (*v).len {
+        vec_set[T](v, i, value)
+        i = i + 1
+    }
+}
+
+fn vec_swap[T](v: *mut Vec[T], i: usize, j: usize) -> bool {
+    if i >= (*v).len || j >= (*v).len {
+        return false
+    }
+    let pi: *mut T = vec_elem_ptr[T](v, i)
+    let pj: *mut T = vec_elem_ptr[T](v, j)
+    let a: T = *pi
+    *pi = *pj
+    *pj = a
+    return true
+}
+
+fn vec_invert[T](v: *mut Vec[T]) {
+    if (*v).len < 2 {
+        return
+    }
+    var a: usize = 0
+    var b: usize = (*v).len - 1
+    while a < b {
+        vec_swap[T](v, a, b)
+        a = a + 1
+        b = b - 1
+    }
+}
+
+// The first hit. NOT FOUND is `vec_len` -- the same rule as with
+// `map_find` (there `cap`): an index past the end can never be a hit, so
+// there is no need for a second way to return.
+fn vec_index_of[T: Scalar](v: *mut Vec[T], value: T) -> usize {
+    var i: usize = 0
+    while i < (*v).len {
+        if vec_at[T](v, i) == value {
+            return i
+        }
+        i = i + 1
+    }
+    return (*v).len
+}
+
+fn vec_contains[T: Scalar](v: *mut Vec[T], value: T) -> bool {
+    return vec_index_of[T](v, value) < (*v).len
+}
+
+fn vec_count[T: Scalar](v: *mut Vec[T], value: T) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*v).len {
+        if vec_at[T](v, i) == value {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Insert at position `i` (i == len appends). `false` = out of memory.
+fn vec_insert[T](v: *mut Vec[T], i: usize, value: T) -> bool {
+    if i > (*v).len {
+        return false
+    }
+    if !vec_push[T](v, value) {
+        return false
+    }
+    var j: usize = (*v).len - 1
+    while j > i {
+        let target: *mut T = vec_elem_ptr[T](v, j)
+        let source: *mut T = vec_elem_ptr[T](v, j - 1)
+        *target = *source
+        j = j - 1
+    }
+    let first: *mut T = vec_elem_ptr[T](v, i)
+    *first = value
+    return true
+}
+
+// Removal that preserves the order -- O(n).
+fn vec_remove[T: Scalar](v: *mut Vec[T], i: usize) -> T {
+    if i >= (*v).len {
+        return 0 as T
+    }
+    let w: T = vec_at[T](v, i)
+    var j: usize = i
+    while j + 1 < (*v).len {
+        vec_set[T](v, j, vec_at[T](v, j + 1))
+        j = j + 1
+    }
+    (*v).len = (*v).len - 1
+    return w
+}
+
+// Removal in O(1) by moving the last element up. The order is lost in the
+// process -- the caller decides whether that is acceptable.
+fn vec_remove_fast[T: Scalar](v: *mut Vec[T], i: usize) -> T {
+    if i >= (*v).len {
+        return 0 as T
+    }
+    let w: T = vec_at[T](v, i)
+    let last: T = vec_at[T](v, (*v).len - 1)
+    vec_set[T](v, i, last)
+    (*v).len = (*v).len - 1
+    return w
+}
+
+// Append `source` to `target`. The two must NOT be the same array.
+fn vec_append[T](target: *mut Vec[T], source: *mut Vec[T]) -> bool {
+    if !vec_reserve[T](target, (*target).len + (*source).len) {
+        return false
+    }
+    var i: usize = 0
+    while i < (*source).len {
+        let p: *mut T = vec_elem_ptr[T](source, i)
+        if !vec_push[T](target, *p) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// `target` becomes a copy of `source` (the previous content is dropped, the
+// memory stays).
+fn vec_copy[T](source: *mut Vec[T], target: *mut Vec[T]) -> bool {
+    vec_clear[T](target)
+    if (*source).len == 0 {
+        return true
+    }
+    if !vec_reserve[T](target, (*source).len) {
+        return false
+    }
+    rt.mem_copy((*target).ptr, (*source).ptr, (*source).len * size_of[T]())
+    (*target).len = (*source).len
+    return true
+}
+
+fn vec_equal[T: Scalar](a: *mut Vec[T], b: *mut Vec[T]) -> bool {
+    if (*a).len != (*b).len {
+        return false
+    }
+    var i: usize = 0
+    while i < (*a).len {
+        if vec_at[T](a, i) != vec_at[T](b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The smallest/largest element. On an empty array the null value -- like `vec_at`.
+// TWO BOUNDS AT ONCE: `Scalar` for the null value on an empty array
+// (`0 as T`), `Ord` for the comparison. Both have to hold, and that is
+// checked at instantiation time.
+fn vec_min[T: Scalar + Ord](v: *mut Vec[T]) -> T {
+    if (*v).len == 0 {
+        return 0 as T
+    }
+    var m: T = vec_at[T](v, 0)
+    var i: usize = 1
+    while i < (*v).len {
+        var w: T = vec_at[T](v, i)
+        if w.less(&m) {
+            m = w
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max[T: Scalar + Ord](v: *mut Vec[T]) -> T {
+    if (*v).len == 0 {
+        return 0 as T
+    }
+    var m: T = vec_at[T](v, 0)
+    var i: usize = 1
+    while i < (*v).len {
+        var w: T = vec_at[T](v, i)
+        if m.less(&w) {
+            m = w
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// ----------------------------------------------------------------- Sorting
+//
+// HEAPSORT, not quicksort. Three reasons, all of them checkable:
+//   * O(n log n) in the WORST case -- quicksort degenerates to O(n^2) on
+//     already sorted or uniformly distributed input, and exactly those turn
+//     up all the time inside a compiler.
+//   * no extra memory (mergesort would need n elements).
+//   * no recursion -- otherwise the depth of a sorting run depends on the
+//     input, and stage 0 has no stack check.
+// NOT STABLE: equal elements may swap places. For scalars that cannot be
+// told apart; as soon as a Vec[T] carries key/value pairs it becomes a
+// promise that is missing here.
+
+fn vec_lower[T: Ord](v: *mut Vec[T], root: usize, end: usize) {
+    var i: usize = root
+    var runs: bool = true
+    while runs {
+        var gr: usize = i
+        let l: usize = 2 * i + 1
+        let r: usize = 2 * i + 2
+        if l < end {
+            let pl: *mut T = vec_elem_ptr[T](v, l)
+            let pg: *mut T = vec_elem_ptr[T](v, gr)
+            if pg.less(pl) {
+                gr = l
+            }
+        }
+        if r < end {
+            let pr: *mut T = vec_elem_ptr[T](v, r)
+            let pg: *mut T = vec_elem_ptr[T](v, gr)
+            if pg.less(pr) {
+                gr = r
+            }
+        }
+        if gr == i {
+            runs = false
+        } else {
+            vec_swap[T](v, i, gr)
+            i = gr
+        }
+    }
+}
+
+fn vec_sort[T: Ord](v: *mut Vec[T]) {
+    let n: usize = (*v).len
+    if n < 2 {
+        return
+    }
+    var i: usize = n / 2
+    while i > 0 {
+        i = i - 1
+        vec_lower[T](v, i, n)
+    }
+    var e: usize = n
+    while e > 1 {
+        e = e - 1
+        vec_swap[T](v, 0, e)
+        vec_lower[T](v, 0, e)
+    }
+}
+
+// -------------------------------------------- ROUND 58: the ordering as a VALUE
+//
+// `vec_sort[T: Ord]` above takes its ordering off the TYPE. That is right
+// wherever a type has exactly one natural order -- and wrong as soon as the
+// same data is to be sorted twice differently. Until round 57 the only way
+// out was to copy the sorter, because a comparison could not be handed over.
+//
+// Since functions are values it can: `less` is an ordinary parameter of type
+// `fn(*T, *T) -> bool`. The call inside the loop is ONE indirect call
+// (`call rax`) -- visibly one more than with `T: Ord`, which resolves
+// statically. That is the price, and it stands here rather than in a
+// footnote.
+//
+// The same heapsort as above: O(n log n) in the worst case, no extra memory,
+// no recursion. NOT STABLE.
+fn vec_lower_by[T](v: *mut Vec[T], root: usize, end: usize, less: fn(*T, *T) -> bool) {
+    var i: usize = root
+    var runs: bool = true
+    while runs {
+        var gr: usize = i
+        let l: usize = 2 * i + 1
+        let r: usize = 2 * i + 2
+        if l < end {
+            let pl: *mut T = vec_elem_ptr[T](v, l)
+            let pg: *mut T = vec_elem_ptr[T](v, gr)
+            if less(pg, pl) {
+                gr = l
+            }
+        }
+        if r < end {
+            let pr: *mut T = vec_elem_ptr[T](v, r)
+            let pg: *mut T = vec_elem_ptr[T](v, gr)
+            if less(pg, pr) {
+                gr = r
+            }
+        }
+        if gr == i {
+            runs = false
+        } else {
+            vec_swap[T](v, i, gr)
+            i = gr
+        }
+    }
+}
+
+// Sorts with an ordering OF YOUR OWN. `less(a, b)` has to answer "a comes
+// before b" and must be a strict weak ordering; a comparison that says true
+// for both directions makes the result arbitrary (it does not crash -- the
+// heap loop is bounded).
+fn vec_sort_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) {
+    let n: usize = (*v).len
+    if n < 2 {
+        return
+    }
+    var i: usize = n / 2
+    while i > 0 {
+        i = i - 1
+        vec_lower_by[T](v, i, n, less)
+    }
+    var e: usize = n
+    while e > 1 {
+        e = e - 1
+        vec_swap[T](v, 0, e)
+        vec_lower_by[T](v, 0, e, less)
+    }
+}
+
+fn vec_is_sorted_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) -> bool {
+    if (*v).len < 2 {
+        return true
+    }
+    var i: usize = 1
+    while i < (*v).len {
+        let a: *mut T = vec_elem_ptr[T](v, i)
+        let b: *mut T = vec_elem_ptr[T](v, i - 1)
+        if less(a, b) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Smallest/largest element by an ordering of your own. The INDEX is the
+// answer, not the value: whoever wants the value reads it, whoever wants to
+// change it needs the position anyway. `vec_len` means "empty".
+fn vec_min_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) -> usize {
+    if (*v).len == 0 {
+        return 0
+    }
+    var best: usize = 0
+    var i: usize = 1
+    while i < (*v).len {
+        if less(vec_elem_ptr[T](v, i), vec_elem_ptr[T](v, best)) {
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn vec_max_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) -> usize {
+    if (*v).len == 0 {
+        return 0
+    }
+    var best: usize = 0
+    var i: usize = 1
+    while i < (*v).len {
+        if less(vec_elem_ptr[T](v, best), vec_elem_ptr[T](v, i)) {
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ------------------------------------------- ROUND 58: the predicate as a VALUE
+//
+// `vec_index_of`/`vec_contains`/`vec_count` compare with `==`. That covers
+// exactly one question ("is this value in there") and nothing else. With a
+// predicate as a parameter the same loop answers every question -- and there
+// is only ONE loop instead of one per question.
+
+// Position of the first element the predicate holds for; `vec_len` = none.
+fn vec_index_where[T](v: *mut Vec[T], pred: fn(*T) -> bool) -> usize {
+    var i: usize = 0
+    while i < (*v).len {
+        if pred(vec_elem_ptr[T](v, i)) {
+            return i
+        }
+        i = i + 1
+    }
+    return (*v).len
+}
+
+fn vec_count_where[T](v: *mut Vec[T], pred: fn(*T) -> bool) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*v).len {
+        if pred(vec_elem_ptr[T](v, i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Empty is TRUE for `all` and FALSE for `any` -- the usual convention, and
+// the only one under which `all(p) == !any(not p)` holds.
+fn vec_all[T](v: *mut Vec[T], pred: fn(*T) -> bool) -> bool {
+    var i: usize = 0
+    while i < (*v).len {
+        if !pred(vec_elem_ptr[T](v, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn vec_any[T](v: *mut Vec[T], pred: fn(*T) -> bool) -> bool {
+    var i: usize = 0
+    while i < (*v).len {
+        if pred(vec_elem_ptr[T](v, i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn vec_is_sorted[T: Ord](v: *mut Vec[T]) -> bool {
+    if (*v).len < 2 {
+        return true
+    }
+    var i: usize = 1
+    while i < (*v).len {
+        let a: *mut T = vec_elem_ptr[T](v, i)
+        let b: *mut T = vec_elem_ptr[T](v, i - 1)
+        if a.less(b) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The first position where `value` could stand (everything before it is
+// smaller) -- the standard bound you can insert with as well.
+// IT ASSUMES that the array is sorted; otherwise the answer is arbitrary.
+fn vec_lower_bound[T: Ord](v: *mut Vec[T], value: T) -> usize {
+    var w: T = value
+    var lo: usize = 0
+    var hi: usize = (*v).len
+    while lo < hi {
+        let m: usize = lo + (hi - lo) / 2
+        let p: *mut T = vec_elem_ptr[T](v, m)
+        if p.less(&w) {
+            lo = m + 1
+        } else {
+            hi = m
+        }
+    }
+    return lo
+}
+
+// Binary search. NOT FOUND is `vec_len` -- as with `vec_index_of`.
+//
+// EQUALITY OUT OF THE ORDERING: `a == b` means `!(a < b) && !(b < a)` here.
+// That is not convenience but the only equality that fits a binary search --
+// it has to be the same one the array was sorted by. Otherwise the search
+// would find a spot where, by the ordering, nothing stands.
+fn vec_binary_search[T: Ord](v: *mut Vec[T], value: T) -> usize {
+    var w: T = value
+    let i: usize = vec_lower_bound[T](v, w)
+    if i < (*v).len {
+        let p: *mut T = vec_elem_ptr[T](v, i)
+        if !p.less(&w) && !w.less(p) {
+            return i
+        }
+    }
+    return (*v).len
+}
+
+// Insert in order: the ordering is preserved.
+fn vec_sorted_insert[T: Ord](v: *mut Vec[T], value: T) -> bool {
+    return vec_insert[T](v, vec_lower_bound[T](v, value), value)
+}

@@ -1,0 +1,505 @@
+// SPDX-License-Identifier: MIT
+// lib/std/crypto/accel.fi -- AES and SHA-256 on the instructions the
+// processor already has (round 82).
+//
+// ================================================================== THE POINT
+//
+// Measured on this machine before this round (docs/ROUND82.md 2):
+//
+//     SHA-256       22.6 MiB/s   OpenSSL 1424 MB/s    ~60x
+//     AES-128-CBC    5.50 MiB/s  OpenSSL 1025 MB/s   ~190x
+//     AES-128-CFB8   0.34 MiB/s                     ~3000x
+//
+// Those factors are not an optimizer failing. `lib/std/crypto/aes.fi` and
+// `sha256.fi` compute the cipher; OpenSSL EXECUTES it. `aesenc` is one
+// instruction that does a whole AES round -- SubBytes, ShiftRows,
+// MixColumns and AddRoundKey together. `sha256rnds2` does two SHA-256
+// rounds. Against that, forty scalar instructions lose, and no amount of
+// register allocation changes it.
+//
+// This file is the other half: the same two ciphers written on those
+// instructions, through the `__aesenc` / `__sha256rnds2` intrinsics of round
+// 82 (`compiler/src/simd.rs`).
+//
+// ============================================================== THE FALLBACK
+//
+// NOTHING HERE RUNS WITHOUT ASKING FIRST. `aes.fi` and `sha256.fi` call
+// `cpu.has_aes()` / `cpu.has_sha()` and go to their own scalar code when the
+// answer is no. That code stays in the binary; it is not dead weight but the
+// only reason a Firn program still runs on a processor from 2008.
+//
+// AND BOTH PATHS ARE HELD AGAINST THE SAME VECTORS. `tools/bench82/run.sh`
+// runs the 1,919 NIST CAVP vectors of `testdata/crypto/` and the FIPS 180-4
+// / FIPS 197 known answer tests TWICE -- once with the hardware path forced
+// on, once with it forced off (`FIRN_NO_ACCEL=1` in the test binaries) --
+// and demands the same answer. A fast implementation that is wrong is worth
+// less than a slow one that is right, so the proof comes first.
+//
+// ================================================================== KEY SETUP
+//
+// AES-128 encryption uses the SAME round keys as the scalar cipher: eleven
+// times sixteen octets, exactly the layout `Aes.rk` already has. Nothing has
+// to be expanded twice.
+//
+// DECRYPTION does need a second schedule. `aesdec` implements the
+// EQUIVALENT INVERSE CIPHER, whose round keys are the encryption keys in
+// reverse order with `InvMixColumns` applied to the nine middle ones --
+// which is exactly what the instruction `aesimc` is for. That conversion
+// happens once per call and costs nine instructions.
+//
+// ============================================================== WHAT IS HERE
+//
+// AES-128 only, as in `aes.fi` -- 192 and 256 differ in the key schedule,
+// and an untested key length is worse than a missing one. CBC in both
+// directions, CFB8 in both directions, and the SHA-256 block function.
+// No GCM: that needs `pclmulqdq` and an authentication design, and half a
+// GCM is worse than none.
+import std.cpu
+
+export {
+    accel_aes, accel_sha,
+    aes128_ni_encrypt_block,
+    aes128_ni_cbc_encrypt, aes128_ni_cbc_decrypt,
+    aes128_ni_cfb8_encrypt, aes128_ni_cfb8_decrypt,
+    sha256_ni_blocks,
+}
+
+// Is the hardware path available AND allowed? The environment variable is
+// not a luxury: it is what lets `tools/bench82/run.sh` run the very same
+// test vectors through both implementations.
+fn accel_aes() -> bool {
+    return cpu.has_aes() && cpu.has_ssse3()
+}
+
+fn accel_sha() -> bool {
+    return cpu.has_sha() && cpu.has_ssse3()
+}
+
+// ------------------------------------------------------------------- AES-NI
+//
+// The eleven round keys of `rk` (176 octets, the layout of `Aes.rk`) into
+// eleven registers, and then ten instructions.
+
+fn aes128_ni_encrypt_block(rk: u64, inp: u64, out: u64) {
+    var s: v128 = __v128_load(inp as *u8)
+    s = __v128_xor(s, __v128_load(rk as *u8))
+    s = __aesenc(s, __v128_load((rk + 16) as *u8))
+    s = __aesenc(s, __v128_load((rk + 32) as *u8))
+    s = __aesenc(s, __v128_load((rk + 48) as *u8))
+    s = __aesenc(s, __v128_load((rk + 64) as *u8))
+    s = __aesenc(s, __v128_load((rk + 80) as *u8))
+    s = __aesenc(s, __v128_load((rk + 96) as *u8))
+    s = __aesenc(s, __v128_load((rk + 112) as *u8))
+    s = __aesenc(s, __v128_load((rk + 128) as *u8))
+    s = __aesenc(s, __v128_load((rk + 144) as *u8))
+    s = __aesenclast(s, __v128_load((rk + 160) as *u8))
+    __v128_store(out as *mut u8, s)
+}
+
+// CBC ENCRYPTION IS SERIAL BY DEFINITION -- block n needs the ciphertext of
+// block n-1. There is nothing to parallelise here, and the whole speed sits
+// in the ten round instructions staying in registers. `iv` is updated in
+// place, so the caller can keep chaining.
+fn aes128_ni_cbc_encrypt(rk: u64, iv: u64, p: u64, n: usize, out: u64) {
+    let k0: v128 = __v128_load(rk as *u8)
+    let k1: v128 = __v128_load((rk + 16) as *u8)
+    let k2: v128 = __v128_load((rk + 32) as *u8)
+    let k3: v128 = __v128_load((rk + 48) as *u8)
+    let k4: v128 = __v128_load((rk + 64) as *u8)
+    let k5: v128 = __v128_load((rk + 80) as *u8)
+    let k6: v128 = __v128_load((rk + 96) as *u8)
+    let k7: v128 = __v128_load((rk + 112) as *u8)
+    let k8: v128 = __v128_load((rk + 128) as *u8)
+    let k9: v128 = __v128_load((rk + 144) as *u8)
+    let k10: v128 = __v128_load((rk + 160) as *u8)
+    var c: v128 = __v128_load(iv as *u8)
+    var at: usize = 0
+    while at < n {
+        var s: v128 = __v128_xor(__v128_load((p + at as u64) as *u8), c)
+        s = __v128_xor(s, k0)
+        s = __aesenc(s, k1)
+        s = __aesenc(s, k2)
+        s = __aesenc(s, k3)
+        s = __aesenc(s, k4)
+        s = __aesenc(s, k5)
+        s = __aesenc(s, k6)
+        s = __aesenc(s, k7)
+        s = __aesenc(s, k8)
+        s = __aesenc(s, k9)
+        c = __aesenclast(s, k10)
+        __v128_store((out + at as u64) as *mut u8, c)
+        at = at + 16
+    }
+    __v128_store(iv as *mut u8, c)
+}
+
+// The inverse schedule for `aesdec`: reversed order, `aesimc` on the nine in
+// the middle. Nine instructions, once per call.
+fn inv_schedule(rk: u64, dk: u64) {
+    __v128_store(dk as *mut u8, __v128_load((rk + 160) as *u8))
+    var i: usize = 1
+    while i < 10 {
+        let src: v128 = __v128_load((rk + ((10 - i) * 16) as u64) as *u8)
+        __v128_store((dk + (i * 16) as u64) as *mut u8, __aesimc(src))
+        i = i + 1
+    }
+    __v128_store((dk + 160) as *mut u8, __v128_load(rk as *u8))
+}
+
+// CBC DECRYPTION IS NOT SERIAL -- every block only needs the CIPHERTEXT of
+// its predecessor, which is already there. Four blocks are decrypted at
+// once, which fills the four cycle latency of `aesdec` instead of waiting
+// through it. The tail below sixteen octets runs one at a time.
+fn aes128_ni_cbc_decrypt(rk: u64, iv: u64, p: u64, n: usize, out: u64) {
+    var dk: [u8; 176] = [0; 176]
+    let d: u64 = (&dk[0]) as u64
+    inv_schedule(rk, d)
+    let k0: v128 = __v128_load(d as *u8)
+    let k1: v128 = __v128_load((d + 16) as *u8)
+    let k2: v128 = __v128_load((d + 32) as *u8)
+    let k3: v128 = __v128_load((d + 48) as *u8)
+    let k4: v128 = __v128_load((d + 64) as *u8)
+    let k5: v128 = __v128_load((d + 80) as *u8)
+    let k6: v128 = __v128_load((d + 96) as *u8)
+    let k7: v128 = __v128_load((d + 112) as *u8)
+    let k8: v128 = __v128_load((d + 128) as *u8)
+    let k9: v128 = __v128_load((d + 144) as *u8)
+    let k10: v128 = __v128_load((d + 160) as *u8)
+    var chain: v128 = __v128_load(iv as *u8)
+    var at: usize = 0
+    while at < n {
+        let ct: v128 = __v128_load((p + at as u64) as *u8)
+        var s: v128 = __v128_xor(ct, k0)
+        s = __aesdec(s, k1)
+        s = __aesdec(s, k2)
+        s = __aesdec(s, k3)
+        s = __aesdec(s, k4)
+        s = __aesdec(s, k5)
+        s = __aesdec(s, k6)
+        s = __aesdec(s, k7)
+        s = __aesdec(s, k8)
+        s = __aesdec(s, k9)
+        s = __aesdeclast(s, k10)
+        __v128_store((out + at as u64) as *mut u8, __v128_xor(s, chain))
+        chain = ct
+        at = at + 16
+    }
+    __v128_store(iv as *mut u8, chain)
+}
+
+// CFB8: ONE FULL AES ENCRYPTION PER OCTET. That is the mode, not a
+// weakness of this implementation -- Minecraft's session encryption costs
+// exactly this. What the hardware path buys is that those ten rounds are
+// ten instructions instead of some four hundred.
+//
+// The shift register lives in a register too: `palignr` shifts the sixteen
+// octets by one and `pinsrb` would append the new one -- there is no
+// `pinsrb` intrinsic in round 82, so the register is kept in memory and
+// only the ENCRYPTION runs on the vector unit. Measured, that is still the
+// whole of the gain, because the shift is four instructions against the
+// cipher's ten.
+fn aes128_ni_cfb8_encrypt(rk: u64, iv: u64, p: u64, n: usize, out: u64) {
+    let k0: v128 = __v128_load(rk as *u8)
+    let k1: v128 = __v128_load((rk + 16) as *u8)
+    let k2: v128 = __v128_load((rk + 32) as *u8)
+    let k3: v128 = __v128_load((rk + 48) as *u8)
+    let k4: v128 = __v128_load((rk + 64) as *u8)
+    let k5: v128 = __v128_load((rk + 80) as *u8)
+    let k6: v128 = __v128_load((rk + 96) as *u8)
+    let k7: v128 = __v128_load((rk + 112) as *u8)
+    let k8: v128 = __v128_load((rk + 128) as *u8)
+    let k9: v128 = __v128_load((rk + 144) as *u8)
+    let k10: v128 = __v128_load((rk + 160) as *u8)
+    var sr: v128 = __v128_load(iv as *u8)
+    var i: usize = 0
+    while i < n {
+        var s: v128 = __v128_xor(sr, k0)
+        s = __aesenc(s, k1)
+        s = __aesenc(s, k2)
+        s = __aesenc(s, k3)
+        s = __aesenc(s, k4)
+        s = __aesenc(s, k5)
+        s = __aesenc(s, k6)
+        s = __aesenc(s, k7)
+        s = __aesenc(s, k8)
+        s = __aesenc(s, k9)
+        s = __aesenclast(s, k10)
+        let c: u8 = ld8(p, i) ^ (__v128_get_u32(s, 0) & (255 as u32)) as u8
+        st8(out, i, c)
+        sr = shift_reg(sr, c)
+        i = i + 1
+    }
+    __v128_store(iv as *mut u8, sr)
+}
+
+fn aes128_ni_cfb8_decrypt(rk: u64, iv: u64, p: u64, n: usize, out: u64) {
+    let k0: v128 = __v128_load(rk as *u8)
+    let k1: v128 = __v128_load((rk + 16) as *u8)
+    let k2: v128 = __v128_load((rk + 32) as *u8)
+    let k3: v128 = __v128_load((rk + 48) as *u8)
+    let k4: v128 = __v128_load((rk + 64) as *u8)
+    let k5: v128 = __v128_load((rk + 80) as *u8)
+    let k6: v128 = __v128_load((rk + 96) as *u8)
+    let k7: v128 = __v128_load((rk + 112) as *u8)
+    let k8: v128 = __v128_load((rk + 128) as *u8)
+    let k9: v128 = __v128_load((rk + 144) as *u8)
+    let k10: v128 = __v128_load((rk + 160) as *u8)
+    var sr: v128 = __v128_load(iv as *u8)
+    var i: usize = 0
+    while i < n {
+        var s: v128 = __v128_xor(sr, k0)
+        s = __aesenc(s, k1)
+        s = __aesenc(s, k2)
+        s = __aesenc(s, k3)
+        s = __aesenc(s, k4)
+        s = __aesenc(s, k5)
+        s = __aesenc(s, k6)
+        s = __aesenc(s, k7)
+        s = __aesenc(s, k8)
+        s = __aesenc(s, k9)
+        s = __aesenclast(s, k10)
+        let c: u8 = ld8(p, i)
+        st8(out, i, c ^ (__v128_get_u32(s, 0) & (255 as u32)) as u8)
+        sr = shift_reg(sr, c)
+        i = i + 1
+    }
+    __v128_store(iv as *mut u8, sr)
+}
+
+// The shift register moves one octet down, the new one goes in at the top.
+// IN THE REGISTER: `psrldq` by one octet, the new octet built as a vector
+// at position 15, then `por`. Three instructions instead of the thirty
+// memory accesses of a fifteen step loop.
+fn shift_reg(sr: v128, c: u8) -> v128 {
+    let top: v128 = __v128_from_u64(0, (c as u64) << 56)
+    return __v128_or(__v128_shr_bytes(sr, 1), top)
+}
+
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn st8(p: u64, i: usize, v: u8) {
+    *((p + i as u64) as *mut u8) = v
+}
+
+// ------------------------------------------------------------------ SHA-NI
+//
+// `hp` points at EIGHT 32 bit words of state in the order A B C D E F G H,
+// little endian -- the layout FIPS 180-4 prescribes and the one
+// `sha256.fi` hands over. `p` points at `nblocks` times 64 octets.
+//
+// The two state registers are NOT A B C D / E F G H. `sha256rnds2` wants
+// A B E F in one and C D G H in the other; the four shuffles at the top and
+// the four at the bottom are that conversion, and they happen ONCE per call,
+// not once per block. That is why this function takes a block COUNT.
+//
+// The sixteen groups of four rounds are written out. They are not a loop
+// because they are not the same: the first four load the message, the middle
+// eleven run the schedule (`sha256msg1`/`sha256msg2`), the last one runs
+// neither. Rolling that into a loop would need a branch per group and would
+// keep the message schedule in memory -- which is the whole thing the
+// message instructions exist to avoid.
+fn sha256_ni_blocks(hp: u64, p: u64, nblocks: usize) {
+    var kt: [u32; 64] = [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
+        2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
+        1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
+        264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
+        113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+        1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
+        3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+        1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
+        2428436474, 2756734187, 3204031479, 3329325298
+    ]
+    let kp: u64 = (&kt[0]) as u64
+    // MEASURED (docs/ROUND82.md 3.3): the sixteen constant groups as VALUES
+    // in front of the loop, not as a pointer computation per group. A
+    // `__v128_load((kp + 16 * g) as *u8)` inside the loop costs an address
+    // addition, a slot write, a slot read and only then the vector load --
+    // four instructions where one `movdqa` out of the frame slot does.
+    let kc0: v128 = __v128_load((kp + 0) as *u8)
+    let kc1: v128 = __v128_load((kp + 16) as *u8)
+    let kc2: v128 = __v128_load((kp + 32) as *u8)
+    let kc3: v128 = __v128_load((kp + 48) as *u8)
+    let kc4: v128 = __v128_load((kp + 64) as *u8)
+    let kc5: v128 = __v128_load((kp + 80) as *u8)
+    let kc6: v128 = __v128_load((kp + 96) as *u8)
+    let kc7: v128 = __v128_load((kp + 112) as *u8)
+    let kc8: v128 = __v128_load((kp + 128) as *u8)
+    let kc9: v128 = __v128_load((kp + 144) as *u8)
+    let kc10: v128 = __v128_load((kp + 160) as *u8)
+    let kc11: v128 = __v128_load((kp + 176) as *u8)
+    let kc12: v128 = __v128_load((kp + 192) as *u8)
+    let kc13: v128 = __v128_load((kp + 208) as *u8)
+    let kc14: v128 = __v128_load((kp + 224) as *u8)
+    let kc15: v128 = __v128_load((kp + 240) as *u8)
+    // The byte swap mask: each 32 bit word big endian -> little endian.
+    // 0x0405060700010203 low, 0x0c0d0e0f08090a0b high.
+    let mask: v128 = __v128_from_u64(289644378169868803, 868365760874482187)
+
+    var tmp: v128 = __v128_load(hp as *u8)
+    var st1: v128 = __v128_load((hp + 16) as *u8)
+    tmp = __v128_shuffle32(tmp, 177)
+    st1 = __v128_shuffle32(st1, 27)
+    var st0: v128 = __v128_alignr(tmp, st1, 8)
+    st1 = __v128_blend16(st1, tmp, 240)
+
+    var m0: v128 = st0
+    var m1: v128 = st0
+    var m2: v128 = st0
+    var m3: v128 = st0
+    var msg: v128 = st0
+    var sch: v128 = st0
+
+    var b: usize = 0
+    while b < nblocks {
+        let base: u64 = p + (b as u64) * 64
+        let a0: v128 = st0
+        let a1: v128 = st1
+        // rounds 0-3
+        m0 = __v128_shuffle8(__v128_load((base + 0) as *u8), mask)
+        msg = __v128_add32(m0, kc0)
+        st1 = __sha256rnds2(st1, st0, msg)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        // rounds 4-7
+        m1 = __v128_shuffle8(__v128_load((base + 16) as *u8), mask)
+        msg = __v128_add32(m1, kc1)
+        st1 = __sha256rnds2(st1, st0, msg)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m0 = __sha256msg1(m0, m1)
+        // rounds 8-11
+        m2 = __v128_shuffle8(__v128_load((base + 32) as *u8), mask)
+        msg = __v128_add32(m2, kc2)
+        st1 = __sha256rnds2(st1, st0, msg)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m1 = __sha256msg1(m1, m2)
+        // rounds 12-15
+        m3 = __v128_shuffle8(__v128_load((base + 48) as *u8), mask)
+        msg = __v128_add32(m3, kc3)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m3, m2, 4)
+        m0 = __v128_add32(m0, sch)
+        m0 = __sha256msg2(m0, m3)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m2 = __sha256msg1(m2, m3)
+        // rounds 16-19
+        msg = __v128_add32(m0, kc4)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m0, m3, 4)
+        m1 = __v128_add32(m1, sch)
+        m1 = __sha256msg2(m1, m0)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m3 = __sha256msg1(m3, m0)
+        // rounds 20-23
+        msg = __v128_add32(m1, kc5)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m1, m0, 4)
+        m2 = __v128_add32(m2, sch)
+        m2 = __sha256msg2(m2, m1)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m0 = __sha256msg1(m0, m1)
+        // rounds 24-27
+        msg = __v128_add32(m2, kc6)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m2, m1, 4)
+        m3 = __v128_add32(m3, sch)
+        m3 = __sha256msg2(m3, m2)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m1 = __sha256msg1(m1, m2)
+        // rounds 28-31
+        msg = __v128_add32(m3, kc7)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m3, m2, 4)
+        m0 = __v128_add32(m0, sch)
+        m0 = __sha256msg2(m0, m3)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m2 = __sha256msg1(m2, m3)
+        // rounds 32-35
+        msg = __v128_add32(m0, kc8)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m0, m3, 4)
+        m1 = __v128_add32(m1, sch)
+        m1 = __sha256msg2(m1, m0)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m3 = __sha256msg1(m3, m0)
+        // rounds 36-39
+        msg = __v128_add32(m1, kc9)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m1, m0, 4)
+        m2 = __v128_add32(m2, sch)
+        m2 = __sha256msg2(m2, m1)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m0 = __sha256msg1(m0, m1)
+        // rounds 40-43
+        msg = __v128_add32(m2, kc10)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m2, m1, 4)
+        m3 = __v128_add32(m3, sch)
+        m3 = __sha256msg2(m3, m2)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m1 = __sha256msg1(m1, m2)
+        // rounds 44-47
+        msg = __v128_add32(m3, kc11)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m3, m2, 4)
+        m0 = __v128_add32(m0, sch)
+        m0 = __sha256msg2(m0, m3)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m2 = __sha256msg1(m2, m3)
+        // rounds 48-51
+        msg = __v128_add32(m0, kc12)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m0, m3, 4)
+        m1 = __v128_add32(m1, sch)
+        m1 = __sha256msg2(m1, m0)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        m3 = __sha256msg1(m3, m0)
+        // rounds 52-55
+        msg = __v128_add32(m1, kc13)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m1, m0, 4)
+        m2 = __v128_add32(m2, sch)
+        m2 = __sha256msg2(m2, m1)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        // rounds 56-59
+        msg = __v128_add32(m2, kc14)
+        st1 = __sha256rnds2(st1, st0, msg)
+        sch = __v128_alignr(m2, m1, 4)
+        m3 = __v128_add32(m3, sch)
+        m3 = __sha256msg2(m3, m2)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        // rounds 60-63
+        msg = __v128_add32(m3, kc15)
+        st1 = __sha256rnds2(st1, st0, msg)
+        msg = __v128_shuffle32(msg, 14)
+        st0 = __sha256rnds2(st0, st1, msg)
+        st0 = __v128_add32(st0, a0)
+        st1 = __v128_add32(st1, a1)
+        b = b + 1
+    }
+
+    tmp = __v128_shuffle32(st0, 27)
+    st1 = __v128_shuffle32(st1, 177)
+    st0 = __v128_blend16(tmp, st1, 240)
+    st1 = __v128_alignr(st1, tmp, 8)
+    __v128_store(hp as *mut u8, st0)
+    __v128_store((hp + 16) as *mut u8, st1)
+}

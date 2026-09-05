@@ -1,0 +1,156 @@
+// expect_exit: 0
+// ROUND 49 -- VARIANT B: FREE LISTS PER THREAD.
+//
+// The allocation can run in two ways (docs/ROUND49.md 5):
+//   A  every allocation takes the GC lock (the default)
+//   B  every thread fetches a BATCH of blocks into its own free list under
+//      the lock and serves itself from there without the lock
+//
+// This test demands that B yields the same result as A -- in the SAME
+// process and with bit-identical code, switched over with `gc_set_local`.
+// That is exactly how docs/ROUND49.md measures as well; a measurement from
+// two different binaries would be distorted by the code layout.
+//
+// Checked on top of that:
+//   * the local lists are really used (gc_local_refills())
+//   * a thread that ends gives its list back -- otherwise the blocks
+//     would be neither free nor occupied and the heap would grow every round
+
+gc class Cell {
+    next: Gc[Cell],
+    value: u64,
+}
+
+const CHAIN: u64 = 250
+const GARBAGE: u64 = 4000
+
+fn chain_build(kind: u64) -> AllocError!Gc[Cell] {
+    var header: Gc[Cell] = gc_null[Cell]()
+    var i: u64 = 0
+    while i < CHAIN {
+        let n: Gc[Cell] = try gc Cell { next: header, value: kind * 1000 + i }
+        header = n
+        var m: u64 = 0
+        while m < GARBAGE / CHAIN {
+            let dead: Gc[Cell] = try gc Cell { next: gc_null[Cell](), value: 0 }
+            if dead.value != 0 {
+                return header
+            }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    return header
+}
+
+fn chain_check(header: Gc[Cell], kind: u64) -> u64 {
+    var p: Gc[Cell] = header
+    var i: u64 = CHAIN
+    while i > 0 {
+        i = i - 1
+        if p == gc_null[Cell]() {
+            return 1
+        }
+        if p.value != kind * 1000 + i {
+            return 2
+        }
+        p = p.next
+    }
+    return 0
+}
+
+fn work(kind: u64) -> AllocError!u64 {
+    let header: Gc[Cell] = try chain_build(kind)
+    gc_collect()
+    if chain_check(header, kind) != 0 {
+        return 900
+    }
+    return kind
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let _unused: u64 = arg
+    let r: AllocError!u64 = work(kind)
+    return r catch 800
+}
+
+// A whole set of threads. Yields the sum of the results.
+fn set(n: u64) -> u64 {
+    var h: [u64; 4] = [0; 4]
+    var i: u64 = 0
+    while i < n {
+        h[i as usize] = thread_start(i + 1, 0)
+        if h[i as usize] == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    var s: u64 = 0
+    i = 0
+    while i < n {
+        let r: u64 = thread_wait(h[i as usize])
+        if r >= 800 {
+            return 0
+        }
+        s = s + r
+        i = i + 1
+    }
+    return s
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    if !thread_init() {
+        return 91
+    }
+
+    // --- A: everything under the GC lock ------------------------------------
+    if gc_local() != 0 {
+        return 1
+    }
+    if set(4) != 10 {
+        return 2
+    }
+    if gc_local_refills() != 0 {
+        return 3
+    }
+    let heap_a: u64 = gc_heap_bytes()
+
+    // --- B: free lists per thread -------------------------------------------
+    gc_set_local(1)
+    if gc_local() != 1 {
+        return 4
+    }
+    if set(4) != 10 {
+        return 5
+    }
+    if gc_local_refills() == 0 {
+        return 6
+    }
+
+    // Two more sets: if the ending threads did not give their lists back,
+    // the heap would keep growing with every set.
+    if set(4) != 10 {
+        return 7
+    }
+    if set(4) != 10 {
+        return 8
+    }
+    gc_collect()
+    let heap_b: u64 = gc_heap_bytes()
+    if heap_b > heap_a * 3 + 4194304 {
+        return 9
+    }
+
+    // --- back to A: the same way has to keep being right ---------------------
+    gc_set_local(0)
+    if set(4) != 10 {
+        return 10
+    }
+    if thread_count() != 1 {
+        return 11
+    }
+    return 0
+}

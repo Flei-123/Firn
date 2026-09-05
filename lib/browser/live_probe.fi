@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/live_probe.fi -- the INVALIDATION on its own (root file, B4).
+//
+// It exists so that the narrowing of round B4 can be measured WITHOUT a
+// script engine in the picture: the mutations come as commands on standard
+// input instead of out of JavaScript, and everything else -- the marks, the
+// narrowed style walk, the layout wall, the counter-check against a full
+// layout -- is exactly the code the browser uses.
+//
+// stdin, little endian:
+//     u32 viewport width      u32 viewport height
+//     u32 n ; u8[n]   the HTML document
+//     u32 n ; u8[n]   the user agent stylesheet
+//     u32 n ; u8[n]   the author stylesheet
+//     u32 flags       1 = do NOT narrow (the counter-check: every update
+//                     costs a full pass), 2 = verify every update against
+//                     a full layout
+//     u32 k ; then k commands, each:
+//         u32 op      1 = set the `style` attribute of element #i
+//                     2 = set the text of text node #i
+//                     3 = append a fresh <span>x</span> under element #i
+//                     4 = remove element #i
+//                     5 = set the `class` attribute of element #i
+//         u32 i       the index in document order (elements resp. texts)
+//         u32 n ; u8[n]  the value
+//
+// stdout: one line per command
+//     STEP <k> styled=<n> visited=<n> boxes=<n> laid=<n> total=<n>
+//              scope=<0|1> us_style=<n> us_layout=<n> bad=<n>
+// and at the end
+//     LOAD styled=<n> total=<n> us_style=<n> us_layout=<n>
+//     SUM styled=<n> laid=<n> scopes=<n>
+import std.rt
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import browser.live
+import css.cascade
+import dom.api
+import layout.box
+
+fn read_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+fn lit(out: *mut mem.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+fn kv(out: *mut mem.Buf, p: u64, n: usize, v: u64) {
+    lit(out, p, n)
+    mem.buf_push_dec(out, v)
+    mem.buf_push(out, 32 as u8)
+}
+
+// The n-th element in document order (the document itself is not counted).
+fn elem_at(doc: Gc[Node], i: u32) -> Gc[Node] {
+    var n: u32 = 0
+    var k: Gc[Node] = api.dom_next(doc, doc)
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            if n == i {
+                return k
+            }
+            n = n + 1 as u32
+        }
+        k = api.dom_next(k, doc)
+    }
+    return gc_null[Node]()
+}
+
+fn text_at(doc: Gc[Node], i: u32) -> Gc[Node] {
+    var n: u32 = 0
+    var k: Gc[Node] = api.dom_next(doc, doc)
+    while k != gc_null[Node]() {
+        if k.kind == node.K_TEXT {
+            if n == i {
+                return k
+            }
+            n = n + 1 as u32
+        }
+        k = api.dom_next(k, doc)
+    }
+    return gc_null[Node]()
+}
+
+fn chain_of_bytes(b: *mut mem.Buf, off: usize, n: usize) -> AllocError!Gc[Chain] {
+    let c = try node.chain_new()
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try node.chain_push(c, mem.buf_at(b, off + i) as u32)
+        i = i + 1
+    }
+    return c
+}
+
+fn __gc_finalize(kind: u64, p: *mut u8) {
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    gc_set_max_bytes(1 << 30)
+    var inb: mem.Buf = mem.buf_new()
+    mem.read_all_stdin(&inb)
+    let total: usize = mem.buf_len(&inb)
+    if total < 8 {
+        return 1
+    }
+    let vw: f64 = read_u32(&inb, 0) as f64
+    let vh: f64 = read_u32(&inb, 4) as f64
+    var off: usize = 8
+    let html_n: usize = read_u32(&inb, off) as usize
+    let html_at: usize = off + 4
+    off = html_at + html_n
+    let ua_n: usize = read_u32(&inb, off) as usize
+    let ua_at: usize = off + 4
+    off = ua_at + ua_n
+    let au_n: usize = read_u32(&inb, off) as usize
+    let au_at: usize = off + 4
+    off = au_at + au_n
+    let flags: u32 = read_u32(&inb, off)
+    off = off + 4
+    let ncmd: u32 = read_u32(&inb, off)
+    off = off + 4
+
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    let nm: *mut names.Names = driver.run_names(&run)
+    driver.run_text_out_bytes(&run,
+        ((mem.buf_ptr(&inb) as u64) + html_at as u64) as *mut u8, html_n)
+    let rc: u32 = driver.run_document_build(&run)
+    let doc: Gc[Node] = driver.run_document(&run)
+
+    var l: live.Live = live.live_new(nm)
+    if !live.live_init(&l) {
+        return 92
+    }
+    live.live_set_viewport(&l, vw, vh)
+    live.live_set_scoped(&l, (flags & 1 as u32) == 0 as u32)
+    let oku: bool = live.live_add_ua(&l,
+        ((mem.buf_ptr(&inb) as u64) + ua_at as u64) as *mut u8, ua_n)
+    catch false
+    let oka: bool = live.live_add_sheet(&l, cascade.ORIGIN_AUTHOR,
+        ((mem.buf_ptr(&inb) as u64) + au_at as u64) as *mut u8, au_n)
+    catch false
+    if !live.live_load(&l, doc) {
+        return 93
+    }
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    var k_load: [u8; 13] = "LOAD styled= "
+    var k_total: [u8; 7] = "total= "
+    var k_us1: [u8; 10] = "us_style= "
+    var k_us2: [u8; 11] = "us_layout= "
+    lit(&out, (&k_load[0]) as u64, 12)
+    mem.buf_push_dec(&out, live.live_styled(&l))
+    mem.buf_push(&out, 32 as u8)
+    kv(&out, (&k_total[0]) as u64, 6, live.live_total_boxes(&l))
+    kv(&out, (&k_us1[0]) as u64, 9, live.live_style_us(&l))
+    kv(&out, (&k_us2[0]) as u64, 10, live.live_layout_us(&l))
+    mem.buf_push(&out, 10 as u8)
+
+    var sum_styled: u64 = 0
+    var sum_laid: u64 = 0
+    var c: u32 = 0
+    while c < ncmd {
+        let op: u32 = read_u32(&inb, off)
+        let idx: u32 = read_u32(&inb, off + 4)
+        let vn: usize = read_u32(&inb, off + 8) as usize
+        let vat: usize = off + 12
+        off = vat + vn
+        if op == 1 as u32 || op == 5 as u32 {
+            let e: Gc[Node] = elem_at(doc, idx)
+            if e != gc_null[Node]() {
+                var attr_style: [u8; 5] = "style"
+                var attr_class: [u8; 5] = "class"
+                var at: u32 = 0
+                if op == 1 as u32 {
+                    at = names.names_of_bytes(nm, &attr_style[0], 5)
+                } else {
+                    at = names.names_of_bytes(nm, &attr_class[0], 5)
+                }
+                var cp: mem.CpBuf = mem.cp_new()
+                mem.cp_init(&cp)
+                var q: usize = 0
+                while q < vn {
+                    mem.cp_push(&cp, mem.buf_at(&inb, vat + q) as u32)
+                    q = q + 1
+                }
+                let oks: bool = api.dom_attr_set_text(node.node_as_elem(e),
+                    at, 0, 0, &cp) catch false
+                mem.cp_free(&cp)
+                live.live_mark_style(&l, e)
+            }
+        } else if op == 2 as u32 {
+            let t: Gc[Node] = text_at(doc, idx)
+            if t != gc_null[Node]() {
+                let ch = chain_of_bytes(&inb, vat, vn) catch gc_null[Chain]()
+                let tx: Gc[Text] = t as Gc[Text]
+                tx.data = ch
+                live.live_mark_text(&l, t)
+            }
+        } else if op == 3 as u32 {
+            let e: Gc[Node] = elem_at(doc, idx)
+            if e != gc_null[Node]() {
+                var sp: [u8; 4] = "span"
+                let nid: u32 = names.names_of_bytes(nm, &sp[0], 4)
+                let ne = node.elem_new(nid, node.NS_HTML) catch gc_null[Elem]()
+                if ne != gc_null[Elem]() {
+                    let ch = chain_of_bytes(&inb, vat, vn) catch gc_null[Chain]()
+                    let tn = node.text_new(ch) catch gc_null[Text]()
+                    node.append_child(ne, tn)
+                    node.append_child(e, ne)
+                    live.live_mark_children(&l, e)
+                }
+            }
+        } else if op == 4 as u32 {
+            let e: Gc[Node] = elem_at(doc, idx)
+            if e != gc_null[Node]() {
+                let p: Gc[Node] = e.parent
+                node.kind_remove(e)
+                live.live_mark_children(&l, p)
+            }
+        }
+        let oku2: bool = live.live_update(&l)
+        var bad: u64 = 0
+        if (flags & 2 as u32) != 0 as u32 {
+            bad = live.live_verify(&l)
+        }
+        sum_styled = sum_styled + live.live_styled(&l)
+        sum_laid = sum_laid + live.live_laid(&l)
+        var k_step: [u8; 6] = "STEP \0"
+        lit(&out, (&k_step[0]) as u64, 5)
+        mem.buf_push_dec(&out, c as u64)
+        mem.buf_push(&out, 32 as u8)
+        var k_st: [u8; 8] = "styled= "
+        var k_vi: [u8; 9] = "visited= "
+        var k_bo: [u8; 7] = "boxes= "
+        var k_la: [u8; 6] = "laid= "
+        var k_sc: [u8; 7] = "scope= "
+        var k_ba: [u8; 5] = "bad= "
+        kv(&out, (&k_st[0]) as u64, 7, live.live_styled(&l))
+        kv(&out, (&k_vi[0]) as u64, 8, live.live_visited(&l))
+        kv(&out, (&k_bo[0]) as u64, 6, live.live_boxed(&l))
+        kv(&out, (&k_la[0]) as u64, 5, live.live_laid(&l))
+        kv(&out, (&k_total[0]) as u64, 6, live.live_total_boxes(&l))
+        kv(&out, (&k_sc[0]) as u64, 6, live.live_scope_hit(&l))
+        kv(&out, (&k_us1[0]) as u64, 9, live.live_style_us(&l))
+        kv(&out, (&k_us2[0]) as u64, 10, live.live_layout_us(&l))
+        kv(&out, (&k_ba[0]) as u64, 4, bad)
+        mem.buf_push(&out, 10 as u8)
+        if (flags & 4 as u32) != 0 as u32 {
+            var dmp: mem.Buf = mem.buf_new()
+            mem.buf_init(&dmp)
+            live.live_dump(&l, &dmp)
+            mem.buf_flush(&dmp, 2)
+            mem.buf_free(&dmp)
+        }
+        c = c + 1 as u32
+    }
+    var k_sum: [u8; 12] = "SUM styled= "
+    lit(&out, (&k_sum[0]) as u64, 12)
+    mem.buf_push_dec(&out, sum_styled)
+    mem.buf_push(&out, 32 as u8)
+    var k_sl: [u8; 6] = "laid= "
+    var k_sh: [u8; 9] = "scopes=  "
+    kv(&out, (&k_sl[0]) as u64, 5, sum_laid)
+    kv(&out, (&k_sh[0]) as u64, 7, live.live_scope_hit(&l))
+    mem.buf_push(&out, 10 as u8)
+    mem.buf_flush(&out, 1)
+    live.live_free(&l)
+    driver.run_tree_release(&run)
+    return 0
+}

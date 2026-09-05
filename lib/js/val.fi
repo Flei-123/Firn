@@ -1,0 +1,1444 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/js/val.fi -- the JAVASCRIPT VALUES AND THE OBJECT MODEL, in the GC
+// heap (ECMA-262 clauses 6 and 10).
+//
+// EVERY JavaScript value is a `Gc[JsVal]`. There is no tagged word, no
+// NaN boxing, no immediate. That is a deliberate decision and the reason is
+// the collector: it scans the stack CONSERVATIVELY (SPEC 3.5.3), so it
+// recognizes a pointer by its bit pattern. A NaN boxed pointer, with its
+// high bits set, would not be recognized -- the object would be collected
+// while a local variable still held it. A packed small integer would be
+// harmless in the other direction (`__gc_mark` finds no block for it), but
+// the pointer case is fatal, and a representation that is only half safe is
+// worth nothing.
+//
+// So:
+//
+//     JsVal   tag                     the base class, `tag` at offset 0
+//      +-- JsNum   bits               an IEEE 754 double as a bit pattern
+//      +-- JsStr   units, n, hash     UTF-16, one code unit per slot
+//      +-- JsSym   desc, sid          a symbol with its own identity
+//      +-- JsObj   proto, props, ...  everything with properties
+//
+// `undefined`, `null`, `true` and `false` are four SINGLETONS of the realm
+// -- one object each, not one per use. `gc class` gives the prefix layout
+// and with it the free upcast (SPEC 4.4), so a property value, an array
+// element and a variable binding are all simply `Gc[JsVal]`, and the
+// collector traces them through the compiler generated type table. No
+// special path, no external root.
+//
+// THE PRICE, named: a number costs a heap object of 24 octets instead of 8.
+// `realm_num` therefore keeps a cache for the small integers -128..1024 and
+// for the four constants; every other number allocates. That is what makes
+// the collector work in an interpreter loop -- and it is exactly what the
+// soak run of this round measures.
+//
+// PROPERTIES. An object carries a `GcMap` from the KEY NUMBER to a `Prop`
+// (value, setter, attributes) plus a `GcVec` with the key numbers in
+// insertion order (9.1.11 OrdinaryOwnPropertyKeys). A key number is
+// `((id + 1) << 1) | is_symbol`; the shift keeps the values 0 and 1 free,
+// which `GcMap` reserves for "empty" and "tombstone".
+//
+// ARRAY ELEMENTS lie densely in `elems`, one slot per index, gaps marked
+// with the `gap` singleton. That is the shape almost every array really
+// has; an array that is used sparsely pays with memory, not with wrong
+// behaviour.
+import html.mem
+import str.ucd
+import std.math
+import js.lex
+import js.ast
+
+export {
+    JsVal, JsNum, JsStr, JsBool, JsSym, JsObj, Prop, Env, Realm,
+    JsBigInt, JsGenObj, JsPromise, GenFrame, GenState,
+    JsRegExp, regexp_new, as_regexp,
+    TAG_UNDEF, TAG_NULL, TAG_BOOL, TAG_NUM, TAG_STR, TAG_SYM, TAG_OBJ,
+    TAG_GAP, TAG_BIGINT,
+    is_bigint, as_bigint, bigint_new, bigint_limbs, bigint_sign,
+    genobj_new, as_genobj, promise_new, as_promise,
+    frame_new, genstate_new,
+    G_SUSPENDED_START, G_SUSPENDED_YIELD, G_EXECUTING, G_COMPLETED,
+    GK_SYNC, GK_ASYNC, GK_ASYNC_GEN,
+    P_PENDING, P_FULFILLED, P_REJECTED,
+    realm_jobs, realm_job_push, realm_job_shift, realm_private_key,
+    CLS_ORDINARY, CLS_ARRAY, CLS_FUNCTION, CLS_NATIVE, CLS_BOUND,
+    CLS_ARGUMENTS, CLS_ERROR, CLS_BOOLEAN, CLS_NUMBER, CLS_STRING,
+    CLS_MATH, CLS_JSON, CLS_MAP, CLS_SET, CLS_SYMBOL, CLS_REGEXP,
+    CLS_DEFAULT_CTOR,
+    CLS_PROXY_FREE,
+    CLS_ITERATOR, CLS_WEAKMAP, CLS_WEAKSET, CLS_WEAKREF, CLS_FINREG,
+    CLS_DATE, CLS_PROXY,
+    A_WRITABLE, A_ENUMERABLE, A_CONFIGURABLE, A_ACCESSOR, A_DEFAULT,
+    F_EXTENSIBLE, F_STRICT, F_ARROW, F_CTOR, F_CLASS_CTOR, F_DERIVED,
+    F_METHOD, F_HAS_THIS,
+    ENV_DECL, ENV_OBJECT, ENV_FUNCTION, ENV_GLOBAL,
+    P_MUTABLE, P_INITIALIZED, P_STRICT_FN,
+    realm_new, realm_ctx, realm_set_ctx,
+    val_tag, is_undefined, is_null, is_nullish, is_bool, is_number,
+    is_string, is_symbol, is_object, is_callable, is_gap,
+    as_num, as_str, as_obj, as_sym, as_bool,
+    num_value, bool_value,
+    realm_num, realm_bool, realm_undefined, realm_null, realm_gap,
+    make_num, make_bool_val,
+    str_new, str_from_ascii, str_from_ast, str_from_units, str_empty,
+    str_len, str_at, str_push, str_hash, str_equal, str_compare,
+    str_concat, str_slice, str_index_of, str_of_name,
+    sym_new, sym_desc, sym_id,
+    obj_new, obj_new_proto, obj_proto, obj_set_proto,
+    obj_get_own, obj_put_own, obj_delete_own, obj_has_own,
+    obj_key_count, obj_key_at, obj_own_string_keys,
+    obj_class, obj_set_class, obj_flags, obj_set_flags,
+    prop_value, prop_setter, prop_attrs, prop_set_value, prop_set_attrs,
+    prop_is_accessor,
+    elems_get, elems_set, elems_len, elems_push, elems_ensure,
+    elems_dense_ok, DENSE_LIMIT,
+    array_new, array_length, array_set_length,
+    key_for_name, key_for_str, key_for_symbol, key_is_symbol, key_id,
+    key_for_index, index_of_key, key_name_str,
+    intern_units, intern_ascii, intern_count, intern_str,
+    env_new, env_parent, env_lookup, env_declare, env_set_slot,
+    env_get_slot, env_slot_flags, env_set_flags, env_object, env_kind,
+    env_this, env_set_this, env_has_this, env_func,
+    realm_global, realm_set_global, realm_proto, realm_set_proto,
+    PROTO_OBJECT, PROTO_FUNCTION, PROTO_ARRAY, PROTO_STRING, PROTO_NUMBER,
+    PROTO_BOOLEAN, PROTO_ERROR, PROTO_SYMBOL, PROTO_MAP, PROTO_SET,
+    PROTO_TYPE_ERROR, PROTO_RANGE_ERROR, PROTO_SYNTAX_ERROR,
+    PROTO_REFERENCE_ERROR, PROTO_EVAL_ERROR, PROTO_URI_ERROR,
+    PROTO_ITERATOR, PROTO_GENERATOR, PROTO_GENERATOR_FUNCTION,
+    PROTO_ASYNC_ITERATOR, PROTO_ASYNC_GENERATOR,
+    PROTO_ASYNC_GENERATOR_FUNCTION, PROTO_ASYNC_FUNCTION, PROTO_PROMISE,
+    PROTO_BIGINT,
+    PROTO_ARRAY_ITERATOR, PROTO_STRING_ITERATOR, PROTO_MAP_ITERATOR,
+    PROTO_SET_ITERATOR, PROTO_REGEXP_STRING_ITERATOR, PROTO_WEAKMAP,
+    PROTO_WEAKSET, PROTO_WEAKREF, PROTO_FINREG, PROTO_AGGREGATE_ERROR,
+    PROTO_REGEXP, PROTO_DATE,
+    PROTO_COUNT,
+    realm_names, realm_ast, realm_set_ast,
+    WELL_KNOWN_ITERATOR, WELL_KNOWN_TOPRIMITIVE, WELL_KNOWN_TOSTRINGTAG,
+    WELL_KNOWN_HASINSTANCE, WELL_KNOWN_ASYNCITERATOR, WELL_KNOWN_SPECIES,
+    WELL_KNOWN_MATCH, WELL_KNOWN_MATCHALL, WELL_KNOWN_REPLACE,
+    WELL_KNOWN_SEARCH, WELL_KNOWN_SPLIT, WELL_KNOWN_ISCONCATSPREADABLE,
+    WELL_KNOWN_UNSCOPABLES,
+    WELL_KNOWN_COUNT,
+    realm_registry, realm_set_registry, realm_rand, realm_set_rand,
+    realm_well_known, realm_set_well_known,
+}
+
+// ---------------------------------------------------------------- The tags
+
+const TAG_UNDEF: u64 = 0
+const TAG_NULL: u64 = 1
+const TAG_BOOL: u64 = 2
+const TAG_NUM: u64 = 3
+const TAG_STR: u64 = 4
+const TAG_SYM: u64 = 5
+const TAG_OBJ: u64 = 6
+const TAG_GAP: u64 = 7 // an absent array element -- never visible to JS
+const TAG_BIGINT: u64 = 8 // round 66: the second numeric type
+
+// The kinds of an object.
+const CLS_ORDINARY: u64 = 0
+const CLS_ARRAY: u64 = 1
+const CLS_FUNCTION: u64 = 2
+const CLS_NATIVE: u64 = 3
+const CLS_BOUND: u64 = 4
+const CLS_ARGUMENTS: u64 = 5
+const CLS_ERROR: u64 = 6
+const CLS_BOOLEAN: u64 = 7
+const CLS_NUMBER: u64 = 8
+const CLS_STRING: u64 = 9
+const CLS_MATH: u64 = 10
+const CLS_JSON: u64 = 11
+const CLS_MAP: u64 = 12
+const CLS_SET: u64 = 13
+const CLS_SYMBOL: u64 = 14
+const CLS_REGEXP: u64 = 15
+const CLS_PROXY_FREE: u64 = 16
+// The constructor a class WITHOUT one gets (15.7.14): it creates the
+// object and, in a derived class, forwards every argument to the parent.
+const CLS_DEFAULT_CTOR: u64 = 17
+// Round 74.
+const CLS_ITERATOR: u64 = 18
+const CLS_WEAKMAP: u64 = 19
+const CLS_WEAKSET: u64 = 20
+const CLS_WEAKREF: u64 = 21
+const CLS_FINREG: u64 = 22
+const CLS_DATE: u64 = 23
+const CLS_PROXY: u64 = 24
+
+// The property attributes (6.1.7.1).
+const A_WRITABLE: u64 = 1
+const A_ENUMERABLE: u64 = 2
+const A_CONFIGURABLE: u64 = 4
+const A_ACCESSOR: u64 = 8
+const A_DEFAULT: u64 = 7
+
+// The flags of an object.
+const F_EXTENSIBLE: u64 = 1
+const F_STRICT: u64 = 2
+const F_ARROW: u64 = 4
+const F_CTOR: u64 = 8
+const F_CLASS_CTOR: u64 = 16
+const F_DERIVED: u64 = 32
+const F_METHOD: u64 = 64
+const F_HAS_THIS: u64 = 128
+
+// The kinds of an environment record (9.1).
+const ENV_DECL: u64 = 0
+const ENV_OBJECT: u64 = 1
+const ENV_FUNCTION: u64 = 2
+const ENV_GLOBAL: u64 = 3
+
+// The flags of a binding.
+const P_MUTABLE: u64 = 1
+const P_INITIALIZED: u64 = 2
+const P_STRICT_FN: u64 = 4
+
+// The prototypes the realm holds.
+const PROTO_OBJECT: u64 = 0
+const PROTO_FUNCTION: u64 = 1
+const PROTO_ARRAY: u64 = 2
+const PROTO_STRING: u64 = 3
+const PROTO_NUMBER: u64 = 4
+const PROTO_BOOLEAN: u64 = 5
+const PROTO_ERROR: u64 = 6
+const PROTO_SYMBOL: u64 = 7
+const PROTO_MAP: u64 = 8
+const PROTO_SET: u64 = 9
+const PROTO_TYPE_ERROR: u64 = 10
+const PROTO_RANGE_ERROR: u64 = 11
+const PROTO_SYNTAX_ERROR: u64 = 12
+const PROTO_REFERENCE_ERROR: u64 = 13
+const PROTO_EVAL_ERROR: u64 = 14
+const PROTO_URI_ERROR: u64 = 15
+const PROTO_ITERATOR: u64 = 16
+// Round 66.
+const PROTO_GENERATOR: u64 = 17
+const PROTO_GENERATOR_FUNCTION: u64 = 18
+const PROTO_ASYNC_ITERATOR: u64 = 19
+const PROTO_ASYNC_GENERATOR: u64 = 20
+const PROTO_ASYNC_GENERATOR_FUNCTION: u64 = 21
+const PROTO_ASYNC_FUNCTION: u64 = 22
+const PROTO_PROMISE: u64 = 23
+const PROTO_BIGINT: u64 = 24
+// Round 74: the iterators of the ordinary collections, the weak pair, the
+// regular expressions, the dates and AggregateError.
+const PROTO_ARRAY_ITERATOR: u64 = 25
+const PROTO_STRING_ITERATOR: u64 = 26
+const PROTO_MAP_ITERATOR: u64 = 27
+const PROTO_SET_ITERATOR: u64 = 28
+const PROTO_REGEXP_STRING_ITERATOR: u64 = 29
+const PROTO_WEAKMAP: u64 = 30
+const PROTO_WEAKSET: u64 = 31
+const PROTO_WEAKREF: u64 = 32
+const PROTO_FINREG: u64 = 33
+const PROTO_AGGREGATE_ERROR: u64 = 34
+const PROTO_REGEXP: u64 = 35
+const PROTO_DATE: u64 = 36
+const PROTO_COUNT: u64 = 37
+
+const WELL_KNOWN_ITERATOR: u64 = 0
+const WELL_KNOWN_TOPRIMITIVE: u64 = 1
+const WELL_KNOWN_TOSTRINGTAG: u64 = 2
+const WELL_KNOWN_HASINSTANCE: u64 = 3
+const WELL_KNOWN_ASYNCITERATOR: u64 = 4
+const WELL_KNOWN_SPECIES: u64 = 5
+// Round 74: the protocols that a regular expression and the spread take
+// part in.
+const WELL_KNOWN_MATCH: u64 = 6
+const WELL_KNOWN_MATCHALL: u64 = 7
+const WELL_KNOWN_REPLACE: u64 = 8
+const WELL_KNOWN_SEARCH: u64 = 9
+const WELL_KNOWN_SPLIT: u64 = 10
+const WELL_KNOWN_ISCONCATSPREADABLE: u64 = 11
+const WELL_KNOWN_UNSCOPABLES: u64 = 12
+const WELL_KNOWN_COUNT: u64 = 13
+
+// ========================================================== The gc classes
+
+gc class JsVal {
+    tag: u64,
+}
+
+gc class JsNum extends JsVal {
+    bits: u64,
+}
+
+gc class JsBool extends JsVal {
+    on: u64,
+}
+
+gc class JsStr extends JsVal {
+    units: Gc[GcVec],
+    n: u64,
+    hash: u64,
+}
+
+gc class JsSym extends JsVal {
+    desc: Gc[JsVal],
+    sid: u64,
+}
+
+gc class Prop {
+    value: Gc[JsVal],
+    setter: Gc[JsVal],
+    attrs: u64,
+}
+
+gc class Env {
+    parent: Gc[Env],
+    names: Gc[GcMap],
+    vals: Gc[GcVec],
+    flags: Gc[GcVec],
+    obj: Gc[JsObj],
+    this_val: Gc[JsVal],
+    func: Gc[JsObj],
+    kind: u64,
+    has_this: u64,
+}
+
+gc class JsObj extends JsVal {
+    proto: Gc[JsObj],
+    props: Gc[GcMap],
+    order: Gc[GcVec],
+    elems: Gc[GcVec],
+    env: Gc[Env],
+    prim: Gc[JsVal],
+    extra: Gc[JsObj],
+    cls: u64,
+    node: u64,
+    native: u64,
+    flags: u64,
+    len: u64,
+}
+
+// A BIGINT (round 66). The magnitude lies as base 2^32 limbs, least
+// significant first, in a RAW vector -- no pointers in it, so the collector
+// walks it without looking at the contents. Zero has no limbs and the sign
+// 0; there is no negative zero.
+gc class JsBigInt extends JsVal {
+    limbs: Gc[GcVec],
+    sign: u64,
+}
+
+// A REGULAR EXPRESSION (round 74). The compiled pattern is a TREE OF
+// NODES in a raw vector -- eight `u64` columns per node, no pointers
+// inside, so the collector walks it without looking at the contents, just
+// like the syntax tree of the engine itself lies outside the heap. What
+// the collector does have to see are the two texts and the group names.
+gc class JsRegExp extends JsObj {
+    prog: Gc[GcVec],
+    sets: Gc[GcVec],
+    source: Gc[JsVal],
+    flag_text: Gc[JsVal],
+    group_names: Gc[GcVec],
+    ngroups: u64,
+    fbits: u64,
+}
+
+fn regexp_new(r: Gc[Realm], proto: Gc[JsObj]) -> AllocError!Gc[JsRegExp] {
+    let o: Gc[JsRegExp] = try gc JsRegExp {
+        tag: TAG_OBJ,
+        proto: proto,
+        props: try gcmap_new(false, true),
+        order: try gcvec_new_raw(),
+        elems: gc_null[GcVec](),
+        env: gc_null[Env](),
+        prim: gc_null[JsVal](),
+        extra: gc_null[JsObj](),
+        cls: CLS_REGEXP,
+        node: 0,
+        native: 0,
+        flags: F_EXTENSIBLE,
+        len: 0,
+        prog: try gcvec_new_raw(),
+        sets: try gcvec_new_raw(),
+        source: gc_null[JsVal](),
+        flag_text: gc_null[JsVal](),
+        group_names: try gcvec_new(),
+        ngroups: 0,
+        fbits: 0,
+    }
+    return o
+}
+
+fn as_regexp(v: Gc[JsVal]) -> Gc[JsRegExp] {
+    return v.as?[JsRegExp]
+}
+
+// ONE frame of a suspended function body. The frames form a linked stack in
+// the GC heap; that is the whole point of round 66: a generator that nobody
+// holds any more is collected like every other object, and a live one is
+// traced through the compiler generated type table -- no external root, no
+// pinning, no second stack the collector would have to know about.
+gc class GenFrame {
+    next: Gc[GenFrame],
+    env: Gc[Env],
+    a: Gc[JsVal],
+    b: Gc[JsVal],
+    c: Gc[JsVal],
+    list: Gc[GcVec],
+    obj: Gc[JsObj],
+    node: u64,
+    state: u64,
+    i: u64,
+    n: u64,
+    flag: u64,
+    fk: u64,
+}
+
+// The state of ONE suspended body.
+gc class GenState {
+    frame: Gc[GenFrame],
+    env: Gc[Env],
+    result: Gc[JsVal],
+    sent: Gc[JsVal],
+    fnobj: Gc[JsObj],
+    cap: Gc[JsObj],
+    queue: Gc[GcVec],
+    status: u64,
+    kind: u64,
+    body: u64,
+    running: u64,
+    mode: u64,
+    done: u64,
+}
+
+const G_SUSPENDED_START: u64 = 0
+const G_SUSPENDED_YIELD: u64 = 1
+const G_EXECUTING: u64 = 2
+const G_COMPLETED: u64 = 3
+
+const GK_SYNC: u64 = 0
+const GK_ASYNC: u64 = 1
+const GK_ASYNC_GEN: u64 = 2
+
+// A generator object is an ordinary object PLUS its suspended body. It is
+// a subclass instead of a field in `JsObj`, so that the ordinary object --
+// of which a program makes millions -- does not grow by eight octets.
+gc class JsGenObj extends JsObj {
+    gs: Gc[GenState],
+}
+
+const P_PENDING: u64 = 0
+const P_FULFILLED: u64 = 1
+const P_REJECTED: u64 = 2
+
+// A promise: the state, the settled value and the two reaction lists.
+gc class JsPromise extends JsObj {
+    value: Gc[JsVal],
+    on_ok: Gc[GcVec],
+    on_err: Gc[GcVec],
+    pstate: u64,
+    handled: u64,
+}
+
+gc class Realm {
+    global: Gc[JsObj],
+    global_env: Gc[Env],
+    protos: Gc[GcVec],
+    well_known: Gc[GcVec],
+    num_cache: Gc[GcVec],
+    intern_vals: Gc[GcVec],
+    intern_index: Gc[GcMap],
+    name_keys: Gc[GcVec],
+    undef: Gc[JsVal],
+    nul: Gc[JsVal],
+    yes: Gc[JsVal],
+    no: Gc[JsVal],
+    gap: Gc[JsVal],
+    empty_str: Gc[JsVal],
+    pending: Gc[JsVal],
+    jobs: Gc[GcVec],
+    priv_syms: Gc[GcMap],
+    // Round 74: the registry of `Symbol.for` (one symbol per description)
+    // and the state of `Math.random`.
+    registry: Gc[JsObj],
+    ctx: *mut u8,
+    names: *mut u8,
+    tree: *mut u8,
+    next_sym: u64,
+    depth: u64,
+    rand: u64,
+    // Round 95: the generated Unicode table
+    // (generated/unicode_tables.fi). Stage 0 has no global variables, so
+    // the pointer lives in the realm -- next to `ctx`, `names` and `tree`,
+    // which are handed around the same way. 0 means the mapping failed;
+    // every lookup then answers as if the code point were unassigned.
+    ucdtab: u64,
+}
+
+// ---------------------------------------------------------- Small helpers
+
+fn val_tag(v: Gc[JsVal]) -> u64 {
+    if (v as u64) == 0 {
+        return TAG_UNDEF
+    }
+    return v.tag
+}
+
+fn is_undefined(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_UNDEF }
+fn is_null(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_NULL }
+fn is_bool(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_BOOL }
+fn is_number(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_NUM }
+fn is_string(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_STR }
+fn is_symbol(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_SYM }
+fn is_object(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_OBJ }
+fn is_gap(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_GAP }
+
+fn is_bigint(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_BIGINT }
+
+fn is_nullish(v: Gc[JsVal]) -> bool {
+    let t: u64 = val_tag(v)
+    return t == TAG_UNDEF || t == TAG_NULL
+}
+
+fn as_num(v: Gc[JsVal]) -> Gc[JsNum] { return v.as?[JsNum] }
+fn as_str(v: Gc[JsVal]) -> Gc[JsStr] { return v.as?[JsStr] }
+fn as_obj(v: Gc[JsVal]) -> Gc[JsObj] { return v.as?[JsObj] }
+fn as_sym(v: Gc[JsVal]) -> Gc[JsSym] { return v.as?[JsSym] }
+fn as_bool(v: Gc[JsVal]) -> Gc[JsBool] { return v.as?[JsBool] }
+
+fn num_value(v: Gc[JsVal]) -> f64 {
+    let n: Gc[JsNum] = v.as?[JsNum]
+    if (n as u64) == 0 {
+        return math.math_f64(0x7FF8000000000000)
+    }
+    return math.math_f64(n.bits)
+}
+
+fn bool_value(v: Gc[JsVal]) -> bool {
+    let b: Gc[JsBool] = v.as?[JsBool]
+    if (b as u64) == 0 {
+        return false
+    }
+    return b.on == 1
+}
+
+fn as_bigint(v: Gc[JsVal]) -> Gc[JsBigInt] { return v.as?[JsBigInt] }
+
+fn bigint_new(r: Gc[Realm], limbs: Gc[GcVec], sign: u64) -> AllocError!Gc[JsVal] {
+    let b: Gc[JsBigInt] = try gc JsBigInt {
+        tag: TAG_BIGINT, limbs: limbs, sign: sign,
+    }
+    let v: Gc[JsVal] = b
+    return v
+}
+
+fn bigint_limbs(v: Gc[JsVal]) -> Gc[GcVec] {
+    let b: Gc[JsBigInt] = v.as?[JsBigInt]
+    if (b as u64) == 0 {
+        return gc_null[GcVec]()
+    }
+    return b.limbs
+}
+
+fn bigint_sign(v: Gc[JsVal]) -> u64 {
+    let b: Gc[JsBigInt] = v.as?[JsBigInt]
+    if (b as u64) == 0 {
+        return 0
+    }
+    return b.sign
+}
+
+// A generator object -- an object with a suspended body hanging on it.
+fn genobj_new(r: Gc[Realm], proto: Gc[JsObj]) -> AllocError!Gc[JsGenObj] {
+    return try gc JsGenObj {
+        tag: TAG_OBJ,
+        proto: proto,
+        props: try gcmap_new(false, true),
+        order: try gcvec_new_raw(),
+        elems: gc_null[GcVec](),
+        env: gc_null[Env](),
+        prim: gc_null[JsVal](),
+        extra: gc_null[JsObj](),
+        cls: CLS_ORDINARY,
+        node: 0,
+        native: 0,
+        flags: F_EXTENSIBLE,
+        len: 0,
+        gs: gc_null[GenState](),
+    }
+}
+
+fn as_genobj(v: Gc[JsVal]) -> Gc[JsGenObj] { return v.as?[JsGenObj] }
+
+fn promise_new(r: Gc[Realm], proto: Gc[JsObj]) -> AllocError!Gc[JsPromise] {
+    return try gc JsPromise {
+        tag: TAG_OBJ,
+        proto: proto,
+        props: try gcmap_new(false, true),
+        order: try gcvec_new_raw(),
+        elems: gc_null[GcVec](),
+        env: gc_null[Env](),
+        prim: gc_null[JsVal](),
+        extra: gc_null[JsObj](),
+        cls: CLS_ORDINARY,
+        node: 0,
+        native: 0,
+        flags: F_EXTENSIBLE,
+        len: 0,
+        value: r.undef,
+        on_ok: try gcvec_new(),
+        on_err: try gcvec_new(),
+        pstate: P_PENDING,
+        handled: 0,
+    }
+}
+
+fn as_promise(v: Gc[JsVal]) -> Gc[JsPromise] { return v.as?[JsPromise] }
+
+fn frame_new(r: Gc[Realm], node: u32, env: Gc[Env],
+    below: Gc[GenFrame]) -> AllocError!Gc[GenFrame] {
+    return try gc GenFrame {
+        next: below,
+        env: env,
+        a: r.undef,
+        b: r.undef,
+        c: r.undef,
+        list: gc_null[GcVec](),
+        obj: gc_null[JsObj](),
+        node: node as u64,
+        state: 0,
+        i: 0,
+        n: 0,
+        flag: 0,
+        fk: 0,
+    }
+}
+
+fn genstate_new(r: Gc[Realm], f: Gc[JsObj], env: Gc[Env], body: u32,
+    kind: u64) -> AllocError!Gc[GenState] {
+    return try gc GenState {
+        frame: gc_null[GenFrame](),
+        env: env,
+        result: r.undef,
+        sent: r.undef,
+        fnobj: f,
+        cap: gc_null[JsObj](),
+        queue: gc_null[GcVec](),
+        status: G_SUSPENDED_START,
+        kind: kind,
+        body: body as u64,
+        running: 0,
+        mode: 0,
+        done: 0,
+    }
+}
+
+// The job queue of the realm (9.5 -- the microtasks of the promises).
+fn realm_jobs(r: Gc[Realm]) -> Gc[GcVec] { return r.jobs }
+
+// The key of a PRIVATE class element (15.7). It is a SYMBOL key, so that a
+// private field never appears in `Object.keys`, in a `for ... in` or in
+// `JSON.stringify` -- exactly the behaviour the specification asks for.
+// The honest limit: the key hangs on the NAME, not on the class
+// evaluation, so two classes with the same `#x` share it (docs/ROUND66.md).
+fn realm_private_key(r: Gc[Realm], name: u32,
+    desc: Gc[JsVal]) -> AllocError!u64 {
+    let have: u64 = gcmap_get(r.priv_syms, name as u64 + 1, 0)
+    if have != 0 {
+        return have
+    }
+    let sym: Gc[JsVal] = try sym_new(r, desc)
+    let k: u64 = key_for_symbol(sym)
+    let ok: bool = try gcmap_set(r.priv_syms, name as u64 + 1, k)
+    return k
+}
+
+fn realm_job_push(r: Gc[Realm], job: Gc[JsVal]) -> AllocError!bool {
+    return gcvec_append[JsVal](r.jobs, job)
+}
+
+fn realm_job_shift(r: Gc[Realm]) -> Gc[JsVal] {
+    if gcvec_length(r.jobs) == 0 {
+        return r.undef
+    }
+    let v: Gc[JsVal] = gcvec_read[JsVal](r.jobs, 0)
+    let ok: bool = gcvec_remove(r.jobs, 0)
+    return v
+}
+
+fn is_callable(v: Gc[JsVal]) -> bool {
+    let o: Gc[JsObj] = v.as?[JsObj]
+    if (o as u64) == 0 {
+        return false
+    }
+    let c: u64 = o.cls
+    return c == CLS_FUNCTION || c == CLS_NATIVE || c == CLS_BOUND || c == CLS_DEFAULT_CTOR
+}
+
+// ================================================================ The realm
+
+fn realm_new() -> AllocError!Gc[Realm] {
+    let u: Gc[JsVal] = try gc JsVal { tag: TAG_UNDEF }
+    let n: Gc[JsVal] = try gc JsVal { tag: TAG_NULL }
+    let h: Gc[JsVal] = try gc JsVal { tag: TAG_GAP }
+    let yb: Gc[JsBool] = try gc JsBool { tag: TAG_BOOL, on: 1 }
+    let nb: Gc[JsBool] = try gc JsBool { tag: TAG_BOOL, on: 0 }
+    let y: Gc[JsVal] = yb
+    let no: Gc[JsVal] = nb
+    let protos: Gc[GcVec] = try gcvec_new()
+    var i: u64 = 0
+    while i < PROTO_COUNT {
+        let ok: bool = try gcvec_append_raw(protos, 0)
+        i = i + 1
+    }
+    let wk: Gc[GcVec] = try gcvec_new()
+    i = 0
+    while i < WELL_KNOWN_COUNT {
+        let ok: bool = try gcvec_append_raw(wk, 0)
+        i = i + 1
+    }
+    let r: Gc[Realm] = try gc Realm {
+        global: gc_null[JsObj](),
+        global_env: gc_null[Env](),
+        protos: protos,
+        well_known: wk,
+        num_cache: try gcvec_new(),
+        intern_vals: try gcvec_new(),
+        intern_index: try gcmap_new(false, true),
+        name_keys: try gcvec_new_raw(),
+        undef: u, nul: n, yes: y, no: no, gap: h,
+        empty_str: gc_null[JsVal](),
+        pending: u,
+        jobs: try gcvec_new(),
+        priv_syms: try gcmap_new(false, false),
+        registry: gc_null[JsObj](),
+        ctx: 0 as *mut u8, names: 0 as *mut u8, tree: 0 as *mut u8,
+        next_sym: 1, depth: 0,
+        // The seed of `Math.random`: a fixed odd number. This engine has no
+        // clock and does not pretend to have one -- see docs/ROUND74.md.
+        rand: 0x9E3779B97F4A7C15,
+        ucdtab: ucd.ucd_map(),
+    }
+    let e: Gc[JsStr] = try str_new(r)
+    let ev: Gc[JsVal] = e
+    r.empty_str = ev
+    return r
+}
+
+fn realm_registry(r: Gc[Realm]) -> Gc[JsObj] { return r.registry }
+fn realm_set_registry(r: Gc[Realm], o: Gc[JsObj]) { r.registry = o }
+fn realm_rand(r: Gc[Realm]) -> u64 { return r.rand }
+fn realm_set_rand(r: Gc[Realm], v: u64) { r.rand = v }
+
+fn realm_ctx(r: Gc[Realm]) -> *mut u8 { return r.ctx }
+fn realm_set_ctx(r: Gc[Realm], p: *mut u8) { r.ctx = p }
+fn realm_names(r: Gc[Realm]) -> *mut lex.Names { return r.names as *mut lex.Names }
+fn realm_ast(r: Gc[Realm]) -> *mut ast.Ast { return r.tree as *mut ast.Ast }
+fn realm_set_ast(r: Gc[Realm], t: *mut ast.Ast, nm: *mut lex.Names) {
+    r.tree = t as *mut u8
+    r.names = nm as *mut u8
+}
+
+fn realm_undefined(r: Gc[Realm]) -> Gc[JsVal] { return r.undef }
+fn realm_null(r: Gc[Realm]) -> Gc[JsVal] { return r.nul }
+fn realm_gap(r: Gc[Realm]) -> Gc[JsVal] { return r.gap }
+
+fn realm_bool(r: Gc[Realm], on: bool) -> Gc[JsVal] {
+    if on {
+        return r.yes
+    }
+    return r.no
+}
+
+fn realm_global(r: Gc[Realm]) -> Gc[JsObj] { return r.global }
+fn realm_set_global(r: Gc[Realm], o: Gc[JsObj], e: Gc[Env]) {
+    r.global = o
+    r.global_env = e
+}
+
+fn realm_proto(r: Gc[Realm], which: u64) -> Gc[JsObj] {
+    return gcvec_read[JsObj](r.protos, which)
+}
+
+fn realm_set_proto(r: Gc[Realm], which: u64, o: Gc[JsObj]) {
+    let ok: bool = gcvec_set[JsObj](r.protos, which, o)
+}
+
+fn realm_well_known(r: Gc[Realm], which: u64) -> Gc[JsVal] {
+    return gcvec_read[JsVal](r.well_known, which)
+}
+
+fn realm_set_well_known(r: Gc[Realm], which: u64, v: Gc[JsVal]) {
+    let ok: bool = gcvec_set[JsVal](r.well_known, which, v)
+}
+
+// The number cache. -128 .. 1024 plus NaN and the infinities cover almost
+// every intermediate value of a loop; everything else allocates.
+fn make_num(r: Gc[Realm], x: f64) -> AllocError!Gc[JsVal] {
+    let n: Gc[JsNum] = try gc JsNum { tag: TAG_NUM, bits: math.math_bits(x) }
+    let v: Gc[JsVal] = n
+    return v
+}
+
+fn realm_num(r: Gc[Realm], x: f64) -> AllocError!Gc[JsVal] {
+    // Only exact small integers land in the cache -- and -0 must not,
+    // because it is a different value from 0 for `Object.is`.
+    if x >= 0.0 && x <= 1024.0 && math.math_bits(x) != 0x8000000000000000 {
+        let i: u64 = x as u64
+        if (i as f64) == x {
+            if gcvec_length(r.num_cache) == 0 {
+                var k: u64 = 0
+                while k <= 1024 {
+                    let e: Gc[JsVal] = try make_num(r, k as f64)
+                    let ok: bool = try gcvec_append[JsVal](r.num_cache, e)
+                    k = k + 1
+                }
+            }
+            return gcvec_read[JsVal](r.num_cache, i)
+        }
+    }
+    return make_num(r, x)
+}
+
+fn make_bool_val(r: Gc[Realm], on: bool) -> Gc[JsVal] {
+    return realm_bool(r, on)
+}
+
+// =============================================================== Strings
+
+fn str_new(r: Gc[Realm]) -> AllocError!Gc[JsStr] {
+    return try gc JsStr { tag: TAG_STR, units: try gcvec_new_raw(), n: 0, hash: 0 }
+}
+
+fn str_len(s: Gc[JsVal]) -> u64 {
+    let x: Gc[JsStr] = s.as?[JsStr]
+    if (x as u64) == 0 {
+        return 0
+    }
+    return x.n
+}
+
+fn str_at(s: Gc[JsVal], i: u64) -> u32 {
+    let x: Gc[JsStr] = s.as?[JsStr]
+    if (x as u64) == 0 || i >= x.n {
+        return 0
+    }
+    return gcvec_read_raw(x.units, i) as u32
+}
+
+fn str_push(s: Gc[JsStr], u: u32) -> AllocError!bool {
+    let ok: bool = try gcvec_append_raw(s.units, u as u64)
+    s.n = s.n + 1
+    s.hash = 0
+    return true
+}
+
+fn str_hash(s: Gc[JsVal]) -> u64 {
+    let x: Gc[JsStr] = s.as?[JsStr]
+    if (x as u64) == 0 {
+        return 0
+    }
+    if x.hash != 0 {
+        return x.hash
+    }
+    var h: u64 = 14695981039346656037
+    var i: u64 = 0
+    while i < x.n {
+        h = h ^ gcvec_read_raw(x.units, i)
+        h = h *% 1099511628211 // ROUND 72: FNV-1a wraps on purpose, *% says so
+        i = i + 1
+    }
+    if h == 0 {
+        h = 1
+    }
+    x.hash = h
+    return h
+}
+
+fn str_empty(r: Gc[Realm]) -> Gc[JsVal] {
+    return r.empty_str
+}
+
+fn str_from_ascii(r: Gc[Realm], p: *mut u8, n: usize) -> AllocError!Gc[JsVal] {
+    let s: Gc[JsStr] = try str_new(r)
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try str_push(s, (*((p as usize + i) as *mut u8)) as u32)
+        i = i + 1
+    }
+    let v: Gc[JsVal] = s
+    return v
+}
+
+// A literal out of the syntax tree (its pool holds UTF-16 code units).
+fn str_from_ast(r: Gc[Realm], off: u32, len: usize) -> AllocError!Gc[JsVal] {
+    let t: *mut ast.Ast = realm_ast(r)
+    let s: Gc[JsStr] = try str_new(r)
+    var i: usize = 0
+    while i < len {
+        let ok: bool = try str_push(s, ast.ast_str_at(t, off, i))
+        i = i + 1
+    }
+    let v: Gc[JsVal] = s
+    return v
+}
+
+fn str_from_units(r: Gc[Realm], src: *mut mem.CpBuf, off: usize,
+    len: usize) -> AllocError!Gc[JsVal] {
+    let s: Gc[JsStr] = try str_new(r)
+    var i: usize = 0
+    while i < len {
+        let ok: bool = try str_push(s, mem.cp_at(src, off + i))
+        i = i + 1
+    }
+    let v: Gc[JsVal] = s
+    return v
+}
+
+// The text of an interned name as a JS string.
+fn str_of_name(r: Gc[Realm], id: u32) -> AllocError!Gc[JsVal] {
+    let nm: *mut lex.Names = realm_names(r)
+    let s: Gc[JsStr] = try str_new(r)
+    let n: usize = lex.names_len(nm, id)
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try str_push(s, lex.names_at(nm, id, i))
+        i = i + 1
+    }
+    let v: Gc[JsVal] = s
+    return v
+}
+
+fn str_equal(a: Gc[JsVal], b: Gc[JsVal]) -> bool {
+    if (a as u64) == (b as u64) {
+        return true
+    }
+    let x: Gc[JsStr] = a.as?[JsStr]
+    let y: Gc[JsStr] = b.as?[JsStr]
+    if (x as u64) == 0 || (y as u64) == 0 {
+        return false
+    }
+    if x.n != y.n {
+        return false
+    }
+    if x.hash != 0 && y.hash != 0 && x.hash != y.hash {
+        return false
+    }
+    var i: u64 = 0
+    while i < x.n {
+        if gcvec_read_raw(x.units, i) != gcvec_read_raw(y.units, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The abstract relational comparison of two strings (7.2.13): code unit by
+// code unit, the shorter one first when it is a prefix.
+fn str_compare(a: Gc[JsVal], b: Gc[JsVal]) -> i64 {
+    let la: u64 = str_len(a)
+    let lb: u64 = str_len(b)
+    var n: u64 = la
+    if lb < n {
+        n = lb
+    }
+    var i: u64 = 0
+    while i < n {
+        let ca: u32 = str_at(a, i)
+        let cb: u32 = str_at(b, i)
+        if ca < cb {
+            return -1
+        }
+        if ca > cb {
+            return 1
+        }
+        i = i + 1
+    }
+    if la < lb {
+        return -1
+    }
+    if la > lb {
+        return 1
+    }
+    return 0
+}
+
+fn str_concat(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let s: Gc[JsStr] = try str_new(r)
+    var i: u64 = 0
+    let la: u64 = str_len(a)
+    while i < la {
+        let ok: bool = try str_push(s, str_at(a, i))
+        i = i + 1
+    }
+    i = 0
+    let lb: u64 = str_len(b)
+    while i < lb {
+        let ok: bool = try str_push(s, str_at(b, i))
+        i = i + 1
+    }
+    let v: Gc[JsVal] = s
+    return v
+}
+
+fn str_slice(r: Gc[Realm], a: Gc[JsVal], from: u64, to: u64) -> AllocError!Gc[JsVal] {
+    let s: Gc[JsStr] = try str_new(r)
+    var i: u64 = from
+    while i < to && i < str_len(a) {
+        let ok: bool = try str_push(s, str_at(a, i))
+        i = i + 1
+    }
+    let v: Gc[JsVal] = s
+    return v
+}
+
+fn str_index_of(hay: Gc[JsVal], needle: Gc[JsVal], from: u64) -> i64 {
+    let lh: u64 = str_len(hay)
+    let ln: u64 = str_len(needle)
+    if ln > lh {
+        return -1
+    }
+    var i: u64 = from
+    while i + ln <= lh {
+        var k: u64 = 0
+        var same: bool = true
+        while k < ln {
+            if str_at(hay, i + k) != str_at(needle, k) {
+                same = false
+                break
+            }
+            k = k + 1
+        }
+        if same {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// =============================================================== Symbols
+
+fn sym_new(r: Gc[Realm], desc: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let id: u64 = r.next_sym
+    r.next_sym = id + 1
+    let s: Gc[JsSym] = try gc JsSym { tag: TAG_SYM, desc: desc, sid: id }
+    let v: Gc[JsVal] = s
+    return v
+}
+
+fn sym_desc(v: Gc[JsVal]) -> Gc[JsVal] {
+    let s: Gc[JsSym] = v.as?[JsSym]
+    if (s as u64) == 0 {
+        return gc_null[JsVal]()
+    }
+    return s.desc
+}
+
+fn sym_id(v: Gc[JsVal]) -> u64 {
+    let s: Gc[JsSym] = v.as?[JsSym]
+    if (s as u64) == 0 {
+        return 0
+    }
+    return s.sid
+}
+
+// ====================================================== Interning and keys
+//
+// A property key is a NUMBER. Strings are interned (equal text -> equal
+// number), symbols carry their identity anyway. The encoding keeps the two
+// smallest values free, because `GcMap` reserves them:
+//
+//     key = ((id + 1) << 1) | is_symbol
+//
+// `intern_index` maps the hash of a string onto a chain of ids; the
+// comparison at the end is a real text comparison, so a hash collision
+// costs time and never correctness.
+
+fn intern_units(r: Gc[Realm], s: Gc[JsVal]) -> AllocError!u64 {
+    let h: u64 = str_hash(s)
+    var chain: Gc[GcVec] = gcmap_get_value[GcVec](r.intern_index, h + 2)
+    if (chain as u64) != 0 {
+        var i: u64 = 0
+        while i < gcvec_length(chain) {
+            let id: u64 = gcvec_read_raw(chain, i)
+            let cand: Gc[JsVal] = gcvec_read[JsVal](r.intern_vals, id)
+            if str_equal(cand, s) {
+                return id
+            }
+            i = i + 1
+        }
+    } else {
+        chain = try gcvec_new_raw()
+        let ok: bool = try gcmap_set_value[GcVec](r.intern_index, h + 2, chain)
+    }
+    let id: u64 = gcvec_length(r.intern_vals)
+    let ok2: bool = try gcvec_append[JsVal](r.intern_vals, s)
+    let ok3: bool = try gcvec_append_raw(chain, id)
+    return id
+}
+
+fn intern_ascii(r: Gc[Realm], p: *mut u8, n: usize) -> AllocError!u64 {
+    let s: Gc[JsVal] = try str_from_ascii(r, p, n)
+    return intern_units(r, s)
+}
+
+fn intern_count(r: Gc[Realm]) -> u64 {
+    return gcvec_length(r.intern_vals)
+}
+
+fn intern_str(r: Gc[Realm], id: u64) -> Gc[JsVal] {
+    return gcvec_read[JsVal](r.intern_vals, id)
+}
+
+fn key_for_str(r: Gc[Realm], s: Gc[JsVal]) -> AllocError!u64 {
+    let id: u64 = try intern_units(r, s)
+    return ((id + 1) << 1)
+}
+
+fn key_for_symbol(v: Gc[JsVal]) -> u64 {
+    return ((sym_id(v) + 1) << 1) | 1
+}
+
+fn key_is_symbol(k: u64) -> bool {
+    return (k & 1) == 1
+}
+
+fn key_id(k: u64) -> u64 {
+    return (k >> 1) - 1
+}
+
+// The string of a key (only meaningful for a string key).
+fn key_name_str(r: Gc[Realm], k: u64) -> Gc[JsVal] {
+    return intern_str(r, key_id(k))
+}
+
+// The key of an identifier out of the syntax tree, with a cache over the
+// name numbers of the lexer -- that is the hot path of every `a.b`.
+fn key_for_name(r: Gc[Realm], name: u32) -> AllocError!u64 {
+    let idx: u64 = name as u64
+    while gcvec_length(r.name_keys) <= idx {
+        let ok: bool = try gcvec_append_raw(r.name_keys, 0)
+    }
+    let got: u64 = gcvec_read_raw(r.name_keys, idx)
+    if got != 0 {
+        return got - 1
+    }
+    let s: Gc[JsVal] = try str_of_name(r, name)
+    let k: u64 = try key_for_str(r, s)
+    let ok2: bool = gcvec_set_raw(r.name_keys, idx, k + 1)
+    return k
+}
+
+// The canonical string of an array index, as a key.
+fn key_for_index(r: Gc[Realm], i: u64) -> AllocError!u64 {
+    let s: Gc[JsStr] = try str_new(r)
+    if i == 0 {
+        let ok: bool = try str_push(s, 48 as u32)
+    } else {
+        var digits: [u8; 24] = [0 as u8; 24]
+        var n: usize = 0
+        var v: u64 = i
+        while v > 0 {
+            digits[n] = (48 + (v % 10)) as u8
+            v = v / 10
+            n = n + 1
+        }
+        while n > 0 {
+            n = n - 1
+            let ok: bool = try str_push(s, digits[n] as u32)
+        }
+    }
+    let sv: Gc[JsVal] = s
+    return key_for_str(r, sv)
+}
+
+// Is this key a canonical array index (7.1.21)? -1 if not.
+fn index_of_key(r: Gc[Realm], k: u64) -> i64 {
+    if key_is_symbol(k) {
+        return -1
+    }
+    let s: Gc[JsVal] = key_name_str(r, k)
+    let n: u64 = str_len(s)
+    if n == 0 || n > 10 {
+        return -1
+    }
+    let c0: u32 = str_at(s, 0)
+    if c0 == 48 as u32 {
+        if n != 1 {
+            return -1
+        }
+        return 0
+    }
+    var v: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        let c: u32 = str_at(s, i)
+        if c < 48 as u32 || c > 57 as u32 {
+            return -1
+        }
+        v = v * 10 + (c - 48 as u32) as u64
+        i = i + 1
+    }
+    if v >= 4294967295 {
+        return -1
+    }
+    return v as i64
+}
+
+// =============================================================== Objects
+
+fn obj_new(r: Gc[Realm]) -> AllocError!Gc[JsObj] {
+    return obj_new_proto(r, realm_proto(r, PROTO_OBJECT))
+}
+
+fn obj_new_proto(r: Gc[Realm], proto: Gc[JsObj]) -> AllocError!Gc[JsObj] {
+    return try gc JsObj {
+        tag: TAG_OBJ,
+        proto: proto,
+        props: try gcmap_new(false, true),
+        order: try gcvec_new_raw(),
+        elems: gc_null[GcVec](),
+        env: gc_null[Env](),
+        prim: gc_null[JsVal](),
+        extra: gc_null[JsObj](),
+        cls: CLS_ORDINARY,
+        node: 0,
+        native: 0,
+        flags: F_EXTENSIBLE,
+        len: 0,
+    }
+}
+
+fn obj_proto(o: Gc[JsObj]) -> Gc[JsObj] { return o.proto }
+fn obj_set_proto(o: Gc[JsObj], p: Gc[JsObj]) { o.proto = p }
+fn obj_class(o: Gc[JsObj]) -> u64 { return o.cls }
+fn obj_set_class(o: Gc[JsObj], c: u64) { o.cls = c }
+fn obj_flags(o: Gc[JsObj]) -> u64 { return o.flags }
+fn obj_set_flags(o: Gc[JsObj], f: u64) { o.flags = f }
+
+fn obj_get_own(o: Gc[JsObj], k: u64) -> Gc[Prop] {
+    return gcmap_get_value[Prop](o.props, k)
+}
+
+fn obj_has_own(o: Gc[JsObj], k: u64) -> bool {
+    return gcmap_has(o.props, k)
+}
+
+fn obj_put_own(o: Gc[JsObj], k: u64, p: Gc[Prop]) -> AllocError!bool {
+    if !gcmap_has(o.props, k) {
+        let ok: bool = try gcvec_append_raw(o.order, k)
+    }
+    return gcmap_set_value[Prop](o.props, k, p)
+}
+
+fn obj_delete_own(o: Gc[JsObj], k: u64) -> bool {
+    if !gcmap_has(o.props, k) {
+        return true
+    }
+    let ok: bool = gcmap_remove(o.props, k)
+    var i: u64 = 0
+    while i < gcvec_length(o.order) {
+        if gcvec_read_raw(o.order, i) == k {
+            let ok2: bool = gcvec_remove(o.order, i)
+            break
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn obj_key_count(o: Gc[JsObj]) -> u64 {
+    return gcvec_length(o.order)
+}
+
+fn obj_key_at(o: Gc[JsObj], i: u64) -> u64 {
+    return gcvec_read_raw(o.order, i)
+}
+
+// The own string keys in the order of 10.1.11.1: the integer indices
+// ascending first, then the rest in insertion order.
+fn obj_own_string_keys(r: Gc[Realm], o: Gc[JsObj]) -> AllocError!Gc[GcVec] {
+    let out: Gc[GcVec] = try gcvec_new_raw()
+    let n: u64 = elems_len(o)
+    var i: u64 = 0
+    while i < n {
+        let e: Gc[JsVal] = gcvec_read[JsVal](o.elems, i)
+        if !is_gap(e) {
+            let k: u64 = try key_for_index(r, i)
+            let ok: bool = try gcvec_append_raw(out, k)
+        }
+        i = i + 1
+    }
+    // Integer keys that lie in the property table (a sparse object).
+    var idx: u64 = 0
+    while idx < gcvec_length(o.order) {
+        let k: u64 = gcvec_read_raw(o.order, idx)
+        if !key_is_symbol(k) && index_of_key(r, k) >= 0 {
+            let ok: bool = try gcvec_append_raw(out, k)
+        }
+        idx = idx + 1
+    }
+    idx = 0
+    while idx < gcvec_length(o.order) {
+        let k: u64 = gcvec_read_raw(o.order, idx)
+        if !key_is_symbol(k) && index_of_key(r, k) < 0 {
+            let ok: bool = try gcvec_append_raw(out, k)
+        }
+        idx = idx + 1
+    }
+    return out
+}
+
+fn prop_value(p: Gc[Prop]) -> Gc[JsVal] { return p.value }
+fn prop_setter(p: Gc[Prop]) -> Gc[JsVal] { return p.setter }
+fn prop_attrs(p: Gc[Prop]) -> u64 { return p.attrs }
+fn prop_set_value(p: Gc[Prop], v: Gc[JsVal]) { p.value = v }
+fn prop_set_attrs(p: Gc[Prop], a: u64) { p.attrs = a }
+fn prop_is_accessor(p: Gc[Prop]) -> bool { return p.attrs & A_ACCESSOR != 0 }
+
+// ------------------------------------------------------- Array elements
+
+fn elems_len(o: Gc[JsObj]) -> u64 {
+    if (o.elems as u64) == 0 {
+        return 0
+    }
+    return gcvec_length(o.elems)
+}
+
+fn elems_get(r: Gc[Realm], o: Gc[JsObj], i: u64) -> Gc[JsVal] {
+    if (o.elems as u64) == 0 || i >= gcvec_length(o.elems) {
+        return r.gap
+    }
+    return gcvec_read[JsVal](o.elems, i)
+}
+
+// The dense element storage is only materialized up to this many slots.
+// `a.length = 4294967295` is legal JavaScript; laying out four billion
+// slots for it is not. Above the limit the length is only REMEMBERED and
+// the elements live in the ordinary property table.
+const DENSE_LIMIT: u64 = 4194304
+
+fn elems_dense_ok(i: u64) -> bool {
+    return i < DENSE_LIMIT
+}
+
+fn elems_ensure(r: Gc[Realm], o: Gc[JsObj], n: u64) -> AllocError!bool {
+    if n > DENSE_LIMIT {
+        return false
+    }
+    if (o.elems as u64) == 0 {
+        o.elems = try gcvec_new()
+    }
+    while gcvec_length(o.elems) < n {
+        let ok: bool = try gcvec_append[JsVal](o.elems, r.gap)
+    }
+    return true
+}
+
+fn elems_set(r: Gc[Realm], o: Gc[JsObj], i: u64, v: Gc[JsVal]) -> AllocError!bool {
+    if i >= DENSE_LIMIT {
+        return false
+    }
+    let ok0: bool = try elems_ensure(r, o, i + 1)
+    return gcvec_set[JsVal](o.elems, i, v)
+}
+
+fn elems_push(r: Gc[Realm], o: Gc[JsObj], v: Gc[JsVal]) -> AllocError!bool {
+    if (o.elems as u64) == 0 {
+        o.elems = try gcvec_new()
+    }
+    return gcvec_append[JsVal](o.elems, v)
+}
+
+fn array_new(r: Gc[Realm]) -> AllocError!Gc[JsObj] {
+    let o: Gc[JsObj] = try obj_new_proto(r, realm_proto(r, PROTO_ARRAY))
+    o.cls = CLS_ARRAY
+    o.elems = try gcvec_new()
+    o.len = 0
+    return o
+}
+
+fn array_length(o: Gc[JsObj]) -> u64 {
+    return o.len
+}
+
+fn array_set_length(r: Gc[Realm], o: Gc[JsObj], n: u64) -> AllocError!bool {
+    if n > DENSE_LIMIT {
+        o.len = n
+        return true
+    }
+    if n < o.len {
+        var i: u64 = gcvec_length(o.elems)
+        while i > n {
+            let ok: bool = gcvec_remove(o.elems, i - 1)
+            i = i - 1
+        }
+    } else {
+        let ok: bool = try elems_ensure(r, o, n)
+    }
+    o.len = n
+    return true
+}
+
+// ========================================================== Environments
+
+fn env_new(r: Gc[Realm], parent: Gc[Env], kind: u64) -> AllocError!Gc[Env] {
+    return try gc Env {
+        parent: parent,
+        names: try gcmap_new(false, false),
+        vals: try gcvec_new(),
+        flags: try gcvec_new_raw(),
+        obj: gc_null[JsObj](),
+        this_val: r.undef,
+        func: gc_null[JsObj](),
+        kind: kind,
+        has_this: 0,
+    }
+}
+
+fn env_parent(e: Gc[Env]) -> Gc[Env] { return e.parent }
+fn env_kind(e: Gc[Env]) -> u64 { return e.kind }
+fn env_object(e: Gc[Env]) -> Gc[JsObj] { return e.obj }
+fn env_this(e: Gc[Env]) -> Gc[JsVal] { return e.this_val }
+fn env_has_this(e: Gc[Env]) -> bool { return e.has_this == 1 }
+fn env_func(e: Gc[Env]) -> Gc[JsObj] { return e.func }
+
+fn env_set_this(e: Gc[Env], v: Gc[JsVal], f: Gc[JsObj]) {
+    e.this_val = v
+    e.func = f
+    e.has_this = 1
+}
+
+// The slot of a name in THIS record, or -1.
+fn env_lookup(e: Gc[Env], key: u64) -> i64 {
+    let s: u64 = gcmap_get(e.names, key, 0xFFFFFFFFFFFFFFFF)
+    if s == 0xFFFFFFFFFFFFFFFF {
+        return -1
+    }
+    return s as i64
+}
+
+fn env_declare(r: Gc[Realm], e: Gc[Env], key: u64,
+    flags: u64) -> AllocError!i64 {
+    let have: i64 = env_lookup(e, key)
+    if have >= 0 {
+        return have
+    }
+    let slot: u64 = gcvec_length(e.vals)
+    let ok1: bool = try gcvec_append[JsVal](e.vals, r.undef)
+    let ok2: bool = try gcvec_append_raw(e.flags, flags)
+    let ok3: bool = try gcmap_set(e.names, key, slot)
+    return slot as i64
+}
+
+fn env_get_slot(e: Gc[Env], slot: i64) -> Gc[JsVal] {
+    return gcvec_read[JsVal](e.vals, slot as u64)
+}
+
+fn env_set_slot(e: Gc[Env], slot: i64, v: Gc[JsVal]) {
+    let ok: bool = gcvec_set[JsVal](e.vals, slot as u64, v)
+}
+
+fn env_slot_flags(e: Gc[Env], slot: i64) -> u64 {
+    return gcvec_read_raw(e.flags, slot as u64)
+}
+
+fn env_set_flags(e: Gc[Env], slot: i64, f: u64) {
+    let ok: bool = gcvec_set_raw(e.flags, slot as u64, f)
+}

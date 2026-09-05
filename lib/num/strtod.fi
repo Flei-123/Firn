@@ -1,0 +1,757 @@
+// lib/num/strtod.fi -- text -> IEEE-754 double precision, CORRECTLY ROUNDED
+// (SPEC 8.4, requirement Z5).
+//
+// Stage 0 has no floating point type (yet); `strtod` therefore returns the
+// BIT PATTERN of the double as a `u64`. That is no shortcut: the whole
+// computation runs in integer arithmetic anyway, and `dtoa` works on the
+// same bit pattern. As soon as the language has `f64`, a thin wrapper goes
+// on top (see ACCEPTANCE.md, section str).
+//
+// Method: exact big number arithmetic. The value is held as a fraction
+// of two big integers, D * 10^exp, scaled so that the quotient has exactly
+// 53 bit, and from the remainder it is rounded to the nearest double -- at
+// exactly half distance towards the EVEN mantissa. The result is therefore
+// the correctly rounded one for EVERY input, including 2.2250738585072011e-308,
+// 9007199254740993 and 5e-324.
+//
+// The form it recognizes:  [+-] digits [ . digits ] [ (e|E) [+-] digits ]
+// Deliberately not recognized (the calling layer's job): "Infinity", "NaN",
+// hexadecimal floating point, leading whitespace.
+//
+// Include:  //#include lib/num/strtod.fi  (needs alloc.fi, bignum.fi)
+
+const D_INF_BITS: u64 = 0x7FF0000000000000
+const D_SIGN_BIT: u64 = 0x8000000000000000
+const D_TWO52: u64 = 4503599627370496
+const D_TWO53: u64 = 9007199254740992
+const D_MAXDIG: usize = 780 // significant digits, a sticky bit after them
+const STRTOD_WS_BYTES: usize = 6 * 512 * 4
+
+// ROUND 73: renamed from `is_digit`. `lib/std/core.fi` puts this file
+// and the text facade into ONE module, and the facade has an
+// `is_digit` of its own (lib/str/core_facade.fi). Two functions of the
+// same name would be a compile error -- and of the two names this one
+// is the one that only strtod uses.
+fn strtod_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn u64_bitlen(v: u64) -> usize {
+    var x: u64 = v
+    var n: usize = 0
+    while x != 0 {
+        x = x >> 1
+        n = n + 1
+    }
+    return n
+}
+
+// The quotient of 2^s * num0 / den0; the remainder stays in `numw`, the
+// scaled denominator in `denw` (the rounding afterwards needs both).
+fn strtod_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn, tmp: *mut Bn, s: i64) -> u64 {
+    bn_copy(numw, num0)
+    bn_copy(denw, den0)
+    if s >= 0 {
+        bn_shl(numw, s as usize)
+    } else {
+        bn_shl(denw, (0 - s) as usize)
+    }
+    return bn_div_q(numw, denw, tmp)
+}
+
+// ====================================================================
+// ROUND 87 -- THE SHORT WAY, for the numbers that a real document carries
+// ====================================================================
+//
+// WHAT WAS WRONG. The path above is exact for every input, and it is the
+// ONLY path: `1.5` goes through the same big number arithmetic as
+// `2.2250738585072011e-308`. Every single digit costs a `bn_mul_small` plus
+// a `bn_add_small` over a big integer, and after that comes a big number
+// division. Measured in round 81: a JSON document with floats reads at
+// 1.4 MiB/s, the same document with integers at 11.7 MiB/s -- a factor of
+// eight, and the float reader was named as the reason without being
+// measured.
+//
+// WHAT IS NEW. A number whose significant digits fit into a `u64` (at most
+// nineteen) and whose decimal exponent lies between -27 and +27 can be
+// converted with FIXED WIDTH integer arithmetic, exactly and without a
+// single allocation:
+//
+//   exponent >= 0:  w * 10^q = (w * 5^q) * 2^q. `5^q` fits into a `u64` up
+//       to q = 27, the product `w * 5^q` into 128 bits. The product is
+//       EXACT, so the rounding to 53 bits sees every discarded bit and is
+//       the correctly rounded one -- there is nothing to estimate.
+//
+//   exponent < 0:   w / 10^m = (w / 5^m) * 2^-m. `w` is shifted left far
+//       enough for the quotient to have 64 bits, and the 128-by-64
+//       division yields quotient AND remainder. The remainder is the sticky
+//       bit, so this rounding is exact as well.
+//
+// So this is NOT Eisel/Lemire's method, although it comes from the same
+// place. Eisel/Lemire multiply by a 128 bit APPROXIMATION of the power of
+// ten out of a table of 651 entries and need a check for the ambiguous
+// case, because the approximation can land exactly on a rounding boundary.
+// Firn has no global variables (SPEC 2, item 5), so a table of 1,302
+// constants would have to be built at run time or unrolled into a
+// generated function -- and neither is worth it: within +-27 the power of
+// five is EXACT in 64 bits, and an exact factor needs no ambiguity check
+// at all. Outside that range, and for more than nineteen digits, the exact
+// path above takes over unchanged. It stays the only answer for the hard
+// cases, and it stays the one the acceptance measures.
+
+const D_TWO63: u64 = 9223372036854775808
+
+// 64 x 64 -> 128. `hi` receives the upper half, the lower one is returned.
+// Four 32 bit products; the language has no 128 bit type and needs none.
+fn mul64(a: u64, b: u64, hi: *mut u64) -> u64 {
+    let mask: u64 = 4294967295
+    let al: u64 = a & mask
+    let ah: u64 = a >> 32
+    let bl: u64 = b & mask
+    let bh: u64 = b >> 32
+    let ll: u64 = al * bl
+    let lh: u64 = al * bh
+    let hl: u64 = ah * bl
+    let hh: u64 = ah * bh
+    let mid: u64 = (ll >> 32) + (lh & mask) + (hl & mask)
+    *hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32)
+    return (ll & mask) | (mid << 32)
+}
+
+fn bitlen128(hi: u64, lo: u64) -> usize {
+    if hi != 0 {
+        return 64 + u64_bitlen(hi)
+    }
+    return u64_bitlen(lo)
+}
+
+// The lower 64 bits of (hi,lo) >> s. Used only where the result is known to
+// fit into 64 bits.
+fn shr128_lo(hi: u64, lo: u64, s: usize) -> u64 {
+    if s == 0 {
+        return lo
+    }
+    if s < 64 {
+        return (lo >> s) | (hi << (64 - s))
+    }
+    if s < 128 {
+        return hi >> (s - 64)
+    }
+    return 0
+}
+
+fn bit128(hi: u64, lo: u64, i: usize) -> u64 {
+    if i < 64 {
+        return (lo >> i) & 1
+    }
+    if i < 128 {
+        return (hi >> (i - 64)) & 1
+    }
+    return 0
+}
+
+// Is any of the bits 0 .. k-1 set?
+fn low128_any(hi: u64, lo: u64, k: usize) -> bool {
+    if k == 0 {
+        return false
+    }
+    if k < 64 {
+        return (lo & (((1 as u64) << k) - 1)) != 0
+    }
+    if k == 64 {
+        return lo != 0
+    }
+    if lo != 0 {
+        return true
+    }
+    let j: usize = k - 64
+    if j >= 64 {
+        return hi != 0
+    }
+    return (hi & (((1 as u64) << j) - 1)) != 0
+}
+
+// (nhi,nlo) / d, with the remainder in `rem`. REQUIRES nhi < d, which makes
+// the quotient fit into 64 bits.
+//
+// Bit by bit, sixty-four steps. Knuth's two-limb algorithm would be about
+// four times as short, but it needs the wrap-around of the unsigned
+// subtraction in three places, and this file is not the place to depend on
+// that -- round 83 is putting checked arithmetic into the language next
+// door. Every step here stays inside the range: the only difficult case is
+// `r >= 2^63`, where doubling would overflow, and there `2r + bit - d` is
+// written as `r - (d - r) + bit`, which is non-negative because d - r < 2^63
+// <= r.
+fn div128(nhi: u64, nlo: u64, d: u64, rem: *mut u64) -> u64 {
+    var r: u64 = nhi
+    var q: u64 = 0
+    var i: usize = 0
+    while i < 64 {
+        let bit: u64 = (nlo >> (63 - i)) & 1
+        if r >= D_TWO63 {
+            // 2r >= 2^64 > d, so the subtraction always happens
+            r = r - (d - r) + bit
+            q = (q << 1) | 1
+        } else {
+            let r2: u64 = (r << 1) | bit
+            if r2 >= d {
+                r = r2 - d
+                q = (q << 1) | 1
+            } else {
+                r = r2
+                q = q << 1
+            }
+        }
+        i = i + 1
+    }
+    *rem = r
+    return q
+}
+
+fn pow5_u64(m: usize) -> u64 {
+    var v: u64 = 1
+    var i: usize = 0
+    while i < m {
+        v = v * 5
+        i = i + 1
+    }
+    return v
+}
+
+// (hi,lo) * 2^e2, plus something smaller than one unit in the last place if
+// `sticky`, rounded to 53 bits. `ok` stays false when the result is not a
+// NORMAL double -- overflow and the subnormal range go the exact way, they
+// are rare and they are where the difficult cases live.
+fn strtod_pack(hi: u64, lo: u64, e2in: i64, sticky: bool, odd: bool, ok: *mut bool) -> u64 {
+    *ok = false
+    let bl: usize = bitlen128(hi, lo)
+    if bl == 0 {
+        return 0
+    }
+    var q: u64 = 0
+    var e2: i64 = e2in
+    if bl <= 53 {
+        // exact, nothing is discarded
+        let sh: usize = 53 - bl
+        q = lo << sh
+        e2 = e2 - sh as i64
+        if sticky && odd {
+            q = q | 1
+        }
+    } else {
+        let sh: usize = bl - 53
+        q = shr128_lo(hi, lo, sh)
+        e2 = e2 + sh as i64
+        let half: u64 = bit128(hi, lo, sh - 1)
+        let rest: bool = low128_any(hi, lo, sh - 1) || sticky
+        if odd {
+            if half != 0 || rest {
+                q = q | 1
+            }
+        } else {
+            var up: bool = false
+            if half != 0 {
+                if rest {
+                    up = true
+                } else if q % 2 == 1 {
+                    up = true
+                }
+            }
+            if up {
+                q = q + 1
+                if q == D_TWO53 {
+                    q = D_TWO52
+                    e2 = e2 + 1
+                }
+            }
+        }
+    }
+    if e2 > 971 || e2 < -1074 {
+        return 0
+    }
+    if q < D_TWO52 {
+        return 0 // subnormal -- the exact path
+    }
+    let biased: i64 = e2 + 1075
+    if biased < 1 || biased > 2046 {
+        return 0
+    }
+    *ok = true
+    return ((biased as u64) << 52) + (q - D_TWO52)
+}
+
+// w * 10^q10 as a bit pattern, without the sign. `ok` stays false when this
+// way does not apply.
+fn strtod_fast(w: u64, q10: i64, odd: bool, ok: *mut bool) -> u64 {
+    *ok = false
+    if w == 0 {
+        return 0
+    }
+    if q10 > 27 || q10 < -27 {
+        return 0
+    }
+    if q10 >= 0 {
+        let d5: u64 = pow5_u64(q10 as usize)
+        var hi: u64 = 0
+        let lo: u64 = mul64(w, d5, &hi)
+        return strtod_pack(hi, lo, q10, false, odd, ok)
+    }
+    let m: usize = (0 - q10) as usize
+    let d5: u64 = pow5_u64(m)
+    let bl: usize = u64_bitlen(w)
+    let bd: usize = u64_bitlen(d5)
+    // w << s, with s chosen so that the quotient has just under 64 bits and
+    // is guaranteed to fit into one: w * 2^s < 2^(bd+63) < d5 * 2^64.
+    let s: usize = 63 + bd - bl
+    var nhi: u64 = 0
+    var nlo: u64 = 0
+    if s == 0 {
+        nlo = w
+    } else if s < 64 {
+        nhi = w >> (64 - s)
+        nlo = w << s
+    } else {
+        nhi = w << (s - 64)
+    }
+    var r: u64 = 0
+    let qq: u64 = div128(nhi, nlo, d5, &r)
+    return strtod_pack(0, qq, q10 - s as i64, r != 0, odd, ok)
+}
+
+// The cheap pre-scan. Mirrors the parse of `strtod_mode` EXACTLY, but keeps
+// the digits in a `u64` instead of a big integer, and gives up the moment
+// anything unusual turns up -- more than nineteen significant digits, no
+// number at all. `false` costs nothing: the exact path parses again from
+// the beginning and sets `consumed` itself.
+fn strtod_scan(p: *mut u8, len: usize, wout: *mut u64, qout: *mut i64,
+    negout: *mut bool, consumed: *mut usize) -> bool {
+    var i: usize = 0
+    var neg: bool = false
+    if i < len {
+        let c0: u8 = ld8(p, i)
+        if c0 == 43 as u8 {
+            i = i + 1
+        } else if c0 == 45 as u8 {
+            neg = true
+            i = i + 1
+        }
+    }
+    var w: u64 = 0
+    var nsig: usize = 0
+    var exp: i64 = 0
+    var any: bool = false
+    var stop: bool = false
+    while i < len && !stop {
+        let c: u8 = ld8(p, i)
+        if strtod_digit(c) {
+            any = true
+            let dig: u64 = (c - 48 as u8) as u64
+            if w != 0 || dig != 0 {
+                if nsig >= 19 {
+                    return false
+                }
+                w = w * 10 + dig
+                nsig = nsig + 1
+            }
+            i = i + 1
+        } else {
+            stop = true
+        }
+    }
+    if i < len {
+        if ld8(p, i) == 46 as u8 {
+            var j: usize = i + 1
+            var fany: bool = false
+            stop = false
+            while j < len && !stop {
+                let c: u8 = ld8(p, j)
+                if strtod_digit(c) {
+                    fany = true
+                    let dig: u64 = (c - 48 as u8) as u64
+                    if w == 0 && dig == 0 {
+                        exp = exp - 1
+                    } else {
+                        if nsig >= 19 {
+                            return false
+                        }
+                        w = w * 10 + dig
+                        nsig = nsig + 1
+                        exp = exp - 1
+                    }
+                    j = j + 1
+                } else {
+                    stop = true
+                }
+            }
+            if any || fany {
+                any = true
+                i = j
+            }
+        }
+    }
+    if !any {
+        return false
+    }
+    if i < len {
+        let ec: u8 = ld8(p, i)
+        if ec == 101 as u8 || ec == 69 as u8 {
+            var j: usize = i + 1
+            var eneg: bool = false
+            if j < len {
+                let sc: u8 = ld8(p, j)
+                if sc == 43 as u8 {
+                    j = j + 1
+                } else if sc == 45 as u8 {
+                    eneg = true
+                    j = j + 1
+                }
+            }
+            var eany: bool = false
+            var ev: i64 = 0
+            stop = false
+            while j < len && !stop {
+                let c: u8 = ld8(p, j)
+                if strtod_digit(c) {
+                    eany = true
+                    if ev < 1000000 {
+                        ev = ev * 10 + (c - 48 as u8) as i64
+                    }
+                    j = j + 1
+                } else {
+                    stop = true
+                }
+            }
+            if eany {
+                if eneg {
+                    exp = exp - ev
+                } else {
+                    exp = exp + ev
+                }
+                i = j
+            }
+        }
+    }
+    *wout = w
+    *qout = exp
+    *negout = neg
+    *consumed = i
+    return true
+}
+
+// Text -> bit pattern. `consumed` receives the number of characters used up
+// (0 = no valid number). `ws` needs STRTOD_WS_BYTES bytes.
+// ROUND 71 -- `odd = true` rounds TO ODD instead of to nearest: cut off,
+// and set the last bit when anything was left over.
+//
+// That is what makes a correct `f32` possible. The way decimal -> binary64
+// (nearest) -> binary32 (nearest) is NOT correctly rounded: at the exact
+// middle between two binary32 the intermediate rounding lands ON the middle,
+// and the tie-to-even then decides without knowing which side the real value
+// lay on. Measured against C `strtof`: 63568 of 239064 such cases came out
+// one ulp wrong. With round-to-odd it cannot happen -- a value whose last
+// bit is set is never exactly a binary32 middle (Boldo/Melquiond, 53 >= 24+2).
+// ROUND 87 -- THE SHORT WAY AS A FRONT DOOR OF ITS OWN.
+//
+// `true` means: this number is done, `out` holds the bit pattern and
+// `consumed` the characters used up. `false` means: nothing has happened,
+// the exact path has to run.
+//
+// It is a front door because it needs NO WORKSPACE. `read_f64_bits` in
+// lib/num/std_facade.fi used to fetch STRTOD_WS_BYTES = 12,288 octets from
+// the operating system and give them back again FOR EVERY SINGLE NUMBER --
+// and a JSON document with 60,000 floats therefore made 60,000 mmap/munmap
+// pairs. That was the larger half of the cost, and no arithmetic in the
+// world would have fixed it.
+fn strtod_short(p: *mut u8, len: usize, consumed: *mut usize, odd: bool, out: *mut u64) -> bool {
+    *consumed = 0
+    *out = 0
+    var fw: u64 = 0
+    var fq: i64 = 0
+    var fneg: bool = false
+    var fcons: usize = 0
+    if !strtod_scan(p, len, &fw, &fq, &fneg, &fcons) {
+        return false
+    }
+    if fw == 0 {
+        *consumed = fcons
+        if fneg {
+            *out = D_SIGN_BIT
+        }
+        return true
+    }
+    var fok: bool = false
+    let fbits: u64 = strtod_fast(fw, fq, odd, &fok)
+    if !fok {
+        return false
+    }
+    *consumed = fcons
+    if fneg {
+        *out = D_SIGN_BIT + fbits
+    } else {
+        *out = fbits
+    }
+    return true
+}
+
+fn strtod_mode(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize, odd: bool) -> u64 {
+    *consumed = 0
+    // The short way first. It answers or it does not; when it does not,
+    // nothing below it has happened yet -- not even the workspace has been
+    // touched.
+    var sbits: u64 = 0
+    if strtod_short(p, len, consumed, odd, &sbits) {
+        return sbits
+    }
+    *consumed = 0
+    var d: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var num0: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var den0: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var numw: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var denw: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    var tmp: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
+    let stride: usize = BN_LIMBS * 4
+    bn_init(&d, ws, BN_LIMBS)
+    bn_init(&num0, (ws as usize + stride) as *mut u8, BN_LIMBS)
+    bn_init(&den0, (ws as usize + stride * 2) as *mut u8, BN_LIMBS)
+    bn_init(&numw, (ws as usize + stride * 3) as *mut u8, BN_LIMBS)
+    bn_init(&denw, (ws as usize + stride * 4) as *mut u8, BN_LIMBS)
+    bn_init(&tmp, (ws as usize + stride * 5) as *mut u8, BN_LIMBS)
+
+    var i: usize = 0
+    var neg: bool = false
+    if i < len {
+        let c0: u8 = ld8(p, i)
+        if c0 == 43 as u8 {
+            i = i + 1
+        } else if c0 == 45 as u8 {
+            neg = true
+            i = i + 1
+        }
+    }
+    var nsig: usize = 0
+    var exp: i64 = 0
+    var sticky: bool = false
+    var any: bool = false
+    var stop: bool = false
+
+    // --- the digits before the point ---
+    while i < len && !stop {
+        let c: u8 = ld8(p, i)
+        if strtod_digit(c) {
+            any = true
+            let dig: u32 = (c - 48 as u8) as u32
+            if bn_is_zero(&d) && dig == 0 as u32 {
+                stop = false
+            } else if nsig < D_MAXDIG {
+                bn_mul_small(&d, 10 as u32)
+                bn_add_small(&d, dig)
+                nsig = nsig + 1
+            } else {
+                exp = exp + 1
+                if dig != 0 as u32 {
+                    sticky = true
+                }
+            }
+            i = i + 1
+        } else {
+            stop = true
+        }
+    }
+
+    // --- the digits after the point ---
+    if i < len {
+        if ld8(p, i) == 46 as u8 {
+            var j: usize = i + 1
+            var fany: bool = false
+            stop = false
+            while j < len && !stop {
+                let c: u8 = ld8(p, j)
+                if strtod_digit(c) {
+                    fany = true
+                    let dig: u32 = (c - 48 as u8) as u32
+                    if bn_is_zero(&d) && dig == 0 as u32 {
+                        exp = exp - 1
+                    } else if nsig < D_MAXDIG {
+                        bn_mul_small(&d, 10 as u32)
+                        bn_add_small(&d, dig)
+                        nsig = nsig + 1
+                        exp = exp - 1
+                    } else {
+                        if dig != 0 as u32 {
+                            sticky = true
+                        }
+                    }
+                    j = j + 1
+                } else {
+                    stop = true
+                }
+            }
+            if any || fany {
+                any = true
+                i = j
+            }
+        }
+    }
+
+    if !any {
+        return 0
+    }
+
+    // --- exponent ---
+    if i < len {
+        let ec: u8 = ld8(p, i)
+        if ec == 101 as u8 || ec == 69 as u8 {
+            var j: usize = i + 1
+            var eneg: bool = false
+            if j < len {
+                let sc: u8 = ld8(p, j)
+                if sc == 43 as u8 {
+                    j = j + 1
+                } else if sc == 45 as u8 {
+                    eneg = true
+                    j = j + 1
+                }
+            }
+            var eany: bool = false
+            var ev: i64 = 0
+            stop = false
+            while j < len && !stop {
+                let c: u8 = ld8(p, j)
+                if strtod_digit(c) {
+                    eany = true
+                    if ev < 1000000 {
+                        ev = ev * 10 + (c - 48 as u8) as i64
+                    }
+                    j = j + 1
+                } else {
+                    stop = true
+                }
+            }
+            if eany {
+                if eneg {
+                    exp = exp - ev
+                } else {
+                    exp = exp + ev
+                }
+                i = j
+            }
+        }
+    }
+    *consumed = i
+
+    var sign: u64 = 0
+    if neg {
+        sign = D_SIGN_BIT
+    }
+
+    // Digits that were cut off: a sticky bit below the last place makes sure
+    // that an exact half step never turns into a wrong rounding.
+    if sticky {
+        bn_mul_small(&d, 10 as u32)
+        bn_add_small(&d, 1 as u32)
+        exp = exp - 1
+    }
+    if bn_is_zero(&d) {
+        return sign
+    }
+
+    // Rough range: 10^(mag-1) <= |value| < 10^mag
+    let likes: i64 = exp + nsig as i64
+    if likes - 1 >= 309 {
+        return sign + D_INF_BITS
+    }
+    if likes <= -400 {
+        return sign
+    }
+
+    bn_copy(&num0, &d)
+    bn_set_u64(&den0, 1)
+    if exp > 0 {
+        bn_mul_pow10(&num0, exp as usize)
+    } else if exp < 0 {
+        bn_mul_pow10(&den0, (0 - exp) as usize)
+    }
+
+    // Scale until the quotient has exactly 53 bit.
+    var s: i64 = 53 - (bn_bitlen(&num0) as i64 - bn_bitlen(&den0) as i64)
+    var q: u64 = 0
+    var done: bool = false
+    var iter: usize = 0
+    while !done && iter < 6 {
+        q = strtod_quot(&num0, &den0, &numw, &denw, &tmp, s)
+        let qb: i64 = u64_bitlen(q) as i64
+        if qb == 53 {
+            done = true
+        } else {
+            s = s + (53 - qb)
+        }
+        iter = iter + 1
+    }
+    var e2: i64 = 0 - s
+    if e2 < -1074 {
+        s = 1074
+        e2 = -1074
+        q = strtod_quot(&num0, &den0, &numw, &denw, &tmp, s)
+    }
+
+    // ROUND 71: round to odd, if that is what was asked for.
+    if odd {
+        if !bn_is_zero(&numw) {
+            q = q | 1
+        }
+        if e2 > 971 {
+            return sign + D_INF_BITS
+        }
+        if q == 0 {
+            return sign
+        }
+        if q >= D_TWO52 {
+            let biased_o: u64 = (e2 + 1075) as u64
+            return sign + (biased_o << 52) + (q - D_TWO52)
+        }
+        return sign + q
+    }
+    // Round: the remainder (numw) against half the denominator (denw).
+    bn_shl(&numw, 1)
+    let cv: i32 = bn_cmp(&numw, &denw)
+    var up: bool = false
+    if cv > 0 {
+        up = true
+    } else if cv == 0 {
+        if q % 2 == 1 {
+            up = true
+        }
+    }
+    if up {
+        q = q + 1
+        if q == D_TWO53 {
+            q = D_TWO52
+            e2 = e2 + 1
+        }
+    }
+    if e2 > 971 {
+        return sign + D_INF_BITS
+    }
+    if q == 0 {
+        return sign
+    }
+    var bits: u64 = 0
+    if q >= D_TWO52 {
+        let biased: u64 = (e2 + 1075) as u64
+        bits = (biased << 52) + (q - D_TWO52)
+    } else {
+        bits = q
+    }
+    return sign + bits
+}
+
+// The two front doors: `strtod` rounds to nearest (the correctly rounded
+// binary64), `strtod_odd` rounds to odd -- the intermediate value from which
+// a correct binary32 comes out with ONE further rounding.
+fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, false)
+}
+
+fn strtod_odd(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, true)
+}

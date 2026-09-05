@@ -1,0 +1,187 @@
+// expect_exit: 0
+// ROUND 49 -- THREADS, the foundation (SPEC 7).
+//
+// What is promised is checked:
+//   A  `thread_start` creates a REAL thread (its own thread id,
+//      its own stack) and `thread_wait` yields its result.
+//   B  The mutex loses no increment: four threads count up 20,000 times
+//      each under the lock, and in the end exactly 80,000 stand there. As a
+//      counter-check the same run counts a second counter up PURELY
+//      ATOMICALLY -- both have to be exactly right.
+//   C  A counter WITHOUT a lock and WITHOUT an atomic instruction loses
+//      increments. Without this counter-check B would be worthless: the test
+//      would pass even if the threads did not run at the same time at all.
+//   D  The channel transports every value exactly once.
+//   E  A handle can be reused after the join (slots of the
+//      thread table become free).
+//
+// This program has NO `gc class`. It pulls in the runtime through its
+// `thread_` identifiers alone (source_needs_gc in gc.rs) -- exactly that is
+// checked along here, because the state block still has to be in the assembly.
+
+const F_SYS_MMAP: i64 = 9
+const F_PROT_RW: i64 = 3
+const F_MAP_ANON: i64 = 34
+
+const Z_SPERRZ: u64 = 0
+const Z_MUTEX: u64 = 8
+const Z_ATOMZ: u64 = 16
+const Z_ROHZ: u64 = 24
+const Z_CHANNEL: u64 = 32
+
+const ROUNDS: u64 = 20000
+const KANALWERTE: u64 = 2000
+
+fn page() -> u64 {
+    let r: i64 = syscall(F_SYS_MMAP, 0, 4096, F_PROT_RW, F_MAP_ANON, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+// THE DISPATCHER. Stage 0 has no function pointers; a thread carries a
+// KIND OF WORK, exactly as an object carries a cleanup kind (round 47).
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == 1 {
+        var i: u64 = 0
+        while i < ROUNDS {
+            thread_lock((arg + Z_MUTEX) as *mut u64)
+            st(arg, Z_SPERRZ, ld(arg, Z_SPERRZ) + 1)
+            thread_unlock((arg + Z_MUTEX) as *mut u64)
+            __atomic_add((arg + Z_ATOMZ) as *mut u64, 1)
+            // Counter-check: the same without a lock and without an atomic instruction.
+            st(arg, Z_ROHZ, ld(arg, Z_ROHZ) + 1)
+            i = i + 1
+        }
+        return ROUNDS
+    }
+    if kind == 2 {
+        let k: u64 = ld(arg, Z_CHANNEL)
+        var i: u64 = 0
+        var s: u64 = 0
+        while i < KANALWERTE {
+            thread_channel_send(k, i + 1)
+            s = s + i + 1
+            i = i + 1
+        }
+        return s
+    }
+    if kind == 3 {
+        return arg * 3
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if !thread_init() {
+        return 90
+    }
+    let z: u64 = page()
+    if z == 0 {
+        return 91
+    }
+
+    // --- A/E: one thread, its result, its slot ------------------------------
+    let h0: u64 = thread_start(3, 14)
+    if h0 == 0 {
+        return 1
+    }
+    if thread_wait(h0) != 42 {
+        return 2
+    }
+    let h1: u64 = thread_start(3, 15)
+    if h1 == 0 {
+        return 3
+    }
+    if thread_wait(h1) != 45 {
+        return 4
+    }
+    // The slot was reused -- otherwise the table would be exhausted after
+    // 64 threads.
+    if h1 != h0 {
+        return 5
+    }
+    if thread_started() != 2 {
+        return 6
+    }
+
+    // --- B/C: four threads, three counters -----------------------------------
+    var h: [u64; 4] = [0; 4]
+    var i: u64 = 0
+    while i < 4 {
+        h[i as usize] = thread_start(1, z)
+        if h[i as usize] == 0 {
+            return 10
+        }
+        i = i + 1
+    }
+    var sum: u64 = 0
+    i = 0
+    while i < 4 {
+        sum = sum + thread_wait(h[i as usize])
+        i = i + 1
+    }
+    if sum != 4 * ROUNDS {
+        return 11
+    }
+    if ld(z, Z_SPERRZ) != 4 * ROUNDS {
+        return 12
+    }
+    if ld(z, Z_ATOMZ) != 4 * ROUNDS {
+        return 13
+    }
+    // The counter-check MUST lose. If it does not, the threads did not
+    // really run at the same time, and B proves nothing.
+    if ld(z, Z_ROHZ) >= 4 * ROUNDS {
+        return 14
+    }
+
+    // --- D: the channel ------------------------------------------------------
+    let k: u64 = thread_channel_new(64)
+    if k == 0 {
+        return 20
+    }
+    st(z, Z_CHANNEL, k)
+    let hs: u64 = thread_start(2, z)
+    if hs == 0 {
+        return 21
+    }
+    var receive: u64 = 0
+    var n: u64 = 0
+    while n < KANALWERTE {
+        receive = receive + thread_channel_receive(k)
+        n = n + 1
+    }
+    let sent: u64 = thread_wait(hs)
+    if receive != sent {
+        return 22
+    }
+    if receive != KANALWERTE * (KANALWERTE + 1) / 2 {
+        return 23
+    }
+    if thread_channel_used(k) != 0 {
+        return 24
+    }
+    thread_channel_free(k)
+
+    // --- bookkeeping ---------------------------------------------------------
+    if thread_count() != 1 {
+        return 30
+    }
+    if thread_multi_threaded() != 1 {
+        return 31
+    }
+    if thread_tid() == 0 {
+        return 32
+    }
+    return 0
+}

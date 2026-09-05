@@ -1,0 +1,982 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/live.fi -- the LIVING document (round B4).
+//
+// Rounds B1 to B3 built a pipeline that ran ONCE: markup in, picture out.
+// A script that changes the tree turns that into a loop, and the whole
+// question of this file is how much of the loop may be SKIPPED.
+//
+// THE MARK. Every node carries four bits (`lib/browser/node.fi`, `dirty`):
+//
+//     D_SELF          this element's computed style is stale
+//     D_TEXT          its text changed -- its box has to be built again
+//     D_LAYOUT        its box has to be laid out again
+//     D_CHILD         somewhere BELOW here something is stale
+//     D_CHILD_LAYOUT  ... and it needs layout
+//
+// The first three are set ON the node that changed. The last two are
+// carried UP to the root and stop at the first ancestor that already has
+// them -- that is what makes a thousand changes under one node cost one
+// walk instead of a thousand. The walk downwards turns round at every
+// branch that carries neither bit.
+//
+// THE TWO WIDENINGS, and they are the honest part of this file. A computed
+// style does not depend on its element alone:
+//
+//   * INHERITANCE. Restyling an element means restyling its whole subtree.
+//     There is no cheaper rule that is also correct: `color` on a `div`
+//     reaches every descendant that did not set its own.
+//   * SIBLING AND POSITIONAL SELECTORS. `.a + .b` and `li:nth-child(2)`
+//     make an element's style depend on its neighbours. So a change to an
+//     element widens to its FOLLOWING SIBLINGS, and a change to a child
+//     LIST widens to all children -- but ONLY IF the stylesheet in force
+//     really contains such a selector. `live_scan_rules` looks once, and
+//     `has_sibling`/`has_positional` decide. A document whose sheet has
+//     neither pays nothing for the possibility.
+//
+// THE LAYOUT SCOPE. A box whose outer size cannot change from within is a
+// wall: everything outside it keeps its geometry. This file takes the
+// narrow, provable version of that rule -- a definite `width` AND a
+// definite `height`, both in px, no float, not out of flow. From the
+// changed element it walks UP to the nearest such ancestor and lays out
+// only that subtree. If there is none, the whole document is laid out.
+//
+// AND THE COUNTER-CHECK, which is the only reason any of this may be
+// believed: `live_verify` lays the same document out from scratch and
+// compares EVERY box, x, y, w and h. A scoped update that does not give
+// the same picture as a full one is a bug, not an optimisation. The
+// programme in lib/browser/b4_main.fi runs both and prints both numbers.
+import html.mem
+import browser.node
+import browser.names
+import browser.tag
+import dom.api
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+import layout.box
+import layout.build
+import layout.flow
+
+export {
+    Live,
+    live_new, live_init, live_free,
+    live_set_viewport, live_set_font, live_set_scoped,
+    live_add_sheet, live_add_ua, live_load, live_document,
+    live_root_box, live_styles, live_style_of, live_root_style,
+    live_names, live_ctx,
+    live_mark_style, live_mark_text, live_mark_children, live_mark_all,
+    live_update, live_full, live_verify,
+    live_styled, live_visited, live_boxed, live_laid, live_total_boxes,
+    live_generation, live_scope_hit,
+    live_has_sibling, live_has_positional,
+    live_style_us, live_layout_us, live_dump, live_vw, live_vh,
+}
+
+struct Live {
+    // --- the GC fields. They are the reason a `Live` belongs in a frame:
+    // the collector scans the stack conservatively (SPEC 3.5.3), so a
+    // struct that holds managed pointers has to stand where it can see it.
+    doc: Gc[Node],
+    styles: Gc[GcMap],
+    root_style: Gc[Style],
+    rules: Gc[Rule],
+    root: Gc[Box],
+
+    t: tok.Tokens,
+    cx: sel.Ctx,
+    w: cascade.Winner,
+    text: mem.CpBuf,
+    tmp: mem.CpBuf,
+    nm: *mut names.Names,
+    order: u32,
+    style_attr: u32,
+    vw: f64,
+    vh: f64,
+    fm: u64,
+    ua_done: bool,
+    scoped: bool,
+    has_sibling: bool,
+    has_positional: bool,
+    // --- the counters. Everything this round claims is one of these.
+    styled: u64, // elements whose style was computed again
+    visited: u64, // nodes the walk looked at
+    boxed: u64, // boxes built again
+    laid: u64, // boxes laid out
+    total: u64, // boxes in the tree
+    scope_hit: u64, // updates that found a layout wall
+    generation: u64,
+    us_style: u64,
+    us_layout: u64,
+}
+
+// The clock, microseconds. CLOCK_MONOTONIC, number 228 on x86-64 -- the
+// same call lib/paint/b3_main.fi uses, for the same reason.
+fn micros() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000 + (ts[1] as u64) / 1000
+}
+
+fn live_new(nm: *mut names.Names) -> Live {
+    return Live {
+        doc: gc_null[Node](), styles: gc_null[GcMap](),
+        root_style: gc_null[Style](), rules: gc_null[Rule](),
+        root: gc_null[Box](),
+        t: tok.tokens_new(), cx: sel.ctx_new(nm), w: cascade.winner_new(),
+        text: mem.cp_new(), tmp: mem.cp_new(), nm: nm,
+        order: 0, style_attr: 0, vw: 800.0, vh: 600.0, fm: 0,
+        ua_done: false, scoped: true,
+        has_sibling: false, has_positional: false,
+        styled: 0, visited: 0, boxed: 0, laid: 0, total: 0, scope_hit: 0,
+        generation: 0, us_style: 0, us_layout: 0,
+    }
+}
+
+fn live_init(l: *mut Live) -> bool {
+    tok.tokens_init(&(*l).t)
+    sel.ctx_init(&(*l).cx)
+    mem.cp_init(&(*l).text)
+    mem.cp_init(&(*l).tmp)
+    var lit: [u8; 5] = "style"
+    (*l).style_attr = names.names_of_bytes((*l).nm, &lit[0], 5)
+    return true
+}
+
+fn live_free(l: *mut Live) {
+    sel.ctx_free(&(*l).cx)
+    mem.cp_free(&(*l).text)
+    mem.cp_free(&(*l).tmp)
+    (*l).doc = gc_null[Node]()
+    (*l).styles = gc_null[GcMap]()
+    (*l).root_style = gc_null[Style]()
+    (*l).rules = gc_null[Rule]()
+    (*l).root = gc_null[Box]()
+}
+
+fn live_set_viewport(l: *mut Live, w: f64, h: f64) {
+    (*l).vw = w
+    (*l).vh = h
+}
+
+fn live_set_font(l: *mut Live, fm: u64) { (*l).fm = fm }
+fn live_set_scoped(l: *mut Live, on: bool) { (*l).scoped = on }
+fn live_vw(l: *mut Live) -> f64 { return (*l).vw }
+fn live_vh(l: *mut Live) -> f64 { return (*l).vh }
+fn live_document(l: *mut Live) -> Gc[Node] { return (*l).doc }
+fn live_root_box(l: *mut Live) -> Gc[Box] { return (*l).root }
+fn live_styles(l: *mut Live) -> Gc[GcMap] { return (*l).styles }
+fn live_root_style(l: *mut Live) -> Gc[Style] { return (*l).root_style }
+fn live_names(l: *mut Live) -> *mut names.Names { return (*l).nm }
+fn live_ctx(l: *mut Live) -> *mut sel.Ctx { return &(*l).cx }
+fn live_styled(l: *mut Live) -> u64 { return (*l).styled }
+fn live_visited(l: *mut Live) -> u64 { return (*l).visited }
+fn live_boxed(l: *mut Live) -> u64 { return (*l).boxed }
+fn live_laid(l: *mut Live) -> u64 { return (*l).laid }
+fn live_total_boxes(l: *mut Live) -> u64 { return (*l).total }
+fn live_scope_hit(l: *mut Live) -> u64 { return (*l).scope_hit }
+fn live_generation(l: *mut Live) -> u64 { return (*l).generation }
+fn live_has_sibling(l: *mut Live) -> bool { return (*l).has_sibling }
+fn live_has_positional(l: *mut Live) -> bool { return (*l).has_positional }
+fn live_style_us(l: *mut Live) -> u64 { return (*l).us_style }
+fn live_layout_us(l: *mut Live) -> u64 { return (*l).us_layout }
+
+fn live_style_of(l: *mut Live, k: Gc[Node]) -> Gc[Style] {
+    if (*l).styles == gc_null[GcMap]() || k == gc_null[Node]() {
+        return gc_null[Style]()
+    }
+    return gcmap_get_value[Style]((*l).styles, k as u64)
+}
+
+// ------------------------------------------------------- The stylesheets
+
+fn chain_last(r: Gc[Rule]) -> Gc[Rule] {
+    var x: Gc[Rule] = r
+    while x != gc_null[Rule]() && x.next != gc_null[Rule]() {
+        x = x.next
+    }
+    return x
+}
+
+fn add_parsed(l: *mut Live, origin: u32) -> AllocError!bool {
+    tok.tokenize(&(*l).t, &(*l).text)
+    var p: cv.Parser = cv.parser_new(&(*l).t)
+    let sheet = try cv.parse_stylesheet(&p)
+    var next_order: u32 = (*l).order
+    let part = try cascade.collect_rules(sheet, origin, next_order, (*l).nm,
+        &(*l).tmp, &next_order)
+    (*l).order = next_order
+    if part == gc_null[Rule]() {
+        return true
+    }
+    if (*l).rules == gc_null[Rule]() {
+        (*l).rules = part
+    } else {
+        let last: Gc[Rule] = chain_last((*l).rules)
+        last.next = part
+    }
+    return true
+}
+
+fn byte_at(p: *mut u8, n: usize, i: usize) -> u32 {
+    if i >= n {
+        return 0
+    }
+    return (*((p as u64 + i as u64) as *mut u8)) as u32
+}
+
+fn bytes_to_cp(l: *mut Live, p: *mut u8, n: usize) {
+    mem.cp_clear(&(*l).text)
+    var i: usize = 0
+    while i < n {
+        let c0: u32 = byte_at(p, n, i)
+        if c0 < 0x80 as u32 {
+            mem.cp_push(&(*l).text, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 {
+            mem.cp_push(&(*l).text, ((c0 & 0x07 as u32) << 18) |
+                ((byte_at(p, n, i + 1) & 0x3F as u32) << 12) |
+                ((byte_at(p, n, i + 2) & 0x3F as u32) << 6) |
+                (byte_at(p, n, i + 3) & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 {
+            mem.cp_push(&(*l).text, ((c0 & 0x0F as u32) << 12) |
+                ((byte_at(p, n, i + 1) & 0x3F as u32) << 6) |
+                (byte_at(p, n, i + 2) & 0x3F as u32))
+            i = i + 3
+        } else {
+            mem.cp_push(&(*l).text, ((c0 & 0x1F as u32) << 6) |
+                (byte_at(p, n, i + 1) & 0x3F as u32))
+            i = i + 2
+        }
+    }
+}
+
+fn live_add_sheet(l: *mut Live, origin: u32, p: *mut u8,
+    n: usize) -> AllocError!bool {
+    bytes_to_cp(l, p, n)
+    return try add_parsed(l, origin)
+}
+
+fn live_add_ua(l: *mut Live, p: *mut u8, n: usize) -> AllocError!bool {
+    if (*l).ua_done {
+        return true
+    }
+    (*l).ua_done = true
+    return try live_add_sheet(l, cascade.ORIGIN_UA, p, n)
+}
+
+// The `<style>` elements of the document, in document order.
+fn add_document_sheets(l: *mut Live) -> AllocError!bool {
+    var e: Gc[Elem] = api.dom_first_elem((*l).doc)
+    while e != gc_null[Elem]() {
+        if e.ns == node.NS_HTML && e.name == tag.M_STYLE {
+            let text = try api.dom_text_content(e)
+            mem.cp_clear(&(*l).text)
+            node.chain_after_cpbuf(text, &(*l).text)
+            let ok: bool = try add_parsed(l, cascade.ORIGIN_AUTHOR)
+        }
+        e = api.dom_next_elem(e, (*l).doc)
+    }
+    return true
+}
+
+// Does any selector in force use a sibling combinator or a positional
+// class? One walk, once -- and it decides how far a change has to widen.
+fn live_scan_rules(l: *mut Live) {
+    (*l).has_sibling = false
+    (*l).has_positional = false
+    var r: Gc[Rule] = (*l).rules
+    while r != gc_null[Rule]() {
+        var s: Gc[Sel] = r.sel
+        while s != gc_null[Sel]() {
+            var c: Gc[Cpd] = s.right
+            while c != gc_null[Cpd]() {
+                if c.combinator == sel.CB_NEXT || c.combinator == sel.CB_LATER {
+                    (*l).has_sibling = true
+                }
+                var sm: Gc[Sim] = c.first
+                while sm != gc_null[Sim]() {
+                    if sm.kind == sel.SIM_NTH_CHILD ||
+                    sm.kind == sel.SIM_NTH_LAST_CHILD ||
+                    sm.kind == sel.SIM_FIRST_CHILD ||
+                    sm.kind == sel.SIM_LAST_CHILD ||
+                    sm.kind == sel.SIM_ONLY_CHILD {
+                        (*l).has_positional = true
+                    }
+                    sm = sm.next
+                }
+                c = c.left
+            }
+            s = s.next
+        }
+        r = r.next
+    }
+}
+
+// ------------------------------------------------------------ The marks
+
+// An element changed: attribute, inline style, class. Its own style and
+// everything that inherits from it.
+fn live_mark_style(l: *mut Live, k: Gc[Node]) {
+    if k == gc_null[Node]() {
+        return
+    }
+    node.node_mark(k, node.D_SELF | node.D_LAYOUT)
+    if (*l).has_sibling {
+        var s: Gc[Node] = k.next
+        while s != gc_null[Node]() {
+            node.node_mark(s, node.D_SELF | node.D_LAYOUT)
+            s = s.next
+        }
+    }
+    node.node_mark_up(k.parent, node.D_CHILD | node.D_CHILD_LAYOUT)
+    node.node_mark(k, node.D_SELF | node.D_LAYOUT)
+}
+
+// A text node changed.
+fn live_mark_text(l: *mut Live, k: Gc[Node]) {
+    if k == gc_null[Node]() {
+        return
+    }
+    node.node_mark(k, node.D_TEXT)
+    let p: Gc[Node] = k.parent
+    if p != gc_null[Node]() {
+        node.node_mark(p, node.D_TEXT | node.D_LAYOUT)
+        node.node_mark_up(p, node.D_CHILD | node.D_CHILD_LAYOUT)
+    }
+}
+
+// The child LIST of `p` changed: something was inserted or removed.
+fn live_mark_children(l: *mut Live, p: Gc[Node]) {
+    if p == gc_null[Node]() {
+        return
+    }
+    node.node_mark(p, node.D_TEXT | node.D_LAYOUT)
+    if (*l).has_positional {
+        var c: Gc[Node] = p.first_child
+        while c != gc_null[Node]() {
+            node.node_mark(c, node.D_SELF)
+            c = c.next
+        }
+    }
+    node.node_mark_up(p, node.D_CHILD | node.D_CHILD_LAYOUT)
+}
+
+// Everything. The counter-check switch: with this the update does exactly
+// as much work as a fresh load, and the two numbers can be put side by
+// side.
+fn live_mark_all(l: *mut Live) {
+    var k: Gc[Node] = (*l).doc
+    while k != gc_null[Node]() {
+        node.node_mark(k, node.D_SELF | node.D_TEXT | node.D_LAYOUT |
+            node.D_CHILD | node.D_CHILD_LAYOUT)
+        k = api.dom_next(k, (*l).doc)
+    }
+}
+
+fn clear_marks(l: *mut Live) {
+    var k: Gc[Node] = (*l).doc
+    while k != gc_null[Node]() {
+        node.node_clean(k)
+        k = api.dom_next(k, (*l).doc)
+    }
+}
+
+// -------------------------------------------------------- The style pass
+
+fn inline_declarations(l: *mut Live, e: Gc[Elem]) -> AllocError!Gc[GcVec] {
+    let v: Gc[Chain] = node.attr_value(e, (*l).style_attr, 0)
+    if v == gc_null[Chain]() || node.chain_len(v) == 0 {
+        return gc_null[GcVec]()
+    }
+    mem.cp_clear(&(*l).text)
+    node.chain_after_cpbuf(v, &(*l).text)
+    tok.tokenize(&(*l).t, &(*l).text)
+    var p: cv.Parser = cv.parser_new(&(*l).t)
+    let values = try cv.parse_component_value_list(&p)
+    return try cascade.parse_inline_declarations(values)
+}
+
+fn style_one(l: *mut Live, e: Gc[Elem], parent: Gc[Style]) -> bool {
+    let inline = inline_declarations(l, e) catch gc_null[GcVec]()
+    let computed = cascade.cascade_elem_inline((*l).rules, e, parent,
+        &(*l).cx, &(*l).w, inline) catch gc_null[Style]()
+    if computed == gc_null[Style]() {
+        return false
+    }
+    let ok: bool = gcmap_set_value[Style]((*l).styles, e as u64, computed)
+    catch false
+    (*l).styled = (*l).styled + 1
+    return ok
+}
+
+fn parent_style_of(l: *mut Live, k: Gc[Node]) -> Gc[Style] {
+    let p: Gc[Node] = k.parent
+    if p != gc_null[Node]() && p.kind == node.K_ELEM {
+        let s: Gc[Style] = gcmap_get_value[Style]((*l).styles, p as u64)
+        if s != gc_null[Style]() {
+            return s
+        }
+    }
+    return (*l).root_style
+}
+
+// The whole subtree under `k`, unconditionally -- this is what
+// INHERITANCE costs, and it is the reason a restyle is never one element.
+fn style_subtree(l: *mut Live, k: Gc[Node], parent: Gc[Style]) -> bool {
+    (*l).visited = (*l).visited + 1
+    var mine: Gc[Style] = parent
+    if k.kind == node.K_ELEM {
+        if !style_one(l, node.node_as_elem(k), parent) {
+            return false
+        }
+        mine = gcmap_get_value[Style]((*l).styles, k as u64)
+    }
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if !style_subtree(l, c, mine) {
+            return false
+        }
+        c = c.next
+    }
+    return true
+}
+
+// The narrowed walk: down only where a mark says so.
+fn style_walk(l: *mut Live, k: Gc[Node], parent: Gc[Style]) -> bool {
+    (*l).visited = (*l).visited + 1
+    let d: u32 = node.node_dirty(k)
+    if (d & node.D_SELF) != 0 as u32 {
+        return style_subtree(l, k, parent)
+    }
+    var mine: Gc[Style] = parent
+    if k.kind == node.K_ELEM {
+        let s: Gc[Style] = gcmap_get_value[Style]((*l).styles, k as u64)
+        if s != gc_null[Style]() {
+            mine = s
+        } else {
+            // never styled (a fresh node whose parent was not marked)
+            if !style_one(l, node.node_as_elem(k), parent) {
+                return false
+            }
+            mine = gcmap_get_value[Style]((*l).styles, k as u64)
+        }
+    }
+    if (d & node.D_CHILD) == 0 as u32 {
+        return true // the whole branch is clean -- turn round HERE
+    }
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if !style_walk(l, c, mine) {
+            return false
+        }
+        c = c.next
+    }
+    return true
+}
+
+// ---------------------------------------------------------- The box tree
+
+fn count_boxes(b: Gc[Box]) -> u64 {
+    if b == gc_null[Box]() {
+        return 0
+    }
+    var n: u64 = 1
+    var i: u64 = 0
+    let m: u64 = box.box_kids(b)
+    while i < m {
+        n = n + count_boxes(box.box_kid(b, i))
+        i = i + 1
+    }
+    return n
+}
+
+fn rebuild_boxes(l: *mut Live) -> bool {
+    let r = build.build_document((*l).doc, (*l).styles, (*l).root_style,
+        (*l).nm) catch gc_null[Box]()
+    (*l).root = r
+    (*l).total = count_boxes(r)
+    (*l).boxed = (*l).total
+    if r != gc_null[Box]() {
+        box.box_stamp_font(r, (*l).fm)
+    }
+    return true
+}
+
+// The box that belongs to a DOM node, found by walking DOWN from the root
+// along the DOM ancestor chain. The box tree has no parent pointer (round
+// 61 left it out on purpose), so this is the way round: at most as many
+// steps as the tree is deep, times the fan-out of each level.
+fn box_for(l: *mut Live, k: Gc[Node], parent_out: *mut Gc[Box]) -> Gc[Box] {
+    *parent_out = gc_null[Box]()
+    if (*l).root == gc_null[Box]() || k == gc_null[Node]() {
+        return gc_null[Box]()
+    }
+    return box_search((*l).root, gc_null[Box](), k, parent_out)
+}
+
+fn box_search(b: Gc[Box], parent: Gc[Box], k: Gc[Node],
+    parent_out: *mut Gc[Box]) -> Gc[Box] {
+    if b.elem == k {
+        *parent_out = parent
+        return b
+    }
+    var i: u64 = 0
+    let m: u64 = box.box_kids(b)
+    while i < m {
+        let got: Gc[Box] = box_search(box.box_kid(b, i), b, k, parent_out)
+        if got != gc_null[Box]() {
+            return got
+        }
+        i = i + 1
+    }
+    return gc_null[Box]()
+}
+
+// A LAYOUT WALL: a box whose outer size cannot change from within. Narrow
+// on purpose -- a definite px width and a definite px height, in flow, not
+// floated, not a flex item. Everything else is refused, because a wall
+// that is not one gives a wrong picture, and a picture is what is being
+// measured.
+fn is_wall(b: Gc[Box]) -> bool {
+    if b == gc_null[Box]() {
+        return false
+    }
+    if b.kind != box.BK_BLOCK && b.kind != box.BK_FLEX {
+        return false
+    }
+    if (b.flags & (box.F_ABS | box.F_FLOAT | box.F_FLEX_ITEM)) != 0 as u32 {
+        return false
+    }
+    let s: Gc[Style] = b.style
+    if s == gc_null[Style]() {
+        return false
+    }
+    if box.length_is_auto(s, cascade.S_WIDTH) ||
+    box.length_is_auto(s, cascade.S_HEIGHT) {
+        return false
+    }
+    if cascade.style_unit(s, cascade.S_WIDTH) != cascade.U_PX ||
+    cascade.style_unit(s, cascade.S_HEIGHT) != cascade.U_PX {
+        return false
+    }
+    // It has to open its own block formatting context, or the floats of
+    // the world outside reach into it and a fresh float context is the
+    // wrong one.
+    if !box.is_bfc_root(b) {
+        return false
+    }
+    // A box that has NOT been placed yet has no old position to keep.
+    return (b.flags & box.F_PLACED) != 0 as u32
+}
+
+// The deepest marked node, and from it the nearest wall above. Returns the
+// wall's box, or null when there is none.
+fn find_scope(l: *mut Live, k: Gc[Node], found: *mut Gc[Node]) -> bool {
+    let d: u32 = node.node_dirty(k)
+    if (d & (node.D_LAYOUT | node.D_TEXT)) != 0 as u32 {
+        if *found != gc_null[Node]() {
+            return false // more than one -- no single scope
+        }
+        *found = k
+    }
+    if (d & node.D_CHILD_LAYOUT) == 0 as u32 {
+        return true
+    }
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if !find_scope(l, c, found) {
+            return false
+        }
+        c = c.next
+    }
+    return true
+}
+
+// THE WALL HAS TO BE A PROPER ANCESTOR. If the changed element IS the
+// wall, its own margins may have changed and its outer position with them
+// -- laying it out in place would then keep a position that is no longer
+// right. Starting one level up costs nothing and removes the whole class
+// of error; it was found by the counter-check, not by reading the code.
+fn scope_box(l: *mut Live, k: Gc[Node], parent_out: *mut Gc[Box]) -> Gc[Box] {
+    var up: Gc[Node] = k.parent
+    while up != gc_null[Node]() {
+        var pb: Gc[Box] = gc_null[Box]()
+        let b: Gc[Box] = box_for(l, up, &pb)
+        if b != gc_null[Box]() && is_wall(b) && pb != gc_null[Box]() {
+            *parent_out = pb
+            return b
+        }
+        up = up.parent
+    }
+    *parent_out = gc_null[Box]()
+    return gc_null[Box]()
+}
+
+// ------------------------------------------------------------ The layout
+
+fn layout_full(l: *mut Live) -> bool {
+    if (*l).root == gc_null[Box]() {
+        (*l).laid = 0
+        return true
+    }
+    box.box_stamp_font((*l).root, (*l).fm)
+    box.box_stamp_alpha((*l).root, 1.0)
+    let ok: bool = flow.relayout_document((*l).root, (*l).vw, (*l).vh)
+    catch false
+    box.box_stamp_clip((*l).root, 0.0 - 1.0e9, 0.0 - 1.0e9, 1.0e9, 1.0e9)
+    (*l).laid = (*l).total
+    return ok
+}
+
+// Lay out ONE subtree and put it back exactly where it stood. `place_tree`
+// adds an offset to the relative coordinates the layout produced, so the
+// offset that restores the old absolute position can be computed from the
+// numbers themselves -- no parent pointer needed.
+// The INTRINSIC CACHE (`int_min`/`int_max`/`int_ok`, round B2) survives a
+// reflow on purpose -- the width of the window cannot change what a box
+// contributes. A STYLE change can: one line of `padding` moves the
+// min-content width of every ancestor up to the wall. The full path gets
+// this for free because it builds new boxes; the scoped path reuses them
+// and has to say so. Found by the counter-check, at 476 wrong boxes.
+fn clear_intrinsic(b: Gc[Box]) {
+    if b == gc_null[Box]() {
+        return
+    }
+    b.int_ok = 0
+    var i: u64 = 0
+    let m: u64 = box.box_kids(b)
+    while i < m {
+        clear_intrinsic(box.box_kid(b, i))
+        i = i + 1
+    }
+}
+
+// A restyle makes a NEW `Style` object and puts it in the table. The boxes
+// still point at the old one -- the full path never notices, because it
+// builds new boxes anyway, and the scoped path would lay out the old
+// style and get the old picture. That is what the counter-check caught:
+// 14 boxes with a margin that had just been taken away.
+//
+// A text box carries the style of its parent element, and an anonymous
+// block carries `style_anonymous` of it (lib/layout/build.fi), so the walk
+// has to carry the inherited style down with it.
+fn refresh_styles(l: *mut Live, b: Gc[Box], inherited: Gc[Style]) {
+    if b == gc_null[Box]() {
+        return
+    }
+    var mine: Gc[Style] = inherited
+    let e: Gc[Node] = b.elem
+    if e != gc_null[Node]() && e.kind == node.K_ELEM {
+        let s: Gc[Style] = gcmap_get_value[Style]((*l).styles, e as u64)
+        if s != gc_null[Style]() {
+            b.style = s
+            mine = s
+        } else {
+            mine = b.style
+        }
+    } else if b.kind == box.BK_TEXT {
+        b.style = inherited
+    } else if b.kind == box.BK_ANON {
+        let a = cascade.style_anonymous(inherited) catch gc_null[Style]()
+        if a != gc_null[Style]() {
+            b.style = a
+        }
+    }
+    var i: u64 = 0
+    let m: u64 = box.box_kids(b)
+    while i < m {
+        refresh_styles(l, box.box_kid(b, i), mine)
+        i = i + 1
+    }
+}
+
+fn layout_scope(l: *mut Live, b: Gc[Box], parent: Gc[Box]) -> bool {
+    let ax: f64 = b.x
+    let ay: f64 = b.y
+    let cbw: f64 = parent.w
+    var cbh: f64 = parent.h
+    refresh_styles(l, b, b.style)
+    box.reset_box_geometry(b)
+    clear_intrinsic(b)
+    box.box_stamp_font(b, (*l).fm)
+    var fc: box.FloatCtx = box.floatctx_new()
+    let okf: bool = box.floatctx_init(&fc) catch false
+    let ok: bool = flow.layout_block(b, cbw, cbh, true, &fc) catch false
+    flow.place_tree(b, ax - b.x - b.rel_x, ay - b.y - b.rel_y)
+    box.box_stamp_alpha(b, 1.0)
+    box.box_stamp_clip(b, 0.0 - 1.0e9, 0.0 - 1.0e9, 1.0e9, 1.0e9)
+    (*l).laid = count_boxes(b)
+    (*l).scope_hit = (*l).scope_hit + 1
+    return ok
+}
+
+// --------------------------------------------------------------- The load
+
+// The first pass: styles for every element, a box tree, a layout.
+fn live_load(l: *mut Live, doc: Gc[Node]) -> bool {
+    (*l).doc = doc
+    let ok: bool = add_document_sheets(l) catch false
+    if !ok {
+        return false
+    }
+    live_scan_rules(l)
+    (*l).styles = gcmap_new(true, true) catch gc_null[GcMap]()
+    (*l).root_style = cascade.style_root() catch gc_null[Style]()
+    if (*l).styles == gc_null[GcMap]() || (*l).root_style == gc_null[Style]() {
+        return false
+    }
+    sel.ctx_set_hover(&(*l).cx, gc_null[Node]())
+    (*l).styled = 0
+    (*l).visited = 0
+    let t0: u64 = micros()
+    if !style_subtree(l, doc, (*l).root_style) {
+        return false
+    }
+    let t1: u64 = micros()
+    (*l).us_style = t1 - t0
+    if !rebuild_boxes(l) {
+        return false
+    }
+    let okl: bool = layout_full(l)
+    (*l).us_layout = micros() - t1
+    clear_marks(l)
+    (*l).generation = (*l).generation + 1
+    return okl
+}
+
+// EVERYTHING again, as if the document had just arrived. This is the
+// yardstick the narrowed update is measured against.
+fn live_full(l: *mut Live) -> bool {
+    (*l).styled = 0
+    (*l).visited = 0
+    let t0: u64 = micros()
+    if !style_subtree(l, (*l).doc, (*l).root_style) {
+        return false
+    }
+    let t1: u64 = micros()
+    (*l).us_style = t1 - t0
+    if !rebuild_boxes(l) {
+        return false
+    }
+    let ok: bool = layout_full(l)
+    (*l).us_layout = micros() - t1
+    clear_marks(l)
+    (*l).generation = (*l).generation + 1
+    return ok
+}
+
+// THE NARROWED UPDATE. Style only where a mark says so; the box tree again
+// only when the structure or a text changed; the layout only inside the
+// nearest wall.
+fn live_update(l: *mut Live) -> bool {
+    if (*l).doc == gc_null[Node]() {
+        return false
+    }
+    if !(*l).scoped {
+        return live_full(l)
+    }
+    (*l).styled = 0
+    (*l).visited = 0
+    (*l).boxed = 0
+    (*l).laid = 0
+    let t0: u64 = micros()
+    if !style_walk(l, (*l).doc, (*l).root_style) {
+        return false
+    }
+    let t1: u64 = micros()
+    (*l).us_style = t1 - t0
+
+    // Did the STRUCTURE change? Then the box tree has to be built again.
+    // Rebuilding it throws every position away, so a scoped layout is not
+    // possible in the same step -- that is a limit, and it is named in
+    // docs/ROUNDB4.md rather than papered over.
+    var structural: bool = false
+    var k: Gc[Node] = (*l).doc
+    while k != gc_null[Node]() {
+        let d: u32 = node.node_dirty(k)
+        if (d & node.D_TEXT) != 0 as u32 {
+            structural = true
+            break
+        }
+        if (d & (node.D_CHILD | node.D_SELF | node.D_CHILD_LAYOUT)) ==
+        0 as u32 {
+            // clean branch: skip it whole
+            var nx: Gc[Node] = k.next
+            var up: Gc[Node] = k
+            while nx == gc_null[Node]() && up != (*l).doc {
+                up = up.parent
+                if up == gc_null[Node]() {
+                    break
+                }
+                nx = up.next
+            }
+            k = nx
+            continue
+        }
+        k = api.dom_next(k, (*l).doc)
+    }
+    var ok: bool = true
+    if structural {
+        if !rebuild_boxes(l) {
+            return false
+        }
+        ok = layout_full(l)
+    } else {
+        // find the single changed node and the wall above it
+        var one: Gc[Node] = gc_null[Node]()
+        let single: bool = find_scope(l, (*l).doc, &one)
+        var done: bool = false
+        if single && one != gc_null[Node]() {
+            var pb: Gc[Box] = gc_null[Box]()
+            let wall: Gc[Box] = scope_box(l, one, &pb)
+            if wall != gc_null[Box]() {
+                ok = layout_scope(l, wall, pb)
+                done = true
+            }
+        }
+        if !done {
+            // No wall: the whole document, but the boxes are the old ones
+            // and their style pointers have to be brought up to date the
+            // same way.
+            if (*l).root != gc_null[Box]() {
+                refresh_styles(l, (*l).root, (*l).root_style)
+                clear_intrinsic((*l).root)
+            }
+            ok = layout_full(l)
+        }
+    }
+    (*l).us_layout = micros() - t1
+    clear_marks(l)
+    (*l).generation = (*l).generation + 1
+    return ok
+}
+
+// -------------------------------------------------------- The counter-check
+
+fn geom_collect(b: Gc[Box], out: *mut mem.Buf) {
+    if b == gc_null[Box]() {
+        return
+    }
+    push_f(out, b.x)
+    push_f(out, b.y)
+    push_f(out, b.w)
+    push_f(out, b.h)
+    var i: u64 = 0
+    let m: u64 = box.box_kids(b)
+    while i < m {
+        geom_collect(box.box_kid(b, i), out)
+        i = i + 1
+    }
+}
+
+fn push_f(out: *mut mem.Buf, v: f64) {
+    // The bit pattern, so that the comparison is exact and not "close".
+    let u: u64 = f64_bits(v)
+    var i: usize = 0
+    while i < 8 {
+        mem.buf_push(out, ((u >> (8 * i as u64)) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+fn f64_bits(v: f64) -> u64 {
+    var x: f64 = v
+    return *((&x) as *mut u64)
+}
+
+// Lays the SAME document out from scratch and compares every box. Returns
+// the number of boxes whose geometry differs -- 0 is the only acceptable
+// answer, and a number that is not 0 means the narrowing is wrong.
+fn live_verify(l: *mut Live) -> u64 {
+    var before: mem.Buf = mem.buf_new()
+    mem.buf_init(&before)
+    geom_collect((*l).root, &before)
+    let sty: u64 = (*l).styled
+    let vis: u64 = (*l).visited
+    let bx: u64 = (*l).boxed
+    let la: u64 = (*l).laid
+    let us: u64 = (*l).us_style
+    let ul: u64 = (*l).us_layout
+    let ok: bool = live_full(l)
+    var after: mem.Buf = mem.buf_new()
+    mem.buf_init(&after)
+    geom_collect((*l).root, &after)
+    (*l).styled = sty
+    (*l).visited = vis
+    (*l).boxed = bx
+    (*l).laid = la
+    (*l).us_style = us
+    (*l).us_layout = ul
+    var bad: u64 = 0
+    let na: usize = mem.buf_len(&before)
+    let nb: usize = mem.buf_len(&after)
+    if na != nb {
+        bad = 1
+        if na > nb {
+            bad = ((na - nb) / 32) as u64 + 1
+        } else {
+            bad = ((nb - na) / 32) as u64 + 1
+        }
+    } else {
+        var i: usize = 0
+        while i + 32 <= na {
+            var same: bool = true
+            var q: usize = 0
+            while q < 32 {
+                if mem.buf_at(&before, i + q) != mem.buf_at(&after, i + q) {
+                    same = false
+                    break
+                }
+                q = q + 1
+            }
+            if !same {
+                bad = bad + 1
+            }
+            i = i + 32
+        }
+    }
+    mem.buf_free(&before)
+    mem.buf_free(&after)
+    return bad
+}
+
+// The geometry of every box as text, for the days when `bad` is not 0 and
+// somebody has to see WHICH box moved.
+fn live_dump(l: *mut Live, out: *mut mem.Buf) {
+    dump_box((*l).root, out, 0)
+}
+
+fn dump_box(b: Gc[Box], out: *mut mem.Buf, depth: u32) {
+    if b == gc_null[Box]() {
+        return
+    }
+    mem.buf_push_dec(out, depth as u64)
+    mem.buf_push(out, 32 as u8)
+    mem.buf_push_dec(out, b.kind as u64)
+    mem.buf_push(out, 32 as u8)
+    dump_num(out, b.x)
+    dump_num(out, b.y)
+    dump_num(out, b.w)
+    dump_num(out, b.h)
+    dump_num(out, b.mt)
+    dump_num(out, b.pt)
+    mem.buf_push(out, 10 as u8)
+    var i: u64 = 0
+    let m: u64 = box.box_kids(b)
+    while i < m {
+        dump_box(box.box_kid(b, i), out, depth + 1 as u32)
+        i = i + 1
+    }
+}
+
+fn dump_num(out: *mut mem.Buf, v: f64) {
+    var x: f64 = v * 100.0
+    if x < 0.0 {
+        mem.buf_push(out, 45 as u8)
+        x = 0.0 - x
+    }
+    mem.buf_push_dec(out, x as u64)
+    mem.buf_push(out, 32 as u8)
+}

@@ -1,0 +1,1397 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// bin/firnc1.fi -- THE COMPILER, WRITTEN IN FIRN.
+//
+// The whole chain in one file: text -> tokens -> tree -> types -> FIR ->
+// x86-64 assembly -> `as` -> `ld` -> executable.
+//
+// Usage:
+//     firnc1 source.fi            assembly on standard output
+//     firnc1 source.fi -o target  build an executable
+//
+// With `-o`, `firnc1` writes `target.s`, calls `/usr/bin/as` and `/usr/bin/ld`
+// through `fork`/`execve` and does not clean up the intermediate files (they
+// are the best evidence of what was really produced). That settles point 11
+// of the list in docs/SELF_HOSTING.md.
+//
+// Return values: 0 = assembly produced * 1 = error * 2 = I/O *
+// 3 = not core language * 4 = comptime needed * 5 = `defer` *
+// 6 = the code generator cannot do this FIR (floating point, > 6 arguments).
+
+import rt
+import vec
+import intern
+import lexer
+import ast
+import mono
+import pattern
+import err
+import time
+import gc
+import gctext
+import iface
+import package
+import lock
+import parser
+import types
+import sema
+import fir
+import lower
+import codegen
+
+// ---------------------------------------------------------- module system
+//
+// `import a.b` looks for `a/b.fi` in this order: (1) next to the importing
+// file, (2) next to the root file, (3) in `$FIRNLIB`, (4) in
+// `<directory of the running compiler binary>/../lib` -- the same rule
+// as in `firnc0` (`modules.rs::resolve`). All files end up in ONE tree
+// and share ONE name table; the renaming with `alias__` is done by the
+// parser.
+
+// The directory part of a path, including the trailing slash.
+fn dirname(b: *mut rt.Buf, path: u64, n: usize) {
+    var last: i64 = -1
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(path, i) == 47 as u8 {
+            last = i as i64
+        }
+        i = i + 1
+    }
+    if last >= 0 {
+        rt.buf_push_bytes(b, path, last as usize + 1)
+    }
+}
+
+// Builds `<dir><part1>/<part2>....fi\0` into `out`.
+fn module_path(out: *mut rt.Buf, dir: *mut rt.Buf, l: *mut lexer.Lexer,
+    of: usize, to: usize) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, rt.buf_ptr(dir), rt.buf_len(dir))
+    var i: usize = of
+    while i < to {
+        if lexer.lex_kind(l, i) == 1 {
+            let nr: u32 = lexer.lex_nr(l, i)
+            rt.buf_push_bytes(out, lexer.lex_name_ptr(l, nr), lexer.lex_name_length(l, nr))
+        } else {
+            rt.buf_push(out, 47 as u8)
+        }
+        i = i + 1
+    }
+    var e: [u8; 4] = ".fi\0"
+    rt.buf_push_bytes(out, (&e[0]) as u64, 4)
+}
+
+// Look up an environment variable in the start block. `envp` follows `argv`:
+//     [argc][argv0]..[argvN][0][envp0]..[0][auxv..]
+// Returns a pointer to the VALUE after `NAME=`, or 0 if it is not set.
+fn env(start: u64, name: u64, name_n: usize) -> u64 {
+    if start == 0 {
+        return 0
+    }
+    var i: usize = 1 + rt.arg_count(start) + 1
+    while true {
+        let p: u64 = rt.ld64(start, i)
+        if p == 0 {
+            break
+        }
+        var j: usize = 0
+        var equal: bool = true
+        while j < name_n {
+            if rt.ld8(p, j) != rt.ld8(name, j) {
+                equal = false
+                break
+            }
+            j = j + 1
+        }
+        if equal && rt.ld8(p, name_n) == 61 as u8 {
+            return p + name_n as u64 + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Installation fallback: the directory of the running compiler binary,
+// followed by `../lib/`. `firnc0` reads `current_exe` for this; here it
+// goes through `/proc/self/exe`. If that call fails, the buffer stays
+// empty and the step is skipped.
+fn exe_search_path(out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    var slf: [u8; 15] = "/proc/self/exe\0"
+    var target: [u8; 1024] = [0 as u8; 1024]
+    let sp: u64 = (&slf[0]) as u64
+    let zp: u64 = (&target[0]) as u64
+    let n: i64 = syscall(89, sp as i64, zp as i64, 1023, 0, 0, 0)
+    if n <= 0 {
+        return
+    }
+    var last: i64 = -1
+    var i: usize = 0
+    while i < n as usize {
+        if target[i] == 47 as u8 {
+            last = i as i64
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return
+    }
+    rt.buf_push_bytes(out, zp, last as usize + 1)
+    var rest: [u8; 8] = "../lib/\0"
+    rt.buf_push_bytes(out, (&rest[0]) as u64, 7)
+}
+
+// --------------------------------------------------------- search space
+//
+// Everything the resolution of ONE `import` needs. A struct, because
+// `lib/firnc1/codegen.fi` can do at most six arguments and the list would
+// have grown to eight with the package system (round 48).
+struct SearchSpace {
+    dir: rt.Buf, // directory of the importing file, with '/'
+    root_dir: rt.Buf, // directory of the root file, with '/'
+    firnlib: rt.Buf,
+    exelib: rt.Buf,
+    cwd: rt.Buf,
+    my_package: i64, // package of the importing file, -1 = none
+}
+
+fn sr_new() -> SearchSpace {
+    return SearchSpace {
+        dir: rt.buf_new(), root_dir: rt.buf_new(),
+        firnlib: rt.buf_new(), exelib: rt.buf_new(),
+        cwd: rt.buf_new(), my_package: 0 - 1,
+    }
+}
+
+fn sr_free(s: *mut SearchSpace) {
+    rt.buf_free(&(*s).dir)
+    rt.buf_free(&(*s).root_dir)
+    rt.buf_free(&(*s).firnlib)
+    rt.buf_free(&(*s).exelib)
+    rt.buf_free(&(*s).cwd)
+}
+
+fn buf_set(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, p, n)
+}
+
+// Which package does this file belong to? -1 = none (or no world).
+fn package_of_file(w: *mut package.World, cwd: *mut rt.Buf, p: u64, n: usize) -> i64 {
+    if package.world_is_empty(w) {
+        return 0 - 1
+    }
+    var abs: rt.Buf = rt.buf_new()
+    package.absolute(&abs, p, n, rt.buf_ptr(cwd), rt.buf_len(cwd))
+    let r: i64 = package.world_package_of(w, rt.buf_ptr(&abs), rt.buf_len(&abs))
+    rt.buf_free(&abs)
+    return r
+}
+
+// Is the argument exactly this option?
+fn arg_is(a: u64, an: usize, lit: u64) -> bool {
+    if an != rt.c_length(lit) {
+        return false
+    }
+    return rt.mem_eq(a, lit, an)
+}
+
+// ----------------------------------------------------------- module list
+//
+// The queue of all files of this translation. Index 0 is ALWAYS the root
+// file -- so that a module which imports the root again does not pull it
+// in a second time (`modules.rs::resolve` does the same).
+//
+// All paths lie one after another in ONE buffer, each terminated by a
+// null byte, because `open` needs them that way. THAT is why a pointer
+// from `ml_ptr` must not be used across an `ml_add`: the buffer grows
+// and afterwards lives somewhere else.
+struct ModuleList {
+    text: rt.Buf,
+    off: Vec[u32],
+    len: Vec[u32],
+    alias: Vec[u32],
+    // ROUND 73: 1 = this file was reached through an `import std.<name>`.
+    // The kernel profile asks about it (`// HOOK profil` in the module
+    // loop of `main`), because only a `std` module has to declare
+    // `profile kernel` itself before a kernel may use it. `compiler/src/
+    // modules.rs` reads the same thing off the parsed import path.
+    from_std: Vec[u32],
+}
+
+fn ml_new() -> ModuleList {
+    return ModuleList {
+        text: rt.buf_new(),
+        off: vec_new[u32](), len: vec_new[u32](), alias: vec_new[u32](),
+        from_std: vec_new[u32](),
+    }
+}
+
+fn ml_free(m: *mut ModuleList) {
+    rt.buf_free(&(*m).text)
+    vec_free[u32](&(*m).off)
+    vec_free[u32](&(*m).len)
+    vec_free[u32](&(*m).alias)
+    vec_free[u32](&(*m).from_std)
+}
+
+fn ml_count(m: *mut ModuleList) -> usize { return vec_len[u32](&(*m).off) }
+fn ml_alias(m: *mut ModuleList, i: usize) -> u32 { return vec_at[u32](&(*m).alias, i) }
+fn ml_length(m: *mut ModuleList, i: usize) -> usize {
+    return vec_at[u32](&(*m).len, i) as usize
+}
+fn ml_ptr(m: *mut ModuleList, i: usize) -> u64 {
+    return rt.buf_ptr(&(*m).text) + vec_at[u32](&(*m).off, i) as u64
+}
+
+fn ml_knows(m: *mut ModuleList, p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < ml_count(m) {
+        if ml_length(m, i) == n {
+            if rt.mem_eq(ml_ptr(m, i), p, n) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn ml_add(m: *mut ModuleList, p: u64, n: usize, alias: u32, from_std: bool) {
+    vec_push[u32](&(*m).off, rt.buf_len(&(*m).text) as u32)
+    vec_push[u32](&(*m).len, n as u32)
+    vec_push[u32](&(*m).alias, alias)
+    var f: u32 = 0
+    if from_std {
+        f = 1
+    }
+    vec_push[u32](&(*m).from_std, f)
+    rt.buf_push_bytes(&(*m).text, p, n)
+    rt.buf_push(&(*m).text, 0 as u8)
+}
+
+// ROUND 73: was this file reached through `import std.<name>`?
+fn ml_from_std(m: *mut ModuleList, i: usize) -> bool {
+    return vec_at[u32](&(*m).from_std, i) != 0
+}
+
+// ROUND 73 (`// HOOK profil`, twin of `compiler/src/prof.rs`).
+//
+// Does this token stream carry the declaration `profile kernel`? That is
+// the CLAIM by which a `std` module is admitted under the kernel profile.
+// It is read off the TOKENS and not off the text, because the word
+// `kernel` stands in many a comment -- the lexer has already thrown those
+// away.
+//
+// The claim is not believed: the module lands in the same compilation
+// unit as its importer, so `sema` walks its functions too and reports
+// every `syscall`, every `gc class` and every unmarked f64 in it at the
+// line where it stands.
+fn says_kernel(l: *mut lexer.Lexer) -> bool {
+    var s_kernel: [u8; 6] = "kernel"
+    var i: usize = 0
+    while i + 1 < lexer.lex_count(l) {
+        if lexer.lex_kind(l, i) == 13 {
+            if lexer.lex_kind(l, i + 1) == 1 {
+                let nr: u32 = lexer.lex_nr(l, i + 1)
+                if lexer.lex_name_length(l, nr) == 6 {
+                    if rt.mem_eq(lexer.lex_name_ptr(l, nr), (&s_kernel[0]) as u64, 6) {
+                        return true
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The message of `compiler/src/prof.rs::hook_import`, word for word (the
+// position comes out of `firnc0`; `firnc1` has no source map for imports).
+fn complain_std_module(it: *mut intern.Interner, alias: u32) {
+    var a: [u8; 23] = "error: the module 'std."
+    var b: [u8; 75] = "' belongs to the standard library and is not available in profile 'kernel'\n"
+    var c: [u8; 125] = "note: SPEC 2: the kernel profile has no global allocator and no runtime; the standard library presupposes both (mmap, write)\n"
+    var out: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&out, (&a[0]) as u64, 23)
+    if alias != 4294967295 {
+        rt.buf_push_bytes(&out, intern.intern_ptr(it, alias),
+            intern.intern_length(it, alias))
+    }
+    rt.buf_push_bytes(&out, (&b[0]) as u64, 75)
+    rt.buf_push_bytes(&out, (&c[0]) as u64, 125)
+    rt.write_everything(2, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+}
+
+// NAME CLASH (round 48): two DIFFERENT files with the same module name
+// were merged onto the same renaming `module__name` and would quietly
+// shadow each other. The search runs over the absolute paths, so that
+// two spellings of the same file are not a clash. Returns the index of
+// the older entry, or -1.
+fn ml_name_dup(ml: *mut ModuleList, cwd: *mut rt.Buf, new: u64, nn: usize) -> i64 {
+    var an: rt.Buf = rt.buf_new()
+    var bn: rt.Buf = rt.buf_new()
+    var xa: rt.Buf = rt.buf_new()
+    var xb: rt.Buf = rt.buf_new()
+    package.absolute(&xa, new, nn, rt.buf_ptr(cwd), rt.buf_len(cwd))
+    package.module_name(&an, rt.buf_ptr(&xa), rt.buf_len(&xa))
+    var r: i64 = 0 - 1
+    var i: usize = 0
+    while i < ml_count(ml) {
+        package.absolute(&xb, ml_ptr(ml, i), ml_length(ml, i),
+            rt.buf_ptr(cwd), rt.buf_len(cwd))
+        var same_file: bool = false
+        if rt.buf_len(&xa) == rt.buf_len(&xb) {
+            same_file = rt.mem_eq(rt.buf_ptr(&xa), rt.buf_ptr(&xb), rt.buf_len(&xa))
+        }
+        if !same_file {
+            package.module_name(&bn, rt.buf_ptr(&xb), rt.buf_len(&xb))
+            if rt.buf_len(&an) == rt.buf_len(&bn) {
+                if rt.mem_eq(rt.buf_ptr(&an), rt.buf_ptr(&bn), rt.buf_len(&an)) {
+                    r = i as i64
+                    break
+                }
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_free(&an)
+    rt.buf_free(&bn)
+    rt.buf_free(&xa)
+    rt.buf_free(&xb)
+    return r
+}
+
+// Resolve all `import` lines of a token stream and append the files that
+// are not known yet. That turns the list into a BREADTH FIRST SEARCH over
+// the whole import graph: a module may import a module without the root
+// file having to know about it.
+//
+// Before round 31 only the `import` lines of the ROOT FILE were read. That
+// went unnoticed for a long time, because `bin/firnc1.fi` lists all its
+// dependencies anyway -- `tests/640_vec_module.fi` however failed quietly
+// because `modules/vec.fi` did not get its own `rt`.
+//
+// SEARCH ORDER (round 48, twin of `modules.rs::resolve`):
+//   1. next to the importing file
+//   2. next to the root file
+//   3. in the `source` directories of its own package
+//   4. in a `needs` dependency of its own package, if the first path
+//      element is its name
+//   5. in `$FIRNLIB`
+//   6. in `<exe>/../lib`
+// Without a manifest the world is empty, 3 and 4 drop out, and the order
+// of round 39 remains.
+//
+// Returns: 0 = fine * 2 = module not found * 9 = package error, with the
+// finished message in `package.world_error(w)`.
+fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.World,
+    ml: *mut ModuleList) -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&path)
+    var base: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&base)
+    var abs: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&abs)
+    var mname: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&mname)
+    var old: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&old)
+    var i: usize = 0
+    while i + 1 < lexer.lex_count(l) {
+        if lexer.lex_kind(l, i) != 27 {
+            i = i + 1
+            continue
+        }
+        // Collect the path elements: IDENT (DOT IDENT)*
+        var j: usize = i + 1
+        var alias: u32 = 0
+        var parts: usize = 0
+        while j < lexer.lex_count(l) {
+            if lexer.lex_kind(l, j) != 1 {
+                break
+            }
+            alias = lexer.lex_nr(l, j)
+            parts = parts + 1
+            j = j + 1
+            if j >= lexer.lex_count(l) {
+                break
+            }
+            if lexer.lex_kind(l, j) != 43 {
+                break
+            }
+            j = j + 1
+        }
+        if parts == 0 {
+            i = j
+            continue
+        }
+        // ROUND 73 (`// HOOK profil`): did this import say `std.<name>`?
+        // Only for those does the kernel profile ask for the declaration
+        // `profile kernel` in the module itself (`compiler/src/prof.rs`).
+        var s_std: [u8; 3] = "std"
+        var from_std: bool = false
+        if parts >= 2 {
+            let first: u32 = lexer.lex_nr(l, i + 1)
+            if lexer.lex_name_length(l, first) == 3 {
+                from_std = rt.mem_eq(lexer.lex_name_ptr(l, first),
+                    (&s_std[0]) as u64, 3)
+            }
+        }
+        var found: bool = false
+        // (1) next to the importing file
+        module_path(&path, &(*s).dir, l, i + 1, j)
+        if package.is_file(rt.buf_ptr(&path)) {
+            found = true
+        }
+        // (2) next to the root file
+        if !found {
+            module_path(&path, &(*s).root_dir, l, i + 1, j)
+            if package.is_file(rt.buf_ptr(&path)) {
+                found = true
+            }
+        }
+        // (3) its own source directories
+        if !found {
+            if (*s).my_package >= 0 {
+                let mp: usize = (*s).my_package as usize
+                var qi: usize = 0
+                while qi < package.world_source_count(w, mp) {
+                    package.world_source_base(w, mp, qi, &base)
+                    module_path(&path, &base, l, i + 1, j)
+                    if package.is_file(rt.buf_ptr(&path)) {
+                        found = true
+                        break
+                    }
+                    qi = qi + 1
+                }
+            }
+        }
+        // (4) a dependency: the FIRST path element names the package.
+        if !found {
+            if (*s).my_package >= 0 {
+                let mp: usize = (*s).my_package as usize
+                let knr: u32 = lexer.lex_nr(l, i + 1)
+                let di: i64 = package.world_edge(w, mp, lexer.lex_name_ptr(l, knr),
+                    lexer.lex_name_length(l, knr))
+                if di >= 0 {
+                    var of: usize = i + 1
+                    if parts > 1 {
+                        of = i + 3
+                    }
+                    var qi: usize = 0
+                    while qi < package.world_source_count(w, di as usize) {
+                        package.world_source_base(w, di as usize, qi, &base)
+                        module_path(&path, &base, l, of, j)
+                        if package.is_file(rt.buf_ptr(&path)) {
+                            found = true
+                            break
+                        }
+                        qi = qi + 1
+                    }
+                }
+            }
+        }
+        // (5) $FIRNLIB
+        if !found {
+            if rt.buf_len(&(*s).firnlib) > 0 {
+                module_path(&path, &(*s).firnlib, l, i + 1, j)
+                if package.is_file(rt.buf_ptr(&path)) {
+                    found = true
+                }
+            }
+        }
+        // (6) <exe>/../lib
+        if !found {
+            if rt.buf_len(&(*s).exelib) > 0 {
+                module_path(&path, &(*s).exelib, l, i + 1, j)
+                if package.is_file(rt.buf_ptr(&path)) {
+                    found = true
+                }
+            }
+        }
+        if !found {
+            return 2
+        }
+        // ROUND 93: from here on the module is known under the spelling
+        // that does not name this machine (`package.build_path`). It has to
+        // happen BEFORE `ml_knows`, otherwise the same file would land in
+        // the queue twice under two spellings.
+        var shortp: rt.Buf = rt.buf_new()
+        package.build_path(&shortp, rt.buf_ptr(&path), rt.buf_len(&path) - 1,
+            rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+        rt.buf_clear(&path)
+        rt.buf_push_bytes(&path, rt.buf_ptr(&shortp), rt.buf_len(&shortp))
+        rt.buf_push(&path, 0 as u8)
+        rt.buf_free(&shortp)
+        let n: usize = rt.buf_len(&path) - 1
+        // VISIBILITY: if the hit leads into ANOTHER package, that package
+        // has to be a registered dependency and the module has to be in
+        // its `public` list.
+        if !package.world_is_empty(w) {
+            package.absolute(&abs, rt.buf_ptr(&path), n,
+                rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+            let zp: i64 = package.world_package_of(w, rt.buf_ptr(&abs), rt.buf_len(&abs))
+            if zp >= 0 {
+                if (*s).my_package >= 0 {
+                    if zp != (*s).my_package {
+                        let mp: usize = (*s).my_package as usize
+                        let zn: u64 = package.world_name_ptr(w, zp as usize)
+                        if package.world_edge(w, mp, zn, rt.c_length(zn)) != zp {
+                            package.world_text_no_dependency(w, zp as usize, mp)
+                            return 9
+                        }
+                        package.module_name(&mname, rt.buf_ptr(&abs), rt.buf_len(&abs))
+                        if !package.world_is_public(w, zp as usize,
+                            rt.buf_ptr(&mname), rt.buf_len(&mname)) {
+                            package.world_text_not_public(w, zp as usize,
+                                rt.buf_ptr(&mname), rt.buf_len(&mname))
+                            return 9
+                        }
+                    }
+                }
+            }
+        }
+        if !ml_knows(ml, rt.buf_ptr(&path), n) {
+            if !package.world_is_empty(w) {
+                let double: i64 = ml_name_dup(ml, &(*s).cwd, rt.buf_ptr(&path), n)
+                if double >= 0 {
+                    package.absolute(&abs, rt.buf_ptr(&path), n,
+                        rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+                    package.module_name(&mname, rt.buf_ptr(&abs), rt.buf_len(&abs))
+                    package.absolute(&old, ml_ptr(ml, double as usize),
+                        ml_length(ml, double as usize),
+                        rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+                    package.world_text_name_clash(w, rt.buf_ptr(&mname),
+                        rt.buf_ptr(&old), rt.buf_ptr(&abs))
+                    return 9
+                }
+            }
+            ml_add(ml, rt.buf_ptr(&path), n, alias, from_std)
+        }
+        i = j
+    }
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    // --- command line (round 48). The same options as `firnc0`:
+    //     firnc1 source.fi [-o target]
+    //     firnc1 --package <directory> [-o target]
+    //     firnc1 --package-info <directory>
+    var inp: u64 = 0
+    var in_n: usize = 0
+    var pak: u64 = 0
+    var pak_n: usize = 0
+    var info: u64 = 0
+    var info_n: usize = 0
+    var targetb: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&targetb)
+    var has_target: bool = false
+    // ROUND 52 (SPEC 2): `-c`/`--object` produces a freestanding ELF
+    // object file -- `as`, but NO `ld`. `--profile=kernel` forces the
+    // kernel profile for the whole translation unit; object output is
+    // then on anyway.
+    var only_object: bool = false
+    var kernel_flag: bool = false
+    // ROUND 72 (checkmode.rs, SPEC 13 item L9): does this build level check
+    // `+ - * / %` and a narrowing `as`? `dev`, `dev-fast` and
+    // `release-safe` do; only `release-fast` wraps. The DEFAULT is
+    // `dev-fast`, the same one `firnc0` resolves to without a flag --
+    // `firnc1` has no optimiser of its own, so the level says nothing else
+    // here, but it has to say THIS or the two compilers would disagree
+    // about every overflowing program.
+    var checked: bool = true
+    var c_opt: [u8; 3] = "-c\0"
+    var ob_opt: [u8; 9] = "--object\0"
+    var pk_opt: [u8; 17] = "--profile=kernel\0"
+    var pa_opt: [u8; 14] = "--profile=app\0"
+    var o_opt: [u8; 3] = "-o\0"
+    var p_opt: [u8; 10] = "--package\0"
+    var i_opt: [u8; 15] = "--package-info\0"
+    // ROUND 93: the two lock options of the build driver.
+    var lk_opt: [u8; 7] = "--lock\0"
+    var lkd_opt: [u8; 9] = "--locked\0"
+    var lock_write: bool = false
+    var lock_check: bool = false
+    var no_opt: [u8; 9] = "--no-opt\0"
+    var lv_dev: [u8; 16] = "--opt-level=dev\0"
+    var lv_devfast: [u8; 21] = "--opt-level=dev-fast\0"
+    var lv_safe: [u8; 25] = "--opt-level=release-safe\0"
+    var lv_fast: [u8; 25] = "--opt-level=release-fast\0"
+    // ROUND ARM-FREESTANDING (compiler/src/target.rs): the four target
+    // names. This stage generates x86-64 and nothing else, so it accepts
+    // the two x86-64 names and REFUSES the two aarch64 ones -- with a
+    // message that says what is missing. Silently producing x86 for
+    // `--target=aarch64-linux` would be the one answer that is certainly
+    // wrong, and it is the answer a compiler that ignores unknown flags
+    // gives by default.
+    var t_x86: [u8; 22] = "--target=x86_64-linux\0"
+    var t_x86s: [u8; 16] = "--target=x86_64\0"
+    var t_x86n: [u8; 21] = "--target=x86_64-none\0"
+    var t_a64: [u8; 24] = "--target=aarch64-linux\0\0"
+    var t_a64n: [u8; 22] = "--target=aarch64-none\0"
+    var ai: usize = 1
+    while ai < rt.arg_count(start) {
+        let a: u64 = rt.arg_ptr(start, ai)
+        let an: usize = rt.c_length(a)
+        if arg_is(a, an, (&no_opt[0]) as u64) || arg_is(a, an, (&lv_dev[0]) as u64)
+        || arg_is(a, an, (&lv_devfast[0]) as u64) || arg_is(a, an, (&lv_safe[0]) as u64) {
+            checked = true
+        } else if arg_is(a, an, (&lv_fast[0]) as u64) {
+            checked = false
+        } else if arg_is(a, an, (&c_opt[0]) as u64) || arg_is(a, an, (&ob_opt[0]) as u64) {
+            only_object = true
+        } else if arg_is(a, an, (&lk_opt[0]) as u64) {
+            lock_write = true
+        } else if arg_is(a, an, (&lkd_opt[0]) as u64) {
+            lock_check = true
+        } else if arg_is(a, an, (&t_x86[0]) as u64) || arg_is(a, an, (&t_x86s[0]) as u64) {
+            // The machine this stage generates. Nothing to switch.
+            checked = checked
+        } else if arg_is(a, an, (&t_x86n[0]) as u64) {
+            // ROUND ARM-FREESTANDING: `x86_64-none` is the command line half
+            // of `profile kernel` (compiler/src/prof.rs) -- no operating
+            // system underneath, so an ELF object file with no `_start` and
+            // no system call. That is exactly what this stage already
+            // produces under `--profile=kernel`, so the flag sets the same
+            // switch and a kernel build script can use ONE flag for both
+            // compilers.
+            kernel_flag = true
+        } else if arg_is(a, an, (&t_a64[0]) as u64) || arg_is(a, an, (&t_a64n[0]) as u64) {
+            var m_a64: [u8; 218] = "error: firnc1 cannot generate aarch64 yet\n  note: the Rust bootstrap can (firnc --target=aarch64-linux, docs/ROUND80.md);\n  what is missing here is the A64 code generator in Firn -- see docs/ROUND-ARM-FREESTANDING.md\n\0"
+            rt.write_everything(2, (&m_a64[0]) as u64, rt.c_length((&m_a64[0]) as u64))
+            return 2
+        } else {
+            if arg_is(a, an, (&pk_opt[0]) as u64) {
+                kernel_flag = true
+            } else {
+                if arg_is(a, an, (&pa_opt[0]) as u64) {
+                    kernel_flag = false
+                } else {
+                    if arg_is(a, an, (&o_opt[0]) as u64) {
+                        ai = ai + 1
+                        if ai < rt.arg_count(start) {
+                            let z: u64 = rt.arg_ptr(start, ai)
+                            rt.buf_clear(&targetb)
+                            rt.buf_push_bytes(&targetb, z, rt.c_length(z))
+                            rt.buf_push(&targetb, 0 as u8)
+                            rt.buf_set_len(&targetb, rt.buf_len(&targetb) - 1)
+                            has_target = true
+                        }
+                    } else {
+                        if arg_is(a, an, (&p_opt[0]) as u64) {
+                            ai = ai + 1
+                            if ai < rt.arg_count(start) {
+                                pak = rt.arg_ptr(start, ai)
+                                pak_n = rt.c_length(pak)
+                            }
+                        } else {
+                            if arg_is(a, an, (&i_opt[0]) as u64) {
+                                ai = ai + 1
+                                if ai < rt.arg_count(start) {
+                                    info = rt.arg_ptr(start, ai)
+                                    info_n = rt.c_length(info)
+                                }
+                            } else {
+                                if inp == 0 {
+                                    inp = a
+                                    in_n = an
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ai = ai + 1
+    }
+
+    if pak != 0 {
+        if inp != 0 {
+            var m_both: [u8; 59] = "error: --package and an input file are mutually exclusive\n\0"
+            rt.write_everything(2, (&m_both[0]) as u64, rt.c_length((&m_both[0]) as u64))
+            return 2
+        }
+    }
+    // ROUND 93: `--lock`/`--locked` are options OF THE BUILD DRIVER. Without
+    // `--package` there is no manifest a lock file could belong to, and
+    // silently doing nothing would be the worst of the three answers.
+    if pak == 0 {
+        if lock_write || lock_check {
+            var lk0: lock.Lock = lock.lock_new()
+            var which: u64 = (&lk_opt[0]) as u64
+            if lock_check {
+                which = (&lkd_opt[0]) as u64
+            }
+            lock.lock_error_needs_package(&lk0, which)
+            rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk0)),
+                rt.buf_len(lock.lock_error(&lk0)))
+            return 2
+        }
+    }
+
+    // --- the package world. With `--package`/`--package-info` the named
+    // project, otherwise the manifest above the source file; without a
+    // manifest it stays empty and everything behaves as before round 48.
+    var w: package.World = package.world_new()
+    defer package.world_free(&w)
+    var startb: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&startb)
+
+    if info != 0 {
+        if !package.world_ab_root(&w, info, info_n) {
+            rt.write_everything(2, rt.buf_ptr(package.world_error(&w)),
+                rt.buf_len(package.world_error(&w)))
+            return 2
+        }
+        var ib: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&ib)
+        package.world_info(&w, info, info_n, &ib)
+        if !rt.write_everything(1, rt.buf_ptr(&ib), rt.buf_len(&ib)) {
+            return 2
+        }
+        return 0
+    }
+
+    if pak != 0 {
+        if !package.world_ab_root(&w, pak, pak_n) {
+            rt.write_everything(2, rt.buf_ptr(package.world_error(&w)),
+                rt.buf_len(package.world_error(&w)))
+            return 2
+        }
+        let sp: u64 = package.world_start_ptr(&w, 0)
+        if sp == 0 {
+            package.world_text_no_start(&w, 0)
+            rt.write_everything(2, rt.buf_ptr(package.world_error(&w)),
+                rt.buf_len(package.world_error(&w)))
+            return 2
+        }
+        package.join(&startb, pak, pak_n, sp, rt.c_length(sp))
+        inp = rt.buf_ptr(&startb)
+        in_n = rt.buf_len(&startb)
+        if !has_target {
+            let np: u64 = package.world_name_ptr(&w, 0)
+            package.join(&targetb, pak, pak_n, np, rt.c_length(np))
+            has_target = true
+        }
+    }
+
+    // ROUND 93: the root file too is known under the spelling that does not
+    // name this machine -- `modules::resolve` in `firnc0` does the same to
+    // every file, and the two have to agree in every message.
+    var nameb: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&nameb)
+    if inp != 0 {
+        var cwd0: rt.Buf = rt.buf_new()
+        package.work_dir(&cwd0)
+        package.build_path(&nameb, inp, in_n, rt.buf_ptr(&cwd0), rt.buf_len(&cwd0))
+        rt.buf_free(&cwd0)
+        inp = rt.buf_ptr(&nameb)
+        in_n = rt.buf_len(&nameb)
+    }
+
+    var source: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&source)
+    var name: u64 = 0
+    var name_n: usize = 0
+    if inp != 0 {
+        name = inp
+        name_n = in_n
+        if !rt.read_file(name, &source) {
+            return 2
+        }
+    } else {
+        var sn: [u8; 7] = "<stdin>"
+        name = (&sn[0]) as u64
+        name_n = 7
+        if !rt.read_stdin(&source) {
+            return 2
+        }
+    }
+    // Without `--package` the source file determines the project.
+    if pak == 0 {
+        if inp != 0 {
+            if !package.world_ab_file(&w, name, name_n) {
+                rt.write_everything(2, rt.buf_ptr(package.world_error(&w)),
+                    rt.buf_len(package.world_error(&w)))
+                return 2
+            }
+        }
+    }
+
+    var kwtxt: [u8; 179] = "fn|let|var|if|else|while|return|struct|const|profile|as|mut|true|false|syscall|extern|break|continue|defer|errdefer|comptime|for|in|import|export|enum|match|error|try|catch|static"
+    var l: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&source), rt.buf_len(&source),
+        (&kwtxt[0]) as u64, 179, name, name_n)
+    defer lexer.lex_free(&l)
+    lexer.lex_run(&l)
+    if lexer.lex_error(&l) > 0 {
+        return 1
+    }
+    let it: *mut intern.Interner = lexer.lex_names(&l)
+    var tree_s: ast.Tree = ast.tree_new()
+    defer ast.tree_free(&tree_s)
+    let tree: *mut ast.Tree = &tree_s
+
+    // --- find the imported modules and compile them FIRST: a constant may
+    // use one from another module, so the dependencies have to be in the
+    // tree beforehand.
+    var dir: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&dir)
+    dirname(&dir, name, name_n)
+
+    // --- extra module search paths: $FIRNLIB (terminated with a slash,
+    // `module_path` appends the parts directly) and `<exe>/../lib/`.
+    // Both stay empty if they do not exist.
+    var sr: SearchSpace = sr_new()
+    defer sr_free(&sr)
+    var flname: [u8; 7] = "FIRNLIB"
+    let flvalue: u64 = env(start, (&flname[0]) as u64, 7)
+    if flvalue != 0 {
+        rt.buf_push_bytes(&sr.firnlib, flvalue, rt.c_length(flvalue))
+        if rt.buf_len(&sr.firnlib) > 0 {
+            if rt.buf_at(&sr.firnlib, rt.buf_len(&sr.firnlib) - 1) != 47 as u8 {
+                rt.buf_push(&sr.firnlib, 47 as u8)
+            }
+        }
+    }
+    exe_search_path(&sr.exelib)
+    package.work_dir(&sr.cwd)
+    buf_set(&sr.root_dir, rt.buf_ptr(&dir), rt.buf_len(&dir))
+
+    // --- generic templates: first find out WHICH names are generic, then
+    // parse. Before that, `Vec[i32]` cannot be told apart from an
+    // indexing operation.
+    var g: mono.Gen = mono.gen_new(tree as u64, it as u64)
+    defer mono.gen_free(&g)
+
+    // Enums and pattern matches: ONE registry for all files of this
+    // translation (enum names are visible program wide).
+    var mu: pattern.Pat = pattern.pat_new()
+    defer pattern.pat_free(&mu)
+
+    // Error sets and unions: ONE registry for all files of this
+    // translation (error set names are visible program wide, SPEC 14.1).
+    var fe: err.Error = err.error_new()
+    defer err.error_free(&fe)
+
+    // gc classes: ONE registry for all files of this translation
+    // (round 34 -- class names are visible program wide, like enums).
+    var gcreg: gc.Gc = gc.gc_new()
+    defer gc.gc_free(&gcreg)
+
+    // Interfaces: ONE registry for all files of this translation
+    // (round 46 -- interface names are visible program wide).
+    var ifreg: iface.If = iface.if_new()
+    defer iface.if_free(&ifreg)
+    // ROUND 50: the bound check at instantiation needs the interfaces --
+    // `T: Ord` only holds if there is an `impl Ord for T`.
+    mono.gen_if_set(&g, (&ifreg) as u64)
+
+    var ml: ModuleList = ml_new()
+    defer ml_free(&ml)
+    ml_add(&ml, name, name_n, 4294967295, false)
+
+    var msource: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&msource)
+    var mpath: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&mpath)
+    var mdir: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&mdir)
+
+    // --- GC SCAN over the token stream (source_needs_gc /
+    // source_has_allocerror in gc.rs): if a `gc class` appears anywhere,
+    // the collector runtime (lib/gc/gc.fi, embedded in gctext.fi) is pulled
+    // in as an extra module; if the program declares `AllocError` itself,
+    // the error set that ships with it is left out.
+    var sgc: [u8; 2] = "gc"
+    var scl: [u8; 5] = "class"
+    var sae: [u8; 10] = "AllocError"
+    var sfin: [u8; 13] = "__gc_finalize"
+    var sfa: [u8; 13] = "__thread_work"
+    // `intern_number` rather than a plain lookup: the three words have to BE
+    // in the interner, otherwise the scan searches with -1 and finds nothing
+    // -- exactly when the root file itself contains no `gc` and the keyword
+    // only turns up in an imported module (a round 34 find: 560 did not
+    // run, because only modules/dom.fi has a `gc class`).
+    let gc_nr: i64 = intern.intern_number(it, (&sgc[0]) as u64, 2) as i64
+    let class_nr: i64 = intern.intern_number(it, (&scl[0]) as u64, 5) as i64
+    let ae_nr: i64 = intern.intern_number(it, (&sae[0]) as u64, 10) as i64
+    let fin_nr: i64 = intern.intern_number(it, (&sfin[0]) as u64, 13) as i64
+    let fa_nr: i64 = intern.intern_number(it, (&sfa[0]) as u64, 13) as i64
+    var gc_scan: u32 = gc.gc_source_scan((&l) as u64, it as u64, gc_nr, class_nr,
+        ae_nr, fin_nr, fa_nr)
+
+    // --- FIRST PASS: build the queue and collect the generic names. Both
+    // have to be settled BEFORE the first file is parsed. The price is
+    // lexing every module source a second time; that is cheaper than
+    // keeping all lexers open at once, and it makes the order of the
+    // `import` lines irrelevant.
+    mono.gen_upfront(&g, (&l) as u64)
+    buf_set(&sr.dir, rt.buf_ptr(&dir), rt.buf_len(&dir))
+    sr.my_package = package_of_file(&w, &sr.cwd, name, name_n)
+    let wrc: i32 = imports_collect(&l, &sr, &w, &ml)
+    if wrc == 9 {
+        rt.write_everything(2, rt.buf_ptr(package.world_error(&w)),
+            rt.buf_len(package.world_error(&w)))
+        return 2
+    }
+    if wrc != 0 {
+        return wrc
+    }
+    // ROUND 73 (`// HOOK profil`, twin of `modules.rs::build_program`): the
+    // import rule of the kernel profile has to be settled HERE, before the
+    // modules are walked -- the type check runs much later. `--profile=`
+    // wins, otherwise the declaration in the root file decides.
+    var kernel_early: bool = kernel_flag
+    if !kernel_early {
+        kernel_early = says_kernel(&l)
+    }
+
+    var mi: usize = 1
+    while mi < ml_count(&ml) {
+        rt.buf_clear(&mpath)
+        rt.buf_push_bytes(&mpath, ml_ptr(&ml, mi), ml_length(&ml, mi))
+        rt.buf_push(&mpath, 0 as u8)
+        rt.buf_clear(&msource)
+        if !rt.read_file(rt.buf_ptr(&mpath), &msource) {
+            return 2
+        }
+        var vl: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&msource), rt.buf_len(&msource),
+            (&kwtxt[0]) as u64, 179,
+            rt.buf_ptr(&mpath), rt.buf_len(&mpath) - 1)
+        lexer.lex_names_set(&vl, it as u64)
+        lexer.lex_run(&vl)
+        if lexer.lex_error(&vl) > 0 {
+            lexer.lex_free(&vl)
+            return 1
+        }
+        // HOOK profil (prof.rs, round 52/73): under the kernel profile the
+        // standard library is barred -- unless the module declares
+        // `profile kernel` itself. Then it holds to the same rules, and
+        // because it lands in THIS compilation unit, `sema` proves it.
+        if kernel_early {
+            if ml_from_std(&ml, mi) {
+                if !says_kernel(&vl) {
+                    complain_std_module(it, ml_alias(&ml, mi))
+                    lexer.lex_free(&vl)
+                    return 1
+                }
+            }
+        }
+        mono.gen_upfront(&g, (&vl) as u64)
+        // Round 47: bit 4 (a finalizer dispatcher of its own) counts ONLY
+        // in the root file -- module results are masked. Round 53: bit 8
+        // (collections) does count in every module, just like bits 1 and 2
+        // -- lib/dom/dom.fi uses GcVec, the root file does not.
+        // Merge R49: bit 16 (a thread dispatcher of its own) counts, like
+        // bit 4, ONLY in the root file, so it drops out of the mask.
+        gc_scan = gc_scan | (gc.gc_source_scan((&vl) as u64, it as u64, gc_nr,
+                class_nr, ae_nr, fin_nr, fa_nr) & 11)
+        rt.buf_clear(&mdir)
+        dirname(&mdir, rt.buf_ptr(&mpath), rt.buf_len(&mpath) - 1)
+        buf_set(&sr.dir, rt.buf_ptr(&mdir), rt.buf_len(&mdir))
+        sr.my_package = package_of_file(&w, &sr.cwd, rt.buf_ptr(&mpath),
+            rt.buf_len(&mpath) - 1)
+        let irc: i32 = imports_collect(&vl, &sr, &w, &ml)
+        lexer.lex_free(&vl)
+        if irc == 9 {
+            rt.write_everything(2, rt.buf_ptr(package.world_error(&w)),
+                rt.buf_len(package.world_error(&w)))
+            return 2
+        }
+        if irc != 0 {
+            return irc
+        }
+        mi = mi + 1
+    }
+
+    // --- ROUND 93: the lock file. The queue is complete here -- every
+    // module is found and read -- and nothing has been parsed yet. That is
+    // the same place `firnc0` does it, so `--locked` refuses at the same
+    // moment in both compilers, before any work.
+    if lock_write || lock_check {
+        var lk: lock.Lock = lock.lock_new()
+        var mj: usize = 0
+        while mj < ml_count(&ml) {
+            lock.lock_add(&lk, ml_ptr(&ml, mj), ml_length(&ml, mj))
+            mj = mj + 1
+        }
+        var lpath: rt.Buf = rt.buf_new()
+        var lfile: [u8; 10] = "firn.lock\0"
+        package.join(&lpath, pak, pak_n, (&lfile[0]) as u64, 9)
+        if !lock.lock_finish(&lk, &w, rt.buf_ptr(&sr.cwd), rt.buf_len(&sr.cwd)) {
+            rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk)),
+                rt.buf_len(lock.lock_error(&lk)))
+            return 2
+        }
+        if lock_check {
+            var lfound: rt.Buf = rt.buf_new()
+            if !rt.read_file(rt.buf_ptr(&lpath), &lfound) {
+                lock.lock_error_missing(&lk, rt.buf_ptr(&lpath), rt.buf_len(&lpath))
+                rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk)),
+                    rt.buf_len(lock.lock_error(&lk)))
+                return 2
+            }
+            if !lock.lock_error_mismatch(&lk, rt.buf_ptr(&lpath), rt.buf_len(&lpath),
+                rt.buf_ptr(&lfound), rt.buf_len(&lfound)) {
+                rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk)),
+                    rt.buf_len(lock.lock_error(&lk)))
+                return 2
+            }
+            rt.buf_free(&lfound)
+        } else {
+            if !rt.write_file(rt.buf_ptr(&lpath),
+                rt.buf_ptr(lock.lock_out(&lk)), rt.buf_len(lock.lock_out(&lk))) {
+                var m_w1: [u8; 22] = "error: cannot write '\0"
+                var m_w2: [u8; 3] = "'\n\0"
+                var eb: rt.Buf = rt.buf_new()
+                package.ptext(&eb, (&m_w1[0]) as u64)
+                rt.buf_push_bytes(&eb, rt.buf_ptr(&lpath), rt.buf_len(&lpath))
+                package.ptext(&eb, (&m_w2[0]) as u64)
+                rt.write_everything(2, rt.buf_ptr(&eb), rt.buf_len(&eb))
+                return 2
+            }
+        }
+        rt.buf_free(&lpath)
+        lock.lock_free(&lk)
+    }
+
+    // --- ROUND 53: the generic templates of the COLLECTOR RUNTIME have to
+    // be known BEFORE the first file is parsed. It is not on disk but in
+    // gctext.fi -- and it is parsed only at the very end. Without this
+    // prescan the parser would read `gcvec_append[T](...)` in the root
+    // file as an indexing operation instead of an instantiation.
+    // The same price as for the modules: one extra lexing pass.
+    if gc_scan & 9 == 9 {
+        var vq: rt.Buf = rt.buf_new()
+        gctext.gctext_write(&vq, true)
+        var vgpn: [u8; 12] = "lib/gc/gc.fi"
+        var cmp: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&vq), rt.buf_len(&vq),
+            (&kwtxt[0]) as u64, 179,
+            (&vgpn[0]) as u64, 12)
+        lexer.lex_names_set(&cmp, it as u64)
+        lexer.lex_run(&cmp)
+        if lexer.lex_error(&cmp) > 0 {
+            lexer.lex_free(&cmp)
+            rt.buf_free(&vq)
+            return 1
+        }
+        mono.gen_upfront(&g, (&cmp) as u64)
+        lexer.lex_free(&cmp)
+        rt.buf_free(&vq)
+    }
+
+    // --- SECOND PASS: compile the modules.
+    mi = 1
+    while mi < ml_count(&ml) {
+        rt.buf_clear(&mpath)
+        rt.buf_push_bytes(&mpath, ml_ptr(&ml, mi), ml_length(&ml, mi))
+        rt.buf_push(&mpath, 0 as u8)
+        let alias: u32 = ml_alias(&ml, mi)
+        rt.buf_clear(&msource)
+        if !rt.read_file(rt.buf_ptr(&mpath), &msource) {
+            return 2
+        }
+        var mlx: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&msource), rt.buf_len(&msource),
+            (&kwtxt[0]) as u64, 179,
+            rt.buf_ptr(&mpath), rt.buf_len(&mpath) - 1)
+        lexer.lex_names_set(&mlx, it as u64)
+        lexer.lex_run(&mlx)
+        if lexer.lex_error(&mlx) > 0 {
+            lexer.lex_free(&mlx)
+            return 1
+        }
+        var mp: parser.Parser = parser.par_new_module((&mlx) as u64, tree as u64, alias)
+        // ROUND 79 (escape.fi): every node of this file carries its number,
+        // so that a message names the MODULE and not the root file.
+        parser.par_file_set(&mp, ast.file_add(tree, rt.buf_ptr(&mpath),
+                rt.buf_len(&mpath) - 1))
+        parser.par_gen_set(&mp, (&g) as u64)
+        parser.par_mu_set(&mp, (&mu) as u64)
+        parser.par_fe_set(&mp, (&fe) as u64)
+        parser.par_gc_set(&mp, (&gcreg) as u64)
+        parser.par_if_set(&mp, (&ifreg) as u64)
+        parser.par_time_set(&mp)
+        parser.par_run(&mp)
+        let bad: bool = parser.par_not_core(&mp)
+        let fail: usize = parser.par_error(&mp)
+        parser.par_free(&mp)
+        lexer.lex_free(&mlx)
+        if bad {
+            return 3
+        }
+        if fail > 0 {
+            return 1
+        }
+        mi = mi + 1
+    }
+
+    // --- the root file last: its names stay unchanged.
+    var p: parser.Parser = parser.par_new_module((&l) as u64, tree as u64, 4294967295)
+    defer parser.par_free(&p)
+    // ROUND 79 (escape.fi): the root file, under the name it was given on
+    // the command line -- `firnc0` names it the same way.
+    parser.par_file_set(&p, ast.file_add(tree, name, name_n))
+    parser.par_gen_set(&p, (&g) as u64)
+    parser.par_mu_set(&p, (&mu) as u64)
+    parser.par_fe_set(&p, (&fe) as u64)
+    parser.par_gc_set(&p, (&gcreg) as u64)
+    parser.par_if_set(&p, (&ifreg) as u64)
+    parser.par_time_set(&p)
+    parser.par_run(&p)
+    if parser.par_not_core(&p) {
+        return 3
+    }
+    if parser.par_error(&p) > 0 {
+        return 1
+    }
+
+    // --- pull in the collector runtime automatically as soon as a
+    // `gc class` appears anywhere (round 34; HOOK gc in modules.rs,
+    // SPEC 3.5). It lives in the ROOT NAMESPACE: `gc_init()` is called
+    // `gc_init()` in every module, without `import` and without a prefix.
+    if gc_scan & 1 != 0 {
+        gc.gc_runtime_set(&gcreg, 1 as usize)
+        var gq: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&gq)
+        if gc_scan & 2 == 0 {
+            var aed: [u8; 33] = "error AllocError { OutOfMemory }\n"
+            rt.buf_push_bytes(&gq, (&aed[0]) as u64, 33)
+        }
+        // Round 47: the empty default of the finalizer dispatcher -- only
+        // if the root file does not bring one of its own (bit 4).
+        // Word for word as gc.rs::finalizer_default.
+        if gc_scan & 4 == 0 {
+            var fdt: [u8; 201] = "// Round 47: default of the finalizer dispatcher. The program\n// declares none of its own, so cleanup does nothing.\nfn __gc_finalize(kind: u64, p: *mut u8) {\n    let _unused: u64 = kind + (p as u64)\n}\n"
+            rt.buf_push_bytes(&gq, (&fdt[0]) as u64, 201)
+        }
+        // Round 49 (merge: bit 16): the empty default of the thread
+        // dispatcher -- only if the root file does not bring one of
+        // its own. Word for word as gc.rs::thread_work_default.
+        if gc_scan & 16 == 0 {
+            var fat: [u8; 198] = "// Round 49: default of the thread dispatcher. The program\n// declares none of its own, so a thread does nothing.\nfn __thread_work(kind: u64, arg: u64) -> u64 {\n    return kind + arg - kind - arg\n}\n"
+            rt.buf_push_bytes(&gq, (&fat[0]) as u64, 198)
+        }
+        // Round 53: add the collections only if they are used (bit 8) --
+        // a program with a `gc class` but without GcVec/GcMap then produces
+        // exactly the same code as before.
+        gctext.gctext_write(&gq, gc_scan & 8 != 0)
+        var gpn: [u8; 12] = "lib/gc/gc.fi"
+        var gl: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&gq), rt.buf_len(&gq),
+            (&kwtxt[0]) as u64, 179,
+            (&gpn[0]) as u64, 12)
+        lexer.lex_names_set(&gl, it as u64)
+        lexer.lex_run(&gl)
+        if lexer.lex_error(&gl) > 0 {
+            lexer.lex_free(&gl)
+            return 1
+        }
+        var gp: parser.Parser = parser.par_new_module((&gl) as u64, tree as u64, 4294967295)
+        parser.par_file_set(&gp, ast.file_add(tree, (&gpn[0]) as u64, 12))
+        parser.par_gen_set(&gp, (&g) as u64)
+        parser.par_mu_set(&gp, (&mu) as u64)
+        parser.par_fe_set(&gp, (&fe) as u64)
+        parser.par_gc_set(&gp, (&gcreg) as u64)
+        parser.par_if_set(&gp, (&ifreg) as u64)
+        parser.par_run(&gp)
+        let gschlecht: bool = parser.par_not_core(&gp)
+        let gerr: usize = parser.par_error(&gp)
+        parser.par_free(&gp)
+        lexer.lex_free(&gl)
+        if gschlecht {
+            return 3
+        }
+        if gerr > 0 {
+            return 1
+        }
+    }
+
+    // --- comptime: the blocks of the root file run BEFORE the type check.
+    // What they write through `emit_raw`/`emit_number` is FIRN SOURCE TEXT,
+    // which the same run lexes, parses and appends to the program -- after
+    // that the type checker sees no difference to handwritten source text
+    // (SPEC 6.4, acceptance point 6; modelled on compiler/src/main.rs).
+    if ast.ct_count(tree) > 0 {
+        var zt: time.Time = time.time_new(tree as u64, it as u64,
+            rt.buf_ptr(&dir), rt.buf_len(&dir))
+        time.time_run(&zt)
+        if time.time_error(&zt) > 0 {
+            time.time_free(&zt)
+            return 1
+        }
+        let outb: *mut rt.Buf = time.time_output(&zt)
+        if rt.buf_len(outb) > 0 {
+            var ctname: [u8; 10] = "<comptime>"
+            var ctl: lexer.Lexer = lexer.lex_new(rt.buf_ptr(outb), rt.buf_len(outb),
+                (&kwtxt[0]) as u64, 179,
+                (&ctname[0]) as u64, 10)
+            lexer.lex_names_set(&ctl, it as u64)
+            lexer.lex_run(&ctl)
+            if lexer.lex_error(&ctl) > 0 {
+                lexer.lex_free(&ctl)
+                time.time_free(&zt)
+                return 1
+            }
+            var ctp: parser.Parser = parser.par_new_module((&ctl) as u64, tree as u64, 4294967295)
+            parser.par_file_set(&ctp, ast.file_add(tree, (&ctname[0]) as u64, 10))
+            parser.par_gen_set(&ctp, (&g) as u64)
+            parser.par_mu_set(&ctp, (&mu) as u64)
+            parser.par_fe_set(&ctp, (&fe) as u64)
+            parser.par_gc_set(&ctp, (&gcreg) as u64)
+            parser.par_if_set(&ctp, (&ifreg) as u64)
+            parser.par_run(&ctp)
+            let ctbad: bool = parser.par_not_core(&ctp)
+            let cterr: usize = parser.par_error(&ctp)
+            parser.par_free(&ctp)
+            lexer.lex_free(&ctl)
+            time.time_free(&zt)
+            if ctbad {
+                return 3
+            }
+            if cterr > 0 {
+                return 1
+            }
+        } else {
+            time.time_free(&zt)
+        }
+    }
+
+    // --- monomorphization: every type combination that is used becomes a
+    // separate, fully concrete function or struct. After that the type
+    // checker sees only ordinary code.
+    mono.gen_run(&g)
+    if mono.gen_error(&g) > 0 {
+        return 1
+    }
+
+    // ROUND 52 (SPEC 2): resolve the profile -- `--profile=` wins, otherwise
+    // the declaration `profile kernel` in the root file. In the kernel
+    // profile there is no `_start`, no `syscall`, no `gc class` and no
+    // executable, but an ELF object instead.
+    //
+    // ROUND 73: the profile is read off the ROOT FILE, not off the merged
+    // tree. Since this round a MODULE may declare `profile kernel` too
+    // (that is the declaration by which `lib/std/core.fi` is admitted in a
+    // kernel), and `ast.profile_set` writes into the one shared tree --
+    // the module's declaration would otherwise overwrite the root's and
+    // turn every app program that imports `std.math` into an object file.
+    // `compiler/src/modules.rs` has always taken it from the root file
+    // (`merged.profile = progs.first()`); `kernel_early` is the same
+    // answer, read off the root token stream above.
+    let kernel: bool = kernel_early
+    let object: bool = only_object || kernel
+
+    var sm: sema.Sema = sema.sema_new(tree as u64, it as u64)
+    defer sema.sema_free(&sm)
+    sema.sema_kernel_set(&sm, kernel)
+    sema.sema_mu_set(&sm, (&mu) as u64)
+    sema.sema_fe_set(&sm, (&fe) as u64)
+    sema.sema_gc_set(&sm, (&gcreg) as u64)
+    sema.sema_if_set(&sm, (&ifreg) as u64)
+    sema.sema_run(&sm)
+    if sema.sema_needs_comptime(&sm) {
+        return 4
+    }
+    if sema.sema_error(&sm) > 0 {
+        return 1
+    }
+
+    var lo: lower.Lower = lower.low_new(tree as u64, it as u64, (&sm) as u64)
+    defer lower.low_free(&lo)
+    lower.low_mu_set(&lo, (&mu) as u64)
+    lower.low_fe_set(&lo, (&fe) as u64)
+    lower.low_gc_set(&lo, (&gcreg) as u64)
+    lower.low_if_set(&lo, (&ifreg) as u64)
+    lower.low_checked_set(&lo, checked)
+    lower.low_run(&lo)
+    if lower.low_unsuitable(&lo) {
+        return 5
+    }
+    if lower.low_error(&lo) > 0 {
+        return 1
+    }
+
+    var cg: codegen.Cg = codegen.cg_new(lower.low_fir(&lo) as u64, it as u64)
+    defer codegen.cg_free(&cg)
+    codegen.cg_gc_set(&cg, (&gcreg) as u64)
+    codegen.cg_if_set(&cg, (&ifreg) as u64)
+    codegen.cg_freestanding_set(&cg, kernel)
+    // ROUND 75 (SPEC 14.5): `extern fn` / `#[export_c]` link names --
+    // `sym()` needs the tree to resolve them.
+    codegen.cg_tree_set(&cg, tree as u64)
+    // ROUND 89 (statics.rs): the type checker holds the finished octets
+    // of every global variable; the data section is written from there.
+    codegen.cg_sema_set(&cg, (&sm) as u64)
+    codegen.cg_run(&cg)
+    if codegen.cg_unsuitable(&cg) {
+        return 6
+    }
+    let out: *mut rt.Buf = codegen.cg_text(&cg)
+
+    // Without `-o` and without `--package` the assembly goes to stdout.
+    if !has_target {
+        if !rt.write_everything(1, rt.buf_ptr(out), rt.buf_len(out)) {
+            return 2
+        }
+        return 0
+    }
+    let target: u64 = rt.buf_ptr(&targetb)
+    let target_n: usize = rt.buf_len(&targetb)
+
+    // Build `target.s` and `target.o` as null terminated names.
+    var sname: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&sname)
+    rt.buf_push_bytes(&sname, target, target_n)
+    var extension_s: [u8; 3] = ".s\0"
+    rt.buf_push_bytes(&sname, (&extension_s[0]) as u64, 3)
+
+    var oname: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&oname)
+    if object {
+        // With `-c` the result is named exactly as `-o` says.
+        rt.buf_push_bytes(&oname, target, target_n)
+        rt.buf_push(&oname, 0 as u8)
+    } else {
+        rt.buf_push_bytes(&oname, target, target_n)
+        var extension_o: [u8; 3] = ".o\0"
+        rt.buf_push_bytes(&oname, (&extension_o[0]) as u64, 3)
+    }
+
+    if !rt.write_file(rt.buf_ptr(&sname), rt.buf_ptr(out), rt.buf_len(out)) {
+        return 2
+    }
+
+    // as --64 -o target.o target.s
+    var as_path: [u8; 12] = "/usr/bin/as\0"
+    var opt64: [u8; 6] = "--64\0\0"
+    var minus_o: [u8; 3] = "-o\0"
+    var argv_as: [u64; 6] = [0; 6]
+    argv_as[0] = (&as_path[0]) as u64
+    argv_as[1] = (&opt64[0]) as u64
+    argv_as[2] = (&minus_o[0]) as u64
+    argv_as[3] = rt.buf_ptr(&oname)
+    argv_as[4] = rt.buf_ptr(&sname)
+    argv_as[5] = 0
+    if rt.run((&as_path[0]) as u64, (&argv_as[0]) as u64) != 0 {
+        return 7
+    }
+    // ROUND 52: freestanding means FREESTANDING -- this is the end, no `ld`.
+    if object {
+        return 0
+    }
+
+    // ld -o target target.o
+    var ld_path: [u8; 12] = "/usr/bin/ld\0"
+    var argv_ld: [u64; 5] = [0; 5]
+    argv_ld[0] = (&ld_path[0]) as u64
+    argv_ld[1] = (&minus_o[0]) as u64
+    argv_ld[2] = target
+    argv_ld[3] = rt.buf_ptr(&oname)
+    argv_ld[4] = 0
+    if rt.run((&ld_path[0]) as u64, (&argv_ld[0]) as u64) != 0 {
+        return 8
+    }
+    return 0
+}

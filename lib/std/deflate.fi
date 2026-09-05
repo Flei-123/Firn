@@ -1,0 +1,1735 @@
+// SPDX-License-Identifier: MIT
+// lib/std/deflate.fi -- DEFLATE (RFC 1951), zlib (RFC 1950) and gzip
+// (RFC 1952), in both directions, written in Firn (round 81).
+//
+// WHY THIS IS THE FILE THAT DECIDES WHETHER A LANGUAGE IS USABLE. Round 76
+// built sockets and a Minecraft server that a real client walks into -- and
+// it walks in only because the server runs with
+// `network-compression-threshold -1`. The moment a packet is longer than
+// the threshold, EVERY packet on that connection is a zlib stream, and a
+// server that cannot inflate one cannot read a single further octet. The
+// same holds for .png (zlib), for .gz, for HTTP `Content-Encoding: gzip`,
+// for .jar/.zip and for a Minecraft world on disk. Without DEFLATE a
+// language may have every socket in the world and still not be able to read
+// anything anybody actually sends.
+//
+// ALL OF IT IS IN FIRN. No zlib, no `extern fn`, nothing linked in. Round 75
+// built foreign calls, and using them here would have answered a different
+// question than the one this round asks.
+//
+// ================================================================ THE FORMAT
+//
+// A DEFLATE stream is a sequence of BLOCKS, each of which begins with three
+// bits: one final flag and two type bits. The three types are the whole
+// format:
+//
+//   00 STORED    the block is not compressed at all. After the header the
+//                stream skips to the next octet boundary and carries LEN,
+//                ~LEN and LEN raw octets. This is what makes DEFLATE safe
+//                for incompressible data: the worst case is +5 octets per
+//                65,535, not a doubling. `--` a compressor that lacks it
+//                turns random data into something LARGER, and the round's
+//                edge case "data that grows" is exactly this test.
+//   01 FIXED     literals and lengths use a code written down in the
+//                specification (RFC 1951 3.2.6), distances a flat 5 bit
+//                code. Nothing has to be transmitted; for short blocks that
+//                saves the whole table.
+//   10 DYNAMIC   the block carries its OWN Huffman code, and it carries it
+//                as code LENGTHS -- and those lengths are themselves
+//                Huffman coded with a third code whose lengths are sent
+//                as 19 three bit numbers in a fixed, jumbled order
+//                (16, 17, 18, 0, 8, 7, ...). Two levels of indirection
+//                before a single octet of payload; this is where most
+//                hand-written implementations are wrong.
+//
+// Inside a block the data is a sequence of SYMBOLS: 0-255 are literal
+// octets, 256 ends the block, and 257-285 announce a MATCH -- "copy `len`
+// octets from `dist` octets back", `len` 3..258, `dist` 1..32768, with
+// extra bits after the symbol for the parts the code does not carry. The
+// back reference may REACH INTO ITSELF (`dist` 1 with `len` 100 means one
+// octet a hundred times), which is why the copy loop here goes octet by
+// octet and must not become a `memcpy`.
+//
+// BIT ORDER, and it is the classic trap: everything in DEFLATE is packed
+// LEAST SIGNIFICANT BIT FIRST -- except the Huffman codes themselves, which
+// are packed most significant bit first. So a code is written REVERSED into
+// an LSB-first stream. This file reverses the codes once when it builds
+// them (`rev_bits`) instead of per symbol.
+//
+// ==================================================== WHAT THE COMPRESSOR DOES
+//
+// LZ77 with a hash chain, exactly the shape zlib uses:
+//
+//   * a hash over THREE octets (the shortest match the format has) selects
+//     a bucket; `head[bucket]` is the most recent position with that hash,
+//     `prev[pos & 32767]` chains backwards through the older ones.
+//   * the chain is walked with a LIMIT (`chain`), because the last 1% of
+//     compression costs 90% of the time. `level` sets it.
+//   * LAZY MATCHING (levels 4 and up): after a match is found at `pos`, the
+//     compressor looks at `pos+1` too, and if the match there is longer it
+//     emits the literal at `pos` and takes the better one. That is worth
+//     one to two per cent and it is the reason a greedy matcher looks worse
+//     than zlib on text.
+//
+// Per block the compressor then computes the EXACT cost in bits of all
+// three block types and takes the cheapest. Not a heuristic -- the counting
+// is what makes "the output is never much larger than the input" a
+// guarantee instead of a hope.
+//
+// ================================================= THE LENGTH LIMITED CODE
+//
+// A Huffman code for 286 symbols can be 285 bits deep; DEFLATE allows 15.
+// Building the tree and then FIXING it is the standard answer (zlib's
+// `gen_bitlen`): count how many codes are too long, then repeatedly take a
+// leaf from a shorter level down one, which makes room for two of the
+// overlong ones. Afterwards the lengths are handed out to the symbols
+// sorted by frequency -- the most frequent symbol gets the shortest code,
+// which is what keeps the result optimal for the given length profile.
+//
+// And then it is CHECKED: `kraft_ok` verifies that the code is complete
+// (sum of 2^-len == 1) before a single bit is written. If it is not, the
+// block falls back to the fixed code. A broken dynamic table is the one
+// error in this file that would produce a stream which decompresses to
+// garbage instead of failing, and a check is cheaper than a debugging
+// session.
+//
+// ====================================================================== HONEST
+//
+// D1 NOT A STREAMING INTERFACE. Everything works on a whole input in
+//    memory and appends to a whole output in memory. For a 4 MiB packet
+//    that is right; for a 4 GiB file it is not. A streaming state machine
+//    means suspending and resuming the bit reader in the middle of a
+//    Huffman symbol, and that is a round of its own.
+// D2 THE DECODER DECODES BIT BY BIT (the algorithm from Mark Adler's
+//    `puff`), not through a multi-level lookup table. It is CORRECT and it
+//    is about four to six times slower than zlib's table decoder. The
+//    measured numbers are in `docs/ROUND81.md`; when something in this
+//    repository needs the speed, the table goes in and the measurement
+//    says by how much it helped.
+// D3 NO PRESET DICTIONARY (zlib FDICT) -- a stream that asks for one is
+//    refused rather than silently mis-decoded.
+// D4 GZIP: only the DEFLATE method, only ONE member. A multi member .gz
+//    (what `cat a.gz b.gz` produces) reads its first member and stops; the
+//    trailer check of the first member still has to pass. FEXTRA, FNAME,
+//    FCOMMENT and FHCRC in the header ARE handled.
+// D5 THE COMPRESSOR NEVER EMITS A DISTANCE ACROSS THE START of the input,
+//    so it does not use the window across `deflate` calls; see D1.
+// D6 `level` is 0 (stored only) to 9. It is not zlib's level: the same
+//    number does not have to produce the same octets. What is guaranteed
+//    is that every level produces a stream zlib reads, which is the only
+//    thing that matters.
+import rt
+
+export {
+    DeflateError,
+    // checksums
+    adler32, adler32_more, CrcTable, crc_table, crc32, crc32_more,
+    // raw DEFLATE
+    inflate, deflate,
+    // the two frames
+    zlib_decompress, zlib_compress, gzip_decompress, gzip_compress,
+    // introspection, for the proofs
+    inflate_into, deflate_level_default,
+}
+
+error DeflateError {
+    Data, // the bit stream contradicts RFC 1951
+    Format, // a zlib/gzip header this file does not accept
+    OutOfMemory,
+    Checksum, // Adler-32/CRC-32/ISIZE does not match
+    Truncated, // the input ended in the middle of something
+}
+
+const WSIZE: usize = 32768
+const WMASK: usize = 32767
+const HASHSIZE: usize = 32768
+const HASHMASK: u32 = 32767
+const MINMATCH: usize = 3
+const MAXMATCH: usize = 258
+const NIL: u32 = 4294967295
+const MAXTOK: usize = 16384
+const MAXBITS: usize = 15
+const ENDBLOCK: usize = 256
+
+fn deflate_level_default() -> usize {
+    return 6
+}
+
+// ====================================================================
+// CHECKSUMS
+// ====================================================================
+
+// Adler-32 (RFC 1950): two running sums modulo 65521, the low one over the
+// octets, the high one over the low one. Weak as a checksum and cheap,
+// which is what zlib wanted. The 5552 is the largest number of octets that
+// cannot make the 32 bit accumulator overflow before the modulo -- that is
+// the whole reason for the inner loop.
+fn adler32_more(start: u32, p: u64, n: usize) -> u32 {
+    var a: u64 = (start & 65535 as u32) as u64
+    var b: u64 = (start >> 16) as u64
+    var i: usize = 0
+    while i < n {
+        var chunk: usize = n - i
+        if chunk > 5552 {
+            chunk = 5552
+        }
+        let stop: usize = i + chunk
+        while i < stop {
+            a = a + rt.ld8(p, i) as u64
+            b = b + a
+            i = i + 1
+        }
+        a = a % 65521
+        b = b % 65521
+    }
+    return ((b << 16) | a) as u32
+}
+
+fn adler32(p: u64, n: usize) -> u32 {
+    return adler32_more(1 as u32, p, n)
+}
+
+// CRC-32 as gzip and PNG use it: the reflected polynomial 0xEDB88320, the
+// register pre- and post-inverted. The table is built at run time -- this
+// language has no global variables (SPEC 14.1 item 5), so the 256 entries
+// live in a value the caller holds and passes on.
+struct CrcTable {
+    t: [u32; 256],
+}
+
+fn crc_table() -> CrcTable {
+    var c: CrcTable = CrcTable { t: [0; 256] }
+    var i: usize = 0
+    while i < 256 {
+        var v: u32 = i as u32
+        var k: usize = 0
+        while k < 8 {
+            if (v & 1 as u32) != 0 as u32 {
+                v = (v >> 1) ^ 3988292384 as u32
+            } else {
+                v = v >> 1
+            }
+            k = k + 1
+        }
+        c.t[i] = v
+        i = i + 1
+    }
+    return c
+}
+
+// `crc` is the running value in the form the caller got back last time
+// (start with 0).
+fn crc32_more(tab: *mut CrcTable, crc: u32, p: u64, n: usize) -> u32 {
+    var c: u32 = crc ^ 4294967295 as u32
+    var i: usize = 0
+    while i < n {
+        let idx: usize = ((c ^ (rt.ld8(p, i) as u32)) & 255 as u32) as usize
+        c = (c >> 8) ^ (*tab).t[idx]
+        i = i + 1
+    }
+    return c ^ 4294967295 as u32
+}
+
+// The one-shot form: builds its own table. For a whole file that is 256
+// iterations against a megabyte of data and not worth threading a table
+// through.
+fn crc32(p: u64, n: usize) -> u32 {
+    var tab: CrcTable = crc_table()
+    return crc32_more(&tab, 0 as u32, p, n)
+}
+
+// ====================================================================
+// THE TABLES OF RFC 1951 3.2.5
+// ====================================================================
+//
+// Length code 257+i has base `lbase[i]` and `lext[i]` extra bits; distance
+// code i has base `dbase[i]` and `dext[i]`. They are values, not constants,
+// because `const` in this language is scalars only.
+
+struct Codes {
+    lbase: [u16; 29],
+    lext: [u8; 29],
+    dbase: [u16; 30],
+    dext: [u8; 30],
+    // length -> code index, for the compressor. 259 entries so that
+    // `lcode[258]` exists.
+    lcode: [u8; 259],
+}
+
+fn codes_new() -> Codes {
+    var c: Codes = Codes {
+        lbase: [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35,
+            43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258],
+        lext: [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+            4, 4, 4, 4, 5, 5, 5, 5, 0],
+        dbase: [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+            257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
+            12289, 16385, 24577],
+        dext: [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+            9, 9, 10, 10, 11, 11, 12, 12, 13, 13],
+        lcode: [0; 259],
+    }
+    // The reverse table: for every length 3..258 the code that carries it.
+    var l: usize = 3
+    var idx: usize = 0
+    while l <= 258 {
+        while idx < 28 && l as u16 >= c.lbase[idx + 1] {
+            idx = idx + 1
+        }
+        c.lcode[l] = idx as u8
+        l = l + 1
+    }
+    return c
+}
+
+// The distance code of a distance 1..32768. A loop over at most 30 entries,
+// called once per match -- a two-tier table would be faster and would be
+// the third table to keep correct.
+fn dist_code(c: *mut Codes, d: usize) -> usize {
+    var i: usize = 29
+    while i > 0 {
+        if d as u16 >= (*c).dbase[i] {
+            return i
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+// ====================================================================
+// THE DECODER
+// ====================================================================
+
+// A canonical Huffman code, in the form Mark Adler's `puff` uses: how many
+// codes there are per length, and the symbols sorted by (length, symbol).
+// That is all a decoder needs -- no tree, no pointers.
+struct Huff {
+    count: [u16; 16],
+    symbol: [u16; 288],
+}
+
+struct Inflater {
+    src: u64,
+    srclen: usize,
+    pos: usize,
+    bitbuf: u64,
+    bitcnt: usize,
+    out: u64, // *mut rt.Buf as a number -- see `out_buf`
+    ran_out: bool, // the input ended in the middle of a symbol
+}
+
+fn out_buf(s: *mut Inflater) -> *mut rt.Buf {
+    return (*s).out as *mut rt.Buf
+}
+
+// One bit, LSB first. On a spent input it returns 0 AND sets `ran_out` --
+// the caller checks that flag once per block instead of threading an error
+// through the innermost loop of the whole decoder.
+fn get_bit(s: *mut Inflater) -> u32 {
+    if (*s).bitcnt == 0 {
+        if (*s).pos >= (*s).srclen {
+            (*s).ran_out = true
+            return 0 as u32
+        }
+        (*s).bitbuf = rt.ld8((*s).src, (*s).pos) as u64
+        (*s).pos = (*s).pos + 1
+        (*s).bitcnt = 8
+    }
+    let v: u32 = ((*s).bitbuf & 1) as u32
+    (*s).bitbuf = (*s).bitbuf >> 1
+    (*s).bitcnt = (*s).bitcnt - 1
+    return v
+}
+
+fn get_bits(s: *mut Inflater, n: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        v = v | (get_bit(s) << (i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+// Builds the decoding form from the code LENGTHS. Returns false when the
+// code is over-subscribed (more codes than the length allows) -- an
+// incomplete code is allowed in exactly one case, which the caller decides.
+fn huff_build(h: *mut Huff, lengths: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < 16 {
+        (*h).count[i] = 0 as u16
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        let l: usize = rt.ld8(lengths, i) as usize
+        (*h).count[l] = (*h).count[l] + 1 as u16
+        i = i + 1
+    }
+    if (*h).count[0] as usize == n {
+        return true // no symbols at all -- an empty distance code is legal
+    }
+    // Over-subscription check: the Kraft sum must not exceed 1.
+    var left: i32 = 1
+    var len: usize = 1
+    while len < 16 {
+        left = left * 2
+        left = left - ((*h).count[len] as i32)
+        if left < 0 {
+            return false
+        }
+        len = len + 1
+    }
+    // The offsets of the first symbol of every length, then fill.
+    var offs: [u16; 16] = [0; 16]
+    len = 1
+    while len < 15 {
+        offs[len + 1] = offs[len] + (*h).count[len]
+        len = len + 1
+    }
+    i = 0
+    while i < n {
+        let l: usize = rt.ld8(lengths, i) as usize
+        if l != 0 {
+            (*h).symbol[offs[l] as usize] = i as u16
+            offs[l] = offs[l] + 1 as u16
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Decodes one symbol, bit by bit (D2). `code` is the value read so far,
+// `first` the first code of this length, `index` the first symbol of this
+// length; as long as the code lies below the range of its length, one more
+// bit is read.
+fn huff_decode(s: *mut Inflater, h: *mut Huff) -> i32 {
+    var code: i32 = 0
+    var first: i32 = 0
+    var index: i32 = 0
+    var len: usize = 1
+    while len < 16 {
+        code = code | (get_bit(s) as i32)
+        let count: i32 = (*h).count[len] as i32
+        if code - count < first {
+            return (*h).symbol[(index + (code - first)) as usize] as i32
+        }
+        index = index + count
+        first = (first + count) * 2
+        code = code * 2
+        len = len + 1
+    }
+    return -1
+}
+
+// Appends one octet to the output. The fast path writes straight into the
+// buffer; `rt.buf_push` would do the same thing plus a call per octet.
+fn out_push(s: *mut Inflater, v: u8) -> bool {
+    let b: *mut rt.Buf = out_buf(s)
+    if (*b).len == (*b).cap {
+        // `buf_reserve` wants the TOTAL capacity, not the additional one.
+        rt.buf_reserve(b, (*b).len + 1)
+        if (*b).len == (*b).cap {
+            return false
+        }
+    }
+    rt.st8((*b).ptr, (*b).len, v)
+    (*b).len = (*b).len + 1
+    return true
+}
+
+fn out_len(s: *mut Inflater) -> usize {
+    return (*out_buf(s)).len
+}
+
+// One stored block: to the octet boundary, then LEN and its complement.
+fn inflate_stored(s: *mut Inflater) -> DeflateError!bool {
+    (*s).bitbuf = 0
+    (*s).bitcnt = 0
+    if (*s).pos + 4 > (*s).srclen {
+        return DeflateError::Truncated
+    }
+    let len: usize = (rt.ld8((*s).src, (*s).pos) as usize)
+    | ((rt.ld8((*s).src, (*s).pos + 1) as usize) << 8)
+    let nlen: usize = (rt.ld8((*s).src, (*s).pos + 2) as usize)
+    | ((rt.ld8((*s).src, (*s).pos + 3) as usize) << 8)
+    (*s).pos = (*s).pos + 4
+    if len != (nlen ^ 65535) {
+        return DeflateError::Data
+    }
+    if (*s).pos + len > (*s).srclen {
+        return DeflateError::Truncated
+    }
+    let b: *mut rt.Buf = out_buf(s)
+    rt.buf_reserve(b, (*b).len + len)
+    if (*b).cap < (*b).len + len {
+        return DeflateError::OutOfMemory
+    }
+    rt.mem_copy((*b).ptr + (*b).len as u64, (*s).src + (*s).pos as u64, len)
+    (*b).len = (*b).len + len
+    (*s).pos = (*s).pos + len
+    return true
+}
+
+// The body of a block, once both codes are known. This is the loop the
+// whole format exists for.
+fn inflate_codes(s: *mut Inflater, lit: *mut Huff, dst: *mut Huff,
+    c: *mut Codes) -> DeflateError!bool {
+    while true {
+        let sym: i32 = huff_decode(s, lit)
+        if (*s).ran_out {
+            return DeflateError::Truncated
+        }
+        if sym < 0 {
+            return DeflateError::Data
+        }
+        if sym < 256 {
+            if !out_push(s, sym as u8) {
+                return DeflateError::OutOfMemory
+            }
+        } else if sym as usize == ENDBLOCK {
+            return true
+        } else {
+            let li: usize = (sym as usize) - 257
+            if li >= 29 {
+                return DeflateError::Data // 286/287 exist in the code and never in a stream
+            }
+            let len: usize = (*c).lbase[li] as usize
+            +get_bits(s, (*c).lext[li] as usize) as usize
+            let dsym: i32 = huff_decode(s, dst)
+            if (*s).ran_out {
+                return DeflateError::Truncated
+            }
+            if dsym < 0 || dsym >= 30 {
+                return DeflateError::Data
+            }
+            let di: usize = dsym as usize
+            let dist: usize = (*c).dbase[di] as usize
+            +get_bits(s, (*c).dext[di] as usize) as usize
+            if (*s).ran_out {
+                return DeflateError::Truncated
+            }
+            if dist > out_len(s) {
+                return DeflateError::Data // reaches in front of the output
+            }
+            // OCTET BY OCTET, on purpose: `dist` may be smaller than `len`,
+            // and then the copy reads what it has just written.
+            let b: *mut rt.Buf = out_buf(s)
+            rt.buf_reserve(b, (*b).len + len)
+            if (*b).cap < (*b).len + len {
+                return DeflateError::OutOfMemory
+            }
+            var from: usize = (*b).len - dist
+            var k: usize = 0
+            while k < len {
+                rt.st8((*b).ptr, (*b).len, rt.ld8((*b).ptr, from))
+                (*b).len = (*b).len + 1
+                from = from + 1
+                k = k + 1
+            }
+        }
+    }
+    return true
+}
+
+fn fixed_lit_lengths(buf: u64) {
+    var i: usize = 0
+    while i < 144 { rt.st8(buf, i, 8 as u8); i = i + 1 }
+    while i < 256 { rt.st8(buf, i, 9 as u8); i = i + 1 }
+    while i < 280 { rt.st8(buf, i, 7 as u8); i = i + 1 }
+    while i < 288 { rt.st8(buf, i, 8 as u8); i = i + 1 }
+}
+
+// The dynamic table: HLIT/HDIST/HCLEN, then the 19 code length lengths in
+// their jumbled order, then the lengths of both codes -- themselves Huffman
+// coded, with 16/17/18 as run length escapes.
+fn inflate_dynamic(s: *mut Inflater, lit: *mut Huff, dst: *mut Huff,
+    lens: u64) -> DeflateError!bool {
+    let hlit: usize = get_bits(s, 5) as usize + 257
+    let hdist: usize = get_bits(s, 5) as usize + 1
+    let hclen: usize = get_bits(s, 4) as usize + 4
+    if (*s).ran_out {
+        return DeflateError::Truncated
+    }
+    if hlit > 286 || hdist > 30 {
+        return DeflateError::Data
+    }
+    var order: [u8; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3,
+        13, 2, 14, 1, 15]
+    var cl: [u8; 19] = [0; 19]
+    var i: usize = 0
+    while i < hclen {
+        cl[order[i] as usize] = get_bits(s, 3) as u8
+        i = i + 1
+    }
+    if (*s).ran_out {
+        return DeflateError::Truncated
+    }
+    var clh: Huff = Huff { count: [0; 16], symbol: [0; 288] }
+    if !huff_build(&clh, (&cl[0]) as u64, 19) {
+        return DeflateError::Data
+    }
+    // The two code length lists come as ONE sequence -- a run may cross the
+    // border between the literal code and the distance code, which is the
+    // second place implementations get this wrong.
+    var n: usize = 0
+    while n < hlit + hdist {
+        let sym: i32 = huff_decode(s, &clh)
+        if (*s).ran_out {
+            return DeflateError::Truncated
+        }
+        if sym < 0 {
+            return DeflateError::Data
+        }
+        if sym < 16 {
+            rt.st8(lens, n, sym as u8)
+            n = n + 1
+        } else if sym == 16 {
+            if n == 0 {
+                return DeflateError::Data // nothing to repeat
+            }
+            let prev: u8 = rt.ld8(lens, n - 1)
+            let rep: usize = 3 + get_bits(s, 2) as usize
+            if n + rep > hlit + hdist {
+                return DeflateError::Data
+            }
+            var k: usize = 0
+            while k < rep {
+                rt.st8(lens, n, prev)
+                n = n + 1
+                k = k + 1
+            }
+        } else if sym == 17 {
+            let rep: usize = 3 + get_bits(s, 3) as usize
+            if n + rep > hlit + hdist {
+                return DeflateError::Data
+            }
+            var k: usize = 0
+            while k < rep {
+                rt.st8(lens, n, 0 as u8)
+                n = n + 1
+                k = k + 1
+            }
+        } else {
+            let rep: usize = 11 + get_bits(s, 7) as usize
+            if n + rep > hlit + hdist {
+                return DeflateError::Data
+            }
+            var k: usize = 0
+            while k < rep {
+                rt.st8(lens, n, 0 as u8)
+                n = n + 1
+                k = k + 1
+            }
+        }
+    }
+    // A stream whose literal code has no code for 256 can never end.
+    if rt.ld8(lens, ENDBLOCK) == 0 as u8 {
+        return DeflateError::Data
+    }
+    if !huff_build(lit, lens, hlit) {
+        return DeflateError::Data
+    }
+    if !huff_build(dst, lens + hlit as u64, hdist) {
+        return DeflateError::Data
+    }
+    return true
+}
+
+// Raw DEFLATE into `out` (appended). The return value is the number of
+// octets written.
+fn inflate_into(src: u64, n: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    var s: Inflater = Inflater { src: src, srclen: n, pos: 0, bitbuf: 0,
+        bitcnt: 0, out: out as u64, ran_out: false }
+    var c: Codes = codes_new()
+    let before: usize = (*out).len
+
+    // 320 lengths: 288 literal/length plus 32 distance, in one array,
+    // because a run length escape may cross from one into the other.
+    var lens: [u8; 320] = [0; 320]
+    var lit: Huff = Huff { count: [0; 16], symbol: [0; 288] }
+    var dst: Huff = Huff { count: [0; 16], symbol: [0; 288] }
+
+    var last: bool = false
+    while !last {
+        last = get_bit(&s) != 0 as u32
+        let typ: u32 = get_bits(&s, 2)
+        if s.ran_out {
+            return DeflateError::Truncated
+        }
+        if typ == 0 as u32 {
+            try inflate_stored(&s)
+        } else if typ == 3 as u32 {
+            return DeflateError::Data // the reserved type
+        } else {
+            if typ == 1 as u32 {
+                fixed_lit_lengths((&lens[0]) as u64)
+                if !huff_build(&lit, (&lens[0]) as u64, 288) {
+                    return DeflateError::Data
+                }
+                var i: usize = 0
+                while i < 30 {
+                    rt.st8((&lens[0]) as u64, i, 5 as u8)
+                    i = i + 1
+                }
+                if !huff_build(&dst, (&lens[0]) as u64, 30) {
+                    return DeflateError::Data
+                }
+            } else {
+                try inflate_dynamic(&s, &lit, &dst, (&lens[0]) as u64)
+            }
+            try inflate_codes(&s, &lit, &dst, &c)
+        }
+    }
+    return (*out).len - before
+}
+
+fn inflate(src: u64, n: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    return inflate_into(src, n, out)
+}
+
+// ------------------------------------------------------------- zlib, gzip
+
+fn zlib_decompress(src: u64, n: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    if n < 6 {
+        return DeflateError::Truncated
+    }
+    let cmf: u32 = rt.ld8(src, 0) as u32
+    let flg: u32 = rt.ld8(src, 1) as u32
+    if (cmf & 15 as u32) != 8 as u32 {
+        return DeflateError::Format // only DEFLATE
+    }
+    if (cmf >> 4) > 7 as u32 {
+        return DeflateError::Format // window > 32 KiB
+    }
+    if (cmf * 256 + flg) % 31 as u32 != 0 as u32 {
+        return DeflateError::Format // the header check of RFC 1950 2.2
+    }
+    if (flg & 32 as u32) != 0 as u32 {
+        return DeflateError::Format // FDICT -- see D3
+    }
+    let before: usize = (*out).len
+    let got: usize = try inflate_into(src + 2, n - 6, out)
+    // The Adler-32 stands BIG endian at the end -- the one big endian
+    // number in a format that is little endian everywhere else.
+    let want: u32 = ((rt.ld8(src, n - 4) as u32) << 24)
+    | ((rt.ld8(src, n - 3) as u32) << 16)
+    | ((rt.ld8(src, n - 2) as u32) << 8)
+    | (rt.ld8(src, n - 1) as u32)
+    if adler32((*out).ptr + before as u64, got) != want {
+        return DeflateError::Checksum
+    }
+    return got
+}
+
+fn gzip_decompress(src: u64, n: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    if n < 18 {
+        return DeflateError::Truncated
+    }
+    if rt.ld8(src, 0) != 31 as u8 || rt.ld8(src, 1) != 139 as u8 {
+        return DeflateError::Format
+    }
+    if rt.ld8(src, 2) != 8 as u8 {
+        return DeflateError::Format // only DEFLATE
+    }
+    let flg: u32 = rt.ld8(src, 3) as u32
+    if (flg & 224 as u32) != 0 as u32 {
+        return DeflateError::Format // reserved bits set
+    }
+    var at: usize = 10
+    if (flg & 4 as u32) != 0 as u32 { // FEXTRA
+        if at + 2 > n {
+            return DeflateError::Truncated
+        }
+        let xlen: usize = (rt.ld8(src, at) as usize)
+        | ((rt.ld8(src, at + 1) as usize) << 8)
+        at = at + 2 + xlen
+    }
+    if (flg & 8 as u32) != 0 as u32 { // FNAME
+        while at < n && rt.ld8(src, at) != 0 as u8 {
+            at = at + 1
+        }
+        at = at + 1
+    }
+    if (flg & 16 as u32) != 0 as u32 { // FCOMMENT
+        while at < n && rt.ld8(src, at) != 0 as u8 {
+            at = at + 1
+        }
+        at = at + 1
+    }
+    if (flg & 2 as u32) != 0 as u32 { // FHCRC
+        at = at + 2
+    }
+    if at + 8 > n {
+        return DeflateError::Truncated
+    }
+    let before: usize = (*out).len
+    let got: usize = try inflate_into(src + at as u64, n - at - 8, out)
+    // CRC-32 and the length little endian, and the length only modulo 2^32
+    // -- that is the format's own limit, not this file's.
+    let want: u32 = (rt.ld8(src, n - 8) as u32)
+    | ((rt.ld8(src, n - 7) as u32) << 8)
+    | ((rt.ld8(src, n - 6) as u32) << 16)
+    | ((rt.ld8(src, n - 5) as u32) << 24)
+    let isize_want: u32 = (rt.ld8(src, n - 4) as u32)
+    | ((rt.ld8(src, n - 3) as u32) << 8)
+    | ((rt.ld8(src, n - 2) as u32) << 16)
+    | ((rt.ld8(src, n - 1) as u32) << 24)
+    if crc32((*out).ptr + before as u64, got) != want {
+        return DeflateError::Checksum
+    }
+    if (got as u64 & 4294967295 as u64) as u32 != isize_want {
+        return DeflateError::Checksum
+    }
+    return got
+}
+
+// ====================================================================
+// THE COMPRESSOR
+// ====================================================================
+
+struct Deflater {
+    src: u64,
+    n: usize,
+    head: u64, // u32[HASHSIZE]
+    prev: u64, // u32[WSIZE]
+    tlit: u64, // u16[MAXTOK] -- literal octet or (length - 3)
+    tdist: u64, // u16[MAXTOK] -- 0 = literal, else the distance
+    ntok: usize,
+    lfreq: u64, // u32[288]
+    dfreq: u64, // u32[30]
+    out: u64, // *mut rt.Buf
+    bitbuf: u32,
+    bitcnt: usize,
+    bad: bool,
+    chain: usize, // how far the hash chain is walked
+    lazy: bool,
+    blk_start: usize, // where the current block's data starts in `src`
+}
+
+fn d_out(d: *mut Deflater) -> *mut rt.Buf {
+    return (*d).out as *mut rt.Buf
+}
+
+// ----------------------------------------------------------- the bit writer
+
+fn put_bits(d: *mut Deflater, value: u32, n: usize) {
+    (*d).bitbuf = (*d).bitbuf | (value << ((*d).bitcnt as u32))
+    (*d).bitcnt = (*d).bitcnt + n
+    while (*d).bitcnt >= 8 {
+        let b: *mut rt.Buf = d_out(d)
+        if (*b).len == (*b).cap {
+            rt.buf_reserve(b, (*b).len + 1)
+            if (*b).len == (*b).cap {
+                (*d).bad = true
+                return
+            }
+        }
+        rt.st8((*b).ptr, (*b).len, ((*d).bitbuf & 255 as u32) as u8)
+        (*b).len = (*b).len + 1
+        (*d).bitbuf = (*d).bitbuf >> 8
+        (*d).bitcnt = (*d).bitcnt - 8
+    }
+}
+
+fn flush_bits(d: *mut Deflater) {
+    while (*d).bitcnt > 0 {
+        put_bits(d, 0 as u32, 8 - (*d).bitcnt)
+    }
+}
+
+// A Huffman code goes into the stream most significant bit first, the rest
+// of the format least significant bit first. The codes are stored REVERSED
+// (see `rev_bits`), so writing one is an ordinary `put_bits`.
+fn rev_bits(v: u32, n: usize) -> u32 {
+    var r: u32 = 0
+    var i: usize = 0
+    while i < n {
+        r = (r << 1) | ((v >> (i as u32)) & 1 as u32)
+        i = i + 1
+    }
+    return r
+}
+
+// ------------------------------------------------- the length limited code
+
+// The tree, without pointers: `parent` per node, frequencies in `f`. n is
+// at most 288, so the O(n^2) search for the two smallest is at most 83,000
+// comparisons per block and not worth a heap.
+//
+// `lens` (u8 per symbol) is the result. Returns false when the code cannot
+// be built -- the caller then takes the fixed code.
+fn build_lengths(freq: u64, nsym: usize, maxbits: usize, lens: u64) -> bool {
+    // Which symbols occur at all.
+    var used: [u16; 288] = [0; 288]
+    var m: usize = 0
+    var i: usize = 0
+    while i < nsym {
+        rt.st8(lens, i, 0 as u8)
+        if rt.ld32(freq, i) != 0 as u32 {
+            used[m] = i as u16
+            m = m + 1
+        }
+        i = i + 1
+    }
+    if m == 0 {
+        return true // an empty code -- legal for distances
+    }
+    if m == 1 {
+        rt.st8(lens, used[0] as usize, 1 as u8)
+        return true
+    }
+
+    // The tree: 2m-1 nodes, the first m of them leaves.
+    var nf: [u64; 576] = [0; 576]
+    var par: [u16; 576] = [0; 576]
+    var alive: [u8; 576] = [0; 576]
+    i = 0
+    while i < m {
+        nf[i] = rt.ld32(freq, used[i] as usize) as u64
+        alive[i] = 1 as u8
+        i = i + 1
+    }
+    var total: usize = m
+    var remaining: usize = m
+    while remaining > 1 {
+        // the two smallest living nodes
+        var a: usize = 576
+        var b: usize = 576
+        i = 0
+        while i < total {
+            if alive[i] == 1 as u8 {
+                if a == 576 || nf[i] < nf[a] {
+                    b = a
+                    a = i
+                } else if b == 576 || nf[i] < nf[b] {
+                    b = i
+                }
+            }
+            i = i + 1
+        }
+        nf[total] = nf[a] + nf[b]
+        alive[total] = 1 as u8
+        alive[a] = 0 as u8
+        alive[b] = 0 as u8
+        par[a] = total as u16
+        par[b] = total as u16
+        total = total + 1
+        remaining = remaining - 1
+    }
+    let root: usize = total - 1
+
+    // The depth of every leaf, capped at `maxbits`, and how many were too
+    // deep. `bl_count` then gets the standard repair.
+    var bl: [u16; 16] = [0; 16]
+    var depth: [u16; 288] = [0; 288]
+    var overflow: usize = 0
+    i = 0
+    while i < m {
+        var d: usize = 0
+        var node: usize = i
+        while node != root && d < 300 {
+            node = par[node] as usize
+            d = d + 1
+        }
+        if d > maxbits {
+            d = maxbits
+            overflow = overflow + 1
+        }
+        depth[i] = d as u16
+        bl[d] = bl[d] + 1 as u16
+        i = i + 1
+    }
+
+    // zlib's repair: take one leaf from a shorter length down a level,
+    // which makes room for two of the overlong ones.
+    while overflow > 0 {
+        var bits: usize = maxbits - 1
+        while bits > 0 && bl[bits] == 0 as u16 {
+            bits = bits - 1
+        }
+        if bits == 0 {
+            return false
+        }
+        bl[bits] = bl[bits] - 1 as u16
+        bl[bits + 1] = bl[bits + 1] + 2 as u16
+        bl[maxbits] = bl[maxbits] - 1 as u16
+        if overflow < 2 {
+            overflow = 0
+        } else {
+            overflow = overflow - 2
+        }
+    }
+
+    // Hand the lengths out by frequency: the most frequent symbol gets the
+    // shortest code. Insertion sort over at most 288 entries, descending by
+    // frequency and, for equal frequencies, by symbol -- so that the result
+    // does not depend on the order the symbols happened to be visited in.
+    var ord: [u16; 288] = [0; 288]
+    i = 0
+    while i < m {
+        ord[i] = used[i]
+        i = i + 1
+    }
+    i = 1
+    while i < m {
+        let key: u16 = ord[i]
+        let kf: u32 = rt.ld32(freq, key as usize)
+        var j: usize = i
+        while j > 0 {
+            let of: u32 = rt.ld32(freq, ord[j - 1] as usize)
+            if of < kf || (of == kf && ord[j - 1] > key) {
+                ord[j] = ord[j - 1]
+                j = j - 1
+            } else {
+                j = 0 + j
+                break
+            }
+        }
+        ord[j] = key
+        i = i + 1
+    }
+
+    var at: usize = 0
+    var len: usize = 1
+    while len <= maxbits {
+        var k: usize = 0
+        while k < bl[len] as usize {
+            if at >= m {
+                return false
+            }
+            rt.st8(lens, ord[at] as usize, len as u8)
+            at = at + 1
+            k = k + 1
+        }
+        len = len + 1
+    }
+    if at != m {
+        return false
+    }
+
+    // The completeness check (the header calls it `kraft_ok`): the sum of
+    // 2^-len over all codes has to be exactly 1. Anything else and the
+    // decoder on the other side reads a different stream than we wrote.
+    var sum: u64 = 0
+    i = 0
+    while i < nsym {
+        let l: usize = rt.ld8(lens, i) as usize
+        if l > 0 {
+            sum = sum + (1 << ((maxbits - l) as u64))
+        }
+        i = i + 1
+    }
+    return sum == (1 << (maxbits as u64))
+}
+
+// The canonical codes out of the lengths (RFC 1951 3.2.2), already
+// REVERSED for the writer.
+fn build_codes(lens: u64, nsym: usize, codes: u64 /* u32[] */) {
+    var bl: [u16; 16] = [0; 16]
+    var i: usize = 0
+    while i < nsym {
+        let l: usize = rt.ld8(lens, i) as usize
+        bl[l] = bl[l] + 1 as u16
+        i = i + 1
+    }
+    bl[0] = 0 as u16
+    var next: [u32; 16] = [0; 16]
+    var code: u32 = 0
+    var b: usize = 1
+    while b < 16 {
+        code = (code + (bl[b - 1] as u32)) * 2 as u32
+        next[b] = code
+        b = b + 1
+    }
+    i = 0
+    while i < nsym {
+        let l: usize = rt.ld8(lens, i) as usize
+        if l != 0 {
+            rt.st32(codes, i, rev_bits(next[l], l))
+            next[l] = next[l] + 1 as u32
+        } else {
+            rt.st32(codes, i, 0 as u32)
+        }
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------ the LZ77 part
+
+fn hash3(d: *mut Deflater, pos: usize) -> usize {
+    let a: u32 = rt.ld8((*d).src, pos) as u32
+    let b: u32 = rt.ld8((*d).src, pos + 1) as u32
+    let c: u32 = rt.ld8((*d).src, pos + 2) as u32
+    return (((a << 10) ^ (b << 5) ^ c) & HASHMASK) as usize
+}
+
+// An UNALIGNED 64 bit read at an octet offset. `rt.ld64` counts in units of
+// eight, which is exactly what is not wanted here: the two positions being
+// compared have any offset at all against each other.
+fn ldu64(p: u64, off: usize) -> u64 {
+    return *((p + off as u64) as *mut u64)
+}
+
+// ROUND 87 -- EIGHT OCTETS PER COMPARISON INSTEAD OF ONE.
+//
+// This loop is the hot spot of the whole compressor: for every position the
+// hash chain is walked, and for every link in it this function runs. Octet
+// by octet that is one load, one comparison and one branch per octet, and
+// the branch is unpredictable by nature -- it is data.
+//
+// Eight at a time is one load, one comparison and one branch per EIGHT
+// octets, and the tail is at most seven single octets. Deliberately NOT
+// with `bsf` on the exclusive or: after the wide loop breaks, the octet loop
+// simply carries on from `k` and finds the same place. That costs at most
+// seven comparisons ONCE per call, needs no instruction the language does
+// not have, and stays correct on a big endian machine, where the lowest
+// differing octet would not be the first one.
+//
+// The reads never leave the buffer: `limit` is at most `n - b`, and `a < b`,
+// so `a + k + 8 <= a + limit < n` and `b + k + 8 <= n`.
+fn match_len(d: *mut Deflater, a: usize, b: usize, limit: usize) -> usize {
+    let src: u64 = (*d).src
+    var k: usize = 0
+    while k + 8 <= limit {
+        if ldu64(src, a + k) != ldu64(src, b + k) {
+            break
+        }
+        k = k + 8
+    }
+    while k < limit && rt.ld8(src, a + k) == rt.ld8(src, b + k) {
+        k = k + 1
+    }
+    return k
+}
+
+// The best match for `pos`, or length 0. `*out_dist` gets the distance.
+fn find_match(d: *mut Deflater, pos: usize, out_dist: *mut usize) -> usize {
+    *out_dist = 0
+    if pos + MINMATCH > (*d).n {
+        return 0
+    }
+    var limit: usize = (*d).n - pos
+    if limit > MAXMATCH {
+        limit = MAXMATCH
+    }
+    if limit < MINMATCH {
+        return 0
+    }
+    let h: usize = hash3(d, pos)
+    var cur: u32 = rt.ld32((*d).head, h)
+    var left: usize = (*d).chain
+    var best: usize = 0
+    var bestd: usize = 0
+    let src: u64 = (*d).src
+    while cur != NIL && left > 0 {
+        let cp: usize = cur as usize
+        if cp >= pos {
+            break
+        }
+        let dist: usize = pos - cp
+        if dist > WSIZE {
+            break
+        }
+        // Only compare when the octet behind the current best differs --
+        // that one test throws out most candidates before the loop starts.
+        // ROUND 87: and the one BEFORE it as well, exactly as zlib does. A
+        // candidate has to beat the current best, so both of those octets
+        // have to fit; two comparisons here save a whole call.
+        if best == 0
+        || (rt.ld8(src, cp + best) == rt.ld8(src, pos + best)
+            && rt.ld8(src, cp + best - 1) == rt.ld8(src, pos + best - 1)) {
+            let l: usize = match_len(d, cp, pos, limit)
+            if l > best {
+                best = l
+                bestd = dist
+                if l >= limit {
+                    break
+                }
+            }
+        }
+        cur = rt.ld32((*d).prev, cp & WMASK)
+        left = left - 1
+    }
+    if best < MINMATCH {
+        return 0
+    }
+    *out_dist = bestd
+    return best
+}
+
+fn insert_pos(d: *mut Deflater, pos: usize) {
+    if pos + MINMATCH > (*d).n {
+        return
+    }
+    let h: usize = hash3(d, pos)
+    rt.st32((*d).prev, pos & WMASK, rt.ld32((*d).head, h))
+    rt.st32((*d).head, h, pos as u32)
+}
+
+// ------------------------------------------------------- emitting a block
+
+// The exact cost of the token list under a given code, in bits.
+fn block_bits(d: *mut Deflater, c: *mut Codes, llen: u64, dlen: u64) -> u64 {
+    var bits: u64 = 0
+    var i: usize = 0
+    while i < (*d).ntok {
+        let dist: usize = rt.ld16((*d).tdist, i) as usize
+        let v: usize = rt.ld16((*d).tlit, i) as usize
+        if dist == 0 {
+            bits = bits + rt.ld8(llen, v) as u64
+        } else {
+            let len: usize = v + MINMATCH
+            let lc: usize = (*c).lcode[len] as usize
+            bits = bits + rt.ld8(llen, 257 + lc) as u64 + (*c).lext[lc] as u64
+            let dc: usize = dist_code(c, dist)
+            bits = bits + rt.ld8(dlen, dc) as u64 + (*c).dext[dc] as u64
+        }
+        i = i + 1
+    }
+    return bits + rt.ld8(llen, ENDBLOCK) as u64
+}
+
+fn write_tokens(d: *mut Deflater, c: *mut Codes, llen: u64, lcode: u64,
+    dlen: u64, dcode: u64) {
+    var i: usize = 0
+    while i < (*d).ntok {
+        let dist: usize = rt.ld16((*d).tdist, i) as usize
+        let v: usize = rt.ld16((*d).tlit, i) as usize
+        if dist == 0 {
+            put_bits(d, rt.ld32(lcode, v), rt.ld8(llen, v) as usize)
+        } else {
+            let len: usize = v + MINMATCH
+            let lc: usize = (*c).lcode[len] as usize
+            put_bits(d, rt.ld32(lcode, 257 + lc), rt.ld8(llen, 257 + lc) as usize)
+            let ex: usize = (*c).lext[lc] as usize
+            if ex > 0 {
+                put_bits(d, (len - (*c).lbase[lc] as usize) as u32, ex)
+            }
+            let dc: usize = dist_code(c, dist)
+            put_bits(d, rt.ld32(dcode, dc), rt.ld8(dlen, dc) as usize)
+            let dx: usize = (*c).dext[dc] as usize
+            if dx > 0 {
+                put_bits(d, (dist - (*c).dbase[dc] as usize) as u32, dx)
+            }
+        }
+        i = i + 1
+    }
+    put_bits(d, rt.ld32(lcode, ENDBLOCK), rt.ld8(llen, ENDBLOCK) as usize)
+}
+
+// The stored form: aligned, LEN and ~LEN, then the raw octets. Split at
+// 65,535 because the length field is 16 bits.
+fn emit_stored(d: *mut Deflater, from: usize, to: usize, last: bool) {
+    var at: usize = from
+    if at == to {
+        // An empty input still needs a block, otherwise the stream has none.
+        put_bits(d, (last as u32), 1)
+        put_bits(d, 0 as u32, 2)
+        flush_bits(d)
+        let b: *mut rt.Buf = d_out(d)
+        rt.buf_reserve(b, (*b).len + 4)
+        rt.st8((*b).ptr, (*b).len, 0 as u8)
+        rt.st8((*b).ptr, (*b).len + 1, 0 as u8)
+        rt.st8((*b).ptr, (*b).len + 2, 255 as u8)
+        rt.st8((*b).ptr, (*b).len + 3, 255 as u8)
+        (*b).len = (*b).len + 4
+        return
+    }
+    while at < to {
+        var chunk: usize = to - at
+        if chunk > 65535 {
+            chunk = 65535
+        }
+        let is_last: bool = last && (at + chunk == to)
+        put_bits(d, (is_last as u32), 1)
+        put_bits(d, 0 as u32, 2)
+        flush_bits(d)
+        let b: *mut rt.Buf = d_out(d)
+        rt.buf_reserve(b, (*b).len + chunk + 4)
+        if (*b).cap < (*b).len + chunk + 4 {
+            (*d).bad = true
+            return
+        }
+        rt.st8((*b).ptr, (*b).len, (chunk & 255) as u8)
+        rt.st8((*b).ptr, (*b).len + 1, ((chunk >> 8) & 255) as u8)
+        rt.st8((*b).ptr, (*b).len + 2, ((chunk ^ 65535) & 255) as u8)
+        rt.st8((*b).ptr, (*b).len + 3, (((chunk ^ 65535) >> 8) & 255) as u8)
+        (*b).len = (*b).len + 4
+        rt.mem_copy((*b).ptr + (*b).len as u64, (*d).src + at as u64, chunk)
+        (*b).len = (*b).len + chunk
+        at = at + chunk
+    }
+}
+
+// Chooses between stored, fixed and dynamic by COUNTING, and writes the
+// block. `from`/`to` are the octets the tokens cover -- needed for the
+// stored variant, which does not use the tokens at all.
+fn emit_block(d: *mut Deflater, c: *mut Codes, from: usize, to: usize,
+    last: bool) {
+    // --- the fixed code
+    var flen: [u8; 288] = [0; 288]
+    var i: usize = 0
+    while i < 144 { flen[i] = 8 as u8; i = i + 1 }
+    while i < 256 { flen[i] = 9 as u8; i = i + 1 }
+    while i < 280 { flen[i] = 7 as u8; i = i + 1 }
+    while i < 288 { flen[i] = 8 as u8; i = i + 1 }
+    var fdlen: [u8; 30] = [5; 30]
+    let fixed_bits: u64 = 3 + block_bits(d, c, (&flen[0]) as u64, (&fdlen[0]) as u64)
+
+    // --- the dynamic code
+    var llen: [u8; 288] = [0; 288]
+    var dlen: [u8; 30] = [0; 30]
+    var dyn_ok: bool = build_lengths((*d).lfreq, 286, MAXBITS, (&llen[0]) as u64)
+    if dyn_ok {
+        dyn_ok = build_lengths((*d).dfreq, 30, MAXBITS, (&dlen[0]) as u64)
+    }
+    var dyn_bits: u64 = 18446744073709551615 as u64
+
+    // How the table itself is transmitted: HLIT + HDIST lengths, run length
+    // coded with 16/17/18, and that sequence Huffman coded again.
+    var hlit: usize = 286
+    var hdist: usize = 30
+    var rle_sym: [u8; 320] = [0; 320]
+    var rle_extra: [u8; 320] = [0; 320]
+    var nrle: usize = 0
+    var clfreq: [u32; 19] = [0; 19]
+    var cllen: [u8; 19] = [0; 19]
+    var clcode: [u32; 19] = [0; 19]
+    var hclen: usize = 19
+    var order: [u8; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3,
+        13, 2, 14, 1, 15]
+
+    if dyn_ok {
+        // Trailing zero lengths are not transmitted.
+        while hlit > 257 && llen[hlit - 1] == 0 as u8 {
+            hlit = hlit - 1
+        }
+        while hdist > 1 && dlen[hdist - 1] == 0 as u8 {
+            hdist = hdist - 1
+        }
+        var all: [u8; 320] = [0; 320]
+        i = 0
+        while i < hlit { all[i] = llen[i]; i = i + 1 }
+        i = 0
+        while i < hdist { all[hlit + i] = dlen[i]; i = i + 1 }
+        let total: usize = hlit + hdist
+
+        var at: usize = 0
+        while at < total {
+            let v: u8 = all[at]
+            var run: usize = 1
+            while at + run < total && all[at + run] == v {
+                run = run + 1
+            }
+            if v == 0 as u8 {
+                while run >= 11 {
+                    var take: usize = run
+                    if take > 138 {
+                        take = 138
+                    }
+                    rle_sym[nrle] = 18 as u8
+                    rle_extra[nrle] = (take - 11) as u8
+                    nrle = nrle + 1
+                    at = at + take
+                    run = run - take
+                }
+                while run >= 3 {
+                    var take: usize = run
+                    if take > 10 {
+                        take = 10
+                    }
+                    rle_sym[nrle] = 17 as u8
+                    rle_extra[nrle] = (take - 3) as u8
+                    nrle = nrle + 1
+                    at = at + take
+                    run = run - take
+                }
+                while run > 0 {
+                    rle_sym[nrle] = 0 as u8
+                    rle_extra[nrle] = 0 as u8
+                    nrle = nrle + 1
+                    at = at + 1
+                    run = run - 1
+                }
+            } else {
+                // The first one is written out, only the repetitions behind
+                // it may use 16.
+                rle_sym[nrle] = v
+                rle_extra[nrle] = 0 as u8
+                nrle = nrle + 1
+                at = at + 1
+                run = run - 1
+                while run >= 3 {
+                    var take: usize = run
+                    if take > 6 {
+                        take = 6
+                    }
+                    rle_sym[nrle] = 16 as u8
+                    rle_extra[nrle] = (take - 3) as u8
+                    nrle = nrle + 1
+                    at = at + take
+                    run = run - take
+                }
+                while run > 0 {
+                    rle_sym[nrle] = v
+                    rle_extra[nrle] = 0 as u8
+                    nrle = nrle + 1
+                    at = at + 1
+                    run = run - 1
+                }
+            }
+        }
+        i = 0
+        while i < nrle {
+            clfreq[rle_sym[i] as usize] = clfreq[rle_sym[i] as usize] + 1 as u32
+            i = i + 1
+        }
+        // The code length code may be at most 7 bits deep.
+        if !build_lengths((&clfreq[0]) as u64, 19, 7, (&cllen[0]) as u64) {
+            dyn_ok = false
+        } else {
+            build_codes((&cllen[0]) as u64, 19, (&clcode[0]) as u64)
+            while hclen > 4 && cllen[order[hclen - 1] as usize] == 0 as u8 {
+                hclen = hclen - 1
+            }
+            var head: u64 = 5 + 5 + 4 + (hclen as u64) * 3
+            i = 0
+            while i < nrle {
+                let s: usize = rle_sym[i] as usize
+                head = head + cllen[s] as u64
+                if s == 16 {
+                    head = head + 2
+                } else if s == 17 {
+                    head = head + 3
+                } else if s == 18 {
+                    head = head + 7
+                }
+                i = i + 1
+            }
+            dyn_bits = 3 + head
+            +block_bits(d, c, (&llen[0]) as u64, (&dlen[0]) as u64)
+        }
+    }
+
+    // --- stored: three header bits, the padding to the octet, 4 octets of
+    // length, and the data.
+    let raw: u64 = (to - from) as u64
+    var stored_bits: u64 = 3 + 7 + 32 + raw * 8
+    if raw > 65535 {
+        stored_bits = 3 + ((raw / 65535) + 1) * 42 + raw * 8
+    }
+
+    if stored_bits <= fixed_bits && stored_bits <= dyn_bits {
+        emit_stored(d, from, to, last)
+        return
+    }
+    if dyn_ok && dyn_bits < fixed_bits {
+        put_bits(d, (last as u32), 1)
+        put_bits(d, 2 as u32, 2)
+        put_bits(d, (hlit - 257) as u32, 5)
+        put_bits(d, (hdist - 1) as u32, 5)
+        put_bits(d, (hclen - 4) as u32, 4)
+        i = 0
+        while i < hclen {
+            put_bits(d, cllen[order[i] as usize] as u32, 3)
+            i = i + 1
+        }
+        i = 0
+        while i < nrle {
+            let s: usize = rle_sym[i] as usize
+            put_bits(d, clcode[s], cllen[s] as usize)
+            if s == 16 {
+                put_bits(d, rle_extra[i] as u32, 2)
+            } else if s == 17 {
+                put_bits(d, rle_extra[i] as u32, 3)
+            } else if s == 18 {
+                put_bits(d, rle_extra[i] as u32, 7)
+            }
+            i = i + 1
+        }
+        var lcode: [u32; 288] = [0; 288]
+        var dcode: [u32; 30] = [0; 30]
+        build_codes((&llen[0]) as u64, 288, (&lcode[0]) as u64)
+        build_codes((&dlen[0]) as u64, 30, (&dcode[0]) as u64)
+        write_tokens(d, c, (&llen[0]) as u64, (&lcode[0]) as u64,
+            (&dlen[0]) as u64, (&dcode[0]) as u64)
+        return
+    }
+    put_bits(d, (last as u32), 1)
+    put_bits(d, 1 as u32, 2)
+    var flcode: [u32; 288] = [0; 288]
+    var fdcode: [u32; 30] = [0; 30]
+    build_codes((&flen[0]) as u64, 288, (&flcode[0]) as u64)
+    build_codes((&fdlen[0]) as u64, 30, (&fdcode[0]) as u64)
+    write_tokens(d, c, (&flen[0]) as u64, (&flcode[0]) as u64,
+        (&fdlen[0]) as u64, (&fdcode[0]) as u64)
+}
+
+fn tokens_clear(d: *mut Deflater) {
+    (*d).ntok = 0
+    var i: usize = 0
+    while i < 288 {
+        rt.st32((*d).lfreq, i, 0 as u32)
+        i = i + 1
+    }
+    i = 0
+    while i < 30 {
+        rt.st32((*d).dfreq, i, 0 as u32)
+        i = i + 1
+    }
+    // THE END OF BLOCK SYMBOL COUNTS AS ONE OCCURRENCE. Without it the
+    // dynamic code has no code for 256, the block cannot be closed, and
+    // every decoder in the world reports "missing end-of-block" -- which is
+    // exactly what happened here the first time this ran.
+    rt.st32((*d).lfreq, ENDBLOCK, 1 as u32)
+}
+
+fn push_literal(d: *mut Deflater, v: u8) {
+    rt.st16((*d).tlit, (*d).ntok, v as u16)
+    rt.st16((*d).tdist, (*d).ntok, 0 as u16)
+    (*d).ntok = (*d).ntok + 1
+    rt.st32((*d).lfreq, v as usize, rt.ld32((*d).lfreq, v as usize) + 1 as u32)
+}
+
+fn push_match(d: *mut Deflater, c: *mut Codes, len: usize, dist: usize) {
+    rt.st16((*d).tlit, (*d).ntok, (len - MINMATCH) as u16)
+    rt.st16((*d).tdist, (*d).ntok, dist as u16)
+    (*d).ntok = (*d).ntok + 1
+    let lc: usize = 257 + (*c).lcode[len] as usize
+    rt.st32((*d).lfreq, lc, rt.ld32((*d).lfreq, lc) + 1 as u32)
+    let dc: usize = dist_code(c, dist)
+    rt.st32((*d).dfreq, dc, rt.ld32((*d).dfreq, dc) + 1 as u32)
+}
+
+// Raw DEFLATE. `level` 0..9; 0 means stored blocks only.
+fn deflate(src: u64, n: usize, level: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    let before: usize = (*out).len
+    var d: Deflater = Deflater { src: src, n: n, head: 0, prev: 0, tlit: 0,
+        tdist: 0, ntok: 0, lfreq: 0, dfreq: 0, out: out as u64, bitbuf: 0,
+        bitcnt: 0, bad: false, chain: 32, lazy: true, blk_start: 0 }
+    var c: Codes = codes_new()
+
+    if level == 0 {
+        emit_stored(&d, 0, n, true)
+        if d.bad {
+            return DeflateError::OutOfMemory
+        }
+        return (*out).len - before
+    }
+
+    // The chain limit per level -- measured in tools/stdlib81/run.sh.
+    // The chain limit per level -- measured in tools/stdlib81/run.sh.
+    //
+    // ROUND 87 TRIED zlib's other two limits here and THREW THEM OUT again;
+    // the numbers are in docs/ROUND87.md 2. `nice_length` (stop the walk at
+    // a match of 128) bought 4.5 % of speed at level 6 and cost 0.15
+    // percentage points of ratio; `good_length` (walk only a quarter of the
+    // chain once a match of 8 has been found) bought 26 % and cost 1.4
+    // points -- and at level 1, where the chain is 8 links long anyway,
+    // quartering it made the output 168,715 -> 185,005 octets, nearly ten
+    // percent worse. The mandate for the round was that the ratio must NOT
+    // get worse, so neither of them is in here. What made the compressor
+    // faster is in `match_len` and in the pre-check of `find_match`, and
+    // both of those produce bit-identical output.
+    if level <= 2 {
+        d.chain = 8
+        d.lazy = false
+    } else if level <= 4 {
+        d.chain = 32
+        d.lazy = false
+    } else if level <= 6 {
+        d.chain = 128
+        d.lazy = true
+    } else if level <= 8 {
+        d.chain = 1024
+        d.lazy = true
+    } else {
+        d.chain = 4096
+        d.lazy = true
+    }
+
+    d.head = rt.heap_alloc(HASHSIZE * 4)
+    d.prev = rt.heap_alloc(WSIZE * 4)
+    d.tlit = rt.heap_alloc(MAXTOK * 2)
+    d.tdist = rt.heap_alloc(MAXTOK * 2)
+    d.lfreq = rt.heap_alloc(288 * 4)
+    d.dfreq = rt.heap_alloc(30 * 4)
+    if d.head == 0 || d.prev == 0 || d.tlit == 0 || d.tdist == 0
+    || d.lfreq == 0 || d.dfreq == 0 {
+        deflater_free(&d)
+        return DeflateError::OutOfMemory
+    }
+    var i: usize = 0
+    while i < HASHSIZE {
+        rt.st32(d.head, i, NIL)
+        i = i + 1
+    }
+    i = 0
+    while i < WSIZE {
+        rt.st32(d.prev, i, NIL)
+        i = i + 1
+    }
+    tokens_clear(&d)
+
+    // THE WALK. The invariant that makes this readable: when the loop body
+    // starts, every position BEFORE `pos` has been entered into the hash
+    // chain and every octet before `pos` is covered by a token. `pos` only
+    // ever moves forward, which is what makes the loop terminate -- the
+    // first version of this file kept a match back and stepped `pos` back
+    // by one for it, and on 300,000 identical octets it never came out
+    // again.
+    var pos: usize = 0
+    d.blk_start = 0
+    var cached: bool = false // the match for `pos` is already known
+    var c_len: usize = 0
+    var c_dist: usize = 0
+
+    while pos < n {
+        var dist: usize = 0
+        var len: usize = 0
+        if cached {
+            len = c_len
+            dist = c_dist
+            cached = false
+        } else {
+            len = find_match(&d, pos, &dist)
+        }
+
+        if len >= MINMATCH && d.lazy && pos + 1 < n {
+            // LAZY: enter `pos` into the chain (so the search one octet
+            // further can see it) and look whether it gets better there.
+            insert_pos(&d, pos)
+            var d2: usize = 0
+            let len2: usize = find_match(&d, pos + 1, &d2)
+            if len2 > len {
+                push_literal(&d, rt.ld8(src, pos))
+                pos = pos + 1
+                cached = true
+                c_len = len2
+                c_dist = d2
+            } else {
+                push_match(&d, &c, len, dist)
+                var k: usize = 1
+                while k < len {
+                    insert_pos(&d, pos + k)
+                    k = k + 1
+                }
+                pos = pos + len
+            }
+        } else if len >= MINMATCH {
+            push_match(&d, &c, len, dist)
+            var k: usize = 0
+            while k < len {
+                insert_pos(&d, pos + k)
+                k = k + 1
+            }
+            pos = pos + len
+        } else {
+            push_literal(&d, rt.ld8(src, pos))
+            insert_pos(&d, pos)
+            pos = pos + 1
+        }
+
+        if d.ntok >= MAXTOK - 2 {
+            emit_block(&d, &c, d.blk_start, pos, false)
+            if d.bad {
+                deflater_free(&d)
+                return DeflateError::OutOfMemory
+            }
+            d.blk_start = pos
+            tokens_clear(&d)
+        }
+    }
+    emit_block(&d, &c, d.blk_start, n, true)
+    flush_bits(&d)
+    let failed: bool = d.bad
+    deflater_free(&d)
+    if failed {
+        return DeflateError::OutOfMemory
+    }
+    return (*out).len - before
+}
+
+fn deflater_free(d: *mut Deflater) {
+    if (*d).head != 0 { rt.heap_free((*d).head, HASHSIZE * 4) }
+    if (*d).prev != 0 { rt.heap_free((*d).prev, WSIZE * 4) }
+    if (*d).tlit != 0 { rt.heap_free((*d).tlit, MAXTOK * 2) }
+    if (*d).tdist != 0 { rt.heap_free((*d).tdist, MAXTOK * 2) }
+    if (*d).lfreq != 0 { rt.heap_free((*d).lfreq, 288 * 4) }
+    if (*d).dfreq != 0 { rt.heap_free((*d).dfreq, 30 * 4) }
+    (*d).head = 0
+    (*d).prev = 0
+    (*d).tlit = 0
+    (*d).tdist = 0
+    (*d).lfreq = 0
+    (*d).dfreq = 0
+}
+
+// ------------------------------------------------------------- the frames
+
+fn buf_push_u8(out: *mut rt.Buf, v: u8) -> bool {
+    rt.buf_push(out, v)
+    return true
+}
+
+fn zlib_compress(src: u64, n: usize, level: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    let before: usize = (*out).len
+    // CMF: method 8, window 32 KiB (CINFO 7). FLG: the two level bits and a
+    // check value that makes the 16 bit header a multiple of 31.
+    let cmf: u32 = 120 // 0x78
+    var flg: u32 = 0
+    if level >= 6 {
+        flg = 2 * 64 as u32
+    } else if level >= 2 {
+        flg = 1 * 64 as u32
+    }
+    let rest: u32 = (cmf * 256 + flg) % 31 as u32
+    if rest != 0 as u32 {
+        flg = flg + (31 as u32 - rest)
+    }
+    buf_push_u8(out, cmf as u8)
+    buf_push_u8(out, flg as u8)
+    try deflate(src, n, level, out)
+    let a: u32 = adler32(src, n)
+    buf_push_u8(out, (a >> 24) as u8)
+    buf_push_u8(out, ((a >> 16) & 255 as u32) as u8)
+    buf_push_u8(out, ((a >> 8) & 255 as u32) as u8)
+    buf_push_u8(out, (a & 255 as u32) as u8)
+    return (*out).len - before
+}
+
+fn gzip_compress(src: u64, n: usize, level: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    let before: usize = (*out).len
+    buf_push_u8(out, 31 as u8)
+    buf_push_u8(out, 139 as u8)
+    buf_push_u8(out, 8 as u8) // DEFLATE
+    buf_push_u8(out, 0 as u8) // no flags: no name, no extra field
+    // MTIME 0 -- "no time available" (RFC 1952 2.3.1). A real time would
+    // make the output depend on the clock, and this repository compares
+    // outputs octet for octet.
+    buf_push_u8(out, 0 as u8)
+    buf_push_u8(out, 0 as u8)
+    buf_push_u8(out, 0 as u8)
+    buf_push_u8(out, 0 as u8)
+    if level >= 9 {
+        buf_push_u8(out, 2 as u8) // XFL: the slowest setting
+    } else if level <= 2 {
+        buf_push_u8(out, 4 as u8) // XFL: the fastest
+    } else {
+        buf_push_u8(out, 0 as u8)
+    }
+    buf_push_u8(out, 3 as u8) // OS: Unix
+    try deflate(src, n, level, out)
+    let c: u32 = crc32(src, n)
+    buf_push_u8(out, (c & 255 as u32) as u8)
+    buf_push_u8(out, ((c >> 8) & 255 as u32) as u8)
+    buf_push_u8(out, ((c >> 16) & 255 as u32) as u8)
+    buf_push_u8(out, (c >> 24) as u8)
+    let sz: u32 = (n as u64 & 4294967295 as u64) as u32
+    buf_push_u8(out, (sz & 255 as u32) as u8)
+    buf_push_u8(out, ((sz >> 8) & 255 as u32) as u8)
+    buf_push_u8(out, ((sz >> 16) & 255 as u32) as u8)
+    buf_push_u8(out, (sz >> 24) as u8)
+    return (*out).len - before
+}

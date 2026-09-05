@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: MIT
+// demos/freestanding/core.fi -- A TINY KERNEL, ENTIRELY IN FIRN.
+//
+// Round 52. The proof that `profile kernel` means something: this file
+// compiles to an ELF OBJECT FILE without a single undefined name -- no libc,
+// no `_start`, no system call, no runtime.
+// `tools/freestanding/run.sh` compiles it with BOTH compilers, reads the
+// symbol table with `nm`/`readelf` and links the result against
+// `demos/freestanding/linker.ld`.
+//
+// What is in it:
+//   * serial port COM1 through `in`/`out` (inline assembly)
+//   * VGA text buffer at 0xB8000 through MMIO
+//   * one interrupt entry point (`#[interrupt]`, ends with `iretq`)
+//
+// What is NOT in it, and why: an IDT needs global, mutable data. Stage 0 does
+// not have that (SPEC 14, item 5: `const` only).
+// As long as that is missing, this kernel cannot install its own interrupt
+// vector -- the entry function is ready, the table has to come from outside
+// (for now). Named honestly in docs/ROUND52.md.
+//
+// ROUND 59 removes that limit, without a change to the language: the
+// mutable state does not lie in the language but in a memory region whose
+// address `boot.s` hands over. The kernel that grew out of it is
+// `the osum repository (kernel/kmain.fi)` -- with its own IDT, exception reports, timer,
+// frame allocator, heap, keyboard and ring 3 (docs/ROUND59.md). This file
+// stays the minimal example that `tools/freestanding/run.sh` measures.
+
+profile kernel
+
+// ------------------------------------------------------------- port I/O
+
+fn out8(port: u16, value: u8) {
+    asm("out dx, al", in("dx") port, in("al") value)
+}
+
+fn in8(port: u16) -> u8 {
+    // ROUND 72: `in al, dx` only ever DEFINES the low byte of `rax` --
+    // the upper 56 bits are whatever was in the register before, and the
+    // new checked `as u8` narrowing cast rightly caught that garbage the
+    // moment it stopped being all-zero (found booting this very kernel).
+    // `movzx eax, al` makes the WHOLE `rax` well-defined from the read
+    // byte, matching what `out("rax")` already promised the caller.
+    return asm("in al, dx\nmovzx eax, al", out("rax"), in("dx") port) as u8
+}
+
+// ------------------------------------------------------- serial port
+
+// 0x3F8 = COM1
+const COM1: u16 = 1016
+
+fn serial_init() {
+    out8(COM1 + 1 as u16, 0 as u8)
+    out8(COM1 + 3 as u16, 128 as u8)
+    out8(COM1 + 0 as u16, 3 as u8)
+    out8(COM1 + 1 as u16, 0 as u8)
+    out8(COM1 + 3 as u16, 3 as u8)
+    out8(COM1 + 2 as u16, 199 as u8)
+    out8(COM1 + 4 as u16, 11 as u8)
+}
+
+fn serial_ready() -> bool {
+    return (in8(COM1 + 5 as u16) & 32 as u8) != 0 as u8
+}
+
+fn serial_char(z: u8) {
+    while !serial_ready() {
+    }
+    out8(COM1, z)
+}
+
+fn serial_text(p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        serial_char(*((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------- VGA text buffer
+
+// 0xB8000
+const VGA: u64 = 753664
+// 0x0F00 -- light grey on black
+const ATTR: u16 = 3840
+const CELLS: usize = 2000
+
+fn vga_cell(i: usize, z: u8) {
+    let p: *mut u16 = (VGA + i as u64 * 2) as *mut u16
+    __mmio_write16(p, ATTR | z as u16)
+}
+
+fn vga_clear() {
+    var i: usize = 0
+    while i < CELLS {
+        vga_cell(i, 32 as u8)
+        i = i + 1
+    }
+}
+
+fn vga_text(p: u64, n: usize, line: usize) {
+    var i: usize = 0
+    while i < n {
+        vga_cell(line * 80 + i, *((p + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// -------------------------------------------------- interrupt entry
+//
+// Its own calling convention: all general purpose registers are saved, the
+// end is `iretq`. It cannot be called -- the compiler rejects that with a
+// line and a column.
+
+#[interrupt]
+fn timer_ih() {
+    // Sign of life: the character in the top right corner counts up.
+    // The counter lives in video memory because stage 0 has no global mutable
+    // variables.
+    let p: *mut u16 = (VGA + 158) as *mut u16
+    let old: u16 = __mmio_read16(p)
+    let z: u16 = (old + 1 as u16) & 255 as u16
+    __mmio_write16(p, ATTR | z)
+    // End of interrupt to the first PIC (port 0x20, command 0x20)
+    out8(32 as u16, 32 as u8)
+}
+
+// ------------------------------------------------------------- entry
+//
+// This is where the boot loader jumps (`ENTRY` in linker.ld). No `_start`,
+// no arguments, no return.
+
+fn core_start() {
+    asm("cli")
+    vga_clear()
+    serial_init()
+    var greeting: [u8; 24] = "FIRN: profile kernel ist"
+    var greet2: [u8; 13] = "freestanding."
+    vga_text((&greeting[0]) as u64, 24, 0)
+    vga_text((&greet2[0]) as u64, 13, 1)
+    serial_text((&greeting[0]) as u64, 24)
+    serial_char(10 as u8)
+    serial_text((&greet2[0]) as u64, 13)
+    serial_char(10 as u8)
+    while true {
+        asm("hlt")
+    }
+}

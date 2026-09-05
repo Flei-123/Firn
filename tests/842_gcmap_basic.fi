@@ -1,0 +1,280 @@
+// expect_exit: 0
+// Round 53: `GcMap[K,V]` -- the map with a mutable size in the
+// GC heap (SPEC 3.5.2 `attrs: GcMap[Atom, Str]`).
+//
+// What is checked:
+//   1. set / get / has / remove / size / clear,
+//   2. rehashing while growing -- the entries must not get lost while the
+//      whole buffer is built anew,
+//   3. tombstones: a search must not stop behind a deletion,
+//   4. the collector traces KEYS AND VALUES,
+//   5. a deleted entry does NOT keep its object alive any more,
+//   6. a cycle through a GcMap is collected.
+
+gc class Text {
+    content: u64,
+}
+
+gc class Elem {
+    attrs: Gc[GcMap],
+    back: Gc[Elem],
+    mark: u64,
+}
+
+fn text(x: u64) -> AllocError!Gc[Text] {
+    return try gc Text { content: x }
+}
+
+fn elem(mark: u64, kz: bool, wz: bool) -> AllocError!Gc[Elem] {
+    return try gc Elem {
+        attrs: try gcmap_new(kz, wz),
+        back: gc_null[Elem](),
+        mark: mark,
+    }
+}
+
+// Cycle: element -> GcMap -> text ... and element -> GcMap -> element
+// back. The collector has to resolve both.
+fn cycle(n: u64) -> AllocError!u64 {
+    let e: Gc[Elem] = try elem(1, false, true)
+    var i: u64 = 0
+    while i < n {
+        let t: Gc[Text] = try text(i + 1)
+        let ok: bool = try gcmap_set_value[Text](e.attrs, i + 2, t)
+        i = i + 1
+    }
+    // And a back reference to the element itself, as a value in the map.
+    let ok2: bool = try gcmap_set_value[Elem](e.attrs, 9999, e)
+    return gcmap_size(e.attrs)
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+
+    // --- 1. raw map: number -> number ------------------------------------
+    let m: Gc[GcMap] = gcmap_new(false, false) catch gc_null[GcMap]()
+    if (m as u64) == 0 {
+        return 91
+    }
+    if gcmap_size(m) != 0 || gcmap_capacity(m) != 0 {
+        return 1
+    }
+    // 0 and 1 are reserved keys and have to be rejected.
+    if gcmap_set(m, 0, 5) catch true {
+        return 2
+    }
+    if gcmap_set(m, 1, 5) catch true {
+        return 3
+    }
+    var i: u64 = 2
+    while i < 5002 {
+        let ok: bool = gcmap_set(m, i, i * 7) catch false
+        if !ok {
+            return 4
+        }
+        i = i + 1
+    }
+    if gcmap_size(m) != 5000 {
+        return 5
+    }
+    i = 2
+    while i < 5002 {
+        if gcmap_get(m, i, 0) != i * 7 {
+            return 6
+        }
+        if !gcmap_has(m, i) {
+            return 7
+        }
+        i = i + 1
+    }
+    if gcmap_get(m, 999999, 4711) != 4711 {
+        return 8
+    }
+    if gcmap_has(m, 999999) {
+        return 9
+    }
+    // Overwriting does not change the size.
+    let o1: bool = gcmap_set(m, 100, 12345) catch false
+    if !o1 || gcmap_size(m) != 5000 || gcmap_get(m, 100, 0) != 12345 {
+        return 10
+    }
+    // Tombstones: delete every second one, then the remaining ones still
+    // have to be found (the search must NOT stop at a tombstone).
+    i = 2
+    while i < 5002 {
+        if !gcmap_remove(m, i) {
+            return 11
+        }
+        i = i + 2
+    }
+    if gcmap_size(m) != 2500 {
+        return 12
+    }
+    i = 3
+    while i < 5002 {
+        if gcmap_get(m, i, 0) != i * 7 {
+            return 13
+        }
+        i = i + 2
+    }
+    i = 2
+    while i < 5002 {
+        if gcmap_has(m, i) {
+            return 14
+        }
+        i = i + 2
+    }
+    // Insert again: the tombstones have to be reused.
+    i = 2
+    while i < 5002 {
+        let ok: bool = gcmap_set(m, i, i * 7) catch false
+        if !ok {
+            return 15
+        }
+        i = i + 2
+    }
+    if gcmap_size(m) != 5000 {
+        return 16
+    }
+    // Iteration: every occupied slot exactly once.
+    var counted: u64 = 0
+    var sum: u64 = 0
+    var p: u64 = 0
+    while p < gcmap_capacity(m) {
+        if gcmap_slot_used(m, p) {
+            counted = counted + 1
+            sum = sum + gcmap_slot_key(m, p)
+        }
+        p = p + 1
+    }
+    if counted != 5000 {
+        return 17
+    }
+    // 2 + 3 + ... + 5001
+    if sum != (2 + 5001) * 5000 / 2 {
+        return 18
+    }
+    gcmap_clear(m)
+    if gcmap_size(m) != 0 || gcmap_has(m, 100) {
+        return 19
+    }
+
+    // --- 2. traced values survive the rehashing -------------------------
+    let w: Gc[GcMap] = gcmap_new(false, true) catch gc_null[GcMap]()
+    i = 2
+    while i < 3002 {
+        let t: Gc[Text] = text(i * 11) catch gc_null[Text]()
+        if (t as u64) == 0 {
+            return 20
+        }
+        let ok: bool = gcmap_set_value[Text](w, i, t) catch false
+        if !ok {
+            return 21
+        }
+        i = i + 1
+    }
+    gc_collect()
+    gc_collect()
+    i = 2
+    while i < 3002 {
+        let t: Gc[Text] = gcmap_get_value[Text](w, i)
+        if (t as u64) == 0 {
+            return 22
+        }
+        if t.content != i * 11 {
+            return 23
+        }
+        i = i + 1
+    }
+
+    // --- 3. traced KEYS -------------------------------------------------
+    let s: Gc[GcMap] = gcmap_new(true, true) catch gc_null[GcMap]()
+    let ss: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
+    i = 0
+    while i < 500 {
+        let k: Gc[Text] = text(i + 1) catch gc_null[Text]()
+        let v: Gc[Text] = text(1000 + i) catch gc_null[Text]()
+        let o3: bool = gcvec_append[Text](ss, k) catch false
+        let o4: bool = gcmap_set(s, k as u64, v as u64) catch false
+        if !o3 || !o4 {
+            return 24
+        }
+        i = i + 1
+    }
+    gc_collect()
+    gc_collect()
+    i = 0
+    while i < 500 {
+        let k: Gc[Text] = gcvec_read[Text](ss, i)
+        if k.content != i + 1 {
+            return 25
+        }
+        let v: Gc[Text] = gcmap_get(s, k as u64, 0) as Gc[Text]
+        if (v as u64) == 0 {
+            return 26
+        }
+        if v.content != 1000 + i {
+            return 27
+        }
+        i = i + 1
+    }
+
+    // --- 4. a deleted entry holds nothing any more ----------------------
+    gc_collect()
+    let before: u64 = gc_live_objects()
+    let d: Gc[GcMap] = gcmap_new(false, true) catch gc_null[GcMap]()
+    i = 2
+    while i < 1002 {
+        let t: Gc[Text] = text(i) catch gc_null[Text]()
+        let ok: bool = gcmap_set_value[Text](d, i, t) catch false
+        if !ok {
+            return 28
+        }
+        i = i + 1
+    }
+    gc_collect()
+    if gc_live_objects() < before + 1000 {
+        return 29
+    }
+    i = 2
+    while i < 1002 {
+        if !gcmap_remove(d, i) {
+            return 30
+        }
+        i = i + 1
+    }
+    // MERGE R49+R53: the conservative stack scan may keep dead objects.
+    // Round 49 repaired the scan (it now really begins below its own frame
+    // and covers the saved callee-saved registers)
+    // -- since then two old slot buffers of this map together with their 768
+    // values were held as accidental hits. Whoever wants to prove that
+    // something is NOT held has to clean the dead stack first; that is exactly
+    // what gc_stack_clean() is for (gc.fi, round 49), and tests/833 as well as
+    // lib/dom do the same.
+    gc_stack_clean()
+    gc_collect()
+    gc_collect()
+    if gc_live_objects() > before + 16 {
+        return 31
+    }
+
+    // --- 5. cycles through a GcMap are collected ------------------------
+    gc_collect()
+    let vor2: u64 = gc_live_objects()
+    var z: u64 = 0
+    while z < 200 {
+        let n: u64 = cycle(20) catch 0
+        if n != 21 {
+            return 32
+        }
+        z = z + 1
+    }
+    gc_collect()
+    gc_collect()
+    if gc_live_objects() > vor2 + 24 {
+        return 33
+    }
+    return 0
+}

@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/paint/display.fi -- THE DISPLAY LIST. The box tree becomes an
+// ordered list of drawing commands.
+//
+// This is the step everybody skips and everybody then pays for. It would
+// be possible to walk the box tree and draw straight away; a browser does
+// not, and the reason is not tidiness:
+//
+//   * THE ORDER IS NOT THE TREE ORDER. CSS 2.1, Appendix E puts a float
+//     over the background of the paragraph beside it and UNDER its
+//     letters; it puts a positioned box with no z-index over every
+//     ordinary block, however deep that block sits; and it makes a
+//     `z-index: 1` inside a `z-index: 0` unable to escape its parent, no
+//     matter how large the number. A recursive draw does the tree order,
+//     and the tree order is wrong.
+//   * A LIST CAN BE COUNTED, PRINTED AND COMPARED. `tools/paintb3` reads
+//     the list as text and holds it against what is expected; a
+//     `draw_rect` deep in a recursion can only be checked by looking at
+//     the picture afterwards.
+//   * THE TWO HALVES CAN BE TIMED APART. Round B3 reports how long the
+//     list takes to build and how long it takes to raster; with a
+//     recursive draw there is one number and no way to know which half is
+//     slow.
+//
+// The order itself comes out of `layout.stack`, which round 67 measured
+// against Chromium at 5171 probe points. Round B3 only added the PHASE to
+// it (see there): where a box's background goes, and where its text goes.
+import css.cascade
+import layout.box
+import layout.stack
+
+export {
+    Cmd, DisplayList,
+    CMD_RECT, CMD_GRADIENT, CMD_BORDER, CMD_TEXT, CMD_SHADOW,
+    CMD_CLIP_PUSH, CMD_CLIP_POP, CMD_IMAGE,
+    build_display_list, dl_count, dl_at,
+    resolve_radii, radius_used,
+}
+
+const CMD_RECT: u32 = 0 // a filled rectangle, possibly with round corners
+const CMD_GRADIENT: u32 = 1 // the same shape, filled with a gradient
+const CMD_BORDER: u32 = 2 // the four borders of one box
+const CMD_TEXT: u32 = 3 // one run of characters on one line
+const CMD_SHADOW: u32 = 4 // a box shadow, outer or inset
+const CMD_CLIP_PUSH: u32 = 5
+const CMD_CLIP_POP: u32 = 6
+const CMD_IMAGE: u32 = 7 // a decoded bitmap, scaled into a rectangle
+
+// One command. It is one class with room for every kind rather than a
+// class per kind, because stage 0 has no sum types with payloads and a
+// vector of eight different classes would need a tag anyway.
+gc class Cmd {
+    style: Gc[Style],
+    src: Gc[Box], // the box, for a border
+    run: Gc[TextRun], // the characters, for text
+    rad: [f64; 8],
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    a: f64, // blur radius / image handle low word
+    b: f64, // spread
+    alpha: f64, // the inherited opacity, already multiplied out
+    cx0: f64, // what the clipping ancestors leave over
+    cy0: f64,
+    cx1: f64,
+    cy1: f64,
+    color: u32,
+    kind: u32,
+    flag: u32, // shadow: 1 = inset. image: the handle.
+}
+
+gc class DisplayList {
+    cmds: Gc[GcVec],
+}
+
+fn cmd_new(kind: u32) -> AllocError!Gc[Cmd] {
+    return try gc Cmd {
+        style: gc_null[Style](),
+        src: gc_null[Box](),
+        run: gc_null[TextRun](),
+        rad: [0.0; 8],
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+        a: 0.0,
+        b: 0.0,
+        alpha: 1.0,
+        cx0: 0.0 - 1.0e9,
+        cy0: 0.0 - 1.0e9,
+        cx1: 1.0e9,
+        cy1: 1.0e9,
+        color: 0,
+        kind: kind,
+        flag: 0,
+    }
+}
+
+fn dl_count(d: Gc[DisplayList]) -> u64 {
+    return gcvec_length(d.cmds)
+}
+
+fn dl_at(d: Gc[DisplayList], i: u64) -> Gc[Cmd] {
+    return gcvec_read[Cmd](d.cmds, i)
+}
+
+// ---------------------------------------------------------- The corners
+//
+// THE OVERLAP RULE, css-backgrounds-3, 5.5, and it is the one thing about
+// `border-radius` that is always forgotten: if the two radii on one side
+// together are longer than the side, ALL EIGHT radii are scaled by the
+// same factor -- the smallest factor any of the four sides demands. So
+// `border-radius: 100px` on a 50 px box gives 25 px corners and not 50,
+// and it gives them on all four corners even if only one side is short.
+fn resolve_radii(s: Gc[Style], w: f64, h: f64, out: *mut f64) {
+    var i: usize = 0
+    while i < 8 {
+        var v: f64 = cascade.style_radius(s, i)
+        let u: u32 = cascade.style_radius_unit(s, i)
+        if u == cascade.U_PERCENT {
+            if i % 2 == 0 {
+                v = w * v / 100.0
+            } else {
+                v = h * v / 100.0
+            }
+        } else if u != cascade.U_PX {
+            v = 0.0
+        }
+        if v < 0.0 {
+            v = 0.0
+        }
+        *((out as u64 + (i * 8) as u64) as *mut f64) = v
+        i = i + 1
+    }
+    var f: f64 = 1.0
+    f = shrink(f, w, rd(out, cascade.R_TL_H) + rd(out, cascade.R_TR_H))
+    f = shrink(f, w, rd(out, cascade.R_BL_H) + rd(out, cascade.R_BR_H))
+    f = shrink(f, h, rd(out, cascade.R_TL_V) + rd(out, cascade.R_BL_V))
+    f = shrink(f, h, rd(out, cascade.R_TR_V) + rd(out, cascade.R_BR_V))
+    if f < 1.0 {
+        i = 0
+        while i < 8 {
+            *((out as u64 + (i * 8) as u64) as *mut f64) = rd(out, i) * f
+            i = i + 1
+        }
+    }
+}
+
+fn rd(p: *mut f64, i: usize) -> f64 {
+    return *((p as u64 + (i * 8) as u64) as *mut f64)
+}
+
+fn shrink(f: f64, side: f64, sum: f64) -> f64 {
+    if sum <= 0.0 || side <= 0.0 {
+        return f
+    }
+    let g: f64 = side / sum
+    if g < f {
+        return g
+    }
+    return f
+}
+
+fn radius_used(r: *mut f64) -> bool {
+    var i: usize = 0
+    while i < 8 {
+        if rd(r, i) > 0.0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The radii of a rectangle that has been pulled in by `t`, `r`, `b`, `l`:
+// each radius shrinks by the edge that runs along it, and never below
+// zero. The same rule as the inner edge of a border ring.
+fn shrink_radii(rad: *mut f64, t: f64, r: f64, b: f64, l: f64) {
+    setr(rad, 0, less(rd(rad, 0), l))
+    setr(rad, 1, less(rd(rad, 1), t))
+    setr(rad, 2, less(rd(rad, 2), r))
+    setr(rad, 3, less(rd(rad, 3), t))
+    setr(rad, 4, less(rd(rad, 4), r))
+    setr(rad, 5, less(rd(rad, 5), b))
+    setr(rad, 6, less(rd(rad, 6), l))
+    setr(rad, 7, less(rd(rad, 7), b))
+}
+
+fn setr(p: *mut f64, i: usize, v: f64) {
+    *((p as u64 + (i * 8) as u64) as *mut f64) = v
+}
+
+fn less(a: f64, b: f64) -> f64 {
+    if a <= b {
+        return 0.0
+    }
+    return a - b
+}
+
+fn set_clip(c: Gc[Cmd], b: Gc[Box]) {
+    c.cx0 = b.clx0
+    c.cy0 = b.cly0
+    c.cx1 = b.clx1
+    c.cy1 = b.cly1
+}
+
+fn copy_rad(c: Gc[Cmd], r: *mut f64) {
+    var i: usize = 0
+    while i < 8 {
+        c.rad[i] = rd(r, i)
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------- The walk
+
+fn build_display_list(root: Gc[Box],
+    vw: f64, vh: f64, canvas_bg: u32) -> AllocError!Gc[DisplayList] {
+    let cmds = try gcvec_new()
+    let d = try gc DisplayList { cmds: cmds }
+    // The canvas itself. A browser paints the background of the root
+    // element over the WHOLE canvas, not only over the root box -- that
+    // is why a `body { background: red }` on a short page still colours
+    // the part below the last line.
+    let bg = try cmd_new(CMD_RECT)
+    bg.x = 0.0
+    bg.y = 0.0
+    bg.w = vw
+    bg.h = vh
+    bg.color = canvas_bg
+    let ok0: bool = try gcvec_append[Cmd](cmds, bg)
+    if root == gc_null[Box]() {
+        return d
+    }
+    let ops = try stack.paint_order_ops(root)
+    var i: u64 = 0
+    let n: u64 = gcvec_length(ops)
+    while i < n {
+        let op: Gc[PaintOp] = gcvec_read[PaintOp](ops, i)
+        if op.phase == stack.PH_BOX {
+            let ok: bool = try emit_box(cmds, op.b)
+        } else {
+            let ok2: bool = try emit_text(cmds, op.b)
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// The opacity of a box is the product of its own and every ancestor's --
+// `box_stamp_alpha` computed that before the walk started.
+//
+// A real browser paints the whole subtree into a LAYER and composites the
+// layer once; this multiplies the alpha into every command instead. The
+// difference shows only where two children of the same half transparent
+// parent OVERLAP: a layer shows one blend there, this shows two. It is
+// named in docs/ROUNDB3.md rather than hidden.
+fn effective_alpha(b: Gc[Box]) -> f64 {
+    return b.oalpha
+}
+
+fn visible(b: Gc[Box]) -> bool {
+    return cascade.style_visibility(b.style) == cascade.VIS_VISIBLE
+}
+
+fn emit_box(cmds: Gc[GcVec], b: Gc[Box]) -> AllocError!bool {
+    if b.w <= 0.0 && b.h <= 0.0 {
+        return true
+    }
+    let s: Gc[Style] = b.style
+    let alpha: f64 = effective_alpha(b)
+    var rad: [f64; 8] = [0.0; 8]
+    resolve_radii(s, b.w, b.h, &rad[0])
+
+    // 1. the box shadow, UNDER the background (css-backgrounds-3, 6.2)
+    if cascade.style_has_box_shadow(s) && visible(b) {
+        let sh = try cmd_new(CMD_SHADOW)
+        sh.x = b.x
+        sh.y = b.y
+        sh.w = b.w
+        sh.h = b.h
+        sh.a = cascade.style_box_shadow(s, 2)
+        sh.b = cascade.style_box_shadow(s, 3)
+        sh.color = cascade.style_box_shadow_color(s)
+        sh.alpha = alpha
+        sh.style = s
+        sh.src = b
+        copy_rad(sh, &rad[0])
+        set_clip(sh, b)
+        // the offset travels in x/y of the command's own copy
+        sh.x = b.x + cascade.style_box_shadow(s, 0)
+        sh.y = b.y + cascade.style_box_shadow(s, 1)
+        if cascade.style_box_shadow_inset(s) {
+            sh.flag = 1
+            sh.x = b.x
+            sh.y = b.y
+        }
+        let ok: bool = try gcvec_append[Cmd](cmds, sh)
+    }
+
+    // ---- `background-clip`: WHICH rectangle the background fills.
+    // The default is the BORDER box -- a background runs under its own
+    // border, which is why a dashed border shows the background through
+    // its gaps. `padding-box` and `content-box` pull it in, and the
+    // corner radii come in with it.
+    var bx: f64 = b.x
+    var by: f64 = b.y
+    var bw: f64 = b.w
+    var bh: f64 = b.h
+    var brad: [f64; 8] = [0.0; 8]
+    var q: usize = 0
+    while q < 8 {
+        brad[q] = rad[q]
+        q = q + 1
+    }
+    let clip: u32 = cascade.style_background_clip(s)
+    if clip == cascade.BC_PADDING || clip == cascade.BC_CONTENT {
+        var it: f64 = b.bt
+        var ir: f64 = b.br
+        var ib: f64 = b.bb
+        var il: f64 = b.bl
+        if clip == cascade.BC_CONTENT {
+            it = it + b.pt
+            ir = ir + b.pr
+            ib = ib + b.pb
+            il = il + b.pl
+        }
+        bx = b.x + il
+        by = b.y + it
+        bw = b.w - il - ir
+        bh = b.h - it - ib
+        if bw < 0.0 {
+            bw = 0.0
+        }
+        if bh < 0.0 {
+            bh = 0.0
+        }
+        shrink_radii(&brad[0], it, ir, ib, il)
+    }
+
+    // 2. the background colour
+    let bgc: u32 = cascade.style_background(s)
+    if (bgc >> 24) != 0 as u32 && visible(b) {
+        let c = try cmd_new(CMD_RECT)
+        c.x = bx
+        c.y = by
+        c.w = bw
+        c.h = bh
+        c.color = bgc
+        c.alpha = alpha
+        copy_rad(c, &brad[0])
+        set_clip(c, b)
+        let ok: bool = try gcvec_append[Cmd](cmds, c)
+    }
+
+    // 3. the background image -- a gradient, for now
+    if cascade.style_gradient_kind(s) != cascade.GR_NONE && visible(b) {
+        let g = try cmd_new(CMD_GRADIENT)
+        g.x = bx
+        g.y = by
+        g.w = bw
+        g.h = bh
+        g.style = s
+        g.alpha = alpha
+        copy_rad(g, &brad[0])
+        set_clip(g, b)
+        let ok: bool = try gcvec_append[Cmd](cmds, g)
+    }
+
+    // 3b. ROUND B5 -- the picture of a replaced element. It goes over the
+    // background and under the borders, which is where css-images-3 puts
+    // the content of a replaced box.
+    if b.img != 0 && visible(b) {
+        let im = try cmd_new(CMD_IMAGE)
+        im.x = b.x + b.ml + b.bl + b.pl
+        im.y = b.y + b.mt + b.bt + b.pt
+        im.w = b.w - b.ml - b.mr - b.bl - b.br - b.pl - b.pr
+        im.h = b.h - b.mt - b.mb - b.bt - b.bb - b.pt - b.pb
+        im.a = b.img as f64
+        im.alpha = alpha
+        set_clip(im, b)
+        let oki: bool = try gcvec_append[Cmd](cmds, im)
+    }
+
+    // 4. the borders
+    if (b.bt > 0.0 || b.br > 0.0 || b.bb > 0.0 || b.bl > 0.0) && visible(b) {
+        let bo = try cmd_new(CMD_BORDER)
+        bo.x = b.x
+        bo.y = b.y
+        bo.w = b.w
+        bo.h = b.h
+        bo.src = b
+        bo.style = s
+        bo.alpha = alpha
+        copy_rad(bo, &rad[0])
+        set_clip(bo, b)
+        let ok: bool = try gcvec_append[Cmd](cmds, bo)
+    }
+    return true
+}
+
+fn emit_text(cmds: Gc[GcVec], b: Gc[Box]) -> AllocError!bool {
+    if b.runs == gc_null[GcVec]() {
+        return true
+    }
+    var i: u64 = 0
+    let n: u64 = gcvec_length(b.runs)
+    while i < n {
+        let tr: Gc[TextRun] = gcvec_read[TextRun](b.runs, i)
+        if cascade.style_visibility(tr.style) == cascade.VIS_VISIBLE &&
+        tr.n > 0 as u32 {
+            // The shadow of the text goes UNDER the text
+            if cascade.style_has_text_shadow(tr.style) {
+                let sh = try cmd_new(CMD_TEXT)
+                sh.run = tr
+                sh.style = tr.style
+                sh.x = cascade.style_text_shadow(tr.style, 0)
+                sh.y = cascade.style_text_shadow(tr.style, 1)
+                sh.a = cascade.style_text_shadow(tr.style, 2)
+                sh.color = cascade.style_text_shadow_color(tr.style)
+                sh.alpha = b.oalpha
+                sh.flag = 1 // this one is the shadow
+                set_clip(sh, b)
+                let oks: bool = try gcvec_append[Cmd](cmds, sh)
+            }
+            let c = try cmd_new(CMD_TEXT)
+            c.run = tr
+            c.style = tr.style
+            c.color = cascade.style_color(tr.style, 0)
+            c.alpha = b.oalpha
+            set_clip(c, b)
+            let ok: bool = try gcvec_append[Cmd](cmds, c)
+        }
+        i = i + 1
+    }
+    return true
+}

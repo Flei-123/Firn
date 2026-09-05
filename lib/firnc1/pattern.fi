@@ -1,0 +1,682 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/pattern.fi -- ENUMS (`enum`) AND PATTERN MATCHING (`match`):
+// THE REGISTRY, WRITTEN IN FIRN.
+//
+// Twelfth part of stage 1: the port of the data model of
+// `compiler/src/sema_match.rs`. Why a registry outside the
+// tree? Two reasons, both taken over from stage 0:
+//
+//   * The ARMS of a `match` are NOT in the syntax tree. The tree holds
+//     only a call `__match#<number>` without arguments; subject, patterns
+//     and body blocks live here. The reason in `firnc0`: generic templates
+//     could otherwise not substitute the arms per instantiation. `firnc1`
+//     keeps the split unchanged -- that way the tree stays flat and
+//     `--emit=ast-canon` prints exactly what stage 0 prints.
+//   * The LAYOUT of an enum does not belong in the tree but in the type
+//     context: the enum is recorded as a struct with the fields `__tag`
+//     and `__v<tag>_<i>` (see `pat_layout`).
+//
+// MEMORY LAYOUT (binding, SPEC 6.3):
+//   offset 0           : __tag : u32   (variant number, order of declaration)
+//   offset payload_off : payload, payload_off = round_up(4, payload_align)
+// The payload fields of a variant sit in order of declaration with
+// natural alignment one after another; the ranges of DIFFERENT
+// variants overlap (a true union). Size =
+// round_up(payload_off + max_variant_size, align), align =
+// max(4, payload_align).
+//
+// PATTERNS (SPEC 6.3): `_`, binding, integer, bool, range `lo..hi` /
+// `lo..=hi`, `Enum::Variant(subpattern..)` -- the enum part may be
+// left out (`::Variant`), nesting up to 32 levels.
+//
+// LIMIT AGAINST STAGE 0 (stated honestly): pattern values and range
+// bounds are `i64` here and `i128` in `firnc0`. A value beyond
+// `i64` (say `u64::MAX` as a pattern) could not be written down
+// here. No program in the corpus does that; anyone who does gets
+// a wrong comparison instead of a message -- the same direction this
+// stage takes elsewhere, which is why it is said here and in
+// docs/SELF_HOSTING.md section 22.
+
+import rt
+import vec
+import intern
+import ast
+import types
+
+export { Pat, pat_new, pat_free, pat_error,
+    MU_WILD, MU_BIND, MU_INT, MU_BOOL, MU_RANGE, MU_VARIANT,
+    pat_enum_add, pat_vt_start, pat_vt_add, pat_variant_add,
+    pat_match_add, pat_arm_add,
+    pat_mu_add, pat_children_start, pat_child_add,
+    pat_enum_count, pat_enum_find, pat_enum_at_struct,
+    pat_e_name, pat_e_sidx, pat_e_voff, pat_e_vlen,
+    pat_e_size, pat_e_align,
+    pat_v_name, pat_v_tag, pat_v_tlen, pat_v_roff,
+    pat_variant_find, pat_rf_ty, pat_rf_off,
+    pat_match_count, pat_m_subj, pat_m_aoff, pat_m_alen,
+    pat_a_pat, pat_a_block,
+    pat_mu_kind, pat_mu_a, pat_mu_b, pat_mu_lo, pat_mu_hi,
+    pat_mu_soff, pat_mu_slen, pat_mu_child, pat_irrefutable,
+    pat_is_matchname, pat_match_number, pat_is_ctorname,
+    pat_register, pat_layout }
+
+const NONE: u32 = 4294967295
+
+// pattern kinds
+const MU_WILD: u32 = 0 // `_`
+const MU_BIND: u32 = 1 // `x` -- binds the whole value (mu_a = name)
+const MU_INT: u32 = 2 // integer (mu_lo)
+const MU_BOOL: u32 = 3 // true/false (mu_a = 1/0)
+const MU_RANGE: u32 = 4 // `lo..hi` / `lo..=hi` (mu_lo/mu_hi, mu_a = 1 for `=`)
+const MU_VARIANT: u32 = 5 // `Enum::Variant(sub..)` -- mu_a = the enum
+// or NONE, mu_b = variant,
+// subpatterns from mu_soff on (mu_slen of them)
+
+struct Pat {
+    // enums
+    e_name: Vec[u32],
+    e_sidx: Vec[u32], // struct index, types.Types (NONE up to pat_register)
+    e_voff: Vec[u32], e_vlen: Vec[u32],
+    e_size: Vec[u64], e_align: Vec[u64],
+
+    // variants of all enums, one after another
+    v_name: Vec[u32], v_tag: Vec[u32],
+    v_toff: Vec[u32], v_tlen: Vec[u32], // payload type nodes (tree)
+    v_roff: Vec[u32], // resolved fields from here (from layout)
+
+    vt_ty: Vec[u32], // payload types, as written (type nodes)
+    rf_ty: Vec[u32], // resolved: type per payload field
+    rf_off: Vec[u64], // ... and its offset
+
+    // pattern matches
+    m_subj: Vec[u32], m_aoff: Vec[u32], m_alen: Vec[u32],
+    a_pat: Vec[u32], a_block: Vec[u32],
+
+    // pattern nodes (flat)
+    mu_kind: Vec[u32], mu_a: Vec[u32], mu_b: Vec[u32],
+    mu_lo: Vec[i64], mu_hi: Vec[i64],
+    mu_soff: Vec[u32], mu_slen: Vec[u32],
+    mu_children: Vec[u32],
+
+    scratch: rt.Buf,
+    err: usize,
+}
+
+fn pat_new() -> Pat {
+    return Pat {
+        e_name: vec_new[u32](), e_sidx: vec_new[u32](),
+        e_voff: vec_new[u32](), e_vlen: vec_new[u32](),
+        e_size: vec_new[u64](), e_align: vec_new[u64](),
+        v_name: vec_new[u32](), v_tag: vec_new[u32](),
+        v_toff: vec_new[u32](), v_tlen: vec_new[u32](), v_roff: vec_new[u32](),
+        vt_ty: vec_new[u32](),
+        rf_ty: vec_new[u32](), rf_off: vec_new[u64](),
+        m_subj: vec_new[u32](), m_aoff: vec_new[u32](), m_alen: vec_new[u32](),
+        a_pat: vec_new[u32](), a_block: vec_new[u32](),
+        mu_kind: vec_new[u32](), mu_a: vec_new[u32](), mu_b: vec_new[u32](),
+        mu_lo: vec_new[i64](), mu_hi: vec_new[i64](),
+        mu_soff: vec_new[u32](), mu_slen: vec_new[u32](),
+        mu_children: vec_new[u32](),
+        scratch: rt.buf_new(),
+        err: 0,
+    }
+}
+
+fn pat_free(m: *mut Pat) {
+    vec_free[u32](&(*m).e_name)
+    vec_free[u32](&(*m).e_sidx)
+    vec_free[u32](&(*m).e_voff)
+    vec_free[u32](&(*m).e_vlen)
+    vec_free[u64](&(*m).e_size)
+    vec_free[u64](&(*m).e_align)
+    vec_free[u32](&(*m).v_name)
+    vec_free[u32](&(*m).v_tag)
+    vec_free[u32](&(*m).v_toff)
+    vec_free[u32](&(*m).v_tlen)
+    vec_free[u32](&(*m).v_roff)
+    vec_free[u32](&(*m).vt_ty)
+    vec_free[u32](&(*m).rf_ty)
+    vec_free[u64](&(*m).rf_off)
+    vec_free[u32](&(*m).m_subj)
+    vec_free[u32](&(*m).m_aoff)
+    vec_free[u32](&(*m).m_alen)
+    vec_free[u32](&(*m).a_pat)
+    vec_free[u32](&(*m).a_block)
+    vec_free[u32](&(*m).mu_kind)
+    vec_free[u32](&(*m).mu_a)
+    vec_free[u32](&(*m).mu_b)
+    vec_free[i64](&(*m).mu_lo)
+    vec_free[i64](&(*m).mu_hi)
+    vec_free[u32](&(*m).mu_soff)
+    vec_free[u32](&(*m).mu_slen)
+    vec_free[u32](&(*m).mu_children)
+    rt.buf_free(&(*m).scratch)
+}
+
+fn pat_error(m: *mut Pat) -> usize { return (*m).err }
+
+// -------------------------------------------------------------- creating
+
+fn pat_enum_find(m: *mut Pat, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*m).e_name) {
+        if vec_at[u32](&(*m).e_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// A new enum. The name stays UNCHANGED -- enum names are visible
+// program wide, not per module (SPEC 14.1). Declaring it twice is an
+// error; it is recorded anyway (the first entry wins the lookup).
+fn pat_enum_add(m: *mut Pat, name: u32) -> u32 {
+    if pat_enum_find(m, name) != NONE {
+        (*m).err = (*m).err + 1
+    }
+    let i: u32 = vec_len[u32](&(*m).e_name) as u32
+    vec_push[u32](&(*m).e_name, name)
+    vec_push[u32](&(*m).e_sidx, NONE)
+    vec_push[u32](&(*m).e_voff, vec_len[u32](&(*m).v_name) as u32)
+    vec_push[u32](&(*m).e_vlen, 0)
+    vec_push[u64](&(*m).e_size, 0)
+    vec_push[u64](&(*m).e_align, 1)
+    return i
+}
+
+fn pat_vt_start(m: *mut Pat) -> u32 { return vec_len[u32](&(*m).vt_ty) as u32 }
+fn pat_vt_add(m: *mut Pat, t: u32) { vec_push[u32](&(*m).vt_ty, t) }
+
+fn pat_variant_add(m: *mut Pat, ei: u32, name: u32, toff: u32, tlen: u32) {
+    // A variant declared twice is an error.
+    let voff: u32 = vec_at[u32](&(*m).e_voff, ei as usize)
+    let vlen: u32 = vec_at[u32](&(*m).e_vlen, ei as usize)
+    var k: u32 = 0
+    while k < vlen {
+        if vec_at[u32](&(*m).v_name, (voff + k) as usize) == name {
+            (*m).err = (*m).err + 1
+            break
+        }
+        k = k + 1
+    }
+    vec_push[u32](&(*m).v_name, name)
+    vec_push[u32](&(*m).v_tag, vlen)
+    vec_push[u32](&(*m).v_toff, toff)
+    vec_push[u32](&(*m).v_tlen, tlen)
+    vec_push[u32](&(*m).v_roff, 0)
+    vec_set[u32](&(*m).e_vlen, ei as usize, vlen + 1)
+}
+
+// Index of a variant in this enum (the GLOBAL variant index),
+// or NONE.
+fn pat_variant_find(m: *mut Pat, ei: u32, name: u32) -> u32 {
+    let voff: u32 = vec_at[u32](&(*m).e_voff, ei as usize)
+    let vlen: u32 = vec_at[u32](&(*m).e_vlen, ei as usize)
+    var k: u32 = 0
+    while k < vlen {
+        if vec_at[u32](&(*m).v_name, (voff + k) as usize) == name {
+            return voff + k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+// --------------------------------------------------------------- match arms
+
+fn pat_match_add(m: *mut Pat, subj: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*m).m_subj) as u32
+    vec_push[u32](&(*m).m_subj, subj)
+    vec_push[u32](&(*m).m_aoff, vec_len[u32](&(*m).a_pat) as u32)
+    vec_push[u32](&(*m).m_alen, 0)
+    return i
+}
+
+fn pat_arm_add(m: *mut Pat, mi: u32, pat: u32, block: u32) {
+    vec_push[u32](&(*m).a_pat, pat)
+    vec_push[u32](&(*m).a_block, block)
+    let n: u32 = vec_at[u32](&(*m).m_alen, mi as usize)
+    vec_set[u32](&(*m).m_alen, mi as usize, n + 1)
+}
+
+// Create a pattern node. Subpattern lists have to be collected first and then
+// stored in one go (pat_children_start / pat_child_add) -- the same
+// lesson as in the parser: appending straight away nests the lists.
+fn pat_mu_add(m: *mut Pat, kind: u32, a: u32, b: u32, lo: i64, hi: i64,
+    soff: u32, slen: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*m).mu_kind) as u32
+    vec_push[u32](&(*m).mu_kind, kind)
+    vec_push[u32](&(*m).mu_a, a)
+    vec_push[u32](&(*m).mu_b, b)
+    vec_push[i64](&(*m).mu_lo, lo)
+    vec_push[i64](&(*m).mu_hi, hi)
+    vec_push[u32](&(*m).mu_soff, soff)
+    vec_push[u32](&(*m).mu_slen, slen)
+    return i
+}
+
+fn pat_children_start(m: *mut Pat) -> u32 { return vec_len[u32](&(*m).mu_children) as u32 }
+fn pat_child_add(m: *mut Pat, k: u32) { vec_push[u32](&(*m).mu_children, k) }
+
+// --------------------------------------------------------------- reading
+
+fn pat_enum_count(m: *mut Pat) -> usize { return vec_len[u32](&(*m).e_name) }
+fn pat_e_name(m: *mut Pat, ei: u32) -> u32 { return vec_at[u32](&(*m).e_name, ei as usize) }
+fn pat_e_sidx(m: *mut Pat, ei: u32) -> u32 { return vec_at[u32](&(*m).e_sidx, ei as usize) }
+fn pat_e_voff(m: *mut Pat, ei: u32) -> u32 { return vec_at[u32](&(*m).e_voff, ei as usize) }
+fn pat_e_vlen(m: *mut Pat, ei: u32) -> u32 { return vec_at[u32](&(*m).e_vlen, ei as usize) }
+fn pat_e_size(m: *mut Pat, ei: u32) -> u64 { return vec_at[u64](&(*m).e_size, ei as usize) }
+fn pat_e_align(m: *mut Pat, ei: u32) -> u64 { return vec_at[u64](&(*m).e_align, ei as usize) }
+
+fn pat_enum_at_struct(m: *mut Pat, sidx: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*m).e_sidx) {
+        if vec_at[u32](&(*m).e_sidx, i) == sidx {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn pat_v_name(m: *mut Pat, vi: u32) -> u32 { return vec_at[u32](&(*m).v_name, vi as usize) }
+fn pat_v_tag(m: *mut Pat, vi: u32) -> u32 { return vec_at[u32](&(*m).v_tag, vi as usize) }
+fn pat_v_tlen(m: *mut Pat, vi: u32) -> u32 { return vec_at[u32](&(*m).v_tlen, vi as usize) }
+fn pat_v_roff(m: *mut Pat, vi: u32) -> u32 { return vec_at[u32](&(*m).v_roff, vi as usize) }
+fn pat_rf_ty(m: *mut Pat, ri: u32) -> u32 { return vec_at[u32](&(*m).rf_ty, ri as usize) }
+fn pat_rf_off(m: *mut Pat, ri: u32) -> u64 { return vec_at[u64](&(*m).rf_off, ri as usize) }
+
+fn pat_match_count(m: *mut Pat) -> usize { return vec_len[u32](&(*m).m_subj) }
+fn pat_m_subj(m: *mut Pat, mi: u32) -> u32 { return vec_at[u32](&(*m).m_subj, mi as usize) }
+fn pat_m_aoff(m: *mut Pat, mi: u32) -> u32 { return vec_at[u32](&(*m).m_aoff, mi as usize) }
+fn pat_m_alen(m: *mut Pat, mi: u32) -> u32 { return vec_at[u32](&(*m).m_alen, mi as usize) }
+fn pat_a_pat(m: *mut Pat, ai: u32) -> u32 { return vec_at[u32](&(*m).a_pat, ai as usize) }
+fn pat_a_block(m: *mut Pat, ai: u32) -> u32 { return vec_at[u32](&(*m).a_block, ai as usize) }
+
+fn pat_mu_kind(m: *mut Pat, i: u32) -> u32 { return vec_at[u32](&(*m).mu_kind, i as usize) }
+fn pat_mu_a(m: *mut Pat, i: u32) -> u32 { return vec_at[u32](&(*m).mu_a, i as usize) }
+fn pat_mu_b(m: *mut Pat, i: u32) -> u32 { return vec_at[u32](&(*m).mu_b, i as usize) }
+fn pat_mu_lo(m: *mut Pat, i: u32) -> i64 { return vec_at[i64](&(*m).mu_lo, i as usize) }
+fn pat_mu_hi(m: *mut Pat, i: u32) -> i64 { return vec_at[i64](&(*m).mu_hi, i as usize) }
+fn pat_mu_soff(m: *mut Pat, i: u32) -> u32 { return vec_at[u32](&(*m).mu_soff, i as usize) }
+fn pat_mu_slen(m: *mut Pat, i: u32) -> u32 { return vec_at[u32](&(*m).mu_slen, i as usize) }
+fn pat_mu_child(m: *mut Pat, i: u32) -> u32 { return vec_at[u32](&(*m).mu_children, i as usize) }
+
+// Does the pattern always match?
+fn pat_irrefutable(m: *mut Pat, i: u32) -> bool {
+    let a: u32 = pat_mu_kind(m, i)
+    return a == MU_WILD || a == MU_BIND
+}
+
+// ------------------------------------------------------- call identifiers
+
+// Does the name start with `__match#`? A `#` can never occur in a
+// source text identifier (sema_match.rs, MATCH_PREFIX).
+fn pat_is_matchname(it: *mut intern.Interner, name: u32) -> bool {
+    var pfx: [u8; 8] = "__match#"
+    let p: u64 = intern.intern_ptr(it, name)
+    let n: usize = intern.intern_length(it, name)
+    if n < 8 {
+        return false
+    }
+    return rt.mem_eq(p, (&pfx[0]) as u64, 8)
+}
+
+// The number after `__match#`.
+fn pat_match_number(it: *mut intern.Interner, name: u32) -> u32 {
+    let p: u64 = intern.intern_ptr(it, name)
+    let n: usize = intern.intern_length(it, name)
+    var v: u32 = 0
+    var i: usize = 8
+    while i < n {
+        v = v * 10 + (rt.ld8(p, i) - 48 as u8) as u32
+        i = i + 1
+    }
+    return v
+}
+
+// Does the name contain `::`? Then it is an enum constructor
+// (`Enum::Variant`). Ordinary function names contain no
+// double colon -- the lexer never reads one as part of an identifier.
+fn pat_is_ctorname(it: *mut intern.Interner, name: u32) -> bool {
+    let p: u64 = intern.intern_ptr(it, name)
+    let n: usize = intern.intern_length(it, name)
+    var i: usize = 0
+    while i + 1 < n {
+        if rt.ld8(p, i) == 58 as u8 {
+            if rt.ld8(p, i + 1) == 58 as u8 {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Splits `Enum::Variant` at the FIRST double colon. `en`/`vn` are
+// numbers in the interner; the buffer `k` must not move afterwards.
+fn ctor_split(m: *mut Pat, it: *mut intern.Interner, name: u32,
+    en: *mut u32, vn: *mut u32) {
+    let p: u64 = intern.intern_ptr(it, name)
+    let n: usize = intern.intern_length(it, name)
+    var i: usize = 0
+    while i + 1 < n {
+        if rt.ld8(p, i) == 58 as u8 && rt.ld8(p, i + 1) == 58 as u8 {
+            *en = intern.intern_number(it, p, i) as u32
+            *vn = intern.intern_number(it, p + (i + 2) as u64, n - i - 2) as u32
+            return
+        }
+        i = i + 1
+    }
+    *en = NONE
+    *vn = NONE
+}
+
+// ----------------------------------------- registering in the type context
+
+// Registers the NAMES of all enums, so that structs and function
+// signatures can use them. Has to run BEFORE `types.types_resolve`
+// -- the enums then come before the tree structs in the type
+// context, exactly as in stage 0 (`declare_enums` before `collect_structs`).
+fn pat_register(m: *mut Pat, t: *mut types.Types) {
+    var i: usize = 0
+    while i < pat_enum_count(m) {
+        let name: u32 = pat_e_name(m, i as u32)
+        if types.struct_index(t, name) >= 0 {
+            (*m).err = (*m).err + 1
+        }
+        let idx: u32 = types.types_struct_reserve(t, name)
+        vec_set[u32](&(*m).e_sidx, i, idx)
+        i = i + 1
+    }
+}
+
+// The name of a type, as far as it is held BY VALUE (pointers are not).
+fn value_name(b: *mut ast.Tree, te: u32) -> u32 {
+    let a: u32 = ast.t_kind(b, te)
+    if a == ast.T_NAME {
+        return ast.t_a(b, te)
+    }
+    if a == ast.T_ARR {
+        return value_name(b, ast.t_a(b, te))
+    }
+    return NONE
+}
+
+// Does the resolved type contain an enum BY VALUE?
+fn contains_enum(m: *mut Pat, t: *mut types.Types, ty: u32) -> bool {
+    let k: u32 = types.ty_kind(t, ty)
+    if k == types.K_STRUCT {
+        return pat_enum_at_struct(m, types.ty_a(t, ty)) != NONE
+    }
+    if k == types.K_ARR {
+        return contains_enum(m, t, types.ty_a(t, ty))
+    }
+    return false
+}
+
+fn toposort(mu: *mut Pat, i: u32, d_off: *mut Vec[u32], d_len: *mut Vec[u32],
+    d_target: *mut Vec[u32], state: *mut Vec[u32], order: *mut Vec[u32],
+    bad: *mut Vec[u32]) {
+    let st: u32 = vec_at[u32](state, i as usize)
+    if st == 2 {
+        return
+    }
+    if st == 1 {
+        // cycle: this enum contains itself.
+        var k: usize = 0
+        var da: bool = false
+        while k < vec_len[u32](bad) {
+            if vec_at[u32](bad, k) == i {
+                da = true
+            }
+            k = k + 1
+        }
+        if !da {
+            vec_push[u32](bad, i)
+        }
+        return
+    }
+    vec_set[u32](state, i as usize, 1)
+    let off: u32 = vec_at[u32](d_off, i as usize)
+    let len: u32 = vec_at[u32](d_len, i as usize)
+    var k: u32 = 0
+    while k < len {
+        let j: u32 = vec_at[u32](d_target, (off + k) as usize)
+        toposort(mu, j, d_off, d_len, d_target, state, order, bad)
+        // Anything that depends on a cycle is broken itself.
+        var x: usize = 0
+        var jbad: bool = false
+        while x < vec_len[u32](bad) {
+            if vec_at[u32](bad, x) == j {
+                jbad = true
+            }
+            x = x + 1
+        }
+        if jbad {
+            var ibad: bool = false
+            x = 0
+            while x < vec_len[u32](bad) {
+                if vec_at[u32](bad, x) == i {
+                    ibad = true
+                }
+                x = x + 1
+            }
+            if !ibad {
+                vec_push[u32](bad, i)
+            }
+        }
+        k = k + 1
+    }
+    vec_set[u32](state, i as usize, 2)
+    vec_push[u32](order, i)
+}
+
+fn in_bad(bad: *mut Vec[u32], i: u32) -> bool {
+    var k: usize = 0
+    while k < vec_len[u32](bad) {
+        if vec_at[u32](bad, k) == i {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// The internal names `__v<vi>_<fi>` and `__tag` for the struct fields.
+fn field_name(m: *mut Pat, it: *mut intern.Interner, vi: u32, fi: u32) -> u32 {
+    rt.buf_clear(&(*m).scratch)
+    var v: [u8; 3] = "__v"
+    rt.buf_push_bytes(&(*m).scratch, (&v[0]) as u64, 3)
+    rt.buf_push_dec_u64(&(*m).scratch, vi as u64)
+    rt.buf_push(&(*m).scratch, 95 as u8)
+    rt.buf_push_dec_u64(&(*m).scratch, fi as u64)
+    return intern.intern_number(it, rt.buf_ptr(&(*m).scratch),
+        rt.buf_len(&(*m).scratch)) as u32
+}
+
+fn tag_name(m: *mut Pat, it: *mut intern.Interner) -> u32 {
+    var v: [u8; 5] = "__tag"
+    return intern.intern_number(it, (&v[0]) as u64, 5) as u32
+}
+
+// Computes the layout of every enum and records it as a struct layout in
+// the type context. Has to run AFTER `types.types_resolve` (the structs
+// of the tree are known by then; an enum may hold a struct by value,
+// but not the other way round). Returns the number of new errors.
+fn pat_layout(m: *mut Pat, t: *mut types.Types, b: *mut ast.Tree,
+    it: *mut intern.Interner) -> u32 {
+    let before: usize = (*m).err
+    let n: usize = pat_enum_count(m)
+    if n == 0 {
+        return 0
+    }
+    // 1. A struct field of enum type BY VALUE is an error
+    //    (the struct layouts are already fixed at that point).
+    var si: usize = 0
+    while si < ast.structure_count(b) {
+        var k: u32 = 0
+        while k < ast.structure_flen(b, si) {
+            let fi: u32 = ast.structure_foff(b, si) + k
+            let ty: u32 = types.resolve(t, b, it, ast.field_ty(b, fi))
+            if contains_enum(m, t, ty) {
+                (*m).err = (*m).err + 1
+            }
+            k = k + 1
+        }
+        si = si + 1
+    }
+    // 2. Dependencies between enums (an enum may contain another
+    //    one by value). Cycles are an error.
+    var d_off: Vec[u32] = vec_new[u32]()
+    var d_len: Vec[u32] = vec_new[u32]()
+    var d_target: Vec[u32] = vec_new[u32]()
+    var i: usize = 0
+    while i < n {
+        vec_push[u32](&d_off, vec_len[u32](&d_target) as u32)
+        vec_push[u32](&d_len, 0)
+        let ei: u32 = i as u32
+        let voff: u32 = pat_e_voff(m, ei)
+        let vlen: u32 = pat_e_vlen(m, ei)
+        var v: u32 = 0
+        while v < vlen {
+            let toff: u32 = vec_at[u32](&(*m).v_toff, (voff + v) as usize)
+            let tlen: u32 = vec_at[u32](&(*m).v_tlen, (voff + v) as usize)
+            var f: u32 = 0
+            while f < tlen {
+                let wn: u32 = value_name(b, vec_at[u32](&(*m).vt_ty, (toff + f) as usize))
+                if wn != NONE {
+                    let dep: u32 = pat_enum_find(m, wn)
+                    if dep != NONE {
+                        vec_push[u32](&d_target, dep)
+                        vec_set[u32](&d_len, i, vec_at[u32](&d_len, i) + 1)
+                    }
+                }
+                f = f + 1
+            }
+            v = v + 1
+        }
+        i = i + 1
+    }
+    var state: Vec[u32] = vec_new[u32]()
+    var order: Vec[u32] = vec_new[u32]()
+    var bad: Vec[u32] = vec_new[u32]()
+    i = 0
+    while i < n {
+        vec_push[u32](&state, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        toposort(m, i as u32, &d_off, &d_len, &d_target, &state, &order, &bad)
+        i = i + 1
+    }
+    vec_free[u32](&d_off)
+    vec_free[u32](&d_len)
+    vec_free[u32](&d_target)
+    vec_free[u32](&state)
+    i = 0
+    while i < vec_len[u32](&bad) {
+        // the enum contains itself (directly or indirectly).
+        (*m).err = (*m).err + 1
+        i = i + 1
+    }
+
+    // 3. Layout in dependency order.
+    let t_u32: u32 = types.new_ty(t, types.K_U32, 0, 0)
+    var fnames: Vec[u32] = vec_new[u32]()
+    var ftypes: Vec[u32] = vec_new[u32]()
+    var fvers: Vec[u64] = vec_new[u64]()
+    var oi: usize = 0
+    while oi < vec_len[u32](&order) {
+        let ei: u32 = vec_at[u32](&order, oi)
+        oi = oi + 1
+        if in_bad(&bad, ei) {
+            continue
+        }
+        let sidx: u32 = pat_e_sidx(m, ei)
+        if sidx == NONE {
+            continue
+        }
+        // 3a. Resolve the payload types, find the largest alignment.
+        var payload_align: u64 = 1
+        let voff: u32 = pat_e_voff(m, ei)
+        let vlen: u32 = pat_e_vlen(m, ei)
+        var v: u32 = 0
+        while v < vlen {
+            let vi: u32 = voff + v
+            let toff: u32 = vec_at[u32](&(*m).v_toff, vi as usize)
+            let tlen: u32 = vec_at[u32](&(*m).v_tlen, vi as usize)
+            // resolved fields of this variant: from here without gaps
+            vec_set[u32](&(*m).v_roff, vi as usize,
+                vec_len[u32](&(*m).rf_ty) as u32)
+            var f: u32 = 0
+            while f < tlen {
+                let ty: u32 = types.resolve(t, b, it,
+                    vec_at[u32](&(*m).vt_ty, (toff + f) as usize))
+                if types.ty_kind(t, ty) == types.K_VOID {
+                    (*m).err = (*m).err + 1
+                }
+                var a: u64 = types.alignment_of(t, ty)
+                if a < 1 { a = 1 }
+                if a > payload_align {
+                    payload_align = a
+                }
+                vec_push[u32](&(*m).rf_ty, ty)
+                vec_push[u64](&(*m).rf_off, 0)
+                f = f + 1
+            }
+            v = v + 1
+        }
+        let payload_off: u64 = types.round_up(4, payload_align)
+        // 3b. Offsets per variant -- the ranges of different variants
+        //     overlap (a true union).
+        vec_clear[u32](&fnames)
+        vec_clear[u32](&ftypes)
+        vec_clear[u64](&fvers)
+        vec_push[u32](&fnames, tag_name(m, it))
+        vec_push[u32](&ftypes, t_u32)
+        vec_push[u64](&fvers, 0)
+        var max_end: u64 = payload_off
+        v = 0
+        while v < vlen {
+            let vi: u32 = voff + v
+            let tlen: u32 = vec_at[u32](&(*m).v_tlen, vi as usize)
+            let roff: u32 = vec_at[u32](&(*m).v_roff, vi as usize)
+            var off: u64 = payload_off
+            var f: u32 = 0
+            while f < tlen {
+                let ty: u32 = vec_at[u32](&(*m).rf_ty, (roff + f) as usize)
+                var a: u64 = types.alignment_of(t, ty)
+                if a < 1 { a = 1 }
+                let gr: u64 = types.size_of(t, ty)
+                off = types.round_up(off, a)
+                vec_set[u64](&(*m).rf_off, (roff + f) as usize, off)
+                vec_push[u32](&fnames, field_name(m, it, v, f))
+                vec_push[u32](&ftypes, ty)
+                vec_push[u64](&fvers, off)
+                off = off + gr
+                f = f + 1
+            }
+            if off > max_end {
+                max_end = off
+            }
+            v = v + 1
+        }
+        var align: u64 = payload_align
+        if align < 4 { align = 4 }
+        var size: u64 = types.round_up(max_end, align)
+        if size < align { size = align }
+        vec_set[u64](&(*m).e_size, ei as usize, size)
+        vec_set[u64](&(*m).e_align, ei as usize, align)
+        types.types_struct_define(t, sidx, size, align,
+            &fnames, &ftypes, &fvers)
+    }
+    vec_free[u32](&fnames)
+    vec_free[u32](&ftypes)
+    vec_free[u64](&fvers)
+    vec_free[u32](&order)
+    vec_free[u32](&bad)
+    return ((*m).err - before) as u32
+}

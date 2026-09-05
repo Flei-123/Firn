@@ -1,0 +1,1048 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/types.fi -- MEMORY LAYOUT AND CALLING CONVENTION, IN FIRN.
+//
+// Fifth part of stage 1: the port of `compiler/src/types.rs` and
+// `compiler/src/abi.rs`. `docs/SELF_HOSTING.md` section 3 names both as
+// the files that could be written entirely in Firn today -- they
+// compute only on type and size, without heap and without text.
+//
+// WHY THAT IS THE RIGHT NEXT STEP: layout and calling convention
+// are the places where a compiler goes wrong QUIETLY. One field offset
+// off, an aggregate passed in registers instead of memory -- the program
+// still runs, just wrongly. Putting two independent implementations against
+// each other is worth more here than any made up test case.
+//
+// RULES (SPEC 11, 13):
+//   * struct layout: order of declaration, natural alignment, NO
+//     reordering. The size is rounded up to the alignment of the struct.
+//   * System V AMD64: scalars -> one integer word. Aggregates up to 16 bytes
+//     -> one or two words. Anything larger -> memory.
+//   * Return through the hidden pointer as soon as an aggregate is larger
+//     than 8 bytes (SPEC 14.1 -- a deliberate deviation from System V, which
+//     returns 9..16 bytes in `rax:rdx`).
+
+import rt
+import vec
+import intern
+import ast
+import err
+import gc
+
+export { Types, types_new, types_free, types_resolve,
+    K_I8, K_I16, K_I32, K_I64, K_U8, K_U16, K_U32, K_U64,
+    K_USIZE, K_ISIZE, K_BOOL, K_F64, K_F32, K_PTR, K_ARR, K_STRUCT, K_VOID, K_ERROR,
+    K_FN, fn_ty_new, fn_ty_len, fn_ty_param,
+    ty_kind, ty_a, ty_n, size_of, alignment_of, round_up,
+    class_of, needs_sret, is_aggregate, word_class, W_INT, W_SSE,
+    st_count, st_name, st_size, st_alignment, st_foff, st_flen,
+    sf_name, sf_ty, sf_offset, ty_the_root, ret_ty_the_func,
+    param_ty_resolved, CLASS_MEM,
+    new_ty, resolve, ty_equal, compatible, is_int, is_ptr,
+    is_sign, bits_of, name_of, struct_index, base_ty,
+    base_ty_name, st_field_ty,
+    STR_INDEX, str_is_view, str_same_view, str_like, str_is_builtin,
+    types_struct_reserve, types_struct_define,
+    types_struct_append, types_error_set, types_gc_set }
+
+const K_I8: u32 = 0
+const K_I16: u32 = 1
+const K_I32: u32 = 2
+const K_I64: u32 = 3
+const K_U8: u32 = 4
+const K_U16: u32 = 5
+const K_U32: u32 = 6
+const K_U64: u32 = 7
+const K_USIZE: u32 = 8
+const K_ISIZE: u32 = 9
+const K_BOOL: u32 = 10
+const K_F64: u32 = 11
+// ROUND 71 (types.rs): IEEE-754 binary32, four bytes. It stands DIRECTLY
+// behind `f64` because the name table `base_ty` maps position onto kind
+// number -- the new name has to be appended, not inserted.
+const K_F32: u32 = 12
+const K_PTR: u32 = 13
+const K_ARR: u32 = 14
+const K_STRUCT: u32 = 15
+const K_VOID: u32 = 16
+const K_ERROR: u32 = 17
+// ROUND 58 (fnval.rs): a function as a VALUE. One machine word wide -- the
+// address of a FUNCTION RECORD whose word 0 holds the code address.
+//   a = result type   n = index into `ft_off`/`ft_len` (the parameter list)
+const K_FN: u32 = 18
+
+// The largest aggregate that is still passed in registers.
+const MAX_REGISTER_AGGREGATE: u64 = 16
+// Return of `class_of` for the memory class.
+const CLASS_MEM: u32 = 255
+
+struct Types {
+    // resolved types
+    kind: Vec[u32],
+    a: Vec[u32], // ptr/array: inner type | struct: number, struct array
+    n: Vec[u64], // ptr: mut(0/1) | array: length
+    // structs
+    s_name: Vec[u32],
+    s_size: Vec[u64],
+    s_align: Vec[u64],
+    s_foff: Vec[u32],
+    s_flen: Vec[u32],
+    // fields of all structs one after another
+    f_name: Vec[u32],
+    f_ty: Vec[u32],
+    f_offset: Vec[u64],
+    // Number of struct entries that do NOT come from the tree (round 32:
+    // enums, reserved by `pattern.fi`). They come BEFORE the tree
+    // structs -- exactly as in stage 0 (`declare_enums` before
+    // `collect_structs`).
+    eoff: u32,
+    // Registry of the gc classes (round 34, `gc.fi`), 0 = none.
+    // With it `resolve` resolves the placeholders `__gc#p:`/`__gc#w:`
+    // and `compatible` allows the implicit upcast
+    // (the same import cycle as for `err.fi`).
+    gc: u64,
+    // Registry of the error unions (round 33, `err.fi`), 0 = none.
+    // With it `resolve` resolves the placeholders `__eu#<n>` and reports
+    // the struct phase. A function pointer instead of an import in the
+    // other direction would be cleaner, but Firn has none, so this
+    // file calls `err.fi` directly -- the import cycle is allowed (measured:
+    // modules.rs resolves it like any other).
+    feh: u64,
+    // ROUND 58: the parameter lists of the FUNCTION TYPES. `n` of a K_FN
+    // entry indexes ft_off/ft_len, and those describe a range in ft_par.
+    ft_off: Vec[u32],
+    ft_len: Vec[u32],
+    ft_par: Vec[u32],
+    // per function: resolved parameter types and return type
+    fn_poff: Vec[u32],
+    fn_plen: Vec[u32],
+    fn_ptyp: Vec[u32],
+    fn_ret: Vec[u32],
+}
+
+fn types_new() -> Types {
+    return Types {
+        kind: vec_new[u32](), a: vec_new[u32](), n: vec_new[u64](),
+        s_name: vec_new[u32](), s_size: vec_new[u64](), s_align: vec_new[u64](),
+        s_foff: vec_new[u32](), s_flen: vec_new[u32](),
+        f_name: vec_new[u32](), f_ty: vec_new[u32](), f_offset: vec_new[u64](),
+        eoff: 0, gc: 0, feh: 0,
+        ft_off: vec_new[u32](), ft_len: vec_new[u32](), ft_par: vec_new[u32](),
+        fn_poff: vec_new[u32](), fn_plen: vec_new[u32](), fn_ptyp: vec_new[u32](),
+        fn_ret: vec_new[u32](),
+    }
+}
+
+fn types_free(t: *mut Types) {
+    vec_free[u32](&(*t).kind)
+    vec_free[u32](&(*t).a)
+    vec_free[u64](&(*t).n)
+    vec_free[u32](&(*t).s_name)
+    vec_free[u64](&(*t).s_size)
+    vec_free[u64](&(*t).s_align)
+    vec_free[u32](&(*t).s_foff)
+    vec_free[u32](&(*t).s_flen)
+    vec_free[u32](&(*t).f_name)
+    vec_free[u32](&(*t).f_ty)
+    vec_free[u64](&(*t).f_offset)
+    vec_free[u32](&(*t).ft_off)
+    vec_free[u32](&(*t).ft_len)
+    vec_free[u32](&(*t).ft_par)
+    vec_free[u32](&(*t).fn_poff)
+    vec_free[u32](&(*t).fn_plen)
+    vec_free[u32](&(*t).fn_ptyp)
+    vec_free[u32](&(*t).fn_ret)
+}
+
+fn ty_kind(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).kind, i as usize) }
+fn ty_a(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).a, i as usize) }
+fn ty_n(t: *mut Types, i: u32) -> u64 { return vec_at[u64](&(*t).n, i as usize) }
+
+// ROUND 58: create a function type. `par` holds the resolved parameter
+// types; `ret` is the result type.
+fn fn_ty_new(t: *mut Types, par: *mut Vec[u32], ret: u32) -> u32 {
+    let li: u32 = vec_len[u32](&(*t).ft_off) as u32
+    vec_push[u32](&(*t).ft_off, vec_len[u32](&(*t).ft_par) as u32)
+    vec_push[u32](&(*t).ft_len, vec_len[u32](par) as u32)
+    var k: usize = 0
+    while k < vec_len[u32](par) {
+        vec_push[u32](&(*t).ft_par, vec_at[u32](par, k))
+        k = k + 1
+    }
+    return new_ty(t, K_FN, ret, li as u64)
+}
+
+// Number of parameters of a function type.
+fn fn_ty_len(t: *mut Types, i: u32) -> u32 {
+    return vec_at[u32](&(*t).ft_len, ty_n(t, i) as usize)
+}
+
+// The k-th parameter type of a function type.
+fn fn_ty_param(t: *mut Types, i: u32, k: u32) -> u32 {
+    let off: u32 = vec_at[u32](&(*t).ft_off, ty_n(t, i) as usize)
+    return vec_at[u32](&(*t).ft_par, (off + k) as usize)
+}
+
+fn st_count(t: *mut Types) -> usize { return vec_len[u32](&(*t).s_name) }
+fn st_name(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).s_name, i) }
+fn st_size(t: *mut Types, i: usize) -> u64 { return vec_at[u64](&(*t).s_size, i) }
+fn st_alignment(t: *mut Types, i: usize) -> u64 { return vec_at[u64](&(*t).s_align, i) }
+fn st_foff(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).s_foff, i) }
+fn st_flen(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).s_flen, i) }
+fn sf_name(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).f_name, i as usize) }
+fn sf_ty(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).f_ty, i as usize) }
+fn sf_offset(t: *mut Types, i: u32) -> u64 { return vec_at[u64](&(*t).f_offset, i as usize) }
+
+fn ret_ty_the_func(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).fn_ret, i) }
+fn param_ty_resolved(t: *mut Types, fi: usize, k: u32) -> u32 {
+    return vec_at[u32](&(*t).fn_ptyp, vec_at[u32](&(*t).fn_poff, fi) as usize + k as usize)
+}
+
+fn new_ty(t: *mut Types, kind: u32, a: u32, n: u64) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).kind) as u32
+    vec_push[u32](&(*t).kind, kind)
+    vec_push[u32](&(*t).a, a)
+    vec_push[u64](&(*t).n, n)
+    return i
+}
+
+// ------------------------------------------------------------ size/alignment
+
+fn round_up(value: u64, on: u64) -> u64 {
+    if on == 0 {
+        return value
+    }
+    let rest: u64 = value % on
+    if rest == 0 {
+        return value
+    }
+    return value + on - rest
+}
+
+fn size_of(t: *mut Types, i: u32) -> u64 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_I8 || k == K_U8 || k == K_BOOL { return 1 }
+    if k == K_I16 || k == K_U16 { return 2 }
+    if k == K_I32 || k == K_U32 || k == K_F32 { return 4 }
+    if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 8 }
+    if k == K_F64 { return 8 }
+    if k == K_PTR { return 8 }
+    // ROUND 58: a function value is the pointer to its function record.
+    if k == K_FN { return 8 }
+    if k == K_ARR { return size_of(t, ty_a(t, i)) * ty_n(t, i) }
+    if k == K_STRUCT { return st_size(t, ty_a(t, i) as usize) }
+    return 0
+}
+
+fn alignment_of(t: *mut Types, i: u32) -> u64 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_ARR { return alignment_of(t, ty_a(t, i)) }
+    if k == K_STRUCT { return st_alignment(t, ty_a(t, i) as usize) }
+    if k == K_VOID || k == K_ERROR { return 1 }
+    let g: u64 = size_of(t, i)
+    if g < 1 { return 1 }
+    return g
+}
+
+// ----------------------------------------------------- calling convention
+
+fn is_aggregate(t: *mut Types, i: u32) -> bool {
+    let k: u32 = ty_kind(t, i)
+    return k == K_ARR || k == K_STRUCT
+}
+
+// ROUND 71 (abi.rs::Word) -- the register class of ONE eightbyte.
+// 0 = INTEGER (rdi, rsi, ...), 1 = SSE (xmm0-xmm7).
+const W_INT: u32 = 0
+const W_SSE: u32 = 1
+
+// Merge rule of System V (3.2.3): as soon as ONE integer field lies in an
+// eightbyte, the whole eightbyte counts as INTEGER. SSE only survives where
+// nothing but floating point sits. 2 stands for "nothing there yet".
+fn class_merge(cur: u32, add: u32) -> u32 {
+    if cur == 2 { return add }
+    if cur == W_SSE && add == W_SSE { return W_SSE }
+    return W_INT
+}
+
+// Walks every SCALAR leaf and enters its class into the eightbyte it lies
+// in. `which` selects the eightbyte (0 or 1); the result is W_INT, W_SSE
+// or 2 for "nothing there".
+fn class_collect(t: *mut Types, i: u32, base: u64, which: u64, cur: u32) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    var out: u32 = cur
+    if k == K_STRUCT {
+        let si: usize = ty_a(t, i) as usize
+        var n: u32 = 0
+        while n < st_flen(t, si) {
+            out = class_collect(t, sf_ty(t, st_foff(t, si) + n),
+                base + sf_offset(t, st_foff(t, si) + n), which, out)
+            n = n + 1
+        }
+        return out
+    }
+    if k == K_ARR {
+        let el: u32 = ty_a(t, i)
+        let step: u64 = size_of(t, el)
+        var n2: u64 = 0
+        while n2 < ty_n(t, i) {
+            let off: u64 = base + n2 * step
+            if off >= MAX_REGISTER_AGGREGATE {
+                return out
+            }
+            out = class_collect(t, el, off, which, out)
+            n2 = n2 + 1
+        }
+        return out
+    }
+    var w: u32 = W_INT
+    if k == K_F32 || k == K_F64 { w = W_SSE }
+    var g: u64 = size_of(t, i)
+    if g < 1 { g = 1 }
+    let first: u64 = base / 8
+    let last: u64 = (base + g - 1) / 8
+    if which >= first && which <= last {
+        out = class_merge(out, w)
+    }
+    return out
+}
+
+// ROUND 71: the class of eightbyte `which` of the type -- W_INT or W_SSE.
+fn word_class(t: *mut Types, i: u32, which: u64) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_F32 || k == K_F64 {
+        return W_SSE
+    }
+    if !is_aggregate(t, i) {
+        return W_INT
+    }
+    let c: u32 = class_collect(t, i, 0, which, 2)
+    if c == 2 { return W_INT }
+    return c
+}
+
+// The number of integer words, or CLASS_MEM for the memory class.
+fn class_of(t: *mut Types, i: u32) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_VOID || k == K_ERROR {
+        return 0
+    }
+    if is_aggregate(t, i) {
+        let g: u64 = size_of(t, i)
+        if g == 0 {
+            return 0
+        }
+        if g > MAX_REGISTER_AGGREGATE {
+            return CLASS_MEM
+        }
+        return ((g + 7) / 8) as u32
+    }
+    return 1
+}
+
+fn needs_sret(t: *mut Types, i: u32) -> bool {
+    return is_aggregate(t, i) && size_of(t, i) > 8
+}
+
+// ------------------------------------------------------------- resolution
+
+// Index of a primitive type, or -1.
+fn base_ty(it: *mut intern.Interner, nr: u32) -> i32 {
+    var tab: [u8; 54] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32"
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    var k: i32 = 0
+    var start: usize = 0
+    while i <= 54 {
+        var end: bool = i == 54
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if i - start == n {
+                if rt.mem_eq((&tab[start]) as u64, p, n) {
+                    return k
+                }
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return alias_ty(it, nr)
+}
+
+// ROUND 70 -- THE SECOND SPELLING of a primitive type (types.rs::alias_of).
+//
+// The table stands in the SAME order as the one above, so that a hit gives
+// the kind number directly: `int` is entry 2 and therefore `i32` -- not a
+// new type, only another name for it. The three empty places belong to
+// `usize`, `isize` and `bool`, which have no second spelling; an empty
+// place can never be hit, because a name is never empty.
+//
+// ROUND 71: `float` is there now and it is entry 12 -- the same position
+// that `f32` has in the table above. So `float` IS `f32`, not a new type.
+//
+// ROUND 88 -- WHY `string` IS NOT IN THIS TABLE. It belongs to the same
+// family (`types.rs::alias_of`), but this table gives back the NUMBER OF A
+// PRIMITIVE KIND, and `str` is no primitive: it is the builtin struct
+// (`sema.fi::str_declare`). An entry here would hand out kind 13, which
+// does not exist. The fold therefore happens one step later, in `resolve`
+// -- see `canon_str` below.
+fn alias_ty(it: *mut intern.Interner, nr: u32) -> i32 {
+    var tab: [u8; 59] = "sbyte|short|int|long|byte|ushort|uint|ulong||||double|float"
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    var k: i32 = 0
+    var start: usize = 0
+    while i <= 59 {
+        var end: bool = i == 59
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if i - start == n && n > 0 {
+                if rt.mem_eq((&tab[start]) as u64, p, n) {
+                    return k
+                }
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ROUND 88 (types.rs::alias_of, sema.rs::resolve_ty) -- THE SECOND
+// SPELLING OF `str`. The alias family of round 70/71 is the one of C#, and
+// there the text type is called `string`; it was the only name missing, so
+// `let x: string = "test"` answered "unknown type".
+//
+// It cannot ride along in `alias_ty` (see the note there): that table maps
+// onto primitive KINDS, `str` is a struct. So the name is exchanged here,
+// directly before the struct lookup in `resolve` -- from that point on
+// there is exactly ONE type, with one layout, one set of methods and one
+// name in every error message.
+fn canon_str(it: *mut intern.Interner, nr: u32) -> u32 {
+    if intern.intern_length(it, nr) != 6 {
+        return nr
+    }
+    var a: [u8; 6] = "string"
+    if !rt.mem_eq((&a[0]) as u64, intern.intern_ptr(it, nr), 6) {
+        return nr
+    }
+    var b: [u8; 3] = "str"
+    return intern.intern_number(it, (&b[0]) as u64, 3) as u32
+}
+
+// The inverse of `base_ty`: the NAME of a type kind as a number in the
+// interner. 4294967295 if `k` is not a primitive type (pointer, array,
+// struct, void, error).
+//
+// ROUND 50: needed since a primitive type can have methods
+// (`impl Ord for i32` creates `i32__less`). For that the receiver type
+// of a method call has to become a name again.
+fn base_ty_name(it: *mut intern.Interner, k: u32) -> u32 {
+    var tab: [u8; 54] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32"
+    var idx: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while idx <= 54 {
+        var end: bool = idx == 54
+        if !end {
+            end = tab[idx] == 124 as u8
+        }
+        if end {
+            if nr == k {
+                return intern.intern_number(it, (&tab[start]) as u64, idx - start) as u32
+            }
+            nr = nr + 1
+            start = idx + 1
+        }
+        idx = idx + 1
+    }
+    return 4294967295
+}
+
+// Finds the struct index for a name; -1 if there is none here.
+fn struct_index(t: *mut Types, name: u32) -> i32 {
+    var i: usize = 0
+    while i < st_count(t) {
+        if st_name(t, i) == name {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Reserves a struct NAME without fields (round 32: enums from
+// `pattern.fi`). The entry stays empty -- size 0, alignment 1 -- until
+// `types_struct_define` fills it. Has to be called BEFORE `types_resolve`;
+// entries reserved this way come BEFORE the structs of the tree.
+fn types_struct_reserve(t: *mut Types, name: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).s_name) as u32
+    vec_push[u32](&(*t).s_name, name)
+    vec_push[u64](&(*t).s_size, 0)
+    vec_push[u64](&(*t).s_align, 1)
+    vec_push[u32](&(*t).s_foff, 0)
+    vec_push[u32](&(*t).s_flen, 0)
+    (*t).eoff = (*t).eoff + 1
+    return i
+}
+
+// Register the store of error unions (round 33). MUST happen before
+// `types_resolve`; with 0 the resolution of `E!T` is skipped (then it
+// stays an unknown type -- `layoutdump` runs that way deliberately,
+// because the yardstick `layout_canon.rs` prints error unions as `?`).
+fn types_error_set(t: *mut Types, f: u64) { (*t).feh = f }
+
+// Register the store of gc classes (round 34). MUST happen before
+// `types_resolve`; 0 leaves the GC type names unresolved (the
+// dump tools run that way deliberately -- their stage 0 counterpart
+// does not know the placeholders).
+fn types_gc_set(t: *mut Types, g: u64) { (*t).gc = g }
+
+// Like `types_struct_reserve`, but WITHOUT counting towards `eoff`: the
+// error unions are created AFTER the structs of the tree (stage 0 creates
+// them in the type context during resolution too -- `get_or_create_union`
+// in errors.rs) and bring their layout with them.
+fn types_struct_append(t: *mut Types, name: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).s_name) as u32
+    vec_push[u32](&(*t).s_name, name)
+    vec_push[u64](&(*t).s_size, 0)
+    vec_push[u64](&(*t).s_align, 1)
+    vec_push[u32](&(*t).s_foff, 0)
+    vec_push[u32](&(*t).s_flen, 0)
+    return i
+}
+
+// Records finished fields, size and alignment for a reserved struct,
+// WITHOUT going through the tree (the enum layout is computed in
+// `pattern.fi`, not here). The field lists are appended without
+// gaps.
+fn types_struct_define(t: *mut Types, idx: u32, size: u64, align: u64,
+    names: *mut Vec[u32], types: *mut Vec[u32],
+    offset: *mut Vec[u64]) {
+    let off: u32 = vec_len[u32](&(*t).f_name) as u32
+    let len: u32 = vec_len[u32](names) as u32
+    var k: u32 = 0
+    while k < len {
+        vec_push[u32](&(*t).f_name, vec_at[u32](names, k as usize))
+        vec_push[u32](&(*t).f_ty, vec_at[u32](types, k as usize))
+        vec_push[u64](&(*t).f_offset, vec_at[u64](offset, k as usize))
+        k = k + 1
+    }
+    vec_set[u32](&(*t).s_foff, idx as usize, off)
+    vec_set[u32](&(*t).s_flen, idx as usize, len)
+    vec_set[u64](&(*t).s_size, idx as usize, size)
+    vec_set[u64](&(*t).s_align, idx as usize, align)
+}
+
+// Resolves a type expression of the tree into a concrete type.
+//
+// A NAME THAT DOES NOT EXIST HERE (say `rt.Buf` from another module)
+// becomes K_ERROR with size 0 and alignment 1 -- exactly as in
+// `compiler/src/layout_canon.rs`. Both implementations do the same, so
+// that the comparison stays exact instead of failing on an artificial
+// uncertainty.
+fn resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -> u32 {
+    if te == ast.NOTHING {
+        return new_ty(t, K_VOID, 0, 0)
+    }
+    let a: u32 = ast.t_kind(b, te)
+    if a == ast.T_PTR {
+        let inner: u32 = resolve(t, b, it, ast.t_a(b, te))
+        return new_ty(t, K_PTR, inner, ast.t_b(b, te))
+    }
+    if a == ast.T_ARR {
+        let elem: u32 = resolve(t, b, it, ast.t_a(b, te))
+        // ROUND 79: `_` as the length only works where there is an
+        // initializer to take it from -- in a `let`/`var`, where the parser
+        // has already filled it in. Anywhere else (a parameter, a field, a
+        // `const`) it has to be caught, or a type of 2^64 elements would go
+        // into the layout.
+        if ast.t_b(b, te) == ast.LEN_INFER {
+            return new_ty(t, K_ERROR, 0, 0)
+        }
+        return new_ty(t, K_ARR, elem, ast.t_b(b, te))
+    }
+    // ROUND 58 (fnval.rs): `fn(T1, T2) -> R`.
+    if a == ast.T_FN {
+        let packed: u64 = ast.t_b(b, te)
+        let off: u32 = (packed >> 32) as u32
+        let cnt: u32 = (packed & 4294967295) as u32
+        var par: Vec[u32] = vec_new[u32]()
+        var k: u32 = 0
+        while k < cnt {
+            vec_push[u32](&par, resolve(t, b, it, ast.child_at(b, off + k)))
+            k = k + 1
+        }
+        var ret: u32 = new_ty(t, K_VOID, 0, 0)
+        if ast.t_a(b, te) != ast.NOTHING {
+            ret = resolve(t, b, it, ast.t_a(b, te))
+        }
+        let r: u32 = fn_ty_new(t, &par, ret)
+        vec_free[u32](&par)
+        return r
+    }
+    let nr: u32 = ast.t_a(b, te)
+    let g: i32 = base_ty(it, nr)
+    if g >= 0 {
+        return new_ty(t, g as u32, 0, 0)
+    }
+    if (*t).feh != 0 {
+        // HOOK error unions: the type `E!T` sits in the tree as the
+        // placeholder `__eu#<n>` (`hook_resolve_ty` in errors.rs).
+        let pi: i64 = err.error_placeholder(it, nr)
+        if pi >= 0 {
+            return err.error_ty((*t).feh, t, b, it, pi as u32)
+        }
+    }
+    if (*t).gc != 0 {
+        // HOOK gc: `Gc[C]`, `GcWeak[C]` and the forbidden use of a
+        // class name as an ordinary type (`hook_resolve_ty` in gc.rs).
+        let gt: u32 = gc.gc_ty_hook((*t).gc, t, it, nr)
+        if gt != 4294967295 {
+            return gt
+        }
+    }
+    // ROUND 88: `string` is the second spelling of `str` -- fold it onto
+    // the canonical name, so that ONE struct comes out of both.
+    let si: i32 = struct_index(t, canon_str(it, nr))
+    if si >= 0 {
+        return new_ty(t, K_STRUCT, si as u32, 0)
+    }
+    return new_ty(t, K_ERROR, 0, 0)
+}
+
+fn ty_the_root(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -> u32 {
+    return resolve(t, b, it, te)
+}
+
+// Layout of ONE struct. If a field contains another struct, THAT one is
+// laid out first -- even if it is declared further down.
+//
+// WHY NOT SIMPLY IN ORDER (up to round 31): `struct A { b: B }` before
+// `struct B` yielded size 0 for `b`, and that QUIETLY. The program ran
+// and computed the wrong answer. It only showed up at monomorphisation:
+// the instantiation `Vec__u32` is created AFTER all handwritten structs,
+// but `lexer.Lexer` uses it as a field.
+//
+// `state`: 0 = open | 1 = in progress | 2 = done. Pointers are NOT
+// descended into (a pointer is eight bytes, whatever it points to) --
+// which is exactly why `struct Node { next: *mut Node }` works.
+fn struct_layout(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner,
+    ai: u32, si: u32, state: *mut Vec[u32]) {
+    if vec_at[u32](state, si as usize) != 0 {
+        return
+    }
+    vec_set[u32](state, si as usize, 1)
+    // 2a. Resolve the field types and demand a size wherever one is needed.
+    //     Only AFTER that may the fields be stored: they have to sit
+    //     WITHOUT GAPS, and an intervening step would push other fields
+    //     in between.
+    var types_the_fields: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < ast.structure_flen(b, ai as usize) {
+        let fi: u32 = ast.structure_foff(b, ai as usize) + k
+        let ty: u32 = resolve(t, b, it, ast.field_ty(b, fi))
+        vec_push[u32](&types_the_fields, ty)
+        size_request(t, b, it, ty, state)
+        k = k + 1
+    }
+    // 2b. Compute the offsets.
+    let off: u32 = vec_len[u32](&(*t).f_name) as u32
+    var offset: u64 = 0
+    var max_a: u64 = 1
+    k = 0
+    while k < ast.structure_flen(b, ai as usize) {
+        let fi: u32 = ast.structure_foff(b, ai as usize) + k
+        let ty: u32 = vec_at[u32](&types_the_fields, k as usize)
+        var au: u64 = alignment_of(t, ty)
+        if au < 1 { au = 1 }
+        let gr: u64 = size_of(t, ty)
+        if au > max_a { max_a = au }
+        offset = round_up(offset, au)
+        vec_push[u32](&(*t).f_name, ast.field_name(b, fi))
+        vec_push[u32](&(*t).f_ty, ty)
+        vec_push[u64](&(*t).f_offset, offset)
+        offset = offset + gr
+        k = k + 1
+    }
+    vec_free[u32](&types_the_fields)
+    vec_set[u32](&(*t).s_foff, si as usize, off)
+    vec_set[u32](&(*t).s_flen, si as usize, ast.structure_flen(b, ai as usize))
+    vec_set[u64](&(*t).s_size, si as usize, round_up(offset, max_a))
+    vec_set[u64](&(*t).s_align, si as usize, max_a)
+    vec_set[u32](state, si as usize, 2)
+}
+
+// Makes sure the size of this type is known.
+fn size_request(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner,
+    ty: u32, state: *mut Vec[u32]) {
+    let a: u32 = ty_kind(t, ty)
+    if a == K_ARR {
+        size_request(t, b, it, ty_a(t, ty), state)
+        return
+    }
+    if a == K_STRUCT {
+        let s: u32 = ty_a(t, ty)
+        // A RESERVED entry (an enum) has no counterpart in the tree --
+        // its layout is filled in by `pattern.fi`. A struct that holds an
+        // enum by value carries on with size 0 here; the error is
+        // reported there, not silently used.
+        if s < (*t).eoff {
+            return
+        }
+        if s >= vec_len[u32](state) as u32 {
+            // An ERROR UNION (round 33): it is created fully laid out,
+            // AFTER the state vector here already exists.
+            return
+        }
+        struct_layout(t, b, it, s - (*t).eoff, s, state)
+    }
+}
+
+// Creates layout and calling convention for the whole program.
+fn types_resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner) {
+    // 1. Register the structs -- only after that can a field point to one
+    //    of them. The order matters: a struct may contain one that was
+    //    declared EARLIER, and its layout has to be known by then.
+    var i: usize = 0
+    while i < ast.structure_count(b) {
+        vec_push[u32](&(*t).s_name, ast.structure_name(b, i))
+        vec_push[u64](&(*t).s_size, 0)
+        vec_push[u64](&(*t).s_align, 1)
+        vec_push[u32](&(*t).s_foff, 0)
+        vec_push[u32](&(*t).s_flen, 0)
+        i = i + 1
+    }
+    // 2. Resolve the fields and compute the offsets -- INDEPENDENT of the
+    //    order of declaration (see `struct_layout`). The state vector
+    //    covers ALL entries; reserved ones (enums) count as done,
+    //    because their layout comes from `pattern.fi`.
+    if (*t).feh != 0 {
+        // HOOK error unions: announce the layout phase -- during it a
+        // union over a struct cannot be laid out
+        // (`hook_struct_phase`, errors.rs, reported in collect_structs).
+        err.error_structphase((*t).feh, true)
+    }
+    var state: Vec[u32] = vec_new[u32]()
+    i = 0
+    while i < st_count(t) {
+        var z: u32 = 0
+        if (i as u32) < (*t).eoff {
+            z = 2
+        }
+        vec_push[u32](&state, z)
+        i = i + 1
+    }
+    i = 0
+    while i < ast.structure_count(b) {
+        struct_layout(t, b, it, i as u32, i as u32 + (*t).eoff, &state)
+        i = i + 1
+    }
+    vec_free[u32](&state)
+    if (*t).feh != 0 {
+        // HOOK error unions: layout phase over -- from here on the
+        // success type of a union may be a struct (signatures, bodies).
+        err.error_structphase((*t).feh, false)
+    }
+    // 3. Function signatures.
+    i = 0
+    while i < ast.fn_count(b) {
+        let poff: u32 = vec_len[u32](&(*t).fn_ptyp) as u32
+        var k: u32 = 0
+        while k < ast.fn_plen(b, i) {
+            let ty: u32 = resolve(t, b, it, ast.param_ty(b, ast.fn_poff(b, i) + k))
+            vec_push[u32](&(*t).fn_ptyp, ty)
+            k = k + 1
+        }
+        vec_push[u32](&(*t).fn_poff, poff)
+        vec_push[u32](&(*t).fn_plen, ast.fn_plen(b, i))
+        vec_push[u32](&(*t).fn_ret, resolve(t, b, it, ast.fn_ret(b, i)))
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------- questions about a type
+//
+// From here on comes what `sema` needs: comparability, integerness,
+// signedness, width and the readable name. In `compiler/src/types.rs`
+// these are the methods of `Type` and `TypeCtx::name_of`.
+
+fn is_int(t: *mut Types, i: u32) -> bool {
+    let k: u32 = ty_kind(t, i)
+    return k <= K_ISIZE
+}
+
+fn is_ptr(t: *mut Types, i: u32) -> bool {
+    return ty_kind(t, i) == K_PTR
+}
+
+fn is_sign(t: *mut Types, i: u32) -> bool {
+    let k: u32 = ty_kind(t, i)
+    return k == K_I8 || k == K_I16 || k == K_I32 || k == K_I64 || k == K_ISIZE
+}
+
+fn bits_of(t: *mut Types, i: u32) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_I8 || k == K_U8 || k == K_BOOL { return 8 }
+    if k == K_I16 || k == K_U16 { return 16 }
+    if k == K_I32 || k == K_U32 { return 32 }
+    if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 64 }
+    if k == K_PTR { return 64 }
+    if k == K_FN { return 64 }
+    return 0
+}
+
+// Structural equality of two types. Two entries of the table can
+// mean the same type -- so the CONTENT is compared, not the index.
+fn ty_equal(t: *mut Types, a: u32, b: u32) -> bool {
+    if a == b {
+        return true
+    }
+    let ka: u32 = ty_kind(t, a)
+    if ka != ty_kind(t, b) {
+        return false
+    }
+    if ka == K_PTR {
+        // The `mut` marker does NOT count -- stage 0 has no
+        // mutability checker for pointer targets (sema.rs, `compatible`).
+        return ty_equal(t, ty_a(t, a), ty_a(t, b))
+    }
+    if ka == K_ARR {
+        if ty_n(t, a) != ty_n(t, b) {
+            return false
+        }
+        return ty_equal(t, ty_a(t, a), ty_a(t, b))
+    }
+    if ka == K_STRUCT {
+        return ty_a(t, a) == ty_a(t, b)
+    }
+    // ROUND 58: function types are compared EXACTLY -- same number of
+    // parameters, same parameter types, same result. A pointer compares
+    // leniently above; for a call target that would be wrong, because the
+    // callee reads the memory behind it.
+    if ka == K_FN {
+        if fn_ty_len(t, a) != fn_ty_len(t, b) {
+            return false
+        }
+        if !ty_equal(t, ty_a(t, a), ty_a(t, b)) {
+            return false
+        }
+        var k: u32 = 0
+        while k < fn_ty_len(t, a) {
+            if !ty_equal(t, fn_ty_param(t, a, k), fn_ty_param(t, b, k)) {
+                return false
+            }
+            k = k + 1
+        }
+        return true
+    }
+    return true
+}
+
+// Assignment compatibility: NO implicit conversions. The error type is
+// compatible with everything, so that a reported error does not set off
+// an avalanche.
+fn compatible(t: *mut Types, a: u32, b: u32) -> bool {
+    if ty_kind(t, a) == K_ERROR || ty_kind(t, b) == K_ERROR {
+        return true
+    }
+    // HOOK str: the language type `str` and a view of the same shape
+    // (`str.Span`) may be used for each other -- same two words, same ABI,
+    // no copy of the octets (strtype.rs, round 70).
+    if str_same_view(t, a, b) {
+        return true
+    }
+    if (*t).gc != 0 {
+        // HOOK gc: implicit upcast `Gc[Derived]` -> `Gc[Base]`
+        // (gc.rs, SPEC 4.4). ONLY this direction; downcasts go
+        // exclusively through the checked `x.as?[C]`.
+        if gc.gc_is_upward((*t).gc, t, a, b) {
+            return true
+        }
+    }
+    return ty_equal(t, a, b)
+}
+
+// ROUND 70 (strtype.rs) -- the struct index of the builtin `str`.
+// It is declared FIRST in every program (sema.fi::sema_run), so index 0.
+const STR_INDEX: u32 = 0
+
+// Is this struct shaped `{ *mut u8, usize }`? That is exactly `str.Span` --
+// and exactly what a `str` is.
+fn str_is_view(t: *mut Types, si: u32) -> bool {
+    if st_flen(t, si as usize) != 2 {
+        return false
+    }
+    let f0: u32 = st_foff(t, si as usize)
+    let a0: u32 = sf_ty(t, f0)
+    if ty_kind(t, a0) != K_PTR {
+        return false
+    }
+    if ty_kind(t, ty_a(t, a0)) != K_U8 {
+        return false
+    }
+    if sf_offset(t, f0) != 0 {
+        return false
+    }
+    let a1: u32 = sf_ty(t, f0 + 1)
+    if ty_kind(t, a1) != K_USIZE {
+        return false
+    }
+    return sf_offset(t, f0 + 1) == 8
+}
+
+// May these two types be used for each other? True exactly when ONE of them
+// is the builtin `str` and the other is a view of the same shape. Two
+// ordinary structs of that shape stay separate -- only `str` gets this
+// privilege.
+fn str_same_view(t: *mut Types, a: u32, b: u32) -> bool {
+    if ty_kind(t, a) != K_STRUCT || ty_kind(t, b) != K_STRUCT {
+        return false
+    }
+    let x: u32 = ty_a(t, a)
+    let y: u32 = ty_a(t, b)
+    if x == y {
+        return false
+    }
+    if st_count(t) <= STR_INDEX as usize {
+        return false
+    }
+    if x == STR_INDEX {
+        return str_is_view(t, y)
+    }
+    if y == STR_INDEX {
+        return str_is_view(t, x)
+    }
+    return false
+}
+
+// Is this type the builtin `str` OR a view of the same shape? The operators
+// of round 70 work on both -- the library hands out `Span`.
+fn str_like(t: *mut Types, a: u32) -> bool {
+    if ty_kind(t, a) != K_STRUCT {
+        return false
+    }
+    if st_count(t) <= STR_INDEX as usize {
+        return false
+    }
+    if ty_a(t, a) == STR_INDEX {
+        return true
+    }
+    return str_is_view(t, ty_a(t, a))
+}
+
+// ROUND 88 (strtype.rs::is_str) -- is this type EXACTLY the builtin `str`,
+// possibly behind a pointer? Not `str_like`: a `Span` is not meant here.
+// The method resolution needs the difference, because only the builtin
+// `str` borrows the methods of the views (sema.fi::method_target).
+fn str_is_builtin(t: *mut Types, a: u32) -> bool {
+    var i: u32 = a
+    if ty_kind(t, i) == K_PTR {
+        i = ty_a(t, i)
+    }
+    if ty_kind(t, i) != K_STRUCT {
+        return false
+    }
+    if st_count(t) <= STR_INDEX as usize {
+        return false
+    }
+    return ty_a(t, i) == STR_INDEX
+}
+
+fn st_field_ty(t: *mut Types, si: usize, field_name: u32) -> u32 {
+    var k: u32 = 0
+    while k < st_flen(t, si) {
+        let fi: u32 = st_foff(t, si) + k
+        if sf_name(t, fi) == field_name {
+            return sf_ty(t, fi)
+        }
+        k = k + 1
+    }
+    return 4294967295
+}
+
+// Readable name of a type -- exactly the form from `TypeCtx::name_of`:
+// `*mut i32`, `[i32; 3]`, `()` for void, `<error>` for the error type.
+fn name_of(t: *mut Types, it: *mut intern.Interner, b: *mut rt.Buf, i: u32) {
+    let k: u32 = ty_kind(t, i)
+    if k == K_PTR {
+        rt.buf_push(b, 42 as u8)
+        if ty_n(t, i) == 1 {
+            var m: [u8; 4] = "mut "
+            rt.buf_push_bytes(b, (&m[0]) as u64, 4)
+        }
+        name_of(t, it, b, ty_a(t, i))
+        return
+    }
+    if k == K_ARR {
+        rt.buf_push(b, 91 as u8)
+        name_of(t, it, b, ty_a(t, i))
+        var s: [u8; 2] = "; "
+        rt.buf_push_bytes(b, (&s[0]) as u64, 2)
+        rt.buf_push_dec_u64(b, ty_n(t, i))
+        rt.buf_push(b, 93 as u8)
+        return
+    }
+    if k == K_STRUCT {
+        let nr: u32 = st_name(t, ty_a(t, i) as usize)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+        return
+    }
+    if k == K_FN {
+        // `fn(i32, i32) -> i32`, and `fn(i32)` without a result.
+        var fw: [u8; 3] = "fn("
+        rt.buf_push_bytes(b, (&fw[0]) as u64, 3)
+        var k2: u32 = 0
+        while k2 < fn_ty_len(t, i) {
+            if k2 > 0 {
+                var cm: [u8; 2] = ", "
+                rt.buf_push_bytes(b, (&cm[0]) as u64, 2)
+            }
+            name_of(t, it, b, fn_ty_param(t, i, k2))
+            k2 = k2 + 1
+        }
+        rt.buf_push(b, 41 as u8)
+        if ty_kind(t, ty_a(t, i)) != K_VOID {
+            var ar: [u8; 4] = " -> "
+            rt.buf_push_bytes(b, (&ar[0]) as u64, 4)
+            name_of(t, it, b, ty_a(t, i))
+        }
+        return
+    }
+    if k == K_VOID {
+        var v: [u8; 2] = "()"
+        rt.buf_push_bytes(b, (&v[0]) as u64, 2)
+        return
+    }
+    if k == K_ERROR {
+        var f: [u8; 7] = "<error>"
+        rt.buf_push_bytes(b, (&f[0]) as u64, 7)
+        return
+    }
+    var tab: [u8; 54] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32"
+    var idx: usize = 0
+    var nr2: u32 = 0
+    var start: usize = 0
+    while idx <= 54 {
+        var end: bool = idx == 54
+        if !end {
+            end = tab[idx] == 124 as u8
+        }
+        if end {
+            if nr2 == k {
+                rt.buf_push_bytes(b, (&tab[start]) as u64, idx - start)
+                return
+            }
+            nr2 = nr2 + 1
+            start = idx + 1
+        }
+        idx = idx + 1
+    }
+}

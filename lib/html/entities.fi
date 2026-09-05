@@ -1,0 +1,528 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/html/entities.fi -- the character references of the HTML5 tokenizer (in Firn).
+//
+// It implements WHATWG-HTML 13.2.5.72 ff.:
+//   Character reference state, Named character reference state,
+//   Ambiguous ampersand state, Numeric character reference state,
+//   Hexadecimal/Decimal character reference (start) state,
+//   Numeric character reference end state (with the replacement table).
+//
+// THE INTERFACE (the contract with `tokenizer-core`, PLAN.md 2.3):
+//
+//   fn char_ref(input: *mut mem.CpBuf, pos: usize, in_attr: bool,
+//               s: *mut tokens.Sink) -> usize
+//
+//   `pos` points BEHIND the '&'. `in_attr` = true when the reference stands
+//   inside an attribute value: then the special rule of the standard applies
+//   (a name without a semicolon, followed by '=' or alphanumeric -> do not
+//   replace) AND the output goes to `tokens.tok_attr_value_push` instead of
+//   `sink_emit_char`. The return value is the new position in the input (the
+//   first character not consumed). Something is ALWAYS emitted -- in the
+//   worst case the '&' itself. ONE exception: if the name table could not be
+//   created, `REF_UNMOEGLICH` comes back; the caller MUST then abort the
+//   case as "not supported" (lib/html/tokenizer.fi does that).
+//
+//   `char_ref_out(input, pos, in_attr, s, out)` is the same function with the
+//   output switch from PLAN.md 2.3 (out == 0 -> sink_emit_char, otherwise
+//   tok_attr_value_push); `in_attr` only steers the special rule there.
+//
+// THE NAME TABLE: 2,231 entries from `html.entities.html5`, generated into
+// lib/html/entities_data.fi (tools/tokenizer/gen_entities.py). Stage 0 has no
+// global arrays; the table is therefore created at the first '&' of a run
+// with mmap WITHOUT MAP_FIXED at an ARBITRARY address chosen by the kernel,
+// filled -- and the pointer is held in the `tokens.Sink` and passed on from
+// there through the tokenizer (`tokens.sink_entities`). There is no fixed
+// address and no assumption about the memory image of the process.
+// If the build fails (mmap returns an error), `table()` returns the null
+// pointer; `char_ref` then reports REF_UNMOEGLICH and the tokenizer reports
+// the case as unsupported -- it is NEVER tokenized wrongly in silence.
+// The lookup is a binary search over the sorted names, longest match
+// first (up to 32 characters).
+import mem
+import tokens
+import entities_data
+import error_codes
+
+export { char_ref, char_ref_out, lookup, numeric_map, table, REF_UNMOEGLICH }
+
+const SYS_MMAP: i64 = 9
+const PROT_READ_WRITE: i64 = 3
+// MAP_PRIVATE|MAP_ANONYMOUS -- expressly WITHOUT MAP_FIXED/MAP_FIXED_NOREPLACE
+const MAP_FLAGS: i64 = 0x22
+
+// The return value of `char_ref` when the name table could not be created.
+// The caller MUST abort on it (the case counts as unsupported).
+const REF_UNMOEGLICH: usize = 0xFFFFFFFFFFFFFFFF
+
+const MAX_NAME: usize = 32
+
+// ----------------------------------------------------- Access to the table
+
+// Behind the generated table lies an index by first character: two u32 per
+// byte value (the first entry, and one past the last entry). It shortens the
+// binary search and is computed along with the table at the first call.
+const OFF_INDEX: usize = 0 // is added to entities_data.BYTES
+const INDEX_BYTES: usize = 2048
+
+// Creates the name table at an arbitrary address and fills it.
+// Returns 0 when the memory could not be obtained.
+#[no_gc]
+fn table_build() -> *mut u8 {
+    let total: usize = entities_data.BYTES + OFF_INDEX + INDEX_BYTES
+    let pages: i64 = ((total + 4095) / 4096 * 4096) as i64
+    let r: i64 = syscall(SYS_MMAP, 0, pages, PROT_READ_WRITE, MAP_FLAGS, -1, 0)
+    // mmap reports failure as -1..-4095 (errno); any other return value is the
+    // address chosen by the kernel.
+    if r > -4096 && r < 0 {
+        return 0 as *mut u8
+    }
+    if r == 0 {
+        return 0 as *mut u8
+    }
+    let p: *mut u8 = r as *mut u8
+    entities_data.load(p)
+    // Sum up the starting position per name from the lengths.
+    var off: usize = 0
+    var i: usize = 0
+    while i < entities_data.COUNT {
+        *((p as usize + entities_data.OFF_POS + i * 4) as *mut u32) = off as u32
+        off = off + (*((p as usize + entities_data.OFF_LEN + i) as *mut u8)) as usize
+        i = i + 1
+    }
+    // The index by first character (the names are sorted).
+    var b: usize = 0
+    while b < 256 {
+        *((p as usize + entities_data.BYTES + b * 8) as *mut u32) = 0 as u32
+        *((p as usize + entities_data.BYTES + b * 8 + 4) as *mut u32) = 0 as u32
+        b = b + 1
+    }
+    i = 0
+    while i < entities_data.COUNT {
+        let first: usize = name_byte(p, i, 0) as usize
+        let z: usize = p as usize + entities_data.BYTES + first * 8
+        if *(z as *mut u32) == *((z + 4) as *mut u32) {
+            *(z as *mut u32) = i as u32
+        }
+        *((z + 4) as *mut u32) = (i + 1) as u32
+        i = i + 1
+    }
+    *((p as usize) as *mut u64) = entities_data.ID
+    return p
+}
+
+// Returns the name table from the sink; at the first call it gets built.
+// A return value of 0 means: the table is not available.
+#[no_gc]
+fn table(s: *mut tokens.Sink) -> *mut u8 {
+    let present: *mut u8 = tokens.sink_entities(s)
+    if present as usize != 0 {
+        return present
+    }
+    if tokens.sink_entities_tries(s) {
+        return 0 as *mut u8
+    }
+    tokens.sink_set_entities_tries(s, true)
+    let p: *mut u8 = table_build()
+    if p as usize != 0 {
+        if *((p as usize) as *mut u64) != entities_data.ID {
+            return 0 as *mut u8
+        }
+        tokens.sink_set_entities(s, p)
+    }
+    return p
+}
+
+#[no_gc]
+fn name_length(p: *mut u8, i: usize) -> usize {
+    return (*((p as usize + entities_data.OFF_LEN + i) as *mut u8)) as usize
+}
+
+#[no_gc]
+fn name_pos(p: *mut u8, i: usize) -> usize {
+    return (*((p as usize + entities_data.OFF_POS + i * 4) as *mut u32)) as usize
+}
+
+#[no_gc]
+fn name_byte(p: *mut u8, i: usize, k: usize) -> u32 {
+    return (*((p as usize + entities_data.OFF_NAMES + name_pos(p, i) + k) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn value(p: *mut u8, i: usize) -> u64 {
+    return *((p as usize + entities_data.OFF_VALUE + i * 8) as *mut u64)
+}
+
+// ----------------------------------------------------------------- Helpers
+
+#[no_gc]
+fn is_alnum(c: u32) -> bool {
+    return (c >= 48 as u32 && c <= 57 as u32) ||
+    (c >= 65 as u32 && c <= 90 as u32) ||
+    (c >= 97 as u32 && c <= 122 as u32)
+}
+
+#[no_gc]
+fn hex_value(c: u32) -> i32 {
+    if c >= 48 as u32 && c <= 57 as u32 {
+        return (c - 48 as u32) as i32
+    }
+    if c >= 97 as u32 && c <= 102 as u32 {
+        return (c - 97 as u32 + 10 as u32) as i32
+    }
+    if c >= 65 as u32 && c <= 70 as u32 {
+        return (c - 65 as u32 + 10 as u32) as i32
+    }
+    return -1 as i32
+}
+
+#[no_gc]
+fn char_at(input: *mut mem.CpBuf, i: usize) -> u32 {
+    if i >= mem.cp_len(input) {
+        return 0xFFFFFFFF as u32
+    }
+    return mem.cp_at(input, i)
+}
+
+// Emit one character -- into the attribute value or into the character stream.
+#[no_gc]
+fn out(s: *mut tokens.Sink, cp: u32, after_attr: bool) {
+    if after_attr {
+        tokens.tok_attr_value_push(s, cp)
+    } else {
+        tokens.sink_emit_char(s, cp)
+    }
+}
+
+// --------------------------------------------------------- The name lookup
+
+// Compares entry `i` with the first `len` characters of `cand`.
+// -1: the entry is smaller, 0: equal, 1: the entry is larger.
+#[no_gc]
+fn compare(p: *mut u8, i: usize, cand: *mut u32, len: usize) -> i32 {
+    let el: usize = name_length(p, i)
+    // Compute the start of the name ONCE -- not per character (a hot path).
+    let np: usize = p as usize + entities_data.OFF_NAMES + name_pos(p, i)
+    var k: usize = 0
+    while k < el && k < len {
+        let a: u32 = (*((np + k) as *mut u8)) as u32
+        let b: u32 = *((cand as usize + k * 4) as *mut u32)
+        if a < b {
+            return -1 as i32
+        }
+        if a > b {
+            return 1 as i32
+        }
+        k = k + 1
+    }
+    if el < len {
+        return -1 as i32
+    }
+    if el > len {
+        return 1 as i32
+    }
+    return 0 as i32
+}
+
+// Looks for the name `cand[0..len]` (an array of code points) in the table.
+// The return value: the index + 1, or 0 if it does not exist.
+#[no_gc]
+fn lookup(p: *mut u8, cand: *mut u32, len: usize) -> usize {
+    if p as usize == 0 || len == 0 {
+        return 0
+    }
+    let first: u32 = *(cand as *mut u32)
+    if first > 255 as u32 {
+        return 0
+    }
+    let z: usize = p as usize + entities_data.BYTES + first as usize * 8
+    var lo: usize = (*(z as *mut u32)) as usize
+    var hi: usize = (*((z + 4) as *mut u32)) as usize
+    while lo < hi {
+        let mid: usize = lo + (hi - lo) / 2
+        let v: i32 = compare(p, mid, cand, len)
+        if v == 0 as i32 {
+            return mid + 1
+        }
+        if v < 0 as i32 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return 0
+}
+
+// Non characters per Unicode: U+FDD0..U+FDEF and every ...FFFE/...FFFF.
+#[no_gc]
+fn is_non_char(n: u32) -> bool {
+    if n >= 0xFDD0 as u32 && n <= 0xFDEF as u32 {
+        return true
+    }
+    let below: u32 = n & 0xFFFF as u32
+    return below == 0xFFFE as u32 || below == 0xFFFF as u32
+}
+
+// "control-character-reference": C0/C1 control characters without the ASCII
+// whitespace characters (tab, LF, FF, CR) and without U+0000 (its own code).
+#[no_gc]
+fn is_control_char_ref(n: u32) -> bool {
+    if n == 0 as u32 {
+        return false
+    }
+    if n == 13 as u32 {
+        // The standard names U+000D expressly (even though it is whitespace).
+        return true
+    }
+    if n == 9 as u32 || n == 10 as u32 || n == 12 as u32 || n == 32 as u32 {
+        return false
+    }
+    if n < 0x20 as u32 {
+        return true
+    }
+    return n >= 0x7F as u32 && n <= 0x9F as u32
+}
+
+// ----------------------------------------- the numeric character reference
+
+// Numeric character reference end state: the replacements of the standard.
+#[no_gc]
+fn numeric_map(n: u32) -> u32 {
+    if n == 0 as u32 {
+        return 0xFFFD as u32
+    }
+    if n > 0x10FFFF as u32 {
+        return 0xFFFD as u32
+    }
+    if n >= 0xD800 as u32 && n <= 0xDFFF as u32 {
+        return 0xFFFD as u32
+    }
+    if n < 0x80 as u32 || n > 0x9F as u32 {
+        return n
+    }
+    // The C1 replacement table (WHATWG-HTML 13.2.5.80)
+    if n == 0x80 as u32 { return 0x20AC as u32 }
+    if n == 0x82 as u32 { return 0x201A as u32 }
+    if n == 0x83 as u32 { return 0x0192 as u32 }
+    if n == 0x84 as u32 { return 0x201E as u32 }
+    if n == 0x85 as u32 { return 0x2026 as u32 }
+    if n == 0x86 as u32 { return 0x2020 as u32 }
+    if n == 0x87 as u32 { return 0x2021 as u32 }
+    if n == 0x88 as u32 { return 0x02C6 as u32 }
+    if n == 0x89 as u32 { return 0x2030 as u32 }
+    if n == 0x8A as u32 { return 0x0160 as u32 }
+    if n == 0x8B as u32 { return 0x2039 as u32 }
+    if n == 0x8C as u32 { return 0x0152 as u32 }
+    if n == 0x8E as u32 { return 0x017D as u32 }
+    if n == 0x91 as u32 { return 0x2018 as u32 }
+    if n == 0x92 as u32 { return 0x2019 as u32 }
+    if n == 0x93 as u32 { return 0x201C as u32 }
+    if n == 0x94 as u32 { return 0x201D as u32 }
+    if n == 0x95 as u32 { return 0x2022 as u32 }
+    if n == 0x96 as u32 { return 0x2013 as u32 }
+    if n == 0x97 as u32 { return 0x2014 as u32 }
+    if n == 0x98 as u32 { return 0x02DC as u32 }
+    if n == 0x99 as u32 { return 0x2122 as u32 }
+    if n == 0x9A as u32 { return 0x0161 as u32 }
+    if n == 0x9B as u32 { return 0x203A as u32 }
+    if n == 0x9C as u32 { return 0x0153 as u32 }
+    if n == 0x9E as u32 { return 0x017E as u32 }
+    if n == 0x9F as u32 { return 0x0178 as u32 }
+    return n
+}
+
+// &#...  or  &#x...  -- `pos` points at the '#'.
+#[no_gc]
+fn numeric_reference(input: *mut mem.CpBuf, pos: usize, s: *mut tokens.Sink,
+    after_attr: bool) -> usize {
+    var j: usize = pos + 1
+    var hex: bool = false
+    let c1: u32 = char_at(input, j)
+    if c1 == 120 as u32 || c1 == 88 as u32 { // 'x' / 'X'
+        hex = true
+        j = j + 1
+    }
+    let start: usize = j
+    var number: u32 = 0
+    var runs: bool = true
+    while runs {
+        let c: u32 = char_at(input, j)
+        var d: i32 = -1 as i32
+        if hex {
+            d = hex_value(c)
+        } else if c >= 48 as u32 && c <= 57 as u32 {
+            d = (c - 48 as u32) as i32
+        }
+        if d < 0 as i32 {
+            runs = false
+        } else {
+            if number <= 0x10FFFF as u32 {
+                var base: u32 = 10
+                if hex {
+                    base = 16
+                }
+                number = number * base + d as u32
+                if number > 0x10FFFF as u32 {
+                    number = 0x110000 as u32 // Overflow: it stays too large
+                }
+            }
+            j = j + 1
+        }
+    }
+    if j == start {
+        // absence-of-digits-in-numeric-character-reference: replace nothing.
+        tokens.sink_error_at(s, error_codes.F_ABSENCE_OF_DIGITS_IN_NUMERIC_CHARACTER_REFERENCE,
+            input, start)
+        out(s, 38 as u32, after_attr)
+        out(s, 35 as u32, after_attr)
+        if hex {
+            out(s, c1, after_attr)
+        }
+        return start
+    }
+    if char_at(input, j) == 59 as u32 { // ';'
+        j = j + 1
+    } else {
+        tokens.sink_error_at(s, error_codes.F_MISSING_SEMICOLON_AFTER_CHARACTER_REFERENCE,
+            input, j)
+    }
+    // The error codes of the "numeric character reference end state" -- reported
+    // at the position BEHIND the reference (that is how html5lib-tests keeps book).
+    if number == 0 as u32 {
+        tokens.sink_error_at(s, error_codes.F_NULL_CHARACTER_REFERENCE, input, j)
+    } else if number > 0x10FFFF as u32 {
+        tokens.sink_error_at(s, error_codes.F_CHARACTER_REFERENCE_OUTSIDE_UNICODE_RANGE,
+            input, j)
+    } else if number >= 0xD800 as u32 && number <= 0xDFFF as u32 {
+        tokens.sink_error_at(s, error_codes.F_SURROGATE_CHARACTER_REFERENCE, input, j)
+    } else if is_non_char(number) {
+        tokens.sink_error_at(s, error_codes.F_NONCHARACTER_CHARACTER_REFERENCE, input, j)
+    } else if is_control_char_ref(number) {
+        tokens.sink_error_at(s, error_codes.F_CONTROL_CHARACTER_REFERENCE, input, j)
+    }
+    out(s, numeric_map(number), after_attr)
+    return j
+}
+
+// --------------------------------------------------------- The entry point
+
+#[no_gc]
+fn reference(input: *mut mem.CpBuf, pos: usize, in_attr: bool, s: *mut tokens.Sink,
+    after_attr: bool) -> usize {
+    let c: u32 = char_at(input, pos)
+    if c == 35 as u32 { // '#'
+        return numeric_reference(input, pos, s, after_attr)
+    }
+    if !is_alnum(c) {
+        // Character reference state, "anything else": just the '&'.
+        out(s, 38 as u32, after_attr)
+        return pos
+    }
+
+    // Collect the candidate: alphanumeric, at most one closing ';'.
+    // Deliberately an array on the stack and NO mem.CpBuf: a character reference
+    // must not request memory (an mmap/munmap per '&' cost ten times as much as
+    // all the remaining work together).
+    var cand: [u32; 33] = [0 as u32; 33]
+    let kp: *mut u32 = (&cand[0]) as *mut u32
+    var cnt: usize = 0
+    var j: usize = pos
+    var collect: bool = true
+    while collect {
+        if cnt >= MAX_NAME {
+            collect = false
+        } else {
+            let x: u32 = char_at(input, j)
+            if is_alnum(x) {
+                cand[cnt] = x
+                cnt = cnt + 1
+                j = j + 1
+            } else if x == 59 as u32 {
+                cand[cnt] = x
+                cnt = cnt + 1
+                j = j + 1
+                collect = false
+            } else {
+                collect = false
+            }
+        }
+    }
+
+    let p: *mut u8 = table(s)
+    if p as usize == 0 {
+        // Without a name table this reference cannot be resolved:
+        // abort honestly instead of tokenizing wrongly in silence.
+        return REF_UNMOEGLICH
+    }
+    var len: usize = cnt
+    var hit: usize = 0
+    while len > 0 && hit == 0 {
+        hit = lookup(p, kp, len)
+        if hit == 0 {
+            len = len - 1
+        }
+    }
+
+    var end: usize = pos
+    if hit > 0 {
+        let idx: usize = hit - 1
+        let with_semicolon: bool = cand[len - 1] == 59 as u32
+        let after: u32 = char_at(input, pos + len)
+        var literal: bool = false
+        if in_attr && !with_semicolon {
+            if after == 61 as u32 || is_alnum(after) {
+                literal = true
+            }
+        }
+        if !with_semicolon && !literal {
+            tokens.sink_error_at(s, error_codes.F_MISSING_SEMICOLON_AFTER_CHARACTER_REFERENCE,
+                input, pos + len)
+        }
+        if literal {
+            // The special rule inside an attribute value: take it over unchanged.
+            out(s, 38 as u32, after_attr)
+            var k: usize = 0
+            while k < len {
+                out(s, cand[k], after_attr)
+                k = k + 1
+            }
+        } else {
+            let v: u64 = value(p, idx)
+            out(s, (v & 0xFFFFFFFF as u64) as u32, after_attr)
+            let second: u32 = (v >> 32) as u32
+            if second != 0 as u32 {
+                out(s, second, after_attr)
+            }
+        }
+        end = pos + len
+    } else {
+        // No match: emit the '&', then ambiguous ampersand state -- every
+        // alphanumeric character unchanged, then back into the starting
+        // state (including at a ';', which is looked at again there).
+        out(s, 38 as u32, after_attr)
+        var k: usize = pos
+        while is_alnum(char_at(input, k)) {
+            out(s, char_at(input, k), after_attr)
+            k = k + 1
+        }
+        if char_at(input, k) == 59 as u32 {
+            // Ambiguous ampersand state: the ';' triggers the error.
+            tokens.sink_error_at(s, error_codes.F_UNKNOWN_NAMED_CHARACTER_REFERENCE, input, k)
+        }
+        end = k
+    }
+    return end
+}
+
+// The character reference from `pos` on (behind the '&'); output per `in_attr`.
+#[no_gc]
+fn char_ref(input: *mut mem.CpBuf, pos: usize, in_attr: bool, s: *mut tokens.Sink) -> usize {
+    return reference(input, pos, in_attr, s, in_attr)
+}
+
+// Like `char_ref`, but with a separate output switch (PLAN.md 2.3):
+// out == 0 -> tokens.sink_emit_char, otherwise tokens.tok_attr_value_push.
+#[no_gc]
+fn char_ref_out(input: *mut mem.CpBuf, pos: usize, in_attr: bool, s: *mut tokens.Sink,
+    out: u32) -> usize {
+    return reference(input, pos, in_attr, s, out != 0 as u32)
+}

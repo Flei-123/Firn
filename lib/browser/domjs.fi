@@ -1,0 +1,3359 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/browser/domjs.fi -- the DOM as JAVASCRIPT sees it (round B4).
+//
+// Round 63 built a JavaScript engine and round B1 built a DOM, and until
+// now they had never met: a script could compute, and it could not touch
+// the page. This file is the join, and it is the reason the thing in this
+// repository can start to be called a browser rather than a renderer.
+//
+// HOW A NATIVE IS REACHED. `lib/js/builtin.fi` hands every native number
+// from 30000 on to a function VALUE the driver installs
+// (`Ctx.gen_native`). Round 66 put the generators there. This round
+// installs `dom_native` instead and forwards everything below 40000 back
+// to `gen.gen_native` -- so the chain is builtin -> dom -> generators, and
+// neither of the two older files had to learn about this one. That is the
+// same trick, for the same reason: `lib/js/interp.fi` must not import a
+// DOM, or the engine could no longer be built without one.
+//
+// THE WRAPPER, and why it has to be the SAME object every time. A DOM node
+// is a `Gc[Node]`; JavaScript wants an object with properties. `DomObj` is
+// a `JsObj` with the node beside it -- a real subclass, so the collector
+// traces the node through the compiler generated type table and a node
+// that only a script still holds stays alive. `Host.wrappers` maps the
+// node to its wrapper, because
+//
+//     document.getElementById("x") === document.getElementById("x")
+//
+// has to be true, and because an event listener list hangs off identity.
+//
+// WHAT AN ATTRIBUTE COSTS. Every setter that can change the picture calls
+// `live_mark_*` (lib/browser/live.fi) and nothing else -- no relayout, no
+// paint. The page is brought up to date once, after the script has run,
+// which is what makes a loop of a thousand `appendChild` calls cost one
+// layout instead of a thousand.
+//
+// NAMED LIMITS are in docs/ROUNDB4.md; the largest are: no shadow DOM, no
+// custom elements, no mutation observers, no live `HTMLCollection` (every
+// list is a snapshot, as `querySelectorAll` returns anyway), and `style`
+// is the INLINE declaration block, not the computed style.
+// CHAPTER Z, AND IT IS A RULE ABOUT THIS FILE (round B6)
+//
+// Every field this host hands to a page which says something about the
+// MACHINE rather than about the document is a fingerprint bit, and it
+// goes through `browser.fpz` before it is handed over:
+//
+//   navigator.hardwareConcurrency   fpz.fp_hardware_concurrency
+//   navigator.deviceMemory          fpz.fp_device_memory
+//   navigator.userAgent             fpz.fp_user_agent  (FROZEN, not
+//                                   noised -- a per-site user agent is a
+//                                   mark of its own)
+//   screen.width / .height          fpz.fp_screen_round
+//   performance.now / Date.now      fpz.fp_clock_us
+//
+// The key belongs to the ORIGIN of the document and to the SESSION, so
+// the answers are consistent within one visit and line up with nothing
+// outside it. There is no switch (Z6): every mode a user can be in is
+// itself a bit.
+//
+// The requirement is Z3, Z4 and Z6 of orientos-browser/REQUIREMENTS.md,
+// the measurement is `tools/fpz/run.sh`, and the reason is the AliExpress
+// case of 24 August 2026 -- see `lib/browser/fpz.fi`.
+import html.mem
+import browser.node
+import browser.names
+import browser.tag
+import browser.write
+import browser.driver
+import browser.live
+import dom.api
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+import js.lex
+import js.val
+import js.interp
+import js.gen
+import std.math
+
+export {
+    Host, DomObj, DOM_BASE,
+    host_new, host_init, host_free,
+    host_set_live, host_set_document, host_set_fragment_parser,
+    host_set_location,
+    dom_native, dom_arity, install_dom,
+    host_timers_due, host_run_timers, host_timer_count, host_advance,
+    host_dispatch_named, host_events_fired, host_listeners_run,
+    host_timer_errors, host_last_throw,
+    wrap_node, node_of,
+}
+
+const DOM_BASE: u64 = 40000
+
+// The kinds of host object that are not a node.
+const HK_NODE: u64 = 0
+const HK_STYLE: u64 = 1 // an inline declaration block
+const HK_CLASSLIST: u64 = 2
+const HK_EVENT: u64 = 3
+const HK_LOCATION: u64 = 4
+const HK_WINDOW: u64 = 5
+
+// The prototypes this file owns, in `Host.protos`.
+const P_NODE: u64 = 0
+const P_ELEMENT: u64 = 1
+const P_DOCUMENT: u64 = 2
+const P_TEXT: u64 = 3
+const P_COMMENT: u64 = 4
+const P_STYLE: u64 = 5
+const P_CLASSLIST: u64 = 6
+const P_EVENT: u64 = 7
+const P_LOCATION: u64 = 8
+const P_WINDOW: u64 = 9
+// Round B4: the chain the DOM standard really has. `instanceof` is a
+// property of the PROTOTYPE CHAIN, so an engine that puts every method on
+// one object answers `el instanceof HTMLElement` with false and fails a
+// whole class of tests for a reason that has nothing to do with the
+// method itself.
+const P_EVENTTARGET: u64 = 10
+const P_HTMLELEMENT: u64 = 11
+const P_CHARDATA: u64 = 12
+const P_COUNT: u64 = 13
+
+// A wrapper. `k` is the node for HK_NODE and the OWNER element for a
+// style block or a class list; `hkind` says which.
+gc class DomObj extends JsObj {
+    k: Gc[Node],
+    ev: Gc[JsObj], // an event object: its own fields hang here
+    hkind: u64,
+}
+
+// One registered listener.
+gc class Listener {
+    target: Gc[Node],
+    fn_: Gc[JsVal],
+    type_: Gc[JsVal],
+    capture: bool,
+    once: bool,
+    dead: bool,
+}
+
+// One timer.
+gc class Timer {
+    fn_: Gc[JsVal],
+    args: Gc[GcVec],
+    id: u64,
+    due_ms: u64,
+    every_ms: u64,
+    repeat: bool,
+    dead: bool,
+}
+
+struct Host {
+    // --- the GC fields. A `Host` belongs in a frame; the collector scans
+    // the stack conservatively and finds them there.
+    wrappers: Gc[GcMap], // node -> DomObj
+    listeners: Gc[GcMap], // node -> GcVec[Listener]
+    timers: Gc[GcVec],
+    protos: Gc[GcVec],
+    realm: Gc[Realm],
+    doc: Gc[Node],
+    window: Gc[JsObj],
+    ev_current: Gc[DomObj],
+
+    lv: *mut live.Live,
+    nm: *mut names.Names,
+    // The second parser, for `innerHTML`. It belongs to the driver -- a
+    // `Run` holds the whole tree construction state and there must be
+    // exactly one of it per document being built.
+    frag: *mut driver.Run,
+    t: tok.Tokens,
+    cx: sel.Ctx,
+    tmp: mem.CpBuf,
+    tmp2: mem.CpBuf,
+    buf: mem.Buf,
+    loc: mem.Buf,
+    next_timer: u64,
+    now_ms: u64,
+    fired: u64, // events dispatched
+    ran: u64, // listeners really called
+    timers_run: u64,
+    timer_errors: u64,
+    last_throw: Gc[JsVal],
+    ok: bool,
+}
+
+fn host_new() -> Host {
+    return Host {
+        wrappers: gc_null[GcMap](), listeners: gc_null[GcMap](),
+        timers: gc_null[GcVec](), protos: gc_null[GcVec](),
+        realm: gc_null[Realm](), doc: gc_null[Node](),
+        window: gc_null[JsObj](), ev_current: gc_null[DomObj](),
+        lv: 0 as *mut live.Live, nm: 0 as *mut names.Names,
+        frag: 0 as *mut driver.Run,
+        t: tok.tokens_new(), cx: sel.ctx_new(0 as *mut names.Names),
+        tmp: mem.cp_new(), tmp2: mem.cp_new(), buf: mem.buf_new(),
+        loc: mem.buf_new(),
+        next_timer: 1, now_ms: 0, fired: 0, ran: 0, timers_run: 0,
+        timer_errors: 0, last_throw: gc_null[JsVal](),
+        ok: false,
+    }
+}
+
+fn host_init(h: *mut Host, nm: *mut names.Names) -> bool {
+    (*h).cx = sel.ctx_new(nm)
+    sel.ctx_init(&(*h).cx)
+    tok.tokens_init(&(*h).t)
+    mem.cp_init(&(*h).tmp)
+    mem.cp_init(&(*h).tmp2)
+    mem.buf_init(&(*h).buf)
+    mem.buf_init(&(*h).loc)
+    (*h).nm = nm
+    (*h).ok = true
+    return true
+}
+
+fn host_free(h: *mut Host) {
+    sel.ctx_free(&(*h).cx)
+    mem.cp_free(&(*h).tmp)
+    mem.cp_free(&(*h).tmp2)
+    mem.buf_free(&(*h).buf)
+    mem.buf_free(&(*h).loc)
+    (*h).wrappers = gc_null[GcMap]()
+    (*h).listeners = gc_null[GcMap]()
+    (*h).timers = gc_null[GcVec]()
+    (*h).protos = gc_null[GcVec]()
+    (*h).realm = gc_null[Realm]()
+    (*h).doc = gc_null[Node]()
+    (*h).window = gc_null[JsObj]()
+}
+
+fn host_set_live(h: *mut Host, l: *mut live.Live) { (*h).lv = l }
+fn host_set_fragment_parser(h: *mut Host, d: *mut driver.Run) {
+    (*h).frag = d
+}
+fn host_set_document(h: *mut Host, d: Gc[Node]) { (*h).doc = d }
+fn host_events_fired(h: *mut Host) -> u64 { return (*h).fired }
+fn host_timer_errors(h: *mut Host) -> u64 { return (*h).timer_errors }
+fn host_last_throw(h: *mut Host) -> Gc[JsVal] { return (*h).last_throw }
+fn host_listeners_run(h: *mut Host) -> u64 { return (*h).ran }
+fn host_timer_count(h: *mut Host) -> u64 {
+    if (*h).timers == gc_null[GcVec]() {
+        return 0
+    }
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < gcvec_length((*h).timers) {
+        let t: Gc[Timer] = gcvec_read[Timer]((*h).timers, i)
+        if !t.dead {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn host_of(r: Gc[Realm]) -> *mut Host {
+    return interp.ctx_host(r) as *mut Host
+}
+
+// ------------------------------------------------------------- Strings
+
+fn js_to_cp(v: Gc[JsVal], out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    if val.val_tag(v) != val.TAG_STR {
+        return
+    }
+    var i: u64 = 0
+    let n: u64 = val.str_len(v)
+    while i < n {
+        mem.cp_push(out, val.str_at(v, i))
+        i = i + 1
+    }
+}
+
+fn cp_to_js(r: Gc[Realm], b: *mut mem.CpBuf) -> AllocError!Gc[JsVal] {
+    return try val.str_from_units(r, b, 0, mem.cp_len(b))
+}
+
+fn chain_to_js(r: Gc[Realm], c: Gc[Chain],
+    tmp: *mut mem.CpBuf) -> AllocError!Gc[JsVal] {
+    mem.cp_clear(tmp)
+    if c != gc_null[Chain]() {
+        node.chain_after_cpbuf(c, tmp)
+    }
+    return try cp_to_js(r, tmp)
+}
+
+fn name_to_js(r: Gc[Realm], nm: *mut names.Names, id: u32,
+    tmp: *mut mem.CpBuf) -> AllocError!Gc[JsVal] {
+    mem.cp_clear(tmp)
+    names.names_after_cpbuf(nm, id, tmp)
+    return try cp_to_js(r, tmp)
+}
+
+fn cp_upper(b: *mut mem.CpBuf) {
+    var i: usize = 0
+    let n: usize = mem.cp_len(b)
+    while i < n {
+        let c: u32 = mem.cp_at(b, i)
+        if c >= 97 as u32 && c <= 122 as u32 {
+            mem.cp_set(b, i, c - 32 as u32)
+        }
+        i = i + 1
+    }
+}
+
+fn ascii_js(r: Gc[Realm], p: *mut u8, n: usize) -> AllocError!Gc[JsVal] {
+    return try val.str_from_ascii(r, p, n)
+}
+
+fn arg(r: Gc[Realm], a: Gc[GcVec], i: u64) -> Gc[JsVal] {
+    if i >= gcvec_length(a) {
+        return val.realm_undefined(r)
+    }
+    return gcvec_read[JsVal](a, i)
+}
+
+fn arg_str(r: Gc[Realm], a: Gc[GcVec], i: u64,
+    out: *mut mem.CpBuf) -> AllocError!bool {
+    let v: Gc[JsVal] = arg(r, a, i)
+    let s: Gc[JsVal] = try interp.to_string(r, v)
+    js_to_cp(s, out)
+    return true
+}
+
+// ------------------------------------------------------------- Wrappers
+
+fn wrap_node(h: *mut Host, r: Gc[Realm], k: Gc[Node]) -> AllocError!Gc[JsVal] {
+    if k == gc_null[Node]() {
+        return val.realm_null(r)
+    }
+    let have: Gc[DomObj] = gcmap_get_value[DomObj]((*h).wrappers, k as u64)
+    if have != gc_null[DomObj]() {
+        let v: Gc[JsVal] = have
+        return v
+    }
+    var which: u64 = P_NODE
+    if k.kind == node.K_ELEM {
+        which = P_HTMLELEMENT
+        let e2: Gc[Elem] = node.node_as_elem(k)
+        if e2.ns != node.NS_HTML {
+            which = P_ELEMENT
+        }
+    } else if k.kind == node.K_TEXT {
+        which = P_TEXT
+    } else if k.kind == node.K_COMMENT {
+        which = P_COMMENT
+    } else if k.kind == node.K_DOCUMENT {
+        which = P_DOCUMENT
+    }
+    let o: Gc[DomObj] = try dom_obj(h, r, which, k, HK_NODE)
+    let ok: bool = try gcmap_set_value[DomObj]((*h).wrappers, k as u64, o)
+    let v: Gc[JsVal] = o
+    return v
+}
+
+fn dom_obj(h: *mut Host, r: Gc[Realm], which: u64, k: Gc[Node],
+    hk: u64) -> AllocError!Gc[DomObj] {
+    let proto: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, which)
+    return try gc DomObj {
+        tag: val.TAG_OBJ,
+        proto: proto,
+        props: try gcmap_new(false, true),
+        order: try gcvec_new_raw(),
+        elems: gc_null[GcVec](),
+        env: gc_null[Env](),
+        prim: gc_null[JsVal](),
+        extra: gc_null[JsObj](),
+        cls: val.CLS_ORDINARY,
+        node: 0,
+        native: 0,
+        flags: val.F_EXTENSIBLE,
+        len: 0,
+        k: k,
+        ev: gc_null[JsObj](),
+        hkind: hk,
+    }
+}
+
+fn as_dom(v: Gc[JsVal]) -> Gc[DomObj] {
+    if val.val_tag(v) != val.TAG_OBJ {
+        return gc_null[DomObj]()
+    }
+    return v.as?[DomObj]
+}
+
+fn node_of(v: Gc[JsVal]) -> Gc[Node] {
+    let d: Gc[DomObj] = as_dom(v)
+    if d == gc_null[DomObj]() {
+        return gc_null[Node]()
+    }
+    return d.k
+}
+
+fn elem_of(v: Gc[JsVal]) -> Gc[Elem] {
+    let k: Gc[Node] = node_of(v)
+    if k == gc_null[Node]() || k.kind != node.K_ELEM {
+        return gc_null[Elem]()
+    }
+    return node.node_as_elem(k)
+}
+
+fn type_err(r: Gc[Realm], p: *mut u8, n: usize) -> AllocError!Gc[JsVal] {
+    return interp.throw_error(r, interp.ERR_TYPE, p, n)
+}
+
+fn not_a_node(r: Gc[Realm]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 24] = "this is not a DOM node  "
+    return type_err(r, &m[0], 22)
+}
+
+// A snapshot as a JavaScript array. Every list this file hands out is one;
+// a live `HTMLCollection` would have to hang on the tree and be
+// invalidated on every change, and `querySelectorAll` returns a snapshot
+// in every browser anyway.
+fn nodes_to_array(h: *mut Host, r: Gc[Realm],
+    v: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let a: Gc[JsObj] = try val.array_new(r)
+    var i: u64 = 0
+    let n: u64 = gcvec_length(v)
+    while i < n {
+        let k: Gc[Node] = gcvec_read[Node](v, i)
+        let w: Gc[JsVal] = try wrap_node(h, r, k)
+        let ok: bool = try val.elems_push(r, a, w)
+        i = i + 1
+    }
+    let okl: bool = try val.array_set_length(r, a, n)
+    let out: Gc[JsVal] = a
+    return out
+}
+
+// ===================================================== The native numbers
+//
+// Grouped so the dispatcher can decide in ranges. Everything below
+// DOM_BASE belongs to round 66 and is handed straight back.
+
+const D_GET_BY_ID: u64 = 40000
+const D_QUERY: u64 = 40001
+const D_QUERY_ALL: u64 = 40002
+const D_CREATE_ELEM: u64 = 40003
+const D_CREATE_TEXT: u64 = 40004
+const D_BY_TAG: u64 = 40005
+const D_BY_CLASS: u64 = 40006
+const D_CREATE_COMMENT: u64 = 40007
+const D_DOC_WRITE: u64 = 40008
+const D_CREATE_ELEM_NS: u64 = 40009
+
+const D_APPEND: u64 = 40020
+const D_REMOVE_CHILD: u64 = 40021
+const D_INSERT_BEFORE: u64 = 40022
+const D_REPLACE_CHILD: u64 = 40023
+const D_CLONE: u64 = 40024
+const D_CONTAINS: u64 = 40025
+const D_REMOVE: u64 = 40026
+const D_HAS_CHILDREN: u64 = 40027
+const D_EL_QUERY: u64 = 40028
+const D_EL_QUERY_ALL: u64 = 40029
+const D_MATCHES: u64 = 40030
+const D_CLOSEST: u64 = 40031
+const D_EL_BY_TAG: u64 = 40032
+const D_EL_BY_CLASS: u64 = 40033
+
+const D_GET_ATTR: u64 = 40040
+const D_SET_ATTR: u64 = 40041
+const D_DEL_ATTR: u64 = 40042
+const D_HAS_ATTR: u64 = 40043
+const D_ATTR_NAMES: u64 = 40044
+const D_INS_TEXT: u64 = 40045
+const D_INS_HTML: u64 = 40046
+const D_INS_ELEM: u64 = 40047
+const D_TOGGLE_ATTR: u64 = 40048
+// CharacterData (DOM 4.10) and the two convenience mixins ChildNode and
+// ParentNode (DOM 4.2.7/4.2.6). They are not sugar: a third of the
+// official node tests use them, and every one of them is four lines over
+// the tree operations that are already here.
+const D_SUBSTRING: u64 = 40050
+const D_APPEND_DATA: u64 = 40051
+const D_INSERT_DATA: u64 = 40052
+const D_DELETE_DATA: u64 = 40053
+const D_REPLACE_DATA: u64 = 40054
+const D_BEFORE: u64 = 40055
+const D_AFTER: u64 = 40056
+const D_REPLACE_WITH: u64 = 40057
+const D_PN_APPEND: u64 = 40058
+const D_PN_PREPEND: u64 = 40059
+const D_PN_REPLACE_ALL: u64 = 40060
+const G_CD_DATA: u64 = 40061
+const S_CD_DATA: u64 = 40062
+const G_CD_LENGTH: u64 = 40063
+
+// One number per accessor. The dispatcher reads the number, not a name.
+const G_NODE_TYPE: u64 = 40100
+const G_NODE_NAME: u64 = 40101
+const G_TAG_NAME: u64 = 40102
+const G_PARENT: u64 = 40103
+const G_PARENT_ELEM: u64 = 40104
+const G_FIRST_CHILD: u64 = 40105
+const G_LAST_CHILD: u64 = 40106
+const G_NEXT: u64 = 40107
+const G_PREV: u64 = 40108
+const G_CHILD_NODES: u64 = 40109
+const G_CHILDREN: u64 = 40110
+const G_FIRST_ELEM: u64 = 40111
+const G_LAST_ELEM: u64 = 40112
+const G_TEXT_CONTENT: u64 = 40113
+const G_INNER_HTML: u64 = 40114
+const G_OUTER_HTML: u64 = 40115
+const G_ID: u64 = 40116
+const G_CLASS_NAME: u64 = 40117
+const G_STYLE: u64 = 40118
+const G_CLASS_LIST: u64 = 40119
+const G_NODE_VALUE: u64 = 40120
+const G_DOC_BODY: u64 = 40121
+const G_DOC_ROOT: u64 = 40122
+const G_CHILD_COUNT: u64 = 40123
+const G_ATTR_COUNT: u64 = 40124
+const G_DOC_HEAD: u64 = 40125
+const G_DOC_READY: u64 = 40126
+
+const S_TEXT_CONTENT: u64 = 40200
+const S_INNER_HTML: u64 = 40201
+const S_ID: u64 = 40202
+const S_CLASS_NAME: u64 = 40203
+const S_NODE_VALUE: u64 = 40204
+
+const D_ADD_LISTENER: u64 = 40300
+const D_DEL_LISTENER: u64 = 40301
+const D_DISPATCH: u64 = 40302
+const D_PREVENT: u64 = 40303
+const D_STOP: u64 = 40304
+const D_STOP_IMM: u64 = 40305
+const D_EVENT_CTOR: u64 = 40306
+const D_ILLEGAL_CTOR: u64 = 40307
+const D_CREATE_EVENT: u64 = 40308
+const D_INIT_EVENT: u64 = 40309
+const G_EV_TYPE: u64 = 40310
+const G_EV_TARGET: u64 = 40311
+const G_EV_CURRENT: u64 = 40312
+const G_EV_PHASE: u64 = 40313
+const G_EV_BUBBLES: u64 = 40314
+const G_EV_CANCELABLE: u64 = 40315
+const G_EV_PREVENTED: u64 = 40316
+
+const D_SET_TIMEOUT: u64 = 40400
+const D_CLEAR_TIMEOUT: u64 = 40401
+const D_SET_INTERVAL: u64 = 40402
+const D_CLEAR_INTERVAL: u64 = 40403
+
+const D_STYLE_GET: u64 = 40500
+const D_STYLE_SET: u64 = 40501
+const D_STYLE_DEL: u64 = 40502
+const G_STYLE_TEXT: u64 = 40503
+const S_STYLE_TEXT: u64 = 40504
+const G_STYLE_LEN: u64 = 40505
+// The camelCase accessors of a declaration block. ONE getter and ONE
+// setter for all of them: which property is meant stands in the `node`
+// field of the function object itself, and `interp.current_native` says
+// which function object is running. Without that trick every CSS property
+// would need two numbers of its own.
+const G_STYLE_PROP: u64 = 40506
+const S_STYLE_PROP: u64 = 40507
+
+const D_CL_ADD: u64 = 40600
+const D_CL_REMOVE: u64 = 40601
+const D_CL_TOGGLE: u64 = 40602
+const D_CL_CONTAINS: u64 = 40603
+const G_CL_LENGTH: u64 = 40604
+const D_CL_ITEM: u64 = 40605
+const G_CL_VALUE: u64 = 40606
+
+const G_LOC_PART: u64 = 40700 // the part number stands in `node`
+const G_WIN_SELF: u64 = 40710
+const G_WIN_DOC: u64 = 40711
+const G_WIN_W: u64 = 40712
+const G_WIN_H: u64 = 40713
+const G_WIN_LOC: u64 = 40714
+
+// ------------------------------------------------------ Defining things
+
+fn nat(r: Gc[Realm], target: Gc[JsObj], name: *mut u8, n: usize, id: u64,
+    arity: u64) -> AllocError!bool {
+    let f: Gc[JsObj] = try interp.make_native(r, id, arity, name, n)
+    let s: Gc[JsVal] = try val.str_from_ascii(r, name, n)
+    let k: u64 = try val.key_for_str(r, s)
+    let fv: Gc[JsVal] = f
+    return interp.define_value(r, target, k, fv,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+}
+
+// An accessor. `sid` = 0 means read only. `slot` is stamped into both
+// function objects, for the shared handlers.
+fn acc(r: Gc[Realm], target: Gc[JsObj], name: *mut u8, n: usize,
+    gid: u64, sid: u64, slot: u64) -> AllocError!bool {
+    let g: Gc[JsObj] = try interp.make_native(r, gid, 0, name, n)
+    g.node = slot
+    var sv: Gc[JsVal] = val.realm_undefined(r)
+    if sid != 0 as u64 {
+        let sf: Gc[JsObj] = try interp.make_native(r, sid, 1, name, n)
+        sf.node = slot
+        sv = sf
+    }
+    let s: Gc[JsVal] = try val.str_from_ascii(r, name, n)
+    let k: u64 = try val.key_for_str(r, s)
+    let gv: Gc[JsVal] = g
+    return interp.define_accessor(r, target, k, gv, sv, val.A_CONFIGURABLE)
+}
+
+fn put_obj(r: Gc[Realm], target: Gc[JsObj], name: *mut u8, n: usize,
+    v: Gc[JsVal]) -> AllocError!bool {
+    let s: Gc[JsVal] = try val.str_from_ascii(r, name, n)
+    let k: u64 = try val.key_for_str(r, s)
+    return interp.define_value(r, target, k, v,
+        val.A_WRITABLE | val.A_CONFIGURABLE)
+}
+
+// ------------------------------------------------------------ The install
+
+// Builds the prototypes, `window`, `document` and `location`, and puts
+// them on the global object. Called ONCE per realm, after
+// `builtin.install`.
+fn install_dom(h: *mut Host, r: Gc[Realm]) -> AllocError!bool {
+    (*h).realm = r
+    (*h).wrappers = try gcmap_new(true, true)
+    (*h).listeners = try gcmap_new(true, true)
+    (*h).timers = try gcvec_new()
+    (*h).protos = try gcvec_new()
+    let objp: Gc[JsObj] = val.realm_proto(r, val.PROTO_OBJECT)
+    var i: u64 = 0
+    while i < P_COUNT {
+        let p: Gc[JsObj] = try val.obj_new_proto(r, objp)
+        let ok: bool = try gcvec_append[JsObj]((*h).protos, p)
+        i = i + 1
+    }
+    // Element, Text, Comment and Document inherit from Node.
+    let pnode: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_NODE)
+    let pelem: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_ELEMENT)
+    let pdoc: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_DOCUMENT)
+    let ptext: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_TEXT)
+    let pcom: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_COMMENT)
+    let pstyle: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_STYLE)
+    let pcl: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_CLASSLIST)
+    let pev: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_EVENT)
+    let ploc: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_LOCATION)
+    let pwin: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_WINDOW)
+    let pet: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_EVENTTARGET)
+    let phtml: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_HTMLELEMENT)
+    let pcd: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, P_CHARDATA)
+    // EventTarget <- Node <- Element <- HTMLElement
+    //                     <- CharacterData <- Text, Comment
+    //                     <- Document
+    val.obj_set_proto(pnode, pet)
+    val.obj_set_proto(pelem, pnode)
+    val.obj_set_proto(phtml, pelem)
+    val.obj_set_proto(pdoc, pnode)
+    val.obj_set_proto(pcd, pnode)
+    val.obj_set_proto(ptext, pcd)
+    val.obj_set_proto(pcom, pcd)
+
+    // --- Node
+    var n_append: [u8; 11] = "appendChild"
+    var n_remove_c: [u8; 11] = "removeChild"
+    var n_insert: [u8; 12] = "insertBefore"
+    var n_replace: [u8; 12] = "replaceChild"
+    var n_clone: [u8; 9] = "cloneNode"
+    var n_contains: [u8; 8] = "contains"
+    var n_haskids: [u8; 13] = "hasChildNodes"
+    let a1: bool = try nat(r, pnode, &n_append[0], 11, D_APPEND, 1)
+    let a2: bool = try nat(r, pnode, &n_remove_c[0], 11, D_REMOVE_CHILD, 1)
+    let a3: bool = try nat(r, pnode, &n_insert[0], 12, D_INSERT_BEFORE, 2)
+    let a4: bool = try nat(r, pnode, &n_replace[0], 12, D_REPLACE_CHILD, 2)
+    let a5: bool = try nat(r, pnode, &n_clone[0], 9, D_CLONE, 1)
+    let a6: bool = try nat(r, pnode, &n_contains[0], 8, D_CONTAINS, 1)
+    let a7: bool = try nat(r, pnode, &n_haskids[0], 13, D_HAS_CHILDREN, 0)
+    var n_nodetype: [u8; 8] = "nodeType"
+    var n_nodename: [u8; 8] = "nodeName"
+    var n_parent: [u8; 10] = "parentNode"
+    var n_parente: [u8; 13] = "parentElement"
+    var n_first: [u8; 10] = "firstChild"
+    var n_last: [u8; 9] = "lastChild"
+    var n_next: [u8; 11] = "nextSibling"
+    var n_prev: [u8; 15] = "previousSibling"
+    var n_kids: [u8; 10] = "childNodes"
+    var n_textc: [u8; 11] = "textContent"
+    var n_nodev: [u8; 9] = "nodeValue"
+    let b1: bool = try acc(r, pnode, &n_nodetype[0], 8, G_NODE_TYPE, 0, 0)
+    let b2: bool = try acc(r, pnode, &n_nodename[0], 8, G_NODE_NAME, 0, 0)
+    let b3: bool = try acc(r, pnode, &n_parent[0], 10, G_PARENT, 0, 0)
+    let b4: bool = try acc(r, pnode, &n_parente[0], 13, G_PARENT_ELEM, 0, 0)
+    let b5: bool = try acc(r, pnode, &n_first[0], 10, G_FIRST_CHILD, 0, 0)
+    let b6: bool = try acc(r, pnode, &n_last[0], 9, G_LAST_CHILD, 0, 0)
+    let b7: bool = try acc(r, pnode, &n_next[0], 11, G_NEXT, 0, 0)
+    let b8: bool = try acc(r, pnode, &n_prev[0], 15, G_PREV, 0, 0)
+    let b9: bool = try acc(r, pnode, &n_kids[0], 10, G_CHILD_NODES, 0, 0)
+    let b10: bool = try acc(r, pnode, &n_textc[0], 11, G_TEXT_CONTENT,
+        S_TEXT_CONTENT, 0)
+    let b11: bool = try acc(r, pnode, &n_nodev[0], 9, G_NODE_VALUE,
+        S_NODE_VALUE, 0)
+    var n_addl: [u8; 16] = "addEventListener"
+    var n_dell: [u8; 19] = "removeEventListener"
+    var n_disp: [u8; 13] = "dispatchEvent"
+    let c1: bool = try nat(r, pet, &n_addl[0], 16, D_ADD_LISTENER, 2)
+    let c2: bool = try nat(r, pet, &n_dell[0], 19, D_DEL_LISTENER, 2)
+    let c3: bool = try nat(r, pet, &n_disp[0], 13, D_DISPATCH, 1)
+    // The node type constants (DOM 4.4). They stand on the prototype AND
+    // on the constructor, exactly as the standard says.
+    let cc: bool = try node_constants(r, pnode)
+    // ChildNode on Element, Text and Comment; ParentNode on Element and
+    // Document. The DOM standard puts them on the interfaces, not on
+    // Node, and `document.before` really is undefined in a browser.
+    var n_before: [u8; 6] = "before"
+    var n_after: [u8; 5] = "after"
+    var n_repw: [u8; 11] = "replaceWith"
+    var n_app2: [u8; 6] = "append"
+    var n_pre2: [u8; 7] = "prepend"
+    var n_repc: [u8; 15] = "replaceChildren"
+    var n_rem2: [u8; 6] = "remove"
+    var k: usize = 0
+    while k < 3 {
+        var tp: Gc[JsObj] = pelem
+        if k == 1 {
+            tp = ptext
+        } else if k == 2 {
+            tp = pcom
+        }
+        let x1: bool = try nat(r, tp, &n_before[0], 6, D_BEFORE, 1)
+        let x2: bool = try nat(r, tp, &n_after[0], 5, D_AFTER, 1)
+        let x3: bool = try nat(r, tp, &n_repw[0], 11, D_REPLACE_WITH, 1)
+        let x4: bool = try nat(r, tp, &n_rem2[0], 6, D_REMOVE, 0)
+        k = k + 1
+    }
+    var kp: usize = 0
+    while kp < 2 {
+        var tp: Gc[JsObj] = pelem
+        if kp == 1 {
+            tp = pdoc
+        }
+        let y1: bool = try nat(r, tp, &n_app2[0], 6, D_PN_APPEND, 1)
+        let y2: bool = try nat(r, tp, &n_pre2[0], 7, D_PN_PREPEND, 1)
+        let y3: bool = try nat(r, tp, &n_repc[0], 15, D_PN_REPLACE_ALL, 1)
+        kp = kp + 1
+    }
+    // CharacterData
+    var n_data: [u8; 4] = "data"
+    var n_len3: [u8; 6] = "length"
+    var n_sub: [u8; 13] = "substringData"
+    var n_apd: [u8; 10] = "appendData"
+    var n_ind: [u8; 10] = "insertData"
+    var n_ded: [u8; 10] = "deleteData"
+    var n_red: [u8; 11] = "replaceData"
+    let z1: bool = try acc(r, pcd, &n_data[0], 4, G_CD_DATA, S_CD_DATA, 0)
+    let z2: bool = try acc(r, pcd, &n_len3[0], 6, G_CD_LENGTH, 0, 0)
+    let z3: bool = try nat(r, pcd, &n_sub[0], 13, D_SUBSTRING, 2)
+    let z4: bool = try nat(r, pcd, &n_apd[0], 10, D_APPEND_DATA, 1)
+    let z5: bool = try nat(r, pcd, &n_ind[0], 10, D_INSERT_DATA, 2)
+    let z6: bool = try nat(r, pcd, &n_ded[0], 10, D_DELETE_DATA, 2)
+    let z7: bool = try nat(r, pcd, &n_red[0], 11, D_REPLACE_DATA, 3)
+
+    // --- Element
+    var n_tag: [u8; 7] = "tagName"
+    var n_id: [u8; 2] = "id"
+    var n_cls: [u8; 9] = "className"
+    var n_style: [u8; 5] = "style"
+    var n_cl: [u8; 9] = "classList"
+    var n_inner: [u8; 9] = "innerHTML"
+    var n_outer: [u8; 9] = "outerHTML"
+    var n_children: [u8; 8] = "children"
+    var n_fec: [u8; 17] = "firstElementChild"
+    var n_lec: [u8; 16] = "lastElementChild"
+    var n_ccount: [u8; 17] = "childElementCount"
+    let d1: bool = try acc(r, pelem, &n_tag[0], 7, G_TAG_NAME, 0, 0)
+    let d2: bool = try acc(r, pelem, &n_id[0], 2, G_ID, S_ID, 0)
+    let d3: bool = try acc(r, pelem, &n_cls[0], 9, G_CLASS_NAME,
+        S_CLASS_NAME, 0)
+    let d4: bool = try acc(r, pelem, &n_style[0], 5, G_STYLE, 0, 0)
+    let d5: bool = try acc(r, pelem, &n_cl[0], 9, G_CLASS_LIST, 0, 0)
+    let d6: bool = try acc(r, pelem, &n_inner[0], 9, G_INNER_HTML,
+        S_INNER_HTML, 0)
+    let d7: bool = try acc(r, pelem, &n_outer[0], 9, G_OUTER_HTML, 0, 0)
+    let d8: bool = try acc(r, pelem, &n_children[0], 8, G_CHILDREN, 0, 0)
+    let d9: bool = try acc(r, pelem, &n_fec[0], 17, G_FIRST_ELEM, 0, 0)
+    let d10: bool = try acc(r, pelem, &n_lec[0], 16, G_LAST_ELEM, 0, 0)
+    let d11: bool = try acc(r, pelem, &n_ccount[0], 17, G_CHILD_COUNT, 0, 0)
+    var n_getat: [u8; 12] = "getAttribute"
+    var n_setat: [u8; 12] = "setAttribute"
+    var n_delat: [u8; 15] = "removeAttribute"
+    var n_hasat: [u8; 12] = "hasAttribute"
+    var n_atnames: [u8; 17] = "getAttributeNames"
+    var n_qs: [u8; 13] = "querySelector"
+    var n_qsa: [u8; 16] = "querySelectorAll"
+    var n_matches: [u8; 7] = "matches"
+    var n_closest: [u8; 7] = "closest"
+    var n_bytag: [u8; 22] = "getElementsByTagName  "
+    var n_bycls: [u8; 24] = "getElementsByClassName  "
+    var n_rem: [u8; 6] = "remove"
+    let e1: bool = try nat(r, pelem, &n_getat[0], 12, D_GET_ATTR, 1)
+    let e2: bool = try nat(r, pelem, &n_setat[0], 12, D_SET_ATTR, 2)
+    let e3: bool = try nat(r, pelem, &n_delat[0], 15, D_DEL_ATTR, 1)
+    let e4: bool = try nat(r, pelem, &n_hasat[0], 12, D_HAS_ATTR, 1)
+    let e5: bool = try nat(r, pelem, &n_atnames[0], 17, D_ATTR_NAMES, 0)
+    let e6: bool = try nat(r, pelem, &n_qs[0], 13, D_EL_QUERY, 1)
+    let e7: bool = try nat(r, pelem, &n_qsa[0], 16, D_EL_QUERY_ALL, 1)
+    let e8: bool = try nat(r, pelem, &n_matches[0], 7, D_MATCHES, 1)
+    let e9: bool = try nat(r, pelem, &n_closest[0], 7, D_CLOSEST, 1)
+    let e10: bool = try nat(r, pelem, &n_bytag[0], 20, D_EL_BY_TAG, 1)
+    let e11: bool = try nat(r, pelem, &n_bycls[0], 22, D_EL_BY_CLASS, 1)
+    let e12: bool = try nat(r, pelem, &n_rem[0], 6, D_REMOVE, 0)
+    var n_iat: [u8; 18] = "insertAdjacentText"
+    var n_iah: [u8; 18] = "insertAdjacentHTML"
+    var n_tga: [u8; 15] = "toggleAttribute"
+    let e16: bool = try nat(r, pelem, &n_tga[0], 15, D_TOGGLE_ATTR, 2)
+    var n_iae: [u8; 21] = "insertAdjacentElement"
+    let e13: bool = try nat(r, pelem, &n_iat[0], 18, D_INS_TEXT, 2)
+    let e14: bool = try nat(r, pelem, &n_iah[0], 18, D_INS_HTML, 2)
+    let e15: bool = try nat(r, pelem, &n_iae[0], 21, D_INS_ELEM, 2)
+
+    // --- Document
+    var n_gbi: [u8; 14] = "getElementById"
+    var n_ce: [u8; 13] = "createElement"
+    var n_ct: [u8; 16] = "createTextNode  "
+    var n_cc: [u8; 13] = "createComment"
+    var n_body: [u8; 4] = "body"
+    var n_de: [u8; 15] = "documentElement"
+    let f1: bool = try nat(r, pdoc, &n_gbi[0], 14, D_GET_BY_ID, 1)
+    let f2: bool = try nat(r, pdoc, &n_qs[0], 13, D_QUERY, 1)
+    let f3: bool = try nat(r, pdoc, &n_qsa[0], 16, D_QUERY_ALL, 1)
+    let f4: bool = try nat(r, pdoc, &n_ce[0], 13, D_CREATE_ELEM, 1)
+    let f5: bool = try nat(r, pdoc, &n_ct[0], 14, D_CREATE_TEXT, 1)
+    let f6: bool = try nat(r, pdoc, &n_cc[0], 13, D_CREATE_COMMENT, 1)
+    let f7: bool = try nat(r, pdoc, &n_bytag[0], 20, D_BY_TAG, 1)
+    let f8: bool = try nat(r, pdoc, &n_bycls[0], 22, D_BY_CLASS, 1)
+    let f9: bool = try acc(r, pdoc, &n_body[0], 4, G_DOC_BODY, 0, 0)
+    let f10: bool = try acc(r, pdoc, &n_de[0], 15, G_DOC_ROOT, 0, 0)
+    var n_cens: [u8; 15] = "createElementNS"
+    var n_head: [u8; 4] = "head"
+    var n_ready: [u8; 11] = "readyState "
+    let f11: bool = try nat(r, pdoc, &n_cens[0], 15, D_CREATE_ELEM_NS, 2)
+    let f12: bool = try acc(r, pdoc, &n_head[0], 4, G_DOC_HEAD, 0, 0)
+    let f13: bool = try acc(r, pdoc, &n_ready[0], 10, G_DOC_READY, 0, 0)
+    var n_crev: [u8; 11] = "createEvent"
+    let f14: bool = try nat(r, pdoc, &n_crev[0], 11, D_CREATE_EVENT, 1)
+    var n_inev: [u8; 9] = "initEvent"
+    let f15: bool = try nat(r, pev, &n_inev[0], 9, D_INIT_EVENT, 3)
+
+    // --- CSSStyleDeclaration
+    var n_gpv: [u8; 16] = "getPropertyValue"
+    var n_spv: [u8; 11] = "setProperty"
+    var n_rpv: [u8; 14] = "removeProperty"
+    var n_csstext: [u8; 8] = "cssText "
+    let g1: bool = try nat(r, pstyle, &n_gpv[0], 16, D_STYLE_GET, 1)
+    let g2: bool = try nat(r, pstyle, &n_spv[0], 11, D_STYLE_SET, 2)
+    let g3: bool = try nat(r, pstyle, &n_rpv[0], 14, D_STYLE_DEL, 1)
+    let g4: bool = try acc(r, pstyle, &n_csstext[0], 7, G_STYLE_TEXT,
+        S_STYLE_TEXT, 0)
+    let g5: bool = try install_css_props(h, r, pstyle)
+
+    // --- DOMTokenList
+    var n_add: [u8; 3] = "add"
+    var n_rm: [u8; 6] = "remove"
+    var n_tg: [u8; 6] = "toggle"
+    var n_cn: [u8; 8] = "contains"
+    var n_it: [u8; 4] = "item"
+    var n_len: [u8; 6] = "length"
+    var n_valu: [u8; 5] = "value"
+    let h1: bool = try nat(r, pcl, &n_add[0], 3, D_CL_ADD, 1)
+    let h2: bool = try nat(r, pcl, &n_rm[0], 6, D_CL_REMOVE, 1)
+    let h3: bool = try nat(r, pcl, &n_tg[0], 6, D_CL_TOGGLE, 1)
+    let h4: bool = try nat(r, pcl, &n_cn[0], 8, D_CL_CONTAINS, 1)
+    let h5: bool = try nat(r, pcl, &n_it[0], 4, D_CL_ITEM, 1)
+    let h6: bool = try acc(r, pcl, &n_len[0], 6, G_CL_LENGTH, 0, 0)
+    let h7: bool = try acc(r, pcl, &n_valu[0], 5, G_CL_VALUE, 0, 0)
+
+    // --- Event
+    var n_pd: [u8; 14] = "preventDefault"
+    var n_sp: [u8; 15] = "stopPropagation"
+    var n_si: [u8; 24] = "stopImmediatePropagation"
+    var n_type: [u8; 4] = "type"
+    var n_target: [u8; 6] = "target"
+    var n_curr: [u8; 13] = "currentTarget"
+    var n_phase: [u8; 10] = "eventPhase"
+    var n_bub: [u8; 7] = "bubbles"
+    var n_can: [u8; 10] = "cancelable"
+    var n_dp: [u8; 16] = "defaultPrevented"
+    let i1: bool = try nat(r, pev, &n_pd[0], 14, D_PREVENT, 0)
+    let i2: bool = try nat(r, pev, &n_sp[0], 15, D_STOP, 0)
+    let i3: bool = try nat(r, pev, &n_si[0], 24, D_STOP_IMM, 0)
+    let i4: bool = try acc(r, pev, &n_type[0], 4, G_EV_TYPE, 0, 0)
+    let i5: bool = try acc(r, pev, &n_target[0], 6, G_EV_TARGET, 0, 0)
+    let i6: bool = try acc(r, pev, &n_curr[0], 13, G_EV_CURRENT, 0, 0)
+    let i7: bool = try acc(r, pev, &n_phase[0], 10, G_EV_PHASE, 0, 0)
+    let i8: bool = try acc(r, pev, &n_bub[0], 7, G_EV_BUBBLES, 0, 0)
+    let i9: bool = try acc(r, pev, &n_can[0], 10, G_EV_CANCELABLE, 0, 0)
+    let i10: bool = try acc(r, pev, &n_dp[0], 16, G_EV_PREVENTED, 0, 0)
+
+    // --- location
+    let loc: Gc[DomObj] = try dom_obj(h, r, P_LOCATION, gc_null[Node](),
+        HK_LOCATION)
+    var lparts: [u8; 64] = "href    protocolhost    hostnameport    pathnamesearch  hash    "
+    var llen: [usize; 8] = [4, 8, 4, 8, 4, 8, 6, 4]
+    var loff: [usize; 8] = [0, 8, 16, 24, 32, 40, 48, 56]
+    var q: usize = 0
+    while q < 8 {
+        let lp: u64 = (&lparts[0]) as u64
+        let ok: bool = try acc(r, ploc, (lp + loff[q] as u64) as *mut u8,
+            llen[q], G_LOC_PART, 0, q as u64)
+        q = q + 1
+    }
+
+    // --- window and the global object
+    // THE WINDOW IS THE GLOBAL OBJECT. Not "a window object beside it":
+    // in a browser `window === globalThis`, and every library in the world
+    // relies on it -- `self.foo = bar` inside a module has to make `foo` a
+    // global variable. The official test harness does exactly that, and
+    // with a separate window object none of its tests can even start.
+    let g: Gc[JsObj] = val.realm_global(r)
+    let win: Gc[JsObj] = g
+    (*h).window = win
+    var n_st: [u8; 10] = "setTimeout"
+    var n_clt: [u8; 12] = "clearTimeout"
+    var n_si2: [u8; 11] = "setInterval"
+    var n_cli: [u8; 13] = "clearInterval"
+    let j1: bool = try nat(r, g, &n_st[0], 10, D_SET_TIMEOUT, 2)
+    let j2: bool = try nat(r, g, &n_clt[0], 12, D_CLEAR_TIMEOUT, 1)
+    let j3: bool = try nat(r, g, &n_si2[0], 11, D_SET_INTERVAL, 2)
+    let j4: bool = try nat(r, g, &n_cli[0], 13, D_CLEAR_INTERVAL, 1)
+    let j5: bool = try nat(r, g, &n_addl[0], 16, D_ADD_LISTENER, 2)
+    let j6: bool = try nat(r, g, &n_dell[0], 19, D_DEL_LISTENER, 2)
+    let j7: bool = try nat(r, g, &n_disp[0], 13, D_DISPATCH, 1)
+    // THE INTERFACE OBJECTS. `x instanceof Node` is a question about the
+    // prototype chain plus a global name; without these the answer is a
+    // ReferenceError, and a large part of the official suite asks it in
+    // its first line. Every one of them refuses to be called
+    // (`Illegal constructor`, WebIDL 3.7.1) except `Event`.
+    let i1c: bool = try iface(h, r, g, P_EVENTTARGET, 11)
+    let i2c: bool = try iface(h, r, g, P_NODE, 4)
+    let i3c: bool = try iface(h, r, g, P_ELEMENT, 7)
+    let i4c: bool = try iface(h, r, g, P_HTMLELEMENT, 11)
+    let i5c: bool = try iface(h, r, g, P_CHARDATA, 13)
+    let i6c: bool = try iface(h, r, g, P_TEXT, 4)
+    let i7c: bool = try iface(h, r, g, P_COMMENT, 7)
+    let i8c: bool = try iface(h, r, g, P_DOCUMENT, 8)
+    let i9c: bool = try iface(h, r, g, P_STYLE, 19)
+    let i10c: bool = try iface(h, r, g, P_CLASSLIST, 12)
+    var n_evc: [u8; 5] = "Event"
+    let evc: Gc[JsObj] = try interp.make_native(r, D_EVENT_CTOR, 1,
+        &n_evc[0], 5)
+    var n_proto: [u8; 9] = "prototype"
+    let pv: Gc[JsVal] = pev
+    let pk: bool = try put_obj(r, evc, &n_proto[0], 9, pv)
+    let evv: Gc[JsVal] = evc
+    let ec: bool = try put_obj(r, g, &n_evc[0], 5, evv)
+    let ev1c: bool = try event_constants(r, evc)
+    let ev2c: bool = try event_constants(r, pev)
+    let nd1: bool = try node_constants(r, gcvec_read[JsObj]((*h).protos,
+            P_NODE))
+    var n_win: [u8; 6] = "window"
+    var n_self: [u8; 4] = "self"
+    var n_doc2: [u8; 8] = "document"
+    var n_iw: [u8; 10] = "innerWidth"
+    var n_ih: [u8; 11] = "innerHeight"
+    var n_loc: [u8; 8] = "location"
+    let wv: Gc[JsVal] = win
+    let k1: bool = try put_obj(r, g, &n_win[0], 6, wv)
+    let k2: bool = try put_obj(r, g, &n_self[0], 4, wv)
+    let k3: bool = try acc(r, g, &n_doc2[0], 8, G_WIN_DOC, 0, 0)
+    let k4: bool = try acc(r, g, &n_iw[0], 10, G_WIN_W, 0, 0)
+    let k5: bool = try acc(r, g, &n_ih[0], 11, G_WIN_H, 0, 0)
+    let lv2: Gc[JsVal] = loc
+    let k6: bool = try put_obj(r, g, &n_loc[0], 8, lv2)
+    // ... and the same names on `window` itself, so `window.document`
+    // works as well as the bare `document`.
+    // The rest of the browsing context. Small, and none of it optional:
+    // the official test harness walks `while (w != w.parent) w = w.parent`
+    // to find the top window, and without `parent` pointing at the window
+    // itself that loop dereferences `undefined` on its second turn and no
+    // test in the suite ever starts. A top-level page has
+    // `parent === top === self` and `opener === null`; that is the whole
+    // truth for a browser without frames, and this one has none.
+    var n_wparent: [u8; 6] = "parent"
+    var n_top: [u8; 3] = "top"
+    var n_frames: [u8; 6] = "frames"
+    var n_opener: [u8; 6] = "opener"
+    var n_len2: [u8; 6] = "length"
+    var n_closed: [u8; 6] = "closed"
+    var n_name2: [u8; 4] = "name"
+    let p1: bool = try put_obj(r, g, &n_wparent[0], 6, wv)
+    let p2: bool = try put_obj(r, g, &n_top[0], 3, wv)
+    let p3: bool = try put_obj(r, g, &n_frames[0], 6, wv)
+    let p4: bool = try put_obj(r, g, &n_opener[0], 6, val.realm_null(r))
+    let zero: Gc[JsVal] = try val.realm_num(r, 0.0)
+    let p5: bool = try put_obj(r, g, &n_len2[0], 6, zero)
+    let p6: bool = try put_obj(r, g, &n_closed[0], 6, val.realm_bool(r, false))
+    var empty: [u8; 1] = " "
+    let es: Gc[JsVal] = try val.str_from_ascii(r, &empty[0], 0)
+    let p7: bool = try put_obj(r, g, &n_name2[0], 4, es)
+    // `P_WINDOW` stays in the table so the numbering does not shift, but
+    // nothing else uses it -- the window's members are on `g`.
+    return true
+}
+
+// ------------------------------------------------- The CSS property names
+//
+// ONE table of camelCase names. The dashed name is DERIVED, not stored:
+// the rule of CSSOM 6.7.2 is exactly "an upper case letter becomes a
+// hyphen and the lower case letter", so `backgroundColor` is
+// `background-color` and a second table would only be a second place to
+// get it wrong. `cssFloat` is the one exception the standard itself makes
+// (`float` was a reserved word), and it is handled where it occurs.
+const CSS_PROPS: usize = 50
+
+fn css_names() -> [u8; 437] {
+    var t: [u8; 437] = "colorbackgroundColorbackgroundwidthheightminWidthmaxWidthminHeightmaxHeightmarginmarginTopmarginRightmarginBottommarginLeftpaddingpaddingToppaddingRightpaddingBottompaddingLeftborderborderWidthborderStyleborderColordisplaypositiontoprightbottomleftcssFloatclearoverflowtextAlignverticalAlignwhiteSpacefontSizelineHeightzIndexopacityflexDirectionflexWrapflexGrowflexShrinkflexBasisjustifyContentalignItemsalignSelfboxSizingordervisibility"
+    return t
+}
+
+fn css_off(i: usize) -> usize {
+    var t: [usize; 50] = [0, 5, 20, 30, 35, 41, 49, 57, 66, 75, 81, 90, 101, 113, 123, 130, 140, 152, 165, 176, 182, 193, 204, 215, 222, 230, 233, 238, 244, 248, 256, 261, 269, 278, 291, 301, 309, 319, 325, 332, 345, 353, 361, 371, 380, 394, 404, 413, 422, 427]
+    return t[i]
+}
+
+fn css_len(i: usize) -> usize {
+    var t: [usize; 50] = [5, 15, 10, 5, 6, 8, 8, 9, 9, 6, 9, 11, 12, 10, 7, 10, 12, 13, 11, 6, 11, 11, 11, 7, 8, 3, 5, 6, 4, 8, 5, 8, 9, 13, 10, 8, 10, 6, 7, 13, 8, 8, 10, 9, 14, 10, 9, 9, 5, 10]
+    return t[i]
+}
+
+// The dashed name of property `i`, as code points.
+fn css_dashed(i: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var t: [u8; 437] = css_names()
+    let base: u64 = (&t[0]) as u64
+    let off: usize = css_off(i)
+    let n: usize = css_len(i)
+    var q: usize = 0
+    // `cssFloat` is the exception: the property is called `float`.
+    var lit_css: [u8; 3] = "css"
+    var is_css: bool = n > 3
+    if is_css {
+        var z: usize = 0
+        while z < 3 {
+            if *((base + (off + z) as u64) as *mut u8) != lit_css[z] {
+                is_css = false
+            }
+            z = z + 1
+        }
+    }
+    if is_css {
+        q = 3
+        mem.cp_push(out, (*((base + (off + 3) as u64) as *mut u8)) as u32 +
+            32 as u32)
+        q = 4
+    }
+    while q < n {
+        let c: u8 = *((base + (off + q) as u64) as *mut u8)
+        if c >= 65 as u8 && c <= 90 as u8 {
+            mem.cp_push(out, 45 as u32)
+            mem.cp_push(out, (c + 32 as u8) as u32)
+        } else {
+            mem.cp_push(out, c as u32)
+        }
+        q = q + 1
+    }
+}
+
+fn install_css_props(h: *mut Host, r: Gc[Realm],
+    pstyle: Gc[JsObj]) -> AllocError!bool {
+    var t: [u8; 437] = css_names()
+    let base: u64 = (&t[0]) as u64
+    var i: usize = 0
+    while i < CSS_PROPS {
+        let ok: bool = try acc(r, pstyle,
+            (base + css_off(i) as u64) as *mut u8, css_len(i),
+            G_STYLE_PROP, S_STYLE_PROP, i as u64)
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------ The inline declaration block
+//
+// `el.style` is the `style` ATTRIBUTE, read and written as text. That is
+// not a shortcut but the right shape for this round: the cascade parses
+// the attribute anyway (`cascade.parse_inline_declarations`), so a second,
+// parsed representation would be a second truth to keep in step. What it
+// costs is named: every read scans the attribute.
+
+fn style_attr_id(h: *mut Host) -> u32 {
+    var lit: [u8; 5] = "style"
+    return names.names_of_bytes((*h).nm, &lit[0], 5)
+}
+
+fn cp_eq_ci(a: *mut mem.CpBuf, ao: usize, an: usize,
+    b: *mut mem.CpBuf) -> bool {
+    if an != mem.cp_len(b) {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        var x: u32 = mem.cp_at(a, ao + i)
+        var y: u32 = mem.cp_at(b, i)
+        if x >= 65 as u32 && x <= 90 as u32 {
+            x = x + 32 as u32
+        }
+        if y >= 65 as u32 && y <= 90 as u32 {
+            y = y + 32 as u32
+        }
+        if x != y {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_sp(c: u32) -> bool {
+    return c == 32 as u32 || c == 9 as u32 || c == 10 as u32 ||
+    c == 13 as u32 || c == 12 as u32
+}
+
+// Reads the value of `want` out of the declaration text in `decl`.
+// `*found` says whether it was there at all.
+fn decl_get(decl: *mut mem.CpBuf, want: *mut mem.CpBuf,
+    out: *mut mem.CpBuf, found: *mut bool) {
+    *found = false
+    mem.cp_clear(out)
+    let n: usize = mem.cp_len(decl)
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && mem.cp_at(decl, e) != 59 as u32 {
+            e = e + 1
+        }
+        var s: usize = i
+        while s < e && is_sp(mem.cp_at(decl, s)) {
+            s = s + 1
+        }
+        var c: usize = e
+        var q: usize = s
+        while q < e {
+            if mem.cp_at(decl, q) == 58 as u32 {
+                c = q
+                break
+            }
+            q = q + 1
+        }
+        if c < e {
+            var ne: usize = c
+            while ne > s && is_sp(mem.cp_at(decl, ne - 1)) {
+                ne = ne - 1
+            }
+            if cp_eq_ci(decl, s, ne - s, want) {
+                var vs: usize = c + 1
+                var ve: usize = e
+                while vs < ve && is_sp(mem.cp_at(decl, vs)) {
+                    vs = vs + 1
+                }
+                while ve > vs && is_sp(mem.cp_at(decl, ve - 1)) {
+                    ve = ve - 1
+                }
+                mem.cp_clear(out)
+                var w: usize = vs
+                while w < ve {
+                    mem.cp_push(out, mem.cp_at(decl, w))
+                    w = w + 1
+                }
+                *found = true
+                // The LAST declaration wins, as in the cascade.
+            }
+        }
+        i = e + 1
+    }
+}
+
+// Writes `want: value` into `decl`, replacing what was there. An empty
+// value removes the declaration.
+fn decl_set(decl: *mut mem.CpBuf, want: *mut mem.CpBuf,
+    value: *mut mem.CpBuf, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    let n: usize = mem.cp_len(decl)
+    var i: usize = 0
+    var wrote: bool = false
+    while i < n {
+        var e: usize = i
+        while e < n && mem.cp_at(decl, e) != 59 as u32 {
+            e = e + 1
+        }
+        var s: usize = i
+        while s < e && is_sp(mem.cp_at(decl, s)) {
+            s = s + 1
+        }
+        var c: usize = e
+        var q: usize = s
+        while q < e {
+            if mem.cp_at(decl, q) == 58 as u32 {
+                c = q
+                break
+            }
+            q = q + 1
+        }
+        var keep: bool = true
+        if c < e {
+            var ne: usize = c
+            while ne > s && is_sp(mem.cp_at(decl, ne - 1)) {
+                ne = ne - 1
+            }
+            if cp_eq_ci(decl, s, ne - s, want) {
+                keep = false
+                if !wrote && mem.cp_len(value) > 0 {
+                    decl_emit(out, want, value)
+                    wrote = true
+                }
+            }
+        }
+        if keep && e > s {
+            if mem.cp_len(out) > 0 {
+                mem.cp_push(out, 59 as u32)
+                mem.cp_push(out, 32 as u32)
+            }
+            var w: usize = s
+            var ee: usize = e
+            while ee > s && is_sp(mem.cp_at(decl, ee - 1)) {
+                ee = ee - 1
+            }
+            while w < ee {
+                mem.cp_push(out, mem.cp_at(decl, w))
+                w = w + 1
+            }
+        }
+        i = e + 1
+    }
+    if !wrote && mem.cp_len(value) > 0 {
+        decl_emit(out, want, value)
+    }
+}
+
+fn decl_emit(out: *mut mem.CpBuf, want: *mut mem.CpBuf,
+    value: *mut mem.CpBuf) {
+    if mem.cp_len(out) > 0 {
+        mem.cp_push(out, 59 as u32)
+        mem.cp_push(out, 32 as u32)
+    }
+    var i: usize = 0
+    while i < mem.cp_len(want) {
+        mem.cp_push(out, mem.cp_at(want, i))
+        i = i + 1
+    }
+    mem.cp_push(out, 58 as u32)
+    mem.cp_push(out, 32 as u32)
+    i = 0
+    while i < mem.cp_len(value) {
+        mem.cp_push(out, mem.cp_at(value, i))
+        i = i + 1
+    }
+}
+
+fn attr_to_cp(e: Gc[Elem], id: u32, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    let v: Gc[Chain] = node.attr_value(e, id, 0)
+    if v != gc_null[Chain]() {
+        node.chain_after_cpbuf(v, out)
+    }
+}
+
+fn set_attr_cp(e: Gc[Elem], id: u32, v: *mut mem.CpBuf) -> AllocError!bool {
+    return try api.dom_attr_set_text(e, id, 0, 0, v)
+}
+
+// ------------------------------------------------------------- The marks
+
+fn mark_style(h: *mut Host, k: Gc[Node]) {
+    if (*h).lv as u64 != 0 {
+        live.live_mark_style((*h).lv, k)
+    }
+}
+
+fn mark_text(h: *mut Host, k: Gc[Node]) {
+    if (*h).lv as u64 != 0 {
+        live.live_mark_text((*h).lv, k)
+    }
+}
+
+fn mark_children(h: *mut Host, k: Gc[Node]) {
+    if (*h).lv as u64 != 0 {
+        live.live_mark_children((*h).lv, k)
+    }
+}
+
+// ========================================================== The dispatcher
+
+fn dom_arity(id: u64) -> u32 {
+    return 1
+}
+
+// The chain is: `builtin.native_dispatch` -> here -> `gen.gen_native`.
+// Everything this file does not own goes back to round 66 untouched, so
+// neither of the two older files had to learn about this one.
+fn dom_native(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
+    nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    if id < DOM_BASE {
+        return gen.gen_native(r, id, this, args, nt)
+    }
+    let h: *mut Host = host_of(r)
+    if h as u64 == 0 {
+        var m: [u8; 24] = "no DOM in this realm    "
+        return type_err(r, &m[0], 20)
+    }
+    if id < 40020 as u64 {
+        return document_fn(h, r, id, this, args)
+    }
+    if id < 40040 as u64 {
+        return node_fn(h, r, id, this, args)
+    }
+    if id < 40050 as u64 {
+        return attr_fn(h, r, id, this, args)
+    }
+    if id < 40100 as u64 {
+        return mixin_fn(h, r, id, this, args)
+    }
+    if id < 40300 as u64 {
+        return prop_fn(h, r, id, this, args)
+    }
+    if id < 40400 as u64 {
+        return event_fn(h, r, id, this, args)
+    }
+    if id < 40500 as u64 {
+        return timer_fn(h, r, id, this, args)
+    }
+    if id < 40600 as u64 {
+        return style_fn(h, r, id, this, args)
+    }
+    if id < 40700 as u64 {
+        return classlist_fn(h, r, id, this, args)
+    }
+    return window_fn(h, r, id, this, args)
+}
+
+// ------------------------------------------------------------- Selectors
+
+fn parse_selector(h: *mut Host, cp: *mut mem.CpBuf) -> AllocError!Gc[Sel] {
+    tok.tokenize(&(*h).t, cp)
+    var p: cv.Parser = cv.parser_new(&(*h).t)
+    let list = try cv.parse_component_value_list(&p)
+    if list == gc_null[Cv]() {
+        return gc_null[Sel]()
+    }
+    return try sel.sel_parse(list, (*h).nm, &(*h).tmp2)
+}
+
+// --------------------------------------------------------------- Document
+
+fn doc_root(h: *mut Host) -> Gc[Node] {
+    var c: Gc[Node] = (*h).doc
+    if c == gc_null[Node]() {
+        return gc_null[Node]()
+    }
+    var k: Gc[Node] = c.first_child
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            return k
+        }
+        k = k.next
+    }
+    return gc_null[Node]()
+}
+
+fn doc_body(h: *mut Host) -> Gc[Node] {
+    let root: Gc[Node] = doc_root(h)
+    if root == gc_null[Node]() {
+        return gc_null[Node]()
+    }
+    var k: Gc[Node] = root.first_child
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            let e: Gc[Elem] = node.node_as_elem(k)
+            if e.ns == node.NS_HTML && (e.name == tag.M_BODY ||
+                e.name == tag.M_FRAMESET) {
+                return k
+            }
+        }
+        k = k.next
+    }
+    return gc_null[Node]()
+}
+
+fn document_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let doc: Gc[Node] = (*h).doc
+    if id == D_GET_BY_ID {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        var lit: [u8; 2] = "id"
+        let idatom: u32 = names.names_of_bytes((*h).nm, &lit[0], 2)
+        let e: Gc[Elem] = api.dom_by_id(doc, idatom, &(*h).tmp)
+        let k: Gc[Node] = e
+        return try wrap_node(h, r, k)
+    }
+    if id == D_QUERY || id == D_QUERY_ALL {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        let s: Gc[Sel] = try parse_selector(h, &(*h).tmp)
+        if id == D_QUERY {
+            let e: Gc[Elem] = api.dom_query(doc, s, &(*h).cx)
+            let k: Gc[Node] = e
+            return try wrap_node(h, r, k)
+        }
+        let v = try api.dom_query_all(doc, s, &(*h).cx)
+        return try nodes_to_array(h, r, v)
+    }
+    if id == D_CREATE_ELEM_NS {
+        // The namespace is READ and kept: an element made in the SVG
+        // namespace is not an HTML element, and the cascade and the tree
+        // construction both ask. Only the three namespaces the parser
+        // knows are mapped; anything else lands in HTML, which is what a
+        // browser does for an unknown one in this API.
+        let okn: bool = try arg_str(r, args, 0, &(*h).tmp2)
+        let ok: bool = try arg_str(r, args, 1, &(*h).tmp)
+        cp_lower(&(*h).tmp)
+        let nid: u32 = names.names_of_cp((*h).nm, &(*h).tmp)
+        var ns: u32 = node.NS_HTML
+        var l_svg: [u8; 27] = "http://www.w3.org/2000/svg "
+        var l_math: [u8; 34] = "http://www.w3.org/1998/Math/MathML"
+        if cp_eq_ascii(&(*h).tmp2, (&l_svg[0]) as u64, 26) {
+            ns = node.NS_SVG
+        } else if cp_eq_ascii(&(*h).tmp2, (&l_math[0]) as u64, 34) {
+            ns = node.NS_MATHML
+        }
+        let e = try node.elem_new(nid, ns)
+        let k: Gc[Node] = e
+        return try wrap_node(h, r, k)
+    }
+    if id == D_CREATE_ELEM {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        cp_lower(&(*h).tmp)
+        let nid: u32 = names.names_of_cp((*h).nm, &(*h).tmp)
+        let e = try node.elem_new(nid, node.NS_HTML)
+        let k: Gc[Node] = e
+        return try wrap_node(h, r, k)
+    }
+    if id == D_CREATE_TEXT || id == D_CREATE_COMMENT {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        let c = try node.chain_new()
+        var i: usize = 0
+        while i < mem.cp_len(&(*h).tmp) {
+            let ok2: bool = try node.chain_push(c, mem.cp_at(&(*h).tmp, i))
+            i = i + 1
+        }
+        if id == D_CREATE_TEXT {
+            let t = try node.text_new(c)
+            let k: Gc[Node] = t
+            return try wrap_node(h, r, k)
+        }
+        let cm = try node.comment_new(c)
+        let k2: Gc[Node] = cm
+        return try wrap_node(h, r, k2)
+    }
+    if id == D_CREATE_EVENT {
+        // The legacy factory (DOM 4.5.11). It is deprecated and the
+        // official suite still uses it in dozens of places, so it is
+        // here; the event it makes is UNINITIALISED until `initEvent`.
+        let e: Gc[DomObj] = try dom_obj(h, r, P_EVENT, gc_null[Node](),
+            HK_EVENT)
+        var empty: [u8; 1] = " "
+        e.prim = try val.str_from_ascii(r, &empty[0], 0)
+        e.node = 0
+        let out: Gc[JsVal] = e
+        return out
+    }
+    if id == D_BY_TAG {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        cp_lower(&(*h).tmp)
+        let nid: u32 = names.names_of_cp((*h).nm, &(*h).tmp)
+        let v = try api.dom_by_tag(doc, nid)
+        return try nodes_to_array(h, r, v)
+    }
+    if id == D_BY_CLASS {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        var lit: [u8; 5] = "class"
+        let ca: u32 = names.names_of_bytes((*h).nm, &lit[0], 5)
+        let v = try api.dom_by_class(doc, ca, &(*h).tmp)
+        return try nodes_to_array(h, r, v)
+    }
+    return val.realm_undefined(r)
+}
+
+// Inserts `kid` -- or, when it is a fragment, all of its children -- into
+// `parent` before `ref_`.
+fn insert_all(parent: Gc[Node], kid: Gc[Node], ref_: Gc[Node]) {
+    if kid == gc_null[Node]() {
+        return
+    }
+    if kid.kind != node.K_FRAGMENT {
+        node.kind_insert_before(parent, kid, ref_)
+        return
+    }
+    while kid.first_child != gc_null[Node]() {
+        let c: Gc[Node] = kid.first_child
+        node.kind_remove(c)
+        node.kind_insert_before(parent, c, ref_)
+    }
+}
+
+fn cp_eq_lower(b: *mut mem.CpBuf, p: u64, n: usize) -> bool {
+    if mem.cp_len(b) != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        var x: u32 = mem.cp_at(b, i)
+        if x >= 65 as u32 && x <= 90 as u32 {
+            x = x + 32 as u32
+        }
+        if x != (*((p + i as u64) as *mut u8)) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The node type constants of DOM 4.4, on a prototype or a constructor.
+// They are not decoration: half of `dom/nodes/` compares
+// `node.nodeType` against `Node.TEXT_NODE` rather than against 3.
+fn node_constants(r: Gc[Realm], target: Gc[JsObj]) -> AllocError!bool {
+    var t: [u8; 158] = "ELEMENT_NODEATTRIBUTE_NODETEXT_NODECDATA_SECTION_NODEPROCESSING_INSTRUCTION_NODECOMMENT_NODEDOCUMENT_NODEDOCUMENT_TYPE_NODEDOCUMENT_FRAGMENT_NODENOTATION_NODE"
+    var offs: [usize; 10] = [0, 12, 26, 35, 53, 80, 92, 105, 123, 145]
+    var lens: [usize; 10] = [12, 14, 9, 18, 27, 12, 13, 18, 22, 13]
+    var vals: [f64; 10] = [1.0, 2.0, 3.0, 4.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    let b: u64 = (&t[0]) as u64
+    var i: usize = 0
+    while i < 10 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r,
+            (b + offs[i] as u64) as *mut u8, lens[i])
+        let k: u64 = try val.key_for_str(r, s)
+        let v: Gc[JsVal] = try val.realm_num(r, vals[i])
+        let ok: bool = try interp.define_value(r, target, k, v, 0)
+        i = i + 1
+    }
+    return true
+}
+
+// The event phase constants of DOM 2.2.
+fn event_constants(r: Gc[Realm], target: Gc[JsObj]) -> AllocError!bool {
+    var t: [u8; 39] = "NONECAPTURING_PHASEAT_TARGETBUBBLING_PH"
+    var t2: [u8; 4] = "ASE "
+    var offs: [usize; 3] = [0, 4, 19]
+    var lens: [usize; 3] = [4, 15, 9]
+    var vals: [f64; 3] = [0.0, 1.0, 2.0]
+    let b: u64 = (&t[0]) as u64
+    var i: usize = 0
+    while i < 3 {
+        let s: Gc[JsVal] = try val.str_from_ascii(r,
+            (b + offs[i] as u64) as *mut u8, lens[i])
+        let k: u64 = try val.key_for_str(r, s)
+        let v: Gc[JsVal] = try val.realm_num(r, vals[i])
+        let ok: bool = try interp.define_value(r, target, k, v, 0)
+        i = i + 1
+    }
+    var bp: [u8; 14] = "BUBBLING_PHASE"
+    let s2: Gc[JsVal] = try val.str_from_ascii(r, &bp[0], 14)
+    let k2: u64 = try val.key_for_str(r, s2)
+    let v2: Gc[JsVal] = try val.realm_num(r, 3.0)
+    let ok2: bool = try interp.define_value(r, target, k2, v2, 0)
+    return true
+}
+
+fn cp_eq_ascii(b: *mut mem.CpBuf, p: u64, n: usize) -> bool {
+    if mem.cp_len(b) != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if mem.cp_at(b, i) != (*((p + i as u64) as *mut u8)) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn cp_lower(b: *mut mem.CpBuf) {
+    var i: usize = 0
+    let n: usize = mem.cp_len(b)
+    while i < n {
+        let c: u32 = mem.cp_at(b, i)
+        if c >= 65 as u32 && c <= 90 as u32 {
+            mem.cp_set(b, i, c + 32 as u32)
+        }
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------- Node
+
+// Is `k` an ancestor of `x` (or the same node)? A tree may not be made
+// into a cycle, and `appendChild(myOwnAncestor)` is exactly how it would
+// happen (DOM 4.2.3, "pre-insert validity").
+fn is_ancestor(k: Gc[Node], x: Gc[Node]) -> bool {
+    var c: Gc[Node] = x
+    while c != gc_null[Node]() {
+        if c == k {
+            return true
+        }
+        c = c.parent
+    }
+    return false
+}
+
+fn hierarchy_err(r: Gc[Realm]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 32] = "the new child contains the paren"
+    return type_err(r, &m[0], 31)
+}
+
+fn node_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let me: Gc[Node] = node_of(this)
+    if me == gc_null[Node]() {
+        return try not_a_node(r)
+    }
+    if id == D_APPEND || id == D_INSERT_BEFORE || id == D_REPLACE_CHILD {
+        let kid: Gc[Node] = node_of(arg(r, args, 0))
+        if kid == gc_null[Node]() {
+            return try not_a_node(r)
+        }
+        if is_ancestor(kid, me) {
+            return try hierarchy_err(r)
+        }
+        let old_parent: Gc[Node] = kid.parent
+        if id == D_APPEND {
+            node.append_child(me, kid)
+        } else if id == D_INSERT_BEFORE {
+            let ref_: Gc[Node] = node_of(arg(r, args, 1))
+            node.kind_insert_before(me, kid, ref_)
+        } else {
+            let old: Gc[Node] = node_of(arg(r, args, 1))
+            if old == gc_null[Node]() || old.parent != me {
+                return try not_a_node(r)
+            }
+            node.kind_insert_before(me, kid, old)
+            node.kind_remove(old)
+        }
+        if old_parent != gc_null[Node]() && old_parent != me {
+            mark_children(h, old_parent)
+        }
+        mark_children(h, me)
+        return arg(r, args, 0)
+    }
+    if id == D_REMOVE_CHILD {
+        let kid: Gc[Node] = node_of(arg(r, args, 0))
+        if kid == gc_null[Node]() || kid.parent != me {
+            return try not_a_node(r)
+        }
+        node.kind_remove(kid)
+        mark_children(h, me)
+        return arg(r, args, 0)
+    }
+    if id == D_REMOVE {
+        let p: Gc[Node] = me.parent
+        if p != gc_null[Node]() {
+            node.kind_remove(me)
+            mark_children(h, p)
+        }
+        return val.realm_undefined(r)
+    }
+    if id == D_CONTAINS {
+        let other: Gc[Node] = node_of(arg(r, args, 0))
+        return val.realm_bool(r, is_ancestor(me, other))
+    }
+    if id == D_HAS_CHILDREN {
+        return val.realm_bool(r, me.first_child != gc_null[Node]())
+    }
+    if id == D_CLONE {
+        var deep: bool = false
+        if gcvec_length(args) > 0 {
+            deep = interp.to_boolean(r, arg(r, args, 0))
+        }
+        let c = try clone_node(h, me, deep)
+        return try wrap_node(h, r, c)
+    }
+    if id == D_EL_QUERY || id == D_EL_QUERY_ALL || id == D_MATCHES ||
+    id == D_CLOSEST {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        let s: Gc[Sel] = try parse_selector(h, &(*h).tmp)
+        if id == D_MATCHES {
+            return val.realm_bool(r, s != gc_null[Sel]() &&
+                sel.sel_matches(s, me, &(*h).cx))
+        }
+        if id == D_CLOSEST {
+            var c: Gc[Node] = me
+            while c != gc_null[Node]() {
+                if c.kind == node.K_ELEM && s != gc_null[Sel]() &&
+                sel.sel_matches(s, c, &(*h).cx) {
+                    return try wrap_node(h, r, c)
+                }
+                c = c.parent
+            }
+            return val.realm_null(r)
+        }
+        if id == D_EL_QUERY {
+            let e: Gc[Elem] = api.dom_query(me, s, &(*h).cx)
+            let k: Gc[Node] = e
+            return try wrap_node(h, r, k)
+        }
+        let v = try api.dom_query_all(me, s, &(*h).cx)
+        return try nodes_to_array(h, r, v)
+    }
+    if id == D_EL_BY_TAG {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        cp_lower(&(*h).tmp)
+        let nid: u32 = names.names_of_cp((*h).nm, &(*h).tmp)
+        let v = try api.dom_by_tag(me, nid)
+        return try nodes_to_array(h, r, v)
+    }
+    if id == D_EL_BY_CLASS {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        var lit: [u8; 5] = "class"
+        let ca: u32 = names.names_of_bytes((*h).nm, &lit[0], 5)
+        let v = try api.dom_by_class(me, ca, &(*h).tmp)
+        return try nodes_to_array(h, r, v)
+    }
+    return val.realm_undefined(r)
+}
+
+fn clone_node(h: *mut Host, k: Gc[Node], deep: bool) -> AllocError!Gc[Node] {
+    var out: Gc[Node] = gc_null[Node]()
+    if k.kind == node.K_ELEM {
+        let e: Gc[Elem] = node.node_as_elem(k)
+        let c = try node.elem_new(e.name, e.ns)
+        var a: Gc[Attr] = e.first_attr
+        while a != gc_null[Attr]() {
+            let ok: bool = try node.attr_set_full(c, a.name, a.ns, a.prefix,
+                a.value)
+            a = a.next
+        }
+        out = c
+    } else if k.kind == node.K_TEXT {
+        let t: Gc[Text] = k as Gc[Text]
+        let c = try node.text_new(t.data)
+        out = c
+    } else if k.kind == node.K_COMMENT {
+        let t: Gc[Comment] = k as Gc[Comment]
+        let c = try node.comment_new(t.data)
+        out = c
+    } else {
+        let c = try node.fragment_new(0)
+        out = c
+    }
+    if deep {
+        var ch: Gc[Node] = k.first_child
+        while ch != gc_null[Node]() {
+            let cc = try clone_node(h, ch, true)
+            node.append_child(out, cc)
+            ch = ch.next
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------------- Attributes
+
+fn attr_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let e: Gc[Elem] = elem_of(this)
+    if e == gc_null[Elem]() {
+        return try not_a_node(r)
+    }
+    let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+    cp_lower(&(*h).tmp)
+    let a: u32 = names.names_of_cp((*h).nm, &(*h).tmp)
+    if id == D_GET_ATTR {
+        let v: Gc[Chain] = node.attr_value(e, a, 0)
+        if v == gc_null[Chain]() {
+            return val.realm_null(r)
+        }
+        return try chain_to_js(r, v, &(*h).tmp2)
+    }
+    if id == D_HAS_ATTR {
+        return val.realm_bool(r, node.attr_find(e, a, 0) != gc_null[Attr]())
+    }
+    if id == D_SET_ATTR {
+        let ok2: bool = try arg_str(r, args, 1, &(*h).tmp2)
+        let ok3: bool = try set_attr_cp(e, a, &(*h).tmp2)
+        mark_style(h, e)
+        return val.realm_undefined(r)
+    }
+    if id == D_DEL_ATTR {
+        let gone: bool = api.dom_attr_remove(e, a, 0)
+        if gone {
+            mark_style(h, e)
+        }
+        return val.realm_undefined(r)
+    }
+    if id == D_TOGGLE_ATTR {
+        // DOM 4.9: with no second argument it flips, with one it forces.
+        let present: bool = node.attr_find(e, a, 0) != gc_null[Attr]()
+        var want: bool = !present
+        if gcvec_length(args) > 1 {
+            want = interp.to_boolean(r, arg(r, args, 1))
+        }
+        if want && !present {
+            mem.cp_clear(&(*h).tmp2)
+            let okt: bool = try set_attr_cp(e, a, &(*h).tmp2)
+            mark_style(h, e)
+        } else if !want && present {
+            let gone: bool = api.dom_attr_remove(e, a, 0)
+            mark_style(h, e)
+        }
+        return val.realm_bool(r, want)
+    }
+    if id == D_INS_TEXT || id == D_INS_HTML || id == D_INS_ELEM {
+        // `beforebegin`, `afterbegin`, `beforeend`, `afterend`
+        // (DOM Parsing 3.2). The official harness writes its log with
+        // `insertAdjacentText`, so without this NOT ONE test in the
+        // suite reports a result.
+        var where: u32 = 2
+        var l_bb: [u8; 11] = "beforebegin"
+        var l_ab: [u8; 10] = "afterbegin"
+        var l_be: [u8; 9] = "beforeend"
+        var l_ae: [u8; 8] = "afterend"
+        if cp_eq_lower(&(*h).tmp, (&l_bb[0]) as u64, 11) {
+            where = 0
+        } else if cp_eq_lower(&(*h).tmp, (&l_ab[0]) as u64, 10) {
+            where = 1
+        } else if cp_eq_lower(&(*h).tmp, (&l_be[0]) as u64, 9) {
+            where = 2
+        } else if cp_eq_lower(&(*h).tmp, (&l_ae[0]) as u64, 8) {
+            where = 3
+        } else {
+            var m: [u8; 24] = "an unknown position     "
+            return type_err(r, &m[0], 19)
+        }
+        var kid: Gc[Node] = gc_null[Node]()
+        if id == D_INS_ELEM {
+            kid = node_of(arg(r, args, 1))
+            if kid == gc_null[Node]() {
+                return try not_a_node(r)
+            }
+        } else if id == D_INS_TEXT {
+            let ok2: bool = try arg_str(r, args, 1, &(*h).tmp2)
+            let c = try node.chain_new()
+            var q: usize = 0
+            while q < mem.cp_len(&(*h).tmp2) {
+                let ok3: bool = try node.chain_push(c,
+                    mem.cp_at(&(*h).tmp2, q))
+                q = q + 1
+            }
+            let t = try node.text_new(c)
+            kid = t
+        } else {
+            // `insertAdjacentHTML` parses a fragment in the context of the
+            // element (or of its parent, for the two outer positions).
+            var holder: Gc[Node] = e
+            if where == 0 as u32 || where == 3 as u32 {
+                holder = e.parent
+            }
+            if holder == gc_null[Node]() || holder.kind != node.K_ELEM {
+                return val.realm_undefined(r)
+            }
+            let f = try parse_fragment(h, r, holder, arg(r, args, 1))
+            kid = f
+        }
+        let parent: Gc[Node] = e.parent
+        if where == 0 as u32 {
+            if parent != gc_null[Node]() {
+                insert_all(parent, kid, e)
+                mark_children(h, parent)
+            }
+        } else if where == 1 as u32 {
+            insert_all(e, kid, e.first_child)
+            mark_children(h, e)
+        } else if where == 2 as u32 {
+            insert_all(e, kid, gc_null[Node]())
+            mark_children(h, e)
+        } else {
+            if parent != gc_null[Node]() {
+                insert_all(parent, kid, e.next)
+                mark_children(h, parent)
+            }
+        }
+        return val.realm_undefined(r)
+    }
+    if id == D_ATTR_NAMES {
+        let arr: Gc[JsObj] = try val.array_new(r)
+        var x: Gc[Attr] = e.first_attr
+        var n: u64 = 0
+        while x != gc_null[Attr]() {
+            let s: Gc[JsVal] = try name_to_js(r, (*h).nm, x.name, &(*h).tmp2)
+            let ok4: bool = try val.elems_push(r, arr, s)
+            n = n + 1
+            x = x.next
+        }
+        let okl: bool = try val.array_set_length(r, arr, n)
+        let out: Gc[JsVal] = arr
+        return out
+    }
+    return val.realm_undefined(r)
+}
+
+// ------------------------------------------------------- The accessors
+
+fn kids_array(h: *mut Host, r: Gc[Realm], k: Gc[Node],
+    only_elems: bool) -> AllocError!Gc[JsVal] {
+    let arr: Gc[JsObj] = try val.array_new(r)
+    var c: Gc[Node] = k.first_child
+    var n: u64 = 0
+    while c != gc_null[Node]() {
+        if !only_elems || c.kind == node.K_ELEM {
+            let w: Gc[JsVal] = try wrap_node(h, r, c)
+            let ok: bool = try val.elems_push(r, arr, w)
+            n = n + 1
+        }
+        c = c.next
+    }
+    let okl: bool = try val.array_set_length(r, arr, n)
+    let out: Gc[JsVal] = arr
+    return out
+}
+
+fn set_text_content(h: *mut Host, r: Gc[Realm], k: Gc[Node],
+    v: Gc[JsVal]) -> AllocError!bool {
+    let s: Gc[JsVal] = try interp.to_string(r, v)
+    js_to_cp(s, &(*h).tmp)
+    if k.kind == node.K_TEXT || k.kind == node.K_COMMENT {
+        let c = try node.chain_new()
+        var i: usize = 0
+        while i < mem.cp_len(&(*h).tmp) {
+            let ok: bool = try node.chain_push(c, mem.cp_at(&(*h).tmp, i))
+            i = i + 1
+        }
+        if k.kind == node.K_TEXT {
+            let t: Gc[Text] = k as Gc[Text]
+            t.data = c
+        } else {
+            let t2: Gc[Comment] = k as Gc[Comment]
+            t2.data = c
+        }
+        mark_text(h, k)
+        return true
+    }
+    // every child gone, one text node in their place (DOM 4.4)
+    while k.first_child != gc_null[Node]() {
+        node.kind_remove(k.first_child)
+    }
+    if mem.cp_len(&(*h).tmp) > 0 {
+        let c = try node.chain_new()
+        var i: usize = 0
+        while i < mem.cp_len(&(*h).tmp) {
+            let ok: bool = try node.chain_push(c, mem.cp_at(&(*h).tmp, i))
+            i = i + 1
+        }
+        let t = try node.text_new(c)
+        node.append_child(k, t)
+    }
+    mark_children(h, k)
+    return true
+}
+
+// `innerHTML =` -- the FRAGMENT PARSING ALGORITHM (WHATWG 13.4). It is not
+// "parse a document and take the body": the context element decides the
+// insertion mode, so `<td>` inside a `table` context stays a `td` and
+// inside a `div` context does not.
+fn set_inner_html(h: *mut Host, r: Gc[Realm], k: Gc[Node],
+    v: Gc[JsVal]) -> AllocError!bool {
+    if k.kind != node.K_ELEM {
+        return false
+    }
+    let f = try parse_fragment(h, r, k, v)
+    while k.first_child != gc_null[Node]() {
+        node.kind_remove(k.first_child)
+    }
+    if f != gc_null[Node]() {
+        while f.first_child != gc_null[Node]() {
+            let c: Gc[Node] = f.first_child
+            node.kind_remove(c)
+            node.append_child(k, c)
+        }
+    }
+    mark_children(h, k)
+    return true
+}
+
+// The FRAGMENT PARSING ALGORITHM (WHATWG 13.4), in the context of
+// `holder`. It is not "parse a document and take the body": the context
+// element decides the insertion mode, so a `<td>` inside a `table`
+// context stays a `td` and inside a `div` context does not.
+fn parse_fragment(h: *mut Host, r: Gc[Realm], holder: Gc[Node],
+    v: Gc[JsVal]) -> AllocError!Gc[Node] {
+    let out = try node.fragment_new(0)
+    if (*h).frag as u64 == 0 || holder == gc_null[Node]() ||
+    holder.kind != node.K_ELEM {
+        return out
+    }
+    let s: Gc[JsVal] = try interp.to_string(r, v)
+    js_to_cp(s, &(*h).tmp)
+    mem.buf_clear(&(*h).buf)
+    var i: usize = 0
+    while i < mem.cp_len(&(*h).tmp) {
+        write.cp_after_buf(&(*h).buf, mem.cp_at(&(*h).tmp, i))
+        i = i + 1
+    }
+    let e: Gc[Elem] = node.node_as_elem(holder)
+    mem.cp_clear(&(*h).tmp2)
+    names.names_after_cpbuf((*h).nm, e.name, &(*h).tmp2)
+    var ctx: mem.Buf = mem.buf_new()
+    mem.buf_init(&ctx)
+    var q: usize = 0
+    while q < mem.cp_len(&(*h).tmp2) {
+        write.cp_after_buf(&ctx, mem.cp_at(&(*h).tmp2, q))
+        q = q + 1
+    }
+    driver.run_context_out_bytes((*h).frag, mem.buf_ptr(&ctx),
+        mem.buf_len(&ctx))
+    driver.run_text_out_bytes((*h).frag, mem.buf_ptr(&(*h).buf),
+        mem.buf_len(&(*h).buf))
+    let rc: u32 = driver.run_document_build((*h).frag)
+    mem.buf_free(&ctx)
+    if rc == 0 as u32 {
+        let root: Gc[Node] = driver.run_root((*h).frag)
+        if root != gc_null[Node]() {
+            while root.first_child != gc_null[Node]() {
+                let c: Gc[Node] = root.first_child
+                node.kind_remove(c)
+                node.append_child(out, c)
+            }
+        }
+    }
+    // the fragment parser lets go of its tree, or it holds it for ever
+    driver.run_context_out_bytes((*h).frag, 0 as *mut u8, 0)
+    return out
+}
+
+fn prop_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    // The window has no node; its accessors are answered elsewhere.
+    let d: Gc[DomObj] = as_dom(this)
+    if d == gc_null[DomObj]() {
+        return try not_a_node(r)
+    }
+    let me: Gc[Node] = d.k
+    if id == G_DOC_BODY {
+        return try wrap_node(h, r, doc_body(h))
+    }
+    if id == G_DOC_ROOT {
+        return try wrap_node(h, r, doc_root(h))
+    }
+    if id == G_DOC_HEAD {
+        let root: Gc[Node] = doc_root(h)
+        if root != gc_null[Node]() {
+            var c: Gc[Node] = root.first_child
+            while c != gc_null[Node]() {
+                if c.kind == node.K_ELEM {
+                    let e2: Gc[Elem] = node.node_as_elem(c)
+                    if e2.ns == node.NS_HTML && e2.name == tag.M_HEAD {
+                        return try wrap_node(h, r, c)
+                    }
+                }
+                c = c.next
+            }
+        }
+        return val.realm_null(r)
+    }
+    if id == G_DOC_READY {
+        // The document is always finished by the time a script of this
+        // round runs: the parse is over before the first one starts.
+        var rs: [u8; 8] = "complete"
+        return try ascii_js(r, &rs[0], 8)
+    }
+    if me == gc_null[Node]() {
+        return val.realm_undefined(r)
+    }
+    if id == G_NODE_TYPE {
+        return try val.realm_num(r, dom_node_type(me) as f64)
+    }
+    if id == G_NODE_NAME || id == G_TAG_NAME {
+        if me.kind == node.K_ELEM {
+            let e: Gc[Elem] = node.node_as_elem(me)
+            mem.cp_clear(&(*h).tmp)
+            names.names_after_cpbuf((*h).nm, e.name, &(*h).tmp)
+            if e.ns == node.NS_HTML {
+                cp_upper(&(*h).tmp)
+            }
+            return try cp_to_js(r, &(*h).tmp)
+        }
+        if id == G_TAG_NAME {
+            return val.realm_undefined(r)
+        }
+        return try special_name(r, me)
+    }
+    if id == G_PARENT {
+        return try wrap_node(h, r, me.parent)
+    }
+    if id == G_PARENT_ELEM {
+        let p: Gc[Node] = me.parent
+        if p != gc_null[Node]() && p.kind == node.K_ELEM {
+            return try wrap_node(h, r, p)
+        }
+        return val.realm_null(r)
+    }
+    if id == G_FIRST_CHILD {
+        return try wrap_node(h, r, me.first_child)
+    }
+    if id == G_LAST_CHILD {
+        return try wrap_node(h, r, me.last_child)
+    }
+    if id == G_NEXT {
+        return try wrap_node(h, r, me.next)
+    }
+    if id == G_PREV {
+        return try wrap_node(h, r, me.previous)
+    }
+    if id == G_CHILD_NODES {
+        return try kids_array(h, r, me, false)
+    }
+    if id == G_CHILDREN {
+        return try kids_array(h, r, me, true)
+    }
+    if id == G_FIRST_ELEM || id == G_LAST_ELEM {
+        var c: Gc[Node] = me.first_child
+        var found: Gc[Node] = gc_null[Node]()
+        while c != gc_null[Node]() {
+            if c.kind == node.K_ELEM {
+                found = c
+                if id == G_FIRST_ELEM {
+                    break
+                }
+            }
+            c = c.next
+        }
+        return try wrap_node(h, r, found)
+    }
+    if id == G_CHILD_COUNT {
+        var c: Gc[Node] = me.first_child
+        var n: u64 = 0
+        while c != gc_null[Node]() {
+            if c.kind == node.K_ELEM {
+                n = n + 1
+            }
+            c = c.next
+        }
+        return try val.realm_num(r, n as f64)
+    }
+    if id == G_TEXT_CONTENT {
+        let c = try api.dom_text_content(me)
+        return try chain_to_js(r, c, &(*h).tmp)
+    }
+    if id == G_NODE_VALUE {
+        if me.kind == node.K_TEXT {
+            let t: Gc[Text] = me as Gc[Text]
+            return try chain_to_js(r, t.data, &(*h).tmp)
+        }
+        if me.kind == node.K_COMMENT {
+            let t: Gc[Comment] = me as Gc[Comment]
+            return try chain_to_js(r, t.data, &(*h).tmp)
+        }
+        return val.realm_null(r)
+    }
+    if id == G_INNER_HTML || id == G_OUTER_HTML {
+        mem.buf_clear(&(*h).buf)
+        if id == G_INNER_HTML {
+            api.dom_inner_html(me, (*h).nm, &(*h).buf)
+        } else {
+            api.dom_outer_html(me, (*h).nm, &(*h).buf)
+        }
+        mem.cp_clear(&(*h).tmp)
+        utf8_to_cp(&(*h).buf, &(*h).tmp)
+        return try cp_to_js(r, &(*h).tmp)
+    }
+    if id == G_ID || id == G_CLASS_NAME {
+        if me.kind != node.K_ELEM {
+            return val.realm_undefined(r)
+        }
+        var lit_id: [u8; 2] = "id"
+        var lit_cl: [u8; 5] = "class"
+        var a: u32 = 0
+        if id == G_ID {
+            a = names.names_of_bytes((*h).nm, &lit_id[0], 2)
+        } else {
+            a = names.names_of_bytes((*h).nm, &lit_cl[0], 5)
+        }
+        let v: Gc[Chain] = node.attr_value(node.node_as_elem(me), a, 0)
+        if v == gc_null[Chain]() {
+            var empty: [u8; 1] = " "
+            return try ascii_js(r, &empty[0], 0)
+        }
+        return try chain_to_js(r, v, &(*h).tmp)
+    }
+    if id == G_STYLE || id == G_CLASS_LIST {
+        if me.kind != node.K_ELEM {
+            return val.realm_undefined(r)
+        }
+        var which: u64 = P_STYLE
+        var hk: u64 = HK_STYLE
+        if id == G_CLASS_LIST {
+            which = P_CLASSLIST
+            hk = HK_CLASSLIST
+        }
+        // One object per element, kept in the wrapper table under a key
+        // that cannot collide with a node: the node address plus 1 resp. 2.
+        // Identity matters here too -- `el.style === el.style`.
+        let key: u64 = (me as u64) + hk
+        let have: Gc[DomObj] = gcmap_get_value[DomObj]((*h).wrappers, key)
+        if have != gc_null[DomObj]() {
+            let v: Gc[JsVal] = have
+            return v
+        }
+        let o: Gc[DomObj] = try dom_obj(h, r, which, me, hk)
+        let ok: bool = try gcmap_set_value[DomObj]((*h).wrappers, key, o)
+        let v2: Gc[JsVal] = o
+        return v2
+    }
+    // --- the setters
+    if id == S_TEXT_CONTENT || id == S_NODE_VALUE {
+        let ok: bool = try set_text_content(h, r, me, arg(r, args, 0))
+        return val.realm_undefined(r)
+    }
+    if id == S_INNER_HTML {
+        let ok: bool = try set_inner_html(h, r, me, arg(r, args, 0))
+        return val.realm_undefined(r)
+    }
+    if id == S_ID || id == S_CLASS_NAME {
+        if me.kind != node.K_ELEM {
+            return val.realm_undefined(r)
+        }
+        var lit_id: [u8; 2] = "id"
+        var lit_cl: [u8; 5] = "class"
+        var a: u32 = 0
+        if id == S_ID {
+            a = names.names_of_bytes((*h).nm, &lit_id[0], 2)
+        } else {
+            a = names.names_of_bytes((*h).nm, &lit_cl[0], 5)
+        }
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        let ok2: bool = try set_attr_cp(node.node_as_elem(me), a, &(*h).tmp)
+        mark_style(h, me)
+        return val.realm_undefined(r)
+    }
+    return val.realm_undefined(r)
+}
+
+fn dom_node_type(k: Gc[Node]) -> u32 {
+    // The numbers of the DOM standard, not the ones of lib/browser/node.fi
+    // -- there K_ELEM is 2 and K_TEXT is 3 by luck, and the document is 1
+    // in both. Written out so the coincidence cannot become a bug.
+    if k.kind == node.K_ELEM {
+        return 1
+    }
+    if k.kind == node.K_TEXT {
+        return 3
+    }
+    if k.kind == node.K_COMMENT {
+        return 8
+    }
+    if k.kind == node.K_DOCUMENT {
+        return 9
+    }
+    if k.kind == node.K_DOCTYPE {
+        return 10
+    }
+    return 11
+}
+
+fn special_name(r: Gc[Realm], k: Gc[Node]) -> AllocError!Gc[JsVal] {
+    var t_text: [u8; 5] = "#text"
+    var t_com: [u8; 8] = "#comment"
+    var t_doc: [u8; 9] = "#document"
+    var t_frag: [u8; 19] = "#document-fragment "
+    if k.kind == node.K_TEXT {
+        return try ascii_js(r, &t_text[0], 5)
+    }
+    if k.kind == node.K_COMMENT {
+        return try ascii_js(r, &t_com[0], 8)
+    }
+    if k.kind == node.K_DOCUMENT {
+        return try ascii_js(r, &t_doc[0], 9)
+    }
+    return try ascii_js(r, &t_frag[0], 18)
+}
+
+fn utf8_to_cp(b: *mut mem.Buf, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    let n: usize = mem.buf_len(b)
+    var i: usize = 0
+    while i < n {
+        let c0: u32 = mem.buf_at(b, i) as u32
+        if c0 < 0x80 as u32 {
+            mem.cp_push(out, c0)
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 {
+            mem.cp_push(out, ((c0 & 0x07 as u32) << 18) |
+                ((mem.buf_at(b, i + 1) as u32 & 0x3F as u32) << 12) |
+                ((mem.buf_at(b, i + 2) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, i + 3) as u32 & 0x3F as u32))
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 {
+            mem.cp_push(out, ((c0 & 0x0F as u32) << 12) |
+                ((mem.buf_at(b, i + 1) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, i + 2) as u32 & 0x3F as u32))
+            i = i + 3
+        } else {
+            mem.cp_push(out, ((c0 & 0x1F as u32) << 6) |
+                (mem.buf_at(b, i + 1) as u32 & 0x3F as u32))
+            i = i + 2
+        }
+    }
+}
+
+// ============================================================== The events
+//
+// The flow of DOM UI Events 3.1: an event travels from the root DOWN to
+// the target (the CAPTURE phase), is delivered AT the target, and -- if it
+// bubbles -- travels back UP (the BUBBLE phase). A capturing listener is
+// only called on the way down, an ordinary one only on the way up and at
+// the target. Getting that wrong is invisible until two listeners on
+// nested elements have to run in the right order, which is exactly what
+// the tests of this round check.
+
+const PH_NONE: u64 = 0
+const PH_CAPTURE: u64 = 1
+const PH_TARGET: u64 = 2
+const PH_BUBBLE: u64 = 3
+
+// The state of a dispatch, kept in the event object's fields.
+const EV_STOPPED: u64 = 1
+const EV_STOPPED_IMM: u64 = 2
+const EV_PREVENTED: u64 = 4
+const EV_BUBBLES: u64 = 8
+const EV_CANCELABLE: u64 = 16
+
+fn listeners_of(h: *mut Host, k: Gc[Node],
+    make: bool) -> AllocError!Gc[GcVec] {
+    let key: u64 = k as u64
+    let have: Gc[GcVec] = gcmap_get_value[GcVec]((*h).listeners, key)
+    if have != gc_null[GcVec]() || !make {
+        return have
+    }
+    let v = try gcvec_new()
+    let ok: bool = try gcmap_set_value[GcVec]((*h).listeners, key, v)
+    return v
+}
+
+// The target of a listener call: a node, or the window (which is not a
+// node and gets the document as its stand-in key).
+fn target_node(h: *mut Host, this: Gc[JsVal]) -> Gc[Node] {
+    let d: Gc[DomObj] = as_dom(this)
+    if d == gc_null[DomObj]() {
+        // `addEventListener(...)` with no receiver at all: `this` is the
+        // global object (or undefined in a module). That IS the window,
+        // and the window's listeners hang on the document.
+        return (*h).doc
+    }
+    if d.hkind == HK_WINDOW {
+        return (*h).doc
+    }
+    return d.k
+}
+
+fn event_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    if id == D_ADD_LISTENER || id == D_DEL_LISTENER {
+        let k: Gc[Node] = target_node(h, this)
+        if k == gc_null[Node]() {
+            return try not_a_node(r)
+        }
+        let t: Gc[JsVal] = try interp.to_string(r, arg(r, args, 0))
+        let f: Gc[JsVal] = arg(r, args, 1)
+        var capture: bool = false
+        var once: bool = false
+        let o: Gc[JsVal] = arg(r, args, 2)
+        if val.val_tag(o) == val.TAG_OBJ {
+            let oo: Gc[JsObj] = val.as_obj(o)
+            var n_cap: [u8; 7] = "capture"
+            var n_once: [u8; 4] = "once"
+            let sc: Gc[JsVal] = try val.str_from_ascii(r, &n_cap[0], 7)
+            let kc: u64 = try val.key_for_str(r, sc)
+            capture = interp.to_boolean(r, try interp.get_prop(r, o, kc))
+            let so: Gc[JsVal] = try val.str_from_ascii(r, &n_once[0], 4)
+            let ko: u64 = try val.key_for_str(r, so)
+            once = interp.to_boolean(r, try interp.get_prop(r, o, ko))
+        } else if val.val_tag(o) == val.TAG_BOOL {
+            capture = val.bool_value(o)
+        }
+        if id == D_ADD_LISTENER {
+            if !val.is_callable(f) {
+                return val.realm_undefined(r)
+            }
+            let v = try listeners_of(h, k, true)
+            // The same function twice for the same type and phase is
+            // added ONCE (DOM 2.7, step 2). Every event handler that has
+            // ever been registered in a loop depends on this.
+            var i: u64 = 0
+            while i < gcvec_length(v) {
+                let l: Gc[Listener] = gcvec_read[Listener](v, i)
+                if !l.dead && l.capture == capture &&
+                interp.strict_equals(r, l.fn_, f) &&
+                val.str_equal(l.type_, t) {
+                    return val.realm_undefined(r)
+                }
+                i = i + 1
+            }
+            let l2 = try gc Listener {
+                target: k, fn_: f, type_: t, capture: capture, once: once,
+                dead: false,
+            }
+            let ok: bool = try gcvec_append[Listener](v, l2)
+            return val.realm_undefined(r)
+        }
+        let v2 = try listeners_of(h, k, false)
+        if v2 == gc_null[GcVec]() {
+            return val.realm_undefined(r)
+        }
+        var i2: u64 = 0
+        while i2 < gcvec_length(v2) {
+            let l: Gc[Listener] = gcvec_read[Listener](v2, i2)
+            if !l.dead && l.capture == capture &&
+            interp.strict_equals(r, l.fn_, f) && val.str_equal(l.type_, t) {
+                l.dead = true
+            }
+            i2 = i2 + 1
+        }
+        return val.realm_undefined(r)
+    }
+    if id == D_DISPATCH {
+        let k: Gc[Node] = target_node(h, this)
+        let e: Gc[DomObj] = as_dom(arg(r, args, 0))
+        if k == gc_null[Node]() || e == gc_null[DomObj]() ||
+        e.hkind != HK_EVENT {
+            return try not_a_node(r)
+        }
+        let ok: bool = try do_dispatch(h, r, k, e)
+        return val.realm_bool(r, (e.node & EV_PREVENTED) == 0 as u64)
+    }
+    if id == D_ILLEGAL_CTOR {
+        var m: [u8; 20] = "Illegal constructor "
+        return type_err(r, &m[0], 19)
+    }
+    if id == D_EVENT_CTOR {
+        // `new Event(type, {bubbles, cancelable})` -- DOM 2.2. Without it
+        // a script can only receive events, never make one, and half the
+        // official event tests could not run at all.
+        let t: Gc[JsVal] = try interp.to_string(r, arg(r, args, 0))
+        let e2: Gc[DomObj] = try dom_obj(h, r, P_EVENT, gc_null[Node](),
+            HK_EVENT)
+        e2.prim = t
+        var flags: u64 = 0
+        let o: Gc[JsVal] = arg(r, args, 1)
+        if val.val_tag(o) == val.TAG_OBJ {
+            var n_b: [u8; 7] = "bubbles"
+            var n_c: [u8; 10] = "cancelable"
+            let sb: Gc[JsVal] = try val.str_from_ascii(r, &n_b[0], 7)
+            let kb: u64 = try val.key_for_str(r, sb)
+            if interp.to_boolean(r, try interp.get_prop(r, o, kb)) {
+                flags = flags | EV_BUBBLES
+            }
+            let sc2: Gc[JsVal] = try val.str_from_ascii(r, &n_c[0], 10)
+            let kc2: u64 = try val.key_for_str(r, sc2)
+            if interp.to_boolean(r, try interp.get_prop(r, o, kc2)) {
+                flags = flags | EV_CANCELABLE
+            }
+        }
+        e2.node = flags
+        let out: Gc[JsVal] = e2
+        return out
+    }
+    // the methods on the event itself
+    let e: Gc[DomObj] = as_dom(this)
+    if e == gc_null[DomObj]() || e.hkind != HK_EVENT {
+        if id >= G_EV_TYPE {
+            return val.realm_undefined(r)
+        }
+        return try not_a_node(r)
+    }
+    if id == D_INIT_EVENT {
+        e.prim = try interp.to_string(r, arg(r, args, 0))
+        var flags: u64 = 0
+        if interp.to_boolean(r, arg(r, args, 1)) {
+            flags = flags | EV_BUBBLES
+        }
+        if interp.to_boolean(r, arg(r, args, 2)) {
+            flags = flags | EV_CANCELABLE
+        }
+        e.node = flags
+        return val.realm_undefined(r)
+    }
+    if id == D_PREVENT {
+        if (e.node & EV_CANCELABLE) != 0 as u64 {
+            e.node = e.node | EV_PREVENTED
+        }
+        return val.realm_undefined(r)
+    }
+    if id == D_STOP {
+        e.node = e.node | EV_STOPPED
+        return val.realm_undefined(r)
+    }
+    if id == D_STOP_IMM {
+        e.node = e.node | EV_STOPPED | EV_STOPPED_IMM
+        return val.realm_undefined(r)
+    }
+    if id == G_EV_TYPE {
+        return e.prim
+    }
+    if id == G_EV_TARGET {
+        return try wrap_node(h, r, e.k)
+    }
+    if id == G_EV_CURRENT {
+        let c: Gc[JsObj] = e.ev
+        if c == gc_null[JsObj]() {
+            return val.realm_null(r)
+        }
+        let v: Gc[JsVal] = c
+        return v
+    }
+    if id == G_EV_PHASE {
+        return try val.realm_num(r, e.len as f64)
+    }
+    if id == G_EV_BUBBLES {
+        return val.realm_bool(r, (e.node & EV_BUBBLES) != 0 as u64)
+    }
+    if id == G_EV_CANCELABLE {
+        return val.realm_bool(r, (e.node & EV_CANCELABLE) != 0 as u64)
+    }
+    if id == G_EV_PREVENTED {
+        return val.realm_bool(r, (e.node & EV_PREVENTED) != 0 as u64)
+    }
+    return val.realm_undefined(r)
+}
+
+// The path from the root down to the target, as a vector. Built ONCE and
+// then walked twice -- forwards for the capture phase, backwards for the
+// bubble phase. DOM 2.9 fixes the path BEFORE the first listener runs, so
+// a listener that moves the target does not change where the event goes.
+fn event_path(k: Gc[Node]) -> AllocError!Gc[GcVec] {
+    let up = try gcvec_new()
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() {
+        let ok: bool = try gcvec_append[Node](up, c)
+        c = c.parent
+    }
+    return up
+}
+
+fn call_listeners(h: *mut Host, r: Gc[Realm], k: Gc[Node], e: Gc[DomObj],
+    want_capture: bool, phase: u64) -> AllocError!bool {
+    let v = try listeners_of(h, k, false)
+    if v == gc_null[GcVec]() {
+        return true
+    }
+    e.len = phase
+    let w: Gc[JsVal] = try wrap_node(h, r, k)
+    e.ev = val.as_obj(w)
+    let n: u64 = gcvec_length(v)
+    var i: u64 = 0
+    while i < n {
+        let l: Gc[Listener] = gcvec_read[Listener](v, i)
+        i = i + 1
+        if l.dead {
+            continue
+        }
+        if phase != PH_TARGET && l.capture != want_capture {
+            continue
+        }
+        if !val.str_equal(l.type_, e.prim) {
+            continue
+        }
+        if l.once {
+            l.dead = true
+        }
+        let a = try interp.args_new(r)
+        let ev: Gc[JsVal] = e
+        let ok: bool = try gcvec_append[JsVal](a, ev)
+        (*h).ran = (*h).ran + 1
+        let res: Gc[JsVal] = try interp.call_function(r, l.fn_, w, a)
+        let c: *mut interp.Ctx = interp.ctx_of(r)
+        if (*c).comp != interp.C_NORMAL {
+            return false // an exception -- it belongs to the caller
+        }
+        if (e.node & EV_STOPPED_IMM) != 0 as u64 {
+            return false
+        }
+    }
+    return true
+}
+
+fn do_dispatch(h: *mut Host, r: Gc[Realm], k: Gc[Node],
+    e: Gc[DomObj]) -> AllocError!bool {
+    (*h).fired = (*h).fired + 1
+    e.k = k
+    e.node = e.node & (18446744073709551615 as u64 - EV_PREVENTED)
+    e.node = e.node & (18446744073709551615 as u64 - EV_STOPPED -
+        EV_STOPPED_IMM)
+    let path = try event_path(k)
+    let n: u64 = gcvec_length(path)
+    // capture: from the root down to (not including) the target
+    var i: u64 = n
+    while i > 1 {
+        i = i - 1
+        let c: Gc[Node] = gcvec_read[Node](path, i)
+        let go: bool = try call_listeners(h, r, c, e, true, PH_CAPTURE)
+        if !go {
+            e.len = PH_NONE
+            e.ev = gc_null[JsObj]()
+            return true
+        }
+        if (e.node & EV_STOPPED) != 0 as u64 {
+            e.len = PH_NONE
+            e.ev = gc_null[JsObj]()
+            return true
+        }
+    }
+    // at the target: BOTH kinds, in registration order (DOM 2.9, step 9)
+    let go2: bool = try call_listeners(h, r, k, e, false, PH_TARGET)
+    if !go2 || (e.node & EV_STOPPED) != 0 as u64 {
+        e.len = PH_NONE
+        e.ev = gc_null[JsObj]()
+        return true
+    }
+    if (e.node & EV_BUBBLES) != 0 as u64 {
+        var q: u64 = 1
+        while q < n {
+            let c: Gc[Node] = gcvec_read[Node](path, q)
+            let go3: bool = try call_listeners(h, r, c, e, false, PH_BUBBLE)
+            if !go3 || (e.node & EV_STOPPED) != 0 as u64 {
+                q = n
+            } else {
+                q = q + 1
+            }
+        }
+    }
+    e.len = PH_NONE
+    e.ev = gc_null[JsObj]()
+    return true
+}
+
+// An event made from Firn rather than from a script -- what a click or a
+// `load` will be once there is an input layer.
+fn host_dispatch_named(h: *mut Host, r: Gc[Realm], k: Gc[Node],
+    name: *mut u8, n: usize, bubbles: bool,
+    cancelable: bool) -> AllocError!bool {
+    let e: Gc[DomObj] = try dom_obj(h, r, P_EVENT, k, HK_EVENT)
+    e.prim = try val.str_from_ascii(r, name, n)
+    var flags: u64 = 0
+    if bubbles {
+        flags = flags | EV_BUBBLES
+    }
+    if cancelable {
+        flags = flags | EV_CANCELABLE
+    }
+    e.node = flags
+    let ok: bool = try do_dispatch(h, r, k, e)
+    return (e.node & EV_PREVENTED) == 0 as u64
+}
+
+// ============================================================== The timers
+
+fn timer_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    if id == D_SET_TIMEOUT || id == D_SET_INTERVAL {
+        let f: Gc[JsVal] = arg(r, args, 0)
+        if !val.is_callable(f) {
+            return try val.realm_num(r, 0.0)
+        }
+        var ms: f64 = 0.0
+        if gcvec_length(args) > 1 {
+            ms = math.math_f64(try interp.to_number(r, arg(r, args, 1)))
+        }
+        if !(ms >= 0.0) {
+            ms = 0.0
+        }
+        // The extra arguments are handed to the callback (HTML 8.6).
+        let extra = try interp.args_new(r)
+        var i: u64 = 2
+        while i < gcvec_length(args) {
+            let ok: bool = try gcvec_append[JsVal](extra,
+                gcvec_read[JsVal](args, i))
+            i = i + 1
+        }
+        let tid: u64 = (*h).next_timer
+        (*h).next_timer = (*h).next_timer + 1
+        var every: u64 = 0
+        var rep: bool = false
+        if id == D_SET_INTERVAL {
+            rep = true
+            every = ms as u64
+            if every < 1 as u64 {
+                every = 1 // an interval of 0 would never give the page back
+            }
+        }
+        let t = try gc Timer {
+            fn_: f, args: extra, id: tid,
+            due_ms: (*h).now_ms + (ms as u64), every_ms: every,
+            repeat: rep, dead: false,
+        }
+        let ok2: bool = try gcvec_append[Timer]((*h).timers, t)
+        return try val.realm_num(r, tid as f64)
+    }
+    // clearTimeout / clearInterval -- one and the same list
+    let want: f64 = math.math_f64(try interp.to_number(r, arg(r, args, 0)))
+    let wid: u64 = want as u64
+    var i: u64 = 0
+    while i < gcvec_length((*h).timers) {
+        let t: Gc[Timer] = gcvec_read[Timer]((*h).timers, i)
+        if t.id == wid {
+            t.dead = true
+        }
+        i = i + 1
+    }
+    return val.realm_undefined(r)
+}
+
+// Moves the clock forward. Returns the number of timers that are now due.
+fn host_advance(h: *mut Host, ms: u64) -> u64 {
+    (*h).now_ms = (*h).now_ms + ms
+    return host_timers_due(h)
+}
+
+fn host_timers_due(h: *mut Host) -> u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < gcvec_length((*h).timers) {
+        let t: Gc[Timer] = gcvec_read[Timer]((*h).timers, i)
+        if !t.dead && t.due_ms <= (*h).now_ms {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Runs every timer that is due, EARLIEST FIRST and at most `limit` of
+// them. The limit is not decoration: `setInterval(f, 0)` would otherwise
+// never return, and a browser that hangs on that is a browser nobody can
+// use. Returns how many ran.
+fn host_run_timers(h: *mut Host, r: Gc[Realm], limit: u64) -> AllocError!u64 {
+    var ran: u64 = 0
+    var going: bool = true
+    while going && ran < limit {
+        var best: Gc[Timer] = gc_null[Timer]()
+        var i: u64 = 0
+        while i < gcvec_length((*h).timers) {
+            let t: Gc[Timer] = gcvec_read[Timer]((*h).timers, i)
+            if !t.dead && t.due_ms <= (*h).now_ms {
+                if best == gc_null[Timer]() || t.due_ms < best.due_ms ||
+                (t.due_ms == best.due_ms && t.id < best.id) {
+                    best = t
+                }
+            }
+            i = i + 1
+        }
+        if best == gc_null[Timer]() {
+            going = false
+        } else {
+            if best.repeat {
+                best.due_ms = best.due_ms + best.every_ms
+            } else {
+                best.dead = true
+            }
+            let undef: Gc[JsVal] = val.realm_undefined(r)
+            let res: Gc[JsVal] = try interp.call_function(r, best.fn_,
+                undef, best.args)
+            ran = ran + 1
+            (*h).timers_run = (*h).timers_run + 1
+            let c: *mut interp.Ctx = interp.ctx_of(r)
+            if (*c).comp != interp.C_NORMAL {
+                // An exception in ONE timer does not stop the others --
+                // that is what a browser does, and a harness whose first
+                // callback throws would otherwise take the page with it.
+                // It is counted and the last one is kept, so the driver
+                // can print it instead of swallowing it.
+                if (*c).comp == interp.C_THROW {
+                    (*h).last_throw = r.pending
+                }
+                (*h).timer_errors = (*h).timer_errors + 1
+                (*c).comp = interp.C_NORMAL
+            }
+        }
+    }
+    return ran
+}
+
+// ==================================================== The declaration block
+
+fn style_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let d: Gc[DomObj] = as_dom(this)
+    if d == gc_null[DomObj]() || d.hkind != HK_STYLE ||
+    d.k == gc_null[Node]() || d.k.kind != node.K_ELEM {
+        return try not_a_node(r)
+    }
+    let e: Gc[Elem] = node.node_as_elem(d.k)
+    let sa: u32 = style_attr_id(h)
+    if id == G_STYLE_TEXT {
+        attr_to_cp(e, sa, &(*h).tmp)
+        return try cp_to_js(r, &(*h).tmp)
+    }
+    if id == S_STYLE_TEXT {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        let ok2: bool = try set_attr_cp(e, sa, &(*h).tmp)
+        mark_style(h, d.k)
+        return val.realm_undefined(r)
+    }
+    if id == D_STYLE_GET || id == D_STYLE_DEL || id == D_STYLE_SET {
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp2)
+        cp_lower(&(*h).tmp2)
+        attr_to_cp(e, sa, &(*h).tmp)
+        if id == D_STYLE_GET {
+            var found: bool = false
+            var outv: mem.CpBuf = mem.cp_new()
+            mem.cp_init(&outv)
+            decl_get(&(*h).tmp, &(*h).tmp2, &outv, &found)
+            let s: Gc[JsVal] = try cp_to_js(r, &outv)
+            mem.cp_free(&outv)
+            return s
+        }
+        var value: mem.CpBuf = mem.cp_new()
+        mem.cp_init(&value)
+        if id == D_STYLE_SET {
+            let v: Gc[JsVal] = try interp.to_string(r, arg(r, args, 1))
+            js_to_cp(v, &value)
+        }
+        var out: mem.CpBuf = mem.cp_new()
+        mem.cp_init(&out)
+        decl_set(&(*h).tmp, &(*h).tmp2, &value, &out)
+        let ok2: bool = try set_attr_cp(e, sa, &out)
+        mem.cp_free(&value)
+        mem.cp_free(&out)
+        mark_style(h, d.k)
+        return val.realm_undefined(r)
+    }
+    if id == G_STYLE_PROP || id == S_STYLE_PROP {
+        // WHICH property is asked for stands in the function object.
+        let f: Gc[JsObj] = interp.current_native(r)
+        var slot: usize = 0
+        if f != gc_null[JsObj]() {
+            slot = f.node as usize
+        }
+        if slot >= CSS_PROPS {
+            return val.realm_undefined(r)
+        }
+        css_dashed(slot, &(*h).tmp2)
+        attr_to_cp(e, sa, &(*h).tmp)
+        if id == G_STYLE_PROP {
+            var found: bool = false
+            var outv: mem.CpBuf = mem.cp_new()
+            mem.cp_init(&outv)
+            decl_get(&(*h).tmp, &(*h).tmp2, &outv, &found)
+            let s: Gc[JsVal] = try cp_to_js(r, &outv)
+            mem.cp_free(&outv)
+            return s
+        }
+        var value: mem.CpBuf = mem.cp_new()
+        mem.cp_init(&value)
+        let v: Gc[JsVal] = try interp.to_string(r, arg(r, args, 0))
+        js_to_cp(v, &value)
+        var out: mem.CpBuf = mem.cp_new()
+        mem.cp_init(&out)
+        decl_set(&(*h).tmp, &(*h).tmp2, &value, &out)
+        let ok2: bool = try set_attr_cp(e, sa, &out)
+        mem.cp_free(&value)
+        mem.cp_free(&out)
+        mark_style(h, d.k)
+        return val.realm_undefined(r)
+    }
+    return val.realm_undefined(r)
+}
+
+// ====================================================== The class list
+
+fn class_attr_id(h: *mut Host) -> u32 {
+    var lit: [u8; 5] = "class"
+    return names.names_of_bytes((*h).nm, &lit[0], 5)
+}
+
+// The tokens of the class attribute: start and length of each, into
+// `starts`/`lens`. Returns how many there are.
+fn class_tokens(b: *mut mem.CpBuf, starts: *mut [usize; 64],
+    lens: *mut [usize; 64]) -> usize {
+    var n: usize = 0
+    let m: usize = mem.cp_len(b)
+    var i: usize = 0
+    while i < m && n < 64 {
+        while i < m && is_sp(mem.cp_at(b, i)) {
+            i = i + 1
+        }
+        if i >= m {
+            break
+        }
+        let s: usize = i
+        while i < m && !is_sp(mem.cp_at(b, i)) {
+            i = i + 1
+        }
+        (*starts)[n] = s
+        (*lens)[n] = i - s
+        n = n + 1
+    }
+    return n
+}
+
+fn classlist_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let d: Gc[DomObj] = as_dom(this)
+    if d == gc_null[DomObj]() || d.hkind != HK_CLASSLIST ||
+    d.k == gc_null[Node]() || d.k.kind != node.K_ELEM {
+        return try not_a_node(r)
+    }
+    let e: Gc[Elem] = node.node_as_elem(d.k)
+    let ca: u32 = class_attr_id(h)
+    attr_to_cp(e, ca, &(*h).tmp)
+    var starts: [usize; 64] = [0; 64]
+    var lens: [usize; 64] = [0; 64]
+    let n: usize = class_tokens(&(*h).tmp, &starts, &lens)
+    if id == G_CL_LENGTH {
+        return try val.realm_num(r, n as f64)
+    }
+    if id == G_CL_VALUE {
+        return try cp_to_js(r, &(*h).tmp)
+    }
+    if id == D_CL_ITEM {
+        let x: f64 = math.math_f64(try interp.to_number(r, arg(r, args, 0)))
+        let i: usize = x as usize
+        if !(x >= 0.0) || i >= n {
+            return val.realm_null(r)
+        }
+        return try val.str_from_units(r, &(*h).tmp, starts[i], lens[i])
+    }
+    let ok: bool = try arg_str(r, args, 0, &(*h).tmp2)
+    if mem.cp_len(&(*h).tmp2) == 0 {
+        var m: [u8; 24] = "an empty class token    "
+        return type_err(r, &m[0], 20)
+    }
+    var at: usize = 64
+    var i: usize = 0
+    while i < n {
+        if cp_eq_exact(&(*h).tmp, starts[i], lens[i], &(*h).tmp2) {
+            at = i
+            break
+        }
+        i = i + 1
+    }
+    if id == D_CL_CONTAINS {
+        return val.realm_bool(r, at < 64)
+    }
+    var want_in: bool = id == D_CL_ADD
+    if id == D_CL_TOGGLE {
+        want_in = at >= 64
+        if gcvec_length(args) > 1 {
+            want_in = interp.to_boolean(r, arg(r, args, 1))
+        }
+    }
+    if id == D_CL_REMOVE {
+        want_in = false
+    }
+    var out: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&out)
+    var q: usize = 0
+    while q < n {
+        let keep: bool = q != at || want_in
+        if keep {
+            if mem.cp_len(&out) > 0 {
+                mem.cp_push(&out, 32 as u32)
+            }
+            var z: usize = 0
+            while z < lens[q] {
+                mem.cp_push(&out, mem.cp_at(&(*h).tmp, starts[q] + z))
+                z = z + 1
+            }
+        }
+        q = q + 1
+    }
+    if want_in && at >= 64 {
+        if mem.cp_len(&out) > 0 {
+            mem.cp_push(&out, 32 as u32)
+        }
+        var z: usize = 0
+        while z < mem.cp_len(&(*h).tmp2) {
+            mem.cp_push(&out, mem.cp_at(&(*h).tmp2, z))
+            z = z + 1
+        }
+    }
+    let ok2: bool = try set_attr_cp(e, ca, &out)
+    mem.cp_free(&out)
+    mark_style(h, d.k)
+    if id == D_CL_TOGGLE {
+        return val.realm_bool(r, want_in)
+    }
+    return val.realm_undefined(r)
+}
+
+fn cp_eq_exact(a: *mut mem.CpBuf, ao: usize, an: usize,
+    b: *mut mem.CpBuf) -> bool {
+    if an != mem.cp_len(b) {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if mem.cp_at(a, ao + i) != mem.cp_at(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ========================================================= window/location
+
+fn window_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    if id == G_WIN_DOC {
+        return try wrap_node(h, r, (*h).doc)
+    }
+    if id == G_WIN_SELF {
+        let v: Gc[JsVal] = (*h).window
+        return v
+    }
+    if id == G_WIN_W && (*h).lv as u64 != 0 {
+        return try val.realm_num(r, live.live_vw((*h).lv))
+    }
+    if id == G_WIN_H && (*h).lv as u64 != 0 {
+        return try val.realm_num(r, live.live_vh((*h).lv))
+    }
+    if id == G_LOC_PART {
+        let f: Gc[JsObj] = interp.current_native(r)
+        var slot: u64 = 0
+        if f != gc_null[JsObj]() {
+            slot = f.node
+        }
+        return try location_part(h, r, slot)
+    }
+    return val.realm_undefined(r)
+}
+
+// The address of the document. Kept as plain octets: the browser core must
+// not depend on lib/net -- an embedder that has no network at all still
+// needs a `location`, and `about:blank` is a perfectly good one.
+fn host_set_location(h: *mut Host, p: *mut u8, n: usize) {
+    mem.buf_clear(&(*h).loc)
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(&(*h).loc, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// The eight parts of `location`, cut out of the text: 0 href, 1 protocol,
+// 2 host, 3 hostname, 4 port, 5 pathname, 6 search, 7 hash.
+fn location_part(h: *mut Host, r: Gc[Realm],
+    which: u64) -> AllocError!Gc[JsVal] {
+    let b: *mut mem.Buf = &(*h).loc
+    let n: usize = mem.buf_len(b)
+    let base: u64 = mem.buf_ptr(b) as u64
+    if which == 0 as u64 {
+        return try val.str_from_ascii(r, base as *mut u8, n)
+    }
+    // scheme up to and including ':'
+    var col: usize = 0
+    while col < n && mem.buf_at(b, col) != 58 as u8 {
+        col = col + 1
+    }
+    if which == 1 as u64 {
+        var e: usize = col
+        if e < n {
+            e = e + 1
+        }
+        return try val.str_from_ascii(r, base as *mut u8, e)
+    }
+    var at: usize = col
+    if at + 3 <= n && mem.buf_at(b, at + 1) == 47 as u8 &&
+    mem.buf_at(b, at + 2) == 47 as u8 {
+        at = at + 3
+    } else {
+        at = n
+    }
+    var he: usize = at
+    while he < n {
+        let c: u8 = mem.buf_at(b, he)
+        if c == 47 as u8 || c == 63 as u8 || c == 35 as u8 {
+            break
+        }
+        he = he + 1
+    }
+    var pc: usize = he
+    var q: usize = at
+    while q < he {
+        if mem.buf_at(b, q) == 58 as u8 {
+            pc = q
+        }
+        q = q + 1
+    }
+    if which == 2 as u64 {
+        return try val.str_from_ascii(r, (base + at as u64) as *mut u8,
+            he - at)
+    }
+    if which == 3 as u64 {
+        return try val.str_from_ascii(r, (base + at as u64) as *mut u8,
+            pc - at)
+    }
+    if which == 4 as u64 {
+        var s: usize = pc
+        if s < he {
+            s = s + 1
+        }
+        return try val.str_from_ascii(r, (base + s as u64) as *mut u8,
+            he - s)
+    }
+    // path, query, fragment
+    var qs: usize = he
+    while qs < n && mem.buf_at(b, qs) != 63 as u8 &&
+    mem.buf_at(b, qs) != 35 as u8 {
+        qs = qs + 1
+    }
+    if which == 5 as u64 {
+        if qs == he {
+            var slash: [u8; 1] = "/"
+            return try val.str_from_ascii(r, &slash[0], 1)
+        }
+        return try val.str_from_ascii(r, (base + he as u64) as *mut u8,
+            qs - he)
+    }
+    var hs: usize = qs
+    while hs < n && mem.buf_at(b, hs) != 35 as u8 {
+        hs = hs + 1
+    }
+    if which == 6 as u64 {
+        return try val.str_from_ascii(r, (base + qs as u64) as *mut u8,
+            hs - qs)
+    }
+    return try val.str_from_ascii(r, (base + hs as u64) as *mut u8, n - hs)
+}
+
+// The interface objects, by number. The NAME is derived from the same
+// table the prototypes are numbered in, so a new prototype cannot be
+// forgotten here.
+fn iface_name(which: u64) -> u64 {
+    return which
+}
+
+fn iface(h: *mut Host, r: Gc[Realm], g: Gc[JsObj], which: u64,
+    nlen: usize) -> AllocError!bool {
+    var t: [u8; 115] = "NodeElementDocumentTextCommentCSSStyleDeclarationDOMTokenListEventLocationWindowEventTargetHTMLElementCharacterData"
+    var offs: [usize; 13] = [0, 4, 11, 19, 23, 30, 49, 61, 66, 74, 80, 91,
+        102]
+    let b: u64 = (&t[0]) as u64
+    if which >= 13 as u64 {
+        return true
+    }
+    let p: Gc[JsObj] = gcvec_read[JsObj]((*h).protos, which)
+    let name: *mut u8 = (b + offs[which as usize] as u64) as *mut u8
+    let f: Gc[JsObj] = try interp.make_native(r, D_ILLEGAL_CTOR, 0, name,
+        nlen)
+    var n_proto: [u8; 9] = "prototype"
+    let pv: Gc[JsVal] = p
+    let ok1: bool = try put_obj(r, f, &n_proto[0], 9, pv)
+    var n_ctor: [u8; 11] = "constructor"
+    let fv: Gc[JsVal] = f
+    let ok2: bool = try put_obj(r, p, &n_ctor[0], 11, fv)
+    return try put_obj(r, g, name, nlen, fv)
+}
+
+// ================================================ CharacterData and the
+// ================================================ ChildNode/ParentNode mixins
+
+fn cd_chain(k: Gc[Node]) -> Gc[Chain] {
+    if k.kind == node.K_TEXT {
+        let t: Gc[Text] = k as Gc[Text]
+        return t.data
+    }
+    if k.kind == node.K_COMMENT {
+        let c: Gc[Comment] = k as Gc[Comment]
+        return c.data
+    }
+    return gc_null[Chain]()
+}
+
+fn cd_set(k: Gc[Node], c: Gc[Chain]) {
+    if k.kind == node.K_TEXT {
+        let t: Gc[Text] = k as Gc[Text]
+        t.data = c
+    } else if k.kind == node.K_COMMENT {
+        let t2: Gc[Comment] = k as Gc[Comment]
+        t2.data = c
+    }
+}
+
+fn chain_of_cp(b: *mut mem.CpBuf, from: usize,
+    to: usize) -> AllocError!Gc[Chain] {
+    let c = try node.chain_new()
+    var i: usize = from
+    while i < to {
+        let ok: bool = try node.chain_push(c, mem.cp_at(b, i))
+        i = i + 1
+    }
+    return c
+}
+
+// One argument of `before`/`after`/`append`: a node, or a string that
+// becomes a text node (DOM 4.2.7, "converting nodes into a node").
+fn to_node(h: *mut Host, r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[Node] {
+    let k: Gc[Node] = node_of(v)
+    if k != gc_null[Node]() {
+        return k
+    }
+    let s: Gc[JsVal] = try interp.to_string(r, v)
+    js_to_cp(s, &(*h).tmp)
+    let c = try chain_of_cp(&(*h).tmp, 0, mem.cp_len(&(*h).tmp))
+    let t = try node.text_new(c)
+    let out: Gc[Node] = t
+    return out
+}
+
+// Several arguments into ONE fragment, so the whole lot is inserted in one
+// place (DOM 4.2.7 says exactly that, and it is what makes
+// `el.append(a, b)` put `b` after `a` and not before it).
+fn args_to_fragment(h: *mut Host, r: Gc[Realm],
+    args: Gc[GcVec]) -> AllocError!Gc[Node] {
+    let f = try node.fragment_new(0)
+    var i: u64 = 0
+    while i < gcvec_length(args) {
+        let k = try to_node(h, r, gcvec_read[JsVal](args, i))
+        node.append_child(f, k)
+        i = i + 1
+    }
+    let out: Gc[Node] = f
+    return out
+}
+
+fn mixin_fn(h: *mut Host, r: Gc[Realm], id: u64, this: Gc[JsVal],
+    args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    let me: Gc[Node] = node_of(this)
+    if me == gc_null[Node]() {
+        return try not_a_node(r)
+    }
+    // --- CharacterData
+    if id >= G_CD_DATA && id <= G_CD_LENGTH {
+        let c: Gc[Chain] = cd_chain(me)
+        if id == G_CD_LENGTH {
+            var n: u64 = 0
+            if c != gc_null[Chain]() {
+                n = node.chain_len(c)
+            }
+            return try val.realm_num(r, n as f64)
+        }
+        if id == G_CD_DATA {
+            return try chain_to_js(r, c, &(*h).tmp)
+        }
+        let ok: bool = try arg_str(r, args, 0, &(*h).tmp)
+        let nc = try chain_of_cp(&(*h).tmp, 0, mem.cp_len(&(*h).tmp))
+        cd_set(me, nc)
+        mark_text(h, me)
+        return val.realm_undefined(r)
+    }
+    if id >= D_SUBSTRING && id <= D_REPLACE_DATA {
+        let c: Gc[Chain] = cd_chain(me)
+        if c == gc_null[Chain]() {
+            return try not_a_node(r)
+        }
+        mem.cp_clear(&(*h).tmp)
+        node.chain_after_cpbuf(c, &(*h).tmp)
+        let len: usize = mem.cp_len(&(*h).tmp)
+        if id == D_APPEND_DATA {
+            let ok: bool = try arg_str(r, args, 0, &(*h).tmp2)
+            var q: usize = 0
+            while q < mem.cp_len(&(*h).tmp2) {
+                mem.cp_push(&(*h).tmp, mem.cp_at(&(*h).tmp2, q))
+                q = q + 1
+            }
+            let nc = try chain_of_cp(&(*h).tmp, 0, mem.cp_len(&(*h).tmp))
+            cd_set(me, nc)
+            mark_text(h, me)
+            return val.realm_undefined(r)
+        }
+        // offset, and a count where there is one
+        let ox: f64 = math.math_f64(try interp.to_number(r, arg(r, args, 0)))
+        if !(ox >= 0.0) || (ox as usize) > len {
+            // DOM 4.10 wants an IndexSizeError; this engine has no
+            // DOMException, so it is a RangeError with the same meaning.
+            // Named in docs/ROUNDB4.md, and it costs the tests that check
+            // the exception TYPE rather than the behaviour.
+            var m: [u8; 24] = "offset past the end     "
+            return interp.throw_error(r, interp.ERR_RANGE, &m[0], 19)
+        }
+        let off: usize = ox as usize
+        var cnt: usize = len - off
+        if id != D_INSERT_DATA && gcvec_length(args) > 1 {
+            let cx: f64 = math.math_f64(try interp.to_number(r,
+                    arg(r, args, 1)))
+            if cx >= 0.0 {
+                cnt = cx as usize
+            } else {
+                cnt = 0
+            }
+            if off + cnt > len {
+                cnt = len - off
+            }
+        }
+        if id == D_SUBSTRING {
+            return try val.str_from_units(r, &(*h).tmp, off, cnt)
+        }
+        var ins: u64 = 1
+        if id == D_REPLACE_DATA {
+            ins = 2
+        }
+        mem.cp_clear(&(*h).tmp2)
+        if id != D_DELETE_DATA {
+            let ok: bool = try arg_str(r, args, ins, &(*h).tmp2)
+        }
+        var keep: usize = off
+        if id == D_INSERT_DATA {
+            keep = off
+            cnt = 0
+        }
+        let nc = try node.chain_new()
+        var i: usize = 0
+        while i < keep {
+            let ok2: bool = try node.chain_push(nc, mem.cp_at(&(*h).tmp, i))
+            i = i + 1
+        }
+        var q: usize = 0
+        while q < mem.cp_len(&(*h).tmp2) {
+            let ok3: bool = try node.chain_push(nc, mem.cp_at(&(*h).tmp2, q))
+            q = q + 1
+        }
+        i = off + cnt
+        while i < len {
+            let ok4: bool = try node.chain_push(nc, mem.cp_at(&(*h).tmp, i))
+            i = i + 1
+        }
+        cd_set(me, nc)
+        mark_text(h, me)
+        return val.realm_undefined(r)
+    }
+    // --- ChildNode
+    if id == D_BEFORE || id == D_AFTER || id == D_REPLACE_WITH {
+        let p: Gc[Node] = me.parent
+        if p == gc_null[Node]() {
+            return val.realm_undefined(r)
+        }
+        let f = try args_to_fragment(h, r, args)
+        var ref_: Gc[Node] = me
+        if id == D_AFTER {
+            ref_ = me.next
+        }
+        if id == D_REPLACE_WITH {
+            ref_ = me.next
+            node.kind_remove(me)
+        }
+        insert_all(p, f, ref_)
+        mark_children(h, p)
+        return val.realm_undefined(r)
+    }
+    // --- ParentNode
+    if id == D_PN_APPEND || id == D_PN_PREPEND || id == D_PN_REPLACE_ALL {
+        let f = try args_to_fragment(h, r, args)
+        if id == D_PN_REPLACE_ALL {
+            while me.first_child != gc_null[Node]() {
+                node.kind_remove(me.first_child)
+            }
+            insert_all(me, f, gc_null[Node]())
+        } else if id == D_PN_PREPEND {
+            insert_all(me, f, me.first_child)
+        } else {
+            insert_all(me, f, gc_null[Node]())
+        }
+        mark_children(h, me)
+        return val.realm_undefined(r)
+    }
+    return val.realm_undefined(r)
+}

@@ -1,0 +1,670 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/lock.fi -- the lock file `firn.lock`, in Firn (round 93).
+//
+// TWIN of `compiler/src/lock.rs`. Both write the same file, octet for
+// octet, and both say the same sentence when it does not fit --
+// `tools/packages/run.sh` plays them against each other and against the
+// `sha256sum` of coreutils.
+//
+// The format and the reasons behind it stand in `compiler/src/lock.rs`.
+// Short version: one line per package, sorted by name, with the resolved
+// version, the path RELATIVE TO THE ROOT PACKAGE and a checksum over the
+// manifest plus every source file of that package that took part in this
+// build; one line for the files that belong to no package; one total
+// checksum over all the lines above.
+//
+// LIMITS OF THIS VERSION (deliberate, equal for both compilers):
+//   * SHA-256 is computed here in u64 arithmetic with a mask instead of
+//     u32 wrap-around. This build level CHECKS integer arithmetic
+//     (round 72), so `a + b` on two u32 would abort -- masking is not a
+//     detour, it is the honest way to say "32 bits, wrapping".
+//   * at most six parameters per function, because
+//     `lib/firnc1/codegen.fi` cannot do more.
+
+import rt
+import vec
+import package
+
+export {
+    Lock, lock_new, lock_free, lock_add, lock_finish, lock_out, lock_error,
+    lock_error_missing, lock_error_mismatch, lock_error_needs_package,
+    sha256_hex,
+}
+
+// "no entry" -- an offset of its own would be a valid one.
+const NONE: u32 = 4294967295
+// 32 bits as a mask, and the format number of the first line.
+const M32: u64 = 4294967295
+const FORMAT: u64 = 1
+
+// ------------------------------------------------------------- SHA-256
+
+struct Hash {
+    h0: u64, h1: u64, h2: u64, h3: u64,
+    h4: u64, h5: u64, h6: u64, h7: u64,
+    block: rt.Buf,
+    total: u64,
+}
+
+fn hash_new() -> Hash {
+    return Hash {
+        h0: 1779033703, h1: 3144134277, h2: 1013904242, h3: 2773480762,
+        h4: 1359893119, h5: 2600822924, h6: 528734635, h7: 1541459225,
+        block: rt.buf_new(),
+        total: 0,
+    }
+}
+
+fn hash_free(hs: *mut Hash) {
+    rt.buf_free(&(*hs).block)
+}
+
+// Rotate a 32 bit value right, computed in 64 bits.
+fn rotr(x: u64, n: u64) -> u64 {
+    return ((x >> n) | (x << (32 - n))) & M32
+}
+
+// One 64 octet block of FIPS 180-4.
+fn hash_block(hs: *mut Hash) {
+    var kt: [u64; 64] = [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
+        2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
+        1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
+        264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
+        113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+        1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
+        3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+        1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
+        2428436474, 2756734187, 3204031479, 3329325298,
+    ]
+    var w: [u64; 64] = [0; 64]
+    var i: usize = 0
+    while i < 16 {
+        let b: usize = i * 4
+        w[i] = ((rt.buf_at(&(*hs).block, b) as u64) << 24)
+        | ((rt.buf_at(&(*hs).block, b + 1) as u64) << 16)
+        | ((rt.buf_at(&(*hs).block, b + 2) as u64) << 8)
+        | (rt.buf_at(&(*hs).block, b + 3) as u64)
+        i = i + 1
+    }
+    i = 16
+    while i < 64 {
+        let x: u64 = w[i - 15]
+        let y: u64 = w[i - 2]
+        let s0: u64 = rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3)
+        let s1: u64 = rotr(y, 17) ^ rotr(y, 19) ^ (y >> 10)
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & M32
+        i = i + 1
+    }
+    var a: u64 = (*hs).h0
+    var b2: u64 = (*hs).h1
+    var c: u64 = (*hs).h2
+    var d: u64 = (*hs).h3
+    var e: u64 = (*hs).h4
+    var f: u64 = (*hs).h5
+    var g: u64 = (*hs).h6
+    var h: u64 = (*hs).h7
+    i = 0
+    while i < 64 {
+        let sig1: u64 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
+        let ch: u64 = (e & f) ^ ((e ^ M32) & g)
+        let t1: u64 = (h + sig1 + ch + kt[i] + w[i]) & M32
+        let sig0: u64 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
+        let maj: u64 = (a & b2) ^ (a & c) ^ (b2 & c)
+        let t2: u64 = (sig0 + maj) & M32
+        h = g
+        g = f
+        f = e
+        e = (d + t1) & M32
+        d = c
+        c = b2
+        b2 = a
+        a = (t1 + t2) & M32
+        i = i + 1
+    }
+    (*hs).h0 = ((*hs).h0 + a) & M32
+    (*hs).h1 = ((*hs).h1 + b2) & M32
+    (*hs).h2 = ((*hs).h2 + c) & M32
+    (*hs).h3 = ((*hs).h3 + d) & M32
+    (*hs).h4 = ((*hs).h4 + e) & M32
+    (*hs).h5 = ((*hs).h5 + f) & M32
+    (*hs).h6 = ((*hs).h6 + g) & M32
+    (*hs).h7 = ((*hs).h7 + h) & M32
+}
+
+// EVERY octet that goes into the hash is counted HERE, and nowhere else.
+// The first version counted in `hash_push` only, so the single octets that
+// separate the pieces (`hash_byte(&hs, 10)`) were hashed but not counted --
+// the length in the padding came out too small and every checksum over more
+// than one piece was wrong. It cost an hour to find, because the four
+// standard vectors all go through ONE push and were all correct.
+fn hash_byte(hs: *mut Hash, v: u8) {
+    (*hs).total = (*hs).total + 1
+    rt.buf_push(&(*hs).block, v)
+    if rt.buf_len(&(*hs).block) == 64 {
+        hash_block(hs)
+        rt.buf_clear(&(*hs).block)
+    }
+}
+
+fn hash_push(hs: *mut Hash, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        hash_byte(hs, rt.ld8(p, i))
+        i = i + 1
+    }
+}
+
+fn hash_buf(hs: *mut Hash, b: *mut rt.Buf) {
+    hash_push(hs, rt.buf_ptr(b), rt.buf_len(b))
+}
+
+// A decimal number, so that no two file sets can be glued into the same
+// octet stream.
+fn hash_dec(hs: *mut Hash, v: u64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&t, v)
+    hash_buf(hs, &t)
+    rt.buf_free(&t)
+}
+
+fn hex8(out: *mut rt.Buf, v: u64) {
+    var i: usize = 0
+    while i < 8 {
+        let sh: u64 = 28 - (4 * (i as u64))
+        let d: u64 = (v >> sh) & 15
+        var c: u64 = 48 + d
+        if d > 9 {
+            c = 87 + d
+        }
+        rt.buf_push(out, c as u8)
+        i = i + 1
+    }
+}
+
+// Close the stream and append the 64 hex characters to `out`.
+fn hash_hex(hs: *mut Hash, out: *mut rt.Buf) {
+    // The length is taken BEFORE the padding -- the padding octets go
+    // through `hash_byte` too and would otherwise count themselves.
+    let bits: u64 = (*hs).total * 8
+    hash_byte(hs, 128 as u8)
+    while rt.buf_len(&(*hs).block) != 56 {
+        hash_byte(hs, 0 as u8)
+    }
+    var i: usize = 0
+    while i < 8 {
+        let sh: u64 = 56 - (8 * (i as u64))
+        hash_byte(hs, ((bits >> sh) & 255) as u8)
+        i = i + 1
+    }
+    hex8(out, (*hs).h0)
+    hex8(out, (*hs).h1)
+    hex8(out, (*hs).h2)
+    hex8(out, (*hs).h3)
+    hex8(out, (*hs).h4)
+    hex8(out, (*hs).h5)
+    hex8(out, (*hs).h6)
+    hex8(out, (*hs).h7)
+}
+
+// The 64 hex characters over one octet sequence.
+fn sha256_hex(out: *mut rt.Buf, p: u64, n: usize) {
+    var hs: Hash = hash_new()
+    hash_push(&hs, p, n)
+    hash_hex(&hs, out)
+    hash_free(&hs)
+}
+
+// ------------------------------------------------------------------ lock
+//
+// The driver hands over the PATH of every source file of this build
+// (`lock_add`); the reading, the grouping and the sorting happen here.
+
+struct Lock {
+    txt: rt.Buf, // paths, each null terminated
+    poff: Vec[u32],
+    plen: Vec[u32],
+    key: rt.Buf, // sort key per file, null terminated
+    koff: Vec[u32],
+    klen: Vec[u32],
+    pkg: Vec[u32], // package of the file, NONE = outside every package
+    idx: Vec[u32], // scratch for sorting
+    seen: Vec[u32],
+    stack: Vec[u32],
+    order: Vec[u32],
+    out: rt.Buf,
+    err: rt.Buf,
+}
+
+fn lock_new() -> Lock {
+    return Lock {
+        txt: rt.buf_new(), poff: vec_new[u32](), plen: vec_new[u32](),
+        key: rt.buf_new(), koff: vec_new[u32](), klen: vec_new[u32](),
+        pkg: vec_new[u32](), idx: vec_new[u32](),
+        seen: vec_new[u32](), stack: vec_new[u32](), order: vec_new[u32](),
+        out: rt.buf_new(), err: rt.buf_new(),
+    }
+}
+
+fn lock_free(lk: *mut Lock) {
+    rt.buf_free(&(*lk).txt)
+    vec_free[u32](&(*lk).poff)
+    vec_free[u32](&(*lk).plen)
+    rt.buf_free(&(*lk).key)
+    vec_free[u32](&(*lk).koff)
+    vec_free[u32](&(*lk).klen)
+    vec_free[u32](&(*lk).pkg)
+    vec_free[u32](&(*lk).idx)
+    vec_free[u32](&(*lk).seen)
+    vec_free[u32](&(*lk).stack)
+    vec_free[u32](&(*lk).order)
+    rt.buf_free(&(*lk).out)
+    rt.buf_free(&(*lk).err)
+}
+
+fn lock_out(lk: *mut Lock) -> *mut rt.Buf {
+    return &(*lk).out
+}
+
+fn lock_error(lk: *mut Lock) -> *mut rt.Buf {
+    return &(*lk).err
+}
+
+fn lock_count(lk: *mut Lock) -> usize {
+    return vec_len[u32](&(*lk).poff)
+}
+
+// One source file of this build.
+fn lock_add(lk: *mut Lock, p: u64, n: usize) {
+    vec_push[u32](&(*lk).poff, rt.buf_len(&(*lk).txt) as u32)
+    vec_push[u32](&(*lk).plen, n as u32)
+    rt.buf_push_bytes(&(*lk).txt, p, n)
+    rt.buf_push(&(*lk).txt, 0 as u8)
+}
+
+fn lock_path_ptr(lk: *mut Lock, i: usize) -> u64 {
+    return rt.buf_ptr(&(*lk).txt) + vec_at[u32](&(*lk).poff, i) as u64
+}
+
+fn lock_path_len(lk: *mut Lock, i: usize) -> usize {
+    return vec_at[u32](&(*lk).plen, i) as usize
+}
+
+fn key_add(lk: *mut Lock, p: u64, n: usize) {
+    vec_push[u32](&(*lk).koff, rt.buf_len(&(*lk).key) as u32)
+    vec_push[u32](&(*lk).klen, n as u32)
+    rt.buf_push_bytes(&(*lk).key, p, n)
+    rt.buf_push(&(*lk).key, 0 as u8)
+}
+
+fn key_ptr(lk: *mut Lock, i: usize) -> u64 {
+    return rt.buf_ptr(&(*lk).key) + vec_at[u32](&(*lk).koff, i) as u64
+}
+
+fn key_len(lk: *mut Lock, i: usize) -> usize {
+    return vec_at[u32](&(*lk).klen, i) as usize
+}
+
+// The last element of a path -- the key of a file outside every package.
+fn file_name(out: *mut rt.Buf, p: u64, n: usize) {
+    var s: usize = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 47 as u8 {
+            s = i + 1
+        }
+        i = i + 1
+    }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, p + s as u64, n - s)
+}
+
+// `key \n length \n content \n` for every file of `which` (a package index,
+// or NONE for everything outside), in the order of the sorted keys.
+// Appends the 64 hex characters to `out` and returns how many files it was.
+fn sum_over(lk: *mut Lock, which: u32, out: *mut rt.Buf) -> usize {
+    vec_clear[u32](&(*lk).idx)
+    var i: usize = 0
+    while i < lock_count(lk) {
+        if vec_at[u32](&(*lk).pkg, i) == which {
+            vec_push[u32](&(*lk).idx, i as u32)
+        }
+        i = i + 1
+    }
+    // Insertion sort over the keys -- a few dozen entries, and it has to
+    // be the same order as `sort_by` in Rust: octet for octet, the shorter
+    // one first when it is a prefix (`package::str_less`).
+    var a: usize = 1
+    while a < vec_len[u32](&(*lk).idx) {
+        let v: u32 = vec_at[u32](&(*lk).idx, a)
+        var b: usize = a
+        while b > 0 {
+            let u: u32 = vec_at[u32](&(*lk).idx, b - 1)
+            if !package.str_less(key_ptr(lk, v as usize), key_len(lk, v as usize),
+                key_ptr(lk, u as usize), key_len(lk, u as usize)) {
+                break
+            }
+            vec_set[u32](&(*lk).idx, b, u)
+            b = b - 1
+        }
+        vec_set[u32](&(*lk).idx, b, v)
+        a = a + 1
+    }
+    var hs: Hash = hash_new()
+    var source: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < vec_len[u32](&(*lk).idx) {
+        let f: usize = vec_at[u32](&(*lk).idx, k) as usize
+        rt.buf_clear(&source)
+        rt.read_file(lock_path_ptr(lk, f), &source)
+        hash_push(&hs, key_ptr(lk, f), key_len(lk, f))
+        hash_byte(&hs, 10 as u8)
+        hash_dec(&hs, rt.buf_len(&source) as u64)
+        hash_byte(&hs, 10 as u8)
+        hash_buf(&hs, &source)
+        hash_byte(&hs, 10 as u8)
+        k = k + 1
+    }
+    let cnt: usize = vec_len[u32](&(*lk).idx)
+    hash_hex(&hs, out)
+    rt.buf_free(&source)
+    hash_free(&hs)
+    return cnt
+}
+
+// Which package does every file belong to, and under which key? The
+// manifest of every reachable package is appended as a file of its own --
+// it decides version, interface and dependencies, so it belongs in the
+// checksum.
+fn keys_build(lk: *mut Lock, w: *mut package.World, cp: u64, cn: usize) {
+    var abs: rt.Buf = rt.buf_new()
+    var kb: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < lock_count(lk) {
+        package.absolute(&abs, lock_path_ptr(lk, i), lock_path_len(lk, i), cp, cn)
+        let z: i64 = package.world_package_of(w, rt.buf_ptr(&abs), rt.buf_len(&abs))
+        if z >= 0 {
+            let rp: u64 = package.world_root_ptr(w, z as usize)
+            package.relative(&kb, rp, rt.c_length(rp),
+                rt.buf_ptr(&abs), rt.buf_len(&abs))
+            vec_push[u32](&(*lk).pkg, z as u32)
+        } else {
+            file_name(&kb, rt.buf_ptr(&abs), rt.buf_len(&abs))
+            vec_push[u32](&(*lk).pkg, NONE)
+        }
+        key_add(lk, rt.buf_ptr(&kb), rt.buf_len(&kb))
+        i = i + 1
+    }
+    rt.buf_free(&kb)
+    rt.buf_free(&abs)
+}
+
+// Every package that can be REACHED from the root package, ordered by name.
+// After the version resolution a superseded directory can still sit in the
+// world with nobody pointing at it; it is not part of this build.
+fn order_build(lk: *mut Lock, w: *mut package.World) {
+    vec_clear[u32](&(*lk).seen)
+    vec_clear[u32](&(*lk).stack)
+    vec_clear[u32](&(*lk).order)
+    var i: usize = 0
+    while i < package.world_count(w) {
+        vec_push[u32](&(*lk).seen, 0)
+        i = i + 1
+    }
+    if package.world_count(w) == 0 {
+        return
+    }
+    vec_set[u32](&(*lk).seen, 0, 1)
+    vec_push[u32](&(*lk).stack, 0)
+    while vec_len[u32](&(*lk).stack) > 0 {
+        let p: usize = vec_pop[u32](&(*lk).stack) as usize
+        vec_push[u32](&(*lk).order, p as u32)
+        var k: usize = 0
+        while k < package.world_dep_count(w, p) {
+            let t: i64 = package.world_dep_target(w, p, k)
+            if t >= 0 {
+                if vec_at[u32](&(*lk).seen, t as usize) == 0 {
+                    vec_set[u32](&(*lk).seen, t as usize, 1)
+                    vec_push[u32](&(*lk).stack, t as u32)
+                }
+            }
+            k = k + 1
+        }
+    }
+    // by name, insertion sort
+    var a: usize = 1
+    while a < vec_len[u32](&(*lk).order) {
+        let v: u32 = vec_at[u32](&(*lk).order, a)
+        var b: usize = a
+        while b > 0 {
+            let u: u32 = vec_at[u32](&(*lk).order, b - 1)
+            let vp: u64 = package.world_name_ptr(w, v as usize)
+            let up: u64 = package.world_name_ptr(w, u as usize)
+            if !package.str_less(vp, rt.c_length(vp), up, rt.c_length(up)) {
+                break
+            }
+            vec_set[u32](&(*lk).order, b, u)
+            b = b - 1
+        }
+        vec_set[u32](&(*lk).order, b, v)
+        a = a + 1
+    }
+}
+
+// The whole text of the lock file. `false` = a file could not be read; the
+// message is then in `(*lk).err`.
+fn lock_finish(lk: *mut Lock, w: *mut package.World, cp: u64, cn: usize) -> bool {
+    var k_lock: [u8; 6] = "lock \0"
+    var k_root: [u8; 6] = "root \0"
+    var k_package: [u8; 9] = "package \0"
+    var k_outside: [u8; 9] = "outside \0"
+    var k_total: [u8; 7] = "total \0"
+    var mname: [u8; 13] = "firn.package\0"
+    if package.world_count(w) == 0 {
+        return true
+    }
+    order_build(lk, w)
+    // The manifests are files of this build as well.
+    var i: usize = 0
+    while i < vec_len[u32](&(*lk).order) {
+        let p: usize = vec_at[u32](&(*lk).order, i) as usize
+        let mp: u64 = package.world_mpath_ptr(w, p)
+        lock_add(lk, mp, rt.c_length(mp))
+        i = i + 1
+    }
+    keys_build(lk, w, cp, cn)
+    // The manifests get their key from the path arithmetic ("firn.package"
+    // relative to the root of their package) -- the same name `lock.rs` uses,
+    // so nothing has to be patched afterwards.
+    var body: rt.Buf = rt.buf_new()
+    package.ptext(&body, (&k_lock[0]) as u64)
+    rt.buf_push_dec_u64(&body, FORMAT)
+    rt.buf_push(&body, 10 as u8)
+    package.ptext(&body, (&k_root[0]) as u64)
+    package.ptext(&body, package.world_name_ptr(w, 0))
+    rt.buf_push(&body, 10 as u8)
+    var rel: rt.Buf = rt.buf_new()
+    let root0: u64 = package.world_root_ptr(w, 0)
+    var t: usize = 0
+    while t < vec_len[u32](&(*lk).order) {
+        let p: usize = vec_at[u32](&(*lk).order, t) as usize
+        let rp: u64 = package.world_root_ptr(w, p)
+        package.relative(&rel, root0, rt.c_length(root0), rp, rt.c_length(rp))
+        package.ptext(&body, (&k_package[0]) as u64)
+        package.ptext(&body, package.world_name_ptr(w, p))
+        rt.buf_push(&body, 32 as u8)
+        package.ptext(&body, package.world_version_ptr(w, p))
+        rt.buf_push(&body, 32 as u8)
+        rt.buf_push_bytes(&body, rt.buf_ptr(&rel), rt.buf_len(&rel))
+        rt.buf_push(&body, 32 as u8)
+        sum_over(lk, p as u32, &body)
+        rt.buf_push(&body, 10 as u8)
+        t = t + 1
+    }
+    var osum: rt.Buf = rt.buf_new()
+    let ocnt: usize = sum_over(lk, NONE, &osum)
+    package.ptext(&body, (&k_outside[0]) as u64)
+    rt.buf_push_dec_u64(&body, ocnt as u64)
+    rt.buf_push(&body, 32 as u8)
+    rt.buf_push_bytes(&body, rt.buf_ptr(&osum), rt.buf_len(&osum))
+    rt.buf_push(&body, 10 as u8)
+    rt.buf_clear(&(*lk).out)
+    rt.buf_push_bytes(&(*lk).out, rt.buf_ptr(&body), rt.buf_len(&body))
+    package.ptext(&(*lk).out, (&k_total[0]) as u64)
+    sha256_hex(&(*lk).out, rt.buf_ptr(&body), rt.buf_len(&body))
+    rt.buf_push(&(*lk).out, 10 as u8)
+    rt.buf_free(&osum)
+    rt.buf_free(&rel)
+    rt.buf_free(&body)
+    return true
+}
+
+// --------------------------------------------------------------- messages
+//
+// Every text stands here, so that `firnc0` and `firnc1` say the same
+// sentence (`compiler/src/lock.rs`, same names).
+
+fn lock_error_missing(lk: *mut Lock, pp: u64, pn: usize) {
+    var t1: [u8; 8] = "error: \0"
+    var t2: [u8; 28] = ": the lock file is missing\n\0"
+    var t3: [u8; 26] = "note: '--lock' writes it\n\0"
+    rt.buf_clear(&(*lk).err)
+    package.ptext(&(*lk).err, (&t1[0]) as u64)
+    rt.buf_push_bytes(&(*lk).err, pp, pn)
+    package.ptext(&(*lk).err, (&t2[0]) as u64)
+    package.ptext(&(*lk).err, (&t3[0]) as u64)
+}
+
+fn lock_error_needs_package(lk: *mut Lock, wp: u64) {
+    var t1: [u8; 8] = "error: \0"
+    var t2: [u8; 37] = " works only together with --package\n\0"
+    rt.buf_clear(&(*lk).err)
+    package.ptext(&(*lk).err, (&t1[0]) as u64)
+    package.ptext(&(*lk).err, wp)
+    package.ptext(&(*lk).err, (&t2[0]) as u64)
+}
+
+// The i-th line of (p, n), with every trailing newline cut off first --
+// the same rule as `trim_end_matches('\n').split('\n')` in Rust. `false` =
+// there is no such line.
+fn line_at(p: u64, n: usize, i: usize, off: *mut usize, len: *mut usize) -> bool {
+    var m: usize = n
+    while m > 0 {
+        if rt.ld8(p, m - 1) != 10 as u8 {
+            break
+        }
+        m = m - 1
+    }
+    var nr: usize = 0
+    var s: usize = 0
+    var k: usize = 0
+    while k <= m {
+        var at_end: bool = false
+        if k == m {
+            at_end = true
+        } else {
+            if rt.ld8(p, k) == 10 as u8 {
+                at_end = true
+            }
+        }
+        if at_end {
+            if nr == i {
+                *off = s
+                *len = k - s
+                return true
+            }
+            nr = nr + 1
+            s = k + 1
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn line_count(p: u64, n: usize) -> usize {
+    var i: usize = 0
+    var o: usize = 0
+    var l: usize = 0
+    while line_at(p, n, i, &o, &l) {
+        i = i + 1
+    }
+    return i
+}
+
+fn note_line(lk: *mut Lock, front: u64, nr: usize, p: u64, o: usize, l: usize) {
+    var t1: [u8; 12] = "note: line \0"
+    package.ptext(&(*lk).err, (&t1[0]) as u64)
+    rt.buf_push_dec_u64(&(*lk).err, nr as u64)
+    package.ptext(&(*lk).err, front)
+    rt.buf_push(&(*lk).err, 39 as u8)
+    rt.buf_push_bytes(&(*lk).err, p + o as u64, l)
+    rt.buf_push(&(*lk).err, 39 as u8)
+    rt.buf_push(&(*lk).err, 10 as u8)
+}
+
+// "the lock file does not match the sources", plus the FIRST line at which
+// the two texts part. `true` = they are equal after all, then nothing was
+// written.
+fn lock_error_mismatch(lk: *mut Lock, pp: u64, pn: usize, fp: u64, fn_: usize) -> bool {
+    var t1: [u8; 8] = "error: \0"
+    var t2: [u8; 44] = ": the lock file does not match the sources\n\0"
+    var f_file: [u8; 16] = " of the file:  \0"
+    var f_build: [u8; 16] = " of the build: \0"
+    var f_missing: [u8; 26] = " is missing in the file: \0"
+    var f_extra: [u8; 30] = " of the file is superfluous: \0"
+    let cp: u64 = rt.buf_ptr(&(*lk).out)
+    let cn: usize = rt.buf_len(&(*lk).out)
+    let na: usize = line_count(fp, fn_)
+    let nb: usize = line_count(cp, cn)
+    var same: usize = na
+    if nb < na {
+        same = nb
+    }
+    var i: usize = 0
+    var ao: usize = 0
+    var al: usize = 0
+    var bo: usize = 0
+    var bl: usize = 0
+    while i < same {
+        line_at(fp, fn_, i, &ao, &al)
+        line_at(cp, cn, i, &bo, &bl)
+        var equal: bool = false
+        if al == bl {
+            equal = true
+            if al > 0 {
+                equal = rt.mem_eq(fp + ao as u64, cp + bo as u64, al)
+            }
+        }
+        if !equal {
+            rt.buf_clear(&(*lk).err)
+            package.ptext(&(*lk).err, (&t1[0]) as u64)
+            rt.buf_push_bytes(&(*lk).err, pp, pn)
+            package.ptext(&(*lk).err, (&t2[0]) as u64)
+            note_line(lk, (&f_file[0]) as u64, i + 1, fp, ao, al)
+            note_line(lk, (&f_build[0]) as u64, i + 1, cp, bo, bl)
+            return false
+        }
+        i = i + 1
+    }
+    if nb > na {
+        line_at(cp, cn, same, &bo, &bl)
+        rt.buf_clear(&(*lk).err)
+        package.ptext(&(*lk).err, (&t1[0]) as u64)
+        rt.buf_push_bytes(&(*lk).err, pp, pn)
+        package.ptext(&(*lk).err, (&t2[0]) as u64)
+        note_line(lk, (&f_missing[0]) as u64, same + 1, cp, bo, bl)
+        return false
+    }
+    if na > nb {
+        line_at(fp, fn_, same, &ao, &al)
+        rt.buf_clear(&(*lk).err)
+        package.ptext(&(*lk).err, (&t1[0]) as u64)
+        rt.buf_push_bytes(&(*lk).err, pp, pn)
+        package.ptext(&(*lk).err, (&t2[0]) as u64)
+        note_line(lk, (&f_extra[0]) as u64, same + 1, fp, ao, al)
+        return false
+    }
+    return true
+}

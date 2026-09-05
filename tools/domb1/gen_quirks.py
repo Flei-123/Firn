@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Produces lib/browser/quirks_data.fi -- the DOCTYPE lists of the quirks mode.
+
+A WORKBENCH, NOT A PRODUCT: the lists are the ones of WHATWG 13.2.6.4.1
+("the initial insertion mode"), written out, nothing else. Round 54 built
+in four of the prefixes and said so openly; round B1 completes the list.
+
+The entries are compared ASCII CASE INSENSITIVELY, and the comparison
+functions of lib/browser/node.fi lower the DOCUMENT side. So the table
+side has to be lower case already -- the script does that.
+
+The separator is `|`: no public identifier of the standard contains one.
+
+Usage:  python3 tools/domb1/gen_quirks.py
+"""
+
+import os
+
+# Public identifiers that mean quirks on an EXACT match.
+QUIRKS_EXACT = [
+    "-//W3O//DTD W3 HTML Strict 3.0//EN//",
+    "-/W3C/DTD HTML 4.0 Transitional/EN",
+    "HTML",
+]
+
+# The system identifier that means quirks on an exact match.
+QUIRKS_SYSTEM = [
+    "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd",
+]
+
+# Public identifier PREFIXES that mean quirks.
+QUIRKS_PREFIX = [
+    "+//Silmaril//dtd html Pro v0r11 19970101//",
+    "-//AS//DTD HTML 3.0 asWedit + extensions//",
+    "-//AdvaSoft Ltd//DTD HTML 3.0 asWedit + extensions//",
+    "-//IETF//DTD HTML 2.0 Level 1//",
+    "-//IETF//DTD HTML 2.0 Level 2//",
+    "-//IETF//DTD HTML 2.0 Strict Level 1//",
+    "-//IETF//DTD HTML 2.0 Strict Level 2//",
+    "-//IETF//DTD HTML 2.0 Strict//",
+    "-//IETF//DTD HTML 2.0//",
+    "-//IETF//DTD HTML 2.1E//",
+    "-//IETF//DTD HTML 3.0//",
+    "-//IETF//DTD HTML 3.2 Final//",
+    "-//IETF//DTD HTML 3.2//",
+    "-//IETF//DTD HTML 3//",
+    "-//IETF//DTD HTML Level 0//",
+    "-//IETF//DTD HTML Level 1//",
+    "-//IETF//DTD HTML Level 2//",
+    "-//IETF//DTD HTML Level 3//",
+    "-//IETF//DTD HTML Strict Level 0//",
+    "-//IETF//DTD HTML Strict Level 1//",
+    "-//IETF//DTD HTML Strict Level 2//",
+    "-//IETF//DTD HTML Strict Level 3//",
+    "-//IETF//DTD HTML Strict//",
+    "-//IETF//DTD HTML//",
+    "-//Metrius//DTD Metrius Presentational//",
+    "-//Microsoft//DTD Internet Explorer 2.0 HTML Strict//",
+    "-//Microsoft//DTD Internet Explorer 2.0 HTML//",
+    "-//Microsoft//DTD Internet Explorer 2.0 Tables//",
+    "-//Microsoft//DTD Internet Explorer 3.0 HTML Strict//",
+    "-//Microsoft//DTD Internet Explorer 3.0 HTML//",
+    "-//Microsoft//DTD Internet Explorer 3.0 Tables//",
+    "-//Netscape Comm. Corp.//DTD HTML//",
+    "-//Netscape Comm. Corp.//DTD Strict HTML//",
+    "-//O'Reilly and Associates//DTD HTML 2.0//",
+    "-//O'Reilly and Associates//DTD HTML Extended 1.0//",
+    "-//O'Reilly and Associates//DTD HTML Extended Relaxed 1.0//",
+    "-//SQ//DTD HTML 2.0 HoTMetaL + extensions//",
+    "-//SoftQuad Software//DTD HoTMetaL PRO 6.0::19990601::extensions to HTML 4.0//",
+    "-//SoftQuad//DTD HoTMetaL PRO 4.0::19971010::extensions to HTML 4.0//",
+    "-//Spyglass//DTD HTML 2.0 Extended//",
+    "-//Sun Microsystems Corp.//DTD HotJava HTML//",
+    "-//Sun Microsystems Corp.//DTD HotJava Strict HTML//",
+    "-//W3C//DTD HTML 3 1995-03-24//",
+    "-//W3C//DTD HTML 3.2 Draft//",
+    "-//W3C//DTD HTML 3.2 Final//",
+    "-//W3C//DTD HTML 3.2//",
+    "-//W3C//DTD HTML 3.2S Draft//",
+    "-//W3C//DTD HTML 4.0 Frameset//",
+    "-//W3C//DTD HTML 4.0 Transitional//",
+    "-//W3C//DTD HTML Experimental 19960712//",
+    "-//W3C//DTD HTML Experimental 970421//",
+    "-//W3C//DTD W3 HTML//",
+    "-//W3O//DTD W3 HTML 3.0//",
+    "-//WebTechs//DTD Mozilla HTML 2.0//",
+    "-//WebTechs//DTD Mozilla HTML//",
+]
+
+# Prefixes that mean quirks WITHOUT a system identifier and limited quirks
+# WITH one.
+BOTH_PREFIX = [
+    "-//W3C//DTD HTML 4.01 Frameset//",
+    "-//W3C//DTD HTML 4.01 Transitional//",
+]
+
+# Prefixes that always mean limited quirks.
+LIMITED_PREFIX = [
+    "-//W3C//DTD XHTML 1.0 Frameset//",
+    "-//W3C//DTD XHTML 1.0 Transitional//",
+]
+
+
+def literal(name, items, comment):
+    text = "|".join(x.lower() for x in items)
+    raw = text.encode("utf-8")
+    out = []
+    out.append("// %s" % comment)
+    out.append("#[no_gc]")
+    out.append("fn %s(out: *mut mem.Buf) {" % name)
+    out.append("    var t: [u8; %d] = \"%s\"" % (len(raw), text))
+    out.append("    var i: usize = 0")
+    out.append("    while i < %d {" % len(raw))
+    out.append("        mem.buf_push(out, t[i])")
+    out.append("        i = i + 1")
+    out.append("    }")
+    out.append("}")
+    return "\n".join(out)
+
+
+def main():
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    target = os.path.join(root, "lib", "browser", "quirks_data.fi")
+    for group in (QUIRKS_EXACT, QUIRKS_SYSTEM, QUIRKS_PREFIX, BOTH_PREFIX,
+                  LIMITED_PREFIX):
+        for x in group:
+            if "|" in x or '"' in x or "\\" in x:
+                raise SystemExit("bad character in %r" % x)
+
+    head = '''// lib/browser/quirks_data.fi -- GENERATED by tools/domb1/gen_quirks.py.
+// DO NOT EDIT BY HAND. The source of the lists is the script.
+//
+// The DOCTYPE lists of WHATWG 13.2.6.4.1. Round 54 built four of the
+// prefixes in and said openly that the other fifty were missing; this is
+// the rest. The entries are LOWER CASE, because the comparison functions of
+// lib/browser/node.fi lower the document side and expect the table side
+// lowered already. The separator is `|`.
+
+import html.mem
+
+export {
+    quirks_exact_bytes, quirks_system_bytes, quirks_prefix_bytes,
+    both_prefix_bytes, limited_prefix_bytes,
+}
+'''
+    parts = [head.rstrip('\n')]
+    parts.append(literal("quirks_exact_bytes", QUIRKS_EXACT,
+                         "Public identifiers: an exact match means quirks."))
+    parts.append(literal("quirks_system_bytes", QUIRKS_SYSTEM,
+                         "System identifiers: an exact match means quirks."))
+    parts.append(literal("quirks_prefix_bytes", QUIRKS_PREFIX,
+                         "Public identifier prefixes: quirks."))
+    parts.append(literal("both_prefix_bytes", BOTH_PREFIX,
+                         "Prefixes: quirks without a system id, limited with one."))
+    parts.append(literal("limited_prefix_bytes", LIMITED_PREFIX,
+                         "Public identifier prefixes: limited quirks."))
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("\n\n".join(parts) + "\n")
+    print("wrote %s (%d + %d + %d + %d + %d entries)" %
+          (target, len(QUIRKS_EXACT), len(QUIRKS_SYSTEM), len(QUIRKS_PREFIX),
+           len(BOTH_PREFIX), len(LIMITED_PREFIX)))
+
+
+if __name__ == "__main__":
+    main()

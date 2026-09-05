@@ -1,0 +1,206 @@
+// expect_exit: 0
+// tests/915_css_gc.fi -- the CSS path leaves nothing behind.
+//
+// The long endurance run stands in tools/css/gc_style.sh (RSS flat over 60
+// seconds). What is checked HERE is the same promise in the small, so that
+// it is part of test.sh: after N rounds of stylesheet, selectors and style
+// table, the number of LIVE GC objects has to be back where it was -- and
+// the counter check, which holds every table onto a chain, MUST push it up.
+// A test that only checks the good case cannot see a leak at all.
+//
+// The style table is a `GcMap` with the NODES as keys and the styles as
+// values. Both are traced pointers; the table therefore keeps a whole
+// document alive as long as it is reachable itself. Exactly that is the
+// case a reference count cannot resolve.
+//
+// The return value names the first case that deviates (1..3).
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import css.cascade
+
+const SOURCE_LEN: usize = 151
+const SHEET_LEN: usize = 125
+const ROUNDS: u64 = 40
+
+#[no_gc]
+fn source(out: *mut mem.Buf) {
+    var t: [u8; 151] = "<div id=\"a\" class=\"x\"><p class=\"y\">one</p><p>two</p><ul><li>a</li><li class=\"s\">b</li><li>c</li></ul><table><tr><td>1</td><td>2</td></tr></table></div>"
+    mem.buf_clear(out)
+    var i: usize = 0
+    while i < SOURCE_LEN {
+        mem.buf_push(out, t[i])
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn sheet(out: *mut mem.CpBuf) {
+    var t: [u8; 125] = "div p{color:red;font-size:120%}li:nth-child(2n){color:blue}#a .y{margin:1em 2em}td:last-child{padding:1px}p:hover{color:teal}"
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < SHEET_LEN {
+        mem.cp_push(out, t[i] as u32)
+        i = i + 1
+    }
+}
+
+gc class Holder {
+    table: Gc[GcMap],
+    next: Gc[Holder],
+}
+
+fn next_in_order(k: Gc[Node], root: Gc[Node]) -> Gc[Node] {
+    if k.first_child != gc_null[Node]() {
+        return k.first_child
+    }
+    var c: Gc[Node] = k
+    while c != gc_null[Node]() && c != root {
+        if c.next != gc_null[Node]() {
+            return c.next
+        }
+        c = c.parent
+    }
+    return gc_null[Node]()
+}
+
+// Lays a deep, nulled frame over the abandoned frames -- the stack scan is
+// conservative, an old pointer in a dead frame would keep a document alive.
+fn scrub_deep(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    var i: usize = 0
+    while i < 256 {
+        buffer[i] = 0
+        i = i + 1
+    }
+    barrier(&buffer)
+    if n > 0 {
+        scrub_deep(n - 1)
+    }
+}
+
+fn one_round(run: *mut driver.Run, src: *mut mem.Buf, css: *mut mem.CpBuf,
+    t: *mut tok.Tokens, tmp: *mut mem.CpBuf, cx: *mut sel.Ctx,
+    w: *mut cascade.Winner, keep: *mut Gc[GcMap]) -> AllocError!u64 {
+    driver.run_text_out_bytes(run, mem.buf_ptr(src), mem.buf_len(src))
+    if driver.run_document_build(run) != 0 as u32 {
+        return 0
+    }
+    let doc: Gc[Document] = driver.run_document(run)
+    let nm: *mut names.Names = driver.run_names(run)
+    tok.tokenize(t, css)
+    var p: cv.Parser = cv.parser_new(t)
+    let sheet_tree = try cv.parse_stylesheet(&p)
+    var order: u32 = 0
+    let rules = try cascade.collect_rules(sheet_tree, cascade.ORIGIN_AUTHOR, 0,
+        nm, tmp, &order)
+    let styles = try gcmap_new(true, true)
+    let root_style = try cascade.style_root()
+    var k: Gc[Node] = doc
+    var n: u64 = 0
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            var parent_style: Gc[Style] = root_style
+            let parent: Gc[Node] = k.parent
+            if parent != gc_null[Node]() && parent.kind == node.K_ELEM {
+                let found: Gc[Style] = gcmap_get_value[Style](styles, parent as u64)
+                if found != gc_null[Style]() {
+                    parent_style = found
+                }
+            }
+            let s = try cascade.cascade_elem(rules, k, parent_style, cx, w)
+            let ok: bool = try gcmap_set_value[Style](styles, k as u64, s)
+            n = n + 1
+        }
+        k = next_in_order(k, doc)
+    }
+    *keep = styles
+    return n
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    var run: driver.Run = driver.run_new()
+    if !driver.run_init(&run) {
+        return 91
+    }
+    var src: mem.Buf = mem.buf_new()
+    mem.buf_init(&src)
+    source(&src)
+    var css: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&css)
+    sheet(&css)
+    var t: tok.Tokens = tok.tokens_new()
+    tok.tokens_init(&t)
+    var tmp: mem.CpBuf = mem.cp_new()
+    var cx: sel.Ctx = sel.ctx_new(driver.run_names(&run))
+    sel.ctx_init(&cx)
+    var w: cascade.Winner = cascade.winner_new()
+    var keep: Gc[GcMap] = gc_null[GcMap]()
+
+    // 1. the first round has to compute styles at all
+    var elements: u64 = one_round(&run, &src, &css, &t, &tmp, &cx, &w, &keep) catch 0
+    if elements != 15 {
+        return 1
+    }
+    keep = gc_null[GcMap]()
+    driver.run_tree_release(&run)
+    scrub_deep(3)
+    gc_collect()
+    let base: u64 = gc_live_objects()
+
+    // 2. after ROUNDS further rounds nothing more may be alive
+    var i: u64 = 0
+    while i < ROUNDS {
+        let n: u64 = one_round(&run, &src, &css, &t, &tmp, &cx, &w, &keep) catch 0
+        if n != elements {
+            return 2
+        }
+        keep = gc_null[GcMap]()
+        i = i + 1
+    }
+    driver.run_tree_release(&run)
+    scrub_deep(3)
+    gc_collect()
+    let after: u64 = gc_live_objects()
+    if after > base + 200 {
+        return 2
+    }
+
+    // 3. the counter check: every table is held onto -- it HAS to grow
+    var chain: Gc[Holder] = gc_null[Holder]()
+    i = 0
+    while i < ROUNDS {
+        let n: u64 = one_round(&run, &src, &css, &t, &tmp, &cx, &w, &keep) catch 0
+        if n != elements {
+            return 3
+        }
+        let h = gc Holder { table: keep, next: chain } catch gc_null[Holder]()
+        if h == gc_null[Holder]() {
+            return 3
+        }
+        chain = h
+        keep = gc_null[GcMap]()
+        i = i + 1
+    }
+    gc_collect()
+    let leaked: u64 = gc_live_objects()
+    if chain == gc_null[Holder]() {
+        return 3
+    }
+    // Every held table keeps its whole document alive.
+    // Measured (round 60): 40 held tables keep about 2,800 objects alive
+    // -- roughly 70 per document. The limit is set well below that, so
+    // that the check strikes but does not become brittle.
+    if leaked < after + ROUNDS * 40 {
+        return 3
+    }
+    tok.tokens_free(&t)
+    return 0
+}

@@ -1,0 +1,149 @@
+// expect_exit: 0
+// tests/1402_core_allocator.fi -- ROUND 73: THE ALLOCATOR, PASSED BY HAND.
+//
+// SPEC 2 has promised since round 52: "kernel: heap allocation only
+// through an explicitly passed Allocator". This test is the proof that the
+// sentence now has something behind it.
+//
+// WHAT IS CHECKED, and why exactly this:
+//   * the FAILURE CASE IS A VALUE. `alloc` never hands out a bare address;
+//     whoever asks for more than there is gets `ok == false`, and `p` is 0.
+//     A null pointer that looks like a block cannot arise.
+//   * ALIGNMENT is kept, and an impossible one is refused instead of being
+//     quietly rounded down.
+//   * an ARENA OVER MEMORY THAT SOMEBODY ELSE HOLDS -- here the frame of
+//     `main`. Not one system call happens in this whole test.
+//   * `grow` in place where it is possible, and honestly copying where it
+//     is not.
+//   * `reset` frees a whole round in one instruction, and the HIGH WATER
+//     MARK survives it -- it is the number a soak run measures.
+import std.core
+
+fn main() -> i32 {
+    // The whole memory of this test: 16 KiB in the frame. An arena owns
+    // nothing; it only manages what it is given.
+    var pool: [u8; 16384] = [0; 16384]
+    var a: core.Arena = core.arena_new(&pool[0], 16384)
+    let it: dyn Allocator = (&a) as dyn Allocator
+
+    // 1. the empty answer
+    let none: core.Block = core.block_none()
+    if none.ok || none.n != 0 || (none.p as usize) != 0 { return 1 }
+    if none.is_ok() { return 2 }
+    if !none.span().is_empty() { return 3 }
+
+    // 2. a size of 0 is REFUSED, not answered with an empty block
+    if core.alloc(it, 0, 16).ok { return 4 }
+    // an alignment that is not a power of two, likewise
+    if core.alloc(it, 16, 24).ok { return 5 }
+    if core.alloc(it, 16, 0).ok { return 6 }
+    if !core.is_power_of_two(64) { return 7 }
+    if core.is_power_of_two(0) { return 8 }
+    if core.align_up(17, 16) != 32 { return 9 }
+    if core.align_up(32, 16) != 32 { return 10 }
+    if core.align_default() != 16 { return 11 }
+
+    // 3. handing out, alignment, no overlap
+    let b1: core.Block = core.alloc(it, 100, 16)
+    if !b1.ok || b1.length() != 100 { return 12 }
+    if (b1.p as usize) % 16 != 0 { return 13 }
+    let b2: core.Block = core.alloc(it, 64, 64)
+    if !b2.ok { return 14 }
+    if (b2.p as usize) % 64 != 0 { return 15 }
+    if (b1.p as usize) + 100 > b2.p as usize { return 16 }
+
+    // 4. the memory really belongs to us
+    core.mem_zero(b1.p, b1.n)
+    core.st8(b1.p, 0, 65 as u8)
+    core.st8(b1.p, 99, 90 as u8)
+    if core.ld8(b1.p, 0) != 65 as u8 || core.ld8(b1.p, 99) != 90 as u8 { return 17 }
+    if core.ld8(b1.p, 50) != 0 as u8 { return 18 }
+    // and the neighbour was not written across
+    core.mem_zero(b2.p, b2.n)
+    if core.ld8(b1.p, 99) != 90 as u8 { return 19 }
+
+    // 5. MORE THAN THERE IS has to be refused -- honestly, not with a
+    //    pointer into somebody else's memory.
+    let toobig: core.Block = core.alloc(it, 1048576, 16)
+    if toobig.ok { return 20 }
+    if (toobig.p as usize) != 0 { return 21 }
+    if core.arena_refused(&a) < 1 { return 22 }
+
+    // 6. growing IN PLACE: b2 is the last block, so the arena can do it
+    let used_before: usize = a.used()
+    let g: core.Block = core.grow(it, b2, 512, 64)
+    if !g.ok || g.n != 512 { return 23 }
+    if g.p as usize != b2.p as usize { return 24 }
+    if a.used() != used_before + 448 { return 25 }
+    // shrinking gives the old block back unchanged
+    if core.grow(it, g, 100, 64).n != 512 { return 26 }
+    // growing a block that is NOT the last one has to copy
+    core.st8(b1.p, 0, 88 as u8)
+    let g1: core.Block = core.grow(it, b1, 200, 16)
+    if !g1.ok || g1.n != 200 { return 27 }
+    if g1.p as usize == b1.p as usize { return 28 }
+    if core.ld8(g1.p, 0) != 88 as u8 { return 29 }
+    if core.ld8(g1.p, 99) != 90 as u8 { return 30 }
+
+    // 7. zeroed out on request
+    core.arena_reset(&a)
+    let dirty: core.Block = core.alloc(it, 32, 16)
+    core.st8(dirty.p, 0, 77 as u8)
+    core.arena_reset(&a)
+    let clean: core.Block = core.alloc_zeroed(it, 32, 16)
+    if !clean.ok { return 31 }
+    if core.ld8(clean.p, 0) != 0 as u8 { return 32 }
+
+    // 8. giving back: an arena can do exactly the LAST block, and it says
+    //    so in its used count. Anything else is accepted and does nothing
+    //    -- that is the nature of a bump allocator, and it stands in the
+    //    header of lib/mem/core_alloc.fi.
+    core.arena_reset(&a)
+    let x: core.Block = core.alloc(it, 128, 16)
+    let y: core.Block = core.alloc(it, 128, 16)
+    let full: usize = a.used()
+    core.free(it, x, 16) // not the last one: no effect
+    if a.used() != full { return 33 }
+    core.free(it, y, 16) // the last one: comes back
+    if a.used() >= full { return 34 }
+    core.free_bytes(it, core.block_none()) // nothing at all: no crash
+
+    // 9. the high water mark is a MEMORY, not a gauge
+    let high: usize = a.high()
+    if high < full { return 35 }
+    a.reset()
+    if a.used() != 0 { return 36 }
+    if a.high() != high { return 37 }
+    if a.left() != 16384 { return 38 }
+
+    // 10. one call site, many allocators: `take` never learns which one it
+    //     got. That is what the interface is for.
+    var pool2: [u8; 512] = [0; 512]
+    var small: core.Arena = core.arena_new(&pool2[0], 512)
+    if !take((&a) as dyn Allocator, 4096) { return 39 }
+    if take((&small) as dyn Allocator, 4096) { return 40 }
+    if !take((&small) as dyn Allocator, 256) { return 41 }
+
+    // 11. a Block is a text view too -- the bridge to the other half of core
+    core.arena_reset(&a)
+    let t: core.Block = core.alloc(it, 3, 16)
+    core.st8(t.p, 0, 97 as u8)
+    core.st8(t.p, 1, 98 as u8)
+    core.st8(t.p, 2, 99 as u8)
+    var abc: [u8; 4] = "abc\0"
+    if !t.span().equal(core.span_of_c(&abc[0])) { return 42 }
+
+    return 0
+}
+
+// The whole point of the round in four lines: whoever wants memory says
+// WHOSE memory, and the failure case cannot be overlooked.
+fn take(a: dyn Allocator, n: usize) -> bool {
+    let b: core.Block = core.alloc(a, n, 16)
+    if !b.ok {
+        return false
+    }
+    core.mem_zero(b.p, b.n)
+    core.free(a, b, 16)
+    return true
+}

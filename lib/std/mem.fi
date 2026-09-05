@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MIT
+// lib/std/mem.fi -- std.mem: the unified memory facade.
+//
+// Two levels under one roof:
+//   * raw:  alloc/free -- mmap without any bookkeeping (lib/rt)
+//   * rc:   reference counts on a heap of their own (lib/rc, unchanged)
+//
+// The GC runtime deliberately needs NO module here: it is pulled in
+// automatically as soon as `gc class` appears somewhere (HOOK gc in
+// modules.rs, SPEC 3.5) -- an `import std.mem` would be neither needed nor visible.
+//
+// ROUND 73: `PageAllocator` -- the implementation of the `Allocator`
+// interface over `mmap`. The interface itself stands in
+// `lib/std/core.fi` (`lib/mem/core_alloc.fi`), because a kernel has to be
+// able to name it; the implementation has to stand HERE, because it makes
+// a system call and would render `std.core` unusable in a kernel. That
+// this works across the module boundary is no accident: `interface` holds
+// PROGRAM WIDE in Firn (docs/ROUND46.md 9), so `impl Allocator for
+// PageAllocator` finds the contract without a module name in front of it.
+import rt
+import rc
+import core
+
+export {
+    alloc, free,
+    heap_init, heap_free, heap_live, heap_allocations, heap_releases,
+    PageAllocator, pages_new, pages_live, pages_given, pages_released,
+    pages_refused,
+}
+
+// --------------------------------------------------------------------- raw
+// `n` bytes from the operating system (zero initialized). 0 = failed.
+fn alloc(n: usize) -> u64 {
+    return rt.heap_alloc(n)
+}
+
+// Give raw reserved memory back (address and size as with alloc).
+fn free(p: u64, n: usize) {
+    rt.heap_free(p, n)
+}
+
+// ---------------------------------------------------------------------- rc
+// The heap bookkeeping is exposed under short, uniform names.
+// The generic rc API itself (rc_new, rc_read, rc_clone, rc_free,
+// RefCount[T], ...) needs NO wrapper: generic names hold program wide in
+// Firn -- through this module `rc` is loaded and the names are available
+// everywhere without anybody having to qualify them. The heap type
+// `rc.RcHeap` is named through `import std.rc` (a re-export, lib/rc unchanged).
+fn heap_init(h: *mut rc.RcHeap, bytes: usize) -> bool {
+    return rc.rc_heap_init(h, bytes)
+}
+
+fn heap_free(h: *mut rc.RcHeap) {
+    rc.rc_heap_free(h)
+}
+
+fn heap_live(h: *mut rc.RcHeap) -> usize {
+    return rc.rc_heap_live(h)
+}
+
+fn heap_allocations(h: *mut rc.RcHeap) -> usize {
+    return rc.rc_heap_allocations(h)
+}
+
+fn heap_releases(h: *mut rc.RcHeap) -> usize {
+    return rc.rc_heap_releases(h)
+}
+
+// ----------------------------------------------------- the page allocator
+//
+// The allocator of the `app` profile: every block comes straight from
+// `mmap(2)`, zero initialized, page aligned. It keeps no free list and no
+// size classes -- `rt.heap_alloc` rounds up to whole pages and
+// `rt.heap_free` gives them back, and that is the whole bookkeeping.
+//
+// WHAT IT COUNTS AND WHY: `given`, `released` and `live` are not
+// decoration. They are the measurement of a soak run -- whoever runs a
+// million requests through the allocator and finds `live` standing still
+// has proved that nothing leaks. `refused` counts what it turned down; an
+// allocator that never says no is one that has not been asked hard enough.
+//
+// ALIGNMENT: `mmap` hands out page boundaries, so every alignment up to
+// 4096 is satisfied by construction. Above that the answer is an honest
+// `false` -- no over-allocation, no shifting of the address, because a
+// shifted address cannot be given back to `munmap`.
+
+struct PageAllocator {
+    live: usize,
+    given: u64,
+    released: u64,
+    refused: u64,
+}
+
+fn pages_new() -> PageAllocator {
+    return PageAllocator { live: 0, given: 0, released: 0, refused: 0 }
+}
+
+fn pages_live(a: *mut PageAllocator) -> usize {
+    return (*a).live
+}
+
+fn pages_given(a: *mut PageAllocator) -> u64 {
+    return (*a).given
+}
+
+fn pages_released(a: *mut PageAllocator) -> u64 {
+    return (*a).released
+}
+
+fn pages_refused(a: *mut PageAllocator) -> u64 {
+    return (*a).refused
+}
+
+impl PageAllocator {
+    fn live(*mut self) -> usize { return pages_live(self) }
+    fn given(*mut self) -> u64 { return pages_given(self) }
+    fn released(*mut self) -> u64 { return pages_released(self) }
+}
+
+impl Allocator for PageAllocator {
+    fn raw_alloc(*mut self, size: usize, align: usize, out: *mut u64) -> bool {
+        if size == 0 || align > 4096 {
+            (*self).refused = (*self).refused + 1
+            return false
+        }
+        let p: u64 = rt.heap_alloc(size)
+        if p == 0 {
+            (*self).refused = (*self).refused + 1
+            return false
+        }
+        (*self).live = (*self).live + size
+        (*self).given = (*self).given + 1
+        *out = p
+        return true
+    }
+
+    fn raw_free(*mut self, address: u64, size: usize, align: usize) {
+        if address == 0 {
+            return
+        }
+        rt.heap_free(address, size)
+        (*self).live = (*self).live - size
+        (*self).released = (*self).released + 1
+    }
+
+    // `mmap` cannot grow a mapping in place without `mremap`, and `mremap`
+    // may MOVE the region -- which is the same as a new block. So the
+    // honest answer is `false`, and `core.grow` does the copying, where
+    // everybody can see it.
+    fn raw_grow(*mut self, address: u64, old: usize, size: usize, align: usize,
+        out: *mut u64) -> bool {
+        return false
+    }
+}

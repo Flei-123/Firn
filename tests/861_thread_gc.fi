@@ -1,0 +1,151 @@
+// expect_exit: 0
+// ROUND 49 -- THE COLLECTOR UNDER SEVERAL THREADS.
+//
+// That is the real point of the round. What is checked:
+//   A  Several threads allocate AT THE SAME TIME from the same heap, and
+//      the collector runs while they do. The result is DETERMINISTIC: every
+//      thread yields the same sum as in a single-threaded run.
+//   B  What a thread holds on to survives -- even when ANOTHER thread leads
+//      the collection. Every chain is recomputed link by link at the end;
+//      a single collected link shows up.
+//   C  What the MAIN THREAD holds on to survives as well (its stack is the
+//      only one the collector knew before round 49).
+//   D  The world was really stopped (gc_stw_runs() > 0) and there really
+//      were collections (gc_collections() > 0). Without these two
+//      numbers the test could pass without ever having seen a
+//      collector.
+//   E  No thread is left over (thread_count() == 1) and the heap stays
+//      bounded.
+
+gc class Node {
+    next: Gc[Node],
+    value: u64,
+}
+
+const CHAIN: u64 = 400
+const GARBAGE: u64 = 6000
+
+// Builds a chain of CHAIN links with the values `kind*1000 + i` and
+// produces short-lived RUBBISH objects in between, so that the collector
+// really has to work. Yields the head of the chain.
+fn chain_build(kind: u64) -> AllocError!Gc[Node] {
+    var header: Gc[Node] = gc_null[Node]()
+    var i: u64 = 0
+    while i < CHAIN {
+        let n: Gc[Node] = try gc Node { next: header, value: kind * 1000 + i }
+        header = n
+        var m: u64 = 0
+        while m < GARBAGE / CHAIN {
+            let dead: Gc[Node] = try gc Node { next: gc_null[Node](), value: 0 }
+            if dead.value != 0 {
+                return header
+            }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    return header
+}
+
+// Recomputes the chain: length, order and values. 0 = fine,
+// otherwise the number of the first error.
+fn chain_check(header: Gc[Node], kind: u64) -> u64 {
+    var p: Gc[Node] = header
+    var i: u64 = CHAIN
+    while i > 0 {
+        i = i - 1
+        if p == gc_null[Node]() {
+            return 1
+        }
+        if p.value != kind * 1000 + i {
+            return 2
+        }
+        p = p.next
+    }
+    if p != gc_null[Node]() {
+        return 3
+    }
+    return 0
+}
+
+fn work(kind: u64) -> AllocError!u64 {
+    let header: Gc[Node] = try chain_build(kind)
+    // Only recompute AFTER a further collection: at that moment the chain hangs
+    // on the stack of THIS thread alone.
+    gc_collect()
+    let rc: u64 = chain_check(header, kind)
+    if rc != 0 {
+        return 900 + rc
+    }
+    return kind
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let _unused: u64 = arg
+    let r: AllocError!u64 = work(kind)
+    return r catch 800
+}
+
+fn run() -> AllocError!i32 {
+    // C: the main thread holds its own chain during the whole run.
+    let my: Gc[Node] = try chain_build(9)
+
+    var h: [u64; 6] = [0; 6]
+    var i: u64 = 0
+    while i < 6 {
+        h[i as usize] = thread_start(i + 1, 0)
+        if h[i as usize] == 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    // The main thread keeps allocating itself while that happens.
+    var own: u64 = 0
+    while own < 4 {
+        let k: Gc[Node] = try chain_build(20 + own)
+        if chain_check(k, 20 + own) != 0 {
+            return 2
+        }
+        own = own + 1
+    }
+
+    var sum: u64 = 0
+    i = 0
+    while i < 6 {
+        let r: u64 = thread_wait(h[i as usize])
+        if r >= 800 {
+            return 3
+        }
+        sum = sum + r
+        i = i + 1
+    }
+    if sum != 21 {
+        return 4
+    }
+    if chain_check(my, 9) != 0 {
+        return 5
+    }
+    if gc_collections() == 0 {
+        return 6
+    }
+    if gc_stw_runs() == 0 {
+        return 7
+    }
+    if thread_count() != 1 {
+        return 8
+    }
+    if gc_heap_bytes() > 33554432 {
+        return 9
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    if !thread_init() {
+        return 91
+    }
+    return run() catch 92
+}

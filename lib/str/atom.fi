@@ -1,0 +1,166 @@
+// lib/str/atom.fi -- `Atom` (SPEC 8.3): an interned name as a u32.
+//
+// Comparing two atoms is an INTEGER COMPARISON (`a == b`), not a character
+// comparison. Whoever interns first gets the smallest number: the module
+// tok interns its known tag names at startup in a fixed order and thereby
+// gets fixed, small numbers (the prerequisite for jump tables over tag
+// names).
+//
+// Stage 0 has no global variables; the table is therefore held by the
+// caller and passed in as a pointer.
+//
+// Include:  //#include lib/str/atom.fi   (needs alloc.fi, bytes.fi)
+
+struct AtomTable {
+    arena: *mut u8, // all names one after another
+    arena_len: usize,
+    arena_cap: usize,
+    ents: *mut u8, // two u64 per atom: offset, length
+    count: usize,
+    ents_cap: usize,
+    buckets: *mut u8, // open addressing, one u32 per slot (0 = empty, otherwise id+1)
+    nbuckets: usize,
+}
+
+fn atom_hash(p: *mut u8, len: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < len {
+        h = h ^ (ld8(p, i) as u64)
+        h = h *% 1099511628211 // ROUND 72: FNV-1a wraps on purpose, *% says so
+        i = i + 1
+    }
+    return h
+}
+
+fn atom_table_init(t: *mut AtomTable) {
+    (*t).arena = heap_alloc(65536)
+    (*t).arena_len = 0
+    (*t).arena_cap = 65536
+    (*t).ents = heap_alloc(1024 * 16)
+    (*t).count = 0
+    (*t).ents_cap = 1024
+    (*t).nbuckets = 4096
+    (*t).buckets = heap_alloc(4096 * 4)
+    mem_zero((*t).buckets, 4096 * 4)
+}
+
+fn atom_free(t: *mut AtomTable) {
+    heap_free((*t).arena, (*t).arena_cap)
+    heap_free((*t).ents, (*t).ents_cap * 16)
+    heap_free((*t).buckets, (*t).nbuckets * 4)
+    (*t).count = 0
+}
+
+fn atom_off(t: *mut AtomTable, id: u32) -> usize {
+    return ld64((*t).ents, (id as usize) * 2) as usize
+}
+fn atom_len(t: *mut AtomTable, id: u32) -> usize {
+    return ld64((*t).ents, (id as usize) * 2 + 1) as usize
+}
+fn atom_ptr(t: *mut AtomTable, id: u32) -> *mut u8 {
+    return ((*t).arena as usize + atom_off(t, id)) as *mut u8
+}
+
+fn atom_count(t: *mut AtomTable) -> usize {
+    return (*t).count
+}
+
+// Copy the name of an atom into `out`.
+fn atom_text(t: *mut AtomTable, id: u32, out: *mut Bytes) {
+    bytes_clear(out)
+    if id as usize >= (*t).count {
+        return
+    }
+    bytes_append(out, atom_ptr(t, id), atom_len(t, id))
+}
+
+fn atom_rehash(t: *mut AtomTable) {
+    let nb: usize = (*t).nbuckets * 2
+    let nbuf: *mut u8 = heap_alloc(nb * 4)
+    mem_zero(nbuf, nb * 4)
+    heap_free((*t).buckets, (*t).nbuckets * 4)
+    (*t).buckets = nbuf
+    (*t).nbuckets = nb
+    var id: usize = 0
+    while id < (*t).count {
+        let h: u64 = atom_hash(atom_ptr(t, id as u32), atom_len(t, id as u32))
+        var slot: usize = (h as usize) & (nb - 1)
+        while ld32(nbuf, slot) != 0 as u32 {
+            slot = (slot + 1) & (nb - 1)
+        }
+        st32(nbuf, slot, (id + 1) as u32)
+        id = id + 1
+    }
+}
+
+fn atom_grow_arena(t: *mut AtomTable, need: usize) {
+    if (*t).arena_len + need <= (*t).arena_cap {
+        return
+    }
+    var cap: usize = (*t).arena_cap
+    while cap < (*t).arena_len + need {
+        cap = cap * 2
+    }
+    let p: *mut u8 = heap_alloc(cap)
+    mem_copy(p, (*t).arena, (*t).arena_len)
+    heap_free((*t).arena, (*t).arena_cap)
+    (*t).arena = p
+    (*t).arena_cap = cap
+}
+
+fn atom_grow_ents(t: *mut AtomTable) {
+    if (*t).count < (*t).ents_cap {
+        return
+    }
+    let cap: usize = (*t).ents_cap * 2
+    let p: *mut u8 = heap_alloc(cap * 16)
+    mem_copy(p, (*t).ents, (*t).count * 16)
+    heap_free((*t).ents, (*t).ents_cap * 16)
+    (*t).ents = p
+    (*t).ents_cap = cap
+}
+
+// Core: interns `len` octets at `p` and returns the atom number.
+fn atom_intern_raw(t: *mut AtomTable, p: *mut u8, len: usize) -> u32 {
+    if (*t).count * 2 >= (*t).nbuckets {
+        atom_rehash(t)
+    }
+    let h: u64 = atom_hash(p, len)
+    let mask: usize = (*t).nbuckets - 1
+    var slot: usize = (h as usize) & mask
+    while true {
+        let e: u32 = ld32((*t).buckets, slot)
+        if e == 0 as u32 {
+            atom_grow_arena(t, len)
+            atom_grow_ents(t)
+            let id: usize = (*t).count
+            let off: usize = (*t).arena_len
+            mem_copy(((*t).arena as usize + off) as *mut u8, p, len)
+            (*t).arena_len = off + len
+            st64((*t).ents, id * 2, off as u64)
+            st64((*t).ents, id * 2 + 1, len as u64)
+            (*t).count = id + 1
+            st32((*t).buckets, slot, (id + 1) as u32)
+            return id as u32
+        }
+        let id: u32 = e - 1 as u32
+        if atom_len(t, id) == len {
+            if mem_eq(atom_ptr(t, id), p, len) {
+                return id
+            }
+        }
+        slot = (slot + 1) & mask
+    }
+    return 0 as u32
+}
+
+// API contract with the module tok: `atom_intern` over `Bytes`.
+fn atom_intern(t: *mut AtomTable, b: *mut Bytes) -> u32 {
+    return atom_intern_raw(t, (*b).ptr, (*b).len)
+}
+
+// Comparing two atoms -- an integer comparison, nothing more.
+fn atom_eq(a: u32, b: u32) -> bool {
+    return a == b
+}

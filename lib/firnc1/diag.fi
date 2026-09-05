@@ -1,0 +1,412 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/firnc1/diag.fi -- DIAGNOSTICS, WRITTEN IN FIRN.
+//
+// Second part of stage 1 (docs/SELF_HOSTING.md section 2). The output format
+// is BINDING -- the negative tests depend on it:
+//
+//     error: expected ')' after the argument list
+//       --> tests/neg/bad_call.fi:7:22
+//        |
+//      7 |     let x = add(1, 2 ;
+//        |                      ^ here
+//        = note: ...
+//        = help: ...
+//
+// ROUND 64: the line `= help: ...` is the SUGGESTION. `note` says why
+// something is wrong, `help` says what to write instead. The twin in Rust
+// is `compiler/src/diag.rs`; the two renderings have to agree octet for
+// octet, and `tools/lex_compare.sh` checks that over the whole corpus.
+//
+// This is not proved by looking at it but by `tools/lex_compare.sh`:
+// for every source with a lex error the ERROR OUTPUT of this module must
+// match that of `firnc0 --emit=tokens` byte for byte.
+//
+// LAYOUT: like the lexer, struct of arrays instead of array of structs.
+// A diagnostic consists of four numbers (file, line, column, length) and three
+// pieces of text (message, marker text, note); the numbers live in
+// `Vec[u32]`, the texts one after another in ONE buffer with offset and length.
+
+import rt
+import vec
+
+export { Diags, diag_new, diag_free, diag_file, diag_file_name,
+    diag_error, diag_error_note, diag_error_help, diag_error_note_help,
+    diag_count, diag_has_error,
+    diag_full, diag_render, diag_source_line }
+
+const TABBREITE: usize = 4
+// Upper bound, so that broken input cannot produce error avalanches.
+const HOECHSTZAHL: usize = 40
+// Means "no note" -- a real length will never be this.
+const NONE: u32 = 4294967295
+
+struct Diags {
+    // --- source text map
+    dnames: rt.Buf, // file names one after another
+    dname_off: Vec[u32],
+    dname_len: Vec[u32],
+    dsource: Vec[u64], // pointer to the source text per file
+    dsource_len: Vec[u64],
+    // --- collected diagnostics
+    d_file: Vec[u32],
+    d_line: Vec[u32],
+    d_col: Vec[u32],
+    d_length: Vec[u32],
+    txt: rt.Buf, // message, marker and note one after another
+    d_msg_off: Vec[u32],
+    d_msg_len: Vec[u32],
+    d_mark_off: Vec[u32],
+    d_mark_len: Vec[u32],
+    d_to_off: Vec[u32],
+    d_to_len: Vec[u32], // NONE = no note
+    // ROUND 64: the suggestion (`= help: ...`). NONE = none.
+    d_hi_off: Vec[u32],
+    d_hi_len: Vec[u32],
+}
+
+fn diag_new() -> Diags {
+    return Diags {
+        dnames: rt.buf_new(),
+        dname_off: vec_new[u32](), dname_len: vec_new[u32](),
+        dsource: vec_new[u64](), dsource_len: vec_new[u64](),
+        d_file: vec_new[u32](), d_line: vec_new[u32](),
+        d_col: vec_new[u32](), d_length: vec_new[u32](),
+        txt: rt.buf_new(),
+        d_msg_off: vec_new[u32](), d_msg_len: vec_new[u32](),
+        d_mark_off: vec_new[u32](), d_mark_len: vec_new[u32](),
+        d_to_off: vec_new[u32](), d_to_len: vec_new[u32](),
+        d_hi_off: vec_new[u32](), d_hi_len: vec_new[u32](),
+    }
+}
+
+fn diag_free(d: *mut Diags) {
+    rt.buf_free(&(*d).dnames)
+    vec_free[u32](&(*d).dname_off)
+    vec_free[u32](&(*d).dname_len)
+    vec_free[u64](&(*d).dsource)
+    vec_free[u64](&(*d).dsource_len)
+    vec_free[u32](&(*d).d_file)
+    vec_free[u32](&(*d).d_line)
+    vec_free[u32](&(*d).d_col)
+    vec_free[u32](&(*d).d_length)
+    rt.buf_free(&(*d).txt)
+    vec_free[u32](&(*d).d_msg_off)
+    vec_free[u32](&(*d).d_msg_len)
+    vec_free[u32](&(*d).d_mark_off)
+    vec_free[u32](&(*d).d_mark_len)
+    vec_free[u32](&(*d).d_to_off)
+    vec_free[u32](&(*d).d_to_len)
+    vec_free[u32](&(*d).d_hi_off)
+    vec_free[u32](&(*d).d_hi_len)
+}
+
+// Adds a source file to the map and returns its number.
+fn diag_file(d: *mut Diags, name: u64, name_n: usize, source: u64, source_n: usize) -> u32 {
+    let nr: u32 = vec_len[u32](&(*d).dname_off) as u32
+    vec_push[u32](&(*d).dname_off, rt.buf_len(&(*d).dnames) as u32)
+    rt.buf_push_bytes(&(*d).dnames, name, name_n)
+    vec_push[u32](&(*d).dname_len, name_n as u32)
+    vec_push[u64](&(*d).dsource, source)
+    vec_push[u64](&(*d).dsource_len, source_n as u64)
+    return nr
+}
+
+fn diag_count(d: *mut Diags) -> usize { return vec_len[u32](&(*d).d_line) }
+fn diag_has_error(d: *mut Diags) -> bool { return diag_count(d) > 0 }
+fn diag_full(d: *mut Diags) -> bool { return diag_count(d) >= HOECHSTZAHL }
+
+fn diag_file_name(d: *mut Diags, nr: u32, out: *mut rt.Buf) {
+    if nr as usize >= vec_len[u32](&(*d).dname_off) {
+        var unb: [u8; 9] = "<unknown>"
+        rt.buf_push_bytes(out, (&unb[0]) as u64, 9)
+        return
+    }
+    let p: u64 = rt.buf_ptr(&(*d).dnames) + vec_at[u32](&(*d).dname_off, nr as usize) as u64
+    rt.buf_push_bytes(out, p, vec_at[u32](&(*d).dname_len, nr as usize) as usize)
+}
+
+// Compares two pieces of text in the message buffer, or against a pointer.
+fn txt_equal(d: *mut Diags, off: u32, len: u32, p: u64, n: usize) -> bool {
+    if len as usize != n {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(&(*d).txt) + off as u64, p, n)
+}
+
+// Suppress duplicate messages at the same place
+// (error recovery would otherwise produce them one after another).
+fn already_da(d: *mut Diags, file: u32, line: u32, col: u32, length: u32,
+    msg: u64, msg_n: usize) -> bool {
+    var i: usize = 0
+    while i < diag_count(d) {
+        var equal: bool = vec_at[u32](&(*d).d_file, i) == file
+        equal = equal && vec_at[u32](&(*d).d_line, i) == line
+        equal = equal && vec_at[u32](&(*d).d_col, i) == col
+        equal = equal && vec_at[u32](&(*d).d_length, i) == length
+        if equal {
+            if txt_equal(d, vec_at[u32](&(*d).d_msg_off, i), vec_at[u32](&(*d).d_msg_len, i), msg, msg_n) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn store(d: *mut Diags, file: u32, line: u32, col: u32, length: u32,
+    msg: u64, msg_n: usize, to: u64, to_n: usize, has_to: bool,
+    hi: u64, hi_n: usize, has_hi: bool) {
+    if already_da(d, file, line, col, length, msg, msg_n) {
+        return
+    }
+    if diag_full(d) {
+        return
+    }
+    vec_push[u32](&(*d).d_file, file)
+    vec_push[u32](&(*d).d_line, line)
+    vec_push[u32](&(*d).d_col, col)
+    var ln: u32 = length
+    if ln == 0 { ln = 1 }
+    vec_push[u32](&(*d).d_length, ln)
+
+    vec_push[u32](&(*d).d_msg_off, rt.buf_len(&(*d).txt) as u32)
+    rt.buf_push_bytes(&(*d).txt, msg, msg_n)
+    vec_push[u32](&(*d).d_msg_len, msg_n as u32)
+
+    // The marker text is always "here" for `error`/`error_note`.
+    var here: [u8; 4] = "here"
+    vec_push[u32](&(*d).d_mark_off, rt.buf_len(&(*d).txt) as u32)
+    rt.buf_push_bytes(&(*d).txt, (&here[0]) as u64, 4)
+    vec_push[u32](&(*d).d_mark_len, 4)
+
+    vec_push[u32](&(*d).d_to_off, rt.buf_len(&(*d).txt) as u32)
+    if has_to {
+        rt.buf_push_bytes(&(*d).txt, to, to_n)
+        vec_push[u32](&(*d).d_to_len, to_n as u32)
+    } else {
+        vec_push[u32](&(*d).d_to_len, NONE)
+    }
+
+    vec_push[u32](&(*d).d_hi_off, rt.buf_len(&(*d).txt) as u32)
+    if has_hi {
+        rt.buf_push_bytes(&(*d).txt, hi, hi_n)
+        vec_push[u32](&(*d).d_hi_len, hi_n as u32)
+    } else {
+        vec_push[u32](&(*d).d_hi_len, NONE)
+    }
+}
+
+fn diag_error(d: *mut Diags, file: u32, line: u32, col: u32, length: u32,
+    msg: u64, msg_n: usize) {
+    store(d, file, line, col, length, msg, msg_n, 0, 0, false, 0, 0, false)
+}
+
+fn diag_error_note(d: *mut Diags, file: u32, line: u32, col: u32, length: u32,
+    msg: u64, msg_n: usize, to: u64, to_n: usize) {
+    store(d, file, line, col, length, msg, msg_n, to, to_n, true, 0, 0, false)
+}
+
+// ROUND 79: error with a note AND a suggestion. The escape analysis
+// (`escape.fi`) needs both at once: the note says WHERE the local dies, the
+// help says what to write instead. `compiler/src/diag.rs` has carried both
+// fields since round 64; only the way in was missing here.
+fn diag_error_note_help(d: *mut Diags, file: u32, line: u32, col: u32, length: u32,
+    msg: u64, msg_n: usize, to: u64, to_n: usize, hi: u64, hi_n: usize) {
+    store(d, file, line, col, length, msg, msg_n, to, to_n, true, hi, hi_n, true)
+}
+
+// ROUND 64: error plus a SUGGESTION (`= help: ...`).
+fn diag_error_help(d: *mut Diags, file: u32, line: u32, col: u32, length: u32,
+    msg: u64, msg_n: usize, hi: u64, hi_n: usize) {
+    store(d, file, line, col, length, msg, msg_n, 0, 0, false, hi, hi_n, true)
+}
+
+// Start and length of source line `line` (1-based), without the line ending
+// and without a trailing CR. Return value packed: (start << 32) | length.
+// For invalid lines: 0.
+fn diag_source_line(d: *mut Diags, file: u32, line: u32) -> u64 {
+    if line == 0 || file as usize >= vec_len[u64](&(*d).dsource) {
+        return 0
+    }
+    let q: u64 = vec_at[u64](&(*d).dsource, file as usize)
+    let n: usize = vec_at[u64](&(*d).dsource_len, file as usize) as usize
+    var nr: u32 = 1
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(q, i) == 10 as u8 {
+            if nr == line {
+                var end: usize = i
+                if end > start {
+                    if rt.ld8(q, end - 1) == 13 as u8 {
+                        end = end - 1
+                    }
+                }
+                return ((start as u64) << 32) | ((end - start) as u64)
+            }
+            nr = nr + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn digits(v: u64) -> usize {
+    var s: usize = 1
+    var t: u64 = v
+    while t >= 10 {
+        t = t / 10
+        s = s + 1
+    }
+    return s
+}
+
+fn repeat(b: *mut rt.Buf, c: u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, c)
+        i = i + 1
+    }
+}
+
+fn txt_piece(d: *mut Diags, b: *mut rt.Buf, off: u32, len: u32) {
+    rt.buf_push_bytes(b, rt.buf_ptr(&(*d).txt) + off as u64, len as usize)
+}
+
+// One diagnostic rendered in the binding form.
+fn render_a(d: *mut Diags, b: *mut rt.Buf, i: usize) {
+    var s_err: [u8; 7] = "error: "
+    rt.buf_push_bytes(b, (&s_err[0]) as u64, 7)
+    txt_piece(d, b, vec_at[u32](&(*d).d_msg_off, i), vec_at[u32](&(*d).d_msg_len, i))
+    rt.buf_push(b, 10 as u8)
+
+    let file: u32 = vec_at[u32](&(*d).d_file, i)
+    let line: u32 = vec_at[u32](&(*d).d_line, i)
+    let col: u32 = vec_at[u32](&(*d).d_col, i)
+    let length: u32 = vec_at[u32](&(*d).d_length, i)
+    let to_len: u32 = vec_at[u32](&(*d).d_to_len, i)
+    let hi_len: u32 = vec_at[u32](&(*d).d_hi_len, i)
+
+    // Without a real location: only the source file and, if present, the note.
+    if line == 0 {
+        var s_pf: [u8; 6] = "  --> "
+        rt.buf_push_bytes(b, (&s_pf[0]) as u64, 6)
+        diag_file_name(d, file, b)
+        rt.buf_push(b, 10 as u8)
+        if to_len != NONE {
+            var s_h1: [u8; 8] = "  note: "
+            rt.buf_push_bytes(b, (&s_h1[0]) as u64, 8)
+            txt_piece(d, b, vec_at[u32](&(*d).d_to_off, i), to_len)
+            rt.buf_push(b, 10 as u8)
+        }
+        if hi_len != NONE {
+            var s_p1: [u8; 8] = "  help: "
+            rt.buf_push_bytes(b, (&s_p1[0]) as u64, 8)
+            txt_piece(d, b, vec_at[u32](&(*d).d_hi_off, i), hi_len)
+            rt.buf_push(b, 10 as u8)
+        }
+        return
+    }
+
+    let w: usize = digits(line as u64)
+    // pad = w + 1 spaces
+    repeat(b, 32 as u8, w + 1)
+    var s_pf2: [u8; 4] = "--> "
+    rt.buf_push_bytes(b, (&s_pf2[0]) as u64, 4)
+    diag_file_name(d, file, b)
+    rt.buf_push(b, 58 as u8)
+    rt.buf_push_dec_u64(b, line as u64)
+    rt.buf_push(b, 58 as u8)
+    rt.buf_push_dec_u64(b, col as u64)
+    rt.buf_push(b, 10 as u8)
+
+    repeat(b, 32 as u8, w + 1)
+    var s_bar: [u8; 2] = " |"
+    rt.buf_push_bytes(b, (&s_bar[0]) as u64, 2)
+    rt.buf_push(b, 10 as u8)
+
+    // " 7 | <source text with expanded tabs>"
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_dec_u64(b, line as u64)
+    var s_bar2: [u8; 3] = " | "
+    rt.buf_push_bytes(b, (&s_bar2[0]) as u64, 3)
+    let zl: u64 = diag_source_line(d, file, line)
+    let za: usize = (zl >> 32) as usize
+    let zn: usize = (zl & 4294967295) as usize
+    let q: u64 = vec_at[u64](&(*d).dsource, file as usize)
+    var k: usize = 0
+    while k < zn {
+        let c: u8 = rt.ld8(q, za + k)
+        if c == 9 as u8 {
+            repeat(b, 32 as u8, TABBREITE)
+        } else {
+            rt.buf_push(b, c)
+        }
+        k = k + 1
+    }
+    rt.buf_push(b, 10 as u8)
+
+    // Marker line. The offset counts CHARACTERS, not bytes -- and a
+    // tab counts as TABBREITE columns. Without both, the caret lands at the
+    // wrong place as soon as the line contains umlauts or tabs.
+    repeat(b, 32 as u8, w + 1)
+    rt.buf_push_bytes(b, (&s_bar2[0]) as u64, 3)
+    var view: usize = 0
+    var chars: usize = 0
+    var j: usize = 0
+    while j < zn {
+        if chars + 1 >= col as usize {
+            break
+        }
+        let c: u8 = rt.ld8(q, za + j)
+        if (c & 192 as u8) != 128 as u8 {
+            if c == 9 as u8 {
+                view = view + TABBREITE
+            } else {
+                view = view + 1
+            }
+            chars = chars + 1
+        }
+        j = j + 1
+    }
+    repeat(b, 32 as u8, view)
+    var roof: usize = length as usize
+    if roof < 1 { roof = 1 }
+    repeat(b, 94 as u8, roof)
+    rt.buf_push(b, 32 as u8)
+    txt_piece(d, b, vec_at[u32](&(*d).d_mark_off, i), vec_at[u32](&(*d).d_mark_len, i))
+    rt.buf_push(b, 10 as u8)
+
+    if to_len != NONE {
+        repeat(b, 32 as u8, w + 1)
+        // NINE octets, not eight: the trailing blank belongs to it. Until
+        // round 64 only eight were written -- invisible, because no
+        // diagnostic of the lexer carries a note.
+        var s_h2: [u8; 9] = " = note: "
+        rt.buf_push_bytes(b, (&s_h2[0]) as u64, 9)
+        txt_piece(d, b, vec_at[u32](&(*d).d_to_off, i), to_len)
+        rt.buf_push(b, 10 as u8)
+    }
+    if hi_len != NONE {
+        repeat(b, 32 as u8, w + 1)
+        var s_p2: [u8; 9] = " = help: "
+        rt.buf_push_bytes(b, (&s_p2[0]) as u64, 9)
+        txt_piece(d, b, vec_at[u32](&(*d).d_hi_off, i), hi_len)
+        rt.buf_push(b, 10 as u8)
+    }
+}
+
+fn diag_render(d: *mut Diags, b: *mut rt.Buf) {
+    var i: usize = 0
+    while i < diag_count(d) {
+        render_a(d, b, i)
+        i = i + 1
+    }
+    if diag_count(d) > 1 {
+        rt.buf_push_dec_u64(b, diag_count(d) as u64)
+        var s_end: [u8; 13] = " errors found"
+        rt.buf_push_bytes(b, (&s_end[0]) as u64, 13)
+        rt.buf_push(b, 10 as u8)
+    }
+}

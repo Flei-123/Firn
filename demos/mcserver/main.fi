@@ -1,0 +1,643 @@
+// SPDX-License-Identifier: MIT
+// demos/mcserver/main.fi -- a Minecraft server, offline mode, in Firn
+// (round 76).
+//
+// TARGET: 1.20.4, PROTOCOL 765. One version, written down in `proto.fi`,
+// nowhere guessed.
+//
+// WHAT IT DOES:
+//   * server list ping with a JSON answer built by hand (no JSON library
+//     in this repository, and one is not needed to WRITE a fixed object)
+//   * login in offline mode: the UUID is derived from the name the way the
+//     vanilla server derives it (`lib/std/md5.fi`), NO encryption, NO
+//     Mojang session server
+//   * the configuration state of 1.20.2+: the registries, then Finish
+//     Configuration
+//   * Join Game, spawn position, a flat world of 5x5 chunks, and Keep Alive
+//     so the connection is not dropped after 15 seconds
+//   * ONE THREAD PER CONNECTION (round 49). Blocking sockets, no epoll --
+//     which is what the socket API was made for and what makes the code
+//     readable: every connection is a straight line from handshake to
+//     world.
+//
+// COMPRESSION IS OFF, deliberately: `network-compression-threshold: -1`.
+// The client only compresses after a Set Compression packet, so not sending
+// it is a complete configuration and not a hole. This repository has no
+// deflate, and round 76 did not want one.
+//
+// WHAT IT IS NOT: there is no game here. Nobody can break a block, no
+// entity moves, there is no inventory and no chat. It is a PROTOCOL
+// implementation -- the part that decides whether a client gets into the
+// world at all, and that is the part that puts a language under load:
+// threads with blocking input, a hash map under pressure, and octet
+// arithmetic in the optimiser.
+//
+// USAGE:
+//     mcserver [port] [view distance] [seconds]
+//     mcserver 25565 3 0        port 25565, 7x7 chunks, runs forever
+//     mcserver 0                the kernel picks the port; it is printed
+//                               (that is what the test harness uses)
+
+import std.net
+import std.bytes
+import std.rt
+import std.md5
+import proto
+import registry
+import world
+
+// ---------------------------------------------------------- Shared state
+//
+// Stage 0 has no global variables, and a thread gets exactly ONE `u64`.
+// Everything shared therefore lives in one mmap block, and every thread
+// gets the address of ITS SLOT, which carries the address of the block.
+
+const G_LISTEN: u64 = 0
+const G_NEXT_EID: u64 = 8
+const G_ONLINE: u64 = 16
+const G_VIEW: u64 = 24
+const G_TOTAL: u64 = 32 // connections accepted since the start
+const G_STOP: u64 = 40 // != 0: stop the accept loop
+const G_SLOTS: u64 = 64
+
+const SLOT_BYTES: u64 = 32
+const SLOT_FD: u64 = 0
+const SLOT_USED: u64 = 8
+const SLOT_BASE: u64 = 16
+const SLOT_HANDLE: u64 = 24
+
+// 63 and not 64: the thread table of the runtime holds `THREAD_MAX` = 64
+// entries and the MAIN thread occupies the first one (lib/gc/gc.fi,
+// `thread_init`). A 64th worker cannot exist, so there is no point in
+// keeping a connection slot for it.
+const MAX_CONN: u64 = 63
+
+fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
+fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
+
+// A FINISHED THREAD HAS TO BE COLLECTED, or the server stops after 63
+// connections. MEASURED, not feared: without this function the 64th ping
+// got a closed socket, every time, at exactly the same number.
+//
+// The reason sits in `lib/gc/gc.fi`. `__thread_slot_new` only hands out
+// entries whose state is `Z_FREE`, and the only thing that sets `Z_FREE` is
+// `thread_wait`. A worker that runs to its end reaches `Z_DEAD` -- its
+// stack stays mapped and its table entry stays taken. `thread_wait` is
+// therefore not "wait for the result" here, it is `free`.
+//
+// It is cheap: a worker sets `SLOT_USED` to 0 as its last statement, so
+// when this runs the thread is at its final instructions and the futex is
+// about to be cleared. The scan is 63 words per accepted connection.
+fn reap(base: u64) {
+    var k: u64 = 0
+    while k < MAX_CONN {
+        let slot: u64 = base + G_SLOTS + k * SLOT_BYTES
+        if ld(slot, SLOT_USED) == 0 as u64 && ld(slot, SLOT_HANDLE) != 0 as u64 {
+            thread_wait(ld(slot, SLOT_HANDLE))
+            st(slot, SLOT_HANDLE, 0)
+        }
+        k = k + 1
+    }
+}
+
+// ------------------------------------------------------------------- Time
+
+const SYS_CLOCK_GETTIME: i64 = 228
+const CLOCK_MONOTONIC: i64 = 1
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000 as u64 + (ts[1] as u64) / 1000000 as u64
+}
+
+// ------------------------------------------------------------ Small helpers
+
+fn put_dec(b: *mut bytes.Bytes, v: u64) {
+    if v >= 10 as u64 {
+        put_dec(b, v / 10 as u64)
+    }
+    bytes.put_u8(b, 48 as u8 + (v % 10 as u64) as u8)
+}
+
+fn parse_dec(p: u64, n: usize, fallback: i64) -> i64 {
+    if n == 0 {
+        return fallback
+    }
+    var v: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return fallback
+        }
+        v = v * 10 + (c - 48 as u8) as i64
+        i = i + 1
+    }
+    return v
+}
+
+fn say(p: u64) {
+    rt.write_everything(1, p, rt.c_length(p))
+}
+
+fn say_num(v: u64) {
+    var b: bytes.Bytes = bytes.bytes_new()
+    put_dec(&b, v)
+    rt.write_everything(1, bytes.bytes_ptr(&b), bytes.bytes_len(&b))
+    bytes.bytes_free(&b)
+}
+
+// A `catch` needs a value, and an error union carries no payload -- so the
+// error is turned into a negative number the caller can branch on.
+fn err_code(e: ProtoError) -> i32 {
+    if e == ProtoError::Closed {
+        return 0 - 1
+    }
+    if e == ProtoError::Broken {
+        return 0 - 2
+    }
+    if e == ProtoError::TooBig {
+        return 0 - 3
+    }
+    return 0 - 4
+}
+
+// ------------------------------------------------------------- Status (ping)
+
+// The JSON is built by hand. That is not a shortcut: what is needed here is
+// ONE fixed object with three numbers in it, and a JSON library would be a
+// parser plus a writer plus an object model for a string that is eleven
+// lines long. Reading JSON is a different matter -- the server never has to.
+fn status_json(b: *mut bytes.Bytes, online: u64, view: u64) {
+    var part1: [u8; 61] = "{\"version\":{\"name\":\"Firn 1.20.4\",\"protocol\":765},\"players\":{\0"
+    var part2: [u8; 10] = "\"max\":20,\0"
+    var part3: [u8; 10] = "\"online\":\0"
+    var part4: [u8; 15] = ",\"sample\":[]},\0"
+    var part5: [u8; 73] = "\"description\":{\"text\":\"A Minecraft server written in Firn -- round 76\"},\0"
+    var part6: [u8; 28] = "\"enforcesSecureChat\":false}\0"
+    bytes.bytes_clear(b)
+    bytes.put_c(b, (&part1[0]) as u64)
+    bytes.put_c(b, (&part2[0]) as u64)
+    bytes.put_c(b, (&part3[0]) as u64)
+    put_dec(b, online)
+    bytes.put_c(b, (&part4[0]) as u64)
+    bytes.put_c(b, (&part5[0]) as u64)
+    bytes.put_c(b, (&part6[0]) as u64)
+    let _unused: u64 = view
+}
+
+fn serve_status(c: *mut net.Conn, base: u64, body: *mut bytes.Bytes,
+    frame: *mut bytes.Bytes, json: *mut bytes.Bytes) {
+    var running: bool = true
+    while running {
+        let id: i32 = proto.read_packet(c, body) catch | e | (err_code(e))
+        if id < 0 {
+            running = false
+        } else if id == 0 {
+            // Status Request -> Status Response
+            status_json(json, ld(base, G_ONLINE), ld(base, G_VIEW))
+            bytes.bytes_clear(body)
+            bytes.put_string(body, bytes.bytes_ptr(json), bytes.bytes_len(json))
+            let w: usize = proto.write_packet(c, 0, body, frame) catch 0
+            if w == 0 {
+                running = false
+            }
+        } else if id == 1 {
+            // Ping Request -> Pong Response, the SAME eight octets back.
+            // The client measures its latency from this and shows a red
+            // bar if the number differs.
+            let token: i64 = bytes.get_i64(body) catch 0
+            bytes.bytes_clear(body)
+            bytes.put_i64(body, token)
+            proto.write_packet(c, 1, body, frame) catch 0
+            running = false
+        } else {
+            running = false
+        }
+    }
+}
+
+// ------------------------------------------------------------------- Login
+
+// Login Success. The UUID is derived from the name exactly the way the
+// vanilla server derives it -- see lib/std/md5.fi for why that is not a
+// place to be creative.
+fn send_login_success(c: *mut net.Conn, name: u64, name_n: usize,
+    body: *mut bytes.Bytes, frame: *mut bytes.Bytes) -> bool {
+    var high: u64 = 0
+    var low: u64 = 0
+    if !md5.md5_offline_uuid(name, name_n, &high, &low) {
+        return false
+    }
+    bytes.bytes_clear(body)
+    bytes.put_uuid(body, high, low)
+    bytes.put_string(body, name, name_n)
+    bytes.put_varint(body, 0) // no properties: no skin, no signature
+    let w: usize = proto.write_packet(c, 2, body, frame) catch 0
+    return w > 0
+}
+
+// ----------------------------------------------------------- Configuration
+
+fn send_configuration(c: *mut net.Conn, body: *mut bytes.Bytes,
+    frame: *mut bytes.Bytes) -> bool {
+    // Registry Data (0x05): the whole codec as one anonymous NBT compound.
+    bytes.bytes_clear(body)
+    registry.build_registry_codec(body)
+    if !bytes.bytes_ok(body) {
+        return false
+    }
+    if (proto.write_packet(c, 5, body, frame) catch 0) == 0 {
+        return false
+    }
+    // Finish Configuration (0x02). After it the client answers with its own
+    // 0x02 and BOTH sides are in play -- the state is not switched by one
+    // side alone.
+    return (proto.write_raw_packet(c, 2, frame) catch 0) > 0
+}
+
+// Waits for the client's Finish Configuration. Everything else that arrives
+// here (Client Information 0x00, Plugin Message 0x01) is read and dropped:
+// a server that does not understand a packet still has to CONSUME it, or
+// the stream is out of step from then on.
+fn await_config_end(c: *mut net.Conn, body: *mut bytes.Bytes,
+    frame: *mut bytes.Bytes) -> bool {
+    var guard: i32 = 0
+    while guard < 64 {
+        let id: i32 = proto.read_packet(c, body) catch | e | (err_code(e))
+        if id < 0 {
+            return false
+        }
+        if id == 2 {
+            return true
+        }
+        if id == 3 {
+            // Keep Alive in configuration -- answer it
+            let k: i64 = bytes.get_i64(body) catch 0
+            bytes.bytes_clear(body)
+            bytes.put_i64(body, k)
+            proto.write_packet(c, 3, body, frame) catch 0
+        }
+        guard = guard + 1
+    }
+    return false
+}
+
+// -------------------------------------------------------------------- Play
+
+fn send_join_game(c: *mut net.Conn, eid: i32, view: i32,
+    body: *mut bytes.Bytes, frame: *mut bytes.Bytes) -> bool {
+    var ow: [u8; 20] = "minecraft:overworld\0"
+    bytes.bytes_clear(body)
+    bytes.put_i32(body, eid)
+    bytes.put_bool(body, false) // hardcore
+    bytes.put_varint(body, 1) // one world
+    bytes.put_string_c(body, (&ow[0]) as u64)
+    bytes.put_varint(body, 20) // max players (only for the tab list)
+    bytes.put_varint(body, view)
+    bytes.put_varint(body, view) // simulation distance
+    bytes.put_bool(body, false) // reduced debug info
+    bytes.put_bool(body, true) // respawn screen
+    bytes.put_bool(body, false) // limited crafting
+    bytes.put_string_c(body, (&ow[0]) as u64) // dimension TYPE
+    bytes.put_string_c(body, (&ow[0]) as u64) // dimension NAME
+    bytes.put_i64(body, 0) // hashed seed
+    bytes.put_u8(body, 1 as u8) // game mode: creative
+    bytes.put_i8(body, 0 - 1 as i8) // previous game mode: none
+    bytes.put_bool(body, false) // debug world
+    bytes.put_bool(body, true) // flat world -- the horizon is drawn flat
+    bytes.put_bool(body, false) // no death location
+    bytes.put_varint(body, 0) // portal cooldown
+    return (proto.write_packet(c, 41, body, frame) catch 0) > 0
+}
+
+fn send_world(c: *mut net.Conn, view: i32, body: *mut bytes.Bytes,
+    frame: *mut bytes.Bytes, scratch: *mut bytes.Bytes) -> bool {
+    // Player Abilities (0x36): invulnerable + may fly + creative.
+    bytes.bytes_clear(body)
+    bytes.put_i8(body, 13 as i8)
+    bytes.put_f32(body, 0.05f)
+    bytes.put_f32(body, 0.1f)
+    if (proto.write_packet(c, 54, body, frame) catch 0) == 0 {
+        return false
+    }
+
+    // Set Default Spawn Position (0x54) -- where the compass points.
+    bytes.bytes_clear(body)
+    bytes.put_position(body, 8, world.SPAWN_Y, 8)
+    bytes.put_f32(body, 0.0f)
+    if (proto.write_packet(c, 84, body, frame) catch 0) == 0 {
+        return false
+    }
+
+    // Set Center Chunk (0x52). Without it the client throws away every
+    // chunk that is not next to (0,0) -- and then stands in a hole.
+    bytes.bytes_clear(body)
+    bytes.put_varint(body, 0)
+    bytes.put_varint(body, 0)
+    if (proto.write_packet(c, 82, body, frame) catch 0) == 0 {
+        return false
+    }
+
+    // Game Event 13: "start waiting for level chunks". The client shows its
+    // loading screen until the chunks are there.
+    bytes.bytes_clear(body)
+    bytes.put_u8(body, 13 as u8)
+    bytes.put_f32(body, 0.0f)
+    if (proto.write_packet(c, 32, body, frame) catch 0) == 0 {
+        return false
+    }
+
+    // Chunk Batch Start (0x0D) ... chunks ... Chunk Batch Finished (0x0C).
+    // Since 1.20.2 the client measures how fast it can take chunks and tells
+    // the server; the batch is what it measures.
+    if (proto.write_raw_packet(c, 13, frame) catch 0) == 0 {
+        return false
+    }
+    var n: i32 = 0
+    var cx: i32 = 0 - view
+    while cx <= view {
+        var cz: i32 = 0 - view
+        while cz <= view {
+            bytes.bytes_clear(body)
+            world.write_chunk(body, scratch, cx, cz)
+            if !bytes.bytes_ok(body) {
+                return false
+            }
+            if (proto.write_packet(c, 37, body, frame) catch 0) == 0 {
+                return false
+            }
+            n = n + 1
+            cz = cz + 1
+        }
+        cx = cx + 1
+    }
+    bytes.bytes_clear(body)
+    bytes.put_varint(body, n)
+    if (proto.write_packet(c, 12, body, frame) catch 0) == 0 {
+        return false
+    }
+
+    // Synchronize Player Position (0x3E). THIS is the packet the client
+    // waits for before it leaves the loading screen -- without it everything
+    // above was for nothing and the player looks at "Loading terrain"
+    // forever.
+    bytes.bytes_clear(body)
+    bytes.put_f64(body, 8.5)
+    bytes.put_f64(body, world.SPAWN_Y as f64)
+    bytes.put_f64(body, 8.5)
+    bytes.put_f32(body, 0.0f) // yaw
+    bytes.put_f32(body, 0.0f) // pitch
+    bytes.put_i8(body, 0 as i8) // all values absolute
+    bytes.put_varint(body, 1) // teleport id -- the client confirms it
+    return (proto.write_packet(c, 62, body, frame) catch 0) > 0
+}
+
+// The play loop. `set_timeout` makes the blocking read give up after a
+// second, so the same loop can both answer packets and send a Keep Alive on
+// time -- without a second thread and without a poll.
+fn play_loop(c: *mut net.Conn, base: u64, body: *mut bytes.Bytes,
+    frame: *mut bytes.Bytes) {
+    net.set_timeout(c, 1000) catch false
+    var next_keep: u64 = now_ms()
+    var running: bool = true
+    var idle: i32 = 0
+    while running {
+        let t: u64 = now_ms()
+        if t >= next_keep {
+            bytes.bytes_clear(body)
+            bytes.put_i64(body, t as i64)
+            if (proto.write_packet(c, 36, body, frame) catch 0) == 0 {
+                running = false
+            }
+            next_keep = t + 5000 as u64
+        }
+        if !running {
+            return
+        }
+        let id: i32 = proto.read_packet(c, body) catch | e | (err_code(e))
+        if id == 0 - 2 {
+            // A timeout is `Broken` with errno EAGAIN. Everything else is a
+            // real break.
+            let e: i32 = net.conn_error(c)
+            if e != 0 - 11 && e != 0 - 4 {
+                running = false
+            }
+            idle = idle + 1
+            if idle > 600 {
+                running = false // ten minutes without a packet
+            }
+        } else if id < 0 {
+            running = false
+        } else {
+            idle = 0
+            // 0x00 Confirm Teleportation, 0x15 Keep Alive, 0x17/0x18
+            // position -- consumed and, where an answer is due, answered.
+            // Everything else is read to the end and dropped; the length
+            // prefix has already taken it off the stream.
+            if id == 21 {
+                // the client's Keep Alive: nothing to do, it arrived
+                bytes.get_i64(body) catch 0
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------- One connection
+
+fn serve(slot: u64) -> u64 {
+    let base: u64 = ld(slot, SLOT_BASE)
+    var c: net.Conn = net.conn_from_fd(ld(slot, SLOT_FD) as i32)
+    net.set_no_delay(&c, true) catch false
+
+    var body: bytes.Bytes = bytes.bytes_with_capacity(8192)
+    var frame: bytes.Bytes = bytes.bytes_with_capacity(8192)
+    var scratch: bytes.Bytes = bytes.bytes_with_capacity(4096)
+    var json: bytes.Bytes = bytes.bytes_with_capacity(512)
+
+    // --- handshake ---------------------------------------------------------
+    let id: i32 = proto.read_packet(&c, &body) catch | e | (err_code(e))
+    if id == 0 {
+        let ver: i32 = bytes.get_varint(&body) catch 0
+        var hn: usize = 0
+        bytes.get_string(&body, &hn) catch 0
+        bytes.get_u16(&body) catch 0 as u16
+        let next: i32 = bytes.get_varint(&body) catch 0
+        let _v: i32 = ver
+        if next == proto.ST_STATUS {
+            serve_status(&c, base, &body, &frame, &json)
+        } else if next == proto.ST_LOGIN {
+            // --- login ---------------------------------------------------
+            let lid: i32 = proto.read_packet(&c, &body) catch | e | (err_code(e))
+            if lid == 0 {
+                var nn: usize = 0
+                let np: u64 = bytes.get_string(&body, &nn) catch 0
+                if np != 0 && nn > 0 && nn <= 16 {
+                    // The name lies INSIDE `body`, and `body` is reused for
+                    // the next packet -- so it is copied out first. This is
+                    // the kind of aliasing that a garbage collector would
+                    // hide and a raw buffer does not.
+                    var namebuf: [u8; 16] = [0; 16]
+                    var i: usize = 0
+                    while i < nn {
+                        namebuf[i] = rt.ld8(np, i)
+                        i = i + 1
+                    }
+                    let name: u64 = (&namebuf[0]) as u64
+                    if send_login_success(&c, name, nn, &body, &frame) {
+                        let ack: i32 = proto.read_packet(&c, &body) catch | e | (err_code(e))
+                        if ack == 3 {
+                            if send_configuration(&c, &body, &frame) {
+                                if await_config_end(&c, &body, &frame) {
+                                    let eid: u64 = __atomic_add((base + G_NEXT_EID) as *mut u64, 1)
+                                    __atomic_add((base + G_ONLINE) as *mut u64, 1)
+                                    let view: i32 = ld(base, G_VIEW) as i32
+                                    if send_join_game(&c, eid as i32, view, &body, &frame) {
+                                        if send_world(&c, view, &body, &frame, &scratch) {
+                                            play_loop(&c, base, &body, &frame)
+                                        }
+                                    }
+                                    __atomic_add((base + G_ONLINE) as *mut u64, 18446744073709551615 as u64)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bytes.bytes_free(&body)
+    bytes.bytes_free(&frame)
+    bytes.bytes_free(&scratch)
+    bytes.bytes_free(&json)
+    net.close(&c)
+    st(slot, SLOT_FD, 0)
+    st(slot, SLOT_USED, 0)
+    return 1
+}
+
+// The dispatcher of round 49: stage 0 has no function pointers, so a thread
+// carries a KIND and one argument.
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == 1 {
+        return serve(arg)
+    }
+    return 0
+}
+
+// --------------------------------------------------------------------- Main
+
+fn main(start: u64) -> i32 {
+    var t_listen: [u8; 24] = "mcserver: listening on \0"
+    var t_proto: [u8; 32] = "mcserver: protocol 765 (1.20.4)\0"
+    var t_view: [u8; 25] = "mcserver: view distance \0"
+    var t_nl: [u8; 2] = "\n\0"
+    var t_fail: [u8; 32] = "mcserver: the port is not free\n\0"
+    var t_ready: [u8; 17] = "mcserver: ready\n\0"
+
+    var port: u16 = 25565 as u16
+    var view: i32 = 2
+    var seconds: i64 = 0
+    if rt.arg_count(start) > 1 {
+        let p: u64 = rt.arg_ptr(start, 1)
+        port = parse_dec(p, rt.c_length(p), 25565) as u16
+    }
+    if rt.arg_count(start) > 2 {
+        let p: u64 = rt.arg_ptr(start, 2)
+        view = parse_dec(p, rt.c_length(p), 2) as i32
+    }
+    if rt.arg_count(start) > 3 {
+        let p: u64 = rt.arg_ptr(start, 3)
+        seconds = parse_dec(p, rt.c_length(p), 0)
+    }
+    if view < 0 {
+        view = 0
+    }
+    if view > 8 {
+        view = 8
+    }
+
+    if !thread_init() {
+        return 90
+    }
+    let base: u64 = rt.heap_alloc((G_SLOTS + MAX_CONN * SLOT_BYTES) as usize)
+    if base == 0 {
+        return 91
+    }
+    st(base, G_NEXT_EID, 1)
+    st(base, G_ONLINE, 0)
+    st(base, G_VIEW, view as u64)
+    st(base, G_TOTAL, 0)
+    st(base, G_STOP, 0)
+
+    var l: net.Listener = net.listen_tcp(net.ADDR_ANY, port) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&l) {
+        say((&t_fail[0]) as u64)
+        return 1
+    }
+    st(base, G_LISTEN, net.listener_fd(&l) as u64)
+
+    say((&t_listen[0]) as u64)
+    say_num(net.listener_port(&l) as u64)
+    say((&t_nl[0]) as u64)
+    say((&t_proto[0]) as u64)
+    say((&t_nl[0]) as u64)
+    say((&t_view[0]) as u64)
+    say_num(view as u64)
+    say((&t_nl[0]) as u64)
+    say((&t_ready[0]) as u64)
+
+    let deadline: u64 = now_ms() + (seconds as u64) * 1000 as u64
+    // With a time limit the accept has to give up now and then, otherwise
+    // the server would hang in `accept` until somebody connects. Without a
+    // limit it blocks -- which is what a server is supposed to do.
+    if seconds > 0 {
+        var tv: [i64; 2] = [1, 0]
+        syscall(54, net.listener_fd(&l) as i64, 1, 20, (&tv[0]) as i64, 16, 0)
+    }
+
+    var running: bool = true
+    while running {
+        if seconds > 0 && now_ms() >= deadline {
+            running = false
+        } else {
+            thread_blocking_an()
+            var conn: net.Conn = net.accept(&l) catch net.conn_from_fd(0 - 1)
+            thread_blocking_out()
+            if net.conn_is_open(&conn) {
+                // First collect what has finished -- see `reap` above.
+                reap(base)
+                // The first free slot. The lock is `__atomic_swap`; a mutex
+                // would do too, but this is one word.
+                var k: u64 = 0
+                var placed: bool = false
+                while k < MAX_CONN && !placed {
+                    let slot: u64 = base + G_SLOTS + k * SLOT_BYTES
+                    if __atomic_swap((slot + SLOT_USED) as *mut u64, 0 as u64, 1 as u64) == 0 as u64 {
+                        st(slot, SLOT_FD, net.conn_fd(&conn) as u64)
+                        st(slot, SLOT_BASE, base)
+                        st(slot, SLOT_HANDLE, 0)
+                        let h: u64 = thread_start(1, slot)
+                        if h == 0 {
+                            st(slot, SLOT_USED, 0)
+                            net.close(&conn)
+                        } else {
+                            st(slot, SLOT_HANDLE, h)
+                            __atomic_add((base + G_TOTAL) as *mut u64, 1)
+                        }
+                        placed = true
+                    }
+                    k = k + 1
+                }
+                if !placed {
+                    // All 64 slots busy: refuse rather than queue.
+                    net.close(&conn)
+                }
+            }
+        }
+    }
+    net.close_listener(&l)
+    return 0
+}
