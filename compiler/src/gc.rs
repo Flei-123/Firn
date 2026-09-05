@@ -1206,6 +1206,64 @@ pub(crate) const STATE_LABEL: &str = ".L__gc_state";
 /// Label of the type table (`.rodata`, file local).
 pub(crate) const TABLE_LABEL: &str = ".L__gc_typetable";
 
+// ------------------------------------- ROUND ANLEGEWEG: the fast path inline
+//
+// The allocation used to be ONE call into `__gc_alloc_raw` and cost 144 ns
+// there -- measured, and the same value with the collector switched off. The
+// reason was not the collecting but the way there: the runtime had to work
+// out at EVERY call what the CALL SITE has known all along -- the size class
+// of the object and the size of its block.
+//
+// Which is why the ordinary case now stands AT the call site, with `class`
+// and `step` folded into constants (`gc_lower::alloc_fast`). Only when one
+// of the five conditions does not hold does it go into the runtime,
+// unchanged.
+//
+// THE OFFSETS OF THE STATE BLOCK ARE A CONTRACT with `lib/gc/gc.fi`. They are
+// not written down twice on trust: the test `offsets_match_the_runtime` reads
+// them back out of the embedded runtime text and turns red if a single one of
+// them ever moves.
+/// `S_INIT` -- 0 = `gc_init()` missing, 1 = ready, 2 = a finalizer is running.
+pub(crate) const ST_INIT: u64 = 8;
+/// `S_SINCE` -- freshly allocated octets since the last collection run.
+pub(crate) const ST_SINCE: u64 = 88;
+/// `S_LIMIT` -- at this many octets the next run starts.
+pub(crate) const ST_LIMIT: u64 = 96;
+/// `S_SERIES` -- the counter of the serial numbers (`GcWeak`).
+pub(crate) const ST_SERIES: u64 = 104;
+/// `S_FREE` -- head of the free list, one word per size class.
+pub(crate) const ST_FREE: u64 = 168;
+/// `S_TOTAL` -- octets allocated in total.
+pub(crate) const ST_TOTAL: u64 = 296;
+/// `S_PHASE` -- 0 = idle, 1 = marking, 2 = sweeping, 3 = winding up.
+pub(crate) const ST_PHASE: u64 = 320;
+/// `S_PAR` -- the current WHITE (0 or 2); a fresh object gets it while idle.
+pub(crate) const ST_PAR: u64 = 360;
+/// `S_D_ALLOK` -- the diagnostic counter of all allocations.
+pub(crate) const ST_D_ALLOK: u64 = 1528;
+/// `S_MULTI` -- 1 as soon as there is (or was) more than one thread.
+pub(crate) const ST_MULTI: u64 = 1992;
+/// The block header in front of the payload (`HEADER` in `lib/gc/gc.fi`).
+pub(crate) const BLOCK_HEADER: u64 = 16;
+/// The payload sizes of the size classes (`__gc_classes_bytes`).
+pub(crate) const CLASS_BYTES: [u64; 13] =
+    [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096];
+
+/// Which size class does an object of `size` octets fall into? The same
+/// answer as `__gc_class_for` in `lib/gc/gc.fi`, for every size.
+/// `CLASS_BYTES.len()` = no class of its own -- such an object gets a chunk
+/// to itself and never walks the fast path.
+pub(crate) fn class_for(size: u64) -> usize {
+    let mut k = 0;
+    while k < CLASS_BYTES.len() {
+        if size <= CLASS_BYTES[k] {
+            return k;
+        }
+        k += 1;
+    }
+    CLASS_BYTES.len()
+}
+
 /// The compiler generated type table: one entry of 8 words per type, built
 /// from the field layout (SPEC §3.5.3 — precise heap tracing).
 ///
@@ -1280,7 +1338,7 @@ pub(crate) fn ty_table_asm() -> String {
     let mut out = String::new();
     REG.with(|r| {
         let reg = r.borrow();
-        let _ = writeln!(out, ".section .rodata");
+        let _ = writeln!(out, "{}", crate::target::reloc_rodata());
         let _ = writeln!(out, "{}", crate::target::align(8));
         let _ = writeln!(out, "{}:", TABLE_LABEL);
         let _ = writeln!(out, "    .quad {}", reg.classes.len());
@@ -1492,6 +1550,54 @@ pub(crate) fn runtime_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROUND ANLEGEWEG -- the offsets of the state block that the call site
+    /// writes into stand in TWO places: here and in `lib/gc/gc.fi`. This test
+    /// reads them back out of the embedded runtime text. Whoever moves a
+    /// field in `gc.fi` and forgets this file gets a red test and not a heap
+    /// that quietly writes past its own counters.
+    #[test]
+    fn offsets_match_the_runtime() {
+        fn value_of(name: &str) -> u64 {
+            let needle = format!("\nconst {}: u64 = ", name);
+            let at = RUNTIME
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{} is missing from lib/gc/gc.fi", name));
+            let rest = &RUNTIME[at + needle.len()..];
+            let end = rest.find('\n').unwrap_or(rest.len());
+            rest[..end].trim().parse().unwrap_or_else(|_| panic!("{} is no number", name))
+        }
+        assert_eq!(value_of("S_INIT"), ST_INIT);
+        assert_eq!(value_of("S_SINCE"), ST_SINCE);
+        assert_eq!(value_of("S_LIMIT"), ST_LIMIT);
+        assert_eq!(value_of("S_SERIES"), ST_SERIES);
+        assert_eq!(value_of("S_FREE"), ST_FREE);
+        assert_eq!(value_of("S_TOTAL"), ST_TOTAL);
+        assert_eq!(value_of("S_PHASE"), ST_PHASE);
+        assert_eq!(value_of("S_PAR"), ST_PAR);
+        assert_eq!(value_of("S_D_ALLOK"), ST_D_ALLOK);
+        assert_eq!(value_of("S_MULTI"), ST_MULTI);
+        assert_eq!(value_of("HEADER"), BLOCK_HEADER);
+        assert_eq!(value_of("CLASSES"), CLASS_BYTES.len() as u64);
+    }
+
+    /// The size class table has to give the same answers as
+    /// `__gc_class_for` -- at the boundaries and beyond the largest class.
+    #[test]
+    fn class_table_matches_the_runtime() {
+        for b in CLASS_BYTES.iter() {
+            assert!(
+                RUNTIME.contains(&format!("return {}\n", b)),
+                "class size {} is missing from lib/gc/gc.fi",
+                b
+            );
+        }
+        assert_eq!(class_for(0), 0);
+        assert_eq!(class_for(32), 0);
+        assert_eq!(class_for(33), 1);
+        assert_eq!(class_for(4096), 12);
+        assert_eq!(class_for(4097), 13);
+    }
 
     #[test]
     fn internal_names_are_gc_allocations() {

@@ -444,22 +444,22 @@ fn layout(f: &Func, extra_slots: u64) -> (Frame, Vec<(&'static str, u64)>) {
 
 // ----------------------------------------------------------- Liveness analysis ---
 
-struct Live {
+pub(crate) struct Live {
     /// linear position of the first instruction per block
-    block_start: Vec<usize>,
+    pub(crate) block_start: Vec<usize>,
     /// position of the terminator per block
-    block_end: Vec<usize>,
+    pub(crate) block_end: Vec<usize>,
     /// position of every instruction: pos[block][index]
-    pos: Vec<Vec<usize>>,
-    live_in: Vec<Vec<bool>>,
-    live_out: Vec<Vec<bool>>,
+    pub(crate) pos: Vec<Vec<usize>>,
+    pub(crate) live_in: Vec<Vec<bool>>,
+    pub(crate) live_out: Vec<Vec<bool>>,
     /// Did the data flow reach its fixed point? (round 87 -- the loop has a
     /// round limit, and below that limit the sets may be TOO SMALL. Anything
     /// finer than the interval bounds may then not be derived from them.)
-    converged: bool,
+    pub(crate) converged: bool,
 }
 
-fn compute_live(f: &Func) -> Live {
+pub(crate) fn compute_live(f: &Func) -> Live {
     let nb = f.blocks.len();
     let nv = f.val_types.len();
     let mut pos = Vec::with_capacity(nb);
@@ -750,7 +750,7 @@ fn exact_crossings(f: &Func, live: &Live) -> Vec<RegMask> {
 // ---------------------------------------------------------- Cell analysis ---
 
 /// Finds `alloca`s that can live entirely in a register.
-fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
+pub(crate) fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
     let mut cand: HashMap<Val, Option<FTy>> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
@@ -993,7 +993,7 @@ struct Iv {
 
 /// Loop depth per block (approximation: back edge u->v with v <= u spans
 /// the blocks [v, u]).
-fn loop_depth(f: &Func) -> Vec<u32> {
+pub(crate) fn loop_depth(f: &Func) -> Vec<u32> {
     let nb = f.blocks.len();
     let mut depth = vec![0u32; nb];
     for (u, b) in f.blocks.iter().enumerate() {
@@ -2642,7 +2642,9 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     e.line("push rbp");
     e.line("mov rbp, rsp");
     if a.frame.size > 0 {
-        e.line(&format!("sub rsp, {}", a.frame.size));
+        // ROUND WINDOWS: a frame of a page or more probes first
+        // (codegen_x86::emit_frame). On Linux this is the `sub` it always was.
+        crate::codegen_x86::emit_frame(e, a.frame.size);
     }
     for (r, off) in &a.saved {
         e.line(&format!("mov qword ptr [rbp-{}], {}", off, r));
@@ -3941,6 +3943,44 @@ fn emit_inst(
             if args.is_empty() {
                 return Err("internal error: syscall without number".to_string());
             }
+            // ROUND WINDOWS: not an instruction but a call into the seam.
+            // Seven System V arguments -- the seventh over the stack -- and
+            // the same parallel move problem as an ordinary call, because
+            // `r8`/`r9` are homes of the allocation as well.
+            if crate::target::windows() {
+                e.line("sub rsp, 16");
+                if args.len() >= 7 {
+                    ra.load_full(e, "rax", args[6]);
+                } else {
+                    e.line("xor eax, eax");
+                }
+                e.line("mov qword ptr [rsp], rax");
+                let mut wmoves: Vec<(String, String)> = Vec::new();
+                let mut wlater: Vec<(usize, Val)> = Vec::new();
+                for k in 0..ARG_REGS.len().min(args.len()) {
+                    let o = ra.opnd(args[k]);
+                    if is_reg64(&o) {
+                        wmoves.push((ARG_REGS[k].to_string(), o));
+                    } else {
+                        wlater.push((k, args[k]));
+                    }
+                }
+                parallel_reg_moves(e, &wmoves);
+                for (k, arg) in wlater {
+                    ra.load_full(e, ARG_REGS[k], arg);
+                }
+                // The unused ones LAST: before the moves they could have
+                // destroyed a source that still had to travel.
+                for k in args.len()..ARG_REGS.len() {
+                    e.line(&format!("mov {}, 0", ARG_REGS[k]));
+                }
+                e.line(&format!("call {}", label(crate::win_seam::SYSCALL_FN)));
+                e.line("add rsp, 16");
+                if let Some(d) = i.dst {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             // The same class of bug as with the call: `r10`, `r8` and `r9`
             // are at the same time scratch registers of the allocation.
             let mut sys_moves: Vec<(String, String)> = Vec::new();
@@ -4024,6 +4064,25 @@ fn emit_inst(
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
+            // ROUND WINDOWS: `clone(2)` has no Win32 equivalent this round
+            // can honour -- `CreateThread` hands the child a stack of its
+            // own and a different entry convention, and the collector's
+            // thread table (lib/gc/gc.fi) is built on the Linux shape.
+            //
+            // A COMPILE ERROR would be the wrong answer, and the round
+            // measured why: `lib/gc/gc.fi` CONTAINS a spawn, so every
+            // program that links the collector would be refused -- 93 of
+            // 309 cases, almost none of which ever start a thread. So the
+            // instruction becomes what the seam does with a system call it
+            // cannot serve: `-38` (ENOSYS), the value `thread_spawn`
+            // already knows as a failure.
+            if crate::target::windows() {
+                crate::thread::spawn_unsupported(e);
+                if let Some(d) = i.dst {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             let d = i.dst.ok_or("internal error: spawn without target")?;
             ra.load_full(e, "rdi", *arg);
             ra.load_full(e, "rsi", *stack);

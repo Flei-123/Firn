@@ -42,6 +42,8 @@ import escape
 
 export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
+    // ROUND FIRN-ENV (compiler/src/env.rs) -- `const` with a text.
+    sema_const_text_len, sema_const_text_ptr,
     sema_mu_set, sema_fe_set, sema_gc_set, sema_if_set,
     sema_kernel_set,
     sema_tree,
@@ -70,6 +72,14 @@ struct Sema {
     k_name: Vec[u32], // constants
     k_ty: Vec[u32],
     k_value: Vec[u64],
+    // ROUND FIRN-ENV -- the OCTETS of a `const` of type `str`. A text is
+    // not a number and has no place in `k_value`; the name stands there all
+    // the same (with 0), so that everything asking "is this spelling taken,
+    // and by what type" keeps working with ONE table. `k_tlen` is NONE for
+    // every constant that is not a text.
+    k_toff: Vec[u32],
+    k_tlen: Vec[u32],
+    k_tdata: rt.Buf,
     // ROUND 89 -- global variables (`static`, SPEC 14.1.statics). A
     // constant is a NUMBER and lives in `k_value`; a `static` is a PLACE
     // and what lives here is the finished sequence of octets that goes
@@ -126,6 +136,7 @@ fn sema_new(b: u64, it: u64) -> Sema {
         etyp: vec_new[u32](), w32: vec_new[u8](),
         v_name: vec_new[u32](), v_ty: vec_new[u32](), b_limit: vec_new[u32](),
         k_name: vec_new[u32](), k_ty: vec_new[u32](), k_value: vec_new[u64](),
+        k_toff: vec_new[u32](), k_tlen: vec_new[u32](), k_tdata: rt.buf_new(),
         g_name: vec_new[u32](), g_ty: vec_new[u32](), g_mut: vec_new[u32](),
         g_off: vec_new[u32](), g_len: vec_new[u32](), g_align: vec_new[u32](),
         g_data: rt.buf_new(),
@@ -162,6 +173,9 @@ fn sema_free(s: *mut Sema) {
     vec_free[u32](&(*s).k_name)
     vec_free[u32](&(*s).k_ty)
     vec_free[u64](&(*s).k_value)
+    vec_free[u32](&(*s).k_toff)
+    vec_free[u32](&(*s).k_tlen)
+    rt.buf_free(&(*s).k_tdata)
     vec_free[u32](&(*s).mc_fname)
     vec_free[u32](&(*s).mc_si)
     vec_free[u32](&(*s).cl_name)
@@ -488,6 +502,40 @@ fn const_search(s: *mut Sema, name: u32) -> u32 {
 
 fn sema_const_value(s: *mut Sema, name: u32) -> u64 {
     return const_value(s, name)
+}
+
+// ROUND FIRN-ENV: index of a TEXT constant of this spelling, or NONE.
+fn const_text_index(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).k_name) {
+        if vec_at[u32](&(*s).k_name, i) == name {
+            if vec_at[u32](&(*s).k_tlen, i) != NONE {
+                return i as u32
+            }
+            return NONE
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// How many octets does the text constant `name` have? NONE = it is none.
+fn sema_const_text_len(s: *mut Sema, name: u32) -> u32 {
+    let i: u32 = const_text_index(s, name)
+    if i == NONE {
+        return NONE
+    }
+    return vec_at[u32](&(*s).k_tlen, i as usize)
+}
+
+// Where its octets stand. Only meaningful when `sema_const_text_len` said
+// something other than NONE.
+fn sema_const_text_ptr(s: *mut Sema, name: u32) -> u64 {
+    let i: u32 = const_text_index(s, name)
+    if i == NONE {
+        return 0
+    }
+    return rt.buf_ptr(&(*s).k_tdata) + vec_at[u32](&(*s).k_toff, i as usize) as u64
 }
 
 fn const_value(s: *mut Sema, name: u32) -> u64 {
@@ -1009,7 +1057,7 @@ fn static_bytes(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
         }
     } else if k == types.K_F64 || k == types.K_F32 {
         var bits: u64 = 0
-        if !static_float(s, e, k == types.K_F32, &bits) {
+        if !const_float(s, e, k == types.K_F32, &bits) {
             *good = false
         }
         var q5: usize = 0
@@ -1050,11 +1098,124 @@ fn static_bytes(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
     rt.buf_set_len(&(*s).g_data, start + want)
 }
 
-// The bit pattern of a floating point initial value. Only a literal, with
-// an optional minus in front: `0.1 + 0.2` at compile time would need a
-// second evaluator that is exactly IEEE-754 faithful, and one that is only
-// ALMOST right is worse than none.
-fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
+// ROUND FIRN-LUECKEN -- the four bit conversions. A floating point number
+// and its bit pattern are the same octets; the only way to look at them
+// from the other side is through the address (lexer.fi does it the same
+// way, and for the same reason).
+fn f64_of_bits(b: u64) -> f64 {
+    var t: f64 = 0.0
+    let p: u64 = (&t) as u64
+    rt.st64(p, 0, b)
+    return *(p as *mut f64)
+}
+
+fn bits_of_f64(x: f64) -> u64 {
+    var t: f64 = 0.0
+    let p: u64 = (&t) as u64
+    *(p as *mut f64) = x
+    return rt.ld64(p, 0)
+}
+
+fn f32_of_bits(b: u32) -> f32 {
+    var t: f32 = 0.0f
+    let p: u64 = (&t) as u64
+    rt.st32(p, 0, b)
+    return *(p as *mut f32)
+}
+
+fn bits_of_f32(x: f32) -> u32 {
+    var t: f32 = 0.0f
+    let p: u64 = (&t) as u64
+    *(p as *mut f32) = x
+    return rt.ld32(p, 0)
+}
+
+// ROUND FIRN-LUECKEN -- THE BIT PATTERN OF A FLOATING POINT CONSTANT.
+//
+// Until this round there was none: `const` took integers and bools, a
+// `static f64` took a bare literal, and the note here said that an
+// evaluator which is only ALMOST IEEE-754 is worse than none. That is
+// true, and it is why this one may exist: it computes in `f64` and in
+// `f32`, the two formats the machine has, with the machine's own
+// round-to-nearest-even. `0.1 + 0.2` folded here and `0.1 + 0.2` computed
+// by `addsd` at runtime are the same 64 bits -- and `firnc0` does the
+// same operations on the same hardware, so the two translators cannot
+// drift apart. The fixpoint depends on that.
+//
+// NOT allowed, on purpose: an integer (literal or constant) and a cast.
+// `const A: f64 = 100` would otherwise become the bit pattern 100, which
+// is 5e-322 -- the mistake opt.rs describes from round 20. And no `f64`
+// inside an `f32` constant: narrowing rounds, and a rounding the reader
+// did not write down does not happen here. The other direction is exact.
+// ROUND FIRN-ENV -- the OCTETS of a text constant expression, appended to
+// `out`. The third of the three constant walks, next to `const_eval`
+// (which number is this) and `const_float` (which bit pattern). It stands
+// apart for the same reason those two do: a text is neither a number nor a
+// bit pattern.
+//
+// Allowed: a text literal -- and therefore `__env_or(...)` as well, which
+// the parser has already turned into exactly that (parser.fi::env_call);
+// a text constant declared BEFORE this one; and `+` between the two, which
+// concatenates. NOT allowed: a call, an index, a cast, a number.
+// `compiler/src/sema.rs::const_octets` is the twin.
+fn const_octets(s: *mut Sema, e: u32, out: *mut rt.Buf, d: u32) -> bool {
+    if d >= 200 {
+        return false
+    }
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_TEXT {
+        // `u"..."` is WTF-16 and no `str` (SPEC 8.2).
+        if ast.e_b(b, e) != 0 {
+            return false
+        }
+        let lit: u32 = ast.e_a(b, e)
+        if ast.e_kind(b, lit) != ast.E_ALIT {
+            return false
+        }
+        let off: u32 = ast.e_b(b, lit)
+        let cnt: u32 = ast.e_c(b, lit)
+        var i: u32 = 0
+        while i < cnt {
+            let el: u32 = ast.child_at(b, off + i)
+            if ast.e_kind(b, el) != ast.E_INT {
+                return false
+            }
+            let v: u64 = ast.e_number(b, el)
+            if v > 255 {
+                return false
+            }
+            rt.buf_push(out, v as u8)
+            i = i + 1
+        }
+        return true
+    }
+    if a == ast.E_ID {
+        let ti: u32 = const_text_index(s, ast.e_a(b, e))
+        if ti == NONE {
+            return false
+        }
+        // The source may be THIS buffer; `buf_push_bytes` can move it, so
+        // the octets are copied one by one out of a remembered range.
+        let coff: u32 = vec_at[u32](&(*s).k_toff, ti as usize)
+        let clen: u32 = vec_at[u32](&(*s).k_tlen, ti as usize)
+        var q: u32 = 0
+        while q < clen {
+            rt.buf_push(out, rt.ld8(rt.buf_ptr(&(*s).k_tdata), (coff + q) as usize))
+            q = q + 1
+        }
+        return true
+    }
+    if a == ast.E_BIN && ast.e_a(b, e) == 0 {
+        if !const_octets(s, ast.e_b(b, e), out, d + 1) {
+            return false
+        }
+        return const_octets(s, ast.e_c(b, e), out, d + 1)
+    }
+    return false
+}
+
+fn const_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.e_kind(b, e)
     if a == ast.E_FLOAT {
@@ -1069,12 +1230,36 @@ fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
         return true
     }
     if a == ast.E_FLOAT32 {
-        *out = ast.e_number(b, e)
+        if single {
+            *out = ast.e_number(b, e)
+        } else {
+            *out = bits_of_f64(f32_of_bits(ast.e_number(b, e) as u32) as f64)
+        }
         return true
+    }
+    if a == ast.E_ID {
+        let kt: u32 = const_search(s, ast.e_a(b, e))
+        if kt == NONE {
+            return false
+        }
+        let v: u64 = const_value(s, ast.e_a(b, e))
+        if is_f64(s, kt) && !single {
+            *out = v
+            return true
+        }
+        if is_f32(s, kt) {
+            if single {
+                *out = v
+            } else {
+                *out = bits_of_f64(f32_of_bits(v as u32) as f64)
+            }
+            return true
+        }
+        return false
     }
     if a == ast.E_UN && ast.e_a(b, e) == 0 {
         var inner: u64 = 0
-        if !static_float(s, ast.e_b(b, e), single, &inner) {
+        if !const_float(s, ast.e_b(b, e), single, &inner) {
             return false
         }
         if single {
@@ -1082,6 +1267,40 @@ fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
         } else {
             *out = inner ^ 9223372036854775808
         }
+        return true
+    }
+    if a == ast.E_BIN {
+        let op: u32 = ast.e_a(b, e)
+        if op > 3 {
+            return false
+        }
+        var x: u64 = 0
+        var y: u64 = 0
+        if !const_float(s, ast.e_b(b, e), single, &x) {
+            return false
+        }
+        if !const_float(s, ast.e_c(b, e), single, &y) {
+            return false
+        }
+        if single {
+            let p: f32 = f32_of_bits(x as u32)
+            let q: f32 = f32_of_bits(y as u32)
+            var r: f32 = 0.0f
+            if op == 0 { r = p + q }
+            else if op == 1 { r = p - q }
+            else if op == 2 { r = p * q }
+            else { r = p / q }
+            *out = bits_of_f32(r) as u64
+            return true
+        }
+        let p2: f64 = f64_of_bits(x)
+        let q2: f64 = f64_of_bits(y)
+        var r2: f64 = 0.0
+        if op == 0 { r2 = p2 + q2 }
+        else if op == 1 { r2 = p2 - q2 }
+        else if op == 2 { r2 = p2 * q2 }
+        else { r2 = p2 / q2 }
+        *out = bits_of_f64(r2)
         return true
     }
     return false
@@ -1100,7 +1319,22 @@ fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
         return 0
     }
     if a == ast.E_ID {
-        if const_search(s, ast.e_a(b, e)) == NONE {
+        // ROUND FIRN-ENV: `k_value` carries a 0 for a text constant so that
+        // the name is taken. Handing THAT out here would turn `[0; NAME]`
+        // into an empty array without a word.
+        if const_text_index(s, ast.e_a(b, e)) != NONE {
+            *good = false
+            return 0
+        }
+        let kt: u32 = const_search(s, ast.e_a(b, e))
+        if kt == NONE {
+            *good = false
+            return 0
+        }
+        // ROUND FIRN-LUECKEN: what is stored for a float constant is a BIT
+        // PATTERN. Handing it out here would make `[0; SCALE]` an array of
+        // 4613937818241073152 elements.
+        if is_f64(s, kt) || is_f32(s, kt) {
             *good = false
             return 0
         }
@@ -1315,7 +1549,13 @@ fn literal_index(s: *mut Sema, e: u32, out: *mut i64) -> bool {
         return true
     }
     if a == ast.E_ID {
-        if const_search(s, ast.e_a(b, e)) == NONE {
+        let kt: u32 = const_search(s, ast.e_a(b, e))
+        if kt == NONE {
+            return false
+        }
+        // ROUND FIRN-LUECKEN: a float constant carries a bit pattern, not
+        // an index.
+        if is_f64(s, kt) || is_f32(s, kt) {
             return false
         }
         *out = const_value(s, ast.e_a(b, e)) as i64
@@ -3943,11 +4183,42 @@ fn sema_run(s: *mut Sema) {
             complain(s)
         }
         var good: bool = true
-        let v: i64 = const_eval(s, ast.const_value(b, i), &good)
+        var raw: u64 = 0
+        // HOOK env (round FIRN-ENV): a `const` of type `str`. It is the one
+        // aggregate a constant may have, and for the same reason a number
+        // may be one: the value is FINISHED at compile time -- octets, not
+        // an address and not an allocation.
+        var toff: u32 = 0
+        var tlen: u32 = NONE
+        if types.str_is_builtin(table(s), t) && types.ty_kind(table(s), t) == types.K_STRUCT {
+            let tstart: usize = rt.buf_len(&(*s).k_tdata)
+            if const_octets(s, ast.const_value(b, i), &(*s).k_tdata, 0) {
+                toff = tstart as u32
+                tlen = (rt.buf_len(&(*s).k_tdata) - tstart) as u32
+            } else {
+                rt.buf_set_len(&(*s).k_tdata, tstart)
+                toff = tstart as u32
+                tlen = 0
+                good = false
+            }
+        } else if is_f64(s, t) || is_f32(s, t) {
+            // ROUND FIRN-LUECKEN: a `const f64` is evaluated as a NUMBER and
+            // stored as its BIT PATTERN -- exactly the shape in which a float
+            // literal travels into FIR (lower.fi::E_FLOAT). The three
+            // evaluators stay strictly apart; no type slides into another.
+            if !const_float(s, ast.const_value(b, i), is_f32(s, t), &raw) {
+                good = false
+            }
+        } else {
+            let v: i64 = const_eval(s, ast.const_value(b, i), &good)
+            raw = wrap(s, v, t) as u64
+        }
         vec_push[u32](&(*s).k_name, ast.const_name(b, i))
         vec_push[u32](&(*s).k_ty, t)
+        vec_push[u32](&(*s).k_toff, toff)
+        vec_push[u32](&(*s).k_tlen, tlen)
         if good {
-            vec_push[u64](&(*s).k_value, wrap(s, v, t) as u64)
+            vec_push[u64](&(*s).k_value, raw)
         } else {
             vec_push[u64](&(*s).k_value, 0)
             complain(s)

@@ -77,6 +77,8 @@ export {
     raster_line, raster_quad, raster_cubic,
     raster_cov, raster_cov_row, raster_bytes_needed,
     raster_width, raster_height, raster_ok,
+    raster_used_x0, raster_used_y0, raster_used_x1, raster_used_y1,
+    raster_mark,
 }
 
 // The window a path is rasterised into. `ox`/`oy` is its top left corner
@@ -95,6 +97,52 @@ struct Raster {
     ox: f64,
     oy: f64,
     ok: usize, // 0 as soon as a window did not fit into the buffer
+    // ROUND FIRN-LUECKEN -- CLEARING COSTS MORE THAN DRAWING.
+    //
+    // A window of 1540 x 1665 is 2.5 million cells, twenty megaoctets.
+    // Clearing that per path is 237 times twenty megaoctets for a map with
+    // 237 rings -- and each of those rings touches a few thousand cells.
+    // The caller used to answer that by opening a WINDOW OF ITS OWN per
+    // path, computed from the bounding box; that is the rasteriser's work,
+    // not the application's.
+    //
+    // So the rasteriser remembers what it really wrote:
+    //
+    //   `ux0/uy0/ux1/uy1`  the rectangle of cells that was written, half
+    //                      open, in the cell grid of `dstride`
+    //   `dstride`          the stride that rectangle belongs to (the next
+    //                      window may have a different one)
+    //   `zeroed`           how many cells from the start of the buffer are
+    //                      known to be zero. Memory handed over by
+    //                      `raster_attach` is NOT zero, so the first window
+    //                      of a given size pays for its own clearing once,
+    //                      and a later, larger window pays for the piece
+    //                      that grew.
+    //
+    // The invariant that carries all of it: after every `raster_begin`
+    // every cell in [0, zeroed) is 0.0. `raster_begin` restores it by
+    // clearing the used rectangle -- and nothing else.
+    zeroed: usize,
+    dstride: usize,
+    // WRITTEN: every cell a `cell_add` could have touched, including the
+    // two overflow columns at `w` and `w + 1`. This is what has to be put
+    // back to zero, and it may never be narrowed -- a leftover in column
+    // `w + 1` is invisible in THIS window (nothing reads past `w`) and
+    // becomes an interior cell of the NEXT one, which has a different
+    // stride.
+    ux0: usize,
+    uy0: usize,
+    ux1: usize,
+    uy1: usize,
+    // COVERAGE: the cells that really carry ink after `raster_finish`.
+    // That is what a caller wants to walk, and it is usually much smaller
+    // -- a contour left of the window writes cells in column zero and they
+    // all cancel out.
+    vx0: usize,
+    vy0: usize,
+    vx1: usize,
+    vy1: usize,
+    vok: usize, // 1 as soon as `raster_finish` has computed the coverage
 }
 
 // ------------------------------------------------- The arithmetic, in house
@@ -181,6 +229,17 @@ fn raster_new() -> Raster {
         ox: 0.0,
         oy: 0.0,
         ok: 1,
+        zeroed: 0,
+        dstride: 0,
+        ux0: 0,
+        uy0: 0,
+        ux1: 0,
+        uy1: 0,
+        vx0: 0,
+        vy0: 0,
+        vx1: 0,
+        vy1: 0,
+        vok: 0,
     }
 }
 
@@ -199,12 +258,222 @@ fn raster_bytes_needed(w: usize, h: usize) -> usize {
 fn raster_attach(r: *mut Raster, p: *mut u8, cap: usize) {
     (*r).acc = p
     (*r).cap = cap
+    // Fresh memory says nothing about its content: not one cell is known
+    // to be zero yet.
+    (*r).zeroed = 0
+    (*r).dstride = 0
+    (*r).ux0 = 0
+    (*r).uy0 = 0
+    (*r).ux1 = 0
+    (*r).uy1 = 0
+    (*r).vok = 0
 }
 
 #[no_gc]
 fn raster_free(r: *mut Raster) {
     (*r).acc = 0 as *mut u8
     (*r).cap = 0
+    (*r).zeroed = 0
+    (*r).dstride = 0
+    (*r).ux0 = 0
+    (*r).uy0 = 0
+    (*r).ux1 = 0
+    (*r).uy1 = 0
+    (*r).vok = 0
+}
+
+// The rectangle of cells that was really written, clipped to the window.
+// `canvas_fill_raster` walks exactly this and nothing more.
+// Before `raster_finish` the honest answer is "everything that was
+// written"; afterwards it is the ink.
+#[no_gc]
+fn used_x0(r: *mut Raster) -> usize {
+    if (*r).vok != 0 {
+        return (*r).vx0
+    }
+    return (*r).ux0
+}
+
+#[no_gc]
+fn used_y0(r: *mut Raster) -> usize {
+    if (*r).vok != 0 {
+        return (*r).vy0
+    }
+    return (*r).uy0
+}
+
+#[no_gc]
+fn used_x1(r: *mut Raster) -> usize {
+    if (*r).vok != 0 {
+        return (*r).vx1
+    }
+    return (*r).ux1
+}
+
+#[no_gc]
+fn used_y1(r: *mut Raster) -> usize {
+    if (*r).vok != 0 {
+        return (*r).vy1
+    }
+    return (*r).uy1
+}
+
+#[no_gc]
+fn raster_used_x0(r: *mut Raster) -> usize {
+    if used_y1(r) <= used_y0(r) {
+        return 0
+    }
+    if used_x0(r) > (*r).w {
+        return (*r).w
+    }
+    return used_x0(r)
+}
+
+#[no_gc]
+fn raster_used_y0(r: *mut Raster) -> usize {
+    if used_y1(r) <= used_y0(r) {
+        return 0
+    }
+    return used_y0(r)
+}
+
+#[no_gc]
+fn raster_used_x1(r: *mut Raster) -> usize {
+    if used_y1(r) <= used_y0(r) {
+        return 0
+    }
+    if used_x1(r) > (*r).w {
+        return (*r).w
+    }
+    return used_x1(r)
+}
+
+#[no_gc]
+fn raster_used_y1(r: *mut Raster) -> usize {
+    if used_y1(r) <= used_y0(r) {
+        return 0
+    }
+    if used_y1(r) > (*r).h {
+        return (*r).h
+    }
+    return used_y1(r)
+}
+
+// ROUND FIRN-LUECKEN -- FOR THE SECOND WRITER.
+//
+// `lib/paint/painter.fi::blur_pass` writes into the coverage cells
+// DIRECTLY: a box blur is a running sum over the finished coverage, in
+// place, and it spreads ink far beyond the rectangle the path itself
+// touched. As long as `raster_begin` cleared everything, nobody had to
+// tell the rasteriser about that. Now somebody does, or the ink stays
+// behind and turns up in the NEXT path -- measured: 6069 of 480000 pixels
+// in `tools/paintb3/cases/04_shadows.html`, and one of them was a blue box
+// that had become white.
+//
+// So a writer that goes past `raster_line` says where it wrote. That is
+// two lines at the end of `blur_pass` and it keeps the promise of the
+// whole round: what is written is what is cleared.
+#[no_gc]
+fn raster_mark(r: *mut Raster, x0: usize, y0: usize, x1: usize, y1: usize) {
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+    var ex: usize = x1
+    if ex > (*r).stride {
+        ex = (*r).stride
+    }
+    var ey: usize = y1
+    if ey > (*r).h {
+        ey = (*r).h
+    }
+    mark_used(r, y0, ey, x0, ex)
+    // and it is ink, not just paper -- whoever asks after `raster_finish`
+    // has to see it.
+    if (*r).vok == 0 {
+        (*r).vok = 1
+        (*r).vy0 = y0
+        (*r).vy1 = ey
+        (*r).vx0 = x0
+        (*r).vx1 = ex
+        return
+    }
+    if (*r).vy1 <= (*r).vy0 {
+        (*r).vy0 = y0
+        (*r).vy1 = ey
+        (*r).vx0 = x0
+        (*r).vx1 = ex
+        return
+    }
+    if y0 < (*r).vy0 {
+        (*r).vy0 = y0
+    }
+    if ey > (*r).vy1 {
+        (*r).vy1 = ey
+    }
+    if x0 < (*r).vx0 {
+        (*r).vx0 = x0
+    }
+    if ex > (*r).vx1 {
+        (*r).vx1 = ex
+    }
+}
+
+// Widen the used rectangle. Called once per EDGE, not once per cell -- the
+// bookkeeping must not cost what it saves.
+#[no_gc]
+fn mark_used(r: *mut Raster, y0: usize, y1: usize, x0: usize, x1: usize) {
+    if y1 <= y0 || x1 <= x0 {
+        return
+    }
+    if (*r).uy1 <= (*r).uy0 {
+        (*r).uy0 = y0
+        (*r).uy1 = y1
+        (*r).ux0 = x0
+        (*r).ux1 = x1
+        return
+    }
+    if y0 < (*r).uy0 {
+        (*r).uy0 = y0
+    }
+    if y1 > (*r).uy1 {
+        (*r).uy1 = y1
+    }
+    if x0 < (*r).ux0 {
+        (*r).ux0 = x0
+    }
+    if x1 > (*r).ux1 {
+        (*r).ux1 = x1
+    }
+}
+
+// Put back to zero what was written -- and only that. This is the whole
+// point of the round: the cost of a path becomes the cost of the path.
+#[no_gc]
+fn reset_used(r: *mut Raster) {
+    (*r).vok = 0
+    if (*r).uy1 <= (*r).uy0 || (*r).acc as usize == 0 {
+        (*r).ux0 = 0
+        (*r).ux1 = 0
+        (*r).uy0 = 0
+        (*r).uy1 = 0
+        return
+    }
+    let base: u64 = (*r).acc as u64
+    let st: usize = (*r).dstride
+    var y: usize = (*r).uy0
+    while y < (*r).uy1 {
+        let row: u64 = base + ((y * st) * 8) as u64
+        var x: usize = (*r).ux0
+        while x < (*r).ux1 {
+            *((row + (x * 8) as u64) as *mut f64) = 0.0
+            x = x + 1
+        }
+        y = y + 1
+    }
+    (*r).ux0 = 0
+    (*r).ux1 = 0
+    (*r).uy0 = 0
+    (*r).uy1 = 0
 }
 
 #[no_gc]
@@ -229,6 +498,11 @@ fn raster_height(r: *mut Raster) -> usize {
 // contribution belongs.
 #[no_gc]
 fn raster_begin(r: *mut Raster, ox: f64, oy: f64, w: usize, h: usize) -> bool {
+    // FIRST the cleanup, in the geometry the used rectangle belongs to --
+    // afterwards `stride` may be a different one, and the rectangle would
+    // point somewhere else. After this line every cell in [0, zeroed) is
+    // zero again, whatever happens further down.
+    reset_used(r)
     (*r).ox = ox
     (*r).oy = oy
     (*r).w = w
@@ -244,12 +518,19 @@ fn raster_begin(r: *mut Raster, ox: f64, oy: f64, w: usize, h: usize) -> bool {
         return false
     }
     (*r).ok = 1
-    let base: u64 = (*r).acc as u64
-    var i: usize = 0
+    (*r).dstride = (*r).stride
+    // The piece of the buffer that has never been written is whatever the
+    // allocator left there. It is cleared ONCE, and after that the used
+    // rectangle keeps the promise.
     let cells: usize = (*r).stride * h
-    while i < cells {
-        *((base + (i * 8) as u64) as *mut f64) = 0.0
-        i = i + 1
+    if cells > (*r).zeroed {
+        let base: u64 = (*r).acc as u64
+        var i: usize = (*r).zeroed
+        while i < cells {
+            *((base + (i * 8) as u64) as *mut f64) = 0.0
+            i = i + 1
+        }
+        (*r).zeroed = cells
     }
     return true
 }
@@ -353,6 +634,48 @@ fn accumulate(r: *mut Raster, p0x: f64, p0y: f64, p1x: f64, p1y: f64) {
         return
     }
     let wf: f64 = (*r).w as f64
+    // ROUND FIRN-LUECKEN -- write down WHERE this edge lands, once per
+    // edge. The x range of the clipped edge lies between its two ends; the
+    // two extra columns are the ones `span` may still write to the right of
+    // `ceil(rx)` (`x0i + 1`), and `stride` is where that is thrown away.
+    let xend: f64 = xs + dxdy * (ye - ys)
+    var mlo: f64 = xs
+    var mhi: f64 = xend
+    if mlo > mhi {
+        mlo = xend
+        mhi = xs
+    }
+    if mlo < 0.0 {
+        mlo = 0.0
+    }
+    if mhi > wf {
+        mhi = wf
+    }
+    if mhi < 0.0 {
+        mhi = 0.0
+    }
+    if mlo > wf {
+        mlo = wf
+    }
+    var my0: i64 = ffloor(ys) as i64
+    if my0 < 0 {
+        my0 = 0
+    }
+    var my1: i64 = fceil(ye) as i64
+    if my1 > (*r).h as i64 {
+        my1 = (*r).h as i64
+    }
+    if my1 > my0 {
+        var mx0: i64 = ffloor(mlo) as i64
+        if mx0 < 0 {
+            mx0 = 0
+        }
+        var mx1: i64 = (fceil(mhi) as i64) + 2
+        if mx1 > (*r).stride as i64 {
+            mx1 = (*r).stride as i64
+        }
+        mark_used(r, my0 as usize, my1 as usize, mx0 as usize, mx1 as usize)
+    }
     var x: f64 = xs
     var yrow: i64 = ffloor(ys) as i64
     let ylast: i64 = fceil(ye) as i64
@@ -500,13 +823,39 @@ fn raster_finish(r: *mut Raster) {
     if (*r).ok == 0 {
         return
     }
+    // ROUND FIRN-LUECKEN: only the rows that were written. To the left of
+    // `ux0` every cell is zero, so the running sum starts at zero there --
+    // that is not an approximation, it is the same number the walk from
+    // column zero would have arrived at.
     let base: u64 = (*r).acc as u64
-    var y: usize = 0
-    while y < (*r).h {
+    var y: usize = (*r).uy0
+    var far: usize = (*r).ux1
+    // The rectangle that really carries COVERAGE. It is at most the one
+    // that was written to, and usually smaller: a contour whose edges all
+    // lie left of the window writes cells in column zero, and they all
+    // cancel out. Whoever asks afterwards ("did anything land in the
+    // picture?") gets the honest answer, and `canvas_fill_raster` walks
+    // the ink instead of the paper.
+    var cy0: usize = 0
+    var cy1: usize = 0
+    var cx0: usize = 0
+    var cx1: usize = 0
+    var any: bool = false
+    while y < (*r).uy1 {
         var acc: f64 = 0.0
-        var x: usize = 0
+        var x: usize = (*r).ux0
         let row: usize = y * (*r).stride
         while x < (*r).w {
+            if x >= (*r).ux1 {
+                // Past the written rectangle there is nothing left to add.
+                // The loop runs on only while the sum has NOT come back to
+                // zero -- a contour that was cut off at the right border is
+                // the one case where coverage continues, and it kept
+                // continuing before this round as well.
+                if acc < 0.001953125 && acc > 0.0 - 0.001953125 {
+                    break
+                }
+            }
             let a: u64 = base + ((row + x) * 8) as u64
             acc = acc + *(a as *mut f64)
             var v: f64 = acc
@@ -517,9 +866,47 @@ fn raster_finish(r: *mut Raster) {
                 v = 1.0
             }
             *(a as *mut f64) = v
+            if v > 0.0 {
+                if !any {
+                    any = true
+                    cy0 = y
+                    cy1 = y + 1
+                    cx0 = x
+                    cx1 = x + 1
+                } else {
+                    cy1 = y + 1
+                    if x < cx0 {
+                        cx0 = x
+                    }
+                    if x + 1 > cx1 {
+                        cx1 = x + 1
+                    }
+                }
+            }
             x = x + 1
         }
+        if x > far {
+            far = x
+        }
         y = y + 1
+    }
+    if far > (*r).ux1 {
+        (*r).ux1 = far
+    }
+    // The ink, kept BESIDE the written rectangle and not instead of it:
+    // the cells at `w` and `w + 1` are never read here and never cleared
+    // here, and only the written rectangle knows about them.
+    (*r).vok = 1
+    if any {
+        (*r).vy0 = cy0
+        (*r).vy1 = cy1
+        (*r).vx0 = cx0
+        (*r).vx1 = cx1
+    } else {
+        (*r).vy0 = 0
+        (*r).vy1 = 0
+        (*r).vx0 = 0
+        (*r).vx1 = 0
     }
 }
 

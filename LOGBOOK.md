@@ -1,3 +1,46 @@
+## Round WINDOWS (2026-09-01) -- Firn builds Windows programs; branch windows
+SPEC.md line 127 said "target binary format: ELF" and `syscall(nr, a1..a6)` was built into the
+language with the LINUX numbers. Windows has no system call a program may use -- the numbers of
+ntdll are deliberately unstable between versions -- so the round added a third value to the
+second axis of the target model of round ARM-FREESTANDING: `Os::Windows`, `--target=x86_64-windows`.
+FOUR PIECES. (1) PE/COFF through the COFF port of the same binutils (`x86_64-w64-mingw32-as`/`-ld`),
+used as an assembler and a linker and never as a compiler -- and the IMPORT TABLE is written by the
+compiler itself (`.idata$2`..`$7`, win.rs), so no import library and no C runtime object enters the
+image. The only foreign names are `__CTOR_LIST__`/`__DTOR_LIST__` out of the linker script, and that
+is said out loud rather than hidden. (2) The calling convention: Firn-to-Firn stays System V (SPEC 13),
+and every call that LEAVES the program goes through a thunk the compiler emits -- rdi/rsi/rdx/rcx ->
+rcx/rdx/r8/r9, 32 octets of shadow space, arguments five and up down to the stack FIRST because r8/r9
+are argument registers on both sides and would otherwise be lost. The register allocator and both code
+generators were not touched, which is exactly why the Linux side cannot get worse. (3) Stack probing:
+every frame of a page or more walks down page by page, or Windows' guard page is stepped over.
+(4) The seam: `syscall` becomes a call into `win_seam.rs`, ~620 lines of FIRN injected into the
+compilation unit the way comptime and the test runner inject source text, mapping 35 canonical Linux
+numbers onto 42 Win32 functions from kernel32/ws2_32/advapi32.
+MEASURED. 299 of 304 comparable cases of tests/ behave identically on Linux and under Wine (98 %),
+and the five that do not have exactly TWO causes: threads (4) and processes (1). hello.exe, tour.exe
+and a TCP client over ws2_32 print character-identical to their Linux builds; a panic writes the same
+message and exits 101. tools/windows/machine.sh: 25 of 25, including a scan of the whole corpus that
+finds NO `syscall` instruction left in any of the 314 Windows builds.
+THE FIND OF THE ROUND: the collector reads /proc/self/maps for its stack bounds. Windows has no /proc
+-- and Wine makes it worse, because drive Z: is the host's root, so the file really opens and the
+collector then scans from a Windows stack pointer to the end of a LINUX mapping and dies with a page
+fault. 35 of the 46 failing cases were that one thing. The seam now answers the file itself out of
+GetCurrentThreadStackLimits.
+THE LINUX SIDE IS UNTOUCHED, checked three ways and measured before and after: 314 of 314 programs of
+tests/+examples/ produce CHARACTER-IDENTICAL `--emit=asm` from the compiler before and after (0 differ,
+run three times); `cargo test` 270 -> 281 with 0 failures; `tools/packages/run.sh` line for line the
+same -- and that last one is 22 of 39 on the BASE commit as well, measured on an untouched worktree,
+which is written down instead of blamed on this round.
+NOT DONE, and named: `.pdata`/`.xdata` (so no usable crash report and no unwinding across a system
+boundary), callbacks Win64 -> System V (a window procedure IS one, so this blocks a GDI window),
+threads and processes, DWARF on the Windows target, and `lib/firnc1` -- the self-hosted compiler does
+not know the target at all yet, which is written up point by point in docs/ROUND-WINDOWS.md 4.4.
+FOR CERTUS: the engine calls only SEVEN system numbers and all seven work; the collector runs; DNS is
+over TCP so the one socket call the seam cannot do (sendto with an address) is not needed; and Certus
+is single-threaded, so the biggest gap of this round does not touch it. X11 sits in exactly TWO files
+behind EIGHTEEN names -- a `lib/browser/gdi.fi` of 600-800 lines is the whole port, and the only thing
+in front of it is the callback thunk.
+
 ## Round K5 (2026-08-25) -- four processors in Osum; branch k5-smp
 The kernel of rounds 59/62/K1/K2 was an operating system on ONE core, and said so in
 kstate.fi: "NOT atomic -- it does not have to be: the kernel runs on one processor". It now

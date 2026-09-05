@@ -36,7 +36,9 @@ import iface
 export { Parser, par_new, par_new_module, par_free, par_run, par_error, par_tree,
     par_file_set,
     par_not_core, par_tree_take, par_gen_set, par_mu_set,
-    par_fe_set, par_time_set, par_gc_set, par_if_set }
+    par_fe_set, par_time_set, par_gc_set, par_if_set,
+    // ROUND FIRN-ENV -- the build time environment (env.rs).
+    par_env_set }
 
 // token kinds from lexer.fi (in the same order as in compiler/src/lexer.rs)
 // "no value"
@@ -277,6 +279,23 @@ struct Parser {
     // switches this on around exactly that call; everywhere else a `_` is
     // refused right here, so `ast.LEN_INFER` never leaves the parser.
     infer_len_ok: bool,
+    // ROUND FIRN-ENV (compiler/src/env.rs) -- the build time environment for
+    // `__env_or`/`__env_has`. Not a global and not a second registry: the
+    // same handover `gen`/`mu`/`feh`/`gcr`/`ifr` use, because the
+    // environment belongs to the TRANSLATION and not to one file.
+    //
+    //   estart   the start block of the process (`[argc][argv..][0][envp..]`).
+    //            0 means: no environment is visible, so every variable
+    //            counts as unset and every `__env_or` yields its default.
+    //            That is the state the small drivers are in, and it is the
+    //            reason they translate reproducibly.
+    //   eallow_p/n  the EXTRA permitted prefixes, comma separated
+    //            (`--env-allow=`). `FIRN_` is permitted without any of them.
+    //   enotes   an `rt.Buf` collecting the manifest of `--env-log`, or 0.
+    estart: u64,
+    eallow_p: u64,
+    eallow_n: usize,
+    enotes: u64,
 }
 
 fn par_new(lx: u64) -> Parser {
@@ -292,6 +311,7 @@ fn par_new(lx: u64) -> Parser {
         local: vec_new[u32](), llimit: vec_new[u32](),
         hoist: vec_new[u32](), interp: 0,
         file: 0, esc_pending: 0, arch_pending: 0, infer_len_ok: false,
+        estart: 0, eallow_p: 0, eallow_n: 0, enotes: 0,
     }
     p.n = lexer.lex_count(lx as *mut lexer.Lexer)
     // ROUND 83: a parser that owns its tree registers the file it is about
@@ -357,6 +377,15 @@ fn has_fe(p: *mut Parser) -> bool { return (*p).feh != 0 }
 // ROUND 35: register `comptime` blocks.
 fn par_time_set(p: *mut Parser) { (*p).time = true }
 fn has_time(p: *mut Parser) -> bool { return (*p).time }
+
+// ROUND FIRN-ENV: the build time environment. Again BEFORE `par_run` --
+// `__env_or` is resolved WHILE parsing, so afterwards would be too late.
+fn par_env_set(p: *mut Parser, start: u64, allow_p: u64, allow_n: usize, notes: u64) {
+    (*p).estart = start
+    (*p).eallow_p = allow_p
+    (*p).eallow_n = allow_n
+    (*p).enotes = notes
+}
 
 // ROUND 34: register the gc registry. Again BEFORE `par_run`.
 fn par_gc_set(p: *mut Parser, g: u64) { (*p).gcr = g }
@@ -1440,7 +1469,18 @@ fn after_expr(p: *mut Parser) -> u32 {
             next_bump(p)
             let off: u32 = call_args(p)
             let len: u32 = ast.child_count(par_tree(p)) - off
-            e = ast.expr_new(par_tree(p), ast.E_CALL, name, off, len, 0)
+            // HOOK env (round FIRN-ENV, compiler/src/env.rs): `__env_or(...)`
+            // and `__env_has(...)` do not become a call at all -- they become
+            // the LITERAL they stand for, here and now. `firnc0` folds at the
+            // same place and in the same ORDER, so both compilers create the
+            // same number of nodes and `_fseg...` of an interpolation gets
+            // the same name on both sides (tools/parser_compare.sh).
+            let ek: u32 = env_kind(p, name)
+            if ek != 0 {
+                e = env_call(p, ek, off, len)
+            } else {
+                e = ast.expr_new(par_tree(p), ast.E_CALL, name, off, len, 0)
+            }
             pos_default(p, e, base_pos)
         } else if a == A_KWAS {
             next_bump(p)
@@ -1660,6 +1700,363 @@ fn compound_op(k: u32) -> u32 {
     if k == A_SHLEQ { return 8 }
     if k == A_SHREQ { return 9 }
     return NONE
+}
+
+// ------------------------------------------------------------- HOOK env
+//
+// ROUND FIRN-ENV -- build time environment variables, the twin of
+// `compiler/src/env.rs` and `compiler/src/parser.rs::env_call`. The
+// reasoning stands there in full; what stands here is the same rule, in
+// the same order:
+//
+//   1. the name has to be a text literal, shaped `A-Z 0-9 _`, at most
+//      ENV_MAX_NAME octets long, and its prefix has to be permitted
+//      (`FIRN_` always, plus whatever `--env-allow=` added);
+//   2. is it set, the value is checked (at most ENV_MAX_VALUE octets, no
+//      control characters, valid UTF-8) and becomes the literal;
+//   3. is it not set, the second argument -- itself a text literal -- does.
+//
+// A name that is NOT permitted is an error whether the variable is set or
+// not. An error that depended on the environment would be a second way for
+// two builds to differ without anybody noticing.
+
+const ENV_MAX_NAME: usize = 64
+const ENV_MAX_VALUE: usize = 4096
+
+// Do these two octet sequences agree?
+fn same_bytes(a: u64, b: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(a, i) != rt.ld8(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 0 = no intrinsic, 1 = `__env_or`, 2 = `__env_has`.
+fn env_kind(p: *mut Parser, nr: u32) -> u32 {
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let q: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var w1: [u8; 8] = "__env_or"
+    var w2: [u8; 9] = "__env_has"
+    if n == 8 {
+        if same_bytes(q, (&w1[0]) as u64, 8) {
+            return 1
+        }
+    }
+    if n == 9 {
+        if same_bytes(q, (&w2[0]) as u64, 9) {
+            return 2
+        }
+    }
+    return 0
+}
+
+// The octets of a text literal into `out`. `false` for everything else --
+// `u"..."` (WTF-16) included: a build time constant is octets.
+fn env_lit_octets(p: *mut Parser, e: u32, out: *mut rt.Buf) -> bool {
+    let b: *mut ast.Tree = par_tree(p)
+    if ast.e_kind(b, e) != ast.E_TEXT {
+        return false
+    }
+    if ast.e_b(b, e) != 0 {
+        return false
+    }
+    let lit: u32 = ast.e_a(b, e)
+    if ast.e_kind(b, lit) != ast.E_ALIT {
+        return false
+    }
+    let off: u32 = ast.e_b(b, lit)
+    let cnt: u32 = ast.e_c(b, lit)
+    rt.buf_clear(out)
+    var i: u32 = 0
+    while i < cnt {
+        let el: u32 = ast.child_at(b, off + i)
+        if ast.e_kind(b, el) != ast.E_INT {
+            return false
+        }
+        let v: u64 = ast.e_number(b, el)
+        if v > 255 {
+            return false
+        }
+        rt.buf_push(out, v as u8)
+        i = i + 1
+    }
+    return true
+}
+
+// The array literal of exactly these octets, and the text literal around
+// it -- node for node what `text_literal` builds out of a written `"..."`.
+fn env_text_node(p: *mut Parser, q: u64, n: usize) -> u32 {
+    var tmp: Vec[u32] = vec_new[u32]()
+    var i: usize = 0
+    while i < n {
+        vec_push[u32](&tmp, ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0,
+            rt.ld8(q, i) as u64))
+        i = i + 1
+    }
+    let off: u32 = list_store(p, &tmp)
+    vec_free[u32](&tmp)
+    let alit: u32 = ast.expr_new(par_tree(p), ast.E_ALIT, 0, off, n as u32, 0)
+    return ast.expr_new(par_tree(p), ast.E_TEXT, alit, 0, 0, 0)
+}
+
+// Is this octet permitted in the name of an environment variable?
+fn env_name_octet(c: u8, first: bool) -> bool {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return true
+    }
+    if c == 95 as u8 {
+        return true
+    }
+    if !first && c >= 48 as u8 && c <= 57 as u8 {
+        return true
+    }
+    return false
+}
+
+// Does the name start with a permitted prefix? `FIRN_` always; everything
+// else has to stand in the comma separated list of `--env-allow=`.
+fn env_prefix_ok(p: *mut Parser, q: u64, n: usize) -> bool {
+    var d: [u8; 5] = "FIRN_"
+    if n >= 5 {
+        if same_bytes(q, (&d[0]) as u64, 5) {
+            return true
+        }
+    }
+    let ap: u64 = (*p).eallow_p
+    let an: usize = (*p).eallow_n
+    var i: usize = 0
+    while i < an {
+        var j: usize = i
+        while j < an {
+            if rt.ld8(ap, j) == 44 as u8 {
+                break
+            }
+            j = j + 1
+        }
+        let plen: usize = j - i
+        if plen > 0 && plen <= n {
+            if same_bytes(q, ap + i as u64, plen) {
+                return true
+            }
+        }
+        i = j + 1
+    }
+    return false
+}
+
+// Name check -- SHAPE and prefix. Independent of the environment.
+fn env_name_ok(p: *mut Parser, q: u64, n: usize) -> bool {
+    if n == 0 || n > ENV_MAX_NAME {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if !env_name_octet(rt.ld8(q, i), i == 0) {
+            return false
+        }
+        i = i + 1
+    }
+    return env_prefix_ok(p, q, n)
+}
+
+// Valid UTF-8? Overlong forms, surrogates and code points above U+10FFFF
+// are refused -- the same rule `std::str::from_utf8` follows in `firnc0`.
+fn env_utf8_ok(q: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        let c0: u32 = rt.ld8(q, i) as u32
+        if c0 < 128 {
+            i = i + 1
+        } else {
+            var w: usize = 0
+            var cp: u32 = 0
+            if c0 >= 194 && c0 <= 223 {
+                w = 2
+                cp = c0 - 192
+            } else if c0 >= 224 && c0 <= 239 {
+                w = 3
+                cp = c0 - 224
+            } else if c0 >= 240 && c0 <= 244 {
+                w = 4
+                cp = c0 - 240
+            } else {
+                return false
+            }
+            if i + w > n {
+                return false
+            }
+            var j: usize = 1
+            while j < w {
+                let cb: u32 = rt.ld8(q, i + j) as u32
+                if cb < 128 || cb > 191 {
+                    return false
+                }
+                cp = (cp * 64) + (cb - 128)
+                j = j + 1
+            }
+            if w == 3 && cp < 2048 {
+                return false
+            }
+            if w == 4 && cp < 65536 {
+                return false
+            }
+            if cp > 1114111 {
+                return false
+            }
+            if cp >= 55296 && cp <= 57343 {
+                return false
+            }
+            i = i + w
+        }
+    }
+    return true
+}
+
+// Value check -- length, control characters, UTF-8.
+fn env_value_ok(q: u64, n: usize) -> bool {
+    if n > ENV_MAX_VALUE {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(q, i)
+        if c < 32 as u8 || c == 127 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return env_utf8_ok(q, n)
+}
+
+// Look the variable up in the start block. `envp` follows `argv`:
+//     [argc][argv0]..[argvN][0][envp0]..[0][auxv..]
+// `true` = set; the value lands in `out`.
+fn env_find(p: *mut Parser, q: u64, n: usize, out: *mut rt.Buf) -> bool {
+    let start: u64 = (*p).estart
+    if start == 0 {
+        return false
+    }
+    var i: usize = 1 + rt.arg_count(start) + 1
+    while true {
+        let e: u64 = rt.ld64(start, i)
+        if e == 0 {
+            break
+        }
+        var j: usize = 0
+        var equal: bool = true
+        while j < n {
+            if rt.ld8(e, j) != rt.ld8(q, j) {
+                equal = false
+                break
+            }
+            j = j + 1
+        }
+        if equal && rt.ld8(e, n) == 61 as u8 {
+            let v: u64 = e + n as u64 + 1
+            rt.buf_clear(out)
+            rt.buf_push_bytes(out, v, rt.c_length(v))
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// One line of the manifest of `--env-log`, character for character the one
+// `env.rs::manifest` prints.
+fn env_note(p: *mut Parser, nq: u64, nn: usize, vq: u64, vn: usize, from_env: bool) {
+    if (*p).enotes == 0 {
+        return
+    }
+    let nb: *mut rt.Buf = (*p).enotes as *mut rt.Buf
+    var head: [u8; 5] = "env: "
+    rt.buf_push_bytes(nb, (&head[0]) as u64, 5)
+    rt.buf_push_bytes(nb, nq, nn)
+    var mid: [u8; 4] = " = \""
+    rt.buf_push_bytes(nb, (&mid[0]) as u64, 4)
+    rt.buf_push_bytes(nb, vq, vn)
+    var tail1: [u8; 16] = "\" (environment)\n"
+    var tail2: [u8; 12] = "\" (default)\n"
+    if from_env {
+        rt.buf_push_bytes(nb, (&tail1[0]) as u64, 16)
+    } else {
+        rt.buf_push_bytes(nb, (&tail2[0]) as u64, 12)
+    }
+}
+
+// The `__env_has` line: `?` instead of `=`, so that a `false` cannot be
+// read as a value.
+fn env_note_has(p: *mut Parser, nq: u64, nn: usize, set: bool) {
+    if (*p).enotes == 0 {
+        return
+    }
+    let nb: *mut rt.Buf = (*p).enotes as *mut rt.Buf
+    var head: [u8; 5] = "env: "
+    rt.buf_push_bytes(nb, (&head[0]) as u64, 5)
+    rt.buf_push_bytes(nb, nq, nn)
+    var t: [u8; 8] = " ? true\n"
+    var f: [u8; 9] = " ? false\n"
+    if set {
+        rt.buf_push_bytes(nb, (&t[0]) as u64, 8)
+    } else {
+        rt.buf_push_bytes(nb, (&f[0]) as u64, 9)
+    }
+}
+
+// The fold itself. `kind` is 1 for `__env_or` and 2 for `__env_has`; `off`
+// and `len` describe the argument list already parsed.
+fn env_call(p: *mut Parser, kind: u32, off: u32, len: u32) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    var want: u32 = 1
+    if kind == 1 {
+        want = 2
+    }
+    if len != want {
+        complain(p)
+        return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    }
+    var nm: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&nm)
+    if !env_lit_octets(p, ast.child_at(b, off), &nm) {
+        complain(p)
+        return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    }
+    let nq: u64 = rt.buf_ptr(&nm)
+    let nn: usize = rt.buf_len(&nm)
+    if !env_name_ok(p, nq, nn) {
+        complain(p)
+        return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    }
+    var val: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&val)
+    let set: bool = env_find(p, nq, nn, &val)
+    if set {
+        if !env_value_ok(rt.buf_ptr(&val), rt.buf_len(&val)) {
+            complain(p)
+            return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+        }
+    }
+    if kind == 2 {
+        env_note_has(p, nq, nn, set)
+        var w: u32 = 0
+        if set {
+            w = 1
+        }
+        return ast.expr_new(b, ast.E_BOOL, w, 0, 0, 0)
+    }
+    if !set {
+        if !env_lit_octets(p, ast.child_at(b, off + 1), &val) {
+            complain(p)
+            return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+        }
+    }
+    env_note(p, nq, nn, rt.buf_ptr(&val), rt.buf_len(&val), set)
+    return env_text_node(p, rt.buf_ptr(&val), rt.buf_len(&val))
 }
 
 fn text_literal(p: *mut Parser) -> u32 {

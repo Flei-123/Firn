@@ -41,6 +41,13 @@ pub struct TypeInfo {
     pub expr_types: Vec<Type>,
     /// Evaluated `const` declarations: name -> (type, value).
     pub consts: HashMap<String, (Type, i128)>,
+    /// **ROUND FIRN-ENV** — the OCTETS of every `const` of type `str`. A
+    /// text constant is not a number and has no place in `consts`; the name
+    /// stands there all the same (with 0), so that everything asking "is
+    /// this spelling taken, and by what type" keeps working with one table.
+    /// The lowering materialises these octets at every use, exactly as it
+    /// does for a written literal (`lower.rs::write_into`).
+    pub const_texts: HashMap<String, Vec<u8>>,
     /// **ROUND 89** — `static` declarations: name -> (type, `mut`?).
     /// Unlike a `const`, a `static` has an ADDRESS; the initial value does
     /// not live here but in `statics.rs`, already turned into octets.
@@ -90,6 +97,8 @@ pub(crate) struct Checker<'a> {
     pub(crate) tcx: TypeCtx,
     pub(crate) fns: HashMap<String, FnSig>,
     pub(crate) consts: HashMap<String, (Type, i128)>,
+    /// **ROUND FIRN-ENV** — see `TypeInfo::const_texts`.
+    pub(crate) const_texts: HashMap<String, Vec<u8>>,
     /// **ROUND 89** — see `TypeInfo::statics`.
     pub(crate) statics: HashMap<String, (Type, bool)>,
     /// The program of the current pass — needed by `comptime`, which runs
@@ -117,6 +126,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         tcx: TypeCtx::new(),
         fns: HashMap::new(),
         consts: HashMap::new(),
+        const_texts: HashMap::new(),
         statics: HashMap::new(),
         prog: None,
         expr_types: vec![Type::Error; prog.expr_count as usize],
@@ -143,6 +153,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         tcx: ck.tcx,
         expr_types: ck.expr_types,
         consts: ck.consts,
+        const_texts: ck.const_texts,
         statics: ck.statics,
         fns: ck.fns,
         widen_f32: ck.widen_f32,
@@ -697,10 +708,18 @@ impl<'a> Checker<'a> {
     fn check_consts(&mut self, prog: &Program) {
         for c in &prog.consts {
             let ty = self.resolve_ty(&c.ty);
-            if !ty.is_error() && !(ty.is_concrete_int() || ty == Type::Bool) {
+            // HOOK env (round FIRN-ENV): a `const` of type `str`. It is the
+            // one aggregate a constant may have, and for the same reason a
+            // number may be one: the value is FINISHED at compile time --
+            // octets, not an address, not an allocation.
+            let is_text = crate::strtype::is_str(&ty);
+            if !ty.is_error()
+                && !(ty.is_concrete_int() || ty == Type::Bool || ty.is_float() || is_text)
+            {
                 self.dg.error(
                     c.ty.span(),
-                    "'const' supports only integer and bool types in stage 0",
+                    "'const' supports only integer, bool, floating point and 'str' types in \
+stage 0",
                 );
                 self.type_out_expr(&c.value);
                 continue;
@@ -725,7 +744,38 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            match self.eval_const(&c.value) {
+            // HOOK env (round FIRN-ENV): a text constant is octets, and
+            // they are collected by their own walk -- `eval_const` answers
+            // "which NUMBER is this", which is the wrong question for a
+            // brand name. `+` works, and it means the same thing it means at
+            // run time: the two octet sequences after one another.
+            if is_text {
+                match self.const_octets(&c.value, 0) {
+                    Ok(b) => {
+                        self.const_texts.insert(c.name.clone(), b);
+                        self.consts.insert(c.name.clone(), (ty.clone(), 0));
+                    }
+                    Err((span, msg)) => {
+                        self.dg.error(span, msg);
+                        self.const_texts.insert(c.name.clone(), Vec::new());
+                        self.consts.insert(c.name.clone(), (ty.clone(), 0));
+                    }
+                }
+                continue;
+            }
+            // ROUND FIRN-LUECKEN: a `const f64` is evaluated as a NUMBER and
+            // stored as its BIT PATTERN -- exactly the shape in which a float
+            // literal travels into FIR (lower.rs::ExprKind::Float). The two
+            // evaluators are kept strictly apart: an integer never slides
+            // into a float here and a float never into an integer, which is
+            // the mistake `opt.rs::fold_cast` describes for round 20.
+            let ev = if ty.is_float() {
+                self.eval_const_float(&c.value, ty == Type::F32, 0)
+                    .map(|b| b as i128)
+            } else {
+                self.eval_const(&c.value)
+            };
+            match ev {
                 Ok(v) => {
                     self.consts.insert(c.name.clone(), (ty.clone(), wrap(v, &ty)));
                 }
@@ -1014,27 +1064,173 @@ compile time)"
         Ok(())
     }
 
-    /// The bit pattern of a floating point initial value. Only a literal
-    /// (with an optional minus in front) -- `0.1 + 0.2` at compile time
-    /// would need a second, exactly IEEE-754 conforming evaluator, and one
-    /// that is only ALMOST right is worse than none.
+    /// The bit pattern of a floating point initial value of a `static`. The
+    /// same walk a `const` uses -- a `const` and a `static` may not disagree
+    /// about what `1.0 / 3.0` is.
     fn eval_static_float(&self, e: &Expr, single: bool) -> Result<u64, (Span, String)> {
+        self.eval_const_float(e, single, 0)
+    }
+
+    /// **ROUND FIRN-ENV** — the OCTETS of a text constant expression.
+    ///
+    /// The third of the three constant walks, next to `eval_const` (which
+    /// number is this) and `eval_const_float` (which bit pattern). It stands
+    /// apart for the same reason those two do: a text is neither a number
+    /// nor a bit pattern, and an evaluator that pretended otherwise would be
+    /// the round 20 mistake in a new place.
+    ///
+    /// What is allowed:
+    ///
+    ///   * a text literal — and therefore `__env_or(…)` as well, which the
+    ///     parser has already turned into exactly that (env.rs);
+    ///   * a text constant declared BEFORE this one;
+    ///   * `+` between the two, which concatenates. The same meaning `+`
+    ///     has on a `str` at run time, only without the collector: the
+    ///     octets are already there.
+    ///
+    /// What is deliberately NOT allowed: a call, an index, a cast, a number.
+    /// Everything a `comptime` function could compute belongs in `comptime`,
+    /// which owns the interpreter with the step limit.
+    fn const_octets(&self, e: &Expr, d: u32) -> Result<Vec<u8>, (Span, String)> {
+        if d >= MAX_DEPTH {
+            return Err((
+                e.span,
+                "constant expression is nested too deeply".to_string(),
+            ));
+        }
         match &e.kind {
-            ExprKind::Float(bits, s32) => {
-                Ok(if single { *s32 as u64 } else { *bits })
+            ExprKind::Text(false, inner) => match &inner.kind {
+                ExprKind::ArrayLit(elems) => {
+                    let mut out = Vec::with_capacity(elems.len());
+                    for el in elems {
+                        match &el.kind {
+                            ExprKind::Int(v) if (0..256).contains(v) => out.push(*v as u8),
+                            _ => {
+                                return Err((
+                                    e.span,
+                                    "this text literal is not made of octets".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
+                _ => Err((e.span, "this text literal has no octets".to_string())),
+            },
+            ExprKind::Text(true, _) => Err((
+                e.span,
+                "a u\"…\" literal is WTF-16 and is no 'str' (SPEC §8.2)".to_string(),
+            )),
+            ExprKind::Ident(n) => match self.const_texts.get(n) {
+                Some(b) => Ok(b.clone()),
+                None => Err((
+                    e.span,
+                    format!("'{}' is not an already declared text constant", n),
+                )),
+            },
+            ExprKind::Binary(BinOp::Add, l, r) => {
+                let mut a = self.const_octets(l, d + 1)?;
+                let b = self.const_octets(r, d + 1)?;
+                a.extend_from_slice(&b);
+                Ok(a)
             }
-            ExprKind::FloatF32(b) => Ok(*b as u64),
+            _ => Err((
+                e.span,
+                "a text constant is built from text literals, text constants declared before \
+it and '+'"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// **ROUND FIRN-LUECKEN** — the bit pattern of a floating point constant
+    /// expression.
+    ///
+    /// Until this round the answer was "there is none": `const` took integers
+    /// and bools, and a `static f64` took a bare literal. The note that stood
+    /// here said an evaluator that is only ALMOST IEEE-754 would be worse than
+    /// none. That is true, and it is exactly why THIS one is allowed to exist:
+    /// it does not compute in some private format, it computes in `f64` and in
+    /// `f32` — the same two formats the machine has, with the same
+    /// round-to-nearest-even. `0.1 + 0.2` folded here and `0.1 + 0.2` computed
+    /// by `addsd` at runtime are the same 64 bits, and the self hosted
+    /// compiler (`lib/firnc1/sema.fi`) does the very same operations on the
+    /// very same hardware, so the two translators cannot drift apart.
+    ///
+    /// What is deliberately NOT allowed:
+    ///
+    ///   * an integer literal or an integer constant. `const A: f64 = 100`
+    ///     stays an error and does not silently become the bit pattern 100
+    ///     (that is 5e-322) -- the very mistake `opt.rs::fold_cast` reports
+    ///     from round 20.
+    ///   * a cast. `X as f64` would be that same door with a friendlier name.
+    ///   * an `f64` constant inside an `f32` constant: narrowing rounds, and a
+    ///     rounding that the reader did not write down does not happen here.
+    ///     The other direction (`f32` in an `f64` place) is exact and is the
+    ///     one implicit conversion the language has (round 71).
+    fn eval_const_float(&self, e: &Expr, single: bool, d: u32) -> Result<u64, (Span, String)> {
+        if d >= MAX_DEPTH {
+            return Err((
+                e.span,
+                "constant expression is nested too deeply".to_string(),
+            ));
+        }
+        match &e.kind {
+            // The token carries BOTH patterns: the correctly rounded binary64
+            // AND the correctly rounded binary32 of the same TEXT. Narrowing
+            // the binary64 here would be one rounding too many (round 71).
+            ExprKind::Float(bits, s32) => Ok(if single { *s32 as u64 } else { *bits }),
+            ExprKind::FloatF32(b) => Ok(if single {
+                *b as u64
+            } else {
+                (f32::from_bits(*b) as f64).to_bits()
+            }),
+            ExprKind::Ident(n) => match self.consts.get(n) {
+                Some((Type::F64, v)) if !single => Ok(*v as u64),
+                Some((Type::F32, v)) if single => Ok(*v as u64),
+                Some((Type::F32, v)) => Ok((f32::from_bits(*v as u32) as f64).to_bits()),
+                Some((Type::F64, _)) => Err((
+                    e.span,
+                    format!(
+                        "'{}' is an f64 constant and does not narrow to f32 by itself",
+                        n
+                    ),
+                )),
+                Some(_) => Err((
+                    e.span,
+                    format!(
+                        "'{}' is not a floating point constant (an integer does not \
+become a float here -- write '1.0', not '1')",
+                        n
+                    ),
+                )),
+                None => Err((
+                    e.span,
+                    format!("'{}' is not an already declared constant", n),
+                )),
+            },
             ExprKind::Unary(UnOp::Neg, inner) => {
-                let v = self.eval_static_float(inner, single)?;
+                let v = self.eval_const_float(inner, single, d + 1)?;
                 Ok(if single {
                     (v as u32 ^ 0x8000_0000) as u64
                 } else {
                     v ^ 0x8000_0000_0000_0000
                 })
             }
+            ExprKind::Binary(op, l, r) => {
+                let a = self.eval_const_float(l, single, d + 1)?;
+                let b = self.eval_const_float(r, single, d + 1)?;
+                float_fold(*op, a, b, single).ok_or((
+                    e.span,
+                    "a floating point constant knows '+', '-', '*' and '/' and nothing else"
+                        .to_string(),
+                ))
+            }
             _ => Err((
                 e.span,
-                "a floating point 'static' starts from a literal ('1.5', '-0.25')".to_string(),
+                "a floating point constant is built from literals ('1.5', '-0.25'), \
+constants declared before it, and '+ - * /'"
+                    .to_string(),
             )),
         }
     }
@@ -1627,7 +1823,13 @@ compile time)"
             ExprKind::Int(v) => Some(*v),
             ExprKind::Cast(inner, _) => self.literal_index(inner),
             ExprKind::Unary(UnOp::Neg, inner) => self.literal_index(inner).map(|v| -v),
-            ExprKind::Ident(n) => self.consts.get(n).map(|(_, v)| *v),
+            // ROUND FIRN-LUECKEN: a float constant carries a bit pattern, not
+            // an index.
+            ExprKind::Ident(n) => self
+                .consts
+                .get(n)
+                .filter(|(t, _)| !t.is_float())
+                .map(|(_, v)| *v),
             _ => None,
         }
     }
@@ -2835,7 +3037,21 @@ compile time)"
         match &e.kind {
             ExprKind::Int(v) => Ok(*v),
             ExprKind::Bool(b) => Ok(if *b { 1 } else { 0 }),
+            ExprKind::Ident(n) if self.const_texts.contains_key(n) => Err((
+                e.span,
+                // ROUND FIRN-ENV: `consts` carries a 0 for a text constant
+                // so that the name is taken. Handing THAT out here would
+                // turn `[0; NAME]` into an empty array without a word.
+                format!("'{}' is a text constant and is not a number here", n),
+            )),
             ExprKind::Ident(n) => match self.consts.get(n) {
+                // ROUND FIRN-LUECKEN: the stored value of a float constant is
+                // a BIT PATTERN. Handing it out here would make
+                // `[0; SCALE]` an array of 4613937818241073152 elements.
+                Some((t, _)) if t.is_float() => Err((
+                    e.span,
+                    format!("'{}' is a floating point constant and is not a number here", n),
+                )),
                 Some((_, v)) => Ok(*v),
                 None => Err((
                     e.span,
@@ -3046,6 +3262,35 @@ fn fixed_note(reason: &str) -> &'static str {
     } else {
         "use 'var' instead of 'let'"
     }
+}
+
+/// **ROUND FIRN-LUECKEN** — one floating point operation on two bit
+/// patterns, in the format the constant really has. `f32` is computed as
+/// `f32` and not as a narrowed `f64`: that is one instruction of the machine,
+/// one rounding, and the same result the program would compute at runtime.
+fn float_fold(op: BinOp, a: u64, b: u64, single: bool) -> Option<u64> {
+    if single {
+        let x = f32::from_bits(a as u32);
+        let y = f32::from_bits(b as u32);
+        let r = match op {
+            BinOp::Add => x + y,
+            BinOp::Sub => x - y,
+            BinOp::Mul => x * y,
+            BinOp::Div => x / y,
+            _ => return None,
+        };
+        return Some(r.to_bits() as u64);
+    }
+    let x = f64::from_bits(a);
+    let y = f64::from_bits(b);
+    let r = match op {
+        BinOp::Add => x + y,
+        BinOp::Sub => x - y,
+        BinOp::Mul => x * y,
+        BinOp::Div => x / y,
+        _ => return None,
+    };
+    Some(r.to_bits())
 }
 
 fn wrap(v: i128, t: &Type) -> i128 {
@@ -3271,6 +3516,7 @@ mod tests {
             tcx: TypeCtx::new(),
             fns: HashMap::new(),
             consts: HashMap::new(),
+            const_texts: HashMap::new(),
             statics: HashMap::new(),
             expr_types: vec![Type::Error; first.expr_count as usize],
             scopes: Vec::new(),

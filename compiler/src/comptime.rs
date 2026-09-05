@@ -358,6 +358,18 @@ impl<'a> Execution<'a> {
                     }
                 }
                 match self.consts.get(n) {
+                    // ROUND FIRN-LUECKEN: a float constant is a BIT PATTERN in
+                    // that table. Compile time execution has no floating point
+                    // (see the arm above), so it does not get one through the
+                    // back door either.
+                    Some((t, _)) if t.is_float() => Err((
+                        e.span,
+                        format!(
+                            "comptime: '{}' is a floating point constant, and floating \
+point is not yet possible at compile time",
+                            n
+                        ),
+                    )),
                     Some((_, v)) => Ok(*v),
                     None => Err((e.span, format!("comptime: '{}' is not known here", n))),
                 }

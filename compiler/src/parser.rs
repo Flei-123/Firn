@@ -742,7 +742,14 @@ impl<'a> Parser<'a> {
                     let (args, end) = self.call_args("after the argument list");
                     let sp = Parser::join(e.span, end);
                     let _ = lp;
-                    e = self.mk(sp, ExprKind::Call(name, args, e.span));
+                    // HOOK env: `__env_or(…)` / `__env_has(…)` do not become
+                    // a call at all — they become the LITERAL they stand
+                    // for, here and now (env.rs, round FIRN-ENV).
+                    if crate::env::is_env_call(&name) {
+                        e = self.env_call(&name, &args, sp);
+                    } else {
+                        e = self.mk(sp, ExprKind::Call(name, args, e.span));
+                    }
                 }
                 TokKind::KwAs => {
                     self.bump();
@@ -1265,6 +1272,125 @@ impl<'a> Parser<'a> {
                 None
             }
         }
+    }
+
+    // ------------------------------------------------------- HOOK env
+    //
+    // **ROUND FIRN-ENV** — the two build time intrinsics. `env.rs` carries
+    // the reasoning; what happens HERE is the whole of the translation:
+    // `__env_or("FIRN_X", "d")` turns into exactly the node `"d"` (or the
+    // value out of the environment) would have produced, and
+    // `__env_has("FIRN_X")` into `true`/`false`. Nothing behind the parser
+    // learns a new case, and the finished program never asks the
+    // environment again.
+    //
+    // The self hosted compiler does the same thing at the same place
+    // (`lib/firnc1/parser.fi::env_call`), in the same ORDER — the nodes
+    // created here are counted, and `_fseg…` of an interpolation is named
+    // after that count on both sides (tools/parser_compare.sh).
+    fn env_call(&mut self, name: &str, args: &[Expr], sp: Span) -> Expr {
+        let want = if name == crate::env::FN_OR { 2 } else { 1 };
+        if args.len() != want {
+            let call = if want == 2 {
+                "__env_or(\"FIRN_X\", \"default\")"
+            } else {
+                "__env_has(\"FIRN_X\")"
+            };
+            self.dg.error_note(
+                sp,
+                format!(
+                    "'{}' expects {} argument(s), found {}",
+                    name,
+                    want,
+                    args.len()
+                ),
+                format!("call: {}", call),
+            );
+            return self.broken_expr(sp);
+        }
+        let raw = match Parser::literal_octets(&args[0]) {
+            Some(b) => b,
+            None => {
+                self.dg.error_note(
+                    args[0].span,
+                    format!("the first argument of '{}' has to be a text literal", name),
+                    "the name is read at build time; there is no expression yet that could \
+compute it",
+                );
+                return self.broken_expr(sp);
+            }
+        };
+        let vname = match String::from_utf8(raw) {
+            Ok(s) => s,
+            Err(_) => {
+                self.dg.error(
+                    args[0].span,
+                    "the name of an environment variable has to be valid UTF-8".to_string(),
+                );
+                return self.broken_expr(sp);
+            }
+        };
+        let found = match crate::env::lookup(&vname) {
+            Ok(v) => v,
+            Err(msg) => {
+                self.dg.error(args[0].span, msg);
+                return self.broken_expr(sp);
+            }
+        };
+        if name == crate::env::FN_HAS {
+            let set = found.is_some();
+            crate::env::note_has(&vname, set);
+            return self.mk(sp, ExprKind::Bool(set));
+        }
+        let (bytes, from_env) = match found {
+            Some(v) => (v, true),
+            None => match Parser::literal_octets(&args[1]) {
+                Some(b) => (b, false),
+                None => {
+                    self.dg.error_note(
+                        args[1].span,
+                        format!("the second argument of '{}' has to be a text literal", name),
+                        "it is the value the program gets when the variable is not set",
+                    );
+                    return self.broken_expr(sp);
+                }
+            },
+        };
+        crate::env::note(&vname, &bytes, from_env);
+        self.text_from_octets(sp, &bytes)
+    }
+
+    /// The octets of a text literal — `None` for everything else,
+    /// `u"…"` (WTF-16) included: a build time constant is octets.
+    fn literal_octets(e: &Expr) -> Option<Vec<u8>> {
+        let inner = match &e.kind {
+            ExprKind::Text(false, inner) => inner,
+            _ => return None,
+        };
+        let elems = match &inner.kind {
+            ExprKind::ArrayLit(v) => v,
+            _ => return None,
+        };
+        let mut out = Vec::with_capacity(elems.len());
+        for el in elems {
+            match &el.kind {
+                ExprKind::Int(v) if (0..256).contains(v) => out.push(*v as u8),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Builds the node a text literal of exactly these octets would be:
+    /// the array literal of its octets inside an `ExprKind::Text`
+    /// (round 70, `parser::primary`).
+    pub(crate) fn text_from_octets(&mut self, sp: Span, bytes: &[u8]) -> Expr {
+        let mut elems: Vec<Expr> = Vec::with_capacity(bytes.len());
+        for b in bytes {
+            elems.push(self.mk(sp, ExprKind::Int(*b as i128)));
+        }
+        let lit = self.mk(sp, ExprKind::ArrayLit(elems));
+        self.mk(sp, ExprKind::Text(false, Box::new(lit)))
     }
 
     /// How many elements does this initializer have? `None` = not a literal.

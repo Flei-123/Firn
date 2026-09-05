@@ -88,7 +88,7 @@ pub(crate) fn records_asm() -> String {
     if recs.is_empty() {
         return out;
     }
-    let _ = writeln!(out, ".section .rodata");
+    let _ = writeln!(out, "{}", crate::target::reloc_rodata());
     let _ = writeln!(out, "{}", crate::target::align(8));
     for k in recs {
         let sym = crate::codegen_x86::label(&k);

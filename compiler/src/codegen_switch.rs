@@ -162,7 +162,7 @@ fn emit_table(
     e.line("jmp qword ptr [rdx + rax*8]");
 
     // table in .rodata; missing labels point to the default branch.
-    e.raw(".section .rodata");
+    e.raw(crate::target::reloc_rodata());
     e.raw(".align 8");
     e.raw(&format!("{}:", label));
     let mut i = 0usize;

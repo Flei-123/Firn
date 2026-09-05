@@ -259,6 +259,30 @@ const S_ZBUDGET: u64 = 2136
 // 0 = not yet determined.
 const S_STR_TID: u64 = 2144
 
+// ROUND ANLEGEWEG -- THE FAST REJECTION.
+//
+// `__gc_block_of` walks the chunk list. For an address that does not lie
+// in the heap at all it walks it TO THE END -- measured 274 ns on a heap
+// of 9.7 MiB (37 chunks). And that is by far the most frequent case: the
+// CONSERVATIVE stack scan (SPEC 3.5.3) hands EVERY word of the stack and
+// every saved register to `__gc_mark`, and the fewest of them are
+// pointers.
+//
+// These two words hold the LOWEST and the HIGHEST address the heap has
+// ever occupied. Everything outside is refused in four instructions.
+// The pair is only ever widened, never narrowed -- a chunk that is given
+// back to the operating system leaves the bounds where they are. That is
+// deliberate: the answer stays CORRECT (an address inside the bounds is
+// still looked for properly), only a little less sharp. Narrowing it
+// would need a walk of the list at exactly the moment that is meant to
+// become cheap.
+//
+// The empty state is LO = the largest possible number and HI = 0; then
+// `a < LO` holds for every address and the rejection fires -- which is
+// right, because without a chunk nothing can lie in the heap.
+const S_HEAPLO: u64 = 2152
+const S_HEAPHI: u64 = 2160
+
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
 const M_WITHOUT_MARK: u32 = 4294967292
@@ -626,35 +650,40 @@ fn gc_diag(i: u64) -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_D_CN_RUHE + i * 8)
 }
 
+// ROUND ANLEGEWEG: the same table, but as a BINARY search -- at most four
+// comparisons instead of up to thirteen. The values are unchanged:
+// 32 48 64 96 128 192 256 384 512 768 1024 2048 4096. This table is the
+// contract with `compiler/src/gc.rs` (`CLASS_BYTES`, checked by the test
+// `class_table_matches_the_runtime`) and with `lib/firnc1/gc.fi`.
 fn __gc_classes_bytes(k: u64) -> u64 {
-    if k == 0 {
-        return 32
-    }
-    if k == 1 {
-        return 48
-    }
-    if k == 2 {
-        return 64
-    }
-    if k == 3 {
+    if k < 4 {
+        if k < 2 {
+            if k == 0 {
+                return 32
+            }
+            return 48
+        }
+        if k == 2 {
+            return 64
+        }
         return 96
     }
-    if k == 4 {
-        return 128
-    }
-    if k == 5 {
-        return 192
-    }
-    if k == 6 {
-        return 256
-    }
-    if k == 7 {
+    if k < 8 {
+        if k < 6 {
+            if k == 4 {
+                return 128
+            }
+            return 192
+        }
+        if k == 6 {
+            return 256
+        }
         return 384
     }
-    if k == 8 {
-        return 512
-    }
-    if k == 9 {
+    if k < 10 {
+        if k == 8 {
+            return 512
+        }
         return 768
     }
     if k == 10 {
@@ -666,15 +695,65 @@ fn __gc_classes_bytes(k: u64) -> u64 {
     return 4096
 }
 
+// ROUND ANLEGEWEG: up to here this was a LOOP that CALLED
+// `__gc_classes_bytes` once per round. Measured on the same bench:
+// 5.2 ns for 24 octets and 27.8 ns for 200 -- for a question whose answer
+// is four comparisons. Now it is a binary search without a single call.
+// The answer is identical for every size.
 fn __gc_class_for(size: u64) -> u64 {
-    var k: u64 = 0
-    while k < CLASSES {
-        if size <= __gc_classes_bytes(k) {
-            return k
+    if size <= 128 {
+        if size <= 48 {
+            if size <= 32 {
+                return 0
+            }
+            return 1
         }
-        k = k + 1
+        if size <= 64 {
+            return 2
+        }
+        if size <= 96 {
+            return 3
+        }
+        return 4
+    }
+    if size <= 512 {
+        if size <= 192 {
+            return 5
+        }
+        if size <= 256 {
+            return 6
+        }
+        if size <= 384 {
+            return 7
+        }
+        return 8
+    }
+    if size <= 1024 {
+        if size <= 768 {
+            return 9
+        }
+        return 10
+    }
+    if size <= 2048 {
+        return 11
+    }
+    if size <= 4096 {
+        return 12
     }
     return CLASSES
+}
+
+// ROUND ANLEGEWEG: size class AND payload size of that class in ONE go --
+// the fast path needs both, and every call is measurable there. Packed:
+// the class in the lowest four bits, the payload size above them. The
+// table itself stands only in `__gc_classes_bytes`.
+// `CLASSES` (= 13) as the answer means: no size class of its own.
+fn __gc_class_and_bytes(size: u64) -> u64 {
+    let k: u64 = __gc_class_for(size)
+    if k >= CLASSES {
+        return CLASSES
+    }
+    return k +% (__gc_classes_bytes(k) *% 16)
 }
 
 // ------------------------------------------------------------------ Chunks
@@ -709,6 +788,13 @@ fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
     __gc_st64(p + 40, class)
     __gc_st64(st + S_CHUNKS, p)
     __gc_st64(st + S_HEAP, __gc_ld64(st + S_HEAP) + real)
+    // ROUND ANLEGEWEG: widen the bounds of the fast rejection.
+    if p < __gc_ld64(st + S_HEAPLO) {
+        __gc_st64(st + S_HEAPLO, p)
+    }
+    if p + real > __gc_ld64(st + S_HEAPHI) {
+        __gc_st64(st + S_HEAPHI, p + real)
+    }
     // All blocks into the free list of the class
     if class < CLASSES {
         let header: u64 = st + S_FREE + class * 8
@@ -737,6 +823,15 @@ fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
 // Interior pointers are expressly allowed (the conservative scan).
 fn __gc_block_of(a: u64) -> u64 {
     let st: u64 = __gc_state() as u64
+    // ROUND ANLEGEWEG: everything outside the heap bounds is out in four
+    // instructions instead of a walk of the whole chunk list. Measured on
+    // a heap of 9.7 MiB: 274 ns -> 3 ns.
+    if a < *((st +% S_HEAPLO) as *mut u64) {
+        return 0
+    }
+    if a >= *((st +% S_HEAPHI) as *mut u64) {
+        return 0
+    }
     let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
     if cc != 0 {
         let data0: u64 = cc + CHUNK_HEADER
@@ -766,6 +861,13 @@ fn __gc_block_of(a: u64) -> u64 {
 // cache.
 fn __gc_chunk_of(a: u64) -> u64 {
     let st: u64 = __gc_state() as u64
+    // ROUND ANLEGEWEG: the same fast rejection as in `__gc_block_of`.
+    if a < *((st +% S_HEAPLO) as *mut u64) {
+        return 0
+    }
+    if a >= *((st +% S_HEAPHI) as *mut u64) {
+        return 0
+    }
     // The same one entry cache as in __gc_block_of: consecutive finalizers
     // almost always hit the same chunk.
     let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
@@ -1726,10 +1828,111 @@ fn __gc_alloc_locked(st: u64) {
     __gc_error_fin_alloc()
 }
 
+// ROUND ANLEGEWEG -- THE FAST PATH OF THE ALLOCATION.
+//
+// Until this round `__gc_alloc_raw` cost 144 ns for an object of 24 octets --
+// and with the collector switched OFF exactly the same, so it was never the
+// collecting. It was the way there: some three dozen FUNCTION CALLS. Every
+// single word access went through `__gc_ld64`/`__gc_st64` (which stay
+// functions of their own, about 3 ns each), the size class through a loop
+// that called `__gc_classes_bytes` once per round, and on top of that three
+// counter works and a nulling loop with one call per word.
+//
+// This function asks in ONE go whether the ordinary case holds. Every
+// condition is the same one the long path checks; not one is skipped:
+//
+//   S_INIT  == 1        the collector is ready. 0 = `gc_init()` is missing,
+//                       2 = a finalizer is running -- both belong to the long
+//                       path, which reports them properly.
+//   S_MULTI == 0        one thread. With several threads the safepoint, the
+//                       GC lock and the per thread free lists apply; all of
+//                       that stays untouched below.
+//   S_PHASE == 0        no cycle running. During a cycle a fresh object has
+//                       to become GREY and go onto the mark stack.
+//   S_SINCE <  S_LIMIT  the allocation limit has not been reached. The start
+//                       of a cycle hangs off exactly this comparison.
+//   class < CLASSES     the size has a size class (anything larger gets a
+//                       chunk of its own).
+//   the free list of that class is not empty
+//
+// After that the block is unhooked, its payload nulled, and the header
+// written: type id, the current white, serial number. The counters
+// (S_SINCE, S_TOTAL, S_D_ALLOK) are the same ones and are kept in the same
+// way -- `gc_total_bytes()`, `gc_diag(6)` and the serial numbers of `GcWeak`
+// keep their meaning down to the last octet.
+//
+// The arithmetic is `+%` (wrapping) throughout. These are ADDRESSES inside
+// the state block and inside a chunk; an overflow is impossible by
+// construction there, and the check on every single one of them was
+// measurably a good part of what made the way slow.
+//
+// Return value: the payload address, or 0 when the ordinary case does not
+// hold -- the caller then walks the old, complete path. A payload address
+// can never be 0 (it comes from `mmap`), so the two cannot be confused.
+//
+// SINCE THE SAME ROUND THE CALL SITE CARRIES THIS PATH ITSELF: `gc C{ }`
+// is lowered with `class` and `step` folded into constants
+// (`compiler/src/gc_lower.rs`, `lib/firnc1/lower.fi`). This function stays
+// for everything that reaches the runtime WITHOUT a call site of its own --
+// the slot buffers of `GcVec`/`GcMap`, and every direct call of
+// `__gc_alloc_raw`.
+fn __gc_alloc_fast(st: u64, tid: u64, size: u64) -> u64 {
+    if *((st +% S_INIT) as *mut u64) != 1 {
+        return 0
+    }
+    if *((st +% S_MULTI) as *mut u64) != 0 {
+        return 0
+    }
+    if *((st +% S_PHASE) as *mut u64) != 0 {
+        return 0
+    }
+    let since0: u64 = *((st +% S_SINCE) as *mut u64)
+    if since0 >= *((st +% S_LIMIT) as *mut u64) {
+        return 0
+    }
+    let kb: u64 = __gc_class_and_bytes(size)
+    let class: u64 = kb & 15
+    if class >= CLASSES {
+        return 0
+    }
+    let step: u64 = HEADER +% (kb >> 4)
+    let header: u64 = st +% S_FREE +% (class *% 8)
+    let b: u64 = *(header as *mut u64)
+    if b == 0 {
+        return 0
+    }
+    // Unhook: the link of the free list lies in the first word of the payload.
+    let obj0: u64 = b +% HEADER
+    *(header as *mut u64) = *(obj0 as *mut u64)
+    // Null the payload: a half filled object has to be traceable at any
+    // moment (a field initialisation can allocate again itself).
+    var i: u64 = 0
+    while i < size {
+        *((obj0 +% i) as *mut u64) = 0
+        i = i +% 8
+    }
+    let series: u64 = (*((st +% S_SERIES) as *mut u64)) +% 1
+    *((st +% S_SERIES) as *mut u64) = series
+    *(b as *mut u32) = (tid & 4294967295) as u32
+    *((b +% 4) as *mut u32) = ((*((st +% S_PAR) as *mut u64)) & 4294967295) as u32
+    *((b +% 8) as *mut u64) = series
+    *((st +% S_SINCE) as *mut u64) = since0 +% step
+    *((st +% S_TOTAL) as *mut u64) = (*((st +% S_TOTAL) as *mut u64)) +% step
+    *((st +% S_D_ALLOK) as *mut u64) = (*((st +% S_D_ALLOK) as *mut u64)) +% 1
+    return obj0
+}
+
 // Returns the payload address (= the value of a `Gc[T]`) or 0.
 // On exhaustion: FIRST a collection run, THEN the failure.
 fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     let st: u64 = __gc_state() as u64
+    // ROUND ANLEGEWEG: the fast path first. It yields 0 as soon as anything
+    // is out of the ordinary -- and then everything below runs exactly as
+    // it always did.
+    let fast: u64 = __gc_alloc_fast(st, tid, size)
+    if fast != 0 {
+        return fast as *mut u8
+    }
     // S_INIT: 0 = gc_init() is missing, 1 = ready, 2 = a finalizer is running.
     // The lock sits DELIBERATELY inside this one check, which is there
     // anyway -- a finalizer that allocates would start a collection run out
@@ -2677,6 +2880,11 @@ fn gc_init() -> bool {
     __gc_st64(st + S_INKRAB, INCR_FROM)
     // Round 47: determine once whether any class has a weak field at all.
     // Programs without GcWeak then pay nothing for the nulling.
+    // ROUND ANLEGEWEG: the empty bounds -- LO larger than every address,
+    // HI smaller than every address. Every `__gc_block_of` then refuses at
+    // once, which is correct as long as there is no chunk.
+    __gc_st64(st + S_HEAPLO, 18446744073709551615)
+    __gc_st64(st + S_HEAPHI, 0)
     __gc_st64(st + S_HATWEAK, __gc_weak_present())
     __gc_st64(st + S_WEAKMASK, __gc_weak_mask())
     __gc_st64(st + S_INIT, 1)

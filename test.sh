@@ -24,6 +24,9 @@
 #   8b. The atomic primitive `__atomic_add` really produces a
 #      `lock xadd` -- in three build stages and in both compilers, with a
 #      counter-check (tools/atomic/run.sh, round 47).
+#   8b2. Build time environment variables (`__env_or`/`__env_has`): default
+#      and set, the program without an environment, the allow list, the
+#      manifest -- in both compilers (tools/env/run.sh, ROUND FIRN-ENV).
 #   8c. Interface bounds dispatch STATICALLY: no indirect call,
 #      no method table -- counter-check with `dyn I`, both compilers
 #      (tools/bounds/run.sh, round 50).
@@ -441,6 +444,19 @@ if [ "$ATRC" -eq 0 ]; then
 else
     bad "tools/atomic/run.sh failed (see .test-work/atomic.log)"
     tail -20 "$WORK/atomic.log" | sed 's/^/   /'
+fi
+
+echo "== 8b2. build time environment variables (tools/env/run.sh, ROUND FIRN-ENV) =="
+# `__env_or`/`__env_has` in both compilers: default and set, the finished
+# program without an environment (`env -i`), the allow list, the manifest,
+# and the shape `kernel/marke.fi` in OrientOS would use.
+bash tools/env/run.sh > "$WORK/env.log" 2>&1 && EVRC=0 || EVRC=$?
+if [ "$EVRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/env.log" | sed 's/^/   /'
+else
+    bad "tools/env/run.sh failed (see .test-work/env.log)"
+    tail -30 "$WORK/env.log" | sed 's/^/   /'
 fi
 
 echo "== 8c. bounds: static dispatch without an indirect call (ROUND 50) =="
@@ -1466,6 +1482,71 @@ else
     bad "tools/fpz/run.sh failed (see .test-work/fpz.log)"
     grep -E 'FAIL|Traceback|Error' "$WORK/fpz.log" | head -12 | sed 's/^/   /'
     tail -5 "$WORK/fpz.log" | sed 's/^/   /'
+fi
+
+echo "== 65. WINDOWS: the same program on two operating systems (ROUND WINDOWS) =="
+# `--target=x86_64-windows` builds a PE/COFF `.exe`. THREE tools, and each
+# asks a different question:
+#
+#   machine.sh  what the FILE is -- PE32+, an import table of our own, no C
+#               runtime symbol in the image, the Win64 thunk in the right
+#               order, 32 octets of shadow space, the stack probe with its
+#               counter-check, and a scan of the whole corpus that must find
+#               NO `syscall` instruction left anywhere.
+#   run.sh      what the program DOES -- every case of tests/ built twice and
+#               run twice (natively and under Wine), standard output compared
+#               character for character and the exit code compared. Whatever
+#               differs is grouped by CAUSE (tools/windows/causes.txt); the
+#               floor is tools/windows/minquota.txt.
+#   net.sh      that the seam carries more than printf -- a TCP client over
+#               `ws2_32.dll`, against a server with a fixed reply, with the
+#               port coming out of argv so the start block is measured too.
+#
+# All three SKIP cleanly (exit 0) where the mingw binutils or Wine are not
+# installed: a machine that never had them must not turn the suite red.
+bash tools/windows/machine.sh > "$WORK/win_machine.log" 2>&1 && WMRC=0 || WMRC=$?
+grep -E '^  (passed|SKIP)' "$WORK/win_machine.log" | sed 's/^/ /'
+bash tools/windows/net.sh > "$WORK/win_net.log" 2>&1 && WNRC=0 || WNRC=$?
+grep -E '^  (passed|SKIP|OK    (linux|windows under))' "$WORK/win_net.log" | sed 's/^/ /'
+bash tools/windows/run.sh > "$WORK/win_run.log" 2>&1 && WRRC=0 || WRRC=$?
+grep -E '^  (SAME|DIFFERENT|NOT SUPPORTED|RESULT|SKIP)' "$WORK/win_run.log" | sed 's/^/ /'
+grep -E '^  -- what does not work' -A6 "$WORK/win_run.log" | sed 's/^/ /'
+if [ "$WMRC" -eq 0 ] && [ "$WNRC" -eq 0 ] && [ "$WRRC" -eq 0 ]; then
+    ok
+else
+    bad "the windows target failed (see .test-work/win_*.log)"
+    grep -E 'FAIL' "$WORK/win_machine.log" "$WORK/win_net.log" "$WORK/win_run.log" | head -12 | sed 's/^/        /'
+fi
+
+echo "== 65b. WINDOWS: the real programs of this repository (ROUND MERGE-WIN) =="
+# Section 65 asks whether a TEST CASE behaves the same on both operating
+# systems. This one asks the question that comes after it, and it asks it
+# with the programs this repository actually ships:
+#
+#   programs.sh  every tool in bin/ -- the compiler written in Firn and the
+#                six dump tools -- plus the examples, built as .exe and RUN.
+#                Standard input, argv, files, the collector.
+#   selfhost.sh  THE COMPILER ITSELF as a Windows program, over the whole
+#                corpus of tests/ and examples/: the assembly `firnc1.exe`
+#                writes under Wine has to be CHARACTER IDENTICAL with the
+#                one the Linux build of the same compiler writes.
+#   seam.sh      what the seam really answers, measured instead of read out
+#                of win_seam.rs: one probe per system call number, on both
+#                operating systems, and a table of BOUND vs ENOSYS.
+#
+# All three SKIP cleanly (exit 0) where the mingw binutils or Wine are not
+# installed.
+bash tools/windows/programs.sh > "$WORK/win_programs.log" 2>&1 && WPRC=0 || WPRC=$?
+grep -E '^  (RESULT|SKIP)' "$WORK/win_programs.log" | sed 's/^/ /'
+bash tools/windows/selfhost.sh > "$WORK/win_selfhost.log" 2>&1 && WSRC=0 || WSRC=$?
+grep -E '^  (SAME|REFUSED|DIFFERENT|corpus|RESULT|SKIP)' "$WORK/win_selfhost.log" | sed 's/^/ /'
+bash tools/windows/seam.sh > "$WORK/win_seam.log" 2>&1 && WERC=0 || WERC=$?
+grep -E '^  (BOUND|MISSING|SKIP)' "$WORK/win_seam.log" | sed 's/^/ /'
+if [ "$WPRC" -eq 0 ] && [ "$WSRC" -eq 0 ] && [ "$WERC" -eq 0 ]; then
+    ok
+else
+    bad "the windows programs failed (see .test-work/win_programs.log, win_selfhost.log, win_seam.log)"
+    grep -E 'DIFFERENT|FAIL' "$WORK/win_programs.log" "$WORK/win_selfhost.log" "$WORK/win_seam.log" | head -12 | sed 's/^/        /'
 fi
 
 TOTAL=$((PASS + FAIL))
