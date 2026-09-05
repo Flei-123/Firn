@@ -404,6 +404,41 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             }
             vstore(e, fr, d, VR);
         }
+        // RUNDE KODIERER II — die vier Befehle der Runde RASTERN.
+        //
+        // `pmullw` ist `mul .8h`, eins zu eins: acht Produkte, jeweils die
+        // unteren 16 Bit.
+        SimdKind::Mul16Lo => bin(e, fr, "mul", "8h", need(dst)?, args[0], args[1]),
+        // `pmulhuw` hat KEIN Gegenstück in einem Befehl. ARM rechnet die
+        // Produkte breit (`umull` für die unteren vier Halbwörter,
+        // `umull2` für die oberen) und man greift sich die oberen Hälften
+        // heraus: `uzp2 .8h` nimmt genau die ungeraden Halbwörter, und das
+        // sind bei kleinem Ende die oberen 16 Bit jedes 32-Bit-Produkts.
+        SimdKind::Mul16HiU => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            vload(e, fr, VB, args[1]);
+            e.line(&format!("umull {}.4s, {}.4h, {}.4h", VC, VA, VB));
+            e.line(&format!("umull2 {}.4s, {}.8h, {}.8h", VT, VA, VB));
+            e.line(&format!("uzp2 {}.8h, {}.8h, {}.8h", VR, VC, VT));
+            vstore(e, fr, d, VR);
+        }
+        // `punpcklbw` verschränkt die unteren acht Oktette beider Werte —
+        // das ist `zip1 .16b`, wieder eins zu eins.
+        SimdKind::UnpackLo8 => bin(e, fr, "zip1", "16b", need(dst)?, args[0], args[1]),
+        // `packuswb` verengt 8+8 vorzeichenbehaftete Halbwörter auf 16
+        // vorzeichenlos gesättigte Oktette. `sqxtun` macht genau das für
+        // die untere Hälfte, `sqxtun2` schreibt die obere in DASSELBE
+        // Register — deshalb steht das Ziel im zweiten Befehl schon fest
+        // und darf vorher nicht überschrieben werden.
+        SimdKind::PackU8 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            vload(e, fr, VB, args[1]);
+            e.line(&format!("sqxtun {}.8b, {}.8h", VR, VA));
+            e.line(&format!("sqxtun2 {}.16b, {}.8h", VR, VB));
+            vstore(e, fr, d, VR);
+        }
         SimdKind::UnpackLo32 => bin(e, fr, "zip1", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "zip2", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo64 => bin(e, fr, "zip1", "2d", need(dst)?, args[0], args[1]),

@@ -25,7 +25,7 @@ export FIRNLIB="$(pwd)/lib"
 
 ARCH=x86
 TFLAG=""
-STUFEN="dev-fast release-fast release-safe no-opt"
+STUFEN="dev-fast release-fast release-safe no-opt streu"
 NUR=""
 JOBS="${JOBS:-8}"
 while [ $# -gt 0 ]; do
@@ -69,10 +69,21 @@ eine() { # $1 = quelle, $2 = stufe, $3 = arbeitsnummer
     # Zweig geprueft, in dem `as` KEINE eigene Einheit anlegt.
     local lvlflag="--opt-level=$lvl"
     [ "$lvl" = no-opt ] && lvlflag="--no-opt"
+    # `streu` ist auch keine Baustufe: derselbe Text, aber mit gestreuten
+    # Quellstellen (`loc_streuer.py`). Nur so kommen Zeilenspruenge,
+    # Rueckspruenge, mehrere Dateien und Zeile 0 ueberhaupt vor -- der
+    # Codeerzeuger schreibt sie nie, der Kodierer muss sie trotzdem
+    # koennen. Auf ARM64 ist das die EINZIGE Deckung, weil
+    # `codegen_a64.rs` gar keine `.loc` schreibt (Runde 80).
+    [ "$lvl" = streu ] && lvlflag="--opt-level=release-fast"
     if ! "$FIRNC" $TFLAG --emit=asm $lvlflag -o "$s" "$f" >/dev/null 2>&1; then
         echo "UEBERSPRUNGEN $f [$lvl]" >> "$W/log.$id"
         rm -f "$s"
         return 0
+    fi
+    if [ "$lvl" = streu ]; then
+        python3 tools/kodierer/loc_streuer.py "$s" "$s.streu" "$id" 2>/dev/null \
+            && mv "$s.streu" "$s"
     fi
     local extra=""
     [ "$ARCH" = a64 ] && extra="--a64"

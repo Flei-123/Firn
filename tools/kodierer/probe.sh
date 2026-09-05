@@ -7,7 +7,7 @@ FIRNC="compiler/target/release/firnc"
 export FIRNLIB="$(pwd)/lib"
 ARCH=x86; TFLAG=""; EXTRA=""
 if [ "${1:-}" = "--a64" ]; then ARCH=a64; TFLAG="--target=aarch64-linux"; EXTRA="--a64"; shift; fi
-STUFEN="${STUFEN:-dev-fast release-fast no-opt}"
+STUFEN="${STUFEN:-dev-fast release-fast no-opt streu}"
 JOBS="${JOBS:-6}"
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 n=0
@@ -15,9 +15,15 @@ for f in "$@"; do
     [ -f "$f" ] || continue
     for lvl in $STUFEN; do
         (
-            lf="--opt-level=$lvl"; [ "$lvl" = no-opt ] && lf="--no-opt"
+            lf="--opt-level=$lvl"
+            [ "$lvl" = no-opt ] && lf="--no-opt"
+            [ "$lvl" = streu ] && lf="--opt-level=release-fast"
             s="$W/$n.s"
             if "$FIRNC" $TFLAG --emit=asm $lf -o "$s" "$f" >/dev/null 2>&1; then
+                if [ "$lvl" = streu ]; then
+                    python3 tools/kodierer/loc_streuer.py "$s" "$s.x" "$n" \
+                        >/dev/null 2>&1 && mv "$s.x" "$s"
+                fi
                 python3 tools/kodierer/vergleich.py $EXTRA "$FIRNC" "$s" >> "$W/log" 2>&1
             else
                 echo "UEBERSPRUNGEN $f [$lvl]" >> "$W/log"

@@ -115,13 +115,19 @@ every other primitive in this compiler — `__atomic_add` (round 47),
 been a second syntax for the same thing and would have needed the lexer, the
 parser, `firnfmt` and `lib/firnc1` to learn it, for no gain whatsoever.
 
-**42 intrinsics**, all in `compiler/src/simd.rs`, which is the only file in
-the compiler where a vector instruction is written down:
+**46 intrinsics** (42 from this round, four added by RUNDE KODIERER II —
+see `docs/RUNDE-KODIERER.md`), all in `compiler/src/simd.rs`, which is the
+only file in the compiler where a vector instruction is written down:
 
 * memory and construction — `__v128_load`, `__v128_store`, `__v128_zero`,
   `__v128_from_u64`, `__v128_get_u64`, `__v128_get_u32`, `__v128_set_u32`
 * bitwise — `__v128_xor`, `__v128_and`, `__v128_or`, `__v128_andnot`
-* integer — `__v128_add8`, `__v128_add32`, `__v128_add64`, `__v128_sub32`
+* integer — `__v128_add8`, `__v128_add32`, `__v128_add64`, `__v128_sub32`,
+  `__v128_mullo16` (`pmullw`), `__v128_mulhi16u` (`pmulhuw`)
+* packing (RUNDE KODIERER II) — `__v128_unpacklo8` (`punpcklbw`),
+  `__v128_packus16` (`packuswb`). Together with the two above they are what
+  alpha blending needs: unpack eight octets to sixteen bits, multiply by a
+  weight, saturate back down.
 * shuffling and shifting — `__v128_shuffle8` (`pshufb`), `__v128_shuffle32`
   (`pshufd`), `__v128_alignr` (`palignr`), `__v128_unpacklo32/hi32/lo64/hi64`,
   `__v128_shl_bytes`/`__v128_shr_bytes` (`pslldq`/`psrldq`),

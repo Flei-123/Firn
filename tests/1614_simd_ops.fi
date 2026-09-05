@@ -181,6 +181,66 @@ fn hex_is(p: u64, n: usize, lit: u64) -> bool {
 
 // ------------------------------------------------------------------- main
 
+// --- RUNDE KODIERER II: die vier Befehle, die dem Alphaueberblenden
+// fehlten. Ein Ueberblenden rechnet `(vorn * a + hinten * (255 - a)) / 255`
+// je Farbanteil. Acht Oktette gleichzeitig geht nur ueber 16 Bit: auspacken
+// (`punpcklbw`), multiplizieren (`pmullw`/`pmulhuw`), zurueckpacken
+// (`packuswb`). Hier stehen alle vier gegen eine skalare Fassung.
+
+fn ld16(src: u64, l: usize) -> u32 {
+    return (rt.ld8(src, l * 2) as u32) | ((rt.ld8(src, l * 2 + 1) as u32) << 8)
+}
+
+fn st16(out: u64, l: usize, v: u32) {
+    rt.st8(out, l * 2, (v & 255 as u32) as u8)
+    rt.st8(out, l * 2 + 1, ((v >> 8) & 255 as u32) as u8)
+}
+
+fn ref_mullo16(a: u64, b: u64, out: u64) {
+    var l: usize = 0
+    while l < 8 {
+        st16(out, l, (ld16(a, l) * ld16(b, l)) & 65535 as u32)
+        l = l + 1
+    }
+}
+
+fn ref_mulhi16u(a: u64, b: u64, out: u64) {
+    var l: usize = 0
+    while l < 8 {
+        st16(out, l, (ld16(a, l) * ld16(b, l)) >> 16)
+        l = l + 1
+    }
+}
+
+// `punpcklbw d, s` verschraenkt die UNTEREN acht Oktette: d0 s0 d1 s1 ...
+fn ref_unpacklo8(a: u64, b: u64, out: u64) {
+    var i: usize = 0
+    while i < 8 {
+        rt.st8(out, i * 2, rt.ld8(a, i))
+        rt.st8(out, i * 2 + 1, rt.ld8(b, i))
+        i = i + 1
+    }
+}
+
+// `packuswb d, s`: acht vorzeichenbehaftete Halbwoerter aus d in die
+// unteren acht Oktette, acht aus s in die oberen -- gesaettigt auf 0..255.
+fn ref_packus16_half(src: u64, out: u64, at: usize) {
+    var l: usize = 0
+    while l < 8 {
+        let raw: u32 = ld16(src, l)
+        var v: u8 = 0 as u8
+        if raw >= 32768 as u32 {
+            v = 0 as u8
+        } else if raw > 255 as u32 {
+            v = 255 as u8
+        } else {
+            v = raw as u8
+        }
+        rt.st8(out, at + l, v)
+        l = l + 1
+    }
+}
+
 fn main() -> i32 {
     var ok: [u8; 8] = "simd ok\0"
     let okp: u64 = (&ok[0]) as u64
@@ -670,6 +730,73 @@ fn main() -> i32 {
         if !eq16(gp, wp) {
             return 92
         }
+    }
+
+    // --- I: RUNDE KODIERER II -- Auspacken, 16-Bit-Produkt, Zurueckpacken.
+    // Alle vier sind SSE2, also schon oben abgefragt.
+    ref_mullo16(ap, bp, wp)
+    spill(__v128_mullo16(a, b), gp)
+    if !eq16(gp, wp) {
+        return 100
+    }
+    ref_mulhi16u(ap, bp, wp)
+    spill(__v128_mulhi16u(a, b), gp)
+    if !eq16(gp, wp) {
+        return 101
+    }
+    ref_unpacklo8(ap, bp, wp)
+    spill(__v128_unpacklo8(a, b), gp)
+    if !eq16(gp, wp) {
+        return 102
+    }
+    ref_packus16_half(ap, wp, 0)
+    ref_packus16_half(bp, wp, 8)
+    spill(__v128_packus16(a, b), gp)
+    if !eq16(gp, wp) {
+        return 103
+    }
+    // Die Saettigung wird ausdruecklich getroffen: ein negatives Halbwort
+    // muss 0 werden, ein zu grosses 255. Aus den Vorgabewerten kommt das
+    // nicht sicher heraus, also von Hand.
+    var sat: [u8; 16] = [0; 16]
+    let sp: u64 = (&sat[0]) as u64
+    st16(sp, 0, 65535 as u32)
+    st16(sp, 1, 65280 as u32)
+    st16(sp, 2, 32768 as u32)
+    st16(sp, 3, 256 as u32)
+    st16(sp, 4, 255 as u32)
+    st16(sp, 5, 128 as u32)
+    st16(sp, 6, 1 as u32)
+    st16(sp, 7, 0 as u32)
+    let sv: v128 = __v128_load(sp as *u8)
+    ref_packus16_half(sp, wp, 0)
+    ref_packus16_half(sp, wp, 8)
+    spill(__v128_packus16(sv, sv), gp)
+    if !eq16(gp, wp) {
+        return 104
+    }
+    // Und ein ganzes Alphaueberblenden, acht Oktette auf einmal, gegen die
+    // skalare Rechnung: (vorn * alpha + hinten * (255 - alpha) + 127) / 255,
+    // genaehert mit dem ueblichen `x + 128; (x + (x >> 8)) >> 8`.
+    var alv: [u8; 16] = [0; 16]
+    let alp: u64 = (&alv[0]) as u64
+    i = 0
+    while i < 8 {
+        st16(alp, i, ((i * 31 + 7) % 256) as u32)
+        i = i + 1
+    }
+    let alpha: v128 = __v128_load(alp as *u8)
+    let zero: v128 = __v128_zero()
+    let vorn: v128 = __v128_unpacklo8(a, zero)
+    let mixed: v128 = __v128_mullo16(vorn, alpha)
+    spill(mixed, gp)
+    i = 0
+    while i < 8 {
+        let erwartet: u32 = ((rt.ld8(ap, i) as u32) * ld16(alp, i)) & 65535 as u32
+        if ld16(gp, i) != erwartet {
+            return 105
+        }
+        i = i + 1
     }
 
     io.print_line_bytes(okp, 7)
