@@ -120,6 +120,12 @@ const TABLE: &[(i64, A64)] = &[
     (62, A64::Direct(129)),          // kill
     (63, A64::Direct(160)),          // uname
     (79, A64::Direct(17)),           // getcwd
+    // Round ABSCHLUSS (Certus): the same shape as `open` two lines up --
+    // the generic table has no `mkdir`, only `mkdirat`, and AT_FDCWD in
+    // front of the path makes it mean the same. Without this line every
+    // program that links lib/pdf/down.fi (the download folder) was
+    // untranslatable for the phone, and that is the whole browser.
+    (83, A64::AtFdcwd(34)),          // mkdir     -> mkdirat
     (96, A64::Direct(169)),          // gettimeofday
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
