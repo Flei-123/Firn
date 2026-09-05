@@ -64,7 +64,16 @@ pub const SEC_RODATA: usize = 2;
 pub const SEC_NOTE: usize = 3;
 /// `.bss` — Inhalt null, belegt aber Platz im Abbild (ELF: `NOBITS`).
 pub const SEC_BSS: usize = 4;
-pub const N_SEC: usize = 5;
+/// RUNDE KODIERER II — die Fehlersuchabschnitte. `.debug_abbrev` und
+/// `.debug_info` schreibt der Übersetzer selbst (`dwarf_info.rs`) und sie
+/// kommen als Oktette im Text an; `.debug_line`, `.debug_aranges` und
+/// `.debug_str` entstehen hier aus `.file`/`.loc` (`dwarf_line.rs`).
+pub const SEC_DBG_LINE: usize = 5;
+pub const SEC_DBG_INFO: usize = 6;
+pub const SEC_DBG_ABBREV: usize = 7;
+pub const SEC_DBG_ARANGES: usize = 8;
+pub const SEC_DBG_STR: usize = 9;
+pub const N_SEC: usize = 10;
 
 /// Umsetzungsarten, die hier vorkommen (Werte nach der System-V-ABI, x86-64).
 pub const R_X86_64_64: u32 = 1;
@@ -127,6 +136,9 @@ enum Piece {
     Align { n: u64 },
     /// Marke an dieser Stelle.
     Label { name: String },
+    /// Eine Quellstelle (`.loc`). Null Oktette lang — die Adresse, an der
+    /// sie steht, IST ihr ganzer Inhalt.
+    Loc { file: u32, line: u32, col: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +171,15 @@ pub struct Asm {
     /// Zähler für die zahligen Marken (`1:` … `jnz 1f`).
     numeric: HashMap<u32, u32>,
     line_no: usize,
+    /// RUNDE KODIERER II — die Quelldateien aus `.file`, 1-basiert
+    /// nummeriert (`files[0]` ist `.file 1`).
+    files: Vec<String>,
+    /// Die noch nicht abgelegte Quellstelle. `as` schreibt eine `.loc`
+    /// nicht sofort, sondern erst wenn feststeht, WO sie hingehört: beim
+    /// nächsten Befehl — oder bei der nächsten `.loc`, die die vorige
+    /// „jetzt sofort" hinausschreibt (`dwarf2_directive_loc`). Deshalb
+    /// liegen drei `.loc` hintereinander alle auf derselben Adresse.
+    pending_loc: Option<(u32, u32, u32)>,
 }
 
 impl Default for Asm {
@@ -170,17 +191,27 @@ impl Default for Asm {
 impl Asm {
     pub fn new() -> Asm {
         Asm {
-            pieces: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            pieces: std::array::from_fn(|_| Vec::new()),
             cur: SEC_TEXT,
             globals: Vec::new(),
-            aligns: [1, 1, 1, 1, 1],
+            aligns: [1; N_SEC],
             numeric: HashMap::new(),
             line_no: 0,
+            files: Vec::new(),
+            pending_loc: None,
         }
     }
 
     fn push(&mut self, p: Piece) {
         self.pieces[self.cur].push(p);
+    }
+
+    /// Legt eine wartende Quellstelle an der Stelle ab, an der der
+    /// Zerteiler gerade steht.
+    fn flush_loc(&mut self) {
+        if let Some((file, line, col)) = self.pending_loc.take() {
+            self.push(Piece::Loc { file, line, col });
+        }
     }
 
     fn err(&self, m: impl AsRef<str>) -> String {
@@ -284,8 +315,45 @@ impl Asm {
             None => (s, ""),
         };
         match d {
-            ".intel_syntax" | ".file" | ".loc" | ".ident" | ".cfi_startproc"
+            ".intel_syntax" | ".ident" | ".cfi_startproc"
             | ".cfi_endproc" | ".type" | ".size" => Ok(()),
+            // `.file <nr> "<pfad>"` — die Nummern sind 1-basiert und kommen
+            // lückenlos in aufsteigender Folge (`dwarf.rs`).
+            ".file" => {
+                let rest = rest.trim();
+                let (num, path) = match rest.find(char::is_whitespace) {
+                    Some(i) => (&rest[..i], rest[i..].trim()),
+                    // `.file "name"` ohne Nummer ist die alte STABS-Form und
+                    // hat mit der Zeilentabelle nichts zu tun.
+                    None => return Ok(()),
+                };
+                let n: usize = match num.parse() {
+                    Ok(n) => n,
+                    Err(_) => return Ok(()),
+                };
+                if n == 0 {
+                    return Err(self.err("Dateinummer 0 gibt es erst in DWARF 5"));
+                }
+                let path = path.trim_matches('"');
+                if self.files.len() < n {
+                    self.files.resize(n, String::new());
+                }
+                self.files[n - 1] = unescape_text(path);
+                Ok(())
+            }
+            // `.loc <datei> <zeile> <spalte>`
+            ".loc" => {
+                let mut it = rest.split_whitespace();
+                let f: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                let l: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                let c: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                self.flush_loc();
+                // Zeile 0 heißt „hier gehört keine Quellzeile hin". `as`
+                // wirft solche Angaben weg (`dwarf2_gen_line_info`), also
+                // wir auch — sonst stünde im Ergebnis eine Zeile mehr.
+                self.pending_loc = if l == 0 { None } else { Some((f, l, c)) };
+                Ok(())
+            }
             ".text" => {
                 self.cur = SEC_TEXT;
                 Ok(())
@@ -302,6 +370,11 @@ impl Asm {
                     ".rodata" => SEC_RODATA,
                     ".note.GNU-stack" => SEC_NOTE,
                     ".bss" => SEC_BSS,
+                    ".debug_line" => SEC_DBG_LINE,
+                    ".debug_info" => SEC_DBG_INFO,
+                    ".debug_abbrev" => SEC_DBG_ABBREV,
+                    ".debug_aranges" => SEC_DBG_ARANGES,
+                    ".debug_str" => SEC_DBG_STR,
                     other => return Err(self.err(format!("unbekannter Abschnitt {}", other))),
                 };
                 Ok(())
@@ -391,6 +464,9 @@ impl Asm {
     // -----------------------------------------------------------------
 
     fn instruction(&mut self, s: &str) -> Result<(), String> {
+        // Die wartende `.loc` gehört vor DIESEN Befehl — das ist genau
+        // der Zeitpunkt, an dem `as` sie hinausschreibt.
+        self.flush_loc();
         let (mut m, mut rest) = match s.find(char::is_whitespace) {
             Some(i) => (s[..i].to_ascii_lowercase(), s[i..].trim()),
             None => (s.to_ascii_lowercase(), ""),
@@ -958,6 +1034,7 @@ impl Asm {
                         Piece::Label { name } => {
                             labels.insert(name.clone(), (sec, off));
                         }
+                        Piece::Loc { .. } => {}
                     }
                 }
                 offsets[sec] = v;
@@ -1015,8 +1092,18 @@ impl Asm {
         // `as` schreibt zuerst die Abschnittssymbole, dann die lokalen,
         // dann die globalen. Die Abschnittssymbole brauchen wir sowieso:
         // Umsetzungen auf lokale Marken laufen über sie.
-        let secnames: [&'static str; N_SEC] =
-            [".text", ".data", ".rodata", ".note.GNU-stack", ".bss"];
+        let secnames: [&'static str; N_SEC] = [
+            ".text",
+            ".data",
+            ".rodata",
+            ".note.GNU-stack",
+            ".bss",
+            ".debug_line",
+            ".debug_info",
+            ".debug_abbrev",
+            ".debug_aranges",
+            ".debug_str",
+        ];
         let mut symbols: Vec<Sym> = Vec::new();
         let mut symidx: HashMap<String, usize> = HashMap::new();
         for (i, n) in secnames.iter().enumerate() {
@@ -1057,12 +1144,30 @@ impl Asm {
             })
             .collect();
 
+        // Die Zeilen der Tabelle: jede `.loc` hinterlässt hier ihre
+        // endgültige Adresse.
+        let mut rows: Vec<crate::dwarf_line::Row> = Vec::new();
         for sec in 0..N_SEC {
             let pieces = std::mem::take(&mut self.pieces[sec]);
             for p in pieces {
                 let base = sections[sec].bytes.len() as u64;
                 match p {
                     Piece::Label { .. } => {}
+                    Piece::Loc { file, line, col } => {
+                        // `as` legt für jeden Abschnitt mit Quellstellen
+                        // eine eigene Folge an und die Einheit bekäme
+                        // `DW_AT_ranges` statt `low_pc`/`high_pc`. Firn
+                        // schreibt `.loc` nur in `.text` — wenn das je
+                        // anders wird, soll es auffallen und nicht still
+                        // eine andere Tabelle ergeben.
+                        if sec != SEC_TEXT {
+                            return Err(format!(
+                                "Quellstelle in {} — nur .text ist vorgesehen",
+                                secnames[sec]
+                            ));
+                        }
+                        rows.push(crate::dwarf_line::Row { addr: base, file, line, col });
+                    }
                     Piece::Align { n } => {
                         let r = base % n;
                         if r != 0 {
@@ -1144,8 +1249,96 @@ impl Asm {
             }
         }
 
+        // --- RUNDE KODIERER II: die Fehlersuchabschnitte -------------
+        // Erst hier, denn die Zeilentabelle braucht die ENDGÜLTIGEN
+        // Adressen — und die stehen erst nach der Relaxation fest.
+        if !self.files.is_empty() && !rows.is_empty() {
+            let cwd = crate::package_world::cwd();
+            let producer =
+                format!("{} {}", crate::config::compiler_name(), crate::config::VERSION);
+            let p = crate::dwarf_line::Params {
+                files: &self.files,
+                text_size: sections[SEC_TEXT].bytes.len() as u64,
+                min_insn: 1,
+                cwd: &cwd,
+                pwd: &cwd,
+                producer: &producer,
+                own_debug_info: !sections[SEC_DBG_INFO].bytes.is_empty(),
+            };
+            let d = crate::dwarf_line::build(&p, &rows);
+            put_debug(&mut sections, &symidx, d);
+        }
+
         Ok(Assembled { sections, symbols })
     }
+}
+
+/// Legt die erzeugten Fehlersuchabschnitte ab und übersetzt ihre
+/// Umsetzungen auf die Abschnittssymbole.
+fn put_debug(
+    sections: &mut [Section],
+    symidx: &HashMap<String, usize>,
+    d: crate::dwarf_line::Sections,
+) {
+    use crate::dwarf_line::RelTo;
+    let secsym = |t: RelTo| -> usize {
+        let n = match t {
+            RelTo::Text => SEC_TEXT,
+            RelTo::Line => SEC_DBG_LINE,
+            RelTo::Info => SEC_DBG_INFO,
+            RelTo::Abbrev => SEC_DBG_ABBREV,
+            RelTo::Str => SEC_DBG_STR,
+        };
+        symidx[&format!("\u{3}sec{}", n)]
+    };
+    let mut place = |sec: usize, bytes: Vec<u8>, rels: Vec<crate::dwarf_line::Rel>| {
+        if bytes.is_empty() {
+            return;
+        }
+        let base = sections[sec].bytes.len() as u64;
+        sections[sec].bytes.extend_from_slice(&bytes);
+        for r in rels {
+            sections[sec].relocs.push(Reloc {
+                offset: base + r.at,
+                sym: secsym(r.to),
+                kind: if r.width == 8 { R_X86_64_64 } else { R_X86_64_32 },
+                addend: r.addend,
+            });
+        }
+    };
+    place(SEC_DBG_LINE, d.line, d.line_rel);
+    place(SEC_DBG_INFO, d.info, d.info_rel);
+    place(SEC_DBG_ABBREV, d.abbrev, Vec::new());
+    place(SEC_DBG_ARANGES, d.aranges, d.aranges_rel);
+    place(SEC_DBG_STR, d.dstr, Vec::new());
+    // Die Adresspaare in `.debug_aranges` liegen auf dem Doppelten einer
+    // Adresse — `as` richtet den Abschnitt entsprechend aus.
+    if !sections[SEC_DBG_ARANGES].bytes.is_empty() {
+        sections[SEC_DBG_ARANGES].align = 16;
+    }
+}
+
+/// Entfernt die Maskierungen aus einer Zeichenkette im Assemblertext.
+/// Für Pfade in `.file` reichen `\\` und `\"`.
+pub fn unescape_text(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(x) => out.push(x),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Findet (oder legt an) das Symbol, gegen das eine Umsetzung läuft.
@@ -1747,7 +1940,12 @@ fn elf_index(sec: usize) -> usize {
         SEC_DATA => 1,
         SEC_BSS => 2,
         SEC_RODATA => 3,
-        _ => 4,
+        SEC_NOTE => 4,
+        SEC_DBG_LINE => 5,
+        SEC_DBG_INFO => 6,
+        SEC_DBG_ABBREV => 7,
+        SEC_DBG_ARANGES => 8,
+        _ => 9,
     }
 }
 
@@ -1765,6 +1963,13 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
             a.sections[SEC_RODATA].align,
         ],
     );
+    secs.extend(crate::elfobj::debug_sections(
+        a.sections[SEC_DBG_LINE].bytes.clone(),
+        a.sections[SEC_DBG_INFO].bytes.clone(),
+        a.sections[SEC_DBG_ABBREV].bytes.clone(),
+        a.sections[SEC_DBG_ARANGES].bytes.clone(),
+        a.sections[SEC_DBG_STR].bytes.clone(),
+    ));
     for s in 0..N_SEC {
         let ei = elf_index(s);
         for r in &a.sections[s].relocs {

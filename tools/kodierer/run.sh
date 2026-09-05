@@ -25,7 +25,7 @@ export FIRNLIB="$(pwd)/lib"
 
 ARCH=x86
 TFLAG=""
-STUFEN="dev-fast release-fast release-safe"
+STUFEN="dev-fast release-fast release-safe no-opt"
 NUR=""
 JOBS="${JOBS:-8}"
 while [ $# -gt 0 ]; do
@@ -63,7 +63,13 @@ trap 'rm -rf "$W"' EXIT
 eine() { # $1 = quelle, $2 = stufe, $3 = arbeitsnummer
     local f="$1" lvl="$2" id="$3"
     local s="$W/$id.s"
-    if ! "$FIRNC" $TFLAG --emit=asm --opt-level="$lvl" -o "$s" "$f" >/dev/null 2>&1; then
+    # RUNDE KODIERER II: `no-opt` ist keine Baustufe, sondern die Fahne
+    # `--no-opt` -- nur dort schreibt der Uebersetzer eine EIGENE
+    # `.debug_info` mit Namen, Typen und Variablen, und nur dort wird der
+    # Zweig geprueft, in dem `as` KEINE eigene Einheit anlegt.
+    local lvlflag="--opt-level=$lvl"
+    [ "$lvl" = no-opt ] && lvlflag="--no-opt"
+    if ! "$FIRNC" $TFLAG --emit=asm $lvlflag -o "$s" "$f" >/dev/null 2>&1; then
         echo "UEBERSPRUNGEN $f [$lvl]" >> "$W/log.$id"
         rm -f "$s"
         return 0
@@ -88,7 +94,8 @@ wait
 cat "$W"/log.* > "$W/alle.log" 2>/dev/null
 python3 - "$W/alle.log" <<'PY'
 import json, sys
-gesamt = {"dateien": 0, "gut": 0, "schlecht": 0, "bytes": 0, "relocs": 0}
+gesamt = {"dateien": 0, "gut": 0, "schlecht": 0, "bytes": 0, "relocs": 0,
+          "dwarf_bytes": 0, "dwarf_rows": 0}
 uebersprungen = 0
 fehler = []
 puffer = []
@@ -118,6 +125,8 @@ if fehler:
 print("uebersetzte Einheiten : %d" % gesamt["dateien"])
 print("bitgleich             : %d" % gesamt["gut"])
 print("abweichend            : %d" % gesamt["schlecht"])
+print("Fehlersuch-Oktette    : %d" % gesamt["dwarf_bytes"])
+print("Zeilentabellen-Zeilen : %d" % gesamt["dwarf_rows"])
 print("uebersprungen         : %d  (Quelle baut nicht, nicht dem Kodierer anzulasten)"
       % uebersprungen)
 print("verglichene Oktette   : %d" % gesamt["bytes"])

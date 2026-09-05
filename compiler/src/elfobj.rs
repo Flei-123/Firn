@@ -34,6 +34,9 @@ pub struct OutSec {
     /// sh_flags
     pub flags: u64,
     pub relocs: Vec<OutReloc>,
+    /// `sh_entsize` — nur `.debug_str` braucht es (1, weil dort
+    /// nullterminierte Zeichenketten verschmolzen werden dürfen).
+    pub entsize: u64,
 }
 
 pub struct OutReloc {
@@ -62,6 +65,8 @@ const SHT_NOBITS: u32 = 8;
 const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
+const SHF_MERGE: u64 = 0x10;
+const SHF_STRINGS: u64 = 0x20;
 
 pub const EM_X86_64: u16 = 62;
 pub const EM_AARCH64: u16 = 183;
@@ -258,7 +263,7 @@ pub fn write(machine: u16, secs: &[OutSec], syms: &[OutSym]) -> Vec<u8> {
             0,
             0,
             s.align.max(1),
-            0,
+            s.entsize,
         );
     }
     push_sh(
@@ -366,6 +371,7 @@ pub fn standard_sections_bss(
             kind: SHT_PROGBITS,
             flags: SHF_ALLOC | SHF_EXECINSTR,
             relocs: Vec::new(),
+            entsize: 0,
         },
         OutSec {
             name: ".data".into(),
@@ -374,6 +380,7 @@ pub fn standard_sections_bss(
             kind: SHT_PROGBITS,
             flags: SHF_ALLOC | SHF_WRITE,
             relocs: Vec::new(),
+            entsize: 0,
         },
         OutSec {
             name: ".bss".into(),
@@ -382,6 +389,7 @@ pub fn standard_sections_bss(
             kind: SHT_NOBITS,
             flags: SHF_ALLOC | SHF_WRITE,
             relocs: Vec::new(),
+            entsize: 0,
         },
         OutSec {
             name: ".rodata".into(),
@@ -390,6 +398,7 @@ pub fn standard_sections_bss(
             kind: SHT_PROGBITS,
             flags: SHF_ALLOC,
             relocs: Vec::new(),
+            entsize: 0,
         },
         OutSec {
             name: ".note.GNU-stack".into(),
@@ -398,6 +407,43 @@ pub fn standard_sections_bss(
             kind: SHT_PROGBITS,
             flags: 0,
             relocs: Vec::new(),
+            entsize: 0,
         },
+    ]
+}
+
+/// RUNDE KODIERER II — die Fehlersuchabschnitte, mit den Merkmalen, die
+/// `as` ihnen gibt: kein `SHF_ALLOC` (sie werden nicht geladen), keine
+/// Ausrichtung — außer `.debug_aranges`, dessen Adresspaare gerade liegen
+/// müssen, und `.debug_str`, dessen Zeichenketten der Binder verschmelzen
+/// darf.
+///
+/// Alle fünf stehen immer in der Liste, auch wenn sie leer sind: die
+/// Abschnittsnummern sind fest verdrahtet (`asm_x86::elf_index`), und ein
+/// leerer Kopf kostet 64 Oktette. Ein Bau OHNE Quellangaben ist bei Firn
+/// der Ausnahmefall — die Zeilentabelle hängt an den Befehlen und
+/// entsteht auf jeder Baustufe.
+pub fn debug_sections(
+    line: Vec<u8>,
+    info: Vec<u8>,
+    abbrev: Vec<u8>,
+    aranges: Vec<u8>,
+    dstr: Vec<u8>,
+) -> Vec<OutSec> {
+    let mk = |name: &str, bytes: Vec<u8>, align: u64, flags: u64, entsize: u64| OutSec {
+        name: name.into(),
+        bytes,
+        align,
+        kind: SHT_PROGBITS,
+        flags,
+        relocs: Vec::new(),
+        entsize,
+    };
+    vec![
+        mk(".debug_line", line, 1, 0, 0),
+        mk(".debug_info", info, 1, 0, 0),
+        mk(".debug_abbrev", abbrev, 1, 0, 0),
+        mk(".debug_aranges", aranges, 16, 0, 0),
+        mk(".debug_str", dstr, 1, SHF_MERGE | SHF_STRINGS, 1),
     ]
 }

@@ -17,6 +17,7 @@ mod codegen_switch;
 mod codegen_x86;
 mod x86enc;
 mod asm_intern;
+mod dwarf_line;
 mod asm_x86;
 mod a64enc;
 mod asm_a64;
