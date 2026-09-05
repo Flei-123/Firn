@@ -91,6 +91,9 @@ pub enum Os {
     Linux,
     /// Nothing at all: freestanding, an ELF object file, no system calls.
     None,
+    /// Windows: no `syscall` instruction, a PE/COFF executable, Win32 under
+    /// it. Round WINDOWS.
+    Windows,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,11 @@ pub enum Target {
     X86_64None,
     /// `aarch64-none` — freestanding AArch64. The one this round exists for.
     Aarch64None,
+    /// `x86_64-windows` — round WINDOWS. Same instruction set as
+    /// `x86_64-linux`, a different operating system underneath and therefore
+    /// a different binary format (PE/COFF), a different calling convention at
+    /// the outer boundary and no `syscall` instruction at all.
+    X86_64Windows,
 }
 
 impl Target {
@@ -113,13 +121,14 @@ impl Target {
             Target::Aarch64 => "aarch64-linux",
             Target::X86_64None => "x86_64-none",
             Target::Aarch64None => "aarch64-none",
+            Target::X86_64Windows => "x86_64-windows",
         }
     }
     /// The instruction set — everything that is about the MACHINE and not
     /// about what runs under it asks this and nothing else.
     pub fn arch(self) -> Arch {
         match self {
-            Target::X86_64 | Target::X86_64None => Arch::X86_64,
+            Target::X86_64 | Target::X86_64None | Target::X86_64Windows => Arch::X86_64,
             Target::Aarch64 | Target::Aarch64None => Arch::Aarch64,
         }
     }
@@ -128,7 +137,13 @@ impl Target {
         match self {
             Target::X86_64 | Target::Aarch64 => Os::Linux,
             Target::X86_64None | Target::Aarch64None => Os::None,
+            Target::X86_64Windows => Os::Windows,
         }
+    }
+    /// Is Windows underneath? Everything that is about PE/COFF, the Win64
+    /// calling convention or the system seam asks this and nothing else.
+    pub fn is_windows(self) -> bool {
+        self.os() == Os::Windows
     }
     /// Is there no operating system under this target?
     pub fn is_freestanding(self) -> bool {
@@ -138,6 +153,13 @@ impl Target {
     /// binutils that assemble A64 do not care whether Linux is going to run
     /// the result.
     pub fn assembler(self) -> &'static str {
+        // Windows is the one place where the ARCH alone does not decide: the
+        // instruction set is the same, but the OBJECT FORMAT is not. `as`
+        // writes ELF, and a PE image cannot be built out of ELF objects, so
+        // the COFF port of the same binutils does the job.
+        if self.is_windows() {
+            return "x86_64-w64-mingw32-as";
+        }
         match self.arch() {
             Arch::X86_64 => "as",
             Arch::Aarch64 => "aarch64-linux-gnu-as",
@@ -145,6 +167,10 @@ impl Target {
     }
     /// The arguments the assembler needs in front of `-o`.
     pub fn as_flags(self) -> &'static [&'static str] {
+        if self.is_windows() {
+            // The COFF assembler is a 64 bit one and knows no `--64`.
+            return &[];
+        }
         match self.arch() {
             Arch::X86_64 => &["--64"],
             Arch::Aarch64 => &[],
@@ -155,6 +181,9 @@ impl Target {
     /// for both members of an arch — and it is the honest one for the day
     /// somebody links an object of ours by hand.
     pub fn linker(self) -> &'static str {
+        if self.is_windows() {
+            return "x86_64-w64-mingw32-ld";
+        }
         match self.arch() {
             Arch::X86_64 => "ld",
             Arch::Aarch64 => "aarch64-linux-gnu-ld",
@@ -174,6 +203,40 @@ impl Target {
 
 thread_local! {
     static ACTIVE: Cell<Target> = const { Cell::new(Target::X86_64) };
+    /// ROUND MOBIL (Certus): position independent code for a shared
+    /// library (`.so`). Default OFF — the path for programmes and for
+    /// Osum stays character for character the one it was.
+    static PIC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `--pic`. Moves the tables that hold ABSOLUTE addresses out of the
+/// read-only `.rodata` into `.data.rel.ro`, which is writable while the
+/// loader relocates and read-only afterwards.
+///
+/// WHY THIS IS NEEDED, measured and not guessed: a `.so` in which a
+/// relocation points into a read-only section carries `TEXTREL` in its
+/// dynamic section. Android's loader refuses such a library outright
+/// from API 23 on. Measured on `lib/paint/b3_main.fi` for aarch64: 135
+/// `R_AARCH64_ABS64` in `.rodata`, all of them jump tables of dense
+/// `switch` expressions, plus the tables of the collector, of the
+/// interfaces and of the function values.
+pub fn pic_set(on: bool) {
+    PIC.with(|p| p.set(on));
+}
+
+/// Is this compilation position independent?
+pub fn pic() -> bool {
+    PIC.with(|p| p.get())
+}
+
+/// The section for a table that holds addresses. Without `--pic`
+/// exactly what stood there before.
+pub fn reloc_rodata() -> &'static str {
+    if pic() {
+        ".section .data.rel.ro"
+    } else {
+        ".section .rodata"
+    }
 }
 
 /// `--target=<name>`. `Err` = unknown name.
@@ -191,10 +254,12 @@ pub fn flag_set(name: &str) -> Result<(), String> {
         "aarch64-none" | "arm64-none" | "aarch64-unknown-none" | "aarch64-none-elf" => {
             Target::Aarch64None
         }
+        "x86_64-windows" | "x86-64-windows" | "x86_64-pc-windows" | "x86_64-pc-windows-gnu"
+        | "x86_64-w64-mingw32" | "windows" => Target::X86_64Windows,
         other => {
             return Err(format!(
                 "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, \
-                 x86_64-none, aarch64-none)",
+                 x86_64-none, aarch64-none, x86_64-windows)",
                 other
             ))
         }
@@ -218,6 +283,11 @@ pub fn freestanding() -> bool {
     active().is_freestanding()
 }
 
+/// Is Windows underneath?
+pub fn windows() -> bool {
+    active().is_windows()
+}
+
 /// `.align`/`.balign` of the active machine (see `Target::align_directive`).
 pub fn align(bytes: u64) -> String {
     active().align_directive(bytes)
@@ -228,6 +298,7 @@ pub fn align(bytes: u64) -> String {
 #[cfg(test)]
 pub fn reset() {
     ACTIVE.with(|a| a.set(Target::X86_64));
+    PIC.with(|p| p.set(false));
 }
 
 /// Set the target directly. Only for the module tests; the command line goes
@@ -287,6 +358,37 @@ mod tests {
         assert_eq!(active().assembler(), "aarch64-linux-gnu-as");
         assert!(active().as_flags().is_empty());
         assert_eq!(align(8), ".balign 8");
+        reset();
+    }
+
+    #[test]
+    fn windows_is_a_third_value_on_the_second_axis() {
+        reset();
+        for n in [
+            "x86_64-windows",
+            "x86-64-windows",
+            "x86_64-pc-windows",
+            "x86_64-pc-windows-gnu",
+            "x86_64-w64-mingw32",
+            "windows",
+        ] {
+            flag_set(n).unwrap();
+            assert_eq!(active(), Target::X86_64Windows, "{}", n);
+        }
+        // Same instruction set as Linux, other operating system.
+        assert_eq!(active().arch(), Arch::X86_64);
+        assert_eq!(active().os(), Os::Windows);
+        assert_eq!(active().name(), "x86_64-windows");
+        // NOT freestanding -- there is an operating system, it just is not
+        // Linux. Mixing the two up would switch the kernel profile on.
+        assert!(!freestanding());
+        assert!(windows());
+        // `.align` still counts bytes: the instruction set decides that.
+        assert_eq!(align(8), ".align 8");
+        // The object format decides the binutils, not the instruction set.
+        assert_eq!(active().assembler(), "x86_64-w64-mingw32-as");
+        assert!(active().as_flags().is_empty());
+        assert_eq!(active().linker(), "x86_64-w64-mingw32-ld");
         reset();
     }
 

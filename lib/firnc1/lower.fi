@@ -577,6 +577,16 @@ fn address_inner(l: *mut Lower, e: u32) -> u32 {
         if sema.sema_static_index(sm(l), ast.e_a(b, e)) != NONE {
             return push(l, fir.O_GLOBAL, fir.T_PTR, ast.e_a(b, e), 0, 0, 0, 0, 0)
         }
+        // HOOK env (round FIRN-ENV): a `const` of type `str` is not a place
+        // but a VALUE, exactly like the literal it stands for. Where an
+        // address is wanted, it gets one of its own -- the same three lines
+        // a written literal gets.
+        if sema.sema_const_text_len(sm(l), ast.e_a(b, e)) != NONE {
+            let tct: u32 = sema.sema_ty(sm(l), e)
+            let tslot: u32 = alloca(l, q_size(l, tct), q_align(l, tct))
+            write_after(l, tslot, e)
+            return tslot
+        }
         give_up(l)
         return 0
     }
@@ -839,6 +849,36 @@ fn write_after(l: *mut Lower, addr: u32, e: u32) {
         let na: u32 = ptradd_const(l, addr, 8)
         store(l, fir.T_U64, na, constant(l, fir.T_U64, n as u64))
         return
+    }
+    // HOOK env (round FIRN-ENV): a `const` of type `str`. Its octets stand
+    // in the type checker (`sema.fi::k_tdata`), and what is built out of
+    // them is what the arm above builds out of a literal -- a place for the
+    // octets, and the two words p/n next to it. The arm sits BEHIND the
+    // local lookup (`search`), so a local of the same spelling still wins,
+    // the way it does everywhere else.
+    if a == ast.E_ID && search(l, ast.e_a(b, e)) == NONE {
+        let tn: u32 = sema.sema_const_text_len(sm(l), ast.e_a(b, e))
+        if tn != NONE {
+            let tq: u64 = sema.sema_const_text_ptr(sm(l), ast.e_a(b, e))
+            var tp: u32 = 0
+            if tn == 0 {
+                tp = constant(l, fir.T_PTR, 0)
+            } else {
+                let tbytes: u32 = alloca(l, tn as u64, 1)
+                var ti: u32 = 0
+                while ti < tn {
+                    let tea: u32 = elem_address_const(l, tbytes, 1, ti as u64)
+                    store(l, fir.T_U8, tea, constant(l, fir.T_U8,
+                        rt.ld8(tq, ti as usize) as u64))
+                    ti = ti + 1
+                }
+                tp = tbytes
+            }
+            store(l, fir.T_PTR, addr, tp)
+            let tna: u32 = ptradd_const(l, addr, 8)
+            store(l, fir.T_U64, tna, constant(l, fir.T_U64, tn as u64))
+            return
+        }
     }
     // HOOK str: `a + b` on `str` -- the result comes from the collector.
     if a == ast.E_BIN && ast.e_a(b, e) == 0 && types.str_like(tf(l), t) {
@@ -1393,6 +1433,150 @@ fn args_store(l: *mut Lower, tmp: *mut Vec[u32]) -> u32 {
 // the error union `AllocError!Gc[C]` at `target` and write the fields.
 // The collection happens inside `__gc_alloc_raw`: collect FIRST, THEN
 // `AllocError::OutOfMemory` (DESIGN_GOALS 2).
+// ROUND ANLEGEWEG -- the fast path of the allocation, AT the call site.
+// Word for word the same FIR as `gc_lower::alloc_fast` in firnc0; what the
+// two produce is compared octet for octet by `tools/fir_compare.sh`.
+//
+//   st = &state
+//   if [st+INIT]  != 1            -> slow
+//   if [st+MULTI] != 0            -> slow
+//   if [st+PHASE] != 0            -> slow
+//   if [st+SINCE] >= [st+LIMIT]   -> slow
+//   b = [st + FREE + class*8] ; if b == 0 -> slow
+//   [st + FREE + class*8] = [b+16]
+//   [b+16 ..] = 0                 (unrolled, `size` is a constant here)
+//   ser = [st+SERIES] + 1 ; [st+SERIES] = ser
+//   [b] = tid ; [b+4] = [st+PAR] ; [b+8] = ser
+//   [st+SINCE] += step ; [st+TOTAL] += step ; [st+D_ALLOK] += 1
+//   p = b + 16
+// slow:
+//   p = call __gc_alloc_raw(tid, size)
+//
+// The result travels through a stack cell, not through a phi: FIR has none.
+fn gc_alloc_fast(l: *mut Lower, tid: u64, size: u64) -> u32 {
+    let class: u64 = gc.gc_class_for(size)
+    let slot: u32 = alloca(l, 8, 8)
+    let slow_bb: u32 = new_block(l)
+    let done_bb: u32 = new_block(l)
+    if class < gc.GC_CLASSES {
+        let step: u64 = gc.BLOCK_HEADER + gc.gc_class_bytes(class)
+        let free_off: u64 = gc.ST_FREE + class * 8
+        let st: u32 = push(l, fir.O_GCADDR, fir.T_PTR, 0, 0, 0, 0, 0, 0)
+
+        // S_INIT == 1
+        let ia: u32 = ptradd_const(l, st, gc.ST_INIT)
+        let iv: u32 = load(l, fir.T_U64, ia)
+        let one: u32 = constant(l, fir.T_U64, 1)
+        let ic: u32 = push(l, fir.O_CMP, fir.T_BOOL, iv, one, 0, fir.T_U64 as u64, 0, 0)
+        let b1: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, ic, b1, slow_bb)
+        (*l).cur = b1
+
+        // S_MULTI == 0
+        let ma: u32 = ptradd_const(l, st, gc.ST_MULTI)
+        let mv: u32 = load(l, fir.T_U64, ma)
+        let zero: u32 = constant(l, fir.T_U64, 0)
+        let mc: u32 = push(l, fir.O_CMP, fir.T_BOOL, mv, zero, 0, fir.T_U64 as u64, 0, 0)
+        let b2: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, mc, b2, slow_bb)
+        (*l).cur = b2
+
+        // S_PHASE == 0
+        let pa: u32 = ptradd_const(l, st, gc.ST_PHASE)
+        let pv: u32 = load(l, fir.T_U64, pa)
+        let pc: u32 = push(l, fir.O_CMP, fir.T_BOOL, pv, zero, 0, fir.T_U64 as u64, 0, 0)
+        let b3: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, pc, b3, slow_bb)
+        (*l).cur = b3
+
+        // S_SINCE < S_LIMIT
+        let la: u32 = ptradd_const(l, st, gc.ST_LIMIT)
+        let lv: u32 = load(l, fir.T_U64, la)
+        let sa: u32 = ptradd_const(l, st, gc.ST_SINCE)
+        let sv: u32 = load(l, fir.T_U64, sa)
+        let sc: u32 = push(l, fir.O_CMP, fir.T_BOOL, sv, lv, 2, fir.T_U64 as u64, 0, 0)
+        let b4: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, sc, b4, slow_bb)
+        (*l).cur = b4
+
+        // the head of the free list of this class
+        let ha: u32 = ptradd_const(l, st, free_off)
+        let bv: u32 = load(l, fir.T_PTR, ha)
+        let null0: u32 = constant(l, fir.T_PTR, 0)
+        let hc: u32 = push(l, fir.O_CMP, fir.T_BOOL, bv, null0, 1, fir.T_PTR as u64, 0, 0)
+        let b5: u32 = new_block(l)
+        term(l, fir.TERM_BRCOND, hc, b5, slow_bb)
+        (*l).cur = b5
+
+        // unhook: the link lies in the first word of the payload
+        let obj: u32 = ptradd_const(l, bv, gc.BLOCK_HEADER)
+        let nxt: u32 = load(l, fir.T_PTR, obj)
+        store(l, fir.T_PTR, ha, nxt)
+
+        // null the payload -- unrolled, `size` is a constant here
+        let z64: u32 = constant(l, fir.T_U64, 0)
+        var off: u64 = 0
+        while off < size {
+            let za: u32 = ptradd_const(l, obj, off)
+            store(l, fir.T_U64, za, z64)
+            off = off + 8
+        }
+
+        // serial number
+        let ra: u32 = ptradd_const(l, st, gc.ST_SERIES)
+        let r0: u32 = load(l, fir.T_U64, ra)
+        let ser: u32 = push(l, fir.O_BIN, fir.T_U64, r0, one, 0, 0, 0, 0)
+        store(l, fir.T_U64, ra, ser)
+
+        // the header: type id, the current white, serial number
+        let tv: u32 = constant(l, fir.T_U32, tid)
+        store(l, fir.T_U32, bv, tv)
+        let pra: u32 = ptradd_const(l, st, gc.ST_PAR)
+        let prv: u32 = load(l, fir.T_U32, pra)
+        let mka: u32 = ptradd_const(l, bv, 4)
+        store(l, fir.T_U32, mka, prv)
+        let sea: u32 = ptradd_const(l, bv, 8)
+        store(l, fir.T_U64, sea, ser)
+
+        // the three counters
+        let stv: u32 = constant(l, fir.T_U64, step)
+        let sn: u32 = push(l, fir.O_BIN, fir.T_U64, sv, stv, 0, 0, 0, 0)
+        store(l, fir.T_U64, sa, sn)
+        let ta: u32 = ptradd_const(l, st, gc.ST_TOTAL)
+        let tv0: u32 = load(l, fir.T_U64, ta)
+        let tn: u32 = push(l, fir.O_BIN, fir.T_U64, tv0, stv, 0, 0, 0, 0)
+        store(l, fir.T_U64, ta, tn)
+        let aa: u32 = ptradd_const(l, st, gc.ST_D_ALLOK)
+        let av0: u32 = load(l, fir.T_U64, aa)
+        let an: u32 = push(l, fir.O_BIN, fir.T_U64, av0, one, 0, 0, 0, 0)
+        store(l, fir.T_U64, aa, an)
+
+        store(l, fir.T_PTR, slot, obj)
+        term(l, fir.TERM_BR, done_bb, 0, 0)
+    } else {
+        // no size class of its own -- straight into the runtime
+        term(l, fir.TERM_BR, slow_bb, 0, 0)
+    }
+
+    // the slow path: everything the runtime has always done
+    (*l).cur = slow_bb
+    var ar: [u8; 14] = "__gc_alloc_raw"
+    let arn: u32 = intern.intern_number(names(l), (&ar[0]) as u64, 14) as u32
+    let tidv: u32 = constant(l, fir.T_U64, tid)
+    let sizev: u32 = constant(l, fir.T_U64, size)
+    var tmp: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&tmp, tidv)
+    vec_push[u32](&tmp, sizev)
+    let aoff: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+    let ps: u32 = push(l, fir.O_CALL, fir.T_PTR, arn, 0, 0, 0, aoff, 2)
+    store(l, fir.T_PTR, slot, ps)
+    term(l, fir.TERM_BR, done_bb, 0, 0)
+
+    (*l).cur = done_bb
+    return load(l, fir.T_PTR, slot)
+}
+
 fn gc_alloc_lower(l: *mut Lower, e: u32, target: u32) {
     let b: *mut ast.Tree = tree(l)
     let ki_i: i64 = gc.gc_class_out_new(gcl(l), names(l), ast.e_a(b, e))
@@ -1419,17 +1603,9 @@ fn gc_alloc_lower(l: *mut Lower, e: u32, target: u32) {
         give_up(l)
         return
     }
-    var ar: [u8; 14] = "__gc_alloc_raw"
-    let arn: u32 = intern.intern_number(names(l), (&ar[0]) as u64, 14) as u32
-
-    let tidv: u32 = constant(l, fir.T_U64, gc.gc_tid(gcl(l), ki))
-    let sizev: u32 = constant(l, fir.T_U64, gc.gc_size(gcl(l), ki))
-    var tmp: Vec[u32] = vec_new[u32]()
-    vec_push[u32](&tmp, tidv)
-    vec_push[u32](&tmp, sizev)
-    let aoff: u32 = args_store(l, &tmp)
-    vec_free[u32](&tmp)
-    let p: u32 = push(l, fir.O_CALL, fir.T_PTR, arn, 0, 0, 0, aoff, 2)
+    // ROUND ANLEGEWEG: the fast path stands here, folded into constants;
+    // the runtime is only reached when the ordinary case does not hold.
+    let p: u32 = gc_alloc_fast(l, gc.gc_tid(gcl(l), ki), gc.gc_size(gcl(l), ki))
     let null: u32 = constant(l, fir.T_PTR, 0)
     // 1 = not equal (in the order of `ast::BinOp`: eq ne lt le gt ge)
     let ok: u32 = push(l, fir.O_CMP, fir.T_BOOL, p, null, 1, fir.T_PTR as u64, 0, 0)
