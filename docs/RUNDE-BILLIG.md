@@ -23,14 +23,14 @@ vollen Bericht `certus:docs/RUNDE-BILLIG.md`. Kurzfassung davon am Ende.
    ERGEBNIS, in Zahlen:
 
      Certus' Maler (lib/paint/b3_main.fi), fuer aarch64 uebersetzt
-        statische Befehle   572 399  ->  416 020        -27,3 %
-        Binaerdatei       2 646 224  ->  2 020 704      -23,6 %
-        Seitenaufbau unter qemu                    1,18 x bis 1,42 x
+        statische Befehle   572 399  ->  431 234        -24,7 %
+        Binaerdatei       2 646 224  ->  2 081 552      -21,3 %
+        Seitenaufbau unter qemu                    1,29 x bis 1,45 x
         Bild auf allen drei Seiten                        BITGLEICH
 
      Elf Baenke (bench/firn/, dieselben wie Runde 43 und 90)
-        statische Befehle    13 859  ->   11 161        -19,5 %
-        Durchsatz unter qemu, geom. Mittel                 1,358 x
+        statische Befehle    13 859  ->   11 488        -17,1 %
+        Durchsatz unter qemu, geom. Mittel                 1,384 x
         Ergebnis identisch in allen elf Baenken                 JA
 
      Korrektheit
@@ -143,7 +143,10 @@ es beim Stapelmodell.
 
 Dazu die **beförderte Zelle** (`promotable_cells` aus `regalloc.rs`, Schritt
 2): ein `alloca` von höchstens acht Oktetten, dessen Adresse nie den
-direkten Operanden eines `load`/`store` verlässt, IST ein Register. Der
+direkten Operanden eines `load`/`store` verlässt, IST ein Register.
+**Sie ist am Ende dieser Runde wieder ausgeschaltet — Abschnitt 5b sagt,
+warum, und was es kostet.** Gebaut bleibt sie; `FIRN_A64_CELLS=1` schaltet
+sie zum Messen wieder an. Der
 `Op::Alloca` selbst erzeugt dann gar keinen Code mehr.
 
 Beim Lesen aus einer Zelle wird mit **Nullen** verbreitert (`uxtb`/`uxth`/
@@ -295,6 +298,88 @@ werden — siehe Stufe 2.
 
 ---
 
+
+## 5b. Der zweite Fund: der Registerzuteiler macht den Sammler blind
+
+`tools/aarch64/run.sh --no-opt` meldete einen einzigen Unterschied:
+
+```
+  DIFF tests/901_dom_tree_gc.fi :: exit code x86=0 aarch64=3
+```
+
+Rueckgabewert 3 heisst in diesem Fall: *„nach dem Einsammeln sind noch zu
+viele Objekte am Leben"*. Kein falscher Code -- ein **staendiger
+Wurzelpunkt**. Nachgemessen mit einer Fassung des Falls, die den
+Unterschied als Zahl zurueckgibt:
+
+```
+   zurueckgehalten nach einem Einsammeln, das alles freigeben muesste
+   (der Baum hat 4680 Knoten):
+
+     mit befoerderten Zellen ....... 4600
+     ohne befoerderte Zellen .......    0
+     ohne Register (nur Konstanten)     0
+     alter Uebersetzer .............    0
+```
+
+**Die Ursache, und sie ist kein Versehen, sondern eine Eigenschaft:** eine
+befoerderte Zelle ist eine oertliche Groesse, die ihre GANZE Funktion lang
+in einem aufrufergesicherten Register wohnt (Intervall `[0, letzter
+Zugriff]`, die Regel aus Runde 90). Und jedes dieser sechs Register schreibt
+`emit_gc_addr` bei JEDEM Sicherungspunkt in den Zustandsblock des Sammlers,
+weil SPEC §3.5.3 einen konservativen Lauf ueber Stapel **und Register**
+verspricht. Eine tote Baumwurzel in so einer Zelle haelt damit ihren ganzen
+Baum fest.
+
+**Zwei Reparaturversuche, beide gemessen, beide verworfen:**
+
+1. *Am Sicherungspunkt die toten Register mit `xzr` ueberschreiben.* Sauber
+   begruendbar (Intervalle sind eine Obermenge der Lebendigkeit, wer
+   durchfaellt, ist wirklich tot), und es feuerte an 2 von 114
+   Sicherungspunkten. Der Grund: eine Zelle gilt ab Stelle 0 als lebendig,
+   also ueberdeckt sie fast jeden Sicherungspunkt. **4600 Objekte blieben.**
+2. *An der Sterbestelle `mov rN, xzr`.* 1265 solcher Leerungen wurden
+   erzeugt -- und der erste Anlauf brachte das Programm zum **Haengen**,
+   weil ein Intervall, das auf `block_end` endet, LIVE-OUT dieses Blocks ist
+   und ueber die Rueckwaertskante an den Schleifenkopf weiterfaehrt. Nach
+   der Korrektur (nur echte Befehlsstellen) lief es wieder, und es half
+   trotzdem nicht: **4600 Objekte blieben.** Auch der Versuch, nur
+   `FTy::Ptr` auszuschliessen, half nicht -- `Gc[T]` ist in FIR eine ZAHL
+   und kein Zeigertyp, und eine Zahl, die ein Zeiger ist, kann FIR gar nicht
+   von einer Zahl unterscheiden. Das ist der Preis eines konservativen
+   Sammlers und keine Nachlaessigkeit.
+
+**Die Entscheidung: befoerderte Zellen bleiben auf ARM64 aus.** Alles
+andere -- Werte in Registern, neu gebaute Konstanten, das Register als
+Operand -- bleibt an. `FIRN_A64_CELLS=1` schaltet sie zum Messen wieder ein.
+
+Was das kostet, ist gemessen und nicht geschaetzt:
+
+```
+                                mit Zellen   ohne Zellen
+   b3_main statische Befehle      -27,32 %      -24,66 %
+   elf Baenke statisch            -19,47 %      -17,11 %
+   elf Baenke Durchsatz (qemu)     1,358 x       1,384 x   <- BESSER
+   Certus example                  1,42 x        1,45 x    <- BESSER
+   Certus hackernews               1,18 x        1,29 x    <- BESSER
+```
+
+Die Zellen kosten also 2,7 Prozentpunkte Befehle und bringen beim Durchsatz
+**nichts** -- eher das Gegenteil, weil sie sechs Register ueber die ganze
+Funktion binden und damit den kurzlebigen Werten wegnehmen. Der Verzicht
+ist billiger, als er aussieht.
+
+**Warum das auf x86 nicht auffaellt:** dort gibt es vier Registervorraete,
+und nur EINER (`rbx`, `rbp`, `r12`-`r15`) landet im Zustandsblock. Alles,
+was keinen Aufruf kreuzt, bekommt `r11`/`r10`/`rsi`/`rdi`/`rdx` und ist fuer
+den Sammler unsichtbar. Auf ARM64 sind alle sechs ausgeteilten Register im
+Block.
+
+**Der Weg zurueck ist bekannt** und steht in „Was NICHT getan wurde":
+`x25`-`x28` als nicht-sammlersichtbare Haelfte, sobald der Registerblock des
+Sammlers von sechs auf zehn Woerter waechst. Dann koennen Zellen ohne
+Zeigerinhalt dorthin -- und die 2,7 Prozentpunkte kommen zurueck.
+
 ## 6. Die Messung, und was sie wert ist
 
 **Die Warnung gehört an den Anfang:** Es hängt kein ARM64-Rechner an diesem
@@ -310,17 +395,17 @@ dagegen exakt und hängt von gar keiner Maschine ab.
 
 ```
    lib/paint/b3_main.fi, --target=aarch64-linux, --opt-level=dev-fast
-   statische Befehle   572 399  ->  416 020     -27,32 %
-   Binaerdatei       2 646 224  ->  2 020 704   -23,64 %
+   statische Befehle   572 399  ->  431 234     -24,66 %
+   Binaerdatei       2 646 224  ->  2 081 552   -21,34 %
 ```
 
 Seitenaufbau unter qemu (`tools/tempo2/messen.py`, drei Läufe, Bestwert):
 
 | Seite | alt | neu | Faktor | Bild |
 |---|---:|---:|---:|:--:|
-| `example` | 626,1 ms | 440,9 ms | **1,42 x** | bitgleich |
-| `wikipedia-firn` | 1742,1 ms | 1246,4 ms | **1,40 x** | bitgleich |
-| `hackernews` | 3429,4 ms | 2913,6 ms | **1,18 x** | bitgleich |
+| `example` | 559,5 ms | 386,4 ms | **1,45 x** | bitgleich |
+| `wikipedia-firn` | 1662,4 ms | 1238,6 ms | **1,34 x** | bitgleich |
+| `hackernews` | 3333,2 ms | 2579,9 ms | **1,29 x** | bitgleich |
 
 ### 6.2 Die elf Bänke
 
@@ -329,31 +414,31 @@ drei Läufen:
 
 | Bank | statische Befehle alt | neu | Unterschied | Wanduhr qemu alt | neu | Faktor |
 |---|---:|---:|---:|---:|---:|---:|
-| `fib` | 801 | 622 | -22.3 % | 0.600 s | 0.500 s | **1.201 x** |
-| `sieve` | 1114 | 925 | -17.0 % | 1.591 s | 1.367 s | **1.164 x** |
-| `matmul` | 1185 | 953 | -19.6 % | 5.090 s | 3.949 s | **1.289 x** |
-| `bytecount` | 1057 | 868 | -17.9 % | 14.408 s | 11.190 s | **1.288 x** |
-| `bubblesort` | 1191 | 983 | -17.5 % | 3.063 s | 2.686 s | **1.140 x** |
-| `statemachine` | 1319 | 1049 | -20.5 % | 3.670 s | 1.899 s | **1.933 x** |
-| `bitmap` | 1311 | 1078 | -17.8 % | 3.975 s | 2.556 s | **1.555 x** |
-| `xxhash` | 1511 | 1265 | -16.3 % | 8.496 s | 5.871 s | **1.447 x** |
-| `jsonscan` | 2172 | 1608 | -26.0 % | 6.050 s | 4.954 s | **1.221 x** |
-| `memstride` | 992 | 807 | -18.6 % | 1.626 s | 1.327 s | **1.226 x** |
-| `branchy` | 1206 | 1003 | -16.8 % | 5.355 s | 3.172 s | **1.688 x** |
-| **zusammen / geom. Mittel** | **13859** | **11161** | **-19.47 %** | | | **1.358 x** |
+| `fib` | 801 | 646 | -19.4 % | 0.506 s | 0.422 s | **1.197 x** |
+| `sieve` | 1114 | 949 | -14.8 % | 1.511 s | 1.221 s | **1.238 x** |
+| `matmul` | 1185 | 977 | -17.6 % | 5.057 s | 3.478 s | **1.454 x** |
+| `bytecount` | 1057 | 892 | -15.6 % | 12.778 s | 10.274 s | **1.244 x** |
+| `bubblesort` | 1191 | 1007 | -15.4 % | 2.945 s | 2.419 s | **1.217 x** |
+| `statemachine` | 1319 | 1083 | -17.9 % | 3.658 s | 1.913 s | **1.912 x** |
+| `bitmap` | 1311 | 1102 | -15.9 % | 3.566 s | 2.544 s | **1.402 x** |
+| `xxhash` | 1511 | 1289 | -14.7 % | 8.685 s | 5.987 s | **1.451 x** |
+| `jsonscan` | 2172 | 1685 | -22.4 % | 5.976 s | 4.851 s | **1.232 x** |
+| `memstride` | 992 | 831 | -16.2 % | 1.513 s | 1.150 s | **1.316 x** |
+| `branchy` | 1206 | 1027 | -14.8 % | 5.404 s | 3.105 s | **1.740 x** |
+| **zusammen / geom. Mittel** | **13859** | **11488** | **-17.11 %** | | | **1.384 x** |
 
 ```
-   statische Befehle gesamt: 13859 -> 11161   (-19.47 %)
-   Durchsatz unter qemu, geometrisches Mittel:  1.358 x
+   statische Befehle gesamt: 13859 -> 11488   (-17.11 %)
+   Durchsatz unter qemu, geometrisches Mittel:  1.384 x
    Ergebnis (Ausgabe + Rueckgabewert) identisch in allen 11 Baenken: JA
 ```
 
 Der Streubereich ist gross und er hat einen Grund: `statemachine`
-(**1,933 x**), `branchy` (**1,688 x**) und `bitmap` (**1,555 x**) sind
+(**1,912 x**), `branchy` (**1,740 x**) und `matmul` (**1,454 x**) sind
 Schleifen mit vielen kleinen Werten, die vorher alle im Rahmen lagen --
-genau das, wofuer sechs Register reichen. `bubblesort` (1,140 x) und
-`sieve` (1,164 x) haengen am Speicher und nicht an den Registern; da ist
-wenig zu holen und es wird auch wenig geholt.
+genau das, wofuer sechs Register reichen. `fib` (1,197 x) haengt am Aufruf,
+`bubblesort` (1,217 x) und `sieve` (1,238 x) am Speicher; da ist wenig zu
+holen und es wird auch wenig geholt.
 
 
 ### 6.3 Exakt ausgeführte Befehle
@@ -361,7 +446,7 @@ wenig zu holen und es wird auch wenig geholt.
 ```
    PROBE                          alt          neu     Unterschied
    ---------------------------------------------------------------
-   tools/billig/icount_probe.fi  2 707 467    2 465 389    -8,94 %
+   tools/billig/icount_probe.fi  2 707 467    2 465 517    -8,94 %
    die reine Rechenschleife         37 490       26 372   -29,66 %
 ```
 
@@ -375,7 +460,7 @@ Rechnen -- alles Wege, die Stufe 1 und 2 mitnehmen, Stufe 3 aber noch
 nicht. Sie gewinnt 8,9 %.
 
 **Der reale Fall liegt dazwischen und naeher am oberen Ende**: Certus'
-Maler verliert 27,3 % seiner statischen Befehle, die elf Baenke 19,5 %.
+Maler verliert 24,7 % seiner statischen Befehle, die elf Baenke 17,1 %.
 
 Warum nicht alle elf Baenke exakt ausgezaehlt wurden: `qemu -singlestep
 -d cpu` schreibt rund tausend Oktette je ausgefuehrtem Befehl, gezaehlt

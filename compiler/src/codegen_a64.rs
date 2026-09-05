@@ -986,8 +986,18 @@ fn emit_block(
     b: &Block,
     site: &mut crate::panic_rt::SiteCounter,
 ) -> Result<(), String> {
-    for i in &b.insts {
+    let bi = b.id as usize;
+    for (ii, i) in b.insts.iter().enumerate() {
         emit_inst(e, f, fr, i, site)?;
+        // RUNDE BILLIG: hier ist ein ZEIGER gestorben. Der Lauf des
+        // Sammlers ist konservativ; ein toter Zeiger in einem
+        // aufrufergesicherten Register haelt seinen ganzen Baum fest --
+        // und der Vorspann jeder gerufenen Funktion traegt ihn ausserdem
+        // in deren Rahmen. Ein `mov rN, xzr` an der Sterbestelle ist
+        // dagegen ein Befehl, und nur dort, wo wirklich einer stirbt.
+        for r in fr.ra.clear_after(bi, ii) {
+            e.line(&format!("mov {}, xzr", r));
+        }
     }
     match &b.term {
         Term::Br(t) => e.line(&format!("b {}", block_label(&f.name, *t))),
@@ -1296,7 +1306,7 @@ fn emit_inst(
         }
         Op::GcAddr { regs } => {
             let d = i.dst.ok_or("internal error: gc_state without target")?;
-            emit_gc_addr(e, *regs);
+            emit_gc_addr_tot(e, *regs, fr.ra.dead_at(d));
             store_dst(e, fr, d, A);
         }
         Op::Alloca { .. } => {
@@ -1692,7 +1702,12 @@ fn emit_inst(
 }
 
 /// `Op::GcAddr` — address of the state block of the collector in `x9`.
-fn emit_gc_addr(e: &mut Emitter, regs: bool) {
+///
+/// RUNDE BILLIG: `tot` nennt die Register, die an dieser Stelle nichts
+/// Lebendiges mehr halten. Fuer sie geht `xzr` in den Block statt des
+/// Registerinhalts — sonst haelt ein toter Zeiger im aufrufergesicherten
+/// Register den ganzen Baum daran fest (siehe `regalloc_a64::safepoints`).
+fn emit_gc_addr_tot(e: &mut Emitter, regs: bool, tot: &[&'static str]) {
     let l = crate::gc::STATE_LABEL;
     e.line(&format!("adrp {}, {}", A, l));
     e.line(&format!("add {}, {}, :lo12:{}", A, A, l));
@@ -1707,8 +1722,14 @@ fn emit_gc_addr(e: &mut Emitter, regs: bool) {
     let off = crate::gc::REG_SAVE_OFF;
     for (i, r) in ["x19", "x20", "x21", "x22", "x23", "x24"].iter().enumerate() {
         let m = at_base(e, A, off + 8 * i as u64, 8);
-        e.line(&format!("str {}, {}", r, m));
+        let q = if tot.contains(r) { "xzr" } else { *r };
+        e.line(&format!("str {}, {}", q, m));
     }
+}
+
+/// Der alte Name, fuer alle Aufrufer, die keine Belegung haben.
+fn emit_gc_addr(e: &mut Emitter, regs: bool) {
+    emit_gc_addr_tot(e, regs, &[]);
 }
 
 /// `Op::Syscall` — `svc #0`, the number in x8, the arguments in x0-x5.

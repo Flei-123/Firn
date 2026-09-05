@@ -73,6 +73,46 @@ pub(crate) struct RaA64 {
     pub cells: HashMap<Val, (&'static str, FTy)>,
     /// which registers the prologue has to save (sorted, as in `A64_POOL`)
     pub saved: Vec<&'static str>,
+    /// RUNDE BILLIG, DER BEFUND MIT DEM SAMMLER -- je `Op::GcAddr
+    /// { regs: true }` (Wert des Ziels als Schluessel) die Register aus
+    /// `saved`, die dort NICHTS LEBENDES mehr halten. `emit_gc_addr`
+    /// schreibt fuer sie `xzr` in den Zustandsblock statt des Registers.
+    ///
+    /// WARUM ES DAS BRAUCHT, und es ist der Fund dieser Runde:
+    /// `tests/901_dom_tree_gc.fi` ging mit `--no-opt` von 0 auf 3 --
+    /// „nach dem Einsammeln sind noch zu viele Objekte am Leben". Kein
+    /// falscher Code, sondern ein STAENDERER WURZELPUNKT: der Lauf des
+    /// Sammlers ist konservativ, und ein toter Zeiger, der bis dahin in
+    /// einem Rahmenplatz einer laengst zurueckgekehrten Funktion lag (also
+    /// UNTER `sp` und damit ausserhalb des Laufs), liegt jetzt in einem
+    /// aufrufergesicherten Register -- und das wird bei jedem Sicherungs-
+    /// punkt mitgeschrieben. 4680 Knoten blieben so am Leben.
+    ///
+    /// Die Richtung ist sicher: geleert wird NUR ein Register aus `saved`
+    /// (dessen Wert des Aufrufers also im eigenen Rahmen liegt und dort
+    /// gefunden wird) und NUR dann, wenn kein Intervall die Stelle
+    /// ueberdeckt. Intervalle sind die konvexe Huelle der Lebendigkeit,
+    /// also eine OBERMENGE -- wer hier durchfaellt, ist wirklich tot.
+    /// Erreicht der Datenfluss seinen Fixpunkt nicht, wird gar nichts
+    /// geleert.
+    pub safepoints: HashMap<Val, Vec<&'static str>>,
+    /// RUNDE BILLIG, DIE ANDERE HAELFTE DESSELBEN BEFUNDS -- je Stelle
+    /// (Block, Befehlsnummer) die Register, die DANACH mit `xzr`
+    /// ueberschrieben werden, weil dort ein ZEIGER gestorben ist.
+    ///
+    /// Den Zustandsblock am Sicherungspunkt zu leeren reicht NICHT: der
+    /// Vorspann JEDER gerufenen Funktion schreibt die aufrufergesicherten
+    /// Register in ihren eigenen Rahmen, und dieser Rahmen liegt ueber `sp`
+    /// und wird konservativ mitgelesen. Ein toter Zeiger in x19 pflanzt
+    /// sich also die ganze Aufrufkette hinunter fort. Er muss dort
+    /// verschwinden, wo er stirbt.
+    ///
+    /// Nur fuer `FTy::Ptr`. Eine tote Zahl in einem Register kostet den
+    /// Sammler nichts (`__gc_block_of` findet fuer sie keinen Block); ein
+    /// toter Zeiger kostet den ganzen daran haengenden Baum. Und nur, wenn
+    /// das Register nicht sofort wieder gebraucht wird -- dann erledigt
+    /// der naechste Schreiber es umsonst.
+    pub clears: HashMap<(usize, usize), Vec<&'static str>>,
     /// RUNDE BILLIG -- values that are REBUILT instead of stored. See
     /// `cheap_const`: a constant that `imm_into` writes in ONE instruction
     /// costs nothing to make again, so it deserves neither a slot nor a
@@ -91,6 +131,26 @@ impl RaA64 {
             return None;
         }
         self.regs.get(&v).copied()
+    }
+    /// Die Register, die NACH diesem Befehl mit `xzr` zu ueberschreiben sind.
+    pub fn clear_after(&self, bi: usize, ii: usize) -> &[&'static str] {
+        if !self.on {
+            return &[];
+        }
+        match self.clears.get(&(bi, ii)) {
+            Some(v) => v.as_slice(),
+            None => &[],
+        }
+    }
+    /// Die Register, die an diesem Sicherungspunkt geleert werden duerfen.
+    pub fn dead_at(&self, gcaddr: Val) -> &[&'static str] {
+        if !self.on {
+            return &[];
+        }
+        match self.safepoints.get(&gcaddr) {
+            Some(v) => v.as_slice(),
+            None => &[],
+        }
     }
     /// The constant a value is, if it is one that gets rebuilt.
     pub fn imm(&self, v: Val) -> Option<i64> {
@@ -137,6 +197,9 @@ pub(crate) fn cheap_const(v: i64) -> bool {
 
 /// May a value of this type live in a general purpose register?
 fn integral(t: FTy) -> bool {
+    if t == FTy::Ptr && std::env::var_os("FIRN_A64_NO_PTR").is_some() {
+        return false;
+    }
     !matches!(t, FTy::F32 | FTy::F64 | FTy::V128 | FTy::Void)
 }
 
@@ -149,6 +212,12 @@ fn needs_frame_slot(f: &Func, v: Val) -> bool {
 
 pub(crate) fn allocate(f: &Func) -> RaA64 {
     let mut ra = RaA64::default();
+    // Schalter zum Eingrenzen -- dasselbe Mittel, das die x86-Seite mit
+    // `FIRN_RA_STATS`/`FIRN_RA_ROUGH` hat. Wer einen Fehler sucht, will
+    // wissen, WELCHE der drei Stufen ihn macht, ohne uebersetzen zu muessen.
+    if std::env::var_os("FIRN_A64_RA_OFF").is_some() {
+        return ra;
+    }
     if f.interrupt {
         return ra; // see the header: INT_SAVE_A64 does not save x19-x24
     }
@@ -193,7 +262,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
                     continue;
                 }
                 let val = i.ty.truncate(*c) as i64;
-                if cheap_const(val) {
+                if cheap_const(val) && std::env::var_os("FIRN_A64_NO_REMAT").is_none() {
                     ra.remat.insert(d, val);
                 }
             }
@@ -202,7 +271,44 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
 
     let live = crate::regalloc::compute_live(f);
     let depth = crate::regalloc::loop_depth(f);
-    let cells = crate::regalloc::promotable_cells(f);
+    // DIE BEFOERDERTE ZELLE BLEIBT AUS, UND DAS IST DER ZWEITE BEFUND
+    // DIESER RUNDE -- gemessen, nicht befuerchtet.
+    //
+    // Eine befoerderte Zelle ist eine oertliche Groesse, die ihre GANZE
+    // Funktion lang in einem aufrufergesicherten Register wohnt
+    // (Intervall [0, letzter Zugriff], die Regel aus Runde 90). Und jedes
+    // dieser Register schreibt `emit_gc_addr` bei JEDEM Sicherungspunkt in
+    // den Zustandsblock des Sammlers, weil der Lauf konservativ ist. Eine
+    // tote Baumwurzel in so einer Zelle haelt damit ihren ganzen Baum fest.
+    //
+    // Gemessen an `tests/901_dom_tree_gc.fi` mit `--no-opt` (die Stufe
+    // ohne mem2reg, in der JEDE oertliche Groesse eine Zelle ist),
+    // zurueckgehalten nach einem Einsammeln, das alles freigeben muesste:
+    //
+    //     mit Zellen      4600 von 4680 Knoten
+    //     ohne Zellen        0
+    //
+    // Und es liegt NICHT am Zeigertyp: `Gc[T]` ist in FIR eine Zahl, kein
+    // `FTy::Ptr` -- die Probe, nur `Ptr` auszuschliessen, hielt dieselben
+    // 4600 Objekte fest. FIR kann eine Zahl, die ein Zeiger ist, gar nicht
+    // von einer Zahl unterscheiden; das ist der Preis eines konservativen
+    // Sammlers und keine Nachlaessigkeit.
+    //
+    // Auf x86 faellt derselbe Mechanismus weniger auf, weil dort vier
+    // Registervorraete existieren und nur EINER (rbx/rbp/r12-r15) im
+    // Zustandsblock landet; alles, was keinen Aufruf kreuzt, bekommt
+    // r11/r10/rsi/rdi/rdx und ist fuer den Sammler unsichtbar. Auf ARM64
+    // sind alle sechs ausgeteilten Register im Block.
+    //
+    // Der saubere Weg zurueck ist bekannt und steht im Bericht: x25-x28
+    // als NICHT-sammlersichtbare Haelfte, sobald der Zustandsblock von
+    // sechs auf zehn Woerter waechst. Bis dahin bleiben Zellen im Rahmen.
+    // `FIRN_A64_CELLS=1` schaltet sie zum Messen wieder an.
+    let cells = if std::env::var_os("FIRN_A64_CELLS").is_some() {
+        crate::regalloc::promotable_cells(f)
+    } else {
+        HashMap::new()
+    };
 
     // ---- intervals and weights ----------------------------------------
     let mut start = vec![usize::MAX; nv];
@@ -301,6 +407,10 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     // Poletto/Sarkar, with the one simplification the ABI hands us: every
     // register in the pool survives every call, so a register fits an
     // interval whenever it is free. No crossing mask, no four pools.
+    if std::env::var_os("FIRN_A64_NO_REGS").is_some() {
+        ra.on = !ra.remat.is_empty();
+        return ra;
+    }
     let mut free: Vec<&'static str> = A64_POOL.to_vec();
     let mut active: Vec<(usize, &'static str, usize)> = Vec::new(); // (end, reg, index in ivs)
     let mut got: Vec<Option<&'static str>> = vec![None; ivs.len()];
@@ -353,6 +463,96 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         return ra;
     }
     ra.saved = A64_POOL.iter().copied().filter(|r| used.contains(r)).collect();
+
+    // ---- die Sicherungspunkte -------------------------------------------
+    // Fuer jeden `Op::GcAddr { regs: true }`: welches Register aus `saved`
+    // haelt an dieser Stelle nichts Lebendiges mehr? Siehe den langen Text
+    // am Feld `safepoints`.
+    if live.converged && !ra.saved.is_empty() {
+        // Belegte Intervalle, nach Register sortiert.
+        let mut je_reg: HashMap<&'static str, Vec<(usize, usize)>> = HashMap::new();
+        for (k, iv) in ivs.iter().enumerate() {
+            if let Some(r) = got[k] {
+                je_reg.entry(r).or_default().push((iv.start, iv.end));
+            }
+        }
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
+                let d = match (i.dst, &i.op) {
+                    (Some(d), crate::fir::Op::GcAddr { regs: true }) => d,
+                    _ => continue,
+                };
+                let p = live.pos[bi][ii];
+                let tot: Vec<&'static str> = ra
+                    .saved
+                    .iter()
+                    .copied()
+                    .filter(|r| match je_reg.get(r) {
+                        Some(v) => !v.iter().any(|&(s, e)| s <= p && p <= e),
+                        None => true,
+                    })
+                    .collect();
+                if !tot.is_empty() {
+                    ra.safepoints.insert(d, tot);
+                }
+            }
+        }
+    }
+    // ---- wo ein Zeiger stirbt -------------------------------------------
+    if live.converged {
+        let mut je_reg: HashMap<&'static str, Vec<(usize, usize)>> = HashMap::new();
+        for (k, iv) in ivs.iter().enumerate() {
+            if let Some(r) = got[k] {
+                je_reg.entry(r).or_default().push((iv.start, iv.end));
+            }
+        }
+        // Stelle -> (Block, Befehlsnummer). Endet ein Intervall auf der
+        // Stelle des Abschlusses eines Blocks, gehoert das Leeren hinter
+        // den LETZTEN Befehl dieses Blocks -- der Abschluss selbst darf
+        // nichts mehr dazwischen bekommen.
+        let mut stelle: HashMap<usize, (usize, usize)> = HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for ii in 0..b.insts.len() {
+                stelle.insert(live.pos[bi][ii], (bi, ii));
+            }
+            // NICHT die Stelle des Abschlusses. Das war der Fehler beim
+            // ersten Anlauf, und er hat das Programm zum Haengen gebracht:
+            // endet ein Intervall auf `block_end`, dann ist der Wert
+            // LIVE-OUT dieses Blocks -- er faehrt ueber die Kante weiter,
+            // haeufig ueber eine Rueckwaertskante an den Schleifenkopf.
+            // Ein `mov r, xzr` davor loescht einen lebenden Wert.
+            //
+            // Umgekehrt gilt: liegt das Ende auf einer echten
+            // Befehlsstelle, dann ist der Wert weder live-out dieses
+            // Blocks noch live-in irgendeines spaeteren -- sonst haette
+            // `touch(block_end)` bzw. `touch(block_start)` das Ende
+            // dorthin geschoben. Genau dann ist das Leeren sicher.
+        }
+        for (k, iv) in ivs.iter().enumerate() {
+            let r = match got[k] {
+                Some(r) => r,
+                None => continue,
+            };
+            if f.val_types.get(iv.val as usize) != Some(&FTy::Ptr) {
+                continue;
+            }
+            // Wird das Register gleich danach wieder gebraucht, macht der
+            // naechste Schreiber die Arbeit umsonst.
+            let weiter = je_reg
+                .get(r)
+                .map(|v| v.iter().any(|&(s2, e2)| s2 <= iv.end + 1 && iv.end + 1 <= e2))
+                .unwrap_or(false);
+            if weiter {
+                continue;
+            }
+            if let Some(&(bi, ii)) = stelle.get(&iv.end) {
+                let e = ra.clears.entry((bi, ii)).or_default();
+                if !e.contains(&r) {
+                    e.push(r);
+                }
+            }
+        }
+    }
     ra.on = true;
     ra
 }
