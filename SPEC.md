@@ -131,6 +131,34 @@ WITH an operating system), and the x86-64 output is provably unchanged --
 `--target=x86_64-none` and the plain build of a `profile kernel` source
 produce the same octets (`tools/freestanding/none.sh`).
 
+### 2.2 A third value on the second axis: Windows (round WINDOWS)
+
+`--target=x86_64-windows` is the same instruction set as `x86_64-linux` with
+a different operating system underneath, and that changes four things and
+nothing else:
+
+1. **The binary format is PE/COFF**, not ELF. The COFF port of the same
+   binutils assembles and links it (`x86_64-w64-mingw32-as` / `-ld`), used
+   the way `as`/`ld` are used everywhere else: as an assembler and a linker,
+   never as a compiler. **The import table is written by the compiler
+   itself** (`compiler/src/win.rs`) instead of being pulled in from an
+   import library, so no foreign object file enters the image.
+2. **The calling convention at the OUTER boundary is Win64** -- `rcx, rdx,
+   r8, r9`, 32 octets of shadow space, `rsi`/`rdi`/`xmm6`-`xmm15`
+   callee-saved. Firn-to-Firn calls stay System V (13); every call that
+   leaves the program goes through a thunk the compiler emits for it.
+3. **A frame of a page or more probes the stack.** Windows grows a thread
+   stack over guard pages; skipping one is an access violation.
+4. **`syscall` is not an instruction here.** The number stays the canonical
+   (x86-64 Linux) one and is answered by a seam written in Firn
+   (`compiler/src/win_seam.rs`) over `kernel32.dll`, `ws2_32.dll` and
+   `advapi32.dll`. A number with no Windows counterpart answers `-38`
+   (`ENOSYS`) instead of doing something else.
+
+Windows is **not** freestanding: there is an operating system, it is simply
+not Linux. The kernel profile is not turned on by it. What is measured and
+what is still missing stands in `docs/ROUND-WINDOWS.md`.
+
 | Property | `kernel` | `app` |
 |---|---|---|
 | Heap allocation | only through an explicitly passed `Allocator` (built in round 73, `lib/mem/core_alloc.fi`) | a global allocator is available |
@@ -141,7 +169,7 @@ produce the same octets (`tools/freestanding/none.sh`).
 | Panic on an out-of-range index | calls `osum_panic`, configurable | run-time panic handler |
 | Floating point | only with `#[allow_fp]` (the FPU state!) | free |
 | Stack depth checkable (`#[max_stack]`) | yes | yes |
-| Target binary format | ELF object, freestanding | ELF executable |
+| Target binary format | ELF object, freestanding | ELF executable, **or a PE/COFF `.exe` for `--target=x86_64-windows`** (2.2) |
 
 ### 2.1 The standard library under `kernel` (round 73)
 
@@ -1283,11 +1311,21 @@ brackets a line break has never ended anything and still does not. Proof:
   reordering. `#[packed]`, `#[align(n)]`.
 * **The calling convention:** System V AMD64 (`rdi, rsi, rdx, rcx, r8, r9`, the
   return value in `rax`, 16 byte alignment, `rbx, rbp, r12-r15` preserved).
-  `extern "C"` is the same. In addition (`L13`): a documented, stable
+  `extern "C"` is the same. **On `--target=x86_64-windows` this stays the
+  Firn-to-Firn convention** and only the outer boundary is Win64 (2.2): the
+  compiler emits one thunk per imported function that moves the arguments
+  into `rcx, rdx, r8, r9`, allocates the 32 octets of shadow space and calls
+  through the import address table. A Firn function cannot yet be handed to
+  Windows as a CALLBACK -- that needs the mirror image thunk and is written
+  down as open in `docs/ROUND-WINDOWS.md`. In addition (`L13`): a documented, stable
   **Firn-to-Firn ABI** across component boundaries, because the browser consists
   of separate Osum components that talk to each other.
 * `syscall(nr, a1, ..., a6)` is built in and maps directly onto `syscall`
-  (`rax, rdi, rsi, rdx, r10, r8, r9`).
+  (`rax, rdi, rsi, rdx, r10, r8, r9`). **On Windows there is no instruction
+  to map it onto** (the numbers of `ntdll` are deliberately not stable), so
+  the same seven values become a call into the seam (2.2). The NUMBER in the
+  source does not change -- it is the canonical x86-64 Linux one on every
+  target, exactly as `syscalls.rs` already reads it for aarch64.
 
 ### 13.1 The result location -- a guarantee, not an optimization
 

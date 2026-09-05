@@ -1,0 +1,138 @@
+// tools/anlegeweg/reject.fi -- WHAT AN ADDRESS THAT IS NOT IN THE HEAP
+// COSTS THE COLLECTOR (round ANLEGEWEG, finding 3).
+//
+// The head of `lib/js/val.fi` in Certus says about tagged immediates:
+//
+//     "A packed small integer would be harmless in the other direction
+//      (`__gc_mark` finds no block for it), but the pointer case is fatal."
+//
+// The first half of that sentence is TRUE about correctness and WRONG
+// about the price. `__gc_mark` calls `__gc_block_of`, and that WALKS THE
+// CHUNK LIST. Its one entry cache hits for a real pointer almost always;
+// for a value that is not in the heap it NEVER hits -- so every such value
+// costs a full walk over every chunk of the heap.
+//
+// And that case is not exotic, it is the common one: the CONSERVATIVE
+// stack scan (SPEC 3.5.3) hands EVERY word of the stack and every saved
+// register to `__gc_mark`, and the fewest of them are pointers.
+//
+// This file measures the three cases on a heap of about 9.7 MiB
+// (200,000 live objects, some 37 chunks):
+//
+//     __gc_mark on a real pointer
+//     __gc_mark on an immediate (odd, never in the heap)
+//     __gc_block_of on an immediate -- the bare walk of the list
+//
+// Before the fast rejection: 27 / 280 / 274 ns.
+// After it:                  27 /   6 /   3 ns.
+//
+// The counter-check comes FIRST, while the marking is untouched: calling
+// `__gc_mark` from outside leaves marks behind, so the collection run has
+// to happen before the measurement.
+import dom.meas
+
+gc class Chain {
+    next: Gc[Chain],
+    a: u64,
+    b: u64,
+}
+
+fn __gc_finalize(kind: u64, p: *mut u8) {
+}
+
+#[no_gc]
+fn nanos() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000000 + (ts[1] as u64)
+}
+
+fn line(name: *mut u8, n: u64, value: u64) {
+    meas.meas_write(name as u64, n as i64)
+    var i: u64 = n
+    while i < 40 {
+        meas.meas_char(32 as u8)
+        i = i + 1
+    }
+    meas.meas_u64(value)
+    meas.meas_nl()
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 9
+    }
+    gc_set_max_bytes(2147483648)
+    return run()
+}
+
+#[allow_escape]
+fn run() -> i32 {
+    // Build a heap with many chunks: 200,000 live objects in a chain.
+    var head: Gc[Chain] = gc_null[Chain]()
+    var i: u64 = 0
+    while i < 200000 {
+        let k = gc Chain { next: head, a: i, b: 0 } catch gc_null[Chain]()
+        if k == gc_null[Chain]() {
+            return 8
+        }
+        head = k
+        i = i + 1
+    }
+    var m0: [u8; 12] = "live objects"
+    line(&m0[0], 12, 200000)
+    var mh: [u8; 13] = "heap (octets)"
+    line(&mh[0], 13, gc_heap_bytes())
+
+    // The counter-check FIRST, while the marking is untouched.
+    gc_collect()
+    var m4: [u8; 29] = "live objects after gc_collect"
+    line(&m4[0], 29, gc_live_objects())
+    if gc_live_objects() < 200000 {
+        return 7
+    }
+    if head.a != 199999 {
+        return 6
+    }
+
+    let ROUNDS: u64 = 2000000
+    // 1. __gc_mark on a REAL pointer (the chunk cache hits)
+    let p: u64 = head as u64
+    var t0: u64 = nanos()
+    i = 0
+    while i < ROUNDS {
+        __gc_mark(p)
+        i = i + 1
+    }
+    var t1: u64 = nanos()
+    var m1: [u8; 25] = "__gc_mark on pointer (ns)"
+    line(&m1[0], 25, (t1 - t0) / ROUNDS)
+
+    // 2. __gc_mark on an IMMEDIATE (odd, never in the heap)
+    t0 = nanos()
+    i = 0
+    while i < ROUNDS {
+        __gc_mark(((i & 1023) * 2 + 1))
+        i = i + 1
+    }
+    t1 = nanos()
+    var m2: [u8; 27] = "__gc_mark on immediate (ns)"
+    line(&m2[0], 27, (t1 - t0) / ROUNDS)
+
+    // 3. __gc_block_of on an immediate -- the bare walk of the list
+    t0 = nanos()
+    i = 0
+    var acc: u64 = 0
+    while i < ROUNDS {
+        acc = acc ^ __gc_block_of(((i & 1023) * 2 + 1))
+        i = i + 1
+    }
+    t1 = nanos()
+    var m3: [u8; 31] = "__gc_block_of on immediate (ns)"
+    line(&m3[0], 31, (t1 - t0) / ROUNDS)
+
+    if acc != 0 {
+        return 5
+    }
+    return 0
+}

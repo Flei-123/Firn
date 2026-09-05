@@ -262,6 +262,19 @@ fn lit_store(s: &mut String, lit: &str) {
 /// column, because that is how round 72 built it and how
 /// `tools/checked/run.sh` proves both compilers agree), its length, the
 /// two numbers, and the kind code.
+/// **ROUND WINDOWS.** The one line of this file that is not the same on
+/// both operating systems. On Linux a runtime that has to write a message
+/// and stop uses the instruction; on Windows there is no kernel under it,
+/// so the same register set goes to the stub (`win.rs::sysstub_asm`) and
+/// from there into the seam.
+fn sys_instruction() -> String {
+    if crate::target::windows() {
+        crate::win::note_sysstub();
+        return format!("    call {}\n", crate::win::SYSSTUB);
+    }
+    "    syscall\n".to_string()
+}
+
 pub fn trampoline_asm() -> String {
     // ROUND 89: a program that brought its own ending. Both entry points
     // hand over to it; the formatter below is not emitted at all then.
@@ -279,7 +292,7 @@ pub fn trampoline_asm() -> String {
                 // that is certainly false.
                 s.push_str("    mov rax, 231\n");
                 s.push_str("    mov rdi, 101\n");
-                s.push_str("    syscall\n");
+                s.push_str(&sys_instruction());
                 s.push_str("    hlt\n");
             }
         }
@@ -341,13 +354,13 @@ pub fn trampoline_asm() -> String {
         s.push_str("    mov rdi, 2\n");
         s.push_str("    mov rsi, r12\n");
         s.push_str("    mov rdx, r13\n");
-        s.push_str("    syscall\n");
+        s.push_str(&sys_instruction());
         s.push_str("    mov rax, 1\n");
         s.push_str("    mov rdi, 2\n");
         s.push_str("    lea rsi, [rsp]\n");
         s.push_str("    mov rdx, rbx\n");
         s.push_str("    sub rdx, rsp\n");
-        s.push_str("    syscall\n");
+        s.push_str(&sys_instruction());
         // r14 is popped only AFTER both writes -- popping it earlier would
         // shift rsp by 8 while rbx (the buffer's fixed base) stays where it
         // was, throwing the second write's start address and length off by
@@ -356,7 +369,7 @@ pub fn trampoline_asm() -> String {
         s.push_str("    pop r14\n");
         s.push_str("    mov rax, 231\n");
         s.push_str("    mov rdi, 101\n");
-        s.push_str("    syscall\n");
+        s.push_str(&sys_instruction());
         s.push_str("    hlt\n");
     }
     // Helper: append the decimal (signed) text of `rax` at `[rbx]`,

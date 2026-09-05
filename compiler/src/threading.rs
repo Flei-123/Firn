@@ -226,6 +226,59 @@ pub(crate) fn thread_bool_phis(f: &mut Func) -> usize {
     if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
     }
+    // ROUND FIRN-LUECKEN -- THE VALUE OF THE JOIN MAY BE READ NOWHERE ELSE.
+    //
+    // This is the check the round SPEED version was missing, and it cost the
+    // fixpoint: `firnc0` built a stage 1 compiler that could not find a
+    // single module any more, because `imports_collect` answered "not found"
+    // for a file it had just found.
+    //
+    // The shape, straight out of `demos/.../probe`:
+    //
+    //     bb3: %21 = phi.bool [bb1 %6, bb2 %3] ; brcond %21, bb5, bb4
+    //     bb6: %20 = phi.bool [bb5 %21, bb9 %19] ; brcond %20, bb11, bb10
+    //
+    // Threading bb3 drops BOTH of its phi entries -- and `%21` is thereby
+    // undefined, while the phi of bb6 still names it as the value that
+    // travels along the edge bb5 -> bb6. That is the very rule the round
+    // wrote down for itself one paragraph further down ("a pass may delete a
+    // block's control flow, but not a definition another instruction still
+    // names") -- and it was only applied to the corpse block, not to the
+    // value the corpse defines. `%found` of a chain of `if !found` is
+    // exactly this shape, which is why every module search in the language's
+    // own compiler came out false.
+    //
+    // The remedy is one set: a join may only be threaded if the value of its
+    // phi is read by NOTHING but the `brcond` of its own block. That leaves
+    // the case the pass was written for -- the short circuit of `&&` / `||`,
+    // whose phi is read exactly once -- untouched.
+    let mut foreign: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    {
+        let mut buf: Vec<Val> = Vec::new();
+        for b in f.blocks.iter() {
+            for i in &b.insts {
+                buf.clear();
+                i.op.uses(&mut buf);
+                for v in buf.iter() {
+                    foreign.insert(*v);
+                }
+            }
+            let t = match &b.term {
+                Term::BrCond { cond, .. } => Some(*cond),
+                Term::Ret(Some(v)) => Some(*v),
+                Term::Switch { val, .. } => Some(*val),
+                Term::Br(_) | Term::Ret(None) | Term::Unset => None,
+            };
+            if let Some(v) = t {
+                // The one use that is allowed: the terminator of the very
+                // block that defines the value -- that is the join itself.
+                let own = b.insts.len() == 1 && b.insts[0].dst == Some(v);
+                if !own {
+                    foreign.insert(v);
+                }
+            }
+        }
+    }
     // 1. The joins: exactly one instruction, and it is a bool phi the
     //    terminator branches on.
     let mut joins: Vec<(usize, BlockId, BlockId, Vec<(BlockId, Val)>)> = Vec::new();
@@ -240,6 +293,12 @@ pub(crate) fn thread_bool_phis(f: &mut Func) -> usize {
             _ => continue,
         };
         if i.ty != FTy::Bool || f.is_secret(d) {
+            continue;
+        }
+        // ROUND FIRN-LUECKEN: read anywhere else -- another phi, another
+        // instruction, another block's terminator -- and threading would
+        // leave that reader with a value that has no definition.
+        if foreign.contains(&d) {
             continue;
         }
         let (cond, th, el) = match &b.term {
