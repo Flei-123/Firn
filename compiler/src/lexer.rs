@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Hand-written lexer (no generator).
 //!
 //! INTERFACE (fixed, used by parser.rs):

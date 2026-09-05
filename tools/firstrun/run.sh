@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/firstrun/run.sh -- THE FIRST FIVE MINUTES WITH THE LANGUAGE (round 88).
 #
 # Every other tool in this directory proves that something DIFFICULT works:

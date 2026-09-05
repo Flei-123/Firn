@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/checked/run.sh -- THE PROOF FOR CHECKED INTEGER ARITHMETIC
 # (round 72, SPEC section 13 item L9), in BOTH compilers.
 #

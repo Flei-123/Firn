@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/billig/arm_icount.sh -- DIE EXAKT AUSGEFUEHRTEN BEFEHLE AUF ARM64.
 #
 # Das Gegenstueck zu `tools/bench90/icount.py`, das auf x86 mit callgrind

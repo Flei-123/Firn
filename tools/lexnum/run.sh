@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/lexnum/run.sh -- THE NUMBER READER OF THE TWO LEXERS, MEASURED
 # (round 65).
 #

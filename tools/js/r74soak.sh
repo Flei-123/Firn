@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/js/r74soak.sh -- the ENDURANCE RUN for the objects of round 74,
 # with the counter check.
 #

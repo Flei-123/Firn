@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/layout/gc_layout.sh -- soak run: box trees without growth.
 #
 # Every round builds the WHOLE layout path out of one document and one

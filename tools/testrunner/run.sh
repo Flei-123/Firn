@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/testrunner/run.sh -- THE PROOF FOR THE TEST RUNNER (round 94,
 # ACCEPTANCE.md item 4 criterion A, TODO-FIRN.md 0.3).
 #

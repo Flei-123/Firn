@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # Corrects `var x: [u8; N] = "..."` where N does not match the literal.
 # The array length of a string literal has to agree exactly (SPEC 14.1 S1).
 import re,sys

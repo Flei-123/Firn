@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **Jump threading through bool cells** (round 51).
 //!
 //! INTERFACE (fixed):

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/f32data/run.sh -- `f32` AGAINST REAL DATA (round 71).
 #
 # WHY THIS EXISTS. A test in which a program writes a number and reads it

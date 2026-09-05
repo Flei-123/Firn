@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """CALIBRATION, not acceptance: the same corpus through a real Chromium.
 
 `harness.py` compares the numbers of `lib/layout/b2_main.fi` against the

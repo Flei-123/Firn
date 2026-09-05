@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/tlsb5/run.sh -- ROUND B5: TLS, pictures, and a window.
 #
 #   1. compile the round's root files in THREE build stages

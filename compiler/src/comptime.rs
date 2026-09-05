@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **`comptime`** — evaluation at compile time.
 //!
 //! INTERFACE (fixed):

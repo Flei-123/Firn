@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/billig/arm_bench.py -- WAS DER ARM64-REGISTERZUTEILER WIRKLICH BRINGT.
 
 Dieselben elf Baenke, mit denen Runde 43 und Runde 90 den x86-Zuteiler

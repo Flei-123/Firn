@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/core/run.sh -- THE PROOF THAT A KERNEL MAY USE THE LIBRARY
 # (round 73, docs/ROUND73.md).
 #

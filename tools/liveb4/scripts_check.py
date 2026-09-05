@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/liveb4/scripts_check.py -- `<script src>`, over a REAL socket.
 
 The ordering rules of HTML 8.1.3.1 only become visible with EXTERNAL

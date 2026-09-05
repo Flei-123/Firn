@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/english/check_lengths.py — GEGENPROBE fuer die LAENGENANGABEN.
 
 In Firn stehen Zeichenketten als `var w: [u8; N] = "…"`. Die Laenge wird an
