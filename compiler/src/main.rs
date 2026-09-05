@@ -56,6 +56,7 @@ mod package_world;
 mod prof;
 mod parser;
 mod regalloc;
+mod regalloc_a64;
 mod sema;
 mod simd;
 mod simd_a64;
