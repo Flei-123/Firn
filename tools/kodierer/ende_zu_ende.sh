@@ -32,10 +32,12 @@ lauf() { # $1 = programm -> "rc|ausgabe"
 for t in $MUSTER; do
     [ -f "$t" ] || continue
     b=$(basename "$t" .fi)
-    if ! "$FIRNC" -o "$W/alt" "$t" >"$W/alt.log" 2>&1; then
+    # Seit Runde KODIERER II ist der eigene Kodierer die Vorgabe --
+    # `--asm-extern` ist der alte Weg.
+    if ! "$FIRNC" --asm-extern -o "$W/alt" "$t" >"$W/alt.log" 2>&1; then
         altfehler=$((altfehler+1)); continue
     fi
-    if ! "$FIRNC" --asm-intern -o "$W/neu" "$t" >"$W/neu.log" 2>&1; then
+    if ! "$FIRNC" -o "$W/neu" "$t" >"$W/neu.log" 2>&1; then
         neufehler=$((neufehler+1))
         echo "BAU  $t"
         head -3 "$W/neu.log" | sed 's/^/     /'
