@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Canonical rendering of **memory layout and calling convention** — the
 //! yardstick for `lib/firnc1/types.fi`.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Jump threading through bool cells** (round 51).
 //!
 //! INTERFACE (fixed):

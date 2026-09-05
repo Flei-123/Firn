@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Measures the boxes of a case with a REAL browser (Chromium, headless).
 
 This is the counter-witness of round 61.  An expectation written by hand

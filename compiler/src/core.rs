@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 52 — freestanding: inline assembler, MMIO, interrupt entry.**
 //!
 //! Everything a kernel needs and an application does not: the three places
@@ -148,9 +149,58 @@ const LOCKED: &[&str] = &[
     "r15", "r15d", "r15w", "r15b",
 ];
 
+/// **ROUND ARM-FREESTANDING — the same table for A64.**
+///
+/// AAPCS64 calls x0-x17 corruptible across a call: x0-x7 carry arguments and
+/// results, x8 is the indirect result register (and the system call number
+/// on Linux), x9-x15 are scratch, x16/x17 are the linker's veneer registers.
+/// All of them may be named here, at both widths (`x9` and `w9` are one
+/// register, exactly as `rax` and `eax` are).
+///
+/// The second entry is again the 64-BIT TRUNK — that is the name the code
+/// generator writes when it moves the operand in or out, so that `in("w0")`
+/// and `in("x0")` reach the same place.
+const REGISTER_A64: &[(&str, &str)] = &[
+    ("x0", "x0"), ("w0", "x0"), ("x1", "x1"), ("w1", "x1"),
+    ("x2", "x2"), ("w2", "x2"), ("x3", "x3"), ("w3", "x3"),
+    ("x4", "x4"), ("w4", "x4"), ("x5", "x5"), ("w5", "x5"),
+    ("x6", "x6"), ("w6", "x6"), ("x7", "x7"), ("w7", "x7"),
+    ("x8", "x8"), ("w8", "x8"), ("x9", "x9"), ("w9", "x9"),
+    ("x10", "x10"), ("w10", "x10"), ("x11", "x11"), ("w11", "x11"),
+    ("x12", "x12"), ("w12", "x12"), ("x13", "x13"), ("w13", "x13"),
+    ("x14", "x14"), ("w14", "x14"), ("x15", "x15"), ("w15", "x15"),
+    ("x16", "x16"), ("w16", "x16"), ("x17", "x17"), ("w17", "x17"),
+];
+
+/// The A64 counterpart of `LOCKED`: registers that exist and are refused,
+/// with a reason. x18 is the one that would be easy to get wrong — it is
+/// neither scratch nor callee-saved, it belongs to the PLATFORM (thread
+/// pointer areas on some systems), and AAPCS64 says a portable program must
+/// not touch it. Writing it would break nothing under `qemu-aarch64` today
+/// and something else on a real machine tomorrow, which is the worst kind of
+/// error to allow.
+const LOCKED_A64: &[&str] = &[
+    "x18", "w18",
+    "x19", "w19", "x20", "w20", "x21", "w21", "x22", "w22", "x23", "w23",
+    "x24", "w24", "x25", "w25", "x26", "w26", "x27", "w27", "x28", "w28",
+    "x29", "w29", "fp", "x30", "w30", "lr", "sp", "wsp", "xzr", "wzr",
+];
+
 /// 64-bit trunk of an allowed register name.
+///
+/// **ROUND ARM-FREESTANDING:** the answer depends on the MACHINE. For
+/// `Arch::X86_64` it is the same table lookup that stood here before,
+/// character for character; A64 gets its own table above. There is no third
+/// possibility and no fallback — a register name belongs to an instruction
+/// set, and a compiler that accepted `rax` while generating A64 would be
+/// lying to whoever wrote it.
 pub(crate) fn stem(r: &str) -> Option<&'static str> {
-    REGISTER.iter().find(|(n, _)| *n == r).map(|(_, s)| *s)
+    match crate::target::arch() {
+        crate::target::Arch::X86_64 => REGISTER.iter().find(|(n, _)| *n == r).map(|(_, s)| *s),
+        crate::target::Arch::Aarch64 => {
+            REGISTER_A64.iter().find(|(n, _)| *n == r).map(|(_, s)| *s)
+        }
+    }
 }
 
 // ------------------------------------------------------------ Register ---
@@ -367,21 +417,39 @@ fn check_reg(ck: &mut Checker, reg: &str, span: Span, wo: &str) -> bool {
     if stem(reg).is_some() {
         return true;
     }
-    if LOCKED.contains(&reg) {
+    // ROUND ARM-FREESTANDING: both messages name the register set of the
+    // machine that is actually being compiled for. A message that offers
+    // `rax` to somebody generating A64 is worse than no message.
+    let a64 = crate::target::arch() == crate::target::Arch::Aarch64;
+    let locked = if a64 { LOCKED_A64 } else { LOCKED };
+    if locked.contains(&reg) {
+        let why = if a64 {
+            "allowed are only the corruptible registers x0-x17 (and their w names); \
+             x18 belongs to the platform, x19-x28 are callee-saved, x29/x30 carry \
+             the frame and the return address, sp is the stack pointer"
+        } else {
+            "allowed are only the caller-saved registers rax rcx rdx rsi rdi r8..r11 \
+             (including their narrow names); rbx, rbp, rsp and r12-r15 carry the frame \
+             or are callee-saved"
+        };
         ck.dg.error_note(
             span,
             format!("register '{}' is not allowed in the asm block ({})", reg, wo),
-            "allowed are only the caller-saved registers rax rcx rdx rsi rdi r8..r11 \
-             (including their narrow names); rbx, rbp, rsp and r12-r15 carry the frame \
-             or are callee-saved",
+            why,
         );
         return false;
     }
+    let why = if a64 {
+        "allowed are x0-x17 including their 32-bit names (w0..w17); \
+         in the clobber list additionally 'memory'"
+    } else {
+        "allowed are rax rcx rdx rsi rdi r8..r11 including narrow names \
+         (eax/ax/al, r8d/r8w/r8b, …); in the clobber list additionally 'memory'"
+    };
     ck.dg.error_note(
         span,
         format!("unknown register name '{}' in the asm block ({})", reg, wo),
-        "allowed are rax rcx rdx rsi rdi r8..r11 including narrow names \
-         (eax/ax/al, r8d/r8w/r8b, …); in the clobber list additionally 'memory'",
+        why,
     );
     false
 }

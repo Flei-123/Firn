@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/self_compare.sh -- the compiler in FIRN compiles, the result
 # RUNS, and it does the same as the one from `firnc0`.
 #

@@ -56,15 +56,19 @@ the numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | | state | proof |
 |---|---|---|
 | **Self-hosting** | `firnc1` is written in Firn, compiles itself, **stage 2 == stage 3 character-identical** | `tools/fixpoint.sh`, `tools/self_compare.sh` |
-| **Two machines** | x86-64 and aarch64, same source, **296 of 301 programs byte-identical output**; 1 differs, and it is named below | `tools/aarch64/run.sh` |
+| **Two machines** | x86-64 and aarch64, same source, **304 of 304 comparable programs byte-identical output, 0 differing, 0 unsupported** (both build stages) | `tools/aarch64/run.sh` |
+| **Freestanding** | `--target=x86_64-none` and `--target=aarch64-none`: no operating system underneath. Both images **boot in QEMU and print over the serial line**; the x86 build is octet-identical to the plain `profile kernel` build | `tools/freestanding/none.sh` |
+| **Windows** | `--target=x86_64-windows`: a **PE/COFF `.exe`** with an import table the compiler writes itself (no import library, no C runtime in the image), Win64 at the outer boundary, stack probing, and `syscall` answered over `kernel32`/`ws2_32`/`advapi32`. **299 of 304 comparable programs behave identically on Linux and Windows**; the five that do not are threads (4) and processes (1) | `tools/windows/run.sh`, `machine.sh`, `net.sh` |
 | **Language** | structs, arrays, `enum` + `match` with exhaustiveness check, generics, interfaces, closures and function values, error unions `E!T`, `defer`/`errdefer`, `comptime` + `emit`, `f32`/`f64`, `str` with `f"…"` interpolation, threads, `extern fn` in both directions | `tests/` (three build levels each) |
 | **Garbage collector** | opt-in, incremental mark-sweep, **longest pause 0.45 ms** at 120,000 live nodes; weak refs, finalizers, `GcVec`/`GcMap` | `tools/dom_soak/run.sh` |
 | **Tooling** | formatter, DWARF line info + `gdb`, language server (`firnc --lsp`), package/project system, test runner with JSON output | `tools/fmt`, `tools/dwarf`, `tools/lsp`, `tools/packages` |
 | **HTML** | tokenizer written in Firn, **6,810 / 6,810 html5lib cases (100.00 %)**; against html5ever **1.18x** on real pages and **0.80x** (ahead) on the pathological corpus | `tools/tokenizer/run.sh`, `throughput.sh` |
-| **CSS + layout** | against Chromium: **1,087 / 1,087 boxes, deviation 0.00 %**, paint order 5,171 / 5,171 probe points; against the **official Web Platform Tests** (`css/`, self-describing layout tests): **59 / 186** — Chromium 141 reaches 138 / 186 on the same corpus through the same harness | `tools/layout/run.sh`, `tools/layoutb2/run.sh` |
+| **CSS + layout** | against Chromium: **1,087 / 1,087 boxes, deviation 0.00 %**, paint order 5,171 / 5,171 probe points; against the **official Web Platform Tests** (`css/`, self-describing layout tests): **97 / 186 (52.15 %)** — Chromium 141 reaches 138 / 186 on the same corpus through the same harness; round B6 added the logical properties, `aspect-ratio`, `margin-trim`, the replaced elements without a picture (`canvas`, `svg`, `video`) and the two-word alignment values | `tools/layout/run.sh`, `tools/layoutb2/run.sh` |
 | **Painting** | the browser is VISIBLE: display list in the order of CSS 2.1 Appendix E, own scanline rasteriser with exact anti-aliasing, round corners, eight border styles, gradients, blurred shadows, blend modes, clipping, a TrueType reader with composite glyphs and kerning, PNG in and out. Against the **official WPT reference tests** — two documents that have to look the same — **202 / 541 (37.34 %)**, with the 32 pairs that match only because both sides are empty counted separately and NOT in the quota | `tools/paintb3/run.sh` |
 | **A page that is ALIVE** | scripts really change the tree: the DOM bound into the JavaScript engine (`document`, `querySelector`, `createElement`, `innerHTML` through the fragment parsing algorithm, `classList`, `style`, `addEventListener` with all three phases of the event flow, `setTimeout`), `<script>` with the ordering rules of `async` and `defer`, and a per-node dirty mark that makes a change cost **103x less style work** than a full pass -- checked against a full layout after every single mutation, **0 boxes different**. Against the **official Web Platform Tests** for the DOM, through the unmodified `testharness.js`: **390 / 1,714 subtests (22.75 %)**, with the 169 files whose harness never finished counted separately and NEVER as passes | `tools/liveb4/run.sh` |
 | **The network** | an HTTP/1.1 client in Firn: GET/POST, chunked transfer, gzip, redirects with the method rules, a cache with revalidation, cookies (RFC 6265) and persistent connections -- measured against Python's own `http.server` over a real socket, **28 / 28 rules, six of them counter-checks**. **`https://` is refused by name**: TLS is a round of its own and is not faked | `tools/liveb4/http_check.py` |
+| **TLS** | TLS 1.3 in Firn -- record layer, key schedule, handshake, X.509 with a trust store: **647 / 647** primitive cases against Python's `cryptography` (49 of them counter-checks that MUST fail), **26 / 26** certificate cases (14 refusals, each with the RIGHT reason), **18 / 18** handshakes against `openssl s_server` and the public internet (7 refusals, one of them a man in the middle who flips a single bit), 512 KiB octet for octet | `tools/tlsb5/run.sh` |
+| **Fingerprint defence** | chapter Z, on by default and with no switch: the canvas readback and the `navigator` fields are noised **per origin and per session** (Brave's method). Measured: 500 origins give **500 distinct** canvases and 500 sessions **500 distinct**, while twenty reads on one origin are **byte-identical**; the largest deviation of any colour channel is **1** and the alpha channel is never touched. The counter-check -- the same path with the farbling taken out -- gives **1** result over the same 500 origins | `tools/fpz/run.sh` |
 | **Fonts** | 408 characters and 469 kerning pairs against fontTools: **0 deviations**; **393 / 393 glyphs** agree pixel for pixel with an independent rasteriser, largest deviation of any single pixel **0.049** | `tools/paintb3/font_check.py` |
 | **JavaScript** | test262, **63,364 cases, nothing filtered**: parser **91.94 %**, engine **76.00 %** | `tools/js/run.sh` |
 | **Cryptography, compression** | SHA-256, AES, DEFLATE — written in Firn, held against OpenSSL/zlib and the NIST vectors; behind by 1.38x–1.88x | `tools/stdlib81/run.sh`, `tools/bench82/run.sh` |
@@ -212,19 +216,26 @@ and a `line:column` — it does not crash and it does not pretend.
 ### Not in the toolchain
 
 * **No WASM.** `--target=wasm32` answers *"unknown target 'wasm32' (allowed:
-  x86_64-linux, aarch64-linux)"*.
+  x86_64-linux, aarch64-linux, x86_64-none, aarch64-none, x86_64-windows)"*.
 * **No LLVM backend, and there will not be one** — that is the point of the
   project, not a gap. It is listed here because people ask.
-* **No vector instructions on aarch64 — and this currently makes `test.sh`
-  red.** AES-NI, SHA-NI and SSE are emitted for x86-64 behind a `cpuid`
-  check (`compiler/src/codegen_a64.rs`, the comment at the `Simd` arm). One
-  program in the corpus, `tests/1613_crypto.fi`, therefore does not compile for
-  the second machine at all: *"--target=aarch64-linux cannot emit the vector
-  instruction CpuFeatures yet"*. `bash tools/aarch64/run.sh` reports
-  **296 of 301 identical, 1 differing** and fails, in both build stages. The
-  scalar path computes the same results everywhere, only slowly (35x–147x
-  slower for the cryptography, docs/BENCHMARKS.md §1); what is missing is the
-  aarch64 form of the instruction, not the algorithm.
+* **No self-hosting on ARM.** `firnc0` (the Rust bootstrap) generates
+  aarch64; `firnc1` (the compiler written in Firn) does not, and says so:
+  *"error: firnc1 cannot generate aarch64 yet"*. What is missing is the A64
+  code generator in Firn -- `lib/firnc1/codegen.fi` writes Intel-syntax
+  strings. The system call table already exists on both sides and is
+  compared entry for entry on every run (`tools/aarch64/syscall_table.sh`).
+  docs/ROUND-ARM-FREESTANDING.md section 8.
+* **No debug information and no register allocation on aarch64.** `.loc` and
+  `.debug_info` are emitted for x86-64 only, and `regalloc.rs` is an x86
+  pass -- the A64 backend uses the base path, so its code is correct and
+  slow.
+* **Aggregates across `extern fn` on aarch64 are untested and should be
+  assumed wrong.** `abi.rs` classifies by the System V rules; AAPCS64
+  classifies composites differently (homogeneous float aggregates, anything
+  above 16 octets by reference). Scalars and up to ten integer / nine
+  floating point words are proven against `aarch64-linux-gnu-gcc`
+  (`tools/aarch64/machine.sh`).
 * **No package registry, no lock file, no reproducible two-machine build.**
   There is a module system and a project manifest (`firn.package`,
   `firnc --package <dir>`), but `compiler/src/package.rs` and
@@ -333,9 +344,9 @@ Not one of the six comes from anything this round changed (`git diff main`
 touches `README.md`, `bench/RESULTS.md`, `docs/`, `examples/tour.fi` and two
 checker scripts — no compiler, no library, no test program):
 
-* **two are real and reproducible** — `tools/aarch64/run.sh` in both build
-  stages, on `tests/1613_crypto.fi`, for the reason given in the "can not"
-  list above;
+* **two were real and reproducible** — `tools/aarch64/run.sh` in both build
+  stages, on `tests/1613_crypto.fi`. Round 91 built the vector instructions
+  for the second machine and both are green again (`simd_a64.rs`);
 * **four are load flakes** on a machine that was running five copies of this
   suite at once, and every one of them was re-run on its own and passed:
   `tools/thread/run.sh` (the deliberate counter-check "the unlocked counter
@@ -361,6 +372,10 @@ firnc [OPTIONS] file.fi
   --package <dir>      compile the project from <dir>/firn.package
   --emit=exe|asm|fir|fir-raw|fir-opt|comptime|tokens|ast|ast-canon|layout|types
   --target=<name>      x86_64-linux (default) | aarch64-linux
+                       | x86_64-none | aarch64-none  (freestanding: no
+                         operating system, ELF object, no syscall)
+                       | x86_64-windows  (PE/COFF .exe, Win64 at the
+                         boundary, syscall answered over Win32)
   --profile=<name>     kernel | app (SPEC 2)
   --opt-level=<lvl>    dev | dev-fast | release-safe | release-fast
   --no-opt             switch off the optimizer (= --opt-level=dev)
@@ -404,6 +419,29 @@ firnc [OPTIONS] file.fi
 The language name lives in exactly three constants
 (`compiler/src/config.rs`: `LANG_NAME`, `LANG_NAME_LOWER`, `FILE_EXT`).
 
-## License
+## Licence
 
-MIT — see [LICENSE](LICENSE).
+**Two licences, and which one applies depends on the directory.**
+
+* **MIT** for the RUNTIME AND THE STANDARD LIBRARY -- `lib/std`, `lib/rt`,
+  `lib/gc`, `lib/rc`, `lib/str`, `lib/num`, `lib/math`, `lib/mem`,
+  `lib/test`, `lib/generated`, plus `compiler/src/panic_rt*.rs`, `demos/`
+  and `examples/`. That is everything the compiler links into a program YOU
+  write. **You may therefore ship a Firn program under any licence you
+  like, including a closed one** -- compiling with `firnc` does not put your
+  program under the GPL. Full text: [LICENSE.MIT](LICENSE.MIT).
+* **GPL-2.0-only** for everything else: the compiler (`compiler/`,
+  `lib/firnc1/`, `bin/`), the browser engine Certus (`lib/browser`,
+  `lib/css`, `lib/dom`, `lib/font`, `lib/html`, `lib/js`, `lib/layout`,
+  `lib/net`, `lib/paint`, `lib/tls`), the tools and the tests. Full text:
+  [LICENSE](LICENSE).
+
+**Version 2 ONLY, never "or later".** GPLv3 section 6 would force a device
+maker to hand out the signing keys of a consumer device, which makes
+binding firmware to its machine as a theft deterrent legally impossible.
+Linux and Android are GPLv2-only for the same reason.
+
+Every source file carries an `SPDX-License-Identifier:` line, which is the
+authoritative answer for that file. The reasoning and the file-by-file
+boundary are in [LICENSING.md](LICENSING.md); third-party material and its
+own terms are in [THIRD_PARTY.md](THIRD_PARTY.md).

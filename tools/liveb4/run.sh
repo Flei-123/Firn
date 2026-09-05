@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/liveb4/run.sh -- ROUND B4: the page comes ALIVE.
 #
 #   1. compile the round's five root files in THREE build stages

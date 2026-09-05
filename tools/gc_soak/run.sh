@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/gc_soak/run.sh -- ACCEPTANCE ITEM 2, the two halves that were open:
 # THE LONG RUN and FRAGMENTATION WITH CHANGING OBJECT SIZES (round 95).
 #

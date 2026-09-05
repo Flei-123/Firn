@@ -1,3 +1,46 @@
+## Round WINDOWS (2026-09-01) -- Firn builds Windows programs; branch windows
+SPEC.md line 127 said "target binary format: ELF" and `syscall(nr, a1..a6)` was built into the
+language with the LINUX numbers. Windows has no system call a program may use -- the numbers of
+ntdll are deliberately unstable between versions -- so the round added a third value to the
+second axis of the target model of round ARM-FREESTANDING: `Os::Windows`, `--target=x86_64-windows`.
+FOUR PIECES. (1) PE/COFF through the COFF port of the same binutils (`x86_64-w64-mingw32-as`/`-ld`),
+used as an assembler and a linker and never as a compiler -- and the IMPORT TABLE is written by the
+compiler itself (`.idata$2`..`$7`, win.rs), so no import library and no C runtime object enters the
+image. The only foreign names are `__CTOR_LIST__`/`__DTOR_LIST__` out of the linker script, and that
+is said out loud rather than hidden. (2) The calling convention: Firn-to-Firn stays System V (SPEC 13),
+and every call that LEAVES the program goes through a thunk the compiler emits -- rdi/rsi/rdx/rcx ->
+rcx/rdx/r8/r9, 32 octets of shadow space, arguments five and up down to the stack FIRST because r8/r9
+are argument registers on both sides and would otherwise be lost. The register allocator and both code
+generators were not touched, which is exactly why the Linux side cannot get worse. (3) Stack probing:
+every frame of a page or more walks down page by page, or Windows' guard page is stepped over.
+(4) The seam: `syscall` becomes a call into `win_seam.rs`, ~620 lines of FIRN injected into the
+compilation unit the way comptime and the test runner inject source text, mapping 35 canonical Linux
+numbers onto 42 Win32 functions from kernel32/ws2_32/advapi32.
+MEASURED. 299 of 304 comparable cases of tests/ behave identically on Linux and under Wine (98 %),
+and the five that do not have exactly TWO causes: threads (4) and processes (1). hello.exe, tour.exe
+and a TCP client over ws2_32 print character-identical to their Linux builds; a panic writes the same
+message and exits 101. tools/windows/machine.sh: 25 of 25, including a scan of the whole corpus that
+finds NO `syscall` instruction left in any of the 314 Windows builds.
+THE FIND OF THE ROUND: the collector reads /proc/self/maps for its stack bounds. Windows has no /proc
+-- and Wine makes it worse, because drive Z: is the host's root, so the file really opens and the
+collector then scans from a Windows stack pointer to the end of a LINUX mapping and dies with a page
+fault. 35 of the 46 failing cases were that one thing. The seam now answers the file itself out of
+GetCurrentThreadStackLimits.
+THE LINUX SIDE IS UNTOUCHED, checked three ways and measured before and after: 314 of 314 programs of
+tests/+examples/ produce CHARACTER-IDENTICAL `--emit=asm` from the compiler before and after (0 differ,
+run three times); `cargo test` 270 -> 281 with 0 failures; `tools/packages/run.sh` line for line the
+same -- and that last one is 22 of 39 on the BASE commit as well, measured on an untouched worktree,
+which is written down instead of blamed on this round.
+NOT DONE, and named: `.pdata`/`.xdata` (so no usable crash report and no unwinding across a system
+boundary), callbacks Win64 -> System V (a window procedure IS one, so this blocks a GDI window),
+threads and processes, DWARF on the Windows target, and `lib/firnc1` -- the self-hosted compiler does
+not know the target at all yet, which is written up point by point in docs/ROUND-WINDOWS.md 4.4.
+FOR CERTUS: the engine calls only SEVEN system numbers and all seven work; the collector runs; DNS is
+over TCP so the one socket call the seam cannot do (sendto with an address) is not needed; and Certus
+is single-threaded, so the biggest gap of this round does not touch it. X11 sits in exactly TWO files
+behind EIGHTEEN names -- a `lib/browser/gdi.fi` of 600-800 lines is the whole port, and the only thing
+in front of it is the callback thunk.
+
 ## Round K5 (2026-08-25) -- four processors in Osum; branch k5-smp
 The kernel of rounds 59/62/K1/K2 was an operating system on ONE core, and said so in
 kstate.fi: "NOT atomic -- it does not have to be: the kernel runs on one processor". It now
@@ -325,3 +368,59 @@ MEASUREMENTS: test.sh section 62 = tools/paintb3/run.sh -- three build stages of
 font against fontTools and against the second rasteriser, PNG both ways against Pillow, seven own cases
 byte-identical in all three stages against a frozen picture, the text-fit check with its counter-check,
 the 541 reference pairs, limits in tools/paintb3/minquota.txt. english 0 0 0 0 0.
+
+## Round ARM-FREESTANDING -- a machine with nothing underneath it
+
+THE ROUND IN ONE LINE: `--target=aarch64-none` exists, and a Firn program built with it BOOTS in
+`qemu-system-aarch64 -M virt` and prints over the serial line. Round 80 built the second instruction
+set; this one built the second SITUATION -- no operating system.
+
+`target.rs` got a second axis. Arch (x86_64 / aarch64) was round 80's question; Os (linux / none) is
+this one's, and the two do not fold into each other. Four names, and `none` is the word the GNU and
+LLVM triples already use for bare metal. A `-none` target TURNS ON the kernel profile of round 52
+rather than duplicating it -- which is why the x86 claim can be made to the octet:
+`--target=x86_64-none` and the plain build of a `profile kernel` source produce the same 24,138
+octets, and 305 of 305 programs in tests/ produce character-identical x86 assembly before and after.
+
+INLINE ASSEMBLER ON A64, which is where round 80 stopped (4 NOT SUPPORTED, all of them this). The
+first thing that had to move was not in the code generator: register names are checked in the TYPE
+CHECKER, so `core.rs::stem` had to become target-dependent, or an A64 build would have swallowed
+`out("rax")`. Operands do not travel on the stack here -- `sp` is set once in the prologue and every
+slot is addressed relative to it -- so an asm block parks its operands in the outgoing argument area,
+which is what makes a template that names x12 or x13 (this backend's own scratch) safe. MRS/MSR need
+no form of their own and that was checked before it was written down: the system register name is
+assembler TEXT and GNU as owns that table.
+
+`#[interrupt]` on A64: x0-x18 and x30 saved by hand (A64 saves NOTHING by itself; the return address
+is in ELR_EL1, a system register, not on the stack) and `eret` instead of `ret`.
+
+NEW IN THE LANGUAGE: `#[arch(x86_64)]` / `#[arch(aarch64)]` in front of a function. An x86 assembler
+template is not a Firn expression that has not been ported, it is a line for another assembler, and
+the language had no way to say which machine a definition belongs to. One attribute, one `retain`,
+run BEFORE the type checker. On the function and not on the statement, because two definitions of one
+name then resolve themselves and a block has no value. firnc1 learned it too.
+
+MEASURED: tools/aarch64/run.sh 304 of 304 comparable cases identical on both machines, 0 DIFFERENT,
+0 NOT SUPPORTED, in both build stages (before: 300 SAME, 4 NOT SUPPORTED). machine.sh 16/16.
+tools/freestanding/none.sh 27/27 (new, test.sh section 65). tools/aarch64/syscall_table.sh 6/6 (new,
+section 66). tools/freestanding/run.sh 41/41. cargo test 262/262. The fixpoint holds: stage 2 ==
+stage 3, character-identical, 23,278,384 octets. Compilation time -1.4 % on two workloads, i.e. no
+measurable change.
+
+NOT MEASURED, and said out loud: the full 66-section test.sh could not be run to completion, before
+or after. Four to eight other rounds were running their own suites on the same twelve cores and the
+long sections (16 self_compare, 17 fixpoint) were killed twice. Sections 1-15 ran green with 0 FAIL,
+and the fixpoint was re-run on its own and holds.
+
+WHAT IS STILL MISSING: firnc1 cannot generate aarch64 and says so instead of quietly producing x86.
+Its share of this round is real but partial -- `#[arch]`, `lib/firnc1/syscalls.fi` (compared entry for
+entry against the Rust table on every run, read out of a RUNNING program built by both compilers) and
+`--target=` on its command line, including `x86_64-none`, so one flag builds a freestanding object
+with either compiler. The A64 code generator in Firn is a round of its own.
+
+TRAPS worth the next reader's time: `.align 2048` for a vector table is not an error on AArch64 but a
+WARNING ("alignment too large: 63 assumed") and the table is then misaligned -- the silent form of
+round 80's `.align` trap. A64 has no move-64-bit-immediate and no store-immediate-to-memory, both of
+which bite inside asm templates where the compiler cannot help. And the freestanding check "contains
+no syscall instruction" does not translate literally: `svc` is also how a kernel is ENTERED, so the
+A64 check counts them instead of forbidding them.

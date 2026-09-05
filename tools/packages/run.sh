@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/packages/run.sh -- the package and project system (round 48).
 #
 # THREE things are checked, on real projects on disk:

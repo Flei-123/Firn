@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Produces lib/browser/tag.fi -- the FIXED name table of the tree building.
 
 A WORKBENCH, NOT A PRODUCT: there is no parser logic here, only the list of

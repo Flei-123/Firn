@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // lib/layout/box.fi -- THE BOX. The thing layout produces: a rectangle with
 // a position, a size and four rings of edges around the content.
 //
@@ -31,8 +32,11 @@ export {
     BK_BLOCK, BK_INLINE, BK_TEXT, BK_ATOMIC, BK_ANON, BK_FLEX, BK_LINE,
     F_ABS, F_FLOAT, F_BFC, F_REPLACED, F_HAS_BLOCKS, F_COLLAPSE_THROUGH,
     F_PLACED, F_FROZEN, F_FLEX_ITEM, F_STATIC_ABS, F_FLEX_BOX, F_H_DEPENDS,
+    F_BR, F_FILL_INLINE,
+    DEFAULT_OBJECT_W, DEFAULT_OBJECT_H, box_ratio, box_has_ratio,
     IT_WORD, IT_SPACE, IT_ATOMIC, IT_OPEN, IT_CLOSE, IT_BREAK,
     box_new, item_new, frag_new, round_px, reset_box_geometry,
+    replaced_size, box_is_replaced,
     box_add, box_kid, box_kids,
     margin_empty, margin_add, margin_value, margin_join,
     font_ascent, font_descent, font_advance, font_xheight, used_line_height,
@@ -82,6 +86,18 @@ const F_FLEX_BOX: u32 = 1024
 // with flex containers three deep, that is the difference between a
 // second pass and a second pass per level.
 const F_H_DEPENDS: u32 = 2048
+// ROUND B6 -- `<br>`. Until this round it borrowed `F_REPLACED`, which
+// worked only because `box_is_replaced` also asked for an intrinsic size
+// and `<br>` has none. This round gives a replaced element a DEFAULT
+// size (300 x 150, css-images-3 5.1), so that test no longer separates
+// the two and the forced break needs a bit of its own.
+const F_BR: u32 = 4096
+// ROUND B6 -- an `<svg>` root with a `viewBox` and no `width`/`height`
+// attribute. SVG2, 8.2 says `auto` on those two means `100%`, so the box
+// fills the inline axis of its containing block and takes its height
+// from the ratio. That is a rule of SVG and not of CSS, which is why it
+// is a flag on the box and not a value in the style.
+const F_FILL_INLINE: u32 = 8192
 
 // The kinds of an inline item.
 const IT_WORD: u32 = 0
@@ -159,6 +175,22 @@ gc class Box {
     cly0: f64,
     clx1: f64,
     cly1: f64,
+    // ROUND B5 -- the replaced box. `img` is the address of a decoded
+    // `paint.png.Image` (0 when there is none), `iw`/`ih` its intrinsic
+    // size in CSS pixels. A raw address for the same reason `fm` is one:
+    // the pictures live in a store the driver owns and outlive any one
+    // layout, and a managed pointer into them would tie the collector to
+    // the network.
+    img: u64,
+    iw: f64,
+    ih: f64,
+    // ROUND B6 -- the NATURAL RATIO, width divided by height, 0.0 when
+    // there is none. It is NOT always `iw / ih`: a `<video>` with nothing
+    // playing falls back to 300 x 150 and has, by the standard, no ratio
+    // at all, so `height: 100px` leaves its width at 300 and does not
+    // make it 200. Keeping the two apart is the whole reason this field
+    // exists.
+    ratio: f64,
     kind: u32,
     flags: u32,
     int_ok: u32,
@@ -191,6 +223,10 @@ fn box_new(kind: u32, s: Gc[Style], e: Gc[Node]) -> AllocError!Gc[Box] {
         cly0: 0.0 - 1.0e9,
         clx1: 1.0e9,
         cly1: 1.0e9,
+        img: 0,
+        iw: 0.0,
+        ih: 0.0,
+        ratio: 0.0,
         kind: kind,
         flags: 0,
         int_ok: 0,
@@ -909,4 +945,137 @@ fn float_clear_y(f: *mut FloatCtx, y: f64, which: u32) -> f64 {
         }
     }
     return result - (*f).dy
+}
+
+// ------------------------------------------------- The replaced element
+//
+// CSS 2.1, 10.3.2 and 10.4: a box with an INTRINSIC size and an aspect
+// ratio. The four cases, and the third and fourth are the ones that get
+// forgotten:
+//
+//   width and height given   -> both are used, the ratio is broken
+//   width given, height auto -> height = width / ratio
+//   height given, width auto -> width  = height * ratio
+//   both auto                -> the intrinsic size
+//
+// The ratio is the intrinsic one, so a picture that is 800 x 600 and gets
+// `width: 400px` is 300 high and not 600. A browser that leaves the height
+// at `auto` meaning zero makes every image-heavy page reflow when the
+// pictures arrive, which is the single most visible layout bug there is.
+// The DEFAULT OBJECT SIZE of css-images-3, 5.1. Every browser uses these
+// two numbers, and they are in the standard because a replaced element
+// that knows nothing about itself still has to be laid out somewhere.
+fn DEFAULT_OBJECT_W() -> f64 {
+    return 300.0
+}
+
+fn DEFAULT_OBJECT_H() -> f64 {
+    return 150.0
+}
+
+fn box_is_replaced(b: Gc[Box]) -> bool {
+    return (b.flags & F_REPLACED) != 0 as u32
+}
+
+// The ratio this box is sized by: the `aspect-ratio` property where it
+// says something, otherwise the natural one. `aspect-ratio: auto 2 / 1`
+// prefers a natural ratio and falls back to 2/1; a bare `2 / 1` always
+// wins (css-sizing-4, 4).
+fn box_ratio(b: Gc[Box]) -> f64 {
+    let ar: f64 = cascade.style_aspect_ratio(b.style)
+    if ar > 0.0 {
+        if cascade.style_ar_auto(b.style) && b.ratio > 0.0 {
+            return b.ratio
+        }
+        return ar
+    }
+    return b.ratio
+}
+
+fn box_has_ratio(b: Gc[Box]) -> bool {
+    return box_ratio(b) > 0.0
+}
+
+// `has_w`/`has_h` say whether the style settled that axis; `wv`/`hv` are
+// the settled content values. The answers come back in `out_w`/`out_h`.
+fn replaced_size(b: Gc[Box], has_w: bool, wv: f64, has_h: bool, hv: f64,
+    out_w: *mut f64, out_h: *mut f64) {
+    let r: f64 = box_ratio(b)
+    if has_w && has_h {
+        *out_w = wv
+        *out_h = hv
+        return
+    }
+    if has_w {
+        *out_w = wv
+        if r > 0.0 {
+            *out_h = wv / r
+        } else if b.ih > 0.0 {
+            *out_h = b.ih
+        } else {
+            *out_h = DEFAULT_OBJECT_H()
+        }
+        return
+    }
+    if has_h {
+        *out_h = hv
+        if r > 0.0 {
+            *out_w = hv * r
+        } else if b.iw > 0.0 {
+            *out_w = b.iw
+        } else {
+            *out_w = DEFAULT_OBJECT_W()
+        }
+        return
+    }
+    // Neither axis is settled. The natural size comes first; a ratio with
+    // only one natural side fills in the other; a ratio with no natural
+    // side at all is laid into the default object size so that the ratio
+    // is kept and the box CONTAINS itself -- that is the `contain`
+    // constraint of css-images-3, 5.1, and it is why a 4:1 picture of
+    // unknown size becomes 300 x 75 and not 300 x 150.
+    if r > 0.0 && b.iw > 0.0 && r != b.ratio {
+        // The `aspect-ratio` PROPERTY was given without `auto`, so it
+        // replaces the natural ratio (css-sizing-4, 4). The natural size
+        // then still says how WIDE the box is, but no longer how tall:
+        // a 50 x 25 canvas with `aspect-ratio: 1` is 50 x 50.
+        *out_w = b.iw
+        *out_h = b.iw / r
+        return
+    }
+    if b.iw > 0.0 && b.ih > 0.0 {
+        *out_w = b.iw
+        *out_h = b.ih
+        return
+    }
+    if r > 0.0 {
+        if b.iw > 0.0 {
+            *out_w = b.iw
+            *out_h = b.iw / r
+            return
+        }
+        if b.ih > 0.0 {
+            *out_h = b.ih
+            *out_w = b.ih * r
+            return
+        }
+        if DEFAULT_OBJECT_W() / r <= DEFAULT_OBJECT_H() {
+            *out_w = DEFAULT_OBJECT_W()
+            *out_h = DEFAULT_OBJECT_W() / r
+        } else {
+            *out_h = DEFAULT_OBJECT_H()
+            *out_w = DEFAULT_OBJECT_H() * r
+        }
+        return
+    }
+    if b.iw > 0.0 {
+        *out_w = b.iw
+    } else {
+        *out_w = DEFAULT_OBJECT_W()
+    }
+    if b.ih > 0.0 {
+        *out_h = b.ih
+    } else {
+        *out_h = DEFAULT_OBJECT_H()
+    }
 }

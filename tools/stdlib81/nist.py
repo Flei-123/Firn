@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/stdlib81/nist.py -- the official test vectors against lib/std/crypto.
 
 This script does not implement any cryptography. It reads the NIST CAVP

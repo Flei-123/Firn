@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/bench87/gen_json.py -- the two documents of the JSON measurement.
 
 Same shape, same number of members, same key names: the ONLY difference is

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/liveb4/server.py -- a REAL server for round B4.
 
 The point of this file is that it is NOT the client. `lib/net/http.fi`
@@ -145,8 +146,17 @@ class H(BaseHTTPRequestHandler):
         if p == "/loop-b":
             return self._send(302, b"", extra=[("Location", "/loop-a")])
         if p == "/tohttps":
+            # ROUND B5: this used to point at `example.invalid`, which was
+            # refused before a socket was ever opened. The client now has
+            # a resolver, so an invalid name comes back `Resolve` and no
+            # longer says anything about TLS. It therefore points at THIS
+            # server over `https://` -- the connection succeeds, the
+            # handshake does not, and the refusal is a TLS one.
             return self._send(
-                302, b"", extra=[("Location", "https://example.invalid/x")])
+                302, b"",
+                extra=[("Location",
+                        "https://" + self.headers.get("Host", "localhost")
+                        + "/x")])
         if p == "/echo":
             out = ["METHOD=" + self.command,
                    "BODY=" + body.decode("latin-1")]

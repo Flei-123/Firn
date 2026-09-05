@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 72** — which build level checks integer arithmetic (SPEC §13,
 //! `L9`)?
 //!

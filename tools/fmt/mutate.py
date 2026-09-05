@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/fmt/mutate.py -- the random test for firnfmt.
 
 It scrambles the BLANKS of a Firn source text without touching a single

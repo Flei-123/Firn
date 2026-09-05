@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/checkidx/run.sh -- THE PROOF FOR THE CHECKED INDEX, THE CHECKED
 # DIVISION AND THE REPLACEABLE PANIC HANDLER (round 89, SPEC 13 items
 # L9), in BOTH compilers -- after the pattern of tools/checked/run.sh.

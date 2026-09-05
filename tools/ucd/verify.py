@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/ucd/verify.py -- holds the table the COMPILER generated against a
 parser of its own, over ALL 1,114,112 code points.
 

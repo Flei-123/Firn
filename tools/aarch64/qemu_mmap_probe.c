@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* tools/aarch64/qemu_mmap_probe.c -- does the RUNNER give a freed mapping
  * back at the same address?
  *

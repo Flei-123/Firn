@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # bench/ab.sh -- A/B comparison of TWO firnc builds on the same programs.
 #
 # WHY THIS SCRIPT: `bench/run.sh` measures Firn against Rust. The factor there

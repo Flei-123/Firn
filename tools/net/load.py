@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/net/load.py -- many connections at the same time, and a number
 at the end (round 76).
 

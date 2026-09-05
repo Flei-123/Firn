@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // lib/firnc1/parser.fi -- THE FIRN PARSER, WRITTEN IN FIRN.
 //
 // Recursive descent, no generator -- exactly like `compiler/src/parser.rs`.
@@ -266,6 +267,13 @@ struct Parser {
     file: u32,
     // ROUND 79: `#[allow_escape]` in front of the next function (attrs.rs).
     esc_pending: u32,
+    // ROUND ARM-FREESTANDING: `#[arch(...)]` in front of the next function
+    // (archsel.rs in firnc0). 0 = nothing said, 1 = this machine, 2 = another
+    // machine, so the declaration is parsed and THROWN AWAY. This stage
+    // generates x86-64 and nothing else, so 1 means `x86_64` -- and that is
+    // written down here rather than assumed, because the day this file grows
+    // an A64 code generator is the day the constant has to move.
+    arch_pending: u32,
     // ROUND 79: `[T; _]` is only allowed where an initializer follows that
     // the length can be taken from -- the type of a `let`/`var`. `let_stmt`
     // switches this on around exactly that call; everywhere else a `_` is
@@ -302,7 +310,7 @@ fn par_new(lx: u64) -> Parser {
         link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1,
         local: vec_new[u32](), llimit: vec_new[u32](),
         hoist: vec_new[u32](), interp: 0,
-        file: 0, esc_pending: 0, infer_len_ok: false,
+        file: 0, esc_pending: 0, arch_pending: 0, infer_len_ok: false,
         estart: 0, eallow_p: 0, eallow_n: 0, enotes: 0,
     }
     p.n = lexer.lex_count(lx as *mut lexer.Lexer)
@@ -3141,8 +3149,14 @@ fn fn_decl(p: *mut Parser) {
         let empty_body: u32 = ast.block_new(par_tree(p), 0, 0)
         var ls: u32 = 0
         if (*p).link_pending_set { ls = 1 }
-        ast.fn_add(par_tree(p), name, poff, plen, ret, empty_body, 0, 0, 0,
-            1, (*p).link_pending, ls, 0)
+        // ROUND ARM-FREESTANDING: `#[arch(...)]` for another machine. The
+        // declaration was PARSED (so a syntax error in it is still an error
+        // on both machines) and is now simply not added to the tree.
+        if (*p).arch_pending != 2 {
+            ast.fn_add(par_tree(p), name, poff, plen, ret, empty_body, 0, 0, 0,
+                1, (*p).link_pending, ls, 0)
+        }
+        (*p).arch_pending = 0
         (*p).link_pending = 0
         (*p).link_pending_set = false
         (*p).nogc_pending = 0
@@ -3155,6 +3169,23 @@ fn fn_decl(p: *mut Parser) {
     }
     let body: u32 = block(p)
     loc_off(p)
+    // ROUND ARM-FREESTANDING: the body of another machine's variant is
+    // parsed and then dropped. Parsing it is not wasted work -- it is what
+    // makes a syntax error in the A64 version an error on x86 too, so that
+    // one machine cannot rot while the other is green.
+    if (*p).arch_pending == 2 {
+        (*p).arch_pending = 0
+        (*p).esc_pending = 0
+        (*p).nogc_pending = 0
+        (*p).mc_pending = 0
+        (*p).int_pending = 0
+        (*p).ph_pending = 0
+        (*p).export_pending = 0
+        (*p).link_pending = 0
+        (*p).link_pending_set = false
+        return
+    }
+    (*p).arch_pending = 0
     ast.fn_add(par_tree(p), name, poff, plen, ret, body, (*p).nogc_pending,
         (*p).mc_pending, (*p).int_pending, 0, 0, 0, (*p).export_pending)
     // ROUND 89: this function ends every panic (SPEC 13). The name is the
@@ -3849,9 +3880,13 @@ fn extensions_search(p: *mut Parser) {
                 && lexer.lex_kind(lx(p), i + 6) == A_RBRACKET
                 {
                     var ln: [u8; 9] = "link_name"
+                    // ROUND ARM-FREESTANDING: `#[arch(x86_64)]` has the same
+                    // six token shape (archsel.rs).
+                    var arw: [u8; 4] = "arch"
                     let anr: u32 = lexer.lex_nr(lx(p), i + 2)
                     let itn: *mut intern.Interner = lexer.lex_names(lx(p))
-                    ok_attr = intern.intern_equal(itn, anr, (&ln[0]) as u64, 9)
+                    ok_attr = intern.intern_equal(itn, anr, (&ln[0]) as u64, 9) ||
+                    intern.intern_equal(itn, anr, (&arw[0]) as u64, 4)
                 }
             }
             if !ok_attr {
@@ -4566,6 +4601,9 @@ fn attr(p: *mut Parser) {
     var phw: [u8; 13] = "panic_handler"
     // ROUND 94 (attrs.rs, testrun.rs): `#[test]` -- a test case, 0 arguments.
     var tw: [u8; 4] = "test"
+    // ROUND ARM-FREESTANDING (archsel.rs): `#[arch(x86_64)]` -- this
+    // definition belongs to ONE machine. Exactly one argument, an identifier.
+    var arw: [u8; 4] = "arch"
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
     let is_nogc: bool = intern.intern_equal(it, tok_nr(p, 0), (&an[0]) as u64, 5)
     let is_mc: bool = intern.intern_equal(it, tok_nr(p, 0), (&mc[0]) as u64, 12)
@@ -4576,13 +4614,43 @@ fn attr(p: *mut Parser) {
     let is_esc: bool = intern.intern_equal(it, tok_nr(p, 0), (&esw[0]) as u64, 12)
     let is_ph: bool = intern.intern_equal(it, tok_nr(p, 0), (&phw[0]) as u64, 13)
     let is_test: bool = intern.intern_equal(it, tok_nr(p, 0), (&tw[0]) as u64, 4)
+    let is_arch: bool = intern.intern_equal(it, tok_nr(p, 0), (&arw[0]) as u64, 4)
     if !is_nogc && !is_mc && !is_int && !is_fp && !is_link && !is_export && !is_esc && !is_ph
-    && !is_test {
+    && !is_test && !is_arch {
         complain(p)
         return
     }
     next_bump(p)
-    if is_link {
+    if is_arch {
+        if !expect(p, A_LPAREN) {
+            return
+        }
+        if !actual(p, A_IDENT) {
+            complain(p)
+            return
+        }
+        // The name of THIS machine. Everything else is another machine and
+        // the declaration behind it is thrown away in `fn_decl`.
+        var xw: [u8; 6] = "x86_64"
+        var aw: [u8; 7] = "aarch64"
+        let mine: bool = intern.intern_equal(it, tok_nr(p, 0), (&xw[0]) as u64, 6)
+        let other: bool = intern.intern_equal(it, tok_nr(p, 0), (&aw[0]) as u64, 7)
+        if !mine && !other {
+            // An unknown machine name is an ERROR and not a silent removal
+            // -- the same rule firnc0 follows (archsel.rs).
+            complain(p)
+            return
+        }
+        if mine {
+            (*p).arch_pending = 1
+        } else {
+            (*p).arch_pending = 2
+        }
+        next_bump(p)
+        if !expect(p, A_RPAREN) {
+            return
+        }
+    } else if is_link {
         if !expect(p, A_LPAREN) {
             return
         }
@@ -4747,6 +4815,12 @@ fn par_run(p: *mut Parser) {
         if (*p).export_pending == 1 && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
             complain(p)
             (*p).export_pending = 0
+        }
+        // ROUND ARM-FREESTANDING: `#[arch(...)]` belongs in front of a
+        // function, exactly like `#[no_gc]` (attrs.rs: Target::Func).
+        if (*p).arch_pending > 0 && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
+            complain(p)
+            (*p).arch_pending = 0
         }
         if a == A_HASH && has_gc(p) {
             // `#[no_gc]` in front of a function (round 34, SPEC 3.5.4),

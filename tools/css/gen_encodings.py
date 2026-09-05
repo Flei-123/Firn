@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/css/gen_encodings.py -- generates lib/css/encoding_data.fi.
 
 The byte stream of a stylesheet is not always UTF-8 (css-syntax-3 3.2), and

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/bench82/run.sh -- the speed of round 82, measured and compared
 # against somebody else's implementation.
 #

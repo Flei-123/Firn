@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Driver of the stage 0 compiler: command line, pipeline, assembling/linking.
 //!
 //! Pipeline: source -> lexer -> parser -> AST -> type checker -> FIR -> optimizer
@@ -56,6 +57,7 @@ mod package_world;
 mod prof;
 mod parser;
 mod regalloc;
+mod regalloc_a64;
 mod sema;
 mod simd;
 mod simd_a64;
@@ -68,8 +70,11 @@ mod rangecheck;
 mod strings;
 mod strtype;
 mod syscalls;
+mod archsel;
 mod target;
 mod types;
+mod win;
+mod win_seam;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -212,6 +217,10 @@ fn usage() -> String {
          -c, --object       only assemble: ELF object file, no ld\n  \
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
+                              | x86_64-none | aarch64-none (freestanding:\n  \
+                              no operating system, ELF object, no syscall)\n  \
+                              | x86_64-windows (round WINDOWS: PE/COFF .exe,\n  \
+                              Win64 at the boundary, syscall over Win32)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -815,7 +824,52 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    // --- ROUND WINDOWS: the system seam -------------------------------
+    //
+    // The same shape as the `comptime` injection above and the `--test`
+    // one: source text that arises DURING the compilation is lexed,
+    // parsed and appended, after which the type checker sees no
+    // difference to hand written text.
+    //
+    // What is injected is `win_seam.rs` -- the layer that answers a
+    // `syscall(...)` over Win32, written in Firn. It goes in whenever the
+    // target is Windows, because `_start` itself calls into it (the
+    // standard handles, the command line) even in a program that never
+    // says `syscall` at all.
+    if target::windows() && !dg.has_errors() {
+        let src = win_seam::source();
+        let file = dg.add_file("<windows seam>", &src);
+        dwarf::add_file("<windows seam>");
+        let toks = lexer::lex_file(&src, file, &mut dg);
+        // `parser::parse` would call `reset_hooks` and thereby throw away
+        // everything the MAIN parse registered -- the `gc class`es, the
+        // interfaces, the error sets, the builtin `str` of round 70. The
+        // seam declares none of those, so it is parsed as a further MODULE
+        // of the same compilation, which is what it is.
+        let mut extra = parser::parse_module(&toks, &mut dg, file, 0);
+        let mut next = prog.expr_count;
+        for f in extra.funcs.iter_mut() {
+            crate::mono::renumber_block(&mut f.body, &mut next);
+        }
+        for c in extra.consts.iter_mut() {
+            crate::mono::renumber_expr(&mut c.value, &mut next);
+        }
+        prog.expr_count = next;
+        prog.funcs.extend(extra.funcs);
+        prog.structs.extend(extra.structs);
+        prog.consts.extend(extra.consts);
+        prog.statics.extend(extra.statics);
+        win::note_baseline();
+    }
+
     tm.mark("comptime");
+    // ROUND ARM-FREESTANDING: `#[arch(...)]` -- throw away every function
+    // that belongs to another machine, BEFORE anything has looked at a type
+    // or at a register name (archsel.rs explains why the order matters).
+    archsel::select(&mut prog, &mut dg);
+    if dg.has_errors() {
+        return report(&dg);
+    }
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
     tm.mark("mono");
@@ -869,7 +923,8 @@ fn run(opts: &Options) -> i32 {
     tm.mark("lower");
     if opts.stats {
         eprintln!(
-            "profile:    {}{}",
+            "target:     {}\nprofile:    {}{}",
+            target::active().name(),
             prof::name(),
             if core::block_count() > 0 {
                 format!("  ({} asm blocks)", core::block_count())
@@ -949,9 +1004,13 @@ fn run(opts: &Options) -> i32 {
         eprintln!("error: {}", e);
         return 1;
     }
-    let emitted = match target::active() {
-        target::Target::X86_64 => codegen_x86::emit(&module),
-        target::Target::Aarch64 => codegen_a64::emit(&module),
+    // ROUND ARM-FREESTANDING: the code generator is chosen by the
+    // INSTRUCTION SET alone. Whether an operating system lies underneath is
+    // the other axis of `target.rs`, and it is answered inside the two
+    // generators (no `_start`, no system calls), not by picking a third one.
+    let emitted = match target::arch() {
+        target::Arch::X86_64 => codegen_x86::emit(&module),
+        target::Arch::Aarch64 => codegen_a64::emit(&module),
     };
     let asm = match emitted {
         Ok(a) => a,
@@ -1060,6 +1119,12 @@ fn default_output(input: &Path) -> PathBuf {
     if p.as_os_str().is_empty() {
         p = PathBuf::from("a.out");
     }
+    // ROUND WINDOWS: an image without `.exe` is not startable there, and a
+    // name without a suffix would collide with the Linux build in the same
+    // directory.
+    if target::windows() {
+        p.set_extension("exe");
+    }
     p
 }
 
@@ -1117,7 +1182,17 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     // page aligned segments, everything else stays bit for bit what it was
     // (`tools/repro`).
     let mut cmd = Command::new(t.linker());
-    if !crate::statics::any() {
+    if t.is_windows() {
+        // ROUND WINDOWS. The linker gets exactly three things and no
+        // library at all: the entry point (ours, `_start`), the subsystem
+        // (a console program, so that stdout is a console and not a
+        // window), and a fixed image base so that no relocation section is
+        // needed. The import table comes out of our own object file
+        // (`win.rs::idata_asm`) -- `-lkernel32` never appears here, and no
+        // foreign object file enters the image.
+        cmd.arg("-e").arg("_start");
+        cmd.arg("--subsystem").arg("console");
+    } else if !crate::statics::any() {
         cmd.arg("-n");
     }
     let st = cmd.arg("-o").arg(out).arg(obj).status();
