@@ -719,7 +719,53 @@ den eigenen Weg genauso wie über `as`. Das war die Stelle, an der eine
 selbstgeschriebene Zeilentabelle am ehesten etwas kaputtmacht, denn sie
 schreibt Pfade; `remap_debug_filename` wird deshalb nachgebildet (§7.3).
 
-## 8.5 Was das für die Fahne heißt
+## 8.5 Die volle Prüfsuite
+
+`bash test.sh`, mit dem eigenen Kodierer als **Vorgabe** — also der Fall,
+der zählt. Stand bei Abgabe: **Abschnitte 1 bis 15 grün, null Fehlschläge.**
+
+```
+    1  Übersetzer bauen                                       ok
+    2  Modultests des Übersetzers                     283 / 283
+    3  positive Tests, JEDE Baustufe      334 Programme x 4 Läufe
+    4  negative Tests (Fehlermeldungen)                       ok
+    5  Nachweis des Optimierers                         45 / 45
+    6  Ergebnisort-Garantie (SPEC 13.1)                       ok
+    7  Feldzugriff / Speicherort getrennt                     ok
+    8  Symbolschema                                           ok
+   8b  `lock xadd`, FIR oktettgleich, beide Übersetzer        ok
+  8b2  Bau-Umgebungsvariablen, beide Übersetzer               ok
+   8c  statische Bindung ohne indirekten Aufruf               ok
+    9  HTML5-Zerteiler gegen html5lib              6810 / 6810
+   9b  HTML-Baumbau + DOM                            150 / 150
+   9c  CSS: Syntax, Selektoren, Kaskade    305/305 · 109/109 ·
+                                            840/840 gegen cssselect2
+   10  DOM-Dauerlauf ohne Leck                 flach 1764 KiB
+   11  Lexer in Firn gegen Rust      752 gleich, 1 343 686 Marken
+   28  Zahlenleser, vier Leser                 0 Abweichungen
+   31  `str`-Dauerlauf, 200 000 Runden                        ok
+   12  Zerteiler in Firn gegen Rust       435 gleich, 1 bekannt
+   13  Auslegung/ABI in Firn gegen Rust       370 gleich, 0 ab
+   14  Typprüfer in Firn gegen Rust     187 gleich, 37 201 Ausdrücke
+   15  Absenkung in Firn gegen Rust       183 gleich, 1 bekannt
+   16  Selbstübersetzung (self_compare.sh)                LÄUFT
+```
+
+Die beiden mit „1 bekannt" sind die Grundlinie, die schon vor beiden Runden
+rot war und im Werkzeug namentlich steht — sie gehören nicht dieser Runde.
+
+**Abschnitt 16 und die folgenden liefen bei Abgabe noch.** Sie sind auf
+diesem Wirt sehr langsam: `self_compare.sh` lässt den *in Firn geschriebenen*
+Übersetzer jede Testdatei übersetzen und ausführen, und daneben liefen drei
+fremde Prüfsuiten der Runde SAMMELN. Das Protokoll läuft weiter unter
+`/root/KOD2-test.log`; bis dahin ist kein einziger Fehlschlag aufgetreten.
+
+Ich sage ausdrücklich nicht „die Suite ist grün". Was ich sagen kann:
+**bis Abschnitt 15 einschließlich ist sie grün**, und für den Vorgabepfad
+liegt mit §8.4 die stärkere Aussage vor (314/314 gleiches Verhalten,
+313/313 Oktettgleichheit der Rückfallebene).
+
+## 8.6 Was das für die Fahne heißt
 
 `--asm-intern` ist **Vorgabe**. `--asm-extern` ruft `as` und bleibt als
 Rückfallebene erhalten — und als Vergleichsmaß, denn ohne `as` gäbe es
