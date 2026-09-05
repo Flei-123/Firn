@@ -38,8 +38,10 @@ gesamt_alt=0
 gesamt_neu=0
 for f in "$@"; do
     [ -f "$f" ] || continue
-    a=$(best "$FIRNC" -c -o "$W/o1.o" "$f")
-    b=$(best "$FIRNC" --asm-intern -c -o "$W/o2.o" "$f")
+    # Seit Runde KODIERER II ist der eigene Kodierer die Vorgabe --
+    # `--asm-extern` ist der alte Weg.
+    a=$(best "$FIRNC" --asm-extern -c -o "$W/o1.o" "$f")
+    b=$(best "$FIRNC" -c -o "$W/o2.o" "$f")
     diff=$((a - b))
     fak=$(python3 -c "print('%.2fx' % ($a / max($b,1)))")
     printf "%-34s %10s %10s %10s %8s\n" "$(basename "$f")" "$a" "$b" "$diff" "$fak"
