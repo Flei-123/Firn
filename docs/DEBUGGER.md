@@ -13,7 +13,7 @@ Two halves, and the split is deliberate:
 
 | Section | Who writes it | Why |
 |---|---|---|
-| `.debug_line` | the assembler, out of `.file`/`.loc` | it knows the addresses; the compiler would have to guess instruction lengths |
+| `.debug_line` | **the compiler** (`dwarf_line.rs`, RUNDE KODIERER II), out of `.file`/`.loc`; with `--asm-extern` still the assembler | it needs the FINAL addresses -- the built in assembler has them after the jump relaxation, and both ways produce the same octets |
 | `.debug_info`, `.debug_abbrev` | **the compiler**, `compiler/src/dwarf_info.rs` | names, types and frame offsets are known only to the compiler |
 
 `compiler/src/dwarf.rs` collects during lowering: the mapping *instruction →
