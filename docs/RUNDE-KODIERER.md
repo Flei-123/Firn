@@ -679,7 +679,28 @@ Ergebnissen Zeile für Zeile dasselbe.
 Das ist die Prüfung, die zählt: nicht „die Oktette sehen richtig aus",
 sondern „der Fehlersucher tut dasselbe".
 
-## 8.4 Was das für die Fahne heißt
+## 8.4 Die drei Proben, die die Umstellung tragen
+
+Die Fahne umzudrehen ist der Schritt, bei dem ein Fehler nicht mehr nur
+theoretisch wäre. Drei Messungen stehen dahinter, alle mit dem Übersetzer
+dieser Runde:
+
+```
+   Testprogramme, gleiches Verhalten (Vorgabe gegen --asm-extern)   314 / 314
+     -- gebaut und AUSGEFUEHRT, gleicher Rueckgabewert, gleiche Ausgabe
+   Rueckfallebene oktettgleich zum unberuehrten Uebersetzer         313 / 313
+     -- `--asm-extern` tut, was firnc vor beiden Runden tat
+   Modultests des Uebersetzers (cargo test --release)               283 / 283
+     -- darunter neun neue in `dwarf_line.rs`
+```
+
+Dazu die **Wiederholbarkeit** (Runde 93, `ACCEPTANCE.md` Punkt 5): dasselbe
+Programm aus zwei verschiedenen Verzeichnissen gebaut ist bitgleich — über
+den eigenen Weg genauso wie über `as`. Das war die Stelle, an der eine
+selbstgeschriebene Zeilentabelle am ehesten etwas kaputtmacht, denn sie
+schreibt Pfade; `remap_debug_filename` wird deshalb nachgebildet (§7.3).
+
+## 8.5 Was das für die Fahne heißt
 
 `--asm-intern` ist **Vorgabe**. `--asm-extern` ruft `as` und bleibt als
 Rückfallebene erhalten — und als Vergleichsmaß, denn ohne `as` gäbe es
