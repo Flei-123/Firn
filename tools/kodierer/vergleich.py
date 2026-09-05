@@ -25,6 +25,14 @@ import os, re, subprocess, sys, tempfile, json
 
 VERGLICHENE_ABSCHNITTE = [".text", ".data", ".rodata", ".bss"]
 
+# RUNDE KODIERER II -- die Fehlersuchabschnitte. `.debug_str` steht NICHT
+# dabei: dort steht als letzte Zeichenkette der Erzeuger, und der eigene
+# Weg schreibt ehrlich `firnc` hin statt `GNU AS`. Alles davor (Name des
+# Hauptquelltextes, Arbeitsverzeichnis) wird trotzdem geprueft, siehe
+# `pruefe_debug_str`.
+DWARF_ABSCHNITTE = [".debug_line", ".debug_info", ".debug_abbrev",
+                    ".debug_aranges"]
+
 
 # --------------------------------------------------------------------------
 # ELF lesen (nur so viel, wie der Vergleich braucht)
@@ -189,18 +197,74 @@ def marke_vor(path, secname, offset):
 # Eine Datei pruefen
 # --------------------------------------------------------------------------
 
+def pruefe_debug_str(da, db):
+    """`.debug_str` haelt Name, Arbeitsverzeichnis und Erzeuger.
+
+    Der Erzeuger ist die EINE Stelle, an der der eigene Weg mit Absicht
+    von `as` abweicht: `as` schreibt `GNU AS 2.40`, wir schreiben `firnc`.
+    Alles davor muss stimmen -- inklusive der Versaetze, denn auf die
+    zeigt `.debug_info`.
+    """
+    if not da and not db:
+        return None
+    ta = da.split(b"\0")
+    tb = db.split(b"\0")
+    if len(ta) != len(tb) or len(ta) < 3:
+        return ("ABSCHNITT .debug_str hat eine andere Form (as: %r, "
+                "Kodierer: %r)" % (da[:80], db[:80]))
+    if ta[:-2] != tb[:-2]:
+        return ("ABSCHNITT .debug_str weicht vor dem Erzeuger ab\n"
+                "  as       : %r\n  Kodierer : %r" % (da[:80], db[:80]))
+    if not ta[-2].startswith(b"GNU AS") or not tb[-2].startswith(b"firnc"):
+        return ("ABSCHNITT .debug_str: unerwartete Erzeugerangabe "
+                "(as: %r, Kodierer: %r)" % (ta[-2], tb[-2]))
+    return None
+
+
+def decoded_line(obj, arch):
+    """Die Zeilentabelle, wie ein Werkzeug sie SIEHT -- nicht wie sie
+    kodiert ist. `readelf` fuehrt den Automaten aus und gibt die Matrix
+    aus; daraus wird eine Liste (Datei, Zeile, Adresse, Sicht, stmt)."""
+    rd = "readelf" if arch == "x86" else "aarch64-linux-gnu-readelf"
+    r = subprocess.run([rd, "--debug-dump=decodedline", obj],
+                       capture_output=True, text=True)
+    zeilen = []
+    for l in r.stdout.splitlines():
+        l = l.rstrip()
+        if not l or l.startswith(("Contents", "File name", "CU:")) or l.endswith(":"):
+            continue
+        if not l.startswith(" ") and not l[0].isalnum():
+            continue
+        t = l.split()
+        if len(t) < 3:
+            continue
+        # Datei, Zeile, Adresse [, Sicht] [, x]
+        if not (t[1].isdigit() or t[1] == "-"):
+            continue
+        if not t[2].startswith("0x"):
+            continue
+        zeilen.append(tuple(t))
+    return zeilen
+
+
 def pruefe(firnc, s_path, tmpd, arch="x86"):
-    ergebnis = {"datei": s_path, "ok": True, "fehler": [], "bytes": 0, "relocs": 0}
+    ergebnis = {"datei": s_path, "ok": True, "fehler": [], "bytes": 0,
+                "relocs": 0, "dwarf_bytes": 0, "dwarf_rows": 0}
     a_o = os.path.join(tmpd, "as.o")
     b_o = os.path.join(tmpd, "intern.o")
     for p in (a_o, b_o):
         if os.path.exists(p):
             os.unlink(p)
+    # RUNDE KODIERER II: dieselbe Pfadabbildung wie `main.rs::assemble`,
+    # sonst schriebe `as` sein Arbeitsverzeichnis in die Zeilentabelle und
+    # der eigene Weg nicht -- ein Unterschied, der nichts mit dem Kodierer
+    # zu tun haette.
+    karte = "--debug-prefix-map=%s=." % os.getcwd()
     if arch == "x86":
-        as_cmd = ["as", "--64", "-o", a_o, s_path]
+        as_cmd = ["as", "--64", karte, "-o", a_o, s_path]
         fc_cmd = [firnc, "--asm-intern", "--nur-obj", "-o", b_o, s_path]
     else:
-        as_cmd = ["aarch64-linux-gnu-as", "-o", a_o, s_path]
+        as_cmd = ["aarch64-linux-gnu-as", karte, "-o", a_o, s_path]
         fc_cmd = [firnc, "--target=aarch64-linux", "--asm-intern",
                   "--nur-obj", "-o", b_o, s_path]
 
@@ -258,6 +322,60 @@ def pruefe(firnc, s_path, tmpd, arch="x86"):
                 msg.append("  zuviel : off=0x%x sym=%s art=%d zusatz=%d" % f)
             ergebnis["fehler"].append("\n".join(msg))
 
+    # --- die Fehlersuchinformation ---------------------------------
+    for sec in DWARF_ABSCHNITTE:
+        da, db = ea.data(sec), eb.data(sec)
+        ergebnis["dwarf_bytes"] += len(da)
+        if da != db:
+            ergebnis["ok"] = False
+            n = min(len(da), len(db))
+            i = 0
+            while i < n and da[i] == db[i]:
+                i += 1
+            ergebnis["fehler"].append("\n".join([
+                "ABSCHNITT %s weicht ab bei Versatz 0x%x (as: %d Oktette, "
+                "Kodierer: %d Oktette)" % (sec, i, len(da), len(db)),
+                "  as       : " + da[i:i + 24].hex(" "),
+                "  Kodierer : " + db[i:i + 24].hex(" "),
+            ]))
+        ra, rb = ea.relocs(sec), eb.relocs(sec)
+        if ra != rb:
+            ergebnis["ok"] = False
+            msg = ["UMSETZUNGEN in %s weichen ab (as: %d, Kodierer: %d)"
+                   % (sec, len(ra), len(rb))]
+            for f in sorted(ra - rb)[:6]:
+                msg.append("  fehlt  : off=0x%x sym=%s art=%d zusatz=%d" % f)
+            for f in sorted(rb - ra)[:6]:
+                msg.append("  zuviel : off=0x%x sym=%s art=%d zusatz=%d" % f)
+            ergebnis["fehler"].append("\n".join(msg))
+
+    f = pruefe_debug_str(ea.data(".debug_str"), eb.data(".debug_str"))
+    if f:
+        ergebnis["ok"] = False
+        ergebnis["fehler"].append(f)
+
+    # Die ausgewertete Tabelle, unabhaengig von der Kodierung: beide
+    # Programme durch `readelf` laufen lassen und Zeile fuer Zeile
+    # vergleichen. Waere die Kodierung anders, aber gleichwertig, faende
+    # der Oktettvergleich oben einen Unterschied und dieser hier nicht --
+    # deshalb stehen beide da.
+    if ea.data(".debug_line"):
+        za = decoded_line(a_o, arch)
+        zb = decoded_line(b_o, arch)
+        ergebnis["dwarf_rows"] += len(za)
+        if za != zb:
+            ergebnis["ok"] = False
+            msg = ["AUSGEWERTETE ZEILENTABELLE weicht ab (as: %d Zeilen, "
+                   "Kodierer: %d Zeilen)" % (len(za), len(zb))]
+            for i in range(max(len(za), len(zb))):
+                x = za[i] if i < len(za) else None
+                y = zb[i] if i < len(zb) else None
+                if x != y:
+                    msg.append("  Zeile %d:  as = %s" % (i, x))
+                    msg.append("            eigen = %s" % (y,))
+                    break
+            ergebnis["fehler"].append("\n".join(msg))
+
     ga, gb = ea.global_defs(), eb.global_defs()
     if ga != gb:
         ergebnis["ok"] = False
@@ -293,13 +411,16 @@ def main():
     if dateien and dateien[0] == "--liste":
         dateien = [l.strip() for l in open(dateien[1]) if l.strip()]
 
-    gesamt = {"dateien": 0, "gut": 0, "schlecht": 0, "bytes": 0, "relocs": 0}
+    gesamt = {"dateien": 0, "gut": 0, "schlecht": 0, "bytes": 0, "relocs": 0,
+              "dwarf_bytes": 0, "dwarf_rows": 0}
     with tempfile.TemporaryDirectory() as tmpd:
         for f in dateien:
             r = pruefe(firnc, f, tmpd, arch)
             gesamt["dateien"] += 1
             gesamt["bytes"] += r["bytes"]
             gesamt["relocs"] += r["relocs"]
+            gesamt["dwarf_bytes"] += r["dwarf_bytes"]
+            gesamt["dwarf_rows"] += r["dwarf_rows"]
             if r["ok"]:
                 gesamt["gut"] += 1
             else:
