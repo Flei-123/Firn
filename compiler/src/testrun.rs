@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND 94** — `firnc --test`: find the test functions, run them, report
 //! the result MACHINE READABLY (`ACCEPTANCE.md` item 4 criterion A,
 //! `TODO-FIRN.md` 0.3).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/windows/programs.sh -- ROUND MERGE-WIN: the REAL programs of this
 # repository, built as Windows `.exe` and RUN.
 #

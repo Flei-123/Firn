@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! Project manifest `firn.package` — name, version, entry point,
 //! source directories, public modules, dependencies.
 //!

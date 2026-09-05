@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND 70** — the language type `str`.
 //!
 //! ## What `str` is

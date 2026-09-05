@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/liveb4/url_check.py -- the URL resolver against somebody else's.
 
 `urllib.parse.urljoin` implements RFC 3986 section 5 and shares no line of

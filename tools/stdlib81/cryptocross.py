@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/stdlib81/cryptocross.py -- lib/std/crypto against python and openssl.
 
 The NIST vectors (`nist.py`) are the formal proof. They have one hole, and

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/stdlib81/deflate_check.py -- lib/std/deflate.fi against zlib/gzip.
 
 The whole point is that NOTHING here is judged by this repository:

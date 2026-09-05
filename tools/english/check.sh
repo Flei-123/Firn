@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/english/check.sh — GEGENPROBE zur Englisch-Umstellung (Etappe A).
 # Sucht deutsche Wortteile in ALLEN Bezeichnern (check.py), in allen
 # Ausgabetexten der beiden Uebersetzer (check_texts.py), in den Laengen der

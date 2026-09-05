@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # ROUND 58 -- PROOF IN THE ASSEMBLY: a direct call STAYS direct.
 #
 # The whole point of the function record (compiler/src/fnval.rs) is that a

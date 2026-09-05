@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/bench87/run.sh -- the two throughputs of round 87 that round 82 left
 # lying, and the price for each of them.
 #

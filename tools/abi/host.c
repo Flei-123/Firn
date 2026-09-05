@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MPL-2.0 */
 /* tools/abi/host.c -- THE GCC SIDE OF THE ABI CROSS CHECK (round 71).
  *
  * This file is a MEASURING INSTRUMENT, not a dependency: nothing in Firn

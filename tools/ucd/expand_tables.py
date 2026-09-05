@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/ucd/expand_tables.py -- writes tools/ucd/gen_ucd.fi.
 
 WHAT THIS SCRIPT DOES **NOT** DO: it does not read a single Unicode

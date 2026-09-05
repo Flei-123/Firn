@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND 82** — the three things the optimizer was leaving on the table.
 //!
 //! Found the way the round asked for it: small Firn programs, `objdump -d`

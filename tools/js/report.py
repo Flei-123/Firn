@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/js/report.py -- write tools/js/RESULTS.md out of the measurements.
 
 Reads the per directory JSON files of `tools/js/run_all.sh` plus the JSON of

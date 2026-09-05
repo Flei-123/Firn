@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **Round WINDOWS — PE/COFF, the Win64 calling convention and the imports.**
 //!
 //! Everything in this file exists because the second axis of a target

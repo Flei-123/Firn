@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND 82** — the vector and crypto instructions of the processor
 //! (SPEC §8.6).
 //!

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 """tools/english/check_texts.py — GEGENPROBE fuer die AUSGABETEXTE.
 
 Sucht in allen ZEICHENKETTENLITERALEN der beiden Uebersetzer (compiler/src/*.rs,

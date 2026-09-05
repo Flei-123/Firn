@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/net/run.sh -- the sockets against the OUTSIDE (round 76).
 #
 # `tests/1600_net_echo.fi` runs in section 3 of test.sh and pushes 1 MiB

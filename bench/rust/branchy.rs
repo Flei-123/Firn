@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 // Counterpart to bench/firn/branchy.fi.
 use std::hint::black_box;
 

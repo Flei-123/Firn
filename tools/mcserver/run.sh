@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/mcserver/run.sh -- does a real client get into the world? (round 76)
 #
 # THE POINT OF THIS SCRIPT IS THAT IT DOES NOT BELIEVE THE SERVER. It starts

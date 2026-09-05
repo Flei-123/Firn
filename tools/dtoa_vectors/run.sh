@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # The big number run of the module `str` (SPEC 8.4, Z5/Z6).
 #
 #   f64 -> text (lib/num/dtoa.fi, in Firn)  ->  f64 (lib/num/strtod.fi, in Firn)

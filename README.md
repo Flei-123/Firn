@@ -421,27 +421,20 @@ The language name lives in exactly three constants
 
 ## Licence
 
-**Two licences, and which one applies depends on the directory.**
+**MPL-2.0 for the whole repository** since 05.09.2026 -- compiler, standard
+library, runtime, tools and tests alike. See [LICENSE](LICENSE) and NOTICE.
 
-* **MIT** for the RUNTIME AND THE STANDARD LIBRARY -- `lib/std`, `lib/rt`,
-  `lib/gc`, `lib/rc`, `lib/str`, `lib/num`, `lib/math`, `lib/mem`,
-  `lib/test`, `lib/generated`, plus `compiler/src/panic_rt*.rs`, `demos/`
-  and `examples/`. That is everything the compiler links into a program YOU
-  write. **You may therefore ship a Firn program under any licence you
-  like, including a closed one** -- compiling with `firnc` does not put your
-  program under the GPL. Full text: [LICENSE.MIT](LICENSE.MIT).
-* **GPL-2.0-only** for everything else: the compiler (`compiler/`,
-  `lib/firnc1/`, `bin/`), the browser engine Certus (`lib/browser`,
-  `lib/css`, `lib/dom`, `lib/font`, `lib/html`, `lib/js`, `lib/layout`,
-  `lib/net`, `lib/paint`, `lib/tls`), the tools and the tests. Full text:
-  [LICENSE](LICENSE).
+What that means in practice:
 
-**Version 2 ONLY, never "or later".** GPLv3 section 6 would force a device
-maker to hand out the signing keys of a consumer device, which makes
-binding firmware to its machine as a theft deterrent legally impossible.
-Linux and Android are GPLv2-only for the same reason.
+* **You may ship a Firn program under any licence you like, including a
+  closed one.** Compiling with `firnc` and linking `lib/` into your program
+  does not put your program under the MPL; the MPL is file-based, and your
+  files are yours.
+* **If you change a file of Firn itself** (the compiler, the standard
+  library, the runtime) and pass that version on, you must publish the
+  changed files. Improvements to the language come back.
 
-Every source file carries an `SPDX-License-Identifier:` line, which is the
-authoritative answer for that file. The reasoning and the file-by-file
-boundary are in [LICENSING.md](LICENSING.md); third-party material and its
-own terms are in [THIRD_PARTY.md](THIRD_PARTY.md).
+Every source file carries an `SPDX-License-Identifier:` line. Third-party
+material (Unicode data, test fonts) and its own terms are listed in
+[THIRD_PARTY.md](THIRD_PARTY.md). Earlier public states of Firn were MIT
+licensed; that text is kept in `LICENSES/` for reference.

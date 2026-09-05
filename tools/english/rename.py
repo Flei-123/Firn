@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/english/rename.py — wendet `names.tsv` (und `names_file.tsv`)
 # auf den Quelltext an. Getroffen werden NUR Bezeichner im Code; Kommentare,
 # Zeichenketten und Zeichenliterale bleiben unangetastet (das ist Etappe B).

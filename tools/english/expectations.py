@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/english/expectations.py — zieht die Testerwartungen nach.
 #
 #   --namen       Bezeichner in `// expect_error:` / `// expect_out:` ersetzen.
