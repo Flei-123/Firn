@@ -857,7 +857,28 @@ Zwei Dinge stehen da:
    sie erzeugt. Der Vergleich, der zählt, ist der mit gleichem Ergebnis,
    und der lautet 1,33 ×.
 
-## 10.3 Braucht es jetzt einen eigenen Binder?
+## 10.3 Und was ist mit dem selbstgehosteten Übersetzer?
+
+Hier gehört eine Einschränkung hin, die man leicht übersieht und die für
+OrientOS die wichtigere Hälfte ist:
+
+> **`firnc1` ruft weiterhin `/usr/bin/as` und `/usr/bin/ld`.**
+
+Der Kodierer steckt in `firnc0`, dem Übersetzer in Rust. `bin/firnc1.fi` —
+der Übersetzer **in Firn**, der sich selbst übersetzt — schreibt nach wie vor
+`target.s` und startet die beiden Programme über `fork`/`execve`
+(`bin/firnc1.fi`, Zeile 1384). Für den Bau *mit* `firnc0` ist `as` also weg;
+für die selbstgehostete Kette ist es das nicht.
+
+Was dafür nötig wäre: `x86enc.rs`, `asm_x86.rs`, `dwarf_line.rs` und
+`elfobj.rs` nach Firn übersetzen und in `lib/firnc1/` legen — rund 4 900
+Zeilen, deren Verhalten durch diese beiden Runden bereits **oktettgenau
+festgenagelt** ist. Das ist die günstigste Portierung, die es in diesem Baum
+gibt: die Vorlage ist bewiesen, und der Prüfstand (`as` als Maß) gilt für die
+Firn-Fassung unverändert weiter. Erst danach ist die Kette *von der Quelle
+bis zur Objektdatei* wirklich geschlossen.
+
+## 10.4 Braucht es jetzt einen eigenen Binder?
 
 Nein, und die Zahl ist noch deutlicher als in TEIL 5c: **`ld` kostet 6,1 ms**
 von 587. Ein eigener Binder wäre für die Geschwindigkeit sinnlos. Er wäre
@@ -865,7 +886,7 @@ nur dann interessant, wenn OrientOS auch die *letzte* fremde Binärabhängigkeit
 loswerden soll — und dann ist es der einfachste Binderfall, den es gibt: eine
 Objektdatei je Programm, keine Bibliotheken, keine dynamische Bindung.
 
-## 10.4 Der nächste Schritt — und wie der Prüfstand ihn überlebt
+## 10.5 Der nächste Schritt — und wie der Prüfstand ihn überlebt
 
 Der Auftrag fragt nach dem, was in TEIL 5a als Schätzung stand: `codegen_x86.rs`
 soll `x86enc::Inst` **direkt** erzeugen statt Assemblertext. Diese Runde hat
@@ -902,6 +923,16 @@ Konkret:
 Damit bleibt bis zum Schluss nachprüfbar, was der Kodierer tut, und `as`
 bleibt bis zum Schluss das Maß. Der geschätzte Gewinn steht in §5a: noch
 einmal grob 100–150 ms von 587, also rund 20 %. Es bleibt eine Schätzung.
+
+**Reihenfolge, wenn OrientOS ohne fremde Binutils gebaut werden soll:**
+
+1. ~~`.debug_line` selbst schreiben~~ — erledigt (TEIL 7/8).
+2. Den Kodierer nach Firn portieren, damit auch `firnc1` ohne `as` auskommt
+   (§10.3). Das ist der Schritt mit dem größten Gewinn für OrientOS und dem
+   kleinsten Risiko, weil die Vorlage oktettgenau geprüft ist.
+3. Codeerzeuger auf `Inst` umstellen (§10.5) — reine Geschwindigkeit.
+4. Eigener Binder zuletzt, und nur wenn die *letzte* fremde Binärdatei
+   verschwinden soll: 6,1 ms von 587 sind kein Argument.
 
 
 ---
