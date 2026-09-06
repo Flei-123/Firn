@@ -18,7 +18,8 @@
 export {
     Buf,
     heap_alloc, heap_free, mem_copy, mem_set, mem_eq,
-    buf_new, buf_free, buf_clear, buf_reserve, buf_push, buf_push_bytes,
+    buf_new, buf_free, buf_clear, buf_reserve, buf_reserve_or_die,
+    buf_grow, buf_push, buf_push_bytes,
     buf_len, buf_at, buf_ptr, buf_data, buf_set_len,
     buf_push_dec_u64, buf_push_dec_i64, buf_push_hex_u64,
     write_everything, read_file, read_stdin, finish,
@@ -215,7 +216,25 @@ fn buf_at(b: *mut Buf, i: usize) -> u8 {
 }
 
 // Growing doubles the size -- that keeps the number of copies logarithmic.
-fn buf_grow(b: *mut Buf, needed: usize) {
+//
+// ROUND HAERTUNG-2: THERE IS AN ANSWER NOW. Before, this function just
+// returned when `heap_alloc` said no; `cap` kept its old value, and
+// whoever wrote afterwards wrote past the end of the buffer.
+//
+// How far that really reached is MEASURED, not assumed (canary right
+// behind the buffer, arena genuinely exhausted):
+//
+//   * `buf_push` and `buf_push_bytes` did NOT overrun. Both check the
+//     capacity a SECOND time after growing and then simply do not
+//     write -- silent, but intact (`len=128`, canary 1).
+//   * `buf_reserve` PLUS the caller's own write loop DID overrun
+//     (`len=192`, canary 0). That is the real defect, and it hits the
+//     places that reserve and then write themselves.
+//
+// Hence `bool` and not an abort: a library that kills the process when
+// memory is tight takes the decision away from its caller. Whoever
+// cannot go on without the space uses `buf_reserve_or_die`.
+fn buf_grow(b: *mut Buf, needed: usize) -> bool {
     var cap: usize = (*b).cap
     if cap == 0 {
         cap = 64
@@ -225,7 +244,7 @@ fn buf_grow(b: *mut Buf, needed: usize) {
     }
     let new: u64 = heap_alloc(cap)
     if new == 0 {
-        return
+        return false
     }
     if (*b).len > 0 {
         mem_copy(new, (*b).ptr, (*b).len)
@@ -233,36 +252,61 @@ fn buf_grow(b: *mut Buf, needed: usize) {
     heap_free((*b).ptr, (*b).cap)
     (*b).ptr = new
     (*b).cap = cap
+    return true
 }
 
-fn buf_reserve(b: *mut Buf, needed: usize) {
+// `true` means: there really are `needed` octets now. Only then may the
+// caller write up to that point.
+fn buf_reserve(b: *mut Buf, needed: usize) -> bool {
     if (*b).cap >= needed {
+        return true
+    }
+    return buf_grow(b, needed)
+}
+
+// FOR THE PLACES THAT CANNOT GO ON WITHOUT THE SPACE.
+//
+// They are the reason `buf_reserve` returns a value instead of aborting
+// by itself: the abort stands HERE, in ONE place, with a message --
+// instead of in every caller separately.
+fn buf_reserve_or_die(b: *mut Buf, needed: usize) {
+    if buf_reserve(b, needed) {
         return
     }
-    buf_grow(b, needed)
+    var m: [u8; 40] = "rt: out of memory (buf_reserve)\n\0\0\0\0\0\0\0\0"
+    write_everything(2, (&m[0]) as u64, 32)
+    finish(70)
 }
 
 // THE FAST PATH ON TOP: only the comparison lives here, the growing is a
 // function of its own. That keeps `buf_push` small enough to inline -- measured
 // during round 6, the capacity checks otherwise made up 33 % of all
 // instructions of the tokenizer.
-fn buf_push(b: *mut Buf, v: u8) {
+// ROUND HAERTUNG-2: `bool` here too -- not because these two overran
+// (they demonstrably do not, see `buf_grow`), but so that a caller who
+// WANTS to know does not have to guess. The second capacity check
+// stays: it is the reason these two paths are safe, and it is not there
+// by accident.
+fn buf_push(b: *mut Buf, v: u8) -> bool {
     if (*b).len >= (*b).cap {
         buf_grow(b, (*b).len + 1)
     }
     if (*b).len < (*b).cap {
         st8((*b).ptr, (*b).len, v)
         (*b).len = (*b).len + 1
+        return true
     }
+    return false
 }
 
-fn buf_push_bytes(b: *mut Buf, p: u64, n: usize) {
+fn buf_push_bytes(b: *mut Buf, p: u64, n: usize) -> bool {
     buf_reserve(b, (*b).len + n)
     if (*b).len + n > (*b).cap {
-        return
+        return false
     }
     mem_copy((*b).ptr + (*b).len as u64, p, n)
     (*b).len = (*b).len + n
+    return true
 }
 
 // ---------------------------------------------------------- Number -> text

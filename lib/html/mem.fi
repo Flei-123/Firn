@@ -147,15 +147,18 @@ fn buf_ptr(b: *mut Buf) -> *mut u8 {
 }
 
 #[no_gc]
-fn buf_reserve(b: *mut Buf, need: usize) {
+fn buf_reserve(b: *mut Buf, need: usize) -> bool {
     if (*b).cap >= need {
-        return
+        return true
     }
-    buf_grow(b, need)
+    return buf_grow(b, need)
 }
 
 #[no_gc]
-fn buf_grow(b: *mut Buf, need: usize) {
+// ROUND HAERTUNG-2: the same answer as in `lib/rt/rt.fi`. This is the
+// SECOND buffer implementation in the tree, and it had the same silent
+// return -- here it did not even look at what `heap_alloc` gave back.
+fn buf_grow(b: *mut Buf, need: usize) -> bool {
     var cap: usize = (*b).cap
     if cap == 0 {
         cap = 64
@@ -164,21 +167,36 @@ fn buf_grow(b: *mut Buf, need: usize) {
         cap = cap * 2
     }
     let p: *mut u8 = heap_alloc(cap)
+    if (p as u64) == 0 {
+        return false
+    }
     if (*b).len > 0 {
         mem_copy(p, (*b).ptr, (*b).len)
     }
     heap_free((*b).ptr, (*b).cap)
     (*b).ptr = p
     (*b).cap = cap
+    return true
 }
 
+// ROUND HAERTUNG-2: AND HERE IT REALLY DID OVERRUN.
+//
+// `lib/rt/rt.fi` checks the capacity a SECOND time after growing and
+// then does not write. This one did NOT -- it wrote unconditionally,
+// even when `buf_grow` had just failed. That is the silent heap
+// overflow the round was looking for, and it sits in the buffer used by
+// the HTML side, not in the one everybody reads.
 #[no_gc]
-fn buf_push(b: *mut Buf, v: u8) {
+fn buf_push(b: *mut Buf, v: u8) -> bool {
     if (*b).len >= (*b).cap {
         buf_grow(b, (*b).len + 1)
     }
+    if (*b).len >= (*b).cap {
+        return false
+    }
     *(((*b).ptr as usize + (*b).len) as *mut u8) = v
     (*b).len = (*b).len + 1
+    return true
 }
 
 #[no_gc]
@@ -225,7 +243,13 @@ fn read_all_stdin(b: *mut Buf) {
     buf_clear(b)
     var next: bool = true
     while next {
-        buf_reserve(b, (*b).len + 65536)
+        // ROUND HAERTUNG-2: without the space nothing is read. The
+        // `read` below fills 65536 octets -- into a buffer that did not
+        // have to be that big.
+        if !buf_reserve(b, (*b).len + 65536) {
+            next = false
+            break
+        }
         let r: i64 = syscall(SYS_READ, 0, ((*b).ptr as usize + (*b).len) as i64, 65536, 0, 0, 0)
         if r <= 0 {
             next = false
