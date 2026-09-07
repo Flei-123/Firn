@@ -62,7 +62,7 @@ const P_AS: &str = "__gc#as:";
 
 /// Call names of the runtime (`lib/gc/gc.fi`) that can trigger a collection
 /// run or touch the state of the collector.
-const RUNTIME_COLLECTS: [&str; 4] = ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now"];
+const RUNTIME_COLLECTS: [&str; 5] = ["gc_init", "gc_collect", "gc_cycle_finish", "__gc_alloc_raw", "__gc_collect_now"];
 /// Further runtime names: pure queries, but part of the collector.
 const RUNTIME_QUERY: [&str; 11] = [
     "gc_set_max_bytes",
