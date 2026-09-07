@@ -258,6 +258,17 @@ const S_ZBUDGET: u64 = 2136
 // ROUND 70: the type tag of `StrBytes`, determined once (`__str_tid`).
 // 0 = not yet determined.
 const S_STR_TID: u64 = 2144
+// RUNDE KERN-2 (Certus) -- DIE CHUNK-TABELLE. `__gc_block_of` lief die
+// Chunk-Liste ab, ein Chunk nach dem anderen: ein grosser Block (ein
+// Stringpuffer, ein Vektor) ist ein eigener Chunk, also standen bei
+// 40 MB Haufen Tausende in der Liste -- und jeder Zeiger beim Markieren
+// ging sie durch. Gemessen (callgrind, m.youtube.com/base.js in Certus):
+// 38 % aller Befehle in __gc_block_of, 35 % in __gc_ld64 darunter;
+// 12,06 s mit Sammler, 2,85 s ohne. Jetzt: eine nach Anfangsadresse
+// sortierte Tabelle (16 Oktett je Chunk: Datenanfang, Chunk), Binaersuche.
+const S_CTAB: u64 = 2152      // die Tabelle (mmap), 0 = keine
+const S_CTAB_N: u64 = 2160    // Eintraege
+const S_CTAB_CAP: u64 = 2168  // Plaetze
 
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
@@ -709,6 +720,7 @@ fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
     __gc_st64(p + 40, class)
     __gc_st64(st + S_CHUNKS, p)
     __gc_st64(st + S_HEAP, __gc_ld64(st + S_HEAP) + real)
+    __gc_ctab_add(p)
     // All blocks into the free list of the class
     if class < CLASSES {
         let header: u64 = st + S_FREE + class * 8
@@ -745,6 +757,33 @@ fn __gc_block_of(a: u64) -> u64 {
             return data0 + (a - data0) / __gc_ld64(cc + 16) * __gc_ld64(cc + 16)
         }
     }
+    // RUNDE KERN-2: die sortierte Tabelle, Binaersuche nach dem letzten
+    // Eintrag mit Datenanfang <= a.
+    let tab: u64 = __gc_ld64(st + S_CTAB)
+    let n: u64 = __gc_ld64(st + S_CTAB_N)
+    if tab != 0 && n > 0 {
+        var lo: u64 = 0
+        var hi: u64 = n
+        while lo < hi {
+            let mid: u64 = (lo + hi) / 2
+            if __gc_ld64(tab + mid * 16) <= a {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo > 0 {
+            let ct: u64 = __gc_ld64(tab + (lo - 1) * 16 + 8)
+            let data1: u64 = ct + CHUNK_HEADER
+            let block1: u64 = __gc_ld64(ct + 16)
+            let end1: u64 = data1 + block1 * __gc_ld64(ct + 24)
+            if a >= data1 && a < end1 {
+                __gc_st64(st + S_CHUNK_CACHE, ct)
+                return data1 + (a - data1) / block1 * block1
+            }
+        }
+        return 0
+    }
     var c: u64 = __gc_ld64(st + S_CHUNKS)
     while c != 0 {
         let data: u64 = c + CHUNK_HEADER
@@ -759,6 +798,96 @@ fn __gc_block_of(a: u64) -> u64 {
         c = __gc_ld64(c)
     }
     return 0
+}
+
+// RUNDE KERN-2: einen Chunk in die sortierte Tabelle einfuegen. Waechst
+// die Tabelle, wird sie verdoppelt (mmap, kopieren, munmap). Schlaegt
+// mmap fehl, bleibt die Tabelle weg (S_CTAB = 0) und __gc_block_of
+// laeuft wie frueher die Liste ab -- langsam, aber richtig.
+fn __gc_ctab_add(c: u64) {
+    let st: u64 = __gc_state() as u64
+    var tab: u64 = __gc_ld64(st + S_CTAB)
+    let n: u64 = __gc_ld64(st + S_CTAB_N)
+    var cap: u64 = __gc_ld64(st + S_CTAB_CAP)
+    if n + 1 > cap {
+        var ncap: u64 = cap * 2
+        if ncap < 256 {
+            ncap = 256
+        }
+        let nt: u64 = __gc_mmap(ncap * 16)
+        if nt == 0 {
+            if tab != 0 {
+                __gc_munmap(tab, cap * 16)
+            }
+            __gc_st64(st + S_CTAB, 0)
+            __gc_st64(st + S_CTAB_N, 0)
+            __gc_st64(st + S_CTAB_CAP, 0)
+            return
+        }
+        var i: u64 = 0
+        while i < n * 2 {
+            __gc_st64(nt + i * 8, __gc_ld64(tab + i * 8))
+            i = i + 1
+        }
+        if tab != 0 {
+            __gc_munmap(tab, cap * 16)
+        }
+        tab = nt
+        cap = ncap
+        __gc_st64(st + S_CTAB, tab)
+        __gc_st64(st + S_CTAB_CAP, cap)
+    }
+    let data: u64 = c + CHUNK_HEADER
+    // Einfuegestelle: erster Eintrag mit Anfang > data
+    var lo: u64 = 0
+    var hi: u64 = n
+    while lo < hi {
+        let mid: u64 = (lo + hi) / 2
+        if __gc_ld64(tab + mid * 16) <= data {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    var j: u64 = n
+    while j > lo {
+        __gc_st64(tab + j * 16, __gc_ld64(tab + (j - 1) * 16))
+        __gc_st64(tab + j * 16 + 8, __gc_ld64(tab + (j - 1) * 16 + 8))
+        j = j - 1
+    }
+    __gc_st64(tab + lo * 16, data)
+    __gc_st64(tab + lo * 16 + 8, c)
+    __gc_st64(st + S_CTAB_N, n + 1)
+}
+
+fn __gc_ctab_del(c: u64) {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_CTAB)
+    let n: u64 = __gc_ld64(st + S_CTAB_N)
+    if tab == 0 || n == 0 {
+        return
+    }
+    let data: u64 = c + CHUNK_HEADER
+    var lo: u64 = 0
+    var hi: u64 = n
+    while lo < hi {
+        let mid: u64 = (lo + hi) / 2
+        if __gc_ld64(tab + mid * 16) < data {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo >= n || __gc_ld64(tab + lo * 16 + 8) != c {
+        return
+    }
+    var j: u64 = lo
+    while j + 1 < n {
+        __gc_st64(tab + j * 16, __gc_ld64(tab + (j + 1) * 16))
+        __gc_st64(tab + j * 16 + 8, __gc_ld64(tab + (j + 1) * 16 + 8))
+        j = j + 1
+    }
+    __gc_st64(st + S_CTAB_N, n - 1)
 }
 
 // Which chunk does the address belong to? 0 = not a heap address. It is
@@ -1125,6 +1254,7 @@ fn __gc_sweep_step(t0: u64) -> u64 {
             if __gc_ld64(st + S_CHUNK_CACHE) == c {
                 __gc_st64(st + S_CHUNK_CACHE, 0)
             }
+            __gc_ctab_del(c)
             __gc_munmap(c, bytes)
         } else {
             before = c
