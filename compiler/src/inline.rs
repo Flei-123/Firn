@@ -48,17 +48,29 @@ const MAX_CALLEE_BLOCKS: usize = 8;
 const MAX_CALLER_INSTS: usize = 24000;
 /// ROUND INLINE: overridable for measuring. `FIRNC_MAX_INLINES` is read once
 /// per pass; unset it keeps the compiled-in default.
-/// ROUND PHI: **0 -- the count budget is switched off by default.**
+/// Round INLINE's value, and round PHI LEFT IT HERE after trying to remove it.
 ///
-/// Round INLINE left this at 2,000 and measured, from two directions, that
-/// the number is the wrong instrument. Round PHI measured the same thing a
-/// third way, with callgrind instead of the wall clock, and the count is now
-/// gone from the default. See `MAX_ALWAYS_INSTS` for what decides instead.
+/// ROUND PHI, THE ATTEMPT AND WHY IT WAS REVERTED. Setting this to 0 (the
+/// size rule alone deciding) looked like a clear win on a first callgrind
+/// reading: 718.1 M against 729.7 M instructions on the JS engine, a smaller
+/// binary and a faster compile. It was then measured properly and it is
+/// **slower**: +2.67 % (A won 13 of 15 pairs) and +4.27 % (12 of 15) in two
+/// separate interleaved runs, against a noise floor of +0.87 % at 9:6 pairs
+/// measured with two byte identical copies of the same engine.
 ///
-/// It is kept as a knob (`FIRNC_MAX_INLINES`) because it is what round
-/// INLINE's numbers were taken with, and a reference side that cannot be
-/// rebuilt is not a reference.
-const MAX_INLINES: usize = 0;
+/// THE FIRST READING WAS AN ARTEFACT, and the reason is worth keeping:
+/// **callgrind is not deterministic on the JS engine.** Three runs of ONE
+/// binary give 725.6 M / 725.9 M / 721.6 M. The collector's incremental
+/// slice has a TIME budget (`gc.fi:1216`, `__gc_now_ns() - t0 >= budget`),
+/// and under valgrind's ~50x slowdown it does a different amount of work
+/// every run. Instruction counts are only solid ground where no wall clock
+/// enters the program's own decisions -- on the WASM interpreter, which has
+/// no collector, three runs agree to the digit (1279457762 each time).
+///
+/// On a deliberately allocation-poor JS job (arithmetic only, so the time
+/// sliced collector barely runs) the counts agree with the wall clock:
+/// 1461.6 M for this value against 1468.9 M for 0.
+const MAX_INLINES: usize = 2000;
 
 /// ROUND INLINE -- a body of at most this many instructions is embedded even
 /// after `MAX_INLINES` is exhausted.
@@ -135,11 +147,29 @@ const MAX_ALWAYS_INSTS: usize = 8;
 /// STARTED, not from its current size -- otherwise it compounds: every
 /// embedding raises the bound that permits the next one, which is how a
 /// percentage bound turns back into no bound at all.
-const GROW_PERCENT: usize = 30;
+/// ROUND PHI: **0 = off.** The mechanism is built and kept; the default is
+/// off because it MEASURED WORSE than what it would replace, on both
+/// benchmarks and in both directions:
+///
+///   JS engine, 30 % growth bound   +6.66 %  (won 2 of 11 pairs)
+///   WASM interpreter, 30 %        +23.04 %  (won 0 of 7 pairs)
+///   JS engine, 100 %               -0.41 %  (a tie with the default)
+///   JS engine, 400 %               +2.61 %  (converging back onto it)
+///
+/// WHY IT DOES NOT WORK. What hurts the WASM interpreter is not how much one
+/// caller grows, it is WHICH bodies get in at all: a percentage bound still
+/// lets forty instruction bodies into the opcode chain, it just lets fewer
+/// of them, and the I-cache does not care how many there are.
+///
+/// Both knobs at 0 is a byte identical no-op against round INLINE's
+/// default -- verified by md5 of the built JS engine -- which is what makes
+/// it an honest reference side. `FIRNC_GROW_PERCENT` / `FIRNC_GROW_MIN`
+/// switch it on for measuring.
+const GROW_PERCENT: usize = 0;
 /// Absolute slack, so a 10 instruction function may still take one 12
 /// instruction body. Without it `GROW_PERCENT` alone would lock out exactly
 /// the small hot helpers a small hot caller is made of.
-const GROW_MIN_INSTS: usize = 24;
+const GROW_MIN_INSTS: usize = 0;
 
 fn grow_percent() -> usize {
     match std::env::var("FIRNC_GROW_PERCENT") {
