@@ -62,7 +62,13 @@ run_one() {
   if ! (cd "$ROOT" && timeout 300 "$FIRNC" $flag "$f" -o "$b") >/dev/null 2>&1; then
     echo "BUILDFAIL [$lvl] $f"; rm -f "$b"; return 0
   fi
-  out=$(cd "$ROOT" && timeout 120 "$b" 2>/dev/null); rc=$?
+  # ROUND PHI -- `< /dev/null`. Programs that READ STDIN (tests/1283_std_io_ask.fi
+  # asks for input) otherwise inherit the harness's stdin, which under
+  # `xargs -P` is the job list itself: the test eats lines of it, answers
+  # wrong, and starves the other jobs. It passes standalone and failed only
+  # here. A gate that reports a failure the compiler did not cause is worse
+  # than no gate.
+  out=$(cd "$ROOT" && timeout 120 "$b" < /dev/null 2>/dev/null); rc=$?
   rm -f "$b"
   if [ "$kind" = exit ]; then
     if [ "$rc" = "$exp" ]; then echo "OK"; else echo "FAIL [$lvl] $f: exit $rc want $exp"; fi
