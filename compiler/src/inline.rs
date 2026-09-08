@@ -46,7 +46,61 @@ const MAX_CALLEE_BLOCKS: usize = 8;
 /// below every callee bound. A big function is not automatically cold; with
 /// a state machine the opposite holds.
 const MAX_CALLER_INSTS: usize = 24000;
+/// ROUND INLINE: overridable for measuring. `FIRNC_MAX_INLINES` is read once
+/// per pass; unset it keeps the compiled-in default.
 const MAX_INLINES: usize = 2000;
+
+/// ROUND INLINE -- a body of at most this many instructions is embedded even
+/// after `MAX_INLINES` is exhausted.
+///
+/// WHY A SECOND, SIZE BASED BOUND. `MAX_INLINES` is a bound on the NUMBER of
+/// embeddings, and a number cannot tell a one instruction accessor from a
+/// forty instruction body. In `lib/js/run_main.fi` the count runs out long
+/// before the collector accessors are reached, so `__gc_ld64` -- ONE
+/// instruction -- stayed a real call and became 21 % of the running engine.
+///
+/// MEASURED (round INLINE, lib/js/run_main.fi, 120,000 round allocating
+/// loop, interleaved A/B): raising the pure count bound is NOT monotonic.
+///   cap  2,000 (the old value)  1687 ms   baseline
+///   cap  5,000                  1670 ms   +6.1 % SLOWER (won 1 of 11 pairs)
+///   cap 20,000                  1687 ms  +10.1 % SLOWER (won 0 of 11 pairs)
+///   cap 22,138 (saturated)      1228 ms  -27.2 % FASTER (won 15 of 15)
+/// A half spent budget is the worst of both worlds: the code has grown but
+/// the hot accessors are still calls. That is the shape round SCHLEUSE saw
+/// from the other side (`release-fast` slower than `dev-fast`, the inline
+/// pass blowing the opcode chain out of the I-cache).
+/// MEASURED, same bench, count bound left at 2,000 and only THIS bound
+/// varied (interleaved A/B against the old cap 2,000 binary):
+///   <=1  insts   956 ms  -36.7 %  (11 of 11 pairs)
+///   <=4  insts   929 ms  -38.4 %  (11 of 11)
+///   <=8  insts   912 ms  -39.4 %  (11 of 11)
+///   <=12 insts   879 ms  -41.5 %  (11 of 11)
+/// and 4 / 8 / 12 are a TIE with each other (6:5, 5:6 pairs -- noise), so the
+/// middle of the plateau is taken. It also beats embedding EVERYTHING
+/// (22,138 inlines, the saturated count bound) by -17.4 %, 11 of 11 pairs,
+/// while the binary grows 1.83 MB -> 1.93 MB instead of 1.83 MB -> 3.16 MB.
+///
+/// That is the I-cache finding of round SCHLEUSE from the other side: what
+/// makes an interpreter faster is embedding the ONE INSTRUCTION accessors it
+/// runs millions of times, not embedding forty instruction bodies that push
+/// the opcode chain out of the cache.
+const MAX_ALWAYS_INSTS: usize = 8;
+
+fn max_inlines() -> usize {
+    match std::env::var("FIRNC_MAX_INLINES") {
+        Ok(v) => v.trim().parse().unwrap_or(MAX_INLINES),
+        Err(_) => MAX_INLINES,
+    }
+}
+
+/// ROUND INLINE -- the SIZE bound that applies once the count budget is used
+/// up. See `MAX_ALWAYS_INSTS`. Overridable for measuring.
+fn always_insts() -> usize {
+    match std::env::var("FIRNC_ALWAYS_INSTS") {
+        Ok(v) => v.trim().parse().unwrap_or(MAX_ALWAYS_INSTS),
+        Err(_) => MAX_ALWAYS_INSTS,
+    }
+}
 
 // ROUND INLINE: `reaches` / `reaches_itself_self` are replaced by the memoised
 // `Reach` below. The reasoning that a self reachable body must not be
@@ -197,6 +251,9 @@ fn find_site(
     from_ii: usize,
     idx: &NameIndex,
     reach: &mut Reach,
+    // ROUND INLINE: `Some(k)` = the count budget is used up, only bodies of
+    // at most `k` instructions are still embedded. `None` = no extra bound.
+    small_only: Option<usize>,
 ) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
@@ -221,6 +278,11 @@ fn find_site(
                 let callee = &m.funcs[gi];
                 if gi == ci || !inlinable(callee) {
                     continue;
+                }
+                if let Some(k) = small_only {
+                    if callee.inst_count() > k {
+                        continue;
+                    }
                 }
                 if callee.params.len() != args.len() {
                     continue;
@@ -508,6 +570,8 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
 pub fn inline_module(m: &mut Module) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
+    let cap = max_inlines();
+    let always = always_insts();
     let idx = NameIndex::new(m);
     let mut reach = Reach::new(m, &idx);
 
@@ -517,7 +581,14 @@ pub fn inline_module(m: &mut Module) -> usize {
         let mut bi = 0usize;
         let mut ii = 0usize;
         loop {
-            match find_site(m, ci, bi, ii, &idx, &mut reach) {
+            // Below the count budget everything the heuristic allows; above
+            // it only bodies at most `always` instructions long. With
+            // `always == 0` that is the old behaviour exactly: the pass stops.
+            let small_only = if n >= cap { Some(always) } else { None };
+            if let Some(0) = small_only {
+                break;
+            }
+            match find_site(m, ci, bi, ii, &idx, &mut reach, small_only) {
                 Some((fbi, fii, gi)) => {
                     if dbg {
                         eprintln!(
@@ -530,9 +601,6 @@ pub fn inline_module(m: &mut Module) -> usize {
                     }
                     inline_one(m, ci, fbi, fii, gi);
                     n += 1;
-                    if n >= MAX_INLINES {
-                        return n;
-                    }
                     // The call at (fbi, fii) is gone: the block was split
                     // there and everything after it moved into the new
                     // continuation block at the end. Carry on at the same
