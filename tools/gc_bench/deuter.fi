@@ -1,0 +1,138 @@
+// expect_exit: 0
+// tools/gc_bench/deuter.fi -- ROUND SAMMLER, the test bench.
+//
+// The load an INTERPRETER puts on the collector, which is what the profile of
+// round KERN-3 (Certus' JS interpreter, ~9 us per empty loop round, ~35 % of
+// the time in `__gc_ld64` / `__gc_block_of`) actually shows:
+//
+//   * MANY SMALL SHORT LIVED objects -- every interpreter step boxes a value
+//     that dies again immediately (the write barrier and the marking hit
+//     `__gc_block_of` for each one).
+//   * POINTER CHASING -- an environment chain / a linked structure that the
+//     marking has to walk, so `__gc_ld64` sits in the inner loop.
+//   * DEEP STACKS -- the conservative stack scan has to read real frames.
+//
+// The number that counts is nanoseconds per round, printed at the end.
+// Deterministic (a fixed LCG, no clock in the load itself) so that two
+// builds can be compared.
+
+import dom.meas
+
+gc class Node {
+    next: Gc[Node],
+    a: u64,
+    b: u64,
+}
+
+gc class Env {
+    parent: Gc[Env],
+    val: Gc[Node],
+    depth: u64,
+}
+
+const ROUNDS: u64 = 20000
+const CHAIN: u64 = 24
+const KEEP: u64 = 256
+
+// A deterministic pseudo random number -- no syscall, no clock.
+fn lcg(s: u64) -> u64 {
+    return s * 6364136223846793005 + 1442695040888963407
+}
+
+// Deep stack: the conservative scan has to walk real frames with real
+// pointers in them. Recursive, so the inliner cannot flatten it away.
+fn deep(e: Gc[Env], t: u64, acc: u64) -> u64 {
+    var fill: [u64; 16] = [0; 16]
+    let fp: u64 = (&fill) as u64
+    *(fp as *mut u64) = acc
+    if t > 0 {
+        return deep(e, t - 1, acc + e.depth)
+    }
+    // Walk the environment chain -- pointer chasing through the heap.
+    var cur: Gc[Env] = e
+    var sum: u64 = acc
+    var guard: u64 = 0
+    while cur != gc_null[Env]() && guard < 32 {
+        sum = sum + cur.depth
+        let v: Gc[Node] = cur.val
+        if v != gc_null[Node]() {
+            sum = sum + v.a + v.b
+        }
+        cur = cur.parent
+        guard = guard + 1
+    }
+    return sum
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 9
+    }
+    // A live working set that survives, so marking really has work to do.
+    var keep: [Gc[Node]; 256] = [gc_null[Node](); 256]
+    var env: Gc[Env] = gc_null[Env]()
+    var i: u64 = 0
+    while i < 8 {
+        env = gc Env { parent: env, val: gc_null[Node](), depth: i } catch gc_null[Env]()
+        if env == gc_null[Env]() {
+            return 1
+        }
+        i = i + 1
+    }
+
+    let t0: u64 = meas.meas_now_ms()
+    var s: u64 = 12345
+    var sink: u64 = 0
+    var r: u64 = 0
+    while r < ROUNDS {
+        s = lcg(s)
+        // A short chain of small objects -- born and dead within the round.
+        var head: Gc[Node] = gc_null[Node]()
+        var k: u64 = 0
+        while k < CHAIN {
+            head = gc Node { next: head, a: s + k, b: r } catch gc_null[Node]()
+            if head == gc_null[Node]() {
+                return 2
+            }
+            k = k + 1
+        }
+        // Pointer chasing over the fresh chain.
+        var cur: Gc[Node] = head
+        while cur != gc_null[Node]() {
+            sink = sink + cur.a
+            cur = cur.next
+        }
+        // A write barrier into the OLD working set: the classic
+        // old -> young store an interpreter does all the time.
+        let slot: u64 = (s >> 13) % KEEP
+        keep[slot as usize] = head
+        // Occasionally hang a value into the environment (old -> young too).
+        if (s >> 29) % 16 == 0 {
+            env.val = head
+        }
+        // The deep stack every few rounds.
+        if r % 64 == 0 {
+            sink = sink + deep(env, 24, r)
+        }
+        r = r + 1
+    }
+    let t1: u64 = meas.meas_now_ms()
+
+    let ms: u64 = t1 - t0
+    meas.meas_u64(ROUNDS)
+    meas.meas_tab()
+    meas.meas_u64(ms)
+    meas.meas_tab()
+    meas.meas_u64(ms * 1000000 / ROUNDS)
+    meas.meas_tab()
+    meas.meas_u64(gc_collections())
+    meas.meas_tab()
+    meas.meas_u64(gc_heap_bytes())
+    meas.meas_tab()
+    meas.meas_u64(gc_live_objects())
+    meas.meas_nl()
+    if sink == 999999999 {
+        return 3
+    }
+    return 0
+}
