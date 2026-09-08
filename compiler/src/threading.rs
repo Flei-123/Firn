@@ -168,6 +168,55 @@ pub(crate) fn fork_at(f: &Func, bi: usize) -> Option<(Val, BlockId, BlockId)> {
     if f.blocks[then as usize].has_phi() || f.blocks[els as usize].has_phi() {
         return None;
     }
+    // ROUND INLINE -- THE LOADED VALUE MAY NOT BE USED ANYWHERE ELSE.
+    //
+    // This pass makes every predecessor jump PAST this block into its two
+    // arms. When that succeeds for all of them the block becomes
+    // unreachable, and with it the `load` that defines `d`. That is fine as
+    // long as `d` is only the branch condition of this very block -- which
+    // is what the shape looks like when `mem2reg` built it.
+    //
+    // It is NOT fine when something else still names `d`. After `inline.rs`
+    // embeds a callee with SEVERAL `ret`s, the return value travels through
+    // a slot and arrives as exactly such a `load` in the continuation block
+    // -- and the caller then uses that value again further on, typically in
+    // a phi. Threading past the continuation leaves the phi naming a value
+    // whose defining instruction is unreachable; the register allocator
+    // reads whatever the register happens to hold.
+    //
+    // FOUND BY: `tests/1133_js_class_private.fi` assertion 4, the private
+    // brand check `#p in o`. `B.has({})` answered `true` instead of `false`
+    // because `val__obj_has_own` -- one line, `return gcmap_has(...)`, but
+    // FOUR blocks after `gcmap_has` is embedded into it -- was inlined twice
+    // into `interp__eval_binary`, once guarded by the result of the other.
+    // Minimal reproduction: `tests/1136_inline_multiret_thread.fi`.
+    //
+    // The bug is OLDER than this round: the same program miscompiles on the
+    // base commit as soon as the inliner reaches that call site. Raising the
+    // inline budget only made it reachable in the JS engine.
+    let mut uses = Vec::new();
+    for ob in &f.blocks {
+        for oi in &ob.insts {
+            if ob.id == b.id && std::ptr::eq(oi, i) {
+                continue;
+            }
+            uses.clear();
+            oi.op.uses(&mut uses);
+            if uses.contains(&d) {
+                return None;
+            }
+        }
+        if ob.id != b.id {
+            match &ob.term {
+                Term::Ret(Some(v)) | Term::BrCond { cond: v, .. } | Term::Switch { val: v, .. } => {
+                    if *v == d {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     Some((addr, then, els))
 }
 
