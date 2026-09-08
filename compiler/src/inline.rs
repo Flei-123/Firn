@@ -48,7 +48,17 @@ const MAX_CALLEE_BLOCKS: usize = 8;
 const MAX_CALLER_INSTS: usize = 24000;
 /// ROUND INLINE: overridable for measuring. `FIRNC_MAX_INLINES` is read once
 /// per pass; unset it keeps the compiled-in default.
-const MAX_INLINES: usize = 2000;
+/// ROUND PHI: **0 -- the count budget is switched off by default.**
+///
+/// Round INLINE left this at 2,000 and measured, from two directions, that
+/// the number is the wrong instrument. Round PHI measured the same thing a
+/// third way, with callgrind instead of the wall clock, and the count is now
+/// gone from the default. See `MAX_ALWAYS_INSTS` for what decides instead.
+///
+/// It is kept as a knob (`FIRNC_MAX_INLINES`) because it is what round
+/// INLINE's numbers were taken with, and a reference side that cannot be
+/// rebuilt is not a reference.
+const MAX_INLINES: usize = 0;
 
 /// ROUND INLINE -- a body of at most this many instructions is embedded even
 /// after `MAX_INLINES` is exhausted.
