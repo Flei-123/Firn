@@ -86,6 +86,65 @@ const MAX_INLINES: usize = 2000;
 /// the opcode chain out of the cache.
 const MAX_ALWAYS_INSTS: usize = 8;
 
+/// ROUND PHI -- **the bound that replaces the count budget: how much may ONE
+/// caller grow.**
+///
+/// WHY THE COUNT BUDGET IS THE WRONG INSTRUMENT. `MAX_INLINES` is a bound on
+/// the number of embeddings *in the whole module*, so it is spent in the
+/// order the functions happen to stand in. Round INLINE measured what that
+/// does from both ends:
+///
+///   * `lib/js/run_main.fi` -- the budget is used up long before the
+///     collector, so `__gc_ld64` (ONE instruction, 33 M calls) stayed a real
+///     call and was 21 % of the running engine. Raising the cap is NOT
+///     monotonic: 5,000 and 20,000 are SLOWER than 2,000 (+6.1 %, +10.1 %),
+///     because a half spent budget grows the code without ever reaching the
+///     hot accessors.
+///   * `/root/osum-schleuse/kernel/app/wasm.fi` -- the opposite end. The
+///     interpreter is one long if/else chain over the opcode; 500 embeddings
+///     of up to forty instructions already cost **+35 %** and 2,000 cost
+///     **+46 %**, because the chain is pushed out of the I-cache. That is
+///     why round SCHLEUSE ships `--no-pass=inline`.
+///
+/// Both are the same mistake: a *count* cannot tell a one instruction
+/// accessor from a forty instruction body, and a *module wide* count cannot
+/// tell the hot function from the cold one it happens to scan first.
+///
+/// WHAT THIS BOUND SAYS INSTEAD. Every caller gets its own allowance,
+/// measured in the thing that actually costs -- instructions:
+///
+///   * a body of at most `MAX_ALWAYS_INSTS` instructions is ALWAYS embedded
+///     (`__gc_ld64`, `__gc_st64`, `__gc_block_of`). These are the ones that
+///     pay, and they pay everywhere, so no budget may stand in their way.
+///   * anything larger may be embedded only while the caller has not yet
+///     grown by more than `GROW_PERCENT` % of its ORIGINAL instruction count,
+///     and never beyond `GROW_MIN_INSTS` instructions of absolute slack (so
+///     that small functions get a fair allowance too).
+///
+/// The allowance is computed from the size the caller had when the pass
+/// STARTED, not from its current size -- otherwise it compounds: every
+/// embedding raises the bound that permits the next one, which is how a
+/// percentage bound turns back into no bound at all.
+const GROW_PERCENT: usize = 30;
+/// Absolute slack, so a 10 instruction function may still take one 12
+/// instruction body. Without it `GROW_PERCENT` alone would lock out exactly
+/// the small hot helpers a small hot caller is made of.
+const GROW_MIN_INSTS: usize = 24;
+
+fn grow_percent() -> usize {
+    match std::env::var("FIRNC_GROW_PERCENT") {
+        Ok(v) => v.trim().parse().unwrap_or(GROW_PERCENT),
+        Err(_) => GROW_PERCENT,
+    }
+}
+
+fn grow_min_insts() -> usize {
+    match std::env::var("FIRNC_GROW_MIN") {
+        Ok(v) => v.trim().parse().unwrap_or(GROW_MIN_INSTS),
+        Err(_) => GROW_MIN_INSTS,
+    }
+}
+
 fn max_inlines() -> usize {
     match std::env::var("FIRNC_MAX_INLINES") {
         Ok(v) => v.trim().parse().unwrap_or(MAX_INLINES),
@@ -575,16 +634,52 @@ pub fn inline_module(m: &mut Module) -> usize {
     let idx = NameIndex::new(m);
     let mut reach = Reach::new(m, &idx);
 
+    // ROUND PHI -- the per caller allowance, computed from the size the
+    // caller has BEFORE the pass touches it. Reading it here, once, is what
+    // keeps a percentage bound from compounding: if the allowance were
+    // recomputed from the current size, every embedding would raise the
+    // bound that permits the next one.
+    let gp = grow_percent();
+    let gmin = grow_min_insts();
+    let start_insts: Vec<usize> = m.funcs.iter().map(|f| f.inst_count()).collect();
+
     for ci in 0..m.funcs.len() {
         // Where the previous site sat: the scan resumes here instead of
         // walking the (now longer) body from the start again.
         let mut bi = 0usize;
         let mut ii = 0usize;
+        // How many instructions this caller may still take on beyond the
+        // always-embed size. `usize::MAX` when the growth bound is switched
+        // off (gp == 0 and gmin == 0), which restores the pure count budget.
+        // `FIRNC_GROW_PERCENT=0 FIRNC_GROW_MIN=0` must be a true no-op --
+        // the pure count budget of round INLINE, byte for byte -- so that
+        // the A/B comparison has an honest reference side. `allow = 0` would
+        // instead be the harshest possible bound, which is the opposite.
+        let allow = if gp == 0 && gmin == 0 {
+            usize::MAX
+        } else {
+            (start_insts[ci].saturating_mul(gp) / 100).max(gmin)
+        };
+        let mut grown = 0usize;
         loop {
-            // Below the count budget everything the heuristic allows; above
-            // it only bodies at most `always` instructions long. With
-            // `always == 0` that is the old behaviour exactly: the pass stops.
-            let small_only = if n >= cap { Some(always) } else { None };
+            // ROUND PHI -- TWO bounds, and the order between them is the
+            // whole design:
+            //
+            //  * a body of at most `always` instructions is embedded
+            //    regardless of any budget. That is the rule that gets
+            //    `__gc_ld64` into the collector's callers and into the
+            //    interpreter's opcode chain, and round INLINE measured it as
+            //    the one that pays (-39 % on the JS engine, and it costs the
+            //    WASM interpreter nothing).
+            //  * a LARGER body is embedded only while this caller has not
+            //    used up its own allowance. That is what the module wide
+            //    count budget was trying and failing to do.
+            //
+            // The count budget stays as an outer limit so that a pathological
+            // module cannot run away, but at the default it is no longer what
+            // decides: the per caller bound bites first.
+            let over_count = n >= cap;
+            let small_only = if over_count || grown >= allow { Some(always) } else { None };
             if let Some(0) = small_only {
                 break;
             }
@@ -599,7 +694,16 @@ pub fn inline_module(m: &mut Module) -> usize {
                             m.funcs[gi].blocks.len()
                         );
                     }
+                    // Count the growth BEFORE the body is copied in: after
+                    // `inline_one` the callee's instructions are part of the
+                    // caller and `inst_count()` of the callee is unchanged,
+                    // but reading it here is the honest number and needs no
+                    // second pass over the caller.
+                    let added = m.funcs[gi].inst_count();
                     inline_one(m, ci, fbi, fii, gi);
+                    if added > always {
+                        grown += added;
+                    }
                     n += 1;
                     // The call at (fbi, fii) is gone: the block was split
                     // there and everything after it moved into the new
