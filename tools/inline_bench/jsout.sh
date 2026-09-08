@@ -3,7 +3,7 @@
 # on this branch, over every .js in tools/js/cases and tools/js/progs.
 # Each file becomes one job in the run_main.fi job format.
 set -uo pipefail
-cd /root/firn-inline
+cd "${JSOUTROOT:-/root/firn-phi}"
 A="${1:?engine A}"; B="${2:?engine B}"
 W=.work/jsout.$$; mkdir -p "$W"; trap 'rm -rf "$W"' EXIT
 same=0; diff=0
