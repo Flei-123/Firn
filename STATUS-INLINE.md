@@ -249,11 +249,25 @@ so ≤16, ≤24 and ≤40 do not reach it and change the microbench by less than
 
 ## `./test.sh` and `self_compare.sh`
 
-The full suite takes hours on this machine under the load of other rounds.
-`tools/self_compare.sh` was started on the finished branch; `.firnc1` — the
-compiler written in Firn, 1,912,952 bytes — **built successfully** with the new
-`firnc`, which is itself a substantial gate (the compiler compiles the compiler).
-The stage comparison was still running when the round ended; log
-`.work/self.log`. The 1340-run four level gate above was used as the
-correctness gate instead, as in round SAMMLER: it is the same programs and the
-same four build levels as `test.sh` step 3.
+The full suite takes hours on this machine, which carried a load average of
+**8** from other rounds throughout. `tools/self_compare.sh` was started on the
+finished branch and was **still running when the round ended** (~35 minutes;
+it prints only its final tally, so the log is empty until then). Log
+`.work/self.log`. That is the same position round SAMMLER was in, and it is
+reported as unfinished rather than as a pass.
+
+What *was* established about self compilation:
+
+* **`.firnc1` — the compiler written in Firn, 1,912,952 bytes — builds
+  successfully with the new `firnc`.** The compiler compiling the compiler is
+  a substantial gate on its own, and it is the step that has to work before
+  `self_compare.sh` can compare anything.
+* **`tests/303_wtf8_roundtrip.fi` is right at all four build levels and
+  through `firnc1` as well** (`65536 2048 2049 0 1114112 0`). That is the
+  program round 92 found the last inliner/phi bug with — it printed
+  `0 0 0 0 2048 1112064` then, and only at the two levels that inline. It is
+  the most directly relevant single case this round could check.
+
+The 1340-run four level gate above was used as the correctness gate instead,
+as in round SAMMLER: it is the same programs and the same four build levels as
+`test.sh` step 3.
