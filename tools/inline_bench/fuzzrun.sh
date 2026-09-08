@@ -24,7 +24,7 @@ one() {
   if ! timeout 300 "$FIRNC" $FLAGS "$f" -o "$b" >/dev/null 2>&1; then
     echo "BUILDFAIL $f"; rm -f "$b"; return 0
   fi
-  out=$(timeout 60 "$b" 2>/dev/null); rc=$?
+  out=$(timeout 60 "$b" < /dev/null 2>/dev/null); rc=$?
   rm -f "$b"
   if [ "$rc" = 0 ]; then echo "OK"; else echo "WRONG $f: exit $rc (want 0)"; fi
 }

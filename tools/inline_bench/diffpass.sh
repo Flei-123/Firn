@@ -41,8 +41,8 @@ one() {
   if ! (cd "$ROOT" && timeout 300 "$FIRNC" $B_FLAGS "$f" -o "$bb") >/dev/null 2>&1; then
     echo "BUILDDIFF $f (B fails, A builds)"; rm -f "$ba" "$bb"; return 0
   fi
-  oa=$(cd "$ROOT" && timeout 120 "$ba" 2>/dev/null); ra=$?
-  ob=$(cd "$ROOT" && timeout 120 "$bb" 2>/dev/null); rb=$?
+  oa=$(cd "$ROOT" && timeout 120 "$ba" < /dev/null 2>/dev/null); ra=$?
+  ob=$(cd "$ROOT" && timeout 120 "$bb" < /dev/null 2>/dev/null); rb=$?
   rm -f "$ba" "$bb"
   if [ "$ra" != "$rb" ]; then
     echo "DIFF-EXIT $f: A=$ra B=$rb"
