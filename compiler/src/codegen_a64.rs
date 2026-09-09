@@ -2076,7 +2076,17 @@ mod tests {
         let s = build(&simple_module());
         assert!(s.contains("_start:"), "{}", s);
         assert!(s.contains("stp x29, x30, [sp, #-16]!"), "{}", s);
-        assert!(s.contains("movz x9, #42"), "{}", s);
+        // ROUND REGALLOC-A64: the constant is built into whatever register
+        // the allocation chose for it -- for a value that is returned
+        // straight away that is `x0`, the result register, so the `mov` the
+        // round 80 path needed at the end is gone as well. What this test
+        // is really about is that the constant IS built with `movz` and not
+        // fetched from anywhere, so it asks exactly that.
+        assert!(
+            s.lines().any(|l| l.trim().starts_with("movz x") && l.contains("#42")),
+            "{}",
+            s
+        );
         // exit(2) is 93 here and 60 on x86 — that is the whole point of
         // syscalls.rs.
         assert!(s.contains("mov x8, #93"), "{}", s);
