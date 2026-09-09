@@ -24,6 +24,9 @@
 #   8b. The atomic primitive `__atomic_add` really produces a
 #      `lock xadd` -- in three build stages and in both compilers, with a
 #      counter-check (tools/atomic/run.sh, round 47).
+#   8b2. Build time environment variables (`__env_or`/`__env_has`): default
+#      and set, the program without an environment, the allow list, the
+#      manifest -- in both compilers (tools/env/run.sh, ROUND FIRN-ENV).
 #   8c. Interface bounds dispatch STATICALLY: no indirect call,
 #      no method table -- counter-check with `dyn I`, both compilers
 #      (tools/bounds/run.sh, round 50).
@@ -441,6 +444,19 @@ if [ "$ATRC" -eq 0 ]; then
 else
     bad "tools/atomic/run.sh failed (see .test-work/atomic.log)"
     tail -20 "$WORK/atomic.log" | sed 's/^/   /'
+fi
+
+echo "== 8b2. build time environment variables (tools/env/run.sh, ROUND FIRN-ENV) =="
+# `__env_or`/`__env_has` in both compilers: default and set, the finished
+# program without an environment (`env -i`), the allow list, the manifest,
+# and the shape `kernel/marke.fi` in OrientOS would use.
+bash tools/env/run.sh > "$WORK/env.log" 2>&1 && EVRC=0 || EVRC=$?
+if [ "$EVRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/env.log" | sed 's/^/   /'
+else
+    bad "tools/env/run.sh failed (see .test-work/env.log)"
+    tail -30 "$WORK/env.log" | sed 's/^/   /'
 fi
 
 echo "== 8c. bounds: static dispatch without an indirect call (ROUND 50) =="

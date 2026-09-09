@@ -1,0 +1,139 @@
+// expect_out: same 1 empty 1 rect 1 grow 1 spill 1
+// ROUND FIRN-LUECKEN -- the rasteriser clears only what it wrote.
+//
+// `raster_begin` used to zero the WHOLE window: 2.5 million cells for a
+// picture of 1540 by 1665, per path. The map in `demos/choropleth`
+// answered that by opening a window of its own per polygon, computed from
+// the bounding box -- library work, done in the application.
+//
+// Now the rasteriser carries the rectangle it really wrote and puts back
+// only that. The promise it has to keep is the one this test checks: a
+// window opened a second time behaves as if it had been zeroed
+// completely. If a single cell of the previous path survived, the second
+// picture would carry a ghost.
+import std.io
+import font.raster
+import html.mem
+
+const W: usize = 200
+const H: usize = 200
+
+fn sum_all(r: *mut raster.Raster) -> i64 {
+    var s: f64 = 0.0
+    var y: usize = 0
+    while y < H {
+        var x: usize = 0
+        while x < W {
+            s = s + raster.raster_cov(r, x, y)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return (s * 100.0 + 0.5) as i64
+}
+
+fn box(r: *mut raster.Raster, x0: f64, y0: f64, x1: f64, y1: f64) {
+    raster.raster_line(r, x0, y0, x1, y0)
+    raster.raster_line(r, x1, y0, x1, y1)
+    raster.raster_line(r, x1, y1, x0, y1)
+    raster.raster_line(r, x0, y1, x0, y0)
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 1
+    }
+    var r: raster.Raster = raster.raster_new()
+    let need: usize = raster.raster_bytes_needed(W, H)
+    let m: *mut u8 = mem.heap_alloc(need)
+    if m as usize == 0 {
+        return 2
+    }
+    // The memory is NOT zero -- whatever the allocator left there is what
+    // the first `raster_begin` has to deal with.
+    var i: usize = 0
+    while i < need {
+        *(((m as u64) + i as u64) as *mut u8) = 255 as u8
+        i = i + 8
+    }
+    raster.raster_attach(&r, m, need)
+
+    // 1. a big box, then a small one in a fresh window. The small one has
+    //    to weigh exactly what it weighs on its own.
+    raster.raster_begin(&r, 0.0, 0.0, W, H)
+    box(&r, 10.0, 10.0, 190.0, 190.0)
+    raster.raster_finish(&r)
+    let big: i64 = sum_all(&r)
+
+    raster.raster_begin(&r, 0.0, 0.0, W, H)
+    box(&r, 20.0, 20.0, 30.0, 30.0)
+    raster.raster_finish(&r)
+    let small_after_big: i64 = sum_all(&r)
+
+    raster.raster_begin(&r, 0.0, 0.0, W, H)
+    box(&r, 20.0, 20.0, 30.0, 30.0)
+    raster.raster_finish(&r)
+    let small_alone: i64 = sum_all(&r)
+
+    var same: i64 = 0
+    if small_after_big == small_alone && small_alone == 10000 && big > 0 {
+        same = 1
+    }
+
+    // 2. a path that lies entirely LEFT of the window writes cells (the
+    //    rasteriser moves an edge that leaves to the left onto column
+    //    zero) but leaves no coverage. The used rectangle has to say so.
+    raster.raster_begin(&r, 0.0, 0.0, W, H)
+    box(&r, 0.0 - 90.0, 30.0, 0.0 - 50.0, 70.0)
+    raster.raster_finish(&r)
+    var empty: i64 = 0
+    if raster.raster_used_y1(&r) == raster.raster_used_y0(&r) &&
+    sum_all(&r) == 0 {
+        empty = 1
+    }
+
+    // 3. the rectangle really is the ink and not the paper
+    raster.raster_begin(&r, 0.0, 0.0, W, H)
+    box(&r, 40.0, 50.0, 60.0, 90.0)
+    raster.raster_finish(&r)
+    var rect: i64 = 0
+    if raster.raster_used_x0(&r) == 40 && raster.raster_used_x1(&r) == 60 &&
+    raster.raster_used_y0(&r) == 50 && raster.raster_used_y1(&r) == 90 {
+        rect = 1
+    }
+
+    // 4. a SMALL window first, then a bigger one -- the piece that has
+    //    never been touched still holds the 255s from above and has to be
+    //    cleared before it is read.
+    raster.raster_begin(&r, 0.0, 0.0, 20, 20)
+    box(&r, 5.0, 5.0, 15.0, 15.0)
+    raster.raster_finish(&r)
+    raster.raster_begin(&r, 0.0, 0.0, W, H)
+    box(&r, 20.0, 20.0, 30.0, 30.0)
+    raster.raster_finish(&r)
+    var grow: i64 = 0
+    if sum_all(&r) == 10000 {
+        grow = 1
+    }
+
+    // 5. THE OVERFLOW COLUMNS. A cell at column `w` may still be written
+    //    (an edge that leaves to the right), and `w + 1` is where its
+    //    closing difference is thrown away. Neither is ever READ -- and
+    //    that is the trap: a leftover there is invisible in this window
+    //    and becomes an ordinary cell of the next one, which has a
+    //    different stride. So a narrow window whose path runs off the
+    //    right edge, then a wide one that has to be clean.
+    raster.raster_begin(&r, 0.0, 0.0, 10, 10)
+    box(&r, 5.0, 1.0, 40.0, 9.0)
+    raster.raster_finish(&r)
+    raster.raster_begin(&r, 0.0, 0.0, W, H)
+    box(&r, 20.0, 20.0, 30.0, 30.0)
+    raster.raster_finish(&r)
+    var spill: i64 = 0
+    if sum_all(&r) == 10000 {
+        spill = 1
+    }
+
+    io.fmt_print_line(f"same {same} empty {empty} rect {rect} grow {grow} spill {spill}")
+    return 0
+}

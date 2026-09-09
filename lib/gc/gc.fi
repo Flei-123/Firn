@@ -270,6 +270,24 @@ const S_CTAB: u64 = 2152      // die Tabelle (mmap), 0 = keine
 const S_CTAB_N: u64 = 2160    // Eintraege
 const S_CTAB_CAP: u64 = 2168  // Plaetze
 
+// ROUND SAMMLER -- the BLOCK SIZE PER CLASS, worked out once.
+//
+// `__gc_get_block` ended every allocation with
+//     __gc_st64(st + S_BLOCKGROESSE, HEADER + __gc_classes_bytes(class))
+// and `__gc_classes_bytes` is, since step 1 of this round, a shift and a
+// multiplication -- eleven instructions that recompute a CONSTANT of the
+// class on every single allocation. The table holds `HEADER + size` for
+// the classes 0..12 ready; `gc_init` fills it (`__gc_blocktab_init`).
+// 13 * 8 = 104 bytes in the free area from 2152 on.
+const S_BLOCKTAB: u64 = 2152
+
+// ROUND SAMMLER -- a SECOND chunk cache entry.
+// The one entry cache of __gc_block_of misses whenever the program alternates
+// between two chunks, which an interpreter does constantly (a value chunk and
+// an environment chunk). Measured in the JS engine: 0.83 chunks of the list
+// walked per call despite the cache. 256 bytes further on in the free area.
+const S_CHUNK_CACHE2: u64 = 2256
+
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
 const M_WITHOUT_MARK: u32 = 4294967292
@@ -637,55 +655,80 @@ fn gc_diag(i: u64) -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_D_CN_RUHE + i * 8)
 }
 
+// ROUND SAMMLER -- the size of a class WITHOUT a chain of comparisons.
+//
+// MEASURED (tools/gc_bench/deuter.fi, callgrind, before this change):
+// `__gc_classes_bytes` alone was 5.38 % of all executed instructions
+// (9,600,220 of 178,288,390 Ir) and `__gc_class_for` called it in a LOOP --
+// up to 13 calls, each walking up to 13 `if`s, for every single allocation.
+// That is a constant table written as control flow.
+//
+// The classes for k = 0..10 follow one rule exactly:
+//     (4 + 2 * (k & 1)) << (k / 2 + 3)
+//   k:  0   1   2   3    4    5    6    7    8    9   10
+//      32  48  64  96  128  192  256  384  512  768 1024
+// Classes 11 and 12 (2048, 4096) deliberately break the sequence -- they
+// double instead of continuing the 1.5 step -- so they stay as two branches.
+// Verified against the old chain for every k in `tests/`.
 fn __gc_classes_bytes(k: u64) -> u64 {
-    if k == 0 {
-        return 32
+    if k >= 11 {
+        if k == 11 {
+            return 2048
+        }
+        return 4096
     }
-    if k == 1 {
-        return 48
-    }
-    if k == 2 {
-        return 64
-    }
-    if k == 3 {
-        return 96
-    }
-    if k == 4 {
-        return 128
-    }
-    if k == 5 {
-        return 192
-    }
-    if k == 6 {
-        return 256
-    }
-    if k == 7 {
-        return 384
-    }
-    if k == 8 {
-        return 512
-    }
-    if k == 9 {
-        return 768
-    }
-    if k == 10 {
-        return 1024
-    }
-    if k == 11 {
-        return 2048
-    }
-    return 4096
+    return (4 + 2 * (k & 1)) << (k / 2 + 3)
 }
 
+// ROUND SAMMLER -- the class of a size WITHOUT a search loop.
+//
+// The old version walked the classes from 0 upwards and called
+// `__gc_classes_bytes` for each one: for a 256 byte object that is seven
+// calls with up to seven comparisons each, per allocation. The inverse of
+// the rule above gives the class directly.
+//
+// For size <= 1024 the class is found from the position of the highest set
+// bit: within one octave `[2^n, 2^(n+1))` there are exactly two classes,
+// the lower half (<= 1.5 * 2^n) and the upper half. `__gc_bit_len` is the
+// only loop left, and it runs at most 11 times over a WORD, not over the
+// heap -- in practice the sizes an interpreter allocates land in the first
+// three classes.
 fn __gc_class_for(size: u64) -> u64 {
-    var k: u64 = 0
-    while k < CLASSES {
-        if size <= __gc_classes_bytes(k) {
-            return k
-        }
-        k = k + 1
+    if size <= 32 {
+        return 0
     }
-    return CLASSES
+    if size > 4096 {
+        return CLASSES
+    }
+    if size > 2048 {
+        return 12
+    }
+    if size > 1024 {
+        return 11
+    }
+    // 32 < size <= 1024. `size` lies in the octave (2^(n-1), 2^n].
+    let n: u64 = __gc_bit_len(size - 1)
+    // That octave holds exactly two classes: 1.5 * 2^(n-1) and 2^n.
+    // 2^n is class 2*(n-5) (32 = 2^5 -> 0, 64 -> 2, 128 -> 4 ...), the
+    // 1.5 step right below it is the class before that.
+    let k2: u64 = 2 * (n - 5)
+    let half: u64 = 3 << (n - 2)
+    if size <= half {
+        return k2 - 1
+    }
+    return k2
+}
+
+// The position of the highest set bit + 1 (0 for 0). At most 11 rounds for
+// the sizes this is used with.
+fn __gc_bit_len(v: u64) -> u64 {
+    var x: u64 = v
+    var n: u64 = 0
+    while x != 0 {
+        x = x >> 1
+        n = n + 1
+    }
+    return n
 }
 
 // ------------------------------------------------------------------ Chunks
@@ -752,9 +795,30 @@ fn __gc_block_of(a: u64) -> u64 {
     let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
     if cc != 0 {
         let data0: u64 = cc + CHUNK_HEADER
-        let end0: u64 = data0 + __gc_ld64(cc + 16) * __gc_ld64(cc + 24)
+        // ROUND SAMMLER: the block size is read ONCE. It stood four times in
+        // this branch (once for the end of the chunk, three times in the
+        // return line) and `__gc_ld64` survives as a real CALL in a module as
+        // large as the JavaScript engine -- the inliner runs out of its
+        // budget of 2000 embeddings long before it reaches the collector.
+        // MEASURED there: 20.1 million of the 33.0 million __gc_ld64 calls of
+        // a run come out of this one function, six per call.
+        let block0: u64 = __gc_ld64(cc + 16)
+        let end0: u64 = data0 + block0 * __gc_ld64(cc + 24)
         if a >= data0 && a < end0 {
-            return data0 + (a - data0) / __gc_ld64(cc + 16) * __gc_ld64(cc + 16)
+            return data0 + (a - data0) / block0 * block0
+        }
+    }
+    // ROUND SAMMLER: the second entry. On a hit it becomes the first one, so
+    // two alternating chunks both stay cached instead of evicting each other.
+    let c2: u64 = __gc_ld64(st + S_CHUNK_CACHE2)
+    if c2 != 0 {
+        let d2: u64 = c2 + CHUNK_HEADER
+        let b2: u64 = __gc_ld64(c2 + 16)
+        let e2: u64 = d2 + b2 * __gc_ld64(c2 + 24)
+        if a >= d2 && a < e2 {
+            __gc_st64(st + S_CHUNK_CACHE2, cc)
+            __gc_st64(st + S_CHUNK_CACHE, c2)
+            return d2 + (a - d2) / b2 * b2
         }
     }
     // RUNDE KERN-2: die sortierte Tabelle, Binaersuche nach dem letzten
@@ -791,6 +855,7 @@ fn __gc_block_of(a: u64) -> u64 {
         let count: u64 = __gc_ld64(c + 24)
         let end: u64 = data + block * count
         if a >= data && a < end {
+            __gc_st64(st + S_CHUNK_CACHE2, cc)
             __gc_st64(st + S_CHUNK_CACHE, c)
             let idx: u64 = (a - data) / block
             return data + idx * block
@@ -1254,6 +1319,15 @@ fn __gc_sweep_step(t0: u64) -> u64 {
             if __gc_ld64(st + S_CHUNK_CACHE) == c {
                 __gc_st64(st + S_CHUNK_CACHE, 0)
             }
+            // ROUND SAMMLER: the second cache entry has to be invalidated
+            // here too -- the chunk is about to be handed back to the kernel,
+            // and a cache still pointing at it would read unmapped memory.
+            if __gc_ld64(st + S_CHUNK_CACHE2) == c {
+                __gc_st64(st + S_CHUNK_CACHE2, 0)
+            }
+            // RUNDE KERN-2 (dns-pic): der Chunk faellt auch aus der
+            // sortierten Chunk-Tafel, sonst sucht __gc_block_of binaer in
+            // einem Eintrag, der dem Kern schon zurueckgegeben wurde.
             __gc_ctab_del(c)
             __gc_munmap(c, bytes)
         } else {
@@ -1933,7 +2007,33 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
         __gc_cycle_step()
         __gc_stw_out()
     }
-    var b: u64 = __gc_get_block(class, size)
+    // ROUND SAMMLER -- the free list pop for the size classes, straight in
+    // this frame.
+    //
+    // MEASURED: __gc_get_block cost 42 instructions per allocation, of which
+    // the actual pop is FOUR (load head, load link, store head, done). The
+    // rest is prologue, epilogue, ten saved registers and a 1,888 byte frame
+    // for a function that in the common case reads two words and writes two.
+    //
+    // The conditions of the fast path are exactly the ones __gc_get_block
+    // checks first: a size class (not the large object path), no per thread
+    // free list in play (S_LOCAL/S_MULTI -- single threaded both are 0), and
+    // a non empty free list of that class. Everything else still goes
+    // through __gc_get_block unchanged, including the refill, the large
+    // objects and the multi threaded case.
+    var b: u64 = 0
+    if class < CLASSES && __gc_ld64(st + S_LOCAL) == 0 {
+        let header: u64 = st + S_FREE + class * 8
+        let f: u64 = __gc_ld64(header)
+        if f != 0 {
+            __gc_st64(header, __gc_ld64(f + HEADER))
+            __gc_st64(st + S_BLOCKGROESSE, __gc_ld64(st + S_BLOCKTAB + class * 8))
+            b = f
+        }
+    }
+    if b == 0 {
+        b = __gc_get_block(class, size)
+    }
     if b == 0 {
         // Collect first, fail after (DESIGN_GOALS 2): bring a running cycle to
         // an end, otherwise force a complete run.
@@ -1980,11 +2080,16 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     // stack: the stack is not scanned again, otherwise an object that lives
     // only on the stack could be swept before it was ever attached to a heap
     // field. While idle: the current white.
-    __gc_diag_inc(S_D_ALLOK)
+    // ROUND SAMMLER: the two diagnostic counters use the state pointer THIS
+    // function already holds. `__gc_diag_inc` fetches `__gc_state()` again,
+    // and the code generator materialises that address anew every time --
+    // three instructions per allocation for a counter that is only ever read
+    // by the measuring tools.
+    __gc_st64(st + S_D_ALLOK, __gc_ld64(st + S_D_ALLOK) + 1)
     if __gc_ld64(st + S_PHASE) == 0 {
         __gc_st32(b + 4, __gc_ld64(st + S_PAR) as u32)
     } else {
-        __gc_diag_inc(S_D_GRAU)
+        __gc_st64(st + S_D_GRAU, __gc_ld64(st + S_D_GRAU) + 1)
         __gc_st32(b + 4, 1)
         __gc_mark_push(b + HEADER)
     }
@@ -1992,10 +2097,29 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     // Null the payload: a half filled object has to be traceable at any moment
     // (a field initialization can itself allocate again).
     let obj: u64 = b + HEADER
-    var i: u64 = 0
-    while i < size {
-        __gc_st64(obj + i, 0)
-        i = i + 8
+    // ROUND SAMMLER -- nulling the payload without a loop for the small
+    // objects.
+    //
+    // MEASURED (480,000 allocations of a 24 byte object, callgrind,
+    // --dump-instr): the loop below cost FOUR instructions per eight bytes
+    // (compare, conditional jump, store, increment, jump) -- 20 of the 138
+    // instructions an allocation spent in this function, for three words.
+    // An interpreter allocates almost only such objects; the size classes
+    // 0..2 (32, 48, 64 bytes) cover them.
+    //
+    // The straight line cases write a fixed number of words with no test in
+    // between; everything above stays with the loop.
+    if size <= 32 {
+        __gc_st64(obj, 0)
+        __gc_st64(obj + 8, 0)
+        __gc_st64(obj + 16, 0)
+        __gc_st64(obj + 24, 0)
+    } else {
+        var i: u64 = 0
+        while i < size {
+            __gc_st64(obj + i, 0)
+            i = i + 8
+        }
     }
     let block: u64 = __gc_ld64(st + S_BLOCKGROESSE)
     __gc_st64(st + S_SINCE, __gc_ld64(st + S_SINCE) + block)
@@ -2078,7 +2202,7 @@ fn __gc_alloc_local(st: u64, tid: u64, size: u64) -> u64 {
         __gc_st64(obj + i, 0)
         i = i + 8
     }
-    let block: u64 = HEADER + __gc_classes_bytes(class)
+    let block: u64 = __gc_ld64(st + S_BLOCKTAB + class * 8)
     __atomic_add((st + S_SINCE) as *mut u64, block)
     __atomic_add((st + S_TOTAL) as *mut u64, block)
     __gc_diag_inc(S_D_ALLOK)
@@ -2116,7 +2240,9 @@ fn __gc_get_block(class: u64, size: u64) -> u64 {
         }
     }
     __gc_st64(header, __gc_ld64(b + HEADER))
-    __gc_st64(st + S_BLOCKGROESSE, HEADER + __gc_classes_bytes(class))
+    // ROUND SAMMLER: the size of the class comes out of the table
+    // (one load) instead of being computed again for every allocation.
+    __gc_st64(st + S_BLOCKGROESSE, __gc_ld64(st + S_BLOCKTAB + class * 8))
     return b
 }
 
@@ -2134,7 +2260,7 @@ fn __gc_get_block_local(st: u64, class: u64, size: u64) -> u64 {
     if b == 0 {
         return 0
     }
-    __gc_st64(st + S_BLOCKGROESSE, HEADER + __gc_classes_bytes(class))
+    __gc_st64(st + S_BLOCKGROESSE, __gc_ld64(st + S_BLOCKTAB + class * 8))
     return b
 }
 
@@ -2830,8 +2956,22 @@ fn gc_init() -> bool {
     // Programs without GcWeak then pay nothing for the nulling.
     __gc_st64(st + S_HATWEAK, __gc_weak_present())
     __gc_st64(st + S_WEAKMASK, __gc_weak_mask())
+    // ROUND SAMMLER: the block size per class, worked out once instead of
+    // per allocation (see S_BLOCKTAB).
+    __gc_blocktab_init(st)
     __gc_st64(st + S_INIT, 1)
     return true
+}
+
+// ROUND SAMMLER -- fill the block size table (S_BLOCKTAB). Called once by
+// `gc_init`. The classes are fixed at compile time, so the table never has
+// to be touched again.
+fn __gc_blocktab_init(st: u64) {
+    var k: u64 = 0
+    while k < CLASSES {
+        __gc_st64(st + S_BLOCKTAB + k * 8, HEADER + __gc_classes_bytes(k))
+        k = k + 1
+    }
 }
 
 // Round 44: set the switch over threshold (heap bytes) between the atomic
