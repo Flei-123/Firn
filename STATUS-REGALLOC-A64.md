@@ -234,7 +234,7 @@ hand-written panic trampoline, which never returns.
 | `tools/aarch64/run.sh` (dev-fast) | **307 SAME, 0 DIFFERENT** — identical to the baseline before this round |
 | `tools/aarch64/run.sh --no-opt` | **307 SAME, 0 DIFFERENT** |
 | `tests/` exit codes on aarch64 under qemu | **265 correct, 0 wrong** |
-| `cargo test --release` | **267 passed, 0 failed** |
+| `cargo test --release` | **269 passed, 0 failed** (two of them new: the aarch64 clobber answer, and SPEC 3.5.3 as an assertion) |
 | `tools/checked/run.sh` | **150 checks passed, 0 failed** (compares panic messages octet for octet) |
 | `tools/phi/run.sh` | **ok** — and its point 4 now reads *aarch64 loads/stores in `sum_to`: 25 without mem2reg, **0** with it* |
 | x86 assembly vs. the base compiler | **316 files, 0 differences** |
