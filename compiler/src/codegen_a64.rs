@@ -1476,10 +1476,43 @@ fn emit_inst(
         // them; the check itself computes at the type's own width.
         Op::CheckedBin { op, a, b, msg } => {
             let d = i.dst.ok_or("internal error: checked binary operation without target")?;
-            load_ext(e, fr, A, *a, ty, 64);
-            load_ext(e, fr, B, *b, ty, 64);
-            crate::panic_rt_a64::emit_checked_bin(e, *op, ty, msg, site);
-            store_dst_ty(e, fr, d, A, ty);
+            // ROUND REGALLOC-A64: the left operand straight out of its
+            // register when it has one, the right one as a 12-bit immediate
+            // when the allocator proved it is a small constant. `adds`/`subs`
+            // take exactly the same immediate the plain `add`/`sub` do.
+            // The three address form below is the 32/64-bit `Add`/`Sub` arm
+            // of `emit_checked_bin_at` and ONLY that one. The multiplications
+            // and the narrow widths compute in x9/x10 and read them by name,
+            // so for those the operands go where they have always gone.
+            let wide = ty.bits() >= 32 && matches!(op, BinOp::Add | BinOp::Sub);
+            let la = if wide {
+                operand_ext(e, fr, *a, ty, A)
+            } else {
+                load_ext(e, fr, A, *a, ty, 64);
+                A.to_string()
+            };
+            let rb = if wide { imm12(fr, *b) } else { None };
+            if rb.is_none() {
+                load_ext(e, fr, B, *b, ty, 64);
+            }
+            // ROUND REGALLOC-A64: the cold arm re-loads the two originals
+            // into x11/x13 itself (see `emit_checked_bin`), with exactly the
+            // loading code this site would have used -- so the hot path does
+            // not carry two `mov`s for a message that never prints.
+            let (av, bv, fr2) = (*a, *b, &*fr);
+            let restore = move |em: &mut Emitter| {
+                load_ext(em, fr2, "x11", av, ty, 64);
+                load_ext(em, fr2, "x13", bv, ty, 64);
+            };
+            let rd = if wide { dest(fr, d, ty, A) } else { A };
+            crate::panic_rt_a64::emit_checked_bin_at(
+                e, *op, ty, msg, site, &restore, &la, rb.as_deref(), rd,
+            );
+            if rd == A {
+                store_dst_ty(e, fr, d, A, ty);
+            } else {
+                canonicalise(e, rd, ty);
+            }
         }
         Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
             let d = i.dst.ok_or("internal error: checked division without target")?;
@@ -1670,6 +1703,82 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
     Ok(())
 }
 
+/// ROUND REGALLOC-A64 -- AN OPERAND WITHOUT A DETOUR.
+///
+/// A64 is a three address machine: `add x19, x20, x21` names its target and
+/// both sources. Round 80 could not use that, because every operand came out
+/// of a slot and had to be loaded into a scratch register first, so the
+/// shape was always
+///
+///     ldr x9, [sp, #N] / ldr x10, [sp, #M] / add x9, x9, x10 / str x9, [sp]
+///
+/// With the allocation of this round the operands are often ALREADY in a
+/// register. Feeding them through x9/x10 anyway costs two `mov`s per
+/// operation and one more to carry the result home -- 167 of the 400
+/// instructions of `misch_zeile` were plain register to register moves
+/// before this function existed.
+///
+/// So: if the value lives in a register whose full 64 bits are the value
+/// (`canonicalise` guarantees exactly that), that register IS the operand.
+/// Otherwise it is loaded into the scratch register `fallback` as before.
+///
+/// Only for widths where the type's own bits are the ones being computed on
+/// (32 and 64); the narrow widths keep the explicit widening of `load_ext`.
+fn operand(e: &mut Emitter, fr: &Frame, v: Val, ty: FTy, fallback: &'static str) -> String {
+    if ty.bits() >= 32 && !ty.is_float() && ty != FTy::V128 {
+        if let Some(r) = fr.reg_of(v) {
+            return r.to_string();
+        }
+    }
+    load_ext(e, fr, fallback, v, ty, if ty.bits() > 32 { 64 } else { 32 });
+    fallback.to_string()
+}
+
+/// ROUND REGALLOC-A64 -- the checked path's operand: a register that already
+/// holds the widened value, or the scratch register loaded the old way.
+fn operand_ext(e: &mut Emitter, fr: &Frame, v: Val, ty: FTy, fallback: &'static str) -> String {
+    if ty.bits() >= 32 && !ty.is_float() && ty != FTy::V128 {
+        if let Some(r) = fr.reg_of(v) {
+            return r.to_string();
+        }
+    }
+    load_ext(e, fr, fallback, v, ty, 64);
+    fallback.to_string()
+}
+
+/// ROUND REGALLOC-A64 -- IS THIS VALUE AN `add`/`sub` IMMEDIATE?
+///
+/// A64's arithmetic immediate is an unsigned 12-bit number, optionally
+/// shifted left by 12. x86 writes `add r9d, 1`; round 80 wrote
+/// `movz x10, #1` and then `adds w9, w9, w10`, because the constant lived in
+/// a slot like everything else. With the allocator's immediate set the
+/// number is known here, and the operation can carry it.
+///
+/// Returns the assembler text of the operand, or `None` when the value is
+/// not a constant that fits.
+fn imm12(fr: &Frame, v: Val) -> Option<String> {
+    let k = fr.imm_of(v)?;
+    if (0..=4095).contains(&k) {
+        return Some(format!("#{}", k));
+    }
+    if k > 0 && k % 4096 == 0 && k / 4096 <= 4095 {
+        return Some(format!("#{}, lsl #12", k / 4096));
+    }
+    None
+}
+
+/// The register an instruction may write its result straight into: the home
+/// of the target value, when it has one. Otherwise the scratch register,
+/// from which `store_dst_ty` carries it to the slot.
+fn dest(fr: &Frame, d: Val, ty: FTy, fallback: &'static str) -> &'static str {
+    if ty.bits() >= 32 && !ty.is_float() && ty != FTy::V128 {
+        if let Some(r) = fr.reg_of(d) {
+            return r;
+        }
+    }
+    fallback
+}
+
 fn emit_bin(
     e: &mut Emitter,
     fr: &Frame,
@@ -1710,8 +1819,6 @@ fn emit_bin(
             // For these the low order bits do not depend on the width, which
             // is why the computing happens at 32/64 bits and the result gets
             // cut to the type width when it is read again.
-            load_full(e, fr, A, a);
-            load_full(e, fr, B, b);
             let m = match op {
                 BinOp::Add => "add",
                 BinOp::Sub => "sub",
@@ -1720,14 +1827,27 @@ fn emit_bin(
                 BinOp::Xor => "eor",
                 _ => "mul",
             };
+            // ROUND REGALLOC-A64: three address form when the operands are
+            // already in registers -- see `operand`/`dest`.
+            let ra = operand(e, fr, a, ty, A);
+            let rd = dest(fr, d, ty, A);
+            // ROUND REGALLOC-A64: `add`/`sub` can carry a 12-bit immediate.
+            let rb = match (op, imm12(fr, b)) {
+                (BinOp::Add, Some(k)) | (BinOp::Sub, Some(k)) if bits >= 32 => k,
+                _ => rw(&operand(e, fr, b, ty, B), bits),
+            };
             e.line(&format!(
                 "{} {}, {}, {}",
                 m,
-                rw(A, bits),
-                rw(A, bits),
-                rw(B, bits)
+                rw(rd, bits),
+                rw(&ra, bits),
+                rb
             ));
-            store_dst_ty(e, fr, d, A, ty);
+            if rd == A {
+                store_dst_ty(e, fr, d, A, ty);
+            } else {
+                canonicalise(e, rd, ty);
+            }
         }
         BinOp::Div | BinOp::Rem => {
             // The operands are brought exactly to the computing width (the
