@@ -1126,9 +1126,22 @@ fn emit_inst(
                 return Ok(());
             }
             let bits = if oty.bits() > 32 { 64 } else { 32 };
-            load_ext(e, fr, A, *a, *oty, bits);
-            load_ext(e, fr, B, *b, *oty, bits);
-            e.line(&format!("cmp {}, {}", rw(A, bits), rw(B, bits)));
+            // ROUND REGALLOC-A64: compare the registers themselves, and let
+            // `cmp` carry a 12-bit immediate the way x86's `cmp r, imm` does.
+            let la = if oty.bits() >= 32 {
+                operand(e, fr, *a, *oty, A)
+            } else {
+                load_ext(e, fr, A, *a, *oty, bits);
+                A.to_string()
+            };
+            let rb = match if oty.bits() >= 32 { imm12(fr, *b) } else { None } {
+                Some(k) => k,
+                None => {
+                    load_ext(e, fr, B, *b, *oty, bits);
+                    rw(B, bits)
+                }
+            };
+            e.line(&format!("cmp {}, {}", rw(&la, bits), rb));
             let cc = match (op, oty.signed()) {
                 (CmpOp::Eq, _) => "eq",
                 (CmpOp::Ne, _) => "ne",
@@ -1141,8 +1154,15 @@ fn emit_inst(
                 (CmpOp::Ge, true) => "ge",
                 (CmpOp::Ge, false) => "hs",
             };
-            e.line(&format!("cset {}, {}", w(A), cc));
-            store_dst_ty(e, fr, d, A, ty);
+            // `bool` is 0/1, so `cset` into the home register needs no
+            // widening afterwards.
+            match fr.reg_of(d) {
+                Some(r) => e.line(&format!("cset {}, {}", w(r), cc)),
+                None => {
+                    e.line(&format!("cset {}, {}", w(A), cc));
+                    store_dst_ty(e, fr, d, A, ty);
+                }
+            }
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
@@ -1257,37 +1277,81 @@ fn emit_inst(
                 crate::simd_a64::emit_ptr_load(e, fr, d, *addr);
                 return Ok(());
             }
-            load_full(e, fr, B, *addr);
+            // ROUND REGALLOC-A64: the pointer is a 64-bit value, so if it
+            // has a register that register IS the address. The result goes
+            // straight into the home of the loaded value; the load widths
+            // below already leave exactly the canonical form
+            // (`ldrb`/`ldrh`/`ldr w` zero the rest of the register), so for
+            // the unsigned widths no `canonicalise` is needed -- and for a
+            // signed narrow type `store_dst_ty` still does it.
+            let ra = match fr.reg_of(*addr) {
+                Some(r) => r.to_string(),
+                None => {
+                    load_full(e, fr, B, *addr);
+                    B.to_string()
+                }
+            };
             let bits = ty.bits().max(8);
+            let signed_narrow = ty.signed() && ty.bits() < 64;
+            let rd = if signed_narrow { A } else { dest(fr, d, FTy::I64, A) };
             match bits {
-                8 => e.line(&format!("ldrb {}, [{}]", w(A), B)),
-                16 => e.line(&format!("ldrh {}, [{}]", w(A), B)),
-                32 => e.line(&format!("ldr {}, [{}]", w(A), B)),
-                _ => e.line(&format!("ldr {}, [{}]", A, B)),
+                8 => e.line(&format!("ldrb {}, [{}]", w(rd), ra)),
+                16 => e.line(&format!("ldrh {}, [{}]", w(rd), ra)),
+                32 => e.line(&format!("ldr {}, [{}]", w(rd), ra)),
+                _ => e.line(&format!("ldr {}, [{}]", rd, ra)),
             }
-            store_dst_ty(e, fr, d, A, ty);
+            if rd == A {
+                store_dst_ty(e, fr, d, A, ty);
+            }
         }
         Op::Store { addr, val } | Op::MmioStore { addr, val } => {
             if ty == FTy::V128 {
                 crate::simd_a64::emit_ptr_store(e, fr, *addr, *val);
                 return Ok(());
             }
-            load_full(e, fr, B, *addr);
-            load_full(e, fr, A, *val);
+            // ROUND REGALLOC-A64: both operands may already be in registers.
+            let ra = match fr.reg_of(*addr) {
+                Some(r) => r.to_string(),
+                None => {
+                    load_full(e, fr, B, *addr);
+                    B.to_string()
+                }
+            };
+            let rv = match fr.reg_of(*val) {
+                Some(r) => r.to_string(),
+                None => {
+                    load_full(e, fr, A, *val);
+                    A.to_string()
+                }
+            };
             let bits = ty.bits().max(8);
             match bits {
-                8 => e.line(&format!("strb {}, [{}]", w(A), B)),
-                16 => e.line(&format!("strh {}, [{}]", w(A), B)),
-                32 => e.line(&format!("str {}, [{}]", w(A), B)),
-                _ => e.line(&format!("str {}, [{}]", A, B)),
+                8 => e.line(&format!("strb {}, [{}]", w(&rv), ra)),
+                16 => e.line(&format!("strh {}, [{}]", w(&rv), ra)),
+                32 => e.line(&format!("str {}, [{}]", w(&rv), ra)),
+                _ => e.line(&format!("str {}, [{}]", rv, ra)),
             }
         }
         Op::PtrAdd { base, off } => {
             let d = i.dst.ok_or("internal error: ptradd without target")?;
-            load_full(e, fr, A, *base);
-            load_full(e, fr, B, *off);
-            e.line(&format!("add {}, {}, {}", A, A, B));
-            store_dst_ty(e, fr, d, A, ty);
+            // ROUND REGALLOC-A64: pointers are 64 bits, so this is the
+            // simplest three address case there is.
+            let ra = match fr.reg_of(*base) {
+                Some(r) => r.to_string(),
+                None => { load_full(e, fr, A, *base); A.to_string() }
+            };
+            let rb = match imm12(fr, *off) {
+                Some(k) => k,
+                None => match fr.reg_of(*off) {
+                    Some(r) => r.to_string(),
+                    None => { load_full(e, fr, B, *off); B.to_string() }
+                },
+            };
+            let rd = dest(fr, d, FTy::I64, A);
+            e.line(&format!("add {}, {}, {}", rd, ra, rb));
+            if rd == A {
+                store_dst_ty(e, fr, d, A, ty);
+            }
         }
         Op::Call { name, args } => {
             let (spot, _stack) = place_args(f, args);
@@ -1767,6 +1831,58 @@ fn imm12(fr: &Frame, v: Val) -> Option<String> {
     None
 }
 
+/// ROUND REGALLOC-A64 -- IS THIS VALUE A LOGICAL (BITMASK) IMMEDIATE?
+///
+/// `and`/`orr`/`eor` on A64 take an immediate out of a very particular set:
+/// a pattern of `n` set bits, rotated, repeated over the whole width. The
+/// masks that actually occur in this kind of code (0xff, 0xffff, 0x7f, ...)
+/// are all in it, and the assembler checks the encoding for us -- but a
+/// value it cannot encode is a hard error, not a slow path, so the test
+/// here has to be exact rather than optimistic.
+///
+/// The rule (Arm ARM, "Logical (immediate)"): the value must consist of a
+/// block of `ones` consecutive set bits inside an element of size `size`
+/// (a power of two, 2..=64), that element repeated to fill the register,
+/// and it may be rotated. Neither all zeros nor all ones is encodable.
+fn logical_imm(fr: &Frame, v: Val, bits: u32) -> Option<String> {
+    let k = fr.imm_of(v)?;
+    let width = if bits <= 32 { 32u32 } else { 64u32 };
+    let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let val = (k as u64) & mask;
+    if val == 0 || val == mask {
+        return None;
+    }
+    let mut size = width;
+    while size > 2 {
+        let half = size / 2;
+        let lo = val & ((1u64 << half) - 1);
+        let hi = (val >> half) & ((1u64 << half) - 1);
+        // only keep halving while the two halves are the same pattern
+        if lo != hi {
+            break;
+        }
+        size = half;
+    }
+    let elem = if size == 64 { val } else { val & ((1u64 << size) - 1) };
+    // rotate the element until the set bits are contiguous and start at bit 0
+    let ones = elem.count_ones();
+    if ones == 0 || ones == size {
+        return None;
+    }
+    let mut ok = false;
+    for r in 0..size {
+        let rot = ((elem >> r) | (elem << (size - r))) & if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
+        if rot == (1u64 << ones) - 1 {
+            ok = true;
+            break;
+        }
+    }
+    if !ok {
+        return None;
+    }
+    Some(format!("#{}", val))
+}
+
 /// The register an instruction may write its result straight into: the home
 /// of the target value, when it has one. Otherwise the scratch register,
 /// from which `store_dst_ty` carries it to the slot.
@@ -1832,8 +1948,18 @@ fn emit_bin(
             let ra = operand(e, fr, a, ty, A);
             let rd = dest(fr, d, ty, A);
             // ROUND REGALLOC-A64: `add`/`sub` can carry a 12-bit immediate.
-            let rb = match (op, imm12(fr, b)) {
-                (BinOp::Add, Some(k)) | (BinOp::Sub, Some(k)) if bits >= 32 => k,
+            let rb = match op {
+                // `add`/`sub`: the 12-bit arithmetic immediate.
+                BinOp::Add | BinOp::Sub if bits >= 32 && imm12(fr, b).is_some() => {
+                    imm12(fr, b).unwrap()
+                }
+                // `and`/`orr`/`eor`: the bitmask immediate. This is where the
+                // 0xff masks of byte extraction stop costing a `movz`.
+                BinOp::And | BinOp::Or | BinOp::Xor
+                    if bits >= 32 && logical_imm(fr, b, bits).is_some() =>
+                {
+                    logical_imm(fr, b, bits).unwrap()
+                }
                 _ => rw(&operand(e, fr, b, ty, B), bits),
             };
             e.line(&format!(
@@ -1881,21 +2007,46 @@ fn emit_bin(
             // Widen the left operand exactly, so that a right shift of an
             // 8/16-bit type pulls the right bits along. The shift count is
             // taken modulo the width by the hardware — on both machines.
-            load_ext(e, fr, A, a, ty, bits);
-            load_full(e, fr, B, b);
             let m = match (op, ty.signed()) {
                 (BinOp::Shl, _) => "lsl",
                 (_, true) => "asr",
                 (_, false) => "lsr",
             };
+            // ROUND REGALLOC-A64: a constant shift count is an immediate --
+            // `lsr w9, w9, #8` instead of `movz x10, #8` and a register
+            // shift. The hardware takes the count modulo the width, and the
+            // immediate form is only used when the count is already inside
+            // that range, so the two forms cannot disagree.
+            let la = if ty.bits() >= 32 {
+                operand(e, fr, a, ty, A)
+            } else {
+                load_ext(e, fr, A, a, ty, bits);
+                A.to_string()
+            };
+            let count = match fr.imm_of(b) {
+                Some(k) if k >= 0 && (k as u32) < bits => Some(format!("#{}", k)),
+                _ => None,
+            };
+            let rb = match &count {
+                Some(k) => k.clone(),
+                None => {
+                    load_full(e, fr, B, b);
+                    rw(B, bits)
+                }
+            };
+            let rd = if ty.bits() >= 32 { dest(fr, d, ty, A) } else { A };
             e.line(&format!(
                 "{} {}, {}, {}",
                 m,
-                rw(A, bits),
-                rw(A, bits),
-                rw(B, bits)
+                rw(rd, bits),
+                rw(&la, bits),
+                rb
             ));
-            store_dst_ty(e, fr, d, A, ty);
+            if rd == A {
+                store_dst_ty(e, fr, d, A, ty);
+            } else {
+                canonicalise(e, rd, ty);
+            }
         }
     }
     Ok(())
