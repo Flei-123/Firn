@@ -189,7 +189,7 @@ breaks a cycle. 3 grows the frame at the top, next to the value slots.
 | what | result |
 |---|---|
 | `tools/aarch64/run.sh` (dev-fast) | **307 SAME, 0 DIFFERENT** — identical to the baseline before this round |
-| `tools/aarch64/run.sh --no-opt` | see below |
+| `tools/aarch64/run.sh --no-opt` | **307 SAME, 0 DIFFERENT** |
 | `tests/` exit codes on aarch64 under qemu | **265 correct, 0 wrong** |
 | `cargo test --release` | **267 passed, 0 failed** |
 | `tools/checked/run.sh` | **150 checks passed, 0 failed** (compares panic messages octet for octet) |
@@ -241,6 +241,18 @@ inline machine code this branch cannot express.
   knows one register class; the `v`/`d` registers would need intervals of
   their own. That is the same restriction x86 has had since round 71/82,
   now shared rather than newly introduced.
+
+  What that costs, counted with `FIRN_RA_WARN=1`:
+
+  | program | functions | refused | allocated | reason |
+  |---|---:|---:|---:|---|
+  | `1400_core_span` | 290 | 73 | **74 %** | all `f64` |
+  | `940_layout_box_model` | 1270 | 245 | **80 %** | all `f64` |
+  | `1613_crypto` | 702 | 40 | **94 %** | 32 `f64`, 8 `v128` |
+
+  So three quarters to nineteen twentieths of the code gets the
+  allocation, and the hole is one shape: a second register class. That is
+  the obvious next round, and it would help x86 by exactly as much.
 * **Inline assembler and MMIO** stay on the base path (round 52's reason:
   they bind fixed registers and are `volatile`). On aarch64 that means
   `tests/850_asm_basic` and friends are refused by the code generator, as

@@ -264,18 +264,42 @@ pub(crate) const X86: Machine = Machine {
 //           T1=x13, T2=x14) and of `panic_rt_a64.rs`/`simd_a64.rs`
 //           (x15, x16, x17). Every one of them can be written between two
 //           instructions of a value's lifetime. NOT handed out.
-//   x19-x28 callee-saved, saved in the prologue like `rbx` and friends on
-//           the other machine. The main supply.
+//   x19-x24 callee-saved AND SCANNED BY THE COLLECTOR. The main supply.
+//   x25-x28 callee-saved but NOT handed out -- see the next paragraph.
 //
-// So: ten long-lived registers and eight short-lived ones, against x86's
-// five and seven. A64 is the RICHER machine here, which is the reason the
-// result below beats the x86 instruction count rather than merely matching it.
-const A64_POOL: [&str; 18] = [
-    "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+// WHY THE SUPPLY STOPS AT x24, AND WHAT WOULD BREAK IF IT DID NOT.
+//
+// SPEC 3.5.3 promises a CONSERVATIVE REGISTER SCAN: a Gc pointer whose only
+// copy sits in a callee-saved register must still be found when a collection
+// runs. The mechanism is `Op::GcAddr { regs: true }`, which spills the
+// callee-saved registers into the save area of the state block, and
+// `lib/gc/gc.fi`, which scans that area:
+//
+//     __gc_scan(regs + S_REGS, regs + S_REGS + 48)      // 48 octets
+//
+// FORTY-EIGHT OCTETS IS SIX WORDS. x86 has exactly six callee-saved
+// registers (rbx, rbp, r12-r15) and writes all six, so the promise holds
+// there. AArch64 has ten, and `codegen_a64::emit_gc_addr` writes six of them
+// -- which was correct as long as no value lived in one of them at all
+// (round 80 kept everything in the frame; the comment in that function says
+// so in as many words).
+//
+// This round makes values live there. Handing out x25-x28 would therefore
+// have created exactly the bug the register scan exists to prevent: a Gc
+// object whose last reference sits in x27, a collection, and a freed object
+// still in use. It would not show up in any test that does not collect at
+// the wrong microsecond, which is the worst kind.
+//
+// The supply is therefore the SIX registers the collector really reads. That
+// is the same number x86 has, so nothing is lost against the other machine.
+// Widening it is a change to the runtime (the 48 in gc.fi, the save area in
+// two code generators and in `lib/firnc1/codegen.fi`) and belongs in a round
+// that can test the collector, not in this one.
+const A64_POOL: [&str; 14] = [
+    "x19", "x20", "x21", "x22", "x23", "x24",
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
 ];
-const A64_CALLEE: [&str; 10] =
-    ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"];
+const A64_CALLEE: [&str; 6] = ["x19", "x20", "x21", "x22", "x23", "x24"];
 /// A64 has no register that is caller-saved AND not an argument register:
 /// x9-x17 belong to the backend. The argument registers are the whole
 /// short-lived supply, and they are asked through `arg_spare`.
