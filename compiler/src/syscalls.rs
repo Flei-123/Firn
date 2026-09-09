@@ -126,6 +126,13 @@ const TABLE: &[(i64, A64)] = &[
     // program that links lib/pdf/down.fi (the download folder) was
     // untranslatable for the phone, and that is the whole browser.
     (83, A64::AtFdcwd(34)),          // mkdir     -> mkdirat
+    // ROUND VERIFY (Certus): the crash report deletes itself after it has
+    // been sent (lib/android/absturz.fi). Same shape as `open` and
+    // `mkdir` above -- the generic table has no `unlink`, only
+    // `unlinkat`, and AT_FDCWD in front of the path makes it mean the
+    // same thing. The third argument (flags) is 0, which is what
+    // `unlinkat` wants for a plain file.
+    (87, A64::AtFdcwd(35)),          // unlink    -> unlinkat
     (96, A64::Direct(169)),          // gettimeofday
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
