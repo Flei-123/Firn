@@ -640,6 +640,11 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         emit_block(e, f, &fr, b, &mut site)?;
     }
+    // ROUND REGALLOC-A64: the panic arms of this function's checked
+    // operations, behind the last `ret`. Same rule as x86 round 90 --
+    // without this call the cold buffer would be carried into the NEXT
+    // function (or lost at the end of the module).
+    e.flush_cold();
     Ok(())
 }
 
