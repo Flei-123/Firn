@@ -1797,6 +1797,48 @@ fn emit_gc_addr(e: &mut Emitter, regs: bool) {
     }
 }
 
+
+/// ROUND REGALLOC-A64 (Nachtrag) -- DIE SYSTEMAUFRUF-ARGUMENTE PARALLEL FUELLEN.
+///
+/// THE BUG THIS EXISTS FOR. `emit_syscall` filled x0..x5 one after another:
+///
+///     for (k, a) in given.iter().enumerate() { load_full(e, fr, SYS_REGS[k], *a); }
+///
+/// That is safe exactly as long as every value lives in a frame slot -- a
+/// slot is a source and never also a target. With the register allocation of
+/// this round a value CAN live in x0..x5, and then one argument's target is
+/// another argument's source. `mem__cp_grow` in lib/html/mem.fi produced for
+/// `heap_free(ptr, len)` -> `munmap(2)`:
+///
+///     mov x0, x9      // the rounded LENGTH into x0
+///     mov x0, x6      // the POINTER into x0 -- overwrites the length
+///     mov x1, x0      // the length -- reads x0, which is now the pointer
+///
+/// so the call became `munmap(ptr, ptr)`. It unmapped a region the size of
+/// the pointer, the freshly allocated buffer went away with it, and the next
+/// access to it was a segmentation fault (measured: the 29 github style
+/// sheets of tools/cssbench died at once, x86 was correct).
+///
+/// The rule is the one `emit_call` above already follows: everything that
+/// comes out of a REGISTER is moved with the cycle breaking walk, everything
+/// that is loaded from memory or built as an immediate goes afterwards,
+/// straight into its argument register, because those writes read no
+/// argument register at all.
+fn load_sys_args(e: &mut Emitter, fr: &Frame, given: &[Val], first: usize) {
+    let mut par: Vec<(String, String)> = Vec::new();
+    for (k, a) in given.iter().enumerate() {
+        if let Some(src) = fr.reg_of(*a) {
+            par.push((SYS_REGS[k + first].to_string(), src.to_string()));
+        }
+    }
+    parallel_reg_moves(e, &par);
+    for (k, a) in given.iter().enumerate() {
+        if fr.reg_of(*a).is_none() {
+            load_full(e, fr, SYS_REGS[k + first], *a);
+        }
+    }
+}
+
 /// `Op::Syscall` — `svc #0`, the number in x8, the arguments in x0-x5.
 ///
 /// The number in FIR is the x86-64 number (see `syscalls.rs`); it has to be
@@ -1903,14 +1945,10 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
                 }
             }
         }
-        for (k, a) in given.iter().enumerate().take(5) {
-            load_full(e, fr, SYS_REGS[k + 1], *a);
-        }
+        load_sys_args(e, fr, &given[..given.len().min(5)], 1);
         imm_into(e, "x0", syscalls::AT_FDCWD);
     } else {
-        for (k, a) in given.iter().enumerate() {
-            load_full(e, fr, SYS_REGS[k], *a);
-        }
+        load_sys_args(e, fr, &given, 0);
     }
     imm_into(e, "x8", number as i64);
     e.line("svc #0");
