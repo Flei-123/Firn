@@ -289,15 +289,54 @@ pub(crate) fn emit_checked_bin(
     ty: FTy,
     msg: &str,
     site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
+) {
+    emit_checked_bin_at(e, op, ty, msg, site, restore, A, None, A)
+}
+
+/// ROUND REGALLOC-A64 -- the same operation, but told WHERE its operands are
+/// and where the result belongs. `src` is the left operand's register, `imm`
+/// an optional 12-bit immediate for the right one (else it is in `B`), and
+/// `dst` the register the result is written to.
+///
+/// Only the 32/64-bit `Add`/`Sub` arm can use all three; every other shape
+/// (the multiplications, the narrow widths) still computes in `A`/`B` and is
+/// handed on unchanged, so this stays one code path and not two.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_checked_bin_at(
+    e: &mut Emitter,
+    op: BinOp,
+    ty: FTy,
+    msg: &str,
+    site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
+    src: &str,
+    imm: Option<&str>,
+    dst: &str,
 ) {
     let bits = ty.bits();
     let label = intern(msg);
     let uid = site.next();
     let bad = format!(".Lchksite{}", uid);
-    // The two originals have to survive the operation: the message names
-    // them. x11/x13 are scratch of the A64 backend and hold no FIR value.
-    e.line(&format!("mov x11, {}", A));
-    e.line(&format!("mov x13, {}", B));
+    // ROUND REGALLOC-A64 -- THE TWO ORIGINALS ARE SAVED ONLY WHERE THEY ARE
+    // NEEDED, WHICH IS THE ARM THAT NEVER RUNS.
+    //
+    // The panic message names both operands, so up to this round every
+    // checked operation began with `mov x11, x9` / `mov x13, x10` -- two
+    // instructions in the HOT path for a message that is printed at most
+    // once in the life of the program. In `misch_zeile` that is 26 of 400
+    // instructions.
+    //
+    // Since step 1 of this round the panic arm sits in the cold half, and
+    // `caller_saves` below writes those two moves THERE instead. The
+    // operation itself may then destroy x9/x10 -- the arm does not read
+    // them any more.
+    //
+    // The one case that does not work for is an operation that overwrites
+    // its own operand before the branch is taken (`adds x9, x9, x10` does
+    // exactly that). So the cold arm gets the ORIGINALS handed to it by the
+    // caller, which knows where they came from: `restore` re-loads them.
+    let _ = &bad;
     if bits == 64 && op == BinOp::Mul {
         // 64 bits: the upper half decides. Signed overflow means the high
         // word is not the sign extension of the low one, unsigned means it
@@ -320,10 +359,15 @@ pub(crate) fn emit_checked_bin(
         e.line(&format!("mul {}, {}, {}", A, A, B));
         range_check(e, ty, &bad);
     } else if bits >= 32 {
-        let (aw, bw) = (rw(A, bits), rw(B, bits));
+        let aw = rw(src, bits);
+        let dw = rw(dst, bits);
+        let bw = match imm {
+            Some(k) => k.to_string(),
+            None => rw(B, bits),
+        };
         match op {
-            BinOp::Add => e.line(&format!("adds {}, {}, {}", aw, aw, bw)),
-            BinOp::Sub => e.line(&format!("subs {}, {}, {}", aw, aw, bw)),
+            BinOp::Add => e.line(&format!("adds {}, {}, {}", dw, aw, bw)),
+            BinOp::Sub => e.line(&format!("subs {}, {}, {}", dw, aw, bw)),
             _ => unreachable!("emit_checked_bin only ever sees Add/Sub/Mul"),
         }
         // `adds`/`subs` set V for the SIGNED reading. Unsigned addition
@@ -375,6 +419,7 @@ pub(crate) fn emit_checked_bin(
     e.cold_raw(&format!("{}:", bad));
     e.cold_loc_here();
     let mut arm = Emitter::default();
+    restore(&mut arm);
     trampoline_jump(&mut arm, panic_code_of(op), &label, msg.len(), "x11", "x13", !ty.signed());
     e.cold.push_str(&arm.out);
 }
