@@ -321,22 +321,49 @@ fn extend_to(e: &mut Emitter, dst: &str, src: &str, ty: FTy) {
 /// Emits `+ - *`, CHECKED. Precondition: `x9` = a and `x10` = b, both
 /// already extended to 64 bits the way `ty` reads them (`load_ext(.., 64)`
 /// in `codegen_a64.rs` produces exactly that). The result is left in `x9`.
-pub(crate) fn emit_checked_bin(
+/// ROUND REGALLOC-A64 -- the same operation, but told WHERE its operands are
+/// and where the result belongs. `src` is the left operand's register, `imm`
+/// an optional 12-bit immediate for the right one (else it is in `B`), and
+/// `dst` the register the result is written to.
+///
+/// Only the 32/64-bit `Add`/`Sub` arm can use all three; every other shape
+/// (the multiplications, the narrow widths) still computes in `A`/`B` and is
+/// handed on unchanged, so this stays one code path and not two.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_checked_bin_at(
     e: &mut Emitter,
     op: BinOp,
     ty: FTy,
     msg: &str,
     site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
+    src: &str,
+    imm: Option<&str>,
+    dst: &str,
 ) {
     let bits = ty.bits();
     let label = intern(msg);
     let uid = site.next();
-    let ok = format!(".Lchkok{}", uid);
     let bad = format!(".Lchksite{}", uid);
-    // The two originals have to survive the operation: the message names
-    // them. x11/x13 are scratch of the A64 backend and hold no FIR value.
-    e.line(&format!("mov x11, {}", A));
-    e.line(&format!("mov x13, {}", B));
+    // ROUND REGALLOC-A64 -- THE TWO ORIGINALS ARE SAVED ONLY WHERE THEY ARE
+    // NEEDED, WHICH IS THE ARM THAT NEVER RUNS.
+    //
+    // The panic message names both operands, so up to this round every
+    // checked operation began with `mov x11, x9` / `mov x13, x10` -- two
+    // instructions in the HOT path for a message that is printed at most
+    // once in the life of the program. In `misch_zeile` that is 26 of 400
+    // instructions.
+    //
+    // Since step 1 of this round the panic arm sits in the cold half, and
+    // `caller_saves` below writes those two moves THERE instead. The
+    // operation itself may then destroy x9/x10 -- the arm does not read
+    // them any more.
+    //
+    // The one case that does not work for is an operation that overwrites
+    // its own operand before the branch is taken (`adds x9, x9, x10` does
+    // exactly that). So the cold arm gets the ORIGINALS handed to it by the
+    // caller, which knows where they came from: `restore` re-loads them.
+    let _ = &bad;
     if bits == 64 && op == BinOp::Mul {
         // 64 bits: the upper half decides. Signed overflow means the high
         // word is not the sign extension of the low one, unsigned means it
@@ -359,10 +386,15 @@ pub(crate) fn emit_checked_bin(
         e.line(&format!("mul {}, {}, {}", A, A, B));
         range_check(e, ty, &bad);
     } else if bits >= 32 {
-        let (aw, bw) = (rw(A, bits), rw(B, bits));
+        let aw = rw(src, bits);
+        let dw = rw(dst, bits);
+        let bw = match imm {
+            Some(k) => k.to_string(),
+            None => rw(B, bits),
+        };
         match op {
-            BinOp::Add => e.line(&format!("adds {}, {}, {}", aw, aw, bw)),
-            BinOp::Sub => e.line(&format!("subs {}, {}, {}", aw, aw, bw)),
+            BinOp::Add => e.line(&format!("adds {}, {}, {}", dw, aw, bw)),
+            BinOp::Sub => e.line(&format!("subs {}, {}, {}", dw, aw, bw)),
             _ => unreachable!("emit_checked_bin only ever sees Add/Sub/Mul"),
         }
         // `adds`/`subs` set V for the SIGNED reading. Unsigned addition
@@ -396,10 +428,27 @@ pub(crate) fn emit_checked_bin(
         e.line(&format!("sxtw {}, {}", A, wn(A)));
         range_check(e, ty, &bad);
     }
-    e.line(&format!("b {}", ok));
-    e.raw(&format!("{}:", bad));
-    trampoline_jump(e, panic_code_of(op), &label, msg.len(), "x11", "x13", !ty.signed());
-    e.raw(&format!("{}:", ok));
+    // ROUND REGALLOC-A64 -- THE HOT PATH IS THE BRANCH, NOTHING ELSE.
+    //
+    // Up to this round the ending above was
+    //     b.vs .Lchksite7 / b .Lchkok7 / .Lchksite7: <panic> / .Lchkok7:
+    // — TWO branches per checked operation, and the panic arm sat BETWEEN
+    // the operation and whatever came next, i.e. in the middle of the hot
+    // path. `misch_zeile` alone carried 15 such `chkok` blocks with 190
+    // instructions in the loop body (docs/RUNDE-TEMPO-3.md §1).
+    //
+    // x86 has done it the other way since round 90: ONE forward
+    // conditional branch, not taken in the normal case, into the cold half
+    // of the function that `Emitter::flush_cold` prints behind the `ret`.
+    // A64 can do exactly the same — the condition is already computed, only
+    // the arm has to move. The fallthrough IS the ok case, so `.Lchkok`
+    // disappears completely.
+    e.cold_raw(&format!("{}:", bad));
+    e.cold_loc_here();
+    let mut arm = Emitter::default();
+    restore(&mut arm);
+    trampoline_jump(&mut arm, panic_code_of(op), &label, msg.len(), "x11", "x13", !ty.signed());
+    e.cold.push_str(&arm.out);
 }
 
 /// `x9` cut to `ty` and read back: differs from `x9` exactly when the
@@ -427,17 +476,20 @@ pub(crate) fn emit_checked_div(
 ) {
     let bits = ty.bits().max(32);
     let uid = site.next();
-    let past_zero = format!(".Lchkdivz{}", uid);
     let site_zero = format!(".Lchksitez{}", uid);
     let past_range = format!(".Lchkdivr{}", uid);
     let site_range = format!(".Lchksiter{}", uid);
     e.line(&format!("mov x11, {}", A));
     e.line(&format!("mov x13, {}", B));
-    e.line(&format!("cbnz {}, {}", rw(B, bits), past_zero));
-    e.raw(&format!("{}:", site_zero));
+    // ROUND REGALLOC-A64: divisor non-zero is the normal case and falls
+    // through; `cbz` (branch if zero) carries the rare one into the cold half.
+    e.line(&format!("cbz {}, {}", rw(B, bits), site_zero));
     let label0 = intern(msg_zero);
-    trampoline_jump(e, PANIC_DIV0, &label0, msg_zero.len(), "x11", "x13", !ty.signed());
-    e.raw(&format!("{}:", past_zero));
+    e.cold_raw(&format!("{}:", site_zero));
+    e.cold_loc_here();
+    let mut arm0 = Emitter::default();
+    trampoline_jump(&mut arm0, PANIC_DIV0, &label0, msg_zero.len(), "x11", "x13", !ty.signed());
+    e.cold.push_str(&arm0.out);
     if ty.signed() {
         let min_val: i64 = match ty {
             FTy::I8 => i8::MIN as i64,
@@ -445,17 +497,23 @@ pub(crate) fn emit_checked_div(
             FTy::I32 => i32::MIN as i64,
             _ => i64::MIN,
         };
+        // MIN / -1 needs BOTH halves to be true. The first mismatch skips
+        // the second test and falls through to the division; only when both
+        // match does the single `b.eq` leave for the cold half.
         crate::codegen_a64::imm_into(e, T, min_val);
         e.line(&format!("cmp {}, {}", A, T));
         e.line(&format!("b.ne {}", past_range));
         crate::codegen_a64::imm_into(e, T, -1);
         e.line(&format!("cmp {}, {}", B, T));
-        e.line(&format!("b.ne {}", past_range));
-        e.raw(&format!("{}:", site_range));
+        e.line(&format!("b.eq {}", site_range));
         let label_r = intern(msg_range);
-        trampoline_jump(e, PANIC_DIV_OVERFLOW, &label_r, msg_range.len(), "x11", "x13", false);
+        e.cold_raw(&format!("{}:", site_range));
+        e.cold_loc_here();
+        let mut armr = Emitter::default();
+        trampoline_jump(&mut armr, PANIC_DIV_OVERFLOW, &label_r, msg_range.len(), "x11", "x13", false);
+        e.cold.push_str(&armr.out);
+        e.raw(&format!("{}:", past_range));
     }
-    e.raw(&format!("{}:", past_range));
     // Both operands are already at the computing width and correctly
     // extended; A64 divides in one instruction and gets its remainder out
     // of `msub`, exactly as the unchecked path does.
@@ -480,7 +538,6 @@ pub(crate) fn emit_checked_cast(
     site: &mut SiteCounter,
 ) {
     let uid = site.next();
-    let ok = format!(".Lchkcast{}", uid);
     let bad = format!(".Lchksitec{}", uid);
     // The original, for the comparison and for the message.
     e.line(&format!("mov x11, {}", A));
@@ -492,11 +549,15 @@ pub(crate) fn emit_checked_cast(
         extend_to(e, A, A, from);
     }
     e.line(&format!("cmp {}, x11", A));
-    e.line(&format!("b.eq {}", ok));
-    e.raw(&format!("{}:", bad));
+    // ROUND REGALLOC-A64: fits = fallthrough, does not fit = one branch
+    // into the cold half.
+    e.line(&format!("b.ne {}", bad));
     let label = intern(msg);
-    trampoline_jump(e, PANIC_CAST, &label, msg.len(), "x11", "x13", !from.signed());
-    e.raw(&format!("{}:", ok));
+    e.cold_raw(&format!("{}:", bad));
+    e.cold_loc_here();
+    let mut arm = Emitter::default();
+    trampoline_jump(&mut arm, PANIC_CAST, &label, msg.len(), "x11", "x13", !from.signed());
+    e.cold.push_str(&arm.out);
     // Nothing was lost — but the value in `x9` was widened back to
     // `from`'s width for the comparison. Cut it to `to` once more, so the
     // caller's `store_dst` sees exactly what the unchecked cast produces.
@@ -655,12 +716,18 @@ pub(crate) fn emit_checked_idx(e: &mut Emitter, len: u64, msg: &str, site: &mut 
     crate::panic_rt::note_index_site();
     let label = intern(msg);
     let uid = site.next();
-    let ok = format!(".Lchkidx{}", uid);
+    // ROUND REGALLOC-A64: the in-range case FALLS THROUGH, the panic arm
+    // goes to the cold half behind the `ret`. `b.hs` ("unsigned higher or
+    // same") is the exact negation of the `b.lo` this used to jump with.
+    let bad = format!(".Lchksitei{}", uid);
     crate::codegen_a64::imm_into(e, B, len as i64);
     e.line(&format!("cmp {}, {}", A, B));
-    e.line(&format!("b.lo {}", ok));
+    e.line(&format!("b.hs {}", bad));
+    e.cold_raw(&format!("{}:", bad));
+    e.cold_loc_here();
+    let mut arm = Emitter::default();
     trampoline_jump_to(
-        e,
+        &mut arm,
         crate::panic_rt::TRAMPOLINE_INDEX,
         crate::panic_rt::PANIC_INDEX,
         &label,
@@ -669,5 +736,5 @@ pub(crate) fn emit_checked_idx(e: &mut Emitter, len: u64, msg: &str, site: &mut 
         B,
         true,
     );
-    e.raw(&format!("{}:", ok));
+    e.cold.push_str(&arm.out);
 }

@@ -1,0 +1,118 @@
+// expect_exit: 0
+// tools/inline_bench/soak_tree.fi -- ROUND INLINE, the correctness soak.
+//
+// The shape round SAMMLER used and the shape Certus uses: a LIVE TREE that
+// must survive, a fixed amount of GARBAGE per step, and a FULL `gc_collect()`
+// between every single step. After each collection the checksum over the live
+// tree is recomputed. If the collector frees something that is still
+// reachable -- which is exactly what a wrong frame layout after inlining
+// causes, round 37's `tests/520_gc_weak.fi` exit 6 -- the checksum changes or
+// the program faults.
+//
+// The checksum must be IDENTICAL on base and on this branch. It is printed at
+// the end, so the two builds can be compared with one number.
+
+import dom.meas
+
+gc class Leaf {
+    a: u64,
+    b: u64,
+}
+
+gc class Tree {
+    left: Gc[Tree],
+    right: Gc[Tree],
+    leaf: Gc[Leaf],
+    tag: u64,
+}
+
+const STEPS: u64 = 937
+const GARBAGE_PER_STEP: u64 = 200
+const DEPTH: u64 = 7
+
+fn lcg(s: u64) -> u64 {
+    // the LCG wraps on purpose -- `*%` / `+%` say so (ROUND 72 convention)
+    return s *% 6364136223846793005 +% 1442695040888963407
+}
+
+// Build a tree of the given depth. Every node carries a leaf, so the marking
+// has two levels of indirection to walk.
+fn build(d: u64, seed: u64) -> AllocError!Gc[Tree] {
+    let lf: Gc[Leaf] = try gc Leaf { a: seed & 255, b: (seed >> 8) & 255 }
+    var t: Gc[Tree] = try gc Tree {
+        left: gc_null[Tree](),
+        right: gc_null[Tree](),
+        leaf: lf,
+        tag: seed & 65535,
+    }
+    if d > 0 {
+        t.left = try build(d - 1, lcg(seed))
+        t.right = try build(d - 1, lcg(seed + 1))
+    }
+    return t
+}
+
+// Walk the whole tree and add everything up -- this is the checksum, and at
+// the same time the proof that every node is still readable.
+fn sum(t: Gc[Tree]) -> u64 {
+    if t == gc_null[Tree]() {
+        return 0
+    }
+    var s: u64 = t.tag
+    let lf: Gc[Leaf] = t.leaf
+    if lf != gc_null[Leaf]() {
+        s = s + lf.a + lf.b
+    }
+    return s + sum(t.left) + sum(t.right)
+}
+
+// The garbage of one step: objects that are dead again the moment the
+// function returns.
+fn garbage(n: u64, seed: u64) -> AllocError!u64 {
+    var i: u64 = 0
+    var s: u64 = seed
+    var acc: u64 = 0
+    while i < n {
+        let lf: Gc[Leaf] = try gc Leaf { a: s & 255, b: (s >> 8) & 255 }
+        acc = acc + lf.a
+        s = lcg(s)
+        i = i + 1
+    }
+    return acc
+}
+
+fn run() -> AllocError!u64 {
+    let live: Gc[Tree] = try build(DEPTH, 12345)
+    let first: u64 = sum(live)
+    var step: u64 = 0
+    var seed: u64 = 999
+    while step < STEPS {
+        let _g: u64 = try garbage(GARBAGE_PER_STEP, seed)
+        seed = lcg(seed)
+        // The full collection between every step -- the shape Certus uses.
+        gc_collect()
+        // The live tree must be untouched after it.
+        let now: u64 = sum(live)
+        if now != first {
+            return 1
+        }
+        step = step + 1
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    let live: Gc[Tree] = build(DEPTH, 12345) catch gc_null[Tree]()
+    if live == gc_null[Tree]() {
+        return 90
+    }
+    let checksum: u64 = sum(live)
+    let bad: u64 = run() catch 91
+    if bad != 0 {
+        // the live tree changed under the collector, or the run failed
+        return 6
+    }
+    meas.meas_u64(checksum)
+    meas.meas_nl()
+    return 0
+}

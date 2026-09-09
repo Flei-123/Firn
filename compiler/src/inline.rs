@@ -47,57 +47,170 @@ const MAX_CALLEE_BLOCKS: usize = 8;
 /// below every callee bound. A big function is not automatically cold; with
 /// a state machine the opposite holds.
 const MAX_CALLER_INSTS: usize = 24000;
+/// ROUND INLINE: overridable for measuring. `FIRNC_MAX_INLINES` is read once
+/// per pass; unset it keeps the compiled-in default.
+/// Round INLINE's value, and round PHI LEFT IT HERE after trying to remove it.
+///
+/// ROUND PHI, THE ATTEMPT AND WHY IT WAS REVERTED. Setting this to 0 (the
+/// size rule alone deciding) looked like a clear win on a first callgrind
+/// reading: 718.1 M against 729.7 M instructions on the JS engine, a smaller
+/// binary and a faster compile. It was then measured properly and it is
+/// **slower**: +2.67 % (A won 13 of 15 pairs) and +4.27 % (12 of 15) in two
+/// separate interleaved runs, against a noise floor of +0.87 % at 9:6 pairs
+/// measured with two byte identical copies of the same engine.
+///
+/// THE FIRST READING WAS AN ARTEFACT, and the reason is worth keeping:
+/// **callgrind is not deterministic on the JS engine.** Three runs of ONE
+/// binary give 725.6 M / 725.9 M / 721.6 M. The collector's incremental
+/// slice has a TIME budget (`gc.fi:1216`, `__gc_now_ns() - t0 >= budget`),
+/// and under valgrind's ~50x slowdown it does a different amount of work
+/// every run. Instruction counts are only solid ground where no wall clock
+/// enters the program's own decisions -- on the WASM interpreter, which has
+/// no collector, three runs agree to the digit (1279457762 each time).
+///
+/// On a deliberately allocation-poor JS job (arithmetic only, so the time
+/// sliced collector barely runs) the counts agree with the wall clock:
+/// 1461.6 M for this value against 1468.9 M for 0.
 const MAX_INLINES: usize = 2000;
 
-/// Can `from` reach `to` through calls?
-fn reaches(m: &Module, from: &str, to: &str) -> bool {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut stack = vec![from];
-    while let Some(cur) = stack.pop() {
-        if cur == to {
-            return true;
-        }
-        if !seen.insert(cur) {
-            continue;
-        }
-        if let Some(f) = m.funcs.iter().find(|f| f.name == cur) {
-            for b in &f.blocks {
-                for i in &b.insts {
-                    if let Op::Call { name, .. } = &i.op {
-                        stack.push(name.as_str());
-                    }
-                }
-            }
-        }
+/// ROUND INLINE -- a body of at most this many instructions is embedded even
+/// after `MAX_INLINES` is exhausted.
+///
+/// WHY A SECOND, SIZE BASED BOUND. `MAX_INLINES` is a bound on the NUMBER of
+/// embeddings, and a number cannot tell a one instruction accessor from a
+/// forty instruction body. In `lib/js/run_main.fi` the count runs out long
+/// before the collector accessors are reached, so `__gc_ld64` -- ONE
+/// instruction -- stayed a real call and became 21 % of the running engine.
+///
+/// MEASURED (round INLINE, lib/js/run_main.fi, 120,000 round allocating
+/// loop, interleaved A/B): raising the pure count bound is NOT monotonic.
+///   cap  2,000 (the old value)  1687 ms   baseline
+///   cap  5,000                  1670 ms   +6.1 % SLOWER (won 1 of 11 pairs)
+///   cap 20,000                  1687 ms  +10.1 % SLOWER (won 0 of 11 pairs)
+///   cap 22,138 (saturated)      1228 ms  -27.2 % FASTER (won 15 of 15)
+/// A half spent budget is the worst of both worlds: the code has grown but
+/// the hot accessors are still calls. That is the shape round SCHLEUSE saw
+/// from the other side (`release-fast` slower than `dev-fast`, the inline
+/// pass blowing the opcode chain out of the I-cache).
+/// MEASURED, same bench, count bound left at 2,000 and only THIS bound
+/// varied (interleaved A/B against the old cap 2,000 binary):
+///   <=1  insts   956 ms  -36.7 %  (11 of 11 pairs)
+///   <=4  insts   929 ms  -38.4 %  (11 of 11)
+///   <=8  insts   912 ms  -39.4 %  (11 of 11)
+///   <=12 insts   879 ms  -41.5 %  (11 of 11)
+/// and 4 / 8 / 12 are a TIE with each other (6:5, 5:6 pairs -- noise), so the
+/// middle of the plateau is taken. It also beats embedding EVERYTHING
+/// (22,138 inlines, the saturated count bound) by -17.4 %, 11 of 11 pairs,
+/// while the binary grows 1.83 MB -> 1.93 MB instead of 1.83 MB -> 3.16 MB.
+///
+/// That is the I-cache finding of round SCHLEUSE from the other side: what
+/// makes an interpreter faster is embedding the ONE INSTRUCTION accessors it
+/// runs millions of times, not embedding forty instruction bodies that push
+/// the opcode chain out of the cache.
+const MAX_ALWAYS_INSTS: usize = 8;
+
+/// ROUND PHI -- **the bound that replaces the count budget: how much may ONE
+/// caller grow.**
+///
+/// WHY THE COUNT BUDGET IS THE WRONG INSTRUMENT. `MAX_INLINES` is a bound on
+/// the number of embeddings *in the whole module*, so it is spent in the
+/// order the functions happen to stand in. Round INLINE measured what that
+/// does from both ends:
+///
+///   * `lib/js/run_main.fi` -- the budget is used up long before the
+///     collector, so `__gc_ld64` (ONE instruction, 33 M calls) stayed a real
+///     call and was 21 % of the running engine. Raising the cap is NOT
+///     monotonic: 5,000 and 20,000 are SLOWER than 2,000 (+6.1 %, +10.1 %),
+///     because a half spent budget grows the code without ever reaching the
+///     hot accessors.
+///   * `/root/osum-schleuse/kernel/app/wasm.fi` -- the opposite end. The
+///     interpreter is one long if/else chain over the opcode; 500 embeddings
+///     of up to forty instructions already cost **+35 %** and 2,000 cost
+///     **+46 %**, because the chain is pushed out of the I-cache. That is
+///     why round SCHLEUSE ships `--no-pass=inline`.
+///
+/// Both are the same mistake: a *count* cannot tell a one instruction
+/// accessor from a forty instruction body, and a *module wide* count cannot
+/// tell the hot function from the cold one it happens to scan first.
+///
+/// WHAT THIS BOUND SAYS INSTEAD. Every caller gets its own allowance,
+/// measured in the thing that actually costs -- instructions:
+///
+///   * a body of at most `MAX_ALWAYS_INSTS` instructions is ALWAYS embedded
+///     (`__gc_ld64`, `__gc_st64`, `__gc_block_of`). These are the ones that
+///     pay, and they pay everywhere, so no budget may stand in their way.
+///   * anything larger may be embedded only while the caller has not yet
+///     grown by more than `GROW_PERCENT` % of its ORIGINAL instruction count,
+///     and never beyond `GROW_MIN_INSTS` instructions of absolute slack (so
+///     that small functions get a fair allowance too).
+///
+/// The allowance is computed from the size the caller had when the pass
+/// STARTED, not from its current size -- otherwise it compounds: every
+/// embedding raises the bound that permits the next one, which is how a
+/// percentage bound turns back into no bound at all.
+/// ROUND PHI: **0 = off.** The mechanism is built and kept; the default is
+/// off because it MEASURED WORSE than what it would replace, on both
+/// benchmarks and in both directions:
+///
+///   JS engine, 30 % growth bound   +6.66 %  (won 2 of 11 pairs)
+///   WASM interpreter, 30 %        +23.04 %  (won 0 of 7 pairs)
+///   JS engine, 100 %               -0.41 %  (a tie with the default)
+///   JS engine, 400 %               +2.61 %  (converging back onto it)
+///
+/// WHY IT DOES NOT WORK. What hurts the WASM interpreter is not how much one
+/// caller grows, it is WHICH bodies get in at all: a percentage bound still
+/// lets forty instruction bodies into the opcode chain, it just lets fewer
+/// of them, and the I-cache does not care how many there are.
+///
+/// Both knobs at 0 is a byte identical no-op against round INLINE's
+/// default -- verified by md5 of the built JS engine -- which is what makes
+/// it an honest reference side. `FIRNC_GROW_PERCENT` / `FIRNC_GROW_MIN`
+/// switch it on for measuring.
+const GROW_PERCENT: usize = 0;
+/// Absolute slack, so a 10 instruction function may still take one 12
+/// instruction body. Without it `GROW_PERCENT` alone would lock out exactly
+/// the small hot helpers a small hot caller is made of.
+const GROW_MIN_INSTS: usize = 0;
+
+fn grow_percent() -> usize {
+    match std::env::var("FIRNC_GROW_PERCENT") {
+        Ok(v) => v.trim().parse().unwrap_or(GROW_PERCENT),
+        Err(_) => GROW_PERCENT,
     }
-    false
 }
 
-/// Can a function reach itself again through at least one call (direct or
-/// indirect recursion)?
-///
-/// Such bodies are NOT embedded. Inlining unrolls one recursion level and
-/// moves its frames into the caller — program code whose effect rests on the
-/// stack depth (the stack scrubbing of the conservative GC, `lib/gc`:
-/// `__gc_scrub_deep`) loses its effect that way. MEASURED in round 37: with
-/// raised bounds (60/10) `__gc_scrub_deep` (29 insts, 9 blocks, recursive)
-/// got embedded into `main` — `tests/520_gc_weak.fi` failed with exit 6,
-/// because phantom pointers in the unscrubbed stack fed the collector.
-///
-fn reaches_itself_self(m: &Module, name: &str) -> bool {
-    if let Some(f) = m.funcs.iter().find(|f| f.name == name) {
-        for b in &f.blocks {
-            for i in &b.insts {
-                if let Op::Call { name: target, .. } = &i.op {
-                    if reaches(m, target, name) {
-                        return true;
-                    }
-                }
-            }
-        }
+fn grow_min_insts() -> usize {
+    match std::env::var("FIRNC_GROW_MIN") {
+        Ok(v) => v.trim().parse().unwrap_or(GROW_MIN_INSTS),
+        Err(_) => GROW_MIN_INSTS,
     }
-    false
 }
+
+fn max_inlines() -> usize {
+    match std::env::var("FIRNC_MAX_INLINES") {
+        Ok(v) => v.trim().parse().unwrap_or(MAX_INLINES),
+        Err(_) => MAX_INLINES,
+    }
+}
+
+/// ROUND INLINE -- the SIZE bound that applies once the count budget is used
+/// up. See `MAX_ALWAYS_INSTS`. Overridable for measuring.
+fn always_insts() -> usize {
+    match std::env::var("FIRNC_ALWAYS_INSTS") {
+        Ok(v) => v.trim().parse().unwrap_or(MAX_ALWAYS_INSTS),
+        Err(_) => MAX_ALWAYS_INSTS,
+    }
+}
+
+// ROUND INLINE: `reaches` / `reaches_itself_self` are replaced by the memoised
+// `Reach` below. The reasoning that a self reachable body must not be
+// embedded is unchanged and documented there and at `inlinable`.
+//
+// The round 37 warning that produced the rule, kept verbatim:
+//   with raised bounds (60/10) `__gc_scrub_deep` (29 insts, 9 blocks,
+//   recursive) got embedded into `main` -- `tests/520_gc_weak.fi` failed
+//   with exit 6, because phantom pointers in the unscrubbed stack fed the
+//   collector.
 
 fn inlinable(callee: &Func) -> bool {
     // Loop free bodies WITHOUT a return value (effect through pointer
@@ -118,10 +231,130 @@ fn inlinable(callee: &Func) -> bool {
         && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
 }
 
-/// Looks for a worthwhile call site in the caller `ci`.
-/// `self_rec`: precomputed per function (does not change through
-/// embeddings — only the caller is mutated).
-fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, usize)> {
+/// ROUND INLINE — the call graph as an index instead of a linear search.
+///
+/// `find_site` used to resolve every callee name with
+/// `m.funcs.iter().position(...)` — a linear scan over all 1638 functions of
+/// the JS engine, at every call site, on every pass. The map is built once.
+/// Function names never change during the pass (only bodies do), so it stays
+/// valid throughout.
+struct NameIndex {
+    by_name: HashMap<String, usize>,
+}
+
+impl NameIndex {
+    fn new(m: &Module) -> Self {
+        let mut by_name = HashMap::with_capacity(m.funcs.len() * 2);
+        for (i, f) in m.funcs.iter().enumerate() {
+            // First definition wins — the same rule `position()` followed.
+            by_name.entry(f.name.clone()).or_insert(i);
+        }
+        NameIndex { by_name }
+    }
+    fn get(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).copied()
+    }
+}
+
+/// ROUND INLINE — `reaches` memoised over the ORIGINAL call graph.
+///
+/// The old code ran a fresh DFS over the whole module for every candidate
+/// call site, and `reaches_itself_self` ran one DFS per call instruction of
+/// every function on top. Both ask the same question about the same graph.
+///
+/// **Why a snapshot of the graph is the right answer and not a shortcut.**
+/// Inlining only ever *removes* a call edge from the caller and copies the
+/// callee's edges in its place. So the set of functions reachable from any
+/// function is unchanged by embedding: whatever the embedded body could
+/// reach, the caller could already reach through the call it replaced. The
+/// reachability relation is therefore an invariant of the pass, and computing
+/// it once is not an approximation — it is the same answer the repeated DFS
+/// gave, minus the repetition.
+struct Reach {
+    /// adjacency of the original call graph, as indices
+    adj: Vec<Vec<usize>>,
+    /// memo: for caller index -> set of indices reachable from it
+    memo: HashMap<usize, HashSet<usize>>,
+}
+
+impl Reach {
+    fn new(m: &Module, idx: &NameIndex) -> Self {
+        let mut adj: Vec<Vec<usize>> = Vec::with_capacity(m.funcs.len());
+        for f in &m.funcs {
+            let mut out: Vec<usize> = Vec::new();
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Op::Call { name, .. } = &i.op {
+                        if let Some(g) = idx.get(name) {
+                            out.push(g);
+                        }
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            adj.push(out);
+        }
+        Reach { adj, memo: HashMap::new() }
+    }
+
+    /// Everything reachable from `from` through calls, `from` itself only if
+    /// it lies on a cycle. Iterative — the call graph of the JS engine is
+    /// deeper than the Rust stack likes.
+    fn set_of(&mut self, from: usize) -> &HashSet<usize> {
+        if !self.memo.contains_key(&from) {
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut stack: Vec<usize> = self.adj[from].clone();
+            while let Some(cur) = stack.pop() {
+                if !seen.insert(cur) {
+                    continue;
+                }
+                for &n in &self.adj[cur] {
+                    if !seen.contains(&n) {
+                        stack.push(n);
+                    }
+                }
+            }
+            self.memo.insert(from, seen);
+        }
+        self.memo.get(&from).expect("just inserted")
+    }
+
+    /// Can `from` reach `to`? (the old `reaches(m, from, to)`, where
+    /// `from == to` counted as true straight away)
+    fn reaches(&mut self, from: usize, to: usize) -> bool {
+        from == to || self.set_of(from).contains(&to)
+    }
+
+    /// Can the body of `g` reach `g` again — direct or indirect recursion?
+    /// The old `reaches_itself_self`: true when SOME callee of `g` reaches
+    /// `g`. That is exactly "`g` lies on a cycle", i.e. `g` is reachable
+    /// from `g` over at least one edge.
+    fn self_rec(&mut self, g: usize) -> bool {
+        self.set_of(g).contains(&g)
+    }
+}
+
+/// Looks for a worthwhile call site in the caller `ci`, starting at
+/// `(from_bi, from_ii)`.
+///
+/// ROUND INLINE — the scan RESUMES instead of starting over. `inline_one`
+/// only ever appends blocks and rewrites the calling block; everything before
+/// the call site that was just handled has already been judged and cannot
+/// have become inlinable in the meantime. Restarting at block 0 re-walked the
+/// whole (and growing) body after every single embedding, which is one of the
+/// four quadratic factors this round removed.
+fn find_site(
+    m: &Module,
+    ci: usize,
+    from_bi: usize,
+    from_ii: usize,
+    idx: &NameIndex,
+    reach: &mut Reach,
+    // ROUND INLINE: `Some(k)` = the count budget is used up, only bodies of
+    // at most `k` instructions are still embedded. `None` = no extra bound.
+    small_only: Option<usize>,
+) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
         return None;
@@ -132,16 +365,24 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
     if caller.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return None;
     }
-    for (bi, b) in caller.blocks.iter().enumerate() {
-        for (ii, inst) in b.insts.iter().enumerate() {
+    for bi in from_bi..caller.blocks.len() {
+        let b = &caller.blocks[bi];
+        let start = if bi == from_bi { from_ii } else { 0 };
+        for ii in start..b.insts.len() {
+            let inst = &b.insts[ii];
             if let Op::Call { name, args } = &inst.op {
-                let gi = match m.funcs.iter().position(|f| &f.name == name) {
+                let gi = match idx.get(name) {
                     Some(g) => g,
                     None => continue,
                 };
                 let callee = &m.funcs[gi];
                 if gi == ci || !inlinable(callee) {
                     continue;
+                }
+                if let Some(k) = small_only {
+                    if callee.inst_count() > k {
+                        continue;
+                    }
                 }
                 if callee.params.len() != args.len() {
                     continue;
@@ -150,11 +391,11 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
                     continue;
                 }
                 // Recursion (indirect one too) is not embedded.
-                if reaches(m, &callee.name, &caller.name) {
+                if reach.reaches(gi, ci) {
                     continue;
                 }
                 // Self reachable bodies neither (see above).
-                if self_rec[gi] {
+                if reach.self_rec(gi) {
                     continue;
                 }
                 return Some((bi, ii, gi));
@@ -413,33 +654,109 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
 
 /// Embeds as long as the heuristic allows. Yields the number of embedded
 /// calls.
+///
+/// ROUND INLINE — a worklist instead of `'outer: loop { for ci in 0.. }`.
+///
+/// The old driver restarted the scan at function 0 after EVERY embedding and
+/// `continue 'outer`'d out of the loop, so reaching function 1600 of the JS
+/// engine meant walking functions 0..1599 again — 2000 times over. Together
+/// with the linear name lookup, the per-site call graph DFS and the
+/// restart-at-block-0 inside `find_site` that is what made the pass O(n²) and
+/// 5.8 s of the 12 s compile.
+///
+/// The replacement walks each caller ONCE and stays with it until it has no
+/// site left, remembering where the last site was found. `inline_one` mutates
+/// only the caller, so no other function's verdict can change while we work.
 pub fn inline_module(m: &mut Module) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
-    // Determined once: it hangs off the body of the callee only, which never
-    // changes through embeddings (only the caller is mutated).
-    let self_rec: Vec<bool> = m
-        .funcs
-        .iter()
-        .map(|f| reaches_itself_self(m, &f.name))
-        .collect();
-    'outer: loop {
-        for ci in 0..m.funcs.len() {
-            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec) {
-                if dbg {
-                    eprintln!("inline: {} <- {} ({} insts, {} blocks)",
-                        m.funcs[ci].name, m.funcs[gi].name,
-                        m.funcs[gi].inst_count(), m.funcs[gi].blocks.len());
+    let cap = max_inlines();
+    let always = always_insts();
+    let idx = NameIndex::new(m);
+    let mut reach = Reach::new(m, &idx);
+
+    // ROUND PHI -- the per caller allowance, computed from the size the
+    // caller has BEFORE the pass touches it. Reading it here, once, is what
+    // keeps a percentage bound from compounding: if the allowance were
+    // recomputed from the current size, every embedding would raise the
+    // bound that permits the next one.
+    let gp = grow_percent();
+    let gmin = grow_min_insts();
+    let start_insts: Vec<usize> = m.funcs.iter().map(|f| f.inst_count()).collect();
+
+    for ci in 0..m.funcs.len() {
+        // Where the previous site sat: the scan resumes here instead of
+        // walking the (now longer) body from the start again.
+        let mut bi = 0usize;
+        let mut ii = 0usize;
+        // How many instructions this caller may still take on beyond the
+        // always-embed size. `usize::MAX` when the growth bound is switched
+        // off (gp == 0 and gmin == 0), which restores the pure count budget.
+        // `FIRNC_GROW_PERCENT=0 FIRNC_GROW_MIN=0` must be a true no-op --
+        // the pure count budget of round INLINE, byte for byte -- so that
+        // the A/B comparison has an honest reference side. `allow = 0` would
+        // instead be the harshest possible bound, which is the opposite.
+        let allow = if gp == 0 && gmin == 0 {
+            usize::MAX
+        } else {
+            (start_insts[ci].saturating_mul(gp) / 100).max(gmin)
+        };
+        let mut grown = 0usize;
+        loop {
+            // ROUND PHI -- TWO bounds, and the order between them is the
+            // whole design:
+            //
+            //  * a body of at most `always` instructions is embedded
+            //    regardless of any budget. That is the rule that gets
+            //    `__gc_ld64` into the collector's callers and into the
+            //    interpreter's opcode chain, and round INLINE measured it as
+            //    the one that pays (-39 % on the JS engine, and it costs the
+            //    WASM interpreter nothing).
+            //  * a LARGER body is embedded only while this caller has not
+            //    used up its own allowance. That is what the module wide
+            //    count budget was trying and failing to do.
+            //
+            // The count budget stays as an outer limit so that a pathological
+            // module cannot run away, but at the default it is no longer what
+            // decides: the per caller bound bites first.
+            let over_count = n >= cap;
+            let small_only = if over_count || grown >= allow { Some(always) } else { None };
+            if let Some(0) = small_only {
+                break;
+            }
+            match find_site(m, ci, bi, ii, &idx, &mut reach, small_only) {
+                Some((fbi, fii, gi)) => {
+                    if dbg {
+                        eprintln!(
+                            "inline: {} <- {} ({} insts, {} blocks)",
+                            m.funcs[ci].name,
+                            m.funcs[gi].name,
+                            m.funcs[gi].inst_count(),
+                            m.funcs[gi].blocks.len()
+                        );
+                    }
+                    // Count the growth BEFORE the body is copied in: after
+                    // `inline_one` the callee's instructions are part of the
+                    // caller and `inst_count()` of the callee is unchanged,
+                    // but reading it here is the honest number and needs no
+                    // second pass over the caller.
+                    let added = m.funcs[gi].inst_count();
+                    inline_one(m, ci, fbi, fii, gi);
+                    if added > always {
+                        grown += added;
+                    }
+                    n += 1;
+                    // The call at (fbi, fii) is gone: the block was split
+                    // there and everything after it moved into the new
+                    // continuation block at the end. Carry on at the same
+                    // block from the same index — what stands there now is
+                    // the first instruction of the embedded body.
+                    bi = fbi;
+                    ii = fii;
                 }
-                inline_one(m, ci, bi, ii, gi);
-                n += 1;
-                if n >= MAX_INLINES {
-                    break 'outer;
-                }
-                continue 'outer;
+                None => break,
             }
         }
-        break;
     }
     n
 }

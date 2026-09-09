@@ -399,6 +399,17 @@ impl<'a> Lower<'a> {
                 None if self.info.statics.contains_key(name) => {
                     Some(self.push(FTy::Ptr, Op::GlobalAddr { name: name.clone() }))
                 }
+                // HOOK env (round FIRN-ENV): a `const` of type `str` is not
+                // a place but a VALUE, exactly like the literal it stands
+                // for. Where an address is wanted, it gets one of its own --
+                // the same three lines a written literal gets below.
+                None if self.info.const_texts.contains_key(name) => {
+                    let t = self.ty_of(e);
+                    let (size, align) = self.size_align(&t);
+                    let slot = self.alloca(size, align);
+                    self.write_into(slot, e)?;
+                    Some(slot)
+                }
                 None => {
                     if self.info.consts.contains_key(name) {
                         self.err(e.span, "a constant has no address")
@@ -573,6 +584,42 @@ impl<'a> Lower<'a> {
                 };
                 self.store(FTy::Ptr, pa, p);
                 let len = self.constant(FTy::U64, n as i128);
+                self.store(FTy::U64, na, len);
+                Some(())
+            }
+            // HOOK env (round FIRN-ENV): a `const` of type `str`. Its octets
+            // stand in `TypeInfo::const_texts`, and what is built out of them
+            // is what the arm above builds out of a literal -- a place for
+            // the octets, and the two words `p`/`n` next to it. The arm sits
+            // BEHIND the local lookup (`self.lookup`), so a local of the same
+            // spelling still wins, the way it does everywhere else.
+            ExprKind::Ident(name)
+                if self.lookup(name).is_none()
+                    && self.info.const_texts.contains_key(name) =>
+            {
+                let octets = match self.info.const_texts.get(name) {
+                    Some(b) => b.clone(),
+                    None => return self.ice(e.span, "text constant without octets"),
+                };
+                let sidx = match t {
+                    Type::Struct(i) => i,
+                    _ => return self.ice(e.span, "text constant without str type"),
+                };
+                let pa = self.field_addr(addr, sidx, crate::strtype::F_PTR, e.span)?;
+                let na = self.field_addr(addr, sidx, crate::strtype::F_LEN, e.span)?;
+                let p = if octets.is_empty() {
+                    self.constant(FTy::Ptr, 0)
+                } else {
+                    let bytes = self.alloca(octets.len() as u64, 1);
+                    for (i, b) in octets.iter().enumerate() {
+                        let ea = self.elem_addr_const(bytes, 1, i as u64);
+                        let v = self.constant(FTy::U8, *b as i128);
+                        self.store(FTy::U8, ea, v);
+                    }
+                    bytes
+                };
+                self.store(FTy::Ptr, pa, p);
+                let len = self.constant(FTy::U64, octets.len() as i128);
                 self.store(FTy::U64, na, len);
                 Some(())
             }
@@ -2180,6 +2227,7 @@ mod tests {
             tcx,
             expr_types: b.types.clone(),
             consts: HashMap::new(),
+            const_texts: HashMap::new(),
             statics: HashMap::new(),
             fns: HashMap::new(),
             widen_f32: std::collections::HashSet::new(),
