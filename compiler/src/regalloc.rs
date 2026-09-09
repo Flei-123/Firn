@@ -141,6 +141,161 @@ const POOL: [&str; 12] = [
 /// A set of [`POOL`] registers.
 type RegMask = u16;
 
+// ------------------------------------------------- THE MACHINE (round REGALLOC-A64) ---
+//
+// ROUND REGALLOC-A64 — WHY THERE IS A SECOND REGISTER FILE IN THIS FILE.
+//
+// Up to this round every register name in `regalloc.rs` was an x86 name, and
+// `codegen_a64.rs` therefore had no register allocation at all: every FIR
+// value went through its frame slot, constants included. Certus measured
+// what that costs (`docs/RUNDE-TEMPO-3.md`): the same Firn source, the same
+// compiler, `misch_zeile` 264 instructions on x86 and 403 on aarch64, and
+// 33 % of the aarch64 body was stack traffic against 8 % on x86.
+//
+// The ANALYSIS in this file was never x86 specific — `compute_live`,
+// `promotable_cells`, `immediate_consts`, `loop_depth`, `count_reads`,
+// `exact_crossings` and `direct_frame_addrs` do not contain a single
+// register name between them. What was x86 specific is the register FILE
+// (which names exist, which of them a call destroys) and the EMISSION.
+//
+// This struct is the first half of the answer: the register file as data,
+// so that the linear scan can run for a machine it does not have to know.
+// The second half is `emit_a64.rs`, which emits A64 out of the same `Alloc`.
+//
+// The masks stay a `u16` and stay POSITIONAL: bit k is the k-th entry of
+// `pool`, whatever it is called on this machine. Everything that speaks in
+// masks — `inst_clobbers`, `exact_crossings`, `Iv::killed` — therefore keeps
+// working unchanged, which is the point of doing it this way.
+#[derive(Clone, Copy)]
+pub(crate) struct Machine {
+    /// every register that may ever hold a value, in mask-bit order
+    pub(crate) pool: &'static [&'static str],
+    /// those of `pool` that survive a call (the prologue saves them)
+    pub(crate) callee_saved: &'static [&'static str],
+    /// handed out first: caller-saved, free when no call is crossed
+    pub(crate) temp: &'static [&'static str],
+    /// argument registers, usable when no call and no block memory op is crossed
+    pub(crate) arg_spare: &'static [&'static str],
+    /// scratch of the division/select sequence, usable when none is crossed
+    pub(crate) div_spare: &'static [&'static str],
+    /// everything a call destroys
+    pub(crate) m_call: RegMask,
+    /// everything a `rep movsb`-style block memory operation destroys
+    pub(crate) m_memop: RegMask,
+}
+
+impl Machine {
+    /// Bit of a register on THIS machine; 0 for anything not in the pool.
+    fn bit(&self, r: &str) -> RegMask {
+        match self.pool.iter().position(|p| *p == r) {
+            Some(k) => 1 << k,
+            None => 0,
+        }
+    }
+    /// Mask of a whole list.
+    const fn mask_of(pool: &[&str], list: &[&str]) -> RegMask {
+        let mut m: RegMask = 0;
+        let mut i = 0;
+        while i < list.len() {
+            let mut k = 0;
+            while k < pool.len() {
+                if eq_str(pool[k], list[i]) {
+                    m |= 1 << k;
+                }
+                k += 1;
+            }
+            i += 1;
+        }
+        m
+    }
+}
+
+/// `==` for `&str` in a `const fn` (round REGALLOC-A64: the masks are built
+/// at compile time, and `str::eq` is not const).
+const fn eq_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// ---- x86-64, System V: exactly the file this allocator has always had ----
+const X86_POOL: [&str; 12] = [
+    "rbx", "r12", "r13", "r14", "r15", "r11", "r10", "r9", "r8", "rsi", "rdi", "rdx",
+];
+const X86_CALLEE: [&str; 5] = ["rbx", "r12", "r13", "r14", "r15"];
+const X86_TEMP: [&str; 4] = ["r11", "r10", "r9", "r8"];
+const X86_ARG: [&str; 2] = ["rsi", "rdi"];
+const X86_DIV: [&str; 1] = ["rdx"];
+
+pub(crate) const X86: Machine = Machine {
+    pool: &X86_POOL,
+    callee_saved: &X86_CALLEE,
+    temp: &X86_TEMP,
+    arg_spare: &X86_ARG,
+    div_spare: &X86_DIV,
+    m_call: Machine::mask_of(&X86_POOL, &["r11", "r10", "r9", "r8", "rsi", "rdi", "rdx"]),
+    m_memop: Machine::mask_of(&X86_POOL, &["rdi", "rsi"]),
+};
+
+// ---- aarch64, AAPCS64 ----
+//
+// WHICH REGISTERS ARE FREE HERE, AND WHY THESE.
+//
+// AAPCS64 splits x0-x30 into caller-saved x0-x17 and callee-saved x19-x28,
+// with x18 the platform register (untouchable), x29 the frame pointer and
+// x30 the link register. That is the ABI. What is left after the BACKEND
+// has taken its share is smaller:
+//
+//   x0-x7   argument and result registers. Usable for a value exactly as
+//           long as its interval crosses no call -- `bl` overwrites them
+//           and so does building the next argument list.
+//   x8      indirect result register, and `panic_rt_a64`/`simd_a64` use it
+//           as scratch. NOT handed out.
+//   x9-x17  the scratch of `codegen_a64.rs` (A=x9, B=x10, C=x11, ADDR=x12,
+//           T1=x13, T2=x14) and of `panic_rt_a64.rs`/`simd_a64.rs`
+//           (x15, x16, x17). Every one of them can be written between two
+//           instructions of a value's lifetime. NOT handed out.
+//   x19-x28 callee-saved, saved in the prologue like `rbx` and friends on
+//           the other machine. The main supply.
+//
+// So: ten long-lived registers and eight short-lived ones, against x86's
+// five and seven. A64 is the RICHER machine here, which is the reason the
+// result below beats the x86 instruction count rather than merely matching it.
+const A64_POOL: [&str; 18] = [
+    "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+];
+const A64_CALLEE: [&str; 10] =
+    ["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"];
+/// A64 has no register that is caller-saved AND not an argument register:
+/// x9-x17 belong to the backend. The argument registers are the whole
+/// short-lived supply, and they are asked through `arg_spare`.
+const A64_TEMP: [&str; 0] = [];
+const A64_ARG: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+const A64_DIV: [&str; 0] = [];
+
+pub(crate) const A64: Machine = Machine {
+    pool: &A64_POOL,
+    callee_saved: &A64_CALLEE,
+    temp: &A64_TEMP,
+    arg_spare: &A64_ARG,
+    div_spare: &A64_DIV,
+    // A call destroys every argument register. The callee-saved ten survive it.
+    m_call: Machine::mask_of(&A64_POOL, &A64_ARG),
+    // `copymem`/`secure_zero` on this backend run in x9-x14 and touch no
+    // pool register at all.
+    m_memop: 0,
+};
+
 const M_RBX: RegMask = 1 << 0;
 const M_R12: RegMask = 1 << 1;
 const M_R13: RegMask = 1 << 2;
@@ -193,7 +348,35 @@ fn reg_bit(r: &str) -> RegMask {
 /// writes only its target, and only `mul cx`/`ecx`/`rcx` really splits the
 /// product across `rdx:rax`.
 fn inst_clobbers(i: &Inst) -> RegMask {
+    inst_clobbers_on(i, &X86)
+}
+
+/// ROUND REGALLOC-A64 — the same question for a named machine.
+///
+/// The whole table below is a list of x86 ODDITIES: instructions that write
+/// a register their operand list never mentions (`mul` into rdx:rax,
+/// `div`/`idiv` out of it, `cqo`, the `cmov` sequences that park a bound in
+/// rdx, `rep movsb` in rdi/rsi). A64 has none of them. It divides with
+/// `sdiv`/`udiv` into the target register, multiplies with `mul`/`smulh`
+/// into the target register, and every helper the backend needs sits in
+/// x9-x17, which is not in the A64 pool at all.
+///
+/// So on aarch64 exactly ONE thing destroys a pool register: a call. That is
+/// not a simplification that was chosen, it is what the machine is — and it
+/// is the reason the argument registers are worth handing out there.
+fn inst_clobbers_on(i: &Inst, m: &Machine) -> RegMask {
     let ty = i.ty;
+    if m.pool.first() == Some(&"x19") {
+        return match &i.op {
+            Op::Call { .. }
+            | Op::CallIndirect { .. }
+            | Op::Syscall { .. }
+            | Op::ThreadSpawn { .. } => m.m_call,
+            // `__cpu_features()` is a call on this machine too (simd_a64).
+            Op::Simd { .. } if is_cpuid(&i.op) => m.m_call,
+            _ => 0,
+        };
+    }
     match &i.op {
         // A call and everything shaped like one. `syscall` itself only
         // destroys rax/rcx/r11 architecturally, but building its argument
@@ -663,7 +846,7 @@ fn each_and(a: &Bits, b: &Bits, mut f: impl FnMut(usize)) {
 
 /// For every value: WHICH pool registers really die while it is alive?
 /// Exact, along the control flow, using [`inst_clobbers`] as its only table.
-fn exact_crossings(f: &Func, live: &Live) -> Vec<RegMask> {
+fn exact_crossings(f: &Func, live: &Live, mach: &Machine) -> Vec<RegMask> {
     let nv = f.val_types.len();
     let mut killed = vec![0 as RegMask; nv];
     let mut after = Bits::new(nv);
@@ -686,7 +869,7 @@ fn exact_crossings(f: &Func, live: &Live) -> Vec<RegMask> {
             }
         }
         for i in b.insts.iter().rev() {
-            let m = inst_clobbers(i);
+            let m = inst_clobbers_on(i, mach);
             if m != 0 {
                 after.copy_from(&cur);
             }
@@ -1081,6 +1264,11 @@ fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Optio
 
 /// Carries out the complete allocation.
 pub fn allocate(f: &Func) -> Alloc {
+    allocate_on(f, &X86)
+}
+
+/// The allocation for a named machine (round REGALLOC-A64).
+pub(crate) fn allocate_on(f: &Func, m: &Machine) -> Alloc {
     let nv = f.val_types.len();
     let nb = f.blocks.len();
     let mut locs: Vec<Loc> = Vec::with_capacity(nv);
@@ -1123,7 +1311,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // exactly as before this round. `FIRN_RA_ROUGH=1` forces that state for
     // troubleshooting.
     let exact = if live.converged && std::env::var_os("FIRN_RA_ROUGH").is_none() {
-        Some(exact_crossings(f, &live))
+        Some(exact_crossings(f, &live, m))
     } else {
         None
     };
@@ -1141,9 +1329,10 @@ pub fn allocate(f: &Func) -> Alloc {
     // these were two lists with two different op sets, and the difference was
     // the bug of this round.
     let mut clob_pos: Vec<(usize, RegMask)> = Vec::new();
+    let mach = m;
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
-            let m = inst_clobbers(i);
+            let m = inst_clobbers_on(i, mach);
             if m != 0 {
                 clob_pos.push((live.pos[bi][ii], m));
             }
@@ -1325,14 +1514,14 @@ pub fn allocate(f: &Func) -> Alloc {
     //
     // Four pools, from the most restricted to the freest register. `fits`
     // checks whether a register tolerates the crossings of an interval.
-    fn fits(iv: &Iv, r: &str) -> bool {
-        let b = reg_bit(r);
+    fn fits(iv: &Iv, r: &str, m: &Machine) -> bool {
+        let b = m.bit(r);
         b != 0 && iv.killed & b == 0
     }
-    let mut free_saved: Vec<&'static str> = CALLEE_SAVED.to_vec();
-    let mut free_temp: Vec<&'static str> = TEMP_REGS.to_vec();
-    let mut free_arg: Vec<&'static str> = ARG_SPARE.to_vec();
-    let mut free_div: Vec<&'static str> = DIV_SPARE.to_vec();
+    let mut free_saved: Vec<&'static str> = m.callee_saved.to_vec();
+    let mut free_temp: Vec<&'static str> = m.temp.to_vec();
+    let mut free_arg: Vec<&'static str> = m.arg_spare.to_vec();
+    let mut free_div: Vec<&'static str> = m.div_spare.to_vec();
     let mut active: Vec<(Iv, &'static str)> = Vec::new();
     let mut assign: HashMap<Val, &'static str> = HashMap::new();
     let mut used_saved: Vec<&'static str> = Vec::new();
@@ -1342,11 +1531,11 @@ pub fn allocate(f: &Func) -> Alloc {
                      free_temp: &mut Vec<&'static str>,
                      free_arg: &mut Vec<&'static str>,
                      free_div: &mut Vec<&'static str>| {
-        if TEMP_REGS.contains(&r) {
+        if m.temp.contains(&r) {
             free_temp.push(r);
-        } else if ARG_SPARE.contains(&r) {
+        } else if m.arg_spare.contains(&r) {
             free_arg.push(r);
-        } else if DIV_SPARE.contains(&r) {
+        } else if m.div_spare.contains(&r) {
             free_div.push(r);
         } else {
             free_saved.push(r);
@@ -1400,7 +1589,7 @@ pub fn allocate(f: &Func) -> Alloc {
         // register of a pool) wherever the whole pool fits, and skips exactly
         // the registers this interval may not have.
         let take = |pool: &mut Vec<&'static str>| -> Option<&'static str> {
-            pool.iter().rposition(|r| fits(&iv, r)).map(|k| pool.remove(k))
+            pool.iter().rposition(|r| fits(&iv, r, m)).map(|k| pool.remove(k))
         };
         // MEASURED, round 90: letting a cell ask the callee-saved pool FIRST
         // (it lives long, and the four temp registers are what the short
@@ -1415,7 +1604,7 @@ pub fn allocate(f: &Func) -> Alloc {
             .or_else(|| take(&mut free_saved));
         match pick {
             Some(r) => {
-                if CALLEE_SAVED.contains(&r) && !used_saved.contains(&r) {
+                if m.callee_saved.contains(&r) && !used_saved.contains(&r) {
                     used_saved.push(r);
                 }
                 assign.insert(iv.val, r);
@@ -1427,7 +1616,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 // the later end decides.
                 let mut worst: Option<usize> = None;
                 for (k, (a, r)) in active.iter().enumerate() {
-                    if !fits(&iv, r) {
+                    if !fits(&iv, r, m) {
                         continue; // this register does not help us
                     }
                     let better = match worst {
@@ -1450,7 +1639,7 @@ pub fn allocate(f: &Func) -> Alloc {
                     }
                 }
                 // otherwise this value stays in the stack slot
-                if iv.killed & M_CALL != 0 {
+                if iv.killed & m.m_call != 0 {
                     st.lost_call += 1;
                 } else {
                     st.lost_plain += 1;
@@ -1542,7 +1731,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 // register. (Failure picture: bin/layoutdump.fi crashed
                 // in `intern_find` with t=0.)
                 if matches!(nj.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. })
-                    && !CALLEE_SAVED.contains(&rc)
+                    && !m.callee_saved.contains(&rc)
                 {
                     destroys = true;
                     break;
