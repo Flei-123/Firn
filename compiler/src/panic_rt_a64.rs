@@ -283,17 +283,6 @@ fn extend_to(e: &mut Emitter, dst: &str, src: &str, ty: FTy) {
 /// Emits `+ - *`, CHECKED. Precondition: `x9` = a and `x10` = b, both
 /// already extended to 64 bits the way `ty` reads them (`load_ext(.., 64)`
 /// in `codegen_a64.rs` produces exactly that). The result is left in `x9`.
-pub(crate) fn emit_checked_bin(
-    e: &mut Emitter,
-    op: BinOp,
-    ty: FTy,
-    msg: &str,
-    site: &mut SiteCounter,
-    restore: &dyn Fn(&mut Emitter),
-) {
-    emit_checked_bin_at(e, op, ty, msg, site, restore, A, None, A)
-}
-
 /// ROUND REGALLOC-A64 -- the same operation, but told WHERE its operands are
 /// and where the result belongs. `src` is the left operand's register, `imm`
 /// an optional 12-bit immediate for the right one (else it is in `B`), and
