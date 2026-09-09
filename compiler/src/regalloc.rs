@@ -576,6 +576,9 @@ impl Alloc {
         self.loc(v)
     }
     /// Immediate operand of a value, if it is suitable as one.
+    pub(crate) fn imm_of(&self, v: Val) -> Option<i64> {
+        self.imms.get(&v).copied()
+    }
     fn imm(&self, v: Val) -> Option<i64> {
         self.imms.get(&v).copied()
     }
@@ -2710,6 +2713,55 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
 /// one needs the frame.
 fn debug_vars_active(_f: &Func) -> bool {
     crate::dwarf::with_variables()
+}
+
+/// ROUND REGALLOC-A64 — the guard and the allocation for the A64 backend.
+///
+/// The guard is `unsupported_basic`, unchanged and shared: everything it
+/// refuses (inline assembler, MMIO, vectors, floating point, non-consecutive
+/// blocks) it refuses for a reason that is about the FIR or about binding
+/// fixed registers, not about x86. A function it lets through gets an
+/// allocation over the AAPCS64 file; anything else gets `None` and travels
+/// the round 80 path, which is still there and still correct.
+pub(crate) fn allocate_a64(f: &Func) -> Option<Alloc> {
+    if !supported(f) {
+        return None;
+    }
+    if std::env::var_os("FIRN_NO_RA_A64").is_some() {
+        return None;
+    }
+    // Troubleshooting handle of this round: allocate ONLY for the functions
+    // whose name contains one of these comma separated fragments. That is
+    // how a miscompilation in a 4000 line program is bisected down to the
+    // one function that has it.
+    if let Some(only) = std::env::var_os("FIRN_RA_A64_ONLY") {
+        let pat = only.to_string_lossy().to_string();
+        if !pat.split(',').any(|q| !q.is_empty() && f.name.contains(q)) {
+            return None;
+        }
+    }
+    if let Some(skip) = std::env::var_os("FIRN_RA_A64_SKIP") {
+        let pat = skip.to_string_lossy().to_string();
+        if pat.split(',').any(|q| !q.is_empty() && f.name.contains(q)) {
+            return None;
+        }
+    }
+    Some(allocate_on(f, &A64))
+}
+
+/// The callee-saved registers this allocation really uses, in a stable order.
+impl Alloc {
+    pub(crate) fn used_callee_saved(&self, m: &Machine) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = Vec::new();
+        for r in m.callee_saved {
+            let used = self.locs.iter().any(|l| matches!(l, Loc::Reg(x) if x == r))
+                || self.cells.values().any(|x| x == r);
+            if used {
+                v.push(r);
+            }
+        }
+        v
+    }
 }
 
 fn supported(f: &Func) -> bool {

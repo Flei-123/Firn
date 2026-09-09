@@ -161,9 +161,31 @@ pub(crate) struct Frame {
     outgoing: u64,
     /// values defined by `Op::Const` — the system call number has to be one
     consts: HashMap<Val, i128>,
+    /// ROUND REGALLOC-A64 — where the register allocation put each value.
+    /// Empty means "everything in its slot", which is exactly the model
+    /// round 80 built and which every path here still falls back to.
+    ra: Option<crate::regalloc::Alloc>,
+    /// ROUND REGALLOC-A64 — callee-saved registers this function really
+    /// uses, with the frame offset each is parked at over the call.
+    saved: Vec<(&'static str, u64)>,
 }
 
 impl Frame {
+    /// The register a value lives in, if it got one. THE one question the
+    /// whole register aware path asks; everything else follows from it.
+    pub(crate) fn reg_of(&self, v: Val) -> Option<&'static str> {
+        match self.ra.as_ref()?.place(v) {
+            crate::regalloc::Loc::Reg(r) => Some(r),
+            crate::regalloc::Loc::Slot(_) => None,
+        }
+    }
+
+    /// ROUND REGALLOC-A64 - a value the allocator proved needs neither a
+    /// register nor a slot: it is rebuilt at every use site instead.
+    fn imm_of(&self, v: Val) -> Option<i64> {
+        self.ra.as_ref()?.imm_of(v)
+    }
+
     /// Distance of a slot from `sp` (that is what an `ldr` gets to see).
     fn off(&self, v: Val) -> u64 {
         self.size - self.slot[v as usize]
@@ -240,6 +262,8 @@ fn layout(f: &Func) -> Frame {
         size: align_up(cursor + outgoing, 16),
         outgoing,
         consts,
+        ra: None,
+        saved: Vec::new(),
     }
 }
 
@@ -323,6 +347,18 @@ pub(crate) fn at(e: &mut Emitter, fr: &Frame, v: Val, scale: u64) -> String {
 
 /// Loads the complete 8-byte slot of a value.
 pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
+    // ROUND REGALLOC-A64: an immediate is built, not fetched.
+    if let Some(k) = fr.imm_of(v) {
+        imm_into(e, r, k);
+        return;
+    }
+    // ROUND REGALLOC-A64: the value may already be in a register.
+    if let Some(src) = fr.reg_of(v) {
+        if src != r {
+            e.line(&format!("mov {}, {}", r, src));
+        }
+        return;
+    }
     let m = at(e, fr, v, 8);
     e.line(&format!("ldr {}, {}", r, m));
 }
@@ -333,6 +369,43 @@ pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
 /// it is read.
 fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32) {
     let bits = ty.bits().max(8);
+    // ROUND REGALLOC-A64: an immediate is built at its use site. It was cut
+    // to its type when the allocator accepted it, so it already has the
+    // widened form this function promises.
+    if let Some(k) = fr.imm_of(v) {
+        imm_into(e, r, k);
+        return;
+    }
+    // ROUND REGALLOC-A64 -- THE VALUE IS ALREADY IN A REGISTER.
+    //
+    // A slot holds only the bits of its type and says nothing about the rest,
+    // which is why the memory path below widens while it reads. A REGISTER
+    // holding a FIR value is different: every writer in this backend
+    // (`store_dst` and the register path of the emission) leaves the full
+    // 64-bit value in it, already widened the way its type reads. So the
+    // extension is a no-op unless the consumer wants a NARROWER reading than
+    // the type gives -- and then it is one register instruction, not a load.
+    if let Some(src) = fr.reg_of(v) {
+        if bits >= to_bits {
+            if src != r {
+                e.line(&format!("mov {}, {}", rw(r, to_bits), rw(src, to_bits)));
+            }
+            return;
+        }
+        match (ty.signed(), bits) {
+            (true, 8) => e.line(&format!("sxtb {}, {}", rw(r, to_bits), w(src))),
+            (true, 16) => e.line(&format!("sxth {}, {}", rw(r, to_bits), w(src))),
+            (true, _) => e.line(&format!("sxtw {}, {}", r, w(src))),
+            (false, 8) => e.line(&format!("uxtb {}, {}", w(r), w(src))),
+            (false, 16) => e.line(&format!("uxth {}, {}", w(r), w(src))),
+            (false, _) => {
+                if src != r {
+                    e.line(&format!("mov {}, {}", w(r), w(src)));
+                }
+            }
+        }
+        return;
+    }
     if bits >= to_bits {
         let m = at(e, fr, v, if to_bits <= 32 { 4 } else { 8 });
         e.line(&format!("ldr {}, {}", rw(r, to_bits), m));
@@ -371,7 +444,55 @@ fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32)
 }
 
 /// Writes a register (full 64 bits) into the slot of the target value.
+/// ROUND REGALLOC-A64 — the widened form of a value, in place.
+///
+/// THE INVARIANT THIS FUNCTION EXISTS FOR, AND WHY IT IS NOT OPTIONAL.
+///
+/// Round 80 computes at 32 or 64 bits and lets the result keep whatever
+/// upper bits fall out, because the SLOT is narrow and `load_ext` widens
+/// again on the way back in ("the result gets cut to the type width when it
+/// is read again" — `emit_bin`). A register has no width. If a value lives
+/// in one, the reader can no longer repair it, so the WRITER has to leave it
+/// canonical: sign extended for a signed type, zero extended for an
+/// unsigned one, exactly as `load_ext` would have produced it out of memory.
+///
+/// Without this, `add w19, w19, w20` on two `i32` leaves a zero extended sum
+/// in x19 and the next signed comparison reads a large positive number where
+/// a negative one belongs. That is the one way this whole path could be
+/// wrong, and it is closed here rather than at forty call sites.
+fn canonicalise(e: &mut Emitter, r: &str, ty: FTy) {
+    let bits = ty.bits();
+    if bits >= 64 || ty.is_float() || ty == FTy::V128 {
+        return;
+    }
+    match (ty.signed(), bits.max(8)) {
+        // `bool` is 0/1 by construction everywhere in this backend.
+        _ if ty == FTy::Bool => {}
+        (true, 8) => e.line(&format!("sxtb {}, {}", r, w(r))),
+        (true, 16) => e.line(&format!("sxth {}, {}", r, w(r))),
+        (true, _) => e.line(&format!("sxtw {}, {}", r, w(r))),
+        (false, 8) => e.line(&format!("uxtb {}, {}", w(r), w(r))),
+        (false, 16) => e.line(&format!("uxth {}, {}", w(r), w(r))),
+        // A write to a `w` register already zeroed the upper half.
+        (false, _) => {}
+    }
+}
+
 pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
+    store_dst_ty(e, fr, d, r, FTy::I64)
+}
+
+/// `store_dst` for a value whose TYPE is known — the register path needs it
+/// to keep the widening invariant (see `canonicalise`).
+pub(crate) fn store_dst_ty(e: &mut Emitter, fr: &Frame, d: Val, r: &str, ty: FTy) {
+    // ROUND REGALLOC-A64: the target lives in a register -- the store is a move.
+    if let Some(dst) = fr.reg_of(d) {
+        if dst != r {
+            e.line(&format!("mov {}, {}", dst, r));
+        }
+        canonicalise(e, dst, ty);
+        return;
+    }
     let m = at(e, fr, d, 8);
     e.line(&format!("str {}, {}", r, m));
 }
@@ -394,7 +515,7 @@ fn load_fp(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
 fn store_fp(e: &mut Emitter, fr: &Frame, d: Val, x: &str, single: bool) {
     if single {
         e.line(&format!("fmov {}, {}", w(A), sreg(x)));
-        store_dst(e, fr, d, A);
+        store_dst_ty(e, fr, d, A, FTy::F32);
     } else {
         let m = at(e, fr, d, 8);
         e.line(&format!("str {}, {}", x, m));
@@ -477,9 +598,40 @@ fn load_args(e: &mut Emitter, f: &Func, fr: &Frame, args: &[Val], spot: &[Option
             }
         }
     }
+    // ROUND REGALLOC-A64 -- THE ARGUMENT REGISTERS ARE FILLED IN PARALLEL.
+    //
+    // THE BUG THIS EXISTS FOR. Round 80 filled x0..x7 one after another,
+    // which is safe while every value lives in a frame slot: a slot is a
+    // source and never also a target. With the register allocation of this
+    // round a value CAN live in x0..x7, and then one argument's target is
+    // another argument's source. `core__span_ab` in tests/1400_core_span.fi
+    // produced
+    //
+    //     mov x3, x5      // argument 3 into its place
+    //     mov x4, x3      // argument 4 -- wanted the OLD x3, got the new one
+    //
+    // and the program returned 5 instead of 0.
+    //
+    // Everything that comes out of a REGISTER is therefore collected and
+    // moved with the same cycle-breaking walk the prologue uses; everything
+    // that has to be loaded from memory or built as an immediate is emitted
+    // afterwards, straight into its argument register, because those writes
+    // read no argument register at all.
+    let mut par: Vec<(String, String)> = Vec::new();
     for (k, a) in args.iter().enumerate() {
         if let Some(r) = spot[k] {
             if !r.starts_with('d') {
+                match fr.reg_of(*a) {
+                    Some(src) => par.push((r.to_string(), src.to_string())),
+                    None => {}
+                }
+            }
+        }
+    }
+    parallel_reg_moves(e, &par);
+    for (k, a) in args.iter().enumerate() {
+        if let Some(r) = spot[k] {
+            if !r.starts_with('d') && fr.reg_of(*a).is_none() {
                 load_full(e, fr, r, *a);
             }
         }
@@ -591,7 +743,50 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
             f.name
         ));
     }
-    let fr = layout(f);
+    let mut fr = layout(f);
+    // ROUND REGALLOC-A64 -- THE REGISTER ALLOCATION FOR THIS MACHINE.
+    //
+    // The same linear scan the x86 side has used since round 43, over the
+    // AAPCS64 register file (`regalloc::A64`). It answers one question per
+    // value -- register or slot -- and `load_full`/`load_ext`/`store_dst`
+    // below turn that answer into either a move or the memory access round
+    // 80 always emitted. Nothing else in this file had to change: the
+    // instruction selection is the same, only its operands now sometimes
+    // live in x19-x28 or x0-x7 instead of in the frame.
+    //
+    // A function the guard refuses keeps the round 80 model exactly.
+    if let Some(a) = crate::regalloc::allocate_a64(f) {
+        let used = a.used_callee_saved(&crate::regalloc::A64);
+        // ROUND REGALLOC-A64 -- WHERE THE SAVED REGISTERS LIVE, AND THE BUG
+        // THAT DECIDED IT.
+        //
+        // The frame of this backend is measured from x29 DOWNWARDS (value
+        // slots, then alloca storage) while the OUTGOING ARGUMENT AREA sits
+        // at the other end, at sp+0, because that is where the callee reads
+        // its stack arguments. The first version of this round appended the
+        // save slots after `fr.size` -- which is the same place. In
+        // `tests/331_stack_args.fi` the recursion in `deep` then wrote its
+        // ten arguments straight over the saved x27/x28 and came back with
+        // 4 instead of 42.
+        //
+        // The saves therefore grow the frame at the TOP, next to the value
+        // slots: the whole frame gets bigger by as many words as there are
+        // saved registers, and each offset is counted from x29 like every
+        // other slot. `at_base(sp, size - off)` then addresses it, and the
+        // outgoing area at the bottom stays untouched.
+        let mut saved: Vec<(&'static str, u64)> = Vec::new();
+        if !used.is_empty() {
+            let mut off = fr.size - fr.outgoing;
+            for r in used {
+                off += 8;
+                saved.push((r, off));
+            }
+            fr.size = align_up(off + fr.outgoing, 16);
+        }
+        fr.saved = saved;
+        fr.ra = Some(a);
+    }
+    let fr = fr;
     e.raw("");
     e.raw(&format!(".globl {}", label(&f.name)));
     e.raw(&format!("{}:", label(&f.name)));
@@ -605,6 +800,12 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
             e.line("sub sp, sp, x16");
         }
     }
+    // ROUND REGALLOC-A64: park the callee-saved registers this function
+    // borrows. AAPCS64 promises the caller they come back unchanged.
+    for (r, off) in &fr.saved {
+        let m = at_base(e, "sp", fr.size - off, 8);
+        e.line(&format!("str {}, {}", r, m));
+    }
     // The parameters into their slots. `place_args` is asked with the
     // parameter VALUES, so the caller's rule and the callee's rule are
     // literally the same function.
@@ -612,6 +813,13 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     let (spot, _stack) = place_args(f, &pvals);
     check_v128_stack(f, &pvals, &spot)?;
     let mut stack_i = 0usize;
+    // ROUND REGALLOC-A64: the register homes are filled IN PARALLEL (see
+    // `parallel_reg_moves`), because an argument register can be the home of
+    // one parameter and still hold another. Slot homes are written first --
+    // they overwrite no register - and the widening of a register home
+    // happens afterwards, once every parameter is where it belongs.
+    let mut par: Vec<(String, String)> = Vec::new();
+    let mut widen: Vec<(&'static str, FTy)> = Vec::new();
     for (i, _t) in f.params.iter().enumerate() {
         match spot[i] {
             Some(r) if r.starts_with('d') => {
@@ -621,16 +829,26 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
                     store_fp(e, &fr, i as Val, r, f.params[i] == FTy::F32);
                 }
             }
-            Some(r) => store_dst(e, &fr, i as Val, r),
+            Some(r) => match fr.reg_of(i as Val) {
+                Some(home) => {
+                    par.push((home.to_string(), r.to_string()));
+                    widen.push((home, f.params[i]));
+                }
+                None => store_dst_ty(e, &fr, i as Val, r, f.params[i]),
+            },
             None => {
                 // Incoming stack arguments sit ABOVE the saved x29/x30 pair.
                 let off = 16 + 8 * stack_i as u64;
                 stack_i += 1;
                 let m = at_base(e, "x29", off, 8);
                 e.line(&format!("ldr {}, {}", A, m));
-                store_dst(e, &fr, i as Val, A);
+                store_dst_ty(e, &fr, i as Val, A, f.params[i]);
             }
         }
+    }
+    parallel_reg_moves(e, &par);
+    for (r, t) in widen {
+        canonicalise(e, r, t);
     }
     // ROUND 83: one counter per function, so that two checked sites in
     // the same function get two label pairs and two functions never
@@ -648,7 +866,55 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     Ok(())
 }
 
+/// ROUND REGALLOC-A64 - MOVE A WHOLE SET OF REGISTERS AT ONCE.
+///
+/// THE BUG THIS EXISTS FOR. The parameter prologue used to walk the
+/// parameters in order and emit one `mov` each. That is correct while every
+/// home is a frame slot, because a slot is never also a SOURCE. As soon as a
+/// parameter lives in a register it can be both: in `tests/024_six_args.fi`
+/// parameter 3 wanted x4 while parameter 4 still sat in x3, and the two
+/// sequential moves
+///
+///     mov x4, x3      // parameter 3 into its home
+///     mov x3, x4      // parameter 4 into its home -- reads the NEW x4
+///
+/// destroyed parameter 4. Six arguments came in, 17 came out instead of 21.
+///
+/// The answer is the one `regalloc.rs::parallel_reg_moves` has used on the
+/// other machine since round 43: emit only those moves whose TARGET is not
+/// somebody else's source yet, repeatedly. What is left when none qualifies
+/// is a cycle; it is broken with one scratch register (x9 is the backend's
+/// first scratch and holds no FIR value at this point in the prologue).
+fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
+    let mut open: Vec<(String, String)> =
+        pairs.iter().filter(|(d, s)| d != s).cloned().collect();
+    while !open.is_empty() {
+        if let Some(i) = open
+            .iter()
+            .position(|(d, _)| !open.iter().any(|(_, s)| s == d))
+        {
+            let (d, s) = open.remove(i);
+            e.line(&format!("mov {}, {}", d, s));
+            continue;
+        }
+        let (d, s) = open[0].clone();
+        e.line(&format!("mov {}, {}", A, d));
+        for (_, source) in open.iter_mut() {
+            if *source == d {
+                *source = A.to_string();
+            }
+        }
+        e.line(&format!("mov {}, {}", d, s));
+        open.remove(0);
+    }
+}
+
 fn emit_epilogue(e: &mut Emitter, fr: &Frame) {
+    // ROUND REGALLOC-A64: give the borrowed callee-saved registers back.
+    for (r, off) in &fr.saved {
+        let m = at_base(e, "sp", fr.size - off, 8);
+        e.line(&format!("ldr {}, {}", r, m));
+    }
     if fr.size > 0 {
         if fr.size <= 4095 {
             e.line(&format!("add sp, sp, #{}", fr.size));
@@ -691,8 +957,10 @@ fn emit_block(
                     f.val_ty(*cond).name()
                 ));
             }
-            let m = at(e, fr, *cond, 1);
-            e.line(&format!("ldrb {}, {}", w(A), m));
+            // ROUND REGALLOC-A64: through the register aware loader -- the
+            // condition may live in a register, and reading its slot then
+            // reads a value that was never written.
+            load_ext(e, fr, A, *cond, FTy::Bool, 32);
             e.line(&format!("cbnz {}, {}", w(A), block_label(&f.name, *then_bb)));
             e.line(&format!("b {}", block_label(&f.name, *else_bb)));
         }
@@ -814,8 +1082,15 @@ fn emit_inst(
     match &i.op {
         Op::Const(c) => {
             let d = i.dst.ok_or("internal error: const without target")?;
+            // ROUND REGALLOC-A64: a constant whose every use site can carry
+            // it as an immediate is not materialised at all. Round 80 wrote
+            // a movz and a str for each of them and loaded it back at every
+            // use -- nine such constants in `summe_feld` alone.
+            if fr.imm_of(d).is_some() {
+                return Ok(());
+            }
             imm_into(e, A, ty.truncate(*c) as i64);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Bin(op, a, b) => {
             let d = i.dst.ok_or("internal error: binary operation without target")?;
@@ -847,7 +1122,7 @@ fn emit_inst(
                     CmpOp::Ge => "ge",
                 };
                 e.line(&format!("cset {}, {}", w(A), cc));
-                store_dst(e, fr, d, A);
+                store_dst_ty(e, fr, d, A, f.val_ty(d));
                 return Ok(());
             }
             let bits = if oty.bits() > 32 { 64 } else { 32 };
@@ -867,7 +1142,7 @@ fn emit_inst(
                 (CmpOp::Ge, false) => "hs",
             };
             e.line(&format!("cset {}, {}", w(A), cc));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
@@ -897,14 +1172,14 @@ fn emit_inst(
                     }
                 }
             }
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Cast { src, from } => {
             let d = i.dst.ok_or("internal error: conversion without target")?;
             if ty.is_float() && from.is_float() {
                 if ty == *from {
                     load_full(e, fr, A, *src);
-                    store_dst(e, fr, d, A);
+                    store_dst_ty(e, fr, d, A, f.val_ty(d));
                     return Ok(());
                 }
                 load_fp(e, fr, "d0", *src, *from == FTy::F32);
@@ -944,7 +1219,7 @@ fn emit_inst(
                 } else {
                     e.line(&format!("fcvtzs {}, d0", A));
                 }
-                store_dst(e, fr, d, A);
+                store_dst_ty(e, fr, d, A, f.val_ty(d));
                 return Ok(());
             }
             if ty == FTy::Bool {
@@ -952,38 +1227,28 @@ fn emit_inst(
                 // decide, so they are read zero extended and tested.
                 let bits = from.bits().max(8);
                 let to = if bits > 32 { 64 } else { 32 };
-                match bits {
-                    8 => {
-                        let m = at(e, fr, *src, 1);
-                        e.line(&format!("ldrb {}, {}", w(A), m));
-                    }
-                    16 => {
-                        let m = at(e, fr, *src, 2);
-                        e.line(&format!("ldrh {}, {}", w(A), m));
-                    }
-                    32 => {
-                        let m = at(e, fr, *src, 4);
-                        e.line(&format!("ldr {}, {}", w(A), m));
-                    }
-                    _ => load_full(e, fr, A, *src),
-                }
+                // ROUND REGALLOC-A64: one register aware read instead of
+                // three hand written slot accesses. `from` unsigned-widened
+                // to 32/64 is exactly what the three `ldr*` produced.
+                let _ = bits;
+                load_ext(e, fr, A, *src, *from, to);
                 e.line(&format!("cmp {}, #0", rw(A, to)));
                 e.line(&format!("cset {}, ne", w(A)));
             } else {
                 load_ext(e, fr, A, *src, *from, 64);
             }
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::GcAddr { regs } => {
             let d = i.dst.ok_or("internal error: gc_state without target")?;
             emit_gc_addr(e, *regs);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Alloca { .. } => {
             let d = i.dst.ok_or("internal error: alloca without target")?;
             let off = fr.alloca(d).ok_or("internal error: alloca without space")?;
             add_imm(e, A, "sp", off);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Load { addr } | Op::MmioLoad { addr } => {
             let d = i.dst.ok_or("internal error: load without target")?;
@@ -1000,7 +1265,7 @@ fn emit_inst(
                 32 => e.line(&format!("ldr {}, [{}]", w(A), B)),
                 _ => e.line(&format!("ldr {}, [{}]", A, B)),
             }
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Store { addr, val } | Op::MmioStore { addr, val } => {
             if ty == FTy::V128 {
@@ -1022,7 +1287,7 @@ fn emit_inst(
             load_full(e, fr, A, *base);
             load_full(e, fr, B, *off);
             e.line(&format!("add {}, {}, {}", A, A, B));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Call { name, args } => {
             let (spot, _stack) = place_args(f, args);
@@ -1035,7 +1300,7 @@ fn emit_inst(
                 } else if ty.is_float() {
                     store_fp(e, fr, d, "d0", ty == FTy::F32);
                 } else {
-                    store_dst(e, fr, d, "x0");
+                    store_dst_ty(e, fr, d, "x0", f.val_ty(d));
                 }
             }
         }
@@ -1053,7 +1318,7 @@ fn emit_inst(
                 } else if ty.is_float() {
                     store_fp(e, fr, d, "d0", ty == FTy::F32);
                 } else {
-                    store_dst(e, fr, d, "x0");
+                    store_dst_ty(e, fr, d, "x0", f.val_ty(d));
                 }
             }
         }
@@ -1062,14 +1327,14 @@ fn emit_inst(
             let l = crate::iface::table_label(table);
             e.line(&format!("adrp {}, {}", A, l));
             e.line(&format!("add {}, {}, :lo12:{}", A, A, l));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::FnRef { name } => {
             let d = i.dst.ok_or("internal error: fnref without target")?;
             let l = crate::fnval::record_label(name);
             e.line(&format!("adrp {}, {}", A, l));
             e.line(&format!("add {}, {}, :lo12:{}", A, A, l));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         // ROUND 89 (statics.rs): aarch64 has no rip-relative addressing
         // mode — the address of a global is built out of a PAGE
@@ -1081,7 +1346,7 @@ fn emit_inst(
             let l = crate::statics::label_of(name);
             e.line(&format!("adrp {}, {}", A, l));
             e.line(&format!("add {}, {}, :lo12:{}", A, A, l));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Syscall { args } => emit_syscall(e, fr, i, args)?,
         Op::Select { cond, a, b } => {
@@ -1092,7 +1357,7 @@ fn emit_inst(
             load_full(e, fr, A, *b);
             e.line(&format!("tst {}, #255", C));
             e.line(&format!("csel {}, {}, {}, ne", A, B, A));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         // ROUND 92 -- see the same arm in `codegen_x86.rs`. This machine has
         // no register allocation at all, so every value lives in the frame
@@ -1100,7 +1365,7 @@ fn emit_inst(
         Op::Copy { src } => {
             let d = i.dst.ok_or("internal error: copy without target")?;
             load_full(e, fr, A, *src);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::Phi { .. } => {
             return Err("internal error: phi in the code generator (phi.rs did not run)".into())
@@ -1109,7 +1374,7 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: barrier without target")?;
             load_full(e, fr, A, *val);
             e.raw("    // barrier: opaque to every optimization pass");
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::SecureZero { addr, size } => {
             load_full(e, fr, A, *addr);
@@ -1136,7 +1401,7 @@ fn emit_inst(
             e.line(&format!("add {}, {}, {}", T1, A, C));
             e.line(&format!("stlxr {}, {}, [{}]", w(T2), T1, B));
             e.line(&format!("cbnz {}, {}", w(T2), top));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::AtomicCas { addr, erw, new } => {
             let d = i.dst.ok_or("internal error: atomcas without target")?;
@@ -1157,7 +1422,7 @@ fn emit_inst(
             // The exclusive monitor stays open when the store is skipped.
             e.line("clrex");
             e.raw(&format!("{}:", done));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
             let d = i.dst.ok_or("internal error: spawn without target")?;
@@ -1165,7 +1430,7 @@ fn emit_inst(
             load_full(e, fr, "x1", *stack);
             load_full(e, fr, "x2", *ctid);
             crate::thread::spawn_sequence_a64(e);
-            store_dst(e, fr, d, "x0");
+            store_dst_ty(e, fr, d, "x0", f.val_ty(d));
         }
         Op::ThreadSelf => {
             // The counterpart of `mov rax, qword ptr fs:0`. AArch64 keeps the
@@ -1176,7 +1441,7 @@ fn emit_inst(
             // what `__thread_tcb` in lib/gc/gc.fi checks for.
             let d = i.dst.ok_or("internal error: threadself without target")?;
             e.line(&format!("mrs {}, tpidr_el0", A));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::CopyMem { dst, src, size } => {
             if *size == 0 {
@@ -1214,14 +1479,14 @@ fn emit_inst(
             load_ext(e, fr, A, *a, ty, 64);
             load_ext(e, fr, B, *b, ty, 64);
             crate::panic_rt_a64::emit_checked_bin(e, *op, ty, msg, site);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
             let d = i.dst.ok_or("internal error: checked division without target")?;
             load_ext(e, fr, A, *a, ty, 64);
             load_ext(e, fr, B, *b, ty, 64);
             crate::panic_rt_a64::emit_checked_div(e, *op, ty, msg_zero, msg_range, site);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         // ROUND 89 -- the checked ARRAY INDEX (SPEC section 13, item L9).
         // The index is a `usize`, so ONE unsigned comparison against the
@@ -1230,20 +1495,20 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: checked index without target")?;
             load_ext(e, fr, A, *idx, ty, 64);
             crate::panic_rt_a64::emit_checked_idx(e, *len, msg, site);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::CheckedCast { src, from, msg } => {
             let d = i.dst.ok_or("internal error: checked cast without target")?;
             load_ext(e, fr, A, *src, *from, 64);
             crate::panic_rt_a64::emit_checked_cast(e, *from, ty, msg, site);
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         Op::BinWrapSat { kind, op, a, b } => {
             let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
             load_ext(e, fr, A, *a, ty, 64);
             load_ext(e, fr, B, *b, ty, 64);
             crate::panic_rt_a64::emit_wrap_sat(e, *kind, *op, ty, site)?;
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         // ROUND 82 on ROUND 80, corrected in ROUND 87, FINISHED IN ROUND 91.
         //
@@ -1318,7 +1583,7 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
         e.line(&format!("msr tpidr_el0, {}", A));
         if let Some(d) = i.dst {
             e.line(&format!("mov {}, xzr", A));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, i.ty);
         }
         return Ok(());
     }
@@ -1343,7 +1608,7 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             imm_into(e, "x8", n as i64);
             e.line("svc #0");
             if let Some(d) = i.dst {
-                store_dst(e, fr, d, "x0");
+                store_dst_ty(e, fr, d, "x0", i.ty);
             }
             return Ok(());
         }
@@ -1363,7 +1628,7 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             imm_into(e, "x8", n as i64);
             e.line("svc #0");
             if let Some(d) = i.dst {
-                store_dst(e, fr, d, "x0");
+                store_dst_ty(e, fr, d, "x0", i.ty);
             }
             return Ok(());
         }
@@ -1400,7 +1665,7 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
     imm_into(e, "x8", number as i64);
     e.line("svc #0");
     if let Some(d) = i.dst {
-        store_dst(e, fr, d, "x0");
+        store_dst_ty(e, fr, d, "x0", i.ty);
     }
     Ok(())
 }
@@ -1462,7 +1727,7 @@ fn emit_bin(
                 rw(A, bits),
                 rw(B, bits)
             ));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
         BinOp::Div | BinOp::Rem => {
             // The operands are brought exactly to the computing width (the
@@ -1480,7 +1745,7 @@ fn emit_bin(
                 rw(B, bits)
             ));
             if op == BinOp::Div {
-                store_dst(e, fr, d, C);
+                store_dst_ty(e, fr, d, C, ty);
             } else {
                 e.line(&format!(
                     "msub {}, {}, {}, {}",
@@ -1489,7 +1754,7 @@ fn emit_bin(
                     rw(B, bits),
                     rw(A, bits)
                 ));
-                store_dst(e, fr, d, A);
+                store_dst_ty(e, fr, d, A, ty);
             }
         }
         BinOp::Shl | BinOp::Shr => {
@@ -1510,7 +1775,7 @@ fn emit_bin(
                 rw(A, bits),
                 rw(B, bits)
             ));
-            store_dst(e, fr, d, A);
+            store_dst_ty(e, fr, d, A, ty);
         }
     }
     Ok(())
