@@ -21,11 +21,11 @@ Executed instructions — not seconds, not static size.
 
 | what | x86 | aarch64 round 80 | aarch64 now | now / x86 | gain |
 |---|---:|---:|---:|---:|---:|
-| `misch_zeile` (the blend loop) | 1 093 312 | 1 903 520 | **1 171 504** | **1.07×** | 1.62× |
+| `misch_zeile` (the blend loop) | 1 093 312 | 1 903 520 | **1 210 512** | **1.11×** | 1.57× |
 | `gc_alloc`, whole program | 13 332 393 | 38 473 940 | **13 857 131** | **1.04×** | 2.78× |
 
 Before this round the same two ratios were **1.74×** and **2.89×**. The
-brief asked for 1.2× or better; both are under 1.1×.
+brief asked for 1.2× or better; both are inside it.
 
 Static shape of the same loop, which is where TEMPO-3 took its reading:
 
@@ -104,10 +104,14 @@ Machine { pool, callee_saved, temp, arg_spare, div_spare, m_call, m_memop }
 ```
 
 `X86` is exactly the file this allocator always had. `A64` is AAPCS64:
-**x19–x28** callee-saved (ten, against x86's five) plus **x0–x7** as the
-short-lived supply, and nothing else — x8 and x9–x17 are the scratch of
-`codegen_a64.rs`, `panic_rt_a64.rs` and `simd_a64.rs` and can be written
-between any two instructions of a value's lifetime.
+**x19–x24** callee-saved plus **x0–x7** as the short-lived supply, and
+nothing else — x8 and x9–x17 are the scratch of `codegen_a64.rs`,
+`panic_rt_a64.rs` and `simd_a64.rs` and can be written between any two
+instructions of a value's lifetime.
+
+AAPCS64 offers ten callee-saved registers, not six. Section 3 says why
+the last four are not handed out; it is the one finding of this round
+that no test would have produced.
 
 The masks stay a `u16` and stay POSITIONAL (bit *k* = `pool[k]`), so
 `inst_clobbers`, `exact_crossings` and `Iv::killed` keep working
@@ -181,6 +185,45 @@ target; a register can be both.
 1 and 2 now go through `parallel_reg_moves`, the cycle breaking walk
 `regalloc.rs` has used on x86 since round 43, with x9 as the scratch that
 breaks a cycle. 3 grows the frame at the top, next to the value slots.
+
+---
+
+## 3b. The bug that no test would have found
+
+`Op::GcAddr { regs: true }` spills the callee-saved registers into the
+save area of the GC state block, and `lib/gc/gc.fi` scans it:
+
+```
+__gc_scan(regs + S_REGS, regs + S_REGS + 48)
+```
+
+**Forty-eight octets is six words.** x86 has exactly six callee-saved
+registers (rbx, rbp, r12–r15) and `emit_gc_addr` writes all six, so
+SPEC §3.5.3's conservative register scan holds there. AArch64 has ten,
+and its `emit_gc_addr` writes six — which was correct as long as no value
+lived in one of them at all. The function said so itself:
+
+```
+// On this path no value ever lives in a callee-saved register across a
+// call — everything is in the frame, and the frame is scanned.
+```
+
+Step 3 of this round made that sentence false. Handing out x25–x28 would
+have created exactly the bug the register scan exists to prevent: a Gc
+object whose last reference sits in x27, a collection, and a freed object
+still in use. It would surface only when a collection lands on the wrong
+microsecond — in no test that does not collect there.
+
+So the supply is the six registers the collector really reads. That is
+the same callee-saved count x86 has, so nothing is lost against the other
+machine; it cost `misch_zeile` 1.07× → 1.11×. Widening it means changing
+the runtime (the 48 in `gc.fi`, the save area in two code generators and
+in `lib/firnc1/codegen.fi`) and belongs in a round that can test the
+collector.
+
+Verified afterwards that no function the allocator touches mentions
+x25–x28: the only occurrences left in emitted assembly are in the
+hand-written panic trampoline, which never returns.
 
 ---
 
