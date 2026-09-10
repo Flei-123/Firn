@@ -69,18 +69,29 @@ build layout
 "$W/layout"
 
 echo
-echo "== 6. THE ICONS AT THE PIXEL =="
+echo "== 6. SYMMETRY OF BORDER AND FOCUS RING =="
+# Justins Befund vom 10.09.2026: der Fokusring war oben 6 Zeilen dick
+# und unten 2, und stand oben rechts zwei Punkte ueber. Ursache war
+# der Innenpfad in painter.path_round_ccw (vertauschte Kontrollpunkte,
+# ein Segment endete auf seinem eigenen Anfang). Diese Pruefung ZAEHLT
+# die vier Kantendicken nach -- dieselbe Sorte Asymmetrie hat uns beim
+# Schliesskreuz zwei Runden gekostet.
+build symmetry
+"$W/symmetry"
+
+echo
+echo "== 7. THE ICONS AT THE PIXEL =="
 build icon
 "$W/icon"
 
 echo
-echo "== 7. WAVE 1 AT THE PIXEL =="
+echo "== 8. WAVE 1 AT THE PIXEL =="
 build wave1
 "$W/wave1"
 
 if [ "$1" = "--images" ]; then
     echo
-    echo "== 8. THE GALLERY =="
+    echo "== 9. THE GALLERY =="
     Z=/srv/store/belege/fui
     mkdir -p "$Z"
     build gallery
