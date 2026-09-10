@@ -819,7 +819,34 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // live in x19-x28 or x0-x7 instead of in the frame.
     //
     // A function the guard refuses keeps the round 80 model exactly.
-    if let Some(a) = crate::regalloc::allocate_a64(f) {
+    //
+    // ROUND ENTSCHEIDER -- FIRN_NO_REGALLOC_A64=1 SKIPS THE ALLOCATOR.
+    //
+    // Certus crashed on Justin's phone at a pc that is bitwise identical
+    // across five reports and two versions, with a frame pointer of 17.
+    // That is exactly the shape a broken register allocation produces --
+    // and "probably not the compiler" is not an answer.
+    //
+    // This switch answers it by measurement instead. With it set, `ra`
+    // stays `None`, `reg_of` returns `None` for every value, and the
+    // whole function falls back to the round 80 model: every value in
+    // its frame slot, every operand loaded and stored around each
+    // instruction. Slower, but it is the code path that ran for months
+    // before the allocator existed.
+    //
+    //   crashes WITHOUT the allocator too -> the allocator is innocent
+    //   stops crashing                     -> the allocator is the cause
+    //
+    // Nothing else changes: same instruction selection, same ABI, same
+    // frame layout apart from the saved registers the allocator would
+    // have used.
+    let zuteiler_aus = std::env::var_os("FIRN_NO_REGALLOC_A64").is_some();
+    let versuch = if zuteiler_aus {
+        None
+    } else {
+        crate::regalloc::allocate_a64(f)
+    };
+    if let Some(a) = versuch {
         let used = a.used_callee_saved(&crate::regalloc::A64);
         // ROUND REGALLOC-A64 -- WHERE THE SAVED REGISTERS LIVE, AND THE BUG
         // THAT DECIDED IT.
