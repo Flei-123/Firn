@@ -1,0 +1,550 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/fui/zeichnen.fi -- DIE ZEICHENSCHICHT VON fUi.
+//
+// ====================================================== WARUM ES SIE GIBT
+//
+// lib/fenster/fenster.fi sagt in F1 ausdruecklich, was es NICHT tut:
+//
+//     "KEIN Zeichnen ausser Bildpunkten, Rechtecken und Systemtext. Wer
+//      Kurven will, rastert sie selbst und schiebt den fertigen Puffer
+//      mit `bild` hinueber."
+//
+// Genau dieses "rastert sie selbst" steht hier. Jedes Bedienelement in
+// fUi malt AUSSCHLIESSLICH durch diese Datei -- kein Element setzt einen
+// Bildpunkt selbst.
+//
+// DAS IST DIE REGEL, UM DIE ES GEHT. In OrientOS malt das
+// Kontrollzentrum eigene Kacheln, statt `paint_button` zu benutzen, und
+// deshalb sehen sie anders aus als jeder andere Knopf im System. In
+// Certus malte die Leiste ihre Knoepfe selbst, in lib/android/ui.fi noch
+// einmal. Drei Zeichnungen derselben Sache. Wer hier vorbeimalt, baut
+// denselben Fehler ein.
+//
+// =================================================== WAS SIE ZEICHNET
+//
+// Alles kantengeglaettet durch den Rasterer, mit dem Certus auch die
+// Seite malt (lib/font/raster.fi) -- kein GDI, kein Xlib, keine
+// Systemschrift.
+//
+//   flaeche          ein Rechteck
+//   rund             ein Rechteck mit runden Ecken
+//   ring             sein Umriss (fuer den Fokusring)
+//   linie            eine waagerechte oder senkrechte Linie
+//   text             Text mit Ausrichtung, an einer Grundlinie
+//   text_breite      wie breit er wuerde -- fuer die Anordnung
+//   marke_strich     die Einfuegemarke
+//
+// ============================== DIE VIER ECKEN OHNE lib/svg
+//
+// Certus rundet mit `svg.pfad.pfad_rund_rechteck`. lib/svg gibt es im
+// Firn-Baum NICHT (geprueft: lib/ hat browser, css, dom, font, gc, ...,
+// aber kein svg), und fUi darf nicht an einer Anwendungsbibliothek
+// haengen. Die vier Ecken stehen darum hier, als Kubiken direkt im
+// Rasterer.
+//
+// Der Faktor 0,5523 ist der bekannte: eine kubische Bezier trifft einen
+// Viertelkreis mit einem Fehler unter 0,03 % des Radius, wenn die
+// Kontrollpunkte auf 4/3 * (sqrt(2) - 1) = 0,55228... der Kantenlaenge
+// liegen. Das ist keine Naeherung nach Gefuehl, sondern die Zahl, die
+// jeder Vektorzeichner benutzt.
+//
+// ============================================ DER TEXT SITZT MITTIG
+//
+// Justin, 10.09.2026: in OrientOS sitzt die Beschriftung nicht in der
+// Mitte des Knopfes. Das ist ein Fehler, den fUi nicht erben darf, und
+// er hat eine bekannte Ursache: wer senkrecht mit der ZEILENHOEHE
+// zentriert, zentriert die Zeile und nicht die Schrift.
+//
+// Richtig ist die SCHRIFTMETRIK. Ein Grossbuchstabe steht auf der
+// Grundlinie und reicht `ascent` nach oben; `descent` haengt darunter
+// und ist bei "Knopf" gar nicht belegt. Die optische Mitte einer Zeile
+// liegt darum bei
+//
+//     grundlinie = y + (h + ascent - descent) / 2
+//
+// und NICHT bei `y + h/2 + size/2`. `text_mitte_y` rechnet genau das,
+// und `tools/fui/mitte_main.fi` misst danach am fertigen Bild nach, dass
+// oben so viele leere Zeilen stehen wie unten.
+import std.rt
+import paint.canvas
+import font.raster
+import font.metrics
+import font.ttf
+import fui.marke
+
+export {
+    Zeichner, zeichner_neu, zeichner_init, zeichner_frei, zeichner_ok,
+    zeichner_leinwand, zeichner_setz_schrift, zeichner_schrift,
+    flaeche, rund, ring, linie,
+    text, text_breite, text_passt_bis, text_mitte_y,
+    text_L, text_M, text_R,
+    marke_strich,
+    hoehe_ascent, hoehe_descent,
+}
+
+// Die Ausrichtung waagerecht. Senkrecht gibt es nur eine sinnvolle
+// (mittig zur Schriftmetrik), darum ist sie keine Wahl.
+const text_L: u32 = 0
+const text_M: u32 = 1
+const text_R: u32 = 2
+
+// Der Kratzpuffer des TrueType-Lesers. Dieselbe Zahl wie in
+// lib/browser/chrome.fi -- sie reicht fuer jeden Glyphen einer
+// Bedienoberflaeche.
+const SCRATCH: usize = 65536
+
+struct Zeichner {
+    cv: u64,          // die Leinwand, dem Aufrufer gehoerend
+    ra: raster.Raster,
+    rbuf: *mut u8,
+    rcap: usize,
+    scratch: *mut u8,
+    fm: u64,          // der Schriftsatz (metrics.FontSet), 0 = keiner
+    w: usize,
+    h: usize,
+    ok: usize,
+}
+
+#[no_gc]
+fn zeichner_neu() -> Zeichner {
+    return Zeichner {
+        cv: 0, ra: raster.raster_new(), rbuf: 0 as *mut u8, rcap: 0,
+        scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
+    }
+}
+
+// `w` x `h` ist die groesste Flaeche, die auf einmal gerastert wird.
+// Das ist NICHT die Leinwand: gerastert wird immer nur das Rechteck
+// eines Elements, und ein Knopf ist selten groesser als ein paar
+// hundert Bildpunkte. Wer die ganze Leinwand angibt, zahlt
+// (w + 2) * h * 8 Oktett fuer nichts.
+fn zeichner_init(z: *mut Zeichner, cv: *mut canvas.Canvas, w: usize,
+    h: usize) -> bool {
+    (*z).cv = cv as u64
+    (*z).w = w
+    (*z).h = h
+    let need: usize = raster.raster_bytes_needed(w, h)
+    (*z).rbuf = rt.heap_alloc(need) as *mut u8
+    if (*z).rbuf as usize == 0 {
+        return false
+    }
+    (*z).rcap = need
+    raster.raster_attach(&(*z).ra, (*z).rbuf, need)
+    (*z).scratch = rt.heap_alloc(SCRATCH) as *mut u8
+    if (*z).scratch as usize == 0 {
+        return false
+    }
+    (*z).ok = 1
+    return true
+}
+
+fn zeichner_frei(z: *mut Zeichner) {
+    if (*z).rbuf as usize != 0 {
+        rt.heap_free((*z).rbuf as u64, (*z).rcap)
+        (*z).rbuf = 0 as *mut u8
+    }
+    if (*z).scratch as usize != 0 {
+        rt.heap_free((*z).scratch as u64, SCRATCH)
+        (*z).scratch = 0 as *mut u8
+    }
+    (*z).ok = 0
+}
+
+#[no_gc]
+fn zeichner_ok(z: *mut Zeichner) -> bool { return (*z).ok != 0 }
+
+#[no_gc]
+fn zeichner_leinwand(z: *mut Zeichner) -> *mut canvas.Canvas {
+    return (*z).cv as *mut canvas.Canvas
+}
+
+#[no_gc]
+fn zeichner_setz_schrift(z: *mut Zeichner, fm: u64) { (*z).fm = fm }
+
+#[no_gc]
+fn zeichner_schrift(z: *mut Zeichner) -> u64 { return (*z).fm }
+
+// ------------------------------------------------------------ Helfer
+
+#[no_gc]
+fn klemm(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+#[no_gc]
+fn b8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+// Ein Kodepunkt aus UTF-8. Uebernommen aus lib/browser/chrome.fi.
+#[no_gc]
+fn utf8_at(p: u64, n: usize, i: usize, adv: *mut usize) -> u32 {
+    let c0: u32 = b8(p, i) as u32
+    if c0 < 128 as u32 {
+        *adv = 1
+        return c0
+    }
+    if c0 >= 240 as u32 && i + 3 < n {
+        *adv = 4
+        return ((c0 & 7 as u32) << 18)
+        | (((b8(p, i + 1) as u32) & 63 as u32) << 12)
+        | (((b8(p, i + 2) as u32) & 63 as u32) << 6)
+        | ((b8(p, i + 3) as u32) & 63 as u32)
+    }
+    if c0 >= 224 as u32 && i + 2 < n {
+        *adv = 3
+        return ((c0 & 15 as u32) << 12)
+        | (((b8(p, i + 1) as u32) & 63 as u32) << 6)
+        | ((b8(p, i + 2) as u32) & 63 as u32)
+    }
+    if c0 >= 192 as u32 && i + 1 < n {
+        *adv = 2
+        return ((c0 & 31 as u32) << 6)
+        | ((b8(p, i + 1) as u32) & 63 as u32)
+    }
+    *adv = 1
+    return c0
+}
+
+// ===================================================== DIE FLAECHEN
+
+// Ein Rechteck. Die einfachste Sache, und sie geht NICHT durch den
+// Rasterer: ganze Bildpunkte brauchen keine Kantenglaettung, und
+// `canvas_fill_rect` ist um ein Vielfaches schneller.
+fn flaeche(z: *mut Zeichner, x: f64, y: f64, w: f64, h: f64, col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    canvas.canvas_fill_rect(zeichner_leinwand(z), x, y, x + w, y + h,
+        marke.deck(col))
+}
+
+// Eine Linie. Waagerecht oder senkrecht -- eine schraege Linie braucht
+// eine Bedienoberflaeche nur fuer Symbole, und die haben ihren eigenen
+// Weg. `st` ist die Strichstaerke.
+fn linie(z: *mut Zeichner, x: f64, y: f64, w: f64, h: f64, st: f64,
+    col: u32) {
+    if w >= h {
+        flaeche(z, x, y, w, st, col)
+    } else {
+        flaeche(z, x, y, st, h, col)
+    }
+}
+
+// Der Faktor fuer den Viertelkreis aus einer Kubik.
+#[no_gc]
+fn K() -> f64 { return 0.5522847498307933 }
+
+// Den Umriss eines runden Rechtecks in den Rasterer schreiben.
+// `r` wird auf die halbe kuerzere Seite geklemmt -- ein Radius groesser
+// als das Rechteck ist keine Form, sondern ein Fehler, und in `u64`
+// waere die Subtraktion darunter genau der Ueberlauf, an dem Justins
+// Startmenue in OrientOS gestorben ist (kernel/user/wlib.fi, Runde
+// ECHTHARDWARE-1). Hier ist alles f64, aber die Klemme steht trotzdem.
+#[no_gc]
+fn pfad_rund(ra: *mut raster.Raster, x: f64, y: f64, w: f64, h: f64,
+    r0: f64) {
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2.0 {
+        r = m / 2.0
+    }
+    if r < 0.0 {
+        r = 0.0
+    }
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    let k: f64 = r * K()
+    if r <= 0.0 {
+        // Ein eckiges Rechteck ist derselbe Weg mit vier Linien -- so
+        // ist `form_klassisch` (Radius 0) bildpunktgleich mit dem, was
+        // `flaeche` malt, und nicht ein zweiter Zeichencode.
+        raster.raster_line(ra, x, y, x1, y)
+        raster.raster_line(ra, x1, y, x1, y1)
+        raster.raster_line(ra, x1, y1, x, y1)
+        raster.raster_line(ra, x, y1, x, y)
+        return
+    }
+    // oben, im Uhrzeigersinn
+    raster.raster_line(ra, x + r, y, x1 - r, y)
+    raster.raster_cubic(ra, x1 - r, y, x1 - r + k, y, x1, y + r - k,
+        x1, y + r)
+    raster.raster_line(ra, x1, y + r, x1, y1 - r)
+    raster.raster_cubic(ra, x1, y1 - r, x1, y1 - r + k, x1 - r + k, y1,
+        x1 - r, y1)
+    raster.raster_line(ra, x1 - r, y1, x + r, y1)
+    raster.raster_cubic(ra, x + r, y1, x + r - k, y1, x, y1 - r + k,
+        x, y1 - r)
+    raster.raster_line(ra, x, y1 - r, x, y + r)
+    raster.raster_cubic(ra, x, y + r, x, y + r - k, x + r - k, y,
+        x + r, y)
+}
+
+// Das Rasterfenster fuer ein Rechteck aufmachen. Gibt false, wenn
+// nichts zu tun ist.
+#[no_gc]
+fn fenster_auf(z: *mut Zeichner, x: f64, y: f64, w: f64, h: f64,
+    luft: f64, wx: *mut f64, wy: *mut f64) -> bool {
+    let cv: *mut canvas.Canvas = zeichner_leinwand(z)
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+    let ax: f64 = klemm(x - luft, 0.0, cw)
+    let ay: f64 = klemm(y - luft, 0.0, ch)
+    let bx: f64 = klemm(x + w + luft, 0.0, cw)
+    let by: f64 = klemm(y + h + luft, 0.0, ch)
+    if bx <= ax || by <= ay {
+        return false
+    }
+    let rw: usize = (bx - ax) as usize + 1
+    let rh: usize = (by - ay) as usize + 1
+    if rw > (*z).w || rh > (*z).h {
+        return false
+    }
+    *wx = ax
+    *wy = ay
+    return raster.raster_begin(&(*z).ra, ax, ay, rw, rh)
+}
+
+// EIN RECHTECK MIT RUNDEN ECKEN, kantengeglaettet.
+fn rund(z: *mut Zeichner, x: f64, y: f64, w: f64, h: f64, r: f64,
+    col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    if r <= 0.0 {
+        flaeche(z, x, y, w, h, col)
+        return
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !fenster_auf(z, x, y, w, h, 1.0, &wx, &wy) {
+        return
+    }
+    pfad_rund(&(*z).ra, x, y, w, h, r)
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(zeichner_leinwand(z), &(*z).ra,
+        wx as usize, wy as usize, marke.deck(col))
+}
+
+// DER UMRISS. Ein Ring und keine gefuellte Flaeche: er liegt AUF einem
+// schon gemalten Element. Gemacht wird er als zwei Pfade in EINEM
+// Rasterlauf -- aussen im Uhrzeigersinn, innen dagegen. Der Rasterer
+// zaehlt Windungen, also bleibt genau der Rand stehen.
+//
+// Das ist der Fokusring, und er ist das einzige, worauf sich jemand
+// verlaesst, der mit der Tastatur bedient. Darum ist er zwei Bildpunkte
+// stark (marke.Form.fokus) und nicht einer: einer verschwindet auf
+// jedem Schirm mit Skalierung.
+fn ring(z: *mut Zeichner, x: f64, y: f64, w: f64, h: f64, r: f64,
+    st: f64, col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 || st <= 0.0 {
+        return
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !fenster_auf(z, x, y, w, h, 1.0, &wx, &wy) {
+        return
+    }
+    pfad_rund(&(*z).ra, x, y, w, h, r)
+    // innen, gegenlaeufig -- darum die Punkte in umgekehrter Folge
+    let ix: f64 = x + st
+    let iy: f64 = y + st
+    let iw: f64 = w - 2.0 * st
+    let ih: f64 = h - 2.0 * st
+    if iw > 0.0 && ih > 0.0 {
+        var ir: f64 = r - st
+        if ir < 0.0 {
+            ir = 0.0
+        }
+        pfad_rund_gegen(&(*z).ra, ix, iy, iw, ih, ir)
+    }
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(zeichner_leinwand(z), &(*z).ra,
+        wx as usize, wy as usize, marke.deck(col))
+}
+
+// Derselbe Pfad gegen den Uhrzeigersinn. Er steht als eigene Funktion
+// da und nicht als Schalter in `pfad_rund`, weil eine Schleife mit
+// vertauschten Punkten schwerer zu lesen ist als zwei klare Faelle.
+#[no_gc]
+fn pfad_rund_gegen(ra: *mut raster.Raster, x: f64, y: f64, w: f64,
+    h: f64, r0: f64) {
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2.0 {
+        r = m / 2.0
+    }
+    if r < 0.0 {
+        r = 0.0
+    }
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    let k: f64 = r * K()
+    if r <= 0.0 {
+        raster.raster_line(ra, x, y, x, y1)
+        raster.raster_line(ra, x, y1, x1, y1)
+        raster.raster_line(ra, x1, y1, x1, y)
+        raster.raster_line(ra, x1, y, x, y)
+        return
+    }
+    raster.raster_line(ra, x + r, y, x, y + r)
+    raster.raster_cubic(ra, x, y + r, x, y + r - k, x + r - k, y,
+        x + r, y)
+    raster.raster_line(ra, x, y + r, x, y1 - r)
+    raster.raster_cubic(ra, x, y1 - r, x + r - k, y1, x + r, y1,
+        x + r, y1)
+    raster.raster_line(ra, x + r, y1, x1 - r, y1)
+    raster.raster_cubic(ra, x1 - r, y1, x1, y1 - r + k, x1, y1 - r,
+        x1, y1 - r)
+    raster.raster_line(ra, x1, y1 - r, x1, y + r)
+    raster.raster_cubic(ra, x1, y + r, x1 - r + k, y, x1 - r, y,
+        x1 - r, y)
+}
+
+// ========================================================== DER TEXT
+
+#[no_gc]
+fn hoehe_ascent(z: *mut Zeichner, size: f64) -> f64 {
+    return metrics.fm_ascent((*z).fm, size)
+}
+
+#[no_gc]
+fn hoehe_descent(z: *mut Zeichner, size: f64) -> f64 {
+    return metrics.fm_descent((*z).fm, size)
+}
+
+// Wie breit wird der Text? Die Zahl, auf der jede Anordnung ruht.
+#[no_gc]
+fn text_breite(z: *mut Zeichner, p: u64, n: usize, size: f64) -> f64 {
+    if !metrics.fm_present((*z).fm) {
+        return 0.0
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        x = x + metrics.fm_advance((*z).fm, size, cp)
+        i = i + adv
+    }
+    return x
+}
+
+// Wieviele Oktett passen in `platz`? Immer an einer Zeichengrenze --
+// nie mitten in einem UTF-8-Zeichen.
+#[no_gc]
+fn text_passt_bis(z: *mut Zeichner, p: u64, n: usize, size: f64,
+    platz: f64) -> usize {
+    if !metrics.fm_present((*z).fm) {
+        return n
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let w: f64 = metrics.fm_advance((*z).fm, size, cp)
+        if x + w > platz {
+            return i
+        }
+        x = x + w
+        i = i + adv
+    }
+    return n
+}
+
+// DIE GRUNDLINIE FUER SENKRECHT MITTIGEN TEXT.
+//
+// Das ist die Rechnung, die Justins Befund "die Beschriftung sitzt
+// nicht in der Mitte" behebt, und der Grund steht im Kopf dieser Datei:
+// zentriert wird die SCHRIFT, nicht die Zeile.
+//
+//     Die Schrift belegt von (grundlinie - ascent) bis
+//     (grundlinie + descent). Ihre Mitte liegt bei
+//     grundlinie - (ascent - descent) / 2, und die soll auf y + h/2
+//     fallen:
+//
+//         grundlinie = y + h/2 + (ascent - descent) / 2
+//                    = y + (h + ascent - descent) / 2
+//
+// Gerundet auf einen ganzen Bildpunkt: eine Grundlinie zwischen zwei
+// Bildpunkten macht jede Zeile halb unscharf (dieselbe Begruendung
+// steht in lib/font/metrics.fi bei `fm_ascent`).
+#[no_gc]
+fn text_mitte_y(z: *mut Zeichner, y: f64, h: f64, size: f64) -> f64 {
+    let a: f64 = metrics.fm_ascent((*z).fm, size)
+    let d: f64 = metrics.fm_descent((*z).fm, size)
+    let b: f64 = y + (h + a - d) / 2.0
+    let t: f64 = ((b + 0.5) as i64) as f64
+    return t
+}
+
+// TEXT ZEICHNEN.
+//
+// `x`/`w` ist der Kasten, in dem er ausgerichtet wird; `base` die
+// Grundlinie (aus `text_mitte_y`). Zurueck kommt die Stelle, an der er
+// endet -- daraus rechnet das Textfeld die Lage seiner Einfuegemarke.
+fn text(z: *mut Zeichner, x: f64, base: f64, w: f64, size: f64,
+    col: u32, p: u64, n: usize, aus: u32) -> f64 {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return x
+    }
+    let br: f64 = text_breite(z, p, n, size)
+    var sx: f64 = x
+    if aus == text_M {
+        sx = x + (w - br) / 2.0
+    } else if aus == text_R {
+        sx = x + w - br
+    }
+    // Auf einen ganzen Bildpunkt: derselbe Grund wie bei der
+    // Grundlinie.
+    sx = ((sx + 0.5) as i64) as f64
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    // Luft: eine Schriftgroesse nach jeder Seite. Ein Glyph kann ueber
+    // seine Laufweite hinausragen (kursiv, weit ausladende Buchstaben).
+    if !fenster_auf(z, sx, base - size * 1.4, br, size * 2.0, size,
+        &wx, &wy) {
+        return sx + br
+    }
+    let fs: *mut metrics.FontSet = (*z).fm as *mut metrics.FontSet
+    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
+    let up: f64 = metrics.fm_upem((*z).fm)
+    let sc: f64 = size / up
+    var pen: f64 = sx
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        let okg: bool = ttf.font_outline(f, gid, &(*z).ra, pen, base,
+            sc, (*z).scratch, SCRATCH, 0)
+        pen = pen + metrics.fm_advance((*z).fm, size, cp)
+        i = i + adv
+    }
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(zeichner_leinwand(z), &(*z).ra,
+        wx as usize, wy as usize, marke.deck(col))
+    return pen
+}
+
+// DIE EINFUEGEMARKE. Ein senkrechter Strich auf ganzen Bildpunkten --
+// er darf NICHT durch den Rasterer, sonst ist er bei halben Stellen
+// zwei blasse Spalten statt einer scharfen.
+fn marke_strich(z: *mut Zeichner, x: f64, y: f64, h: f64, st: f64,
+    col: u32) {
+    let ix: f64 = ((x + 0.5) as i64) as f64
+    var s: f64 = st
+    if s < 1.0 {
+        s = 1.0
+    }
+    flaeche(z, ix, y, s, h, col)
+}
