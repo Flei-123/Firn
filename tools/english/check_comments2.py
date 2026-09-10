@@ -29,7 +29,8 @@ for z in open('tools/english/morphemes.tsv',encoding='utf-8'):
         a=p[0].strip().lower(); b=(p[1].strip().lower() if len(p)>1 else '')
         if a and b and a!=b.replace('_',''): mor.add(a)
 # English words that literally contain a german morpheme -> ignore as whole words
-EN_OK={'absolute','relative','negative','signature','aggregate','profile','surrogate',
+EN_OK={'lies','lie','lied','dies',
+ 'absolute','relative','negative','signature','aggregate','profile','surrogate',
  'parameter','alternative','imperative','declarative','iterative','mark','marker','marks',
  'rand','random','band','hand','land','stand','brand','grand','strand','send','end','ends',
  'bind','find','kind','mind','wind','round','sound','found','ground','bound','pound','and',
