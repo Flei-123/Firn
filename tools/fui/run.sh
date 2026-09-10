@@ -69,13 +69,18 @@ build layout
 "$W/layout"
 
 echo
-echo "== 6. WAVE 1 AT THE PIXEL =="
+echo "== 6. THE ICONS AT THE PIXEL =="
+build icon
+"$W/icon"
+
+echo
+echo "== 7. WAVE 1 AT THE PIXEL =="
 build wave1
 "$W/wave1"
 
 if [ "$1" = "--images" ]; then
     echo
-    echo "== 7. THE GALLERY =="
+    echo "== 8. THE GALLERY =="
     Z=/srv/store/belege/fui
     mkdir -p "$Z"
     build gallery
