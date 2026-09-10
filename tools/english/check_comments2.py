@@ -125,6 +125,11 @@ def scan(paths):
             if not s.strip().startswith('//'): continue
             probe=re.sub(r'`[^`]*`',' ',s)
             probe=re.sub(r'\b(?:lib|tools|bin|tests|docs|src)/[A-Za-z0-9_./-]+',' ',probe)
+            # Absolute paths OUTSIDE this tree are foreign names. The button
+            # template lives at /root/jarvis/downloads/knopf-vorlage/ and is
+            # not ours to rename -- the mechanical rename turned "knopf" into
+            # "button" inside that path once and broke the reference.
+            probe=re.sub(r'/root/[A-Za-z0-9_./-]+',' ',probe)
             bad=[]
             for w in parts(probe):
                 lw=w.lower()
