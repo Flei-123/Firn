@@ -1,0 +1,474 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fenster/fenster.fi -- EIN FENSTER, EINMAL. (Runde FENSTER)
+//
+// ====================================================== WARUM ES SIE GIBT
+//
+// Es gab ZWEI Fensterschichten mit fast gleicher Schnittstelle und
+// verschiedenem Praefix: lib/browser/x11.fi (x11_open, x11_put_image,
+// ...) und lib/windows/gdi.fi (win_open, win_put_image, ...). Die
+// Abstraktion war also schon da -- sie stand nur nirgends geschrieben.
+// Die Folge war messbar: lib/windows/certus_main.fi war eine KOPIE von
+// lib/browser/window_main.fi, 888 Zeilen Wort fuer Wort gleich, und die
+// zwei liefen bereits auseinander. Windows bekam resize, dpi, EV_MOTION,
+// EV_CHAR, EV_THEME; X11 bekam davon NICHTS.
+//
+// Diese Datei ist die aufgeschriebene Abstraktion. Der obere Rand kennt
+// nichts Plattformeigenes: kein HWND, keine X-Nachricht, keine
+// Win32-Konstante.
+//
+// ============================== WIE DIE RUECKWAND GEWAEHLT WIRD
+//
+// Firn hat keine bedingte Uebersetzung, und es braucht auch keine. Die
+// Modulsuche loest `import` erst NEBEN DER IMPORTIERENDEN Datei auf,
+// dann NEBEN DER WURZELDATEI, dann in $FIRNLIB (compiler/src/modules.rs,
+// `resolve`). Diese Datei importiert `fenster.rueck`; Regel 1 greift
+// nicht, also Regel 2 -- und dort liegt ein Verweis:
+//
+//   lib/browser/fenster/rueck.fi  ->  ../../fenster/x11.fi
+//   lib/windows/fenster/rueck.fi  ->  ../../fenster/win32.fi
+//
+// Das VERZEICHNIS der Wurzeldatei waehlt damit die Rueckwand: ohne eine
+// Zeile im Uebersetzer, ohne Funktionszeiger, und ohne dass der
+// Linux-Bau je eine `extern fn` auf user32.dll zu sehen bekommt. Fremde
+// Programme baut `tools/fenster/bau.sh <quelle> <ziel> linux|windows`.
+//
+// ================================================= WAS HIER OBEN LIEGT
+//
+// Alles, was NICHT plattformeigen ist -- genau das war der Fehler:
+//   * die GROESSENAENDERUNG (EV_CONFIGURE -> Leinwand neu). Stand vorher
+//     nur unter Windows, unter X11 gar nicht.
+//   * DPI und `skaliert(f, n)`. Justins Zeiger war 8x15 auf einem
+//     34-Zoll-Schirm, weil das als einziges Stueck nicht skaliert wurde.
+//   * HELL/DUNKEL/SYSTEM -- die ENTSCHEIDUNG, nicht die Farben; eine
+//     Farbtafel gehoert dem Programm (browser.chrome).
+//   * DAS WARTEN. X11 hat einen Steckplatz (`poll`), Windows keinen
+//     (MsgWaitForMultipleObjectsEx). Oben heisst beides `warte(ms)`.
+//
+// ================================================= WAS HIER NICHT STEHT
+//
+// F1 KEIN Zeichnen ausser Bildpunkten, Rechtecken und Systemtext. Wer
+//    Kurven will, rastert sie selbst und schiebt den fertigen Puffer
+//    mit `bild` hinueber -- der Vertrag von Certus seit Runde B3.
+// F2 KEINE Reiter, Menues, Knoepfe. Sache des Programms.
+// F3 EIN Bildpunktformat: BGRX (32 Bit, B,G,R,X im Speicher). Es ist
+//    das, was ein X-Server mit 24-Bit-TrueColor und was ein 32-Bit-DIB
+//    mit BI_RGB wollen -- dieselben Oktette auf beiden Systemen.
+import std.rt
+import fenster.rueck
+
+export {
+    Fenster, fenster_neu,
+    oeffne, mache, zeige_fenster, titel, schliesse, offen,
+    schirm, mittig,
+    breite, hoehe, dpi, dpi_setzen, uiscale, skaliert, groesse_neu,
+    bild, fuelle, schrift, text, zeigen, speichere_ppm,
+    warte, anhaengig, naechstes, zieht,
+    ev_a, ev_x, ev_y, ev_zustand,
+    theme_setzen, theme_modus, dunkel, theme_bekannt, theme_neu_lesen,
+    rgb_nach_bgrx, nach_bgrx, gift_setzen, gift_farbe,
+    EV_NONE, EV_EXPOSE, EV_KEY, EV_CHAR, EV_BUTTON, EV_MOTION,
+    EV_CONFIGURE, EV_THEME, EV_CLOSED,
+    K_ESCAPE, K_RETURN, K_BACK, K_TAB, K_DOWN, K_UP, K_PAGEDOWN,
+    K_PAGEUP, K_LEFT, K_RIGHT, K_HOME, K_END, K_DELETE,
+    TH_SYSTEM, TH_HELL, TH_DUNKEL,
+    KN_LINKS, KN_MITTE, KN_RECHTS, KN_RAD_HOCH, KN_RAD_RUNTER,
+    FMT_BGRX,
+}
+
+// ===================================================== DIE EREIGNISSE
+//
+// Die VEREINIGUNG der beiden bisherigen Mengen. Die Zahlen sind die von
+// lib/browser/x11.fi und lib/windows/gdi.fi -- beide hatten schon
+// dieselben, und ein Programm, das gegen die alten Zahlen geschrieben
+// wurde, rechnet weiter richtig.
+const EV_NONE: u32 = 0
+// Der Inhalt ist verloren, es muss neu gemalt werden.
+const EV_EXPOSE: u32 = 1
+// Eine TASTE mit Bedeutung: `ev_a` ist ein K_*. Zeichen kommen NICHT
+// hier an, sondern als EV_CHAR -- das ist die Trennung, die Windows mit
+// WM_KEYDOWN/WM_CHAR vorgibt und die X11 nun nachbildet.
+const EV_KEY: u32 = 2
+// Ein Mausknopf oder das Rad: `ev_a` ist ein KN_*, `ev_x`/`ev_y` die
+// Stelle im Fenster.
+const EV_BUTTON: u32 = 3
+// Die Fenstergroesse hat sich geaendert: `ev_x` ist die neue Breite,
+// `ev_y` die neue Hoehe. `naechstes` hat die Leinwand da schon
+// nachgezogen.
+const EV_CONFIGURE: u32 = 4
+// Das Fenster wurde geschlossen (Knopf, Fenstermanager, WM_CLOSE).
+const EV_CLOSED: u32 = 5
+// Ein ZEICHEN, fertig zusammengesetzt: `ev_a` ist ein Unicode-Codepunkt.
+const EV_CHAR: u32 = 6
+// Der Zeiger hat sich bewegt: `ev_x`/`ev_y`.
+const EV_MOTION: u32 = 7
+// Die Systemeinstellung hell/dunkel hat sich geaendert. `dunkel(f)`
+// steht danach schon richtig.
+const EV_THEME: u32 = 8
+
+// ======================================================== DIE TASTEN
+//
+// Absichtlich die X11-Tastennummern: sie stehen seit Runde B5 in den
+// Ereignisschleifen, und lib/windows/gdi.fi hat sie fuer Windows
+// nachgebaut statt eigene zu erfinden. Wer eine neue Rueckwand baut,
+// bildet SEINE Zahlen auf diese ab -- nicht umgekehrt.
+const K_ESCAPE: u32 = 9
+const K_BACK: u32 = 22
+const K_TAB: u32 = 23
+const K_RETURN: u32 = 36
+const K_HOME: u32 = 110
+const K_UP: u32 = 111
+const K_PAGEUP: u32 = 112
+const K_LEFT: u32 = 113
+const K_RIGHT: u32 = 114
+const K_END: u32 = 115
+const K_DOWN: u32 = 116
+const K_PAGEDOWN: u32 = 117
+const K_DELETE: u32 = 119
+
+// ================================================== MAUSKNOEPFE / RAD
+// Die X11-Nummern; das Rad ist dort ein Knopf und bleibt es hier.
+const KN_LINKS: u32 = 1
+const KN_MITTE: u32 = 2
+const KN_RECHTS: u32 = 3
+const KN_RAD_HOCH: u32 = 4
+const KN_RAD_RUNTER: u32 = 5
+
+// ==================================================== HELL UND DUNKEL
+const TH_SYSTEM: u32 = 0
+const TH_HELL: u32 = 1
+const TH_DUNKEL: u32 = 2
+
+// ================================================= DAS BILDPUNKTFORMAT
+// EIN Format, und es hat einen Namen. Siehe F3 im Kopf.
+const FMT_BGRX: u32 = 0
+
+struct Fenster {
+    // Der Zustand der Rueckwand. Was darin steht, weiss diese Datei
+    // nicht und darf sie nicht wissen.
+    p: rueck.Platte,
+    w: usize,
+    h: usize,
+    dpi_ist: usize,
+    dpi_zwang: usize,
+    // das zuletzt entnommene Ereignis
+    ev_kind: u32,
+    e_a: u32,
+    e_x: u32,
+    e_y: u32,
+    e_s: u32,
+    // hell/dunkel
+    th_modus: u32,
+    th_dunkel: bool,
+    th_bekannt: bool,
+}
+
+fn fenster_neu() -> Fenster {
+    return Fenster { p: rueck.platte_neu(), w: 0, h: 0, dpi_ist: 96,
+        dpi_zwang: 0, ev_kind: 0, e_a: 0, e_x: 0, e_y: 0, e_s: 0,
+        th_modus: 0, th_dunkel: false, th_bekannt: false }
+}
+
+// --------------------------------------------------------- aufmachen
+//
+// `anzeige` ist die X11-Anzeigenummer (`:0` = 0). Unter Windows gibt es
+// keine zu waehlen; der Wert wird dort nicht angesehen. Das ist der
+// EINZIGE Parameter der Schnittstelle, der nur eine Seite betrifft, und
+// er steht hier, damit die Abnahme unter Xvfb weiter eine eigene
+// Anzeige bekommt.
+fn oeffne(f: *mut Fenster, anzeige: usize) -> bool {
+    if !rueck.r_auf(&(*f).p, anzeige) {
+        return false
+    }
+    theme_aufloesen(f)
+    return true
+}
+
+// Fenster und Zeichenflaeche anlegen, `bw` x `bh` INNENFLAECHE.
+fn mache(f: *mut Fenster, bw: usize, bh: usize) -> bool {
+    if !rueck.r_mache(&(*f).p, bw, bh) {
+        return false
+    }
+    (*f).w = rueck.r_breite(&(*f).p)
+    (*f).h = rueck.r_hoehe(&(*f).p)
+    (*f).dpi_ist = rueck.r_dpi(&(*f).p)
+    return true
+}
+
+fn schirm(f: *mut Fenster, sw: *mut usize, sh: *mut usize) -> bool {
+    return rueck.r_schirm(&(*f).p, sw, sh)
+}
+
+fn mittig(f: *mut Fenster) -> bool {
+    return rueck.r_mittig(&(*f).p)
+}
+
+fn zeige_fenster(f: *mut Fenster) -> bool {
+    return rueck.r_zeige(&(*f).p)
+}
+
+fn titel(f: *mut Fenster, p: u64, n: usize) -> bool {
+    return rueck.r_titel(&(*f).p, p, n)
+}
+
+fn schliesse(f: *mut Fenster) {
+    rueck.r_zu(&(*f).p)
+}
+
+fn offen(f: *mut Fenster) -> bool {
+    return rueck.r_offen(&(*f).p)
+}
+
+fn breite(f: *mut Fenster) -> usize {
+    return (*f).w
+}
+
+fn hoehe(f: *mut Fenster) -> usize {
+    return (*f).h
+}
+
+// DPI UND UISCALE. Der Fehler, den das verhindert: Justins Zeiger war
+// 8x15 Bildpunkte auf einem 34-Zoll-Ultrawide, weil er als einziges
+// Stueck mit festen Zahlen gemalt wurde. Eine Zahl aus dem Entwurf ist
+// in Punkten bei 96 dpi gemeint; `skaliert` macht Geraetepunkte
+// daraus. Wer eine Groesse hinschreibt, schreibt sie hier durch.
+fn dpi(f: *mut Fenster) -> usize {
+    if (*f).dpi_zwang > 0 {
+        return (*f).dpi_zwang
+    }
+    return (*f).dpi_ist
+}
+
+// Von Hand, fuer Abnahmelaeufe und fuer einen Schalter `--dpi=`.
+// 0 = wieder das, was das System sagt.
+fn dpi_setzen(f: *mut Fenster, d: usize) {
+    (*f).dpi_zwang = d
+}
+
+// Der Massstab in Promille: 1000 = 100 %, 1500 = 150 %.
+fn uiscale(f: *mut Fenster) -> usize {
+    return dpi(f) * 1000 / 96
+}
+
+// `n` Entwurfspunkte in Geraetepunkte, kaufmaennisch gerundet.
+fn skaliert(f: *mut Fenster, n: usize) -> usize {
+    return (n * dpi(f) + 48) / 96
+}
+
+// Die Zeichenflaeche von Hand auf eine andere Groesse bringen. Der
+// Normalfall ist EV_CONFIGURE, das `naechstes` selbst erledigt.
+fn groesse_neu(f: *mut Fenster, bw: usize, bh: usize) -> bool {
+    if bw == 0 || bh == 0 {
+        return false
+    }
+    if !rueck.r_gross(&(*f).p, bw, bh) {
+        return false
+    }
+    (*f).w = rueck.r_breite(&(*f).p)
+    (*f).h = rueck.r_hoehe(&(*f).p)
+    return true
+}
+
+// ----------------------------------------------------------- das Malen
+
+// Ein fertiger BGRX-Puffer nach (dx, dy). `bw`/`bh` sind seine Masse.
+fn bild(f: *mut Fenster, px: u64, bw: usize, bh: usize, dx: usize,
+    dy: usize) -> bool {
+    return rueck.r_bild(&(*f).p, px, bw, bh, dx, dy)
+}
+
+// Ein Rechteck in 0xRRGGBB.
+fn fuelle(f: *mut Fenster, farbe: u32, x0: usize, y0: usize, bw: usize,
+    bh: usize) -> bool {
+    return rueck.r_fuelle(&(*f).p, farbe, x0, y0, bw, bh)
+}
+
+// Die Systemfestschrift bereitstellen (X11: "fixed", Windows:
+// SYSTEM_FIXED_FONT). Fuer Beschriftungen, die kein eigener Rasterer
+// malen soll -- eine Seite malt Certus mit lib/font.
+fn schrift(f: *mut Fenster) -> bool {
+    return rueck.r_schrift(&(*f).p)
+}
+
+// `ty` ist die GRUNDLINIE, auf beiden Systemen.
+fn text(f: *mut Fenster, fg: u32, bg: u32, tx: usize, ty: usize, p: u64,
+    n: usize) -> bool {
+    return rueck.r_text(&(*f).p, fg, bg, tx, ty, p, n)
+}
+
+// Alles Gemalte auf den Schirm.
+fn zeigen(f: *mut Fenster) -> bool {
+    return rueck.r_blitten(&(*f).p)
+}
+
+// DER ABZUG DESSEN, WAS WIRKLICH IM FENSTER STEHT (nicht der Leinwand
+// des Programms), als binaeres PPM. X11 kann es nicht -- dort holt die
+// Abnahme das Bild mit `xwd` vom Server, was staerker ist.
+fn speichere_ppm(f: *mut Fenster, pfad: u64) -> bool {
+    return rueck.r_ppm(&(*f).p, pfad)
+}
+
+// DAS GIFT: die frische Zeichenflaeche wird mit reinem Magenta
+// gefuellt. Was danach noch magenta ist, hat nie ein `bild` und nie
+// ein `fuelle` gesehen -- "Anteil unbemalter Bildpunkte" wird damit
+// GEZAEHLT und nicht geschaetzt. Im Auslieferungsbetrieb aus.
+fn gift_setzen(f: *mut Fenster, an: bool) {
+    rueck.r_gift(&(*f).p, an)
+}
+
+fn gift_farbe() -> u32 {
+    return 16711935 as u32
+}
+
+// ------------------------------------------------------- die Ereignisse
+
+// Steht schon eines bereit, ohne zu warten?
+// Zieht der Nutzer gerade am Rand? Windows weiss es, X11 nicht.
+fn zieht(f: *mut Fenster) -> bool {
+    return rueck.r_zieht(&(*f).p)
+}
+
+fn anhaengig(f: *mut Fenster) -> bool {
+    return rueck.r_da(&(*f).p)
+}
+
+// WARTEN, PLATTFORMNEUTRAL. Der letzte harte Unterschied: X11 hat
+// einen Steckplatz (`poll`), Windows keinen
+// (MsgWaitForMultipleObjectsEx). Beides ist "warte hoechstens `ms`
+// Millisekunden"; `ms` < 0 = ewig, 0 = nur nachsehen. DER RUHESTROM
+// BLEIBT NULL -- gemessen: 0 CPU-Ticks in 10 s Leerlauf.
+fn warte(f: *mut Fenster, ms: i64) -> bool {
+    if rueck.r_da(&(*f).p) {
+        return true
+    }
+    return rueck.r_warte(&(*f).p, ms)
+}
+
+// Das naechste Ereignis, NICHT blockierend: EV_NONE heisst "keins da".
+//
+// Hier steht die gemeinsame Nachbehandlung, und sie ist der Grund,
+// warum diese Bibliothek existiert: die Groessenaenderung wird EINMAL
+// richtig gemacht und nicht zweimal halb.
+fn naechstes(f: *mut Fenster) -> u32 {
+    var k: u32 = EV_NONE
+    var a: u32 = 0
+    var x: u32 = 0
+    var y: u32 = 0
+    var s: u32 = 0
+    if !rueck.r_hole(&(*f).p, &k, &a, &x, &y, &s) {
+        (*f).ev_kind = EV_NONE
+        return EV_NONE
+    }
+    (*f).ev_kind = k
+    (*f).e_a = a
+    (*f).e_x = x
+    (*f).e_y = y
+    (*f).e_s = s
+    if k == EV_CONFIGURE {
+        let nw: usize = x as usize
+        let nh: usize = y as usize
+        if nw > 0 && nh > 0 {
+            if nw != (*f).w || nh != (*f).h {
+                (*f).w = nw
+                (*f).h = nh
+                // Die Zeichenflaeche wird NEU ANGELEGT und nicht
+                // gestreckt. Eine gestreckte Leinwand waere genau die
+                // Unschaerfe, die Runde MOBIL5 auf Android gemessen hat.
+                let ok: bool = rueck.r_gross(&(*f).p, nw, nh)
+                // Der Geraetekontext ist danach neu, also auch die
+                // Schrift: sonst malt `text` ab hier nichts mehr.
+                let okf: bool = rueck.r_schrift(&(*f).p)
+            }
+        }
+        // Ein Fenster kann auf einen anderen Schirm geschoben worden
+        // sein. Dann ist die Bildpunktdichte eine andere.
+        (*f).dpi_ist = rueck.r_dpi(&(*f).p)
+    }
+    if k == EV_THEME {
+        theme_aufloesen(f)
+    }
+    return k
+}
+
+fn ev_a(f: *mut Fenster) -> u32 {
+    return (*f).e_a
+}
+
+fn ev_x(f: *mut Fenster) -> u32 {
+    return (*f).e_x
+}
+
+fn ev_y(f: *mut Fenster) -> u32 {
+    return (*f).e_y
+}
+
+// Die Umschalttasten zum Ereignis. Bit 0 = Umschalt, Bit 2 = Strg --
+// die X11-Belegung, die die Windows-Rueckwand nachbildet.
+fn ev_zustand(f: *mut Fenster) -> u32 {
+    return (*f).e_s
+}
+
+// HELL/DUNKEL. Die ENTSCHEIDUNG liegt hier: `TH_SYSTEM` fragt die
+// Rueckwand, `TH_HELL`/`TH_DUNKEL` sind der Handschalter. Die FARBEN
+// nicht -- eine Farbtafel gehoert dem Programm (browser.chrome).
+fn theme_setzen(f: *mut Fenster, modus: u32) {
+    (*f).th_modus = modus
+    theme_aufloesen(f)
+}
+
+fn theme_modus(f: *mut Fenster) -> u32 {
+    return (*f).th_modus
+}
+
+fn dunkel(f: *mut Fenster) -> bool {
+    return (*f).th_dunkel
+}
+
+// Konnte das System wirklich gefragt werden? Sonst ist `dunkel` der
+// Rueckfall (HELL) und keine Auskunft.
+fn theme_bekannt(f: *mut Fenster) -> bool {
+    return (*f).th_bekannt
+}
+
+// Noch einmal beim System nachsehen; true = es hat sich geaendert. Die
+// Rueckwaende, die von sich aus EV_THEME schicken, brauchen das nicht;
+// wer keine Benachrichtigung hat, ruft es gelegentlich selbst.
+fn theme_neu_lesen(f: *mut Fenster) -> bool {
+    let vorher: bool = (*f).th_dunkel
+    theme_aufloesen(f)
+    return (*f).th_dunkel != vorher
+}
+
+fn theme_aufloesen(f: *mut Fenster) {
+    if (*f).th_modus == TH_HELL {
+        (*f).th_dunkel = false
+        (*f).th_bekannt = true
+        return
+    }
+    if (*f).th_modus == TH_DUNKEL {
+        (*f).th_dunkel = true
+        (*f).th_bekannt = true
+        return
+    }
+    (*f).th_dunkel = rueck.r_dunkel(&(*f).p)
+    (*f).th_bekannt = rueck.r_dunkel_bekannt(&(*f).p)
+}
+
+// DAS FORMAT. Runde UHR hatte die BGRX/RGBA-Umwandlung an mehreren
+// Stellen stehen; sie steht jetzt hier, einmal, mit Namen. 0xRRGGBB ->
+// ein 32-Bit-Wort, das kleinendisch als B,G,R,0 liegt. Es ist eine
+// MASKE und keine Vertauschung -- eine erste Fassung von `to_bgrx`
+// tauschte R und B, und das Fenster zeigte die Seite in Falschfarben.
+fn rgb_nach_bgrx(rgb: u32) -> u32 {
+    return rgb & 16777215 as u32
+}
+
+// Ein ganzer Streifen 0xAARRGGBB -> BGRX. Quelle und Ziel duerfen
+// dieselbe Adresse sein.
+fn nach_bgrx(quelle: u64, ziel: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let v: u32 = *((quelle + (i * 4) as u64) as *mut u32)
+        *((ziel + (i * 4) as u64) as *mut u32) = v & 16777215 as u32
+        i = i + 1
+    }
+}
