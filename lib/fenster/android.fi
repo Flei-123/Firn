@@ -1,0 +1,614 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fenster/android.fi -- DIE RUECKWAND ANDROID (Runde EINKERN).
+//
+// Die dritte Rueckwand hinter `lib/fenster/fenster.fi`, nach x11.fi und
+// win32.fi und nach genau demselben Vertrag. Sie ist NICHT neu erfunden:
+// jeder Griff darin steht seit MOBIL2 in lib/android/a_main.fi, nur
+// dort mitten im Programm statt hinter einer Schnittstelle. Was hier
+// steht, ist derselbe Ablauf unter den Namen, die die anderen zwei
+// Systeme schon tragen.
+//
+// ================================== WARUM ANDROID KEIN `r_auf` KENNT
+//
+// Unter X11 macht das Programm die Verbindung auf, unter Windows legt
+// es die Fensterklasse an. Unter Android ist es umgekehrt: das
+// Betriebssystem legt das Fenster an und meldet es der App durch
+// `ANativeActivityCallbacks.onNativeWindowCreated`. Die App kann es
+// nicht anfordern und nicht wegwerfen; sie bekommt es geliehen.
+//
+// Deshalb hat diese Rueckwand die Griffe `an_fenster_setzen` und
+// `an_aktivitaet_setzen`. Das ist kein Bruch des Vertrags -- x11.fi
+// liest die Umgebung und ~/.Xauthority, win32.fi baut sein HWND; jede
+// Rueckwand hat die Stelle, an der sie mit ihrem System redet. Sie ist
+// hier nur nach aussen sichtbar, weil das System zuerst spricht.
+//
+// ============================================ DER SCHIRM OHNE TELEFON
+//
+// Ist keine `ANativeWindow` angemeldet, legt `r_mache` eine EIGENE
+// Zeichenflaeche im Haufen an, `r_bild`/`r_fuelle` schreiben dorthin,
+// `r_blitten` tut nichts und `r_ppm` schreibt sie als PPM heraus. Genau
+// das macht win32.fi ueber sein DIB (r_ppm dort) -- und genau das ist
+// der Weg, auf dem diese Runde den bildpunktweisen Vergleich zwischen
+// X11, Windows und Android messen kann, ohne dass ein Telefon
+// angeschlossen ist. Auf dem Geraet wird derselbe Zweig nie betreten.
+//
+// ================================================ DAS BILDPUNKTFORMAT
+//
+// Der Vertrag (F3 im Kopf von fenster.fi) ist BGRX: B, G, R, X im
+// Speicher. Androids `WINDOW_FORMAT_RGBA_8888` legt R, G, B, A ab --
+// dieselben vier Oktett in der anderen Reihenfolge. `r_bild` dreht sie
+// darum um. Das kostet auf dem Geraet einen Tausch je Bildpunkt, und es
+// ist der EINZIGE Preis dafuer, dass die drei Systeme dieselbe
+// Fensterschnittstelle haben. (lib/android/blit.fi kopiert heute ohne
+// Tausch, weil die App ihre Leinwand unter Umgehung dieser Schicht
+// direkt hinueberschiebt; wer den Tausch sparen will, sagt es kuenftig
+// ueber ein zweites Format im Vertrag und nicht durch eine zweite
+// Fensterschicht.)
+//
+// ================================================================ EHRLICH
+//
+// U1 `r_schrift`/`r_text` sind FALSE. Das NDK hat keine Systemschrift
+//    ohne Java -- es gibt weder ein "fixed" wie bei X11 noch ein
+//    SYSTEM_FIXED_FONT wie bei GDI. Der Browser braucht sie nicht:
+//    lib/browser/certus_app.fi ruft `fenster.text` an keiner Stelle
+//    (nachgezaehlt: 0 Treffer), die Seite und die Leiste malt
+//    lib/font/raster.fi.
+// U2 HELL/DUNKEL kommt nicht von selbst. `AConfiguration_getUiModeNight`
+//    steht zwar in libandroid.so, ist aber in lib/android/ndk.fi nicht
+//    gebunden; diese Runde bindet nichts Neues. Bis dahin sagt
+//    `r_dunkel_bekannt` ehrlich `false`, und die Aktivitaet darf ueber
+//    `an_dunkel_setzen` sagen, was sie weiss.
+// U3 `r_warte` wartet auf Androids `ALooper`. Wer die Ereignisse
+//    STATTDESSEN ueber `ALooper_addFd`-Rueckrufe bekommt (so macht es
+//    lib/android/a_main.fi heute), ruft `r_warte` gar nicht und
+//    schuettet die Ereignisse mit `an_ereignis` in dieselbe Schlange.
+//    Beide Wege enden in `r_hole`.
+// U4 KEIN `r_titel`. Der Fenstertitel einer Android-Aktivitaet ist der
+//    Anwendungsname aus dem Manifest; ein eingeborener Prozess kann ihn
+//    ohne Java nicht setzen. `r_titel` gibt `false` und behauptet
+//    nichts.
+import std.rt
+import android.ndk
+import fenster.fenster
+
+export {
+    r_zieht,
+    Platte, platte_neu,
+    r_auf, r_mache, r_zeige, r_titel, r_zu, r_offen,
+    r_breite, r_hoehe, r_dpi, r_gross,
+    r_bild, r_fuelle, r_schrift, r_text, r_blitten, r_ppm,
+    r_warte, r_da, r_hole, r_dunkel, r_dunkel_bekannt, r_gift,
+    r_schirm, r_mittig,
+    // Die Griffe, an denen Android mit dieser Rueckwand redet. Siehe
+    // den Kopf: das System spricht hier zuerst.
+    an_fenster_setzen, an_aktivitaet_setzen, an_dpi_setzen,
+    an_dunkel_setzen, an_ereignis, an_schirm_setzen, an_gesperrt,
+    // RUNDE ABSCHLUSS: der Fensterpuffer SELBST. lib/android/a_main.fi
+    // malt die Seite mit `blit.blit_zeilen` -- ein `mem_copy` je Zeile,
+    // mit Massstab und Spaltentafel (MOBIL4/MOBIL6d). Das ist der
+    // zweitgroesste Posten je Bild und laesst sich nicht durch `r_bild`
+    // ersetzen, das je Bildpunkt drei Oktett einzeln umsetzt. Also
+    // bekommt die App den gesperrten Puffer -- und das SPERREN, das
+    // FORMAT und das FREIGEBEN gehoeren trotzdem hierher.
+    an_sperren, an_bits, an_stride, an_format, an_fenster,
+}
+
+const RING: usize = 64
+const MAGENTA: u32 = 16711935
+
+struct Platte {
+    // Die geliehene ANativeWindow, 0 = keine (Schirm ohne Telefon).
+    win: u64,
+    // Die ANativeActivity, fuer die Bildschirmtastatur.
+    akt: u64,
+    offen: bool,
+    w: usize,
+    h: usize,
+    dpi: usize,
+    schirm_w: usize,
+    schirm_h: usize,
+    // Der gesperrte Fensterpuffer zwischen `r_bild` und `r_blitten`.
+    // `bits` 0 = nicht gesperrt.
+    bits: u64,
+    stride: usize,
+    // Die eigene Zeichenflaeche, wenn keine ANativeWindow da ist.
+    eigen: u64,
+    eigen_n: usize,
+    gift: u32,
+    // RUNDE ABSCHLUSS: das Bildpunktformat, das der Treiber WIRKLICH
+    // geliefert hat. Die Pruefung stand in a_main.fi (MOBIL6: "das
+    // Format wird geprueft, nicht geglaubt") -- sie gehoert dorthin, wo
+    // gesperrt wird.
+    fmt: i32,
+    dark: bool,
+    dark_bekannt: bool,
+    // die Ereignisschlange
+    q_kind: [u32; 64],
+    q_a: [u32; 64],
+    q_x: [u32; 64],
+    q_y: [u32; 64],
+    q_s: [u32; 64],
+    q_head: usize,
+    q_tail: usize,
+}
+
+fn platte_neu() -> Platte {
+    return Platte { win: 0, akt: 0, offen: false, w: 0, h: 0, dpi: 160,
+        schirm_w: 0, schirm_h: 0, bits: 0, stride: 0, eigen: 0,
+        eigen_n: 0, gift: 0, fmt: 0, dark: false, dark_bekannt: false,
+        q_kind: [0; 64], q_a: [0; 64], q_x: [0; 64], q_y: [0; 64],
+        q_s: [0; 64], q_head: 0, q_tail: 0 }
+}
+
+// ==================================================== DIE ZWEI FRAGEN
+
+fn r_offen(x: *mut Platte) -> bool {
+    return (*x).offen
+}
+
+fn r_breite(x: *mut Platte) -> usize {
+    return (*x).w
+}
+
+fn r_hoehe(x: *mut Platte) -> usize {
+    return (*x).h
+}
+
+fn r_dpi(x: *mut Platte) -> usize {
+    return (*x).dpi
+}
+
+// ==================================== WAS DIE AKTIVITAET HEREINREICHT
+
+// `onNativeWindowCreated` / `onNativeWindowDestroyed`. 0 heisst: das
+// Fenster ist weg, und ab hier gilt der Weg ohne Telefon nicht -- es
+// wird einfach nichts mehr hinuebergeschoben.
+fn an_fenster_setzen(x: *mut Platte, win: u64) {
+    if (*x).bits != 0 && (*x).win != 0 {
+        let a: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+        (*x).bits = 0
+    }
+    (*x).win = win
+    if win != 0 {
+        (*x).w = ndk.ANativeWindow_getWidth(win) as usize
+        (*x).h = ndk.ANativeWindow_getHeight(win) as usize
+        if (*x).schirm_w == 0 {
+            (*x).schirm_w = (*x).w
+            (*x).schirm_h = (*x).h
+        }
+    }
+}
+
+fn an_aktivitaet_setzen(x: *mut Platte, akt: u64) {
+    (*x).akt = akt
+}
+
+// Aus `AConfiguration_getDensity`. Android zaehlt in dpi wie alle
+// anderen auch (160 = mdpi), also geht die Zahl unveraendert durch.
+fn an_dpi_setzen(x: *mut Platte, d: usize) {
+    if d >= 48 && d <= 960 {
+        (*x).dpi = d
+    }
+}
+
+fn an_dunkel_setzen(x: *mut Platte, dunkel: bool) {
+    (*x).dark = dunkel
+    (*x).dark_bekannt = true
+}
+
+fn an_schirm_setzen(x: *mut Platte, sw: usize, sh: usize) {
+    (*x).schirm_w = sw
+    (*x).schirm_h = sh
+}
+
+// Ein Ereignis in die gemeinsame Schlange. `kind` ist ein EV_* aus
+// fenster.fenster -- die Aktivitaet rechnet ihre AMotionEvent- und
+// AKeyEvent-Zahlen dorthin um, genau wie win32.fi seine WM_*-Nachrichten
+// und x11.fi seine Ereignisnummern.
+fn an_ereignis(x: *mut Platte, kind: u32, a: u32, ex: u32, ey: u32,
+    es: u32) {
+    let n: usize = ((*x).q_head + 1) % RING
+    if n == (*x).q_tail {
+        // Die Schlange ist voll. Das ALTESTE geht -- ein verlorenes
+        // Bewegungsereignis ist besser als ein stehender Zeiger.
+        (*x).q_tail = ((*x).q_tail + 1) % RING
+    }
+    (*x).q_kind[(*x).q_head] = kind
+    (*x).q_a[(*x).q_head] = a
+    (*x).q_x[(*x).q_head] = ex
+    (*x).q_y[(*x).q_head] = ey
+    (*x).q_s[(*x).q_head] = es
+    (*x).q_head = n
+}
+
+// Steht der Fensterpuffer gerade gesperrt? Wer aus einem anderen Faden
+// malen will, muss es wissen.
+fn an_gesperrt(x: *mut Platte) -> bool {
+    return (*x).bits != 0
+}
+
+// ========================================================== AUFMACHEN
+
+// Es gibt nichts aufzumachen: das Fenster kommt vom System. `anzeige`
+// hat unter Android keine Bedeutung und wird nicht angesehen -- so wie
+// unter Windows.
+fn r_auf(x: *mut Platte, anzeige: usize) -> bool {
+    (*x).offen = true
+    return true
+}
+
+// Die Zeichenflaeche auf `w` x `h` bringen.
+//
+// MIT Fenster: `ANativeWindow_setBuffersGeometry`. Der Treiber darf die
+// Zeilenbreite aufrunden -- deshalb wird `stride` bei jedem `lock` neu
+// gelesen und nie gerechnet.
+//
+// OHNE Fenster: ein Stueck Haufen, `w * h * 4` Oktett.
+fn r_mache(x: *mut Platte, w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 {
+        return false
+    }
+    (*x).w = w
+    (*x).h = h
+    if (*x).win != 0 {
+        let r: i32 = ndk.ANativeWindow_setBuffersGeometry((*x).win,
+            w as i32, h as i32, ndk.WINDOW_FORMAT_RGBA_8888)
+        if r != 0 {
+            return false
+        }
+        if (*x).gift != 0 {
+            let okg: bool = r_fuelle(x, MAGENTA, 0, 0, w, h)
+        }
+        return true
+    }
+    let n: usize = w * h * 4
+    if (*x).eigen != 0 {
+        rt.heap_free((*x).eigen, (*x).eigen_n)
+        (*x).eigen = 0
+        (*x).eigen_n = 0
+    }
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return false
+    }
+    (*x).eigen = p
+    (*x).eigen_n = n
+    (*x).stride = w
+    rt.mem_set(p, 0 as u8, n)
+    if (*x).gift != 0 {
+        let okg2: bool = r_fuelle(x, MAGENTA, 0, 0, w, h)
+    }
+    return true
+}
+
+fn r_gross(x: *mut Platte, w: usize, h: usize) -> bool {
+    return r_mache(x, w, h)
+}
+
+// Das Fenster IST sichtbar, sobald Android es gibt.
+fn r_zeige(x: *mut Platte) -> bool {
+    return (*x).win != 0 || (*x).eigen != 0
+}
+
+// U4: ohne Java kein Titel.
+fn r_titel(x: *mut Platte, p: u64, n: usize) -> bool {
+    return false
+}
+
+fn r_schirm(x: *mut Platte, sw: *mut usize, sh: *mut usize) -> bool {
+    if (*x).schirm_w == 0 || (*x).schirm_h == 0 {
+        return false
+    }
+    *sw = (*x).schirm_w
+    *sh = (*x).schirm_h
+    return true
+}
+
+// Eine Android-Aktivitaet fuellt den Schirm; sie mittig zu stellen ist
+// gegenstandslos und wird nicht behauptet.
+fn r_mittig(x: *mut Platte) -> bool {
+    return false
+}
+
+// Am Rand ziehen gibt es nicht.
+fn r_zieht(x: *mut Platte) -> bool {
+    return false
+}
+
+fn r_gift(x: *mut Platte, an: bool) {
+    if an {
+        (*x).gift = 1
+    } else {
+        (*x).gift = 0
+    }
+}
+
+fn r_dunkel(x: *mut Platte) -> bool {
+    return (*x).dark
+}
+
+fn r_dunkel_bekannt(x: *mut Platte) -> bool {
+    return (*x).dark_bekannt
+}
+
+// ============================================================== MALEN
+
+// Den Fensterpuffer sperren, wenn er es nicht schon ist. Danach stehen
+// `bits` und `stride`; ohne Fenster ist es der eigene Puffer.
+fn sperren(x: *mut Platte) -> bool {
+    if (*x).bits != 0 {
+        return true
+    }
+    if (*x).win == 0 {
+        if (*x).eigen == 0 {
+            return false
+        }
+        (*x).bits = (*x).eigen
+        (*x).stride = (*x).w
+        (*x).fmt = ndk.WINDOW_FORMAT_RGBA_8888
+        return true
+    }
+    var kasten: [u8; 48] = [0 as u8; 48]
+    let bp: u64 = (&kasten[0]) as u64
+    if ndk.ANativeWindow_lock((*x).win, bp, 0) != 0 {
+        return false
+    }
+    let bw: usize = ndk.peek32(bp + ndk.BUF_WIDTH) as usize
+    let bh: usize = ndk.peek32(bp + ndk.BUF_HEIGHT) as usize
+    (*x).stride = ndk.peek32(bp + ndk.BUF_STRIDE) as usize
+    (*x).fmt = ndk.peek32(bp + ndk.BUF_FORMAT)
+    (*x).bits = ndk.peek64(bp + ndk.BUF_BITS)
+    // Der Treiber darf eine andere Groesse geliefert haben als bestellt.
+    // Dann gilt SEINE -- der Vertrag verlangt, dass `breite`/`hoehe`
+    // sagen, was wirklich dasteht.
+    if bw > 0 && bh > 0 {
+        (*x).w = bw
+        (*x).h = bh
+    }
+    // RUNDE ABSCHLUSS: gelingt das Sperren, liefert aber keinen Zeiger,
+    // dann ist das Fenster TROTZDEM gesperrt. Hier stand nur
+    // `return (*x).bits != 0` -- der Aufrufer bekam ein Nein und hatte
+    // keine Moeglichkeit mehr, das Fenster wieder freizugeben (`r_blitten`
+    // kehrt bei `bits == 0` sofort zurueck). Das Fenster waere fuer immer
+    // gesperrt geblieben. Also wird hier freigegeben, wo es auffaellt.
+    if (*x).bits == 0 {
+        let a: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+        return false
+    }
+    return true
+}
+
+// ===================================================================
+// RUNDE ABSCHLUSS -- DER GESPERRTE PUFFER, FUER DEN, DER SELBST MALT
+// ===================================================================
+//
+// `r_bild` setzt je Bildpunkt drei Oktett einzeln um. Fuer die Leiste
+// ist das richtig; fuer die SEITE ist es das nicht -- lib/android/
+// blit.fi kopiert eine Zeile am Stueck (`mem_copy`) und kann dabei
+// vergroessern. A3 im Kopf von a_main.fi hat nachgerechnet, dass die
+// Umrechnung ein Kreis war: Androids RGBA_8888 ist genau die Reihenfolge,
+// in der lib/paint/canvas.fi ihre Oktett ablegt.
+//
+// Darum diese vier Griffe. Was hier steht, ist trotzdem alles, was am
+// FENSTER haengt: sperren, Zeilenbreite, Format, freigeben -- und die
+// App weiss ab jetzt nichts mehr von `ANativeWindow_lock`.
+fn an_sperren(x: *mut Platte) -> bool {
+    return sperren(x)
+}
+
+#[no_gc]
+fn an_bits(x: *mut Platte) -> u64 {
+    return (*x).bits
+}
+
+#[no_gc]
+fn an_stride(x: *mut Platte) -> usize {
+    return (*x).stride
+}
+
+#[no_gc]
+fn an_format(x: *mut Platte) -> i32 {
+    return (*x).fmt
+}
+
+// Die geliehene ANativeWindow. 0 = keine (Schirm ohne Telefon).
+#[no_gc]
+fn an_fenster(x: *mut Platte) -> u64 {
+    return (*x).win
+}
+
+// Ein fertiger BGRX-Puffer nach (dx, dy). Androids RGBA_8888 will
+// dieselben vier Oktett in der Reihenfolge R, G, B, A -- Oktett 0 und 2
+// werden getauscht (siehe den Kopf).
+fn r_bild(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
+    dy: usize) -> bool {
+    if !sperren(x) {
+        return false
+    }
+    let ziel: u64 = (*x).bits
+    let st: usize = (*x).stride
+    var y: usize = 0
+    while y < h {
+        let ty: usize = dy + y
+        if ty >= (*x).h {
+            break
+        }
+        var n: usize = w
+        if dx + n > (*x).w {
+            if dx >= (*x).w {
+                n = 0
+            } else {
+                n = (*x).w - dx
+            }
+        }
+        var i: usize = 0
+        let q: u64 = px + (y * w * 4) as u64
+        let z: u64 = ziel + ((ty * st + dx) * 4) as u64
+        while i < n {
+            let b: u8 = rt.ld8(q, i * 4)
+            let g: u8 = rt.ld8(q, i * 4 + 1)
+            let r: u8 = rt.ld8(q, i * 4 + 2)
+            rt.st8(z, i * 4, r)
+            rt.st8(z, i * 4 + 1, g)
+            rt.st8(z, i * 4 + 2, b)
+            rt.st8(z, i * 4 + 3, 255 as u8)
+            i = i + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// Ein Rechteck in 0xRRGGBB.
+fn r_fuelle(x: *mut Platte, px: u32, x0: usize, y0: usize, w: usize,
+    h: usize) -> bool {
+    if !sperren(x) {
+        return false
+    }
+    let ziel: u64 = (*x).bits
+    let st: usize = (*x).stride
+    let rr: u8 = ((px >> 16) & 255 as u32) as u8
+    let gg: u8 = ((px >> 8) & 255 as u32) as u8
+    let bb: u8 = (px & 255 as u32) as u8
+    var y: usize = 0
+    while y < h {
+        let ty: usize = y0 + y
+        if ty >= (*x).h {
+            break
+        }
+        var i: usize = 0
+        let z: u64 = ziel + ((ty * st + x0) * 4) as u64
+        while i < w && x0 + i < (*x).w {
+            rt.st8(z, i * 4, rr)
+            rt.st8(z, i * 4 + 1, gg)
+            rt.st8(z, i * 4 + 2, bb)
+            rt.st8(z, i * 4 + 3, 255 as u8)
+            i = i + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// U1: das NDK hat keine Systemschrift ohne Java.
+fn r_schrift(x: *mut Platte) -> bool {
+    return false
+}
+
+fn r_text(x: *mut Platte, fg: u32, bg: u32, tx: usize, ty: usize, p: u64,
+    n: usize) -> bool {
+    return false
+}
+
+// Alles Gemalte auf den Schirm: das Freigeben des Fensterpuffers IST
+// das Hinausschieben. Ohne Fenster bleibt die Zeichenflaeche stehen,
+// damit `r_ppm` sie noch findet.
+fn r_blitten(x: *mut Platte) -> bool {
+    if (*x).bits == 0 {
+        return true
+    }
+    if (*x).win == 0 {
+        (*x).bits = 0
+        return true
+    }
+    let r: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+    (*x).bits = 0
+    return r == 0
+}
+
+// Der Abzug dessen, was wirklich dasteht -- wie win32.fi ueber sein DIB.
+// Ohne eigenen Puffer geht es nicht: eine gepostete ANativeWindow gibt
+// ihre Bildpunkte nicht wieder her.
+fn r_ppm(x: *mut Platte, pfad: u64) -> bool {
+    if (*x).eigen == 0 {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    var p6: [u8; 3] = "P6\n"
+    rt.buf_push_bytes(&b, (&p6[0]) as u64, 3)
+    rt.buf_push_dec_u64(&b, (*x).w as u64)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_u64(&b, (*x).h as u64)
+    rt.buf_push(&b, 10 as u8)
+    var m255: [u8; 4] = "255\n"
+    rt.buf_push_bytes(&b, (&m255[0]) as u64, 4)
+    var y: usize = 0
+    while y < (*x).h {
+        var xx: usize = 0
+        while xx < (*x).w {
+            let o: u64 = (*x).eigen + ((y * (*x).stride + xx) * 4) as u64
+            // Im Puffer liegen R, G, B, A -- PPM will R, G, B.
+            rt.buf_push(&b, rt.ld8(o, 0))
+            rt.buf_push(&b, rt.ld8(o, 1))
+            rt.buf_push(&b, rt.ld8(o, 2))
+            xx = xx + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = rt.write_file(pfad, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    return ok
+}
+
+// ======================================================= DIE EREIGNISSE
+
+fn r_da(x: *mut Platte) -> bool {
+    return (*x).q_head != (*x).q_tail
+}
+
+// U3: Androids Schleife. `ms` < 0 = ewig, 0 = nur nachsehen. Der
+// Rueckruf, den `ALooper_pollOnce` unterwegs abarbeitet, ist der der
+// Aktivitaet -- er schuettet die Ereignisse mit `an_ereignis` in
+// dieselbe Schlange, aus der `r_hole` sie nimmt.
+fn r_warte(x: *mut Platte, ms: i64) -> bool {
+    if r_da(x) {
+        return true
+    }
+    if !(*x).offen {
+        return false
+    }
+    if (*x).win == 0 {
+        // Ohne Fenster kommt nichts. Das ehrlich zu sagen ist besser,
+        // als in einer Schleife zu stehen.
+        return false
+    }
+    var fd: i32 = 0
+    var ev: i32 = 0
+    var daten: u64 = 0
+    let r: i32 = ndk.ALooper_pollOnce(ms as i32, (&fd) as u64,
+        (&ev) as u64, (&daten) as u64)
+    return r_da(x)
+}
+
+fn r_hole(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
+    oy: *mut u32, os: *mut u32) -> bool {
+    if (*x).q_head == (*x).q_tail {
+        return false
+    }
+    let i: usize = (*x).q_tail
+    *k = (*x).q_kind[i]
+    *a = (*x).q_a[i]
+    *ox = (*x).q_x[i]
+    *oy = (*x).q_y[i]
+    *os = (*x).q_s[i]
+    (*x).q_tail = (i + 1) % RING
+    return true
+}
+
+// =========================================================== ZUMACHEN
+//
+// Das Fenster gehoert Android; es wird NICHT freigegeben, nur
+// losgelassen. Der eigene Puffer gehoert uns und geht zurueck.
+fn r_zu(x: *mut Platte) {
+    if (*x).bits != 0 && (*x).win != 0 {
+        let a: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+    }
+    (*x).bits = 0
+    (*x).win = 0
+    if (*x).eigen != 0 {
+        rt.heap_free((*x).eigen, (*x).eigen_n)
+        (*x).eigen = 0
+        (*x).eigen_n = 0
+    }
+    (*x).offen = false
+}
