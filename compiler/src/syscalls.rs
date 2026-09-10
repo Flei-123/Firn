@@ -81,6 +81,7 @@ const TABLE: &[(i64, A64)] = &[
     (11, A64::Direct(215)),          // munmap
     (12, A64::Direct(214)),          // brk
     (13, A64::Direct(134)),          // rt_sigaction
+    (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (14, A64::Direct(135)),          // rt_sigprocmask
     (16, A64::Direct(29)),           // ioctl
     (17, A64::Direct(67)),           // pread64
