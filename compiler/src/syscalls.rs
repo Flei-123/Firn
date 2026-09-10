@@ -134,6 +134,12 @@ const TABLE: &[(i64, A64)] = &[
     // same thing. The third argument (flags) is 0, which is what
     // `unlinkat` wants for a plain file.
     (87, A64::AtFdcwd(35)),          // unlink    -> unlinkat
+    // RUNDE CSS/STAPEL (Certus, 10.09.2026): lib/js/interp.fi fragt den
+    // WIRKLICHEN Stapel ab (getrlimit(RLIMIT_STACK)) statt 6 MiB zu
+    // raten -- die geratene Zahl hat den Windows-Bau umgebracht, weil
+    // dort nur 2 MiB Stapel stehen. Ohne diese Zeile ist derselbe
+    // Quelltext fuer das Telefon nicht uebersetzbar.
+    (97, A64::Direct(163)),          // getrlimit
     (96, A64::Direct(169)),          // gettimeofday
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
