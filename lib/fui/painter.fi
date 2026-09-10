@@ -1,0 +1,586 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/painter.fi -- THE DRAWING LAYER OF fUi.
+//
+// ========================================================= WHY IT EXISTS
+//
+// lib/fenster/fenster.fi says outright in F1 what it does NOT do:
+//
+//     "NO drawing except pixels, rectangles and system text. Whoever
+//      wants curves rasterises them himself and pushes the finished
+//      buffer across with `bild`."
+//
+// Exactly that "rasterises them himself" stands here. Every control in
+// fUi paints EXCLUSIVELY through this file -- no widget sets a pixel
+// itself.
+//
+// THAT IS THE RULE THIS IS ABOUT. In OrientOS the control centre paints
+// its own tiles instead of using `paint_button`, and that is why they
+// look different from every other button in the system. In Certus the
+// bar painted its buttons itself, and lib/android/ui.fi did it once
+// more. Three drawings of the same thing. Whoever paints past this file
+// builds the same mistake in.
+//
+// ====================================================== WHAT IT DRAWS
+//
+// Everything antialiased through the rasteriser Certus also paints the
+// page with (lib/font/raster.fi) -- no GDI, no Xlib, no system font.
+// Systemschrift.
+//
+//   surface          a rectangle
+//   round_rect       a rectangle with round corners
+//   round_ring       its outline (for the focus ring)
+//   border_col       a horizontal or vertical line
+//   text             text with an alignment, on a baseline
+//   text_width       how wide it would be -- for the layout
+//   caret_bar        the caret
+//
+// ================================= THE FOUR CORNERS WITHOUT lib/svg
+//
+// Certus rounds with `svg.pfad.pfad_rund_rechteck`. lib/svg does NOT
+// exist in the Firn tree (checked: lib/ has browser, css, dom, font,
+// gc, ..., but no svg), and fUi must not hang on an application
+// library. The four corners therefore stand here, as cubics straight in
+// the rasteriser.
+//
+// The factor 0.5523 is the well known one: a cubic Bezier meets a
+// quarter circle with an error under 0.03 % of the radius when the
+// control points lie at 4/3 * (sqrt(2) - 1) = 0.55228... of the edge
+// length. That is not an approximation by feel but the number every
+// vector drawing program uses.
+//
+// =============================================== THE TEXT SITS CENTRED
+//
+// Justin, 10.09.2026: in OrientOS the label does not sit in the middle
+// of the button. That is a mistake fUi must not inherit, and it has a
+// known cause: whoever centres vertically by the LINE HEIGHT centres
+// the line and not the font.
+//
+// Right is the FONT METRIC. A capital letter stands on the baseline and
+// reaches `ascent` upwards; `descent` hangs below it and is not used at
+// all by "Button". The optical middle of a line therefore lies at
+//
+//     baseline = y + (h + ascent - descent) / 2
+//
+// and NOT at `y + h/2 + size/2`. `text_baseline_mid` computes exactly
+// that, and `tools/fui/preview_main.fi` measures on the finished
+// picture afterwards that as many empty rows stand above as below.
+import std.rt
+import paint.canvas
+import font.raster
+import font.metrics
+import font.ttf
+import fui.theme
+
+export {
+    Painter, painter_new, painter_init, painter_free, painter_ok,
+    painter_canvas, painter_set_font, painter_font,
+    surface, round_rect, round_ring, border_col,
+    text, text_width, text_fits_upto, text_baseline_mid,
+    TEXT_L, TEXT_M, TEXT_R,
+    caret_bar,
+    font_ascent, font_descent,
+}
+
+// The alignment horizontally. Vertically there is only one sensible
+// one (centred to the font metric), so it is not a choice.
+const TEXT_L: u32 = 0
+const TEXT_M: u32 = 1
+const TEXT_R: u32 = 2
+
+// The scratch buffer of the TrueType reader. The same number as in
+// lib/browser/chrome.fi -- it is enough for every glyph of a user
+// interface.
+const SCRATCH: usize = 65536
+
+struct Painter {
+    cv: u64,          // the canvas, owned by the caller
+    ra: raster.Raster,
+    rbuf: *mut u8,
+    rcap: usize,
+    scratch: *mut u8,
+    fm: u64,          // the font set (metrics.FontSet), 0 = none
+    w: usize,
+    h: usize,
+    ok: usize,
+}
+
+#[no_gc]
+fn painter_new() -> Painter {
+    return Painter {
+        cv: 0, ra: raster.raster_new(), rbuf: 0 as *mut u8, rcap: 0,
+        scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
+    }
+}
+
+// `w` x `h` is the largest area rasterised at once. That is NOT the
+// canvas: what gets rasterised is always only the rectangle of one
+// widget, and a button is seldom bigger than a few hundred pixels.
+// Whoever gives the whole canvas pays (w + 2) * h * 8 bytes for
+// nothing.
+fn painter_init(z: *mut Painter, cv: *mut canvas.Canvas, w: usize,
+    h: usize) -> bool {
+    (*z).cv = cv as u64
+    (*z).w = w
+    (*z).h = h
+    let need: usize = raster.raster_bytes_needed(w, h)
+    (*z).rbuf = rt.heap_alloc(need) as *mut u8
+    if (*z).rbuf as usize == 0 {
+        return false
+    }
+    (*z).rcap = need
+    raster.raster_attach(&(*z).ra, (*z).rbuf, need)
+    (*z).scratch = rt.heap_alloc(SCRATCH) as *mut u8
+    if (*z).scratch as usize == 0 {
+        return false
+    }
+    (*z).ok = 1
+    return true
+}
+
+fn painter_free(z: *mut Painter) {
+    if (*z).rbuf as usize != 0 {
+        rt.heap_free((*z).rbuf as u64, (*z).rcap)
+        (*z).rbuf = 0 as *mut u8
+    }
+    if (*z).scratch as usize != 0 {
+        rt.heap_free((*z).scratch as u64, SCRATCH)
+        (*z).scratch = 0 as *mut u8
+    }
+    (*z).ok = 0
+}
+
+#[no_gc]
+fn painter_ok(z: *mut Painter) -> bool { return (*z).ok != 0 }
+
+#[no_gc]
+fn painter_canvas(z: *mut Painter) -> *mut canvas.Canvas {
+    return (*z).cv as *mut canvas.Canvas
+}
+
+#[no_gc]
+fn painter_set_font(z: *mut Painter, fm: u64) { (*z).fm = fm }
+
+#[no_gc]
+fn painter_font(z: *mut Painter) -> u64 { return (*z).fm }
+
+// ------------------------------------------------------------- helpers
+
+#[no_gc]
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+#[no_gc]
+fn b8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+// A code point from UTF-8. Taken from lib/browser/chrome.fi.
+#[no_gc]
+fn utf8_at(p: u64, n: usize, i: usize, adv: *mut usize) -> u32 {
+    let c0: u32 = b8(p, i) as u32
+    if c0 < 128 as u32 {
+        *adv = 1
+        return c0
+    }
+    if c0 >= 240 as u32 && i + 3 < n {
+        *adv = 4
+        return ((c0 & 7 as u32) << 18)
+        | (((b8(p, i + 1) as u32) & 63 as u32) << 12)
+        | (((b8(p, i + 2) as u32) & 63 as u32) << 6)
+        | ((b8(p, i + 3) as u32) & 63 as u32)
+    }
+    if c0 >= 224 as u32 && i + 2 < n {
+        *adv = 3
+        return ((c0 & 15 as u32) << 12)
+        | (((b8(p, i + 1) as u32) & 63 as u32) << 6)
+        | ((b8(p, i + 2) as u32) & 63 as u32)
+    }
+    if c0 >= 192 as u32 && i + 1 < n {
+        *adv = 2
+        return ((c0 & 31 as u32) << 6)
+        | ((b8(p, i + 1) as u32) & 63 as u32)
+    }
+    *adv = 1
+    return c0
+}
+
+// ========================================================== THE AREAS
+
+// A rectangle. The simplest thing, and it does NOT go through the
+// rasteriser: whole pixels need no antialiasing, and `canvas_fill_rect`
+// is many times faster.
+fn surface(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    canvas.canvas_fill_rect(painter_canvas(z), x, y, x + w, y + h,
+        theme.opaque(col))
+}
+
+// A line. Horizontal or vertical -- a slanted line is only needed by a
+// user interface for icons, and those have their own path. `st` is the
+// stroke width.
+fn border_col(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, st: f64,
+    col: u32) {
+    if w >= h {
+        surface(z, x, y, w, st, col)
+    } else {
+        surface(z, x, y, st, h, col)
+    }
+}
+
+// The factor for the quarter circle out of a cubic.
+#[no_gc]
+fn K() -> f64 { return 0.5522847498307933 }
+
+// Write the outline of a round rectangle into the rasteriser.
+// `r` is clamped to half the shorter side -- a radius bigger than the
+// rectangle is not a shape but a mistake, and in `u64` the subtraction
+// below would be exactly the overflow Justin's start menu in OrientOS
+// died of (kernel/user/wlib.fi, round ECHTHARDWARE-1). Here everything
+// is f64, but the clamp stands all the same.
+#[no_gc]
+fn path_round(ra: *mut raster.Raster, x: f64, y: f64, w: f64, h: f64,
+    r0: f64) {
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2.0 {
+        r = m / 2.0
+    }
+    if r < 0.0 {
+        r = 0.0
+    }
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    let k: f64 = r * K()
+    if r <= 0.0 {
+        // A square rectangle is the same path with four lines -- that
+        // way `shape_classic` (radius 0) is pixel-identical with what
+        // `surface` paints, and not a second lot of drawing code.
+        raster.raster_line(ra, x, y, x1, y)
+        raster.raster_line(ra, x1, y, x1, y1)
+        raster.raster_line(ra, x1, y1, x, y1)
+        raster.raster_line(ra, x, y1, x, y)
+        return
+    }
+    // top, clockwise
+    raster.raster_line(ra, x + r, y, x1 - r, y)
+    raster.raster_cubic(ra, x1 - r, y, x1 - r + k, y, x1, y + r - k,
+        x1, y + r)
+    raster.raster_line(ra, x1, y + r, x1, y1 - r)
+    raster.raster_cubic(ra, x1, y1 - r, x1, y1 - r + k, x1 - r + k, y1,
+        x1 - r, y1)
+    raster.raster_line(ra, x1 - r, y1, x + r, y1)
+    raster.raster_cubic(ra, x + r, y1, x + r - k, y1, x, y1 - r + k,
+        x, y1 - r)
+    raster.raster_line(ra, x, y1 - r, x, y + r)
+    raster.raster_cubic(ra, x, y + r, x, y + r - k, x + r - k, y,
+        x + r, y)
+}
+
+// Open the raster window for a rectangle. Gives false when there is
+// nothing to do.
+#[no_gc]
+fn raster_window(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
+    luft: f64, wx: *mut f64, wy: *mut f64) -> bool {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+    let ax: f64 = clamp(x - luft, 0.0, cw)
+    let ay: f64 = clamp(y - luft, 0.0, ch)
+    let bx: f64 = clamp(x + w + luft, 0.0, cw)
+    let by: f64 = clamp(y + h + luft, 0.0, ch)
+    if bx <= ax || by <= ay {
+        return false
+    }
+    let rw: usize = (bx - ax) as usize + 1
+    let rh: usize = (by - ay) as usize + 1
+    if rw > (*z).w || rh > (*z).h {
+        return false
+    }
+    *wx = ax
+    *wy = ay
+    return raster.raster_begin(&(*z).ra, ax, ay, rw, rh)
+}
+
+// A RECTANGLE WITH ROUND CORNERS, antialiased.
+fn round_rect(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
+    col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    if r <= 0.0 {
+        surface(z, x, y, w, h, col)
+        return
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
+        return
+    }
+    path_round(&(*z).ra, x, y, w, h, r)
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
+        wx as usize, wy as usize, theme.opaque(col))
+}
+
+// THE OUTLINE. A ring and not a filled area: it lies ON an already
+// painted widget. It is made as two paths in ONE raster run -- outside
+// clockwise, inside against it. The rasteriser counts windings, so
+// exactly the border stays.
+//
+// That is the focus ring, and it is the only thing somebody working by
+// keyboard relies on. Therefore it is two pixels wide
+// (theme.Shape.focus_w) and not one: one disappears on every screen
+// with scaling.
+fn round_ring(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
+    st: f64, col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 || st <= 0.0 {
+        return
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
+        return
+    }
+    path_round(&(*z).ra, x, y, w, h, r)
+    // inside, counter-running -- hence the points in reverse order
+    let ix: f64 = x + st
+    let iy: f64 = y + st
+    let iw: f64 = w - 2.0 * st
+    let ih: f64 = h - 2.0 * st
+    if iw > 0.0 && ih > 0.0 {
+        var ir: f64 = r - st
+        if ir < 0.0 {
+            ir = 0.0
+        }
+        path_round_ccw(&(*z).ra, ix, iy, iw, ih, ir)
+    }
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
+        wx as usize, wy as usize, theme.opaque(col))
+}
+
+// The same path counter-clockwise. It stands as a function of its own
+// and not as a switch in `path_round`, because a loop with swapped
+// points is harder to read than two clear cases.
+#[no_gc]
+fn path_round_ccw(ra: *mut raster.Raster, x: f64, y: f64, w: f64,
+    h: f64, r0: f64) {
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2.0 {
+        r = m / 2.0
+    }
+    if r < 0.0 {
+        r = 0.0
+    }
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    let k: f64 = r * K()
+    if r <= 0.0 {
+        raster.raster_line(ra, x, y, x, y1)
+        raster.raster_line(ra, x, y1, x1, y1)
+        raster.raster_line(ra, x1, y1, x1, y)
+        raster.raster_line(ra, x1, y, x, y)
+        return
+    }
+    // DER FEHLER, DEN JUSTIN IM BILD GEFUNDEN HAT (10.09.2026).
+    //
+    // Diese vier Kurven waren falsch, und zwar auf eine Art, die
+    // uebersetzt, laeuft und fast richtig aussieht:
+    //
+    //   * Die ERSTE Kurve endete auf ihrem eigenen ANFANG
+    //     (P3 = (x+r, y) statt (x, y+r)) -- ein Segment, das nirgends
+    //     hinfuehrt.
+    //   * Bei allen vier waren die Kontrollpunkte um eine Stelle
+    //     VERSCHOBEN, so dass der zweite Kontrollpunkt auf dem
+    //     Endpunkt lag. Eine Bezier mit c2 == P3 ist keine
+    //     Viertelkreis-Rundung mehr, sondern faellt zur Sehne hin ab.
+    //
+    // Sichtbar wurde das erst am Fokusring, weil dort AUSSEN- und
+    // INNENpfad uebereinanderliegen: der Innenpfad schnitt oben zu
+    // wenig weg. Gemessen im hellen Bild, Ring des Knopfs "Focused",
+    // Farbe (0,96,223):
+    //
+    //     obere Kante  y=52..57  -> 6 Zeilen dick
+    //     untere Kante y=80..81  -> 2 Zeilen dick
+    //     oben rechts bis x=661, die Seiten nur bis x=659
+    //
+    // Soll sind ueberall 2 (theme.Shape.focus_w bei Massstab 1).
+    //
+    // DIE REGEL, DIE DABEI GILT: bei einer Viertelkreis-Bezier liegt
+    // c1 TANGENTIAL am Startpunkt und c2 TANGENTIAL am Endpunkt, je
+    // k = r * K() entfernt. Wer die Punkte nur abschreibt und dabei
+    // die Reihenfolge dreht, bekommt genau diesen Fehler.
+    //
+    // Gegen den Uhrzeigersinn, beginnend oben links:
+    //     (x+r, y) -> (x, y+r) -> (x, y1-r) -> (x+r, y1)
+    //  -> (x1-r, y1) -> (x1, y1-r) -> (x1, y+r) -> (x1-r, y)
+    //
+    // oben links: waagerecht los, senkrecht an
+    raster.raster_cubic(ra, x + r, y, x + r - k, y, x, y + r - k,
+        x, y + r)
+    raster.raster_line(ra, x, y + r, x, y1 - r)
+    // unten links: senkrecht los, waagerecht an
+    raster.raster_cubic(ra, x, y1 - r, x, y1 - r + k, x + r - k, y1,
+        x + r, y1)
+    raster.raster_line(ra, x + r, y1, x1 - r, y1)
+    // unten rechts: waagerecht los, senkrecht an
+    raster.raster_cubic(ra, x1 - r, y1, x1 - r + k, y1, x1, y1 - r + k,
+        x1, y1 - r)
+    raster.raster_line(ra, x1, y1 - r, x1, y + r)
+    // oben rechts: senkrecht los, waagerecht an
+    raster.raster_cubic(ra, x1, y + r, x1, y + r - k, x1 - r + k, y,
+        x1 - r, y)
+    raster.raster_line(ra, x1 - r, y, x + r, y)
+}
+
+// ============================================================ THE TEXT
+
+#[no_gc]
+fn font_ascent(z: *mut Painter, size: f64) -> f64 {
+    return metrics.fm_ascent((*z).fm, size)
+}
+
+#[no_gc]
+fn font_descent(z: *mut Painter, size: f64) -> f64 {
+    return metrics.fm_descent((*z).fm, size)
+}
+
+// How wide does the text get? The number every layout rests on.
+#[no_gc]
+fn text_width(z: *mut Painter, p: u64, n: usize, size: f64) -> f64 {
+    if !metrics.fm_present((*z).fm) {
+        return 0.0
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        x = x + metrics.fm_advance((*z).fm, size, cp)
+        i = i + adv
+    }
+    return x
+}
+
+// How many bytes fit into `platz`? Always on a character boundary --
+// never in the middle of a UTF-8 character.
+#[no_gc]
+fn text_fits_upto(z: *mut Painter, p: u64, n: usize, size: f64,
+    platz: f64) -> usize {
+    if !metrics.fm_present((*z).fm) {
+        return n
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let w: f64 = metrics.fm_advance((*z).fm, size, cp)
+        if x + w > platz {
+            return i
+        }
+        x = x + w
+        i = i + adv
+    }
+    return n
+}
+
+// THE BASELINE FOR VERTICALLY CENTRED TEXT.
+//
+// This is the arithmetic that fixes Justin's finding "the label does
+// not sit in the middle", and the reason stands at the head of this
+// file: what is centred is the FONT, not the line.
+//
+//     The font occupies from (baseline - ascent) to
+//     (baseline + descent). Its middle lies at
+//     baseline - (ascent - descent) / 2, and that should fall on
+//     y + h/2:
+//
+//         baseline = y + h/2 + (ascent - descent) / 2
+//                  = y + (h + ascent - descent) / 2
+//
+// Rounded to a whole pixel: a baseline between two pixels makes every
+// line half blurred (the same reasoning stands in lib/font/metrics.fi
+// at `fm_ascent`).
+#[no_gc]
+fn text_baseline_mid(z: *mut Painter, y: f64, h: f64, size: f64) -> f64 {
+    let a: f64 = metrics.fm_ascent((*z).fm, size)
+    let d: f64 = metrics.fm_descent((*z).fm, size)
+    let b: f64 = y + (h + a - d) / 2.0
+    let t: f64 = ((b + 0.5) as i64) as f64
+    return t
+}
+
+// DRAW TEXT.
+//
+// `x`/`w` is the rect it is aligned in; `base_y` the baseline (from
+// `text_baseline_mid`). Back comes the position where it ends -- from
+// that the TextBuf works out where its caret sits.
+fn text(z: *mut Painter, x: f64, base_y: f64, w: f64, size: f64,
+    col: u32, p: u64, n: usize, align: u32) -> f64 {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return x
+    }
+    let br: f64 = text_width(z, p, n, size)
+    var sx: f64 = x
+    if align == TEXT_M {
+        sx = x + (w - br) / 2.0
+    } else if align == TEXT_R {
+        sx = x + w - br
+    }
+    // To a whole pixel: the same reason as at the baseline.
+    //
+    sx = ((sx + 0.5) as i64) as f64
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    // Air: one font size to each side. A glyph can reach beyond its
+    // advance width (italic, widely sweeping letters).
+    if !raster_window(z, sx, base_y - size * 1.4, br, size * 2.0, size,
+        &wx, &wy) {
+        return sx + br
+    }
+    let fs: *mut metrics.FontSet = (*z).fm as *mut metrics.FontSet
+    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
+    let up: f64 = metrics.fm_upem((*z).fm)
+    let sc: f64 = size / up
+    var pen: f64 = sx
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        let okg: bool = ttf.font_outline(f, gid, &(*z).ra, pen, base_y,
+            sc, (*z).scratch, SCRATCH, 0)
+        pen = pen + metrics.fm_advance((*z).fm, size, cp)
+        i = i + adv
+    }
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
+        wx as usize, wy as usize, theme.opaque(col))
+    return pen
+}
+
+// THE CARET. A vertical stroke on whole pixels -- it must NOT go
+// through the rasteriser, otherwise at half positions it is two pale
+// columns instead of one sharp one.
+fn caret_bar(z: *mut Painter, x: f64, y: f64, h: f64, st: f64,
+    col: u32) {
+    let ix: f64 = ((x + 0.5) as i64) as f64
+    var s: f64 = st
+    if s < 1.0 {
+        s = 1.0
+    }
+    surface(z, ix, y, s, h, col)
+}
