@@ -1,30 +1,30 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# tools/fui/run.sh -- DIE ABNAHME VON fUi.
+# tools/fui/run.sh -- THE ACCEPTANCE RUN FOR fUi.
 #
-# Ein Lauf, der alles prueft. Faellt eine Pruefung, faellt der Bau --
-# das ist Justins Punkt 2 zur Abnahme und die Antwort darauf, dass
-# dieselbe Zeichnung in OrientOS zweimal STILL verlorengegangen ist.
+# One run that checks everything. If a check fails, the build fails --
+# that is Justin's point 2 on acceptance, and the answer to the fact
+# that the same drawing went SILENTLY missing in OrientOS twice.
 #
-#     tools/fui/run.sh              nur pruefen
-#     tools/fui/run.sh --bilder     zusaetzlich die Schauseite malen
+#     tools/fui/run.sh              check only
+#     tools/fui/run.sh --images     additionally paint the gallery
 #
-# Die Abzuege landen unter /srv/store/belege/fui/.
+# The renders land under /srv/store/belege/fui/.
 set -e
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC="${FIRNC:-/root/firn-certuswin/compiler/target/release/firnc}"
-W="${W:-/tmp/fui-abnahme}"
+W="${W:-/tmp/fui-acceptance}"
 mkdir -p "$W"
 
-bau() {
+build() {
     "$FIRNC" --opt-level=dev -o "$W/$1" "tools/fui/$1_main.fi"
 }
 
-echo "== 1. DER KERN BAUT FREISTEHEND (profile kernel) =="
-# Das ist Justins Architektur: derselbe Quelltext im Kernel und in der
-# Anwendung. Geprueft wird, dass es baut UND dass kein Systemruf und
-# kein fremder Name darin steht.
+echo "== 1. THE CORE BUILDS FREESTANDING (profile kernel) =="
+# This is Justin's architecture: the same source in the kernel and in
+# the application. What is checked: that it builds AND that no syscall
+# and no foreign name is left inside.
 "$FIRNC" --profile=kernel --target=x86_64-none -c \
     -o "$W/core.o" lib/fui/core.fi
 "$FIRNC" --profile=kernel --target=x86_64-none -c \
@@ -34,55 +34,55 @@ echo "== 1. DER KERN BAUT FREISTEHEND (profile kernel) =="
 for o in core style layout; do
     n=$(objdump -d "$W/$o.o" | grep -c syscall || true)
     if [ "$n" != "0" ]; then
-        echo "  $o.o: $n syscall-Instruktionen -- im Kern verboten"
+        echo "  $o.o: $n syscall instructions -- forbidden in the core"
         exit 1
     fi
-    # Der EINZIGE erlaubte offene Name ist osum_panic (SPEC 2): den
-    # stellt das Betriebssystem, das den Kern einbindet.
-    fremd=$(nm -u "$W/$o.o" | grep -v osum_panic | wc -l)
-    if [ "$fremd" != "0" ]; then
-        echo "  $o.o: fremde Namen ausser osum_panic:"
+    # The ONLY permitted open name is osum_panic (SPEC 2): it is
+    # provided by the operating system that links the core in.
+    foreign=$(nm -u "$W/$o.o" | grep -v osum_panic | wc -l)
+    if [ "$foreign" != "0" ]; then
+        echo "  $o.o: foreign names besides osum_panic:"
         nm -u "$W/$o.o" | grep -v osum_panic
         exit 1
     fi
-    echo "  $o.o: 0 syscall, 0 fremde Namen  OK"
+    echo "  $o.o: 0 syscall, 0 foreign names  OK"
 done
 
 echo
-echo "== 2. DIE MARKE HAELT IHRE ZUSAGE (WCAG 4.5:1) =="
-bau contrast
+echo "== 2. THE BRAND KEEPS ITS PROMISE (WCAG 4.5:1) =="
+build contrast
 "$W/contrast"
 
 echo
-echo "== 3. DAS SCHLIESSKREUZ =="
-bau capicon
+echo "== 3. THE CLOSE CROSS =="
+build capicon
 "$W/capicon"
 
 echo
-echo "== 4. DAS STILSYSTEM =="
-bau style
+echo "== 4. THE STYLE SYSTEM =="
+build style
 "$W/style"
 
 echo
-echo "== 5. DIE ANORDNUNG =="
-bau layout
+echo "== 5. THE LAYOUT =="
+build layout
 "$W/layout"
 
 echo
-echo "== 6. WELLE 1 AM BILDPUNKT =="
-bau wave1
+echo "== 6. WAVE 1 AT THE PIXEL =="
+build wave1
 "$W/wave1"
 
-if [ "$1" = "--bilder" ]; then
+if [ "$1" = "--images" ]; then
     echo
-    echo "== 7. DIE SCHAUSEITE =="
+    echo "== 7. THE GALLERY =="
     Z=/srv/store/belege/fui
     mkdir -p "$Z"
-    bau gallery
-    "$W/gallery" "$Z/fui-welle1-hell.png" hell
-    "$W/gallery" "$Z/fui-welle1-dunkel.png" dunkel
+    build gallery
+    "$W/gallery" "$Z/fui-wave1-light.png" light
+    "$W/gallery" "$Z/fui-wave1-dark.png" dark
     ls -la "$Z"
 fi
 
 echo
-echo "ALLE PRUEFUNGEN BESTANDEN."
+echo "ALL CHECKS PASSED."
