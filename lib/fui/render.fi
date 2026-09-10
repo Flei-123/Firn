@@ -1,0 +1,365 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/fui/render.fi -- DIE EINE STELLE, AN DER ELEMENTE GEMALT WERDEN.
+//
+// ====================================================== WARUM ES SIE GIBT
+//
+// Das ist die Regel, um die es in diesem ganzen Vorhaben geht, und sie
+// ist zweimal teuer bezahlt worden:
+//
+//   * In OrientOS malt das Kontrollzentrum eigene Kacheln, statt
+//     `paint_button` zu benutzen -- darum sehen sie anders align als jeder
+//     andere Knopf im System.
+//   * Die Fensterknoepfe sind zweimal kaputtgegangen, weil ihre
+//     Zeichnung an einer zweiten Stelle nachgebaut wurde.
+//
+// DARUM: kein Bedienelement in fUi malt sich selbst. Es gibt genau eine
+// Datei, die align einem `Widget` Bildpunkte macht, und das ist diese.
+// Wer ein neues Widget baut, ergaenzt hier einen Fall -- und bekommt
+// Zustaende, Style, Fokusring und Kantenglaettung geschenkt, weil sie
+// schon da sind.
+//
+// ============================================== DER AUFBAU EINES ELEMENTS
+//
+// Jedes Widget wird in DERSELBEN Reihenfolge gemalt, und das ist keine
+// Bequemlichkeit -- es ist der Grund, warum sie alle zusammenpassen:
+//
+//   1. FLAECHE   der Hintergrund, wenn er visible ist
+//   2. RAHMEN    der Umriss, wenn er visible ist
+//   3. INHALT    Text oder Symbol
+//   4. FOKUSRING zuletzt, damit er ueber allem liegt
+//
+// `draw_base` macht 1, 2 und 4 fuer JEDES Widget. Ein neues Widget
+// schreibt nur seinen Inhalt.
+import std.rt
+import paint.canvas
+import fui.style
+import fui.theme
+import fui.widget
+import fui.painter
+
+export {
+    Ctx, ctx_new, ctx_theme, ctx_painter,
+    draw_base, draw_widget, draw_label, draw_button,
+    def_bg, def_bg_state, def_border, def_fg, def_radius, def_border_width,
+    def_pad_x, def_pad_y, def_font, def_align,
+    color_of, len_of,
+}
+
+// Was zum Malen gebraucht wird: die Theme (Colors, Shape, Massstab) und
+// der Painter (Leinwand, Schrift, Rasterer). Beide gehoeren dem
+// Aufrufer.
+struct Ctx {
+    m: u64,   // *mut theme.Theme
+    z: u64,   // *mut painter.Painter
+}
+
+fn ctx_new(m: *mut theme.Theme, z: *mut painter.Painter) -> Ctx {
+    return Ctx { m: m as u64, z: z as u64 }
+}
+
+fn ctx_theme(c: *mut Ctx) -> *mut theme.Theme {
+    return (*c).m as *mut theme.Theme
+}
+
+fn ctx_painter(c: *mut Ctx) -> *mut painter.Painter {
+    return (*c).z as *mut painter.Painter
+}
+
+// Einen aufgeloesten Stilwert zu einer echten Farbe.
+fn color_of(c: *mut Ctx, w: u32) -> u32 {
+    return theme.color_from_style(ctx_theme(c), w)
+}
+
+// Eine Entwurfslaenge in Geraetepunkte -- jede Laenge geht hier durch.
+fn len_of(c: *mut Ctx, n: usize) -> f64 {
+    return theme.theme_px(ctx_theme(c), n) as f64
+}
+
+// ======================================================================
+// DIE WIDGET-VORGABEN
+// ======================================================================
+//
+// Was ein Widget von sich align ist, wenn der Aufrufer nichts sagt. Das
+// ist die unterste Ebene der Vererbungskette align lib/fui/style.fi.
+//
+// HIER steht "eine Beschriftung hat von Haus align keinen Hintergrund"
+// als EINE Zeile -- und nicht als Regel im Kopf des Programmierers.
+
+// ======================================================================
+// DIE WIDGET-VORGABE HAENGT AM ZUSTAND -- SONST GIBT ES KEINE ZUSTAENDE
+// ======================================================================
+//
+// EIN FEHLER DIESER RUNDE, IM BILD GEFUNDEN. Die erste Fassung gab hier
+// fuer jeden Zustand `TOK_BUTTON` zurueck. Uebersetzt hat das sauber,
+// gelaufen ist es auch -- und auf der Schauseite waren alle fuenf
+// Knoepfe GLEICH GRAU. Gemessen (dark, Mitte des jeweiligen Knopfes):
+//
+//     normal 0x42414D  ueber 0x42414D  druck 0x42414D  ...
+//
+// Der Grund: `style.resolve_bg` faellt auf die Widget-Vorgabe zurueck,
+// wenn weder Zustandsaufsatz noch Aufrufer etwas sagen -- und genau das
+// ist bei einem gewoehnlichen Knopf der Normalfall. Eine Vorgabe ohne
+// Zustand macht die Zustaende also unsichtbar, obwohl das Stilsystem
+// darunter richtig rechnet.
+//
+// DAS IST DER GRUND, WARUM ES DIE SCHAUSEITE GIBT: im Quelltext sieht
+// beides gleich align.
+fn def_bg_state(kind: u32, zu: u32) -> u32 {
+    if kind == widget.KIND_BUTTON || kind == widget.KIND_TOGGLE
+        || kind == widget.KIND_TILE || kind == widget.KIND_TAB {
+        if zu == style.STATE_ACTIVE {
+            return style.color_token(style.TOK_BUTTON_ACTIVE)
+        }
+        if zu == style.STATE_HOVER {
+            return style.color_token(style.TOK_BUTTON_HOVER)
+        }
+        if zu == style.STATE_SELECTED {
+            return style.color_token(style.TOK_ACCENT)
+        }
+        // SPERR und FOKUS behalten die Ruhefarbe: gesperrt zeigt sich
+        // am blassen Text, Fokus am Ring. Zwei Signale fuer denselben
+        // Zustand sind eines zu viel.
+        return style.color_token(style.TOK_BUTTON)
+    }
+    if kind == widget.KIND_TEXTBOX {
+        if zu == style.STATE_FOCUS {
+            return style.color_token(style.TOK_FIELD_FOCUS)
+        }
+        return style.color_token(style.TOK_FIELD)
+    }
+    return def_bg(kind)
+}
+
+fn def_bg(kind: u32) -> u32 {
+    if kind == widget.KIND_LABEL {
+        // Eine Beschriftung ist Text auf dem, was darunter liegt.
+        return style.color_transparent()
+    }
+    if kind == widget.KIND_TEXTBOX {
+        return style.color_token(style.TOK_FIELD)
+    }
+    if kind == widget.KIND_SEPARATOR {
+        return style.color_token(style.TOK_SEPARATOR)
+    }
+    if kind == widget.KIND_PROGRESS {
+        return style.color_token(style.TOK_FIELD)
+    }
+    if kind == widget.KIND_CARD || kind == widget.KIND_MENU {
+        return style.color_token(style.TOK_SURFACE_RAISED)
+    }
+    if kind == widget.KIND_TOOLBAR {
+        return style.color_token(style.TOK_SURFACE)
+    }
+    if kind == widget.KIND_NONE {
+        return style.color_transparent()
+    }
+    return style.color_token(style.TOK_BUTTON)
+}
+
+fn def_border(kind: u32) -> u32 {
+    if kind == widget.KIND_TEXTBOX {
+        return style.color_token(style.TOK_BORDER)
+    }
+    // Knoepfe dieses Themas tragen keinen Rahmen -- `tone=0` in
+    // osum.shape: getrennt wird durch Abstand, nicht durch eine Linie.
+    return style.color_transparent()
+}
+
+fn def_fg(kind: u32) -> u32 {
+    return style.color_token(style.TOK_TEXT)
+}
+
+fn def_radius(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_TEXTBOX {
+        return (*fo).r_field
+    }
+    if kind == widget.KIND_CARD || kind == widget.KIND_MENU {
+        return (*fo).r_panel
+    }
+    if kind == widget.KIND_LABEL || kind == widget.KIND_SEPARATOR {
+        return 0
+    }
+    return (*fo).r_button
+}
+
+fn def_border_width(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_TEXTBOX {
+        return (*fo).border_w
+    }
+    return 0
+}
+
+fn def_pad_x(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_LABEL {
+        return 0
+    }
+    return (*fo).pad_x
+}
+
+fn def_pad_y(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_LABEL {
+        return 0
+    }
+    return (*fo).pad_y
+}
+
+fn def_font(c: *mut Ctx) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    return (*fo).font
+}
+
+fn def_align(kind: u32) -> u32 {
+    if kind == widget.KIND_LABEL || kind == widget.KIND_TEXTBOX {
+        return style.ALIGN_LEFT
+    }
+    // Ein Knopf beschriftet sich mittig.
+    return style.ALIGN_CENTER
+}
+
+// ======================================================================
+// DER GEMEINSAME GRUND
+// ======================================================================
+//
+// Flaeche, Rahmen und Fokusring -- fuer JEDES Widget gleich. Das ist
+// der Teil, den ein neues Widget nicht mehr schreiben muss.
+//
+// `nur_ring` malt den Fokusring NACH dem Inhalt; darum ist er ein
+// eigener Aufruf und nicht Teil von `draw_base`.
+fn draw_base(c: *mut Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+
+    // ---- 1. DIE FLAECHE
+    //
+    // DIE ENTSCHEIDENDE ZEILE DIESER DATEI: ist der Wert nicht
+    // visible, wird NICHT GEMALT. Kein Ersatzanstrich in Fensterfarbe
+    // -- das ist Justins Punkt 4, und ueber einem Hintergrundbild ist
+    // der Unterschied sofort zu sehen.
+    let bg: u32 = style.resolve_bg(sz, zu, def_bg_state(kind, zu))
+    let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize, def_radius(c, kind)))
+    if style.color_is_visible(bg) {
+        painter.round_rect(z, widget.w_x(e), widget.w_y(e),
+            widget.w_w(e), widget.w_h(e), r, color_of(c, bg))
+    }
+
+    // ---- 2. DER RAHMEN
+    let ra: u32 = style.resolve_border(sz, zu, def_border(kind))
+    let st: f64 = len_of(c, style.resolve_num(sz, style.SF_BORDER_W,
+        (*style.styleset_base(sz)).border_w as usize, def_border_width(c, kind)))
+    if style.color_is_visible(ra) && st > 0.0 {
+        painter.round_ring(z, widget.w_x(e), widget.w_y(e),
+            widget.w_w(e), widget.w_h(e), r, st, color_of(c, ra))
+    }
+}
+
+// DER FOKUSRING, zuletzt und ueber allem.
+//
+// Er ist das einzige, worauf sich jemand verlaesst, der mit der
+// Tastatur bedient -- darum ist er zwei Bildpunkte stark
+// (theme.Shape.focus_w) und faerbt die Flaeche NICHT: waere er eine
+// Fuellung, koennte man fokussiert nicht von ueberfahren
+// unterscheiden.
+fn draw_focus_ring(c: *mut Ctx, e: *mut widget.Widget) {
+    if !widget.w_is_focus(e) || widget.w_is_disabled(e) {
+        return
+    }
+    let z: *mut painter.Painter = ctx_painter(c)
+    let m: *mut theme.Theme = ctx_theme(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize, def_radius(c, kind)))
+    painter.round_ring(z, widget.w_x(e), widget.w_y(e), widget.w_w(e),
+        widget.w_h(e), r, len_of(c, (*fo).focus_w), (*f).accent)
+}
+
+// ======================================================================
+// DER TEXT EINES ELEMENTS
+// ======================================================================
+//
+// Waagerecht nach der Ausrichtung, vertical IMMER mittig zur
+// Schriftmetrik -- das ist Justins Beschwerde 1, und der Grund steht
+// in painter.text_baseline_mid: wer mit der Zeilenhoehe zentriert,
+// zentriert die Zeile und nicht die Schrift.
+fn draw_text(c: *mut Ctx, e: *mut widget.Widget) {
+    if widget.w_text_len(e) == 0 {
+        return
+    }
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+
+    // Die Textfarbe. Bei einem gesperrten Widget ist die Vorgabe die
+    // blasse -- aber ein gesetzter Style schlaegt sie, sonst koennte man
+    // die Farbe eines gesperrten Elements nicht bestimmen.
+    var fallback: u32 = def_fg(kind)
+    if zu == style.STATE_DISABLED {
+        fallback = style.color_token(style.TOK_TEXT_DISABLED)
+    }
+    let tf: u32 = style.resolve_fg(sz, zu, fallback)
+    if !style.color_is_visible(tf) {
+        return
+    }
+    let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, kind)))
+    var align: u32 = def_align(kind)
+    if ((*s).set_mask & style.SF_ALIGN) != 0 as u32 {
+        align = (*s).align as u32
+    }
+    let base_y: f64 = painter.text_baseline_mid(z, widget.w_y(e),
+        widget.w_h(e), px)
+    let e2: f64 = painter.text(z, widget.w_x(e) + padx, base_y,
+        widget.w_w(e) - 2.0 * padx, px, color_of(c, tf),
+        widget.w_text(e), widget.w_text_len(e), align)
+}
+
+// ======================================================================
+// DIE ELEMENTE
+// ======================================================================
+
+// EINE BESCHRIFTUNG. Text, sonst nichts -- und darum ist ihr
+// Hintergrund von Haus align transparent (`def_bg`). Sie ist das
+// einfachste Widget und zeigt, dass der Aufbau traegt: sie hat keine
+// einzige eigene Zeile Zeichencode.
+fn draw_label(c: *mut Ctx, e: *mut widget.Widget) {
+    draw_base(c, e)
+    draw_text(c, e)
+    draw_focus_ring(c, e)
+}
+
+// EIN KNOPF. Derselbe Aufbau -- der Unterschied steckt allein in den
+// Widget-Vorgaben (Fuellung statt transparent, Text mittig statt
+// left).
+fn draw_button(c: *mut Ctx, e: *mut widget.Widget) {
+    draw_base(c, e)
+    draw_text(c, e)
+    draw_focus_ring(c, e)
+}
+
+// DER VERTEILER. Ein Widget malen, ohne zu wissen, was es ist -- das
+// braucht die Anordnung, und es ist die Stelle, an der ein neues
+// Widget eingehaengt wird.
+fn draw_widget(c: *mut Ctx, e: *mut widget.Widget) {
+    let kind: u32 = widget.w_kind(e)
+    if kind == widget.KIND_LABEL {
+        draw_label(c, e)
+        return
+    }
+    // Knopf, Umschalter, Ankreuzfeld, Reiter, Kachel ... alle malen
+    // heute denselben Grund. Was sie unterscheidet, sind die
+    // Widget-Vorgaben und -- ab Welle 2 -- ihr Inhalt.
+    draw_button(c, e)
+}

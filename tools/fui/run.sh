@@ -26,12 +26,12 @@ echo "== 1. DER KERN BAUT FREISTEHEND (profile kernel) =="
 # Anwendung. Geprueft wird, dass es baut UND dass kein Systemruf und
 # kein fremder Name darin steht.
 "$FIRNC" --profile=kernel --target=x86_64-none -c \
-    -o "$W/kern.o" lib/fui/kern.fi
+    -o "$W/core.o" lib/fui/core.fi
 "$FIRNC" --profile=kernel --target=x86_64-none -c \
-    -o "$W/stil.o" lib/fui/stil.fi
+    -o "$W/style.o" lib/fui/style.fi
 "$FIRNC" --profile=kernel --target=x86_64-none -c \
-    -o "$W/anordnung.o" lib/fui/anordnung.fi
-for o in kern stil anordnung; do
+    -o "$W/layout.o" lib/fui/layout.fi
+for o in core style layout; do
     n=$(objdump -d "$W/$o.o" | grep -c syscall || true)
     if [ "$n" != "0" ]; then
         echo "  $o.o: $n syscall-Instruktionen -- im Kern verboten"
@@ -50,37 +50,37 @@ done
 
 echo
 echo "== 2. DIE MARKE HAELT IHRE ZUSAGE (WCAG 4.5:1) =="
-bau kontrast
-"$W/kontrast"
+bau contrast
+"$W/contrast"
 
 echo
 echo "== 3. DAS SCHLIESSKREUZ =="
-bau kreuz
-"$W/kreuz"
+bau capicon
+"$W/capicon"
 
 echo
 echo "== 4. DAS STILSYSTEM =="
-bau stil
-"$W/stil"
+bau style
+"$W/style"
 
 echo
 echo "== 5. DIE ANORDNUNG =="
-bau anordnung
-"$W/anordnung"
+bau layout
+"$W/layout"
 
 echo
 echo "== 6. WELLE 1 AM BILDPUNKT =="
-bau welle1
-"$W/welle1"
+bau wave1
+"$W/wave1"
 
 if [ "$1" = "--bilder" ]; then
     echo
     echo "== 7. DIE SCHAUSEITE =="
     Z=/srv/store/belege/fui
     mkdir -p "$Z"
-    bau schauseite
-    "$W/schauseite" "$Z/fui-welle1-hell.png" hell
-    "$W/schauseite" "$Z/fui-welle1-dunkel.png" dunkel
+    bau gallery
+    "$W/gallery" "$Z/fui-welle1-hell.png" hell
+    "$W/gallery" "$Z/fui-welle1-dunkel.png" dunkel
     ls -la "$Z"
 fi
 
