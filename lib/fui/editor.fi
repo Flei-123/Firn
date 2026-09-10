@@ -97,11 +97,11 @@ const MOD_ALT: u32 = 8
 // swallow every key combination of the whole program.
 // Programms schlucken.
 const RES_NONE: u32 = 0
-const RES_CHANGED: u32 = 1  // der Text ist anders -> neu malen
-const RES_MOVED: u32 = 2     // nur Zeiger/Auswahl -> neu malen
+const RES_CHANGED: u32 = 1  // the text differs -> repaint
+const RES_MOVED: u32 = 2     // caret/selection only -> repaint
 const RES_COMMIT: u32 = 3     // Eingabetaste
 const RES_CANCEL: u32 = 4    // Esc
-const RES_PASS: u32 = 5     // nicht meine Taste
+const RES_PASS: u32 = 5     // not my key
 
 // ================================================== THE UNDO STACK
 //
@@ -119,7 +119,7 @@ const RES_PASS: u32 = 5     // nicht meine Taste
 // "wikipedia" and presses Ctrl+Z once does not want to see "wikipedi".
 // `editor_push_undo` is therefore called before every change, but only
 // stores when something other than one more character has happened
-// since the last store (`sammelt`).
+// since the last store (`coalescing`).
 const UNDO_N: usize = 16
 const UNDO_CAP: usize = 512
 
@@ -129,21 +129,21 @@ struct Editor {
     u_buf: *mut u8,       // UNDO_N * UNDO_CAP
     u_len: [usize; 16],
     u_caret: [usize; 16],
-    u_n: usize,           // wieviele Stufen belegt
-    u_at: usize,          // wo wir im Box stehen
-    sammelt: u32,         // 1 = die letzte Aenderung war ein Zeichen
+    u_n: usize,           // how many levels are in use
+    u_at: usize,          // where we are in the ring
+    coalescing: u32,      // 1 = the last change was a character
     // --- the clipboard of the platform
-    ab_lesen: fn(u64, usize) -> usize,
-    ab_schreiben: fn(u64, usize) -> bool,
+    clip_read: fn(u64, usize) -> usize,
+    clip_write: fn(u64, usize) -> bool,
     ab_da: u32,
     // --- the INTERNAL clipboard, when the platform has none
     ab_buf: *mut u8,
     ab_n: usize,
     // --- the scrolling on long text
-    width: f64,          // sichtbare Breite in Bildpunkten
-    scroll: f64,           // wieviel nach left geschoben ist
+    width: f64,          // visible width in pixels
+    scroll: f64,           // how far it is shifted to the left
     // --- the blinking caret
-    blink_us: u64,        // wann sie zuletzt umgeschaltet hat
+    blink_us: u64,        // when it last toggled
     blink_an: u32,
     // --- the mouse
     klick_zeit: u64,
@@ -161,8 +161,8 @@ fn editor_new() -> Editor {
     return Editor {
         tf: textbuf.tb_new(),
         u_buf: 0 as *mut u8, u_len: [0; 16], u_caret: [0; 16],
-        u_n: 0, u_at: 0, sammelt: 0,
-        ab_lesen: clip_read_none, ab_schreiben: clip_write_none, ab_da: 0,
+        u_n: 0, u_at: 0, coalescing: 0,
+        clip_read: clip_read_none, clip_write: clip_write_none, ab_da: 0,
         ab_buf: 0 as *mut u8, ab_n: 0,
         width: 0.0, scroll: 0.0,
         blink_us: 0, blink_an: 1,
@@ -205,8 +205,8 @@ fn editor_buf(e: *mut Editor) -> *mut textbuf.TextBuf {
 
 fn editor_set_clipboard(e: *mut Editor, lesen: fn(u64, usize) -> usize,
     schreiben: fn(u64, usize) -> bool) {
-    (*e).ab_lesen = lesen
-    (*e).ab_schreiben = schreiben
+    (*e).clip_read = lesen
+    (*e).clip_write = schreiben
     (*e).ab_da = 1
 }
 
@@ -222,7 +222,7 @@ fn editor_scroll(e: *mut Editor) -> f64 { return (*e).scroll }
 // about to come is a single typed character -- then it is only stored
 // when the last step was NOT a character.
 fn editor_push_undo(e: *mut Editor, from_char: bool) {
-    if from_char && (*e).sammelt != 0 {
+    if from_char && (*e).coalescing != 0 {
         return
     }
     let n: usize = textbuf.tb_len(&(*e).tf)
@@ -251,9 +251,9 @@ fn editor_push_undo(e: *mut Editor, from_char: bool) {
     (*e).u_at = at + 1
     (*e).u_n = at + 1
     if from_char {
-        (*e).sammelt = 1
+        (*e).coalescing = 1
     } else {
-        (*e).sammelt = 0
+        (*e).coalescing = 0
     }
 }
 
@@ -279,7 +279,7 @@ fn editor_undo(e: *mut Editor) -> bool {
     textbuf.tb_set_text(&(*e).tf,
         ((*e).u_buf as u64) + (at * UNDO_CAP) as u64, (*e).u_len[at])
     textbuf.tb_set_range(&(*e).tf, (*e).u_caret[at], (*e).u_caret[at])
-    (*e).sammelt = 0
+    (*e).coalescing = 0
     return true
 }
 
@@ -292,7 +292,7 @@ fn editor_redo(e: *mut Editor) -> bool {
     textbuf.tb_set_text(&(*e).tf,
         ((*e).u_buf as u64) + (at * UNDO_CAP) as u64, (*e).u_len[at])
     textbuf.tb_set_range(&(*e).tf, (*e).u_caret[at], (*e).u_caret[at])
-    (*e).sammelt = 0
+    (*e).coalescing = 0
     return true
 }
 
@@ -311,7 +311,7 @@ fn editor_copy(e: *mut Editor) -> bool {
     let n: usize = b - a
     let von: u64 = textbuf.tb_ptr(&(*e).tf) + a as u64
     if (*e).ab_da != 0 {
-        let f: fn(u64, usize) -> bool = (*e).ab_schreiben
+        let f: fn(u64, usize) -> bool = (*e).clip_write
         if f(von, n) {
             return true
         }
@@ -341,7 +341,7 @@ fn editor_paste(e: *mut Editor) -> bool {
     var puf: [u8; 512] = [0; 512]
     var n: usize = 0
     if (*e).ab_da != 0 {
-        let f: fn(u64, usize) -> usize = (*e).ab_lesen
+        let f: fn(u64, usize) -> usize = (*e).clip_read
         n = f((&puf[0]) as u64, 512)
     }
     if n == 0 && (*e).ab_n > 0 {
@@ -385,7 +385,7 @@ fn editor_key(e: *mut Editor, key: u32, mods: u32) -> u32 {
         } else {
             textbuf.tb_left(t, extend)
         }
-        (*e).sammelt = 0
+        (*e).coalescing = 0
         return RES_MOVED
     }
     if key == KEY_RIGHT {
@@ -394,17 +394,17 @@ fn editor_key(e: *mut Editor, key: u32, mods: u32) -> u32 {
         } else {
             textbuf.tb_right(t, extend)
         }
-        (*e).sammelt = 0
+        (*e).coalescing = 0
         return RES_MOVED
     }
     if key == KEY_HOME {
         textbuf.tb_home(t, extend)
-        (*e).sammelt = 0
+        (*e).coalescing = 0
         return RES_MOVED
     }
     if key == KEY_END {
         textbuf.tb_end(t, extend)
-        (*e).sammelt = 0
+        (*e).coalescing = 0
         return RES_MOVED
     }
     if key == KEY_BACKSPACE {
@@ -638,7 +638,7 @@ fn editor_mouse_down(e: *mut Editor, x: f64, jetzt_us: u64,
     }
     textbuf.tb_set_caret(t, pos, extend)
     textbuf.tb_set_drag(t, 1)
-    (*e).sammelt = 0
+    (*e).coalescing = 0
     return RES_MOVED
 }
 
