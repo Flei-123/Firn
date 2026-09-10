@@ -1,0 +1,1371 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/fenster/x11.fi -- DIE RUECKWAND X11 (Runde FENSTER).
+//
+// NICHT neu geschrieben: das ist lib/browser/x11.fi aus Runde B5,
+// umgehaengt auf den Vertrag von lib/fenster/fenster.fi und um genau
+// die Luecken ergaenzt, die der Vergleich mit lib/windows/gdi.fi
+// aufgedeckt hat. Der ganze X11-Klient ohne Xlib, ohne xcb, ohne
+// C-Bibliothek steht Zeile fuer Zeile so da wie vorher.
+//
+// Benutzt werden CreateWindow(1), CreateGC(55), MapWindow(8),
+// PutImage(72), PolyFillRectangle(70), ChangeProperty(18),
+// GetProperty(20), InternAtom(16), OpenFont(45), ChangeGC(56),
+// ImageText8(76) und die Ereignisse Expose(12), KeyPress(2),
+// ButtonPress(4), MotionNotify(6), ConfigureNotify(22),
+// ClientMessage(33).
+//
+// ============================= WAS DIESE RUNDE ERGAENZT HAT (die Luecken)
+//
+// L1 EV_MOTION. Die Ereignismaske hatte PointerMotion nicht. Ohne
+//    Zeigerbewegung kein ueberfahrener Knopf -- unter Windows gab es
+//    das seit CERTUS-WIN2, unter X11 nicht.
+// L2 EV_CHAR. Vorher gab der Klient nur Tastennummern heraus, und JEDES
+//    Programm musste `x11_key_ascii` selbst rufen. Jetzt trennt die
+//    Rueckwand wie Windows: Tasten mit Bedeutung als EV_KEY, Druckbares
+//    als EV_CHAR.
+// L3 WM_DELETE_WINDOW. Vorher toetete das Schliessen des Fensters den
+//    Prozess mit einem E/A-Fehler (U2 der alten Datei). Jetzt fragt der
+//    Fenstermanager, und das Programm bekommt EV_CLOSED.
+// L4 DIE BILDPUNKTDICHTE. `Xft.dpi` aus RESOURCE_MANAGER (das, was
+//    jeder Schreibtisch wirklich setzt), sonst Bildpunkte und
+//    Millimeter des Schirms aus dem Verbindungsblock -- zwei Zahlen,
+//    die die alte Fassung ueberlesen hat --, sonst 96.
+// L5 HELL/DUNKEL. Es gibt keine Registrierung. Gelesen wird
+//    CERTUS_THEME und GTK_THEME aus der Umgebung, danach
+//    ~/.config/gtk-4.0/settings.ini und gtk-3.0 -- die Datei, die
+//    GNOME und XFCE wirklich schreiben.
+// L6 DIE UMGEBUNG. "Aus `rt` nicht erreichbar" stand seit B5 im Kopf
+//    dieser Datei, und deshalb stand hier ein fester Pfad
+//    `/root/.Xauthority`. /proc/self/environ braucht open, read, close.
+//
+// ================================================================ EHRLICH
+//
+// U1 EIN VISUAL: 24 Bit in einem 32-Bit-Bildpunkt. Eine andere Tiefe
+//    ist eine Absage mit Grund und kein schwarzes Fenster.
+// U2 DIE GANZE LEINWAND GEHT BEI JEDEM BILD HINUEBER (3,8 MB bei
+//    1200x800). Ein Schadensrechteck waere der naechste Schritt.
+// U3 KEIN GETEILTER SPEICHER (MIT-SHM), KEIN RUECKPUFFER: `fuelle` und
+//    `text` gehen einzeln zum Server. Wer flimmerfrei sein will, malt
+//    in einen eigenen Puffer und schickt EIN `bild`.
+// U4 `r_ppm` GIBT ES HIER NICHT (false). Der Klient haelt keine
+//    Leinwand. Der Abzug kommt bei der Abnahme mit `xwd` VOM SERVER --
+//    die staerkere Messung: ein Programm, das behauptet gemalt zu
+//    haben, faellt dort auf und hier nicht.
+// U5 EV_THEME kommt, wenn beim Ablauf einer Wartefrist eine Aenderung
+//    auffaellt (hoechstens einmal je Sekunde nachgesehen). Wer ewig
+//    wartet, bekommt es nie; dafuer gibt es `fenster.theme_neu_lesen`.
+//    Sofort ginge nur ueber das XDG-Portal auf D-Bus.
+import std.rt
+import std.net
+import fenster.fenster
+
+export {
+    r_zieht,
+    Platte, platte_neu,
+    r_auf, r_mache, r_zeige, r_titel, r_zu, r_offen,
+    r_breite, r_hoehe, r_dpi, r_gross,
+    r_bild, r_fuelle, r_schrift, r_text, r_blitten, r_ppm,
+    r_warte, r_da, r_hole, r_dunkel, r_dunkel_bekannt, r_gift,
+    r_schirm, r_mittig,
+}
+
+const RD_ERR: usize = 18446744073709551615
+
+struct Platte {
+    c: net.Conn,
+    open: bool,
+    schirm_w: usize,
+    schirm_h: usize,
+    root: u32,
+    id_base: u32,
+    id_mask: u32,
+    next_id: u32,
+    visual: u32,
+    depth: u32,
+    win: u32,
+    gc: u32,
+    font: u32,
+    w: usize,
+    h: usize,
+    seq: u32,
+    // der Antwort-/Ereignispuffer
+    rb: rt.Buf,
+    rpos: usize,
+    // die Atome fuer WM_DELETE_WINDOW (L3)
+    a_protocols: u32,
+    a_delete: u32,
+    // die Bildpunktdichte (L4)
+    dpi: usize,
+    // hell/dunkel (L5)
+    dark: bool,
+    dark_bekannt: bool,
+    dark_us: u64,
+    // ein eingespeistes Ereignis (EV_THEME); 0 = keines
+    inj: u32,
+    // das Gift, siehe fenster.gift_setzen
+    gift: u32,
+    fail: u32,
+}
+
+fn platte_neu() -> Platte {
+    return Platte { c: net.Conn { fd: -1, err: 0, peer: 0 as u32,
+            peer_port: 0 as u16 }, open: false, schirm_w: 0, schirm_h: 0,
+        root: 0, id_base: 0,
+        id_mask: 0, next_id: 0, visual: 0, depth: 0, win: 0, gc: 0,
+        font: 0, w: 0, h: 0, seq: 0, rb: rt.buf_new(), rpos: 0,
+        a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
+        dark_bekannt: false, dark_us: 0, inj: 0, gift: 0, fail: 0 }
+}
+
+fn r_offen(x: *mut Platte) -> bool {
+    return (*x).open
+}
+
+fn r_breite(x: *mut Platte) -> usize {
+    return (*x).w
+}
+
+fn r_hoehe(x: *mut Platte) -> usize {
+    return (*x).h
+}
+
+fn r_dpi(x: *mut Platte) -> usize {
+    return (*x).dpi
+}
+
+// ------------------------------------------------------- kleine Helfer
+
+fn put32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn put16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+}
+
+fn ld32le(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+    | ((rt.ld8(p, off + 2) as u32) << 16)
+    | ((rt.ld8(p, off + 3) as u32) << 24)
+}
+
+fn ld16le(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+}
+
+fn pad4(n: usize) -> usize {
+    return (4 - (n % 4)) % 4
+}
+
+fn send(x: *mut Platte, p: u64, n: usize) -> bool {
+    let k: usize = net.write_all(&(*x).c, p, n) catch RD_ERR
+    return k == n
+}
+
+// Liest, bis mindestens `need` Oktett an `rpos` stehen. BLOCKIEREND --
+// nur fuer die Verbindungsaufnahme und fuer den Rest einer Antwort, von
+// der der Anfang schon da ist.
+fn want(x: *mut Platte, need: usize) -> bool {
+    while (*x).rb.len - (*x).rpos < need {
+        if !lese_nach(x) {
+            return false
+        }
+    }
+    return true
+}
+
+// Ein einziges `read`. Blockiert, wenn nichts da ist -- gerufen wird es
+// entweder aus `want` (der Server hat schon gesendet) oder nachdem
+// `poll` gesagt hat, dass etwas da ist.
+fn lese_nach(x: *mut Platte) -> bool {
+    if (*x).rpos > 0 && (*x).rpos == (*x).rb.len {
+        rt.buf_clear(&(*x).rb)
+        (*x).rpos = 0
+    }
+    let have: usize = (*x).rb.len
+    rt.buf_reserve(&(*x).rb, have + 65536)
+    if (*x).rb.cap < have + 65536 {
+        return false
+    }
+    let k: usize = net.read(&(*x).c, (*x).rb.ptr + have as u64, 65536)
+    catch RD_ERR
+    if k == RD_ERR || k == 0 {
+        (*x).open = false
+        return false
+    }
+    rt.buf_set_len(&(*x).rb, have + k)
+    return true
+}
+
+// ======================================================== DIE UMGEBUNG
+//
+// Aus `rt` ist die Umgebung nicht erreichbar -- das steht seit Runde B5
+// woertlich im Kopf der alten Datei, und deshalb stand dort ein fester
+// Pfad `/root/.Xauthority`. /proc/self/environ braucht nur open, read
+// und close, und genau so macht es lib/i18n/lang.fi seit Runde LOKAL.
+const ENVCAP: usize = 32768
+static mut G_ENV: [u8; 32768] = [0 as u8; 32768]
+static mut G_ENV_N: usize = 0
+static mut G_ENV_DA: u32 = 0
+
+fn env_laden() {
+    if G_ENV_DA != 0 as u32 {
+        return
+    }
+    G_ENV_DA = 1
+    G_ENV_N = 0
+    var pfad: [u8; 19] = "/proc/self/environ\0"
+    var b: rt.Buf = rt.buf_new()
+    if rt.read_file((&pfad[0]) as u64, &b) {
+        var n: usize = rt.buf_len(&b)
+        if n > ENVCAP {
+            n = ENVCAP
+        }
+        rt.mem_copy((&G_ENV[0]) as u64, rt.buf_ptr(&b), n)
+        G_ENV_N = n
+    }
+    rt.buf_free(&b)
+}
+
+// Ein Wert aus der Umgebung nach `out`. false = steht nicht da.
+fn env_hole(name: u64, nn: usize, out: *mut rt.Buf) -> bool {
+    env_laden()
+    rt.buf_clear(out)
+    let p: u64 = (&G_ENV[0]) as u64
+    let n: usize = G_ENV_N
+    var at: usize = 0
+    while at < n {
+        // Ende dieses Eintrags suchen
+        var e: usize = at
+        while e < n && rt.ld8(p, e) != 0 as u8 {
+            e = e + 1
+        }
+        var passt: bool = at + nn + 1 <= e
+        if passt {
+            var i: usize = 0
+            while i < nn {
+                if rt.ld8(p, at + i) != rt.ld8(name, i) {
+                    passt = false
+                }
+                i = i + 1
+            }
+            if passt && rt.ld8(p, at + nn) != 61 as u8 {
+                passt = false
+            }
+        }
+        if passt {
+            var q: usize = at + nn + 1
+            while q < e {
+                rt.buf_push(out, rt.ld8(p, q))
+                q = q + 1
+            }
+            return true
+        }
+        at = e + 1
+    }
+    return false
+}
+
+// ~/.Xauthority, der MIT-MAGIC-COOKIE-1-Satz. Die Datei ist eine Liste
+// grossendischer gezaehlter Zeichenketten; genommen wird der erste
+// Keks mit dem richtigen Namen.
+fn read_auth(name: *mut rt.Buf, data: *mut rt.Buf) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var got: bool = false
+    // Zuerst XAUTHORITY, dann $HOME/.Xauthority, dann /root -- die alte
+    // Fassung konnte nur das letzte.
+    var e_xa: [u8; 10] = "XAUTHORITY"
+    var pfad: rt.Buf = rt.buf_new()
+    if env_hole((&e_xa[0]) as u64, 10, &pfad) {
+        rt.buf_push(&pfad, 0 as u8)
+        if rt.read_file(rt.buf_ptr(&pfad), &b) {
+            got = true
+        }
+    }
+    if !got {
+        var e_home: [u8; 4] = "HOME"
+        rt.buf_clear(&pfad)
+        if env_hole((&e_home[0]) as u64, 4, &pfad) {
+            var suffix: [u8; 12] = "/.Xauthority"
+            rt.buf_push_bytes(&pfad, (&suffix[0]) as u64, 12)
+            rt.buf_push(&pfad, 0 as u8)
+            if rt.read_file(rt.buf_ptr(&pfad), &b) {
+                got = true
+            }
+        }
+    }
+    rt.buf_free(&pfad)
+    if !got {
+        var p1: [u8; 18] = "/root/.Xauthority\0"
+        if rt.read_file((&p1[0]) as u64, &b) {
+            got = true
+        }
+    }
+    if !got {
+        rt.buf_free(&b)
+        return false
+    }
+    let p: u64 = b.ptr
+    let n: usize = b.len
+    var at: usize = 0
+    var found: bool = false
+    while at + 2 <= n {
+        at = at + 2
+        var i: usize = 0
+        var lens: [usize; 4] = [0; 4]
+        var offs: [usize; 4] = [0; 4]
+        var bad: bool = false
+        while i < 4 {
+            if at + 2 > n {
+                bad = true
+                break
+            }
+            let l: usize = ((rt.ld8(p, at) as usize) << 8)
+            | (rt.ld8(p, at + 1) as usize)
+            at = at + 2
+            offs[i] = at
+            lens[i] = l
+            at = at + l
+            if at > n {
+                bad = true
+                break
+            }
+            i = i + 1
+        }
+        if bad {
+            break
+        }
+        if lens[2] == 18 {
+            rt.buf_clear(name)
+            rt.buf_push_bytes(name, p + offs[2] as u64, lens[2])
+            rt.buf_clear(data)
+            rt.buf_push_bytes(data, p + offs[3] as u64, lens[3])
+            found = true
+            break
+        }
+    }
+    rt.buf_free(&b)
+    return found
+}
+
+fn conn_fail(bad: *mut bool) -> net.Conn {
+    *bad = true
+    return net.Conn { fd: -1, err: 0, peer: 0 as u32, peer_port: 0 as u16 }
+}
+
+fn new_id(x: *mut Platte) -> u32 {
+    let id: u32 = (*x).id_base | ((*x).next_id & (*x).id_mask)
+    (*x).next_id = (*x).next_id + 1 as u32
+    return id
+}
+
+// ======================================================== AUFMACHEN
+
+fn r_auf(x: *mut Platte, anzeige: usize) -> bool {
+    var path: [u8; 20] = "/tmp/.X11-unix/X0   "
+    var plen: usize = 17
+    var display: usize = anzeige
+    // Ohne Angabe: DISPLAY aus der Umgebung, sonst 0.
+    if display == 0 {
+        var e_d: [u8; 7] = "DISPLAY"
+        var dv: rt.Buf = rt.buf_new()
+        if env_hole((&e_d[0]) as u64, 7, &dv) {
+            display = zahl_aus(rt.buf_ptr(&dv), 0, rt.buf_len(&dv))
+        }
+        rt.buf_free(&dv)
+    }
+    if display < 10 {
+        path[16] = (48 + display) as u8
+    } else {
+        path[16] = (48 + (display / 10) % 10) as u8
+        path[17] = (48 + (display % 10)) as u8
+        plen = 18
+    }
+    var bad: bool = false
+    let c: net.Conn = net.connect_unix((&path[0]) as u64, plen)
+    catch | e | conn_fail(&bad)
+    if bad {
+        (*x).fail = 1
+        return false
+    }
+    (*x).c = c
+    var name: rt.Buf = rt.buf_new()
+    var data: rt.Buf = rt.buf_new()
+    let have_auth: bool = read_auth(&name, &data)
+    var req: rt.Buf = rt.buf_new()
+    rt.buf_push(&req, 108 as u8) // 'l' -- kleinendisch
+    rt.buf_push(&req, 0 as u8)
+    put16(&req, 11 as u32)
+    put16(&req, 0 as u32)
+    if have_auth {
+        put16(&req, name.len as u32)
+        put16(&req, data.len as u32)
+    } else {
+        put16(&req, 0 as u32)
+        put16(&req, 0 as u32)
+    }
+    put16(&req, 0 as u32)
+    if have_auth {
+        rt.buf_push_bytes(&req, name.ptr, name.len)
+        var q: usize = 0
+        let pn: usize = pad4(name.len)
+        while q < pn {
+            rt.buf_push(&req, 0 as u8)
+            q = q + 1
+        }
+        rt.buf_push_bytes(&req, data.ptr, data.len)
+        q = 0
+        let pd: usize = pad4(data.len)
+        while q < pd {
+            rt.buf_push(&req, 0 as u8)
+            q = q + 1
+        }
+    }
+    let sent: bool = send(x, req.ptr, req.len)
+    rt.buf_free(&req)
+    rt.buf_free(&name)
+    rt.buf_free(&data)
+    if !sent {
+        (*x).fail = 2
+        return false
+    }
+    (*x).open = true
+    if !want(x, 8) {
+        (*x).fail = 3
+        return false
+    }
+    let base: u64 = (*x).rb.ptr + (*x).rpos as u64
+    let status: u8 = rt.ld8(base, 0)
+    let extra: usize = (ld16le(base, 6) as usize) * 4
+    if !want(x, 8 + extra) {
+        (*x).fail = 4
+        return false
+    }
+    if status != 1 as u8 {
+        (*x).fail = 5 // abgelehnt -- fast immer die Berechtigung
+        (*x).open = false
+        return false
+    }
+    let b2: u64 = (*x).rb.ptr + (*x).rpos as u64
+    (*x).id_base = ld32le(b2, 12)
+    (*x).id_mask = ld32le(b2, 16)
+    let vendor_len: usize = ld16le(b2, 24) as usize
+    let nformats: usize = rt.ld8(b2, 29) as usize
+    var at: usize = 40 + vendor_len + pad4(vendor_len) + nformats * 8
+    (*x).root = ld32le(b2, at)
+    // L4: die Groesse des Schirms, in Bildpunkten und in Millimetern.
+    let s_px: usize = ld16le(b2, at + 20) as usize
+    let s_mm: usize = ld16le(b2, at + 24) as usize
+    // RUNDE CERTUS-WIN4: die Startgroesse haengt am Schirm.
+    (*x).schirm_w = s_px
+    (*x).schirm_h = ld16le(b2, at + 22) as usize
+    (*x).depth = rt.ld8(b2, at + 38) as u32
+    let ndepths: usize = rt.ld8(b2, at + 39) as usize
+    var dat: usize = at + 40
+    var vis: u32 = 0
+    var vdepth: u32 = 0
+    var di: usize = 0
+    while di < ndepths {
+        let dep: u32 = rt.ld8(b2, dat) as u32
+        let nvis: usize = ld16le(b2, dat + 2) as usize
+        if dep == 24 as u32 && nvis > 0 {
+            vis = ld32le(b2, dat + 8)
+            vdepth = 24
+            break
+        }
+        dat = dat + 8 + nvis * 24
+        di = di + 1
+    }
+    if vis == 0 as u32 {
+        (*x).fail = 6 // U1: kein 24-Bit-Visual
+        (*x).open = false
+        return false
+    }
+    (*x).visual = vis
+    (*x).depth = vdepth
+    (*x).next_id = 0
+    (*x).rpos = (*x).rpos + 8 + extra
+    // L3: die zwei Atome. Erst hier, weil vorher keine Betriebsmittel-
+    // basis feststand -- und noch VOR dem Fenster, weil danach
+    // Ereignisse zwischen die Antworten geraten koennten.
+    atome_holen(x)
+    // L4: die Bildpunktdichte.
+    (*x).dpi = dpi_bestimmen(x, s_px, s_mm)
+    // L5: hell oder dunkel.
+    theme_lesen(x)
+    return true
+}
+
+// L3 -- InternAtom(16) zweimal, dann die zwei Antworten.
+fn atome_holen(x: *mut Platte) {
+    var n1: [u8; 12] = "WM_PROTOCOLS"
+    var n2: [u8; 16] = "WM_DELETE_WINDOW"
+    (*x).a_protocols = atom_von(x, (&n1[0]) as u64, 12)
+    (*x).a_delete = atom_von(x, (&n2[0]) as u64, 16)
+}
+
+fn atom_von(x: *mut Platte, p: u64, n: usize) -> u32 {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 16 as u8) // InternAtom
+    rt.buf_push(&r, 0 as u8) // only-if-exists = nein
+    put16(&r, (2 + (n + pad4(n)) / 4) as u32)
+    put16(&r, n as u32)
+    put16(&r, 0 as u32)
+    rt.buf_push_bytes(&r, p, n)
+    var q: usize = 0
+    while q < pad4(n) {
+        rt.buf_push(&r, 0 as u8)
+        q = q + 1
+    }
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !ok {
+        return 0 as u32
+    }
+    if !want(x, 32) {
+        return 0 as u32
+    }
+    let b: u64 = (*x).rb.ptr + (*x).rpos as u64
+    let code: u8 = rt.ld8(b, 0)
+    var extra: usize = 0
+    if code == 1 as u8 {
+        extra = (ld32le(b, 4) as usize) * 4
+        if !want(x, 32 + extra) {
+            return 0 as u32
+        }
+    }
+    var atom: u32 = 0
+    if code == 1 as u8 {
+        atom = ld32le((*x).rb.ptr + (*x).rpos as u64, 8)
+    }
+    (*x).rpos = (*x).rpos + 32 + extra
+    return atom
+}
+
+// L4 -- die Bildpunktdichte.
+//
+// Reihenfolge: CERTUS_DPI (Handschalter, auch fuer die Abnahme), dann
+// `Xft.dpi` aus RESOURCE_MANAGER -- das ist, was GNOME, KDE und XFCE
+// wirklich setzen und was jede Werkzeugsammlung liest --, dann die
+// Millimeter des Schirms, sonst 96.
+fn dpi_bestimmen(x: *mut Platte, s_px: usize, s_mm: usize) -> usize {
+    var e: [u8; 10] = "CERTUS_DPI"
+    var b: rt.Buf = rt.buf_new()
+    var d: usize = 0
+    if env_hole((&e[0]) as u64, 10, &b) {
+        d = zahl_aus(rt.buf_ptr(&b), 0, rt.buf_len(&b))
+    }
+    rt.buf_free(&b)
+    if d >= 48 && d <= 480 {
+        return d
+    }
+    d = xft_dpi(x)
+    if d >= 48 && d <= 480 {
+        return d
+    }
+    if s_mm > 0 && s_px > 0 {
+        // 1 Zoll = 25,4 mm; ganzzahlig gerechnet und gerundet.
+        d = (s_px * 254 + s_mm * 5) / (s_mm * 10)
+        if d >= 48 && d <= 480 {
+            return d
+        }
+    }
+    return 96
+}
+
+fn zahl_aus(p: u64, von: usize, bis: usize) -> usize {
+    var v: usize = 0
+    var i: usize = von
+    var sah: bool = false
+    while i < bis {
+        let ch: u8 = rt.ld8(p, i)
+        if ch >= 48 as u8 && ch <= 57 as u8 {
+            v = v * 10 + ((ch - 48 as u8) as usize)
+            sah = true
+        } else if sah {
+            return v
+        }
+        i = i + 1
+    }
+    if !sah {
+        return 0
+    }
+    return v
+}
+
+// RESOURCE_MANAGER ist das vordefinierte Atom 23 -- es braucht kein
+// InternAtom. Der Inhalt ist die X-Ressourcendatenbank als Text.
+fn xft_dpi(x: *mut Platte) -> usize {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 20 as u8) // GetProperty
+    rt.buf_push(&r, 0 as u8) // delete = nein
+    put16(&r, 6 as u32)
+    put32(&r, (*x).root)
+    put32(&r, 23 as u32) // RESOURCE_MANAGER
+    put32(&r, 0 as u32) // AnyPropertyType
+    put32(&r, 0 as u32) // long-offset
+    put32(&r, 16384 as u32) // long-length, in 4-Oktett-Einheiten
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !ok {
+        return 0
+    }
+    if !want(x, 32) {
+        return 0
+    }
+    let b: u64 = (*x).rb.ptr + (*x).rpos as u64
+    let code: u8 = rt.ld8(b, 0)
+    if code != 1 as u8 {
+        (*x).rpos = (*x).rpos + 32
+        return 0
+    }
+    let extra: usize = (ld32le(b, 4) as usize) * 4
+    if !want(x, 32 + extra) {
+        return 0
+    }
+    let b2: u64 = (*x).rb.ptr + (*x).rpos as u64
+    let fmt: usize = rt.ld8(b2, 1) as usize
+    let nitems: usize = ld32le(b2, 16) as usize
+    var bytes: usize = 0
+    if fmt == 8 {
+        bytes = nitems
+    }
+    if bytes > extra {
+        bytes = extra
+    }
+    var d: usize = 0
+    if bytes > 0 {
+        var lit: [u8; 8] = "Xft.dpi:"
+        let txt: u64 = b2 + 32 as u64
+        var i: usize = 0
+        while i + 8 <= bytes {
+            var gleich: bool = true
+            var j: usize = 0
+            while j < 8 {
+                if rt.ld8(txt, i + j) != lit[j] {
+                    gleich = false
+                }
+                j = j + 1
+            }
+            if gleich {
+                d = zahl_aus(txt, i + 8, bytes)
+                i = bytes
+            }
+            i = i + 1
+        }
+    }
+    (*x).rpos = (*x).rpos + 32 + extra
+    return d
+}
+
+// L5 -- hell oder dunkel, ohne Registrierung und ohne D-Bus.
+fn theme_lesen(x: *mut Platte) {
+    (*x).dark_bekannt = false
+    (*x).dark = false
+    var b: rt.Buf = rt.buf_new()
+    // 1. CERTUS_THEME=dark|light (der Handschalter, den auch die Abnahme
+    //    benutzt), dann GTK_THEME=Adwaita:dark.
+    var e1: [u8; 12] = "CERTUS_THEME"
+    var e2: [u8; 9] = "GTK_THEME"
+    if env_hole((&e1[0]) as u64, 12, &b) && rt.buf_len(&b) > 0 {
+        (*x).dark = hat_dark(rt.buf_ptr(&b), rt.buf_len(&b))
+        (*x).dark_bekannt = true
+        rt.buf_free(&b)
+        return
+    }
+    rt.buf_clear(&b)
+    if env_hole((&e2[0]) as u64, 9, &b) {
+        if hat_dark(rt.buf_ptr(&b), rt.buf_len(&b)) {
+            (*x).dark = true
+            (*x).dark_bekannt = true
+            rt.buf_free(&b)
+            return
+        }
+    }
+    // 2. ~/.config/gtk-4.0/settings.ini, dann gtk-3.0.
+    var e3: [u8; 4] = "HOME"
+    rt.buf_clear(&b)
+    var home: rt.Buf = rt.buf_new()
+    if !env_hole((&e3[0]) as u64, 4, &home) {
+        var hr: [u8; 5] = "/root"
+        rt.buf_push_bytes(&home, (&hr[0]) as u64, 5)
+    }
+    var gefunden: bool = false
+    var s4: [u8; 30] = "/.config/gtk-4.0/settings.ini\0"
+    var s3: [u8; 30] = "/.config/gtk-3.0/settings.ini\0"
+    gefunden = ini_lesen(&home, (&s4[0]) as u64, 30, x)
+    if !gefunden {
+        gefunden = ini_lesen(&home, (&s3[0]) as u64, 30, x)
+    }
+    rt.buf_free(&home)
+    rt.buf_free(&b)
+}
+
+fn ini_lesen(home: *mut rt.Buf, suffix: u64, sn: usize,
+    x: *mut Platte) -> bool {
+    var pfad: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&pfad, rt.buf_ptr(home), rt.buf_len(home))
+    rt.buf_push_bytes(&pfad, suffix, sn)
+    var inhalt: rt.Buf = rt.buf_new()
+    let da: bool = rt.read_file(rt.buf_ptr(&pfad), &inhalt)
+    rt.buf_free(&pfad)
+    if !da {
+        rt.buf_free(&inhalt)
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&inhalt)
+    let n: usize = rt.buf_len(&inhalt)
+    var lit: [u8; 34] = "gtk-application-prefer-dark-theme="
+    var i: usize = 0
+    var antwort: bool = false
+    var sah: bool = false
+    while i + 34 <= n {
+        var gleich: bool = true
+        var j: usize = 0
+        while j < 34 {
+            if rt.ld8(p, i + j) != lit[j] {
+                gleich = false
+            }
+            j = j + 1
+        }
+        if gleich {
+            let v: u8 = rt.ld8(p, i + 34)
+            if v == 49 as u8 || v == 116 as u8 || v == 84 as u8 {
+                antwort = true
+            }
+            sah = true
+            i = n
+        }
+        i = i + 1
+    }
+    if !sah {
+        // Kein ausdruecklicher Schluessel: dann entscheidet der
+        // Themenname, denn "Adwaita-dark" ist genau so ueblich.
+        if hat_dark(p, n) {
+            antwort = true
+            sah = true
+        }
+    }
+    rt.buf_free(&inhalt)
+    if sah {
+        (*x).dark = antwort
+        (*x).dark_bekannt = true
+    }
+    return sah
+}
+
+// Steht irgendwo "dark" oder "Dark"?
+fn hat_dark(p: u64, n: usize) -> bool {
+    var lit: [u8; 4] = "dark"
+    var i: usize = 0
+    while i + 4 <= n {
+        var gleich: bool = true
+        var j: usize = 0
+        while j < 4 {
+            var c: u8 = rt.ld8(p, i + j)
+            if c >= 65 as u8 && c <= 90 as u8 {
+                c = c + 32 as u8
+            }
+            if c != lit[j] {
+                gleich = false
+            }
+            j = j + 1
+        }
+        if gleich {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn r_dunkel(x: *mut Platte) -> bool {
+    return (*x).dark
+}
+
+fn r_dunkel_bekannt(x: *mut Platte) -> bool {
+    return (*x).dark_bekannt
+}
+
+// ======================================================= DAS FENSTER
+
+fn r_mache(x: *mut Platte, w: usize, h: usize) -> bool {
+    (*x).win = new_id(x)
+    (*x).gc = new_id(x)
+    (*x).w = w
+    (*x).h = h
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 1 as u8) // CreateWindow
+    rt.buf_push(&r, (*x).depth as u8)
+    put16(&r, 10 as u32)
+    put32(&r, (*x).win)
+    put32(&r, (*x).root)
+    put16(&r, 0 as u32)
+    put16(&r, 0 as u32)
+    put16(&r, w as u32)
+    put16(&r, h as u32)
+    put16(&r, 0 as u32)
+    put16(&r, 1 as u32) // InputOutput
+    put32(&r, (*x).visual)
+    put32(&r, 2050 as u32) // background-pixel | event-mask
+    put32(&r, 16777215 as u32)
+    // Exposure(32768) | KeyPress(1) | ButtonPress(4) |
+    // PointerMotion(64, L1) | StructureNotify(131072)
+    put32(&r, 32768 as u32 | 1 as u32 | 4 as u32 | 64 as u32
+        | 131072 as u32)
+    rt.buf_push(&r, 55 as u8) // CreateGC
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, (*x).win)
+    put32(&r, 0 as u32)
+    var ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !ok {
+        return false
+    }
+    // L3: WM_PROTOCOLS = { WM_DELETE_WINDOW }. Ohne diese Zeile toetet
+    // der Fenstermanager den Prozess, statt ihn zu fragen.
+    if (*x).a_protocols != 0 as u32 && (*x).a_delete != 0 as u32 {
+        var q: rt.Buf = rt.buf_new()
+        rt.buf_push(&q, 18 as u8) // ChangeProperty
+        rt.buf_push(&q, 0 as u8) // Replace
+        put16(&q, 7 as u32)
+        put32(&q, (*x).win)
+        put32(&q, (*x).a_protocols)
+        put32(&q, 4 as u32) // ATOM
+        rt.buf_push(&q, 32 as u8)
+        rt.buf_push(&q, 0 as u8)
+        rt.buf_push(&q, 0 as u8)
+        rt.buf_push(&q, 0 as u8)
+        put32(&q, 1 as u32)
+        put32(&q, (*x).a_delete)
+        ok = send(x, q.ptr, q.len)
+        rt.buf_free(&q)
+    }
+    if (*x).gift != 0 {
+        let okg: bool = r_fuelle(x, 16711935 as u32, 0, 0, w, h)
+    }
+    return ok
+}
+
+fn r_titel(x: *mut Platte, p: u64, n: usize) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 18 as u8) // ChangeProperty
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, (6 + (n + pad4(n)) / 4) as u32)
+    put32(&r, (*x).win)
+    put32(&r, 39 as u32) // WM_NAME
+    put32(&r, 31 as u32) // STRING
+    rt.buf_push(&r, 8 as u8)
+    rt.buf_push(&r, 0 as u8)
+    rt.buf_push(&r, 0 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put32(&r, n as u32)
+    rt.buf_push_bytes(&r, p, n)
+    var q: usize = 0
+    while q < pad4(n) {
+        rt.buf_push(&r, 0 as u8)
+        q = q + 1
+    }
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+fn r_zeige(x: *mut Platte) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 8 as u8) // MapWindow
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 2 as u32)
+    put32(&r, (*x).win)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !ok {
+        return false
+    }
+    return r_blitten(x)
+}
+
+// Unter X11 gibt es keine Leinwand des Klienten, die neu angelegt
+// werden muesste. Uebernommen wird die neue Groesse, damit
+// `r_breite`/`r_hoehe` und der Zuschnitt in `r_bild` stimmen.
+// Der Schirm, in Bildpunkten.
+fn r_schirm(x: *mut Platte, sw: *mut usize, sh: *mut usize) -> bool {
+    if (*x).schirm_w == 0 || (*x).schirm_h == 0 {
+        return false
+    }
+    *sw = (*x).schirm_w
+    *sh = (*x).schirm_h
+    return true
+}
+
+// Mittig setzen macht unter X11 der FENSTERMANAGER, und die Abnahme
+// laeuft ohne einen. Hier steht darum nur die ehrliche Antwort.
+fn r_mittig(x: *mut Platte) -> bool {
+    return false
+}
+
+fn r_gross(x: *mut Platte, w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 {
+        return false
+    }
+    (*x).w = w
+    (*x).h = h
+    if (*x).gift != 0 {
+        let okg: bool = r_fuelle(x, 16711935 as u32, 0, 0, w, h)
+    }
+    return true
+}
+
+fn r_gift(x: *mut Platte, an: bool) {
+    if an {
+        (*x).gift = 1
+    } else {
+        (*x).gift = 0
+    }
+}
+
+// ------------------------------------------------------------ das Malen
+
+fn r_fuelle(x: *mut Platte, px: u32, x0: usize, y0: usize, w: usize,
+    h: usize) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 56 as u8) // ChangeGC
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, 4 as u32) // GCForeground
+    put32(&r, px)
+    rt.buf_push(&r, 70 as u8) // PolyFillRectangle
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 5 as u32)
+    put32(&r, (*x).win)
+    put32(&r, (*x).gc)
+    put16(&r, x0 as u32)
+    put16(&r, y0 as u32)
+    put16(&r, w as u32)
+    put16(&r, h as u32)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// Die Leinwand als BGRX. Ein PutImage darf nicht laenger sein als die
+// groesste Anfrage des Servers -- das Bild geht in Baendern hinueber.
+fn r_bild(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
+    dy: usize) -> bool {
+    let per_row: usize = w * 4
+    if per_row == 0 {
+        return true
+    }
+    var rows: usize = 65536 / per_row
+    if rows == 0 {
+        rows = 1
+    }
+    var y: usize = 0
+    var r: rt.Buf = rt.buf_new()
+    while y < h {
+        var band: usize = h - y
+        if band > rows {
+            band = rows
+        }
+        rt.buf_clear(&r)
+        let bytes: usize = band * per_row
+        rt.buf_push(&r, 72 as u8) // PutImage
+        rt.buf_push(&r, 2 as u8) // ZPixmap
+        put16(&r, (6 + bytes / 4) as u32)
+        put32(&r, (*x).win)
+        put32(&r, (*x).gc)
+        put16(&r, w as u32)
+        put16(&r, band as u32)
+        put16(&r, dx as u32)
+        put16(&r, (dy + y) as u32)
+        rt.buf_push(&r, 0 as u8)
+        rt.buf_push(&r, (*x).depth as u8)
+        rt.buf_push(&r, 0 as u8)
+        rt.buf_push(&r, 0 as u8)
+        rt.buf_push_bytes(&r, px + (y * per_row) as u64, bytes)
+        if !send(x, r.ptr, r.len) {
+            rt.buf_free(&r)
+            return false
+        }
+        y = y + band
+    }
+    rt.buf_free(&r)
+    return true
+}
+
+// Die Schrift des Servers fuer Beschriftungen. "fixed" hat jeder
+// X-Server seit 1987.
+fn r_schrift(x: *mut Platte) -> bool {
+    if (*x).font == 0 as u32 {
+        (*x).font = new_id(x)
+    }
+    var nm: [u8; 5] = "fixed"
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 45 as u8) // OpenFont
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, (3 + (5 + pad4(5)) / 4) as u32)
+    put32(&r, (*x).font)
+    put16(&r, 5 as u32)
+    put16(&r, 0 as u32)
+    rt.buf_push_bytes(&r, (&nm[0]) as u64, 5)
+    var q: usize = 0
+    while q < pad4(5) {
+        rt.buf_push(&r, 0 as u8)
+        q = q + 1
+    }
+    rt.buf_push(&r, 56 as u8) // ChangeGC: font
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, 16384 as u32) // GCFont
+    put32(&r, (*x).font)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// ImageText8: die Oktette werden mit gefuelltem Hintergrund gezeichnet.
+// `ty` ist die Grundlinie.
+fn r_text(x: *mut Platte, px: u32, bg: u32, tx: usize, ty: usize, p: u64,
+    n: usize) -> bool {
+    var m: usize = n
+    if m > 254 {
+        m = 254
+    }
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 56 as u8) // ChangeGC
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 5 as u32)
+    put32(&r, (*x).gc)
+    put32(&r, 12 as u32) // GCForeground | GCBackground
+    put32(&r, px)
+    put32(&r, bg)
+    rt.buf_push(&r, 76 as u8) // ImageText8
+    rt.buf_push(&r, m as u8)
+    put16(&r, (4 + (m + pad4(m)) / 4) as u32)
+    put32(&r, (*x).win)
+    put32(&r, (*x).gc)
+    put16(&r, tx as u32)
+    put16(&r, ty as u32)
+    rt.buf_push_bytes(&r, p, m)
+    var q: usize = 0
+    while q < pad4(m) {
+        rt.buf_push(&r, 0 as u8)
+        q = q + 1
+    }
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// Auf dieser Seite wird nichts gepuffert -- eine Anfrage geht heraus,
+// sobald sie gebaut ist. GetInputFocus ist der klassische Rundlauf, der
+// den Server alles abarbeiten laesst, bevor er antwortet.
+// X11 kennt kein "der Nutzer zieht gerade": der Fenstermanager sagt es
+// nicht. Auf Linux wird deshalb weiter bei jedem ConfigureNotify neu
+// gelegt -- gesammelt wie bisher. Benannte Grenze.
+#[no_gc]
+fn r_zieht(w: *mut Platte) -> bool { return false }
+
+fn r_blitten(x: *mut Platte) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 43 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 1 as u32)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    return ok
+}
+
+// U4 -- keine Leinwand des Klienten; der Abzug kommt mit `xwd`.
+fn r_ppm(x: *mut Platte, pfad: u64) -> bool {
+    return false
+}
+
+// ==================================================== DIE EREIGNISSE
+
+// ANTWORTEN SIND KEINE EREIGNISSE. Der Rundlauf in `r_blitten`
+// (GetInputFocus) bringt eine 32-Oktett-ANTWORT zurueck. Wer sie als
+// Ereignis zaehlt, baut sich eine Warteschleife, die nie schlaeft --
+// der erste Lauf dieser Runde tat genau das, und man sah es daran,
+// dass `xwd` ein halb gemaltes Bild erwischte (Hintergrund ja,
+// Kaestchen nein). Also weg mit allem, was KEIN Ereignis ist:
+// Antworten (Code 1) und Fehler (Code 0).
+fn antworten_weg(x: *mut Platte) {
+    var laeuft: bool = true
+    while laeuft {
+        if (*x).rb.len - (*x).rpos < 32 {
+            return
+        }
+        let p: u64 = (*x).rb.ptr + (*x).rpos as u64
+        let code: u8 = rt.ld8(p, 0) & 127 as u8
+        if code == 1 as u8 {
+            let extra: usize = (ld32le(p, 4) as usize) * 4
+            if !want(x, 32 + extra) {
+                return
+            }
+            (*x).rpos = (*x).rpos + 32 + extra
+        } else if code == 0 as u8 {
+            (*x).rpos = (*x).rpos + 32
+        } else {
+            return
+        }
+    }
+}
+
+fn r_da(x: *mut Platte) -> bool {
+    if (*x).inj != 0 as u32 {
+        return true
+    }
+    antworten_weg(x)
+    return (*x).rb.len - (*x).rpos >= 32
+}
+
+fn jetzt_us() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000 + (ts[1] as u64) / 1000
+}
+
+// WARTEN. `ms` < 0 = ewig, 0 = nur nachsehen.
+fn r_warte(x: *mut Platte, ms: i64) -> bool {
+    if r_da(x) {
+        return true
+    }
+    if !(*x).open {
+        return false
+    }
+    let fd: i32 = net.conn_fd(&(*x).c)
+    // struct pollfd { int fd; short events; short revents; }
+    var pfd: [i32; 2] = [0; 2]
+    pfd[0] = fd
+    pfd[1] = 1 // POLLIN
+    let start: u64 = jetzt_us()
+    var rest: i64 = ms
+    var laeuft: bool = true
+    while laeuft {
+        pfd[1] = 1
+        let r: i64 = syscall(7, (&pfd[0]) as i64, 1, rest, 0, 0, 0)
+        if r > 0 {
+            let ok: bool = lese_nach(x)
+            if r_da(x) {
+                return true
+            }
+            if !(*x).open {
+                return true
+            }
+            // Es kam NUR eine Antwort. Weiterwarten -- aber nur die
+            // Restzeit, sonst waere `warte(50)` eine Frist ohne Ende.
+            if ms >= 0 {
+                let hin: i64 = ((jetzt_us() - start) / 1000 as u64) as i64
+                if hin >= ms {
+                    return false
+                }
+                rest = ms - hin
+            }
+        } else {
+            // U5: die Frist ist abgelaufen. Hoechstens einmal je
+            // Sekunde beim System nachsehen, ob hell/dunkel umgestellt
+            // wurde.
+            let n: u64 = jetzt_us()
+            if n > (*x).dark_us + 1000000 as u64 {
+                (*x).dark_us = n
+                let vorher: bool = (*x).dark
+                theme_lesen(x)
+                if (*x).dark != vorher {
+                    (*x).inj = fenster.EV_THEME
+                    return true
+                }
+            }
+            return false
+        }
+    }
+    return false
+}
+
+// Ein Blick auf den Stecker, ohne zu warten. false = die Verbindung ist
+// weg (der Server hat zugemacht oder das Fenster wurde getoetet).
+fn nachsehen(x: *mut Platte) -> bool {
+    if !(*x).open {
+        return false
+    }
+    let fd: i32 = net.conn_fd(&(*x).c)
+    var pfd: [i32; 2] = [0; 2]
+    pfd[0] = fd
+    pfd[1] = 1 // POLLIN
+    let r: i64 = syscall(7, (&pfd[0]) as i64, 1, 0, 0, 0, 0)
+    if r > 0 {
+        let ok: bool = lese_nach(x)
+        return (*x).open
+    }
+    return true
+}
+
+// Das naechste Ereignis, NICHT blockierend. Antworten und Fehler werden
+// weggeworfen -- dieser Klient stellt ausser den Atomen und
+// RESOURCE_MANAGER keine Frage, deren Antwort er braucht, und die zwei
+// sind vor dem ersten Ereignis erledigt.
+fn r_hole(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
+    oy: *mut u32, os: *mut u32) -> bool {
+    if (*x).inj != 0 as u32 {
+        *k = (*x).inj
+        *a = 0 as u32
+        *ox = 0 as u32
+        *oy = 0 as u32
+        *os = 0 as u32
+        (*x).inj = 0
+        return true
+    }
+    var laeuft: bool = true
+    while laeuft {
+        if (*x).rb.len - (*x).rpos < 32 {
+            // Einmal OHNE Warten nachsehen. Damit bedeutet `naechstes`
+            // auf beiden Systemen dasselbe: "gib mir ein Ereignis, wenn
+            // gerade eines da ist" -- unter Windows tut `pumpe(w, 0)`
+            // genau das.
+            let lebt: bool = nachsehen(x)
+            if !lebt {
+                *k = fenster.EV_CLOSED
+                *a = 0 as u32
+                *ox = 0 as u32
+                *oy = 0 as u32
+                *os = 0 as u32
+                return true
+            }
+            if (*x).rb.len - (*x).rpos < 32 {
+                return false
+            }
+        }
+        let p: u64 = (*x).rb.ptr + (*x).rpos as u64
+        let code: u8 = rt.ld8(p, 0) & 127 as u8
+        var consume: usize = 32
+        if code == 1 as u8 {
+            let extra: usize = (ld32le(p, 4) as usize) * 4
+            if !want(x, 32 + extra) {
+                *k = fenster.EV_CLOSED
+                return true
+            }
+            consume = 32 + extra
+        }
+        (*x).rpos = (*x).rpos + consume
+        *a = 0 as u32
+        *ox = 0 as u32
+        *oy = 0 as u32
+        *os = 0 as u32
+        if code == 12 as u8 { // Expose
+            *k = fenster.EV_EXPOSE
+            return true
+        }
+        if code == 2 as u8 { // KeyPress
+            let kc: u32 = rt.ld8(p, 1) as u32
+            let st: u32 = ld16le(p, 28)
+            *os = st
+            // L2: wie unter Windows -- Tasten mit Bedeutung als EV_KEY,
+            // Druckbares als EV_CHAR.
+            if ist_taste(kc) {
+                *a = kc
+                *k = fenster.EV_KEY
+                return true
+            }
+            let ch: u32 = key_ascii(kc, (st & 1 as u32) != 0 as u32)
+            if ch != 0 as u32 {
+                *a = ch
+                *k = fenster.EV_CHAR
+                return true
+            }
+            // Eine Taste, die weder Bedeutung noch Zeichen hat: als
+            // EV_KEY mit ihrer Nummer, damit nichts verschwindet.
+            *a = kc
+            *k = fenster.EV_KEY
+            return true
+        }
+        if code == 4 as u8 { // ButtonPress
+            *a = rt.ld8(p, 1) as u32
+            *ox = ld16le(p, 24)
+            *oy = ld16le(p, 26)
+            *os = ld16le(p, 28)
+            *k = fenster.EV_BUTTON
+            return true
+        }
+        if code == 6 as u8 { // MotionNotify (L1)
+            *ox = ld16le(p, 24)
+            *oy = ld16le(p, 26)
+            *os = ld16le(p, 28)
+            *k = fenster.EV_MOTION
+            return true
+        }
+        if code == 22 as u8 { // ConfigureNotify
+            let nw: u32 = ld16le(p, 20)
+            let nh: u32 = ld16le(p, 22)
+            *ox = nw
+            *oy = nh
+            *k = fenster.EV_CONFIGURE
+            return true
+        }
+        if code == 33 as u8 { // ClientMessage (L3)
+            let atom: u32 = ld32le(p, 12)
+            if atom == (*x).a_delete && (*x).a_delete != 0 as u32 {
+                *k = fenster.EV_CLOSED
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// Hat diese Tastennummer eine Bedeutung (K_*)? Die Zahlen SIND die
+// X11-Nummern; lib/fenster/win32.fi bildet Windows darauf ab.
+fn ist_taste(kc: u32) -> bool {
+    return kc == fenster.K_ESCAPE || kc == fenster.K_BACK
+    || kc == fenster.K_TAB || kc == fenster.K_RETURN
+    || kc == fenster.K_HOME || kc == fenster.K_UP
+    || kc == fenster.K_PAGEUP || kc == fenster.K_LEFT
+    || kc == fenster.K_RIGHT || kc == fenster.K_END
+    || kc == fenster.K_DOWN || kc == fenster.K_PAGEDOWN
+    || kc == fenster.K_DELETE
+}
+
+// Die US-Tastatur, wie sie jeder X-Server herausgibt, fuer den
+// ASCII-Bereich. Vier Reihen, die sich seit dem IBM PC nicht bewegt
+// haben -- als TABELLE und nicht als vier fast gleiche Bloecke.
+fn key_ascii(code: u32, shift: bool) -> u32 {
+    var von: [u32; 4] = [10, 24, 38, 52]
+    var bis: [u32; 4] = [21, 35, 48, 61]
+    var ab: [usize; 4] = [0, 12, 24, 35]
+    var reihen: [u8; 45] = "1234567890-=qwertyuiop[]asdfghjkl;'zxcvbnm,./"
+    var ziffern_um: [u8; 12] = "!@#$%^&*()_+"
+    var i: usize = 0
+    while i < 4 {
+        if code >= von[i] && code <= bis[i] {
+            let k: usize = (code - von[i]) as usize
+            if i == 0 && shift {
+                return ziffern_um[k] as u32
+            }
+            var ch: u32 = reihen[ab[i] + k] as u32
+            if shift && ch >= 97 as u32 && ch <= 122 as u32 {
+                ch = ch - 32 as u32
+            }
+            return ch
+        }
+        i = i + 1
+    }
+    if code == 65 as u32 {
+        return 32 as u32 // Leerzeichen
+    }
+    return 0 as u32
+}
+
+fn r_zu(x: *mut Platte) {
+    if (*x).open {
+        net.close(&(*x).c)
+        (*x).open = false
+    }
+    rt.buf_free(&(*x).rb)
+}
