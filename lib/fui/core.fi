@@ -1,0 +1,531 @@
+profile kernel
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/core.fi -- THE FREESTANDING CORE OF fUi.
+//
+// ===================================================== WHY IT EXISTS
+//
+// Justin, 10.09.2026: "why do we not make ONE lib for all buttons,
+// including the ones running in the kernel, just that this lib is used
+// directly in the kernel?"
+//
+// The objection against it ran: the title bar belongs to the window
+// server, so the window manager IN THE KERNEL (kernel/wm.fi) paints its
+// buttons itself, and fUi could only take over the application buttons.
+// That is exactly the division at which the drawing has ALREADY broken
+// TWICE: first a frayed cross out of a vector rasteriser, then a cross
+// of which only one diagonal was left.
+//
+// This file dissolves that. It carries `profile kernel` in line 1 and
+// keeps to SPEC 2:
+//
+//   * NO memory request. Every buffer comes from the caller.
+//   * NO syscall, no runtime, no `std.rt`, no `std.io`.
+//   * NO Gc, no Rc, no `throw`.
+//   * NO floating point. Everything integer -- see below.
+//
+// With that the window manager of OrientOS binds in EXACTLY THIS FILE
+// and paints the same pixels as every application, because it is the
+// same source. Drifting apart is then no longer possible.
+//
+// ================================================ WITHOUT FLOATING POINT
+//
+// SPEC 2 allows floating point in the kernel profile only with
+// `#[allow_fp]`, and for a real reason: the state of the floating point
+// unit belongs to the interrupted process. A window manager that
+// touches the FPU while drawing has to save it.
+//
+// This file therefore computes IN INTEGERS. That is no restriction but
+// suits the matter: the template from OrientOS
+// (/root/jarvis/downloads/knopf-vorlage/) sets every pixel exactly
+// once, without blending. The antialiasing of the round corners runs
+// over a coverage number 0..255 from integer area arithmetic.
+//
+// =============================================== THE PIXEL FORMAT
+//
+// BGRX, 32 bit, as lib/fenster/fenster.fi lays it down in F3: B, G, R,
+// X in memory. A colour comes in as 0xRRGGBB; `put` lays it down
+// correctly. That way the core paints into the same buffer the window
+// layer passes around anyway.
+//
+// ==================================================== WHAT IS NOT HERE
+//
+// K1 NO TEXT. Font rasterising needs the font file, a scratch buffer
+//    and floating point. It stands in lib/fui/painter.fi (profile
+//    `app`). The window manager paints its titles with its own font --
+//    that is the one part that stays divided.
+// K2 NO STATE. No `static mut`, nothing that survives between two
+//    calls. Everything stands in the arguments.
+
+export {
+    Target, target_new,
+    put, get, fill_all, fill_rect, border, line_h, line_v,
+    round_fill, round_frame,
+    cap_minimize, cap_maximize, cap_restore, cap_close,
+    cap_surface,
+    CAP_NORMAL, CAP_HOVER, CAP_ACTIVE,
+    mix_channel, corner_coverage,
+}
+
+// The three states a button knows in the core. Focus and disabled are
+// matters of the shell -- a window button does not have them.
+const CAP_NORMAL: u32 = 0
+const CAP_HOVER: u32 = 1
+const CAP_ACTIVE: u32 = 2
+
+// ======================================================== THE TARGET
+//
+// A pixel buffer the caller provides. `stride` is the number of BYTES
+// per row, not of pixels -- a window server almost never gets a row
+// without padding.
+struct Target {
+    p: u64,        // start of the buffer
+    w: usize,      // width in pixels
+    h: usize,      // height in pixels
+    stride: usize, // octets per row
+}
+
+fn target_new(p: u64, w: usize, h: usize, stride: usize) -> Target {
+    return Target { p: p, w: w, h: h, stride: stride }
+}
+
+// SET ONE PIXEL. Outside NOTHING is written -- that is the only guard a
+// drawing routine in the kernel needs, and it stands in exactly one
+// place.
+fn put(z: *mut Target, x: usize, y: usize, color: u32) {
+    if x >= (*z).w || y >= (*z).h {
+        return
+    }
+    let off: u64 = (y * (*z).stride + x * 4) as u64
+    // BGRX: blue first.
+    *(((*z).p + off) as *mut u8) = (color & 255 as u32) as u8
+    *(((*z).p + off + 1 as u64) as *mut u8) =
+        ((color >> 8) & 255 as u32) as u8
+    *(((*z).p + off + 2 as u64) as *mut u8) =
+        ((color >> 16) & 255 as u32) as u8
+    *(((*z).p + off + 3 as u64) as *mut u8) = 0 as u8
+}
+
+fn get(z: *mut Target, x: usize, y: usize) -> u32 {
+    if x >= (*z).w || y >= (*z).h {
+        return 0 as u32
+    }
+    let off: u64 = (y * (*z).stride + x * 4) as u64
+    let b: u32 = (*(((*z).p + off) as *mut u8)) as u32
+    let g: u32 = (*(((*z).p + off + 1 as u64) as *mut u8)) as u32
+    let r: u32 = (*(((*z).p + off + 2 as u64) as *mut u8)) as u32
+    return (r << 16) | (g << 8) | b
+}
+
+// Mix two colours by coverage 0..255. Integer, per channel.
+// That is the whole antialiasing of this file.
+fn mix_channel(bottom: u32, top: u32, a: usize) -> u32 {
+    if a >= 255 {
+        return top
+    }
+    if a == 0 {
+        return bottom
+    }
+    var out: u32 = 0
+    var s: u32 = 16
+    while true {
+        let cu: usize = ((bottom >> s) & 255 as u32) as usize
+        let co: usize = ((top >> s) & 255 as u32) as usize
+        let v: usize = (cu * (255 - a) + co * a + 127) / 255
+        out = out | ((v as u32) << s)
+        if s == 0 as u32 {
+            break
+        }
+        s = s - 8 as u32
+    }
+    return out
+}
+
+// ==================================================== THE AREAS
+
+fn fill_all(z: *mut Target, color: u32) {
+    fill_rect(z, 0, 0, (*z).w, (*z).h, color)
+}
+
+fn fill_rect(z: *mut Target, x: usize, y: usize, w: usize, h: usize,
+    color: u32) {
+    var yy: usize = 0
+    while yy < h {
+        var xx: usize = 0
+        while xx < w {
+            put(z, x + xx, y + yy, color)
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// An OUTLINE, `st` pixels wide. The maximise mark is exactly that.
+fn border(z: *mut Target, x: usize, y: usize, w: usize, h: usize,
+    st: usize, color: u32) {
+    if w == 0 || h == 0 || st == 0 {
+        return
+    }
+    var s: usize = st
+    if 2 * s > w || 2 * s > h {
+        s = 1
+    }
+    fill_rect(z, x, y, w, s, color)
+    fill_rect(z, x, y + h - s, w, s, color)
+    fill_rect(z, x, y + s, s, h - 2 * s, color)
+    fill_rect(z, x + w - s, y + s, s, h - 2 * s, color)
+}
+
+fn line_h(z: *mut Target, x: usize, y: usize, len: usize, st: usize,
+    color: u32) {
+    fill_rect(z, x, y, len, st, color)
+}
+
+fn line_v(z: *mut Target, x: usize, y: usize, len: usize, st: usize,
+    color: u32) {
+    fill_rect(z, x, y, st, len, color)
+}
+
+// ================================================= THE ROUND CORNERS
+//
+// The coverage of a pixel at a corner with radius `r`, as a number
+// 0..255. INTEGER and without a square root: it is tested with 4x4
+// probes per pixel whether the probe lies in the circle (dx*dx + dy*dy
+// <= r*r). 16 probes give 17 steps, and the difference from an exact
+// area computation is under one brightness step of 255.
+//
+// `cx`/`cy` is the centre of the corner circle, `px`/`py` the pixel.
+// Everything in pixels, everything `usize`.
+fn corner_coverage(px: usize, py: usize, cx: usize, cy: usize,
+    r: usize) -> usize {
+    if r == 0 {
+        return 255
+    }
+    let rr: usize = r * r
+    var drin: usize = 0
+    // Four by four probes, each in the middle of its quarter: offset
+    // 1/8, 3/8, 5/8, 7/8. Computed times 8, so that it stays integer.
+    //
+    var iy: usize = 0
+    while iy < 4 {
+        var ix: usize = 0
+        while ix < 4 {
+            // Position of the probe, in eighths
+            let sx8: usize = px * 8 + 1 + ix * 2
+            let sy8: usize = py * 8 + 1 + iy * 2
+            let cx8: usize = cx * 8
+            let cy8: usize = cy * 8
+            var dx: usize = 0
+            if sx8 > cx8 {
+                dx = sx8 - cx8
+            } else {
+                dx = cx8 - sx8
+            }
+            var dy: usize = 0
+            if sy8 > cy8 {
+                dy = sy8 - cy8
+            } else {
+                dy = cy8 - sy8
+            }
+            // Comparison in eighths: (dx/8)^2 + (dy/8)^2 <= r^2
+            if dx * dx + dy * dy <= rr * 64 {
+                drin = drin + 1
+            }
+            ix = ix + 1
+        }
+        iy = iy + 1
+    }
+    return drin * 255 / 16
+}
+
+// A RECTANGLE WITH ROUND CORNERS, antialiased, integer.
+//
+// The radius is clamped to half the shorter side. That is NOT caution
+// on suspicion: in `u64`, `w - 2*border_w` on a button narrower than
+// two borders is a number close to 2^64 -- exactly what Justin's start
+// menu in OrientOS died of (kernel/user/wlib.fi, round ECHTHARDWARE-1,
+// "panic: integer overflow in 'u64 - u64'").
+fn round_fill(z: *mut Target, x: usize, y: usize, w: usize, h: usize,
+    r0: usize, color: u32) {
+    if w == 0 || h == 0 {
+        return
+    }
+    var r: usize = r0
+    var m: usize = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2 {
+        r = m / 2
+    }
+    if r == 0 {
+        fill_rect(z, x, y, w, h, color)
+        return
+    }
+    // The middle part and the two bars -- without corners.
+    fill_rect(z, x + r, y, w - 2 * r, h, color)
+    fill_rect(z, x, y + r, r, h - 2 * r, color)
+    fill_rect(z, x + w - r, y + r, r, h - 2 * r, color)
+    // The four corners, pixel by pixel with coverage.
+    var iy: usize = 0
+    while iy < r {
+        var ix: usize = 0
+        while ix < r {
+            // top left: centre (r, r) in the corner square
+            let a: usize = corner_coverage(ix, iy, r, r, r)
+            if a > 0 {
+                blend_px(z, x + ix, y + iy, color, a)
+                blend_px(z, x + w - 1 - ix, y + iy, color, a)
+                blend_px(z, x + ix, y + h - 1 - iy, color, a)
+                blend_px(z, x + w - 1 - ix, y + h - 1 - iy, color, a)
+            }
+            ix = ix + 1
+        }
+        iy = iy + 1
+    }
+}
+
+// Lay a pixel with coverage over what is already there.
+fn blend_px(z: *mut Target, x: usize, y: usize, color: u32, a: usize) {
+    if a >= 255 {
+        put(z, x, y, color)
+        return
+    }
+    if a == 0 {
+        return
+    }
+    let bottom: u32 = get(z, x, y)
+    put(z, x, y, mix_channel(bottom, color, a))
+}
+
+// The outline of a round rectangle -- the focus ring of the shell and
+// the border of a window.
+fn round_frame(z: *mut Target, x: usize, y: usize, w: usize, h: usize,
+    r: usize, st: usize, color: u32) {
+    if st == 0 || w == 0 || h == 0 {
+        return
+    }
+    // The honest construction in the core without an intermediate
+    // buffer: `st` rings, from outside inwards, each a round outline of
+    // four bars and four corner arcs. At st = 1..3 (more is not a
+    // border) that is cheaper than a second buffer.
+    var i: usize = 0
+    while i < st {
+        if 2 * i >= w || 2 * i >= h {
+            break
+        }
+        var ri: usize = 0
+        if r > i {
+            ri = r - i
+        }
+        ring_one(z, x + i, y + i, w - 2 * i, h - 2 * i, ri, color)
+        i = i + 1
+    }
+}
+
+// ONE pixel of outline.
+fn ring_one(z: *mut Target, x: usize, y: usize, w: usize, h: usize,
+    r0: usize, color: u32) {
+    var r: usize = r0
+    var m: usize = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2 {
+        r = m / 2
+    }
+    // the four straight pieces
+    fill_rect(z, x + r, y, w - 2 * r, 1, color)
+    fill_rect(z, x + r, y + h - 1, w - 2 * r, 1, color)
+    fill_rect(z, x, y + r, 1, h - 2 * r, color)
+    fill_rect(z, x + w - 1, y + r, 1, h - 2 * r, color)
+    if r == 0 {
+        return
+    }
+    // the four arcs: the pixel whose coverage tips from inside to
+    // outside
+    var iy: usize = 0
+    while iy < r {
+        var ix: usize = 0
+        while ix < r {
+            let a: usize = corner_coverage(ix, iy, r, r, r)
+            let b: usize = corner_coverage(ix, iy, r, r, r - 1)
+            if a > b {
+                let d: usize = a - b
+                blend_px(z, x + ix, y + iy, color, d)
+                blend_px(z, x + w - 1 - ix, y + iy, color, d)
+                blend_px(z, x + ix, y + h - 1 - iy, color, d)
+                blend_px(z, x + w - 1 - ix, y + h - 1 - iy, color, d)
+            }
+            ix = ix + 1
+        }
+        iy = iy + 1
+    }
+}
+
+// ======================================================================
+// THE FOUR WINDOW MARKS
+//
+// Template: /root/jarvis/downloads/knopf-vorlage/KNOPF-VORLAGE.md,
+// from kernel/wm.fi `cap_glyph` at commit bee3999. Justin calls these
+// three buttons the only thing in the system that is perfect.
+//
+// WHAT IS TAKEN OVER IS THE SHAPE, NOT THE SIZE. The original is
+// nailed to 10 x 10 pixels; on Justin's screen (3440x1440, scale 2) the
+// button is 60 wide and the mark still 10 -- hence his finding "-- [] /".
+// EVERY length here hangs on `d` and `sb`, and the caller gives
+// `d = 10 * scale`, `sb = 1 * scale`.
+//
+// `x`/`y` is the top left corner of the mark field, `d` its edge
+// length.
+
+// Minimise: a horizontal stroke at half height.
+fn cap_minimize(z: *mut Target, x: usize, y: usize, d: usize,
+    sb: usize, color: u32) {
+    if d == 0 || sb == 0 {
+        return
+    }
+    // Template: from (0, d/2) to (d-1, d/2), thickness sb. At sb > 1
+    // the stroke is laid around the centre line, otherwise it wanders
+    // downwards when scaled.
+    var oy: usize = d / 2
+    if sb > 1 {
+        if oy >= sb / 2 {
+            oy = oy - sb / 2
+        } else {
+            oy = 0
+        }
+    }
+    line_h(z, x, y + oy, d, sb, color)
+}
+
+// Maximise: an empty square.
+fn cap_maximize(z: *mut Target, x: usize, y: usize, d: usize,
+    sb: usize, color: u32) {
+    if d == 0 || sb == 0 {
+        return
+    }
+    border(z, x, y, d, d, sb, color)
+}
+
+// Restore: two offset squares. The offset is 2 at scale 1, so `2 * sb`
+// -- the template says "at scale the offset is 2 * scale", and `sb` IS
+// the scale (stroke width 1 * scale).
+fn cap_restore(z: *mut Target, x: usize, y: usize, d: usize,
+    sb: usize, color: u32) {
+    if d == 0 || sb == 0 {
+        return
+    }
+    let v: usize = 2 * sb
+    if d <= v {
+        border(z, x, y, d, d, sb, color)
+        return
+    }
+    let k: usize = d - v
+    // A: by `v` to the right, up
+    border(z, x + v, y, k, k, sb, color)
+    // B: by `v` down, to the left
+    border(z, x, y + v, k, k, sb, color)
+}
+
+// ======================================================================
+// CLOSE -- THE CROSS, AND WHY IT IS PAINTED THIS WAY AND NO OTHER
+// ======================================================================
+//
+// TWO MISTAKES HAVE ALREADY BEEN PAID FOR DEARLY HERE, both stand in
+// the template:
+//
+// 1. A VECTOR RASTERISER WITH ONE SHARED PATH IS WRONG. If you lay the
+//    two diagonals as two stroke outlines into ONE path and fill by the
+//    nonzero rule, the winding numbers add up at the crossing and a fat
+//    extra bar appears. Measured: 4 doubly covered pixels at scale 1,
+//    12 at 2, 24 at 3 -- it gets WORSE with scaling. Therefore it is
+//    set here point by point, each exactly once, without blending.
+//    Fraying is impossible that way.
+//
+// 2. NAIVELY WIDENING TO THE RIGHT RUNS OUT OF THE FIELD. In the first
+//    and last row a point is then missing on the right and the cross
+//    becomes 21 columns wide in a 20-wide field. Right is the
+//    arithmetic from the template: `kn = d - (sb - 1)` steps, set
+//    centred with `off = (d - (kn + sb - 1)) / 2`, and the second
+//    diagonal grows to the LEFT instead of to the right.
+//
+// Measured at d = 20: sb=1 -> 20x20, sb=2 -> 20x19, sb=3 -> 20x18, in
+// all cases 0 points outside and mirror-equal in both axes.
+// spiegelgleich.
+fn cap_close(z: *mut Target, x: usize, y: usize, d: usize,
+    sb: usize, color: u32) {
+    if d == 0 || sb == 0 {
+        return
+    }
+    if sb > d {
+        return
+    }
+    let kn: usize = d - (sb - 1)
+    // ==================================================================
+    // A THIRD MISTAKE, FOUND AND MEASURED IN THIS ROUND
+    // ==================================================================
+    //
+    // The template names ONE offset: `off = (d - (kn + sb - 1)) / 2`.
+    // It is right horizontally and WRONG vertically, because the two
+    // extents are not equal:
+    //
+    //     occupied WIDTH  = kn + sb - 1   (k runs, and t goes to the
+    //                                      right -- both add up)
+    //     occupied HEIGHT = kn            (only k runs; t moves
+    //                                      horizontally, not vertically)
+    //
+    // At sb = 1 both are equal, which is why it NEVER shows in the
+    // original. From sb = 2 on the height is smaller by (sb - 1), the
+    // cross sticks to the top and leaves a row free at the bottom.
+    //
+    // MEASURED with tools/fui/capicon_main.fi before the correction:
+    //     d=20 sb=2  vertically unequal: 76 pixels
+    //     d=30 sb=3  vertically unequal: 216 pixels
+    // Horizontally it was clean in both cases -- exactly the pattern a
+    // computation thought out only horizontally leaves behind.
+    //
+    // On Justin's screen sb = 2. The cross would therefore sit half a
+    // pixel too high in the button -- visible next to the square of the
+    // maximise button, which sits centred.
+    let breit: usize = kn + sb - 1
+    let up: usize = kn
+    var ox: usize = 0
+    if d > breit {
+        ox = (d - breit) / 2
+    }
+    var oy: usize = 0
+    if d > up {
+        oy = (d - up) / 2
+    }
+    var k: usize = 0
+    while k < kn {
+        var t: usize = 0
+        while t < sb {
+            // Diagonal 1: grows to the RIGHT
+            put(z, x + ox + k + t, y + oy + k, color)
+            // Diagonal 2: grows to the LEFT
+            put(z, x + ox + kn - 1 - k + t, y + oy + k, color)
+            t = t + 1
+        }
+        k = k + 1
+    }
+}
+
+// ======================================================================
+// THE BUTTON SURFACE
+// ======================================================================
+//
+// The three states. The window manager calls this with its colours, an
+// application with those from lib/fui/theme.fi -- the same drawing, two
+// colour sources.
+fn cap_surface(z: *mut Target, x: usize, y: usize, w: usize, h: usize,
+    r: usize, state: u32, f_normal: u32, f_hover: u32,
+    f_active: u32) {
+    var f: u32 = f_normal
+    if state == CAP_HOVER {
+        f = f_hover
+    } else if state == CAP_ACTIVE {
+        f = f_active
+    }
+    round_fill(z, x, y, w, h, r, f)
+}

@@ -1,0 +1,381 @@
+profile kernel
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/layout.fi -- WHERE THE WIDGETS SIT.
+//
+// ========================================================= WHY IT EXISTS
+//
+// Without a layout, a widget collection is not a WinForms alternative
+// but a collection of rectangles whose positions somebody works out by
+// hand. That is exactly what stands in lib/browser/chrome.fi today:
+// `BTN_X0 = 6`, `btn_x(i) = BTN_X0 + i * (BTN + BTN_GAP)`,
+// `feld_x() = btn_x(2) + BTN + FELD_LUECKE`. That works for ONE bar
+// with THREE buttons and falls over as soon as a fourth arrives.
+//
+// ======================================================= WHY IN THE CORE
+//
+// `profile kernel` in line 1. A layout only computes -- it does not
+// draw and asks for no memory. That lets the window manager of OrientOS
+// lay out its title bar with the same layout as an application lays out
+// its toolbar.
+//
+// INTEGER, like everything in the core (SPEC 2: no floating point
+// without `#[allow_fp]`). That suits the matter: a pixel position is a
+// whole number, and a layout that computes on half pixels produces
+// exactly the blurred edges you never get rid of again.
+// loswird.
+//
+// ========================================================== THE TWO PASSES
+//
+// Every layout worth having runs twice:
+//
+//   1. MEASURE  How big does each child want to be? (`pref`)
+//   2. PLACE    The space is handed out; whoever stretches gets the
+//               rest.
+//
+// Separate, because the second pass needs the result of the first:
+// only once all the wishes are known do you know how much there is to
+// go round at all.
+//
+// ==================================================== WHAT IS NOT HERE
+//
+// A1 NO child list in the container. The caller holds his own array of
+//    widgets and passes pointers in. A tree of pointers would be the
+//    end of being allocation-free -- and in the core there is no
+//    allocator that could build one.
+// A2 NO nesting through pointers. Whoever needs a grid inside a box
+//    works the inner rect out and calls the inner layout on it. That
+//    is one line more and costs no allocation.
+
+export {
+    Rect, rect_new, rect_x, rect_y, rect_w, rect_h,
+    rect_shrink, rect_offset,
+    Box, box_new, box_set_margin, box_set_gap,
+    box_set_align, box_measure, box_layout,
+    Grid, grid_new, grid_set_margin, grid_set_gap,
+    grid_cell,
+    distribute, center_in, align_in,
+    HORIZONTAL, VERTICAL,
+    ALIGN_START, ALIGN_MID, ALIGN_END, ALIGN_STRETCH,
+}
+
+const HORIZONTAL: u32 = 0
+const VERTICAL: u32 = 1
+
+// How a child sits ACROSS the stacking direction.
+const ALIGN_START: u32 = 0
+const ALIGN_MID: u32 = 1
+const ALIGN_END: u32 = 2
+const ALIGN_STRETCH: u32 = 3
+
+// ============================================================== THE RECT
+//
+// A rectangle in pixels. The currency of the whole layout.
+struct Rect {
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+}
+
+fn rect_new(x: i64, y: i64, w: i64, h: i64) -> Rect {
+    return Rect { x: x, y: y, w: w, h: h }
+}
+
+fn rect_x(k: *mut Rect) -> i64 { return (*k).x }
+fn rect_y(k: *mut Rect) -> i64 { return (*k).y }
+fn rect_w(k: *mut Rect) -> i64 { return (*k).w }
+fn rect_h(k: *mut Rect) -> i64 { return (*k).h }
+
+// Pull a rect inwards by `border_w`. NEVER below zero: an inner margin
+// larger than the rect gives an empty rect and not a negative one --
+// in `usize` that would be the overflow Justin's start menu in OrientOS
+// died of.
+fn rect_shrink(k: Rect, left: i64, top: i64, right: i64,
+    bottom: i64) -> Rect {
+    var o: Rect = Rect { x: k.x + left, y: k.y + top,
+        w: k.w - left - right, h: k.h - top - bottom }
+    if o.w < 0 {
+        o.w = 0
+    }
+    if o.h < 0 {
+        o.h = 0
+    }
+    return o
+}
+
+fn rect_offset(k: Rect, dx: i64, dy: i64) -> Rect {
+    return Rect { x: k.x + dx, y: k.y + dy, w: k.w, h: k.h }
+}
+
+// ============================================================== THE BOX
+//
+// A row of children, horizontal or vertical. This is the layout nine
+// out of ten surfaces need: a bar, a row of buttons, a column in a
+// dialog.
+struct Box {
+    dir: u32,
+    margin_l: i64,
+    margin_t: i64,
+    margin_r: i64,
+    margin_b: i64,
+    gap: i64,
+    align: u32,   // across the direction
+}
+
+fn box_new(dir: u32) -> Box {
+    return Box { dir: dir, margin_l: 0, margin_t: 0,
+        margin_r: 0, margin_b: 0, gap: 0, align: ALIGN_STRETCH }
+}
+
+fn box_set_margin(s: *mut Box, l: i64, o: i64, r: i64, u: i64) {
+    (*s).margin_l = l
+    (*s).margin_t = o
+    (*s).margin_r = r
+    (*s).margin_b = u
+}
+
+fn box_set_gap(s: *mut Box, a: i64) { (*s).gap = a }
+
+fn box_set_align(s: *mut Box, a: u32) { (*s).align = a }
+
+// ---- PASS 1: MEASURE
+//
+// How much room does a box need at least? `pref` is an array of the
+// preferred sizes ALONG the stacking direction, `n` its length.
+//
+// The caller holds the array (A1). Back comes the sum including gaps
+// and margins.
+fn box_measure(s: *mut Box, pref: *mut i64, n: usize) -> i64 {
+    var total_pref: i64 = 0
+    var i: usize = 0
+    while i < n {
+        total_pref = total_pref + *((pref as u64 + (i * 8) as u64) as *mut i64)
+        i = i + 1
+    }
+    if n > 1 {
+        total_pref = total_pref + (*s).gap * ((n - 1) as i64)
+    }
+    if (*s).dir == HORIZONTAL {
+        return total_pref + (*s).margin_l + (*s).margin_r
+    }
+    return total_pref + (*s).margin_t + (*s).margin_b
+}
+
+// ---- PASS 2: PLACE
+//
+// Hands `space` out to `n` children and writes the finished rects to
+// `align`. `pref` is the wanted size along the stacking direction,
+// `grow` says per child whether it may take the rest (0/1), `quer` the
+// wanted size ACROSS the direction.
+//
+// HANDING OUT THE REMAINDER is the place where a layout is either right
+// or one pixel off: the remainder of an integer division goes to the
+// FIRST stretchy children, one each. That makes the sum of the parts
+// EXACTLY the space -- and not one less, which you see at the right
+// edge.
+fn box_layout(s: *mut Box, space: Rect, pref: *mut i64,
+    grow: *mut i64, cross: *mut i64, align: *mut Rect, n: usize) {
+    let inner: Rect = rect_shrink(space, (*s).margin_l, (*s).margin_t,
+        (*s).margin_r, (*s).margin_b)
+    // How much is wanted, how much is stretchy?
+    var total_pref: i64 = 0
+    var dehnbare: i64 = 0
+    var i: usize = 0
+    while i < n {
+        total_pref = total_pref + ld(pref, i)
+        if ld(grow, i) != 0 {
+            dehnbare = dehnbare + 1
+        }
+        i = i + 1
+    }
+    var gaps: i64 = 0
+    if n > 1 {
+        gaps = (*s).gap * ((n - 1) as i64)
+    }
+    var total: i64 = inner.w
+    if (*s).dir == VERTICAL {
+        total = inner.h
+    }
+    var rest: i64 = total - total_pref - gaps
+    if rest < 0 {
+        rest = 0
+    }
+    // The extra per stretchy child, and the remainder of that.
+    var zuschlag: i64 = 0
+    var extra: i64 = 0
+    if dehnbare > 0 {
+        zuschlag = rest / dehnbare
+        extra = rest - zuschlag * dehnbare
+    }
+    // Place.
+    var lauf: i64 = inner.x
+    if (*s).dir == VERTICAL {
+        lauf = inner.y
+    }
+    var j: usize = 0
+    while j < n {
+        var groesse: i64 = ld(pref, j)
+        if ld(grow, j) != 0 {
+            groesse = groesse + zuschlag
+            if extra > 0 {
+                groesse = groesse + 1
+                extra = extra - 1
+            }
+        }
+        if groesse < 0 {
+            groesse = 0
+        }
+        // Across the direction
+        let q_ganz: i64 = cross_size(s, &inner)
+        var q_gross: i64 = ld(cross, j)
+        if (*s).align == ALIGN_STRETCH || q_gross <= 0 || q_gross > q_ganz {
+            q_gross = q_ganz
+        }
+        var q_pos: i64 = cross_pos(s, &inner)
+        if (*s).align == ALIGN_MID {
+            q_pos = q_pos + (q_ganz - q_gross) / 2
+        } else if (*s).align == ALIGN_END {
+            q_pos = q_pos + q_ganz - q_gross
+        }
+        if (*s).dir == HORIZONTAL {
+            store_rect(align, j, rect_new(lauf, q_pos, groesse, q_gross))
+        } else {
+            store_rect(align, j, rect_new(q_pos, lauf, q_gross, groesse))
+        }
+        lauf = lauf + groesse + (*s).gap
+        j = j + 1
+    }
+}
+
+fn cross_size(s: *mut Box, inner: *mut Rect) -> i64 {
+    if (*s).dir == HORIZONTAL {
+        return (*inner).h
+    }
+    return (*inner).w
+}
+
+fn cross_pos(s: *mut Box, inner: *mut Rect) -> i64 {
+    if (*s).dir == HORIZONTAL {
+        return (*inner).y
+    }
+    return (*inner).x
+}
+
+// Array access without allocation. Firn stage 0 has no slices, so the
+// access computes itself -- in ONE place, so that the address
+// arithmetic does not stand everywhere.
+fn ld(f: *mut i64, i: usize) -> i64 {
+    return *((f as u64 + (i * 8) as u64) as *mut i64)
+}
+
+fn store_rect(f: *mut Rect, i: usize, k: Rect) {
+    *((f as u64 + (i * 32) as u64) as *mut Rect) = k
+}
+
+// ============================================================== THE GRID
+//
+// Columns times rows, equally wide. Enough for dialogs, tiles, a
+// keyboard -- and whoever needs different column widths nests two
+// boxes (A2).
+struct Grid {
+    cols: usize,
+    rows: usize,
+    margin_l: i64,
+    margin_t: i64,
+    margin_r: i64,
+    margin_b: i64,
+    gap_x: i64,
+    gap_y: i64,
+}
+
+fn grid_new(cols: usize, rows: usize) -> Grid {
+    return Grid { cols: cols, rows: rows, margin_l: 0,
+        margin_t: 0, margin_r: 0, margin_b: 0, gap_x: 0, gap_y: 0 }
+}
+
+fn grid_set_margin(r: *mut Grid, l: i64, o: i64, re: i64, u: i64) {
+    (*r).margin_l = l
+    (*r).margin_t = o
+    (*r).margin_r = re
+    (*r).margin_b = u
+}
+
+fn grid_set_gap(r: *mut Grid, x: i64, y: i64) {
+    (*r).gap_x = x
+    (*r).gap_y = y
+}
+
+// The cell (`col_i`, `ze`) in `space`.
+//
+// COMPUTED AND NOT ACCUMULATED: the position of every cell comes from
+// its number, not from the sum of the previous ones. That way no
+// rounding error piles up, and the last column ends exactly at the
+// edge -- the error you otherwise only see at twelve columns.
+fn grid_cell(r: *mut Grid, space: Rect, col_i: usize,
+    ze: usize) -> Rect {
+    if (*r).cols == 0 || (*r).rows == 0 {
+        return rect_new(space.x, space.y, 0, 0)
+    }
+    let inner: Rect = rect_shrink(space, (*r).margin_l, (*r).margin_t,
+        (*r).margin_r, (*r).margin_b)
+    let nsp: i64 = (*r).cols as i64
+    let nze: i64 = (*r).rows as i64
+    let ganz_x: i64 = inner.w - (*r).gap_x * (nsp - 1)
+    let ganz_y: i64 = inner.h - (*r).gap_y * (nze - 1)
+    let i: i64 = col_i as i64
+    let j: i64 = ze as i64
+    // Left edge = start + i-th of the whole; right edge = (i+1)-th.
+    // The width is their difference -- that way the columns sum
+    // exactly to `ganz_x`.
+    var x0: i64 = 0
+    var x1: i64 = 0
+    if ganz_x > 0 {
+        x0 = ganz_x * i / nsp
+        x1 = ganz_x * (i + 1) / nsp
+    }
+    var y0: i64 = 0
+    var y1: i64 = 0
+    if ganz_y > 0 {
+        y0 = ganz_y * j / nze
+        y1 = ganz_y * (j + 1) / nze
+    }
+    return rect_new(inner.x + x0 + (*r).gap_x * i,
+        inner.y + y0 + (*r).gap_y * j, x1 - x0, y1 - y0)
+}
+
+// ========================================================= SMALL HELPERS
+
+// Hand `n` parts out over `total`, remainder to the first ones. Back
+// comes the size of the `i`-th part. The same arithmetic as in the
+// grid -- here for the caller who hands out by hand.
+fn distribute(total: i64, n: usize, i: usize) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    let a: i64 = total * (i as i64) / (n as i64)
+    let b: i64 = total * ((i + 1) as i64) / (n as i64)
+    return b - a
+}
+
+// A piece of size `size` centred in `total`. The rest falls to the
+// bottom/right -- a decision that has to be taken once, so that two
+// widgets next to each other sit alike.
+fn center_in(total: i64, size: i64) -> i64 {
+    if size >= total {
+        return 0
+    }
+    return (total - size) / 2
+}
+
+fn align_in(total: i64, size: i64, how: u32) -> i64 {
+    if how == ALIGN_MID {
+        return center_in(total, size)
+    }
+    if how == ALIGN_END {
+        if size >= total {
+            return 0
+        }
+        return total - size
+    }
+    return 0
+}

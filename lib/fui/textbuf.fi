@@ -1,0 +1,700 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/textbuf.fi -- A ONE-LINE TEXT FIELD, WITHOUT A SCREEN.
+//
+// ===================================================================
+// WHY THIS FILE EXISTS (round TEXTBOX-2)
+// ===================================================================
+//
+// Up to this round "the text box" of the address line lay in three
+// files at once: the buffer in lib/android/a_main.fi (`G_EINGABE`), the
+// caret in lib/android/ui.fi (`cpos`, `sel` = all or nothing) and the
+// arithmetic in UTF-16 units in lib/android/ime.fi (`G_SEL`, `G_COMP`).
+// Three places, three half truths -- and a caret that only knew "at the
+// end" or "everything selected". Justin's question was: "What is still
+// missing for a normal text box?" The answer: one place where it stands
+// WHOLE.
+//
+// That is this file. It knows NO canvas, NO Android, NO font. It knows
+// a buffer in WTF-8, a caret (`caret`), an anchor (`anchor`; unequal to
+// `caret` means something is selected) and a floating range
+// (`comp_a..comp_b`, the word an on-screen keyboard is currently
+// composing). Everything a TextBuf DOES -- insert, delete, select, grab
+// a word, move the caret with arrow keys, work the caret out from a
+// finger position -- stands here ONCE, and every screen (Android, X11,
+// Windows) only paints what stands here.
+//
+//
+// ===================================================================
+// WHAT IT TAKES TO UNDERSTAND A FINGER
+// ===================================================================
+//
+// A TextBuf without a font does not know how wide "Tirol" is. It asks:
+// `tb_caret_from_x(t, x, mess, ctx)` is given a measuring function
+// `mess(ctx, p, n) -> width of the first n bytes in pixels`. The caller
+// passes his font in through `ctx`. That keeps the rule "whoever taps
+// the right half of a character wants to stand behind it" here, and the
+// font where it belongs.
+//
+// ===================================================================
+// UNITS
+// ===================================================================
+//
+// All positions are BYTE offsets into the buffer and always sit on a
+// character boundary (no 10xxxxxx continuation byte). Android computes
+// in UTF-16 units; `tb_u16_of` and `tb_byte_from_u16` convert, so that
+// lib/android/ime.fi does not have to do it itself.
+//
+// NO collector object and NO `rt`: the buffer comes from the caller
+// (`tb_init`), all arithmetic runs on raw pointers, every function
+// except the two with a measuring callback is `#[no_gc]` -- so the file
+// may also be used from a thread without a collector.
+
+export {
+    TextBuf,
+    tb_new, tb_init,
+    tb_ptr, tb_len, tb_cap, tb_caret, tb_anchor, tb_sel_a, tb_sel_b,
+    tb_has_sel, tb_comp_a, tb_comp_b, tb_has_comp,
+    tb_set_text, tb_clear, tb_set_len,
+    tb_select_all, tb_set_range, tb_set_caret, tb_clear_sel,
+    tb_insert, tb_insert_cp, tb_replace, tb_delete,
+    tb_backspace, tb_delete_fwd, tb_delete_sel,
+    tb_left, tb_right, tb_home, tb_end,
+    tb_prev, tb_next, tb_is_boundary,
+    tb_word_at, tb_select_word, tb_is_word_byte,
+    tb_copy, tb_cut,
+    tb_comp_set, tb_comp_end,
+    tb_x_of, tb_caret_from_x,
+    tb_u16_of, tb_byte_from_u16, tb_u16_len,
+    tb_cp_at, tb_cp_encode,
+    tb_drag, tb_set_drag, tb_secret, tb_set_secret,
+}
+
+struct TextBuf {
+    p: u64,          // the buffer (WTF-8), owned by the caller
+    n: usize,        // how many octets are in use
+    cap: usize,      // how many there is room for
+    caret: usize,   // the caret, octet offset
+    anchor: usize,    // the other end of the selection (== caret: none)
+    comp_a: usize,   // pending text [comp_a, comp_b)
+    comp_b: usize,
+    secret: u32,     // 1 = password: give nothing out
+    drag: u32,       // 0 none, 1 caret dragged, 2 start handle, 3 end handle
+    scroll: f64,      // horizontal offset in pixels (for long texts)
+}
+
+#[no_gc]
+fn tb_new() -> TextBuf {
+    return TextBuf {
+        p: 0, n: 0, cap: 0, caret: 0, anchor: 0, comp_a: 0, comp_b: 0,
+        secret: 0, drag: 0, scroll: 0.0,
+    }
+}
+
+#[no_gc]
+fn tb_init(t: *mut TextBuf, p: u64, cap: usize) {
+    (*t).p = p
+    (*t).cap = cap
+    (*t).n = 0
+    (*t).caret = 0
+    (*t).anchor = 0
+    (*t).comp_a = 0
+    (*t).comp_b = 0
+}
+
+// -------------------------------------------------------------- reading
+#[no_gc]
+fn tb_ptr(t: *mut TextBuf) -> u64 { return (*t).p }
+#[no_gc]
+fn tb_len(t: *mut TextBuf) -> usize { return (*t).n }
+#[no_gc]
+fn tb_cap(t: *mut TextBuf) -> usize { return (*t).cap }
+#[no_gc]
+fn tb_caret(t: *mut TextBuf) -> usize { return (*t).caret }
+#[no_gc]
+fn tb_anchor(t: *mut TextBuf) -> usize { return (*t).anchor }
+#[no_gc]
+fn tb_has_sel(t: *mut TextBuf) -> bool { return (*t).anchor != (*t).caret }
+#[no_gc]
+fn tb_comp_a(t: *mut TextBuf) -> usize { return (*t).comp_a }
+#[no_gc]
+fn tb_comp_b(t: *mut TextBuf) -> usize { return (*t).comp_b }
+#[no_gc]
+fn tb_has_comp(t: *mut TextBuf) -> bool { return (*t).comp_b > (*t).comp_a }
+#[no_gc]
+fn tb_drag(t: *mut TextBuf) -> u32 { return (*t).drag }
+#[no_gc]
+fn tb_set_drag(t: *mut TextBuf, z: u32) { (*t).drag = z }
+#[no_gc]
+fn tb_secret(t: *mut TextBuf) -> bool { return (*t).secret != 0 }
+#[no_gc]
+fn tb_set_secret(t: *mut TextBuf, g: bool) {
+    if g { (*t).secret = 1 } else { (*t).secret = 0 }
+}
+
+// Start and end of the selection, ordered.
+#[no_gc]
+fn tb_sel_a(t: *mut TextBuf) -> usize {
+    if (*t).anchor < (*t).caret { return (*t).anchor }
+    return (*t).caret
+}
+#[no_gc]
+fn tb_sel_b(t: *mut TextBuf) -> usize {
+    if (*t).anchor > (*t).caret { return (*t).anchor }
+    return (*t).caret
+}
+
+// ------------------------------------------------- character boundaries
+#[no_gc]
+fn byte_of(t: *mut TextBuf, i: usize) -> u8 {
+    return *(((*t).p + i as u64) as *mut u8)
+}
+
+// Is `i` a character boundary? 0 and n always are.
+#[no_gc]
+fn tb_is_boundary(t: *mut TextBuf, i: usize) -> bool {
+    if i == 0 || i >= (*t).n {
+        return true
+    }
+    return (byte_of(t, i) & 0xC0 as u8) != 0x80 as u8
+}
+
+// The boundary BEFORE `i` (0 if there is none).
+#[no_gc]
+fn tb_prev(t: *mut TextBuf, i: usize) -> usize {
+    if i == 0 {
+        return 0
+    }
+    var a: usize = i - 1
+    while a > 0 && !tb_is_boundary(t, a) {
+        a = a - 1
+    }
+    return a
+}
+
+// The boundary AFTER `i` (n if there is none).
+#[no_gc]
+fn tb_next(t: *mut TextBuf, i: usize) -> usize {
+    if i >= (*t).n {
+        return (*t).n
+    }
+    var b: usize = i + 1
+    while b < (*t).n && !tb_is_boundary(t, b) {
+        b = b + 1
+    }
+    return b
+}
+
+// Round down to the next boundary on the left and clamp into the buffer.
+#[no_gc]
+fn clamp(t: *mut TextBuf, i0: usize) -> usize {
+    var i: usize = i0
+    if i > (*t).n {
+        i = (*t).n
+    }
+    while i > 0 && !tb_is_boundary(t, i) {
+        i = i - 1
+    }
+    return i
+}
+
+// ---------------------------------------------------------- code points
+// The code point at byte `i`; `*adv` = how many bytes it takes.
+#[no_gc]
+fn tb_cp_at(t: *mut TextBuf, i: usize, adv: *mut usize) -> u32 {
+    let n: usize = (*t).n
+    if i >= n {
+        *adv = 0
+        return 0 as u32
+    }
+    let b0: u32 = byte_of(t, i) as u32
+    if b0 < 0x80 as u32 {
+        *adv = 1
+        return b0
+    }
+    if b0 >= 0xF0 as u32 && i + 3 < n {
+        *adv = 4
+        return ((b0 & 0x07 as u32) << 18)
+            | ((byte_of(t, i + 1) as u32 & 0x3F as u32) << 12)
+            | ((byte_of(t, i + 2) as u32 & 0x3F as u32) << 6)
+            | (byte_of(t, i + 3) as u32 & 0x3F as u32)
+    }
+    if b0 >= 0xE0 as u32 && i + 2 < n {
+        *adv = 3
+        return ((b0 & 0x0F as u32) << 12)
+            | ((byte_of(t, i + 1) as u32 & 0x3F as u32) << 6)
+            | (byte_of(t, i + 2) as u32 & 0x3F as u32)
+    }
+    if b0 >= 0xC0 as u32 && i + 1 < n {
+        *adv = 2
+        return ((b0 & 0x1F as u32) << 6)
+            | (byte_of(t, i + 1) as u32 & 0x3F as u32)
+    }
+    *adv = 1
+    return 0xFFFD as u32
+}
+
+// Encode a code point into WTF-8 (four-byte branch for emoji).
+// Return: number of bytes in `roh` (room for 4).
+#[no_gc]
+fn tb_cp_encode(cp: u32, roh: u64) -> usize {
+    if cp < 0x80 as u32 {
+        *(roh as *mut u8) = cp as u8
+        return 1
+    }
+    if cp < 0x800 as u32 {
+        *(roh as *mut u8) = (0xC0 as u32 | (cp >> 6)) as u8
+        *((roh + 1) as *mut u8) = (0x80 as u32 | (cp & 0x3F as u32)) as u8
+        return 2
+    }
+    if cp < 0x10000 as u32 {
+        *(roh as *mut u8) = (0xE0 as u32 | (cp >> 12)) as u8
+        *((roh + 1) as *mut u8) = (0x80 as u32 | ((cp >> 6) & 0x3F as u32)) as u8
+        *((roh + 2) as *mut u8) = (0x80 as u32 | (cp & 0x3F as u32)) as u8
+        return 3
+    }
+    *(roh as *mut u8) = (0xF0 as u32 | (cp >> 18)) as u8
+    *((roh + 1) as *mut u8) = (0x80 as u32 | ((cp >> 12) & 0x3F as u32)) as u8
+    *((roh + 2) as *mut u8) = (0x80 as u32 | ((cp >> 6) & 0x3F as u32)) as u8
+    *((roh + 3) as *mut u8) = (0x80 as u32 | (cp & 0x3F as u32)) as u8
+    return 4
+}
+
+// ----------------------------------------------------- setting content
+// Replace the whole text; caret and anchor stand at the end afterwards.
+#[no_gc]
+fn tb_set_text(t: *mut TextBuf, p: u64, n0: usize) {
+    var n: usize = n0
+    if n > (*t).cap {
+        n = (*t).cap
+    }
+    var i: usize = 0
+    while i < n {
+        *(((*t).p + i as u64) as *mut u8) = *((p + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*t).n = n
+    (*t).caret = n
+    (*t).anchor = n
+    (*t).comp_a = 0
+    (*t).comp_b = 0
+}
+
+#[no_gc]
+fn tb_clear(t: *mut TextBuf) {
+    (*t).n = 0
+    (*t).caret = 0
+    (*t).anchor = 0
+    (*t).comp_a = 0
+    (*t).comp_b = 0
+}
+
+// Somebody wrote DIRECTLY into the buffer (the input method does that)
+// and reports the new length. Caret, anchor and the floating range are
+// clamped into the buffer; where the caret should go, the caller says
+// afterwards with `tb_set_range`.
+#[no_gc]
+fn tb_set_len(t: *mut TextBuf, n0: usize) {
+    var n: usize = n0
+    if n > (*t).cap {
+        n = (*t).cap
+    }
+    (*t).n = n
+    (*t).caret = clamp(t, (*t).caret)
+    (*t).anchor = clamp(t, (*t).anchor)
+    (*t).comp_a = clamp(t, (*t).comp_a)
+    (*t).comp_b = clamp(t, (*t).comp_b)
+    if (*t).comp_b < (*t).comp_a {
+        (*t).comp_b = (*t).comp_a
+    }
+}
+
+// ------------------------------------------------------------ selection
+#[no_gc]
+fn tb_select_all(t: *mut TextBuf) {
+    (*t).anchor = 0
+    (*t).caret = (*t).n
+}
+
+// Set caret AND anchor (bytes). Both are clamped to boundaries.
+#[no_gc]
+fn tb_set_range(t: *mut TextBuf, caret: usize, anchor: usize) {
+    (*t).caret = clamp(t, caret)
+    (*t).anchor = clamp(t, anchor)
+}
+
+// Only the caret; `extend` = extend the selection from the anchor
+// (shift key), otherwise take the anchor along.
+#[no_gc]
+fn tb_set_caret(t: *mut TextBuf, caret: usize, extend: bool) {
+    (*t).caret = clamp(t, caret)
+    if !extend {
+        (*t).anchor = (*t).caret
+    }
+}
+
+#[no_gc]
+fn tb_clear_sel(t: *mut TextBuf) {
+    (*t).anchor = (*t).caret
+}
+
+// ------------------------------------------------------ insert/delete
+// Replace [a, b) with `n` bytes from `p`. Caret and anchor stand behind
+// what was inserted afterwards. Return: false if it does not fit --
+// then NOTHING is changed.
+#[no_gc]
+fn tb_replace(t: *mut TextBuf, a0: usize, b0: usize, p: u64,
+    n: usize) -> bool {
+    var a: usize = clamp(t, a0)
+    var b: usize = clamp(t, b0)
+    if b < a {
+        let x: usize = a
+        a = b
+        b = x
+    }
+    let alt: usize = (*t).n
+    let weg: usize = b - a
+    if alt - weg + n > (*t).cap {
+        return false
+    }
+    // Move the rest behind `b`. Both directions are possible, so take
+    // the safe one: backwards from the back, forwards from the front.
+    if n > weg {
+        let d: usize = n - weg
+        var i: usize = alt
+        while i > b {
+            *(((*t).p + (i - 1 + d) as u64) as *mut u8) =
+                *(((*t).p + (i - 1) as u64) as *mut u8)
+            i = i - 1
+        }
+    } else if n < weg {
+        let d: usize = weg - n
+        var i: usize = b
+        while i < alt {
+            *(((*t).p + (i - d) as u64) as *mut u8) =
+                *(((*t).p + i as u64) as *mut u8)
+            i = i + 1
+        }
+    }
+    var j: usize = 0
+    while j < n {
+        *(((*t).p + (a + j) as u64) as *mut u8) = *((p + j as u64) as *mut u8)
+        j = j + 1
+    }
+    (*t).n = alt - weg + n
+    (*t).caret = a + n
+    (*t).anchor = a + n
+    // A floating range that touches the area is over with this; what
+    // lies behind it moves along.
+    if (*t).comp_b > a && (*t).comp_a <= b {
+        (*t).comp_a = 0
+        (*t).comp_b = 0
+    } else if (*t).comp_a > b {
+        (*t).comp_a = (*t).comp_a + n - weg
+        (*t).comp_b = (*t).comp_b + n - weg
+    }
+    return true
+}
+
+// Insert text at the caret. If something is selected, it is REPLACED --
+// that is what every text box does, and that is what MOBIL8 demanded
+// for the address line.
+#[no_gc]
+fn tb_insert(t: *mut TextBuf, p: u64, n: usize) -> bool {
+    return tb_replace(t, tb_sel_a(t), tb_sel_b(t), p, n)
+}
+
+#[no_gc]
+fn tb_insert_cp(t: *mut TextBuf, cp: u32) -> bool {
+    if cp == 0 as u32 {
+        return false
+    }
+    var roh: [u8; 4] = [0; 4]
+    let k: usize = tb_cp_encode(cp, (&roh[0]) as u64)
+    return tb_insert(t, (&roh[0]) as u64, k)
+}
+
+#[no_gc]
+fn tb_delete(t: *mut TextBuf, a: usize, b: usize) -> bool {
+    return tb_replace(t, a, b, 0, 0)
+}
+
+// Backspace: selection away, otherwise the character BEFORE the caret.
+#[no_gc]
+fn tb_backspace(t: *mut TextBuf) -> bool {
+    if tb_has_sel(t) {
+        return tb_delete(t, tb_sel_a(t), tb_sel_b(t))
+    }
+    if (*t).caret == 0 {
+        return false
+    }
+    let a: usize = tb_prev(t, (*t).caret)
+    return tb_delete(t, a, (*t).caret)
+}
+
+// Delete: selection away, otherwise the character BEHIND the caret.
+#[no_gc]
+fn tb_delete_fwd(t: *mut TextBuf) -> bool {
+    if tb_has_sel(t) {
+        return tb_delete(t, tb_sel_a(t), tb_sel_b(t))
+    }
+    if (*t).caret >= (*t).n {
+        return false
+    }
+    let b: usize = tb_next(t, (*t).caret)
+    return tb_delete(t, (*t).caret, b)
+}
+
+#[no_gc]
+fn tb_delete_sel(t: *mut TextBuf) -> bool {
+    if !tb_has_sel(t) {
+        return false
+    }
+    return tb_delete(t, tb_sel_a(t), tb_sel_b(t))
+}
+
+// ---------------------------------------------------------- arrow keys
+// Without `extend` and with a selection: the caret jumps to its edge
+// (left: start, right: end) -- that is what all text fields do.
+#[no_gc]
+fn tb_left(t: *mut TextBuf, extend: bool) {
+    if !extend && tb_has_sel(t) {
+        let a: usize = tb_sel_a(t)
+        (*t).caret = a
+        (*t).anchor = a
+        return
+    }
+    tb_set_caret(t, tb_prev(t, (*t).caret), extend)
+}
+
+#[no_gc]
+fn tb_right(t: *mut TextBuf, extend: bool) {
+    if !extend && tb_has_sel(t) {
+        let b: usize = tb_sel_b(t)
+        (*t).caret = b
+        (*t).anchor = b
+        return
+    }
+    tb_set_caret(t, tb_next(t, (*t).caret), extend)
+}
+
+#[no_gc]
+fn tb_home(t: *mut TextBuf, extend: bool) {
+    tb_set_caret(t, 0, extend)
+}
+
+#[no_gc]
+fn tb_end(t: *mut TextBuf, extend: bool) {
+    tb_set_caret(t, (*t).n, extend)
+}
+
+// ---------------------------------------------------------------- words
+// What counts as a word in an address line: letters, digits, `_`, `-`
+// and everything from 0x80 up (foreign scripts). Separators are
+// `/ . : ? = & # @` and whitespace -- a long press on "wikipedia" in
+// `de.wikipedia.org/wiki/Tirol` should grab "wikipedia", not the whole
+// line.
+#[no_gc]
+fn tb_is_word_byte(b: u8) -> bool {
+    if b >= 0x80 as u8 {
+        return true
+    }
+    if b >= 48 as u8 && b <= 57 as u8 {
+        return true
+    }
+    if b >= 65 as u8 && b <= 90 as u8 {
+        return true
+    }
+    if b >= 97 as u8 && b <= 122 as u8 {
+        return true
+    }
+    return b == 95 as u8 || b == 45 as u8
+}
+
+// The word around byte `pos`: [*a, *b). If `pos` sits on a separator,
+// the character itself is grabbed.
+#[no_gc]
+fn tb_word_at(t: *mut TextBuf, pos0: usize, a: *mut usize, b: *mut usize) {
+    let n: usize = (*t).n
+    if n == 0 {
+        *a = 0
+        *b = 0
+        return
+    }
+    var pos: usize = clamp(t, pos0)
+    if pos >= n {
+        pos = tb_prev(t, n)
+    }
+    if !tb_is_word_byte(byte_of(t, pos)) {
+        // maybe the caret stands exactly BEHIND a word
+        if pos > 0 && tb_is_word_byte(byte_of(t, pos - 1)) {
+            pos = pos - 1
+        } else {
+            *a = pos
+            *b = tb_next(t, pos)
+            return
+        }
+    }
+    var x: usize = pos
+    while x > 0 && tb_is_word_byte(byte_of(t, x - 1)) {
+        x = x - 1
+    }
+    var y: usize = pos
+    while y < n && tb_is_word_byte(byte_of(t, y)) {
+        y = y + 1
+    }
+    *a = x
+    *b = y
+}
+
+#[no_gc]
+fn tb_select_word(t: *mut TextBuf, pos: usize) {
+    var a: usize = 0
+    var b: usize = 0
+    tb_word_at(t, pos, &a, &b)
+    (*t).anchor = a
+    (*t).caret = b
+}
+
+// ------------------------------------------------------------ clipboard
+// Copy the selection to `ziel` (at most `cap`). Return: length; 0 when
+// nothing is selected or the field is secret.
+#[no_gc]
+fn tb_copy(t: *mut TextBuf, dst: u64, cap: usize) -> usize {
+    if (*t).secret != 0 || !tb_has_sel(t) {
+        return 0
+    }
+    let a: usize = tb_sel_a(t)
+    var k: usize = tb_sel_b(t) - a
+    if k > cap {
+        k = cap
+    }
+    var i: usize = 0
+    while i < k {
+        *((dst + i as u64) as *mut u8) = byte_of(t, a + i)
+        i = i + 1
+    }
+    return k
+}
+
+#[no_gc]
+fn tb_cut(t: *mut TextBuf, dst: u64, cap: usize) -> usize {
+    let k: usize = tb_copy(t, dst, cap)
+    if k > 0 {
+        let ok: bool = tb_delete_sel(t)
+    }
+    return k
+}
+
+// ----------------------------------------------------- the floating range
+#[no_gc]
+fn tb_comp_set(t: *mut TextBuf, a: usize, b: usize) {
+    (*t).comp_a = clamp(t, a)
+    (*t).comp_b = clamp(t, b)
+    if (*t).comp_b < (*t).comp_a {
+        let x: usize = (*t).comp_a
+        (*t).comp_a = (*t).comp_b
+        (*t).comp_b = x
+    }
+}
+
+#[no_gc]
+fn tb_comp_end(t: *mut TextBuf) {
+    (*t).comp_a = 0
+    (*t).comp_b = 0
+}
+
+// ------------------------------------------------------ finger and font
+// The pixel position of a boundary `i`, relative to the start of the text.
+fn tb_x_of(t: *mut TextBuf, i0: usize, mess: fn(u64, u64, usize) -> f64,
+    ctx: u64) -> f64 {
+    let i: usize = clamp(t, i0)
+    if i == 0 {
+        return 0.0
+    }
+    return mess(ctx, (*t).p, i)
+}
+
+// The boundary CLOSEST to a pixel position `x` (relative to the start of
+// the text) -- not the last one that still fits before it. Whoever taps
+// the right half of a character wants to stand behind it.
+fn tb_caret_from_x(t: *mut TextBuf, x: f64,
+    mess: fn(u64, u64, usize) -> f64, ctx: u64) -> usize {
+    if x <= 0.0 || (*t).n == 0 {
+        return 0
+    }
+    var best: usize = 0
+    var bestd: f64 = x
+    var i: usize = 1
+    while i <= (*t).n {
+        if tb_is_boundary(t, i) {
+            let w: f64 = mess(ctx, (*t).p, i)
+            var d: f64 = w - x
+            if d < 0.0 {
+                d = 0.0 - d
+            }
+            if d < bestd {
+                bestd = d
+                best = i
+            }
+            if w > x + bestd {
+                break
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ---------------------------------------------------------------- UTF-16
+// How many UTF-16 units stand BEFORE byte `i`? A code point from
+// 0x10000 up counts two. That is the currency Android computes in.
+#[no_gc]
+fn tb_u16_of(t: *mut TextBuf, i0: usize) -> usize {
+    let i: usize = clamp(t, i0)
+    var k: usize = 0
+    var j: usize = 0
+    var adv: usize = 0
+    while j < i {
+        let cp: u32 = tb_cp_at(t, j, &adv)
+        if adv == 0 {
+            break
+        }
+        if cp >= 0x10000 as u32 {
+            k = k + 2
+        } else {
+            k = k + 1
+        }
+        j = j + adv
+    }
+    return k
+}
+
+#[no_gc]
+fn tb_u16_len(t: *mut TextBuf) -> usize {
+    return tb_u16_of(t, (*t).n)
+}
+
+// The byte offset of UTF-16 unit `e` (clamps to n). If `e` falls into a
+// surrogate pair, the start of the character holds.
+#[no_gc]
+fn tb_byte_from_u16(t: *mut TextBuf, e: usize) -> usize {
+    var k: usize = 0
+    var j: usize = 0
+    var adv: usize = 0
+    while j < (*t).n {
+        if k >= e {
+            return j
+        }
+        let cp: u32 = tb_cp_at(t, j, &adv)
+        if adv == 0 {
+            break
+        }
+        if cp >= 0x10000 as u32 {
+            k = k + 2
+        } else {
+            k = k + 1
+        }
+        j = j + adv
+    }
+    return (*t).n
+}
