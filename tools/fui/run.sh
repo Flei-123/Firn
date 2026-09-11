@@ -89,6 +89,11 @@ echo "== 8. WAVE 1 AT THE PIXEL =="
 build wave1
 "$W/wave1"
 
+echo
+echo "== 9. WAVE 2 AT THE PIXEL =="
+build wave2
+"$W/wave2"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
@@ -97,6 +102,9 @@ if [ "$1" = "--images" ]; then
     build gallery
     "$W/gallery" "$Z/fui-wave1-light.png" light
     "$W/gallery" "$Z/fui-wave1-dark.png" dark
+    build gallery2
+    "$W/gallery2" "$Z/fui-wave2-light.png" light
+    "$W/gallery2" "$Z/fui-wave2-dark.png" dark
     ls -la "$Z"
 fi
 
