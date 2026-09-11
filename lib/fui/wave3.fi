@@ -1,0 +1,1230 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave3.fi -- THE CONTROLS OF WAVE 3 AND 4.
+//
+// ========================================================= WHY IT EXISTS
+//
+// wave2.fi holds the twelve controls a window needs to be OPERABLE --
+// checkbox, slider, menu, tooltip. This file holds the ones a window
+// needs to SHOW SOMETHING and to ASK SOMETHING:
+//
+//   list view, table/grid, tree view, card, badge,
+//   modal dialog, file open/save dialog, colour picker, date picker
+//
+// They follow wave 2 to the letter, and the rules are worth repeating
+// because they are the whole reason this library exists:
+//
+//   * `render.draw_base` FIRST -- surface, border, radius and the
+//     state colour come from the same place as on a button.
+//   * EVERY colour from theme/style. Not one literal colour value
+//     stands in this file; tools/fui/wave3_main.fi counts that.
+//   * `render.draw_focus_ring` LAST, so keyboard focus works on a
+//     table the same way it works on a checkbox.
+//   * Every length through `render.len_of`, so scale really takes
+//     effect.
+//   * Not one `if hovered { colour = ... }`. The state is asked with
+//     `widget.w_state` and handed to the style system -- the
+//     precedence is decided in widget.w_state and nowhere else.
+//
+// ============================================= WHY ROWS ARE WIDGETS TOO
+//
+// A row of a list, a cell of a table and a node of a tree are drawn as
+// WIDGETS (through `row_part`), not as rectangles with a colour worked
+// out on the spot. That is what makes a selected row in a table look
+// exactly like a selected row in a list and like a selected entry in a
+// menu -- all three go through `render.draw_base` with the same state.
+//
+// The alternative -- painting the row with `painter.surface` and a
+// hand-picked colour -- is the drift this library was built to stop,
+// and it is how the same list ended up looking different in two
+// windows of the same system.
+//
+// ======================================== WHY THE DIALOGS ARE IN HERE
+//
+// A modal dialog, a file chooser, a colour picker and a date picker
+// are not "programs", they are CONTROLS. If every application builds
+// its own file dialog, then every application has a different one, and
+// the one bug in it has to be fixed in every one of them. Justin's
+// point: a bug is fixed ONCE in fUi and is gone everywhere.
+//
+// So they are built from the controls that already exist. The file
+// dialog is a dialog frame + a list + a text field + two buttons; it
+// does not paint a single pixel of its own. That is also why it is
+// short.
+//
+// ==================================================== THE SCRIM
+//
+// A modal dialog darkens what is behind it. That is a FULL-SURFACE
+// wash, not a rectangle laid under the panel -- the tooltip in wave 2
+// shows what happens when a "shadow" is a rectangle: it sticks out at
+// the corners. The scrim covers the WHOLE window on purpose, so it has
+// no edge that could stick out anywhere.
+
+profile app
+
+import std.rt
+import fui.core
+import fui.style
+import fui.theme
+import fui.layout
+import fui.painter
+import fui.widget
+import fui.render
+import fui.wave2
+
+// ======================================================================
+// THE RECTANGLE OF THIS FILE
+// ======================================================================
+//
+// WHY NOT layout.Rect: that one is whole pixels (i64), and it is right
+// for a layout -- a window edge sits on a pixel. But a table column is
+// `width / 7`, and rounding that to whole pixels first makes the last
+// column up to six pixels too narrow. The error is invisible on one
+// column and obvious on a header that no longer lines up with its body.
+//
+// So the geometry in here is f64 and is only rounded when it is
+// PAINTED -- by the painter, once, at the end.
+struct FRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+fn frect(x: f64, y: f64, w: f64, h: f64) -> FRect {
+    return FRect { x: x, y: y, w: w, h: h }
+}
+
+// ======================================================================
+// SHARED HELPERS
+// ======================================================================
+
+// The state bits of a control, so a part of it can carry the same
+// ones. Same reasoning as wave2.part: the part goes through
+// draw_base and therefore gets its colour from the same source.
+fn state_bits_of(e: *mut widget.Widget) -> u32 {
+    var b: u32 = 0
+    if widget.w_is_hover(e) { b = b | 1 as u32 }
+    if widget.w_is_active(e) { b = b | 2 as u32 }
+    if widget.w_is_focus(e) { b = b | 4 as u32 }
+    if widget.w_is_disabled(e) { b = b | 8 as u32 }
+    if widget.w_is_selected(e) { b = b | 16 as u32 }
+    return b
+}
+
+// A part of a control, as a widget. See wave2.part -- the reasoning is
+// the same and it is written out there.
+fn part(c: *mut render.Ctx, e: *mut widget.Widget, kind: u32,
+    x: f64, y: f64, w: f64, h: f64, bg: u32, radius_set: bool,
+    radius: usize) -> widget.Widget {
+    var p: widget.Widget = widget.widget_new(kind)
+    widget.w_place(&p, x, y, w, h)
+    widget.w_set_state_bits(&p, state_bits_of(e))
+    widget.w_set_focus(&p, false)   // the ring belongs to the whole control
+    let s: *mut style.Style = widget.w_style(&p)
+    *s = style.style_set_bg(*s, bg)
+    if radius_set {
+        *s = style.style_set_radius(*s, radius)
+    }
+    return p
+}
+
+// A ROW of a list/table/tree, with its OWN state bits.
+//
+// WHY ITS OWN BITS AND NOT THE CONTROL'S: a list has one hovered row
+// and one selected row, and they are not the same row. A row that
+// inherited the list's bits would light up all at once -- which is
+// exactly the "whole list highlights" bug. So the caller says per row
+// what it is, and the row is a widget with those bits.
+fn row_part(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64,
+    hover: bool, selected: bool, disabled: bool,
+    focused: bool) -> widget.Widget {
+    var p: widget.Widget = widget.widget_new(widget.KIND_NONE)
+    widget.w_place(&p, x, y, w, h)
+    widget.w_set_hover(&p, hover)
+    widget.w_set_selected(&p, selected)
+    widget.w_set_disabled(&p, disabled)
+    widget.w_set_focus(&p, focused)
+    return p
+}
+
+// The surface a row shows for its state.
+//
+// WHY A SEPARATE FUNCTION AND NOT def_bg: a row is transparent when
+// nothing is going on -- it must let the list background through, or
+// every row would paint over the list's own surface and the list would
+// have no colour of its own. Only hover and selection give it one.
+fn row_bg(e: *mut widget.Widget) -> u32 {
+    if widget.w_is_disabled(e) {
+        return style.color_transparent()
+    }
+    if widget.w_is_selected(e) {
+        return style.color_token(style.TOK_SELECTION)
+    }
+    if widget.w_is_hover(e) {
+        return style.color_token(style.TOK_BUTTON_HOVER)
+    }
+    return style.color_transparent()
+}
+
+// The text colour that belongs to that surface.
+//
+// WHY IT IS DECIDED HERE: a selected row has the selection colour
+// under it, and normal text on it would be unreadable. The pair
+// "surface + the text colour that goes with it" has to be decided in
+// ONE place or the two drift apart -- that is how white-on-white
+// happens.
+fn row_fg(e: *mut widget.Widget) -> u32 {
+    if widget.w_is_disabled(e) {
+        return style.color_token(style.TOK_TEXT_DISABLED)
+    }
+    if widget.w_is_selected(e) {
+        return style.color_token(style.TOK_SELECTION_TEXT)
+    }
+    return style.color_token(style.TOK_TEXT)
+}
+
+// A piece of text inside a row, clipped to a width.
+//
+// `render.draw_text` already cuts off at the widget width (painter
+// .text_fits_upto), so a label that is too long ends inside its cell
+// and does not run into the next column. That is the "clipped label"
+// the acceptance measures.
+fn cell_text(c: *mut render.Ctx, p: u64, n: usize, x: f64, y: f64,
+    w: f64, h: f64, fg: u32, align: u32, px_set: bool, px: usize) {
+    if n == 0 {
+        return
+    }
+    var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&l, x, y, w, h)
+    widget.w_set_text(&l, p, n)
+    let s: *mut style.Style = widget.w_style(&l)
+    *s = style.style_set_pad(*s, 0, 0)
+    *s = style.style_set_fg(*s, fg)
+    *s = style.style_set_align(*s, align)
+    if px_set {
+        *s = style.style_set_font(*s, 0, px)
+    }
+    render.draw_text(c, &l)
+}
+
+// The height of one row, from the theme -- NOT a number picked here.
+// A list, a table and a tree all use it, so they line up when they
+// stand next to each other.
+fn row_height(c: *mut render.Ctx) -> f64 {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let px: f64 = render.len_of(c, (*fo).font)
+    return painter.font_ascent(z, px) + painter.font_descent(z, px)
+        + 2.0 * render.len_of(c, (*fo).sp_xs)
+}
+
+// ======================================================================
+// LIST VIEW
+// ======================================================================
+//
+// A framed surface with rows in it. The list itself is a field (like a
+// text box) because it is a place where something is CHOSEN -- and the
+// systems all give that the field colour, not the button colour.
+//
+// The rows come from the caller through `list_row`: the library cannot
+// hold the data (E1, the text belongs to the caller), so it draws the
+// frame and gives the caller a function to draw a row INSIDE it, with
+// the clipping already right.
+fn draw_list(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s, style.color_token(style.TOK_FIELD))
+    }
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        *s = style.style_set_radius(*s, (*fo).r_field)
+    }
+    render.draw_base(c, e)
+    render.draw_focus_ring(c, e)
+}
+
+// WHERE ROW `i` SITS inside a list. The caller needs this to know
+// which row the mouse is over -- and if he has to work it out himself,
+// his answer and the drawing drift apart.
+fn list_row_rect(c: *mut render.Ctx, e: *mut widget.Widget,
+    i: usize) -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let rh: f64 = row_height(c)
+    return FRect {
+        x: widget.w_x(e) + bw,
+        y: widget.w_y(e) + bw + (i as f64) * rh,
+        w: widget.w_w(e) - 2.0 * bw,
+        h: rh,
+    }
+}
+
+// WHICH ROW is under a point -- or -1 for none. The counterpart of
+// list_row_rect, so hit-testing and drawing cannot disagree.
+fn list_row_at(c: *mut render.Ctx, e: *mut widget.Widget, px: f64,
+    py: f64, count: usize) -> i64 {
+    if !widget.w_hits(e, px, py) {
+        return -1 as i64
+    }
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let rh: f64 = row_height(c)
+    if rh <= 0.0 {
+        return -1 as i64
+    }
+    let d: f64 = py - (widget.w_y(e) + bw)
+    if d < 0.0 {
+        return -1 as i64
+    }
+    let i: i64 = (d / rh) as i64
+    if i < 0 as i64 || (i as usize) >= count {
+        return -1 as i64
+    }
+    return i
+}
+
+// HOW MANY ROWS FIT -- so the caller does not draw into the border.
+fn list_visible_rows(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> usize {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let rh: f64 = row_height(c)
+    if rh <= 0.0 {
+        return 0
+    }
+    let inner: f64 = widget.w_h(e) - 2.0 * bw
+    if inner <= 0.0 {
+        return 0
+    }
+    return (inner / rh) as usize
+}
+
+// ONE ROW of a list. The caller says what state it is in; the look
+// comes from row_bg/row_fg, so it matches a menu entry and a table row.
+fn draw_list_row(c: *mut render.Ctx, e: *mut widget.Widget, i: usize,
+    p: u64, n: usize, hover: bool, selected: bool, disabled: bool) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let r: FRect = list_row_rect(c, e, i)
+    // Never draw past the bottom edge -- that is the "runs out of the
+    // frame" the acceptance looks for.
+    if r.y + r.h > widget.w_y(e) + widget.w_h(e) {
+        return
+    }
+    var row: widget.Widget = row_part(c, r.x, r.y, r.w, r.h, hover,
+        selected, disabled, false)
+    let rs: *mut style.Style = widget.w_style(&row)
+    *rs = style.style_set_bg(*rs, row_bg(&row))
+    *rs = style.style_set_radius(*rs, (*fo).r_field)
+    render.draw_base(c, &row)
+
+    let padx: f64 = render.len_of(c, (*fo).sp_s)
+    cell_text(c, p, n, r.x + padx, r.y, r.w - 2.0 * padx, r.h,
+        row_fg(&row), style.ALIGN_LEFT, false, 0)
+}
+
+// ======================================================================
+// TABLE / GRID
+// ======================================================================
+//
+// A list with columns and a header. The header is a RAISED surface and
+// the body is a field -- that is the difference that makes a table
+// readable at a glance, and it comes from the theme, not from here.
+fn draw_table(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s, style.color_token(style.TOK_FIELD))
+    }
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        *s = style.style_set_radius(*s, (*fo).r_field)
+    }
+    render.draw_base(c, e)
+    render.draw_focus_ring(c, e)
+}
+
+// The header strip of a table.
+fn table_header_rect(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    return FRect {
+        x: widget.w_x(e) + bw,
+        y: widget.w_y(e) + bw,
+        w: widget.w_w(e) - 2.0 * bw,
+        h: row_height(c),
+    }
+}
+
+// Where row `i` of the BODY sits -- below the header.
+fn table_row_rect(c: *mut render.Ctx, e: *mut widget.Widget,
+    i: usize) -> FRect {
+    let hd: FRect = table_header_rect(c, e)
+    let rh: f64 = row_height(c)
+    return FRect {
+        x: hd.x,
+        y: hd.y + hd.h + (i as f64) * rh,
+        w: hd.w,
+        h: rh,
+    }
+}
+
+// Where column `i` of `n` sits inside a row. Equal widths, and the
+// LAST one takes the rounding remainder -- otherwise a one-pixel gap
+// shows up at the right edge on some widths.
+fn table_cell_rect(r: FRect, i: usize, n: usize) -> FRect {
+    if n == 0 {
+        return FRect { x: r.x, y: r.y, w: 0.0, h: r.h }
+    }
+    let cw: f64 = r.w / (n as f64)
+    var x: f64 = r.x + (i as f64) * cw
+    var w: f64 = cw
+    if i + 1 == n {
+        w = r.x + r.w - x
+    }
+    return FRect { x: x, y: r.y, w: w, h: r.h }
+}
+
+// THE HEADER. Drawn as a widget with the raised surface, so it darkens
+// in dark mode like everything else.
+fn draw_table_header(c: *mut render.Ctx, e: *mut widget.Widget,
+    cols: *mut u64, lens: *mut usize, n: usize) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let hd: FRect = table_header_rect(c, e)
+
+    var bar: widget.Widget = part(c, e, widget.KIND_NONE, hd.x, hd.y,
+        hd.w, hd.h, style.color_token(style.TOK_SURFACE_RAISED),
+        true, 0)
+    widget.w_set_state_bits(&bar, 0)
+    render.draw_base(c, &bar)
+
+    // The line under the header. It is a separator from the theme, so
+    // it is the same line as in a menu.
+    painter.surface(z, hd.x, hd.y + hd.h - 1.0, hd.w, 1.0,
+        render.color_of(c, style.color_token(style.TOK_SEPARATOR)))
+
+    let padx: f64 = render.len_of(c, (*fo).sp_s)
+    var i: usize = 0
+    while i < n {
+        let cr: FRect = table_cell_rect(hd, i, n)
+        cell_text(c, *(((cols as u64) + (i) as u64 * 8) as *mut u64), *(((lens as u64) + (i) as u64 * 8) as *mut usize), cr.x + padx, cr.y,
+            cr.w - 2.0 * padx, cr.h,
+            style.color_token(style.TOK_TEXT_MUTED),
+            style.ALIGN_LEFT, false, 0)
+        i = i + 1
+    }
+}
+
+// ONE BODY ROW with its cells.
+fn draw_table_row(c: *mut render.Ctx, e: *mut widget.Widget, i: usize,
+    cells: *mut u64, lens: *mut usize, n: usize, hover: bool,
+    selected: bool, disabled: bool) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let r: FRect = table_row_rect(c, e, i)
+    if r.y + r.h > widget.w_y(e) + widget.w_h(e) {
+        return
+    }
+    var row: widget.Widget = row_part(c, r.x, r.y, r.w, r.h, hover,
+        selected, disabled, false)
+    let rs: *mut style.Style = widget.w_style(&row)
+    *rs = style.style_set_bg(*rs, row_bg(&row))
+    *rs = style.style_set_radius(*rs, 0)
+    render.draw_base(c, &row)
+
+    let fg: u32 = row_fg(&row)
+    let padx: f64 = render.len_of(c, (*fo).sp_s)
+    var k: usize = 0
+    while k < n {
+        let cr: FRect = table_cell_rect(r, k, n)
+        cell_text(c, *(((cells as u64) + (k) as u64 * 8) as *mut u64), *(((lens as u64) + (k) as u64 * 8) as *mut usize), cr.x + padx, cr.y,
+            cr.w - 2.0 * padx, cr.h, fg, style.ALIGN_LEFT, false, 0)
+        k = k + 1
+    }
+}
+
+// ======================================================================
+// TREE VIEW
+// ======================================================================
+//
+// A list whose rows are indented and carry a twisty. The twisty is
+// drawn from the same triangle as the dropdown arrow in wave 2 -- one
+// arrow shape in the library, not two that slowly stop matching.
+fn draw_tree(c: *mut render.Ctx, e: *mut widget.Widget) {
+    draw_list(c, e)
+}
+
+// The twisty: a triangle, pointing right when closed and down when
+// open. Drawn with the painter's triangle, in the muted text colour.
+fn draw_twisty(c: *mut render.Ctx, x: f64, y: f64, side: f64,
+    open: bool, col: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let k: u32 = render.color_of(c, col)
+    // A filled triangle from horizontal runs -- the painter has no
+    // triangle, and a glyph would depend on the font being there.
+    var i: f64 = 0.0
+    if open {
+        // Pointing down: a row that gets narrower from the top.
+        while i < side / 2.0 {
+            painter.surface(z, x + i, y + i, side - 2.0 * i, 1.0, k)
+            i = i + 1.0
+        }
+    } else {
+        // Pointing right: a column that gets narrower from the left.
+        while i < side / 2.0 {
+            painter.surface(z, x + i, y + i, 1.0, side - 2.0 * i, k)
+            i = i + 1.0
+        }
+    }
+}
+
+// ONE TREE ROW. `depth` is the indent level, `has_kids` says whether a
+// twisty is drawn at all -- a leaf has none, and the text still lines
+// up with the others because the space is kept either way.
+fn draw_tree_row(c: *mut render.Ctx, e: *mut widget.Widget, i: usize,
+    p: u64, n: usize, depth: usize, has_kids: bool, open: bool,
+    hover: bool, selected: bool, disabled: bool) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let r: FRect = list_row_rect(c, e, i)
+    if r.y + r.h > widget.w_y(e) + widget.w_h(e) {
+        return
+    }
+    var row: widget.Widget = row_part(c, r.x, r.y, r.w, r.h, hover,
+        selected, disabled, false)
+    let rs: *mut style.Style = widget.w_style(&row)
+    *rs = style.style_set_bg(*rs, row_bg(&row))
+    *rs = style.style_set_radius(*rs, (*fo).r_field)
+    render.draw_base(c, &row)
+
+    let padx: f64 = render.len_of(c, (*fo).sp_s)
+    let step: f64 = render.len_of(c, (*fo).sp_m)
+    let side: f64 = render.len_of(c, (*fo).sp_s)
+    let ind: f64 = r.x + padx + (depth as f64) * step
+
+    let fg: u32 = row_fg(&row)
+    if has_kids {
+        var col: u32 = fg
+        if widget.w_is_disabled(&row) {
+            col = style.color_token(style.TOK_TEXT_DISABLED)
+        }
+        draw_twisty(c, ind, r.y + (r.h - side) / 2.0, side, open, col)
+    }
+    let tx: f64 = ind + side + render.len_of(c, (*fo).sp_xs)
+    cell_text(c, p, n, tx, r.y, r.x + r.w - padx - tx, r.h, fg,
+        style.ALIGN_LEFT, false, 0)
+}
+
+// ======================================================================
+// CARD
+// ======================================================================
+//
+// A raised surface with a radius, for grouping. It is the one control
+// that is allowed to be nothing but a surface -- but it still goes
+// through draw_base, so its hover state and dark mode work like
+// everywhere else.
+fn draw_card(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s,
+            style.color_token(style.TOK_SURFACE_RAISED))
+    }
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        *s = style.style_set_radius(*s, (*fo).r_panel)
+    }
+    render.draw_base(c, e)
+
+    if widget.w_text_len(e) != 0 {
+        let padx: f64 = render.len_of(c, (*fo).sp_m)
+        let pady: f64 = render.len_of(c, (*fo).sp_s)
+        var fg: u32 = style.color_token(style.TOK_TEXT)
+        if widget.w_is_disabled(e) {
+            fg = style.color_token(style.TOK_TEXT_DISABLED)
+        }
+        cell_text(c, widget.w_text(e), widget.w_text_len(e),
+            widget.w_x(e) + padx, widget.w_y(e) + pady,
+            widget.w_w(e) - 2.0 * padx, row_height(c), fg,
+            style.ALIGN_LEFT, false, 0)
+    }
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// BADGE
+// ======================================================================
+//
+// A small pill with a count or a word in it. Its colour says what it
+// means, and the four meanings come from the theme (accent, error,
+// warning, success) -- a badge with a hand-picked red would be the
+// only red in the system that does not change with the theme.
+const BADGE_NEUTRAL: u32 = 0
+const BADGE_ACCENT: u32 = 1
+const BADGE_ERROR: u32 = 2
+const BADGE_WARNING: u32 = 3
+const BADGE_SUCCESS: u32 = 4
+
+fn badge_bg(tone: u32) -> u32 {
+    if tone == BADGE_ACCENT { return style.color_token(style.TOK_ACCENT) }
+    if tone == BADGE_ERROR { return style.color_token(style.TOK_ERROR) }
+    if tone == BADGE_WARNING { return style.color_token(style.TOK_WARNING) }
+    if tone == BADGE_SUCCESS { return style.color_token(style.TOK_SUCCESS) }
+    return style.color_token(style.TOK_BUTTON)
+}
+
+// The text colour on a badge. On a coloured badge it is the
+// on-accent colour, on the neutral one the normal text -- decided
+// here, with the surface, for the reason written at row_fg.
+fn badge_fg(tone: u32) -> u32 {
+    if tone == BADGE_NEUTRAL {
+        return style.color_token(style.TOK_TEXT)
+    }
+    return style.color_token(style.TOK_TEXT_ON_ACCENT)
+}
+
+// The badge tone travels in the widget's VALUE -- a badge needs one
+// number and it has one (see widget.Widget.value).
+fn draw_badge(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    var tone: u32 = widget.w_value(e) as u32
+
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s, badge_bg(tone))
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        // Half the height = a pill. The radius is clamped by
+        // painter.path_round, so a big number is safe.
+        *s = style.style_set_radius(*s, (*fo).r_button)
+    }
+    render.draw_base(c, e)
+
+    if widget.w_text_len(e) != 0 {
+        var fg: u32 = badge_fg(tone)
+        if widget.w_is_disabled(e) {
+            fg = style.color_token(style.TOK_TEXT_DISABLED)
+        }
+        let px: f64 = render.len_of(c, (*fo).font)
+        cell_text(c, widget.w_text(e), widget.w_text_len(e),
+            widget.w_x(e), widget.w_y(e), widget.w_w(e),
+            widget.w_h(e), fg, style.ALIGN_CENTER, true, (*fo).font)
+    }
+}
+
+// How wide a badge has to be for its text -- so the caller does not
+// guess and cut the text off.
+fn badge_size(c: *mut render.Ctx, p: u64, n: usize, w: *mut f64,
+    h: *mut f64) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let px: f64 = render.len_of(c, (*fo).font)
+    let padx: f64 = render.len_of(c, (*fo).sp_s)
+    let pady: f64 = render.len_of(c, (*fo).sp_xs)
+    *w = painter.text_width(z, p, n, px) + 2.0 * padx
+    *h = painter.font_ascent(z, px) + painter.font_descent(z, px)
+        + 2.0 * pady
+}
+
+// ======================================================================
+// MODAL DIALOG
+// ======================================================================
+//
+// THE SCRIM first, then the panel. The scrim covers the WHOLE window --
+// see the note at the top of this file about why it is not a rectangle
+// under the panel.
+//
+// The scrim colour comes from the theme's base with an alpha, so it
+// darkens in light mode and lightens nothing in dark mode: in both it
+// pushes the window back.
+fn draw_scrim(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    painter.surface(z, x, y, w, h, theme.scrim_color(m))
+}
+
+// The dialog panel: a raised surface with a title, a body area and a
+// row of buttons at the bottom. The caller draws his own content into
+// `dialog_body_rect` -- with the CONTROLS of this library, not with
+// his own painting.
+fn draw_dialog(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s,
+            style.color_token(style.TOK_SURFACE))
+    }
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        *s = style.style_set_radius(*s, (*fo).r_panel)
+    }
+    render.draw_base(c, e)
+
+    // The title bar. A separator under it, the same line as a menu's.
+    if widget.w_text_len(e) != 0 {
+        let tr: FRect = dialog_title_rect(c, e)
+        let padx: f64 = render.len_of(c, (*fo).sp_m)
+        cell_text(c, widget.w_text(e), widget.w_text_len(e),
+            tr.x + padx, tr.y, tr.w - 2.0 * padx, tr.h,
+            style.color_token(style.TOK_TEXT), style.ALIGN_LEFT,
+            true, (*fo).font)
+        painter.surface(z, tr.x, tr.y + tr.h, tr.w, 1.0,
+            render.color_of(c,
+                style.color_token(style.TOK_SEPARATOR)))
+    }
+}
+
+fn dialog_title_rect(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let px: f64 = render.len_of(c, (*fo).font)
+    let h: f64 = painter.font_ascent(z, px) + painter.font_descent(z, px)
+        + 2.0 * render.len_of(c, (*fo).sp_s)
+    return FRect {
+        x: widget.w_x(e) + bw,
+        y: widget.w_y(e) + bw,
+        w: widget.w_w(e) - 2.0 * bw,
+        h: h,
+    }
+}
+
+// The row at the bottom where OK and Cancel go.
+fn dialog_buttons_rect(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let pad: f64 = render.len_of(c, (*fo).sp_m)
+    let h: f64 = row_height(c) + 2.0 * render.len_of(c, (*fo).sp_xs)
+    return FRect {
+        x: widget.w_x(e) + bw + pad,
+        y: widget.w_y(e) + widget.w_h(e) - bw - pad - h,
+        w: widget.w_w(e) - 2.0 * (bw + pad),
+        h: h,
+    }
+}
+
+// What is left in the middle: the caller's area.
+fn dialog_body_rect(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let pad: f64 = render.len_of(c, (*fo).sp_m)
+    let tr: FRect = dialog_title_rect(c, e)
+    let br: FRect = dialog_buttons_rect(c, e)
+    let top: f64 = tr.y + tr.h + pad
+    return FRect {
+        x: tr.x + pad,
+        y: top,
+        w: tr.w - 2.0 * pad,
+        h: br.y - pad - top,
+    }
+}
+
+// ======================================================================
+// FILE OPEN / SAVE DIALOG
+// ======================================================================
+//
+// Built ENTIRELY from what is already here: the dialog frame, a list
+// for the files, a text box for the name and two buttons. It paints
+// nothing of its own -- that is the point. A bug in the list is fixed
+// once and this dialog is fixed with it.
+const FILE_OPEN: u32 = 0
+const FILE_SAVE: u32 = 1
+
+// The list of files inside the dialog.
+fn filedialog_list_rect(c: *mut render.Ctx, e: *mut widget.Widget,
+    mode: u32) -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let b: FRect = dialog_body_rect(c, e)
+    if mode == FILE_OPEN {
+        return b
+    }
+    // On SAVE a name field sits underneath it.
+    let gap: f64 = render.len_of(c, (*fo).sp_s)
+    let nh: f64 = row_height(c) + 2.0 * render.len_of(c, (*fo).sp_xs)
+    return FRect { x: b.x, y: b.y, w: b.w, h: b.h - nh - gap }
+}
+
+// The name field -- only on SAVE.
+fn filedialog_name_rect(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let b: FRect = dialog_body_rect(c, e)
+    let nh: f64 = row_height(c) + 2.0 * render.len_of(c, (*fo).sp_xs)
+    return FRect {
+        x: b.x, y: b.y + b.h - nh, w: b.w, h: nh,
+    }
+}
+
+// The frame of a file dialog. The caller then draws the rows with
+// `draw_list_row` and the buttons with `render.draw_widget` -- both
+// already exist, and that is why this function is four lines long.
+fn draw_filedialog(c: *mut render.Ctx, e: *mut widget.Widget,
+    mode: u32) {
+    draw_dialog(c, e)
+    let lr: FRect = filedialog_list_rect(c, e, mode)
+    var lst: widget.Widget = widget.widget_new(widget.KIND_LIST)
+    widget.w_place(&lst, lr.x, lr.y, lr.w, lr.h)
+    draw_list(c, &lst)
+    if mode == FILE_SAVE {
+        let nr: FRect = filedialog_name_rect(c, e)
+        var nm: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+        widget.w_place(&nm, nr.x, nr.y, nr.w, nr.h)
+        render.draw_widget(c, &nm)
+    }
+}
+
+// ======================================================================
+// COLOUR PICKER
+// ======================================================================
+//
+// A saturation/value FIELD plus a hue STRIP, and a row of swatches.
+// This is the one place in the library where colours are computed
+// instead of taken from the theme -- and that is correct, because the
+// colours ARE the content here, not the styling. The FRAME around them
+// still comes from the theme.
+//
+// The maths is HSV -> RGB, written out, because the alternative is a
+// table that nobody can check.
+fn hsv_rgb(h: f64, s: f64, v: f64) -> u32 {
+    var hh: f64 = h
+    while hh >= 360.0 { hh = hh - 360.0 }
+    while hh < 0.0 { hh = hh + 360.0 }
+    let i: i64 = (hh / 60.0) as i64
+    let f: f64 = hh / 60.0 - (i as f64)
+    let p: f64 = v * (1.0 - s)
+    let q: f64 = v * (1.0 - s * f)
+    let t: f64 = v * (1.0 - s * (1.0 - f))
+    var r: f64 = 0.0
+    var g: f64 = 0.0
+    var b: f64 = 0.0
+    if i == 0 as i64 {
+        r = v
+        g = t
+        b = p
+    }
+    if i == 1 as i64 {
+        r = q
+        g = v
+        b = p
+    }
+    if i == 2 as i64 {
+        r = p
+        g = v
+        b = t
+    }
+    if i == 3 as i64 {
+        r = p
+        g = q
+        b = v
+    }
+    if i == 4 as i64 {
+        r = t
+        g = p
+        b = v
+    }
+    if i >= 5 as i64 {
+        r = v
+        g = p
+        b = q
+    }
+    let ri: u32 = (r * 255.0 + 0.5) as u32
+    let gi: u32 = (g * 255.0 + 0.5) as u32
+    let bi: u32 = (b * 255.0 + 0.5) as u32
+    return 4278190080 as u32 | (ri << 16) | (gi << 8) | bi
+}
+
+// The big square: saturation left to right, value top to bottom, at
+// the hue the widget's value holds.
+fn colorpicker_field_rect(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let strip: f64 = render.len_of(c, (*fo).sp_m)
+    let gap: f64 = render.len_of(c, (*fo).sp_s)
+    return FRect {
+        x: widget.w_x(e) + bw,
+        y: widget.w_y(e) + bw,
+        w: widget.w_w(e) - 2.0 * bw,
+        h: widget.w_h(e) - 2.0 * bw - strip - gap,
+    }
+}
+
+fn colorpicker_hue_rect(c: *mut render.Ctx, e: *mut widget.Widget)
+    -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let strip: f64 = render.len_of(c, (*fo).sp_m)
+    return FRect {
+        x: widget.w_x(e) + bw,
+        y: widget.w_y(e) + widget.w_h(e) - bw - strip,
+        w: widget.w_w(e) - 2.0 * bw,
+        h: strip,
+    }
+}
+
+// The hue the picker is showing, 0..359, from the widget's value.
+fn colorpicker_hue(e: *mut widget.Widget) -> f64 {
+    var h: i64 = widget.w_value(e)
+    if h < 0 as i64 { h = 0 as i64 }
+    if h > 359 as i64 { h = 359 as i64 }
+    return h as f64
+}
+
+fn draw_colorpicker(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s, style.color_token(style.TOK_FIELD))
+    }
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        *s = style.style_set_radius(*s, (*fo).r_field)
+    }
+    render.draw_base(c, e)
+
+    let hue: f64 = colorpicker_hue(e)
+    let fr: FRect = colorpicker_field_rect(c, e)
+    // A disabled picker shows GREY, not colours -- a colour field that
+    // still glows when it cannot be used is a lie about the state.
+    let off: bool = widget.w_is_disabled(e)
+
+    var x: f64 = 0.0
+    while x < fr.w {
+        let sat: f64 = x / fr.w
+        var y: f64 = 0.0
+        while y < fr.h {
+            let val: f64 = 1.0 - y / fr.h
+            var col: u32 = hsv_rgb(hue, sat, val)
+            if off {
+                col = hsv_rgb(0.0, 0.0, val)
+            }
+            painter.surface(z, fr.x + x, fr.y + y, 1.0, 1.0, col)
+            y = y + 1.0
+        }
+        x = x + 1.0
+    }
+
+    let hr: FRect = colorpicker_hue_rect(c, e)
+    var hx: f64 = 0.0
+    while hx < hr.w {
+        var col: u32 = hsv_rgb(360.0 * hx / hr.w, 1.0, 1.0)
+        if off {
+            col = hsv_rgb(0.0, 0.0, 0.6)
+        }
+        painter.surface(z, hr.x + hx, hr.y, 1.0, hr.h, col)
+        hx = hx + 1.0
+    }
+
+    // The marker on the hue strip, so the picker shows WHICH hue it is
+    // on. Drawn in the border colour from the theme.
+    let mx: f64 = hr.x + hr.w * hue / 360.0
+    painter.surface(z, mx - 1.0, hr.y, 2.0, hr.h,
+        render.color_of(c, style.color_token(style.TOK_TEXT_ON_ACCENT)))
+
+    render.draw_focus_ring(c, e)
+}
+
+// WHICH COLOUR a point in the field means. The counterpart to the
+// drawing, so picking and showing cannot disagree.
+fn colorpicker_color_at(c: *mut render.Ctx, e: *mut widget.Widget,
+    px: f64, py: f64) -> u32 {
+    let fr: FRect = colorpicker_field_rect(c, e)
+    if fr.w <= 0.0 || fr.h <= 0.0 {
+        return hsv_rgb(0.0, 0.0, 0.0)
+    }
+    var sat: f64 = (px - fr.x) / fr.w
+    var val: f64 = 1.0 - (py - fr.y) / fr.h
+    if sat < 0.0 { sat = 0.0 }
+    if sat > 1.0 { sat = 1.0 }
+    if val < 0.0 { val = 0.0 }
+    if val > 1.0 { val = 1.0 }
+    return hsv_rgb(colorpicker_hue(e), sat, val)
+}
+
+// The hue a point on the STRIP means -- for dragging the hue.
+fn colorpicker_hue_at(c: *mut render.Ctx, e: *mut widget.Widget,
+    px: f64) -> i64 {
+    let hr: FRect = colorpicker_hue_rect(c, e)
+    if hr.w <= 0.0 {
+        return 0 as i64
+    }
+    var t: f64 = (px - hr.x) / hr.w
+    if t < 0.0 { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    var h: i64 = (t * 360.0) as i64
+    if h > 359 as i64 { h = 359 as i64 }
+    return h
+}
+
+// ======================================================================
+// DATE PICKER
+// ======================================================================
+//
+// A month grid: seven columns, six rows, a header with the weekday
+// letters. The days are ROWS in the same sense as a list's -- they go
+// through row_bg/row_fg, so "today" and "selected" look the way a
+// selected row looks everywhere else.
+//
+// THE CALENDAR MATHS IS IN HERE and not in the caller, because every
+// caller would get the leap year wrong in his own way.
+fn is_leap(y: i64) -> bool {
+    if y % (4 as i64) != 0 as i64 { return false }
+    if y % (100 as i64) != 0 as i64 { return true }
+    return y % (400 as i64) == 0 as i64
+}
+
+fn days_in_month(y: i64, mo: i64) -> i64 {
+    if mo == 2 as i64 {
+        if is_leap(y) { return 29 as i64 }
+        return 28 as i64
+    }
+    if mo == 4 as i64 || mo == 6 as i64 || mo == 9 as i64
+        || mo == 11 as i64 {
+        return 30 as i64
+    }
+    return 31 as i64
+}
+
+// Which weekday the 1st falls on, 0 = Monday. Sakamoto's method --
+// short, and it is checked in the acceptance against known dates.
+fn weekday(y: i64, mo: i64, d: i64) -> i64 {
+    var yy: i64 = y
+    var t: [i64; 12] = [0 as i64, 3 as i64, 2 as i64, 5 as i64,
+        0 as i64, 3 as i64, 5 as i64, 1 as i64, 4 as i64, 6 as i64,
+        2 as i64, 4 as i64]
+    if mo < 3 as i64 {
+        yy = yy - 1 as i64
+    }
+    let w: i64 = (yy + yy / (4 as i64) - yy / (100 as i64)
+        + yy / (400 as i64) + t[(mo - 1 as i64) as usize] + d)
+        % (7 as i64)
+    // Sakamoto gives 0 = Sunday; the week starts on Monday here.
+    return (w + 6 as i64) % (7 as i64)
+}
+
+// One cell of the grid.
+fn datepicker_cell_rect(c: *mut render.Ctx, e: *mut widget.Widget,
+    col: i64, row: i64) -> FRect {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let bw: f64 = render.len_of(c, (*fo).border_w)
+    let pad: f64 = render.len_of(c, (*fo).sp_s)
+    let x0: f64 = widget.w_x(e) + bw + pad
+    let y0: f64 = widget.w_y(e) + bw + pad
+    let iw: f64 = widget.w_w(e) - 2.0 * (bw + pad)
+    let ih: f64 = widget.w_h(e) - 2.0 * (bw + pad)
+    let cw: f64 = iw / 7.0
+    // Seven rows: one for the weekday letters, six for the days.
+    let ch: f64 = ih / 7.0
+    return FRect {
+        x: x0 + (col as f64) * cw,
+        y: y0 + (row as f64) * ch,
+        w: cw,
+        h: ch,
+    }
+}
+
+// The picker shows the month held in its value as y*12+(m-1).
+fn datepicker_year(e: *mut widget.Widget) -> i64 {
+    return widget.w_value(e) / (12 as i64)
+}
+fn datepicker_month(e: *mut widget.Widget) -> i64 {
+    return widget.w_value(e) % (12 as i64) + 1 as i64
+}
+fn datepicker_value(y: i64, mo: i64) -> i64 {
+    return y * (12 as i64) + (mo - 1 as i64)
+}
+
+// `sel` is the selected day of the month, or 0 for none. `today` the
+// same, for the day that gets the ring.
+fn draw_datepicker(c: *mut render.Ctx, e: *mut widget.Widget,
+    sel: i64, today: i64, hover_day: i64, wd_p: *mut u64,
+    wd_n: *mut usize, num_p: *mut u64, num_n: *mut usize) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s,
+            style.color_token(style.TOK_SURFACE))
+    }
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        *s = style.style_set_radius(*s, (*fo).r_field)
+    }
+    render.draw_base(c, e)
+
+    let dis: bool = widget.w_is_disabled(e)
+
+    // The weekday letters.
+    var i: i64 = 0 as i64
+    while i < 7 as i64 {
+        let r: FRect = datepicker_cell_rect(c, e, i, 0 as i64)
+        cell_text(c, *(((wd_p as u64) + (i as usize) as u64 * 8) as *mut u64), *(((wd_n as u64) + (i as usize) as u64 * 8) as *mut usize),
+            r.x, r.y, r.w, r.h,
+            style.color_token(style.TOK_TEXT_MUTED),
+            style.ALIGN_CENTER, true, (*fo).font)
+        i = i + 1 as i64
+    }
+
+    let y: i64 = datepicker_year(e)
+    let mo: i64 = datepicker_month(e)
+    let first: i64 = weekday(y, mo, 1 as i64)
+    let n: i64 = days_in_month(y, mo)
+
+    var d: i64 = 1 as i64
+    while d <= n {
+        let idx: i64 = first + d - 1 as i64
+        let col: i64 = idx % (7 as i64)
+        let row: i64 = idx / (7 as i64) + 1 as i64
+        if row <= 6 as i64 {
+            let r: FRect = datepicker_cell_rect(c, e, col, row)
+            var cell: widget.Widget = row_part(c, r.x, r.y, r.w, r.h,
+                d == hover_day && !dis, d == sel, dis, false)
+            let cs: *mut style.Style = widget.w_style(&cell)
+            *cs = style.style_set_bg(*cs, row_bg(&cell))
+            *cs = style.style_set_radius(*cs, (*fo).r_button)
+            render.draw_base(c, &cell)
+
+            // Today gets the accent ring, so it is visible even when
+            // another day is selected.
+            if d == today && d != sel {
+                let z: *mut painter.Painter = render.ctx_painter(c)
+                painter.round_ring(z, r.x, r.y, r.w, r.h,
+                    render.len_of(c, (*fo).r_button) as f64, 1.0,
+                    render.color_of(c,
+                        style.color_token(style.TOK_ACCENT)))
+            }
+            cell_text(c, *(((num_p as u64) + (d as usize) as u64 * 8) as *mut u64), *(((num_n as u64) + (d as usize) as u64 * 8) as *mut usize),
+                r.x, r.y, r.w, r.h, row_fg(&cell),
+                style.ALIGN_CENTER, true, (*fo).font)
+        }
+        d = d + 1 as i64
+    }
+    render.draw_focus_ring(c, e)
+}
+
+// WHICH DAY is under a point, or 0. The counterpart of the drawing.
+fn datepicker_day_at(c: *mut render.Ctx, e: *mut widget.Widget,
+    px: f64, py: f64) -> i64 {
+    if !widget.w_hits(e, px, py) {
+        return 0 as i64
+    }
+    let y: i64 = datepicker_year(e)
+    let mo: i64 = datepicker_month(e)
+    let first: i64 = weekday(y, mo, 1 as i64)
+    let n: i64 = days_in_month(y, mo)
+    var d: i64 = 1 as i64
+    while d <= n {
+        let idx: i64 = first + d - 1 as i64
+        let col: i64 = idx % (7 as i64)
+        let row: i64 = idx / (7 as i64) + 1 as i64
+        if row <= 6 as i64 {
+            let r: FRect = datepicker_cell_rect(c, e, col, row)
+            if px >= r.x && px < r.x + r.w && py >= r.y
+                && py < r.y + r.h {
+                return d
+            }
+        }
+        d = d + 1 as i64
+    }
+    return 0 as i64
+}
+
+// ======================================================================
+// THE DISPATCHER
+// ======================================================================
+//
+// `draw_any` IS THE ONE AN APPLICATION CALLS -- now for all three
+// waves. It chains in front of wave 2 exactly the way wave2.draw_wave2
+// was built to allow, and neither of them had to change for it.
+//
+// The controls that need DATA to be drawn -- table rows, tree rows,
+// the date grid -- are not in here: a dispatcher that takes only a
+// widget cannot invent a row of cells. They keep their own entry
+// points, and this one draws their FRAME, which is what a generic
+// "draw this widget" can honestly do.
+fn draw_wave3(c: *mut render.Ctx, e: *mut widget.Widget) -> bool {
+    let k: u32 = widget.w_kind(e)
+    if k == widget.KIND_LIST {
+        draw_list(c, e)
+        return true
+    }
+    if k == widget.KIND_TABLE {
+        draw_table(c, e)
+        return true
+    }
+    if k == widget.KIND_TREE {
+        draw_tree(c, e)
+        return true
+    }
+    if k == widget.KIND_CARD {
+        draw_card(c, e)
+        return true
+    }
+    if k == widget.KIND_BADGE {
+        draw_badge(c, e)
+        return true
+    }
+    return false
+}
+
+// THE one entry point for an application.
+fn draw_any(c: *mut render.Ctx, e: *mut widget.Widget) {
+    if draw_wave3(c, e) {
+        return
+    }
+    wave2.draw_any(c, e)
+}
