@@ -1,0 +1,551 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/control.fi -- THE PART THAT MAKES A CONTROL RESPOND.
+//
+// ========================================================= WHY IT EXISTS
+//
+// Justin, 11.09.2026, on wave 2: "Hover must really work (mouse move ->
+// state change -> repaint), not just a field in the struct." And:
+// "A slider must be draggable and deliver a VALUE, not only look drawn."
+//
+// That is the whole reason this file is separate from widget.fi and
+// from render.fi. Wave 1 could get away without it, because a button
+// whose `hover` bit somebody else sets still LOOKS right in a gallery
+// picture. A slider cannot: whether it works is not decided by how it
+// is painted but by whether pulling the mouse changes the number.
+//
+// THE MISTAKE THIS PREVENTS is the one the brief names outright --
+// FAKE SWITCHES. A checkbox that paints a tick but never flips, a
+// slider that shows a handle at a fixed place: both look perfect in a
+// screenshot and are worth nothing. Whoever puts the event handling in
+// the application instead of the library gets exactly that, because
+// every application then invents its own -- and nineteen of twenty
+// invent it wrong.
+//
+// ================================================== WHAT A PANEL IS
+//
+// A `Panel` is a LIST OF WIDGETS THE CALLER OWNS plus three numbers:
+// who is under the pointer, who is being pressed, who has the focus.
+// Those three are exactly the state that cannot live in a single
+// widget, because they are relationships BETWEEN widgets: only one
+// widget at a time can be hovered, and that is a property of the set,
+// not of the element.
+//
+// The widgets stay the caller's. A Panel holds a pointer to his array
+// and a count -- no allocation and no copy. That is the same decision
+// widget.fi made in E1 and E3, and for the same reason. The file sits
+// in the app profile only because widget.fi does; it asks for no
+// memory of its own and would otherwise be core-clean.
+//
+// ======================================= WHY IT RETURNS "PLEASE REPAINT"
+//
+// Every event function gives back a bitmask: what CHANGED. Nothing
+// changed -> 0 -> the caller does not repaint. That is not an
+// optimisation for its own sake, it is the difference between a
+// window that redraws sixty times a second while the mouse sits still
+// and one that does not.
+//
+// The caller cannot forget it either: he gets the answer as the return
+// value of the call he had to make anyway.
+//
+// ==================================================== WHAT IS NOT HERE
+//
+// S1 NO drawing. This file never touches a canvas; it imports neither
+//    painter nor render. Event handling and painting are two jobs,
+//    and a file that does both cannot be tested without a screen.
+// S2 NO timer. A tooltip appears after a delay -- the delay is COUNTED
+//    by the caller, who owns the clock. This file only takes the
+//    answer ("the pointer has now rested long enough") and turns it
+//    into a state.
+// S3 NO keyboard focus chain beyond tab order. Which key does what is
+//    the widget's business (lib/fui/editor.fi does it for text).
+import fui.widget
+
+export {
+    Panel, panel_new, panel_attach, panel_count, panel_widget,
+    panel_hot, panel_pressed, panel_focus,
+    panel_set_focus, panel_clear,
+    mouse_move, mouse_down, mouse_up, mouse_leave,
+    key_tab, activate_focused,
+    CH_NONE, CH_REPAINT, CH_VALUE, CH_ACTIVATE, CH_FOCUS,
+    NOBODY,
+    hit_test,
+    value_from_x, value_from_y, clamp_i64,
+    track_begin, track_active, track_end, track_widget,
+    drag_value,
+}
+
+// ===================================================== THE CHANGE BITS
+//
+// What came of an event. They combine: a click on a checkbox changes
+// the value AND wants a repaint AND counts as an activation.
+const CH_NONE: u32 = 0
+const CH_REPAINT: u32 = 1    // the picture is stale
+const CH_VALUE: u32 = 2      // the value of a widget moved
+const CH_ACTIVATE: u32 = 4   // a button was really triggered
+const CH_FOCUS: u32 = 8      // the focus moved
+
+// "no widget". Not 0 -- 0 is the first widget.
+const NOBODY: usize = 18446744073709551615
+
+// ============================================================ THE PANEL
+//
+// `p` is the caller's array of `widget.Widget`. It is held as a u64 and
+// not as a typed pointer, because a struct in the kernel profile must
+// not carry a pointer into GC memory -- the same reason render.Ctx
+// keeps its theme as u64.
+struct Panel {
+    p: u64,        // *mut widget.Widget -- the caller's array
+    n: usize,      // how many
+    hot: usize,    // under the pointer, or NOBODY
+    press: usize,  // being held down, or NOBODY
+    focus: usize,  // has the keyboard, or NOBODY
+    // The drag. `track` is the widget the button went down on and that
+    // keeps receiving the movement until it is released -- ALSO when
+    // the pointer has long left it. That is the point: whoever pulls a
+    // slider and slips off it by two pixels does not want the handle
+    // to jump back.
+    track: usize,
+    grab: i64,     // the offset inside the handle at the moment of grabbing
+}
+
+fn panel_new() -> Panel {
+    return Panel { p: 0, n: 0, hot: NOBODY, press: NOBODY,
+        focus: NOBODY, track: NOBODY, grab: 0 }
+}
+
+// The caller hands his array over. Nothing is copied.
+fn panel_attach(s: *mut Panel, p: u64, n: usize) {
+    (*s).p = p
+    (*s).n = n
+    (*s).hot = NOBODY
+    (*s).press = NOBODY
+    (*s).track = NOBODY
+}
+
+fn panel_count(s: *mut Panel) -> usize { return (*s).n }
+
+// The i-th widget. The arithmetic is the one the compiler would do --
+// it stands here because the array is held as a raw address.
+fn panel_widget(s: *mut Panel, i: usize) -> *mut widget.Widget {
+    return ((*s).p + ((i * widget_size()) as u64)) as *mut widget.Widget
+}
+
+// How big one widget is. `size_of` is not available in stage 0, so it
+// is measured: the distance between element 0 and element 1 of a real
+// array. That is exact and survives every change to the struct -- a
+// hard-coded number would not.
+fn widget_size() -> usize {
+    var probe: [widget.Widget; 2] = [widget.widget_new(widget.KIND_NONE); 2]
+    let a: usize = (&probe[0]) as usize
+    let b: usize = (&probe[1]) as usize
+    return b - a
+}
+
+fn panel_hot(s: *mut Panel) -> usize { return (*s).hot }
+fn panel_pressed(s: *mut Panel) -> usize { return (*s).press }
+fn panel_focus(s: *mut Panel) -> usize { return (*s).focus }
+
+// ============================================================ THE HIT
+//
+// WHO IS UNDER THE POINTER. Searched from the BACK forwards, because
+// what was painted last lies on top -- a menu that opens over a button
+// must take the click, not the button under it.
+//
+// A disabled widget is not hit; `widget.w_hits` sees to that, and the
+// reason stands there: it would swallow clicks meant for what lies
+// beneath.
+fn hit_test(s: *mut Panel, x: f64, y: f64) -> usize {
+    if (*s).n == 0 {
+        return NOBODY
+    }
+    var i: usize = (*s).n
+    while i > 0 {
+        i = i - 1
+        let e: *mut widget.Widget = panel_widget(s, i)
+        if widget.w_hits(e, x, y) {
+            return i
+        }
+    }
+    return NOBODY
+}
+
+// ==================================================== THE MOUSE MOVES
+//
+// THIS IS THE FUNCTION JUSTIN'S POINT IS ABOUT. Hover is not a field
+// somebody sets -- it is what happens here:
+//
+//   1. work out who is under the pointer now
+//   2. if that is somebody else than before: clear the old bit, set
+//      the new one
+//   3. say that the picture is stale
+//
+// Step 3 is the one that is forgotten, and then hover "works" in the
+// data and not on the screen.
+//
+// WHILE A BUTTON IS HELD DOWN hover does not wander: the pressed
+// widget keeps the pointer until it is released. Otherwise dragging
+// across a toolbar would light up every button on the way.
+fn mouse_move(s: *mut Panel, x: f64, y: f64) -> u32 {
+    // A drag beats everything: the tracked widget gets the movement.
+    if (*s).track != NOBODY {
+        return drag_move(s, x, y)
+    }
+
+    let neu: usize = hit_test(s, x, y)
+    var ch: u32 = CH_NONE
+
+    if neu == (*s).hot {
+        return CH_NONE
+    }
+
+    // the old one loses the hover
+    if (*s).hot != NOBODY && (*s).hot < (*s).n {
+        widget.w_set_hover(panel_widget(s, (*s).hot), false)
+        ch = ch | CH_REPAINT
+    }
+    // the new one gets it
+    if neu != NOBODY {
+        widget.w_set_hover(panel_widget(s, neu), true)
+        ch = ch | CH_REPAINT
+    }
+    (*s).hot = neu
+
+    // A widget being held down keeps its pressed look only while the
+    // pointer is on it. That is the behaviour of every system: press,
+    // slide off, and the button rises again -- releasing outside must
+    // not trigger.
+    if (*s).press != NOBODY && (*s).press < (*s).n {
+        let e: *mut widget.Widget = panel_widget(s, (*s).press)
+        widget.w_set_active(e, (*s).press == neu)
+        ch = ch | CH_REPAINT
+    }
+    return ch
+}
+
+// ===================================================== THE BUTTON GOES DOWN
+//
+// Sets `active` and moves the focus. Both belong together: a click
+// takes the focus away from wherever it was, and that has to be
+// visible at once.
+fn mouse_down(s: *mut Panel, x: f64, y: f64) -> u32 {
+    let i: usize = hit_test(s, x, y)
+    var ch: u32 = CH_REPAINT
+    if i == NOBODY {
+        // Clicking into empty space takes the focus away. Otherwise a
+        // ring stays standing on a widget nobody is working in.
+        if (*s).focus != NOBODY {
+            ch = ch | panel_set_focus(s, NOBODY)
+        }
+        return ch
+    }
+    let e: *mut widget.Widget = panel_widget(s, i)
+    widget.w_set_active(e, true)
+    (*s).press = i
+    ch = ch | panel_set_focus(s, i)
+
+    // A widget that carries a value takes the press as the start of a
+    // drag. WHICH widgets those are is decided by the kind -- and by
+    // that alone, so that a new kind does not have to be entered in
+    // three places.
+    if kind_drags(widget.w_kind(e)) {
+        ch = ch | track_begin(s, i, x, y)
+    }
+    return ch
+}
+
+// ==================================================== THE BUTTON COMES UP
+//
+// AN ACTIVATION ONLY COUNTS WHEN IT GOES UP ON THE SAME WIDGET. That
+// is not a detail: it is the way out every system offers -- press the
+// wrong button, slide off, release. Whoever triggers on the way down
+// takes that away.
+fn mouse_up(s: *mut Panel, x: f64, y: f64) -> u32 {
+    var ch: u32 = CH_NONE
+
+    if (*s).track != NOBODY {
+        ch = ch | track_end(s)
+    }
+
+    if (*s).press == NOBODY {
+        return ch
+    }
+    let i: usize = (*s).press
+    (*s).press = NOBODY
+    if i >= (*s).n {
+        return ch | CH_REPAINT
+    }
+    let e: *mut widget.Widget = panel_widget(s, i)
+    widget.w_set_active(e, false)
+    ch = ch | CH_REPAINT
+
+    // Really on it? Then it is an activation.
+    if widget.w_hits(e, x, y) {
+        ch = ch | CH_ACTIVATE
+        ch = ch | toggle_on_click(e)
+    }
+    return ch
+}
+
+// The pointer leaves the window. Everything that hangs on it goes out
+// -- a hover that stays standing when the mouse is elsewhere is the
+// most visible bug of the lot.
+fn mouse_leave(s: *mut Panel) -> u32 {
+    var ch: u32 = CH_NONE
+    if (*s).hot != NOBODY && (*s).hot < (*s).n {
+        widget.w_set_hover(panel_widget(s, (*s).hot), false)
+        ch = ch | CH_REPAINT
+    }
+    (*s).hot = NOBODY
+    if (*s).press != NOBODY && (*s).press < (*s).n {
+        widget.w_set_active(panel_widget(s, (*s).press), false)
+        ch = ch | CH_REPAINT
+    }
+    return ch
+}
+
+// ====================================================== WHAT A CLICK FLIPS
+//
+// A checkbox flips, a radio button switches on and switches its
+// siblings off, a toggle switch flips. A button does nothing -- it
+// has no value.
+//
+// THIS STANDS HERE AND NOT IN THE APPLICATION. That is the whole point
+// of the brief: whoever leaves the flipping to the caller gets a
+// checkbox that one program flips and the next does not.
+fn toggle_on_click(e: *mut widget.Widget) -> u32 {
+    let k: u32 = widget.w_kind(e)
+    if k == widget.KIND_CHECKBOX || k == widget.KIND_TOGGLE {
+        var v: i64 = widget.w_value(e)
+        // 2 is "partially" (the dash). A click out of partially goes
+        // to ON -- that is what the systems do, and it is the only
+        // answer that is not arbitrary.
+        if v == 0 {
+            v = 1
+        } else {
+            v = 0
+        }
+        widget.w_set_value(e, v)
+        widget.w_set_selected(e, v != 0)
+        return CH_VALUE
+    }
+    if k == widget.KIND_RADIO {
+        widget.w_set_value(e, 1)
+        widget.w_set_selected(e, true)
+        return CH_VALUE
+    }
+    if k == widget.KIND_TAB {
+        widget.w_set_selected(e, true)
+        return CH_VALUE
+    }
+    return CH_NONE
+}
+
+// Which kinds answer to being dragged. One list, so a new kind is
+// entered once.
+fn kind_drags(k: u32) -> bool {
+    return k == widget.KIND_SLIDER || k == widget.KIND_SCROLLBAR
+}
+
+// ============================================================ THE FOCUS
+fn panel_set_focus(s: *mut Panel, i: usize) -> u32 {
+    if (*s).focus == i {
+        return CH_NONE
+    }
+    if (*s).focus != NOBODY && (*s).focus < (*s).n {
+        widget.w_set_focus(panel_widget(s, (*s).focus), false)
+    }
+    if i != NOBODY && i < (*s).n {
+        // A disabled widget does not take the focus -- otherwise the
+        // tab order runs into a dead end.
+        if widget.w_is_disabled(panel_widget(s, i)) {
+            (*s).focus = NOBODY
+            return CH_REPAINT | CH_FOCUS
+        }
+        widget.w_set_focus(panel_widget(s, i), true)
+    }
+    (*s).focus = i
+    return CH_REPAINT | CH_FOCUS
+}
+
+// TAB AND SHIFT+TAB. Skips everything that cannot be focused -- a
+// label, a separator, anything disabled. Wraps around at the end,
+// because a focus that gets stuck at the last widget is a trap for
+// somebody working by keyboard.
+fn key_tab(s: *mut Panel, backwards: bool) -> u32 {
+    if (*s).n == 0 {
+        return CH_NONE
+    }
+    var start: usize = (*s).focus
+    var i: usize = 0
+    while i < (*s).n {
+        var k: usize = 0
+        if start == NOBODY {
+            if backwards {
+                k = (*s).n - 1 - i
+            } else {
+                k = i
+            }
+        } else {
+            if backwards {
+                // + n so the subtraction cannot go below zero
+                k = (start + (*s).n - 1 - i) % (*s).n
+            } else {
+                k = (start + 1 + i) % (*s).n
+            }
+        }
+        if can_focus(panel_widget(s, k)) {
+            return panel_set_focus(s, k)
+        }
+        i = i + 1
+    }
+    return CH_NONE
+}
+
+// What can take the focus. A label cannot -- it does nothing, and a
+// ring around it would only be in the way.
+fn can_focus(e: *mut widget.Widget) -> bool {
+    if widget.w_is_disabled(e) {
+        return false
+    }
+    let k: u32 = widget.w_kind(e)
+    if k == widget.KIND_LABEL || k == widget.KIND_SEPARATOR
+        || k == widget.KIND_TOOLTIP || k == widget.KIND_PROGRESS
+        || k == widget.KIND_BADGE || k == widget.KIND_CARD
+        || k == widget.KIND_GROUPBOX || k == widget.KIND_NONE {
+        return false
+    }
+    return true
+}
+
+// SPACE AND ENTER ON THE FOCUSED WIDGET. The keyboard equivalent of a
+// click, and it has to flip exactly the same things -- hence the same
+// function (`toggle_on_click`) and not a second copy of the rules.
+fn activate_focused(s: *mut Panel) -> u32 {
+    if (*s).focus == NOBODY || (*s).focus >= (*s).n {
+        return CH_NONE
+    }
+    let e: *mut widget.Widget = panel_widget(s, (*s).focus)
+    if widget.w_is_disabled(e) {
+        return CH_NONE
+    }
+    return CH_REPAINT | CH_ACTIVATE | toggle_on_click(e)
+}
+
+// ============================================================ THE DRAG
+//
+// THIS IS WHAT MAKES A SLIDER A SLIDER. Justin's condition: it must be
+// draggable and deliver a value.
+//
+// The values run 0..1000 (per mille) and not 0..100 or 0..1: a
+// slider 200 pixels wide has 200 positions, and with 0..100 every
+// second pixel would be the same number -- you feel that as juddering.
+// An integer and not a float, because a value that gets saved and read
+// back has to compare equal -- 0.1 does not.
+const VAL_MAX: i64 = 1000
+
+fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// WHERE THE POINTER SITS, AS A VALUE.
+//
+// The usable travel is not the full width: the handle has a width of
+// its own and its CENTRE is what points at the value. Whoever
+// forgets that gets a slider that reaches 1000 before the right edge
+// and never quite gets to 0.
+fn value_from_x(x: f64, left: f64, width: f64, handle: f64) -> i64 {
+    var travel: f64 = width - handle
+    if travel <= 0.0 {
+        return 0
+    }
+    let rel: f64 = x - left - handle / 2.0
+    let v: i64 = ((rel * (VAL_MAX as f64)) / travel) as i64
+    return clamp_i64(v, 0, VAL_MAX)
+}
+
+// The same downwards, for a vertical scrollbar. Counted from the TOP:
+// 0 is up, 1000 is down -- that is how a scroll position reads.
+fn value_from_y(y: f64, top: f64, height: f64, handle: f64) -> i64 {
+    var travel: f64 = height - handle
+    if travel <= 0.0 {
+        return 0
+    }
+    let rel: f64 = y - top - handle / 2.0
+    let v: i64 = ((rel * (VAL_MAX as f64)) / travel) as i64
+    return clamp_i64(v, 0, VAL_MAX)
+}
+
+// Grab it. The value jumps to where it was clicked -- that is what
+// every system does today, and it is the only behaviour that makes
+// sense on a touch screen.
+fn track_begin(s: *mut Panel, i: usize, x: f64, y: f64) -> u32 {
+    (*s).track = i
+    (*s).grab = 0
+    return drag_move(s, x, y)
+}
+
+fn track_active(s: *mut Panel) -> bool { return (*s).track != NOBODY }
+fn track_widget(s: *mut Panel) -> usize { return (*s).track }
+
+fn track_end(s: *mut Panel) -> u32 {
+    if (*s).track == NOBODY {
+        return CH_NONE
+    }
+    (*s).track = NOBODY
+    return CH_REPAINT
+}
+
+// The movement during a drag. Works out the new value and writes it
+// -- and ONLY reports CH_VALUE when it really changed, so that a
+// caller who saves on every change does not save a thousand times.
+fn drag_move(s: *mut Panel, x: f64, y: f64) -> u32 {
+    let i: usize = (*s).track
+    if i == NOBODY || i >= (*s).n {
+        return CH_NONE
+    }
+    let e: *mut widget.Widget = panel_widget(s, i)
+    let alt: i64 = widget.w_value(e)
+    let neu: i64 = drag_value(e, x, y)
+    if neu == alt {
+        return CH_NONE
+    }
+    widget.w_set_value(e, neu)
+    return CH_REPAINT | CH_VALUE
+}
+
+// WHICH VALUE A POINTER POSITION MEANS ON THIS WIDGET.
+//
+// Separate, so the acceptance can check the arithmetic without a
+// Panel and without events -- a number you can only get at through
+// three layers of mouse handling does not get checked.
+//
+// Which way round it runs follows the SHAPE and not the kind: a
+// scrollbar lying on its side is dragged horizontally like a slider.
+// That way a horizontal scrollbar needs no case of its own.
+fn drag_value(e: *mut widget.Widget, x: f64, y: f64) -> i64 {
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    if h > w {
+        // upright: the handle is as high as it is wide
+        return value_from_y(y, widget.w_y(e), h, w)
+    }
+    return value_from_x(x, widget.w_x(e), w, h)
+}
+
+// Everything off. For a caller who rebuilds his window.
+fn panel_clear(s: *mut Panel) {
+    var i: usize = 0
+    while i < (*s).n {
+        let e: *mut widget.Widget = panel_widget(s, i)
+        widget.w_set_hover(e, false)
+        widget.w_set_active(e, false)
+        widget.w_set_focus(e, false)
+        i = i + 1
+    }
+    (*s).hot = NOBODY
+    (*s).press = NOBODY
+    (*s).focus = NOBODY
+    (*s).track = NOBODY
+}
