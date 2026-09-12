@@ -13,7 +13,7 @@
 set -e
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
-FIRNC="${FIRNC:-/root/firn-certuswin/compiler/target/release/firnc}"
+FIRNC="${FIRNC:-/root/firn-dnspic/compiler/target/release/firnc}"
 W="${W:-/tmp/fui-acceptance}"
 mkdir -p "$W"
 
@@ -99,6 +99,13 @@ echo "== 10. WAVE 3/4 AT THE PIXEL =="
 build wave3
 "$W/wave3"
 
+echo
+echo "== 11. THE TEXT VALUES AT THE PIXEL =="
+# Tracking, line height, kerning, outline, shadow, gradient. The three
+# tracking numbers Justin asked to see are printed by this one.
+build text
+"$W/text"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
@@ -113,6 +120,9 @@ if [ "$1" = "--images" ]; then
     build gallery3
     "$W/gallery3" "$Z/fui-wave3-light.png" light
     "$W/gallery3" "$Z/fui-wave3-dark.png" dark
+    build gallery4
+    "$W/gallery4" "$Z/fui-text-light.png" light
+    "$W/gallery4" "$Z/fui-text-dark.png" dark
     ls -la "$Z"
 fi
 
