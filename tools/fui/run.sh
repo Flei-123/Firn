@@ -148,6 +148,13 @@ if [ "$1" = "--images" ]; then
     build gallery4
     "$W/gallery4" "$Z/fui-text-light.png" light
     "$W/gallery4" "$Z/fui-text-dark.png" dark
+    # BILD UND SVG (Runde BILD+SVG, 13.09.2026). Fuenf Baender: Knopf mit
+    # Icon, Beschriftung mit Bild und Icon-Toolbar, dasselbe SVG je Groesse
+    # NEU gerastert (12..64) samt currentColor=TOK_ACCENT daneben, Bild mit
+    # Transparenz ueber vier Gruenden, Reiter/Menue/Kachel.
+    build artshow
+    "$W/artshow" "$Z/fui-bild-svg-hell.png" light
+    "$W/artshow" "$Z/fui-bild-svg-dunkel.png" dark
     ls -la "$Z"
 fi
 
