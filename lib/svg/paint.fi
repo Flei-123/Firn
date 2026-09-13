@@ -1,0 +1,2702 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/svg/mal.fi -- DER SVG-MALER. Aus dem Baum werden Bildpunkte.
+//
+// Was hier passiert, in einem Satz: der Baum wird von der Wurzel her
+// durchlaufen, jedes Element bekommt einen ZUSTAND vererbt (Matrix,
+// Fuellung, Strich, Deckung, Schriftgroesse, Ansichtsfenster), und jedes
+// Element, das eine Form ist, baut daraus einen `pfad.Pfad`, der gefuellt
+// und/oder bestrichen wird.
+//
+// ------------------------------------------------------ DER ZUSTAND ERBT
+//
+// SVG hat keine Kaskade wie CSS, aber es hat VERERBUNG, und zwar ueber
+// `g`, `use`, `symbol` und geschachtelte `svg`. `fill="red"` auf einem
+// `g` gilt fuer jedes Kind, das nichts anderes sagt. Der Zustand wird
+// darum als WERT durch die Rekursion gereicht: jeder Aufruf bekommt eine
+// Kopie, aendert daran, was sein Element sagt, und gibt sie weiter. Damit
+// gibt es keinen Zustandsstapel, den man vergessen kann abzuraeumen, und
+// ein `use`, das mitten in einen fremden Teilbaum springt, erbt
+// automatisch vom RICHTIGEN Ort -- naemlich von der Stelle, an der das
+// `use` steht, so wie die Spezifikation es verlangt.
+//
+// --------------------------------------------- ATTRIBUT ODER EIGENSCHAFT
+//
+// Jedes Malattribut darf in SVG auf zwei Wegen stehen:
+//
+//     <rect fill="red"/>            als Attribut
+//     <rect style="fill: red"/>     als CSS-Eigenschaft
+//
+// und die zweite Form GEWINNT, weil ein `style`-Attribut in der Kaskade
+// ueber jeder Praesentationseigenschaft steht (SVG 1.1, 6.1: die
+// Praesentationsattribute zaehlen wie ein Stilblatt mit der niedrigsten
+// Bedeutung). `hole_wert` sucht darum immer zuerst in `style` und dann
+// unter den Attributen. Das ist ein eigener Testfall.
+//
+// WAS ES HIER NICHT GIBT, und es ist nicht vergessen, sondern in
+// docs/ROUNDGRAFIK.md bewertet: Filter, Masken, Clip-Pfade, Muster,
+// SMIL-Animation. Ein `<style>`-Element mit Selektoren wird ebenfalls
+// nicht ausgewertet -- nur das `style`-ATTRIBUT.
+import html.mem
+import font.raster
+import font.ttf
+// PORTIERT IN DEN FIRN-BAUM (13.09.2026): die Schriftmasse gehen ueber
+// svg.fontsel statt direkt an font.metrics. Der Grund und was dabei
+// verloren geht, stehen im Kopf von lib/svg/fontsel.fi. Diese Datei ist
+// ansonsten UNVERAENDERT aus dem Certus-Baum uebernommen.
+import svg.fontsel
+import paint.canvas
+import svg.matrix
+import svg.path
+import svg.stroke
+import svg.color
+import svg.xml
+
+export {
+    Maler, Zustand,
+    maler_neu, maler_init, maler_frei, maler_ok,
+    zustand_neu,
+    male_svg, male_baum, male_baum_farbe, svg_groesse,
+    ansicht_matrix, PAR_NONE, PAR_MEET, PAR_SLICE,
+    maler_setze_schrift, maler_tinte,
+    fuelle_pfad, bestreiche_pfad,
+}
+
+const REGEL_NICHTNULL: u32 = 0
+const REGEL_GERADE: u32 = 1
+
+const PAR_NONE: u32 = 0
+const PAR_MEET: u32 = 1
+const PAR_SLICE: u32 = 2
+
+const ANKER_ANFANG: u32 = 0
+const ANKER_MITTE: u32 = 1
+const ANKER_ENDE: u32 = 2
+
+// Wie tief `use` und `g` gehen duerfen. Der Wert ist nicht willkuerlich:
+// er ist die SCHLEIFENSPERRE. Ein `use`, das auf seinen eigenen Vorfahren
+// zeigt, wuerde sonst ewig laufen -- der Testfall (e) in
+// docs/ROUNDGRAFIK.md macht genau das.
+const TIEFE_MAX: usize = 24
+
+const GLYPH_SCRATCH: usize = 1 << 20
+
+// Hoechstens so viele Farbstopps in einem Verlauf.
+const STOPP_MAX: usize = 32
+
+// Die Namen als FNV-1a-Streuwert. Ein Vergleich statt eines
+// Zeichenkettenvergleichs je Element -- bei 3000 Pfaden in einer
+// Symbolsammlung ist das der Unterschied zwischen einer und zwanzig
+// Millisekunden.
+const N_SVG: u32 = 3880226465
+const N_G: u32 = 3792446982
+const N_PATH: u32 = 2223459638
+const N_RECT: u32 = 3940830471
+const N_CIRCLE: u32 = 673280137
+const N_ELLIPSE: u32 = 2667997009
+const N_LINE: u32 = 400234023
+const N_POLYLINE: u32 = 408269525
+const N_POLYGON: u32 = 85768329
+const N_USE: u32 = 1469170932
+const N_DEFS: u32 = 2866998125
+const N_SYMBOL: u32 = 4093333969
+const N_TEXT: u32 = 3185987134
+const N_TSPAN: u32 = 2965929447
+const N_LINGRAD: u32 = 3919366736
+const N_RADGRAD: u32 = 1884581770
+const N_STOP: u32 = 3411225317
+const N_TITLE: u32 = 2556802313
+const N_DESC: u32 = 2198011936
+const N_STYLE: u32 = 2888859350
+const N_A: u32 = 3826002220
+const N_SWITCH: u32 = 2480955249
+const N_CLIPPATH: u32 = 948855084
+const N_MASK: u32 = 3883353449
+const N_FILTER: u32 = 3353438327
+const N_PATTERN: u32 = 2268922153
+const N_MARKER: u32 = 3086496151
+const N_METADATA: u32 = 1713525568
+const N_SCRIPT: u32 = 540962730
+
+// ------------------------------------------------------------ Der Zustand
+
+struct Zustand {
+    m: matrix.Mat, // Benutzerkoordinaten -> Bildpunkte
+    f_art: u32, // farbe.F_*
+    f_col: u32,
+    f_va: usize, // Verweisname bei F_VERWEIS
+    f_vn: usize,
+    s_art: u32,
+    s_col: u32,
+    s_va: usize,
+    s_vn: usize,
+    breite: f64,
+    kappe: u32,
+    stoss: u32,
+    gehrung: f64,
+    striche: [f64; 32],
+    n_striche: usize,
+    versatz: f64,
+    f_deck: f64, // fill-opacity
+    s_deck: f64, // stroke-opacity
+    deck: f64, // opacity, aufmultipliziert
+    regel: u32,
+    aktuell: u32, // currentColor
+    groesse: f64, // font-size
+    anker: u32,
+    vw: f64, // das laufende Ansichtsfenster, fuer Prozentangaben
+    vh: f64,
+}
+
+// Der Anfangszustand nach SVG 1.1: schwarz gefuellt, nicht bestrichen,
+// Strichbreite 1, Nichtnull-Regel, alles undurchsichtig.
+#[no_gc]
+fn zustand_neu(vw: f64, vh: f64) -> Zustand {
+    return Zustand {
+        m: matrix.mat_eins(),
+        f_art: color.F_FARBE,
+        f_col: 4278190080 as u32,
+        f_va: 0,
+        f_vn: 0,
+        s_art: color.F_KEINE,
+        s_col: 4278190080 as u32,
+        s_va: 0,
+        s_vn: 0,
+        breite: 1.0,
+        kappe: stroke.K_STUMPF,
+        stoss: stroke.S_GEHRUNG,
+        gehrung: 4.0,
+        striche: [0.0; 32],
+        n_striche: 0,
+        versatz: 0.0,
+        f_deck: 1.0,
+        s_deck: 1.0,
+        deck: 1.0,
+        regel: REGEL_NICHTNULL,
+        aktuell: 4278190080 as u32,
+        groesse: 16.0,
+        anker: ANKER_ANFANG,
+        vw: vw,
+        vh: vh,
+    }
+}
+
+struct Maler {
+    cv: *mut canvas.Canvas,
+    ra: raster.Raster,
+    abuf: *mut u8,
+    rcap: usize,
+    p1: path.Pfad, // die Form in Benutzerkoordinaten
+    p2: path.Pfad, // geglaettet
+    p3: path.Pfad, // der Umriss des Strichs
+    st: stroke.Strich,
+    hilf: stroke.Strich,
+    scratch: *mut u8, // der Punktpuffer des TrueType-Lesers
+    fm: u64, // die Schriftsammlung, 0 = keine
+    tinte: u64, // wieviele Bildpunkte wirklich gesetzt wurden
+    // DIE SCHLEIFENSPERRE FUER `use`. Nicht die Tiefe allein, sondern die
+    // Kette der gerade offenen Ziele: ein `use`, das auf einen Vorfahren
+    // zeigt, wuerde bei reiner Tiefenbegrenzung 24 Kopien malen, bevor es
+    // aufhoert, und das sieht aus wie ein Fehler im Bild. Steht das Ziel
+    // schon in der Kette, wird es UEBERSPRUNGEN -- genau das verlangt
+    // SVG 1.1, 5.6 ("an invalid circular reference ... is an error").
+    benutzt: [u32; 24],
+    n_benutzt: usize,
+    // DIE SCHICHTEN fuer `opacity` auf einer GRUPPE.
+    //
+    // `opacity` auf einer Form ist einfach: die Farbe wird durchsichtiger.
+    // `opacity` auf einer GRUPPE ist etwas anderes -- die Gruppe wird
+    // erst FERTIG gemalt und dann als Ganzes durchsichtig darueber
+    // gelegt. Der Unterschied ist genau dort zu sehen, wo sich zwei
+    // Kinder ueberlappen: durchmultipliziert scheint das untere Kind
+    // durch das obere hindurch, als Schicht nicht. Gegen Chromium
+    // gemessen sind das auf zwei ueberlappenden Rechtecken mit
+    // `opacity="0.7"` 5,64 % abweichende Bildpunkte -- zu viel, um es
+    // eine Naeherung zu nennen.
+    //
+    // Vier Schichten reichen; tiefer geschachtelte Gruppen mit Deckung
+    // fallen auf das Durchmultiplizieren zurueck, und das steht im
+    // Bericht.
+    schicht: [canvas.Canvas; 4],
+    schicht_da: [usize; 4],
+    voriges: [u64; 4],
+    n_schicht: usize,
+    ok: usize,
+}
+
+#[no_gc]
+fn maler_neu() -> Maler {
+    return Maler {
+        cv: 0 as *mut canvas.Canvas,
+        ra: raster.raster_new(),
+        abuf: 0 as *mut u8,
+        rcap: 0,
+        p1: path.pfad_neu(),
+        p2: path.pfad_neu(),
+        p3: path.pfad_neu(),
+        st: stroke.strich_neu(),
+        hilf: stroke.strich_neu(),
+        scratch: 0 as *mut u8,
+        fm: 0,
+        tinte: 0,
+        benutzt: [0; 24],
+        n_benutzt: 0,
+        schicht: [canvas.canvas_new(); 4],
+        schicht_da: [0; 4],
+        voriges: [0; 4],
+        n_schicht: 0,
+        ok: 0,
+    }
+}
+
+#[no_gc]
+fn maler_init(m: *mut Maler, cv: *mut canvas.Canvas) -> bool {
+    (*m).cv = cv
+    let w: usize = canvas.canvas_width(cv)
+    let h: usize = canvas.canvas_height(cv)
+    let need: usize = raster.raster_bytes_needed(w, h)
+    (*m).rcap = need
+    (*m).abuf = mem.heap_alloc(need)
+    (*m).scratch = mem.heap_alloc(GLYPH_SCRATCH)
+    path.pfad_init(&(*m).p1)
+    path.pfad_init(&(*m).p2)
+    path.pfad_init(&(*m).p3)
+    if (*m).abuf as usize == 0 || (*m).scratch as usize == 0 {
+        return false
+    }
+    raster.raster_attach(&(*m).ra, (*m).abuf, need)
+    (*m).tinte = 0
+    (*m).ok = 1
+    return true
+}
+
+#[no_gc]
+fn maler_frei(m: *mut Maler) {
+    var i: usize = 0
+    while i < 4 {
+        if (*m).schicht_da[i] != 0 {
+            canvas.canvas_free(&(*m).schicht[i])
+            (*m).schicht_da[i] = 0
+        }
+        i = i + 1
+    }
+    mem.heap_free((*m).abuf, (*m).rcap)
+    mem.heap_free((*m).scratch, GLYPH_SCRATCH)
+    path.pfad_frei(&(*m).p1)
+    path.pfad_frei(&(*m).p2)
+    path.pfad_frei(&(*m).p3)
+    stroke.strich_frei(&(*m).st)
+    stroke.strich_frei(&(*m).hilf)
+    (*m).ok = 0
+}
+
+#[no_gc]
+fn maler_ok(m: *mut Maler) -> bool {
+    return (*m).ok != 0
+}
+
+// Eine Schicht aufmachen. Ab jetzt geht alles auf die Schicht statt auf
+// die Leinwand.
+#[no_gc]
+fn schicht_auf(m: *mut Maler) -> bool {
+    let k: usize = (*m).n_schicht
+    if k >= 4 {
+        return false
+    }
+    let w: usize = canvas.canvas_width((*m).cv)
+    let h: usize = canvas.canvas_height((*m).cv)
+    if (*m).schicht_da[k] == 0 {
+        if !canvas.canvas_init(&(*m).schicht[k], w, h) {
+            return false
+        }
+        (*m).schicht_da[k] = 1
+    }
+    if canvas.canvas_width(&(*m).schicht[k]) != w
+        || canvas.canvas_height(&(*m).schicht[k]) != h {
+        return false
+    }
+    canvas.canvas_clear(&(*m).schicht[k], 0 as u32)
+    (*m).voriges[k] = (*m).cv as u64
+    (*m).cv = &(*m).schicht[k]
+    (*m).n_schicht = k + 1
+    return true
+}
+
+// Die Schicht schliessen und mit der Deckung darueberlegen.
+//
+// Die Bildpunkte der Schicht sind VORMULTIPLIZIERT; `canvas_blend` will
+// eine gerade Farbe und eine Deckung. Also wird zurueckgerechnet -- und
+// zwar nur fuer Bildpunkte mit Deckung ueber null, denn bei Deckung null
+// ist die Farbe nicht wiederherstellbar und auch nicht noetig.
+#[no_gc]
+fn schicht_ab(m: *mut Maler, deck: f64) {
+    if (*m).n_schicht == 0 {
+        return
+    }
+    let k: usize = (*m).n_schicht - 1
+    (*m).n_schicht = k
+    let sch: *mut canvas.Canvas = &(*m).schicht[k]
+    (*m).cv = (*m).voriges[k] as *mut canvas.Canvas
+    let w: usize = canvas.canvas_width(sch)
+    let h: usize = canvas.canvas_height(sch)
+    // Nur den Bereich ablaufen, den der Beschnitt der Leinwand uebriglaesst.
+    let x0: i64 = klemmi(matrix.m_floor(canvas.clip_x0((*m).cv)), 0,
+        w as i64)
+    let y0: i64 = klemmi(matrix.m_floor(canvas.clip_y0((*m).cv)), 0,
+        h as i64)
+    let x1: i64 = klemmi(matrix.m_ceil(canvas.clip_x1((*m).cv)), 0, w as i64)
+    let y1: i64 = klemmi(matrix.m_ceil(canvas.clip_y1((*m).cv)), 0, h as i64)
+    var y: i64 = y0
+    while y < y1 {
+        var x: i64 = x0
+        while x < x1 {
+            let v: u32 = canvas.canvas_get(sch, x as usize, y as usize)
+            let a: u32 = (v >> 24) & 255 as u32
+            if a != 0 as u32 {
+                let af: f64 = (a as f64) / 255.0
+                let r: f64 = (((v >> 16) & 255 as u32) as f64) / af
+                let g: f64 = (((v >> 8) & 255 as u32) as f64) / af
+                let b: f64 = ((v & 255 as u32) as f64) / af
+                let col: u32 = canvas.color_of(255 as u32, klemme255(r),
+                    klemme255(g), klemme255(b))
+                canvas.canvas_blend((*m).cv, x as usize, y as usize, col,
+                    af * deck)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+#[no_gc]
+fn klemme255(v: f64) -> u32 {
+    if v != v || v <= 0.0 {
+        return 0 as u32
+    }
+    if v >= 255.0 {
+        return 255 as u32
+    }
+    return (v + 0.5) as u32
+}
+
+#[no_gc]
+fn maler_setze_schrift(m: *mut Maler, fm: u64) {
+    (*m).fm = fm
+}
+
+#[no_gc]
+fn maler_tinte(m: *mut Maler) -> u64 {
+    return (*m).tinte
+}
+
+// --------------------------------------------------- Attribute und Werte
+
+#[no_gc]
+fn streu(p: u64, a: usize, n: usize) -> u32 {
+    var v: u64 = 2166136261
+    var i: usize = 0
+    while i < n {
+        v = (v ^ (matrix.lies_oktett(p, a + i) as u64)) & 4294967295
+        v = (v * 16777619) & 4294967295
+        i = i + 1
+    }
+    return v as u32
+}
+
+#[no_gc]
+fn name_streu(b: *mut xml.Baum, i: u32) -> u32 {
+    return streu(xml.baum_pool(b), xml.knoten_name_a(b, i),
+        xml.knoten_name_n(b, i))
+}
+
+// Eine Eigenschaft aus dem `style`-Attribut. `style="fill:red;stroke:none"`
+#[no_gc]
+fn style_wert(b: *mut xml.Baum, i: u32, w: u64, wn: usize, ra: *mut usize,
+    rn: *mut usize) -> bool {
+    var sa: usize = 0
+    var sn: usize = 0
+    var sw: [u8; 5] = "style"
+    if !xml.attr_wert(b, i, (&sw[0]) as u64, 5, &sa, &sn) {
+        return false
+    }
+    return block_wert(xml.baum_pool(b), sa, sn, w, wn, ra, rn)
+}
+
+// EINE EIGENSCHAFT AUS EINEM ERKLAERUNGSBLOCK.
+//
+// Das ist der Rumpf, der frueher in `style_wert` stand. Er ist jetzt von
+// der Frage getrennt, WOHER der Block kommt: aus dem `style`-Attribut
+// eines Elements oder aus einer Regel des `<style>`-Elements im
+// Dokument (siehe `blatt_sammeln`). Beide sehen gleich aus --
+// `name: wert; name: wert`.
+#[no_gc]
+fn block_wert(p: u64, ba: usize, bn: usize, w: u64, wn: usize,
+    ra: *mut usize, rn: *mut usize) -> bool {
+    let sa: usize = ba
+    let ende: usize = ba + bn
+    var j: usize = sa
+    while j < ende {
+        while j < ende && (matrix.ist_leer(matrix.lies_oktett(p, j))
+            || matrix.lies_oktett(p, j) == 59) {
+            j = j + 1
+        }
+        let nvon: usize = j
+        while j < ende && matrix.lies_oktett(p, j) != 58
+            && matrix.lies_oktett(p, j) != 59 {
+            j = j + 1
+        }
+        var nbis: usize = j
+        while nbis > nvon && matrix.ist_leer(matrix.lies_oktett(p, nbis - 1)) {
+            nbis = nbis - 1
+        }
+        if j >= ende || matrix.lies_oktett(p, j) != 58 {
+            // Kein Doppelpunkt -- Schrott, bis zum naechsten Strichpunkt
+            // ueberspringen.
+            while j < ende && matrix.lies_oktett(p, j) != 59 {
+                j = j + 1
+            }
+            continue
+        }
+        j = j + 1
+        while j < ende && matrix.ist_leer(matrix.lies_oktett(p, j)) {
+            j = j + 1
+        }
+        let wvon: usize = j
+        while j < ende && matrix.lies_oktett(p, j) != 59 {
+            j = j + 1
+        }
+        var wbis: usize = j
+        while wbis > wvon && matrix.ist_leer(matrix.lies_oktett(p, wbis - 1)) {
+            wbis = wbis - 1
+        }
+        if nbis - nvon == wn {
+            var k: usize = 0
+            var gleich: bool = true
+            while k < wn {
+                if matrix.lies_oktett(p, nvon + k) != matrix.lies_oktett(w, k) {
+                    gleich = false
+                    break
+                }
+                k = k + 1
+            }
+            if gleich {
+                *ra = wvon
+                *rn = wbis - wvon
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// ===================================================================
+// RUNDE R3-2 -- DAS STILBLATT IM SVG SELBST
+// ===================================================================
+//
+// Der Malstand kam bisher aus zwei Quellen: dem `style`-Attribut und
+// dem Darstellungsattribut (`fill="red"`). Genau eine dritte fehlte --
+// das `<style>`-ELEMENT IM DOKUMENT. `zeichne` hat es ausdruecklich
+// uebersprungen ("Vorratsbehaelter und Beschreibungen").
+//
+// Das ist kein Randfall. Jedes Werkzeug, das aus Illustrator oder
+// Figma exportiert, schreibt seine Farben genau so:
+//
+//     <defs><style>.cls-1 { fill: #19afff; }</style></defs>
+//     <path class="cls-1" d="..."/>
+//
+// Ohne diese Quelle bleibt jeder Pfad beim Anfangswert von SVG 1.1 --
+// SCHWARZ. Das ist der schwarze Klecks, den das willhaben-Logo in
+// .gauntlet-shots/willhaben.png hinterlaesst (die Datei
+// /bbx-search/_next/static/assets/logo.*.svg hat genau diesen Aufbau),
+// und derselbe Grund steht hinter den schwarzen Kaestchen anderer
+// Sinnbilder.
+//
+// Was hier geht: Typ-, Klassen-, Id- und Universalwaehler, auch als
+// Liste mit Komma; Kommentare; `@`-Regeln werden uebersprungen. Was
+// NICHT geht (Nachfahren, Pseudoklassen, Attributwaehler), wird
+// erkannt und die Regel ausgelassen -- lieber keine Farbe als die
+// falsche. Die Vorrangfolge ist die von CSS 2.1, 6.4.4: das
+// `style`-Attribut schlaegt die Regel, die Regel schlaegt das
+// Darstellungsattribut.
+const REG_MAX: usize = 128
+static mut G_REG_ART: [u32; 128] = [0 as u32; 128] // 0 Typ 1 Klasse 2 Id 3 *
+static mut G_REG_HASH: [u32; 128] = [0 as u32; 128]
+static mut G_REG_A: [usize; 128] = [0 as usize; 128]
+static mut G_REG_N: [usize; 128] = [0 as usize; 128]
+static mut G_REG_SPEZ: [u32; 128] = [0 as u32; 128]
+static mut G_NREG: usize = 0
+
+#[no_gc]
+fn blatt_leeren() {
+    G_NREG = 0
+}
+
+// Ein Waehler, schon zurechtgeschnitten. `false` heisst: nicht
+// unterstuetzt, die Regel wird ausgelassen.
+#[no_gc]
+fn waehler_merken(p: u64, von_in: usize, bis_in: usize, ba: usize,
+    bn: usize) {
+    var von: usize = von_in
+    var bis: usize = bis_in
+    while von < bis && matrix.ist_leer(matrix.lies_oktett(p, von)) {
+        von = von + 1
+    }
+    while bis > von && matrix.ist_leer(matrix.lies_oktett(p, bis - 1)) {
+        bis = bis - 1
+    }
+    if bis <= von || G_NREG >= REG_MAX {
+        return
+    }
+    // Alles, was mehr als EIN einfacher Waehler ist, bleibt draussen.
+    var k: usize = von
+    while k < bis {
+        let c: u32 = matrix.lies_oktett(p, k)
+        if matrix.ist_leer(c) || c == 62 || c == 43 || c == 126 || c == 58
+            || c == 91 || c == 40 {
+            return
+        }
+        if k > von && (c == 46 || c == 35) {
+            return
+        }
+        k = k + 1
+    }
+    let c0: u32 = matrix.lies_oktett(p, von)
+    var art: u32 = 0
+    var spez: u32 = 1
+    var na: usize = von
+    if c0 == 46 {
+        art = 1
+        spez = 10
+        na = von + 1
+    } else if c0 == 35 {
+        art = 2
+        spez = 100
+        na = von + 1
+    } else if c0 == 42 && bis - von == 1 {
+        art = 3
+        spez = 0
+        na = von
+    }
+    if art != 3 && bis <= na {
+        return
+    }
+    let k2: usize = G_NREG
+    G_REG_ART[k2] = art
+    G_REG_HASH[k2] = streu(p, na, bis - na)
+    G_REG_A[k2] = ba
+    G_REG_N[k2] = bn
+    G_REG_SPEZ[k2] = spez
+    G_NREG = k2 + 1
+}
+
+// Der Text eines `<style>`-Elements: Regel fuer Regel.
+#[no_gc]
+fn blatt_lies(p: u64, a: usize, n: usize) {
+    let ende: usize = a + n
+    var j: usize = a
+    while j < ende {
+        // Kommentare und Leerraum weg.
+        if matrix.lies_oktett(p, j) == 47 && j + 1 < ende
+            && matrix.lies_oktett(p, j + 1) == 42 {
+            j = j + 2
+            while j + 1 < ende && !(matrix.lies_oktett(p, j) == 42
+                && matrix.lies_oktett(p, j + 1) == 47) {
+                j = j + 1
+            }
+            j = j + 2
+            continue
+        }
+        if matrix.ist_leer(matrix.lies_oktett(p, j)) {
+            j = j + 1
+            continue
+        }
+        // Eine `@`-Regel: bis zum Strichpunkt oder ueber ihren Block
+        // hinweg ueberspringen.
+        if matrix.lies_oktett(p, j) == 64 {
+            var tiefe: usize = 0
+            while j < ende {
+                let c2: u32 = matrix.lies_oktett(p, j)
+                if c2 == 123 {
+                    tiefe = tiefe + 1
+                } else if c2 == 125 {
+                    j = j + 1
+                    if tiefe <= 1 {
+                        break
+                    }
+                    tiefe = tiefe - 1
+                    continue
+                } else if c2 == 59 && tiefe == 0 {
+                    j = j + 1
+                    break
+                }
+                j = j + 1
+            }
+            continue
+        }
+        let svon: usize = j
+        while j < ende && matrix.lies_oktett(p, j) != 123 {
+            j = j + 1
+        }
+        if j >= ende {
+            return
+        }
+        let sbis: usize = j
+        j = j + 1
+        let bvon: usize = j
+        while j < ende && matrix.lies_oktett(p, j) != 125 {
+            j = j + 1
+        }
+        let bbis: usize = j
+        if j < ende {
+            j = j + 1
+        }
+        // Die Waehlerliste an den Kommas zerlegen.
+        var t: usize = svon
+        var stueck: usize = svon
+        while t <= sbis {
+            if t == sbis || matrix.lies_oktett(p, t) == 44 {
+                waehler_merken(p, stueck, t, bvon, bbis - bvon)
+                stueck = t + 1
+            }
+            t = t + 1
+        }
+    }
+}
+
+// Alle `<style>`-Elemente des Baumes einsammeln. Einmal je Bild.
+#[no_gc]
+fn blatt_sammeln(b: *mut xml.Baum) {
+    blatt_leeren()
+    let p: u64 = xml.baum_pool(b)
+    let n: usize = xml.knoten_anzahl(b)
+    var i: usize = 0
+    while i < n {
+        let e: u32 = i as u32
+        if xml.knoten_art(b, e) == xml.K_ELEMENT && name_streu(b, e)
+            == N_STYLE {
+            var c: u32 = xml.knoten_kind(b, e)
+            while c != xml.KEINER {
+                if xml.knoten_art(b, c) == xml.K_TEXT {
+                    blatt_lies(p, xml.knoten_text_a(b, c),
+                        xml.knoten_text_n(b, c))
+                }
+                c = xml.knoten_naechst(b, c)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Passt die Regel `k` auf das Element `i`?
+#[no_gc]
+fn regel_passt(b: *mut xml.Baum, i: u32, k: usize) -> bool {
+    let art: u32 = G_REG_ART[k]
+    if art == 3 {
+        return true
+    }
+    if art == 0 {
+        return name_streu(b, i) == G_REG_HASH[k]
+    }
+    let p: u64 = xml.baum_pool(b)
+    var a: usize = 0
+    var n: usize = 0
+    if art == 2 {
+        var wid: [u8; 2] = "id"
+        if !xml.attr_wert(b, i, (&wid[0]) as u64, 2, &a, &n) {
+            return false
+        }
+        return streu(p, a, n) == G_REG_HASH[k]
+    }
+    var wcl: [u8; 5] = "class"
+    if !xml.attr_wert(b, i, (&wcl[0]) as u64, 5, &a, &n) {
+        return false
+    }
+    let ende: usize = a + n
+    var j: usize = a
+    while j < ende {
+        while j < ende && matrix.ist_leer(matrix.lies_oktett(p, j)) {
+            j = j + 1
+        }
+        let von: usize = j
+        while j < ende && !matrix.ist_leer(matrix.lies_oktett(p, j)) {
+            j = j + 1
+        }
+        if j > von && streu(p, von, j - von) == G_REG_HASH[k] {
+            return true
+        }
+    }
+    return false
+}
+
+// Der Wert aus dem Stilblatt -- der mit dem hoechsten Vorrang, bei
+// Gleichstand der spaetere.
+#[no_gc]
+fn blatt_wert(b: *mut xml.Baum, i: u32, w: u64, wn: usize, ra: *mut usize,
+    rn: *mut usize) -> bool {
+    if G_NREG == 0 {
+        return false
+    }
+    let p: u64 = xml.baum_pool(b)
+    var gefunden: bool = false
+    var best: u32 = 0
+    var k: usize = 0
+    while k < G_NREG {
+        var a: usize = 0
+        var n: usize = 0
+        if block_wert(p, G_REG_A[k], G_REG_N[k], w, wn, &a, &n)
+            && regel_passt(b, i, k) {
+            if !gefunden || G_REG_SPEZ[k] >= best {
+                best = G_REG_SPEZ[k]
+                *ra = a
+                *rn = n
+                gefunden = true
+            }
+        }
+        k = k + 1
+    }
+    return gefunden
+}
+
+// Der Wert einer Malangabe: erst `style`, dann das Stilblatt, dann das
+// Attribut (CSS 2.1, 6.4.4).
+#[no_gc]
+fn hole_wert(b: *mut xml.Baum, i: u32, w: u64, wn: usize, ra: *mut usize,
+    rn: *mut usize) -> bool {
+    if style_wert(b, i, w, wn, ra, rn) {
+        return true
+    }
+    if blatt_wert(b, i, w, wn, ra, rn) {
+        return true
+    }
+    return xml.attr_wert(b, i, w, wn, ra, rn)
+}
+
+// Eine LAENGE. `bezug` ist die Bezugsgroesse fuer Prozentangaben.
+//
+// Die Umrechnungen sind die von CSS: 1pt = 4/3 px, 1pc = 16 px,
+// 1in = 96 px, 1cm = 96/2.54 px, 1mm = 96/25.4 px. `em` und `ex` haengen
+// an der Schriftgroesse; `ex` wird mit der halben genommen, was die
+// uebliche Naeherung ist, wenn die Schrift keine x-Hoehe meldet.
+#[no_gc]
+fn laenge_von(p: u64, a: usize, n: usize, bezug: f64, groesse: f64,
+    ok: *mut bool) -> f64 {
+    var i: usize = a
+    let ende: usize = a + n
+    matrix.ueberspringe_leer(p, ende, &i)
+    let v: f64 = matrix.zahl(p, ende, &i, ok)
+    if !*ok {
+        return 0.0
+    }
+    matrix.ueberspringe_leer(p, ende, &i)
+    if i >= ende {
+        return v
+    }
+    let c0: u32 = matrix.lies_oktett(p, i)
+    if c0 == 37 {
+        return v * bezug / 100.0
+    }
+    if i + 1 >= ende {
+        return v
+    }
+    let c1: u32 = matrix.lies_oktett(p, i + 1)
+    if c0 == 112 && c1 == 120 {
+        return v
+    }
+    if c0 == 112 && c1 == 116 {
+        return v * 4.0 / 3.0
+    }
+    if c0 == 112 && c1 == 99 {
+        return v * 16.0
+    }
+    if c0 == 105 && c1 == 110 {
+        return v * 96.0
+    }
+    if c0 == 99 && c1 == 109 {
+        return v * 96.0 / 2.54
+    }
+    if c0 == 109 && c1 == 109 {
+        return v * 96.0 / 25.4
+    }
+    if c0 == 101 && c1 == 109 {
+        return v * groesse
+    }
+    if c0 == 101 && c1 == 120 {
+        return v * groesse / 2.0
+    }
+    return v
+}
+
+// Ein Attribut als Laenge, mit Vorgabewert.
+#[no_gc]
+fn attr_laenge(b: *mut xml.Baum, i: u32, w: u64, wn: usize, bezug: f64,
+    z: *mut Zustand, vorgabe: f64) -> f64 {
+    var a: usize = 0
+    var n: usize = 0
+    if !hole_wert(b, i, w, wn, &a, &n) {
+        return vorgabe
+    }
+    var ok: bool = false
+    let v: f64 = laenge_von(xml.baum_pool(b), a, n, bezug, (*z).groesse, &ok)
+    if !ok {
+        return vorgabe
+    }
+    return v
+}
+
+// Die Bezugsgroesse fuer eine Prozentangabe in einer Richtung, die weder
+// waagerecht noch senkrecht ist (etwa `r` eines Kreises): die
+// normalisierte Diagonale des Ansichtsfensters, SVG 1.1, 7.10.
+#[no_gc]
+fn diagonale(vw: f64, vh: f64) -> f64 {
+    return matrix.m_sqrt(vw * vw + vh * vh) / 1.4142135623730951
+}
+
+// -------------------------------------------------------- Das Fenster
+
+#[no_gc]
+fn klemmi(v: f64, lo: i64, hi: i64) -> i64 {
+    if v != v {
+        return lo
+    }
+    if v < (lo as f64) {
+        return lo
+    }
+    if v > (hi as f64) {
+        return hi
+    }
+    return v as i64
+}
+
+// Das Rechteck aus Bildpunkten, das eine Form beruehren kann -- mit dem
+// Beschnitt der Leinwand verschnitten.
+#[no_gc]
+fn fenster(m: *mut Maler, x0: f64, y0: f64, x1: f64, y1: f64, wx: *mut i64,
+    wy: *mut i64, w: *mut usize, h: *mut usize) -> bool {
+    let cw: usize = canvas.canvas_width((*m).cv)
+    let ch: usize = canvas.canvas_height((*m).cv)
+    var a0: f64 = x0 - 1.0
+    var b0: f64 = y0 - 1.0
+    var a1: f64 = x1 + 1.0
+    var b1: f64 = y1 + 1.0
+    let cx0: f64 = canvas.clip_x0((*m).cv)
+    let cy0: f64 = canvas.clip_y0((*m).cv)
+    let cx1: f64 = canvas.clip_x1((*m).cv)
+    let cy1: f64 = canvas.clip_y1((*m).cv)
+    if a0 < cx0 {
+        a0 = cx0
+    }
+    if b0 < cy0 {
+        b0 = cy0
+    }
+    if a1 > cx1 {
+        a1 = cx1
+    }
+    if b1 > cy1 {
+        b1 = cy1
+    }
+    let ix0: i64 = klemmi(matrix.m_floor(a0), 0, cw as i64)
+    let iy0: i64 = klemmi(matrix.m_floor(b0), 0, ch as i64)
+    let ix1: i64 = klemmi(matrix.m_ceil(a1), 0, cw as i64)
+    let iy1: i64 = klemmi(matrix.m_ceil(b1), 0, ch as i64)
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return false
+    }
+    *wx = ix0
+    *wy = iy0
+    *w = (ix1 - ix0) as usize
+    *h = (iy1 - iy0) as usize
+    return true
+}
+
+// ------------------------------------------------------------ Verlaeufe
+
+struct Verlauf {
+    da: bool,
+    radial: bool,
+    // Die Zahlen im Verlaufssystem.
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    cx: f64,
+    cy: f64,
+    r: f64,
+    fx: f64,
+    fy: f64,
+    einheit_bbox: bool, // gradientUnits = objectBoundingBox
+    gm: matrix.Mat, // gradientTransform
+    spreiz: u32, // 0 pad, 1 reflect, 2 repeat
+    off: [f64; 32],
+    col: [u32; 32],
+    n: usize,
+}
+
+#[no_gc]
+fn verlauf_neu() -> Verlauf {
+    return Verlauf {
+        da: false,
+        radial: false,
+        x1: 0.0,
+        y1: 0.0,
+        x2: 1.0,
+        y2: 0.0,
+        cx: 0.5,
+        cy: 0.5,
+        r: 0.5,
+        fx: 0.5,
+        fy: 0.5,
+        einheit_bbox: true,
+        gm: matrix.mat_eins(),
+        spreiz: 0,
+        off: [0.0; 32],
+        col: [0; 32],
+        n: 0,
+    }
+}
+
+// Ein Element mit dieser `id` suchen. Linear -- ein SVG-Baum hat selten
+// mehr als ein paar tausend Knoten, und ein Verzeichnis waere ein
+// zweiter Speicher, der mit dem Baum synchron bleiben muesste.
+#[no_gc]
+fn finde_id(b: *mut xml.Baum, p: u64, a: usize, n: usize) -> u32 {
+    if n == 0 {
+        return xml.KEINER
+    }
+    var iw: [u8; 2] = "id"
+    let anz: usize = xml.knoten_anzahl(b)
+    let pool: u64 = xml.baum_pool(b)
+    var i: usize = 0
+    while i < anz {
+        let k: u32 = i as u32
+        if xml.knoten_art(b, k) == xml.K_ELEMENT {
+            var va: usize = 0
+            var vn: usize = 0
+            if xml.attr_wert(b, k, (&iw[0]) as u64, 2, &va, &vn) {
+                if vn == n {
+                    var j: usize = 0
+                    var gleich: bool = true
+                    while j < n {
+                        if matrix.lies_oktett(pool, va + j)
+                            != matrix.lies_oktett(p, a + j) {
+                            gleich = false
+                            break
+                        }
+                        j = j + 1
+                    }
+                    if gleich {
+                        return k
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return xml.KEINER
+}
+
+#[no_gc]
+fn stopps_lesen(v: *mut Verlauf, b: *mut xml.Baum, e: u32, z: *mut Zustand) {
+    var soff: [u8; 6] = "offset"
+    var scol: [u8; 10] = "stop-color"
+    var sop: [u8; 12] = "stop-opacity"
+    let pool: u64 = xml.baum_pool(b)
+    var k: u32 = xml.knoten_kind(b, e)
+    while k != xml.KEINER {
+        if xml.knoten_art(b, k) == xml.K_ELEMENT && name_streu(b, k) == N_STOP {
+            if (*v).n < STOPP_MAX {
+                var a: usize = 0
+                var n: usize = 0
+                var o: f64 = 0.0
+                if hole_wert(b, k, (&soff[0]) as u64, 6, &a, &n) {
+                    var ok: bool = false
+                    o = laenge_von(pool, a, n, 1.0, (*z).groesse, &ok)
+                    if !ok {
+                        o = 0.0
+                    }
+                }
+                if o < 0.0 {
+                    o = 0.0
+                }
+                if o > 1.0 {
+                    o = 1.0
+                }
+                // Die Stopps muessen aufsteigen; ein kleinerer Wert wird
+                // auf den vorigen gehoben (SVG 1.1, 13.2.4).
+                if (*v).n > 0 && o < (*v).off[(*v).n - 1] {
+                    o = (*v).off[(*v).n - 1]
+                }
+                var c: u32 = 4278190080 as u32
+                if hole_wert(b, k, (&scol[0]) as u64, 10, &a, &n) {
+                    var va: usize = 0
+                    var vn: usize = 0
+                    let art: u32 = color.lies_farbe(pool, a, n, &c, &va, &vn)
+                    if art == color.F_AKTUELL {
+                        c = (*z).aktuell
+                    } else if art != color.F_FARBE {
+                        c = 4278190080 as u32
+                    }
+                }
+                var d: f64 = 1.0
+                if hole_wert(b, k, (&sop[0]) as u64, 12, &a, &n) {
+                    var ok2: bool = false
+                    d = color.lies_deckung(pool, a, n, &ok2)
+                    if !ok2 {
+                        d = 1.0
+                    }
+                }
+                let al: f64 = (((c >> 24) & 255 as u32) as f64) * d
+                var ai: u32 = 0 as u32
+                if al > 0.0 {
+                    ai = (al + 0.5) as u32
+                    if ai > 255 as u32 {
+                        ai = 255 as u32
+                    }
+                }
+                (*v).off[(*v).n] = o
+                (*v).col[(*v).n] = (ai << 24) | (c & 16777215 as u32)
+                (*v).n = (*v).n + 1
+            }
+        }
+        k = xml.knoten_naechst(b, k)
+    }
+}
+
+// Einen Verlauf aus einem Element lesen. `tiefe` sperrt eine `href`-Kette,
+// die im Kreis geht.
+#[no_gc]
+fn verlauf_lesen(v: *mut Verlauf, b: *mut xml.Baum, e: u32, z: *mut Zustand,
+    tiefe: usize) {
+    if e == xml.KEINER || tiefe > 8 {
+        return
+    }
+    let art: u32 = name_streu(b, e)
+    let radial: bool = art == N_RADGRAD
+    if art != N_LINGRAD && !radial {
+        return
+    }
+    (*v).da = true
+    (*v).radial = radial
+    let pool: u64 = xml.baum_pool(b)
+    // Zuerst der Verweis: `href` erbt alles, was hier nicht steht.
+    var hw: [u8; 4] = "href"
+    var ha: usize = 0
+    var hn: usize = 0
+    if xml.attr_wert(b, e, (&hw[0]) as u64, 4, &ha, &hn) {
+        if hn > 1 && matrix.lies_oktett(pool, ha) == 35 {
+            let o: u32 = finde_id(b, pool, ha + 1, hn - 1)
+            if o != xml.KEINER && o != e {
+                verlauf_lesen(v, b, o, z, tiefe + 1)
+                (*v).radial = radial
+            }
+        }
+    }
+    var a: usize = 0
+    var n: usize = 0
+    var wgu: [u8; 13] = "gradientUnits"
+    if xml.attr_wert(b, e, (&wgu[0]) as u64, 13, &a, &n) {
+        var wus: [u8; 14] = "userSpaceOnUse"
+        // Nur die ersten 13 Zeichen vergleichen reicht nicht; die Laenge
+        // wird mitgeprueft.
+        if n == 14 {
+            var gleich: bool = true
+            var j: usize = 0
+            while j < 14 {
+                if matrix.lies_oktett(pool, a + j)
+                    != matrix.lies_oktett((&wus[0]) as u64, j) {
+                    gleich = false
+                    break
+                }
+                j = j + 1
+            }
+            if gleich {
+                (*v).einheit_bbox = false
+            }
+        }
+    }
+    var wgt: [u8; 17] = "gradientTransform"
+    if xml.attr_wert(b, e, (&wgt[0]) as u64, 17, &a, &n) {
+        (*v).gm = matrix.zerteile_transform(pool + a as u64, n)
+    }
+    var wsm: [u8; 12] = "spreadMethod"
+    if xml.attr_wert(b, e, (&wsm[0]) as u64, 12, &a, &n) {
+        if n >= 3 {
+            let c0: u32 = matrix.lies_oktett(pool, a)
+            if c0 == 114 {
+                if n == 7 {
+                    (*v).spreiz = 1 // reflect
+                } else {
+                    (*v).spreiz = 2 // repeat
+                }
+            }
+        }
+    }
+    // Die Zahlen. Bei `objectBoundingBox` sind sie Anteile, sonst
+    // Benutzerkoordinaten; die Prozentangabe bezieht sich in beiden
+    // Faellen auf 1 bzw. auf das Ansichtsfenster.
+    var bez_x: f64 = 1.0
+    var bez_y: f64 = 1.0
+    var bez_d: f64 = 1.0
+    if !(*v).einheit_bbox {
+        bez_x = (*z).vw
+        bez_y = (*z).vh
+        bez_d = diagonale((*z).vw, (*z).vh)
+    }
+    var w1: [u8; 2] = "x1"
+    var w2: [u8; 2] = "y1"
+    var w3: [u8; 2] = "x2"
+    var w4: [u8; 2] = "y2"
+    if xml.attr_wert(b, e, (&w1[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).x1 = laenge_von(pool, a, n, bez_x, (*z).groesse, &ok)
+    }
+    if xml.attr_wert(b, e, (&w2[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).y1 = laenge_von(pool, a, n, bez_y, (*z).groesse, &ok)
+    }
+    if xml.attr_wert(b, e, (&w3[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).x2 = laenge_von(pool, a, n, bez_x, (*z).groesse, &ok)
+    }
+    if xml.attr_wert(b, e, (&w4[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).y2 = laenge_von(pool, a, n, bez_y, (*z).groesse, &ok)
+    }
+    var wcx: [u8; 2] = "cx"
+    var wcy: [u8; 2] = "cy"
+    var wr: [u8; 1] = "r"
+    var wfx: [u8; 2] = "fx"
+    var wfy: [u8; 2] = "fy"
+    var hat_f: bool = false
+    if xml.attr_wert(b, e, (&wcx[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).cx = laenge_von(pool, a, n, bez_x, (*z).groesse, &ok)
+    }
+    if xml.attr_wert(b, e, (&wcy[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).cy = laenge_von(pool, a, n, bez_y, (*z).groesse, &ok)
+    }
+    if xml.attr_wert(b, e, (&wr[0]) as u64, 1, &a, &n) {
+        var ok: bool = false
+        (*v).r = laenge_von(pool, a, n, bez_d, (*z).groesse, &ok)
+    }
+    if xml.attr_wert(b, e, (&wfx[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).fx = laenge_von(pool, a, n, bez_x, (*z).groesse, &ok)
+        hat_f = true
+    }
+    if xml.attr_wert(b, e, (&wfy[0]) as u64, 2, &a, &n) {
+        var ok: bool = false
+        (*v).fy = laenge_von(pool, a, n, bez_y, (*z).groesse, &ok)
+        hat_f = true
+    }
+    if !hat_f {
+        // Ohne `fx`/`fy` liegt der Brennpunkt in der Mitte.
+        (*v).fx = (*v).cx
+        (*v).fy = (*v).cy
+    }
+    // Eigene Stopps ueberschreiben geerbte.
+    var eigene: usize = 0
+    var k: u32 = xml.knoten_kind(b, e)
+    while k != xml.KEINER {
+        if name_streu(b, k) == N_STOP {
+            eigene = eigene + 1
+        }
+        k = xml.knoten_naechst(b, k)
+    }
+    if eigene > 0 {
+        (*v).n = 0
+        stopps_lesen(v, b, e, z)
+    }
+}
+
+// Die Farbe an der Stelle `t`. Zwischen zwei Stopps wird in GERADER
+// (nicht vormultiplizierter) Darstellung gemischt -- so verlangt es
+// SVG 1.1, und der Unterschied ist bei einem Verlauf nach `transparent`
+// mit blossem Auge zu sehen.
+#[no_gc]
+fn verlauf_farbe(v: *mut Verlauf, t_in: f64) -> u32 {
+    let n: usize = (*v).n
+    if n == 0 {
+        return 0 as u32
+    }
+    var t: f64 = t_in
+    if (*v).spreiz == 2 {
+        t = t - matrix.m_floor(t)
+    } else if (*v).spreiz == 1 {
+        var u: f64 = t - matrix.m_floor(t / 2.0) * 2.0
+        if u > 1.0 {
+            u = 2.0 - u
+        }
+        t = u
+    } else {
+        if t < 0.0 {
+            t = 0.0
+        }
+        if t > 1.0 {
+            t = 1.0
+        }
+    }
+    if n == 1 {
+        return (*v).col[0]
+    }
+    if t <= (*v).off[0] {
+        return (*v).col[0]
+    }
+    if t >= (*v).off[n - 1] {
+        return (*v).col[n - 1]
+    }
+    var i: usize = 1
+    while i < n {
+        if t <= (*v).off[i] {
+            let o0: f64 = (*v).off[i - 1]
+            let o1: f64 = (*v).off[i]
+            var f: f64 = 0.0
+            if o1 > o0 {
+                f = (t - o0) / (o1 - o0)
+            }
+            let a: u32 = (*v).col[i - 1]
+            let bb: u32 = (*v).col[i]
+            return mische(a, bb, f)
+        }
+        i = i + 1
+    }
+    return (*v).col[n - 1]
+}
+
+#[no_gc]
+fn kanal(a: u32, b: u32, sh: u32, f: f64) -> u32 {
+    let x: f64 = ((a >> sh) & 255 as u32) as f64
+    let y: f64 = ((b >> sh) & 255 as u32) as f64
+    var v: f64 = x + (y - x) * f
+    if v < 0.0 {
+        v = 0.0
+    }
+    if v > 255.0 {
+        v = 255.0
+    }
+    return (v + 0.5) as u32
+}
+
+#[no_gc]
+fn mische(a: u32, b: u32, f: f64) -> u32 {
+    return (kanal(a, b, 24, f) << 24) | (kanal(a, b, 16, f) << 16)
+        | (kanal(a, b, 8, f) << 8) | kanal(a, b, 0, f)
+}
+
+// ------------------------------------------------------- Fuellen und Malen
+
+// Eine Farbe mit einer Deckung multiplizieren.
+#[no_gc]
+fn mit_deckung(col: u32, d: f64) -> u32 {
+    if d >= 1.0 {
+        return col
+    }
+    var a: f64 = (((col >> 24) & 255 as u32) as f64) * d
+    if a < 0.0 {
+        a = 0.0
+    }
+    if a > 255.0 {
+        a = 255.0
+    }
+    return (((a + 0.5) as u32) << 24) | (col & 16777215 as u32)
+}
+
+// DIE EINE STELLE, an der Bildpunkte gesetzt werden. Der Rasterer hat die
+// Deckung schon berechnet; hier kommt nur noch die Farbe dazu -- entweder
+// eine feste oder eine aus einem Verlauf.
+#[no_gc]
+fn giesse(m: *mut Maler, wx: i64, wy: i64, w: usize, h: usize, col: u32,
+    v: *mut Verlauf, gv: bool, gi: matrix.Mat) {
+    // DIE ZEILE AM STUECK. `raster_cov` prueft je Bildpunkt die
+    // Grenzen und rechnet den Index aus; bei einem langen Strich ist das
+    // Fenster leicht 400 x 250 gross, und dann laeuft diese Schleife
+    // hunderttausendmal je Form. Gemessen an 1000 langen Strichen:
+    // 2,62 s mit dem Aufruf je Bildpunkt gegen 0,55 s mit dem
+    // Zeilenzeiger -- derselbe Rasterinhalt, dieselbe Rechnung, nur
+    // ohne den Aufruf.
+    var yy: usize = 0
+    while yy < h {
+        let zeile: u64 = raster.raster_cov_row(&(*m).ra, yy)
+        var xx: usize = 0
+        while xx < w {
+            let cov: f64 = *((zeile + (xx * 8) as u64) as *mut f64)
+            if cov > 0.0 {
+                var c: u32 = col
+                if gv {
+                    let sx: f64 = ((wx + xx as i64) as f64) + 0.5
+                    let sy: f64 = ((wy + yy as i64) as f64) + 0.5
+                    let gx: f64 = matrix.mat_x(gi, sx, sy)
+                    let gy: f64 = matrix.mat_y(gi, sx, sy)
+                    var t: f64 = 0.0
+                    if (*v).radial {
+                        t = radial_t(v, gx, gy)
+                    } else {
+                        let dx: f64 = (*v).x2 - (*v).x1
+                        let dy: f64 = (*v).y2 - (*v).y1
+                        let l2: f64 = dx * dx + dy * dy
+                        if l2 > 0.0 {
+                            t = ((gx - (*v).x1) * dx + (gy - (*v).y1) * dy) / l2
+                        }
+                    }
+                    c = verlauf_farbe(v, t)
+                    // Die Deckung der Form wirkt auf die Verlaufsfarbe.
+                    c = mit_deckung(c, (((col >> 24) & 255 as u32) as f64)
+                        / 255.0)
+                }
+                if (c >> 24) != 0 as u32 {
+                    let a: f64 = (((c >> 24) & 255 as u32) as f64) / 255.0
+                    canvas.canvas_blend((*m).cv, (wx + xx as i64) as usize,
+                        (wy + yy as i64) as usize,
+                        c | 4278190080 as u32, cov * a)
+                    if cov > 0.5 {
+                        (*m).tinte = (*m).tinte + 1
+                    }
+                }
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// Der Wert eines radialen Verlaufs an einem Punkt, mit Brennpunkt.
+#[no_gc]
+fn radial_t(v: *mut Verlauf, gx: f64, gy: f64) -> f64 {
+    let r: f64 = (*v).r
+    if r <= 0.0 {
+        return 1.0
+    }
+    var fx: f64 = (*v).fx
+    var fy: f64 = (*v).fy
+    // Ein Brennpunkt AUSSERHALB des Kreises ist nicht erlaubt; die
+    // Spezifikation schiebt ihn auf den Rand.
+    let ddx: f64 = fx - (*v).cx
+    let ddy: f64 = fy - (*v).cy
+    let dd: f64 = matrix.m_sqrt(ddx * ddx + ddy * ddy)
+    if dd > r * 0.999 {
+        let s: f64 = r * 0.999 / dd
+        fx = (*v).cx + ddx * s
+        fy = (*v).cy + ddy * s
+    }
+    let dx: f64 = gx - fx
+    let dy: f64 = gy - fy
+    let a: f64 = dx * dx + dy * dy
+    if a <= 0.0 {
+        return 0.0
+    }
+    let ex: f64 = fx - (*v).cx
+    let ey: f64 = fy - (*v).cy
+    let bb: f64 = 2.0 * (dx * ex + dy * ey)
+    let cc: f64 = ex * ex + ey * ey - r * r
+    let disk: f64 = bb * bb - 4.0 * a * cc
+    if disk < 0.0 {
+        return 1.0
+    }
+    let s: f64 = (0.0 - bb + matrix.m_sqrt(disk)) / (2.0 * a)
+    if s <= 0.0 {
+        return 1.0
+    }
+    return 1.0 / s
+}
+
+// Einen Pfad FUELLEN. `bx0..by1` ist die Umgrenzung der Form in
+// BENUTZERkoordinaten -- ein Verlauf mit `objectBoundingBox` braucht sie.
+#[no_gc]
+fn fuelle_pfad(m: *mut Maler, b: *mut xml.Baum, pf: *mut path.Pfad,
+    z: *mut Zustand, art: u32, col: u32, va: usize, vn: usize, deck: f64,
+    regel: u32, bx0: f64, by0: f64, bx1: f64, by1: f64) {
+    if art == color.F_KEINE {
+        return
+    }
+    var farbwert: u32 = col
+    if art == color.F_AKTUELL {
+        farbwert = (*z).aktuell
+    }
+    var v: Verlauf = verlauf_neu()
+    var gv: bool = false
+    var gi: matrix.Mat = matrix.mat_eins()
+    if art == color.F_VERWEIS {
+        let e: u32 = finde_id(b, xml.baum_pool(b), va, vn)
+        if e != xml.KEINER {
+            verlauf_lesen(&v, b, e, z, 0)
+        }
+        if v.da && v.n > 0 {
+            // Das Verlaufssystem: Benutzerkoordinaten, dann ggf. die
+            // Einheitsbox der Form, dann `gradientTransform`.
+            var g: matrix.Mat = (*z).m
+            if v.einheit_bbox {
+                let bw: f64 = bx1 - bx0
+                let bh: f64 = by1 - by0
+                if bw <= 0.0 || bh <= 0.0 {
+                    return
+                }
+                g = matrix.mat_mal(g, matrix.mat_von_sechs(bw, 0.0, 0.0, bh,
+                    bx0, by0))
+            }
+            g = matrix.mat_mal(g, v.gm)
+            var ok: bool = false
+            gi = matrix.mat_kehr(g, &ok)
+            if !ok {
+                return
+            }
+            gv = true
+        } else if v.da {
+            // Ein Verlauf ohne Stopps faerbt nichts (SVG 1.1, 13.2.4).
+            return
+        }
+        // Kein Verlauf gefunden -> die Ersatzfarbe in `col`.
+    }
+    var x0: f64 = 0.0
+    var y0: f64 = 0.0
+    var x1: f64 = 0.0
+    var y1: f64 = 0.0
+    if !path.pfad_grenzen(pf, (*z).m, &x0, &y0, &x1, &y1) {
+        return
+    }
+    var wx: i64 = 0
+    var wy: i64 = 0
+    var w: usize = 0
+    var h: usize = 0
+    if !fenster(m, x0, y0, x1, y1, &wx, &wy, &w, &h) {
+        return
+    }
+    if !raster.raster_begin(&(*m).ra, wx as f64, wy as f64, w, h) {
+        return
+    }
+    path.pfad_an_raster(pf, &(*m).ra, (*z).m)
+    if regel == REGEL_GERADE {
+        raster.raster_finish_evenodd(&(*m).ra)
+    } else {
+        raster.raster_finish(&(*m).ra)
+    }
+    giesse(m, wx, wy, w, h, mit_deckung(farbwert, deck), &v, gv, gi)
+}
+
+// Einen Pfad BESTREICHEN. Der Umriss entsteht in Benutzerkoordinaten und
+// wird danach wie eine Fuellung behandelt -- mit der Nichtnull-Regel, denn
+// der Umriss ist nach Bauart eine Vereinigung gleich gerichteter Konturen.
+#[no_gc]
+fn bestreiche_pfad(m: *mut Maler, b: *mut xml.Baum, pf: *mut path.Pfad,
+    z: *mut Zustand, bx0: f64, by0: f64, bx1: f64, by1: f64) {
+    if (*z).s_art == color.F_KEINE || (*z).breite <= 0.0 {
+        return
+    }
+    let mass: f64 = matrix.mat_laengenmass((*z).m)
+    path.pfad_glaette(&(*m).p2, pf, mass)
+    (*m).st.breite = (*z).breite
+    (*m).st.kappe = (*z).kappe
+    (*m).st.stoss = (*z).stoss
+    (*m).st.gehrung = (*z).gehrung
+    (*m).st.n_striche = (*z).n_striche
+    (*m).st.versatz = (*z).versatz
+    var i: usize = 0
+    while i < (*z).n_striche {
+        (*m).st.striche[i] = (*z).striche[i]
+        i = i + 1
+    }
+    stroke.strich_umriss(&(*m).p3, &(*m).p2, &(*m).st, &(*m).hilf)
+    fuelle_pfad(m, b, &(*m).p3, z, (*z).s_art, (*z).s_col, (*z).s_va,
+        (*z).s_vn, (*z).s_deck * (*z).deck, REGEL_NICHTNULL, bx0, by0,
+        bx1, by1)
+}
+
+// Beides, in der richtigen Reihenfolge: erst die Fuellung, dann der
+// Strich. Ein Strich liegt IMMER ueber der Fuellung derselben Form.
+#[no_gc]
+fn male_form(m: *mut Maler, b: *mut xml.Baum, z: *mut Zustand) {
+    var bx0: f64 = 0.0
+    var by0: f64 = 0.0
+    var bx1: f64 = 0.0
+    var by1: f64 = 0.0
+    if !path.pfad_grenzen(&(*m).p1, matrix.mat_eins(), &bx0, &by0, &bx1,
+        &by1) {
+        return
+    }
+    fuelle_pfad(m, b, &(*m).p1, z, (*z).f_art, (*z).f_col, (*z).f_va,
+        (*z).f_vn, (*z).f_deck * (*z).deck, (*z).regel, bx0, by0, bx1, by1)
+    bestreiche_pfad(m, b, &(*m).p1, z, bx0, by0, bx1, by1)
+}
+
+// ------------------------------------------------- Der Zustand eines Elements
+//
+// Liest alle Malangaben des Elements und aendert den geerbten Zustand.
+// Die Reihenfolge ist nicht beliebig: `color` zuerst, weil `fill`
+// `currentColor` sein darf; `transform` zuletzt, weil es die Matrix
+// aendert, mit der die Kinder rechnen.
+
+#[no_gc]
+fn setz_malstelle(pool: u64, a: usize, n: usize, art: *mut u32,
+    col: *mut u32, va: *mut usize, vn: *mut usize) {
+    var c: u32 = 0
+    var va2: usize = 0
+    var vn2: usize = 0
+    let k: u32 = color.lies_farbe(pool, a, n, &c, &va2, &vn2)
+    *art = k
+    *col = c
+    *va = va2
+    *vn = vn2
+}
+
+// `stroke-dasharray`. Die Werte sind Laengen, durch Komma oder Leerraum
+// getrennt. Ein NEGATIVER Wert macht die ganze Angabe ungueltig (SVG 1.1,
+// 11.4) -- dann wird durchgezogen gemalt, nicht "so gut es geht".
+#[no_gc]
+fn lies_striche(z: *mut Zustand, pool: u64, a: usize, n: usize) {
+    var i: usize = a
+    let ende: usize = a + n
+    (*z).n_striche = 0
+    matrix.ueberspringe_leer(pool, ende, &i)
+    // `none` schaltet ab.
+    if i < ende && matrix.lies_oktett(pool, i) == 110 {
+        return
+    }
+    while i < ende && (*z).n_striche < 32 {
+        var ok: bool = false
+        var v: f64 = matrix.zahl(pool, ende, &i, &ok)
+        if !ok {
+            break
+        }
+        // Die Einheit steht direkt hinter der Zahl.
+        if i < ende {
+            let c0: u32 = matrix.lies_oktett(pool, i)
+            if c0 == 37 {
+                v = v * (*z).vw / 100.0
+                i = i + 1
+            } else if i + 1 < ende {
+                let c1: u32 = matrix.lies_oktett(pool, i + 1)
+                if c0 == 112 && c1 == 116 {
+                    v = v * 4.0 / 3.0
+                    i = i + 2
+                } else if c0 == 101 && c1 == 109 {
+                    v = v * (*z).groesse
+                    i = i + 2
+                } else if c0 == 112 && c1 == 120 {
+                    i = i + 2
+                }
+            }
+        }
+        if v < 0.0 {
+            (*z).n_striche = 0
+            return
+        }
+        (*z).striche[(*z).n_striche] = v
+        (*z).n_striche = (*z).n_striche + 1
+        matrix.ueberspringe_trenner(pool, ende, &i)
+    }
+}
+
+#[no_gc]
+fn wort_ist(pool: u64, a: usize, n: usize, w: u64, wn: usize) -> bool {
+    if n != wn {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if matrix.lies_oktett(pool, a + i) != matrix.lies_oktett(w, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Die eigene Deckung EINES Elements, ohne die geerbte.
+#[no_gc]
+fn element_deckung(b: *mut xml.Baum, i: u32) -> f64 {
+    var a: usize = 0
+    var n: usize = 0
+    var wop: [u8; 7] = "opacity"
+    if !hole_wert(b, i, (&wop[0]) as u64, 7, &a, &n) {
+        return 1.0
+    }
+    var ok: bool = false
+    let v: f64 = color.lies_deckung(xml.baum_pool(b), a, n, &ok)
+    if !ok {
+        return 1.0
+    }
+    return v
+}
+
+#[no_gc]
+fn zustand_anwenden(b: *mut xml.Baum, i: u32, z: *mut Zustand) {
+    let pool: u64 = xml.baum_pool(b)
+    var a: usize = 0
+    var n: usize = 0
+    var wcolor: [u8; 5] = "color"
+    if hole_wert(b, i, (&wcolor[0]) as u64, 5, &a, &n) {
+        var c: u32 = 0
+        var va: usize = 0
+        var vn: usize = 0
+        if color.lies_farbe(pool, a, n, &c, &va, &vn) == color.F_FARBE {
+            (*z).aktuell = c
+        }
+    }
+    var wfs: [u8; 9] = "font-size"
+    if hole_wert(b, i, (&wfs[0]) as u64, 9, &a, &n) {
+        var ok: bool = false
+        let v: f64 = laenge_von(pool, a, n, (*z).groesse, (*z).groesse, &ok)
+        if ok && v > 0.0 {
+            (*z).groesse = v
+        }
+    }
+    var wfill: [u8; 4] = "fill"
+    if hole_wert(b, i, (&wfill[0]) as u64, 4, &a, &n) {
+        setz_malstelle(pool, a, n, &(*z).f_art, &(*z).f_col, &(*z).f_va,
+            &(*z).f_vn)
+    }
+    var wstroke: [u8; 6] = "stroke"
+    if hole_wert(b, i, (&wstroke[0]) as u64, 6, &a, &n) {
+        setz_malstelle(pool, a, n, &(*z).s_art, &(*z).s_col, &(*z).s_va,
+            &(*z).s_vn)
+    }
+    var wsw: [u8; 12] = "stroke-width"
+    if hole_wert(b, i, (&wsw[0]) as u64, 12, &a, &n) {
+        var ok: bool = false
+        let v: f64 = laenge_von(pool, a, n, diagonale((*z).vw, (*z).vh),
+            (*z).groesse, &ok)
+        if ok && v >= 0.0 {
+            (*z).breite = v
+        }
+    }
+    var wlc: [u8; 14] = "stroke-linecap"
+    if hole_wert(b, i, (&wlc[0]) as u64, 14, &a, &n) {
+        var wr: [u8; 5] = "round"
+        var wq: [u8; 6] = "square"
+        if wort_ist(pool, a, n, (&wr[0]) as u64, 5) {
+            (*z).kappe = stroke.K_RUND
+        } else if wort_ist(pool, a, n, (&wq[0]) as u64, 6) {
+            (*z).kappe = stroke.K_ECKIG
+        } else {
+            (*z).kappe = stroke.K_STUMPF
+        }
+    }
+    var wlj: [u8; 15] = "stroke-linejoin"
+    if hole_wert(b, i, (&wlj[0]) as u64, 15, &a, &n) {
+        var wr: [u8; 5] = "round"
+        var wb: [u8; 5] = "bevel"
+        if wort_ist(pool, a, n, (&wr[0]) as u64, 5) {
+            (*z).stoss = stroke.S_RUND
+        } else if wort_ist(pool, a, n, (&wb[0]) as u64, 5) {
+            (*z).stoss = stroke.S_ABGE
+        } else {
+            (*z).stoss = stroke.S_GEHRUNG
+        }
+    }
+    var wml: [u8; 17] = "stroke-miterlimit"
+    if hole_wert(b, i, (&wml[0]) as u64, 17, &a, &n) {
+        var ok: bool = false
+        var j: usize = a
+        let v: f64 = matrix.zahl(pool, a + n, &j, &ok)
+        if ok && v >= 1.0 {
+            (*z).gehrung = v
+        }
+    }
+    var wda: [u8; 18] = "stroke-dasharray  "
+    if hole_wert(b, i, (&wda[0]) as u64, 16, &a, &n) {
+        lies_striche(z, pool, a, n)
+    }
+    var wdo: [u8; 19] = "stroke-dashoffset  "
+    if hole_wert(b, i, (&wdo[0]) as u64, 17, &a, &n) {
+        var ok: bool = false
+        let v: f64 = laenge_von(pool, a, n, (*z).vw, (*z).groesse, &ok)
+        if ok {
+            (*z).versatz = v
+        }
+    }
+    var wfr: [u8; 9] = "fill-rule"
+    if hole_wert(b, i, (&wfr[0]) as u64, 9, &a, &n) {
+        var we: [u8; 7] = "evenodd"
+        if wort_ist(pool, a, n, (&we[0]) as u64, 7) {
+            (*z).regel = REGEL_GERADE
+        } else {
+            (*z).regel = REGEL_NICHTNULL
+        }
+    }
+    var wfo: [u8; 12] = "fill-opacity"
+    if hole_wert(b, i, (&wfo[0]) as u64, 12, &a, &n) {
+        var ok: bool = false
+        (*z).f_deck = color.lies_deckung(pool, a, n, &ok)
+    }
+    var wso: [u8; 14] = "stroke-opacity"
+    if hole_wert(b, i, (&wso[0]) as u64, 14, &a, &n) {
+        var ok: bool = false
+        (*z).s_deck = color.lies_deckung(pool, a, n, &ok)
+    }
+    // `opacity` steht NICHT hier. Bei einer Form ist sie ein Faktor auf
+    // die Farbe, bei einer Gruppe eine eigene Schicht -- die
+    // Unterscheidung trifft `zeichne`, nicht diese Funktion.
+    var wta: [u8; 11] = "text-anchor"
+    if hole_wert(b, i, (&wta[0]) as u64, 11, &a, &n) {
+        var wm: [u8; 6] = "middle"
+        var we2: [u8; 3] = "end"
+        if wort_ist(pool, a, n, (&wm[0]) as u64, 6) {
+            (*z).anker = ANKER_MITTE
+        } else if wort_ist(pool, a, n, (&we2[0]) as u64, 3) {
+            (*z).anker = ANKER_ENDE
+        } else {
+            (*z).anker = ANKER_ANFANG
+        }
+    }
+    var wtr: [u8; 9] = "transform"
+    if xml.attr_wert(b, i, (&wtr[0]) as u64, 9, &a, &n) {
+        (*z).m = matrix.mat_mal((*z).m,
+            matrix.zerteile_transform(pool + a as u64, n))
+    }
+}
+
+// --------------------------------------------- viewBox und preserveAspectRatio
+//
+// Die haeufigste Fehlerquelle ueberhaupt bei SVG-Symbolen. `viewBox`
+// sagt, welcher Ausschnitt des Benutzersystems im Ansichtsfenster
+// erscheint; `preserveAspectRatio` sagt, was passiert, wenn die beiden
+// Seitenverhaeltnisse nicht zusammenpassen.
+//
+// Die Kodierung von `ausricht`: 0 heisst `none` (verzerren erlaubt),
+// sonst `1 + 3*xi + yi` mit xi, yi aus {0 = Min, 1 = Mid, 2 = Max}.
+
+#[no_gc]
+fn lies_par(pool: u64, a: usize, n: usize, ausricht: *mut u32,
+    art: *mut u32) {
+    *ausricht = 1 + 3 * 1 + 1 // xMidYMid
+    *art = PAR_MEET
+    var i: usize = a
+    let ende: usize = a + n
+    matrix.ueberspringe_leer(pool, ende, &i)
+    // Ein fuehrendes `defer` wird ueberlesen.
+    if i + 5 <= ende && matrix.lies_oktett(pool, i) == 100 {
+        while i < ende && !matrix.ist_leer(matrix.lies_oktett(pool, i)) {
+            i = i + 1
+        }
+        matrix.ueberspringe_leer(pool, ende, &i)
+    }
+    if i >= ende {
+        return
+    }
+    if matrix.lies_oktett(pool, i) == 110 {
+        *ausricht = 0
+        i = i + 4
+    } else if i + 8 <= ende && matrix.lies_oktett(pool, i) == 120 {
+        // xMinYMax: Zeichen 1..3 sind der x-Teil, 5..7 der y-Teil.
+        var xi: u32 = 1
+        var yi: u32 = 1
+        let x2: u32 = matrix.lies_oktett(pool, i + 3)
+        if x2 == 110 {
+            xi = 0
+        } else if x2 == 120 {
+            xi = 2
+        }
+        let y2: u32 = matrix.lies_oktett(pool, i + 7)
+        if y2 == 110 {
+            yi = 0
+        } else if y2 == 120 {
+            yi = 2
+        }
+        *ausricht = 1 + 3 * xi + yi
+        i = i + 8
+    }
+    matrix.ueberspringe_leer(pool, ende, &i)
+    if i < ende && matrix.lies_oktett(pool, i) == 115 {
+        *art = PAR_SLICE
+    }
+}
+
+// Die Matrix, die den `viewBox`-Ausschnitt in das Ansichtsfenster legt.
+#[no_gc]
+fn ansicht_matrix(vx: f64, vy: f64, vw: f64, vh: f64, ex: f64, ey: f64,
+    ew: f64, eh: f64, ausricht: u32, art: u32) -> matrix.Mat {
+    if vw <= 0.0 || vh <= 0.0 {
+        return matrix.mat_verschiebe(ex, ey)
+    }
+    var sx: f64 = ew / vw
+    var sy: f64 = eh / vh
+    if ausricht != 0 {
+        if art == PAR_SLICE {
+            if sy > sx {
+                sx = sy
+            } else {
+                sy = sx
+            }
+        } else {
+            if sy < sx {
+                sx = sy
+            } else {
+                sy = sx
+            }
+        }
+    }
+    var tx: f64 = ex - vx * sx
+    var ty: f64 = ey - vy * sy
+    if ausricht != 0 {
+        let a: u32 = ausricht - 1
+        let xi: u32 = a / 3
+        let yi: u32 = a % 3
+        if xi == 1 {
+            tx = tx + (ew - vw * sx) / 2.0
+        } else if xi == 2 {
+            tx = tx + (ew - vw * sx)
+        }
+        if yi == 1 {
+            ty = ty + (eh - vh * sy) / 2.0
+        } else if yi == 2 {
+            ty = ty + (eh - vh * sy)
+        }
+    }
+    return matrix.mat_von_sechs(sx, 0.0, 0.0, sy, tx, ty)
+}
+
+// Die vier Zahlen einer `viewBox`.
+#[no_gc]
+fn lies_viewbox(pool: u64, a: usize, n: usize, v: *mut f64) -> bool {
+    var i: usize = a
+    let ende: usize = a + n
+    var k: usize = 0
+    while k < 4 {
+        matrix.ueberspringe_trenner(pool, ende, &i)
+        var ok: bool = false
+        let x: f64 = matrix.zahl(pool, ende, &i, &ok)
+        if !ok {
+            return false
+        }
+        *((v as u64 + (k * 8) as u64) as *mut f64) = x
+        k = k + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------- Die Formen
+//
+// Jede Grundform wird zu einem Pfad. Die Regeln fuer entartete Werte
+// stehen in SVG 1.1, 9.2 bis 9.7 und sind hier ausgeschrieben, weil sie
+// nicht alle gleich sind: ein `rect` mit `width="0"` wird NICHT gemalt,
+// ein `line` mit gleichem Anfang und Ende schon (es kann eine runde Kappe
+// haben), und ein `circle` mit `r="0"` wieder nicht.
+
+#[no_gc]
+fn form_rect(m: *mut Maler, b: *mut xml.Baum, i: u32, z: *mut Zustand) {
+    var wx: [u8; 1] = "x"
+    var wy: [u8; 1] = "y"
+    var ww: [u8; 5] = "width"
+    var wh: [u8; 6] = "height"
+    var wrx: [u8; 2] = "rx"
+    var wry: [u8; 2] = "ry"
+    let x: f64 = attr_laenge(b, i, (&wx[0]) as u64, 1, (*z).vw, z, 0.0)
+    let y: f64 = attr_laenge(b, i, (&wy[0]) as u64, 1, (*z).vh, z, 0.0)
+    let w: f64 = attr_laenge(b, i, (&ww[0]) as u64, 5, (*z).vw, z, 0.0)
+    let h: f64 = attr_laenge(b, i, (&wh[0]) as u64, 6, (*z).vh, z, 0.0)
+    if w <= 0.0 || h <= 0.0 {
+        return
+    }
+    // Steht nur eines von `rx`/`ry`, gilt es fuer beide.
+    var rx: f64 = attr_laenge(b, i, (&wrx[0]) as u64, 2, (*z).vw, z, 0.0 - 1.0)
+    var ry: f64 = attr_laenge(b, i, (&wry[0]) as u64, 2, (*z).vh, z, 0.0 - 1.0)
+    if rx < 0.0 && ry < 0.0 {
+        rx = 0.0
+        ry = 0.0
+    } else if rx < 0.0 {
+        rx = ry
+    } else if ry < 0.0 {
+        ry = rx
+    }
+    path.pfad_rund_rechteck(&(*m).p1, x, y, w, h, rx, ry)
+}
+
+#[no_gc]
+fn form_circle(m: *mut Maler, b: *mut xml.Baum, i: u32, z: *mut Zustand) {
+    var wcx: [u8; 2] = "cx"
+    var wcy: [u8; 2] = "cy"
+    var wr: [u8; 1] = "r"
+    let cx: f64 = attr_laenge(b, i, (&wcx[0]) as u64, 2, (*z).vw, z, 0.0)
+    let cy: f64 = attr_laenge(b, i, (&wcy[0]) as u64, 2, (*z).vh, z, 0.0)
+    let r: f64 = attr_laenge(b, i, (&wr[0]) as u64, 1,
+        diagonale((*z).vw, (*z).vh), z, 0.0)
+    if r <= 0.0 {
+        return
+    }
+    path.pfad_kreis(&(*m).p1, cx, cy, r)
+}
+
+#[no_gc]
+fn form_ellipse(m: *mut Maler, b: *mut xml.Baum, i: u32, z: *mut Zustand) {
+    var wcx: [u8; 2] = "cx"
+    var wcy: [u8; 2] = "cy"
+    var wrx: [u8; 2] = "rx"
+    var wry: [u8; 2] = "ry"
+    let cx: f64 = attr_laenge(b, i, (&wcx[0]) as u64, 2, (*z).vw, z, 0.0)
+    let cy: f64 = attr_laenge(b, i, (&wcy[0]) as u64, 2, (*z).vh, z, 0.0)
+    var rx: f64 = attr_laenge(b, i, (&wrx[0]) as u64, 2, (*z).vw, z,
+        0.0 - 1.0)
+    var ry: f64 = attr_laenge(b, i, (&wry[0]) as u64, 2, (*z).vh, z,
+        0.0 - 1.0)
+    // `auto` bzw. Fehlen: der andere Radius gilt (SVG 2); fehlen beide,
+    // wird nichts gemalt.
+    if rx < 0.0 && ry < 0.0 {
+        return
+    }
+    if rx < 0.0 {
+        rx = ry
+    }
+    if ry < 0.0 {
+        ry = rx
+    }
+    if rx <= 0.0 || ry <= 0.0 {
+        return
+    }
+    path.pfad_ellipse(&(*m).p1, cx, cy, rx, ry)
+}
+
+#[no_gc]
+fn form_line(m: *mut Maler, b: *mut xml.Baum, i: u32, z: *mut Zustand) {
+    var w1: [u8; 2] = "x1"
+    var w2: [u8; 2] = "y1"
+    var w3: [u8; 2] = "x2"
+    var w4: [u8; 2] = "y2"
+    let x1: f64 = attr_laenge(b, i, (&w1[0]) as u64, 2, (*z).vw, z, 0.0)
+    let y1: f64 = attr_laenge(b, i, (&w2[0]) as u64, 2, (*z).vh, z, 0.0)
+    let x2: f64 = attr_laenge(b, i, (&w3[0]) as u64, 2, (*z).vw, z, 0.0)
+    let y2: f64 = attr_laenge(b, i, (&w4[0]) as u64, 2, (*z).vh, z, 0.0)
+    path.pfad_zug(&(*m).p1, x1, y1)
+    path.pfad_linie(&(*m).p1, x2, y2)
+}
+
+#[no_gc]
+fn form_poly(m: *mut Maler, b: *mut xml.Baum, i: u32, zu: bool) {
+    var wp: [u8; 6] = "points"
+    var a: usize = 0
+    var n: usize = 0
+    if !xml.attr_wert(b, i, (&wp[0]) as u64, 6, &a, &n) {
+        return
+    }
+    let pool: u64 = xml.baum_pool(b)
+    let ok: bool = path.zerteile_punkte(&(*m).p1, pool + a as u64, n, zu)
+}
+
+#[no_gc]
+fn form_path(m: *mut Maler, b: *mut xml.Baum, i: u32) {
+    var wd: [u8; 1] = "d"
+    var a: usize = 0
+    var n: usize = 0
+    if !hole_wert(b, i, (&wd[0]) as u64, 1, &a, &n) {
+        return
+    }
+    let pool: u64 = xml.baum_pool(b)
+    let ok: bool = path.zerteile_d(&(*m).p1, pool + a as u64, n)
+}
+
+// ------------------------------------------------------------- Der Text
+//
+// Was gebaut ist: `text` und `tspan`, `x`/`y`/`dx`/`dy` als EINZELWERT
+// (nicht als Liste je Zeichen), `text-anchor`, `font-size`, Fuellung und
+// Strich wie bei jeder anderen Form. Was NICHT gebaut ist und in
+// docs/ROUNDGRAFIK.md steht: `textPath`, `textLength`, Listen von
+// Koordinaten je Zeichen, `rotate`.
+
+#[no_gc]
+fn utf8_naechst(p: u64, n: usize, i: *mut usize) -> u32 {
+    if *i >= n {
+        return 0
+    }
+    let c: u32 = matrix.lies_oktett(p, *i)
+    if c < 128 {
+        *i = *i + 1
+        return c
+    }
+    if c >= 240 && *i + 3 < n {
+        let v: u32 = ((c & 7) << 18)
+            | ((matrix.lies_oktett(p, *i + 1) & 63) << 12)
+            | ((matrix.lies_oktett(p, *i + 2) & 63) << 6)
+            | (matrix.lies_oktett(p, *i + 3) & 63)
+        *i = *i + 4
+        return v
+    }
+    if c >= 224 && *i + 2 < n {
+        let v: u32 = ((c & 15) << 12)
+            | ((matrix.lies_oktett(p, *i + 1) & 63) << 6)
+            | (matrix.lies_oktett(p, *i + 2) & 63)
+        *i = *i + 3
+        return v
+    }
+    if c >= 192 && *i + 1 < n {
+        let v: u32 = ((c & 31) << 6)
+            | (matrix.lies_oktett(p, *i + 1) & 63)
+        *i = *i + 2
+        return v
+    }
+    *i = *i + 1
+    return 65533
+}
+
+// Der Vorschub einer Zeichenkette. Ohne Schrift ist er null -- dann wird
+// auch nichts gemalt, und das ist sichtbar, nicht still falsch.
+#[no_gc]
+fn text_breite(m: *mut Maler, p: u64, a: usize, n: usize, groesse: f64)
+    -> f64 {
+    if (*m).fm == 0 {
+        return 0.0
+    }
+    var req: fontsel.FontReq = fontsel.req_new()
+    var i: usize = a
+    let ende: usize = a + n
+    var br: f64 = 0.0
+    var vorher: u32 = 0
+    while i < ende {
+        let cp: u32 = utf8_naechst(p, ende, &i)
+        if cp == 0 {
+            break
+        }
+        br = br + fontsel.fm_advance((*m).fm, &req, groesse, cp)
+        vorher = cp
+    }
+    return br
+}
+
+// Die Gesamtbreite eines `text`-Elements samt aller `tspan`.
+#[no_gc]
+fn text_breite_baum(m: *mut Maler, b: *mut xml.Baum, e: u32, groesse: f64,
+    tiefe: usize) -> f64 {
+    if tiefe > 8 {
+        return 0.0
+    }
+    var br: f64 = 0.0
+    let pool: u64 = xml.baum_pool(b)
+    var k: u32 = xml.knoten_kind(b, e)
+    while k != xml.KEINER {
+        if xml.knoten_art(b, k) == xml.K_TEXT {
+            br = br + text_breite(m, pool, xml.knoten_text_a(b, k),
+                xml.knoten_text_n(b, k), groesse)
+        } else if name_streu(b, k) == N_TSPAN {
+            br = br + text_breite_baum(m, b, k, groesse, tiefe + 1)
+        }
+        k = xml.knoten_naechst(b, k)
+    }
+    return br
+}
+
+// Ein Stueck Text an der Feder malen.
+#[no_gc]
+fn male_lauf(m: *mut Maler, b: *mut xml.Baum, p: u64, a: usize, n: usize,
+    z: *mut Zustand, feder: *mut f64, gy: f64) {
+    if (*m).fm == 0 || n == 0 {
+        return
+    }
+    if (*z).f_art == color.F_KEINE && (*z).s_art == color.F_KEINE {
+        // Trotzdem vorschieben, sonst stimmt die Stelle des naechsten
+        // Stuecks nicht.
+        *feder = *feder + text_breite(m, p, a, n, (*z).groesse)
+        return
+    }
+    var req: fontsel.FontReq = fontsel.req_new()
+    let groesse: f64 = (*z).groesse
+    let asc: f64 = fontsel.fm_ascent((*m).fm, &req, groesse)
+    let desc: f64 = fontsel.fm_descent((*m).fm, &req, groesse)
+    let br: f64 = text_breite(m, p, a, n, groesse)
+    // Das Fenster: die Grundlinie plus Ober- und Unterlaenge, durch die
+    // Matrix geschickt. Alle vier Ecken, weil die Matrix drehen darf.
+    let ux0: f64 = *feder - groesse
+    let uy0: f64 = gy - asc - groesse * 0.3
+    let ux1: f64 = *feder + br + groesse
+    let uy1: f64 = gy + desc + groesse * 0.3
+    var bx0: f64 = 1.0e300
+    var by0: f64 = 1.0e300
+    var bx1: f64 = 0.0 - 1.0e300
+    var by1: f64 = 0.0 - 1.0e300
+    var e: usize = 0
+    while e < 4 {
+        var px: f64 = ux0
+        var py: f64 = uy0
+        if e == 1 {
+            px = ux1
+        }
+        if e == 2 {
+            py = uy1
+        }
+        if e == 3 {
+            px = ux1
+            py = uy1
+        }
+        let sx: f64 = matrix.mat_x((*z).m, px, py)
+        let sy: f64 = matrix.mat_y((*z).m, px, py)
+        if sx < bx0 {
+            bx0 = sx
+        }
+        if sy < by0 {
+            by0 = sy
+        }
+        if sx > bx1 {
+            bx1 = sx
+        }
+        if sy > by1 {
+            by1 = sy
+        }
+        e = e + 1
+    }
+    var wx: i64 = 0
+    var wy: i64 = 0
+    var w: usize = 0
+    var h: usize = 0
+    if !fenster(m, bx0, by0, bx1, by1, &wx, &wy, &w, &h) {
+        *feder = *feder + br
+        return
+    }
+    if !raster.raster_begin(&(*m).ra, wx as f64, wy as f64, w, h) {
+        *feder = *feder + br
+        return
+    }
+    // Die Umrisse werden mit dem LINEAREN Teil der Matrix gezeichnet, an
+    // der y-Spiegelung konjugiert: die y-Achse einer Schrift zeigt nach
+    // oben, die der Seite nach unten. Ohne die Konjugation stuenden die
+    // Buchstaben bei einer Drehung falsch herum -- dieselbe Rechnung wie
+    // in lib/paint/painter.fi.
+    let g00: f64 = (*z).m.a
+    let g01: f64 = 0.0 - (*z).m.b
+    let g10: f64 = 0.0 - (*z).m.c
+    let g11: f64 = (*z).m.d
+    var i: usize = a
+    let ende: usize = a + n
+    var vorher: u32 = 0
+    var vorher_face: u32 = fontsel.PICK_NONE
+    while i < ende {
+        let cp: u32 = utf8_naechst(p, ende, &i)
+        if cp == 0 {
+            break
+        }
+        let pick: u32 = fontsel.fm_pick((*m).fm, &req, cp)
+        let f: *mut ttf.Font = fontsel.fm_face_of((*m).fm, pick)
+        let up: f64 = ttf.font_upem(f) as f64
+        let scale: f64 = groesse / up
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        if vorher != 0 as u32 && (pick & 65535 as u32) == vorher_face {
+            *feder = *feder + (ttf.font_kern(f, vorher, gid) as f64) * scale
+        }
+        let px: f64 = matrix.mat_x((*z).m, *feder, gy)
+        let py: f64 = matrix.mat_y((*z).m, *feder, gy)
+        let okg: bool = ttf.font_outline_m(f, gid, &(*m).ra, px, py, scale,
+            g00, g01, g10, g11, (*m).scratch, GLYPH_SCRATCH, 0)
+        *feder = *feder + (ttf.font_advance(f, gid) as f64) * scale
+        vorher = gid
+        vorher_face = pick & 65535 as u32
+    }
+    raster.raster_finish(&(*m).ra)
+    var col: u32 = (*z).f_col
+    if (*z).f_art == color.F_AKTUELL {
+        col = (*z).aktuell
+    }
+    var vl: Verlauf = verlauf_neu()
+    giesse(m, wx, wy, w, h, mit_deckung(col, (*z).f_deck * (*z).deck), &vl,
+        false, matrix.mat_eins())
+}
+
+// Ein `text` oder `tspan` samt Kindern.
+#[no_gc]
+fn male_text_baum(m: *mut Maler, b: *mut xml.Baum, e: u32, z_in: Zustand,
+    feder: *mut f64, gy_in: f64, tiefe: usize) {
+    if tiefe > 8 {
+        return
+    }
+    var z: Zustand = z_in
+    zustand_anwenden(b, e, &z)
+    var gy: f64 = gy_in
+    var wx: [u8; 1] = "x"
+    var wy: [u8; 1] = "y"
+    var wdx: [u8; 2] = "dx"
+    var wdy: [u8; 2] = "dy"
+    var a: usize = 0
+    var n: usize = 0
+    if xml.attr_wert(b, e, (&wx[0]) as u64, 1, &a, &n) {
+        *feder = attr_laenge(b, e, (&wx[0]) as u64, 1, z.vw, &z, *feder)
+    }
+    if xml.attr_wert(b, e, (&wy[0]) as u64, 1, &a, &n) {
+        gy = attr_laenge(b, e, (&wy[0]) as u64, 1, z.vh, &z, gy)
+    }
+    *feder = *feder + attr_laenge(b, e, (&wdx[0]) as u64, 2, z.vw, &z, 0.0)
+    gy = gy + attr_laenge(b, e, (&wdy[0]) as u64, 2, z.vh, &z, 0.0)
+    let pool: u64 = xml.baum_pool(b)
+    var k: u32 = xml.knoten_kind(b, e)
+    while k != xml.KEINER {
+        if xml.knoten_art(b, k) == xml.K_TEXT {
+            male_lauf(m, b, pool, xml.knoten_text_a(b, k),
+                xml.knoten_text_n(b, k), &z, feder, gy)
+        } else if name_streu(b, k) == N_TSPAN {
+            male_text_baum(m, b, k, z, feder, gy, tiefe + 1)
+        }
+        k = xml.knoten_naechst(b, k)
+    }
+}
+
+#[no_gc]
+fn male_text(m: *mut Maler, b: *mut xml.Baum, e: u32, z: *mut Zustand) {
+    if (*m).fm == 0 {
+        return
+    }
+    var wx: [u8; 1] = "x"
+    var wy: [u8; 1] = "y"
+    var x: f64 = attr_laenge(b, e, (&wx[0]) as u64, 1, (*z).vw, z, 0.0)
+    let y: f64 = attr_laenge(b, e, (&wy[0]) as u64, 1, (*z).vh, z, 0.0)
+    if (*z).anker != ANKER_ANFANG {
+        let br: f64 = text_breite_baum(m, b, e, (*z).groesse, 0)
+        if (*z).anker == ANKER_MITTE {
+            x = x - br / 2.0
+        } else {
+            x = x - br
+        }
+    }
+    var feder: f64 = x
+    // Der Zustand ist schon angewandt; `male_text_baum` wendet ihn
+    // erneut an, was fuer dasselbe Element dasselbe Ergebnis gibt.
+    male_text_baum(m, b, e, *z, &feder, y, 0)
+}
+
+// ---------------------------------------------------------- Der Durchlauf
+
+// Ist `moeglicher` ein Vorfahre von `i`? Ein `use`, dessen Ziel sein
+// eigener Vorfahre ist, ist nach SVG 1.1, 5.6 ein FEHLER -- das `use`
+// wird dann gar nicht gezeichnet, und zwar auch nicht ein einziges Mal.
+// Ohne diese Pruefung malt eine Fassung, die nur die Tiefe begrenzt, das
+// Ziel einmal (oder 24 mal), und das sieht auf der Seite aus wie ein
+// Fehler im Bild statt wie ein Fehler in der Datei. Genau das war der
+// erste Messwert dieser Runde: 8,04 % Abweichung gegen Chromium auf
+// tests/grafik/aufbau/use_schleife.svg.
+#[no_gc]
+fn ist_vorfahre(b: *mut xml.Baum, moeglicher: u32, i: u32) -> bool {
+    var k: u32 = i
+    var wach: usize = 0
+    while k != xml.KEINER && wach < 4096 {
+        if k == moeglicher {
+            return true
+        }
+        k = xml.knoten_eltern(b, k)
+        wach = wach + 1
+    }
+    return false
+}
+
+#[no_gc]
+fn schon_benutzt(m: *mut Maler, e: u32) -> bool {
+    var i: usize = 0
+    while i < (*m).n_benutzt {
+        if (*m).benutzt[i] == e {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+#[no_gc]
+fn zeichne_kinder(m: *mut Maler, b: *mut xml.Baum, e: u32, z: Zustand,
+    tiefe: usize) {
+    var k: u32 = xml.knoten_kind(b, e)
+    while k != xml.KEINER {
+        zeichne(m, b, k, z, tiefe + 1)
+        k = xml.knoten_naechst(b, k)
+    }
+}
+
+// Ein `svg` oder ein `symbol` als ANSICHTSFENSTER. `ex`/`ey`/`ew`/`eh`
+// ist das Fenster in den Koordinaten des Elternteils.
+#[no_gc]
+fn zeichne_ansicht(m: *mut Maler, b: *mut xml.Baum, e: u32, z_in: Zustand,
+    ex: f64, ey: f64, ew: f64, eh: f64, ersatz_w: f64, ersatz_h: f64,
+    tiefe: usize) {
+    var z: Zustand = z_in
+    if ew <= 0.0 || eh <= 0.0 {
+        return
+    }
+    let pool: u64 = xml.baum_pool(b)
+    var a: usize = 0
+    var n: usize = 0
+    var wvb: [u8; 7] = "viewBox"
+    var wpar: [u8; 19] = "preserveAspectRatio"
+    var vb: [f64; 4] = [0.0; 4]
+    var hat_vb: bool = false
+    if xml.attr_wert(b, e, (&wvb[0]) as u64, 7, &a, &n) {
+        hat_vb = lies_viewbox(pool, a, n, &vb[0])
+    }
+    // ERSATZ-viewBox FUER DIE WURZEL.
+    //
+    // Ein `<svg width="50" height="50">` OHNE `viewBox` hat eine
+    // Eigengroesse von 50x50, und ein Browser, der es als Bild in einen
+    // 200x200-Kasten legt, SKALIERT es auf 200x200. Wer hier nur
+    // verschiebt, malt es klein in die Ecke. Genau das ist bei drei von
+    // vier echten Wikipedia-Symbolen passiert (49 %, 61 % und 26 %
+    // Abweichung gegen Chromium; danach 0,4 %, 0,6 % und 0,5 %).
+    //
+    // Fuer ein GESCHACHTELTES `svg` gilt das NICHT: dort ist das
+    // Koordinatensystem des Kindes das des Elternteils, und ohne
+    // `viewBox` wird wirklich nur verschoben. Darum steht die Ersatzbox
+    // nicht hier fest, sondern kommt von aussen -- nur `male_baum` gibt
+    // sie mit.
+    var ersatz: bool = false
+    if !hat_vb && ersatz_w > 0.0 && ersatz_h > 0.0 {
+        vb[0] = 0.0
+        vb[1] = 0.0
+        vb[2] = ersatz_w
+        vb[3] = ersatz_h
+        hat_vb = true
+        ersatz = true
+    }
+    var ausricht: u32 = 5
+    var art: u32 = PAR_MEET
+    if xml.attr_wert(b, e, (&wpar[0]) as u64, 19, &a, &n) {
+        lies_par(pool, a, n, &ausricht, &art)
+    }
+    // Die Ersatzbox wird GEZERRT, nicht eingepasst. Der Grund steht in
+    // der Bildskalierung, nicht in SVG: ein `<img>` mit gesetzter Breite
+    // UND Hoehe zieht sein Bild auf genau diese Groesse, und ein SVG ohne
+    // `viewBox` ist an dieser Stelle ein Bild seiner Eigengroesse. Mit
+    // Einpassung stuende es mit Rand in der Mitte -- gegen Chromium
+    // gemessen 28,85 % Abweichung bei einem nicht quadratischen Rahmen,
+    // mit Zerrung 0,60 %.
+    if ersatz {
+        ausricht = 0
+    }
+    // Das Ansichtsfenster BESCHNEIDET. `overflow: hidden` ist der
+    // Vorgabewert fuer `svg` und `symbol`; ohne den Beschnitt laeuft ein
+    // Symbol mit `slice` ueber seinen Rahmen hinaus.
+    let cx0: f64 = matrix.mat_x(z.m, ex, ey)
+    let cy0: f64 = matrix.mat_y(z.m, ex, ey)
+    let cx1: f64 = matrix.mat_x(z.m, ex + ew, ey + eh)
+    let cy1: f64 = matrix.mat_y(z.m, ex + ew, ey + eh)
+    var kx0: f64 = cx0
+    var ky0: f64 = cy0
+    var kx1: f64 = cx1
+    var ky1: f64 = cy1
+    if kx1 < kx0 {
+        kx0 = cx1
+        kx1 = cx0
+    }
+    if ky1 < ky0 {
+        ky0 = cy1
+        ky1 = cy0
+    }
+    // Nur bei einer achsenparallelen Matrix ist ein Rechteckbeschnitt
+    // richtig; bei einer Drehung waere er zu gross. Zu gross heisst: es
+    // wird zu viel gezeigt, nicht zu wenig -- das ist die harmlosere
+    // Seite, und sie ist hier benannt.
+    let beschnitten: bool = canvas.clip_push_rect((*m).cv, kx0, ky0, kx1, ky1)
+    if hat_vb {
+        z.m = matrix.mat_mal(z.m, ansicht_matrix(vb[0], vb[1], vb[2], vb[3],
+            ex, ey, ew, eh, ausricht, art))
+        z.vw = vb[2]
+        z.vh = vb[3]
+    } else {
+        z.m = matrix.mat_mal(z.m, matrix.mat_verschiebe(ex, ey))
+        z.vw = ew
+        z.vh = eh
+    }
+    zeichne_kinder(m, b, e, z, tiefe)
+    if beschnitten {
+        canvas.clip_pop((*m).cv)
+    }
+}
+
+// EIN KNOTEN. Hier wird nur entschieden, OB und WIE -- gemalt wird in
+// `zeichne_kern`.
+#[no_gc]
+fn zeichne(m: *mut Maler, b: *mut xml.Baum, i: u32, z_in: Zustand,
+    tiefe: usize) {
+    if tiefe > TIEFE_MAX {
+        return
+    }
+    if xml.knoten_art(b, i) != xml.K_ELEMENT {
+        return
+    }
+    let h: u32 = name_streu(b, i)
+    // Was NICHT gemalt wird: Vorratsbehaelter und Beschreibungen.
+    if h == N_DEFS || h == N_SYMBOL || h == N_TITLE || h == N_DESC
+        || h == N_STYLE || h == N_METADATA || h == N_SCRIPT
+        || h == N_LINGRAD || h == N_RADGRAD || h == N_CLIPPATH
+        || h == N_MASK || h == N_FILTER || h == N_PATTERN || h == N_MARKER {
+        return
+    }
+    // `display: none` schaltet den ganzen Teilbaum ab.
+    var wdis: [u8; 7] = "display"
+    var da: usize = 0
+    var dn: usize = 0
+    if hole_wert(b, i, (&wdis[0]) as u64, 7, &da, &dn) {
+        var wnone: [u8; 4] = "none"
+        if wort_ist(xml.baum_pool(b), da, dn, (&wnone[0]) as u64, 4) {
+            return
+        }
+    }
+    let eigen: f64 = element_deckung(b, i)
+    let behaelter: bool = h == N_G || h == N_A || h == N_SVG || h == N_USE
+        || h == N_SWITCH
+    if behaelter && eigen < 1.0 {
+        var z2: Zustand = z_in
+        let geerbt: f64 = z2.deck
+        z2.deck = 1.0
+        if schicht_auf(m) {
+            zeichne_kern(m, b, i, z2, tiefe)
+            schicht_ab(m, eigen * geerbt)
+            return
+        }
+        // Keine Schicht mehr frei -- dann wird durchmultipliziert. Das
+        // ist die Naeherung, und sie steht im Bericht.
+    }
+    var z3: Zustand = z_in
+    z3.deck = z3.deck * eigen
+    zeichne_kern(m, b, i, z3, tiefe)
+}
+
+// EIN KNOTEN, wirklich gemalt.
+#[no_gc]
+fn zeichne_kern(m: *mut Maler, b: *mut xml.Baum, i: u32, z_in: Zustand,
+    tiefe: usize) {
+    let h: u32 = name_streu(b, i)
+    var a: usize = 0
+    var n: usize = 0
+    var z: Zustand = z_in
+    let pool: u64 = xml.baum_pool(b)
+    if h == N_SVG {
+        // Ein geschachteltes `svg`. Die aeussere Wurzel wird nicht hier
+        // behandelt, sondern in `male_baum`.
+        var wx: [u8; 1] = "x"
+        var wy: [u8; 1] = "y"
+        var ww: [u8; 5] = "width"
+        var wh: [u8; 6] = "height"
+        zustand_anwenden(b, i, &z)
+        let ex: f64 = attr_laenge(b, i, (&wx[0]) as u64, 1, z.vw, &z, 0.0)
+        let ey: f64 = attr_laenge(b, i, (&wy[0]) as u64, 1, z.vh, &z, 0.0)
+        let ew: f64 = attr_laenge(b, i, (&ww[0]) as u64, 5, z.vw, &z, z.vw)
+        let eh: f64 = attr_laenge(b, i, (&wh[0]) as u64, 6, z.vh, &z, z.vh)
+        zeichne_ansicht(m, b, i, z, ex, ey, ew, eh, 0.0, 0.0, tiefe)
+        return
+    }
+    if h == N_USE {
+        zustand_anwenden(b, i, &z)
+        var whref: [u8; 4] = "href"
+        var ha: usize = 0
+        var hn: usize = 0
+        if !xml.attr_wert(b, i, (&whref[0]) as u64, 4, &ha, &hn) {
+            return
+        }
+        if hn < 2 || matrix.lies_oktett(pool, ha) != 35 {
+            return
+        }
+        let ziel: u32 = finde_id(b, pool, ha + 1, hn - 1)
+        if ziel == xml.KEINER || ziel == i {
+            return
+        }
+        // DIE SCHLEIFENSPERRE, zweifach: das Ziel darf weder ein
+        // Vorfahre dieses `use` sein noch schon weiter oben in der Kette
+        // stehen.
+        if ist_vorfahre(b, ziel, i) {
+            return
+        }
+        if schon_benutzt(m, ziel) || (*m).n_benutzt >= 24 {
+            return
+        }
+        var wx: [u8; 1] = "x"
+        var wy: [u8; 1] = "y"
+        var ww: [u8; 5] = "width"
+        var wh: [u8; 6] = "height"
+        let ux: f64 = attr_laenge(b, i, (&wx[0]) as u64, 1, z.vw, &z, 0.0)
+        let uy: f64 = attr_laenge(b, i, (&wy[0]) as u64, 1, z.vh, &z, 0.0)
+        z.m = matrix.mat_mal(z.m, matrix.mat_verschiebe(ux, uy))
+        (*m).benutzt[(*m).n_benutzt] = ziel
+        (*m).n_benutzt = (*m).n_benutzt + 1
+        let zh: u32 = name_streu(b, ziel)
+        if zh == N_SYMBOL || zh == N_SVG {
+            // Ein `symbol` bekommt sein Fenster vom `use`: dessen
+            // `width`/`height`, sonst 100 %.
+            var z2: Zustand = z
+            zustand_anwenden(b, ziel, &z2)
+            var ew: f64 = attr_laenge(b, i, (&ww[0]) as u64, 5, z.vw, &z, z.vw)
+            var eh: f64 = attr_laenge(b, i, (&wh[0]) as u64, 6, z.vh, &z, z.vh)
+            if zh == N_SVG {
+                ew = attr_laenge(b, ziel, (&ww[0]) as u64, 5, z.vw, &z, ew)
+                eh = attr_laenge(b, ziel, (&wh[0]) as u64, 6, z.vh, &z, eh)
+            }
+            zeichne_ansicht(m, b, ziel, z2, 0.0, 0.0, ew, eh, 0.0, 0.0,
+                tiefe + 1)
+        } else {
+            zeichne(m, b, ziel, z, tiefe + 1)
+        }
+        (*m).n_benutzt = (*m).n_benutzt - 1
+        return
+    }
+    zustand_anwenden(b, i, &z)
+    if h == N_G || h == N_A {
+        zeichne_kinder(m, b, i, z, tiefe)
+        return
+    }
+    if h == N_SWITCH {
+        // `switch` malt das ERSTE Kind, dessen Bedingungen erfuellt sind.
+        // Bedingungen (`requiredFeatures`, `systemLanguage`) gibt es hier
+        // nicht; also gilt das erste Kind, das ueberhaupt malbar ist.
+        var k: u32 = xml.knoten_kind(b, i)
+        while k != xml.KEINER {
+            if xml.knoten_art(b, k) == xml.K_ELEMENT {
+                zeichne(m, b, k, z, tiefe + 1)
+                return
+            }
+            k = xml.knoten_naechst(b, k)
+        }
+        return
+    }
+    if h == N_TEXT {
+        male_text(m, b, i, &z)
+        return
+    }
+    // Ab hier: eine Form.
+    path.pfad_leere(&(*m).p1)
+    if h == N_PATH {
+        form_path(m, b, i)
+    } else if h == N_RECT {
+        form_rect(m, b, i, &z)
+    } else if h == N_CIRCLE {
+        form_circle(m, b, i, &z)
+    } else if h == N_ELLIPSE {
+        form_ellipse(m, b, i, &z)
+    } else if h == N_LINE {
+        form_line(m, b, i, &z)
+    } else if h == N_POLYLINE {
+        form_poly(m, b, i, false)
+    } else if h == N_POLYGON {
+        form_poly(m, b, i, true)
+    } else {
+        // Ein unbekanntes Element malt nichts, aber seine Kinder duerfen
+        // malen -- so verhaelt sich auch Chromium bei einem Element aus
+        // einem fremden Namensraum.
+        zeichne_kinder(m, b, i, z, tiefe)
+        return
+    }
+    if path.pfad_ist_leer(&(*m).p1) {
+        return
+    }
+    male_form(m, b, &z)
+}
+
+// ----------------------------------------------------------- Der Einstieg
+
+// Die Groesse, die eine SVG-Datei von sich aus hat. Sie steht in
+// `width`/`height`; fehlen die, kommt sie aus der `viewBox`; fehlt auch
+// die, sind es die 300x150 der Spezifikation.
+#[no_gc]
+fn svg_groesse(b: *mut xml.Baum, bw: *mut f64, bh: *mut f64) -> bool {
+    let e: u32 = xml.knoten_wurzel(b)
+    if e == xml.KEINER {
+        return false
+    }
+    let pool: u64 = xml.baum_pool(b)
+    var z: Zustand = zustand_neu(300.0, 150.0)
+    var ww: [u8; 5] = "width"
+    var wh: [u8; 6] = "height"
+    var wvb: [u8; 7] = "viewBox"
+    var a: usize = 0
+    var n: usize = 0
+    var vb: [f64; 4] = [0.0; 4]
+    var hat_vb: bool = false
+    if xml.attr_wert(b, e, (&wvb[0]) as u64, 7, &a, &n) {
+        hat_vb = lies_viewbox(pool, a, n, &vb[0])
+    }
+    var w: f64 = 0.0 - 1.0
+    var h: f64 = 0.0 - 1.0
+    if xml.attr_wert(b, e, (&ww[0]) as u64, 5, &a, &n) {
+        var ok: bool = false
+        // Eine Prozentangabe hier heisst "so gross wie der Rahmen"; ohne
+        // Rahmen bleibt nur die viewBox.
+        if matrix.lies_oktett(pool, a + n - 1) != 37 {
+            let v: f64 = laenge_von(pool, a, n, 0.0, 16.0, &ok)
+            if ok && v > 0.0 {
+                w = v
+            }
+        }
+    }
+    if xml.attr_wert(b, e, (&wh[0]) as u64, 6, &a, &n) {
+        var ok: bool = false
+        if matrix.lies_oktett(pool, a + n - 1) != 37 {
+            let v: f64 = laenge_von(pool, a, n, 0.0, 16.0, &ok)
+            if ok && v > 0.0 {
+                h = v
+            }
+        }
+    }
+    if w < 0.0 && hat_vb && vb[2] > 0.0 {
+        w = vb[2]
+    }
+    if h < 0.0 && hat_vb && vb[3] > 0.0 {
+        h = vb[3]
+    }
+    if w < 0.0 {
+        w = 300.0
+    }
+    if h < 0.0 {
+        h = 150.0
+    }
+    *bw = w
+    *bh = h
+    return true
+}
+
+// Den ganzen Baum in das gegebene Rechteck malen.
+#[no_gc]
+fn male_baum(m: *mut Maler, b: *mut xml.Baum, ex: f64, ey: f64, ew: f64,
+    eh: f64) {
+    male_baum_farbe(m, b, ex, ey, ew, eh, 4278190080 as u32)
+}
+
+// DASSELBE, MIT VORGEGEBENEM `currentColor`.
+//
+// PORTIERUNG IN DEN FIRN-BAUM (13.09.2026, Runde BILD+SVG): fUi braucht
+// das, und zwar genau dafuer, wofuer `currentColor` erfunden wurde.
+//
+// Justin: eingefaerbte Flaechen sollen die AKZENTFARBE aus theme.fi
+// ziehen (TOK_ACCENT / TOK_TEXT_ON_ACCENT), weil parallel zwei Runden die
+// Oberflaechen darauf umstellen. Ein Symbol von Lucide, Feather oder
+// Material schreibt `fill="currentColor"` oder `stroke="currentColor"` --
+// es ERWARTET, dass die Umgebung die Farbe setzt.
+//
+// Bisher stand `aktuell` auf Schwarz und war von aussen nicht erreichbar.
+// Ein Symbol auf einem Akzent-Knopf waere damit schwarz auf blau statt
+// weiss auf blau, und ein Symbol im dunklen Thema schwarz auf dunkelgrau
+// -- also unsichtbar.
+//
+// WARUM DAS DER RICHTIGE WEG IST und nicht das Einfaerben der fertigen
+// Maske: `currentColor` wirkt PRO FLAECHE. Ein zweifarbiges Symbol behaelt
+// seine zweite Farbe, und ein Symbol mit fest verdrahteter Farbe behaelt
+// seine -- so wie der Autor es gemeint hat. Das nachtraegliche Toenen der
+// Alphamaske macht jedes Symbol einfarbig und ist darum nur der Notnagel
+// (lib/fui/uisvg.fi sagt, wann welcher Weg gilt).
+//
+// `male_baum` bleibt als Aufruf mit Schwarz erhalten, damit Certus
+// unveraendert weiterlaeuft.
+#[no_gc]
+fn male_baum_farbe(m: *mut Maler, b: *mut xml.Baum, ex: f64, ey: f64,
+    ew: f64, eh: f64, aktuell: u32) {
+    let e: u32 = xml.knoten_wurzel(b)
+    if e == xml.KEINER {
+        return
+    }
+    if name_streu(b, e) != N_SVG {
+        return
+    }
+    (*m).n_benutzt = 0
+    // Das Stilblatt des Dokuments steht vor allem anderen: `hole_wert`
+    // fragt es bei JEDEM Element, auch schon beim Wurzelelement hier.
+    blatt_sammeln(b)
+    var z: Zustand = zustand_neu(ew, eh)
+    // Vor `zustand_anwenden`, damit ein `color="..."` im Dokument selbst
+    // noch gewinnt -- das ist die Reihenfolge, die CSS vorschreibt.
+    z.aktuell = aktuell
+    zustand_anwenden(b, e, &z)
+    // Die Eigengroesse der Datei -- sie dient als Ersatz-`viewBox`, wenn
+    // keine dasteht.
+    var nw: f64 = 0.0
+    var nh: f64 = 0.0
+    if !svg_groesse(b, &nw, &nh) {
+        nw = 0.0
+        nh = 0.0
+    }
+    zeichne_ansicht(m, b, e, z, ex, ey, ew, eh, nw, nh, 0)
+}
+
+// Der bequeme Weg: Oktette in, Bild auf der Leinwand.
+#[no_gc]
+fn male_svg(m: *mut Maler, b: *mut xml.Baum, p: u64, n: usize, ex: f64,
+    ey: f64, ew: f64, eh: f64) -> bool {
+    if !xml.zerteile_xml(b, p, n) {
+        return false
+    }
+    male_baum(m, b, ex, ey, ew, eh)
+    return true
+}
