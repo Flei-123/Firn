@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/art_main.fi -- THE PICTURE ON THE WIDGET, AT THE PIXEL.
+//
+// image_main.fi proves the blitter and svg_main.fi proves the reader.
+// This one proves the part that ties them to a control, and every check
+// is a way that wiring goes wrong without looking wrong:
+//
+//   1. A button with an icon LEFT of the text really has the icon on the
+//      left and the text to the right of it -- and the two do NOT
+//      overlap. Overlapping is the classic version of this bug: the icon
+//      is placed in the padding box while the text is still centred in
+//      the whole rect.
+//   2. ART_RIGHT puts it on the other side.
+//   3. ART_ONLY draws NO text, centred.
+//   4. The measured width GROWS by the icon plus the gap -- that is
+//      `pref_of`, and without it the layout clips the icon.
+//   5. A tint paints the icon in the theme colour, and an untinted icon
+//      keeps its own colours.
+//   6. An SVG icon and a raster icon go through the SAME placement.
+//   7. A disabled widget pales a TINTED icon and leaves a coloured one.
+//   8. A tab and a menu entry carry the icon too (the borrowed label
+//      path in wave2.label_at, which is easy to forget).
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.painter
+import fui.theme
+import fui.style
+import fui.widget
+import fui.render
+import fui.wave2
+import fui.image
+import fui.svg
+
+const W: usize = 300
+const H: usize = 120
+// Same as tools/fui/gallery2_main.fi -- a FontSet is bigger than a stack
+// frame likes, so it is heap allocated.
+const FONTSET_BYTES: usize = 262144
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, got: i64, want: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 52 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 3] = "OK "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 3)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var h1: [u8; 5] = " got "
+    rt.buf_push_bytes(&t, (&h1[0]) as u64, 5)
+    rt.buf_push_dec_i64(&t, got)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, want)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn say(s: u64, n: usize) { rt.write_everything(1, s, n) }
+
+fn chan(cv: *mut canvas.Canvas, x: usize, y: usize, which: usize) -> i64 {
+    let v: u32 = canvas.canvas_get(cv, x, y)
+    let a: u32 = (v >> 24) & 255 as u32
+    if which == 3 { return a as i64 }
+    var c: u32 = 0
+    if which == 0 { c = (v >> 16) & 255 as u32 }
+    if which == 1 { c = (v >> 8) & 255 as u32 }
+    if which == 2 { c = v & 255 as u32 }
+    if a == 0 as u32 { return 0 }
+    return ((c as f64) * 255.0 / (a as f64) + 0.5) as i64
+}
+
+// Count pixels in a column band that carry a PARTICULAR colour, so the
+// icon can be told apart from the text.
+fn count_col(cv: *mut canvas.Canvas, x0: usize, x1: usize, y0: usize,
+    y1: usize, r: i64, g: i64, b: i64, tol: i64) -> i64 {
+    var n: i64 = 0
+    var y: usize = y0
+    while y < y1 {
+        var x: usize = x0
+        while x < x1 {
+            if chan(cv, x, y, 3) > 60 {
+                var dr: i64 = chan(cv, x, y, 0) - r
+                var dg: i64 = chan(cv, x, y, 1) - g
+                var db: i64 = chan(cv, x, y, 2) - b
+                if dr < 0 { dr = 0 - dr }
+                if dg < 0 { dg = 0 - dg }
+                if db < 0 { db = 0 - db }
+                if dr <= tol && dg <= tol && db <= tol { n = n + 1 }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+fn ink_band(cv: *mut canvas.Canvas, x0: usize, x1: usize, y0: usize,
+    y1: usize) -> i64 {
+    var n: i64 = 0
+    var y: usize = y0
+    while y < y1 {
+        var x: usize = x0
+        while x < x1 {
+            if chan(cv, x, y, 3) > 60 { n = n + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+// A solid picture in a colour nothing else uses, so it is unmistakable.
+// Pure magenta: the theme has no magenta anywhere.
+fn make_magenta(w: usize, h: usize) -> u64 {
+    let p: u64 = rt.heap_alloc(w * h * 4) as u64
+    var i: usize = 0
+    while i < w * h {
+        rt.st8(p, i * 4, 255 as u8)      // R
+        rt.st8(p, i * 4 + 1, 0 as u8)    // G
+        rt.st8(p, i * 4 + 2, 255 as u8)  // B
+        rt.st8(p, i * 4 + 3, 255 as u8)  // A
+        i = i + 1
+    }
+    return p
+}
+
+fn main() -> i32 {
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) { return 2 }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, H) { return 2 }
+    // The font, the same way gallery2_main.fi does it. Without a font the
+    // text checks below cannot mean anything, so a missing font is a
+    // FAILURE and not a quiet skip.
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let have: bool = rt.read_file((&f1[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 { return 3 }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    if fm == 0 {
+        var nf: [u8; 36] = "no font -- the text checks need one\n"
+        rt.write_everything(2, (&nf[0]) as u64, 35)
+        return 3
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(false)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+
+    let mg: u64 = make_magenta(8, 8)
+    var im: image.Image = image.image_wrap(mg, 8, 8, 0)
+
+    var lbl: [u8; 5] = "Datei"
+
+    // ================================================================
+    var t1: [u8; 50] = "== 1. THE ICON SITS LEFT, THE TEXT RIGHT OF IT ==\n"
+    say((&t1[0]) as u64, 50)
+
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    var b1: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b1, 10.0, 10.0, 160.0, 40.0)
+    widget.w_set_text(&b1, (&lbl[0]) as u64, 5)
+    widget.w_set_image(&b1, (&im) as u64)
+    widget.w_set_art_align(&b1, widget.ART_LEFT)
+    widget.w_set_art_size(&b1, 16, 16)
+    render.draw_button(&c, &b1)
+
+    // The magenta must be in the LEFT part of the button and nowhere in
+    // the right part.
+    let mg_left: i64 = count_col(&cv, 10, 50, 10, 50, 255, 0, 255, 40)
+    let mg_right: i64 = count_col(&cv, 90, 170, 10, 50, 255, 0, 255, 40)
+    var n1a: [u8; 31] = "1 the icon is in the LEFT third"
+    report((&n1a[0]) as u64, 31, mg_left > 100, mg_left, 100)
+    var n1b: [u8; 37] = "1 and nothing of it in the right part"
+    report((&n1b[0]) as u64, 37, mg_right == 0, mg_right, 0)
+    // and there IS dark text to the right of the icon
+    let txt: i64 = count_col(&cv, 46, 170, 10, 50, 26, 26, 26, 90)
+    var n1c: [u8; 44] = "1 the text is drawn to the right of the icon"
+    report((&n1c[0]) as u64, 44, txt > 30, txt, 30)
+
+    // ================================================================
+    var t2: [u8; 34] = "\n== 2. ART_RIGHT MOVES IT OVER ==\n"
+    say((&t2[0]) as u64, 34)
+
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    widget.w_set_art_align(&b1, widget.ART_RIGHT)
+    render.draw_button(&c, &b1)
+    let r_left: i64 = count_col(&cv, 10, 50, 10, 50, 255, 0, 255, 40)
+    let r_right: i64 = count_col(&cv, 130, 170, 10, 50, 255, 0, 255, 40)
+    var n2a: [u8; 30] = "2 now the icon is on the RIGHT"
+    report((&n2a[0]) as u64, 30, r_right > 100, r_right, 100)
+    var n2b: [u8; 27] = "2 and no longer on the left"
+    report((&n2b[0]) as u64, 27, r_left == 0, r_left, 0)
+
+    // ================================================================
+    var t3: [u8; 33] = "\n== 3. ART_ONLY DRAWS NO TEXT ==\n"
+    say((&t3[0]) as u64, 33)
+
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    var b3: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b3, 10.0, 10.0, 40.0, 40.0)
+    widget.w_set_text(&b3, (&lbl[0]) as u64, 5)
+    widget.w_set_image(&b3, (&im) as u64)
+    widget.w_set_art_align(&b3, widget.ART_ONLY)
+    widget.w_set_art_size(&b3, 16, 16)
+    render.draw_button(&c, &b3)
+    let only_mg: i64 = count_col(&cv, 10, 50, 10, 50, 255, 0, 255, 40)
+    let only_tx: i64 = count_col(&cv, 10, 50, 10, 50, 26, 26, 26, 60)
+    var n3a: [u8; 19] = "3 the icon is there"
+    report((&n3a[0]) as u64, 19, only_mg > 100, only_mg, 100)
+    var n3b: [u8; 25] = "3 and NO text was painted"
+    report((&n3b[0]) as u64, 25, only_tx == 0, only_tx, 0)
+
+    // ================================================================
+    var t4: [u8; 41] = "\n== 4. THE MEASURE COUNTS THE ICON IN ==\n"
+    say((&t4[0]) as u64, 41)
+
+    var b4: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_set_text(&b4, (&lbl[0]) as u64, 5)
+    var w_plain: f64 = 0.0
+    var h_plain: f64 = 0.0
+    render.pref_of(&c, &b4, &w_plain, &h_plain)
+    widget.w_set_image(&b4, (&im) as u64)
+    widget.w_set_art_size(&b4, 16, 16)
+    widget.w_set_art_align(&b4, widget.ART_LEFT)
+    var w_art: f64 = 0.0
+    var h_art: f64 = 0.0
+    render.pref_of(&c, &b4, &w_art, &h_art)
+    // 16 points of icon + 8 points of gap at scale 1 = 24 px wider
+    let grew: i64 = (w_art - w_plain) as i64
+    var n4: [u8; 39] = "4 the icon plus the gap widens it by 24"
+    report((&n4[0]) as u64, 39, grew >= 20 && grew <= 28, grew, 24)
+
+    // ================================================================
+    var t5: [u8; 37] = "\n== 5. THE TINT FOLLOWS THE THEME ==\n"
+    say((&t5[0]) as u64, 37)
+
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    var b5: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b5, 10.0, 10.0, 60.0, 40.0)
+    widget.w_set_image(&b5, (&im) as u64)
+    widget.w_set_art_align(&b5, widget.ART_ONLY)
+    widget.w_set_art_size(&b5, 16, 16)
+    widget.w_set_art_tint(&b5, style.color_token(style.TOK_ACCENT))
+    render.draw_button(&c, &b5)
+    // The magenta must be GONE -- it is painted in the accent now.
+    let tint_mg: i64 = count_col(&cv, 10, 70, 10, 50, 255, 0, 255, 30)
+    var n5: [u8; 39] = "5 a tinted icon is NOT magenta any more"
+    report((&n5[0]) as u64, 39, tint_mg == 0, tint_mg, 0)
+    // but something was still drawn
+    let tint_any: i64 = ink_band(&cv, 10, 70, 10, 50)
+    var n5b: [u8; 23] = "5 and it is still drawn"
+    report((&n5b[0]) as u64, 23, tint_any > 100, tint_any, 100)
+
+    // ================================================================
+    var t6: [u8; 32] = "\n== 6. SVG GOES THE SAME WAY ==\n"
+    say((&t6[0]) as u64, 32)
+
+    var sd: [u8; 88] = "<svg viewBox='0 0 10 10'><rect x='0' y='0' width='10' height='10' fill='#ff00ff'/></svg>"
+    var sv: svg.Svg = svg.svg_new()
+    let sok: bool = svg.svg_parse(&sv, (&sd[0]) as u64, 88)
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    var b6: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b6, 10.0, 10.0, 160.0, 40.0)
+    widget.w_set_text(&b6, (&lbl[0]) as u64, 5)
+    widget.w_set_svg(&b6, (&sv) as u64)
+    widget.w_set_art_align(&b6, widget.ART_LEFT)
+    widget.w_set_art_size(&b6, 16, 16)
+    render.draw_button(&c, &b6)
+    let svg_left: i64 = count_col(&cv, 10, 50, 10, 50, 255, 0, 255, 40)
+    let svg_right: i64 = count_col(&cv, 90, 170, 10, 50, 255, 0, 255, 40)
+    var n6a: [u8; 36] = "6 the SVG icon also sits on the left"
+    report((&n6a[0]) as u64, 36, sok && svg_left > 100, svg_left, 100)
+    var n6b: [u8; 22] = "6 and not on the right"
+    report((&n6b[0]) as u64, 22, svg_right == 0, svg_right, 0)
+
+    // ================================================================
+    var t7: [u8; 39] = "\n== 7. DISABLED PALES A TINTED ICON ==\n"
+    say((&t7[0]) as u64, 39)
+
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    widget.w_set_disabled(&b5, true)
+    render.draw_button(&c, &b5)
+    let dis: i64 = ink_band(&cv, 10, 70, 10, 50)
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    widget.w_set_disabled(&b5, false)
+    render.draw_button(&c, &b5)
+    let ena: i64 = ink_band(&cv, 10, 70, 10, 50)
+    var n7: [u8; 39] = "7 a disabled tinted icon is still drawn"
+    report((&n7[0]) as u64, 39, dis > 100, dis, 100)
+    // the coloured (untinted) one must NOT change with disabled
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    widget.w_set_disabled(&b3, true)
+    render.draw_button(&c, &b3)
+    let cdis: i64 = count_col(&cv, 10, 50, 10, 50, 255, 0, 255, 40)
+    var n7b: [u8; 44] = "7 a COLOURED icon keeps its colours disabled"
+    report((&n7b[0]) as u64, 44, cdis > 100, cdis, 100)
+    widget.w_set_disabled(&b3, false)
+
+    // ================================================================
+    var t8: [u8; 36] = "\n== 8. TAB AND MENU CARRY IT TOO ==\n"
+    say((&t8[0]) as u64, 36)
+
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    var tb: widget.Widget = widget.widget_new(widget.KIND_TAB)
+    widget.w_place(&tb, 10.0, 10.0, 120.0, 36.0)
+    widget.w_set_text(&tb, (&lbl[0]) as u64, 5)
+    widget.w_set_image(&tb, (&im) as u64)
+    widget.w_set_art_align(&tb, widget.ART_LEFT)
+    widget.w_set_art_size(&tb, 16, 16)
+    widget.w_set_selected(&tb, true)
+    wave2.draw_tab(&c, &tb)
+    let tab_mg: i64 = count_col(&cv, 10, 130, 10, 46, 255, 0, 255, 40)
+    var n8a: [u8; 22] = "8 a TAB draws its icon"
+    report((&n8a[0]) as u64, 22, tab_mg > 100, tab_mg, 100)
+
+    canvas.canvas_clear(&cv, 4294967295 as u32)
+    var mi: widget.Widget = widget.widget_new(widget.KIND_MENU)
+    widget.w_place(&mi, 10.0, 10.0, 160.0, 32.0)
+    widget.w_set_text(&mi, (&lbl[0]) as u64, 5)
+    widget.w_set_image(&mi, (&im) as u64)
+    widget.w_set_art_align(&mi, widget.ART_LEFT)
+    widget.w_set_art_size(&mi, 16, 16)
+    wave2.draw_menu_item(&c, &mi, false, false)
+    let mi_mg: i64 = count_col(&cv, 10, 170, 10, 42, 255, 0, 255, 40)
+    var n8b: [u8; 29] = "8 a MENU ENTRY draws its icon"
+    report((&n8b[0]) as u64, 29, mi_mg > 100, mi_mg, 100)
+
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    if G_ERRORS != 0 {
+        var bad: [u8; 13] = "\nART FAILED.\n"
+        say((&bad[0]) as u64, 13)
+        return 1
+    }
+    var good: [u8; 13] = "\nART PASSED.\n"
+    say((&good[0]) as u64, 13)
+    return 0
+}
