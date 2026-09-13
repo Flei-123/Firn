@@ -100,6 +100,29 @@ build wave3
 "$W/wave3"
 
 echo
+echo "== 10b. PICTURES AT THE PIXEL =="
+# The blitter: the channels as NUMBERS against the colour asked for (the
+# R/B swap in this project was invisible to the eye), the alpha, and the
+# box sampling that keeps a shrunk icon free of stairs.
+build image
+"$W/image"
+
+echo
+echo "== 10c. THE SVG READER AT THE PIXEL =="
+# viewBox, scaling, fill-rule evenodd (the shared rasteriser is non-zero
+# only), and the ARC against the same shape drawn as a cubic -- that
+# comparison is what caught the halved Bezier handle.
+build svg
+"$W/svg"
+
+echo
+echo "== 10d. THE PICTURE ON THE WIDGET =="
+# Icon left/right/only, the measure, the tint, and the tab and menu entry
+# that paint through the borrowed label.
+build art
+"$W/art"
+
+echo
 echo "== 11. THE TEXT VALUES AT THE PIXEL =="
 # Tracking, line height, kerning, outline, shadow, gradient. The three
 # tracking numbers Justin asked to see are printed by this one.
