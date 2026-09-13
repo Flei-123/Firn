@@ -125,6 +125,19 @@ build art
 "$W/art"
 
 echo
+echo "== 10c. RAND, FARBE UND HOVER-STIL AM BILDPUNKT =="
+# Justins Frage vom 13.09.2026: "fUi hat auch Buttons ohne Rand -- kann
+# man das konfigurieren, Rand weglassen, andere Farbe usw.?"
+#
+# Dass die Setzer EXISTIEREN, ist keine Antwort -- diese Pruefung malt
+# jede Fassung und liest den Bildpunkt zurueck: Rand weg, eigener Rand,
+# Ghost, eigene Flaeche, Radius 0 gegen rund, und ein Hover-Stil, der
+# den Zustand NICHT auffrisst. Sie endet mit 1, wenn eine Fassung nicht
+# durchschlaegt. Die Anleitung dazu: docs/FUI-RAND-UND-FARBE.md
+build rand
+"$W/rand"
+
+echo
 echo "== 11. THE TEXT VALUES AT THE PIXEL =="
 # Tracking, line height, kerning, outline, shadow, gradient. The three
 # tracking numbers Justin asked to see are printed by this one.
@@ -148,6 +161,9 @@ if [ "$1" = "--images" ]; then
     build gallery4
     "$W/gallery4" "$Z/fui-text-light.png" light
     "$W/gallery4" "$Z/fui-text-dark.png" dark
+    build rand
+    "$W/rand" "$Z/fui-rand-light.png" light
+    "$W/rand" "$Z/fui-rand-dark.png" dark
     # BILD UND SVG (Runde BILD+SVG, 13.09.2026). Fuenf Baender: Knopf mit
     # Icon, Beschriftung mit Bild und Icon-Toolbar, dasselbe SVG je Groesse
     # NEU gerastert (12..64) samt currentColor=TOK_ACCENT daneben, Bild mit
