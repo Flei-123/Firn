@@ -1,0 +1,460 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/rand_main.fi -- DER RAND: WEG, ANDERS, DICKER, RUNDER.
+//
+// ====================================================== WARUM ES DAS GIBT
+//
+// Justins Frage vom 13.09.2026: "fUi hat auch Buttons ohne Rand -- kann
+// man das konfigurieren, Rand weglassen, andere Farbe usw.?"
+//
+// Die Antwort darf keine Aufzaehlung von Funktionsnamen sein. Dass
+// `style_set_border` EXISTIERT, sagt nichts darueber, ob der Rand danach
+// auch wirklich weg ist -- genau diese Sorte Behauptung hat in diesem
+// Projekt schon zweimal eine Zeichnung still verschwinden lassen, ohne
+// dass eine Pruefung es merkte.
+//
+// Dieses Programm tut deshalb beides:
+//
+//   * es MALT die Fassungen nebeneinander in ein PNG (fuer das Auge),
+//   * und es MISST jede Fassung im Bildpunktraster nach (fuer die Zahl).
+//
+// Gemessen wird an drei Stellen je Knopf:
+//
+//       RAND OBEN  --  Mitte der oberen Kante, einen Punkt innerhalb
+//       FLAECHE    --  die Mitte des Knopfes
+//       AUSSEN     --  einen Punkt NEBEN dem Knopf
+//
+// Damit laesst sich jede der drei Fragen mit einer Zahl beantworten:
+// "ist der Rand weg" heisst RAND OBEN == AUSSEN, "hat er die verlangte
+// Farbe" heisst RAND OBEN == der gesetzte Wert, und "ist die Flaeche
+// leer" heisst FLAECHE == AUSSEN.
+//
+// DER HINTERGRUND IST ABSICHTLICH GRELL. Ein Knopf ohne Hintergrund
+// vor einer Flaeche in Themenfarbe sieht genauso aus wie einer, der die
+// Themenfarbe MALT -- der Unterschied faellt erst vor einer Farbe auf,
+// die in keinem Thema vorkommt. Das ist dieselbe Ueberlegung wie das
+// Magenta in tools/fui/style_main.fi.
+//
+//     rand_main [<out.png>] [light|dark] [<font.ttf>]
+//
+// Ohne Ausgabedatei wird nur gemessen und geprueft; mit einer wird
+// zusaetzlich das Bild geschrieben. Faellt eine Messung durch, endet
+// das Programm mit 1 -- damit kann es in tools/fui/run.sh stehen.
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+
+const FONTSET_BYTES: usize = 4096
+const W: usize = 1180
+const H: usize = 540
+
+// Der Knopf, immer gleich gross -- so sind die Messpunkte fuer alle
+// Fassungen dieselbe Rechnung.
+const BW: f64 = 150.0
+const BH: f64 = 44.0
+
+// Die grelle Unterlage. 0xFF00FF kommt in keinem Thema vor.
+fn PROBE() -> u32 { return 16711935 as u32 }
+
+// DAS ALPHA MUSS WEG, BEVOR MAN VERGLEICHT.
+//
+// `canvas.canvas_get` gibt den GESPEICHERTEN Bildpunkt zurueck, und der
+// ist 0xAARRGGBB (lib/paint/canvas.fi:257). Jede Farbe in diesem
+// Programm ist dagegen als 0xRRGGBB geschrieben. Ohne diese Maske
+// verglichen, waere 0xFF0000 niemals gleich dem gemessenen 0xFFFF0000,
+// und JEDE Pruefung dieser Seite schlaege fehl -- und zwar so, dass es
+// wie ein Fehler in fUi aussaehe.
+fn rgb(v: u32) -> u32 {
+    return v & 16777215 as u32
+}
+
+static mut G_ERRORS: usize = 0
+static mut G_CHECKS: usize = 0
+
+// ---------------------------------------------------------- die Ausgabe
+fn puts(p: u64, n: usize) {
+    rt.write_everything(1, p, n)
+}
+
+fn zeile(t: *mut rt.Buf) {
+    rt.buf_push(t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(t), rt.buf_len(t))
+    rt.buf_free(t)
+}
+
+// Ein Messsatz: Name, die drei Farben, und das Urteil.
+fn melde(nm: u64, nn: usize, oben: u32, flaeche: u32, aussen: u32,
+    ok: bool, was: u64, wn: usize) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 34 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    var h1: [u8; 5] = "rand "
+    rt.buf_push_bytes(&t, (&h1[0]) as u64, 5)
+    rt.buf_push_hex_u64(&t, oben as u64, 6)
+    var h2: [u8; 7] = "  flae "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_hex_u64(&t, flaeche as u64, 6)
+    var h3: [u8; 6] = "  aus "
+    rt.buf_push_bytes(&t, (&h3[0]) as u64, 5)
+    rt.buf_push_hex_u64(&t, aussen as u64, 6)
+    var sp: [u8; 2] = "  "
+    rt.buf_push_bytes(&t, (&sp[0]) as u64, 2)
+    G_CHECKS = G_CHECKS + 1
+    if ok {
+        var o: [u8; 3] = "OK "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 3)
+    } else {
+        var f: [u8; 7] = "FALSCH "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 7)
+        G_ERRORS = G_ERRORS + 1
+    }
+    rt.buf_push_bytes(&t, was, wn)
+    zeile(&t)
+}
+
+// ======================================================================
+// EINE FASSUNG MALEN UND MESSEN
+// ======================================================================
+//
+// Der Knopf wird auf die grelle Unterlage gemalt und danach an den
+// drei Stellen ausgelesen. `zu` ist der Zustand (NORMAL/HOVER), damit
+// dieselbe Fassung auch mit ihrem Hover-Stil gemessen werden kann.
+//
+// WARUM DIE MESSUNG EINEN PUNKT NACH INNEN GEHT: `round_ring` malt den
+// Rand INNERHALB des Rechtecks (siehe painter.fi), und die aeusserste
+// Zeile traegt bei runden Ecken die Kantenglaettung. Ein Punkt nach
+// innen liegt sicher im vollen Rand und nicht in dessen weichem Saum.
+fn mal_und_miss(c: *mut render.Ctx, cv: *mut canvas.Canvas,
+    x: f64, y: f64, z: style.StyleSet, zu: u32, txt: u64, tn: usize,
+    aus_oben: *mut u32, aus_flae: *mut u32, aus_aussen: *mut u32) {
+    // die Unterlage unter GENAU diesem Knopf, mit Rand ringsum
+    // DIE UNTERLAGE WIRD ROH GESETZT.
+    //
+    // `canvas_fill_rect` ging hier nicht: gemessen stand an der Stelle
+    // "aussen" hinterher 0xFFFFFF (die Flaeche des Themas) und nicht
+    // das Magenta. Der Fuellweg mischt ueber Alpha und haelt sich an
+    // den Clip-Stapel des Painters; fuer eine MESSUNTERLAGE ist beides
+    // falsch -- sie soll genau den Wert tragen, der hier steht, damit
+    // "unveraendert" auch wirklich unveraendert heisst.
+    var uy: usize = (y - 10.0) as usize
+    while uy < (y + BH + 10.0) as usize {
+        var ux: usize = (x - 10.0) as usize
+        while ux < (x + BW + 10.0) as usize {
+            canvas.canvas_set_raw(cv, ux, uy,
+                (255 as u32 << 24) | PROBE())
+            ux = ux + 1
+        }
+        uy = uy + 1
+    }
+    var e: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&e, x, y, BW, BH)
+    widget.w_set_text(&e, txt, tn)
+    widget.w_set_styleset(&e, z)
+    if zu == style.STATE_HOVER {
+        widget.w_set_hover(&e, true)
+    }
+    render.draw_widget(c, &e)
+    *aus_oben = rgb(canvas.canvas_get(cv, (x + BW / 2.0) as usize,
+        (y + 1.0) as usize))
+    // NICHT IN DIE MITTE: dort steht die BESCHRIFTUNG, und gemessen
+    // wurde dann die Schrift statt der Flaeche (0x104b15 auf einem
+    // Knopf, der 0x00FF00 sein sollte -- gruen mit Buchstaben drin).
+    // Ein Viertel der Hoehe unterhalb der Oberkante liegt innerhalb
+    // des Knopfes, aber ueber der Grundlinie der Schrift.
+    *aus_flae = rgb(canvas.canvas_get(cv, (x + BW / 2.0) as usize,
+        (y + BH / 4.0) as usize))
+    *aus_aussen = rgb(canvas.canvas_get(cv, (x + BW / 2.0) as usize,
+        (y - 5.0) as usize))
+}
+
+fn main(start: u64) -> i32 {
+    var willbild: bool = false
+    var path: u64 = 0
+    if rt.arg_count(start) >= 2 {
+        willbild = true
+        path = rt.arg_ptr(start, 1)
+    }
+    var dark: bool = false
+    if rt.arg_count(start) >= 3 {
+        if rt.ld8(rt.arg_ptr(start, 2), 0) == 100 as u8 {
+            dark = true
+        }
+    }
+
+    // ---- die Schrift
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 4 {
+        have = rt.read_file(rt.arg_ptr(start, 3), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, 160) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(dark)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    canvas.canvas_clear(&cv, theme.opaque((*f).base))
+
+    var o: u32 = 0
+    var fl: u32 = 0
+    var au: u32 = 0
+
+    // die Farben, die dieses Programm selbst setzt
+    let ROT: u32 = 16711680 as u32
+    let GRUEN: u32 = 65280 as u32
+    let BLAU: u32 = 255 as u32
+    let ORANGE: u32 = 16750848 as u32
+
+    var y: f64 = 40.0
+    var x: f64 = 40.0
+
+    // ==================================================================
+    // (a) STANDARD -- so wie ihn dieses Thema malt
+    // ==================================================================
+    //
+    // WICHTIG FUER DAS VERSTAENDNIS DER GANZEN SEITE: in DIESEM Thema
+    // hat ein Knopf von Haus aus KEINEN Rand. `render.def_border` gibt
+    // fuer einen Knopf `color_transparent()` zurueck, und
+    // `def_border_width` gibt 0 -- die Knoepfe dieses Themas werden
+    // durch Abstand getrennt und nicht durch eine Linie ("tone=0" in
+    // osum.shape). Fassung (a) ist deshalb der Beleg dafuer, dass
+    // "randlos" hier bereits der NORMALFALL ist; die Frage ist nicht,
+    // wie man den Rand wegbekommt, sondern wie man einen hinbekommt.
+    var t_a: [u8; 9] = "Standard\0"
+    var za: style.StyleSet = style.styleset_new()
+    mal_und_miss(&c, &cv, x, y, za, style.STATE_NORMAL,
+        (&t_a[0]) as u64, 8, &o, &fl, &au)
+    // Ohne Rand traegt die obere Kante DIESELBE Farbe wie die Flaeche
+    // -- und beide sind die Knopffarbe des Themas, nicht die
+    // Unterlage. Genau das ist der Beleg fuer "dieses Thema malt
+    // Knoepfe randlos".
+    var n_a: [u8; 31] = "a Standard (Thema: ohne Rand)  "
+    melde((&n_a[0]) as u64, 29, o, fl, au, o == fl && o != au,
+        (&n_a[0]) as u64, 0)
+
+    // ==================================================================
+    // (b) RAND AUSDRUECKLICH WEG -- Breite 0 UND durchsichtig
+    // ==================================================================
+    x = x + BW + 40.0
+    var t_b: [u8; 11] = "Kein Rand\0\0"
+    var zb: style.StyleSet = style.styleset_new()
+    let sb: *mut style.Style = style.styleset_base(&zb)
+    *sb = style.style_set_bg(*sb, style.color_literal(GRUEN))
+    *sb = style.style_set_border(*sb, style.color_transparent(), 0)
+    mal_und_miss(&c, &cv, x, y, zb, style.STATE_NORMAL,
+        (&t_b[0]) as u64, 9, &o, &fl, &au)
+    var n_b: [u8; 30] = "b Rand weg: oben == Flaeche   "
+    melde((&n_b[0]) as u64, 28, o, fl, au, o == GRUEN && fl == GRUEN,
+        (&n_b[0]) as u64, 0)
+
+    // ==================================================================
+    // (c) NUR RAND, KEIN HINTERGRUND -- "ghost"
+    // ==================================================================
+    x = x + BW + 40.0
+    var t_c: [u8; 6] = "Ghost\0"
+    var zc: style.StyleSet = style.styleset_new()
+    let sc: *mut style.Style = style.styleset_base(&zc)
+    *sc = style.style_set_bg(*sc, style.color_transparent())
+    *sc = style.style_set_border(*sc, style.color_literal(ROT), 2)
+    mal_und_miss(&c, &cv, x, y, zc, style.STATE_NORMAL,
+        (&t_c[0]) as u64, 5, &o, &fl, &au)
+    // Der Rand ist rot, die FLAECHE muss die Unterlage bleiben.
+    var n_c: [u8; 32] = "c Ghost: Rand rot, Flaeche leer "
+    melde((&n_c[0]) as u64, 31, o, fl, au, o == ROT && fl == PROBE(),
+        (&n_c[0]) as u64, 0)
+
+    // ==================================================================
+    // (d) EIGENE HINTERGRUNDFARBE
+    // ==================================================================
+    x = x + BW + 40.0
+    var t_d: [u8; 8] = "Eigene\0\0"
+    var zd: style.StyleSet = style.styleset_new()
+    let sd: *mut style.Style = style.styleset_base(&zd)
+    *sd = style.style_set_bg(*sd, style.color_literal(BLAU))
+    mal_und_miss(&c, &cv, x, y, zd, style.STATE_NORMAL,
+        (&t_d[0]) as u64, 6, &o, &fl, &au)
+    var n_d: [u8; 30] = "d eigene Farbe: Flaeche blau  "
+    melde((&n_d[0]) as u64, 29, o, fl, au, fl == BLAU,
+        (&n_d[0]) as u64, 0)
+
+    // ==================================================================
+    // (e) EIGENE RANDFARBE UND -BREITE
+    // ==================================================================
+    y = y + BH + 60.0
+    x = 40.0
+    var t_e: [u8; 10] = "Randdick\0\0"
+    var ze: style.StyleSet = style.styleset_new()
+    let se: *mut style.Style = style.styleset_base(&ze)
+    *se = style.style_set_bg(*se, style.color_literal(GRUEN))
+    *se = style.style_set_border(*se, style.color_literal(ROT), 6)
+    mal_und_miss(&c, &cv, x, y, ze, style.STATE_NORMAL,
+        (&t_e[0]) as u64, 8, &o, &fl, &au)
+    var n_e: [u8; 33] = "e Rand 6 rot auf gruener Flaeche "
+    melde((&n_e[0]) as u64, 32, o, fl, au, o == ROT && fl == GRUEN,
+        (&n_e[0]) as u64, 0)
+
+    // ==================================================================
+    // (f) ECKENRADIUS 0 GEGEN RUND
+    // ==================================================================
+    //
+    // Gemessen wird hier die ECKE und nicht die Kante: bei Radius 0 ist
+    // der Punkt (x+1,y+1) noch im Knopf, bei einem runden Knopf liegt
+    // er ausserhalb und traegt die Unterlage.
+    x = x + BW + 40.0
+    var t_f: [u8; 8] = "Eckig\0\0\0"
+    var zf: style.StyleSet = style.styleset_new()
+    let sf: *mut style.Style = style.styleset_base(&zf)
+    *sf = style.style_set_bg(*sf, style.color_literal(BLAU))
+    *sf = style.style_set_radius(*sf, 0)
+    mal_und_miss(&c, &cv, x, y, zf, style.STATE_NORMAL,
+        (&t_f[0]) as u64, 5, &o, &fl, &au)
+    let ecke_eckig: u32 = rgb(canvas.canvas_get(&cv, (x + 1.0) as usize,
+        (y + 1.0) as usize))
+    var n_f: [u8; 32] = "f Radius 0: Ecke ist gefuellt   "
+    melde((&n_f[0]) as u64, 30, ecke_eckig, fl, au,
+        ecke_eckig == BLAU, (&n_f[0]) as u64, 0)
+
+    x = x + BW + 40.0
+    var t_g: [u8; 8] = "Rund\0\0\0\0"
+    var zg: style.StyleSet = style.styleset_new()
+    let sg: *mut style.Style = style.styleset_base(&zg)
+    *sg = style.style_set_bg(*sg, style.color_literal(BLAU))
+    *sg = style.style_set_radius(*sg, 20)
+    mal_und_miss(&c, &cv, x, y, zg, style.STATE_NORMAL,
+        (&t_g[0]) as u64, 4, &o, &fl, &au)
+    let ecke_rund: u32 = rgb(canvas.canvas_get(&cv, (x + 2.0) as usize,
+        (y + 2.0) as usize))
+    var n_g: [u8; 32] = "f Radius 20: Ecke bleibt frei   "
+    melde((&n_g[0]) as u64, 31, ecke_rund, fl, au,
+        ecke_rund == PROBE(), (&n_g[0]) as u64, 0)
+
+    // ==================================================================
+    // (g) HOVER-STIL IN EIGENER FARBE
+    // ==================================================================
+    //
+    // DAS IST DIE FRAGE HINTER DER FRAGE. Ein eigener Stil nuetzt
+    // nichts, wenn er den Zustand auffrisst -- dann sieht man zwar eine
+    // Farbe, aber nicht mehr, ob der Knopf an oder aus ist. Hier wird
+    // deshalb DERSELBE Knopf zweimal gemessen, einmal ruhend und einmal
+    // ueberfahren, und verlangt, dass die zwei Werte VERSCHIEDEN sind.
+    y = y + BH + 60.0
+    x = 40.0
+    var t_h: [u8; 8] = "Ruhend\0\0"
+    var zh: style.StyleSet = style.styleset_new()
+    let sh: *mut style.Style = style.styleset_base(&zh)
+    *sh = style.style_set_bg(*sh, style.color_literal(BLAU))
+    *sh = style.style_set_border(*sh, style.color_transparent(), 0)
+    style.styleset_set_override(&zh, style.STATE_HOVER,
+        style.override_set_bg(style.override_new(),
+            style.color_literal(ORANGE)))
+    mal_und_miss(&c, &cv, x, y, zh, style.STATE_NORMAL,
+        (&t_h[0]) as u64, 6, &o, &fl, &au)
+    let ruhend: u32 = fl
+    var n_h: [u8; 30] = "g Hover-Stil: ruhend ist blau "
+    melde((&n_h[0]) as u64, 29, o, fl, au, fl == BLAU,
+        (&n_h[0]) as u64, 0)
+
+    x = x + BW + 40.0
+    var t_i: [u8; 12] = "Ueberfahren\0"
+    mal_und_miss(&c, &cv, x, y, zh, style.STATE_HOVER,
+        (&t_i[0]) as u64, 11, &o, &fl, &au)
+    var n_i: [u8; 33] = "g Hover-Stil: hover ist orange   "
+    melde((&n_i[0]) as u64, 32, o, fl, au, fl == ORANGE,
+        (&n_i[0]) as u64, 0)
+    var n_j: [u8; 33] = "g ruhend und hover unterscheidbar"
+    melde((&n_j[0]) as u64, 33, ruhend, fl, au, ruhend != fl,
+        (&n_j[0]) as u64, 0)
+
+    // ==================================================================
+    // (h) HOVER MIT EIGENER RANDFARBE -- der Rand allein reagiert
+    // ==================================================================
+    x = x + BW + 40.0
+    var t_k: [u8; 12] = "Randwechsel\0"
+    var zk: style.StyleSet = style.styleset_new()
+    let sk: *mut style.Style = style.styleset_base(&zk)
+    *sk = style.style_set_bg(*sk, style.color_transparent())
+    *sk = style.style_set_border(*sk, style.color_literal(BLAU), 3)
+    style.styleset_set_override(&zk, style.STATE_HOVER,
+        style.override_set_border(style.override_new(),
+            style.color_literal(ROT)))
+    mal_und_miss(&c, &cv, x, y, zk, style.STATE_NORMAL,
+        (&t_k[0]) as u64, 11, &o, &fl, &au)
+    let rand_ruhend: u32 = o
+    mal_und_miss(&c, &cv, x, y, zk, style.STATE_HOVER,
+        (&t_k[0]) as u64, 11, &o, &fl, &au)
+    var n_k: [u8; 33] = "h Randfarbe wechselt bei Hover   "
+    melde((&n_k[0]) as u64, 32, rand_ruhend, o, au,
+        rand_ruhend == BLAU && o == ROT, (&n_k[0]) as u64, 0)
+
+    // ---------------------------------------------------- das Bild
+    if willbild {
+        var out: mem.Buf = mem.buf_new()
+        mem.buf_init(&out)
+        if !png.write_png(&cv, &out) {
+            return 6
+        }
+        var pf: rt.Buf = rt.buf_new()
+        var k: usize = 0
+        while k < rt.c_length(path) {
+            rt.buf_push(&pf, rt.ld8(path, k))
+            k = k + 1
+        }
+        rt.buf_push(&pf, 0 as u8)
+        if !rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64,
+            mem.buf_len(&out)) {
+            return 7
+        }
+    }
+
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push(&t, 10 as u8)
+    if G_ERRORS > 0 {
+        var fm2: [u8; 25] = "RAND IST NICHT IN ORDNUNG"
+        rt.buf_push_bytes(&t, (&fm2[0]) as u64, 24)
+        rt.buf_push(&t, 10 as u8)
+        zeile(&t)
+        painter.painter_free(&z)
+        canvas.canvas_free(&cv)
+        return 1
+    }
+    var okm: [u8; 14] = "RAND BESTANDEN"
+    rt.buf_push_bytes(&t, (&okm[0]) as u64, 14)
+    rt.buf_push(&t, 10 as u8)
+    zeile(&t)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    return 0
+}
