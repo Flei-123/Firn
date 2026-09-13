@@ -1,0 +1,460 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/wrap_main.fi -- KUERZEN, UMBRECHEN, MITTIG STELLEN.
+//
+// Was hier geprueft wird, und warum jedes davon hier steht:
+//
+//   1. EIN TEXT, DER PASST, WIRD NICHT ANGEFASST. Die neue Kuerzung
+//      darf den haeufigen Fall nicht veraendern -- sonst haette jeder
+//      Knopf dieses Baums ab heute ein anderes Bild.
+//   2. EIN TEXT, DER NICHT PASST, ENDET MIT DREI PUNKTEN und nicht
+//      mitten im Wort. Gemessen wird die TINTE am rechten Rand: drei
+//      Punkte auf der Grundlinie sehen anders aus als ein abgeschnittener
+//      Buchstabe, und zwar in der untersten Zeile des Kastens.
+//   3. NICHTS WIRD BREITER ALS DER KASTEN. Das ist die eigentliche
+//      Zusage; ein "..." das selbst ueberlaeuft waere schlimmer als der
+//      harte Schnitt.
+//   4. UMBRECHEN ERGIBT WIRKLICH ZWEI ZEILEN, und die zweite steht
+//      TIEFER als die erste. Gemessen an zwei getrennten Tintenbaendern.
+//   5. UMBROCHEN WIRD AN DER WORTGRENZE. Im Umbruch darf kein
+//      Wortstueck stehen: die erste Zeile endet auf dem letzten Wort,
+//      das ganz passt.
+//   6. ART_ABOVE_CENTER STELLT DIE BESCHRIFTUNG MITTIG, ART_ABOVE
+//      nicht. Das ist Justins Punkt 4, und er ist nur im Bild zu sehen:
+//      gemessen wird der Schwerpunkt der Tinte gegen die Mitte des
+//      Elements.
+//   7. DAS SYMBOL BLEIBT DABEI MITTIG und rutscht nicht mit.
+//
+// GEMESSEN WIRD IN BILDPUNKTEN, nicht an Rueckgabewerten: der Fehler,
+// der diese Runde ausgeloest hat ("Netz vortaeusc"), war im Quelltext
+// unsichtbar und stand nur im Bild.
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.painter
+import fui.widget
+import fui.render
+import fui.theme
+import fui.style
+import fui.uiimage
+
+const W: usize = 320
+const H: usize = 220
+const FONTSET_BYTES: usize = 262144
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, got: i64, want: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 50 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 3] = "OK "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 3)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var h1: [u8; 5] = " got "
+    rt.buf_push_bytes(&t, (&h1[0]) as u64, 5)
+    rt.buf_push_dec_i64(&t, got)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, want)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn say(s: u64, n: usize) {
+    rt.write_everything(1, s, n)
+}
+
+// Ist an dieser Stelle Tinte? Der Grund ist hell, die Schrift dunkel --
+// also zaehlt alles, was deutlich dunkler ist als der Grund.
+// Ist an dieser Stelle Tinte? Gemessen wird gegen den GEMESSENEN Grund
+// und nicht gegen eine geratene Schwelle: der Grund des hellen Themas
+// ist nicht reines Weiss, und eine feste Zahl waere beim naechsten
+// Farbwechsel still falsch.
+static mut G_BG_SUM: i64 = 765
+
+fn ink(cv: *mut canvas.Canvas, x: usize, y: usize) -> bool {
+    let v: u32 = canvas.canvas_get(cv, x, y)
+    let a: u32 = (v >> 24) & 255 as u32
+    if a == 0 as u32 {
+        return false
+    }
+    let r: u32 = (v >> 16) & 255 as u32
+    let g: u32 = (v >> 8) & 255 as u32
+    let b: u32 = v & 255 as u32
+    // 60 von 765 ist reichlich mehr als die Kantenglaettung eines
+    // Buchstabens am Rand und viel weniger als der Abstand zwischen
+    // Schrift und Grund.
+    return ((r + g + b) as i64) < G_BG_SUM - 60
+}
+
+// Die aeusserste Spalte mit Tinte, von links bzw. von rechts.
+fn ink_links(cv: *mut canvas.Canvas) -> i64 {
+    var x: usize = 0
+    while x < W {
+        var y: usize = 0
+        while y < H {
+            if ink(cv, x, y) {
+                return x as i64
+            }
+            y = y + 1
+        }
+        x = x + 1
+    }
+    return -1
+}
+
+fn ink_rechts(cv: *mut canvas.Canvas) -> i64 {
+    var x: i64 = (W as i64) - 1
+    while x >= 0 {
+        var y: usize = 0
+        while y < H {
+            if ink(cv, x as usize, y) {
+                return x
+            }
+            y = y + 1
+        }
+        x = x - 1
+    }
+    return -1
+}
+
+// Wie viele Zeilen Tinte gibt es? Ein Band ist eine Folge von Zeilen
+// mit Tinte; zwischen zwei Baendern liegt mindestens eine leere Zeile.
+fn baender(cv: *mut canvas.Canvas) -> i64 {
+    var n: i64 = 0
+    var drin: bool = false
+    var y: usize = 0
+    while y < H {
+        var hat: bool = false
+        var x: usize = 0
+        while x < W {
+            if ink(cv, x, y) {
+                hat = true
+                x = W
+            }
+            x = x + 1
+        }
+        if hat && !drin {
+            n = n + 1
+            drin = true
+        }
+        if !hat {
+            drin = false
+        }
+        y = y + 1
+    }
+    return n
+}
+
+// Die Mitte der Tinte in x -- (links + rechts) / 2. Damit laesst sich
+// "steht mittig" gegen "steht links" pruefen, ohne die Schrift zu kennen.
+fn ink_mitte(cv: *mut canvas.Canvas) -> i64 {
+    let l: i64 = ink_links(cv)
+    let r: i64 = ink_rechts(cv)
+    if l < 0 || r < 0 {
+        return -1
+    }
+    return (l + r) / 2
+}
+
+fn clear(cv: *mut canvas.Canvas, bg: u32) {
+    canvas.canvas_clear(cv, theme.opaque(bg))
+}
+
+fn near(a: i64, b: i64, tol: i64) -> bool {
+    var d: i64 = a - b
+    if d < 0 { d = 0 - d }
+    return d <= tol
+}
+
+fn main(start: u64) -> i32 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let have: bool = rt.read_file((&f1[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    if fm == 0 as u64 {
+        var nof: [u8; 30] = "no font -- cannot measure\n\0\0\0\0"
+        rt.write_everything(2, (&nof[0]) as u64, 26)
+        return 3
+    }
+
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, H) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    // FALSCH WAERE `theme_new(true)`: das ist das DUNKLE Thema, und dort
+// ist der Grund dunkel. Der erste Anlauf dieses Pruefstands hat
+// genau daran elf Zusagen verloren -- die Tintenprobe hielt den
+// dunklen Grund fuer Schrift und meldete in jeder Spalte Tinte.
+    var m: theme.Theme = theme.theme_new(false)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    let bg: u32 = (*f).base & 16777215 as u32
+    // Den Grund EINMAL messen und merken -- danach weiss `ink`, wogegen
+    // es vergleicht.
+    clear(&cv, bg)
+    let bgv: u32 = canvas.canvas_get(&cv, 1, 1)
+    G_BG_SUM = (((bgv >> 16) & 255 as u32) + ((bgv >> 8) & 255 as u32)
+        + (bgv & 255 as u32)) as i64
+
+    // Der Text, um den es wirklich geht -- die laengste Beschriftung des
+    // Kontrollzentrums von OrientOS.
+    var langtext: [u8; 20] = "Netz vortaeuschen  \0"
+    let lp: u64 = (&langtext[0]) as u64
+    let ln: usize = 17
+    var kurz: [u8; 5] = "Netz\0"
+    let kp: u64 = (&kurz[0]) as u64
+    let kn: usize = 4
+
+    // ================================================================
+    var t1: [u8; 44] = "== 1. WAS PASST, BLEIBT UNVERAENDERT ==\n\0\0\0\0"
+    say((&t1[0]) as u64, 40)
+
+    // Zwei Laeufe desselben kurzen Textes: einmal ueber den alten Weg
+    // (run_draw), einmal ueber den neuen (run_draw_ellipsis). Die Tinte
+    // muss an derselben Stelle stehen.
+    var r0: painter.TextRun = painter.run_plain(15.0)
+    let fgc: u32 = theme.opaque((*f).text)
+
+    clear(&cv, bg)
+    let e_alt: f64 = painter.run_draw(&z, &r0, 20.0, 40.0, 200.0, fgc,
+        kp, kn, painter.TEXT_L)
+    let alt_l: i64 = ink_links(&cv)
+    let alt_r: i64 = ink_rechts(&cv)
+
+    clear(&cv, bg)
+    let e_neu: f64 = painter.run_draw_ellipsis(&z, &r0, 20.0, 40.0,
+        200.0, fgc, kp, kn, painter.TEXT_L)
+    let neu_l: i64 = ink_links(&cv)
+    let neu_r: i64 = ink_rechts(&cv)
+
+    var n1: [u8; 43] = "1 kurzer Text: linke Kante unveraendert   \0"
+    report((&n1[0]) as u64, 41, alt_l == neu_l, neu_l, alt_l)
+    var n2: [u8; 43] = "1 kurzer Text: rechte Kante unveraendert  \0"
+    report((&n2[0]) as u64, 41, alt_r == neu_r, neu_r, alt_r)
+
+    // ================================================================
+    var t2: [u8; 41] = "== 2. WAS NICHT PASST, ENDET MIT ... ==\n\0"
+    say((&t2[0]) as u64, 39)
+
+    // Der lange Text in einen Kasten, der ihn NICHT fasst.
+    let raum: f64 = 90.0
+    let voll: f64 = painter.run_width(&z, &r0, lp, ln)
+
+    var n3: [u8; 46] = "2 der Text ist wirklich zu breit fuer 90 px  \0"
+    report((&n3[0]) as u64, 44, voll > raum, voll as i64, 90)
+
+    clear(&cv, bg)
+    let e2: f64 = painter.run_draw_ellipsis(&z, &r0, 20.0, 40.0, raum,
+        fgc, lp, ln, painter.TEXT_L)
+    let er: i64 = ink_rechts(&cv)
+
+    // Die Zusage: nichts steht rechts von 20 + 90.
+    var n4: [u8; 44] = "2 nichts ragt ueber den Kasten hinaus      \0"
+    report((&n4[0]) as u64, 42, er <= 110, er, 110)
+
+    // Und es wurde WIRKLICH gekuerzt.
+    var gek: bool = false
+    let nn: usize = painter.run_fits_ellipsis(&z, &r0, lp, ln, raum,
+        &gek)
+    var n5: [u8; 41] = "2 gekuerzt wurde gemeldet               \0"
+    report((&n5[0]) as u64, 39, gek, nn as i64, ln as i64)
+
+    // Die drei Punkte stehen UNTEN: auf der Grundlinie. In den obersten
+    // Zeilen des Textbandes darf am rechten Ende nichts mehr stehen --
+    // ein abgeschnittener Buchstabe haette dort Tinte.
+    var oben: bool = false
+    var y2: usize = 26
+    while y2 < 34 {
+        if ink(&cv, (er as usize) - 1, y2) {
+            oben = true
+        }
+        y2 = y2 + 1
+    }
+    var n6: [u8; 46] = "2 am rechten Ende steht nur die Punktzeile   \0"
+    report((&n6[0]) as u64, 44, !oben, 0, 0)
+
+    // ================================================================
+    var t3: [u8; 35] = "== 3. UMBRECHEN IN ZWEI ZEILEN ==\n\0"
+    say((&t3[0]) as u64, 33)
+
+    clear(&cv, bg)
+    let zl: usize = painter.run_draw_wrapped(&z, &r0, 20.0, 40.0, raum,
+        18.0, fgc, lp, ln, painter.TEXT_L, 2)
+    var n7: [u8; 36] = "3 es wurden zwei Zeilen gemalt     \0"
+    report((&n7[0]) as u64, 34, zl == 2, zl as i64, 2)
+
+    let bnd: i64 = baender(&cv)
+    var n8: [u8; 40] = "3 im Bild stehen zwei Tintenbaender    \0"
+    report((&n8[0]) as u64, 38, bnd == 2, bnd, 2)
+
+    let br: i64 = ink_rechts(&cv)
+    var n9: [u8; 44] = "3 auch umbrochen ragt nichts hinaus        \0"
+    report((&n9[0]) as u64, 42, br <= 110, br, 110)
+
+    // Die Zeilenzahl, die das Messen vorhersagt, muss die sein, die
+    // gemalt wird -- sonst rechnet das Layout mit einer anderen Hoehe
+    // als das Bild hat.
+    // DIE VORHERSAGE MUSS DAS ZAEHLEN, WAS GEMALT WIRD -- und zwar bei
+    // DERSELBEN Obergrenze. Mit `max_zeilen = 2` malt `run_draw_wrapped`
+    // zwei Zeilen, also muss `run_line_count` bei 2 auch 2 sagen.
+    //
+    // Bei OFFENER Obergrenze sind es hier DREI, und das ist richtig:
+    // "vortaeuschen" passt als ganzes Wort nicht in 90 Punkte und wird
+    // hart getrennt, der Rest "en" ist die dritte Zeile. Der erste
+    // Anlauf dieses Pruefstands hat 2 erwartet und damit die Bibliothek
+    // beschuldigt, wo die Erwartung falsch war.
+    let vor2: usize = painter.run_line_count(&z, &r0, lp, ln, raum, 2)
+    var n10: [u8; 46] = "3 run_line_count zaehlt wie gemalt wird      \0"
+    report((&n10[0]) as u64, 44, vor2 == zl, vor2 as i64, zl as i64)
+
+    let vor_offen: usize = painter.run_line_count(&z, &r0, lp, ln, raum,
+        8)
+    var n10b: [u8; 48] = "3 ohne Grenze drei Zeilen (Wort wird getrennt) \0"
+    report((&n10b[0]) as u64, 46, vor_offen == 3, vor_offen as i64, 3)
+
+    // ================================================================
+    var t4: [u8; 44] = "== 4. MITTIG: ART_ABOVE_CENTER ==\n\0\0\0\0\0\0\0\0\0\0"
+    say((&t4[0]) as u64, 34)
+
+    // Ein Bild als Symbol: 16x16, volle Deckung, damit es Tinte ist.
+    let ip: u64 = rt.heap_alloc(16 * 16 * 4)
+    var q: usize = 0
+    while q < 16 * 16 {
+        rt.st8(ip, q * 4, 20 as u8)
+        rt.st8(ip, q * 4 + 1, 20 as u8)
+        rt.st8(ip, q * 4 + 2, 20 as u8)
+        rt.st8(ip, q * 4 + 3, 255 as u8)
+        q = q + 1
+    }
+    var sym: uiimage.Image = uiimage.image_wrap(ip, 16, 16, 0)
+
+    // Dasselbe Element zweimal, nur die Ausrichtung ist anders.
+    // Ein LABEL, weil dessen Vorgabe linksbuendig ist -- an einem Knopf
+    // (der ohnehin mittig setzt) waere der Unterschied nicht zu messen.
+    let EX: f64 = 40.0
+    let EY: f64 = 60.0
+    let EW: f64 = 200.0
+    let EH: f64 = 60.0
+    let mitte_soll: i64 = ((EX + EW / 2.0) as i64)
+
+    clear(&cv, bg)
+    var a1: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&a1, EX, EY, EW, EH)
+    widget.w_set_text(&a1, kp, kn)
+    widget.w_set_image(&a1, (&sym) as u64)
+    widget.w_set_art_align(&a1, widget.ART_ABOVE)
+    render.draw_text(&c, &a1)
+    let m_above: i64 = ink_mitte(&cv)
+
+    clear(&cv, bg)
+    var a2: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&a2, EX, EY, EW, EH)
+    widget.w_set_text(&a2, kp, kn)
+    widget.w_set_image(&a2, (&sym) as u64)
+    widget.w_set_art_align(&a2, widget.ART_ABOVE_CENTER)
+    render.draw_text(&c, &a2)
+    let m_center: i64 = ink_mitte(&cv)
+
+    // ART_ABOVE: linksbuendig, also deutlich LINKS der Mitte.
+    var n11: [u8; 46] = "4 ART_ABOVE steht links (wie bisher)         \0"
+    report((&n11[0]) as u64, 43, m_above < mitte_soll - 20, m_above,
+        mitte_soll)
+    // ART_ABOVE_CENTER: in der Mitte.
+    var n12: [u8; 45] = "4 ART_ABOVE_CENTER steht mittig             \0"
+    report((&n12[0]) as u64, 43, near(m_center, mitte_soll, 6), m_center,
+        mitte_soll)
+
+    // ================================================================
+    var t5: [u8; 44] = "== 5. DAS SYMBOL BLEIBT MITTIG ==\n\0\0\0\0\0\0\0\0\0\0"
+    say((&t5[0]) as u64, 34)
+
+    // Nur das Symbol malen (kein Text): seine Mitte muss die des
+    // Elements sein, in BEIDEN Ausrichtungen.
+    clear(&cv, bg)
+    render.draw_widget_art(&c, &a2)
+    let s_mitte: i64 = ink_mitte(&cv)
+    var n13: [u8; 44] = "5 das Symbol sitzt mittig ueber dem Text   \0"
+    report((&n13[0]) as u64, 42, near(s_mitte, mitte_soll, 2), s_mitte,
+        mitte_soll)
+
+    // ================================================================
+    var t6: [u8; 44] = "== 6. MEHRZEILIG IM ELEMENT ==\n\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    say((&t6[0]) as u64, 31)
+
+    // Das schmale Element mit dem langen Text und zwei erlaubten Zeilen:
+    // genau der Fall der Kachel. Gemessen wird, dass die Tinte in zwei
+    // Baendern steht und NICHT ueber den Rand laeuft.
+    let KX: f64 = 40.0
+    let KW: f64 = 110.0
+    clear(&cv, bg)
+    var k1: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&k1, KX, EY, KW, EH)
+    widget.w_set_text(&k1, lp, ln)
+    widget.w_set_image(&k1, (&sym) as u64)
+    widget.w_set_art_align(&k1, widget.ART_ABOVE_CENTER)
+    widget.w_set_text_lines(&k1, 2)
+    render.draw_text(&c, &k1)
+    let kb: i64 = baender(&cv)
+    let kr: i64 = ink_rechts(&cv)
+    let kl: i64 = ink_links(&cv)
+
+    var n14: [u8; 44] = "6 die Kachelbeschriftung steht zweizeilig  \0"
+    report((&n14[0]) as u64, 42, kb == 2, kb, 2)
+    var n15: [u8; 46] = "6 sie bleibt innerhalb der Kachel (rechts)   \0"
+    report((&n15[0]) as u64, 44, kr <= ((KX + KW) as i64), kr,
+        (KX + KW) as i64)
+    var n16: [u8; 46] = "6 sie bleibt innerhalb der Kachel (links)    \0"
+    report((&n16[0]) as u64, 44, kl >= (KX as i64), kl, KX as i64)
+
+    // Und der Vergleich, der den Gewinn zeigt: EINZEILIG im selben
+    // Kasten wird gekuerzt, ZWEIZEILIG nicht.
+    let einz: usize = painter.run_line_count(&z, &r0, lp, ln, KW, 1)
+    var gek2: bool = false
+    let nn2: usize = painter.run_fits_ellipsis(&z, &r0, lp, ln, KW,
+        &gek2)
+    var n17: [u8; 46] = "6 einzeilig muesste gekuerzt werden          \0"
+    report((&n17[0]) as u64, 44, gek2, 1, 1)
+
+    // ================================================================
+    var tail: [u8; 32] = "\n== ERGEBNIS ==\n\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    say((&tail[0]) as u64, 16)
+    var out: rt.Buf = rt.buf_new()
+    var w1: [u8; 8] = "FEHLER: "
+    rt.buf_push_bytes(&out, (&w1[0]) as u64, 8)
+    rt.buf_push_dec_i64(&out, G_ERRORS as i64)
+    rt.buf_push(&out, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+
+    if G_ERRORS != 0 {
+        return 1
+    }
+    return 0
+}

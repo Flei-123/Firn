@@ -84,6 +84,8 @@ export {
     run_set_weight, run_set_slant, run_set_line_height,
     run_set_outline, run_set_shadow, run_set_gradient,
     run_width, run_fits_upto, run_draw, run_line_height,
+    run_fits_ellipsis, run_draw_ellipsis, ellipsis_w,
+    run_line_upto, run_line_count, run_draw_wrapped,
     advance_of, pair_kern,
 }
 
@@ -786,6 +788,252 @@ fn run_fits_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
         i = i + adv
     }
     return n
+}
+
+// ======================================================================
+// KUERZEN MIT AUSLASSUNGSPUNKTEN, UND UMBRECHEN
+// ======================================================================
+//
+// Justin, 13.09.2026, am Bild des Kontrollzentrums: eine Kachel, deren
+// Beschriftung als "Netz vortaeusc" endet, ist kein Ergebnis. Windows
+// bricht die Beschriftung um oder beendet sie mit "...".
+//
+// WARUM DAS HIERHER GEHOERT UND NICHT IN DEN AUFRUFER. `run_fits_upto`
+// schneidet hart auf dem letzten Zeichen, das noch passt -- das ist
+// richtig fuer einen Textcursor und falsch fuer eine Beschriftung. Wer
+// es im Programm nachbaut, misst mit einer zweiten Rechnung und bekommt
+// eine andere Breite als der Maler: genau der Fehler, den der Kopf von
+// `art_text_split` beschreibt. Also steht es in der Datei, die die
+// Vorschuebe kennt, und jedes Element bekommt es umsonst.
+//
+// DIE AUSLASSUNGSPUNKTE SIND DREI PUNKTE UND KEIN U+2026. Die
+// Symbolschrift dieses Baums fuehrt das einzelne Zeichen nicht
+// zwangslaeufig; drei Punkte hat jede Schrift. Gemessen wird mit
+// denselben Vorschueben wie der Rest der Zeile, Kerning eingeschlossen.
+
+// Wie breit sind die drei Punkte in diesem Lauf?
+fn ellipsis_w(z: *mut Painter, r: *mut TextRun) -> f64 {
+    var w: f64 = 0.0
+    var k: usize = 0
+    while k < 3 {
+        var nx: u32 = 0
+        if k < 2 {
+            nx = 46
+        }
+        w = w + advance_of(z, r, 46, nx)
+        k = k + 1
+    }
+    return w
+}
+
+// WIE VIELE OKTETTE PASSEN, WENN HINTER IHNEN NOCH "..." STEHEN MUSS.
+//
+// Gibt zusaetzlich ueber `gekuerzt` zurueck, OB gekuerzt wurde -- der
+// Aufrufer muss wissen, ob er die Punkte ueberhaupt malen soll, und
+// soll es nicht an einem Laengenvergleich zweiter Hand ablesen.
+fn run_fits_ellipsis(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    room: f64, gekuerzt: *mut bool) -> usize {
+    *gekuerzt = false
+    if !metrics.fm_present((*z).fm) || n == 0 {
+        return n
+    }
+    // Passt alles, ist nichts zu tun -- und das ist der haeufige Fall.
+    if run_width(z, r, p, n) <= room {
+        return n
+    }
+    *gekuerzt = true
+    let ew: f64 = ellipsis_w(z, r)
+    if ew > room {
+        return 0
+    }
+    return run_fits_upto(z, r, p, n, room - ew)
+}
+
+// EINE ZEILE MALEN, DIE MIT "..." ENDET, WENN SIE NICHT PASST.
+//
+// Rueckgabe wie `run_draw`: wo der Stift stehengeblieben ist.
+fn run_draw_ellipsis(z: *mut Painter, r: *mut TextRun, x: f64,
+    base_y: f64, w: f64, col: u32, p: u64, n: usize,
+    align: u32) -> f64 {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return x
+    }
+    if w <= 0.0 {
+        return run_draw(z, r, x, base_y, w, col, p, n, align)
+    }
+    var ab: bool = false
+    let nn: usize = run_fits_ellipsis(z, r, p, n, w, &ab)
+    if !ab {
+        return run_draw(z, r, x, base_y, w, col, p, n, align)
+    }
+    if nn == 0 {
+        return x
+    }
+    // DIE AUSRICHTUNG RECHNET MIT DER GESAMTBREITE AUS TEXT UND PUNKTEN,
+    // sonst sitzt eine mittige Beschriftung um die halbe Punktbreite
+    // daneben -- derselbe Fehler, den `run_draw` im Kopf beschreibt.
+    let bw: f64 = run_width(z, r, p, nn)
+    let ew: f64 = ellipsis_w(z, r)
+    var sx: f64 = x
+    if align == TEXT_M {
+        sx = x + (w - (bw + ew)) / 2.0
+    } else if align == TEXT_R {
+        sx = x + w - (bw + ew)
+    }
+    // Beide Stuecke linksbuendig ab `sx` -- die Ausrichtung ist oben
+    // schon eingerechnet, ein zweites Mal waere sie doppelt.
+    let e1: f64 = run_draw(z, r, sx, base_y, 0.0, col, p, nn, TEXT_L)
+    var pkt: [u8; 4] = "...\0"
+    let e2: f64 = run_draw(z, r, e1, base_y, 0.0, col,
+        (&pkt[0 as usize]) as u64, 3, TEXT_L)
+    return e2
+}
+
+// ================================================== UMBRECHEN AN WORTGRENZEN
+//
+// Sucht das Ende der Zeile, die in `room` passt, und gibt ueber `nach`
+// zurueck, wo die naechste Zeile ANFAENGT (das Leerzeichen dazwischen
+// wird uebersprungen, es gehoert keiner der beiden Zeilen).
+//
+// WARUM AN WORTGRENZEN UND NICHT AN ZEICHEN: ein Umbruch mitten im Wort
+// liest sich schlechter als eine kuerzere Zeile. Passt ein EINZELNES
+// Wort nicht in die Breite, wird es doch auf dem Zeichen getrennt --
+// sonst stuende die Zeile leer da und die Schleife kaeme nicht voran.
+fn run_line_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    room: f64, nach: *mut usize) -> usize {
+    *nach = n
+    if !metrics.fm_present((*z).fm) || n == 0 {
+        return n
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    var letzte_luecke: usize = 0
+    var nach_luecke: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let nx: u32 = next_cp(p, n, i, adv)
+        if cp == 32 {
+            letzte_luecke = i
+            nach_luecke = i + adv
+        }
+        let step: f64 = advance_of(z, r, cp, nx)
+        if x + step > room {
+            if letzte_luecke > 0 {
+                *nach = nach_luecke
+                return letzte_luecke
+            }
+            // Ein einzelnes zu langes Wort: hart trennen, aber nie mit
+            // null Zeichen zurueckkommen.
+            if i == 0 {
+                *nach = adv
+                return adv
+            }
+            *nach = i
+            return i
+        }
+        x = x + step
+        i = i + adv
+    }
+    *nach = n
+    return n
+}
+
+// WIE VIELE ZEILEN BRAUCHT DIESER TEXT IN DIESER BREITE?
+// Zum Messen, bevor etwas gemalt wird -- das Layout fragt danach.
+// NUR LEERZEICHEN SIND KEINE ZEILE.
+//
+// GEFUNDEN IM PRUEFSTAND, nicht im Kopf: `run_line_count` sagte DREI
+// Zeilen voraus, wo `run_draw_wrapped` ZWEI malte. Die dritte war der
+// Rest "  " am Ende der Zeichenkette -- ein Umbruch hinter dem letzten
+// Wort laesst die Leerzeichen stehen, und eine Zeile aus zwei
+// Leerzeichen ist im Bild nichts, in der Rechnung aber eine Zeile.
+//
+// Das ist genau die Sorte Abweichung, vor der der Kopf dieser Datei
+// warnt: das Messen und das Malen muessen DASSELBE zaehlen. Wer die
+// Hoehe aus der Vorhersage nimmt, laesst sonst eine leere Zeile Platz.
+fn nur_leer(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if b8(p, i) != 32 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn run_line_count(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    room: f64, max_zeilen: usize) -> usize {
+    if n == 0 || room <= 0.0 {
+        return 0
+    }
+    var zeilen: usize = 0
+    var i: usize = 0
+    while i < n && zeilen < max_zeilen {
+        if nur_leer(p + (i as u64), n - i) {
+            return zeilen
+        }
+        var weiter: usize = 0
+        let bis: usize = run_line_upto(z, r, p + (i as u64), n - i,
+            room, &weiter)
+        if bis == 0 {
+            return zeilen + 1
+        }
+        zeilen = zeilen + 1
+        i = i + weiter
+    }
+    return zeilen
+}
+
+// MEHRZEILIG MALEN. Die letzte erlaubte Zeile bekommt "...", wenn der
+// Text dort noch nicht zu Ende ist -- sonst bricht er stumm ab, und
+// genau das ist der Fehler, der ueberhaupt zu dieser Runde gefuehrt hat.
+//
+// `zeilen_h` ist der Zeilenabstand in Bildpunkten; `base_y` die
+// Grundlinie der ERSTEN Zeile. Rueckgabe: die Zahl der gemalten Zeilen.
+fn run_draw_wrapped(z: *mut Painter, r: *mut TextRun, x: f64,
+    base_y: f64, w: f64, zeilen_h: f64, col: u32, p: u64, n: usize,
+    align: u32, max_zeilen: usize) -> usize {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return 0
+    }
+    if w <= 0.0 || max_zeilen == 0 {
+        return 0
+    }
+    var zeilen: usize = 0
+    var i: usize = 0
+    var y: f64 = base_y
+    while i < n && zeilen < max_zeilen {
+        // Siehe `nur_leer`: der Rest aus lauter Leerzeichen bekommt
+        // keine eigene Zeile, sonst zaehlt die Vorhersage anders als
+        // das Bild.
+        if nur_leer(p + (i as u64), n - i) {
+            return zeilen
+        }
+        var weiter: usize = 0
+        let bis: usize = run_line_upto(z, r, p + (i as u64), n - i, w,
+            &weiter)
+        if bis == 0 {
+            return zeilen
+        }
+        let ist_letzte: bool = (zeilen + 1 == max_zeilen)
+        let rest_bleibt: bool = (i + weiter < n)
+        if ist_letzte && rest_bleibt {
+            // Auf der letzten Zeile steht der GANZE Rest zur Wahl, nicht
+            // nur das, was das Umbrechen ihr zugeteilt hat -- sonst
+            // stuenden die Punkte schon nach dem vorletzten Wort.
+            let e4: f64 = run_draw_ellipsis(z, r, x, y, w, col,
+                p + (i as u64), n - i, align)
+        } else {
+            let e5: f64 = run_draw(z, r, x, y, w, col, p + (i as u64),
+                bis, align)
+        }
+        zeilen = zeilen + 1
+        y = y + zeilen_h
+        i = i + weiter
+    }
+    return zeilen
 }
 
 // ======================================================================
