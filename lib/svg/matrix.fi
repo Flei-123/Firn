@@ -1,0 +1,802 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/svg/matrix.fi -- DIE AFFINE MATRIX von SVG, und der Zerteiler fuer
+// das `transform`-Attribut.
+//
+// Eine Matrix ist hier immer `[a, b, c, d, e, f]` und bedeutet genau das,
+// was SVG 1.1 Abschnitt 7.4 hinschreibt:
+//
+//     | x' |   | a  c  e |   | x |
+//     | y' | = | b  d  f | * | y |
+//     | 1  |   | 0  0  1 |   | 1 |
+//
+// also `x' = a*x + c*y + e` und `y' = b*x + d*y + f`. Die Reihenfolge der
+// sechs Zahlen ist die der Schreibweise `matrix(a b c d e f)` im Attribut,
+// damit zwischen dem Text auf der Seite und den Zahlen im Speicher keine
+// Umsortierung liegt, die man vergessen kann.
+//
+// WARUM EINE EIGENE FASSUNG. Runde CSS2 hat fuer `transform` in
+// lib/css/cascade.fi bereits Matrixrechnung gebaut, und Runde LAYOUT2
+// baut daran weiter. Diese Datei ist bewusst eine ZWEITE, kleine Fassung
+// im eigenen Gebiet: das SVG-Attribut `transform` hat eine andere
+// Grammatik als die CSS-Eigenschaft (kein `deg`-Suffix als Pflicht, aber
+// `rotate(a cx cy)` mit Drehpunkt, das es in CSS so nicht gibt), und ein
+// Eingriff in fremdes Gebiet waere fuer den Merge teurer als diese paar
+// hundert Zeilen. Beim Zusammenfuehren der Zweige gehoeren die beiden
+// zusammengelegt -- das steht auch so in docs/ROUNDGRAFIK.md.
+//
+// Alles hier ist `#[no_gc]` und rechnet nur mit `f64`. Die Datei hat
+// KEINE Importe: `std.math` ist nicht `#[no_gc]`, und die vier Stuecke
+// Arithmetik, die hier gebraucht werden (Sinus, Kosinus, Tangens,
+// Wurzel), stehen darum unten als eigene Fassung. Das ist dieselbe
+// Entscheidung, die lib/font/raster.fi getroffen hat, und aus demselben
+// Grund: eine Datei, die nichts unter sich hat, kann auch aus einem Kern
+// heraus benutzt werden.
+
+export {
+    Mat,
+    mat_eins, mat_setze, mat_mal, mat_x, mat_y, mat_dx, mat_dy,
+    mat_verschiebe, mat_skaliere, mat_drehe, mat_drehe_um,
+    mat_neige_x, mat_neige_y, mat_von_sechs,
+    mat_kehr, mat_determinante, mat_laengenmass,
+    mat_hole, mat_ist_eins,
+    zerteile_transform,
+    m_sin, m_cos, m_tan, m_sqrt, m_abs, m_floor, m_ceil,
+    m_atan_grad, m_atan2_grad,
+    ist_leer, ist_ziffer, lies_oktett, ueberspringe_leer,
+    ueberspringe_trenner, zahl,
+}
+
+
+// ------------------------------------------------------ Die Arithmetik
+//
+// Sinus und Kosinus mit ARGUMENTREDUKTION IN GRAD. Das ist der Punkt, an
+// dem eine naive Fassung sichtbar falsch wird: `rotate(90)` muss eine
+// Matrix mit einer exakten Null ergeben, sonst steht ein gedrehtes
+// Rechteck um 1e-16 schief und die Kante liegt auf der falschen Seite der
+// Pixelmitte. Wird erst nach Bogenmass gerechnet, ist 90 Grad
+// `1.5707963267948966` und der Kosinus davon `6.12e-17` -- nicht null.
+//
+// Deshalb: erst in Grad auf `[0, 360)` bringen, die vier Viertel exakt
+// abhandeln, und nur den Rest in `[0, 45]` durch die Reihe schicken. Die
+// Reihe selbst ist die Taylorreihe um null; auf `[0, pi/4]` bricht sie
+// nach dem Glied x^15 unterhalb der Aufloesung eines `f64` ab.
+
+#[no_gc]
+fn m_abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+#[no_gc]
+fn m_floor(x: f64) -> f64 {
+    if x != x || x > 9.0e15 || x < 0.0 - 9.0e15 {
+        return x
+    }
+    let t: f64 = (x as i64) as f64
+    if t > x {
+        return t - 1.0
+    }
+    return t
+}
+
+#[no_gc]
+fn m_ceil(x: f64) -> f64 {
+    let f: f64 = m_floor(x)
+    if f < x {
+        return f + 1.0
+    }
+    return f
+}
+
+// Wurzel nach Newton. Der Startwert kommt aus einer Halbierung des
+// Exponenten, damit die Schleife von jeder Groessenordnung aus in
+// wenigen Schritten steht; sechs Newton-Schritte verdoppeln die Stellen
+// jedes Mal und sind fuer `f64` mehr als genug.
+#[no_gc]
+fn m_sqrt(x: f64) -> f64 {
+    if x != x || x < 0.0 {
+        return 0.0
+    }
+    if x == 0.0 {
+        return 0.0
+    }
+    var g: f64 = x
+    if g > 1.0 {
+        var o: f64 = 1.0
+        while o * o < x {
+            o = o * 2.0
+        }
+        g = o
+    } else {
+        var o: f64 = 1.0
+        while o * o > x {
+            o = o / 2.0
+        }
+        g = o * 2.0
+    }
+    var i: i32 = 0
+    while i < 24 {
+        let ng: f64 = 0.5 * (g + x / g)
+        if ng == g {
+            return g
+        }
+        g = ng
+        i = i + 1
+    }
+    return g
+}
+
+// Die Taylorreihe von sin auf `[-pi/4, pi/4]`.
+#[no_gc]
+fn reihe_sin(x: f64) -> f64 {
+    let x2: f64 = x * x
+    var s: f64 = 0.0 - 1.0 / 1307674368000.0
+    s = s * x2 + 1.0 / 6227020800.0
+    s = s * x2 - 1.0 / 39916800.0
+    s = s * x2 + 1.0 / 362880.0
+    s = s * x2 - 1.0 / 5040.0
+    s = s * x2 + 1.0 / 120.0
+    s = s * x2 - 1.0 / 6.0
+    s = s * x2 + 1.0
+    return s * x
+}
+
+// Die Taylorreihe von cos auf `[-pi/4, pi/4]`.
+#[no_gc]
+fn reihe_cos(x: f64) -> f64 {
+    let x2: f64 = x * x
+    var s: f64 = 0.0 - 1.0 / 87178291200.0
+    s = s * x2 + 1.0 / 479001600.0
+    s = s * x2 - 1.0 / 3628800.0
+    s = s * x2 + 1.0 / 40320.0
+    s = s * x2 - 1.0 / 720.0
+    s = s * x2 + 1.0 / 24.0
+    s = s * x2 - 1.0 / 2.0
+    s = s * x2 + 1.0
+    return s
+}
+
+// Grad auf `[0, 360)`.
+#[no_gc]
+fn grad_norm(g_in: f64) -> f64 {
+    var g: f64 = g_in
+    if g != g {
+        return 0.0
+    }
+    if g >= 360.0 || g <= 0.0 - 360.0 {
+        g = g - m_floor(g / 360.0) * 360.0
+    }
+    if g < 0.0 {
+        g = g + 360.0
+    }
+    if g >= 360.0 {
+        g = 0.0
+    }
+    return g
+}
+
+// Sinus eines Winkels in GRAD.
+#[no_gc]
+fn m_sin(grad: f64) -> f64 {
+    let g: f64 = grad_norm(grad)
+    // Die vier Viertelpunkte exakt.
+    if g == 0.0 {
+        return 0.0
+    }
+    if g == 90.0 {
+        return 1.0
+    }
+    if g == 180.0 {
+        return 0.0
+    }
+    if g == 270.0 {
+        return 0.0 - 1.0
+    }
+    var q: f64 = g
+    var vorz: f64 = 1.0
+    if q >= 180.0 {
+        q = q - 180.0
+        vorz = 0.0 - 1.0
+    }
+    // Jetzt liegt q in (0, 180). Auf (0, 90] spiegeln.
+    if q > 90.0 {
+        q = 180.0 - q
+    }
+    let r: f64 = q * 3.141592653589793 / 180.0
+    if q <= 45.0 {
+        return vorz * reihe_sin(r)
+    }
+    return vorz * reihe_cos(1.5707963267948966 - r)
+}
+
+// Kosinus eines Winkels in GRAD.
+#[no_gc]
+fn m_cos(grad: f64) -> f64 {
+    return m_sin(grad + 90.0)
+}
+
+// Tangens eines Winkels in GRAD. Bei 90 und 270 Grad gibt es keinen; SVG
+// laesst `skewX(90)` zwar zu, das Ergebnis ist aber eine entartete
+// Abbildung. Hier kommt eine sehr grosse Zahl heraus statt unendlich,
+// damit die nachfolgende Rechnung nicht NaN wird und die Determinante
+// sauber null bleibt.
+#[no_gc]
+fn m_tan(grad: f64) -> f64 {
+    let c: f64 = m_cos(grad)
+    if c == 0.0 {
+        return 1.0e16
+    }
+    return m_sin(grad) / c
+}
+
+// Arkustangens, ANTWORT IN GRAD. Zwei Reduktionen bringen das Argument in
+// den Bereich, in dem die Reihe schnell steht:
+//
+//   |t| > 1          ->  90 - atan(1/t)
+//   t  > 2 - sqrt(3) ->  30 + atan((t - tan30) / (1 + t*tan30))
+//
+// Danach ist |t| <= tan(15 Grad) = 0,2679, und dort faellt jedes Glied
+// der Reihe um den Faktor 0,072; zwanzig Glieder liegen unter der
+// Aufloesung eines `f64`.
+#[no_gc]
+fn atan_reihe(x: f64) -> f64 {
+    let x2: f64 = x * x
+    var term: f64 = x
+    var s: f64 = 0.0
+    var k: i64 = 0
+    while k < 20 {
+        let d: f64 = ((2 * k + 1) as f64)
+        if k % 2 == 0 {
+            s = s + term / d
+        } else {
+            s = s - term / d
+        }
+        term = term * x2
+        k = k + 1
+    }
+    return s
+}
+
+// atan fuer ein nicht negatives Argument, in Grad, Ergebnis in [0, 90].
+#[no_gc]
+fn atan_pos_grad(t: f64) -> f64 {
+    if t != t {
+        return 0.0
+    }
+    if t > 1.0e17 {
+        return 90.0
+    }
+    if t > 1.0 {
+        return 90.0 - atan_pos_grad(1.0 / t)
+    }
+    if t == 1.0 {
+        return 45.0
+    }
+    let tan30: f64 = 0.5773502691896258
+    if t > 0.2679491924311227 {
+        let u: f64 = (t - tan30) / (1.0 + t * tan30)
+        return 30.0 + atan_reihe(u) * 180.0 / 3.141592653589793
+    }
+    return atan_reihe(t) * 180.0 / 3.141592653589793
+}
+
+#[no_gc]
+fn m_atan_grad(t: f64) -> f64 {
+    if t < 0.0 {
+        return 0.0 - atan_pos_grad(0.0 - t)
+    }
+    return atan_pos_grad(t)
+}
+
+// atan2 in GRAD, Ergebnis in (-180, 180]. Die vier Achsenrichtungen
+// kommen exakt heraus -- das ist die Voraussetzung dafuer, dass ein
+// Halbkreis als Bogen genau ein Halbkreis wird und nicht 179,9999 Grad.
+#[no_gc]
+fn m_atan2_grad(y: f64, x: f64) -> f64 {
+    if x != x || y != y {
+        return 0.0
+    }
+    if x == 0.0 {
+        if y > 0.0 {
+            return 90.0
+        }
+        if y < 0.0 {
+            return 0.0 - 90.0
+        }
+        return 0.0
+    }
+    if y == 0.0 {
+        if x > 0.0 {
+            return 0.0
+        }
+        return 180.0
+    }
+    let a: f64 = atan_pos_grad(m_abs(y / x))
+    if x > 0.0 {
+        if y > 0.0 {
+            return a
+        }
+        return 0.0 - a
+    }
+    if y > 0.0 {
+        return 180.0 - a
+    }
+    return a - 180.0
+}
+
+// Sechs Zahlen. Als `struct` und nicht als `[f64; 6]`, weil ein Wert dann
+// zurueckgegeben und zugewiesen werden kann, ohne dass der Aufrufer einen
+// Zeiger halten muss.
+struct Mat {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+}
+
+#[no_gc]
+fn mat_eins() -> Mat {
+    return Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+}
+
+#[no_gc]
+fn mat_von_sechs(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> Mat {
+    return Mat { a: a, b: b, c: c, d: d, e: e, f: f }
+}
+
+#[no_gc]
+fn mat_setze(m: *mut Mat, s: Mat) {
+    (*m).a = s.a
+    (*m).b = s.b
+    (*m).c = s.c
+    (*m).d = s.d
+    (*m).e = s.e
+    (*m).f = s.f
+}
+
+// Eine der sechs Zahlen nach Nummer -- fuer Schleifen und fuer den
+// Vergleich in den Pruefwerkzeugen.
+#[no_gc]
+fn mat_hole(m: Mat, i: usize) -> f64 {
+    if i == 0 {
+        return m.a
+    }
+    if i == 1 {
+        return m.b
+    }
+    if i == 2 {
+        return m.c
+    }
+    if i == 3 {
+        return m.d
+    }
+    if i == 4 {
+        return m.e
+    }
+    return m.f
+}
+
+#[no_gc]
+fn mat_ist_eins(m: Mat) -> bool {
+    return m.a == 1.0 && m.b == 0.0 && m.c == 0.0 && m.d == 1.0
+        && m.e == 0.0 && m.f == 0.0
+}
+
+// `p * q`: erst `q`, dann `p`. Das ist die Reihenfolge, in der SVG die
+// Transformationsliste eines Elements liest -- `transform="translate(10)
+// scale(2)"` skaliert ZUERST und verschiebt dann, weil die Liste von
+// links nach rechts als Matrixprodukt gelesen wird.
+#[no_gc]
+fn mat_mal(p: Mat, q: Mat) -> Mat {
+    return Mat {
+        a: p.a * q.a + p.c * q.b,
+        b: p.b * q.a + p.d * q.b,
+        c: p.a * q.c + p.c * q.d,
+        d: p.b * q.c + p.d * q.d,
+        e: p.a * q.e + p.c * q.f + p.e,
+        f: p.b * q.e + p.d * q.f + p.f,
+    }
+}
+
+#[no_gc]
+fn mat_x(m: Mat, x: f64, y: f64) -> f64 {
+    return m.a * x + m.c * y + m.e
+}
+
+#[no_gc]
+fn mat_y(m: Mat, x: f64, y: f64) -> f64 {
+    return m.b * x + m.d * y + m.f
+}
+
+// Ein RICHTUNGSVEKTOR wird ohne die Verschiebung abgebildet. Das braucht
+// jeder, der eine Normale oder eine Tangente durch die Matrix schickt.
+#[no_gc]
+fn mat_dx(m: Mat, x: f64, y: f64) -> f64 {
+    return m.a * x + m.c * y
+}
+
+#[no_gc]
+fn mat_dy(m: Mat, x: f64, y: f64) -> f64 {
+    return m.b * x + m.d * y
+}
+
+#[no_gc]
+fn mat_verschiebe(tx: f64, ty: f64) -> Mat {
+    return Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
+}
+
+#[no_gc]
+fn mat_skaliere(sx: f64, sy: f64) -> Mat {
+    return Mat { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
+}
+
+// Der Winkel steht in SVG in GRAD, nicht im Bogenmass.
+#[no_gc]
+fn mat_drehe(grad: f64) -> Mat {
+    let c: f64 = m_cos(grad)
+    let s: f64 = m_sin(grad)
+    return Mat { a: c, b: s, c: 0.0 - s, d: c, e: 0.0, f: 0.0 }
+}
+
+// `rotate(a cx cy)` ist laut Spezifikation genau
+// `translate(cx cy) rotate(a) translate(-cx -cy)`.
+#[no_gc]
+fn mat_drehe_um(grad: f64, cx: f64, cy: f64) -> Mat {
+    let m: Mat = mat_mal(mat_verschiebe(cx, cy), mat_drehe(grad))
+    return mat_mal(m, mat_verschiebe(0.0 - cx, 0.0 - cy))
+}
+
+#[no_gc]
+fn mat_neige_x(grad: f64) -> Mat {
+    let t: f64 = m_tan(grad)
+    return Mat { a: 1.0, b: 0.0, c: t, d: 1.0, e: 0.0, f: 0.0 }
+}
+
+#[no_gc]
+fn mat_neige_y(grad: f64) -> Mat {
+    let t: f64 = m_tan(grad)
+    return Mat { a: 1.0, b: t, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+}
+
+#[no_gc]
+fn mat_determinante(m: Mat) -> f64 {
+    return m.a * m.d - m.b * m.c
+}
+
+// Die Umkehrung. Bei einer entarteten Matrix (Determinante 0 -- etwa
+// `scale(0)`) gibt es keine; dann kommt die Einheitsmatrix zurueck und
+// `ok` steht auf false. Der Aufrufer darf dann nichts zeichnen, denn eine
+// entartete Abbildung hat kein Bild mit Flaeche.
+#[no_gc]
+fn mat_kehr(m: Mat, ok: *mut bool) -> Mat {
+    let det: f64 = mat_determinante(m)
+    if det == 0.0 || det != det {
+        *ok = false
+        return mat_eins()
+    }
+    *ok = true
+    let ia: f64 = m.d / det
+    let ib: f64 = (0.0 - m.b) / det
+    let ic: f64 = (0.0 - m.c) / det
+    let id: f64 = m.a / det
+    return Mat {
+        a: ia,
+        b: ib,
+        c: ic,
+        d: id,
+        e: 0.0 - (ia * m.e + ic * m.f),
+        f: 0.0 - (ib * m.e + id * m.f),
+    }
+}
+
+// Ein LAENGENMASS der Abbildung: wie stark eine Strecke im Mittel
+// gestreckt wird. SVG braucht das an zwei Stellen -- fuer die
+// Strichbreite unter einer nicht gleichmaessigen Skalierung und fuer die
+// Frage, wie fein eine Kurve unterteilt werden muss. Die Wurzel aus dem
+// Betrag der Determinante ist das geometrische Mittel der beiden
+// Hauptstreckungen und genau das, was die Spezifikation fuer
+// `stroke-width` unter einer Skalierung meint.
+#[no_gc]
+fn mat_laengenmass(m: Mat) -> f64 {
+    var d: f64 = mat_determinante(m)
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    if d <= 0.0 {
+        return 0.0
+    }
+    return m_sqrt(d)
+}
+
+// ------------------------------------------------- Das `transform`-Attribut
+//
+// Die Grammatik von SVG 1.1, Anhang zur Praesentation:
+//
+//     transform-list  = *wsp [ transforms ] *wsp
+//     transforms      = transform | transform comma-wsp+ transforms
+//     transform       = matrix | translate | scale | rotate | skewX | skewY
+//
+// Zahlen sind durch Leerraum ODER Komma getrennt, beides beliebig oft.
+// Fehlende Zahlen haben Vorgaben: `translate(5)` heisst `translate(5 0)`,
+// `scale(2)` heisst `scale(2 2)`, `rotate(45)` dreht um den Ursprung.
+//
+// FEHLERTOLERANZ. SVG sagt fuer ein kaputtes `transform`: das Attribut
+// gilt als fehlerhaft und wird ganz verworfen. Genau das passiert hier --
+// bei einem Fehler kommt die Einheitsmatrix zurueck. Nicht "so weit wie
+// moeglich", denn eine halb angewandte Transformationsliste sieht schlimmer
+// aus als gar keine und ist schwerer zu finden.
+
+#[no_gc]
+fn ist_leer(c: u32) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 12
+}
+
+#[no_gc]
+fn lies_oktett(p: u64, i: usize) -> u32 {
+    let v: u8 = *((p + i as u64) as *mut u8)
+    return v as u32
+}
+
+#[no_gc]
+fn ueberspringe_leer(p: u64, n: usize, i: *mut usize) {
+    while *i < n && ist_leer(lies_oktett(p, *i)) {
+        *i = *i + 1
+    }
+}
+
+// Leerraum und HOECHSTENS EIN Komma. Zwei Kommas hintereinander sind ein
+// Fehler und werden hier nicht stillschweigend geschluckt.
+#[no_gc]
+fn ueberspringe_trenner(p: u64, n: usize, i: *mut usize) {
+    ueberspringe_leer(p, n, i)
+    if *i < n && lies_oktett(p, *i) == 44 {
+        *i = *i + 1
+        ueberspringe_leer(p, n, i)
+    }
+}
+
+#[no_gc]
+fn ist_ziffer(c: u32) -> bool {
+    return c >= 48 && c <= 57
+}
+
+// Eine Zahl nach der SVG-Grammatik: Vorzeichen, Ziffern, Punkt, Ziffern,
+// Exponent. `.5`, `5.`, `-.5e-3` sind alle gueltig.
+//
+// DIE ARITHMETIK. Der Nachkommateil wird als GANZE ZAHL gesammelt und
+// einmal am Ende geteilt, nicht Ziffer fuer Ziffer aufaddiert. Das ist
+// nicht Kosmetik: `0.1 + 0.02 + 0.003` gerundet in jedem Schritt weicht
+// von `123 / 1000` in der letzten Stelle ab, und bei einer Koordinate, die
+// gegen Chromium Bildpunkt fuer Bildpunkt verglichen wird, entscheidet die
+// letzte Stelle darueber, auf welcher Seite einer Pixelmitte ein Punkt
+// liegt.
+#[no_gc]
+fn zahl(p: u64, n: usize, i: *mut usize, ok: *mut bool) -> f64 {
+    var pos: usize = *i
+    var vorz: f64 = 1.0
+    if pos < n && (lies_oktett(p, pos) == 43 || lies_oktett(p, pos) == 45) {
+        if lies_oktett(p, pos) == 45 {
+            vorz = 0.0 - 1.0
+        }
+        pos = pos + 1
+    }
+    var ganz: f64 = 0.0
+    var ziffern: usize = 0
+    while pos < n && ist_ziffer(lies_oktett(p, pos)) {
+        ganz = ganz * 10.0 + ((lies_oktett(p, pos) - 48) as f64)
+        pos = pos + 1
+        ziffern = ziffern + 1
+    }
+    var wert: f64 = ganz
+    if pos < n && lies_oktett(p, pos) == 46 {
+        pos = pos + 1
+        var bruch: f64 = 0.0
+        var teiler: f64 = 1.0
+        while pos < n && ist_ziffer(lies_oktett(p, pos)) {
+            bruch = bruch * 10.0 + ((lies_oktett(p, pos) - 48) as f64)
+            teiler = teiler * 10.0
+            pos = pos + 1
+            ziffern = ziffern + 1
+        }
+        if teiler > 1.0 {
+            wert = wert + bruch / teiler
+        }
+    }
+    if ziffern == 0 {
+        *ok = false
+        return 0.0
+    }
+    if pos < n && (lies_oktett(p, pos) == 101 || lies_oktett(p, pos) == 69) {
+        var epos: usize = pos + 1
+        var evorz: i64 = 1
+        if epos < n && (lies_oktett(p, epos) == 43
+            || lies_oktett(p, epos) == 45) {
+            if lies_oktett(p, epos) == 45 {
+                evorz = 0 - 1
+            }
+            epos = epos + 1
+        }
+        var ez: i64 = 0
+        var eziffern: usize = 0
+        while epos < n && ist_ziffer(lies_oktett(p, epos)) {
+            if ez < 10000 {
+                ez = ez * 10 + (lies_oktett(p, epos) - 48) as i64
+            }
+            epos = epos + 1
+            eziffern = eziffern + 1
+        }
+        // Nur wenn wirklich Ziffern folgen, ist es ein Exponent. `1e` ist
+        // die Zahl 1, gefolgt von einem Buchstaben -- so liest es auch
+        // Chromium.
+        if eziffern > 0 {
+            pos = epos
+            var k: i64 = ez * evorz
+            if k > 308 {
+                k = 308
+            }
+            if k < 0 - 324 {
+                k = 0 - 324
+            }
+            while k > 0 {
+                wert = wert * 10.0
+                k = k - 1
+            }
+            while k < 0 {
+                wert = wert / 10.0
+                k = k + 1
+            }
+        }
+    }
+    *i = pos
+    *ok = true
+    return wert * vorz
+}
+
+// Der Name einer Funktion, verglichen mit einem festen Wort.
+#[no_gc]
+fn wort_passt(p: u64, n: usize, i: usize, w0: u32, w1: u32, w2: u32,
+    w3: u32, w4: u32, w5: u32, len: usize) -> bool {
+    if i + len > n {
+        return false
+    }
+    if len > 0 && lies_oktett(p, i) != w0 {
+        return false
+    }
+    if len > 1 && lies_oktett(p, i + 1) != w1 {
+        return false
+    }
+    if len > 2 && lies_oktett(p, i + 2) != w2 {
+        return false
+    }
+    if len > 3 && lies_oktett(p, i + 3) != w3 {
+        return false
+    }
+    if len > 4 && lies_oktett(p, i + 4) != w4 {
+        return false
+    }
+    if len > 5 && lies_oktett(p, i + 5) != w5 {
+        return false
+    }
+    return true
+}
+
+// Bis zu sechs Zahlen zwischen runden Klammern. `min` und `max` sagen,
+// wieviele erlaubt sind; `anz` sagt hinterher, wieviele wirklich da waren.
+#[no_gc]
+fn klammer_zahlen(p: u64, n: usize, i: *mut usize, z: *mut f64,
+    min: usize, max: usize, anz: *mut usize) -> bool {
+    ueberspringe_leer(p, n, i)
+    if *i >= n || lies_oktett(p, *i) != 40 {
+        return false
+    }
+    *i = *i + 1
+    var k: usize = 0
+    while k < max {
+        ueberspringe_trenner(p, n, i)
+        if *i < n && lies_oktett(p, *i) == 41 {
+            break
+        }
+        var ok: bool = false
+        let v: f64 = zahl(p, n, i, &ok)
+        if !ok {
+            return false
+        }
+        *((z as u64 + (k * 8) as u64) as *mut f64) = v
+        k = k + 1
+    }
+    ueberspringe_leer(p, n, i)
+    if *i >= n || lies_oktett(p, *i) != 41 {
+        return false
+    }
+    *i = *i + 1
+    if k < min {
+        return false
+    }
+    *anz = k
+    return true
+}
+
+// Die ganze Liste. Bei einem Fehler die Einheitsmatrix.
+#[no_gc]
+fn zerteile_transform(p: u64, n: usize) -> Mat {
+    var m: Mat = mat_eins()
+    var i: usize = 0
+    var z: [f64; 6] = [0.0; 6]
+    var anz: usize = 0
+    ueberspringe_leer(p, n, &i)
+    while i < n {
+        if lies_oktett(p, i) == 44 {
+            // Ein Komma zwischen zwei Transformationen ist erlaubt.
+            i = i + 1
+            ueberspringe_leer(p, n, &i)
+            continue
+        }
+        var g: Mat = mat_eins()
+        if wort_passt(p, n, i, 109, 97, 116, 114, 105, 120, 6) {
+            i = i + 6
+            if !klammer_zahlen(p, n, &i, &z[0], 6, 6, &anz) {
+                return mat_eins()
+            }
+            g = mat_von_sechs(z[0], z[1], z[2], z[3], z[4], z[5])
+        } else if wort_passt(p, n, i, 116, 114, 97, 110, 115, 108, 6)
+            && i + 9 <= n && lies_oktett(p, i + 6) == 97
+            && lies_oktett(p, i + 7) == 116
+            && lies_oktett(p, i + 8) == 101 {
+            i = i + 9
+            z[0] = 0.0
+            z[1] = 0.0
+            if !klammer_zahlen(p, n, &i, &z[0], 1, 2, &anz) {
+                return mat_eins()
+            }
+            if anz < 2 {
+                z[1] = 0.0
+            }
+            g = mat_verschiebe(z[0], z[1])
+        } else if wort_passt(p, n, i, 115, 99, 97, 108, 101, 0, 5) {
+            i = i + 5
+            z[0] = 1.0
+            z[1] = 1.0
+            if !klammer_zahlen(p, n, &i, &z[0], 1, 2, &anz) {
+                return mat_eins()
+            }
+            if anz < 2 {
+                z[1] = z[0]
+            }
+            g = mat_skaliere(z[0], z[1])
+        } else if wort_passt(p, n, i, 114, 111, 116, 97, 116, 101, 6) {
+            i = i + 6
+            z[0] = 0.0
+            z[1] = 0.0
+            z[2] = 0.0
+            if !klammer_zahlen(p, n, &i, &z[0], 1, 3, &anz) {
+                return mat_eins()
+            }
+            if anz == 3 {
+                g = mat_drehe_um(z[0], z[1], z[2])
+            } else {
+                g = mat_drehe(z[0])
+            }
+        } else if wort_passt(p, n, i, 115, 107, 101, 119, 88, 0, 5) {
+            i = i + 5
+            if !klammer_zahlen(p, n, &i, &z[0], 1, 1, &anz) {
+                return mat_eins()
+            }
+            g = mat_neige_x(z[0])
+        } else if wort_passt(p, n, i, 115, 107, 101, 119, 89, 0, 5) {
+            i = i + 5
+            if !klammer_zahlen(p, n, &i, &z[0], 1, 1, &anz) {
+                return mat_eins()
+            }
+            g = mat_neige_y(z[0])
+        } else {
+            return mat_eins()
+        }
+        m = mat_mal(m, g)
+        ueberspringe_leer(p, n, &i)
+    }
+    return m
+}

@@ -108,12 +108,14 @@ build image
 "$W/image"
 
 echo
-echo "== 10c. THE SVG READER AT THE PIXEL =="
-# viewBox, scaling, fill-rule evenodd (the shared rasteriser is non-zero
-# only), and the ARC against the same shape drawn as a cubic -- that
-# comparison is what caught the halved Bezier handle.
-build svg
-"$W/svg"
+echo "== 10c. DAS PORTIERTE lib/svg IM FIRN-BAUM =="
+# lib/svg kommt aus dem Certus-Baum (13.09.2026, sieben von acht Dateien
+# byte-identisch). Geprueft wird, was bei der Portierung angefasst wurde:
+# raster_finish_evenodd in der NEUEREN raster.fi, ttf.font_outline_m, und
+# der Schrift-Adapter svg/fontsel.fi. Dazu currentColor gegen die
+# Akzentfarbe -- Justins Zusatz vom 13.09.2026.
+build uisvg
+"$W/uisvg"
 
 echo
 echo "== 10d. THE PICTURE ON THE WIDGET =="
