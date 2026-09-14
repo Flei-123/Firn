@@ -350,7 +350,32 @@ nichts.
 | `tests/` + `tests/opt/` + `examples/` in **allen vier** Baustufen (`release-fast`, `--no-opt`, `dev-fast`, `release-safe`) | **1304 / 1304 grün, 0 rot** |
 | `tests/neg/` — 193 Programme müssen mit Meldung scheitern | **193 / 193 grün**, keine Rust-Panik |
 | Certus `web1` baut (8,4 MB Binär, der ganze Browser) | **grün**, byte-gleich groß wie mit `main` |
+| Selbstbau: `firnc` baut `bin/firnc1.fi` (der Übersetzer in Firn) | **grün**, 1.894.632 Oktette |
+| `tools/self_compare.sh` — `firnc1` gegen `firnc0`, Verhalten je Programm | **DIFFERING: 0** bei 194 verglichenen Programmen |
 | Attributwache `only_must_consume_is_implemented` | angeschlagen wie vorgesehen, Liste + Merkbuch nachgezogen |
+
+**Zu den 112 `FAULTY` im Selbstvergleich** (`firnc1` gibt 2 zurück, erster
+Fall `tests/1000_js_lex.fi`): **das ist vorbestehend und gehört nicht dieser
+Runde.** Nachgewiesen mit einem eigenen Arbeitsbaum auf dem
+**unveränderten** Abzweigpunkt:
+
+```
+  git worktree add /root/firn-basis-pruef 2a20c514     # NICHTS geaendert
+  cd /root/firn-basis-pruef && cargo build --release
+  firnc bin/firnc1.fi -o .firnc1
+  ./.firnc1 tests/1000_js_lex.fi -o /tmp/x   ->  rc = 2
+  ./.firnc1 tests/1001_js_parse.fi -o /tmp/x ->  rc = 2
+
+  dieselben zwei Dateien im Zweig `einbetten`          ->  rc = 2
+```
+
+Gleicher Stand, gleiche Zahl. Der Unterschied zu `/root/firn-dnspic` (dort
+`rc = 0`) ist **nicht** der Inliner, sondern der Commit: jener Arbeitsbaum
+steht auf `7893ea2c`, also 24 Commits weiter als der Abzweigpunkt dieser
+Runde. Wer die Zahl senken will, zweigt von `7893ea2c` ab — mit dem
+Einbetten hat sie nichts zu tun. Entscheidend ist die Zeile, auf die es
+ankommt: **`DIFFERING: 0`** — kein einziges Programm verhält sich
+unterschiedlich.
 
 Fünf neue Modultests halten fest, was die Marken dürfen und was nicht:
 
@@ -375,7 +400,10 @@ Fünf neue Modultests halten fest, was die Marken dürfen und was nicht:
   Übersetzer aus `main`: derselbe Fehler, Zeile für Zeile.** Der Schaden liegt
   im osum-Repo, nicht im Zweig `einbetten`. Damit konnten auch
   `tools/usbimg/run.sh` (Bootprobe) und die Abbildgröße nicht gemessen werden.
-* **Der Selbstbau (`firnc` baut sich selbst)** steht noch aus — siehe unten.
+* **`--emit=fir` / DWARF-Gegenprobe für umsortierte Blöcke** ist nicht
+  gefahren worden. Die Umsortierung schreibt `phi`-Kanten mit; die
+  Modultests und die 1304 Programmläufe decken sie ab, ein eigener
+  Prüfstand dafür wäre trotzdem besser.
 * **`tools/check-ui.sh`** wurde nicht gefahren — das Certus-Binär baut, die
   Bildprüfung braucht eine X11-Sitzung.
 * **DWARF `inlined_subroutine`** fehlt weiterhin (siehe Abschnitt 3).
