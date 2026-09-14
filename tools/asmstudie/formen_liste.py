@@ -248,9 +248,19 @@ def a64_faelle(formen):
                 else:
                     ok = False
                     break
-            elif o == "#imm]!" or o.startswith("mem[b],"):
-                ok = False
-                break
+            elif o.startswith("mem[b]"):
+                # Nachtraegliche Anpassung: `ldrb w0, [x0], #1`. Der Versatz
+                # steht NACH der Klammer und ist NICHT skaliert -- er zaehlt
+                # in Oktetten, anders als beim unsigned offset.
+                skal = {"ldp": 8, "stp": 8}.get(mnem, 1)
+                if mnem in ("ldp", "stp"):
+                    kand.append(["[%s], #%d" % (b, m * skal)
+                                 for b in ("x0", "x1", "sp", "x28")
+                                 for m in (0, 1, 2, -8)])
+                else:
+                    kand.append(["[%s], #%d" % (b, m)
+                                 for b in ("x0", "x1", "sp", "x28")
+                                 for m in (0, 1, 8, -8, 255)])
             elif o == ":lo12:sym":
                 kand.append([":lo12:markeA"])
             else:
