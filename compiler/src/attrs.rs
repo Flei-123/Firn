@@ -302,6 +302,9 @@ mod tests {
         // Round ARM-FREESTANDING: plus #[arch(...)] -- this definition
         // belongs to one machine, and the others are thrown away before the
         // type checker runs (archsel.rs, docs/ROUND-ARM-FREESTANDING.md 5).
+        // RUNDE EINBETTEN: plus #[inline] und #[no_inline] -- der
+        // ausdrueckliche Wille des Programmierers ueber das Einbetten
+        // (inline.rs, fir::Func::inline_hint, docs/RUNDE-EINBETTEN.md).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
@@ -313,6 +316,8 @@ mod tests {
                 "arch",
                 "link_name",
                 "export_c",
+                "inline",
+                "no_inline",
                 "allow_escape",
                 "panic_handler",
                 "allow_fp"
