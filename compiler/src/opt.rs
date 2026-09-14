@@ -196,6 +196,16 @@ pub const PASSES: &[PassInfo] = &[
         debug_preserving: false,
         what: "inline calls (size heuristic) — makes the call stack unreadable",
     },
+    // RUNDE EINBETTEN: der ausdrueckliche Wunsch, auf JEDER Stufe ausser
+    // `dev`. Debug-erhaltend ist er in dem Sinn, dass NUR angefasst wird,
+    // was der Programmierer selbst mit `#[inline]` ausgezeichnet hat -- wer
+    // die Marke setzt, weiss, dass der Rahmen verschwindet.
+    PassInfo {
+        name: "inline-verlangt",
+        scope: Scope::Module,
+        debug_preserving: true,
+        what: "#[inline]: nur die ausdruecklich verlangten Einbauten (RUNDE EINBETTEN)",
+    },
 ];
 
 /// What shall be executed during a run.
@@ -344,6 +354,20 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     // works on bodies that are already simplified.
     for f in m.funcs.iter_mut() {
         optimize_func(f, &mut st, cfg, &mut clk);
+    }
+    // RUNDE EINBETTEN -- zuerst der ausdrueckliche Wille. Er gilt auf jeder
+    // Stufe; die Groessenregel darunter nur bei `release-*`. Laufen beide,
+    // findet der zweite Durchgang die verlangten Stellen schon erledigt vor.
+    if cfg.runs("inline-verlangt") && !cfg.runs("inline") {
+        let t = std::time::Instant::now();
+        st.inlined += crate::inline::inline_module_nur_verlangt(m);
+        clk.add("inline-verlangt", t);
+        for f in m.funcs.iter() {
+            phi_check(f, "inline-verlangt");
+        }
+        for f in m.funcs.iter_mut() {
+            optimize_func(f, &mut st, cfg, &mut clk);
+        }
     }
     if cfg.runs("inline") {
         let t = std::time::Instant::now();

@@ -694,6 +694,19 @@ pub struct Func {
     /// generator rescues ALL general purpose registers and closes with `iretq`
     /// rather than `ret` (SPEC §2, kernel profile).
     pub interrupt: bool,
+    /// **RUNDE EINBETTEN** -- `#[inline]` / `#[no_inline]`, der ausdrueckliche
+    /// Wille des Programmierers. `None` heisst: der Uebersetzer entscheidet
+    /// nach seiner Groessenregel (`inline.rs`).
+    ///
+    /// `Some(true)`  -- EINBETTEN, auch wenn der Rumpf ueber der Groessengrenze
+    ///                 liegt. Rekursion, Adressnahme und die Sperren aus
+    ///                 SPEC 9 (`secret`/`#[constant_time]`) bleiben trotzdem
+    ///                 in Kraft: sie sind Richtigkeitsfragen, keine
+    ///                 Geschmacksfragen.
+    /// `Some(false)` -- NIE einbetten. Das braucht, wer einen Rahmen sehen
+    ///                 will (Fehlersuche) oder wessen Wirkung an der
+    ///                 Stapeltiefe haengt (`__gc_scrub_deep`).
+    pub inline_hint: Option<bool>,
     /// **ROUND 94** -- the position every newly pushed instruction is stamped
     /// with. `lower.rs` sets it per statement and per expression; everything
     /// else leaves it alone. It belongs to the FUNCTION and not to a global:
@@ -716,6 +729,7 @@ impl Func {
             secret: std::collections::HashSet::new(),
             constant_time: false,
             interrupt: false,
+            inline_hint: None,
             loc_stamp: Loc::NONE,
         }
     }

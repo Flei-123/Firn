@@ -100,6 +100,20 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "make a Firn function callable under its bare name from C (SPEC 14.5)",
     },
     AttrInfo {
+        name: "inline",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "bette diese Funktion an der Aufrufstelle ein, auch ueber der Groessengrenze (RUNDE EINBETTEN)",
+    },
+    AttrInfo {
+        name: "no_inline",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "bette diese Funktion NIE ein -- der Rahmen bleibt sichtbar (RUNDE EINBETTEN)",
+    },
+    AttrInfo {
         name: "allow_escape",
         target: Target::Func,
         args: 0,

@@ -99,6 +99,24 @@ fn reaches_itself_self(m: &Module, name: &str) -> bool {
     false
 }
 
+/// Die HARTEN Sperren: hier geht es um Richtigkeit, nicht um Groesse.
+/// `#[inline]` hebt KEINE davon auf.
+///
+///  * `#[constant_time]` / `secret` -- die Pruefung im Codeerzeuger arbeitet
+///    je Funktion (SPEC 9.2). Eingebettet in einen Aufrufer ohne die Marke
+///    faellt sie weg, und eine Zeitseitenkanal-Zusage waere still gebrochen.
+///  * `#[interrupt]` -- eigene Aufruffolge, endet mit `iretq` statt `ret`
+///    (Runde 52). Der Rumpf gehoert nicht in einen gewoehnlichen Rahmen.
+///  * ein unfertiger Block (`Term::Unset`) oder eine Blockliste, deren
+///    Nummern nicht der Reihe nach stehen -- dann stimmt `blockmap` nicht.
+fn darf_grundsaetzlich(callee: &Func) -> bool {
+    !callee.constant_time
+        && callee.secret.is_empty()
+        && !callee.interrupt
+        && !callee.blocks.iter().any(|b| matches!(b.term, Term::Unset))
+        && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
+}
+
 fn inlinable(callee: &Func) -> bool {
     // Loop free bodies WITHOUT a return value (effect through pointer
     // arguments, say the sink mutators of the tokenizer) may have more
@@ -110,25 +128,41 @@ fn inlinable(callee: &Func) -> bool {
     // for the stack scanning conservative GC (`tests/520_gc_weak.fi`,
     // round 37: `__gc_strong_raw` inlined into `create` produced phantom
     // pointers and exit 6).
-    !callee.constant_time
-        && callee.secret.is_empty()
-        && callee.inst_count() <= MAX_CALLEE_INSTS
-        && callee.blocks.len() <= MAX_CALLEE_BLOCKS
-        && !callee.blocks.iter().any(|b| matches!(b.term, Term::Unset))
-        && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
+    if !darf_grundsaetzlich(callee) {
+        return false;
+    }
+    // RUNDE EINBETTEN -- der ausdrueckliche Wille schlaegt die Groessenregel.
+    match callee.inline_hint {
+        // `#[no_inline]`: Schluss, ohne Wenn und Aber.
+        Some(false) => return false,
+        // `#[inline]`: die Groessengrenzen entfallen. Genau das braucht der
+        // JIT fuer seine Helfer -- ihre Ruempfe liegen ueber 40 Befehlen,
+        // und ohne diesen Weg bleibt der Aufruf stehen.
+        Some(true) => return true,
+        None => {}
+    }
+    callee.inst_count() <= MAX_CALLEE_INSTS && callee.blocks.len() <= MAX_CALLEE_BLOCKS
 }
 
 /// Looks for a worthwhile call site in the caller `ci`.
 /// `self_rec`: precomputed per function (does not change through
 /// embeddings — only the caller is mutated).
-fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, usize)> {
+fn find_site(
+    m: &Module,
+    ci: usize,
+    self_rec: &[bool],
+    nur_verlangt: bool,
+) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
         return None;
     }
-    if caller.inst_count() > MAX_CALLER_INSTS {
-        return None;
-    }
+    // Die Aufrufergrenze schuetzt Uebersetzungszeit und Codegroesse. Sie
+    // darf aber einen AUSDRUECKLICH verlangten Einbau nicht aussperren --
+    // sonst haengt `#[inline]` davon ab, wie gross der Aufrufer zufaellig
+    // ist. Deshalb wird sie unten je Aufrufstelle geprueft und nicht hier
+    // fuer die ganze Funktion.
+    let caller_voll = caller.inst_count() > MAX_CALLER_INSTS;
     if caller.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return None;
     }
@@ -141,6 +175,15 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
                 };
                 let callee = &m.funcs[gi];
                 if gi == ci || !inlinable(callee) {
+                    continue;
+                }
+                // Der volle Aufrufer nimmt nur noch, was ausdruecklich
+                // verlangt ist.
+                if caller_voll && callee.inline_hint != Some(true) {
+                    continue;
+                }
+                // Vorgabestufe: NUR was `#[inline]` traegt.
+                if nur_verlangt && callee.inline_hint != Some(true) {
                     continue;
                 }
                 if callee.params.len() != args.len() {
@@ -411,9 +454,25 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
     }
 }
 
+/// RUNDE EINBETTEN -- nur die AUSDRUECKLICH verlangten Einbauten.
+///
+/// Das ist der Durchgang fuer die Vorgabestufe (`dev-fast`). Die
+/// Groessenregel bleibt dort aus: sie macht den Aufrufstapel unlesbar, und
+/// `dev-fast` ist die Stufe, auf der man mit dem Fehlersucher arbeitet.
+/// `#[inline]` ist dagegen eine Zusage an den Programmierer -- sie darf
+/// nicht davon abhaengen, mit welchem Schalter gebaut wird, sonst misst man
+/// (wie die Runde JIT) still etwas anderes, als man gebaut hat.
+pub fn inline_module_nur_verlangt(m: &mut Module) -> usize {
+    inline_module_inner(m, true)
+}
+
 /// Embeds as long as the heuristic allows. Yields the number of embedded
 /// calls.
 pub fn inline_module(m: &mut Module) -> usize {
+    inline_module_inner(m, false)
+}
+
+fn inline_module_inner(m: &mut Module, nur_verlangt: bool) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
     // Determined once: it hangs off the body of the callee only, which never
@@ -425,7 +484,7 @@ pub fn inline_module(m: &mut Module) -> usize {
         .collect();
     'outer: loop {
         for ci in 0..m.funcs.len() {
-            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec) {
+            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec, nur_verlangt) {
                 if dbg {
                     eprintln!("inline: {} <- {} ({} insts, {} blocks)",
                         m.funcs[ci].name, m.funcs[gi].name,
