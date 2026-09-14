@@ -292,6 +292,9 @@ mod tests {
         // every run time abort (SPEC 13, panic_rt.rs, docs/ROUND89.md).
         // Round 94: plus #[test] -- the test runner finds its cases by it
         // (testrun.rs, lib/test/runner.fi, docs/ROUND94.md).
+        // Round EINBETTEN: plus #[inline] and #[no_inline] -- the explicit
+        // will of the programmer about inlining (inline.rs,
+        // fir::Func::inline_hint, docs/RUNDE-EINBETTEN.md).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
@@ -302,6 +305,8 @@ mod tests {
                 "interrupt",
                 "link_name",
                 "export_c",
+                "inline",
+                "no_inline",
                 "allow_escape",
                 "panic_handler",
                 "allow_fp"
