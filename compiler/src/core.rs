@@ -777,6 +777,19 @@ pub(crate) fn has_interrupt(f: &crate::ast::FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "interrupt")
 }
 
+/// RUNDE EINBETTEN: `#[inline]` / `#[no_inline]` aus der Quelle lesen.
+/// Beides zugleich ist ein Widerspruch; `sema` meldet ihn (siehe
+/// `check_inline_hints`), hier gewinnt das Verbot -- die sichere Seite.
+pub(crate) fn inline_hint(f: &crate::ast::FnDecl) -> Option<bool> {
+    let ja = f.attrs.iter().any(|a| a.name == "inline");
+    let nein = f.attrs.iter().any(|a| a.name == "no_inline");
+    match (ja, nein) {
+        (_, true) => Some(false),
+        (true, false) => Some(true),
+        (false, false) => None,
+    }
+}
+
 /// `// HOOK kern` in `sema::run`: check the form of the `#[interrupt]`
 /// functions and make sure that nobody calls them.
 pub(crate) fn check_interrupts(ck: &mut Checker, prog: &crate::ast::Program) {
