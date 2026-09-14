@@ -580,6 +580,117 @@ mod tests {
         assert!(main.blocks[0].insts.iter().any(|i| matches!(i.op, Op::Const(9))));
     }
 
+    /// RUNDE EINBETTEN: `#[no_inline]` verbietet den Einbau, auch wenn der
+    /// Rumpf winzig ist und die Groessenregel ihn laengst genommen haette.
+    #[test]
+    fn no_inline_verbietet_den_einbau() {
+        let mut m = Module::new();
+        let mut g = add_fn();
+        g.inline_hint = Some(false);
+        m.funcs.push(g);
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let a = f.push(0, FTy::I32, Op::Const(2));
+        let r = f.push(0, FTy::I32, Op::Call { name: "add".into(), args: vec![a, a] });
+        f.set_term(0, Term::Ret(Some(r)));
+        m.funcs.push(f);
+        assert_eq!(inline_module(&mut m), 0);
+    }
+
+    /// `#[inline]` hebt die GROESSENGRENZE auf: ein Rumpf ueber
+    /// `MAX_CALLEE_INSTS` wird eingebaut, den die Regel sonst ablehnt.
+    #[test]
+    fn inline_hebt_die_groessengrenze_auf() {
+        // Ein Rumpf mit deutlich mehr als MAX_CALLEE_INSTS Befehlen.
+        let mut g = Func::new("gross", vec![FTy::I32], FTy::I32);
+        let mut cur: Val = 0;
+        for _ in 0..(MAX_CALLEE_INSTS + 10) {
+            cur = g.push(0, FTy::I32, Op::Bin(BinOp::Add, cur, 0));
+        }
+        g.set_term(0, Term::Ret(Some(cur)));
+        assert!(g.inst_count() > MAX_CALLEE_INSTS);
+        let ruf = |g: Func| {
+            let mut m = Module::new();
+            m.funcs.push(g);
+            let mut f = Func::new("main", vec![], FTy::I32);
+            let a = f.push(0, FTy::I32, Op::Const(1));
+            let r = f.push(0, FTy::I32, Op::Call { name: "gross".into(), args: vec![a] });
+            f.set_term(0, Term::Ret(Some(r)));
+            m.funcs.push(f);
+            m
+        };
+        // ohne Marke: die Groessenregel lehnt ab
+        let mut m1 = ruf(g.clone());
+        assert_eq!(inline_module(&mut m1), 0);
+        // mit #[inline]: eingebaut
+        g.inline_hint = Some(true);
+        let mut m2 = ruf(g);
+        assert_eq!(inline_module(&mut m2), 1);
+    }
+
+    /// Die HARTEN Sperren bleiben: `#[inline]` auf einer
+    /// `#[constant_time]`-Funktion aendert nichts. Das ist eine
+    /// Richtigkeitsfrage (SPEC 9.2), keine Geschmacksfrage.
+    #[test]
+    fn inline_hebt_die_harten_sperren_nicht_auf() {
+        let mut m = Module::new();
+        let mut g = add_fn();
+        g.constant_time = true;
+        g.inline_hint = Some(true);
+        m.funcs.push(g);
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let a = f.push(0, FTy::I32, Op::Const(2));
+        let r = f.push(0, FTy::I32, Op::Call { name: "add".into(), args: vec![a, a] });
+        f.set_term(0, Term::Ret(Some(r)));
+        m.funcs.push(f);
+        assert_eq!(inline_module(&mut m), 0);
+    }
+
+    /// Auch Rekursion bleibt gesperrt, mit `#[inline]` wie ohne.
+    #[test]
+    fn inline_bricht_die_rekursionssperre_nicht() {
+        let mut m = Module::new();
+        let mut f = Func::new("fact", vec![FTy::I32], FTy::I32);
+        f.inline_hint = Some(true);
+        let one = f.push(0, FTy::I32, Op::Const(1));
+        let c = f.push(0, FTy::Bool, Op::Cmp { op: CmpOp::Le, ty: FTy::I32, a: 0, b: one });
+        let bt = f.add_block();
+        let be = f.add_block();
+        f.set_term(0, Term::BrCond { cond: c, then_bb: bt, else_bb: be });
+        f.set_term(bt, Term::Ret(Some(one)));
+        let sub = f.push(be, FTy::I32, Op::Bin(BinOp::Sub, 0, one));
+        let rc = f.push(be, FTy::I32, Op::Call { name: "fact".into(), args: vec![sub] });
+        let mu = f.push(be, FTy::I32, Op::Bin(BinOp::Mul, 0, rc));
+        f.set_term(be, Term::Ret(Some(mu)));
+        m.funcs.push(f);
+        assert_eq!(inline_module(&mut m), 0);
+    }
+
+    /// Der Durchgang der Vorgabestufe nimmt NUR, was `#[inline]` traegt.
+    #[test]
+    fn nur_verlangt_nimmt_nur_markierte() {
+        let bau = |hint: Option<bool>| {
+            let mut m = Module::new();
+            let mut g = add_fn();
+            g.inline_hint = hint;
+            m.funcs.push(g);
+            let mut f = Func::new("main", vec![], FTy::I32);
+            let a = f.push(0, FTy::I32, Op::Const(2));
+            let r = f.push(0, FTy::I32, Op::Call { name: "add".into(), args: vec![a, a] });
+            f.set_term(0, Term::Ret(Some(r)));
+            m.funcs.push(f);
+            m
+        };
+        // ohne Marke: der Vorgabe-Durchgang laesst den Aufruf stehen ...
+        let mut m1 = bau(None);
+        assert_eq!(inline_module_nur_verlangt(&mut m1), 0);
+        // ... obwohl die Groessenregel ihn genommen haette.
+        let mut m2 = bau(None);
+        assert_eq!(inline_module(&mut m2), 1);
+        // mit Marke: auch der Vorgabe-Durchgang nimmt ihn.
+        let mut m3 = bau(Some(true));
+        assert_eq!(inline_module_nur_verlangt(&mut m3), 1);
+    }
+
     #[test]
     fn constant_time_funcs_stay_separate() {
         let mut m = Module::new();
