@@ -243,6 +243,14 @@ def a64_faelle(formen):
                         for m in (0, 1, 2, 15):
                             v.append("[%s, #%d]" % (b, m * skal))
                     kand.append(v)
+                elif inner == "b,#imm]!" or inner.endswith("]!"):
+                    # Anpassung VOR dem Zugriff: `stp x29, x30, [sp, #-16]!`
+                    # Das ist der Rahmenaufbau jeder Funktion -- 7744-mal
+                    # in der Ernte, also alles andere als ein Randfall.
+                    skal2 = 8 if mnem in ("ldp", "stp") else 1
+                    kand.append(["[%s, #%d]!" % (b, m * skal2)
+                                 for b in ("x0", "sp", "x28")
+                                 for m in (0, -1, -2, -8, 7)])
                 elif inner == "b,r,shift":
                     kand.append(["[x0, x1, lsl #3]", "[x28, x9, lsl #3]", "[x0, x1]"])
                 else:
