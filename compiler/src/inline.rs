@@ -263,11 +263,14 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
 
     // 3. Create the blocks of the body + the continuation block.
     let mut blockmap: HashMap<u32, u32> = HashMap::new();
+    let mut neue: Vec<u32> = Vec::with_capacity(callee.blocks.len() + 1);
     for b in &callee.blocks {
         let nb = f.add_block();
         blockmap.insert(b.id, nb);
+        neue.push(nb);
     }
     let cont = f.add_block();
+    neue.push(cont);
 
     // 4. Split the calling block.
     let tail: Vec<Inst> = f.blocks[bi].insts.split_off(ii + 1);
@@ -361,6 +364,10 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
             Term::Unset => Term::Br(cont),
         };
     }
+
+    // RUNDE EINBETTEN: den Rumpf unmittelbar hinter den Aufrufblock holen.
+    // Begruendung und Messung stehen bei `bloecke_umsortieren`.
+    bloecke_umsortieren(f, bi, &neue);
 }
 
 /// ROUND 92 -- `blockmap` is the callee's block numbering translated into
@@ -464,6 +471,103 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
 /// (wie die Runde JIT) still etwas anderes, als man gebaut hat.
 pub fn inline_module_nur_verlangt(m: &mut Module) -> usize {
     inline_module_inner(m, true)
+}
+
+/// RUNDE EINBETTEN -- DIE BLOECKE DES EINGEBAUTEN RUMPFES NACH VORNE HOLEN.
+///
+/// `Func::add_block` haengt nur an. Ein eingebauter Rumpf landet damit am
+/// ENDE der Funktion, auch wenn die Aufrufstelle in der ersten Schleife
+/// steht. Das ist kein Schoenheitsfehler:
+///
+/// `regalloc.rs` bildet die Lebendintervalle als `[kleinste Position,
+/// groesste Position]` ueber die LINEARE Blockfolge (`live.block_start` /
+/// `live.block_end`). Liegt der Rumpf hinter allen anderen Bloecken, spannt
+/// das Intervall jedes Werts, der in den Rumpf hinein und wieder heraus
+/// lebt, ueber die GANZE Funktion -- auch ueber fremde Schleifen, mit denen
+/// er nichts zu tun hat. Dort kollidiert er mit deren Werten und wird
+/// ausgelagert.
+///
+/// GEMESSEN (dev-fast, /root/einbetten-mess/):
+///   * `iso_main.fi`, EINE Schleife, der Rumpf landet direkt daneben:
+///     2,35 ns -> 1,08 ns je Durchgang = Faktor 2,2 BESSER.
+///   * `kosten_main.fi`, dieselbe Rechnung, aber ZWEI Schleifen in `main`,
+///     der Rumpf landet hinter der zweiten: 2,37 ns -> 3,44 ns = SCHLECHTER.
+/// Derselbe Rumpf, derselbe Einbau -- nur die Blockentfernung entscheidet.
+///
+/// Deshalb werden die Bloecke hier umsortiert: der Rumpf und der
+/// Fortsetzungsblock ruecken unmittelbar hinter den Aufrufblock. Die
+/// Nummern sind ein INDEX (ueberall im Uebersetzer gilt `b.id as usize == i`,
+/// siehe `mem2reg.rs`, `opt.rs`, `regalloc.rs`), also muessen Nummer,
+/// Sprungziele und die Blockangaben in jedem `phi` zusammen umgeschrieben
+/// werden.
+fn bloecke_umsortieren(f: &mut Func, nach: usize, neue: &[u32]) {
+    let n = f.blocks.len();
+    if n != f.blocks.len() || neue.is_empty() {
+        return;
+    }
+    // Die gewuenschte Reihenfolge: alles bis einschliesslich `nach`, dann
+    // die neuen Bloecke, dann der Rest.
+    let neu_set: std::collections::HashSet<u32> = neue.iter().copied().collect();
+    let mut folge: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..=nach {
+        let id = i as u32;
+        if !neu_set.contains(&id) {
+            folge.push(id);
+        }
+    }
+    for &b in neue {
+        folge.push(b);
+    }
+    for i in (nach + 1)..n {
+        let id = i as u32;
+        if !neu_set.contains(&id) {
+            folge.push(id);
+        }
+    }
+    if folge.len() != n {
+        return; // etwas stimmt nicht -- dann lieber gar nicht umsortieren
+    }
+    // alt -> neu
+    let mut karte = vec![0u32; n];
+    for (neu_i, &alt) in folge.iter().enumerate() {
+        karte[alt as usize] = neu_i as u32;
+    }
+    // Bloecke in die neue Reihenfolge bringen ...
+    let alt_blocks = std::mem::take(&mut f.blocks);
+    let mut nach_id: Vec<Option<crate::fir::Block>> = alt_blocks.into_iter().map(Some).collect();
+    let mut neu_blocks: Vec<crate::fir::Block> = Vec::with_capacity(n);
+    for &alt in &folge {
+        let mut b = nach_id[alt as usize].take().expect("Block zweimal vergeben");
+        b.id = karte[alt as usize];
+        neu_blocks.push(b);
+    }
+    f.blocks = neu_blocks;
+    // ... und jede Blockangabe mitziehen: Sprungziele und phi-Kanten.
+    let mv = |b: &u32| -> u32 { karte[*b as usize] };
+    for b in f.blocks.iter_mut() {
+        b.term = match &b.term {
+            Term::Br(t) => Term::Br(mv(t)),
+            Term::BrCond { cond, then_bb, else_bb } => {
+                Term::BrCond { cond: *cond, then_bb: mv(then_bb), else_bb: mv(else_bb) }
+            }
+            Term::Switch { val, ty, cases, default } => Term::Switch {
+                val: *val,
+                ty: *ty,
+                cases: cases.iter().map(|(k, t)| (*k, mv(t))).collect(),
+                default: mv(default),
+            },
+            Term::Ret(v) => Term::Ret(*v),
+            Term::Unset => Term::Unset,
+        };
+        for i in b.insts.iter_mut() {
+            if let Op::Phi { incoming } = &mut i.op {
+                for e in incoming.iter_mut() {
+                    e.0 = karte[e.0 as usize];
+                }
+                incoming.sort_by_key(|(p, _)| *p);
+            }
+        }
+    }
 }
 
 /// Embeds as long as the heuristic allows. Yields the number of embedded
