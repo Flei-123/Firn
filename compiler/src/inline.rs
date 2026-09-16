@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Inlining (embedding function bodies) with a size heuristic.
 //!
 //! How it works: an `Op::Call` to a function present in the same

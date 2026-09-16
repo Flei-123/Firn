@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **Round 52 — freestanding: inline assembler, MMIO, interrupt entry.**
 //!
 //! Everything a kernel needs and an application does not: the three places

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND 89** — global variables: `static` and `static mut` (SPEC §14.1
 //! item 5).
 //!

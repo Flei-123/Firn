@@ -1,0 +1,686 @@
+profile kernel
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/style.fi -- HOW A WIDGET LOOKS. ONE TYPE FOR ALL.
+//
+// ========================================================= WHY IT EXISTS
+//
+// Justin, 10.09.2026: every widget has to be freely styleable -- "no
+// background", "background only on hover", "background red", or
+// theme-dependent; plus text colour, -kind, -size, -slant, border,
+// radius, padding, alignment, opacity.
+//
+// The mistake this prevents is the same one as everywhere in this
+// tree: IF EVERY WIDGET HAS ITS OWN STYLING PARAMETERS, you end up
+// with twenty ways to say "make the background red", and nineteen of
+// them cannot be combined. Hence ONE type -- `Style` -- for button,
+// label, TextBuf, tab, table and everything still to come.
+//
+// ======================================== WHY THIS FILE LIVES IN THE CORE
+//
+// `profile kernel` in line 1. A Style is a pure VALUE STRUCTURE: only
+// numbers, no pointer, no allocation, no syscall. That lets the window
+// manager of OrientOS draw its title buttons with the SAME style system
+// as any application -- and Justin's demand that the core carry this
+// too is met without a special path.
+//
+// The price is at the bottom, at `font`: the font is carried as a
+// NUMBER, not as a loaded file. Whoever loads is the shell.
+//
+// ================================================ ONE COLOUR, FOUR KINDS
+//
+// Firn stage 0 has NO `enum` (SPEC 14.1). The four kinds therefore sit
+// in the top eight bits of a `u32` -- a colour needs only 24:
+//
+//     0x00RRGGBB   LITERAL       exactly this colour
+//     0x01______   TOKEN         a role from the theme (see TK_*)
+//     0x02000000   TRANSPARENT   DO NOT PAINT
+//     0x03000000   INHERIT       take what the layer below says
+//
+// No real colour collides with a kind, because the kind sits in its own
+// bits: 0x000000 (black) is kind 0 and therefore LITERAL, 0xFFFFFF
+// likewise.
+//
+// WHY OPACITY IS NOT IN THESE BITS: it is a field of its own, because
+// it has to be inherited separately. Otherwise you could not say
+// "inherit the colour, but take my own opacity".
+//
+// ==================================== "NO BACKGROUND" IS A STATE
+//
+// Justin's point 4, and he is right: `TRANSPARENT` means DO NOT PAINT.
+// It does not mean "paint the window colour over it". The difference is
+// invisible on a plain area and immediately visible over an image or a
+// gradient -- and a button on a background image is exactly the case
+// you need it for.
+//
+// ======================================================= THE INHERITANCE
+//
+//   1. THEME          the theme (lib/fui/theme.fi)
+//   2. WIDGET         what a button asks for by itself
+//   3. CALLER         what the programmer sets
+//   4. STATE          what holds on top for hover/active/...
+//
+// Resolved from 4 down to 1: the first layer that does not say
+// `INHERIT` wins. That is ONE function (`resolve_color`) and stands
+// there once, not in every widget.
+
+export {
+    Style, style_new, style_empty,
+    Override, override_new, override_empty,
+    StyleSet, styleset_new, styleset_base, styleset_override, styleset_set_override,
+    color_literal, color_token, color_transparent, color_inherit,
+    color_kind, color_value, color_is_visible, color_is_token,
+    COLOR_LITERAL, COLOR_TOKEN, COLOR_TRANSPARENT, COLOR_INHERIT,
+    TOK_BASE, TOK_SURFACE, TOK_SURFACE_RAISED, TOK_BUTTON, TOK_BUTTON_HOVER,
+    TOK_BUTTON_ACTIVE, TOK_FIELD, TOK_FIELD_FOCUS, TOK_BORDER, TOK_SEPARATOR,
+    TOK_TEXT, TOK_TEXT_MUTED, TOK_TEXT_DISABLED, TOK_TEXT_ON_ACCENT,
+    TOK_ACCENT, TOK_SELECTION, TOK_SELECTION_TEXT, TOK_ERROR, TOK_WARNING,
+    TOK_SUCCESS, TOK_COUNT,
+    STATE_NORMAL, STATE_HOVER, STATE_ACTIVE, STATE_FOCUS, STATE_DISABLED, STATE_SELECTED,
+    STATE_COUNT,
+    ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT,
+    WEIGHT_NORMAL, WEIGHT_BOLD, WEIGHT_LIGHT,
+    SLANT_UPRIGHT, SLANT_ITALIC,
+    SF_BG, SF_BORDER, SF_FG, SF_BORDER_W, SF_RADIUS, SF_PAD_X,
+    SF_PAD_Y, SF_FONT_PX, SF_WEIGHT, SF_SLANT, SF_ALIGN, SF_ALPHA,
+    SF_FONT_ID,
+    SF_TRACKING, SF_WORD_SPACING, SF_LINE_HEIGHT, SF_KERNING,
+    SF_OUTLINE, SF_SHADOW, SF_GRADIENT,
+    style_set_bg, style_set_border, style_set_fg,
+    style_set_radius, style_set_border_width, style_set_pad,
+    style_set_font, style_set_weight, style_set_slant,
+    style_set_align, style_set_alpha,
+    style_set_tracking, style_set_word_spacing,
+    style_set_line_height, style_set_line_height_px,
+    style_set_kerning, style_set_outline, style_set_shadow,
+    style_set_gradient,
+    override_set_bg, override_set_border, override_set_fg,
+    override_set_alpha,
+    resolve_bg, resolve_border, resolve_fg, resolve_alpha,
+    resolve_num, resolve_snum,
+}
+
+// ========================================================= THE COLOUR KINDS
+const COLOR_LITERAL: u32 = 0
+const COLOR_TOKEN: u32 = 1
+const COLOR_TRANSPARENT: u32 = 2
+const COLOR_INHERIT: u32 = 3
+
+// Exactly this colour: `color_literal(0xFF0000)` = red.
+fn color_literal(rgb: u32) -> u32 {
+    return rgb & 16777215 as u32
+}
+
+// A role from the theme. On a theme change it follows BY ITSELF --
+// that is Justin's point 3: the widgets are not rebuilt, because there
+// is no colour in them at all, only a number.
+fn color_token(tk: u32) -> u32 {
+    return (COLOR_TOKEN << 24) | (tk & 16777215 as u32)
+}
+
+// DO NOT PAINT. No substitute coat in the window colour.
+fn color_transparent() -> u32 {
+    return COLOR_TRANSPARENT << 24
+}
+
+// Take what the layer below says. This is the default of EVERY field
+// -- a freshly made Style changes nothing.
+fn color_inherit() -> u32 {
+    return COLOR_INHERIT << 24
+}
+
+fn color_kind(f: u32) -> u32 {
+    return (f >> 24) & 255 as u32
+}
+
+fn color_value(f: u32) -> u32 {
+    return f & 16777215 as u32
+}
+
+fn color_is_visible(f: u32) -> bool {
+    let a: u32 = color_kind(f)
+    return a == COLOR_LITERAL || a == COLOR_TOKEN
+}
+
+fn color_is_token(f: u32) -> bool {
+    return color_kind(f) == COLOR_TOKEN
+}
+
+// ============================================================= THE TOKENS
+//
+// The roles of the theme, as numbers. They stand HERE and not in
+// theme.fi, because this file lives in the core and theme.fi does not:
+// the window manager knows the numbers, and the shell maps them onto
+// the colours (`theme.color_from_token`). That way the core hangs on no
+// colour table.
+//
+// The order is that of `theme.Colors` -- whoever adds a role there adds
+// it here in the same place.
+const TOK_BASE: u32 = 0
+const TOK_SURFACE: u32 = 1
+const TOK_SURFACE_RAISED: u32 = 2
+const TOK_BUTTON: u32 = 3
+const TOK_BUTTON_HOVER: u32 = 4
+const TOK_BUTTON_ACTIVE: u32 = 5
+const TOK_FIELD: u32 = 6
+const TOK_FIELD_FOCUS: u32 = 7
+const TOK_BORDER: u32 = 8
+const TOK_SEPARATOR: u32 = 9
+const TOK_TEXT: u32 = 10
+const TOK_TEXT_MUTED: u32 = 11
+const TOK_TEXT_DISABLED: u32 = 12
+const TOK_TEXT_ON_ACCENT: u32 = 13
+const TOK_ACCENT: u32 = 14
+const TOK_SELECTION: u32 = 15
+const TOK_SELECTION_TEXT: u32 = 16
+const TOK_ERROR: u32 = 17
+const TOK_WARNING: u32 = 18
+const TOK_SUCCESS: u32 = 19
+const TOK_COUNT: u32 = 20
+
+// ============================================================= THE STATES
+//
+// The six Justin names. `STATE_SELECTED` is new against theme.fi and
+// belongs here: a tab, a list row and a toggle button are selected
+// without being focused.
+const STATE_NORMAL: u32 = 0
+const STATE_HOVER: u32 = 1
+const STATE_ACTIVE: u32 = 2
+const STATE_FOCUS: u32 = 3
+const STATE_DISABLED: u32 = 4
+const STATE_SELECTED: u32 = 5
+const STATE_COUNT: usize = 6
+
+// ======================================================= ALIGNMENT ETC.
+const ALIGN_LEFT: u32 = 0
+const ALIGN_CENTER: u32 = 1
+const ALIGN_RIGHT: u32 = 2
+
+const WEIGHT_LIGHT: u32 = 300
+const WEIGHT_NORMAL: u32 = 400
+const WEIGHT_BOLD: u32 = 700
+
+const SLANT_UPRIGHT: u32 = 0
+const SLANT_ITALIC: u32 = 1
+
+// ==================================================== WHICH FIELD IS SET
+//
+// The number fields (radius, padding, font size) cannot carry an
+// `INHERIT` inside them the way colours can -- 0 is a valid radius.
+// Hence a bit mask: if the bit stands, the value holds; if it does not,
+// it is inherited.
+const SF_BG: u32 = 1
+const SF_BORDER: u32 = 2
+const SF_FG: u32 = 4
+const SF_BORDER_W: u32 = 8
+const SF_RADIUS: u32 = 16
+const SF_PAD_X: u32 = 32
+const SF_PAD_Y: u32 = 64
+const SF_FONT_PX: u32 = 128
+const SF_WEIGHT: u32 = 256
+const SF_SLANT: u32 = 512
+const SF_ALIGN: u32 = 1024
+const SF_ALPHA: u32 = 2048
+const SF_FONT_ID: u32 = 4096
+// ---- the text values of 12.09.2026. Each one its own bit, because
+// each one has to be inheritable ON ITS OWN: a style that sets the
+// tracking must not silently also set the line height.
+const SF_TRACKING: u32 = 8192
+const SF_WORD_SPACING: u32 = 16384
+const SF_LINE_HEIGHT: u32 = 32768
+const SF_KERNING: u32 = 65536
+const SF_OUTLINE: u32 = 131072
+const SF_SHADOW: u32 = 262144
+const SF_GRADIENT: u32 = 524288
+
+// ============================================================== THE STYLE
+//
+// A pure value structure, 32 bytes. Copyable, no pointer, no
+// allocation -- passable in the kernel profile.
+//
+// THE FONT AS A NUMBER, and why: loading a font file means reading and
+// asking for memory, and neither exists in the core. The Style
+// therefore carries `font_id` -- 0 means "the font of the theme",
+// anything else is a place in the font list of the shell
+// (`painter.painter_set_font`). The core passes the number through and
+// paints no text; the shell looks it up. That way font loading does
+// NOT collide with the kernel profile, and it is not quietly simplified
+// either: the core simply cannot do text, and that stands in K1 of
+// lib/fui/core.fi.
+struct Style {
+    bg: u32,          // Hintergrund (Farbwert)
+    border: u32,      // Rahmenfarbe (Farbwert)
+    fg: u32,   // Schriftfarbe (Farbwert)
+    border_w: u16,   // Rahmenstaerke in Entwurfspunkten
+    radius: u16,      // Eckradius in Entwurfspunkten
+    pad_x: u16,       // Innenabstand waagerecht
+    pad_y: u16,       // Innenabstand vertical
+    font_px: u16,     // Schriftgroesse in Entwurfspunkten
+    weight: u16,     // 300 / 400 / 700
+    slant: u16,     // gerade / kursiv
+    font_id: u16,     // 0 = the font of the theme
+    align: u8,     // left / mittig / right
+    alpha: u8,    // 0..255
+    // ---- TEXT, the values of 12.09.2026.
+    //
+    // TRACKING IS SIGNED. Setting text tighter is a normal wish (a
+    // headline, a logo), and an unsigned field would have made "-1"
+    // into 65535. It is in DESIGN POINTS like every other length here,
+    // so it scales with the display -- render.len_of turns it into
+    // pixels.
+    tracking: i16,
+    word_spacing: i16,
+    // The line height as PER MILLE OF THE FONT SIZE (1500 = 1.5x) or,
+    // when line_h_abs is set, as design points. Two ways because both
+    // are wanted: a multiple follows the font size, a fixed value
+    // makes two columns line up whatever their size.
+    line_height: u16,
+    line_h_abs: u16,
+    kerning: u8,        // 0 = off, 1 = on
+    // ---- outline / shadow / gradient (the TextMeshPro side)
+    out_w: u16,         // design points
+    sh_dx: i16,
+    sh_dy: i16,
+    out_col: u32,
+    sh_col: u32,
+    grad_col: u32,
+    set_mask: u32,     // Bitmaske S_*
+}
+
+// A Style that changes NOTHING: every field inherits. That is the
+// default -- whoever says nothing gets the theme.
+fn style_new() -> Style {
+    return Style {
+        bg: color_inherit(), border: color_inherit(), fg: color_inherit(),
+        border_w: 0, radius: 0, pad_x: 0, pad_y: 0, font_px: 0,
+        weight: 0, slant: 0, font_id: 0,
+        align: 0, alpha: 255,
+        tracking: 0, word_spacing: 0, line_height: 0, line_h_abs: 0,
+        kerning: 1,
+        out_w: 0, sh_dx: 0, sh_dy: 0,
+        out_col: color_inherit(), sh_col: color_inherit(),
+        grad_col: color_inherit(),
+        set_mask: 0,
+    }
+}
+
+fn style_empty() -> Style {
+    return style_new()
+}
+
+// ---- the setters. They give the Style BACK, so that they can be
+// chained without Firn stage 0 needing methods.
+fn style_set_bg(s: Style, f: u32) -> Style {
+    var o: Style = s
+    o.bg = f
+    o.set_mask = o.set_mask | SF_BG
+    return o
+}
+
+fn style_set_border(s: Style, f: u32, width_px: usize) -> Style {
+    var o: Style = s
+    o.border = f
+    o.border_w = width_px as u16
+    o.set_mask = o.set_mask | SF_BORDER | SF_BORDER_W
+    return o
+}
+
+fn style_set_fg(s: Style, f: u32) -> Style {
+    var o: Style = s
+    o.fg = f
+    o.set_mask = o.set_mask | SF_FG
+    return o
+}
+
+fn style_set_radius(s: Style, r: usize) -> Style {
+    var o: Style = s
+    o.radius = r as u16
+    o.set_mask = o.set_mask | SF_RADIUS
+    return o
+}
+
+fn style_set_border_width(s: Style, st: usize) -> Style {
+    var o: Style = s
+    o.border_w = st as u16
+    o.set_mask = o.set_mask | SF_BORDER_W
+    return o
+}
+
+fn style_set_pad(s: Style, x: usize, y: usize) -> Style {
+    var o: Style = s
+    o.pad_x = x as u16
+    o.pad_y = y as u16
+    o.set_mask = o.set_mask | SF_PAD_X | SF_PAD_Y
+    return o
+}
+
+// `nr` 0 = the font of the theme.
+fn style_set_font(s: Style, nr: usize, px: usize) -> Style {
+    var o: Style = s
+    o.font_id = nr as u16
+    o.font_px = px as u16
+    o.set_mask = o.set_mask | SF_FONT_ID | SF_FONT_PX
+    return o
+}
+
+fn style_set_weight(s: Style, g: u32) -> Style {
+    var o: Style = s
+    o.weight = g as u16
+    o.set_mask = o.set_mask | SF_WEIGHT
+    return o
+}
+
+fn style_set_slant(s: Style, k: u32) -> Style {
+    var o: Style = s
+    o.slant = k as u16
+    o.set_mask = o.set_mask | SF_SLANT
+    return o
+}
+
+fn style_set_align(s: Style, a: u32) -> Style {
+    var o: Style = s
+    o.align = a as u8
+    o.set_mask = o.set_mask | SF_ALIGN
+    return o
+}
+
+fn style_set_alpha(s: Style, d: usize) -> Style {
+    var o: Style = s
+    var v: usize = d
+    if v > 255 {
+        v = 255
+    }
+    o.alpha = v as u8
+    o.set_mask = o.set_mask | SF_ALPHA
+    return o
+}
+
+// =================================================== THE STATE OVERRIDE
+//
+// THIN, and on purpose. In practice a state almost never overrides
+// everything -- mostly only the background colour ("background only on
+// hover"). A full `Style` per state would be 6 x 32 = 192 bytes per
+// widget; this way it is 32 + 5 x 16 = 112, and on a widget without a
+// state deviation only 32.
+//
+// That counts, because in the kernel profile everything sits on the
+// stack: a toolbar with 20 buttons is 2240 instead of 3840 bytes.
+struct Override {
+    bg: u32,
+    border: u32,
+    fg: u32,
+    alpha: u8,
+    set_mask: u8,
+}
+
+fn override_new() -> Override {
+    return Override { bg: color_inherit(), border: color_inherit(),
+        fg: color_inherit(), alpha: 255, set_mask: 0 }
+}
+
+fn override_empty() -> Override {
+    return override_new()
+}
+
+fn override_set_bg(u: Override, f: u32) -> Override {
+    var o: Override = u
+    o.bg = f
+    o.set_mask = o.set_mask | 1 as u8
+    return o
+}
+
+fn override_set_border(u: Override, f: u32) -> Override {
+    var o: Override = u
+    o.border = f
+    o.set_mask = o.set_mask | 2 as u8
+    return o
+}
+
+fn override_set_fg(u: Override, f: u32) -> Override {
+    var o: Override = u
+    o.fg = f
+    o.set_mask = o.set_mask | 4 as u8
+    return o
+}
+
+fn override_set_alpha(u: Override, d: usize) -> Override {
+    var o: Override = u
+    var v: usize = d
+    if v > 255 {
+        v = 255
+    }
+    o.alpha = v as u8
+    o.set_mask = o.set_mask | 8 as u8
+    return o
+}
+
+// ============================================================ THE STYLESET
+//
+// Base style plus the five state overrides. That is what a widget
+// gets.
+//
+// `STATE_NORMAL` has no override of its own -- that is what the base style is for.
+struct StyleSet {
+    s: Style,
+    u: [Override; 5],   // HOVER, ACTIVE, FOCUS, DISABLED, SELECTED
+}
+
+fn styleset_new() -> StyleSet {
+    return StyleSet { s: style_new(), u: [override_new(); 5] }
+}
+
+fn styleset_base(z: *mut StyleSet) -> *mut Style {
+    return &(*z).s
+}
+
+fn styleset_override(z: *mut StyleSet, state: u32) -> *mut Override {
+    var i: usize = 0
+    if state >= 1 as u32 && state <= 5 as u32 {
+        i = (state as usize) - 1
+    }
+    return &(*z).u[i]
+}
+
+fn styleset_set_override(z: *mut StyleSet, state: u32, u: Override) {
+    if state >= 1 as u32 && state <= 5 as u32 {
+        (*z).u[(state as usize) - 1] = u
+    }
+}
+
+// ========================================================= THE RESOLUTION
+//
+// From top to bottom: state, caller, widget default. The first layer
+// that does not say `INHERIT` wins. That is Justin's points 1 and 2 in
+// one function.
+//
+// `def` is the default of the widget -- a button passes
+// `color_token(TOK_BUTTON)` in there, a label
+// `color_transparent()`. That way "a label has no background by
+// default" stands in ONE place in the button code and not as a rule in
+// the programmer's head.
+// ======================================================================
+// THE TEXT SETTERS (12.09.2026)
+// ======================================================================
+//
+// Justin asked for "letter size, letter spacing -- like TextMeshPro".
+// These are the knobs. Each sets its OWN bit, so a style that only
+// touches the tracking leaves the line height inherited -- the rule
+// every value in this file keeps to.
+
+// LETTER SPACING, in design points, MAY BE NEGATIVE.
+//
+// The space sits BETWEEN the letters: n letters get (n-1) gaps. That
+// is what tools/fui/text_main.fi measures, and it is why a single
+// letter is not made wider by it.
+fn style_set_tracking(s: Style, px: i64) -> Style {
+    var o: Style = s
+    o.tracking = px as i16
+    o.set_mask = o.set_mask | SF_TRACKING
+    return o
+}
+
+// EXTRA SPACE ON THE BLANK, in design points. Falls out of the
+// tracking work for free -- the blank is just a character whose
+// advance gets a little more.
+fn style_set_word_spacing(s: Style, px: i64) -> Style {
+    var o: Style = s
+    o.word_spacing = px as i16
+    o.set_mask = o.set_mask | SF_WORD_SPACING
+    return o
+}
+
+// LINE HEIGHT AS A MULTIPLE, in per mille: 1500 = 1.5 lines.
+//
+// WHY PER MILLE AND NOT A FLOAT: the whole Style is integers so it can
+// be copied and compared without a care, and per mille is finer than
+// any typographer needs.
+fn style_set_line_height(s: Style, per_mille: usize) -> Style {
+    var o: Style = s
+    o.line_height = per_mille as u16
+    o.line_h_abs = 0
+    o.set_mask = o.set_mask | SF_LINE_HEIGHT
+    return o
+}
+
+// LINE HEIGHT AS A FIXED VALUE, in design points. For two columns that
+// have to line up even though their font sizes differ.
+fn style_set_line_height_px(s: Style, px: usize) -> Style {
+    var o: Style = s
+    o.line_h_abs = px as u16
+    o.line_height = 0
+    o.set_mask = o.set_mask | SF_LINE_HEIGHT
+    return o
+}
+
+// KERNING ON OR OFF. On is the default and the right one for reading.
+//
+// OFF IS FOR COLUMNS OF FIGURES. Kerning makes "11" narrower than
+// "10", and in a table the digits then no longer stand under each
+// other. That is the one place it has to go.
+fn style_set_kerning(s: Style, on: bool) -> Style {
+    var o: Style = s
+    if on {
+        o.kerning = 1
+    } else {
+        o.kerning = 0
+    }
+    o.set_mask = o.set_mask | SF_KERNING
+    return o
+}
+
+// A CONTOUR AROUND THE GLYPH. Width in design points, colour as any
+// other colour here -- a token, so it follows the theme.
+//
+// WHAT IT IS FOR: text over a picture or a video. Without it the same
+// label is unreadable on a light frame and on a dark one.
+fn style_set_outline(s: Style, width_px: usize, col: u32) -> Style {
+    var o: Style = s
+    o.out_w = width_px as u16
+    o.out_col = col
+    o.set_mask = o.set_mask | SF_OUTLINE
+    return o
+}
+
+// A SHADOW UNDER THE TEXT. Offset in design points, may be negative
+// (a shadow up and to the left is a legitimate look).
+fn style_set_shadow(s: Style, dx: i64, dy: i64, col: u32) -> Style {
+    var o: Style = s
+    o.sh_dx = dx as i16
+    o.sh_dy = dy as i16
+    o.sh_col = col
+    o.set_mask = o.set_mask | SF_SHADOW
+    return o
+}
+
+// A GRADIENT DOWN THE LINE: from the text colour to this one.
+//
+// Only vertical, and the reason stands at painter.fill_raster_gradient:
+// a horizontal gradient over a line makes the last word a different
+// colour from the first, and that reads as a fault.
+fn style_set_gradient(s: Style, col: u32) -> Style {
+    var o: Style = s
+    o.grad_col = col
+    o.set_mask = o.set_mask | SF_GRADIENT
+    return o
+}
+
+// A SIGNED NUMBER out of the cascade. `resolve_num` is unsigned and
+// must stay so -- a padding of -1 is nonsense. Tracking and the shadow
+// offset are the values where the sign carries meaning, so they get
+// their own resolver instead of bending the other one.
+fn resolve_snum(z: *mut StyleSet, bit: u32, value: i64,
+    def: i64) -> i64 {
+    let b: *mut Style = styleset_base(z)
+    if ((*b).set_mask & bit) != 0 as u32 {
+        return value
+    }
+    return def
+}
+
+fn resolve_color(state_col: u32, state_has: bool, own_col: u32,
+    own_has: bool, def: u32) -> u32 {
+    if state_has && color_kind(state_col) != COLOR_INHERIT {
+        return state_col
+    }
+    if own_has && color_kind(own_col) != COLOR_INHERIT {
+        return own_col
+    }
+    return def
+}
+
+fn resolve_bg(z: *mut StyleSet, state: u32, def: u32) -> u32 {
+    let s: *mut Style = &(*z).s
+    if state == STATE_NORMAL {
+        return resolve_color(color_inherit(), false, (*s).bg,
+            ((*s).set_mask & SF_BG) != 0 as u32, def)
+    }
+    let u: *mut Override = styleset_override(z, state)
+    return resolve_color((*u).bg, ((*u).set_mask & 1 as u8) != 0 as u8,
+        (*s).bg, ((*s).set_mask & SF_BG) != 0 as u32, def)
+}
+
+fn resolve_border(z: *mut StyleSet, state: u32, def: u32) -> u32 {
+    let s: *mut Style = &(*z).s
+    if state == STATE_NORMAL {
+        return resolve_color(color_inherit(), false, (*s).border,
+            ((*s).set_mask & SF_BORDER) != 0 as u32, def)
+    }
+    let u: *mut Override = styleset_override(z, state)
+    return resolve_color((*u).border, ((*u).set_mask & 2 as u8) != 0 as u8,
+        (*s).border, ((*s).set_mask & SF_BORDER) != 0 as u32, def)
+}
+
+fn resolve_fg(z: *mut StyleSet, state: u32, def: u32) -> u32 {
+    let s: *mut Style = &(*z).s
+    if state == STATE_NORMAL {
+        return resolve_color(color_inherit(), false, (*s).fg,
+            ((*s).set_mask & SF_FG) != 0 as u32, def)
+    }
+    let u: *mut Override = styleset_override(z, state)
+    return resolve_color((*u).fg,
+        ((*u).set_mask & 4 as u8) != 0 as u8,
+        (*s).fg, ((*s).set_mask & SF_FG) != 0 as u32, def)
+}
+
+fn resolve_alpha(z: *mut StyleSet, state: u32) -> usize {
+    let s: *mut Style = &(*z).s
+    if state != STATE_NORMAL {
+        let u: *mut Override = styleset_override(z, state)
+        if ((*u).set_mask & 8 as u8) != 0 as u8 {
+            return (*u).alpha as usize
+        }
+    }
+    if ((*s).set_mask & SF_ALPHA) != 0 as u32 {
+        return (*s).alpha as usize
+    }
+    return 255
+}
+
+// Resolve a number field. `bit` is the S_*, `value` the value in the
+// Style, `def` the default of the widget.
+fn resolve_num(z: *mut StyleSet, bit: u32, value: usize, def: usize) -> usize {
+    let s: *mut Style = &(*z).s
+    if ((*s).set_mask & bit) != 0 as u32 {
+        return value
+    }
+    return def
+}

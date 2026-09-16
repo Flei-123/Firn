@@ -1,0 +1,518 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/render.fi -- THE ONE PLACE WHERE WIDGETS GET PAINTED.
+//
+// ========================================================= WHY IT EXISTS
+//
+// This is the rule the whole undertaking is about, and it has been paid
+// for dearly twice:
+//
+//   * In OrientOS the control centre paints its own tiles instead of
+//     using `paint_button` -- which is why they look different from
+//     every other button in the system.
+//   * The window buttons broke twice, because their drawing was rebuilt
+//     in a second place.
+//
+// THEREFORE: no control in fUi paints itself. There is exactly one file
+// that turns a `Widget` into pixels, and this is it. Whoever builds a
+// new widget adds a case here -- and gets states, style, focus ring and
+// antialiasing for free, because they are already there.
+//
+// ================================================= THE BUILD-UP OF A WIDGET
+//
+// Every widget is painted in the SAME order, and that is not
+// convenience -- it is the reason they all fit together:
+//
+//   1. SURFACE   the background, if it is visible
+//   2. BORDER    the outline, if it is visible
+//   3. CONTENT   text or icon
+//   4. FOCUS RING last, so that it lies over everything
+//
+// `draw_base` does 1, 2 and 4 for EVERY widget. A new widget writes
+// only its content.
+import std.rt
+import paint.canvas
+import fui.style
+import fui.theme
+import fui.widget
+import fui.painter
+
+export {
+    Ctx, ctx_new, ctx_theme, ctx_painter,
+    draw_base, draw_widget, draw_label, draw_button,
+    draw_text, draw_focus_ring,
+    def_bg, def_bg_state, def_border, def_fg, def_radius, def_border_width,
+    def_pad_x, def_pad_y, def_font, def_align,
+    color_of, len_of, len_signed,
+    text_run_of,
+}
+
+// What is needed for painting: the theme (Colors, Shape, scale) and the
+// painter (canvas, font, rasteriser). Both belong to the caller.
+//
+struct Ctx {
+    m: u64,   // *mut theme.Theme
+    z: u64,   // *mut painter.Painter
+}
+
+fn ctx_new(m: *mut theme.Theme, z: *mut painter.Painter) -> Ctx {
+    return Ctx { m: m as u64, z: z as u64 }
+}
+
+fn ctx_theme(c: *mut Ctx) -> *mut theme.Theme {
+    return (*c).m as *mut theme.Theme
+}
+
+fn ctx_painter(c: *mut Ctx) -> *mut painter.Painter {
+    return (*c).z as *mut painter.Painter
+}
+
+// A resolved style value to a real colour.
+fn color_of(c: *mut Ctx, w: u32) -> u32 {
+    return theme.color_from_style(ctx_theme(c), w)
+}
+
+// A design length into device points -- every length goes through here.
+fn len_of(c: *mut Ctx, n: usize) -> f64 {
+    return theme.theme_px(ctx_theme(c), n) as f64
+}
+
+// ======================================================================
+// THE WIDGET DEFAULTS
+// ======================================================================
+//
+// What a widget asks for by itself, when the caller says nothing. This
+// is the bottom layer of the inheritance chain from lib/fui/style.fi.
+//
+// HERE stands "a label has no background by default" as ONE line -- and
+// not as a rule in the programmer's head.
+
+// ======================================================================
+// THE WIDGET DEFAULT HANGS ON THE STATE -- OTHERWISE THERE ARE NO STATES
+// ======================================================================
+//
+// A BUG OF THIS ROUND, FOUND IN THE PICTURE. The first version returned
+// `TOK_BUTTON` here for every state. It compiled cleanly, it ran too --
+// and on the gallery page all five buttons were THE SAME GREY. Measured
+// (dark, centre of each button):
+//
+//     normal 0x42414D  hover 0x42414D  active 0x42414D  ...
+//
+// The reason: `style.resolve_bg` falls back to the widget default when
+// neither the state override nor the caller says anything -- and that
+// is exactly the normal case for an ordinary button. A default without
+// a state therefore makes the states invisible, even though the style
+// system underneath computes correctly.
+//
+// THAT IS THE REASON THE GALLERY PAGE EXISTS: in the source both look
+// the same.
+fn def_bg_state(kind: u32, zu: u32) -> u32 {
+    if kind == widget.KIND_BUTTON || kind == widget.KIND_TOGGLE
+        || kind == widget.KIND_TILE || kind == widget.KIND_TAB {
+        if zu == style.STATE_ACTIVE {
+            return style.color_token(style.TOK_BUTTON_ACTIVE)
+        }
+        if zu == style.STATE_HOVER {
+            return style.color_token(style.TOK_BUTTON_HOVER)
+        }
+        if zu == style.STATE_SELECTED {
+            return style.color_token(style.TOK_ACCENT)
+        }
+        // DISABLED and FOCUS keep the resting colour: disabled shows
+        // in the pale text, focus in the ring. Two signals for the
+        // same state are one too many.
+        return style.color_token(style.TOK_BUTTON)
+    }
+    if kind == widget.KIND_TEXTBOX {
+        if zu == style.STATE_FOCUS {
+            return style.color_token(style.TOK_FIELD_FOCUS)
+        }
+        return style.color_token(style.TOK_FIELD)
+    }
+    return def_bg(kind)
+}
+
+fn def_bg(kind: u32) -> u32 {
+    if kind == widget.KIND_LABEL {
+        // A label is text on whatever lies underneath.
+        return style.color_transparent()
+    }
+    if kind == widget.KIND_TEXTBOX {
+        return style.color_token(style.TOK_FIELD)
+    }
+    if kind == widget.KIND_SEPARATOR {
+        return style.color_token(style.TOK_SEPARATOR)
+    }
+    if kind == widget.KIND_PROGRESS {
+        return style.color_token(style.TOK_FIELD)
+    }
+    if kind == widget.KIND_CARD || kind == widget.KIND_MENU {
+        return style.color_token(style.TOK_SURFACE_RAISED)
+    }
+    if kind == widget.KIND_TOOLBAR {
+        return style.color_token(style.TOK_SURFACE)
+    }
+    if kind == widget.KIND_NONE {
+        return style.color_transparent()
+    }
+    // ============================ A SLIDER HAS NO SURFACE OF ITS OWN
+    //
+    // A BUG OF WAVE 2, FOUND IN THE PICTURE. Without this case a
+    // slider fell through to `TOK_BUTTON` and painted its whole rect
+    // -- 200 x 24 of button grey -- and the track, the fill and the
+    // handle then sat on top of that slab. Measured near the top edge
+    // the row was then filled right across at EVERY value, so the
+    // handle could not be found at all and the three positions read
+    // the same.
+    //
+    // What a slider consists of is the track, the filled part and the
+    // handle; the area between them belongs to whatever lies behind.
+    // The same holds for a radio button, a checkbox and a toggle: they
+    // colour their BOX, not their row (the reason stands in
+    // wave2.draw_checkbox).
+    if kind == widget.KIND_SLIDER || kind == widget.KIND_CHECKBOX
+        || kind == widget.KIND_RADIO || kind == widget.KIND_TOGGLE
+        || kind == widget.KIND_TOOLTIP || kind == widget.KIND_BADGE {
+        return style.color_transparent()
+    }
+    if kind == widget.KIND_SCROLLBAR {
+        // A scrollbar DOES have a track -- that is the difference
+        // from a slider, and it is what you drop a page onto.
+        return style.color_token(style.TOK_SURFACE)
+    }
+    return style.color_token(style.TOK_BUTTON)
+}
+
+fn def_border(kind: u32) -> u32 {
+    if kind == widget.KIND_TEXTBOX {
+        return style.color_token(style.TOK_BORDER)
+    }
+    // Buttons of this theme carry no border -- `tone=0` in
+    // osum.shape: they are separated by spacing, not by a line.
+    return style.color_transparent()
+}
+
+fn def_fg(kind: u32) -> u32 {
+    return style.color_token(style.TOK_TEXT)
+}
+
+fn def_radius(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_TEXTBOX {
+        return (*fo).r_field
+    }
+    if kind == widget.KIND_CARD || kind == widget.KIND_MENU {
+        return (*fo).r_panel
+    }
+    if kind == widget.KIND_LABEL || kind == widget.KIND_SEPARATOR {
+        return 0
+    }
+    return (*fo).r_button
+}
+
+fn def_border_width(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_TEXTBOX {
+        return (*fo).border_w
+    }
+    return 0
+}
+
+fn def_pad_x(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_LABEL {
+        return 0
+    }
+    return (*fo).pad_x
+}
+
+fn def_pad_y(c: *mut Ctx, kind: u32) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    if kind == widget.KIND_LABEL {
+        return 0
+    }
+    return (*fo).pad_y
+}
+
+fn def_font(c: *mut Ctx) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    return (*fo).font
+}
+
+fn def_align(kind: u32) -> u32 {
+    if kind == widget.KIND_LABEL || kind == widget.KIND_TEXTBOX {
+        return style.ALIGN_LEFT
+    }
+    // A button labels itself centred.
+    return style.ALIGN_CENTER
+}
+
+// ======================================================================
+// THE COMMON BASE
+// ======================================================================
+//
+// Surface, border and focus ring -- the same for EVERY widget. That is
+// the part a new widget no longer has to write.
+//
+// `nur_ring` paints the focus ring AFTER the content; that is why it is
+// a call of its own and not part of `draw_base`.
+fn draw_base(c: *mut Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+
+    // ---- 1. THE SURFACE
+    //
+    // THE DECIDING LINE OF THIS FILE: if the value is not visible,
+    // NOTHING IS PAINTED. No substitute coat in the window colour --
+    // that is Justin's point 4, and over a background image the
+    // difference shows at once.
+    let bg: u32 = style.resolve_bg(sz, zu, def_bg_state(kind, zu))
+    let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize, def_radius(c, kind)))
+    if style.color_is_visible(bg) {
+        painter.round_rect(z, widget.w_x(e), widget.w_y(e),
+            widget.w_w(e), widget.w_h(e), r, color_of(c, bg))
+    }
+
+    // ---- 2. THE BORDER
+    let ra: u32 = style.resolve_border(sz, zu, def_border(kind))
+    let st: f64 = len_of(c, style.resolve_num(sz, style.SF_BORDER_W,
+        (*style.styleset_base(sz)).border_w as usize, def_border_width(c, kind)))
+    if style.color_is_visible(ra) && st > 0.0 {
+        painter.round_ring(z, widget.w_x(e), widget.w_y(e),
+            widget.w_w(e), widget.w_h(e), r, st, color_of(c, ra))
+    }
+}
+
+// THE FOCUS RING, last and over everything.
+//
+// It is the only thing somebody working by keyboard relies on --
+// therefore it is two pixels wide (theme.Shape.focus_w) and does NOT
+// colour the surface: were it a fill, you could not tell focused from
+// hovered apart.
+//
+fn draw_focus_ring(c: *mut Ctx, e: *mut widget.Widget) {
+    if !widget.w_is_focus(e) || widget.w_is_disabled(e) {
+        return
+    }
+    let z: *mut painter.Painter = ctx_painter(c)
+    let m: *mut theme.Theme = ctx_theme(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize, def_radius(c, kind)))
+    painter.round_ring(z, widget.w_x(e), widget.w_y(e), widget.w_w(e),
+        widget.w_h(e), r, len_of(c, (*fo).focus_w), (*f).accent)
+}
+
+// ======================================================================
+// THE TEXT OF A WIDGET
+// ======================================================================
+//
+// Horizontally by the alignment, vertically ALWAYS centred to the font
+// metrics -- that is Justin's complaint 1, and the reason stands in
+// painter.text_baseline_mid: whoever centres by the line height centres
+// the line and not the font.
+fn draw_text(c: *mut Ctx, e: *mut widget.Widget) {
+    if widget.w_text_len(e) == 0 {
+        return
+    }
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+
+    // The text colour. On a disabled widget the default is the pale
+    // one -- but a style that is set beats it, otherwise you could not
+    // choose the colour of a disabled widget.
+    var fallback: u32 = def_fg(kind)
+    if zu == style.STATE_DISABLED {
+        fallback = style.color_token(style.TOK_TEXT_DISABLED)
+    }
+    let tf: u32 = style.resolve_fg(sz, zu, fallback)
+    if !style.color_is_visible(tf) {
+        return
+    }
+    let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, kind)))
+    var align: u32 = def_align(kind)
+    if ((*s).set_mask & style.SF_ALIGN) != 0 as u32 {
+        align = (*s).align as u32
+    }
+    let base_y: f64 = painter.text_baseline_mid(z, widget.w_y(e),
+        widget.w_h(e), px)
+    // THE RUN CARRIES EVERYTHING THE STYLE SAYS ABOUT TEXT.
+    //
+    // This is the one place it is assembled, and that is the answer to
+    // Justin's "the values have to take effect on EVERY element that
+    // paints text -- button, label, list, table, menu, tab, text
+    // field. Not only the label." Every one of those goes through
+    // `draw_text`, so every one of them gets tracking, kerning, the
+    // outline and the shadow without knowing that any of it exists.
+    var r: painter.TextRun = text_run_of(c, e, px)
+    let e2: f64 = painter.run_draw(z, &r, widget.w_x(e) + padx, base_y,
+        widget.w_w(e) - 2.0 * padx, color_of(c, tf),
+        widget.w_text(e), widget.w_text_len(e), align)
+}
+
+// ======================================================================
+// FROM THE STYLE TO THE TEXT RUN
+// ======================================================================
+//
+// Reads the text values out of the cascade and turns the design points
+// into pixels. Anything the style does not set stays at the run's own
+// default, so a style that says nothing changes nothing -- the rule
+// that holds for every value in fUi.
+//
+// WHY THE COLOURS GO THROUGH `color_of`: the outline and the shadow
+// take a TOKEN like every other colour, so they follow the theme. A
+// black shadow hard-coded here would be the one colour in the library
+// that does not go dark with the rest -- and that is exactly the fault
+// Justin found in the real system.
+fn text_run_of(c: *mut Ctx, e: *mut widget.Widget,
+    px: f64) -> painter.TextRun {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let zu: u32 = widget.w_state(e)
+    var r: painter.TextRun = painter.run_new(px)
+
+    // --- weight and slant. These two already existed in the Style and
+    // were never used by anything -- now they are.
+    let wg: usize = style.resolve_num(sz, style.SF_WEIGHT,
+        (*s).weight as usize, style.WEIGHT_NORMAL as usize)
+    r = painter.run_set_weight(r, wg)
+    let sl: usize = style.resolve_num(sz, style.SF_SLANT,
+        (*s).slant as usize, style.SLANT_UPRIGHT as usize)
+    r = painter.run_set_slant(r, sl)
+
+    // --- tracking and word spacing, design points -> pixels
+    let tr: i64 = style.resolve_snum(sz, style.SF_TRACKING,
+        (*s).tracking as i64, 0)
+    if tr != 0 {
+        r = painter.run_set_tracking(r, len_signed(c, tr))
+    }
+    let ws: i64 = style.resolve_snum(sz, style.SF_WORD_SPACING,
+        (*s).word_spacing as i64, 0)
+    if ws != 0 {
+        r = painter.run_set_word_spacing(r, len_signed(c, ws))
+    }
+
+    // --- kerning. On unless the style says otherwise.
+    if ((*s).set_mask & style.SF_KERNING) != 0 as u32 {
+        r = painter.run_set_kerning(r, (*s).kerning != 0 as u8)
+    }
+
+    // --- the line height, for whoever draws more than one line
+    if ((*s).set_mask & style.SF_LINE_HEIGHT) != 0 as u32 {
+        if (*s).line_h_abs != 0 as u16 {
+            r = painter.run_set_line_height(r,
+                len_of(c, (*s).line_h_abs as usize))
+        } else {
+            r = painter.run_set_line_height(r,
+                px * ((*s).line_height as f64) / 1000.0)
+        }
+    }
+
+    // --- outline
+    if ((*s).set_mask & style.SF_OUTLINE) != 0 as u32
+        && (*s).out_w != 0 as u16 {
+        r = painter.run_set_outline(r,
+            len_of(c, (*s).out_w as usize),
+            color_of(c, (*s).out_col))
+    }
+
+    // --- shadow
+    if ((*s).set_mask & style.SF_SHADOW) != 0 as u32 {
+        r = painter.run_set_shadow(r,
+            len_signed(c, (*s).sh_dx as i64),
+            len_signed(c, (*s).sh_dy as i64),
+            color_of(c, (*s).sh_col))
+    }
+
+    // --- gradient
+    if ((*s).set_mask & style.SF_GRADIENT) != 0 as u32 {
+        r = painter.run_set_gradient(r, color_of(c, (*s).grad_col))
+    }
+    return r
+}
+
+// A SIGNED design length into pixels. `len_of` is unsigned because
+// every other length is; tracking and the shadow offset are the two
+// that may be negative, so the sign is handled here and the scaling
+// stays in one place.
+fn len_signed(c: *mut Ctx, n: i64) -> f64 {
+    if n < 0 {
+        return 0.0 - len_of(c, (0 - n) as usize)
+    }
+    return len_of(c, n as usize)
+}
+
+// ======================================================================
+// THE WIDGETS
+// ======================================================================
+
+// A LABEL. Text, nothing else -- and that is why its background is
+// transparent by default (`def_bg`). It is the simplest widget and
+// shows that the build-up carries: it has not a single line of drawing
+// code of its own.
+fn draw_label(c: *mut Ctx, e: *mut widget.Widget) {
+    draw_base(c, e)
+    draw_text(c, e)
+    draw_focus_ring(c, e)
+}
+
+// A BUTTON. The same build-up -- the difference sits solely in the
+// widget defaults (fill instead of transparent, text centred instead of
+// left).
+fn draw_button(c: *mut Ctx, e: *mut widget.Widget) {
+    draw_base(c, e)
+    draw_text(c, e)
+    draw_focus_ring(c, e)
+}
+
+// THE DISPATCHER OF THE BUILD-UP. Paints a widget out of what THIS
+// file knows: the shared build-up plus the widget defaults.
+//
+// ================== WHY THE FULL DISPATCHER IS NOT IN THIS FILE
+//
+// The controls of wave 2 (checkbox, slider, tabs, tooltip, ...) stand
+// in lib/fui/wave2.fi, and the one that paints ANY control is
+// `wave2.draw_any`. It is the one an application calls.
+//
+// The direction of the dependency decides that. wave2.fi needs
+// `draw_base`, `draw_text` and `draw_focus_ring` from here -- that is
+// the shared build-up, and it is the reason all the controls fit
+// together. So wave2.fi imports render.fi. If render.fi imported
+// wave2.fi back, the two would be a cycle and neither would build.
+//
+// A function pointer set at start-up would break the cycle, and it was
+// tried: Firn stage 0 refuses it, because the starting value of a
+// `static` is written into the object file and a function name is not
+// a constant in that sense (SPEC 14.1.statics) -- and a null pointer
+// is out too, since no conversion between a function pointer and a
+// number is allowed.
+//
+// So the rule for a caller is ONE line, and it stands in the README:
+//
+//     paint with `wave2.draw_any(c, e)`, not with
+//     `render.draw_widget(c, e)`
+//
+// `draw_any` falls back to this function for everything it does not
+// know itself, so nothing is lost -- and the promise of the library
+// (one call paints any control, no program paints its own) holds.
+fn draw_widget(c: *mut Ctx, e: *mut widget.Widget) {
+    let kind: u32 = widget.w_kind(e)
+    if kind == widget.KIND_LABEL {
+        draw_label(c, e)
+        return
+    }
+    // Button, toggle, tile ... they all paint the same base. What
+    // tells them apart are the widget defaults.
+    draw_button(c, e)
+}

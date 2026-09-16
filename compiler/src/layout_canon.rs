@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Canonical rendering of **memory layout and calling convention** — the
 //! yardstick for `lib/firnc1/types.fi`.
 //!

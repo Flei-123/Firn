@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Lowering of the optional tracing GC to FIR (module `gckern`, SPEC §3.5).
 //!
 //! The language surface from `gc.rs` is mapped here onto three things:

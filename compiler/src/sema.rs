@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Type checker (SPEC §12).
 //!
 //! INTERFACE (fixed):

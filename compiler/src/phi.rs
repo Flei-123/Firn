@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND 92 — phi elimination.** The last thing that happens to FIR before
 //! a code generator sees it.
 //!

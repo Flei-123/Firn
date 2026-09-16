@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Lowering of `match` and enum constructors to FIR (module `types`).
 //!
 //! The result is a `fir::Term::Switch` over the variant number (or over the

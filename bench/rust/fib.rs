@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Gegenstueck zu bench/firn/fib.fi — gleiche Arbeit, gleiches Ergebnis.
 use std::hint::black_box;
 

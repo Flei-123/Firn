@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Abstract syntax tree of the v0 subset (SPEC §10.1).
 //!
 //! Every expression carries a unique `ExprId`; the type checker builds the

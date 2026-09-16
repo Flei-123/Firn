@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Hand-written lexer (no generator).
 //!
 //! INTERFACE (fixed, used by parser.rs):

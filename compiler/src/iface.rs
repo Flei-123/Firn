@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `interface` and **dynamic dispatch** — round 46 (SPEC §6.2).
 //!
 //! ## What this round adds

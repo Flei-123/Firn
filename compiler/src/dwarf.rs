@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! DWARF basics: line numbers (`.debug_line`) for the debugger.
 //!
 //! FIR carries no source positions (`fir.rs` is frozen). That is why lowering

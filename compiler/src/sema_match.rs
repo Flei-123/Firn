@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Sum types (`enum`) and pattern matching (`match`) — SPEC §6.3, `L4`.
 //!
 //! This file belongs to the module `types`. It holds

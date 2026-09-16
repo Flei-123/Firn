@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Lowering AST -> FIR.
 //!
 //! INTERFACE (fixed):
