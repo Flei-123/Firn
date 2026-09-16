@@ -1,0 +1,1104 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave2.fi -- THE CONTROLS OF WAVE 2.
+//
+// ========================================================= WHY IT EXISTS
+//
+// render.fi holds the build-up every widget shares (surface, border,
+// content, focus ring) and the two controls of wave 1. This file adds
+// the twelve of wave 2:
+//
+//   checkbox, radio button, toggle switch, slider, scrollbar,
+//   progress bar, dropdown, tabs, toolbar, menu bar + menu,
+//   context menu, tooltip
+//
+// They sit in a file of their own and not in render.fi for one
+// reason: render.fi is the BUILD-UP, and it has to stay readable for
+// somebody who wants to know how a widget is made. A thousand lines of
+// individual controls in the same file would bury exactly that.
+//
+// WHAT THEY ALL KEEP TO -- and this is the part that matters:
+//
+//   * They call `render.draw_base` FIRST. Surface, border, radius and
+//     the state colour therefore come from the same place as on a
+//     button. Nobody paints his own background.
+//   * They take EVERY colour from theme/style. There is not one
+//     literal colour value in this file -- a check counts that
+//     (tools/fui/wave2_main.fi, test 9).
+//   * They end with `render.draw_focus_ring`. That is why keyboard
+//     focus works on all of them without any of them doing anything
+//     for it.
+//   * Every length goes through `render.len_of`, so the scale and the
+//     shape really take effect.
+//
+// ================================== WHY THE STATES ARE NOT RE-INVENTED
+//
+// Not one control in this file asks `if hovered { colour = ... }`. It
+// asks `widget.w_state(e)` and hands the answer to the style system,
+// exactly as render.draw_base does. The precedence (disabled beats
+// active beats selected beats hover beats focus) therefore holds for a
+// checkbox in the same way as for a button -- because it is decided in
+// ONE place, in widget.w_state, and this file does not know it at all.
+//
+// That is the answer to the demand "consistent across the existing
+// state handling, not re-invented".
+//
+// ========================================== THE TOOLTIP AND THE GREY BOX
+//
+// Justin, 11.09.2026: in the real system a grey rectangle stood behind
+// the tooltip text. That artefact must not be possible here, and the
+// reason it happened is worth writing down, because it is a trap the
+// next control would fall into as well:
+//
+// A SHADOW PAINTED AS A RECTANGLE IS NOT A SHADOW. Whoever lays a grey
+// rect under a panel and then paints the panel on top gets a grey
+// border sticking out on every side where the panel does not reach --
+// and with a ROUND panel it sticks out at all four corners, because the
+// rect has none. That is exactly the "grey box behind the text".
+//
+// The answer here: the tooltip paints NO shadow rectangle at all. It is
+// a surface with a border, both from the theme, and nothing underneath
+// it. `tools/fui/wave2_main.fi` measures the pixels diagonally outside
+// each corner and requires that they are UNCHANGED (test 8).
+import std.rt
+import fui.style
+import fui.theme
+import fui.widget
+import fui.painter
+import fui.render
+import fui.icon
+import fui.layout
+
+export {
+    draw_checkbox, draw_radio, draw_toggle, draw_slider,
+    draw_scrollbar, draw_progress, draw_dropdown, draw_tab,
+    draw_tabbar, draw_toolbar, draw_menubar, draw_menu,
+    draw_menu_item, draw_tooltip, draw_separator, draw_groupbox,
+    draw_wave2, draw_any,
+    box_side, mark_color, track_rect, handle_rect,
+    VAL_MAX, CHECK_PARTIAL,
+    tooltip_size, menu_item_height,
+}
+
+// The value range of everything that slides. The same number as in
+// lib/fui/control.fi -- and the reason it is 1000 stands there.
+const VAL_MAX: i64 = 1000
+
+// The third state of a checkbox: neither on nor off, because its
+// children disagree. Every system has it, and a tree without it has to
+// lie about mixed ticks.
+const CHECK_PARTIAL: i64 = 2
+
+// ======================================================================
+// THE SHARED PIECES
+// ======================================================================
+
+// THE SIDE OF A SQUARE BOX INSIDE A CONTROL.
+//
+// The tick box of a checkbox, the circle of a radio button. It follows
+// the FONT SIZE and not the widget height: a checkbox next to a line of
+// 15 point text should be as big as that text, whether the row it sits
+// in is 32 or 40 high. Every system ties it to the text, and that is
+// why a checkbox never looks blown up in a tall row.
+//
+// Rounded to a whole pixel, because a box of 15.4 pixels gets a blurred
+// border on one side and a sharp one on the other.
+fn box_side(c: *mut render.Ctx, e: *mut widget.Widget) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let px: f64 = render.len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, render.def_font(c)))
+    var d: f64 = ((px + 0.5) as i64) as f64
+    // It must not grow past the widget: a checkbox in a 12 pixel row
+    // is small, not clipped.
+    let h: f64 = widget.w_h(e) - 2.0
+    if d > h && h > 0.0 {
+        d = h
+    }
+    if d < 8.0 {
+        d = 8.0
+    }
+    return d
+}
+
+// THE COLOUR OF A MARK -- tick, dot, triangle, the thumb of a switch.
+//
+// It is NOT the text colour: on a filled box (a ticked checkbox is
+// filled with the accent) the tick has to be legible against the
+// ACCENT, and that is `text_on_accent`. The theme worked that pair out
+// against WCAG (theme.fi, finding 2), so asking for it here is the
+// whole job.
+fn mark_color(c: *mut render.Ctx, e: *mut widget.Widget,
+    on_accent: bool) -> u32 {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    if widget.w_is_disabled(e) {
+        return (*f).text_disabled
+    }
+    if on_accent {
+        return (*f).text_on_accent
+    }
+    return (*f).text
+}
+
+// Where the text of a control starts when a box sits in front of it.
+fn text_after_box(c: *mut render.Ctx, e: *mut widget.Widget,
+    d: f64) -> f64 {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    return d + render.len_of(c, (*fo).sp_s)
+}
+
+// Paint the label of a control at an x of our choosing.
+//
+// It goes through a SECOND widget that borrows the styleset of the
+// first. That sounds roundabout and is deliberate: this way the label
+// of a checkbox runs through exactly the same `render.draw_text` as the
+// label of a button -- same baseline arithmetic, same disabled colour,
+// same truncation. A `painter.text` call of our own here would be the
+// second drawing of the same thing, and that is the mistake the whole
+// library exists to prevent.
+fn label_at(c: *mut render.Ctx, e: *mut widget.Widget, x: f64, w: f64) {
+    if widget.w_text_len(e) == 0 {
+        return
+    }
+    var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&l, x, widget.w_y(e), w, widget.w_h(e))
+    widget.w_set_text(&l, widget.w_text(e), widget.w_text_len(e))
+    widget.w_set_styleset(&l, *widget.w_styleset(e))
+    // The label must not drag the background of the control along.
+    let ls: *mut style.Style = widget.w_style(&l)
+    *ls = style.style_set_bg(*ls, style.color_transparent())
+    *ls = style.style_set_pad(*ls, 0, 0)
+    *ls = style.style_set_align(*ls, style.ALIGN_LEFT)
+    // The state has to travel with it, otherwise a disabled checkbox
+    // keeps a black label.
+    widget.w_set_state_bits(&l, state_bits_of(e))
+    // ... but not the focus: the ring belongs round the control, not
+    // round its text.
+    widget.w_set_focus(&l, false)
+    render.draw_text(c, &l)
+}
+
+// The state bits of a widget, so they can be passed on.
+fn state_bits_of(e: *mut widget.Widget) -> u32 {
+    var b: u32 = 0
+    if widget.w_is_hover(e) { b = b | 1 as u32 }
+    if widget.w_is_active(e) { b = b | 2 as u32 }
+    if widget.w_is_focus(e) { b = b | 4 as u32 }
+    if widget.w_is_disabled(e) { b = b | 8 as u32 }
+    if widget.w_is_selected(e) { b = b | 16 as u32 }
+    return b
+}
+
+// A widget that stands in for a PART of a control -- the box of a
+// checkbox, the thumb of a slider, the track of a scrollbar.
+//
+// WHY A WIDGET AND NOT A RECTANGLE: because then the part goes through
+// `render.draw_base` and gets surface, border, radius and the state
+// colour from the same source as everything else. A `painter.round_rect`
+// here with a colour worked out by hand would be the beginning of the
+// drift this library exists to stop.
+fn part(c: *mut render.Ctx, e: *mut widget.Widget, kind: u32,
+    x: f64, y: f64, w: f64, h: f64, bg: u32, radius_set: bool,
+    radius: usize) -> widget.Widget {
+    var p: widget.Widget = widget.widget_new(kind)
+    widget.w_place(&p, x, y, w, h)
+    widget.w_set_state_bits(&p, state_bits_of(e))
+    widget.w_set_focus(&p, false)   // the ring belongs to the whole control
+    let s: *mut style.Style = widget.w_style(&p)
+    *s = style.style_set_bg(*s, bg)
+    if radius_set {
+        *s = style.style_set_radius(*s, radius)
+    }
+    return p
+}
+
+// ======================================================================
+// CHECKBOX
+// ======================================================================
+//
+// A square box and a label. The box carries the state, the label says
+// what it means.
+//
+// WHY THE BOX AND NOT THE WHOLE WIDGET IS COLOURED: the hit area is the
+// whole rect (widget.w_hits, and the reason stands there) -- but a
+// checkbox whose whole row lights up on hover looks like a list entry.
+// The systems all colour only the box and leave the row alone. The row
+// therefore gets `transparent` as its default here, and that is the one
+// place it is decided.
+fn draw_checkbox(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let zu: u32 = widget.w_state(e)
+    let v: i64 = widget.w_value(e)
+    let an: bool = v != 0
+
+    // The row itself: whatever the caller asked for, transparent by
+    // default. `render.draw_base` does the right thing with
+    // transparent -- it paints nothing (style.fi, "no background is a
+    // state").
+    render.draw_base(c, e)
+
+    let d: f64 = box_side(c, e)
+    let by: f64 = widget.w_y(e) + (widget.w_h(e) - d) / 2.0
+    let bx: f64 = widget.w_x(e)
+
+    // The box. Filled in the accent when it is on, in the field
+    // colour when it is off -- that is the pair the theme already
+    // guarantees a contrast for.
+    var bg: u32 = style.color_token(style.TOK_FIELD)
+    if an {
+        bg = style.color_token(style.TOK_ACCENT)
+    }
+    if widget.w_is_disabled(e) {
+        // Disabled: no accent. A pale box, and the tick in the pale
+        // text colour -- otherwise "off and disabled" looks like "on".
+        bg = style.color_token(style.TOK_FIELD)
+    }
+    var bo: widget.Widget = part(c, e, widget.KIND_NONE, bx, by, d, d,
+        bg, true, (*fo).r_field)
+    // The border: only when it is NOT filled. An accent box with a
+    // grey border round it looks stuck on.
+    let bs: *mut style.Style = widget.w_style(&bo)
+    if !an || widget.w_is_disabled(e) {
+        *bs = style.style_set_border(*bs,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    render.draw_base(c, &bo)
+
+    // The mark. `icon.check` is the ONE tick of this library -- the
+    // menu uses the same one, and that is the point of icon.fi.
+    if an {
+        let mc: u32 = mark_color(c, e, !widget.w_is_disabled(e))
+        let st: f64 = render.len_of(c, 2)
+        if v == CHECK_PARTIAL {
+            icon.dash(render.ctx_painter(c), bx, by, d, st, mc)
+        } else {
+            icon.check(render.ctx_painter(c), bx, by, d, st, mc)
+        }
+    }
+
+    let tx: f64 = bx + text_after_box(c, e, d)
+    label_at(c, e, tx, widget.w_x(e) + widget.w_w(e) - tx)
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// RADIO BUTTON
+// ======================================================================
+//
+// The same as a checkbox, with two differences that are not decoration:
+// it is ROUND, and its mark is a DOT and not a tick.
+//
+// Both say the same thing to the eye: round means "one of these",
+// square means "this one on or off". Whoever makes a radio button
+// square takes that signal away, and no label gets it back. The
+// roundness is therefore not a style here but the radius = half the
+// side, worked out and not fetched from the shape -- a "round" that
+// `shape_classic` could square off would be the wrong kind of
+// theming.
+fn draw_radio(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let an: bool = widget.w_value(e) != 0
+
+    render.draw_base(c, e)
+
+    let d: f64 = box_side(c, e)
+    let by: f64 = widget.w_y(e) + (widget.w_h(e) - d) / 2.0
+    let bx: f64 = widget.w_x(e)
+
+    var bg: u32 = style.color_token(style.TOK_FIELD)
+    if an && !widget.w_is_disabled(e) {
+        bg = style.color_token(style.TOK_ACCENT)
+    }
+    var bo: widget.Widget = part(c, e, widget.KIND_NONE, bx, by, d, d,
+        bg, false, 0)
+    // A circle is a rectangle with half the side as its radius. Set
+    // in POINTS, because the radius goes through `render.len_of`
+    // afterwards -- so it stays a circle at every scale.
+    let bs: *mut style.Style = widget.w_style(&bo)
+    let dp: usize = style.resolve_num(widget.w_styleset(e),
+        style.SF_FONT_PX,
+        (*style.styleset_base(widget.w_styleset(e))).font_px as usize,
+        render.def_font(c))
+    *bs = style.style_set_radius(*bs, dp)
+    if !an || widget.w_is_disabled(e) {
+        *bs = style.style_set_border(*bs,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    render.draw_base(c, &bo)
+
+    if an {
+        // The dot is 0.4 of the circle. Smaller and it looks like
+        // dirt, bigger and it touches the edge.
+        let dd: f64 = d * 0.4
+        icon.dot(render.ctx_painter(c), bx + (d - dd) / 2.0,
+            by + (d - dd) / 2.0, dd,
+            mark_color(c, e, !widget.w_is_disabled(e)))
+    }
+
+    let tx: f64 = bx + text_after_box(c, e, d)
+    label_at(c, e, tx, widget.w_x(e) + widget.w_w(e) - tx)
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// TOGGLE SWITCH
+// ======================================================================
+//
+// A pill with a round thumb that sits left or right. It says the same
+// as a checkbox and is used where the change takes effect AT ONCE --
+// that is the convention on every phone, and the reason both exist.
+//
+// The width is 1.8 times the height. That is the proportion at which
+// the thumb clearly has two positions; at 1.5 the two states look
+// almost alike, and that is the only thing a switch has to get right.
+fn draw_toggle(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    let an: bool = widget.w_value(e) != 0
+
+    render.draw_base(c, e)
+
+    // The pill follows the font, like the box of a checkbox -- so a
+    // switch and a checkbox in the same row are the same height.
+    let h: f64 = box_side(c, e)
+    let w: f64 = h * 1.8
+    let y: f64 = widget.w_y(e) + (widget.w_h(e) - h) / 2.0
+    let x: f64 = widget.w_x(e)
+
+    var bg: u32 = style.color_token(style.TOK_FIELD)
+    if an && !widget.w_is_disabled(e) {
+        bg = style.color_token(style.TOK_ACCENT)
+    }
+    var pill: widget.Widget = part(c, e, widget.KIND_NONE, x, y, w, h,
+        bg, false, 0)
+    let ps: *mut style.Style = widget.w_style(&pill)
+    // radius in POINTS = half the height in points, so the pill stays
+    // a pill at every scale. `render.len_of` runs over it afterwards.
+    let hp: usize = style.resolve_num(widget.w_styleset(e),
+        style.SF_FONT_PX,
+        (*style.styleset_base(widget.w_styleset(e))).font_px as usize,
+        render.def_font(c))
+    *ps = style.style_set_radius(*ps, hp)
+    if !an {
+        let fo: *mut theme.Shape = theme.theme_shape(m)
+        *ps = style.style_set_border(*ps,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    render.draw_base(c, &pill)
+
+    // The thumb. It sits INSIDE the pill with a gap, otherwise it
+    // looks like it is falling out.
+    let gap: f64 = 2.0
+    let td: f64 = h - 2.0 * gap
+    var tx: f64 = x + gap
+    if an {
+        tx = x + w - gap - td
+    }
+    var tc: u32 = (*f).text_on_accent
+    if !an {
+        tc = (*f).text_muted
+    }
+    if widget.w_is_disabled(e) {
+        tc = (*f).text_disabled
+    }
+    icon.dot(render.ctx_painter(c), tx, y + gap, td, tc)
+
+    let lx: f64 = x + w + render.len_of(c,
+        (*theme.theme_shape(m)).sp_s)
+    label_at(c, e, lx, widget.w_x(e) + widget.w_w(e) - lx)
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// SLIDER
+// ======================================================================
+//
+// A track, a filled part up to the value, and a handle on it.
+//
+// THE HANDLE IS THE REASON THE ARITHMETIC IS NOT TRIVIAL: it has a
+// width, and its CENTRE points at the value. The usable travel is
+// therefore `width - handle`, not `width`. Whoever forgets it gets a
+// slider that stands at 1000 before it reaches the right edge -- and
+// worse, a handle that hangs half out of the widget at both ends.
+//
+// `handle_rect` and `track_rect` work that out, and lib/fui/control.fi
+// uses THE SAME arithmetic for the drag (`value_from_x`). That the two
+// agree is not a matter of care but of construction: both take the
+// handle size from the height of the widget.
+fn track_rect(c: *mut render.Ctx, e: *mut widget.Widget) -> layout.Rect {
+    let h: f64 = widget.w_h(e)
+    let w: f64 = widget.w_w(e)
+    if h > w {
+        // upright
+        let t: f64 = render.len_of(c, 4)
+        return layout.rect_new((widget.w_x(e) + (w - t) / 2.0) as i64,
+            widget.w_y(e) as i64, t as i64, h as i64)
+    }
+    let t: f64 = render.len_of(c, 4)
+    return layout.rect_new(widget.w_x(e) as i64,
+        (widget.w_y(e) + (h - t) / 2.0) as i64, w as i64, t as i64)
+}
+
+// Where the handle sits for the current value.
+fn handle_rect(c: *mut render.Ctx, e: *mut widget.Widget) -> layout.Rect {
+    let h: f64 = widget.w_h(e)
+    let w: f64 = widget.w_w(e)
+    var v: i64 = widget.w_value(e)
+    if v < 0 { v = 0 }
+    if v > VAL_MAX { v = VAL_MAX }
+    if h > w {
+        let d: f64 = w
+        let travel: f64 = h - d
+        let off: f64 = (travel * (v as f64)) / (VAL_MAX as f64)
+        return layout.rect_new(widget.w_x(e) as i64,
+            (widget.w_y(e) + off) as i64, d as i64, d as i64)
+    }
+    let d: f64 = h
+    let travel: f64 = w - d
+    let off: f64 = (travel * (v as f64)) / (VAL_MAX as f64)
+    return layout.rect_new((widget.w_x(e) + off) as i64,
+        widget.w_y(e) as i64, d as i64, d as i64)
+}
+
+fn draw_slider(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    render.draw_base(c, e)
+
+    let tr: layout.Rect = track_rect(c, e)
+    let hr: layout.Rect = handle_rect(c, e)
+    let upright: bool = widget.w_h(e) > widget.w_w(e)
+
+    // The track. A pill: radius = half the thickness, in points.
+    var tw: widget.Widget = part(c, e, widget.KIND_NONE,
+        layout.rect_x(&tr) as f64, layout.rect_y(&tr) as f64,
+        layout.rect_w(&tr) as f64, layout.rect_h(&tr) as f64,
+        style.color_token(style.TOK_FIELD), true, 2)
+    render.draw_base(c, &tw)
+
+    // THE FILLED PART -- from the start to the middle of the handle.
+    // It is what makes a slider readable at a glance: you see how far
+    // along it stands without reading a number.
+    //
+    // On a DISABLED slider it is not the accent: a disabled control
+    // must not be the most colourful thing on the page.
+    var fill_tok: u32 = style.color_token(style.TOK_ACCENT)
+    if widget.w_is_disabled(e) {
+        fill_tok = style.color_token(style.TOK_SEPARATOR)
+    }
+    if upright {
+        let mid: f64 = (layout.rect_y(&hr) as f64)
+            + (layout.rect_h(&hr) as f64) / 2.0
+        let top: f64 = layout.rect_y(&tr) as f64
+        if mid > top {
+            var fw: widget.Widget = part(c, e, widget.KIND_NONE,
+                layout.rect_x(&tr) as f64, top,
+                layout.rect_w(&tr) as f64, mid - top, fill_tok, true, 2)
+            render.draw_base(c, &fw)
+        }
+    } else {
+        let mid: f64 = (layout.rect_x(&hr) as f64)
+            + (layout.rect_w(&hr) as f64) / 2.0
+        let left: f64 = layout.rect_x(&tr) as f64
+        if mid > left {
+            var fw: widget.Widget = part(c, e, widget.KIND_NONE,
+                left, layout.rect_y(&tr) as f64,
+                mid - left, layout.rect_h(&tr) as f64, fill_tok, true, 2)
+            render.draw_base(c, &fw)
+        }
+    }
+
+    // The handle. Round, and it carries the state -- THAT is what
+    // makes hovering a slider visible.
+    var hc: u32 = style.color_token(style.TOK_BUTTON)
+    let zu: u32 = widget.w_state(e)
+    if zu == style.STATE_ACTIVE {
+        hc = style.color_token(style.TOK_BUTTON_ACTIVE)
+    } else if zu == style.STATE_HOVER {
+        hc = style.color_token(style.TOK_BUTTON_HOVER)
+    }
+    var hw: widget.Widget = part(c, e, widget.KIND_NONE,
+        layout.rect_x(&hr) as f64, layout.rect_y(&hr) as f64,
+        layout.rect_w(&hr) as f64, layout.rect_h(&hr) as f64,
+        hc, false, 0)
+    let hs: *mut style.Style = widget.w_style(&hw)
+    *hs = style.style_set_radius(*hs, 999)   // clamped to half the side
+    *hs = style.style_set_border(*hs,
+        style.color_token(style.TOK_BORDER), (*fo).border_w)
+    render.draw_base(c, &hw)
+
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// SCROLLBAR
+// ======================================================================
+//
+// A track and a thumb. The difference from a slider: the thumb has a
+// SIZE that says how much of the content is visible -- that is the
+// second number a scrollbar carries, and it is the one that makes it
+// a scrollbar and not a slider.
+//
+// It is taken from `w_pref_h` (upright) or `w_pref_w`: the visible
+// fraction in per mille. A widget has exactly one `value`, and the
+// brief said why ("whoever needs two has two widgets") -- but a
+// scrollbar needs the second number to be drawable at all, and
+// `pref` is free on a scrollbar. That is the cheapest honest place.
+fn draw_scrollbar(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let upright: bool = widget.w_h(e) > widget.w_w(e)
+
+    // The track is the widget itself -- that is what `def_bg` gives a
+    // scrollbar.
+    render.draw_base(c, e)
+
+    // How big a share is visible. 0 or unset means "a third" -- a
+    // sensible default that never gives a thumb of zero length.
+    var share: f64 = 0.333
+    var pref: f64 = widget.w_pref_h(e)
+    if !upright {
+        pref = widget.w_pref_w(e)
+    }
+    if pref > 0.0 && pref <= (VAL_MAX as f64) {
+        share = pref / (VAL_MAX as f64)
+    }
+
+    var v: i64 = widget.w_value(e)
+    if v < 0 { v = 0 }
+    if v > VAL_MAX { v = VAL_MAX }
+
+    var zu: u32 = widget.w_state(e)
+    var tc: u32 = style.color_token(style.TOK_BUTTON)
+    if zu == style.STATE_ACTIVE {
+        tc = style.color_token(style.TOK_BUTTON_ACTIVE)
+    } else if zu == style.STATE_HOVER {
+        tc = style.color_token(style.TOK_BUTTON_HOVER)
+    }
+
+    let pad: f64 = 2.0
+    if upright {
+        let len: f64 = widget.w_h(e) - 2.0 * pad
+        // A minimum length, otherwise a long page gives a thumb you
+        // cannot grab.
+        var th: f64 = len * share
+        let min: f64 = render.len_of(c, 24)
+        if th < min { th = min }
+        if th > len { th = len }
+        let off: f64 = (len - th) * (v as f64) / (VAL_MAX as f64)
+        var t: widget.Widget = part(c, e, widget.KIND_NONE,
+            widget.w_x(e) + pad, widget.w_y(e) + pad + off,
+            widget.w_w(e) - 2.0 * pad, th, tc, true, (*fo).r_field)
+        render.draw_base(c, &t)
+        // The grip grooves: they say "this can be grabbed". Only when
+        // there is room for them.
+        if th > render.len_of(c, 28) {
+            icon.grip_lines(render.ctx_painter(c), widget.w_x(e) + pad,
+                widget.w_y(e) + pad + off, widget.w_w(e) - 2.0 * pad,
+                th, true, mark_color(c, e, false))
+        }
+    } else {
+        let len: f64 = widget.w_w(e) - 2.0 * pad
+        var tw2: f64 = len * share
+        let min: f64 = render.len_of(c, 24)
+        if tw2 < min { tw2 = min }
+        if tw2 > len { tw2 = len }
+        let off: f64 = (len - tw2) * (v as f64) / (VAL_MAX as f64)
+        var t: widget.Widget = part(c, e, widget.KIND_NONE,
+            widget.w_x(e) + pad + off, widget.w_y(e) + pad,
+            tw2, widget.w_h(e) - 2.0 * pad, tc, true, (*fo).r_field)
+        render.draw_base(c, &t)
+        if tw2 > render.len_of(c, 28) {
+            icon.grip_lines(render.ctx_painter(c),
+                widget.w_x(e) + pad + off, widget.w_y(e) + pad,
+                tw2, widget.w_h(e) - 2.0 * pad, false,
+                mark_color(c, e, false))
+        }
+    }
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// PROGRESS BAR
+// ======================================================================
+//
+// A track and a filled part. No handle, because nothing can be
+// grabbed -- and that is the ONLY visible difference from a slider,
+// which is why it must be clear: a progress bar with a handle would be
+// a lie about what you can do with it.
+fn draw_progress(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    // The track comes from `def_bg` (TOK_FIELD) through draw_base.
+    render.draw_base(c, e)
+
+    var v: i64 = widget.w_value(e)
+    if v < 0 { v = 0 }
+    if v > VAL_MAX { v = VAL_MAX }
+    if v == 0 {
+        render.draw_focus_ring(c, e)
+        return
+    }
+
+    var fill: u32 = style.color_token(style.TOK_ACCENT)
+    if widget.w_is_disabled(e) {
+        fill = style.color_token(style.TOK_SEPARATOR)
+    }
+    let w: f64 = widget.w_w(e) * (v as f64) / (VAL_MAX as f64)
+    var p: widget.Widget = part(c, e, widget.KIND_NONE, widget.w_x(e),
+        widget.w_y(e), w, widget.w_h(e), fill, true, (*fo).r_field)
+    render.draw_base(c, &p)
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// DROPDOWN / COMBOBOX
+// ======================================================================
+//
+// A button with a triangle on the right. The triangle is the one from
+// icon.fi -- the same one the scrollbar and the menu use, and that is
+// why they cannot drift apart.
+//
+// The text has to be kept away from the triangle, or a long entry runs
+// underneath it. That is done by SHRINKING the text rect, not by
+// hoping the text is short: `label_at` gets the width without the
+// arrow area, and `render.draw_text` truncates on a character
+// boundary.
+fn draw_dropdown(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    render.draw_base(c, e)
+
+    let padx: f64 = render.len_of(c, (*fo).pad_x)
+    let d: f64 = render.len_of(c, 8)
+    let ax: f64 = widget.w_x(e) + widget.w_w(e) - padx - d
+    let ay: f64 = widget.w_y(e) + (widget.w_h(e) - d * 0.5) / 2.0
+    icon.triangle_down(render.ctx_painter(c), ax, ay, d,
+        mark_color(c, e, false))
+
+    // The text: from the left padding up to BEFORE the arrow.
+    let tx: f64 = widget.w_x(e) + padx
+    label_at(c, e, tx, ax - tx - render.len_of(c, (*fo).sp_s))
+    render.draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// TAB
+// ======================================================================
+//
+// One tab. Selected means: it carries the surface of the page it
+// belongs to, and an accent bar at the bottom.
+//
+// THE BAR AND NOT ONLY THE COLOUR: a selected tab that differs only in
+// its background is hard to tell from a hovered one -- they are two
+// close greys. The bar is unambiguous, and that is why every system
+// has one.
+fn draw_tab(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sel: bool = widget.w_is_selected(e)
+
+    // A selected tab is NOT painted in the accent -- it takes the
+    // page colour, so that tab and page look like one piece. The
+    // widget default would give it the accent (def_bg_state does that
+    // for KIND_TAB), so it is set here.
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        if sel {
+            *s = style.style_set_bg(*s,
+                style.color_token(style.TOK_SURFACE_RAISED))
+        } else {
+            *s = style.style_set_bg(*s, style.color_transparent())
+            style.styleset_set_override(sz, style.STATE_HOVER,
+                style.override_set_bg(style.override_new(),
+                    style.color_token(style.TOK_BUTTON_HOVER)))
+        }
+    }
+    render.draw_base(c, e)
+
+    if sel {
+        var acc: u32 = style.color_token(style.TOK_ACCENT)
+        if widget.w_is_disabled(e) {
+            acc = style.color_token(style.TOK_SEPARATOR)
+        }
+        let st: f64 = render.len_of(c, 2)
+        var bar: widget.Widget = part(c, e, widget.KIND_NONE,
+            widget.w_x(e), widget.w_y(e) + widget.w_h(e) - st,
+            widget.w_w(e), st, acc, true, 0)
+        render.draw_base(c, &bar)
+    }
+
+    let padx: f64 = render.len_of(c, (*fo).pad_x)
+    var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&l, widget.w_x(e) + padx, widget.w_y(e),
+        widget.w_w(e) - 2.0 * padx, widget.w_h(e))
+    widget.w_set_text(&l, widget.w_text(e), widget.w_text_len(e))
+    let ls: *mut style.Style = widget.w_style(&l)
+    *ls = style.style_set_align(*ls, style.ALIGN_CENTER)
+    *ls = style.style_set_pad(*ls, 0, 0)
+    // A selected tab reads as the stronger one. Not as a colour --
+    // that would be a second signal for the same thing -- but the
+    // muted colour for the UNSELECTED ones, which is what the systems
+    // do.
+    if !sel && !widget.w_is_disabled(e) {
+        *ls = style.style_set_fg(*ls,
+            style.color_token(style.TOK_TEXT_MUTED))
+    }
+    widget.w_set_state_bits(&l, state_bits_of(e))
+    widget.w_set_focus(&l, false)
+    render.draw_text(c, &l)
+    render.draw_focus_ring(c, e)
+}
+
+// A ROW OF TABS with the line underneath them.
+//
+// The line is what makes a tab bar a tab bar: it carries the tabs, and
+// the selected one breaks through it. Whoever leaves it out gets
+// buttons floating in space.
+fn draw_tabbar(c: *mut render.Ctx, e: *mut widget.Widget,
+    tabs: *mut widget.Widget, n: usize) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    render.draw_base(c, e)
+    let st: f64 = render.len_of(c, 1)
+    var line: widget.Widget = part(c, e, widget.KIND_NONE,
+        widget.w_x(e), widget.w_y(e) + widget.w_h(e) - st,
+        widget.w_w(e), st, style.color_token(style.TOK_SEPARATOR),
+        true, 0)
+    render.draw_base(c, &line)
+    var i: usize = 0
+    while i < n {
+        draw_tab(c, tab_at(tabs, i))
+        i = i + 1
+    }
+}
+
+// The i-th of an array of widgets. The same arithmetic as
+// control.panel_widget, and for the same reason.
+fn tab_at(p: *mut widget.Widget, i: usize) -> *mut widget.Widget {
+    var probe: [widget.Widget; 2] =
+        [widget.widget_new(widget.KIND_NONE); 2]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    return ((p as usize) + i * sz) as *mut widget.Widget
+}
+
+// ======================================================================
+// TOOLBAR AND MENU BAR
+// ======================================================================
+//
+// A strip that carries other controls. It paints the strip and the
+// dividing line, nothing else -- what sits ON it are ordinary
+// widgets, drawn by the caller through `render.draw_widget`.
+//
+// THAT IS THE POINT: a toolbar that painted its own buttons would be
+// the second drawing of a button. The OrientOS control centre did
+// exactly that, and its tiles look different from every other button
+// in the system.
+fn draw_toolbar(c: *mut render.Ctx, e: *mut widget.Widget) {
+    render.draw_base(c, e)
+    let st: f64 = render.len_of(c, 1)
+    var line: widget.Widget = part(c, e, widget.KIND_NONE,
+        widget.w_x(e), widget.w_y(e) + widget.w_h(e) - st,
+        widget.w_w(e), st, style.color_token(style.TOK_SEPARATOR),
+        true, 0)
+    render.draw_base(c, &line)
+}
+
+fn draw_menubar(c: *mut render.Ctx, e: *mut widget.Widget) {
+    draw_toolbar(c, e)
+}
+
+// ======================================================================
+// MENU AND CONTEXT MENU
+// ======================================================================
+//
+// A raised panel with a border. A context menu is the SAME thing at a
+// different place -- there is no second function for it, and that is
+// deliberate: they differ in where they open, not in what they are.
+//
+// NO SHADOW RECTANGLE. The reason stands at the head of this file: a
+// grey rect under a round panel sticks out at the corners, and that is
+// the artefact Justin saw behind the tooltip. A menu gets its lift
+// from `surface_raised` plus a border, and that holds on every
+// background.
+fn draw_menu(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    render.draw_base(c, e)
+}
+
+// ONE LINE OF A MENU.
+//
+// Hover colours the whole row -- that is the one place where a full
+// row lights up, and it is right here: in a menu the row IS the
+// target.
+//
+// A tick in front when it is checked, a triangle at the end when it
+// opens a submenu. Both from icon.fi, both the same marks as
+// everywhere else.
+fn draw_menu_item(c: *mut render.Ctx, e: *mut widget.Widget,
+    checked: bool, submenu: bool) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    // Transparent at rest, accent on hover. Set only when the caller
+    // said nothing.
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s, style.color_transparent())
+        style.styleset_set_override(sz, style.STATE_HOVER,
+            style.override_set_bg(style.override_new(),
+                style.color_token(style.TOK_SELECTION)))
+        style.styleset_set_override(sz, style.STATE_ACTIVE,
+            style.override_set_bg(style.override_new(),
+                style.color_token(style.TOK_SELECTION)))
+    }
+    render.draw_base(c, e)
+
+    let padx: f64 = render.len_of(c, (*fo).pad_x)
+    let d: f64 = render.len_of(c, 10)
+    let cy: f64 = widget.w_y(e) + (widget.w_h(e) - d) / 2.0
+
+    if checked {
+        icon.check(render.ctx_painter(c), widget.w_x(e) + padx / 2.0,
+            cy, d, render.len_of(c, 2), mark_color(c, e, false))
+    }
+    if submenu {
+        icon.triangle_right(render.ctx_painter(c),
+            widget.w_x(e) + widget.w_w(e) - padx / 2.0 - d * 0.5, cy,
+            d, mark_color(c, e, false))
+    }
+
+    // The text always starts at the same x, whether there is a tick or
+    // not -- otherwise the entries of a menu jump about as you tick
+    // them.
+    let tx: f64 = widget.w_x(e) + padx / 2.0 + d
+        + render.len_of(c, (*fo).sp_s)
+    label_at(c, e, tx,
+        widget.w_x(e) + widget.w_w(e) - tx - padx / 2.0 - d)
+}
+
+// How high one menu line is. Out of the theme, so a menu can be
+// measured before it is painted.
+fn menu_item_height(c: *mut render.Ctx) -> f64 {
+    let fo: *mut theme.Shape = theme.theme_shape(render.ctx_theme(c))
+    return render.len_of(c, (*fo).row)
+}
+
+// ======================================================================
+// TOOLTIP
+// ======================================================================
+//
+// ============================ THE GREY BOX MUST NOT COME BACK
+//
+// Justin, 11.09.2026: "Tooltip: WITHOUT a shadow-rectangle artefact
+// behind it. In the real system you could see a grey box behind the
+// text so far -- that must not happen in fUi, and you prove it with a
+// pixel measurement."
+//
+// The cause is named at the head of this file, and the answer is that
+// this function paints EXACTLY TWO THINGS: a rounded surface and its
+// border. There is no third `painter` call before them, and no
+// "shadow" anywhere in this file.
+//
+// It cannot come back by accident either: `tools/fui/wave2_main.fi`
+// test 8 reads the pixels diagonally outside all four corners and
+// requires that they still hold the background colour. A shadow rect
+// would show up there at once, because a rect has corners where a
+// rounded panel has none -- which is precisely why the artefact was
+// visible in the first place.
+fn draw_tooltip(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s,
+            style.color_token(style.TOK_SURFACE_RAISED))
+    }
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_RADIUS) == 0 as u32 {
+        *s = style.style_set_radius(*s, (*fo).r_field)
+    }
+    // Surface and border -- and nothing else. THAT is the fix.
+    render.draw_base(c, e)
+
+    let padx: f64 = render.len_of(c, (*fo).sp_s)
+    var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&l, widget.w_x(e) + padx, widget.w_y(e),
+        widget.w_w(e) - 2.0 * padx, widget.w_h(e))
+    widget.w_set_text(&l, widget.w_text(e), widget.w_text_len(e))
+    let ls: *mut style.Style = widget.w_style(&l)
+    *ls = style.style_set_pad(*ls, 0, 0)
+    // The font size travels with it, so a tooltip can be made smaller.
+    if ((*s).set_mask & style.SF_FONT_PX) != 0 as u32 {
+        *ls = style.style_set_font(*ls, 0, (*s).font_px as usize)
+    }
+    render.draw_text(c, &l)
+}
+
+// HOW BIG A TOOLTIP HAS TO BE for its text. The caller places it, so
+// he has to be able to measure it -- and if he has to guess, the text
+// gets cut off. That is the "clipped label" the acceptance looks for.
+fn tooltip_size(c: *mut render.Ctx, p: u64, n: usize, w: *mut f64,
+    h: *mut f64) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let px: f64 = render.len_of(c, (*fo).font)
+    let padx: f64 = render.len_of(c, (*fo).sp_s)
+    let pady: f64 = render.len_of(c, (*fo).sp_xs)
+    *w = painter.text_width(z, p, n, px) + 2.0 * padx
+    *h = painter.font_ascent(z, px) + painter.font_descent(z, px)
+        + 2.0 * pady
+}
+
+// ======================================================================
+// SEPARATOR AND GROUP BOX
+// ======================================================================
+fn draw_separator(c: *mut render.Ctx, e: *mut widget.Widget) {
+    render.draw_base(c, e)
+}
+
+// A frame with a caption on it. The caption sits ON the line, and for
+// that the line has to be BROKEN -- otherwise it runs through the
+// letters. That is done by painting the top line in two pieces.
+fn draw_groupbox(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if ((*s).set_mask & style.SF_BORDER) == 0 as u32 {
+        *s = style.style_set_border(*s,
+            style.color_token(style.TOK_BORDER), (*fo).border_w)
+    }
+    if ((*s).set_mask & style.SF_BG) == 0 as u32 {
+        *s = style.style_set_bg(*s, style.color_transparent())
+    }
+    render.draw_base(c, e)
+
+    if widget.w_text_len(e) == 0 {
+        return
+    }
+    let px: f64 = render.len_of(c, style.resolve_num(sz,
+        style.SF_FONT_PX, (*s).font_px as usize, render.def_font(c)))
+    let tw: f64 = painter.text_width(z, widget.w_text(e),
+        widget.w_text_len(e), px)
+    let gap: f64 = render.len_of(c, (*fo).sp_s)
+    let tx: f64 = widget.w_x(e) + render.len_of(c, (*fo).sp_m)
+
+    // Break the top line: paint over it in the BACKGROUND colour.
+    // That is honest here -- the background of a group box is what
+    // lies behind it, and the caller says so with his own bg. Where he
+    // said nothing, the base colour holds.
+    var bgc: u32 = style.color_token(style.TOK_BASE)
+    if ((*s).set_mask & style.SF_BG) != 0 as u32
+        && style.color_is_visible((*s).bg) {
+        bgc = (*s).bg
+    }
+    painter.surface(z, tx - gap / 2.0, widget.w_y(e) - 1.0,
+        tw + gap, 3.0, render.color_of(c, bgc))
+
+    var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&l, tx, widget.w_y(e) - px / 2.0, tw + 2.0, px)
+    widget.w_set_text(&l, widget.w_text(e), widget.w_text_len(e))
+    let ls: *mut style.Style = widget.w_style(&l)
+    *ls = style.style_set_pad(*ls, 0, 0)
+    *ls = style.style_set_fg(*ls,
+        style.color_token(style.TOK_TEXT_MUTED))
+    render.draw_text(c, &l)
+}
+
+// ======================================================================
+// THE DISPATCHER
+// ======================================================================
+//
+// `draw_any` IS THE ONE AN APPLICATION CALLS. It paints any control of
+// wave 1 and wave 2, and that is the promise the whole library rests
+// on: no program paints an element itself, so no program may need to
+// know which wave a control belongs to.
+//
+// Why it is here and not in render.fi stands there, at `draw_widget`:
+// wave2.fi imports render.fi for the shared build-up, so render.fi
+// cannot import wave2.fi back without making a cycle.
+fn draw_any(c: *mut render.Ctx, e: *mut widget.Widget) {
+    if draw_wave2(c, e) {
+        return
+    }
+    render.draw_widget(c, e)
+}
+
+// Gives TRUE when this wave took the widget. Kept separate from
+// `draw_any` so that a wave 3 can chain in front of it later without
+// either of them having to change.
+fn draw_wave2(c: *mut render.Ctx, e: *mut widget.Widget) -> bool {
+    let k: u32 = widget.w_kind(e)
+    if k == widget.KIND_CHECKBOX {
+        draw_checkbox(c, e)
+        return true
+    }
+    if k == widget.KIND_RADIO {
+        draw_radio(c, e)
+        return true
+    }
+    if k == widget.KIND_TOGGLE {
+        draw_toggle(c, e)
+        return true
+    }
+    if k == widget.KIND_SLIDER {
+        draw_slider(c, e)
+        return true
+    }
+    if k == widget.KIND_SCROLLBAR {
+        draw_scrollbar(c, e)
+        return true
+    }
+    if k == widget.KIND_PROGRESS {
+        draw_progress(c, e)
+        return true
+    }
+    if k == widget.KIND_DROPDOWN {
+        draw_dropdown(c, e)
+        return true
+    }
+    if k == widget.KIND_TAB {
+        draw_tab(c, e)
+        return true
+    }
+    if k == widget.KIND_TOOLBAR {
+        draw_toolbar(c, e)
+        return true
+    }
+    if k == widget.KIND_MENU {
+        draw_menu(c, e)
+        return true
+    }
+    if k == widget.KIND_TOOLTIP {
+        draw_tooltip(c, e)
+        return true
+    }
+    if k == widget.KIND_SEPARATOR {
+        draw_separator(c, e)
+        return true
+    }
+    if k == widget.KIND_GROUPBOX {
+        draw_groupbox(c, e)
+        return true
+    }
+    return false
+}

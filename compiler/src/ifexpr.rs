@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **`if` AS AN EXPRESSION** -- `let x = if c { a } else { b }`.
 //!
 //! INTERFACE (fixed):

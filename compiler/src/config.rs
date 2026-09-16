@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Central configuration: the language name and the file suffix live EXCLUSIVELY here.
 //! Renaming the language = adjust these three constants, nothing else.
 

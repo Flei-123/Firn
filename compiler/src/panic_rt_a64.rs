@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **Round 83** — the checked arithmetic of round 72 on the SECOND machine
 //! (`docs/ROUND80.md` §7, SPEC §13 item `L9`).
 //!

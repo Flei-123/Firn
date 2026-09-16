@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **LICM** — pull loop invariant computations out of the loop.
 //!
 //! INTERFACE (fixed):

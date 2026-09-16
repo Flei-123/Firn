@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND FIRN-ENV** — environment variables AT BUILD TIME, as a value of
 //! the language.
 //!

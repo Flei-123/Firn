@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Optional tracing GC — SPEC §3.5 (`S2`–`S6`), inheritance §4.4.
 //!
 //! This file belongs to the module `gckern` (see PLAN.md, round "hardening

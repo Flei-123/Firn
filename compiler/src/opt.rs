@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Optimizer on FIR: constant folding and removal of dead code.
 //!
 //! INTERFACE (fixed):

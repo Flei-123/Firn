@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Counterpart to bench/firn/jsonscan.fi.
 use std::hint::black_box;
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Generic templates (`L5`): capture at the parser, naming scheme, bounds.
 //!
 //! This file belongs to the module `types`. Generics get **monomorphized**

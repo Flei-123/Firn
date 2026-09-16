@@ -1,0 +1,1194 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/painter.fi -- THE DRAWING LAYER OF fUi.
+//
+// ========================================================= WHY IT EXISTS
+//
+// lib/fenster/fenster.fi says outright in F1 what it does NOT do:
+//
+//     "NO drawing except pixels, rectangles and system text. Whoever
+//      wants curves rasterises them himself and pushes the finished
+//      buffer across with `bild`."
+//
+// Exactly that "rasterises them himself" stands here. Every control in
+// fUi paints EXCLUSIVELY through this file -- no widget sets a pixel
+// itself.
+//
+// THAT IS THE RULE THIS IS ABOUT. In OrientOS the control centre paints
+// its own tiles instead of using `paint_button`, and that is why they
+// look different from every other button in the system. In Certus the
+// bar painted its buttons itself, and lib/android/ui.fi did it once
+// more. Three drawings of the same thing. Whoever paints past this file
+// builds the same mistake in.
+//
+// ====================================================== WHAT IT DRAWS
+//
+// Everything antialiased through the rasteriser Certus also paints the
+// page with (lib/font/raster.fi) -- no GDI, no Xlib, no system font.
+// Systemschrift.
+//
+//   surface          a rectangle
+//   round_rect       a rectangle with round corners
+//   round_ring       its outline (for the focus ring)
+//   border_col       a horizontal or vertical line
+//   text             text with an alignment, on a baseline
+//   text_width       how wide it would be -- for the layout
+//   caret_bar        the caret
+//
+// ================================= THE FOUR CORNERS WITHOUT lib/svg
+//
+// Certus rounds with `svg.pfad.pfad_rund_rechteck`. lib/svg does NOT
+// exist in the Firn tree (checked: lib/ has browser, css, dom, font,
+// gc, ..., but no svg), and fUi must not hang on an application
+// library. The four corners therefore stand here, as cubics straight in
+// the rasteriser.
+//
+// The factor 0.5523 is the well known one: a cubic Bezier meets a
+// quarter circle with an error under 0.03 % of the radius when the
+// control points lie at 4/3 * (sqrt(2) - 1) = 0.55228... of the edge
+// length. That is not an approximation by feel but the number every
+// vector drawing program uses.
+//
+// =============================================== THE TEXT SITS CENTRED
+//
+// Justin, 10.09.2026: in OrientOS the label does not sit in the middle
+// of the button. That is a mistake fUi must not inherit, and it has a
+// known cause: whoever centres vertically by the LINE HEIGHT centres
+// the line and not the font.
+//
+// Right is the FONT METRIC. A capital letter stands on the baseline and
+// reaches `ascent` upwards; `descent` hangs below it and is not used at
+// all by "Button". The optical middle of a line therefore lies at
+//
+//     baseline = y + (h + ascent - descent) / 2
+//
+// and NOT at `y + h/2 + size/2`. `text_baseline_mid` computes exactly
+// that, and `tools/fui/preview_main.fi` measures on the finished
+// picture afterwards that as many empty rows stand above as below.
+import std.rt
+import paint.canvas
+import font.raster
+import font.metrics
+import font.ttf
+import fui.theme
+
+export {
+    Painter, painter_new, painter_init, painter_free, painter_ok,
+    painter_canvas, painter_set_font, painter_font,
+    surface, round_rect, round_ring, border_col,
+    text, text_width, text_fits_upto, text_baseline_mid,
+    TEXT_L, TEXT_M, TEXT_R,
+    caret_bar,
+    font_ascent, font_descent,
+    TextRun, run_new, run_plain,
+    run_set_tracking, run_set_word_spacing, run_set_kerning,
+    run_set_weight, run_set_slant, run_set_line_height,
+    run_set_outline, run_set_shadow, run_set_gradient,
+    run_width, run_fits_upto, run_draw, run_line_height,
+    advance_of, pair_kern,
+}
+
+// The alignment horizontally. Vertically there is only one sensible
+// one (centred to the font metric), so it is not a choice.
+const TEXT_L: u32 = 0
+const TEXT_M: u32 = 1
+const TEXT_R: u32 = 2
+
+// The scratch buffer of the TrueType reader. The same number as in
+// lib/browser/chrome.fi -- it is enough for every glyph of a user
+// interface.
+const SCRATCH: usize = 65536
+
+struct Painter {
+    cv: u64,          // the canvas, owned by the caller
+    ra: raster.Raster,
+    rbuf: *mut u8,
+    rcap: usize,
+    scratch: *mut u8,
+    fm: u64,          // the font set (metrics.FontSet), 0 = none
+    w: usize,
+    h: usize,
+    ok: usize,
+}
+
+#[no_gc]
+fn painter_new() -> Painter {
+    return Painter {
+        cv: 0, ra: raster.raster_new(), rbuf: 0 as *mut u8, rcap: 0,
+        scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
+    }
+}
+
+// `w` x `h` is the largest area rasterised at once. That is NOT the
+// canvas: what gets rasterised is always only the rectangle of one
+// widget, and a button is seldom bigger than a few hundred pixels.
+// Whoever gives the whole canvas pays (w + 2) * h * 8 bytes for
+// nothing.
+fn painter_init(z: *mut Painter, cv: *mut canvas.Canvas, w: usize,
+    h: usize) -> bool {
+    (*z).cv = cv as u64
+    (*z).w = w
+    (*z).h = h
+    let need: usize = raster.raster_bytes_needed(w, h)
+    (*z).rbuf = rt.heap_alloc(need) as *mut u8
+    if (*z).rbuf as usize == 0 {
+        return false
+    }
+    (*z).rcap = need
+    raster.raster_attach(&(*z).ra, (*z).rbuf, need)
+    (*z).scratch = rt.heap_alloc(SCRATCH) as *mut u8
+    if (*z).scratch as usize == 0 {
+        return false
+    }
+    (*z).ok = 1
+    return true
+}
+
+fn painter_free(z: *mut Painter) {
+    if (*z).rbuf as usize != 0 {
+        rt.heap_free((*z).rbuf as u64, (*z).rcap)
+        (*z).rbuf = 0 as *mut u8
+    }
+    if (*z).scratch as usize != 0 {
+        rt.heap_free((*z).scratch as u64, SCRATCH)
+        (*z).scratch = 0 as *mut u8
+    }
+    (*z).ok = 0
+}
+
+#[no_gc]
+fn painter_ok(z: *mut Painter) -> bool { return (*z).ok != 0 }
+
+#[no_gc]
+fn painter_canvas(z: *mut Painter) -> *mut canvas.Canvas {
+    return (*z).cv as *mut canvas.Canvas
+}
+
+#[no_gc]
+fn painter_set_font(z: *mut Painter, fm: u64) { (*z).fm = fm }
+
+#[no_gc]
+fn painter_font(z: *mut Painter) -> u64 { return (*z).fm }
+
+// ------------------------------------------------------------- helpers
+
+#[no_gc]
+// Down to the whole pixel. Used for raster window origins -- the
+// reason stands at `raster_window`.
+#[no_gc]
+fn floor_px(v: f64) -> f64 {
+    let t: f64 = (v as i64) as f64
+    if t > v {
+        return t - 1.0
+    }
+    return t
+}
+
+#[no_gc]
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+#[no_gc]
+fn b8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+// A code point from UTF-8. Taken from lib/browser/chrome.fi.
+#[no_gc]
+fn utf8_at(p: u64, n: usize, i: usize, adv: *mut usize) -> u32 {
+    let c0: u32 = b8(p, i) as u32
+    if c0 < 128 as u32 {
+        *adv = 1
+        return c0
+    }
+    if c0 >= 240 as u32 && i + 3 < n {
+        *adv = 4
+        return ((c0 & 7 as u32) << 18)
+        | (((b8(p, i + 1) as u32) & 63 as u32) << 12)
+        | (((b8(p, i + 2) as u32) & 63 as u32) << 6)
+        | ((b8(p, i + 3) as u32) & 63 as u32)
+    }
+    if c0 >= 224 as u32 && i + 2 < n {
+        *adv = 3
+        return ((c0 & 15 as u32) << 12)
+        | (((b8(p, i + 1) as u32) & 63 as u32) << 6)
+        | ((b8(p, i + 2) as u32) & 63 as u32)
+    }
+    if c0 >= 192 as u32 && i + 1 < n {
+        *adv = 2
+        return ((c0 & 31 as u32) << 6)
+        | ((b8(p, i + 1) as u32) & 63 as u32)
+    }
+    *adv = 1
+    return c0
+}
+
+// ========================================================== THE AREAS
+
+// A rectangle. The simplest thing, and it does NOT go through the
+// rasteriser: whole pixels need no antialiasing, and `canvas_fill_rect`
+// is many times faster.
+fn surface(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    canvas.canvas_fill_rect(painter_canvas(z), x, y, x + w, y + h,
+        theme.opaque(col))
+}
+
+// A line. Horizontal or vertical -- a slanted line is only needed by a
+// user interface for icons, and those have their own path. `st` is the
+// stroke width.
+fn border_col(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, st: f64,
+    col: u32) {
+    if w >= h {
+        surface(z, x, y, w, st, col)
+    } else {
+        surface(z, x, y, st, h, col)
+    }
+}
+
+// The factor for the quarter circle out of a cubic.
+#[no_gc]
+fn K() -> f64 { return 0.5522847498307933 }
+
+// Write the outline of a round rectangle into the rasteriser.
+// `r` is clamped to half the shorter side -- a radius bigger than the
+// rectangle is not a shape but a mistake, and in `u64` the subtraction
+// below would be exactly the overflow Justin's start menu in OrientOS
+// died of (kernel/user/wlib.fi, round ECHTHARDWARE-1). Here everything
+// is f64, but the clamp stands all the same.
+#[no_gc]
+fn path_round(ra: *mut raster.Raster, x: f64, y: f64, w: f64, h: f64,
+    r0: f64) {
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2.0 {
+        r = m / 2.0
+    }
+    if r < 0.0 {
+        r = 0.0
+    }
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    let k: f64 = r * K()
+    if r <= 0.0 {
+        // A square rectangle is the same path with four lines -- that
+        // way `shape_classic` (radius 0) is pixel-identical with what
+        // `surface` paints, and not a second lot of drawing code.
+        raster.raster_line(ra, x, y, x1, y)
+        raster.raster_line(ra, x1, y, x1, y1)
+        raster.raster_line(ra, x1, y1, x, y1)
+        raster.raster_line(ra, x, y1, x, y)
+        return
+    }
+    // top, clockwise
+    raster.raster_line(ra, x + r, y, x1 - r, y)
+    raster.raster_cubic(ra, x1 - r, y, x1 - r + k, y, x1, y + r - k,
+        x1, y + r)
+    raster.raster_line(ra, x1, y + r, x1, y1 - r)
+    raster.raster_cubic(ra, x1, y1 - r, x1, y1 - r + k, x1 - r + k, y1,
+        x1 - r, y1)
+    raster.raster_line(ra, x1 - r, y1, x + r, y1)
+    raster.raster_cubic(ra, x + r, y1, x + r - k, y1, x, y1 - r + k,
+        x, y1 - r)
+    raster.raster_line(ra, x, y1 - r, x, y + r)
+    raster.raster_cubic(ra, x, y + r, x, y + r - k, x + r - k, y,
+        x + r, y)
+}
+
+// Open the raster window for a rectangle. Gives false when there is
+// nothing to do.
+#[no_gc]
+fn raster_window(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
+    luft: f64, wx: *mut f64, wy: *mut f64) -> bool {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+    // THE ORIGIN SITS ON A WHOLE PIXEL.
+    //
+    // Justin, 12.09.2026: adding letter spacing moved the "N" of a
+    // badge one pixel left, and the wave 3 pixel check caught it. The
+    // cause was NOT the spacing -- it was here.
+    //
+    // `canvas_fill_raster` writes the coverage back at
+    // `wx as usize, wy as usize`, so it TRUNCATES the origin. The
+    // rasteriser meanwhile subtracts the true, fractional origin. The
+    // difference between the two is a subpixel shift, and it depends on
+    // the FRACTION of the origin. As long as every caller happened to
+    // hand in the same fraction, everything lined up. The wider window
+    // the text needs for an outline pushed the origin below zero, the
+    // clamp made it exactly 0.0, the fraction changed -- and the glyph
+    // moved.
+    //
+    // Flooring the origin makes the fraction always zero, so the
+    // rasteriser and the write-back agree by construction. This is the
+    // same class of bug as the baseline being rounded to a whole pixel
+    // (see `text_baseline_mid`), and it gets the same answer.
+    let ax: f64 = floor_px(clamp(x - luft, 0.0, cw))
+    let ay: f64 = floor_px(clamp(y - luft, 0.0, ch))
+    let bx: f64 = clamp(x + w + luft, 0.0, cw)
+    let by: f64 = clamp(y + h + luft, 0.0, ch)
+    if bx <= ax || by <= ay {
+        return false
+    }
+    let rw: usize = (bx - ax) as usize + 1
+    let rh: usize = (by - ay) as usize + 1
+    if rw > (*z).w || rh > (*z).h {
+        return false
+    }
+    *wx = ax
+    *wy = ay
+    return raster.raster_begin(&(*z).ra, ax, ay, rw, rh)
+}
+
+// A RECTANGLE WITH ROUND CORNERS, antialiased.
+fn round_rect(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
+    col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    if r <= 0.0 {
+        surface(z, x, y, w, h, col)
+        return
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
+        return
+    }
+    path_round(&(*z).ra, x, y, w, h, r)
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
+        wx as usize, wy as usize, theme.opaque(col))
+}
+
+// THE OUTLINE. A ring and not a filled area: it lies ON an already
+// painted widget. It is made as two paths in ONE raster run -- outside
+// clockwise, inside against it. The rasteriser counts windings, so
+// exactly the border stays.
+//
+// That is the focus ring, and it is the only thing somebody working by
+// keyboard relies on. Therefore it is two pixels wide
+// (theme.Shape.focus_w) and not one: one disappears on every screen
+// with scaling.
+fn round_ring(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
+    st: f64, col: u32) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 || st <= 0.0 {
+        return
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
+        return
+    }
+    path_round(&(*z).ra, x, y, w, h, r)
+    // inside, counter-running -- hence the points in reverse order
+    let ix: f64 = x + st
+    let iy: f64 = y + st
+    let iw: f64 = w - 2.0 * st
+    let ih: f64 = h - 2.0 * st
+    if iw > 0.0 && ih > 0.0 {
+        var ir: f64 = r - st
+        if ir < 0.0 {
+            ir = 0.0
+        }
+        path_round_ccw(&(*z).ra, ix, iy, iw, ih, ir)
+    }
+    raster.raster_finish(&(*z).ra)
+    canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
+        wx as usize, wy as usize, theme.opaque(col))
+}
+
+// The same path counter-clockwise. It stands as a function of its own
+// and not as a switch in `path_round`, because a loop with swapped
+// points is harder to read than two clear cases.
+#[no_gc]
+fn path_round_ccw(ra: *mut raster.Raster, x: f64, y: f64, w: f64,
+    h: f64, r0: f64) {
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m {
+        m = h
+    }
+    if r > m / 2.0 {
+        r = m / 2.0
+    }
+    if r < 0.0 {
+        r = 0.0
+    }
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    let k: f64 = r * K()
+    if r <= 0.0 {
+        raster.raster_line(ra, x, y, x, y1)
+        raster.raster_line(ra, x, y1, x1, y1)
+        raster.raster_line(ra, x1, y1, x1, y)
+        raster.raster_line(ra, x1, y, x, y)
+        return
+    }
+    // DER FEHLER, DEN JUSTIN IM BILD GEFUNDEN HAT (10.09.2026).
+    //
+    // Diese vier Kurven waren falsch, und zwar auf eine Art, die
+    // uebersetzt, laeuft und fast richtig aussieht:
+    //
+    //   * Die ERSTE Kurve endete auf ihrem eigenen ANFANG
+    //     (P3 = (x+r, y) statt (x, y+r)) -- ein Segment, das nirgends
+    //     hinfuehrt.
+    //   * Bei allen vier waren die Kontrollpunkte um eine Stelle
+    //     VERSCHOBEN, so dass der zweite Kontrollpunkt auf dem
+    //     Endpunkt lag. Eine Bezier mit c2 == P3 ist keine
+    //     Viertelkreis-Rundung mehr, sondern faellt zur Sehne hin ab.
+    //
+    // Sichtbar wurde das erst am Fokusring, weil dort AUSSEN- und
+    // INNENpfad uebereinanderliegen: der Innenpfad schnitt oben zu
+    // wenig weg. Gemessen im hellen Bild, Ring des Knopfs "Focused",
+    // Farbe (0,96,223):
+    //
+    //     obere Kante  y=52..57  -> 6 Zeilen dick
+    //     untere Kante y=80..81  -> 2 Zeilen dick
+    //     oben rechts bis x=661, die Seiten nur bis x=659
+    //
+    // Soll sind ueberall 2 (theme.Shape.focus_w bei Massstab 1).
+    //
+    // DIE REGEL, DIE DABEI GILT: bei einer Viertelkreis-Bezier liegt
+    // c1 TANGENTIAL am Startpunkt und c2 TANGENTIAL am Endpunkt, je
+    // k = r * K() entfernt. Wer die Punkte nur abschreibt und dabei
+    // die Reihenfolge dreht, bekommt genau diesen Fehler.
+    //
+    // Gegen den Uhrzeigersinn, beginnend oben links:
+    //     (x+r, y) -> (x, y+r) -> (x, y1-r) -> (x+r, y1)
+    //  -> (x1-r, y1) -> (x1, y1-r) -> (x1, y+r) -> (x1-r, y)
+    //
+    // oben links: waagerecht los, senkrecht an
+    raster.raster_cubic(ra, x + r, y, x + r - k, y, x, y + r - k,
+        x, y + r)
+    raster.raster_line(ra, x, y + r, x, y1 - r)
+    // unten links: senkrecht los, waagerecht an
+    raster.raster_cubic(ra, x, y1 - r, x, y1 - r + k, x + r - k, y1,
+        x + r, y1)
+    raster.raster_line(ra, x + r, y1, x1 - r, y1)
+    // unten rechts: waagerecht los, senkrecht an
+    raster.raster_cubic(ra, x1 - r, y1, x1 - r + k, y1, x1, y1 - r + k,
+        x1, y1 - r)
+    raster.raster_line(ra, x1, y1 - r, x1, y + r)
+    // oben rechts: senkrecht los, waagerecht an
+    raster.raster_cubic(ra, x1, y + r, x1, y + r - k, x1 - r + k, y,
+        x1 - r, y)
+    raster.raster_line(ra, x1 - r, y, x + r, y)
+}
+
+// ============================================================ THE TEXT
+
+
+// ======================================================================
+// THE TEXT RUN
+// ======================================================================
+//
+// ========================================================= WHY IT EXISTS
+//
+// Justin, 12.09.2026: "can you make the text bold, letter size, letter
+// spacing -- like TextMeshPro in Unity? or would an own text library be
+// good?" The answer to the second half is no: lib/font already does the
+// hard part (TrueType outlines, metrics, a real `kern` table). What was
+// missing is that fUi never USED most of it.
+//
+// A TextRun is the set of attributes one piece of text is drawn with.
+// It exists for ONE reason, and it is the reason the wave 3 measurement
+// found a real bug:
+//
+//     `text_width`, `text_fits_upto` and `text` each walked the string
+//     themselves and each worked out the advance themselves. Three
+//     copies of the same arithmetic. When `painter.text` learned to cut
+//     off, the cut used a width that the drawing then did not keep to.
+//
+// So now there is ONE function that says how wide a character is --
+// `advance_of` -- and all three ask it. Add letter spacing there and
+// the measurement, the cutting and the drawing change TOGETHER. They
+// cannot drift apart, because there is nothing left to drift.
+//
+// THIS IS THE SAME RULE AS EVERYWHERE IN fUi, one level down: a bug is
+// fixed once. Not once per function.
+//
+// ================================================== WHAT IT CAN DO
+//
+//   tracking       letter spacing, in pixels, MAY BE NEGATIVE
+//   word_spacing   extra space on U+0020 only
+//   kerning        the font's own pair adjustment, on by default
+//   weight         400 normal, 700 bold (synthetic if the font has no
+//                  bold face: the glyph is drawn several times, offset)
+//   slant          upright or italic (a shear on the outline)
+//   line_height    for multi-line text
+//   outline        a contour around the glyph, colour + width
+//   shadow         an offset copy underneath, colour + alpha
+//   gradient       a second colour, blended over the height of the line
+//
+// ============================================ WHY TRACKING IS PIXELS
+//
+// The style says it in DESIGN POINTS and `render.len_of` turns that
+// into pixels -- the same road every other length in fUi takes, so
+// tracking scales with the display like a padding does. By the time it
+// reaches here it is pixels, because the painter knows nothing about
+// design points and must not start now.
+//
+// ================================= WHY TRACKING SITS AFTER EVERY GLYPH
+//
+// `(n - 1) * tracking` is what the acceptance measures, and that is the
+// definition it measures against: the space sits BETWEEN the letters,
+// so a single letter is not made wider by it. The loops therefore add
+// the tracking only when another character follows -- `advance_of` gets
+// told whether it is the last one.
+struct TextRun {
+    size: f64,
+    tracking: f64,
+    word_spacing: f64,
+    line_height: f64,   // 0 = from the font metric
+    kerning: usize,      // 0 = off, 1 = on
+    weight: usize,      // 400 / 700
+    slant: usize,       // 0 = upright, 1 = italic
+    // --- outline
+    out_w: f64,
+    out_col: u32,
+    out_on: usize,
+    // --- shadow
+    sh_dx: f64,
+    sh_dy: f64,
+    sh_col: u32,
+    sh_on: usize,
+    // --- gradient
+    grad_col: u32,
+    grad_on: usize,
+}
+
+// A run with nothing switched on except the things that are always
+// true: kerning on (that is what a reader expects) and the weight the
+// font was made for.
+#[no_gc]
+fn run_new(size: f64) -> TextRun {
+    return TextRun {
+        size: size, tracking: 0.0, word_spacing: 0.0, line_height: 0.0,
+        kerning: 1, weight: 400, slant: 0,
+        out_w: 0.0, out_col: 0, out_on: 0,
+        sh_dx: 0.0, sh_dy: 0.0, sh_col: 0, sh_on: 0,
+        grad_col: 0, grad_on: 0,
+    }
+}
+
+// The same thing under the name the old callers used, so `text` and
+// `text_width` keep behaving exactly as before.
+#[no_gc]
+fn run_plain(size: f64) -> TextRun {
+    return run_new(size)
+}
+
+#[no_gc]
+fn run_set_tracking(r: TextRun, px: f64) -> TextRun {
+    var o: TextRun = r
+    o.tracking = px
+    return o
+}
+
+#[no_gc]
+fn run_set_word_spacing(r: TextRun, px: f64) -> TextRun {
+    var o: TextRun = r
+    o.word_spacing = px
+    return o
+}
+
+#[no_gc]
+fn run_set_kerning(r: TextRun, on: bool) -> TextRun {
+    var o: TextRun = r
+    if on {
+        o.kerning = 1
+    } else {
+        o.kerning = 0
+    }
+    return o
+}
+
+#[no_gc]
+fn run_set_weight(r: TextRun, w: usize) -> TextRun {
+    var o: TextRun = r
+    o.weight = w
+    return o
+}
+
+#[no_gc]
+fn run_set_slant(r: TextRun, s: usize) -> TextRun {
+    var o: TextRun = r
+    o.slant = s
+    return o
+}
+
+#[no_gc]
+fn run_set_line_height(r: TextRun, px: f64) -> TextRun {
+    var o: TextRun = r
+    o.line_height = px
+    return o
+}
+
+#[no_gc]
+fn run_set_outline(r: TextRun, width_px: f64, col: u32) -> TextRun {
+    var o: TextRun = r
+    o.out_w = width_px
+    o.out_col = col
+    o.out_on = 1
+    return o
+}
+
+#[no_gc]
+fn run_set_shadow(r: TextRun, dx: f64, dy: f64, col: u32) -> TextRun {
+    var o: TextRun = r
+    o.sh_dx = dx
+    o.sh_dy = dy
+    o.sh_col = col
+    o.sh_on = 1
+    return o
+}
+
+#[no_gc]
+fn run_set_gradient(r: TextRun, col: u32) -> TextRun {
+    var o: TextRun = r
+    o.grad_col = col
+    o.grad_on = 1
+    return o
+}
+
+// THE LINE HEIGHT of a run. Without a set value it comes from the font
+// metric (ascent + descent) -- that is the height the font itself says
+// it needs, and it is the right default for every language.
+#[no_gc]
+fn run_line_height(z: *mut Painter, r: *mut TextRun) -> f64 {
+    if (*r).line_height > 0.0 {
+        return (*r).line_height
+    }
+    return metrics.fm_ascent((*z).fm, (*r).size)
+        + metrics.fm_descent((*z).fm, (*r).size)
+}
+
+// THE KERNING BETWEEN TWO CHARACTERS, or zero when it is switched off.
+//
+// WHY IT CAN BE SWITCHED OFF: in a table of numbers every column has to
+// stand under the one above it. Kerning makes "11" narrower than "10"
+// and the column starts to wobble. That is why the switch exists and
+// why the table in wave 3 is the place that uses it.
+#[no_gc]
+fn pair_kern(z: *mut Painter, r: *mut TextRun, a: u32, b: u32) -> f64 {
+    if (*r).kerning == 0 {
+        return 0.0
+    }
+    return metrics.fm_kern((*z).fm, (*r).size, a, b)
+}
+
+// HOW FAR THE PEN MOVES AFTER ONE CHARACTER.
+//
+// THE ONE PLACE THIS IS DECIDED. Every measurement and the drawing ask
+// this function, and that is what keeps them from disagreeing.
+//
+//   * the font's advance for the glyph
+//   * the kerning against the character that FOLLOWS
+//   * the word spacing, on the space only
+//   * the tracking, but NOT after the last character
+//
+// `nxt` is 0 when nothing follows -- then neither kerning nor tracking
+// is added, and that is exactly the `(n - 1) * tracking` the acceptance
+// measures.
+#[no_gc]
+fn advance_of(z: *mut Painter, r: *mut TextRun, cp: u32,
+    nxt: u32) -> f64 {
+    var a: f64 = metrics.fm_advance((*z).fm, (*r).size, cp)
+    if cp == 32 as u32 {
+        a = a + (*r).word_spacing
+    }
+    if nxt != 0 as u32 {
+        a = a + pair_kern(z, r, cp, nxt)
+        a = a + (*r).tracking
+    }
+    return a
+}
+
+// The character that follows position `i`, or 0 at the end. Needed
+// because kerning and tracking look forward.
+#[no_gc]
+fn next_cp(p: u64, n: usize, i: usize, adv: usize) -> u32 {
+    let j: usize = i + adv
+    if j >= n {
+        return 0
+    }
+    var a2: usize = 1
+    return utf8_at(p, n, j, &a2)
+}
+
+// HOW WIDE THE RUN IS. Walks exactly like the drawing does.
+#[no_gc]
+fn run_width(z: *mut Painter, r: *mut TextRun, p: u64,
+    n: usize) -> f64 {
+    if !metrics.fm_present((*z).fm) || n == 0 {
+        return 0.0
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let nx: u32 = next_cp(p, n, i, adv)
+        x = x + advance_of(z, r, cp, nx)
+        i = i + adv
+    }
+    return x
+}
+
+// HOW MANY BYTES FIT into `room`, on a character boundary.
+//
+// It counts with the SAME advance as the drawing, so a text that is cut
+// here really does end inside the rect. Wave 3 measured that a long
+// file name ran into the next column; with tracking the same mistake
+// would come straight back if this function did its own arithmetic.
+#[no_gc]
+fn run_fits_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    room: f64) -> usize {
+    if !metrics.fm_present((*z).fm) {
+        return n
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let nx: u32 = next_cp(p, n, i, adv)
+        // WHAT HAS TO FIT IS THE FULL ADVANCE, exactly as the old
+        // `text_fits_upto` counted it -- and that is not a detail.
+        //
+        // The first version of this function asked whether the INK
+        // fits, reasoning that the tracking after the last letter may
+        // hang over the edge. That is defensible, but it made every
+        // centred text ONE PIXEL WIDER than before, because the
+        // alignment divides the measured width in half. The wave 3
+        // badge check caught it at once: the "N" of NEW moved a pixel
+        // left and the measured pill colour became the glyph's
+        // antialiased edge.
+        //
+        // The lesson is the one this file keeps learning: the
+        // measurement and the drawing have to count THE SAME THING.
+        // `run_width` counts full advances, so this counts full
+        // advances. Whoever wants the ink can ask `run_width` for one
+        // character.
+        let step: f64 = advance_of(z, r, cp, nx)
+        if x + step > room {
+            return i
+        }
+        x = x + step
+        i = i + adv
+    }
+    return n
+}
+
+// ======================================================================
+// DRAWING A RUN
+// ======================================================================
+//
+// ============================================== THE ORDER OF THE PASSES
+//
+// shadow, then outline, then the glyph. That order is not a taste, it
+// is what makes the result readable:
+//
+//   * the SHADOW lies furthest back, so it must go down first
+//   * the OUTLINE lies around the glyph and must not cover it, so it
+//     goes down before it
+//   * the GLYPH last, on top of both
+//
+// The other way round the outline would eat the letter and the letter
+// would sit in a fog.
+//
+// =================================== WHY THE OUTLINE IS DRAWN AND NOT GROWN
+//
+// A real contour needs the path offset outwards (Minkowski). That is a
+// hard piece of geometry, it goes wrong on sharp corners, and it is not
+// what a user interface needs.
+//
+// What is done here: the glyph is rasterised SEVERAL TIMES, moved by
+// `out_w` in eight directions. The union of the copies is the glyph
+// grown by `out_w` in every direction -- which is exactly what a
+// contour is. Eight directions is enough because the steps in between
+// are covered by the neighbouring copies; with four the diagonals stay
+// thin, and that is visible on an O.
+//
+// It costs eight rasterisations per outlined text. That is paid only by
+// whoever switches the outline on, and it is drawn into ONE raster and
+// filled ONCE -- so it costs one fill, not eight.
+//
+// ============================================ SYNTHETIC BOLD AND ITALIC
+//
+// If the font set has no bold face, bold is made: the glyph is drawn
+// three times, each a little to the right. That is what every text
+// engine does as a fallback and it is honest -- it says so here.
+//
+// Italic is a SHEAR: x' = x + y * 0.21. The 0.21 is the tangent of
+// about 12 degrees, the slant of most italic faces. `ttf.outline_at`
+// takes a 2x3 matrix, so this costs nothing extra.
+const ITALIC_SHEAR: f64 = 0.21
+const BOLD_STEP: f64 = 0.035    // of the font size, per pass
+const BOLD_PASSES: usize = 3
+
+// One glyph into the raster, with the run's weight and slant.
+#[no_gc]
+fn glyph_into(z: *mut Painter, r: *mut TextRun, f: *mut ttf.Font,
+    gid: u32, pen: f64, base_y: f64, sc: f64) {
+    var m01: f64 = 0.0
+    if (*r).slant != 0 {
+        // A shear in x by the height. The sign is such that the top
+        // leans RIGHT, which is what italic means.
+        m01 = ITALIC_SHEAR
+    }
+    var k: usize = 0
+    var passes: usize = 1
+    var step: f64 = 0.0
+    if (*r).weight >= 700 {
+        passes = BOLD_PASSES
+        step = (*r).size * BOLD_STEP
+    }
+    while k < passes {
+        let dx: f64 = (k as f64) * step
+        let okg: bool = ttf.outline_at(f, gid, &(*z).ra,
+            pen + dx, base_y, sc,
+            1.0, m01, 0.0, 1.0, 0.0, 0.0,
+            (*z).scratch, SCRATCH, 0)
+        k = k + 1
+    }
+}
+
+// A whole string into the raster at one offset. Used by every pass --
+// shadow, outline and the glyph itself -- so the three cannot land in
+// different places.
+#[no_gc]
+fn run_into_raster(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    sx: f64, base_y: f64, dx: f64, dy: f64) {
+    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
+    let up: f64 = metrics.fm_upem((*z).fm)
+    let sc: f64 = (*r).size / up
+    var pen: f64 = sx + dx
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let nx: u32 = next_cp(p, n, i, adv)
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        glyph_into(z, r, f, gid, pen, base_y + dy, sc)
+        pen = pen + advance_of(z, r, cp, nx)
+        i = i + adv
+    }
+}
+
+// The eight directions the outline grows in.
+#[no_gc]
+fn out_dir_x(k: usize) -> f64 {
+    if k == 0 { return 1.0 }
+    if k == 1 { return -1.0 }
+    if k == 2 { return 0.0 }
+    if k == 3 { return 0.0 }
+    if k == 4 { return 0.7071 }
+    if k == 5 { return -0.7071 }
+    if k == 6 { return 0.7071 }
+    return -0.7071
+}
+
+#[no_gc]
+fn out_dir_y(k: usize) -> f64 {
+    if k == 0 { return 0.0 }
+    if k == 1 { return 0.0 }
+    if k == 2 { return 1.0 }
+    if k == 3 { return -1.0 }
+    if k == 4 { return 0.7071 }
+    if k == 5 { return 0.7071 }
+    if k == 6 { return -0.7071 }
+    return -0.7071
+}
+
+// Fills the current raster with one colour and clears it for the next
+// pass. Returns nothing -- the raster belongs to the painter.
+// Fills the FINISHED raster with one colour. The caller finishes it --
+// see the note at `fill_raster_gradient` for why that must happen
+// exactly once.
+#[no_gc]
+fn flush_raster(z: *mut Painter, wx: f64, wy: f64, col: u32) {
+    canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
+        wx as usize, wy as usize, theme.opaque(col))
+}
+
+// A GRADIENT OVER THE LINE.
+//
+// The glyph is filled row by row, and the colour is mixed from the top
+// colour to the bottom one over the height of the font. That is what
+// TextMeshPro calls a vertical gradient, and it is the only one worth
+// having in a user interface -- a horizontal one over a whole line
+// makes the last word a different colour from the first and looks like
+// a fault.
+//
+// It goes through `canvas_blend` per row because the colour changes per
+// row; `canvas_fill_raster` can only do one colour.
+// RASTER_FINISH IS CALLED HERE AND EXACTLY ONCE.
+//
+// Justin, 12.09.2026: the gradient came out invisible and nothing in
+// the source said why. The cause is worth writing down, because it is
+// a trap for the next person who reads coverage back:
+//
+//     `raster.raster_finish` INTEGRATES THE ACCUMULATOR IN PLACE. It
+//     walks each row, adds the cell deltas into a running sum and
+//     writes the sum back over the delta. Run it a second time and it
+//     integrates the already-integrated values -- every cell is then
+//     positive, the running sum never returns to zero, and the result
+//     is nothing that resembles the glyph.
+//
+// The first version of this function called `raster_finish` itself and
+// was called from a place that had already finished the raster. So the
+// fix is not a bigger threshold or a different offset: it is to finish
+// ONCE. `run_draw` now finishes before it chooses between the flat
+// fill and this one, and neither of them finishes again.
+fn fill_raster_gradient(z: *mut Painter, wx: f64, wy: f64, top: u32,
+    bot: u32, y0: f64, y1: f64) {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let x0: usize = raster.raster_used_x0(&(*z).ra)
+    let x1: usize = raster.raster_used_x1(&(*z).ra)
+    let ry0: usize = raster.raster_used_y0(&(*z).ra)
+    let ry1: usize = raster.raster_used_y1(&(*z).ra)
+    let span: f64 = y1 - y0
+    var y: usize = ry0
+    while y < ry1 {
+        // where this row sits in the line, 0..1
+        let devy: f64 = wy + (y as f64)
+        var t: f64 = 0.0
+        if span > 0.0 {
+            t = (devy - y0) / span
+        }
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+        let col: u32 = theme.opaque(theme.mix(top, bot,
+            (t * 1000.0) as usize))
+        var x: usize = x0
+        while x < x1 {
+            let cov: f64 = raster.raster_cov(&(*z).ra, x, y)
+            if cov > 0.001 {
+                canvas.canvas_blend(cv, (wx as usize) + x,
+                    (wy as usize) + y, col, cov)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// DRAW THE RUN. Returns where the pen ended, like `text` does.
+//
+// `w` is the room it may use; 0 or less means "no cutting". The
+// alignment is worked out from the width the run REALLY has, so a
+// centred text with tracking still sits in the middle.
+fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
+    w: f64, col: u32, p: u64, n: usize, align: u32) -> f64 {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return x
+    }
+    var nn: usize = n
+    if w > 0.0 {
+        nn = run_fits_upto(z, r, p, n, w)
+    }
+    if nn == 0 {
+        return x
+    }
+    let br: f64 = run_width(z, r, p, nn)
+    var sx: f64 = x
+    if align == TEXT_M {
+        sx = x + (w - br) / 2.0
+    } else if align == TEXT_R {
+        sx = x + w - br
+    }
+    sx = ((sx + 0.5) as i64) as f64
+
+    // THE WINDOW. It has to hold everything the passes reach into:
+    // the shadow offset, the outline width and the shear of an italic.
+    // Too small a window and the raster clips -- which is the class of
+    // bug that cost two rounds on the close cross.
+    // ONLY AS MUCH ROOM AS THE PASSES REALLY NEED.
+    //
+    // `raster_window` already adds one font size of air on every side
+    // and refuses a window bigger than the painter's raster budget.
+    // The first version added half a font size ON TOP of that for
+    // every text, which pushed the window one row over the budget on a
+    // short canvas -- `raster_window` then returned false and
+    // `run_draw` returned WITHOUT DRAWING ANYTHING. The gradient
+    // looked broken; in truth nothing was drawn at all.
+    //
+    // So the padding starts at zero and only grows for the features
+    // that really reach outside the glyph. Plain text asks for exactly
+    // the window the old `text` asked for, which is also why the other
+    // waves keep rendering pixel for pixel as before.
+    var pad: f64 = 0.0
+    if (*r).out_on != 0 {
+        pad = pad + (*r).out_w + 1.0
+    }
+    var shx: f64 = 0.0
+    var shy: f64 = 0.0
+    if (*r).sh_on != 0 {
+        shx = (*r).sh_dx
+        shy = (*r).sh_dy
+        if shx < 0.0 { shx = 0.0 - shx }
+        if shy < 0.0 { shy = 0.0 - shy }
+    }
+    if (*r).slant != 0 {
+        pad = pad + (*r).size * ITALIC_SHEAR
+    }
+    if (*r).weight >= 700 {
+        pad = pad + (*r).size * BOLD_STEP * (BOLD_PASSES as f64)
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    let wl: f64 = sx - pad - shx
+    let wt: f64 = base_y - (*r).size * 1.4 - pad - shy
+    let ww: f64 = br + 2.0 * pad + 2.0 * shx
+    let wh: f64 = (*r).size * 2.0 + 2.0 * pad + 2.0 * shy
+    // A WINDOW THAT DOES NOT FIT MEANS NOTHING IS DRAWN, and that has
+    // to be visible to whoever debugs it.
+    //
+    // Justin, 12.09.2026: the gradient looked broken for half an hour.
+    // It was not: the painter had been set up with a raster budget of
+    // 120 rows, the window for 40 px text needs 121, `raster_window`
+    // said no, and this function returned in silence. The old `text`
+    // did exactly the same, so the trap is as old as the file.
+    //
+    // It still returns -- there is nothing sensible to draw into a
+    // window that does not exist -- but the reason is written down
+    // here now, in the one place somebody will be standing when it
+    // happens: give `painter_init` a raster height of at least
+    // 3 * the largest font size.
+    if !raster_window(z, wl, wt, ww, wh, (*r).size, &wx, &wy) {
+        return sx + br
+    }
+
+    // ---- pass 1: THE SHADOW, furthest back
+    if (*r).sh_on != 0 {
+        run_into_raster(z, r, p, nn, sx, base_y, (*r).sh_dx,
+            (*r).sh_dy)
+        raster.raster_finish(&(*z).ra)
+        flush_raster(z, wx, wy, (*r).sh_col)
+        // a fresh window for the next pass
+        if !raster_window(z, wl, wt, ww, wh, (*r).size, &wx, &wy) {
+            return sx + br
+        }
+    }
+
+    // ---- pass 2: THE OUTLINE, eight copies into ONE raster
+    if (*r).out_on != 0 && (*r).out_w > 0.0 {
+        var k: usize = 0
+        while k < 8 {
+            run_into_raster(z, r, p, nn, sx, base_y,
+                out_dir_x(k) * (*r).out_w,
+                out_dir_y(k) * (*r).out_w)
+            k = k + 1
+        }
+        raster.raster_finish(&(*z).ra)
+        flush_raster(z, wx, wy, (*r).out_col)
+        if !raster_window(z, wl, wt, ww, wh, (*r).size, &wx, &wy) {
+            return sx + br
+        }
+    }
+
+    // ---- pass 3: THE GLYPH
+    run_into_raster(z, r, p, nn, sx, base_y, 0.0, 0.0)
+    raster.raster_finish(&(*z).ra)
+    if (*r).grad_on != 0 {
+        let asc: f64 = metrics.fm_ascent((*z).fm, (*r).size)
+        let dsc: f64 = metrics.fm_descent((*z).fm, (*r).size)
+        fill_raster_gradient(z, wx, wy, col, (*r).grad_col,
+            base_y - asc, base_y + dsc)
+    } else {
+        flush_raster(z, wx, wy, col)
+    }
+    return sx + br
+}
+
+#[no_gc]
+fn font_ascent(z: *mut Painter, size: f64) -> f64 {
+    return metrics.fm_ascent((*z).fm, size)
+}
+
+#[no_gc]
+fn font_descent(z: *mut Painter, size: f64) -> f64 {
+    return metrics.fm_descent((*z).fm, size)
+}
+
+// How wide does the text get? The number every layout rests on.
+#[no_gc]
+fn text_width(z: *mut Painter, p: u64, n: usize, size: f64) -> f64 {
+    var r: TextRun = run_new(size)
+    return run_width(z, &r, p, n)
+}
+
+// How many bytes fit into `platz`? Always on a character boundary --
+// never in the middle of a UTF-8 character.
+#[no_gc]
+fn text_fits_upto(z: *mut Painter, p: u64, n: usize, size: f64,
+    platz: f64) -> usize {
+    var r: TextRun = run_new(size)
+    return run_fits_upto(z, &r, p, n, platz)
+}
+
+// THE BASELINE FOR VERTICALLY CENTRED TEXT.
+//
+// This is the arithmetic that fixes Justin's finding "the label does
+// not sit in the middle", and the reason stands at the head of this
+// file: what is centred is the FONT, not the line.
+//
+//     The font occupies from (baseline - ascent) to
+//     (baseline + descent). Its middle lies at
+//     baseline - (ascent - descent) / 2, and that should fall on
+//     y + h/2:
+//
+//         baseline = y + h/2 + (ascent - descent) / 2
+//                  = y + (h + ascent - descent) / 2
+//
+// Rounded to a whole pixel: a baseline between two pixels makes every
+// line half blurred (the same reasoning stands in lib/font/metrics.fi
+// at `fm_ascent`).
+#[no_gc]
+fn text_baseline_mid(z: *mut Painter, y: f64, h: f64, size: f64) -> f64 {
+    let a: f64 = metrics.fm_ascent((*z).fm, size)
+    let d: f64 = metrics.fm_descent((*z).fm, size)
+    let b: f64 = y + (h + a - d) / 2.0
+    let t: f64 = ((b + 0.5) as i64) as f64
+    return t
+}
+
+// DRAW TEXT.
+//
+// `x`/`w` is the rect it is aligned in; `base_y` the baseline (from
+// `text_baseline_mid`). Back comes the position where it ends -- from
+// that the TextBuf works out where its caret sits.
+fn text(z: *mut Painter, x: f64, base_y: f64, w: f64, size: f64,
+    col: u32, p: u64, n: usize, align: u32) -> f64 {
+    // THE PLAIN CASE OF `run_draw`. It stays because most callers want
+    // nothing special, and because every caller in the tree already
+    // uses it -- but there is only ONE walk over the string now, in
+    // run_draw. When wave 3's measurement found that this function
+    // drew every glyph however narrow the rect was, the reason was
+    // that it did its own arithmetic. That cannot happen again here:
+    // there is no arithmetic left in it.
+    var r: TextRun = run_new(size)
+    return run_draw(z, &r, x, base_y, w, col, p, n, align)
+}
+
+// THE CARET. A vertical stroke on whole pixels -- it must NOT go
+// through the rasteriser, otherwise at half positions it is two pale
+// columns instead of one sharp one.
+fn caret_bar(z: *mut Painter, x: f64, y: f64, h: f64, st: f64,
+    col: u32) {
+    let ix: f64 = ((x + 0.5) as i64) as f64
+    var s: f64 = st
+    if s < 1.0 {
+        s = 1.0
+    }
+    surface(z, ix, y, s, h, col)
+}

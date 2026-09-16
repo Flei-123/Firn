@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! **ROUND SPEED** — the checks that can never fire.
 //!
 //! INTERFACE (fixed):

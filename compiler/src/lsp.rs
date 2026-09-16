@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Round 64, point 4 — THE LANGUAGE SERVER (`firnc --lsp`).
 //!
 //! It speaks the Language Server Protocol over standard input/output and sits

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Gegenstueck zu bench/firn/bytecount.fi.
 use std::hint::black_box;
 

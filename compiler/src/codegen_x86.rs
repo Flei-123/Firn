@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! x86_64 code generator: FIR -> GNU assembler text (Intel syntax) for `as`/`ld`.
 //! No LLVM, no Cranelift, no C — every instruction is chosen here by hand.
 //!

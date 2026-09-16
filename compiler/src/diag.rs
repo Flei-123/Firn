@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Diagnostics: collecting and printing error messages with file, line, column,
 //! source line and marker.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Strings in the compiler (SPEC §8) — module `str`.
 //!
 //! This file holds the **compiler side** of the four string types:

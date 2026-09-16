@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Real register allocation: **linear scan with liveness intervals**
 //! (Poletto/Sarkar) plus a register aware emission path.
 //!
