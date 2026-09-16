@@ -83,9 +83,16 @@ while IFS= read -r f; do
         [ -z "$first" ] && first="$f (no executable file)"
         continue
     fi
-    timeout 20 "$WORK/ref" > "$WORK/ref.out" 2>/dev/null
+    # ROUND IFEXPR -- the limit used to be 20 seconds, and that reported
+    # DEVIATIONS THAT DO NOT EXIST. Inside a full `test.sh` run the machine
+    # is busy, the heavy files (the JavaScript tests) run into the limit and
+    # get counted as DIFFERING or FAULTY. Measured on the same tree: under
+    # load 15 differing / 7 faulty, in a second run 4 / 3, and on its own
+    # 338 same behaviour, 0 / 0. Whoever reads a deviation here should first
+    # run the tool ALONE before looking for a fault in the compiler.
+    timeout 120 "$WORK/ref" > "$WORK/ref.out" 2>/dev/null
     rref=$?
-    timeout 20 "$WORK/a.bin" > "$WORK/a.out" 2>/dev/null
+    timeout 120 "$WORK/a.bin" > "$WORK/a.out" 2>/dev/null
     ra=$?
     if [ "$rref" -eq "$ra" ] && cmp -s "$WORK/ref.out" "$WORK/a.out"; then
         same=$((same+1))
