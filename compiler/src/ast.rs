@@ -191,6 +191,11 @@ pub enum ExprKind {
     Text(bool, Box<Expr>),
     /// **Round 58** — a closure literal (`fnval.rs`).
     Lambda(Box<LambdaDecl>),
+    /// **ROUND IFEXPR** — `if c { a } else { b }` in expression position
+    /// (`ifexpr.rs`). Each branch is EXACTLY ONE expression, `else` is
+    /// mandatory. SPEC T1 had put this off because stage 0 had no merge of
+    /// values; since round 92 it has one.
+    IfElse(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 /// **Round 58** — an anonymous function in an expression.

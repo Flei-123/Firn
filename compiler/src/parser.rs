@@ -522,7 +522,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Expression without a struct literal at top level (conditions).
-    fn cond_expr(&mut self) -> Expr {
+    pub(crate) fn cond_expr(&mut self) -> Expr {
         let saved = self.no_struct_lit;
         self.no_struct_lit = true;
         let e = self.expr();
@@ -817,6 +817,10 @@ impl<'a> Parser<'a> {
         // HOOK fnval: the closure literal `fn(…) { … }` / `gc fn(…) { … }`
         // (fnval.rs, round 58)
         if let Some(e) = crate::fnval::hook_primary(self) {
+            return e;
+        }
+        // HOOK ifexpr: `if c { a } else { b }` as an expression.
+        if let Some(e) = crate::ifexpr::hook_primary(self) {
             return e;
         }
         // ROUND 70: `++`/`--` inside an expression. Instead of a clueless
@@ -2372,6 +2376,10 @@ mod tests {
 
     fn dump(e: &Expr) -> String {
         match &e.kind {
+            // ROUND IFEXPR
+            ExprKind::IfElse(c, a, b) => {
+                format!("(if {} {} {})", dump(c), dump(a), dump(b))
+            }
             ExprKind::Int(v) => format!("{}", v),
             ExprKind::Float(bits, _) => format!("{}", f64::from_bits(*bits)),
             ExprKind::FloatF32(bits) => format!("{}f", f32::from_bits(*bits)),

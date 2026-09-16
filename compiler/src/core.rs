@@ -809,6 +809,12 @@ fn visit_calls(ck: &mut Checker, b: &crate::ast::Block, names: &[String]) {
 
 fn visit_expr(ck: &mut Checker, e: &Expr, names: &[String]) {
     match &e.kind {
+        // ROUND IFEXPR
+        ExprKind::IfElse(c, a, b) => {
+            visit_expr(ck, c, names);
+            visit_expr(ck, a, names);
+            visit_expr(ck, b, names);
+        }
         ExprKind::FloatF32(_) => {}
         // Round 58: a closure body is code like any other.
         ExprKind::Lambda(d) => visit_calls(ck, &d.body, names),

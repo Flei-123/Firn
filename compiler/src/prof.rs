@@ -359,6 +359,12 @@ impl Guard<'_> {
 
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            // ROUND IFEXPR
+            ExprKind::IfElse(c, a, b) => {
+                self.expr(c);
+                self.expr(a);
+                self.expr(b);
+            }
             // ROUND 71: `f32` falls under the same rule as `f64` —
             // floating point in the kernel profile only with #[allow_fp].
             ExprKind::Float(..) | ExprKind::FloatF32(_) => self.fp(e.span, "a floating point literal"),

@@ -240,6 +240,12 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_expr(&mut self, e: &Expr) {
         match &e.kind {
+            // ROUND IFEXPR
+            ExprKind::IfElse(c, a, b) => {
+                self.check_expr(c);
+                self.check_expr(a);
+                self.check_expr(b);
+            }
             ExprKind::FloatF32(_) => {}
             // ROUND 70: the text literal carries its array literal inside.
             ExprKind::Text(_, inner) => self.check_expr(inner),
