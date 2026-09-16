@@ -410,6 +410,12 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
 fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
     let sp = e.span;
     match &mut e.kind {
+        // ROUND IFEXPR
+        ExprKind::IfElse(c, a, b) => {
+            subst_expr(c, map, queue);
+            subst_expr(a, map, queue);
+            subst_expr(b, map, queue);
+        }
         ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => {}
         ExprKind::Ident(_) => {}
         // ROUND 70: the text literal carries its array literal inside.
@@ -518,6 +524,12 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     e.id = *next;
     *next += 1;
     match &mut e.kind {
+        // ROUND IFEXPR
+        ExprKind::IfElse(c, a, b) => {
+            renumber_expr(c, next);
+            renumber_expr(a, next);
+            renumber_expr(b, next);
+        }
         ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         // ROUND 70: the text literal carries its array literal inside.
         ExprKind::Text(_, inner) => renumber_expr(inner, next),
@@ -651,6 +663,12 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
 
 fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
     match &e.kind {
+        // ROUND IFEXPR
+        ExprKind::IfElse(c, a, b) => {
+            check_bare_expr(c, out);
+            check_bare_expr(a, out);
+            check_bare_expr(b, out);
+        }
         ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         // ROUND 70: the text literal carries its array literal inside.
         ExprKind::Text(_, inner) => check_bare_expr(inner, out),

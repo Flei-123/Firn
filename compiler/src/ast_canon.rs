@@ -186,6 +186,13 @@ fn ex(e: &Expr) -> String {
 fn ex_core(e: &Expr) -> String {
     match &e.kind {
         ExprKind::Int(v) => format!("(int {})", v),
+        // ROUND IFEXPR: `if` as an expression appears as a node of its own.
+        // The children go through `ex`, not `ex_core` -- otherwise they
+        // would lack the type note every other node carries (found in the
+        // comparison against the compiler written in Firn).
+        ExprKind::IfElse(c, a, b) => format!(
+            "(ifexpr {} {} {})", ex(c), ex(a), ex(b)
+        ),
         ExprKind::Float(bits, _) => format!("(float {})", bits),
         // ROUND 71: the f32 literal carries its binary32 bit pattern.
         ExprKind::FloatF32(bits) => format!("(float32 {})", bits),

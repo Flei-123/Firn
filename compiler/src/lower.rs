@@ -776,6 +776,47 @@ impl<'a> Lower<'a> {
                     self.ice(e.span, "unknown name in lowering")
                 }
             }
+            // ROUND IFEXPR: `if c { a } else { b }` as an expression.
+            //
+            // No phi node by hand: the lowering makes -- as for every mutable
+            // variable -- an `alloca` place, writes into it in both branches
+            // and reads afterwards. `mem2reg` turns that into a phi later by
+            // itself. So this construct hangs on no new mechanism in the core.
+            ExprKind::IfElse(c, a, b) => {
+                let t = self.ty_of(e);
+                let ft = match scalar_fty(&t) {
+                    Some(f) => f,
+                    None => {
+                        return self.err(
+                            e.span,
+                            "an 'if' expression only produces scalar values so far; \
+                             use the 'if' statement with an assignment",
+                        )
+                    }
+                };
+                let (size, align) = self.size_align(&t);
+                let slot = self.alloca(size, align);
+                let cv = self.lower_expr(c)?;
+                let then_bb = self.new_block();
+                let else_bb = self.new_block();
+                let join_bb = self.new_block();
+                self.set_term(Term::BrCond { cond: cv, then_bb, else_bb });
+
+                self.cur = then_bb;
+                self.write_into(slot, a)?;
+                if !self.terminated() {
+                    self.set_term(Term::Br(join_bb));
+                }
+
+                self.cur = else_bb;
+                self.write_into(slot, b)?;
+                if !self.terminated() {
+                    self.set_term(Term::Br(join_bb));
+                }
+
+                self.cur = join_bb;
+                Some(self.load(ft, slot))
+            }
             ExprKind::Unary(op, inner) => self.lower_unary(e, *op, inner),
             ExprKind::Binary(op, a, b) => self.lower_binary(e, *op, a, b),
             ExprKind::Field(..) | ExprKind::Index(..) => {

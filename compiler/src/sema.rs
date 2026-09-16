@@ -1890,6 +1890,32 @@ constants declared before it, and '+ - * /'"
 
     fn expr_inner(&mut self, e: &Expr, hint: Option<&Type>) -> Type {
         match &e.kind {
+            // ROUND IFEXPR: `if c { a } else { b }` as an expression.
+            // The condition has to be a `bool`, and both branches have to
+            // produce the same type -- otherwise the expression would have a
+            // different type depending on a value known only at run time.
+            ExprKind::IfElse(c, a, b) => {
+                self.check_cond(c, "if");
+                let at = self.expr(a, hint);
+                // The second branch gets the type of the first as its
+                // wish: that way an untyped literal adapts (`if c { 1 }
+                // else { 0 }` in an f64 context).
+                let want = if at.is_error() { hint.cloned() } else { Some(at.clone()) };
+                let bt = self.expr(b, want.as_ref());
+                if !at.is_error() && !bt.is_error() && !compatible(&at, &bt) {
+                    self.dg.error_note(
+                        b.span,
+                        format!(
+                            "the two branches of the 'if' expression have different types: '{}' and '{}'",
+                            self.tcx.name_of(&at),
+                            self.tcx.name_of(&bt)
+                        ),
+                        "both branches have to produce the same type; there is no implicit conversion",
+                    );
+                    return Type::Error;
+                }
+                if at.is_error() { bt } else { at }
+            }
             // ROUND 71 — the float literal is UNTYPED, like the integer
             // literal since round 70. Where the context says `f32`, it is an
             // `f32`; where nothing says anything, `f64` holds -- the default
@@ -2767,6 +2793,9 @@ constants declared before it, and '+ - * /'"
             return None;
         }
         match &e.kind {
+            // ROUND IFEXPR: the probe takes the `if` branch; that the two
+            // branches disagree is reported by the real check.
+            ExprKind::IfElse(_, a, _) => self.probe_d(a, d + 1),
             ExprKind::Int(_) => None,
             // ROUND 70: a text literal probes as `str` — that is how the
             // other side of `text == "quit"` gets its type (strtype.rs).

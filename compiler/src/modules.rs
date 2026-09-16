@@ -836,6 +836,12 @@ impl<'a, 'b> Renamer<'a, 'b> {
     fn expr(&mut self, e: &mut Expr) {
         let span = e.span;
         match &mut e.kind {
+            // ROUND IFEXPR
+            ExprKind::IfElse(c, a, b) => {
+                self.expr(c);
+                self.expr(a);
+                self.expr(b);
+            }
             ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => {}
             // ROUND 70: the text literal carries its array literal inside.
             ExprKind::Text(_, inner) => self.expr(inner),

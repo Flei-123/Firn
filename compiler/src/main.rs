@@ -30,6 +30,7 @@ mod threading;
 mod fir;
 mod fnval;
 mod gc;
+mod ifexpr;
 mod gc_lower;
 mod iface;
 mod impls;
