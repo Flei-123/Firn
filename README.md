@@ -436,5 +436,9 @@ What that means in practice:
 
 Every source file carries an `SPDX-License-Identifier:` line. Third-party
 material (Unicode data, test fonts) and its own terms are listed in
-[THIRD_PARTY.md](THIRD_PARTY.md). Earlier public states of Firn were MIT
-licensed; that text is kept in `LICENSES/` for reference.
+[THIRD_PARTY.md](THIRD_PARTY.md). Until 16 September 2026 this repository was
+published under MIT; that text is kept in `LICENSES/MIT.old.txt` for
+reference. The archive branches (`archiv/*`) were rewritten to MPL-2.0 on
+17 September 2026, so every branch here now carries the same licence.
+Anyone who obtained a copy before the change keeps the rights MIT gave
+them for that copy.
