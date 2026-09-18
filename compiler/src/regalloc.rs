@@ -76,6 +76,33 @@ fn used_register(alloc: &Alloc, v: Val, r: &'static str) -> bool {
 
 /// callee-saved registers that may get handed out (prologue/epilogue save).
 const CALLEE_SAVED: [&str; 5] = ["rbx", "r12", "r13", "r14", "r15"];
+
+/// ROUND XMM3 -- DIE ZWEITE REGISTERKLASSE.
+///
+/// Bis hierher kannte der Zuteiler nur Ganzzahlregister, und JEDE Funktion
+/// mit einem `f32`/`f64` fiel deshalb auf den Grundweg zurueck, der jeden
+/// Zwischenwert auf den Stapel legt. Gemessen war das der Unterschied
+/// zwischen dem Faktor drei und dem Faktor siebzehn gegenueber C
+/// (`docs/TON2.md`).
+///
+/// Ausgegeben werden `xmm4`-`xmm15`; `xmm0`-`xmm3` bleiben Kratzregister
+/// der Ausgabe (die Umwandlungen und die Vergleiche brauchen sie).
+///
+/// EINE REGEL IST HART: auf System V sind ALLE sechzehn `xmm` caller-saved.
+/// Ein Wert, dessen Lebensdauer einen Aufruf kreuzt, bekommt deshalb KEIN
+/// Register -- nicht als Vorsicht, sondern weil es keines gibt, das der
+/// Aufruf nicht zerstoert. (Sichern und Zurueckholen um jeden Aufruf herum
+/// waere die naechste Stufe; sie lohnt erst, wenn gemessen ist, dass die
+/// betroffenen Werte heiss sind.)
+const FP_POOL: [&str; 12] = [
+    "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
+    "xmm13", "xmm14", "xmm15",
+];
+
+/// Ist dieser Platz ein SSE-Register?
+pub(crate) fn is_xmm(r: &str) -> bool {
+    r.starts_with("xmm")
+}
 /// caller-saved register for intervals that enclose NO `call`/`syscall`:
 /// in that case neither the call itself nor the build-up of its argument
 /// list (rdi, rsi, rdx, rcx, r8, r9, r10) can destroy the value.
@@ -859,6 +886,15 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
                 if defs.get(&d).copied().unwrap_or(0) != 1 {
                     continue;
                 }
+                // ROUND XMM3: eine GLEITZAHL ist nie ein unmittelbarer
+                // Operand. SSE kennt keine Form mit Konstante, und ihr
+                // Bitmuster als Zahl in einen `movss`-Operanden zu setzen
+                // ergibt stillen Unsinn -- vor dieser Runde konnte der Fall
+                // nicht auftreten, weil Funktionen mit Fliesskomma diesen
+                // Weg nie erreicht haben.
+                if i.ty.is_float() {
+                    continue;
+                }
                 let v = i.ty.truncate(*c);
                 // Up to 32 bits the immediate may use the whole unsigned
                 // range: `cmp $0xffffffff,%r9d` computes exactly right with
@@ -1081,6 +1117,58 @@ fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Optio
 }
 
 /// Carries out the complete allocation.
+/// ROUND XMM3 -- WELCHE FLIESSKOMMAWERTE DUERFEN IN EIN REGISTER?
+///
+/// Nur die, deren Erzeugung UND jede Verwendung im Fliesskommaweg der
+/// Ausgabe steht. Der Grund ist kein Misstrauen gegen den Zuteiler, sondern
+/// die Bauart des Erzeugers: an vielen Stellen steht `ra.load_full(e,
+/// "rax", v)`, und das erzeugt `mov rax, <platz von v>`. Stuende dort ein
+/// `xmm`, waere das ein stiller Fehler. Ein Wert, der irgendwo anders
+/// angefasst wird, bleibt deshalb auf seinem Platz -- dort ist er fuer
+/// jeden Weg lesbar.
+///
+/// DRAUSSEN sind damit ausdruecklich: Parameter (der Vorspann schreibt sie
+/// in ihre Plaetze), Ergebnisse von Aufrufen, geprueste Umwandlungen,
+/// `Select`, `Barrier`, `CopyMem`, Vektoranweisungen und alles, was als
+/// Aufrufargument dient.
+fn fp_taugt(f: &Func) -> Vec<bool> {
+    let nv = f.val_types.len();
+    let mut ok: Vec<bool> = (0..nv).map(|v| f.val_ty(v as Val).is_float()).collect();
+    for i in 0..f.params.len().min(nv) {
+        ok[i] = false;
+    }
+    let mut buf: Vec<Val> = Vec::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst {
+                let erzeugt_gut = matches!(
+                    &inst.op,
+                    Op::Const(_) | Op::Bin(..) | Op::Cast { .. } | Op::Load { .. } | Op::Copy { .. }
+                );
+                if !erzeugt_gut && (d as usize) < nv {
+                    ok[d as usize] = false;
+                }
+            }
+            let liest_gut = match &inst.op {
+                Op::Bin(..) | Op::Cmp { .. } | Op::Cast { .. } | Op::Copy { .. } => true,
+                // Beim Speichern ist der WERT eine Gleitzahl, die Adresse nie.
+                Op::Store { .. } => true,
+                _ => false,
+            };
+            if !liest_gut {
+                buf.clear();
+                inst.op.uses(&mut buf);
+                for u in buf.iter() {
+                    if (*u as usize) < nv {
+                        ok[*u as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+    ok
+}
+
 pub fn allocate(f: &Func) -> Alloc {
     let nv = f.val_types.len();
     let nb = f.blocks.len();
@@ -1230,6 +1318,9 @@ pub fn allocate(f: &Func) -> Alloc {
         if cells.contains_key(&(v as Val)) {
             continue; // is treated as a cell
         }
+        if f.val_ty(v as Val).is_float() {
+            continue; // ROUND XMM3: eigene Klasse, eigener Durchgang unten
+        }
         if alloc.imms.contains_key(&(v as Val)) || alloc.frame_addr.contains_key(&(v as Val)) {
             continue; // needs no place at all
         }
@@ -1301,6 +1392,42 @@ pub fn allocate(f: &Func) -> Alloc {
     }
     ivs.sort_by_key(|i| (i.start, i.end, i.val));
 
+    // ROUND XMM3 -- die Fliesskommawerte, getrennt gesammelt. `fp_taugt`
+    // sagt, welche ueberhaupt in Frage kommen: ein Wert bekommt nur dann ein
+    // `xmm`, wenn JEDE Stelle, die ihn erzeugt oder liest, im Fliesskommaweg
+    // der Ausgabe steht. Alles andere bleibt auf seinem Platz und wird
+    // gelesen wie bisher -- so kann kein Weg im Erzeuger versehentlich ein
+    // `xmm` als Ganzzahlregister behandeln.
+    let fp_ok = fp_taugt(f);
+    let mut fp_ivs: Vec<Iv> = Vec::new();
+    for v in 0..nv {
+        if !f.val_ty(v as Val).is_float() || !fp_ok[v] {
+            continue;
+        }
+        if start[v] == usize::MAX || f.is_secret(v as Val) {
+            continue;
+        }
+        if cells.contains_key(&(v as Val)) || alloc.imms.contains_key(&(v as Val)) {
+            continue;
+        }
+        let (sp, ep) = (start[v], end[v]);
+        let killed = match &exact {
+            Some(x) => x[v],
+            None => rough(sp, ep),
+        };
+        // Ein Aufruf zerstoert jedes SSE-Register: dann bleibt der Platz.
+        if killed & M_CALL != 0 {
+            continue;
+        }
+        fp_ivs.push(Iv { val: v as Val, start: sp, end: ep, weight: weight[v], killed: 0, is_cell: false });
+    }
+    fp_ivs.sort_by_key(|i| (i.start, i.end, i.val));
+    // Zur Fehlersuche: FIRN_NO_FP_RA=1 laesst die Fliesskommawerte auf ihren
+    // Plaetzen, der Rest des Weges bleibt wie er ist.
+    if std::env::var_os("FIRN_NO_FP_RA").is_some() {
+        fp_ivs.clear();
+    }
+
     // ROUND 87: the real register pressure. NOT `active.len()` -- `active`
     // only holds the intervals that got a register, so it can never exceed
     // twelve and would report "pressure 12" for a function that needs 900.
@@ -1337,6 +1464,7 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut active: Vec<(Iv, &'static str)> = Vec::new();
     let mut assign: HashMap<Val, &'static str> = HashMap::new();
     let mut used_saved: Vec<&'static str> = Vec::new();
+    let mut fp_assign: HashMap<Val, &'static str> = HashMap::new();
 
     let free = |r: &'static str,
                      free_saved: &mut Vec<&'static str>,
@@ -1460,6 +1588,55 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     }
 
+    // ---- ROUND XMM3: derselbe Durchlauf noch einmal, fuer die SSE-Klasse --
+    //
+    // Er ist einfacher als der obere: alle zwoelf Register sind
+    // gleichwertig (keines ist Argument-, Divisions- oder callee-saved
+    // Register), und was einen Aufruf kreuzt, ist oben schon aussortiert.
+    {
+        let mut free_fp: Vec<&'static str> = FP_POOL.to_vec();
+        let mut active_fp: Vec<(Iv, &'static str)> = Vec::new();
+        for iv in fp_ivs.iter().copied() {
+            let mut k = 0;
+            while k < active_fp.len() {
+                if active_fp[k].0.end < iv.start {
+                    let (_, r) = active_fp.remove(k);
+                    free_fp.push(r);
+                } else {
+                    k += 1;
+                }
+            }
+            match free_fp.pop() {
+                Some(r) => {
+                    fp_assign.insert(iv.val, r);
+                    active_fp.push((iv, r));
+                }
+                None => {
+                    // Verdraengung nach Gewicht, wie oben.
+                    let mut worst: Option<usize> = None;
+                    for (k, (a, _)) in active_fp.iter().enumerate() {
+                        let better = match worst {
+                            None => true,
+                            Some(w) => (a.weight, usize::MAX - a.end)
+                                < (active_fp[w].0.weight, usize::MAX - active_fp[w].0.end),
+                        };
+                        if better {
+                            worst = Some(k);
+                        }
+                    }
+                    if let Some(w) = worst {
+                        if active_fp[w].0.weight < iv.weight {
+                            let (old, r) = active_fp.remove(w);
+                            fp_assign.remove(&old.val);
+                            fp_assign.insert(iv.val, r);
+                            active_fp.push((iv, r));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if want_stats {
         for c in cells.keys() {
             if !assign.contains_key(c) {
@@ -1469,6 +1646,9 @@ pub fn allocate(f: &Func) -> Alloc {
         alloc.stats = Some(st);
     }
     // enter the result
+    for (v, r) in fp_assign.iter() {
+        alloc.locs[*v as usize] = Loc::Reg(r);
+    }
     for (v, r) in assign.iter() {
         if cells.contains_key(v) {
             alloc.cells.insert(*v, r);
@@ -1496,6 +1676,12 @@ pub fn allocate(f: &Func) -> Alloc {
                 (Op::Load { addr }, Some(d)) => (*addr, d),
                 _ => continue,
             };
+            // ROUND XMM3: der Alias sagt "der Wert steht schon im
+            // Zellregister" -- das ist ein GANZZAHLregister. Fuer einen
+            // Gleitzahlwert waere das eine Verwechslung der Registerklassen.
+            if f.val_ty(d).is_float() {
+                continue;
+            }
             // FULL WIDTH ONLY: at 8/16/32 bits the load pulls the relevant bits
             // out via movzx/mov32 — the cell register contains leftovers in the
             // upper part, and an alias would read them along (round 40, failure
@@ -2013,6 +2199,81 @@ impl<'a> Ra<'a> {
             Loc::Slot(off) => format!("{} [rbp-{}]", size_word(bits), off),
         }
     }
+    /// ROUND XMM3 -- der Operand eines Fliesskommawerts: entweder sein
+    /// `xmm`-Register oder sein Platz. SSE-Anweisungen nehmen den Speicher
+    /// als zweiten Operanden unmittelbar an, also braucht keiner der beiden
+    /// Faelle eine Hilfsanweisung.
+    fn fpo(&self, v: Val, single: bool) -> String {
+        match self.a.place(v) {
+            Loc::Reg(r) => r.to_string(),
+            Loc::Slot(off) => {
+                format!("{} ptr [rbp-{}]", if single { "dword" } else { "qword" }, off)
+            }
+        }
+    }
+    /// Den Wert in ein bestimmtes `xmm` holen (fuer die Kratzregister der
+    /// Umwandlungen und Vergleiche).
+    fn fp_into(&self, e: &mut Emitter, x: &str, v: Val, single: bool) {
+        let o = self.fpo(v, single);
+        if o == x {
+            return;
+        }
+        if is_xmm(&o) {
+            e.line(&format!("movaps {}, {}", x, o));
+        } else {
+            e.line(&format!("{} {}, {}", if single { "movss" } else { "movsd" }, x, o));
+        }
+    }
+    /// Das Ergebnis aus einem `xmm` an seinen Platz bringen -- wenn der Wert
+    /// selbst in einem Register lebt, ist das eine Kopie, sonst ein Schreiben.
+    fn fp_out(&self, e: &mut Emitter, d: Val, x: &str, single: bool) {
+        match self.a.loc(d) {
+            Loc::Reg(r) => {
+                if r != x {
+                    e.line(&format!("movaps {}, {}", r, x));
+                }
+            }
+            Loc::Slot(off) => e.line(&format!(
+                "{} {} ptr [rbp-{}], {}",
+                if single { "movss" } else { "movsd" },
+                if single { "dword" } else { "qword" },
+                off,
+                x
+            )),
+        }
+    }
+    /// Das Register, IN dem gerechnet wird: das Zielregister, wenn es eines
+    /// hat, sonst das Kratzregister `xmm0`.
+    fn fp_work(&self, d: Val) -> &'static str {
+        match self.a.loc(d) {
+            Loc::Reg(r) => r,
+            Loc::Slot(_) => "xmm0",
+        }
+    }
+
+    /// ROUND XMM3 -- der Speicherort, auf den ein Zeigerwert zeigt.
+    ///
+    /// Zwei Faelle, und der zweite war der Fehler dieser Runde: ein
+    /// `alloca`, dessen Adresse fest im Rahmen steht (`frame_addr`), hat
+    /// GAR KEINEN Platz, in dem die Adresse stuende -- sie wird an jeder
+    /// Verwendung als `[rbp-off]` eingesetzt. Wer sie mit `load_full` in ein
+    /// Register holen will, liest einen nie beschriebenen Platz und springt
+    /// ins Nichts.
+    fn addr_mem(&self, e: &mut Emitter, v: Val) -> String {
+        // Eine Adressrechnung, die ganz in den Speicherzugriff gewandert ist
+        // (`foldable_addresses`), steht in KEINEM Register und in keinem
+        // Platz -- sie ist nur noch dieser Text. Wer sie stattdessen laedt,
+        // liest einen nie beschriebenen Platz.
+        if let Some(a) = self.offset.get(&v) {
+            return a.text();
+        }
+        if let Some(off) = self.a.frame_addr.get(&v) {
+            return format!("[rbp-{}]", off);
+        }
+        self.load_full(e, "rcx", v);
+        "[rcx]".to_string()
+    }
+
     /// Load a value completely into a scratch register.
     fn load_full(&self, e: &mut Emitter, r: &str, v: Val) {
         let o = self.opnd(v);
@@ -2555,8 +2816,51 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     // ROUND 71: `f32` too. The linear scan knows only the integer registers;
     // as long as that is so, EVERY function with floating point in it goes
     // through the base path (SPEC 14.1.f64, restriction F1).
-    if f.val_types.iter().any(|t| t.is_float()) {
-        return Some("f64 in the value set".into());
+    // ROUND XMM3: Fliesskomma ist auf diesem Weg zuhause -- mit einer
+    // scharf gezogenen Grenze. Was die Ausgabe hier NICHT selbst kann,
+    // schickt die ganze Funktion weiterhin ueber den Grundweg:
+    //
+    //   * `bool`-Umwandlung aus einer Gleitzahl (der Vergleich mit Null hat
+    //     bei NaN eine eigene Regel, die hier nicht steht),
+    //   * die GEPRUEFTE Umwandlung (`CheckedCast`) mit Gleitzahlen,
+    //   * `Select`, `Un`, `BinWrapSat` und Systemaufrufe mit Gleitzahlen,
+    //   * alles, was `v128` anfasst (schon oben ausgeschlossen).
+    for b in &f.blocks {
+        for i in &b.insts {
+            match &i.op {
+                Op::Cast { from, .. } => {
+                    if i.ty == FTy::Bool && from.is_float() {
+                        return Some("Umwandlung Gleitzahl -> bool".into());
+                    }
+                }
+                Op::CheckedCast { from, .. } => {
+                    if from.is_float() || i.ty.is_float() {
+                        return Some("gepruefte Umwandlung mit Gleitzahl".into());
+                    }
+                }
+                Op::Un(_, x) => {
+                    if f.val_ty(*x).is_float() || i.ty.is_float() {
+                        return Some("einstellige Rechnung mit Gleitzahl".into());
+                    }
+                }
+                Op::Select { a, b: bv, .. } => {
+                    if f.val_ty(*a).is_float() || f.val_ty(*bv).is_float() {
+                        return Some("Select mit Gleitzahl".into());
+                    }
+                }
+                Op::BinWrapSat { .. } => {
+                    if i.ty.is_float() {
+                        return Some("umlaufende Rechnung mit Gleitzahl".into());
+                    }
+                }
+                Op::Syscall { args } => {
+                    if args.iter().any(|a| f.val_ty(*a).is_float()) {
+                        return Some("Systemaufruf mit Gleitzahl".into());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     // ROUND 82: `v128` is a second register class of its own (xmm) with
     // sixteen byte slots. The linear scan hands out integer registers only —
@@ -2651,32 +2955,97 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     // CAUTION: `r8`/`r9` are argument registers 5/6 AND at the same time
     // possible homes of earlier parameters. That is why all slot targets come
     // first (they overwrite no register), then the register targets IN PARALLEL.
+    // ROUND XMM3: System V zaehlt die beiden Klassen GETRENNT. Ein
+    // Fliesskomma-Parameter kommt in xmm0-xmm7 an und verbraucht KEIN
+    // Ganzzahlregister -- vorher zaehlte dieser Weg stur die Position, was
+    // richtig war, solange keine Funktion mit Fliesskomma hier ankam.
     let mut prolog_moves: Vec<(String, String)> = Vec::new();
-    for (i, _t) in f.params.iter().enumerate().take(ARG_REGS.len()) {
-        match ra.a.loc(i as Val) {
-            Loc::Slot(off) => {
-                e.line(&format!("mov qword ptr [rbp-{}], {}", off, ARG_REGS[i]))
+    let mut int_i = 0usize;
+    let mut sse_i = 0usize;
+    let mut stack_i = 0usize;
+    let mut aus_stapel: Vec<(usize, u64)> = Vec::new();
+    for (i, t) in f.params.iter().enumerate() {
+        if t.is_float() {
+            if sse_i < crate::codegen_x86::SSE_REGS.len() {
+                let r = crate::codegen_x86::SSE_REGS[sse_i];
+                sse_i += 1;
+                let single = *t == FTy::F32;
+                match ra.a.loc(i as Val) {
+                    Loc::Slot(off) => e.line(&format!(
+                        "{} {} ptr [rbp-{}], {}",
+                        if single { "movss" } else { "movsd" },
+                        if single { "dword" } else { "qword" },
+                        off,
+                        r
+                    )),
+                    Loc::Reg(dst) => {
+                        if dst != r {
+                            e.line(&format!("movaps {}, {}", dst, r));
+                        }
+                    }
+                }
+                continue;
             }
-            Loc::Reg(dst) => prolog_moves.push((dst.to_string(), ARG_REGS[i].to_string())),
+        } else if int_i < ARG_REGS.len() {
+            let r = ARG_REGS[int_i];
+            int_i += 1;
+            match ra.a.loc(i as Val) {
+                Loc::Slot(off) => e.line(&format!("mov qword ptr [rbp-{}], {}", off, r)),
+                Loc::Reg(dst) => prolog_moves.push((dst.to_string(), r.to_string())),
+            }
+            continue;
         }
+        // Kein Register der eigenen Klasse mehr frei: der Wert liegt im
+        // Rahmen des AUFRUFERS, ab [rbp+16], in der Reihenfolge der
+        // Uebergabe.
+        aus_stapel.push((i, 16 + 8 * stack_i as u64));
+        stack_i += 1;
     }
     parallel_reg_moves(e, &prolog_moves);
+    for (i, of) in aus_stapel {
+        let t = f.params[i];
+        if t.is_float() {
+            let single = t == FTy::F32;
+            match ra.a.loc(i as Val) {
+                Loc::Slot(off) => {
+                    e.line(&format!(
+                        "{} xmm0, {} ptr [rbp+{}]",
+                        if single { "movss" } else { "movsd" },
+                        if single { "dword" } else { "qword" },
+                        of
+                    ));
+                    e.line(&format!(
+                        "{} {} ptr [rbp-{}], xmm0",
+                        if single { "movss" } else { "movsd" },
+                        if single { "dword" } else { "qword" },
+                        off
+                    ));
+                }
+                Loc::Reg(dst) => e.line(&format!(
+                    "{} {}, {} ptr [rbp+{}]",
+                    if single { "movss" } else { "movsd" },
+                    dst,
+                    if single { "dword" } else { "qword" },
+                    of
+                )),
+            }
+        } else {
+            match ra.a.loc(i as Val) {
+                Loc::Slot(off) => {
+                    e.line(&format!("mov rax, qword ptr [rbp+{}]", of));
+                    e.line(&format!("mov qword ptr [rbp-{}], rax", off));
+                }
+                Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, of)),
+            }
+        }
+    }
     // Parameters from the seventh on lie in the frame of the CALLER (System V:
     // [rbp+16], [rbp+24], … — in front of those sit the saved return address
     // and the saved rbp). They are fetched ONLY AFTER the parallel moves: their
     // target register could otherwise overwrite a source that is still needed.
     // `rax`, being a scratch register, is never the home of a value and may
     // serve as intermediate storage here.
-    for (i, _t) in f.params.iter().enumerate().skip(ARG_REGS.len()) {
-        let of = 16 + 8 * (i - ARG_REGS.len()) as u64;
-        match ra.a.loc(i as Val) {
-            Loc::Slot(off) => {
-                e.line(&format!("mov rax, qword ptr [rbp+{}]", of));
-                e.line(&format!("mov qword ptr [rbp-{}], rax", off));
-            }
-            Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, of)),
-        }
-    }
+
     // Round 51: the blocks are no longer printed in their FIR order but
     // along traces (see `emit_order`).
     let order = emit_order(f);
@@ -3253,6 +3622,14 @@ fn emit_block(
                 && last.dst == Some(*cond)
                 && ra.read.get(*cond as usize).copied().unwrap_or(2) == 1
                 && !ra.f.is_secret(*cond)
+                // ROUND XMM3: `==`/`!=` auf Gleitzahlen braucht hinter dem
+                // Vergleich noch die Paritaetskorrektur fuer NaN. Die passt
+                // nicht zwischen Vergleich und Sprung, also wird hier nicht
+                // verschmolzen.
+                && !matches!(&last.op,
+                    Op::Cmp { op: CmpOp::Eq, ty, .. } if ty.is_float())
+                && !matches!(&last.op,
+                    Op::Cmp { op: CmpOp::Ne, ty, .. } if ty.is_float())
         }
         _ => false,
     };
@@ -3336,7 +3713,12 @@ fn emit_block(
         }
         Term::Ret(v) => {
             if let Some(v) = v {
+                if f.ret.is_float() {
+                    // ROUND XMM3: System V gibt ein Fliesskommaergebnis in xmm0 zurueck.
+                    ra.fp_into(e, "xmm0", *v, f.ret == FTy::F32);
+                } else {
                 ra.load_full(e, "rax", *v);
+                }
             } else {
                 // Round 51: NO `xor eax, eax` any more. A function with
                 // return type `void` has no result value; System V
@@ -3370,6 +3752,31 @@ fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Re
         Term::BrCond { then_bb, else_bb, .. } => (*then_bb, *else_bb),
         _ => return Err("internal error: cmp+jcc without brcond".to_string()),
     };
+    // ROUND XMM3: Fliesskomma setzt die Flaggen mit `ucomis*`, sonst gilt
+    // alles Weitere unveraendert.
+    if oty.is_float() {
+        let single = oty == FTy::F32;
+        let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
+        let (first, second) = if swap { (bb, a) } else { (a, bb) };
+        ra.fp_into(e, "xmm0", first, single);
+        let o2 = ra.fpo(second, single);
+        e.line(&format!("{} xmm0, {}", if single { "ucomiss" } else { "ucomisd" }, o2));
+        let jcc = match op {
+            CmpOp::Eq => "je",
+            CmpOp::Ne => "jne",
+            CmpOp::Lt | CmpOp::Gt => "ja",
+            CmpOp::Le | CmpOp::Ge => "jae",
+        };
+        if next == Some(else_bb) {
+            e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
+        } else if next == Some(then_bb) {
+            e.line(&format!("{} {}", jcc_inverse(jcc), block_label(&f.name, else_bb)));
+        } else {
+            e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
+            e.line(&format!("jmp {}", block_label(&f.name, else_bb)));
+        }
+        return Ok(());
+    }
     let bits = oty.bits().max(8);
     let oa = ra.opnd_w(a, bits);
     let ob = ra.opnd_w(bb, bits);
@@ -3452,6 +3859,116 @@ fn emit_inst(
             }
             _ => return Err("internal error: v128 reached the register path".to_string()),
         },
+        Op::Const(c) if ty.is_float() => {
+            // ROUND XMM3: das Bitmuster ueber `rax` -- SSE hat keine Form
+            // mit unmittelbarer Konstante. Liegt der Wert auf seinem Platz,
+            // reicht das Schreiben als Ganzzahl.
+            let d = i.dst.ok_or("internal error: const without target")?;
+            let single = ty == FTy::F32;
+            let bits = ty.truncate(*c) as i64;
+            match ra.a.loc(d) {
+                Loc::Reg(r) => {
+                    if bits == 0 {
+                        e.line(&format!("xorps {}, {}", r, r));
+                    } else if single {
+                        e.line(&format!("mov eax, {}", bits as u32));
+                        e.line(&format!("movd {}, eax", r));
+                    } else {
+                        e.line(&format!("mov rax, {}", bits));
+                        e.line(&format!("movq {}, rax", r));
+                    }
+                }
+                Loc::Slot(off) => {
+                    if single {
+                        e.line(&format!("mov dword ptr [rbp-{}], {}", off, bits as u32));
+                    } else {
+                        e.line(&format!("mov rax, {}", bits));
+                        e.line(&format!("mov qword ptr [rbp-{}], rax", off));
+                    }
+                }
+            }
+        }
+        Op::Copy { src } if ty.is_float() => {
+            let d = i.dst.ok_or("internal error: copy without target")?;
+            let single = ty == FTy::F32;
+            match (ra.a.loc(d), ra.a.place(*src)) {
+                (Loc::Reg(r), _) => ra.fp_into(e, r, *src, single),
+                (Loc::Slot(_), Loc::Reg(sr)) => ra.fp_out(e, d, sr, single),
+                (Loc::Slot(_), Loc::Slot(_)) => {
+                    ra.fp_into(e, "xmm0", *src, single);
+                    ra.fp_out(e, d, "xmm0", single);
+                }
+            }
+        }
+        Op::Load { addr } if ty.is_float() && ra.a.cell(*addr).is_some() => {
+            // ROUND XMM3: die Zelle liegt in einem GANZZAHLregister (dort
+            // steht das Bitmuster). Von da in ein `xmm` geht es mit `movq`/
+            // `movd` -- ohne den Umweg ueber den Speicher.
+            let d = i.dst.ok_or("internal error: load without target")?;
+            if ra.a.alias.contains_key(&d) {
+                return Ok(());
+            }
+            let (cr, _) = ra.a.cell(*addr).ok_or("internal error: cell lost")?;
+            let single = ty == FTy::F32;
+            let w = ra.fp_work(d);
+            if single {
+                e.line(&format!("movd {}, {}", w, rn(cr, 32)));
+            } else {
+                e.line(&format!("movq {}, {}", w, cr));
+            }
+            ra.fp_out(e, d, w, single);
+        }
+        Op::Store { addr, val } if ty.is_float() && ra.a.cell(*addr).is_some() => {
+            let (cr, _) = ra.a.cell(*addr).ok_or("internal error: cell lost")?;
+            let single = ty == FTy::F32;
+            let o = ra.fpo(*val, single);
+            let q = if is_xmm(&o) {
+                o
+            } else {
+                ra.fp_into(e, "xmm0", *val, single);
+                "xmm0".to_string()
+            };
+            if single {
+                e.line(&format!("movd {}, {}", rn(cr, 32), q));
+            } else {
+                e.line(&format!("movq {}, {}", cr, q));
+            }
+        }
+        Op::Load { addr } if ty.is_float() && ra.a.cell(*addr).is_none() => {
+            let d = i.dst.ok_or("internal error: load without target")?;
+            if ra.a.alias.contains_key(&d) {
+                return Ok(());
+            }
+            let single = ty == FTy::F32;
+            let mem = ra.addr_mem(e, *addr);
+            let w = ra.fp_work(d);
+            e.line(&format!(
+                "{} {}, {} ptr {}",
+                if single { "movss" } else { "movsd" },
+                w,
+                if single { "dword" } else { "qword" },
+                mem
+            ));
+            ra.fp_out(e, d, w, single);
+        }
+        Op::Store { addr, val } if ty.is_float() && ra.a.cell(*addr).is_none() => {
+            let single = ty == FTy::F32;
+            let o = ra.fpo(*val, single);
+            let quelle = if is_xmm(&o) {
+                o
+            } else {
+                ra.fp_into(e, "xmm0", *val, single);
+                "xmm0".to_string()
+            };
+            let mem = ra.addr_mem(e, *addr);
+            e.line(&format!(
+                "{} {} ptr {}, {}",
+                if single { "movss" } else { "movsd" },
+                if single { "dword" } else { "qword" },
+                mem,
+                quelle
+            ));
+        }
         Op::Const(c) => {
             let d = i.dst.ok_or("internal error: const without target")?;
             if ra.a.imm(d).is_some() {
@@ -3559,6 +4076,45 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
             emit_wrap_sat_ra(e, ra, *kind, *op, ty, *a, *b, d, site)?;
         }
+        Op::Cmp { op, ty: oty, a, b } if oty.is_float() => {
+            // ROUND XMM3 -- der Fliesskommavergleich, nach demselben Muster
+            // wie im Grundweg: `ucomiss`/`ucomisd` setzen CF/ZF wie ein
+            // UNSIGNED Vergleich, und fuer `<`/`<=` werden die Operanden
+            // getauscht, statt hinterher mit dem Paritaetsbit zu rechnen.
+            let d = i.dst.ok_or("internal error: comparison without target")?;
+            let single = *oty == FTy::F32;
+            let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
+            let (first, second) = if swap { (*b, *a) } else { (*a, *b) };
+            ra.fp_into(e, "xmm0", first, single);
+            let o2 = ra.fpo(second, single);
+            e.line(&format!("{} xmm0, {}", if single { "ucomiss" } else { "ucomisd" }, o2));
+            let cc = match op {
+                CmpOp::Eq => "sete",
+                CmpOp::Ne => "setne",
+                CmpOp::Lt | CmpOp::Gt => "seta",
+                CmpOp::Le | CmpOp::Ge => "setae",
+            };
+            e.line(&format!("{} al", cc));
+            // NaN ist mit nichts vergleichbar, auch nicht mit sich selbst:
+            // `ucomis*` setzt dann ZF UND PF. `sete` allein saehe NaN == NaN
+            // als wahr an, `setne` saehe NaN != NaN als falsch -- beides
+            // verkehrt herum. Das Paritaetsbit korrigiert genau diesen Fall.
+            if matches!(op, CmpOp::Eq) {
+                e.line("setnp cl");
+                e.line("and al, cl");
+            }
+            if matches!(op, CmpOp::Ne) {
+                e.line("setp cl");
+                e.line("or al, cl");
+            }
+            match ra.a.loc(d) {
+                Loc::Reg(dr) => e.line(&format!("movzx {}, al", rn(dr, 32))),
+                Loc::Slot(_) => {
+                    e.line("movzx eax, al");
+                    ra.store_dst(e, d, "rax");
+                }
+            }
+        }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
             let bits = oty.bits().max(8);
@@ -3611,6 +4167,49 @@ fn emit_inst(
                 }
             }
             ra.store_dst(e, d, "rax");
+        }
+        Op::Cast { src, from } if ty.is_float() || from.is_float() => {
+            // ROUND XMM3 -- die Umwandlungen, Wort fuer Wort wie im Grundweg,
+            // nur mit den Operanden der Zuteilung. `xmm0` ist das
+            // Kratzregister; es wird nie als Heimat vergeben.
+            let d = i.dst.ok_or("internal error: conversion without target")?;
+            if ty.is_float() && from.is_float() {
+                if ty == *from {
+                    // Gleiche Breite: das Bitmuster wandert unveraendert.
+                    let single = ty == FTy::F32;
+                    ra.fp_into(e, "xmm0", *src, single);
+                    ra.fp_out(e, d, "xmm0", single);
+                    return Ok(());
+                }
+                ra.fp_into(e, "xmm0", *src, *from == FTy::F32);
+                e.line(if ty == FTy::F64 { "cvtss2sd xmm0, xmm0" } else { "cvtsd2ss xmm0, xmm0" });
+                ra.fp_out(e, d, "xmm0", ty == FTy::F32);
+                return Ok(());
+            }
+            if ty.is_float() {
+                // Ganzzahl -> Fliesskomma. Die Quelle wird auf 64 Bit
+                // gebracht; `cvtsi2ss/sd` liest vorzeichenbehaftet.
+                ra.load_ext(e, "rax", *src, *from, 64);
+                let w = ra.fp_work(d);
+                e.line(&format!(
+                    "{} {}, rax",
+                    if ty == FTy::F32 { "cvtsi2ss" } else { "cvtsi2sd" },
+                    w
+                ));
+                ra.fp_out(e, d, w, ty == FTy::F32);
+                return Ok(());
+            }
+            // Fliesskomma -> Ganzzahl, abschneidend zur Null hin (wie in C).
+            ra.fp_into(e, "xmm0", *src, *from == FTy::F32);
+            e.line(if *from == FTy::F32 { "cvttss2si rax, xmm0" } else { "cvttsd2si rax, xmm0" });
+            match ra.a.loc(d) {
+                Loc::Reg(r) => {
+                    if r != "rax" {
+                        e.line(&format!("mov {}, rax", r));
+                    }
+                }
+                Loc::Slot(_) => ra.store_dst(e, d, "rax"),
+            }
         }
         Op::Cast { src, from } => {
             let d = i.dst.ok_or("internal error: conversion without target")?;
@@ -3839,35 +4438,64 @@ fn emit_inst(
             // After `push rbp` + `sub rsp, <multiple of 16>` it is; the argument
             // area is therefore rounded up to 16 as well — word for word like
             // the base path in codegen_x86.rs.
-            let stack = args.len().saturating_sub(ARG_REGS.len());
-            let space = align_up(stack as u64 * 8, 16);
+            // ROUND XMM3: System V hat ZWEI Registerfolgen -- Ganzzahlen in
+            // rdi/rsi/rdx/rcx/r8/r9, Fliesskomma in xmm0-xmm7, jede fuer
+            // sich gezaehlt. Vorher zaehlte dieser Weg nur Positionen, was
+            // richtig war, solange keine Funktion mit Fliesskomma hier
+            // ankam.
+            let (spot, stack_args) = crate::codegen_x86::place_args(ra.f, args);
+            let space = align_up(stack_args.len() as u64 * 8, 16);
             if space > 0 {
                 e.line(&format!("sub rsp, {}", space));
-                for (k, arg) in args.iter().skip(ARG_REGS.len()).enumerate() {
-                    ra.load_full(e, "rax", *arg);
-                    e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
+                for (k, arg) in stack_args.iter().enumerate() {
+                    if ra.f.val_ty(*arg).is_float() {
+                        let single = ra.f.val_ty(*arg) == FTy::F32;
+                        ra.fp_into(e, "xmm0", *arg, single);
+                        e.line(&format!(
+                            "{} {} ptr [rsp+{}], xmm0",
+                            if single { "movsd" } else { "movsd" },
+                            "qword",
+                            k * 8
+                        ));
+                    } else {
+                        ra.load_full(e, "rax", *arg);
+                        e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
+                    }
                 }
             }
             let mut reg_moves: Vec<(String, String)> = Vec::new();
-            let mut later: Vec<(usize, Val)> = Vec::new();
-            for (k, arg) in args.iter().enumerate().take(ARG_REGS.len()) {
+            let mut later: Vec<(&'static str, Val)> = Vec::new();
+            for (k, arg) in args.iter().enumerate() {
+                let r = match spot[k] {
+                    Some(r) => r,
+                    None => continue,
+                };
+                if is_xmm(r) {
+                    let single = ra.f.val_ty(*arg) == FTy::F32;
+                    ra.fp_into(e, r, *arg, single);
+                    continue;
+                }
                 let o = ra.opnd(*arg);
                 if is_reg64(&o) {
-                    reg_moves.push((ARG_REGS[k].to_string(), o));
+                    reg_moves.push((r.to_string(), o));
                 } else {
-                    later.push((k, *arg));
+                    later.push((r, *arg));
                 }
             }
             parallel_reg_moves(e, &reg_moves);
-            for (k, arg) in later {
-                ra.load_full(e, ARG_REGS[k], arg);
+            for (r, arg) in later {
+                ra.load_full(e, r, arg);
             }
             e.line(&format!("call {}", label(name)));
             if space > 0 {
                 e.line(&format!("add rsp, {}", space));
             }
             if let Some(d) = i.dst {
-                ra.store_dst(e, d, "rax");
+                if ty.is_float() {
+                    ra.fp_out(e, d, "xmm0", ty == FTy::F32);
+                } else {
+                    ra.store_dst(e, d, "rax");
+                }
             }
         }
         // Dynamic dispatch (iface.rs, round 46). Word for word like the `call`
@@ -4129,6 +4757,40 @@ fn emit_bin(
     b: Val,
     d: Val,
 ) -> Result<(), String> {
+    // ROUND XMM3 -- die vier Grundrechenarten auf der SSE-Einheit. Gerechnet
+    // wird IM Zielregister, wenn der Wert eines hat; sonst in `xmm0`. Liegt
+    // der zweite Operand ausgerechnet im Zielregister, wird er vorher nach
+    // `xmm1` gerettet -- sonst ueberschriebe ihn die Kopie des ersten.
+    if ty.is_float() {
+        let single = ty == FTy::F32;
+        let m = match (op, single) {
+            (BinOp::Add, true) => "addss",
+            (BinOp::Sub, true) => "subss",
+            (BinOp::Mul, true) => "mulss",
+            (BinOp::Div, true) => "divss",
+            (BinOp::Add, false) => "addsd",
+            (BinOp::Sub, false) => "subsd",
+            (BinOp::Mul, false) => "mulsd",
+            (BinOp::Div, false) => "divsd",
+            _ => {
+                return Err(format!(
+                    "internal error: operator '{:?}' is not defined for {}",
+                    op,
+                    ty.name()
+                ))
+            }
+        };
+        let w = ra.fp_work(d);
+        let mut ob = ra.fpo(b, single);
+        if is_xmm(&ob) && ob == w {
+            e.line(&format!("movaps xmm1, {}", ob));
+            ob = "xmm1".to_string();
+        }
+        ra.fp_into(e, w, a, single);
+        e.line(&format!("{} {}, {}", m, w, ob));
+        ra.fp_out(e, d, w, single);
+        return Ok(());
+    }
     let wide = ty.bits() > 32;
     let bits = if wide { 64 } else { 32 };
     match op {

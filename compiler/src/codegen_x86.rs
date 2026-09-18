@@ -759,7 +759,7 @@ fn store_xmm(e: &mut Emitter, fr: &Frame, d: Val, x: &str, single: bool) {
 /// stack. The FIR type decides the class, and nothing else; that is what
 /// makes a `{ f32, f32 }` (loaded as one SSE word by the lowering) land in
 /// `xmm0` all by itself.
-fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, Vec<Val>) {
+pub(crate) fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, Vec<Val>) {
     let mut int_i = 0usize;
     let mut sse_i = 0usize;
     let mut spot: Vec<Option<&'static str>> = Vec::with_capacity(args.len());
