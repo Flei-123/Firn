@@ -42,6 +42,13 @@ pub enum A64 {
     Direct(u32),
     /// `AT_FDCWD` in front of the arguments, then this number
     AtFdcwd(u32),
+    /// `AT_FDCWD` in front AND a zero flag word behind, then this number.
+    /// `unlink(path)` -> `unlinkat(AT_FDCWD, path, 0)`: the generic table
+    /// kept only the `at` form, and that one carries a flag word the old
+    /// call did not have. `AtFdcwd` alone would leave that register
+    /// holding whatever was in it, and `unlinkat` refuses anything but 0
+    /// or AT_REMOVEDIR -- so the zero is written here, explicitly.
+    AtFdcwdZero(u32),
     /// `fork()` -> `clone(SIGCHLD, 0, 0, 0, 0)`. The generic table has no
     /// `fork`; the call it is a special case of is there, and `SIGCHLD` as
     /// the flag word is exactly what makes it one.
@@ -120,10 +127,35 @@ const TABLE: &[(i64, A64)] = &[
     (62, A64::Direct(129)),          // kill
     (63, A64::Direct(160)),          // uname
     (79, A64::Direct(17)),           // getcwd
+    // Round ABSCHLUSS (Certus): the same shape as `open` two lines up --
+    // the generic table has no `mkdir`, only `mkdirat`, and AT_FDCWD in
+    // front of the path makes it mean the same. Without this line every
+    // program that links lib/pdf/down.fi (the download folder) was
+    // untranslatable for the phone, and that is the whole browser.
+    (83, A64::AtFdcwd(34)),          // mkdir     -> mkdirat
+    // Round APK-55 (Certus): lib/drive/chan.fi removes a stale socket node
+    // before it binds (SYS_UNLINK = 87). Without this line the whole
+    // browser was untranslatable for the phone -- the same shape as
+    // `open` and `mkdir` above, only with the flag word behind.
+    (87, A64::AtFdcwdZero(35)),      // unlink    -> unlinkat(.., 0)
+    (90, A64::AtFdcwd(53)),          // chmod     -> fchmodat
+    (95, A64::Direct(166)),          // umask
     (96, A64::Direct(169)),          // gettimeofday
+    // Uebernommen aus 7a51a06d: lib/js/interp.fi fragt seit der Runde
+    // STAPEL den WIRKLICHEN Stapel ab (getrlimit(RLIMIT_STACK)) statt
+    // 6 MiB zu raten. Ohne diese Zeile ist derselbe Quelltext fuer das
+    // Telefon nicht uebersetzbar -- und Justin faehrt Android.
+    (97, A64::Direct(163)),          // getrlimit
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
+    // Round APK-55: the runtime installs its own signal stack before it
+    // arms the fault handler (a stack overflow cannot be reported on the
+    // stack that overflowed). Same arguments, different number.
+    (131, A64::Direct(132)),         // sigaltstack
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
+    // Round APK-55, the other half of getrlimit: whoever asks for the
+    // stack limit also sets it (lib/js/interp.fi, deep recursion).
+    (160, A64::Direct(164)),         // setrlimit
     (186, A64::Direct(178)),         // gettid
     (200, A64::Direct(131)),         // tgkill
     (202, A64::Direct(98)),          // futex
@@ -133,6 +165,7 @@ const TABLE: &[(i64, A64)] = &[
     (257, A64::Direct(56)),          // openat
     (262, A64::Direct(79)),          // newfstatat
     (288, A64::Direct(242)),         // accept4
+    (302, A64::Direct(261)),         // prlimit64
     (318, A64::Direct(278)),         // getrandom
 ];
 

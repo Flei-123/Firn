@@ -1321,6 +1321,37 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
     let (number, at_fdcwd) = match form {
         syscalls::A64::Direct(n) => (n, false),
         syscalls::A64::AtFdcwd(n) => (n, true),
+        syscalls::A64::AtFdcwdZero(n) => {
+            // unlink(path) -> unlinkat(AT_FDCWD, path, 0). One register in
+            // front AND one behind; the flag word is written, not assumed.
+            // The library writes the unused argument registers as
+            // constant zeroes (same as fork and dup2 above); they have to
+            // BE zero, otherwise something is really being passed.
+            if given.is_empty() {
+                return Err(format!(
+                    "aarch64: system call {} becomes unlinkat and needs the path",
+                    nr
+                ));
+            }
+            for (k, a) in given.iter().enumerate().skip(1) {
+                if !matches!(fr.consts.get(a), Some(0)) {
+                    return Err(format!(
+                        "aarch64: system call {} becomes unlinkat(AT_FDCWD, path, 0); argument {} is not the padding zero",
+                        nr,
+                        k + 1
+                    ));
+                }
+            }
+            load_full(e, fr, "x1", given[0]);
+            imm_into(e, "x0", syscalls::AT_FDCWD);
+            e.line("mov x2, xzr");
+            imm_into(e, "x8", n as i64);
+            e.line("svc #0");
+            if let Some(d) = i.dst {
+                store_dst(e, fr, d, "x0");
+            }
+            return Ok(());
+        }
         syscalls::A64::ForkClone(n) => {
             // fork() -> clone(SIGCHLD, 0, 0, 0, 0). The arguments the
             // library writes are the padding zeroes; they have to BE zero.
