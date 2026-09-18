@@ -499,6 +499,12 @@ const POOL: [&str; 12] = [
 /// own state, and a method would borrow the emitter twice.
 pub(crate) struct XmmCache {
     val: [Option<Val>; 12],
+    /// ROUND XMM2: Breite des Eintrags in Oktett -- 4 (`f32`), 8 (`f64`)
+    /// oder 16 (`v128`). Vorher konnte der Zwischenspeicher nur Vektoren und
+    /// hat alles mit `movdqa` bewegt; mit der Breite je Eintrag halten auch
+    /// SKALARE Fliesskommawerte ihr Register, und genau die kommen in jeder
+    /// Rechnung vor.
+    wid: [u8; 12],
     /// Where the entry belongs when it is written back. For an ordinary
     /// value that is its frame slot, for a promoted cell the storage of its
     /// `alloca` — two different tables, so the offset travels with the entry.
@@ -545,6 +551,7 @@ impl Default for XmmCache {
     fn default() -> Self {
         XmmCache {
             val: [None; 12],
+            wid: [16; 12],
             off: [0; 12],
             dirty: [false; 12],
             used: [0; 12],
@@ -704,6 +711,52 @@ fn at(off: u64) -> String {
     format!("xmmword ptr [rbp-{}]", off)
 }
 
+/// Die Bewegungsanweisung zur Breite eines Eintrags.
+fn mvr(w: u8) -> &'static str {
+    match w {
+        4 => "movss",
+        8 => "movsd",
+        _ => "movdqa",
+    }
+}
+
+/// Der Speicheroperand zur Breite eines Eintrags.
+fn at_w(off: u64, w: u8) -> String {
+    let p = match w {
+        4 => "dword",
+        8 => "qword",
+        _ => "xmmword",
+    };
+    format!("{} ptr [rbp-{}]", p, off)
+}
+
+/// ROUND XMM2 -- WER AUSSERHALB DIESES ZWISCHENSPEICHERS EINEN PLATZ LIEST,
+/// muss den gueltigen Inhalt vorfinden. Jeder Leseweg ueber ein
+/// GANZZAHLregister (`load_full`) ruft das hier zuerst: steht der Platz noch
+/// schmutzig in einem `xmm`, wird er geschrieben. Der Eintrag bleibt gueltig,
+/// nur eben nicht mehr schmutzig.
+pub(crate) fn xsync_off(e: &mut Emitter, off: u64) {
+    for k in 0..POOL.len() {
+        if e.xmm.val[k].is_some() && e.xmm.dirty[k] && e.xmm.off[k] == off {
+            let w = e.xmm.wid[k];
+            e.line(&format!("{} {}, {}", mvr(w), at_w(off, w), POOL[k]));
+            e.xmm.dirty[k] = false;
+        }
+    }
+}
+
+/// Das Gegenstueck: wer einen Platz UNMITTELBAR beschreibt (Ganzzahlweg,
+/// `store_dst`), macht den Zwischenspeicher-Eintrag ungueltig -- sonst
+/// liest die naechste Rechnung einen ueberholten Wert.
+pub(crate) fn xkill_off(e: &mut Emitter, off: u64) {
+    for k in 0..POOL.len() {
+        if e.xmm.val[k].is_some() && e.xmm.off[k] == off {
+            e.xmm.val[k] = None;
+            e.xmm.dirty[k] = false;
+        }
+    }
+}
+
 /// Write every dirty register back into its home slot and forget everything.
 /// Called at the end of every basic block and in front of every `call`,
 /// `syscall`, `asm` and thread instruction.
@@ -711,8 +764,9 @@ pub(crate) fn xflush(e: &mut Emitter, fr: &Frame) {
     let _ = fr;
     for k in 0..POOL.len() {
         if e.xmm.val[k].is_some() && e.xmm.dirty[k] {
-            let home = at(e.xmm.off[k]);
-            e.line(&format!("movdqa {}, {}", home, POOL[k]));
+            let w = e.xmm.wid[k];
+            let home = at_w(e.xmm.off[k], w);
+            e.line(&format!("{} {}, {}", mvr(w), home, POOL[k]));
         }
         e.xmm.val[k] = None;
         e.xmm.dirty[k] = false;
@@ -748,8 +802,9 @@ fn xpick(e: &mut Emitter, fr: &Frame) -> usize {
     // holds twelve. The fallback keeps the generator total all the same.
     let k = if best == usize::MAX { 0 } else { best };
     if e.xmm.val[k].is_some() && e.xmm.dirty[k] {
-        let home = at(e.xmm.off[k]);
-        e.line(&format!("movdqa {}, {}", home, POOL[k]));
+        let w = e.xmm.wid[k];
+        let home = at_w(e.xmm.off[k], w);
+        e.line(&format!("{} {}, {}", mvr(w), home, POOL[k]));
     }
     e.xmm.val[k] = None;
     e.xmm.dirty[k] = false;
@@ -779,18 +834,23 @@ pub(crate) fn xdef_cell(e: &mut Emitter, fr: &Frame, c: Val, off: u64) -> &'stat
 }
 
 fn xget_at(e: &mut Emitter, fr: &Frame, v: Val, off: u64) -> &'static str {
+    xget_at_w(e, fr, v, off, 16)
+}
+
+fn xget_at_w(e: &mut Emitter, fr: &Frame, v: Val, off: u64, w: u8) -> &'static str {
     if e.xmm.on {
         for k in 0..POOL.len() {
-            if e.xmm.val[k] == Some(v) {
+            if e.xmm.val[k] == Some(v) && e.xmm.wid[k] == w {
                 xtouch(e, k);
                 return POOL[k];
             }
         }
         let k = xpick(e, fr);
-        let home = at(off);
-        e.line(&format!("movdqa {}, {}", POOL[k], home));
+        let home = at_w(off, w);
+        e.line(&format!("{} {}, {}", mvr(w), POOL[k], home));
         e.xmm.val[k] = Some(v);
         e.xmm.off[k] = off;
+        e.xmm.wid[k] = w;
         e.xmm.dirty[k] = false;
         xtouch(e, k);
         return POOL[k];
@@ -800,8 +860,8 @@ fn xget_at(e: &mut Emitter, fr: &Frame, v: Val, off: u64) -> &'static str {
     let k = (e.xmm.tick % 3) as usize;
     e.xmm.tick += 1;
     let r = ["xmm1", "xmm2", "xmm3"][k];
-    let home = at(off);
-    e.line(&format!("movdqa {}, {}", r, home));
+    let home = at_w(off, w);
+    e.line(&format!("{} {}, {}", mvr(w), r, home));
     r
 }
 
@@ -814,6 +874,10 @@ fn xdef(e: &mut Emitter, fr: &Frame, d: Val) -> &'static str {
 }
 
 fn xdef_at(e: &mut Emitter, fr: &Frame, d: Val, off: u64) -> &'static str {
+    xdef_at_w(e, fr, d, off, 16)
+}
+
+fn xdef_at_w(e: &mut Emitter, fr: &Frame, d: Val, off: u64, w: u8) -> &'static str {
     if e.xmm.on {
         for k in 0..POOL.len() {
             if e.xmm.val[k] == Some(d) {
@@ -824,11 +888,48 @@ fn xdef_at(e: &mut Emitter, fr: &Frame, d: Val, off: u64) -> &'static str {
         let k = xpick(e, fr);
         e.xmm.val[k] = Some(d);
         e.xmm.off[k] = off;
+        e.xmm.wid[k] = w;
         e.xmm.dirty[k] = true;
         xtouch(e, k);
         return POOL[k];
     }
     "xmm0"
+}
+
+// ---------------------------------------------------------- Fliesskomma ---
+//
+// ROUND XMM2: dieselbe Buchfuehrung fuer `f32`/`f64`. Ein Wert, der in
+// derselben Grundblockfolge mehrfach gelesen wird, bleibt im Register --
+// vorher lief JEDE Rechnung ueber den Rahmenplatz.
+
+pub(crate) fn xget_fp(e: &mut Emitter, fr: &Frame, v: Val, single: bool) -> &'static str {
+    let off = fr.slot[v as usize];
+    xget_at_w(e, fr, v, off, if single { 4 } else { 8 })
+}
+
+pub(crate) fn xdef_fp(e: &mut Emitter, fr: &Frame, d: Val, single: bool) -> &'static str {
+    let off = fr.slot[d as usize];
+    xdef_at_w(e, fr, d, off, if single { 4 } else { 8 })
+}
+
+/// Bei abgeschaltetem Zwischenspeicher muss das Ergebnis sofort in den Platz.
+pub(crate) fn xstore_fp(e: &mut Emitter, fr: &Frame, d: Val, r: &str, single: bool) {
+    if !e.xmm.on {
+        let w = if single { 4u8 } else { 8u8 };
+        let home = at_w(fr.slot[d as usize], w);
+        e.line(&format!("{} {}, {}", mvr(w), home, r));
+    }
+}
+
+/// Register-zu-Register-Kopie eines Fliesskommawerts.
+pub(crate) fn xmove(e: &mut Emitter, to: &str, from: &str) {
+    if to != from {
+        e.line(&format!("movaps {}, {}", to, from));
+    }
+}
+
+pub(crate) fn xunlock_pub(e: &mut Emitter) {
+    xunlock(e)
 }
 
 /// The counterpart of `xdef` for the switched off cache.

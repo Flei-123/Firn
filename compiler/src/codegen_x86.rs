@@ -642,12 +642,17 @@ fn emit_block(
 
 /// Loads the complete 8-byte slot of a value into a register.
 pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
+    // ROUND XMM2: der Wert kann schmutzig in einem `xmm` stehen (der
+    // Zwischenspeicher haelt jetzt auch Skalare). Wer ihn ueber ein
+    // GANZZAHLregister liest, braucht den Platz auf dem neuesten Stand.
+    crate::simd::xsync_off(e, fr.slot[v as usize]);
     e.line(&format!("mov {}, qword ptr [rbp-{}]", r, fr.slot[v as usize]));
 }
 
 /// Loads a value sign/zero extended to `to_bits` (32 or 64).
 pub(crate) fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32) {
     let off = fr.slot[v as usize];
+    crate::simd::xsync_off(e, off);
     let bits = ty.bits().max(8);
     if bits >= to_bits {
         // Already at least that wide: the lower `to_bits` bits suffice.
@@ -667,6 +672,9 @@ pub(crate) fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to
 
 /// Writes rax (full) into the slot of the target value.
 pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
+    // ROUND XMM2: der Platz bekommt einen neuen Inhalt -- ein
+    // Zwischenspeicher-Eintrag darauf ist ab jetzt falsch.
+    crate::simd::xkill_off(e, fr.slot[d as usize]);
     e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[d as usize], r));
 }
 
@@ -675,15 +683,12 @@ pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
 /// pattern, `movq` brings all 8 of them over. For an `f32` only the lower 4
 /// count, and those are exactly the ones the SSE instructions read.
 fn load_xmm(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
-    if single {
-        // 32 bits: `movd` zeroes the rest of the register, so what is
-        // standing there is exactly the bit pattern and nothing else.
-        e.line(&format!("mov eax, dword ptr [rbp-{}]", fr.slot[v as usize]));
-        e.line(&format!("movd {}, eax", x));
-        return;
-    }
-    load_full(e, fr, "rax", v);
-    e.line(&format!("movq {}, rax", x));
+    // ROUND XMM1/XMM2: der Wert kommt aus dem Zwischenspeicher, wenn er dort
+    // schon liegt -- sonst UNMITTELBAR aus dem Rahmenplatz. Bis Runde XMM1
+    // lief jeder Fliesskommawert ueber `rax` als Faehre: zwei Anweisungen
+    // statt einer, bei JEDEM Operanden JEDER Rechnung.
+    let r = crate::simd::xget_fp(e, fr, v, single);
+    crate::simd::xmove(e, x, r);
 }
 
 /// The way back: xmm register -> `rax` -> frame slot of `d`. For `f32`
@@ -691,12 +696,18 @@ fn load_xmm(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
 /// slot holds a DEFINED value and not the leftovers of an earlier
 /// instruction.
 fn store_xmm(e: &mut Emitter, fr: &Frame, d: Val, x: &str, single: bool) {
+    crate::simd::xkill_off(e, fr.slot[d as usize]);
+    // ROUND XMM1: ebenfalls direkt. Fuer `f32` werden nur vier Oktett
+    // geschrieben -- die oberen vier des acht Oktett breiten Platzes bleiben
+    // stehen. Das ist zulaessig, weil ein `f32`-Platz AUSSCHLIESSLICH als
+    // `dword` gelesen wird (`load_xmm` mit `single`, `cvtss2sd`, die
+    // Argumentuebergabe); wer acht Oktett kopiert, kopiert die oberen mit,
+    // ohne sie je zu deuten.
     if single {
-        e.line(&format!("movd eax, {}", x));
+        e.line(&format!("movss dword ptr [rbp-{}], {}", fr.slot[d as usize], x));
     } else {
-        e.line(&format!("movq rax, {}", x));
+        e.line(&format!("movsd qword ptr [rbp-{}], {}", fr.slot[d as usize], x));
     }
-    store_dst(e, fr, d, "rax");
 }
 
 /// **ROUND 71** — WHERE does argument number `k` sit?
@@ -1047,6 +1058,24 @@ fn emit_inst(
                 return Ok(());
             }
             load_full(e, fr, "rcx", *addr);
+            // ROUND XMM2: ein Fliesskommawert geht UNMITTELBAR in ein
+            // `xmm`-Register des Zwischenspeichers. Vorher lief er ueber
+            // `eax` und den Rahmenplatz -- drei Anweisungen und ein
+            // Speicherhin-und-her fuer jedes geladene Wort. Das ist der Weg,
+            // den ein Dekoder oder ein Rasterer millionenfach geht.
+            if ty.is_float() {
+                let single = ty == FTy::F32;
+                crate::simd::xunlock_pub(e);
+                let rd = crate::simd::xdef_fp(e, fr, d, single);
+                e.line(&format!(
+                    "{} {}, {} ptr [rcx]",
+                    if single { "movss" } else { "movsd" },
+                    rd,
+                    if single { "dword" } else { "qword" }
+                ));
+                crate::simd::xstore_fp(e, fr, d, rd, single);
+                return Ok(());
+            }
             let bits = ty.bits().max(8);
             match bits {
                 8 => e.line("movzx eax, byte ptr [rcx]"),
@@ -1063,6 +1092,25 @@ fn emit_inst(
                     return Ok(());
                 }
                 crate::simd::emit_ptr_store(e, fr, *addr, *val);
+                return Ok(());
+            }
+            // ROUND XMM2: Gegenstueck zum Laden -- der Wert steht (oder
+            // landet) in einem `xmm` und geht von dort unmittelbar in den
+            // Speicher. Ein Schreiben durch einen Zeiger kann keinen
+            // Zwischenspeicher-Eintrag treffen: der haelt nur Plaetze von
+            // FIR-WERTEN, und deren Adresse gibt es im Programm nicht
+            // (Adressen gibt es nur von `alloca`-Speicher).
+            if ty.is_float() {
+                let single = ty == FTy::F32;
+                crate::simd::xunlock_pub(e);
+                let rv = crate::simd::xget_fp(e, fr, *val, single);
+                load_full(e, fr, "rcx", *addr);
+                e.line(&format!(
+                    "{} {} ptr [rcx], {}",
+                    if single { "movss" } else { "movsd" },
+                    if single { "dword" } else { "qword" },
+                    rv
+                ));
                 return Ok(());
             }
             load_full(e, fr, "rcx", *addr);
@@ -1377,11 +1425,19 @@ fn emit_bin(
                 ))
             }
         };
+        // ROUND XMM2: beide Operanden und das Ergebnis liegen in Registern
+        // des Zwischenspeichers. `xdef_fp` kann keines der beiden
+        // Operandenregister waehlen -- die sind fuer diese Anweisung
+        // gesperrt (`xtouch` setzt die Sperre) -- also ist die Kopie
+        // `rd <- ra` immer sicher.
         let single = ty == FTy::F32;
-        load_xmm(e, fr, "xmm0", a, single);
-        load_xmm(e, fr, "xmm1", b, single);
-        e.line(&format!("{} xmm0, xmm1", m));
-        store_xmm(e, fr, d, "xmm0", single);
+        crate::simd::xunlock_pub(e);
+        let ra = crate::simd::xget_fp(e, fr, a, single);
+        let rb = crate::simd::xget_fp(e, fr, b, single);
+        let rd = crate::simd::xdef_fp(e, fr, d, single);
+        crate::simd::xmove(e, rd, ra);
+        e.line(&format!("{} {}, {}", m, rd, rb));
+        crate::simd::xstore_fp(e, fr, d, rd, single);
         return Ok(());
     }
     match op {
