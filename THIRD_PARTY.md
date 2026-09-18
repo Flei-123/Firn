@@ -8,9 +8,18 @@ of the rest of this repository.
 | `tools/ucd/UnicodeData.txt`, `tools/ucd/DerivedCoreProperties.txt` | Unicode Character Database 17.0.0, unicode.org | Unicode Licence v3 (permissive, attribution) |
 | `tests/data/fonts/Ahem.ttf` | CSS working group test font, via web-platform-tests | Public domain (Todd Fahrner, 1995); WPT itself BSD-3-Clause |
 | `tests/data/fonts/FirnSans.ttf`, `tools/layout/FirnMetric.ttf` | Subsets of DejaVu Sans, made here with fontTools | DejaVu / Bitstream Vera licence (permissive, attribution) |
+| `lib/ton/mp3_tab.fi` (generated), structure of `lib/ton/mp3.fi` | **minimp3** by lieff, https://github.com/lieff/minimp3 | **CC0-1.0** (public domain dedication) |
+| `testdata/ton/*.mp3` | encoded here with ffmpeg from synthetic signals (sine, noise, impulses) | no rights of third parties |
 
 Provenance, versions and checksums are documented in `tools/ucd/SOURCE.md`
 and `tests/data/fonts/PROVENANCE.md`.
 
 No third party *source code* is vendored in this repository. The compiler,
 the standard library and the code generator were written from scratch.
+
+The one place that follows an outside implementation is the MP3 decoder in
+`lib/ton/`: its tables are GENERATED from minimp3 (CC0-1.0, i.e. dedicated
+to the public domain) by `tools/mp3_tabellen.py`, and the decoding steps
+follow the same structure. CC0 carries no conditions -- attribution is given
+here because it is honest, not because it is required. The Firn code itself
+is MPL-2.0 like the rest of the repository. See `docs/TON1.md`.
