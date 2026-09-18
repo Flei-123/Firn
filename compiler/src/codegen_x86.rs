@@ -203,9 +203,30 @@ impl Emitter {
         self.here = crate::fir::Loc::NONE;
     }
     pub(crate) fn line(&mut self, s: &str) {
+        // ROUND XMM2 -- DIE REGEL, DIE DEN ZWISCHENSPEICHER SICHER MACHT.
+        //
+        // Seit er auch Skalare haelt, ueberlebt ein Wert mehrere
+        // Anweisungen in einem `xmm`-Register. Das ist nur so lange
+        // richtig, wie der Weg dorthin GERADE ist. Der Erzeuger setzt aber
+        // mitten in einen Grundblock Spruenge und Marken (saettigende
+        // Arithmetik, Division durch eine Konstante, die Sonderfaelle der
+        // Umwandlung, die geprueften Rechnungen): hinter einer Marke kann
+        // der Zustand von zwei Wegen kommen, und dann darf nichts geglaubt
+        // werden.
+        //
+        // Deshalb: VOR jedem Sprung alles Schmutzige in seinen Platz, HINTER
+        // jeder Marke alles vergessen. Das kostet in geradem Code nichts --
+        // dort steht kein Sprung -- und macht die Buchfuehrung unabhaengig
+        // davon, welche Stelle im Erzeuger als naechstes eine Marke setzt.
+        if is_jump(s) || is_call(s) {
+            crate::simd::xflush_free(self);
+        }
         let _ = writeln!(self.out, "    {}", s);
     }
     pub(crate) fn raw(&mut self, s: &str) {
+        if s.starts_with(".L") && s.ends_with(':') {
+            crate::simd::xclear(self);
+        }
         let _ = writeln!(self.out, "{}", s);
     }
     /// ROUND 90 — one instruction of the COLD half (see the field).
@@ -638,6 +659,23 @@ fn emit_block(
         }
     }
     Ok(())
+}
+
+/// Ist diese Anweisung ein AUFRUF? Auf System V sind alle sechzehn
+/// `xmm`-Register caller-saved: hinter einem `call`/`syscall` haelt keines
+/// mehr seinen Wert. Der Erzeuger spuelt zwar vor einem Aufruf aus, laedt
+/// danach aber die ARGUMENTE -- und legt damit neue Eintraege an, die der
+/// Aufruf gleich darauf zerstoert. Genau dieser Fall war der Fehler der
+/// Runde (tests/1002_js_interp.fi, `toFixed`): nach `call math__fmod`
+/// stand `movaps xmm0, xmm4` mit einem laengst ueberschriebenen xmm4.
+fn is_call(s: &str) -> bool {
+    s.starts_with("call") || s.starts_with("syscall")
+}
+
+/// Ist diese Anweisung ein Sprung? (Siehe `Emitter::line`.)
+fn is_jump(s: &str) -> bool {
+    let mn = s.split(|c: char| c == ' ' || c == '\t').next().unwrap_or("");
+    mn.len() >= 2 && mn.starts_with('j') && mn.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 /// Loads the complete 8-byte slot of a value into a register.
@@ -1430,6 +1468,10 @@ fn emit_bin(
         // Operandenregister waehlen -- die sind fuer diese Anweisung
         // gesperrt (`xtouch` setzt die Sperre) -- also ist die Kopie
         // `rd <- ra` immer sicher.
+        // ROUND XMM2: beide Operanden und das Ergebnis liegen in Registern
+        // des Zwischenspeichers. `xdef_fp` kann keines der beiden
+        // Operandenregister waehlen -- die sind fuer diese Anweisung
+        // gesperrt -- also ist die Kopie `rd <- ra` immer sicher.
         let single = ty == FTy::F32;
         crate::simd::xunlock_pub(e);
         let ra = crate::simd::xget_fp(e, fr, a, single);

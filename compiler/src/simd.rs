@@ -513,6 +513,9 @@ pub(crate) struct XmmCache {
     used: [u64; 12],
     /// locked for the instruction currently being emitted
     lock: [bool; 12],
+    /// ROUND XMM2: laeuft gerade ein Ausspuelen? (Schutz gegen Rekursion,
+    /// weil `Emitter::line` das Ausspuelen selbst ausloest.)
+    flushing: bool,
     tick: u64,
     pub(crate) on: bool,
     /// **The retirement plan** (per function, built by `xplan`).
@@ -556,6 +559,7 @@ impl Default for XmmCache {
             dirty: [false; 12],
             used: [0; 12],
             lock: [false; 12],
+            flushing: false,
             tick: 0,
             on: std::env::var_os("FIRN_NO_XMM_CACHE").is_none(),
             home: Vec::new(),
@@ -760,6 +764,26 @@ pub(crate) fn xkill_off(e: &mut Emitter, off: u64) {
 /// Write every dirty register back into its home slot and forget everything.
 /// Called at the end of every basic block and in front of every `call`,
 /// `syscall`, `asm` and thread instruction.
+/// ROUND XMM2: Ausspuelen OHNE Rahmen -- fuer den Aufruf aus `Emitter::line`
+/// heraus, wo kein `Frame` zur Hand ist. `xflush` braucht ihn ohnehin nicht.
+pub(crate) fn xflush_free(e: &mut Emitter) {
+    if e.xmm.flushing {
+        return;
+    }
+    e.xmm.flushing = true;
+    for k in 0..POOL.len() {
+        if e.xmm.val[k].is_some() && e.xmm.dirty[k] {
+            let w = e.xmm.wid[k];
+            let home = at_w(e.xmm.off[k], w);
+            e.line(&format!("{} {}, {}", mvr(w), home, POOL[k]));
+        }
+        e.xmm.val[k] = None;
+        e.xmm.dirty[k] = false;
+        e.xmm.lock[k] = false;
+    }
+    e.xmm.flushing = false;
+}
+
 pub(crate) fn xflush(e: &mut Emitter, fr: &Frame) {
     let _ = fr;
     for k in 0..POOL.len() {
