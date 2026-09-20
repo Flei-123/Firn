@@ -36,9 +36,46 @@
 //    Rechteck geprueft. `tf_hit_test` ist die Fassung von
 //    `control.hit_test` fuer eine Flaeche unter Transformation; die
 //    gerade Fassung in control.fi bleibt, was sie ist.
+// 4. TEXT wird als PFAD gedreht. Die Glyphe geht Kontur fuer Kontur
+//    durch dieselbe Matrix wie jede andere Form -- `ttf.outline_at`
+//    nimmt die 2x3-Matrix seit der Runde BILD+SVG, und das ist genau
+//    der Weg, den lib/svg/paint.fi fuer `<text transform=...>` schon
+//    geht. Ein gedrehter Ausschnitt aus einem fertigen Textbild waere
+//    zweimal gerastert und sichtbar weich.
+//
+// ==================================== WAS HIER BEWUSST NICHT STEHT
+//
+// EINE ZWEITE TREFFERPRUEFUNG IN control.fi. Die Frage stand an:
+// bekommt `control.fi` eine Fassung, die eine Matrix nimmt? NEIN --
+// und zwar aus dem Grund, der diese Datei ueberhaupt traegt: ein
+// Punkt, der EINMAL zurueckgeholt wird, laeuft danach durch die
+// vorhandene Suche. `tf_hit_test` tut genau das und ruft
+// `control.hit_test` UNVERAENDERT auf. Eine Matrixfassung in
+// control.fi wuerde lib/svg in die Abhaengigkeiten von control.fi
+// ziehen und die Suche ein zweites Mal hinschreiben. Wer Maus-
+// EREIGNISSE unter einer Abbildung braucht, reicht den
+// zurueckgeholten Punkt weiter:
+//
+//     control.mouse_move(&pn, tf_local_x(&xf, mx, my),
+//                             tf_local_y(&xf, mx, my))
+//
+// Dafuer stehen `tf_local_x`/`tf_local_y` hier (dieselbe Rechnung wie
+// `xf_inv_x`/`xf_inv_y`, unter dem Namen, unter dem ein Aufrufer sie
+// sucht).
+//
+// EINE ZWEITE BILINEARE ABTASTUNG. `uiimage.fi` hat eine, aber sie ist
+// dort DATEILOKAL und nicht ausgefuehrt; uiimage.fi gehoert einer
+// anderen Runde und wird hier nicht angefasst. Die Fassung unten ist
+// darum die EINZIGE, die von aussen aufrufbar ist
+// (`tf_sample_bilinear`), und sie rechnet mit ALPHA GEWICHTET -- ohne
+// das bekommt der Rand eines Bildes mit Transparenz einen grauen
+// Saum, weil eine unsichtbare schwarze Nachbarstelle mitgemittelt
+// wird.
 import std.rt
 import paint.canvas
 import font.raster
+import font.ttf
+import font.metrics
 import svg.matrix
 import fui.painter
 import fui.widget
@@ -54,8 +91,10 @@ export {
     XF_MAX,
     // Zeichnen
     tf_fill_round_rect, tf_fill_quad, tf_draw_image, tf_text,
+    tf_sample_bilinear,
     // Treffer
     tf_hit_rect, tf_hit_widget, tf_hit_test,
+    tf_local_x, tf_local_y,
 }
 
 // Wie tief der Stapel geht. Fest, weil fUi ohne Allokator laufen
@@ -384,6 +423,22 @@ fn tf_draw_image(z: *mut painter.Painter, xf: *mut Xform,
     if py0 < 0 { py0 = 0 }
     let bw: f64 = uiimage.image_w(b) as f64
     let bh: f64 = uiimage.image_h(b) as f64
+    // WIE BREIT IST DIE KANTE IN ZIELPIXELN. Die Koordinate `u` des
+    // Bildes ist ueber der Leinwand ein lineares Feld; sein Gefaelle
+    // steht in der ERSTEN ZEILE der Kehrmatrix, das von `v` in der
+    // zweiten. Der Kehrwert des Betrags ist die Strecke in Zielpixeln,
+    // die eine Einheit im Bild braucht -- und damit genau die Breite,
+    // ueber die die Deckung von 0 auf 1 laufen muss. Ohne diese
+    // Rechnung ist die Kante ein harter Vergleich und das gedrehte
+    // Bild hat die Treppen, wegen derer die Datei ueberhaupt
+    // rueckwaerts abbildet.
+    let gx: f64 = matrix.m_sqrt(matrix.mat_hole(inv, 0) * matrix.mat_hole(inv, 0)
+        + matrix.mat_hole(inv, 2) * matrix.mat_hole(inv, 2))
+    let gy: f64 = matrix.m_sqrt(matrix.mat_hole(inv, 1) * matrix.mat_hole(inv, 1)
+        + matrix.mat_hole(inv, 3) * matrix.mat_hole(inv, 3))
+    if gx <= 0.0 || gy <= 0.0 {
+        return
+    }
     var py: i64 = py0
     while py < py1 && py < ch {
         var px: i64 = px0
@@ -391,12 +446,22 @@ fn tf_draw_image(z: *mut painter.Painter, xf: *mut Xform,
             // Die Mitte des Zielpixels zurueckholen.
             let sx: f64 = matrix.mat_x(inv, (px as f64) + 0.5, (py as f64) + 0.5)
             let sy: f64 = matrix.mat_y(inv, (px as f64) + 0.5, (py as f64) + 0.5)
-            if sx >= x && sx < x + w && sy >= y && sy < y + h {
-                // in Bildkoordinaten
+            // Der kleinste Abstand zu den vier Kanten, in ZIELPIXELN.
+            var d: f64 = (sx - x) / gx
+            d = kleiner(d, (x + w - sx) / gx)
+            d = kleiner(d, (sy - y) / gy)
+            d = kleiner(d, (y + h - sy) / gy)
+            var deckung: f64 = d + 0.5
+            if deckung > 1.0 { deckung = 1.0 }
+            if deckung > 0.0 {
+                // in Bildkoordinaten; `tf_sample_bilinear` setzt den
+                // Rand fort, darum darf die Stelle knapp draussen
+                // liegen (das ist die halbe Pixelbreite der Kante).
                 let u: f64 = (sx - x) / w * bw - 0.5
                 let v: f64 = (sy - y) / h * bh - 0.5
-                let c: u32 = bilinear(b, u, v)
-                let a: f64 = (((c >> 24) & 255 as u32) as f64) / 255.0 * alpha
+                let c: u32 = tf_sample_bilinear(b, u, v)
+                let a: f64 = (((c >> 24) & 255 as u32) as f64) / 255.0 *
+                    alpha * deckung
                 if a > 0.0 {
                     canvas.canvas_blend(cv, px as usize, py as usize,
                         (255 as u32 << 24) | (c & 16777215 as u32), a)
@@ -408,36 +473,62 @@ fn tf_draw_image(z: *mut painter.Painter, xf: *mut Xform,
     }
 }
 
-// Bilineare Abtastung, Rand fortgesetzt. Ohne sie hat ein gedrehtes
-// Bild genau die Treppen, wegen derer die ganze Datei rueckwaerts
-// abbildet.
-fn bilinear(b: *mut uiimage.Image, u: f64, v: f64) -> u32 {
+// BILINEARE ABTASTUNG MIT ALPHA-GEWICHTUNG, Rand fortgesetzt.
+//
+// `u`/`v` zaehlen in PIXELMITTEN: (0,0) ist die Mitte des linken
+// oberen Bildpunktes. Die Farbe wird mit dem Alpha GEWICHTET gemittelt
+// und am Ende wieder herausdividiert; wer die vier Farben gerade
+// mittelt, zieht das Schwarz hinter einer unsichtbaren Nachbarstelle
+// mit hinein und bekommt den grauen Saum, den jedes Bild mit weichem
+// Rand dann zeigt.
+fn tf_sample_bilinear(b: *mut uiimage.Image, u: f64, v: f64) -> u32 {
     let iw: i64 = uiimage.image_w(b) as i64
     let ih: i64 = uiimage.image_h(b) as i64
+    if iw <= 0 || ih <= 0 {
+        return 0 as u32
+    }
     let u0: i64 = matrix.m_floor(u) as i64
     let v0: i64 = matrix.m_floor(v) as i64
     let fu: f64 = u - (u0 as f64)
     let fv: f64 = v - (v0 as f64)
-    let c00: u32 = hol(b, u0, v0, iw, ih)
-    let c10: u32 = hol(b, u0 + 1, v0, iw, ih)
-    let c01: u32 = hol(b, u0, v0 + 1, iw, ih)
-    let c11: u32 = hol(b, u0 + 1, v0 + 1, iw, ih)
-    var out: u32 = 0
-    var s: u32 = 0
-    while s < 32 {
-        let k00: f64 = ((c00 >> s) & 255 as u32) as f64
-        let k10: f64 = ((c10 >> s) & 255 as u32) as f64
-        let k01: f64 = ((c01 >> s) & 255 as u32) as f64
-        let k11: f64 = ((c11 >> s) & 255 as u32) as f64
-        let o: f64 = k00 * (1.0 - fu) * (1.0 - fv) + k10 * fu * (1.0 - fv) +
-            k01 * (1.0 - fu) * fv + k11 * fu * fv
-        var q: f64 = o + 0.5
-        if q < 0.0 { q = 0.0 }
-        if q > 255.0 { q = 255.0 }
-        out = out | (((q as i64) as u32) << s)
-        s = s + 8
+    var sa: f64 = 0.0
+    var sr: f64 = 0.0
+    var sg: f64 = 0.0
+    var sb: f64 = 0.0
+    var j: i64 = 0
+    while j < 2 {
+        var i: i64 = 0
+        while i < 2 {
+            var wx: f64 = fu
+            if i == 0 { wx = 1.0 - fu }
+            var wy: f64 = fv
+            if j == 0 { wy = 1.0 - fv }
+            let g: f64 = wx * wy
+            if g > 0.0 {
+                let c: u32 = hol(b, u0 + i, v0 + j, iw, ih)
+                let av: f64 = (((c >> 24) & 255 as u32) as f64) / 255.0
+                sa = sa + g * av
+                let wa: f64 = g * av
+                sr = sr + wa * (((c >> 16) & 255 as u32) as f64)
+                sg = sg + wa * (((c >> 8) & 255 as u32) as f64)
+                sb = sb + wa * ((c & 255 as u32) as f64)
+            }
+            i = i + 1
+        }
+        j = j + 1
     }
-    return out
+    if sa <= 0.0 {
+        return 0 as u32
+    }
+    return (auf255(sa * 255.0) << 24) | (auf255(sr / sa) << 16) |
+        (auf255(sg / sa) << 8) | auf255(sb / sa)
+}
+
+fn auf255(v: f64) -> u32 {
+    var t: f64 = v + 0.5
+    if t < 0.0 { t = 0.0 }
+    if t > 255.0 { t = 255.0 }
+    return (t as i64) as u32
 }
 
 fn hol(b: *mut uiimage.Image, x: i64, y: i64, w: i64, h: i64) -> u32 {
@@ -452,19 +543,153 @@ fn hol(b: *mut uiimage.Image, x: i64, y: i64, w: i64, h: i64) -> u32 {
 
 // ======================================================== TEXT ZEICHNEN
 //
-// Text unter einer reinen Verschiebung (und Skalierung der Schrift)
-// geht durch den normalen Weg: `painter.text` rastert die Glyphen in
-// der Zielgroesse NEU, und genau das will man -- ein skaliertes
-// Pixelbild von Text ist an jedem Bildschirm sofort als solches zu
-// erkennen. Fuer eine gedrehte Abbildung bleibt der Ankerpunkt
-// abgebildet und die Schriftgroesse folgt dem Laengenmass.
+// DIE GRUNDLINIE DREHT SICH MIT. Jede Glyphe geht als UMRISS durch
+// dieselbe Matrix wie jede andere Form: `ttf.outline_at` nimmt die
+// 2x3-Matrix (deswegen ist sie dort ausgefuehrt -- lib/svg/paint.fi
+// zeichnet `<text transform=...>` genauso), die Konturen werden in
+// Zielpixeln gerastert und EINMAL gefuellt. Ein fertiges Textbild
+// nachtraeglich zu drehen hiesse zweimal rastern, und das sieht man
+// sofort: weiche, ausgefranste Buchstaben.
+//
+// Gemessen wird wie beim geraden Text -- `painter.text_width` und
+// `painter.text_fits_upto`, damit die Ausrichtung und das Abschneiden
+// dieselben Zahlen benutzen wie ueberall sonst und nicht eine zweite
+// Meinung entsteht. Zurueck kommt das ENDE der Schrift in den
+// Koordinaten des Aufrufers (nicht auf dem Schirm), also das, was
+// `painter.text` in seinem System auch liefert.
+const TF_SCRATCH: usize = 65536
+
 fn tf_text(z: *mut painter.Painter, xf: *mut Xform, x: f64, base_y: f64,
     w: f64, size: f64, col: u32, p: u64, n: usize, align: u32) -> f64 {
+    if n == 0 || size <= 0.0 || w <= 0.0 {
+        return x
+    }
+    let fm: u64 = painter.painter_font(z)
+    if !metrics.fm_present(fm) {
+        return x
+    }
     let m: matrix.Mat = xf_mat(xf)
-    let ax: f64 = matrix.mat_x(m, x, base_y)
-    let ay: f64 = matrix.mat_y(m, x, base_y)
-    let s: f64 = matrix.mat_laengenmass(m)
-    return painter.text(z, ax, ay, w * s, size * s, col, p, n, align)
+    if matrix.mat_determinante(m) == 0.0 {
+        return x
+    }
+    // Wieviel passt, und wie breit ist es? Dieselbe Messung wie gerade.
+    let cnt: usize = painter.text_fits_upto(z, p, n, size, w)
+    if cnt == 0 {
+        return x
+    }
+    let br: f64 = painter.text_width(z, p, cnt, size)
+    var sx: f64 = x
+    if align == painter.TEXT_M {
+        sx = x + (w - br) / 2.0
+    }
+    if align == painter.TEXT_R {
+        sx = x + w - br
+    }
+    // Die Huellbox im System des Aufrufers: die Schrift steht von
+    // (Grundlinie - Oberlaenge) bis (Grundlinie + Unterlaenge). Ein
+    // Punkt Zugabe, weil der Umriss einer Glyphe ueber die Metrik
+    // hinausragen darf.
+    let asc: f64 = painter.font_ascent(z, size)
+    let dsc: f64 = painter.font_descent(z, size)
+    let lx0: f64 = sx - 1.0
+    let ly0: f64 = base_y - asc - 1.0
+    let lx1: f64 = sx + br + 1.0
+    let ly1: f64 = base_y + dsc + 1.0
+    let e0x: f64 = matrix.mat_x(m, lx0, ly0)
+    let e0y: f64 = matrix.mat_y(m, lx0, ly0)
+    let e1x: f64 = matrix.mat_x(m, lx1, ly0)
+    let e1y: f64 = matrix.mat_y(m, lx1, ly0)
+    let e2x: f64 = matrix.mat_x(m, lx1, ly1)
+    let e2y: f64 = matrix.mat_y(m, lx1, ly1)
+    let e3x: f64 = matrix.mat_x(m, lx0, ly1)
+    let e3y: f64 = matrix.mat_y(m, lx0, ly1)
+    var f: Fenster = fenster_auf(
+        kleiner(kleiner(e0x, e1x), kleiner(e2x, e3x)),
+        kleiner(kleiner(e0y, e1y), kleiner(e2y, e3y)),
+        groesser(groesser(e0x, e1x), groesser(e2x, e3x)),
+        groesser(groesser(e0y, e1y), groesser(e2y, e3y)))
+    if !f.ok {
+        return sx + br
+    }
+    let sc: *mut u8 = rt.heap_alloc(TF_SCRATCH) as *mut u8
+    if sc as usize == 0 {
+        fenster_zu(&f)
+        return sx + br
+    }
+    let fnt: *mut ttf.Font = metrics.fontset_font(fm)
+    let up: f64 = metrics.fm_upem(fm)
+    let gsc: f64 = size / up
+    // DIE MATRIX IM SCHRIFTSYSTEM. Die y-Achse einer Schrift zeigt
+    // NACH OBEN, die des Schirms nach unten; `ttf.devy` zieht das
+    // Ergebnis darum ab. Ein Punkt (px,py) der Glyphe steht also beim
+    // Aufrufer bei (gsc*px, -gsc*py) neben der Feder, und daraus wird
+    // mit dem linearen Teil (a,b,c,d) der Matrix:
+    //
+    //     Schirm-x = a*gsc*px - c*gsc*py   -> m00 = a, m10 = -c
+    //     Schirm-y = b*gsc*px - d*gsc*py   -> m01 = -b, m11 = d
+    //
+    // (m01/m11 mit umgedrehtem Vorzeichen, weil devy subtrahiert.)
+    let m00: f64 = matrix.mat_hole(m, 0)
+    let m01: f64 = 0.0 - matrix.mat_hole(m, 1)
+    let m10: f64 = 0.0 - matrix.mat_hole(m, 2)
+    let m11: f64 = matrix.mat_hole(m, 3)
+    var pen: f64 = sx
+    var i: usize = 0
+    while i < cnt {
+        var adv: usize = 1
+        let cp: u32 = utf8_bei(p, cnt, i, &adv)
+        let gid: u32 = ttf.font_glyph_for(fnt, cp)
+        let okg: bool = ttf.outline_at(fnt, gid, &f.ra,
+            matrix.mat_x(m, pen, base_y), matrix.mat_y(m, pen, base_y),
+            gsc, m00, m01, m10, m11, 0.0, 0.0, sc, TF_SCRATCH, 0)
+        var schritt: f64 = metrics.fm_advance(fm, size, cp)
+        let nx: usize = i + adv
+        if nx < cnt {
+            var adv2: usize = 1
+            let cp2: u32 = utf8_bei(p, cnt, nx, &adv2)
+            schritt = schritt + metrics.fm_kern(fm, size, cp, cp2)
+        }
+        pen = pen + schritt
+        i = i + adv
+    }
+    raster.raster_finish(&f.ra)
+    canvas.canvas_fill_raster(painter.painter_canvas(z), &f.ra,
+        f.ox as usize, f.oy as usize, col)
+    rt.heap_free(sc as u64, TF_SCRATCH)
+    fenster_zu(&f)
+    return sx + br
+}
+
+// EIN ZEICHEN AUS UTF-8. lib/fui/painter.fi hat denselben Dreisatz,
+// aber DATEILOKAL -- ausgefuehrt ist er dort nicht, und painter.fi
+// gehoert nicht dieser Datei. Mehr als die Laenge und den
+// Kodierungspunkt braucht der Glyphenlauf hier nicht.
+fn utf8_bei(p: u64, n: usize, i: usize, adv: *mut usize) -> u32 {
+    let c0: u32 = rt.ld8(p, i) as u32
+    if c0 < 128 as u32 {
+        *adv = 1
+        return c0
+    }
+    if c0 >= 240 as u32 && i + 3 < n {
+        *adv = 4
+        return ((c0 & 7 as u32) << 18)
+            | (((rt.ld8(p, i + 1) as u32) & 63 as u32) << 12)
+            | (((rt.ld8(p, i + 2) as u32) & 63 as u32) << 6)
+            | ((rt.ld8(p, i + 3) as u32) & 63 as u32)
+    }
+    if c0 >= 224 as u32 && i + 2 < n {
+        *adv = 3
+        return ((c0 & 15 as u32) << 12)
+            | (((rt.ld8(p, i + 1) as u32) & 63 as u32) << 6)
+            | ((rt.ld8(p, i + 2) as u32) & 63 as u32)
+    }
+    if c0 >= 192 as u32 && i + 1 < n {
+        *adv = 2
+        return ((c0 & 31 as u32) << 6)
+            | ((rt.ld8(p, i + 1) as u32) & 63 as u32)
+    }
+    *adv = 1
+    return c0
 }
 
 // ========================================================= DIE TREFFER
@@ -481,6 +706,18 @@ fn tf_hit_rect(xf: *mut Xform, x: f64, y: f64, w: f64, h: f64, mx: f64,
     let lx: f64 = matrix.mat_x(k, mx, my)
     let ly: f64 = matrix.mat_y(k, mx, my)
     return lx >= x && lx < x + w && ly >= y && ly < y + h
+}
+
+// DER MAUSPUNKT IM SYSTEM DES AUFRUFERS. Damit laeuft jedes vorhandene
+// Ereignis von control.fi unveraendert weiter -- siehe den Kopf dieser
+// Datei. Bei entarteter Matrix kommt der Punkt selbst zurueck; dort ist
+// ohnehin nichts zu sehen und `tf_hit_rect` sagt nein.
+fn tf_local_x(xf: *mut Xform, mx: f64, my: f64) -> f64 {
+    return xf_inv_x(xf, mx, my)
+}
+
+fn tf_local_y(xf: *mut Xform, mx: f64, my: f64) -> f64 {
+    return xf_inv_y(xf, mx, my)
 }
 
 fn tf_hit_widget(xf: *mut Xform, e: *mut widget.Widget, mx: f64,

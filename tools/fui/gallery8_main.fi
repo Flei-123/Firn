@@ -1,9 +1,22 @@
 // SPDX-License-Identifier: MPL-2.0
 // tools/fui/gallery8_main.fi -- DIE ABBILDUNG ALS BILD.
 //
-// Eine Abbildung zeigt sich an KANTEN: eine gedrehte Kachel, deren
-// Rand sauber laeuft, ist der Beleg dafuer, dass die Pfadpunkte durch
-// die Matrix gehen und nicht das fertige Pixelbild gedreht wird.
+// Eine Abbildung zeigt sich an KANTEN. Drei Sorten stehen hier
+// nebeneinander, und jede belegt etwas anderes:
+//
+//   1. GEDREHTE KACHELN MIT SCHRIFT. Rahmen, Flaeche und Text gehen
+//      durch dieselbe Matrix; die Glyphen werden als UMRISS gedreht
+//      und in der Zielgroesse gerastert. Waere hier ein fertiges
+//      Textbild gedreht, saehe man es an den ausgefransten Buchstaben
+//      sofort.
+//   2. SKALIERTE KACHELN. Die Schrift wird NEU gerastert und nicht
+//      vergroessert -- bei 1.5 sind die Striche gleich duenn wie bei
+//      0.65, nur groesser.
+//   3. EIN BILD, gedreht und vergroessert: rueckwaerts abgebildet und
+//      bilinear abgetastet, mit weicher Kante. Ein Gitter im Bild
+//      macht sichtbar, ob die Abtastung stimmt -- eine schiefe Linie
+//      mit Treppen faellt auf einem Gitter sofort auf.
+//   4. EINE SCHERUNG, wie CSS `skewX`.
 //
 //     gallery8_main <out.png> [light|dark] [<font.ttf>]
 import std.rt
@@ -11,18 +24,24 @@ import html.mem
 import paint.canvas
 import paint.png
 import font.metrics
+import svg.matrix
 import fui.theme
 import fui.style
 import fui.widget
 import fui.painter
 import fui.render
-import fui.layout
+import fui.uiimage
 import fui.transform
 
 const FONTSET_BYTES: usize = 4096
-const W: usize = 1240
-const H: usize = 570
+const W: usize = 1280
+const H: usize = 760
+// Die Kantenlaenge des gemalten Bildes. Klein genug, dass die
+// Vergroesserung rechts eine echte Vergroesserung ist.
+const BILD: usize = 64
 
+// Eine gerade Beschriftung -- sie erklaert, was darunter steht, und
+// geht darum den normalen Weg ueber render.draw_label.
 fn label(c: *mut render.Ctx, x: f64, y: f64, w: f64, px: usize, p: u64,
     n: usize, tok: u32) {
     var e: widget.Widget = widget.widget_new(widget.KIND_LABEL)
@@ -35,6 +54,110 @@ fn label(c: *mut render.Ctx, x: f64, y: f64, w: f64, px: usize, p: u64,
     render.draw_label(c, &e)
 }
 
+// EINE KACHEL, DIE AUSSIEHT WIE EIN KNOPF, unter der Abbildung.
+//
+// `render.draw_button` kann das nicht: es malt achsenparallel durch
+// den Painter, und das ist richtig so -- der gerade Weg soll gerade
+// bleiben. Hier wird dieselbe Gestalt aus den abgebildeten Bausteinen
+// zusammengesetzt: Rahmen, Flaeche, Schrift. Der Rahmen ist die
+// groessere Rundung darunter, die Flaeche die um die Strichstaerke
+// eingerueckte darueber -- genau die Reihenfolge, in der painter.fi
+// einen Rahmen zeichnet.
+fn kachel(z: *mut painter.Painter, xf: *mut transform.Xform, x: f64,
+    y: f64, w: f64, h: f64, r: f64, rand: u32, fuell: u32, tcol: u32,
+    p: u64, n: usize, size: f64) {
+    let st: f64 = 1.5
+    transform.tf_fill_round_rect(z, xf, x, y, w, h, r, rand)
+    transform.tf_fill_round_rect(z, xf, x + st, y + st, w - 2.0 * st,
+        h - 2.0 * st, r - st, fuell)
+    if n == 0 {
+        return
+    }
+    // Die Grundlinie genau wie painter.text_baseline_mid sie rechnet,
+    // nur ohne das Runden auf ganze Pixel: gerundet wird unter einer
+    // Drehung nichts, dort gibt es keine Pixelzeile mehr, auf die man
+    // runden koennte.
+    let asc: f64 = painter.font_ascent(z, size)
+    let dsc: f64 = painter.font_descent(z, size)
+    let base: f64 = y + (h + asc - dsc) / 2.0
+    let pad: f64 = 10.0
+    transform.tf_text(z, xf, x + pad, base, w - 2.0 * pad, size, tcol,
+        p, n, painter.TEXT_M)
+}
+
+// DAS GEMALTE BILD. Ein Farbverlauf, ein heller Kreis und ein Gitter
+// alle 16 Punkte. Das Gitter ist der eigentliche Beleg: eine gedrehte
+// Gerade zeigt jede Treppe, die die Abtastung stehen laesst.
+//
+// KREIS UND LINIEN WERDEN HIER SCHON GEGLAETTET. Sonst zeigt das
+// vergroesserte Bild rechts die Treppen der QUELLE und nicht die
+// Guete der Abtastung -- eine bilineare Vergroesserung kann eine
+// harte Kante nur verbreitern, nicht erfinden.
+fn deckung(d: f64, halb: f64) -> f64 {
+    var v: f64 = halb - d + 0.5
+    if v < 0.0 {
+        return 0.0
+    }
+    if v > 1.0 {
+        return 1.0
+    }
+    return v
+}
+
+fn mische(a: f64, b: f64, t: f64) -> f64 {
+    return a + (b - a) * t
+}
+
+fn bild_bauen(p: u64, n: usize) {
+    var y: usize = 0
+    while y < n {
+        var x: usize = 0
+        while x < n {
+            let fx: f64 = (x as f64) / ((n - 1) as f64)
+            let fy: f64 = (y as f64) / ((n - 1) as f64)
+            var r: f64 = 30.0 + 190.0 * fx
+            var g: f64 = 80.0 + 110.0 * fy
+            var b: f64 = 210.0 - 130.0 * fx
+            // Der Kreis, mit weicher Kante ueber den Abstand zum Rand.
+            let dx: f64 = (x as f64) + 0.5 - (n as f64) / 2.0
+            let dy: f64 = (y as f64) + 0.5 - (n as f64) / 2.0
+            let rr: f64 = (n as f64) * 0.28
+            let dk: f64 = matrix.m_sqrt(dx * dx + dy * dy) - rr
+            let ck: f64 = deckung(dk, 0.0)
+            r = mische(r, 250.0, ck)
+            g = mische(g, 243.0, ck)
+            b = mische(b, 214.0, ck)
+            // Das Gitter: der Abstand zur naechsten Linie, in beiden
+            // Richtungen, und davon die weichere Kante.
+            let lx: f64 = abstand_zur_linie((x as f64) + 0.5, 16.0)
+            let ly: f64 = abstand_zur_linie((y as f64) + 0.5, 16.0)
+            var cl: f64 = deckung(lx, 0.9)
+            let cl2: f64 = deckung(ly, 0.9)
+            if cl2 > cl {
+                cl = cl2
+            }
+            r = mische(r, 22.0, cl)
+            g = mische(g, 26.0, cl)
+            b = mische(b, 44.0, cl)
+            let o: usize = (y * n + x) * 4
+            rt.st8(p, o, r as u8)
+            rt.st8(p, o + 1, g as u8)
+            rt.st8(p, o + 2, b as u8)
+            rt.st8(p, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Der Abstand zur naechsten Gitterlinie im Abstand `s`.
+fn abstand_zur_linie(v: f64, s: f64) -> f64 {
+    let m: f64 = v - matrix.m_floor(v / s) * s
+    if m > s - m {
+        return s - m
+    }
+    return m
+}
 
 fn main(start: u64) -> i32 {
     if rt.arg_count(start) < 2 {
@@ -75,7 +198,7 @@ fn main(start: u64) -> i32 {
         return 4
     }
     var z: painter.Painter = painter.painter_new()
-    if !painter.painter_init(&z, &cv, W, 300) {
+    if !painter.painter_init(&z, &cv, W, 120) {
         return 5
     }
     painter.painter_set_font(&z, fm)
@@ -84,68 +207,146 @@ fn main(start: u64) -> i32 {
     let f: *mut theme.Colors = theme.theme_colors(&m)
     canvas.canvas_clear(&cv, theme.opaque((*f).base))
 
-    var t1: [u8; 33] = "TRANSFORMS -- rotate, scale, skew"
-    label(&c, 24.0, 22.0, 900.0, 15, (&t1[0]) as u64, 33, style.TOK_TEXT)
+    let rand: u32 = theme.opaque((*f).border_col)
+    let flaeche: u32 = theme.opaque((*f).surface_raised)
+    let txt: u32 = theme.opaque((*f).text)
+    let akzent: u32 = theme.opaque((*f).accent)
+    let auf_akzent: u32 = theme.opaque((*f).text_on_accent)
 
-    // ---- Eine Reihe gedrehter Kacheln: 0, 10, 20, 30, 45 Grad.
-    var l1: [u8; 36] = "rotate 0 / 10 / 20 / 30 / 45 degrees"
-    label(&c, 24.0, 58.0, 700.0, 12, (&l1[0]) as u64, 36,
-        style.TOK_TEXT_MUTED)
+    var t1: [u8; 48] = "TRANSFORMS -- rotate, scale, skew, and a picture"
+    label(&c, 24.0, 20.0, 900.0, 15, (&t1[0]) as u64, 48, style.TOK_TEXT)
+
     var x: transform.Xform = transform.xf_new()
+
+    // ---------------------------------------- 1. GEDREHTE KACHELN
+    var l1: [u8; 59] = "rotated widgets -- the outline of every glyph turns with it"
+    label(&c, 24.0, 52.0, 900.0, 12, (&l1[0]) as u64, 59,
+        style.TOK_TEXT_MUTED)
+    var g0: [u8; 1] = "0"
+    var g1: [u8; 2] = "12"
+    var g2: [u8; 2] = "24"
+    var g3: [u8; 2] = "36"
+    var g4: [u8; 2] = "48"
     var i: usize = 0
     while i < 5 {
-        let cx: f64 = 110.0 + (i as f64) * 220.0
-        let cy: f64 = 180.0
+        let cx: f64 = 140.0 + (i as f64) * 250.0
+        let cy: f64 = 172.0
         var grad: f64 = 0.0
-        if i == 1 { grad = 10.0 }
-        if i == 2 { grad = 20.0 }
-        if i == 3 { grad = 30.0 }
-        if i == 4 { grad = 45.0 }
+        var p: u64 = (&g0[0]) as u64
+        var n: usize = 1
+        if i == 1 {
+            grad = 12.0
+            p = (&g1[0]) as u64
+            n = 2
+        }
+        if i == 2 {
+            grad = 24.0
+            p = (&g2[0]) as u64
+            n = 2
+        }
+        if i == 3 {
+            grad = 36.0
+            p = (&g3[0]) as u64
+            n = 2
+        }
+        if i == 4 {
+            grad = 48.0
+            p = (&g4[0]) as u64
+            n = 2
+        }
         transform.xf_reset(&x)
         transform.xf_rotate_at(&x, grad, cx, cy)
-        transform.tf_fill_round_rect(&z, &x, cx - 70.0, cy - 40.0, 140.0,
-            80.0, 14.0, theme.opaque((*f).accent))
+        // Der mittlere Knopf ist der Akzentknopf -- damit steht ein
+        // heller Text auf einer satten Flaeche daneben und man sieht,
+        // dass die Schrift in BEIDEN Fassungen sauber gedreht ist.
+        var fl: u32 = flaeche
+        var tc: u32 = txt
+        if i == 2 {
+            fl = akzent
+            tc = auf_akzent
+        }
+        kachel(&z, &x, cx - 85.0, cy - 32.0, 170.0, 64.0, 14.0, rand, fl,
+            tc, p, n, 17.0)
         i = i + 1
     }
-
-    // ---- Dieselbe Kachel, skaliert: 0.6 / 0.8 / 1.0 / 1.25 / 1.5.
-    var l2: [u8; 51] = "scale 0.6 / 0.8 / 1.0 / 1.25 / 1.5 about the centre"
-    label(&c, 24.0, 262.0, 900.0, 12, (&l2[0]) as u64, 51,
+    var l1b: [u8; 45] = "0, 12, 24, 36 and 48 degrees about the centre"
+    label(&c, 24.0, 246.0, 900.0, 12, (&l1b[0]) as u64, 45,
         style.TOK_TEXT_MUTED)
+
+    // ---------------------------------------- 2. SKALIERTE KACHELN
+    var l2: [u8; 57] = "scaled widgets -- the text is re-rasterised, not blown up"
+    label(&c, 24.0, 280.0, 900.0, 12, (&l2[0]) as u64, 57,
+        style.TOK_TEXT_MUTED)
+    var s0: [u8; 4] = "0.65"
+    var s1: [u8; 4] = "0.85"
+    var s2: [u8; 4] = "1.00"
+    var s3: [u8; 4] = "1.25"
+    var s4: [u8; 4] = "1.50"
     i = 0
     while i < 5 {
-        let cx: f64 = 110.0 + (i as f64) * 220.0
-        let cy: f64 = 360.0
-        var s: f64 = 0.6
-        if i == 1 { s = 0.8 }
-        if i == 2 { s = 1.0 }
-        if i == 3 { s = 1.25 }
-        if i == 4 { s = 1.5 }
+        let cx: f64 = 140.0 + (i as f64) * 250.0
+        let cy: f64 = 390.0
+        var sk: f64 = 0.65
+        var p: u64 = (&s0[0]) as u64
+        if i == 1 {
+            sk = 0.85
+            p = (&s1[0]) as u64
+        }
+        if i == 2 {
+            sk = 1.0
+            p = (&s2[0]) as u64
+        }
+        if i == 3 {
+            sk = 1.25
+            p = (&s3[0]) as u64
+        }
+        if i == 4 {
+            sk = 1.5
+            p = (&s4[0]) as u64
+        }
         transform.xf_reset(&x)
-        transform.xf_scale(&x, s, s, cx, cy)
-        transform.tf_fill_round_rect(&z, &x, cx - 60.0, cy - 30.0, 120.0,
-            60.0, 12.0, theme.opaque((*f).surface_raised))
-        transform.xf_reset(&x)
-        transform.xf_scale(&x, s, s, cx, cy)
-        var tx: [u8; 4] = "Tile"
-        transform.tf_text(&z, &x, cx - 60.0 + 14.0, cy + 5.0, 100.0, 14.0,
-            theme.opaque((*f).text), (&tx[0]) as u64, 4, painter.TEXT_L)
+        transform.xf_scale(&x, sk, sk, cx, cy)
+        kachel(&z, &x, cx - 75.0, cy - 28.0, 150.0, 56.0, 12.0, rand,
+            flaeche, txt, p, 4, 16.0)
         i = i + 1
     }
 
-    // ---- Scherung, wie CSS `skewX`.
-    var l3: [u8; 16] = "skewX 12 degrees"
-    label(&c, 24.0, 440.0, 400.0, 12, (&l3[0]) as u64, 16,
+    // ------------------------------------------------ 3. DAS BILD
+    let pix: u64 = rt.heap_alloc(BILD * BILD * 4)
+    if pix == 0 {
+        return 6
+    }
+    bild_bauen(pix, BILD)
+    var im: uiimage.Image = uiimage.image_wrap(pix, BILD, BILD, 0)
+
+    var l3: [u8; 31] = "a picture, turned by 25 degrees"
+    label(&c, 60.0, 452.0, 300.0, 12, (&l3[0]) as u64, 31,
         style.TOK_TEXT_MUTED)
     transform.xf_reset(&x)
-    transform.xf_skew(&x, 12.0, 0.0, 200.0, 500.0)
-    transform.tf_fill_round_rect(&z, &x, 60.0, 470.0, 280.0, 60.0, 10.0,
-        theme.opaque((*f).selection))
+    transform.xf_rotate_at(&x, 25.0, 190.0, 600.0)
+    transform.tf_draw_image(&z, &x, &im, 105.0, 515.0, 170.0, 170.0, 1.0)
+
+    var l4: [u8; 44] = "the same picture at 2.2x, sampled bilinearly"
+    label(&c, 430.0, 452.0, 400.0, 12, (&l4[0]) as u64, 44,
+        style.TOK_TEXT_MUTED)
+    transform.xf_reset(&x)
+    transform.xf_scale(&x, 2.2, 2.2, 560.0, 600.0)
+    transform.tf_draw_image(&z, &x, &im, 505.0, 545.0, 110.0, 110.0, 1.0)
+
+    // ------------------------------------------------ 4. DIE SCHERUNG
+    var l5: [u8; 44] = "skewX 15 degrees about the lower left corner"
+    label(&c, 800.0, 452.0, 420.0, 12, (&l5[0]) as u64, 44,
+        style.TOK_TEXT_MUTED)
+    transform.xf_reset(&x)
+    transform.xf_skew(&x, 15.0, 0.0, 800.0, 690.0)
+    var s5: [u8; 14] = "Sheared widget"
+    kachel(&z, &x, 810.0, 528.0, 330.0, 155.0, 18.0, rand, flaeche, txt,
+        (&s5[0]) as u64, 14, 20.0)
 
     var out: mem.Buf = mem.buf_new()
     mem.buf_init(&out)
     if !png.write_png(&cv, &out) {
-        return 6
+        return 7
     }
     var pf: rt.Buf = rt.buf_new()
     var pk: usize = 0
@@ -156,10 +357,11 @@ fn main(start: u64) -> i32 {
     rt.buf_push(&pf, 0 as u8)
     if !rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64,
         mem.buf_len(&out)) {
-        return 7
+        return 8
     }
     var okm: [u8; 10] = "GALLERY 8\n"
     rt.write_everything(1, (&okm[0]) as u64, 10)
+    rt.heap_free(pix, BILD * BILD * 4)
     painter.painter_free(&z)
     canvas.canvas_free(&cv)
     return 0
