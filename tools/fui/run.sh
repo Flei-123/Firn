@@ -226,6 +226,19 @@ if [ "$1" = "--images" ]; then
     build gallery8
     "$W/gallery8" "$Z/fui-transform-hell.png" light
     "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
+    # DIE DEMO-ANWENDUNG. Kein Pruefblatt, sondern eine Oberflaeche, wie
+    # ein Anwender sie schreibt: Titelzeile und Werkzeugleiste von
+    # `flex.flex_layout` verteilt, der Hover-Uebergang eines Knopfes aus
+    # `anim.Animator`, der Dialogschatten aus
+    # `effect.drop_shadow_spread`. Sie liegt unter demos/ und nicht
+    # unter tools/fui, weil sie den NORMALEN Weg zeigt -- und sie laeuft
+    # hier mit, damit ein Bruch in einem der drei Module auffliegt,
+    # bevor der naechste Anwender darueber stolpert. Das Programm
+    # rechnet selbst nach, dass seine Phasen sich nicht ueberdecken,
+    # und endet sonst mit einem Fehler (set -e bricht den Lauf ab).
+    "$FIRNC" --opt-level=dev -o "$W/fuidemo" demos/fuidemo/main.fi
+    "$W/fuidemo" "$Z/fui-demo-hell.png" light
+    "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     ls -la "$Z"
 fi
 
