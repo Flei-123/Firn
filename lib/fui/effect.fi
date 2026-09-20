@@ -53,7 +53,7 @@ export {
     blur_rect, blur_buffer, box_pass_h, box_pass_v,
     sigma_for_radius, radius_for_sigma,
     // Schatten und Glas
-    drop_shadow_round, backdrop_blur,
+    drop_shadow_round, drop_shadow_spread, backdrop_blur, glass_round,
     // Farbmatrix
     ColorMatrix, cm_identity, cm_saturate, cm_brightness, cm_contrast,
     cm_grayscale, cm_mul, cm_apply_rect, cm_apply_pixel,
@@ -98,6 +98,16 @@ fn wurzel(x: f64) -> f64 {
         i = i + 1
     }
     return g
+}
+
+// Auf den naechsten ganzen Punkt. `as i64` schneidet ab und zieht
+// negative Werte damit in die falsche Richtung; ein Schatten links
+// neben der Leinwand saesse dadurch einen Punkt zu weit rechts.
+fn runde(v: f64) -> i64 {
+    if v < 0.0 {
+        return (v - 0.5) as i64
+    }
+    return (v + 0.5) as i64
 }
 
 fn ld8(p: u64) -> u8 { return *(p as *mut u8) }
@@ -316,12 +326,40 @@ fn setze(cv: *mut canvas.Canvas, x0: i64, y0: i64, w: i64, h: i64,
 // dessen Farbe in den Schatten. Der Schatten kennt nur die Form.
 fn drop_shadow_round(z: *mut painter.Painter, x: f64, y: f64, w: f64,
     h: f64, radius: f64, dx: f64, dy: f64, blur: i64, col: u32) -> bool {
-    if w <= 0.0 || h <= 0.0 {
+    return drop_shadow_spread(z, x, y, w, h, radius, dx, dy, blur, 0.0, col)
+}
+
+// Mit STREUUNG, wie die vierte Laenge in CSS `box-shadow`: die Form
+// waechst vor dem Verwischen um `spread` nach allen vier Seiten (ein
+// negativer Wert laesst sie schrumpfen). Das ist der Unterschied
+// zwischen einem Schatten, der genau unter der Karte liegt, und einem,
+// der wie ein Hof um sie herumsteht.
+//
+// Der Radius waechst mit: eine um 6 Punkte groessere Form mit
+// unveraendertem Eckenradius haette spitzere Ecken als die Karte
+// darueber, und genau das sieht man als Zipfel.
+fn drop_shadow_spread(z: *mut painter.Painter, x: f64, y: f64, w: f64,
+    h: f64, radius: f64, dx: f64, dy: f64, blur: i64, spread: f64,
+    col: u32) -> bool {
+    let fw: f64 = w + 2.0 * spread
+    let fh: f64 = h + 2.0 * spread
+    if fw <= 0.0 || fh <= 0.0 {
         return true
     }
-    let rand: i64 = blur * 3 + 2
-    let bw: i64 = (w as i64) + 2 * rand
-    let bh: i64 = (h as i64) + 2 * rand
+    var fr: f64 = radius + spread
+    if fr < 0.0 {
+        fr = 0.0
+    }
+    var b: i64 = blur
+    if b < 0 {
+        b = 0
+    }
+    // Der Saum um die Form muss die ganze Unschaerfe fassen: drei
+    // Kaesten der Halbbreite `blur` tragen genau 3*blur weit, plus zwei
+    // Punkte Luft fuer die Kantenglaettung.
+    let rand: i64 = b * 3 + 2
+    let bw: i64 = (fw as i64) + 1 + 2 * rand
+    let bh: i64 = (fh as i64) + 1 + 2 * rand
     var tmp: canvas.Canvas = canvas.canvas_new()
     if !canvas.canvas_init(&tmp, bw as usize, bh as usize) {
         return false
@@ -334,7 +372,7 @@ fn drop_shadow_round(z: *mut painter.Painter, x: f64, y: f64, w: f64,
     }
     // Die Form in voller Deckkraft -- die Farbe kommt spaeter, sonst
     // mischt der Weichzeichner die Farbe mit dem Nichts daneben.
-    painter.round_rect(&tz, rand as f64, rand as f64, w, h, radius,
+    painter.round_rect(&tz, rand as f64, rand as f64, fw, fh, fr,
         0xFFFFFFFF as u32)
     let n: usize = (bw * bh * 4) as usize
     let scratch: *mut u8 = rt.heap_alloc(n) as *mut u8
@@ -344,7 +382,7 @@ fn drop_shadow_round(z: *mut painter.Painter, x: f64, y: f64, w: f64,
         return false
     }
     blur_buffer(canvas.canvas_pixels(&tmp), scratch, bw as usize,
-        bh as usize, blur)
+        bh as usize, b)
     rt.heap_free(scratch as u64, n)
     // Einfaerben und auf die Zielleinwand mischen.
     let zv: *mut canvas.Canvas = painter.painter_canvas(z)
@@ -353,21 +391,43 @@ fn drop_shadow_round(z: *mut painter.Painter, x: f64, y: f64, w: f64,
     let sb: i64 = (col & 255 as u32) as i64
     let sa: i64 = ((col >> 24) & 255 as u32) as i64
     let quelle: u64 = canvas.canvas_pixels(&tmp) as u64
-    var j: i64 = 0
-    while j < bh {
-        var i: i64 = 0
-        while i < bw {
+    // DER ZIELBEREICH WIRD GEKLEMMT, und zwar VOR der Schleife: wer
+    // jedes Pixel einzeln auf "liegt es noch drin" prueft, laeuft bei
+    // einem Schatten am linken Rand ueber Millionen Punkte, die
+    // ohnehin verworfen werden -- und wer nur auf >= 0 prueft, laesst
+    // die rechte Seite in die naechste Bildzeile umbrechen.
+    let bx0: i64 = runde(x - spread + dx) - rand
+    let by0: i64 = runde(y - spread + dy) - rand
+    let cw: i64 = canvas.canvas_width(zv) as i64
+    let ch: i64 = canvas.canvas_height(zv) as i64
+    var i0: i64 = 0
+    if bx0 < 0 {
+        i0 = 0 - bx0
+    }
+    var i1: i64 = bw
+    if bx0 + i1 > cw {
+        i1 = cw - bx0
+    }
+    var j0: i64 = 0
+    if by0 < 0 {
+        j0 = 0 - by0
+    }
+    var j1: i64 = bh
+    if by0 + j1 > ch {
+        j1 = ch - by0
+    }
+    var j: i64 = j0
+    while j < j1 {
+        var i: i64 = i0
+        while i < i1 {
             let a: i64 = ld8(quelle + ((j * bw + i) * 4 + 3) as u64) as i64
             if a != 0 {
-                let deck: i64 = a * sa / 255
+                let deck: i64 = (a * sa + 127) / 255
                 if deck != 0 {
-                    let px: i64 = (x as i64) + dx as i64 + i - rand
-                    let py: i64 = (y as i64) + dy as i64 + j - rand
-                    if px >= 0 && py >= 0 {
-                        canvas.canvas_blend(zv, px as usize, py as usize,
-                            ((deck as u32) << 24) | ((sr as u32) << 16) |
-                            ((sg as u32) << 8) | (sb as u32), 1.0)
-                    }
+                    canvas.canvas_blend(zv, (bx0 + i) as usize,
+                        (by0 + j) as usize,
+                        ((deck as u32) << 24) | ((sr as u32) << 16) |
+                        ((sg as u32) << 8) | (sb as u32), 1.0)
                 }
             }
             i = i + 1
@@ -390,6 +450,17 @@ fn drop_shadow_round(z: *mut painter.Painter, x: f64, y: f64, w: f64,
 // (0xAARRGGBB, Alpha entscheidet, wie stark).
 fn backdrop_blur(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     radius: f64, blur: i64, tint: u32) -> bool {
+    return glas_flaeche(z, x, y, w, h, radius, blur, tint, 1.0)
+}
+
+// Dasselbe, aber mit einer SAETTIGUNG auf der verwischten Kopie. Das
+// ist der Punkt, an dem aus "verwischt" wirklich Glas wird: eine
+// Milchscheibe nimmt dem Untergrund die Sattheit, eine Glasscheibe
+// gibt sie ihm zurueck (Apples `backdrop-filter: blur() saturate(180%)`
+// tut nichts anderes). Gerechnet wird mit der Farbmatrix aus dieser
+// Datei -- kein zweiter Saettigungsregler.
+fn glas_flaeche(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    radius: f64, blur: i64, tint: u32, sat: f64) -> bool {
     let iw: i64 = w as i64
     let ih: i64 = h as i64
     if iw <= 0 || ih <= 0 {
@@ -411,33 +482,63 @@ fn backdrop_blur(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     // Die verwischte Kopie durch die runde Maske zurueckmalen. Die
     // Maske entsteht aus derselben `round_rect`, die alles in fUi
     // rundet -- kein zweiter Eckenzeichner.
+    //
+    // VIER PUNKTE LUFT, und das ist kein Schoenheitsfehler: das
+    // Rasterfenster in painter.raster_window nimmt fuer die
+    // Kantenglaettung rundherum einen ganzen Punkt mehr und gibt auf,
+    // wenn das Fenster GROESSER als die Leinwand wird. Eine Maske, die
+    // genau so gross ist wie die Form, faellt dadurch still aus -- und
+    // eine leere Maske heisst: gar kein Glas. Genau das war der Grund,
+    // warum ueber dem Muster nichts zu sehen war: nicht die Unschaerfe
+    // war zu schwach, es wurde gar nichts durchgelassen.
+    let mw: i64 = iw + 4
+    let mh: i64 = ih + 4
     var maske: canvas.Canvas = canvas.canvas_new()
-    if !canvas.canvas_init(&maske, iw as usize, ih as usize) {
+    if !canvas.canvas_init(&maske, mw as usize, mh as usize) {
         rt.heap_free(b as u64, n)
         rt.heap_free(a as u64, n)
         return false
     }
     canvas.canvas_clear(&maske, 0 as u32)
     var mz: painter.Painter = painter.painter_new()
-    if !painter.painter_init(&mz, &maske, iw as usize, ih as usize) {
+    if !painter.painter_init(&mz, &maske, mw as usize, mh as usize) {
         canvas.canvas_free(&maske)
         rt.heap_free(b as u64, n)
         rt.heap_free(a as u64, n)
         return false
     }
-    painter.round_rect(&mz, 0.0, 0.0, w, h, radius, 0xFFFFFFFF as u32)
+    painter.round_rect(&mz, 2.0, 2.0, w, h, radius, 0xFFFFFFFF as u32)
     let mp: u64 = canvas.canvas_pixels(&maske) as u64
     let ta: i64 = ((tint >> 24) & 255 as u32) as i64
+    var cs: ColorMatrix = cm_saturate(sat)
     var j: i64 = 0
     while j < ih {
         var i: i64 = 0
         while i < iw {
-            let m: i64 = ld8(mp + ((j * iw + i) * 4 + 3) as u64) as i64
+            let m: i64 = ld8(mp + (((j + 2) * mw + i + 2) * 4 + 3) as u64) as i64
             if m != 0 {
                 let s: u64 = a as u64 + ((j * iw + i) * 4) as u64
+                let sa: i64 = ld8(s + 3) as i64
                 var rr: i64 = ld8(s) as i64
                 var gg: i64 = ld8(s + 1) as i64
                 var bb: i64 = ld8(s + 2) as i64
+                // Die Kopie liegt premultipliziert vor; die Toenung und
+                // die Saettigung rechnen gerade. Also erst gerade
+                // machen -- sonst wirkt beides auf halbdurchsichtigen
+                // Stellen doppelt.
+                if sa > 0 && sa < 255 {
+                    rr = rr * 255 / sa
+                    gg = gg * 255 / sa
+                    bb = bb * 255 / sa
+                }
+                if sat != 1.0 {
+                    let neu: u32 = cm_apply_pixel(&cs,
+                        (255 as u32 << 24) | ((rr as u32) << 16) |
+                        ((gg as u32) << 8) | (bb as u32))
+                    rr = ((neu >> 16) & 255 as u32) as i64
+                    gg = ((neu >> 8) & 255 as u32) as i64
+                    bb = (neu & 255 as u32) as i64
+                }
                 // Die Tönung: ueber die verwischte Kopie, mit ihrem
                 // eigenen Alpha gewichtet.
                 if ta != 0 {
@@ -445,8 +546,17 @@ fn backdrop_blur(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
                     gg = gg + (((tint >> 8) & 255 as u32) as i64 - gg) * ta / 255
                     bb = bb + ((tint & 255 as u32) as i64 - bb) * ta / 255
                 }
-                let px: i64 = (x as i64) + i
-                let py: i64 = (y as i64) + j
+                let px: i64 = runde(x) + i
+                let py: i64 = runde(y) + j
+                // Ueber 255 kann keiner der drei Werte bleiben: sonst
+                // laufen die Kanaele beim Zusammenschieben ineinander
+                // und aus zu hellem Rot wird Gruen.
+                if rr > 255 { rr = 255 }
+                if gg > 255 { gg = 255 }
+                if bb > 255 { bb = 255 }
+                if rr < 0 { rr = 0 }
+                if gg < 0 { gg = 0 }
+                if bb < 0 { bb = 0 }
                 if px >= 0 && py >= 0 {
                     canvas.canvas_blend(zv, px as usize, py as usize,
                         ((255 as u32) << 24) | ((rr as u32) << 16) |
@@ -462,6 +572,68 @@ fn backdrop_blur(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     canvas.canvas_free(&maske)
     rt.heap_free(b as u64, n)
     rt.heap_free(a as u64, n)
+    return true
+}
+
+// ------------------------------------------------- DIE FERTIGE SCHEIBE
+//
+// `backdrop_blur` allein sah ueber dem gemusterten Grund noch nach
+// "leicht unscharf" aus und nicht nach Glas. Es fehlten genau drei
+// Dinge, und alle drei haben einen Grund:
+//
+//   1. GENUG UNSCHAERFE. Unter einem Kastenradius von etwa einem
+//      Zehntel der Scheibenbreite bleibt das Muster als Muster
+//      erkennbar; erst darueber wird es zu Farbwolken. Deshalb waechst
+//      der Radius hier mit der Scheibe mit und wird nur nach unten
+//      begrenzt.
+//   2. GENUG TOENUNG, und zwar in die richtige Richtung: auf hellem
+//      Grund wird milchig-weiss aufgehellt, auf dunklem tief
+//      abgedunkelt. Eine weisse Toenung im dunklen Thema macht aus der
+//      Scheibe einen grauen Fleck -- das ist genau der Fehler, den
+//      Justin im ersten Bild gesehen hat.
+//   3. EIN FEINER RAND. Echtes Glas hat eine Kante, an der sich das
+//      Licht bricht: aussen eine haarfeine dunkle Linie, innen ein
+//      heller Streifen. Ohne diese zwei Linien schwimmt die Scheibe im
+//      Untergrund, mit ihnen liegt sie darauf.
+//
+// Die Saettigung von 1.4 haelt die Farben des Untergrunds am Leben;
+// ohne sie wird jede Scheibe grau, weil Verwischen Farben mittelt.
+fn glass_round(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    radius: f64, dark: bool) -> bool {
+    if w <= 0.0 || h <= 0.0 {
+        return true
+    }
+    // Der Radius waechst mit der Scheibe, bleibt aber in einem Band:
+    // unter 6 bleibt das Muster ein Muster, ueber 14 wird aus dem
+    // Untergrund eine strukturlose Wolke und man sieht nicht mehr, dass
+    // ueberhaupt etwas dahinter liegt.
+    var kurz: f64 = w
+    if h < kurz {
+        kurz = h
+    }
+    var r: i64 = (kurz / 10.0) as i64
+    if r < 6 {
+        r = 6
+    }
+    if r > 14 {
+        r = 14
+    }
+    var tint: u32 = 0x7AFFFFFF as u32
+    var aussen: u32 = 0x22000000 as u32
+    var innen: u32 = 0xA0FFFFFF as u32
+    if dark {
+        tint = 0x8C10141B as u32
+        aussen = 0x60000000 as u32
+        innen = 0x33FFFFFF as u32
+    }
+    if !glas_flaeche(z, x, y, w, h, radius, r, tint, 1.4) {
+        return false
+    }
+    painter.round_ring(z, x, y, w, h, radius, 1.0, aussen)
+    if w > 2.0 && h > 2.0 {
+        painter.round_ring(z, x + 1.0, y + 1.0, w - 2.0, h - 2.0,
+            radius - 1.0, 1.0, innen)
+    }
     return true
 }
 
