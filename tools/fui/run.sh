@@ -9,7 +9,9 @@
 #     tools/fui/run.sh              check only
 #     tools/fui/run.sh --images     additionally paint the gallery
 #
-# The renders land under /srv/store/belege/fui/.
+# The renders land under $BELEGE, by default $W/belege -- inside the
+# run's own working directory, so that the run does not depend on write
+# access to a path somewhere else in the system.
 set -e
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
@@ -189,8 +191,29 @@ build wrap
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
-    Z=/srv/store/belege/fui
-    mkdir -p "$Z"
+    # WOHIN DIE BELEGE GEHEN. Die Vorgabe liegt INNERHALB des
+    # Arbeitsverzeichnisses ($W), nicht unter einem festen Systempfad:
+    # ein Lauf, der ausserhalb seines eigenen Baums schreibt, faellt bei
+    # jedem, der dort keine Rechte hat, auf die Nase -- und zwar erst
+    # nach zwanzig bestandenen Abschnitten. Wer die Bilder woanders
+    # haben will, setzt BELEGE.
+    Z="${BELEGE:-$W/belege}"
+    if ! mkdir -p "$Z" 2>/dev/null; then
+        echo "  FEHLER: das Belegverzeichnis \"$Z\" laesst sich nicht anlegen."
+        echo "  Der Lauf ist damit NICHT bestanden. Setze BELEGE auf einen"
+        echo "  beschreibbaren Pfad und starte erneut."
+        exit 1
+    fi
+    # Anlegen heisst noch nicht beschreiben duerfen (ein vorhandenes,
+    # fremdes Verzeichnis legt mkdir -p klaglos nicht neu an). Also
+    # einmal wirklich schreiben -- lieber hier scheitern als ein Bild
+    # weniger ausliefern und trotzdem "ALL CHECKS PASSED" drucken.
+    if ! : > "$Z/.schreibprobe" 2>/dev/null; then
+        echo "  FEHLER: in \"$Z\" laesst sich nicht schreiben."
+        echo "  Der Lauf ist damit NICHT bestanden."
+        exit 1
+    fi
+    rm -f "$Z/.schreibprobe"
     build gallery
     "$W/gallery" "$Z/fui-wave1-light.png" light
     "$W/gallery" "$Z/fui-wave1-dark.png" dark
