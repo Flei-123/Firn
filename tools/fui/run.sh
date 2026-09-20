@@ -295,7 +295,9 @@ if [ "$1" = "--images" ]; then
     # dass in JEDEM der sechs waagerechten Baender wirklich etwas
     # steht. Die Zahlen hinter jedem Aufruf sind Breite, kleinste und
     # groesste zulaessige Hoehe (drei Belege schneiden ihre Leinwand
-    # auf den Inhalt zu) und die geforderte Farbvielfalt.
+    # auf den Inhalt zu) und die geforderte Farbvielfalt. Die obere
+    # Grenze ist die Leinwand aus dem malenden Programm -- wer sie dort
+    # aendert, traegt die Zahl HIER nach; genau dafuer steht sie da.
     build belegpruef
     beleg() {
         "$W/belegpruef" "$@"
