@@ -188,6 +188,18 @@ echo "== 17. DER ZEILENUMBRUCH =="
 build wrap
 "$W/wrap"
 
+echo
+echo "== 18. DIE BEDIENUNG DES TEXTFELDES =="
+# lib/fui/editor.fi liess sich seit seinem ersten Tag NICHT uebersetzen
+# (eine fehlende `if`-Zeile im Zweig fuer die Ruecktaste), und es fiel
+# nicht auf, weil kein Programm die Datei einband und dieser Lauf sie
+# nicht kannte. Jetzt wird sie gebaut UND gerechnet: Strg+A ersetzt
+# statt anzuhaengen (Justins Adresszeilen-Fehler), die Wortspruenge,
+# Strg+Rueck/Entf mit und ohne Auswahl, Ctrl+Z/Y und die Tasten, die
+# dem Feld nicht gehoeren.
+build editor
+"$W/editor"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="

@@ -195,6 +195,15 @@ missing for the expressiveness of modern HTML/CSS:
 | `lib/fui/effect.fi` | Separable box blur in three passes (running sum, O(1) per pixel) as a Gauss approximation, `drop_shadow`, `backdrop_blur`/glass, colour matrix |
 | `lib/fui/transform.fi` | Affine 2x3 transforms with a push/pop stack. The matrix arithmetic comes from `lib/svg/matrix.fi` -- **no second matrix library**. Text goes through the matrix as a glyph outline, pictures via inverse mapping with bilinear sampling, hit testing via the inverse |
 
+One thing the integration pass found and fixed: `lib/fui/editor.fi` (the
+key handling of a text field) **never compiled**. In the branch for the
+Backspace key the line `if ctrl && !tb_has_sel(t) {` was missing, so the
+brace below it closed the function and the parser hit an `if` at top
+level. Nobody noticed, because no program imported the file and the
+acceptance run did not know it. The guard is back, and the file is now
+built and measured by section 18 -- a check that fails with
+`got 10 want 7` if the guard is wrong again.
+
 **One command checks all of it:**
 
 ```sh
@@ -207,14 +216,18 @@ It needs `compiler/target/release/firnc` (section 1) plus `objdump` and
 single check exits non-zero on failure and `set -e` stops the run, so a
 check cannot go missing silently -- that is the whole point of the file.
 
-What the seventeen sections do, in short: section 1 compiles
+What the eighteen sections do, in short: section 1 compiles
 `lib/fui/core.fi`, `style.fi` and `layout.fi` with `--profile=kernel` and
 **counts** that not one `syscall` instruction and no foreign name besides
 `osum_panic` is left in the objects (the core has to stay usable from
 inside a kernel). Sections 2-11 are the earlier rounds (contrast,
 icons, the three widget waves, pictures, the ported `lib/svg`, text).
 Sections 12-15 are the new modules, sections 16-17 the interaction and
-the line breaking. The numbers are checked **numerically** against
+the line breaking, section 18 the operation of the text field
+(`lib/fui/editor.fi`: Ctrl+A replaces instead of appending, the word
+jumps, Ctrl+Backspace/Delete with and without a selection, undo/redo,
+and the keys the field hands back to the program). The numbers are
+checked **numerically** against
 values worked out by hand ("got X want Y"): easings at their support
 points, flex distribution in pixels, three box passes against the cubic
 B-spline `(1,3,6,7,6,3,1)/27`, known point images under the transform.
