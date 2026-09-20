@@ -182,6 +182,55 @@ boot of the kernel example with **both** compilers.
 
 In detail in `docs/ROUND52.md`.
 
+## 4c. fUi -- the UI library, and its acceptance run (round UI-WEB)
+
+`lib/fui/*.fi` is the house UI library, written in Firn only: no C, no
+libc, no foreign library. Round UI-WEB added the four modules that were
+missing for the expressiveness of modern HTML/CSS:
+
+| Module | What it is |
+|---|---|
+| `lib/fui/anim.fi` | Tween engine: linear, `cubic-bezier(x1,y1,x2,y2)` with Newton iteration, `steps(n)`, analytically solved spring; animator register with `anim_tick(ms)`; widget state transitions (colour in sRGB **and** OKLab, premultiplied alpha, radius, border, lift) |
+| `lib/fui/flex.fi` | CSS flexbox: direction/justify/align/wrap/align-content, gap, grow/shrink/basis with min/max clamping and the redistribution that follows from it. Extends `lib/fui/layout.fi`, does not replace it |
+| `lib/fui/effect.fi` | Separable box blur in three passes (running sum, O(1) per pixel) as a Gauss approximation, `drop_shadow`, `backdrop_blur`/glass, colour matrix |
+| `lib/fui/transform.fi` | Affine 2x3 transforms with a push/pop stack. The matrix arithmetic comes from `lib/svg/matrix.fi` -- **no second matrix library**. Text goes through the matrix as a glyph outline, pictures via inverse mapping with bilinear sampling, hit testing via the inverse |
+
+**One command checks all of it:**
+
+```sh
+sh tools/fui/run.sh              # the checks only
+sh tools/fui/run.sh --images     # additionally paint the evidence pictures
+```
+
+It needs `compiler/target/release/firnc` (section 1) plus `objdump` and
+`nm` for section 1 of the run. It ends on `ALL CHECKS PASSED`; every
+single check exits non-zero on failure and `set -e` stops the run, so a
+check cannot go missing silently -- that is the whole point of the file.
+
+What the seventeen sections do, in short: section 1 compiles
+`lib/fui/core.fi`, `style.fi` and `layout.fi` with `--profile=kernel` and
+**counts** that not one `syscall` instruction and no foreign name besides
+`osum_panic` is left in the objects (the core has to stay usable from
+inside a kernel). Sections 2-11 are the earlier rounds (contrast,
+icons, the three widget waves, pictures, the ported `lib/svg`, text).
+Sections 12-15 are the new modules, sections 16-17 the interaction and
+the line breaking. The numbers are checked **numerically** against
+values worked out by hand ("got X want Y"): easings at their support
+points, flex distribution in pixels, three box passes against the cubic
+B-spline `(1,3,6,7,6,3,1)/27`, known point images under the transform.
+
+The evidence pictures are written to `/srv/store/belege/fui/` -- light
+and dark for each: `fui-anim-*`, `fui-flex-*`, `fui-effekt-*`,
+`fui-transform-*` are the four from this round.
+
+Single checks without the whole run, if something is to be looked at:
+
+```sh
+export FIRNLIB="$(pwd)/lib"
+compiler/target/release/firnc --opt-level=dev -o /tmp/anim tools/fui/anim_main.fi
+/tmp/anim
+```
+
 ## 5. What does NOT work, because it was not built
 
 Honestly and completely (in detail in `ACCEPTANCE.md`):

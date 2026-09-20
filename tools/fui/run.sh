@@ -168,6 +168,24 @@ echo "== 15. AFFINE ABBILDUNGEN UND DIE TREFFERPRUEFUNG =="
 build transform
 "$W/transform"
 
+echo
+echo "== 16. DIE BEDIENUNG: FOKUSKETTE UND ZEIGER =="
+# tools/fui/control_main.fi lag seit seiner Entstehung NEBEN dem
+# Prueflauf: es rechnet nach, aber niemand rief es. Genau so geht eine
+# Pruefung schweigend verloren -- der Grund, aus dem es diese Datei
+# gibt. Also haengt es jetzt hier drin. Wichtig fuer die Runde UI-WEB:
+# hier liegt die Trefferpruefung, auf die lib/fui/transform.fi den Punkt
+# mit der Kehrabbildung zurueckrechnet.
+build control
+"$W/control"
+
+echo
+echo "== 17. DER ZEILENUMBRUCH =="
+# Ebenfalls nachgetragen: der Umbruch pruefte sich selbst, ohne dass
+# der Lauf davon wusste.
+build wrap
+"$W/wrap"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
