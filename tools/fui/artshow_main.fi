@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/artshow_main.fi -- THE BELEGBILDER.
+//
+//     artshow_main <out.png> [light|dark] [font.ttf]
+//
+// Five bands, each one the thing Justin asked to SEE:
+//
+//   1. A button with an icon LEFT of the text, in five states.
+//   2. A label with a picture, and a toolbar of icon-only buttons.
+//   3. THE SAME SVG icon at 12, 16, 24, 32, 48 and 64 -- the scaling
+//      band. If the reader quantised anything, the small ones go ragged
+//      and the big ones go blocky.
+//   4. A picture WITH TRANSPARENCY over three coloured grounds, so a
+//      wrong alpha shows as a halo or a box.
+//   5. Tabs and menu entries with icons.
+//
+// It also does the PNG ROUND TRIP: the raster icon in band 1 is not made
+// in memory, it is ENCODED to PNG with lib/paint/png.fi and read back
+// with the decoder through lib/fui/uiimagepng.fi. That exercises the real
+// path an application takes (a PNG on disk -> a widget) instead of a
+// buffer that never left the process.
+import std.rt
+import font.metrics
+import paint.canvas
+import html.mem
+import paint.png
+import fui.painter
+import fui.theme
+import fui.style
+import fui.widget
+import fui.render
+import fui.wave2
+import fui.uiimage
+import fui.uiimagepng
+import fui.uisvg
+
+const W: usize = 900
+const H: usize = 620
+const FONTSET_BYTES: usize = 4096
+
+// A 64x64 RGBA icon built by hand: a filled disc with a notch, in a
+// colour that is nothing like the theme, so it is unmistakable in the
+// picture. Straight RGBA, 0xAARRGGBB per pixel.
+fn make_disc(d: usize) -> u64 {
+    let p: u64 = rt.heap_alloc(d * d * 4) as u64
+    let r: f64 = (d as f64) / 2.0 - 1.0
+    let cx: f64 = (d as f64) / 2.0
+    let cy: f64 = (d as f64) / 2.0
+    var y: usize = 0
+    while y < d {
+        var x: usize = 0
+        while x < d {
+            let dx: f64 = (x as f64) + 0.5 - cx
+            let dy: f64 = (y as f64) + 0.5 - cy
+            let dist: f64 = dx * dx + dy * dy
+            let o: usize = (y * d + x) * 4
+            var a: u32 = 0
+            if dist <= r * r {
+                a = 255
+                // a notch in the top right, so the shape is not
+                // symmetric -- a flip or a transpose would show.
+                if dx > r * 0.25 && dy < 0.0 - r * 0.25 {
+                    a = 0
+                }
+            }
+            rt.st8(p, o, 20 as u8)       // R
+            rt.st8(p, o + 1, 140 as u8)  // G
+            rt.st8(p, o + 2, 220 as u8)  // B
+            rt.st8(p, o + 3, a as u8)
+            y = y
+            x = x
+            rt.st8(p, o + 3, a as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return p
+}
+
+// A 48x48 half transparent gradient square, for band 4.
+fn make_fade(d: usize) -> u64 {
+    let p: u64 = rt.heap_alloc(d * d * 4) as u64
+    var y: usize = 0
+    while y < d {
+        var x: usize = 0
+        while x < d {
+            let o: usize = (y * d + x) * 4
+            // alpha rises left to right, colour constant warm orange
+            let a: u32 = ((x as f64) / ((d - 1) as f64) * 255.0) as u32
+            rt.st8(p, o, 240 as u8)
+            rt.st8(p, o + 1, 120 as u8)
+            rt.st8(p, o + 2, 30 as u8)
+            rt.st8(p, o + 3, a as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return p
+}
+
+fn put_text(c: *mut render.Ctx, p: u64, n: usize, x: f64, y: f64,
+    w: f64) {
+    var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&l, x, y, w, 18.0)
+    widget.w_set_text(&l, p, n)
+    let s: *mut style.Style = widget.w_style(&l)
+    *s = style.style_set_font(*s, 0, 11)
+    *s = style.style_set_fg(*s, style.color_token(style.TOK_TEXT_MUTED))
+    render.draw_label(c, &l)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        var u: [u8; 47] = "artshow_main <out.png> [light|dark] [font.ttf]\n"
+        rt.write_everything(2, (&u[0]) as u64, 47)
+        return 2
+    }
+    let path: u64 = rt.arg_ptr(start, 1)
+    var dark: bool = false
+    if rt.arg_count(start) >= 3 {
+        if rt.ld8(rt.arg_ptr(start, 2), 0) == 100 as u8 {
+            dark = true
+        }
+    }
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 4 {
+        have = rt.read_file(rt.arg_ptr(start, 3), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 { return 3 }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) { return 4 }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, 260) { return 5 }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(dark)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+
+    // the page ground
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    canvas.canvas_clear(&cv, theme.opaque((*f).surface))
+
+    // ============================================ THE PNG ROUND TRIP
+    //
+    // Build the disc, ENCODE it to PNG, DECODE it back, and use the
+    // decoded picture for the widgets. That is the real path.
+    let raw: u64 = make_disc(64)
+    var enc: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&enc, 64, 64) { return 6 }
+    // canvas is premultiplied; write the straight pixels in premultiplied
+    var yy: usize = 0
+    while yy < 64 {
+        var xx: usize = 0
+        while xx < 64 {
+            let o: usize = (yy * 64 + xx) * 4
+            let a: u32 = rt.ld8(raw, o + 3) as u32
+            let r: u32 = (rt.ld8(raw, o) as u32) * a / 255
+            let g: u32 = (rt.ld8(raw, o + 1) as u32) * a / 255
+            let b: u32 = (rt.ld8(raw, o + 2) as u32) * a / 255
+            canvas.canvas_set_raw(&enc, xx, yy,
+                (a << 24) | (r << 16) | (g << 8) | b)
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    var pbuf: mem.Buf = mem.buf_new()
+    mem.buf_init(&pbuf)
+    let wrote: bool = png.write_png(&enc, &pbuf)
+    var pim: png.Image = png.image_new()
+    var disc: uiimage.Image = uiimage.image_new()
+    var round_ok: bool = false
+    if wrote {
+        round_ok = uiimagepng.image_from_png(pbuf.ptr as u64, pbuf.len,
+            &pim, &disc)
+    }
+    if !round_ok {
+        // Fall back to the in-memory buffer so the picture still comes
+        // out -- but SAY so, loudly, on stderr.
+        var bad: [u8; 46] = "PNG round trip FAILED -- using the raw buffer\n"
+        rt.write_everything(2, (&bad[0]) as u64, 46)
+        disc = uiimage.image_wrap(raw, 64, 64, 0)
+    } else {
+        var good: [u8; 45] = "PNG round trip ok: encoded and decoded again\n"
+        rt.write_everything(1, (&good[0]) as u64, 45)
+    }
+
+    // an SVG icon: a rounded square with a hole (evenodd), plus a bar
+    var sd: [u8; 179] = "<svg viewBox='0 0 24 24'><path fill='#1e8cdc' fill-rule='evenodd' d='M3 3 h18 a2 2 0 0 1 2 2 v14 a2 2 0 0 1 -2 2 H3 a2 2 0 0 1 -2 -2 V5 a2 2 0 0 1 2 -2 Z M8 9 h8 v6 h-8 Z'/></svg>"
+
+    // Dasselbe Symbol, aber mit currentColor statt fester Farbe -- so
+    // liefern Lucide, Feather und Material aus. Die Farbe setzt fUi ein.
+    var sd2: [u8; 139] = "<svg viewBox='0 0 24 24'><circle cx='12' cy='12' r='10' fill='currentColor'/><rect x='8' y='10' width='8' height='4' fill='#ffffff'/></svg>"
+
+    // JE BENUTZTE GROESSE EINMAL RASTERN -- der Vertrag von uisvg, und der
+    // Grund, ein Symbol als SVG und nicht als PNG zu halten.
+    var sv20: uisvg.Icon = uisvg.icon_new()
+    let svok: bool = uisvg.icon_render(&sv20, (&sd[0]) as u64, 179,
+        20, 20, 0 as u32, 0)
+    var sv16: uisvg.Icon = uisvg.icon_new()
+    uisvg.icon_render(&sv16, (&sd[0]) as u64, 179, 16, 16, 0 as u32, 0)
+    var sv40: uisvg.Icon = uisvg.icon_new()
+    uisvg.icon_render(&sv40, (&sd[0]) as u64, 179, 40, 40, 0 as u32, 0)
+
+    var lab: [u8; 8] = "Speicher"
+    var lab2: [u8; 7] = "Drucken"
+
+    // ================================================================
+    // BAND 1 -- A BUTTON WITH AN ICON, FIVE STATES
+    // ================================================================
+    var c1: [u8; 51] = "1  Knopf mit Icon links vom Text -- fuenf Zustaende"
+    put_text(&c, (&c1[0]) as u64, 51, 20.0, 14.0, 500.0)
+
+    var bx: f64 = 20.0
+    var st: usize = 0
+    while st < 5 {
+        var b: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+        widget.w_place(&b, bx, 38.0, 150.0, 40.0)
+        widget.w_set_text(&b, (&lab[0]) as u64, 8)
+        widget.w_set_image(&b, (&disc) as u64)
+        widget.w_set_art_align(&b, widget.ART_LEFT)
+        widget.w_set_art_size(&b, 18, 18)
+        if st == 1 { widget.w_set_hover(&b, true) }
+        if st == 2 { widget.w_set_active(&b, true) }
+        if st == 3 { widget.w_set_focus(&b, true) }
+        if st == 4 { widget.w_set_disabled(&b, true) }
+        wave2.draw_any(&c, &b)
+        bx = bx + 166.0
+        st = st + 1
+    }
+
+    // ================================================================
+    // BAND 2 -- A LABEL WITH A PICTURE, AND AN ICON-ONLY TOOLBAR
+    // ================================================================
+    var c2: [u8; 55] = "2  Beschriftung mit Bild, daneben Toolbar nur mit Icons"
+    put_text(&c, (&c2[0]) as u64, 55, 20.0, 96.0, 600.0)
+
+    var lb: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&lb, 20.0, 120.0, 220.0, 44.0)
+    widget.w_set_text(&lb, (&lab2[0]) as u64, 7)
+    widget.w_set_image(&lb, (&disc) as u64)
+    widget.w_set_art_align(&lb, widget.ART_LEFT)
+    widget.w_set_art_size(&lb, 26, 26)
+    render.draw_label(&c, &lb)
+
+    // the toolbar strip
+    var tb: widget.Widget = widget.widget_new(widget.KIND_TOOLBAR)
+    widget.w_place(&tb, 270.0, 116.0, 300.0, 52.0)
+    wave2.draw_any(&c, &tb)
+    var tx: f64 = 280.0
+    var k: usize = 0
+    while k < 6 {
+        var ib: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+        widget.w_place(&ib, tx, 122.0, 40.0, 40.0)
+        if k % 2 == 0 {
+            widget.w_set_image(&ib, (&disc) as u64)
+        } else if svok {
+            widget.w_set_svg(&ib, (&sv20) as u64)
+        }
+        widget.w_set_art_align(&ib, widget.ART_ONLY)
+        widget.w_set_art_size(&ib, 20, 20)
+        if k == 2 { widget.w_set_hover(&ib, true) }
+        if k == 4 { widget.w_set_selected(&ib, true) }
+        wave2.draw_any(&c, &ib)
+        tx = tx + 46.0
+        k = k + 1
+    }
+
+    // A TINTED icon next to an untinted one, same source.
+    var c2b: [u8; 45] = "getoent (folgt dem Thema)   /   eigene Farben"
+    put_text(&c, (&c2b[0]) as u64, 45, 600.0, 100.0, 290.0)
+    var t1w: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&t1w, 600.0, 122.0, 40.0, 40.0)
+    widget.w_set_image(&t1w, (&disc) as u64)
+    widget.w_set_art_align(&t1w, widget.ART_ONLY)
+    widget.w_set_art_size(&t1w, 20, 20)
+    widget.w_set_art_tint(&t1w, style.color_token(style.TOK_ACCENT))
+    wave2.draw_any(&c, &t1w)
+    var t2w: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&t2w, 650.0, 122.0, 40.0, 40.0)
+    widget.w_set_image(&t2w, (&disc) as u64)
+    widget.w_set_art_align(&t2w, widget.ART_ONLY)
+    widget.w_set_art_size(&t2w, 20, 20)
+    wave2.draw_any(&c, &t2w)
+
+    // ================================================================
+    // BAND 3 -- THE SAME SVG AT SIX SIZES
+    // ================================================================
+    var c3: [u8; 85] = "3  DASSELBE SVG je Groesse neu gerastert 12..64  |  rechts: currentColor = TOK_ACCENT"
+    put_text(&c, (&c3[0]) as u64, 85, 20.0, 186.0, 600.0)
+
+    if svok {
+        var sizes: [usize; 6] = [12, 16, 24, 32, 48, 64]
+        var sx: f64 = 24.0
+        var i3: usize = 0
+        while i3 < 6 {
+            let d: usize = sizes[i3]
+            // JE GROESSE NEU GERASTERT. Nicht einmal gerastert und dann
+            // skaliert -- sonst waere das ganze Band ein Beweis fuer das
+            // Gegenteil.
+            var one: uisvg.Icon = uisvg.icon_new()
+            if uisvg.icon_render(&one, (&sd[0]) as u64, 179, d, d,
+                0 as u32, 0) {
+                var vv: uiimage.Image = uisvg.icon_view(&one)
+                uiimage.image_draw(&z, &vv, sx,
+                    210.0 + (64.0 - (d as f64)) / 2.0, d as f64,
+                    d as f64, uiimage.FIT_CONTAIN, 0 as u32)
+            }
+            // Dieselbe Leiter noch einmal, aber die Farbe kommt als
+            // currentColor aus dem THEMA (TOK_ACCENT) -- Justins Zusatz.
+            var two: uisvg.Icon = uisvg.icon_new()
+            let acc: u32 = render.color_of(&c,
+                style.color_token(style.TOK_ACCENT))
+            if uisvg.icon_render(&two, (&sd2[0]) as u64, 139, d, d,
+                acc, 0) {
+                var vv2: uiimage.Image = uisvg.icon_view(&two)
+                uiimage.image_draw(&z, &vv2, 470.0 + sx - 24.0,
+                    210.0 + (64.0 - (d as f64)) / 2.0, d as f64,
+                    d as f64, uiimage.FIT_CONTAIN, 0 as u32)
+            }
+            uisvg.icon_free(&one)
+            uisvg.icon_free(&two)
+            sx = sx + (d as f64) + 22.0
+            i3 = i3 + 1
+        }
+    }
+
+    // ================================================================
+    // BAND 4 -- TRANSPARENCY OVER COLOURED GROUNDS
+    // ================================================================
+    var c4: [u8; 71] = "4  Bild mit Transparenz ueber farbigem Grund (Alpha steigt nach rechts)"
+    put_text(&c, (&c4[0]) as u64, 71, 20.0, 300.0, 700.0)
+
+    let fade: u64 = make_fade(48)
+    var fim: uiimage.Image = uiimage.image_wrap(fade, 48, 48, 0)
+    // three grounds: dark, mid, light
+    var g3: [u32; 3] = [4279505940 as u32, 4287137928 as u32,
+        4293848814 as u32]
+    var gx: f64 = 24.0
+    var i5: usize = 0
+    while i5 < 3 {
+        painter.surface(&z, gx, 324.0, 150.0, 60.0, g3[i5])
+        // the picture drawn over the middle of it
+        uiimage.image_draw(&z, &fim, gx + 51.0, 330.0, 48.0, 48.0,
+            uiimage.FIT_CONTAIN, 0 as u32)
+        gx = gx + 166.0
+        i5 = i5 + 1
+    }
+    // and a checkerboard ground, where a wrong alpha is unmistakable
+    var cby: usize = 0
+    while cby < 6 {
+        var cbx: usize = 0
+        while cbx < 15 {
+            var col: u32 = 4293848814 as u32
+            if (cbx + cby) % 2 == 0 { col = 4282203453 as u32 }
+            painter.surface(&z, 522.0 + (cbx as f64) * 10.0,
+                324.0 + (cby as f64) * 10.0, 10.0, 10.0, col)
+            cbx = cbx + 1
+        }
+        cby = cby + 1
+    }
+    uiimage.image_draw(&z, &fim, 573.0, 330.0, 48.0, 48.0,
+        uiimage.FIT_CONTAIN, 0 as u32)
+
+    // ================================================================
+    // BAND 5 -- TABS AND MENU ENTRIES
+    // ================================================================
+    var c5: [u8; 36] = "5  Reiter und Menueintraege mit Icon"
+    put_text(&c, (&c5[0]) as u64, 36, 20.0, 404.0, 600.0)
+
+    var names: [u8; 24] = "AllgemeinNetzKontoHilfe\0"
+    var offs: [usize; 4] = [0, 9, 13, 18]
+    var lens: [usize; 4] = [9, 4, 5, 5]
+    var tabx: f64 = 24.0
+    var i6: usize = 0
+    while i6 < 4 {
+        var tw: widget.Widget = widget.widget_new(widget.KIND_TAB)
+        widget.w_set_text(&tw, (&names[0]) as u64 + offs[i6] as u64,
+            lens[i6])
+        if svok {
+            widget.w_set_svg(&tw, (&sv16) as u64)
+        }
+        widget.w_set_art_align(&tw, widget.ART_LEFT)
+        widget.w_set_art_size(&tw, 16, 16)
+        // Getoent mit der TEXTFARBE, damit der Reiter im hellen UND im
+        // dunklen Thema lesbar ist -- eine feste Farbe waere in einem der
+        // beiden falsch.
+        widget.w_set_art_tint(&tw, style.color_token(style.TOK_TEXT))
+        if i6 == 0 { widget.w_set_selected(&tw, true) }
+        if i6 == 2 { widget.w_set_hover(&tw, true) }
+        // DIE BREITE WIRD GEMESSEN, nicht geraten. Der erste Entwurf hat
+        // hier feste 130 Punkte gesetzt -- und im Bild stand dann
+        // "Allgemei" statt "Allgemein". Genau dafuer rechnet
+        // render.pref_of das Icon samt Abstand mit ein; wer die Breite
+        // raet, schneidet die Beschriftung ab.
+        var tpw: f64 = 0.0
+        var tph: f64 = 0.0
+        render.pref_of(&c, &tw, &tpw, &tph)
+        widget.w_place(&tw, tabx, 428.0, tpw, 40.0)
+        wave2.draw_any(&c, &tw)
+        tabx = tabx + tpw + 8.0
+        i6 = i6 + 1
+    }
+
+    // a menu panel with four entries
+    var mp: widget.Widget = widget.widget_new(widget.KIND_MENU)
+    widget.w_place(&mp, 24.0, 484.0, 260.0, 124.0)
+    wave2.draw_any(&c, &mp)
+    var my: f64 = 490.0
+    var i7: usize = 0
+    while i7 < 4 {
+        var me: widget.Widget = widget.widget_new(widget.KIND_MENU)
+        widget.w_place(&me, 28.0, my, 252.0, 28.0)
+        widget.w_set_text(&me, (&names[0]) as u64 + offs[i7] as u64,
+            lens[i7])
+        widget.w_set_image(&me, (&disc) as u64)
+        widget.w_set_art_align(&me, widget.ART_LEFT)
+        widget.w_set_art_size(&me, 14, 14)
+        if i7 == 1 { widget.w_set_hover(&me, true) }
+        if i7 == 3 { widget.w_set_disabled(&me, true) }
+        wave2.draw_menu_item(&c, &me, false, i7 == 2)
+        my = my + 29.0
+        i7 = i7 + 1
+    }
+
+    // a big ART_ABOVE tile, the start menu case
+    var c6: [u8; 18] = "ART_ABOVE (Kachel)"
+    put_text(&c, (&c6[0]) as u64, 18, 320.0, 484.0, 300.0)
+    var tilex: f64 = 320.0
+    var i8: usize = 0
+    while i8 < 3 {
+        var ti: widget.Widget = widget.widget_new(widget.KIND_TILE)
+        widget.w_place(&ti, tilex, 506.0, 92.0, 92.0)
+        widget.w_set_text(&ti, (&names[0]) as u64 + offs[i8] as u64,
+            lens[i8])
+        if svok {
+            widget.w_set_svg(&ti, (&sv40) as u64)
+        }
+        widget.w_set_art_align(&ti, widget.ART_ABOVE)
+        widget.w_set_art_size(&ti, 40, 40)
+        if i8 == 1 { widget.w_set_hover(&ti, true) }
+        wave2.draw_any(&c, &ti)
+        tilex = tilex + 100.0
+        i8 = i8 + 1
+    }
+
+    // ---- out
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(&cv, &out) { return 7 }
+    if !rt.write_file(path, mem.buf_ptr(&out) as u64, mem.buf_len(&out)) {
+        return 8
+    }
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    return 0
+}
