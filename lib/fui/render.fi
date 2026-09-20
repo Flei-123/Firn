@@ -42,6 +42,8 @@ import fui.transform
 
 export {
     Ctx, ctx_new, ctx_theme, ctx_painter,
+    ctx_bind_anim, ctx_unbind_anim, ctx_set_time, ctx_time,
+    anim_run, anim_none, anim_bg_of,
     shadow_color, is_raised, draw_elevation,
     draw_base, draw_widget, draw_label, draw_button,
     draw_text, draw_focus_ring,
@@ -61,10 +63,95 @@ export {
 struct Ctx {
     m: u64,   // *mut theme.Theme
     z: u64,   // *mut painter.Painter
+    // ================================================ DIE ZEIT IM BILD
+    //
+    // Ein Knopf, der beim Ueberfahren SPRINGT, sieht alt aus -- das ist
+    // der ganze Grund, aus dem es lib/fui/anim.fi gibt. Bis zur Runde
+    // FEHLERBEHEBUNG fuehrte den Uebergang aber NUR das Demoprogramm,
+    // und damit war er genau das, was diese Bibliothek verhindern soll:
+    // jede Anwendung haette ihren eigenen bauen muessen. Jetzt fuehrt
+    // ihn der Zeichenweg selbst.
+    //
+    // WARUM EIN FUNKTIONSZEIGER UND KEIN `anim.Animator` ALS FELD:
+    // anim.fi fragt render.fi nach den ZIELWERTEN eines Zustandes
+    // (`render.def_bg_state`, `def_radius`, `def_border_width` -- die
+    // Kaskade steht hier und darf kein zweites Mal geschrieben werden),
+    // also importiert anim.fi diese Datei. Andersherum waere ein
+    // Kreis, und keine der beiden Dateien liesse sich uebersetzen. Ein
+    // FELD hingegen wird zur Laufzeit gesetzt: `anim.transreg_bind`
+    // haengt das Register ein, und render.fi ruft eine Funktion, die
+    // es nicht kennt. Dieselbe Loesung wie die Trefferpruefung in
+    // control.fi, und aus demselben Grund.
+    //
+    // `ms` ist die Uhrzeit des laufenden Bildes. Sie gehoert dem
+    // Aufrufer (S2 in control.fi: die Uhr haelt, wer das Fenster
+    // haelt); hier steht nur, welchen Stand das gerade gemalte Bild
+    // zeigt.
+    an: u64,   // Zustand des Registers, sein Eigentuemer ist der Aufrufer
+    ah: fn(u64, u64, u64, i64) -> bool,
+    ms: i64,
 }
 
 fn ctx_new(m: *mut theme.Theme, z: *mut painter.Painter) -> Ctx {
-    return Ctx { m: m as u64, z: z as u64 }
+    return Ctx { m: m as u64, z: z as u64, an: 0, ah: anim_none, ms: 0 }
+}
+
+// DIE VORGABE: es gibt keine Zeit im Bild, und nichts ist veraltet.
+// Ohne eingehaengtes Register malt render.fi Bild fuer Bild genau das,
+// was es immer gemalt hat.
+fn anim_none(reg: u64, cx: u64, wx: u64, now_ms: i64) -> bool {
+    return false
+}
+
+fn ctx_bind_anim(c: *mut Ctx, reg: u64,
+    h: fn(u64, u64, u64, i64) -> bool) {
+    (*c).an = reg
+    (*c).ah = h
+}
+
+fn ctx_unbind_anim(c: *mut Ctx) {
+    (*c).an = 0
+    (*c).ah = anim_none
+}
+
+// Die Uhrzeit des Bildes setzen. Zurueck kommt nichts: ob etwas neu zu
+// malen ist, sagt `anim_run` beim Malen -- und nur das ist ehrlich,
+// denn die Antwort haengt am Widget und nicht an der Uhr.
+fn ctx_set_time(c: *mut Ctx, ms: i64) {
+    (*c).ms = ms
+}
+
+fn ctx_time(c: *mut Ctx) -> i64 { return (*c).ms }
+
+// DEN UEBERGANG EINES WIDGETS WEITERRECHNEN. `true` heisst: das Bild
+// ist veraltet, der Aufrufer soll im naechsten Takt wieder malen.
+//
+// Was dabei geschieht, entscheidet das eingehaengte Register: die
+// Fassung in anim.fi setzt den Tween bei einem Zustandswechsel neu an,
+// rechnet ihn auf `now_ms` und schreibt den Zwischenstand (Farbe,
+// Radius, Randstaerke, Deckung) in den Style des Widgets zurueck --
+// weshalb der Rest dieser Datei davon nichts merkt und einfach malt.
+fn anim_run(c: *mut Ctx, e: *mut widget.Widget) -> bool {
+    if (*c).an == 0 {
+        return false
+    }
+    return (*c).ah((*c).an, c as u64, e as u64, (*c).ms)
+}
+
+// DIE FLAECHENFARBE, DIE DIESER ZEICHENWEG GERADE MALEN WUERDE.
+//
+// Dieselbe Rechnung wie in `draw_base`, nur ohne Leinwand -- damit
+// eine Pruefung den Wert AUS DEM RENDER-PFAD lesen kann und nicht die
+// Kaskade nachbaut. Nach `anim_run` steht hier die gemischte Farbe des
+// laufenden Uebergangs.
+fn anim_bg_of(c: *mut Ctx, e: *mut widget.Widget) -> u32 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let bg: u32 = style.resolve_bg(sz, widget.w_state(e),
+        def_bg_state(widget.w_kind(e), widget.w_state(e)))
+    if !style.color_is_visible(bg) {
+        return 0 as u32
+    }
+    return theme.opaque(color_of(c, bg))
 }
 
 fn ctx_theme(c: *mut Ctx) -> *mut theme.Theme {
@@ -1016,6 +1103,16 @@ fn draw_label(c: *mut Ctx, e: *mut widget.Widget) {
 // widget defaults (fill instead of transparent, text centred instead of
 // left).
 fn draw_button(c: *mut Ctx, e: *mut widget.Widget) {
+    // DER UEBERGANG LAEUFT HIER, nicht in der Anwendung. Ohne
+    // eingehaengtes Register kostet die Zeile einen Vergleich.
+    //
+    // WARUM IN `draw_button` UND NICHT IN `draw_base`: die Wellen 2/3
+    // malen ihre Bausteine (Kasten, Griff, Bahn) als KURZLEBIGE
+    // Widgets auf dem Stapel durch `draw_base`. Ein Register, das sich
+    // seine Eintraege nach der Adresse des Widgets merkt, bekaeme dort
+    // Adressen, die gleich wieder jemand anderem gehoeren. Der ganze
+    // Knopf ist langlebig, sein Griff ist es nicht.
+    let dirty: bool = anim_run(c, e)
     draw_base(c, e)
     draw_widget_art(c, e)
     draw_text(c, e)
@@ -1049,6 +1146,9 @@ fn draw_button(c: *mut Ctx, e: *mut widget.Widget) {
 // von control.fi trifft das gedrehte Widget.
 fn draw_widget_xf(c: *mut Ctx, e: *mut widget.Widget,
     xf: *mut transform.Xform) {
+    // Auch der gedrehte Weg fuehrt den Uebergang -- sonst haette ein
+    // schief stehender Knopf kein Hover und niemand wuesste warum.
+    let dirty: bool = anim_run(c, e)
     let z: *mut painter.Painter = ctx_painter(c)
     let sz: *mut style.StyleSet = widget.w_styleset(e)
     let kind: u32 = widget.w_kind(e)

@@ -95,6 +95,12 @@ export {
     widget_target_bg, widget_target_radius, widget_target_border,
     widget_target_alpha,
     trans_from_widget, trans_force_widget, trans_apply, trans_place,
+    // --- Das Register, das der Zeichenweg fuehrt
+    TransReg, transreg_new, transreg_bind, transreg_unbind,
+    transreg_hook, transreg_slot, transreg_find, transreg_count,
+    transreg_index, transreg_clear,
+    transreg_set_duration, transreg_set_easing, transreg_set_oklab,
+    transreg_kind_ok, transreg_dirty, TRANS_MAX,
 }
 
 // ================================================================ EASINGS
@@ -921,4 +927,215 @@ fn trans_apply(t: *mut Transition, e: *mut widget.Widget) {
 fn trans_place(t: *mut Transition, e: *mut widget.Widget, x: f64, y: f64,
     w: f64, h: f64) {
     widget.w_place(e, x + trans_dx(t), y + trans_dy(t), w, h)
+}
+
+// ======================================================================
+// DAS REGISTER, DAS DER ZEICHENWEG SELBST FUEHRT
+// ======================================================================
+//
+// WARUM ES DAS GIBT. Alles ueber dieser Zeile rechnet richtig und
+// wartet darauf, dass jemand es ruft -- und bis zur Runde
+// FEHLERBEHEBUNG rief es genau ein Programm (demos/fuidemo). Damit
+// waere `anim.Transition` das geworden, wogegen diese Bibliothek
+// angetreten ist: eine Faehigkeit, die jede Anwendung sich selbst
+// zusammensetzt, und neunzehn von zwanzig setzen sie anders zusammen.
+//
+// Das Register haelt JE WIDGET EINEN UEBERGANG und wird von
+// `render.draw_button` bei jedem Bild angestossen. Ein Aufrufer
+// braucht dafuer zwei Zeilen:
+//
+//     var reg: anim.TransReg = anim.transreg_new()
+//     anim.transreg_bind(&reg, &ctx)
+//
+// Danach laeuft der Wechsel normal -> hover -> gedrueckt -> Fokus
+// jedes Knopfes ueber die Zeit, ohne dass die Anwendung davon etwas
+// weiss. `render.anim_run` gibt zurueck, ob das Bild veraltet ist --
+// daran haengt das bedarfsgesteuerte Neuzeichnen.
+//
+// DER SCHLUESSEL IST DIE ADRESSE DES WIDGETS. Das passt zu der Art,
+// wie fUi Widgets haelt (der Aufrufer besitzt ein Feld, das laenger
+// lebt als ein Bild -- widget.fi E1). Kurzlebige Bausteine auf dem
+// Stapel gehoeren deshalb NICHT hierher, und darum stoesst render.fi
+// das Register in `draw_button` an und nicht in `draw_base`; der
+// Grund steht dort ausgeschrieben.
+const TRANS_MAX: usize = 32
+
+struct TransReg {
+    k: [u64; 32],          // die Widgets, nach Adresse
+    // DER RUHESTIL DES WIDGETS, wie er beim ersten Bild aussah.
+    //
+    // `trans_apply` schreibt den Zwischenstand IN den Style des
+    // Widgets -- das ist der Grund, aus dem render.fi davon nichts
+    // wissen muss. Genau daraus folgt aber eine Falle, und sie hat
+    // beim ersten Versuch zugeschnappt: beim naechsten Bild holt
+    // `widget_target_bg` die ZIELfarbe wieder aus derselben Kaskade,
+    // und dort steht jetzt die gemischte Farbe von eben. Der
+    // Uebergang liefe dann auf seinen eigenen Zwischenstand zu und
+    // ruehrte sich nie vom Fleck (gemessen: der Knopf blieb auf
+    // 0x42414D stehen).
+    //
+    // Deshalb merkt sich das Register den Stil, den das Widget beim
+    // ersten Bild hatte, und setzt ihn vor jeder Frage nach den
+    // Zielwerten zurueck. WER DEN STIL EINES WIDGETS SPAETER AENDERT,
+    // sagt es mit `transreg_clear` -- sonst malt das Register weiter
+    // den alten.
+    b: [style.Style; 32],
+    t: [Transition; 32],
+    n: usize,
+    dur: i64,              // die Dauer, die ein neuer Eintrag bekommt
+    ease: Easing,
+    oklab: u32,
+    dirty: u32,            // hat im letzten Takt etwas gearbeitet?
+}
+
+// 120 ms und ease-out ist die Vorgabe, die Material und Fluent fuer
+// einen Zustandswechsel nennen: kurz genug, dass es nicht traege
+// wirkt, lang genug, dass das Auge die Bewegung sieht.
+fn transreg_new() -> TransReg {
+    return TransReg {
+        k: [0 as u64; 32],
+        b: [style.style_new(); 32],
+        t: [trans_new(0 as u32, 0.0, 0.0, 1.0); 32],
+        n: 0, dur: 120, ease: easing_named(EASE_OUT), oklab: 0,
+        dirty: 0,
+    }
+}
+
+fn transreg_count(r: *mut TransReg) -> usize { return (*r).n }
+
+// Alles vergessen. Danach wird jedes Widget beim naechsten Bild neu
+// aufgenommen -- mit dem Stil, den es DANN hat.
+fn transreg_clear(r: *mut TransReg) {
+    (*r).n = 0
+    (*r).dirty = 0
+}
+fn transreg_dirty(r: *mut TransReg) -> bool { return (*r).dirty != 0 }
+
+fn transreg_set_duration(r: *mut TransReg, ms: i64) {
+    if ms < 1 {
+        (*r).dur = 1
+    } else {
+        (*r).dur = ms
+    }
+}
+
+fn transreg_set_easing(r: *mut TransReg, e: Easing) { (*r).ease = e }
+
+fn transreg_set_oklab(r: *mut TransReg, an: bool) {
+    if an {
+        (*r).oklab = 1
+    } else {
+        (*r).oklab = 0
+    }
+}
+
+// WELCHE ELEMENTE EINEN UEBERGANG BEKOMMEN. Die, deren Flaechenfarbe
+// am Zustand haengt -- genau die Liste, die `render.def_bg_state`
+// fuehrt. Ein Etikett hat keinen Zustand, den man sehen koennte, und
+// ein Trennstrich erst recht nicht; fuer sie waere der Eintrag im
+// Register nur verbrauchter Platz.
+fn transreg_kind_ok(k: u32) -> bool {
+    return k == widget.KIND_BUTTON || k == widget.KIND_TOGGLE
+        || k == widget.KIND_TILE || k == widget.KIND_TAB
+        || k == widget.KIND_TEXTBOX
+}
+
+// Den Eintrag eines Widgets suchen. TRANS_MAX heisst "keiner".
+fn transreg_find(r: *mut TransReg, e: *mut widget.Widget) -> usize {
+    var i: usize = 0
+    while i < (*r).n {
+        if (*r).k[i] == (e as u64) {
+            return i
+        }
+        i = i + 1
+    }
+    return TRANS_MAX
+}
+
+// Den Eintrag holen und, wenn es ihn noch nicht gibt, anlegen -- auf
+// den WAHREN Werten des Widgets (`trans_force_widget`), damit der
+// erste Wechsel von dort losgeht, wo der Knopf steht, und nicht von
+// einem Schwarz.
+//
+// Ist das Register voll, kommt 0 zurueck. Das ist sichtbar und ehrlich:
+// der Knopf springt dann wie frueher, statt dass irgendwo Speicher
+// angefordert wird, den fUi nicht hat.
+fn transreg_index(r: *mut TransReg, c: *mut render.Ctx,
+    e: *mut widget.Widget, now_ms: i64) -> usize {
+    let i: usize = transreg_find(r, e)
+    if i < TRANS_MAX {
+        return i
+    }
+    if (*r).n >= TRANS_MAX {
+        return TRANS_MAX
+    }
+    let j: usize = (*r).n
+    (*r).n = j + 1
+    (*r).k[j] = e as u64
+    (*r).b[j] = *widget.w_style(e)
+    (*r).t[j] = trans_new(widget_target_bg(c, e, widget.w_state(e)),
+        widget_target_radius(c, e, widget.w_state(e)),
+        widget_target_border(c, e, widget.w_state(e)),
+        widget_target_alpha(c, e, widget.w_state(e)))
+    trans_set_duration(&(*r).t[j], (*r).dur)
+    trans_set_easing(&(*r).t[j], (*r).ease)
+    trans_set_oklab(&(*r).t[j], (*r).oklab != 0)
+    trans_force_widget(&(*r).t[j], c, e, now_ms)
+    return j
+}
+
+fn transreg_slot(r: *mut TransReg, c: *mut render.Ctx,
+    e: *mut widget.Widget, now_ms: i64) -> *mut Transition {
+    let i: usize = transreg_index(r, c, e, now_ms)
+    if i >= TRANS_MAX {
+        return 0 as *mut Transition
+    }
+    return &(*r).t[i]
+}
+
+// DIE FUNKTION, DIE render.fi RUFT. Die Zeiger kommen als Zahlen an,
+// weil render.fi diese Datei nicht kennen darf (der Grund steht dort
+// bei `Ctx`): anim.fi fragt render.fi nach den Zielwerten, also zeigt
+// die Abhaengigkeit in diese Richtung und nicht zurueck.
+//
+// Der Ablauf ist der eines Bildes: bei einem Zustandswechsel den Tween
+// neu ansetzen, auf die Uhrzeit rechnen, den Zwischenstand in den Style
+// zurueckschreiben. Zurueck kommt "das Bild ist veraltet".
+fn transreg_hook(reg: u64, cx: u64, wx: u64, now_ms: i64) -> bool {
+    if reg == 0 || cx == 0 || wx == 0 {
+        return false
+    }
+    let r: *mut TransReg = reg as *mut TransReg
+    let c: *mut render.Ctx = cx as *mut render.Ctx
+    let e: *mut widget.Widget = wx as *mut widget.Widget
+    if !transreg_kind_ok(widget.w_kind(e)) {
+        return false
+    }
+    let i: usize = transreg_index(r, c, e, now_ms)
+    if i >= TRANS_MAX {
+        return false
+    }
+    // Erst den Ruhestil zurueck, DANN nach den Zielwerten fragen --
+    // der Grund steht oben am Feld `b`.
+    *widget.w_style(e) = (*r).b[i]
+    let t: *mut Transition = &(*r).t[i]
+    // Der Wechsel setzt den Tween neu an; die Dauer des ZIELzustandes
+    // gilt, und die steht im Uebergang selbst.
+    var d: bool = trans_from_widget(t, c, e, now_ms)
+    if trans_tick(t, now_ms) {
+        d = true
+    }
+    trans_apply(t, e)
+    if d {
+        (*r).dirty = 1
+    }
+    return d
+}
+
+fn transreg_bind(r: *mut TransReg, c: *mut render.Ctx) {
+    render.ctx_bind_anim(c, r as u64, transreg_hook)
+}
+
+fn transreg_unbind(r: *mut TransReg, c: *mut render.Ctx) {
+    render.ctx_unbind_anim(c)
 }
