@@ -227,7 +227,7 @@ Set `BELEGE` to put them somewhere else. If that directory cannot be
 created or written, the run says so and exits non-zero; it does not
 print `ALL CHECKS PASSED` with pictures missing.
 
-The same eighteen files are checked in under `.gauntlet-shots/`, light
+The same twenty files are checked in under `.gauntlet-shots/`, light
 and dark for each, numbered in reading order. Which picture carries
 which point of the acceptance bar:
 
@@ -242,6 +242,7 @@ which point of the acceptance bar:
 | `13/14-flex-{hell,dunkel}.png` | `gallery6_main.fi` | bar 4: several flex variants side by side with correct gaps (justify, align-self, wrap, align-content, grow/shrink) |
 | `15/16-effekt-blur-glas-{hell,dunkel}.png` | `gallery7_main.fi` | bar 4: soft shadows with a visible gradient (no hard edge), glass/backdrop blur over a patterned ground, colour matrix |
 | `17/18-transform-{hell,dunkel}.png` | `gallery8_main.fi` | bar 4: rotated and scaled widgets with clean edges (no stair-stepping) |
+| `19/20-demo-app-{hell,dunkel}.png` | `demos/fuidemo/main.fi` | bar 2: the three new modules have a caller OUTSIDE their own check -- title bar and tool bar distributed by `flex.flex_layout` (grow on the field, measured through `render.pref_of`), the hover transition of a button driven by `anim.Animator` in seven labelled phases, the dialog shadow from `effect.drop_shadow_spread` |
 
 The set is refreshed from the run with
 
