@@ -13,7 +13,10 @@
 set -e
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
-FIRNC="${FIRNC:-/root/firn-dnspic/compiler/target/release/firnc}"
+FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
+# Freestanding-Ziel gibt es nicht in jedem Compiler-Stand; dann ohne --target.
+NONE_T="--target=x86_64-none"
+if ! "$FIRNC" --help 2>&1 | grep -q "x86_64-none"; then NONE_T=""; fi
 W="${W:-/tmp/fui-acceptance}"
 mkdir -p "$W"
 
@@ -25,11 +28,11 @@ echo "== 1. THE CORE BUILDS FREESTANDING (profile kernel) =="
 # This is Justin's architecture: the same source in the kernel and in
 # the application. What is checked: that it builds AND that no syscall
 # and no foreign name is left inside.
-"$FIRNC" --profile=kernel --target=x86_64-none -c \
+"$FIRNC" --profile=kernel $NONE_T -c \
     -o "$W/core.o" lib/fui/core.fi
-"$FIRNC" --profile=kernel --target=x86_64-none -c \
+"$FIRNC" --profile=kernel $NONE_T -c \
     -o "$W/style.o" lib/fui/style.fi
-"$FIRNC" --profile=kernel --target=x86_64-none -c \
+"$FIRNC" --profile=kernel $NONE_T -c \
     -o "$W/layout.o" lib/fui/layout.fi
 for o in core style layout; do
     n=$(objdump -d "$W/$o.o" | grep -c syscall || true)
