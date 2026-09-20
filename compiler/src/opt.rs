@@ -958,9 +958,41 @@ fn const_map(f: &Func) -> HashMap<Val, i128> {
     m
 }
 
+/// RUNDE TEMPO -- `+% -% *%` IST GEWOEHNLICHE RECHNUNG.
+///
+/// `Op::BinWrapSat { kind: Wrap, .. }` und `Op::Bin` bedeuten im FIR DASSELBE:
+/// beide behalten die unteren Bits, beide pruefen nichts (gepruefte Rechnung
+/// heisst `Op::CheckedBin`). Der Unterschied war rein syntaktisch -- das eine
+/// stand im Quelltext als `+%`, das andere kam aus `+` in `release-fast`.
+///
+/// Das hatte einen messbaren Preis: JEDE Optimierung fragt nach `Op::Bin` --
+/// gemeinsame Teilausdruecke, Schleifeninvarianten, die algebraischen
+/// Kuerzungen und vor allem das FALTEN VON ADRESSEN in den Befehl
+/// (`regalloc::foldable_addresses`). Ein `+%` lief an allen vorbei: aus
+/// `p +% i *% 4` wurden `mov`+`add`+`mov` und ein eigener Zugriff, statt
+/// eines einzigen `movss [base+idx*4]`.
+///
+/// Diese Umschrift macht aus dem einen das andere, einmal vor allen Pässen.
+/// `Sat` bleibt unberuehrt -- das Abschneiden ist wirklich etwas anderes.
+fn canon_wrap(f: &mut Func) -> bool {
+    let mut changed = false;
+    for b in f.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if i.ty.is_float() {
+                continue;
+            }
+            if let Op::BinWrapSat { kind: crate::fir::WrapSatKind::Wrap, op, a, b: bv } = i.op {
+                i.op = Op::Bin(op, a, bv);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
     let mut consts = const_map(f);
-    let mut changed = false;
+    let mut changed = canon_wrap(f);
     for bi in 0..f.blocks.len() {
         for ii in 0..f.blocks[bi].insts.len() {
             let (ty, op, dst) = {
@@ -976,7 +1008,30 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
             // integer wise and would turn `1.5 + 1.5` into silent nonsense.
             // Folding floating point needs its own evaluation that is
             // faithful to rounding — that comes with `comptime` (SPEC §8.6).
-            if ty.is_float() || op_has_float(&op, f) {
+            // RUNDE TEMPO -- die EINE Ausnahme: das Vorzeichen einer
+            // Gleitzahl-Konstante. Es ist ein Bit, kein Rechenschritt; das
+            // Kippen ist exakt, fuer jede Zahl, auch fuer 0 und NaN. Ohne
+            // diese Regel stand `-32767.5f` als Rechnung im Programm
+            // (Konstante laden, Vorzeichenmaske laden, xor) -- gemessen im
+            // Tondekoder, in der innersten Schleife.
+            if ty.is_float() {
+                if let Op::Un(crate::fir::UnOp::Neg, x) = op {
+                    if let Some(&c) = consts.get(&x) {
+                        let bit: i128 = if ty == crate::fir::FTy::F32 {
+                            1i128 << 31
+                        } else {
+                            1i128 << 63
+                        };
+                        let neu = ty.truncate(c ^ bit);
+                        f.blocks[bi].insts[ii].op = Op::Const(neu);
+                        consts.insert(dst, neu);
+                        st.folded += 1;
+                        changed = true;
+                    }
+                }
+                continue;
+            }
+            if op_has_float(&op, f) {
                 continue;
             }
             let folded = match op {

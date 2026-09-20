@@ -1134,8 +1134,16 @@ fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Optio
 fn fp_taugt(f: &Func) -> Vec<bool> {
     let nv = f.val_types.len();
     let mut ok: Vec<bool> = (0..nv).map(|v| f.val_ty(v as Val).is_float()).collect();
+    // RUNDE TEMPO: ein Fliesskomma-PARAMETER darf jetzt in seinem Register
+    // bleiben. Der Vorspann kann das laengst (`Loc::Reg` oben, eine
+    // `movaps`-Kopie oder gar nichts); ausgeschlossen war er nur, weil der
+    // Zuteilerweg zu Beginn der Runde XMM3 kein Fliesskomma ausgab. Jede
+    // andere Bedingung bleibt: wer ausserhalb des Fliesskommaweges angefasst
+    // wird oder einen Aufruf ueberlebt, behaelt seinen Platz.
     for i in 0..f.params.len().min(nv) {
-        ok[i] = false;
+        if !f.params[i].is_float() {
+            ok[i] = false;
+        }
     }
     let mut buf: Vec<Val> = Vec::new();
     for b in &f.blocks {
@@ -1144,15 +1152,34 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 let erzeugt_gut = matches!(
                     &inst.op,
                     Op::Const(_) | Op::Bin(..) | Op::Cast { .. } | Op::Load { .. } | Op::Copy { .. }
-                );
+                ) || matches!(&inst.op, Op::Un(UnOp::Neg, _));
                 if !erzeugt_gut && (d as usize) < nv {
                     ok[d as usize] = false;
                 }
             }
+            // RUNDE TEMPO -- FEHLER AUS RUNDE XMM3 BEHOBEN. Hier stand
+            // frueher "Bin, Cmp, Cast, Copy, Store: immer gut". Das war zu
+            // grosszuegig: die Aufrufkonvention kopiert einen Verbund
+            // ACHTBYTEWEISE, und dabei steht eine `store.u64` mit einem
+            // Wert, dessen Typ `f64` ist (ein Feld `{f32,f32}` reist als ein
+            // Achtbyte in xmm0). Diese Anweisung geht ueber den GANZZAHLWEG,
+            // holt ihren Operanden mit `mov` -- und wenn der Wert inzwischen
+            // in einem xmm lebte, schrieb sie Unsinn in den Rahmen
+            // (gemessen: `tests/1452_f32_abi.fi` gab 6 statt 0; im Erzeugten
+            // stand `mov qword ptr [rbp-360], rbp`).
+            //
+            // Es zaehlt deshalb nicht die Art der Anweisung, sondern ob sie
+            // WIRKLICH im Fliesskommaweg steht -- also genau die Bedingung,
+            // unter der die Ausgabe unten ihren Fliesskomma-Zweig nimmt.
             let liest_gut = match &inst.op {
-                Op::Bin(..) | Op::Cmp { .. } | Op::Cast { .. } | Op::Copy { .. } => true,
-                // Beim Speichern ist der WERT eine Gleitzahl, die Adresse nie.
-                Op::Store { .. } => true,
+                Op::Bin(..) | Op::Copy { .. } => inst.ty.is_float(),
+                Op::Un(UnOp::Neg, _) => inst.ty.is_float(),
+                Op::Cmp { ty, .. } => ty.is_float(),
+                Op::Cast { from, .. } => from.is_float() || inst.ty.is_float(),
+                // Beim Speichern ist der WERT eine Gleitzahl, die Adresse nie
+                // -- aber nur, wenn die Anweisung selbst eine Gleitzahl
+                // speichert.
+                Op::Store { .. } => inst.ty.is_float(),
                 _ => false,
             };
             if !liest_gut {
@@ -2838,8 +2865,13 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                         return Some("gepruefte Umwandlung mit Gleitzahl".into());
                     }
                 }
-                Op::Un(_, x) => {
-                    if f.val_ty(*x).is_float() || i.ty.is_float() {
+                // ROUND XMM4: die Vorzeichenumkehr einer Gleitzahl kann
+                // dieser Weg selbst (ein Bit kippen, `xorps`/`xorpd`). `!`
+                // ist fuer Gleitzahlen ueberhaupt nicht definiert -- das
+                // faengt der Grundweg mit seiner Fehlermeldung ab.
+                Op::Un(op, x) => {
+                    let fp = f.val_ty(*x).is_float() || i.ty.is_float();
+                    if fp && !matches!(op, UnOp::Neg) {
                         return Some("einstellige Rechnung mit Gleitzahl".into());
                     }
                 }
@@ -4152,6 +4184,31 @@ fn emit_inst(
                 }
             }
         }
+        // ROUND XMM4 -- Vorzeichenumkehr einer Gleitzahl: das Vorzeichen ist
+        // EIN Bit. `neg` laese das Bitmuster als Zweierkomplement, also wird
+        // nur Bit 31 bzw. 63 gekippt. Die Maske kommt ueber `rax` in ein
+        // Kratzregister (`xmm1`); SSE hat keine Form mit Konstante.
+        Op::Un(UnOp::Neg, x) if ty.is_float() => {
+            let d = i.dst.ok_or("internal error: unary operation without target")?;
+            let single = ty == FTy::F32;
+            let target = match ra.a.loc(d) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => "xmm0",
+            };
+            ra.fp_into(e, target, *x, single);
+            if single {
+                e.line("mov eax, -2147483648");
+                e.line("movd xmm1, eax");
+                e.line(&format!("xorps {}, xmm1", target));
+            } else {
+                e.line("mov rax, -9223372036854775808");
+                e.line("movq xmm1, rax");
+                e.line(&format!("xorpd {}, xmm1", target));
+            }
+            if matches!(ra.a.loc(d), Loc::Slot(_)) {
+                ra.fp_out(e, d, "xmm0", single);
+            }
+        }
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
@@ -4781,6 +4838,26 @@ fn emit_bin(
             }
         };
         let w = ra.fp_work(d);
+        // RUNDE TEMPO -- VERTAUSCHEN STATT KOPIEREN. `addss`/`mulss` haben nur
+        // die zweistellige Form: gerechnet wird ins Zielregister, also muss
+        // der erste Operand vorher hinein. Liegt der ZWEITE Operand schon
+        // dort, kostete das bisher zwei Befehle (Rettung nach `xmm1`, dann die
+        // Kopie des ersten). Addition und Multiplikation sind vertauschbar --
+        // auch in Fliesskomma, Bit fuer Bit, weil beide Operationen
+        // symmetrisch runden (fuer NaN gilt dasselbe: das Ergebnis ist ein
+        // stilles NaN, und Firn verspricht kein bestimmtes Nutzlastmuster).
+        // Subtraktion und Division bleiben unberuehrt.
+        let (a, b) = if matches!(op, BinOp::Add | BinOp::Mul) {
+            let wb = matches!(ra.a.place(b), Loc::Reg(r) if r == w);
+            let wa = matches!(ra.a.place(a), Loc::Reg(r) if r == w);
+            if wb && !wa {
+                (b, a)
+            } else {
+                (a, b)
+            }
+        } else {
+            (a, b)
+        };
         let mut ob = ra.fpo(b, single);
         if is_xmm(&ob) && ob == w {
             e.line(&format!("movaps xmm1, {}", ob));

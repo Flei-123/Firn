@@ -1189,12 +1189,24 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                     // therefore: as soon as floating point is involved on
                     // ONE side and the types differ, nothing is dropped.
                     let floatswitch = (from.is_float() || i.ty.is_float()) && *from != i.ty;
+                    // RUNDE TEMPO: das VORZEICHEN aendert kein Bit. Bei
+                    // GLEICHER Breite ist `i64 -> u64` (und `i32 -> u32`, und
+                    // `u64 -> ptr`) dieselbe Zahl im selben Muster -- die
+                    // Frage, ob sie als negativ gelesen wird, entscheidet
+                    // allein die Anweisung, die sie benutzt (jede traegt ihren
+                    // eigenen Typ). Bis hierher verlangte diese Stelle
+                    // dieselbe Vorzeichenhaftigkeit, und deshalb blieb aus
+                    // `(i as u64)` ein echtes `mov` stehen -- in der
+                    // Adressrechnung des Tondekoders vor jedem einzelnen
+                    // Feldzugriff. Eine GEPRUEFTE Umwandlung ist etwas
+                    // anderes (`Op::CheckedCast`) und kommt hier nie an.
                     if !floatswitch
                         && (*from == i.ty
                             || (from.bits() == i.ty.bits()
-                                && from.signed() == i.ty.signed()
                                 && *from != crate::fir::FTy::Bool
-                                && i.ty != crate::fir::FTy::Bool))
+                                && i.ty != crate::fir::FTy::Bool
+                                && !from.is_float()
+                                && !i.ty.is_float()))
                     {
                         Some(*src)
                     } else {
@@ -1262,11 +1274,17 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                 _ => None,
             };
             if let Some(s) = same {
-                if s != d
-                    && !locked(f, s)
-                    && f.val_ty(s).bits() == f.val_ty(d).bits()
-                    && f.val_ty(s).signed() == f.val_ty(d).signed()
-                {
+                // RUNDE TEMPO: gleiche Breite genuegt; das Vorzeichen ist
+                // keine Eigenschaft des Bitmusters, sondern der Anweisung,
+                // die es liest (siehe oben bei `Op::Cast`). Bool und
+                // Gleitzahlen bleiben getrennt.
+                let same_slot_ty = |x: crate::fir::FTy, y: crate::fir::FTy| {
+                    x.bits() == y.bits()
+                        && x.is_float() == y.is_float()
+                        && (x == crate::fir::FTy::Bool) == (y == crate::fir::FTy::Bool)
+                        && (!x.is_float() || x == y)
+                };
+                if s != d && !locked(f, s) && same_slot_ty(f.val_ty(s), f.val_ty(d)) {
                     map.insert(d, s);
                 }
             }
