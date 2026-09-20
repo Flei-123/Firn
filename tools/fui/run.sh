@@ -134,6 +134,40 @@ echo "== 11. THE TEXT VALUES AT THE PIXEL =="
 build text
 "$W/text"
 
+echo
+echo "== 12. DIE ZEIT: EASINGS, TWEENS, UEBERGAENGE =="
+# Runde UI-WEB: lib/fui/anim.fi. Geprueft werden die Easings an ihren
+# Stuetzstellen (ease-in-out ist bei 0.5 exakt 0.5), die analytisch
+# geloeste Feder (sie kommt zur Ruhe und driftet nicht), der Takt, der
+# nur bei echter Aenderung "neu zeichnen" meldet, und die
+# Farbmischung mit korrektem Alpha.
+build anim
+"$W/anim"
+
+echo
+echo "== 13. FLEX-LAYOUT AM PIXEL =="
+# Jede Zahl hier ist von Hand gerechnet: Verteilung des freien und des
+# fehlenden Platzes, Klemmung an min/max und die NACHVERTEILUNG, die
+# daraus folgt -- der Ort, an dem eine halbfertige Flexbox eine Luecke
+# am rechten Rand laesst.
+build flex
+"$W/flex"
+
+echo
+echo "== 14. UNSCHAERFE, SCHATTEN, FARBMATRIX =="
+# Der Kastenweichzeichner gegen die Faltung von Hand und dreimal
+# Kasten gegen den kubischen B-Spline (1,3,6,7,6,3,1)/27 -- die
+# analytische Antwort, die eine Gauss-Naeherung geben MUSS.
+build effect
+"$W/effect"
+
+echo
+echo "== 15. AFFINE ABBILDUNGEN UND DIE TREFFERPRUEFUNG =="
+# Bekannte Punktbilder, der Stapel, die Kehrabbildung -- und der
+# Klick unter Drehung, der ohne inverse Abbildung danebengeht.
+build transform
+"$W/transform"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
@@ -158,6 +192,22 @@ if [ "$1" = "--images" ]; then
     build artshow
     "$W/artshow" "$Z/fui-bild-svg-hell.png" light
     "$W/artshow" "$Z/fui-bild-svg-dunkel.png" dark
+    # RUNDE UI-WEB: die vier neuen Faehigkeiten, hell und dunkel.
+    # Eine Bewegung als Phasenreihe, die Flex-Varianten nebeneinander,
+    # Schatten/Glas/Farbmatrix ueber gemustertem Grund, und gedrehte,
+    # skalierte, gescherte Kacheln.
+    build gallery5
+    "$W/gallery5" "$Z/fui-anim-hell.png" light
+    "$W/gallery5" "$Z/fui-anim-dunkel.png" dark
+    build gallery6
+    "$W/gallery6" "$Z/fui-flex-hell.png" light
+    "$W/gallery6" "$Z/fui-flex-dunkel.png" dark
+    build gallery7
+    "$W/gallery7" "$Z/fui-effekt-hell.png" light
+    "$W/gallery7" "$Z/fui-effekt-dunkel.png" dark
+    build gallery8
+    "$W/gallery8" "$Z/fui-transform-hell.png" light
+    "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
     ls -la "$Z"
 fi
 

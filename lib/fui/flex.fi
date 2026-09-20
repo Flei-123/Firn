@@ -1,0 +1,606 @@
+profile kernel
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/flex.fi -- FLEXBOX, WIE CSS SIE MEINT.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// lib/fui/layout.fi kann einen Stapel und ein Gitter. Das reicht fuer
+// eine Werkzeugleiste und fuer eine Maske, aber nicht fuer das, was
+// eine heutige Oberflaeche an Verteilung verlangt: "die drei Knoepfe
+// rechts, der Rest Luft", "gleicher Abstand zwischen allen, keiner
+// aussen", "wenn es eng wird, schrumpft NUR das Textfeld, und nur bis
+// zu seiner Mindestbreite". Wer das mit `box_layout` nachbaut, rechnet
+// jedes Mal von Hand -- und genau dieses Handrechnen steht in
+// lib/browser/chrome.fi und ist der Grund, warum layout.fi ueberhaupt
+// gebaut wurde.
+//
+// ==================================================== ES ERSETZT NICHTS
+//
+// layout.fi BLEIBT. Kein zweites, konkurrierendes Layoutsystem: flex.fi
+// benutzt denselben `Rect`, dasselbe Mess-Protokoll (der Aufrufer haelt
+// seine Felder, A1 aus layout.fi gilt weiter) und dieselbe Regel fuer
+// den Rest der Ganzzahldivision. Wer einen Stapel will, nimmt `Box`;
+// wer Verteilung, Umbruch und Schrumpfen will, nimmt `FlexBox`.
+//
+// ======================================================= WARUM IM KERN
+//
+// `profile kernel` in Zeile 1, wie layout.fi. Ein Layout rechnet nur.
+// GANZZAHLIG: eine Pixelposition ist eine ganze Zahl, und ein Layout,
+// das auf halben Pixeln rechnet, erzeugt genau die unscharfen Kanten,
+// die man nie wieder los wird. Die Anteile (grow/shrink) sind darum
+// PROMILLE als i64 und keine f64 -- 1000 heisst "1.0".
+//
+// ================================================== DIE VERTEILUNG
+//
+// Der Ort, an dem eine Flexbox richtig oder falsch ist, ist die
+// NACHVERTEILUNG. Ein Kind, das an seiner Mindest- oder Hoechstbreite
+// festklemmt, nimmt seinen Anteil nicht an -- der frei gewordene Platz
+// muss unter den UEBRIGEN noch einmal verteilt werden, und zwar so
+// lange, bis niemand mehr neu festklemmt (css-flexbox-1, 9.7). Wer nur
+// einmal verteilt und danach klemmt, hat am Ende eine Zeile, die nicht
+// die volle Breite fuellt. Genau das prueft tools/fui/flex_main.fi mit
+// von Hand gerechneten Pixeln nach.
+import fui.layout
+
+export {
+    // Richtungen
+    FLEX_ROW, FLEX_ROW_REVERSE, FLEX_COLUMN, FLEX_COLUMN_REVERSE,
+    // justify-content
+    JUSTIFY_START, JUSTIFY_END, JUSTIFY_CENTER, JUSTIFY_BETWEEN,
+    JUSTIFY_AROUND, JUSTIFY_EVENLY,
+    // align-items / align-self / align-content
+    AL_AUTO, AL_START, AL_END, AL_CENTER, AL_STRETCH, AL_BASELINE,
+    // flex-wrap
+    WRAP_NONE, WRAP_WRAP, WRAP_REVERSE,
+    // Die Typen
+    FlexItem, flex_item, item_set_flex, item_set_bounds,
+    item_set_align, item_set_baseline,
+    FlexBox, flexbox_new, flex_set_gap, flex_set_justify,
+    flex_set_align_items, flex_set_align_content, flex_set_wrap,
+    flex_set_padding,
+    // Das Rechnen
+    flex_measure_main, flex_measure_cross, flex_layout,
+    flex_line_count,
+    FLEX_MAX,
+}
+
+// ============================================================ DIE WERTE
+const FLEX_ROW: u32 = 0
+const FLEX_ROW_REVERSE: u32 = 1
+const FLEX_COLUMN: u32 = 2
+const FLEX_COLUMN_REVERSE: u32 = 3
+
+const JUSTIFY_START: u32 = 0
+const JUSTIFY_END: u32 = 1
+const JUSTIFY_CENTER: u32 = 2
+const JUSTIFY_BETWEEN: u32 = 3
+const JUSTIFY_AROUND: u32 = 4
+const JUSTIFY_EVENLY: u32 = 5
+
+const AL_AUTO: u32 = 0
+const AL_START: u32 = 1
+const AL_END: u32 = 2
+const AL_CENTER: u32 = 3
+const AL_STRETCH: u32 = 4
+const AL_BASELINE: u32 = 5
+
+const WRAP_NONE: u32 = 0
+const WRAP_WRAP: u32 = 1
+const WRAP_REVERSE: u32 = 2
+
+// Wie viele Kinder eine Flexbox in einem Aufruf verteilt. Fest, weil
+// der Kern keinen Allokator hat (A1 aus layout.fi: der Aufrufer haelt
+// seine Felder, die Zeilenbuchhaltung aber braucht Platz).
+const FLEX_MAX: usize = 64
+
+// ============================================================ EIN KIND
+//
+// Ein Kind ist ein WERT, kein Zeiger auf ein Widget: die Flexbox soll
+// auch Dinge verteilen koennen, die keine Widgets sind (Spalten einer
+// Tabelle, Kacheln eines Rasters). Wer Widgets verteilt, fuellt `basis`
+// und `cross` aus `render.pref_of` -- das ist das vorhandene
+// Mess-Protokoll, und es bleibt das einzige.
+struct FlexItem {
+    basis: i64,      // flex-basis, in Pixeln (auto = die gemessene Groesse)
+    cross: i64,      // die gewuenschte Groesse QUER
+    grow: i64,       // Promille: 1000 = flex-grow: 1
+    shrink: i64,     // Promille: 1000 = flex-shrink: 1
+    min_main: i64,
+    max_main: i64,   // <= 0 heisst "keine obere Schranke"
+    align: u32,      // align-self, AL_AUTO = was der Behaelter sagt
+    baseline: i64,   // Abstand Oberkante -> Grundlinie, fuer AL_BASELINE
+}
+
+fn flex_item(basis: i64, cross: i64) -> FlexItem {
+    return FlexItem { basis: basis, cross: cross, grow: 0, shrink: 1000,
+        min_main: 0, max_main: 0, align: AL_AUTO, baseline: 0 }
+}
+
+fn item_set_flex(k: *mut FlexItem, grow: i64, shrink: i64, basis: i64) {
+    (*k).grow = grow
+    (*k).shrink = shrink
+    (*k).basis = basis
+}
+
+fn item_set_bounds(k: *mut FlexItem, min_main: i64, max_main: i64) {
+    (*k).min_main = min_main
+    (*k).max_main = max_main
+}
+
+fn item_set_align(k: *mut FlexItem, a: u32) { (*k).align = a }
+fn item_set_baseline(k: *mut FlexItem, b: i64) { (*k).baseline = b }
+
+// ========================================================= DER BEHAELTER
+struct FlexBox {
+    dir: u32,
+    justify: u32,
+    align_items: u32,
+    align_content: u32,
+    wrap: u32,
+    gap_main: i64,
+    gap_cross: i64,
+    pad_l: i64,
+    pad_t: i64,
+    pad_r: i64,
+    pad_b: i64,
+}
+
+fn flexbox_new(dir: u32) -> FlexBox {
+    return FlexBox { dir: dir, justify: JUSTIFY_START,
+        align_items: AL_STRETCH, align_content: AL_START, wrap: WRAP_NONE,
+        gap_main: 0, gap_cross: 0,
+        pad_l: 0, pad_t: 0, pad_r: 0, pad_b: 0 }
+}
+
+// gap: Haupt- und Querrichtung GETRENNT, wie `row-gap` und `column-gap`.
+fn flex_set_gap(s: *mut FlexBox, main: i64, cross: i64) {
+    (*s).gap_main = main
+    (*s).gap_cross = cross
+}
+
+fn flex_set_justify(s: *mut FlexBox, j: u32) { (*s).justify = j }
+fn flex_set_align_items(s: *mut FlexBox, a: u32) { (*s).align_items = a }
+fn flex_set_align_content(s: *mut FlexBox, a: u32) { (*s).align_content = a }
+fn flex_set_wrap(s: *mut FlexBox, w: u32) { (*s).wrap = w }
+
+fn flex_set_padding(s: *mut FlexBox, l: i64, t: i64, r: i64, b: i64) {
+    (*s).pad_l = l
+    (*s).pad_t = t
+    (*s).pad_r = r
+    (*s).pad_b = b
+}
+
+fn ist_zeile(s: *mut FlexBox) -> bool {
+    return (*s).dir == FLEX_ROW || (*s).dir == FLEX_ROW_REVERSE
+}
+
+fn ist_rueckwaerts(s: *mut FlexBox) -> bool {
+    return (*s).dir == FLEX_ROW_REVERSE || (*s).dir == FLEX_COLUMN_REVERSE
+}
+
+fn item_at(k: *mut FlexItem, i: usize) -> *mut FlexItem {
+    return (k as u64 + (i * 64) as u64) as *mut FlexItem
+}
+
+// Ein Kind auf seine Schranken klemmen.
+fn klemme(k: *mut FlexItem, v: i64) -> i64 {
+    var x: i64 = v
+    if x < (*k).min_main {
+        x = (*k).min_main
+    }
+    if (*k).max_main > 0 && x > (*k).max_main {
+        x = (*k).max_main
+    }
+    if x < 0 {
+        x = 0
+    }
+    return x
+}
+
+// ------------------------------------------------------------ MESSEN
+//
+// Die Groesse, die der Behaelter in HAUPTRICHTUNG braucht, wenn nichts
+// waechst und nichts schrumpft: die Summe der Basen, die Luecken und
+// die Innenraender. Das ist das Gegenstueck zu `box_measure`.
+fn flex_measure_main(s: *mut FlexBox, k: *mut FlexItem, n: usize) -> i64 {
+    var summe: i64 = 0
+    var i: usize = 0
+    while i < n {
+        summe = summe + klemme(item_at(k, i), (*item_at(k, i)).basis)
+        i = i + 1
+    }
+    if n > 1 {
+        summe = summe + (*s).gap_main * ((n - 1) as i64)
+    }
+    if ist_zeile(s) {
+        return summe + (*s).pad_l + (*s).pad_r
+    }
+    return summe + (*s).pad_t + (*s).pad_b
+}
+
+// Die Groesse QUER: das groesste Kind (ohne Umbruch).
+fn flex_measure_cross(s: *mut FlexBox, k: *mut FlexItem, n: usize) -> i64 {
+    var groesstes: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: i64 = (*item_at(k, i)).cross
+        if c > groesstes {
+            groesstes = c
+        }
+        i = i + 1
+    }
+    if ist_zeile(s) {
+        return groesstes + (*s).pad_t + (*s).pad_b
+    }
+    return groesstes + (*s).pad_l + (*s).pad_r
+}
+
+// Wie viele Zeilen der Umbruch ergibt. Der Aufrufer braucht das, um zu
+// wissen, wie hoch der Behaelter werden muss, BEVOR er verteilt.
+fn flex_line_count(s: *mut FlexBox, k: *mut FlexItem, n: usize,
+    space: layout.Rect) -> usize {
+    if (*s).wrap == WRAP_NONE || n == 0 {
+        if n == 0 {
+            return 0
+        }
+        return 1
+    }
+    let platz: i64 = haupt_platz(s, space)
+    var zeilen: usize = 1
+    var lauf: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let b: i64 = klemme(item_at(k, i), (*item_at(k, i)).basis)
+        var nach: i64 = lauf + b
+        if lauf > 0 {
+            nach = nach + (*s).gap_main
+        }
+        if lauf > 0 && nach > platz {
+            zeilen = zeilen + 1
+            lauf = b
+        } else {
+            lauf = nach
+        }
+        i = i + 1
+    }
+    return zeilen
+}
+
+fn haupt_platz(s: *mut FlexBox, space: layout.Rect) -> i64 {
+    if ist_zeile(s) {
+        return space.w - (*s).pad_l - (*s).pad_r
+    }
+    return space.h - (*s).pad_t - (*s).pad_b
+}
+
+// ------------------------------------------------------------ VERTEILEN
+//
+// Der Kern: `groessen` bekommt fuer jedes Kind einer Zeile die
+// Hauptgroesse. Freier Platz wird nach `grow` verteilt, fehlender nach
+// `shrink` MAL BASIS gewichtet (so macht es CSS: ein breites Kind gibt
+// mehr her als ein schmales), und wer dabei an eine Schranke stoesst,
+// wird eingefroren; der Rest wird NEU verteilt, bis niemand mehr
+// einfriert.
+fn verteile(s: *mut FlexBox, k: *mut FlexItem, von: usize, n: usize,
+    platz: i64, groessen: *mut i64, frozen: *mut i64) {
+    var i: usize = 0
+    var basis_summe: i64 = 0
+    while i < n {
+        let it: *mut FlexItem = item_at(k, von + i)
+        st(groessen, i, (*it).basis)
+        st(frozen, i, 0)
+        basis_summe = basis_summe + (*it).basis
+        i = i + 1
+    }
+    var luecken: i64 = 0
+    if n > 1 {
+        luecken = (*s).gap_main * ((n - 1) as i64)
+    }
+    // Kinder, deren Basis schon ausserhalb ihrer Schranken liegt,
+    // frieren sofort ein -- sonst verteilt die erste Runde Platz an
+    // jemanden, der ihn gar nicht annehmen kann.
+    i = 0
+    while i < n {
+        let it: *mut FlexItem = item_at(k, von + i)
+        let g: i64 = klemme(it, ld(groessen, i))
+        if g != ld(groessen, i) {
+            st(groessen, i, g)
+            st(frozen, i, 1)
+        }
+        i = i + 1
+    }
+    var runde: usize = 0
+    while runde <= n {
+        var summe: i64 = 0
+        i = 0
+        while i < n {
+            summe = summe + ld(groessen, i)
+            i = i + 1
+        }
+        let rest: i64 = platz - luecken - summe
+        if rest == 0 {
+            return
+        }
+        // Die Gewichte der noch beweglichen Kinder.
+        var gewicht: i64 = 0
+        i = 0
+        while i < n {
+            if ld(frozen, i) == 0 {
+                let it: *mut FlexItem = item_at(k, von + i)
+                if rest > 0 {
+                    gewicht = gewicht + (*it).grow
+                } else {
+                    gewicht = gewicht + (*it).shrink * (*it).basis / 1000
+                }
+            }
+            i = i + 1
+        }
+        if gewicht <= 0 {
+            return
+        }
+        // Verteilen, und wer dabei klemmt, friert ein.
+        var neu_gefroren: bool = false
+        var vergeben: i64 = 0
+        var letzter: usize = n
+        i = 0
+        while i < n {
+            if ld(frozen, i) == 0 {
+                let it: *mut FlexItem = item_at(k, von + i)
+                var anteil: i64 = 0
+                if rest > 0 {
+                    anteil = rest * (*it).grow / gewicht
+                } else {
+                    anteil = rest * ((*it).shrink * (*it).basis / 1000) / gewicht
+                }
+                let roh: i64 = ld(groessen, i) + anteil
+                let ge: i64 = klemme(it, roh)
+                st(groessen, i, ge)
+                vergeben = vergeben + anteil
+                letzter = i
+                if ge != roh {
+                    st(frozen, i, 1)
+                    neu_gefroren = true
+                }
+            }
+            i = i + 1
+        }
+        // DER REST DER GANZZAHLDIVISION. Er geht an das letzte bewegliche
+        // Kind, damit die Summe der Teile EXAKT den Platz fuellt -- genau
+        // die Regel, die box_layout schon hat.
+        if !neu_gefroren && letzter < n {
+            let fehlt: i64 = rest - vergeben
+            if fehlt != 0 {
+                let it: *mut FlexItem = item_at(k, von + letzter)
+                let ge: i64 = klemme(it, ld(groessen, letzter) + fehlt)
+                st(groessen, letzter, ge)
+            }
+            return
+        }
+        if !neu_gefroren {
+            return
+        }
+        runde = runde + 1
+    }
+}
+
+fn ld(p: *mut i64, i: usize) -> i64 {
+    return *((p as u64 + (i * 8) as u64) as *mut i64)
+}
+
+fn st(p: *mut i64, i: usize, v: i64) {
+    *((p as u64 + (i * 8) as u64) as *mut i64) = v
+}
+
+// Der Anfang und der Abstand, die `justify-content` vorgibt.
+fn justify_anfang(j: u32, frei: i64, n: usize) -> i64 {
+    if frei <= 0 {
+        return 0
+    }
+    if j == JUSTIFY_END {
+        return frei
+    }
+    if j == JUSTIFY_CENTER {
+        return frei / 2
+    }
+    if j == JUSTIFY_AROUND {
+        return frei / ((n * 2) as i64)
+    }
+    if j == JUSTIFY_EVENLY {
+        return frei / ((n + 1) as i64)
+    }
+    return 0
+}
+
+fn justify_abstand(j: u32, frei: i64, n: usize) -> i64 {
+    if frei <= 0 || n < 2 {
+        if j == JUSTIFY_BETWEEN || n < 2 {
+            return 0
+        }
+    }
+    if j == JUSTIFY_BETWEEN {
+        return frei / ((n - 1) as i64)
+    }
+    if j == JUSTIFY_AROUND {
+        return frei / (n as i64)
+    }
+    if j == JUSTIFY_EVENLY {
+        return frei / ((n + 1) as i64)
+    }
+    return 0
+}
+
+// ------------------------------------------------------------- SETZEN
+//
+// Die fertigen Rechtecke landen in `out` -- ein Feld des Aufrufers,
+// genau wie bei `box_layout`. `zeile_hoehen` ist Arbeitsspeicher fuer
+// die Querverteilung und muss FLEX_MAX Eintraege fassen.
+fn flex_layout(s: *mut FlexBox, space: layout.Rect, k: *mut FlexItem,
+    n: usize, out: *mut layout.Rect, groessen: *mut i64,
+    frozen: *mut i64) {
+    if n == 0 {
+        return
+    }
+    let inner: layout.Rect = layout.rect_shrink(space, (*s).pad_l,
+        (*s).pad_t, (*s).pad_r, (*s).pad_b)
+    let platz: i64 = haupt_platz(s, space)
+    // ---- Zeilen bilden
+    var zeilen_start: [usize; 64] = [0; 64]
+    var zeilen_n: [usize; 64] = [0; 64]
+    var zahl: usize = 0
+    if (*s).wrap == WRAP_NONE {
+        zeilen_start[0] = 0
+        zeilen_n[0] = n
+        zahl = 1
+    } else {
+        var lauf: i64 = 0
+        var anfang: usize = 0
+        var i: usize = 0
+        while i < n {
+            let b: i64 = klemme(item_at(k, i), (*item_at(k, i)).basis)
+            var nach: i64 = lauf + b
+            if lauf > 0 {
+                nach = nach + (*s).gap_main
+            }
+            if lauf > 0 && nach > platz {
+                zeilen_start[zahl] = anfang
+                zeilen_n[zahl] = i - anfang
+                zahl = zahl + 1
+                anfang = i
+                lauf = b
+            } else {
+                lauf = nach
+            }
+            i = i + 1
+        }
+        zeilen_start[zahl] = anfang
+        zeilen_n[zahl] = n - anfang
+        zahl = zahl + 1
+    }
+    // ---- Die Hoehe einer Zeile: das groesste Kind darin.
+    var zeilen_quer: [i64; 64] = [0; 64]
+    var quer_summe: i64 = 0
+    var z: usize = 0
+    while z < zahl {
+        var gr: i64 = 0
+        var i: usize = 0
+        while i < zeilen_n[z] {
+            let c: i64 = (*item_at(k, zeilen_start[z] + i)).cross
+            if c > gr {
+                gr = c
+            }
+            i = i + 1
+        }
+        zeilen_quer[z] = gr
+        quer_summe = quer_summe + gr
+        z = z + 1
+    }
+    var quer_ganz: i64 = inner.h
+    if !ist_zeile(s) {
+        quer_ganz = inner.w
+    }
+    var quer_luecken: i64 = 0
+    if zahl > 1 {
+        quer_luecken = (*s).gap_cross * ((zahl - 1) as i64)
+    }
+    // Eine einzige Zeile ohne Umbruch fuellt die Querrichtung ganz --
+    // sonst haengt `align-items: stretch` in der Luft.
+    if zahl == 1 {
+        zeilen_quer[0] = quer_ganz
+    }
+    var quer_lauf: i64 = 0
+    if ist_zeile(s) {
+        quer_lauf = inner.y
+    } else {
+        quer_lauf = inner.x
+    }
+    let quer_frei: i64 = quer_ganz - quer_summe - quer_luecken
+    if zahl > 1 && quer_frei > 0 {
+        quer_lauf = quer_lauf + justify_anfang((*s).align_content,
+            quer_frei, zahl)
+    }
+    // ---- Jede Zeile setzen
+    z = 0
+    while z < zahl {
+        var zi: usize = z
+        if (*s).wrap == WRAP_REVERSE {
+            zi = zahl - 1 - z
+        }
+        let von: usize = zeilen_start[zi]
+        let m: usize = zeilen_n[zi]
+        verteile(s, k, von, m, platz, groessen, frozen)
+        var summe: i64 = 0
+        var i: usize = 0
+        while i < m {
+            summe = summe + ld(groessen, i)
+            i = i + 1
+        }
+        var luecken: i64 = 0
+        if m > 1 {
+            luecken = (*s).gap_main * ((m - 1) as i64)
+        }
+        var frei: i64 = platz - summe - luecken
+        if frei < 0 {
+            frei = 0
+        }
+        var pos: i64 = inner.x
+        if !ist_zeile(s) {
+            pos = inner.y
+        }
+        pos = pos + justify_anfang((*s).justify, frei, m)
+        let extra: i64 = justify_abstand((*s).justify, frei, m)
+        // Die Grundlinie der Zeile: die tiefste ueber alle Kinder, die
+        // sich danach ausrichten wollen.
+        var grundlinie: i64 = 0
+        i = 0
+        while i < m {
+            let it: *mut FlexItem = item_at(k, von + i)
+            var al: u32 = (*it).align
+            if al == AL_AUTO {
+                al = (*s).align_items
+            }
+            if al == AL_BASELINE && (*it).baseline > grundlinie {
+                grundlinie = (*it).baseline
+            }
+            i = i + 1
+        }
+        i = 0
+        while i < m {
+            var ii: usize = i
+            if ist_rueckwaerts(s) {
+                ii = m - 1 - i
+            }
+            let it: *mut FlexItem = item_at(k, von + ii)
+            let haupt: i64 = ld(groessen, ii)
+            var al: u32 = (*it).align
+            if al == AL_AUTO {
+                al = (*s).align_items
+            }
+            var quer: i64 = (*it).cross
+            var quer_pos: i64 = quer_lauf
+            if al == AL_STRETCH {
+                quer = zeilen_quer[zi]
+            } else if al == AL_CENTER {
+                quer_pos = quer_pos + (zeilen_quer[zi] - quer) / 2
+            } else if al == AL_END {
+                quer_pos = quer_pos + zeilen_quer[zi] - quer
+            } else if al == AL_BASELINE {
+                quer_pos = quer_pos + grundlinie - (*it).baseline
+            }
+            if ist_zeile(s) {
+                *((out as u64 + ((von + ii) * 32) as u64) as *mut layout.Rect) =
+                    layout.rect_new(pos, quer_pos, haupt, quer)
+            } else {
+                *((out as u64 + ((von + ii) * 32) as u64) as *mut layout.Rect) =
+                    layout.rect_new(quer_pos, pos, quer, haupt)
+            }
+            pos = pos + haupt + (*s).gap_main + extra
+            i = i + 1
+        }
+        quer_lauf = quer_lauf + zeilen_quer[zi] + (*s).gap_cross
+        if zahl > 1 && quer_frei > 0 {
+            quer_lauf = quer_lauf + justify_abstand((*s).align_content,
+                quer_frei, zahl)
+        }
+        z = z + 1
+    }
+}

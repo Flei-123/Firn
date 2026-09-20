@@ -1,0 +1,618 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/effect.fi -- UNSCHAERFE, SCHATTEN, GLAS, FARBMATRIX.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Der Unterschied zwischen einer Oberflaeche von 1998 und einer von
+// heute ist zu einem guten Teil ein einziger Effekt: WEICHE UNSCHAERFE.
+// Ein Schatten mit einem harten Rand sieht aufgeklebt aus; derselbe
+// Schatten, weich, laesst die Karte ueber der Seite schweben. Und das
+// "Glas" moderner Leisten ist nichts anderes als der UNTERGRUND,
+// verwischt und leicht aufgehellt.
+//
+// fUi hatte dafuer bisher nichts, und das ist kein Zierrat: ohne
+// Unschaerfe kann man Tiefe nur durch Linien andeuten, und Linien
+// ueberall sind genau das Aussehen, das Justin nicht will.
+//
+// ==================================================== WIE DIE UNSCHAERFE RECHNET
+//
+// Eine echte Gausskurve pro Pixel zu falten kostet (2r+1) Multiplika-
+// tionen je Pixel und Richtung; bei r = 24 sind das ueber einen
+// Bildschirm mehr, als eine Oberflaeche pro Bild ausgeben darf. Der
+// bekannte Ausweg ist DREIMAL KASTEN: die Faltung mit einem Rechteck
+// dreimal hintereinander naehert eine Gausskurve so gut an, dass der
+// Unterschied unter einem Achtel eines Tonwerts bleibt (der Satz
+// dahinter ist der zentrale Grenzwertsatz; drei Faltungen geben einen
+// kubischen B-Spline). Und ein Kasten kostet mit LAUFENDER SUMME genau
+// eine Addition und eine Subtraktion je Pixel -- O(1) statt O(r).
+//
+// ZWEI FALLEN, und beide sieht man sofort:
+//
+//   1. PREMULTIPLIED. Wer R, G, B ungewichtet mittelt und A getrennt,
+//      zieht die Farbe voellig durchsichtiger Pixel (meist Schwarz) in
+//      den Rand hinein -- der klassische dunkle Saum um jedes weiche
+//      Ding. Die Leinwand liegt ohnehin premultiplied vor
+//      (lib/paint/canvas.fi), also wird genau so gemittelt und nicht
+//      zurueckgerechnet.
+//   2. DER RAND. Wer ueber den Rand hinaus mit Nullen mittelt, bekommt
+//      einen dunklen Streifen am Bildrand. Hier wird der Randwert
+//      FORTGESETZT (clamp-to-edge), das ist die Antwort, die ein
+//      Auschnitt eines groesseren Bildes gaebe.
+//
+// ================================================= KEIN ZWEITER ORT
+//
+// Gezeichnet wird ueber lib/fui/painter.fi (die runden Ecken stehen
+// dort und nur dort), die Pixel liegen in lib/paint/canvas.fi. Hier
+// steht nur die Arithmetik, die es sonst nirgends gibt.
+import std.rt
+import paint.canvas
+import fui.painter
+
+export {
+    // Unschaerfe
+    blur_rect, blur_buffer, box_pass_h, box_pass_v,
+    sigma_for_radius, radius_for_sigma,
+    // Schatten und Glas
+    drop_shadow_round, backdrop_blur,
+    // Farbmatrix
+    ColorMatrix, cm_identity, cm_saturate, cm_brightness, cm_contrast,
+    cm_grayscale, cm_mul, cm_apply_rect, cm_apply_pixel,
+}
+
+// ============================================================ DIE MASSE
+//
+// Ein Kasten der Breite (2r+1) hat die Varianz ((2r+1)^2 - 1)/12; drei
+// davon addieren sich, also ist sigma = sqrt(3 * ((2r+1)^2 - 1) / 12).
+// Die Umkehrung dient dazu, aus einem CSS-`blur(8px)` (das sigma
+// meint) den Kastenradius zu bekommen.
+fn sigma_for_radius(r: i64) -> f64 {
+    let d: f64 = (2 * r + 1) as f64
+    return wurzel(3.0 * (d * d - 1.0) / 12.0)
+}
+
+fn radius_for_sigma(s: f64) -> i64 {
+    // aus sigma^2 = 3*((2r+1)^2-1)/12 folgt (2r+1) = sqrt(4*sigma^2+1)
+    let d: f64 = wurzel(4.0 * s * s + 1.0)
+    var r: i64 = ((d - 1.0) * 0.5 + 0.5) as i64
+    if r < 0 {
+        r = 0
+    }
+    return r
+}
+
+// Newton, wie in lib/svg/matrix.fi -- hier noch einmal nur, weil diese
+// Datei sonst wegen einer einzigen Wurzel die ganze Matrixdatei ziehen
+// muesste; sie wird an anderer Stelle gebraucht (transform.fi) und
+// nimmt sie dort her.
+fn wurzel(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    var g: f64 = x
+    if g < 1.0 {
+        g = 1.0
+    }
+    var i: i32 = 0
+    while i < 24 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+fn ld8(p: u64) -> u8 { return *(p as *mut u8) }
+fn st8(p: u64, v: u8) { *(p as *mut u8) = v }
+
+// ------------------------------------------------- EIN KASTENDURCHGANG
+//
+// Waagerecht, mit laufender Summe, ueber alle vier Kanaele eines
+// RGBA-Puffers `w * h`. `src` und `dst` duerfen NICHT derselbe Puffer
+// sein -- die laufende Summe liest hinter sich.
+fn box_pass_h(src: *mut u8, dst: *mut u8, w: usize, h: usize, r: i64) {
+    if r <= 0 {
+        var i: usize = 0
+        while i < w * h * 4 {
+            st8(dst as u64 + i as u64, ld8(src as u64 + i as u64))
+            i = i + 1
+        }
+        return
+    }
+    let teiler: i64 = 2 * r + 1
+    var y: usize = 0
+    while y < h {
+        let zeile: u64 = src as u64 + (y * w * 4) as u64
+        let zeile_d: u64 = dst as u64 + (y * w * 4) as u64
+        var k: usize = 0
+        while k < 4 {
+            // Die Anfangssumme: der linke Randwert (r+1)-mal plus die
+            // ersten r Pixel. Das ist die Fortsetzung des Randes.
+            var summe: i64 = (ld8(zeile + k as u64) as i64) * (r + 1)
+            var j: i64 = 1
+            while j <= r {
+                var q: i64 = j
+                if q > (w - 1) as i64 {
+                    q = (w - 1) as i64
+                }
+                summe = summe + (ld8(zeile + (q * 4 + k as i64) as u64) as i64)
+                j = j + 1
+            }
+            var x: i64 = 0
+            while x < w as i64 {
+                st8(zeile_d + (x * 4 + k as i64) as u64,
+                    ((summe + teiler / 2) / teiler) as u8)
+                var rechts: i64 = x + r + 1
+                if rechts > (w - 1) as i64 {
+                    rechts = (w - 1) as i64
+                }
+                var links: i64 = x - r
+                if links < 0 {
+                    links = 0
+                }
+                summe = summe + (ld8(zeile + (rechts * 4 + k as i64) as u64) as i64)
+                summe = summe - (ld8(zeile + (links * 4 + k as i64) as u64) as i64)
+                x = x + 1
+            }
+            k = k + 1
+        }
+        y = y + 1
+    }
+}
+
+// Senkrecht, dasselbe.
+fn box_pass_v(src: *mut u8, dst: *mut u8, w: usize, h: usize, r: i64) {
+    if r <= 0 {
+        var i: usize = 0
+        while i < w * h * 4 {
+            st8(dst as u64 + i as u64, ld8(src as u64 + i as u64))
+            i = i + 1
+        }
+        return
+    }
+    let teiler: i64 = 2 * r + 1
+    let schritt: i64 = (w * 4) as i64
+    var x: usize = 0
+    while x < w {
+        let spalte: u64 = src as u64 + (x * 4) as u64
+        let spalte_d: u64 = dst as u64 + (x * 4) as u64
+        var k: usize = 0
+        while k < 4 {
+            var summe: i64 = (ld8(spalte + k as u64) as i64) * (r + 1)
+            var j: i64 = 1
+            while j <= r {
+                var q: i64 = j
+                if q > (h - 1) as i64 {
+                    q = (h - 1) as i64
+                }
+                summe = summe + (ld8(spalte + (q * schritt + k as i64) as u64) as i64)
+                j = j + 1
+            }
+            var y: i64 = 0
+            while y < h as i64 {
+                st8(spalte_d + (y * schritt + k as i64) as u64,
+                    ((summe + teiler / 2) / teiler) as u8)
+                var unten: i64 = y + r + 1
+                if unten > (h - 1) as i64 {
+                    unten = (h - 1) as i64
+                }
+                var oben: i64 = y - r
+                if oben < 0 {
+                    oben = 0
+                }
+                summe = summe + (ld8(spalte + (unten * schritt + k as i64) as u64) as i64)
+                summe = summe - (ld8(spalte + (oben * schritt + k as i64) as u64) as i64)
+                y = y + 1
+            }
+            k = k + 1
+        }
+        x = x + 1
+    }
+}
+
+// DREI DURCHGAENGE je Richtung auf einem eigenstaendigen RGBA-Puffer.
+// `tmp` muss `w * h * 4` Oktette fassen. Danach steht das Ergebnis
+// wieder in `px`.
+fn blur_buffer(px: *mut u8, tmp: *mut u8, w: usize, h: usize, r: i64) {
+    if r <= 0 || w == 0 || h == 0 {
+        return
+    }
+    box_pass_h(px, tmp, w, h, r)
+    box_pass_h(tmp, px, w, h, r)
+    box_pass_h(px, tmp, w, h, r)
+    box_pass_v(tmp, px, w, h, r)
+    box_pass_v(px, tmp, w, h, r)
+    box_pass_v(tmp, px, w, h, r)
+}
+
+// Einen Ausschnitt der Leinwand verwischen. Der Ausschnitt wird
+// herauskopiert (damit die laufende Summe einen dichten Puffer hat),
+// verwischt und zurueckgeschrieben.
+fn blur_rect(cv: *mut canvas.Canvas, x0: i64, y0: i64, w: i64, h: i64,
+    r: i64) -> bool {
+    if w <= 0 || h <= 0 || r <= 0 {
+        return true
+    }
+    let n: usize = (w * h * 4) as usize
+    let a: *mut u8 = rt.heap_alloc(n) as *mut u8
+    if a as usize == 0 {
+        return false
+    }
+    let b: *mut u8 = rt.heap_alloc(n) as *mut u8
+    if b as usize == 0 {
+        rt.heap_free(a as u64, n)
+        return false
+    }
+    hole(cv, x0, y0, w, h, a)
+    blur_buffer(a, b, w as usize, h as usize, r)
+    setze(cv, x0, y0, w, h, a)
+    rt.heap_free(b as u64, n)
+    rt.heap_free(a as u64, n)
+    return true
+}
+
+// Ausschnitt heraus: ROH, premultipliziert, Rand fortgesetzt.
+fn hole(cv: *mut canvas.Canvas, x0: i64, y0: i64, w: i64, h: i64,
+    out: *mut u8) {
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    let quelle: u64 = canvas.canvas_pixels(cv) as u64
+    var y: i64 = 0
+    while y < h {
+        var sy: i64 = y0 + y
+        if sy < 0 { sy = 0 }
+        if sy > ch - 1 { sy = ch - 1 }
+        var x: i64 = 0
+        while x < w {
+            var sx: i64 = x0 + x
+            if sx < 0 { sx = 0 }
+            if sx > cw - 1 { sx = cw - 1 }
+            let s: u64 = quelle + ((sy * cw + sx) * 4) as u64
+            let d: u64 = out as u64 + ((y * w + x) * 4) as u64
+            st8(d, ld8(s))
+            st8(d + 1, ld8(s + 1))
+            st8(d + 2, ld8(s + 2))
+            st8(d + 3, ld8(s + 3))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// und zurueck, ohne Mischen (der Ausschnitt ERSETZT).
+fn setze(cv: *mut canvas.Canvas, x0: i64, y0: i64, w: i64, h: i64,
+    src: *mut u8) {
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    let ziel: u64 = canvas.canvas_pixels(cv) as u64
+    var y: i64 = 0
+    while y < h {
+        let dy: i64 = y0 + y
+        if dy >= 0 && dy < ch {
+            var x: i64 = 0
+            while x < w {
+                let dx: i64 = x0 + x
+                if dx >= 0 && dx < cw {
+                    let s: u64 = src as u64 + ((y * w + x) * 4) as u64
+                    let d: u64 = ziel + ((dy * cw + dx) * 4) as u64
+                    st8(d, ld8(s))
+                    st8(d + 1, ld8(s + 1))
+                    st8(d + 2, ld8(s + 2))
+                    st8(d + 3, ld8(s + 3))
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+// ============================================================ DER SCHATTEN
+//
+// Ein weicher Schatten unter einem abgerundeten Rechteck. Der Weg ist
+// der von CSS `box-shadow`: die FORM wird in eine eigene, leere
+// Leinwand gezeichnet, deren ALPHA verwischt, das Ergebnis mit der
+// Schattenfarbe eingefaerbt, versetzt und UNTER das Ding gemalt.
+//
+// Warum eine eigene Leinwand: wer den Untergrund mitverwischt, zieht
+// dessen Farbe in den Schatten. Der Schatten kennt nur die Form.
+fn drop_shadow_round(z: *mut painter.Painter, x: f64, y: f64, w: f64,
+    h: f64, radius: f64, dx: f64, dy: f64, blur: i64, col: u32) -> bool {
+    if w <= 0.0 || h <= 0.0 {
+        return true
+    }
+    let rand: i64 = blur * 3 + 2
+    let bw: i64 = (w as i64) + 2 * rand
+    let bh: i64 = (h as i64) + 2 * rand
+    var tmp: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&tmp, bw as usize, bh as usize) {
+        return false
+    }
+    canvas.canvas_clear(&tmp, 0 as u32)
+    var tz: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&tz, &tmp, bw as usize, bh as usize) {
+        canvas.canvas_free(&tmp)
+        return false
+    }
+    // Die Form in voller Deckkraft -- die Farbe kommt spaeter, sonst
+    // mischt der Weichzeichner die Farbe mit dem Nichts daneben.
+    painter.round_rect(&tz, rand as f64, rand as f64, w, h, radius,
+        0xFFFFFFFF as u32)
+    let n: usize = (bw * bh * 4) as usize
+    let scratch: *mut u8 = rt.heap_alloc(n) as *mut u8
+    if scratch as usize == 0 {
+        painter.painter_free(&tz)
+        canvas.canvas_free(&tmp)
+        return false
+    }
+    blur_buffer(canvas.canvas_pixels(&tmp), scratch, bw as usize,
+        bh as usize, blur)
+    rt.heap_free(scratch as u64, n)
+    // Einfaerben und auf die Zielleinwand mischen.
+    let zv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let sr: i64 = ((col >> 16) & 255 as u32) as i64
+    let sg: i64 = ((col >> 8) & 255 as u32) as i64
+    let sb: i64 = (col & 255 as u32) as i64
+    let sa: i64 = ((col >> 24) & 255 as u32) as i64
+    let quelle: u64 = canvas.canvas_pixels(&tmp) as u64
+    var j: i64 = 0
+    while j < bh {
+        var i: i64 = 0
+        while i < bw {
+            let a: i64 = ld8(quelle + ((j * bw + i) * 4 + 3) as u64) as i64
+            if a != 0 {
+                let deck: i64 = a * sa / 255
+                if deck != 0 {
+                    let px: i64 = (x as i64) + dx as i64 + i - rand
+                    let py: i64 = (y as i64) + dy as i64 + j - rand
+                    if px >= 0 && py >= 0 {
+                        canvas.canvas_blend(zv, px as usize, py as usize,
+                            ((deck as u32) << 24) | ((sr as u32) << 16) |
+                            ((sg as u32) << 8) | (sb as u32), 1.0)
+                    }
+                }
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    painter.painter_free(&tz)
+    canvas.canvas_free(&tmp)
+    return true
+}
+
+// ================================================================ GLAS
+//
+// `backdrop-filter: blur()`. Der UNTERGRUND unter dem Rechteck wird
+// kopiert, verwischt, aufgehellt oder abgedunkelt und mit einem
+// abgerundeten Rechteck zurueckmaskiert. Dass die Maske rund ist, ist
+// der ganze Unterschied zwischen "Glasscheibe" und "grauer Fleck".
+//
+// `tint` ist die Farbe, die ueber die verwischte Kopie gelegt wird
+// (0xAARRGGBB, Alpha entscheidet, wie stark).
+fn backdrop_blur(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    radius: f64, blur: i64, tint: u32) -> bool {
+    let iw: i64 = w as i64
+    let ih: i64 = h as i64
+    if iw <= 0 || ih <= 0 {
+        return true
+    }
+    let zv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let n: usize = (iw * ih * 4) as usize
+    let a: *mut u8 = rt.heap_alloc(n) as *mut u8
+    if a as usize == 0 {
+        return false
+    }
+    let b: *mut u8 = rt.heap_alloc(n) as *mut u8
+    if b as usize == 0 {
+        rt.heap_free(a as u64, n)
+        return false
+    }
+    hole(zv, x as i64, y as i64, iw, ih, a)
+    blur_buffer(a, b, iw as usize, ih as usize, blur)
+    // Die verwischte Kopie durch die runde Maske zurueckmalen. Die
+    // Maske entsteht aus derselben `round_rect`, die alles in fUi
+    // rundet -- kein zweiter Eckenzeichner.
+    var maske: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&maske, iw as usize, ih as usize) {
+        rt.heap_free(b as u64, n)
+        rt.heap_free(a as u64, n)
+        return false
+    }
+    canvas.canvas_clear(&maske, 0 as u32)
+    var mz: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&mz, &maske, iw as usize, ih as usize) {
+        canvas.canvas_free(&maske)
+        rt.heap_free(b as u64, n)
+        rt.heap_free(a as u64, n)
+        return false
+    }
+    painter.round_rect(&mz, 0.0, 0.0, w, h, radius, 0xFFFFFFFF as u32)
+    let mp: u64 = canvas.canvas_pixels(&maske) as u64
+    let ta: i64 = ((tint >> 24) & 255 as u32) as i64
+    var j: i64 = 0
+    while j < ih {
+        var i: i64 = 0
+        while i < iw {
+            let m: i64 = ld8(mp + ((j * iw + i) * 4 + 3) as u64) as i64
+            if m != 0 {
+                let s: u64 = a as u64 + ((j * iw + i) * 4) as u64
+                var rr: i64 = ld8(s) as i64
+                var gg: i64 = ld8(s + 1) as i64
+                var bb: i64 = ld8(s + 2) as i64
+                // Die Tönung: ueber die verwischte Kopie, mit ihrem
+                // eigenen Alpha gewichtet.
+                if ta != 0 {
+                    rr = rr + (((tint >> 16) & 255 as u32) as i64 - rr) * ta / 255
+                    gg = gg + (((tint >> 8) & 255 as u32) as i64 - gg) * ta / 255
+                    bb = bb + ((tint & 255 as u32) as i64 - bb) * ta / 255
+                }
+                let px: i64 = (x as i64) + i
+                let py: i64 = (y as i64) + j
+                if px >= 0 && py >= 0 {
+                    canvas.canvas_blend(zv, px as usize, py as usize,
+                        ((255 as u32) << 24) | ((rr as u32) << 16) |
+                        ((gg as u32) << 8) | (bb as u32),
+                        (m as f64) / 255.0)
+                }
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    painter.painter_free(&mz)
+    canvas.canvas_free(&maske)
+    rt.heap_free(b as u64, n)
+    rt.heap_free(a as u64, n)
+    return true
+}
+
+// ========================================================= DIE FARBMATRIX
+//
+// Vier Zeilen zu fuenf Spalten, wie `feColorMatrix`: die letzte Spalte
+// ist der Versatz. Saettigung, Helligkeit, Kontrast und Graustufe sind
+// nur BELEGUNGEN dieser einen Matrix -- deshalb gibt es sie nicht als
+// vier eigene Schleifen ueber die Pixel, sondern als vier Bauer.
+struct ColorMatrix {
+    m: [f64; 20],
+}
+
+fn cm_identity() -> ColorMatrix {
+    var c: ColorMatrix = ColorMatrix { m: [0.0; 20] }
+    c.m[0] = 1.0
+    c.m[6] = 1.0
+    c.m[12] = 1.0
+    c.m[18] = 1.0
+    return c
+}
+
+// Die Leuchtdichtefaktoren sind die von Rec.709, dieselben, die
+// lib/fui/theme.fi fuer den Kontrast benutzt.
+fn cm_saturate(s: f64) -> ColorMatrix {
+    var c: ColorMatrix = cm_identity()
+    let lr: f64 = 0.2126
+    let lg: f64 = 0.7152
+    let lb: f64 = 0.0722
+    c.m[0] = lr + (1.0 - lr) * s
+    c.m[1] = lg - lg * s
+    c.m[2] = lb - lb * s
+    c.m[5] = lr - lr * s
+    c.m[6] = lg + (1.0 - lg) * s
+    c.m[7] = lb - lb * s
+    c.m[10] = lr - lr * s
+    c.m[11] = lg - lg * s
+    c.m[12] = lb + (1.0 - lb) * s
+    return c
+}
+
+fn cm_grayscale() -> ColorMatrix {
+    return cm_saturate(0.0)
+}
+
+fn cm_brightness(b: f64) -> ColorMatrix {
+    var c: ColorMatrix = cm_identity()
+    c.m[0] = b
+    c.m[6] = b
+    c.m[12] = b
+    return c
+}
+
+// Kontrast dreht um die Mitte 0.5: y = (x - 0.5) * k + 0.5.
+fn cm_contrast(k: f64) -> ColorMatrix {
+    var c: ColorMatrix = cm_identity()
+    let o: f64 = 0.5 - 0.5 * k
+    c.m[0] = k
+    c.m[6] = k
+    c.m[12] = k
+    c.m[4] = o
+    c.m[9] = o
+    c.m[14] = o
+    return c
+}
+
+// Erst `a`, dann `b`. (Die Reihenfolge ist die, die man beim Lesen
+// erwartet: cm_mul(saturate, contrast) heisst "saettigen, dann
+// kontrastieren".)
+fn cm_mul(a: ColorMatrix, b: ColorMatrix) -> ColorMatrix {
+    var c: ColorMatrix = ColorMatrix { m: [0.0; 20] }
+    var z: usize = 0
+    while z < 4 {
+        var s: usize = 0
+        while s < 5 {
+            var summe: f64 = 0.0
+            var i: usize = 0
+            while i < 4 {
+                summe = summe + b.m[z * 5 + i] * a.m[i * 5 + s]
+                i = i + 1
+            }
+            if s == 4 {
+                summe = summe + b.m[z * 5 + 4]
+            }
+            c.m[z * 5 + s] = summe
+            s = s + 1
+        }
+        z = z + 1
+    }
+    return c
+}
+
+fn klemme8(v: f64) -> u32 {
+    var x: f64 = v * 255.0 + 0.5
+    if x < 0.0 {
+        x = 0.0
+    }
+    if x > 255.0 {
+        x = 255.0
+    }
+    return (x as i64) as u32
+}
+
+// Ein einzelnes Pixel, 0xAARRGGBB NICHT premultipliziert -- so lassen
+// sich Sollwerte von Hand nachrechnen, und genau das tut die Pruefung.
+fn cm_apply_pixel(c: *mut ColorMatrix, px: u32) -> u32 {
+    let r: f64 = (((px >> 16) & 255 as u32) as f64) / 255.0
+    let g: f64 = (((px >> 8) & 255 as u32) as f64) / 255.0
+    let b: f64 = ((px & 255 as u32) as f64) / 255.0
+    let a: f64 = (((px >> 24) & 255 as u32) as f64) / 255.0
+    let nr: f64 = (*c).m[0] * r + (*c).m[1] * g + (*c).m[2] * b + (*c).m[3] * a + (*c).m[4]
+    let ng: f64 = (*c).m[5] * r + (*c).m[6] * g + (*c).m[7] * b + (*c).m[8] * a + (*c).m[9]
+    let nb: f64 = (*c).m[10] * r + (*c).m[11] * g + (*c).m[12] * b + (*c).m[13] * a + (*c).m[14]
+    let na: f64 = (*c).m[15] * r + (*c).m[16] * g + (*c).m[17] * b + (*c).m[18] * a + (*c).m[19]
+    return (klemme8(na) << 24) | (klemme8(nr) << 16) | (klemme8(ng) << 8) |
+        klemme8(nb)
+}
+
+// Auf einen Rechteckbereich der Leinwand. Die Leinwand liegt
+// PREMULTIPLIED vor, die Matrix rechnet gerade -- also heraus, rechnen,
+// wieder hinein.
+fn cm_apply_rect(cv: *mut canvas.Canvas, c: *mut ColorMatrix, x0: i64,
+    y0: i64, w: i64, h: i64) {
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    let p: u64 = canvas.canvas_pixels(cv) as u64
+    var y: i64 = y0
+    while y < y0 + h {
+        if y >= 0 && y < ch {
+            var x: i64 = x0
+            while x < x0 + w {
+                if x >= 0 && x < cw {
+                    let d: u64 = p + ((y * cw + x) * 4) as u64
+                    let a: i64 = ld8(d + 3) as i64
+                    if a != 0 {
+                        // gerade machen
+                        let rr: u32 = ((ld8(d) as i64) * 255 / a) as u32
+                        let gg: u32 = ((ld8(d + 1) as i64) * 255 / a) as u32
+                        let bb: u32 = ((ld8(d + 2) as i64) * 255 / a) as u32
+                        let neu: u32 = cm_apply_pixel(c,
+                            ((a as u32) << 24) | (rr << 16) | (gg << 8) | bb)
+                        let na: i64 = ((neu >> 24) & 255 as u32) as i64
+                        st8(d, ((((neu >> 16) & 255 as u32) as i64) * na / 255) as u8)
+                        st8(d + 1, ((((neu >> 8) & 255 as u32) as i64) * na / 255) as u8)
+                        st8(d + 2, (((neu & 255 as u32) as i64) * na / 255) as u8)
+                        st8(d + 3, na as u8)
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}

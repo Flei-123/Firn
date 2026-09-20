@@ -1,0 +1,505 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/transform.fi -- WIDGETS UNTER EINER AFFINEN ABBILDUNG.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Ein Reiter, der sich beim Oeffnen leicht dreht; eine Kachel, die
+// unter dem Zeiger um zwei Prozent waechst; ein ganzes Fenster, das
+// beim Minimieren in die Leiste faellt -- das alles ist EINE affine
+// Abbildung ueber dem Zeichnen, und ohne sie bleibt jede Bewegung eine
+// Verschiebung auf ganzen Pixeln.
+//
+// ============================================== KEIN ZWEITER ORT FUER MATRIZEN
+//
+// lib/svg/matrix.fi HAT die Matrixarithmetik: Produkt, Kehrmatrix,
+// Determinante, Drehung um einen Punkt, Scherung, und Sinus/Kosinus mit
+// Argumentreduktion in Grad (rotate(90) gibt dort eine exakte Null --
+// genau das braucht eine Kante, die nicht schief stehen darf). Diese
+// Datei RECHNET NICHT SELBST. Sie haelt einen Stapel und bildet das
+// Zeichnen darauf ab; jede Zeile Matrixarithmetik hier waere die
+// zweite Fassung derselben Sache, und das ist die Regel dieses Baumes.
+//
+// ======================================== WAS RICHTIG GEMACHT WERDEN MUSS
+//
+// 1. FORMEN werden als PFAD abgebildet und danach gerastert -- die
+//    Punkte gehen durch die Matrix, nicht das fertige Pixelbild.
+//    Andersherum bekommt man Treppen, die kein Kantenglaetten mehr
+//    wegbekommt, weil die Information schon weg ist.
+// 2. BILDER gehen den umgekehrten Weg: fuer jedes ZIELPIXEL wird die
+//    Quellstelle mit der KEHRMATRIX gesucht und dort BILINEAR
+//    abgetastet. Vorwaerts abzubilden laesst Loecher, sobald
+//    vergroessert wird.
+// 3. DIE TREFFERPRUEFUNG. Wer unter einer Drehung zeichnet und gerade
+//    testet, klickt daneben -- sichtbar schon bei fuenf Grad. Der
+//    Mauspunkt wird deshalb mit der Kehrmatrix in das
+//    Widget-Koordinatensystem zurueckgeholt und ERST DANN gegen das
+//    Rechteck geprueft. `tf_hit_test` ist die Fassung von
+//    `control.hit_test` fuer eine Flaeche unter Transformation; die
+//    gerade Fassung in control.fi bleibt, was sie ist.
+import std.rt
+import paint.canvas
+import font.raster
+import svg.matrix
+import fui.painter
+import fui.widget
+import fui.control
+import fui.uiimage
+
+export {
+    Xform, xf_new, xf_reset, xf_mat, xf_set,
+    xf_push, xf_pop, xf_depth,
+    xf_translate, xf_scale, xf_rotate, xf_rotate_at, xf_skew,
+    xf_apply, xf_point_x, xf_point_y, xf_inv_x, xf_inv_y,
+    xf_scale_hint,
+    XF_MAX,
+    // Zeichnen
+    tf_fill_round_rect, tf_fill_quad, tf_draw_image, tf_text,
+    // Treffer
+    tf_hit_rect, tf_hit_widget, tf_hit_test,
+}
+
+// Wie tief der Stapel geht. Fest, weil fUi ohne Allokator laufen
+// koennen muss; 16 ist dieselbe Tiefe, die lib/paint/canvas.fi fuer
+// den Clip-Stapel waehlt, und aus demselben Grund.
+const XF_MAX: usize = 16
+
+struct Xform {
+    m: [matrix.Mat; 16],
+    n: usize,          // Tiefe: n-1 ist die oberste, gueltige Matrix
+}
+
+fn xf_new() -> Xform {
+    var x: Xform = Xform { m: [matrix.mat_eins(); 16], n: 1 }
+    return x
+}
+
+fn xf_reset(x: *mut Xform) {
+    (*x).n = 1
+    (*x).m[0] = matrix.mat_eins()
+}
+
+fn xf_depth(x: *mut Xform) -> usize { return (*x).n }
+
+fn xf_mat(x: *mut Xform) -> matrix.Mat {
+    return (*x).m[(*x).n - 1]
+}
+
+fn xf_set(x: *mut Xform, m: matrix.Mat) {
+    (*x).m[(*x).n - 1] = m
+}
+
+// Den aktuellen Stand sichern. `false` heisst: der Stapel ist voll --
+// das ist sichtbar und ehrlich, und besser als eine Zuteilung mitten
+// im Zeichnen.
+fn xf_push(x: *mut Xform) -> bool {
+    if (*x).n >= XF_MAX {
+        return false
+    }
+    (*x).m[(*x).n] = (*x).m[(*x).n - 1]
+    (*x).n = (*x).n + 1
+    return true
+}
+
+fn xf_pop(x: *mut Xform) {
+    if (*x).n > 1 {
+        (*x).n = (*x).n - 1
+    }
+}
+
+// VERKETTEN. Die neue Abbildung kommt RECHTS an die bestehende: wer
+// erst dreht und dann verschiebt, verschiebt im gedrehten System --
+// dieselbe Reihenfolge wie `transform: rotate(...) translate(...)` in
+// CSS und wie in SVG.
+fn xf_apply(x: *mut Xform, m: matrix.Mat) {
+    (*x).m[(*x).n - 1] = matrix.mat_mal((*x).m[(*x).n - 1], m)
+}
+
+fn xf_translate(x: *mut Xform, tx: f64, ty: f64) {
+    xf_apply(x, matrix.mat_verschiebe(tx, ty))
+}
+
+fn xf_scale(x: *mut Xform, sx: f64, sy: f64, ox: f64, oy: f64) {
+    xf_apply(x, matrix.mat_verschiebe(ox, oy))
+    xf_apply(x, matrix.mat_skaliere(sx, sy))
+    xf_apply(x, matrix.mat_verschiebe(0.0 - ox, 0.0 - oy))
+}
+
+fn xf_rotate(x: *mut Xform, grad: f64) {
+    xf_apply(x, matrix.mat_drehe(grad))
+}
+
+// Um einen frei waehlbaren Ursprung -- das ist der Normalfall in einer
+// Oberflaeche: gedreht wird um die MITTE des Widgets und nicht um die
+// Ecke der Leinwand.
+fn xf_rotate_at(x: *mut Xform, grad: f64, cx: f64, cy: f64) {
+    xf_apply(x, matrix.mat_drehe_um(grad, cx, cy))
+}
+
+fn xf_skew(x: *mut Xform, gx: f64, gy: f64, ox: f64, oy: f64) {
+    xf_apply(x, matrix.mat_verschiebe(ox, oy))
+    if gx != 0.0 {
+        xf_apply(x, matrix.mat_neige_x(gx))
+    }
+    if gy != 0.0 {
+        xf_apply(x, matrix.mat_neige_y(gy))
+    }
+    xf_apply(x, matrix.mat_verschiebe(0.0 - ox, 0.0 - oy))
+}
+
+fn xf_point_x(x: *mut Xform, px: f64, py: f64) -> f64 {
+    return matrix.mat_x(xf_mat(x), px, py)
+}
+
+fn xf_point_y(x: *mut Xform, px: f64, py: f64) -> f64 {
+    return matrix.mat_y(xf_mat(x), px, py)
+}
+
+// Der Punkt ZURUECK im Widget-System. Bei einer entarteten Matrix
+// (Skalierung 0) kommt der Punkt selbst zurueck; treffen kann man dort
+// ohnehin nichts, weil nichts zu sehen ist.
+fn xf_inv_x(x: *mut Xform, px: f64, py: f64) -> f64 {
+    var ok: bool = false
+    let k: matrix.Mat = matrix.mat_kehr(xf_mat(x), &ok)
+    if !ok {
+        return px
+    }
+    return matrix.mat_x(k, px, py)
+}
+
+fn xf_inv_y(x: *mut Xform, px: f64, py: f64) -> f64 {
+    var ok: bool = false
+    let k: matrix.Mat = matrix.mat_kehr(xf_mat(x), &ok)
+    if !ok {
+        return py
+    }
+    return matrix.mat_y(k, px, py)
+}
+
+// Wie stark die Abbildung im Mittel vergroessert. Das braucht, wer eine
+// Strichstaerke oder einen Radius mitwachsen lassen will --
+// `mat_laengenmass` aus lib/svg/matrix.fi ist genau diese Zahl.
+fn xf_scale_hint(x: *mut Xform) -> f64 {
+    return matrix.mat_laengenmass(xf_mat(x))
+}
+
+// ======================================================= FORMEN ZEICHNEN
+//
+// Ein eigener Rasterpuffer, weil der Puffer des Painters fuer die
+// GERADE Groesse eines Widgets ausgelegt ist -- ein gedrehtes Rechteck
+// braucht die Huellbox der gedrehten Ecken, und die ist groesser.
+struct Fenster {
+    ra: raster.Raster,
+    buf: *mut u8,
+    n: usize,
+    ox: i64,
+    oy: i64,
+    ok: bool,
+}
+
+fn fenster_auf(x0: f64, y0: f64, x1: f64, y1: f64) -> Fenster {
+    var f: Fenster = Fenster { ra: raster.raster_new(), buf: 0 as *mut u8,
+        n: 0, ox: 0, oy: 0, ok: false }
+    var ax: i64 = (matrix.m_floor(x0) as i64) - 1
+    var ay: i64 = (matrix.m_floor(y0) as i64) - 1
+    if ax < 0 { ax = 0 }
+    if ay < 0 { ay = 0 }
+    let bx: i64 = (matrix.m_ceil(x1) as i64) + 1
+    let by: i64 = (matrix.m_ceil(y1) as i64) + 1
+    let w: i64 = bx - ax
+    let h: i64 = by - ay
+    if w <= 0 || h <= 0 {
+        return f
+    }
+    let n: usize = raster.raster_bytes_needed(w as usize, h as usize)
+    f.buf = rt.heap_alloc(n) as *mut u8
+    if f.buf as usize == 0 {
+        return f
+    }
+    f.n = n
+    raster.raster_attach(&f.ra, f.buf, n)
+    raster.raster_begin(&f.ra, ax as f64, ay as f64, w as usize, h as usize)
+    f.ox = ax
+    f.oy = ay
+    f.ok = true
+    return f
+}
+
+fn fenster_zu(f: *mut Fenster) {
+    if (*f).buf as usize != 0 {
+        rt.heap_free((*f).buf as u64, (*f).n)
+        (*f).buf = 0 as *mut u8
+    }
+}
+
+fn kleiner(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn groesser(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Ein Viereck, dessen vier Ecken schon im Bildschirmsystem stehen.
+// Darauf laeuft jede abgebildete Form hinaus.
+fn tf_fill_quad(z: *mut painter.Painter, x0: f64, y0: f64, x1: f64,
+    y1: f64, x2: f64, y2: f64, x3: f64, y3: f64, col: u32) {
+    let lx: f64 = kleiner(kleiner(x0, x1), kleiner(x2, x3))
+    let ly: f64 = kleiner(kleiner(y0, y1), kleiner(y2, y3))
+    let hx: f64 = groesser(groesser(x0, x1), groesser(x2, x3))
+    let hy: f64 = groesser(groesser(y0, y1), groesser(y2, y3))
+    var f: Fenster = fenster_auf(lx, ly, hx, hy)
+    if !f.ok {
+        return
+    }
+    raster.raster_line(&f.ra, x0, y0, x1, y1)
+    raster.raster_line(&f.ra, x1, y1, x2, y2)
+    raster.raster_line(&f.ra, x2, y2, x3, y3)
+    raster.raster_line(&f.ra, x3, y3, x0, y0)
+    raster.raster_finish(&f.ra)
+    canvas.canvas_fill_raster(painter.painter_canvas(z), &f.ra,
+        f.ox as usize, f.oy as usize, col)
+    fenster_zu(&f)
+}
+
+// Ein abgerundetes Rechteck unter der Abbildung. Die Ecken sind die
+// bekannten Kubiken mit dem Faktor 0.5523 (derselbe wie in
+// painter.path_round -- die Zahl ist die des Viertelkreises und nicht
+// eine zweite Meinung), und JEDER Kontrollpunkt geht einzeln durch die
+// Matrix. Deshalb bleibt die Rundung unter einer Drehung eine Rundung
+// und wird nicht zur Ellipse aus einem gedrehten Pixelbild.
+fn tf_fill_round_rect(z: *mut painter.Painter, xf: *mut Xform, x: f64,
+    y: f64, w: f64, h: f64, r0: f64, col: u32) {
+    if w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let m: matrix.Mat = xf_mat(xf)
+    var r: f64 = r0
+    var kl: f64 = w
+    if h < kl {
+        kl = h
+    }
+    if r > kl / 2.0 {
+        r = kl / 2.0
+    }
+    if r < 0.0 {
+        r = 0.0
+    }
+    if r == 0.0 {
+        tf_fill_quad(z,
+            matrix.mat_x(m, x, y), matrix.mat_y(m, x, y),
+            matrix.mat_x(m, x + w, y), matrix.mat_y(m, x + w, y),
+            matrix.mat_x(m, x + w, y + h), matrix.mat_y(m, x + w, y + h),
+            matrix.mat_x(m, x, y + h), matrix.mat_y(m, x, y + h), col)
+        return
+    }
+    // Die Huellbox der vier abgebildeten Ecken.
+    let ex0: f64 = matrix.mat_x(m, x, y)
+    let ey0: f64 = matrix.mat_y(m, x, y)
+    let ex1: f64 = matrix.mat_x(m, x + w, y)
+    let ey1: f64 = matrix.mat_y(m, x + w, y)
+    let ex2: f64 = matrix.mat_x(m, x + w, y + h)
+    let ey2: f64 = matrix.mat_y(m, x + w, y + h)
+    let ex3: f64 = matrix.mat_x(m, x, y + h)
+    let ey3: f64 = matrix.mat_y(m, x, y + h)
+    var f: Fenster = fenster_auf(
+        kleiner(kleiner(ex0, ex1), kleiner(ex2, ex3)),
+        kleiner(kleiner(ey0, ey1), kleiner(ey2, ey3)),
+        groesser(groesser(ex0, ex1), groesser(ex2, ex3)),
+        groesser(groesser(ey0, ey1), groesser(ey2, ey3)))
+    if !f.ok {
+        return
+    }
+    let k: f64 = r * 0.5522847498307933
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    // oben, rechts herum -- dieselbe Umlaufrichtung wie painter.path_round
+    lin(&f.ra, m, x + r, y, x1 - r, y)
+    kub(&f.ra, m, x1 - r, y, x1 - r + k, y, x1, y + r - k, x1, y + r)
+    lin(&f.ra, m, x1, y + r, x1, y1 - r)
+    kub(&f.ra, m, x1, y1 - r, x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1)
+    lin(&f.ra, m, x1 - r, y1, x + r, y1)
+    kub(&f.ra, m, x + r, y1, x + r - k, y1, x, y1 - r + k, x, y1 - r)
+    lin(&f.ra, m, x, y1 - r, x, y + r)
+    kub(&f.ra, m, x, y + r, x, y + r - k, x + r - k, y, x + r, y)
+    raster.raster_finish(&f.ra)
+    canvas.canvas_fill_raster(painter.painter_canvas(z), &f.ra,
+        f.ox as usize, f.oy as usize, col)
+    fenster_zu(&f)
+}
+
+fn lin(ra: *mut raster.Raster, m: matrix.Mat, ax: f64, ay: f64, bx: f64,
+    by: f64) {
+    raster.raster_line(ra, matrix.mat_x(m, ax, ay), matrix.mat_y(m, ax, ay),
+        matrix.mat_x(m, bx, by), matrix.mat_y(m, bx, by))
+}
+
+fn kub(ra: *mut raster.Raster, m: matrix.Mat, ax: f64, ay: f64, bx: f64,
+    by: f64, cx: f64, cy: f64, dx: f64, dy: f64) {
+    raster.raster_cubic(ra,
+        matrix.mat_x(m, ax, ay), matrix.mat_y(m, ax, ay),
+        matrix.mat_x(m, bx, by), matrix.mat_y(m, bx, by),
+        matrix.mat_x(m, cx, cy), matrix.mat_y(m, cx, cy),
+        matrix.mat_x(m, dx, dy), matrix.mat_y(m, dx, dy))
+}
+
+// ======================================================= BILDER ZEICHNEN
+//
+// Rueckwaerts: ueber die Zielpixel laufen, jeden mit der Kehrmatrix in
+// das Bild zuruecksetzen, dort BILINEAR abtasten. Wer vorwaerts
+// abbildet, sprueht bei Vergroesserung Loecher und bei Verkleinerung
+// doppelt auf dieselbe Stelle.
+fn tf_draw_image(z: *mut painter.Painter, xf: *mut Xform,
+    b: *mut uiimage.Image, x: f64, y: f64, w: f64, h: f64, alpha: f64) {
+    if !uiimage.image_ok(b) || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let m: matrix.Mat = xf_mat(xf)
+    var ok: bool = false
+    let inv: matrix.Mat = matrix.mat_kehr(m, &ok)
+    if !ok {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    let e0x: f64 = matrix.mat_x(m, x, y)
+    let e0y: f64 = matrix.mat_y(m, x, y)
+    let e1x: f64 = matrix.mat_x(m, x + w, y)
+    let e1y: f64 = matrix.mat_y(m, x + w, y)
+    let e2x: f64 = matrix.mat_x(m, x + w, y + h)
+    let e2y: f64 = matrix.mat_y(m, x + w, y + h)
+    let e3x: f64 = matrix.mat_x(m, x, y + h)
+    let e3y: f64 = matrix.mat_y(m, x, y + h)
+    var px0: i64 = matrix.m_floor(kleiner(kleiner(e0x, e1x), kleiner(e2x, e3x))) as i64
+    var py0: i64 = matrix.m_floor(kleiner(kleiner(e0y, e1y), kleiner(e2y, e3y))) as i64
+    let px1: i64 = (matrix.m_ceil(groesser(groesser(e0x, e1x), groesser(e2x, e3x))) as i64) + 1
+    let py1: i64 = (matrix.m_ceil(groesser(groesser(e0y, e1y), groesser(e2y, e3y))) as i64) + 1
+    if px0 < 0 { px0 = 0 }
+    if py0 < 0 { py0 = 0 }
+    let bw: f64 = uiimage.image_w(b) as f64
+    let bh: f64 = uiimage.image_h(b) as f64
+    var py: i64 = py0
+    while py < py1 && py < ch {
+        var px: i64 = px0
+        while px < px1 && px < cw {
+            // Die Mitte des Zielpixels zurueckholen.
+            let sx: f64 = matrix.mat_x(inv, (px as f64) + 0.5, (py as f64) + 0.5)
+            let sy: f64 = matrix.mat_y(inv, (px as f64) + 0.5, (py as f64) + 0.5)
+            if sx >= x && sx < x + w && sy >= y && sy < y + h {
+                // in Bildkoordinaten
+                let u: f64 = (sx - x) / w * bw - 0.5
+                let v: f64 = (sy - y) / h * bh - 0.5
+                let c: u32 = bilinear(b, u, v)
+                let a: f64 = (((c >> 24) & 255 as u32) as f64) / 255.0 * alpha
+                if a > 0.0 {
+                    canvas.canvas_blend(cv, px as usize, py as usize,
+                        (255 as u32 << 24) | (c & 16777215 as u32), a)
+                }
+            }
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// Bilineare Abtastung, Rand fortgesetzt. Ohne sie hat ein gedrehtes
+// Bild genau die Treppen, wegen derer die ganze Datei rueckwaerts
+// abbildet.
+fn bilinear(b: *mut uiimage.Image, u: f64, v: f64) -> u32 {
+    let iw: i64 = uiimage.image_w(b) as i64
+    let ih: i64 = uiimage.image_h(b) as i64
+    let u0: i64 = matrix.m_floor(u) as i64
+    let v0: i64 = matrix.m_floor(v) as i64
+    let fu: f64 = u - (u0 as f64)
+    let fv: f64 = v - (v0 as f64)
+    let c00: u32 = hol(b, u0, v0, iw, ih)
+    let c10: u32 = hol(b, u0 + 1, v0, iw, ih)
+    let c01: u32 = hol(b, u0, v0 + 1, iw, ih)
+    let c11: u32 = hol(b, u0 + 1, v0 + 1, iw, ih)
+    var out: u32 = 0
+    var s: u32 = 0
+    while s < 32 {
+        let k00: f64 = ((c00 >> s) & 255 as u32) as f64
+        let k10: f64 = ((c10 >> s) & 255 as u32) as f64
+        let k01: f64 = ((c01 >> s) & 255 as u32) as f64
+        let k11: f64 = ((c11 >> s) & 255 as u32) as f64
+        let o: f64 = k00 * (1.0 - fu) * (1.0 - fv) + k10 * fu * (1.0 - fv) +
+            k01 * (1.0 - fu) * fv + k11 * fu * fv
+        var q: f64 = o + 0.5
+        if q < 0.0 { q = 0.0 }
+        if q > 255.0 { q = 255.0 }
+        out = out | (((q as i64) as u32) << s)
+        s = s + 8
+    }
+    return out
+}
+
+fn hol(b: *mut uiimage.Image, x: i64, y: i64, w: i64, h: i64) -> u32 {
+    var cx: i64 = x
+    var cy: i64 = y
+    if cx < 0 { cx = 0 }
+    if cy < 0 { cy = 0 }
+    if cx > w - 1 { cx = w - 1 }
+    if cy > h - 1 { cy = h - 1 }
+    return uiimage.image_pixel_at(b, cx as usize, cy as usize)
+}
+
+// ======================================================== TEXT ZEICHNEN
+//
+// Text unter einer reinen Verschiebung (und Skalierung der Schrift)
+// geht durch den normalen Weg: `painter.text` rastert die Glyphen in
+// der Zielgroesse NEU, und genau das will man -- ein skaliertes
+// Pixelbild von Text ist an jedem Bildschirm sofort als solches zu
+// erkennen. Fuer eine gedrehte Abbildung bleibt der Ankerpunkt
+// abgebildet und die Schriftgroesse folgt dem Laengenmass.
+fn tf_text(z: *mut painter.Painter, xf: *mut Xform, x: f64, base_y: f64,
+    w: f64, size: f64, col: u32, p: u64, n: usize, align: u32) -> f64 {
+    let m: matrix.Mat = xf_mat(xf)
+    let ax: f64 = matrix.mat_x(m, x, base_y)
+    let ay: f64 = matrix.mat_y(m, x, base_y)
+    let s: f64 = matrix.mat_laengenmass(m)
+    return painter.text(z, ax, ay, w * s, size * s, col, p, n, align)
+}
+
+// ========================================================= DIE TREFFER
+//
+// Der Punkt kommt aus dem Bildschirmsystem und wird mit der
+// Kehrmatrix in das System zurueckgeholt, in dem das Rechteck steht.
+fn tf_hit_rect(xf: *mut Xform, x: f64, y: f64, w: f64, h: f64, mx: f64,
+    my: f64) -> bool {
+    var ok: bool = false
+    let k: matrix.Mat = matrix.mat_kehr(xf_mat(xf), &ok)
+    if !ok {
+        return false
+    }
+    let lx: f64 = matrix.mat_x(k, mx, my)
+    let ly: f64 = matrix.mat_y(k, mx, my)
+    return lx >= x && lx < x + w && ly >= y && ly < y + h
+}
+
+fn tf_hit_widget(xf: *mut Xform, e: *mut widget.Widget, mx: f64,
+    my: f64) -> bool {
+    return tf_hit_rect(xf, widget.w_x(e), widget.w_y(e), widget.w_w(e),
+        widget.w_h(e), mx, my)
+}
+
+// Die Fassung von `control.hit_test` fuer eine Flaeche unter einer
+// Abbildung: EIN Punkt wird zurueckgeholt, danach laeuft genau die
+// vorhandene Suche. Es gibt also weiterhin nur EINE Trefferpruefung --
+// hier steht nur die Umrechnung davor.
+fn tf_hit_test(s: *mut control.Panel, xf: *mut Xform, mx: f64,
+    my: f64) -> usize {
+    var ok: bool = false
+    let k: matrix.Mat = matrix.mat_kehr(xf_mat(xf), &ok)
+    if !ok {
+        return control.NOBODY
+    }
+    return control.hit_test(s, matrix.mat_x(k, mx, my),
+        matrix.mat_y(k, mx, my))
+}

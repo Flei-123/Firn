@@ -1,0 +1,661 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/anim.fi -- ZEIT IM BILD. Tweens, Easings, Zustandsuebergaenge.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Eine Oberflaeche, die zwischen zwei Zustaenden SPRINGT, sieht alt aus.
+// Was moderne Oberflaechen jung aussehen laesst, ist nicht eine hoehere
+// Farbtiefe, sondern dass ein Knopf beim Ueberfahren seine Farbe UEBER
+// EINE ZEIT annimmt -- genau das, was CSS `transition` heisst. In fUi
+// gab es dafuer bisher keinen Ort, also haette jedes Widget seine eigene
+// Uhr bekommen. Das ist die Sorte Wiederholung, die dieser Baum nicht
+// duldet: hier steht die Uhr EINMAL.
+//
+// ======================================================= WAS HIER STEHT
+//
+//   Animation   ein Tween: von -> bis, ueber eine Dauer, mit Easing
+//   Animator    ein Register laufender Tweens; `anim_tick` rechnet alle
+//               weiter und MELDET, ob sich etwas geaendert hat -- daran
+//               haengt das bedarfsgesteuerte Neuzeichnen. Wer immer neu
+//               zeichnet, verbrennt Strom; wer nie neu zeichnet, friert.
+//   Easings     linear, ease-in/out/in-out als cubic-bezier mit frei
+//               waehlbaren Kontrollpunkten (Newton fuer t aus x, genau
+//               wie es die CSS-Kurve verlangt), steps(n), und eine
+//               echte Feder (Masse/Steifigkeit/Daempfung, ANALYTISCH
+//               geloest -- ein Euler-Schritt driftet und kommt bei
+//               langer Laufzeit nie sauber zur Ruhe).
+//   Transition  der Zustandswechsel eines Widgets (normal/hover/pressed/
+//               focus) als interpolierter Style: Farbe, Radius, Rand,
+//               Alpha, Verschiebung.
+//
+// ============================================== DIE FARBEN, UND DER GRAUE FLECK
+//
+// Farbinterpolation ist der Ort, an dem es falsch aussieht, ohne dass
+// man sagen kann warum. Zwei Fallen:
+//
+//   1. ALPHA. Wer RGB und A getrennt linear mischt, laeuft von einem
+//      durchsichtigen Schwarz nach einem deckenden Rot durch ein
+//      dunkles Grau. Richtig ist PREMULTIPLIED mischen und danach
+//      zurueckteilen.
+//   2. DER FARBRAUM. sRGB-Mischung von Blau nach Gelb geht durch ein
+//      totes Grau. In OKLab bleibt der Weg bunt. Deshalb gibt es beides:
+//      `mix_srgb` (billig, genau wie CSS es per Vorgabe tut) und
+//      `mix_oklab` (schoener, fuer Verlaeufe).
+//
+// KEIN ZWEITER ORT: die Wurzel kommt aus lib/svg/matrix.fi (`m_sqrt`),
+// e^x und die Kosinusse aus `std.math`. Hier steht keine eigene
+// Arithmetik.
+import std.math
+import svg.matrix
+
+export {
+    // --- Easings
+    EASE_LINEAR, EASE_IN, EASE_OUT, EASE_IN_OUT, EASE_STEPS, EASE_SPRING,
+    Easing, easing_linear, easing_bezier, easing_steps, easing_spring,
+    easing_named, ease_eval,
+    bezier_t_for_x, spring_eval,
+    // --- Ein Tween
+    Animation, anim_new, anim_set_delay, anim_set_repeat,
+    anim_set_direction, anim_value, anim_done, anim_progress,
+    anim_start, anim_stop, anim_active,
+    DIR_NORMAL, DIR_ALTERNATE, REPEAT_FOREVER,
+    // --- Das Register
+    Animator, animator_new, animator_add, animator_count, animator_at,
+    animator_clear, anim_tick, animator_dirty,
+    ANIM_MAX,
+    // --- Farben
+    mix_srgb, mix_oklab, srgb_to_oklab, oklab_to_srgb,
+    // --- Zustandsuebergang
+    Transition, trans_new, trans_set_duration, trans_set_easing,
+    trans_to_state, trans_tick, trans_state, trans_alpha,
+    trans_color, trans_radius, trans_border, trans_dx, trans_dy,
+}
+
+// ================================================================ EASINGS
+const EASE_LINEAR: u32 = 0
+const EASE_IN: u32 = 1
+const EASE_OUT: u32 = 2
+const EASE_IN_OUT: u32 = 3
+const EASE_STEPS: u32 = 4
+const EASE_SPRING: u32 = 5
+
+// Eine Easing-Kurve als VALUE. Vier Bezier-Kontrollpunkte fuer die
+// Kurvenfaelle, `n` fuer steps(n), und drei Federzahlen. Ein Wert und
+// kein Zeiger, damit eine Animation ihre Kurve BEI SICH hat und nicht
+// in eine Tabelle zeigt, die jemand anders weiterschiebt.
+struct Easing {
+    kind: u32,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    steps: i64,
+    mass: f64,
+    stiff: f64,
+    damp: f64,
+}
+
+fn easing_linear() -> Easing {
+    return Easing { kind: EASE_LINEAR, x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0,
+        steps: 1, mass: 1.0, stiff: 100.0, damp: 10.0 }
+}
+
+// cubic-bezier(x1,y1,x2,y2) wie in CSS. Die beiden Endpunkte sind fest
+// (0,0) und (1,1), genau wie dort.
+fn easing_bezier(x1: f64, y1: f64, x2: f64, y2: f64) -> Easing {
+    var e: Easing = easing_linear()
+    e.kind = EASE_IN_OUT
+    e.x1 = x1
+    e.y1 = y1
+    e.x2 = x2
+    e.y2 = y2
+    return e
+}
+
+fn easing_steps(n: i64) -> Easing {
+    var e: Easing = easing_linear()
+    e.kind = EASE_STEPS
+    if n < 1 {
+        e.steps = 1
+    } else {
+        e.steps = n
+    }
+    return e
+}
+
+fn easing_spring(mass: f64, stiff: f64, damp: f64) -> Easing {
+    var e: Easing = easing_linear()
+    e.kind = EASE_SPRING
+    e.mass = mass
+    e.stiff = stiff
+    e.damp = damp
+    return e
+}
+
+// Die drei benannten CSS-Kurven mit ihren echten Kontrollpunkten
+// (css-easing-1, 3.1): ease-in = (0.42,0,1,1), ease-out = (0,0,0.58,1),
+// ease-in-out = (0.42,0,0.58,1).
+fn easing_named(kind: u32) -> Easing {
+    if kind == EASE_IN {
+        return easing_bezier(0.42, 0.0, 1.0, 1.0)
+    }
+    if kind == EASE_OUT {
+        return easing_bezier(0.0, 0.0, 0.58, 1.0)
+    }
+    if kind == EASE_IN_OUT {
+        return easing_bezier(0.42, 0.0, 0.58, 1.0)
+    }
+    return easing_linear()
+}
+
+// Ein Bezier-Polynom in einer Koordinate, mit P0 = 0 und P3 = 1.
+fn bez(a1: f64, a2: f64, t: f64) -> f64 {
+    let u: f64 = 1.0 - t
+    return 3.0 * u * u * t * a1 + 3.0 * u * t * t * a2 + t * t * t
+}
+
+fn bez_ableitung(a1: f64, a2: f64, t: f64) -> f64 {
+    let u: f64 = 1.0 - t
+    return 3.0 * u * u * a1 + 6.0 * u * t * (a2 - a1) + 3.0 * t * t * (1.0 - a2)
+}
+
+// DER KERN DER CSS-KURVE. Die Kurve gibt x und y beide ueber einen
+// Parameter t an -- gefragt ist aber y an einer STELLE x. Also erst t
+// aus x loesen. Newton, und wo die Ableitung zu flach wird (die Kurve
+// hat an den Enden waagerechte Stellen), Bisektion als Netz darunter.
+fn bezier_t_for_x(x1: f64, x2: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    if x >= 1.0 {
+        return 1.0
+    }
+    var t: f64 = x
+    var i: i32 = 0
+    while i < 8 {
+        let fx: f64 = bez(x1, x2, t) - x
+        if matrix.m_abs(fx) < 1.0e-9 {
+            return t
+        }
+        let d: f64 = bez_ableitung(x1, x2, t)
+        if matrix.m_abs(d) < 1.0e-6 {
+            i = 8
+        } else {
+            t = t - fx / d
+            if t < 0.0 {
+                t = 0.0
+            }
+            if t > 1.0 {
+                t = 1.0
+            }
+            i = i + 1
+        }
+    }
+    // Das Netz: Bisektion auf [0,1], 40 Halbierungen sind 1e-12.
+    var lo: f64 = 0.0
+    var hi: f64 = 1.0
+    var m: f64 = t
+    var k: i32 = 0
+    while k < 40 {
+        m = (lo + hi) * 0.5
+        if bez(x1, x2, m) < x {
+            lo = m
+        } else {
+            hi = m
+        }
+        k = k + 1
+    }
+    return m
+}
+
+// DIE FEDER, ANALYTISCH. Masse m, Steifigkeit k, Daempfung c; die
+// Auslenkung startet bei 1 (= "noch ganz am Anfang") und laeuft nach 0.
+// Zurueck kommt der Fortschritt 1 - x(t).
+//
+// Drei Faelle, und alle drei muessen dastehen, sonst bricht die Formel
+// genau am aperiodischen Grenzfall (w == 0 im Nenner):
+//
+//   unterkritisch  z < 1: e^(-z*w0*t) * (cos(wd*t) + z*w0/wd * sin(wd*t))
+//   kritisch       z = 1: e^(-w0*t) * (1 + w0*t)
+//   ueberkritisch  z > 1: zwei reelle Exponenten
+fn spring_eval(mass: f64, stiff: f64, damp: f64, t: f64) -> f64 {
+    var m: f64 = mass
+    if m <= 0.0 {
+        m = 1.0
+    }
+    var k: f64 = stiff
+    if k <= 0.0 {
+        k = 1.0
+    }
+    let w0: f64 = matrix.m_sqrt(k / m)
+    let z: f64 = damp / (2.0 * matrix.m_sqrt(k * m))
+    var x: f64 = 0.0
+    if z < 0.999999 {
+        let wd: f64 = w0 * matrix.m_sqrt(1.0 - z * z)
+        x = math.exp(0.0 - z * w0 * t) *
+            (math.cos(wd * t) + (z * w0 / wd) * math.sin(wd * t))
+    } else if z <= 1.000001 {
+        x = math.exp(0.0 - w0 * t) * (1.0 + w0 * t)
+    } else {
+        let r: f64 = matrix.m_sqrt(z * z - 1.0)
+        let a: f64 = 0.0 - w0 * (z - r)
+        let b: f64 = 0.0 - w0 * (z + r)
+        // x(0) = 1, x'(0) = 0 loest sich zu diesen beiden Gewichten.
+        let ca: f64 = 0.0 - b / (a - b)
+        let cb: f64 = a / (a - b)
+        x = ca * math.exp(a * t) + cb * math.exp(b * t)
+    }
+    return 1.0 - x
+}
+
+// Eine Easing an der Stelle `p` aus [0,1]. Fuer die Feder ist `p` die
+// normierte Zeit; die Dauer der Animation ist dann die Zeit, nach der
+// die Feder als ausgeschwungen gilt.
+fn ease_eval(e: *mut Easing, p: f64) -> f64 {
+    var t: f64 = p
+    if t < 0.0 {
+        t = 0.0
+    }
+    if t > 1.0 {
+        t = 1.0
+    }
+    let k: u32 = (*e).kind
+    if k == EASE_LINEAR {
+        return t
+    }
+    if k == EASE_STEPS {
+        // steps(n, jump-end): der Sprung passiert AM ENDE jedes
+        // Abschnitts, t = 1 gibt genau 1.
+        let n: f64 = (*e).steps as f64
+        let s: f64 = math.floor(t * n) / n
+        if s > 1.0 {
+            return 1.0
+        }
+        return s
+    }
+    if k == EASE_SPRING {
+        // Die Federzeit laeuft ueber die Dauer; 1.0 am Parameterende
+        // heisst "eine Sekunde Federzeit" -- bei Steifigkeit 100 ist
+        // das reichlich Zeit zum Ausschwingen.
+        return spring_eval((*e).mass, (*e).stiff, (*e).damp, t)
+    }
+    let u: f64 = bezier_t_for_x((*e).x1, (*e).x2, t)
+    return bez((*e).y1, (*e).y2, u)
+}
+
+// ============================================================= EIN TWEEN
+const DIR_NORMAL: u32 = 0
+const DIR_ALTERNATE: u32 = 1
+const REPEAT_FOREVER: i64 = 0 - 1
+
+struct Animation {
+    start_ms: i64,
+    delay_ms: i64,
+    dur_ms: i64,
+    von: f64,
+    bis: f64,
+    ease: Easing,
+    repeat: i64,      // wie oft im Ganzen; REPEAT_FOREVER = endlos
+    richtung: u32,
+    aktiv: u32,
+    now_ms: i64,
+}
+
+fn anim_new(start_ms: i64, dur_ms: i64, von: f64, bis: f64,
+    e: Easing) -> Animation {
+    var d: i64 = dur_ms
+    if d < 1 {
+        d = 1
+    }
+    return Animation { start_ms: start_ms, delay_ms: 0, dur_ms: d,
+        von: von, bis: bis, ease: e, repeat: 1, richtung: DIR_NORMAL,
+        aktiv: 1, now_ms: start_ms }
+}
+
+fn anim_set_delay(a: *mut Animation, ms: i64) { (*a).delay_ms = ms }
+fn anim_set_repeat(a: *mut Animation, n: i64) { (*a).repeat = n }
+fn anim_set_direction(a: *mut Animation, d: u32) { (*a).richtung = d }
+fn anim_start(a: *mut Animation, ms: i64) {
+    (*a).start_ms = ms
+    (*a).now_ms = ms
+    (*a).aktiv = 1
+}
+fn anim_stop(a: *mut Animation) { (*a).aktiv = 0 }
+fn anim_active(a: *mut Animation) -> bool { return (*a).aktiv != 0 }
+
+// Der Fortschritt in [0,1] zur Zeit `ms`, MIT Verzoegerung, Wiederholung
+// und Richtung, aber OHNE Easing.
+fn anim_progress(a: *mut Animation, ms: i64) -> f64 {
+    let t: i64 = ms - (*a).start_ms - (*a).delay_ms
+    if t <= 0 {
+        return 0.0
+    }
+    let d: i64 = (*a).dur_ms
+    var zyklus: i64 = t / d
+    var rest: f64 = ((t - zyklus * d) as f64) / (d as f64)
+    if (*a).repeat != REPEAT_FOREVER && zyklus >= (*a).repeat {
+        // Fertig: auf dem Endwert des LETZTEN Zyklus stehen bleiben.
+        zyklus = (*a).repeat - 1
+        rest = 1.0
+    }
+    if (*a).richtung == DIR_ALTERNATE && (zyklus & 1) == 1 {
+        return 1.0 - rest
+    }
+    return rest
+}
+
+fn anim_done(a: *mut Animation, ms: i64) -> bool {
+    if (*a).repeat == REPEAT_FOREVER {
+        return false
+    }
+    return ms - (*a).start_ms - (*a).delay_ms >= (*a).dur_ms * (*a).repeat
+}
+
+// Der Wert zur Zeit `ms`.
+fn anim_value(a: *mut Animation, ms: i64) -> f64 {
+    let p: f64 = ease_eval(&(*a).ease, anim_progress(a, ms))
+    return (*a).von + ((*a).bis - (*a).von) * p
+}
+
+// ========================================================== DAS REGISTER
+//
+// Feste Groesse, kein Allokator: fUi laeuft auch dort, wo es keinen
+// gibt. Wer mehr als ANIM_MAX Tweens gleichzeitig laufen hat, hat ein
+// anderes Problem als die Obergrenze.
+const ANIM_MAX: usize = 32
+
+struct Animator {
+    a: [Animation; 32],
+    n: usize,
+    dirty: u32,
+}
+
+fn animator_new() -> Animator {
+    return Animator {
+        a: [anim_new(0, 1, 0.0, 0.0, easing_linear()); 32],
+        n: 0, dirty: 0,
+    }
+}
+
+fn animator_count(g: *mut Animator) -> usize { return (*g).n }
+fn animator_clear(g: *mut Animator) { (*g).n = 0 }
+fn animator_at(g: *mut Animator, i: usize) -> *mut Animation {
+    return &(*g).a[i]
+}
+
+// Zurueck kommt der Platz, damit der Aufrufer seinen Tween
+// wiederfindet; ANIM_MAX heisst "kein Platz mehr".
+fn animator_add(g: *mut Animator, a: Animation) -> usize {
+    if (*g).n >= ANIM_MAX {
+        return ANIM_MAX
+    }
+    let i: usize = (*g).n
+    (*g).a[i] = a
+    (*g).n = i + 1
+    return i
+}
+
+// DER TAKT. Alle laufenden Tweens auf `ms` stellen und sagen, ob sich
+// ein Wert geaendert hat. Nur dann muss neu gezeichnet werden.
+fn anim_tick(g: *mut Animator, ms: i64) -> bool {
+    var geaendert: bool = false
+    var i: usize = 0
+    while i < (*g).n {
+        let a: *mut Animation = &(*g).a[i]
+        if (*a).aktiv != 0 {
+            let alt: f64 = anim_value(a, (*a).now_ms)
+            (*a).now_ms = ms
+            let neu: f64 = anim_value(a, ms)
+            if neu != alt {
+                geaendert = true
+            }
+            if anim_done(a, ms) {
+                (*a).aktiv = 0
+                geaendert = true
+            }
+        }
+        i = i + 1
+    }
+    if geaendert {
+        (*g).dirty = 1
+    }
+    return geaendert
+}
+
+fn animator_dirty(g: *mut Animator) -> bool { return (*g).dirty != 0 }
+
+// ================================================================ FARBEN
+//
+// Beide Mischer nehmen und geben 0xAARRGGBB und rechnen PREMULTIPLIED.
+fn kanal(c: u32, s: u32) -> f64 {
+    return (((c >> s) & 255 as u32) as f64) / 255.0
+}
+
+fn pack(a: f64, r: f64, g: f64, b: f64) -> u32 {
+    return (acht(a) << 24) | (acht(r) << 16) | (acht(g) << 8) | acht(b)
+}
+
+fn acht(v: f64) -> u32 {
+    var x: f64 = v * 255.0 + 0.5
+    if x < 0.0 {
+        x = 0.0
+    }
+    if x > 255.0 {
+        x = 255.0
+    }
+    return (x as i64) as u32
+}
+
+// Linear in sRGB, mit korrektem Alpha: die Farbanteile werden MIT dem
+// Alpha gewichtet gemischt und danach wieder herausgeteilt. Ohne das
+// laeuft der Weg von durchsichtig nach deckend durch ein Grau, das in
+// keiner der beiden Farben vorkommt.
+fn mix_srgb(c0: u32, c1: u32, t: f64) -> u32 {
+    var u: f64 = t
+    if u < 0.0 {
+        u = 0.0
+    }
+    if u > 1.0 {
+        u = 1.0
+    }
+    let a0: f64 = kanal(c0, 24)
+    let a1: f64 = kanal(c1, 24)
+    let a: f64 = a0 + (a1 - a0) * u
+    if a <= 0.0 {
+        return 0 as u32
+    }
+    let r: f64 = (kanal(c0, 16) * a0 + (kanal(c1, 16) * a1 - kanal(c0, 16) * a0) * u) / a
+    let g: f64 = (kanal(c0, 8) * a0 + (kanal(c1, 8) * a1 - kanal(c0, 8) * a0) * u) / a
+    let b: f64 = (kanal(c0, 0) * a0 + (kanal(c1, 0) * a1 - kanal(c0, 0) * a0) * u) / a
+    return pack(a, r, g, b)
+}
+
+// sRGB -> OKLab (Björn Ottosson, 2020). Erst die Gammakurve heraus,
+// dann die LMS-Matrix, dann die Kubikwurzel, dann die zweite Matrix.
+fn zu_linear(c: f64) -> f64 {
+    if c <= 0.04045 {
+        return c / 12.92
+    }
+    return math.powf((c + 0.055) / 1.055, 2.4)
+}
+
+fn zu_srgb(c: f64) -> f64 {
+    if c <= 0.0031308 {
+        return c * 12.92
+    }
+    return 1.055 * math.powf(c, 1.0 / 2.4) - 0.055
+}
+
+fn kubikwurzel(x: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0
+    }
+    if x < 0.0 {
+        return 0.0 - math.powf(0.0 - x, 1.0 / 3.0)
+    }
+    return math.powf(x, 1.0 / 3.0)
+}
+
+fn srgb_to_oklab(r: f64, g: f64, b: f64, ol: *mut f64, oa: *mut f64,
+    ob: *mut f64) {
+    let lr: f64 = zu_linear(r)
+    let lg: f64 = zu_linear(g)
+    let lb: f64 = zu_linear(b)
+    let l: f64 = kubikwurzel(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb)
+    let m: f64 = kubikwurzel(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb)
+    let s: f64 = kubikwurzel(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb)
+    *ol = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s
+    *oa = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+    *ob = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+}
+
+fn oklab_to_srgb(ll: f64, aa: f64, bb: f64, orr: *mut f64, og: *mut f64,
+    ob: *mut f64) {
+    let l_: f64 = ll + 0.3963377774 * aa + 0.2158037573 * bb
+    let m_: f64 = ll - 0.1055613458 * aa - 0.0638541728 * bb
+    let s_: f64 = ll - 0.0894841775 * aa - 1.2914855480 * bb
+    let l: f64 = l_ * l_ * l_
+    let m: f64 = m_ * m_ * m_
+    let s: f64 = s_ * s_ * s_
+    *orr = zu_srgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s)
+    *og = zu_srgb(0.0 - 1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s)
+    *ob = zu_srgb(0.0 - 0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+}
+
+// Der schoene Weg: in OKLab mischen. Alpha bleibt linear und wird NICHT
+// in den Farbraum gezogen -- es ist eine Deckung, keine Farbe.
+fn mix_oklab(c0: u32, c1: u32, t: f64) -> u32 {
+    var u: f64 = t
+    if u < 0.0 {
+        u = 0.0
+    }
+    if u > 1.0 {
+        u = 1.0
+    }
+    var l0: f64 = 0.0
+    var a0v: f64 = 0.0
+    var b0v: f64 = 0.0
+    var l1: f64 = 0.0
+    var a1v: f64 = 0.0
+    var b1v: f64 = 0.0
+    srgb_to_oklab(kanal(c0, 16), kanal(c0, 8), kanal(c0, 0), &l0, &a0v, &b0v)
+    srgb_to_oklab(kanal(c1, 16), kanal(c1, 8), kanal(c1, 0), &l1, &a1v, &b1v)
+    var r: f64 = 0.0
+    var g: f64 = 0.0
+    var b: f64 = 0.0
+    oklab_to_srgb(l0 + (l1 - l0) * u, a0v + (a1v - a0v) * u,
+        b0v + (b1v - b0v) * u, &r, &g, &b)
+    let al: f64 = kanal(c0, 24) + (kanal(c1, 24) - kanal(c0, 24)) * u
+    return pack(al, r, g, b)
+}
+
+// ==================================================== DER ZUSTANDSWECHSEL
+//
+// Das ist CSS `transition` fuer ein Widget: beim Wechsel des Zustandes
+// laeuft ein Tween von den ALTEN Werten auf die NEUEN. Die alten Werte
+// sind die, die gerade auf dem Schirm stehen -- nicht die des vorigen
+// Zustandes. Nur so bleibt ein Wechsel mitten in der Bewegung stetig
+// (Maus wieder herunter, bevor die Bewegung fertig ist).
+struct Transition {
+    state: u32,
+    dur_ms: i64,
+    ease: Easing,
+    t0_ms: i64,
+    // von / bis fuer jede Groesse
+    bg_von: u32,
+    bg_bis: u32,
+    rad_von: f64,
+    rad_bis: f64,
+    bor_von: f64,
+    bor_bis: f64,
+    alp_von: f64,
+    alp_bis: f64,
+    dx_von: f64,
+    dx_bis: f64,
+    dy_von: f64,
+    dy_bis: f64,
+    p: f64,        // der zuletzt gerechnete Fortschritt nach Easing
+    oklab: u32,    // 1 = Farbe in OKLab mischen
+}
+
+fn trans_new(bg: u32, radius: f64, border: f64, alpha: f64) -> Transition {
+    return Transition {
+        state: 0, dur_ms: 120, ease: easing_named(EASE_OUT), t0_ms: 0,
+        bg_von: bg, bg_bis: bg, rad_von: radius, rad_bis: radius,
+        bor_von: border, bor_bis: border, alp_von: alpha, alp_bis: alpha,
+        dx_von: 0.0, dx_bis: 0.0, dy_von: 0.0, dy_bis: 0.0,
+        p: 1.0, oklab: 0,
+    }
+}
+
+fn trans_set_duration(t: *mut Transition, ms: i64) {
+    if ms < 1 {
+        (*t).dur_ms = 1
+    } else {
+        (*t).dur_ms = ms
+    }
+}
+
+fn trans_set_easing(t: *mut Transition, e: Easing) { (*t).ease = e }
+
+// Der Wechsel. Was jetzt zu sehen ist, wird zum Anfang; die Zielwerte
+// kommen vom Aufrufer, der sie aus Theme und Style holt.
+fn trans_to_state(t: *mut Transition, now_ms: i64, state: u32, bg: u32,
+    radius: f64, border: f64, alpha: f64, dx: f64, dy: f64) {
+    (*t).bg_von = trans_color(t)
+    (*t).rad_von = trans_radius(t)
+    (*t).bor_von = trans_border(t)
+    (*t).alp_von = trans_alpha(t)
+    (*t).dx_von = trans_dx(t)
+    (*t).dy_von = trans_dy(t)
+    (*t).bg_bis = bg
+    (*t).rad_bis = radius
+    (*t).bor_bis = border
+    (*t).alp_bis = alpha
+    (*t).dx_bis = dx
+    (*t).dy_bis = dy
+    (*t).state = state
+    (*t).t0_ms = now_ms
+    (*t).p = 0.0
+}
+
+// Weiterrechnen. `true` heisst: das Bild ist veraltet.
+fn trans_tick(t: *mut Transition, now_ms: i64) -> bool {
+    let alt: f64 = (*t).p
+    var roh: f64 = ((now_ms - (*t).t0_ms) as f64) / ((*t).dur_ms as f64)
+    if roh < 0.0 {
+        roh = 0.0
+    }
+    if roh > 1.0 {
+        roh = 1.0
+    }
+    (*t).p = ease_eval(&(*t).ease, roh)
+    return (*t).p != alt
+}
+
+fn trans_state(t: *mut Transition) -> u32 { return (*t).state }
+
+fn trans_color(t: *mut Transition) -> u32 {
+    if (*t).oklab != 0 {
+        return mix_oklab((*t).bg_von, (*t).bg_bis, (*t).p)
+    }
+    return mix_srgb((*t).bg_von, (*t).bg_bis, (*t).p)
+}
+
+fn lerp(a: f64, b: f64, p: f64) -> f64 { return a + (b - a) * p }
+
+fn trans_radius(t: *mut Transition) -> f64 {
+    return lerp((*t).rad_von, (*t).rad_bis, (*t).p)
+}
+fn trans_border(t: *mut Transition) -> f64 {
+    return lerp((*t).bor_von, (*t).bor_bis, (*t).p)
+}
+fn trans_alpha(t: *mut Transition) -> f64 {
+    return lerp((*t).alp_von, (*t).alp_bis, (*t).p)
+}
+fn trans_dx(t: *mut Transition) -> f64 {
+    return lerp((*t).dx_von, (*t).dx_bis, (*t).p)
+}
+fn trans_dy(t: *mut Transition) -> f64 {
+    return lerp((*t).dy_von, (*t).dy_bis, (*t).p)
+}

@@ -773,3 +773,144 @@ path exists without duplicating code.
    together into `ACCEPTANCE.md` and `README.md`.
 7. A GC that cannot be shown to collect in the test is worthless. Every GC test
    case backs its claim with `gc_collections()` and `gc_live_objects()`.
+
+---
+---
+
+# RUNDE UI-WEB (20.09.2026) -- fUi auf das Ausdrucksniveau von HTML/CSS
+
+*Alles oberhalb dieser Linie gehoert zur Runde `firnc0` und bleibt
+unveraendert stehen. Was folgt, ist der Bauplan der laufenden Runde auf
+dem Zweig `ui-web`.*
+
+## 0. Der Stand, auf dem gebaut wird
+
+`sh tools/fui/run.sh --images` lief vor dieser Runde gruen durch
+(Abschnitte 1 bis 11, dazu die Galerien 1-4 und die Bild/SVG-Schau).
+lib/svg ist seit 2b82d78e im Baum, Bilder und SVG haengen ueber
+`lib/fui/uiimage.fi`, `uiimagepng.fi`, `uisvg.fi` am Widget.
+
+Das GERUEST dieser Runde steht bereits und ist gruen -- jedes Modul
+UEBERNIMMT eine fertige, uebersetzbare Datei und baut sie aus; keines
+faengt bei null an:
+
+| Datei | Stand |
+|---|---|
+| `lib/fui/anim.fi` | Easings (linear, cubic-bezier mit Newton, steps, analytische Feder), `Animation`, `Animator`/`anim_tick`, `mix_srgb`/`mix_oklab` (premultipliziert), `Transition` |
+| `lib/fui/flex.fi` | `profile kernel`, ganzzahlig: `FlexItem`/`FlexBox`, Verteilung mit grow/shrink/Klemmung samt Nachverteilung, justify/align/wrap/gap |
+| `lib/fui/effect.fi` | Kastenweichzeichner mit laufender Summe (3x je Richtung), `blur_rect`, `drop_shadow_round`, `backdrop_blur`, `ColorMatrix` |
+| `lib/fui/transform.fi` | `Xform`-Stapel ueber `lib/svg/matrix.fi`, `tf_fill_round_rect` (Pfadpunkte durch die Matrix), `tf_draw_image` (invers, bilinear), `tf_text`, `tf_hit_rect`/`tf_hit_test` |
+| `tools/fui/{anim,flex,effect,transform}_main.fi` | je 11-15 numerische Behauptungen, alle gruen, Abschluss `<NAME> PASSED.` |
+| `tools/fui/gallery{5,6,7,8}_main.fi` | je ein Belegbild, hell und dunkel, laufen durch |
+| `tools/fui/run.sh` | Abschnitte 12-15 und die vier neuen Galerien sind EINGEHAENGT |
+
+## 1. Wem welche Datei gehoert
+
+| Modul | AUSSCHLIESSLICH diese Dateien |
+|---|---|
+| **anim** | `lib/fui/anim.fi`, `tools/fui/anim_main.fi`, `tools/fui/gallery5_main.fi` |
+| **flex** | `lib/fui/flex.fi`, `tools/fui/flex_main.fi`, `tools/fui/gallery6_main.fi` |
+| **effect** | `lib/fui/effect.fi`, `tools/fui/effect_main.fi`, `tools/fui/gallery7_main.fi` |
+| **transform** | `lib/fui/transform.fi`, `tools/fui/transform_main.fi`, `tools/fui/gallery8_main.fi`, `lib/fui/control.fi` |
+
+NIEMAND ausser dem Architekten fasst `tools/fui/run.sh` an -- die
+Abschnitte 12 bis 15 und die Galerieaufrufe stehen schon drin, mit
+genau diesen Dateinamen. Wer eine weitere Pruefung braucht, haengt sie
+in seine EIGENE `*_main.fi`, nicht in eine neue Datei.
+
+NIEMAND aendert `lib/fui/core.fi`, `style.fi`, `layout.fi`, `theme.fi`,
+`painter.fi`, `render.fi`, `widget.fi`, `wave2.fi`, `wave3.fi`,
+`lib/svg/*`, `lib/paint/*`. Reicht eine Schnittstelle nicht: im eigenen
+Modul umgehen und es im Bericht benennen.
+
+## 2. Die Schnittstellen -- festgeschrieben
+
+Diese Namen sind BESTAND. Sie duerfen ERWEITERT, aber nicht umbenannt
+oder in ihrer Bedeutung geaendert werden, denn die Galerien und
+Pruefungen der anderen Module rufen sie auf:
+
+* **anim**: `Easing`, `easing_linear/bezier/steps/spring/named`,
+  `ease_eval(&Easing, p) -> f64` mit p in [0,1];
+  `Animation`, `anim_new(start_ms, dur_ms, von, bis, Easing)`,
+  `anim_value(&Animation, ms) -> f64`, `anim_progress`, `anim_done`;
+  `Animator`, `animator_add`, `animator_at`, `anim_tick(&Animator, ms) -> bool`
+  (`true` = das Bild ist veraltet);
+  `mix_srgb(c0, c1, t) -> u32`, `mix_oklab(...)` auf 0xAARRGGBB;
+  `Transition` mit `trans_to_state`, `trans_tick`, `trans_color`,
+  `trans_radius`, `trans_border`, `trans_alpha`, `trans_dx`, `trans_dy`.
+* **flex**: `FlexItem` (64 Oktette -- die Schrittweite steht in
+  `item_at`, wer Felder hinzufuegt, prueft sie nach),
+  `flex_item(basis, cross)`, `item_set_flex(grow, shrink, basis)` mit
+  PROMILLE (1000 = 1.0), `item_set_bounds(min, max)`, `item_set_align`;
+  `FlexBox`, `flexbox_new(dir)`, `flex_set_gap(main, cross)`,
+  `flex_set_justify/align_items/align_content/wrap/padding`;
+  `flex_layout(&FlexBox, Rect, *FlexItem, n, *Rect out, *i64, *i64)`,
+  `flex_measure_main`, `flex_measure_cross`, `flex_line_count`.
+  Die beiden `*i64` sind Arbeitsfelder des Aufrufers mit je `n`
+  Eintraegen -- dieselbe Regel A1 wie in `layout.fi`.
+* **effect**: `box_pass_h/v(src, dst, w, h, r)` auf dichten RGBA-Puffern
+  (src != dst), `blur_buffer(px, tmp, w, h, r)`,
+  `blur_rect(&Canvas, x, y, w, h, r) -> bool`,
+  `drop_shadow_round(&Painter, x, y, w, h, radius, dx, dy, blur, col)`,
+  `backdrop_blur(&Painter, x, y, w, h, radius, blur, tint)`,
+  `ColorMatrix` mit `cm_identity/saturate/brightness/contrast/grayscale/mul`,
+  `cm_apply_pixel`, `cm_apply_rect`.
+* **transform**: `Xform`, `xf_new/reset/push/pop`,
+  `xf_translate/scale/rotate/rotate_at/skew` (Skalierung und Scherung
+  um einen frei waehlbaren Ursprung), `xf_point_x/y`, `xf_inv_x/y`,
+  `xf_scale_hint`, `tf_fill_quad`, `tf_fill_round_rect`,
+  `tf_draw_image`, `tf_text`, `tf_hit_rect`, `tf_hit_widget`,
+  `tf_hit_test(&Panel, &Xform, x, y)`.
+
+## 3. Harte Regeln
+
+1. **Firn, sonst nichts.** Kein C, kein Rust, kein JS, keine libc, keine
+   fremde Bibliothek. `export { ... }` oben, Kommentare als ganze
+   Saetze, die das WARUM sagen, `#[no_gc]` wo der Kern es braucht.
+2. **Kein zweiter Ort fuer dieselbe Sache.** Matrix: `lib/svg/matrix.fi`.
+   PNG: `lib/paint/png.fi`. Runde Ecken: `painter.round_rect` bzw. die
+   Kubiken mit dem Faktor 0.5523. Pixel: `lib/paint/canvas.fi`.
+   e^x/ln/sin: `std.math`. Wer etwas zum zweiten Mal schreibt, begruendet
+   es im Kopfkommentar oder laesst es.
+3. **Kernel-rein bleiben.** `core.fi`, `style.fi`, `layout.fi` (und neu
+   `flex.fi`) uebersetzen mit `--profile=kernel` ohne Syscall und ohne
+   fremden Namen ausser `osum_panic`. Abschnitt 1 von `run.sh` prueft es.
+   Neue Module duerfen nach unten haengen, nie umgekehrt.
+4. **Zahlen, keine Blicke.** Jede Behauptung in einer `*_main.fi` ist ein
+   von Hand gerechneter Sollwert mit `got X want Y`. Kein Test wird
+   abgeschwaecht oder entfernt -- auch kein alter.
+5. **Bilder in hell UND dunkel.** Nichts ueberlappt, nichts ist
+   abgeschnitten, kein Text laeuft aus seinem Kasten. Die Laengen der
+   `[u8; N]`-Beschriftungen richtet `tools/fui/fixlen.py`; der
+   LAENGENPARAMETER am Aufruf muss dazu passen, sonst steht die
+   Beschriftung abgeschnitten im Bild (im Geruest ist das erledigt,
+   beim Erweitern wieder pruefen).
+6. **Git**: kleine, erklaerte Commits auf `ui-web`. Kein force-push, kein
+   Zweigwechsel, nichts loeschen, was man nicht selbst angelegt hat.
+7. Am Ende muss `sh tools/fui/run.sh --images` durchlaufen und
+   `ALL CHECKS PASSED` drucken.
+
+## 4. Was im Geruest noch fehlt (der eigentliche Bauauftrag)
+
+* **anim**: die `Transition` ist noch an kein Widget gebunden -- es
+  fehlt der Weg von `widget.w_state()`/`theme`/`style` in
+  `trans_to_state` und ein Beispiel, das hover/pressed/focus wirklich
+  interpoliert zeigt; OKLab ist eingebaut, aber `Transition.oklab`
+  laesst sich noch nicht von aussen setzen; Verzoegerung, Wiederholung
+  und `alternate` sind da, aber unbelegt im Bild.
+* **flex**: `align-content` kennt erst Anfang und Abstand ueber dieselbe
+  Rechnung wie `justify-content`; `AL_BASELINE` ist verdrahtet, aber im
+  Bild nicht belegt; `wrap-reverse` und Spaltenrichtung sind
+  ungeprueft; die Bruecke zu `render.pref_of` (f64 -> ganzzahlige Basis)
+  fehlt als eigene, benannte Funktion.
+* **effect**: `backdrop_blur` ist im Bild noch zu schwach zu sehen (die
+  Toenung greift zu wenig, der Radius ist zu klein gewaehlt); der
+  Schatten der kombinierten Karte in gallery7 wirkt als grauer Klumpen
+  statt als Verlauf; `blur_rect` ist ungenutzt; die Kanten von
+  `cm_apply_rect` sind ungeprueft gegen den Clip.
+* **transform**: `tf_draw_image` ist gebaut, aber weder geprueft noch im
+  Bild belegt (ein gedrehtes Bild mit bilinearer Abtastung gehoert in
+  gallery8); `tf_text` dreht den Ankerpunkt, aber nicht die Grundlinie;
+  `tf_hit_test` ist geprueft, `control.fi` selbst noch unberuehrt --
+  falls dort eine Fassung mit Matrix gewuenscht ist, gehoert sie in die
+  Hand dieses Moduls und darf `control.hit_test` NICHT ersetzen.
