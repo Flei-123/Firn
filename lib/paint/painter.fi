@@ -46,6 +46,13 @@ export {
     painter_new, painter_init, painter_free, painter_ok,
     painter_run, painter_canvas, painter_set_font,
     paint_rounded_rect, painter_glyph_ink,
+    // The blur of this file, in the two pieces a check can reach: the
+    // box width that belongs to a CSS blur radius, and one box pass
+    // over a line of coverage values. tools/fui/effect_main.fi holds
+    // them against the blur of lib/fui/effect.fi at the same sigma --
+    // the two files blur different data (coverage in f64 here, a
+    // premultiplied u8 canvas there) and have to agree on the tone.
+    box_size, blur_line,
 }
 
 const GLYPH_SCRATCH: usize = 1 << 20
@@ -833,13 +840,57 @@ fn box_size(blur: f64) -> i64 {
 // additions whatever the radius is. It has to be done in one direction at
 // a time -- a two dimensional box filter is separable, and that IS the
 // reason a box blur is worth using at all.
+// ONE BOX PASS OVER A LINE OF COVERAGE VALUES, with a running sum.
+//
+// It is written once and used for both directions: a row of the
+// coverage window lies packed (stride 8), a column lies strided by the
+// row pitch, and apart from that the arithmetic is the same. Writing
+// it twice is how the two directions drift apart -- and a blur that is
+// half a pixel wider in y than in x looks like a smear, not a shadow.
+//
+// Outside the line counts as ZERO. That is right here: the window is
+// grown by the blur radius before the shape is rasterised, so what
+// lies outside it really is empty. The blur in lib/fui/effect.fi
+// continues the EDGE instead, because it works on a cut-out of a
+// canvas where outside means "more of the same"; the two answers are
+// both correct for their own data, and that difference is named in
+// the head of that file.
+#[no_gc]
+fn blur_line(src: u64, sstride: u64, dst: u64, dstride: u64, n: i64,
+    half: i64) {
+    if n <= 0 {
+        return
+    }
+    let denom: f64 = (2 * half + 1) as f64
+    var sum: f64 = 0.0
+    var k: i64 = 0
+    while k <= half {
+        if k < n {
+            sum = sum + *((src + (k as u64) * sstride) as *mut f64)
+        }
+        k = k + 1
+    }
+    var i: i64 = 0
+    while i < n {
+        *((dst + (i as u64) * dstride) as *mut f64) = sum / denom
+        let add: i64 = i + half + 1
+        let drop: i64 = i - half
+        if add < n {
+            sum = sum + *((src + (add as u64) * sstride) as *mut f64)
+        }
+        if drop >= 0 {
+            sum = sum - *((src + (drop as u64) * sstride) as *mut f64)
+        }
+        i = i + 1
+    }
+}
+
 #[no_gc]
 fn blur_pass(p: *mut Painter, w: usize, h: usize, d: i64) {
     if d <= 0 || w == 0 || h == 0 {
         return
     }
     let half: i64 = d / 2
-    let denom: f64 = (2 * half + 1) as f64
     let tmp: u64 = (*p).tmp as u64
     let wi: i64 = w as i64
     let hi: i64 = h as i64
@@ -847,28 +898,8 @@ fn blur_pass(p: *mut Painter, w: usize, h: usize, d: i64) {
     var y: usize = 0
     while y < h {
         let row: u64 = raster.raster_cov_row(&(*p).ra, y)
-        var sum: f64 = 0.0
-        var k: i64 = 0
-        while k <= half {
-            if k < wi {
-                sum = sum + *((row + (k * 8) as u64) as *mut f64)
-            }
-            k = k + 1
-        }
+        blur_line(row, 8, tmp, 8, wi, half)
         var x: i64 = 0
-        while x < wi {
-            *((tmp + (x * 8) as u64) as *mut f64) = sum / denom
-            let add: i64 = x + half + 1
-            let drop: i64 = x - half
-            if add < wi {
-                sum = sum + *((row + (add * 8) as u64) as *mut f64)
-            }
-            if drop >= 0 {
-                sum = sum - *((row + (drop * 8) as u64) as *mut f64)
-            }
-            x = x + 1
-        }
-        x = 0
         while x < wi {
             *((row + (x * 8) as u64) as *mut f64) =
             *((tmp + (x * 8) as u64) as *mut f64)
@@ -882,31 +913,8 @@ fn blur_pass(p: *mut Painter, w: usize, h: usize, d: i64) {
     let base: u64 = raster.raster_cov_row(&(*p).ra, 0)
     var xx: i64 = 0
     while xx < wi {
-        var sum2: f64 = 0.0
-        var k2: i64 = 0
-        while k2 <= half {
-            if k2 < hi {
-                sum2 = sum2 + *((base + (k2 as u64) * stride +
-                        (xx * 8) as u64) as *mut f64)
-            }
-            k2 = k2 + 1
-        }
+        blur_line(base + (xx * 8) as u64, stride, tmp, 8, hi, half)
         var yy: i64 = 0
-        while yy < hi {
-            *((tmp + (yy * 8) as u64) as *mut f64) = sum2 / denom
-            let add2: i64 = yy + half + 1
-            let drop2: i64 = yy - half
-            if add2 < hi {
-                sum2 = sum2 + *((base + (add2 as u64) * stride +
-                        (xx * 8) as u64) as *mut f64)
-            }
-            if drop2 >= 0 {
-                sum2 = sum2 - *((base + (drop2 as u64) * stride +
-                        (xx * 8) as u64) as *mut f64)
-            }
-            yy = yy + 1
-        }
-        yy = 0
         while yy < hi {
             *((base + (yy as u64) * stride + (xx * 8) as u64) as *mut f64) =
             *((tmp + (yy * 8) as u64) as *mut f64)

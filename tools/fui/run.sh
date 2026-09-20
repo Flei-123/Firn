@@ -162,6 +162,17 @@ echo "== 14. UNSCHAERFE, SCHATTEN, FARBMATRIX =="
 # analytische Antwort, die eine Gauss-Naeherung geben MUSS.
 build effect
 "$W/effect"
+# DIE ZWEITE HAELFTE DERSELBEN PRUEFUNG. Es gibt in diesem Baum zwei
+# Kastenweichzeichner -- lib/paint/painter.blur_line auf
+# DECKUNGSGRADEN (f64) und lib/fui/effect.blur_buffer auf der
+# PREMULTIPLIZIERTEN u8-LEINWAND. Dass das kein zweiter Ort fuer
+# dieselbe Sache ist, steht im Kopf von effect.fi; dass beide bei
+# demselben sigma denselben Tonwert liefern, rechnen die beiden
+# Programme gegen DIESELBE Tabelle nach. Zwei sind es, weil Firn ein
+# Modul nach dem letzten Pfadabschnitt aufloest und `fui.painter` und
+# `paint.painter` darum nicht in ein Programm passen.
+build blurref
+"$W/blurref"
 
 echo
 echo "== 15. AFFINE ABBILDUNGEN UND DIE TREFFERPRUEFUNG =="
