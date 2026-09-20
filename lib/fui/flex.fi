@@ -48,8 +48,11 @@ export {
     // justify-content
     JUSTIFY_START, JUSTIFY_END, JUSTIFY_CENTER, JUSTIFY_BETWEEN,
     JUSTIFY_AROUND, JUSTIFY_EVENLY,
-    // align-items / align-self / align-content
+    // align-items / align-self
     AL_AUTO, AL_START, AL_END, AL_CENTER, AL_STRETCH, AL_BASELINE,
+    // align-content -- EIGENE Werte, siehe unten
+    AC_START, AC_END, AC_CENTER, AC_STRETCH, AC_BETWEEN, AC_AROUND,
+    AC_EVENLY,
     // flex-wrap
     WRAP_NONE, WRAP_WRAP, WRAP_REVERSE,
     // Die Typen
@@ -61,6 +64,8 @@ export {
     // Das Rechnen
     flex_measure_main, flex_measure_cross, flex_layout,
     flex_line_count,
+    // Die Bruecke zum Mess-Protokoll
+    flex_px, flex_item_from_pref,
     FLEX_MAX,
 }
 
@@ -83,6 +88,21 @@ const AL_END: u32 = 2
 const AL_CENTER: u32 = 3
 const AL_STRETCH: u32 = 4
 const AL_BASELINE: u32 = 5
+
+// align-content hat EIGENE Werte und leiht sich weder die von
+// `align-items` noch die von `justify-content`. Der Grund ist nicht
+// Ordnungsliebe: AL_START ist 1 und JUSTIFY_END ist ebenfalls 1, und
+// wer die eine Zahl in die andere Rechnung gibt, bekommt schweigend
+// die falsche Verteilung. CSS kennt fuer align-content ausserdem
+// `stretch` UND `space-between` -- zwei Dinge, die es in keiner der
+// beiden anderen Listen zusammen gibt.
+const AC_START: u32 = 0
+const AC_END: u32 = 1
+const AC_CENTER: u32 = 2
+const AC_STRETCH: u32 = 3
+const AC_BETWEEN: u32 = 4
+const AC_AROUND: u32 = 5
+const AC_EVENLY: u32 = 6
 
 const WRAP_NONE: u32 = 0
 const WRAP_WRAP: u32 = 1
@@ -130,6 +150,55 @@ fn item_set_bounds(k: *mut FlexItem, min_main: i64, max_main: i64) {
 fn item_set_align(k: *mut FlexItem, a: u32) { (*k).align = a }
 fn item_set_baseline(k: *mut FlexItem, b: i64) { (*k).baseline = b }
 
+// -------------------------------------- DIE BRUECKE ZUM MESS-PROTOKOLL
+//
+// `render.pref_of` misst in f64 -- eine Schrift hat nun einmal keine
+// ganzzahlige Breite. Die Flexbox rechnet ganzzahlig. Dazwischen
+// gehoert GENAU EINE Umrechnung, sonst rundet jede Aufrufstelle anders
+// und zwei Kaesten mit demselben Text werden verschieden breit.
+//
+// Gerundet wird AUFWAERTS: die gemessene Groesse ist das Minimum, das
+// der Inhalt braucht: ein halber Bildpunkt zu wenig schneidet den
+// letzten Buchstaben an, ein halber zu viel faellt niemandem auf.
+//
+// flex.fi importiert dafuer NICHTS. Es sind reine Zahlenfunktionen,
+// der Aufrufer misst und reicht die Zahlen herein -- dieselbe Richtung
+// der Abhaengigkeit wie bei layout.fi, das ebenfalls Zahlen nimmt und
+// keine Widgets. `#[allow_fp]` wie in lib/math/core_math.fi: im Kern
+// gehoeren die SSE-Register dem unterbrochenen Faden, und wer sie
+// anfasst, sagt es hin.
+#[allow_fp]
+fn flex_px(v: f64) -> i64 {
+    if v <= 0.0 {
+        return 0
+    }
+    let ganz: i64 = v as i64
+    if (ganz as f64) < v {
+        return ganz + 1
+    }
+    return ganz
+}
+
+// Aus einem Messergebnis (pw, ph) wird ein Kind: was in Hauptrichtung
+// liegt, haengt an der Richtung des Behaelters -- bei einer Zeile ist
+// die Breite die Basis, bei einer Spalte die Hoehe. Die gemessene
+// Groesse ist zugleich die Mindestgroesse, damit Schrumpfen den Inhalt
+// nicht abschneidet; wer das nicht will, ruft danach
+// `item_set_bounds`.
+#[allow_fp]
+fn flex_item_from_pref(pw: f64, ph: f64, zeile: bool) -> FlexItem {
+    let b: i64 = flex_px(pw)
+    let c: i64 = flex_px(ph)
+    if zeile {
+        var k: FlexItem = flex_item(b, c)
+        k.min_main = b
+        return k
+    }
+    var k: FlexItem = flex_item(c, b)
+    k.min_main = c
+    return k
+}
+
 // ========================================================= DER BEHAELTER
 struct FlexBox {
     dir: u32,
@@ -147,7 +216,8 @@ struct FlexBox {
 
 fn flexbox_new(dir: u32) -> FlexBox {
     return FlexBox { dir: dir, justify: JUSTIFY_START,
-        align_items: AL_STRETCH, align_content: AL_START, wrap: WRAP_NONE,
+        align_items: AL_STRETCH, align_content: AC_STRETCH,
+        wrap: WRAP_NONE,
         gap_main: 0, gap_cross: 0,
         pad_l: 0, pad_t: 0, pad_r: 0, pad_b: 0 }
 }
@@ -412,12 +482,13 @@ fn justify_anfang(j: u32, frei: i64, n: usize) -> i64 {
 }
 
 fn justify_abstand(j: u32, frei: i64, n: usize) -> i64 {
-    if frei <= 0 || n < 2 {
-        if j == JUSTIFY_BETWEEN || n < 2 {
-            return 0
-        }
+    if frei <= 0 || n == 0 {
+        return 0
     }
     if j == JUSTIFY_BETWEEN {
+        if n < 2 {
+            return 0
+        }
         return frei / ((n - 1) as i64)
     }
     if j == JUSTIFY_AROUND {
@@ -427,6 +498,76 @@ fn justify_abstand(j: u32, frei: i64, n: usize) -> i64 {
         return frei / ((n + 1) as i64)
     }
     return 0
+}
+
+// ------------------------------------------------------- ALIGN-CONTENT
+//
+// Die Verteilung der ZEILEN quer -- die eigene Rechnung, nicht die von
+// `justify-content` geliehene. Zwei Gruende: die Werte sind andere
+// (siehe AC_*), und `stretch` gibt es drueben gar nicht. `stretch`
+// verteilt den freien Platz auf die Zeilen SELBST und laesst danach
+// keinen Anfang und keinen Abstand uebrig; alles andere laesst die
+// Zeilenhoehen, wie sie sind, und schiebt nur.
+//
+// `quer` zeigt auf `zahl` Zeilenhoehen und wird bei AC_STRETCH
+// veraendert. Zurueck kommt der freie Platz, der NACH dem Strecken
+// noch zu verschieben ist; Anfang und Abstand landen in `anfang` und
+// `abstand`.
+fn inhalt_verteilen(a: u32, zahl: usize, frei_in: i64, quer: *mut i64,
+    anfang: *mut i64, abstand: *mut i64) {
+    *anfang = 0
+    *abstand = 0
+    if zahl == 0 || frei_in <= 0 {
+        return
+    }
+    var frei: i64 = frei_in
+    if a == AC_STRETCH {
+        // Jede Zeile bekommt denselben Anteil, und der Rest der
+        // Ganzzahldivision geht an die letzte -- dieselbe Regel wie
+        // bei der Hauptrichtung, damit die Summe EXAKT aufgeht und
+        // unten kein leerer Streifen bleibt.
+        let je: i64 = frei / (zahl as i64)
+        var vergeben: i64 = 0
+        var z: usize = 0
+        while z < zahl {
+            let p: *mut i64 = (quer as u64 + (z * 8) as u64) as *mut i64
+            *p = *p + je
+            vergeben = vergeben + je
+            z = z + 1
+        }
+        let letzte: *mut i64 =
+            (quer as u64 + ((zahl - 1) * 8) as u64) as *mut i64
+        *letzte = *letzte + (frei - vergeben)
+        return
+    }
+    if a == AC_END {
+        *anfang = frei
+        return
+    }
+    if a == AC_CENTER {
+        *anfang = frei / 2
+        return
+    }
+    if a == AC_BETWEEN {
+        if zahl > 1 {
+            *abstand = frei / ((zahl - 1) as i64)
+        }
+        return
+    }
+    if a == AC_AROUND {
+        // Jede Zeile bekommt gleich viel Luft, halb davor, halb
+        // dahinter -- aussen also eine halbe, innen eine ganze.
+        let je: i64 = frei / (zahl as i64)
+        *anfang = je / 2
+        *abstand = je
+        return
+    }
+    if a == AC_EVENLY {
+        let je: i64 = frei / ((zahl + 1) as i64)
+        *anfang = je
+        *abstand = je
+        return
+    }
 }
 
 // ------------------------------------------------------------- SETZEN
@@ -502,22 +643,29 @@ fn flex_layout(s: *mut FlexBox, space: layout.Rect, k: *mut FlexItem,
     if zahl > 1 {
         quer_luecken = (*s).gap_cross * ((zahl - 1) as i64)
     }
-    // Eine einzige Zeile ohne Umbruch fuellt die Querrichtung ganz --
-    // sonst haengt `align-items: stretch` in der Luft.
-    if zahl == 1 {
+    // Ohne Umbruch gibt es genau eine Zeile, und sie fuellt die
+    // Querrichtung ganz -- sonst haengt `align-items: stretch` in der
+    // Luft. MIT Umbruch entscheidet darueber align-content, auch bei
+    // nur einer Zeile.
+    if (*s).wrap == WRAP_NONE {
         zeilen_quer[0] = quer_ganz
+        quer_summe = quer_ganz
     }
+    var quer_frei: i64 = quer_ganz - quer_summe - quer_luecken
+    if quer_frei < 0 {
+        quer_frei = 0
+    }
+    var inhalt_anfang: i64 = 0
+    var inhalt_abstand: i64 = 0
+    inhalt_verteilen((*s).align_content, zahl, quer_frei,
+        (&zeilen_quer[0]) as *mut i64, &inhalt_anfang, &inhalt_abstand)
     var quer_lauf: i64 = 0
     if ist_zeile(s) {
         quer_lauf = inner.y
     } else {
         quer_lauf = inner.x
     }
-    let quer_frei: i64 = quer_ganz - quer_summe - quer_luecken
-    if zahl > 1 && quer_frei > 0 {
-        quer_lauf = quer_lauf + justify_anfang((*s).align_content,
-            quer_frei, zahl)
-    }
+    quer_lauf = quer_lauf + inhalt_anfang
     // ---- Jede Zeile setzen
     z = 0
     while z < zahl {
@@ -542,11 +690,11 @@ fn flex_layout(s: *mut FlexBox, space: layout.Rect, k: *mut FlexItem,
         if frei < 0 {
             frei = 0
         }
-        var pos: i64 = inner.x
+        var haupt_anfang: i64 = inner.x
         if !ist_zeile(s) {
-            pos = inner.y
+            haupt_anfang = inner.y
         }
-        pos = pos + justify_anfang((*s).justify, frei, m)
+        var pos: i64 = haupt_anfang + justify_anfang((*s).justify, frei, m)
         let extra: i64 = justify_abstand((*s).justify, frei, m)
         // Die Grundlinie der Zeile: die tiefste ueber alle Kinder, die
         // sich danach ausrichten wollen.
@@ -565,10 +713,7 @@ fn flex_layout(s: *mut FlexBox, space: layout.Rect, k: *mut FlexItem,
         }
         i = 0
         while i < m {
-            var ii: usize = i
-            if ist_rueckwaerts(s) {
-                ii = m - 1 - i
-            }
+            let ii: usize = i
             let it: *mut FlexItem = item_at(k, von + ii)
             let haupt: i64 = ld(groessen, ii)
             var al: u32 = (*it).align
@@ -586,21 +731,30 @@ fn flex_layout(s: *mut FlexBox, space: layout.Rect, k: *mut FlexItem,
             } else if al == AL_BASELINE {
                 quer_pos = quer_pos + grundlinie - (*it).baseline
             }
+            // *_REVERSE dreht die HAUPTACHSE um, nicht die Reihenfolge
+            // im Feld: in CSS liegt bei `row-reverse` der Anfang der
+            // Achse rechts. Darum wird durchgehend vorwaerts gerechnet
+            // und die fertige Lage am Ende gespiegelt -- so stimmt
+            // auch `justify-content: flex-start`, das dann rechts
+            // buendig packt. Wer stattdessen nur die Reihenfolge
+            // tauscht, bekommt bei freiem Platz eine Zeile, die auf
+            // der falschen Seite klebt.
+            var mpos: i64 = pos
+            if ist_rueckwaerts(s) {
+                mpos = haupt_anfang + platz - (pos - haupt_anfang) - haupt
+            }
             if ist_zeile(s) {
                 *((out as u64 + ((von + ii) * 32) as u64) as *mut layout.Rect) =
-                    layout.rect_new(pos, quer_pos, haupt, quer)
+                    layout.rect_new(mpos, quer_pos, haupt, quer)
             } else {
                 *((out as u64 + ((von + ii) * 32) as u64) as *mut layout.Rect) =
-                    layout.rect_new(quer_pos, pos, quer, haupt)
+                    layout.rect_new(quer_pos, mpos, quer, haupt)
             }
             pos = pos + haupt + (*s).gap_main + extra
             i = i + 1
         }
         quer_lauf = quer_lauf + zeilen_quer[zi] + (*s).gap_cross
-        if zahl > 1 && quer_frei > 0 {
-            quer_lauf = quer_lauf + justify_abstand((*s).align_content,
-                quer_frei, zahl)
-        }
+            + inhalt_abstand
         z = z + 1
     }
 }
