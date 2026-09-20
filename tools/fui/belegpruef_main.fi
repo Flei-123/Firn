@@ -1,0 +1,278 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/belegpruef_main.fi -- DIE BELEGE WERDEN NACHGERECHNET.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Ein Belegbild wird geschrieben, der Lauf druckt "ALL CHECKS PASSED"
+// -- und niemand hat je HINEINGESEHEN. Genau so ist in OrientOS eine
+// Oberflaeche ohne einen einzigen Buchstaben durch die Abnahme
+// gekommen: die Datei war da, sie war sogar gross, sie war nur leer.
+// Ein Bild, das nur ENTSTANDEN ist, belegt nichts.
+//
+// Dieses Programm liest jedes erzeugte PNG mit `paint/png.decode_png`
+// wieder EIN und rechnet drei Dinge nach, die eine leere oder halb
+// gemalte Leinwand nicht bestehen kann:
+//
+//   1. DIE ABMESSUNGEN. Breite und Hoehe stehen im Aufruf und kommen
+//      aus dem Programm, das das Bild gemalt hat. Eine Leinwand, die
+//      ploetzlich anders gross ist, ist ein abgeschnittener Beleg.
+//   2. DIE ZAHL VERSCHIEDENER FARBEN. Eine geleerte Leinwand hat eine
+//      einzige; ein Bild mit Text, Kanten und Verlaeufen hat Hunderte.
+//      Gezaehlt wird mit einer offenen Streutabelle (4096 Plaetze) --
+//      ab `MAX_FARBEN` wird nicht weiter gezaehlt, die Schranke reicht.
+//   3. DER ANTEIL NICHT-HINTERGRUND-PIXEL JE BAND. Das Bild wird in
+//      `BAENDER` waagerechte Baender geschnitten, und in JEDEM muss
+//      etwas stehen. Das ist die Pruefung, die ein Bild nicht besteht,
+//      dessen untere Haelfte leer blieb, weil eine Zeichenschleife zu
+//      frueh abbrach -- der Fehler, den man auf einem Daumennagel
+//      uebersieht.
+//
+// Der Hintergrund wird NICHT geraten: er ist die Farbe des Pixels
+// (2,2), also der Ecke, in die kein Beleg etwas malt. Ein Pixel gilt
+// als "nicht Hintergrund", wenn sich einer seiner drei Kanaele um mehr
+// als `TOLERANZ` unterscheidet -- sonst zaehlte das Rauschen einer
+// Kantenglaettung als Inhalt.
+//
+//     belegpruef_main <bild.png> <breite> <h_min> <h_max> <min_farben>
+//
+// Die Breite steht EXAKT fest; bei der Hoehe wird eine Spanne
+// angegeben, weil drei Belege ihre Leinwand auf den Inhalt
+// zuschneiden (fui-wave2 ist im dunklen Schema drei Zeilen kuerzer als
+// im hellen). Die obere Grenze ist die Hoehe der Leinwand aus dem
+// malenden Programm -- zugeschnitten werden kann nur nach unten --,
+// die untere haelt fest, dass wirklich der ganze Satz gemalt wurde und
+// nicht nur die Kopfzeile.
+//
+// Jede Verletzung wird auf fd 1 benannt, und der Rueckgabewert ist
+// dann 1: `set -e` in tools/fui/run.sh bricht den Lauf damit ab.
+import std.rt
+import paint.png
+
+const BAENDER: usize = 6
+// Wie viel von einem Band bemalt sein muss. Ein Tausendstel ist wenig
+// und trotzdem scharf: ein LEERES Band hat null, und selbst ein Band,
+// in dem nur eine Zeile Text steht, liegt darueber (ein 1240x764-Bild
+// hat je Band rund 158000 Pixel, ein Tausendstel davon sind 158).
+const MIN_PROMILLE: i64 = 1
+const TOLERANZ: i64 = 8
+const PLAETZE: usize = 4096
+const MAX_FARBEN: usize = 2000
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Eine Dezimalzahl von der Befehlszeile. Alles, was keine Ziffer ist,
+// beendet die Zahl -- der abschliessende Nullbyte ebenso.
+fn zahl_von(p: u64) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < 20 {
+        let c: u32 = rt.ld8(p, i) as u32
+        if c < 48 as u32 || c > 57 as u32 {
+            return v
+        }
+        v = v * 10 + ((c - 48 as u32) as i64)
+        i = i + 1
+    }
+    return v
+}
+
+// Der Name der Datei in die Meldung -- ohne ihn weiss niemand, WELCHER
+// Beleg zerbrochen ist.
+fn sag_datei(p: u64) {
+    var t: rt.Buf = rt.buf_new()
+    var k: [u8; 8] = "BELEG:  "
+    rt.buf_push_bytes(&t, (&k[0]) as u64, 8)
+    rt.buf_push_bytes(&t, p, rt.c_length(p))
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// DIE FARBEN. Offene Adressierung mit linearem Sondieren; 0 heisst
+// "Platz frei", deshalb wird die Farbe mit 1 geoderrt, bevor sie
+// abgelegt wird (der Alphakanal eines Belegs ist immer 255, die
+// unterste Bitstelle der Blaustufe faellt hier nicht ins Gewicht --
+// gezaehlt wird die VIELFALT, nicht die einzelne Farbe).
+fn farbe_neu(tab: *mut u64, c: u32) -> bool {
+    let key: u64 = (c as u64) | 1099511627776 as u64
+    var h: usize = (((c as u64) * 2654435761 as u64) >> 13) as usize
+    var i: usize = 0
+    while i < PLAETZE {
+        let j: usize = (h + i) & (PLAETZE - 1)
+        let slot: *mut u64 = ((tab as u64) + (j * 8) as u64) as *mut u64
+        if *slot == 0 as u64 {
+            *slot = key
+            return true
+        }
+        if *slot == key {
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn abstand(a: u32, b: u32) -> i64 {
+    var d: i64 = (a as i64) - (b as i64)
+    if d < 0 {
+        d = 0 - d
+    }
+    return d
+}
+
+fn anders(a: u32, b: u32) -> bool {
+    if abstand((a >> 16) & 255 as u32, (b >> 16) & 255 as u32) > TOLERANZ {
+        return true
+    }
+    if abstand((a >> 8) & 255 as u32, (b >> 8) & 255 as u32) > TOLERANZ {
+        return true
+    }
+    return abstand(a & 255 as u32, b & 255 as u32) > TOLERANZ
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 6 {
+        var u: [u8; 65] = "belegpruef_main <bild.png> <breite> <h_min> <h_max> <min_farben>\n"
+        rt.write_everything(2, (&u[0]) as u64, 65)
+        return 2
+    }
+    let pfad: u64 = rt.arg_ptr(start, 1)
+    let soll_w: i64 = zahl_von(rt.arg_ptr(start, 2))
+    let h_min: i64 = zahl_von(rt.arg_ptr(start, 3))
+    let h_max: i64 = zahl_von(rt.arg_ptr(start, 4))
+    let min_farben: i64 = zahl_von(rt.arg_ptr(start, 5))
+
+    var roh: rt.Buf = rt.buf_new()
+    if !rt.read_file(pfad, &roh) {
+        var e1: [u8; 37] = "BELEG FEHLT: die Datei ist nicht da.\n"
+        rt.write_everything(2, (&e1[0]) as u64, 37)
+        sag_datei(pfad)
+        return 1
+    }
+    var im: png.Image = png.image_new()
+    if !png.decode_png(rt.buf_ptr(&roh), rt.buf_len(&roh), &im) {
+        var e2: [u8; 42] = "BELEG UNLESBAR: kein gueltiges PNG darin.\n"
+        rt.write_everything(2, (&e2[0]) as u64, 42)
+        sag_datei(pfad)
+        rt.buf_free(&roh)
+        return 1
+    }
+    sag_datei(pfad)
+
+    // ================================================ 1. DIE ABMESSUNGEN
+    let w: usize = png.image_width(&im)
+    let h: usize = png.image_height(&im)
+    var n1: [u8; 22] = "1 the width as painted"
+    report((&n1[0]) as u64, 22, (w as i64) == soll_w, w as i64, soll_w)
+    var n2: [u8; 32] = "1 the height within its bounds  "
+    report((&n2[0]) as u64, 30,
+        (h as i64) >= h_min && (h as i64) <= h_max, h as i64, h_max)
+    if (w as i64) != soll_w || (h as i64) < h_min || (h as i64) > h_max ||
+        w < 8 || h < 8 {
+        png.image_free(&im)
+        rt.buf_free(&roh)
+        return 1
+    }
+
+    // ================ 2. DIE VIELFALT UND 3. DER INHALT JE BAND
+    let tab: *mut u64 = rt.heap_alloc(PLAETZE * 8) as *mut u64
+    if tab as usize == 0 {
+        png.image_free(&im)
+        rt.buf_free(&roh)
+        return 3
+    }
+    rt.mem_set(tab as u64, 0 as u8, PLAETZE * 8)
+    let grund: u32 = png.image_pixel(&im, 2, 2) & 16777215 as u32
+    var farben: usize = 0
+    var voll: [i64; 6] = [0; 6]
+    let bh: usize = h / BAENDER
+    var y: usize = 0
+    while y < h {
+        var b: usize = y / bh
+        if b >= BAENDER {
+            b = BAENDER - 1
+        }
+        var x: usize = 0
+        while x < w {
+            let c: u32 = png.image_pixel(&im, x, y) & 16777215 as u32
+            if farben < MAX_FARBEN {
+                if farbe_neu(tab, c) {
+                    farben = farben + 1
+                }
+            }
+            if anders(c, grund) {
+                voll[b] = voll[b] + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    rt.heap_free(tab as u64, PLAETZE * 8)
+
+    var n3: [u8; 31] = "2 distinct colours in the image"
+    report((&n3[0]) as u64, 31, (farben as i64) >= min_farben,
+        farben as i64, min_farben)
+
+    // Der Anteil je Band in Promille. Das letzte Band traegt den Rest
+    // der Division mit, deshalb wird seine Hoehe getrennt gerechnet --
+    // sonst faellt bei einer Hoehe wie 764 die letzte Zeile in ein
+    // Band, das als leer gilt.
+    var i: usize = 0
+    while i < BAENDER {
+        var hoehe: usize = bh
+        if i == BAENDER - 1 {
+            hoehe = h - bh * (BAENDER - 1)
+        }
+        let pro: i64 = (voll[i] * 1000) / ((hoehe * w) as i64)
+        var nb: [u8; 34] = "3 band 0: per mille painted over 0"
+        // Die Bandnummer in die Meldung schreiben, damit man sieht,
+        // WELCHES Band leer blieb.
+        nb[7] = (48 + i) as u8
+        report((&nb[0]) as u64, 34, pro >= MIN_PROMILLE, pro, MIN_PROMILLE)
+        i = i + 1
+    }
+
+    png.image_free(&im)
+    rt.buf_free(&roh)
+
+    var t: rt.Buf = rt.buf_new()
+    if G_ERRORS > 0 {
+        var f: [u8; 26] = "THIS PICTURE IS NO PROOF.\n"
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 26)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+        return 1
+    }
+    var o: [u8; 18] = "BELEG IN ORDNUNG.\n"
+    rt.buf_push_bytes(&t, (&o[0]) as u64, 18)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 0
+}

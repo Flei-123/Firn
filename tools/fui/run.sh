@@ -200,6 +200,42 @@ echo "== 18. DIE BEDIENUNG DES TEXTFELDES =="
 build editor
 "$W/editor"
 
+echo
+echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
+# DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
+# liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
+# und wrap_main.fi rechneten fuer niemanden, und tools/fui/preview_main.fi
+# stand ganz ausserhalb: keine dieser Dateien kam in diesem Lauf vor,
+# also fiel nichts auf. Eine Pruefung, die niemand ruft, ist keine.
+#
+# Deshalb hier zweierlei, MASCHINELL und nicht nach Gedaechtnis:
+#   1. JEDE Datei tools/fui/*_main.fi und demos/*/main.fi wird
+#      uebersetzt -- auch die Demos ausserhalb von fUi, denn was
+#      niemand baut, hoert irgendwann auf zu bauen.
+#   2. JEDE Datei tools/fui/*_main.fi und demos/fuidemo/main.fi muss in
+#      diesem Skript VORKOMMEN. (Die uebrigen Demos gehoeren anderen
+#      Baeumen; sie werden gebaut, aber nicht hier gerechnet.)
+for f in tools/fui/*_main.fi demos/*/main.fi; do
+    "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
+done
+echo "  alle tools/fui/*_main.fi und demos/*/main.fi uebersetzen  OK"
+fehlt=0
+for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
+    n=$(basename "$f" _main.fi)
+    case "$f" in
+        demos/*) n="fuidemo" ;;
+    esac
+    if ! grep -q "$n" "tools/fui/run.sh"; then
+        echo "  $f kommt in tools/fui/run.sh NICHT vor -- eine Pruefung,"
+        echo "  die niemand ruft, ist keine. Haenge sie ein."
+        fehlt=1
+    fi
+done
+if [ "$fehlt" != "0" ]; then
+    exit 1
+fi
+echo "  jede von ihnen wird in diesem Lauf auch gerufen            OK"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
@@ -226,18 +262,53 @@ if [ "$1" = "--images" ]; then
         exit 1
     fi
     rm -f "$Z/.schreibprobe"
+
+    # DIE SCHRIFT, EINMAL UND VORHER. Jedes Belegprogramm bricht seit
+    # dieser Runde mit einem Fehler ab, wenn es keine Schrift laden
+    # kann -- ein Bild ohne einen einzigen Buchstaben belegt nichts.
+    # Hier wird dieselbe Datei EINMAL vorher geprueft, damit der Lauf
+    # nicht erst nach dem zwanzigsten Abschnitt an zehn Programmen
+    # hintereinander scheitert und niemand die Ursache sieht.
+    SCHRIFT="${SCHRIFT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
+    if [ ! -r "$SCHRIFT" ]; then
+        echo "  FEHLER: die Schrift \"$SCHRIFT\" ist nicht lesbar."
+        echo "  Ohne Schrift entstehen textlose Belege, und ein Beleg"
+        echo "  ohne Beschriftung belegt nichts. Installiere DejaVuSans"
+        echo "  oder setze SCHRIFT auf eine vorhandene TTF-Datei."
+        exit 1
+    fi
+    echo "  Schrift gefunden: $SCHRIFT"
+
+    # DIE BELEGPRUEFUNG. Sie liest jedes geschriebene PNG WIEDER EIN
+    # und rechnet nach: Abmessungen, Zahl verschiedener Farben, und
+    # dass in JEDEM der sechs waagerechten Baender wirklich etwas
+    # steht. Die Zahlen hinter jedem Aufruf sind Breite, kleinste und
+    # groesste zulaessige Hoehe (drei Belege schneiden ihre Leinwand
+    # auf den Inhalt zu) und die geforderte Farbvielfalt.
+    build belegpruef
+    beleg() {
+        "$W/belegpruef" "$@"
+    }
     build gallery
     "$W/gallery" "$Z/fui-wave1-light.png" light
     "$W/gallery" "$Z/fui-wave1-dark.png" dark
+    beleg "$Z/fui-wave1-light.png" 1200 400 760 200
+    beleg "$Z/fui-wave1-dark.png" 1200 400 760 200
     build gallery2
     "$W/gallery2" "$Z/fui-wave2-light.png" light
     "$W/gallery2" "$Z/fui-wave2-dark.png" dark
+    beleg "$Z/fui-wave2-light.png" 1240 700 1180 200
+    beleg "$Z/fui-wave2-dark.png" 1240 700 1180 200
     build gallery3
     "$W/gallery3" "$Z/fui-wave3-light.png" light
     "$W/gallery3" "$Z/fui-wave3-dark.png" dark
+    beleg "$Z/fui-wave3-light.png" 1240 700 1320 200
+    beleg "$Z/fui-wave3-dark.png" 1240 700 1320 200
     build gallery4
     "$W/gallery4" "$Z/fui-text-light.png" light
     "$W/gallery4" "$Z/fui-text-dark.png" dark
+    beleg "$Z/fui-text-light.png" 1240 600 1180 200
+    beleg "$Z/fui-text-dark.png" 1240 600 1180 200
     # BILD UND SVG (Runde BILD+SVG, 13.09.2026). Fuenf Baender: Knopf mit
     # Icon, Beschriftung mit Bild und Icon-Toolbar, dasselbe SVG je Groesse
     # NEU gerastert (12..64) samt currentColor=TOK_ACCENT daneben, Bild mit
@@ -245,6 +316,8 @@ if [ "$1" = "--images" ]; then
     build artshow
     "$W/artshow" "$Z/fui-bild-svg-hell.png" light
     "$W/artshow" "$Z/fui-bild-svg-dunkel.png" dark
+    beleg "$Z/fui-bild-svg-hell.png" 900 400 620 200
+    beleg "$Z/fui-bild-svg-dunkel.png" 900 400 620 200
     # RUNDE UI-WEB: die vier neuen Faehigkeiten, hell und dunkel.
     # Eine Bewegung als Phasenreihe, die Flex-Varianten nebeneinander,
     # Schatten/Glas/Farbmatrix ueber gemustertem Grund, und gedrehte,
@@ -252,15 +325,33 @@ if [ "$1" = "--images" ]; then
     build gallery5
     "$W/gallery5" "$Z/fui-anim-hell.png" light
     "$W/gallery5" "$Z/fui-anim-dunkel.png" dark
+    beleg "$Z/fui-anim-hell.png" 1240 500 764 200
+    beleg "$Z/fui-anim-dunkel.png" 1240 500 764 200
     build gallery6
     "$W/gallery6" "$Z/fui-flex-hell.png" light
     "$W/gallery6" "$Z/fui-flex-dunkel.png" dark
+    beleg "$Z/fui-flex-hell.png" 1240 600 880 200
+    beleg "$Z/fui-flex-dunkel.png" 1240 600 880 200
     build gallery7
     "$W/gallery7" "$Z/fui-effekt-hell.png" light
     "$W/gallery7" "$Z/fui-effekt-dunkel.png" dark
+    beleg "$Z/fui-effekt-hell.png" 1240 400 640 200
+    beleg "$Z/fui-effekt-dunkel.png" 1240 400 640 200
     build gallery8
     "$W/gallery8" "$Z/fui-transform-hell.png" light
     "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
+    beleg "$Z/fui-transform-hell.png" 1280 500 760 200
+    beleg "$Z/fui-transform-dunkel.png" 1280 500 760 200
+    # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
+    # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
+    # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet
+    # erst recht nicht. Jetzt entsteht ihr Bild hier und wird
+    # nachgerechnet wie jeder andere Beleg.
+    build preview
+    "$W/preview" "$Z/fui-preview-hell.png" light
+    "$W/preview" "$Z/fui-preview-dunkel.png" dark
+    beleg "$Z/fui-preview-hell.png" 760 200 240 120
+    beleg "$Z/fui-preview-dunkel.png" 760 200 240 120
     # DIE DEMO-ANWENDUNG. Kein Pruefblatt, sondern eine Oberflaeche, wie
     # ein Anwender sie schreibt: Titelzeile und Werkzeugleiste von
     # `flex.flex_layout` verteilt, der Hover-Uebergang eines Knopfes aus
@@ -274,6 +365,8 @@ if [ "$1" = "--images" ]; then
     "$FIRNC" --opt-level=dev -o "$W/fuidemo" demos/fuidemo/main.fi
     "$W/fuidemo" "$Z/fui-demo-hell.png" light
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
+    beleg "$Z/fui-demo-hell.png" 1000 350 500 200
+    beleg "$Z/fui-demo-dunkel.png" 1000 350 500 200
     ls -la "$Z"
 fi
 
