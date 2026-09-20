@@ -143,6 +143,11 @@ echo "== 12. DIE ZEIT: EASINGS, TWEENS, UEBERGAENGE =="
 # geloeste Feder (sie kommt zur Ruhe und driftet nicht), der Takt, der
 # nur bei echter Aenderung "neu zeichnen" meldet, und die
 # Farbmischung mit korrektem Alpha.
+# Abschnitt 12b liest die Zahlen AUS DEM RENDER-PFAD: render.Ctx fuehrt
+# seit der Runde FEHLERBEHEBUNG ein Register laufender Uebergaenge
+# (anim.TransReg), und der Bildpunkt in der Mitte des gemalten Knopfes
+# geht ueber drei Bilder von 0x42414D nach 0x52525E. Ohne das Register
+# springt er sofort -- die Gegenprobe steht daneben.
 build anim
 "$W/anim"
 
@@ -178,6 +183,12 @@ echo
 echo "== 15. AFFINE ABBILDUNGEN UND DIE TREFFERPRUEFUNG =="
 # Bekannte Punktbilder, der Stapel, die Kehrabbildung -- und der
 # Klick unter Drehung, der ohne inverse Abbildung danebengeht.
+# Abschnitt 16 dieser Datei geht den NORMALEN Weg: ein um 24 Grad
+# gedrehter Knopf, gemalt mit wave2.draw_any_xf (also ueber
+# render.draw_widget_xf), bedient mit control.mouse_down -- und der
+# Punkt, an dem er gemalt wurde, ist derselbe, an dem er getroffen
+# wird. Ohne transform.tf_bind_panel geht genau dieser Klick daneben,
+# und auch das steht dort als Zahl.
 build transform
 "$W/transform"
 
