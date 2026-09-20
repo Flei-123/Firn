@@ -231,6 +231,43 @@ compiler/target/release/firnc --opt-level=dev -o /tmp/anim tools/fui/anim_main.f
 /tmp/anim
 ```
 
+## 4d. The state of `bash test.sh` (measured 2026-09-20)
+
+`test.sh` runs 59 sections and takes roughly an hour and a half. It has
+to be started with **`bash`**, not `sh`: line 216 uses `set -o pipefail`.
+All 533 `tests/*.fi` pass in all four build stages (`opt`, `noopt`,
+`devfast`, `safe`). Four sections fail, and none of them is the UI
+library -- they are named here so that nobody has to find that out
+twice:
+
+| Section | Fails because |
+|---|---|
+| `tools/fixpoint.sh` | `lib/firnc1/gctext.fi` does not match `lib/gc/*.fi` (`tools/gen_gctext.sh` was not re-run) |
+| `tools/js/run.sh` | `testdata/test262/subset.sha256` is missing from the tree |
+| `tools/english/check.sh` | 324 German identifiers; 224 of them in `lib/svg`, which came in as a port in `2b82d78e` |
+| `tools/fmt/run.sh` | 51 files are not in canonical `firnfmt` shape, among them long-standing ones like `lib/fui/core.fi`, `control.fi`, `render.fi` and `demos/choropleth/main.fi` |
+
+That each of these is older than the UI-WEB round can be read off the
+failures themselves: every one of them names files that the round never
+touched. The fifth failure, round 95, **is** fixed -- see section 4e.
+
+## 4e. Rebuilding the Unicode table
+
+```sh
+bash tools/ucd/build.sh --verify
+```
+
+Expected: `identical, octet for octet (100862 octets)`. Without
+`--verify` the script **overwrites** `lib/generated/unicode_tables.fi`
+(`generated/` is a symlink to it); with `--verify` it only compares.
+
+This is the check that section 54 of `test.sh` runs. It was failing:
+the licence sweep `0cb03e98` put `// SPDX-License-Identifier: MPL-2.0`
+into the generated file by hand but not into the template
+`tools/ucd/table_head.fi.in`, so the second build could never match the
+first line again. The template carries the line now; the generated file
+itself is unchanged, octet for octet.
+
 ## 5. What does NOT work, because it was not built
 
 Honestly and completely (in detail in `ACCEPTANCE.md`):
