@@ -38,6 +38,7 @@ import fui.painter
 import fui.uiimage
 import fui.uisvg
 import fui.effect
+import fui.transform
 
 export {
     Ctx, ctx_new, ctx_theme, ctx_painter,
@@ -48,6 +49,7 @@ export {
     def_pad_x, def_pad_y, def_font, def_align,
     color_of, len_of, len_signed,
     text_run_of,
+    draw_widget_xf,
     def_art_size, def_art_gap, art_box, draw_art, art_extra_w,
     art_text_split, draw_widget_art, pady_of,
     pref_of, set_pref_from,
@@ -1018,6 +1020,123 @@ fn draw_button(c: *mut Ctx, e: *mut widget.Widget) {
     draw_widget_art(c, e)
     draw_text(c, e)
     draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// DASSELBE WIDGET UNTER EINER AFFINEN ABBILDUNG
+// ======================================================================
+//
+// WARUM DAS HIER STEHT UND NICHT IM ANWENDUNGSPROGRAMM. lib/fui/
+// transform.fi konnte seit seinem ersten Tag ein gedrehtes Rechteck und
+// einen gedrehten Text malen -- aber nur, wer die Datei kannte, kam
+// daran. Ein Widget ging diesen Weg nirgends, und damit war die
+// Faehigkeit genau das, wogegen diese Bibliothek angetreten ist:
+// vorhanden, geprueft, nicht angeschlossen. Der Zeichenweg gehoert in
+// dieselbe Datei wie `draw_base`, und zwar aus demselben Grund, aus dem
+// `draw_elevation` hier steht und nicht in effect.fi: WAS ein Widget
+// malt, entscheidet render.fi; WIE die Unschaerfe oder die Matrix
+// gerechnet wird, entscheidet das Fachmodul.
+//
+// ES IST DERSELBE AUFBAU wie oben, Schritt fuer Schritt -- Flaeche,
+// Rand, Inhalt, Fokusring -- nur dass jede Form durch die Matrix geht:
+// die PUNKTE werden abgebildet und danach gerastert, nie das fertige
+// Bild gedreht (der Grund steht im Kopf von transform.fi: was einmal
+// Pixel ist, bekommt Treppen, die kein Kantenglaetten mehr wegnimmt).
+//
+// WAS DER AUFRUFER DAZU TUN MUSS: die Trefferpruefung mitdrehen. Sonst
+// klickt er neben das, was er sieht. Dafuer gibt es
+// `transform.tf_bind_panel` -- eine Zeile, und der normale Zeigerpfad
+// von control.fi trifft das gedrehte Widget.
+fn draw_widget_xf(c: *mut Ctx, e: *mut widget.Widget,
+    xf: *mut transform.Xform) {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize, def_radius(c, kind)))
+
+    // ---- 1. DIE FLAECHE. Dieselbe Regel wie in `draw_base`: was nicht
+    // sichtbar ist, wird NICHT gemalt -- kein Ersatzanstrich.
+    // JEDE FARBE GEHT DECKEND HINEIN. `transform.tf_*` gibt die Farbe
+    // unveraendert an die Leinwand weiter, und die rechnet mit dem
+    // Alphakanal: eine Farbe ohne ihn ist eine unsichtbare Farbe. Das
+    // ist derselbe `theme.opaque`, den lib/svg und tools/fui/gallery8
+    // an dieser Stelle rufen.
+    let bg: u32 = style.resolve_bg(sz, zu, def_bg_state(kind, zu))
+    if style.color_is_visible(bg) {
+        transform.tf_fill_round_rect(z, xf, x, y, w, h, r, theme.opaque(color_of(c, bg)))
+    }
+
+    // ---- 2. DER RAND. Ein Ring ist die Flaeche minus die innere
+    // Flaeche; unter einer Abbildung heisst das: das aeussere
+    // abgerundete Rechteck malen und das innere in der FLAECHENFARBE
+    // daruebersetzen, wenn es eine gibt. Ohne Flaechenfarbe bleibt der
+    // Rand ein voller Kasten -- das waere falsch, also wird er dann
+    // nicht gemalt. Diese Einschraenkung steht hier ehrlich, statt
+    // einen zweiten Ringrasterer aufzumachen.
+    let ra: u32 = style.resolve_border(sz, zu, def_border(kind))
+    let st: f64 = len_of(c, style.resolve_num(sz, style.SF_BORDER_W,
+        (*style.styleset_base(sz)).border_w as usize,
+        def_border_width(c, kind)))
+    if style.color_is_visible(ra) && st > 0.0 && style.color_is_visible(bg) {
+        transform.tf_fill_round_rect(z, xf, x, y, w, h, r, theme.opaque(color_of(c, ra)))
+        var ir: f64 = r - st
+        if ir < 0.0 {
+            ir = 0.0
+        }
+        transform.tf_fill_round_rect(z, xf, x + st, y + st,
+            w - 2.0 * st, h - 2.0 * st, ir, theme.opaque(color_of(c, bg)))
+    }
+
+    // ---- 3. DER FOKUSRING. Er steht hier VOR dem Inhalt und nicht
+    // wie im geraden Weg dahinter, und das ist kein Versehen: unter
+    // einer Abbildung wird ein Ring aus zwei gefuellten Formen gebaut
+    // (aussen der Ring, innen die Flaechenfarbe wieder hinein), und
+    // die innere Fuellung wuerde die Schrift wegwischen, kaeme sie
+    // danach. Am Bild aendert die Reihenfolge nichts -- der Ring liegt
+    // am Rand, die Schrift in der Mitte.
+    if widget.w_is_focus(e) && !widget.w_is_disabled(e)
+        && style.color_is_visible(bg) {
+        let m: *mut theme.Theme = ctx_theme(c)
+        let fw: f64 = len_of(c, (*theme.theme_shape(m)).focus_w)
+        transform.tf_fill_round_rect(z, xf, x, y, w, h, r,
+            theme.opaque((*theme.theme_colors(m)).accent))
+        var ir2: f64 = r - fw
+        if ir2 < 0.0 {
+            ir2 = 0.0
+        }
+        transform.tf_fill_round_rect(z, xf, x + fw, y + fw,
+            w - 2.0 * fw, h - 2.0 * fw, ir2, theme.opaque(color_of(c, bg)))
+    }
+
+    // ---- 4. DER INHALT. Die Schrift geht Kontur fuer Kontur durch
+    // dieselbe Matrix, und sie wird EINMAL gerastert.
+    if widget.w_text_len(e) != 0 {
+        var fallback: u32 = def_fg(kind)
+        if zu == style.STATE_DISABLED {
+            fallback = style.color_token(style.TOK_TEXT_DISABLED)
+        }
+        let tf: u32 = style.resolve_fg(sz, zu, fallback)
+        if style.color_is_visible(tf) {
+            let s: *mut style.Style = style.styleset_base(sz)
+            let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+                (*s).font_px as usize, def_font(c)))
+            let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+                (*s).pad_x as usize, def_pad_x(c, kind)))
+            // Die Grundlinie kommt aus derselben Rechnung wie beim
+            // geraden Text -- sonst saesse die Schrift im gedrehten
+            // Knopf anders als im geraden.
+            let by: f64 = painter.text_baseline_mid(z, y, h, px)
+            transform.tf_text(z, xf, x + padx, by, w - 2.0 * padx, px,
+                theme.opaque(color_of(c, tf)), widget.w_text(e), widget.w_text_len(e),
+                text_align_of(e))
+        }
+    }
 }
 
 // THE DISPATCHER OF THE BUILD-UP. Paints a widget out of what THIS
