@@ -76,6 +76,9 @@ export {
     decl_has, decl_merge, decl_inherit,
     EX_TRANSITION, EX_TRANSLATE, EX_SCALE, EX_ROTATE,
     INHERIT_MASK, sheet_inheritable,
+    // --- Die Bruecken: hier wird nichts gerechnet, nur weitergereicht
+    decl_easing, decl_apply_transition,
+    decl_apply_transform, decl_apply_transform_at,
     // --- Der beschriebene Knoten
     NodeDesc, desc_new, desc_add_class, desc_set_state, desc_class_count,
     DESC_CLASS_MAX,
@@ -86,6 +89,8 @@ export {
 }
 
 import fui.style
+import fui.anim
+import fui.transform
 
 // ======================================================================
 // NAMEN
@@ -253,7 +258,13 @@ struct Decl {
     ty: f64,
     sx: f64,
     sy: f64,
-    rot: f64,            // Bogenmass
+    // IN GRAD, NICHT IM BOGENMASS. Gedreht wird am Ende von
+    // lib/svg/matrix.fi (`mat_drehe`), und das rechnet in Grad -- mit
+    // Argumentreduktion, damit rotate(90) eine exakte Null gibt. Wer
+    // hier im Bogenmass abliefe, muesste auf dem Weg zur Matrix
+    // umrechnen, und das waere die zweite Stelle, an der ein Winkel
+    // angefasst wird. Also steht hier dieselbe Einheit wie dort.
+    rot: f64,
     ex: u32,
 }
 
@@ -289,8 +300,8 @@ fn decl_set_scale(d: *mut Decl, x: f64, y: f64) {
     (*d).ex = (*d).ex | EX_SCALE
 }
 
-fn decl_set_rotate(d: *mut Decl, rad: f64) {
-    (*d).rot = rad
+fn decl_set_rotate(d: *mut Decl, grad: f64) {
+    (*d).rot = grad
     (*d).ex = (*d).ex | EX_ROTATE
 }
 
@@ -307,6 +318,93 @@ fn decl_has(d: *mut Decl, bit: u32, extra: bool) -> bool {
         return ((*d).ex & bit) != 0 as u32
     }
     return ((*d).s.set_mask & bit) != 0 as u32
+}
+
+// ======================================================================
+// DIE BRUECKEN: WO DER WERT ZUR WIRKUNG WIRD
+// ======================================================================
+//
+// Bis hierher waren `transition` und `transform` nur Zahlen in einem
+// `Decl` -- und Zahlen, die niemand abholt, sind eine Behauptung. Die
+// drei Funktionen hier holen sie ab, und zwar so, dass in dieser Datei
+// KEINE Zeile Zeit- oder Matrixarithmetik steht:
+//
+//   * Die Dauer geht an `anim.trans_set_duration`, die Kurve an
+//     `anim.easing_named` -- was aus beiden wird (Bezier, steps, Feder),
+//     entscheidet lib/fui/anim.fi allein.
+//   * Verschiebung, Streckung und Drehung gehen an `transform.xf_*`,
+//     die ihrerseits lib/svg/matrix.fi rufen. Hier wird kein Sinus
+//     angefasst und keine Matrix multipliziert.
+//
+// Das ist der ganze Sinn: das Stilblatt SAGT, was gelten soll; gerechnet
+// wird dort, wo die Rechnung ohnehin schon steht.
+
+// Die Kurve dieses Uebergangs als `anim.Easing`. Ist keine
+// `transition` gesetzt, ist es die lineare Kurve -- dieselbe Vorgabe,
+// die `anim.easing_named(EASE_LINEAR)` liefert.
+fn decl_easing(d: *mut Decl) -> anim.Easing {
+    if ((*d).ex & EX_TRANSITION) == 0 as u32 {
+        return anim.easing_named(anim.EASE_LINEAR)
+    }
+    return anim.easing_named((*d).trans_ease)
+}
+
+// Den Uebergang eines Widgets auf das stellen, was das Blatt sagt.
+// `false` heisst: dieses Decl nennt keine `transition`, der Uebergang
+// bleibt unangetastet (und behaelt damit, was ihm zuvor gesagt wurde).
+fn decl_apply_transition(d: *mut Decl, t: *mut anim.Transition) -> bool {
+    if ((*d).ex & EX_TRANSITION) == 0 as u32 {
+        return false
+    }
+    anim.trans_set_duration(t, (*d).trans_ms)
+    anim.trans_set_easing(t, anim.easing_named((*d).trans_ease))
+    return true
+}
+
+// Die Umformung auf den Stapel legen, um den Punkt (ox, oy) herum --
+// in einer Oberflaeche ist das die MITTE des Knotens, nicht die Ecke
+// der Leinwand: eine Kachel, die unter dem Zeiger waechst, waechst nach
+// allen Seiten.
+//
+// Die Reihenfolge ist die von CSS: erst verschieben, dann drehen, dann
+// strecken. Sie steht hier fest, damit zwei Knoten mit demselben Decl
+// nicht verschieden aussehen. `false` heisst: dieses Decl nennt keine
+// Umformung, der Stapel wurde nicht angefasst.
+fn decl_apply_transform_at(d: *mut Decl, x: *mut transform.Xform,
+    ox: f64, oy: f64) -> bool {
+    let e: u32 = (*d).ex
+    if (e & (EX_TRANSLATE | EX_SCALE | EX_ROTATE)) == 0 as u32 {
+        return false
+    }
+    if (e & EX_TRANSLATE) != 0 as u32 {
+        transform.xf_translate(x, (*d).tx, (*d).ty)
+    }
+    if (e & EX_ROTATE) != 0 as u32 {
+        transform.xf_rotate_at(x, (*d).rot, ox, oy)
+    }
+    if (e & EX_SCALE) != 0 as u32 {
+        transform.xf_scale(x, (*d).sx, (*d).sy, ox, oy)
+    }
+    return true
+}
+
+// Dieselbe Umformung um den Ursprung der Leinwand. Das ist der Fall,
+// in dem der Aufrufer seinen Ursprung bereits gesetzt hat.
+fn decl_apply_transform(d: *mut Decl, x: *mut transform.Xform) -> bool {
+    let e: u32 = (*d).ex
+    if (e & (EX_TRANSLATE | EX_SCALE | EX_ROTATE)) == 0 as u32 {
+        return false
+    }
+    if (e & EX_TRANSLATE) != 0 as u32 {
+        transform.xf_translate(x, (*d).tx, (*d).ty)
+    }
+    if (e & EX_ROTATE) != 0 as u32 {
+        transform.xf_rotate(x, (*d).rot)
+    }
+    if (e & EX_SCALE) != 0 as u32 {
+        transform.xf_scale(x, (*d).sx, (*d).sy, 0.0, 0.0)
+    }
+    return true
 }
 
 // ======================================================================
