@@ -144,6 +144,20 @@ pub enum SimdKind {
     AddF32,
     SubF32,
     MulF32,
+    // RUNDE TEMPO 5: wandeln und vergleichen, damit aus vier Gleitzahlen
+    // vier ganze Zahlen werden koennen (`scale_pcm`).
+    //
+    // `TruncF32I32` schneidet zur Null hin ab -- genau das, was `as i32` in
+    // Firn tut. `CmpNltF32` ist NICHT die Verneinung von `CmpLtF32`: bei
+    // NaN sind beide Vergleiche "ungeordnet", und `cmpnltps` sagt dann WAHR.
+    // Genau das braucht die Nachbildung der einzelnen Fassung.
+    TruncF32I32,
+    CvtI32F32,
+    CmpLtF32,
+    CmpLeF32,
+    CmpNltF32,
+    /// Vergleich GANZER Zahlen je Spur: `a > b` (vorzeichenbehaftet).
+    CmpGt32,
     // --- shuffling and shifting ---------------------------------------
     ShuffleB,
     Shuffle32,
@@ -252,6 +266,12 @@ static TABLE: &[Sig] = &[
     s("__v128_addf32", SimdKind::AddF32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_subf32", SimdKind::SubF32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_mulf32", SimdKind::MulF32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_trunc_f32_i32", SimdKind::TruncF32I32, &[P::V], None, Some(P::V)),
+    s("__v128_cvt_i32_f32", SimdKind::CvtI32F32, &[P::V], None, Some(P::V)),
+    s("__v128_cmplt_f32", SimdKind::CmpLtF32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_cmple_f32", SimdKind::CmpLeF32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_cmpnlt_f32", SimdKind::CmpNltF32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_cmpgt_i32", SimdKind::CmpGt32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle8", SimdKind::ShuffleB, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle32", SimdKind::Shuffle32, &[P::V], Some(255), Some(P::V)),
     s("__v128_alignr", SimdKind::AlignR, &[P::V, P::V], Some(31), Some(P::V)),
@@ -1154,6 +1174,12 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::AddF32 => bin(e, fr, "addps", need(dst)?, args[0], args[1]),
         SimdKind::SubF32 => bin(e, fr, "subps", need(dst)?, args[0], args[1]),
         SimdKind::MulF32 => bin(e, fr, "mulps", need(dst)?, args[0], args[1]),
+        SimdKind::TruncF32I32 => un_src(e, fr, "cvttps2dq", need(dst)?, args[0], None),
+        SimdKind::CvtI32F32 => un_src(e, fr, "cvtdq2ps", need(dst)?, args[0], None),
+        SimdKind::CmpLtF32 => bin(e, fr, "cmpltps", need(dst)?, args[0], args[1]),
+        SimdKind::CmpLeF32 => bin(e, fr, "cmpleps", need(dst)?, args[0], args[1]),
+        SimdKind::CmpNltF32 => bin(e, fr, "cmpnltps", need(dst)?, args[0], args[1]),
+        SimdKind::CmpGt32 => bin(e, fr, "pcmpgtd", need(dst)?, args[0], args[1]),
         SimdKind::ShuffleB => bin(e, fr, "pshufb", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo32 => bin(e, fr, "punpckldq", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "punpckhdq", need(dst)?, args[0], args[1]),

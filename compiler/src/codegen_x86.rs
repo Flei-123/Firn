@@ -487,7 +487,8 @@ fn vexify(s: &str) -> Option<String> {
         }
         // RUNDE TEMPO 4: die gepackten Rechnungen, auch zweistellig mit dem
         // Ziel als erster Quelle.
-        "addps" | "subps" | "mulps" | "divps" | "minps" | "maxps" => {
+        "addps" | "subps" | "mulps" | "divps" | "minps" | "maxps" | "cmpltps" | "cmpleps"
+        | "cmpnltps" | "pcmpgtd" | "pand" | "pandn" | "por" | "pxor" | "paddd" | "psubd" => {
             if ops.len() != 2 {
                 return None;
             }
@@ -503,7 +504,8 @@ fn vexify(s: &str) -> Option<String> {
         }
         // Reine Kopien und Vergleiche: dieselbe Zahl von Operanden.
         "movaps" | "movapd" | "movups" | "movdqu" | "movdqa" | "ucomiss" | "ucomisd"
-        | "comiss" | "comisd" | "cvttss2si" | "cvttsd2si" | "movd" | "movq" => {
+        | "comiss" | "comisd" | "cvttss2si" | "cvttsd2si" | "cvttps2dq" | "cvtdq2ps"
+        | "movd" | "movq" => {
             if ops.len() != 2 {
                 return None;
             }

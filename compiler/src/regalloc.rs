@@ -105,7 +105,27 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
     use crate::simd::SimdKind as K;
     matches!(
         k,
-        K::Load | K::Store | K::Zero | K::AddF32 | K::SubF32 | K::MulF32 | K::Shuffle32
+        K::Load
+            | K::Store
+            | K::Zero
+            | K::AddF32
+            | K::SubF32
+            | K::MulF32
+            | K::Shuffle32
+            // RUNDE TEMPO 5: wandeln, vergleichen, verknuepfen -- alles
+            // einfache Zweistellerformen ohne Sonderregeln.
+            | K::TruncF32I32
+            | K::CvtI32F32
+            | K::CmpLtF32
+            | K::CmpLeF32
+            | K::CmpNltF32
+            | K::CmpGt32
+            | K::And
+            | K::AndNot
+            | K::Or
+            | K::Xor
+            | K::Add32
+            | K::Sub32
     )
 }
 
@@ -4340,12 +4360,49 @@ fn emit_inst(
                     e.line(&format!("xorps {}, {}", w, w));
                     ra.v_out(e, d, w);
                 }
-                K::AddF32 | K::SubF32 | K::MulF32 => {
+                // RUNDE TEMPO 5: die einstelligen Wandlungen.
+                K::TruncF32I32 | K::CvtI32F32 => {
+                    let d = i.dst.ok_or("internal error: conversion without target")?;
+                    let m = if matches!(kind, K::TruncF32I32) {
+                        "cvttps2dq"
+                    } else {
+                        "cvtdq2ps"
+                    };
+                    let sa = ra.v_reg(e, args[0], "xmm1");
+                    let w = ra.v_work(d);
+                    e.line(&format!("{} {}, {}", m, w, sa));
+                    ra.v_out(e, d, w);
+                }
+                K::AddF32
+                | K::SubF32
+                | K::MulF32
+                | K::CmpLtF32
+                | K::CmpLeF32
+                | K::CmpNltF32
+                | K::CmpGt32
+                | K::And
+                | K::AndNot
+                | K::Or
+                | K::Xor
+                | K::Add32
+                | K::Sub32 => {
                     let d = i.dst.ok_or("internal error: vector arithmetic without target")?;
                     let m = match kind {
                         K::AddF32 => "addps",
                         K::SubF32 => "subps",
-                        _ => "mulps",
+                        K::MulF32 => "mulps",
+                        K::CmpLtF32 => "cmpltps",
+                        K::CmpLeF32 => "cmpleps",
+                        K::CmpNltF32 => "cmpnltps",
+                        K::CmpGt32 => "pcmpgtd",
+                        // `pandn d, s` rechnet `~d & s` -- der ERSTE Operand
+                        // ist der verneinte, genau wie im Grundweg.
+                        K::And => "pand",
+                        K::AndNot => "pandn",
+                        K::Or => "por",
+                        K::Xor => "pxor",
+                        K::Add32 => "paddd",
+                        _ => "psubd",
                     };
                     let w = ra.v_work(d);
                     if crate::target::avx() {

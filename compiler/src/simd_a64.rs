@@ -355,6 +355,33 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::AddF32 => bin(e, fr, "fadd", "4s", need(dst)?, args[0], args[1]),
         SimdKind::SubF32 => bin(e, fr, "fsub", "4s", need(dst)?, args[0], args[1]),
         SimdKind::MulF32 => bin(e, fr, "fmul", "4s", need(dst)?, args[0], args[1]),
+        // RUNDE TEMPO 5. `fcvtzs` schneidet zur Null hin ab wie `cvttps2dq`,
+        // `scvtf` wandelt zurueck. Bei den Vergleichen dreht NEON die
+        // Operanden um (`fcmgt d, b, a` ist `a < b`), und `cmpnlt` ist die
+        // Verneinung von `fcmlt` -- deshalb steht sie hier ausgeschrieben.
+        SimdKind::TruncF32I32 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            e.line(&format!("fcvtzs {}.4s, {}.4s", VR, VA));
+            vstore(e, fr, d, VR);
+        }
+        SimdKind::CvtI32F32 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            e.line(&format!("scvtf {}.4s, {}.4s", VR, VA));
+            vstore(e, fr, d, VR);
+        }
+        SimdKind::CmpGt32 => bin(e, fr, "cmgt", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::CmpLtF32 => bin(e, fr, "fcmgt", "4s", need(dst)?, args[1], args[0]),
+        SimdKind::CmpLeF32 => bin(e, fr, "fcmge", "4s", need(dst)?, args[1], args[0]),
+        SimdKind::CmpNltF32 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            vload(e, fr, VB, args[1]);
+            e.line(&format!("fcmgt {}.4s, {}.4s, {}.4s", VR, VB, VA));
+            e.line(&format!("mvn {}.16b, {}.16b", VR, VR));
+            vstore(e, fr, d, VR);
+        }
         // --- shuffling and shifting ------------------------------------
         // `pshufb`: an index with its top bit set writes a zero octet, and
         // only the low four bits count otherwise. `tbl` writes a zero for
