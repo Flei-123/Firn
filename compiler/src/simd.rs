@@ -119,6 +119,11 @@ pub enum SimdKind {
     // --- memory -------------------------------------------------------
     Load,
     Store,
+    /// RUNDE TEMPO 7: nur die UNTERE Haelfte schreiben (acht Oktette). Fuer
+    /// zwei benachbarte `f32`, wie sie die Synthesefilterbank paarweise
+    /// ablegt -- ein Sechzehn-Oktett-Schreiben wuerde die zwei daneben
+    /// mit zerstoeren.
+    Store64,
     // --- construction / extraction ------------------------------------
     Zero,
     FromU64,
@@ -194,7 +199,7 @@ impl SimdKind {
     /// Pure = no memory touched, removable when unused, mergeable by CSE.
     /// Exactly two of them are not.
     pub fn is_pure(self) -> bool {
-        !matches!(self, SimdKind::Load | SimdKind::Store)
+        !matches!(self, SimdKind::Load | SimdKind::Store | SimdKind::Store64)
     }
 }
 
@@ -250,6 +255,7 @@ const fn s(
 static TABLE: &[Sig] = &[
     s("__v128_load", SimdKind::Load, &[P::CPtr], None, Some(P::V)),
     s("__v128_store", SimdKind::Store, &[P::MPtr, P::V], None, None),
+    s("__v128_store64", SimdKind::Store64, &[P::MPtr, P::V], None, None),
     s("__v128_zero", SimdKind::Zero, &[], None, Some(P::V)),
     s("__v128_from_u64", SimdKind::FromU64, &[P::U64, P::U64], None, Some(P::V)),
     s("__v128_get_u64", SimdKind::GetU64, &[P::V], Some(1), Some(P::U64)),
@@ -1114,6 +1120,11 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             load_full(e, fr, "rax", args[0]);
             e.line(&format!("movdqu xmmword ptr [rax], {}", rv));
         }
+        SimdKind::Store64 => {
+            let rv = xget(e, fr, args[1]);
+            load_full(e, fr, "rax", args[0]);
+            e.line(&format!("movlps qword ptr [rax], {}", rv));
+        }
         SimdKind::Zero => {
             let d = need(dst)?;
             let rd = xdef(e, fr, d);
@@ -1374,6 +1385,6 @@ mod tests {
     fn only_load_and_store_are_impure() {
         let impure: Vec<_> =
             TABLE.iter().filter(|e| !e.kind.is_pure()).map(|e| e.name).collect();
-        assert_eq!(impure, vec!["__v128_load", "__v128_store"]);
+        assert_eq!(impure, vec!["__v128_load", "__v128_store", "__v128_store64"]);
     }
 }

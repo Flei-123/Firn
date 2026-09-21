@@ -300,6 +300,13 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             load_full(e, fr, B, args[0]);
             e.line(&format!("str {}, [{}]", qn(VA), B));
         }
+        // RUNDE TEMPO 7: nur die untere Haelfte -- `d<n>` ist das
+        // Acht-Oktett-Gesicht desselben Registers.
+        SimdKind::Store64 => {
+            vload(e, fr, VA, args[1]);
+            load_full(e, fr, B, args[0]);
+            e.line(&format!("str d{}, [{}]", &VA[1..], B));
+        }
         // --- construction / extraction ---------------------------------
         SimdKind::Zero => {
             let d = need(dst)?;

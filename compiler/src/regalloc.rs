@@ -107,7 +107,10 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
         k,
         K::Load
             | K::Store
+            | K::Store64
             | K::Zero
+            | K::UnpackLo32
+            | K::UnpackHi32
             | K::AddF32
             | K::SubF32
             | K::MulF32
@@ -4424,6 +4427,12 @@ fn emit_inst(
                     let mem = ra.addr_mem(e, args[0]);
                     e.line(&format!("movdqu xmmword ptr {}, {}", mem, q));
                 }
+                // RUNDE TEMPO 7: nur die untere Haelfte.
+                K::Store64 => {
+                    let q = ra.v_reg(e, args[1], "xmm0");
+                    let mem = ra.addr_mem(e, args[0]);
+                    e.line(&format!("movlps qword ptr {}, {}", mem, q));
+                }
                 K::Zero => {
                     let d = i.dst.ok_or("internal error: v128 zero without target")?;
                     let w = ra.v_work(d);
@@ -4455,7 +4464,9 @@ fn emit_inst(
                 | K::Or
                 | K::Xor
                 | K::Add32
-                | K::Sub32 => {
+                | K::Sub32
+                | K::UnpackLo32
+                | K::UnpackHi32 => {
                     let d = i.dst.ok_or("internal error: vector arithmetic without target")?;
                     let m = match kind {
                         K::AddF32 => "addps",
@@ -4472,6 +4483,8 @@ fn emit_inst(
                         K::Or => "por",
                         K::Xor => "pxor",
                         K::Add32 => "paddd",
+                        K::UnpackLo32 => "punpckldq",
+                        K::UnpackHi32 => "punpckhdq",
                         _ => "psubd",
                     };
                     let w = ra.v_work(d);
