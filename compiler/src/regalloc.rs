@@ -1245,6 +1245,47 @@ pub fn allocate(f: &Func) -> Alloc {
     };
     let depth = loop_depth(f);
     let cells = promotable_cells(f);
+
+    // RUNDE TEMPO 2 -- FLIESSKOMMA-ZELLEN IN EIN `xmm`.
+    //
+    // Eine Zelle ist eine `alloca`, die eine Variable haelt (Schleifensumme,
+    // Zaehler). Bisher konnte sie nur ein GANZZAHLregister bekommen: eine
+    // `f32`-Summe reiste dann bei jedem Zugriff per `movd` zwischen `r13` und
+    // der Recheneinheit hin und her -- oder blieb, wenn kein Register frei
+    // war, ganz auf ihrem Platz. Gemessen im Tondekoder: `synth` haelt acht
+    // Summen und ging deswegen pro Durchlauf sechzehnmal in den Rahmen und
+    // zurueck.
+    //
+    // Eine Zelle darf in die SSE-Klasse, wenn sie eine Gleitzahl haelt UND
+    // jeder Wert, der aus ihr geladen wird, nur im Fliesskommaweg der Ausgabe
+    // gelesen wird (`fp_taugt` -- dieselbe Bedingung, die den Fehler aus
+    // Runde XMM 3 abgestellt hat: die Aufrufkonvention kopiert Verbunde
+    // achtbyteweise und liest eine `f64` dabei mit `mov`).
+    let fp_ok = fp_taugt(f);
+    let mut fp_cells: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    if std::env::var_os("FIRN_NO_FP_CELLS").is_none() {
+        for (&c, t) in cells.iter() {
+            if !t.is_float() {
+                continue;
+            }
+            let mut gut = true;
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let (Op::Load { addr }, Some(d)) = (&i.op, i.dst) {
+                        if *addr == c && ((d as usize) >= nv || !fp_ok[d as usize]) {
+                            gut = false;
+                        }
+                    }
+                }
+            }
+            if gut {
+                fp_cells.insert(c);
+            }
+            if std::env::var_os("FIRN_FPCELL_DEBUG").is_some() {
+                eprintln!("FPCELL {} zelle={} typ={} tauglich={}", f.name, c, t.name(), gut);
+            }
+        }
+    }
     alloc.imms = immediate_consts(f);
     alloc.frame_addr = direct_frame_addrs(f, &alloc.frame);
     for v in alloc.imms.keys() {
@@ -1372,6 +1413,9 @@ pub fn allocate(f: &Func) -> Alloc {
         ivs.push(Iv { val: v as Val, start: s, end: e, weight: weight[v], killed, is_cell: false });
     }
     for (&c, _) in cells.iter() {
+        if fp_cells.contains(&c) {
+            continue; // gehoert in die SSE-Klasse (siehe unten)
+        }
         let cv = c as usize;
         if start[cv] == usize::MAX {
             continue;
@@ -1425,7 +1469,6 @@ pub fn allocate(f: &Func) -> Alloc {
     // der Ausgabe steht. Alles andere bleibt auf seinem Platz und wird
     // gelesen wie bisher -- so kann kein Weg im Erzeuger versehentlich ein
     // `xmm` als Ganzzahlregister behandeln.
-    let fp_ok = fp_taugt(f);
     let mut fp_ivs: Vec<Iv> = Vec::new();
     for v in 0..nv {
         if !f.val_ty(v as Val).is_float() || !fp_ok[v] {
@@ -1447,6 +1490,28 @@ pub fn allocate(f: &Func) -> Alloc {
             continue;
         }
         fp_ivs.push(Iv { val: v as Val, start: sp, end: ep, weight: weight[v], killed: 0, is_cell: false });
+    }
+    // Die Fliesskomma-ZELLEN: wie oben bei den Ganzzahlzellen vom Beginn der
+    // Funktion bis zum letzten Zugriff (ihr Inhalt ueberlebt Bloecke ohne
+    // Zugriff), doppeltes Gewicht. Alle sechzehn `xmm` sind caller-saved --
+    // kreuzt die Lebensdauer einen Aufruf, bleibt die Zelle im Rahmen.
+    for &c in fp_cells.iter() {
+        let cv = c as usize;
+        if start[cv] == usize::MAX {
+            continue;
+        }
+        let e_end = end[cv];
+        if rough(0, e_end) & M_CALL != 0 {
+            continue;
+        }
+        fp_ivs.push(Iv {
+            val: c,
+            start: 0,
+            end: e_end,
+            weight: weight[cv].saturating_mul(2).max(1),
+            killed: 0,
+            is_cell: true,
+        });
     }
     fp_ivs.sort_by_key(|i| (i.start, i.end, i.val));
     // Zur Fehlersuche: FIRN_NO_FP_RA=1 laesst die Fliesskommawerte auf ihren
@@ -1674,7 +1739,14 @@ pub fn allocate(f: &Func) -> Alloc {
     }
     // enter the result
     for (v, r) in fp_assign.iter() {
-        alloc.locs[*v as usize] = Loc::Reg(r);
+        if fp_cells.contains(v) {
+            alloc.cells.insert(*v, r);
+            if let Some(t) = cells.get(v) {
+                alloc.cell_ty.insert(*v, *t);
+            }
+        } else {
+            alloc.locs[*v as usize] = Loc::Reg(r);
+        }
     }
     for (v, r) in assign.iter() {
         if cells.contains_key(v) {
@@ -1921,6 +1993,11 @@ struct Ra<'a> {
     /// value -> source value. The rest of the computation sits in the memory
     /// operand of the following access.
     preloader: HashMap<Val, Val>,
+    /// RUNDE TEMPO 2 -- die UEBERGABE. Gleitzahlen, die kein Register
+    /// bekommen haben, deren einziger Leser aber kurz darauf im selben Block
+    /// steht: sie gehen durch `xmm2`/`xmm3` statt durch den Rahmen. Siehe
+    /// `fp_handover`.
+    fp_hand: HashMap<Val, &'static str>,
 }
 
 /// A memory operand that the processor computes itself:
@@ -2231,6 +2308,9 @@ impl<'a> Ra<'a> {
     /// als zweiten Operanden unmittelbar an, also braucht keiner der beiden
     /// Faelle eine Hilfsanweisung.
     fn fpo(&self, v: Val, single: bool) -> String {
+        if let Some(r) = self.fp_hand.get(&v) {
+            return (*r).to_string();
+        }
         match self.a.place(v) {
             Loc::Reg(r) => r.to_string(),
             Loc::Slot(off) => {
@@ -2254,6 +2334,12 @@ impl<'a> Ra<'a> {
     /// Das Ergebnis aus einem `xmm` an seinen Platz bringen -- wenn der Wert
     /// selbst in einem Register lebt, ist das eine Kopie, sonst ein Schreiben.
     fn fp_out(&self, e: &mut Emitter, d: Val, x: &str, single: bool) {
+        if let Some(r) = self.fp_hand.get(&d) {
+            if x != *r {
+                e.line(&format!("movaps {}, {}", r, x));
+            }
+            return;
+        }
         match self.a.loc(d) {
             Loc::Reg(r) => {
                 if r != x {
@@ -2272,6 +2358,9 @@ impl<'a> Ra<'a> {
     /// Das Register, IN dem gerechnet wird: das Zielregister, wenn es eines
     /// hat, sonst das Kratzregister `xmm0`.
     fn fp_work(&self, d: Val) -> &'static str {
+        if let Some(r) = self.fp_hand.get(&d) {
+            return *r;
+        }
         match self.a.loc(d) {
             Loc::Reg(r) => r,
             Loc::Slot(_) => "xmm0",
@@ -2386,6 +2475,14 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
     let mut tmp = Emitter::default();
+    // RUNDE TEMPO 2: nur dieser Weg darf VEX schreiben (`--cpu=avx`). Der
+    // Grundweg bleibt bei SSE -- dort haelt `simd.rs` `v128`-Werte in den
+    // Registern, und eine Umschrift von `movss` auf `vmovaps` wuerde deren
+    // obere Haelfte ausloeschen.
+    tmp.vex = crate::target::avx();
+    if let Ok(nur) = std::env::var("FIRN_VEX_ONLY") {
+        tmp.vex = tmp.vex && f.name.contains(&nur);
+    }
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
             // ROUND 90: the panic arms of the checked operations, behind the
@@ -2960,10 +3057,158 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     None
 }
 
+/// RUNDE TEMPO 2 -- EIN UEBERGABEREGISTER FUER GLEITZAHLEN.
+///
+/// Zwoelf `xmm` reichen in einer dicht gerechneten Schleife nicht. Wer keines
+/// bekommt, liegt im Rahmen, und dann stand im Erzeugten woertlich das:
+///
+/// ```text
+///     movaps xmm0, xmm12
+///     mulss  xmm0, xmm5
+///     movss  [rbp-3912], xmm0     <- hinschreiben
+///     movss  xmm0, [rbp-3912]     <- und gleich wieder holen
+///     addss  xmm0, [rbp-3936]
+/// ```
+///
+/// Das Hinschreiben ist unnoetig, wenn der Wert nur EINEN Leser hat und der
+/// die unmittelbar folgende Anweisung ist: dann kann er einfach im Register
+/// stehen bleiben. `xmm3` ist dafuer reserviert (der Zuteiler gibt nur
+/// `xmm4`-`xmm15` aus, `xmm0`/`xmm1` sind die Kratzregister der Rechnung).
+///
+/// Mehr als eine Uebergabe kann nie gleichzeitig offen sein -- eine zweite
+/// bekaeme ihren Leser erst nach der ersten, und dann waere deren Leser nicht
+/// mehr die unmittelbar folgende Anweisung.
+fn fp_handover(
+    f: &Func,
+    a: &Alloc,
+    read: &[u32],
+) -> HashMap<Val, &'static str> {
+    let mut out: HashMap<Val, &'static str> = HashMap::new();
+    if std::env::var_os("FIRN_NO_FP_HAND").is_some() {
+        return out;
+    }
+    // `xmm2` und `xmm3` gibt der Zuteiler NIE aus (`FP_POOL` beginnt bei
+    // `xmm4`), und die Rechnung benutzt sie nicht als Kratzregister (das sind
+    // `xmm0` und `xmm1`). Dazu kommen die Register des Vorrats, die diese
+    // Funktion ueberhaupt nicht braucht -- in einer Funktion mit zwei heissen
+    // Werten sind das zehn.
+    let mut hand: Vec<&'static str> = vec!["xmm2", "xmm3"];
+    {
+        let mut benutzt: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for l in a.locs.iter() {
+            if let Loc::Reg(r) = l {
+                if is_xmm(r) {
+                    benutzt.insert(r);
+                }
+            }
+        }
+        for r in a.cells.values() {
+            if is_xmm(r) {
+                benutzt.insert(r);
+            }
+        }
+        for r in FP_POOL.iter() {
+            if !benutzt.contains(r) {
+                hand.push(r);
+            }
+        }
+    }
+    const FENSTER: usize = 16;
+    let mut uses: Vec<Val> = Vec::new();
+    for b in &f.blocks {
+        // (Beginn, Ende, Wert) je Kandidat, in Reihenfolge der Erzeugung.
+        let mut cand: Vec<(usize, usize, Val)> = Vec::new();
+        for (idx, i) in b.insts.iter().enumerate() {
+            let d = match i.dst {
+                Some(d) => d,
+                None => continue,
+            };
+            if !f.val_ty(d).is_float() || f.is_secret(d) {
+                continue;
+            }
+            // Wer schon ein Register hat, braucht keine Uebergabe.
+            if !matches!(a.loc(d), Loc::Slot(_)) {
+                continue;
+            }
+            if a.cell(d).is_some() || a.alias.contains_key(&d) || a.imm(d).is_some() {
+                continue;
+            }
+            if read.get(d as usize).copied() != Some(1) {
+                continue;
+            }
+            // Der Erzeuger muss im Fliesskommaweg der Ausgabe stehen.
+            let erzeugt = match &i.op {
+                Op::Bin(..) | Op::Copy { .. } | Op::Load { .. } | Op::Const(_) => true,
+                Op::Un(UnOp::Neg, _) => true,
+                Op::Cast { from, .. } => from.is_float() || i.ty.is_float(),
+                _ => false,
+            };
+            if !erzeugt {
+                continue;
+            }
+            // Den EINEN Leser suchen: im selben Block, hoechstens `FENSTER`
+            // Anweisungen weiter, und dazwischen kein Aufruf (jedes `xmm` ist
+            // caller-saved).
+            let mut leser: Option<usize> = None;
+            for (j, n) in b.insts.iter().enumerate().skip(idx + 1).take(FENSTER) {
+                if matches!(
+                    &n.op,
+                    Op::Call { .. }
+                        | Op::CallIndirect { .. }
+                        | Op::Syscall { .. }
+                        | Op::ThreadSpawn { .. }
+                        | Op::Asm { .. }
+                ) {
+                    break;
+                }
+                uses.clear();
+                n.op.uses(&mut uses);
+                if uses.contains(&d) {
+                    let liest = match &n.op {
+                        Op::Bin(..) | Op::Copy { .. } => n.ty.is_float(),
+                        Op::Un(UnOp::Neg, _) => n.ty.is_float(),
+                        Op::Cmp { ty, .. } => ty.is_float(),
+                        Op::Cast { from, .. } => from.is_float(),
+                        Op::Store { val, .. } => n.ty.is_float() && *val == d,
+                        _ => false,
+                    };
+                    if liest {
+                        leser = Some(j);
+                    }
+                    break;
+                }
+            }
+            if let Some(j) = leser {
+                cand.push((idx, j, d));
+            }
+        }
+        // Zwei Register, gierig nach Beginn: ein Kandidat bekommt eines, wenn
+        // es bis zu seinem Leser frei ist. Ueberschneidungen gibt es sonst
+        // wirklich -- `t1` wird erzeugt, dann `t2`, und erst danach werden
+        // beide gelesen.
+        let mut belegt: Vec<usize> = vec![0; hand.len()];
+        for (s0, e0, d) in cand.into_iter() {
+            let mut genommen = None;
+            for k in 0..hand.len() {
+                if belegt[k] <= s0 {
+                    belegt[k] = e0;
+                    genommen = Some(k);
+                    break;
+                }
+            }
+            if let Some(k) = genommen {
+                out.insert(d, hand[k]);
+            }
+        }
+    }
+    out
+}
+
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let read = count_reads(f);
     let (offset, skipped, preloader) = foldable_addresses(f, a, &read);
-    let ra = Ra { f, a, read, offset, skipped, preloader };
+    let fp_hand = fp_handover(f, a, &read);
+    let ra = Ra { f, a, read, offset, skipped, preloader, fp_hand };
     // ROUND 72: one label counter per function (panic_rt.rs::SiteCounter).
     let mut site = crate::panic_rt::SiteCounter::new(&f.name);
     e.raw("");
@@ -3898,6 +4143,18 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: const without target")?;
             let single = ty == FTy::F32;
             let bits = ty.truncate(*c) as i64;
+            if let Some(r) = ra.fp_hand.get(&d) {
+                if bits == 0 {
+                    e.line(&format!("xorps {}, {}", r, r));
+                } else if single {
+                    e.line(&format!("mov eax, {}", bits as u32));
+                    e.line(&format!("movd {}, eax", r));
+                } else {
+                    e.line(&format!("mov rax, {}", bits));
+                    e.line(&format!("movq {}, rax", r));
+                }
+                return Ok(());
+            }
             match ra.a.loc(d) {
                 Loc::Reg(r) => {
                     if bits == 0 {
@@ -3942,6 +4199,15 @@ fn emit_inst(
             }
             let (cr, _) = ra.a.cell(*addr).ok_or("internal error: cell lost")?;
             let single = ty == FTy::F32;
+            // RUNDE TEMPO 2: liegt die Zelle selbst in einem `xmm`, ist das
+            // Laden nur noch eine Kopie -- oft nicht einmal das, weil
+            // `fp_out` sie weglaesst, wenn Ziel und Quelle dasselbe Register
+            // sind. Vorher stand hier IMMER `movd`/`movq` durch ein
+            // Ganzzahlregister.
+            if is_xmm(cr) {
+                ra.fp_out(e, d, cr, single);
+                return Ok(());
+            }
             let w = ra.fp_work(d);
             if single {
                 e.line(&format!("movd {}, {}", w, rn(cr, 32)));
@@ -3953,6 +4219,13 @@ fn emit_inst(
         Op::Store { addr, val } if ty.is_float() && ra.a.cell(*addr).is_some() => {
             let (cr, _) = ra.a.cell(*addr).ok_or("internal error: cell lost")?;
             let single = ty == FTy::F32;
+            // RUNDE TEMPO 2: Zelle in einem `xmm` -- das Schreiben ist eine
+            // Kopie in dieses Register (`fp_into` laesst sie weg, wenn der
+            // Wert schon dort liegt).
+            if is_xmm(cr) {
+                ra.fp_into(e, cr, *val, single);
+                return Ok(());
+            }
             let o = ra.fpo(*val, single);
             let q = if is_xmm(&o) {
                 o
@@ -4191,23 +4464,41 @@ fn emit_inst(
         Op::Un(UnOp::Neg, x) if ty.is_float() => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let single = ty == FTy::F32;
-            let target = match ra.a.loc(d) {
-                Loc::Reg(r) => r,
-                Loc::Slot(_) => "xmm0",
-            };
-            ra.fp_into(e, target, *x, single);
+            let target = ra.fp_work(d);
+            // Die Maske zuerst -- sie liegt in `xmm1`, dem Kratzregister der
+            // Rechnung.
             if single {
                 e.line("mov eax, -2147483648");
                 e.line("movd xmm1, eax");
-                e.line(&format!("xorps {}, xmm1", target));
             } else {
                 e.line("mov rax, -9223372036854775808");
                 e.line("movq xmm1, rax");
-                e.line(&format!("xorpd {}, xmm1", target));
             }
-            if matches!(ra.a.loc(d), Loc::Slot(_)) {
-                ra.fp_out(e, d, "xmm0", single);
+            if crate::target::avx() && std::env::var_os("FIRN_NO_VEX3").is_none() {
+                // RUNDE TEMPO 2: Dreioperandenform -- die Quelle bleibt
+                // stehen, das Ergebnis geht direkt ins Ziel.
+                let ox = ra.fpo(*x, single);
+                let src = if is_xmm(&ox) {
+                    ox
+                } else {
+                    ra.fp_into(e, "xmm0", *x, single);
+                    "xmm0".to_string()
+                };
+                e.line(&format!(
+                    "{} {}, {}, xmm1",
+                    if single { "vxorps" } else { "vxorpd" },
+                    target,
+                    src
+                ));
+            } else {
+                ra.fp_into(e, target, *x, single);
+                e.line(&format!(
+                    "{} {}, xmm1",
+                    if single { "xorps" } else { "xorpd" },
+                    target
+                ));
             }
+            ra.fp_out(e, d, target, single);
         }
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
@@ -4838,6 +5129,24 @@ fn emit_bin(
             }
         };
         let w = ra.fp_work(d);
+        // RUNDE TEMPO 2 -- DIE DREIOPERANDENFORM. `vmulss d, a, b` nennt sein
+        // Ziel selbst; damit entfaellt die Kopie, die SSE erzwingt (in der
+        // heissen Schleife der Synthesefilterbank standen 50 solche
+        // `movaps`). Die erste Quelle MUSS ein Register sein, die zweite darf
+        // Speicher sein.
+        if crate::target::avx() && std::env::var_os("FIRN_NO_VEX3").is_none() {
+            let oa = ra.fpo(a, single);
+            let src1 = if is_xmm(&oa) {
+                oa
+            } else {
+                ra.fp_into(e, "xmm0", a, single);
+                "xmm0".to_string()
+            };
+            let src2 = ra.fpo(b, single);
+            e.line(&format!("v{} {}, {}, {}", m, w, src1, src2));
+            ra.fp_out(e, d, w, single);
+            return Ok(());
+        }
         // RUNDE TEMPO -- VERTAUSCHEN STATT KOPIEREN. `addss`/`mulss` haben nur
         // die zweistellige Form: gerechnet wird ins Zielregister, also muss
         // der erste Operand vorher hinein. Liegt der ZWEITE Operand schon

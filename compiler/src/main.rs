@@ -213,7 +213,8 @@ fn usage() -> String {
          --lsp              language server over standard input/output\n  \
          -c, --object       only assemble: ELF object file, no ld\n  \
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
-         --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
+         --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)
+  --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -335,6 +336,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             // path below is the one that has always been walked.
             _ if a.starts_with("--target=") => {
                 if let Err(e) = target::flag_set(&a["--target=".len()..]) {
+                    return Err(e);
+                }
+            }
+            // RUNDE TEMPO 2: die CPU-Stufe. `avx` erlaubt die
+            // Dreioperandenform (VEX) -- sie spart in jeder
+            // Fliesskommarechnung die Kopie, die SSE erzwingt.
+            _ if a.starts_with("--cpu=") => {
+                if let Err(e) = target::cpu_set(&a["--cpu=".len()..]) {
                     return Err(e);
                 }
             }

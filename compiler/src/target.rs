@@ -73,6 +73,38 @@ impl Target {
 
 thread_local! {
     static ACTIVE: Cell<Target> = const { Cell::new(Target::X86_64) };
+    /// RUNDE TEMPO 2 -- `--cpu=avx`. Aus, bis es einer einschaltet: ein
+    /// Programm, das mit AVX uebersetzt ist, laeuft auf einer Maschine ohne
+    /// AVX gar nicht, und die Grundausstattung von x86-64 ist SSE2.
+    static AVX: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `--cpu=<baseline|avx>`. `Err` = unbekannter Name.
+pub fn cpu_set(name: &str) -> Result<(), String> {
+    let on = match name {
+        "baseline" | "x86-64" | "sse2" => false,
+        "avx" | "x86-64-v3" | "avx2" => true,
+        other => {
+            return Err(format!(
+                "unknown CPU level '{}' (allowed: baseline, avx)",
+                other
+            ))
+        }
+    };
+    AVX.with(|a| a.set(on));
+    Ok(())
+}
+
+/// Darf die Dreioperandenform (VEX) benutzt werden?
+///
+/// Umgebungsvariable `FIRN_CPU=avx` wirkt wie die Schalterstellung -- damit
+/// laesst sich die volle Testreihe einmal in jeder Stufe fahren, ohne jedes
+/// Werkzeug im Baum anzufassen.
+pub fn avx() -> bool {
+    if AVX.with(|a| a.get()) {
+        return true;
+    }
+    matches!(std::env::var("FIRN_CPU"), Ok(v) if v == "avx" || v == "x86-64-v3" || v == "avx2")
 }
 
 /// `--target=<name>`. `Err` = unknown name.
