@@ -410,6 +410,20 @@ if [ "$1" = "--images" ]; then
     # Grenze ist die Leinwand aus dem malenden Programm -- wer sie dort
     # aendert, traegt die Zahl HIER nach; genau dafuer steht sie da.
     build belegpruef
+    # DIE BELEGE, NACHGERECHNET. Ab Abschnitt 4 kommen zwei weitere
+    # Zahlen dazu, und beide sind ABSICHTLICH je Blatt gesetzt:
+    #
+    #   <rand>   wieviel leerer Streifen unter dem letzten Inhalt noch
+    #            durchgeht. Die Belege dieses Baumes lassen 20 Punkte
+    #            Rand; 40 laesst Luft fuer eine Kantenglaettung und
+    #            faengt trotzdem jede Leinwand, die auf eine Konstante
+    #            statt auf den Inhalt gesetzt ist (gallery6 hatte so
+    #            42 Punkte, siehe dort).
+    #   <seiten> 1 heisst: auch links und rechts muss Luft sein. Zwei
+    #            Blaetter setzen mit Absicht ueber die volle Breite --
+    #            der Verdunkler hinter den Dialogen in fui-wave3 und
+    #            die Trennlinie unter der Titelzeile von fui-demo --,
+    #            die rufen ohne die 1.
     beleg() {
         "$W/belegpruef" "$@"
     }
@@ -427,26 +441,26 @@ if [ "$1" = "--images" ]; then
     kette gallery 1200
     "$W/gallery" "$Z/fui-wave1-light.png" light
     "$W/gallery" "$Z/fui-wave1-dark.png" dark
-    beleg "$Z/fui-wave1-light.png" 1200 400 760 200
-    beleg "$Z/fui-wave1-dark.png" 1200 400 760 200
+    beleg "$Z/fui-wave1-light.png" 1200 400 760 200 40 1
+    beleg "$Z/fui-wave1-dark.png" 1200 400 760 200 40 1
     build gallery2
     kette gallery2 1240
     "$W/gallery2" "$Z/fui-wave2-light.png" light
     "$W/gallery2" "$Z/fui-wave2-dark.png" dark
-    beleg "$Z/fui-wave2-light.png" 1240 700 1180 200
-    beleg "$Z/fui-wave2-dark.png" 1240 700 1180 200
+    beleg "$Z/fui-wave2-light.png" 1240 700 1180 200 40 1
+    beleg "$Z/fui-wave2-dark.png" 1240 700 1180 200 40 1
     build gallery3
     kette gallery3 1240
     "$W/gallery3" "$Z/fui-wave3-light.png" light
     "$W/gallery3" "$Z/fui-wave3-dark.png" dark
-    beleg "$Z/fui-wave3-light.png" 1240 700 1320 200
-    beleg "$Z/fui-wave3-dark.png" 1240 700 1320 200
+    beleg "$Z/fui-wave3-light.png" 1240 700 1320 200 40 0
+    beleg "$Z/fui-wave3-dark.png" 1240 700 1320 200 40 0
     build gallery4
     kette gallery4 1240
     "$W/gallery4" "$Z/fui-text-light.png" light
     "$W/gallery4" "$Z/fui-text-dark.png" dark
-    beleg "$Z/fui-text-light.png" 1240 600 1180 200
-    beleg "$Z/fui-text-dark.png" 1240 600 1180 200
+    beleg "$Z/fui-text-light.png" 1240 600 1180 200 40 1
+    beleg "$Z/fui-text-dark.png" 1240 600 1180 200 40 1
     # BILD UND SVG (Runde BILD+SVG, 13.09.2026). Fuenf Baender: Knopf mit
     # Icon, Beschriftung mit Bild und Icon-Toolbar, dasselbe SVG je Groesse
     # NEU gerastert (12..64) samt currentColor=TOK_ACCENT daneben, Bild mit
@@ -455,8 +469,8 @@ if [ "$1" = "--images" ]; then
     kette artshow 900
     "$W/artshow" "$Z/fui-bild-svg-hell.png" light
     "$W/artshow" "$Z/fui-bild-svg-dunkel.png" dark
-    beleg "$Z/fui-bild-svg-hell.png" 900 400 620 200
-    beleg "$Z/fui-bild-svg-dunkel.png" 900 400 620 200
+    beleg "$Z/fui-bild-svg-hell.png" 900 400 620 200 40 1
+    beleg "$Z/fui-bild-svg-dunkel.png" 900 400 620 200 40 1
     # RUNDE UI-WEB: die vier neuen Faehigkeiten, hell und dunkel.
     # Eine Bewegung als Phasenreihe, die Flex-Varianten nebeneinander,
     # Schatten/Glas/Farbmatrix ueber gemustertem Grund, und gedrehte,
@@ -465,26 +479,26 @@ if [ "$1" = "--images" ]; then
     kette gallery5 1240
     "$W/gallery5" "$Z/fui-anim-hell.png" light
     "$W/gallery5" "$Z/fui-anim-dunkel.png" dark
-    beleg "$Z/fui-anim-hell.png" 1240 500 764 200
-    beleg "$Z/fui-anim-dunkel.png" 1240 500 764 200
+    beleg "$Z/fui-anim-hell.png" 1240 500 764 200 40 1
+    beleg "$Z/fui-anim-dunkel.png" 1240 500 764 200 40 1
     build gallery6
     kette gallery6 1240
     "$W/gallery6" "$Z/fui-flex-hell.png" light
     "$W/gallery6" "$Z/fui-flex-dunkel.png" dark
-    beleg "$Z/fui-flex-hell.png" 1240 600 880 200
-    beleg "$Z/fui-flex-dunkel.png" 1240 600 880 200
+    beleg "$Z/fui-flex-hell.png" 1240 600 880 200 40 1
+    beleg "$Z/fui-flex-dunkel.png" 1240 600 880 200 40 1
     build gallery7
     kette gallery7 1240
     "$W/gallery7" "$Z/fui-effekt-hell.png" light
     "$W/gallery7" "$Z/fui-effekt-dunkel.png" dark
-    beleg "$Z/fui-effekt-hell.png" 1240 400 700 200
-    beleg "$Z/fui-effekt-dunkel.png" 1240 400 700 200
+    beleg "$Z/fui-effekt-hell.png" 1240 400 700 200 40 1
+    beleg "$Z/fui-effekt-dunkel.png" 1240 400 700 200 40 1
     build gallery8
     kette gallery8 1280
     "$W/gallery8" "$Z/fui-transform-hell.png" light
     "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
-    beleg "$Z/fui-transform-hell.png" 1280 500 760 200
-    beleg "$Z/fui-transform-dunkel.png" 1280 500 760 200
+    beleg "$Z/fui-transform-hell.png" 1280 500 760 200 40 1
+    beleg "$Z/fui-transform-dunkel.png" 1280 500 760 200 40 1
     # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
     # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
     # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet
@@ -494,8 +508,8 @@ if [ "$1" = "--images" ]; then
     kette preview 760
     "$W/preview" "$Z/fui-preview-hell.png" light
     "$W/preview" "$Z/fui-preview-dunkel.png" dark
-    beleg "$Z/fui-preview-hell.png" 760 200 240 120
-    beleg "$Z/fui-preview-dunkel.png" 760 200 240 120
+    beleg "$Z/fui-preview-hell.png" 760 200 240 120 40 1
+    beleg "$Z/fui-preview-dunkel.png" 760 200 240 120 40 1
     # DIE DEMO-ANWENDUNG. Kein Pruefblatt, sondern eine Oberflaeche, wie
     # ein Anwender sie schreibt: Titelzeile und Werkzeugleiste von
     # `flex.flex_layout` verteilt, der Hover-Uebergang eines Knopfes aus
@@ -510,8 +524,8 @@ if [ "$1" = "--images" ]; then
     "$W/belegpruef" --ketten "$SCHRIFT" 1000 demos/fuidemo/main.fi
     "$W/fuidemo" "$Z/fui-demo-hell.png" light
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
-    beleg "$Z/fui-demo-hell.png" 1000 350 500 200
-    beleg "$Z/fui-demo-dunkel.png" 1000 350 500 200
+    beleg "$Z/fui-demo-hell.png" 1000 350 500 200 40 0
+    beleg "$Z/fui-demo-dunkel.png" 1000 350 500 200 40 0
     ls -la "$Z"
 fi
 
