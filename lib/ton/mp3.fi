@@ -900,8 +900,20 @@ fn l3_huffman(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
 // ====================================================================
 
 fn l3_midside_stereo(left: u64, n: i32) {
+    // VIER SPUREN AUF EINMAL (Runde TEMPO 4). Je Spur genau dieselbe
+    // Rechnung wie unten -- `addps` ist viermal `addss` --, also bleibt die
+    // Ausgabe bitgleich. Was nicht durch vier teilbar ist, rechnet der
+    // Rest weiter einzeln.
     var i: i64 = 0
-    while i < n as i64 {
+    let nn: i64 = n as i64
+    while i + 4 <= nn {
+        let va: v128 = __v128_load(adr4(left, i) as *u8)
+        let vb: v128 = __v128_load(adr4(left, i + 576) as *u8)
+        __v128_store(adr4(left, i) as *mut u8, __v128_addf32(va, vb))
+        __v128_store(adr4(left, i + 576) as *mut u8, __v128_subf32(va, vb))
+        i = i + 4
+    }
+    while i < nn {
         let a: f32 = lf(left, i)
         let b: f32 = lf(left, i + 576)
         sf(left, i, a + b)
@@ -1043,18 +1055,32 @@ fn l3_reorder(grbuf: u64, scratch: u64, sfb_in: u64) {
 }
 
 fn l3_antialias(t: *mut mp3_tab.Tabs, grbuf_in: u64, nbands_in: i32) {
+    // VIER SPUREN AUF EINMAL (Runde TEMPO 4).
+    //
+    // Die acht Schritte lesen `u` AUFSTEIGEND (18+i) und `d` ABSTEIGEND
+    // (17-i). Beide liegen also je vier Werte nebeneinander im Speicher --
+    // `d` nur in umgekehrter Reihenfolge, und die dreht `__v128_shuffle32`
+    // mit 0x1B (Spuren 3,2,1,0) einmal hin und einmal zurueck. Je Spur
+    // stehen danach genau dieselben Rechnungen wie unten in der einzelnen
+    // Fassung: die Ausgabe bleibt bitgleich.
+    let aa0: u64 = (&(*t).aa[0]) as u64
     var nbands: i32 = nbands_in
     var b: i64 = 0
     while nbands > 0 {
         var i: i32 = 0
         while i < 8 {
-            let u: f32 = lf(grbuf_in, b + (18 + i) as i64)
-            let d: f32 = lf(grbuf_in, b + (17 - i) as i64)
-            let c0: f32 = (*t).aa[i as usize]
-            let c1: f32 = (*t).aa[(8 + i) as usize]
-            sf(grbuf_in, b + (18 + i) as i64, u * c0 - d * c1)
-            sf(grbuf_in, b + (17 - i) as i64, u * c1 + d * c0)
-            i = i + 1
+            let iu: i64 = b + (18 + i) as i64
+            let id: i64 = b + (14 - i) as i64
+            let vu: v128 = __v128_load(adr4(grbuf_in, iu) as *u8)
+            let vdr: v128 = __v128_load(adr4(grbuf_in, id) as *u8)
+            let vd: v128 = __v128_shuffle32(vdr, 27)
+            let vc0: v128 = __v128_load(adr4(aa0, i as i64) as *u8)
+            let vc1: v128 = __v128_load(adr4(aa0, (8 + i) as i64) as *u8)
+            let nu: v128 = __v128_subf32(__v128_mulf32(vu, vc0), __v128_mulf32(vd, vc1))
+            let nd: v128 = __v128_addf32(__v128_mulf32(vu, vc1), __v128_mulf32(vd, vc0))
+            __v128_store(adr4(grbuf_in, iu) as *mut u8, nu)
+            __v128_store(adr4(grbuf_in, id) as *mut u8, __v128_shuffle32(nd, 27))
+            i = i + 4
         }
         b = b + 18
         nbands = nbands - 1
@@ -1488,58 +1514,60 @@ fn synth(t: *mut mp3_tab.Tabs, xl: u64, dstl: u64, nch: i32, lins: u64) {
         sf(zlin, (4 * (i - 16) + 2) as i64, lf(xl, (18 * (1 + i)) as i64))
         sf(zlin, (4 * (i - 16) + 3) as i64, lf(xr, (18 * (1 + i)) as i64))
 
-        var a0: f32 = 0.0f
-        var a1: f32 = 0.0f
-        var a2: f32 = 0.0f
-        var a3: f32 = 0.0f
-        var b0: f32 = 0.0f
-        var b1: f32 = 0.0f
-        var b2: f32 = 0.0f
-        var b3: f32 = 0.0f
+        // VIER SPUREN AUF EINMAL (Runde TEMPO 4).
+        //
+        // Die vier Summen a0..a3 rechnen alle dasselbe mit
+        // NEBENEINANDERLIEGENDEN Werten (`zlin[idx+0..3]`) und denselben zwei
+        // Fenstergewichten -- das ist genau die Form, fuer die es `addps`,
+        // `subps` und `mulps` gibt. Jede Spur rechnet dabei Befehl fuer
+        // Befehl, was vorher die einzelne Rechnung gerechnet hat, in
+        // derselben Reihenfolge: die Ausgabe bleibt BITGLEICH (nachgewiesen,
+        // `tools/ton_bauen.sh` und der Vergleich der ganzen PCM-Datei).
+        //
+        // `w` zeigt auf ein Paar (w0, w1) im Fenster; eine Ladung holt beide
+        // und `__v128_shuffle32` zieht jeden auf alle vier Spuren. Deshalb hat
+        // `win` vier Werte Polster (`mp3_tab.fi`) -- die letzte Ladung liest
+        // sechzehn Oktette ab dem vorletzten Paar.
+        var va: v128 = __v128_zero()
+        var vb: v128 = __v128_zero()
 
         var k: i32 = 0
         while k < 8 {
-            let w0: f32 = lf(win, w)
-            let w1: f32 = lf(win, w + 1)
+            let vwp: v128 = __v128_load(adr4(win, w) as *u8)
+            let vw0: v128 = __v128_shuffle32(vwp, 0)
+            let vw1: v128 = __v128_shuffle32(vwp, 85)
             w = w + 2
-            let vz: u64 = adr4(zlin, (4 * i - k * 64) as i64)
-            let vy: u64 = adr4(zlin, (4 * i - (15 - k) * 64) as i64)
-            let z0: f32 = *(vz as *mut f32)
-            let z1: f32 = *((vz + 4) as *mut f32)
-            let z2: f32 = *((vz + 8) as *mut f32)
-            let z3: f32 = *((vz + 12) as *mut f32)
-            let y0: f32 = *(vy as *mut f32)
-            let y1: f32 = *((vy + 4) as *mut f32)
-            let y2: f32 = *((vy + 8) as *mut f32)
-            let y3: f32 = *((vy + 12) as *mut f32)
+            let vz: v128 = __v128_load(adr4(zlin, (4 * i - k * 64) as i64) as *u8)
+            let vy: v128 = __v128_load(adr4(zlin, (4 * i - (15 - k) * 64) as i64) as *u8)
+            let zw1: v128 = __v128_mulf32(vz, vw1)
+            let yw0: v128 = __v128_mulf32(vy, vw0)
+            let zw0: v128 = __v128_mulf32(vz, vw0)
+            let yw1: v128 = __v128_mulf32(vy, vw1)
             if k == 0 {
-                b0 = z0 * w1 + y0 * w0
-                b1 = z1 * w1 + y1 * w0
-                b2 = z2 * w1 + y2 * w0
-                b3 = z3 * w1 + y3 * w0
-                a0 = z0 * w0 - y0 * w1
-                a1 = z1 * w0 - y1 * w1
-                a2 = z2 * w0 - y2 * w1
-                a3 = z3 * w0 - y3 * w1
+                vb = __v128_addf32(zw1, yw0)
+                va = __v128_subf32(zw0, yw1)
             } else {
-                b0 = b0 + (z0 * w1 + y0 * w0)
-                b1 = b1 + (z1 * w1 + y1 * w0)
-                b2 = b2 + (z2 * w1 + y2 * w0)
-                b3 = b3 + (z3 * w1 + y3 * w0)
+                vb = __v128_addf32(vb, __v128_addf32(zw1, yw0))
                 if (k & 1) == 1 {
-                    a0 = a0 + (y0 * w1 - z0 * w0)
-                    a1 = a1 + (y1 * w1 - z1 * w0)
-                    a2 = a2 + (y2 * w1 - z2 * w0)
-                    a3 = a3 + (y3 * w1 - z3 * w0)
+                    va = __v128_addf32(va, __v128_subf32(yw1, zw0))
                 } else {
-                    a0 = a0 + (z0 * w0 - y0 * w1)
-                    a1 = a1 + (z1 * w0 - y1 * w1)
-                    a2 = a2 + (z2 * w0 - y2 * w1)
-                    a3 = a3 + (z3 * w0 - y3 * w1)
+                    va = __v128_addf32(va, __v128_subf32(zw0, yw1))
                 }
             }
             k = k + 1
         }
+        var af: [f32; 4] = [0.0f; 4]
+        var bf: [f32; 4] = [0.0f; 4]
+        __v128_store((&af[0]) as *mut u8, va)
+        __v128_store((&bf[0]) as *mut u8, vb)
+        let a0: f32 = af[0]
+        let a1: f32 = af[1]
+        let a2: f32 = af[2]
+        let a3: f32 = af[3]
+        let b0: f32 = bf[0]
+        let b1: f32 = bf[1]
+        let b2: f32 = bf[2]
+        let b3: f32 = bf[3]
 
         s16(dstr, ((15 - i) * nch) as i64, scale_pcm(a1))
         s16(dstr, ((17 + i) * nch) as i64, scale_pcm(b1))
