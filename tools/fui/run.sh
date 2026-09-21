@@ -335,6 +335,29 @@ if [ -n "$verboten" ]; then
 fi
 echo "  floor/ceil/abs kommen in lib/fui/ nur aus svg.matrix        OK"
 
+echo
+echo "== 19b. KEINE BESCHRIFTUNG WIRD UNTERWEGS ABGESCHNITTEN =="
+# DER FEHLER, DER "red fixe" HIESS. In tools/fui/gallery_main.fi stand
+# `var t_v3: [u8; 10] = "red fixed "`, gemalt wurden acht Bytes, und im
+# Beleg las ein Pruefer "red fixe". Daneben malten drei Kacheln
+# derselben Datei die ersten zwei Bytes von "12 15 20", also dreimal
+# "12", obwohl die Schrift 12, 15 und 20 Punkt gross war. Beide Bilder
+# haben jede bestehende Pruefung bestanden: die Abmessungen stimmten,
+# die Farbvielfalt stimmte, jedes Band war bemalt -- nur das WORT war
+# kaputt. Ein Beleg mit einem halben Wort belegt das Gegenteil von dem,
+# was er behauptet.
+#
+# tools/fui/belegpruef_main.fi rechnet das jetzt maschinell nach
+# (Betriebsart --ketten): zu jeder gemalten Kette `(&name[0]) as u64, M`
+# wird die Deklaration `var name: [u8; N] = "..."` gesucht und
+# N - Fuellung <= M <= N gefordert. Hier laeuft die Laengenrechnung ueber
+# JEDE Quelle des Baums -- ohne Schrift ("-") und ohne Breite (0), damit
+# sie auch auf einem Rechner ohne DejaVu laeuft. Die Breitenrechnung mit
+# `render.pref_of` steht weiter unten bei den Belegbildern, wo die
+# Leinwandbreite jedes Blattes bekannt ist.
+build belegpruef
+"$W/belegpruef" --ketten - 0 tools/fui/*_main.fi demos/*/main.fi
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
@@ -390,22 +413,36 @@ if [ "$1" = "--images" ]; then
     beleg() {
         "$W/belegpruef" "$@"
     }
+    # DIE BESCHRIFTUNGEN GEGEN DIE LEINWAND. Abschnitt 19b rechnet die
+    # Kettenlaengen jeder Quelle nach; hier kommt die zweite Haelfte
+    # dazu, fuer die man die Leinwandbreite des Blattes braucht: jede
+    # gemalte Kette wird mit `render.pref_of` bei 15 Punkt gemessen und
+    # muss in die Breite des Belegs minus zweimal 24 Punkt Rand passen.
+    # Die Breite ist DIESELBE Zahl, die zwei Zeilen weiter an `beleg`
+    # geht -- steht sie einmal falsch, faellt es hier oder dort auf.
+    kette() {
+        "$W/belegpruef" --ketten "$SCHRIFT" "$2" "tools/fui/$1_main.fi"
+    }
     build gallery
+    kette gallery 1200
     "$W/gallery" "$Z/fui-wave1-light.png" light
     "$W/gallery" "$Z/fui-wave1-dark.png" dark
     beleg "$Z/fui-wave1-light.png" 1200 400 760 200
     beleg "$Z/fui-wave1-dark.png" 1200 400 760 200
     build gallery2
+    kette gallery2 1240
     "$W/gallery2" "$Z/fui-wave2-light.png" light
     "$W/gallery2" "$Z/fui-wave2-dark.png" dark
     beleg "$Z/fui-wave2-light.png" 1240 700 1180 200
     beleg "$Z/fui-wave2-dark.png" 1240 700 1180 200
     build gallery3
+    kette gallery3 1240
     "$W/gallery3" "$Z/fui-wave3-light.png" light
     "$W/gallery3" "$Z/fui-wave3-dark.png" dark
     beleg "$Z/fui-wave3-light.png" 1240 700 1320 200
     beleg "$Z/fui-wave3-dark.png" 1240 700 1320 200
     build gallery4
+    kette gallery4 1240
     "$W/gallery4" "$Z/fui-text-light.png" light
     "$W/gallery4" "$Z/fui-text-dark.png" dark
     beleg "$Z/fui-text-light.png" 1240 600 1180 200
@@ -415,6 +452,7 @@ if [ "$1" = "--images" ]; then
     # NEU gerastert (12..64) samt currentColor=TOK_ACCENT daneben, Bild mit
     # Transparenz ueber vier Gruenden, Reiter/Menue/Kachel.
     build artshow
+    kette artshow 900
     "$W/artshow" "$Z/fui-bild-svg-hell.png" light
     "$W/artshow" "$Z/fui-bild-svg-dunkel.png" dark
     beleg "$Z/fui-bild-svg-hell.png" 900 400 620 200
@@ -424,21 +462,25 @@ if [ "$1" = "--images" ]; then
     # Schatten/Glas/Farbmatrix ueber gemustertem Grund, und gedrehte,
     # skalierte, gescherte Kacheln.
     build gallery5
+    kette gallery5 1240
     "$W/gallery5" "$Z/fui-anim-hell.png" light
     "$W/gallery5" "$Z/fui-anim-dunkel.png" dark
     beleg "$Z/fui-anim-hell.png" 1240 500 764 200
     beleg "$Z/fui-anim-dunkel.png" 1240 500 764 200
     build gallery6
+    kette gallery6 1240
     "$W/gallery6" "$Z/fui-flex-hell.png" light
     "$W/gallery6" "$Z/fui-flex-dunkel.png" dark
     beleg "$Z/fui-flex-hell.png" 1240 600 880 200
     beleg "$Z/fui-flex-dunkel.png" 1240 600 880 200
     build gallery7
+    kette gallery7 1240
     "$W/gallery7" "$Z/fui-effekt-hell.png" light
     "$W/gallery7" "$Z/fui-effekt-dunkel.png" dark
-    beleg "$Z/fui-effekt-hell.png" 1240 400 640 200
-    beleg "$Z/fui-effekt-dunkel.png" 1240 400 640 200
+    beleg "$Z/fui-effekt-hell.png" 1240 400 700 200
+    beleg "$Z/fui-effekt-dunkel.png" 1240 400 700 200
     build gallery8
+    kette gallery8 1280
     "$W/gallery8" "$Z/fui-transform-hell.png" light
     "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
     beleg "$Z/fui-transform-hell.png" 1280 500 760 200
@@ -449,6 +491,7 @@ if [ "$1" = "--images" ]; then
     # erst recht nicht. Jetzt entsteht ihr Bild hier und wird
     # nachgerechnet wie jeder andere Beleg.
     build preview
+    kette preview 760
     "$W/preview" "$Z/fui-preview-hell.png" light
     "$W/preview" "$Z/fui-preview-dunkel.png" dark
     beleg "$Z/fui-preview-hell.png" 760 200 240 120
@@ -464,6 +507,7 @@ if [ "$1" = "--images" ]; then
     # rechnet selbst nach, dass seine Phasen sich nicht ueberdecken,
     # und endet sonst mit einem Fehler (set -e bricht den Lauf ab).
     "$FIRNC" --opt-level=dev -o "$W/fuidemo" demos/fuidemo/main.fi
+    "$W/belegpruef" --ketten "$SCHRIFT" 1000 demos/fuidemo/main.fi
     "$W/fuidemo" "$Z/fui-demo-hell.png" light
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     beleg "$Z/fui-demo-hell.png" 1000 350 500 200
