@@ -914,3 +914,216 @@ Pruefungen der anderen Module rufen sie auf:
   `tf_hit_test` ist geprueft, `control.fi` selbst noch unberuehrt --
   falls dort eine Fassung mit Matrix gewuenscht ist, gehoert sie in die
   Hand dieses Moduls und darf `control.hit_test` NICHT ersetzen.
+
+---
+
+# RUNDE fUi-DEKLARATIV (21.09.2026) -- beschreiben statt malen
+
+Zweig `fui-deklarativ`. Ziel der Runde: fUi bekommt die letzte grosse
+Sache, die es von HTML/CSS trennt -- man BESCHREIBT eine Oberflaeche,
+statt sie Aufruf fuer Aufruf zu malen. Dazu drei neue Module:
+
+* `lib/fui/viewport.fi` -- der Scheibenkasten (Ausschnitt, echtes
+  Clipping, Rollbalken aus dem Verhaeltnis, kinetisches Rollen).
+* `lib/fui/sheet.fi` -- das Stilblatt (Auswahl -> Stilwerte, Rangfolge,
+  Vererbung).
+* `lib/fui/scene.fi` -- der Baum (messen, anordnen, zeichnen -- in
+  dieser Reihenfolge und getrennt).
+
+## 0. Was der Lead-Architekt in dieser Runde schon gebaut hat
+
+Es steht, es uebersetzt, es rechnet, und der Lauf ist damit gruen
+(`sh tools/fui/run.sh --images` -> `ALL CHECKS PASSED`). NICHTS davon
+wird neu gebaut; erweitert wird es sehr wohl.
+
+| Datei | Stand |
+|---|---|
+| `lib/fui/sheet.fi` | vollstaendig: `Sel`/`Decl`/`Sheet`/`NodeDesc`, FNV-Namen, Rangfolge, `sheet_resolve`, `decl_merge`, `decl_inherit` |
+| `lib/fui/viewport.fi` | vollstaendig: Ausschnitt/Inhalt/Verschiebung, Balkenbedarf ueber Kreuz, Anteil+Stellung, `ensure_visible`, `viewport_hit`, Clip ueber `canvas.clip_push_rect`, Fling ueber `anim.Animation` |
+| `lib/fui/scene.fi` | tragend: Baum, vier Durchgaenge (`scene_style`/`_measure`/`_layout`/`_draw`), Treffer, Drift-Wache |
+| `tools/fui/sheet_main.fi` | 16 Behauptungen, `SHEET PASSED.` |
+| `tools/fui/viewport_main.fi` | 17 Behauptungen, `VIEWPORT PASSED.` |
+| `tools/fui/scene_main.fi` | 12 Behauptungen, `SCENE PASSED.` |
+| `tools/fui/run.sh` | Abschnitte 18b/18c/18d haengen die drei ein |
+
+Die SCHNITTSTELLEN dieser drei Dateien sind ab jetzt FESTGESCHRIEBEN
+(siehe Abschnitt 2). Wer eine Signatur wirklich aendern muss, meldet
+das im Bericht -- er aendert sie nicht still, denn zwei Module bauen
+darauf.
+
+## 1. Wem welche Datei gehoert -- zwei Module fassen NIE dieselbe Datei an
+
+| Modul | ausschliesslich diese Dateien |
+|---|---|
+| **viewport** | `lib/fui/viewport.fi`, `tools/fui/viewport_main.fi`, `lib/fui/wave2.fi` (NUR die benannte Auslagerung, siehe 3.1) |
+| **sheet** | `lib/fui/sheet.fi`, `tools/fui/sheet_main.fi` |
+| **scene** | `lib/fui/scene.fi`, `tools/fui/scene_main.fi` |
+| **galerie** | `tools/fui/gallery9_main.fi`, `tools/fui/gallery10_main.fi`, `tools/fui/scenedemo_main.fi`, `tools/fui/run.sh`, `LOGBOOK.md`, `ACCEPTANCE.md` |
+
+`PLAN.md` gehoert dem Lead. `lib/fui/core.fi`, `style.fi`, `layout.fi`,
+`flex.fi`, `anim.fi`, `effect.fi`, `transform.fi`, `render.fi`,
+`wave3.fi`, `lib/paint/*`, `lib/svg/*` und JEDE bestehende
+`tools/fui/*_main.fi` bleiben unberuehrt. Keine bestehende Pruefung
+wird abgeschwaecht, umbenannt oder entfernt.
+
+## 2. Die festgeschriebenen Schnittstellen
+
+### `lib/fui/sheet.fi`
+```
+sheet_name(p: u64, n: usize) -> u32          // FNV-1a, nie 0
+Sel   sel_any/sel_kind/sel_id/sel_class
+      sel_with_class/sel_with_state
+      sel_within_class/sel_within_kind/sel_within_id
+      sel_specificity(*mut Sel) -> i64       // id 10000, Klasse/Zustand 100, Art 1
+Decl  decl_new, decl_style -> *mut style.Style, decl_set_style,
+      decl_set_transition(ms, anim.EASE_*), decl_set_translate/_scale/_rotate,
+      decl_has(bit, extra), decl_merge(dst, src), decl_inherit(child, parent)
+NodeDesc desc_new(kind, id), desc_add_class, desc_set_state   // 56 Oktette!
+Sheet sheet_new, sheet_add(sel, decl) -> usize, sheet_count,
+      sheet_sel, sheet_decl, sheet_match, sheet_resolve(chain, depth, out)
+INHERIT_MASK = SF_FG|SF_FONT_PX|SF_FONT_ID|SF_LINE_HEIGHT
+```
+Die Kette `chain` ist ein Feld aus `NodeDesc`, Wurzel zuerst, der
+Knoten selbst an `depth - 1`. `sheet.chain_at` rechnet mit der
+Schrittweite 56; wer `NodeDesc` aendert, aendert BEIDES und die
+Messung in `sheet_main.fi` Abschnitt 6 faengt es.
+
+### `lib/fui/viewport.fi`
+```
+Viewport viewport_new(x, y, w, h, cw, ch)
+   viewport_set_rect/_set_content/_set_bar/_set_offset/_scroll_by
+   viewport_inner_w/_inner_h/_max_x/_max_y/_needs_h/_needs_v
+   viewport_share_h/_share_v -> f64          // Ausschnitt / Inhalt
+   viewport_value_h/_value_v -> i64          // 0..wave2.VAL_MAX
+   viewport_bar_rect_v/_h(x, y, w, h) -> bool
+   viewport_content_x/_content_y             // x - ox, y - oy
+   viewport_hit(px, py, *cx, *cy) -> bool    // Fenster -> Inhalt
+   viewport_visible(rx, ry, rw, rh) -> bool
+   viewport_ensure_visible(rx, ry, rw, rh) -> bool
+   viewport_begin(ctx, v) -> bool / viewport_end(ctx, v)   // canvas-Clip
+   viewport_draw_bars(ctx, v)
+   viewport_wheel/_key(VP_*)/_fling(vx, vy, now)/_tick(now)/_moving
+```
+
+### `lib/fui/scene.fi`
+```
+Scene scene_new, scene_add(parent, kind) -> usize, SCENE_NONE
+      N_BOX/N_TEXT/N_IMAGE/N_SVG/N_WIDGET/N_VIEWPORT
+      node_set_id/_add_class/_set_state/_set_text/_set_widget_kind
+      node_set_image/_set_svg/_set_art_align/_widget
+      node_set_flex(dir, justify, align_items)/_set_gap/_set_padding/_set_wrap
+      node_set_grow/_set_basis/_set_align_self/_set_size/_set_viewport
+      scene_style(sheet) -> scene_measure(ctx) -> scene_layout(ctx, x, y, w, h)
+        -> scene_draw(ctx)
+      node_x/_y/_w/_h/_pref_w/_pref_h, scene_hit(px, py), scene_find_id(id)
+      scene_phase, scene_size_drift
+```
+Die Rechtecke sind ABSOLUT, die Rollposition ist beim Anordnen schon
+eingerechnet. Nach dem Rollen wird `scene_layout` erneut gerufen --
+und NICHT beim Zeichnen nachgeschoben.
+
+## 3. Der eigentliche Bauauftrag je Modul
+
+### 3.1 viewport
+* `wave2.draw_scrollbar` rechnet die Laenge des Schiebers heute IN SICH
+  (Zeilen 601 ff.). Sie wird als `wave2.scrollbar_thumb(c, e) -> layout.Rect`
+  herausgezogen und von `draw_scrollbar` gerufen -- eine Auslagerung
+  ohne jede Verhaltensaenderung, damit `viewport_main.fi` die Laenge
+  gegen `Ausschnitt/Inhalt` PRUEFEN kann, ohne sie ein zweites Mal
+  auszurechnen. Die Bilder aller bestehenden Belege muessen danach
+  Bildpunkt fuer Bildpunkt dieselben sein.
+* Abschnitt 8 von `viewport_main.fi`: HARTES CLIPPING auf einer echten
+  Leinwand. Ein Inhalt, der absichtlich weit ueber den Ausschnitt
+  hinausragt, wird zwischen `viewport_begin`/`viewport_end` gemalt;
+  danach wird JEDER Bildpunkt ausserhalb des Ausschnitts geprueft. Ein
+  einziger gesetzter Punkt ist ein Fehlschlag. Die GEGENPROBE gehoert
+  dazu: derselbe Inhalt OHNE Clip muss von demselben Test rot gemeldet
+  werden (die Zahl der uebergelaufenen Punkte wird gedruckt).
+* Rollbalkenlaenge im Bild: die Laenge des Schiebers wird aus der
+  Leinwand GEMESSEN und gegen `Ausschnitt/Inhalt * Spurlaenge`
+  gerechnet (mit der Mindestlaenge aus wave2 als benannte Ausnahme).
+* Radrasten, Tasten (`VP_PAGE_DOWN` am Ende klemmt), Fling mit
+  Verzoegerung und `viewport_tick` mitten in der Bewegung.
+
+### 3.2 sheet
+* Uebergaenge und Umformungen WIRKSAM machen: eine Brueckenfunktion, die
+  ein `Decl` an `anim.trans_set_duration`/`anim.easing_named` bzw. an
+  `transform.xf_translate/_scale/_rotate` reicht. Gerechnet wird dort,
+  nicht hier.
+* `sheet_resolve` gegen einen Fall mit VIER passenden Regeln, deren
+  Raenge sich paarweise widersprechen, und gegen eine Kette der Tiefe 4
+  ("Klasse A in Klasse B in Kennung C").
+* Der Zustand: dieselbe Auswahl mit `STATE_HOVER` und ohne, am selben
+  Knoten, einmal mit gesetztem Hover und einmal ohne -- die Zahlen
+  muessen kippen.
+* Die Grenze der Vererbung mit ZAHLEN je nicht vererbbarem Wert
+  (Grund, Rahmen, Radius, Polster, Ausrichtung, Alpha).
+
+### 3.3 scene
+* Messen und Anordnen mit echtem `render.Ctx` (Schrift, Leinwand,
+  Theme): von Hand gerechnete Sollwerte fuer eine Zeile aus drei
+  Knoepfen mit Luecke und Innenrand, gegen `flex_main.fi`-Manier.
+* Ein `N_VIEWPORT`-Knoten mit 40 Kindern: es wird geprueft, dass die
+  Kinder ausserhalb des Ausschnitts NICHT anklickbar sind und dass
+  `scene_hit` nach dem Rollen einen ANDEREN Knoten liefert.
+* Die Drift-Wache scharf machen: ein absichtlich falscher Knoten, der
+  beim Zeichnen seine Groesse aendert, muss `scene_size_drift` auf 1
+  bringen (Gegenprobe im Test, nicht in der Bibliothek).
+* Vererbung durch DREI Ebenen im Baum, und `scene_desc` gegen die
+  Art-Verschiebung um 1000 (Widget-Arten und Knotenarten duerfen sich
+  nicht ueberschneiden).
+
+### 3.4 galerie
+* `tools/fui/gallery9_main.fi` -- hell UND dunkel: eine LANGE Liste in
+  einem Scheibenkasten, sichtbar abgeschnitten, mit Rollbalken, dessen
+  Laenge dem Verhaeltnis entspricht; daneben derselbe Kasten in drei
+  Rollstellungen (Anfang, Mitte, Ende).
+* `tools/fui/gallery10_main.fi` -- hell UND dunkel: eine VOLLSTAENDIGE,
+  mit `scene`+`sheet` beschriebene Oberflaeche (Titelzeile,
+  Werkzeugleiste, Seitenleiste, Inhalt, Statuszeile), die aussieht wie
+  eine moderne Anwendung.
+* `tools/fui/scenedemo_main.fi` -- DER NACHWEIS: dieselbe Oberflaeche
+  wie `demos/fuidemo/main.fi`, aber mit `scene`+`sheet` beschrieben.
+  Das bestehende Demo bleibt UNVERAENDERT stehen (es ist eine laufende
+  Pruefung). Das Programm druckt die beiden Zeilenzahlen -- vorher
+  (`demos/fuidemo/main.fi`) und nachher -- und das Bild ist mindestens
+  so gut.
+* `tools/fui/run.sh`: die drei Programme einhaengen, mit `kette` und
+  `beleg` wie jedes andere Blatt. Die Zahlen hinter `beleg` sind
+  ABSICHTLICH je Blatt gesetzt und muessen zur Leinwand des Programms
+  passen.
+* `LOGBOOK.md`/`ACCEPTANCE.md`: was diese Runde gebaut hat, mit den
+  Zahlen (Zeilen vorher/nachher, Zahl der Behauptungen).
+
+## 4. Harte Regeln (fuer alle, nicht verhandelbar)
+
+1. **Sprache ist Firn.** Kein C, kein Rust, kein JS, keine libc, keine
+   fremde Bibliothek. `export { ... }` oben, Kommentare als ganze
+   Saetze, die das WARUM erklaeren.
+2. **Kein zweiter Ort fuer dieselbe Sache.** Flexbox aus `flex.fi`,
+   Zeit und Easing aus `anim.fi`, Matrizen aus `lib/svg/matrix.fi`,
+   Weichzeichner aus `effect.fi`, Messen und Malen aus
+   `render.fi`/`wave2.fi`/`wave3.fi`, Clip aus `lib/paint/canvas.fi`.
+   In `lib/fui/` gilt weiter `matrix.m_floor/m_ceil/m_abs`, nie
+   `math.floor/ceil/abs` (Abschnitt 19 des Laufs verbietet es
+   maschinell).
+3. **Kernel-rein bleibt kernel-rein.** `core.fi`, `style.fi`,
+   `layout.fi` uebersetzen weiter mit `--profile=kernel`, ohne
+   Syscall und ohne fremden Namen ausser `osum_panic`. Die neuen
+   Module haengen nach unten, nie umgekehrt.
+4. **Zahlen, keine Blicke.** Jede Behauptung ist ein von Hand
+   gerechneter Sollwert mit `got X want Y`; am Ende steht
+   `<NAME> PASSED.`. Wo eine Pruefung etwas ausschliesst (Clipping,
+   Drift), gehoert die GEGENPROBE dazu.
+5. **Bilder hell UND dunkel.** Nichts ueberlappt, nichts ist
+   abgeschnitten -- ausser dort, wo der Scheibenkasten es soll --, kein
+   Text laeuft aus seinem Kasten. Die Laengen der `[u8; N]`-
+   Beschriftungen richtet `tools/fui/fixlen.py`; der LAENGENPARAMETER am
+   Aufruf muss dazu passen, sonst steht die Beschriftung abgeschnitten
+   im Bild.
+6. **Git**: kleine, erklaerte Commits auf `fui-deklarativ`. Kein
+   force-push, kein Zweigwechsel, nichts loeschen, was man nicht selbst
+   angelegt hat.
+7. Am Ende muss `sh tools/fui/run.sh --images` VOLLSTAENDIG durchlaufen
+   und `ALL CHECKS PASSED` drucken -- mit allen alten Pruefungen
+   unveraendert darin.

@@ -270,6 +270,40 @@ build editor
 "$W/editor"
 
 echo
+echo "== 18b. DER SCHEIBENKASTEN =="
+# lib/fui/viewport.fi: der Ausschnitt, der mehr Inhalt aufnimmt, als er
+# hoch ist. Nachgerechnet werden die Rechnung ueber Kreuz (ein
+# senkrechter Balken macht einen waagerechten noetig), der sichtbare
+# Ausschnitt, die Klemmung, Anteil und Stellung des Rollbalkens aus dem
+# Verhaeltnis Ausschnitt/Inhalt, `viewport_ensure_visible`, die
+# Trefferpruefung UNTER VERSCHIEBUNG und das kinetische Auslaufen ueber
+# lib/fui/anim.fi. Das harte Clipping wird auf der Leinwand gemessen:
+# kein Bildpunkt ausserhalb des Ausschnitts darf gesetzt sein, und die
+# Gegenprobe OHNE Clip muss derselbe Test rot melden.
+build viewport
+"$W/viewport"
+
+echo
+echo "== 18c. DAS STILBLATT: RANGFOLGE UND VERERBUNG =="
+# lib/fui/sheet.fi. Die Faelle widersprechen sich mit Absicht:
+# Kennung schlaegt Klasse schlaegt Art, bei Gleichstand gewinnt die
+# spaeter geschriebene Regel, und eine ranghohe Regel, die nur die
+# Schriftfarbe nennt, loescht keinen Grund. Dazu die Vererbung UND
+# ihre Grenze -- vier Werte gehen ueber, der Grund nicht.
+build sheet
+"$W/sheet"
+
+echo
+echo "== 18d. DER BESCHRIEBENE BAUM =="
+# lib/fui/scene.fi: Baum, Stil, Messen, Anordnen, Zeichnen -- in
+# dieser Reihenfolge und in getrennten Durchgaengen. Geprueft wird
+# unter anderem, dass beim Zeichnen keine Groesse mehr driftet
+# (`scene_size_drift` ist 0) und dass die Trefferpruefung den obersten
+# Knoten liefert.
+build scene
+"$W/scene"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi

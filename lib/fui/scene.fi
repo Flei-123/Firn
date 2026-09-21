@@ -1,0 +1,772 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/scene.fi -- DIE BESCHRIEBENE OBERFLAECHE.
+//
+// ===================================================== WARUM ES SIE GIBT
+//
+// Bis hierher wurde eine Oberflaeche in fUi GEMALT: Aufruf fuer Aufruf,
+// jeder mit seinen eigenen Koordinaten. Das funktioniert, solange
+// jemand die Koordinaten im Kopf hat -- und es bricht in dem Augenblick,
+// in dem sich eine Schriftgroesse aendert, ein Text laenger wird oder
+// das Fenster eine andere Breite hat. Genau deshalb beschreibt man im
+// Web eine Seite, statt sie zu zeichnen.
+//
+// Dieses Modul ist die Beschreibung: ein BAUM aus Knoten. Jeder Knoten
+// hat eine Art, eine Kennung, Klassen, Kinder und einen Stil. Der Baum
+// wird EINMAL gebaut und dann in klar getrennten Durchgaengen
+// abgearbeitet:
+//
+//     1. STIL      scene_style   -- welche Regel gilt fuer welchen
+//                                   Knoten (lib/fui/sheet.fi), und was
+//                                   erbt er von seinem Elternteil.
+//     2. MESSEN    scene_measure -- jeder Knoten meldet seine
+//                                   Wunschgroesse. Blaetter ueber
+//                                   render.pref_of, Kaesten ueber
+//                                   flex.flex_measure_main/_cross.
+//     3. ANORDNEN  scene_layout  -- flex.flex_layout verteilt den Platz
+//                                   und schreibt die Rechtecke.
+//     4. ZEICHNEN  scene_draw    -- und erst jetzt wird gemalt.
+//
+// DASS DAS VIER DURCHGAENGE SIND, IST DER GANZE PUNKT. Ein Knoten, der
+// beim Zeichnen noch seine Groesse aendert, macht das Bild von der
+// Zeichenreihenfolge abhaengig -- dann steht das zweite Element eine
+// Zeile tiefer, je nachdem, ob das erste schon gemalt wurde. `scene_draw`
+// wacht darueber: es merkt sich die gemessenen Groessen und meldet ueber
+// `scene_size_drift`, wenn sich waehrend des Zeichnens eine geaendert
+// hat. tools/fui/scene_main.fi rechnet diese Zahl nach.
+//
+// ================================================ WAS HIER NICHT STEHT
+//
+// Dieses Modul RECHNET FAST NICHTS SELBST, und das ist Absicht:
+//
+//     Flexbox        lib/fui/flex.fi
+//     Kasten/Raster  lib/fui/layout.fi
+//     Messen/Malen   lib/fui/render.fi, wave2.fi, wave3.fi
+//     Zeit/Easing    lib/fui/anim.fi
+//     Matrizen       lib/fui/transform.fi (auf lib/svg/matrix.fi)
+//     Abschneiden    lib/fui/viewport.fi (auf lib/paint/canvas.fi)
+//     Regeln/Rang    lib/fui/sheet.fi
+//
+// Was hier steht, ist der BAUM und die REIHENFOLGE. Sobald in dieser
+// Datei eine zweite Flexbox oder eine zweite Zeitrechnung auftaucht, ist
+// sie falsch.
+//
+// ======================================================= DER AUFBAU
+//
+//     var sc: scene.Scene = scene.scene_new()
+//     let wurzel: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+//         scene.N_BOX)
+//     let kopf: usize = scene.scene_add(&sc, wurzel, scene.N_TEXT)
+//     scene.node_set_text(&sc, kopf, (&t[0]) as u64, 5)
+//     scene.node_add_class(&sc, kopf, sheet.sheet_name((&k[0]) as u64, 4))
+//     scene.scene_style(&sc, &blatt)
+//     scene.scene_measure(&sc, &c)
+//     scene.scene_layout(&sc, &c, 0.0, 0.0, 800.0, 600.0)
+//     scene.scene_draw(&sc, &c)
+//
+// Knoten sind ZAHLEN (Plaetze in einem festen Feld), keine Zeiger: der
+// Baum bleibt kopierbar, braucht keinen Allokator und keinen Sammler --
+// dieselbe Entscheidung wie bei anim.Animator und sheet.Sheet.
+export {
+    Scene, Node,
+    scene_new, scene_add, scene_count, scene_node, scene_reset,
+    scene_root, scene_parent, scene_first_child, scene_next_sibling,
+    scene_child_count, scene_child_at,
+    node_set_id, node_id, node_add_class, node_class_count, node_has_class,
+    node_set_state, node_state, node_kind,
+    node_set_text, node_set_widget_kind, node_widget,
+    node_set_image, node_set_svg, node_set_art_align,
+    node_set_flex, node_set_gap, node_set_padding, node_set_wrap,
+    node_set_grow, node_set_basis, node_set_align_self,
+    node_set_size, node_set_viewport, node_viewport,
+    node_style, node_decl,
+    node_pref_w, node_pref_h, node_x, node_y, node_w, node_h,
+    scene_style, scene_measure, scene_layout, scene_draw,
+    scene_phase, scene_size_drift, scene_desc,
+    scene_hit, scene_find_id,
+    N_BOX, N_TEXT, N_IMAGE, N_SVG, N_WIDGET, N_VIEWPORT,
+    SCENE_NONE, SCENE_MAX, KIDS_MAX,
+    PHASE_BUILD, PHASE_STYLE, PHASE_MEASURE, PHASE_LAYOUT, PHASE_DRAW,
+}
+
+import std.rt
+import svg.matrix
+import fui.style
+import fui.theme
+import fui.widget
+import fui.layout
+import fui.flex
+import fui.painter
+import fui.render
+import fui.anim
+import fui.wave3
+import fui.uiimage
+import fui.uisvg
+import fui.sheet
+import fui.viewport
+
+// ======================================================= DIE ARTEN
+//
+// Ein Knoten ist eines von sechs Dingen. Mehr braucht es nicht: ein
+// Knopf ist ein N_WIDGET mit widget.KIND_BUTTON, eine Karte ein
+// N_WIDGET mit widget.KIND_CARD -- die Arten der Widgets stehen in
+// lib/fui/widget.fi und werden hier nicht noch einmal aufgezaehlt.
+const N_BOX: u32 = 1
+const N_TEXT: u32 = 2
+const N_IMAGE: u32 = 3
+const N_SVG: u32 = 4
+const N_WIDGET: u32 = 5
+const N_VIEWPORT: u32 = 6
+
+const SCENE_MAX: usize = 128
+const KIDS_MAX: usize = 32
+const SCENE_NONE: usize = 4294967295
+
+// Die Durchgaenge, als Zahlen, damit eine Pruefung sie benennen kann.
+const PHASE_BUILD: u32 = 0
+const PHASE_STYLE: u32 = 1
+const PHASE_MEASURE: u32 = 2
+const PHASE_LAYOUT: u32 = 3
+const PHASE_DRAW: u32 = 4
+
+struct Node {
+    kind: u32,
+    id: u32,
+    cls: [u32; 8],
+    ncls: usize,
+    // Der Baum. Kinder haengen in einer einfach verketteten Liste, und
+    // `last` haelt das Anhaengen in O(1) -- die Reihenfolge der Kinder
+    // ist die Reihenfolge, in der sie angelegt wurden, wie im Web.
+    parent: usize,
+    first: usize,
+    last: usize,
+    next: usize,
+    nkids: usize,
+    // DER TRAEGER. Text, Bild, Zustand, Wert und Stil eines Knotens sind
+    // genau das, was ein widget.Widget schon haelt -- und render.pref_of
+    // und wave3.draw_any nehmen genau das entgegen. Ein eigener
+    // Knotenstil waere der zweite Ort fuer den Stil.
+    e: widget.Widget,
+    d: sheet.Decl,
+    // Der Kasten, wenn dieser Knoten Kinder verteilt.
+    fb: flex.FlexBox,
+    // Was dieser Knoten seinem Elternteil ueber sich sagt.
+    grow: i64,
+    shrink: i64,
+    basis: i64,       // < 0 = auto (die gemessene Groesse)
+    align_self: u32,
+    fix_w: f64,       // <= 0 = automatisch
+    fix_h: f64,
+    // Das Ergebnis der Durchgaenge.
+    pw: f64,
+    ph: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    // Der Scheibenkasten, wenn kind == N_VIEWPORT. Er gehoert dem
+    // AUFRUFER -- wie ein Bild am Widget, und aus demselben Grund: er
+    // ueberlebt den Baum, denn die Rollposition darf ein neuer Aufbau
+    // nicht vergessen.
+    vp: u64,
+}
+
+struct Scene {
+    nodes: [Node; 128],
+    n: usize,
+    root: usize,
+    phase: u32,
+    drift: usize,
+}
+
+fn node_blank() -> Node {
+    return Node {
+        kind: N_BOX, id: 0 as u32, cls: [0 as u32; 8], ncls: 0,
+        parent: SCENE_NONE, first: SCENE_NONE, last: SCENE_NONE,
+        next: SCENE_NONE, nkids: 0,
+        e: widget.widget_new(widget.KIND_NONE), d: sheet.decl_new(),
+        fb: flex.flexbox_new(flex.FLEX_COLUMN),
+        grow: 0, shrink: 1000, basis: 0 - 1, align_self: flex.AL_AUTO,
+        fix_w: 0.0, fix_h: 0.0,
+        pw: 0.0, ph: 0.0, x: 0.0, y: 0.0, w: 0.0, h: 0.0, vp: 0,
+    }
+}
+
+fn scene_new() -> Scene {
+    return Scene { nodes: [node_blank(); 128], n: 0, root: SCENE_NONE,
+        phase: PHASE_BUILD, drift: 0 }
+}
+
+fn scene_reset(sc: *mut Scene) {
+    (*sc).n = 0
+    (*sc).root = SCENE_NONE
+    (*sc).phase = PHASE_BUILD
+    (*sc).drift = 0
+}
+
+fn scene_count(sc: *mut Scene) -> usize { return (*sc).n }
+fn scene_root(sc: *mut Scene) -> usize { return (*sc).root }
+fn scene_phase(sc: *mut Scene) -> u32 { return (*sc).phase }
+fn scene_size_drift(sc: *mut Scene) -> usize { return (*sc).drift }
+
+fn scene_node(sc: *mut Scene, i: usize) -> *mut Node {
+    return &(*sc).nodes[i]
+}
+
+// EINEN KNOTEN ANLEGEN. `parent` ist SCENE_NONE fuer die Wurzel.
+// Zurueck kommt der Platz; SCENE_MAX heisst "kein Platz mehr", und der
+// Aufrufer merkt es, weil jeder Zugriff darauf still nichts tut.
+fn scene_add(sc: *mut Scene, parent: usize, kind: u32) -> usize {
+    if (*sc).n >= SCENE_MAX {
+        return SCENE_MAX
+    }
+    let i: usize = (*sc).n
+    (*sc).nodes[i] = node_blank()
+    (*sc).nodes[i].kind = kind
+    (*sc).nodes[i].parent = parent
+    // Eine Art bekommt ihren Traeger: ein Text ist eine Beschriftung,
+    // ein Kasten ist ein rahmenloses Etwas, ein Widget sagt seine Art
+    // selbst (node_set_widget_kind).
+    if kind == N_TEXT {
+        widget.w_set_kind(&(*sc).nodes[i].e, widget.KIND_LABEL)
+    } else {
+        widget.w_set_kind(&(*sc).nodes[i].e, widget.KIND_NONE)
+    }
+    (*sc).n = i + 1
+    if parent == SCENE_NONE {
+        if (*sc).root == SCENE_NONE {
+            (*sc).root = i
+        }
+        return i
+    }
+    if parent >= (*sc).n {
+        return i
+    }
+    let p: *mut Node = &(*sc).nodes[parent]
+    if (*p).first == SCENE_NONE {
+        (*p).first = i
+    } else {
+        (*sc).nodes[(*p).last].next = i
+    }
+    (*p).last = i
+    (*p).nkids = (*p).nkids + 1
+    return i
+}
+
+fn scene_parent(sc: *mut Scene, i: usize) -> usize {
+    return (*sc).nodes[i].parent
+}
+
+fn scene_first_child(sc: *mut Scene, i: usize) -> usize {
+    return (*sc).nodes[i].first
+}
+
+fn scene_next_sibling(sc: *mut Scene, i: usize) -> usize {
+    return (*sc).nodes[i].next
+}
+
+fn scene_child_count(sc: *mut Scene, i: usize) -> usize {
+    return (*sc).nodes[i].nkids
+}
+
+fn scene_child_at(sc: *mut Scene, i: usize, k: usize) -> usize {
+    var c: usize = (*sc).nodes[i].first
+    var j: usize = 0
+    while c != SCENE_NONE && j < k {
+        c = (*sc).nodes[c].next
+        j = j + 1
+    }
+    return c
+}
+
+// ================================================ WAS EIN KNOTEN IST
+fn node_kind(sc: *mut Scene, i: usize) -> u32 { return (*sc).nodes[i].kind }
+
+fn node_set_id(sc: *mut Scene, i: usize, id: u32) {
+    (*sc).nodes[i].id = id
+    widget.w_set_id(&(*sc).nodes[i].e, id)
+}
+
+fn node_id(sc: *mut Scene, i: usize) -> u32 { return (*sc).nodes[i].id }
+
+fn node_add_class(sc: *mut Scene, i: usize, c: u32) -> bool {
+    let nd: *mut Node = &(*sc).nodes[i]
+    if (*nd).ncls >= sheet.DESC_CLASS_MAX {
+        return false
+    }
+    (*nd).cls[(*nd).ncls] = c
+    (*nd).ncls = (*nd).ncls + 1
+    return true
+}
+
+fn node_class_count(sc: *mut Scene, i: usize) -> usize {
+    return (*sc).nodes[i].ncls
+}
+
+fn node_has_class(sc: *mut Scene, i: usize, c: u32) -> bool {
+    let nd: *mut Node = &(*sc).nodes[i]
+    var k: usize = 0
+    while k < (*nd).ncls {
+        if (*nd).cls[k] == c {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// Der Zustand steht AM WIDGET -- dort, wo ihn render.draw_base und
+// control.fi schon lesen. `node_state` fragt dieselbe Stelle; ein
+// zweites Zustandsfeld am Knoten waere der Anfang davon, dass hover
+// zweimal verschiedene Dinge heisst.
+fn node_set_state(sc: *mut Scene, i: usize, st: u32) {
+    let e: *mut widget.Widget = &(*sc).nodes[i].e
+    widget.w_set_hover(e, st == style.STATE_HOVER)
+    widget.w_set_active(e, st == style.STATE_ACTIVE)
+    widget.w_set_focus(e, st == style.STATE_FOCUS)
+    widget.w_set_disabled(e, st == style.STATE_DISABLED)
+    widget.w_set_selected(e, st == style.STATE_SELECTED)
+}
+
+fn node_state(sc: *mut Scene, i: usize) -> u32 {
+    return widget.w_state(&(*sc).nodes[i].e)
+}
+
+fn node_set_text(sc: *mut Scene, i: usize, p: u64, n: usize) {
+    widget.w_set_text(&(*sc).nodes[i].e, p, n)
+}
+
+fn node_set_widget_kind(sc: *mut Scene, i: usize, k: u32) {
+    widget.w_set_kind(&(*sc).nodes[i].e, k)
+}
+
+// Der Traeger selbst -- fuer alles, was ein Widget kann und ein Knoten
+// nicht eigens wiederholt (Wert eines Schiebers, Zeilenzahl, Tinte).
+fn node_widget(sc: *mut Scene, i: usize) -> *mut widget.Widget {
+    return &(*sc).nodes[i].e
+}
+
+fn node_set_image(sc: *mut Scene, i: usize, img: *mut uiimage.Image,
+    w: usize, h: usize) {
+    widget.w_set_image(&(*sc).nodes[i].e, img as u64)
+    widget.w_set_art_size(&(*sc).nodes[i].e, w, h)
+}
+
+fn node_set_svg(sc: *mut Scene, i: usize, ic: *mut uisvg.Icon, w: usize,
+    h: usize) {
+    widget.w_set_svg(&(*sc).nodes[i].e, ic as u64)
+    widget.w_set_art_size(&(*sc).nodes[i].e, w, h)
+}
+
+fn node_set_art_align(sc: *mut Scene, i: usize, a: u32) {
+    widget.w_set_art_align(&(*sc).nodes[i].e, a)
+}
+
+// ============================================ WAS EIN KASTEN VERTEILT
+fn node_set_flex(sc: *mut Scene, i: usize, dir: u32, justify: u32,
+    align_items: u32) {
+    let nd: *mut Node = &(*sc).nodes[i]
+    (*nd).fb = flex.flexbox_new(dir)
+    flex.flex_set_justify(&(*nd).fb, justify)
+    flex.flex_set_align_items(&(*nd).fb, align_items)
+}
+
+fn node_set_gap(sc: *mut Scene, i: usize, main: i64, cross: i64) {
+    flex.flex_set_gap(&(*sc).nodes[i].fb, main, cross)
+}
+
+fn node_set_padding(sc: *mut Scene, i: usize, l: i64, t: i64, r: i64,
+    b: i64) {
+    flex.flex_set_padding(&(*sc).nodes[i].fb, l, t, r, b)
+}
+
+fn node_set_wrap(sc: *mut Scene, i: usize, w: u32) {
+    flex.flex_set_wrap(&(*sc).nodes[i].fb, w)
+}
+
+fn node_set_grow(sc: *mut Scene, i: usize, grow: i64, shrink: i64) {
+    (*sc).nodes[i].grow = grow
+    (*sc).nodes[i].shrink = shrink
+}
+
+fn node_set_basis(sc: *mut Scene, i: usize, basis: i64) {
+    (*sc).nodes[i].basis = basis
+}
+
+fn node_set_align_self(sc: *mut Scene, i: usize, a: u32) {
+    (*sc).nodes[i].align_self = a
+}
+
+// Eine feste Groesse. 0 oder weniger heisst "gemessen".
+fn node_set_size(sc: *mut Scene, i: usize, w: f64, h: f64) {
+    (*sc).nodes[i].fix_w = w
+    (*sc).nodes[i].fix_h = h
+}
+
+fn node_set_viewport(sc: *mut Scene, i: usize, v: *mut viewport.Viewport) {
+    (*sc).nodes[i].vp = v as u64
+}
+
+fn node_viewport(sc: *mut Scene, i: usize) -> *mut viewport.Viewport {
+    return (*sc).nodes[i].vp as *mut viewport.Viewport
+}
+
+fn node_style(sc: *mut Scene, i: usize) -> *mut style.Style {
+    return widget.w_style(&(*sc).nodes[i].e)
+}
+
+fn node_decl(sc: *mut Scene, i: usize) -> *mut sheet.Decl {
+    return &(*sc).nodes[i].d
+}
+
+fn node_pref_w(sc: *mut Scene, i: usize) -> f64 { return (*sc).nodes[i].pw }
+fn node_pref_h(sc: *mut Scene, i: usize) -> f64 { return (*sc).nodes[i].ph }
+fn node_x(sc: *mut Scene, i: usize) -> f64 { return (*sc).nodes[i].x }
+fn node_y(sc: *mut Scene, i: usize) -> f64 { return (*sc).nodes[i].y }
+fn node_w(sc: *mut Scene, i: usize) -> f64 { return (*sc).nodes[i].w }
+fn node_h(sc: *mut Scene, i: usize) -> f64 { return (*sc).nodes[i].h }
+
+// ======================================================================
+// DURCHGANG 1: DER STIL
+// ======================================================================
+//
+// Fuer jeden Knoten wird die KETTE seiner Vorfahren als
+// sheet.NodeDesc gebaut (Wurzel zuerst) und sheet.sheet_resolve
+// gefragt. Danach erbt der Knoten von seinem Elternteil, was vererbbar
+// ist -- und NUR das; die Grenze zieht sheet.decl_inherit.
+//
+// Das Ergebnis landet als style.Style am Widget des Knotens. Ab hier
+// ist der Stil eines Knotens nichts Besonderes mehr: render.draw_base
+// liest ihn wie bei jedem anderen Widget dieser Bibliothek.
+fn scene_desc(sc: *mut Scene, i: usize) -> sheet.NodeDesc {
+    let nd: *mut Node = &(*sc).nodes[i]
+    var d: sheet.NodeDesc = sheet.desc_new(desc_kind_of(sc, i), (*nd).id)
+    var k: usize = 0
+    while k < (*nd).ncls {
+        sheet.desc_add_class(&d, (*nd).cls[k])
+        k = k + 1
+    }
+    sheet.desc_set_state(&d, widget.w_state(&(*nd).e))
+    return d
+}
+
+// DIE ART, NACH DER EINE REGEL AUSWAEHLT. Bei einem Widget-Knoten ist
+// das die Art des Widgets (Knopf, Karte, Reiter) -- danach will ein
+// Stilblatt auswaehlen. Bei allen anderen die Art des Knotens, um
+// 1000 verschoben, damit sich die beiden Zahlenraeume nicht
+// ueberschneiden.
+fn desc_kind_of(sc: *mut Scene, i: usize) -> u32 {
+    let nd: *mut Node = &(*sc).nodes[i]
+    if (*nd).kind == N_WIDGET {
+        return widget.w_kind(&(*nd).e)
+    }
+    return 1000 as u32 + (*nd).kind
+}
+
+fn style_walk(sc: *mut Scene, sh: *mut sheet.Sheet, i: usize,
+    chain: *mut sheet.NodeDesc, depth: usize) {
+    if i == SCENE_NONE || i >= (*sc).n || depth >= sheet.CHAIN_MAX {
+        return
+    }
+    *((chain as u64 + (depth * 56) as u64) as *mut sheet.NodeDesc) =
+        scene_desc(sc, i)
+    var d: sheet.Decl = sheet.decl_new()
+    sheet.sheet_resolve(sh, chain, depth + 1, &d)
+    let nd: *mut Node = &(*sc).nodes[i]
+    if (*nd).parent != SCENE_NONE {
+        sheet.decl_inherit(&d, &(*sc).nodes[(*nd).parent].d)
+    }
+    (*nd).d = d
+    *widget.w_style(&(*nd).e) = *sheet.decl_style(&(*nd).d)
+    var c: usize = (*nd).first
+    while c != SCENE_NONE {
+        style_walk(sc, sh, c, chain, depth + 1)
+        c = (*sc).nodes[c].next
+    }
+}
+
+fn scene_style(sc: *mut Scene, sh: *mut sheet.Sheet) {
+    if (*sc).root == SCENE_NONE {
+        return
+    }
+    var chain: [sheet.NodeDesc; 16] =
+        [sheet.desc_new(0 as u32, 0 as u32); 16]
+    style_walk(sc, sh, (*sc).root, &chain[0], 0)
+    (*sc).phase = PHASE_STYLE
+}
+
+// ======================================================================
+// DURCHGANG 2: MESSEN
+// ======================================================================
+//
+// Von unten nach oben. Ein Blatt fragt render.pref_of -- dasselbe
+// Mess-Protokoll, das jedes Widget dieser Bibliothek benutzt. Ein Kasten
+// fragt flex.flex_measure_main/_cross ueber seine schon gemessenen
+// Kinder. Ein Scheibenkasten meldet die Groesse SEINES AUSSCHNITTS, nicht
+// die seines Inhalts -- das ist ja gerade sein Zweck.
+fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
+    if i == SCENE_NONE || i >= (*sc).n {
+        return
+    }
+    var k: usize = (*sc).nodes[i].first
+    while k != SCENE_NONE {
+        measure_node(sc, c, k)
+        k = (*sc).nodes[k].next
+    }
+    let nd: *mut Node = &(*sc).nodes[i]
+    var pw: f64 = 0.0
+    var ph: f64 = 0.0
+    if (*nd).kind == N_VIEWPORT && (*nd).vp != 0 {
+        let v: *mut viewport.Viewport = (*nd).vp as *mut viewport.Viewport
+        pw = viewport.viewport_w(v)
+        ph = viewport.viewport_h(v)
+    } else if (*nd).nkids == 0 {
+        render.pref_of(c, &(*nd).e, &pw, &ph)
+    } else {
+        var items: [flex.FlexItem; 32] = [flex.flex_item(0, 0); 32]
+        let n: usize = fill_items(sc, i, &items[0])
+        let zeile: bool = is_row(&(*nd).fb)
+        let m: i64 = flex.flex_measure_main(&(*nd).fb, &items[0], n)
+        let q: i64 = flex.flex_measure_cross(&(*nd).fb, &items[0], n)
+        if zeile {
+            pw = m as f64
+            ph = q as f64
+        } else {
+            pw = q as f64
+            ph = m as f64
+        }
+    }
+    if (*nd).fix_w > 0.0 {
+        pw = (*nd).fix_w
+    }
+    if (*nd).fix_h > 0.0 {
+        ph = (*nd).fix_h
+    }
+    (*nd).pw = pw
+    (*nd).ph = ph
+    widget.w_set_pref(&(*nd).e, pw, ph)
+}
+
+fn is_row(fb: *mut flex.FlexBox) -> bool {
+    return (*fb).dir == flex.FLEX_ROW || (*fb).dir == flex.FLEX_ROW_REVERSE
+}
+
+// Aus den gemessenen Kindern werden FlexItems. Die Umrechnung f64 ->
+// ganzzahlige Basis macht flex.flex_item_from_pref, und zwar als
+// einzige Stelle -- wer hier selbst rundet, bekommt zwei Kaesten mit
+// demselben Text in zwei Breiten.
+fn fill_items(sc: *mut Scene, i: usize, items: *mut flex.FlexItem) -> usize {
+    let nd: *mut Node = &(*sc).nodes[i]
+    let zeile: bool = is_row(&(*nd).fb)
+    var c: usize = (*nd).first
+    var n: usize = 0
+    while c != SCENE_NONE && n < KIDS_MAX {
+        let kid: *mut Node = &(*sc).nodes[c]
+        var it: flex.FlexItem = flex.flex_item_from_pref((*kid).pw,
+            (*kid).ph, zeile)
+        var b: i64 = it.basis
+        if (*kid).basis >= 0 {
+            b = (*kid).basis
+        }
+        flex.item_set_flex(&it, (*kid).grow, (*kid).shrink, b)
+        flex.item_set_align(&it, (*kid).align_self)
+        *((items as u64 + (n * 64) as u64) as *mut flex.FlexItem) = it
+        n = n + 1
+        c = (*kid).next
+    }
+    return n
+}
+
+fn scene_measure(sc: *mut Scene, c: *mut render.Ctx) {
+    if (*sc).root == SCENE_NONE {
+        return
+    }
+    measure_node(sc, c, (*sc).root)
+    (*sc).phase = PHASE_MEASURE
+}
+
+// ======================================================================
+// DURCHGANG 3: ANORDNEN
+// ======================================================================
+//
+// Von oben nach unten: der Wurzel wird der Platz gegeben, und
+// flex.flex_layout verteilt ihn auf die Kinder. Die Rechtecke, die
+// herauskommen, sind ABSOLUT (Fensterkoordinaten) -- auch innerhalb
+// eines Scheibenkastens, wo die Rollposition schon eingerechnet ist.
+// Darum trifft `scene_hit` ohne eine zweite Rechnung, und darum genuegt
+// nach dem Rollen ein erneutes `scene_layout`.
+fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
+    y: f64, w: f64, h: f64) {
+    if i == SCENE_NONE || i >= (*sc).n {
+        return
+    }
+    let nd: *mut Node = &(*sc).nodes[i]
+    (*nd).x = x
+    (*nd).y = y
+    (*nd).w = w
+    (*nd).h = h
+    widget.w_place(&(*nd).e, x, y, w, h)
+    if (*nd).nkids == 0 {
+        return
+    }
+    // Der Scheibenkasten: seine Kinder bekommen den INHALT als Platz,
+    // verschoben um die Rollposition.
+    var ox: f64 = x
+    var oy: f64 = y
+    var iw: f64 = w
+    var ih: f64 = h
+    if (*nd).kind == N_VIEWPORT && (*nd).vp != 0 {
+        let v: *mut viewport.Viewport = (*nd).vp as *mut viewport.Viewport
+        viewport.viewport_set_rect(v, x, y, w, h)
+        ox = viewport.viewport_content_x(v)
+        oy = viewport.viewport_content_y(v)
+        iw = viewport.viewport_content_w(v)
+        ih = viewport.viewport_content_h(v)
+    }
+    var items: [flex.FlexItem; 32] = [flex.flex_item(0, 0); 32]
+    let n: usize = fill_items(sc, i, &items[0])
+    var out: [layout.Rect; 32] = [layout.rect_new(0, 0, 0, 0); 32]
+    var groessen: [i64; 32] = [0; 32]
+    var frozen: [i64; 32] = [0; 32]
+    flex.flex_layout(&(*nd).fb,
+        layout.rect_new(ox as i64, oy as i64, iw as i64, ih as i64),
+        &items[0], n, &out[0], &groessen[0], &frozen[0])
+    var k: usize = (*nd).first
+    var j: usize = 0
+    while k != SCENE_NONE && j < n {
+        layout_node(sc, c, k, layout.rect_x(&out[j]) as f64,
+            layout.rect_y(&out[j]) as f64,
+            layout.rect_w(&out[j]) as f64,
+            layout.rect_h(&out[j]) as f64)
+        k = (*sc).nodes[k].next
+        j = j + 1
+    }
+}
+
+fn scene_layout(sc: *mut Scene, c: *mut render.Ctx, x: f64, y: f64,
+    w: f64, h: f64) {
+    if (*sc).root == SCENE_NONE {
+        return
+    }
+    layout_node(sc, c, (*sc).root, x, y, w, h)
+    (*sc).phase = PHASE_LAYOUT
+}
+
+// ======================================================================
+// DURCHGANG 4: ZEICHNEN
+// ======================================================================
+//
+// Und HIER aendert sich keine Groesse mehr. `scene_draw` merkt sich vor
+// dem Malen jedes Knotens seine gemessene Groesse und vergleicht danach;
+// jede Abweichung zaehlt `drift` hoch. Eine Pruefung, die diese Zahl
+// liest, faengt den Rueckfall in "beim Malen noch schnell breiter
+// werden", bevor er im Bild steht.
+fn draw_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
+    if i == SCENE_NONE || i >= (*sc).n {
+        return
+    }
+    let nd: *mut Node = &(*sc).nodes[i]
+    let pw: f64 = (*nd).pw
+    let ph: f64 = (*nd).ph
+    let kind: u32 = (*nd).kind
+    if kind == N_VIEWPORT && (*nd).vp != 0 {
+        let v: *mut viewport.Viewport = (*nd).vp as *mut viewport.Viewport
+        // Der Grund des Ausschnitts wird VOR dem Clip gemalt, die Balken
+        // DANACH -- sonst schnitte sich der Kasten seine eigenen Balken
+        // ab.
+        render.draw_base(c, &(*nd).e)
+        if viewport.viewport_begin(c, v) {
+            var k: usize = (*nd).first
+            while k != SCENE_NONE {
+                draw_node(sc, c, k)
+                k = (*sc).nodes[k].next
+            }
+            viewport.viewport_end(c, v)
+        }
+        viewport.viewport_draw_bars(c, v)
+    } else {
+        if kind == N_BOX {
+            render.draw_base(c, &(*nd).e)
+        } else if kind == N_TEXT {
+            render.draw_label(c, &(*nd).e)
+        } else if kind == N_IMAGE || kind == N_SVG {
+            render.draw_widget_art(c, &(*nd).e)
+        } else if kind == N_WIDGET {
+            wave3.draw_any(c, &(*nd).e)
+        }
+        var k: usize = (*nd).first
+        while k != SCENE_NONE {
+            draw_node(sc, c, k)
+            k = (*sc).nodes[k].next
+        }
+    }
+    if (*nd).pw != pw || (*nd).ph != ph {
+        (*sc).drift = (*sc).drift + 1
+    }
+}
+
+fn scene_draw(sc: *mut Scene, c: *mut render.Ctx) {
+    if (*sc).root == SCENE_NONE {
+        return
+    }
+    (*sc).drift = 0
+    draw_node(sc, c, (*sc).root)
+    (*sc).phase = PHASE_DRAW
+}
+
+// ======================================================================
+// TREFFER UND SUCHE
+// ======================================================================
+//
+// Gesucht wird der OBERSTE Knoten unter dem Punkt, also der zuletzt
+// gemalte -- darum wird die Kinderliste rueckwaerts gelesen. Liegt der
+// Knoten in einem Scheibenkasten, muss der Punkt AUCH in dessen
+// sichtbarem Ausschnitt liegen: was abgeschnitten ist, kann man nicht
+// anklicken. Die Rollposition steckt bereits in den Rechtecken (siehe
+// Durchgang 3).
+fn hit_node(sc: *mut Scene, i: usize, px: f64, py: f64) -> usize {
+    if i == SCENE_NONE || i >= (*sc).n {
+        return SCENE_NONE
+    }
+    let nd: *mut Node = &(*sc).nodes[i]
+    if (*nd).kind == N_VIEWPORT && (*nd).vp != 0 {
+        let v: *mut viewport.Viewport = (*nd).vp as *mut viewport.Viewport
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        if !viewport.viewport_hit(v, px, py, &cx, &cy) {
+            return SCENE_NONE
+        }
+    }
+    if px < (*nd).x || py < (*nd).y || px >= (*nd).x + (*nd).w
+        || py >= (*nd).y + (*nd).h {
+        return SCENE_NONE
+    }
+    // Rueckwaerts: das letzte Kind liegt oben.
+    var beste: usize = SCENE_NONE
+    var k: usize = (*nd).first
+    while k != SCENE_NONE {
+        let t: usize = hit_node(sc, k, px, py)
+        if t != SCENE_NONE {
+            beste = t
+        }
+        k = (*sc).nodes[k].next
+    }
+    if beste != SCENE_NONE {
+        return beste
+    }
+    return i
+}
+
+fn scene_hit(sc: *mut Scene, px: f64, py: f64) -> usize {
+    return hit_node(sc, (*sc).root, px, py)
+}
+
+fn scene_find_id(sc: *mut Scene, id: u32) -> usize {
+    var i: usize = 0
+    while i < (*sc).n {
+        if (*sc).nodes[i].id == id {
+            return i
+        }
+        i = i + 1
+    }
+    return SCENE_NONE
+}
