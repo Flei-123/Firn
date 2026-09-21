@@ -49,6 +49,20 @@ pub enum A64 {
     /// `dup2(old, new)` -> `dup3(old, new, 0)`. Same difference: only the
     /// flag carrying form survived into the generic table.
     Dup3(u32),
+    /// ROUND C-059 (Certus): `poll(fds, n, ms)` -> `ppoll(fds, n, ts, 0, 0)`.
+    ///
+    /// The generic table has no `poll`, only `ppoll` — and that is not a
+    /// number change but a SHAPE change: the third argument is no longer a
+    /// count of milliseconds but a pointer to a `timespec {sec, nsec}`.
+    /// Writing `Direct(73)` here would hand the millisecond count to the
+    /// kernel AS AN ADDRESS; it would not fail, it would read rubbish.
+    ///
+    /// So the millisecond value is turned into a `timespec` on the stack
+    /// at the call site (see `codegen_a64.rs`). A negative timeout means
+    /// "wait forever" for `poll`, and for `ppoll` that is the NULL pointer
+    /// — which is why the constant -1 is translated as a null pointer and
+    /// a computed timeout is refused rather than guessed at.
+    PpollMs(u32),
     /// `arch_prctl(ARCH_SET_FS, p)` -> `msr tpidr_el0, p`. This one is not a
     /// system call at all here: AArch64 lets EL0 write its own thread
     /// pointer, so what costs a system call on x86 costs one instruction.
@@ -75,13 +89,17 @@ const TABLE: &[(i64, A64)] = &[
     (2, A64::AtFdcwd(56)),           // open      -> openat
     (3, A64::Direct(57)),            // close
     (5, A64::Direct(80)),            // fstat
+    // ROUND C-059 (Certus): without this line the browser is not
+    // translatable for the phone at all — `poll` sits in net/atem.fi and
+    // therefore under every socket, every TLS handshake and every HTTP
+    // request. Shape change, not just a number: see `PpollMs`.
+    (7, A64::PpollMs(73)),           // poll      -> ppoll
     (8, A64::Direct(62)),            // lseek
     (9, A64::Direct(222)),           // mmap
     (10, A64::Direct(226)),          // mprotect
     (11, A64::Direct(215)),          // munmap
     (12, A64::Direct(214)),          // brk
     (13, A64::Direct(134)),          // rt_sigaction
-    (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (14, A64::Direct(135)),          // rt_sigprocmask
     (16, A64::Direct(29)),           // ioctl
     (17, A64::Direct(67)),           // pread64
@@ -139,11 +157,18 @@ const TABLE: &[(i64, A64)] = &[
     // raten -- die geratene Zahl hat den Windows-Bau umgebracht, weil
     // dort nur 2 MiB Stapel stehen. Ohne diese Zeile ist derselbe
     // Quelltext fuer das Telefon nicht uebersetzbar.
-    (97, A64::Direct(163)),          // getrlimit
     (96, A64::Direct(169)),          // gettimeofday
+    (97, A64::Direct(163)),          // getrlimit
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
+    // RUNDE C-059: stand bis hierher zwischen 13 und 14 und hat damit die
+    // Sortierung der Tafel gebrochen (eigener Test). Nur verschoben.
+    (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
+    // RUNDE C-059 (Certus): lib/js/interp.fi setzt den Stapel des
+    // Deuters (setrlimit(RLIMIT_STACK)). Dieselbe Gestalt, andere
+    // Nummer -- die generische Tafel hat setrlimit als 164.
+    (160, A64::Direct(164)),         // setrlimit
     (186, A64::Direct(178)),         // gettid
     (200, A64::Direct(131)),         // tgkill
     (202, A64::Direct(98)),          // futex
@@ -297,7 +322,7 @@ mod tests {
     #[test]
     fn the_calls_the_library_makes_are_all_in_the_table() {
         // Exactly the numbers that appear in lib/std/*.fi and tests/*.fi.
-        for n in [0i64, 1, 2, 3, 9, 11, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 231, 288]
+        for n in [0i64, 1, 2, 3, 7, 9, 11, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 231, 288]
         {
             assert!(aarch64(n).is_some(), "syscall {} missing from the table", n);
         }

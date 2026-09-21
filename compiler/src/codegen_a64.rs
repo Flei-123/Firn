@@ -1363,6 +1363,64 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             }
             return Ok(());
         }
+        syscalls::A64::PpollMs(n) => {
+            // ROUND C-059 (Certus): poll(fds, nfds, ms)
+            //                    -> ppoll(fds, nfds, timespec*, NULL, 0)
+            //
+            // The timeout changes SHAPE. `poll` counts milliseconds in a
+            // register, `ppoll` wants the address of a
+            // `timespec { i64 sec; i64 nsec; }`. The value is therefore
+            // taken apart here and written into 16 bytes of stack.
+            //
+            // Two cases the library really writes:
+            //   * a constant -1 — "wait forever". `ppoll` says that with a
+            //     NULL pointer, not with a timespec.
+            //   * everything else — sec = ms / 1000, nsec = (ms % 1000) * 1e6.
+            //
+            // Arguments past the third have to be the padding zeroes.
+            for (k, a) in given.iter().enumerate().skip(3) {
+                if !matches!(fr.consts.get(a), Some(0)) {
+                    return Err(format!(
+                        "aarch64: poll(2) becomes ppoll; argument {} is not the padding zero",
+                        k + 1
+                    ));
+                }
+            }
+            load_full(e, fr, "x0", given[0]);
+            load_full(e, fr, "x1", given[1]);
+            match fr.consts.get(&given[2]) {
+                // "wait forever" -> NULL, no timespec at all.
+                Some(v) if *v as i64 == -1 => {
+                    e.line("mov x2, xzr");
+                }
+                _ => {
+                    // ms -> timespec on the stack. x9/x10/x11 are scratch
+                    // registers here; the frame is not touched.
+                    load_full(e, fr, "x9", given[2]);
+                    e.line("sub sp, sp, #16");
+                    // sec = ms / 1000, nsec = (ms - sec * 1000) * 1000000
+                    imm_into(e, "x10", 1000);
+                    e.line("sdiv x11, x9, x10");          // x11 = sec
+                    e.line("msub x9, x11, x10, x9");      // x9  = ms % 1000
+                    imm_into(e, "x10", 1_000_000);
+                    e.line("mul x9, x9, x10");            // x9  = nsec
+                    e.line("stp x11, x9, [sp]");
+                    e.line("mov x2, sp");
+                }
+            }
+            e.line("mov x3, xzr");                        // sigmask = NULL
+            e.line("mov x4, xzr");                        // sigsetsize = 0
+            imm_into(e, "x8", n as i64);
+            e.line("svc #0");
+            // The stack is only given back where it was taken.
+            if !matches!(fr.consts.get(&given[2]), Some(v) if *v as i64 == -1) {
+                e.line("add sp, sp, #16");
+            }
+            if let Some(d) = i.dst {
+                store_dst_ty(e, fr, d, "x0", i.ty);
+            }
+            return Ok(());
+        }
         syscalls::A64::SetThreadPointer => unreachable!(),
         syscalls::A64::Missing(why) => {
             return Err(format!("aarch64: system call {} — {}", nr, why))
