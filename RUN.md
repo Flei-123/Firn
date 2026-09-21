@@ -204,6 +204,28 @@ acceptance run did not know it. The guard is back, and the file is now
 built and measured by section 18 -- a check that fails with
 `got 10 want 7` if the guard is wrong again.
 
+The integration pass after the round found two more, both of the kind
+that breaks nothing today and something later:
+
+* **The five states stood in two files.** `lib/fui/theme.fi` declared
+  `STATE_NORMAL .. STATE_DISABLED` a second time, with the same values
+  as `lib/fui/style.fi`. The copies agreed only for as long as nobody
+  touched one of them -- and `style.fi` had already grown a sixth
+  state (`STATE_SELECTED`) that `theme.fi` never heard of. The copy is
+  gone; `theme.fi` and its one outside caller
+  (`tools/fui/preview_main.fi`) read `style.STATE_*`. Firn has no
+  cross-module constant alias (`const A: u32 = style.A` is an error),
+  so there is no way to keep a second name honest -- it had to go.
+  Proof that nothing moved: the 22 evidence pictures are byte for byte
+  identical before and after.
+* **A reason that had stopped being true.** The head of
+  `lib/fui/painter.fi` stated that `lib/svg` does not exist in the Firn
+  tree. It did not when the file was written and does since `2b82d78e`
+  -- `lib/fui/transform.fi` takes its matrix arithmetic from there. The
+  paragraph now gives the reason that actually carries (this layer
+  draws straight into the rasteriser, `svg.pfad` builds and keeps a
+  path object) and says where the rule points instead.
+
 **One command checks all of it:**
 
 ```sh
@@ -272,25 +294,75 @@ compiler/target/release/firnc --opt-level=dev -o /tmp/anim tools/fui/anim_main.f
 /tmp/anim
 ```
 
-## 4d. The state of `bash test.sh` (measured 2026-09-20)
+## 4d. The state of `bash test.sh` (re-measured 2026-09-21)
 
 `test.sh` runs 59 sections and takes roughly an hour and a half. It has
 to be started with **`bash`**, not `sh`: line 216 uses `set -o pipefail`.
+Measured on the state of this branch, from a compiler rebuilt from
+source:
+
+```
+FAIL 4/1592 failed:
+
+  tools/fixpoint.sh failed (see .test-work/fixpoint.log)
+  tools/js/run.sh failed (see .test-work/js.log)
+  tools/english/check.sh reports German identifiers (see .test-work/english.log)
+  tools/fmt/run.sh failed (see .test-work/fmt.log)
+```
+
 All 533 `tests/*.fi` pass in all four build stages (`opt`, `noopt`,
-`devfast`, `safe`). Four sections fail, and none of them is the UI
-library -- they are named here so that nobody has to find that out
-twice:
+`devfast`, `safe`). Four sections fail. Not one of them is a
+CALCULATION of the UI library -- no measured value in `lib/fui` is
+wrong -- but two of them ARE made worse by this round, which the
+previous version of this section got wrong. They are named here so
+that nobody has to find that out twice:
 
 | Section | Fails because |
 |---|---|
 | `tools/fixpoint.sh` | `lib/firnc1/gctext.fi` does not match `lib/gc/*.fi` (`tools/gen_gctext.sh` was not re-run) |
 | `tools/js/run.sh` | `testdata/test262/subset.sha256` is missing from the tree |
-| `tools/english/check.sh` | 324 German identifiers; 224 of them in `lib/svg`, which came in as a port in `2b82d78e` |
-| `tools/fmt/run.sh` | 51 files are not in canonical `firnfmt` shape, among them long-standing ones like `lib/fui/core.fi`, `control.fi`, `render.fi` and `demos/choropleth/main.fi` |
+| `tools/english/check.sh` | 357 German identifiers; 223 of them in `lib/svg` (a port, `2b82d78e`), the other **134 in fUi files of this round** |
+| `tools/fmt/run.sh` | 54 files are not in canonical `firnfmt` shape -- **including files this round wrote** |
 
-That each of these is older than the UI-WEB round can be read off the
-failures themselves: every one of them names files that the round never
-touched. The fifth failure, round 95, **is** fixed -- see section 4e.
+**Two of the four fail partly BECAUSE of this round, and an earlier
+version of this section wrongly claimed that none of them did.** The
+claim was "every one of them names files that the round never touched";
+that is false, and the logs say so:
+
+* `.test-work/english.log` ends on `German identifiers: 357`. Counted
+  out of the log, 223 of those lines mention `lib/svg` and the
+  remaining **134 are fUi and `demos/fuidemo` alone** -- `zyklus` in
+  `lib/fui/anim.fi`, `LUECKE` in `tools/fui/anim_main.fi`, `SCHRITT`
+  in `demos/fuidemo/main.fi`, and so on. The round was told to take
+  over the style of the modules around it, and those modules are half
+  German; it did, and the counter went up.
+* `.test-work/fmt.log` names `lib/fui/anim.fi`, `effect.fi`, `flex.fi`
+  and `demos/fuidemo/main.fi`. Counted with `firnfmt -c`, about 47 of
+  the 54 are fUi or `lib/svg` files.
+
+Neither is a wrong number in a picture or a check that does not hold --
+`sh tools/fui/run.sh --images` passes in full. They are house-style
+debts, and they are written down here rather than rounded off.
+
+It is left as debt on purpose, and the reason is checkable in ten
+seconds:
+
+```sh
+compiler/target/release/firnc --opt-level=dev -o /tmp/firnfmt tools/fmt/firnfmt.fi
+/tmp/firnfmt lib/fui/flex.fi | diff -u lib/fui/flex.fi -
+```
+
+The formatter pulls aligned trailing comments up against the field
+(`basis: i64, // flex-basis ...` instead of a column) and **de-indents
+continuation lines** -- a wrapped expression comes back at the
+indentation of the statement above it, which reads like a new
+statement. On `flex.fi` that is the whole diff: 24 lines, not one of
+them an improvement. Running `firnfmt -w` over the tree would trade
+readable code for a green check, and this tree values the first more.
+That is a decision about the formatter, not about the code, and it is
+why long-standing files like `lib/fui/core.fi` have never been
+formatted either. The fifth failure, round 95, **is** fixed -- see
+section 4e.
 
 ## 4e. Rebuilding the Unicode table
 
