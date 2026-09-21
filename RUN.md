@@ -294,7 +294,7 @@ The set is refreshed from the run with
 
 ```sh
 sh tools/fui/run.sh --images
-sh tools/fui/belege_uebernehmen.sh
+sh tools/fui/collect_shots.sh
 ```
 
 The second script holds the table "which painted picture becomes which

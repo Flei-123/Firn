@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: MPL-2.0
-# tools/fui/belege_uebernehmen.sh -- DIE BELEGE IN DEN BAUM UEBERNEHMEN.
+# tools/fui/collect_shots.sh -- DIE BELEGE IN DEN BAUM UEBERNEHMEN.
 #
 # `tools/fui/run.sh --images` malt zweiundzwanzig Bilder nach
 # $BELEGE (Vorgabe: $W/belege). Ausgeliefert wird dieselbe Menge unter
@@ -15,7 +15,7 @@
 # vergessen (oder umgekehrt), und am Ende lieferte der Baum ein Bild
 # aus, das kein Programm mehr malt.
 #
-#     sh tools/fui/belege_uebernehmen.sh
+#     sh tools/fui/collect_shots.sh
 #
 # W und BELEGE wirken wie in run.sh.
 set -e
@@ -25,7 +25,7 @@ Z="${BELEGE:-$W/belege}"
 ZIEL=".gauntlet-shots"
 
 if [ ! -d "$Z" ]; then
-    echo "belege_uebernehmen: \"$Z\" gibt es nicht."
+    echo "collect_shots: \"$Z\" gibt es nicht."
     echo "Erst malen: sh tools/fui/run.sh --images"
     exit 1
 fi
@@ -62,11 +62,11 @@ for e in $TAFEL; do
     ziel="${e%%:*}"
     quelle="${e#*:}"
     if [ ! -r "$Z/$quelle.png" ]; then
-        echo "belege_uebernehmen: \"$Z/$quelle.png\" fehlt."
+        echo "collect_shots: \"$Z/$quelle.png\" fehlt."
         echo "Der Belegsatz waere unvollstaendig -- Abbruch."
         exit 1
     fi
     cp "$Z/$quelle.png" "$ZIEL/$ziel.png"
     n=$((n + 1))
 done
-echo "belege_uebernehmen: $n Bilder nach $ZIEL uebernommen."
+echo "collect_shots: $n Bilder nach $ZIEL uebernommen."
