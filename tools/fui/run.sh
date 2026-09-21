@@ -595,6 +595,18 @@ if [ "$1" = "--images" ]; then
     "$W/gallery9" "$Z/fui-deklarativ-dunkel.png" dark
     beleg "$Z/fui-deklarativ-hell.png" 1240 700 740 200 40 1
     beleg "$Z/fui-deklarativ-dunkel.png" 1240 700 740 200 40 1
+    # UND DIESELBE SEITE SCHMAL. Das ist der eigentliche Beweis der
+    # Beschreibung: NICHTS am Baum und nichts am Stilblatt aendert
+    # sich, nur die Leinwand ist 980 statt 1240 Punkte breit -- die
+    # Karten werden schmaler, die Werkzeugleiste verteilt neu, und die
+    # Seite rechnet ihre eigenen Zusagen noch einmal nach (kein Text
+    # laeuft aus seinem Kasten, kein Punkt aus dem Ausschnitt). Eine
+    # gemalte Fassung muesste dafuer jede Koordinate anfassen.
+    kette gallery9 980
+    "$W/gallery9" "$Z/fui-deklarativ-schmal-hell.png" light - 980
+    "$W/gallery9" "$Z/fui-deklarativ-schmal-dunkel.png" dark - 980
+    beleg "$Z/fui-deklarativ-schmal-hell.png" 980 700 740 200 40 1
+    beleg "$Z/fui-deklarativ-schmal-dunkel.png" 980 700 740 200 40 1
     # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
     # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
     # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet

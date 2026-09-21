@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/fui/collect_shots.sh -- DIE BELEGE IN DEN BAUM UEBERNEHMEN.
 #
-# `tools/fui/run.sh --images` malt vierundzwanzig Bilder nach
+# `tools/fui/run.sh --images` malt sechsundzwanzig Bilder nach
 # $BELEGE (Vorgabe: $W/belege). Ausgeliefert wird dieselbe Menge unter
 # .gauntlet-shots/, in LESEREIHENFOLGE nummeriert -- ein Pruefer, der
 # den Lauf nicht startet, soll die Bilder in der Reihenfolge sehen, in
@@ -57,6 +57,8 @@ TAFEL="
 22-preview-zustaende-dunkel:fui-preview-dunkel
 23-deklarativ-scene-sheet-hell:fui-deklarativ-hell
 24-deklarativ-scene-sheet-dunkel:fui-deklarativ-dunkel
+25-deklarativ-schmal-980px-hell:fui-deklarativ-schmal-hell
+26-deklarativ-schmal-980px-dunkel:fui-deklarativ-schmal-dunkel
 "
 
 n=0
