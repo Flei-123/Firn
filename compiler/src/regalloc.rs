@@ -1993,6 +1993,9 @@ struct Ra<'a> {
     /// value -> source value. The rest of the computation sits in the memory
     /// operand of the following access.
     preloader: HashMap<Val, Val>,
+    /// RUNDE TEMPO 3 -- Summen, in denen die Skalierung des Index steckt:
+    /// Wert -> (Grundregister, Indexregister, Faktor). Ein einziges `lea`.
+    scale: HashMap<Val, (&'static str, &'static str, i64)>,
     /// RUNDE TEMPO 2 -- die UEBERGABE. Gleitzahlen, die kein Register
     /// bekommen haben, deren einziger Leser aber kurz darauf im selben Block
     /// steht: sie gehen durch `xmm2`/`xmm3` statt durch den Rahmen. Siehe
@@ -2092,13 +2095,27 @@ fn foldable_addresses(
     f: &Func,
     a: &Alloc,
     read: &[u32],
-) -> (HashMap<Val, Address>, std::collections::HashSet<Val>, HashMap<Val, Val>) {
+) -> (
+    HashMap<Val, Address>,
+    std::collections::HashSet<Val>,
+    HashMap<Val, Val>,
+    HashMap<Val, (&'static str, &'static str, i64)>,
+) {
     use std::collections::HashSet;
     let mut out: HashMap<Val, Address> = HashMap::new();
     let mut away: HashSet<Val> = HashSet::new();
     let mut before: HashMap<Val, Val> = HashMap::new();
+    // RUNDE TEMPO 3 -- die SKALIERUNG IN DIE ADRESSRECHNUNG.
+    //
+    // Ein Basiszeiger, den MEHRERE Zugriffe benutzen, kann nicht in den
+    // Operanden eines einzelnen Befehls wandern (dafuer ist `out` da). Die
+    // Skalierung des Index aber schon: `lea d, [base + idx*4]` rechnet
+    // dasselbe wie `lea t, [idx*4]` gefolgt von `lea d, [base + t]` -- in
+    // einem Befehl statt zwei. Gemessen in der heissen Schleife der
+    // Synthesefilterbank: dort steht dieses Paar zweimal je Durchlauf.
+    let mut scale: HashMap<Val, (&'static str, &'static str, i64)> = HashMap::new();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
-        return (out, away, before);
+        return (out, away, before, scale);
     }
     // Does the value simply lie in a register — without special handling?
     let pure_reg = |v: Val| -> Option<&'static str> {
@@ -2253,7 +2270,71 @@ fn foldable_addresses(
             }
         }
     }
-    (out, away, before)
+    // ---- zweiter Durchgang: die Skalierung in die Summe ziehen ---------
+    //
+    // Bedingungen, alle noetig:
+    //   * die Summe ist eine Adressrechnung mit voller Breite und hat selbst
+    //     KEINE Faltung bekommen (sonst waere der Befehl schon weg),
+    //   * der skalierte Teil steht UNMITTELBAR davor und wird nur hier
+    //     gelesen -- dann darf er ganz entfallen, ohne dass sich an den
+    //     Lebensdauern etwas aendert,
+    //   * Grundwert und Index liegen in Registern.
+    if std::env::var_os("FIRN_NO_SKALA").is_none() {
+        for b in &f.blocks {
+            for (idx, i) in b.insts.iter().enumerate() {
+                let d = match i.dst {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if out.contains_key(&d) || away.contains(&d) || before.contains_key(&d) {
+                    continue;
+                }
+                if f.is_secret(d) || a.alias.contains_key(&d) || a.cell(d).is_some() {
+                    continue;
+                }
+                let (base, off) = match &i.op {
+                    Op::PtrAdd { base, off } => (*base, *off),
+                    Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (*x, *y),
+                    _ => continue,
+                };
+                if idx == 0 || read.get(off as usize).copied() != Some(1) {
+                    continue;
+                }
+                if away.contains(&off) || out.contains_key(&off) || before.contains_key(&off) {
+                    continue;
+                }
+                if f.is_secret(off) || a.alias.contains_key(&off) || a.cell(off).is_some() {
+                    continue;
+                }
+                let p = &b.insts[idx - 1];
+                if p.dst != Some(off) || p.ty.bits() != 64 {
+                    continue;
+                }
+                let skal = match &p.op {
+                    Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
+                        Some(k) if (1..=3).contains(&k) => Some((*xi, 1i64 << k)),
+                        _ => None,
+                    },
+                    Op::Bin(BinOp::Mul, xi, ki) => match a.imm(*ki) {
+                        Some(k) if [2, 4, 8].contains(&k) => Some((*xi, k)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let (xi, fact) = match skal {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let (br, ir) = match (pure_reg(base), pure_reg(xi)) {
+                    (Some(br), Some(ir)) => (br, ir),
+                    _ => continue,
+                };
+                scale.insert(d, (br, ir, fact));
+                away.insert(off);
+            }
+        }
+    }
+    (out, away, before, scale)
 }
 
 /// Counts per value how often it appears as an operand (instructions, terminators).
@@ -3206,9 +3287,9 @@ fn fp_handover(
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let read = count_reads(f);
-    let (offset, skipped, preloader) = foldable_addresses(f, a, &read);
+    let (offset, skipped, preloader, scale) = foldable_addresses(f, a, &read);
     let fp_hand = fp_handover(f, a, &read);
-    let ra = Ra { f, a, read, offset, skipped, preloader, fp_hand };
+    let ra = Ra { f, a, read, offset, skipped, preloader, fp_hand, scale };
     // ROUND 72: one label counter per function (panic_rt.rs::SiteCounter).
     let mut site = crate::panic_rt::SiteCounter::new(&f.name);
     e.raw("");
@@ -4300,6 +4381,18 @@ fn emit_inst(
         }
         Op::Bin(op, x, y) => {
             let d = i.dst.ok_or("internal error: binary operation without target")?;
+            // RUNDE TEMPO 3: die Summe MIT Skalierung -- ein `lea`.
+            if let Some((br, ir, fact)) = ra.scale.get(&d).copied() {
+                let target = match ra.a.loc(d) {
+                    Loc::Reg(r) => r,
+                    Loc::Slot(_) => "rax",
+                };
+                e.line(&format!("lea {}, [{}+{}*{}]", target, br, ir, fact));
+                if matches!(ra.a.loc(d), Loc::Slot(_)) {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             // Round 51: address computation that sits in the following memory
             // access (`add` as address forming, `shl`/`mul` as scaling of the index).
             if let Some(src) = ra.preloader.get(&d).copied() {
@@ -4700,6 +4793,18 @@ fn emit_inst(
         }
         Op::PtrAdd { base, off } => {
             let d = i.dst.ok_or("internal error: ptradd without target")?;
+            // RUNDE TEMPO 3: siehe `Op::Bin` -- dieselbe Faltung.
+            if let Some((br, ir, fact)) = ra.scale.get(&d).copied() {
+                let target = match ra.a.loc(d) {
+                    Loc::Reg(r) => r,
+                    Loc::Slot(_) => "rax",
+                };
+                e.line(&format!("lea {}, [{}+{}*{}]", target, br, ir, fact));
+                if matches!(ra.a.loc(d), Loc::Slot(_)) {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             if let Some(src) = ra.preloader.get(&d).copied() {
                 if let Loc::Reg(r) = ra.a.loc(d) {
                     ra.load_full(e, r, src);
