@@ -297,6 +297,7 @@ pub(crate) fn block_label(fname: &str, b: u32) -> String {
 }
 
 pub fn emit(m: &Module) -> Result<String, String> {
+    crate::fpool::reset();
     let mut e = Emitter {
         out: String::new(),
         cold: String::new(),
@@ -408,6 +409,15 @@ pub fn emit(m: &Module) -> Result<String, String> {
             e.forget_loc();
         }
         e.raw(&crate::panic_rt::trampoline_asm());
+    }
+    // RUNDE TEMPO 6: der Vorrat der Gleitzahl-Konstanten (`fpool.rs`). Er
+    // steht am Ende, weil er erst beim Erzeugen der Funktionen entsteht.
+    if crate::fpool::any() {
+        if dwarf::with_lines() {
+            e.raw("    .loc 1 0 0");
+            e.forget_loc();
+        }
+        e.raw(&crate::fpool::rodata_asm());
     }
     // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
     // (round 89, SPEC 14.1.statics) — only when the program declares a

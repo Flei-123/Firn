@@ -403,6 +403,9 @@ pub struct Alloc {
     imms: HashMap<Val, i64>,
     /// `alloca` values with a fixed frame offset (addressing without a detour).
     frame_addr: HashMap<Val, u64>,
+    /// RUNDE TEMPO 6: Gleitzahl-Konstanten, die als SPEICHEROPERAND aus
+    /// `.rodata` gelesen werden. Sie brauchen weder Register noch Platz.
+    fconst: HashMap<Val, (String, bool)>,
     /// promoted `alloca` cells: pointer value -> register
     cells: HashMap<Val, &'static str>,
     /// access width per promoted cell
@@ -1266,6 +1269,7 @@ pub fn allocate(f: &Func) -> Alloc {
         alias_src: HashMap::new(),
         imms: HashMap::new(),
         frame_addr: HashMap::new(),
+        fconst: HashMap::new(),
         cells: HashMap::new(),
         cell_ty: HashMap::new(),
         saved: Vec::new(),
@@ -1301,6 +1305,56 @@ pub fn allocate(f: &Func) -> Alloc {
     };
     let depth = loop_depth(f);
     let cells = promotable_cells(f);
+
+    // RUNDE TEMPO 6 -- GLEITZAHL-KONSTANTEN IN DEN VORRAT.
+    //
+    // Sie brauchen dann weder Register noch Platz: jede Verwendung liest sie
+    // als Speicheroperand aus `.rodata`. Bedingung: der Wert wird NUR im
+    // Fliesskommaweg der Ausgabe angefasst (sonst holte ihn jemand mit `mov`
+    // aus einem Platz, den es nicht gibt) und ist nicht `secret`.
+    let mut fconst: HashMap<Val, (String, bool)> = HashMap::new();
+    let nur_hier = match std::env::var("FIRN_FPOOL_ONLY") {
+        Ok(v) => f.name.contains(&v),
+        Err(_) => true,
+    };
+    if std::env::var_os("FIRN_NO_FPOOL").is_none() && nur_hier {
+        let fp_ok_pre = fp_taugt(f);
+        // ROUND 92 GILT AUCH HIER: nach der Aufloesung der `phi`-Knoten darf
+        // ein Wert MEHRMALS geschrieben werden -- eine Schleifenvariable, die
+        // bei `1.0` beginnt, hat den `const` im Vorkopf und eine Kopie auf der
+        // Rueckwaertskante, beide auf DENSELBEN Wert. Wer so einen Wert in den
+        // Vorrat legt, liest in der Schleife ewig die 1.0 -- gemessen:
+        // `math.powi(2.0, 10)` gab 1.0 statt 1024.0. Also nur Werte mit GENAU
+        // EINER Schreibstelle (dieselbe Regel wie in `immediate_consts`).
+        let mut defs: HashMap<Val, u32> = HashMap::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Some(d) = i.dst {
+                    *defs.entry(d).or_insert(0) += 1;
+                }
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
+                    if !i.ty.is_float() || f.is_secret(d) {
+                        continue;
+                    }
+                    if defs.get(&d).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    if (d as usize) >= nv || !fp_ok_pre[d as usize] {
+                        continue;
+                    }
+                    let single = i.ty == FTy::F32;
+                    let bits = i.ty.truncate(*c) as u64
+                        & if single { 0xffff_ffff } else { u64::MAX };
+                    let label = crate::fpool::intern(bits, single);
+                    fconst.insert(d, (label, single));
+                }
+            }
+        }
+    }
 
     // RUNDE TEMPO 2 -- FLIESSKOMMA-ZELLEN IN EIN `xmm`.
     //
@@ -1529,6 +1583,9 @@ pub fn allocate(f: &Func) -> Alloc {
     for v in 0..nv {
         if !sse_class(f.val_ty(v as Val)) || !fp_ok[v] {
             continue;
+        }
+        if fconst.contains_key(&(v as Val)) {
+            continue; // steht in `.rodata`, braucht kein Register (fpool.rs)
         }
         if start[v] == usize::MAX || f.is_secret(v as Val) {
             continue;
@@ -1814,6 +1871,7 @@ pub fn allocate(f: &Func) -> Alloc {
             alloc.locs[*v as usize] = Loc::Reg(r);
         }
     }
+    alloc.fconst = fconst;
     let read = count_reads(f);
     let mut nbuf = Vec::new();
     if std::env::var("FIRN_NO_ALIAS").is_err() {
@@ -2445,6 +2503,9 @@ impl<'a> Ra<'a> {
     /// als zweiten Operanden unmittelbar an, also braucht keiner der beiden
     /// Faelle eine Hilfsanweisung.
     fn fpo(&self, v: Val, single: bool) -> String {
+        if let Some((label, _)) = self.a.fconst.get(&v) {
+            return crate::fpool::operand(label, single);
+        }
         if let Some(r) = self.fp_hand.get(&v) {
             return (*r).to_string();
         }
@@ -2565,6 +2626,15 @@ impl<'a> Ra<'a> {
         }
         if let Some(off) = self.a.frame_addr.get(&v) {
             return format!("[rbp-{}]", off);
+        }
+        // RUNDE TEMPO 6: liegt die Adresse schon in einem Register, ist sie
+        // der Speicheroperand. Bis hierher wurde sie IMMER erst nach `rcx`
+        // kopiert -- ein `mov` vor jedem Zugriff, gemessen neun Stueck allein
+        // in `l3_dct3_9`.
+        if self.a.imm(v).is_none() && self.a.cell(v).is_none() && !self.a.alias.contains_key(&v) {
+            if let Loc::Reg(r) = self.a.place(v) {
+                return format!("[{}]", r);
+            }
         }
         self.load_full(e, "rcx", v);
         "[rcx]".to_string()
@@ -4494,6 +4564,9 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: const without target")?;
             let single = ty == FTy::F32;
             let bits = ty.truncate(*c) as i64;
+            if ra.a.fconst.contains_key(&d) {
+                return Ok(()); // steht in `.rodata` (fpool.rs)
+            }
             if let Some(r) = ra.fp_hand.get(&d) {
                 if bits == 0 {
                     e.line(&format!("xorps {}, {}", r, r));
@@ -4531,10 +4604,14 @@ fn emit_inst(
         Op::Copy { src } if ty.is_float() => {
             let d = i.dst.ok_or("internal error: copy without target")?;
             let single = ty == FTy::F32;
-            match (ra.a.loc(d), ra.a.place(*src)) {
+            // RUNDE TEMPO 6: NICHT nach `place()` fragen, sondern nach
+            // `fpo()` -- eine Konstante aus dem Vorrat hat gar keinen Platz,
+            // sondern steht in `.rodata`.
+            let o = ra.fpo(*src, single);
+            match (ra.a.loc(d), is_xmm_reg(&o)) {
                 (Loc::Reg(r), _) => ra.fp_into(e, r, *src, single),
-                (Loc::Slot(_), Loc::Reg(sr)) => ra.fp_out(e, d, sr, single),
-                (Loc::Slot(_), Loc::Slot(_)) => {
+                (Loc::Slot(_), true) => ra.fp_out(e, d, &o, single),
+                (Loc::Slot(_), false) => {
                     ra.fp_into(e, "xmm0", *src, single);
                     ra.fp_out(e, d, "xmm0", single);
                 }
