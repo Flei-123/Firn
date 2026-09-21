@@ -350,6 +350,11 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::Add32 => bin(e, fr, "add", "4s", need(dst)?, args[0], args[1]),
         SimdKind::Add64 => bin(e, fr, "add", "2d", need(dst)?, args[0], args[1]),
         SimdKind::Sub32 => bin(e, fr, "sub", "4s", need(dst)?, args[0], args[1]),
+        // RUNDE TEMPO 4: vier `f32` auf einmal. NEON schreibt die Breite an
+        // den Befehl, x86 in den Namen -- dasselbe Rechnen.
+        SimdKind::AddF32 => bin(e, fr, "fadd", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::SubF32 => bin(e, fr, "fsub", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::MulF32 => bin(e, fr, "fmul", "4s", need(dst)?, args[0], args[1]),
         // --- shuffling and shifting ------------------------------------
         // `pshufb`: an index with its top bit set writes a zero octet, and
         // only the low four bits count otherwise. `tbl` writes a zero for

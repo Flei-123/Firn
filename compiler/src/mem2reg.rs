@@ -671,7 +671,11 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
             (true, Some(t)) => t,
             _ => continue,
         };
-        if ty == FTy::Void || ty == FTy::V128 {
+        // RUNDE TEMPO 4: `v128` darf jetzt mit. Bis hierher war es
+        // ausgeschlossen, weil die Kopie, die `phi.rs` daraus macht, auf dem
+        // Grundweg als Ganzzahlkopie ausgegeben wurde (acht von sechzehn
+        // Oktetten). Beide Wege koennen sie jetzt.
+        if ty == FTy::Void {
             continue;
         }
         for &(bi, ii) in &u.loads {

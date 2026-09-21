@@ -485,9 +485,25 @@ fn vexify(s: &str) -> Option<String> {
             }
             Some(format!("v{} {}, {}, {}", mn, ops[0], ops[0], ops[1]))
         }
+        // RUNDE TEMPO 4: die gepackten Rechnungen, auch zweistellig mit dem
+        // Ziel als erster Quelle.
+        "addps" | "subps" | "mulps" | "divps" | "minps" | "maxps" => {
+            if ops.len() != 2 {
+                return None;
+            }
+            Some(format!("v{} {}, {}, {}", mn, ops[0], ops[0], ops[1]))
+        }
+        // Dreistellig und schon in der richtigen Form: nur der Name aendert
+        // sich (`pshufd d, s, imm`).
+        "pshufd" => {
+            if ops.len() != 3 {
+                return None;
+            }
+            Some(format!("v{} {}, {}, {}", mn, ops[0], ops[1], ops[2]))
+        }
         // Reine Kopien und Vergleiche: dieselbe Zahl von Operanden.
-        "movaps" | "movapd" | "movups" | "ucomiss" | "ucomisd" | "comiss" | "comisd"
-        | "cvttss2si" | "cvttsd2si" | "movd" | "movq" => {
+        "movaps" | "movapd" | "movups" | "movdqu" | "movdqa" | "ucomiss" | "ucomisd"
+        | "comiss" | "comisd" | "cvttss2si" | "cvttsd2si" | "movd" | "movq" => {
             if ops.len() != 2 {
                 return None;
             }
@@ -1367,6 +1383,12 @@ fn emit_inst(
         // already share one.
         Op::Copy { src } => {
             let d = i.dst.ok_or("internal error: copy without target")?;
+            // RUNDE TEMPO 4: ein `v128` ist sechzehn Oktette breit -- `mov rax`
+            // haette die obere Haelfte liegen lassen.
+            if ty == FTy::V128 {
+                crate::simd::emit_copy_v128(e, fr, d, *src);
+                return Ok(());
+            }
             load_full(e, fr, "rax", *src);
             store_dst(e, fr, d, "rax");
         }

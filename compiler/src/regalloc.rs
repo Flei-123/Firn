@@ -99,9 +99,30 @@ const FP_POOL: [&str; 12] = [
     "xmm13", "xmm14", "xmm15",
 ];
 
+/// RUNDE TEMPO 4 -- die Vektorbefehle, die DIESER Weg selbst ausgeben kann.
+/// Alles andere schickt `unsupported_basic` weiter auf den Grundweg.
+pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
+    use crate::simd::SimdKind as K;
+    matches!(
+        k,
+        K::Load | K::Store | K::Zero | K::AddF32 | K::SubF32 | K::MulF32 | K::Shuffle32
+    )
+}
+
+/// Gehoert dieser Typ in die SSE-Klasse (Gleitzahl oder Vektor)?
+fn sse_class(t: FTy) -> bool {
+    t.is_float() || t == FTy::V128
+}
+
 /// Ist dieser Platz ein SSE-Register?
 pub(crate) fn is_xmm(r: &str) -> bool {
     r.starts_with("xmm")
+}
+
+/// Ist dieser OPERAND genau ein Register? (`xmmword ptr [...]` faengt auch mit
+/// `xmm` an -- deshalb diese zweite Frage.)
+fn is_xmm_reg(o: &str) -> bool {
+    o.starts_with("xmm") && !o.contains(' ')
 }
 /// caller-saved register for intervals that enclose NO `call`/`syscall`:
 /// in that case neither the call itself nor the build-up of its argument
@@ -439,8 +460,18 @@ fn layout(f: &Func, extra_slots: u64) -> (Frame, Vec<(&'static str, u64)>) {
     let n = f.val_types.len();
     let mut slot = vec![0u64; n];
     let mut cursor = 0u64;
-    for s in slot.iter_mut() {
-        cursor += 8;
+    for (idx, s) in slot.iter_mut().enumerate() {
+        // RUNDE TEMPO 4: ein `v128` braucht SECHZEHN Oktette, und zwar
+        // sechzehnfach ausgerichtet, damit `movaps` sie erreicht. `rbp` steht
+        // nach dem Vorspann auf einem Vielfachen von sechzehn (System V: `rsp`
+        // ist beim Aufruf 16-ausgerichtet, die Ruecksprungadresse und `rbp`
+        // machen zusammen wieder sechzehn) -- ein Abstand, der ein Vielfaches
+        // von sechzehn ist, genuegt also.
+        if f.val_types.get(idx) == Some(&FTy::V128) {
+            cursor = align_up(cursor + 16, 16);
+        } else {
+            cursor += 8;
+        }
         *s = cursor;
     }
     let mut alloca_off: Vec<Option<u64>> = vec![None; n];
@@ -1133,7 +1164,7 @@ fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Optio
 /// Aufrufargument dient.
 fn fp_taugt(f: &Func) -> Vec<bool> {
     let nv = f.val_types.len();
-    let mut ok: Vec<bool> = (0..nv).map(|v| f.val_ty(v as Val).is_float()).collect();
+    let mut ok: Vec<bool> = (0..nv).map(|v| sse_class(f.val_ty(v as Val))).collect();
     // RUNDE TEMPO: ein Fliesskomma-PARAMETER darf jetzt in seinem Register
     // bleiben. Der Vorspann kann das laengst (`Loc::Reg` oben, eine
     // `movaps`-Kopie oder gar nichts); ausgeschlossen war er nur, weil der
@@ -1152,7 +1183,9 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 let def_ok = matches!(
                     &inst.op,
                     Op::Const(_) | Op::Bin(..) | Op::Cast { .. } | Op::Load { .. } | Op::Copy { .. }
-                ) || matches!(&inst.op, Op::Un(UnOp::Neg, _));
+                ) || matches!(&inst.op, Op::Un(UnOp::Neg, _))
+                    // RUNDE TEMPO 4: die Vektorbefehle dieses Weges.
+                    || matches!(&inst.op, Op::Simd { kind, .. } if v128_ra_kind(*kind));
                 if !def_ok && (d as usize) < nv {
                     ok[d as usize] = false;
                 }
@@ -1180,6 +1213,9 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 // -- aber nur, wenn die Anweisung selbst eine Gleitzahl
                 // speichert.
                 Op::Store { .. } => inst.ty.is_float(),
+                // RUNDE TEMPO 4: `__v128_store` liest seinen Wert hier, die
+                // Adresse ist eine Ganzzahl und faellt nicht unter `ok`.
+                Op::Simd { kind, .. } => v128_ra_kind(*kind),
                 _ => false,
             };
             if !use_ok {
@@ -1386,7 +1422,7 @@ pub fn allocate(f: &Func) -> Alloc {
         if cells.contains_key(&(v as Val)) {
             continue; // is treated as a cell
         }
-        if f.val_ty(v as Val).is_float() {
+        if sse_class(f.val_ty(v as Val)) {
             continue; // ROUND XMM3: eigene Klasse, eigener Durchgang unten
         }
         if alloc.imms.contains_key(&(v as Val)) || alloc.frame_addr.contains_key(&(v as Val)) {
@@ -1471,7 +1507,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // `xmm` als Ganzzahlregister behandeln.
     let mut fp_ivs: Vec<Iv> = Vec::new();
     for v in 0..nv {
-        if !f.val_ty(v as Val).is_float() || !fp_ok[v] {
+        if !sse_class(f.val_ty(v as Val)) || !fp_ok[v] {
             continue;
         }
         if start[v] == usize::MAX || f.is_secret(v as Val) {
@@ -2399,6 +2435,49 @@ impl<'a> Ra<'a> {
             }
         }
     }
+    // ---- RUNDE TEMPO 4: dieselben drei Helfer fuer `v128` ---------------
+    //
+    // Unterschied zur Gleitzahl: sechzehn Oktette breit, und der Platz ist
+    // sechzehnfach ausgerichtet (`layout`), also darf `movaps` ihn lesen.
+    fn vo(&self, v: Val) -> String {
+        match self.a.place(v) {
+            Loc::Reg(r) => r.to_string(),
+            Loc::Slot(off) => format!("xmmword ptr [rbp-{}]", off),
+        }
+    }
+    fn v_work(&self, d: Val) -> &'static str {
+        match self.a.loc(d) {
+            Loc::Reg(r) => r,
+            Loc::Slot(_) => "xmm0",
+        }
+    }
+    fn v_into(&self, e: &mut Emitter, x: &str, v: Val) {
+        let o = self.vo(v);
+        if o == x {
+            return;
+        }
+        e.line(&format!("movaps {}, {}", x, o));
+    }
+    fn v_out(&self, e: &mut Emitter, d: Val, x: &str) {
+        match self.a.loc(d) {
+            Loc::Reg(r) => {
+                if r != x {
+                    e.line(&format!("movaps {}, {}", r, x));
+                }
+            }
+            Loc::Slot(off) => e.line(&format!("movaps xmmword ptr [rbp-{}], {}", off, x)),
+        }
+    }
+    /// Den Wert in einem Register liefern -- entweder liegt er schon in einem,
+    /// oder er kommt ins Kratzregister.
+    fn v_reg(&self, e: &mut Emitter, v: Val, scratch: &'static str) -> String {
+        let o = self.vo(v);
+        if is_xmm_reg(&o) {
+            return o;
+        }
+        e.line(&format!("movaps {}, {}", scratch, o));
+        scratch.to_string()
+    }
     /// Den Wert in ein bestimmtes `xmm` holen (fuer die Kratzregister der
     /// Umwandlungen und Vergleiche).
     fn fp_into(&self, e: &mut Emitter, x: &str, v: Val, single: bool) {
@@ -3072,14 +3151,52 @@ fn unsupported_basic(f: &Func) -> Option<String> {
             }
         }
     }
-    // ROUND 82: `v128` is a second register class of its own (xmm) with
-    // sixteen byte slots. The linear scan hands out integer registers only —
-    // a function with a vector value therefore goes over the base path of
-    // `codegen_x86.rs`, which has the xmm value cache of `simd.rs`.
-    if f.val_types.iter().any(|t| *t == FTy::V128) || f.params.iter().any(|t| *t == FTy::V128)
-        || f.ret == FTy::V128
-    {
-        return Some("v128 in the value set".into());
+    // ROUND 82 hat jede Funktion mit einem `v128` auf den Grundweg geschickt.
+    //
+    // RUNDE TEMPO 4 laesst eine ENGE Auswahl herein: die Befehle, die der
+    // Tondekoder braucht (`__v128_load`, `__v128_store`, `__v128_zero`,
+    // `addps`/`subps`/`mulps`, `pshufd`). Fuer sie steht die Ausgabe unten in
+    // diesem Weg, und dann bekommt auch der Rest der Funktion -- die ganze
+    // Adressrechnung -- ihre Registerzuteilung. Alles andere (Krypto,
+    // Byteschieben, die Ein- und Ausgaenge einzelner Spuren) geht weiterhin
+    // ueber den Grundweg mit dem Zwischenspeicher aus `simd.rs`.
+    //
+    // Ein `v128` als Parameter oder Rueckgabewert bleibt draussen: das waere
+    // Arbeit an der Aufrufkonvention, und der Dekoder braucht es nicht.
+    if f.params.iter().any(|t| *t == FTy::V128) || f.ret == FTy::V128 {
+        return Some("v128 as parameter or result".into());
+    }
+    if f.val_types.iter().any(|t| *t == FTy::V128) {
+        for b in &f.blocks {
+            for i in &b.insts {
+                let v_dabei = i.ty == FTy::V128
+                    || {
+                        let mut buf = Vec::new();
+                        i.op.uses(&mut buf);
+                        buf.iter().any(|u| f.val_ty(*u) == FTy::V128)
+                    };
+                if !v_dabei {
+                    continue;
+                }
+                match &i.op {
+                    Op::Simd { kind, .. } => {
+                        if !v128_ra_kind(*kind) {
+                            return Some("vector instruction outside the narrow set".into());
+                        }
+                    }
+                    Op::Copy { .. } => {}
+                    // Laden und Schreiben eines ganzen Vektors -- kommt von
+                    // einer `alloca`, die nicht befoerdert wurde.
+                    Op::Load { .. } | Op::Store { .. } => {}
+                    _ => return Some("v128 in an instruction this path cannot emit".into()),
+                }
+            }
+            if let Term::Ret(Some(v)) = &b.term {
+                if f.val_ty(*v) == FTy::V128 {
+                    return Some("v128 as result".into());
+                }
+            }
+        }
     }
     if f.blocks.is_empty() {
         return Some("no blocks".into());
@@ -3124,7 +3241,8 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                         crate::simd::SimdKind::Crc32U8
                             | crate::simd::SimdKind::Crc32U64
                             | crate::simd::SimdKind::CpuFeatures
-                    ) {
+                    ) && !v128_ra_kind(*kind)
+                    {
                         return Some("vector instruction".into());
                     }
                 }
@@ -4192,6 +4310,101 @@ fn emit_inst(
 ) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
+        // RUNDE TEMPO 4 -- DIE VEKTORBEFEHLE, DIE DIESER WEG SELBST AUSGIBT.
+        //
+        // Gerechnet wird im Zielregister, wenn der Wert eines hat, sonst in
+        // `xmm0`; `xmm1` ist das zweite Kratzregister. Geladen und geschrieben
+        // wird mit `movdqu` (der Zeiger kommt aus dem Programm und verspricht
+        // keine Ausrichtung), zwischen Register und Platz mit `movaps` (der
+        // Platz IST ausgerichtet, siehe `layout`).
+        Op::Simd { kind, args, imm } if v128_ra_kind(*kind) => {
+            use crate::simd::SimdKind as K;
+            match kind {
+                K::Load => {
+                    let d = i.dst.ok_or("internal error: v128 load without target")?;
+                    let mem = ra.addr_mem(e, args[0]);
+                    let w = ra.v_work(d);
+                    e.line(&format!("movdqu {}, xmmword ptr {}", w, mem));
+                    ra.v_out(e, d, w);
+                }
+                K::Store => {
+                    // ZUERST der Wert ins Kratzregister, DANN die Adresse --
+                    // `addr_mem` darf `rax`/`rcx` benutzen, das stoert kein xmm.
+                    let q = ra.v_reg(e, args[1], "xmm0");
+                    let mem = ra.addr_mem(e, args[0]);
+                    e.line(&format!("movdqu xmmword ptr {}, {}", mem, q));
+                }
+                K::Zero => {
+                    let d = i.dst.ok_or("internal error: v128 zero without target")?;
+                    let w = ra.v_work(d);
+                    e.line(&format!("xorps {}, {}", w, w));
+                    ra.v_out(e, d, w);
+                }
+                K::AddF32 | K::SubF32 | K::MulF32 => {
+                    let d = i.dst.ok_or("internal error: vector arithmetic without target")?;
+                    let m = match kind {
+                        K::AddF32 => "addps",
+                        K::SubF32 => "subps",
+                        _ => "mulps",
+                    };
+                    let w = ra.v_work(d);
+                    if crate::target::avx() {
+                        let sa = ra.v_reg(e, args[0], "xmm0");
+                        let sb = ra.vo(args[1]);
+                        e.line(&format!("v{} {}, {}, {}", m, w, sa, sb));
+                        ra.v_out(e, d, w);
+                    } else {
+                        // Liegt der zweite Operand im Zielregister, wird er
+                        // vorher gerettet -- sonst ueberschriebe ihn die Kopie
+                        // des ersten.
+                        let mut ob = ra.vo(args[1]);
+                        if is_xmm_reg(&ob) && ob == w {
+                            e.line(&format!("movaps xmm1, {}", ob));
+                            ob = "xmm1".to_string();
+                        }
+                        ra.v_into(e, w, args[0]);
+                        e.line(&format!("{} {}, {}", m, w, ob));
+                        ra.v_out(e, d, w);
+                    }
+                }
+                K::Shuffle32 => {
+                    let d = i.dst.ok_or("internal error: shuffle without target")?;
+                    let sa = ra.v_reg(e, args[0], "xmm1");
+                    let w = ra.v_work(d);
+                    e.line(&format!("pshufd {}, {}, {}", w, sa, imm));
+                    ra.v_out(e, d, w);
+                }
+                _ => return Err("internal error: unexpected vector instruction".to_string()),
+            }
+        }
+        // RUNDE TEMPO 4: ein ganzer Vektor aus dem Speicher und zurueck.
+        // `movdqu`, weil die Adresse aus dem Programm kommt (eine `alloca`
+        // von vier `f32` ist nur vierfach ausgerichtet).
+        Op::Load { addr } if ty == FTy::V128 => {
+            let d = i.dst.ok_or("internal error: load without target")?;
+            let mem = ra.addr_mem(e, *addr);
+            let w = ra.v_work(d);
+            e.line(&format!("movdqu {}, xmmword ptr {}", w, mem));
+            ra.v_out(e, d, w);
+        }
+        Op::Store { addr, val } if ty == FTy::V128 => {
+            let q = ra.v_reg(e, *val, "xmm0");
+            let mem = ra.addr_mem(e, *addr);
+            e.line(&format!("movdqu xmmword ptr {}, {}", mem, q));
+        }
+        // RUNDE TEMPO 4: eine Kopie eines Vektorwertes (kommt aus der
+        // Auflösung der `phi`-Knoten).
+        Op::Copy { src } if ty == FTy::V128 => {
+            let d = i.dst.ok_or("internal error: copy without target")?;
+            match (ra.a.loc(d), ra.a.place(*src)) {
+                (Loc::Reg(r), _) => ra.v_into(e, r, *src),
+                (Loc::Slot(_), Loc::Reg(sr)) => ra.v_out(e, d, sr),
+                (Loc::Slot(_), Loc::Slot(_)) => {
+                    ra.v_into(e, "xmm0", *src);
+                    ra.v_out(e, d, "xmm0");
+                }
+            }
+        }
         // ROUND 82: only the three vector instructions with a SCALAR result
         // reach this path (`supported()` keeps the rest away). They compute in
         // rax/rcx, which are never the home of a value here.

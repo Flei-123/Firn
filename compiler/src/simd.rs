@@ -135,6 +135,15 @@ pub enum SimdKind {
     Add32,
     Add64,
     Sub32,
+    // --- RUNDE TEMPO 4: Fliesskomma, vier `f32` auf einmal ------------
+    //
+    // Nur die drei Grundrechnungen, die der Tondekoder braucht, und sie
+    // rechnen JE SPUR genau das, was der einzelne Befehl auch rechnet
+    // (`addps` ist viermal `addss`) -- deshalb bleibt eine ausgerollte
+    // Schleife, die auf vier Spuren umgestellt wird, bitgleich.
+    AddF32,
+    SubF32,
+    MulF32,
     // --- shuffling and shifting ---------------------------------------
     ShuffleB,
     Shuffle32,
@@ -240,6 +249,9 @@ static TABLE: &[Sig] = &[
     s("__v128_add32", SimdKind::Add32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_add64", SimdKind::Add64, &[P::V, P::V], None, Some(P::V)),
     s("__v128_sub32", SimdKind::Sub32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_addf32", SimdKind::AddF32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_subf32", SimdKind::SubF32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_mulf32", SimdKind::MulF32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle8", SimdKind::ShuffleB, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle32", SimdKind::Shuffle32, &[P::V], Some(255), Some(P::V)),
     s("__v128_alignr", SimdKind::AlignR, &[P::V, P::V], Some(31), Some(P::V)),
@@ -1139,6 +1151,9 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::Add32 => bin(e, fr, "paddd", need(dst)?, args[0], args[1]),
         SimdKind::Add64 => bin(e, fr, "paddq", need(dst)?, args[0], args[1]),
         SimdKind::Sub32 => bin(e, fr, "psubd", need(dst)?, args[0], args[1]),
+        SimdKind::AddF32 => bin(e, fr, "addps", need(dst)?, args[0], args[1]),
+        SimdKind::SubF32 => bin(e, fr, "subps", need(dst)?, args[0], args[1]),
+        SimdKind::MulF32 => bin(e, fr, "mulps", need(dst)?, args[0], args[1]),
         SimdKind::ShuffleB => bin(e, fr, "pshufb", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo32 => bin(e, fr, "punpckldq", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "punpckhdq", need(dst)?, args[0], args[1]),
@@ -1231,6 +1246,22 @@ pub(crate) fn emit_ptr_store(e: &mut Emitter, fr: &Frame, addr: Val, val: Val) {
     let rv = xget(e, fr, val);
     load_full(e, fr, "rax", addr);
     e.line(&format!("movdqu xmmword ptr [rax], {}", rv));
+}
+
+/// RUNDE TEMPO 4 -- die KOPIE eines `v128`.
+///
+/// Sie entsteht, seit `mem2reg` auch Vektorvariablen befoerdert: aus den
+/// `phi`-Knoten macht `phi.rs` Kopien. Der Grundweg hatte dafuer nur den
+/// Ganzzahlweg (`mov rax`), und der haette die oberen acht Oktette liegen
+/// lassen. Hier geht sie durch den Zwischenspeicher, wie jede andere
+/// Vektoranweisung auch.
+pub(crate) fn emit_copy_v128(e: &mut Emitter, fr: &Frame, d: Val, src: Val) {
+    let r = xget(e, fr, src);
+    let rd = xdef(e, fr, d);
+    if rd != r {
+        e.line(&format!("movdqa {}, {}", rd, r));
+    }
+    xstore(e, fr, d, rd);
 }
 
 /// `__cpu_features()` — the `cpuid` sequence, result in `rax`.
