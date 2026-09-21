@@ -1122,7 +1122,7 @@ fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Optio
 /// Nur die, deren Erzeugung UND jede Verwendung im Fliesskommaweg der
 /// Ausgabe steht. Der Grund ist kein Misstrauen gegen den Zuteiler, sondern
 /// die Bauart des Erzeugers: an vielen Stellen steht `ra.load_full(e,
-/// "rax", v)`, und das erzeugt `mov rax, <platz von v>`. Stuende dort ein
+/// "rax", v)`, und das defines `mov rax, <platz von v>`. Stuende dort ein
 /// `xmm`, waere das ein stiller Fehler. Ein Wert, der irgendwo anders
 /// angefasst wird, bleibt deshalb auf seinem Platz -- dort ist er fuer
 /// jeden Weg lesbar.
@@ -1149,11 +1149,11 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
     for b in &f.blocks {
         for inst in &b.insts {
             if let Some(d) = inst.dst {
-                let erzeugt_gut = matches!(
+                let def_ok = matches!(
                     &inst.op,
                     Op::Const(_) | Op::Bin(..) | Op::Cast { .. } | Op::Load { .. } | Op::Copy { .. }
                 ) || matches!(&inst.op, Op::Un(UnOp::Neg, _));
-                if !erzeugt_gut && (d as usize) < nv {
+                if !def_ok && (d as usize) < nv {
                     ok[d as usize] = false;
                 }
             }
@@ -1171,7 +1171,7 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
             // Es zaehlt deshalb nicht die Art der Anweisung, sondern ob sie
             // WIRKLICH im Fliesskommaweg steht -- also genau die Bedingung,
             // unter der die Ausgabe unten ihren Fliesskomma-Zweig nimmt.
-            let liest_gut = match &inst.op {
+            let use_ok = match &inst.op {
                 Op::Bin(..) | Op::Copy { .. } => inst.ty.is_float(),
                 Op::Un(UnOp::Neg, _) => inst.ty.is_float(),
                 Op::Cmp { ty, .. } => ty.is_float(),
@@ -1182,7 +1182,7 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 Op::Store { .. } => inst.ty.is_float(),
                 _ => false,
             };
-            if !liest_gut {
+            if !use_ok {
                 buf.clear();
                 inst.op.uses(&mut buf);
                 for u in buf.iter() {
@@ -1260,7 +1260,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // jeder Wert, der aus ihr geladen wird, nur im Fliesskommaweg der Ausgabe
     // gelesen wird (`fp_taugt` -- dieselbe Bedingung, die den Fehler aus
     // Runde XMM 3 abgestellt hat: die Aufrufkonvention kopiert Verbunde
-    // achtbyteweise und liest eine `f64` dabei mit `mov`).
+    // achtbyteweise und reads eine `f64` dabei mit `mov`).
     let fp_ok = fp_taugt(f);
     let mut fp_cells: std::collections::HashSet<Val> = std::collections::HashSet::new();
     if std::env::var_os("FIRN_NO_FP_CELLS").is_none() {
@@ -1465,7 +1465,7 @@ pub fn allocate(f: &Func) -> Alloc {
 
     // ROUND XMM3 -- die Fliesskommawerte, getrennt gesammelt. `fp_taugt`
     // sagt, welche ueberhaupt in Frage kommen: ein Wert bekommt nur dann ein
-    // `xmm`, wenn JEDE Stelle, die ihn erzeugt oder liest, im Fliesskommaweg
+    // `xmm`, wenn JEDE Stelle, die ihn defines oder reads, im Fliesskommaweg
     // der Ausgabe steht. Alles andere bleibt auf seinem Platz und wird
     // gelesen wie bisher -- so kann kein Weg im Erzeuger versehentlich ein
     // `xmm` als Ganzzahlregister behandeln.
@@ -2373,13 +2373,13 @@ impl<'a> Ra<'a> {
     /// `alloca`, dessen Adresse fest im Rahmen steht (`frame_addr`), hat
     /// GAR KEINEN Platz, in dem die Adresse stuende -- sie wird an jeder
     /// Verwendung als `[rbp-off]` eingesetzt. Wer sie mit `load_full` in ein
-    /// Register holen will, liest einen nie beschriebenen Platz und springt
+    /// Register holen will, reads einen nie beschriebenen Platz und springt
     /// ins Nichts.
     fn addr_mem(&self, e: &mut Emitter, v: Val) -> String {
         // Eine Adressrechnung, die ganz in den Speicherzugriff gewandert ist
         // (`foldable_addresses`), steht in KEINEM Register und in keinem
         // Platz -- sie ist nur noch dieser Text. Wer sie stattdessen laedt,
-        // liest einen nie beschriebenen Platz.
+        // reads einen nie beschriebenen Platz.
         if let Some(a) = self.offset.get(&v) {
             return a.text();
         }
@@ -3137,13 +3137,13 @@ fn fp_handover(
                 continue;
             }
             // Der Erzeuger muss im Fliesskommaweg der Ausgabe stehen.
-            let erzeugt = match &i.op {
+            let defines = match &i.op {
                 Op::Bin(..) | Op::Copy { .. } | Op::Load { .. } | Op::Const(_) => true,
                 Op::Un(UnOp::Neg, _) => true,
                 Op::Cast { from, .. } => from.is_float() || i.ty.is_float(),
                 _ => false,
             };
-            if !erzeugt {
+            if !defines {
                 continue;
             }
             // Den EINEN Leser suchen: im selben Block, hoechstens `FENSTER`
@@ -3164,7 +3164,7 @@ fn fp_handover(
                 uses.clear();
                 n.op.uses(&mut uses);
                 if uses.contains(&d) {
-                    let liest = match &n.op {
+                    let reads = match &n.op {
                         Op::Bin(..) | Op::Copy { .. } => n.ty.is_float(),
                         Op::Un(UnOp::Neg, _) => n.ty.is_float(),
                         Op::Cmp { ty, .. } => ty.is_float(),
@@ -3172,7 +3172,7 @@ fn fp_handover(
                         Op::Store { val, .. } => n.ty.is_float() && *val == d,
                         _ => false,
                     };
-                    if liest {
+                    if reads {
                         leser = Some(j);
                     }
                     break;
@@ -3184,14 +3184,14 @@ fn fp_handover(
         }
         // Zwei Register, gierig nach Beginn: ein Kandidat bekommt eines, wenn
         // es bis zu seinem Leser frei ist. Ueberschneidungen gibt es sonst
-        // wirklich -- `t1` wird erzeugt, dann `t2`, und erst danach werden
+        // wirklich -- `t1` wird defines, dann `t2`, und erst danach werden
         // beide gelesen.
-        let mut belegt: Vec<usize> = vec![0; hand.len()];
+        let mut busy_until: Vec<usize> = vec![0; hand.len()];
         for (s0, e0, d) in cand.into_iter() {
             let mut genommen = None;
             for k in 0..hand.len() {
-                if belegt[k] <= s0 {
-                    belegt[k] = e0;
+                if busy_until[k] <= s0 {
+                    busy_until[k] = e0;
                     genommen = Some(k);
                     break;
                 }
@@ -3240,7 +3240,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let mut int_i = 0usize;
     let mut sse_i = 0usize;
     let mut stack_i = 0usize;
-    let mut aus_stapel: Vec<(usize, u64)> = Vec::new();
+    let mut from_stack: Vec<(usize, u64)> = Vec::new();
     for (i, t) in f.params.iter().enumerate() {
         if t.is_float() {
             if sse_i < crate::codegen_x86::SSE_REGS.len() {
@@ -3275,11 +3275,11 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         // Kein Register der eigenen Klasse mehr frei: der Wert liegt im
         // Rahmen des AUFRUFERS, ab [rbp+16], in der Reihenfolge der
         // Uebergabe.
-        aus_stapel.push((i, 16 + 8 * stack_i as u64));
+        from_stack.push((i, 16 + 8 * stack_i as u64));
         stack_i += 1;
     }
     parallel_reg_moves(e, &prolog_moves);
-    for (i, of) in aus_stapel {
+    for (i, of) in from_stack {
         let t = f.params[i];
         if t.is_float() {
             let single = t == FTy::F32;
@@ -4259,7 +4259,7 @@ fn emit_inst(
         Op::Store { addr, val } if ty.is_float() && ra.a.cell(*addr).is_none() => {
             let single = ty == FTy::F32;
             let o = ra.fpo(*val, single);
-            let quelle = if is_xmm(&o) {
+            let source = if is_xmm(&o) {
                 o
             } else {
                 ra.fp_into(e, "xmm0", *val, single);
@@ -4271,7 +4271,7 @@ fn emit_inst(
                 if single { "movss" } else { "movsd" },
                 if single { "dword" } else { "qword" },
                 mem,
-                quelle
+                source
             ));
         }
         Op::Const(c) => {
@@ -4536,7 +4536,7 @@ fn emit_inst(
             }
             if ty.is_float() {
                 // Ganzzahl -> Fliesskomma. Die Quelle wird auf 64 Bit
-                // gebracht; `cvtsi2ss/sd` liest vorzeichenbehaftet.
+                // gebracht; `cvtsi2ss/sd` reads vorzeichenbehaftet.
                 ra.load_ext(e, "rax", *src, *from, 64);
                 let w = ra.fp_work(d);
                 e.line(&format!(
