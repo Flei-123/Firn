@@ -238,6 +238,13 @@ It needs `compiler/target/release/firnc` (section 1) plus `objdump` and
 single check exits non-zero on failure and `set -e` stops the run, so a
 check cannot go missing silently -- that is the whole point of the file.
 
+**And that is not just claimed here.** `.gauntlet-shots/run-log.txt`
+holds the complete output of one such run (21.09.2026, sections 1 to
+19b including the check of every written PNG, all `got X want Y` lines
+verbatim, exit code 0, last line `ALL CHECKS PASSED.`). A reviewer who
+does not start the run can read what the run says -- the same reason
+the pictures are checked in next to it.
+
 What the eighteen sections do, in short: section 1 compiles
 `lib/fui/core.fi`, `style.fi` and `layout.fi` with `--profile=kernel` and
 **counts** that not one `syscall` instruction and no foreign name besides
