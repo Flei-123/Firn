@@ -78,7 +78,7 @@ export {
     node_set_flex, node_set_gap, node_set_padding, node_set_wrap,
     node_set_grow, node_set_basis, node_set_align_self,
     node_set_size, node_set_viewport, node_viewport,
-    node_style, node_decl,
+    node_set_draw, node_style, node_decl,
     node_pref_w, node_pref_h, node_x, node_y, node_w, node_h,
     scene_style, scene_measure, scene_layout, scene_draw,
     scene_phase, scene_size_drift, scene_desc,
@@ -98,6 +98,7 @@ import fui.flex
 import fui.painter
 import fui.render
 import fui.anim
+import fui.transform
 import fui.wave3
 import fui.uiimage
 import fui.uisvg
@@ -118,7 +119,11 @@ const N_WIDGET: u32 = 5
 const N_VIEWPORT: u32 = 6
 
 const SCENE_MAX: usize = 128
-const KIDS_MAX: usize = 32
+// Wie viele Kinder EIN Kasten verteilt. Es ist genau flex.FLEX_MAX --
+// mehr nimmt `flex_layout` in einem Aufruf nicht an, und weniger waere
+// eine zweite, stillere Schranke. Eine Liste mit vierzig Zeilen in
+// einem Scheibenkasten ist der Normalfall, nicht die Ausnahme.
+const KIDS_MAX: usize = 64
 const SCENE_NONE: usize = 4294967295
 
 // Die Durchgaenge, als Zahlen, damit eine Pruefung sie benennen kann.
@@ -159,6 +164,13 @@ struct Node {
     // Das Ergebnis der Durchgaenge.
     pw: f64,
     ph: f64,
+    // WAS BEIM MESSEN HERAUSKAM, festgehalten. `mw`/`mh` sind die
+    // Groessen, mit denen der Durchgang 2 fertig wurde; `scene_draw`
+    // vergleicht sie danach gegen das, was beim Malen dasteht. Ohne
+    // diesen Abzug waere die Drift-Wache eine Behauptung: sie kann nur
+    // melden, was sie vorher notiert hat.
+    mw: f64,
+    mh: f64,
     x: f64,
     y: f64,
     w: f64,
@@ -168,6 +180,22 @@ struct Node {
     // ueberlebt den Baum, denn die Rollposition darf ein neuer Aufbau
     // nicht vergessen.
     vp: u64,
+    // DER EIGENE MALER. Ein Knoten darf zusaetzlich zu seiner Art etwas
+    // malen, das diese Bibliothek nicht kennt -- ein Diagramm, eine
+    // Karte, eine Messkurve. Er bekommt den Zeichenkontext und SEIN
+    // Widget (also seine schon angeordnete Flaeche) und malt hinein.
+    // Was er NICHT darf, ist seine Groesse aendern; genau das faengt
+    // die Wache in `scene_draw`, und tools/fui/scene_main.fi weist es
+    // mit einem absichtlich falschen Maler nach.
+    dr: fn(u64, *mut render.Ctx, *mut widget.Widget),
+    du: u64,
+    has_dr: u32,
+}
+
+// Der Maler, den ein Knoten hat, solange ihm niemand einen gibt. Er
+// malt nichts -- ein Feld vom Typ `fn` braucht einen Wert, und ein
+// Nullzeiger waere einer, den man vor jedem Aufruf pruefen muesste.
+fn draw_none(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
 }
 
 struct Scene {
@@ -187,7 +215,9 @@ fn node_blank() -> Node {
         fb: flex.flexbox_new(flex.FLEX_COLUMN),
         grow: 0, shrink: 1000, basis: 0 - 1, align_self: flex.AL_AUTO,
         fix_w: 0.0, fix_h: 0.0,
-        pw: 0.0, ph: 0.0, x: 0.0, y: 0.0, w: 0.0, h: 0.0, vp: 0,
+        pw: 0.0, ph: 0.0, mw: 0.0, mh: 0.0,
+        x: 0.0, y: 0.0, w: 0.0, h: 0.0, vp: 0,
+        dr: draw_none, du: 0, has_dr: 0 as u32,
     }
 }
 
@@ -410,6 +440,18 @@ fn node_viewport(sc: *mut Scene, i: usize) -> *mut viewport.Viewport {
     return (*sc).nodes[i].vp as *mut viewport.Viewport
 }
 
+// EINEN EIGENEN MALER ANHAENGEN. Er laeuft NACH dem, was die Art des
+// Knotens malt, und innerhalb eines Scheibenkastens auch innerhalb
+// dessen Clip -- er kann also nicht aus dem Ausschnitt herauslaufen.
+// `ud` reicht der Aufrufer sich selbst durch; dieses Modul sieht die
+// Zahl nie an.
+fn node_set_draw(sc: *mut Scene, i: usize, ud: u64,
+    f: fn(u64, *mut render.Ctx, *mut widget.Widget)) {
+    (*sc).nodes[i].dr = f
+    (*sc).nodes[i].du = ud
+    (*sc).nodes[i].has_dr = 1 as u32
+}
+
 fn node_style(sc: *mut Scene, i: usize) -> *mut style.Style {
     return widget.w_style(&(*sc).nodes[i].e)
 }
@@ -522,7 +564,7 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     } else if (*nd).nkids == 0 {
         render.pref_of(c, &(*nd).e, &pw, &ph)
     } else {
-        var items: [flex.FlexItem; 32] = [flex.flex_item(0, 0); 32]
+        var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
         let n: usize = fill_items(sc, i, &items[0])
         let zeile: bool = is_row(&(*nd).fb)
         let m: i64 = flex.flex_measure_main(&(*nd).fb, &items[0], n)
@@ -543,6 +585,8 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     }
     (*nd).pw = pw
     (*nd).ph = ph
+    (*nd).mw = pw
+    (*nd).mh = ph
     widget.w_set_pref(&(*nd).e, pw, ph)
 }
 
@@ -622,11 +666,11 @@ fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
         iw = viewport.viewport_content_w(v)
         ih = viewport.viewport_content_h(v)
     }
-    var items: [flex.FlexItem; 32] = [flex.flex_item(0, 0); 32]
+    var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
     let n: usize = fill_items(sc, i, &items[0])
-    var out: [layout.Rect; 32] = [layout.rect_new(0, 0, 0, 0); 32]
-    var groessen: [i64; 32] = [0; 32]
-    var frozen: [i64; 32] = [0; 32]
+    var out: [layout.Rect; 64] = [layout.rect_new(0, 0, 0, 0); 64]
+    var groessen: [i64; 64] = [0; 64]
+    var frozen: [i64; 64] = [0; 64]
     flex.flex_layout(&(*nd).fb,
         layout.rect_new(ox as i64, oy as i64, iw as i64, ih as i64),
         &items[0], n, &out[0], &groessen[0], &frozen[0])
@@ -660,13 +704,52 @@ fn scene_layout(sc: *mut Scene, c: *mut render.Ctx, x: f64, y: f64,
 // jede Abweichung zaehlt `drift` hoch. Eine Pruefung, die diese Zahl
 // liest, faengt den Rueckfall in "beim Malen noch schnell breiter
 // werden", bevor er im Bild steht.
+// WAS EIN KNOTEN SELBST MALT -- seine Art, und danach sein eigener
+// Maler. Die Kinder kommen in `draw_node`, denn ein Scheibenkasten legt
+// zwischen beidem seinen Clip.
+//
+// DIE UMFORMUNG IST EIN GANZ NORMALER STILWERT. Nennt das Blatt fuer
+// diesen Knoten `transform`, geht seine Flaeche durch die Matrix --
+// gerechnet wird sie in lib/fui/transform.fi, aufgestellt in
+// sheet.decl_apply_transform_at, und gemalt von render.draw_widget_xf.
+// Hier steht keine einzige Zeile Matrixrechnung. Gedreht wird um die
+// MITTE des Knotens; seine Kinder bleiben, wo sie stehen -- wer eine
+// ganze Gruppe drehen will, dreht den Knoten, der sie malt.
+fn draw_self(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
+    let nd: *mut Node = &(*sc).nodes[i]
+    let e: *mut widget.Widget = &(*nd).e
+    let kind: u32 = (*nd).kind
+    let umgeformt: bool = sheet.decl_has(&(*nd).d,
+        sheet.EX_TRANSLATE | sheet.EX_SCALE | sheet.EX_ROTATE, true)
+    if umgeformt {
+        var xf: transform.Xform = transform.xf_new()
+        sheet.decl_apply_transform_at(&(*nd).d, &xf,
+            (*nd).x + (*nd).w / 2.0, (*nd).y + (*nd).h / 2.0)
+        render.draw_widget_xf(c, e, &xf)
+    } else if kind == N_BOX || kind == N_VIEWPORT {
+        render.draw_base(c, e)
+    } else if kind == N_TEXT {
+        render.draw_label(c, e)
+    } else if kind == N_IMAGE || kind == N_SVG {
+        render.draw_widget_art(c, e)
+    } else if kind == N_WIDGET {
+        wave3.draw_any(c, e)
+    }
+    if (*nd).has_dr != 0 as u32 {
+        let f: fn(u64, *mut render.Ctx, *mut widget.Widget) = (*nd).dr
+        f((*nd).du, c, e)
+    }
+}
+
 fn draw_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     if i == SCENE_NONE || i >= (*sc).n {
         return
     }
     let nd: *mut Node = &(*sc).nodes[i]
-    let pw: f64 = (*nd).pw
-    let ph: f64 = (*nd).ph
+    let rx: f64 = (*nd).x
+    let ry: f64 = (*nd).y
+    let rw: f64 = (*nd).w
+    let rh: f64 = (*nd).h
     let kind: u32 = (*nd).kind
     if kind == N_VIEWPORT && (*nd).vp != 0 {
         let v: *mut viewport.Viewport = (*nd).vp as *mut viewport.Viewport
@@ -675,6 +758,11 @@ fn draw_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         // ab.
         render.draw_base(c, &(*nd).e)
         if viewport.viewport_begin(c, v) {
+            if (*nd).has_dr != 0 as u32 {
+                let f: fn(u64, *mut render.Ctx, *mut widget.Widget) =
+                    (*nd).dr
+                f((*nd).du, c, &(*nd).e)
+            }
             var k: usize = (*nd).first
             while k != SCENE_NONE {
                 draw_node(sc, c, k)
@@ -684,22 +772,30 @@ fn draw_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         }
         viewport.viewport_draw_bars(c, v)
     } else {
-        if kind == N_BOX {
-            render.draw_base(c, &(*nd).e)
-        } else if kind == N_TEXT {
-            render.draw_label(c, &(*nd).e)
-        } else if kind == N_IMAGE || kind == N_SVG {
-            render.draw_widget_art(c, &(*nd).e)
-        } else if kind == N_WIDGET {
-            wave3.draw_any(c, &(*nd).e)
-        }
+        draw_self(sc, c, i)
         var k: usize = (*nd).first
         while k != SCENE_NONE {
             draw_node(sc, c, k)
             k = (*sc).nodes[k].next
         }
     }
-    if (*nd).pw != pw || (*nd).ph != ph {
+    // ================================================== DIE WACHE
+    //
+    // Verglichen wird gegen das, was die Durchgaenge 2 und 3
+    // hinterlassen haben: die gemessene Groesse (`mw`/`mh`) und das
+    // angeordnete Rechteck. Gefragt wird an DREI Stellen, denn ein
+    // Knoten kann sich auf drei Arten breiter machen -- am Knoten, am
+    // Widget (`w_set_pref`, also ein zweites Messen beim Malen) und an
+    // der Flaeche (`w_place`, also ein Verschieben beim Malen). Jede
+    // davon macht das Bild von der Zeichenreihenfolge abhaengig; jede
+    // zaehlt hier EINMAL.
+    if (*nd).pw != (*nd).mw || (*nd).ph != (*nd).mh
+        || widget.w_pref_w(&(*nd).e) != (*nd).mw
+        || widget.w_pref_h(&(*nd).e) != (*nd).mh
+        || (*nd).x != rx || (*nd).y != ry
+        || (*nd).w != rw || (*nd).h != rh
+        || widget.w_x(&(*nd).e) != rx || widget.w_y(&(*nd).e) != ry
+        || widget.w_w(&(*nd).e) != rw || widget.w_h(&(*nd).e) != rh {
         (*sc).drift = (*sc).drift + 1
     }
 }
