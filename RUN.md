@@ -240,6 +240,36 @@ that breaks nothing today and something later:
   draws straight into the rasteriser, `svg.pfad` builds and keeps a
   path object) and says where the rule points instead.
 
+### Round DECLARATIVE: describing a surface instead of painting it
+
+Three modules were added in this round, and they are what separates a
+UI library from a drawing library:
+
+| Module | What it is |
+|---|---|
+| `lib/fui/viewport.fi` | The scroll viewport: a cut-out with its own size over content of any size, **real clipping** through `canvas.clip_push_rect` (no second clip), wheel and keyboard scrolling, scrollbars whose thumb length follows from cut-out/content (computed in `wave2.scrollbar_thumb`, the one place), kinetic fling as a plain `anim.Animation` (no second clock), `viewport_ensure_visible`, and a hit test that accounts for the offset |
+| `lib/fui/scene.fi` | The tree: nodes with kind, `id`, classes, children and style, walked in four separated passes -- style, measure (`render.pref_of`), layout (`flex.flex_layout`), draw. No node may change its size while drawing; `scene_size_drift` counts every attempt and the check reads that number |
+| `lib/fui/sheet.fi` | The style sheet, built **in source** (no CSS parser -- `lib/browser` already has one): rules "selector -> style values", selecting by kind, id, class, state and ancestry, merged by a specificity that is worked out (id 10000 &gt; class 100 &gt; kind 1, ties go to the later rule), plus inheritance of exactly four values (`INHERIT_MASK` = 36996: colour, font size, font id, line height) |
+
+None of the three recomputes anything that already exists: flexbox from
+`flex.fi`, time and easing from `anim.fi`, matrices from
+`lib/svg/matrix.fi` through `transform.fi`, measuring and drawing from
+`render.fi`/`wave2`/`wave3`.
+
+Their checks are sections 18b, 18c and 18d of the acceptance run
+(`viewport_main.fi`, `sheet_main.fi`, `scene_main.fi`), all numeric:
+the cascade on deliberately contradictory cases, inheritance **and its
+boundary**, the clipping counted pixel by pixel on a real canvas (zero
+points outside the cut-out, 49632 inside, and the counter-test without
+the clip reports 44720 spilled points in red), the thumb length from
+the ratio, and the hit test under scrolling.
+
+Section 19c counts, mechanically, what the round is for: the same tool
+bar painted call by call in `demos/fuidemo/main.fi` takes **67 lines of
+code**, described in `tools/fui/gallery9_main.fi` it takes **23** -- and
+the run stops if the described version ever stops being at most half as
+long.
+
 **One command checks all of it:**
 
 ```sh
@@ -283,7 +313,7 @@ Set `BELEGE` to put them somewhere else. If that directory cannot be
 created or written, the run says so and exits non-zero; it does not
 print `ALL CHECKS PASSED` with pictures missing.
 
-The same twenty-two files are checked in under `.gauntlet-shots/`,
+The same twenty-four files are checked in under `.gauntlet-shots/`,
 light and dark for each, numbered in reading order. That is the whole
 delivered evidence set: a reviewer who does not start the run sees in
 this table which picture carries which point of the acceptance bar, and
@@ -302,6 +332,7 @@ which program writes it.
 | `17/18-transform-rotate-scale-{hell,dunkel}.png` | `tools/fui/gallery8_main.fi` | bar 4: rotated, scaled and skewed widgets with clean edges (no stair-stepping), pictures under the inverse mapping with bilinear sampling, the hit test under rotation |
 | `19/20-demo-anwendung-{hell,dunkel}.png` | `demos/fuidemo/main.fi` | bar 2: the three new modules have a caller OUTSIDE their own check -- title bar and tool bar distributed by `flex.flex_layout` (grow on the field, every basis measured through `render.pref_of`), the hover transition of a button driven by `anim.Animator` in seven labelled phases, the dialog shadow from `effect.drop_shadow_spread` |
 | `21/22-preview-zustaende-{hell,dunkel}.png` | `tools/fui/preview_main.fi` | bar 5: the five button states, the text field at rest and focused with selection and caret, the same buttons under `shape_classic`, and the whole row at 150 % scale -- the proof that shape and scale are a theme decision |
+| `23/24-deklarativ-scene-sheet-{hell,dunkel}.png` | `tools/fui/gallery9_main.fi` | round DECLARATIVE: a whole page that is **described**, not painted -- a scroll viewport carrying 28 rows on 1130 points of content in a 528 point cut-out (rows visibly clipped top and bottom, scrollbar length from the cut-out/content ratio), the cascade in the picture (class 100 &lt; two classes 200 &lt; id 10000), inheritance of font and colour but not of the background |
 
 Every one of these pictures is measured before it is written: the
 programs check their own pixels (contrast against the ground it is
