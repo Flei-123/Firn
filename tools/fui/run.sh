@@ -392,6 +392,51 @@ echo "== 19b. KEINE BESCHRIFTUNG WIRD UNTERWEGS ABGESCHNITTEN =="
 build belegpruef
 "$W/belegpruef" --ketten - 0 tools/fui/*_main.fi demos/*/main.fi
 
+echo
+echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
+# DIE EINE ZAHL, DIE DEN GANZEN AUFWAND RECHTFERTIGT. lib/fui/scene.fi
+# und sheet.fi sind nur dann etwas wert, wenn DASSELBE Stueck
+# Oberflaeche beschrieben kuerzer ist als gemalt. Verglichen wird
+# darum nicht Datei gegen Datei (das waere Aepfel gegen Birnen,
+# tools/fui/gallery9_main.fi zeigt mehr), sondern EIN Stueck, das es
+# zweimal gibt: die Werkzeugleiste -- drei Knoepfe, ein Suchfeld mit
+# grow, ein Knopf im Akzent.
+#
+#   gemalt      demos/fuidemo/main.fi, fn werkzeugleiste, dazu die
+#               beiden Helfer setze und item_von_widget, die es nur
+#               dafuer gibt;
+#   beschrieben tools/fui/gallery9_main.fi, zwischen den Marken
+#               ">>> WERKZEUGLEISTE" und "<<< WERKZEUGLEISTE".
+#
+# Gezaehlt werden Zeilen mit Code: ohne Leerzeilen, ohne Kommentar.
+# Faellt die beschriebene Fassung nicht auf hoechstens die Haelfte,
+# bricht der Lauf ab -- dann stimmt die Aussage im Kopf von
+# gallery9_main.fi nicht mehr, und eine Zahl, die nicht mehr stimmt,
+# ist schlimmer als keine.
+zaehle_code() {
+    sed -e 's/^[[:space:]]*//' "$1" | grep -c -v -e '^$' -e '^//'
+}
+awk '/^fn werkzeugleiste\(/{p=1} p{print} p&&/^}$/{exit}' \
+    demos/fuidemo/main.fi > "$W/gemalt.txt"
+awk '/^fn (setze|item_von_widget)\(/{p=1} p{print} p&&/^}$/{p=0}' \
+    demos/fuidemo/main.fi >> "$W/gemalt.txt"
+sed -n '/>>> WERKZEUGLEISTE/,/<<< WERKZEUGLEISTE/p' \
+    tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
+gemalt=$(zaehle_code "$W/gemalt.txt")
+beschrieben=$(zaehle_code "$W/beschrieben.txt")
+echo "  die Werkzeugleiste gemalt (fuidemo)        $gemalt Zeilen Code"
+echo "  dieselbe beschrieben (gallery9)            $beschrieben Zeilen Code"
+if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 10 ]; then
+    echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
+    echo "  Die Marken WERKZEUGLEISTE bzw. fn werkzeugleiste fehlen."
+    exit 1
+fi
+if [ $((beschrieben * 2)) -gt "$gemalt" ]; then
+    echo "  FEHLER: beschrieben ist nicht mehr halb so kurz wie gemalt."
+    exit 1
+fi
+echo "  beschrieben kommt mit hoechstens der Haelfte aus           OK"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
@@ -533,6 +578,23 @@ if [ "$1" = "--images" ]; then
     "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
     beleg "$Z/fui-transform-hell.png" 1280 500 760 200 40 1
     beleg "$Z/fui-transform-dunkel.png" 1280 500 760 200 40 1
+    # DIE BESCHRIEBENE OBERFLAECHE. Der Beleg zu lib/fui/scene.fi,
+    # sheet.fi und viewport.fi: eine ganze Seite, die NICHT Aufruf fuer
+    # Aufruf gemalt, sondern als Baum beschrieben und von einem
+    # Stilblatt eingefaerbt wird -- mit einer Liste aus 28 Eintraegen
+    # in einem Scheibenkasten, sichtbar abgeschnitten und mit einem
+    # Rollbalken, dessen Laenge aus dem Verhaeltnis Ausschnitt/Inhalt
+    # kommt. Das Programm rechnet selbst nach, dass ueber und unter
+    # dem Ausschnitt KEIN Punkt der Liste steht (das harte Clipping am
+    # fertigen Bild), dass die Rangfolge der Regeln im Bild steht und
+    # dass kein Text aus seinem Kasten laeuft; sonst schreibt es kein
+    # PNG und der Lauf bleibt daran haengen.
+    build gallery9
+    kette gallery9 1240
+    "$W/gallery9" "$Z/fui-deklarativ-hell.png" light
+    "$W/gallery9" "$Z/fui-deklarativ-dunkel.png" dark
+    beleg "$Z/fui-deklarativ-hell.png" 1240 700 740 200 40 1
+    beleg "$Z/fui-deklarativ-dunkel.png" 1240 700 740 200 40 1
     # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
     # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
     # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet
