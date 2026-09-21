@@ -50,13 +50,27 @@ compiler/target/release/firnc -o /tmp/mod tests/110_module.fi
 bash test.sh
 ```
 
-Measured result for this state: **PASS 485/485**
-(143 programs x 3 build stages `opt` / `--no-opt` / `--opt-level=dev-fast` = 429,
-51 negative tests, plus one section proof each for the optimizer (`test_opt.sh`,
-41 checks in its own right), the result-location guarantee, the architecture
-guards, the symbol scheme and the HTML5 tokenizer against html5lib; on top of
-that 122 Rust module tests, which do not count individually towards PASS).
-Runtime about 4 minutes.
+Measured result for THIS state (re-run 2026-09-21, same machine):
+**`FAIL 4/1592 failed`, exit code 1** -- 1588 of 1592 checks pass, four
+sections fail. Which four, and why, is in **section 4d**; none of them
+is a calculation of the UI library, and two of them are house-style
+debt this tree takes on knowingly.
+
+The number `PASS 485/485` stood here for a long time and is NOT what
+`bash test.sh` prints today: the suite has grown from 485 to 1592
+checks since, and it has ended non-zero since the rounds described in
+4d. It is corrected rather than kept, because a reader who runs the
+command in the box above has to read the same result here.
+
+Of those 1592: all 533 `tests/*.fi` in four build stages (`opt`,
+`noopt`, `devfast`, `safe`), the negative tests, and one section proof
+each for the optimizer (`test_opt.sh`, 41 checks in its own right), the
+result-location guarantee, the architecture guards, the symbol scheme
+and the HTML5 tokenizer against html5lib. Runtime on a loaded machine
+about 50 minutes, on an idle one a few minutes.
+
+The UI library's own acceptance run is separate and IS green -- see
+section 9: `sh tools/fui/run.sh --images` ends on `ALL CHECKS PASSED`.
 
 Machine-readable (CI, goal 9 / ACCEPTANCE item 4 A):
 
@@ -344,7 +358,7 @@ that nobody has to find that out twice:
 |---|---|
 | `tools/fixpoint.sh` | `lib/firnc1/gctext.fi` does not match `lib/gc/*.fi` (`tools/gen_gctext.sh` was not re-run) |
 | `tools/js/run.sh` | `testdata/test262/subset.sha256` is missing from the tree |
-| `tools/english/check.sh` | 357 German identifiers; 223 of them in `lib/svg` (a port, `2b82d78e`), the other **134 in fUi files of this round** |
+| `tools/english/check.sh` | 383 German identifiers; 223 of the reported lines name `lib/svg` (a port, `2b82d78e`), the other **160 are fUi, `demos/fuidemo` and `tools/fui` of this round** |
 | `tools/fmt/run.sh` | 54 files are not in canonical `firnfmt` shape -- **including files this round wrote** |
 
 **Two of the four fail partly BECAUSE of this round, and an earlier
@@ -352,9 +366,10 @@ version of this section wrongly claimed that none of them did.** The
 claim was "every one of them names files that the round never touched";
 that is false, and the logs say so:
 
-* `.test-work/english.log` ends on `German identifiers: 357`. Counted
+* `.test-work/english.log` ends on `German identifiers: 383`. Counted
   out of the log, 223 of those lines mention `lib/svg` and the
-  remaining **134 are fUi and `demos/fuidemo` alone** -- `zyklus` in
+  remaining **160 are fUi, `demos/fuidemo` and `tools/fui` alone**
+  -- `zyklus` in
   `lib/fui/anim.fi`, `LUECKE` in `tools/fui/anim_main.fi`, `SCHRITT`
   in `demos/fuidemo/main.fi`, and so on. The round was told to take
   over the style of the modules around it, and those modules are half
