@@ -369,6 +369,37 @@ if [ -n "$verboten" ]; then
 fi
 echo "  floor/ceil/abs kommen in lib/fui/ nur aus svg.matrix        OK"
 
+# JEDER IMPORT WIRD AUCH GERUFEN. In lib/fui/scene.fi stand `import
+# std.rt`, obwohl in der ganzen Datei kein einziges `rt.` vorkam -- und
+# genau so kommt eine Abhaengigkeit in ein Modul, das freistehend
+# gebaut werden soll: nicht durch einen Aufruf, sondern durch eine
+# Zeile, die niemand mehr liest. Das laesst sich maschinell ausschliessen
+# und wird darum maschinell ausgeschlossen: zu JEDEM `import x.y` in
+# lib/fui/*.fi muss im SELBEN Modul `y.` vor einem Buchstaben stehen
+# (klein oder gross -- `rt.buf_new` genauso wie `rt.Buf`).
+#
+# Gesucht wird in den Zeilen, die KEIN Kommentar und KEINE Importzeile
+# sind: der Kopf eines Moduls darf ueber `viewport.fi` schreiben, ohne
+# damit einen Import zu rechtfertigen, und `import fui.style` selbst ist
+# kein Gebrauch von `style.`.
+ungenutzt=0
+for f in lib/fui/*.fi; do
+    for mod in $(sed -n 's/^import [a-z0-9_]*\.\([a-z0-9_]*\)[[:space:]]*$/\1/p' \
+        "$f"); do
+        if ! grep -v -e '^[[:space:]]*//' -e '^import ' "$f" \
+            | grep -q "$mod\.[A-Za-z]"; then
+            echo "  $f: import ...$mod, aber kein \"$mod.\" im Modul --"
+            echo "  ein Import, den niemand ruft, ist eine Abhaengigkeit"
+            echo "  ohne Gegenleistung. Streiche die Zeile."
+            ungenutzt=1
+        fi
+    done
+done
+if [ "$ungenutzt" != "0" ]; then
+    exit 1
+fi
+echo "  jeder Import in lib/fui/ wird im Modul auch gerufen        OK"
+
 echo
 echo "== 19b. KEINE BESCHRIFTUNG WIRD UNTERWEGS ABGESCHNITTEN =="
 # DER FEHLER, DER "red fixe" HIESS. In tools/fui/gallery_main.fi stand
@@ -394,48 +425,112 @@ build belegpruef
 
 echo
 echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
-# DIE EINE ZAHL, DIE DEN GANZEN AUFWAND RECHTFERTIGT. lib/fui/scene.fi
-# und sheet.fi sind nur dann etwas wert, wenn DASSELBE Stueck
-# Oberflaeche beschrieben kuerzer ist als gemalt. Verglichen wird
-# darum nicht Datei gegen Datei (das waere Aepfel gegen Birnen,
-# tools/fui/gallery9_main.fi zeigt mehr), sondern EIN Stueck, das es
-# zweimal gibt: die Werkzeugleiste -- drei Knoepfe, ein Suchfeld mit
-# grow, ein Knopf im Akzent.
+# DIE ZAHL, DIE DEN GANZEN AUFWAND RECHTFERTIGT -- UND ZWAR EHRLICH
+# ZUGESCHNITTEN. lib/fui/scene.fi und sheet.fi sind nur dann etwas wert,
+# wenn DASSELBE Stueck Oberflaeche beschrieben kuerzer ist als gemalt.
+# Verglichen wird darum nicht Datei gegen Datei (das waere Aepfel gegen
+# Birnen, tools/fui/gallery9_main.fi zeigt mehr), sondern EIN Stueck,
+# das es zweimal gibt: die Werkzeugleiste -- drei Knoepfe, ein Suchfeld
+# mit grow, ein Knopf im Akzent.
 #
-#   gemalt      demos/fuidemo/main.fi, fn werkzeugleiste, dazu die
-#               beiden Helfer setze und item_von_widget, die es nur
-#               dafuer gibt;
+#   gemalt      demos/fuidemo/main.fi, fn werkzeugleiste_gemalt.
 #   beschrieben tools/fui/gallery9_main.fi, zwischen den Marken
-#               ">>> WERKZEUGLEISTE" und "<<< WERKZEUGLEISTE".
+#               ">>> WERKZEUGLEISTE" und "<<< WERKZEUGLEISTE" (der Baum)
+#               UND zwischen ">>> LEISTENREGELN" und "<<<
+#               LEISTENREGELN" (ihr Aussehen im Stilblatt).
 #
-# Gezaehlt werden Zeilen mit Code: ohne Leerzeilen, ohne Kommentar.
-# Faellt die beschriebene Fassung nicht auf hoechstens die Haelfte,
-# bricht der Lauf ab -- dann stimmt die Aussage im Kopf von
-# gallery9_main.fi nicht mehr, und eine Zahl, die nicht mehr stimmt,
-# ist schlimmer als keine.
+# WAS AN DIESEM ZUSCHNITT NEU IST, UND WARUM. Bis zum 21.09.2026 standen
+# auf der gemalten Seite noch die beiden Helfer `setze` und
+# `item_von_widget` mit der Begruendung, es gebe sie "nur dafuer" -- das
+# war falsch: `titelzeile` und `dialog` rufen beide, also sind es
+# GETEILTE Zeilen, und wer geteilte Zeilen nur einer Seite zuschlaegt,
+# rechnet sich die Ersparnis schoen. Sie sind heraus. Dafuer zaehlt die
+# beschriebene Seite jetzt AUCH ihr Aussehen mit: die Regel fuer die
+# Klasse `leiste`, den Radius der Knoepfe und den Akzent -- auf der
+# gemalten Seite steht genau das mitten in der Funktion. Dass zwei
+# dieser Regeln zugleich die Kopfzeile einfaerben, wird der
+# beschriebenen Seite dabei voll angerechnet.
+#
+# Gezaehlt werden Zeilen mit Code: ohne Leerzeilen, ohne Kommentar. Und
+# gezaehlt wird in DREI Zuschnitten, weil eine einzige Zahl hier
+# zwangslaeufig etwas verschweigt:
+#
+#   roh   alles, was in den Marken bzw. in der Funktion steht.
+#   A     ohne die Beschriftungen (Textfelder und das Setzen des
+#         Textes). Die stehen auf der beschriebenen Seite in
+#         `schreibe_texte`, also ausserhalb der Marken -- sie werden
+#         darum auf BEIDEN Seiten abgezogen und nicht einseitig.
+#   B     zusaetzlich ohne das Aussehen (Flaeche, Rand, Farbe, Radius)
+#         auf beiden Seiten. Uebrig bleibt die reine Gliederung, und
+#         genau dort ist die Beschreibung um ein Vielfaches kuerzer:
+#         die Verteilung, das Setzen jedes Rechtecks und die eigene
+#         Zeichenschleife fallen ganz weg.
+#
+# Die Grenzen unten sind mit dem heutigen Stand gemessen und mit
+# Spielraum gesetzt; bricht eine, ist entweder eine Marke verrutscht
+# oder die Aussage im Kopf von gallery9_main.fi stimmt nicht mehr -- und
+# eine Zahl, die nicht mehr stimmt, ist schlimmer als keine.
 zaehle_code() {
     sed -e 's/^[[:space:]]*//' "$1" | grep -c -v -e '^$' -e '^//'
 }
-awk '/^fn werkzeugleiste\(/{p=1} p{print} p&&/^}$/{exit}' \
+ohne_text() {
+    grep -v -e 'var [tu][0-9]: \[u8;' -e 'w_set_text(' -e 'node_set_text('
+}
+ohne_aussehen() {
+    grep -v -e 'painter\.round_rect' -e 'painter\.round_ring' \
+        -e 'theme\.opaque' -e 'style\.style_set' -e 'style\.color_token' \
+        -e 'let rs:' -e 'sheet\.decl_new' -e 'style\.style_new' \
+        -e 'sheet\.decl_set_style' -e 'regel(sh'
+}
+awk '/^fn werkzeugleiste_gemalt\(/{p=1} p{print} p&&/^}$/{exit}' \
     demos/fuidemo/main.fi > "$W/gemalt.txt"
-awk '/^fn (setze|item_von_widget)\(/{p=1} p{print} p&&/^}$/{p=0}' \
-    demos/fuidemo/main.fi >> "$W/gemalt.txt"
 sed -n '/>>> WERKZEUGLEISTE/,/<<< WERKZEUGLEISTE/p' \
     tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
+sed -n '/>>> LEISTENREGELN/,/<<< LEISTENREGELN/p' \
+    tools/fui/gallery9_main.fi >> "$W/beschrieben.txt"
+ohne_text < "$W/gemalt.txt" > "$W/gemalt_a.txt"
+ohne_text < "$W/beschrieben.txt" > "$W/beschrieben_a.txt"
+ohne_aussehen < "$W/gemalt_a.txt" > "$W/gemalt_b.txt"
+ohne_aussehen < "$W/beschrieben_a.txt" > "$W/beschrieben_b.txt"
 gemalt=$(zaehle_code "$W/gemalt.txt")
 beschrieben=$(zaehle_code "$W/beschrieben.txt")
-echo "  die Werkzeugleiste gemalt (fuidemo)        $gemalt Zeilen Code"
-echo "  dieselbe beschrieben (gallery9)            $beschrieben Zeilen Code"
-if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 10 ]; then
+gemalt_a=$(zaehle_code "$W/gemalt_a.txt")
+beschrieben_a=$(zaehle_code "$W/beschrieben_a.txt")
+gemalt_b=$(zaehle_code "$W/gemalt_b.txt")
+beschrieben_b=$(zaehle_code "$W/beschrieben_b.txt")
+echo "  roh: gemalt $gemalt Zeilen, beschrieben $beschrieben Zeilen"
+echo "  A (ohne Texte): gemalt $gemalt_a, beschrieben $beschrieben_a"
+echo "  B (ohne Texte und Aussehen): gemalt $gemalt_b, beschrieben $beschrieben_b"
+if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
-    echo "  Die Marken WERKZEUGLEISTE bzw. fn werkzeugleiste fehlen."
+    echo "  Es fehlen die Marken WERKZEUGLEISTE/LEISTENREGELN in"
+    echo "  tools/fui/gallery9_main.fi oder fn werkzeugleiste_gemalt in"
+    echo "  demos/fuidemo/main.fi."
     exit 1
 fi
-if [ $((beschrieben * 2)) -gt "$gemalt" ]; then
-    echo "  FEHLER: beschrieben ist nicht mehr halb so kurz wie gemalt."
+if [ "$gemalt_b" -lt 30 ] || [ "$beschrieben_b" -lt 15 ]; then
+    echo "  FEHLER: die Filter ohne_text/ohne_aussehen haben zu viel"
+    echo "  weggenommen -- der Zuschnitt B ist damit keine Messung mehr."
     exit 1
 fi
-echo "  beschrieben kommt mit hoechstens der Haelfte aus           OK"
+# Zuschnitt A: mit dem Aussehen auf beiden Seiten bleibt die
+# Beschreibung kuerzer, aber nicht halb so lang -- ein Stilblatt
+# schreibt Farbe und Radius EINMAL fuer die ganze Seite, in diesem
+# Vergleich zaehlt das trotzdem gegen sie. Gefordert sind hoechstens
+# 90 % (gemessen am 21.09.2026: 40 von 47, also 85 %).
+if [ $((beschrieben_a * 10)) -gt $((gemalt_a * 9)) ]; then
+    echo "  FEHLER: beschrieben ist mit dem Aussehen nicht mehr kuerzer"
+    echo "  als gemalt ($beschrieben_a von $gemalt_a Zeilen)."
+    exit 1
+fi
+# Zuschnitt B: die Gliederung selbst. Gefordert sind hoechstens zwei
+# Drittel (gemessen: 21 von 39, also 54 %).
+if [ $((beschrieben_b * 3)) -gt $((gemalt_b * 2)) ]; then
+    echo "  FEHLER: die beschriebene Gliederung braucht mehr als zwei"
+    echo "  Drittel der gemalten ($beschrieben_b von $gemalt_b Zeilen)."
+    exit 1
+fi
+echo "  beschrieben ist in beiden Zuschnitten kuerzer als gemalt   OK"
 
 if [ "$1" = "--images" ]; then
     echo
