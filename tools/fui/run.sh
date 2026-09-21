@@ -16,9 +16,19 @@ set -e
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
-# Freestanding-Ziel gibt es nicht in jedem Compiler-Stand; dann ohne --target.
+# DAS FREISTEHEND-ZIEL, UND WAS PASSIERT, WENN ES FEHLT. Frueher stand
+# hier: gibt es "x86_64-none" nicht, dann eben ohne --target. Damit war
+# Abschnitt 1 auf jedem Compiler-Stand ohne Freistehend-Ziel STILL
+# gruen, obwohl seine Ueberschrift etwas anderes behauptete -- genau
+# die Sorte weggelassene Pruefung, gegen die dieser Lauf geschrieben
+# ist. Jetzt wird die Ersatzpruefung BENANNT und selbst geprueft
+# (siehe Abschnitt 1); faellt sie aus, bricht der Lauf ab.
 NONE_T="--target=x86_64-none"
-if ! "$FIRNC" --help 2>&1 | grep -q "x86_64-none"; then NONE_T=""; fi
+FREISTEHEND_ZIEL="ja"
+if ! "$FIRNC" --help 2>&1 | grep -q "x86_64-none"; then
+    NONE_T=""
+    FREISTEHEND_ZIEL="nein"
+fi
 W="${W:-/tmp/fui-acceptance}"
 mkdir -p "$W"
 
@@ -30,6 +40,43 @@ echo "== 1. THE CORE BUILDS FREESTANDING (profile kernel) =="
 # This is Justin's architecture: the same source in the kernel and in
 # the application. What is checked: that it builds AND that no syscall
 # and no foreign name is left inside.
+#
+# WENN DAS FREISTEHEND-ZIEL FEHLT. Dieser Compiler-Stand kennt nur
+# x86_64-linux und aarch64-linux; ein Ziel "x86_64-none" gibt es (noch)
+# nicht. Das Weglassen von --target darf aber nicht heissen, dass von
+# der Ueberschrift nichts mehr geprueft wird. Also wird an seiner
+# Stelle nachgewiesen, dass das Profil `kernel` ZAEHNE hat: es muss
+# `syscall` und den Import von std.io ABLEHNEN. Ein Profil, das beides
+# durchlaesst, waere ein Etikett, und dann waere "0 syscall
+# instructions" weiter unten nur ein Zufall des Quelltextes. Scheitert
+# dieser Ersatznachweis, ist der Lauf NICHT bestanden -- still
+# weiterlaufen tut er nicht mehr.
+if [ "$FREISTEHEND_ZIEL" = "ja" ]; then
+    echo "  Freistehend-Ziel x86_64-none vorhanden, es wird gebaut     OK"
+else
+    echo "  dieser Compiler kennt kein Freistehend-Ziel (x86_64-none);"
+    echo "  an seiner Stelle wird das Profil kernel selbst geprueft."
+    printf 'profile kernel\n\nfn f() {\n    syscall(60, 0)\n}\n' \
+        > "$W/kernelprobe_syscall.fi"
+    printf 'profile kernel\nimport std.io\n\nfn f() {\n    io.append_line(0 as u64, 0 as u64, 0 as usize)\n}\n' \
+        > "$W/kernelprobe_import.fi"
+    zaehne=0
+    if "$FIRNC" --profile=kernel -c -o "$W/kernelprobe.o" \
+        "$W/kernelprobe_syscall.fi" >/dev/null 2>&1; then
+        echo "  das Profil kernel nimmt einen syscall an -- es hat keine Zaehne."
+        zaehne=1
+    fi
+    if "$FIRNC" --profile=kernel -c -o "$W/kernelprobe.o" \
+        "$W/kernelprobe_import.fi" >/dev/null 2>&1; then
+        echo "  das Profil kernel nimmt import std.io an -- es hat keine Zaehne."
+        zaehne=1
+    fi
+    if [ "$zaehne" != "0" ]; then
+        echo "  Abschnitt 1 ohne Freistehend-Ziel geprueft -- NICHT bestanden"
+        exit 1
+    fi
+    echo "  Profil kernel weist syscall UND import std.io zurueck      OK"
+fi
 "$FIRNC" --profile=kernel $NONE_T -c \
     -o "$W/core.o" lib/fui/core.fi
 "$FIRNC" --profile=kernel $NONE_T -c \
@@ -247,16 +294,46 @@ for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     case "$f" in
         demos/*) n="fuidemo" ;;
     esac
-    if ! grep -q "$n" "tools/fui/run.sh"; then
-        echo "  $f kommt in tools/fui/run.sh NICHT vor -- eine Pruefung,"
-        echo "  die niemand ruft, ist keine. Haenge sie ein."
+    # GESUCHT WIRD DER AUFRUF, NICHT DER NAME. Frueher stand hier
+    # `grep -q "$n"`, und das war eine Wache, die sich selbst betrog:
+    # "anim" steckt in "gallery5" nicht, aber in jedem Kommentar ueber
+    # anim.fi, "image" in "--images", "text" in "kontext". Ein Programm
+    # galt damit als gerufen, sobald sein Name IRGENDWO in dieser Datei
+    # vorkam -- also genau dann auch, wenn niemand es ruft. Gesucht wird
+    # darum die Zeichenkette "$W/<name>", mit der dieses Skript ein
+    # gebautes Programm ausfuehrt, und zwar als fester Text (-F), damit
+    # kein Sonderzeichen sie zu einem Muster macht.
+    if ! grep -qF "\"\$W/$n\"" "tools/fui/run.sh"; then
+        echo "  $f wird in tools/fui/run.sh NICHT gerufen (kein \"\$W/$n\")"
+        echo "  -- eine Pruefung, die niemand ruft, ist keine. Haenge sie ein."
         fehlt=1
     fi
 done
 if [ "$fehlt" != "0" ]; then
     exit 1
 fi
-echo "  jede von ihnen wird in diesem Lauf auch gerufen            OK"
+echo "  jede von ihnen wird in diesem Lauf wirklich gerufen       OK"
+
+# EIN ORT FUER floor/ceil/abs, UND NICHT ZWEI. `std.math` und
+# lib/svg/matrix.fi koennen beide abrunden. Solange beide in lib/fui/
+# benutzt wurden, rechneten zwei Module dieselbe Rasterkante mit zwei
+# verschiedenen Abrundungen aus, und die Kante lag um einen Bildpunkt
+# daneben -- der teuerste Fehler dieses Baums ist der zweite Ort fuer
+# dieselbe Sache. Festgeschrieben ist es im Kopf von lib/fui/anim.fi:
+# in lib/fui/ gilt ausschliesslich matrix.m_floor/m_ceil/m_abs. Hier
+# wird der jeweils andere Name maschinell verboten.
+#
+# Kommentarzeilen sind ausgenommen: der Kopf von anim.fi MUSS den
+# verbotenen Namen nennen duerfen, um ihn zu verbieten.
+verboten=$(grep -n "math\.\(floor\|ceil\|abs\|fabs\)" lib/fui/*.fi \
+    | grep -v "^[^:]*:[0-9]*: *//" || true)
+if [ -n "$verboten" ]; then
+    echo "  in lib/fui/ steht math.floor/ceil/abs -- verboten. Es gilt"
+    echo "  matrix.m_floor/m_ceil/m_abs (siehe Kopf von lib/fui/anim.fi):"
+    echo "$verboten"
+    exit 1
+fi
+echo "  floor/ceil/abs kommen in lib/fui/ nur aus svg.matrix        OK"
 
 if [ "$1" = "--images" ]; then
     echo
