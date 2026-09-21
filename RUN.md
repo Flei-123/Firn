@@ -262,29 +262,45 @@ Set `BELEGE` to put them somewhere else. If that directory cannot be
 created or written, the run says so and exits non-zero; it does not
 print `ALL CHECKS PASSED` with pictures missing.
 
-The same twenty files are checked in under `.gauntlet-shots/`, light
-and dark for each, numbered in reading order. Which picture carries
-which point of the acceptance bar:
+The same twenty-two files are checked in under `.gauntlet-shots/`,
+light and dark for each, numbered in reading order. That is the whole
+delivered evidence set: a reviewer who does not start the run sees in
+this table which picture carries which point of the acceptance bar, and
+which program writes it.
 
-| File in `.gauntlet-shots/` | written by | carries |
+| File in `.gauntlet-shots/` | written by | what it has to show |
 |---|---|---|
-| `01/02-wave1-basis-{hell,dunkel}.png` | `gallery_main.fi` | bar 5: nothing overlaps, nothing is cut off, labels readable in light AND dark |
-| `03/04-wave2-controls-{hell,dunkel}.png` | `gallery2_main.fi` | bar 5, plus tooltips/controls at their measured size |
-| `05/06-wave3-panels-{hell,dunkel}.png` | `gallery3_main.fi` | bar 5, and the dialog/menu shadows that `render` now takes from `effect.drop_shadow_round` |
-| `07/08-text-{hell,dunkel}.png` | `gallery4_main.fi` | bar 5: line breaking, no text runs out of its box |
-| `09/10-bild-svg-{hell,dunkel}.png` | `artshow_main.fi` | the earlier round (SVG re-rastered per size, pictures with alpha) |
-| `11/12-anim-phasen-{hell,dunkel}.png` | `gallery5_main.fi` | bar 4: a phase series with a visibly NON-linear course; all nine spring phases separately visible |
-| `13/14-flex-{hell,dunkel}.png` | `gallery6_main.fi` | bar 4: several flex variants side by side with correct gaps (justify, align-self, wrap, align-content, grow/shrink) |
-| `15/16-effekt-blur-glas-{hell,dunkel}.png` | `gallery7_main.fi` | bar 4: soft shadows with a visible gradient (no hard edge), glass/backdrop blur over a patterned ground, colour matrix |
-| `17/18-transform-{hell,dunkel}.png` | `gallery8_main.fi` | bar 4: rotated and scaled widgets with clean edges (no stair-stepping) |
-| `19/20-demo-app-{hell,dunkel}.png` | `demos/fuidemo/main.fi` | bar 2: the three new modules have a caller OUTSIDE their own check -- title bar and tool bar distributed by `flex.flex_layout` (grow on the field, measured through `render.pref_of`), the hover transition of a button driven by `anim.Animator` in seven labelled phases, the dialog shadow from `effect.drop_shadow_spread` |
+| `01/02-wave1-grundelemente-{hell,dunkel}.png` | `tools/fui/gallery_main.fi` | bar 5: button in five states, six style looks, label alignment and sizes, the box with the stretchy address field (the address stands there COMPLETE, measured against the field), the 6x2 grid, the window buttons from the core at 1x/2x/3x -- nothing overlaps, nothing is cut off, readable in light AND dark |
+| `03/04-wave2-widgets-{hell,dunkel}.png` | `tools/fui/gallery2_main.fi` | bar 5: checkbox, radio, switch, slider, progress, spinner, tooltip, tabs, menu -- each at its measured size, the tooltip without the grey box behind it |
+| `05/06-wave3-widgets-{hell,dunkel}.png` | `tools/fui/gallery3_main.fi` | bar 5: list, table, tree, card, badges, date and colour picker, modal dialog over the scrim -- and the dialog/menu shadow that `render` takes from `effect.drop_shadow_round` |
+| `07/08-text-{hell,dunkel}.png` | `tools/fui/gallery4_main.fi` | bar 5: line breaking, ellipsis, outline and text shadow -- no text runs out of its box |
+| `09/10-bild-svg-{hell,dunkel}.png` | `tools/fui/artshow_main.fi` | the round BILD+SVG: the same SVG re-rastered per size (12..64) instead of scaled, `currentColor`, pictures with alpha over four grounds |
+| `11/12-anim-phasen-{hell,dunkel}.png` | `tools/fui/gallery5_main.fi` | bar 4: one movement as a phase series with a visibly NON-linear course -- six curves (linear, ease-in/out/in-out, steps, spring), nine phases each, plus the state transition of a widget |
+| `13/14-flex-varianten-{hell,dunkel}.png` | `tools/fui/gallery6_main.fi` | bar 4: the flex variants side by side with correct gaps -- `justify-content` in all six forms, `align-items`/`align-self`, `wrap` with `align-content`, `grow`/`shrink`/`basis` with min/max clamping |
+| `15/16-effekt-blur-schatten-glas-{hell,dunkel}.png` | `tools/fui/gallery7_main.fi` | bar 4: soft shadows with a visible gradient and NO hard edge (four blur radii, one with spread, painted with the library's unchanged `render.shadow_color`), glass/backdrop blur over a patterned ground with the shapes behind it still recognisable, colour matrix (grey, saturate, contrast) |
+| `17/18-transform-rotate-scale-{hell,dunkel}.png` | `tools/fui/gallery8_main.fi` | bar 4: rotated, scaled and skewed widgets with clean edges (no stair-stepping), pictures under the inverse mapping with bilinear sampling, the hit test under rotation |
+| `19/20-demo-anwendung-{hell,dunkel}.png` | `demos/fuidemo/main.fi` | bar 2: the three new modules have a caller OUTSIDE their own check -- title bar and tool bar distributed by `flex.flex_layout` (grow on the field, every basis measured through `render.pref_of`), the hover transition of a button driven by `anim.Animator` in seven labelled phases, the dialog shadow from `effect.drop_shadow_spread` |
+| `21/22-preview-zustaende-{hell,dunkel}.png` | `tools/fui/preview_main.fi` | bar 5: the five button states, the text field at rest and focused with selection and caret, the same buttons under `shape_classic`, and the whole row at 150 % scale -- the proof that shape and scale are a theme decision |
+
+Every one of these pictures is measured before it is written: the
+programs check their own pixels (contrast against the ground it is
+really painted on, tone distance of the shadows, no band left empty)
+and exit non-zero instead of writing a picture that does not keep its
+promise. On top of that `tools/fui/belegpruef_main.fi` reads every
+written PNG back in and checks size, colour variety and that something
+stands in each of the six horizontal bands.
 
 The set is refreshed from the run with
 
 ```sh
 sh tools/fui/run.sh --images
-cp "$W/belege/fui-flex-hell.png" .gauntlet-shots/13-flex-hell.png   # and so on
+sh tools/fui/belege_uebernehmen.sh
 ```
+
+The second script holds the table "which painted picture becomes which
+delivered number" -- in ONE place, so that a new piece of evidence
+cannot end up in the run and be missing from the tree (or the other way
+round).
 
 Single checks without the whole run, if something is to be looked at:
 
