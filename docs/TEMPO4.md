@@ -79,9 +79,13 @@ MP3-Dekoder, 60 s Ton, `release-fast`:
 | nach TEMPO 3 | 304,4 Mio | 0,24 s |
 | + `synth` auf vier Spuren | 272,3 Mio | |
 | + `l3_midside_stereo` | 267,3 Mio | |
-| + `l3_antialias` | **258,6 Mio** | **0,23 s** |
-| dasselbe mit `--cpu=avx` | **235,4 Mio** | **0,22 s** |
+| + `l3_antialias` | **258,6 Mio** | **0,21 s** |
+| dasselbe mit `--cpu=avx` | **235,4 Mio** | **0,21 s** |
 | `minimp3` in C, `gcc -O2` | 74,8 Mio | 0,07 s |
+| dasselbe C, `-O2 -fno-tree-vectorize` | — | 0,10 s |
+
+**Abstand zu C: 3,0x** gegen `gcc -O2`, **2,1x** gegen dasselbe C ohne
+Auto-Vektorisierung (vor dieser Runde: 3,4x und 2,4x).
 
 Richtigkeit: nach **jedem** der drei Schritte ist die PCM-Ausgabe bitgleich
 (`cmp` ueber 10,6 MB) und der Selbsttest gibt PASS 4/4 — in `baseline` wie in
