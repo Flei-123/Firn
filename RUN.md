@@ -265,10 +265,29 @@ the clip reports 44720 spilled points in red), the thumb length from
 the ratio, and the hit test under scrolling.
 
 Section 19c counts, mechanically, what the round is for: the same tool
-bar painted call by call in `demos/fuidemo/main.fi` takes **67 lines of
-code**, described in `tools/fui/gallery9_main.fi` it takes **23** -- and
-the run stops if the described version ever stops being at most half as
-long.
+bar -- three buttons, a search field with `grow`, one accent button --
+painted call by call in `demos/fuidemo/main.fi` (`fn
+werkzeugleiste_gemalt`) against the same bar described in
+`tools/fui/gallery9_main.fi` (tree plus its rules in the style sheet).
+Counted are lines of code, without blanks and comments, in three cuts,
+because a single number here would necessarily hide something:
+
+| cut | painted | described |
+|---|---|---|
+| raw (everything inside the markers resp. the function) | 57 | 42 |
+| A -- without the captions, subtracted on **both** sides | 47 | 40 |
+| B -- additionally without the looks (fill, border, colour, radius) | 39 | 21 |
+
+Cut B is the honest headline: what is left is the structure alone, and
+there the description needs **21 lines where painting needs 39** -- the
+distribution, the setting of every single rectangle and the own drawing
+loop fall away entirely. In cut A the saving is small on purpose: a
+style sheet writes colour and radius **once for the whole page**, and
+this comparison still charges all of it to the described side. The run
+stops if A ever exceeds 90 % or B ever exceeds two thirds of the
+painted side. Shared helpers (`setze`, `item_von_widget`) are counted
+on neither side, because `titelzeile` and `dialog` call them too --
+charging shared lines to one side only would be talking the saving up.
 
 **One command checks all of it:**
 
@@ -313,7 +332,7 @@ Set `BELEGE` to put them somewhere else. If that directory cannot be
 created or written, the run says so and exits non-zero; it does not
 print `ALL CHECKS PASSED` with pictures missing.
 
-The same twenty-four files are checked in under `.gauntlet-shots/`,
+The same twenty-six files are checked in under `.gauntlet-shots/`,
 light and dark for each, numbered in reading order. That is the whole
 delivered evidence set: a reviewer who does not start the run sees in
 this table which picture carries which point of the acceptance bar, and
@@ -333,6 +352,7 @@ which program writes it.
 | `19/20-demo-anwendung-{hell,dunkel}.png` | `demos/fuidemo/main.fi` | bar 2: the three new modules have a caller OUTSIDE their own check -- title bar and tool bar distributed by `flex.flex_layout` (grow on the field, every basis measured through `render.pref_of`), the hover transition of a button driven by `anim.Animator` in seven labelled phases, the dialog shadow from `effect.drop_shadow_spread` |
 | `21/22-preview-zustaende-{hell,dunkel}.png` | `tools/fui/preview_main.fi` | bar 5: the five button states, the text field at rest and focused with selection and caret, the same buttons under `shape_classic`, and the whole row at 150 % scale -- the proof that shape and scale are a theme decision |
 | `23/24-deklarativ-scene-sheet-{hell,dunkel}.png` | `tools/fui/gallery9_main.fi` | round DECLARATIVE: a whole page that is **described**, not painted -- a scroll viewport carrying 28 rows on 1130 points of content in a 528 point cut-out (rows visibly clipped top and bottom, scrollbar length from the cut-out/content ratio), the cascade in the picture (class 100 &lt; two classes 200 &lt; id 10000), inheritance of font and colour but not of the background |
+| `25/26-deklarativ-schmal-980px-{hell,dunkel}.png` | `tools/fui/gallery9_main.fi` | the same described page on 980 instead of 1240 points: the layout is really **computed**, not written down -- the right column gets narrower, the tool bar keeps its gaps, the viewport keeps its scrollbar, and still nothing overlaps and no text leaves its box |
 
 Every one of these pictures is measured before it is written: the
 programs check their own pixels (contrast against the ground it is
