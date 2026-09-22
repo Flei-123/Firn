@@ -4,6 +4,31 @@ Everything here **has been run** exactly as it stands (2026-08-14, AMD EPYC
 7571, Linux x86_64, rustc 1.99.0-nightly, binutils `as`/`ld`). Relative paths
 only, everything inside this directory.
 
+## 0a. Integration pass, re-measured 2026-09-22
+
+The three modules of this round (`viewport.fi`, `scene.fi`, `sheet.fi`)
+were built by three people in parallel. This pass checked that they are
+ONE working whole and not three that happen to compile. What was run,
+and what it printed:
+
+```sh
+sh tools/fui/run.sh --images     # -> ALL CHECKS PASSED, 26 pictures
+W=/tmp/fui-clean sh tools/fui/run.sh   # clean working dir -> ALL CHECKS PASSED
+```
+
+Four things a green run does **not** prove were checked separately:
+
+| Checked | How | Result |
+|---|---|---|
+| The delivered evidence is what the code paints **today** | `cmp` of all 26 `.gauntlet-shots/*.png` against the freshly painted `$W/belege` | 26 of 26 **byte-identical** |
+| No name is defined in two modules | the `export { ... }` blocks of all 23 `lib/fui/*.fi` collected and `uniq -d` | 1017 exported names, **0 duplicates** |
+| The new modules contain no second copy of flex/anim/matrix/blur | grep for own `bezier`/`spring`/`matrix`/`blur` functions in the three files | none; instead 41 `flex.`, 31 `render.`, 13 `anim.`, 4 `transform.` calls |
+| The core is still kernel-pure | section 1 of the run | `core.o` / `style.o` / `layout.o`: **0 syscall, 0 foreign names** each |
+
+Nothing had to be repaired in this pass: the tree was already
+consistent. The numbers above are the evidence for that, so that the
+next reader does not have to take it on trust.
+
 ## 0. Prerequisites
 
 * `cargo`/`rustc` (only to build the compiler and the yardsticks -- the
