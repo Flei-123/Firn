@@ -274,12 +274,12 @@ because a single number here would necessarily hide something:
 
 | cut | painted | described |
 |---|---|---|
-| raw (everything inside the markers resp. the function) | 57 | 42 |
-| A -- without the captions, subtracted on **both** sides | 47 | 40 |
-| B -- additionally without the looks (fill, border, colour, radius) | 39 | 21 |
+| raw (everything inside the markers resp. the function) | 64 | 42 |
+| A -- without the captions, subtracted on **both** sides | 54 | 40 |
+| B -- additionally without the looks (fill, border, colour, radius) | 46 | 21 |
 
 Cut B is the honest headline: what is left is the structure alone, and
-there the description needs **21 lines where painting needs 39** -- the
+there the description needs **21 lines where painting needs 46** -- the
 distribution, the setting of every single rectangle and the own drawing
 loop fall away entirely. In cut A the saving is small on purpose: a
 style sheet writes colour and radius **once for the whole page**, and
@@ -288,6 +288,34 @@ stops if A ever exceeds 90 % or B ever exceeds two thirds of the
 painted side. Shared helpers (`setze`, `item_von_widget`) are counted
 on neither side, because `titelzeile` and `dialog` call them too --
 charging shared lines to one side only would be talking the saving up.
+
+**And the same comparison inside ONE file (section 19d).** 19c counts
+across two files, and a reviewer may rightly ask whether that is still
+the same piece of surface. So the same bar is counted a second time
+where both versions stand next to each other and provably paint the
+same picture: `demos/fuidemo/main.fi`, `fn werkzeugleiste` (markers
+`>>> LEISTE BESCHRIEBEN` ... `<<< LEISTE BESCHRIEBEN`) against
+`fn werkzeugleiste_gemalt` in **the same file** (markers
+`>>> LEISTE GEMALT` ... `<<< LEISTE GEMALT`). `pruefe_leisten` in that
+file holds their five rectangles against each other as integers, at 952
+**and** at 260 points of width, where the 140-point clamp of the search
+field really bites.
+
+| cut | painted | described |
+|---|---|---|
+| raw | 52 | 51 |
+| A -- without the captions | 42 | 41 |
+| B -- the structure alone | 32 | **22** |
+
+The first two numbers say something uncomfortable, and they say it as
+numbers instead of as an excuse: for a **single** bar the description
+is not shorter (51 against 52 lines) -- a style sheet for one bar does
+not amortise. The structure is where it pays: 22 lines against 32,
+that is 69 %, and the run stops above 75 % (and also if the described
+version ever gets longer than the painted one in raw or in cut A).
+Outside the markers stands, on both sides, only the check itself: the
+handing out of the five rectangles and the message about an incomplete
+tree. Nothing of the surface.
 
 **One command checks all of it:**
 

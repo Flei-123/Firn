@@ -559,6 +559,88 @@ if [ $((beschrieben_b * 3)) -gt $((gemalt_b * 2)) ]; then
 fi
 echo "  beschrieben ist in beiden Zuschnitten kuerzer als gemalt   OK"
 
+echo
+echo "== 19d. DIESELBE LEISTE, DIESELBE DATEI, ZWEI FASSUNGEN =="
+# WARUM ES DIESEN ZWEITEN VERGLEICH GIBT. Abschnitt 19c haelt die
+# Werkzeugleiste aus tools/fui/gallery9_main.fi gegen die gemalte aus
+# demos/fuidemo/main.fi. Das ist eine ehrliche Messung, aber sie geht
+# ueber ZWEI Dateien, und ein Pruefer darf zu Recht fragen, ob da noch
+# dasselbe Stueck Oberflaeche verglichen wird.
+#
+# Hier stehen beide Fassungen in EINER Datei, nebeneinander, und sie
+# malen nachweislich dasselbe Bild: `pruefe_leisten` in derselben Datei
+# haelt ihre fuenf Rechtecke ganzzahlig gegeneinander, und zwar bei
+# 952 UND bei 260 Punkten Breite (dort greift die Klemmung des
+# Suchfeldes). Verglichen werden die Marken
+#
+#   >>> LEISTE BESCHRIEBEN ... <<< LEISTE BESCHRIEBEN   (fn werkzeugleiste)
+#   >>> LEISTE GEMALT      ... <<< LEISTE GEMALT        (fn werkzeugleiste_gemalt)
+#
+# beide in demos/fuidemo/main.fi. Ausserhalb der Marken liegt in BEIDEN
+# Faellen nur die Pruefung (das Herausreichen der Rechtecke, die
+# Meldung bei unvollstaendigem Baum) -- kein Stueck Oberflaeche.
+#
+# DREI ZUSCHNITTE, wie in 19c, und die beiden ersten sagen etwas
+# Unbequemes: fuer EINE Leiste ist die Beschreibung NICHT kuerzer (51
+# gegen 52 Zeilen roh). Das steht hier als Zahl und nicht als Ausrede --
+# ein Stilblatt fuer eine einzige Leiste amortisiert sich nicht, und
+# genau darum zeigt 19c die Seite mit mehreren Kacheln.
+#
+# Der dritte Zuschnitt ist der, um den es geht: die GLIEDERUNG. Ohne
+# die Beschriftungen und ohne das Aussehen (auf der gemalten Seite
+# Painter, Farben und Stile; auf der beschriebenen Seite das Stilblatt
+# samt seinen Klassennamen -- das ist dort das Aussehen) bleibt stehen,
+# WAS dasteht. Dort spart die Beschreibung die Messung, die Verteilung,
+# das Setzen jedes Rechtecks und die eigene Zeichenschleife.
+ohne_aussehen_d() {
+    grep -v -e 'painter\.round_rect' -e 'painter\.round_ring' \
+        -e 'theme\.opaque' -e 'theme\.theme_colors' \
+        -e 'render\.ctx_painter' -e 'style\.style_set' \
+        -e 'style\.color_token' -e 'let rs:' -e 'sheet\.decl_new' \
+        -e 'style\.style_new' -e 'sheet\.decl_set_style' \
+        -e 'sheet\.sheet_new' -e 'sheet\.sheet_add' \
+        -e 'sheet\.sheet_name' -e 'var n[a-z]*: \[u8;'
+}
+sed -n '/>>> LEISTE BESCHRIEBEN/,/<<< LEISTE BESCHRIEBEN/p' \
+    demos/fuidemo/main.fi > "$W/leiste_b.txt"
+sed -n '/>>> LEISTE GEMALT/,/<<< LEISTE GEMALT/p' \
+    demos/fuidemo/main.fi > "$W/leiste_g.txt"
+ohne_text < "$W/leiste_b.txt" > "$W/leiste_ba.txt"
+ohne_text < "$W/leiste_g.txt" > "$W/leiste_ga.txt"
+ohne_aussehen_d < "$W/leiste_ba.txt" > "$W/leiste_bb.txt"
+ohne_aussehen_d < "$W/leiste_ga.txt" > "$W/leiste_gb.txt"
+lb=$(zaehle_code "$W/leiste_b.txt")
+lg=$(zaehle_code "$W/leiste_g.txt")
+lba=$(zaehle_code "$W/leiste_ba.txt")
+lga=$(zaehle_code "$W/leiste_ga.txt")
+lbb=$(zaehle_code "$W/leiste_bb.txt")
+lgb=$(zaehle_code "$W/leiste_gb.txt")
+echo "  roh: beschrieben $lb Zeilen, gemalt $lg Zeilen"
+echo "  A (ohne Texte): beschrieben $lba, gemalt $lga"
+echo "  B (nur Gliederung): beschrieben $lbb, gemalt $lgb"
+if [ "$lb" -lt 30 ] || [ "$lg" -lt 30 ] || [ "$lbb" -lt 12 ] \
+    || [ "$lgb" -lt 20 ]; then
+    echo "  FEHLER: eine der beiden Fassungen wurde nicht gefunden oder"
+    echo "  die Filter haben zu viel weggenommen. Es fehlen die Marken"
+    echo "  LEISTE BESCHRIEBEN / LEISTE GEMALT in demos/fuidemo/main.fi."
+    exit 1
+fi
+# ROH UND A: die Beschreibung darf nicht LAENGER sein. Mehr wird hier
+# nicht verlangt, und der Grund steht oben.
+if [ "$lb" -gt "$lg" ] || [ "$lba" -gt "$lga" ]; then
+    echo "  FEHLER: die beschriebene Leiste ist laenger als die gemalte"
+    echo "  ($lb von $lg roh, $lba von $lga ohne Texte)."
+    exit 1
+fi
+# B: die Gliederung. Gefordert sind hoechstens 75 % (gemessen am
+# 22.09.2026: 22 von 32, also 69 %).
+if [ $((lbb * 4)) -gt $((lgb * 3)) ]; then
+    echo "  FEHLER: die beschriebene Gliederung braucht mehr als drei"
+    echo "  Viertel der gemalten ($lbb von $lgb Zeilen)."
+    exit 1
+fi
+echo "  dieselbe Leiste beschrieben: Gliederung $lbb von $lgb        OK"
+
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
