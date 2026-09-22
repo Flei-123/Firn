@@ -33,7 +33,15 @@
 //      anim.Animation mit EASE_OUT auf der Verschiebung. Es gibt hier
 //      keine zweite Zeitrechnung: die Millisekunden kommen von aussen
 //      herein (render.ctx_time), wie ueberall sonst in fUi.
-//   5. ER RECHNET DEN KLICK ZURUECK. `viewport_hit` nimmt einen Punkt
+//   5. ER LAESST SEINE BALKEN ANFASSEN. `viewport_bar_hit` sagt,
+//      welcher Balken unter dem Zeiger liegt, `viewport_bar_press`
+//      greift den Schieber (oder springt seitenweise, wenn daneben
+//      gedrueckt wurde), `viewport_bar_drag` uebersetzt die Strecke
+//      des Zeigers in eine Verschiebung. Die Geometrie des Schiebers
+//      kommt dabei aus wave2.scrollbar_thumb -- aus derselben
+//      Rechnung, die ihn malt, und sogar seine Weglaenge wird dort
+//      ERFRAGT statt hergeleitet.
+//   6. ER RECHNET DEN KLICK ZURUECK. `viewport_hit` nimmt einen Punkt
 //      in Fensterkoordinaten und gibt den Punkt IM INHALT. Ohne das
 //      trifft ein Klick in einer gerollten Liste die falsche Zeile --
 //      derselbe Fehler, den lib/fui/transform.fi fuer die Drehung mit
@@ -62,6 +70,10 @@ export {
     viewport_share_h, viewport_share_v,
     viewport_value_h, viewport_value_v,
     viewport_bar_rect_v, viewport_bar_rect_h,
+    viewport_bar_hit, viewport_bar_thumb,
+    viewport_bar_press, viewport_bar_drag, viewport_bar_release,
+    viewport_bar_dragging,
+    VP_BAR_NONE, VP_BAR_V, VP_BAR_H,
     viewport_content_x, viewport_content_y,
     viewport_hit, viewport_visible,
     viewport_ensure_visible,
@@ -73,6 +85,7 @@ export {
 }
 
 import paint.canvas
+import fui.layout
 import fui.widget
 import fui.painter
 import fui.render
@@ -102,6 +115,13 @@ const VP_WHEEL_STEP: f64 = 72.0
 // Wie lange das kinetische Auslaufen dauert.
 const VP_FLING_MS: i64 = 420
 
+// WELCHER BALKEN GEMEINT IST. Dieselbe Sorte Zahl wie die acht
+// Bewegungen oben: der Aufrufer bekommt eine Richtung zurueck und
+// muss dafuer nicht wissen, wie ein Balken gebaut ist.
+const VP_BAR_NONE: u32 = 0
+const VP_BAR_V: u32 = 1
+const VP_BAR_H: u32 = 2
+
 struct Viewport {
     // Der Ausschnitt im Fenster.
     x: f64,
@@ -122,6 +142,11 @@ struct Viewport {
     fy: anim.Animation,
     fx_on: u32,
     fy_on: u32,
+    // Das Ziehen an einem Balken: welche Richtung, wo gegriffen wurde
+    // und welche Verschiebung in diesem Augenblick galt.
+    drag: u32,
+    grab: f64,
+    grab_off: f64,
 }
 
 fn viewport_new(x: f64, y: f64, w: f64, h: f64, cw: f64,
@@ -130,7 +155,8 @@ fn viewport_new(x: f64, y: f64, w: f64, h: f64, cw: f64,
         ox: 0.0, oy: 0.0, bar: 12,
         fx: anim.anim_new(0, 1, 0.0, 0.0, anim.easing_linear()),
         fy: anim.anim_new(0, 1, 0.0, 0.0, anim.easing_linear()),
-        fx_on: 0 as u32, fy_on: 0 as u32 }
+        fx_on: 0 as u32, fy_on: 0 as u32,
+        drag: VP_BAR_NONE, grab: 0.0, grab_off: 0.0 }
 }
 
 fn viewport_set_rect(v: *mut Viewport, x: f64, y: f64, w: f64, h: f64) {
@@ -551,25 +577,221 @@ fn viewport_end(c: *mut render.Ctx, v: *mut Viewport) {
 // Gemalt wird mit wave2.draw_scrollbar, also mit DEM Rollbalken dieser
 // Bibliothek. Dieses Modul rechnet nur Anteil und Stellung aus; wie ein
 // Rollbalken aussieht, steht an einer Stelle, und die ist nicht hier.
+// DAS WIDGET EINES BALKENS -- an EINER Stelle gebaut.
+//
+// Gemalt und bedient wird derselbe Rollbalken, also darf er auch nur
+// einmal zusammengesetzt werden: Rechteck, Anteil (als `pref`) und
+// Stellung (als `value`). Stuende das Malen hier und das Greifen
+// daneben, haetten Bild und Bedienung zwei Geometrien -- und der
+// Schieber laege genau dort, wo man NICHT hinfasst. `wert` sagt, mit
+// welcher Stellung der Balken gebaut wird: die Bedienung fragt ihn
+// auch nach den Enden seiner Spur (0 und VAL_MAX), und genau daher
+// kommt die Weglaenge des Schiebers, ohne sie ein zweites Mal
+// auszurechnen.
+fn bar_widget(v: *mut Viewport, senkrecht: bool,
+    wert: i64) -> widget.Widget {
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    var e: widget.Widget = widget.widget_new(widget.KIND_SCROLLBAR)
+    if senkrecht {
+        if !viewport_bar_rect_v(v, &bx, &by, &bw, &bh) {
+            return e
+        }
+        widget.w_place(&e, bx, by, bw, bh)
+        widget.w_set_pref(&e, 0.0,
+            viewport_share_v(v) * (wave2.VAL_MAX as f64))
+        widget.w_set_value(&e, wert)
+        return e
+    }
+    if !viewport_bar_rect_h(v, &bx, &by, &bw, &bh) {
+        return e
+    }
+    widget.w_place(&e, bx, by, bw, bh)
+    widget.w_set_pref(&e,
+        viewport_share_h(v) * (wave2.VAL_MAX as f64), 0.0)
+    widget.w_set_value(&e, wert)
+    return e
+}
+
 fn viewport_draw_bars(c: *mut render.Ctx, v: *mut Viewport) {
+    if viewport_needs_v(v) {
+        var e: widget.Widget = bar_widget(v, true, viewport_value_v(v))
+        wave2.draw_scrollbar(c, &e)
+    }
+    if viewport_needs_h(v) {
+        var e: widget.Widget = bar_widget(v, false, viewport_value_h(v))
+        wave2.draw_scrollbar(c, &e)
+    }
+}
+
+// ======================================================================
+// DIE BALKEN BEDIENEN
+// ======================================================================
+//
+// Bis hierher konnte der Kasten seine Balken MALEN, und der Zeiger
+// hatte nichts damit zu tun: rollen liess sich nur mit Rad und
+// Tastatur. Das ist genau die halbe Sache, gegen die dieses Modul
+// geschrieben ist -- ein Rollbalken, den man nicht anfassen kann, ist
+// eine Anzeige und kein Bedienelement.
+//
+// WAS HIER NICHT STEHT: die Geometrie des Schiebers. Sie kommt Stueck
+// fuer Stueck aus `wave2.scrollbar_thumb`, also aus derselben Rechnung,
+// die ihn auch malt. Selbst die WEGLAENGE (wie weit der Schieber von
+// oben nach unten wandert) wird nicht hergeleitet, sondern GEFRAGT:
+// einmal die Lage bei Stellung 0, einmal bei VAL_MAX, die Differenz
+// ist der Weg. Damit kann die Bedienung gar nicht von dem abweichen,
+// was im Bild steht -- auch dann nicht, wenn wave2 sein Polster oder
+// seine Mindestlaenge aendert.
+fn viewport_bar_hit(v: *mut Viewport, px: f64, py: f64) -> u32 {
     var bx: f64 = 0.0
     var by: f64 = 0.0
     var bw: f64 = 0.0
     var bh: f64 = 0.0
     if viewport_bar_rect_v(v, &bx, &by, &bw, &bh) {
-        var e: widget.Widget = widget.widget_new(widget.KIND_SCROLLBAR)
-        widget.w_place(&e, bx, by, bw, bh)
-        widget.w_set_pref(&e, 0.0,
-            viewport_share_v(v) * (wave2.VAL_MAX as f64))
-        widget.w_set_value(&e, viewport_value_v(v))
-        wave2.draw_scrollbar(c, &e)
+        if px >= bx && px < bx + bw && py >= by && py < by + bh {
+            return VP_BAR_V
+        }
     }
     if viewport_bar_rect_h(v, &bx, &by, &bw, &bh) {
-        var e: widget.Widget = widget.widget_new(widget.KIND_SCROLLBAR)
-        widget.w_place(&e, bx, by, bw, bh)
-        widget.w_set_pref(&e,
-            viewport_share_h(v) * (wave2.VAL_MAX as f64), 0.0)
-        widget.w_set_value(&e, viewport_value_h(v))
-        wave2.draw_scrollbar(c, &e)
+        if px >= bx && px < bx + bw && py >= by && py < by + bh {
+            return VP_BAR_H
+        }
     }
+    return VP_BAR_NONE
 }
+
+// Der Schieber eines Balkens als Rechteck -- dieselbe Form, die
+// `wave2.draw_scrollbar` malt, bei der aktuellen Stellung.
+fn viewport_bar_thumb(c: *mut render.Ctx, v: *mut Viewport,
+    dir: u32) -> layout.Rect {
+    var wert: i64 = viewport_value_h(v)
+    if dir == VP_BAR_V {
+        wert = viewport_value_v(v)
+    }
+    var e: widget.Widget = bar_widget(v, dir == VP_BAR_V, wert)
+    return wave2.scrollbar_thumb(c, &e)
+}
+
+// DIE WEGLAENGE DES SCHIEBERS, BEI WAVE2 ERFRAGT. Der Schieber steht
+// bei Stellung 0 am Anfang der Spur und bei VAL_MAX an ihrem Ende; was
+// dazwischen liegt, ist genau die Strecke, die ein Ziehen ausnutzen
+// kann. Sie in Polster und Mindestlaenge selbst zu zerlegen waere die
+// zweite Fassung einer Rechnung, die es schon gibt.
+fn bar_travel(c: *mut render.Ctx, v: *mut Viewport, dir: u32) -> f64 {
+    let senkrecht: bool = dir == VP_BAR_V
+    var e0: widget.Widget = bar_widget(v, senkrecht, 0)
+    var e1: widget.Widget = bar_widget(v, senkrecht, wave2.VAL_MAX)
+    var x0: f64 = 0.0
+    var y0: f64 = 0.0
+    var w0: f64 = 0.0
+    var h0: f64 = 0.0
+    var x1: f64 = 0.0
+    var y1: f64 = 0.0
+    var w1: f64 = 0.0
+    var h1: f64 = 0.0
+    wave2.scrollbar_thumb_f(c, &e0, &x0, &y0, &w0, &h0)
+    wave2.scrollbar_thumb_f(c, &e1, &x1, &y1, &w1, &h1)
+    if senkrecht {
+        return y1 - y0
+    }
+    return x1 - x0
+}
+
+// EINEN BALKEN ANFASSEN.
+//
+// Zwei Faelle, und beide sind das, was jedes System tut:
+//
+//   * AUF DEM SCHIEBER faengt ein Ziehen an. Gemerkt werden der Punkt,
+//     an dem gegriffen wurde, und die Verschiebung in diesem
+//     Augenblick -- so bleibt der Griff unter dem Zeiger stehen, statt
+//     dass der Schieber unter ihm wegspringt.
+//   * AUF DER SPUR springt es SEITENWEISE: eine Seite ist der sichtbare
+//     Ausschnitt, dieselbe Strecke wie Bild-auf/Bild-ab. Ein Sprung an
+//     die Zeigerstelle waere die Alternative; seitenweise ist die
+//     Wahl, die den Inhalt nicht ueberspringen laesst.
+//
+// Zurueck kommt, ob der Druck ueberhaupt einen Balken getroffen hat --
+// die Auskunft, die ein Fenster braucht, um den Druck nicht auch noch
+// an den Inhalt weiterzureichen.
+fn viewport_bar_press(c: *mut render.Ctx, v: *mut Viewport, px: f64,
+    py: f64) -> bool {
+    let dir: u32 = viewport_bar_hit(v, px, py)
+    if dir == VP_BAR_NONE {
+        return false
+    }
+    let t: layout.Rect = viewport_bar_thumb(c, v, dir)
+    let tx: f64 = layout.rect_x(&t) as f64
+    let ty: f64 = layout.rect_y(&t) as f64
+    let tw: f64 = layout.rect_w(&t) as f64
+    let th: f64 = layout.rect_h(&t) as f64
+    if px >= tx && px < tx + tw && py >= ty && py < ty + th {
+        fling_stop(v)
+        (*v).drag = dir
+        if dir == VP_BAR_V {
+            (*v).grab = py
+            (*v).grab_off = (*v).oy
+        } else {
+            (*v).grab = px
+            (*v).grab_off = (*v).ox
+        }
+        return true
+    }
+    // Die Spur: eine Seite vor oder zurueck, je nachdem, auf welcher
+    // Seite des Schiebers gedrueckt wurde.
+    if dir == VP_BAR_V {
+        if py < ty {
+            viewport_scroll_by(v, 0.0, 0.0 - viewport_inner_h(v))
+        } else {
+            viewport_scroll_by(v, 0.0, viewport_inner_h(v))
+        }
+        return true
+    }
+    if px < tx {
+        viewport_scroll_by(v, 0.0 - viewport_inner_w(v), 0.0)
+    } else {
+        viewport_scroll_by(v, viewport_inner_w(v), 0.0)
+    }
+    return true
+}
+
+// DAS ZIEHEN. Die Strecke des Zeigers wird mit dem VERHAELTNIS
+// groesste Verschiebung / Weglaenge des Schiebers auf den Inhalt
+// uebersetzt -- dasselbe Verhaeltnis wie Inhalt / Spur, nur ohne den
+// Umweg ueber die Laenge des Schiebers (tools/fui/viewport_main.fi
+// Abschnitt 12 rechnet beide Wege gegeneinander).
+//
+// Zurueck kommt, ob sich etwas bewegt hat.
+fn viewport_bar_drag(c: *mut render.Ctx, v: *mut Viewport, px: f64,
+    py: f64) -> bool {
+    if (*v).drag == VP_BAR_NONE {
+        return false
+    }
+    let dir: u32 = (*v).drag
+    let weg: f64 = bar_travel(c, v, dir)
+    if weg <= 0.0 {
+        return false
+    }
+    if dir == VP_BAR_V {
+        let vorher: f64 = (*v).oy
+        let d: f64 = (py - (*v).grab) * viewport_max_y(v) / weg
+        viewport_set_offset(v, (*v).ox, (*v).grab_off + d)
+        (*v).drag = dir   // set_offset haelt nur das Auslaufen an
+        return (*v).oy != vorher
+    }
+    let vorher: f64 = (*v).ox
+    let d: f64 = (px - (*v).grab) * viewport_max_x(v) / weg
+    viewport_set_offset(v, (*v).grab_off + d, (*v).oy)
+    (*v).drag = dir   // set_offset haelt nur das Auslaufen an
+    return (*v).ox != vorher
+}
+
+// Loslassen. Ein eigener Aufruf, weil ein Kasten, der das Ziehen am
+// Rand seiner Spur selbst beendet, beim Zurueckfahren nicht mehr
+// mitzoege.
+fn viewport_bar_release(v: *mut Viewport) {
+    (*v).drag = VP_BAR_NONE
+}
+
+fn viewport_bar_dragging(v: *mut Viewport) -> u32 { return (*v).drag }
