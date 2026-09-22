@@ -507,7 +507,7 @@ ohne_aussehen() {
     grep -v -e 'painter\.round_rect' -e 'painter\.round_ring' \
         -e 'theme\.opaque' -e 'style\.style_set' -e 'style\.color_token' \
         -e 'let rs:' -e 'sheet\.decl_new' -e 'style\.style_new' \
-        -e 'sheet\.decl_set_style' -e 'regel(sh'
+        -e 'sheet\.decl_set_style' -e 'regel(sh' -e 'sheet\.sheet_rule'
 }
 awk '/^fn werkzeugleiste_gemalt\(/{p=1} p{print} p&&/^}$/{exit}' \
     demos/fuidemo/main.fi > "$W/gemalt.txt"
@@ -540,21 +540,41 @@ if [ "$gemalt_b" -lt 30 ] || [ "$beschrieben_b" -lt 15 ]; then
     echo "  weggenommen -- der Zuschnitt B ist damit keine Messung mehr."
     exit 1
 fi
+# DIE ALTE SCHRANKE, WIEDER DA, UND ZWAR AUF DEM ROHWERT. Bis zum
+# 21.09.2026 galt hier "die beschriebene Fassung faellt auf hoechstens
+# die HAELFTE"; am 22.09.2026 wurde sie durch 90 % (A) und 66 % (B)
+# ersetzt, weil der Rohwert damals 42 von 64 war. Eine Pruefung, die
+# man weicher macht, damit der eigene Stand sie besteht, ist keine
+# Pruefung mehr. Also steht sie wieder da, und stattdessen ist die
+# BESCHREIBUNG kuerzer geworden: lib/fui/scene.fi hat mit scene_box,
+# scene_widget, node_set_space, node_set_flexitem und scene_run die
+# Kurzformen bekommen, die ein Baum wirklich braucht, und
+# lib/fui/sheet.fi mit sheet_rule die Regel aus einem Stil.
+#
+# Gemessen am 22.09.2026: 31 von 64 Zeilen, also 48 %. Das ist eine
+# Zeile unter der Schranke -- wer hier eine hinzufuegt, muss eine
+# andere streichen. Genau das ist der Zweck.
+if [ $((beschrieben * 2)) -gt "$gemalt" ]; then
+    echo "  FEHLER: die beschriebene Fassung faellt nicht auf hoechstens"
+    echo "  die Haelfte der gemalten ($beschrieben von $gemalt Zeilen)."
+    exit 1
+fi
 # Zuschnitt A: mit dem Aussehen auf beiden Seiten bleibt die
 # Beschreibung kuerzer, aber nicht halb so lang -- ein Stilblatt
 # schreibt Farbe und Radius EINMAL fuer die ganze Seite, in diesem
 # Vergleich zaehlt das trotzdem gegen sie. Gefordert sind hoechstens
-# 90 % (gemessen am 21.09.2026: 40 von 47, also 85 %).
-if [ $((beschrieben_a * 10)) -gt $((gemalt_a * 9)) ]; then
+# zwei Drittel (gemessen am 22.09.2026: 30 von 54, also 56 %).
+if [ $((beschrieben_a * 3)) -gt $((gemalt_a * 2)) ]; then
     echo "  FEHLER: beschrieben ist mit dem Aussehen nicht mehr kuerzer"
     echo "  als gemalt ($beschrieben_a von $gemalt_a Zeilen)."
     exit 1
 fi
-# Zuschnitt B: die Gliederung selbst. Gefordert sind hoechstens zwei
-# Drittel (gemessen: 21 von 39, also 54 %).
-if [ $((beschrieben_b * 3)) -gt $((gemalt_b * 2)) ]; then
-    echo "  FEHLER: die beschriebene Gliederung braucht mehr als zwei"
-    echo "  Drittel der gemalten ($beschrieben_b von $gemalt_b Zeilen)."
+# Zuschnitt B: die Gliederung selbst. Gefordert ist auch hier
+# hoechstens die Haelfte (gemessen am 22.09.2026: 18 von 46, also
+# 39 %).
+if [ $((beschrieben_b * 2)) -gt "$gemalt_b" ]; then
+    echo "  FEHLER: die beschriebene Gliederung braucht mehr als die"
+    echo "  Haelfte der gemalten ($beschrieben_b von $gemalt_b Zeilen)."
     exit 1
 fi
 echo "  beschrieben ist in beiden Zuschnitten kuerzer als gemalt   OK"
@@ -599,6 +619,7 @@ ohne_aussehen_d() {
         -e 'style\.color_token' -e 'let rs:' -e 'sheet\.decl_new' \
         -e 'style\.style_new' -e 'sheet\.decl_set_style' \
         -e 'sheet\.sheet_new' -e 'sheet\.sheet_add' \
+        -e 'sheet\.sheet_rule' \
         -e 'sheet\.sheet_name' -e 'var n[a-z]*: \[u8;'
 }
 sed -n '/>>> LEISTE BESCHRIEBEN/,/<<< LEISTE BESCHRIEBEN/p' \
@@ -627,16 +648,26 @@ if [ "$lb" -lt 30 ] || [ "$lg" -lt 30 ] || [ "$lbb" -lt 12 ] \
 fi
 # ROH UND A: die Beschreibung darf nicht LAENGER sein. Mehr wird hier
 # nicht verlangt, und der Grund steht oben.
-if [ "$lb" -gt "$lg" ] || [ "$lba" -gt "$lga" ]; then
-    echo "  FEHLER: die beschriebene Leiste ist laenger als die gemalte"
-    echo "  ($lb von $lg roh, $lba von $lga ohne Texte)."
+# ROH UND A: hoechstens 80 % -- die Texte und das Aussehen zaehlen
+# hier auf beiden Seiten voll mit, und eine Beschreibung, die ihre
+# fuenf Beschriftungen genauso einzeln hinschreibt wie die gemalte,
+# kann in diesen beiden Zuschnitten gar nicht halb so lang werden
+# (gemessen am 22.09.2026: 40 von 52 roh = 77 %, 30 von 42 ohne
+# Texte = 71 %).
+if [ $((lb * 5)) -gt $((lg * 4)) ] || [ $((lba * 5)) -gt $((lga * 4)) ]; then
+    echo "  FEHLER: die beschriebene Leiste braucht mehr als vier"
+    echo "  Fuenftel der gemalten ($lb von $lg roh, $lba von $lga ohne"
+    echo "  Texte)."
     exit 1
 fi
-# B: die Gliederung. Gefordert sind hoechstens 75 % (gemessen am
-# 22.09.2026: 22 von 32, also 69 %).
-if [ $((lbb * 4)) -gt $((lgb * 3)) ]; then
-    echo "  FEHLER: die beschriebene Gliederung braucht mehr als drei"
-    echo "  Viertel der gemalten ($lbb von $lgb Zeilen)."
+# B: die Gliederung. Auch hier gilt wieder die HAELFTE, dieselbe
+# Schranke wie in 19c -- und sie haelt nicht, weil die Pruefung
+# nachgegeben haette, sondern weil dieselbe Leiste mit scene_box,
+# node_set_space, node_set_flexitem und scene_run jetzt kuerzer
+# beschrieben ist (gemessen am 22.09.2026: 15 von 32, also 47 %).
+if [ $((lbb * 2)) -gt "$lgb" ]; then
+    echo "  FEHLER: die beschriebene Gliederung braucht mehr als die"
+    echo "  Haelfte der gemalten ($lbb von $lgb Zeilen)."
     exit 1
 fi
 echo "  dieselbe Leiste beschrieben: Gliederung $lbb von $lgb        OK"
