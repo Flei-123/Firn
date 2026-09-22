@@ -1231,7 +1231,15 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
             // WIRKLICH im Fliesskommaweg steht -- also genau die Bedingung,
             // unter der die Ausgabe unten ihren Fliesskomma-Zweig nimmt.
             let use_ok = match &inst.op {
-                Op::Bin(..) | Op::Copy { .. } => inst.ty.is_float(),
+                Op::Bin(..) => inst.ty.is_float(),
+                // RUNDE TEMPO 8: eine Kopie mit `v128` steht ebenfalls im
+                // SSE-Weg -- `emit_inst` hat dafuer einen eigenen Zweig
+                // (`Op::Copy` mit `FTy::V128`, `v_into`/`v_out`). Hier stand
+                // `is_float()`, und das ist fuer `v128` FALSCH: jeder Wert,
+                // den eine Vektorkopie liest, verlor damit sein Register.
+                // Gemessen an den beiden Sammlern der Synthesefilterbank:
+                // sie fielen aus dem Zuteiler und liefen ueber den Rahmen.
+                Op::Copy { .. } => sse_class(inst.ty),
                 Op::Un(UnOp::Neg, _) => inst.ty.is_float(),
                 Op::Cmp { ty, .. } => ty.is_float(),
                 Op::Cast { from, .. } => from.is_float() || inst.ty.is_float(),
@@ -1301,7 +1309,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // by that call. Then the conservative interval question stands again,
     // exactly as before this round. `FIRN_RA_ROUGH=1` forces that state for
     // troubleshooting.
-    let exact = if live.converged && std::env::var_os("FIRN_RA_ROUGH").is_none() {
+    let mut exact = if live.converged && std::env::var_os("FIRN_RA_ROUGH").is_none() {
         Some(exact_crossings(f, &live))
     } else {
         None
@@ -1483,6 +1491,183 @@ pub fn allocate(f: &Func) -> Alloc {
         };
         if let Some(v) = tv {
             touch(v, live.block_end[bi], w, &mut start, &mut end, &mut weight);
+        }
+    }
+
+    // ---- RUNDE TEMPO 8: KOPIEN VERSCHMELZEN (copy coalescing) ----------
+    //
+    // WARUM. `phi.rs` loest jeden phi-Knoten in eine Kopie am Ende des
+    // Vorgaengers auf, und `fold_into_definitions` gibt die Kopie dort
+    // zurueck, wo der eingehende Wert IM SELBEN Block gerechnet wird. In
+    // einer Schleife mit Verzweigung ist das genau nicht der Fall: die
+    // Laufvariable wird oben im Rumpf fortgeschaltet, die Rueckwaertskante
+    // verlaesst den Rumpf aber unten, hinter dem `if`. Gemessen an der
+    // heissen Schleife der Synthesefilterbank (667 440 Durchlaeufe, vier
+    // Laufzeiger, zwei Sammler) stand darum je Wert
+    //
+    //     mov %rbx,%rax           # Kopie, weil das Ziel keinen Platz hat
+    //     add $0x2,%rax
+    //     mov %rax,-0xa18(%rbp)   # in den Rahmen
+    //     ...
+    //     mov -0xa18(%rbp),%rbx   # auf der Rueckwaertskante zurueck
+    //
+    // -- vier Befehle fuer das, was C mit `add $2,%rbx` erledigt.
+    //
+    // WAS. Die Quelle einer Kopie und ihr Ziel werden zu EINEM Intervall
+    // zusammengelegt, BEVOR der lineare Scan laeuft. Beide bekommen damit
+    // denselben Platz; `emit_bin` rechnet gleich dort (`load_full` schreibt
+    // nichts, wenn der Wert schon steht) und die Kopie selbst gibt keinen
+    // Befehl aus -- alle drei Kopiewege in `emit_inst` pruefen das.
+    //
+    // WARUM VOR DEM SCAN und nicht danach: ein `t`, das der Scan selbst
+    // schon in ein Register gelegt hat, ist danach nicht mehr zu bewegen,
+    // ohne dem Nachbarn sein Register wegzunehmen. Gemessen: die
+    // nachtraegliche Fassung verschmolz vier Werte, diese elf.
+    //
+    // WANN ES ERLAUBT IST. Drei Bedingungen, jede einzeln notwendig:
+    //
+    //  1. `t` wird GENAU EINMAL geschrieben und GENAU EINMAL gelesen, und
+    //     zwar von dieser Kopie. Ein zweiter Leser saehe sonst ein Register,
+    //     das die Rueckwaertskante laengst weitergedreht hat.
+    //  2. Beide haben denselben Typ (und damit dieselbe Registerklasse), und
+    //     keiner der beiden hat einen Sonderplatz: ein unmittelbarer Wert
+    //     traegt `Slot(0)` als Platzhalter, ein Vorrats-Wert steht in
+    //     `.rodata`, eine Zelle und ein `alloca` liegen woanders.
+    //  3. `t` und `p` STOEREN SICH NICHT (Chaitin): an keiner Stelle, an der
+    //     das eine geschrieben wird, lebt das andere noch. Die Kopie selbst
+    //     ist ausgenommen -- sie ist der Grund, aus dem verschmolzen wird.
+    //
+    // Mehrere Quellen je `p` sind erlaubt, solange sie sich untereinander
+    // nicht stoeren: ein `if` im Schleifenrumpf schreibt die
+    // Schleifenvariable in jedem Zweig einmal, und die Zweige schliessen
+    // einander aus.
+    let mut coalesced: HashMap<Val, Val> = HashMap::new();
+    // OHNE FIXPUNKT DER LEBENDIGKEIT NICHT. Unterhalb der Rundengrenze von
+    // `compute_live` sind die Mengen moeglicherweise ZU KLEIN -- und ein
+    // Wert, von dem faelschlich angenommen wird, er lebe nicht mehr, wuerde
+    // mit einem verschmolzen, der ihn ueberschreibt. Dieselbe Vorsicht wie
+    // bei `exact_crossings`.
+    let coal_scope_ok = match std::env::var("FIRN_COAL_ONLY") {
+        Ok(v) => f.name.contains(&v),
+        Err(_) => true,
+    };
+    if std::env::var_os("FIRN_NO_COALESCE").is_none() && live.converged && coal_scope_ok {
+        let dbg = match std::env::var("FIRN_COAL_DBG") {
+            Ok(x) => f.name.contains(&x),
+            Err(_) => false,
+        };
+        // Die Schreibstellen EINMAL sammeln. Die erste Fassung lief fuer
+        // jeden Kandidaten die ganze Funktion ab -- bei `bin/firnc1.fi`
+        // kostete das zwoelf Prozent Uebersetzungszeit fuer nichts.
+        let mut defs: Vec<u32> = vec![0; nv];
+        let mut defsites: HashMap<Val, Vec<(usize, usize)>> = HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
+                if let Some(d) = i.dst {
+                    if (d as usize) < nv {
+                        defs[d as usize] += 1;
+                        defsites.entry(d).or_default().push((bi, ii));
+                    }
+                }
+            }
+        }
+        let read0 = count_reads(f);
+        let np = f.params.len() as Val;
+        let mut sources: HashMap<Val, Vec<Val>> = HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
+                let (t, p) = match (&i.op, i.dst) {
+                    (Op::Copy { src }, Some(p)) => (*src, p),
+                    _ => continue,
+                };
+                macro_rules! reject {
+                    ($w:expr) => {{
+                        if dbg {
+                            eprintln!("COAL {} t=%{} p=%{} -> {}", f.name, t, p, $w);
+                        }
+                        continue;
+                    }};
+                }
+                if t == p || t as usize >= nv || p as usize >= nv {
+                    reject!("selbst")
+                }
+                if t < np || coalesced.contains_key(&t) || sources.contains_key(&t) {
+                    reject!("t schon vergeben")
+                }
+                if coalesced.contains_key(&p) {
+                    reject!("p ist selbst Quelle")
+                }
+                // (1) genau eine Schreib- und eine Lesestelle.
+                if defs[t as usize] != 1 || read0.get(t as usize).copied() != Some(1) {
+                    reject!("defs/reads")
+                }
+                // (2) gleicher Typ, kein Sonderplatz.
+                if f.val_ty(t) != f.val_ty(p) || f.val_ty(t) != i.ty {
+                    reject!("Typ")
+                }
+                if f.is_secret(t) || f.is_secret(p) {
+                    reject!("secret")
+                }
+                if cells.contains_key(&t)
+                    || cells.contains_key(&p)
+                    || fconst.contains_key(&t)
+                    || fconst.contains_key(&p)
+                    || alloc.imms.contains_key(&t)
+                    || alloc.imms.contains_key(&p)
+                    || alloc.frame_addr.contains_key(&t)
+                    || alloc.frame_addr.contains_key(&p)
+                {
+                    reject!("Sonderplatz")
+                }
+                // DIESELBE SCHRANKE WIE DER SCAN: wer nicht `fp_taugt`, darf
+                // kein `xmm` sehen -- sonst liest irgendein Weg des Erzeugers
+                // ein SSE-Register als Ganzzahlregister. Genau das war der
+                // Fehler aus Runde TEMPO 1 (`tests/1452_f32_abi.fi`).
+                if sse_class(f.val_ty(t)) && !(fp_ok[t as usize] && fp_ok[p as usize]) {
+                    reject!("taugt nicht fuer xmm")
+                }
+                if start[t as usize] == usize::MAX || start[p as usize] == usize::MAX {
+                    reject!("kein Intervall")
+                }
+                // (3) keine Stoerung -- weder mit `p` noch mit einer Quelle,
+                // die `p` schon hat.
+                if interferes(f, &live, &defsites, t, p, Some((bi, ii))) {
+                    reject!("Stoerung")
+                }
+                let taken = sources.entry(p).or_default();
+                if taken.iter().any(|&u| interferes(f, &live, &defsites, u, t, None)) {
+                    reject!("stoert eine schon verschmolzene Quelle")
+                }
+                if let Ok(n) = std::env::var("FIRN_COAL_N") {
+                    if coalesced.len() >= n.parse::<usize>().unwrap_or(usize::MAX) {
+                        reject!("Grenze FIRN_COAL_N")
+                    }
+                }
+                if dbg {
+                    eprintln!("COAL {} t=%{} p=%{} -> JA", f.name, t, p);
+                }
+                taken.push(t);
+                coalesced.insert(t, p);
+            }
+        }
+        // Die Intervalle zusammenlegen: `p` traegt ab jetzt die Lebensdauer,
+        // das Gewicht und die zerstoerten Register BEIDER Werte, `t` faellt
+        // aus der Liste. Das Gewicht ist der Grund, aus dem das hier und
+        // nicht spaeter steht -- ein Laufzeiger, der in jedem Durchlauf
+        // fortgeschaltet wird, ist damit so schwer, wie er wirklich ist.
+        for (t, ptgt) in coalesced.iter() {
+            let (tv, pv) = (*t as usize, *ptgt as usize);
+            if start[tv] < start[pv] {
+                start[pv] = start[tv];
+            }
+            if end[tv] > end[pv] {
+                end[pv] = end[tv];
+            }
+            weight[pv] = weight[pv].saturating_add(weight[tv]);
+            if let Some(x) = exact.as_mut() {
+                x[pv] |= x[tv];
+            }
+            start[tv] = usize::MAX;
         }
     }
 
@@ -1898,6 +2083,13 @@ pub fn allocate(f: &Func) -> Alloc {
             if f.val_ty(d).is_float() {
                 continue;
             }
+            // RUNDE TEMPO 8: eine verschmolzene Quelle NICHT aliasen. Der
+            // Alias laesst das Laden ganz weg ("der Wert steht schon im
+            // Zellregister") -- der Platz, mit dem sie verschmolzen ist,
+            // bekaeme ihn dann nie.
+            if coalesced.contains_key(&d) || coalesced.values().any(|q| *q == d) {
+                continue;
+            }
             // FULL WIDTH ONLY: at 8/16/32 bits the load pulls the relevant bits
             // out via movzx/mov32 — the cell register contains leftovers in the
             // upper part, and an alias would read them along (round 40, failure
@@ -2037,6 +2229,26 @@ pub fn allocate(f: &Func) -> Alloc {
     }
 
     }
+
+    // ---- RUNDE TEMPO 8, ZWEITER TEIL: die Verschmelzung eintragen ------
+    // `t` bekommt den Platz von `p`. Erst JETZT, nach dem Alias- und dem
+    // Zellweg -- beide vergeben eigene Plaetze und wuerden die
+    // Verschmelzung sonst wieder ueberschreiben.
+    // NUR WENN `p` WIRKLICH EIN REGISTER BEKOMMEN HAT.
+    //
+    // Sonst teilten sich zwei Werte EINEN RAHMENPLATZ. Das bringt nichts
+    // (gemessen: null Befehle) und macht die Wege kaputt, die einem Wert
+    // OHNE Register nachtraeglich doch einen Platz geben -- vor allem die
+    // Fliesskomma-Uebergabe `fp_handover`, die einen Wert mit genau einem
+    // Leser in `xmm2` legt statt in den Rahmen. Die Kopie haette dann
+    // geglaubt, Quelle und Ziel seien derselbe Platz, und nichts ausgegeben,
+    // waehrend der Wert in `xmm2` stand und niemand ihn ablegte.
+    for (t, ptgt) in coalesced.iter() {
+        if let Loc::Reg(r) = alloc.loc(*ptgt) {
+            alloc.locs[*t as usize] = Loc::Reg(r);
+        }
+    }
+
 
     // Frame including save slots for the callee-saved registers in use
     used_saved.sort_unstable();
@@ -2687,6 +2899,72 @@ impl<'a> Ra<'a> {
             Loc::Slot(off) => e.line(&format!("mov qword ptr [rbp-{}], {}", off, r)),
         }
     }
+}
+
+/// Lebt `v` unmittelbar NACH der Anweisung `ii` des Blocks `bi`?
+///
+/// Rueckwaertslauf vom Blockende: `live_out` ist der Anfang, jede
+/// Schreibstelle loescht, jede Lesestelle setzt. Innerhalb EINER Anweisung
+/// gewinnt das Lesen -- `v = v + 1` liest `v` vor dem Schreiben.
+fn live_after(f: &Func, live: &Live, v: Val, bi: usize, ii: usize) -> bool {
+    let b = &f.blocks[bi];
+    let mut alive = live.live_out[bi].get(v as usize).copied().unwrap_or(true);
+    match &b.term {
+        Term::BrCond { cond, .. } if *cond == v => alive = true,
+        Term::Switch { val, .. } if *val == v => alive = true,
+        Term::Ret(Some(x)) if *x == v => alive = true,
+        _ => {}
+    }
+    let mut buf = Vec::new();
+    for k in (ii + 1..b.insts.len()).rev() {
+        let inst = &b.insts[k];
+        if inst.dst == Some(v) {
+            alive = false;
+        }
+        buf.clear();
+        inst.op.uses(&mut buf);
+        if buf.contains(&v) {
+            alive = true;
+        }
+    }
+    alive
+}
+
+/// Stoeren sich `a` und `b` (Chaitin)? Ja, sobald an einer Schreibstelle des
+/// einen der andere noch lebt. Die Kopie `ausnahme`, die `b` aus `a`
+/// schreibt, zaehlt nicht mit -- sie ist der Grund, aus dem verschmolzen
+/// wird.
+///
+/// Geprueft werden nur die SCHREIBSTELLEN der beiden Werte; alles andere
+/// kann sie nicht gleichzeitig lebendig machen. Sie stehen fertig in
+/// `defsites`.
+fn interferes(
+    f: &Func,
+    live: &Live,
+    defsites: &HashMap<Val, Vec<(usize, usize)>>,
+    a: Val,
+    b: Val,
+    ausnahme: Option<(usize, usize)>,
+) -> bool {
+    // Ein Parameter wird beim Eintritt geschrieben, ohne Anweisung. Dort
+    // duerfte der andere nicht schon leben -- was nur fuer einen Wert mit
+    // mehreren Schreibstellen ueberhaupt vorkommen kann. Einfacher und
+    // sicher: ein Parameter wird nicht verschmolzen.
+    let np = f.params.len() as Val;
+    if a < np || b < np {
+        return true;
+    }
+    for (x, y) in [(a, b), (b, a)] {
+        for &(bi, ii) in defsites.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if ausnahme == Some((bi, ii)) {
+                continue;
+            }
+            if live_after(f, live, y, bi, ii) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Register aware emission of a function.
