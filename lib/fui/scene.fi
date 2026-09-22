@@ -76,13 +76,15 @@ export {
     node_set_text, node_set_widget_kind, node_widget,
     node_set_image, node_set_svg, node_set_art_align,
     node_set_flex, node_set_gap, node_set_padding, node_set_wrap,
-    node_set_grow, node_set_basis, node_set_align_self,
+    node_set_grow, node_set_basis, node_set_bounds, node_set_align_self,
     node_set_size, node_set_viewport, node_viewport,
     node_set_draw, node_style, node_decl,
     node_pref_w, node_pref_h, node_x, node_y, node_w, node_h,
     scene_style, scene_measure, scene_layout, scene_draw,
     scene_phase, scene_size_drift, scene_desc,
-    scene_kid_overflow, scene_depth_overflow,
+    scene_kid_overflow, scene_depth_overflow, scene_node_overflow,
+    scene_xform_skipped,
+    scene_limits_ok, scene_work_max, scene_limit_break,
     scene_hit, scene_find_id,
     N_BOX, N_TEXT, N_IMAGE, N_SVG, N_WIDGET, N_VIEWPORT,
     SCENE_NONE, SCENE_MAX, KIDS_MAX,
@@ -122,6 +124,29 @@ const SCENE_MAX: usize = 128
 const KIDS_MAX: usize = 64
 const SCENE_NONE: usize = 4294967295
 
+// DIE LAENGE DER ARBEITSFELDER IN `measure_node` UND `layout_node`.
+//
+// Dort stehen vier Felder -- die FlexItems, die Rechtecke und die
+// beiden Arbeitsfelder von `flex_layout` --, und ihre Laenge steht dort
+// als ZIFFER. Das ist keine Nachlaessigkeit, sondern die Sprache:
+// Firn nimmt an einer Feldlaenge keinen Namen an, ein
+// `[flex.FlexItem; KIDS_MAX]` wird mit "expected an integer array
+// length, found 'KIDS_MAX'" abgewiesen. Also wird die Ziffer hier
+// EINMAL benannt, und die Pruefung `scene_limits_ok` haelt die drei
+// Zahlen gegeneinander, die zusammenpassen muessen:
+//
+//     KIDS_MAX <= WORK_MAX        sonst schriebe `fill_items` hinter
+//                                 das letzte Feldelement,
+//     KIDS_MAX <= flex.FLEX_MAX   sonst nimmt `flex_layout` die Kinder
+//                                 gar nicht erst an.
+//
+// `scene_measure` und `scene_layout` fragen sie VOR dem ersten Schreiben
+// und MELDEN, statt zu schreiben (`scene_limit_break`). Wer eine der
+// drei Zahlen aendert und die anderen vergisst, bekommt darum eine
+// Zahl und keinen ueberschriebenen Stapel -- tools/fui/scene_main.fi
+// rechnet sie nach.
+const WORK_MAX: usize = 64
+
 // Die Durchgaenge, als Zahlen, damit eine Pruefung sie benennen kann.
 const PHASE_BUILD: u32 = 0
 const PHASE_STYLE: u32 = 1
@@ -154,6 +179,12 @@ struct Node {
     grow: i64,
     shrink: i64,
     basis: i64, // < 0 = auto (die gemessene Groesse)
+    // DIE SCHRANKEN AUF DER HAUPTACHSE, in Entwurfspunkten. 0 heisst
+    // "keine" -- genau wie bei flex.item_set_bounds, an das sie
+    // unveraendert weitergehen. Gerechnet wird mit ihnen dort und nur
+    // dort; dieses Modul klemmt nichts selbst.
+    min_main: i64,
+    max_main: i64,
     align_self: u32,
     fix_w: f64, // <= 0 = automatisch
     fix_h: f64,
@@ -210,6 +241,24 @@ struct Scene {
     // tools/fui/scene_main.fi rechnet die Zahl nach.
     kidof: usize,
     depthof: usize,
+    // UND DIE DRITTE: der Baum selbst ist voll. `scene_add` gibt dann
+    // ehrlich SCENE_NONE zurueck -- aber wer in einer Schleife
+    // zweihundert Zeilen anlegt, sieht den Rueckgabewert nicht an.
+    // Diese Zahl sagt hinterher, WIE VIELE Knoten gefehlt haben, und ein
+    // Aufrufer kann daraufhin melden, statt ein halbes Bild zu zeigen.
+    nodeof: usize,
+    // WIE OFT EINE UMFORMUNG UEBERGANGEN WURDE. Nicht jede Art laesst
+    // sich unter einer Matrix malen (der Grund steht bei `draw_self`).
+    // Ein solcher Knoten wird GERADE gemalt statt gar nicht -- und die
+    // Zahl steht hier, damit "mein Bild dreht sich nicht" eine Antwort
+    // hat, die man ablesen kann.
+    xfof: usize,
+    // UND DIE LETZTE, DIE GAR NICHT ERST EINTRETEN DARF: die drei
+    // Schranken aus dem Kopf dieser Datei (KIDS_MAX, WORK_MAX,
+    // flex.FLEX_MAX) passen nicht mehr zusammen. Dann wird NICHTS
+    // angeordnet und nichts gemessen, denn der erste Schreibzugriff
+    // laege hinter dem Feld -- gezaehlt wird stattdessen.
+    limof: usize,
 }
 
 fn node_blank() -> Node {
@@ -219,7 +268,8 @@ fn node_blank() -> Node {
         next: SCENE_NONE, nkids: 0,
         e: widget.widget_new(widget.KIND_NONE), d: sheet.decl_new(),
         fb: flex.flexbox_new(flex.FLEX_COLUMN),
-        grow: 0, shrink: 1000, basis: 0 - 1, align_self: flex.AL_AUTO,
+        grow: 0, shrink: 1000, basis: 0 - 1,
+        min_main: 0, max_main: 0, align_self: flex.AL_AUTO,
         fix_w: 0.0, fix_h: 0.0,
         pw: 0.0, ph: 0.0, mw: 0.0, mh: 0.0,
         x: 0.0, y: 0.0, w: 0.0, h: 0.0, vp: 0,
@@ -229,7 +279,8 @@ fn node_blank() -> Node {
 
 fn scene_new() -> Scene {
     return Scene { nodes: [node_blank(); 128], n: 0, root: SCENE_NONE,
-        phase: PHASE_BUILD, drift: 0, kidof: 0, depthof: 0 }
+        phase: PHASE_BUILD, drift: 0, kidof: 0, depthof: 0, nodeof: 0,
+        xfof: 0, limof: 0 }
 }
 
 fn scene_reset(sc: *mut Scene) {
@@ -239,6 +290,9 @@ fn scene_reset(sc: *mut Scene) {
     (*sc).drift = 0
     (*sc).kidof = 0
     (*sc).depthof = 0
+    (*sc).nodeof = 0
+    (*sc).xfof = 0
+    (*sc).limof = 0
 }
 
 fn scene_count(sc: *mut Scene) -> usize { return (*sc).n }
@@ -260,6 +314,36 @@ fn scene_kid_overflow(sc: *mut Scene) -> usize { return (*sc).kidof }
 // sagt es -- vorher tat es niemand.
 fn scene_depth_overflow(sc: *mut Scene) -> usize { return (*sc).depthof }
 
+// WIE VIELE KNOTEN DER BAUM NICHT MEHR AUFNEHMEN KONNTE. Die Zahl gilt
+// fuer den ganzen Aufbau seit dem letzten `scene_reset` -- anders als
+// `kidof`, die zum letzten Durchgang gehoert, denn Knoten werden im
+// Durchgang 0 angelegt. Null heisst: der Baum steht vollstaendig da.
+fn scene_node_overflow(sc: *mut Scene) -> usize { return (*sc).nodeof }
+
+// WIE OFT EINE UMFORMUNG UEBERGANGEN WURDE. Gilt fuer das letzte
+// Zeichnen, wie `scene_size_drift`.
+fn scene_xform_skipped(sc: *mut Scene) -> usize { return (*sc).xfof }
+
+// PASSEN DIE DREI SCHRANKEN ZUSAMMEN? Die Begruendung steht bei
+// WORK_MAX: Firn nimmt an einer Feldlaenge keinen Namen an, also gibt
+// es die Laenge der Arbeitsfelder zweimal -- als Ziffer im Feld und als
+// Name hier. Diese Funktion ist die Klammer um beide Stellen, und sie
+// wird GERUFEN, bevor irgendetwas geschrieben wird.
+fn scene_limits_ok() -> bool {
+    return KIDS_MAX <= WORK_MAX && KIDS_MAX <= flex.FLEX_MAX
+}
+
+// Die Laenge der Arbeitsfelder, damit eine Pruefung sie nennen kann,
+// ohne die Ziffer ein drittes Mal hinzuschreiben.
+fn scene_work_max() -> usize { return WORK_MAX }
+
+// WIE OFT EIN DURCHGANG WEGEN DER SCHRANKEN NICHT GELAUFEN IST. Null
+// heisst: `scene_measure` und `scene_layout` haben wirklich gerechnet.
+// Ist sie nicht null, steht kein Bild da -- und das ist die ehrliche
+// Antwort darauf, dass die Alternative ein Schreibzugriff hinter das
+// Feld waere.
+fn scene_limit_break(sc: *mut Scene) -> usize { return (*sc).limof }
+
 fn scene_node(sc: *mut Scene, i: usize) -> *mut Node {
     return &(*sc).nodes[i]
 }
@@ -274,6 +358,12 @@ fn scene_node(sc: *mut Scene, i: usize) -> *mut Node {
 // Knoten, aber er beschaedigt nichts.
 fn scene_add(sc: *mut Scene, parent: usize, kind: u32) -> usize {
     if (*sc).n >= SCENE_MAX {
+        // DER RUECKKANAL ZUR SCHRANKE. SCENE_NONE sieht nur der, der
+        // hinsieht; in einer Schleife ueber zweihundert Zeilen sieht es
+        // niemand. Also wird jeder abgewiesene Knoten GEZAEHLT, wie
+        // `kidof` und `drift`, und `scene_node_overflow` gibt die Zahl
+        // heraus.
+        (*sc).nodeof = (*sc).nodeof + 1
         return SCENE_NONE
     }
     let i: usize = (*sc).n
@@ -491,6 +581,27 @@ fn node_set_basis(sc: *mut Scene, i: usize, basis: i64) {
     (*sc).nodes[i].basis = basis
 }
 
+// DIE MINDEST- UND HOECHSTGROESSE AUF DER HAUPTACHSE. Das ist
+// `min-width`/`max-width` einer Zeile (bzw. `min-height`/`max-height`
+// einer Spalte), und es ist der Wert, ohne den ein wachsendes Kind beim
+// Schrumpfen verschwindet: ein Suchfeld mit grow 1000 wird in einer
+// engen Leiste so klein, dass sein Text nicht mehr hineinpasst. 0 heisst
+// "keine Schranke".
+//
+// GEKLEMMT WIRD IN flex.fi. Diese Funktion reicht die beiden Zahlen an
+// `flex.item_set_bounds` durch (in `fill_items`), und die
+// Nachverteilung, die daraus folgt (css-flexbox-1, 9.7), steht dort an
+// EINER Stelle. Ein eigenes `if breite < min` in dieser Datei waere die
+// zweite Klemmung und beim zweiten Durchgang der Nachverteilung falsch.
+fn node_set_bounds(sc: *mut Scene, i: usize, min_main: i64,
+    max_main: i64) {
+    if i >= (*sc).n {
+        return
+    }
+    (*sc).nodes[i].min_main = min_main
+    (*sc).nodes[i].max_main = max_main
+}
+
 fn node_set_align_self(sc: *mut Scene, i: usize, a: u32) {
     if i >= (*sc).n {
         return
@@ -660,7 +771,11 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     } else {
         var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
         let n: usize = fill_items(sc, i, &items[0])
-        let zeile: bool = is_row(&(*nd).fb)
+        // DIE RICHTUNGSFRAGE STELLT flex.fi. `flex_is_row` ist dieselbe
+        // Funktion, die `flex_measure_main` und `flex_layout` intern
+        // stellen -- ein `(*fb).dir == FLEX_ROW` an dieser Stelle waere
+        // der zweite Ort fuer dieselbe Entscheidung.
+        let zeile: bool = flex.flex_is_row(&(*nd).fb)
         let m: i64 = flex.flex_measure_main(&(*nd).fb, &items[0], n)
         let q: i64 = flex.flex_measure_cross(&(*nd).fb, &items[0], n)
         if zeile {
@@ -684,17 +799,13 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     widget.w_set_pref(&(*nd).e, pw, ph)
 }
 
-fn is_row(fb: *mut flex.FlexBox) -> bool {
-    return (*fb).dir == flex.FLEX_ROW || (*fb).dir == flex.FLEX_ROW_REVERSE
-}
-
 // Aus den gemessenen Kindern werden FlexItems. Die Umrechnung f64 ->
 // ganzzahlige Basis macht flex.flex_item_from_pref, und zwar als
 // einzige Stelle -- wer hier selbst rundet, bekommt zwei Kaesten mit
 // demselben Text in zwei Breiten.
 fn fill_items(sc: *mut Scene, i: usize, items: *mut flex.FlexItem) -> usize {
     let nd: *mut Node = &(*sc).nodes[i]
-    let zeile: bool = is_row(&(*nd).fb)
+    let zeile: bool = flex.flex_is_row(&(*nd).fb)
     var c: usize = (*nd).first
     var n: usize = 0
     while c != SCENE_NONE && n < KIDS_MAX {
@@ -706,6 +817,9 @@ fn fill_items(sc: *mut Scene, i: usize, items: *mut flex.FlexItem) -> usize {
             b = (*kid).basis
         }
         flex.item_set_flex(&it, (*kid).grow, (*kid).shrink, b)
+        // Die Schranken gehen unveraendert weiter -- auch die beiden
+        // Nullen, denn "keine Schranke" heisst in flex.fi genau 0.
+        flex.item_set_bounds(&it, (*kid).min_main, (*kid).max_main)
         flex.item_set_align(&it, (*kid).align_self)
         // Dieselbe Regel wie bei der Kette oben: die Schrittweite eines
         // FlexItem kennt flex.fi, nicht dieses Modul.
@@ -728,6 +842,13 @@ fn fill_items(sc: *mut Scene, i: usize, items: *mut flex.FlexItem) -> usize {
 
 fn scene_measure(sc: *mut Scene, c: *mut render.Ctx) {
     if (*sc).root == SCENE_NONE {
+        return
+    }
+    // MELDEN STATT SCHREIBEN. Stimmen die Schranken nicht mehr, ist der
+    // erste Schreibzugriff in `fill_items` einer hinter das Feld --
+    // also wird hier gar nicht erst angefangen.
+    if !scene_limits_ok() {
+        (*sc).limof = (*sc).limof + 1
         return
     }
     (*sc).kidof = 0
@@ -756,11 +877,18 @@ fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
     (*nd).w = w
     (*nd).h = h
     widget.w_place(&(*nd).e, x, y, w, h)
-    if (*nd).nkids == 0 {
-        return
-    }
-    // Der Scheibenkasten: seine Kinder bekommen den INHALT als Platz,
-    // verschoben um die Rollposition.
+    // DER SCHEIBENKASTEN BEKOMMT SEIN RECHTECK IMMER -- auch wenn er
+    // leer ist. Bis zum 21.09.2026 stand der Ruecksprung bei `nkids ==
+    // 0` VOR dieser Stelle, und ein Scheibenkasten ohne Kinder behielt
+    // darum das Rechteck, das er beim Anlegen bekommen hatte: seine
+    // Balken sassen woanders als sein Grund, `viewport_hit` rechnete
+    // gegen einen alten Ausschnitt, und der Clip schnitt eine Flaeche
+    // ab, die es nicht mehr gab. Eine Liste, die gerade leer gefiltert
+    // ist, ist kein Sonderfall, sondern der Normalfall -- also steht
+    // dieser Zweig jetzt vor dem Ruecksprung.
+    //
+    // Die Kinder bekommen danach den INHALT als Platz, verschoben um
+    // die Rollposition.
     var ox: f64 = x
     var oy: f64 = y
     var iw: f64 = w
@@ -772,6 +900,9 @@ fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
         oy = viewport.viewport_content_y(v)
         iw = viewport.viewport_content_w(v)
         ih = viewport.viewport_content_h(v)
+    }
+    if (*nd).nkids == 0 {
+        return
     }
     var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
     let n: usize = fill_items(sc, i, &items[0])
@@ -798,6 +929,12 @@ fn scene_layout(sc: *mut Scene, c: *mut render.Ctx, x: f64, y: f64,
     if (*sc).root == SCENE_NONE {
         return
     }
+    // Dieselbe Klammer wie beim Messen, aus demselben Grund: die vier
+    // Arbeitsfelder in `layout_node` sind WORK_MAX lang.
+    if !scene_limits_ok() {
+        (*sc).limof = (*sc).limof + 1
+        return
+    }
     (*sc).kidof = 0
     layout_node(sc, c, (*sc).root, x, y, w, h)
     (*sc).phase = PHASE_LAYOUT
@@ -819,29 +956,72 @@ fn scene_layout(sc: *mut Scene, c: *mut render.Ctx, x: f64, y: f64,
 // DIE UMFORMUNG IST EIN GANZ NORMALER STILWERT. Nennt das Blatt fuer
 // diesen Knoten `transform`, geht seine Flaeche durch die Matrix --
 // gerechnet wird sie in lib/fui/transform.fi, aufgestellt in
-// sheet.decl_apply_transform_at, und gemalt von render.draw_widget_xf.
-// Hier steht keine einzige Zeile Matrixrechnung. Gedreht wird um die
-// MITTE des Knotens; seine Kinder bleiben, wo sie stehen -- wer eine
-// ganze Gruppe drehen will, dreht den Knoten, der sie malt.
+// sheet.decl_apply_transform_at, und gemalt von render.draw_widget_xf
+// bzw. wave3.draw_any_xf. Hier steht keine einzige Zeile
+// Matrixrechnung. Gedreht wird um die MITTE des Knotens; seine Kinder
+// bleiben, wo sie stehen -- wer eine ganze Gruppe drehen will, dreht
+// den Knoten, der sie malt.
+//
+// UND DIE UMFORMUNG ERSETZT DIE ART NICHT. Bis zum 21.09.2026 stand
+// hier ein Zweig VOR der Artunterscheidung: hatte ein Knoten eine
+// Matrix, ging er durch `render.draw_widget_xf` -- und war damit, ganz
+// gleich was er war, ein Kasten mit Flaeche, Rand und Schrift. Ein
+// gedrehtes Ankreuzkaestchen verlor seinen Haken, ein gedrehtes Bild
+// sein Bild, und im Quelltext war nichts zu sehen. Jetzt entscheidet
+// ZUERST die Art und dann der Weg:
+//
+//     N_BOX, N_VIEWPORT, N_TEXT   render.draw_widget_xf -- ihr ganzes
+//                                 Aussehen IST Flaeche, Rand, Schrift.
+//     N_WIDGET                    wave3.draw_any_xf, aber nur, wenn
+//                                 `wave3.kind_xf_ready` die Art dafuer
+//                                 bereit nennt.
+//     N_IMAGE, N_SVG              gerade gemalt: eine Bildflaeche unter
+//                                 einer Matrix ist eine zweite
+//                                 Abtastung und gehoerte nach
+//                                 uiimage.fi, nicht hierher.
+//
+// Was NICHT umgeformt werden kann, wird UNVERAENDERT gemalt und die
+// uebergangene Umformung GEZAEHLT (`scene_xform_skipped`) -- dieselbe
+// Regel wie bei `drift` und `kidof`: ein fehlendes Element ist
+// schlimmer als ein unverdrehtes, und eine stille Auslassung ist
+// schlimmer als beides.
 fn draw_self(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     let nd: *mut Node = &(*sc).nodes[i]
     let e: *mut widget.Widget = &(*nd).e
     let kind: u32 = (*nd).kind
     let umgeformt: bool = sheet.decl_has(&(*nd).d,
         sheet.EX_TRANSLATE | sheet.EX_SCALE | sheet.EX_ROTATE, true)
+    var xf: transform.Xform = transform.xf_new()
     if umgeformt {
-        var xf: transform.Xform = transform.xf_new()
         sheet.decl_apply_transform_at(&(*nd).d, &xf,
             (*nd).x + (*nd).w / 2.0, (*nd).y + (*nd).h / 2.0)
-        render.draw_widget_xf(c, e, &xf)
-    } else if kind == N_BOX || kind == N_VIEWPORT {
-        render.draw_base(c, e)
+    }
+    if kind == N_BOX || kind == N_VIEWPORT {
+        if umgeformt {
+            render.draw_widget_xf(c, e, &xf)
+        } else {
+            render.draw_base(c, e)
+        }
     } else if kind == N_TEXT {
-        render.draw_label(c, e)
+        if umgeformt {
+            render.draw_widget_xf(c, e, &xf)
+        } else {
+            render.draw_label(c, e)
+        }
     } else if kind == N_IMAGE || kind == N_SVG {
+        if umgeformt {
+            (*sc).xfof = (*sc).xfof + 1
+        }
         render.draw_widget_art(c, e)
     } else if kind == N_WIDGET {
-        wave3.draw_any(c, e)
+        if umgeformt && wave3.kind_xf_ready(widget.w_kind(e)) {
+            wave3.draw_any_xf(c, e, &xf)
+        } else {
+            if umgeformt {
+                (*sc).xfof = (*sc).xfof + 1
+            }
+            wave3.draw_any(c, e)
+        }
     }
     if (*nd).has_dr != 0 as u32 {
         let f: fn(u64, *mut render.Ctx, *mut widget.Widget) = (*nd).dr
@@ -923,6 +1103,7 @@ fn scene_draw(sc: *mut Scene, c: *mut render.Ctx) {
         return
     }
     (*sc).drift = 0
+    (*sc).xfof = 0
     draw_node(sc, c, (*sc).root)
     (*sc).phase = PHASE_DRAW
 }

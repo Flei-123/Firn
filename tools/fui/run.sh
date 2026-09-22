@@ -369,6 +369,33 @@ if [ -n "$verboten" ]; then
 fi
 echo "  floor/ceil/abs kommen in lib/fui/ nur aus svg.matrix        OK"
 
+# KEINE ZIFFER ALS SCHRITTWEITE UEBER EINE STRUKTUR. In
+# demos/fuidemo/main.fi stand dreimal `(i * 32)`, um in ein Feld von
+# `layout.Rect` zu greifen. Das ist heute richtig und morgen falsch:
+# kommt in `Rect` ein Feld dazu, sagt kein Uebersetzer etwas, und ab da
+# wird mitten in ein Rechteck hinein gelesen -- der Fehler faellt als
+# verschobenes Bild auf, nicht als Meldung. Die Schrittweite wird
+# darum GEMESSEN (layout.rect_stride, sheet.sheet_desc_stride, beide
+# nach demselben Muster: Differenz zweier Nachbarn eines echten
+# Feldes), und hier wird die Ziffer maschinell verboten.
+#
+# Gesucht werden Zeilen, die eine Zahl mit einem Index malnehmen UND im
+# selben Atemzug auf einen STRUKTURZEIGER (`as *mut modul.Typ`)
+# umdeuten. Die Schrittweiten der Grundtypen (4 fuer u32, 8 fuer i64
+# und f64) bleiben erlaubt: die aendern sich nicht, wenn jemand ein
+# Feld hinzufuegt. Kommentarzeilen sind ausgenommen, denn dieser Text
+# hier darf die verbotene Form nennen duerfen.
+ziffern=$(grep -n -E '\* *[0-9]+\)? *as u64.*as \*mut [a-z_]+\.[A-Z]' \
+    demos/*/main.fi tools/fui/*.fi \
+    | grep -v "^[^:]*:[0-9]*: *//" || true)
+if [ -n "$ziffern" ]; then
+    echo "  eine Ziffer als Schrittweite ueber eine Struktur --"
+    echo "  nimm layout.rect_stride() bzw. sheet.sheet_desc_stride():"
+    echo "$ziffern"
+    exit 1
+fi
+echo "  keine Ziffer als Schrittweite in demos/ und tools/fui/     OK"
+
 # JEDER IMPORT WIRD AUCH GERUFEN. In lib/fui/scene.fi stand `import
 # std.rt`, obwohl in der ganzen Datei kein einziges `rt.` vorkam -- und
 # genau so kommt eine Abhaengigkeit in ein Modul, das freistehend
