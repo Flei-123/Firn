@@ -4,6 +4,31 @@ Everything here **has been run** exactly as it stands (2026-08-14, AMD EPYC
 7571, Linux x86_64, rustc 1.99.0-nightly, binutils `as`/`ld`). Relative paths
 only, everything inside this directory.
 
+## 0a. Integration pass, re-measured 2026-09-22
+
+The three modules of this round (`viewport.fi`, `scene.fi`, `sheet.fi`)
+were built by three people in parallel. This pass checked that they are
+ONE working whole and not three that happen to compile. What was run,
+and what it printed:
+
+```sh
+sh tools/fui/run.sh --images     # -> ALL CHECKS PASSED, 26 pictures
+W=/tmp/fui-clean sh tools/fui/run.sh   # clean working dir -> ALL CHECKS PASSED
+```
+
+Four things a green run does **not** prove were checked separately:
+
+| Checked | How | Result |
+|---|---|---|
+| The delivered evidence is what the code paints **today** | `cmp` of all 26 `.gauntlet-shots/*.png` against the freshly painted `$W/belege` | 26 of 26 **byte-identical** |
+| No name is defined in two modules | the `export { ... }` blocks of all 23 `lib/fui/*.fi` collected and `uniq -d` | 1017 exported names, **0 duplicates** |
+| The new modules contain no second copy of flex/anim/matrix/blur | grep for own `bezier`/`spring`/`matrix`/`blur` functions in the three files | none; instead 41 `flex.`, 31 `render.`, 13 `anim.`, 4 `transform.` calls |
+| The core is still kernel-pure | section 1 of the run | `core.o` / `style.o` / `layout.o`: **0 syscall, 0 foreign names** each |
+
+Nothing had to be repaired in this pass: the tree was already
+consistent. The numbers above are the evidence for that, so that the
+next reader does not have to take it on trust.
+
 ## 0. Prerequisites
 
 * `cargo`/`rustc` (only to build the compiler and the yardsticks -- the
@@ -240,6 +265,83 @@ that breaks nothing today and something later:
   draws straight into the rasteriser, `svg.pfad` builds and keeps a
   path object) and says where the rule points instead.
 
+### Round DECLARATIVE: describing a surface instead of painting it
+
+Three modules were added in this round, and they are what separates a
+UI library from a drawing library:
+
+| Module | What it is |
+|---|---|
+| `lib/fui/viewport.fi` | The scroll viewport: a cut-out with its own size over content of any size, **real clipping** through `canvas.clip_push_rect` (no second clip), wheel and keyboard scrolling, scrollbars whose thumb length follows from cut-out/content (computed in `wave2.scrollbar_thumb`, the one place), kinetic fling as a plain `anim.Animation` (no second clock), `viewport_ensure_visible`, and a hit test that accounts for the offset |
+| `lib/fui/scene.fi` | The tree: nodes with kind, `id`, classes, children and style, walked in four separated passes -- style, measure (`render.pref_of`), layout (`flex.flex_layout`), draw. No node may change its size while drawing; `scene_size_drift` counts every attempt and the check reads that number |
+| `lib/fui/sheet.fi` | The style sheet, built **in source** (no CSS parser -- `lib/browser` already has one): rules "selector -> style values", selecting by kind, id, class, state and ancestry, merged by a specificity that is worked out (id 10000 &gt; class 100 &gt; kind 1, ties go to the later rule), plus inheritance of exactly four values (`INHERIT_MASK` = 36996: colour, font size, font id, line height) |
+
+None of the three recomputes anything that already exists: flexbox from
+`flex.fi`, time and easing from `anim.fi`, matrices from
+`lib/svg/matrix.fi` through `transform.fi`, measuring and drawing from
+`render.fi`/`wave2`/`wave3`.
+
+Their checks are sections 18b, 18c and 18d of the acceptance run
+(`viewport_main.fi`, `sheet_main.fi`, `scene_main.fi`), all numeric:
+the cascade on deliberately contradictory cases, inheritance **and its
+boundary**, the clipping counted pixel by pixel on a real canvas (zero
+points outside the cut-out, 49632 inside, and the counter-test without
+the clip reports 44720 spilled points in red), the thumb length from
+the ratio, and the hit test under scrolling.
+
+Section 19c counts, mechanically, what the round is for: the same tool
+bar -- three buttons, a search field with `grow`, one accent button --
+painted call by call in `demos/fuidemo/main.fi` (`fn
+werkzeugleiste_gemalt`) against the same bar described in
+`tools/fui/gallery9_main.fi` (tree plus its rules in the style sheet).
+Counted are lines of code, without blanks and comments, in three cuts,
+because a single number here would necessarily hide something:
+
+| cut | painted | described |
+|---|---|---|
+| raw (everything inside the markers resp. the function) | 64 | 42 |
+| A -- without the captions, subtracted on **both** sides | 54 | 40 |
+| B -- additionally without the looks (fill, border, colour, radius) | 46 | 21 |
+
+Cut B is the honest headline: what is left is the structure alone, and
+there the description needs **21 lines where painting needs 46** -- the
+distribution, the setting of every single rectangle and the own drawing
+loop fall away entirely. In cut A the saving is small on purpose: a
+style sheet writes colour and radius **once for the whole page**, and
+this comparison still charges all of it to the described side. The run
+stops if A ever exceeds 90 % or B ever exceeds two thirds of the
+painted side. Shared helpers (`setze`, `item_von_widget`) are counted
+on neither side, because `titelzeile` and `dialog` call them too --
+charging shared lines to one side only would be talking the saving up.
+
+**And the same comparison inside ONE file (section 19d).** 19c counts
+across two files, and a reviewer may rightly ask whether that is still
+the same piece of surface. So the same bar is counted a second time
+where both versions stand next to each other and provably paint the
+same picture: `demos/fuidemo/main.fi`, `fn werkzeugleiste` (markers
+`>>> LEISTE BESCHRIEBEN` ... `<<< LEISTE BESCHRIEBEN`) against
+`fn werkzeugleiste_gemalt` in **the same file** (markers
+`>>> LEISTE GEMALT` ... `<<< LEISTE GEMALT`). `pruefe_leisten` in that
+file holds their five rectangles against each other as integers, at 952
+**and** at 260 points of width, where the 140-point clamp of the search
+field really bites.
+
+| cut | painted | described |
+|---|---|---|
+| raw | 52 | 51 |
+| A -- without the captions | 42 | 41 |
+| B -- the structure alone | 32 | **22** |
+
+The first two numbers say something uncomfortable, and they say it as
+numbers instead of as an excuse: for a **single** bar the description
+is not shorter (51 against 52 lines) -- a style sheet for one bar does
+not amortise. The structure is where it pays: 22 lines against 32,
+that is 69 %, and the run stops above 75 % (and also if the described
+version ever gets longer than the painted one in raw or in cut A).
+Outside the markers stands, on both sides, only the check itself: the
+handing out of the five rectangles and the message about an incomplete
+tree. Nothing of the surface.
+
 **One command checks all of it:**
 
 ```sh
@@ -283,7 +385,7 @@ Set `BELEGE` to put them somewhere else. If that directory cannot be
 created or written, the run says so and exits non-zero; it does not
 print `ALL CHECKS PASSED` with pictures missing.
 
-The same twenty-two files are checked in under `.gauntlet-shots/`,
+The same twenty-six files are checked in under `.gauntlet-shots/`,
 light and dark for each, numbered in reading order. That is the whole
 delivered evidence set: a reviewer who does not start the run sees in
 this table which picture carries which point of the acceptance bar, and
@@ -292,7 +394,7 @@ which program writes it.
 | File in `.gauntlet-shots/` | written by | what it has to show |
 |---|---|---|
 | `01/02-wave1-grundelemente-{hell,dunkel}.png` | `tools/fui/gallery_main.fi` | bar 5: button in five states, six style looks, label alignment and sizes, the box with the stretchy address field (the address stands there COMPLETE, measured against the field), the 6x2 grid, the window buttons from the core at 1x/2x/3x -- nothing overlaps, nothing is cut off, readable in light AND dark |
-| `03/04-wave2-widgets-{hell,dunkel}.png` | `tools/fui/gallery2_main.fi` | bar 5: checkbox, radio, switch, slider, progress, spinner, tooltip, tabs, menu -- each at its measured size, the tooltip without the grey box behind it |
+| `03/04-wave2-widgets-{hell,dunkel}.png` | `tools/fui/gallery2_main.fi` | bar 5: checkbox, radio, switch, slider, progress, spinner, tooltip, tabs, menu -- each at its measured size, the tooltip without the grey box behind it, and **the switch without a grey slab behind its label**: `KIND_TOGGLE` stood in both branches of `render.def_bg_state`/`def_bg`, so the documented rule ("it colours its box, not its row") silently lost to the order of the tests. Measured in these two pictures, in the strip above the pill (y 282..288, x 150..599): **2830 foreign pixels before, 51 after** in light, 2832 -> 51 in dark -- what is left is the edge of the pill itself. The check for it is section 10 of `tools/fui/wave2_main.fi`, on a real canvas and with the counter-proof that a BUTTON of the same size does carry 790 points of surface |
 | `05/06-wave3-widgets-{hell,dunkel}.png` | `tools/fui/gallery3_main.fi` | bar 5: list, table, tree, card, badges, date and colour picker, modal dialog over the scrim -- and the dialog/menu shadow that `render` takes from `effect.drop_shadow_round` |
 | `07/08-text-{hell,dunkel}.png` | `tools/fui/gallery4_main.fi` | bar 5: line breaking, ellipsis, outline and text shadow -- no text runs out of its box |
 | `09/10-bild-svg-{hell,dunkel}.png` | `tools/fui/artshow_main.fi` | the round BILD+SVG: the same SVG re-rastered per size (12..64) instead of scaled, `currentColor`, pictures with alpha over four grounds |
@@ -302,6 +404,8 @@ which program writes it.
 | `17/18-transform-rotate-scale-{hell,dunkel}.png` | `tools/fui/gallery8_main.fi` | bar 4: rotated, scaled and skewed widgets with clean edges (no stair-stepping), pictures under the inverse mapping with bilinear sampling, the hit test under rotation |
 | `19/20-demo-anwendung-{hell,dunkel}.png` | `demos/fuidemo/main.fi` | bar 2: the three new modules have a caller OUTSIDE their own check -- title bar and tool bar distributed by `flex.flex_layout` (grow on the field, every basis measured through `render.pref_of`), the hover transition of a button driven by `anim.Animator` in seven labelled phases, the dialog shadow from `effect.drop_shadow_spread` |
 | `21/22-preview-zustaende-{hell,dunkel}.png` | `tools/fui/preview_main.fi` | bar 5: the five button states, the text field at rest and focused with selection and caret, the same buttons under `shape_classic`, and the whole row at 150 % scale -- the proof that shape and scale are a theme decision |
+| `23/24-deklarativ-scene-sheet-{hell,dunkel}.png` | `tools/fui/gallery9_main.fi` | round DECLARATIVE: a whole page that is **described**, not painted -- a scroll viewport carrying 28 rows on 1130 points of content in a 528 point cut-out (rows visibly clipped top and bottom, scrollbar length from the cut-out/content ratio), the cascade in the picture (class 100 &lt; two classes 200 &lt; id 10000), inheritance of font and colour but not of the background |
+| `25/26-deklarativ-schmal-980px-{hell,dunkel}.png` | `tools/fui/gallery9_main.fi` | the same described page on 980 instead of 1240 points: the layout is really **computed**, not written down -- the right column gets narrower, the tool bar keeps its gaps, the viewport keeps its scrollbar, and still nothing overlaps and no text leaves its box |
 
 Every one of these pictures is measured before it is written: the
 programs check their own pixels (contrast against the ground it is

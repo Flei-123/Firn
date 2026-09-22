@@ -1,0 +1,1454 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/scene_main.fi -- DER BAUM WIRD NACHGERECHNET.
+//
+// Was hier geprueft wird, ist nicht "es sieht gut aus", sondern die
+// Eigenschaften, ohne die eine Beschreibung keine Beschreibung waere:
+//
+//   1. Der Baum steht so da, wie er gebaut wurde: Reihenfolge der
+//      Kinder, Elternteil, Zahl der Kinder.
+//   2. Das Stilblatt kommt am richtigen Knoten an -- und was der
+//      Elternteil vererbt, steht beim Kind, was er nicht vererbt,
+//      nicht.
+//   3. Die Trefferpruefung trifft den OBERSTEN Knoten unter dem Punkt
+//      und nicht den ersten.
+//   4. Die Durchgaenge sind getrennt: nach dem Zeichnen meldet
+//      `scene_size_drift` NULL -- kein Knoten hat beim Malen noch
+//      seine Groesse geaendert.
+//
+//   5. Gemessen und angeordnet wird mit einem ECHTEN Zeichenkontext
+//      (Schrift, Leinwand, Theme), und jede Zahl ist von Hand
+//      gerechnet -- eine Zeile aus drei Knoepfen mit Luecke und
+//      Innenrand, wie in tools/fui/flex_main.fi.
+//   6. Ein Scheibenkasten mit VIERZIG Kindern: was ausserhalb des
+//      Ausschnitts liegt, ist nicht anklickbar, und nach dem Rollen
+//      trifft derselbe Punkt ein ANDERES Kind.
+//   7. Die Drift-Wache ist scharf: ein absichtlich falscher Maler, der
+//      beim Zeichnen die Groesse seines Knotens aendert, bringt
+//      `scene_size_drift` auf genau 1. Der falsche Maler steht HIER
+//      und nicht in der Bibliothek -- eine Wache, die nie anschlaegt,
+//      ist keine.
+//   8. Die Vererbung geht durch DREI Ebenen, und `scene_desc`
+//      verschiebt die Knotenarten um 1000: eine Regel auf
+//      widget.KIND_LABEL darf einen N_TEXT-Knoten NICHT treffen.
+//   9. Der VOLLE Baum: 129 Aufrufe von `scene_add` legen 128 Knoten
+//      an, der 129. liefert SCENE_NONE, und kein Setter auf diesen
+//      Platz schreibt irgendetwas. Dazu die beiden Schrittweiten
+//      (sheet.sheet_desc_stride, flex.flex_item_stride) gegen die
+//      ECHTE Adressdifferenz zweier Feldelemente -- nicht gegen eine
+//      Konstante, die hier ein zweites Mal stuende.
+//  10. Ein Kasten mit 65 Kindern: `scene_kid_overflow` meldet GENAU 1
+//      (mit der Gegenprobe bei 64: dort null), das 65. Kind bekommt
+//      kein Rechteck -- und bei (0,0) steht danach auf der Leinwand
+//      noch der Grund, es wird also nicht in die Ecke gemalt.
+//  11. Ein Baum mit 17 Ebenen: `scene_depth_overflow` meldet GENAU 1
+//      (Gegenprobe bei 16: null), der abgebrochene Knoten bleibt
+//      wirklich ohne Grund und sein Elternteil ist noch gestylt.
+//  12. Die drei Schranken (KIDS_MAX, die Laenge der Arbeitsfelder,
+//      flex.FLEX_MAX) passen zusammen -- und ein Scheibenkasten OHNE
+//      Kinder bekommt sein Rechteck trotzdem: alle vier Zahlen des
+//      Ausschnitts werden nachgerechnet.
+//  13. Der VOLLE Baum zaehlt: SCENE_MAX + 3 Aufrufe von `scene_add`
+//      legen 128 Knoten an und melden GENAU 3 ueber
+//      `scene_node_overflow` (Gegenprobe bei SCENE_MAX: null), und
+//      `scene_overflow_reason` nennt den Grund als EINE Zahl.
+//  14. `node_set_bounds` klemmt wirklich -- und zwar in flex.fi: ohne
+//      Schranke gibt ein Kind seine gemessene Breite nicht her, mit
+//      Schranke klemmt es bei 140 und die Nachverteilung gibt den Rest
+//      an sein Geschwister (60).
+//  15. DIE UMFORMUNG ERSETZT DIE ART NICHT. Ein gedrehter Knopf steht
+//      wirklich schief (Punkte links neben seinem geraden Rechteck),
+//      ein gedrehtes Ankreuzkaestchen behaelt seinen HAKEN und meldet
+//      die uebergangene Umformung -- mit der Gegenprobe, dass der alte
+//      Weg (`render.draw_widget_xf` fuer jede Art) den Haken verliert.
+//  16. Ein Bildknoten und ein SVG-Knoten: gemessene Wunschgroesse
+//      (56 x 40), Lage der Bildflaeche bei ART_ONLY, ART_LEFT und
+//      ART_RIGHT, und die Farbkanaele auf der Leinwand.
+//
+// Die Abschnitte 1 bis 4 haengen nicht an der Schrift; fehlt sie, sind
+// nur die Textbreiten in Abschnitt 5 null, und die Pruefung dort
+// vergleicht Baum gegen render.pref_of, also zwei Zahlen aus derselben
+// Quelle.
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.style
+import fui.theme
+import fui.widget
+import fui.flex
+import fui.painter
+import fui.render
+import fui.viewport
+import fui.transform
+import fui.uiimage
+import fui.uisvg
+import fui.sheet
+import fui.scene
+
+const FONTSET_BYTES: usize = 4096
+const CW: usize = 420
+const CH: usize = 260
+
+// DER ABSICHTLICH FALSCHE MALER. Er tut genau das, was ein Knoten beim
+// Zeichnen nicht darf: er aendert seine Groesse. Damit ist die
+// Gegenprobe zur Drift-Wache eine ECHTE -- sie liegt im Test, die
+// Bibliothek hat keinen Schalter dafuer.
+fn maler_falsch(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    widget.w_set_pref(e, widget.w_pref_w(e) + 7.0, widget.w_pref_h(e))
+}
+
+// Und der brave: er malt (hier: nichts) und laesst die Groesse in Ruhe.
+fn maler_brav(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    render.draw_base(c, e)
+}
+
+// ======================================================================
+// WAS AUF DER LEINWAND STEHT -- DREI ZAEHLUNGEN
+// ======================================================================
+//
+// Die Abschnitte 14 und 15 behaupten nichts ueber Bilder, sie ZAEHLEN
+// Bildpunkte. Dafuer braucht dieses Programm genau drei Werkzeuge: wie
+// viele Punkte in einem Rechteck gesetzt sind, wie ein Rechteck vor
+// einer Aenderung aussah, und wie viele Punkte sich danach geaendert
+// haben. Der Vergleich ueber einen Schnappschuss ist dabei der
+// belastbarste, den es gibt: er haengt an KEINER Farbe des Themas --
+// zwei Bilder desselben Knotens, einmal mit und einmal ohne Haken,
+// unterscheiden sich genau dort, wo der Haken steht.
+const SCHNAPP_MAX: usize = 2048
+
+fn zaehle_gesetzt(cv: *mut canvas.Canvas, x0: usize, y0: usize,
+    w: usize, h: usize) -> usize {
+    var n: usize = 0
+    var y: usize = y0
+    while y < y0 + h {
+        var x: usize = x0
+        while x < x0 + w {
+            if canvas.color_a(canvas.canvas_get(cv, x, y)) != 0 as u32 {
+                n = n + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+fn schnappe(cv: *mut canvas.Canvas, x0: usize, y0: usize, w: usize,
+    h: usize, out: *mut u32) {
+    var i: usize = 0
+    var y: usize = y0
+    while y < y0 + h {
+        var x: usize = x0
+        while x < x0 + w {
+            if i < SCHNAPP_MAX {
+                *((out as u64 + (i * 4) as u64) as *mut u32) =
+                    canvas.canvas_get(cv, x, y)
+            }
+            i = i + 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn zaehle_anders(cv: *mut canvas.Canvas, x0: usize, y0: usize, w: usize,
+    h: usize, alt: *mut u32) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    var y: usize = y0
+    while y < y0 + h {
+        var x: usize = x0
+        while x < x0 + w {
+            if i < SCHNAPP_MAX {
+                let a: u32 = *((alt as u64 + (i * 4) as u64) as *mut u32)
+                if canvas.canvas_get(cv, x, y) != a {
+                    n = n + 1
+                }
+            }
+            i = i + 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn main(start: u64) -> i32 {
+    var c_karte: [u8; 5] = "karte"
+    var c_titel: [u8; 5] = "titel"
+    let K: u32 = sheet.sheet_name((&c_karte[0]) as u64, 5)
+    let T: u32 = sheet.sheet_name((&c_titel[0]) as u64, 5)
+
+    // ==================================================== 1. DER BAUM
+    var sc: scene.Scene = scene.scene_new()
+    let wurzel: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_BOX)
+    let karte: usize = scene.scene_add(&sc, wurzel, scene.N_BOX)
+    let titel: usize = scene.scene_add(&sc, karte, scene.N_TEXT)
+    let zeile: usize = scene.scene_add(&sc, karte, scene.N_TEXT)
+    scene.node_add_class(&sc, karte, K)
+    scene.node_add_class(&sc, titel, T)
+
+    var n1: [u8; 30] = "1 die Wurzel hat ein Kind     "
+    report((&n1[0]) as u64, 30,
+        scene.scene_child_count(&sc, wurzel) == 1,
+        scene.scene_child_count(&sc, wurzel) as i64, 1)
+    var n2: [u8; 30] = "1 die Karte hat zwei Kinder   "
+    report((&n2[0]) as u64, 30,
+        scene.scene_child_count(&sc, karte) == 2,
+        scene.scene_child_count(&sc, karte) as i64, 2)
+    var n3: [u8; 34] = "1 das zweite Kind ist die Zeile   "
+    report((&n3[0]) as u64, 34,
+        scene.scene_child_at(&sc, karte, 1) == zeile,
+        scene.scene_child_at(&sc, karte, 1) as i64, zeile as i64)
+    var n4: [u8; 35] = "1 der Titel kennt seinen Elternteil"
+    report((&n4[0]) as u64, 35, scene.scene_parent(&sc, titel) == karte,
+        scene.scene_parent(&sc, titel) as i64, karte as i64)
+
+    // ============================ 2. DAS BLATT UND DIE VERERBUNG
+    //
+    // Die Karte bekommt Grund UND Schriftfarbe. Beim Titel darf die
+    // Schriftfarbe ankommen, der Grund NICHT -- sonst malt jedes Kind
+    // den Grund seines Elternteils noch einmal.
+    var blatt: sheet.Sheet = sheet.sheet_new()
+    var d_karte: sheet.Decl = sheet.decl_new()
+    var s: style.Style = style.style_new()
+    s = style.style_set_bg(s, style.color_literal(17 as u32))
+    s = style.style_set_fg(s, style.color_literal(33 as u32))
+    sheet.decl_set_style(&d_karte, s)
+    sheet.sheet_add(&blatt, sheet.sel_class(K), d_karte)
+
+    scene.scene_style(&sc, &blatt)
+    let t_fg: i64 =
+    style.color_value((*scene.node_style(&sc, titel)).fg) as i64
+    let t_hat_bg: bool = sheet.decl_has(scene.node_decl(&sc, titel),
+        style.SF_BG, false)
+    let k_bg: i64 =
+    style.color_value((*scene.node_style(&sc, karte)).bg) as i64
+    var n5: [u8; 34] = "2 die Karte hat ihren Grund       "
+    report((&n5[0]) as u64, 34, k_bg == 17, k_bg, 17)
+    var n6: [u8; 34] = "2 der Titel erbt die Schriftfarbe "
+    report((&n6[0]) as u64, 34, t_fg == 33, t_fg, 33)
+    var n7: [u8; 34] = "2 der Titel erbt den Grund NICHT  "
+    report((&n7[0]) as u64, 34, !t_hat_bg, t_hat_bg as i64, 0)
+
+    // ============================== 3. DIE TREFFERPRUEFUNG
+    //
+    // Ohne Schrift wird nicht gemessen, also werden die Rechtecke von
+    // Hand gesetzt -- geprueft wird die AUSWAHL, nicht das Anordnen.
+    let w_wurzel: *mut scene.Node = scene.scene_node(&sc, wurzel)
+    let w_karte: *mut scene.Node = scene.scene_node(&sc, karte)
+    let w_titel: *mut scene.Node = scene.scene_node(&sc, titel)
+    (*w_wurzel).x = 0.0
+    (*w_wurzel).y = 0.0
+    (*w_wurzel).w = 400.0
+    (*w_wurzel).h = 300.0
+    (*w_karte).x = 20.0
+    (*w_karte).y = 20.0
+    (*w_karte).w = 200.0
+    (*w_karte).h = 100.0
+    (*w_titel).x = 30.0
+    (*w_titel).y = 30.0
+    (*w_titel).w = 80.0
+    (*w_titel).h = 20.0
+
+    let tr1: usize = scene.scene_hit(&sc, 35.0, 35.0)
+    var n8: [u8; 34] = "3 der Punkt im Titel trifft ihn   "
+    report((&n8[0]) as u64, 34, tr1 == titel, tr1 as i64, titel as i64)
+    let tr2: usize = scene.scene_hit(&sc, 150.0, 90.0)
+    var n9: [u8; 34] = "3 daneben trifft die Karte        "
+    report((&n9[0]) as u64, 34, tr2 == karte, tr2 as i64, karte as i64)
+    let tr3: usize = scene.scene_hit(&sc, 390.0, 290.0)
+    var n10: [u8; 34] = "3 ganz aussen trifft die Wurzel   "
+    report((&n10[0]) as u64, 34, tr3 == wurzel, tr3 as i64,
+        wurzel as i64)
+
+    // ======================================== 4. DIE DURCHGAENGE
+    var n11: [u8; 34] = "4 nach dem Stil steht Durchgang 1 "
+    report((&n11[0]) as u64, 34,
+        scene.scene_phase(&sc) == scene.PHASE_STYLE,
+        scene.scene_phase(&sc) as i64, scene.PHASE_STYLE as i64)
+    var n12: [u8; 34] = "4 keine Groesse driftet beim Malen"
+    report((&n12[0]) as u64, 34, scene.scene_size_drift(&sc) == 0,
+        scene.scene_size_drift(&sc) as i64, 0)
+
+    // ==================================================================
+    // DER ECHTE ZEICHENKONTEXT
+    // ==================================================================
+    //
+    // Ab hier wird mit Schrift, Leinwand und Theme gerechnet -- also
+    // genau mit dem, womit auch eine Galerie malt. Nichts davon wird
+    // nachgebaut: die Schrift kommt aus lib/font, die Leinwand aus
+    // lib/paint, das Messen aus lib/fui/render.fi.
+    var fbuf: rt.Buf = rt.buf_new()
+    var fpfad: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let hat_schrift: bool = rt.read_file((&fpfad[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+    rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if hat_schrift {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, CW, CH) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, CW, 200) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    var leer: sheet.Sheet = sheet.sheet_new()
+
+    // ================== 5. MESSEN UND ANORDNEN, VON HAND GERECHNET
+    //
+    // Eine Zeile aus drei Knoepfen mit fester Groesse (60, 80, 40 breit,
+    // je 30 hoch), Luecke 12, Innenrand links/rechts 10 und oben/unten
+    // 8. Damit steht jede Zahl vorher fest:
+    //
+    //     Breite  = 10 + 60 + 12 + 80 + 12 + 40 + 10 = 224
+    //     Hoehe   =  8 + 30 +  8                     =  46
+    //     x der drei Kinder: 10, 82, 174; y: 8; Hoehe je 30.
+    //
+    // Die feste Groesse ist Absicht: so haengt die Rechnung NICHT an
+    // der Schrift des Rechners, auf dem dieser Lauf laeuft -- die
+    // Schrift wird in Abschnitt 5b geprueft.
+    scene.scene_reset(&sc)
+    let reihe: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_BOX)
+    scene.node_set_flex(&sc, reihe, flex.FLEX_ROW, flex.JUSTIFY_START,
+        flex.AL_STRETCH)
+    scene.node_set_gap(&sc, reihe, 12, 0)
+    scene.node_set_padding(&sc, reihe, 10, 8, 10, 8)
+    let kn1: usize = scene.scene_add(&sc, reihe, scene.N_WIDGET)
+    let kn2: usize = scene.scene_add(&sc, reihe, scene.N_WIDGET)
+    let kn3: usize = scene.scene_add(&sc, reihe, scene.N_WIDGET)
+    scene.node_set_widget_kind(&sc, kn1, widget.KIND_BUTTON)
+    scene.node_set_widget_kind(&sc, kn2, widget.KIND_BUTTON)
+    scene.node_set_widget_kind(&sc, kn3, widget.KIND_BUTTON)
+    scene.node_set_size(&sc, kn1, 60.0, 30.0)
+    scene.node_set_size(&sc, kn2, 80.0, 30.0)
+    scene.node_set_size(&sc, kn3, 40.0, 30.0)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+
+    var n13: [u8; 34] = "5 die Zeile misst sich 224 breit  "
+    report((&n13[0]) as u64, 34,
+        scene.node_pref_w(&sc, reihe) as i64 == 224,
+        scene.node_pref_w(&sc, reihe) as i64, 224)
+    var n14: [u8; 34] = "5 und 46 hoch                     "
+    report((&n14[0]) as u64, 34,
+        scene.node_pref_h(&sc, reihe) as i64 == 46,
+        scene.node_pref_h(&sc, reihe) as i64, 46)
+
+    scene.scene_layout(&sc, &c, 0.0, 0.0, 224.0, 46.0)
+    var n15: [u8; 34] = "5 der erste Knopf steht bei x=10  "
+    report((&n15[0]) as u64, 34, scene.node_x(&sc, kn1) as i64 == 10,
+        scene.node_x(&sc, kn1) as i64, 10)
+    var n16: [u8; 34] = "5 der zweite bei x=82             "
+    report((&n16[0]) as u64, 34, scene.node_x(&sc, kn2) as i64 == 82,
+        scene.node_x(&sc, kn2) as i64, 82)
+    var n17: [u8; 34] = "5 der dritte bei x=174            "
+    report((&n17[0]) as u64, 34, scene.node_x(&sc, kn3) as i64 == 174,
+        scene.node_x(&sc, kn3) as i64, 174)
+    var n18: [u8; 34] = "5 alle drei sitzen bei y=8        "
+    report((&n18[0]) as u64, 34, scene.node_y(&sc, kn2) as i64 == 8,
+        scene.node_y(&sc, kn2) as i64, 8)
+    var n19: [u8; 34] = "5 und sind 30 hoch (stretch)      "
+    report((&n19[0]) as u64, 34, scene.node_h(&sc, kn3) as i64 == 30,
+        scene.node_h(&sc, kn3) as i64, 30)
+    var n20: [u8; 34] = "5 der dritte ist 40 breit         "
+    report((&n20[0]) as u64, 34, scene.node_w(&sc, kn3) as i64 == 40,
+        scene.node_w(&sc, kn3) as i64, 40)
+
+    // 100 Punkte mehr Platz, und NUR der mittlere waechst: 80 + 100 =
+    // 180, der dritte rutscht auf 10+60+12+180+12 = 274.
+    scene.node_set_grow(&sc, kn2, 1000, 1000)
+    scene.scene_layout(&sc, &c, 0.0, 0.0, 324.0, 46.0)
+    var n21: [u8; 34] = "5 der wachsende wird 180 breit    "
+    report((&n21[0]) as u64, 34, scene.node_w(&sc, kn2) as i64 == 180,
+        scene.node_w(&sc, kn2) as i64, 180)
+    var n22: [u8; 34] = "5 der erste bleibt 60 breit       "
+    report((&n22[0]) as u64, 34, scene.node_w(&sc, kn1) as i64 == 60,
+        scene.node_w(&sc, kn1) as i64, 60)
+    var n23: [u8; 34] = "5 der dritte rutscht auf x=274    "
+    report((&n23[0]) as u64, 34, scene.node_x(&sc, kn3) as i64 == 274,
+        scene.node_x(&sc, kn3) as i64, 274)
+
+    // Und das Bild dazu: gemalt wird mit render.fi und wave3.fi, und
+    // dabei aendert KEINE Groesse sich mehr.
+    canvas.canvas_clear(&cv, theme.opaque((*theme.theme_colors(&m)).base))
+    scene.scene_draw(&sc, &c)
+    var n24: [u8; 39] = "5 echtes Malen treibt keine Groesse    "
+    report((&n24[0]) as u64, 39, scene.scene_size_drift(&sc) == 0,
+        scene.scene_size_drift(&sc) as i64, 0)
+    var n25: [u8; 39] = "5 nach dem Malen steht Durchgang 4     "
+    report((&n25[0]) as u64, 39,
+        scene.scene_phase(&sc) == scene.PHASE_DRAW,
+        scene.scene_phase(&sc) as i64, scene.PHASE_DRAW as i64)
+
+    // ---- 5b. DER BAUM MISST WIE render.pref_of, NICHT ANDERS
+    //
+    // Ein Textknoten und ein Widget mit demselben Text muessen auf
+    // denselben Wert kommen. Waere in scene.fi eine zweite Messung, so
+    // stuende hier die Differenz.
+    scene.scene_reset(&sc)
+    let nur_text: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_TEXT)
+    var tx: [u8; 11] = "Datenschutz"
+    scene.node_set_text(&sc, nur_text, (&tx[0]) as u64, 11)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    var probe: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_set_text(&probe, (&tx[0]) as u64, 11)
+    var ppw: f64 = 0.0
+    var pph: f64 = 0.0
+    render.pref_of(&c, &probe, &ppw, &pph)
+    var n26: [u8; 39] = "5b der Textknoten misst wie pref_of    "
+    report((&n26[0]) as u64, 39,
+        scene.node_pref_w(&sc, nur_text) == ppw,
+        scene.node_pref_w(&sc, nur_text) as i64, ppw as i64)
+    var n27: [u8; 39] = "5b und in der Hoehe ebenso             "
+    report((&n27[0]) as u64, 39,
+        scene.node_pref_h(&sc, nur_text) == pph,
+        scene.node_pref_h(&sc, nur_text) as i64, pph as i64)
+
+    // ================== 6. VIERZIG ZEILEN IN EINEM SCHEIBENKASTEN
+    //
+    // Der Ausschnitt sitzt bei (50,50) und ist 200 x 100 gross; der
+    // Inhalt ist 180 x 1000 -- also vierzig Zeilen zu 25 Punkten.
+    // 180 statt 200, damit KEIN waagerechter Balken noetig wird: der
+    // senkrechte nimmt 12 Punkte, 180 passt in die verbleibenden 188.
+    // Sichtbar sind damit die Zeilen 0 bis 3.
+    var vp: viewport.Viewport =
+    viewport.viewport_new(50.0, 50.0, 200.0, 100.0, 180.0, 1000.0)
+    scene.scene_reset(&sc)
+    let liste: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_VIEWPORT)
+    scene.node_set_viewport(&sc, liste, &vp)
+    scene.node_set_flex(&sc, liste, flex.FLEX_COLUMN,
+        flex.JUSTIFY_START, flex.AL_STRETCH)
+    var zeilen: [usize; 40] = [0; 40]
+    var zi: usize = 0
+    while zi < 40 {
+        zeilen[zi] = scene.scene_add(&sc, liste, scene.N_BOX)
+        scene.node_set_size(&sc, zeilen[zi], 0.0, 25.0)
+        zi = zi + 1
+    }
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 50.0, 50.0, 200.0, 100.0)
+
+    var n28: [u8; 39] = "6 vierzig Kinder haengen im Kasten     "
+    report((&n28[0]) as u64, 39,
+        scene.scene_child_count(&sc, liste) == 40,
+        scene.scene_child_count(&sc, liste) as i64, 40)
+    var n29: [u8; 44] = "6 der Kasten misst SEINEN Ausschnitt (100)  "
+    report((&n29[0]) as u64, 44,
+        scene.node_pref_h(&sc, liste) as i64 == 100,
+        scene.node_pref_h(&sc, liste) as i64, 100)
+    var n30: [u8; 44] = "6 die vierte Zeile sitzt bei y=125          "
+    report((&n30[0]) as u64, 44,
+        scene.node_y(&sc, zeilen[3]) as i64 == 125,
+        scene.node_y(&sc, zeilen[3]) as i64, 125)
+    var n31: [u8; 44] = "6 die Zeile ist 180 breit (Inhalt)          "
+    report((&n31[0]) as u64, 44,
+        scene.node_w(&sc, zeilen[3]) as i64 == 180,
+        scene.node_w(&sc, zeilen[3]) as i64, 180)
+
+    let h1: usize = scene.scene_hit(&sc, 60.0, 130.0)
+    var n32: [u8; 44] = "6 der Punkt (60,130) trifft die vierte      "
+    report((&n32[0]) as u64, 44, h1 == zeilen[3], h1 as i64,
+        zeilen[3] as i64)
+    // Zeile 20 steht bei y = 550 -- weit unter dem Ausschnitt. Ihr
+    // Rechteck sagt das auch; anklicken laesst sie sich trotzdem nicht.
+    var n33: [u8; 44] = "6 Zeile 20 steht bei y=550 (ausserhalb)     "
+    report((&n33[0]) as u64, 44,
+        scene.node_y(&sc, zeilen[20]) as i64 == 550,
+        scene.node_y(&sc, zeilen[20]) as i64, 550)
+    let h2: usize = scene.scene_hit(&sc, 60.0, 560.0)
+    var n34: [u8; 44] = "6 und ist NICHT anklickbar                  "
+    report((&n34[0]) as u64, 44, h2 == scene.SCENE_NONE, h2 as i64,
+        scene.SCENE_NONE as i64)
+    // Unter dem senkrechten Balken (x >= 50 + 188) wird ebenfalls
+    // nichts getroffen -- sonst klickt man durch den Balken hindurch.
+    let h3: usize = scene.scene_hit(&sc, 244.0, 60.0)
+    var n35: [u8; 44] = "6 durch den Rollbalken klickt niemand       "
+    report((&n35[0]) as u64, 44, h3 == scene.SCENE_NONE, h3 as i64,
+        scene.SCENE_NONE as i64)
+
+    // ---- UND JETZT WIRD GEROLLT. 200 Punkte nach unten, danach ein
+    // erneutes scene_layout -- beim Zeichnen wird nichts nachgeschoben.
+    viewport.viewport_set_offset(&vp, 0.0, 200.0)
+    scene.scene_layout(&sc, &c, 50.0, 50.0, 200.0, 100.0)
+    let h4: usize = scene.scene_hit(&sc, 60.0, 130.0)
+    // DIE ZAHL IN DER BESCHRIFTUNG IST DIE, DIE GEDRUCKT WIRD. Getroffen
+    // wird zeilen[11], also die ZWOELFTE Zeile -- und weil der
+    // Scheibenkasten selbst Knoten 0 ist, ist ihr Knotenindex 12. Genau
+    // diese 12 stehen in "got X want Y"; eine Beschriftung, die 11 sagt
+    // und 12 vergleicht, laesst den Leser die Rechnung zweimal machen.
+    var n36: [u8; 44] = "6 nach dem Rollen trifft derselbe Punkt 12  "
+    report((&n36[0]) as u64, 44, h4 == zeilen[11], h4 as i64,
+        zeilen[11] as i64)
+    var n37: [u8; 44] = "6 und das ist ein ANDERER Knoten als vorher "
+    report((&n37[0]) as u64, 44, h4 != h1, (h4 != h1) as i64, 1)
+    var n38: [u8; 44] = "6 Zeile 11 steht nun bei y=125              "
+    report((&n38[0]) as u64, 44,
+        scene.node_y(&sc, zeilen[11]) as i64 == 125,
+        scene.node_y(&sc, zeilen[11]) as i64, 125)
+    // Zeile 0 ist nach oben hinausgerollt: ihr Rechteck liegt bei
+    // y = -150, und dort trifft die Pruefung nichts mehr.
+    let h5: usize = scene.scene_hit(&sc, 60.0, 40.0)
+    var n39: [u8; 44] = "6 die herausgerollte Zeile 0 trifft nicht   "
+    report((&n39[0]) as u64, 44, h5 == scene.SCENE_NONE, h5 as i64,
+        scene.SCENE_NONE as i64)
+
+    canvas.canvas_clear(&cv, theme.opaque((*theme.theme_colors(&m)).base))
+    scene.scene_draw(&sc, &c)
+    var n40: [u8; 44] = "6 auch der Kasten malt ohne Groessendrift   "
+    report((&n40[0]) as u64, 44, scene.scene_size_drift(&sc) == 0,
+        scene.scene_size_drift(&sc) as i64, 0)
+
+    // ====================== 7. DIE DRIFT-WACHE, MIT GEGENPROBE
+    //
+    // Erst der brave Maler: er malt und laesst die Groesse stehen --
+    // die Wache meldet nichts. Dann derselbe Baum mit dem falschen
+    // Maler an EINEM Knoten: die Wache meldet genau eine Abweichung,
+    // nicht null und nicht zwei.
+    scene.scene_reset(&sc)
+    let wache: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_BOX)
+    scene.node_set_flex(&sc, wache, flex.FLEX_ROW, flex.JUSTIFY_START,
+        flex.AL_STRETCH)
+    let brav: usize = scene.scene_add(&sc, wache, scene.N_BOX)
+    let boese: usize = scene.scene_add(&sc, wache, scene.N_BOX)
+    scene.node_set_size(&sc, brav, 40.0, 20.0)
+    scene.node_set_size(&sc, boese, 40.0, 20.0)
+    scene.node_set_draw(&sc, brav, 0, maler_brav)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 0.0, 0.0, 80.0, 20.0)
+    canvas.canvas_clear(&cv, theme.opaque((*theme.theme_colors(&m)).base))
+    scene.scene_draw(&sc, &c)
+    var n41: [u8; 44] = "7 der brave Maler treibt nichts             "
+    report((&n41[0]) as u64, 44, scene.scene_size_drift(&sc) == 0,
+        scene.scene_size_drift(&sc) as i64, 0)
+
+    scene.node_set_draw(&sc, boese, 0, maler_falsch)
+    canvas.canvas_clear(&cv, theme.opaque((*theme.theme_colors(&m)).base))
+    scene.scene_draw(&sc, &c)
+    var n42: [u8; 44] = "7 der falsche Maler wird gemeldet: genau 1  "
+    report((&n42[0]) as u64, 44, scene.scene_size_drift(&sc) == 1,
+        scene.scene_size_drift(&sc) as i64, 1)
+
+    // ============ 8. VERERBUNG DURCH DREI EBENEN UND DIE ARTEN
+    //
+    // Die Wurzel traegt Schriftfarbe, Schriftgroesse UND Innenrand.
+    // Durch zwei Ebenen hindurch kommen die ersten beiden beim Text an,
+    // der Innenrand NICHT -- das ist die Grenze, die sheet.fi zieht.
+    var c_seite: [u8; 5] = "seite"
+    var c_kart2: [u8; 5] = "kart2"
+    let S: u32 = sheet.sheet_name((&c_seite[0]) as u64, 5)
+    let K2: u32 = sheet.sheet_name((&c_kart2[0]) as u64, 5)
+    var blatt3: sheet.Sheet = sheet.sheet_new()
+    var d_seite: sheet.Decl = sheet.decl_new()
+    var s3: style.Style = style.style_new()
+    s3 = style.style_set_fg(s3, style.color_literal(77 as u32))
+    s3 = style.style_set_font(s3, 0, 19)
+    s3 = style.style_set_pad(s3, 13, 13)
+    sheet.decl_set_style(&d_seite, s3)
+    sheet.sheet_add(&blatt3, sheet.sel_class(S), d_seite)
+    // Eine Regel auf die ART "Beschriftung" (widget.KIND_LABEL = 1).
+    // Ein N_TEXT-Knoten traegt dieses Widget, aber `scene_desc` meldet
+    // seine Art als 1000 + N_TEXT -- die Regel darf ihn also NICHT
+    // treffen. Ohne die Verschiebung um 1000 traefe sie ihn, und jede
+    // Regel auf einen Knopf traefe zugleich N_IMAGE.
+    var d_label: sheet.Decl = sheet.decl_new()
+    var s4: style.Style = style.style_new()
+    s4 = style.style_set_bg(s4, style.color_literal(42 as u32))
+    sheet.decl_set_style(&d_label, s4)
+    sheet.sheet_add(&blatt3, sheet.sel_kind(widget.KIND_LABEL), d_label)
+    // Und die Regel auf die KNOTENART trifft ihn sehr wohl.
+    var d_ntext: sheet.Decl = sheet.decl_new()
+    var s5: style.Style = style.style_new()
+    s5 = style.style_set_bg(s5, style.color_literal(99 as u32))
+    sheet.decl_set_style(&d_ntext, s5)
+    sheet.sheet_add(&blatt3, sheet.sel_kind(1000 as u32 + scene.N_TEXT),
+        d_ntext)
+
+    scene.scene_reset(&sc)
+    let e1: usize = scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+    let e2: usize = scene.scene_add(&sc, e1, scene.N_BOX)
+    let e3: usize = scene.scene_add(&sc, e2, scene.N_TEXT)
+    scene.node_add_class(&sc, e1, S)
+    scene.node_add_class(&sc, e2, K2)
+    scene.scene_style(&sc, &blatt3)
+
+    let e3_fg: i64 =
+    style.color_value((*scene.node_style(&sc, e3)).fg) as i64
+    var n43: [u8; 44] = "8 die Farbe kommt drei Ebenen tief an       "
+    report((&n43[0]) as u64, 44, e3_fg == 77, e3_fg, 77)
+    let e3_px: i64 = (*scene.node_style(&sc, e3)).font_px as i64
+    var n44: [u8; 44] = "8 die Schriftgroesse ebenso                 "
+    report((&n44[0]) as u64, 44, e3_px == 19, e3_px, 19)
+    let e3_pad: bool = sheet.decl_has(scene.node_decl(&sc, e3),
+        style.SF_PAD_X, false)
+    var n45: [u8; 44] = "8 der Innenrand kommt NICHT an              "
+    report((&n45[0]) as u64, 44, !e3_pad, e3_pad as i64, 0)
+    let e2_fg: i64 =
+    style.color_value((*scene.node_style(&sc, e2)).fg) as i64
+    var n46: [u8; 44] = "8 die mittlere Ebene erbt sie auch          "
+    report((&n46[0]) as u64, 44, e2_fg == 77, e2_fg, 77)
+
+    var desc_text: sheet.NodeDesc = scene.scene_desc(&sc, e3)
+    var n47: [u8; 44] = "8 scene_desc meldet 1002 fuer N_TEXT        "
+    report((&n47[0]) as u64, 44, desc_text.kind == 1002 as u32,
+        desc_text.kind as i64, 1002)
+    let e3_bg: i64 =
+    style.color_value((*scene.node_style(&sc, e3)).bg) as i64
+    var n48: [u8; 44] = "8 die Regel auf die Knotenart trifft (99)   "
+    report((&n48[0]) as u64, 44, e3_bg == 99, e3_bg, 99)
+    var n49: [u8; 44] = "8 die Regel auf KIND_LABEL trifft NICHT     "
+    report((&n49[0]) as u64, 44, e3_bg != 42, e3_bg, 99)
+    // Ein Widget-Knoten dagegen meldet die Art SEINES Widgets.
+    let knopf: usize = scene.scene_add(&sc, e2, scene.N_WIDGET)
+    scene.node_set_widget_kind(&sc, knopf, widget.KIND_BUTTON)
+    var desc_knopf: sheet.NodeDesc = scene.scene_desc(&sc, knopf)
+    var n50: [u8; 44] = "8 ein Widget-Knoten meldet KIND_BUTTON      "
+    report((&n50[0]) as u64, 44,
+        desc_knopf.kind == widget.KIND_BUTTON,
+        desc_knopf.kind as i64, widget.KIND_BUTTON as i64)
+
+    // ================= 9. DER VOLLE BAUM UND DIE SCHRITTWEITEN
+    //
+    // EIN BAUM HAT EIN ENDE, und was danach kommt, muss ehrlich
+    // abgewiesen werden. Frueher gab `scene_add` bei vollem Feld
+    // SCENE_MAX zurueck -- eine Zahl, die wie ein Platz aussieht; wer
+    // damit `node_set_text` rief, schrieb hinter das letzte
+    // Feldelement. Jetzt kommt SCENE_NONE, und JEDER Setter prueft
+    // seinen Platz. Hier wird beides nachgerechnet: 129 Aufrufe, 128
+    // Knoten, und die Marke, die der 129. setzen wollte, steht an
+    // keinem einzigen Knoten.
+    scene.scene_reset(&sc)
+    let stamm: usize = scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+    var gebaut: usize = 1
+    while gebaut < scene.SCENE_MAX {
+        scene.scene_add(&sc, stamm, scene.N_BOX)
+        gebaut = gebaut + 1
+    }
+    var n51: [u8; 44] = "9 der Baum fasst genau 128 Knoten           "
+    report((&n51[0]) as u64, 44, scene.scene_count(&sc) == 128,
+        scene.scene_count(&sc) as i64, 128)
+    let voll: usize = scene.scene_add(&sc, stamm, scene.N_BOX)
+    var n52: [u8; 44] = "9 der 129. Aufruf liefert SCENE_NONE        "
+    report((&n52[0]) as u64, 44, voll == scene.SCENE_NONE, voll as i64,
+        scene.SCENE_NONE as i64)
+    var n53: [u8; 44] = "9 und legt keinen 129. Knoten an            "
+    report((&n53[0]) as u64, 44, scene.scene_count(&sc) == 128,
+        scene.scene_count(&sc) as i64, 128)
+    // Die Setter auf den nicht vorhandenen Knoten: sie duerfen NICHTS
+    // tun. Gemessen wird das an der Marke 4242 -- sie darf an keinem
+    // der 128 Knoten auftauchen -- und an der Klasse, die `node_add_class`
+    // zurueckweisen muss.
+    let MARKE: u32 = 4242 as u32
+    scene.node_set_id(&sc, voll, MARKE)
+    scene.node_set_size(&sc, voll, 99.0, 99.0)
+    scene.node_set_text(&sc, voll, (&c_seite[0]) as u64, 5)
+    scene.node_set_widget_kind(&sc, voll, widget.KIND_BUTTON)
+    let nahm_klasse: bool = scene.node_add_class(&sc, voll, S)
+    var n54: [u8; 44] = "9 node_add_class weist den Platz zurueck    "
+    report((&n54[0]) as u64, 44, !nahm_klasse, nahm_klasse as i64, 0)
+    var marken: usize = 0
+    var letzte_klassen: usize = 0
+    var q: usize = 0
+    while q < scene.scene_count(&sc) {
+        if scene.node_id(&sc, q) == MARKE {
+            marken = marken + 1
+        }
+        if q == scene.scene_count(&sc) - 1 {
+            letzte_klassen = scene.node_class_count(&sc, q)
+        }
+        q = q + 1
+    }
+    var n55: [u8; 44] = "9 kein Knoten traegt die Marke des 129.     "
+    report((&n55[0]) as u64, 44, marken == 0, marken as i64, 0)
+    var n56: [u8; 44] = "9 der letzte Knoten blieb ohne Klasse       "
+    report((&n56[0]) as u64, 44, letzte_klassen == 0,
+        letzte_klassen as i64, 0)
+    // DIE SCHRITTWEITEN. scene.fi legt zwei Felder als Zeiger an --
+    // die Kette der NodeDesc (sheet.fi) und die FlexItems (flex.fi) --
+    // und rechnet die Adresse des i-ten Gliedes aus. Die Zahl dafuer
+    // steht in keinem der drei Module als Ziffer; sie kommt aus
+    // sheet.sheet_desc_stride bzw. flex.flex_item_stride. Geprueft wird
+    // sie gegen die ECHTE Adressdifferenz zweier Nachbarn eines Feldes
+    // -- nicht gegen eine Konstante, die hier noch einmal stuende.
+    var kette: [sheet.NodeDesc; 2] = [sheet.desc_new(0 as u32, 0 as u32); 2]
+    let diff_desc: i64 = ((&kette[1]) as u64 - (&kette[0]) as u64) as i64
+    var n57: [u8; 44] = "9 sheet_desc_stride ist die Adressdifferenz "
+    report((&n57[0]) as u64, 44,
+        sheet.sheet_desc_stride() as i64 == diff_desc,
+        sheet.sheet_desc_stride() as i64, diff_desc)
+    var kinder: [flex.FlexItem; 2] = [flex.flex_item(0, 0); 2]
+    let diff_item: i64 = ((&kinder[1]) as u64 - (&kinder[0]) as u64) as i64
+    var n58: [u8; 44] = "9 flex_item_stride ist die Adressdifferenz  "
+    report((&n58[0]) as u64, 44,
+        flex.flex_item_stride() as i64 == diff_item,
+        flex.flex_item_stride() as i64, diff_item)
+
+    // ============ 10. MEHR KINDER, ALS EIN KASTEN VERTEILEN KANN
+    //
+    // Ein Kasten verteilt KIDS_MAX = 64 Kinder. Wer ihm 65 gibt, hat
+    // eines zu viel -- und bis zu dieser Runde verschluckte der Baum es
+    // schweigend: es bekam kein Rechteck, blieb bei (0,0) mit der
+    // Groesse null stehen und wurde dort gemalt. Jetzt zaehlt der Kasten
+    // EINMAL hoch, und `draw_node` laesst Knoten ohne Flaeche aus.
+    //
+    // Erst die Gegenprobe mit genau 64 Kindern: da darf die Zahl null
+    // sein, sonst meldete der Zaehler jeden Kasten.
+    scene.scene_reset(&sc)
+    let k64: usize = scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+    scene.node_set_flex(&sc, k64, flex.FLEX_COLUMN, flex.JUSTIFY_START,
+        flex.AL_STRETCH)
+    var g64: usize = 0
+    while g64 < 64 {
+        let kk: usize = scene.scene_add(&sc, k64, scene.N_BOX)
+        scene.node_set_size(&sc, kk, 40.0, 2.0)
+        g64 = g64 + 1
+    }
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 10.0, 10.0, 400.0, 180.0)
+    var n59: [u8; 44] = "10 vierundsechzig Kinder laufen nicht ueber "
+    report((&n59[0]) as u64, 44, scene.scene_kid_overflow(&sc) == 0,
+        scene.scene_kid_overflow(&sc) as i64, 0)
+
+    // Und nun 65. Der 65. Knoten ist der letzte, den `scene_add`
+    // zurueckgegeben hat; er bekommt kein Rechteck.
+    scene.scene_reset(&sc)
+    let k65: usize = scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+    scene.node_set_flex(&sc, k65, flex.FLEX_COLUMN, flex.JUSTIFY_START,
+        flex.AL_STRETCH)
+    var letzter: usize = scene.SCENE_NONE
+    var g65: usize = 0
+    while g65 < 65 {
+        letzter = scene.scene_add(&sc, k65, scene.N_BOX)
+        scene.node_set_size(&sc, letzter, 40.0, 2.0)
+        g65 = g65 + 1
+    }
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 10.0, 10.0, 400.0, 180.0)
+    var n60: [u8; 44] = "10 das 65. Kind wird gemeldet: genau 1      "
+    report((&n60[0]) as u64, 44, scene.scene_kid_overflow(&sc) == 1,
+        scene.scene_kid_overflow(&sc) as i64, 1)
+    var n61: [u8; 44] = "10 es hat 65 Kinder am Kasten               "
+    report((&n61[0]) as u64, 44,
+        scene.scene_child_count(&sc, k65) == 65,
+        scene.scene_child_count(&sc, k65) as i64, 65)
+    // Es hat kein Rechteck: Breite und Hoehe sind null. Genau darum
+    // duerfte es nie gemalt werden.
+    let ueberw: i64 = scene.node_w(&sc, letzter) as i64
+    let ueberh: i64 = scene.node_h(&sc, letzter) as i64
+    var n62: [u8; 44] = "10 und bekommt kein Rechteck (Breite 0)     "
+    report((&n62[0]) as u64, 44, ueberw == 0, ueberw, 0)
+    var n63: [u8; 44] = "10 auch keine Hoehe                         "
+    report((&n63[0]) as u64, 44, ueberh == 0, ueberh, 0)
+    // UND DER NACHWEIS AUF DER LEINWAND: bei (0,0) steht nach dem
+    // Zeichnen noch der Grund. Der Kasten beginnt bei (10,10), also
+    // kaeme dort NUR der uebergelaufene Knoten hin -- er wird nicht
+    // gemalt, und das ist hier keine Behauptung, sondern ein
+    // Bildpunkt.
+    let grund65: u32 = theme.opaque((*theme.theme_colors(&m)).base)
+    canvas.canvas_clear(&cv, grund65)
+    scene.scene_draw(&sc, &c)
+    let ecke: u32 = canvas.canvas_get(&cv, 0, 0)
+    var n64: [u8; 44] = "10 bei (0,0) steht kein Knoten im Bild      "
+    report((&n64[0]) as u64, 44, ecke == grund65, ecke as i64,
+        grund65 as i64)
+
+    // ================= 11. TIEFER ALS DIE KETTE, DIE ES GIBT
+    //
+    // Eine Kette ist sheet.CHAIN_MAX = 16 Ebenen lang. Ein Baum mit 17
+    // Ebenen hat also einen Knoten, fuer den es keine Kette mehr gibt:
+    // er bleibt UNGESTYLT. Bis zu dieser Runde geschah das schweigend.
+    //
+    // Erst die Gegenprobe mit 16 Ebenen -- die passen, die Zahl bleibt
+    // null.
+    var d_box: sheet.Decl = sheet.decl_new()
+    var s_box: style.Style = style.style_new()
+    s_box = style.style_set_bg(s_box, style.color_literal(55 as u32))
+    sheet.decl_set_style(&d_box, s_box)
+    var blatt4: sheet.Sheet = sheet.sheet_new()
+    sheet.sheet_add(&blatt4, sheet.sel_kind(1000 as u32 + scene.N_BOX),
+        d_box)
+
+    scene.scene_reset(&sc)
+    var vor: usize = scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+    var e16: usize = 1
+    while e16 < 16 {
+        vor = scene.scene_add(&sc, vor, scene.N_BOX)
+        e16 = e16 + 1
+    }
+    scene.scene_style(&sc, &blatt4)
+    var n65: [u8; 44] = "11 sechzehn Ebenen passen in die Kette      "
+    report((&n65[0]) as u64, 44, scene.scene_depth_overflow(&sc) == 0,
+        scene.scene_depth_overflow(&sc) as i64, 0)
+    let tief16: bool = sheet.decl_has(scene.node_decl(&sc, vor),
+        style.SF_BG, false)
+    var n66: [u8; 44] = "11 die 16. Ebene bekommt ihren Grund        "
+    report((&n66[0]) as u64, 44, tief16, tief16 as i64, 1)
+
+    // Und jetzt 17 Ebenen: der 17. Knoten liegt auf Tiefe 16, dort
+    // bricht `style_walk` ab -- EINMAL, nicht keinmal und nicht
+    // zweimal.
+    scene.scene_reset(&sc)
+    var kette17: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_BOX)
+    var e17: usize = 1
+    while e17 < 17 {
+        kette17 = scene.scene_add(&sc, kette17, scene.N_BOX)
+        e17 = e17 + 1
+    }
+    scene.scene_style(&sc, &blatt4)
+    var n67: [u8; 44] = "11 die 17. Ebene wird gemeldet: genau 1     "
+    report((&n67[0]) as u64, 44, scene.scene_depth_overflow(&sc) == 1,
+        scene.scene_depth_overflow(&sc) as i64, 1)
+    var n68: [u8; 44] = "11 der Baum hat 17 Knoten                   "
+    report((&n68[0]) as u64, 44, scene.scene_count(&sc) == 17,
+        scene.scene_count(&sc) as i64, 17)
+    // Der abgebrochene Knoten hat wirklich KEINEN Grund -- das ist die
+    // Folge, die der Zaehler meldet.
+    let tief17: bool = sheet.decl_has(scene.node_decl(&sc, kette17),
+        style.SF_BG, false)
+    var n69: [u8; 44] = "11 und bleibt ohne Grund (ungestylt)        "
+    report((&n69[0]) as u64, 44, !tief17, tief17 as i64, 0)
+    // Sein Elternteil auf Tiefe 15 dagegen ist gestylt: der Abbruch
+    // trifft genau eine Ebene und nicht den halben Baum.
+    let eltern17: usize = scene.scene_parent(&sc, kette17)
+    let tief16b: bool = sheet.decl_has(scene.node_decl(&sc, eltern17),
+        style.SF_BG, false)
+    var n70: [u8; 44] = "11 sein Elternteil ist noch gestylt         "
+    report((&n70[0]) as u64, 44, tief16b, tief16b as i64, 1)
+
+    // ======== 12. DIE SCHRANKEN UND DER LEERE SCHEIBENKASTEN
+    //
+    // ZWEI DINGE, DIE MAN NICHT SIEHT, BIS SIE WEHTUN.
+    //
+    // Das erste sind die Feldlaengen. In `measure_node` und
+    // `layout_node` liegen vier Arbeitsfelder, und ihre Laenge steht
+    // dort als ZIFFER -- Firn nimmt an einer Feldlaenge keinen Namen an
+    // ("expected an integer array length"). Also gibt es die Zahl
+    // zweimal, und hier wird nachgerechnet, dass die drei Schranken
+    // zusammenpassen: KIDS_MAX (64) hoechstens so gross wie die
+    // Feldlaenge (scene_work_max) und hoechstens so gross wie
+    // flex.FLEX_MAX. Stimmt das nicht, rechnet `scene_measure` gar
+    // nicht erst, sondern MELDET (`scene_limit_break`) -- ein
+    // Schreibzugriff hinter das Feld waere die Alternative.
+    //
+    // Das zweite ist ein Scheibenkasten OHNE Kinder. Bis zum
+    // 21.09.2026 sprang `layout_node` bei `nkids == 0` zurueck, BEVOR
+    // der Ausschnitt sein Rechteck bekam: eine leer gefilterte Liste
+    // behielt das Rechteck vom Anlegen, ihre Balken sassen woanders als
+    // ihr Grund, und der Clip schnitt eine Flaeche ab, die es nicht
+    // mehr gab. Also wird hier ein leerer Kasten angeordnet und jede
+    // seiner vier Zahlen nachgerechnet.
+    var n71: [u8; 44] = "12 die drei Schranken passen zusammen       "
+    report((&n71[0]) as u64, 44, scene.scene_limits_ok(),
+        scene.scene_limits_ok() as i64, 1)
+    var n72: [u8; 44] = "12 KIDS_MAX ist die Laenge der Felder: 64   "
+    report((&n72[0]) as u64, 44,
+        scene.KIDS_MAX == scene.scene_work_max(),
+        scene.scene_work_max() as i64, scene.KIDS_MAX as i64)
+    var n73: [u8; 44] = "12 und nicht groesser als flex.FLEX_MAX     "
+    report((&n73[0]) as u64, 44, scene.KIDS_MAX <= flex.FLEX_MAX,
+        flex.FLEX_MAX as i64, scene.KIDS_MAX as i64)
+
+    // Der leere Scheibenkasten. Sein Inhalt ist 400 x 900, sein
+    // Ausschnitt wird beim Anordnen 200 x 120 gross -- er braucht also
+    // beide Balken (12 Punkte dick), und die Rollposition 300 liegt
+    // innerhalb der 792, die er senkrecht hergibt (900 - (120 - 12)).
+    var leerv: viewport.Viewport = viewport.viewport_new(0.0, 0.0, 10.0,
+        10.0, 400.0, 900.0)
+    viewport.viewport_set_bar(&leerv, 12)
+    scene.scene_reset(&sc)
+    let leerk: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_VIEWPORT)
+    scene.node_set_viewport(&sc, leerk, &leerv)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 30.0, 20.0, 200.0, 120.0)
+    viewport.viewport_set_offset(&leerv, 0.0, 300.0)
+    var n74: [u8; 44] = "12 der leere Ausschnitt steht bei x = 30    "
+    report((&n74[0]) as u64, 44,
+        viewport.viewport_x(&leerv) as i64 == 30,
+        viewport.viewport_x(&leerv) as i64, 30)
+    var n75: [u8; 44] = "12 und bei y = 20                           "
+    report((&n75[0]) as u64, 44,
+        viewport.viewport_y(&leerv) as i64 == 20,
+        viewport.viewport_y(&leerv) as i64, 20)
+    var n76: [u8; 44] = "12 seine Breite ist 200                     "
+    report((&n76[0]) as u64, 44,
+        viewport.viewport_w(&leerv) as i64 == 200,
+        viewport.viewport_w(&leerv) as i64, 200)
+    var n77: [u8; 44] = "12 seine Hoehe ist 120                      "
+    report((&n77[0]) as u64, 44,
+        viewport.viewport_h(&leerv) as i64 == 120,
+        viewport.viewport_h(&leerv) as i64, 120)
+    // Und die Folgen davon: der senkrechte Balken nimmt 12 Punkte
+    // Breite weg (188 bleiben), der waagerechte 12 Punkte Hoehe (108),
+    // und der Inhalt steht bei der Rollposition 300 um genau diese 300
+    // Punkte hoeher: 20 - 300 = -280.
+    var n78: [u8; 44] = "12 innen bleiben 188 Punkte Breite          "
+    report((&n78[0]) as u64, 44,
+        viewport.viewport_inner_w(&leerv) as i64 == 188,
+        viewport.viewport_inner_w(&leerv) as i64, 188)
+    var n79: [u8; 44] = "12 und 108 Punkte Hoehe                     "
+    report((&n79[0]) as u64, 44,
+        viewport.viewport_inner_h(&leerv) as i64 == 108,
+        viewport.viewport_inner_h(&leerv) as i64, 108)
+    var n80: [u8; 44] = "12 der Inhalt beginnt bei y = -280          "
+    report((&n80[0]) as u64, 44,
+        viewport.viewport_content_y(&leerv) as i64 == 0 - 280,
+        viewport.viewport_content_y(&leerv) as i64, 0 - 280)
+    var n81: [u8; 44] = "12 kein Durchgang ist an einer Schranke aus "
+    report((&n81[0]) as u64, 44, scene.scene_limit_break(&sc) == 0,
+        scene.scene_limit_break(&sc) as i64, 0)
+
+    // ============ 13. DER BAUM IST VOLL, UND ER SAGT ES JETZT
+    //
+    // `scene_add` gibt bei vollem Baum SCENE_NONE zurueck (Abschnitt 9)
+    // -- das ist ehrlich, aber niemand sieht einen Rueckgabewert an, der
+    // in einer Schleife ueber zweihundert Listenzeilen steht. Seit
+    // dieser Runde ZAEHLT der Baum die abgewiesenen Knoten, und
+    // `scene_node_overflow` gibt die Zahl heraus. Hier stehen
+    // SCENE_MAX + 3 Aufrufe: 128 Knoten, 3 Meldungen -- mit der
+    // Gegenprobe bei genau SCENE_MAX, wo die Zahl null bleibt.
+    scene.scene_reset(&sc)
+    var geb: usize = 0
+    while geb < scene.SCENE_MAX {
+        scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+        geb = geb + 1
+    }
+    var n82: [u8; 44] = "13 SCENE_MAX Knoten laufen nicht ueber      "
+    report((&n82[0]) as u64, 44, scene.scene_node_overflow(&sc) == 0,
+        scene.scene_node_overflow(&sc) as i64, 0)
+    var geb2: usize = 0
+    while geb2 < 3 {
+        scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+        geb2 = geb2 + 1
+    }
+    var n83: [u8; 44] = "13 drei Knoten zu viel werden gemeldet      "
+    report((&n83[0]) as u64, 44, scene.scene_node_overflow(&sc) == 3,
+        scene.scene_node_overflow(&sc) as i64, 3)
+    var n84: [u8; 44] = "13 und der Baum hat trotzdem 128 Knoten     "
+    report((&n84[0]) as u64, 44, scene.scene_count(&sc) == scene.SCENE_MAX,
+        scene.scene_count(&sc) as i64, scene.SCENE_MAX as i64)
+    // UND DER GRUND STEHT IN EINER ZAHL. Fuenf Zaehler sind einzeln
+    // richtig und zusammen unhandlich; `scene_overflow_reason` gibt den
+    // schwersten vorliegenden Grund heraus, und genau den drucken
+    // tools/fui/gallery9_main.fi und demos/fuidemo/main.fi, statt ein
+    // halbes Bild abzuliefern.
+    var n84b: [u8; 44] = "13 der Grund heisst OF_NODES (1)            "
+    report((&n84b[0]) as u64, 44,
+        scene.scene_overflow_reason(&sc) == scene.OF_NODES,
+        scene.scene_overflow_reason(&sc) as i64,
+        scene.OF_NODES as i64)
+    // `scene_reset` setzt die Zahl zurueck -- sie gehoert zum AUFBAU
+    // und nicht zum Programmlauf.
+    scene.scene_reset(&sc)
+    var n85: [u8; 44] = "13 scene_reset setzt die Zahl zurueck       "
+    report((&n85[0]) as u64, 44, scene.scene_node_overflow(&sc) == 0,
+        scene.scene_node_overflow(&sc) as i64, 0)
+    var n85b: [u8; 44] = "13 und danach ist der Grund OF_NONE (0)     "
+    report((&n85b[0]) as u64, 44,
+        scene.scene_overflow_reason(&sc) == scene.OF_NONE,
+        scene.scene_overflow_reason(&sc) as i64, scene.OF_NONE as i64)
+
+    // ============ 14. DIE KLEMMUNG KOMMT AUS flex.fi, NICHT VON HIER
+    //
+    // `node_set_bounds` reicht Mindest- und Hoechstgroesse an
+    // `flex.item_set_bounds` durch. Gerechnet wird in flex.fi
+    // (css-flexbox-1, 9.7), und hier wird NACHGERECHNET:
+    //
+    //     Zeile 200 breit, zwei Kinder von 100 und 200 Punkten, beide
+    //     schrumpfbar. OHNE eigene Schranke gibt keines nach: die
+    //     gemessene Groesse IST die Mindestgroesse
+    //     (flex.flex_item_from_pref) -- die Zeile laeuft ueber, und das
+    //     ist richtig so, denn Schrumpfen darf keinen Text abschneiden.
+    //
+    //     MIT Schranken (das erste ab 40, das zweite ab 140) sind -100
+    //     zu verteilen, gewichtet nach der Basis: 100/300 und 200/300,
+    //     also -33 und -67. Das zweite kaeme damit auf 133 und klemmt
+    //     bei 140 fest; die Nachverteilung gibt den frei gewordenen
+    //     Rest AN DAS ERSTE, das damit auf 200 - 140 = 60 kommt.
+    //
+    // Genau diese Klemmung braucht die Werkzeugleiste in
+    // demos/fuidemo/main.fi fuer ihr Suchfeld.
+    scene.scene_reset(&sc)
+    let zeile2: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_BOX)
+    scene.node_set_flex(&sc, zeile2, flex.FLEX_ROW, flex.JUSTIFY_START,
+        flex.AL_STRETCH)
+    let kl_a: usize = scene.scene_add(&sc, zeile2, scene.N_BOX)
+    let kl_b: usize = scene.scene_add(&sc, zeile2, scene.N_BOX)
+    scene.node_set_size(&sc, kl_a, 100.0, 20.0)
+    scene.node_set_size(&sc, kl_b, 200.0, 20.0)
+    scene.node_set_grow(&sc, kl_a, 0, 1000)
+    scene.node_set_grow(&sc, kl_b, 0, 1000)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 0.0, 0.0, 200.0, 20.0)
+    var n86: [u8; 44] = "14 ohne Schranke bleibt das zweite bei 200  "
+    report((&n86[0]) as u64, 44,
+        scene.node_w(&sc, kl_b) as i64 == 200,
+        scene.node_w(&sc, kl_b) as i64, 200)
+    var n87: [u8; 44] = "14 und das erste bei 100                    "
+    report((&n87[0]) as u64, 44,
+        scene.node_w(&sc, kl_a) as i64 == 100,
+        scene.node_w(&sc, kl_a) as i64, 100)
+    scene.node_set_bounds(&sc, kl_a, 40, 0)
+    scene.node_set_bounds(&sc, kl_b, 140, 0)
+    scene.scene_layout(&sc, &c, 0.0, 0.0, 200.0, 20.0)
+    var n88: [u8; 44] = "14 mit Schranke klemmt das zweite bei 140   "
+    report((&n88[0]) as u64, 44,
+        scene.node_w(&sc, kl_b) as i64 == 140,
+        scene.node_w(&sc, kl_b) as i64, 140)
+    var n89: [u8; 44] = "14 und das erste bekommt den Rest: 60       "
+    report((&n89[0]) as u64, 44,
+        scene.node_w(&sc, kl_a) as i64 == 60,
+        scene.node_w(&sc, kl_a) as i64, 60)
+    var n90: [u8; 44] = "14 zusammen sind das wieder 200             "
+    report((&n90[0]) as u64, 44,
+        (scene.node_w(&sc, kl_a) + scene.node_w(&sc, kl_b)) as i64 == 200,
+        (scene.node_w(&sc, kl_a) + scene.node_w(&sc, kl_b)) as i64, 200)
+
+    // ============ 15. DIE UMFORMUNG ERSETZT DIE ART DES KNOTENS NICHT
+    //
+    // Bis zum 21.09.2026 stand in `draw_self` der Umformungs-Zweig VOR
+    // der Artunterscheidung: jeder Knoten mit einer Matrix wurde als
+    // Kasten mit Flaeche, Rand und Schrift gemalt. Ein gedrehtes
+    // Ankreuzkaestchen verlor damit seinen Haken -- unsichtbar im
+    // Quelltext und nur im Bild zu sehen. Also wird es hier im BILD
+    // geprueft.
+    //
+    // (a) DER GEDREHTE KNOPF DREHT SICH WIRKLICH. Ein Knopf von 60 x 40
+    // bei (100,60) hat seine Mitte bei (130,80). Um 45 Grad gedreht
+    // reicht er (30 + 20) * cos 45 = 35.4 Punkte nach links und rechts
+    // ueber die Mitte hinaus, also von x = 94.6 bis x = 165.4. In dem
+    // Streifen x = 90..100 links VOR dem Knopf kann darum nur eine
+    // Drehung Punkte setzen -- ungedreht ist er leer.
+    var c_dreh: [u8; 4] = "dreh"
+    let D: u32 = sheet.sheet_name((&c_dreh[0]) as u64, 4)
+    var blatt5: sheet.Sheet = sheet.sheet_new()
+    var d_dreh: sheet.Decl = sheet.decl_new()
+    sheet.decl_set_rotate(&d_dreh, 45.0)
+    sheet.sheet_add(&blatt5, sheet.sel_class(D), d_dreh)
+
+    scene.scene_reset(&sc)
+    let knopf2: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_WIDGET)
+    scene.node_set_widget_kind(&sc, knopf2, widget.KIND_BUTTON)
+    scene.node_set_size(&sc, knopf2, 60.0, 40.0)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 100.0, 60.0, 60.0, 40.0)
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    let gerade_links: usize = zaehle_gesetzt(&cv, 90, 60, 10, 40)
+    var n91: [u8; 44] = "15a ungedreht bleibt der Streifen links leer"
+    report((&n91[0]) as u64, 44, gerade_links == 0,
+        gerade_links as i64, 0)
+    scene.node_add_class(&sc, knopf2, D)
+    scene.scene_style(&sc, &blatt5)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 100.0, 60.0, 60.0, 40.0)
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    let gedreht_links: usize = zaehle_gesetzt(&cv, 90, 60, 10, 40)
+    var n92: [u8; 44] = "15a gedreht steht der Knopf im Streifen     "
+    report((&n92[0]) as u64, 44, gedreht_links > 0,
+        gedreht_links as i64, 1)
+    var n93: [u8; 44] = "15a der Knopf geht den gedrehten Weg (0)    "
+    report((&n93[0]) as u64, 44, scene.scene_xform_skipped(&sc) == 0,
+        scene.scene_xform_skipped(&sc) as i64, 0)
+
+    // (b) DAS GEDREHTE ANKREUZKAESTCHEN BEHAELT SEINEN HAKEN.
+    // `wave3.kind_xf_ready` nennt KIND_CHECKBOX nicht: Kasten, Haken und
+    // Beschriftung einzeln durch die Matrix zu schicken waere der zweite
+    // Zeichenweg. Es wird darum GERADE gemalt -- vollstaendig, mit
+    // Haken -- und die uebergangene Umformung wird gezaehlt.
+    //
+    // Gemessen wird ohne jede Farbe des Themas: dasselbe Kaestchen
+    // zweimal, einmal ohne und einmal mit Haken. Die Punkte, die sich
+    // unterscheiden, SIND der Haken.
+    scene.scene_reset(&sc)
+    let haken: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_WIDGET)
+    scene.node_set_widget_kind(&sc, haken, widget.KIND_CHECKBOX)
+    scene.node_add_class(&sc, haken, D)
+    scene.node_set_size(&sc, haken, 40.0, 40.0)
+    scene.scene_style(&sc, &blatt5)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 100.0, 60.0, 40.0, 40.0)
+    let he: *mut widget.Widget = scene.node_widget(&sc, haken)
+    var bild_ohne: [u32; 2048] = [0 as u32; 2048]
+    widget.w_set_value(he, 0)
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    schnappe(&cv, 100, 60, 40, 40, (&bild_ohne[0]) as *mut u32)
+    let kasten_da: usize = zaehle_gesetzt(&cv, 100, 60, 40, 40)
+    var n94: [u8; 44] = "15b das Kaestchen selbst ist gemalt         "
+    report((&n94[0]) as u64, 44, kasten_da > 100,
+        kasten_da as i64, 100)
+    var n95: [u8; 44] = "15b die uebergangene Umformung wird gezaehlt"
+    report((&n95[0]) as u64, 44, scene.scene_xform_skipped(&sc) == 1,
+        scene.scene_xform_skipped(&sc) as i64, 1)
+    widget.w_set_value(he, 1)
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    let marke_neu: usize = zaehle_anders(&cv, 100, 60, 40, 40,
+        (&bild_ohne[0]) as *mut u32)
+    var n96: [u8; 44] = "15b der Haken steht im Bild (Punkte > 0)    "
+    report((&n96[0]) as u64, 44, marke_neu > 0,
+        marke_neu as i64, 1)
+    // UND DIE GEGENPROBE, DIE DEN ALTEN WEG ENTLARVT. Derselbe Knoten,
+    // dieselbe Matrix -- aber durch `render.draw_widget_xf`, also durch
+    // den Zweig, der bis zu dieser Runde fuer JEDE Art lief. Er malt
+    // Flaeche, Rand und Schrift: mit und ohne Haken kommt DASSELBE Bild
+    // heraus, die Differenz ist null. Genau diese Null ist der Grund,
+    // warum der Zweig nach der Art fragen muss.
+    var xf_haken: transform.Xform = transform.xf_new()
+    sheet.decl_apply_transform_at(scene.node_decl(&sc, haken), &xf_haken,
+        120.0, 80.0)
+    widget.w_set_value(he, 0)
+    canvas.canvas_clear(&cv, 0 as u32)
+    render.draw_widget_xf(&c, he, &xf_haken)
+    schnappe(&cv, 100, 60, 40, 40, (&bild_ohne[0]) as *mut u32)
+    widget.w_set_value(he, 1)
+    canvas.canvas_clear(&cv, 0 as u32)
+    render.draw_widget_xf(&c, he, &xf_haken)
+    let marke_alt: usize = zaehle_anders(&cv, 100, 60, 40, 40,
+        (&bild_ohne[0]) as *mut u32)
+    var n97: [u8; 44] = "15b der alte Weg zeigt den Haken NICHT (0)  "
+    report((&n97[0]) as u64, 44, marke_alt == 0,
+        marke_alt as i64, 0)
+
+    // (c) DAS GEDREHTE BILD DREHT SICH AUCH.
+    //
+    // Hier stand bis zum 22.09.2026 die Begruendung, eine Bildflaeche
+    // unter einer Matrix waere eine zweite Abtastung. Das war eine
+    // fehlende Leitung und kein Grund: die Abtastung steht in
+    // uiimage.sample_bilinear, der Weg darauf in
+    // transform.tf_draw_image, und render.draw_widget_art_xf haengt
+    // beides an dieselbe Zerlegung, die der gerade Weg benutzt.
+    //
+    // DIE ZAHLEN. Der Knoten ist 56 x 40 gross und liegt bei (100,60),
+    // seine Bildflaeche also 24 x 24 bei (116,68), Mitte (128,80).
+    // Ungedreht reicht das Bild von x = 116 bis 140. Um 45 Grad
+    // gedreht liegt seine Ecke 12 * Wurzel(2) = 16.97 Punkte links der
+    // Mitte, also bei x = 111. Der Streifen x = 111..115 ist darum
+    // ungedreht LEER und gedreht bemalt -- und das ist der ganze
+    // Nachweis.
+    var bpx2: [u32; 64] = [4291322930 as u32; 64]
+    var bild2: uiimage.Image = uiimage.image_wrap((&bpx2[0]) as u64, 8,
+        8, 0)
+    scene.scene_reset(&sc)
+    let bdreh: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_IMAGE)
+    scene.node_set_image(&sc, bdreh, &bild2, 24, 24)
+    scene.node_set_art_align(&sc, bdreh, widget.ART_ONLY)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 100.0, 60.0, 56.0, 40.0)
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    let bild_gerade: usize = zaehle_gesetzt(&cv, 111, 78, 4, 4)
+    var n97b: [u8; 44] = "15c ungedreht ist der Streifen links leer   "
+    report((&n97b[0]) as u64, 44, bild_gerade == 0,
+        bild_gerade as i64, 0)
+    scene.node_add_class(&sc, bdreh, D)
+    scene.scene_style(&sc, &blatt5)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 100.0, 60.0, 56.0, 40.0)
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    let bild_gedreht: usize = zaehle_gesetzt(&cv, 111, 78, 4, 4)
+    var n97c: [u8; 44] = "15c gedreht steht das Bild im Streifen      "
+    report((&n97c[0]) as u64, 44, bild_gedreht > 0,
+        bild_gedreht as i64, 1)
+    var n97d: [u8; 44] = "15c das Bild geht den gedrehten Weg (0)     "
+    report((&n97d[0]) as u64, 44, scene.scene_xform_skipped(&sc) == 0,
+        scene.scene_xform_skipped(&sc) as i64, 0)
+    // Und es bleibt ein BILD: die Punkte in seiner Mitte tragen die
+    // Farbe des Bildes und nicht die einer Flaeche.
+    let mitte: u32 = canvas.canvas_get(&cv, 128, 80)
+    var n97e: [u8; 44] = "15c und es ist das Bild, nicht ein Kasten   "
+    report((&n97e[0]) as u64, 44,
+        canvas.color_a(mitte) != 0 as u32, canvas.color_a(mitte) as i64,
+        255)
+
+    // ============ 16. EIN BILD UND EIN SYMBOL ALS KNOTEN
+    //
+    // `node_set_image`, `node_set_svg` und `node_set_art_align` standen
+    // im export-Block, ohne dass eine Pruefung sie rief. Jetzt stehen
+    // die Zahlen da, und sie sind von Hand gerechnet: das Thema gibt
+    // pad_x = 16, pad_y = 8, die Luecke zwischen Bild und Text sp_s = 8,
+    // und die Mindesthoehe eines Bedienelements ist ctrl_h = 32.
+    //
+    //     Bildknoten, Bildflaeche 24 x 24, ART_ONLY (kein Text):
+    //         Breite = 24 + 2 * 16 = 56
+    //         Hoehe  = 24 + 2 *  8 = 40   (mehr als ctrl_h = 32)
+    //
+    // Das Bild selbst sind 8 x 8 Punkte in Rot 200 / Gruen 100 /
+    // Blau 50 -- drei verschiedene Kanaele, damit eine Vertauschung
+    // auffaellt (dieselbe Regel wie in tools/fui/image_main.fi). Die
+    // Reihenfolge im Speicher ist R, G, B, A (lib/fui/uiimage.fi), eine
+    // 32-Bit-Zahl auf dieser Maschine also 0xAABBGGRR: 4281492680 ist
+    // genau Rot 200, Gruen 100, Blau 50, voll gedeckt.
+    var bpx: [u32; 64] = [4281492680 as u32; 64]
+    var bild: uiimage.Image = uiimage.image_wrap((&bpx[0]) as u64, 8, 8, 0)
+    scene.scene_reset(&sc)
+    let bknoten: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_IMAGE)
+    scene.node_set_image(&sc, bknoten, &bild, 24, 24)
+    scene.node_set_art_align(&sc, bknoten, widget.ART_ONLY)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    var n98: [u8; 44] = "16 der Bildknoten misst 56 breit            "
+    report((&n98[0]) as u64, 44, scene.node_pref_w(&sc, bknoten) as i64 == 56,
+        scene.node_pref_w(&sc, bknoten) as i64, 56)
+    var n99: [u8; 44] = "16 und 40 hoch                              "
+    report((&n99[0]) as u64, 44, scene.node_pref_h(&sc, bknoten) as i64 == 40,
+        scene.node_pref_h(&sc, bknoten) as i64, 40)
+    // Die Lage der Bildflaeche: bei ART_ONLY steht sie MITTIG im
+    // Inhaltskasten. Angeordnet bei (100,60) mit 56 x 40 ist der
+    // Inhaltskasten (116, 68, 24, 24) -- das Bild fuellt ihn genau, also
+    // liegt seine linke obere Ecke bei (116, 68).
+    scene.scene_layout(&sc, &c, 100.0, 60.0, 56.0, 40.0)
+    var ax: f64 = 0.0
+    var ay: f64 = 0.0
+    var aw: f64 = 0.0
+    var ah: f64 = 0.0
+    var ttx: f64 = 0.0
+    var ttw: f64 = 0.0
+    render.art_text_split(&c, scene.node_widget(&sc, bknoten), 116.0,
+        68.0, 24.0, 24.0, &ax, &ay, &aw, &ah, &ttx, &ttw)
+    var n100: [u8; 44] = "16 die Bildflaeche beginnt bei x=116        "
+    report((&n100[0]) as u64, 44, ax as i64 == 116,
+        ax as i64, 116)
+    var n101: [u8; 44] = "16 und bei y=68                             "
+    report((&n101[0]) as u64, 44, ay as i64 == 68,
+        ay as i64, 68)
+    var n102: [u8; 44] = "16 sie ist 24 x 24 gross                    "
+    report((&n102[0]) as u64, 44, aw as i64 == 24 && ah as i64 == 24,
+        aw as i64, 24)
+    // UND DAS BILD STEHT WIRKLICH IM BILD. Gezaehlt wird die Flaeche,
+    // die gesetzt wurde, und der rote Kanal in ihrer Mitte: 8 x 8
+    // Punkte auf 24 x 24 gestreckt sind 576 Punkte, und ihre Mitte ist
+    // Rot 200.
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    let bild_punkte: usize = zaehle_gesetzt(&cv, 116, 68, 24, 24)
+    var n103: [u8; 44] = "16 das Bild deckt seine Flaeche (>500)      "
+    report((&n103[0]) as u64, 44, bild_punkte > 500,
+        bild_punkte as i64, 500)
+    var n104: [u8; 44] = "16 und sein roter Kanal ist 200             "
+    report((&n104[0]) as u64, 44, canvas.color_r(canvas.canvas_get(&cv, 128, 80)) == 200 as u32,
+        canvas.color_r(canvas.canvas_get(&cv, 128, 80)) as i64, 200)
+
+    // ---- DAS SYMBOL. Dasselbe noch einmal mit einem gerasterten SVG
+    // und einem Text daneben. Hier zaehlt die LAGE: bei ART_LEFT steht
+    // das Symbol am linken Rand des Inhaltskastens, bei ART_RIGHT am
+    // rechten. Der Knoten ist auf 200 x 40 festgelegt, sein
+    // Inhaltskasten also (116, 68, 168, 24):
+    //
+    //     ART_LEFT   x = 116
+    //     ART_RIGHT  x = 116 + 168 - 16 = 268
+    //     y (immer mittig) = 68 + (24 - 16) / 2 = 72
+    var svgq: [u8; 88] = "<svg viewBox='0 0 10 10'><rect x='0' y='0' width='10' height='10' fill='#3264c8'/></svg>"
+    var sym: uisvg.Icon = uisvg.icon_new()
+    let hat_sym: bool = uisvg.icon_render(&sym, (&svgq[0]) as u64, 88,
+        16, 16, 0 as u32, fm)
+    var n105: [u8; 44] = "16 das Symbol wird gerastert                "
+    report((&n105[0]) as u64, 44, hat_sym,
+        hat_sym as i64, 1)
+    var t_sym: [u8; 4] = "Save"
+    scene.scene_reset(&sc)
+    let sknoten: usize = scene.scene_add(&sc, scene.SCENE_NONE,
+        scene.N_SVG)
+    scene.node_set_svg(&sc, sknoten, &sym, 16, 16)
+    scene.node_set_text(&sc, sknoten, (&t_sym[0]) as u64, 4)
+    scene.node_set_art_align(&sc, sknoten, widget.ART_LEFT)
+    scene.node_set_size(&sc, sknoten, 200.0, 40.0)
+    scene.scene_style(&sc, &leer)
+    scene.scene_measure(&sc, &c)
+    scene.scene_layout(&sc, &c, 100.0, 60.0, 200.0, 40.0)
+    render.art_text_split(&c, scene.node_widget(&sc, sknoten), 116.0,
+        68.0, 168.0, 24.0, &ax, &ay, &aw, &ah, &ttx, &ttw)
+    var n106: [u8; 44] = "16 das Symbol steht links bei x=116         "
+    report((&n106[0]) as u64, 44, ax as i64 == 116,
+        ax as i64, 116)
+    var n107: [u8; 44] = "16 mittig bei y=72                          "
+    report((&n107[0]) as u64, 44, ay as i64 == 72,
+        ay as i64, 72)
+    var n108: [u8; 44] = "16 und der Text beginnt dahinter: 140       "
+    report((&n108[0]) as u64, 44, ttx as i64 == 140,
+        ttx as i64, 140)
+    scene.node_set_art_align(&sc, sknoten, widget.ART_RIGHT)
+    render.art_text_split(&c, scene.node_widget(&sc, sknoten), 116.0,
+        68.0, 168.0, 24.0, &ax, &ay, &aw, &ah, &ttx, &ttw)
+    var n109: [u8; 44] = "16 rechts ausgerichtet steht es bei x=268   "
+    report((&n109[0]) as u64, 44, ax as i64 == 268,
+        ax as i64, 268)
+    // Und auch das Symbol wird gemalt: 16 x 16 Punkte an seiner Stelle,
+    // mit Blau 200 in der Mitte.
+    canvas.canvas_clear(&cv, 0 as u32)
+    scene.scene_draw(&sc, &c)
+    let sym_punkte: usize = zaehle_gesetzt(&cv, 268, 72, 16, 16)
+    var n110: [u8; 44] = "16 das Symbol deckt seine Flaeche (>200)    "
+    report((&n110[0]) as u64, 44, sym_punkte > 200,
+        sym_punkte as i64, 200)
+    var n111: [u8; 44] = "16 und sein blauer Kanal ist 200            "
+    report((&n111[0]) as u64, 44, canvas.color_b(canvas.canvas_get(&cv, 276, 80)) == 200 as u32,
+        canvas.color_b(canvas.canvas_get(&cv, 276, 80)) as i64, 200)
+    uisvg.icon_free(&sym)
+
+    // ============================== 17. DIE KURZFORMEN DES BAUMS
+    //
+    // scene_box, scene_widget, node_set_space, node_set_flexitem und
+    // scene_run schreiben dasselbe hin wie die Einzelaufrufe -- das
+    // ist keine Behauptung, sondern hier eine Messung: ZWEI Baeume,
+    // links Langform, rechts Kurzform, gleiche Zahlen hinein, und
+    // danach muessen die angeordneten Rechtecke Punkt fuer Punkt
+    // uebereinstimmen. Ginge eine der Kurzformen einen anderen Weg,
+    // stuenden hier zwei verschiedene Zahlen.
+    var kt: [u8; 3] = "Run"
+    var kf_blatt: sheet.Sheet = sheet.sheet_new()
+    var lang: scene.Scene = scene.scene_new()
+    let l_wurzel: usize = scene.scene_add(&lang, scene.SCENE_NONE,
+        scene.N_BOX)
+    scene.node_add_class(&lang, l_wurzel, 7 as u32)
+    scene.node_set_flex(&lang, l_wurzel, flex.FLEX_ROW,
+        flex.JUSTIFY_START, flex.AL_CENTER)
+    scene.node_set_padding(&lang, l_wurzel, 10, 10, 10, 10)
+    scene.node_set_gap(&lang, l_wurzel, 8, 0)
+    let l_kind: usize = scene.scene_add(&lang, l_wurzel, scene.N_WIDGET)
+    scene.node_set_widget_kind(&lang, l_kind, widget.KIND_BUTTON)
+    scene.node_set_text(&lang, l_kind, (&kt[0]) as u64, 3)
+    scene.node_set_grow(&lang, l_kind, 1000, 1000)
+    scene.node_set_bounds(&lang, l_kind, 140, 0)
+    scene.scene_style(&lang, &kf_blatt)
+    scene.scene_measure(&lang, &c)
+    scene.scene_layout(&lang, &c, 0.0, 0.0, 400.0, 60.0)
+    scene.scene_draw(&lang, &c)
+
+    var kurz: scene.Scene = scene.scene_new()
+    let k_wurzel: usize = scene.scene_box(&kurz, scene.SCENE_NONE,
+        7 as u32, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    scene.node_set_space(&kurz, k_wurzel, 10, 10, 10, 10, 8, 0)
+    let k_kind: usize = scene.scene_widget(&kurz, k_wurzel,
+        widget.KIND_BUTTON, (&kt[0]) as u64, 3)
+    scene.node_set_flexitem(&kurz, k_kind, 1000, 1000, 140, 0)
+    scene.scene_run(&kurz, &c, &kf_blatt, 0.0, 0.0, 400.0, 60.0)
+
+    var n120: [u8; 44] = "17 die Kurzform setzt dieselbe Klasse       "
+    report((&n120[0]) as u64, 43,
+        scene.node_has_class(&kurz, k_wurzel, 7 as u32),
+        scene.node_class_count(&kurz, k_wurzel) as i64, 1)
+    var n121: [u8; 44] = "17 und dieselbe Art (N_WIDGET = 5)          "
+    report((&n121[0]) as u64, 43,
+        scene.node_kind(&kurz, k_kind) == scene.N_WIDGET,
+        scene.node_kind(&kurz, k_kind) as i64,
+        scene.N_WIDGET as i64)
+    var n122: [u8; 44] = "17 das Kind steht bei x = 10                "
+    report((&n122[0]) as u64, 43,
+        scene.node_x(&kurz, k_kind) as i64
+        == scene.node_x(&lang, l_kind) as i64,
+        scene.node_x(&kurz, k_kind) as i64,
+        scene.node_x(&lang, l_kind) as i64)
+    var n123: [u8; 44] = "17 gleiche Breite wie in der Langform       "
+    report((&n123[0]) as u64, 43,
+        scene.node_w(&kurz, k_kind) as i64
+        == scene.node_w(&lang, l_kind) as i64,
+        scene.node_w(&kurz, k_kind) as i64,
+        scene.node_w(&lang, l_kind) as i64)
+    var n124: [u8; 44] = "17 gleiche Hoehe und gleiches y             "
+    report((&n124[0]) as u64, 43,
+        scene.node_y(&kurz, k_kind) as i64
+        == scene.node_y(&lang, l_kind) as i64
+        && scene.node_h(&kurz, k_kind) as i64
+        == scene.node_h(&lang, l_kind) as i64,
+        scene.node_h(&kurz, k_kind) as i64,
+        scene.node_h(&lang, l_kind) as i64)
+    // scene_run laeuft ALLE vier Durchgaenge: danach steht der Baum
+    // auf PHASE_DRAW, und keine Groesse ist beim Zeichnen gewandert.
+    var n125: [u8; 44] = "17 scene_run endet in PHASE_DRAW (4)        "
+    report((&n125[0]) as u64, 43,
+        scene.scene_phase(&kurz) == scene.PHASE_DRAW,
+        scene.scene_phase(&kurz) as i64, scene.PHASE_DRAW as i64)
+    var n126: [u8; 44] = "17 und nichts driftet dabei                 "
+    report((&n126[0]) as u64, 43, scene.scene_size_drift(&kurz) == 0,
+        scene.scene_size_drift(&kurz) as i64, 0)
+    // Und die Null als "keine Klasse": scene_box mit 0 haengt keine an.
+    let ohne: usize = scene.scene_box(&kurz, k_wurzel, 0 as u32,
+        flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    var n127: [u8; 44] = "17 Klasse 0 heisst: gar keine Klasse        "
+    report((&n127[0]) as u64, 43,
+        scene.node_class_count(&kurz, ohne) == 0,
+        scene.node_class_count(&kurz, ohne) as i64, 0)
+
+    canvas.canvas_free(&cv)
+    painter.painter_free(&z)
+    rt.buf_free(&fbuf)
+
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push(&t, 10 as u8)
+    if G_ERRORS > 0 {
+        var f: [u8; 23] = "SCENE IS NOT IN ORDER.\n"
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 23)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+        return 1
+    }
+    var o: [u8; 14] = "SCENE PASSED.\n"
+    rt.buf_push_bytes(&t, (&o[0]) as u64, 14)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 0
+}
