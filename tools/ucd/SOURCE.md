@@ -26,3 +26,20 @@ chain security; negative tests `tests/neg/comptime_file_absolute.fi` and
 `comptime_file_parent.fi`).
 
 Terms of use of the data: <https://www.unicode.org/terms_of_use.html>.
+
+# Die Bidi-Dateien (seit 23.09.2026)
+
+`tools/ucd/build_bidi.sh` baut daraus `generated/bidi_tables.fi` (die
+Bidi-Klasse, die arabische Verbindungsart, Spiegel- und Klammerpaare, die
+arabischen Darstellungsformen). Alle vier sind **Unicode 17.0.0**, geholt
+am 2026-09-23, die Summen stehen in `tools/ucd/UCD_BIDI.sha256`.
+
+| Datei | URL | Oktette |
+|---|---|---|
+| `DerivedBidiClass.txt` | <https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedBidiClass.txt> | 173,433 |
+| `BidiMirroring.txt` | <https://www.unicode.org/Public/17.0.0/ucd/BidiMirroring.txt> | 26,827 |
+| `BidiBrackets.txt` | <https://www.unicode.org/Public/17.0.0/ucd/BidiBrackets.txt> | 8,891 |
+| `ArabicShaping.txt` | <https://www.unicode.org/Public/17.0.0/ucd/ArabicShaping.txt> | 41,441 |
+
+Neu holen und vergleichen: `bash tools/ucd/build_bidi.sh --fetch`
+(bricht ab, wenn eine Summe nicht mehr passt).
