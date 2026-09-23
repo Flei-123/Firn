@@ -1699,7 +1699,7 @@ fn closure_lower(l: *mut Lower, e: u32, target: u32) {
     (*l).cur = join
 }
 
-fn gc_barrier(l: *mut Lower, target: u32) {
+fn gc_barrier(l: *mut Lower, target: u32, addr: u32) {
     let b: *mut ast.Tree = tree(l)
     let t: u32 = sema.sema_ty(sm(l), target)
     if !gc.gc_is_gc_ptr(gcl(l), tf(l), t) {
@@ -1728,16 +1728,41 @@ fn gc_barrier(l: *mut Lower, target: u32) {
     if !ins_heap {
         return
     }
-    var bn: [u8; 12] = "__gc_barrier"
-    let bnn: u32 = intern.intern_number(names(l), (&bn[0]) as u64, 12) as u32
-    let addr: u32 = address(l, target)
+    // Round B4: `addr` is the address the store went to -- the target is
+    // not evaluated a second time (`pick().next = x` called `pick` twice).
     let val: u32 = load(l, fir.T_PTR, addr)
+    gc_barrier_inline(l, val)
+}
+
+// Round B4 (gc_lower.rs::emit_barrier): the fast half of the barrier INLINE
+// at the store -- count into S_BARRIEREN (144), test S_PHASE (320), and only
+// while a cycle runs call `__gc_barrier_slow(value)`. The two offsets are the
+// contract with lib/gc/gc.fi; compiler/src/gc.rs checks them in a module
+// test.
+fn gc_barrier_inline(l: *mut Lower, val: u32) {
+    let st: u32 = push(l, fir.O_GCADDR, fir.T_PTR, 0, 0, 0, 0, 0, 0)
+    let ca: u32 = ptradd_const(l, st, 144)
+    let c: u32 = load(l, fir.T_U64, ca)
+    let one: u32 = constant(l, fir.T_U64, 1)
+    let c1: u32 = push(l, fir.O_BIN, fir.T_U64, c, one, 0, 0, 0, 0)
+    store(l, fir.T_U64, ca, c1)
+    let pa: u32 = ptradd_const(l, st, 320)
+    let ph: u32 = load(l, fir.T_U64, pa)
+    let zero: u32 = constant(l, fir.T_U64, 0)
+    let busy: u32 = push(l, fir.O_CMP, fir.T_BOOL, ph, zero, 1, fir.T_U64 as u64, 0, 0)
+    let slow: u32 = new_block(l)
+    let join: u32 = new_block(l)
+    term(l, fir.TERM_BRCOND, busy, slow, join)
+    (*l).cur = slow
+    var bn: [u8; 17] = "__gc_barrier_slow"
+    let bnn: u32 = intern.intern_number(names(l), (&bn[0]) as u64, 17) as u32
     var tmp: Vec[u32] = vec_new[u32]()
-    vec_push[u32](&tmp, addr)
     vec_push[u32](&tmp, val)
     let aoff: u32 = args_store(l, &tmp)
     vec_free[u32](&tmp)
-    push_void(l, fir.O_CALL, fir.T_VOID, bnn, 0, 0, 0, aoff, 2)
+    push_void(l, fir.O_CALL, fir.T_VOID, bnn, 0, 0, 0, aoff, 1)
+    term(l, fir.TERM_BR, join, 0, 0)
+    (*l).cur = join
 }
 
 // A call following the calling convention. `target` is the destination
@@ -2154,6 +2179,16 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
             vec_free[u32](&tmp)
             return push(l, fir.O_CALL, fir.T_PTR, ann, 0, 0, 0, aoff, 2)
         }
+        // Round B4: an explicit `__gc_barrier(field, value)` (lib/gc/gcvec.fi,
+        // gcmap.fi) gets the same inline fast path as a compiler-inserted
+        // one (gc_lower.rs::hook_call). The field is evaluated, not used.
+        var gb: [u8; 12] = "__gc_barrier"
+        if intern.intern_equal(names(l), name, (&gb[0]) as u64, 12) {
+            let gfield: u32 = value(l, ast.child_at(b, ast.e_b(b, e)))
+            let gval: u32 = value(l, ast.child_at(b, ast.e_b(b, e) + 1))
+            gc_barrier_inline(l, gval)
+            return 0
+        }
         // `barrier(x)` (ct.rs): opaque for the optimizer -- this stage
         // has none, so it stays the identity.
         var bw: [u8; 7] = "barrier"
@@ -2510,7 +2545,7 @@ fn stmt(l: *mut Lower, i: u32) {
         // HOOK gc (gc_lower.rs::hook_assign): the insertion barrier AFTER
         // writing a Gc pointer into a heap field.
         if has_gc(l) {
-            gc_barrier(l, ast.s_a(b, i))
+            gc_barrier(l, ast.s_a(b, i), addr)
         }
         return
     }
@@ -2563,7 +2598,7 @@ fn stmt(l: *mut Lower, i: u32) {
         let res: u32 = push(l, fir.O_BIN, ft, cur, rhs, op, 0, 0, 0)
         store(l, ft, addr, res)
         if has_gc(l) {
-            gc_barrier(l, target)
+            gc_barrier(l, target, addr)
         }
         return
     }
