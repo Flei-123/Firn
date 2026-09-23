@@ -841,7 +841,19 @@ if [ "$1" = "--images" ]; then
     # PNG und der Lauf bleibt daran haengen.
     build gallery9
     kette gallery9 1240
-    "$W/gallery9" "$Z/fui-deklarativ-hell.png" light
+    # Das sechste Argument laesst dieselbe Seite ihren Barrierefreiheits-
+    # Baum (lib/fui/a11y.fi, a11y_dump) als Text neben das Bild legen.
+    # Abschnitt 10 im Programm verlangt dabei, dass jedes der 12
+    # Bedienelemente Rolle und Namen hat; sonst gibt es kein Bild.
+    "$W/gallery9" "$Z/fui-deklarativ-hell.png" light - 1240 \
+        "$Z/fui-deklarativ-a11y.txt"
+    if ! grep -q '^    textbox "Im Baum suchen" focusable' \
+        "$Z/fui-deklarativ-a11y.txt"; then
+        echo "  FEHLER: fui-deklarativ-a11y.txt fehlt oder das Suchfeld hat"
+        echo "  darin keinen Namen."
+        exit 1
+    fi
+    echo "  fui-deklarativ-a11y.txt: $(wc -l < "$Z/fui-deklarativ-a11y.txt") Zeilen Barrierefreiheits-Baum  OK"
     "$W/gallery9" "$Z/fui-deklarativ-dunkel.png" dark
     beleg "$Z/fui-deklarativ-hell.png" 1240 700 740 200 40 1
     beleg "$Z/fui-deklarativ-dunkel.png" 1240 700 740 200 40 1
