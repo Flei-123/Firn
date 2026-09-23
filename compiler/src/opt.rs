@@ -161,6 +161,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "hoist loop invariant computations into the preheader",
     },
     PassInfo {
+        name: "memset",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "a loop that writes only zeroes becomes one block instruction",
+    },
+    PassInfo {
         name: "bce",
         scope: Scope::Func,
         debug_preserving: true,
@@ -396,7 +402,7 @@ struct Fix {
 }
 
 /// as many slots as there are passes in `PASSES`
-const PASS_SLOTS: usize = 12;
+const PASS_SLOTS: usize = 13;
 
 impl Fix {
     fn new() -> Fix {
@@ -499,6 +505,13 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             clk.add2("licm", t, h > 0);
             fx.note(5, h > 0);
             phi_check(f, "licm");
+        }
+        if cfg.runs("memset") && fx.due(11) {
+            let t = std::time::Instant::now();
+            let m = crate::memset::recognise(f);
+            clk.add2("memset", t, m > 0);
+            fx.note(11, m > 0);
+            phi_check(f, "memset");
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
