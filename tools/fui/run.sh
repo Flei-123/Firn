@@ -879,6 +879,23 @@ if [ "$1" = "--images" ]; then
     "$W/gallery9" "$Z/fui-deklarativ-schmal-dunkel.png" dark - 980
     beleg "$Z/fui-deklarativ-schmal-hell.png" 980 700 740 200 40 1
     beleg "$Z/fui-deklarativ-schmal-dunkel.png" 980 700 740 200 40 1
+    # DIE ZWEIRICHTUNGSSCHRIFT (Runde Bidi, 23.09.2026). Arabisch und
+    # Hebraeisch neben Lateinisch, alles ueber den normalen Weg der
+    # Bibliothek: Beschriftungen mit Zahlen und Klammern, dieselbe
+    # Beschriftung mit direction ltr und rtl, Knoepfe, ein Absatz ueber
+    # zwei Zeilen, eine Kuerzung mit den Punkten links, zwei Textfelder
+    # (Schreibmarke am arabischen Textende, Auswahl ueber die
+    # Richtungsgrenze). Das Programm rechnet selbst nach, dass neben
+    # keinem Kasten ein fremder Punkt steht, dass der Text im RTL-Kasten
+    # rechts beginnt und dass der Absatz wirklich zwei Zeilen hat --
+    # sonst schreibt es kein PNG. Die Schrift ist DejaVu Sans, die
+    # arabische und hebraeische Glyphen samt GSUB fuehrt.
+    build gallery10
+    kette gallery10 1000
+    "$W/gallery10" "$Z/fui-bidi-hell.png" light
+    "$W/gallery10" "$Z/fui-bidi-dunkel.png" dark
+    beleg "$Z/fui-bidi-hell.png" 1000 500 900 200 40 1
+    beleg "$Z/fui-bidi-dunkel.png" 1000 500 900 200 40 1
     # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
     # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
     # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet
