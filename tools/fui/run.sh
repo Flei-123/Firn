@@ -289,7 +289,8 @@ echo "== 18c. DAS STILBLATT: RANGFOLGE UND VERERBUNG =="
 # Kennung schlaegt Klasse schlaegt Art, bei Gleichstand gewinnt die
 # spaeter geschriebene Regel, und eine ranghohe Regel, die nur die
 # Schriftfarbe nennt, loescht keinen Grund. Dazu die Vererbung UND
-# ihre Grenze -- vier Werte gehen ueber, der Grund nicht.
+# ihre Grenze -- fuenf Werte gehen ueber (seit 23.09.2026 auch die
+# Schreibrichtung), der Grund nicht.
 build sheet
 "$W/sheet"
 
