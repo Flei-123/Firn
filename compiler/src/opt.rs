@@ -131,6 +131,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "constant folding (Bin/Cmp/Un/Cast with constant operands)",
     },
     PassInfo {
+        name: "sroa",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "a struct on the stack whose address never escapes becomes one cell per field",
+    },
+    PassInfo {
         name: "mem2reg",
         scope: Scope::Func,
         debug_preserving: true,
@@ -402,7 +408,7 @@ struct Fix {
 }
 
 /// as many slots as there are passes in `PASSES`
-const PASS_SLOTS: usize = 13;
+const PASS_SLOTS: usize = 14;
 
 impl Fix {
     fn new() -> Fix {
@@ -454,6 +460,13 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             clk.add2("fold", t, c);
             fx.note(0, c);
             phi_check(f, "fold");
+        }
+        if cfg.runs("sroa") && fx.due(12) {
+            let t = std::time::Instant::now();
+            let n = crate::sroa::split(f);
+            clk.add2("sroa", t, n > 0);
+            fx.note(12, n > 0);
+            phi_check(f, "sroa");
         }
         if cfg.runs("mem2reg") && fx.due(1) {
             let t = std::time::Instant::now();

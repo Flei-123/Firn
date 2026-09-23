@@ -49,6 +49,7 @@ mod modules;
 mod mono;
 mod mem2reg;
 mod memset;
+mod sroa;
 mod escape;
 mod nogc;
 mod opt;

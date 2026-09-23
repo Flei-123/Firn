@@ -451,6 +451,10 @@ pub struct Alloc {
     cell_ty: HashMap<Val, FTy>,
     /// callee-saved registers used and their save slot
     saved: Vec<(&'static str, u64)>,
+    /// RUNDE TEMPO 12: je Aufruf (Block, Anweisung) die Werte, die in einem
+    /// caller-saved Register ueber ihn hinweg leben und darum direkt davor
+    /// abgelegt und direkt danach zurueckgeholt werden: (Register, Platz, Typ).
+    call_saves: HashMap<(usize, usize), Vec<(&'static str, u64, FTy)>>,
     frame: Frame,
     /// Round 87: why did the values that got no register not get one? Only
     /// filled when `FIRN_RA_STATS` is set -- the counting costs nothing, but
@@ -1302,6 +1306,49 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
     ok
 }
 
+/// RUNDE TEMPO 13: teilen zwei Stueck-Listen (je aufsteigend, geschlossene
+/// Stuecke) eine Stelle?
+fn segs_meet(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        let (a0, a1) = a[i];
+        let (b0, b1) = b[j];
+        if a0 <= b1 && b0 <= a1 {
+            return true;
+        }
+        if a1 < b1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
+}
+
+/// Vereinigung zweier Stueck-Listen, wieder aufsteigend und ohne Ueberlappung.
+fn seg_union(a: &[(usize, usize)], b: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut all: Vec<(usize, usize)> = a.iter().chain(b.iter()).copied().collect();
+    all.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(all.len());
+    for (x, y) in all {
+        if let Some(l) = out.last_mut() {
+            if x <= l.1 {
+                if y > l.1 {
+                    l.1 = y;
+                }
+                continue;
+            }
+        }
+        out.push((x, y));
+    }
+    out
+}
+
+/// Gesamtlaenge einer Stueck-Liste (Anzahl Stellen).
+fn seg_len(a: &[(usize, usize)]) -> u64 {
+    a.iter().map(|(x, y)| (y - x + 1) as u64).sum()
+}
+
 pub fn allocate(f: &Func) -> Alloc {
     let nv = f.val_types.len();
     let nb = f.blocks.len();
@@ -1320,6 +1367,7 @@ pub fn allocate(f: &Func) -> Alloc {
         cells: HashMap::new(),
         cell_ty: HashMap::new(),
         saved: Vec::new(),
+        call_saves: HashMap::new(),
         frame,
         stats: None,
     };
@@ -1476,6 +1524,61 @@ pub fn allocate(f: &Func) -> Alloc {
         m
     };
 
+    // RUNDE TEMPO 12 -- WAS EIN AUFRUF WIRKLICH KOSTET.
+    //
+    // Bis hierher hiess "kreuzt einen Aufruf": nur die fuenf callee-saved
+    // Register, bei Gleitzahlen GAR KEIN Register. In `l3_huffman` kreuzen
+    // 92 Werte den einen, selten genommenen Aufruf `l3_pow_43` -- und lagen
+    // deshalb im Rahmen, auch in der heissen Schleife, die ihn nie ausfuehrt.
+    //
+    // Die Alternative ist, was jeder Uebersetzer macht: der Wert bekommt ein
+    // beliebiges Register, und nur AM AUFRUF wird es abgelegt und
+    // zurueckgeholt. Das kostet zwei Befehle je Aufruf und lohnt, wenn der
+    // Wert oefter gebraucht wird, als die Aufrufe laufen, die er kreuzt.
+    // Nur echte Aufrufe (`call`, `call rax`); `syscall`, Faeden und `cpuid`
+    // bleiben harte Grenzen. `FIRN_NO_CALLSAVE=1` schaltet es ab.
+    let callsave_on = std::env::var_os("FIRN_NO_CALLSAVE").is_none()
+        && match std::env::var("FIRN_CS_FN") {
+            Ok(x) => f.name.contains(&x),
+            Err(_) => true,
+        };
+    let mut calls: Vec<(usize, u64, usize, usize)> = Vec::new(); // (pos, gewicht, block, index)
+    let mut clob_nc: Vec<(usize, RegMask)> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, i) in b.insts.iter().enumerate() {
+            let m = inst_clobbers(i);
+            if matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. }) {
+                calls.push((live.pos[bi][ii], 10u64.saturating_pow(depth[bi]), bi, ii));
+            } else if m != 0 {
+                clob_nc.push((live.pos[bi][ii], m));
+            }
+        }
+    }
+    let rough_nc = |sp: usize, ep: usize| -> RegMask {
+        let mut m: RegMask = 0;
+        for &(p, k) in clob_nc.iter() {
+            if sp <= p && p <= ep {
+                m |= k;
+            }
+        }
+        m
+    };
+    // Kosten der Aufrufe, die echt INNERHALB liegen (s < p < e): Ablegen +
+    // Zurueckholen je Lauf. Ein Aufruf AM Rand ist der letzte Leser bzw.
+    // der Erzeuger und braucht nichts.
+    let call_cost = |sp: usize, ep: usize| -> u64 {
+        let mut c: u64 = 0;
+        for &(p, w, _, _) in calls.iter() {
+            if sp < p && p < ep {
+                c = c.saturating_add(w.saturating_mul(2));
+            }
+        }
+        c
+    };
+    let mut save_set: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    let cs_int = std::env::var_os("FIRN_CS_INT").is_some();
+    let cs_k: u64 = std::env::var("FIRN_CS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+
     // intervals + weights
     let mut start = vec![usize::MAX; nv];
     let mut end = vec![0usize; nv];
@@ -1527,6 +1630,97 @@ pub fn allocate(f: &Func) -> Alloc {
         };
         if let Some(v) = tv {
             touch(v, live.block_end[bi], w, &mut start, &mut end, &mut weight);
+        }
+    }
+
+    // ---- RUNDE TEMPO 13: LEBENSDAUER MIT LUECKEN -------------------------
+    //
+    // Bis hierher war ein Intervall `[erstes Beruehren, letztes Beruehren]`
+    // am Stueck. Ein Wert, der am Anfang der Funktion gebraucht wird und am
+    // Ende noch einmal, belegte sein Register dazwischen durchgehend -- auch
+    // durch jede Schleife, in der er gar nicht vorkommt. `l3_huffman`: 86
+    // "gleichzeitig lebende" Werte bei 14 Registern.
+    //
+    // Jetzt bekommt jeder Wert je Block ein STUECK: ab Blockanfang, wenn er
+    // hineinlebt (sonst ab dem ersten Beruehren), bis Blockende, wenn er
+    // hinauslebt (sonst bis zum letzten Beruehren). Zwei Werte stoeren sich
+    // genau dann, wenn sich zwei ihrer Stuecke ueberschneiden. Das ist die
+    // Lebendigkeit aus der Datenflussanalyse, also richtig fuer jede
+    // Kontrollflussform -- die Blockreihenfolge spielt keine Rolle mehr.
+    //
+    // Nur mit Fixpunkt der Lebendigkeit (sonst koennten die Mengen zu klein
+    // sein, dieselbe Vorsicht wie bei `exact_crossings`). `FIRN_NO_HOLES=1`
+    // stellt den alten Scan wieder her.
+    let holes = live.converged && std::env::var_os("FIRN_NO_HOLES").is_none();
+    let mut segs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nv];
+    if holes {
+        let mut first = vec![usize::MAX; nv];
+        let mut last = vec![0usize; nv];
+        let mut seen: Vec<usize> = Vec::new();
+        let mut ubuf: Vec<Val> = Vec::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            seen.clear();
+            {
+                let mut mark = |v: Val, p: usize, first: &mut Vec<usize>, last: &mut Vec<usize>, seen: &mut Vec<usize>| {
+                    let v = v as usize;
+                    if v >= nv {
+                        return;
+                    }
+                    if first[v] == usize::MAX {
+                        first[v] = p;
+                        last[v] = p;
+                        seen.push(v);
+                    } else {
+                        if p < first[v] {
+                            first[v] = p;
+                        }
+                        if p > last[v] {
+                            last[v] = p;
+                        }
+                    }
+                };
+                if bi == 0 {
+                    for k in 0..f.params.len() {
+                        mark(k as Val, 0, &mut first, &mut last, &mut seen);
+                    }
+                }
+                for (ii, i) in b.insts.iter().enumerate() {
+                    let p = live.pos[bi][ii];
+                    ubuf.clear();
+                    i.op.uses(&mut ubuf);
+                    for &u in ubuf.iter() {
+                        mark(u, p, &mut first, &mut last, &mut seen);
+                    }
+                    if let Some(d) = i.dst {
+                        mark(d, p, &mut first, &mut last, &mut seen);
+                    }
+                }
+                let tv = match &b.term {
+                    Term::BrCond { cond, .. } => Some(*cond),
+                    Term::Switch { val, .. } => Some(*val),
+                    Term::Ret(Some(v)) => Some(*v),
+                    _ => None,
+                };
+                if let Some(v) = tv {
+                    mark(v, live.block_end[bi], &mut first, &mut last, &mut seen);
+                }
+            }
+            for v in 0..nv {
+                let li = live.live_in[bi][v];
+                let lo = live.live_out[bi][v];
+                let t = first[v] != usize::MAX;
+                if !li && !lo && !t {
+                    continue;
+                }
+                let a = if li { live.block_start[bi] } else if t { first[v] } else { live.block_start[bi] };
+                let z = if lo { live.block_end[bi] } else if t { last[v] } else { a };
+                let a = if bi == 0 && t && first[v] < a { first[v] } else { a };
+                segs[v].push((a.min(z), z.max(a)));
+            }
+            for &v in seen.iter() {
+                first[v] = usize::MAX;
+                last[v] = 0;
+            }
         }
     }
 
@@ -1608,6 +1802,7 @@ pub fn allocate(f: &Func) -> Alloc {
             }
         }
         let read0 = count_reads(f);
+        let coal_multi = std::env::var_os("FIRN_COAL_SINGLE").is_none();
         let np = f.params.len() as Val;
         let mut sources: HashMap<Val, Vec<Val>> = HashMap::new();
         for (bi, b) in f.blocks.iter().enumerate() {
@@ -1673,7 +1868,10 @@ pub fn allocate(f: &Func) -> Alloc {
                 // Register erben. Die Frage ist also nicht, wie oft der Wert
                 // gelesen wird, sondern ob er NACH dieser Anweisung noch
                 // lebt.
-                if defs[t as usize] != 1 {
+                // RUNDE TEMPO 13: mit mehreren Schreibstellen ist Chaitins
+                // Regel genauso richtig -- `interferes` prueft JEDE davon.
+                // Bisher blieb so jede phi-Variable einer Schleife aussen vor.
+                if defs[t as usize] != 1 && !coal_multi {
                     reject!("mehrere Schreibstellen")
                 }
                 if two_address {
@@ -1751,6 +1949,11 @@ pub fn allocate(f: &Func) -> Alloc {
             if let Some(x) = exact.as_mut() {
                 x[pv] |= x[tv];
             }
+            if holes {
+                let tseg = std::mem::take(&mut segs[tv]);
+                let merged = seg_union(&segs[pv], &tseg);
+                segs[pv] = merged;
+            }
             start[tv] = usize::MAX;
         }
     }
@@ -1779,10 +1982,20 @@ pub fn allocate(f: &Func) -> Alloc {
         let (s, e) = (start[v], end[v]);
         // The exact answer where it exists, the interval answer otherwise.
         // Both are safe; the exact one is only narrower.
-        let killed = match &exact {
+        let mut killed = match &exact {
             Some(x) => x[v],
             None => rough(s, e),
         };
+        if callsave_on && cs_int && killed & M_CALL != 0 {
+            let c = call_cost(s, e);
+            if c.saturating_mul(cs_k) < weight[v] {
+                killed = rough_nc(s, e) | (killed & !M_CALL);
+                // Was nicht von einem Aufruf kommt, bleibt: `rough_nc`
+                // deckt div/rep/select usw. ab, das exakte Ergebnis ohne
+                // die Aufrufbits das, was die Kontrollflussanalyse wusste.
+                save_set.insert(v as Val);
+            }
+        }
         if want_stats {
             st.ivs += 1;
             if rough(s, e) & M_CALL != 0 {
@@ -1834,6 +2047,9 @@ pub fn allocate(f: &Func) -> Alloc {
         // in with the value intervals would make the false-positive rate
         // look better than it is.)
         st.cell_ivs += 1;
+        if holes {
+            segs[cv] = vec![(s, e)];
+        }
         ivs.push(Iv {
             val: c,
             start: s,
@@ -1870,9 +2086,13 @@ pub fn allocate(f: &Func) -> Alloc {
             Some(x) => x[v],
             None => rough(sp, ep),
         };
-        // Ein Aufruf zerstoert jedes SSE-Register: dann bleibt der Platz.
+        // Ein Aufruf zerstoert jedes SSE-Register: dann bleibt der Platz --
+        // ausser das Ablegen am Aufruf ist billiger (RUNDE TEMPO 12).
         if killed & M_CALL != 0 {
-            continue;
+            if !(callsave_on && call_cost(sp, ep).saturating_mul(cs_k) < weight[v]) {
+                continue;
+            }
+            save_set.insert(v as Val);
         }
         fp_ivs.push(Iv { val: v as Val, start: sp, end: ep, weight: weight[v], killed: 0, is_cell: false });
     }
@@ -1888,6 +2108,9 @@ pub fn allocate(f: &Func) -> Alloc {
         let e_end = end[cv];
         if rough(0, e_end) & M_CALL != 0 {
             continue;
+        }
+        if holes {
+            segs[cv] = vec![(0, e_end)];
         }
         fp_ivs.push(Iv {
             val: c,
@@ -1913,6 +2136,13 @@ pub fn allocate(f: &Func) -> Alloc {
     if want_stats {
         let mut ev: Vec<(usize, i32)> = Vec::with_capacity(ivs.len() * 2);
         for i in ivs.iter() {
+            if holes && !segs[i.val as usize].is_empty() {
+                for &(a, z) in segs[i.val as usize].iter() {
+                    ev.push((a, 1));
+                    ev.push((z + 1, -1));
+                }
+                continue;
+            }
             ev.push((i.start, 1));
             ev.push((i.end + 1, -1));
         }
@@ -1969,6 +2199,124 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     };
 
+    // RUNDE TEMPO 13: der Scan mit Luecken. Statt einer Liste aktiver
+    // Intervalle haelt jedes Register die Intervalle, die es gerade traegt
+    // (abgelaufene fallen heraus, sobald der Scan an ihrem Ende vorbei ist).
+    // Frei ist ein Register fuer `iv`, wenn es passt (`fits`) und keines
+    // seiner Intervalle ein Stueck mit `iv` teilt. Die Reihenfolge der
+    // Vorlieben ist die des alten Scans: erst die eingeschraenkten Register,
+    // die callee-saved zuletzt.
+    if holes {
+        // Sicherheitsnetz: ein Intervall ohne Stuecke stiesse mit NIEMANDEM
+        // zusammen und teilte sein Register mit allen. Dann gilt das ganze
+        // Intervall am Stueck.
+        for iv in ivs.iter().chain(fp_ivs.iter()) {
+            if segs[iv.val as usize].is_empty() {
+                segs[iv.val as usize] = vec![(iv.start, iv.end)];
+            }
+        }
+        let pref: Vec<&'static str> = TEMP_REGS
+            .iter()
+            .rev()
+            .chain(DIV_SPARE.iter().rev())
+            .chain(ARG_SPARE.iter().rev())
+            .chain(CALLEE_SAVED.iter().rev())
+            .copied()
+            .collect();
+        let mut on_reg: Vec<Vec<Iv>> = vec![Vec::new(); pref.len()];
+        let dens = |iv: &Iv| -> u64 {
+            if std::env::var_os("FIRN_HOLES_SPAN").is_some() {
+                return density(iv);
+            }
+            let l = seg_len(&segs[iv.val as usize]).max(1);
+            iv.weight.saturating_mul(64) / l
+        };
+        for iv in ivs.iter().copied() {
+            for l in on_reg.iter_mut() {
+                l.retain(|a| a.end >= iv.start);
+            }
+            let sv = &segs[iv.val as usize];
+            let mut pick: Option<usize> = None;
+            // Wer nur wegen der Sicherung am Aufruf hier ist, nimmt zuerst
+            // ein callee-saved Register (TEMPO 12) -- das kostet dort nichts.
+            let order: Vec<usize> = if save_set.contains(&iv.val) {
+                let mut o: Vec<usize> = (0..pref.len()).filter(|&k| CALLEE_SAVED.contains(&pref[k])).collect();
+                o.extend((0..pref.len()).filter(|&k| !CALLEE_SAVED.contains(&pref[k])));
+                o
+            } else {
+                (0..pref.len()).collect()
+            };
+            for &k in order.iter() {
+                let r = &pref[k];
+                if !fits(&iv, r) {
+                    continue;
+                }
+                if on_reg[k].iter().any(|a| segs_meet(&segs[a.val as usize], sv)) {
+                    continue;
+                }
+                pick = Some(k);
+                break;
+            }
+            if let Some(k) = pick {
+                let r = pref[k];
+                if CALLEE_SAVED.contains(&r) && !used_saved.contains(&r) {
+                    used_saved.push(r);
+                }
+                assign.insert(iv.val, r);
+                on_reg[k].push(iv);
+                continue;
+            }
+            // Verdraengen: das Register, dessen stoerende Intervalle
+            // zusammen am wenigsten wert sind -- und nur, wenn JEDES davon
+            // weniger dicht ist als `iv`.
+            let di = dens(&iv);
+            let mut best: Option<(usize, u64)> = None;
+            for (k, r) in pref.iter().enumerate() {
+                if !fits(&iv, r) {
+                    continue;
+                }
+                let mut sum: u64 = 0;
+                let mut ok = true;
+                for a in on_reg[k].iter() {
+                    if segs_meet(&segs[a.val as usize], sv) {
+                        let da = dens(a);
+                        if da >= di {
+                            ok = false;
+                            break;
+                        }
+                        sum = sum.saturating_add(da);
+                    }
+                }
+                if ok && best.map(|(_, b)| sum < b).unwrap_or(true) {
+                    best = Some((k, sum));
+                }
+            }
+            if let Some((k, _)) = best {
+                let r = pref[k];
+                let mut keep: Vec<Iv> = Vec::new();
+                for a in on_reg[k].drain(..) {
+                    if segs_meet(&segs[a.val as usize], sv) {
+                        assign.remove(&a.val);
+                        st.evicted += 1;
+                    } else {
+                        keep.push(a);
+                    }
+                }
+                on_reg[k] = keep;
+                if CALLEE_SAVED.contains(&r) && !used_saved.contains(&r) {
+                    used_saved.push(r);
+                }
+                assign.insert(iv.val, r);
+                on_reg[k].push(iv);
+                continue;
+            }
+            if iv.killed & M_CALL != 0 {
+                st.lost_call += 1;
+            } else {
+                st.lost_plain += 1;
+            }
+        }
+    } else {
     for iv in ivs.iter().copied() {
         // Release intervals that have expired.
         //
@@ -2025,10 +2373,20 @@ pub fn allocate(f: &Func) -> Alloc {
         // (tools/bench90/icount.py). So the order stays one order for
         // everybody: the cheap registers first, the ones that cost a push
         // and a pop last.
-        let pick = take(&mut free_temp)
-            .or_else(|| take(&mut free_div))
-            .or_else(|| take(&mut free_arg))
-            .or_else(|| take(&mut free_saved));
+        // RUNDE TEMPO 12: wer einen Aufruf kreuzt und nur wegen der
+        // Sicherung am Aufruf ueberhaupt hier ist, nimmt ZUERST ein
+        // callee-saved Register -- das kostet am Aufruf nichts.
+        let pick = if save_set.contains(&iv.val) {
+            take(&mut free_saved)
+                .or_else(|| take(&mut free_temp))
+                .or_else(|| take(&mut free_div))
+                .or_else(|| take(&mut free_arg))
+        } else {
+            take(&mut free_temp)
+                .or_else(|| take(&mut free_div))
+                .or_else(|| take(&mut free_arg))
+                .or_else(|| take(&mut free_saved))
+        };
         match pick {
             Some(r) => {
                 if CALLEE_SAVED.contains(&r) && !used_saved.contains(&r) {
@@ -2082,6 +2440,8 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     }
 
+    }
+
     // ---- ROUND XMM3: derselbe Durchlauf noch einmal, fuer die SSE-Klasse --
     //
     // Er ist einfacher als der obere: alle zwoelf Register sind
@@ -2090,6 +2450,58 @@ pub fn allocate(f: &Func) -> Alloc {
     {
         let mut free_fp: Vec<&'static str> = FP_POOL.to_vec();
         let mut active_fp: Vec<(Iv, &'static str)> = Vec::new();
+        if holes {
+            // RUNDE TEMPO 13: dieselben Luecken fuer die SSE-Klasse.
+            let mut on_fp: Vec<Vec<Iv>> = vec![Vec::new(); FP_POOL.len()];
+            for iv in fp_ivs.iter().copied() {
+                for l in on_fp.iter_mut() {
+                    l.retain(|a| a.end >= iv.start);
+                }
+                let sv = &segs[iv.val as usize];
+                let mut pick: Option<usize> = None;
+                for k in (0..FP_POOL.len()).rev() {
+                    if !on_fp[k].iter().any(|a| segs_meet(&segs[a.val as usize], sv)) {
+                        pick = Some(k);
+                        break;
+                    }
+                }
+                if pick.is_none() {
+                    let mut best: Option<(usize, u64)> = None;
+                    for k in (0..FP_POOL.len()).rev() {
+                        let mut sum: u64 = 0;
+                        let mut ok = true;
+                        for a in on_fp[k].iter() {
+                            if segs_meet(&segs[a.val as usize], sv) {
+                                if a.weight >= iv.weight {
+                                    ok = false;
+                                    break;
+                                }
+                                sum = sum.saturating_add(a.weight);
+                            }
+                        }
+                        if ok && best.map(|(_, b)| sum < b).unwrap_or(true) {
+                            best = Some((k, sum));
+                        }
+                    }
+                    if let Some((k, _)) = best {
+                        let mut keep: Vec<Iv> = Vec::new();
+                        for a in on_fp[k].drain(..) {
+                            if segs_meet(&segs[a.val as usize], sv) {
+                                fp_assign.remove(&a.val);
+                            } else {
+                                keep.push(a);
+                            }
+                        }
+                        on_fp[k] = keep;
+                        pick = Some(k);
+                    }
+                }
+                if let Some(k) = pick {
+                    fp_assign.insert(iv.val, FP_POOL[k]);
+                    on_fp[k].push(iv);
+                }
+            }
+        } else {
         for iv in fp_ivs.iter().copied() {
             let mut k = 0;
             while k < active_fp.len() {
@@ -2128,6 +2540,7 @@ pub fn allocate(f: &Func) -> Alloc {
                     }
                 }
             }
+        }
         }
     }
 
@@ -2380,6 +2793,69 @@ pub fn allocate(f: &Func) -> Alloc {
     let (frame, slots) = layout(f, used_saved.len() as u64);
     alloc.frame = frame;
     alloc.saved = used_saved.iter().copied().zip(slots.iter().map(|(_, o)| *o)).collect();
+
+    // RUNDE TEMPO 12: die Sicherungen je Aufruf. Nur Werte aus `save_set`,
+    // die wirklich ein caller-saved Register behalten haben, und nur an
+    // Aufrufen echt innerhalb ihres Intervalls. Das Intervall ist eine
+    // Obermenge der Lebensdauer; ein Wert, der am Aufruf schon tot ist, wird
+    // umsonst gesichert, aber nie falsch: das Register gehoert ihm auf dem
+    // ganzen Intervall allein.
+    //
+    // EINE AUSNAHME ist Pflicht: das Ziel des Aufrufs. Ist es mit einem
+    // gesicherten Wert verschmolzen (`x = f(x)` in einer Schleife), steht es
+    // im selben Register, und das Zurueckholen wuerde das Ergebnis
+    // ueberschreiben.
+    if !save_set.is_empty() {
+        let mut sv: Vec<Val> = save_set.iter().copied().collect();
+        sv.sort_unstable();
+        for &(p, _, bi, ii) in calls.iter() {
+            let dst_reg = f.blocks[bi].insts[ii].dst.and_then(|d| match alloc.loc(d) {
+                Loc::Reg(r) => Some(r),
+                _ => None,
+            });
+            let mut list: Vec<(&'static str, u64, FTy)> = Vec::new();
+            for &v in &sv {
+                let vi = v as usize;
+                // Mit Luecken (TEMPO 13) gehoert das Register dem Wert nur
+                // auf seinen Stuecken -- gesichert wird nur, wo der Aufruf
+                // echt IN einem Stueck liegt. Sonst koennte das
+                // Zurueckholen einen anderen Wert ueberschreiben.
+                let inside = if holes {
+                    // `a <= p`: ein Stueck, das AM Aufruf beginnt, lebt in
+                    // den Block hinein (Blockanfang == Stelle des Aufrufs).
+                    // Ist der Wert das Ziel des Aufrufs, faengt das die
+                    // Ausnahme `dst_reg` unten ab.
+                    segs[vi].iter().any(|&(a, z)| a <= p && p < z)
+                } else {
+                    start[vi] < p && p < end[vi]
+                };
+                if std::env::var_os("FIRN_CS_DBG").is_some() {
+                    eprintln!("CSDBG {} call@{} v=%{} inside={} loc={:?} segs={:?} off={:?}", f.name, p, v, inside, alloc.loc(v), segs[vi], alloc.frame.slot.get(vi));
+                }
+                if !inside {
+                    continue;
+                }
+                let r = match alloc.loc(v) {
+                    Loc::Reg(r) => r,
+                    _ => continue,
+                };
+                if CALLEE_SAVED.contains(&r) || Some(r) == dst_reg {
+                    continue;
+                }
+                if list.iter().any(|(q, _, _)| *q == r) {
+                    continue;
+                }
+                let off = alloc.frame.slot.get(vi).copied().unwrap_or(0);
+                if off == 0 {
+                    continue;
+                }
+                list.push((r, off, f.val_ty(v)));
+            }
+            if !list.is_empty() {
+                alloc.call_saves.insert((bi, ii), list);
+            }
+        }
+    }
     alloc
 }
 
@@ -4633,6 +5109,34 @@ fn cmp_br_mergeable(ra: &Ra, b: &Block) -> bool {
     }
 }
 
+/// RUNDE TEMPO 12: ein Register in seinen Platz legen (`hin`) bzw. von dort
+/// zurueckholen.
+fn save_line(r: &str, off: u64, t: FTy, hin: bool) -> String {
+    let m = if is_xmm(r) {
+        match t {
+            FTy::F32 => format!("dword ptr [rbp-{}]", off),
+            FTy::V128 => format!("xmmword ptr [rbp-{}]", off),
+            _ => format!("qword ptr [rbp-{}]", off),
+        }
+    } else {
+        format!("qword ptr [rbp-{}]", off)
+    };
+    let op = if is_xmm(r) {
+        match t {
+            FTy::F32 => "movss",
+            FTy::V128 => "movaps",
+            _ => "movsd",
+        }
+    } else {
+        "mov"
+    };
+    if hin {
+        format!("{} {}, {}", op, m, r)
+    } else {
+        format!("{} {}, {}", op, r, m)
+    }
+}
+
 fn emit_block(
     e: &mut Emitter,
     ra: &Ra,
@@ -4659,13 +5163,34 @@ fn emit_block(
     //   * no `secret` value (SPEC §9.2).
     let mergeable = cmp_br_mergeable(ra, b);
     let n = if mergeable { b.insts.len() - 1 } else { b.insts.len() };
-    for i in &b.insts[..n] {
+    for (ii, i) in b.insts[..n].iter().enumerate() {
         // ROUND 94 -- the register allocated path carries the line table too.
         // Before this round it emitted only the `fn` line, which is why an
         // optimized build claimed the function's first line for its whole
         // body (measured: `inl.fi:7` for code out of `inl.fi:3`).
         e.loc_at(i.loc);
+        // RUNDE TEMPO 12: caller-saved Register ueber einen Aufruf retten.
+        let saves = ra.a.call_saves.get(&(b.id as usize, ii));
+        if let Some(l) = saves {
+            // Stand direkt davor ein Aufruf, der dasselbe Register vom
+            // selben Platz zurueckgeholt hat, steht der Wert dort noch --
+            // zwei Aufrufe hintereinander sichern nur einmal.
+            let vorher = if ii > 0 { ra.a.call_saves.get(&(b.id as usize, ii - 1)) } else { None };
+            for (r, off, t) in l {
+                if let Some(v) = vorher {
+                    if v.iter().any(|(q, o, _)| q == r && o == off) {
+                        continue;
+                    }
+                }
+                e.line(&save_line(r, *off, *t, true));
+            }
+        }
         emit_inst(e, ra, i, site)?;
+        if let Some(l) = saves {
+            for (r, off, t) in l {
+                e.line(&save_line(r, *off, *t, false));
+            }
+        }
     }
     if mergeable {
         if let Some(last) = b.insts.last() {
