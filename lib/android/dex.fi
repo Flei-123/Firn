@@ -1,0 +1,1492 @@
+// SPDX-License-Identifier: MPL-2.0
+// Herkunft: Certus, lib/android/dex.fi, Stand Certus-Commit 9e119268;
+// vom alleinigen Urheber Justin am 23.09.2026 fuer Firn unter MPL-2.0
+// freigegeben. In Firn dazugekommen: OP_CONST_STRING (21c, string index,
+// renumbered after sorting like method and field indices) -- the static
+// initialiser of org.firn.FirnService needs `const-string` for
+// System.loadLibrary (tools/android/servicedex_main.fi).
+// lib/android/dex.fi -- EIN DEX-SCHREIBER IN FIRN.
+//
+// ===================================================================
+// WOZU DAS DA IST
+// ===================================================================
+//
+// Runde MOBIL4 hat nachgewiesen, warum in dieser App keine
+// Systemtastatur schreiben kann, und der Beweis endete in einem Satz:
+//
+//     "Kein Weg fuehrt ohne Java-Bytecode zu einer InputConnection."
+//
+// Der Eingabemethodendienst holt die Verbindung beim `startInput` VON DER
+// ANSICHT (`View.onCreateInputConnection`). Androids interne
+// `NativeContentView` ueberschreibt die Methode nicht, die Vorgabe gibt
+// `null`, und moderne Tastaturen schicken Text AUSSCHLIESSLICH ueber
+// `commitText`/`setComposingText` an dieses Objekt -- keine
+// Tastenereignisse. Wer die Methode ueberschreiben will, braucht eine
+// eigene Klasse. Eine Klasse braucht Bytecode. JNI kann keine definieren
+// (`DefineClass` will fertigen Bytecode, kein Werkzeug, ihn zu erzeugen),
+// und `java.lang.reflect.Proxy` braucht selbst einen `InvocationHandler`
+// -- also wieder eine Klasse.
+//
+// Die Zusage dieses Baums ist "kein Java-Werkzeug in der Baukette": kein
+// `javac`, kein `d8`, kein `androidx`. Die Zusage ist NICHT "keine
+// Klasse". Also wird die Klasse hier erzeugt -- als Oktettfolge im
+// Speicher, nach der offenen Beschreibung des Formats
+// ("Dalvik Executable format", Android Open Source Project). Der
+// Uebersetzer dafuer ist diese Datei, und sie ist in Firn geschrieben wie
+// alles andere auch.
+//
+// ===================================================================
+// WAS DAS IST UND WAS ES NICHT IST
+// ===================================================================
+//
+// Es ist KEIN Java-Uebersetzer. Es gibt keinen Zerteiler, keine
+// Typpruefung, keine Registerzuteilung und keine Sprungmarken. Was es
+// gibt, ist ein SCHREIBER: wer die Tabellen fuellt und die Befehle
+// einzeln einwirft, bekommt eine gueltige `.dex`-Datei. Der Anrufer muss
+// wissen, was er tut -- genau wie bei einem Assembler.
+//
+// Das reicht fuer die Aufgabe: die beiden Klassen in `lib/android/ime.fi`
+// haben zusammen VIER Befehle mit Wirkung. Alles andere sind `native`
+// Methoden ohne Rumpf, die ueber `RegisterNatives` an Firn-Funktionen
+// gehaengt werden. Die Arbeit steckt in den Tabellen und ihrer
+// Sortierung, nicht im Code -- und die Tabellen sind hier.
+//
+// ===================================================================
+// DER AUFBAU EINER DEX-DATEI, UND DIE FALLEN DARIN
+// ===================================================================
+//
+//   header      112 Oktett: Magie, Adler-32, SHA-1, Groessen und Versaetze
+//   string_ids  4 Oktett je Eintrag -> Versatz der Zeichenkette
+//   type_ids    4 Oktett je Eintrag -> Nummer der Beschreibung
+//   proto_ids   12 Oktett: Kurzform, Rueckgabetyp, Versatz der Parameter
+//   field_ids   8 Oktett: Klasse (u16), Typ (u16), Name (u32)
+//   method_ids  8 Oktett: Klasse (u16), Prototyp (u16), Name (u32)
+//   class_defs  32 Oktett: acht u32
+//   data        alles mit veraenderlicher Laenge
+//   map_list    ein Verzeichnis aller Abschnitte, NACH VERSATZ SORTIERT
+//
+// DREI FALLEN, UND SIE SIND DER GRUND, WARUM DIESE DATEI SO AUSSIEHT:
+//
+//  1. JEDE TABELLE MUSS SORTIERT SEIN, und zwar nach dem, was DRIN
+//     steht, nicht nach der Reihenfolge des Eintragens:
+//       string_ids  nach dem Inhalt
+//       type_ids    nach der Nummer der Beschreibung
+//       proto_ids   nach Rueckgabetyp, dann nach der Parameterliste
+//       field_ids   nach Klasse, dann Name, dann Typ
+//       method_ids  nach Klasse, dann Name, dann Prototyp
+//     Wer das nicht tut, bekommt von ART kein "sortiere bitte", sondern
+//     `java.lang.ClassNotFoundException` oder einen Verweigerungsvermerk
+//     im Protokoll, und darf raten. Deshalb wird hier in der Reihenfolge
+//     des EINTRAGENS gesammelt und beim Schreiben durch eine
+//     Sortierabbildung (`*_ord` / `*_neu`) uebersetzt. Die Nummern, die
+//     der Anrufer in der Hand haelt, bleiben dabei gueltig.
+//
+//  2. DIE PRUEFSUMMEN GEHEN UEBER VERSCHIEDENE BEREICHE.
+//       Adler-32 ueber [12 .. Ende)   -- alles hinter der Pruefsumme
+//       SHA-1    ueber [32 .. Ende)   -- alles hinter der Signatur
+//     Also erst die Datei fertig bauen, dann die Signatur, dann die
+//     Pruefsumme (die Signatur liegt IM Bereich der Pruefsumme).
+//
+//  3. AUSRICHTUNG. `code_item` und `type_list` muessen auf vier Oktett
+//     ausgerichtet liegen, `map_list` ebenfalls. `string_data_item` und
+//     `class_data_item` duerfen ueberall stehen. Und `data_size` muss ein
+//     Vielfaches von vier sein -- also wird die Datei am Ende aufgefuellt.
+//
+// GRENZE, DIE HIER OFFEN GENANNT WIRD: die Sortierung der Zeichenketten
+// vergleicht OKTETT und nicht UTF-16-Kodepunkte. Fuer alles bis 0x7F ist
+// das dasselbe; darueber nicht. Java-Bezeichner und Typbeschreibungen
+// sind ASCII, und dieser Schreiber erzeugt nichts anderes. Wer ihn
+// einmal fuer Zeichenketten mit Umlauten benutzen will, muss hier
+// nachbessern -- der Vergleich steht an EINER Stelle (`str_cmp`).
+import std.crypto.sha1
+
+export {
+    dex_neu, dex_frei, dex_fehler,
+    dex_str, dex_typ, dex_proto, dex_feld, dex_methode, dex_klasse,
+    dex_glied, dex_code, dex_op10x, dex_op11x, dex_op11n, dex_op21c,
+    dex_op22c, dex_op35c, dex_bauen, dex_l8,
+    ACC_PUBLIC, ACC_PRIVATE, ACC_PROTECTED, ACC_STATIC, ACC_FINAL,
+    ACC_NATIVE, ACC_ABSTRACT, ACC_CONSTRUCTOR,
+    G_STATFELD, G_FELD, G_DIREKT, G_VIRTUELL,
+    OP_MOVE_RESULT, OP_MOVE_RESULT_OBJECT, OP_RETURN_VOID, OP_RETURN,
+    OP_RETURN_OBJECT, OP_CONST4,
+    OP_IGET, OP_IGET_OBJECT, OP_IPUT, OP_IPUT_OBJECT,
+    OP_SGET, OP_SGET_BOOLEAN, OP_SGET_OBJECT,
+    OP_SPUT, OP_SPUT_BOOLEAN, OP_SPUT_OBJECT,
+    OP_INVOKE_VIRTUAL, OP_INVOKE_SUPER, OP_INVOKE_DIRECT,
+    OP_INVOKE_STATIC, OP_CONST_STRING,
+    DEX_CAP,
+}
+
+// ------------------------------------------------- Zugriffsmerkzeichen
+const ACC_PUBLIC: u32 = 1
+const ACC_PRIVATE: u32 = 2
+const ACC_PROTECTED: u32 = 4
+const ACC_STATIC: u32 = 8
+const ACC_FINAL: u32 = 16
+const ACC_NATIVE: u32 = 256
+const ACC_ABSTRACT: u32 = 1024
+const ACC_CONSTRUCTOR: u32 = 65536
+
+// Die vier Listen eines `class_data_item`, in genau dieser Reihenfolge.
+const G_STATFELD: u32 = 0
+const G_FELD: u32 = 1
+const G_DIREKT: u32 = 2
+const G_VIRTUELL: u32 = 3
+
+// ------------------------------------------------------ die Befehle
+// Nur die, die gebraucht werden. Die Nummern stehen in der
+// Befehlsliste des Formats ("Dalvik bytecode").
+const OP_MOVE_RESULT: u32 = 10           // 0x0a  11x
+const OP_MOVE_RESULT_OBJECT: u32 = 12    // 0x0c  11x
+const OP_RETURN_VOID: u32 = 14           // 0x0e  10x
+const OP_RETURN: u32 = 15                // 0x0f  11x
+const OP_RETURN_OBJECT: u32 = 17         // 0x11  11x
+const OP_CONST4: u32 = 18                // 0x12  11n
+const OP_IGET: u32 = 82                  // 0x52  22c
+const OP_IGET_OBJECT: u32 = 84           // 0x54  22c
+const OP_IPUT: u32 = 89                  // 0x59  22c
+const OP_IPUT_OBJECT: u32 = 91           // 0x5b  22c
+const OP_SGET: u32 = 96                  // 0x60  21c
+const OP_SGET_BOOLEAN: u32 = 99          // 0x63  21c
+const OP_SGET_OBJECT: u32 = 98           // 0x62  21c
+const OP_SPUT: u32 = 103                 // 0x67  21c
+const OP_SPUT_BOOLEAN: u32 = 106         // 0x6a  21c
+const OP_SPUT_OBJECT: u32 = 105          // 0x69  21c
+const OP_INVOKE_VIRTUAL: u32 = 110       // 0x6e  35c
+const OP_INVOKE_SUPER: u32 = 111         // 0x6f  35c
+const OP_INVOKE_DIRECT: u32 = 112        // 0x70  35c
+const OP_INVOKE_STATIC: u32 = 113        // 0x71  35c
+const OP_CONST_STRING: u32 = 26          // 0x1a  21c  (Firn)
+
+// ------------------------------------------------------- die Grenzen
+// Bewusst klein: dieser Schreiber baut zwei Klassen mit zusammen
+// fuenfzehn Methoden. Wer mehr will, dreht hier -- und die Fehlerfahne
+// sagt, wenn es zu wenig war, statt still zu verstuemmeln.
+const MAX_STR: usize = 128
+const STRBUF: usize = 4096
+const MAX_TYP: usize = 64
+const MAX_PRO: usize = 64
+const MAX_PAR: usize = 128
+const MAX_FLD: usize = 32
+const MAX_MTH: usize = 96
+const MAX_KLS: usize = 8
+const MAX_GLD: usize = 128
+const MAX_COD: usize = 32
+const MAX_INS: usize = 512
+
+// So viel Platz bekommt der Arbeitssatz. `heap` ist ein `mmap`; die
+// Seiten kosten erst etwas, wenn sie beruehrt werden.
+const DEX_CAP: usize = 262144
+
+struct Dex {
+    fehler: u32,
+
+    // ---------------------------------------------- Zeichenketten
+    s_off: [u32; 128],
+    s_len: [u32; 128],
+    s_ord: [u32; 128],     // Platz k -> Einfuegenummer
+    s_neu: [u32; 128],     // Einfuegenummer -> Platz
+    s_pos: [u32; 128],     // Dateiversatz des string_data_item
+    s_n: usize,
+    s_buf: [u8; 4096],
+    s_bn: usize,
+
+    // ------------------------------------------------------- Typen
+    t_str: [u32; 64],
+    t_ord: [u32; 64],
+    t_neu: [u32; 64],
+    t_n: usize,
+
+    // -------------------------------------------------- Prototypen
+    p_sho: [u32; 64],     // Kurzform als Zeichenkettennummer
+    p_ret: [u32; 64],
+    p_par: [u32; 64],     // Anfang in `par`
+    p_pn: [u32; 64],
+    p_ord: [u32; 64],
+    p_neu: [u32; 64],
+    p_pos: [u32; 64],     // Dateiversatz der type_list (0 = keine)
+    p_n: usize,
+    par: [u32; 128],
+    par_n: usize,
+
+    // ------------------------------------------------------ Felder
+    f_cls: [u32; 32],
+    f_typ: [u32; 32],
+    f_nam: [u32; 32],
+    f_ord: [u32; 32],
+    f_neu: [u32; 32],
+    f_n: usize,
+
+    // ---------------------------------------------------- Methoden
+    m_cls: [u32; 96],
+    m_pro: [u32; 96],
+    m_nam: [u32; 96],
+    m_ord: [u32; 96],
+    m_neu: [u32; 96],
+    m_n: usize,
+
+    // ----------------------------------------------------- Klassen
+    c_typ: [u32; 8],
+    c_acc: [u32; 8],
+    c_sup: [u32; 8],
+    c_pos: [u32; 8],     // Dateiversatz des class_data_item
+    c_n: usize,
+
+    // Die Glieder einer Klasse (Felder und Methoden), in der
+    // Reihenfolge des Eintragens. Beim Schreiben werden sie je Klasse
+    // und je Art herausgesucht und nach Nummer sortiert -- das
+    // `class_data_item` verlangt aufsteigende Nummern, weil es
+    // DIFFERENZEN speichert.
+    e_cls: [u32; 128],
+    e_art: [u32; 128],
+    e_id: [u32; 128],
+    e_acc: [u32; 128],
+    e_cod: [i32; 128],     // Codenummer oder -1 (native/abstrakt)
+    e_n: usize,
+
+    // -------------------------------------------------------- Code
+    k_regs: [u32; 32],
+    k_ins: [u32; 32],
+    k_outs: [u32; 32],
+    k_off: [u32; 32],     // Anfang in `insn`
+    k_len: [u32; 32],     // Laenge in Codeeinheiten (16 Bit)
+    k_pos: [u32; 32],     // Dateiversatz
+    k_n: usize,
+    insn: [u32; 512],      // je Eintrag EINE Codeeinheit
+    // RUNDE VERIFY: WAS IN DIESEM WORT STEHT.
+    // 0 = ein gewoehnliches Codewort, es bleibt wie es ist.
+    // 1 = eine METHODENNUMMER, 2 = eine FELDNUMMER.
+    // `sort_mth`/`sort_fld` numerieren die Tabellen um; ohne diese
+    // Notiz bliebe der Operand auf der EINFUEGENUMMER stehen und
+    // zeigte nach dem Sortieren auf eine fremde Methode.
+    insn_art: [u32; 512],
+    insn_n: usize,
+}
+
+// Rohe Handgriffe. `std.rt` hat dieselben, aber NICHT als `#[no_gc]`, und
+// diese Datei darf den Sammler nicht anfassen: sie laeuft in `ime.fi` aus
+// einem JNI-Rueckruf heraus, also auf einem Stapel, in dem Java-Rahmen
+// liegen.
+#[no_gc]
+fn l8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+// Dasselbe nach aussen -- `imedex.fi` misst damit die Laenge seiner
+// C-Zeichenketten, ohne dafuer `std.rt` zu bemuehen (das ist nicht
+// `#[no_gc]`).
+#[no_gc]
+fn dex_l8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+#[no_gc]
+fn s8(p: u64, i: usize, v: u8) {
+    *((p + i as u64) as *mut u8) = v
+}
+
+#[no_gc]
+fn l32(p: u64, i: usize) -> u32 {
+    return *((p + (i * 4) as u64) as *mut u32)
+}
+
+#[no_gc]
+fn heap(n: usize) -> u64 {
+    let r: i64 = syscall(9, 0, n as i64, 3, 34, -1, 0)
+    if r < 0 && r > 0 - 4096 {
+        return 0
+    }
+    return r as u64
+}
+
+// `mmap` gibt genullte Seiten -- der Satz ist damit ohne eine einzige
+// Zuweisung im Anfangszustand. Das ist kein Geiz, sondern der Grund,
+// warum diese Datei ohne Sammler auskommt.
+#[no_gc]
+fn dex_neu() -> u64 {
+    return heap(DEX_CAP)
+}
+
+#[no_gc]
+fn dex_frei(d: u64) {
+    if d == 0 {
+        return
+    }
+    syscall(11, d as i64, DEX_CAP as i64, 0, 0, 0, 0)
+}
+
+#[no_gc]
+fn dex_fehler(d: u64) -> u32 {
+    if d == 0 {
+        return 1 as u32
+    }
+    let p: *mut Dex = d as *mut Dex
+    return (*p).fehler
+}
+
+#[no_gc]
+fn schlecht(p: *mut Dex) {
+    (*p).fehler = (*p).fehler + 1 as u32
+}
+
+// ===================================================================
+// ZEICHENKETTEN
+// ===================================================================
+
+// Vergleich zweier eingetragener Zeichenketten. -1 / 0 / 1.
+// HIER, an genau dieser Stelle, sitzt die Annahme "alles ASCII".
+#[no_gc]
+fn str_cmp(p: *mut Dex, a: usize, b: usize) -> i32 {
+    let ao: usize = (*p).s_off[a] as usize
+    let an: usize = (*p).s_len[a] as usize
+    let bo: usize = (*p).s_off[b] as usize
+    let bn: usize = (*p).s_len[b] as usize
+    var i: usize = 0
+    while i < an && i < bn {
+        let x: u8 = (*p).s_buf[ao + i]
+        let y: u8 = (*p).s_buf[bo + i]
+        if x < y {
+            return 0 - 1
+        }
+        if x > y {
+            return 1
+        }
+        i = i + 1
+    }
+    if an < bn {
+        return 0 - 1
+    }
+    if an > bn {
+        return 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn str_gleich(p: *mut Dex, a: usize, q: u64, n: usize) -> bool {
+    if (*p).s_len[a] as usize != n {
+        return false
+    }
+    let ao: usize = (*p).s_off[a] as usize
+    var i: usize = 0
+    while i < n {
+        if (*p).s_buf[ao + i] != l8(q, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Eine Zeichenkette eintragen. Doppelte werden zusammengelegt -- das ist
+// nicht nur sparsam, es ist NOETIG: `string_ids` darf keinen Eintrag
+// zweimal enthalten.
+#[no_gc]
+fn dex_str(d: u64, q: u64, n: usize) -> u32 {
+    let p: *mut Dex = d as *mut Dex
+    var i: usize = 0
+    while i < (*p).s_n {
+        if str_gleich(p, i, q, n) {
+            return i as u32
+        }
+        i = i + 1
+    }
+    if (*p).s_n >= MAX_STR || (*p).s_bn + n > STRBUF {
+        schlecht(p)
+        return 0 as u32
+    }
+    let k: usize = (*p).s_n
+    (*p).s_off[k] = (*p).s_bn as u32
+    (*p).s_len[k] = n as u32
+    var j: usize = 0
+    while j < n {
+        (*p).s_buf[(*p).s_bn + j] = l8(q, j)
+        j = j + 1
+    }
+    (*p).s_bn = (*p).s_bn + n
+    (*p).s_n = k + 1
+    return k as u32
+}
+
+// ===================================================================
+// TYPEN
+// ===================================================================
+#[no_gc]
+fn dex_typ(d: u64, q: u64, n: usize) -> u32 {
+    let p: *mut Dex = d as *mut Dex
+    let s: u32 = dex_str(d, q, n)
+    var i: usize = 0
+    while i < (*p).t_n {
+        if (*p).t_str[i] == s {
+            return i as u32
+        }
+        i = i + 1
+    }
+    if (*p).t_n >= MAX_TYP {
+        schlecht(p)
+        return 0 as u32
+    }
+    let k: usize = (*p).t_n
+    (*p).t_str[k] = s
+    (*p).t_n = k + 1
+    return k as u32
+}
+
+// Das erste Oktett einer Typbeschreibung, aber `[` gilt als `L`: das ist
+// die Regel der Kurzform (`shorty`), und ein Feld ist dort ein Verweis
+// wie jeder andere.
+#[no_gc]
+fn kurz_zeichen(p: *mut Dex, t: u32) -> u8 {
+    let s: usize = (*p).t_str[t as usize] as usize
+    let o: usize = (*p).s_off[s] as usize
+    let c: u8 = (*p).s_buf[o]
+    if c == 91 as u8 {
+        return 76 as u8
+    }
+    return c
+}
+
+// ===================================================================
+// PROTOTYPEN
+// ===================================================================
+//
+// `par` ist ein Zeiger auf `npar` Typnummern (je 4 Oktett).
+#[no_gc]
+fn dex_proto(d: u64, ret: u32, par: u64, npar: usize) -> u32 {
+    let p: *mut Dex = d as *mut Dex
+    // Schon da?
+    var i: usize = 0
+    while i < (*p).p_n {
+        if (*p).p_ret[i] == ret && (*p).p_pn[i] as usize == npar {
+            var gl: bool = true
+            var j: usize = 0
+            while j < npar {
+                if (*p).par[(*p).p_par[i] as usize + j]
+                    != l32(par, j) {
+                    gl = false
+                }
+                j = j + 1
+            }
+            if gl {
+                return i as u32
+            }
+        }
+        i = i + 1
+    }
+    if (*p).p_n >= MAX_PRO || (*p).par_n + npar > MAX_PAR {
+        schlecht(p)
+        return 0 as u32
+    }
+    // Die Kurzform: Rueckgabe zuerst, dann die Parameter.
+    var kf: [u8; 32] = [0; 32]
+    if npar + 1 > 32 {
+        schlecht(p)
+        return 0 as u32
+    }
+    kf[0] = kurz_zeichen(p, ret)
+    var j2: usize = 0
+    while j2 < npar {
+        kf[j2 + 1] = kurz_zeichen(p, l32(par, j2))
+        j2 = j2 + 1
+    }
+    let sho: u32 = dex_str(d, (&kf[0]) as u64, npar + 1)
+    let k: usize = (*p).p_n
+    (*p).p_sho[k] = sho
+    (*p).p_ret[k] = ret
+    (*p).p_par[k] = (*p).par_n as u32
+    (*p).p_pn[k] = npar as u32
+    var j3: usize = 0
+    while j3 < npar {
+        (*p).par[(*p).par_n + j3] = l32(par, j3)
+        j3 = j3 + 1
+    }
+    (*p).par_n = (*p).par_n + npar
+    (*p).p_n = k + 1
+    return k as u32
+}
+
+// ===================================================================
+// FELDER UND METHODEN
+// ===================================================================
+#[no_gc]
+fn dex_feld(d: u64, cls: u32, typ: u32, nam: u64, nn: usize) -> u32 {
+    let p: *mut Dex = d as *mut Dex
+    let s: u32 = dex_str(d, nam, nn)
+    var i: usize = 0
+    while i < (*p).f_n {
+        if (*p).f_cls[i] == cls && (*p).f_typ[i] == typ
+        && (*p).f_nam[i] == s {
+            return i as u32
+        }
+        i = i + 1
+    }
+    if (*p).f_n >= MAX_FLD {
+        schlecht(p)
+        return 0 as u32
+    }
+    let k: usize = (*p).f_n
+    (*p).f_cls[k] = cls
+    (*p).f_typ[k] = typ
+    (*p).f_nam[k] = s
+    (*p).f_n = k + 1
+    return k as u32
+}
+
+#[no_gc]
+fn dex_methode(d: u64, cls: u32, pro: u32, nam: u64, nn: usize) -> u32 {
+    let p: *mut Dex = d as *mut Dex
+    let s: u32 = dex_str(d, nam, nn)
+    var i: usize = 0
+    while i < (*p).m_n {
+        if (*p).m_cls[i] == cls && (*p).m_pro[i] == pro
+        && (*p).m_nam[i] == s {
+            return i as u32
+        }
+        i = i + 1
+    }
+    if (*p).m_n >= MAX_MTH {
+        schlecht(p)
+        return 0 as u32
+    }
+    let k: usize = (*p).m_n
+    (*p).m_cls[k] = cls
+    (*p).m_pro[k] = pro
+    (*p).m_nam[k] = s
+    (*p).m_n = k + 1
+    return k as u32
+}
+
+// ===================================================================
+// KLASSEN UND IHRE GLIEDER
+// ===================================================================
+#[no_gc]
+fn dex_klasse(d: u64, typ: u32, acc: u32, sup: u32) -> u32 {
+    let p: *mut Dex = d as *mut Dex
+    if (*p).c_n >= MAX_KLS {
+        schlecht(p)
+        return 0 as u32
+    }
+    let k: usize = (*p).c_n
+    (*p).c_typ[k] = typ
+    (*p).c_acc[k] = acc
+    (*p).c_sup[k] = sup
+    (*p).c_n = k + 1
+    return k as u32
+}
+
+// Ein Feld oder eine Methode an eine Klasse haengen.
+//   art  G_STATFELD | G_FELD | G_DIREKT | G_VIRTUELL
+//   id   die Nummer aus `dex_feld` bzw. `dex_methode`
+//   cod  die Nummer aus `dex_code`, oder -1 fuer `native`/abstrakt
+#[no_gc]
+fn dex_glied(d: u64, kls: u32, art: u32, id: u32, acc: u32, cod: i32) {
+    let p: *mut Dex = d as *mut Dex
+    if (*p).e_n >= MAX_GLD {
+        schlecht(p)
+        return
+    }
+    let k: usize = (*p).e_n
+    (*p).e_cls[k] = kls
+    (*p).e_art[k] = art
+    (*p).e_id[k] = id
+    (*p).e_acc[k] = acc
+    (*p).e_cod[k] = cod
+    (*p).e_n = k + 1
+}
+
+// ===================================================================
+// CODE
+// ===================================================================
+//
+// `regs` ist die Gesamtzahl der Register, `ins` die Zahl der
+// hereinkommenden (bei einer Methode: `this` mitgezaehlt), `outs` die
+// groesste Zahl von Argumenten eines Aufrufs darin. Die Parameter liegen
+// AM ENDE der Registerbank: `p0` ist `v(regs - ins)`.
+#[no_gc]
+fn dex_code(d: u64, regs: u32, ins: u32, outs: u32) -> i32 {
+    let p: *mut Dex = d as *mut Dex
+    if (*p).k_n >= MAX_COD {
+        schlecht(p)
+        return 0 - 1
+    }
+    let k: usize = (*p).k_n
+    (*p).k_regs[k] = regs
+    (*p).k_ins[k] = ins
+    (*p).k_outs[k] = outs
+    (*p).k_off[k] = (*p).insn_n as u32
+    (*p).k_len[k] = 0 as u32
+    (*p).k_n = k + 1
+    return k as i32
+}
+
+#[no_gc]
+fn einheit(p: *mut Dex, c: i32, v: u32) {
+    einheit_art(p, c, v, 0 as u32)
+}
+
+// RUNDE VERIFY: dasselbe, aber das Wort wird als Methoden- (1) oder
+// Feldnummer (2) vermerkt, damit `insn_umnumerieren` es nach dem
+// Sortieren nachziehen kann.
+#[no_gc]
+fn einheit_art(p: *mut Dex, c: i32, v: u32, art: u32) {
+    if c < 0 {
+        schlecht(p)
+        return
+    }
+    let k: usize = c as usize
+    // Nur der zuletzt begonnene Code darf noch wachsen -- sonst
+    // ueberschriebe er den naechsten.
+    if k + 1 != (*p).k_n {
+        schlecht(p)
+        return
+    }
+    if (*p).insn_n >= MAX_INS {
+        schlecht(p)
+        return
+    }
+    (*p).insn[(*p).insn_n] = v & 65535 as u32
+    (*p).insn_art[(*p).insn_n] = art
+    (*p).insn_n = (*p).insn_n + 1
+    (*p).k_len[k] = (*p).k_len[k] + 1 as u32
+}
+
+// RUNDE VERIFY -- WELCHE TABELLE MEINT DIESER OPCODE?
+//
+// Der Operand der Form 21c/22c/35c ist eine Nummer IN EINER TABELLE, und
+// welche Tabelle das ist, entscheidet allein der Opcode. Ohne diese
+// Zuordnung bliebe der Operand auf der Einfuegenummer stehen, waehrend
+// `sort_mth`/`sort_fld` die Tabellen umsortieren -- der Aufruf zeigte
+// dann auf eine fremde Methode mit fremdem Prototyp, und Androids
+// Pruefer lehnt die Klasse mit `VerifyError` ab.
+#[no_gc]
+fn art_von(op: u32) -> u32 {
+    if op == OP_INVOKE_VIRTUAL || op == OP_INVOKE_SUPER
+        || op == OP_INVOKE_DIRECT || op == OP_INVOKE_STATIC {
+        return 1 as u32
+    }
+    if op == OP_SGET || op == OP_SGET_BOOLEAN || op == OP_SGET_OBJECT
+        || op == OP_SPUT || op == OP_SPUT_BOOLEAN || op == OP_SPUT_OBJECT
+        || op == OP_IGET || op == OP_IGET_OBJECT
+        || op == OP_IPUT || op == OP_IPUT_OBJECT {
+        return 2 as u32
+    }
+    if op == OP_CONST_STRING {
+        return 3 as u32
+    }
+    return 0 as u32
+}
+
+// RUNDE VERIFY -- die Operanden auf die SORTIERTEN Nummern nachziehen.
+// Muss nach `sort_mth`/`sort_fld` und vor dem Schreiben laufen.
+#[no_gc]
+fn insn_umnumerieren(p: *mut Dex) {
+    var i: usize = 0
+    while i < (*p).insn_n {
+        let a: u32 = (*p).insn_art[i]
+        if a == 1 as u32 {
+            (*p).insn[i] = (*p).m_neu[(*p).insn[i] as usize]
+        }
+        if a == 2 as u32 {
+            (*p).insn[i] = (*p).f_neu[(*p).insn[i] as usize]
+        }
+        if a == 3 as u32 {
+            (*p).insn[i] = (*p).s_neu[(*p).insn[i] as usize]
+        }
+        i = i + 1
+    }
+}
+
+// Form 10x:  00|op
+#[no_gc]
+fn dex_op10x(d: u64, c: i32, op: u32) {
+    einheit(d as *mut Dex, c, op)
+}
+
+// Form 11x:  AA|op
+#[no_gc]
+fn dex_op11x(d: u64, c: i32, op: u32, a: u32) {
+    einheit(d as *mut Dex, c, op | ((a & 255 as u32) << 8))
+}
+
+// Form 11n:  B|A|op   (B ist ein VORZEICHENBEHAFTETES Halboktett)
+#[no_gc]
+fn dex_op11n(d: u64, c: i32, op: u32, a: u32, b: i32) {
+    let bb: u32 = (b as u32) & 15 as u32
+    einheit(d as *mut Dex, c, op | ((a & 15 as u32) << 8) | (bb << 12))
+}
+
+// Form 21c:  AA|op BBBB
+#[no_gc]
+fn dex_op21c(d: u64, c: i32, op: u32, a: u32, idx: u32) {
+    let p: *mut Dex = d as *mut Dex
+    einheit(p, c, op | ((a & 255 as u32) << 8))
+    // RUNDE VERIFY: sget-*/sput-* nennen ein FELD.
+    einheit_art(p, c, idx, art_von(op))
+}
+
+// Form 22c:  B|A|op CCCC
+#[no_gc]
+fn dex_op22c(d: u64, c: i32, op: u32, a: u32, b: u32, idx: u32) {
+    let p: *mut Dex = d as *mut Dex
+    einheit(p, c, op | ((a & 15 as u32) << 8) | ((b & 15 as u32) << 12))
+    // RUNDE VERIFY: iget-*/iput-* nennen ein FELD.
+    einheit_art(p, c, idx, art_von(op))
+}
+
+// Form 35c:  A|G|op BBBB F|E|D|C
+// Bis zu fuenf Register: c, e2, f2, g2, h2 in dieser Reihenfolge; `n` sagt,
+// wieviele davon gelten.
+#[no_gc]
+fn dex_op35c(d: u64, c: i32, op: u32, n: u32, idx: u32,
+    r0: u32, r1: u32, r2: u32, r3: u32, r4: u32) {
+    let p: *mut Dex = d as *mut Dex
+    einheit(p, c, op | ((r4 & 15 as u32) << 8) | ((n & 15 as u32) << 12))
+    // RUNDE VERIFY: invoke-* nennt eine METHODE.
+    einheit_art(p, c, idx, art_von(op))
+    einheit(p, c, (r0 & 15 as u32) | ((r1 & 15 as u32) << 4)
+        | ((r2 & 15 as u32) << 8) | ((r3 & 15 as u32) << 12))
+}
+
+// ===================================================================
+// SORTIEREN
+// ===================================================================
+//
+// Einfuegesortierung ueber die Ordnungsfelder. Bei hoechstens
+// hundertachtundzwanzig Eintraegen ist das schneller geschrieben als ein
+// Haufensortieren und genauso richtig; die Zahlen stehen fest, und die
+// Datei wird einmal je Programmstart gebaut.
+
+#[no_gc]
+fn ord_start(o: *mut u32, n: usize) {
+    var i: usize = 0
+    while i < n {
+        *((o as u64 + (i * 4) as u64) as *mut u32) = i as u32
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn ord_neu(p: *mut Dex, o: *mut u32, neu: *mut u32, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let alt: u32 = *((o as u64 + (i * 4) as u64) as *mut u32)
+        *((neu as u64 + (alt as u64 * 4)) as *mut u32) = i as u32
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn sort_str(p: *mut Dex) {
+    let o: *mut u32 = (&(*p).s_ord[0]) as *mut u32
+    ord_start(o, (*p).s_n)
+    var i: usize = 1
+    while i < (*p).s_n {
+        let x: u32 = (*p).s_ord[i]
+        var j: usize = i
+        while j > 0 && str_cmp(p, (*p).s_ord[j - 1] as usize,
+            x as usize) > 0 {
+            (*p).s_ord[j] = (*p).s_ord[j - 1]
+            j = j - 1
+        }
+        (*p).s_ord[j] = x
+        i = i + 1
+    }
+    ord_neu(p, o, (&(*p).s_neu[0]) as *mut u32, (*p).s_n)
+}
+
+// Typen: nach der (schon sortierten) Nummer ihrer Beschreibung.
+#[no_gc]
+fn typ_schl(p: *mut Dex, t: usize) -> u32 {
+    return (*p).s_neu[(*p).t_str[t] as usize]
+}
+
+#[no_gc]
+fn sort_typ(p: *mut Dex) {
+    let o: *mut u32 = (&(*p).t_ord[0]) as *mut u32
+    ord_start(o, (*p).t_n)
+    var i: usize = 1
+    while i < (*p).t_n {
+        let x: u32 = (*p).t_ord[i]
+        var j: usize = i
+        while j > 0 && typ_schl(p, (*p).t_ord[j - 1] as usize)
+            > typ_schl(p, x as usize) {
+            (*p).t_ord[j] = (*p).t_ord[j - 1]
+            j = j - 1
+        }
+        (*p).t_ord[j] = x
+        i = i + 1
+    }
+    ord_neu(p, o, (&(*p).t_neu[0]) as *mut u32, (*p).t_n)
+}
+
+// Prototypen: Rueckgabetyp zuerst, dann die Parameterliste von links
+// nach rechts; die kuerzere Liste gewinnt bei sonst gleichem Anfang.
+#[no_gc]
+fn pro_cmp(p: *mut Dex, a: usize, b: usize) -> i32 {
+    let ra: u32 = (*p).t_neu[(*p).p_ret[a] as usize]
+    let rb: u32 = (*p).t_neu[(*p).p_ret[b] as usize]
+    if ra < rb {
+        return 0 - 1
+    }
+    if ra > rb {
+        return 1
+    }
+    let na: usize = (*p).p_pn[a] as usize
+    let nb: usize = (*p).p_pn[b] as usize
+    let oa: usize = (*p).p_par[a] as usize
+    let ob: usize = (*p).p_par[b] as usize
+    var i: usize = 0
+    while i < na && i < nb {
+        let xa: u32 = (*p).t_neu[(*p).par[oa + i] as usize]
+        let xb: u32 = (*p).t_neu[(*p).par[ob + i] as usize]
+        if xa < xb {
+            return 0 - 1
+        }
+        if xa > xb {
+            return 1
+        }
+        i = i + 1
+    }
+    if na < nb {
+        return 0 - 1
+    }
+    if na > nb {
+        return 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn sort_pro(p: *mut Dex) {
+    let o: *mut u32 = (&(*p).p_ord[0]) as *mut u32
+    ord_start(o, (*p).p_n)
+    var i: usize = 1
+    while i < (*p).p_n {
+        let x: u32 = (*p).p_ord[i]
+        var j: usize = i
+        while j > 0 && pro_cmp(p, (*p).p_ord[j - 1] as usize,
+            x as usize) > 0 {
+            (*p).p_ord[j] = (*p).p_ord[j - 1]
+            j = j - 1
+        }
+        (*p).p_ord[j] = x
+        i = i + 1
+    }
+    ord_neu(p, o, (&(*p).p_neu[0]) as *mut u32, (*p).p_n)
+}
+
+// Felder: Klasse, Name, Typ.
+#[no_gc]
+fn fld_cmp(p: *mut Dex, a: usize, b: usize) -> i32 {
+    let ca: u32 = (*p).t_neu[(*p).f_cls[a] as usize]
+    let cb: u32 = (*p).t_neu[(*p).f_cls[b] as usize]
+    if ca != cb {
+        if ca < cb {
+            return 0 - 1
+        }
+        return 1
+    }
+    let na: u32 = (*p).s_neu[(*p).f_nam[a] as usize]
+    let nb: u32 = (*p).s_neu[(*p).f_nam[b] as usize]
+    if na != nb {
+        if na < nb {
+            return 0 - 1
+        }
+        return 1
+    }
+    let ta: u32 = (*p).t_neu[(*p).f_typ[a] as usize]
+    let tb: u32 = (*p).t_neu[(*p).f_typ[b] as usize]
+    if ta != tb {
+        if ta < tb {
+            return 0 - 1
+        }
+        return 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn sort_fld(p: *mut Dex) {
+    let o: *mut u32 = (&(*p).f_ord[0]) as *mut u32
+    ord_start(o, (*p).f_n)
+    var i: usize = 1
+    while i < (*p).f_n {
+        let x: u32 = (*p).f_ord[i]
+        var j: usize = i
+        while j > 0 && fld_cmp(p, (*p).f_ord[j - 1] as usize,
+            x as usize) > 0 {
+            (*p).f_ord[j] = (*p).f_ord[j - 1]
+            j = j - 1
+        }
+        (*p).f_ord[j] = x
+        i = i + 1
+    }
+    ord_neu(p, o, (&(*p).f_neu[0]) as *mut u32, (*p).f_n)
+}
+
+// Methoden: Klasse, Name, Prototyp.
+#[no_gc]
+fn mth_cmp(p: *mut Dex, a: usize, b: usize) -> i32 {
+    let ca: u32 = (*p).t_neu[(*p).m_cls[a] as usize]
+    let cb: u32 = (*p).t_neu[(*p).m_cls[b] as usize]
+    if ca != cb {
+        if ca < cb {
+            return 0 - 1
+        }
+        return 1
+    }
+    let na: u32 = (*p).s_neu[(*p).m_nam[a] as usize]
+    let nb: u32 = (*p).s_neu[(*p).m_nam[b] as usize]
+    if na != nb {
+        if na < nb {
+            return 0 - 1
+        }
+        return 1
+    }
+    let pa: u32 = (*p).p_neu[(*p).m_pro[a] as usize]
+    let pb: u32 = (*p).p_neu[(*p).m_pro[b] as usize]
+    if pa != pb {
+        if pa < pb {
+            return 0 - 1
+        }
+        return 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn sort_mth(p: *mut Dex) {
+    let o: *mut u32 = (&(*p).m_ord[0]) as *mut u32
+    ord_start(o, (*p).m_n)
+    var i: usize = 1
+    while i < (*p).m_n {
+        let x: u32 = (*p).m_ord[i]
+        var j: usize = i
+        while j > 0 && mth_cmp(p, (*p).m_ord[j - 1] as usize,
+            x as usize) > 0 {
+            (*p).m_ord[j] = (*p).m_ord[j - 1]
+            j = j - 1
+        }
+        (*p).m_ord[j] = x
+        i = i + 1
+    }
+    ord_neu(p, o, (&(*p).m_neu[0]) as *mut u32, (*p).m_n)
+}
+
+// ===================================================================
+// SCHREIBEN
+// ===================================================================
+
+#[no_gc]
+fn w8(o: u64, at: usize, v: u32) {
+    s8(o, at, (v & 255 as u32) as u8)
+}
+
+#[no_gc]
+fn w16(o: u64, at: usize, v: u32) {
+    w8(o, at, v)
+    w8(o, at + 1, v >> 8)
+}
+
+#[no_gc]
+fn w32(o: u64, at: usize, v: u32) {
+    w8(o, at, v)
+    w8(o, at + 1, v >> 8)
+    w8(o, at + 2, v >> 16)
+    w8(o, at + 3, v >> 24)
+}
+
+// ULEB128. Kein Sonderfall: die Null ist ein Oktett.
+#[no_gc]
+fn wuleb(o: u64, at: usize, v: u32) -> usize {
+    var x: u32 = v
+    var k: usize = at
+    var weiter: bool = true
+    while weiter {
+        var b: u32 = x & 127 as u32
+        x = x >> 7
+        if x != 0 as u32 {
+            b = b | 128 as u32
+        } else {
+            weiter = false
+        }
+        w8(o, k, b)
+        k = k + 1
+    }
+    return k
+}
+
+#[no_gc]
+// Aufrunden auf vier. NICHT `(n + 3) & ~3`: `release-safe` rechnet mit
+// gepruefter Arithmetik, und `0 - 4` auf einem `usize` ist dort ein
+// Ueberlauf und kein Bitmuster (SPEC 13). Geteilt und wieder mal vier
+// ist dasselbe Ergebnis und haelt der Pruefung stand.
+fn aufvier(n: usize) -> usize {
+    return (n + 3) / 4 * 4
+}
+
+// Die Zahl der UTF-16-Einheiten in einer UTF-8-Folge. Ein Kodepunkt
+// jenseits der Grundebene zaehlt ZWEI -- er steht in UTF-16 als
+// Ersatzpaar. (Diese Datei erzeugt nur ASCII; die Rechnung steht
+// trotzdem hier, weil eine falsche Laenge im `string_data_item` ein
+// Fehler waere, den erst ART meldet.)
+#[no_gc]
+fn utf16_laenge(p: *mut Dex, s: usize) -> u32 {
+    let o: usize = (*p).s_off[s] as usize
+    let n: usize = (*p).s_len[s] as usize
+    var i: usize = 0
+    var k: u32 = 0
+    while i < n {
+        let b: u32 = (*p).s_buf[o + i] as u32
+        if b < 128 as u32 {
+            i = i + 1
+            k = k + 1 as u32
+        } else if b < 224 as u32 {
+            i = i + 2
+            k = k + 1 as u32
+        } else if b < 240 as u32 {
+            i = i + 3
+            k = k + 1 as u32
+        } else {
+            i = i + 4
+            k = k + 2 as u32
+        }
+    }
+    return k
+}
+
+// Die Glieder einer Klasse einer Art, nach Nummer aufsteigend. Gibt die
+// Zahl zurueck und legt die Plaetze in `aus` ab.
+#[no_gc]
+fn glieder(p: *mut Dex, kls: u32, art: u32, aus: *mut u32,
+    cap: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*p).e_n {
+        if (*p).e_cls[i] == kls && (*p).e_art[i] == art {
+            if n >= cap {
+                schlecht(p)
+                return n
+            }
+            *((aus as u64 + (n * 4) as u64) as *mut u32) = i as u32
+            n = n + 1
+        }
+        i = i + 1
+    }
+    // nach der ENDGUELTIGEN Nummer sortieren
+    var a: usize = 1
+    while a < n {
+        let x: u32 = *((aus as u64 + (a * 4) as u64) as *mut u32)
+        let xs: u32 = glied_nr(p, x as usize)
+        var b: usize = a
+        var lauf: bool = true
+        while b > 0 && lauf {
+            let y: u32 = *((aus as u64 + ((b - 1) * 4) as u64) as *mut u32)
+            if glied_nr(p, y as usize) > xs {
+                *((aus as u64 + (b * 4) as u64) as *mut u32) = y
+                b = b - 1
+            } else {
+                lauf = false
+            }
+        }
+        *((aus as u64 + (b * 4) as u64) as *mut u32) = x
+        a = a + 1
+    }
+    return n
+}
+
+#[no_gc]
+fn glied_nr(p: *mut Dex, e: usize) -> u32 {
+    if (*p).e_art[e] == G_DIREKT || (*p).e_art[e] == G_VIRTUELL {
+        return (*p).m_neu[(*p).e_id[e] as usize]
+    }
+    return (*p).f_neu[(*p).e_id[e] as usize]
+}
+
+// -------------------------------------------------------- Adler-32
+#[no_gc]
+fn adler32(o: u64, von: usize, bis: usize) -> u32 {
+    var a: u64 = 1
+    var b: u64 = 0
+    var i: usize = von
+    while i < bis {
+        a = (a + l8(o, i) as u64) % 65521
+        b = (b + a) % 65521
+        i = i + 1
+    }
+    return ((b << 16) | a) as u32
+}
+
+// ===================================================================
+// DIE DATEI BAUEN
+// ===================================================================
+//
+// Gibt die Laenge zurueck, 0 bei einem Fehler. `aus` muss `cap` Oktett
+// halten.
+fn dex_bauen(d: u64, aus: u64, cap: usize) -> usize {
+    let p: *mut Dex = d as *mut Dex
+    if d == 0 || aus == 0 {
+        return 0
+    }
+    sort_str(p)
+    sort_typ(p)
+    sort_pro(p)
+    sort_fld(p)
+    sort_mth(p)
+    // RUNDE VERIFY: JETZT stehen die neuen Nummern fest -- die Operanden
+    // im Bytecode muessen ihnen folgen.
+    insn_umnumerieren(p)
+    if (*p).fehler != 0 as u32 {
+        return 0
+    }
+
+    let ns: usize = (*p).s_n
+    let nt: usize = (*p).t_n
+    let np: usize = (*p).p_n
+    let nf: usize = (*p).f_n
+    let nm: usize = (*p).m_n
+    let nc: usize = (*p).c_n
+
+    // --------------------------------------------- die Versaetze
+    let kopf: usize = 112
+    let off_s: usize = kopf
+    let off_t: usize = off_s + 4 * ns
+    let off_p: usize = off_t + 4 * nt
+    let off_f: usize = off_p + 12 * np
+    let off_m: usize = off_f + 8 * nf
+    let off_c: usize = off_m + 8 * nm
+    let daten: usize = off_c + 32 * nc
+    if daten > cap {
+        return 0
+    }
+    var i: usize = 0
+    while i < daten {
+        s8(aus, i, 0 as u8)
+        i = i + 1
+    }
+    var at: usize = daten
+
+    // ------------------------------------- 1. die Parameterlisten
+    // Sie kommen zuerst, weil sie auf vier ausgerichtet sein muessen und
+    // weil `proto_ids` ihren Versatz braucht.
+    let tl_von: usize = at
+    var tl_n: usize = 0
+    var k: usize = 0
+    while k < np {
+        let pi: usize = (*p).p_ord[k] as usize
+        let cnt: usize = (*p).p_pn[pi] as usize
+        if cnt == 0 {
+            (*p).p_pos[pi] = 0 as u32
+        } else {
+            at = aufvier(at)
+            if at + 4 + 2 * cnt > cap {
+                return 0
+            }
+            (*p).p_pos[pi] = at as u32
+            w32(aus, at, cnt as u32)
+            var j: usize = 0
+            while j < cnt {
+                w16(aus, at + 4 + 2 * j,
+                    (*p).t_neu[(*p).par[(*p).p_par[pi] as usize + j]
+                        as usize])
+                j = j + 1
+            }
+            at = at + 4 + 2 * cnt
+            tl_n = tl_n + 1
+        }
+        k = k + 1
+    }
+
+    // -------------------------------------------- 2. die code_items
+    let co_von: usize = at
+    var ci: usize = 0
+    while ci < (*p).k_n {
+        at = aufvier(at)
+        let ln: usize = (*p).k_len[ci] as usize
+        if at + 16 + 2 * ln > cap {
+            return 0
+        }
+        (*p).k_pos[ci] = at as u32
+        w16(aus, at, (*p).k_regs[ci])
+        w16(aus, at + 2, (*p).k_ins[ci])
+        w16(aus, at + 4, (*p).k_outs[ci])
+        w16(aus, at + 6, 0 as u32)          // tries_size
+        w32(aus, at + 8, 0 as u32)          // debug_info_off
+        w32(aus, at + 12, ln as u32)
+        var j2: usize = 0
+        while j2 < ln {
+            w16(aus, at + 16 + 2 * j2,
+                (*p).insn[(*p).k_off[ci] as usize + j2])
+            j2 = j2 + 1
+        }
+        at = at + 16 + 2 * ln
+        ci = ci + 1
+    }
+
+    // ------------------------------------ 3. die Zeichenkettendaten
+    let sd_von: usize = at
+    var si: usize = 0
+    while si < ns {
+        let s: usize = (*p).s_ord[si] as usize
+        let ln: usize = (*p).s_len[s] as usize
+        if at + 6 + ln > cap {
+            return 0
+        }
+        (*p).s_pos[s] = at as u32
+        at = wuleb(aus, at, utf16_laenge(p, s))
+        var j3: usize = 0
+        while j3 < ln {
+            s8(aus, at + j3, (*p).s_buf[(*p).s_off[s] as usize + j3])
+            j3 = j3 + 1
+        }
+        at = at + ln
+        s8(aus, at, 0 as u8)
+        at = at + 1
+        si = si + 1
+    }
+
+    // ------------------------------------- 4. die class_data_items
+    let cd_von: usize = at
+    var kk: usize = 0
+    var cd_n: usize = 0
+    while kk < nc {
+        var sf: [u32; 32] = [0; 32]
+        var inf: [u32; 32] = [0; 32]
+        var dm: [u32; 64] = [0; 64]
+        var vm: [u32; 64] = [0; 64]
+        let n_sf: usize = glieder(p, kk as u32, G_STATFELD,
+            (&sf[0]) as *mut u32, 32)
+        let n_if: usize = glieder(p, kk as u32, G_FELD,
+            (&inf[0]) as *mut u32, 32)
+        let n_dm: usize = glieder(p, kk as u32, G_DIREKT,
+            (&dm[0]) as *mut u32, 64)
+        let n_vm: usize = glieder(p, kk as u32, G_VIRTUELL,
+            (&vm[0]) as *mut u32, 64)
+        if n_sf + n_if + n_dm + n_vm == 0 {
+            (*p).c_pos[kk] = 0 as u32
+            kk = kk + 1
+        } else {
+            if at + 32 + 16 * (n_sf + n_if + n_dm + n_vm) > cap {
+                return 0
+            }
+            (*p).c_pos[kk] = at as u32
+            cd_n = cd_n + 1
+            at = wuleb(aus, at, n_sf as u32)
+            at = wuleb(aus, at, n_if as u32)
+            at = wuleb(aus, at, n_dm as u32)
+            at = wuleb(aus, at, n_vm as u32)
+            at = felder_schreiben(p, aus, at, (&sf[0]) as *mut u32, n_sf)
+            at = felder_schreiben(p, aus, at, (&inf[0]) as *mut u32, n_if)
+            at = meth_schreiben(p, aus, at, (&dm[0]) as *mut u32, n_dm)
+            at = meth_schreiben(p, aus, at, (&vm[0]) as *mut u32, n_vm)
+            kk = kk + 1
+        }
+    }
+
+    // ---------------------------------------------- 5. die map_list
+    at = aufvier(at)
+    let map_off: usize = at
+    // ACHT sind IMMER da: header, string_id, type_id, proto_id,
+    // method_id, class_def, string_data und die map_list selbst.
+    var eintraege: usize = 8
+    if nf > 0 {
+        eintraege = eintraege + 1
+    }
+    if tl_n > 0 {
+        eintraege = eintraege + 1
+    }
+    if (*p).k_n > 0 {
+        eintraege = eintraege + 1
+    }
+    if cd_n > 0 {
+        eintraege = eintraege + 1
+    }
+    if at + 4 + 12 * eintraege > cap {
+        return 0
+    }
+    w32(aus, at, eintraege as u32)
+    var mi: usize = at + 4
+    mi = mapeintrag(aus, mi, 0, 1, 0)                    // header
+    mi = mapeintrag(aus, mi, 1, ns, off_s)               // string_id
+    mi = mapeintrag(aus, mi, 2, nt, off_t)               // type_id
+    mi = mapeintrag(aus, mi, 3, np, off_p)               // proto_id
+    if nf > 0 {
+        mi = mapeintrag(aus, mi, 4, nf, off_f)           // field_id
+    }
+    mi = mapeintrag(aus, mi, 5, nm, off_m)               // method_id
+    mi = mapeintrag(aus, mi, 6, nc, off_c)               // class_def
+    if tl_n > 0 {
+        mi = mapeintrag(aus, mi, 4097, tl_n, tl_von)     // type_list
+    }
+    if (*p).k_n > 0 {
+        mi = mapeintrag(aus, mi, 8193, (*p).k_n, co_von) // code_item
+    }
+    mi = mapeintrag(aus, mi, 8194, ns, sd_von)           // string_data
+    if cd_n > 0 {
+        mi = mapeintrag(aus, mi, 8192, cd_n, cd_von)     // class_data
+    }
+    mi = mapeintrag(aus, mi, 4096, 1, map_off)           // map_list
+    at = mi
+
+    // Die Datei auf vier auffuellen: `data_size` muss ein Vielfaches
+    // von vier sein.
+    while (at & 3) != 0 {
+        s8(aus, at, 0 as u8)
+        at = at + 1
+    }
+    let ende: usize = at
+
+    // ------------------------------------------- die festen Tabellen
+    var a1: usize = 0
+    while a1 < ns {
+        w32(aus, off_s + 4 * a1, (*p).s_pos[(*p).s_ord[a1] as usize])
+        a1 = a1 + 1
+    }
+    var a2: usize = 0
+    while a2 < nt {
+        w32(aus, off_t + 4 * a2,
+            (*p).s_neu[(*p).t_str[(*p).t_ord[a2] as usize] as usize])
+        a2 = a2 + 1
+    }
+    var a3: usize = 0
+    while a3 < np {
+        let pi2: usize = (*p).p_ord[a3] as usize
+        w32(aus, off_p + 12 * a3, (*p).s_neu[(*p).p_sho[pi2] as usize])
+        w32(aus, off_p + 12 * a3 + 4,
+            (*p).t_neu[(*p).p_ret[pi2] as usize])
+        w32(aus, off_p + 12 * a3 + 8, (*p).p_pos[pi2])
+        a3 = a3 + 1
+    }
+    var a4: usize = 0
+    while a4 < nf {
+        let fi: usize = (*p).f_ord[a4] as usize
+        w16(aus, off_f + 8 * a4, (*p).t_neu[(*p).f_cls[fi] as usize])
+        w16(aus, off_f + 8 * a4 + 2, (*p).t_neu[(*p).f_typ[fi] as usize])
+        w32(aus, off_f + 8 * a4 + 4, (*p).s_neu[(*p).f_nam[fi] as usize])
+        a4 = a4 + 1
+    }
+    var a5: usize = 0
+    while a5 < nm {
+        let m2: usize = (*p).m_ord[a5] as usize
+        w16(aus, off_m + 8 * a5, (*p).t_neu[(*p).m_cls[m2] as usize])
+        w16(aus, off_m + 8 * a5 + 2, (*p).p_neu[(*p).m_pro[m2] as usize])
+        w32(aus, off_m + 8 * a5 + 4, (*p).s_neu[(*p).m_nam[m2] as usize])
+        a5 = a5 + 1
+    }
+    var a6: usize = 0
+    while a6 < nc {
+        let b: usize = off_c + 32 * a6
+        w32(aus, b, (*p).t_neu[(*p).c_typ[a6] as usize])
+        w32(aus, b + 4, (*p).c_acc[a6])
+        w32(aus, b + 8, (*p).t_neu[(*p).c_sup[a6] as usize])
+        w32(aus, b + 12, 0 as u32)            // interfaces_off
+        w32(aus, b + 16, 4294967295 as u32)   // source_file_idx = NO_INDEX
+        w32(aus, b + 20, 0 as u32)            // annotations_off
+        w32(aus, b + 24, (*p).c_pos[a6])
+        w32(aus, b + 28, 0 as u32)            // static_values_off
+        a6 = a6 + 1
+    }
+
+    // -------------------------------------------------- der Kopf
+    // "dex\n035\0". Fassung 035 und nicht hoeher: sie wird von jedem
+    // Android seit 2014 gelesen, und nichts hier braucht mehr.
+    s8(aus, 0, 100 as u8)
+    s8(aus, 1, 101 as u8)
+    s8(aus, 2, 120 as u8)
+    s8(aus, 3, 10 as u8)
+    s8(aus, 4, 48 as u8)
+    s8(aus, 5, 51 as u8)
+    s8(aus, 6, 53 as u8)
+    s8(aus, 7, 0 as u8)
+    w32(aus, 32, ende as u32)                 // file_size
+    w32(aus, 36, 112 as u32)                  // header_size
+    w32(aus, 40, 305419896 as u32)            // endian_tag 0x12345678
+    w32(aus, 44, 0 as u32)                    // link_size
+    w32(aus, 48, 0 as u32)                    // link_off
+    w32(aus, 52, map_off as u32)
+    w32(aus, 56, ns as u32)
+    w32(aus, 60, off_s as u32)
+    w32(aus, 64, nt as u32)
+    w32(aus, 68, off_t as u32)
+    w32(aus, 72, np as u32)
+    w32(aus, 76, off_p as u32)
+    w32(aus, 80, nf as u32)
+    if nf == 0 {
+        w32(aus, 84, 0 as u32)
+    } else {
+        w32(aus, 84, off_f as u32)
+    }
+    w32(aus, 88, nm as u32)
+    w32(aus, 92, off_m as u32)
+    w32(aus, 96, nc as u32)
+    w32(aus, 100, off_c as u32)
+    w32(aus, 104, (ende - daten) as u32)      // data_size
+    w32(aus, 108, daten as u32)               // data_off
+
+    if (*p).fehler != 0 as u32 {
+        return 0
+    }
+
+    // SHA-1 ueber [32 .. Ende), dann Adler-32 ueber [12 .. Ende) --
+    // in DIESER Reihenfolge, weil die Signatur im Bereich der
+    // Pruefsumme liegt.
+    var sig: [u8; 20] = [0; 20]
+    sha1.sha1(aus + 32, ende - 32, (&sig[0]) as u64)
+    var z: usize = 0
+    while z < 20 {
+        s8(aus, 12 + z, sig[z])
+        z = z + 1
+    }
+    w32(aus, 8, adler32(aus, 12, ende))
+    return ende
+}
+
+#[no_gc]
+fn mapeintrag(aus: u64, at: usize, art: u32, n: usize,
+    off: usize) -> usize {
+    w16(aus, at, art)
+    w16(aus, at + 2, 0 as u32)
+    w32(aus, at + 4, n as u32)
+    w32(aus, at + 8, off as u32)
+    return at + 12
+}
+
+#[no_gc]
+fn felder_schreiben(p: *mut Dex, aus: u64, at0: usize, liste: *mut u32,
+    n: usize) -> usize {
+    var at: usize = at0
+    var vor: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let e: usize = l32(liste as u64, i) as usize
+        let nr: u32 = (*p).f_neu[(*p).e_id[e] as usize]
+        at = wuleb(aus, at, nr - vor)
+        at = wuleb(aus, at, (*p).e_acc[e])
+        vor = nr
+        i = i + 1
+    }
+    return at
+}
+
+#[no_gc]
+fn meth_schreiben(p: *mut Dex, aus: u64, at0: usize, liste: *mut u32,
+    n: usize) -> usize {
+    var at: usize = at0
+    var vor: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let e: usize = l32(liste as u64, i) as usize
+        let nr: u32 = (*p).m_neu[(*p).e_id[e] as usize]
+        at = wuleb(aus, at, nr - vor)
+        at = wuleb(aus, at, (*p).e_acc[e])
+        var co: u32 = 0
+        if (*p).e_cod[e] >= 0 {
+            co = (*p).k_pos[(*p).e_cod[e] as usize]
+        }
+        at = wuleb(aus, at, co)
+        vor = nr
+        i = i + 1
+    }
+    return at
+}

@@ -31,6 +31,12 @@
 #   --permission <name>   uses-permission, repeatable (android.permission.X)
 #   --manifest-extra <f>  XML inserted into <application> (services, ...)
 #   --dex <file>          classes.dex to ship (then hasCode="true")
+#   --push                the program uses lib/plat/android/push.fi: Firn
+#                         writes classes.dex with org.firn.FirnService
+#                         (tools/android/servicedex_main.fi), the manifest
+#                         gets the foreground service (remoteMessaging) and
+#                         INTERNET, FOREGROUND_SERVICE(_REMOTE_MESSAGING),
+#                         POST_NOTIFICATIONS
 #   --out <file.apk>      (default: build/android/<name>/<name>.apk)
 #
 # Environment: FIRNC, FIRNLIB (default: this tree), NDK, SDK, API (29),
@@ -48,6 +54,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
+PUSH=0
 OUT=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -62,6 +69,7 @@ while [ $# -gt 0 ]; do
         --permission) PERMS+=("$2"); shift 2 ;;
         --manifest-extra) EXTRA=$2; shift 2 ;;
         --dex) DEX=$2; shift 2 ;;
+        --push) PUSH=1; shift ;;
         --out) OUT=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; usage ;;
     esac
@@ -112,7 +120,9 @@ build_abi() { # $1 abi dir, $2 firn target, $3 linker, $4 NDK triple
     "$FIRNC" --target="$target" --pic --opt-level="$OPT" -c \
         -o "$out/app.o" "$ROOTFILE"
     local t1=$(date +%s%N)
-    printf '{ global: firn_activity_create; local: *; };\n' > "$out/exports.ver"
+    # The entry point, and the native methods of org.firn.FirnService
+    # (resolved by name by ART).
+    printf '{ global: firn_activity_create; Java_org_firn_*; local: *; };\n' > "$out/exports.ver"
     local syslib=$NDK/sysroot/usr/lib/$triple/$API
     "$linker" -shared -Bsymbolic --version-script="$out/exports.ver" \
         -z noexecstack -z max-page-size=16384 \
@@ -130,6 +140,25 @@ build_abi() { # $1 abi dir, $2 firn target, $3 linker, $4 NDK triple
 }
 case "$ABI" in arm64|both) build_abi arm64-v8a aarch64-linux aarch64-linux-gnu-ld aarch64-linux-android ;; esac
 case "$ABI" in x86_64|both) build_abi x86_64 x86_64-linux ld x86_64-linux-android ;; esac
+
+# ---- 3b. the push service: a class written by Firn ------------------------
+if [ $PUSH -eq 1 ]; then
+    SDX=$BUILD/servicedex
+    "$FIRNC" -o "$SDX" "$ROOT/tools/android/servicedex_main.fi"
+    "$SDX" "$BUILD/classes.dex" "$LIB"
+    DEX=$BUILD/classes.dex
+    PERMS+=(android.permission.INTERNET android.permission.FOREGROUND_SERVICE
+        android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING
+        android.permission.POST_NOTIFICATIONS)
+    SVCXML=$BUILD/service.xml
+    {
+        echo '        <service android:name="org.firn.FirnService" android:exported="false"'
+        echo '            android:foregroundServiceType="remoteMessaging" />'
+        [ -n "$EXTRA" ] && cat "$EXTRA"
+    } > "$SVCXML"
+    EXTRA=$SVCXML
+    echo "  classes.dex: $(stat -c%s "$DEX") octets (org.firn.FirnService, written by Firn)"
+fi
 
 # ---- 4. manifest, package, sign ------------------------------------------
 HASCODE=false

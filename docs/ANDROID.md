@@ -41,12 +41,46 @@ octet; the double conversion RGBA -> BGRX -> RGBA is a known waste).
 
 ![landscape](android/gallery-used.png)
 
+## Notifications and push without Firebase
+
+```sh
+bash tools/android/build.sh demos/pushdemo/main.fi --name "Firn Push" \
+    --package org.firn.pushdemo --push
+python3 tools/android/relay_test.py 7790          # stand-in relay on the host
+bash tools/android/push_check.sh                  # 8 checks on the emulator
+```
+
+`--push` has Firn WRITE the one Java class a foreground service needs:
+`tools/android/servicedex_main.fi` produces a 828-octet `classes.dex` with
+`org.firn.FirnService` (static initialiser `System.loadLibrary`, constructor,
+three `native` methods) through `lib/android/dex.fi`; no javac, no d8.
+`lib/plat/android/push.fi` implements those natives and the program side:
+
+* `push_start(host, port)` writes `firn-push.cfg`, asks for
+  POST_NOTIFICATIONS on Android 13+, starts the service
+  (`foregroundServiceType="remoteMessaging"`) and keeps the program alive
+  when the activity goes away (`activity_keep_alive`).
+* The service starts a pthread that holds ONE TCP connection to the relay
+  and posts one notification per line; it reconnects every 3 s and runs
+  without the activity (after Back, or when Android restarts the service).
+* `push_notify(title, text)` posts a notification from the program.
+* All of it is `#[no_gc]` and calls Java through `lib/android/jnicall.fi`.
+
+Measured on the emulator: foreground service with type 0x200, three lines ->
+three notifications (umlauts intact), Back -> activity gone, same process,
+relay restarted -> reconnect -> notification, tap on it -> the same program
+gets its window back; the permission dialog appears when the permission is
+missing. Firn's checked cast caught `checkSelfPermission` = -1 as
+`u64 as i32` on the way -- `jnicall.jint` sign-extends now.
+
 ## Open
 
 * The soft keyboard composes nothing yet (no InputConnection without a dex
   class); hardware keys and the key events Android synthesises arrive.
 * A finger drag does not scroll: fUi scrolls by scroll bar, wheel and keys.
 * Only tested in the emulator; the arm64 build still needs a real phone.
+* Push: the relay address is a dotted IPv4 address (no name lookup), the
+  connection is plain TCP (no TLS yet), one line = one message.
 * x86_64 Android forbids some legacy system calls (seccomp); `dup2` hit it.
   Firn's x86_64 code uses the raw numbers, aarch64 goes through the `*at`
   forms -- phones are aarch64.
