@@ -916,6 +916,18 @@ fn emit_inst(
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
+            // Round GAPS (fbits.rs): every value -- float or not -- sits in
+            // its slot as its bit pattern, so the reinterpretation is a copy.
+            // The 32-bit forms clear the upper half (the slot does not
+            // guarantee it).
+            if matches!(op, UnOp::Bits) {
+                load_full(e, fr, "rax", *a);
+                if ty.bits() <= 32 {
+                    e.line("mov eax, eax");
+                }
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
             // FLOATING POINT: the sign is ONE bit. `neg` would treat the whole
             // bit pattern as two's complement — wrong. That is why only bit 63
             // is flipped.
@@ -956,7 +968,7 @@ fn emit_inst(
             load_full(e, fr, "rax", *a);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", reg("rax", bits))),
-                UnOp::Sqrt => unreachable!(),
+                UnOp::Sqrt | UnOp::Bits => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");

@@ -2547,6 +2547,17 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     if debug_vars_active(f) {
         return Some("variable debug information active".into());
     }
+    // Round GAPS: `__sqrt` (fsqrt.rs) is emitted by the base path only. On
+    // main every function with a float already goes there (below); this
+    // check keeps it so once a float register class lands (branch xmm-ra),
+    // instead of hitting "sqrt in the integer register path".
+    if f
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Un(UnOp::Sqrt | UnOp::Bits, _))))
+    {
+        return Some("__sqrt / __bits".into());
+    }
     // FLOATING POINT: this allocator knows only the integer registers. `f64`
     // lives in the SSE registers and needs a second register class with
     // intervals of its own. As long as that is missing, a function containing
@@ -3599,15 +3610,17 @@ fn emit_inst(
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
-            if matches!(op, UnOp::Sqrt) {
+            if matches!(op, UnOp::Sqrt | UnOp::Bits) {
                 // Floats never reach this allocator (`unsupported`: "f64 in
-                // the value set"), and sqrt exists only on floats.
-                return Err("internal error: sqrt in the integer register path".into());
+                // the value set"), sqrt exists only on floats, and a
+                // function with `__bits` is sent to the base path
+                // (`unsupported_basic`).
+                return Err("internal error: sqrt/bits in the integer register path".into());
             }
             ra.load_full(e, "rax", *x);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", rn("rax", bits))),
-                UnOp::Sqrt => unreachable!(),
+                UnOp::Sqrt | UnOp::Bits => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");

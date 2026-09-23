@@ -642,6 +642,7 @@ fn unk(o: UnOp) -> u8 {
         UnOp::Neg => 1,
         UnOp::Not => 2,
         UnOp::Sqrt => 3,
+        UnOp::Bits => 4,
     }
 }
 
@@ -1218,6 +1219,10 @@ fn fold_un(ty: FTy, op: UnOp, a: i128) -> i128 {
         // Only defined on floats, and float operations are never folded
         // (`op_has_float`); an integer sqrt cannot reach this point.
         UnOp::Sqrt => a,
+        // The pattern stays what it is; only its type changes (fbits.rs).
+        // Reached for `__f64_from_bits(<const>)` -- a float constant is
+        // carried as its bit pattern anyway.
+        UnOp::Bits => a,
         UnOp::Not => {
             if ty == FTy::Bool {
                 if a & 1 != 0 {

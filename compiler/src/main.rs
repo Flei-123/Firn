@@ -11,6 +11,7 @@ mod ast_canon;
 mod layout_canon;
 mod atomic;
 mod fsqrt;
+mod fbits;
 mod thread;
 mod testrun;
 mod attrs;

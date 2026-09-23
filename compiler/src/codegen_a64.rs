@@ -867,6 +867,15 @@ fn emit_inst(
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
+            // Round GAPS (fbits.rs): a copy of the pattern, like on x86-64.
+            if matches!(op, UnOp::Bits) {
+                load_full(e, fr, A, *a);
+                if ty.bits() <= 32 {
+                    e.line(&format!("mov {}, {}", w(A), w(A)));
+                }
+                store_dst(e, fr, d, A);
+                return Ok(());
+            }
             if ty.is_float() {
                 if matches!(op, UnOp::Not) {
                     return Err(format!("internal error: '!' is not defined for {}", ty.name()));
@@ -890,7 +899,7 @@ fn emit_inst(
             load_full(e, fr, A, *a);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}, {}", rw(A, bits), rw(A, bits))),
-                UnOp::Sqrt => unreachable!(),
+                UnOp::Sqrt | UnOp::Bits => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line(&format!("eor {}, {}, #1", w(A), w(A)));

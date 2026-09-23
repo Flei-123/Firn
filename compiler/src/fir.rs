@@ -213,6 +213,10 @@ pub enum UnOp {
     /// **Round GAPS** -- square root of a float (`__sqrt`, fsqrt.rs).
     /// Correctly rounded by IEEE 754; only defined on `f64`/`f32`.
     Sqrt,
+    /// **Round GAPS** -- reinterpret the bit pattern (`__bits`,
+    /// `__f64_from_bits`, `__f32_from_bits`, fbits.rs). The instruction type
+    /// is the target, the operand keeps its own type of the same width.
+    Bits,
 }
 
 #[derive(Clone, Debug)]
@@ -988,6 +992,7 @@ fn fmt_inst(i: &Inst) -> String {
             UnOp::Neg => format!("neg.{} %{}", t, a),
             UnOp::Not => format!("not.{} %{}", t, a),
             UnOp::Sqrt => format!("sqrt.{} %{}", t, a),
+            UnOp::Bits => format!("bits.{} %{}", t, a),
         },
         Op::Cast { src, from } => format!("cast.{}.{} %{}", from.name(), t, src),
         Op::Alloca { size, align } => format!("alloca.ptr size={} align={}", size, align),
