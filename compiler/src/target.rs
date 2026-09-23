@@ -96,6 +96,18 @@ thread_local! {
     /// library (`.so`). Default OFF — the path for programmes and for
     /// Osum stays character for character the one it was.
     static PIC: Cell<bool> = const { Cell::new(false) };
+    /// FIRN r64: the program runs as an Android app. On x86_64 that
+    /// changes the SYSTEM CALLS: Android's seccomp filter for apps kills a
+    /// process on the legacy calls bionic itself never makes (measured in
+    /// the emulator: dup2 = 33 and chmod = 90 end in SIGSYS), so they are
+    /// written as their `*at`/`3` forms -- what the aarch64 table has
+    /// always done, because aarch64 never had the legacy calls.
+    static ANDROID: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Is this an Android build (`--target=x86_64-android|aarch64-android`)?
+pub fn android() -> bool {
+    ANDROID.with(|a| a.get())
 }
 
 /// `--pic`. Moves the tables that hold ABSOLUTE addresses out of the
@@ -130,18 +142,29 @@ pub fn reloc_rodata() -> &'static str {
 
 /// `--target=<name>`. `Err` = unknown name.
 pub fn flag_set(name: &str) -> Result<(), String> {
+    let mut on_android = false;
     let t = match name {
         "x86_64-linux" | "x86-64-linux" | "x86_64" => Target::X86_64,
         "aarch64-linux" | "arm64-linux" | "aarch64" => Target::Aarch64,
+        // FIRN r64: the same machines as an Android app (see `android`).
+        "x86_64-android" => {
+            on_android = true;
+            Target::X86_64
+        }
+        "aarch64-android" => {
+            on_android = true;
+            Target::Aarch64
+        }
         "wasm32-browser" | "wasm32" => Target::Wasm32Browser,
         other => {
             return Err(format!(
-                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser)",
+                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser, x86_64-android, aarch64-android)",
                 other
             ))
         }
     };
     ACTIVE.with(|a| a.set(t));
+    ANDROID.with(|a| a.set(on_android));
     Ok(())
 }
 
@@ -161,6 +184,7 @@ pub fn align(bytes: u64) -> String {
 pub fn reset() {
     ACTIVE.with(|a| a.set(Target::X86_64));
     PIC.with(|p| p.set(false));
+    ANDROID.with(|a| a.set(false));
 }
 
 #[cfg(test)]

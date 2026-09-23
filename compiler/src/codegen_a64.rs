@@ -1421,6 +1421,19 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             }
             return Ok(());
         }
+        syscalls::A64::RenameAt(n) => {
+            // FIRN r64: renameat(AT_FDCWD, old, AT_FDCWD, new).
+            load_full(e, fr, "x1", given[0]);
+            load_full(e, fr, "x3", given[1]);
+            imm_into(e, "x0", syscalls::AT_FDCWD);
+            imm_into(e, "x2", syscalls::AT_FDCWD);
+            imm_into(e, "x8", n as i64);
+            e.line("svc #0");
+            if let Some(d) = i.dst {
+                store_dst(e, fr, d, "x0");
+            }
+            return Ok(());
+        }
         syscalls::A64::SetThreadPointer => unreachable!(),
         syscalls::A64::Missing(why) => {
             return Err(format!("aarch64: system call {} — {}", nr, why))

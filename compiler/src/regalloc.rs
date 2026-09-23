@@ -3941,6 +3941,11 @@ fn emit_inst(
             if args.is_empty() {
                 return Err("internal error: syscall without number".to_string());
             }
+            // FIRN r64: the Android forms (codegen_x86.rs,
+            // `emit_syscall_android`, the same rewrite on the base path).
+            if crate::target::android() && emit_syscall_android_ra(e, ra, i, args)? {
+                return Ok(());
+            }
             // The same class of bug as with the call: `r10`, `r8` and `r9`
             // are at the same time scratch registers of the allocation.
             let mut sys_moves: Vec<(String, String)> = Vec::new();
@@ -4943,4 +4948,87 @@ mod tests {
             add
         );
     }
+}
+
+/// FIRN r64 -- `--target=x86_64-android` on the register allocated path.
+/// Same table and the same poll -> ppoll shape as the base path
+/// (codegen_x86.rs, `emit_syscall_android`); the clobbers are the ones of
+/// every syscall (`M_CALL`: rdi..r9 and r11, rax/rcx are scratch anyway).
+fn emit_syscall_android_ra(e: &mut Emitter, ra: &Ra, i: &Inst, args: &[Val]) -> Result<bool, String> {
+    const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
+    let Some(nr) = ra.a.imm(args[0]) else {
+        return Ok(false);
+    };
+    let given = &args[1..];
+    // Argument values into their registers: register sources as one
+    // parallel move (they may sit in each other's targets), then the rest.
+    fn move_args(e: &mut Emitter, ra: &Ra, srcs: &[(&str, Val)]) {
+        let mut moves: Vec<(String, String)> = Vec::new();
+        let mut later: Vec<(&str, Val)> = Vec::new();
+        for (r, v) in srcs {
+            let o = ra.opnd(*v);
+            if is_reg64(&o) {
+                moves.push((r.to_string(), o));
+            } else {
+                later.push((*r, *v));
+            }
+        }
+        parallel_reg_moves(e, &moves);
+        for (r, v) in later {
+            ra.load_full(e, r, v);
+        }
+    }
+    if nr == 7 {
+        if given.len() < 3 {
+            return Err("x86_64-android: poll needs three arguments".to_string());
+        }
+        move_args(e, ra, &[("rdi", given[0]), ("rsi", given[1]), ("rax", given[2])]);
+        e.line("mov r11, rax");
+        e.line("mov rcx, 1000");
+        e.line("cqo");
+        e.line("idiv rcx");
+        e.line("imul rdx, rdx, 1000000");
+        e.line("sub rsp, 16");
+        e.line("mov qword ptr [rsp], rax");
+        e.line("mov qword ptr [rsp + 8], rdx");
+        e.line("mov rdx, rsp");
+        e.line("xor ecx, ecx");
+        e.line("test r11, r11");
+        e.line("cmovs rdx, rcx");
+        e.line("xor r10d, r10d");
+        e.line("mov r8d, 8");
+        e.line("mov eax, 271");
+        e.line("syscall");
+        e.line("add rsp, 16");
+        if let Some(d) = i.dst {
+            ra.store_dst(e, d, "rax");
+        }
+        return Ok(true);
+    }
+    let Some((new_nr, form)) = crate::syscalls::x86_android(nr) else {
+        return Ok(false);
+    };
+    let mut srcs: Vec<(&str, Val)> = Vec::new();
+    let mut imms: Vec<(&str, i64)> = Vec::new();
+    for (k, x) in form.iter().enumerate() {
+        match x {
+            crate::syscalls::X::A(j) => {
+                let v = given.get(*j).ok_or_else(|| {
+                    format!("x86_64-android: system call {} needs argument {}", nr, j + 1)
+                })?;
+                srcs.push((SYS_REGS[k], *v));
+            }
+            crate::syscalls::X::I(c) => imms.push((SYS_REGS[k], *c)),
+        }
+    }
+    move_args(e, ra, &srcs);
+    for (r, c) in imms {
+        e.line(&format!("mov {}, {}", r, c));
+    }
+    e.line(&format!("mov eax, {}", new_nr));
+    e.line("syscall");
+    if let Some(d) = i.dst {
+        ra.store_dst(e, d, "rax");
+    }
+    Ok(true)
 }

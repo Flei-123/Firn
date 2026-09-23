@@ -42,6 +42,9 @@ pub enum A64 {
     Direct(u32),
     /// `AT_FDCWD` in front of the arguments, then this number
     AtFdcwd(u32),
+    /// FIRN r64: rename(old, new) -> renameat(AT_FDCWD, old, AT_FDCWD, new)
+    /// -- TWO directory descriptors, which `AtFdcwd` cannot express.
+    RenameAt(u32),
     /// `fork()` -> `clone(SIGCHLD, 0, 0, 0, 0)`. The generic table has no
     /// `fork`; the call it is a special case of is there, and `SIGCHLD` as
     /// the flag word is exactly what makes it one.
@@ -83,6 +86,38 @@ pub const AT_FDCWD: i64 = -100;
 /// The table. Left the canonical (x86-64) number, right what AArch64 makes
 /// of it. Sorted by the left column; the name in the comment is the one
 /// both sides carry in `unistd.h`.
+/// FIRN r64 -- THE x86_64 CALLS ANDROID'S SECCOMP FILTER REFUSES, and what
+/// they become (`--target=x86_64-android`). Each entry: canonical number,
+/// new number, and the argument list of the new call: `A(k)` is the k-th
+/// argument the program wrote, `I(v)` an immediate. poll is not here: it
+/// changes the SHAPE of its argument (codegen_x86.rs, like `PpollMs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X {
+    A(usize),
+    I(i64),
+}
+
+pub const X86_ANDROID: &[(i64, i64, &[X])] = &[
+    (2, 257, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::A(2)]), // open -> openat
+    (4, 262, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0)]), // stat -> newfstatat
+    (6, 262, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0x100)]), // lstat
+    (21, 269, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0)]), // access -> faccessat
+    (22, 293, &[X::A(0), X::I(0)]),                     // pipe -> pipe2
+    (33, 292, &[X::A(0), X::A(1), X::I(0)]),            // dup2 -> dup3
+    (57, 56, &[X::I(SIGCHLD), X::I(0), X::I(0), X::I(0), X::I(0)]), // fork -> clone
+    (82, 264, &[X::I(AT_FDCWD), X::A(0), X::I(AT_FDCWD), X::A(1)]), // rename -> renameat
+    (83, 258, &[X::I(AT_FDCWD), X::A(0), X::A(1)]),     // mkdir -> mkdirat
+    (84, 263, &[X::I(AT_FDCWD), X::A(0), X::I(0x200)]), // rmdir -> unlinkat
+    (87, 263, &[X::I(AT_FDCWD), X::A(0), X::I(0)]),     // unlink -> unlinkat
+    (89, 267, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::A(2)]), // readlink -> readlinkat
+    (90, 268, &[X::I(AT_FDCWD), X::A(0), X::A(1)]),     // chmod -> fchmodat
+];
+
+/// The Android form of an x86_64 call, `None` = the call stays as it is.
+pub fn x86_android(n: i64) -> Option<(i64, &'static [X])> {
+    X86_ANDROID.iter().find(|(k, _, _)| *k == n).map(|(_, m, a)| (*m, *a))
+}
+
 const TABLE: &[(i64, A64)] = &[
     (0, A64::Direct(63)),            // read
     (1, A64::Direct(64)),            // write
@@ -106,6 +141,7 @@ const TABLE: &[(i64, A64)] = &[
     (18, A64::Direct(68)),           // pwrite64
     (19, A64::Direct(65)),           // readv
     (20, A64::Direct(66)),           // writev
+    (21, A64::AtFdcwd(48)),          // access    -> faccessat (Firn r64)
     (24, A64::Direct(124)),          // sched_yield
     (28, A64::Direct(233)),          // madvise
     (32, A64::Direct(23)),           // dup
@@ -138,12 +174,14 @@ const TABLE: &[(i64, A64)] = &[
     (61, A64::Direct(260)),          // wait4
     (62, A64::Direct(129)),          // kill
     (63, A64::Direct(160)),          // uname
+    (74, A64::Direct(82)), // fsync (Firn r64)
     (79, A64::Direct(17)),           // getcwd
     // Round ABSCHLUSS (Certus): the same shape as `open` two lines up --
     // the generic table has no `mkdir`, only `mkdirat`, and AT_FDCWD in
     // front of the path makes it mean the same. Without this line every
     // program that links lib/pdf/down.fi (the download folder) was
     // untranslatable for the phone, and that is the whole browser.
+    (82, A64::RenameAt(38)),         // rename    -> renameat (Firn r64)
     (83, A64::AtFdcwd(34)),          // mkdir     -> mkdirat
     // ROUND VERIFY (Certus): the crash report deletes itself after it has
     // been sent (lib/android/absturz.fi). Same shape as `open` and
@@ -157,6 +195,7 @@ const TABLE: &[(i64, A64)] = &[
     // raten -- die geratene Zahl hat den Windows-Bau umgebracht, weil
     // dort nur 2 MiB Stapel stehen. Ohne diese Zeile ist derselbe
     // Quelltext fuer das Telefon nicht uebersetzbar.
+    (90, A64::AtFdcwd(53)),          // chmod     -> fchmodat (Firn r64)
     (96, A64::Direct(169)),          // gettimeofday
     (97, A64::Direct(163)),          // getrlimit
     (102, A64::Direct(174)),         // getuid
@@ -259,6 +298,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (20, "writev", Wasm::Missing(NO_FILES)),
     // One thread: yielding to nobody returns at once, as the kernel does
     // when no other thread is runnable.
+    (21, "access", Wasm::Missing(NO_FILES)),
     (24, "sched_yield", Wasm::Constant(0)),
     // Advice may be ignored -- the kernel is allowed to do exactly that.
     (28, "madvise", Wasm::Constant(0)),
@@ -291,9 +331,12 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (62, "kill", Wasm::Missing(NO_PROCESSES)),
     (63, "uname", Wasm::Missing("a browser page has no kernel to name")),
     (72, "fcntl", Wasm::Missing(NO_FILES)),
+    (74, "fsync", Wasm::Missing(NO_FILES)),
     (79, "getcwd", Wasm::Missing(NO_FILES)),
+    (82, "rename", Wasm::Missing(NO_FILES)),
     (83, "mkdir", Wasm::Missing(NO_FILES)),
     (87, "unlink", Wasm::Missing(NO_FILES)),
+    (90, "chmod", Wasm::Missing(NO_FILES)),
     (96, "gettimeofday", Wasm::Missing("use clock_gettime (228), which the host provides")),
     (97, "getrlimit", Wasm::Missing("a browser page has no resource limits")),
     (102, "getuid", Wasm::Missing("a browser page has no users")),
@@ -377,6 +420,25 @@ mod tests {
         assert!(matches!(wasm(57), Some(("fork", Wasm::Missing(_)))));
         assert_eq!(wasm(9), Some(("mmap", Wasm::Mmap)));
         assert_eq!(wasm(4711), None);
+    }
+
+    #[test]
+    fn the_android_forms_of_x86_64_are_the_at_calls() {
+        // Firn r64: the calls Android's seccomp filter refuses (measured:
+        // dup2 and chmod killed the emulator's app with SIGSYS).
+        assert_eq!(x86_android(33), Some((292, &[X::A(0), X::A(1), X::I(0)][..])));
+        assert_eq!(x86_android(90), Some((268, &[X::I(AT_FDCWD), X::A(0), X::A(1)][..])));
+        assert_eq!(x86_android(2).map(|f| f.0), Some(257));
+        // Calls bionic makes itself stay untouched.
+        assert_eq!(x86_android(0), None);
+        assert_eq!(x86_android(41), None);
+        for w in X86_ANDROID.windows(2) {
+            assert!(w[0].0 < w[1].0, "x86 android table not sorted at {}", w[0].0);
+        }
+        // aarch64 got the two FIRNCHAT needed; stat, lstat, pipe, rmdir and
+        // readlink still have no aarch64 form (a compile error, not a guess).
+        assert_eq!(aarch64(90), Some(A64::AtFdcwd(53)));
+        assert_eq!(aarch64(82), Some(A64::RenameAt(38)));
     }
 
     #[test]
