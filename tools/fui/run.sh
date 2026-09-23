@@ -365,6 +365,34 @@ gzip -dc tools/ucd/BidiCharacterTest.txt.gz | "$W/bidiconf"
 # ueber die Naeherung.
 build bidi
 "$W/bidi"
+echo "== 18h. DIE PLATTFORMSCHICHT OHNE BILDSCHIRM (X11 + WIRT) =="
+# lib/window/x11.fi spricht das X11-Protokoll selbst (kein Xlib, kein
+# xcb), lib/plat/fuiwirt.fi gibt die Ereignisse an lib/fui/control.fi.
+# Geprueft wird OHNE X-Server: jede Anfrage Oktett fuer Oktett gegen
+# von Hand bestimmte Werte, jede Antwort gegen echte Mitschnitte eines
+# Xvfb (testdata/x11/, tools/fui/x11_capture.py) und gegen xdpyinfo/
+# xmodmap, dazu die gallery9-Seite bei Massstab 1000/1500/2000, die
+# Bedienung ueber den Wirt und der Leerlauf (0 Bilder ohne Aenderung).
+# `import window.backend` findet die X11-Rueckwand ueber den Verweis
+# tools/fui/window/backend.fi.
+build x11
+"$W/x11"
+
+echo
+echo "== 18i. EIN ECHTES FENSTER AUF EINEM ECHTEN X-SERVER =="
+# Dieselbe Seite als Programm (demos/x11demo) auf einem eigenen Xvfb,
+# von aussen bedient: xdotool fuer Maus und Tastatur, eine rohe
+# ClientMessage WM_DELETE_WINDOW zum Schliessen, xwd fuer das Bild VOM
+# SERVER, /proc fuer die Rechenzeit im Leerlauf. Gebaut mit dem
+# Optimierer, weil der Lauf auf Bilder wartet (ein Vollbild braucht mit
+# --opt-level=dev ueber eine Sekunde). Fehlt Xvfb, sagt der Lauf SKIP
+# und warum -- ein fehlender X-Server ist kein Fehler der Demo.
+"$FIRNC" --opt-level=release-fast -o "$W/x11demo" demos/x11demo/main.fi
+if command -v Xvfb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    python3 tools/fui/x11live.py "$W/x11demo" "${BELEGE:-$W/belege}/x11"
+else
+    echo "  SKIP: kein Xvfb/python3 -- kein echtes Fenster in diesem Lauf"
+fi
 
 echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="

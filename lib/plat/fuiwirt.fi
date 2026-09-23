@@ -1,0 +1,544 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/fuiwirt.fi -- DER WIRT: was ein Fenster meldet, wird fUi.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// fUi hat eine Bedienung (lib/fui/control.fi: Ueberfahren, Druecken,
+// Loslassen, Fokuskette, Ziehen), einen Scheibenkasten mit Rad, Tasten
+// und Rollbalken (lib/fui/viewport.fi) und einen Takt fuer Animationen
+// (lib/fui/anim.fi). Was fehlte, war der Ort, an dem die EREIGNISSE
+// EINES FENSTERS in genau diese drei hineinlaufen -- bisher tat das nur
+// OrientOS, auf seine eigene Weise. Dieser Ort ist hier.
+//
+// DIESE DATEI KENNT KEIN FENSTER. Sie importiert weder lib/window noch
+// irgendeine Plattform; sie nimmt Zeigerstellen, Knoepfe, Tasten und
+// Zeichen als ZAHLEN entgegen. Die Uebersetzung "Ereignis des
+// Fenstersystems -> Aufruf hier" steht in lib/plat/fuiwin.fi, und die
+// ist eine einzige Weiche. Darum laesst sich alles, was hier
+// entschieden wird, ohne Bildschirm nachrechnen (tools/fui/x11_main.fi),
+// und darum gilt es fuer X11, Windows und jede kuenftige Rueckwand
+// gleich.
+//
+// ========================================================== WAS ER TUT
+//
+// W1 ZEIGER. Bewegung, Druecken und Loslassen gehen an control.fi --
+//    an ein Panel, das ueber scene.scene_bind_panel direkt an den
+//    Knoten des beschriebenen Baums haengt. Es gibt keine zweite
+//    Bedienung und keine Kopie der Widgets.
+// W2 ROLLEN. Das Rad (Knopf 4/5, waagrecht 6/7) rollt den Scheibenkasten
+//    UNTER DEM ZEIGER; ein Druck auf dessen Rollbalken nimmt den
+//    Schieber (viewport_bar_press/drag/release). Die Schrittweite ist
+//    eine Laenge aus dem Entwurf und geht darum durch `render.len_of` --
+//    bei Massstab 2 rollt ein Rasten doppelt so viele Bildpunkte, also
+//    dieselbe Strecke auf dem Schirm.
+// W3 TASTEN. Tab / Umschalt+Tab ist die Fokuskette, Eingabe und
+//    Leertaste loesen das Widget im Fokus aus, Pfeile, Bild auf/ab,
+//    Pos1 und Ende rollen den Scheibenkasten, ueber dem der Zeiger
+//    zuletzt stand (sonst den ersten des Baums).
+// W4 DER MASSSTAB. `wirt_set_scale` setzt ihn EINMAL im Theme
+//    (theme.theme_set_scale) -- dem einen Ort, von dem render.len_of
+//    und damit scene.fi ihn lesen. Ein zweiter Weg existiert nicht.
+// W5 WANN GEMALT WIRD. Nur wenn etwas SCHMUTZIG ist: ein Ereignis hat
+//    etwas geaendert (die Aenderungsbits von control.fi sagen es), das
+//    Fenster wurde aufgedeckt oder in der Groesse geaendert, oder der
+//    letzte Takt der Animationen hat einen Wert bewegt
+//    (anim.animator_dirty). `wirt_wait_ms` sagt der Schleife, wie
+//    lange sie schlafen darf: -1 (bis zum naechsten Ereignis), wenn
+//    nichts laeuft, 16 ms, solange ein Tween oder ein Auslaufen aktiv
+//    ist, 0, wenn schon etwas schmutzig ist. IM LEERLAUF WIRD NICHT
+//    GEMALT -- das wird in tools/fui/x11_main.fi gezaehlt und auf einem
+//    echten Xvfb an der Rechenzeit gemessen.
+//
+// ====================================================== WAS NICHT HIER IST
+//
+// N1 KEINE Texteingabe. Zeichen ausser der Leertaste werden gezaehlt,
+//    aber an kein Textfeld gegeben; lib/fui/editor.fi ist eine eigene
+//    Aufgabe.
+// N2 KEIN Doppelklick, kein Ziehen-und-Ablegen, keine Zwischenablage.
+import fui.render
+import fui.scene
+import fui.control
+import fui.viewport
+import fui.anim
+import fui.theme
+
+export {
+    Wirt, wirt_new, wirt_bind, wirt_set_animator,
+    wirt_pointer_move, wirt_pointer_down, wirt_pointer_up,
+    wirt_pointer_leave, wirt_key, wirt_char,
+    wirt_resize, wirt_expose, wirt_set_scale, wirt_touch,
+    wirt_tick, wirt_wait_ms, wirt_dirty, wirt_painted, wirt_frames,
+    wirt_after_layout, wirt_take_activated, wirt_panel,
+    wirt_kbd_viewport, wirt_chars, wirt_focus,
+    rgba_to_bgrx,
+    KEY_TAB, KEY_RETURN, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
+    KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_HOME, KEY_END,
+    MOD_SHIFT, MOD_CTRL,
+    BTN_LEFT, BTN_WHEEL_UP, BTN_WHEEL_DOWN, BTN_WHEEL_LEFT,
+    BTN_WHEEL_RIGHT,
+    FRAME_MS, WAIT_FOREVER, KEINER,
+}
+
+// Die Tasten, die der Wirt versteht -- eigene Zahlen, keine eines
+// Fenstersystems. Welche Taste des Systems welche davon ist, entscheidet
+// lib/plat/fuiwin.fi.
+const KEY_TAB: u32 = 1
+const KEY_RETURN: u32 = 2
+const KEY_UP: u32 = 3
+const KEY_DOWN: u32 = 4
+const KEY_LEFT: u32 = 5
+const KEY_RIGHT: u32 = 6
+const KEY_PAGE_UP: u32 = 7
+const KEY_PAGE_DOWN: u32 = 8
+const KEY_HOME: u32 = 9
+const KEY_END: u32 = 10
+
+// Die Zustandsbits, die der Wirt liest. Dieselben wie in X11 (Shift =
+// Bit 0, Control = Bit 2) -- lib/window/window.fi hat sie fuer alle
+// Rueckwaende so festgelegt (`ev_state`).
+const MOD_SHIFT: u32 = 1
+const MOD_CTRL: u32 = 4
+
+// Die Knoepfe: 1 links, 4/5 das Rad, 6/7 das Rad zur Seite.
+const BTN_LEFT: u32 = 1
+const BTN_WHEEL_UP: u32 = 4
+const BTN_WHEEL_DOWN: u32 = 5
+const BTN_WHEEL_LEFT: u32 = 6
+const BTN_WHEEL_RIGHT: u32 = 7
+
+// Ein Bild alle 16 ms, solange etwas laeuft; -1 = schlafen, bis ein
+// Ereignis kommt.
+const FRAME_MS: i64 = 16
+// "Kein Knoten" -- derselbe Wert wie scene.SCENE_NONE, fuer Aufrufer,
+// die scene nicht importieren (lib/plat/fuiwin.fi).
+const KEINER: usize = 4294967295
+const WAIT_FOREVER: i64 = -1
+
+struct Wirt {
+    sc: u64,        // *mut scene.Scene -- gehoert dem Aufrufer
+    c: u64,         // *mut render.Ctx -- fuer len_of und die Balkenmasse
+    g: u64,         // *mut anim.Animator oder 0
+    pn: control.Panel,
+    dirty: bool,
+    frames: u64,
+    px: f64,
+    py: f64,
+    drin: bool,
+    // Der Scheibenkasten, dessen Schieber gerade gezogen wird, und der,
+    // ueber dem der Zeiger zuletzt stand (fuer die Tasten).
+    bar_node: usize,
+    kbd_node: usize,
+    // Welcher Knoten zuletzt AUSGELOEST wurde (Klick oder Eingabe),
+    // bis der Aufrufer es abholt.
+    act: usize,
+    chars: u64,
+}
+
+fn wirt_new(sc: *mut scene.Scene, c: *mut render.Ctx) -> Wirt {
+    return Wirt { sc: sc as u64, c: c as u64, g: 0,
+        pn: control.panel_new(), dirty: true, frames: 0,
+        px: 0.0, py: 0.0, drin: false,
+        bar_node: scene.SCENE_NONE, kbd_node: scene.SCENE_NONE,
+        act: scene.SCENE_NONE, chars: 0 }
+}
+
+// Das Panel an den Baum haengen. NACH dem Aufbau des Baums rufen, und
+// wieder, wenn Knoten dazukommen -- das Panel kennt ihre Zahl.
+fn wirt_bind(w: *mut Wirt) {
+    scene.scene_bind_panel(wsc(w), &(*w).pn)
+}
+
+fn wirt_set_animator(w: *mut Wirt, g: *mut anim.Animator) {
+    (*w).g = g as u64
+}
+
+fn wsc(w: *mut Wirt) -> *mut scene.Scene {
+    return (*w).sc as *mut scene.Scene
+}
+
+fn wctx(w: *mut Wirt) -> *mut render.Ctx {
+    return (*w).c as *mut render.Ctx
+}
+
+fn wirt_panel(w: *mut Wirt) -> *mut control.Panel {
+    return &(*w).pn
+}
+
+fn schmutzig(w: *mut Wirt, ch: u32) -> u32 {
+    if (ch & control.CH_REPAINT) != 0 as u32 {
+        (*w).dirty = true
+    }
+    return ch
+}
+
+// Etwas hat sich geaendert, was der Wirt nicht sehen kann (der Aufrufer
+// hat einen Wert gesetzt, das Theme gewechselt ...).
+fn wirt_touch(w: *mut Wirt) {
+    (*w).dirty = true
+}
+
+// ------------------------------------------------------------ der Zeiger
+
+fn wirt_pointer_move(w: *mut Wirt, x: f64, y: f64) -> u32 {
+    (*w).px = x
+    (*w).py = y
+    (*w).drin = true
+    if (*w).bar_node != scene.SCENE_NONE {
+        let v: *mut viewport.Viewport = scene.node_viewport(wsc(w),
+            (*w).bar_node)
+        if viewport.viewport_bar_drag(wctx(w), v, x, y) {
+            (*w).dirty = true
+            return control.CH_REPAINT | control.CH_VALUE
+        }
+        return control.CH_NONE
+    }
+    let vn: usize = scene.scene_viewport_at(wsc(w), x, y)
+    if vn != scene.SCENE_NONE {
+        (*w).kbd_node = vn
+    }
+    return schmutzig(w, control.mouse_move(&(*w).pn, x, y))
+}
+
+// Welcher Scheibenkasten hat unter (x, y) seinen ROLLBALKEN? Gefragt
+// wird jeder Kasten selbst (viewport_bar_hit): der Balken liegt am
+// Rand des Ausschnitts, und die Trefferpruefung des Baums rechnet ihn
+// nicht zum Inhalt.
+fn balken_unter(w: *mut Wirt, x: f64, y: f64) -> usize {
+    let sc: *mut scene.Scene = wsc(w)
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if scene.node_kind(sc, i) == scene.N_VIEWPORT {
+            let v: *mut viewport.Viewport = scene.node_viewport(sc, i)
+            if v as u64 != 0 as u64 {
+                if viewport.viewport_bar_hit(v, x, y) != viewport.VP_BAR_NONE {
+                    return i
+                }
+            }
+        }
+        i = i + 1
+    }
+    return scene.SCENE_NONE
+}
+
+// Das Rad: `nx`/`ny` Rasten (positiv = nach unten bzw. rechts).
+fn rad(w: *mut Wirt, x: f64, y: f64, nx: f64, ny: f64) -> u32 {
+    let vn: usize = scene.scene_viewport_at(wsc(w), x, y)
+    if vn == scene.SCENE_NONE {
+        return control.CH_NONE
+    }
+    (*w).kbd_node = vn
+    let v: *mut viewport.Viewport = scene.node_viewport(wsc(w), vn)
+    let schritt: f64 = render.len_of(wctx(w),
+        viewport.VP_WHEEL_STEP as usize)
+    let ox: f64 = viewport.viewport_off_x(v)
+    let oy: f64 = viewport.viewport_off_y(v)
+    viewport.viewport_scroll_by(v, nx * schritt, ny * schritt)
+    if viewport.viewport_off_x(v) != ox || viewport.viewport_off_y(v) != oy {
+        (*w).dirty = true
+        return control.CH_REPAINT | control.CH_VALUE
+    }
+    return control.CH_NONE
+}
+
+fn wirt_pointer_down(w: *mut Wirt, x: f64, y: f64, btn: u32) -> u32 {
+    (*w).px = x
+    (*w).py = y
+    if btn == BTN_WHEEL_UP {
+        return rad(w, x, y, 0.0, -1.0)
+    }
+    if btn == BTN_WHEEL_DOWN {
+        return rad(w, x, y, 0.0, 1.0)
+    }
+    if btn == BTN_WHEEL_LEFT {
+        return rad(w, x, y, -1.0, 0.0)
+    }
+    if btn == BTN_WHEEL_RIGHT {
+        return rad(w, x, y, 1.0, 0.0)
+    }
+    if btn != BTN_LEFT {
+        return control.CH_NONE
+    }
+    let bn: usize = balken_unter(w, x, y)
+    if bn != scene.SCENE_NONE {
+        let v: *mut viewport.Viewport = scene.node_viewport(wsc(w), bn)
+        (*w).kbd_node = bn
+        if viewport.viewport_bar_press(wctx(w), v, x, y) {
+            if viewport.viewport_bar_dragging(v) != viewport.VP_BAR_NONE {
+                (*w).bar_node = bn
+            }
+            (*w).dirty = true
+            return control.CH_REPAINT | control.CH_VALUE
+        }
+    }
+    return schmutzig(w, control.mouse_down(&(*w).pn, x, y))
+}
+
+fn wirt_pointer_up(w: *mut Wirt, x: f64, y: f64, btn: u32) -> u32 {
+    if btn != BTN_LEFT {
+        return control.CH_NONE
+    }
+    if (*w).bar_node != scene.SCENE_NONE {
+        let v: *mut viewport.Viewport = scene.node_viewport(wsc(w),
+            (*w).bar_node)
+        viewport.viewport_bar_release(v)
+        (*w).bar_node = scene.SCENE_NONE
+        (*w).dirty = true
+        return control.CH_REPAINT
+    }
+    // Wer gedrueckt war, steht NUR vor dem Loslassen im Panel.
+    let war: usize = control.panel_pressed(&(*w).pn)
+    let ch: u32 = control.mouse_up(&(*w).pn, x, y)
+    if (ch & control.CH_ACTIVATE) != 0 as u32 {
+        (*w).act = war
+    }
+    return schmutzig(w, ch)
+}
+
+fn wirt_pointer_leave(w: *mut Wirt) -> u32 {
+    (*w).drin = false
+    return schmutzig(w, control.mouse_leave(&(*w).pn))
+}
+
+// NACH EINEM NEUEN ANORDNEN. Wer gerollt hat, hat unter dem stehenden
+// Zeiger einen anderen Knoten; das Ueberfahren muss nachgezogen werden,
+// sonst leuchtet die Zeile, die weggerollt ist. Der Aufrufer ruft das
+// nach jedem `scene_layout`; aendert es etwas, wird noch einmal gemalt.
+fn wirt_after_layout(w: *mut Wirt) -> u32 {
+    if !(*w).drin || (*w).bar_node != scene.SCENE_NONE {
+        return control.CH_NONE
+    }
+    return schmutzig(w, control.mouse_move(&(*w).pn, (*w).px, (*w).py))
+}
+
+// ------------------------------------------------------------- die Tasten
+
+fn kbd_viewport(w: *mut Wirt) -> usize {
+    if (*w).kbd_node != scene.SCENE_NONE {
+        return (*w).kbd_node
+    }
+    let sc: *mut scene.Scene = wsc(w)
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if scene.node_kind(sc, i) == scene.N_VIEWPORT
+        && scene.node_viewport(sc, i) as u64 != 0 as u64 {
+            return i
+        }
+        i = i + 1
+    }
+    return scene.SCENE_NONE
+}
+
+fn wirt_kbd_viewport(w: *mut Wirt) -> usize {
+    return kbd_viewport(w)
+}
+
+fn ausloesen(w: *mut Wirt) -> u32 {
+    let f: usize = control.panel_focus(&(*w).pn)
+    let ch: u32 = control.activate_focused(&(*w).pn)
+    if (ch & control.CH_ACTIVATE) != 0 as u32 {
+        (*w).act = f
+    }
+    return schmutzig(w, ch)
+}
+
+fn wirt_key(w: *mut Wirt, key: u32, mods: u32) -> u32 {
+    if key == KEY_TAB {
+        return schmutzig(w, control.key_tab(&(*w).pn,
+            (mods & MOD_SHIFT) != 0 as u32))
+    }
+    if key == KEY_RETURN {
+        return ausloesen(w)
+    }
+    let vn: usize = kbd_viewport(w)
+    if vn == scene.SCENE_NONE {
+        return control.CH_NONE
+    }
+    let v: *mut viewport.Viewport = scene.node_viewport(wsc(w), vn)
+    let ox: f64 = viewport.viewport_off_x(v)
+    let oy: f64 = viewport.viewport_off_y(v)
+    // Ein Pfeilschritt ist eine Laenge aus dem Entwurf (VP_STEP) und geht
+    // durch len_of; Seite, Anfang und Ende haengen am Ausschnitt selbst
+    // und sind schon Bildpunkte -- die rechnet viewport_key.
+    let schritt: f64 = render.len_of(wctx(w), viewport.VP_STEP as usize)
+    if key == KEY_UP {
+        viewport.viewport_scroll_by(v, 0.0, 0.0 - schritt)
+    } else if key == KEY_DOWN {
+        viewport.viewport_scroll_by(v, 0.0, schritt)
+    } else if key == KEY_LEFT {
+        viewport.viewport_scroll_by(v, 0.0 - schritt, 0.0)
+    } else if key == KEY_RIGHT {
+        viewport.viewport_scroll_by(v, schritt, 0.0)
+    } else if key == KEY_PAGE_UP {
+        let b: bool = viewport.viewport_key(v, viewport.VP_PAGE_UP)
+    } else if key == KEY_PAGE_DOWN {
+        let b: bool = viewport.viewport_key(v, viewport.VP_PAGE_DOWN)
+    } else if key == KEY_HOME {
+        let b: bool = viewport.viewport_key(v, viewport.VP_HOME)
+    } else if key == KEY_END {
+        let b: bool = viewport.viewport_key(v, viewport.VP_END)
+    } else {
+        return control.CH_NONE
+    }
+    if viewport.viewport_off_x(v) != ox || viewport.viewport_off_y(v) != oy {
+        (*w).dirty = true
+        return control.CH_REPAINT | control.CH_VALUE
+    }
+    return control.CH_NONE
+}
+
+// Ein Zeichen. Die Leertaste loest das Widget im Fokus aus (wie die
+// Eingabetaste); alles andere wird nur gezaehlt (N1).
+fn wirt_char(w: *mut Wirt, cp: u32, mods: u32) -> u32 {
+    (*w).chars = (*w).chars + 1
+    if cp == 32 as u32 && (mods & MOD_CTRL) == 0 as u32 {
+        return ausloesen(w)
+    }
+    return control.CH_NONE
+}
+
+// Wer hat den Fokus? KEINER = niemand.
+fn wirt_focus(w: *mut Wirt) -> usize {
+    let f: usize = control.panel_focus(&(*w).pn)
+    if f == control.NOBODY {
+        return KEINER
+    }
+    return f
+}
+
+fn wirt_chars(w: *mut Wirt) -> u64 {
+    return (*w).chars
+}
+
+// Welcher Knoten wurde seit dem letzten Abholen ausgeloest?
+// scene.SCENE_NONE = keiner. Das Panel haengt ab Knoten 0 an den
+// Knoten des Baums, also IST die Nummer im Panel die Knotennummer.
+fn wirt_take_activated(w: *mut Wirt) -> usize {
+    let a: usize = (*w).act
+    (*w).act = scene.SCENE_NONE
+    return a
+}
+
+// ------------------------------------------------- Fenster und Massstab
+
+fn wirt_resize(w: *mut Wirt) {
+    (*w).dirty = true
+}
+
+fn wirt_expose(w: *mut Wirt) {
+    (*w).dirty = true
+}
+
+// W4: der Massstab in Promille (1000 = 96 dpi), EINMAL ins Theme.
+fn wirt_set_scale(w: *mut Wirt, m: *mut theme.Theme, promille: usize) {
+    if theme.theme_scale(m) != promille {
+        theme.theme_set_scale(m, promille)
+        (*w).dirty = true
+    }
+}
+
+// ------------------------------------------------------------- der Takt
+
+// Die Animationen und das Auslaufen der Scheibenkaesten auf `ms` stellen.
+// Schmutzig wird es nur, wenn der Takt WIRKLICH etwas bewegt hat.
+fn wirt_tick(w: *mut Wirt, ms: i64) {
+    if (*w).g != 0 {
+        let g: *mut anim.Animator = (*w).g as *mut anim.Animator
+        let b: bool = anim.anim_tick(g, ms)
+        if anim.animator_dirty(g) {
+            (*w).dirty = true
+        }
+    }
+    let sc: *mut scene.Scene = wsc(w)
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if scene.node_kind(sc, i) == scene.N_VIEWPORT {
+            let v: *mut viewport.Viewport = scene.node_viewport(sc, i)
+            if v as u64 != 0 as u64 {
+                if viewport.viewport_tick(v, ms) {
+                    (*w).dirty = true
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn laeuft_etwas(w: *mut Wirt) -> bool {
+    if (*w).g != 0 {
+        let g: *mut anim.Animator = (*w).g as *mut anim.Animator
+        var i: usize = 0
+        while i < anim.animator_count(g) {
+            if anim.anim_active(anim.animator_at(g, i)) {
+                return true
+            }
+            i = i + 1
+        }
+    }
+    let sc: *mut scene.Scene = wsc(w)
+    var k: usize = 0
+    while k < scene.scene_count(sc) {
+        if scene.node_kind(sc, k) == scene.N_VIEWPORT {
+            let v: *mut viewport.Viewport = scene.node_viewport(sc, k)
+            if v as u64 != 0 as u64 {
+                if viewport.viewport_moving(v) {
+                    return true
+                }
+            }
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// W5: wie lange darf die Schleife schlafen?
+fn wirt_wait_ms(w: *mut Wirt) -> i64 {
+    if (*w).dirty {
+        return 0
+    }
+    if laeuft_etwas(w) {
+        return FRAME_MS
+    }
+    return WAIT_FOREVER
+}
+
+fn wirt_dirty(w: *mut Wirt) -> bool {
+    return (*w).dirty
+}
+
+// Der Aufrufer hat gemalt.
+fn wirt_painted(w: *mut Wirt) {
+    (*w).dirty = false
+    (*w).frames = (*w).frames + 1
+}
+
+fn wirt_frames(w: *mut Wirt) -> u64 {
+    return (*w).frames
+}
+
+// ========================================================= DAS BILDFORMAT
+//
+// Die Leinwand (lib/paint/canvas.fi) haelt je Punkt R, G, B, A im
+// Speicher (vormultipliziert). Ein X-Server mit 24-Bit-TrueColor und
+// eine Windows-DIB wollen B, G, R, X (lib/window/window.fi, F3). Also
+// werden R und B getauscht und das vierte Oktett auf 0 gesetzt. Der
+// Grund des Fensters ist deckend, damit ist "vormultipliziert" hier
+// dasselbe wie "gerade".
+//
+// In Certus war das nur eine Maske (`window.to_bgrx`), weil Certus
+// schon in BGRX malt; fUi malt in RGBA -- die Vertauschung steht darum
+// hier, einmal, mit ihrer Begruendung, und x11_main prueft sie Oktett
+// fuer Oktett.
+fn rgba_to_bgrx(src: u64, dst: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let o: u64 = (i * 4) as u64
+        let r: u8 = *((src + o) as *mut u8)
+        let g: u8 = *((src + o + 1) as *mut u8)
+        let b: u8 = *((src + o + 2) as *mut u8)
+        *((dst + o) as *mut u8) = b
+        *((dst + o + 1) as *mut u8) = g
+        *((dst + o + 2) as *mut u8) = r
+        *((dst + o + 3) as *mut u8) = 0 as u8
+        i = i + 1
+    }
+}

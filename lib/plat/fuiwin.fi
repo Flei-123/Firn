@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/fuiwin.fi -- DIE FENSTERSCHLEIFE: lib/window + fUi.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// lib/window/window.fi kann ein Fenster aufmachen, ein fertiges Bild
+// hineinschieben und Ereignisse herausgeben -- auf X11, Windows,
+// Android und OSUM, je nachdem, welche Rueckwand neben der Wurzeldatei
+// als window/backend.fi liegt. lib/plat/fuiwirt.fi weiss, was ein
+// Ereignis fuer fUi bedeutet. Diese Datei ist das Stueck dazwischen, und
+// sie ist mit Absicht KLEIN:
+//
+//   * EINE WEICHE: jedes EV_* geht an genau eine Funktion des Wirts;
+//     jede Taste mit Bedeutung (window.K_*) wird eine Taste des Wirts.
+//     Welche Taste Escape ist, weiss die Rueckwand (unter X11 aus dem
+//     Keysym, siehe lib/window/x11.fi F1) -- hier steht keine Tabelle.
+//   * DIE LEINWAND: ein canvas.Canvas in Fenstergroesse und ein Painter
+//     darauf. Aendert sich die Groesse (EV_CONFIGURE), werden beide NEU
+//     angelegt und nicht gestreckt -- sonst waere das Bild unscharf.
+//   * DIE SCHLEIFE: warten, solange der Wirt es erlaubt
+//     (`wirt_wait_ms`: -1 = bis ein Ereignis kommt), alle Ereignisse
+//     abholen, den Takt stellen, und NUR wenn der Wirt schmutzig ist:
+//     malen lassen, RGBA -> BGRX, ein PutImage, fertig. Im Leerlauf
+//     steht das Programm in `poll` und verbraucht nichts.
+//   * DER MASSSTAB: `window.uiscale` (aus Xft.dpi bzw. den Millimetern
+//     des Schirms, lib/window/x11.fi L4) geht ueber `wirt_set_scale`
+//     ins Theme -- beim Aufmachen und nach jedem EV_CONFIGURE, denn ein
+//     Fenster kann auf einen anderen Schirm wandern.
+//
+// DIESE DATEI GEHOERT NICHT NACH lib/fui. fUi bleibt ohne Fenster
+// uebersetzbar; wer fUi in einem Fenster will, nimmt lib/plat.
+import std.rt
+import paint.canvas
+import fui.painter
+import fui.theme
+import window.window
+import plat.fuiwirt
+
+export {
+    Fenster, fenster_new, fenster_open, fenster_run, fenster_close,
+    fenster_canvas, fenster_painter, fenster_w, fenster_h,
+    fenster_window, fenster_set_font, fenster_protokoll, fenster_full,
+    fenster_bilder, jetzt_ms,
+}
+
+struct Fenster {
+    f: window.Window,
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    fm: u64,
+    bgrx: u64,
+    cap: usize,
+    w: usize,
+    h: usize,
+    // Liefert die Rueckwand Loslassen/Hinein/Hinaus (window.full_input)?
+    voll: bool,
+    // Eine Zeile je Ereignis und je Bild auf fd 1 -- fuer den Abnahmelauf.
+    log: bool,
+    bilder: u64,
+    offen: bool,
+    // Escape beendet (die Demo will das; ein Programm mit Dialogen nicht).
+    esc_zu: bool,
+}
+
+fn fenster_new() -> Fenster {
+    return Fenster { f: window.window_new(), cv: canvas.canvas_new(),
+        z: painter.painter_new(), fm: 0, bgrx: 0, cap: 0, w: 0, h: 0,
+        voll: false, log: false, bilder: 0, offen: false, esc_zu: true }
+}
+
+fn fenster_canvas(fx: *mut Fenster) -> *mut canvas.Canvas { return &(*fx).cv }
+fn fenster_painter(fx: *mut Fenster) -> *mut painter.Painter { return &(*fx).z }
+fn fenster_w(fx: *mut Fenster) -> usize { return (*fx).w }
+fn fenster_h(fx: *mut Fenster) -> usize { return (*fx).h }
+fn fenster_window(fx: *mut Fenster) -> *mut window.Window { return &(*fx).f }
+fn fenster_full(fx: *mut Fenster) -> bool { return (*fx).voll }
+fn fenster_bilder(fx: *mut Fenster) -> u64 { return (*fx).bilder }
+
+fn fenster_set_font(fx: *mut Fenster, fm: u64) {
+    (*fx).fm = fm
+    painter.painter_set_font(&(*fx).z, fm)
+}
+
+fn fenster_protokoll(fx: *mut Fenster, an: bool) {
+    (*fx).log = an
+}
+
+// Die Uhr, gegen die die Animationen laufen: CLOCK_MONOTONIC in ms.
+fn jetzt_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+// Leinwand, Painter und BGRX-Puffer fuer `w` x `h` -- neu, nicht gestreckt.
+fn flaechen(fx: *mut Fenster, w: usize, h: usize) -> bool {
+    if (*fx).cap > 0 {
+        painter.painter_free(&(*fx).z)
+        canvas.canvas_free(&(*fx).cv)
+        rt.heap_free((*fx).bgrx, (*fx).cap)
+        (*fx).cap = 0
+    }
+    if !canvas.canvas_init(&(*fx).cv, w, h) {
+        return false
+    }
+    if !painter.painter_init(&(*fx).z, &(*fx).cv, w, h) {
+        return false
+    }
+    painter.painter_set_font(&(*fx).z, (*fx).fm)
+    (*fx).bgrx = rt.heap_alloc(w * h * 4)
+    if (*fx).bgrx == 0 {
+        return false
+    }
+    (*fx).cap = w * h * 4
+    (*fx).w = w
+    (*fx).h = h
+    return true
+}
+
+// AUFMACHEN. `bw`/`bh` sind ENTWURFSPUNKTE: die Startgroesse wird wie
+// jede andere Laenge ueber das Theme umgerechnet, nachdem der Massstab
+// des Schirms bekannt ist. `anzeige` 0 = $DISPLAY.
+fn fenster_open(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
+    anzeige: usize, bw: usize, bh: usize, titel: u64, tn: usize) -> bool {
+    if !window.open_window(&(*fx).f, anzeige) {
+        return false
+    }
+    fuiwirt.wirt_set_scale(w, m, window.uiscale(&(*fx).f))
+    let pw: usize = theme.theme_px(m, bw)
+    let ph: usize = theme.theme_px(m, bh)
+    // Loslassen, Hinein, Hinaus -- VOR dem Fenster bestellen.
+    (*fx).voll = window.full_input(&(*fx).f, true)
+    if !window.make(&(*fx).f, pw, ph) {
+        return false
+    }
+    let t: bool = window.title(&(*fx).f, titel, tn)
+    if !flaechen(fx, window.width(&(*fx).f), window.height(&(*fx).f)) {
+        return false
+    }
+    if !window.show_window(&(*fx).f) {
+        return false
+    }
+    (*fx).offen = true
+    return true
+}
+
+fn fenster_close(fx: *mut Fenster) {
+    if (*fx).cap > 0 {
+        painter.painter_free(&(*fx).z)
+        canvas.canvas_free(&(*fx).cv)
+        rt.heap_free((*fx).bgrx, (*fx).cap)
+        (*fx).cap = 0
+    }
+    window.close_window(&(*fx).f)
+    (*fx).offen = false
+}
+
+fn zeile(fx: *mut Fenster, was: u64, wn: usize, a: i64, b: i64, c: i64,
+    d: i64) {
+    if !(*fx).log {
+        return
+    }
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, was, wn)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, a)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, c)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, d)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Taste des Fenstersystems -> Taste des Wirts; 0 = keine fuer ihn.
+fn taste(k: u32) -> u32 {
+    if k == window.K_TAB { return fuiwirt.KEY_TAB }
+    if k == window.K_RETURN { return fuiwirt.KEY_RETURN }
+    if k == window.K_UP { return fuiwirt.KEY_UP }
+    if k == window.K_DOWN { return fuiwirt.KEY_DOWN }
+    if k == window.K_LEFT { return fuiwirt.KEY_LEFT }
+    if k == window.K_RIGHT { return fuiwirt.KEY_RIGHT }
+    if k == window.K_PAGEUP { return fuiwirt.KEY_PAGE_UP }
+    if k == window.K_PAGEDOWN { return fuiwirt.KEY_PAGE_DOWN }
+    if k == window.K_HOME { return fuiwirt.KEY_HOME }
+    if k == window.K_END { return fuiwirt.KEY_END }
+    return 0 as u32
+}
+
+// EIN EREIGNIS -> DER WIRT. false = das Fenster ist zu.
+fn weiche(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
+    k: u32) -> bool {
+    let f: *mut window.Window = &(*fx).f
+    let a: u32 = window.ev_a(f)
+    let x: f64 = window.ev_x(f) as f64
+    let y: f64 = window.ev_y(f) as f64
+    let s: u32 = window.ev_state(f)
+    var nm: [u8; 8] = "ereignis"
+    zeile(fx, (&nm[0]) as u64, 8, k as i64, a as i64, x as i64, y as i64)
+    if k == window.EV_CLOSED {
+        return false
+    }
+    if k == window.EV_EXPOSE {
+        fuiwirt.wirt_expose(w)
+    } else if k == window.EV_CONFIGURE {
+        let nw: usize = window.width(f)
+        let nh: usize = window.height(f)
+        if nw != (*fx).w || nh != (*fx).h {
+            if !flaechen(fx, nw, nh) {
+                return false
+            }
+        }
+        // Ein anderer Schirm kann eine andere Dichte haben.
+        fuiwirt.wirt_set_scale(w, m, window.uiscale(f))
+        fuiwirt.wirt_resize(w)
+    } else if k == window.EV_MOTION || k == window.EV_ENTER {
+        let c: u32 = fuiwirt.wirt_pointer_move(w, x, y)
+    } else if k == window.EV_LEAVE {
+        let c: u32 = fuiwirt.wirt_pointer_leave(w)
+    } else if k == window.EV_BUTTON {
+        let c: u32 = fuiwirt.wirt_pointer_down(w, x, y, a)
+        // Ohne Loslassen von der Rueckwand ist ein Klick das Druecken
+        // allein -- ehrlich schlechter, aber bedienbar.
+        if !(*fx).voll && a == fuiwirt.BTN_LEFT {
+            let c2: u32 = fuiwirt.wirt_pointer_up(w, x, y, a)
+        }
+    } else if k == window.EV_RELEASE {
+        let c: u32 = fuiwirt.wirt_pointer_up(w, x, y, a)
+    } else if k == window.EV_KEY {
+        if a == window.K_ESCAPE && (*fx).esc_zu {
+            return false
+        }
+        let t: u32 = taste(a)
+        if t != 0 as u32 {
+            let c: u32 = fuiwirt.wirt_key(w, t, s)
+        }
+    } else if k == window.EV_CHAR {
+        let c: u32 = fuiwirt.wirt_char(w, a, s)
+    } else if k == window.EV_THEME {
+        theme.theme_set_dark(m, window.dark(f))
+        fuiwirt.wirt_touch(w)
+    }
+    return true
+}
+
+// DIE SCHLEIFE. `male(ud, fx)` malt die Seite in `fenster_canvas(fx)`
+// (Groesse fenster_w/h); `aktion(ud, fx, knoten)` erfaehrt, welcher
+// Knoten ausgeloest wurde. Kehrt zurueck, wenn das Fenster zu ist.
+fn fenster_run(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
+    male: fn(u64, *mut Fenster), aktion: fn(u64, *mut Fenster, usize),
+    ud: u64) {
+    let f: *mut window.Window = &(*fx).f
+    var laeuft: bool = true
+    while laeuft {
+        let ms: i64 = fuiwirt.wirt_wait_ms(w)
+        // Im Protokoll: wie lange die Schleife jetzt schlafen WILL (-1 =
+        // bis ein Ereignis kommt). Das ist der Beleg fuer den Leerlauf.
+        var dn: [u8; 5] = "warte"
+        zeile(fx, (&dn[0]) as u64, 5, ms, jetzt_ms(), 0, 0)
+        if ms != 0 {
+            let da: bool = window.wait_event(f, ms)
+        }
+        var k: u32 = window.next_event(f)
+        while k != window.EV_NONE && laeuft {
+            if !weiche(fx, w, m, k) {
+                laeuft = false
+            } else {
+                k = window.next_event(f)
+            }
+        }
+        if !laeuft {
+            break
+        }
+        let akt: usize = fuiwirt.wirt_take_activated(w)
+        if akt != fuiwirt.KEINER {
+            aktion(ud, fx, akt)
+        }
+        fuiwirt.wirt_tick(w, jetzt_ms())
+        if fuiwirt.wirt_dirty(w) {
+            let q0: i64 = jetzt_ms()
+            male(ud, fx)
+            let q1: i64 = jetzt_ms()
+            fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64,
+                (*fx).bgrx, (*fx).w * (*fx).h)
+            let q2: i64 = jetzt_ms()
+            let ok: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
+            let ok2: bool = window.present(f)
+            let q3: i64 = jetzt_ms()
+            // Wo die Zeit eines Bildes bleibt: fUi malen, RGBA->BGRX,
+            // PutImage -- in ms. Gemessen, damit niemand die Plattform
+            // verdaechtigt, wenn der Rasterer langsam ist (und umgekehrt).
+            var tn: [u8; 4] = "zeit"
+            zeile(fx, (&tn[0]) as u64, 4, q1 - q0, q2 - q1, q3 - q2, 0)
+            fuiwirt.wirt_painted(w)
+            (*fx).bilder = (*fx).bilder + 1
+            var nm: [u8; 4] = "bild"
+            zeile(fx, (&nm[0]) as u64, 4, (*fx).bilder as i64,
+                (*fx).w as i64, (*fx).h as i64,
+                theme.theme_scale(m) as i64)
+            // Nach dem Anordnen kann unter dem stehenden Zeiger ein
+            // anderer Knoten liegen (gerollt) -- das zieht der Wirt nach,
+            // und dann wird noch einmal gemalt.
+            let c: u32 = fuiwirt.wirt_after_layout(w)
+        }
+        if !window.is_open(f) {
+            laeuft = false
+        }
+    }
+}

@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: MPL-2.0
+// demos/x11demo/main.fi -- DIE BESCHRIEBENE SEITE IN EINEM ECHTEN FENSTER.
+//
+// ===================================================== WARUM ES DAS GIBT
+//
+// demos/fuidemo malt eine Oberflaeche in ein PNG; tools/fui/gallery9_main.fi
+// beschreibt eine ganze Seite (Werkzeugleiste, Scheibenkasten mit 28
+// Zeilen, Karten mit Schaltern) und belegt sie an einem Bild. Beides ist
+// ein BILD. Diese Demo ist dieselbe Seite als PROGRAMM: ein Fenster auf
+// einem X-Server, mit Maus und Tastatur bedienbar, in der Groesse
+// aenderbar, sauber zu schliessen -- und bei Massstab 2 doppelt so gross
+// gerechnet, nicht gestreckt.
+//
+// DIE SEITE WIRD NICHT NACHGEBAUT. `gallery9_main.fi` neben dieser Datei
+// ist ein Verweis auf tools/fui/gallery9_main.fi; Stilblatt
+// (`baue_blatt`), Baum (`baue_baum`) und Texte kommen von dort, Aufruf
+// fuer Aufruf dieselben. Was hier dazukommt, ist nur, was ein Fenster
+// braucht: die Groesse aus dem Fenster statt aus einer Konstanten, die
+// Inhaltshoehe der Liste GEMESSEN statt hingeschrieben (sie haengt am
+// Massstab), und eine Aktion fuer den Knopf "Starten": der
+// Fortschrittsbalken laeuft 1,2 s hoch. Das ist die eine Animation, an
+// der man sieht, dass die Schleife nur Bilder macht, solange etwas
+// laeuft -- vorher und nachher steht sie in `poll`.
+//
+// ======================================================== WIE ES BAUT
+//
+// `import window.window` holt lib/window/window.fi, und das holt
+// `window.backend` NEBEN DER WURZELDATEI: demos/x11demo/window/backend.fi
+// ist ein Verweis auf lib/window/x11.fi. Wer dieselbe Demo fuer Windows
+// baut, legt den Verweis auf lib/window/win32.fi -- an dieser Datei
+// aendert sich nichts.
+//
+//     firnc -o x11demo demos/x11demo/main.fi
+//     x11demo [--protokoll] [--dpi=N] [--hell] [--anzeige=N]
+//
+// --protokoll: eine Zeile je Ereignis, je Bild und je Zustand auf fd 1
+// (fuer tools/fui/x11live.sh). --dpi=N: die Dichte von Hand (sonst
+// Xft.dpi bzw. die Millimeter des Schirms). Escape oder der
+// Schliessknopf des Fenstermanagers beenden.
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.scene
+import fui.sheet
+import fui.viewport
+import fui.anim
+import window.window
+import plat.fuiwirt
+import plat.fuiwin
+import gallery9_main
+
+const FONTSET_BYTES: usize = 4096
+const FORTSCHRITT_MS: i64 = 1200
+
+// Alles, was die Seite braucht, an EINER Stelle -- Kontext und Wirt
+// zeigen hinein, also bleibt es liegen, wo es angelegt wurde.
+struct App {
+    sc: scene.Scene,
+    v: viewport.Viewport,
+    sh: sheet.Sheet,
+    m: theme.Theme,
+    c: render.Ctx,
+    w: fuiwirt.Wirt,
+    g: anim.Animator,
+    kasten: usize,
+    starten: usize,
+    fortschritt: usize,
+    schalter: usize,
+    kaestchen: usize,
+    texte: u64,
+    feld: u64,
+    k_leiste: u32,
+    k_titel: u32,
+    k_karte: u32,
+    k_ueber: u32,
+    k_notiz: u32,
+    k_liste: u32,
+    k_zeile: u32,
+    k_gerade: u32,
+    k_akzent: u32,
+    log: bool,
+    // Bei welchem Massstab der Baum gebaut wurde. Wandert das Fenster
+    // auf einen Schirm mit anderer Dichte, wird neu gebaut: die Breite
+    // des Scheibenkastens ist eine Laenge des Aufrufers.
+    skala: usize,
+    // Fuer welche Fenstergroesse die Knoten zuletzt gemeldet wurden.
+    gemeldet_w: usize,
+    gemeldet_h: usize,
+}
+
+fn px(m: *mut theme.Theme, n: f64) -> f64 {
+    return theme.theme_px(m, (n + 0.5) as usize) as f64
+}
+
+// Der Baum aus gallery9, mit einem Scheibenkasten, dessen Masse ueber
+// das Theme gehen (Breite, Balken, Polster -- Entwurfspunkte).
+fn baue(app: *mut App) {
+    let m: *mut theme.Theme = &(*app).m
+    let oy: f64 = viewport.viewport_off_y(&(*app).v)
+    (*app).v = viewport.viewport_new(0.0, 0.0, px(m, gallery9_main.LISTE_W),
+        px(m, 400.0), px(m, gallery9_main.INHALT_W),
+        px(m, gallery9_main.INHALT_H))
+    viewport.viewport_set_bar(&(*app).v, theme.theme_px(m,
+        gallery9_main.BALKEN))
+    viewport.viewport_set_inset(&(*app).v, px(m, gallery9_main.POLSTER))
+    (*app).sh = sheet.sheet_new()
+    let spurfarbe: u32 = theme.color_from_token(m, style.TOK_SURFACE)
+    let grund_liste: u32 = theme.mix(spurfarbe,
+        theme.color_from_token(m, style.TOK_TEXT), 500)
+    gallery9_main.baue_blatt(&(*app).sh, (*app).k_leiste, (*app).k_titel,
+        (*app).k_karte, (*app).k_ueber, (*app).k_notiz, (*app).k_liste,
+        (*app).k_zeile, (*app).k_gerade, (*app).k_akzent,
+        style.color_literal(grund_liste))
+    (*app).sc = scene.scene_new()
+    (*app).kasten = gallery9_main.baue_baum(&(*app).sc, &(*app).v,
+        (*app).feld, (*app).k_leiste, (*app).k_titel, (*app).k_karte,
+        (*app).k_ueber, (*app).k_notiz, (*app).k_liste, (*app).k_zeile,
+        (*app).k_gerade, (*app).k_akzent, (*app).texte)
+    let sc: *mut scene.Scene = &(*app).sc
+    let wurzel: usize = scene.scene_root(sc)
+    let leiste: usize = scene.scene_child_at(sc, wurzel, 1)
+    let rumpf: usize = scene.scene_child_at(sc, wurzel, 2)
+    let rechts: usize = scene.scene_child_at(sc, rumpf, 1)
+    let karte2: usize = scene.scene_child_at(sc, rechts, 1)
+    (*app).starten = scene.scene_child_at(sc, leiste, 4)
+    (*app).kaestchen = scene.scene_child_at(sc, karte2, 1)
+    (*app).schalter = scene.scene_child_at(sc, karte2, 2)
+    (*app).fortschritt = scene.scene_child_at(sc, karte2, 5)
+    (*app).skala = theme.theme_scale(m)
+    fuiwirt.wirt_bind(&(*app).w)
+}
+
+// Anordnen in die Fenstergroesse, die Hoehe der Liste GEMESSEN (letzte
+// Zeile unten minus erste oben plus zweimal Innenrand), und wenn sie
+// sich geaendert hat, noch einmal anordnen -- danach passt der
+// Rollbalken zum Massstab.
+fn ordne(app: *mut App, bw: usize, bh: usize) {
+    let sc: *mut scene.Scene = &(*app).sc
+    scene.scene_style(sc, &(*app).sh)
+    scene.scene_measure(sc, &(*app).c)
+    scene.scene_layout(sc, &(*app).c, 0.0, 0.0, bw as f64, bh as f64)
+    let k: usize = (*app).kasten
+    let n: usize = scene.scene_child_count(sc, k)
+    let erste: usize = scene.scene_child_at(sc, k, 0)
+    let letzte: usize = scene.scene_child_at(sc, k, n - 1)
+    let pad: f64 = theme.theme_px(&(*app).m, 8) as f64
+    let h: f64 = scene.node_y(sc, letzte) + scene.node_h(sc, letzte)
+    - scene.node_y(sc, erste) + 2.0 * pad
+    if h != viewport.viewport_content_h(&(*app).v) {
+        viewport.viewport_set_content(&(*app).v,
+            px(&(*app).m, gallery9_main.INHALT_W), h)
+        scene.scene_layout(sc, &(*app).c, 0.0, 0.0, bw as f64, bh as f64)
+    }
+}
+
+// Eine Zeile Zustand fuer den Abnahmelauf: Bild, Rollstand, Schalter,
+// Kaestchen, Fortschritt, Fokus, Massstab.
+fn zustand(app: *mut App, fx: *mut fuiwin.Fenster) {
+    if !(*app).log {
+        return
+    }
+    let sc: *mut scene.Scene = &(*app).sc
+    var t: rt.Buf = rt.buf_new()
+    var z: [u8; 8] = "zustand "
+    rt.buf_push_bytes(&t, (&z[0]) as u64, 8)
+    rt.buf_push_dec_i64(&t, (fuiwin.fenster_bilder(fx) + 1) as i64)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, viewport.viewport_off_y(&(*app).v) as i64)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, widget.w_value(scene.node_widget(sc,
+        (*app).schalter)))
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, widget.w_value(scene.node_widget(sc,
+        (*app).kaestchen)))
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, widget.w_value(scene.node_widget(sc,
+        (*app).fortschritt)))
+    rt.buf_push(&t, 32 as u8)
+    let fk: usize = fuiwirt.wirt_focus(&(*app).w)
+    if fk == fuiwirt.KEINER {
+        rt.buf_push_dec_i64(&t, -1)
+    } else {
+        rt.buf_push_dec_i64(&t, fk as i64)
+    }
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, theme.theme_scale(&(*app).m) as i64)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn knoten_zeile(app: *mut App, name: u64, nn: usize, i: usize) {
+    let sc: *mut scene.Scene = &(*app).sc
+    var t: rt.Buf = rt.buf_new()
+    var z: [u8; 7] = "knoten "
+    rt.buf_push_bytes(&t, (&z[0]) as u64, 7)
+    rt.buf_push_bytes(&t, name, nn)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, scene.node_x(sc, i) as i64)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, scene.node_y(sc, i) as i64)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, scene.node_w(sc, i) as i64)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, scene.node_h(sc, i) as i64)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Wo die Bedienelemente stehen -- einmal je Fenstergroesse, damit der
+// Abnahmelauf (tools/fui/x11live.py) mit xdotool genau dorthin klickt,
+// statt Koordinaten zu raten.
+fn knoten_melden(app: *mut App, bw: usize, bh: usize) {
+    if !(*app).log || (bw == (*app).gemeldet_w && bh == (*app).gemeldet_h) {
+        return
+    }
+    (*app).gemeldet_w = bw
+    (*app).gemeldet_h = bh
+    var n1: [u8; 8] = "schalter"
+    var n2: [u8; 9] = "kaestchen"
+    var n3: [u8; 7] = "starten"
+    var n4: [u8; 5] = "liste"
+    var n5: [u8; 11] = "fortschritt"
+    knoten_zeile(app, (&n1[0]) as u64, 8, (*app).schalter)
+    knoten_zeile(app, (&n2[0]) as u64, 9, (*app).kaestchen)
+    knoten_zeile(app, (&n3[0]) as u64, 7, (*app).starten)
+    knoten_zeile(app, (&n4[0]) as u64, 5, (*app).kasten)
+    knoten_zeile(app, (&n5[0]) as u64, 11, (*app).fortschritt)
+}
+
+fn male(ud: u64, fx: *mut fuiwin.Fenster) {
+    let app: *mut App = ud as *mut App
+    if theme.theme_scale(&(*app).m) != (*app).skala {
+        baue(app)
+    }
+    let cv: *mut canvas.Canvas = fuiwin.fenster_canvas(fx)
+    // Der Fortschritt steht im Tween, solange es einen gibt.
+    if anim.animator_count(&(*app).g) > 0 {
+        let a: *mut anim.Animation = anim.animator_at(&(*app).g, 0)
+        let wert: f64 = anim.anim_value(a, fuiwin.jetzt_ms())
+        widget.w_set_value(scene.node_widget(&(*app).sc, (*app).fortschritt),
+            wert as i64)
+    }
+    let f: *mut theme.Colors = theme.theme_colors(&(*app).m)
+    canvas.canvas_clear(cv, theme.opaque((*f).base))
+    ordne(app, fuiwin.fenster_w(fx), fuiwin.fenster_h(fx))
+    scene.scene_draw(&(*app).sc, &(*app).c)
+    knoten_melden(app, fuiwin.fenster_w(fx), fuiwin.fenster_h(fx))
+    zustand(app, fx)
+}
+
+fn aktion(ud: u64, fx: *mut fuiwin.Fenster, knoten: usize) {
+    let app: *mut App = ud as *mut App
+    if knoten == (*app).starten {
+        anim.animator_clear(&(*app).g)
+        let i: usize = anim.animator_add(&(*app).g, anim.anim_new(
+            fuiwin.jetzt_ms(), FORTSCHRITT_MS, 0.0, 1000.0,
+            anim.easing_named(anim.EASE_OUT)))
+        fuiwirt.wirt_touch(&(*app).w)
+    }
+}
+
+fn zahl_nach(p: u64, ab: usize) -> usize {
+    var v: usize = 0
+    var i: usize = ab
+    while rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 + (rt.ld8(p, i) - 48 as u8) as usize
+        i = i + 1
+    }
+    return v
+}
+
+fn beginnt(p: u64, lit: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != rt.ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main(start: u64) -> i32 {
+    var log: bool = false
+    var dpi: usize = 0
+    var hell: bool = false
+    var anzeige: usize = 0
+    var o_log: [u8; 11] = "--protokoll"
+    var o_dpi: [u8; 6] = "--dpi="
+    var o_hell: [u8; 6] = "--hell"
+    var o_anz: [u8; 10] = "--anzeige="
+    var i: usize = 1
+    while i < rt.arg_count(start) {
+        let a: u64 = rt.arg_ptr(start, i)
+        if beginnt(a, (&o_log[0]) as u64, 11) {
+            log = true
+        } else if beginnt(a, (&o_dpi[0]) as u64, 6) {
+            dpi = zahl_nach(a, 6)
+        } else if beginnt(a, (&o_hell[0]) as u64, 6) {
+            hell = true
+        } else if beginnt(a, (&o_anz[0]) as u64, 10) {
+            anzeige = zahl_nach(a, 10)
+        }
+        i = i + 1
+    }
+
+    // Die Schrift: DejaVu wie in der Galerie. Ohne Schrift keine Seite.
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let have: bool = rt.read_file((&f1[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+    rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !have || !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        var ks: [u8; 32] = "x11demo: keine Schrift (DejaVu)\n"
+        rt.write_everything(2, (&ks[0]) as u64, 32)
+        return 9
+    }
+
+    var fx: fuiwin.Fenster = fuiwin.fenster_new()
+    fuiwin.fenster_set_font(&fx, fsp as u64)
+    fuiwin.fenster_protokoll(&fx, log)
+    if dpi > 0 {
+        window.set_dpi(fuiwin.fenster_window(&fx), dpi)
+    }
+    // Die App liegt in DIESEM Rahmen und bewegt sich nicht mehr: Kontext
+    // und Wirt zeigen hinein. Darum werden beide erst gesetzt, wenn sie
+    // an ihrem Platz steht.
+    var app: App = App { sc: scene.scene_new(),
+        v: viewport.viewport_new(0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
+        sh: sheet.sheet_new(), m: theme.theme_new(!hell),
+        c: render.ctx_new((0 as u64) as *mut theme.Theme,
+            (0 as u64) as *mut painter.Painter),
+        w: fuiwirt.wirt_new((0 as u64) as *mut scene.Scene,
+            (0 as u64) as *mut render.Ctx),
+        g: anim.animator_new(), kasten: 0, starten: 0, fortschritt: 0,
+        schalter: 0, kaestchen: 0, texte: rt.heap_alloc(640),
+        feld: rt.heap_alloc(gallery9_main.ZEILEN * gallery9_main.SCHRITT),
+        k_leiste: 0, k_titel: 0, k_karte: 0, k_ueber: 0, k_notiz: 0,
+        k_liste: 0, k_zeile: 0, k_gerade: 0, k_akzent: 0, log: log,
+        skala: 0, gemeldet_w: 0, gemeldet_h: 0 }
+    app.c = render.ctx_new(&app.m, fuiwin.fenster_painter(&fx))
+    app.w = fuiwirt.wirt_new(&app.sc, &app.c)
+    var nleiste: [u8; 6] = "leiste"
+    var ntitel: [u8; 5] = "titel"
+    var nkarte: [u8; 5] = "karte"
+    var nueber: [u8; 5] = "ueber"
+    var nnotiz: [u8; 5] = "notiz"
+    var nliste: [u8; 5] = "liste"
+    var nzeile: [u8; 5] = "zeile"
+    var ngerade: [u8; 6] = "gerade"
+    var nakzent: [u8; 6] = "akzent"
+    app.k_leiste = sheet.sheet_name((&nleiste[0]) as u64, 6)
+    app.k_titel = sheet.sheet_name((&ntitel[0]) as u64, 5)
+    app.k_karte = sheet.sheet_name((&nkarte[0]) as u64, 5)
+    app.k_ueber = sheet.sheet_name((&nueber[0]) as u64, 5)
+    app.k_notiz = sheet.sheet_name((&nnotiz[0]) as u64, 5)
+    app.k_liste = sheet.sheet_name((&nliste[0]) as u64, 5)
+    app.k_zeile = sheet.sheet_name((&nzeile[0]) as u64, 5)
+    app.k_gerade = sheet.sheet_name((&ngerade[0]) as u64, 6)
+    app.k_akzent = sheet.sheet_name((&nakzent[0]) as u64, 6)
+    gallery9_main.schreibe_texte(app.texte)
+    gallery9_main.schreibe_zeilen(app.feld)
+
+    // Erst das Fenster: danach ist der Massstab des Schirms im Theme, und
+    // erst dann haben die Masse des Scheibenkastens ihre Bildpunkte.
+    var titel: [u8; 30] = "fUi -- beschriebene Seite, X11"
+    if !fuiwin.fenster_open(&fx, &app.w, &app.m, anzeige,
+        gallery9_main.W_STD, gallery9_main.H, (&titel[0]) as u64, 30) {
+        var ko: [u8; 45] = "x11demo: kein X-Server erreichbar ($DISPLAY)\n"
+        rt.write_everything(2, (&ko[0]) as u64, 45)
+        return 1
+    }
+    baue(&app)
+    fuiwirt.wirt_set_animator(&app.w, &app.g)
+    fuiwin.fenster_run(&fx, &app.w, &app.m, male, aktion, (&app) as u64)
+    fuiwin.fenster_close(&fx)
+    if log {
+        var zu: [u8; 12] = "geschlossen\n"
+        rt.write_everything(1, (&zu[0]) as u64, 12)
+    }
+    return 0
+}
