@@ -1417,7 +1417,7 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
                 e.line("add sp, sp, #16");
             }
             if let Some(d) = i.dst {
-                store_dst_ty(e, fr, d, "x0", i.ty);
+                store_dst(e, fr, d, "x0");
             }
             return Ok(());
         }
