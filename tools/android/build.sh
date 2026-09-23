@@ -33,6 +33,9 @@
 #   --permission <name>   uses-permission, repeatable (android.permission.X)
 #   --manifest-extra <f>  XML inserted into <application> (services, ...)
 #   --dex <file>          classes.dex to ship (then hasCode="true")
+#   --args-file <file>    default arguments (one per line) the app starts
+#                         with, shipped as assets/args.txt; a file args.txt
+#                         in the app's data directory still wins
 #   --push                the program uses lib/plat/android/push.fi: Firn
 #                         writes classes.dex with org.firn.FirnService
 #                         (tools/android/servicedex_main.fi), the manifest
@@ -56,7 +59,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
-PUSH=0
+PUSH=0; ARGSFILE=""
 OUT=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -72,6 +75,7 @@ while [ $# -gt 0 ]; do
         --manifest-extra) EXTRA=$2; shift 2 ;;
         --dex) DEX=$2; shift 2 ;;
         --push) PUSH=1; shift ;;
+        --args-file) ARGSFILE=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; usage ;;
     esac
@@ -199,6 +203,9 @@ if [ -n "$ASSETS" ]; then
     mkdir -p "$PACK/assets"; cp -r "$ASSETS"/. "$PACK/assets/"
 fi
 [ -n "$DEX" ] && cp "$DEX" "$PACK/classes.dex"
+if [ -n "$ARGSFILE" ]; then
+    mkdir -p "$PACK/assets"; cp "$ARGSFILE" "$PACK/assets/args.txt"
+fi
 # `zip` is not always on the build host, Python is. Assets stay STORED:
 # AAssetManager hands out only uncompressed assets in one piece.
 python3 - "$BUILD/raw.apk" "$PACK" <<'PY'

@@ -73,6 +73,26 @@ gets its window back; the permission dialog appears when the permission is
 missing. Firn's checked cast caught `checkSelfPermission` = -1 as
 `u64 as i32` on the way -- `jnicall.jint` sign-extends now.
 
+## FIRNCHAT on Android (r64)
+
+```sh
+bash tools/android/build.sh <firnchat>/src/gui/app.fi --name FirnChat \
+    --package org.firn.firnchat --push --args-file firnchat-args.txt
+bash tools/android/firnchat_check.sh <firnchat>   # 10 checks, own test relay
+```
+
+The same `src/gui/app.fi` as on the desktop (FIRNCHAT branch `android`):
+the build leaves FIRNCHAT's vendored X11 window layer out and uses
+lib/window with the Android backend. The push is FIRNCHAT's own live relay
+session -- end to end encrypted, no Firebase: `window.stay_alive` keeps the
+process through the foreground service after Back, `window.notify` shows
+"N neue Nachricht(en)" while `window.in_front` is false. The working
+directory is the app's files directory (the identity `firnchat.id` lands
+there), and `--args-file` ships the relay address as assets/args.txt.
+To reach the relay the firnc targets `x86_64-android`/`aarch64-android`
+write the legacy system calls as `*at` forms (Android's seccomp filter
+killed the app on chmod and dup2).
+
 ## Open
 
 * The soft keyboard composes nothing yet (no InputConnection without a dex
@@ -81,6 +101,6 @@ missing. Firn's checked cast caught `checkSelfPermission` = -1 as
 * Only tested in the emulator; the arm64 build still needs a real phone.
 * Push: the relay address is a dotted IPv4 address (no name lookup), the
   connection is plain TCP (no TLS yet), one line = one message.
-* x86_64 Android forbids some legacy system calls (seccomp); `dup2` hit it.
-  Firn's x86_64 code uses the raw numbers, aarch64 goes through the `*at`
-  forms -- phones are aarch64.
+* FIRNCHAT's desktop layout is not a phone layout (fixed side bar).
+* aarch64 still lacks stat/lstat/pipe/rmdir/readlink forms (compile error
+  when a program uses them, not a silent guess).

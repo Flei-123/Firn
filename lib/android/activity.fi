@@ -133,6 +133,9 @@ extern fn firn_program_main(start: u64) -> i32;
 #[no_gc]
 #[link_name(dup2)]
 extern fn c_dup2(old: i32, new: i32) -> i32;
+#[no_gc]
+#[link_name(chdir)]
+extern fn c_chdir(path: u64) -> i32;
 
 // ---------------------------------------------------------- raw access
 #[no_gc]
@@ -350,9 +353,41 @@ fn activity_app_ended() -> bool {
 }
 
 // ----------------------------------------------------- the arguments
-// `<data path>/args.txt`, one argument per line, becomes argv[1..]. That
-// is the only way to hand `--protokoll` or `--dpi=` to a program on a
-// phone without Java: `adb push args.txt /sdcard/Android/data/<pkg>/files/`.
+// argv[1..], one argument per line, from the first of:
+//   1. `<data path>/args.txt` -- `adb push args.txt
+//      /sdcard/Android/data/<pkg>/files/`, for tests and for changing a
+//      setting on a phone without Java;
+//   2. `args.txt` in the APK's assets (tools/android/build.sh --args-file):
+//      the defaults an app ships with, e.g. the address of its relay.
+fn zeilen_anhaengen(p: u64, len: usize, n0: usize, used0: usize,
+    nout: *mut usize) -> usize {
+    let blk: u64 = G_B + B_ARGV
+    let buf: u64 = G_B + B_ARGBUF
+    var n: usize = n0
+    var used: usize = used0
+    var i: usize = 0
+    while i < len && n < ARGV_MAX {
+        var j: usize = i
+        while j < len && rt.ld8(p, j) != 10 as u8 {
+            j = j + 1
+        }
+        var e: usize = j
+        if e > i && rt.ld8(p, e - 1) == 13 as u8 {
+            e = e - 1
+        }
+        if e > i && used + (e - i) + 1 < ARGBUF_CAP {
+            rt.mem_copy(buf + used as u64, p + i as u64, e - i)
+            rt.st8(buf + used as u64, e - i, 0 as u8)
+            rt.st64(blk, 1 + n, buf + used as u64)
+            used = used + (e - i) + 1
+            n = n + 1
+        }
+        i = j + 1
+    }
+    *nout = n
+    return used
+}
+
 fn argumente_bauen() -> u64 {
     let blk: u64 = G_B + B_ARGV
     let buf: u64 = G_B + B_ARGBUF
@@ -361,6 +396,7 @@ fn argumente_bauen() -> u64 {
     var n: usize = 1
     rt.st64(blk, 1, buf)
     var used: usize = 9
+    var gefunden: bool = false
     let dp: u64 = activity_data_path()
     if dp != 0 {
         var pfad: rt.Buf = rt.buf_new()
@@ -369,30 +405,36 @@ fn argumente_bauen() -> u64 {
         rt.buf_push_bytes(&pfad, (&tail[0]) as u64, 10)
         var inhalt: rt.Buf = rt.buf_new()
         if rt.read_file(rt.buf_ptr(&pfad), &inhalt) {
-            let p: u64 = rt.buf_ptr(&inhalt)
-            let len: usize = rt.buf_len(&inhalt)
-            var i: usize = 0
-            while i < len && n < ARGV_MAX {
-                var j: usize = i
-                while j < len && rt.ld8(p, j) != 10 as u8 {
-                    j = j + 1
-                }
-                var e: usize = j
-                if e > i && rt.ld8(p, e - 1) == 13 as u8 {
-                    e = e - 1
-                }
-                if e > i && used + (e - i) + 1 < ARGBUF_CAP {
-                    rt.mem_copy(buf + used as u64, p + i as u64, e - i)
-                    rt.st8(buf + used as u64, e - i, 0 as u8)
-                    rt.st64(blk, 1 + n, buf + used as u64)
-                    used = used + (e - i) + 1
-                    n = n + 1
-                }
-                i = j + 1
-            }
+            used = zeilen_anhaengen(rt.buf_ptr(&inhalt), rt.buf_len(&inhalt),
+                n, used, &n)
+            gefunden = true
         }
         rt.buf_free(&inhalt)
         rt.buf_free(&pfad)
+    }
+    let act: u64 = ld(B_ACT)
+    if !gefunden && act != 0 {
+        let am: u64 = ndk.peek64(act + ndk.ACT_ASSET_MANAGER)
+        var an: [u8; 9] = "args.txt\0"
+        var a: u64 = 0
+        if am != 0 {
+            // AASSET_MODE_BUFFER = 3
+            a = ndk.AAssetManager_open(am, (&an[0]) as u64, 3)
+        }
+        if a != 0 {
+            let len: i64 = ndk.AAsset_getLength(a)
+            if len > 0 && len < 65536 {
+                let tmp: u64 = rt.heap_alloc(len as usize)
+                if tmp != 0 {
+                    let r: i32 = ndk.AAsset_read(a, tmp, len as usize)
+                    if r > 0 {
+                        used = zeilen_anhaengen(tmp, r as usize, n, used, &n)
+                    }
+                    rt.heap_free(tmp, len as usize)
+                }
+            }
+            ndk.AAsset_close(a)
+        }
     }
     rt.st64(blk, 0, n as u64)
     rt.st64(blk, 1 + n, 0)
@@ -416,6 +458,16 @@ fn thread_app_main(arg: u64) -> u64 {
     activity_config_read()
     __atomic_add((G_B + B_READY) as *mut u64, 1)
     let start: u64 = argumente_bauen()
+    // The working directory is the app's own files directory: a relative
+    // path in the program ("firnchat.id") then lands where the app may
+    // write, and not in "/", where it may not.
+    let act: u64 = ld(B_ACT)
+    if act != 0 {
+        let ip: u64 = ndk.peek64(act + ndk.ACT_INTERNAL_DATA_PATH)
+        if ip != 0 {
+            let r0: i32 = c_chdir(ip)
+        }
+    }
     let code: i32 = firn_program_main(start)
     // The program is done. Say so first -- the main thread stops waiting
     // for acknowledgements from here on -- then close the activity.
