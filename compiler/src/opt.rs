@@ -565,6 +565,12 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             break;
         }
     }
+    // RUNDE TEMPO 10 -- GANZ ZUM SCHLUSS, UND NUR EINMAL.
+    //
+    // `split` setzt Kopien ein, die der Zuteiler braucht und jeder andere
+    // Pass fuer Unsinn haelt: `copyprop` wuerde sie in derselben Runde
+    // wieder wegpropagieren, `cse` sie zusammenlegen. Er steht deshalb
+    // hinter der Schleife und laeuft genau einmal.
 }
 
 // ----------------------------------------------- common subexpressions (CSE) ---

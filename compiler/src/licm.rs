@@ -118,7 +118,7 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
 
 /// Body of the natural loop belonging to the back edge `back -> head`:
 /// `head` plus everything that reaches `back` without passing `head`.
-fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize> {
+pub(crate) fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize> {
     let mut body = HashSet::new();
     body.insert(head);
     let mut stack = Vec::new();
@@ -140,7 +140,7 @@ fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize
 /// there with a plain `br`. Given several entries the loop is skipped:
 /// introducing a preheader would shift the block numbers, and that is not
 /// worth this pass.
-fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: &[Vec<usize>]) -> Option<usize> {
+pub(crate) fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: &[Vec<usize>]) -> Option<usize> {
     let mut outer = preds[head].iter().copied().filter(|p| !body.contains(p));
     let p = outer.next()?;
     if outer.next().is_some() {

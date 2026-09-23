@@ -121,32 +121,32 @@ pub fn recognise(f: &mut Func) -> usize {
     let npar = f.params.len();
 
     let mut plan: Vec<(usize, usize, usize, Val, Val)> = Vec::new(); // (P, H, B, base, n)
-    let mut belegt: Vec<bool> = vec![false; nb];
+    let mut used: Vec<bool> = vec![false; nb];
 
-    'kopf: for h in 0..nb {
-        if belegt[h] {
+    'head: for h in 0..nb {
+        if used[h] {
             continue;
         }
-        let treffer = match muster(f, &preds, &defblock, npar, &dom, h) {
+        let hit = match pattern(f, &preds, &defblock, npar, &dom, h) {
             Some(t) => t,
-            None => continue 'kopf,
+            None => continue 'head,
         };
-        let (p, b, base, n) = treffer;
-        belegt[h] = true;
-        belegt[b] = true;
+        let (p, b, base, n) = hit;
+        used[h] = true;
+        used[b] = true;
         plan.push((p, h, b, base, n));
     }
     if plan.is_empty() {
         return 0;
     }
-    let anzahl = plan.len();
+    let count = plan.len();
     for (p, h, _b, base, n) in plan {
         // Das Ziel der Schleife ist der Ausgang von `H`.
         let x = match f.blocks[h].term {
             Term::BrCond { then_bb, else_bb, .. } => {
                 // `then` ist der Rumpf, also ist `else` der Ausgang.
-                let rumpf = then_bb;
-                let _ = rumpf;
+                let body = then_bb;
+                let _ = body;
                 else_bb
             }
             _ => continue,
@@ -161,11 +161,11 @@ pub fn recognise(f: &mut Func) -> usize {
         });
         f.blocks[h].term = Term::Br(x);
     }
-    anzahl
+    count
 }
 
 /// Passt an `h` das Muster? Liefert `(Vorkopf, Rumpf, base, n)`.
-fn muster(
+fn pattern(
     f: &Func,
     preds: &[Vec<usize>],
     defblock: &[Option<usize>],
@@ -178,11 +178,11 @@ fn muster(
     if kb.insts.len() != 2 {
         return None;
     }
-    let (cond, rumpf, ausgang) = match kb.term {
+    let (cond, body, ausgang) = match kb.term {
         Term::BrCond { cond, then_bb, else_bb } => (cond, then_bb as usize, else_bb as usize),
         _ => return None,
     };
-    if rumpf >= f.blocks.len() || ausgang >= f.blocks.len() || rumpf == h {
+    if body >= f.blocks.len() || ausgang >= f.blocks.len() || body == h {
         return None;
     }
     let iv = match (&kb.insts[0].op, kb.insts[0].dst) {
@@ -205,49 +205,49 @@ fn muster(
     }
 
     // --- der Rumpf: genau drei Anweisungen, Sprung zurueck ---------------
-    let rb = &f.blocks[rumpf];
+    let rb = &f.blocks[body];
     if rb.insts.len() != 3 || !matches!(rb.term, Term::Br(t) if t as usize == h) {
         return None;
     }
-    if preds[rumpf].len() != 1 || preds[rumpf][0] != h {
+    if preds[body].len() != 1 || preds[body][0] != h {
         return None;
     }
     // Adresse, Speichern, Fortschalten -- in beliebiger Reihenfolge.
     let mut addr: Option<(Val, Val)> = None; // (Ergebnis, base)
-    let mut wert: Option<(Val, Val)> = None; // (gespeicherter Wert, Adresse)
-    let mut schritt: Option<(Val, Val)> = None; // (Ergebnis, Schrittkonstante)
+    let mut value: Option<(Val, Val)> = None; // (gespeicherter Wert, Adresse)
+    let mut step: Option<(Val, Val)> = None; // (Ergebnis, Schrittkonstante)
     let mut store_ty = FTy::Void;
     for inst in rb.insts.iter() {
         match (&inst.op, inst.dst) {
             (Op::Bin(BinOp::Add, a, b), Some(d)) if *a == i_val || *b == i_val => {
-                let anderer = if *a == i_val { *b } else { *a };
+                let other = if *a == i_val { *b } else { *a };
                 // Die Fortschaltung erkennt man daran, dass ihr Ergebnis auf
                 // der Rueckwaertskante des phi steht.
-                if inc.iter().any(|(q, v)| *q as usize == rumpf && *v == d) {
-                    if schritt.is_some() {
+                if inc.iter().any(|(q, v)| *q as usize == body && *v == d) {
+                    if step.is_some() {
                         return None;
                     }
-                    schritt = Some((d, anderer));
+                    step = Some((d, other));
                 } else {
                     if addr.is_some() {
                         return None;
                     }
-                    addr = Some((d, anderer));
+                    addr = Some((d, other));
                 }
             }
             (Op::Store { val, addr: a }, None) => {
-                if wert.is_some() {
+                if value.is_some() {
                     return None;
                 }
                 store_ty = inst.ty;
-                wert = Some((*val, *a));
+                value = Some((*val, *a));
             }
             _ => return None,
         }
     }
     let (a_val, base) = addr?;
-    let (v_val, a_used) = wert?;
-    let (i2_val, step) = schritt?;
+    let (v_val, a_used) = value?;
+    let (i2_val, step) = step?;
     if a_used != a_val {
         return None;
     }
@@ -257,18 +257,18 @@ fn muster(
     }
 
     // --- die Konstanten: Anfang 0, Schrittweite 1, Wert 0 ----------------
-    let vor = inc.iter().find(|(q, _)| *q as usize != rumpf)?;
+    let vor = inc.iter().find(|(q, _)| *q as usize != body)?;
     let p = vor.0 as usize;
     if p >= f.blocks.len() {
         return None;
     }
-    if konstante(f, vor.1) != Some(0) {
+    if const_of(f, vor.1) != Some(0) {
         return None;
     }
-    if konstante(f, step) != Some(1) {
+    if const_of(f, step) != Some(1) {
         return None;
     }
-    if konstante(f, v_val) != Some(0) {
+    if const_of(f, v_val) != Some(0) {
         return None;
     }
     // Der Vorkopf muss GENAU EIN Nachfolger haben (sein Sprung geht nach
@@ -278,7 +278,7 @@ fn muster(
         return None;
     }
     // `h` hat genau zwei Vorgaenger: den Vorkopf und den Rumpf.
-    if preds[h].len() != 2 || !preds[h].contains(&p) || !preds[h].contains(&rumpf) {
+    if preds[h].len() != 2 || !preds[h].contains(&p) || !preds[h].contains(&body) {
         return None;
     }
 
@@ -304,7 +304,7 @@ fn muster(
     // --- nichts aus der Schleife wird draussen gelesen -------------------
     let mut buf = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
-        if bi == rumpf {
+        if bi == body {
             continue;
         }
         for inst in &b.insts {
@@ -339,16 +339,16 @@ fn muster(
     }
 
     // --- winzige feste Laengen bleiben Schleife --------------------------
-    if let Some(k) = konstante(f, n_val) {
+    if let Some(k) = const_of(f, n_val) {
         if k < 16 {
             return None;
         }
     }
-    Some((p, rumpf, base, n_val))
+    Some((p, body, base, n_val))
 }
 
 /// Wert einer Konstante, wenn der Wert eine ist.
-fn konstante(f: &Func, v: Val) -> Option<i128> {
+fn const_of(f: &Func, v: Val) -> Option<i128> {
     for b in &f.blocks {
         for i in &b.insts {
             if i.dst == Some(v) {
@@ -368,24 +368,24 @@ mod tests {
     use crate::fir::{Block, Func};
 
     /// `fn f(p: u64, n: u64) { var i = 0; while i < n { st8(p, i, 0); i += 1 } }`
-    fn schleife(mit_vorzeichen: bool) -> Func {
+    fn loop_fn(signed: bool) -> Func {
         let mut f = Func::new("t", vec![FTy::U64, FTy::U64], FTy::Void);
         // %0 = p, %1 = n
         let null = f.new_val_pub(FTy::U64);
-        let eins = f.new_val_pub(FTy::U64);
-        let wert = f.new_val_pub(FTy::U8);
+        let one = f.new_val_pub(FTy::U64);
+        let value = f.new_val_pub(FTy::U8);
         let i = f.new_val_pub(FTy::U64);
         let c = f.new_val_pub(FTy::Bool);
         let a = f.new_val_pub(FTy::U64);
         let i2 = f.new_val_pub(FTy::U64);
-        let ct = if mit_vorzeichen { FTy::I64 } else { FTy::U64 };
+        let ct = if signed { FTy::I64 } else { FTy::U64 };
         f.blocks = vec![
             Block {
                 id: 0,
                 insts: vec![
                     Inst::new(Some(null), FTy::U64, Op::Const(0)),
-                    Inst::new(Some(eins), FTy::U64, Op::Const(1)),
-                    Inst::new(Some(wert), FTy::U8, Op::Const(0)),
+                    Inst::new(Some(one), FTy::U64, Op::Const(1)),
+                    Inst::new(Some(value), FTy::U8, Op::Const(0)),
                 ],
                 term: Term::Br(1),
             },
@@ -409,8 +409,8 @@ mod tests {
                 id: 2,
                 insts: vec![
                     Inst::new(Some(a), FTy::U64, Op::Bin(BinOp::Add, 0, i)),
-                    Inst::new(None, FTy::U8, Op::Store { val: wert, addr: a }),
-                    Inst::new(Some(i2), FTy::U64, Op::Bin(BinOp::Add, i, eins)),
+                    Inst::new(None, FTy::U8, Op::Store { val: value, addr: a }),
+                    Inst::new(Some(i2), FTy::U64, Op::Bin(BinOp::Add, i, one)),
                 ],
                 term: Term::Br(1),
             },
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn the_unsigned_zero_loop_becomes_one_instruction() {
-        let mut f = schleife(false);
+        let mut f = loop_fn(false);
         assert_eq!(recognise(&mut f), 1);
         assert!(f.blocks[0].insts.iter().any(|i| matches!(i.op, Op::SecureZero { .. })));
         assert!(matches!(f.blocks[1].term, Term::Br(3)));
@@ -431,14 +431,14 @@ mod tests {
     /// negativem `n` null Mal -- `rep stosb` mit `rcx = -1` nicht.
     #[test]
     fn the_signed_comparison_stays_a_loop() {
-        let mut f = schleife(true);
+        let mut f = loop_fn(true);
         assert_eq!(recognise(&mut f), 0);
     }
 
     /// Ein zweiter Speicherzugriff im Rumpf ist keine Nullschleife mehr.
     #[test]
     fn a_second_store_in_the_body_is_refused() {
-        let mut f = schleife(false);
+        let mut f = loop_fn(false);
         let extra = f.new_val_pub(FTy::U8);
         f.blocks[2].insts.insert(
             1,

@@ -461,6 +461,103 @@ impl Op {
     }
 
     /// All values read.
+    /// **RUNDE TEMPO 10** — jeder Platz, an dem diese Anweisung einen Wert
+    /// LIEST, zum Veraendern.
+    ///
+    /// Bis hierher stand diese Tabelle in `mem2reg::replace_uses`, und sie
+    /// ist inzwischen die einzige Stelle, die vollstaendig weiss, welcher
+    /// Operand wo sitzt. Ein zweiter Umschreiber (`split.rs` braucht einen,
+    /// der nur INNERHALB einer Schleife umschreibt) waere eine zweite
+    /// Antwort auf dieselbe Frage gewesen -- also steht sie jetzt hier, und
+    /// beide rufen sie auf.
+    ///
+    /// Die unantastbaren Anweisungen (SPEC §9.2: `select`, `barrier`,
+    /// `secure_zero`, Assembler, MMIO) melden NICHTS; ihre Operanden bleiben
+    /// unveraendert, egal wer fragt.
+    pub(crate) fn for_each_use_mut(&mut self, mut rep: impl FnMut(&mut Val)) {
+        match self {
+            Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } | Op::ThreadSelf => {}
+            Op::Bin(_, a, b2) => {
+                rep(a);
+                rep(b2);
+            }
+            // ROUND 72: same shape as `Op::Bin` — two operands, no
+            // special casing needed for copy propagation.
+            Op::BinWrapSat { a, b: b2, .. }
+            | Op::CheckedBin { a, b: b2, .. }
+            | Op::CheckedDiv { a, b: b2, .. } => {
+                rep(a);
+                rep(b2);
+            }
+            Op::CheckedCast { src, .. } => rep(src),
+            Op::CheckedIdx { idx, .. } => rep(idx),
+            Op::Cmp { a, b: b2, .. } => {
+                rep(a);
+                rep(b2);
+            }
+            Op::Un(_, a) => rep(a),
+            Op::Cast { src, .. } => rep(src),
+            Op::Load { addr } => rep(addr),
+            Op::Store { addr, val } => {
+                rep(addr);
+                rep(val);
+            }
+            Op::PtrAdd { base, off } => {
+                rep(base);
+                rep(off);
+            }
+            Op::Simd { args, .. } => {
+                for a in args.iter_mut() {
+                    rep(a);
+                }
+            }
+            Op::Call { args, .. } | Op::Syscall { args } => {
+                for a in args.iter_mut() {
+                    rep(a);
+                }
+            }
+            Op::CallIndirect { target, args } => {
+                rep(target);
+                for a in args.iter_mut() {
+                    rep(a);
+                }
+            }
+            Op::VtabAddr { .. } | Op::FnRef { .. } | Op::GlobalAddr { .. } => {}
+            Op::CopyMem { dst, src, .. } => {
+                rep(dst);
+                rep(src);
+            }
+            Op::AtomicCas { addr, erw, new } => {
+                rep(addr);
+                rep(erw);
+                rep(new);
+            }
+            Op::ThreadSpawn { arg, stack, ctid } => {
+                rep(arg);
+                rep(stack);
+                rep(ctid);
+            }
+            Op::AtomicAdd { addr, val } => {
+                rep(addr);
+                rep(val);
+            }
+            // ROUND 92: a phi operand is an ordinary use and gets
+            // rewritten like every other one. The BLOCK numbers next to
+            // them are control flow, not values -- they are never
+            // touched here.
+            Op::Phi { incoming } => {
+                for (_, v) in incoming.iter_mut() {
+                    rep(v);
+                }
+            }
+            Op::Copy { src } => rep(src),
+            Op::Select { .. } | Op::Barrier { .. } | Op::SecureZero { .. } => {}
+            // ROUND 52: volatile — the operands are NOT
+            // rewritten (like select/barrier/secure_zero).
+            Op::Asm { .. } | Op::MmioLoad { .. } | Op::MmioStore { .. } => {}
+        }
+    }
+
     pub fn uses(&self, out: &mut Vec<Val>) {
         match self {
             Op::Const(_)
@@ -700,6 +797,18 @@ pub struct Func {
     /// functions are lowered one after another, and a stale stamp would
     /// attribute the prologue of the second to the last line of the first.
     pub loc_stamp: Loc,
+    /// **RUNDE TEMPO 10** — Werte, die NICHT verschmolzen werden duerfen.
+    ///
+    /// `split::nach_zuteilung` schneidet eine Lebensdauer auf, indem es eine
+    /// Kopie in den Vorkopf der Schleife setzt. Das Verschmelzen aus TEMPO 8
+    /// sieht genau diese Kopie und legt beide Werte wieder zusammen — der
+    /// Schnitt waere damit sofort wieder zu. Gemessen: von siebzehn
+    /// Schnitten in `l3_huffman` bekam KEIN EINZIGER ein Register, weil
+    /// jeder vorher wieder verschmolzen wurde.
+    ///
+    /// Leer in jeder Funktion, die aus dem Vorderteil kommt; nur der
+    /// Zuteiler fuellt sie, und nur fuer seine eigene Zweitfassung.
+    pub no_coalesce: std::collections::HashSet<Val>,
 }
 
 impl Func {
@@ -717,6 +826,7 @@ impl Func {
             constant_time: false,
             interrupt: false,
             loc_stamp: Loc::NONE,
+            no_coalesce: std::collections::HashSet::new(),
         }
     }
 

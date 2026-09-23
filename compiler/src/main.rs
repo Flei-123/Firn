@@ -64,6 +64,7 @@ mod sema;
 mod simd;
 mod simd_a64;
 mod sizeof;
+mod split;
 mod statics;
 mod sema_generic;
 mod sema_match;

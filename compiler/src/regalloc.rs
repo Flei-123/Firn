@@ -132,6 +132,42 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
     )
 }
 
+/// **RUNDE TEMPO 10** — rechnet dieser Vektorbefehl IN seinem ersten
+/// Operanden?
+///
+/// SSE hat keine Dreioperandenform: `mulps d, s` heisst `d = d * s`. Der
+/// Erzeuger kopiert darum erst den ersten Operanden ins Ziel (`movaps d, a`)
+/// und rechnet dann. Wenn `a` nach dieser Anweisung ohnehin tot ist, ist die
+/// Kopie ueberfluessig — `a` und `d` duerfen dasselbe Register haben. Genau
+/// diese Befehle sind gemeint.
+pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
+    use crate::simd::SimdKind as K;
+    matches!(
+        k,
+        K::AddF32
+            | K::SubF32
+            | K::MulF32
+            | K::CmpLtF32
+            | K::CmpLeF32
+            | K::CmpNltF32
+            | K::CmpGt32
+            | K::And
+            | K::AndNot
+            | K::Or
+            | K::Xor
+            | K::Add32
+            | K::Sub32
+            | K::UnpackLo32
+            | K::UnpackHi32
+    )
+}
+
+/// Dasselbe fuer die vier Grundrechenarten auf Gleitzahlen (`addss`,
+/// `subss`, `mulss`, `divss` und ihre `sd`-Fassungen).
+fn two_address_bin(op: BinOp) -> bool {
+    matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+}
+
 /// Gehoert dieser Typ in die SSE-Klasse (Gleitzahl oder Vektor)?
 fn sse_class(t: FTy) -> bool {
     t.is_float() || t == FTy::V128
@@ -1324,11 +1360,11 @@ pub fn allocate(f: &Func) -> Alloc {
     // Fliesskommaweg der Ausgabe angefasst (sonst holte ihn jemand mit `mov`
     // aus einem Platz, den es nicht gibt) und ist nicht `secret`.
     let mut fconst: HashMap<Val, (String, bool)> = HashMap::new();
-    let nur_hier = match std::env::var("FIRN_FPOOL_ONLY") {
+    let only_here = match std::env::var("FIRN_FPOOL_ONLY") {
         Ok(v) => f.name.contains(&v),
         Err(_) => true,
     };
-    if std::env::var_os("FIRN_NO_FPOOL").is_none() && nur_hier {
+    if std::env::var_os("FIRN_NO_FPOOL").is_none() && only_here {
         let fp_ok_pre = fp_taugt(f);
         // ROUND 92 GILT AUCH HIER: nach der Aufloesung der `phi`-Knoten darf
         // ein Wert MEHRMALS geschrieben werden -- eine Schleifenvariable, die
@@ -1576,8 +1612,33 @@ pub fn allocate(f: &Func) -> Alloc {
         let mut sources: HashMap<Val, Vec<Val>> = HashMap::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, i) in b.insts.iter().enumerate() {
-                let (t, p) = match (&i.op, i.dst) {
-                    (Op::Copy { src }, Some(p)) => (*src, p),
+                // RUNDE TEMPO 10 -- DIE ZWEIOPERANDENFORM IST AUCH EINE
+                // KOPIE.
+                //
+                // `d = a * b` wird auf SSE zu `movaps d, a` + `mulps d, b`.
+                // Stirbt `a` hier, ist die Kopie fuer nichts — dasselbe
+                // Register fuer `a` und `d` macht daraus einen einzigen
+                // Befehl. Gemessen im MP3-Dekoder: `movaps xmm,xmm` stand
+                // fuer 16,3 von 146,3 Millionen Befehlen, also elf Prozent
+                // des ganzen Programms, und war damit der groesste
+                // Einzelposten ueberhaupt.
+                //
+                // Die Bedingungen darunter sind dieselben wie fuer eine
+                // echte Kopie; die wichtigste (`a` hat genau einen Leser)
+                // ist genau die Frage "stirbt `a` hier".
+                let (t, p, two_address) = match (&i.op, i.dst) {
+                    (Op::Copy { src }, Some(p)) => (*src, p, false),
+                    (Op::Bin(op, a, _), Some(p))
+                        if i.ty.is_float() && two_address_bin(*op) =>
+                    {
+                        (*a, p, true)
+                    }
+                    (Op::Un(UnOp::Neg, a), Some(p)) if i.ty.is_float() => (*a, p, true),
+                    (Op::Simd { kind, args, .. }, Some(p))
+                        if two_address_simd(*kind) && !args.is_empty() =>
+                    {
+                        (args[0], p, true)
+                    }
                     _ => continue,
                 };
                 macro_rules! reject {
@@ -1591,14 +1652,37 @@ pub fn allocate(f: &Func) -> Alloc {
                 if t == p || t as usize >= nv || p as usize >= nv {
                     reject!("selbst")
                 }
+                // RUNDE TEMPO 10: ein Schnitt darf nicht wieder zuwachsen.
+                if f.no_coalesce.contains(&t) || f.no_coalesce.contains(&p) {
+                    reject!("Schnitt")
+                }
                 if t < np || coalesced.contains_key(&t) || sources.contains_key(&t) {
                     reject!("t schon vergeben")
                 }
                 if coalesced.contains_key(&p) {
                     reject!("p ist selbst Quelle")
                 }
-                // (1) genau eine Schreib- und eine Lesestelle.
-                if defs[t as usize] != 1 || read0.get(t as usize).copied() != Some(1) {
+                // (1) Eine Schreibstelle, und der Wert wird hier zum
+                // LETZTEN Mal gebraucht.
+                //
+                // Fuer eine echte Kopie ist das "genau ein Leser" -- die
+                // Kopie selbst. Fuer die Zweioperandenform waere das zu
+                // streng: in der heissen Schleife der Synthesefilterbank
+                // wird derselbe Vektor ZWEIMAL multipliziert, und beim
+                // zweiten Mal stirbt er. Genau dort darf das Ziel sein
+                // Register erben. Die Frage ist also nicht, wie oft der Wert
+                // gelesen wird, sondern ob er NACH dieser Anweisung noch
+                // lebt.
+                if defs[t as usize] != 1 {
+                    reject!("mehrere Schreibstellen")
+                }
+                if two_address {
+                    if live_after(f, &live, t, bi, ii) {
+                        reject!("stirbt hier nicht")
+                    }
+                } else if read0.get(t as usize).copied() != Some(1)
+                    && std::env::var_os("FIRN_COAL_ENG").is_some()
+                {
                     reject!("defs/reads")
                 }
                 // (2) gleicher Typ, kein Sonderplatz.
@@ -1850,6 +1934,16 @@ pub fn allocate(f: &Func) -> Alloc {
         let b = reg_bit(r);
         b != 0 && iv.killed & b == 0
     }
+    /// Gewicht JE LAENGE -- was ein Register an dieser Stelle wirklich wert
+    /// ist. `FIRN_RA_SUMME=1` stellt die alte Antwort (die reine Summe) zum
+    /// Vergleichen wieder her.
+    fn density(iv: &Iv) -> u64 {
+        if std::env::var_os("FIRN_RA_SUMME").is_some() {
+            return iv.weight;
+        }
+        let length = (iv.end.saturating_sub(iv.start) as u64).max(1);
+        iv.weight.saturating_mul(64) / length
+    }
     let mut free_saved: Vec<&'static str> = CALLEE_SAVED.to_vec();
     let mut free_temp: Vec<&'static str> = TEMP_REGS.to_vec();
     let mut free_arg: Vec<&'static str> = ARG_SPARE.to_vec();
@@ -1947,6 +2041,13 @@ pub fn allocate(f: &Func) -> Alloc {
                 // Spilling: the active interval with the SMALLEST weight
                 // (uses x loop depth) clears the register. At equal weight
                 // the later end decides.
+                //
+                // RUNDE TEMPO 10 -- DICHTE STATT SUMME.
+                // Die Summe bevorzugt lange Intervalle: ein Wert mit fuenfzig
+                // ueber die ganze Funktion verstreuten Verwendungen schlaegt
+                // einen mit dreien in der innersten Schleife, obwohl er sein
+                // Register die ganze Zeit belegt und der andere es nur kurz
+                // braeuchte. Was zaehlen sollte, ist Gewicht JE LAENGE.
                 let mut worst: Option<usize> = None;
                 for (k, (a, r)) in active.iter().enumerate() {
                     if !fits(&iv, r) {
@@ -1954,15 +2055,15 @@ pub fn allocate(f: &Func) -> Alloc {
                     }
                     let better = match worst {
                         None => true,
-                        Some(w) => (a.weight, usize::MAX - a.end)
-                            < (active[w].0.weight, usize::MAX - active[w].0.end),
+                        Some(w) => (density(a), usize::MAX - a.end)
+                            < (density(&active[w].0), usize::MAX - active[w].0.end),
                     };
                     if better {
                         worst = Some(k);
                     }
                 }
                 if let Some(w) = worst {
-                    if active[w].0.weight < iv.weight {
+                    if density(&active[w].0) < density(&iv) {
                         let (old, r) = active.remove(w);
                         assign.remove(&old.val);
                         assign.insert(iv.val, r);
@@ -2194,6 +2295,10 @@ pub fn allocate(f: &Func) -> Alloc {
             if alloc.imm(k).is_none()
                 || read.get(v as usize).copied().unwrap_or(0) != 1
                 || f.is_secret(v)
+                // RUNDE TEMPO 10: verschmolzene Werte haben ihren Platz
+                // schon; ein zweiter Weg, der ihn vergibt, macht ihn kaputt.
+                || coalesced.contains_key(&v)
+                || coalesced.values().any(|q| *q == v)
             {
                 continue;
             }
@@ -2244,8 +2349,28 @@ pub fn allocate(f: &Func) -> Alloc {
     // geglaubt, Quelle und Ziel seien derselbe Platz, und nichts ausgegeben,
     // waehrend der Wert in `xmm2` stand und niemand ihn ablegte.
     for (t, ptgt) in coalesced.iter() {
-        if let Loc::Reg(r) = alloc.loc(*ptgt) {
-            alloc.locs[*t as usize] = Loc::Reg(r);
+        match alloc.loc(*ptgt) {
+            Loc::Reg(r) => alloc.locs[*t as usize] = Loc::Reg(r),
+            // RUNDE TEMPO 10 -- AUCH ZWEI RAHMENPLAETZE, ABER NUR FUER
+            // GANZZAHLEN.
+            //
+            // In `l3_huffman` bekommt fast nichts ein Register (maxlive=63
+            // bei vierzehn), und die Kopien der Rueckwaertskante stehen dort
+            // als ZWEI Befehle da: `mov rax,[quelle]` + `mov [ziel],rax`.
+            // Teilen sich beide denselben Platz, faellt die Kopie ganz weg.
+            //
+            // Bei Gleitzahlen ist das VERBOTEN, und zwar wegen
+            // `fp_handover`: das legt einen Wert ohne Register mit genau
+            // einem Leser in `xmm2`, statt ihn abzulegen. Die Kopie haette
+            // dann geglaubt, Quelle und Ziel seien derselbe Platz, und
+            // nichts ausgegeben -- waehrend der Wert nie in den Rahmen kam.
+            // Genau daran ist `tests/1182_layout_float_probe.fi` in TEMPO 8
+            // gestorben.
+            Loc::Slot(off) => {
+                if !sse_class(f.val_ty(*t)) {
+                    alloc.locs[*t as usize] = Loc::Slot(off);
+                }
+            }
         }
     }
 
@@ -2973,7 +3098,53 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     if !supported(f) {
         return None;
     }
-    let a = allocate(f);
+    let a0 = allocate(f);
+    // RUNDE TEMPO 10 -- LEBENSDAUERN ZERSCHNEIDEN, NACHDEM MAN WEISS, WO ES
+    // KLEMMT.
+    //
+    // Der lineare Scan kennt je Wert EIN Intervall und EINEN Platz. Ein
+    // Zeiger, der am Anfang gesetzt und am Ende noch einmal gebraucht wird,
+    // belegt sein Register also ueber die ganze Funktion -- oder keines, und
+    // dann wird er in der heissen Schleife dazwischen bei JEDER Verwendung
+    // aus dem Rahmen geholt. Gemessen ueber den MP3-Dekoder: "aus dem Rahmen
+    // holen" war mit 10,0 von 137,7 Mio Befehlen der groesste Posten, der
+    // nach TEMPO 9 noch stand.
+    //
+    // `split::nach_zuteilung` setzt fuer genau diese Werte eine Kopie in den
+    // Vorkopf der Schleife und laesst den Rumpf die Kopie lesen. Das neue,
+    // kurze Intervall hat das Gewicht der Schleife und gewinnt sein Register
+    // meistens -- aus einem Holen je Durchlauf wird eines je Eintritt.
+    //
+    // ES WIRD ZWEIMAL ZUGETEILT, und das ist der Punkt: eine erste Fassung
+    // schnitt im Optimierer, also bevor jemand weiss, wer ueberhaupt ein
+    // Register bekommt, und war gemessen ZWEI PROZENT SCHLECHTER (137,7 ->
+    // 140,4). Wo der neue Wert auch nur einen Platz bekommt, zahlt man die
+    // Kopie und gewinnt nichts. Also erst zuteilen, dann fragen, dann
+    // schneiden -- und wenn beim zweiten Zuteilen kein einziger der neuen
+    // Werte ein Register bekommt, wird das Ergebnis verworfen.
+    let mut own: Option<(Func, Alloc)> = None;
+    if std::env::var_os("FIRN_NO_SPLIT").is_none() && !debug_vars_active(f) {
+        let in_frame = |v: Val| matches!(a0.loc(v), Loc::Slot(_))
+            && !a0.imms.contains_key(&v)
+            && !a0.frame_addr.contains_key(&v)
+            && !a0.fconst.contains_key(&v)
+            && !a0.alias.contains_key(&v)
+            && !a0.cells.contains_key(&v);
+        if let Some((g, fresh)) = crate::split::after_allocation(f, &in_frame) {
+            let a2 = allocate(&g);
+            let gewonnen = fresh.iter().filter(|v| matches!(a2.loc(**v), Loc::Reg(_))).count();
+            if std::env::var_os("FIRN_SPLIT_DBG").is_some() {
+                eprintln!("SPLIT {} geschnitten={} mit Register={}", f.name, fresh.len(), gewonnen);
+            }
+            if gewonnen > 0 {
+                own = Some((g, a2));
+            }
+        }
+    }
+    let (f, a): (&Func, &Alloc) = match &own {
+        Some((g, a2)) => (g, a2),
+        None => (f, &a0),
+    };
     // ROUND 82 (`FIRN_RA_STATS=1`): how good IS this allocation? One line per
     // function: how many values it has, how many of them got a register, how
     // many stayed on the stack, and how many `alloca` cells were promoted.
@@ -3014,7 +3185,7 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     if let Ok(nur) = std::env::var("FIRN_VEX_ONLY") {
         tmp.vex = tmp.vex && f.name.contains(&nur);
     }
-    match emit_with(&mut tmp, f, &a) {
+    match emit_with(&mut tmp, f, a) {
         Ok(()) => {
             // ROUND 90: the panic arms of the checked operations, behind the
             // function they belong to. They go through the descriptor pass
@@ -3719,7 +3890,7 @@ fn fp_handover(
             // Den EINEN Leser suchen: im selben Block, hoechstens `FENSTER`
             // Anweisungen weiter, und dazwischen kein Aufruf (jedes `xmm` ist
             // caller-saved).
-            let mut leser: Option<usize> = None;
+            let mut readers: Option<usize> = None;
             for (j, n) in b.insts.iter().enumerate().skip(idx + 1).take(FENSTER) {
                 if matches!(
                     &n.op,
@@ -3743,12 +3914,12 @@ fn fp_handover(
                         _ => false,
                     };
                     if reads {
-                        leser = Some(j);
+                        readers = Some(j);
                     }
                     break;
                 }
             }
-            if let Some(j) = leser {
+            if let Some(j) = readers {
                 cand.push((idx, j, d));
             }
         }
@@ -5703,6 +5874,14 @@ fn emit_inst(
         // even though FIR now writes a copy per back edge.
         Op::Copy { src } => {
             let d = i.dst.ok_or("internal error: copy without target")?;
+            // RUNDE TEMPO 10: verschmolzen -- Quelle und Ziel liegen am
+            // selben Platz, die Kopie ist ein `mov [X], [X]` ueber `rax`.
+            // Fuer Register erledigt `load_full` das von selbst, fuer zwei
+            // gleiche RAHMENPLAETZE nicht. Ein Alias zaehlt nicht mit: dort
+            // steht der Wert im Zellregister und nicht im Platz.
+            if ra.a.alias.get(src).is_none() && ra.a.loc(d) == ra.a.loc(*src) {
+                return Ok(());
+            }
             match ra.a.loc(d) {
                 // Straight into its home. `load_full` writes nothing at all
                 // when the value already stands there, so a copy the
