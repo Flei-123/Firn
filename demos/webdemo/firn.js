@@ -18,19 +18,20 @@
     const canvas = document.getElementById('firn');
     const g = canvas.getContext('2d', { alpha: false });
     const utf8 = new TextEncoder();
-    const text = new TextDecoder();
     let mem = null;
     let x = null; // the exports
     const bytes = (p, n) => new Uint8Array(mem.buffer, p >>> 0, n >>> 0);
     class Exit { constructor(code) { this.code = code; } }
 
     // write(fd, buf, len): standard output and error go to the console,
-    // one line per console call.
+    // one line per console call. One streaming decoder per descriptor, so
+    // that a character split between two writes arrives whole.
     const lines = { 1: '', 2: '' };
+    const dec = { 1: new TextDecoder(), 2: new TextDecoder() };
     const firn = {
         write(fd, p, n) {
             if (fd !== 1 && fd !== 2) return -9;
-            lines[fd] += text.decode(bytes(p, n));
+            lines[fd] += dec[fd].decode(bytes(p, n), { stream: true });
             let i;
             while ((i = lines[fd].indexOf('\n')) >= 0) {
                 (fd === 1 ? console.log : console.error)(lines[fd].slice(0, i));
