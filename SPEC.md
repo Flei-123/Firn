@@ -948,7 +948,7 @@ source .fi
                                 +-> backends:
                                      +- x86_64  (own codegen)   <- the only target
                                      +- aarch64 (postponed, 10.5)
-                                     +- wasm32  (postponed, 10.5)
+                                     +- wasm32-browser (round WASM, 10.5)
                                      +- llvm-ir (optional, never in the bootstrap path)
 ```
 
@@ -1019,7 +1019,11 @@ attack surface at B1 and there is no hardened foreign library.
 
 * **no aarch64 backend**, until Osum targets ARM
 * **no WASM backend** -- WASM *execution* in the browser is an interpreter
-  written in Firn, not a compiler backend
+  written in Firn, not a compiler backend. *Round WASM:* a backend exists
+  now all the same, for the OTHER direction -- Firn programs (fUi pages)
+  running inside somebody else's browser: `--target=wasm32-browser`,
+  `compiler/src/codegen_wasm.rs`, `docs/ROUND-WASM.md`. It changes nothing
+  about the point above; the Firn browser still needs no WASM backend.
 * **no JIT**, no code generation at run time
 * **no dynamic libraries**, **no C++ interop**
 

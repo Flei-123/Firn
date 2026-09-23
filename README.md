@@ -58,6 +58,7 @@ the numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | **Self-hosting** | `firnc1` is written in Firn, compiles itself, **stage 2 == stage 3 character-identical** | `tools/fixpoint.sh`, `tools/self_compare.sh` |
 | **Two machines** | x86-64 and aarch64, same source, **304 of 304 comparable programs byte-identical output, 0 differing, 0 unsupported** (both build stages) | `tools/aarch64/run.sh` |
 | **Freestanding** | `--target=x86_64-none` and `--target=aarch64-none`: no operating system underneath. Both images **boot in QEMU and print over the serial line**; the x86 build is octet-identical to the plain `profile kernel` build | `tools/freestanding/none.sh` |
+| **WebAssembly** | `--target=wasm32-browser`: FIR straight to the binary `.wasm` format (no wabt, no LLVM); system calls become six host imports, the collector finds its roots on a shadow stack. **314 of 314 translatable test programs print octet for octet what the native build prints, in all four build levels** (21 more are refused with a reason); the fUi page of `tools/fui/gallery9_main.fi` runs in Chromium with **0 pixels** different from the native PNG | `tools/wasm/run.sh`, `tools/wasm/webdemo.sh`, `demos/webdemo/` |
 | **Windows** | `--target=x86_64-windows`: a **PE/COFF `.exe`** with an import table the compiler writes itself (no import library, no C runtime in the image), Win64 at the outer boundary, stack probing, and `syscall` answered over `kernel32`/`ws2_32`/`advapi32`. **299 of 304 comparable programs behave identically on Linux and Windows**; the five that do not are threads (4) and processes (1) | `tools/windows/run.sh`, `machine.sh`, `net.sh` |
 | **Language** | structs, arrays, `enum` + `match` with exhaustiveness check, generics, interfaces, closures and function values, error unions `E!T`, `defer`/`errdefer`, `comptime` + `emit`, `f32`/`f64`, `str` with `f"…"` interpolation, threads, `extern fn` in both directions | `tests/` (three build levels each) |
 | **Garbage collector** | opt-in, incremental mark-sweep, **longest pause 0.45 ms** at 120,000 live nodes; weak refs, finalizers, `GcVec`/`GcMap` | `tools/dom_soak/run.sh` |
@@ -215,8 +216,12 @@ and a `line:column` — it does not crash and it does not pretend.
 
 ### Not in the toolchain
 
-* **No WASM.** `--target=wasm32` answers *"unknown target 'wasm32' (allowed:
-  x86_64-linux, aarch64-linux, x86_64-none, aarch64-none, x86_64-windows)"*.
+* **WebAssembly only for the browser, and not all of it.**
+  `--target=wasm32-browser` (round WASM) builds a `.wasm` module for a web
+  page; SIMD, threads, inline assembler and the kernel profile are refused at
+  compile time, and so is every system call a page does not have (files,
+  sockets, processes) -- by name, with the path from `main`. There is no WASI
+  target.
 * **No LLVM backend, and there will not be one** — that is the point of the
   project, not a gap. It is listed here because people ask.
 * **No self-hosting on ARM.** `firnc0` (the Rust bootstrap) generates
@@ -376,6 +381,8 @@ firnc [OPTIONS] file.fi
                          operating system, ELF object, no syscall)
                        | x86_64-windows  (PE/COFF .exe, Win64 at the
                          boundary, syscall answered over Win32)
+                       | wasm32-browser  (a .wasm module for a web page;
+                         --emit=asm writes its text form, .wat)
   --profile=<name>     kernel | app (SPEC 2)
   --opt-level=<lvl>    dev | dev-fast | release-safe | release-fast
   --no-opt             switch off the optimizer (= --opt-level=dev)
