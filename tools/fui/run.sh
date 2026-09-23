@@ -304,6 +304,20 @@ build scene
 "$W/scene"
 
 echo
+echo "== 18e. DIE BARRIEREFREIHEIT: ROLLE, NAME, ZUSTAND, FOKUS =="
+# lib/fui/a11y.fi: jede der 23 Arten bekommt ihre Rolle, der Name
+# kommt aus der richtigen Quelle (ausdruecklich > eigene Beschriftung >
+# Etikett per Kennung > Kinder), ein Knopf ohne Namen wird GEZAEHLT,
+# Tab laeuft in Baumreihenfolge an gesperrten Elementen vorbei, der
+# Fokus rollt einen Eintrag einer langen Liste in den Ausschnitt (die
+# Verschiebungen aus viewport.fi von Hand nachgerechnet), und der
+# ausgegebene Baum einer bekannten Oberflaeche stimmt Zeile fuer Zeile.
+# Den Nachweis am echten Beispiel fuehrt tools/fui/gallery9_main.fi
+# (Abschnitt 10 dort) in der Galerie weiter unten.
+build a11y
+"$W/a11y"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
