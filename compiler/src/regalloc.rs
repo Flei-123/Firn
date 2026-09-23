@@ -4756,7 +4756,7 @@ mod tests {
         f.set_term(bd, Term::Ret(Some(cd)));
         f.set_term(0, Term::Switch { val: 0, ty: FTy::U32, cases, default: bd });
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
-        assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
+        assert!(asm.contains("jmp qword ptr [rcx + rax*8]"), "{}", asm);
         assert!(!asm.contains("mov eax, eax"), "superfluous zero extension:\n{}", asm);
         let body = asm.split("main:").nth(1).unwrap();
         // The value is not written into its frame slot first.
