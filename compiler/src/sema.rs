@@ -2579,6 +2579,10 @@ constants declared before it, and '+ - * /'"
         if let Some(t) = crate::atomic::hook_call(self, name, args, nspan, espan) {
             return t;
         }
+        // HOOK sqrt: the square root instruction (fsqrt.rs, round GAPS)
+        if let Some(t) = crate::fsqrt::hook_call(self, name, args, espan) {
+            return t;
+        }
         // HOOK simd: the vector and crypto instructions (simd.rs, round 82)
         if let Some(t) = crate::simd::hook_call(self, name, args, nspan, espan) {
             return t;

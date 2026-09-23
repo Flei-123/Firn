@@ -10,6 +10,7 @@ mod ast;
 mod ast_canon;
 mod layout_canon;
 mod atomic;
+mod fsqrt;
 mod thread;
 mod testrun;
 mod attrs;

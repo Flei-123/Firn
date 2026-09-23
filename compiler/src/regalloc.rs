@@ -3599,9 +3599,15 @@ fn emit_inst(
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
+            if matches!(op, UnOp::Sqrt) {
+                // Floats never reach this allocator (`unsupported`: "f64 in
+                // the value set"), and sqrt exists only on floats.
+                return Err("internal error: sqrt in the integer register path".into());
+            }
             ra.load_full(e, "rax", *x);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", rn("rax", bits))),
+                UnOp::Sqrt => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");

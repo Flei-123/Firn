@@ -641,6 +641,7 @@ fn unk(o: UnOp) -> u8 {
     match o {
         UnOp::Neg => 1,
         UnOp::Not => 2,
+        UnOp::Sqrt => 3,
     }
 }
 
@@ -1214,6 +1215,9 @@ fn fold_un(ty: FTy, op: UnOp, a: i128) -> i128 {
     let a = ty.truncate(a);
     match op {
         UnOp::Neg => ty.truncate(-a),
+        // Only defined on floats, and float operations are never folded
+        // (`op_has_float`); an integer sqrt cannot reach this point.
+        UnOp::Sqrt => a,
         UnOp::Not => {
             if ty == FTy::Bool {
                 if a & 1 != 0 {

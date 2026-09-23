@@ -210,6 +210,9 @@ pub enum UnOp {
     Neg,
     /// bitwise not (integer) or logical not (bool)
     Not,
+    /// **Round GAPS** -- square root of a float (`__sqrt`, fsqrt.rs).
+    /// Correctly rounded by IEEE 754; only defined on `f64`/`f32`.
+    Sqrt,
 }
 
 #[derive(Clone, Debug)]
@@ -984,6 +987,7 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Un(op, a) => match op {
             UnOp::Neg => format!("neg.{} %{}", t, a),
             UnOp::Not => format!("not.{} %{}", t, a),
+            UnOp::Sqrt => format!("sqrt.{} %{}", t, a),
         },
         Op::Cast { src, from } => format!("cast.{}.{} %{}", from.name(), t, src),
         Op::Alloca { size, align } => format!("alloca.ptr size={} align={}", size, align),

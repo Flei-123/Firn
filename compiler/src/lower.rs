@@ -1192,6 +1192,10 @@ impl<'a> Lower<'a> {
         if crate::atomic::is_atomic_call(name) && !self.info.fns.contains_key(name) {
             return crate::atomic::lower_atomic_call(self, name, args, span);
         }
+        // HOOK sqrt (round GAPS): `__sqrt` is one instruction (fsqrt.rs).
+        if crate::fsqrt::is_sqrt_call(name) && !self.info.fns.contains_key(name) {
+            return crate::fsqrt::lower_call(self, args, span);
+        }
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
         }
