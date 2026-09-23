@@ -2,6 +2,13 @@
 // Herkunft: Certus, lib/window/android.fi, Stand Certus-Commit 1f1ec17bdb68 (zuletzt
 // geaendert in cbbc9d8c0475); vom alleinigen Urheber Justin am 23.09.2026
 // fuer Firn unter MPL-2.0 freigegeben.
+//
+// FIRN (r61): THE HOST MODE. Under lib/android/activity.fi a program
+// written against lib/window/window.fi runs unchanged: its `main` sits on
+// the app thread, and this backend takes the window, the input queue and
+// the configuration over from Android's main thread (see `host_pump`).
+// Without the host (Certus drives its own callbacks) nothing below
+// changes behaviour: `activity.activity_on()` is false there.
 // lib/window/android.fi -- DIE RUECKWAND ANDROID (Runde EINKERN).
 //
 // The third backend behind `lib/window/window.fi`, after x11.fi and
@@ -72,6 +79,7 @@
 //
 import std.rt
 import android.ndk
+import android.activity
 import window.window
 // DIE MELDUNG "EINE EINGABE IST DA" -- an wen, sagt der Wirt.
 //
@@ -158,6 +166,18 @@ struct Platte {
     // Der Haken fuer die Eingabemeldung, siehe oben.
     ein_hook: fn(u64),
     ein_ud: u64,
+    // Host mode (lib/android/activity.fi): the program runs on the app
+    // thread, and `q` is the input queue attached to its looper.
+    host: bool,
+    q: u64,
+    // Host mode: the CONTENT rectangle inside the window buffer (not under
+    // status bar, navigation bar or cutout). The program sees only this:
+    // `width`/`height` are its size, pictures and touches are shifted by
+    // (ox, oy). The strips around it are painted black in `r_present`.
+    ox: usize,
+    oy: usize,
+    cw: usize,
+    ch: usize,
 }
 
 fn surface_new() -> Platte {
@@ -166,7 +186,8 @@ fn surface_new() -> Platte {
         eigen_n: 0, gift: 0, fmt: 0, dark: false, dark_bekannt: false,
         q_kind: [0; 64], q_a: [0; 64], q_x: [0; 64], q_y: [0; 64],
         q_s: [0; 64], q_head: 0, q_tail: 0,
-        ein_hook: ein_nichts, ein_ud: 0 }
+        ein_hook: ein_nichts, ein_ud: 0, host: false, q: 0,
+        ox: 0, oy: 0, cw: 0, ch: 0 }
 }
 
 fn ein_nichts(ud: u64) { }
@@ -176,7 +197,9 @@ fn ein_nichts(ud: u64) { }
 // NOCH NICHT -- ehrlich `false`, damit der Wirt es weiss, statt auf
 // Ereignisse zu warten, die nie kommen.
 fn r_full_input(x: *mut Platte, an: bool) -> bool {
-    return false
+    // The host turns ACTION_UP into EV_RELEASE and ends every touch with
+    // EV_LEAVE (a finger does not hover).
+    return activity.activity_on()
 }
 
 fn r_input_hook(x: *mut Platte, h: fn(u64), ud: u64) {
@@ -191,10 +214,16 @@ fn r_is_open(x: *mut Platte) -> bool {
 }
 
 fn r_width(x: *mut Platte) -> usize {
+    if (*x).cw > 0 {
+        return (*x).cw
+    }
     return (*x).w
 }
 
 fn r_height(x: *mut Platte) -> usize {
+    if (*x).ch > 0 {
+        return (*x).ch
+    }
     return (*x).h
 }
 
@@ -289,6 +318,32 @@ fn an_gesperrt(x: *mut Platte) -> bool {
 // as under Windows.
 fn r_open(x: *mut Platte, anzeige: usize) -> bool {
     (*x).is_open = true
+    if activity.activity_on() {
+        (*x).host = true
+        (*x).akt = activity.activity_pointer()
+        konfig_uebernehmen(x)
+        // The program asks for its window before Android has one. Wait
+        // for it here -- `make` then sizes the real window and not a
+        // buffer of our own. Ends early if the activity goes away.
+        while (*x).win == 0 && (*x).is_open {
+            let da: bool = host_pump(x, -1)
+            if activity.activity_app_ended() {
+                break
+            }
+            if r_pending(x) && (*x).win == 0 {
+                // EV_CLOSED before a window ever came.
+                var k: u32 = 0
+                var a: u32 = 0
+                var ex: u32 = 0
+                var ey: u32 = 0
+                var es: u32 = 0
+                let t: bool = r_next(x, &k, &a, &ex, &ey, &es)
+                if k == window.EV_CLOSED {
+                    return false
+                }
+            }
+        }
+    }
     return true
 }
 
@@ -305,6 +360,17 @@ fn r_make(x: *mut Platte, w: usize, h: usize) -> bool {
     }
     (*x).w = w
     (*x).h = h
+    if (*x).win != 0 && (*x).host {
+        // A phone window has the size of the screen, whatever the program
+        // asked for: 0 x 0 = the window's own size, so nothing is
+        // stretched. `width`/`height` then say what really stands there.
+        let r0: i32 = ndk.ANativeWindow_setBuffersGeometry((*x).win, 0, 0,
+            ndk.WINDOW_FORMAT_RGBA_8888)
+        (*x).w = ndk.ANativeWindow_getWidth((*x).win) as usize
+        (*x).h = ndk.ANativeWindow_getHeight((*x).win) as usize
+        rechteck_uebernehmen(x)
+        return r0 == 0
+    }
     if (*x).win != 0 {
         let r: i32 = ndk.ANativeWindow_setBuffersGeometry((*x).win,
             w as i32, h as i32, ndk.WINDOW_FORMAT_RGBA_8888)
@@ -475,11 +541,13 @@ fn an_window(x: *mut Platte) -> u64 {
 // A finished BGRX buffer to (dx, dy). Android's RGBA_8888 wants the
 // same four octets in the order R, G, B, A -- octets 0 and 2 are
 // swapped (see the header).
-fn r_image(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
-    dy: usize) -> bool {
+fn r_image(x: *mut Platte, px: u64, w: usize, h: usize, dx0: usize,
+    dy0: usize) -> bool {
     if !sperren(x) {
         return false
     }
+    let dx: usize = dx0 + (*x).ox
+    let dy: usize = dy0 + (*x).oy
     let ziel: u64 = (*x).bits
     let st: usize = (*x).stride
     var y: usize = 0
@@ -515,11 +583,13 @@ fn r_image(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
 }
 
 // A rectangle in 0xRRGGBB.
-fn r_fill(x: *mut Platte, px: u32, x0: usize, y0: usize, w: usize,
+fn r_fill(x: *mut Platte, px: u32, xa: usize, ya: usize, w: usize,
     h: usize) -> bool {
     if !sperren(x) {
         return false
     }
+    let x0: usize = xa + (*x).ox
+    let y0: usize = ya + (*x).oy
     let ziel: u64 = (*x).bits
     let st: usize = (*x).stride
     let rr: u8 = ((px >> 16) & 255 as u32) as u8
@@ -561,6 +631,9 @@ fn r_text(x: *mut Platte, fg: u32, bg: u32, tx: usize, ty: usize, p: u64,
 fn r_present(x: *mut Platte) -> bool {
     if (*x).bits == 0 {
         return true
+    }
+    if (*x).host && (*x).win != 0 && (*x).cw > 0 {
+        raender_fuellen(x)
     }
     if (*x).win == 0 {
         (*x).bits = 0
@@ -648,6 +721,9 @@ fn r_wait(x: *mut Platte, ms: i64) -> bool {
     if !(*x).is_open {
         return false
     }
+    if (*x).host {
+        return host_pump(x, ms)
+    }
     if (*x).win == 0 {
         // Without a window nothing comes. Saying that honestly is
         // better than standing in a loop.
@@ -663,6 +739,11 @@ fn r_wait(x: *mut Platte, ms: i64) -> bool {
 
 fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
     oy: *mut u32, os: *mut u32) -> bool {
+    if (*x).q_head == (*x).q_tail && (*x).host {
+        // A program that animates never waits; the commands of the main
+        // thread (a window going away!) must still be taken over.
+        let p: bool = host_pump(x, 0)
+    }
     if (*x).q_head == (*x).q_tail {
         return false
     }
@@ -681,6 +762,10 @@ fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
 // The window belongs to Android; it is NOT freed, only let go. The own
 // buffer belongs to us and goes back.
 fn r_close(x: *mut Platte) {
+    if (*x).host && (*x).q != 0 {
+        ndk.AInputQueue_detachLooper((*x).q)
+        (*x).q = 0
+    }
     if (*x).bits != 0 && (*x).win != 0 {
         let a: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
     }
@@ -774,3 +859,281 @@ fn r_drag(x: *mut Platte) { }
 
 #[no_gc]
 fn r_sysmenu(x: *mut Platte, sx: usize, sy: usize) { }
+
+// ===================================================================
+// FIRN (r61) -- THE HOST MODE: WHAT THE APP THREAD TAKES OVER
+// ===================================================================
+
+// Density and light/dark from the activity. Android's "dpi" is a density
+// class (160 = 1 dp per pixel); the window layer counts design points at
+// 96 per inch. One Android dp is one design point, so 160 -> 96.
+fn konfig_uebernehmen(x: *mut Platte) {
+    let d: usize = activity.activity_density()
+    if d > 0 {
+        an_set_dpi(x, (d * 96 + 80) / 160)
+    }
+    let n: u32 = activity.activity_night()
+    if n == 1 as u32 {
+        an_set_dark(x, false)
+    } else if n == 2 as u32 {
+        an_set_dark(x, true)
+    }
+}
+
+// Take over one command of the main thread. The acknowledgement comes
+// AFTER the change, never before: the main thread lets Android destroy a
+// window only once this thread has let go of it.
+fn host_befehl(x: *mut Platte, c: i32) {
+    if c == activity.CMD_WINDOW {
+        let w: u64 = activity.activity_pending_window()
+        if w != (*x).win {
+            an_set_window(x, w)
+            if w != 0 {
+                // NativeActivity asks for RGB_565 (getWindow().setFormat);
+                // the contract is 32 bit, so every new window is told.
+                let r: i32 = ndk.ANativeWindow_setBuffersGeometry(w, 0, 0,
+                    ndk.WINDOW_FORMAT_RGBA_8888)
+                (*x).w = ndk.ANativeWindow_getWidth(w) as usize
+                (*x).h = ndk.ANativeWindow_getHeight(w) as usize
+                rechteck_uebernehmen(x)
+                an_event(x, window.EV_CONFIGURE, 0, r_width(x) as u32,
+                    r_height(x) as u32, 0)
+                an_event(x, window.EV_EXPOSE, 0, 0, 0, 0)
+            }
+        }
+    } else if c == activity.CMD_RESIZED {
+        if (*x).win != 0 {
+            (*x).w = ndk.ANativeWindow_getWidth((*x).win) as usize
+            (*x).h = ndk.ANativeWindow_getHeight((*x).win) as usize
+            rechteck_uebernehmen(x)
+            an_event(x, window.EV_CONFIGURE, 0, r_width(x) as u32,
+                r_height(x) as u32, 0)
+            an_event(x, window.EV_EXPOSE, 0, 0, 0, 0)
+        }
+    } else if c == activity.CMD_REDRAW || c == activity.CMD_RESUME {
+        an_event(x, window.EV_EXPOSE, 0, 0, 0, 0)
+    } else if c == activity.CMD_QUEUE {
+        let q: u64 = activity.activity_pending_queue()
+        if q != (*x).q {
+            if (*x).q != 0 {
+                ndk.AInputQueue_detachLooper((*x).q)
+            }
+            (*x).q = q
+            if q != 0 {
+                ndk.AInputQueue_attachLooper(q, activity.activity_looper(),
+                    activity.IDENT_INPUT, 0, 0)
+            }
+        }
+    } else if c == activity.CMD_CONFIG {
+        let alt_dpi: usize = (*x).dpi
+        let alt_dark: bool = (*x).dark
+        activity.activity_config_read()
+        konfig_uebernehmen(x)
+        if (*x).dpi != alt_dpi {
+            an_event(x, window.EV_CONFIGURE, 0, r_width(x) as u32,
+                r_height(x) as u32, 0)
+        }
+        if (*x).dark != alt_dark {
+            an_event(x, window.EV_THEME, 0, 0, 0, 0)
+        }
+    } else if c == activity.CMD_DESTROY {
+        an_event(x, window.EV_CLOSED, 0, 0, 0, 0)
+    }
+}
+
+// Android key code -> window.K_*; 0 = none (then maybe a character).
+fn host_taste(code: i32) -> u32 {
+    if code == ndk.KEYCODE_BACK || code == ndk.KEYCODE_ESCAPE {
+        return window.K_ESCAPE
+    }
+    if code == ndk.KEYCODE_ENTER || code == ndk.KEYCODE_NUMPAD_ENTER {
+        return window.K_RETURN
+    }
+    if code == ndk.KEYCODE_DEL { return window.K_BACK }
+    if code == ndk.KEYCODE_FORWARD_DEL { return window.K_DELETE }
+    if code == ndk.KEYCODE_TAB { return window.K_TAB }
+    if code == ndk.KEYCODE_DPAD_UP { return window.K_UP }
+    if code == ndk.KEYCODE_DPAD_DOWN { return window.K_DOWN }
+    if code == ndk.KEYCODE_DPAD_LEFT { return window.K_LEFT }
+    if code == ndk.KEYCODE_DPAD_RIGHT { return window.K_RIGHT }
+    if code == ndk.KEYCODE_PAGE_UP { return window.K_PAGEUP }
+    if code == ndk.KEYCODE_PAGE_DOWN { return window.K_PAGEDOWN }
+    if code == ndk.KEYCODE_MOVE_HOME { return window.K_HOME }
+    if code == ndk.KEYCODE_MOVE_END { return window.K_END }
+    return 0 as u32
+}
+
+// One AInputEvent -> window events. Returns 1 = handled.
+fn host_eingabe(x: *mut Platte, ev: u64) -> i32 {
+    let typ: i32 = ndk.AInputEvent_getType(ev)
+    if typ == ndk.EVENT_TYPE_MOTION {
+        let act: i32 = ndk.AMotionEvent_getAction(ev) & ndk.ACTION_MASK
+        var fx: f32 = ndk.AMotionEvent_getX(ev, 0)
+        var fy: f32 = ndk.AMotionEvent_getY(ev, 0)
+        fx = fx - (*x).ox as f32
+        fy = fy - (*x).oy as f32
+        if fx < 0.0 { fx = 0.0 }
+        if fy < 0.0 { fy = 0.0 }
+        let px: u32 = fx as u32
+        let py: u32 = fy as u32
+        if act == ndk.ACTION_DOWN {
+            an_event(x, window.EV_MOTION, 0, px, py, 0)
+            an_event(x, window.EV_BUTTON, window.BTN_LEFT, px, py, 0)
+        } else if act == ndk.ACTION_MOVE
+            || act == ndk.AMOTION_EVENT_ACTION_HOVER_MOVE {
+            an_event(x, window.EV_MOTION, 0, px, py, 0)
+        } else if act == ndk.ACTION_UP {
+            // Android batches moves; the last position may only come with
+            // the UP. Without this motion a drag would end short.
+            an_event(x, window.EV_MOTION, 0, px, py, 0)
+            an_event(x, window.EV_RELEASE, window.BTN_LEFT, px, py, 0)
+            an_event(x, window.EV_LEAVE, 0, px, py, 0)
+        } else if act == ndk.ACTION_CANCEL {
+            an_event(x, window.EV_LEAVE, 0, px, py, 0)
+        } else if act == ndk.AMOTION_EVENT_ACTION_SCROLL {
+            let v: f32 = ndk.AMotionEvent_getAxisValue(ev, ndk.AXIS_VSCROLL, 0)
+            if v > 0.0 {
+                an_event(x, window.EV_BUTTON, window.BTN_WHEEL_UP, px, py, 0)
+            } else if v < 0.0 {
+                an_event(x, window.EV_BUTTON, window.BTN_WHEEL_DOWN, px, py, 0)
+            }
+        }
+        return 1
+    }
+    if typ == ndk.EVENT_TYPE_KEY {
+        let aktion: i32 = ndk.AKeyEvent_getAction(ev)
+        let code: i32 = ndk.AKeyEvent_getKeyCode(ev)
+        let meta: i32 = ndk.AKeyEvent_getMetaState(ev)
+        var zustand: u32 = 0
+        if (meta & ndk.META_SHIFT) != 0 { zustand = zustand | 1 as u32 }
+        if (meta & ndk.META_CTRL) != 0 { zustand = zustand | 4 as u32 }
+        let k: u32 = host_taste(code)
+        if aktion == ndk.KEY_ACTION_DOWN {
+            if k != 0 as u32 {
+                an_event(x, window.EV_KEY, k, code as u32, 0, zustand)
+                return 1
+            }
+            let ch: u32 = ndk.key_char(code, meta)
+            if ch != 0 as u32 {
+                an_event(x, window.EV_CHAR, ch, code as u32, 0, zustand)
+                return 1
+            }
+            return 0
+        }
+        if aktion == ndk.KEY_ACTION_UP {
+            if k != 0 as u32 {
+                an_event(x, window.EV_KEY_UP, k, code as u32, 0, zustand)
+                return 1
+            }
+            if ndk.key_char(code, meta) != 0 as u32 {
+                return 1
+            }
+        }
+        return 0
+    }
+    return 0
+}
+
+fn host_eingaben(x: *mut Platte) {
+    let q: u64 = (*x).q
+    if q == 0 {
+        return
+    }
+    var ev: u64 = 0
+    while ndk.AInputQueue_getEvent(q, (&ev) as u64) >= 0 {
+        // The soft keyboard may claim the event first.
+        if ndk.AInputQueue_preDispatchEvent(q, ev) == 0 {
+            let h: i32 = host_eingabe(x, ev)
+            ndk.AInputQueue_finishEvent(q, ev, h)
+        }
+    }
+}
+
+// THE PUMP of the host mode: wait up to `ms` (-1 = until something comes,
+// 0 = only look) on the app thread's looper, then take over everything
+// that is ready. Returns whether an event is waiting in the queue.
+fn host_pump(x: *mut Platte, ms: i64) -> bool {
+    let lp: u64 = activity.activity_looper()
+    if lp == 0 {
+        return r_pending(x)
+    }
+    var t: i32 = ms as i32
+    if ms > 2147483647 {
+        t = 2147483647
+    }
+    var runden: usize = 0
+    while runden < 64 {
+        var fd: i32 = 0
+        var evs: i32 = 0
+        var daten: u64 = 0
+        let id: i32 = ndk.ALooper_pollOnce(t, (&fd) as u64, (&evs) as u64,
+            (&daten) as u64)
+        if id == activity.IDENT_CMD {
+            var c: i32 = activity.activity_read_cmd()
+            while c != activity.CMD_NONE {
+                host_befehl(x, c)
+                activity.activity_ack()
+                c = activity.activity_read_cmd()
+            }
+        } else if id == activity.IDENT_INPUT {
+            host_eingaben(x)
+        } else {
+            // ALOOPER_POLL_TIMEOUT / _WAKE / _ERROR: nothing (more) ready.
+            break
+        }
+        // Once something came, only take what is ready as well.
+        t = 0
+        runden = runden + 1
+    }
+    return r_pending(x)
+}
+
+// The content rectangle from the activity, clipped to the buffer. Without
+// a report (or a nonsensical one) the whole window is content.
+fn rechteck_uebernehmen(x: *mut Platte) {
+    var l: i32 = 0
+    var t: i32 = 0
+    var r: i32 = 0
+    var b: i32 = 0
+    (*x).ox = 0
+    (*x).oy = 0
+    (*x).cw = 0
+    (*x).ch = 0
+    if !activity.activity_content_rect(&l, &t, &r, &b) {
+        return
+    }
+    if l < 0 || t < 0 || r as usize > (*x).w || b as usize > (*x).h {
+        return
+    }
+    (*x).ox = l as usize
+    (*x).oy = t as usize
+    (*x).cw = (r - l) as usize
+    (*x).ch = (b - t) as usize
+}
+
+// The strips around the content rectangle: black, every frame (the window
+// has two or three buffers, each with its own old content).
+fn raender_fuellen(x: *mut Platte) {
+    let ox: usize = (*x).ox
+    let oy: usize = (*x).oy
+    let cw: usize = (*x).cw
+    let ch: usize = (*x).ch
+    (*x).ox = 0
+    (*x).oy = 0
+    let w: usize = (*x).w
+    let h: usize = (*x).h
+    if oy > 0 {
+        let a: bool = r_fill(x, 0 as u32, 0, 0, w, oy)
+    }
+    if oy + ch < h {
+        let b: bool = r_fill(x, 0 as u32, 0, oy + ch, w, h - oy - ch)
+    }
+    if ox > 0 {
+        let c: bool = r_fill(x, 0 as u32, 0, oy, ox, ch)
+    }
+    if ox + cw < w {
+        let d: bool = r_fill(x, 0 as u32, ox + cw, oy, w - ox - cw, ch)
+    }
+    (*x).ox = ox
+    (*x).oy = oy
+}
