@@ -7,9 +7,11 @@
 # The program is the SAME one that runs under X11: its `main` opens a
 # window through lib/window/window.fi. What makes it an Android app:
 #
-#   1. a shadow of the entry's directory in which window/backend.fi points
-#      to lib/window/android.fi (the backend is chosen by the directory of
-#      the root file, see the header of lib/window/window.fi)
+#   1. a shadow of the program (its whole package if it has a firn.package)
+#      in which window/backend.fi points to lib/window/android.fi and a
+#      vendored platform window layer is left out (tools/android/shadow.py;
+#      the backend is chosen by the directory of the root file, see the
+#      header of lib/window/window.fi)
 #   2. firnc --target=<arch> --pic -c            ->  ELF object
 #      (--pic: no TEXTREL, which Android's loader refuses since API 23)
 #   3. ld -shared -Bsymbolic, only the entry point exported -> lib<lib>.so
@@ -91,25 +93,11 @@ BUILD=$ROOT/build/android/$SAFE
 [ -n "$OUT" ] || OUT=$BUILD/$SAFE.apk
 rm -rf "$BUILD"; mkdir -p "$BUILD"
 
-# ---- 1. the shadow directory ---------------------------------------------
-SHADOW=$BUILD/src
-mkdir -p "$SHADOW/window"
-for f in "$SRCDIR"/* "$SRCDIR"/.[!.]*; do
-    [ -e "$f" ] || continue
-    b=$(basename "$f")
-    [ "$b" = window ] && continue
-    [ "$b" = build ] && continue
-    ln -sfn "$f" "$SHADOW/$b"
-done
-if [ -d "$SRCDIR/window" ]; then
-    for f in "$SRCDIR"/window/*; do
-        [ -e "$f" ] || continue
-        [ "$(basename "$f")" = backend.fi ] && continue
-        ln -sfn "$f" "$SHADOW/window/$(basename "$f")"
-    done
-fi
-ln -sfn "$FIRNLIB/window/android.fi" "$SHADOW/window/backend.fi"
-ROOTFILE=$SHADOW/$(basename "$ENTRY_ABS")
+# ---- 1. the shadow tree ----------------------------------------------------
+# tools/android/shadow.py mirrors the program (its whole package, if it has a
+# firn.package) and leaves out every vendored platform window layer.
+ROOTFILE=$(python3 "$ROOT/tools/android/shadow.py" "$ENTRY_ABS" "$BUILD/src" \
+    "$FIRNLIB/window/android.fi")
 
 # ---- 2./3. compile and link ----------------------------------------------
 build_abi() { # $1 abi dir, $2 firn target, $3 linker, $4 NDK triple
@@ -138,8 +126,8 @@ build_abi() { # $1 abi dir, $2 firn target, $3 linker, $4 NDK triple
     fi
     echo "  $abi: compiled in $(( (t1-t0)/1000000 )) ms, lib$LIB.so $(stat -c%s "$out/lib$LIB.so") octets, no TEXTREL"
 }
-case "$ABI" in arm64|both) build_abi arm64-v8a aarch64-linux aarch64-linux-gnu-ld aarch64-linux-android ;; esac
-case "$ABI" in x86_64|both) build_abi x86_64 x86_64-linux ld x86_64-linux-android ;; esac
+case "$ABI" in arm64|both) build_abi arm64-v8a aarch64-android aarch64-linux-gnu-ld aarch64-linux-android ;; esac
+case "$ABI" in x86_64|both) build_abi x86_64 x86_64-android ld x86_64-linux-android ;; esac
 
 # ---- 3b. the push service: a class written by Firn ------------------------
 if [ $PUSH -eq 1 ]; then

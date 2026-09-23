@@ -59,6 +59,8 @@ S = [
 ("N_REQ_PERM","requestPermissions"),
 ("G_REQ_PERM","([Ljava/lang/String;I)V"),
 ("S_POST_NOTIF","android.permission.POST_NOTIFICATIONS"),
+("N_GET_APP","getApplicationContext"),
+("G_GET_APP","()Landroid/content/Context;"),
 ("S_SERVICE_CLASS","org.firn.FirnService"),
 ("S_ICON","stat_notify_chat"),
 ("G_INT","I"),
@@ -76,7 +78,7 @@ S = [
 ("S_L_START","service started"),
 ("S_L_STOP","service destroyed"),
 ("S_L_NOTE","notification posted"),
-("S_L_NOCFG","no firn-push.cfg"),
+("S_L_NOCFG","no relay configured (service only)"),
 ]
 txt=""; offs=[]; off=0
 for n,v in S:
