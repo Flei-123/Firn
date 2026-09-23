@@ -409,8 +409,16 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 #   2. JEDE Datei tools/fui/*_main.fi und demos/fuidemo/main.fi muss in
 #      diesem Skript VORKOMMEN. (Die uebrigen Demos gehoeren anderen
 #      Baeumen; sie werden gebaut, aber nicht hier gerechnet.)
+#   An Android-only program (it imports plat.android, which links against
+#   the NDK: pthread, ANativeActivity) cannot be linked on this host. It
+#   is still built -- as an object for x86_64-android, the first half of
+#   tools/android/build.sh -- so it cannot silently stop building either.
 for f in tools/fui/*_main.fi demos/*/main.fi; do
-    "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
+    if grep -q '^import plat\.android' "$f"; then
+        "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
+    else
+        "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
+    fi
 done
 echo "  alle tools/fui/*_main.fi und demos/*/main.fi uebersetzen  OK"
 fehlt=0
