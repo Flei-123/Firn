@@ -141,6 +141,135 @@ pub fn aarch64(n: i64) -> Option<A64> {
     TABLE.iter().find(|(k, _)| *k == n).map(|(_, v)| *v)
 }
 
+// ====================================================================
+// ROUND WASM -- the same numbers, read by a browser.
+// ====================================================================
+//
+// In the browser there is no kernel. There is a HOST: the JavaScript that
+// instantiated the module. What a Linux system call becomes there is
+// decided here, in one table, by the same canonical x86-64 number -- and
+// the third answer of the aarch64 table has a sharper edge here: a call
+// the browser does not have is refused at COMPILE time, with its name and
+// the reason (`codegen_wasm.rs` adds the path through which `main`
+// reaches it). Nothing is emulated that would behave differently from the
+// kernel's answer; where a call has an exact equivalent under "one
+// process, one thread, no files" it gets that equivalent.
+
+/// What becomes of an x86-64 system call number on `wasm32-browser`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wasm {
+    /// `firn.write(fd, buf, len)` -- the host decides what fd 1 and 2 are
+    /// (the console, the terminal)
+    Write,
+    /// `firn.read(fd, buf, len)` -- standard input, if the host has one
+    Read,
+    /// `firn.exit(code)` -- `exit` and `exit_group` alike: one thread
+    Exit,
+    /// the host's nanosecond clock, split into a `timespec`
+    ClockGettime,
+    /// `firn.random(buf, len)` -- `crypto.getRandomValues` in a browser
+    Getrandom,
+    /// `firn.sleep_ns(ns)`
+    Nanosleep,
+    /// anonymous memory on top of `memory.grow` (`wasm_rt.rs`)
+    Mmap,
+    /// back into the free list of `wasm_rt.rs`
+    Munmap,
+    /// the futex of a process with exactly one thread (`wasm_rt.rs`)
+    Futex,
+    /// a call whose answer is a fixed number here
+    Constant(i64),
+    /// no counterpart -- the reason goes into the error message
+    Missing(&'static str),
+}
+
+const NO_FILES: &str = "a browser page has no files and no file descriptors";
+const NO_SOCKETS: &str = "a browser page has no sockets (fetch/WebSocket are not system calls)";
+const NO_PROCESSES: &str = "a browser page cannot start, wait for or signal processes";
+const NO_THREADS: &str = "threads are not supported on wasm32 yet";
+const NO_SIGNALS: &str = "a browser page has no signals";
+
+/// The table: the canonical number, the name both `unistd.h` spell, the
+/// answer. Sorted by the number.
+const WASM_TABLE: &[(i64, &str, Wasm)] = &[
+    (0, "read", Wasm::Read),
+    (1, "write", Wasm::Write),
+    (2, "open", Wasm::Missing(NO_FILES)),
+    (3, "close", Wasm::Missing(NO_FILES)),
+    (4, "stat", Wasm::Missing(NO_FILES)),
+    (5, "fstat", Wasm::Missing(NO_FILES)),
+    (6, "lstat", Wasm::Missing(NO_FILES)),
+    (7, "poll", Wasm::Missing(NO_FILES)),
+    (8, "lseek", Wasm::Missing(NO_FILES)),
+    (9, "mmap", Wasm::Mmap),
+    (10, "mprotect", Wasm::Missing("WebAssembly memory has no page protection")),
+    (11, "munmap", Wasm::Munmap),
+    (12, "brk", Wasm::Missing("the program break does not exist in WebAssembly memory (use mmap)")),
+    (13, "rt_sigaction", Wasm::Missing(NO_SIGNALS)),
+    (14, "rt_sigprocmask", Wasm::Missing(NO_SIGNALS)),
+    (16, "ioctl", Wasm::Missing(NO_FILES)),
+    (17, "pread64", Wasm::Missing(NO_FILES)),
+    (18, "pwrite64", Wasm::Missing(NO_FILES)),
+    (19, "readv", Wasm::Missing(NO_FILES)),
+    (20, "writev", Wasm::Missing(NO_FILES)),
+    // One thread: yielding to nobody returns at once, as the kernel does
+    // when no other thread is runnable.
+    (24, "sched_yield", Wasm::Constant(0)),
+    // Advice may be ignored -- the kernel is allowed to do exactly that.
+    (28, "madvise", Wasm::Constant(0)),
+    (32, "dup", Wasm::Missing(NO_FILES)),
+    (33, "dup2", Wasm::Missing(NO_FILES)),
+    (35, "nanosleep", Wasm::Nanosleep),
+    // The one process of the page. 1 is as good a number as any, and it
+    // is never 0 (which a caller could read as "the child").
+    (39, "getpid", Wasm::Constant(1)),
+    (41, "socket", Wasm::Missing(NO_SOCKETS)),
+    (42, "connect", Wasm::Missing(NO_SOCKETS)),
+    (43, "accept", Wasm::Missing(NO_SOCKETS)),
+    (44, "sendto", Wasm::Missing(NO_SOCKETS)),
+    (45, "recvfrom", Wasm::Missing(NO_SOCKETS)),
+    (46, "sendmsg", Wasm::Missing(NO_SOCKETS)),
+    (47, "recvmsg", Wasm::Missing(NO_SOCKETS)),
+    (48, "shutdown", Wasm::Missing(NO_SOCKETS)),
+    (49, "bind", Wasm::Missing(NO_SOCKETS)),
+    (50, "listen", Wasm::Missing(NO_SOCKETS)),
+    (51, "getsockname", Wasm::Missing(NO_SOCKETS)),
+    (52, "getpeername", Wasm::Missing(NO_SOCKETS)),
+    (53, "socketpair", Wasm::Missing(NO_SOCKETS)),
+    (54, "setsockopt", Wasm::Missing(NO_SOCKETS)),
+    (55, "getsockopt", Wasm::Missing(NO_SOCKETS)),
+    (56, "clone", Wasm::Missing(NO_THREADS)),
+    (57, "fork", Wasm::Missing(NO_PROCESSES)),
+    (59, "execve", Wasm::Missing(NO_PROCESSES)),
+    (60, "exit", Wasm::Exit),
+    (61, "wait4", Wasm::Missing(NO_PROCESSES)),
+    (62, "kill", Wasm::Missing(NO_PROCESSES)),
+    (63, "uname", Wasm::Missing("a browser page has no kernel to name")),
+    (72, "fcntl", Wasm::Missing(NO_FILES)),
+    (79, "getcwd", Wasm::Missing(NO_FILES)),
+    (96, "gettimeofday", Wasm::Missing("use clock_gettime (228), which the host provides")),
+    (102, "getuid", Wasm::Missing("a browser page has no users")),
+    (107, "geteuid", Wasm::Missing("a browser page has no users")),
+    (158, "arch_prctl", Wasm::Missing(NO_THREADS)),
+    // The one thread of the process.
+    (186, "gettid", Wasm::Constant(1)),
+    (200, "tgkill", Wasm::Missing(NO_SIGNALS)),
+    (202, "futex", Wasm::Futex),
+    (217, "getdents64", Wasm::Missing(NO_FILES)),
+    (228, "clock_gettime", Wasm::ClockGettime),
+    (231, "exit_group", Wasm::Exit),
+    (257, "openat", Wasm::Missing(NO_FILES)),
+    (262, "newfstatat", Wasm::Missing(NO_FILES)),
+    (288, "accept4", Wasm::Missing(NO_SOCKETS)),
+    (318, "getrandom", Wasm::Getrandom),
+];
+
+/// The browser form of the canonical (x86-64) system call number `n`,
+/// with the call's name for the messages.
+pub fn wasm(n: i64) -> Option<(&'static str, Wasm)> {
+    WASM_TABLE.iter().find(|(k, _, _)| *k == n).map(|(_, nm, v)| (*nm, *v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +313,28 @@ mod tests {
     fn the_table_is_sorted_and_free_of_duplicates() {
         for w in TABLE.windows(2) {
             assert!(w[0].0 < w[1].0, "table not sorted at {}", w[0].0);
+        }
+    }
+
+    #[test]
+    fn the_browser_table_is_sorted_and_names_every_call() {
+        for w in WASM_TABLE.windows(2) {
+            assert!(w[0].0 < w[1].0, "wasm table not sorted at {}", w[0].0);
+        }
+        assert_eq!(wasm(1), Some(("write", Wasm::Write)));
+        assert!(matches!(wasm(2), Some(("open", Wasm::Missing(_)))));
+        assert!(matches!(wasm(41), Some(("socket", Wasm::Missing(_)))));
+        assert!(matches!(wasm(57), Some(("fork", Wasm::Missing(_)))));
+        assert_eq!(wasm(9), Some(("mmap", Wasm::Mmap)));
+        assert_eq!(wasm(4711), None);
+    }
+
+    #[test]
+    fn every_call_of_the_aarch64_table_has_a_browser_answer() {
+        // The two tables cover the same calls: a number the library uses
+        // on one target is never silently unknown on the other.
+        for (n, _) in TABLE {
+            assert!(wasm(*n).is_some(), "syscall {} has no wasm32 answer", n);
         }
     }
 }

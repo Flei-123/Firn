@@ -21,6 +21,12 @@
 //! **The x86-64 path must not change.** Every function here answers for
 //! `Target::X86_64` exactly what stood in the source before, character for
 //! character; the aarch64 answers are the additions.
+//!
+//! **ROUND WASM** adds a third target that is no machine at all:
+//! `wasm32-browser`, a WebAssembly module for a web page
+//! (`codegen_wasm.rs`). It has no assembler and no linker -- the code
+//! generator writes the binary module itself -- so the two tool names are
+//! empty for it and `main.rs` never asks for them.
 
 use std::cell::Cell;
 
@@ -28,6 +34,9 @@ use std::cell::Cell;
 pub enum Target {
     X86_64,
     Aarch64,
+    /// ROUND WASM: WebAssembly 1.0 (plus sign extension, non-trapping
+    /// float-to-int and bulk memory), 32-bit linear memory, a browser host.
+    Wasm32Browser,
 }
 
 impl Target {
@@ -36,20 +45,27 @@ impl Target {
         match self {
             Target::X86_64 => "x86_64-linux",
             Target::Aarch64 => "aarch64-linux",
+            Target::Wasm32Browser => "wasm32-browser",
         }
+    }
+    /// Does this target produce a WebAssembly module instead of machine
+    /// code through `as`/`ld`?
+    pub fn is_wasm(self) -> bool {
+        self == Target::Wasm32Browser
     }
     /// The assembler for this machine.
     pub fn assembler(self) -> &'static str {
         match self {
             Target::X86_64 => "as",
             Target::Aarch64 => "aarch64-linux-gnu-as",
+            Target::Wasm32Browser => "",
         }
     }
     /// The arguments the assembler needs in front of `-o`.
     pub fn as_flags(self) -> &'static [&'static str] {
         match self {
             Target::X86_64 => &["--64"],
-            Target::Aarch64 => &[],
+            Target::Aarch64 | Target::Wasm32Browser => &[],
         }
     }
     /// The linker for this machine.
@@ -57,6 +73,7 @@ impl Target {
         match self {
             Target::X86_64 => "ld",
             Target::Aarch64 => "aarch64-linux-gnu-ld",
+            Target::Wasm32Browser => "",
         }
     }
     /// `.align N` counts BYTES in the x86 port of GNU as and POWERS OF TWO
@@ -66,7 +83,9 @@ impl Target {
     pub fn align_directive(self, bytes: u64) -> String {
         match self {
             Target::X86_64 => format!(".align {}", bytes),
-            Target::Aarch64 => format!(".balign {}", bytes),
+            // The data texts of gc.rs, iface.rs and fnval.rs are READ by
+            // codegen_wasm.rs; `.balign` says bytes without ambiguity.
+            Target::Aarch64 | Target::Wasm32Browser => format!(".balign {}", bytes),
         }
     }
 }
@@ -80,9 +99,10 @@ pub fn flag_set(name: &str) -> Result<(), String> {
     let t = match name {
         "x86_64-linux" | "x86-64-linux" | "x86_64" => Target::X86_64,
         "aarch64-linux" | "arm64-linux" | "aarch64" => Target::Aarch64,
+        "wasm32-browser" | "wasm32" => Target::Wasm32Browser,
         other => {
             return Err(format!(
-                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux)",
+                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser)",
                 other
             ))
         }
@@ -126,5 +146,17 @@ mod tests {
     #[test]
     fn unknown_target_is_refused() {
         assert!(flag_set("sparc").is_err());
+    }
+
+    #[test]
+    fn the_browser_is_a_target_without_tools() {
+        reset();
+        flag_set("wasm32-browser").unwrap();
+        assert!(active().is_wasm());
+        assert_eq!(active().name(), "wasm32-browser");
+        assert_eq!(active().assembler(), "");
+        assert_eq!(align(8), ".balign 8");
+        reset();
+        assert!(!active().is_wasm());
     }
 }
