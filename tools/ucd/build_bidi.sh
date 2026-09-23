@@ -32,6 +32,12 @@ for a in "$@"; do
     [ "$a" = "--verify" ] && VERIFY=1
     [ "$a" = "--fetch" ] && FETCH=1
 done
+# Der Arbeitsordner als absoluter Pfad: Schritt 1 wechselt nach
+# tools/ucd, und ein relativer Pfad zeigte von dort ins Leere.
+case "$WORK" in
+    /*) ;;
+    *) WORK="$ROOT/$WORK" ;;
+esac
 export FIRNLIB="$ROOT/lib"
 fail() { echo "FAILED: $*"; exit 1; }
 mkdir -p "$WORK"
@@ -78,7 +84,7 @@ sed -e "s|@DBC_BYTES@|$(sz DerivedBidiClass.txt)|" -e "s|@DBC_SHA@|$(sh DerivedB
     -e "s|@UCD_BYTES@|$(sz UnicodeData.txt)|" -e "s|@UCD_SHA@|$(sh UnicodeData.txt)|" \
     -e "s|@UVER@|$UVER|" tools/ucd/bidi_head.fi.in > "$WORK/table.fi"
 grep -q '@' "$WORK/table.fi" && fail "im Kopf ist ein Platzhalter stehen geblieben"
-( cd tools/ucd && "$ROOT/$WORK/pack_bidi" DerivedBidiClass.txt BidiMirroring.txt \
+( cd tools/ucd && "$WORK/pack_bidi" DerivedBidiClass.txt BidiMirroring.txt \
     BidiBrackets.txt ArabicShaping.txt UnicodeData.txt ) >> "$WORK/table.fi" 2> "$WORK/pack.log"
 rc=$?
 cat "$WORK/pack.log"

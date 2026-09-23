@@ -304,6 +304,31 @@ build scene
 "$W/scene"
 
 echo
+echo "== 18e. DIE ZWEIRICHTUNGSSCHRIFT: DATEN UND ALGORITHMUS =="
+# Arabisch und Hebraeisch stehen von rechts nach links, Zahlen und
+# lateinische Woerter darin von links nach rechts. Welche Reihenfolge
+# richtig ist, sagt der Unicode-Bidi-Algorithmus (UAX #9), und der steht
+# in lib/fui/bidi.fi. Hier wird zweierlei nachgerechnet:
+#
+#   1. die Bidi-Tabelle (lib/generated/bidi_tables.fi) entsteht aus der
+#      UCD 17.0.0 Oktett fuer Oktett gleich, und ein zweiter Zerleger
+#      (tools/ucd/verify_bidi.py) haelt sie ueber alle 1.114.112
+#      Codepunkte gegen die Dateien -- samt Gegenprobe mit einer
+#      gefaelschten Zeile;
+#   2. lib/fui/bidi.fi gegen BidiCharacterTest.txt, die Prueffaelle des
+#      Unicode-Konsortiums: 91.707 Absaetze mit erwarteter Absatzebene,
+#      Ebene je Zeichen und Reihenfolge auf dem Schirm. Kein einziger
+#      darf abweichen.
+BIDI_WORK="$W/ucd-bidi" bash tools/ucd/build_bidi.sh --verify > "$W/bidi_build.log" 2>&1 || {
+    cat "$W/bidi_build.log"
+    echo "  die Bidi-Tabelle ist nicht, was die UCD sagt -- NICHT bestanden"
+    exit 1
+}
+grep -E "gleich|Gegenprobe|VERSCHIEDEN|Oktette zur|Laufzeit" "$W/bidi_build.log" | sed 's/^ */  /'
+build bidiconf
+gzip -dc tools/ucd/BidiCharacterTest.txt.gz | "$W/bidiconf"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
