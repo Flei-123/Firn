@@ -270,6 +270,21 @@ build editor
 "$W/editor"
 
 echo
+echo "== 18a. DIE EINGABEMETHODE: CHINESISCH, JAPANISCH, KOREANISCH =="
+# lib/fui/ime.fi mit seinem Anschluss an editor.fi. Nachgerechnet
+# werden Romaji nach Kana (Doppelkonsonant, n-Regel, tch), die
+# Hangul-Silben nach Unicode Kapitel 3.12 (zusammensetzen UND zerlegen,
+# jede Zahl steht ausgerechnet daneben), der wandernde Auslaut, der
+# Vorbearbeitungstext mit dem Schreibzeiger davor und dahinter, die
+# Auswahl, die erst beim Bestaetigen ersetzt wird und beim Abbrechen
+# wiederkommt, die Kandidaten, Pinyin gegen die mitgelieferte Tabelle
+# und die Plattform-Schnittstelle ueber eine nachgeahmte Plattform.
+# Das Bild dazu (Feld mit offener Kandidatenliste) entsteht unten bei
+# --images mit tools/fui/imebeleg_main.fi.
+build ime
+"$W/ime"
+
+echo
 echo "== 18b. DER SCHEIBENKASTEN =="
 # lib/fui/viewport.fi: der Ausschnitt, der mehr Inhalt aufnimmt, als er
 # hoch ist. Nachgerechnet werden die Rechnung ueber Kreuz (ein
