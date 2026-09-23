@@ -99,7 +99,7 @@ B1-B4, all of which are merges or collector work, not language features.
 
 ## E. The test suite at the end of the round
 
-`./test.sh` on this branch: 1649 checks, 347 programs x 4 levels, all
+`./test.sh` on this branch: 1649 checks, 347 programs x 4 levels (the two added after the full run, 1662 and 1663, checked the same way on their own), all
 negative tests, the self-compiling comparison (350 same behaviour, 0
 differing), the fixpoint (stage 2 == stage 3, character-identical) -- green.
 Three checks are red, and they are red on `main` (56bea7e9) too, for
