@@ -304,6 +304,20 @@ build scene
 "$W/scene"
 
 echo
+echo "== 18e. DIE BARRIEREFREIHEIT: ROLLE, NAME, ZUSTAND, FOKUS =="
+# lib/fui/a11y.fi: jede der 23 Arten bekommt ihre Rolle, der Name
+# kommt aus der richtigen Quelle (ausdruecklich > eigene Beschriftung >
+# Etikett per Kennung > Kinder), ein Knopf ohne Namen wird GEZAEHLT,
+# Tab laeuft in Baumreihenfolge an gesperrten Elementen vorbei, der
+# Fokus rollt einen Eintrag einer langen Liste in den Ausschnitt (die
+# Verschiebungen aus viewport.fi von Hand nachgerechnet), und der
+# ausgegebene Baum einer bekannten Oberflaeche stimmt Zeile fuer Zeile.
+# Den Nachweis am echten Beispiel fuehrt tools/fui/gallery9_main.fi
+# (Abschnitt 10 dort) in der Galerie weiter unten.
+build a11y
+"$W/a11y"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
@@ -827,7 +841,19 @@ if [ "$1" = "--images" ]; then
     # PNG und der Lauf bleibt daran haengen.
     build gallery9
     kette gallery9 1240
-    "$W/gallery9" "$Z/fui-deklarativ-hell.png" light
+    # Das sechste Argument laesst dieselbe Seite ihren Barrierefreiheits-
+    # Baum (lib/fui/a11y.fi, a11y_dump) als Text neben das Bild legen.
+    # Abschnitt 10 im Programm verlangt dabei, dass jedes der 12
+    # Bedienelemente Rolle und Namen hat; sonst gibt es kein Bild.
+    "$W/gallery9" "$Z/fui-deklarativ-hell.png" light - 1240 \
+        "$Z/fui-deklarativ-a11y.txt"
+    if ! grep -q '^    textbox "Im Baum suchen" focusable' \
+        "$Z/fui-deklarativ-a11y.txt"; then
+        echo "  FEHLER: fui-deklarativ-a11y.txt fehlt oder das Suchfeld hat"
+        echo "  darin keinen Namen."
+        exit 1
+    fi
+    echo "  fui-deklarativ-a11y.txt: $(wc -l < "$Z/fui-deklarativ-a11y.txt") Zeilen Barrierefreiheits-Baum  OK"
     "$W/gallery9" "$Z/fui-deklarativ-dunkel.png" dark
     beleg "$Z/fui-deklarativ-hell.png" 1240 700 740 200 40 1
     beleg "$Z/fui-deklarativ-dunkel.png" 1240 700 740 200 40 1
