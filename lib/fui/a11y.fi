@@ -68,6 +68,9 @@ export {
     ROLE_STATUS, ROLE_COUNT,
     role_of_kind, role_is_widget, role_names_from_content,
     a11y_set_role, a11y_role,
+    NAME_NONE, NAME_EXPLICIT, NAME_OWN, NAME_LABELLED, NAME_CONTENT,
+    a11y_set_name, a11y_clear_name, a11y_set_labelled_by,
+    a11y_name, a11y_name_source, a11y_unnamed, a11y_widgets,
 }
 
 import fui.widget
@@ -342,4 +345,290 @@ fn own_role(sc: *mut scene.Scene, i: usize) -> u32 {
         return ROLE_IMAGE
     }
     return role_of_kind(widget.w_kind(scene.node_widget(sc, i)))
+}
+
+// ======================================================================
+// DER ZUGAENGLICHE NAME
+// ======================================================================
+//
+// DIE REIHENFOLGE, IN DER GESUCHT WIRD -- und die erste Quelle, die
+// etwas Lesbares liefert, gewinnt:
+//
+//   1. NAME_EXPLICIT  der ausdrueckliche Name (a11y_set_name, das
+//                     aria-label des Webs). Wer ihn setzt, meint es.
+//   2. NAME_OWN       die Beschriftung des Elements selbst -- der Text
+//                     am Widget. AUSSER beim Textfeld und beim
+//                     Klappfeld: dort ist der Text der WERT (siehe
+//                     `own_text_names`).
+//   3. NAME_LABELLED  der Text eines verbundenen Etiketts
+//                     (a11y_set_labelled_by), gefunden ueber seine
+//                     KENNUNG im Baum (scene.scene_find_id).
+//   4. NAME_CONTENT   der Text der Kinder, der Reihe nach -- aber nur
+//                     bei Rollen, die ihren Namen aus dem Inhalt nehmen
+//                     duerfen (role_names_from_content).
+//
+// "Lesbar" heisst: mindestens ein Zeichen, das kein Leerraum ist. Die
+// Texte in fUi stehen oft in Feldern fester Laenge und sind mit
+// Leerzeichen aufgefuellt ("Neu     "); ein Vorleseprogramm soll "Neu"
+// sagen und nicht fuenf Pausen machen. Darum wird Leerraum wie im Web
+// behandelt: vorn und hinten weg, innen zu EINEM Leerzeichen
+// zusammengezogen. Ein Name aus lauter Leerzeichen ist KEIN Name.
+//
+// FEHLT DER NAME BEI ETWAS BEDIENBAREM, IST DAS EIN FEHLER, der
+// gezaehlt wird (a11y_unnamed) -- und in der Ausgabe des Baumes steht
+// an genau diesem Element "!name". Still durchgehen darf es nicht.
+const NAME_NONE: u32 = 0
+const NAME_EXPLICIT: u32 = 1
+const NAME_OWN: u32 = 2
+const NAME_LABELLED: u32 = 3
+const NAME_CONTENT: u32 = 4
+
+// Wie tief die Suche im Inhalt hinabsteigt. Ein Baum ist ohnehin nicht
+// tiefer als die Kette des Stilblattes; die Schranke steht hier nur,
+// damit ein verdrehter Baum (ein Knoten, der sich selbst als Kind
+// fuehrt) die Suche nicht endlos macht.
+const DEPTH_MAX: usize = 32
+
+// ---------------------------------------------------------- DAS SCHREIBEN
+//
+// Namen und Baum werden in einen Puffer DES AUFRUFERS geschrieben --
+// wie jeder Text in fUi dem Aufrufer gehoert. `n` zaehlt dabei auch das,
+// was nicht mehr hineinpasst: wie bei snprintf erfaehrt der Aufrufer so,
+// wie gross sein Puffer haette sein muessen, statt eines abgeschnittenen
+// Namens ohne Meldung. Ein Puffer der Laenge 0 ist erlaubt; dann wird
+// nur gezaehlt.
+struct Out {
+    p: u64,
+    cap: usize,
+    n: usize,
+    // Wo der gerade geschriebene Name beginnt, ob noch ein Leerzeichen
+    // aussteht, und ob Anfuehrungszeichen maskiert werden (in der
+    // Ausgabe des Baumes steht der Name zwischen zweien).
+    start: usize,
+    pend: u32,
+    esc: u32,
+}
+
+fn out_new(p: u64, cap: usize) -> Out {
+    return Out { p: p, cap: cap, n: 0, start: 0, pend: 0 as u32,
+        esc: 0 as u32 }
+}
+
+fn put(o: *mut Out, b: u8) {
+    if (*o).p != 0 && (*o).n < (*o).cap {
+        *(((*o).p + (*o).n as u64) as *mut u8) = b
+    }
+    (*o).n = (*o).n + 1
+}
+
+// Ein Stueck Namen, mit dem Leerraum des Webs: Leerraum vorn faellt
+// weg, Leerraum innen wird zu einem Leerzeichen, und das erst, wenn
+// danach noch etwas Lesbares kommt -- dadurch faellt der Leerraum
+// hinten von selbst weg.
+fn put_text(o: *mut Out, p: u64, n: usize) {
+    if p == 0 {
+        return
+    }
+    var k: usize = 0
+    while k < n {
+        let b: u8 = *((p + k as u64) as *mut u8)
+        if b <= 32 as u8 {
+            if (*o).n > (*o).start {
+                (*o).pend = 1 as u32
+            }
+        } else {
+            if (*o).pend != 0 as u32 {
+                put(o, 32 as u8)
+                (*o).pend = 0 as u32
+            }
+            if (*o).esc != 0 as u32 && (b == 34 as u8 || b == 92 as u8) {
+                put(o, 92 as u8)
+            }
+            put(o, b)
+        }
+        k = k + 1
+    }
+}
+
+// Zwischen zwei Teilen eines zusammengesetzten Namens steht ein
+// Leerzeichen -- aber nur, wenn schon etwas dasteht.
+fn put_gap(o: *mut Out) {
+    if (*o).n > (*o).start {
+        (*o).pend = 1 as u32
+    }
+}
+
+// ------------------------------------------------------ DIE ANGABEN SETZEN
+
+// Der ausdrueckliche Name. Der Text bleibt beim Aufrufer.
+fn a11y_set_name(ax: *mut A11y, i: usize, p: u64, n: usize) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].np = p
+    (*ax).a[i].nn = n
+    (*ax).a[i].has_name = 1 as u32
+}
+
+fn a11y_clear_name(ax: *mut A11y, i: usize) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].np = 0
+    (*ax).a[i].nn = 0
+    (*ax).a[i].has_name = 0 as u32
+}
+
+// Das verbundene Etikett, ueber seine KENNUNG (scene.node_set_id). Die
+// Kennung 0 heisst in scene.fi "keine" und nimmt die Verbindung darum
+// zurueck.
+fn a11y_set_labelled_by(ax: *mut A11y, i: usize, id: u32) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].lby = id
+}
+
+// Ob der Text am Widget der NAME ist. Beim Textfeld und beim Klappfeld
+// ist er es nicht, sondern der Wert -- der Grund steht bei
+// role_names_from_content.
+fn own_text_names(r: u32) -> bool {
+    return r != ROLE_TEXTBOX && r != ROLE_COMBOBOX
+}
+
+// ---------------------------------------------------------- DIE SUCHE
+
+// Den Namen schreiben und seine Quelle nennen. Jede Quelle wird der
+// Reihe nach VERSUCHT: bleibt sie leer, wird der Puffer auf den Anfang
+// zurueckgesetzt und die naechste gefragt. So gibt es genau eine
+// Funktion, die weiss, was "der Name" ist -- a11y_name, a11y_name_source
+// und die Ausgabe des Baumes rufen alle diese.
+fn name_into(sc: *mut scene.Scene, ax: *mut A11y, i: usize,
+    o: *mut Out) -> u32 {
+    (*o).start = (*o).n
+    (*o).pend = 0 as u32
+    let anfang: usize = (*o).n
+    if i >= scene.scene_count(sc) {
+        return NAME_NONE
+    }
+    let r: u32 = a11y_role(sc, ax, i)
+    // 1. ausdruecklich
+    if slot_ok(i) && (*ax).a[i].has_name != 0 as u32 {
+        put_text(o, (*ax).a[i].np, (*ax).a[i].nn)
+        if (*o).n > anfang {
+            return NAME_EXPLICIT
+        }
+    }
+    // 2. die eigene Beschriftung
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    if own_text_names(r) {
+        put_text(o, widget.w_text(e), widget.w_text_len(e))
+        if (*o).n > anfang {
+            return NAME_OWN
+        }
+    }
+    // 3. das verbundene Etikett
+    if slot_ok(i) && (*ax).a[i].lby != 0 as u32 {
+        let j: usize = scene.scene_find_id(sc, (*ax).a[i].lby)
+        if j != scene.SCENE_NONE && j != i {
+            label_text(sc, ax, j, o, 0)
+            if (*o).n > anfang {
+                return NAME_LABELLED
+            }
+        }
+    }
+    // 4. der Inhalt
+    if role_names_from_content(r) {
+        kids_text(sc, ax, i, o, 0)
+        if (*o).n > anfang {
+            return NAME_CONTENT
+        }
+    }
+    (*o).n = anfang
+    (*o).pend = 0 as u32
+    return NAME_NONE
+}
+
+// DER TEXT EINES ETIKETTS -- oder eines Kindes, das zum Namen seines
+// Elternteils beitraegt. Wie im Web: hat es selbst einen ausdruecklichen
+// Namen, zaehlt der (und nur der); sonst sein eigener Text und danach
+// der seiner Kinder. Einem WEITEREN verbundenen Etikett wird hier nicht
+// gefolgt -- auch das ist die Regel des Webs, und sie verhindert, dass
+// zwei Etiketten, die aufeinander zeigen, sich endlos gegenseitig
+// vorlesen.
+fn label_text(sc: *mut scene.Scene, ax: *mut A11y, j: usize, o: *mut Out,
+    tiefe: usize) {
+    if j >= scene.scene_count(sc) || tiefe > DEPTH_MAX {
+        return
+    }
+    put_gap(o)
+    if slot_ok(j) && (*ax).a[j].has_name != 0 as u32 {
+        let vorher: usize = (*o).n
+        put_text(o, (*ax).a[j].np, (*ax).a[j].nn)
+        if (*o).n > vorher {
+            return
+        }
+    }
+    let e: *mut widget.Widget = scene.node_widget(sc, j)
+    put_text(o, widget.w_text(e), widget.w_text_len(e))
+    kids_text(sc, ax, j, o, tiefe + 1)
+}
+
+fn kids_text(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
+    tiefe: usize) {
+    if tiefe > DEPTH_MAX {
+        return
+    }
+    var k: usize = scene.scene_first_child(sc, i)
+    while k != scene.SCENE_NONE && k < scene.scene_count(sc) {
+        label_text(sc, ax, k, o, tiefe)
+        k = scene.scene_next_sibling(sc, k)
+    }
+}
+
+// DER NAME, in den Puffer `p` (Laenge `cap`) geschrieben. Zurueck kommt
+// die volle Laenge -- ist sie groesser als `cap`, war der Puffer zu
+// klein, und es steht nur der Anfang darin. 0 heisst: kein Name.
+fn a11y_name(sc: *mut scene.Scene, ax: *mut A11y, i: usize, p: u64,
+    cap: usize) -> usize {
+    var o: Out = out_new(p, cap)
+    name_into(sc, ax, i, &o)
+    return o.n
+}
+
+// WOHER DER NAME KOMMT (NAME_*). Gezaehlt, nicht geschrieben.
+fn a11y_name_source(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
+    var o: Out = out_new(0, 0)
+    return name_into(sc, ax, i, &o)
+}
+
+// WIE VIELE BEDIENBARE KNOTEN KEINEN NAMEN HABEN. Das ist die Zahl, die
+// null sein muss -- jede andere ist ein Knopf, von dem ein
+// Vorleseprogramm nur "Knopf" sagen kann.
+fn a11y_unnamed(sc: *mut scene.Scene, ax: *mut A11y) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if role_is_widget(a11y_role(sc, ax, i))
+            && a11y_name_source(sc, ax, i) == NAME_NONE {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Wie viele bedienbare Knoten der Baum ueberhaupt hat -- der Nenner zu
+// a11y_unnamed. Ohne ihn waere "0 ohne Namen" auch bei einem Baum ohne
+// ein einziges Bedienelement wahr.
+fn a11y_widgets(sc: *mut scene.Scene, ax: *mut A11y) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if role_is_widget(a11y_role(sc, ax, i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
 }
