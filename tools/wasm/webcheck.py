@@ -19,8 +19,10 @@
 #   * wheel       the list scrolls one notch and back -- the reference again
 #   * keyboard    Tab puts a focus ring on the first control, the arrow keys
 #                 scroll the list under the pointer, space toggles
-#   * device px   devicePixelRatio 2: the canvas has 2x the pixels and fUi
-#                 paints with theme scale 2000
+#   * device px   devicePixelRatio 2: the canvas has 2x the pixels, fUi
+#                 paints with theme scale 2000, and the picture, averaged
+#                 back down 2x2, is the reference again -- up to the
+#                 anti-aliasing of glyphs rasterised at twice the size
 #
 # Usage: webcheck.py <demo dir> <reference dir (run.sh --images belege)>
 #        exit 0 = everything held
@@ -300,7 +302,26 @@ try:
     verdict(cw == 2480 and chh == 1440,
             "the canvas has %s x %s device pixels for 1240 x 720 CSS" % (cw, chh))
     r = b.call("Page.captureScreenshot", format="png")
-    Image.open(io.BytesIO(base64.b64decode(r["data"]))).save(os.path.join(OUT, "web-dpr2.png"))
+    big = Image.open(io.BytesIO(base64.b64decode(r["data"]))).convert("RGB")
+    big.save(os.path.join(OUT, "web-dpr2.png"))
+    # The same page with the same layout at twice the resolution: averaged
+    # back down 2x2, it has to be the 1x reference, except where a glyph
+    # or an edge is rasterised finer. Measured when this check was
+    # written: 0.86 % of the pixels off by more than 64 of 255, mean 1.06.
+    # Before scene.fi scaled its lengths through render.len_of it was
+    # 17.4 % and 25.1 -- the layout stayed at 1x while the text doubled.
+    A = np.asarray(big).astype(np.float64)
+    h2, w2 = (A.shape[0] // 2) * 2, (A.shape[1] // 2) * 2
+    small = A[:h2, :w2].reshape(h2 // 2, 2, w2 // 2, 2, 3).mean(axis=(1, 3))
+    R = base.astype(np.float64)
+    if small.shape != R.shape:
+        verdict(False, "ratio 2 averaged down has the size %s, not %s" % (small.shape, R.shape))
+    else:
+        off = np.abs(small - R).max(axis=2)
+        share = 100.0 * float((off > 64).sum()) / off.size
+        mean = float(np.abs(small - R).mean())
+        verdict(share < 2.0 and mean < 3.0,
+                "ratio 2, averaged down 2x2: %.2f %% of pixels off by >64, mean %.2f" % (share, mean))
     print("   screenshot at ratio 2: %s" % os.path.join(OUT, "web-dpr2.png"))
 finally:
     b.close()

@@ -43,9 +43,19 @@ the module. Licence: Bitstream Vera, full text in `LICENSES/Bitstream-Vera.txt`.
 
 The canvas gets `devicePixelRatio` times the CSS size in pixels, and the
 ratio reaches fUi as `theme.theme_set_scale` -- the one scale `render.len_of`
-reads. That scales fonts and everything a widget measures itself. The page of
-gallery9 is written in fixed design points, though: `scene.fi`/`flex.fi` lay
-out paddings, gaps and fixed heights unscaled, and the scroll area's content
-size and offset are given as plain numbers. At a ratio of 2 the page is
-therefore painted with twice the pixels but a squeezed layout. The pixel
-comparison runs at ratio 1, where the page is what it was written for.
+reads. Fonts and everything a widget measures went through it already;
+since this round `scene.fi` sends the lengths of the tree (paddings, gaps,
+fixed and style sizes, basis and bounds) through `render.len_of` too, and the
+page's scroll area gets its numbers through the theme as well
+(`tools/fui/gallery9_web.fi`). At a ratio of 2 the page is the same page with
+twice the pixels: averaged back down 2x2 it differs from the 1x reference in
+0.86 % of the pixels by more than 64 of 255 (mean 1.06) -- the anti-aliasing
+of glyphs rasterised at twice the size. Before `scene.fi` scaled its lengths
+it was 17.4 % (mean 25.1): the text doubled, the boxes did not.
+
+Two things are not done: the page is described once, so a ratio that changes
+while the page is open (the window moved to another screen) scales fonts and
+the tree but not the scroll area's numbers; and at a fractional ratio
+(1.25, 1.5) the hand-computed content height of gallery9's list
+(`INHALT_H`) and the sum of its individually rounded rows can differ by a
+few pixels at the end of the list.
