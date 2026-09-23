@@ -747,16 +747,30 @@ impl<'a> Parser<'a> {
                     // for, here and now (env.rs, round FIRN-ENV).
                     if crate::env::is_env_call(&name) {
                         e = self.env_call(&name, &args, sp);
+                    } else if crate::include::is_include_call(&name) {
+                        // Round GAPS (include.rs): the file's octets, now.
+                        e = self.include_call(&args, sp);
                     } else {
                         e = self.mk(sp, ExprKind::Call(name, args, e.span));
                     }
                 }
                 TokKind::KwAs => {
                     self.bump();
+                    // Round GAPS (wrapcast.rs): `x as% T`, never checked.
+                    let wrapping = self.at(&TokKind::Percent);
+                    if wrapping {
+                        self.bump();
+                    }
                     match self.parse_type() {
                         Some(t) => {
                             let sp = Parser::join(e.span, t.span());
                             e = self.mk(sp, ExprKind::Cast(Box::new(e), t));
+                            if wrapping {
+                                e = self.mk(
+                                    sp,
+                                    ExprKind::Call(crate::wrapcast::NAME.to_string(), vec![e], sp),
+                                );
+                            }
                         }
                         None => return e,
                     }
@@ -1366,7 +1380,7 @@ compute it",
 
     /// The octets of a text literal — `None` for everything else,
     /// `u"…"` (WTF-16) included: a build time constant is octets.
-    fn literal_octets(e: &Expr) -> Option<Vec<u8>> {
+    pub(crate) fn literal_octets(e: &Expr) -> Option<Vec<u8>> {
         let inner = match &e.kind {
             ExprKind::Text(false, inner) => inner,
             _ => return None,

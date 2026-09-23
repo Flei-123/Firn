@@ -378,7 +378,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
     // (round 89, SPEC 14.1.statics) — only when the program declares a
     // `static` at all.
-    if crate::statics::any() {
+    if crate::statics::any_data() {
         e.raw(&crate::statics::data_asm());
     }
     // ROUND 64: `.debug_abbrev` and `.debug_info` of our own -- names, types

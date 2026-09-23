@@ -841,9 +841,18 @@ fn write_after(l: *mut Lower, addr: u32, e: u32) {
         if n == 0 {
             p = constant(l, fir.T_PTR, 0)
         } else {
-            let bytes: u32 = alloca(l, n as u64, 1)
-            write_after(l, bytes, inner)
-            p = bytes
+            // Round GAPS: the octets live in `.rodata`, not in the frame
+            // (statics.rs::intern_text) -- a returned literal stays valid.
+            var ob: rt.Buf = rt.buf_new()
+            var oi: u32 = 0
+            while oi < n {
+                let ox: u32 = ast.child_at(b, ast.e_b(b, inner) + oi)
+                rt.buf_push(&ob, (ast.e_number(b, ox) & 255) as u8)
+                oi = oi + 1
+            }
+            let tname: u32 = sema.sema_text_static(sm(l), rt.buf_ptr(&ob), n as usize)
+            rt.buf_free(&ob)
+            p = push(l, fir.O_GLOBAL, fir.T_PTR, tname, 0, 0, 0, 0, 0)
         }
         store(l, fir.T_PTR, addr, p)
         let na: u32 = ptradd_const(l, addr, 8)
@@ -864,15 +873,9 @@ fn write_after(l: *mut Lower, addr: u32, e: u32) {
             if tn == 0 {
                 tp = constant(l, fir.T_PTR, 0)
             } else {
-                let tbytes: u32 = alloca(l, tn as u64, 1)
-                var ti: u32 = 0
-                while ti < tn {
-                    let tea: u32 = elem_address_const(l, tbytes, 1, ti as u64)
-                    store(l, fir.T_U8, tea, constant(l, fir.T_U8,
-                            rt.ld8(tq, ti as usize) as u64))
-                    ti = ti + 1
-                }
-                tp = tbytes
+                // Round GAPS: in `.rodata` like a literal.
+                let tname2: u32 = sema.sema_text_static(sm(l), tq, tn as usize)
+                tp = push(l, fir.O_GLOBAL, fir.T_PTR, tname2, 0, 0, 0, 0, 0)
             }
             store(l, fir.T_PTR, addr, tp)
             let tna: u32 = ptradd_const(l, addr, 8)
@@ -1230,7 +1233,8 @@ fn value_inner(l: *mut Lower, e: u32) -> u32 {
         // flip can too (`i32 as u32` on a negative value). A WIDENING cast
         // is lossless and stays `O_CAST`; so does every float on either
         // side (SPEC 14.1 defines that one as truncating, not checked).
-        if checkable(l, of) && checkable(l, after)
+        // Round GAPS (wrapcast.rs): `as%` (flag in `c`) is never checked.
+        if checkable(l, of) && checkable(l, after) && ast.e_c(b, e) != 1
         && fir.fty_bits(after) <= fir.fty_bits(of) {
             let m: u32 = cast_msg(l, ast.expr_pos(b, e), of, after)
             return push(l, fir.O_CHECKEDCAST, after, src, 0, of, m as u64, 0, 0)
@@ -1244,6 +1248,60 @@ fn value_inner(l: *mut Lower, e: u32) -> u32 {
 // The value of a constant, taken from the type checker.
 fn sema_const(l: *mut Lower, name: u32) -> u64 {
     return sema.sema_const_value(sm(l), name)
+}
+
+// Round GAPS (ptrarith.rs): a pointer the operators move (not `Gc[T]`).
+fn arith_ptr(l: *mut Lower, t: u32) -> bool {
+    if !types.is_ptr(tf(l), t) {
+        return false
+    }
+    if has_gc(l) && gc.gc_is_gc_ptr(gcl(l), tf(l), t) {
+        return false
+    }
+    return true
+}
+
+// `base` moved `idx` elements forward (or back) -- `layout.rs::elem_addr`.
+fn move_by(l: *mut Lower, base: u32, size: u64, idx: u32, ift: u32, back: bool) -> u32 {
+    var idx64: u32 = idx
+    if ift != fir.T_U64 {
+        idx64 = push(l, fir.O_CAST, fir.T_U64, idx, 0, ift, 0, 0, 0)
+    }
+    if back {
+        let z: u32 = constant(l, fir.T_U64, 0)
+        idx64 = push(l, fir.O_BIN, fir.T_U64, z, idx64, 1, 0, 0, 0)
+    }
+    return elem_address(l, base, idx64, fir.T_U64, size)
+}
+
+fn elem_size_of(l: *mut Lower, t: u32) -> u64 {
+    var n: u64 = types.size_of(tf(l), types.ty_a(tf(l), t))
+    if n == 0 {
+        n = 1
+    }
+    return n
+}
+
+// `p + n`, `p - n`, `p - q`.
+fn ptr_binary(l: *mut Lower, op: u32, li: u32, re: u32, pt: u32) -> u32 {
+    let size: u64 = elem_size_of(l, pt)
+    let rty: u32 = sema.sema_ty(sm(l), re)
+    if op == 1 && arith_ptr(l, rty) {
+        let pv: u32 = value(l, li)
+        let qv: u32 = value(l, re)
+        let pi: u32 = push(l, fir.O_CAST, fir.T_I64, pv, 0, fir.T_PTR, 0, 0, 0)
+        let qi: u32 = push(l, fir.O_CAST, fir.T_I64, qv, 0, fir.T_PTR, 0, 0, 0)
+        let d: u32 = push(l, fir.O_BIN, fir.T_I64, pi, qi, 1, 0, 0, 0)
+        if size == 1 {
+            return d
+        }
+        let sz: u32 = constant(l, fir.T_I64, size)
+        return push(l, fir.O_BIN, fir.T_I64, d, sz, 3, 0, 0, 0)
+    }
+    let base: u32 = value(l, li)
+    let ift: u32 = e_fty(l, re)
+    let iv: u32 = value(l, re)
+    return move_by(l, base, size, iv, ift, op == 1)
 }
 
 fn binary(l: *mut Lower, e: u32) -> u32 {
@@ -1294,6 +1352,13 @@ fn binary(l: *mut Lower, e: u32) -> u32 {
         let av: u32 = value(l, li)
         let bv: u32 = value(l, re)
         return push(l, fir.O_CMP, fir.T_BOOL, av, bv, op - 10, ty as u64, 0, 0)
+    }
+    // HOOK ptrarith (round GAPS): arithmetic on typed pointers.
+    if op == 0 || op == 1 {
+        let pt: u32 = sema.sema_ty(sm(l), li)
+        if arith_ptr(l, pt) {
+            return ptr_binary(l, op, li, re, pt)
+        }
     }
     let ft: u32 = e_fty(l, e)
     // in the order of `ast::BinOp`: add sub mul div rem and or xor shl shr
@@ -2005,6 +2070,13 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
         }
         return push(l, fir.O_ATOMCAS, fir.T_U64, cp, ce, cn, 0, 0, 0)
     }
+    // Round GAPS (fnaddr.rs): `__code_of(f)` is word 0 of the record.
+    var cow: [u8; 9] = "__code_of"
+    if intern.intern_equal(names(l), name, (&cow[0]) as u64, 9) && fn_number(l, name) == NONE {
+        let carg: u32 = ast.child_at(b, ast.e_b(b, e))
+        let cv: u32 = value(l, carg)
+        return load(l, fir.T_U64, cv)
+    }
     // Round GAPS (fbits.rs): `__bits(x)`, `__f64_from_bits(u)`,
     // `__f32_from_bits(u)` are O_UN with operator 3; the instruction type is
     // the target type.
@@ -2469,6 +2541,14 @@ fn stmt(l: *mut Lower, i: u32) {
             pin_clear(l)
             return
         }
+        // HOOK ptrarith (round GAPS): `p += n` / `p -= n`.
+        if (op == 0 || op == 1) && arith_ptr(l, t) {
+            let pcur: u32 = load(l, fir.T_PTR, addr)
+            let pit: u32 = e_fty(l, value)
+            let pn: u32 = value(l, value)
+            store(l, fir.T_PTR, addr, move_by(l, pcur, elem_size_of(l, t), pn, pit, op == 1))
+            return
+        }
         let ft: u32 = e_fty(l, target)
         let cur: u32 = load(l, ft, addr)
         var rhs: u32 = value(l, value)
@@ -2492,6 +2572,15 @@ fn stmt(l: *mut Lower, i: u32) {
     if a == ast.S_STEP {
         let target: u32 = ast.s_a(b, i)
         let addr: u32 = address(l, target)
+        // HOOK ptrarith (round GAPS): `p++` / `p--` move one element.
+        let st: u32 = sema.sema_ty(sm(l), target)
+        if arith_ptr(l, st) {
+            let scur: u32 = load(l, fir.T_PTR, addr)
+            let sone: u32 = constant(l, fir.T_U64, 1)
+            store(l, fir.T_PTR, addr, move_by(l, scur, elem_size_of(l, st), sone, fir.T_U64,
+                    ast.s_b(b, i) != 1))
+            return
+        }
         let ft: u32 = e_fty(l, target)
         let cur: u32 = load(l, ft, addr)
         let one: u32 = constant(l, ft, 1)

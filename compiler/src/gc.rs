@@ -400,7 +400,14 @@ impl<'a> Parser<'a> {
         if !self.expect(TokKind::LBracket, what) {
             return None;
         }
-        let r = self.ident(what)?;
+        let mut r = self.ident(what)?;
+        // Round GAPS: `Gc[module.Class]`. gc classes are global names (the
+        // module pass does not mangle them), so the qualifier only says
+        // where the class comes from -- the last segment is the class.
+        while self.at(&TokKind::Dot) {
+            self.bump();
+            r = self.ident(what)?;
+        }
         if !self.expect(TokKind::RBracket, "after the type argument") {
             return None;
         }
@@ -469,14 +476,26 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     match name.as_str() {
         "gc" => {
             // `gc C{ … }` — allocation on the GC heap.
-            let class = match p.toks.get(p.pos + 1).map(|t| t.kind.clone()) {
+            let mut class = match p.toks.get(p.pos + 1).map(|t| t.kind.clone()) {
                 Some(TokKind::Ident(k)) if k != "class" => k,
                 _ => return None,
             };
-            if !matches!(p.toks.get(p.pos + 2).map(|t| &t.kind), Some(TokKind::LBrace)) {
+            // Round GAPS: `gc module.Class { … }` -- the class name is
+            // global (see `gc_ty_arg`), the qualifier is skipped.
+            let qualified = matches!(p.toks.get(p.pos + 2).map(|t| &t.kind), Some(TokKind::Dot))
+                && matches!(p.toks.get(p.pos + 3).map(|t| &t.kind), Some(TokKind::Ident(_)));
+            let brace_at = if qualified { 4 } else { 2 };
+            if !matches!(p.toks.get(p.pos + brace_at).map(|t| &t.kind), Some(TokKind::LBrace)) {
                 return None;
             }
             let sp = p.bump(); // 'gc'
+            if qualified {
+                p.bump(); // module
+                p.bump(); // '.'
+                if let Some(TokKind::Ident(k)) = p.toks.get(p.pos).map(|t| t.kind.clone()) {
+                    class = k;
+                }
+            }
             let ksp = p.bump(); // class label
             let span = Parser::join(sp, ksp);
             let saved = p.no_struct_lit;

@@ -575,7 +575,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // text is identical to the x86-64 one -- `.byte`/`.zero` in
     // `.bss`/`.data`/`.rodata` say the same thing on both machines; only
     // the two instructions that ADDRESS it differ (`Op::GlobalAddr`).
-    if crate::statics::any() {
+    if crate::statics::any_data() {
         e.raw(&crate::statics::data_asm());
     }
     if auxv {
