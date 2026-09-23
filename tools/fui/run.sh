@@ -551,9 +551,10 @@ fi
 # Kurzformen bekommen, die ein Baum wirklich braucht, und
 # lib/fui/sheet.fi mit sheet_rule die Regel aus einem Stil.
 #
-# Gemessen am 22.09.2026: 31 von 64 Zeilen, also 48 %. Das ist eine
-# Zeile unter der Schranke -- wer hier eine hinzufuegt, muss eine
-# andere streichen. Genau das ist der Zweck.
+# Gemessen am 23.09.2026: 30 von 64 Zeilen, also 47 %. Dazugekommen
+# ist an diesem Tag die GROESSE als Stilwert (style.SF_WIDTH /
+# SF_HEIGHT): Leistenhoehe und Zeilenhoehe stehen jetzt in der Regel
+# und nicht mehr als Zahl an jedem Knoten im Baum.
 if [ $((beschrieben * 2)) -gt "$gemalt" ]; then
     echo "  FEHLER: die beschriebene Fassung faellt nicht auf hoechstens"
     echo "  die Haelfte der gemalten ($beschrieben von $gemalt Zeilen)."
@@ -570,8 +571,8 @@ if [ $((beschrieben_a * 3)) -gt $((gemalt_a * 2)) ]; then
     exit 1
 fi
 # Zuschnitt B: die Gliederung selbst. Gefordert ist auch hier
-# hoechstens die Haelfte (gemessen am 22.09.2026: 18 von 46, also
-# 39 %).
+# hoechstens die Haelfte (gemessen am 23.09.2026: 16 von 46, also
+# 35 %).
 if [ $((beschrieben_b * 2)) -gt "$gemalt_b" ]; then
     echo "  FEHLER: die beschriebene Gliederung braucht mehr als die"
     echo "  Haelfte der gemalten ($beschrieben_b von $gemalt_b Zeilen)."
