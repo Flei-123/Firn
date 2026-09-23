@@ -1,0 +1,618 @@
+// SPDX-License-Identifier: MPL-2.0
+// Herkunft: Certus, lib/window/window.fi, Stand Certus-Commit 1f1ec17bdb68 (zuletzt
+// geaendert in cbbc9d8c0475); vom alleinigen Urheber Justin am 23.09.2026
+// fuer Firn unter MPL-2.0 freigegeben.
+// lib/window/window.fi -- ONE WINDOW, ONCE. (round FENSTER)
+//
+// ======================================================= WHY IT EXISTS
+//
+// There were TWO window layers with almost the same interface and a
+// different prefix: lib/browser/x11.fi (x11_open, x11_put_image, ...)
+// and lib/windows/gdi.fi (win_open, win_put_image, ...). So the
+// abstraction was already there -- it just was not written down
+// anywhere. The consequence was measurable: lib/windows/certus_main.fi
+// was a COPY of lib/browser/window_main.fi, 888 lines word for word the
+// same, and the two had already drifted apart. Windows got resize, dpi,
+// EV_MOTION, EV_CHAR, EV_THEME; X11 got NONE of it.
+//
+// This file is the abstraction written down. The upper edge knows
+// nothing platform specific: no HWND, no X message, no Win32 constant.
+//
+// ============================== HOW THE BACKEND IS CHOSEN
+//
+// Firn has no conditional compilation, and it needs none. The module
+// search resolves `import` first NEXT TO THE IMPORTING file, then NEXT
+// TO THE ROOT file, then in $FIRNLIB (compiler/src/modules.rs,
+// `resolve`). This file imports `window.backend`; rule 1 does not
+// apply, so rule 2 -- and there lies a link:
+//
+//   lib/browser/window/backend.fi  ->  ../../window/x11.fi
+//   lib/windows/window/backend.fi  ->  ../../window/win32.fi
+//
+// So the DIRECTORY of the root file chooses the backend: without a line
+// in the compiler, without function pointers, and without the Linux
+// build ever seeing an `extern fn` on user32.dll. Foreign programs are
+// built by `tools/window/bau.sh <source> <target> linux|windows`.
+//
+// ================================================= WHAT LIES UP HERE
+//
+// Everything that is NOT platform specific -- exactly that was the bug:
+//   * the RESIZE (EV_CONFIGURE -> new canvas). Previously existed only
+//     under Windows, under X11 not at all.
+//   * DPI and `scaled(f, n)`. Justin's caret was 8x15 on a 34 inch
+//     screen, because it was the only piece that was not scaled.
+//   * LIGHT/DARK/SYSTEM -- the DECISION, not the colours; a colour
+//     table belongs to the program (browser.chrome).
+//   * THE WAITING. X11 has a socket (`poll`), Windows has none
+//     (MsgWaitForMultipleObjectsEx). Up here both are `wait_event(ms)`.
+//
+// ================================================ WHAT IS NOT HERE
+//
+// F1 NO drawing beyond pixels, rectangles and system text. Whoever
+//    wants curves rasterises them itself and pushes the finished buffer
+//    over with `image` -- the Certus contract since round B3.
+// F2 NO tabs, menus, buttons. The program's business.
+// F3 ONE pixel format: BGRX (32 bit, B,G,R,X in memory). It is what an
+//    X server with 24 bit TrueColor and what a 32 bit DIB with BI_RGB
+//    want -- the same octets on both systems.
+import std.rt
+import window.backend
+
+export {
+    Window, window_new,
+    open_window, make, show_window, title, close_window, is_open,
+    screen, centre,
+    width, height, dpi, set_dpi, uiscale, scaled, resize,
+    image, fill, font, text, present, save_ppm,
+    wait_event, pending, next_event, dragging, input_pending,
+    update_start,
+    ev_a, ev_x, ev_y, ev_state,
+    set_theme, theme_mode, dark, theme_known, theme_reload,
+    titlebar_colour,
+    // ================================================== RUNDE C-049
+    // DER EIGENE FENSTERRAHMEN. Die obere Kante ist ab hier Sache des
+    // Programms: die Reiterzeile IST die Titelleiste.
+    frame_own, frame_can, frame_height_set, button_zone_set,
+    content_size,
+    window_minimise, window_max_toggle, window_maximised,
+    window_drag, window_sysmenu,
+    rgb_to_bgrx, to_bgrx, set_poison, poison_colour,
+    EV_NONE, EV_EXPOSE, EV_KEY, EV_CHAR, EV_BUTTON, EV_MOTION,
+    EV_CONFIGURE, EV_THEME, EV_CLOSED,
+    K_ESCAPE, K_RETURN, K_BACK, K_TAB, K_DOWN, K_UP, K_PAGEDOWN,
+    K_PAGEUP, K_LEFT, K_RIGHT, K_HOME, K_END, K_DELETE,
+    TH_SYSTEM, TH_LIGHT, TH_DARK,
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_WHEEL_UP, BTN_WHEEL_DOWN,
+    FMT_BGRX,
+}
+
+// ===================================================== DIE EREIGNISSE
+//
+// The UNION of the two previous sets. The numbers are those of
+// lib/browser/x11.fi and lib/windows/gdi.fi -- both already had the
+// same ones, and a program written against the old numbers still
+// computes correctly.
+const EV_NONE: u32 = 0
+// The content is lost, it has to be repainted.
+const EV_EXPOSE: u32 = 1
+// A KEY with meaning: `ev_a` is a K_*. Characters do NOT arrive here
+// but as EV_CHAR -- that is the split Windows dictates with
+// WM_KEYDOWN/WM_CHAR and that X11 now reproduces.
+const EV_KEY: u32 = 2
+// A mouse button or the wheel: `ev_a` is a BTN_*, `ev_x`/`ev_y` the
+// Stelle im Window.
+const EV_BUTTON: u32 = 3
+// The window size has changed: `ev_x` is the new width, `ev_y` the
+// new height. `next_event` has already resized the canvas by then
+// nachgezogen.
+const EV_CONFIGURE: u32 = 4
+// The window was closed (button, window manager, WM_CLOSE).
+const EV_CLOSED: u32 = 5
+// A CHARACTER, fully composed: `ev_a` is a Unicode code point.
+const EV_CHAR: u32 = 6
+// The pointer has moved: `ev_x`/`ev_y`.
+const EV_MOTION: u32 = 7
+// The system setting light/dark has changed. `dark(f)` already
+// reads correctly afterwards.
+const EV_THEME: u32 = 8
+
+// ======================================================== DIE TASTEN
+//
+// Deliberately the X11 key numbers: they have been in the event
+// loops since round B5, and lib/windows/gdi.fi rebuilt them for
+// Windows instead of inventing its own. Whoever builds a new backend
+// maps ITS numbers onto these -- not the other way round.
+const K_ESCAPE: u32 = 9
+const K_BACK: u32 = 22
+const K_TAB: u32 = 23
+const K_RETURN: u32 = 36
+const K_HOME: u32 = 110
+const K_UP: u32 = 111
+const K_PAGEUP: u32 = 112
+const K_LEFT: u32 = 113
+const K_RIGHT: u32 = 114
+const K_END: u32 = 115
+const K_DOWN: u32 = 116
+const K_PAGEDOWN: u32 = 117
+const K_DELETE: u32 = 119
+
+// ================================================== MAUSKNOEPFE / RAD
+// The X11 numbers; the wheel is a button there and stays one here.
+const BTN_LEFT: u32 = 1
+const BTN_MIDDLE: u32 = 2
+const BTN_RIGHT: u32 = 3
+const BTN_WHEEL_UP: u32 = 4
+const BTN_WHEEL_DOWN: u32 = 5
+
+// ==================================================== LIGHT AND DARK
+const TH_SYSTEM: u32 = 0
+const TH_LIGHT: u32 = 1
+const TH_DARK: u32 = 2
+
+// ================================================= THE PIXEL FORMAT
+// ONE format, and it has a name. See F3 in the header.
+const FMT_BGRX: u32 = 0
+
+struct Window {
+    // The state of the backend. What is in it this file does not know
+    // and must not know.
+    p: backend.Platte,
+    w: usize,
+    h: usize,
+    dpi_ist: usize,
+    dpi_zwang: usize,
+    // the event taken out last
+    ev_kind: u32,
+    e_a: u32,
+    e_x: u32,
+    e_y: u32,
+    e_s: u32,
+    // hell/dark
+    th_modus: u32,
+    th_dunkel: bool,
+    th_bekannt: bool,
+}
+
+fn window_new() -> Window {
+    return Window { p: backend.surface_new(), w: 0, h: 0, dpi_ist: 96,
+        dpi_zwang: 0, ev_kind: 0, e_a: 0, e_x: 0, e_y: 0, e_s: 0,
+        th_modus: 0, th_dunkel: false, th_bekannt: false }
+}
+
+// --------------------------------------------------------- aufmachen
+//
+// `display` is the X11 display number (`:0` = 0). Under Windows there
+// is none to choose; the value is not looked at there. It is the ONLY
+// parameter of the interface that concerns just one side, and it is
+// here so that the acceptance run under Xvfb can keep its own
+// Anzeige bekommt.
+fn open_window(f: *mut Window, anzeige: usize) -> bool {
+    if !backend.r_open(&(*f).p, anzeige) {
+        return false
+    }
+    theme_aufloesen(f)
+    return true
+}
+
+// Create window and drawing surface, `bw` x `bh` INNER AREA.
+fn make(f: *mut Window, bw: usize, bh: usize) -> bool {
+    if !backend.r_make(&(*f).p, bw, bh) {
+        return false
+    }
+    (*f).w = backend.r_width(&(*f).p)
+    (*f).h = backend.r_height(&(*f).p)
+    (*f).dpi_ist = backend.r_dpi(&(*f).p)
+    return true
+}
+
+fn screen(f: *mut Window, sw: *mut usize, sh: *mut usize) -> bool {
+    return backend.r_screen(&(*f).p, sw, sh)
+}
+
+fn centre(f: *mut Window) -> bool {
+    return backend.r_centre(&(*f).p)
+}
+
+fn show_window(f: *mut Window) -> bool {
+    return backend.r_show(&(*f).p)
+}
+
+fn title(f: *mut Window, p: u64, n: usize) -> bool {
+    return backend.r_title(&(*f).p, p, n)
+}
+
+fn close_window(f: *mut Window) {
+    backend.r_close(&(*f).p)
+}
+
+fn is_open(f: *mut Window) -> bool {
+    return backend.r_is_open(&(*f).p)
+}
+
+fn width(f: *mut Window) -> usize {
+    return (*f).w
+}
+
+fn height(f: *mut Window) -> usize {
+    return (*f).h
+}
+
+// DPI AND UISCALE. The bug this prevents: Justin's caret was 8x15
+// pixels on a 34 inch ultrawide, because it was the only piece
+// painted with fixed numbers. A number from the design is meant in
+// points at 96 dpi; `scaled` turns it into device pixels. Whoever
+// writes down a size runs it through here.
+fn dpi(f: *mut Window) -> usize {
+    if (*f).dpi_zwang > 0 {
+        return (*f).dpi_zwang
+    }
+    return (*f).dpi_ist
+}
+
+// By hand, for acceptance runs and for a switch `--dpi=`.
+// 0 = whatever the system says again.
+fn set_dpi(f: *mut Window, d: usize) {
+    (*f).dpi_zwang = d
+}
+
+// The scale in per mille: 1000 = 100 %, 1500 = 150 %.
+fn uiscale(f: *mut Window) -> usize {
+    return dpi(f) * 1000 / 96
+}
+
+// `n` Entwurfspunkte in Geraetepunkte, kaufmaennisch gerundet.
+fn scaled(f: *mut Window, n: usize) -> usize {
+    return (n * dpi(f) + 48) / 96
+}
+
+// Bring the drawing surface to another size by hand. The normal case
+// is EV_CONFIGURE, which `next_event` handles itself.
+fn resize(f: *mut Window, bw: usize, bh: usize) -> bool {
+    if bw == 0 || bh == 0 {
+        return false
+    }
+    if !backend.r_maximise(&(*f).p, bw, bh) {
+        return false
+    }
+    (*f).w = backend.r_width(&(*f).p)
+    (*f).h = backend.r_height(&(*f).p)
+    return true
+}
+
+// ---------------------------------------------------------- painting
+
+// A finished BGRX buffer to (dx, dy). `bw`/`bh` are its dimensions.
+fn image(f: *mut Window, px: u64, bw: usize, bh: usize, dx: usize,
+    dy: usize) -> bool {
+    return backend.r_image(&(*f).p, px, bw, bh, dx, dy)
+}
+
+// A rectangle in 0xRRGGBB.
+fn fill(f: *mut Window, farbe: u32, x0: usize, y0: usize, bw: usize,
+    bh: usize) -> bool {
+    return backend.r_fill(&(*f).p, farbe, x0, y0, bw, bh)
+}
+
+// Die Systemfestschrift bereitstellen (X11: "fixed", Windows:
+// SYSTEM_FIXED_FONT). For labels that no own rasteriser should paint
+// -- a page is painted by Certus with lib/font.
+fn font(f: *mut Window) -> bool {
+    return backend.r_font(&(*f).p)
+}
+
+// `ty` ist die GRUNDLINIE, auf beiden Systemen.
+fn text(f: *mut Window, fg: u32, bg: u32, tx: usize, ty: usize, p: u64,
+    n: usize) -> bool {
+    return backend.r_text(&(*f).p, fg, bg, tx, ty, p, n)
+}
+
+// Everything painted onto the screen.
+fn present(f: *mut Window) -> bool {
+    return backend.r_present(&(*f).p)
+}
+
+// THE CAPTURE OF WHAT REALLY STANDS IN THE WINDOW (not of the
+// program's canvas), as binary PPM. X11 cannot do it -- there the
+// acceptance run takes the image from the server with `xwd`, which is stronger.
+fn save_ppm(f: *mut Window, pfad: u64) -> bool {
+    return backend.r_ppm(&(*f).p, pfad)
+}
+
+// THE POISON: the fresh drawing surface is filled with pure magenta.
+// Whatever is still magenta afterwards has never seen an `image` and
+// never a `fill` -- "share of unpainted pixels" is thereby COUNTED
+// and not estimated. Off in shipping builds.
+fn set_poison(f: *mut Window, an: bool) {
+    backend.r_poison(&(*f).p, an)
+}
+
+fn poison_colour() -> u32 {
+    return 16711935 as u32
+}
+
+// ------------------------------------------------------- die Ereignisse
+
+// Is one ready already, without waiting?
+// Is the user dragging the edge right now? Windows knows, X11 does not.
+fn dragging(f: *mut Window) -> bool {
+    return backend.r_dragging(&(*f).p)
+}
+
+fn pending(f: *mut Window) -> bool {
+    return backend.r_pending(&(*f).p)
+}
+
+// RUNDE C-040 -- STEHT EINE EINGABE AN?
+//
+// `pending` sagt "irgendein Ereignis", und das ist fuer den
+// Eingabe-Vorrang zu grob: ein Expose beim Verschieben des Fensters
+// oder eine ueber das Fenster fahrende Maus wuerden sonst jede Scheibe
+// des Seitenbaus verschieben -- die Seite waere nie fertig.
+//
+// `input_pending` sagt "eine TASTE oder ein KLICK liegt in der Schlange",
+// und zwar OHNE sie herauszunehmen. Das ist der Unterschied, auf dem
+// der ganze Vorrang steht: verarbeitet werden darf sie mitten im
+// Umbruch nicht (ein Klick riefe `load_url` aus `load_url` heraus,
+// siehe `pumpe_kurz` in lib/browser/certus_app.fi) -- gewusst werden
+// muss es trotzdem.
+//
+// Diese Funktion ist das, was der Wirt als `hat_eingabe` an
+// `vorrang.vorrang_wirt_setzen` gibt.
+fn input_pending(f: *mut Window) -> bool {
+    return backend.r_input_pending(&(*f).p)
+}
+
+// WAITING, PLATFORM NEUTRAL. The last hard difference: X11 has a
+// socket (`poll`), Windows has none
+// (MsgWaitForMultipleObjectsEx). Beides ist "wait_event hoechstens `ms`
+// milliseconds"; `ms` < 0 = forever, 0 = only look. THE IDLE CURRENT
+// BLEIBT NULL -- gemessen: 0 CPU-Ticks in 10 s Leerlauf.
+fn wait_event(f: *mut Window, ms: i64) -> bool {
+    if backend.r_pending(&(*f).p) {
+        return true
+    }
+    return backend.r_wait(&(*f).p, ms)
+}
+
+// The next event, NON blocking: EV_NONE means "none there".
+//
+// Here stands the common post-processing, and it is the reason this
+// library exists: the resize is done ONCE properly and not twice by
+// halves.
+fn next_event(f: *mut Window) -> u32 {
+    var k: u32 = EV_NONE
+    var a: u32 = 0
+    var x: u32 = 0
+    var y: u32 = 0
+    var s: u32 = 0
+    if !backend.r_next(&(*f).p, &k, &a, &x, &y, &s) {
+        (*f).ev_kind = EV_NONE
+        return EV_NONE
+    }
+    (*f).ev_kind = k
+    (*f).e_a = a
+    (*f).e_x = x
+    (*f).e_y = y
+    (*f).e_s = s
+    if k == EV_CONFIGURE {
+        let nw: usize = x as usize
+        let nh: usize = y as usize
+        if nw > 0 && nh > 0 {
+            if nw != (*f).w || nh != (*f).h {
+                (*f).w = nw
+                (*f).h = nh
+                // The drawing surface is CREATED ANEW and not stretched.
+                // A stretched canvas would be exactly the
+                // Unschaerfe, die Runde MOBIL5 auf Android gemessen hat.
+                let ok: bool = backend.r_maximise(&(*f).p, nw, nh)
+                // The device context is new afterwards, so is the font:
+                // otherwise `text` would paint nothing from here on.
+                let okf: bool = backend.r_font(&(*f).p)
+            }
+        }
+        // A window may have been moved to another screen. Then the
+        // pixel density is a different one.
+        (*f).dpi_ist = backend.r_dpi(&(*f).p)
+    }
+    if k == EV_THEME {
+        theme_aufloesen(f)
+    }
+    return k
+}
+
+fn ev_a(f: *mut Window) -> u32 {
+    return (*f).e_a
+}
+
+fn ev_x(f: *mut Window) -> u32 {
+    return (*f).e_x
+}
+
+fn ev_y(f: *mut Window) -> u32 {
+    return (*f).e_y
+}
+
+// The modifier keys for the event. Bit 0 = Shift, bit 2 = Ctrl --
+// die X11-Belegung, die die Windows-Rueckwand nachbildet.
+fn ev_state(f: *mut Window) -> u32 {
+    return (*f).e_s
+}
+
+// HELL/DUNKEL. Die ENTSCHEIDUNG liegt hier: `TH_SYSTEM` fragt die
+// backend, `TH_LIGHT`/`TH_DARK` are the manual switch. The COLOURS
+// are not -- a colour table belongs to the program (browser.chrome).
+fn set_theme(f: *mut Window, modus: u32) {
+    (*f).th_modus = modus
+    theme_aufloesen(f)
+}
+
+fn theme_mode(f: *mut Window) -> u32 {
+    return (*f).th_modus
+}
+
+fn dark(f: *mut Window) -> bool {
+    return (*f).th_dunkel
+}
+
+// Could the system really be asked? Otherwise `dark` is the fallback
+// (LIGHT) and not an answer.
+fn theme_known(f: *mut Window) -> bool {
+    return (*f).th_bekannt
+}
+
+// Look at the system once more; true = it has changed. The backends
+// that send EV_THEME by themselves do not need this; whoever has no
+// notification calls it occasionally.
+fn theme_reload(f: *mut Window) -> bool {
+    let vorher: bool = (*f).th_dunkel
+    theme_aufloesen(f)
+    return (*f).th_dunkel != vorher
+}
+
+fn theme_aufloesen(f: *mut Window) {
+    if (*f).th_modus == TH_LIGHT {
+        (*f).th_dunkel = false
+        (*f).th_bekannt = true
+        backend.r_titlebar_dark(&(*f).p, false)
+        return
+    }
+    if (*f).th_modus == TH_DARK {
+        (*f).th_dunkel = true
+        (*f).th_bekannt = true
+        backend.r_titlebar_dark(&(*f).p, true)
+        return
+    }
+    (*f).th_dunkel = backend.r_dark(&(*f).p)
+    (*f).th_bekannt = backend.r_dark_known(&(*f).p)
+    // RUNDE C-039: der HANDSCHALTER muss bis zur Titelleiste
+    // durchschlagen. `r_dark` liest die Registrierung; steht das
+    // Programm auf `--theme=dark`, waere die Leiste sonst hell und
+    // die Schale dunkel -- genau der Bruch, um den es hier geht.
+    backend.r_titlebar_dark(&(*f).p, (*f).th_dunkel)
+}
+
+// RUNDE C-039 -- DIE TITELLEISTE TRAEGT DIE FARBE DER SCHALE.
+//
+// Das Programm kennt seine Leistenfarbe (browser.chrome `th_bar`),
+// die Fensterschicht nicht. Also reicht das Programm sie durch, und
+// die Rueckwand macht daraus, was die Plattform kann: unter Windows
+// DWMWA_CAPTION_COLOR, unter X11 nichts (dort zeichnet der
+// Fenstermanager, nicht das Programm).
+fn titlebar_colour(f: *mut Window, rgb: u32, an: bool) {
+    backend.r_titlebar_colour(&(*f).p, rgb, an)
+}
+
+// THE FORMAT. Round UHR had the BGRX/RGBA conversion in several
+// places; it stands here now, once, with a name. 0xRRGGBB -> a 32 bit
+// word that lies little endian as B,G,R,0. It is a MASK and not a
+// swap -- an early version of `to_bgrx` swapped R and B, and the
+// window showed the page in false colours.
+fn rgb_to_bgrx(rgb: u32) -> u32 {
+    return rgb & 16777215 as u32
+}
+
+// A whole strip of 0xAARRGGBB -> BGRX. Source and target may be the
+// same address.
+fn to_bgrx(quelle: u64, ziel: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let v: u32 = *((quelle + (i * 4) as u64) as *mut u32)
+        *((ziel + (i * 4) as u64) as *mut u32) = v & 16777215 as u32
+        i = i + 1
+    }
+}
+
+// ======================================================================
+// RUNDE C-038 -- DEN AKTUALISIERER ANSTOSSEN
+// ======================================================================
+//
+// Der Menuepunkt "Auf Aktualisierung pruefen" braucht kein Netz IN
+// Certus: neben certus.exe liegt certus-update.exe, die das schon kann
+// (Pruefsumme, Rueckfrage, Installation). Diese Funktion startet sie
+// und WARTET NICHT -- die Bildschleife laeuft ungestoert weiter.
+//
+// `mit_fenster` = true heisst "--jetzt": der Nutzer hat selbst geklickt
+// und will in jedem Fall eine Antwort, auch das "ist aktuell".
+//
+// Rueckgabe false = konnte nicht gestartet werden. Unter Linux/Android
+// ist das IMMER so (dort gibt es die exe nicht), unter Windows nur,
+// wenn certus-update.exe fehlt. Der Aufrufer muss das dem Nutzer sagen.
+fn update_start(mit_fenster: bool) -> bool {
+    return backend.r_update_start(mit_fenster)
+}
+
+// ======================================================================
+// RUNDE C-049 -- DER EIGENE FENSTERRAHMEN
+// ======================================================================
+//
+// Justin, 19.09.2026: "die obere taskleiste ist in einem normalen
+// browser direkt auf tab hoehe anstatt eine seperate window leiste".
+//
+// WAS HIER OBEN STEHT, ist absichtlich klein: sechs Fragen, die JEDES
+// Fenstersystem beantworten kann, und keine einzige Windows-Zahl. Die
+// ganze Arbeit (WM_NCCALCSIZE, WM_NCHITTEST, die acht Punkte beim
+// Maximieren) steckt in lib/window/win32.fi -- genau wie F1 bis F3 im
+// Kopf dieser Datei es verlangen.
+//
+// UNTER X11 sagt `frame_can` NEIN. Dort zeichnet der
+// Fensterverwalter die Leiste, und ein Programm, das sie sich selbst
+// nimmt, verliert Aero-Snaps Gegenstueck und die Tastenkuerzel des
+// Verwalters. Das Programm fragt also, statt es anzunehmen -- und die
+// Reiterzeile traegt ihre Knoepfe nur, wenn die Antwort JA ist.
+
+// Kann dieses Fenstersystem einen selbstgezeichneten Rahmen?
+fn frame_can(f: *mut Window) -> bool {
+    return backend.r_frame_can(&(*f).p)
+}
+
+// Den eigenen Rahmen ein- oder ausschalten. Liefert, ob er jetzt
+// wirklich an ist.
+fn frame_own(f: *mut Window, an: bool) -> bool {
+    return backend.r_frame_own(&(*f).p, an)
+}
+
+// Die ECHTE Inhaltsgroesse beim Betriebssystem erfragen. Nur noetig,
+// nachdem sich der Rahmen geaendert hat: dann ist der Inhalt schon
+// gross, die Leinwand noch klein. false = es gibt nichts Neues.
+fn content_size(f: *mut Window, bw: *mut usize, bh: *mut usize) -> bool {
+    return backend.r_content_size(&(*f).p, bw, bh)
+}
+
+// Wie hoch die Zeile ist, die das Programm als Titelleiste benutzt.
+// Der Rahmen braucht die Zahl fuer WM_NCHITTEST: alles darueber ist
+// Titelleiste (ziehen), alles darunter gehoert dem Inhalt.
+fn frame_height_set(f: *mut Window, h: usize) {
+    backend.r_frame_height(&(*f).p, h)
+}
+
+// Welcher waagrechte Streifen der Kopfzeile den Fensterknoepfen des
+// Programms gehoert. Dort wird NICHT gezogen -- sonst verschiebt ein
+// Druck auf "Schliessen" das Fenster, statt es zu schliessen.
+fn button_zone_set(f: *mut Window, x0: usize, x1: usize) {
+    backend.r_button_zone(&(*f).p, x0, x1)
+}
+
+fn window_minimise(f: *mut Window) {
+    backend.r_minimise(&(*f).p)
+}
+
+// Maximieren oder wiederherstellen -- je nachdem, was gerade gilt.
+fn window_max_toggle(f: *mut Window) {
+    backend.r_max_toggle(&(*f).p)
+}
+
+fn window_maximised(f: *mut Window) -> bool {
+    return backend.r_maximised(&(*f).p)
+}
+
+// Das Fenster am Griff nehmen. Wird gerufen, wenn der Benutzer die
+// leere Flaeche der Reiterzeile drueckt.
+fn window_drag(f: *mut Window) {
+    backend.r_drag(&(*f).p)
+}
+
+// Das Systemmenue (Verschieben, Groesse aendern, Schliessen) an der
+// Stelle des Zeigers. Rechtsklick auf die Titelleiste, wie ueberall.
+fn window_sysmenu(f: *mut Window, sx: usize, sy: usize) {
+    backend.r_sysmenu(&(*f).p, sx, sy)
+}

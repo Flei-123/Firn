@@ -1,0 +1,756 @@
+// SPDX-License-Identifier: MPL-2.0
+// Herkunft: Certus, lib/window/android.fi, Stand Certus-Commit 1f1ec17bdb68 (zuletzt
+// geaendert in cbbc9d8c0475); vom alleinigen Urheber Justin am 23.09.2026
+// fuer Firn unter MPL-2.0 freigegeben.
+// lib/window/android.fi -- DIE RUECKWAND ANDROID (Runde EINKERN).
+//
+// The third backend behind `lib/window/window.fi`, after x11.fi and
+// win32.fi and to exactly the same contract. It is NOT newly invented:
+// every handle in it has been in lib/android/a_main.fi since MOBIL2,
+// only there in the middle of the program instead of behind an
+// interface. What stands here is the same course of action under the
+// names the other two systems already carry.
+//
+// ================================== WHY ANDROID HAS NO `r_open`
+//
+// Under X11 the program opens the connection, under Windows it
+// registers the window class. Under Android it is the other way round:
+// the operating system creates the window and tells the app through
+// `ANativeActivityCallbacks.onNativeWindowCreated`. The app can neither
+// request it nor throw it away; it gets it on loan.
+//
+// That is why this backend has the handles `an_set_window` and
+// `an_set_activity`. That is no breach of the contract -- x11.fi reads
+// the environment and ~/.Xauthority, win32.fi builds its HWND; every
+// backend has the place where it talks to its system. Here it is only
+// visible from outside, because the system speaks first.
+//
+// ============================================ THE SCREEN WITHOUT A PHONE
+//
+// If no `ANativeWindow` is registered, `r_make` creates its OWN
+// Zeichenflaeche im Haufen an, `r_image`/`r_fill` schreiben dorthin,
+// `r_blit` does nothing and `r_ppm` writes it out as PPM. That is
+// exactly what win32.fi does through its DIB (r_ppm there) -- and
+// exactly the way this round can measure the pixel by pixel comparison
+// between X11, Windows and Android without a phone being attached. On
+// the device that branch is never entered.
+//
+// ================================================ THE PIXEL FORMAT
+//
+// The contract (F3 in the header of window.fi) is BGRX: B, G, R, X in
+// Speicher. Androids `WINDOW_FORMAT_RGBA_8888` legt R, G, B, A ab --
+// the same four octets in the other order. `r_image` therefore swaps
+// them. On the device that costs one swap per pixel, and it is the
+// ONLY price for the three systems having the same window interface.
+// (lib/android/blit.fi copies without a swap today, because the app
+// pushes its canvas across bypassing this layer; whoever wants to save
+// the swap says so in future through a second format in the contract
+// and not through a second
+// Fensterschicht.)
+//
+// ================================================================ EHRLICH
+//
+// U1 `r_font`/`r_text` are FALSE. The NDK has no system font without
+//    Java -- there is neither a "fixed" as with X11 nor a
+//    SYSTEM_FIXED_FONT as with GDI. The browser does not need it:
+//    lib/browser/certus_app.fi calls `window.text` nowhere (counted:
+//    0 hits), the page and the bar are painted by
+//    lib/font/raster.fi.
+// U2 LIGHT/DARK does not arrive by itself. `AConfiguration_getUiModeNight`
+//    does stand in libandroid.so but is not bound in lib/android/ndk.fi;
+//    this round binds nothing new. Until then `r_dark_known` honestly
+//    says `false`, and the activity may say through `an_set_dark` what
+//    it knows.
+// U3 `r_wait` wartet auf Androids `ALooper`. Wer die Ereignisse
+//    INSTEAD through `ALooper_addFd` callbacks (that is how
+//    lib/android/a_main.fi does it today) does not call `r_wait` at all
+//    and pours the events with `an_event` into the same queue.
+//    Both ways end in `r_take`.
+// U4 NO `r_title`. The window title of an Android activity is the
+//    application name from the manifest; a native process cannot set it
+//    without Java. `r_title` returns `false` and claims nothing.
+//
+import std.rt
+import android.ndk
+import window.window
+// RUNDE C-040, NACHBESSERUNG (fix-r3-3): DER EINGABE-VORRANG AUCH HIER.
+//
+// `lib/window/win32.fi:53` und `lib/window/x11.fi:67` holen sich
+// `browser.vorrang` seit Modul M1; dieser Rueckwand fehlte er. Folge:
+// ein Android-Wirt, der ueber `window.window` geht (und nicht wie
+// lib/android/a_main.fi selbst am `AInputQueue` haengt), meldete seine
+// Tasten NIEMANDEM -- der Vorrang war auf dieser Plattform ein
+// Versprechen ohne Sender. Der Verweis ist derselbe wie in den beiden
+// anderen Rueckwaenden, also auch derselbe Ringe-Befund: `vorrang.fi`
+// holt sich seinerseits nichts aus `window`.
+import browser.vorrang
+
+export {
+    r_dragging,
+    r_update_start,
+    Platte, surface_new,
+    r_open, r_make, r_show, r_title, r_close, r_is_open,
+    r_width, r_height, r_dpi, r_maximise,
+    r_image, r_fill, r_font, r_text, r_present, r_ppm,
+    r_wait, r_pending, r_next, r_dark, r_dark_known, r_poison,
+    r_input_pending,
+    r_titlebar_dark, r_titlebar_colour,
+    // RUNDE C-049 -- der eigene Fensterrahmen. Hier gibt es ihn NICHT
+    // (siehe die Begruendung unten); die Namen muessen trotzdem da
+    // sein, weil lib/window/window.fi sie ruft.
+    r_frame_can, r_frame_own, r_frame_height, r_button_zone,
+    r_content_size,
+    r_minimise, r_max_toggle, r_maximised, r_drag,
+    r_sysmenu,
+    r_screen, r_centre,
+    // The handles through which Android talks to this backend. See the
+    // header: the system speaks first here.
+    an_set_window, an_set_activity, an_set_dpi,
+    an_set_dark, an_event, an_set_screen, an_gesperrt,
+    // ROUND ABSCHLUSS: the window buffer ITSELF. lib/android/a_main.fi
+    // paints the page with `blit.blit_rows` -- one `mem_copy` per row,
+    // with scaling and a column table (MOBIL4/MOBIL6d). That is the second
+    // largest item per frame and cannot be replaced by `r_image`, which
+    // converts three octets individually per pixel. So the app gets the
+    // locked buffer -- and the LOCKING, the FORMAT and the RELEASING
+    // belong here nevertheless.
+    an_lock, an_bits, an_stride, an_format, an_window,
+}
+
+const RING: usize = 64
+const MAGENTA: u32 = 16711935
+
+struct Platte {
+    // The borrowed ANativeWindow, 0 = none (screen without a phone).
+    win: u64,
+    // The ANativeActivity, for the on-screen keyboard.
+    akt: u64,
+    is_open: bool,
+    w: usize,
+    h: usize,
+    dpi: usize,
+    schirm_w: usize,
+    schirm_h: usize,
+    // The locked window buffer between `r_image` and `r_blit`.
+    // `bits` 0 = not locked.
+    bits: u64,
+    stride: usize,
+    // The own drawing surface when there is no ANativeWindow.
+    eigen: u64,
+    eigen_n: usize,
+    gift: u32,
+    // ROUND ABSCHLUSS: the pixel format the driver REALLY delivered. The
+    // check stood in a_main.fi (MOBIL6: "the format is checked, not
+    // believed") -- it belongs where the locking happens.
+    //
+    fmt: i32,
+    dark: bool,
+    dark_bekannt: bool,
+    // die Ereignisschlange
+    q_kind: [u32; 64],
+    q_a: [u32; 64],
+    q_x: [u32; 64],
+    q_y: [u32; 64],
+    q_s: [u32; 64],
+    q_head: usize,
+    q_tail: usize,
+}
+
+fn surface_new() -> Platte {
+    return Platte { win: 0, akt: 0, is_open: false, w: 0, h: 0, dpi: 160,
+        schirm_w: 0, schirm_h: 0, bits: 0, stride: 0, eigen: 0,
+        eigen_n: 0, gift: 0, fmt: 0, dark: false, dark_bekannt: false,
+        q_kind: [0; 64], q_a: [0; 64], q_x: [0; 64], q_y: [0; 64],
+        q_s: [0; 64], q_head: 0, q_tail: 0 }
+}
+
+// ==================================================== DIE ZWEI FRAGEN
+
+fn r_is_open(x: *mut Platte) -> bool {
+    return (*x).is_open
+}
+
+fn r_width(x: *mut Platte) -> usize {
+    return (*x).w
+}
+
+fn r_height(x: *mut Platte) -> usize {
+    return (*x).h
+}
+
+fn r_dpi(x: *mut Platte) -> usize {
+    return (*x).dpi
+}
+
+// ==================================== WAS DIE AKTIVITAET HEREINREICHT
+
+// `onNativeWindowCreated` / `onNativeWindowDestroyed`. 0 means: the
+// window is gone, and from here the path without a phone does not
+// apply -- simply nothing is pushed across any more.
+fn an_set_window(x: *mut Platte, win: u64) {
+    if (*x).bits != 0 && (*x).win != 0 {
+        let a: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+        (*x).bits = 0
+    }
+    (*x).win = win
+    if win != 0 {
+        (*x).w = ndk.ANativeWindow_getWidth(win) as usize
+        (*x).h = ndk.ANativeWindow_getHeight(win) as usize
+        if (*x).schirm_w == 0 {
+            (*x).schirm_w = (*x).w
+            (*x).schirm_h = (*x).h
+        }
+    }
+}
+
+fn an_set_activity(x: *mut Platte, akt: u64) {
+    (*x).akt = akt
+}
+
+// From `AConfiguration_getDensity`. Android counts in dpi like
+// everyone else (160 = mdpi), so the number passes through unchanged.
+fn an_set_dpi(x: *mut Platte, d: usize) {
+    if d >= 48 && d <= 960 {
+        (*x).dpi = d
+    }
+}
+
+fn an_set_dark(x: *mut Platte, dark: bool) {
+    (*x).dark = dark
+    (*x).dark_bekannt = true
+}
+
+fn an_set_screen(x: *mut Platte, sw: usize, sh: usize) {
+    (*x).schirm_w = sw
+    (*x).schirm_h = sh
+}
+
+// An event into the common queue. `kind` is an EV_* from
+// window.window -- the activity converts its AMotionEvent and
+// AKeyEvent numbers into it, exactly as win32.fi does with its WM_*
+// messages and x11.fi with its event numbers.
+fn an_event(x: *mut Platte, kind: u32, a: u32, ex: u32, ey: u32,
+    es: u32) {
+    let n: usize = ((*x).q_head + 1) % RING
+    if n == (*x).q_tail {
+        // The queue is full. The OLDEST goes -- a lost motion event
+        // is better than a stalled pointer.
+        (*x).q_tail = ((*x).q_tail + 1) % RING
+    }
+    (*x).q_kind[(*x).q_head] = kind
+    (*x).q_a[(*x).q_head] = a
+    (*x).q_x[(*x).q_head] = ex
+    (*x).q_y[(*x).q_head] = ey
+    (*x).q_s[(*x).q_head] = es
+    (*x).q_head = n
+    // RUNDE C-040 (fix-r3-3): DIE MELDUNG AN DEN VORRANG -- wortgleich
+    // mit lib/window/win32.fi:359. Sie steht hier und nicht beim
+    // Abholen (`r_take`), weil der Vorrang genau dann etwas nuetzt,
+    // wenn das Ereignis WAEHREND einer langen Rechnung ankommt: der
+    // Atemhaken pumpt, die Schlange fuellt sich, und die Scheibe im
+    // Seitenbau kann sich danach kuerzen. Erst beim Abholen gemeldet
+    // waere die Auskunft immer eine Runde zu spaet.
+    if kind == window.EV_KEY || kind == window.EV_CHAR
+        || kind == window.EV_BUTTON {
+        vorrang.vorrang_eingabe_melden()
+    }
+}
+
+// Is the window buffer locked right now? Whoever wants to paint from
+// another fiber has to know.
+fn an_gesperrt(x: *mut Platte) -> bool {
+    return (*x).bits != 0
+}
+
+// ========================================================== AUFMACHEN
+
+// There is nothing to open: the window comes from the system.
+// `display` has no meaning under Android and is not looked at -- just
+// as under Windows.
+fn r_open(x: *mut Platte, anzeige: usize) -> bool {
+    (*x).is_open = true
+    return true
+}
+
+// Die Zeichenflaeche auf `w` x `h` bringen.
+//
+// WITH a window: `ANativeWindow_setBuffersGeometry`. The driver may
+// round the row width up -- that is why `stride` is read anew on every
+// `lock` and never computed.
+//
+// WITHOUT a window: a piece of heap, `w * h * 4` octets.
+fn r_make(x: *mut Platte, w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 {
+        return false
+    }
+    (*x).w = w
+    (*x).h = h
+    if (*x).win != 0 {
+        let r: i32 = ndk.ANativeWindow_setBuffersGeometry((*x).win,
+            w as i32, h as i32, ndk.WINDOW_FORMAT_RGBA_8888)
+        if r != 0 {
+            return false
+        }
+        if (*x).gift != 0 {
+            let okg: bool = r_fill(x, MAGENTA, 0, 0, w, h)
+        }
+        return true
+    }
+    let n: usize = w * h * 4
+    if (*x).eigen != 0 {
+        rt.heap_free((*x).eigen, (*x).eigen_n)
+        (*x).eigen = 0
+        (*x).eigen_n = 0
+    }
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return false
+    }
+    (*x).eigen = p
+    (*x).eigen_n = n
+    (*x).stride = w
+    rt.mem_set(p, 0 as u8, n)
+    if (*x).gift != 0 {
+        let okg2: bool = r_fill(x, MAGENTA, 0, 0, w, h)
+    }
+    return true
+}
+
+fn r_maximise(x: *mut Platte, w: usize, h: usize) -> bool {
+    return r_make(x, w, h)
+}
+
+// The window IS visible as soon as Android gives it.
+fn r_show(x: *mut Platte) -> bool {
+    return (*x).win != 0 || (*x).eigen != 0
+}
+
+// U4: without Java no title.
+fn r_title(x: *mut Platte, p: u64, n: usize) -> bool {
+    return false
+}
+
+fn r_screen(x: *mut Platte, sw: *mut usize, sh: *mut usize) -> bool {
+    if (*x).schirm_w == 0 || (*x).schirm_h == 0 {
+        return false
+    }
+    *sw = (*x).schirm_w
+    *sh = (*x).schirm_h
+    return true
+}
+
+// An Android activity fills the screen; centring it is pointless and
+// is not claimed.
+fn r_centre(x: *mut Platte) -> bool {
+    return false
+}
+
+// Dragging the edge does not exist.
+fn r_dragging(x: *mut Platte) -> bool {
+    return false
+}
+
+fn r_poison(x: *mut Platte, an: bool) {
+    if an {
+        (*x).gift = 1
+    } else {
+        (*x).gift = 0
+    }
+}
+
+fn r_dark(x: *mut Platte) -> bool {
+    return (*x).dark
+}
+
+fn r_dark_known(x: *mut Platte) -> bool {
+    return (*x).dark_bekannt
+}
+
+// ============================================================== MALEN
+
+// Lock the window buffer if it is not already. Afterwards `bits` and
+// `stride` stand; without a window it is the own buffer.
+fn sperren(x: *mut Platte) -> bool {
+    if (*x).bits != 0 {
+        return true
+    }
+    if (*x).win == 0 {
+        if (*x).eigen == 0 {
+            return false
+        }
+        (*x).bits = (*x).eigen
+        (*x).stride = (*x).w
+        (*x).fmt = ndk.WINDOW_FORMAT_RGBA_8888
+        return true
+    }
+    var kasten: [u8; 48] = [0 as u8; 48]
+    let bp: u64 = (&kasten[0]) as u64
+    if ndk.ANativeWindow_lock((*x).win, bp, 0) != 0 {
+        return false
+    }
+    let bw: usize = ndk.peek32(bp + ndk.BUF_WIDTH) as usize
+    let bh: usize = ndk.peek32(bp + ndk.BUF_HEIGHT) as usize
+    (*x).stride = ndk.peek32(bp + ndk.BUF_STRIDE) as usize
+    (*x).fmt = ndk.peek32(bp + ndk.BUF_FORMAT)
+    (*x).bits = ndk.peek64(bp + ndk.BUF_BITS)
+    // The driver may have delivered another size than ordered. Then HIS
+    // applies -- the contract requires that `width`/`height`
+    // sagen, was wirklich dasteht.
+    if bw > 0 && bh > 0 {
+        (*x).w = bw
+        (*x).h = bh
+    }
+    // ROUND ABSCHLUSS: if the lock succeeds but delivers no pointer, then
+    // the window is STILL locked. Here stood only
+    // `return (*x).bits != 0` -- the caller got a no and had no way left
+    // to release the window again (`r_blit` returns immediately when
+    // `bits == 0`). The window would have stayed locked for ever. So it is
+    // released here, where it shows.
+    if (*x).bits == 0 {
+        let a: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+        return false
+    }
+    return true
+}
+
+// ===================================================================
+// ROUND ABSCHLUSS -- THE LOCKED BUFFER, FOR WHOEVER PAINTS HIMSELF
+// ===================================================================
+//
+// `r_image` converts three octets individually per pixel. For the bar
+// that is right; for the PAGE it is not -- lib/android/blit.fi copies
+// a row in one piece (`mem_copy`) and can scale while doing so. A3 in
+// the header of a_main.fi worked out that the conversion was a circle:
+// Android's RGBA_8888 is exactly the order in which lib/paint/canvas.fi
+// lays down its octets.
+//
+// Hence these four handles. What stands here is still everything that
+// hangs on the WINDOW: lock, row width, format, release -- and from now
+// on the app knows nothing more about `ANativeWindow_lock`.
+fn an_lock(x: *mut Platte) -> bool {
+    return sperren(x)
+}
+
+#[no_gc]
+fn an_bits(x: *mut Platte) -> u64 {
+    return (*x).bits
+}
+
+#[no_gc]
+fn an_stride(x: *mut Platte) -> usize {
+    return (*x).stride
+}
+
+#[no_gc]
+fn an_format(x: *mut Platte) -> i32 {
+    return (*x).fmt
+}
+
+// The borrowed ANativeWindow. 0 = none (screen without a phone).
+#[no_gc]
+fn an_window(x: *mut Platte) -> u64 {
+    return (*x).win
+}
+
+// A finished BGRX buffer to (dx, dy). Android's RGBA_8888 wants the
+// same four octets in the order R, G, B, A -- octets 0 and 2 are
+// swapped (see the header).
+fn r_image(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
+    dy: usize) -> bool {
+    if !sperren(x) {
+        return false
+    }
+    let ziel: u64 = (*x).bits
+    let st: usize = (*x).stride
+    var y: usize = 0
+    while y < h {
+        let ty: usize = dy + y
+        if ty >= (*x).h {
+            break
+        }
+        var n: usize = w
+        if dx + n > (*x).w {
+            if dx >= (*x).w {
+                n = 0
+            } else {
+                n = (*x).w - dx
+            }
+        }
+        var i: usize = 0
+        let q: u64 = px + (y * w * 4) as u64
+        let z: u64 = ziel + ((ty * st + dx) * 4) as u64
+        while i < n {
+            let b: u8 = rt.ld8(q, i * 4)
+            let g: u8 = rt.ld8(q, i * 4 + 1)
+            let r: u8 = rt.ld8(q, i * 4 + 2)
+            rt.st8(z, i * 4, r)
+            rt.st8(z, i * 4 + 1, g)
+            rt.st8(z, i * 4 + 2, b)
+            rt.st8(z, i * 4 + 3, 255 as u8)
+            i = i + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// A rectangle in 0xRRGGBB.
+fn r_fill(x: *mut Platte, px: u32, x0: usize, y0: usize, w: usize,
+    h: usize) -> bool {
+    if !sperren(x) {
+        return false
+    }
+    let ziel: u64 = (*x).bits
+    let st: usize = (*x).stride
+    let rr: u8 = ((px >> 16) & 255 as u32) as u8
+    let gg: u8 = ((px >> 8) & 255 as u32) as u8
+    let bb: u8 = (px & 255 as u32) as u8
+    var y: usize = 0
+    while y < h {
+        let ty: usize = y0 + y
+        if ty >= (*x).h {
+            break
+        }
+        var i: usize = 0
+        let z: u64 = ziel + ((ty * st + x0) * 4) as u64
+        while i < w && x0 + i < (*x).w {
+            rt.st8(z, i * 4, rr)
+            rt.st8(z, i * 4 + 1, gg)
+            rt.st8(z, i * 4 + 2, bb)
+            rt.st8(z, i * 4 + 3, 255 as u8)
+            i = i + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// U1: the NDK has no system font without Java.
+fn r_font(x: *mut Platte) -> bool {
+    return false
+}
+
+fn r_text(x: *mut Platte, fg: u32, bg: u32, tx: usize, ty: usize, p: u64,
+    n: usize) -> bool {
+    return false
+}
+
+// Everything painted onto the screen: releasing the window buffer IS
+// the pushing out. Without a window the drawing surface stays, so that
+// `r_ppm` can still find it.
+fn r_present(x: *mut Platte) -> bool {
+    if (*x).bits == 0 {
+        return true
+    }
+    if (*x).win == 0 {
+        (*x).bits = 0
+        return true
+    }
+    let r: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+    (*x).bits = 0
+    return r == 0
+}
+
+// The capture of what really stands there -- like win32.fi through its DIB.
+// Without an own buffer it does not work: a posted ANativeWindow does
+// not give its pixels back.
+fn r_ppm(x: *mut Platte, pfad: u64) -> bool {
+    if (*x).eigen == 0 {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    var p6: [u8; 3] = "P6\n"
+    rt.buf_push_bytes(&b, (&p6[0]) as u64, 3)
+    rt.buf_push_dec_u64(&b, (*x).w as u64)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_u64(&b, (*x).h as u64)
+    rt.buf_push(&b, 10 as u8)
+    var m255: [u8; 4] = "255\n"
+    rt.buf_push_bytes(&b, (&m255[0]) as u64, 4)
+    var y: usize = 0
+    while y < (*x).h {
+        var xx: usize = 0
+        while xx < (*x).w {
+            let o: u64 = (*x).eigen + ((y * (*x).stride + xx) * 4) as u64
+            // Im Puffer liegen R, G, B, A -- PPM will R, G, B.
+            rt.buf_push(&b, rt.ld8(o, 0))
+            rt.buf_push(&b, rt.ld8(o, 1))
+            rt.buf_push(&b, rt.ld8(o, 2))
+            xx = xx + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = rt.write_file(pfad, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    return ok
+}
+
+// ======================================================= DIE EREIGNISSE
+
+fn r_pending(x: *mut Platte) -> bool {
+    return (*x).q_head != (*x).q_tail
+}
+
+// RUNDE C-040 -- LIEGT EINE EINGABE IN DER SCHLANGE? (der Vertrag von
+// lib/window/window.fi, siehe dort `input_pending`).
+//
+// Nur NACHSEHEN, nichts herausnehmen. Gezaehlt wird Taste, Zeichen,
+// Finger -- eine Bewegung (EV_MOTION) nicht, sonst verschoebe ein
+// ueber den Schirm wandernder Finger jede Scheibe des Seitenbaus.
+//
+// lib/android/a_main.fi geht an dieser Rueckwand vorbei (es haengt mit
+// `AInputQueue` direkt am Looper) und meldet selbst in
+// `browser.vorrang`. Diese Funktion ist fuer jeden anderen
+// Android-Wirt da, der ueber `window.window` geht -- ohne sie waere
+// der Vertrag der Fensterschicht auf einer Plattform unvollstaendig,
+// und genau solche Loecher hat Runde FENSTER zugeschuettet.
+fn r_input_pending(x: *mut Platte) -> bool {
+    var i: usize = (*x).q_tail
+    while i != (*x).q_head {
+        let k: u32 = (*x).q_kind[i]
+        if k == window.EV_KEY || k == window.EV_CHAR
+            || k == window.EV_BUTTON {
+            return true
+        }
+        i = (i + 1) % RING
+    }
+    return false
+}
+
+// U3: Android's loop. `ms` < 0 = forever, 0 = only look. The callback
+// that `ALooper_pollOnce` works off on the way is that of the
+// activity -- it pours the events with `an_event` into the same queue
+// from which `r_take` takes them.
+fn r_wait(x: *mut Platte, ms: i64) -> bool {
+    if r_pending(x) {
+        return true
+    }
+    if !(*x).is_open {
+        return false
+    }
+    if (*x).win == 0 {
+        // Without a window nothing comes. Saying that honestly is
+        // better than standing in a loop.
+        return false
+    }
+    var fd: i32 = 0
+    var ev: i32 = 0
+    var daten: u64 = 0
+    let r: i32 = ndk.ALooper_pollOnce(ms as i32, (&fd) as u64,
+        (&ev) as u64, (&daten) as u64)
+    return r_pending(x)
+}
+
+fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
+    oy: *mut u32, os: *mut u32) -> bool {
+    if (*x).q_head == (*x).q_tail {
+        return false
+    }
+    let i: usize = (*x).q_tail
+    *k = (*x).q_kind[i]
+    *a = (*x).q_a[i]
+    *ox = (*x).q_x[i]
+    *oy = (*x).q_y[i]
+    *os = (*x).q_s[i]
+    (*x).q_tail = (i + 1) % RING
+    return true
+}
+
+// =========================================================== ZUMACHEN
+//
+// The window belongs to Android; it is NOT freed, only let go. The own
+// buffer belongs to us and goes back.
+fn r_close(x: *mut Platte) {
+    if (*x).bits != 0 && (*x).win != 0 {
+        let a: i32 = ndk.ANativeWindow_unlockAndPost((*x).win)
+    }
+    (*x).bits = 0
+    (*x).win = 0
+    if (*x).eigen != 0 {
+        rt.heap_free((*x).eigen, (*x).eigen_n)
+        (*x).eigen = 0
+        (*x).eigen_n = 0
+    }
+    (*x).is_open = false
+}
+
+// RUNDE C-038: die Selbstaktualisierung (certus-update.exe) ist ein
+// Windows-Weg. Hier gibt es sie nicht -- ehrliches `false`, damit der
+// Aufrufer es sagen kann, statt so zu tun, als liefe etwas.
+fn r_update_start(mit_fenster: bool) -> bool {
+    return false
+}
+// RUNDE C-040: DIE SCHLIESSENDE KLAMMER HAT GEFEHLT.
+//
+// Derselbe Fehler wie in lib/window/x11.fi:1467 (siehe PLAN.md,
+// Abschnitt 0): der Uebersetzer las alles Folgende als Rumpf dieser
+// Funktion und meldete auf der naechsten Funktion
+//     error: 'fn' is only allowed at top level, not inside a function body
+//         --> lib/android/window/backend.fi:659:1
+// Der Android-Bau war damit auf diesem Zweig GAR NICHT uebersetzbar --
+// nachgestellt mit
+//     FIRNLIB=/root/firnlib-c040 firnc --target=aarch64-linux --pic \
+//         -c -o .bau/vorrang/a_main.o lib/android/a_main.fi
+
+// ================================================= DIE TITELLEISTE (C-039)
+//
+// HIER GIBT ES NICHTS ZU TUN, und das ist kein fehlendes Stueck.
+// Unter Android zeichnet das System die Leiste, nicht das
+// Programm -- es gibt kein Gegenstueck zu DWMWA_CAPTION_COLOR. Die
+// Funktionen stehen trotzdem da, weil lib/window/window.fi EINEN
+// Vertrag fuer alle Rueckwaende hat; fehlten sie, waere der
+// Android-Bau nicht uebersetzbar.
+fn r_titlebar_dark(x: *mut Platte, dunkel: bool) {
+}
+
+fn r_titlebar_colour(x: *mut Platte, rgb: u32, an: bool) {
+}
+
+// ===================================================================
+// RUNDE C-049 -- DER EIGENE FENSTERRAHMEN, HIER ALS NICHTSTUER
+// ===================================================================
+//
+// `lib/window/window.fi` ruft diese zehn Namen unbedingt. Unter X11
+// stehen sie aus demselben Grund da und geben dasselbe zurueck: es
+// gibt hier keinen selbstgezeichneten Rahmen.
+//
+// WARUM DAS HIER GEFEHLT HAT, und warum es sechs Runden lang niemand
+// gemerkt hat: C-049 hat window.fi erweitert und nur x11.fi und
+// win32.fi nachgezogen. Der Desktop-Bau blieb gruen, der Bau fuer
+// dieses Rueckende scheiterte -- gemerkt wurde es erst, als wieder
+// eine APK gebaut werden sollte.
+//
+// EIN TELEFON HAT KEINE TITELLEISTE. `r_frame_can` sagt deshalb
+// `false`, und damit ruft window.fi die uebrigen neun gar nicht erst
+// auf. Sie sind trotzdem da, weil der Binder sonst nichts findet.
+#[no_gc]
+fn r_frame_can(x: *mut Platte) -> bool { return false }
+
+#[no_gc]
+fn r_frame_own(x: *mut Platte, an: bool) -> bool { return false }
+
+#[no_gc]
+fn r_frame_height(x: *mut Platte, h: usize) { }
+
+#[no_gc]
+fn r_button_zone(x: *mut Platte, x0: usize, x1: usize) { }
+
+#[no_gc]
+fn r_content_size(x: *mut Platte, bw: *mut usize, bh: *mut usize) -> bool {
+    return false
+}
+
+#[no_gc]
+fn r_minimise(x: *mut Platte) { }
+
+#[no_gc]
+fn r_max_toggle(x: *mut Platte) { }
+
+#[no_gc]
+fn r_maximised(x: *mut Platte) -> bool { return false }
+
+#[no_gc]
+fn r_drag(x: *mut Platte) { }
+
+#[no_gc]
+fn r_sysmenu(x: *mut Platte, sx: usize, sy: usize) { }

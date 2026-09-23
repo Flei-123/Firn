@@ -1,0 +1,2004 @@
+// SPDX-License-Identifier: MPL-2.0
+// Herkunft: Certus, lib/window/win32.fi, Stand Certus-Commit 1f1ec17bdb68 (zuletzt
+// geaendert in cbbc9d8c0475); vom alleinigen Urheber Justin am 23.09.2026
+// fuer Firn unter MPL-2.0 freigegeben.
+// lib/window/win32.fi -- DIE RUECKWAND WINDOWS (Runde FENSTER).
+//
+// NOT rewritten: this is lib/windows/gdi.fi from CERTUS-WINDOWS and
+// CERTUS-WIN2, rehung onto the contract of
+// lib/window/window.fi. Die drei Zahlen, an denen die ganze
+// Darstellung haengt, stehen unveraendert da:
+//
+//  1. THE ROW DIRECTION. A DIB is laid out bottom to top when
+//     `biHeight` is positive. The canvas runs top to bottom --
+//     `biHeight` is therefore NEGATIVE.
+//  2. THE ROW LENGTH. At 32 bits per pixel there is no padding, but
+//     only for that reason. Writing always uses `(*w).stride` and
+//     never a guessed stride.
+//  3. THE CHANNEL ORDER. A 32 bit DIB with BI_RGB holds B, G, R, X --
+//     the same as the X11 backend expects. A swap happens only for
+//     GDI TEXT, because a COLORREF is 0x00BBGGRR.
+//
+// NO FOREIGN LIBRARY: everything is `extern fn` on user32, gdi32,
+// kernel32 and advapi32, bound through the import table that
+// compiler/src/win.rs writes itself. No Direct2D, no GDI+, no
+// DirectWrite, not a line of C.
+//
+// THE CALLBACK. `#[win_callback]` puts the Win64 -> System-V thunk in
+// front of `wndproc`; without it `hwnd` would arrive in `rcx` where
+// Firn reads `rdi` -- and there would be neither WM_DESTROY nor
+// WM_SIZE, because both are SENT and never stand in the message queue.
+//
+// ================================ WHAT THIS ROUND ADDED
+//
+// W1 THE KEY STATE. `ev_state` was always 0; now Shift (bit 0) and
+//    Ctrl (bit 2) stand in it -- the X11 layout.
+// W2 RIGHT AND MIDDLE MOUSE BUTTON. W3 K_TAB/K_HOME/K_END/K_DELETE.
+// W4 WM_DPICHANGED: another screen, another density.
+// W5 LIGHT/DARK now stands HERE and not in the browser
+//    (lib/windows/wintheme.fi is gone with it): a window library where
+//    every program has to read the registry itself has not done its
+//    job.
+import std.rt
+import window.window
+// RUNDE C-040 -- DER EINGABE-VORRANG, GEMEINSAM STATT ZWEIMAL.
+//
+// Bis zu dieser Runde kam `G_EIN_VORRANG` NUR in lib/android/a_main.fi
+// vor (9 Fundstellen), in dieser Datei NULL Mal -- nachgezaehlt mit
+//     grep -c G_EIN_VORRANG lib/android/a_main.fi lib/window/win32.fi
+// Die Fensterprozedur ist die EINZIGE Stelle, an der Windows eine
+// Taste oder einen Klick abliefert; hier gemeldet, weiss der Kern
+// (lib/browser/vorrang.fi) davon, noch bevor das Ereignis aus der
+// Schlange geholt wird -- also auch dann, wenn der Umbruch laeuft.
+//
+// `browser.vorrang` importiert selbst NUR `std.rt` und kennt kein
+// Fenster; der Ring `window -> browser -> window` entsteht damit nicht.
+import browser.vorrang
+
+export {
+    Platte, surface_new,
+    r_open, r_make, r_show, r_title, r_close, r_is_open,
+    r_width, r_height, r_dpi, r_maximise,
+    r_image, r_fill, r_font, r_text, r_present, r_ppm,
+    r_wait, r_pending, r_next, r_dark, r_dark_known, r_poison,
+    r_input_pending,
+    r_screen, r_centre, r_dragging,
+    r_update_start,
+    r_titlebar_colour, r_titlebar_dark,
+    // RUNDE C-049 -- DER EIGENE FENSTERRAHMEN.
+    r_frame_can, r_frame_own, r_frame_height, r_button_zone,
+    r_content_size,
+    r_minimise, r_max_toggle, r_maximised, r_drag,
+    r_sysmenu,
+}
+
+// ---------------------------------------------------------------- user32
+extern fn RegisterClassW(c: u64) -> i32;
+extern fn CreateWindowExW(ex: i64, cls: u64, name: u64, style: i64,
+    x: i64, y: i64, w: i64, h: i64, parent: i64, menu: i64, inst: i64,
+    param: i64) -> i64;
+extern fn DestroyWindow(h: i64) -> i32;
+extern fn ShowWindow(h: i64, cmd: i64) -> i32;
+extern fn UpdateWindow(h: i64) -> i32;
+extern fn DefWindowProcW(h: i64, m: i64, wp: i64, lp: i64) -> i64;
+extern fn PeekMessageW(m: u64, h: i64, lo: i64, hi: i64, rm: i64) -> i32;
+extern fn TranslateMessage(m: u64) -> i32;
+extern fn DispatchMessageW(m: u64) -> i64;
+extern fn PostQuitMessage(n: i64);
+extern fn GetDC(h: i64) -> i64;
+extern fn ReleaseDC(h: i64, dc: i64) -> i32;
+extern fn IsWindow(h: i64) -> i32;
+extern fn SetWindowTextW(h: i64, s: u64) -> i32;
+extern fn LoadCursorW(inst: i64, name: i64) -> i64;
+extern fn SetProcessDpiAwarenessContext(c: i64) -> i32;
+extern fn GetDpiForWindow(h: i64) -> i32;
+extern fn MsgWaitForMultipleObjectsEx(n: i64, hp: u64, ms: i64,
+    mask: i64, fl: i64) -> i32;
+extern fn AdjustWindowRectEx(r: u64, style: i64, menu: i64, ex: i64)
+-> i32;
+extern fn SetWindowLongPtrW(h: i64, idx: i64, v: i64) -> i64;
+extern fn GetWindowLongPtrW(h: i64, idx: i64) -> i64;
+extern fn GetKeyState(vk: i64) -> i32;
+// ROUND CERTUS-WIN4: the start size. SystemParametersInfoW with
+// SPI_GETWORKAREA (0x0030) delivers the WORK AREA -- the screen
+// without the taskbar. That is exactly the area of which 80 % is a
+// sensible window.
+extern fn SystemParametersInfoW(a: i64, b: i64, p: u64, w: i64) -> i32;
+extern fn SetWindowPos(h: i64, after: i64, x: i64, y: i64, cx: i64,
+    cy: i64, flags: i64) -> i32;
+extern fn GetWindowRect(h: i64, r: u64) -> i32;
+// ---- RUNDE C-049: was der eigene Rahmen zusaetzlich braucht
+//
+// DREI davon sind schon gebunden (`GetClientRect`, `GetSystemMetrics`,
+// `ReleaseCapture` stehen in compiler/src/win.rs). Die SECHS anderen
+// NICHT -- und die Importtabelle liegt im UEBERSETZER, den sich diese
+// Runde mit C-047 und C-048 teilt. Ein Eingriff dort haette deren
+// laufende Baeue mitgeaendert; das ist kein Preis, den eine Runde ueber
+// den Fensterrahmen zahlen darf.
+//
+// Also derselbe Weg, den diese Datei fuer kernel32 schon geht
+// (`kernel32_holen`): zur Laufzeit aus user32.dll holen. Das ist kein
+// Notbehelf, sondern bei `GetSystemMetricsForDpi` sogar der RICHTIGE
+// Weg -- die Funktion gibt es erst ab Windows 10 1607, und ein
+// statischer Import wuerde das Programm auf aelteren Staenden gar nicht
+// erst starten lassen ("Einstiegspunkt nicht gefunden").
+extern fn GetClientRect(h: i64, r: u64) -> i32;
+extern fn GetSystemMetrics(i: i64) -> i32;
+extern fn ReleaseCapture() -> i32;
+
+// ----------------------------------------------------------------- gdi32
+extern fn CreateDIBSection(dc: i64, bi: u64, mode: i64, bits: u64,
+    sec: i64, off: i64) -> i64;
+extern fn CreateCompatibleDC(dc: i64) -> i64;
+extern fn SelectObject(dc: i64, o: i64) -> i64;
+extern fn BitBlt(dst: i64, dx: i64, dy: i64, w: i64, h: i64, src: i64,
+    sx: i64, sy: i64, rop: i64) -> i32;
+extern fn DeleteObject(o: i64) -> i32;
+extern fn DeleteDC(dc: i64) -> i32;
+extern fn SetTextColor(dc: i64, c: i64) -> i32;
+extern fn SetBkColor(dc: i64, c: i64) -> i32;
+extern fn SetBkMode(dc: i64, m: i64) -> i32;
+extern fn TextOutA(dc: i64, x: i64, y: i64, s: u64, n: i64) -> i32;
+extern fn GetStockObject(n: i64) -> i64;
+extern fn GdiFlush() -> i32;
+
+// -------------------------------------------------------------- kernel32
+#[no_gc]
+extern fn GetModuleHandleW(n: i64) -> i64;
+// RUNDE C-038 -- DEN AKTUALISIERER STARTEN.
+//
+// GetModuleFileNameW und CreateProcessW stehen NICHT in der
+// Einfuhrliste des Uebersetzers (compiler/src/win.rs) -- ein
+// `extern fn` darauf endet im Binder mit "undefined reference".
+// Gemessen, nicht vermutet: genau daran ist der erste Anlauf dieser
+// Runde gescheitert.
+//
+// Den Uebersetzer dafuer zu aendern waere der falsche Hebel: an
+// /root/firnc-gc haengen gerade auch C-037 und C-039. Stattdessen der
+// Weg, den Windows selbst dafuer vorsieht und den der Uebersetzer
+// schon gebunden hat: GetModuleHandleW + GetProcAddress holen die
+// Adresse zur Laufzeit, und die wird als Funktionszeiger gerufen --
+// dieselbe Bauart wie `ruf1`/`ruf2` in lib/core/fiber.fi.
+#[no_gc]
+extern fn GetProcAddress(mod: i64, name: u64) -> i64;
+#[no_gc]
+extern fn CloseHandle(h: i64) -> i32;
+
+// Eine Adresse aus einer DLL als Funktionszeiger rufen. `code` ist
+// das, was GetProcAddress gegeben hat.
+struct H4 { f: fn(i64, u64, i32) -> i32 }
+// ---- RUNDE C-049: die Formen der nachgeladenen user32-Funktionen
+struct HI2 { f: fn(i64, i64) -> i64 }
+struct HI4 { f: fn(i64, i64, i64, i64) -> i64 }
+struct HI2U { f: fn(i64, u64) -> i32 }
+struct HI7 { f: fn(i64, i64, i64, i64, i64, i64, u64) -> i32 }
+struct H10 { f: fn(u64, u64, i64, i64, i32, i64, i64, u64, u64, u64) -> i32 }
+
+#[no_gc]
+fn ruf_modulname(code: u64, mo: i64, buf: u64, n: i32) -> i32 {
+    var satz: [u64; 1] = [0; 1]
+    satz[0] = code
+    var wert: [u64; 1] = [0; 1]
+    wert[0] = (&satz[0]) as u64
+    let h: *mut H4 = (&wert[0]) as *mut H4
+    let f: fn(i64, u64, i32) -> i32 = (*h).f
+    return f(mo, buf, n)
+}
+
+#[no_gc]
+fn ruf_prozess(code: u64, app: u64, zeile: u64, pa: i64, ta: i64,
+    erben: i32, flags: i64, umg: i64, ordner: u64, si: u64,
+    pi: u64) -> i32 {
+    var satz: [u64; 1] = [0; 1]
+    satz[0] = code
+    var wert: [u64; 1] = [0; 1]
+    wert[0] = (&satz[0]) as u64
+    let h: *mut H10 = (&wert[0]) as *mut H10
+    let f: fn(u64, u64, i64, i64, i32, i64, i64, u64, u64, u64) -> i32
+        = (*h).f
+    return f(app, zeile, pa, ta, erben, flags, umg, ordner, si, pi)
+}
+
+// Eine Adresse aus kernel32 holen. `name` ist ASCII mit Null am Ende
+// (GetProcAddress nimmt IMMER ASCII, auch fuer W-Funktionen).
+#[no_gc]
+// user32.dll ist bereits geladen (das Fenster steht ja), also genuegt
+// `GetModuleHandleW` -- kein `LoadLibrary`.
+fn user32_holen(name: u64) -> u64 {
+    var u32n: [u16; 11] = u"user32.dll\0"
+    let mo: i64 = GetModuleHandleW((&u32n[0]) as i64)
+    if mo == 0 {
+        return 0
+    }
+    return GetProcAddress(mo, name) as u64
+}
+
+// Die Adresse einmal holen und merken. Sechs Zahlen, die genau einmal
+// gesucht werden -- `GetProcAddress` bei jedem WM_NCHITTEST waere
+// Arbeit bei jeder Mausbewegung.
+static mut G_U32_GESUCHT: u32 = 0
+static mut G_SMFD: u64 = 0      // GetSystemMetricsForDpi
+static mut G_GWPL: u64 = 0      // GetWindowPlacement
+static mut G_POSTM: u64 = 0     // PostMessageW
+static mut G_SENDM: u64 = 0     // SendMessageW
+static mut G_GSYSM: u64 = 0     // GetSystemMenu
+static mut G_TPM: u64 = 0       // TrackPopupMenu
+
+fn u32_einmal() {
+    if G_U32_GESUCHT != 0 as u32 {
+        return
+    }
+    G_U32_GESUCHT = 1 as u32
+    var n1: [u8; 23] = "GetSystemMetricsForDpi\0"
+    G_SMFD = user32_holen((&n1[0]) as u64)
+    var n2: [u8; 19] = "GetWindowPlacement\0"
+    G_GWPL = user32_holen((&n2[0]) as u64)
+    var n3: [u8; 13] = "PostMessageW\0"
+    G_POSTM = user32_holen((&n3[0]) as u64)
+    var n4: [u8; 13] = "SendMessageW\0"
+    G_SENDM = user32_holen((&n4[0]) as u64)
+    var n5: [u8; 14] = "GetSystemMenu\0"
+    G_GSYSM = user32_holen((&n5[0]) as u64)
+    var n6: [u8; 15] = "TrackPopupMenu\0"
+    G_TPM = user32_holen((&n6[0]) as u64)
+}
+
+// Die Aufrufer. Das Muster (Satz -> Wert -> Halter -> Funktionswert)
+// ist dasselbe wie in `ruf_modulname`; warum es diesen Umweg braucht,
+// steht in lib/android/ndk.fi.
+fn ruf_i2(code: u64, a: i64, b: i64) -> i64 {
+    if code == 0 as u64 {
+        return 0
+    }
+    var satz: [u64; 1] = [0; 1]
+    satz[0] = code
+    var wert: [u64; 1] = [0; 1]
+    wert[0] = (&satz[0]) as u64
+    let h: *mut HI2 = (&wert[0]) as *mut HI2
+    let f: fn(i64, i64) -> i64 = (*h).f
+    return f(a, b)
+}
+
+fn ruf_i4(code: u64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    if code == 0 as u64 {
+        return 0
+    }
+    var satz: [u64; 1] = [0; 1]
+    satz[0] = code
+    var wert: [u64; 1] = [0; 1]
+    wert[0] = (&satz[0]) as u64
+    let h: *mut HI4 = (&wert[0]) as *mut HI4
+    let f: fn(i64, i64, i64, i64) -> i64 = (*h).f
+    return f(a, b, c, d)
+}
+
+fn ruf_i2u(code: u64, a: i64, b: u64) -> i32 {
+    if code == 0 as u64 {
+        return 0
+    }
+    var satz: [u64; 1] = [0; 1]
+    satz[0] = code
+    var wert: [u64; 1] = [0; 1]
+    wert[0] = (&satz[0]) as u64
+    let h: *mut HI2U = (&wert[0]) as *mut HI2U
+    let f: fn(i64, u64) -> i32 = (*h).f
+    return f(a, b)
+}
+
+fn ruf_i7(code: u64, a: i64, b: i64, c: i64, d: i64, e: i64, g: i64,
+    r: u64) -> i32 {
+    if code == 0 as u64 {
+        return 0
+    }
+    var satz: [u64; 1] = [0; 1]
+    satz[0] = code
+    var wert: [u64; 1] = [0; 1]
+    wert[0] = (&satz[0]) as u64
+    let h: *mut HI7 = (&wert[0]) as *mut HI7
+    let f: fn(i64, i64, i64, i64, i64, i64, u64) -> i32 = (*h).f
+    return f(a, b, c, d, e, g, r)
+}
+
+// Die sechs mit ihrem richtigen Namen -- ab hier liest sich der Rest
+// der Datei, als waeren sie gebunden.
+fn GetSystemMetricsForDpi(i: i64, dpi: i64) -> i32 {
+    u32_einmal()
+    return ruf_i2(G_SMFD, i, dpi) as i32
+}
+
+fn GetWindowPlacement(h: i64, p: u64) -> i32 {
+    u32_einmal()
+    return ruf_i2u(G_GWPL, h, p)
+}
+
+fn PostMessageW(h: i64, m: i64, wp: i64, lp: i64) -> i32 {
+    u32_einmal()
+    return ruf_i4(G_POSTM, h, m, wp, lp) as i32
+}
+
+fn SendMessageW(h: i64, m: i64, wp: i64, lp: i64) -> i64 {
+    u32_einmal()
+    return ruf_i4(G_SENDM, h, m, wp, lp)
+}
+
+fn GetSystemMenu(h: i64, rev: i64) -> i64 {
+    u32_einmal()
+    return ruf_i2(G_GSYSM, h, rev)
+}
+
+fn TrackPopupMenu(m: i64, f: i64, x: i64, y: i64, res: i64, h: i64,
+    r: u64) -> i32 {
+    u32_einmal()
+    return ruf_i7(G_TPM, m, f, x, y, res, h, r)
+}
+
+fn kernel32_holen(name: u64) -> u64 {
+    var k32: [u16; 13] = u"kernel32.dll\0"
+    let mo: i64 = GetModuleHandleW((&k32[0]) as i64)
+    if mo == 0 {
+        return 0
+    }
+    return GetProcAddress(mo, name) as u64
+}
+
+// -------------------------------------------------------------- advapi32
+extern fn RegGetValueW(key: i64, sub: u64, name: u64, flags: i64,
+    typ: u64, data: u64, cb: u64) -> i32;
+
+// ---------------------------------------------------------------- dwmapi
+//
+// RUNDE C-039. Justin, 18.09.2026: "die fensterleiste oben passt auch
+// nicht zum style". Certus malte seine Schale dunkel und liess Windows
+// darueber die HELLE Titelleiste zeichnen -- der Bruch sass genau an
+// der Oberkante.
+//
+// `DwmSetWindowAttribute` faerbt die Leiste, die das SYSTEM zeichnet.
+// Das ist der richtige Weg und kein Notbehelf: die drei Systemknoepfe,
+// das Ziehen, der Doppelklick zum Maximieren und Aero-Snap bleiben
+// Windows' Sache und verhalten sich weiter genau so, wie der Benutzer
+// es von jedem anderen Fenster kennt.
+extern fn DwmSetWindowAttribute(h: i64, attr: i64, p: u64,
+    cb: i64) -> i32;
+
+// ----------------------------------------------------- die Nachrichten
+const WM_DESTROY: i64 = 2
+const WM_SIZE: i64 = 5
+const WM_PAINT: i64 = 15
+const WM_CLOSE: i64 = 16
+const WM_ERASEBKGND: i64 = 20
+const WM_SETTINGCHANGE: i64 = 26
+const WM_KEYDOWN: i64 = 256
+const WM_CHAR: i64 = 258
+const WM_SYSKEYDOWN: i64 = 260
+const WM_MOUSEMOVE: i64 = 512
+const WM_LBUTTONDOWN: i64 = 513
+const WM_RBUTTONDOWN: i64 = 516
+const WM_MBUTTONDOWN: i64 = 519
+const WM_MOUSEWHEEL: i64 = 522
+// WM_DPICHANGED = 0x02E0 (W4)
+const WM_DPICHANGED: i64 = 736
+// ROUND CERTUS-WIN5. As long as the user DRAGS the edge, Windows runs
+// in its OWN message loop and sends a WM_SIZE on every mouse move.
+// Answering each of them with a full re-layout and a repaint means:
+// the window stalls while being dragged. Exactly Justin's "moving or
+// resizing the window takes forever". These two messages say when the
+// dragging starts and stops -- in between only the canvas is
+// stretched.
+const WM_ENTERSIZEMOVE: i64 = 561
+const WM_EXITSIZEMOVE: i64 = 562
+
+// ======================================================================
+// RUNDE C-049 -- DIE NACHRICHTEN DES NICHT-CLIENT-BEREICHS
+// ======================================================================
+//
+// WM_NCCALCSIZE (0x0083) fragt, wie gross der INHALT eines Fensters
+// ist. Wer hier den vorgeschlagenen Kasten UNVERAENDERT zurueckgibt,
+// bekommt einen Inhalt so gross wie das ganze Fenster -- und damit
+// verschwindet die Titelleiste, OHNE dass Schatten, Aero-Snap oder das
+// Groessenziehen verlorengehen. Genau das ist der Unterschied zu einem
+// rahmenlosen Fenster (WS_POPUP), bei dem alles drei weg ist.
+const WM_NCCALCSIZE: i64 = 131
+// WM_NCHITTEST (0x0084) fragt, WAS an einer Bildschirmstelle liegt.
+// Die Antwort entscheidet ueber Ziehen (HTCAPTION), Groessenaendern
+// (HTLEFT ...) und den Inhalt (HTCLIENT). Ohne eigene Antwort waere
+// ein Fenster ohne Titelleiste auch eines ohne Griff.
+const WM_NCHITTEST: i64 = 132
+const WM_NCMOUSEMOVE: i64 = 160
+const WM_NCLBUTTONDOWN: i64 = 161
+const WM_NCLBUTTONUP: i64 = 162
+const WM_NCMOUSELEAVE: i64 = 674
+const WM_LBUTTONUP: i64 = 514
+const WM_MOUSELEAVE: i64 = 675
+const WM_GETMINMAXINFO: i64 = 36
+const WM_ACTIVATE: i64 = 6
+const WM_SYSCOMMAND: i64 = 274
+const WM_WINDOWPOSCHANGED: i64 = 71
+
+// Die Antworten von WM_NCHITTEST.
+const HTCLIENT: i64 = 1
+const HTCAPTION: i64 = 2
+const HTSYSMENU: i64 = 3
+const HTMINBUTTON: i64 = 8
+const HTMAXBUTTON: i64 = 9
+const HTLEFT: i64 = 10
+const HTRIGHT: i64 = 11
+const HTTOP: i64 = 12
+const HTTOPLEFT: i64 = 13
+const HTTOPRIGHT: i64 = 14
+const HTBOTTOM: i64 = 15
+const HTBOTTOMLEFT: i64 = 16
+const HTBOTTOMRIGHT: i64 = 17
+const HTCLOSE: i64 = 20
+
+// SC_* fuer WM_SYSCOMMAND.
+const SC_MINIMIZE: i64 = 61472
+const SC_MAXIMIZE: i64 = 61488
+const SC_RESTORE: i64 = 61728
+const SC_MOUSEMOVE: i64 = 61458
+const SC_KEYMENU: i64 = 61696
+
+// SM_CXFRAME = 32, SM_CYFRAME = 33, SM_CXPADDEDBORDER = 92.
+// Der Rand, an dem man die Groesse zieht, ist die SUMME aus
+// SM_CXFRAME und SM_CXPADDEDBORDER -- nicht SM_CXFRAME allein. Wer
+// nur den ersten nimmt, baut einen 4 Punkte schmalen Griff, den
+// niemand trifft.
+const SM_CXFRAME: i64 = 32
+const SM_CYFRAME: i64 = 33
+const SM_CXPADDEDBORDER: i64 = 92
+const SM_CYCAPTION: i64 = 4
+
+// DIE DWM-MERKMALE.
+//
+// 20 = DWMWA_USE_IMMERSIVE_DARK_MODE, gueltig ab Windows 10 1809
+// (Stand 17763) und auf Windows 11. Auf den STAENDEN DAZWISCHEN
+// (1809 bis vor 20H1) trug dasselbe Merkmal die Nummer 19. Es gibt
+// keinen verlaesslichen Weg, aus der Fassungsnummer zu schliessen,
+// welche der beiden gilt -- die uebliche Loesung ist, BEIDE zu setzen
+// und den Rueckgabewert zu beachten. Ein unbekanntes Merkmal liefert
+// E_INVALIDARG und tut sonst nichts; das ist ungefaehrlich.
+const DWMWA_USE_IMMERSIVE_DARK_MODE: i64 = 20
+const DWMWA_USE_IMMERSIVE_DARK_MODE_ALT: i64 = 19
+// 35 = DWMWA_CAPTION_COLOR, erst ab Windows 11 (Stand 22000). Damit
+// bekommt die Leiste GENAU die Farbe der Schale statt Windows'
+// Standardgrau -- die Naht verschwindet ganz. Der Wert ist ein
+// COLORREF, also 0x00BBGGRR und NICHT 0xRRGGBB.
+const DWMWA_CAPTION_COLOR: i64 = 35
+const DWMWA_TEXT_COLOR: i64 = 36
+
+const RING: usize = 64
+
+struct Platte {
+    dragging: u32,
+    hwnd: i64,
+    hdc_mem: i64,
+    hbm: i64,
+    hbm_old: i64,
+    bits: u64,
+    w: usize,
+    h: usize,
+    stride: usize,
+    dpi: usize,
+    open: bool,
+    // the event queue -- it MUST lie here and not above: the window
+    // procedure is a callback and reaches only this structure.
+    q_kind: [u32; 64],
+    q_a: [u32; 64],
+    q_x: [u32; 64],
+    q_y: [u32; 64],
+    q_s: [u32; 64],
+    q_head: usize,
+    q_tail: usize,
+    // hell/dark (W5)
+    dark: bool,
+    dark_bekannt: bool,
+    // the poison, see window.set_poison
+    gift: u32,
+    // RUNDE C-039: die Farbe, die die TITELLEISTE tragen soll
+    // (0xRRGGBB). 0 heisst "keine gesetzt" -- dann bleibt es bei
+    // hell/dunkel ohne eigene Farbe. Sie wird gemerkt, weil das
+    // Fenster beim Setzen noch nicht stehen muss.
+    leiste_rgb: u32,
+    leiste_an: u32,
+    // ================================================== RUNDE C-049
+    // Zeichnet dieses Fenster seinen Rahmen selbst? 0 = nein (dann
+    // verhaelt sich alles wie vor dieser Runde).
+    rahmen: u32,
+    // Wie hoch die Zeile ist, die das PROGRAMM als Titelleiste malt
+    // (die Reiterzeile). WM_NCHITTEST braucht die Zahl: darueber wird
+    // gezogen, darunter faengt der Inhalt an.
+    kopf_h: usize,
+    // Die Bereiche, die das Programm in dieser Zeile fuer seine
+    // Fensterknoepfe belegt -- dort darf NICHT gezogen werden, sonst
+    // verschiebt ein Druck auf "Schliessen" das Fenster. x0 <= x < x1,
+    // vom RECHTEN Rand aus gerechnet ist es nicht: das Programm kennt
+    // seine Breite selbst.
+    knopf_x0: usize,
+    knopf_x1: usize,
+    // Der ZULETZT GESEHENE Maximierzustand. Aus ihm erkennt
+    // WM_WINDOWPOSCHANGED, dass sich etwas geaendert hat und der
+    // Rahmen neu gerechnet werden muss. (Eigenes Feld und nicht
+    // `knopf_x0` mitbenutzt: zwei Bedeutungen in einer Zahl sind der
+    // Anfang des naechsten Fehlers.)
+    war_max: u32,
+}
+
+// The holder with which a Firn function value becomes an address.
+// Why this detour is needed stands in lib/android/ndk.fi: a value of
+// type `fn(..)` is a pointer to a RECORD whose first word holds the
+// code address. With `#[win_callback]` that word does NOT hold the
+// Firn body but the Win64 -> System-V thunk.
+struct Halter4 {
+    f: fn(u64, u64, u64, u64) -> u64,
+}
+
+fn code_of4(f: fn(u64, u64, u64, u64) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut Halter4 = (&roh[0]) as *mut Halter4
+    (*h).f = f
+    return *((roh[0]) as *mut u64)
+}
+
+fn surface_new() -> Platte {
+    return Platte { dragging: 0, hwnd: 0, hdc_mem: 0, hbm: 0, hbm_old: 0, bits: 0,
+        w: 0, h: 0, stride: 0, dpi: 96, open: false,
+        q_kind: [0; 64], q_a: [0; 64], q_x: [0; 64], q_y: [0; 64],
+        q_s: [0; 64], q_head: 0, q_tail: 0,
+        dark: false, dark_bekannt: false, gift: 0,
+        leiste_rgb: 0, leiste_an: 0, rahmen: 0, kopf_h: 0,
+        knopf_x0: 0, knopf_x1: 0, war_max: 0 }
+}
+
+fn r_is_open(w: *mut Platte) -> bool {
+    return (*w).open
+}
+
+fn r_width(w: *mut Platte) -> usize {
+    return (*w).w
+}
+
+fn r_height(w: *mut Platte) -> usize {
+    return (*w).h
+}
+
+fn r_dpi(w: *mut Platte) -> usize {
+    if (*w).hwnd != 0 {
+        let d: i32 = GetDpiForWindow((*w).hwnd)
+        if d > 0 {
+            (*w).dpi = d as usize
+        }
+    }
+    return (*w).dpi
+}
+
+// ------------------------------------------------------ die Schlange
+
+fn push_ev(w: *mut Platte, kind: u32, a: u32, x: u32, y: u32, st: u32) {
+    let n: usize = ((*w).q_head + 1) % RING
+    if n == (*w).q_tail {
+        // full: the oldest falls out, a window must not stall
+        // because nobody collects
+        (*w).q_tail = ((*w).q_tail + 1) % RING
+    }
+    let i: usize = (*w).q_head
+    (*w).q_kind[i] = kind
+    (*w).q_a[i] = a
+    (*w).q_x[i] = x
+    (*w).q_y[i] = y
+    (*w).q_s[i] = st
+    (*w).q_head = n
+    // RUNDE C-040: DIE EINGABE MELDEN, SOBALD SIE ANKOMMT.
+    //
+    // Hier und nicht in den einzelnen Zweigen der Fensterprozedur: es
+    // gibt sechs Stellen, an denen eine Eingabe eingereiht wird
+    // (WM_KEYDOWN, WM_SYSKEYDOWN, WM_CHAR, drei Maustasten, das Rad) --
+    // an einer davon fehlte die Meldung frueher oder spaeter. `push_ev`
+    // ist der EINE Weg, den alle gehen.
+    //
+    // Der Zeitpunkt ist der Punkt: `push_ev` laeuft in der
+    // Fensterprozedur, also in `DispatchMessageW` -- und das ruft
+    // `pumpe`, und die ruft der Atemhaken MITTEN IM UMBRUCH. Die
+    // Meldung kommt damit an, waehrend der Seitenbau noch laeuft, und
+    // genau dafuer ist der Vorrang da.
+    if kind == window.EV_KEY || kind == window.EV_CHAR
+        || kind == window.EV_BUTTON {
+        vorrang.vorrang_eingabe_melden()
+    }
+}
+
+fn r_pending(w: *mut Platte) -> bool {
+    return (*w).q_head != (*w).q_tail
+}
+
+// RUNDE C-040 -- LIEGT EINE EINGABE IN DER SCHLANGE?
+//
+// Das ist die Wirtsfunktion, die `vorrang.vorrang_wirt_setzen` als
+// `hat_eingabe` bekommt. Sie SIEHT NUR NACH und nimmt nichts heraus --
+// das darf sie nicht: ein Ereignis, das mitten im Umbruch verarbeitet
+// wuerde, riefe `load_url` aus `load_url` heraus (die Begruendung steht
+// ausfuehrlich bei `pumpe_kurz` in lib/browser/certus_app.fi).
+//
+// Gezaehlt werden nur die drei Arten, hinter denen ein MENSCH steht:
+// Taste, Zeichen, Maustaste. Ein EV_MOTION oder ein EV_EXPOSE ist keine
+// Eingabe in diesem Sinn -- sonst verschoebe eine ueber das Fenster
+// fahrende Maus jede Scheibe und der Seitenbau kaeme nie voran.
+fn r_input_pending(w: *mut Platte) -> bool {
+    // ===============================================================
+    // RUNDE C-040, NACHBESSERUNG fix-r4-1 -- ERST PUMPEN, DANN SEHEN
+    // ===============================================================
+    //
+    // Hier fing die Schleife gleich an, ueber den Ring zu laufen. Das
+    // ist dieselbe Falle, die in lib/window/x11.fi gemessen wurde und
+    // dort ausfuehrlich steht: der Ring wird von `pumpe` gefuellt,
+    // `pumpe` wird von `r_wait` gerufen, und `window.wait_event`
+    // beginnt mit
+    //
+    //     if backend.r_pending(&(*f).p) { return true }
+    //
+    // Liegt also irgendetwas im Ring -- ein Expose, eine Mausbewegung
+    // --, kehrt `wait_event` sofort zurueck, `pumpe` laeuft nicht, und
+    // die Tasten bleiben in der Nachrichtenschlange des Systems
+    // stehen. Waehrend des Seitenbaus holt niemand Ereignisse ab, der
+    // Ring leert sich also nie von selbst.
+    //
+    // Gemessen unter wine (.bau/fixr41/certus.exe, github.com, 12
+    // Tasten) OHNE diese Zeile: von zwoelf gesendeten Tasten bekamen
+    // NEUN bis zum Laufende kein Bild.
+    //
+    // `pumpe(w, 0)` ist ein PeekMessage-Durchgang ohne Warten -- genau
+    // das, was `r_next` ein paar Zeilen tiefer auch tut, wenn der Ring
+    // leer ist. Es nimmt nichts aus dem Ring heraus; das Verbot,
+    // mitten im Umbruch ein Ereignis zu VERARBEITEN, bleibt
+    // unangetastet.
+    pumpe(w, 0)
+    var i: usize = (*w).q_tail
+    while i != (*w).q_head {
+        let k: u32 = (*w).q_kind[i]
+        if k == window.EV_KEY || k == window.EV_CHAR
+            || k == window.EV_BUTTON {
+            return true
+        }
+        i = (i + 1) % RING
+    }
+    return false
+}
+
+fn r_next(w: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
+    oy: *mut u32, os: *mut u32) -> bool {
+    if (*w).q_head == (*w).q_tail {
+        // Nothing in the queue: look ONCE without waiting, so that
+        // `next_event` auf beiden Systemen dasselbe bedeutet.
+        pumpe(w, 0)
+    }
+    if (*w).q_head == (*w).q_tail {
+        return false
+    }
+    let i: usize = (*w).q_tail
+    *k = (*w).q_kind[i]
+    *a = (*w).q_a[i]
+    *ox = (*w).q_x[i]
+    *oy = (*w).q_y[i]
+    *os = (*w).q_s[i]
+    (*w).q_tail = (i + 1) % RING
+    return true
+}
+
+// ------------------------------------------------- die Fensterprozedur
+
+// W1: the key state in the X11 layout -- bit 0 Shift, bit 2 Ctrl.
+// `GetKeyState` returns the high bit set while the key is
+// gedrueckt ist.
+fn zustand() -> u32 {
+    var s: u32 = 0
+    // VK_SHIFT = 0x10, VK_CONTROL = 0x11
+    if (GetKeyState(16) as i64) & 32768 != 0 {
+        s = s | 1 as u32
+    }
+    if (GetKeyState(17) as i64) & 32768 != 0 {
+        s = s | 4 as u32
+    }
+    return s
+}
+
+// The Windows key number onto that of lib/window (= that of X11).
+// As a TABLE and not as thirteen `if`s: whoever adds a key writes two
+// numbers and not three lines.
+fn vkey(vk: i64) -> u32 {
+    var win: [i64; 13] = [27, 13, 8, 9, 40, 38, 34, 33, 37, 39, 36, 35,
+        46]
+    var uns: [u32; 13] = [9, 36, 22, 23, 116, 111, 117, 112, 113, 114,
+        110, 115, 119]
+    var i: usize = 0
+    while i < 13 {
+        if win[i] == vk {
+            return uns[i]
+        }
+        i = i + 1
+    }
+    return 0 as u32
+}
+
+// Ist `p` die Zeichenkette "ImmersiveColorSet"? UTF-16, null-beendet.
+// The comparison stands here because the window procedure must not
+// allocate: no buffer, no conversion, only seventeen comparisons.
+fn is_colour_set(p: u64) -> bool {
+    if p == 0 as u64 {
+        return false
+    }
+    var lit: [u8; 17] = "ImmersiveColorSet"
+    var i: usize = 0
+    while i < 17 {
+        if rt.ld16(p, i) != (lit[i] as u16) {
+            return false
+        }
+        i = i + 1
+    }
+    return rt.ld16(p, 17) == 0 as u16
+}
+
+// ======================================================================
+// RUNDE C-049 -- DER EIGENE RAHMEN, DAS RECHENWERK
+// ======================================================================
+
+// Der Griffrand: wie breit der unsichtbare Streifen an den Kanten ist,
+// an dem die Groesse gezogen wird. Mit der Dichte des FENSTERS, nicht
+// des Systems -- auf einem zweiten Schirm mit anderer Skalierung waere
+// die Systemzahl falsch. `GetSystemMetricsForDpi` gibt es erst ab
+// Windows 10 1607; fehlt sie, tut es die alte ohne Dichte.
+fn rand_breite(w: *mut Platte) -> i64 {
+    var f: i32 = 0
+    var p: i32 = 0
+    let d: i64 = (*w).dpi as i64
+    if d > 0 {
+        f = GetSystemMetricsForDpi(SM_CXFRAME, d)
+        p = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, d)
+    }
+    if f == 0 {
+        f = GetSystemMetrics(SM_CXFRAME)
+        p = GetSystemMetrics(SM_CXPADDEDBORDER)
+    }
+    var r: i64 = (f as i64) + (p as i64)
+    if r < 4 {
+        r = 4
+    }
+    return r
+}
+
+// IST DAS FENSTER MAXIMIERT? Nicht ueber `IsZoomed` (das kennt nur
+// maximiert/nicht), sondern ueber WINDOWPLACEMENT -- dieselbe Quelle,
+// aus der auch `r_maximised` antwortet, damit Rahmen und Programm
+// nie verschiedener Meinung sind. showCmd steht im dritten u32.
+// SW_SHOWMAXIMIZED = 3.
+fn ist_max(w: *mut Platte) -> bool {
+    if (*w).hwnd == 0 {
+        return false
+    }
+    // WINDOWPLACEMENT: length(4) flags(4) showCmd(4) + 2 POINT + RECT
+    var wpl: [u8; 44] = [0; 44]
+    let pp: u64 = (&wpl[0]) as u64
+    rt.st32(pp, 0, 44 as u32)
+    if GetWindowPlacement((*w).hwnd, pp) == 0 {
+        return false
+    }
+    return rt.ld32(pp, 2) == 3 as u32
+}
+
+// ======================================================================
+// DER FEHLER, DEN JEDER SELBSTGEZEICHNETE RAHMEN MACHT
+// ======================================================================
+//
+// Ein MAXIMIERTES Fenster ist unter Windows absichtlich groesser als
+// der Bildschirm: auf jeder Seite um den Rahmen, den man sonst zum
+// Ziehen braucht (bei 96 dpi 8 Punkte). Solange Windows die
+// Titelleiste zeichnet, faellt das niemandem auf -- der Ueberhang
+// liegt unter dem Rand, den es selbst malt.
+//
+// Wer WM_NCCALCSIZE beantwortet und den Kasten unveraendert laesst,
+// bekommt DIESEN Ueberhang als Inhalt. Die Folge auf dem Bildschirm:
+// die oberste Zeile der Reiter ist abgeschnitten, und rechts liegen
+// acht Punkte des Fensters neben dem Schirm -- der Schliessknopf ist
+// nur noch halb da.
+//
+// Also: maximiert wird der Kasten oben/links/rechts/unten um genau
+// diesen Rand VERKLEINERT. Nicht maximiert bleibt er, wie er ist --
+// dort ist der Ueberhang genau der Griffrand, den WM_NCHITTEST
+// braucht.
+fn nccalc(w: *mut Platte, lp: u64) -> u64 {
+    if !ist_max(w) {
+        // Der volle Kasten wird Inhalt: keine Titelleiste, aber
+        // Schatten, Snap und Groessenrand bleiben Windows' Sache.
+        return 0 as u64
+    }
+    let rb: i64 = rand_breite(w)
+    // NCCALCSIZE_PARAMS: das erste RECT sind vier i32 (l, t, r, b).
+    let l: i32 = rt.ld32(lp, 0) as i32
+    let t: i32 = rt.ld32(lp, 1) as i32
+    let r: i32 = rt.ld32(lp, 2) as i32
+    let b: i32 = rt.ld32(lp, 3) as i32
+    rt.st32(lp, 0, ((l as i64) + rb) as u32)
+    rt.st32(lp, 1, ((t as i64) + rb) as u32)
+    rt.st32(lp, 2, ((r as i64) - rb) as u32)
+    rt.st32(lp, 3, ((b as i64) - rb) as u32)
+    return 0 as u64
+}
+
+// WM_NCHITTEST -- WAS LIEGT HIER?
+//
+// Die Reihenfolge ist nicht beliebig, sie ist die ganze Logik:
+//   1. die KANTEN zuerst (sonst zieht man die Groesse nie, weil die
+//      Titelleiste bis in die Ecke reicht),
+//   2. dann die FENSTERKNOEPFE des Programms (dort wird nicht
+//      gezogen),
+//   3. dann die uebrige Kopfzeile: ziehen,
+//   4. sonst: Inhalt.
+//
+// MAXIMIERT gibt es keine Kanten -- ein maximiertes Fenster zieht man
+// nicht groesser, und ein Griffrand dort wuerde nur den obersten
+// Bildpunkt der Reiter schlucken.
+fn nchit(w: *mut Platte, lp: u64) -> u64 {
+    let sx: i64 = ((lp as i64) & 65535) - (((lp as i64) & 32768) << 1)
+    let sy: i64 = (((lp as i64) >> 16) & 65535)
+        - ((((lp as i64) >> 16) & 32768) << 1)
+    var wr: [i32; 4] = [0; 4]
+    if GetWindowRect((*w).hwnd, (&wr[0]) as u64) == 0 {
+        return HTCLIENT as u64
+    }
+    let l: i64 = wr[0] as i64
+    let t: i64 = wr[1] as i64
+    let r: i64 = wr[2] as i64
+    let b: i64 = wr[3] as i64
+    let rb: i64 = rand_breite(w)
+    let maxi: bool = ist_max(w)
+    if !maxi {
+        let links: bool = sx < l + rb
+        let rechts: bool = sx >= r - rb
+        let oben: bool = sy < t + rb
+        let unten: bool = sy >= b - rb
+        if oben && links {
+            return HTTOPLEFT as u64
+        }
+        if oben && rechts {
+            return HTTOPRIGHT as u64
+        }
+        if unten && links {
+            return HTBOTTOMLEFT as u64
+        }
+        if unten && rechts {
+            return HTBOTTOMRIGHT as u64
+        }
+        if oben {
+            return HTTOP as u64
+        }
+        if unten {
+            return HTBOTTOM as u64
+        }
+        if links {
+            return HTLEFT as u64
+        }
+        if rechts {
+            return HTRIGHT as u64
+        }
+    }
+    // In Inhaltskoordinaten weiterrechnen.
+    let cx: i64 = sx - l
+    let cy: i64 = sy - t
+    if (*w).kopf_h == 0 || cy >= (*w).kopf_h as i64 {
+        return HTCLIENT as u64
+    }
+    // Die Knopfzeile des Programms: HTCLIENT, damit der Klick als
+    // gewoehnlicher Mausklick ankommt und die Leiste ihren Hover
+    // zeichnen kann. Windows' eigene HTMINBUTTON/HTMAXBUTTON/HTCLOSE
+    // wuerden das Zeichnen uebernehmen wollen -- und zwar im Stil der
+    // SYSTEMleiste, die wir gerade abgeschafft haben.
+    if (*w).knopf_x1 > (*w).knopf_x0 {
+        if cx >= (*w).knopf_x0 as i64 && cx < (*w).knopf_x1 as i64 {
+            return HTCLIENT as u64
+        }
+    }
+    // Der Rest der Kopfzeile ist die Titelleiste. Damit koennen
+    // Ziehen, Doppelklick (maximieren) und Rechtsklick (Systemmenue)
+    // bei WINDOWS bleiben -- und verhalten sich deshalb genau so, wie
+    // der Benutzer es von jedem anderen Fenster kennt. Aero-Snap
+    // ebenfalls: es haengt an HTCAPTION.
+    return HTCAPTION as u64
+}
+
+#[win_callback]
+fn wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
+    let m: i64 = msg as i64
+    let sp: i64 = GetWindowLongPtrW(hwnd as i64, 0 - 21)
+    if sp == 0 {
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
+    let w: *mut Platte = sp as *mut Platte
+    // ---- RUNDE C-049: der eigene Rahmen. Nur wenn er an ist; sonst
+    // faellt jede dieser Nachrichten an DefWindowProcW wie bisher.
+    if (*w).rahmen != 0 {
+        if m == WM_NCCALCSIZE {
+            // wParam = TRUE heisst "der Kasten steht in lParam".
+            if (wp as i64) != 0 {
+                return nccalc(w, lp)
+            }
+            return DefWindowProcW(hwnd as i64, m, wp as i64,
+                lp as i64) as u64
+        }
+        if m == WM_NCHITTEST {
+            return nchit(w, lp)
+        }
+    }
+    if m == WM_ERASEBKGND {
+        // Nothing is erased here: the blit covers every pixel, and
+        // what Windows tints white beforehand is exactly the flicker
+        // one would then see.
+        return 1 as u64
+    }
+    if m == WM_PAINT {
+        push_ev(w, window.EV_EXPOSE, 0 as u32, 0 as u32, 0 as u32,
+            0 as u32)
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
+    if m == WM_ENTERSIZEMOVE {
+        (*w).dragging = 1
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
+    if m == WM_EXITSIZEMOVE {
+        (*w).dragging = 0
+        // Now -- and only now -- the final size.
+        push_ev(w, window.EV_CONFIGURE, 0 as u32, (*w).w as u32,
+            (*w).h as u32, 0 as u32)
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
+    if m == WM_SIZE {
+        let l: i64 = lp as i64
+        let nw: i64 = l & 65535
+        let nh: i64 = (l >> 16) & 65535
+        if nw > 0 && nh > 0 {
+            push_ev(w, window.EV_CONFIGURE, 0 as u32, nw as u32,
+                nh as u32, 0 as u32)
+        }
+        return 0 as u64
+    }
+    // RUNDE C-049 -- NACH DEM MAXIMIEREN DEN RAHMEN NEU RECHNEN.
+    //
+    // WM_NCCALCSIZE kommt NICHT von selbst noch einmal, wenn sich nur
+    // der Zustand (maximiert/wiederhergestellt) aendert. Ohne diese
+    // Zeile behaelt ein gerade maximiertes Fenster den Kasten des
+    // wiederhergestellten -- und ragt um den Rahmen ueber den Schirm.
+    // SWP_FRAMECHANGED = 32, dazu NOMOVE(2) NOSIZE(1) NOZORDER(4)
+    // NOACTIVATE(16) = 55.
+    if m == WM_WINDOWPOSCHANGED {
+        if (*w).rahmen != 0 {
+            let jetzt: bool = ist_max(w)
+            let alt: bool = (*w).war_max != 0
+            if jetzt != alt {
+                if jetzt {
+                    (*w).war_max = 1
+                } else {
+                    (*w).war_max = 0
+                }
+                SetWindowPos((*w).hwnd, 0, 0, 0, 0, 0, 55)
+            }
+        }
+        return DefWindowProcW(hwnd as i64, m, wp as i64,
+            lp as i64) as u64
+    }
+    if m == WM_DPICHANGED {
+        // W4: the size stays, the density does not. EV_CONFIGURE with
+        // the known size makes lib/window read `dpi` anew and the
+        // program re-lay out.
+        push_ev(w, window.EV_CONFIGURE, 0 as u32, (*w).w as u32,
+            (*w).h as u32, 0 as u32)
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
+    if m == WM_CLOSE {
+        push_ev(w, window.EV_CLOSED, 0 as u32, 0 as u32, 0 as u32,
+            0 as u32)
+        return 0 as u64
+    }
+    if m == WM_DESTROY {
+        push_ev(w, window.EV_CLOSED, 0 as u32, 0 as u32, 0 as u32,
+            0 as u32)
+        PostQuitMessage(0)
+        return 0 as u64
+    }
+    if m == WM_KEYDOWN || m == WM_SYSKEYDOWN {
+        let k: u32 = vkey(wp as i64)
+        if k != 0 as u32 {
+            push_ev(w, window.EV_KEY, k, 0 as u32, 0 as u32, zustand())
+        }
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
+    if m == WM_CHAR {
+        let c: i64 = wp as i64
+        // ==============================================================
+        // ROUND fUi -- THE CTRL SHORTCUTS NEVER ARRIVED
+        // ==============================================================
+        //
+        // Here stood `if c >= 32 && c != 127`, and that swallowed EVERY
+        // Steuerzeichen verworfen. Die Begruendung daneben lautete
+        // "control characters have already come through as a key" -- and it
+        // holds for backspace, tab and enter. For CTRL+LETTER it does NOT
+        // hold: Windows sends Ctrl+A as WM_CHAR with the value 1, Ctrl+C as
+        // 3, Ctrl+V as 22. A WM_KEYDOWN with the letter does arrive too, but
+        // `vkey` does not map letters (the table knows only the thirteen keys
+        // with a meaning).
+        // Bedeutung) -- also fiel Strg+A auf BEIDEN Wegen heraus.
+        //
+        // MEASURED: under X11 Ctrl+A worked at once after the address bar was
+        // rebuilt (there `key_ascii` delivers the letter and the modifier
+        // separately), under Wine the selection stayed at 0 pixels and the
+        // text at 189 pixels width -- the same number before and after typing,
+        // so no selection at all.
+        // Wirkung.
+        //
+        // NOW: 1..26 pass through as control characters when Ctrl is really
+        // pressed. The three that also arise WITHOUT Ctrl stay out -- they are
+        // already on their way as a key and would otherwise come twice:
+        //
+        //     8  Rueckschritt (K_BACK)
+        //     9  Tabulator    (K_TAB)
+        //     13 Eingabe      (K_RETURN)
+        let st: u32 = zustand()
+        let mit_strg: bool = (st & 4 as u32) != 0 as u32
+        let ist_kuerzel: bool = c >= 1 && c <= 26 && c != 8 && c != 9
+            && c != 13
+        if (c >= 32 && c != 127) || (mit_strg && ist_kuerzel) {
+            push_ev(w, window.EV_CHAR, c as u32, 0 as u32, 0 as u32,
+                st)
+        }
+        return 0 as u64
+    }
+    if m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN {
+        let l: i64 = lp as i64
+        var px: i64 = l & 65535
+        var py: i64 = (l >> 16) & 65535
+        if px > 32767 {
+            px = 0
+        }
+        if py > 32767 {
+            py = 0
+        }
+        var knopf: u32 = window.BTN_LEFT
+        if m == WM_RBUTTONDOWN {
+            knopf = window.BTN_RIGHT
+        }
+        if m == WM_MBUTTONDOWN {
+            knopf = window.BTN_MIDDLE
+        }
+        push_ev(w, window.EV_BUTTON, knopf, px as u32, py as u32,
+            zustand())
+        return 0 as u64
+    }
+    if m == WM_MOUSEMOVE {
+        let l: i64 = lp as i64
+        var px: i64 = l & 65535
+        var py: i64 = (l >> 16) & 65535
+        // A negative value arrives as a 65535 complement -- the pointer is
+        // then left of or above the window, so on no button.
+        if px > 32767 {
+            px = 0
+        }
+        if py > 32767 {
+            py = 0
+        }
+        push_ev(w, window.EV_MOTION, 0 as u32, px as u32, py as u32,
+            zustand())
+        return 0 as u64
+    }
+    if m == WM_SETTINGCHANGE {
+        // `lParam` is a pointer to a UTF-16 string or 0.
+        if is_colour_set(lp) {
+            read_theme(w)
+            // Das System steht jetzt anders -- die Leiste mit.
+            leiste_anwenden(w)
+            push_ev(w, window.EV_THEME, 0 as u32, 0 as u32, 0 as u32,
+                0 as u32)
+        }
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
+    if m == WM_MOUSEWHEEL {
+        let d: i64 = ((wp as i64) >> 16) & 65535
+        var up: bool = true
+        if d >= 32768 {
+            up = false
+        }
+        if up {
+            push_ev(w, window.EV_BUTTON, window.BTN_WHEEL_UP, 0 as u32,
+                0 as u32, zustand())
+        } else {
+            push_ev(w, window.EV_BUTTON, window.BTN_WHEEL_DOWN,
+                0 as u32, 0 as u32, zustand())
+        }
+        return 0 as u64
+    }
+    return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+}
+
+// ========================================================= HELL/DUNKEL
+//
+// W5. Windows keeps the setting as a DWORD in the registry:
+//
+//     HKEY_CURRENT_USER
+//       \Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
+//         AppsUseLightTheme   0 = dark, 1 = hell
+//
+// Besides it there is `SystemUsesLightTheme` -- that is the taskbar
+// and the start menu, NOT the applications.
+//
+// `RegGetValueW` does opening, reading, type checking and closing in
+// ONE call. IF THE VALUE IS MISSING (Windows before 1809, server
+// images, a fresh profile) or the read fails: LIGHT.
+const HKCU: i64 = 2147483649
+const RRF_DWORD: i64 = 16
+
+// ASCII to UTF-16, with `/` as a stand-in for the backslash: a literal
+// with doubled backslashes makes the registry paths unreadable, and a
+// wrongly counted length would then not show up here but only as
+// "value not found".
+fn breit(src: u64, n: usize, dst: u64) {
+    var i: usize = 0
+    while i < n {
+        var c: u16 = rt.ld8(src, i) as u16
+        if c == 47 as u16 {
+            c = 92 as u16
+        }
+        rt.st16(dst, i, c)
+        i = i + 1
+    }
+    rt.st16(dst, n, 0 as u16)
+}
+
+fn read_theme(w: *mut Platte) {
+    var sub: [u8; 60] = "Software/Microsoft/Windows/CurrentVersion/Themes/Personalize"
+    var nam: [u8; 17] = "AppsUseLightTheme"
+    var wsub: [u16; 64] = [0; 64]
+    var wnam: [u16; 24] = [0; 24]
+    breit((&sub[0]) as u64, 60, (&wsub[0]) as u64)
+    breit((&nam[0]) as u64, 17, (&wnam[0]) as u64)
+    var wert: [u32; 1] = [0; 1]
+    var cb: [u32; 1] = [0; 1]
+    cb[0] = 4 as u32
+    let rc: i32 = RegGetValueW(HKCU, (&wsub[0]) as u64,
+        (&wnam[0]) as u64, RRF_DWORD, 0 as u64, (&wert[0]) as u64,
+        (&cb[0]) as u64)
+    if rc != 0 {
+        // ERROR_SUCCESS is 0. Anything else: the value is not there.
+        (*w).dark = false
+        (*w).dark_bekannt = false
+        return
+    }
+    (*w).dark_bekannt = true
+    // 0 = dark, 1 = hell.
+    (*w).dark = wert[0] == 0 as u32
+}
+
+fn r_dark(w: *mut Platte) -> bool {
+    return (*w).dark
+}
+
+fn r_dark_known(w: *mut Platte) -> bool {
+    return (*w).dark_bekannt
+}
+
+// ================================================= DIE TITELLEISTE (C-039)
+//
+// Sie wird bei JEDER Gelegenheit neu gesetzt, an der sich etwas
+// aendern kann: beim Erzeugen des Fensters, beim Umschalten des
+// Schemas und wenn das Programm eine eigene Farbe gibt. Das ist
+// billig (ein Aufruf, kein Neuzeichnen) und spart die Frage, ob das
+// Fenster zum Zeitpunkt X schon stand.
+//
+// WARUM BEIDE MERKMALSNUMMERN. Siehe oben bei den Konstanten: 20 gilt
+// ab 20H1, 19 auf den Staenden davor. Gesetzt wird 20 zuerst; nur wenn
+// das fehlschlaegt, wird 19 versucht. Ein unbekanntes Merkmal gibt
+// E_INVALIDARG zurueck und richtet keinen Schaden an.
+fn leiste_anwenden(w: *mut Platte) {
+    if (*w).hwnd == 0 {
+        return
+    }
+    // BOOL ist 4 Oktett. 1 = die Leiste dunkel zeichnen.
+    var an: [u32; 1] = [0; 1]
+    if (*w).dark {
+        an[0] = 1 as u32
+    }
+    let rc: i32 = DwmSetWindowAttribute((*w).hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE, (&an[0]) as u64, 4)
+    if rc != 0 {
+        DwmSetWindowAttribute((*w).hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE_ALT, (&an[0]) as u64, 4)
+    }
+    // Und die genaue Farbe, wenn das Programm eine genannt hat.
+    // Windows 10 kennt das Merkmal nicht und gibt E_INVALIDARG --
+    // dann bleibt es bei der reinen Hell/Dunkel-Umschaltung oben,
+    // und das ist genau das gewuenschte Verhalten.
+    if (*w).leiste_an != 0 as u32 {
+        var c: [u32; 1] = [0; 1]
+        c[0] = cref_u32((*w).leiste_rgb)
+        DwmSetWindowAttribute((*w).hwnd, DWMWA_CAPTION_COLOR,
+            (&c[0]) as u64, 4)
+    }
+}
+
+// 0xRRGGBB -> COLORREF 0x00BBGGRR. Dasselbe wie `cref`, aber auf u32
+// und ohne den Umweg ueber i64 -- DwmSetWindowAttribute will einen
+// Zeiger auf genau vier Oktett.
+fn cref_u32(c: u32) -> u32 {
+    let r: u32 = (c >> 16) & 255 as u32
+    let g: u32 = (c >> 8) & 255 as u32
+    let b: u32 = c & 255 as u32
+    return (b << 16) | (g << 8) | r
+}
+
+// DER HANDSCHALTER. `theme_aufloesen` in lib/window/window.fi ruft
+// das auch dann, wenn das Schema NICHT vom System kommt (--theme=dark)
+// -- sonst stuende eine helle Leiste ueber einer dunklen Schale.
+fn r_titlebar_dark(w: *mut Platte, dunkel: bool) {
+    (*w).dark = dunkel
+    (*w).dark_bekannt = true
+    leiste_anwenden(w)
+}
+
+// Das Programm gibt die Farbe der Schale durch. `r_titlebar_colour(w, 0)`
+// nimmt sie wieder zurueck.
+fn r_titlebar_colour(w: *mut Platte, rgb: u32, an: bool) {
+    (*w).leiste_rgb = rgb
+    if an {
+        (*w).leiste_an = 1 as u32
+    } else {
+        (*w).leiste_an = 0 as u32
+    }
+    leiste_anwenden(w)
+}
+
+// --------------------------------------------------------- the window
+
+// Registers the class and sets the pixel density right. MUST come
+// before the window: whoever sets the DPI awareness only afterwards no
+// longer has it, and Windows then stretches the image with the result
+// that on Android was the blurriness -- only this time produced by the system.
+fn r_open(w: *mut Platte, anzeige: usize) -> bool {
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4.
+    SetProcessDpiAwarenessContext(0 - 4)
+    let inst: i64 = GetModuleHandleW(0)
+    var cls: [u16; 10] = u"FirnFenst\0"
+    // WNDCLASSW, Win64: style(4)+Fuellung(4), lpfnWndProc(8),
+    // cbClsExtra(4), cbWndExtra(4), hInstance(8), hIcon(8), hCursor(8),
+    // hbrBackground(8), lpszMenuName(8), lpszClassName(8) = 72 Oktett.
+    var wc: [u8; 72] = [0; 72]
+    let p: u64 = (&wc[0]) as u64
+    // CS_HREDRAW | CS_VREDRAW | CS_OWNDC = 2 | 1 | 32
+    rt.st32(p, 0, 35 as u32)
+    rt.st64(p, 1, code_of4(wndproc))
+    rt.st64(p, 3, inst as u64)
+    // IDC_ARROW = 32512
+    rt.st64(p, 5, LoadCursorW(0, 32512) as u64)
+    // hbrBackground = 0: Windows erases nothing, we cover everything.
+    rt.st64(p, 8, (&cls[0]) as u64)
+    if RegisterClassW(p) == 0 {
+        return false
+    }
+    (*w).open = true
+    read_theme(w)
+    return true
+}
+
+// THE POISON -- HOW TO REALLY MEASURE "UNPAINTED". Counting pure black
+// is no good: a page with black text has thousands of black pixels.
+// The fresh DIB is therefore filled with pure magenta; whatever is
+// still magenta afterwards has seen no `r_image` and no
+// `r_fill` je angefasst.
+fn r_poison(w: *mut Platte, an: bool) {
+    if an {
+        (*w).gift = 1
+    } else {
+        (*w).gift = 0
+    }
+}
+
+fn poison_fill(w: *mut Platte) {
+    if (*w).gift == 0 || (*w).bits == 0 {
+        return
+    }
+    var y: usize = 0
+    while y < (*w).h {
+        var x: usize = 0
+        while x < (*w).w {
+            let o: u64 = (*w).bits + (y * (*w).stride + x * 4) as u64
+            rt.st8(o, 0, 255 as u8)
+            rt.st8(o, 1, 0 as u8)
+            rt.st8(o, 2, 255 as u8)
+            rt.st8(o, 3, 0 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn dib_make(w: *mut Platte, cw: usize, ch: usize) -> bool {
+    let dc: i64 = GetDC((*w).hwnd)
+    if dc == 0 {
+        return false
+    }
+    // BITMAPINFOHEADER, 40 octets. biHeight NEGATIVE = top to bottom, see
+    // the header of this file.
+    var bi: [u8; 48] = [0; 48]
+    let b: u64 = (&bi[0]) as u64
+    rt.st32(b, 0, 40 as u32)
+    rt.st32(b, 1, cw as u32)
+    // biHeight negative, in two's complement -- Firn does not silently
+    // convert a negative i64 into a u32, and exactly this
+    // Zahl ist die Zeilenrichtung.
+    let negh: u64 = 4294967296 - (ch as u64)
+    rt.st32(b, 2, negh as u32)
+    rt.st16(b, 6, 1 as u16)
+    rt.st16(b, 7, 32 as u16)
+    rt.st32(b, 4, 0 as u32)
+    var out: [u64; 1] = [0; 1]
+    let hbm: i64 = CreateDIBSection(dc, b, 0, (&out[0]) as u64, 0, 0)
+    let mdc: i64 = CreateCompatibleDC(dc)
+    ReleaseDC((*w).hwnd, dc)
+    if hbm == 0 || mdc == 0 {
+        return false
+    }
+    (*w).hbm = hbm
+    (*w).hdc_mem = mdc
+    (*w).hbm_old = SelectObject(mdc, hbm)
+    (*w).bits = out[0]
+    (*w).w = cw
+    (*w).h = ch
+    // 32 bits per pixel: the row is always aligned to 4 octets anyway.
+    // Still it stands here as a field and is nowhere
+    // geraten.
+    (*w).stride = cw * 4
+    SetBkMode(mdc, 2)
+    poison_fill(w)
+    return true
+}
+
+fn dib_free(w: *mut Platte) {
+    if (*w).hdc_mem != 0 {
+        SelectObject((*w).hdc_mem, (*w).hbm_old)
+        DeleteDC((*w).hdc_mem)
+        (*w).hdc_mem = 0
+    }
+    if (*w).hbm != 0 {
+        DeleteObject((*w).hbm)
+        (*w).hbm = 0
+    }
+    (*w).bits = 0
+}
+
+// The WORK AREA of the screen (without the taskbar), in pixels.
+// `false` when Windows does not hand it over -- then the caller's
+// fixed default stands.
+fn r_screen(w: *mut Platte, sw: *mut usize, sh: *mut usize) -> bool {
+    var r: [i32; 4] = [0; 4]
+    // SPI_GETWORKAREA = 0x0030
+    if SystemParametersInfoW(48, 0, (&r[0]) as u64, 0) == 0 {
+        return false
+    }
+    let bw: i64 = (r[2] as i64) - (r[0] as i64)
+    let bh: i64 = (r[3] as i64) - (r[1] as i64)
+    if bw <= 0 || bh <= 0 {
+        return false
+    }
+    *sw = bw as usize
+    *sh = bh as usize
+    return true
+}
+
+// Put the window into the middle of the work area. SWP_NOSIZE = 1,
+// SWP_NOZORDER = 4, SWP_NOACTIVATE = 16.
+fn r_centre(w: *mut Platte) -> bool {
+    if (*w).hwnd == 0 {
+        return false
+    }
+    var r: [i32; 4] = [0; 4]
+    if SystemParametersInfoW(48, 0, (&r[0]) as u64, 0) == 0 {
+        return false
+    }
+    var wr: [i32; 4] = [0; 4]
+    if GetWindowRect((*w).hwnd, (&wr[0]) as u64) == 0 {
+        return false
+    }
+    let fw: i64 = (wr[2] as i64) - (wr[0] as i64)
+    let fh: i64 = (wr[3] as i64) - (wr[1] as i64)
+    let x: i64 = (r[0] as i64) + (((r[2] as i64) - (r[0] as i64) - fw) / 2)
+    let y: i64 = (r[1] as i64) + (((r[3] as i64) - (r[1] as i64) - fh) / 2)
+    return SetWindowPos((*w).hwnd, 0, x, y, 0, 0, 21) != 0
+}
+
+fn r_make(w: *mut Platte, cw: usize, ch: usize) -> bool {
+    if !(*w).open {
+        return false
+    }
+    var cls: [u16; 10] = u"FirnFenst\0"
+    var title: [u16; 7] = u"Window\0"
+    // WS_OVERLAPPEDWINDOW = 0x00CF0000
+    let style: i64 = 13565952
+    // The inner area shall be exactly cw x ch -- otherwise Windows
+    // measures including frame and title bar, and the content would be
+    // gemessen.
+    var r: [i32; 4] = [0; 4]
+    r[0] = 0
+    r[1] = 0
+    r[2] = cw as i32
+    r[3] = ch as i32
+    AdjustWindowRectEx((&r[0]) as u64, style, 0, 0)
+    let ow: i64 = (r[2] as i64) - (r[0] as i64)
+    let oh: i64 = (r[3] as i64) - (r[1] as i64)
+    let inst: i64 = GetModuleHandleW(0)
+    let h: i64 = CreateWindowExW(0, (&cls[0]) as u64, (&title[0]) as u64,
+        style, 100, 100, ow, oh, 0, 0, inst, 0)
+    if h == 0 {
+        return false
+    }
+    (*w).hwnd = h
+    // GWLP_USERDATA = -21. Ab hier findet die Fensterprozedur ihren
+    // state again without needing a global variable.
+    SetWindowLongPtrW(h, 0 - 21, (w as usize) as i64)
+    // RUNDE C-039: die Titelleiste SOFORT in den Stil holen -- noch
+    // bevor das Fenster gezeigt wird. Wer sie erst nach `ShowWindow`
+    // faerbt, sieht sie fuer einen Lidschlag hell aufblitzen.
+    leiste_anwenden(w)
+    let d: i32 = GetDpiForWindow(h)
+    if d > 0 {
+        (*w).dpi = d as usize
+    }
+    if !dib_make(w, cw, ch) {
+        return false
+    }
+    return true
+}
+
+// THE RESIZE. Without it the DIB stays as large as it was at creation,
+// and `r_blit` keeps pushing a 1024x768 rectangle into a larger
+// window: right and below stays whatever Windows had there -- the
+// black hole on Justin's screenshot.
+//
+// The DIB is CREATED ANEW and not stretched. A stretched canvas would
+// be exactly the bug round MOBIL5 measured on Android (the
+// blurriness): rasterising happens in device pixels.
+fn r_maximise(w: *mut Platte, cw: usize, ch: usize) -> bool {
+    if !(*w).open || (*w).hwnd == 0 {
+        return false
+    }
+    if cw == 0 || ch == 0 {
+        return false
+    }
+    if cw == (*w).w && ch == (*w).h {
+        return true
+    }
+    dib_free(w)
+    if !dib_make(w, cw, ch) {
+        return false
+    }
+    return true
+}
+
+// Is the user dragging the window edge right now? (Windows: between
+// WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE.)
+#[no_gc]
+fn r_dragging(w: *mut Platte) -> bool { return (*w).dragging != 0 }
+
+fn r_show(w: *mut Platte) -> bool {
+    // SW_SHOW = 5
+    ShowWindow((*w).hwnd, 5)
+    UpdateWindow((*w).hwnd)
+    return true
+}
+
+// Der Titel kommt als UTF-8 herein, SetWindowTextW will UTF-16.
+// Bis 0.52 wurde hier JEDES BYTE einzeln zu u16 geweitet -- das ist
+// Latin-1, nicht UTF-8. Aus "fuer" (66 C3 BC 72) wurde deshalb in der
+// Titelleiste "fA1/4r", und aus dem Gedankenstrich drei Zeichen.
+// Justin hat es am 18.09.2026 an "XOFFI - ... fA1/4r KMU" gemeldet.
+// Jetzt wird richtig dekodiert, mit Ersatzpaar fuer alles ueber U+FFFF.
+fn r_title(w: *mut Platte, p: u64, n: usize) -> bool {
+    var u: [u16; 512] = [0; 512]
+    var i: usize = 0
+    var o: usize = 0
+    while i < n && o < 510 {
+        let c0: u32 = rt.ld8(p, i) as u32
+        var cp: u32 = 0 as u32
+        if c0 < 0x80 as u32 {
+            cp = c0
+            i = i + 1
+        } else if c0 >= 0xF0 as u32 && i + 3 < n {
+            cp = ((c0 & 0x07 as u32) << 18) |
+                ((rt.ld8(p, i + 1) as u32 & 0x3F as u32) << 12) |
+                ((rt.ld8(p, i + 2) as u32 & 0x3F as u32) << 6) |
+                (rt.ld8(p, i + 3) as u32 & 0x3F as u32)
+            i = i + 4
+        } else if c0 >= 0xE0 as u32 && i + 2 < n {
+            cp = ((c0 & 0x0F as u32) << 12) |
+                ((rt.ld8(p, i + 1) as u32 & 0x3F as u32) << 6) |
+                (rt.ld8(p, i + 2) as u32 & 0x3F as u32)
+            i = i + 3
+        } else if c0 >= 0xC0 as u32 && i + 1 < n {
+            cp = ((c0 & 0x1F as u32) << 6) |
+                (rt.ld8(p, i + 1) as u32 & 0x3F as u32)
+            i = i + 2
+        } else {
+            // Kaputtes Byte: Ersatzzeichen, damit der Titel nicht abreisst.
+            cp = 0xFFFD as u32
+            i = i + 1
+        }
+        if cp >= 0x10000 as u32 {
+            let v: u32 = cp - 0x10000 as u32
+            u[o] = (0xD800 as u32 + (v >> 10)) as u16
+            u[o + 1] = (0xDC00 as u32 + (v & 0x3FF as u32)) as u16
+            o = o + 2
+        } else {
+            u[o] = cp as u16
+            o = o + 1
+        }
+    }
+    u[o] = 0 as u16
+    return SetWindowTextW((*w).hwnd, (&u[0]) as u64) != 0
+}
+
+// ---------------------------------------------------------- painting
+
+// A finished BGRX buffer, row by row into the DIB.
+fn r_image(w: *mut Platte, px: u64, iw: usize, ih: usize, dx: usize,
+    dy: usize) -> bool {
+    if (*w).bits == 0 {
+        return false
+    }
+    GdiFlush()
+    var y: usize = 0
+    while y < ih {
+        let ty: usize = dy + y
+        if ty >= (*w).h {
+            break
+        }
+        var n: usize = iw
+        if dx + n > (*w).w {
+            if dx >= (*w).w {
+                n = 0
+            } else {
+                n = (*w).w - dx
+            }
+        }
+        if n > 0 {
+            rt.mem_copy((*w).bits + (ty * (*w).stride + dx * 4) as u64,
+                px + (y * iw * 4) as u64, n * 4)
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// A rectangle in one colour. `px` is 0xRRGGBB; in the DIB lie B, G, R, X.
+fn r_fill(w: *mut Platte, px: u32, x0: usize, y0: usize, fw: usize,
+    fh: usize) -> bool {
+    if (*w).bits == 0 {
+        return false
+    }
+    GdiFlush()
+    let b: u8 = (px & 255 as u32) as u8
+    let g: u8 = ((px >> 8) & 255 as u32) as u8
+    let r: u8 = ((px >> 16) & 255 as u32) as u8
+    var y: usize = 0
+    while y < fh {
+        let ty: usize = y0 + y
+        if ty >= (*w).h {
+            break
+        }
+        var x: usize = 0
+        while x < fw {
+            let tx: usize = x0 + x
+            if tx >= (*w).w {
+                break
+            }
+            let o: u64 = (*w).bits + (ty * (*w).stride + tx * 4) as u64
+            rt.st8(o, 0, b)
+            rt.st8(o, 1, g)
+            rt.st8(o, 2, r)
+            rt.st8(o, 3, 0 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// There is no font to open: the device context already has one.
+// SYSTEM_FIXED_FONT = 16 -- the same that the X11 backend has with
+// Serverschrift "fixed" tut.
+fn r_font(w: *mut Platte) -> bool {
+    if (*w).hdc_mem == 0 {
+        return false
+    }
+    let f: i64 = GetStockObject(16)
+    if f != 0 {
+        SelectObject((*w).hdc_mem, f)
+    }
+    return true
+}
+
+// 0xRRGGBB -> COLORREF 0x00BBGGRR.
+fn cref(c: u32) -> i64 {
+    let r: i64 = ((c >> 16) & 255 as u32) as i64
+    let g: i64 = ((c >> 8) & 255 as u32) as i64
+    let b: i64 = (c & 255 as u32) as i64
+    return b * 65536 + g * 256 + r
+}
+
+// Text into the drawing surface. `ty` is the BASELINE, as with X11 --
+// TextOut wants the top edge, and twelve pixels is the height of the
+// system fixed font above the baseline.
+fn r_text(w: *mut Platte, fg: u32, bg: u32, tx: usize, ty: usize, p: u64,
+    n: usize) -> bool {
+    if (*w).hdc_mem == 0 {
+        return false
+    }
+    SetTextColor((*w).hdc_mem, cref(fg))
+    SetBkColor((*w).hdc_mem, cref(bg))
+    var top: i64 = (ty as i64) - 12
+    if top < 0 {
+        top = 0
+    }
+    return TextOutA((*w).hdc_mem, tx as i64, top, p, n as i64) != 0
+}
+
+// The one blit: the whole drawing surface onto the screen.
+// SRCCOPY = 0x00CC0020.
+fn r_present(w: *mut Platte) -> bool {
+    if (*w).hwnd == 0 || (*w).hdc_mem == 0 {
+        return false
+    }
+    let dc: i64 = GetDC((*w).hwnd)
+    if dc == 0 {
+        return false
+    }
+    let ok: i32 = BitBlt(dc, 0, 0, (*w).w as i64, (*w).h as i64,
+        (*w).hdc_mem, 0, 0, 13369376)
+    ReleaseDC((*w).hwnd, dc)
+    return ok != 0
+}
+
+// THE CAPTURE OF WHAT REALLY STANDS ON THE SCREEN: THE DIB, so exactly
+// the octets that `r_blit` pushes into the window. P6.
+fn r_ppm(w: *mut Platte, path: u64) -> bool {
+    if (*w).bits == 0 {
+        return false
+    }
+    GdiFlush()
+    var b: rt.Buf = rt.buf_new()
+    var p6: [u8; 3] = "P6\n"
+    rt.buf_push_bytes(&b, (&p6[0]) as u64, 3)
+    rt.buf_push_dec_u64(&b, (*w).w as u64)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_u64(&b, (*w).h as u64)
+    rt.buf_push(&b, 10 as u8)
+    var m255: [u8; 4] = "255\n"
+    rt.buf_push_bytes(&b, (&m255[0]) as u64, 4)
+    var y: usize = 0
+    while y < (*w).h {
+        var x: usize = 0
+        while x < (*w).w {
+            let o: u64 = (*w).bits + (y * (*w).stride + x * 4) as u64
+            // Im DIB liegen B, G, R, X; PPM will R, G, B.
+            rt.buf_push(&b, rt.ld8(o, 2))
+            rt.buf_push(&b, rt.ld8(o, 1))
+            rt.buf_push(&b, rt.ld8(o, 0))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = rt.write_file(path, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    return ok
+}
+
+// ------------------------------------------------- die Nachrichtenrunde
+//
+// `wait_ms` < 0 means "wait_event until something comes", 0 means
+// "only look". Waiting uses MsgWaitForMultipleObjectsEx and not
+// GetMessage, because a frame loop needs a DEADLINE: while scrolling,
+// the next frame tick must come even when
+// niemand die Maus bewegt.
+fn pumpe(w: *mut Platte, wait_ms: i64) {
+    if !r_pending(w) && wait_ms != 0 {
+        var ms: i64 = wait_ms
+        if ms < 0 {
+            ms = 4294967295
+        }
+        // QS_ALLINPUT = 0x04FF
+        MsgWaitForMultipleObjectsEx(0, 0, ms, 1279, 0)
+    }
+    var m: [u8; 64] = [0; 64]
+    let mp: u64 = (&m[0]) as u64
+    // PM_REMOVE = 1
+    while PeekMessageW(mp, 0, 0, 0, 1) != 0 {
+        TranslateMessage(mp)
+        DispatchMessageW(mp)
+    }
+    if (*w).hwnd != 0 {
+        if IsWindow((*w).hwnd) == 0 {
+            (*w).hwnd = 0
+            push_ev(w, window.EV_CLOSED, 0 as u32, 0 as u32, 0 as u32,
+                0 as u32)
+        }
+    }
+}
+
+fn r_wait(w: *mut Platte, ms: i64) -> bool {
+    if r_pending(w) {
+        return true
+    }
+    pumpe(w, ms)
+    return r_pending(w)
+}
+
+fn r_close(w: *mut Platte) {
+    dib_free(w)
+    if (*w).hwnd != 0 {
+        if IsWindow((*w).hwnd) != 0 {
+            DestroyWindow((*w).hwnd)
+        }
+        (*w).hwnd = 0
+    }
+    (*w).open = false
+}
+
+// ======================================================================
+// RUNDE C-038 -- "AUF AKTUALISIERUNG PRUEFEN" STARTET WIRKLICH ETWAS
+// ======================================================================
+//
+// Bis 0.57 war der Menuepunkt eine Attrappe: `certus_app.fi` behandelte
+// M_AKTUALISIEREN wie M_UEBER und oeffnete nur `certus://ueber`. Der
+// Kommentar daneben begruendete das damit, ein eigener Netzabruf aus
+// der Bildschleife waere ein zweiter, blockierender `fetch`. Das
+// stimmt -- und ist gar nicht noetig:
+//
+// NEBEN certus.exe LIEGT certus-update.exe (Quelle tools/windows/
+// update.c). Sie kann alles schon, und zwar in einem EIGENEN Prozess:
+//   certus-update.exe            still pruefen
+//   certus-update.exe --pruefen  Rueckgabe 10 = es gibt etwas Neues
+//   certus-update.exe --jetzt    laden und mit Pruefsummenkontrolle
+//                                installieren, mit Rueckfrage
+// Sie holt sich die installierte Fassung seit Commit 5715d3a0 aus
+// `fassung.txt` neben der exe -- darauf wird hier aufgebaut, nichts
+// davon angefasst.
+//
+// ES WIRD NICHT GEWARTET. `CreateProcessW` kehrt sofort zurueck, die
+// beiden Griffe werden gleich geschlossen. Certus malt in derselben
+// Millisekunde weiter; der Aktualisierer bringt sein eigenes Fenster
+// mit. Genau darum steht hier KEIN `WaitForSingleObject`.
+//
+// DER PFAD WIRD NICHT GERATEN. `GetModuleFileNameW` gibt den vollen
+// Pfad der LAUFENDEN exe; davon wird hinter dem letzten "\" abgeschnitten
+// und "certus-update.exe" angehaengt. Ein fester Pfad waere falsch,
+// sobald jemand Certus woandershin installiert -- und der Installierer
+// laesst die Wahl.
+//
+// Rueckgabe: false, wenn der Prozess nicht startete (exe fehlt, weil
+// jemand nur certus.exe kopiert hat). Der Aufrufer sagt das dem Nutzer,
+// statt so zu tun, als liefe etwas.
+fn r_update_start(mit_fenster: bool) -> bool {
+    // Die beiden Adressen zur Laufzeit holen (siehe den Kopf dieser
+    // Datei: sie stehen nicht in der Einfuhrliste).
+    var s_gmf: [u8; 19] = "GetModuleFileNameW\0"
+    var s_cp: [u8; 15] = "CreateProcessW\0"
+    let a_gmf: u64 = kernel32_holen((&s_gmf[0]) as u64)
+    let a_cp: u64 = kernel32_holen((&s_cp[0]) as u64)
+    if a_gmf == 0 || a_cp == 0 {
+        return false
+    }
+
+    // Der Pfad der laufenden exe, UTF-16.
+    var pfad: [u16; 320] = [0; 320]
+    let n: i32 = ruf_modulname(a_gmf, 0, (&pfad[0]) as u64, 320)
+    if n <= 0 || n >= 320 {
+        return false
+    }
+    // Hinter dem letzten "\" abschneiden. 92 ist "\".
+    var i: usize = n as usize
+    var schnitt: usize = 0
+    while i > 0 {
+        i = i - 1
+        if rt.ld16((&pfad[0]) as u64, i) == 92 as u16 {
+            schnitt = i + 1
+            break
+        }
+    }
+    if schnitt == 0 {
+        return false
+    }
+    // "certus-update.exe" dahinter, Zeichen fuer Zeichen.
+    var name: [u16; 18] = u"certus-update.exe\0"
+    var j: usize = 0
+    while j < 18 && schnitt + j < 319 {
+        let c: u16 = rt.ld16((&name[0]) as u64, j)
+        rt.st16((&pfad[0]) as u64, schnitt + j, c)
+        if c == 0 as u16 {
+            break
+        }
+        j = j + 1
+    }
+    rt.st16((&pfad[0]) as u64, 319, 0 as u16)
+
+    // Die Befehlszeile. CreateProcessW DARF sie veraendern, also steht
+    // sie in einem eigenen, beschreibbaren Feld -- ein Literal waere
+    // schreibgeschuetzt. Erstes Wort ist der Programmname, so will es
+    // die Regel.
+    var zeile: [u16; 64] = [0; 64]
+    var z0: [u16; 26] = u"certus-update.exe --jetzt\0"
+    var k: usize = 0
+    while k < 26 {
+        rt.st16((&zeile[0]) as u64, k, rt.ld16((&z0[0]) as u64, k))
+        k = k + 1
+    }
+    if !mit_fenster {
+        // Ohne "--jetzt": still pruefen, nur melden wenn es was gibt.
+        rt.st16((&zeile[0]) as u64, 17, 0 as u16)
+    }
+
+    // STARTUPINFOW ist 104 Oktett auf Win64, PROCESS_INFORMATION 24.
+    // `cb` ganz vorn muss die Groesse tragen, sonst lehnt Windows ab.
+    var si: [u8; 104] = [0; 104]
+    var pi: [u8; 24] = [0; 24]
+    rt.st32((&si[0]) as u64, 0, 104 as u32)
+    // CREATE_NO_WINDOW = 0x08000000 -- der Aktualisierer ist ein
+    // Fensterprogramm, aber so steht sicher keine Konsole daneben.
+    let ok: i32 = ruf_prozess(a_cp, (&pfad[0]) as u64,
+        (&zeile[0]) as u64, 0, 0, 0, 134217728, 0, 0,
+        (&si[0]) as u64, (&pi[0]) as u64)
+    if ok == 0 {
+        return false
+    }
+    // NICHT warten. Nur die Griffe zurueckgeben, sonst bleibt der
+    // Prozess als Leiche stehen, bis Certus endet.
+    CloseHandle(rt.ld64((&pi[0]) as u64, 0) as i64)
+    CloseHandle(rt.ld64((&pi[0]) as u64, 1) as i64)
+    return true
+}
+
+// ======================================================================
+// RUNDE C-049 -- WAS DAS PROGRAMM VOM RAHMEN VERLANGEN KANN
+// ======================================================================
+
+fn r_frame_can(w: *mut Platte) -> bool { return true }
+
+// Den eigenen Rahmen an- oder abschalten. SetWindowPos mit
+// SWP_FRAMECHANGED ist der Befehl, der Windows zwingt, WM_NCCALCSIZE
+// NOCH EINMAL zu stellen -- ohne ihn bleibt die Titelleiste stehen,
+// bis man das Fenster zum ersten Mal in der Groesse aendert.
+fn r_frame_own(w: *mut Platte, an: bool) -> bool {
+    if an {
+        (*w).rahmen = 1
+    } else {
+        (*w).rahmen = 0
+    }
+    if (*w).hwnd != 0 {
+        if ist_max(w) {
+            (*w).war_max = 1
+        } else {
+            (*w).war_max = 0
+        }
+        // 32 = SWP_FRAMECHANGED, + NOMOVE|NOSIZE|NOZORDER|NOACTIVATE
+        SetWindowPos((*w).hwnd, 0, 0, 0, 0, 0, 55)
+        // ---- HIER LAG DER LETZTE FEHLER DIESER RUNDE (im Abzug
+        // ausgemessen: der rote Schliessknopf endete 8 Punkte vor der
+        // Fensterkante, rechts standen 8 Punkte Weiss).
+        //
+        // SWP_FRAMECHANGED laesst Windows WM_NCCALCSIZE neu stellen --
+        // und ab da ist der INHALT das ganze Fenster, also 8 Punkte
+        // breiter als vorher. Ein WM_SIZE schickt Windows dabei NICHT
+        // (die AUSSENmasse haben sich ja nicht geaendert). Das Programm
+        // erfaehrt von den 8 Punkten also nichts, malt weiter auf die
+        // alte Leinwand, und rechts bleibt ein weisser Streifen stehen.
+        //
+        // Also wird die neue Inhaltsgroesse hier selbst geholt und als
+        // EV_CONFIGURE gemeldet -- derselbe Weg, den auch WM_SIZE geht.
+        var cr: [i32; 4] = [0; 4]
+        if GetClientRect((*w).hwnd, (&cr[0]) as u64) != 0 {
+            let nw: i64 = (cr[2] as i64) - (cr[0] as i64)
+            let nh: i64 = (cr[3] as i64) - (cr[1] as i64)
+            if nw > 0 && nh > 0 {
+                push_ev(w, window.EV_CONFIGURE, 0 as u32, nw as u32,
+                    nh as u32, 0 as u32)
+            }
+        }
+    }
+    return (*w).rahmen != 0
+}
+
+// DIE ECHTE INHALTSGROESSE, direkt beim Betriebssystem erfragt.
+//
+// `r_width`/`r_height` geben zurueck, was die Leinwand HAT. Nach
+// SWP_FRAMECHANGED ist der Inhalt aber schon groesser, waehrend die
+// Leinwand noch die alten Masse traegt -- genau diese Luecke waren die
+// 8 weissen Punkte rechts. Wer die neue Zahl braucht, muss sie
+// FRAGEN, nicht aus der Leinwand ablesen.
+//
+// Liefert false, wenn es keine gibt (dann bleibt alles, wie es war).
+fn r_content_size(w: *mut Platte, bw: *mut usize, bh: *mut usize) -> bool {
+    if (*w).hwnd == 0 {
+        return false
+    }
+    var cr: [i32; 4] = [0; 4]
+    if GetClientRect((*w).hwnd, (&cr[0]) as u64) == 0 {
+        return false
+    }
+    let nw: i64 = (cr[2] as i64) - (cr[0] as i64)
+    let nh: i64 = (cr[3] as i64) - (cr[1] as i64)
+    if nw <= 0 || nh <= 0 {
+        return false
+    }
+    *bw = nw as usize
+    *bh = nh as usize
+    return true
+}
+
+// Wie hoch die Zeile ist, die das Programm als Titelleiste malt, und
+// welcher Streifen darin seinen Fensterknoepfen gehoert. Beides in
+// EINEM Aufruf, weil beides zusammengehoert: eine Kopfhoehe ohne die
+// Knopfzone waere ein Fenster, das sich beim Druck auf "Schliessen"
+// verschiebt.
+fn r_frame_height(w: *mut Platte, h: usize) {
+    (*w).kopf_h = h
+}
+
+fn r_button_zone(w: *mut Platte, x0: usize, x1: usize) {
+    (*w).knopf_x0 = x0
+    (*w).knopf_x1 = x1
+}
+
+fn r_minimise(w: *mut Platte) {
+    if (*w).hwnd != 0 {
+        PostMessageW((*w).hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0)
+    }
+}
+
+fn r_max_toggle(w: *mut Platte) {
+    if (*w).hwnd == 0 {
+        return
+    }
+    if ist_max(w) {
+        PostMessageW((*w).hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
+    } else {
+        PostMessageW((*w).hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0)
+    }
+}
+
+fn r_maximised(w: *mut Platte) -> bool {
+    return ist_max(w)
+}
+
+// DAS ZIEHEN. Der uebliche Weg ist nicht, die Mausbewegung selbst zu
+// verfolgen (das gaebe ein Fenster, das dem Zeiger hinterherhinkt und
+// kein Aero-Snap kennt), sondern Windows' EIGENE Ziehschleife zu
+// starten: Maus loslassen, dann SC_MOUSEMOVE mit HTCAPTION. Damit
+// bekommt der Benutzer Snap, die Bildschirmkanten und das Aufreissen
+// aus dem maximierten Zustand geschenkt -- alles, was er von jedem
+// anderen Fenster kennt.
+fn r_drag(w: *mut Platte) {
+    if (*w).hwnd == 0 {
+        return
+    }
+    ReleaseCapture()
+    SendMessageW((*w).hwnd, WM_SYSCOMMAND, SC_MOUSEMOVE + HTCAPTION, 0)
+}
+
+// Das Systemmenue an der Stelle des Zeigers (Rechtsklick auf die
+// Leiste). `TrackPopupMenu` liefert den gewaehlten Befehl zurueck,
+// weil TPM_RETURNCMD (256) gesetzt ist; er wird dann als
+// WM_SYSCOMMAND geschickt -- so, wie Windows es selbst tut.
+fn r_sysmenu(w: *mut Platte, sx: usize, sy: usize) {
+    if (*w).hwnd == 0 {
+        return
+    }
+    let mnu: i64 = GetSystemMenu((*w).hwnd, 0)
+    if mnu == 0 {
+        return
+    }
+    // TPM_RETURNCMD(256) | TPM_RIGHTBUTTON(2) | TPM_LEFTALIGN(0)
+    let cmd: i32 = TrackPopupMenu(mnu, 258, sx as i64, sy as i64, 0,
+        (*w).hwnd, 0)
+    if cmd != 0 {
+        PostMessageW((*w).hwnd, WM_SYSCOMMAND, cmd as i64, 0)
+    }
+}
