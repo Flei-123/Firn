@@ -141,6 +141,43 @@ pub(crate) fn run(f: &mut Func) -> usize {
         }
     }
 
+    // ---- 2b. RUNDE TEMPO 11: die Konstante gehoert nach RECHTS ------------
+    //
+    // `4 * i` und `i * 4` sind dasselbe, aber nur die zweite Form sieht der
+    // Erzeuger: er fragt `imm(b)`, und `imm(a)` interessiert ihn nicht. Im
+    // MP3-Dekoder stand deshalb
+    //
+    //     mov  $0x4,%r10
+    //     imul %r8d,%r10d
+    //
+    // wo `lea r10,[r8*4]` haette stehen koennen -- 0,8 Mio Befehle, und
+    // dasselbe fuer `+`, `&`, `|`, `^`.
+    //
+    // Nur GANZZAHLEN. Fuer Gleitzahlen sind `+` und `*` zwar ebenfalls
+    // vertauschbar (beide runden symmetrisch), aber dort hat der Erzeuger
+    // seine eigene Vertauschung an der Stelle, an der er das Zielregister
+    // kennt (Runde TEMPO); zwei Antworten auf dieselbe Frage braucht
+    // niemand.
+    for b in f.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if i.ty.is_float() || i.ty == crate::fir::FTy::V128 {
+                continue;
+            }
+            let (op, x, y) = match &i.op {
+                Op::Bin(
+                    op @ (BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor),
+                    x,
+                    y,
+                ) => (*op, *x, *y),
+                _ => continue,
+            };
+            if consts.contains_key(&x) && !consts.contains_key(&y) {
+                i.op = Op::Bin(op, y, x);
+                changed += 1;
+            }
+        }
+    }
+
     // ---- 3. unsigned `/` and `%` by a power of two ------------------------
     //
     // A new instruction is needed for the shift amount resp. the mask, and it

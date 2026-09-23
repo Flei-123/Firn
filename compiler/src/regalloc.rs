@@ -4610,6 +4610,29 @@ fn epilogue(e: &mut Emitter, a: &Alloc) {
     e.line("ret");
 }
 
+/// Kann der Block als `cmp` + bedingter Sprung ausgegeben werden? (Siehe die
+/// Bedingungen in `emit_block`.) Eigene Funktion seit TEMPO 11, weil die
+/// Schleifenrotation dieselbe Frage fuer den ZIELblock eines `jmp` stellt.
+fn cmp_br_mergeable(ra: &Ra, b: &Block) -> bool {
+    match (&b.term, b.insts.last()) {
+        (Term::BrCond { cond, .. }, Some(last)) => {
+            matches!(last.op, Op::Cmp { .. })
+                && last.dst == Some(*cond)
+                && ra.read.get(*cond as usize).copied().unwrap_or(2) == 1
+                && !ra.f.is_secret(*cond)
+                // ROUND XMM3: `==`/`!=` auf Gleitzahlen braucht hinter dem
+                // Vergleich noch die Paritaetskorrektur fuer NaN. Die passt
+                // nicht zwischen Vergleich und Sprung, also wird hier nicht
+                // verschmolzen.
+                && !matches!(&last.op,
+                    Op::Cmp { op: CmpOp::Eq, ty, .. } if ty.is_float())
+                && !matches!(&last.op,
+                    Op::Cmp { op: CmpOp::Ne, ty, .. } if ty.is_float())
+        }
+        _ => false,
+    }
+}
+
 fn emit_block(
     e: &mut Emitter,
     ra: &Ra,
@@ -4634,23 +4657,7 @@ fn emit_block(
     //   * its result is the jump condition,
     //   * it is read EXACTLY ONCE (otherwise the bool value is needed),
     //   * no `secret` value (SPEC §9.2).
-    let mergeable = match (&b.term, b.insts.last()) {
-        (Term::BrCond { cond, .. }, Some(last)) => {
-            matches!(last.op, Op::Cmp { .. })
-                && last.dst == Some(*cond)
-                && ra.read.get(*cond as usize).copied().unwrap_or(2) == 1
-                && !ra.f.is_secret(*cond)
-                // ROUND XMM3: `==`/`!=` auf Gleitzahlen braucht hinter dem
-                // Vergleich noch die Paritaetskorrektur fuer NaN. Die passt
-                // nicht zwischen Vergleich und Sprung, also wird hier nicht
-                // verschmolzen.
-                && !matches!(&last.op,
-                    Op::Cmp { op: CmpOp::Eq, ty, .. } if ty.is_float())
-                && !matches!(&last.op,
-                    Op::Cmp { op: CmpOp::Ne, ty, .. } if ty.is_float())
-        }
-        _ => false,
-    };
+    let mergeable = cmp_br_mergeable(ra, b);
     let n = if mergeable { b.insts.len() - 1 } else { b.insts.len() };
     for i in &b.insts[..n] {
         // ROUND 94 -- the register allocated path carries the line table too.
@@ -4670,6 +4677,71 @@ fn emit_block(
     match &b.term {
         Term::Br(t) => {
             if next != Some(*t) {
+                // RUNDE TEMPO 11 -- DER SPRUNG ZUM VERGLEICH WIRD DER VERGLEICH.
+                //
+                // Ein Schleifenkopf, der nur aus `cmp` + bedingtem Sprung
+                // besteht, kostete jeden Durchlauf drei Befehle:
+                //
+                //     latch: ...
+                //            jmp  head          <- jedes Mal genommen
+                //     head:  cmp  r11d, 8
+                //            jge  exit
+                //
+                // Steht der Kopf-Vergleich statt des `jmp` direkt im
+                // Rueckweg, sind es zwei (`cmp`, `jl body`) -- gcc nennt das
+                // Schleifenrotation. Gemessen: 4,46 Mio unbedingte
+                // Rueckspruenge im MP3-Dekoder, praktisch alle von dieser Art.
+                //
+                // Warum das nichts brechen kann: der Kopf enthaelt NUR den
+                // Vergleich, dessen Ergebnis genau einmal gelesen wird (die
+                // Bedingung fuer die Verschmelzung oben). Er schreibt also
+                // nichts ausser den Flaggen. Jeder Wert steht sein ganzes
+                // Leben am selben Platz, also liest der kopierte Vergleich
+                // dieselben Operanden am selben Ort wie das Original. Die
+                // Uebergaberegister (`fp_handover`) gelten nur innerhalb
+                // EINES Blocks -- die Operanden des Kopfes stammen aus
+                // anderen Bloecken und liegen deshalb nie dort.
+                //
+                // Abschaltbar mit `FIRN_NO_ROTATE=1` (Fehlersuche).
+                //
+                // Zweite Stufe: vor dem Vergleich duerfen bis zu drei
+                // schlichte Rechnungen stehen (`lea 0x8(r11),rdx; cmp r10,rdx`
+                // in `rt.mem_copy`, `i += 1; cmp i,8` im Rueckweg von
+                // `synth`). Die Begruendung ist dieselbe und gilt fuer jede
+                // Anweisung: der Maschinenzustand am Ende von `b` IST der am
+                // Eingang von `t` (einzige Kante, keine Kopien mehr dahinter),
+                // und die Ausgabe einer Anweisung haengt nur an den festen
+                // Plaetzen ihrer Werte, nicht daran, wo sie steht. Zugelassen
+                // ist nur, was keine eigenen Sprungmarken erzeugt (keine
+                // geprueften Rechnungen) und nichts ausser seinem Ziel
+                // veraendert (kein Schreiben, kein Aufruf).
+                if let Some(tb) = f.blocks.iter().find(|x| x.id == *t) {
+                    let schlicht = tb.insts.len() <= 4
+                        && tb.insts[..tb.insts.len().saturating_sub(1)].iter().all(|i| {
+                            matches!(
+                                i.op,
+                                Op::Bin(..)
+                                    | Op::Un(..)
+                                    | Op::Cast { .. }
+                                    | Op::Copy { .. }
+                                    | Op::Const(_)
+                                    | Op::PtrAdd { .. }
+                                    | Op::Load { .. }
+                            )
+                        });
+                    if schlicht
+                        && tb.id != b.id
+                        && cmp_br_mergeable(ra, tb)
+                        && std::env::var_os("FIRN_NO_ROTATE").is_none()
+                    {
+                        for i in &tb.insts[..tb.insts.len() - 1] {
+                            e.loc_at(i.loc);
+                            emit_inst(e, ra, i, site)?;
+                        }
+                        e.loc_at(tb.insts[tb.insts.len() - 1].loc);
+                        return emit_cmp_br(e, ra, tb, next);
+                    }
+                }
                 e.line(&format!("jmp {}", block_label(&f.name, *t)));
             }
         }
@@ -5990,12 +6062,32 @@ fn add_over_rax(ra: &Ra, a: Val, b: Val) -> bool {
 
 /// Can `d = a op b` be written as a single `lea`?
 ///
-/// 64 bits only (see `lea_sum`), only with a target register, and only when
-/// the operands really do qualify as address parts: register + register,
-/// register + immediate, immediate + register. For `sub` additionally
-/// `k != i64::MIN`, because `-k` would overflow otherwise.
+/// Only with a target register, and only when the operands really do qualify
+/// as address parts: register + register, register + immediate, immediate +
+/// register. For `sub` additionally `k != i64::MIN`, because `-k` would
+/// overflow otherwise.
+///
+/// **RUNDE TEMPO 11 — AUCH MIT 32-BIT-ERGEBNIS.** Hier stand
+/// `ty.bits() <= 32 -> nein`, und das kostete zwei Millionen Befehle im
+/// MP3-Dekoder: jedes `i + 1` auf einem `i32` wurde `mov rdx,r10` +
+/// `add edx,1` statt `lea edx,[r10+1]`.
+///
+/// Es ist erlaubt, und der Grund ist eine Rechnung, keine Meinung: `lea r32,
+/// m` bildet die Adresse in vollen 64 Bit und legt die unteren 32 davon ab
+/// (der Rest des Registers wird null, genau wie bei jedem Schreiben auf ein
+/// 32-Bit-Register). Addition ist mit der Restklassenbildung vertraeglich --
+/// die unteren 32 Bit von `(x + y)` haengen nur von den unteren 32 Bit von
+/// `x` und `y` ab. Also ist `lea r32,[x64+y64]` bis aufs Bit dasselbe wie
+/// `add r32, y32`. Fuer die schmaleren Typen gilt dasselbe: der Weg hier
+/// rechnet sie ohnehin in 32 Bit (`bits = if wide {64} else {32}`).
+///
+/// Die Verschiebung im `lea` ist ein VORZEICHENBEHAFTETES 32-Bit-Feld. Ein
+/// unmittelbarer Wert darf bei 32 Bit aber den ganzen vorzeichenlosen
+/// Bereich ausschoepfen (`immediate_consts`), also wird er beim Schreiben
+/// umgedeutet -- `0xFFFFFFFF` wird `-1`, und das ist modulo 2^32 dieselbe
+/// Zahl.
 fn lea_possible(ra: &Ra, op: BinOp, ty: FTy, a: Val, b: Val, d: Val) -> bool {
-    if ty.bits() <= 32 || !matches!(ra.a.loc(d), Loc::Reg(_)) {
+    if ty.is_float() || ty == FTy::V128 || !matches!(ra.a.loc(d), Loc::Reg(_)) {
         return false;
     }
     let is_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Reg(_));
@@ -6176,23 +6268,37 @@ fn emit_bin(
         // `mov r9, [rbp-8]` + `add r9, r9` on the first attempt — matmul ran
         // into a memory access fault. That bug is the reason for this form.
         BinOp::Add | BinOp::Sub if lea_possible(ra, op, ty, a, b, d) => {
-            let dr = match ra.a.loc(d) {
+            let dr0 = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("lea_possible requires a target register"),
             };
+            // RUNDE TEMPO 11: das ZIEL in der Breite der Rechnung, die
+            // Adressteile immer in 64 Bit -- `lea eax,[rbx+1]` ist die
+            // richtige Form, `lea eax,[ebx+1]` waere eine Adressrechnung mit
+            // 32-Bit-Adressgroesse und damit eine andere Frage.
+            let dr = rn(dr0, bits);
+            let dr = dr.as_str();
             let reg_of = |v: Val| match (ra.a.imm(v), ra.a.place(v)) {
                 (None, Loc::Reg(r)) => Some(r),
                 _ => None,
             };
+            // Die Verschiebung ist ein vorzeichenbehaftetes 32-Bit-Feld.
+            let disp = |k: i64| -> i64 {
+                if bits == 64 {
+                    k
+                } else {
+                    k as u32 as i32 as i64
+                }
+            };
             match op {
                 BinOp::Add => match (reg_of(a), reg_of(b), ra.a.imm(a), ra.a.imm(b)) {
                     (Some(x), Some(y), _, _) => e.line(&format!("lea {}, [{}+{}]", dr, x, y)),
-                    (Some(x), None, _, Some(k)) => lea_sum(e, dr, x, k),
-                    (None, Some(y), Some(k), _) => lea_sum(e, dr, y, k),
+                    (Some(x), None, _, Some(k)) => lea_sum(e, dr, x, disp(k)),
+                    (None, Some(y), Some(k), _) => lea_sum(e, dr, y, disp(k)),
                     _ => unreachable!("lea_possible has guaranteed the case"),
                 },
                 _ => match (reg_of(a), ra.a.imm(b)) {
-                    (Some(x), Some(k)) => lea_sum(e, dr, x, -k),
+                    (Some(x), Some(k)) => lea_sum(e, dr, x, -disp(k)),
                     _ => unreachable!("lea_possible has guaranteed the case"),
                 },
             }
