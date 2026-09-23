@@ -93,6 +93,12 @@ pub(crate) enum Pattern {
     Range { lo: i128, hi: i128, inclusive: bool, span: Span },
     /// `Enum::Variant(sub, pattern)` — `ename` may be absent (`::Variant`)
     Variant { ename: Option<String>, vname: String, subs: Vec<Pattern>, span: Span },
+    /// Round GAPS: `A | B | C` — alternatives. Only at the top of an arm and
+    /// without bindings (every alternative would have to bind the same
+    /// names with the same types; not needed so far). A dense `match` over
+    /// alternatives still becomes one jump table: every alternative adds its
+    /// keys to the same arm (lower_match.rs, `plan_arm`).
+    Or(Vec<Pattern>, Span),
 }
 
 impl Pattern {
@@ -105,11 +111,33 @@ impl Pattern {
             | Pattern::Bool(_, s) => *s,
             Pattern::Range { span, .. } => *span,
             Pattern::Variant { span, .. } => *span,
+            Pattern::Or(_, span) => *span,
         }
     }
     /// Does the pattern ALWAYS match (that is, does it only bind)?
     pub(crate) fn is_irrefutable(&self) -> bool {
-        matches!(self, Pattern::Wild(_) | Pattern::Bind(..))
+        match self {
+            Pattern::Wild(_) | Pattern::Bind(..) => true,
+            Pattern::Or(alts, _) => alts.iter().any(|a| a.is_irrefutable()),
+            _ => false,
+        }
+    }
+    /// The alternatives of a top-level pattern (`A | B` -> [A, B]; any other
+    /// pattern -> [itself]).
+    pub(crate) fn alternatives(&self) -> Vec<&Pattern> {
+        match self {
+            Pattern::Or(alts, _) => alts.iter().collect(),
+            p => vec![p],
+        }
+    }
+    /// Does the pattern introduce a name (a binding)?
+    pub(crate) fn binds(&self) -> Option<Span> {
+        match self {
+            Pattern::Bind(_, s) => Some(*s),
+            Pattern::Variant { subs, .. } => subs.iter().find_map(|p| p.binds()),
+            Pattern::Or(alts, _) => alts.iter().find_map(|p| p.binds()),
+            _ => None,
+        }
     }
 }
 
@@ -382,6 +410,27 @@ impl<'a> Parser<'a> {
             let pat = match self.types_pattern(0) {
                 Some(p) => p,
                 None => break,
+            };
+            // Round GAPS: `A | B | C =>` -- alternatives.
+            let pat = if self.at(&TokKind::Pipe) {
+                let mut alts = vec![pat];
+                let mut ok = true;
+                while self.eat(&TokKind::Pipe) {
+                    match self.types_pattern(0) {
+                        Some(p) => alts.push(p),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                let span = Parser::join(alts[0].span(), alts[alts.len() - 1].span());
+                Pattern::Or(alts, span)
+            } else {
+                pat
             };
             if !self.types_at_fat_arrow() {
                 self.error_here(format!(
@@ -1071,7 +1120,7 @@ fn resolve_const_patterns(ck: &mut Checker, pat: &mut Pattern) -> bool {
             }
             true
         }
-        Pattern::Variant { subs, .. } => {
+        Pattern::Variant { subs, .. } | Pattern::Or(subs, _) => {
             let mut c = false;
             for s in subs.iter_mut() {
                 c |= resolve_const_patterns(ck, s);
@@ -1086,6 +1135,21 @@ fn resolve_const_patterns(ck: &mut Checker, pat: &mut Pattern) -> bool {
 fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, top: bool) {
     match pat {
         Pattern::Wild(_) => {}
+        Pattern::Or(alts, _) => {
+            for a in alts {
+                if let Some(bs) = a.binds() {
+                    ck.dg.error_note(
+                        bs,
+                        "an alternative of a '|' pattern must not bind a name",
+                        "use '_' here, or write the alternatives as separate arms",
+                    );
+                    return;
+                }
+            }
+            for a in alts {
+                check_pattern(ck, a, ty, subject, top);
+            }
+        }
         Pattern::Bind(name, span) => {
             ck.declare_var(name, ty.clone(), false, *span);
         }
@@ -1235,11 +1299,13 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
             }
             let mut missing: Vec<String> = Vec::new();
             for v in &def.variants {
-                let covered = arms.iter().any(|a| match &a.pat {
-                    Pattern::Variant { vname, subs, .. } => {
-                        *vname == v.name && subs.iter().all(|s| s.is_irrefutable())
-                    }
-                    _ => false,
+                let covered = arms.iter().any(|a| {
+                    a.pat.alternatives().iter().any(|p| match p {
+                        Pattern::Variant { vname, subs, .. } => {
+                            *vname == v.name && subs.iter().all(|s| s.is_irrefutable())
+                        }
+                        _ => false,
+                    })
                 });
                 if !covered {
                     missing.push(format!("{}::{}", def.name, v.name));
@@ -1272,8 +1338,12 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
                 return Ok(());
             }
             let has = |b: bool| {
-                arms.iter()
-                    .any(|a| matches!(&a.pat, Pattern::Bool(x, _) if *x == b))
+                arms.iter().any(|a| {
+                    a.pat
+                        .alternatives()
+                        .iter()
+                        .any(|p| matches!(p, Pattern::Bool(x, _) if *x == b))
+                })
             };
             let mut missing = Vec::new();
             if !has(true) {

@@ -755,7 +755,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
                     *p = Pattern::Const(m, *span);
                 }
             }
-            Pattern::Variant { subs, .. } => {
+            Pattern::Variant { subs, .. } | Pattern::Or(subs, _) => {
                 for s in subs.iter_mut() {
                     self.rewrite_pattern(s);
                 }
@@ -768,7 +768,8 @@ impl<'a, 'b> Renamer<'a, 'b> {
     fn declare_pattern(&mut self, p: &crate::sema_match::Pattern) {
         match p {
             crate::sema_match::Pattern::Bind(n, _) => self.declare(n),
-            crate::sema_match::Pattern::Variant { subs, .. } => {
+            crate::sema_match::Pattern::Variant { subs, .. }
+            | crate::sema_match::Pattern::Or(subs, _) => {
                 for s in subs {
                     self.declare_pattern(s);
                 }
