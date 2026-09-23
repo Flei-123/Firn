@@ -219,6 +219,7 @@ fn usage() -> String {
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
                               | wasm32-browser (a .wasm module, round WASM)\n  \
+         --pic              position independent (shared library, round MOBIL)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -338,6 +339,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             // ROUND 80: the second machine. Without this option nothing
             // changes -- `target::active()` answers `x86_64-linux` and every
             // path below is the one that has always been walked.
+            // ROUND MOBIL (Certus): position independent code for a
+            // shared library. Without the flag every output stays
+            // character for character what it was.
+            "--pic" => target::pic_set(true),
             _ if a.starts_with("--target=") => {
                 if let Err(e) = target::flag_set(&a["--target=".len()..]) {
                     return Err(e);
