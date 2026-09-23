@@ -328,6 +328,16 @@ BIDI_WORK="$W/ucd-bidi" bash tools/ucd/build_bidi.sh --verify > "$W/bidi_build.l
 grep -E "gleich|Gegenprobe|VERSCHIEDEN|Oktette zur|Laufzeit" "$W/bidi_build.log" | sed 's/^ */  /'
 build bidiconf
 gzip -dc tools/ucd/BidiCharacterTest.txt.gz | "$W/bidiconf"
+# UND VON HAND: tools/fui/bidi_main.fi haelt dieselben Regeln gegen
+# Sollwerte, die ein Mensch mit Bleistift bestimmt hat -- 30 Absaetze
+# (reines RTL, gemischt, Zahlen in arabischem Text, gespiegelte
+# Klammern samt den drei N0-Beispielen aus UAX #9, Isolate), der
+# Zeilenumbruch in gemischtem Text, die Breiten, die der Maler misst
+# (aus der hmtx-Tabelle von DejaVu), die Schreibmarke und die
+# Pfeiltasten im Textfeld, und die arabischen Gestalten ueber GSUB und
+# ueber die Naeherung.
+build bidi
+"$W/bidi"
 
 echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
