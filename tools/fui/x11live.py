@@ -38,6 +38,12 @@ def chk(nr, text, ok, got, want):
           "OK  " if ok else "WRONG   ", got, want), flush=True)
 
 
+try:
+    from PIL import Image  # nur um das xwd-Bild zu lesen
+except ImportError:
+    print("SKIP: python3-PIL fehlt -- das Bild vom Server laesst sich nicht lesen")
+    sys.exit(0)
+
 for werk in ("Xvfb", "xdotool", "xwd", "xwininfo", "xrdb"):
     if shutil.which(werk) is None:
         print("SKIP: %s fehlt -- kein echter X-Server fuer den Beleg" % werk)
@@ -216,7 +222,7 @@ try:
     grund = bild.getpixel((5, 5))
     chk("L1", "Bild vom Server: Starten traegt den Akzent", akz != grund and
         akz[2] > 200 and akz[0] < 60, akz, "blau")
-    farben = len(set(bild.getdata()))
+    farben = len(bild.getcolors(maxcolors=1 << 24))
     chk("L1", "Bild vom Server hat Text und Flaechen (Farben)", farben > 200,
         farben, "> 200")
 
