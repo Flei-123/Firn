@@ -450,6 +450,9 @@ struct ModuleInfo {
     name: String,
     /// all names declared in the module (functions, structs, constants)
     items: HashSet<String>,
+    /// Round GAPS: the `const` names among `items` -- a bare name in a
+    /// pattern that names one is the constant, not a binding.
+    consts: HashSet<String>,
     /// `export` list; empty = everything visible
     exports: HashSet<String>,
 }
@@ -508,6 +511,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     let mut infos: Vec<ModuleInfo> = Vec::new();
     for (f, p) in files.iter().zip(progs.iter()) {
         let mut items: HashSet<String> = HashSet::new();
+        let consts: HashSet<String> = p.consts.iter().map(|c| c.name.clone()).collect();
         for x in &p.funcs {
             items.insert(x.name.clone());
         }
@@ -543,6 +547,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         infos.push(ModuleInfo {
             name: module_name(f),
             items,
+            consts,
             exports: p.exports.iter().map(|(n, _)| n.clone()).collect(),
         });
     }
@@ -731,6 +736,34 @@ impl<'a, 'b> Renamer<'a, 'b> {
         None
     }
 
+    /// Round GAPS: names of constants in a pattern get the same module
+    /// qualification as everywhere else. `module.NAME` is resolved like a
+    /// qualified value; a bare `NAME` that is a `const` of THIS module (and
+    /// not a local) becomes a qualified constant, so that the type check
+    /// finds it under its mangled name.
+    fn rewrite_pattern(&mut self, p: &mut crate::sema_match::Pattern) {
+        use crate::sema_match::Pattern;
+        match p {
+            Pattern::Const(name, span) => {
+                if let Some(n) = self.resolve(name, *span, true) {
+                    *name = n;
+                }
+            }
+            Pattern::Bind(name, span) => {
+                if !self.is_local(name) && self.infos[self.me].consts.contains(name.as_str()) {
+                    let m = mangle(&self.infos[self.me].name, name);
+                    *p = Pattern::Const(m, *span);
+                }
+            }
+            Pattern::Variant { subs, .. } => {
+                for s in subs.iter_mut() {
+                    self.rewrite_pattern(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Labels that a pattern binds are local to the body of the case.
     fn declare_pattern(&mut self, p: &crate::sema_match::Pattern) {
         match p {
@@ -889,6 +922,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
                         self.expr(&mut info.subject);
                         for arm in info.arms.iter_mut() {
                             self.push_scope();
+                            self.rewrite_pattern(&mut arm.pat);
                             self.declare_pattern(&arm.pat);
                             self.block(&mut arm.body);
                             self.pop_scope();

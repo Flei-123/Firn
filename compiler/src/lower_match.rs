@@ -128,6 +128,9 @@ struct ArmPlan {
 fn plan_arm(pat: &Pattern, subject_enum: Option<&EnumDef>) -> ArmPlan {
     match pat {
         Pattern::Wild(_) | Pattern::Bind(..) => ArmPlan { keys: None, needs_test: false },
+        // Resolved to `Int`/`Bool` by the type check (sema_match.rs,
+        // `resolve_const_patterns`); never reaches the lowering.
+        Pattern::Const(..) => ArmPlan { keys: None, needs_test: true },
         Pattern::Int(v, _) => ArmPlan { keys: Some(vec![*v]), needs_test: false },
         Pattern::Bool(b, _) => {
             ArmPlan { keys: Some(vec![if *b { 1 } else { 0 }]), needs_test: false }
@@ -313,6 +316,7 @@ fn emit_tests(
 ) -> Option<()> {
     match pat {
         Pattern::Wild(_) | Pattern::Bind(..) | Pattern::Int(..) | Pattern::Bool(..) => Some(()),
+        Pattern::Const(_, sp) => lo.ice(*sp, "unresolved constant pattern"),
         Pattern::Range { lo: rlo, hi, inclusive, .. } => {
             let last = if *inclusive { *hi } else { *hi - 1 };
             let c1 = {
@@ -371,6 +375,7 @@ fn emit_sub_test(
 ) -> Option<()> {
     match pat {
         Pattern::Wild(_) | Pattern::Bind(..) => Some(()),
+        Pattern::Const(_, sp) => lo.ice(*sp, "unresolved constant pattern"),
         Pattern::Int(v, span) => {
             let ft = match scalar_fty(ty) {
                 Some(f) => f,
@@ -456,7 +461,11 @@ fn emit_sub_test(
 /// (enum values live in memory, bindings are immutable).
 fn bind_pattern(lo: &mut Lower, addr: Val, pat: &Pattern, ty: &Type, def: Option<&EnumDef>) {
     match pat {
-        Pattern::Wild(_) | Pattern::Int(..) | Pattern::Bool(..) | Pattern::Range { .. } => {}
+        Pattern::Wild(_)
+        | Pattern::Const(..)
+        | Pattern::Int(..)
+        | Pattern::Bool(..)
+        | Pattern::Range { .. } => {}
         Pattern::Bind(name, _) => lo.declare(name, addr),
         Pattern::Variant { vname, subs, .. } => {
             let d = match (def, ty) {

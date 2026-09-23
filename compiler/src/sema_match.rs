@@ -79,8 +79,14 @@ impl EnumDef {
 pub(crate) enum Pattern {
     /// `_`
     Wild(Span),
-    /// `x` — binds the whole value
+    /// `x` — binds the whole value. Round GAPS: if `x` names an integer or
+    /// bool `const`, the type check turns it into `Int`/`Bool` instead
+    /// (`resolve_const_patterns`), as in Rust.
     Bind(String, Span),
+    /// Round GAPS: `module.NAME` — a qualified constant. Exists only between
+    /// the parser and the type check; `resolve_const_patterns` replaces it
+    /// with `Int`/`Bool` (or reports that the name is no constant).
+    Const(String, Span),
     Int(i128, Span),
     Bool(bool, Span),
     /// `lo..hi` (half open) or `lo..=hi` (inclusive)
@@ -92,7 +98,11 @@ pub(crate) enum Pattern {
 impl Pattern {
     pub(crate) fn span(&self) -> Span {
         match self {
-            Pattern::Wild(s) | Pattern::Bind(_, s) | Pattern::Int(_, s) | Pattern::Bool(_, s) => *s,
+            Pattern::Wild(s)
+            | Pattern::Bind(_, s)
+            | Pattern::Const(_, s)
+            | Pattern::Int(_, s)
+            | Pattern::Bool(_, s) => *s,
             Pattern::Range { span, .. } => *span,
             Pattern::Variant { span, .. } => *span,
         }
@@ -456,6 +466,18 @@ impl<'a> Parser<'a> {
                     return Some(Pattern::Wild(sp));
                 }
                 self.bump();
+                // Round GAPS: `module.NAME` -- a constant of another module.
+                if self.tk(0) == TokKind::Dot {
+                    if let TokKind::Ident(rest) = self.tk(1) {
+                        self.bump();
+                        let rsp = self.span();
+                        self.bump();
+                        return Some(Pattern::Const(
+                            format!("{}.{}", name, rest),
+                            Parser::join(sp, rsp),
+                        ));
+                    }
+                }
                 if self.types_at_colon2(0) {
                     self.types_eat_colon2();
                     let (vname, vspan) = self.ident("after '::' in the pattern")?;
@@ -913,6 +935,17 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
     };
     let sty = ck.expr(&mi.subject, None);
     let subject = classify_subject(ck, &sty, mi.subject.span);
+    // Round GAPS: named constants in patterns become literals BEFORE
+    // anything looks at the arms -- reachability, exhaustiveness and the
+    // lowering all see plain `Int`/`Bool` from here on.
+    let mut mi = mi;
+    let mut changed = false;
+    for arm in mi.arms.iter_mut() {
+        changed |= resolve_const_patterns(ck, &mut arm.pat);
+    }
+    if changed {
+        put_match(idx, mi.clone());
+    }
 
     // 1. check patterns, create bindings, check the body
     for arm in &mi.arms {
@@ -992,6 +1025,63 @@ fn classify_subject(ck: &mut Checker, ty: &Type, span: Span) -> Subject {
     Subject::Bad
 }
 
+/// Round GAPS -- NAMED CONSTANTS AS PATTERNS.
+///
+/// `match op { OP_ADD => ..., bc.OP_SUB => ... }` used to be impossible: a
+/// bare name bound the value (so the second arm was "unreachable"), and a
+/// qualified name was a syntax error. Code that dispatches over named
+/// opcodes (Certus `lib/js/bc.fi`, `interp.fi`) therefore wrote a chain of
+/// `if op == ...` -- and a chain never becomes a jump table
+/// (`codegen_switch.rs`), a `match` does.
+///
+/// The rule is Rust's: a bare name that names an integer or bool `const`
+/// is that constant; any other bare name binds. A qualified name
+/// (`module.NAME`) must name a constant. Returns whether anything changed.
+fn resolve_const_patterns(ck: &mut Checker, pat: &mut Pattern) -> bool {
+    match pat {
+        Pattern::Bind(name, span) => match ck.consts.get(name.as_str()) {
+            Some((ty, v)) => {
+                *pat = if matches!(ty, Type::Bool) {
+                    Pattern::Bool(*v != 0, *span)
+                } else {
+                    Pattern::Int(*v, *span)
+                };
+                true
+            }
+            None => false,
+        },
+        Pattern::Const(name, span) => {
+            let sp = *span;
+            match ck.consts.get(name.as_str()) {
+                Some((ty, v)) => {
+                    *pat = if matches!(ty, Type::Bool) {
+                        Pattern::Bool(*v != 0, sp)
+                    } else {
+                        Pattern::Int(*v, sp)
+                    };
+                }
+                None => {
+                    ck.dg.error_note(
+                        sp,
+                        format!("'{}' in a pattern is not an integer or bool constant", name),
+                        "a qualified name in a pattern must name a `const`",
+                    );
+                    *pat = Pattern::Wild(sp);
+                }
+            }
+            true
+        }
+        Pattern::Variant { subs, .. } => {
+            let mut c = false;
+            for s in subs.iter_mut() {
+                c |= resolve_const_patterns(ck, s);
+            }
+            c
+        }
+        _ => false,
+    }
+}
+
 /// Checks a pattern against the expected type and creates its bindings.
 fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, top: bool) {
     match pat {
@@ -999,6 +1089,8 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
         Pattern::Bind(name, span) => {
             ck.declare_var(name, ty.clone(), false, *span);
         }
+        // Resolved by `resolve_const_patterns` before this runs.
+        Pattern::Const(..) => {}
         Pattern::Bool(_, span) => {
             if !matches!(ty, Type::Bool | Type::Error) {
                 ck.dg.error(
