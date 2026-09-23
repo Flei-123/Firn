@@ -22,6 +22,8 @@ command that produced it next to it.
 | The collector without a stack scan | `bash tools/wasm/gc_soak.sh` | intact after **1096-1097 collections**, 36,000,000 nodes verified, in three build levels; **counter-check** without the spills: `CORRUPT after round 9` |
 | The page of `gallery9_main.fi` in Chromium | `bash tools/wasm/webdemo.sh` | **0 differing pixels** in 4 of 4 pictures (dark/light, 1240/980 wide) against the PNGs of `tools/fui/run.sh --images`, from the optimised and the unoptimised build |
 | Operating it | same | hover, click, wheel, Tab, arrows, space -- each changes the picture, each way back gives the reference again, **0 pixels**; no picture while idle |
+| Following the window | same | 1240 wide, then 980 without reloading: repainted, **0 and 0 pixels** from the two references |
+| Nothing else broke | `bash test.sh`, before (56bea7e9) and after | the same 4 of 1592 checks fail on both sides (fixpoint gctext, js, German identifiers, formatter -- all older than this round); **0 new** |
 | Device pixels | same | ratio 2: a 2480x1440 canvas for 1240x720 CSS; averaged down 2x2, **0.86 %** of the pixels off by more than 64/255 (glyph anti-aliasing) |
 
 The 21 refusals, by reason:
