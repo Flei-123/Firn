@@ -19,6 +19,8 @@
 #   * wheel       the list scrolls one notch and back -- the reference again
 #   * keyboard    Tab puts a focus ring on the first control, the arrow keys
 #                 scroll the list under the pointer, space toggles
+#   * resize      without a fixed size the page follows the window: 1240
+#                 wide, then 980 -- each picture is ITS reference
 #   * device px   devicePixelRatio 2: the canvas has 2x the pixels, fUi
 #                 paints with theme scale 2000, and the picture, averaged
 #                 back down 2x2, is the reference again -- up to the
@@ -294,6 +296,26 @@ try:
     settle()
     d_space = diff(b.shot(1240, 720, "op-space"), after_click)
     verdict(d_space > 0, "space on the focused toggle: it flips back, %d px" % d_space)
+
+    print("== the page follows the window ==")
+    b.call("Emulation.setDeviceMetricsOverride", width=1240, height=720,
+           deviceScaleFactor=1, mobile=False)
+    b.call("Page.navigate", url="http://127.0.0.1:%d/index.html?theme=dark&wasm=%s"
+           % (hport, WASM))
+    t0 = time.time()
+    while time.time() - t0 < 30 and b.frames() < 1:
+        time.sleep(0.05)
+    settle()
+    d_wide = diff(b.shot(1240, 720, "resize-1240"), base)
+    f0 = b.frames()
+    b.call("Emulation.setDeviceMetricsOverride", width=980, height=720,
+           deviceScaleFactor=1, mobile=False)
+    painted = b.wait_frame(f0)
+    settle()
+    d_narrow = diff(b.shot(980, 720, "resize-980"), ref("fui-deklarativ-schmal-dunkel.png"))
+    verdict(painted and d_wide == 0 and d_narrow == 0,
+            "window 1240 -> 980 wide: repainted, %d and %d px from the references"
+            % (d_wide, d_narrow))
 
     print("== device pixels: devicePixelRatio 2 ==")
     load("dark", 1240, 720, dpr=2)
