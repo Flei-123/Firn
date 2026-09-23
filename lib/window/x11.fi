@@ -58,6 +58,29 @@
 //    auffaellt (hoechstens einmal je Sekunde nachgesehen). Wer ewig
 //    waits forever never gets it; for that there is `window.theme_reload`.
 //    Immediately would only work through the XDG portal on D-Bus.
+// ======================================= WHAT FIRN ADDED (23.09.2026)
+//
+// F1 THE KEYBOARD FROM THE SERVER. GetKeyboardMapping and
+//    GetModifierMapping at connect time; a key becomes a KEYSYM by the
+//    rules of the protocol (Shift, Lock, NumLock, AltGr), and the keysym
+//    decides K_* and the character. `key_ascii` (the fixed US table)
+//    stays only as the fallback when the server does not answer.
+// F2 RELEASE, ENTER, LEAVE -- on request (`window.full_input`), so that a
+//    program that does not want them sees exactly what it saw before.
+//    lib/fui/control.fi needs the release: a click there is press AND
+//    release on the same widget.
+// F3 ~/.Xauthority BY DISPLAY NUMBER instead of "the first cookie".
+// F4 THE PROTOCOL AS PURE FUNCTIONS (`req_*`, `setup_parse`,
+//    `keymap_*`, `decode_event`, `auth_pick`, `resman_dpi`): every
+//    request and every reply this client knows is built/read by a
+//    function without a connection, and tools/fui/x11_main.fi checks
+//    them octet by octet against hand-derived values and against real
+//    captures of an Xvfb (testdata/x11/).
+//
+// WHAT DOES NOT WORK (still): dead keys and compose (a dead key gives no
+// character), the old Latin-2..9/Cyrillic keysym tables (only Latin-1
+// and the Unicode keysyms become characters), TCP displays
+// (`host:0`), MIT-SHM, and more than the first screen.
 import std.rt
 import std.net
 import window.window
@@ -94,7 +117,16 @@ export {
     // Sie war es, die den fehlenden Doppelpunkt aufgedeckt hat.
     key_ascii,
     r_update_start,
-    r_input_hook,
+    r_input_hook, r_full_input,
+    // F4: das Protokoll als reine Funktionen -- fuer tools/fui/x11_main.fi.
+    Setup, setup_new, setup_parse, dpi_from_mm, resman_dpi, xft_dpi_in,
+    req_setup, req_intern_atom, req_create_window, req_create_gc,
+    req_change_property, req_map_window, req_get_property,
+    req_get_keyboard_mapping, req_get_modifier_mapping,
+    req_put_image_head,
+    Keymap, keymap_new, keymap_ok, keymap_from_reply,
+    keymap_mods_from_reply, keymap_col, keymap_sym, ks_key, ks_char,
+    decode_event, auth_pick,
 }
 
 const RD_ERR: usize = 18446744073709551615
@@ -148,6 +180,9 @@ struct Platte {
     // Der Haken fuer die Eingabemeldung, siehe oben.
     ein_hook: fn(u64),
     ein_ud: u64,
+    // F1: die Belegung des Servers. F2: Loslassen/Hinein/Hinaus melden?
+    km: Keymap,
+    voll: bool,
 }
 
 fn surface_new() -> Platte {
@@ -158,10 +193,18 @@ fn surface_new() -> Platte {
         font: 0, w: 0, h: 0, seq: 0, rb: rt.buf_new(), rpos: 0,
         a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
         dark_bekannt: false, dark_us: 0, inj: 0, gift: 0, fail: 0,
-        spos: 0, ein_n: 0, ein_hook: ein_nichts, ein_ud: 0 }
+        spos: 0, ein_n: 0, ein_hook: ein_nichts, ein_ud: 0,
+        km: keymap_new(), voll: false }
 }
 
 fn ein_nichts(ud: u64) { }
+
+// F2 -- Loslassen, Hinein und Hinaus melden. Muss VOR `r_make` stehen:
+// die Ereignismaske ist Teil von CreateWindow.
+fn r_full_input(x: *mut Platte, an: bool) -> bool {
+    (*x).voll = an
+    return true
+}
 
 // Den Haken setzen. `ud` reicht der Wirt sich selbst durch.
 fn r_input_hook(x: *mut Platte, h: fn(u64), ud: u64) {
@@ -258,6 +301,734 @@ fn lese_nach(x: *mut Platte) -> bool {
     return true
 }
 
+// ======================================================================
+// DAS PROTOKOLL ALS REINE FUNKTIONEN (Firn, 23.09.2026)
+// ======================================================================
+//
+// WARUM DIESER ABSCHNITT. In Certus baute jede Funktion ihre Anfrage
+// an Ort und Stelle zusammen und schickte sie sofort ab. Das lief --
+// aber pruefen liess es sich nur mit einem laufenden X-Server, und der
+// fehlt auf fast jedem Rechner, auf dem ein Abnahmelauf laeuft. Also
+// steht hier jede Anfrage als Funktion, die NUR in einen Puffer
+// schreibt, und jede Antwort als Funktion, die NUR aus einem Puffer
+// liest. Die Aufrufer weiter unten benutzen genau diese Funktionen;
+// tools/fui/x11_main.fi legt dieselben Funktionen Oktett fuer Oktett
+// neben von Hand bestimmte Sollwerte und neben echte Mitschnitte eines
+// Xvfb (testdata/x11/). Es gibt also keinen zweiten, "Pruef"-Weg.
+//
+// Die Zahlen sind die des Protokolls (X Window System Protocol, X11R7,
+// Kapitel 9 fuer die Anfragen und Anhang B fuer das Oktettformat).
+
+// Nullen bis zur naechsten Vierergrenze.
+fn pad_to4(b: *mut rt.Buf, n: usize) {
+    var q: usize = 0
+    let p: usize = pad4(n)
+    while q < p {
+        rt.buf_push(b, 0 as u8)
+        q = q + 1
+    }
+}
+
+// DER VERBINDUNGSAUFBAU. 'l' = kleinendisch, Protokoll 11.0, dann Name
+// und Daten der Berechtigung, jedes auf vier Oktett aufgefuellt. Ohne
+// Berechtigung sind beide Laengen 0 und es folgt nichts.
+fn req_setup(b: *mut rt.Buf, np: u64, nn: usize, dp: u64, dn: usize) {
+    rt.buf_push(b, 108 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 11 as u32)
+    put16(b, 0 as u32)
+    put16(b, nn as u32)
+    put16(b, dn as u32)
+    put16(b, 0 as u32)
+    rt.buf_push_bytes(b, np, nn)
+    pad_to4(b, nn)
+    rt.buf_push_bytes(b, dp, dn)
+    pad_to4(b, dn)
+}
+
+// InternAtom(16), only-if-exists = nein.
+fn req_intern_atom(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push(b, 16 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, (2 + (n + pad4(n)) / 4) as u32)
+    put16(b, n as u32)
+    put16(b, 0 as u32)
+    rt.buf_push_bytes(b, p, n)
+    pad_to4(b, n)
+}
+
+// CreateWindow(1) bei (0,0), Rand 0, InputOutput, mit genau zwei
+// Werten: background-pixel (2) und event-mask (2048).
+fn req_create_window(b: *mut rt.Buf, wid: u32, parent: u32, depth: u32,
+    visual: u32, w: usize, h: usize, bg: u32, maske: u32) {
+    rt.buf_push(b, 1 as u8)
+    rt.buf_push(b, depth as u8)
+    put16(b, 10 as u32)
+    put32(b, wid)
+    put32(b, parent)
+    put16(b, 0 as u32)
+    put16(b, 0 as u32)
+    put16(b, w as u32)
+    put16(b, h as u32)
+    put16(b, 0 as u32)
+    put16(b, 1 as u32)
+    put32(b, visual)
+    put32(b, 2050 as u32)
+    put32(b, bg)
+    put32(b, maske)
+}
+
+// CreateGC(55) ohne Werte.
+fn req_create_gc(b: *mut rt.Buf, gc: u32, drawable: u32) {
+    rt.buf_push(b, 55 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 4 as u32)
+    put32(b, gc)
+    put32(b, drawable)
+    put32(b, 0 as u32)
+}
+
+// ChangeProperty(18), Modus Replace. `fmt` ist 8, 16 oder 32; `nbytes`
+// die Laenge der Daten in Oktett, die Zahl der EINHEITEN rechnet diese
+// Funktion selbst -- genau die Stelle, an der man sich sonst um den
+// Faktor vier verzaehlt.
+fn req_change_property(b: *mut rt.Buf, win: u32, prop: u32, typ: u32,
+    fmt: u32, p: u64, nbytes: usize) {
+    rt.buf_push(b, 18 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, (6 + (nbytes + pad4(nbytes)) / 4) as u32)
+    put32(b, win)
+    put32(b, prop)
+    put32(b, typ)
+    rt.buf_push(b, fmt as u8)
+    rt.buf_push(b, 0 as u8)
+    rt.buf_push(b, 0 as u8)
+    rt.buf_push(b, 0 as u8)
+    put32(b, (nbytes / ((fmt / 8) as usize)) as u32)
+    rt.buf_push_bytes(b, p, nbytes)
+    pad_to4(b, nbytes)
+}
+
+// MapWindow(8).
+fn req_map_window(b: *mut rt.Buf, win: u32) {
+    rt.buf_push(b, 8 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 2 as u32)
+    put32(b, win)
+}
+
+// GetProperty(20), delete = nein.
+fn req_get_property(b: *mut rt.Buf, win: u32, prop: u32, typ: u32,
+    off: u32, len: u32) {
+    rt.buf_push(b, 20 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 6 as u32)
+    put32(b, win)
+    put32(b, prop)
+    put32(b, typ)
+    put32(b, off)
+    put32(b, len)
+}
+
+// GetKeyboardMapping(101): `count` Tastencodes ab `first`.
+fn req_get_keyboard_mapping(b: *mut rt.Buf, first: u32, count: u32) {
+    rt.buf_push(b, 101 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 2 as u32)
+    rt.buf_push(b, first as u8)
+    rt.buf_push(b, count as u8)
+    rt.buf_push(b, 0 as u8)
+    rt.buf_push(b, 0 as u8)
+}
+
+// GetModifierMapping(119): welche Tasten Shift, Lock, Control und
+// Mod1..Mod5 sind.
+fn req_get_modifier_mapping(b: *mut rt.Buf) {
+    rt.buf_push(b, 119 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 1 as u32)
+}
+
+// Der KOPF von PutImage(72), ZPixmap, links-pad 0. Die `bytes` Bildoktett
+// folgen dahinter (der Aufrufer haengt sie an, damit ein 3,8-MB-Bild
+// nicht zweimal kopiert wird). `bytes` ist bei 32 Bit je Punkt immer
+// ein Vielfaches von vier.
+fn req_put_image_head(b: *mut rt.Buf, win: u32, gc: u32, w: usize,
+    h: usize, dx: usize, dy: usize, depth: u32, bytes: usize) {
+    rt.buf_push(b, 72 as u8)
+    rt.buf_push(b, 2 as u8)
+    put16(b, (6 + bytes / 4) as u32)
+    put32(b, win)
+    put32(b, gc)
+    put16(b, w as u32)
+    put16(b, h as u32)
+    put16(b, dx as u32)
+    put16(b, dy as u32)
+    rt.buf_push(b, 0 as u8)
+    rt.buf_push(b, depth as u8)
+    rt.buf_push(b, 0 as u8)
+    rt.buf_push(b, 0 as u8)
+}
+
+// ------------------------------------------------- die Antwort des Aufbaus
+
+struct Setup {
+    id_base: u32,
+    id_mask: u32,
+    root: u32,
+    s_px_w: usize,
+    s_px_h: usize,
+    s_mm_w: usize,
+    s_mm_h: usize,
+    visual: u32,
+    depth: u32,
+    kmin: u32,
+    kmax: u32,
+}
+
+fn setup_new() -> Setup {
+    return Setup { id_base: 0, id_mask: 0, root: 0, s_px_w: 0, s_px_h: 0,
+        s_mm_w: 0, s_mm_h: 0, visual: 0, depth: 0, kmin: 0, kmax: 0 }
+}
+
+// Die Antwort auf den Verbindungsaufbau zerlegen: `p` zeigt auf ihr
+// erstes Oktett, `n` Oktett stehen da. Zurueck kommt 0 oder der Grund,
+// der auch in `Platte.fail` landet: 5 = abgelehnt (fast immer die
+// Berechtigung), 6 = kein 24-Bit-Visual (U1), 7 = zu kurz.
+//
+// Gelesen wird nur der ERSTE Schirm -- `:0.1` gibt es auf keinem
+// Rechner, fuer den dieses Programm gebaut wird.
+fn setup_parse(p: u64, n: usize, s: *mut Setup) -> u32 {
+    if n < 8 {
+        return 7 as u32
+    }
+    if rt.ld8(p, 0) != 1 as u8 {
+        return 5 as u32
+    }
+    if n < 40 {
+        return 7 as u32
+    }
+    (*s).id_base = ld32le(p, 12)
+    (*s).id_mask = ld32le(p, 16)
+    (*s).kmin = rt.ld8(p, 34) as u32
+    (*s).kmax = rt.ld8(p, 35) as u32
+    let vendor_len: usize = ld16le(p, 24) as usize
+    let nformats: usize = rt.ld8(p, 29) as usize
+    let at: usize = 40 + vendor_len + pad4(vendor_len) + nformats * 8
+    if at + 40 > n {
+        return 7 as u32
+    }
+    (*s).root = ld32le(p, at)
+    (*s).s_px_w = ld16le(p, at + 20) as usize
+    (*s).s_px_h = ld16le(p, at + 22) as usize
+    (*s).s_mm_w = ld16le(p, at + 24) as usize
+    (*s).s_mm_h = ld16le(p, at + 26) as usize
+    let ndepths: usize = rt.ld8(p, at + 39) as usize
+    var dat: usize = at + 40
+    var di: usize = 0
+    (*s).visual = 0
+    while di < ndepths && dat + 8 <= n {
+        let dep: u32 = rt.ld8(p, dat) as u32
+        let nvis: usize = ld16le(p, dat + 2) as usize
+        if dep == 24 as u32 && nvis > 0 && dat + 12 <= n {
+            (*s).visual = ld32le(p, dat + 8)
+            (*s).depth = 24
+            break
+        }
+        dat = dat + 8 + nvis * 24
+        di = di + 1
+    }
+    if (*s).visual == 0 as u32 {
+        return 6 as u32
+    }
+    return 0 as u32
+}
+
+// Die Bildpunktdichte aus Punkten und Millimetern: 1 Zoll = 25,4 mm,
+// ganzzahlig und kaufmaennisch gerundet. 0 = nicht bestimmbar.
+fn dpi_from_mm(px: usize, mm: usize) -> usize {
+    if px == 0 || mm == 0 {
+        return 0
+    }
+    return (px * 254 + mm * 5) / (mm * 10)
+}
+
+// `Xft.dpi:` aus dem Text der Ressourcendatenbank. 0 = nicht da.
+fn xft_dpi_in(txt: u64, bytes: usize) -> usize {
+    var lit: [u8; 8] = "Xft.dpi:"
+    var d: usize = 0
+    var i: usize = 0
+    while i + 8 <= bytes {
+        var gleich: bool = true
+        var j: usize = 0
+        while j < 8 {
+            if rt.ld8(txt, i + j) != lit[j] {
+                gleich = false
+            }
+            j = j + 1
+        }
+        if gleich {
+            d = number_from(txt, i + 8, bytes)
+            i = bytes
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// Die Antwort auf GetProperty(RESOURCE_MANAGER) -> Xft.dpi. Nur Format
+// 8 ist Text; alles andere ist "nicht da".
+fn resman_dpi(p: u64, n: usize) -> usize {
+    if n < 32 || rt.ld8(p, 0) != 1 as u8 {
+        return 0
+    }
+    let extra: usize = (ld32le(p, 4) as usize) * 4
+    if 32 + extra > n {
+        return 0
+    }
+    if rt.ld8(p, 1) != 8 as u8 {
+        return 0
+    }
+    var bytes: usize = ld32le(p, 16) as usize
+    if bytes > extra {
+        bytes = extra
+    }
+    return xft_dpi_in(p + 32 as u64, bytes)
+}
+
+// ======================================================================
+// DIE TASTATUR, WIE DER SERVER SIE BELEGT
+// ======================================================================
+//
+// In Certus stand hier nur `key_ascii`: eine US-Tabelle fuer die
+// Tastencodes 10..61, fest eingebaut. Auf einer deutschen Tastatur
+// lieferte die Taste rechts neben der 0 darum '-' statt 'ss', 'z' und
+// 'y' waren vertauscht, und '@' (AltGr+Q) gab es gar nicht. Die
+// Belegung WEISS aber der Server, und er sagt sie jedem, der fragt:
+//
+//   GetKeyboardMapping(kmin, kmax-kmin+1) -> je Tastencode `per`
+//       Keysyms: [Gruppe1 Ebene1, G1 E2, G2 E1, G2 E2, E3, E4, ...]
+//   GetModifierMapping -> welche Tasten Mod1..Mod5 sind; daraus folgt,
+//       welches Zustandsbit AltGr (ISO_Level3_Shift/Mode_switch) und
+//       welches NumLock ist -- das ist KEINE feste Zahl, der Server
+//       legt es fest (bei Xvfb mit xkb: Mod5 = 128, Mod2 = 16).
+//
+// Die Tastennummern K_* in window.fi bleiben, was sie sind (die
+// evdev-Nummern, auf die Certus seine Schleifen gebaut hat) -- aber sie
+// werden jetzt aus dem KEYSYM bestimmt: Escape ist Escape, egal auf
+// welchem Tastencode es liegt.
+
+struct Keymap {
+    syms: rt.Buf,   // je Tastencode `per` Keysyms, kleinendisch u32
+    per: usize,
+    kmin: u32,
+    n: usize,       // wie viele Tastencodes
+    lvl3: u32,      // das Zustandsbit fuer AltGr, 0 = keins
+    numlock: u32,   // das Zustandsbit fuer NumLock, 0 = keins
+}
+
+fn keymap_new() -> Keymap {
+    return Keymap { syms: rt.buf_new(), per: 0, kmin: 0, n: 0, lvl3: 0,
+        numlock: 0 }
+}
+
+fn keymap_ok(km: *mut Keymap) -> bool {
+    return (*km).n > 0 && (*km).per > 0
+}
+
+// Die Antwort auf GetKeyboardMapping uebernehmen. `kmin` ist der erste
+// erfragte Tastencode (die Antwort nennt ihn nicht noch einmal).
+fn keymap_from_reply(km: *mut Keymap, p: u64, n: usize, kmin: u32) -> bool {
+    if n < 32 || rt.ld8(p, 0) != 1 as u8 {
+        return false
+    }
+    let per: usize = rt.ld8(p, 1) as usize
+    let worte: usize = ld32le(p, 4) as usize
+    if per == 0 || 32 + worte * 4 > n {
+        return false
+    }
+    rt.buf_clear(&(*km).syms)
+    rt.buf_push_bytes(&(*km).syms, p + 32 as u64, worte * 4)
+    (*km).per = per
+    (*km).kmin = kmin
+    (*km).n = worte / per
+    return true
+}
+
+// Keysym in Spalte `col` fuer Tastencode `kc`; 0 = NoSymbol.
+fn keymap_col(km: *mut Keymap, kc: u32, col: usize) -> u32 {
+    if !keymap_ok(km) || kc < (*km).kmin || col >= (*km).per {
+        return 0 as u32
+    }
+    let i: usize = (kc - (*km).kmin) as usize
+    if i >= (*km).n {
+        return 0 as u32
+    }
+    return ld32le(rt.buf_ptr(&(*km).syms), (i * (*km).per + col) * 4)
+}
+
+// Die Antwort auf GetModifierMapping: fuer jedes der acht Bits die
+// Tastencodes; ein Bit, auf dem eine Taste mit ISO_Level3_Shift
+// (0xFE03) oder Mode_switch (0xFF7E) liegt, ist AltGr, eines mit
+// Num_Lock (0xFF7F) ist NumLock.
+fn keymap_mods_from_reply(km: *mut Keymap, p: u64, n: usize) -> bool {
+    if n < 32 || rt.ld8(p, 0) != 1 as u8 {
+        return false
+    }
+    let je: usize = rt.ld8(p, 1) as usize
+    if 32 + 8 * je > n {
+        return false
+    }
+    (*km).lvl3 = 0
+    (*km).numlock = 0
+    var m: usize = 0
+    while m < 8 {
+        var k: usize = 0
+        while k < je {
+            let kc: u32 = rt.ld8(p, 32 + m * je + k) as u32
+            if kc != 0 as u32 {
+                var col: usize = 0
+                while col < (*km).per {
+                    let ks: u32 = keymap_col(km, kc, col)
+                    if ks == 65027 as u32 || ks == 65406 as u32 {
+                        (*km).lvl3 = (1 as u32) << (m as u32)
+                    }
+                    if ks == 65407 as u32 {
+                        (*km).numlock = (1 as u32) << (m as u32)
+                    }
+                    col = col + 1
+                }
+            }
+            k = k + 1
+        }
+        m = m + 1
+    }
+    return true
+}
+
+// Kleinbuchstabe -> Grossbuchstabe fuer die Keysyms, die ein Zeichen
+// aus Latin-1 SIND (Keysym == Codepunkt). Gebraucht nur fuer die Regel
+// des Protokolls: steht in Spalte 2 NoSymbol, gilt fuer Spalte 2 der
+// grosse Buchstabe von Spalte 1 (bzw. Spalte 1 selbst).
+fn ks_upper(ks: u32) -> u32 {
+    if ks >= 97 as u32 && ks <= 122 as u32 {
+        return ks - 32 as u32
+    }
+    if ks >= 224 as u32 && ks <= 254 as u32 && ks != 247 as u32 {
+        return ks - 32 as u32
+    }
+    return ks
+}
+
+fn ks_is_lower(ks: u32) -> bool {
+    return ks_upper(ks) != ks
+}
+
+fn ks_is_keypad(ks: u32) -> bool {
+    return ks >= 65408 as u32 && ks <= 65469 as u32
+}
+
+// DAS KEYSYM ZU TASTENCODE UND ZUSTAND. Die Regeln aus Kapitel 5 des
+// Protokolls ("Keyboards"), eingeschraenkt auf das, was eine
+// Oberflaeche braucht:
+//   * AltGr (das Bit aus GetModifierMapping) nimmt die Spalten 4/5
+//     (Ebene 3/4) -- aber nur, wenn dort etwas steht.
+//   * NumLock auf einer Zifferntaste nimmt Spalte 1, Umschalt kehrt es
+//     wieder um.
+//   * Umschalt nimmt Spalte 1; CapsLock (Lock) tut es nur bei einem
+//     Buchstaben. Ist Spalte 1 NoSymbol, gilt der grosse Buchstabe von
+//     Spalte 0 bzw. Spalte 0 selbst.
+fn keymap_sym(km: *mut Keymap, kc: u32, state: u32) -> u32 {
+    let shift: bool = (state & 1 as u32) != 0 as u32
+    let lock: bool = (state & 2 as u32) != 0 as u32
+    var c0: usize = 0
+    if (*km).lvl3 != 0 as u32 && (state & (*km).lvl3) != 0 as u32 {
+        if keymap_col(km, kc, 4) != 0 as u32 {
+            c0 = 4
+        }
+    }
+    let s0: u32 = keymap_col(km, kc, c0)
+    var s1: u32 = keymap_col(km, kc, c0 + 1)
+    if s1 == 0 as u32 {
+        s1 = ks_upper(s0)
+    }
+    if (*km).numlock != 0 as u32 && (state & (*km).numlock) != 0 as u32
+        && ks_is_keypad(s1) {
+        if shift {
+            return s0
+        }
+        return s1
+    }
+    var hoch: bool = shift
+    if lock && ks_is_lower(s0) {
+        hoch = !hoch
+    }
+    if hoch {
+        return s1
+    }
+    return s0
+}
+
+// Keysym -> Tastennummer mit Bedeutung (window.K_*), 0 = keine.
+fn ks_key(ks: u32) -> u32 {
+    if ks == 65307 as u32 { return window.K_ESCAPE }        // Escape
+    if ks == 65288 as u32 { return window.K_BACK }          // BackSpace
+    if ks == 65289 as u32 || ks == 65056 as u32 {           // Tab, ISO_Left_Tab
+        return window.K_TAB
+    }
+    if ks == 65293 as u32 || ks == 65421 as u32 {           // Return, KP_Enter
+        return window.K_RETURN
+    }
+    if ks == 65360 as u32 || ks == 65429 as u32 { return window.K_HOME }
+    if ks == 65361 as u32 || ks == 65430 as u32 { return window.K_LEFT }
+    if ks == 65362 as u32 || ks == 65431 as u32 { return window.K_UP }
+    if ks == 65363 as u32 || ks == 65432 as u32 { return window.K_RIGHT }
+    if ks == 65364 as u32 || ks == 65433 as u32 { return window.K_DOWN }
+    if ks == 65365 as u32 || ks == 65434 as u32 { return window.K_PAGEUP }
+    if ks == 65366 as u32 || ks == 65435 as u32 { return window.K_PAGEDOWN }
+    if ks == 65367 as u32 || ks == 65436 as u32 { return window.K_END }
+    if ks == 65535 as u32 || ks == 65439 as u32 { return window.K_DELETE }
+    return 0 as u32
+}
+
+// Keysym -> Unicode-Codepunkt, 0 = kein Zeichen.
+//   * 0x20..0x7E und 0xA0..0xFF: Keysym == Latin-1 == Unicode.
+//   * 0x01000000 + cp: der Unicode-Bereich der Keysyms (xkb legt z. B.
+//     das grosse Eszett so ab: U1E9E).
+//   * die Zifferntastatur: KP_Space, KP_Equal, KP_Multiply .. KP_9.
+//   * EuroSign 0x20AC ist zugleich U+20AC.
+// NICHT hier: tote Tasten (0xFE50..) und die alten Latin-2..-9- und
+// kyrillischen Keysym-Tafeln -- siehe "WAS NICHT GEHT" im Kopf.
+fn ks_char(ks: u32) -> u32 {
+    if ks >= 32 as u32 && ks <= 126 as u32 {
+        return ks
+    }
+    if ks >= 160 as u32 && ks <= 255 as u32 {
+        return ks
+    }
+    if ks >= 16777216 as u32 && ks <= 17891327 as u32 {
+        return ks - 16777216 as u32
+    }
+    if ks == 8364 as u32 {
+        return ks
+    }
+    if ks == 65408 as u32 { return 32 as u32 }       // KP_Space
+    if ks == 65469 as u32 { return 61 as u32 }       // KP_Equal
+    if ks >= 65450 as u32 && ks <= 65465 as u32 {    // KP_Multiply .. KP_9
+        var t: [u8; 16] = "*+,-./0123456789"
+        return t[(ks - 65450 as u32) as usize] as u32
+    }
+    return 0 as u32
+}
+
+// ======================================================================
+// EIN EREIGNIS, 32 OKTETT -> (Art, a, x, y, Zustand)
+// ======================================================================
+//
+// Die Uebersetzung, die `r_next` frueher selbst tat, als eigene
+// Funktion ohne Verbindung. `a_delete` ist das Atom WM_DELETE_WINDOW,
+// `voll` der Schalter aus `window.full_input` (Loslassen, Hinein,
+// Hinaus). Zurueck: true = das ist ein Ereignis fuer das Programm.
+//
+// Das oberste Bit des Codes sagt nur "kam ueber SendEvent" -- ein
+// Fenstermanager schickt WM_DELETE_WINDOW genau so (Code 161 = 33|128
+// im Mitschnitt testdata/x11/events.bin). Es wird darum abgeschnitten.
+fn decode_event(p: u64, a_delete: u32, km: *mut Keymap, voll: bool,
+    k: *mut u32, a: *mut u32, ox: *mut u32, oy: *mut u32,
+    os: *mut u32) -> bool {
+    let code: u8 = rt.ld8(p, 0) & 127 as u8
+    *a = 0 as u32
+    *ox = 0 as u32
+    *oy = 0 as u32
+    *os = 0 as u32
+    if code == 12 as u8 { // Expose
+        *k = window.EV_EXPOSE
+        return true
+    }
+    if code == 2 as u8 || (code == 3 as u8 && voll) { // KeyPress/Release
+        let kc: u32 = rt.ld8(p, 1) as u32
+        let st: u32 = ld16le(p, 28)
+        *os = st
+        var ks: u32 = 0 as u32
+        if keymap_ok(km) {
+            ks = keymap_sym(km, kc, st)
+        }
+        *ox = ks
+        if code == 3 as u8 {
+            var t: u32 = ks_key(ks)
+            if t == 0 as u32 {
+                t = kc
+            }
+            *a = t
+            *k = window.EV_KEY_UP
+            return true
+        }
+        // L2: as under Windows -- keys with meaning as EV_KEY,
+        // printable characters as EV_CHAR.
+        if keymap_ok(km) {
+            let t: u32 = ks_key(ks)
+            if t != 0 as u32 {
+                *a = t
+                *k = window.EV_KEY
+                return true
+            }
+            let ch: u32 = ks_char(ks)
+            if ch != 0 as u32 {
+                *a = ch
+                *k = window.EV_CHAR
+                return true
+            }
+        } else {
+            // Keine Belegung vom Server (die Anfrage scheiterte): der
+            // alte Weg ueber die feste US-Tabelle, wie in Certus.
+            if is_key(kc) {
+                *a = kc
+                *k = window.EV_KEY
+                return true
+            }
+            let ch: u32 = key_ascii(kc, (st & 1 as u32) != 0 as u32)
+            if ch != 0 as u32 {
+                *a = ch
+                *k = window.EV_CHAR
+                return true
+            }
+        }
+        // A key that has neither meaning nor character: as EV_KEY
+        // with its number, so that nothing disappears.
+        *a = kc
+        *k = window.EV_KEY
+        return true
+    }
+    if code == 4 as u8 || (code == 5 as u8 && voll) { // Button Press/Release
+        *a = rt.ld8(p, 1) as u32
+        *ox = ld16le(p, 24)
+        *oy = ld16le(p, 26)
+        *os = ld16le(p, 28)
+        if code == 4 as u8 {
+            *k = window.EV_BUTTON
+        } else {
+            *k = window.EV_RELEASE
+        }
+        return true
+    }
+    if code == 6 as u8 { // MotionNotify (L1)
+        *ox = ld16le(p, 24)
+        *oy = ld16le(p, 26)
+        *os = ld16le(p, 28)
+        *k = window.EV_MOTION
+        return true
+    }
+    if (code == 7 as u8 || code == 8 as u8) && voll { // Enter/Leave
+        *ox = ld16le(p, 24)
+        *oy = ld16le(p, 26)
+        *os = ld16le(p, 28)
+        if code == 7 as u8 {
+            *k = window.EV_ENTER
+        } else {
+            *k = window.EV_LEAVE
+        }
+        return true
+    }
+    if code == 22 as u8 { // ConfigureNotify
+        *ox = ld16le(p, 20)
+        *oy = ld16le(p, 22)
+        *k = window.EV_CONFIGURE
+        return true
+    }
+    if code == 33 as u8 { // ClientMessage (L3)
+        let atom: u32 = ld32le(p, 12)
+        if atom == a_delete && a_delete != 0 as u32 {
+            *k = window.EV_CLOSED
+            return true
+        }
+    }
+    return false
+}
+
+// ======================================================================
+// ~/.Xauthority: WELCHER EINTRAG
+// ======================================================================
+//
+// Die Datei ist eine Folge von Eintraegen: Familie (2 Oktett, grossendisch),
+// dann vier gezaehlte Zeichenketten (Laenge 2 Oktett grossendisch):
+// Adresse, Anzeigenummer als TEXT, Name der Berechtigung, Daten.
+//
+// In Certus wurde der ERSTE Eintrag mit einem 18 Oktett langen Namen
+// genommen, egal fuer welche Anzeige. Wer mehr als eine Anzeige hat
+// (ssh -X, ein zweites Xvfb, ein Abnahmelauf), bekam damit das Keks
+// einer fremden Anzeige und eine Ablehnung (fail 5). Jetzt gilt: der
+// Eintrag MIT DIESER ANZEIGENUMMER zuerst; nur wenn es keinen gibt, der
+// erste MIT-MAGIC-COOKIE-1 -- das alte Verhalten als Rueckfall.
+fn auth_pick(p: u64, n: usize, anzeige: usize, name: *mut rt.Buf,
+    data: *mut rt.Buf) -> bool {
+    var cookie: [u8; 18] = "MIT-MAGIC-COOKIE-1"
+    var at: usize = 0
+    var erster_n: usize = 0
+    var erster_d: usize = 0
+    var erster_dl: usize = 0
+    var hat_erster: bool = false
+    while at + 2 <= n {
+        at = at + 2
+        var i: usize = 0
+        var lens: [usize; 4] = [0; 4]
+        var offs: [usize; 4] = [0; 4]
+        var bad: bool = false
+        while i < 4 {
+            if at + 2 > n {
+                bad = true
+                break
+            }
+            let l: usize = ((rt.ld8(p, at) as usize) << 8)
+            | (rt.ld8(p, at + 1) as usize)
+            at = at + 2
+            offs[i] = at
+            lens[i] = l
+            at = at + l
+            if at > n {
+                bad = true
+                break
+            }
+            i = i + 1
+        }
+        if bad {
+            break
+        }
+        var ist_keks: bool = lens[2] == 18
+        var j: usize = 0
+        while ist_keks && j < 18 {
+            if rt.ld8(p, offs[2] + j) != cookie[j] {
+                ist_keks = false
+            }
+            j = j + 1
+        }
+        if ist_keks {
+            let nr: usize = number_from(p, offs[1], offs[1] + lens[1])
+            let hat_nr: bool = lens[1] > 0
+            if hat_nr && nr == anzeige {
+                rt.buf_clear(name)
+                rt.buf_push_bytes(name, p + offs[2] as u64, lens[2])
+                rt.buf_clear(data)
+                rt.buf_push_bytes(data, p + offs[3] as u64, lens[3])
+                return true
+            }
+            if !hat_erster {
+                hat_erster = true
+                erster_n = offs[2]
+                erster_d = offs[3]
+                erster_dl = lens[3]
+            }
+        }
+    }
+    if hat_erster {
+        rt.buf_clear(name)
+        rt.buf_push_bytes(name, p + erster_n as u64, 18)
+        rt.buf_clear(data)
+        rt.buf_push_bytes(data, p + erster_d as u64, erster_dl)
+        return true
+    }
+    return false
+}
+
 // ======================================================== DIE UMGEBUNG
 //
 // The environment is not reachable from `rt` -- that stood literally in
@@ -330,7 +1101,7 @@ fn env_hole(name: u64, nn: usize, out: *mut rt.Buf) -> bool {
 // ~/.Xauthority, the MIT-MAGIC-COOKIE-1 record. The file is a list of
 // big endian counted strings; the first cookie with the right name is
 // taken.
-fn read_auth(name: *mut rt.Buf, data: *mut rt.Buf) -> bool {
+fn read_auth(name: *mut rt.Buf, data: *mut rt.Buf, anzeige: usize) -> bool {
     var b: rt.Buf = rt.buf_new()
     var got: bool = false
     // First XAUTHORITY, then $HOME/.Xauthority, then /root -- the old
@@ -366,45 +1137,8 @@ fn read_auth(name: *mut rt.Buf, data: *mut rt.Buf) -> bool {
         rt.buf_free(&b)
         return false
     }
-    let p: u64 = b.ptr
-    let n: usize = b.len
-    var at: usize = 0
-    var found: bool = false
-    while at + 2 <= n {
-        at = at + 2
-        var i: usize = 0
-        var lens: [usize; 4] = [0; 4]
-        var offs: [usize; 4] = [0; 4]
-        var bad: bool = false
-        while i < 4 {
-            if at + 2 > n {
-                bad = true
-                break
-            }
-            let l: usize = ((rt.ld8(p, at) as usize) << 8)
-            | (rt.ld8(p, at + 1) as usize)
-            at = at + 2
-            offs[i] = at
-            lens[i] = l
-            at = at + l
-            if at > n {
-                bad = true
-                break
-            }
-            i = i + 1
-        }
-        if bad {
-            break
-        }
-        if lens[2] == 18 {
-            rt.buf_clear(name)
-            rt.buf_push_bytes(name, p + offs[2] as u64, lens[2])
-            rt.buf_clear(data)
-            rt.buf_push_bytes(data, p + offs[3] as u64, lens[3])
-            found = true
-            break
-        }
-    }
+    // F3: der Eintrag dieser Anzeige, sonst der erste (auth_pick).
+    let found: bool = auth_pick(b.ptr, b.len, anzeige, name, data)
     rt.buf_free(&b)
     return found
 }
@@ -481,35 +1215,12 @@ fn r_open(x: *mut Platte, anzeige: usize) -> bool {
     (*x).c = c
     var name: rt.Buf = rt.buf_new()
     var data: rt.Buf = rt.buf_new()
-    let have_auth: bool = read_auth(&name, &data)
+    let have_auth: bool = read_auth(&name, &data, display)
     var req: rt.Buf = rt.buf_new()
-    rt.buf_push(&req, 108 as u8) // 'l' -- kleinendisch
-    rt.buf_push(&req, 0 as u8)
-    put16(&req, 11 as u32)
-    put16(&req, 0 as u32)
     if have_auth {
-        put16(&req, name.len as u32)
-        put16(&req, data.len as u32)
+        req_setup(&req, name.ptr, name.len, data.ptr, data.len)
     } else {
-        put16(&req, 0 as u32)
-        put16(&req, 0 as u32)
-    }
-    put16(&req, 0 as u32)
-    if have_auth {
-        rt.buf_push_bytes(&req, name.ptr, name.len)
-        var q: usize = 0
-        let pn: usize = pad4(name.len)
-        while q < pn {
-            rt.buf_push(&req, 0 as u8)
-            q = q + 1
-        }
-        rt.buf_push_bytes(&req, data.ptr, data.len)
-        q = 0
-        let pd: usize = pad4(data.len)
-        while q < pd {
-            rt.buf_push(&req, 0 as u8)
-            q = q + 1
-        }
+        req_setup(&req, 0 as u64, 0, 0 as u64, 0)
     }
     let sent: bool = send(x, req.ptr, req.len)
     rt.buf_free(&req)
@@ -525,60 +1236,38 @@ fn r_open(x: *mut Platte, anzeige: usize) -> bool {
         return false
     }
     let base: u64 = (*x).rb.ptr + (*x).rpos as u64
-    let status: u8 = rt.ld8(base, 0)
     let extra: usize = (ld16le(base, 6) as usize) * 4
     if !want(x, 8 + extra) {
         (*x).fail = 4
         return false
     }
-    if status != 1 as u8 {
-        (*x).fail = 5 // abgelehnt -- fast immer die Berechtigung
+    var su: Setup = setup_new()
+    let grund: u32 = setup_parse((*x).rb.ptr + (*x).rpos as u64, 8 + extra,
+        &su)
+    if grund != 0 as u32 {
+        (*x).fail = grund // 5 abgelehnt, 6 kein 24-Bit-Visual (U1), 7 kurz
         (*x).open = false
         return false
     }
-    let b2: u64 = (*x).rb.ptr + (*x).rpos as u64
-    (*x).id_base = ld32le(b2, 12)
-    (*x).id_mask = ld32le(b2, 16)
-    let vendor_len: usize = ld16le(b2, 24) as usize
-    let nformats: usize = rt.ld8(b2, 29) as usize
-    var at: usize = 40 + vendor_len + pad4(vendor_len) + nformats * 8
-    (*x).root = ld32le(b2, at)
+    (*x).id_base = su.id_base
+    (*x).id_mask = su.id_mask
+    (*x).root = su.root
     // L4: the size of the screen, in pixels and in millimetres.
-    let s_px: usize = ld16le(b2, at + 20) as usize
-    let s_mm: usize = ld16le(b2, at + 24) as usize
+    let s_px: usize = su.s_px_w
+    let s_mm: usize = su.s_mm_w
     // RUNDE CERTUS-WIN4: die Startgroesse haengt am Schirm.
-    (*x).schirm_w = s_px
-    (*x).schirm_h = ld16le(b2, at + 22) as usize
-    (*x).depth = rt.ld8(b2, at + 38) as u32
-    let ndepths: usize = rt.ld8(b2, at + 39) as usize
-    var dat: usize = at + 40
-    var vis: u32 = 0
-    var vdepth: u32 = 0
-    var di: usize = 0
-    while di < ndepths {
-        let dep: u32 = rt.ld8(b2, dat) as u32
-        let nvis: usize = ld16le(b2, dat + 2) as usize
-        if dep == 24 as u32 && nvis > 0 {
-            vis = ld32le(b2, dat + 8)
-            vdepth = 24
-            break
-        }
-        dat = dat + 8 + nvis * 24
-        di = di + 1
-    }
-    if vis == 0 as u32 {
-        (*x).fail = 6 // U1: kein 24-Bit-Visual
-        (*x).open = false
-        return false
-    }
-    (*x).visual = vis
-    (*x).depth = vdepth
+    (*x).schirm_w = su.s_px_w
+    (*x).schirm_h = su.s_px_h
+    (*x).visual = su.visual
+    (*x).depth = su.depth
     (*x).next_id = 0
     (*x).rpos = (*x).rpos + 8 + extra
     // L3: the two atoms. Only here, because no resource base was fixed
     // before -- and still BEFORE the window, because afterwards events
     // could get between the replies.
     fetch_atoms(x)
+    // F1: die Belegung der Tastatur, ebenfalls VOR dem Fenster.
+    fetch_keymap(x, su.kmin, su.kmax)
     // L4: die Bildpunktdichte.
     (*x).dpi = dpi_bestimmen(x, s_px, s_mm)
     // L5: light or dark.
@@ -596,17 +1285,7 @@ fn fetch_atoms(x: *mut Platte) {
 
 fn atom_von(x: *mut Platte, p: u64, n: usize) -> u32 {
     var r: rt.Buf = rt.buf_new()
-    rt.buf_push(&r, 16 as u8) // InternAtom
-    rt.buf_push(&r, 0 as u8) // only-if-exists = nein
-    put16(&r, (2 + (n + pad4(n)) / 4) as u32)
-    put16(&r, n as u32)
-    put16(&r, 0 as u32)
-    rt.buf_push_bytes(&r, p, n)
-    var q: usize = 0
-    while q < pad4(n) {
-        rt.buf_push(&r, 0 as u8)
-        q = q + 1
-    }
+    req_intern_atom(&r, p, n)
     let ok: bool = send(x, r.ptr, r.len)
     rt.buf_free(&r)
     if !ok {
@@ -632,6 +1311,59 @@ fn atom_von(x: *mut Platte, p: u64, n: usize) -> u32 {
     return atom
 }
 
+// Eine Anfrage schicken und ihre GANZE Antwort abwarten. Nur fuer die
+// Zeit vor dem Fenster: dann kommen noch keine Ereignisse dazwischen.
+// Zurueck: die Stelle der Antwort im Empfangspuffer und ihre Laenge
+// (0 = Fehler oder keine Antwort); `rpos` steht danach HINTER ihr.
+fn frage(x: *mut Platte, r: *mut rt.Buf, at: *mut usize) -> usize {
+    if !send(x, (*r).ptr, (*r).len) {
+        return 0
+    }
+    if !want(x, 32) {
+        return 0
+    }
+    let b: u64 = (*x).rb.ptr + (*x).rpos as u64
+    var extra: usize = 0
+    if rt.ld8(b, 0) == 1 as u8 {
+        extra = (ld32le(b, 4) as usize) * 4
+        if !want(x, 32 + extra) {
+            return 0
+        }
+    }
+    *at = (*x).rpos
+    (*x).rpos = (*x).rpos + 32 + extra
+    if rt.ld8((*x).rb.ptr + (*at) as u64, 0) != 1 as u8 {
+        return 0
+    }
+    return 32 + extra
+}
+
+// F1 -- GetKeyboardMapping und GetModifierMapping. Scheitert eine der
+// beiden, bleibt die Belegung leer, und `decode_event` nimmt den alten
+// Weg (key_ascii) -- ein Fenster ohne Tastatur waere schlimmer als eines
+// mit US-Tastatur.
+fn fetch_keymap(x: *mut Platte, kmin: u32, kmax: u32) {
+    if kmax < kmin || kmin == 0 as u32 {
+        return
+    }
+    var r: rt.Buf = rt.buf_new()
+    req_get_keyboard_mapping(&r, kmin, kmax - kmin + 1 as u32)
+    var at: usize = 0
+    let n: usize = frage(x, &r, &at)
+    if n > 0 {
+        let ok: bool = keymap_from_reply(&(*x).km, (*x).rb.ptr + at as u64,
+            n, kmin)
+    }
+    rt.buf_clear(&r)
+    req_get_modifier_mapping(&r)
+    let m: usize = frage(x, &r, &at)
+    if m > 0 && keymap_ok(&(*x).km) {
+        let ok2: bool = keymap_mods_from_reply(&(*x).km,
+            (*x).rb.ptr + at as u64, m)
+    }
+    rt.buf_free(&r)
+}
+
 // L4 -- die Bildpunktdichte.
 //
 // Order: CERTUS_DPI (manual switch, also for the acceptance run), then
@@ -653,12 +1385,10 @@ fn dpi_bestimmen(x: *mut Platte, s_px: usize, s_mm: usize) -> usize {
     if d >= 48 && d <= 480 {
         return d
     }
-    if s_mm > 0 && s_px > 0 {
-        // 1 inch = 25.4 mm; computed as integers and rounded.
-        d = (s_px * 254 + s_mm * 5) / (s_mm * 10)
-        if d >= 48 && d <= 480 {
-            return d
-        }
+    // 1 inch = 25.4 mm; computed as integers and rounded.
+    d = dpi_from_mm(s_px, s_mm)
+    if d >= 48 && d <= 480 {
+        return d
     }
     return 96
 }
@@ -687,65 +1417,16 @@ fn number_from(p: u64, von: usize, bis: usize) -> usize {
 // Its content is the X resource database as text.
 fn xft_dpi(x: *mut Platte) -> usize {
     var r: rt.Buf = rt.buf_new()
-    rt.buf_push(&r, 20 as u8) // GetProperty
-    rt.buf_push(&r, 0 as u8) // delete = nein
-    put16(&r, 6 as u32)
-    put32(&r, (*x).root)
-    put32(&r, 23 as u32) // RESOURCE_MANAGER
-    put32(&r, 0 as u32) // AnyPropertyType
-    put32(&r, 0 as u32) // long-offset
-    put32(&r, 16384 as u32) // long-length, in 4-Oktett-Einheiten
-    let ok: bool = send(x, r.ptr, r.len)
+    // RESOURCE_MANAGER (23), AnyPropertyType, bis 64 KB Text.
+    req_get_property(&r, (*x).root, 23 as u32, 0 as u32, 0 as u32,
+        16384 as u32)
+    var at: usize = 0
+    let n: usize = frage(x, &r, &at)
     rt.buf_free(&r)
-    if !ok {
+    if n == 0 {
         return 0
     }
-    if !want(x, 32) {
-        return 0
-    }
-    let b: u64 = (*x).rb.ptr + (*x).rpos as u64
-    let code: u8 = rt.ld8(b, 0)
-    if code != 1 as u8 {
-        (*x).rpos = (*x).rpos + 32
-        return 0
-    }
-    let extra: usize = (ld32le(b, 4) as usize) * 4
-    if !want(x, 32 + extra) {
-        return 0
-    }
-    let b2: u64 = (*x).rb.ptr + (*x).rpos as u64
-    let fmt: usize = rt.ld8(b2, 1) as usize
-    let nitems: usize = ld32le(b2, 16) as usize
-    var bytes: usize = 0
-    if fmt == 8 {
-        bytes = nitems
-    }
-    if bytes > extra {
-        bytes = extra
-    }
-    var d: usize = 0
-    if bytes > 0 {
-        var lit: [u8; 8] = "Xft.dpi:"
-        let txt: u64 = b2 + 32 as u64
-        var i: usize = 0
-        while i + 8 <= bytes {
-            var gleich: bool = true
-            var j: usize = 0
-            while j < 8 {
-                if rt.ld8(txt, i + j) != lit[j] {
-                    gleich = false
-                }
-                j = j + 1
-            }
-            if gleich {
-                d = number_from(txt, i + 8, bytes)
-                i = bytes
-            }
-            i = i + 1
-        }
-    }
-    (*x).rpos = (*x).rpos + 32 + extra
-    return d
+    return resman_dpi((*x).rb.ptr + at as u64, n)
 }
 
 // L5 -- light or dark, without a registry and without D-Bus.
@@ -885,30 +1566,18 @@ fn r_make(x: *mut Platte, w: usize, h: usize) -> bool {
     (*x).w = w
     (*x).h = h
     var r: rt.Buf = rt.buf_new()
-    rt.buf_push(&r, 1 as u8) // CreateWindow
-    rt.buf_push(&r, (*x).depth as u8)
-    put16(&r, 10 as u32)
-    put32(&r, (*x).win)
-    put32(&r, (*x).root)
-    put16(&r, 0 as u32)
-    put16(&r, 0 as u32)
-    put16(&r, w as u32)
-    put16(&r, h as u32)
-    put16(&r, 0 as u32)
-    put16(&r, 1 as u32) // InputOutput
-    put32(&r, (*x).visual)
-    put32(&r, 2050 as u32) // background-pixel | event-mask
-    put32(&r, 16777215 as u32)
     // Exposure(32768) | KeyPress(1) | ButtonPress(4) |
-    // PointerMotion(64, L1) | StructureNotify(131072)
-    put32(&r, 32768 as u32 | 1 as u32 | 4 as u32 | 64 as u32
-        | 131072 as u32)
-    rt.buf_push(&r, 55 as u8) // CreateGC
-    rt.buf_push(&r, 0 as u8)
-    put16(&r, 4 as u32)
-    put32(&r, (*x).gc)
-    put32(&r, (*x).win)
-    put32(&r, 0 as u32)
+    // PointerMotion(64, L1) | StructureNotify(131072); F2 dazu
+    // KeyRelease(2) | ButtonRelease(8) | EnterWindow(16) |
+    // LeaveWindow(32).
+    var maske: u32 = 32768 as u32 | 1 as u32 | 4 as u32 | 64 as u32
+    | 131072 as u32
+    if (*x).voll {
+        maske = maske | 2 as u32 | 8 as u32 | 16 as u32 | 32 as u32
+    }
+    req_create_window(&r, (*x).win, (*x).root, (*x).depth, (*x).visual,
+        w, h, 16777215 as u32, maske)
+    req_create_gc(&r, (*x).gc, (*x).win)
     var ok: bool = send(x, r.ptr, r.len)
     rt.buf_free(&r)
     if !ok {
@@ -918,18 +1587,10 @@ fn r_make(x: *mut Platte, w: usize, h: usize) -> bool {
     // window manager kills the process instead of asking it.
     if (*x).a_protocols != 0 as u32 && (*x).a_delete != 0 as u32 {
         var q: rt.Buf = rt.buf_new()
-        rt.buf_push(&q, 18 as u8) // ChangeProperty
-        rt.buf_push(&q, 0 as u8) // Replace
-        put16(&q, 7 as u32)
-        put32(&q, (*x).win)
-        put32(&q, (*x).a_protocols)
-        put32(&q, 4 as u32) // ATOM
-        rt.buf_push(&q, 32 as u8)
-        rt.buf_push(&q, 0 as u8)
-        rt.buf_push(&q, 0 as u8)
-        rt.buf_push(&q, 0 as u8)
-        put32(&q, 1 as u32)
-        put32(&q, (*x).a_delete)
+        var del: [u32; 1] = [(*x).a_delete; 1]
+        // ChangeProperty WM_PROTOCOLS, Typ ATOM (4), Format 32, ein Atom.
+        req_change_property(&q, (*x).win, (*x).a_protocols, 4 as u32,
+            32 as u32, (&del[0]) as u64, 4)
         ok = send(x, q.ptr, q.len)
         rt.buf_free(&q)
     }
@@ -941,23 +1602,8 @@ fn r_make(x: *mut Platte, w: usize, h: usize) -> bool {
 
 fn r_title(x: *mut Platte, p: u64, n: usize) -> bool {
     var r: rt.Buf = rt.buf_new()
-    rt.buf_push(&r, 18 as u8) // ChangeProperty
-    rt.buf_push(&r, 0 as u8)
-    put16(&r, (6 + (n + pad4(n)) / 4) as u32)
-    put32(&r, (*x).win)
-    put32(&r, 39 as u32) // WM_NAME
-    put32(&r, 31 as u32) // STRING
-    rt.buf_push(&r, 8 as u8)
-    rt.buf_push(&r, 0 as u8)
-    rt.buf_push(&r, 0 as u8)
-    rt.buf_push(&r, 0 as u8)
-    put32(&r, n as u32)
-    rt.buf_push_bytes(&r, p, n)
-    var q: usize = 0
-    while q < pad4(n) {
-        rt.buf_push(&r, 0 as u8)
-        q = q + 1
-    }
+    // WM_NAME (39), Typ STRING (31), Format 8.
+    req_change_property(&r, (*x).win, 39 as u32, 31 as u32, 8 as u32, p, n)
     let ok: bool = send(x, r.ptr, r.len)
     rt.buf_free(&r)
     return ok
@@ -965,10 +1611,7 @@ fn r_title(x: *mut Platte, p: u64, n: usize) -> bool {
 
 fn r_show(x: *mut Platte) -> bool {
     var r: rt.Buf = rt.buf_new()
-    rt.buf_push(&r, 8 as u8) // MapWindow
-    rt.buf_push(&r, 0 as u8)
-    put16(&r, 2 as u32)
-    put32(&r, (*x).win)
+    req_map_window(&r, (*x).win)
     let ok: bool = send(x, r.ptr, r.len)
     rt.buf_free(&r)
     if !ok {
@@ -1062,19 +1705,8 @@ fn r_image(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
         }
         rt.buf_clear(&r)
         let bytes: usize = band * per_row
-        rt.buf_push(&r, 72 as u8) // PutImage
-        rt.buf_push(&r, 2 as u8) // ZPixmap
-        put16(&r, (6 + bytes / 4) as u32)
-        put32(&r, (*x).win)
-        put32(&r, (*x).gc)
-        put16(&r, w as u32)
-        put16(&r, band as u32)
-        put16(&r, dx as u32)
-        put16(&r, (dy + y) as u32)
-        rt.buf_push(&r, 0 as u8)
-        rt.buf_push(&r, (*x).depth as u8)
-        rt.buf_push(&r, 0 as u8)
-        rt.buf_push(&r, 0 as u8)
+        req_put_image_head(&r, (*x).win, (*x).gc, w, band, dx, dy + y,
+            (*x).depth, bytes)
         rt.buf_push_bytes(&r, px + (y * per_row) as u64, bytes)
         if !send(x, r.ptr, r.len) {
             rt.buf_free(&r)
@@ -1458,68 +2090,18 @@ fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
             consume = 32 + extra
         }
         (*x).rpos = (*x).rpos + consume
-        *a = 0 as u32
-        *ox = 0 as u32
-        *oy = 0 as u32
-        *os = 0 as u32
-        if code == 12 as u8 { // Expose
-            *k = window.EV_EXPOSE
-            return true
-        }
-        if code == 2 as u8 { // KeyPress
+        if code == 2 as u8 || code == 4 as u8 {
             // RUNDE C-040: diese Eingabe ist jetzt heraus -- der
             // Vorrang fuer sie ist erledigt.
             ein_weg(x)
-            let kc: u32 = rt.ld8(p, 1) as u32
-            let st: u32 = ld16le(p, 28)
-            *os = st
-            // L2: as under Windows -- keys with meaning as EV_KEY,
-            // printable characters as EV_CHAR.
-            if is_key(kc) {
-                *a = kc
-                *k = window.EV_KEY
-                return true
-            }
-            let ch: u32 = key_ascii(kc, (st & 1 as u32) != 0 as u32)
-            if ch != 0 as u32 {
-                *a = ch
-                *k = window.EV_CHAR
-                return true
-            }
-            // A key that has neither meaning nor character: as EV_KEY
-            // with its number, so that nothing disappears.
-            *a = kc
-            *k = window.EV_KEY
-            return true
         }
-        if code == 4 as u8 { // ButtonPress
-            ein_weg(x)
-            *a = rt.ld8(p, 1) as u32
-            *ox = ld16le(p, 24)
-            *oy = ld16le(p, 26)
-            *os = ld16le(p, 28)
-            *k = window.EV_BUTTON
-            return true
-        }
-        if code == 6 as u8 { // MotionNotify (L1)
-            *ox = ld16le(p, 24)
-            *oy = ld16le(p, 26)
-            *os = ld16le(p, 28)
-            *k = window.EV_MOTION
-            return true
-        }
-        if code == 22 as u8 { // ConfigureNotify
-            let nw: u32 = ld16le(p, 20)
-            let nh: u32 = ld16le(p, 22)
-            *ox = nw
-            *oy = nh
-            *k = window.EV_CONFIGURE
-            return true
-        }
-        if code == 33 as u8 { // ClientMessage (L3)
-            let atom: u32 = ld32le(p, 12)
-            if atom == (*x).a_delete && (*x).a_delete != 0 as u32 {
-                *k = window.EV_CLOSED
+        // `want` kann den Puffer eben verlegt haben -- die Stelle wird
+        // darum NEU bestimmt und nicht aus `p` von oben genommen.
+        // Antworten (1) und Fehler (0) sind keine Ereignisse.
+        if code != 1 as u8 && code != 0 as u8 {
+            let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
+            if decode_event(q, (*x).a_delete, &(*x).km, (*x).voll, k, a,
+                ox, oy, os) {
                 return true
             }
         }
