@@ -270,6 +270,21 @@ build editor
 "$W/editor"
 
 echo
+echo "== 18a. DIE EINGABEMETHODE: CHINESISCH, JAPANISCH, KOREANISCH =="
+# lib/fui/ime.fi mit seinem Anschluss an editor.fi. Nachgerechnet
+# werden Romaji nach Kana (Doppelkonsonant, n-Regel, tch), die
+# Hangul-Silben nach Unicode Kapitel 3.12 (zusammensetzen UND zerlegen,
+# jede Zahl steht ausgerechnet daneben), der wandernde Auslaut, der
+# Vorbearbeitungstext mit dem Schreibzeiger davor und dahinter, die
+# Auswahl, die erst beim Bestaetigen ersetzt wird und beim Abbrechen
+# wiederkommt, die Kandidaten, Pinyin gegen die mitgelieferte Tabelle
+# und die Plattform-Schnittstelle ueber eine nachgeahmte Plattform.
+# Das Bild dazu (Feld mit offener Kandidatenliste) entsteht unten bei
+# --images mit tools/fui/imebeleg_main.fi.
+build ime
+"$W/ime"
+
+echo
 echo "== 18b. DER SCHEIBENKASTEN =="
 # lib/fui/viewport.fi: der Ausschnitt, der mehr Inhalt aufnimmt, als er
 # hoch ist. Nachgerechnet werden die Rechnung ueber Kreuz (ein
@@ -896,6 +911,31 @@ if [ "$1" = "--images" ]; then
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     beleg "$Z/fui-demo-hell.png" 1000 350 500 200 40 0
     beleg "$Z/fui-demo-dunkel.png" 1000 350 500 200 40 0
+    # DIE EINGABEMETHODE (Runde IME, 23.09.2026). Vier Felder mitten in
+    # einer Eingabe -- Japanisch mit offener Liste, Koreanisch mit der
+    # Silbe im Bau, Chinesisch mit der Liste fuer zhong, und eine
+    # Auswahl, die bis zum Bestaetigen stehen bleibt. Dafuer braucht es
+    # eine Schrift mit CJK-GLYPHEN in TrueType-Umrissen; DejaVu hat
+    # keine, und ein Beleg aus leeren Kaesten belegt nichts. Fehlt sie,
+    # ist der Lauf NICHT bestanden -- dieselbe Regel wie bei $SCHRIFT.
+    # (Noto Sans CJK taugt nicht: CFF-Umrisse, die lib/font/ttf.fi
+    # benannt ablehnt.) Das Programm prueft selbst, dass jedes gezeigte
+    # Zeichen eine Glyphe hat, dass nichts ueberlappt und nichts aus
+    # seinem Kasten laeuft, und schreibt sonst kein PNG.
+    SCHRIFT_CJK="${SCHRIFT_CJK:-/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc}"
+    if [ ! -r "$SCHRIFT_CJK" ]; then
+        echo "  FEHLER: die CJK-Schrift \"$SCHRIFT_CJK\" ist nicht lesbar."
+        echo "  Ohne CJK-Glyphen zeigt der IME-Beleg leere Kaesten. Installiere"
+        echo "  fonts-wqy-zenhei oder setze SCHRIFT_CJK auf eine TrueType-Datei"
+        echo "  (glyf-Umrisse) mit Kana, Hangul und Hanzi."
+        exit 1
+    fi
+    build imebeleg
+    kette imebeleg 1000
+    "$W/imebeleg" "$Z/fui-ime-hell.png" light "$SCHRIFT_CJK"
+    "$W/imebeleg" "$Z/fui-ime-dunkel.png" dark "$SCHRIFT_CJK"
+    beleg "$Z/fui-ime-hell.png" 1000 400 485 200 40 1
+    beleg "$Z/fui-ime-dunkel.png" 1000 400 485 200 40 1
     ls -la "$Z"
 fi
 

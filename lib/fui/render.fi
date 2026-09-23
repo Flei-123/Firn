@@ -37,6 +37,7 @@ import fui.uiimage
 import fui.uisvg
 import fui.effect
 import fui.transform
+import fui.textbuf
 
 export {
     Ctx, ctx_new, ctx_theme, ctx_painter,
@@ -54,6 +55,8 @@ export {
     art_text_split, draw_widget_art, pady_of,
     art_tint_of, draw_art_xf, draw_widget_art_xf,
     pref_of, set_pref_from,
+    FieldMess, field_mess_new, field_mess, field_px, field_text_x0,
+    field_x_of, field_caret_x, field_line, field_underline, draw_field,
 }
 
 // What is needed for painting: the theme (Colors, Shape, scale) and the
@@ -1382,4 +1385,255 @@ fn draw_widget(c: *mut Ctx, e: *mut widget.Widget) {
     // Button, toggle, tile ... they all paint the same base. What
     // tells them apart are the widget defaults.
     draw_button(c, e)
+}
+// ======================================================================
+// DAS TEXTFELD AUS SEINEM PUFFER
+// ======================================================================
+//
+// Bis hierher malte ein Textfeld (widget.KIND_TEXTBOX) den festen Text
+// seines Widgets -- es gab keinen Weg, den Puffer aus lib/fui/textbuf.fi
+// mit Schreibzeiger, Auswahl und Vorbearbeitungstext zu zeigen. Das
+// steht jetzt hier, weil hier gemessen und gemalt wird, und zwar mit
+// DERSELBEN Schrift, demselben Lauf (`text_run_of`) und denselben
+// Innenabstaenden wie jedes andere Widget. Ein Feld, das mit einer
+// anderen Rechnung misst, als es malt, setzt den Schreibzeiger neben den
+// Buchstaben, hinter dem er stehen soll.
+//
+// DER VORBEARBEITUNGSTEXT (textbuf `comp_a..comp_b`, siehe den Kopf von
+// lib/fui/ime.fi) ist UNTERSTRICHEN, in der Schriftfarbe des Feldes und
+// in der Strichstaerke des Randes (theme.Shape.border_w). Keine eigene
+// Farbe: so zeichnen ihn Windows, macOS und GTK, und eine zweite
+// Farbtabelle fuer eine Linie waere genau die Drift, gegen die diese
+// Bibliothek steht.
+//
+// WAS DIESE FUNKTION NICHT WEISS: welche Taste gedrueckt wurde (editor.fi)
+// und ob gerade eine Eingabe laeuft (ime.fi). Sie malt, was im Puffer
+// steht, und die Auswahl, die eine Eingabe beim Bestaetigen ersetzen
+// wird, bekommt sie als zwei Zahlen (`keep_a`, `keep_b`) -- so muss
+// render.fi die Eingabemethode nicht kennen.
+
+// Der Messer fuer textbuf.tb_x_of / tb_caret_from_x und
+// editor.editor_scroll_to_caret: die Rueckruf-Form `mess(ctx, p, n)`.
+// `ctx` zeigt auf eine FieldMess; sie haelt, womit gemessen wird.
+struct FieldMess {
+    c: u64,   // *mut Ctx
+    e: u64,   // *mut widget.Widget
+}
+
+fn field_mess_new(c: *mut Ctx, e: *mut widget.Widget) -> FieldMess {
+    return FieldMess { c: c as u64, e: e as u64 }
+}
+
+fn field_mess(ctx: u64, p: u64, n: usize) -> f64 {
+    let fm: *mut FieldMess = ctx as *mut FieldMess
+    let c: *mut Ctx = (*fm).c as *mut Ctx
+    let e: *mut widget.Widget = (*fm).e as *mut widget.Widget
+    var r: painter.TextRun = text_run_of(c, e, field_px(c, e))
+    return painter.run_width(ctx_painter(c), &r, p, n)
+}
+
+// Die Schriftgroesse des Feldes in Pixeln -- dieselbe Aufloesung wie in
+// `draw_text`.
+fn field_px(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    return len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+}
+
+// Wo der Text beginnt: linker Rand plus Innenabstand.
+fn field_text_x0(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, widget.w_kind(e))))
+    return widget.w_x(e) + padx
+}
+
+// Die Breite der ersten i Bytes, ab Textanfang und OHNE Verschiebung.
+fn field_x_of(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    i: usize) -> f64 {
+    var fm: FieldMess = field_mess_new(c, e)
+    return textbuf.tb_x_of(t, i, field_mess, (&fm) as u64)
+}
+
+// Der Schreibzeiger auf dem Schirm. Das braucht die Plattform fuer ihr
+// Kandidatenfenster (editor.editor_ime_spot) und lib/fui/imelist.fi fuer
+// die eigene Liste.
+fn field_caret_x(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    scroll: f64) -> f64 {
+    return field_text_x0(c, e) + field_x_of(c, e, t, textbuf.tb_caret(t)) - scroll
+}
+
+// Die Zeile, in der Schreibzeiger und Auswahl stehen: von der Oberlaenge
+// bis zur Unterlaenge der Schrift, um dieselbe Grundlinie wie der Text.
+fn field_line(c: *mut Ctx, e: *mut widget.Widget, top: *mut f64,
+    h: *mut f64) -> f64 {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let px: f64 = field_px(c, e)
+    let by: f64 = painter.text_baseline_mid(z, widget.w_y(e), widget.w_h(e), px)
+    let a: f64 = painter.font_ascent(z, px)
+    let d: f64 = painter.font_descent(z, px)
+    *top = ((by - a) as i64) as f64
+    *h = ((a + d + 0.5) as i64) as f64
+    return by
+}
+
+// Die Unterstreichung des Vorbearbeitungstextes als Rechteck -- eine
+// Funktion und keine Rechnung in `draw_field`, damit ein Pruefprogramm
+// dieselbe Zahl nachmessen kann, die gemalt wird. false: es gibt keinen
+// Vorbearbeitungstext.
+fn field_underline(c: *mut Ctx, e: *mut widget.Widget,
+    t: *mut textbuf.TextBuf, scroll: f64, x: *mut f64, y: *mut f64,
+    w: *mut f64, h: *mut f64) -> bool {
+    if !textbuf.tb_has_comp(t) {
+        return false
+    }
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    var st: f64 = len_of(c, (*fo).border_w)
+    if st < 1.0 {
+        st = 1.0
+    }
+    var top: f64 = 0.0
+    var lh: f64 = 0.0
+    let by: f64 = field_line(c, e, &top, &lh)
+    let x0: f64 = field_text_x0(c, e)
+    let xa: f64 = x0 + field_x_of(c, e, t, textbuf.tb_comp_a(t)) - scroll
+    let xb: f64 = x0 + field_x_of(c, e, t, textbuf.tb_comp_b(t)) - scroll
+    // Zwei Punkte unter der Grundlinie: tief genug, dass die Linie keinen
+    // Buchstaben schneidet, der auf der Grundlinie steht, und hoch genug,
+    // dass sie im Feld bleibt.
+    *x = xa
+    *y = by + len_of(c, 2)
+    *w = xb - xa
+    *h = st
+    return true
+}
+
+// Ein Stueck Text [a, b) ab der Stelle, an der es im Feld steht, und nur
+// so weit, wie das Feld reicht.
+fn field_piece(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    r: *mut painter.TextRun, a: usize, b: usize, scroll: f64, by: f64,
+    rechts: f64, col: u32) {
+    if b <= a {
+        return
+    }
+    let x: f64 = field_text_x0(c, e) + field_x_of(c, e, t, a) - scroll
+    if x >= rechts {
+        return
+    }
+    let f: f64 = painter.run_draw(ctx_painter(c), r, x, by, rechts - x, col,
+        textbuf.tb_ptr(t) + a as u64, b - a, painter.TEXT_L)
+}
+
+// Eine Markierung [a, b) als Flaeche in der Zeile, auf das Feld begrenzt.
+fn field_mark(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    a: usize, b: usize, scroll: f64, top: f64, lh: f64, links: f64,
+    rechts: f64, col: u32) {
+    if b <= a {
+        return
+    }
+    let x0: f64 = field_text_x0(c, e)
+    var xa: f64 = x0 + field_x_of(c, e, t, a) - scroll
+    var xb: f64 = x0 + field_x_of(c, e, t, b) - scroll
+    if xa < links {
+        xa = links
+    }
+    if xb > rechts {
+        xb = rechts
+    }
+    if xb > xa {
+        painter.surface(ctx_painter(c), xa, top, xb - xa, lh, col)
+    }
+}
+
+// DAS FELD. `scroll` kommt aus editor.editor_scroll, `caret_on` aus
+// editor.editor_caret_tick. `keep_a..keep_b` ist die Auswahl, die eine
+// laufende Eingabe beim Bestaetigen ersetzen wird (ime.ime_repl_a/b) --
+// sie bleibt sichtbar markiert, damit man sieht, was gleich verschwindet.
+fn draw_field(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    scroll: f64, caret_on: bool, keep_a: usize, keep_b: usize) {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+    draw_base(c, e)
+
+    var fallback: u32 = def_fg(kind)
+    if zu == style.STATE_DISABLED {
+        fallback = style.color_token(style.TOK_TEXT_DISABLED)
+    }
+    let fg: u32 = color_of(c, style.resolve_fg(sz, zu, fallback))
+    let sel_bg: u32 = color_of(c, style.color_token(style.TOK_SELECTION))
+    let sel_fg: u32 = color_of(c, style.color_token(style.TOK_SELECTION_TEXT))
+    let px: f64 = field_px(c, e)
+    var r: painter.TextRun = text_run_of(c, e, px)
+    let x0: f64 = field_text_x0(c, e)
+    let rechts: f64 = widget.w_x(e) + widget.w_w(e) - (x0 - widget.w_x(e))
+    var top: f64 = 0.0
+    var lh: f64 = 0.0
+    let by: f64 = field_line(c, e, &top, &lh)
+
+    // ---- 1. DIE MARKIERUNGEN, unter dem Text.
+    let sa: usize = textbuf.tb_sel_a(t)
+    let sb: usize = textbuf.tb_sel_b(t)
+    field_mark(c, e, t, sa, sb, scroll, top, lh, x0, rechts, sel_bg)
+    field_mark(c, e, t, keep_a, keep_b, scroll, top, lh, x0, rechts, sel_bg)
+
+    // ---- 2. DER TEXT. Wo die Verschiebung ein Zeichen links anschneidet,
+    // beginnt das Malen erst beim ersten GANZ sichtbaren -- ein halber
+    // Buchstabe am linken Rand liest sich wie ein anderer.
+    let n: usize = textbuf.tb_len(t)
+    var ab: usize = 0
+    while ab < n && field_x_of(c, e, t, ab) < scroll {
+        ab = textbuf.tb_next(t, ab)
+    }
+    // Die markierten Stuecke in der Markierungsschrift, der Rest in der
+    // Feldschrift. Die Grenzen sind die der Auswahl ODER der gemerkten
+    // Auswahl -- es gibt nie beide zugleich (eine Eingabe hebt die
+    // Auswahl des Puffers auf und merkt sie sich).
+    var ma: usize = sa
+    var mb: usize = sb
+    if keep_b > keep_a {
+        ma = keep_a
+        mb = keep_b
+    }
+    if ma < ab {
+        ma = ab
+    }
+    if mb < ma {
+        mb = ma
+    }
+    field_piece(c, e, t, &r, ab, ma, scroll, by, rechts, fg)
+    field_piece(c, e, t, &r, ma, mb, scroll, by, rechts, sel_fg)
+    field_piece(c, e, t, &r, mb, n, scroll, by, rechts, fg)
+
+    // ---- 3. DER VORBEARBEITUNGSTEXT: unterstrichen.
+    var ux: f64 = 0.0
+    var uy: f64 = 0.0
+    var uw: f64 = 0.0
+    var uh: f64 = 0.0
+    if field_underline(c, e, t, scroll, &ux, &uy, &uw, &uh) {
+        var ua: f64 = ux
+        var ue: f64 = ux + uw
+        if ua < x0 {
+            ua = x0
+        }
+        if ue > rechts {
+            ue = rechts
+        }
+        if ue > ua {
+            painter.surface(z, ua, uy, ue - ua, uh, fg)
+        }
+    }
+
+    // ---- 4. DER SCHREIBZEIGER, mitten in einer Eingabe an seiner Stelle
+    // IM Vorbearbeitungstext.
+    if caret_on && widget.w_is_focus(e) {
+        let cx: f64 = field_caret_x(c, e, t, scroll)
+        if cx >= x0 - 1.0 && cx <= rechts + 1.0 {
+            painter.caret_bar(z, cx, top, lh, len_of(c, 1), fg)
+        }
+    }
+    draw_focus_ring(c, e)
 }
