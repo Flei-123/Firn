@@ -104,14 +104,14 @@ pub const ATTRS: &[AttrInfo] = &[
         target: Target::Func,
         args: 0,
         implemented: true,
-        what: "bette diese Funktion an der Aufrufstelle ein, auch ueber der Groessengrenze (RUNDE EINBETTEN)",
+        what: "inline this function at every call site, even above the size limit (round EINBETTEN)",
     },
     AttrInfo {
         name: "no_inline",
         target: Target::Func,
         args: 0,
         implemented: true,
-        what: "bette diese Funktion NIE ein -- der Rahmen bleibt sichtbar (RUNDE EINBETTEN)",
+        what: "never inline this function -- its frame stays visible (round EINBETTEN)",
     },
     AttrInfo {
         name: "allow_escape",

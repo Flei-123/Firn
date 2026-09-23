@@ -196,15 +196,15 @@ pub const PASSES: &[PassInfo] = &[
         debug_preserving: false,
         what: "inline calls (size heuristic) — makes the call stack unreadable",
     },
-    // RUNDE EINBETTEN: der ausdrueckliche Wunsch, auf JEDER Stufe ausser
-    // `dev`. Debug-erhaltend ist er in dem Sinn, dass NUR angefasst wird,
-    // was der Programmierer selbst mit `#[inline]` ausgezeichnet hat -- wer
-    // die Marke setzt, weiss, dass der Rahmen verschwindet.
+    // Round EINBETTEN: the explicit request, on EVERY level except `dev`.
+    // It is debug preserving in the sense that it touches ONLY what the
+    // programmer marked with `#[inline]` -- whoever sets the mark knows
+    // that the frame disappears.
     PassInfo {
-        name: "inline-verlangt",
+        name: "inline-requested",
         scope: Scope::Module,
         debug_preserving: true,
-        what: "#[inline]: nur die ausdruecklich verlangten Einbauten (RUNDE EINBETTEN)",
+        what: "#[inline]: only the explicitly requested inlinings (round EINBETTEN)",
     },
 ];
 
@@ -355,15 +355,15 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     for f in m.funcs.iter_mut() {
         optimize_func(f, &mut st, cfg, &mut clk);
     }
-    // RUNDE EINBETTEN -- zuerst der ausdrueckliche Wille. Er gilt auf jeder
-    // Stufe; die Groessenregel darunter nur bei `release-*`. Laufen beide,
-    // findet der zweite Durchgang die verlangten Stellen schon erledigt vor.
-    if cfg.runs("inline-verlangt") && !cfg.runs("inline") {
+    // Round EINBETTEN -- the explicit will first. It holds on every level;
+    // the size rule below only on `release-*`. If both run, the second pass
+    // finds the requested sites already done.
+    if cfg.runs("inline-requested") && !cfg.runs("inline") {
         let t = std::time::Instant::now();
-        st.inlined += crate::inline::inline_module_nur_verlangt(m);
-        clk.add("inline-verlangt", t);
+        st.inlined += crate::inline::inline_module_requested_only(m);
+        clk.add("inline-requested", t);
         for f in m.funcs.iter() {
-            phi_check(f, "inline-verlangt");
+            phi_check(f, "inline-requested");
         }
         for f in m.funcs.iter_mut() {
             optimize_func(f, &mut st, cfg, &mut clk);

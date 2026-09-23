@@ -710,13 +710,13 @@ pub(crate) fn has_interrupt(f: &crate::ast::FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "interrupt")
 }
 
-/// RUNDE EINBETTEN: `#[inline]` / `#[no_inline]` aus der Quelle lesen.
-/// Beides zugleich ist ein Widerspruch; `sema` meldet ihn (siehe
-/// `check_inline_hints`), hier gewinnt das Verbot -- die sichere Seite.
+/// Round EINBETTEN: read `#[inline]` / `#[no_inline]` from the source.
+/// Both at once is a contradiction; the prohibition wins here -- the safe
+/// side.
 pub(crate) fn inline_hint(f: &crate::ast::FnDecl) -> Option<bool> {
-    let ja = f.attrs.iter().any(|a| a.name == "inline");
-    let nein = f.attrs.iter().any(|a| a.name == "no_inline");
-    match (ja, nein) {
+    let yes = f.attrs.iter().any(|a| a.name == "inline");
+    let no = f.attrs.iter().any(|a| a.name == "no_inline");
+    match (yes, no) {
         (_, true) => Some(false),
         (true, false) => Some(true),
         (false, false) => None,

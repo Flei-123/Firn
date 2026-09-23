@@ -2057,7 +2057,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     // HOOK kern: `#[interrupt]` — its own calling convention in the code
     // generator (core.rs/codegen_x86.rs, round 52).
     f.interrupt = crate::core::has_interrupt(d);
-    // HOOK einbetten: `#[inline]` / `#[no_inline]` (RUNDE EINBETTEN).
+    // HOOK inline: `#[inline]` / `#[no_inline]` (round EINBETTEN).
     f.inline_hint = crate::core::inline_hint(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {

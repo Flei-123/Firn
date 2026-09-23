@@ -694,18 +694,17 @@ pub struct Func {
     /// generator rescues ALL general purpose registers and closes with `iretq`
     /// rather than `ret` (SPEC §2, kernel profile).
     pub interrupt: bool,
-    /// **RUNDE EINBETTEN** -- `#[inline]` / `#[no_inline]`, der ausdrueckliche
-    /// Wille des Programmierers. `None` heisst: der Uebersetzer entscheidet
-    /// nach seiner Groessenregel (`inline.rs`).
+    /// **Round EINBETTEN** -- `#[inline]` / `#[no_inline]`, the explicit will
+    /// of the programmer. `None` means: the compiler decides by its size
+    /// rule (`inline.rs`).
     ///
-    /// `Some(true)`  -- EINBETTEN, auch wenn der Rumpf ueber der Groessengrenze
-    ///                 liegt. Rekursion, Adressnahme und die Sperren aus
-    ///                 SPEC 9 (`secret`/`#[constant_time]`) bleiben trotzdem
-    ///                 in Kraft: sie sind Richtigkeitsfragen, keine
-    ///                 Geschmacksfragen.
-    /// `Some(false)` -- NIE einbetten. Das braucht, wer einen Rahmen sehen
-    ///                 will (Fehlersuche) oder wessen Wirkung an der
-    ///                 Stapeltiefe haengt (`__gc_scrub_deep`).
+    /// `Some(true)`  -- INLINE, even if the body is above the size limit.
+    ///                 Recursion and the blocks of SPEC 9
+    ///                 (`secret`/`#[constant_time]`) still hold: they are
+    ///                 questions of correctness, not of taste.
+    /// `Some(false)` -- NEVER inline. Needed by whoever wants to see a frame
+    ///                 (debugging) or whose effect depends on the stack depth
+    ///                 (`__gc_scrub_deep`).
     pub inline_hint: Option<bool>,
     /// **ROUND 94** -- the position every newly pushed instruction is stamped
     /// with. `lower.rs` sets it per statement and per expression; everything

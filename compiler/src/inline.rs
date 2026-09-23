@@ -99,17 +99,17 @@ fn reaches_itself_self(m: &Module, name: &str) -> bool {
     false
 }
 
-/// Die HARTEN Sperren: hier geht es um Richtigkeit, nicht um Groesse.
-/// `#[inline]` hebt KEINE davon auf.
+/// The HARD blocks: these are about correctness, not size. `#[inline]`
+/// lifts NONE of them.
 ///
-///  * `#[constant_time]` / `secret` -- die Pruefung im Codeerzeuger arbeitet
-///    je Funktion (SPEC 9.2). Eingebettet in einen Aufrufer ohne die Marke
-///    faellt sie weg, und eine Zeitseitenkanal-Zusage waere still gebrochen.
-///  * `#[interrupt]` -- eigene Aufruffolge, endet mit `iretq` statt `ret`
-///    (Runde 52). Der Rumpf gehoert nicht in einen gewoehnlichen Rahmen.
-///  * ein unfertiger Block (`Term::Unset`) oder eine Blockliste, deren
-///    Nummern nicht der Reihe nach stehen -- dann stimmt `blockmap` nicht.
-fn darf_grundsaetzlich(callee: &Func) -> bool {
+///  * `#[constant_time]` / `secret` -- the check in the code generator works
+///    per function (SPEC 9.2). Inlined into a caller without the mark it
+///    would be gone, and a timing side channel promise silently broken.
+///  * `#[interrupt]` -- its own calling sequence, ends with `iretq` instead
+///    of `ret` (round 52). The body does not belong into an ordinary frame.
+///  * an unfinished block (`Term::Unset`) or a block list whose numbers are
+///    not in order -- then `blockmap` is wrong.
+fn allowed_at_all(callee: &Func) -> bool {
     !callee.constant_time
         && callee.secret.is_empty()
         && !callee.interrupt
@@ -128,16 +128,16 @@ fn inlinable(callee: &Func) -> bool {
     // for the stack scanning conservative GC (`tests/520_gc_weak.fi`,
     // round 37: `__gc_strong_raw` inlined into `create` produced phantom
     // pointers and exit 6).
-    if !darf_grundsaetzlich(callee) {
+    if !allowed_at_all(callee) {
         return false;
     }
-    // RUNDE EINBETTEN -- der ausdrueckliche Wille schlaegt die Groessenregel.
+    // Round EINBETTEN -- the explicit will beats the size rule.
     match callee.inline_hint {
-        // `#[no_inline]`: Schluss, ohne Wenn und Aber.
+        // `#[no_inline]`: never, no exceptions.
         Some(false) => return false,
-        // `#[inline]`: die Groessengrenzen entfallen. Genau das braucht der
-        // JIT fuer seine Helfer -- ihre Ruempfe liegen ueber 40 Befehlen,
-        // und ohne diesen Weg bleibt der Aufruf stehen.
+        // `#[inline]`: the size limits do not apply. That is what the JIT
+        // needs for its helpers -- their bodies are above 40 instructions,
+        // and without this path the call stays.
         Some(true) => return true,
         None => {}
     }
@@ -151,18 +151,17 @@ fn find_site(
     m: &Module,
     ci: usize,
     self_rec: &[bool],
-    nur_verlangt: bool,
+    requested_only: bool,
 ) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
         return None;
     }
-    // Die Aufrufergrenze schuetzt Uebersetzungszeit und Codegroesse. Sie
-    // darf aber einen AUSDRUECKLICH verlangten Einbau nicht aussperren --
-    // sonst haengt `#[inline]` davon ab, wie gross der Aufrufer zufaellig
-    // ist. Deshalb wird sie unten je Aufrufstelle geprueft und nicht hier
-    // fuer die ganze Funktion.
-    let caller_voll = caller.inst_count() > MAX_CALLER_INSTS;
+    // The caller limit protects compile time and code size. But it must not
+    // lock out an EXPLICITLY requested inlining -- otherwise `#[inline]`
+    // would depend on how big the caller happens to be. So it is checked
+    // per call site below, not here for the whole function.
+    let caller_full = caller.inst_count() > MAX_CALLER_INSTS;
     if caller.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return None;
     }
@@ -177,13 +176,12 @@ fn find_site(
                 if gi == ci || !inlinable(callee) {
                     continue;
                 }
-                // Der volle Aufrufer nimmt nur noch, was ausdruecklich
-                // verlangt ist.
-                if caller_voll && callee.inline_hint != Some(true) {
+                // A full caller only takes what is explicitly requested.
+                if caller_full && callee.inline_hint != Some(true) {
                     continue;
                 }
-                // Vorgabestufe: NUR was `#[inline]` traegt.
-                if nur_verlangt && callee.inline_hint != Some(true) {
+                // Default level: ONLY what carries `#[inline]`.
+                if requested_only && callee.inline_hint != Some(true) {
                     continue;
                 }
                 if callee.params.len() != args.len() {
@@ -263,14 +261,14 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
 
     // 3. Create the blocks of the body + the continuation block.
     let mut blockmap: HashMap<u32, u32> = HashMap::new();
-    let mut neue: Vec<u32> = Vec::with_capacity(callee.blocks.len() + 1);
+    let mut new_ids: Vec<u32> = Vec::with_capacity(callee.blocks.len() + 1);
     for b in &callee.blocks {
         let nb = f.add_block();
         blockmap.insert(b.id, nb);
-        neue.push(nb);
+        new_ids.push(nb);
     }
     let cont = f.add_block();
-    neue.push(cont);
+    new_ids.push(cont);
 
     // 4. Split the calling block.
     let tail: Vec<Inst> = f.blocks[bi].insts.split_off(ii + 1);
@@ -365,9 +363,9 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
         };
     }
 
-    // RUNDE EINBETTEN: den Rumpf unmittelbar hinter den Aufrufblock holen.
-    // Begruendung und Messung stehen bei `bloecke_umsortieren`.
-    bloecke_umsortieren(f, bi, &neue);
+    // Round EINBETTEN: move the body right behind the calling block.
+    // Reason and measurement are at `reorder_blocks`.
+    reorder_blocks(f, bi, &new_ids);
 }
 
 /// ROUND 92 -- `blockmap` is the callee's block numbering translated into
@@ -461,89 +459,87 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
     }
 }
 
-/// RUNDE EINBETTEN -- nur die AUSDRUECKLICH verlangten Einbauten.
+/// Round EINBETTEN -- only the EXPLICITLY requested inlinings.
 ///
-/// Das ist der Durchgang fuer die Vorgabestufe (`dev-fast`). Die
-/// Groessenregel bleibt dort aus: sie macht den Aufrufstapel unlesbar, und
-/// `dev-fast` ist die Stufe, auf der man mit dem Fehlersucher arbeitet.
-/// `#[inline]` ist dagegen eine Zusage an den Programmierer -- sie darf
-/// nicht davon abhaengen, mit welchem Schalter gebaut wird, sonst misst man
-/// (wie die Runde JIT) still etwas anderes, als man gebaut hat.
-pub fn inline_module_nur_verlangt(m: &mut Module) -> usize {
+/// This is the pass for the default level (`dev-fast`). The size rule stays
+/// off there: it makes the call stack unreadable, and `dev-fast` is the
+/// level people debug at. `#[inline]` on the other hand is a promise to the
+/// programmer -- it must not depend on the build switch, otherwise one
+/// silently measures something other than what one built (as round JIT
+/// did).
+pub fn inline_module_requested_only(m: &mut Module) -> usize {
     inline_module_inner(m, true)
 }
 
-/// RUNDE EINBETTEN -- DIE BLOECKE DES EINGEBAUTEN RUMPFES NACH VORNE HOLEN.
+/// Round EINBETTEN -- MOVE THE BLOCKS OF THE INLINED BODY FORWARD.
 ///
-/// `Func::add_block` haengt nur an. Ein eingebauter Rumpf landet damit am
-/// ENDE der Funktion, auch wenn die Aufrufstelle in der ersten Schleife
-/// steht. Das ist kein Schoenheitsfehler:
+/// `Func::add_block` only appends. An inlined body therefore lands at the
+/// END of the function, even if the call site sits in the first loop. That
+/// is not cosmetic:
 ///
-/// `regalloc.rs` bildet die Lebendintervalle als `[kleinste Position,
-/// groesste Position]` ueber die LINEARE Blockfolge (`live.block_start` /
-/// `live.block_end`). Liegt der Rumpf hinter allen anderen Bloecken, spannt
-/// das Intervall jedes Werts, der in den Rumpf hinein und wieder heraus
-/// lebt, ueber die GANZE Funktion -- auch ueber fremde Schleifen, mit denen
-/// er nichts zu tun hat. Dort kollidiert er mit deren Werten und wird
-/// ausgelagert.
+/// `regalloc.rs` builds live intervals as `[smallest position, largest
+/// position]` over the LINEAR block order (`live.block_start` /
+/// `live.block_end`). If the body sits behind all other blocks, the
+/// interval of every value that lives into the body and back out spans the
+/// WHOLE function -- including unrelated loops. There it collides with
+/// their values and gets spilled.
 ///
-/// GEMESSEN (dev-fast, /root/einbetten-mess/):
-///   * `iso_main.fi`, EINE Schleife, der Rumpf landet direkt daneben:
-///     2,35 ns -> 1,08 ns je Durchgang = Faktor 2,2 BESSER.
-///   * `kosten_main.fi`, dieselbe Rechnung, aber ZWEI Schleifen in `main`,
-///     der Rumpf landet hinter der zweiten: 2,37 ns -> 3,44 ns = SCHLECHTER.
-/// Derselbe Rumpf, derselbe Einbau -- nur die Blockentfernung entscheidet.
+/// MEASURED (dev-fast, round EINBETTEN):
+///   * one loop, the body lands right next to it:
+///     2.35 ns -> 1.08 ns per iteration = 2.2x BETTER.
+///   * the same computation, but TWO loops in `main`, the body lands behind
+///     the second: 2.37 ns -> 3.44 ns = WORSE.
+/// Same body, same inlining -- only the block distance decides.
 ///
-/// Deshalb werden die Bloecke hier umsortiert: der Rumpf und der
-/// Fortsetzungsblock ruecken unmittelbar hinter den Aufrufblock. Die
-/// Nummern sind ein INDEX (ueberall im Uebersetzer gilt `b.id as usize == i`,
-/// siehe `mem2reg.rs`, `opt.rs`, `regalloc.rs`), also muessen Nummer,
-/// Sprungziele und die Blockangaben in jedem `phi` zusammen umgeschrieben
-/// werden.
-fn bloecke_umsortieren(f: &mut Func, nach: usize, neue: &[u32]) {
+/// So the blocks are reordered here: the body and the continuation block
+/// move right behind the calling block. Block numbers are an INDEX
+/// (everywhere in the compiler `b.id as usize == i`, see `mem2reg.rs`,
+/// `opt.rs`, `regalloc.rs`), so number, jump targets and the block operands
+/// of every `phi` have to be rewritten together.
+fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
     let n = f.blocks.len();
-    if n != f.blocks.len() || neue.is_empty() {
+    if new_ids.is_empty() || after >= n {
         return;
     }
-    // Die gewuenschte Reihenfolge: alles bis einschliesslich `nach`, dann
-    // die neuen Bloecke, dann der Rest.
-    let neu_set: std::collections::HashSet<u32> = neue.iter().copied().collect();
-    let mut folge: Vec<u32> = Vec::with_capacity(n);
-    for i in 0..=nach {
+    // The desired order: everything up to and including `after`, then the
+    // new blocks, then the rest.
+    let new_set: std::collections::HashSet<u32> = new_ids.iter().copied().collect();
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..=after {
         let id = i as u32;
-        if !neu_set.contains(&id) {
-            folge.push(id);
+        if !new_set.contains(&id) {
+            order.push(id);
         }
     }
-    for &b in neue {
-        folge.push(b);
+    for &b in new_ids {
+        order.push(b);
     }
-    for i in (nach + 1)..n {
+    for i in (after + 1)..n {
         let id = i as u32;
-        if !neu_set.contains(&id) {
-            folge.push(id);
+        if !new_set.contains(&id) {
+            order.push(id);
         }
     }
-    if folge.len() != n {
-        return; // etwas stimmt nicht -- dann lieber gar nicht umsortieren
+    if order.len() != n {
+        return; // something is off -- better not reorder at all
     }
-    // alt -> neu
-    let mut karte = vec![0u32; n];
-    for (neu_i, &alt) in folge.iter().enumerate() {
-        karte[alt as usize] = neu_i as u32;
+    // old -> new
+    let mut map = vec![0u32; n];
+    for (new_i, &old) in order.iter().enumerate() {
+        map[old as usize] = new_i as u32;
     }
-    // Bloecke in die neue Reihenfolge bringen ...
-    let alt_blocks = std::mem::take(&mut f.blocks);
-    let mut nach_id: Vec<Option<crate::fir::Block>> = alt_blocks.into_iter().map(Some).collect();
-    let mut neu_blocks: Vec<crate::fir::Block> = Vec::with_capacity(n);
-    for &alt in &folge {
-        let mut b = nach_id[alt as usize].take().expect("Block zweimal vergeben");
-        b.id = karte[alt as usize];
-        neu_blocks.push(b);
+    // Bring the blocks into the new order ...
+    let old_blocks = std::mem::take(&mut f.blocks);
+    let mut by_id: Vec<Option<crate::fir::Block>> = old_blocks.into_iter().map(Some).collect();
+    let mut new_blocks: Vec<crate::fir::Block> = Vec::with_capacity(n);
+    for &old in &order {
+        let mut b = by_id[old as usize].take().expect("block handed out twice");
+        b.id = map[old as usize];
+        new_blocks.push(b);
     }
-    f.blocks = neu_blocks;
-    // ... und jede Blockangabe mitziehen: Sprungziele und phi-Kanten.
-    let mv = |b: &u32| -> u32 { karte[*b as usize] };
+    f.blocks = new_blocks;
+    // ... and carry every block operand along: jump targets and phi edges.
+    let mv = |b: &u32| -> u32 { map[*b as usize] };
     for b in f.blocks.iter_mut() {
         b.term = match &b.term {
             Term::Br(t) => Term::Br(mv(t)),
@@ -562,7 +558,7 @@ fn bloecke_umsortieren(f: &mut Func, nach: usize, neue: &[u32]) {
         for i in b.insts.iter_mut() {
             if let Op::Phi { incoming } = &mut i.op {
                 for e in incoming.iter_mut() {
-                    e.0 = karte[e.0 as usize];
+                    e.0 = map[e.0 as usize];
                 }
                 incoming.sort_by_key(|(p, _)| *p);
             }
@@ -576,7 +572,7 @@ pub fn inline_module(m: &mut Module) -> usize {
     inline_module_inner(m, false)
 }
 
-fn inline_module_inner(m: &mut Module, nur_verlangt: bool) -> usize {
+fn inline_module_inner(m: &mut Module, requested_only: bool) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
     // Determined once: it hangs off the body of the callee only, which never
@@ -588,7 +584,7 @@ fn inline_module_inner(m: &mut Module, nur_verlangt: bool) -> usize {
         .collect();
     'outer: loop {
         for ci in 0..m.funcs.len() {
-            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec, nur_verlangt) {
+            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec, requested_only) {
                 if dbg {
                     eprintln!("inline: {} <- {} ({} insts, {} blocks)",
                         m.funcs[ci].name, m.funcs[gi].name,
@@ -684,10 +680,10 @@ mod tests {
         assert!(main.blocks[0].insts.iter().any(|i| matches!(i.op, Op::Const(9))));
     }
 
-    /// RUNDE EINBETTEN: `#[no_inline]` verbietet den Einbau, auch wenn der
-    /// Rumpf winzig ist und die Groessenregel ihn laengst genommen haette.
+    /// Round EINBETTEN: `#[no_inline]` forbids inlining, even if the body is
+    /// tiny and the size rule would have taken it.
     #[test]
-    fn no_inline_verbietet_den_einbau() {
+    fn no_inline_forbids_inlining() {
         let mut m = Module::new();
         let mut g = add_fn();
         g.inline_hint = Some(false);
@@ -700,42 +696,41 @@ mod tests {
         assert_eq!(inline_module(&mut m), 0);
     }
 
-    /// `#[inline]` hebt die GROESSENGRENZE auf: ein Rumpf ueber
-    /// `MAX_CALLEE_INSTS` wird eingebaut, den die Regel sonst ablehnt.
+    /// `#[inline]` lifts the SIZE LIMIT: a body above `MAX_CALLEE_INSTS` is
+    /// inlined, which the rule would otherwise refuse.
     #[test]
-    fn inline_hebt_die_groessengrenze_auf() {
-        // Ein Rumpf mit deutlich mehr als MAX_CALLEE_INSTS Befehlen.
-        let mut g = Func::new("gross", vec![FTy::I32], FTy::I32);
+    fn inline_lifts_the_size_limit() {
+        // A body with clearly more than MAX_CALLEE_INSTS instructions.
+        let mut g = Func::new("big", vec![FTy::I32], FTy::I32);
         let mut cur: Val = 0;
         for _ in 0..(MAX_CALLEE_INSTS + 10) {
             cur = g.push(0, FTy::I32, Op::Bin(BinOp::Add, cur, 0));
         }
         g.set_term(0, Term::Ret(Some(cur)));
         assert!(g.inst_count() > MAX_CALLEE_INSTS);
-        let ruf = |g: Func| {
+        let build = |g: Func| {
             let mut m = Module::new();
             m.funcs.push(g);
             let mut f = Func::new("main", vec![], FTy::I32);
             let a = f.push(0, FTy::I32, Op::Const(1));
-            let r = f.push(0, FTy::I32, Op::Call { name: "gross".into(), args: vec![a] });
+            let r = f.push(0, FTy::I32, Op::Call { name: "big".into(), args: vec![a] });
             f.set_term(0, Term::Ret(Some(r)));
             m.funcs.push(f);
             m
         };
-        // ohne Marke: die Groessenregel lehnt ab
-        let mut m1 = ruf(g.clone());
+        // without the mark: the size rule refuses
+        let mut m1 = build(g.clone());
         assert_eq!(inline_module(&mut m1), 0);
-        // mit #[inline]: eingebaut
+        // with #[inline]: inlined
         g.inline_hint = Some(true);
-        let mut m2 = ruf(g);
+        let mut m2 = build(g);
         assert_eq!(inline_module(&mut m2), 1);
     }
 
-    /// Die HARTEN Sperren bleiben: `#[inline]` auf einer
-    /// `#[constant_time]`-Funktion aendert nichts. Das ist eine
-    /// Richtigkeitsfrage (SPEC 9.2), keine Geschmacksfrage.
+    /// The HARD blocks stay: `#[inline]` on a `#[constant_time]` function
+    /// changes nothing. That is a question of correctness (SPEC 9.2).
     #[test]
-    fn inline_hebt_die_harten_sperren_nicht_auf() {
+    fn inline_does_not_lift_the_hard_blocks() {
         let mut m = Module::new();
         let mut g = add_fn();
         g.constant_time = true;
@@ -749,9 +744,9 @@ mod tests {
         assert_eq!(inline_module(&mut m), 0);
     }
 
-    /// Auch Rekursion bleibt gesperrt, mit `#[inline]` wie ohne.
+    /// Recursion stays blocked too, with `#[inline]` as without.
     #[test]
-    fn inline_bricht_die_rekursionssperre_nicht() {
+    fn inline_does_not_break_the_recursion_block() {
         let mut m = Module::new();
         let mut f = Func::new("fact", vec![FTy::I32], FTy::I32);
         f.inline_hint = Some(true);
@@ -769,10 +764,10 @@ mod tests {
         assert_eq!(inline_module(&mut m), 0);
     }
 
-    /// Der Durchgang der Vorgabestufe nimmt NUR, was `#[inline]` traegt.
+    /// The pass of the default level takes ONLY what carries `#[inline]`.
     #[test]
-    fn nur_verlangt_nimmt_nur_markierte() {
-        let bau = |hint: Option<bool>| {
+    fn requested_only_takes_only_marked() {
+        let build = |hint: Option<bool>| {
             let mut m = Module::new();
             let mut g = add_fn();
             g.inline_hint = hint;
@@ -784,15 +779,15 @@ mod tests {
             m.funcs.push(f);
             m
         };
-        // ohne Marke: der Vorgabe-Durchgang laesst den Aufruf stehen ...
-        let mut m1 = bau(None);
-        assert_eq!(inline_module_nur_verlangt(&mut m1), 0);
-        // ... obwohl die Groessenregel ihn genommen haette.
-        let mut m2 = bau(None);
+        // without the mark: the default pass leaves the call alone ...
+        let mut m1 = build(None);
+        assert_eq!(inline_module_requested_only(&mut m1), 0);
+        // ... although the size rule would have taken it.
+        let mut m2 = build(None);
         assert_eq!(inline_module(&mut m2), 1);
-        // mit Marke: auch der Vorgabe-Durchgang nimmt ihn.
-        let mut m3 = bau(Some(true));
-        assert_eq!(inline_module_nur_verlangt(&mut m3), 1);
+        // with the mark: the default pass takes it too.
+        let mut m3 = build(Some(true));
+        assert_eq!(inline_module_requested_only(&mut m3), 1);
     }
 
     #[test]
