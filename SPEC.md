@@ -692,7 +692,7 @@ and counter-check D.
 
   | origin | storage | freed by |
   |---|---|---|
-  | literal `"hello"` | the frame of the enclosing function | the frame |
+  | literal `"hello"` | `.rodata`, one entry per distinct text (round GAPS; was the frame -- a returned literal dangled) | nobody |
   | `a + b` | the **GC heap** | the collector |
   | out of a `Span`/`Bytes` | wherever the buffer lies | its owner |
 
@@ -2318,6 +2318,53 @@ R3. **`-x` works on `f64`.** 14.1.f64 named it as implemented and it was
     floating point value has no bits whose flipping would mean anything
     (`tests/neg/1248_f64_has_no_bitnot.fi`).
 
+
+#### 14.1.gaps -- what round GAPS added (docs/LUECKEN.md)
+
+G1. **`__sqrt(x)`** -- `f64 -> f64` / `f32 -> f32`, ONE instruction
+    (`sqrtsd`/`sqrtss`/`fsqrt`), exact by IEEE 754. `tests/1653_sqrt_instruction.fi`.
+
+G2. **Named constants and `A | B | C` as `match` patterns.** A bare `NAME`
+    that is a `const` is the constant (Rust's rule), `module.NAME` too;
+    alternatives must not bind. A dense match stays ONE jump table.
+    `tests/1650`, `1651`, `1654`.
+
+G3. **`__bits(x)`, `__f64_from_bits(u)`, `__f32_from_bits(u)`** -- the bit
+    pattern of a float and back, without a stack slot. `tests/1655_float_bits.fi`.
+
+G4. **A function value as a number.** `f as u64` / `f as usize` and back
+    (`n as fn(..) -> R`) is the address of the function's RECORD; `0 as
+    fn(..)` is the null function (compare with `(f as u64) == 0`).
+    `__code_of(f)` is the machine code address (word 0 of the record).
+    `tests/1656_fn_address.fi`.
+
+G5. **A `const` may name another module's `const`** -- constants are
+    checked in dependency order. `tests/1657_const_from_module.fi`.
+
+G6. **`Gc[m.C]`, `GcWeak[m.C]`, `gc m.C { }`, `gc_null[m.C]()`** -- a gc
+    class named through its module. `tests/1658_gc_qualified_class.fi`.
+
+G7. **The octets of a `str` literal live in `.rodata`** (see 8.0). An ARRAY
+    literal stays a writable copy in the frame. `tests/1659_str_literal_outlives_frame.fi`.
+
+G8. **Arithmetic on typed pointers:** `p + n`, `p - n` (n elements, any
+    concrete integer, a signed one may go back), `p - q` (`i64`, the
+    distance in elements), `p += n`, `p -= n`, `p++`, `p--`. C's rules and
+    no check, like every raw pointer (3.4); not on `Gc[T]`. `n + p` is not
+    accepted. `tests/1660_pointer_arithmetic.fi`.
+
+G9. **`x as% T`** -- the narrowing conversion between two integer types
+    that is NEVER checked, on every level (the promise `+% -% *%` make for
+    arithmetic). An untyped literal inside takes the widest type, not `T`.
+    Only integer to integer. `tests/1661_wrapping_cast.fi`.
+
+G10. **`__include_str("path")`** -- a file's octets as a text literal, read
+    at build time; a relative path is relative to the directory of the
+    source file; at most 1 MiB; the context decides between `str` and
+    `[u8; N]` as for any literal. firnc1: not core. `tests/1663_include_str.fi`.
+
+G11. **`std.dir`** (library) -- `dir.open`, `dir.next` (`d.name`, `d.kind`),
+    `dir.close` over `getdents64`. `tests/1662_std_dir.fi`.
 
 ---
 
