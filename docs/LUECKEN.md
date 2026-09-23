@@ -97,6 +97,26 @@ safer code, not speed. The one miscompile (A3) and the one dangling
 pointer (A10) were the most valuable finds. The speed lever for Certus is
 B1-B4, all of which are merges or collector work, not language features.
 
+## E. The test suite at the end of the round
+
+`./test.sh` on this branch: 1649 checks, 347 programs x 4 levels, all
+negative tests, the self-compiling comparison (350 same behaviour, 0
+differing), the fixpoint (stage 2 == stage 3, character-identical) -- green.
+Three checks are red, and they are red on `main` (56bea7e9) too, for
+reasons outside this round:
+
+* `tools/js/run.sh`: `testdata/test262/subset.sha256` is not in the
+  repository (only `MANIFEST.md` and the archive are).
+* `tools/english/check.sh`: 512 German identifiers, all in `lib/fui`,
+  `lib/svg`, `demos/fuidemo`, `tools/fui` (this round's one hit,
+  `element_size`, was renamed).
+* `tools/fmt/run.sh` step 3: files in `lib/fui`, `lib/svg`, `demos` not in
+  canonical shape (87 on main, 67 here; none of them touched by the round).
+
+Fixed on the way: `tools/fixpoint.sh` failed on main because the licence
+line was added to `lib/firnc1/gctext.fi` by hand without regenerating it --
+`tools/gen_gctext.sh` writes the line now.
+
 ## Counts
 
 * 14 closed (A1-A14): two of them bugs that were on no list as such (A3 a
