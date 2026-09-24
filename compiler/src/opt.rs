@@ -1936,7 +1936,11 @@ mod tests {
         let blocks = f.blocks.len();
         let mut m = Module::new();
         m.funcs.push(f);
-        optimize(&mut m);
+        // ROUND TEMPO 14: ten passes with a constant bound is exactly what
+        // `unroll` takes apart -- this test is about the phi, so the loop
+        // has to stay a loop here (`unrolled_counter_folds_away` below is
+        // the same loop WITH the pass).
+        optimize_with(&mut m, &OptConfig { level: Level::DevFast, disabled: vec!["unroll".to_string()] });
         let g = &m.funcs[0];
         assert_eq!(g.blocks.len(), blocks, "the loop is still a loop");
         assert!(g.inst_count() < before, "{} instructions, was {}", g.inst_count(), before);
@@ -1957,6 +1961,45 @@ mod tests {
             m.to_text()
         );
         assert!(m.funcs[0].verify_phis().is_ok(), "{:?}", m.funcs[0].verify_phis());
+    }
+
+    #[test]
+    fn unrolled_counter_folds_away() {
+        // ROUND TEMPO 14 -- the loop of `loop_counter_becomes_a_phi`, this
+        // time with `unroll`: ten passes of `i = i + 1` are copied, the
+        // copies fold, and what is left is `ret 10` -- no phi, no branch,
+        // no memory.
+        let mut f = Func::new("t", vec![], FTy::I32);
+        let head = f.add_block();
+        let body = f.add_block();
+        let exit = f.add_block();
+        let slot = f.alloca(4, 4);
+        let zero = f.push(0, FTy::I32, Op::Const(0));
+        f.push_void(0, FTy::I32, Op::Store { addr: slot, val: zero });
+        f.set_term(0, Term::Br(head));
+        let i = f.push(head, FTy::I32, Op::Load { addr: slot });
+        let ten = f.push(head, FTy::I32, Op::Const(10));
+        let c = f.push(head, FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::I32, a: i, b: ten });
+        f.set_term(head, Term::BrCond { cond: c, then_bb: body, else_bb: exit });
+        let i2 = f.push(body, FTy::I32, Op::Load { addr: slot });
+        let one = f.push(body, FTy::I32, Op::Const(1));
+        let s = f.push(body, FTy::I32, Op::Bin(BinOp::Add, i2, one));
+        f.push_void(body, FTy::I32, Op::Store { addr: slot, val: s });
+        f.set_term(body, Term::Br(head));
+        let r = f.push(exit, FTy::I32, Op::Load { addr: slot });
+        f.set_term(exit, Term::Ret(Some(r)));
+        let mut m = Module::new();
+        m.funcs.push(f);
+        optimize(&mut m);
+        let g = &m.funcs[0];
+        assert_eq!(g.blocks.len(), 1, "one block is left:\n{}", m.to_text());
+        let ret = match g.blocks[0].term {
+            Term::Ret(Some(v)) => v,
+            _ => panic!("no return:\n{}", m.to_text()),
+        };
+        let k = g.blocks[0].insts.iter().find(|i| i.dst == Some(ret)).map(|i| i.op.clone());
+        assert!(matches!(k, Some(Op::Const(10))), "{}", m.to_text());
+        assert!(g.verify_phis().is_ok(), "{:?}", g.verify_phis());
     }
 
     #[test]
