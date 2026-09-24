@@ -1,0 +1,435 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/fcache.fi -- THE COVERAGE CACHE: what was rastered once is not
+// rastered again (fUi tempo, stage 1, 24.09.2026).
+//
+// ================================================================ WHY
+//
+// MEASURED (FirnChat in Chromium, 1996 x 1211, the look with glass, a new
+// line rising into the conversation): of 150 ms per picture about a third
+// went into rastering TEXT -- reading the outlines of the glyphs out of
+// the font (`ttf.outline_at`), walking every edge through the rasteriser
+// (`raster.accumulate`, `span`, `cell_add`) and summing the rows up
+// (`raster_finish`) -- for lines that stood in the same picture a frame
+// before, letter for letter, only a few rows higher. The same goes for
+// the icons of the head (a Lucide path parsed, stroked and filled per
+// picture).
+//
+// So the FINISHED COVERAGE of a text run or an icon is kept, under a key
+// that says everything it depends on: the kind of thing, the font, the
+// size and the style of the run, the octets of the text, and the fraction
+// of the position (the part the rasteriser sees -- the whole pixels only
+// move it). The next time the same thing is painted at a whole-pixel
+// offset, the kept coverage goes through the SAME write-back as a fresh
+// one (`canvas.canvas_fill_raster`, through a raster that is only a view
+// on the kept block, `raster.raster_view`) -- the same blend, the same
+// clip, the same octets.
+//
+// ================================================== WHAT KEEPS IT EXACT
+//
+// The coverage of a shape does not depend on where its window lies as
+// long as the window is not CUT: the rasteriser folds whatever lies left
+// of a window onto its border column (lib/fui/painter.fi, `clip_rows`),
+// and a window that the canvas edge cut is therefore not a picture of the
+// shape alone. The callers keep only windows that lay wholly on the
+// canvas, and take a kept one only where a fresh window would not be cut
+// either. Colour is not part of the key -- coverage has none; the colour
+// comes at the write-back, so a theme change still finds every line.
+//
+// ================================================================ HOW MUCH
+//
+// A budget in octets (`fc_set_budget`, 24 MiB unless the program says
+// otherwise, 0 switches the cache off). When a new block does not fit,
+// the blocks used longest ago go first. One block is one allocation:
+// header, the octets of the text (compared in full on every hit -- a
+// hash alone could collide) and the coverage, f64 per cell as the
+// rasteriser left it.
+import std.rt
+import paint.canvas
+import font.raster
+
+export {
+    CKey, ckey_new, fc_on, fc_set_budget, fc_budget, fc_used, fc_count,
+    fc_lookup, fc_store, fc_fill, fc_clear, fc_hits, fc_misses,
+    KIND_TEXT, KIND_ICON,
+}
+
+const KIND_TEXT: u64 = 1
+const KIND_ICON: u64 = 2
+
+// Everything a coverage depends on besides the octets of the text: the
+// caller packs its parameters into the seven words (bit patterns of f64 are
+// fine -- two equal patterns are equal numbers).
+struct CKey {
+    kind: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+    g: u64,
+}
+
+fn ckey_new(kind: u64) -> CKey {
+    return CKey { kind: kind, a: 0, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0 }
+}
+
+// THE BLOCK. Offsets in octets from its start.
+const H_NEXT: u64 = 0 // the next block in the same bucket
+const H_HASH: u64 = 8
+const H_KIND: u64 = 16 // 8 words of the key: 16 .. 80
+const H_TN: u64 = 80 // octets of the text
+const H_BW: u64 = 88 // the block of coverage: columns
+const H_BH: u64 = 96 // ... rows
+const H_OX: u64 = 104 // its top left corner from the anchor, i64
+const H_OY: u64 = 112
+const H_USE: u64 = 120 // the tick of the last use
+const H_SIZE: u64 = 128 // octets of the whole allocation
+const H_PREV: u64 = 136 // the previous block in the bucket (0 = the head)
+const HDR: u64 = 144
+
+const BUCKETS: usize = 4096
+
+struct Cache {
+    table: u64, // BUCKETS words
+    budget: usize,
+    used: usize,
+    count: usize,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+static mut G_FC: u64 = 0
+static mut G_FC_BUDGET: usize = 25165824 // 24 MiB
+static mut G_FC_SET: bool = false
+
+fn cache_bytes() -> usize {
+    return 64
+}
+
+fn cache() -> *mut Cache {
+    if G_FC == 0 {
+        if G_FC_BUDGET == 0 {
+            return 0 as u64 as *mut Cache
+        }
+        let p: u64 = rt.heap_alloc(cache_bytes())
+        if p == 0 {
+            return 0 as u64 as *mut Cache
+        }
+        let t: u64 = rt.heap_alloc(BUCKETS * 8)
+        if t == 0 {
+            return 0 as u64 as *mut Cache
+        }
+        let c: *mut Cache = p as *mut Cache
+        (*c).table = t
+        (*c).budget = G_FC_BUDGET
+        (*c).used = 0
+        (*c).count = 0
+        (*c).tick = 1
+        (*c).hits = 0
+        (*c).misses = 0
+        G_FC = p
+    }
+    return G_FC as *mut Cache
+}
+
+// Is the cache in use at all? (A program that set the budget to 0 paints
+// exactly as before this file existed -- nothing is looked up.)
+fn fc_on() -> bool {
+    return G_FC_BUDGET > 0
+}
+
+// The budget in octets; 0 switches the cache off and gives back what it
+// held.
+fn fc_set_budget(n: usize) {
+    G_FC_BUDGET = n
+    G_FC_SET = true
+    if G_FC != 0 {
+        let c: *mut Cache = G_FC as *mut Cache
+        (*c).budget = n
+        shrink(c, 0)
+    }
+}
+
+fn fc_budget() -> usize { return G_FC_BUDGET }
+
+fn fc_used() -> usize {
+    if G_FC == 0 {
+        return 0
+    }
+    return (*(G_FC as *mut Cache)).used
+}
+
+fn fc_count() -> usize {
+    if G_FC == 0 {
+        return 0
+    }
+    return (*(G_FC as *mut Cache)).count
+}
+
+fn fc_hits() -> u64 {
+    if G_FC == 0 {
+        return 0
+    }
+    return (*(G_FC as *mut Cache)).hits
+}
+
+fn fc_misses() -> u64 {
+    if G_FC == 0 {
+        return 0
+    }
+    return (*(G_FC as *mut Cache)).misses
+}
+
+#[inline]
+fn ld(p: u64, off: u64) -> u64 { return *((p + off) as *mut u64) }
+#[inline]
+fn st(p: u64, off: u64, v: u64) { *((p + off) as *mut u64) = v }
+
+// FNV-1a over the key words and the octets.
+fn hash_of(k: *mut CKey, tp: u64, tn: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    let pr: u64 = 1099511628211
+    h = (h ^ (*k).kind) *% pr
+    h = (h ^ (*k).a) *% pr
+    h = (h ^ (*k).b) *% pr
+    h = (h ^ (*k).c) *% pr
+    h = (h ^ (*k).d) *% pr
+    h = (h ^ (*k).e) *% pr
+    h = (h ^ (*k).f) *% pr
+    h = (h ^ (*k).g) *% pr
+    h = (h ^ (tn as u64)) *% pr
+    var i: usize = 0
+    while i < tn {
+        h = (h ^ (*((tp + i as u64) as *mut u8)) as u64) *% pr
+        i = i + 1
+    }
+    return h
+}
+
+fn same(e: u64, h: u64, k: *mut CKey, tp: u64, tn: usize) -> bool {
+    if ld(e, H_HASH) != h || ld(e, H_TN) != tn as u64 {
+        return false
+    }
+    if ld(e, H_KIND) != (*k).kind || ld(e, H_KIND + 8) != (*k).a ||
+        ld(e, H_KIND + 16) != (*k).b || ld(e, H_KIND + 24) != (*k).c ||
+        ld(e, H_KIND + 32) != (*k).d || ld(e, H_KIND + 40) != (*k).e ||
+        ld(e, H_KIND + 48) != (*k).f || ld(e, H_KIND + 56) != (*k).g {
+        return false
+    }
+    return tn == 0 || rt.mem_eq(e + HDR, tp, tn)
+}
+
+// The kept coverage for this key and text, 0 when there is none. A hit
+// counts as a use (the block goes to the back of the eviction line).
+fn fc_lookup(k: *mut CKey, tp: u64, tn: usize) -> u64 {
+    if !fc_on() {
+        return 0
+    }
+    let c: *mut Cache = cache()
+    if c as u64 == 0 {
+        return 0
+    }
+    let h: u64 = hash_of(k, tp, tn)
+    var e: u64 = ld((*c).table, (h % (BUCKETS as u64)) * 8)
+    while e != 0 {
+        if same(e, h, k, tp, tn) {
+            (*c).tick = (*c).tick + 1
+            st(e, H_USE, (*c).tick)
+            (*c).hits = (*c).hits + 1
+            return e
+        }
+        e = ld(e, H_NEXT)
+    }
+    (*c).misses = (*c).misses + 1
+    return 0
+}
+
+fn unlink(c: *mut Cache, e: u64) {
+    let nx: u64 = ld(e, H_NEXT)
+    let pv: u64 = ld(e, H_PREV)
+    if pv == 0 {
+        let slot: u64 = (*c).table + (ld(e, H_HASH) % (BUCKETS as u64)) * 8
+        *(slot as *mut u64) = nx
+    } else {
+        st(pv, H_NEXT, nx)
+    }
+    if nx != 0 {
+        st(nx, H_PREV, pv)
+    }
+    let n: usize = ld(e, H_SIZE) as usize
+    (*c).used = (*c).used - n
+    (*c).count = (*c).count - 1
+    rt.heap_free(e, n)
+}
+
+// Give back blocks, those used longest ago first, until `need` more
+// octets fit into the budget.
+fn shrink(c: *mut Cache, need: usize) {
+    while (*c).count > 0 && (*c).used + need > (*c).budget {
+        // the oldest block: one walk over the table (a few thousand
+        // blocks at most, and this runs only when the budget is full)
+        var best: u64 = 0
+        var bu: u64 = 0
+        var i: usize = 0
+        while i < BUCKETS {
+            var e: u64 = ld((*c).table, (i * 8) as u64)
+            while e != 0 {
+                if best == 0 || ld(e, H_USE) < bu {
+                    best = e
+                    bu = ld(e, H_USE)
+                }
+                e = ld(e, H_NEXT)
+            }
+            i = i + 1
+        }
+        if best == 0 {
+            return
+        }
+        // everything as old as the oldest quarter goes at once, so a full
+        // cache does not walk the table for every new block
+        let cut: u64 = bu + ((*c).tick - bu) / 4
+        i = 0
+        while i < BUCKETS && (*c).used + need > (*c).budget {
+            var e: u64 = ld((*c).table, (i * 8) as u64)
+            while e != 0 {
+                let nx: u64 = ld(e, H_NEXT)
+                if ld(e, H_USE) <= cut {
+                    unlink(c, e)
+                }
+                e = nx
+            }
+            i = i + 1
+        }
+    }
+}
+
+// KEEP the coverage of the finished raster `ra`, whose window has its
+// top left corner at (wx, wy) on the canvas, as the picture of this key:
+// the block of cells that carries ink, placed relative to the ANCHOR
+// (ax, ay) -- the whole-pixel position the caller will give again.
+fn fc_store(k: *mut CKey, tp: u64, tn: usize, ra: *mut raster.Raster,
+    wx: f64, wy: f64, ax: i64, ay: i64) {
+    if !fc_on() {
+        return
+    }
+    let c: *mut Cache = cache()
+    if c as u64 == 0 {
+        return
+    }
+    let x0: usize = raster.raster_used_x0(ra)
+    let x1: usize = raster.raster_used_x1(ra)
+    let y0: usize = raster.raster_used_y0(ra)
+    let y1: usize = raster.raster_used_y1(ra)
+    var bw: usize = 0
+    var bh: usize = 0
+    if x1 > x0 && y1 > y0 {
+        bw = x1 - x0
+        bh = y1 - y0
+    }
+    let cells: usize = bw * bh
+    let size: usize = (HDR as usize) + ((tn + 7) / 8) * 8 + cells * 8
+    if size > (*c).budget / 8 {
+        return // one block may not push out an eighth of the cache
+    }
+    shrink(c, size)
+    let e: u64 = rt.heap_alloc(size)
+    if e == 0 {
+        return
+    }
+    let h: u64 = hash_of(k, tp, tn)
+    st(e, H_HASH, h)
+    st(e, H_KIND, (*k).kind)
+    st(e, H_KIND + 8, (*k).a)
+    st(e, H_KIND + 16, (*k).b)
+    st(e, H_KIND + 24, (*k).c)
+    st(e, H_KIND + 32, (*k).d)
+    st(e, H_KIND + 40, (*k).e)
+    st(e, H_KIND + 48, (*k).f)
+    st(e, H_KIND + 56, (*k).g)
+    st(e, H_TN, tn as u64)
+    st(e, H_BW, bw as u64)
+    st(e, H_BH, bh as u64)
+    st(e, H_OX, ((wx as i64) + (x0 as i64) - ax) as% u64)
+    st(e, H_OY, ((wy as i64) + (y0 as i64) - ay) as% u64)
+    (*c).tick = (*c).tick + 1
+    st(e, H_USE, (*c).tick)
+    st(e, H_SIZE, size as u64)
+    if tn > 0 {
+        rt.mem_copy(e + HDR, tp, tn)
+    }
+    let cov: u64 = e + HDR + (((tn + 7) / 8) * 8) as u64
+    var y: usize = 0
+    while y < bh {
+        rt.mem_copy(cov + ((y * bw) * 8) as u64,
+            raster.raster_cov_row(ra, y0 + y) + (x0 * 8) as u64, bw * 8)
+        y = y + 1
+    }
+    let slot: u64 = (*c).table + (h % (BUCKETS as u64)) * 8
+    let head: u64 = *(slot as *mut u64)
+    st(e, H_NEXT, head)
+    st(e, H_PREV, 0)
+    if head != 0 {
+        st(head, H_PREV, e)
+    }
+    *(slot as *mut u64) = e
+    (*c).used = (*c).used + size
+    (*c).count = (*c).count + 1
+}
+
+// The canvas position of the kept block for the anchor (ax, ay), and its
+// size -- for a caller that wants to cull before the write-back.
+fn fc_box(e: u64, ax: i64, ay: i64, out: *mut i64) {
+    *out = ax + (ld(e, H_OX) as% i64)
+    *((out as u64 + 8) as *mut i64) = ay + (ld(e, H_OY) as% i64)
+    *((out as u64 + 16) as *mut i64) = ld(e, H_BW) as i64
+    *((out as u64 + 24) as *mut i64) = ld(e, H_BH) as i64
+}
+
+// THE WRITE-BACK of a kept block at the anchor (ax, ay) in the colour
+// `col`: through `canvas_fill_raster`, as a fresh raster would go. False
+// when the block would start left of or above the canvas -- then the
+// caller rasters afresh (a window cut at the canvas edge is not the
+// picture that was kept).
+fn fc_fill(cv: *mut canvas.Canvas, e: u64, ax: i64, ay: i64, col: u32) -> bool {
+    let bw: usize = ld(e, H_BW) as usize
+    let bh: usize = ld(e, H_BH) as usize
+    let px: i64 = ax + (ld(e, H_OX) as% i64)
+    let py: i64 = ay + (ld(e, H_OY) as% i64)
+    if px < 0 || py < 0 {
+        return false
+    }
+    if bw == 0 || bh == 0 {
+        return true // nothing of it carries ink
+    }
+    // nothing of it inside the clip: done (the fill would find no pixel)
+    if (px + bw as i64) as f64 <= canvas.clip_x0(cv) || (px as f64) >= canvas.clip_x1(cv) ||
+        (py + bh as i64) as f64 <= canvas.clip_y0(cv) || (py as f64) >= canvas.clip_y1(cv) {
+        return true
+    }
+    let tn: usize = ld(e, H_TN) as usize
+    let cov: u64 = e + HDR + (((tn + 7) / 8) * 8) as u64
+    var view: raster.Raster = raster.raster_new()
+    raster.raster_view(&view, cov as *mut u8, bw, bh)
+    canvas.canvas_fill_raster(cv, &view, px as usize, py as usize, col)
+    return true
+}
+
+// Forget everything (a font was replaced, a program wants the memory).
+fn fc_clear() {
+    if G_FC == 0 {
+        return
+    }
+    let c: *mut Cache = G_FC as *mut Cache
+    var i: usize = 0
+    while i < BUCKETS {
+        var e: u64 = ld((*c).table, (i * 8) as u64)
+        while e != 0 {
+            let nx: u64 = ld(e, H_NEXT)
+            unlink(c, e)
+            e = nx
+        }
+        i = i + 1
+    }
+}

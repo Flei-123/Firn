@@ -86,11 +86,12 @@ import str.ucd_bidi
 import fui.theme
 import fui.bidi
 import fui.shape
+import fui.fcache
 
 export {
     Painter, painter_new, painter_init, painter_free, painter_ok,
     painter_canvas, painter_set_font, painter_font,
-    surface, round_rect, round_ring, border_col, mit_alpha,
+    surface, round_rect, round_ring, border_col, mit_alpha, clip_rows,
     round_rect_grad, mix_argb,
     text, text_width, text_fits_upto, text_baseline_mid,
     TEXT_L, TEXT_M, TEXT_R,
@@ -384,11 +385,62 @@ fn path_round(ra: *mut raster.Raster, x: f64, y: f64, w: f64, h: f64,
         x + r, y)
 }
 
+// THE CLIP CULLS (fUi tempo, stage 1, 24.09.2026). A picture that is
+// painted again only where it changed paints under a clip (a band, a
+// row, the input line) -- and every shape of the page used to be
+// rasterised whole all the same, to have most of its pixels thrown away
+// by the clip one by one. Now a window is cut to the ROWS of the clip:
+// `ay`/`by` (a window's first row, whole, and its end) are narrowed to
+// the clip's rows, and false comes back when nothing of [x0, x1) x the
+// rows is inside it.
+//
+// ONLY ROWS ARE CUT, and that is the point of it: the rasteriser cuts an
+// edge in y without shortening it (lib/font/raster.fi, `accumulate`: x
+// follows along), so a row inside the window gets the same coverage
+// whether the rows above it were in the window or not. In x it clamps --
+// the piece of an edge left of the window is folded onto the window's
+// border, which is exact for the running sum but not for the columns next
+// to the border. So columns stay as they were; a shape wholly left or
+// right of the clip is dropped, never cut.
+#[no_gc]
+fn clip_rows(cv: *mut canvas.Canvas, x0: f64, x1: f64, ay: *mut f64,
+    by: *mut f64) -> bool {
+    if x1 <= canvas.clip_x0(cv) || x0 >= canvas.clip_x1(cv) {
+        return false
+    }
+    let ky0: f64 = floor_px(canvas.clip_y0(cv))
+    let ky1: f64 = canvas.clip_y1(cv)
+    if *ay < ky0 {
+        *ay = ky0
+    }
+    if *by > ky1 {
+        // up to the clip's last row, whole: a clip edge in the middle of
+        // a row still lets part of that row through (canvas.clip_factor)
+        var e: f64 = floor_px(ky1)
+        if e < ky1 {
+            e = e + 1.0
+        }
+        if *by > e {
+            *by = e
+        }
+    }
+    return *by > *ay
+}
+
 // Open the raster window for a rectangle. Gives false when there is
 // nothing to do.
 #[no_gc]
 fn raster_window(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
     luft: f64, wx: *mut f64, wy: *mut f64) -> bool {
+    return raster_window_at(z, x, y, w, h, luft, wx, wy, true)
+}
+
+// ... and with the choice whether the window is cut to the rows of the
+// clip (`cut`): a coverage that is to be KEPT (lib/fui/fcache.fi) needs
+// all of its rows.
+#[no_gc]
+fn raster_window_at(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
+    luft: f64, wx: *mut f64, wy: *mut f64, cut: bool) -> bool {
     let cv: *mut canvas.Canvas = painter_canvas(z)
     let cw: f64 = canvas.canvas_width(cv) as f64
     let ch: f64 = canvas.canvas_height(cv) as f64
@@ -413,9 +465,12 @@ fn raster_window(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
     // same class of bug as the baseline being rounded to a whole pixel
     // (see `text_baseline_mid`), and it gets the same answer.
     let ax: f64 = floor_px(clamp(x - luft, 0.0, cw))
-    let ay: f64 = floor_px(clamp(y - luft, 0.0, ch))
+    var ay: f64 = floor_px(clamp(y - luft, 0.0, ch))
     let bx: f64 = clamp(x + w + luft, 0.0, cw)
-    let by: f64 = clamp(y + h + luft, 0.0, ch)
+    var by: f64 = clamp(y + h + luft, 0.0, ch)
+    if cut && !clip_rows(cv, x - luft, x + w + luft, &ay, &by) {
+        return false
+    }
     if bx <= ax || by <= ay {
         return false
     }
@@ -1593,6 +1648,15 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
     // here now, in the one place somebody will be standing when it
     // happens: give `painter_init` a raster height of at least
     // 3 * the largest font size.
+    // ---- THE KEPT PICTURE (lib/fui/fcache.fi): a plain run -- one pass,
+    // one colour, left to right -- is rastered once and then only written
+    // back, wherever it stands at a whole-pixel offset.
+    if !vis && (*r).sh_on == 0 && (*r).out_on == 0 && (*r).grad_on == 0 &&
+        fcache.fc_on() {
+        if paint_run_kept(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn) {
+            return sx + br
+        }
+    }
     if !raster_window(z, wl, wt, ww, wh, (*r).size, &wx, &wy) {
         return sx + br
     }
@@ -1637,6 +1701,61 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
         flush_raster(z, wx, wy, col)
     }
     return sx + br
+}
+
+// A PLAIN RUN THROUGH THE CACHE. True when it was painted here (from
+// the cache, or rastered and kept); false sends the caller the old way --
+// the window would be cut by the canvas edge, or it does not fit into the
+// raster budget uncut. See lib/fui/fcache.fi for why that keeps the
+// octets the same.
+fn paint_run_kept(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
+    wl: f64, wt: f64, ww: f64, wh: f64, col: u32, p: u64, nn: usize) -> bool {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+    let sz: f64 = (*r).size
+    // the window a fresh raster would get (raster_window: luft = size)
+    let x0: f64 = wl - sz
+    let x1: f64 = wl + ww + sz
+    let y0: f64 = wt - sz
+    let y1: f64 = wt + wh + sz
+    if x0 < 0.0 || x1 > cw {
+        return false
+    }
+    let fx: f64 = floor_px(sx)
+    let fy: f64 = floor_px(base_y)
+    var k: fcache.CKey = fcache.ckey_new(fcache.KIND_TEXT)
+    k.a = (*z).fm
+    k.b = __bits(sz)
+    k.c = ((*r).weight as u64) | (((*r).slant as u64) << 16) |
+        (((*r).kerning as u64) << 24) | (((*r).dir as u64) << 32)
+    k.d = __bits((*r).tracking)
+    k.e = __bits((*r).word_spacing)
+    k.f = __bits(sx - fx)
+    k.g = __bits(base_y - fy)
+    let e: u64 = fcache.fc_lookup(&k, p, nn)
+    if e != 0 {
+        return fcache.fc_fill(cv, e, fx as i64, fy as i64, mit_alpha(col))
+    }
+    // A miss. Only a window wholly on the canvas is kept.
+    if y0 < 0.0 || y1 > ch {
+        return false
+    }
+    // wholly outside the clip: nothing to paint, and nothing rastered
+    if x1 <= canvas.clip_x0(cv) || x0 >= canvas.clip_x1(cv) ||
+        y1 <= canvas.clip_y0(cv) || y0 >= canvas.clip_y1(cv) {
+        return true
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !raster_window_at(z, wl, wt, ww, wh, sz, &wx, &wy, false) {
+        return false
+    }
+    into_raster(z, r, false, p, nn, sx, base_y, 0.0, 0.0)
+    raster.raster_finish(&(*z).ra)
+    fcache.fc_store(&k, p, nn, &(*z).ra, wx, wy, fx as i64, fy as i64)
+    flush_raster(z, wx, wy, col)
+    return true
 }
 
 #[no_gc]
