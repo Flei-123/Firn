@@ -139,7 +139,9 @@ pub enum Ins {
     SimdLane(Simd, u8),
     /// ... a memory access: natural alignment (power of two), offset
     SimdMem(Simd, u32, u32),
-    /// ... a memory access of one lane: alignment, offset, lane
+    /// ... a memory access of one lane: alignment, offset, lane (used by
+    /// `__v128_store64` of TEMPO 7, branch `unroll`)
+    #[allow(dead_code)]
     SimdMemLane(Simd, u32, u32, u8),
     /// `v128.const`, the sixteen octets
     V128Const([u8; 16]),
