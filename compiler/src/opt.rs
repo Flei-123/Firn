@@ -416,14 +416,39 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         let t = std::time::Instant::now();
         let nounmap = crate::promote::nounmap_functions(m);
         let trace = std::env::var_os("FIRN_PROMOTE_TRACE").is_some();
+        if trace {
+            eprintln!("promote: nounmap summary {:.1} ms, {} of {} functions", t.elapsed().as_secs_f64() * 1000.0, nounmap.len(), m.funcs.len());
+        }
+        let mut t_check = 0f64;
+        let mut promoted_funcs = 0usize;
+        let mut n_check = 0usize;
         for f in m.funcs.iter_mut() {
             // Rotation alone is kept only where it lets a cell move into a
             // register: the other passes and both register allocators were
             // tuned on top-tested loops, and a rotated loop that promotes
             // nothing gains little.
+            // bisecting aids: FIRN_PROMOTE_LIMIT=n promotes in the first n
+            // functions only, FIRN_PROMOTE_ONLY=name in that one only
+            if let Some(lim) = std::env::var("FIRN_PROMOTE_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+                if st.promoted_cells > 0 && promoted_funcs >= lim {
+                    continue;
+                }
+            }
+            if let Ok(only) = std::env::var("FIRN_PROMOTE_ONLY") {
+                if f.name != only {
+                    continue;
+                }
+            }
+            let tc = std::time::Instant::now();
+            let cand = crate::promote::candidate_loops(f, &nounmap);
+            t_check += tc.elapsed().as_secs_f64() * 1000.0;
+            if cand.is_empty() && std::env::var_os("FIRN_PROMOTE_ROTATE_ALL").is_none() {
+                continue;
+            }
+            n_check += 1;
             let mut g = f.clone();
-            let r = crate::promote::rotate_loops(&mut g);
-            if r > 0 {
+            let r = crate::promote::rotate_loops(&mut g, &cand);
+            if r > 0 && std::env::var_os("FIRN_PROMOTE_CLEANUP_FIRST").is_some() {
                 optimize_func(&mut g, &mut st, cfg, &mut clk);
             }
             let p = if std::env::var_os("FIRN_PROMOTE_ONLY_ROTATE").is_some() {
@@ -442,8 +467,12 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
                     continue;
                 }
                 st.promoted_cells += p;
+                promoted_funcs += 1;
                 *f = g;
             }
+        }
+        if trace {
+            eprintln!("promote: pre-check {:.1} ms, {} functions passed it, all {:.1} ms", t_check, n_check, t.elapsed().as_secs_f64() * 1000.0);
         }
         clk.add("promote", t);
     }

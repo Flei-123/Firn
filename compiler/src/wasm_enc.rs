@@ -35,14 +35,16 @@
 
 use std::fmt::Write as _;
 
-/// The four value types of WebAssembly 1.0. (`v128` is SIMD and is refused
-/// by `codegen_wasm.rs` before it could ever get here.)
+/// The value types: the four of WebAssembly 1.0 and, since round
+/// OPT-GENERAL, `v128` of the SIMD proposal (part of the standard since 2.0,
+/// in every current browser).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VT {
     I32,
     I64,
     F32,
     F64,
+    V128,
 }
 
 impl VT {
@@ -52,6 +54,7 @@ impl VT {
             VT::I64 => 0x7E,
             VT::F32 => 0x7D,
             VT::F64 => 0x7C,
+            VT::V128 => 0x7B,
         }
     }
     pub fn name(self) -> &'static str {
@@ -60,6 +63,7 @@ impl VT {
             VT::I64 => "i64",
             VT::F32 => "f32",
             VT::F64 => "f64",
+            VT::V128 => "v128",
         }
     }
 }
@@ -84,6 +88,11 @@ pub struct NumFc(pub u32, pub &'static str);
 /// A memory access: opcode, name, natural alignment (as a power of two).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mem(pub u8, pub &'static str, pub u32);
+
+/// Round OPT-GENERAL: an instruction behind the `0xFD` (SIMD) prefix --
+/// opcode and text name, like `Num`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Simd(pub u32, pub &'static str);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ins {
@@ -124,6 +133,20 @@ pub enum Ins {
     F64Const(u64),
     Num(Num),
     Fc(NumFc),
+    /// Round OPT-GENERAL -- SIMD. A plain one (no immediate).
+    SimdOp(Simd),
+    /// ... with a lane index (`extract_lane`, `replace_lane`)
+    SimdLane(Simd, u8),
+    /// ... a memory access: natural alignment (power of two), offset
+    SimdMem(Simd, u32, u32),
+    /// ... a memory access of one lane: alignment, offset, lane
+    SimdMemLane(Simd, u32, u32, u8),
+    /// `v128.const`, the sixteen octets
+    V128Const([u8; 16]),
+    /// `i8x16.shuffle` with its sixteen lane indices (0..31)
+    Shuffle([u8; 16]),
+    /// `select` with a type: needed for `v128`
+    SelectT(VT),
 }
 
 // ------------------------------------------------------------- opcodes
@@ -635,6 +658,37 @@ fn text_of(i: &Ins, globals: &[Global], fsym: &dyn Fn(u32) -> String) -> String 
         Ins::F64Const(b) => format!("f64.const {}", hexfloat64(*b)),
         Ins::Num(n) => n.1.to_string(),
         Ins::Fc(n) => n.1.to_string(),
+        Ins::SimdOp(n) => n.1.to_string(),
+        Ins::SimdLane(n, l) => format!("{} {}", n.1, l),
+        Ins::SimdMem(n, _, off) => {
+            if *off == 0 {
+                n.1.to_string()
+            } else {
+                format!("{} offset={}", n.1, off)
+            }
+        }
+        Ins::SimdMemLane(n, _, off, l) => {
+            if *off == 0 {
+                format!("{} {}", n.1, l)
+            } else {
+                format!("{} offset={} {}", n.1, off, l)
+            }
+        }
+        Ins::V128Const(b) => {
+            let mut s = "v128.const i8x16".to_string();
+            for x in b {
+                let _ = write!(s, " {}", x);
+            }
+            s
+        }
+        Ins::Shuffle(b) => {
+            let mut s = "i8x16.shuffle".to_string();
+            for x in b {
+                let _ = write!(s, " {}", x);
+            }
+            s
+        }
+        Ins::SelectT(t) => format!("select (result {})", t.name()),
     }
 }
 
@@ -811,8 +865,85 @@ fn encode(b: &mut Vec<u8>, i: &Ins) {
             b.push(0xFC);
             uleb(b, n.0 as u64);
         }
+        Ins::SimdOp(n) => {
+            b.push(0xFD);
+            uleb(b, n.0 as u64);
+        }
+        Ins::SimdLane(n, l) => {
+            b.push(0xFD);
+            uleb(b, n.0 as u64);
+            b.push(*l);
+        }
+        Ins::SimdMem(n, align, off) => {
+            b.push(0xFD);
+            uleb(b, n.0 as u64);
+            uleb(b, *align as u64);
+            uleb(b, *off as u64);
+        }
+        Ins::SimdMemLane(n, align, off, l) => {
+            b.push(0xFD);
+            uleb(b, n.0 as u64);
+            uleb(b, *align as u64);
+            uleb(b, *off as u64);
+            b.push(*l);
+        }
+        Ins::V128Const(x) => {
+            b.push(0xFD);
+            uleb(b, 0x0C);
+            b.extend_from_slice(x);
+        }
+        Ins::Shuffle(x) => {
+            b.push(0xFD);
+            uleb(b, 0x0D);
+            b.extend_from_slice(x);
+        }
+        Ins::SelectT(t) => {
+            b.push(0x1C);
+            b.push(0x01);
+            b.push(t.byte());
+        }
     }
 }
+
+// ------------------------------------------------------- SIMD opcodes
+// (the SIMD proposal, final numbering; each one checked against wat2wasm by
+// tools/wasm/run.sh, which assembles our text form and compares octets)
+
+pub const V128_LOAD: Simd = Simd(0x00, "v128.load");
+pub const V128_STORE: Simd = Simd(0x0B, "v128.store");
+pub const I8X16_SWIZZLE: Simd = Simd(0x0E, "i8x16.swizzle");
+pub const I32X4_SPLAT: Simd = Simd(0x11, "i32x4.splat");
+pub const I64X2_SPLAT: Simd = Simd(0x12, "i64x2.splat");
+pub const F32X4_SPLAT: Simd = Simd(0x13, "f32x4.splat");
+pub const I32X4_EXTRACT_LANE: Simd = Simd(0x1B, "i32x4.extract_lane");
+pub const I32X4_REPLACE_LANE: Simd = Simd(0x1C, "i32x4.replace_lane");
+pub const I64X2_EXTRACT_LANE: Simd = Simd(0x1D, "i64x2.extract_lane");
+pub const I64X2_REPLACE_LANE: Simd = Simd(0x1E, "i64x2.replace_lane");
+pub const I32X4_GT_S: Simd = Simd(0x3B, "i32x4.gt_s");
+pub const F32X4_NE: Simd = Simd(0x42, "f32x4.ne");
+pub const F32X4_LT: Simd = Simd(0x43, "f32x4.lt");
+pub const F32X4_LE: Simd = Simd(0x45, "f32x4.le");
+pub const F32X4_GE: Simd = Simd(0x46, "f32x4.ge");
+pub const V128_NOT: Simd = Simd(0x4D, "v128.not");
+pub const V128_AND: Simd = Simd(0x4E, "v128.and");
+pub const V128_ANDNOT: Simd = Simd(0x4F, "v128.andnot");
+pub const V128_OR: Simd = Simd(0x50, "v128.or");
+pub const V128_XOR: Simd = Simd(0x51, "v128.xor");
+pub const V128_BITSELECT: Simd = Simd(0x52, "v128.bitselect");
+pub const V128_STORE64_LANE: Simd = Simd(0x5B, "v128.store64_lane");
+pub const I8X16_ADD: Simd = Simd(0x6E, "i8x16.add");
+pub const I32X4_SHL: Simd = Simd(0xAB, "i32x4.shl");
+pub const I32X4_SHR_U: Simd = Simd(0xAD, "i32x4.shr_u");
+pub const I32X4_ADD: Simd = Simd(0xAE, "i32x4.add");
+pub const I32X4_SUB: Simd = Simd(0xB1, "i32x4.sub");
+pub const I64X2_SHL: Simd = Simd(0xCB, "i64x2.shl");
+pub const I64X2_SHR_U: Simd = Simd(0xCD, "i64x2.shr_u");
+pub const I64X2_ADD: Simd = Simd(0xCE, "i64x2.add");
+pub const F32X4_ADD: Simd = Simd(0xE4, "f32x4.add");
+pub const F32X4_SUB: Simd = Simd(0xE5, "f32x4.sub");
+pub const F32X4_MUL: Simd = Simd(0xE6, "f32x4.mul");
+pub const I32X4_TRUNC_SAT_F32X4_S: Simd = Simd(0xF8, "i32x4.trunc_sat_f32x4_s");
+pub const F32X4_CONVERT_I32X4_S: Simd = Simd(0xFA, "f32x4.convert_i32x4_s");
 
 #[cfg(test)]
 mod tests {

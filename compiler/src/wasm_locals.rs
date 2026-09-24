@@ -373,3 +373,88 @@ pub fn pack(params: &[VT], locals: Vec<VT>, body: &mut Vec<Ins>) -> Vec<VT> {
     }
     slot_ty[np..].to_vec()
 }
+
+/// `if br a else br b end` -> `br_if a-1 ; br b-1`, and `if br a end` ->
+/// `br_if a-1`: the two-way branch the structurer writes for a `brcond`
+/// whose both targets are labels. One label level less inside the `if`.
+pub fn branches(body: &mut Vec<Ins>) {
+    if std::env::var_os("FIRN_WASM_NO_PEEP").is_some() {
+        return;
+    }
+    let mut out: Vec<Ins> = Vec::with_capacity(body.len());
+    let mut p = 0;
+    let n = body.len();
+    while p < n {
+        if let Ins::If = body[p] {
+            if p + 4 < n {
+                if let (Ins::Br(a), Ins::Else, Ins::Br(b), Ins::End) = (&body[p + 1], &body[p + 2], &body[p + 3], &body[p + 4]) {
+                    if *a >= 1 && *b >= 1 {
+                        out.push(Ins::BrIf(a - 1));
+                        out.push(Ins::Br(b - 1));
+                        p += 5;
+                        continue;
+                    }
+                }
+            }
+            if p + 3 < n {
+                if let (Ins::Br(a), Ins::Else, Ins::End) = (&body[p + 1], &body[p + 2], &body[p + 3]) {
+                    if *a >= 1 {
+                        out.push(Ins::BrIf(a - 1));
+                        p += 4;
+                        continue;
+                    }
+                }
+            }
+            if p + 2 < n {
+                if let (Ins::Br(a), Ins::End) = (&body[p + 1], &body[p + 2]) {
+                    if *a >= 1 {
+                        out.push(Ins::BrIf(a - 1));
+                        p += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(body[p].clone());
+        p += 1;
+    }
+    *body = out;
+}
+
+/// After packing: a copy into the same slot vanishes, and `local.set x ;
+/// local.get x` becomes `local.tee x`.
+pub fn copies(body: &mut Vec<Ins>) {
+    if std::env::var_os("FIRN_WASM_NO_PEEP").is_some() {
+        return;
+    }
+    loop {
+        let mut out: Vec<Ins> = Vec::with_capacity(body.len());
+        let mut p = 0;
+        let n = body.len();
+        let mut changed = false;
+        while p < n {
+            if p + 1 < n {
+                match (&body[p], &body[p + 1]) {
+                    (Ins::LocalGet(a), Ins::LocalSet(b)) if a == b => {
+                        p += 2;
+                        changed = true;
+                        continue;
+                    }
+                    (Ins::LocalSet(a), Ins::LocalGet(b)) if a == b => {
+                        out.push(Ins::LocalTee(*a));
+                        p += 2;
+                        changed = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(body[p].clone());
+            p += 1;
+        }
+        *body = out;
+        if !changed {
+            break;
+        }
+    }
+}

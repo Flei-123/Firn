@@ -357,7 +357,7 @@ fn fit(f: &Func) -> bool {
 
 /// Rotates every `while` shaped loop into a guarded `do while`. Yields the
 /// number of rotated loops. Needs a `mem2reg` round afterwards.
-pub(crate) fn rotate_loops(f: &mut Func) -> usize {
+pub(crate) fn rotate_loops(f: &mut Func, only: &HashSet<usize>) -> usize {
     if !fit(f) {
         return 0;
     }
@@ -370,7 +370,8 @@ pub(crate) fn rotate_loops(f: &mut Func) -> usize {
         let loops = find_loops(f, &preds, &dom);
         let mut hit = false;
         for l in &loops {
-            if tried.contains(&l.head) {
+            let all = std::env::var_os("FIRN_PROMOTE_ROTATE_ALL").is_some();
+            if tried.contains(&l.head) || (!all && !only.contains(&l.head)) {
                 continue;
             }
             tried.insert(l.head);
@@ -523,10 +524,13 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
         // uses outside H become loads
         let nb = f.blocks.len();
         for bi in 0..nb {
-            if bi == h {
-                continue;
-            }
-            // phi operands -> load at the end of the predecessor
+            // phi operands -> load at the end of the predecessor. This
+            // includes the phis of H ITSELF: an entry from a latch that
+            // names a value of H (`in_class` unchanged on a `continue`,
+            // the phi naming itself) is read at the end of that latch, and
+            // after rotation the first pass reaches the latch without ever
+            // running H -- the value has to come from the slot the guard
+            // wrote.
             let mut tail_loads: Vec<(usize, Val, Val)> = Vec::new(); // (pred, old, slot)
             {
                 let blk = &f.blocks[bi];
@@ -559,6 +563,9 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
                         break;
                     }
                 }
+            }
+            if bi == h {
+                continue; // ordinary uses inside H read the value directly
             }
             // ordinary uses -> load right in front
             let old = std::mem::take(&mut f.blocks[bi].insts);
@@ -672,36 +679,75 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
 
 // ------------------------------------------------------ side effects ---
 
-/// Functions that cannot unmap memory: no system call, no inline
-/// assembler, no thread, no indirect call, and only calls of such
-/// functions. Greatest fixed point (recursion is fine).
-pub(crate) fn nounmap_functions(m: &Module) -> HashSet<String> {
-    let mut ok: HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
-    loop {
-        let mut drop: Vec<String> = Vec::new();
-        for f in &m.funcs {
-            if !ok.contains(&f.name) {
-                continue;
+/// System calls (canonical x86-64 numbers, which FIR carries on every
+/// target) that can take memory away or share it with another thread of
+/// control: munmap, mremap, brk, mprotect, madvise, clone, fork, vfork,
+/// execve, shmdt, execveat, clone3. Every other call is an ordinary
+/// read/write of memory for this pass. An unknown number is the worst case.
+fn syscall_unmaps(nr: Option<i128>) -> bool {
+    match nr {
+        Some(n) => matches!(n, 10 | 11 | 12 | 25 | 28 | 56 | 57 | 58 | 59 | 67 | 322 | 435),
+        None => true,
+    }
+}
+
+fn const_defs(f: &Func) -> HashMap<Val, i128> {
+    let mut cnt: HashMap<Val, u32> = HashMap::new();
+    let mut val: HashMap<Val, i128> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                *cnt.entry(d).or_insert(0) += 1;
+                if let Op::Const(c) = &i.op {
+                    val.insert(d, *c);
+                }
             }
-            let bad = f.blocks.iter().any(|b| {
-                b.insts.iter().any(|i| match &i.op {
-                    Op::Syscall { .. } | Op::Asm { .. } | Op::ThreadSpawn { .. } | Op::CallIndirect { .. } => true,
-                    Op::Call { name, .. } => !ok.contains(name),
-                    _ => false,
-                })
-            });
-            if bad {
-                drop.push(f.name.clone());
-            }
-        }
-        if drop.is_empty() {
-            break;
-        }
-        for d in drop {
-            ok.remove(&d);
         }
     }
-    ok
+    val.retain(|k, _| cnt.get(k).copied() == Some(1));
+    val
+}
+
+/// Functions that cannot unmap memory: no system call that may (see
+/// `syscall_unmaps`), no inline assembler, no thread, no indirect call, and
+/// only calls of such functions. Greatest fixed point (recursion is fine).
+pub(crate) fn nounmap_functions(m: &Module) -> HashSet<String> {
+    // per function: does it do something bad itself, and whom does it call
+    let idx: HashMap<&str, usize> = m.funcs.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+    let n = m.funcs.len();
+    let mut bad = vec![false; n];
+    let mut callers: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (fi, f) in m.funcs.iter().enumerate() {
+        let consts = const_defs(f);
+        for b in &f.blocks {
+            for i in &b.insts {
+                match &i.op {
+                    Op::Syscall { args } => {
+                        if syscall_unmaps(args.first().and_then(|a| consts.get(a).copied())) {
+                            bad[fi] = true;
+                        }
+                    }
+                    Op::Asm { .. } | Op::ThreadSpawn { .. } | Op::CallIndirect { .. } => bad[fi] = true,
+                    Op::Call { name, .. } => match idx.get(name.as_str()) {
+                        Some(&c) => callers[c].push(fi),
+                        None => bad[fi] = true,
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+    // everything that reaches a bad function is bad
+    let mut work: Vec<usize> = (0..n).filter(|i| bad[*i]).collect();
+    while let Some(c) = work.pop() {
+        for &k in &callers[c] {
+            if !bad[k] {
+                bad[k] = true;
+                work.push(k);
+            }
+        }
+    }
+    m.funcs.iter().enumerate().filter(|(i, _)| !bad[*i]).map(|(_, f)| f.name.clone()).collect()
 }
 
 /// One memory access with a decomposed address.
@@ -729,6 +775,10 @@ struct Ctx<'a> {
     def: Vec<Option<(usize, usize)>>,
     private: HashSet<Val>,
     nounmap: &'a HashSet<String>,
+    /// per instruction: its effect, and for a load/store the decomposed
+    /// address (computed once -- the analysis asks for every cell)
+    effs: Vec<Vec<Eff>>,
+    addrs: Vec<Vec<Option<(Val, Option<i64>)>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -744,7 +794,24 @@ impl<'a> Ctx<'a> {
             }
         }
         let private = private_slots(f);
-        Ctx { f, def, private, nounmap }
+        let mut cx = Ctx { f, def, private, nounmap, effs: Vec::new(), addrs: Vec::new() };
+        let mut effs = Vec::with_capacity(f.blocks.len());
+        let mut addrs = Vec::with_capacity(f.blocks.len());
+        for b in &f.blocks {
+            effs.push(b.insts.iter().map(|i| cx.eff(i)).collect::<Vec<Eff>>());
+            addrs.push(
+                b.insts
+                    .iter()
+                    .map(|i| match &i.op {
+                        Op::Load { addr } | Op::Store { addr, .. } => Some(cx.decompose(*addr)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        cx.effs = effs;
+        cx.addrs = addrs;
+        cx
     }
     fn op_of(&self, v: Val) -> Option<&Inst> {
         let (b, i) = (*self.def.get(v as usize)?)?;
@@ -830,7 +897,15 @@ impl<'a> Ctx<'a> {
                     Eff::Unmap
                 }
             }
-            Op::CallIndirect { .. } | Op::Syscall { .. } | Op::Asm { .. } | Op::ThreadSpawn { .. } => Eff::Unmap,
+            Op::Syscall { args } => {
+                let nr = args.first().and_then(|a| self.const_of(*a)).map(|c| c as i128);
+                if syscall_unmaps(nr) {
+                    Eff::Unmap
+                } else {
+                    Eff::Wild { read: true, write: true }
+                }
+            }
+            Op::CallIndirect { .. } | Op::Asm { .. } | Op::ThreadSpawn { .. } => Eff::Unmap,
             _ => Eff::Pure,
         }
     }
@@ -945,30 +1020,29 @@ impl<'a> Ctx<'a> {
         }
         true
     }
-    fn is_exact(&self, i: &Inst, k: &Cell) -> Option<bool> {
-        // Some(false) = exact load, Some(true) = exact store
-        let (addr, store) = match &i.op {
-            Op::Load { addr } => (*addr, false),
-            Op::Store { addr, .. } => (*addr, true),
+    /// Some(false) = exact load of `k`, Some(true) = exact store
+    fn is_exact(&self, b: usize, ii: usize, k: &Cell) -> Option<bool> {
+        let i = &self.f.blocks[b].insts[ii];
+        let store = match &i.op {
+            Op::Load { .. } => false,
+            Op::Store { .. } => true,
             _ => return None,
         };
         if i.ty != k.ty {
             return None;
         }
-        let (r, o) = self.decompose(addr);
-        if r == k.root && o == Some(k.off) {
-            Some(store)
-        } else {
-            None
+        match self.addrs[b][ii] {
+            Some((r, o)) if r == k.root && o == Some(k.off) => Some(store),
+            _ => None,
         }
     }
     /// Does the instruction touch `k` in any way other than an exact access?
     /// Yields (reads, writes).
-    fn clobbers(&self, i: &Inst, k: &Cell) -> (bool, bool) {
-        if self.is_exact(i, k).is_some() {
+    fn clobbers(&self, b: usize, ii: usize, k: &Cell) -> (bool, bool) {
+        if self.is_exact(b, ii, k).is_some() {
             return (false, false);
         }
-        match self.eff(i) {
+        match self.effs[b][ii].clone() {
             Eff::Pure => (false, false),
             Eff::Mem(v) => {
                 let mut r = false;
@@ -993,6 +1067,26 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Cheap pre-check (one dominator computation): is there a loop without
+/// anything that may unmap memory, with a load or store of a cell whose root
+/// comes from outside the loop? Only then is rotating and promoting worth
+/// the compile time -- measured on bin/firnc1.fi, three functions of 1,300
+/// pass it.
+pub(crate) fn candidate_loops(f: &mut Func, nounmap: &HashSet<String>) -> HashSet<usize> {
+    let mut heads: HashSet<usize> = HashSet::new();
+    if !fit(f) {
+        return heads;
+    }
+    let mut rejected: HashSet<(usize, Cell)> = HashSet::new();
+    let mut found: Vec<(usize, Vec<usize>)> = Vec::new();
+    scan(f, nounmap, &mut rejected, Some(&mut found));
+    for (h, children) in found {
+        heads.insert(h);
+        heads.extend(children);
+    }
+    heads
+}
+
 /// Keeps memory cells in registers across loops (see the module text).
 /// Yields the number of promoted cells. Needs a `mem2reg` round afterwards.
 pub(crate) fn promote_cells(f: &mut Func, nounmap: &HashSet<String>) -> usize {
@@ -1002,7 +1096,7 @@ pub(crate) fn promote_cells(f: &mut Func, nounmap: &HashSet<String>) -> usize {
     let mut done = 0;
     let mut rejected: HashSet<(usize, Cell)> = HashSet::new();
     for _ in 0..256 {
-        match promote_one(f, nounmap, &mut rejected) {
+        match scan(f, nounmap, &mut rejected, None) {
             true => done += 1,
             false => break,
         }
@@ -1012,7 +1106,17 @@ pub(crate) fn promote_cells(f: &mut Func, nounmap: &HashSet<String>) -> usize {
 
 /// Finds and promotes ONE cell (outer loops first). The analysis is rebuilt
 /// after every change, which keeps each step simple.
-fn promote_one(f: &mut Func, nounmap: &HashSet<String>, rejected: &mut HashSet<(usize, Cell)>) -> bool {
+/// With `found == None`: finds and promotes ONE cell. With `Some`: only
+/// looks (before rotation, with the two conditions rotation establishes
+/// relaxed) and collects every loop that has a cell, with its direct
+/// children -- the loops worth rotating.
+fn scan(
+    f: &mut Func,
+    nounmap: &HashSet<String>,
+    rejected: &mut HashSet<(usize, Cell)>,
+    mut found: Option<&mut Vec<(usize, Vec<usize>)>>,
+) -> bool {
+    let check = found.is_some();
     let preds = crate::mem2reg::preds(f);
     let dom = crate::mem2reg::dominators(f);
     let loops = find_loops(f, &preds, &dom);
@@ -1032,14 +1136,14 @@ fn promote_one(f: &mut Func, nounmap: &HashSet<String>, rejected: &mut HashSet<(
             continue;
         }
         let ph = outer[0];
-        if !matches!(f.blocks[ph].term, Term::Br(t) if t as usize == x) {
+        if !check && !matches!(f.blocks[ph].term, Term::Br(t) if t as usize == x) {
             continue;
         }
         let blocks: Vec<usize> = (0..f.blocks.len()).filter(|b| l.has(*b)).collect();
         // (2) nothing that may unmap memory
         let unmap = blocks
             .iter()
-            .any(|&b| f.blocks[b].insts.iter().any(|i| matches!(cx.eff(i), Eff::Unmap)));
+            .any(|&b| cx.effs[b].iter().any(|e| matches!(e, Eff::Unmap)));
         if unmap {
             continue;
         }
@@ -1070,15 +1174,14 @@ fn promote_one(f: &mut Func, nounmap: &HashSet<String>, rejected: &mut HashSet<(
         // candidate cells
         let mut cells: Vec<Cell> = Vec::new();
         for &b in &blocks {
-            for i in &f.blocks[b].insts {
-                let addr = match &i.op {
-                    Op::Load { addr } | Op::Store { addr, .. } => *addr,
-                    _ => continue,
+            for (ii, i) in f.blocks[b].insts.iter().enumerate() {
+                let (root, off) = match cx.addrs[b][ii] {
+                    Some(x) => x,
+                    None => continue,
                 };
                 if matches!(i.ty, FTy::V128 | FTy::Void) {
                     continue;
                 }
-                let (root, off) = cx.decompose(addr);
                 let off = match off {
                     Some(o) => o,
                     None => continue,
@@ -1101,7 +1204,14 @@ fn promote_one(f: &mut Func, nounmap: &HashSet<String>, rejected: &mut HashSet<(
         }
         cells.truncate(MAX_CELLS);
         for k in cells {
-            match analyse(f, &cx, &preds, &dom, &loops, l, &blocks, &children, &exiting, ph, &k) {
+            match analyse(f, &cx, &preds, &dom, &loops, l, &blocks, &children, &exiting, check, &k) {
+                Some(_) if check => {
+                    let ch: Vec<usize> = children.iter().map(|&c| loops[c].head).collect();
+                    if let Some(v) = found.as_deref_mut() {
+                        v.push((x, ch));
+                    }
+                    break; // one cell is enough to rotate this loop
+                }
                 Some(plan) => {
                     drop(cx);
                     if std::env::var_os("FIRN_PROMOTE_TRACE").is_some() {
@@ -1145,7 +1255,7 @@ fn analyse(
     blocks: &[usize],
     children: &[usize],
     exiting: &[usize],
-    _ph: usize,
+    relaxed: bool,
     k: &Cell,
 ) -> Option<Plan> {
     let n = f.blocks.len();
@@ -1162,8 +1272,8 @@ fn analyse(
             if !lc.has(b) {
                 continue;
             }
-            for i in &f.blocks[b].insts {
-                let (r, w) = cx.clobbers(i, k);
+            for ii in 0..f.blocks[b].insts.len() {
+                let (r, w) = cx.clobbers(b, ii, k);
                 if r || w {
                     touched = true;
                     break 'scan;
@@ -1179,7 +1289,7 @@ fn analyse(
             return None;
         }
         let pc = outer[0];
-        if !matches!(f.blocks[pc].term, Term::Br(t) if t as usize == lc.head) || !l.has(pc) {
+        if !relaxed && (!matches!(f.blocks[pc].term, Term::Br(t) if t as usize == lc.head) || !l.has(pc)) {
             return None;
         }
         for b in 0..n {
@@ -1224,7 +1334,7 @@ fn analyse(
         }
         let dall = dominates_all(b);
         for (ii, i) in f.blocks[b].insts.iter().enumerate() {
-            if let Some(st) = cx.is_exact(i, k) {
+            if let Some(st) = cx.is_exact(b, ii, k) {
                 if f.is_secret(i.dst.unwrap_or(u32::MAX)) {
                     return None;
                 }
@@ -1245,7 +1355,7 @@ fn analyse(
                 }
                 continue;
             }
-            let (r, w) = cx.clobbers(i, k);
+            let (r, w) = cx.clobbers(b, ii, k);
             if w {
                 return None;
             }
@@ -1255,7 +1365,7 @@ fn analyse(
                 // dirty, which the write back handles -- but a partial
                 // overlap through the SAME root is a sign of type punning,
                 // keep away from it
-                if let Eff::Mem(v) = cx.eff(i) {
+                if let Eff::Mem(v) = &cx.effs[b][ii] {
                     if v.iter().any(|a| a.root == k.root) {
                         return None;
                     }
@@ -1264,10 +1374,15 @@ fn analyse(
             }
         }
     }
-    if exact.is_empty() || !guard_access {
+    if exact.is_empty() {
         return None;
     }
-    if any_store && !guard_store {
+    // the pre-check (before rotation) cannot ask for these two: rotation is
+    // what makes the body's first block dominate the loop exit
+    if !relaxed && !guard_access {
+        return None;
+    }
+    if !relaxed && any_store && !guard_store {
         return None;
     }
     // Is it worth it? At least one exact access inside a loop block that
