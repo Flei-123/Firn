@@ -292,49 +292,53 @@ fn frost_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     let sw: i64 = (iw + f - 1) / f
     let sh: i64 = (ih + f - 1) / f
     let n: usize = (sw * sh * 4) as usize
-    let a: *mut u8 = rt.heap_alloc(n) as *mut u8
-    if a as usize == 0 {
+    // one block of memory: the small band, its blur partner, one
+    // stretched row, and the table of the columns (source + weight)
+    let rowb: usize = (sw * 4) as usize
+    let tab: usize = (iw * 16) as usize
+    let all: usize = 2 * n + rowb + tab
+    let mem0: u64 = rt.heap_alloc(all)
+    if mem0 == 0 {
         return false
     }
-    let b: *mut u8 = rt.heap_alloc(n) as *mut u8
-    if b as usize == 0 {
-        rt.heap_free(a as u64, n)
-        return false
-    }
+    let a: *mut u8 = mem0 as *mut u8
+    let b: *mut u8 = (mem0 + n as u64) as *mut u8
+    let vrow: u64 = mem0 + (2 * n) as u64
+    let ctab: u64 = vrow + rowb as u64
     let px: u64 = canvas.canvas_pixels(cv) as u64
-    // 1. SHRINK: the average of each f x f block (a block at the edge
-    //    counts only the pixels it has)
+    let stride: i64 = cw * 4
+    // 1. SHRINK: each small pixel is the mean of the 2 x 2 pixels in the
+    //    middle of its f x f block. The blur that follows is several small
+    //    pixels wide, so the other samples add nothing one could see --
+    //    and reading every pixel of the band was the dearest step.
+    let off: i64 = f / 2 - (f / 4)
     var sy: i64 = 0
     while sy < sh {
+        var ya: i64 = sy * f + off
+        if ya > ih - 1 { ya = ih - 1 }
+        var yb: i64 = ya + f / 2
+        if f < 2 { yb = ya }
+        if yb > ih - 1 { yb = ih - 1 }
+        let ra: u64 = px + ((y0 + ya) * stride + x0 * 4) as u64
+        let rb: u64 = px + ((y0 + yb) * stride + x0 * 4) as u64
+        var d: u64 = a as u64 + (sy * sw * 4) as u64
         var sx: i64 = 0
         while sx < sw {
-            var s0: i64 = 0
-            var s1: i64 = 0
-            var s2: i64 = 0
-            var s3: i64 = 0
-            var cnt: i64 = 0
-            var by: i64 = sy * f
-            while by < sy * f + f && by < ih {
-                var bx: i64 = sx * f
-                var q: u64 = px + (((y0 + by) * cw + x0 + bx) * 4) as u64
-                while bx < sx * f + f && bx < iw {
-                    s0 = s0 + (ld8(q) as i64)
-                    s1 = s1 + (ld8(q + 1) as i64)
-                    s2 = s2 + (ld8(q + 2) as i64)
-                    s3 = s3 + (ld8(q + 3) as i64)
-                    cnt = cnt + 1
-                    q = q + 4
-                    bx = bx + 1
-                }
-                by = by + 1
+            var xa: i64 = sx * f + off
+            if xa > iw - 1 { xa = iw - 1 }
+            var xb: i64 = xa + f / 2
+            if f < 2 { xb = xa }
+            if xb > iw - 1 { xb = iw - 1 }
+            let qa: u64 = (xa * 4) as u64
+            let qb: u64 = (xb * 4) as u64
+            var k: u64 = 0
+            while k < 4 {
+                let v: i64 = ((*((ra + qa + k) as *mut u8)) as i64) + ((*((ra + qb + k) as *mut u8)) as i64)
+                    + ((*((rb + qa + k) as *mut u8)) as i64) + ((*((rb + qb + k) as *mut u8)) as i64)
+                *((d + k) as *mut u8) = ((v + 2) >> 2) as u8
+                k = k + 1
             }
-            let d: u64 = a as u64 + ((sy * sw + sx) * 4) as u64
-            if cnt > 0 {
-                st8(d, ((s0 + cnt / 2) / cnt) as u8)
-                st8(d + 1, ((s1 + cnt / 2) / cnt) as u8)
-                st8(d + 2, ((s2 + cnt / 2) / cnt) as u8)
-                st8(d + 3, ((s3 + cnt / 2) / cnt) as u8)
-            }
+            d = d + 4
             sx = sx + 1
         }
         sy = sy + 1
@@ -343,68 +347,90 @@ fn frost_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     var rs: i64 = (blur + f / 2) / f
     if rs < 1 { rs = 1 }
     blur_buffer(a, b, sw as usize, sh as usize, rs)
-    // 3. STRETCH back bilinearly and lay the tint over it
+    // 3. THE TINT, laid over the SMALL band: stretching is linear, so
+    //    tinting before or after gives the same colours -- and before it
+    //    is f^2 times fewer pixels. premultiplied: out = v (1 - ta) + t ta
     let ta: i64 = ((tint >> 24) & 255 as u32) as i64
     let inv: i64 = 255 - ta
-    let t0: i64 = (((tint >> 16) & 255 as u32) as i64) * ta
-    let t1: i64 = (((tint >> 8) & 255 as u32) as i64) * ta
-    let t2: i64 = ((tint & 255 as u32) as i64) * ta
-    let t3: i64 = 255 * ta
+    var tk: [i64; 4] = [0; 4]
+    tk[0] = (((tint >> 16) & 255 as u32) as i64) * ta
+    tk[1] = (((tint >> 8) & 255 as u32) as i64) * ta
+    tk[2] = ((tint & 255 as u32) as i64) * ta
+    tk[3] = 255 * ta
+    var i: usize = 0
+    while i < n {
+        let q: u64 = a as u64 + i as u64
+        let v: i64 = ((*((q) as *mut u8)) as i64) * inv + tk[i & 3] + 128
+        *((q) as *mut u8) = ((v + (v >> 8)) >> 8) as u8
+        i = i + 1
+    }
+    // 4. THE COLUMN TABLE: for every pixel of the band, the small column
+    //    left of it (times 4, an octet offset) and the weight of the one
+    //    right of it, in 1/256 -- centres aligned.
+    var xx: i64 = 0
+    while xx < iw {
+        var fx: i64 = ((xx * 2 + 1) * 128) / f - 128
+        if fx < 0 { fx = 0 }
+        var c0: i64 = fx >> 8
+        var wx: i64 = fx & 255
+        if c0 >= sw - 1 {
+            c0 = sw - 1
+            wx = 0
+        }
+        let e: u64 = ctab + (xx * 16) as u64
+        *(e as *mut i64) = c0 * 4
+        *((e + 8) as *mut i64) = wx
+        xx = xx + 1
+    }
+    // 5. STRETCH: per row of the band, the two small rows are mixed ONCE
+    //    into `vrow`, then every pixel mixes two neighbours of it.
     var yy: i64 = 0
     while yy < ih {
-        // the source row in 1/256 of a small pixel, centres aligned
         var fy: i64 = ((yy * 2 + 1) * 128) / f - 128
         if fy < 0 { fy = 0 }
-        var r0: i64 = fy / 256
-        var wy: i64 = fy - r0 * 256
-        if r0 > sh - 1 {
+        var r0: i64 = fy >> 8
+        var wy: i64 = fy & 255
+        if r0 >= sh - 1 {
             r0 = sh - 1
             wy = 0
         }
         var r1: i64 = r0 + 1
         if r1 > sh - 1 { r1 = sh - 1 }
-        let row0: u64 = a as u64 + ((r0 * sw) * 4) as u64
-        let row1: u64 = a as u64 + ((r1 * sw) * 4) as u64
-        var o: u64 = px + (((y0 + yy) * cw + x0) * 4) as u64
-        var xx: i64 = 0
+        let s0: u64 = a as u64 + (r0 * sw * 4) as u64
+        let s1: u64 = a as u64 + (r1 * sw * 4) as u64
+        var j: u64 = 0
+        let jn: u64 = (sw * 4) as u64
+        while j < jn {
+            let u: i64 = (*((s0 + j) as *mut u8)) as i64
+            *((vrow + j) as *mut u8) = (u + ((((*((s1 + j) as *mut u8)) as i64) - u) * wy >> 8)) as u8
+            j = j + 1
+        }
+        var o: u64 = px + ((y0 + yy) * stride + x0 * 4) as u64
+        var e: u64 = ctab
+        xx = 0
         while xx < iw {
-            var fx: i64 = ((xx * 2 + 1) * 128) / f - 128
-            if fx < 0 { fx = 0 }
-            var c0: i64 = fx / 256
-            var wx: i64 = fx - c0 * 256
-            if c0 > sw - 1 {
-                c0 = sw - 1
-                wx = 0
-            }
-            var c1: i64 = c0 + 1
-            if c1 > sw - 1 { c1 = sw - 1 }
-            let p00: u64 = row0 + (c0 * 4) as u64
-            let p01: u64 = row0 + (c1 * 4) as u64
-            let p10: u64 = row1 + (c0 * 4) as u64
-            let p11: u64 = row1 + (c1 * 4) as u64
-            let w00: i64 = (256 - wx) * (256 - wy)
-            let w01: i64 = wx * (256 - wy)
-            let w10: i64 = (256 - wx) * wy
-            let w11: i64 = wx * wy
-            var k: u64 = 0
-            while k < 4 {
-                let v: i64 = ((ld8(p00 + k) as i64) * w00 + (ld8(p01 + k) as i64) * w01
-                    + (ld8(p10 + k) as i64) * w10 + (ld8(p11 + k) as i64) * w11
-                    + 32768) / 65536
-                var tk: i64 = t3
-                if k == 0 { tk = t0 }
-                if k == 1 { tk = t1 }
-                if k == 2 { tk = t2 }
-                st8(o + k, ((v * inv + tk + 127) / 255) as u8)
-                k = k + 1
+            let c: u64 = vrow + (*(e as *mut i64)) as u64
+            let wx: i64 = *((e + 8) as *mut i64)
+            if wx == 0 {
+                *((o) as *mut u8) = (*((c) as *mut u8))
+                *((o + 1) as *mut u8) = (*((c + 1) as *mut u8))
+                *((o + 2) as *mut u8) = (*((c + 2) as *mut u8))
+                *((o + 3) as *mut u8) = (*((c + 3) as *mut u8))
+            } else {
+                var k: u64 = 0
+                while k < 4 {
+                    let u: i64 = (*((c + k) as *mut u8)) as i64
+                    *((o + k) as *mut u8) = (u + ((((*((c + 4 + k) as *mut u8)) as i64) - u) * wx >> 8)) as u8
+                    k = k + 1
+                }
             }
             o = o + 4
+            e = e + 16
             xx = xx + 1
         }
         yy = yy + 1
     }
-    rt.heap_free(b as u64, n)
-    rt.heap_free(a as u64, n)
+    rt.heap_free(mem0, all)
     return true
 }
 
