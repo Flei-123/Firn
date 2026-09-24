@@ -1,0 +1,857 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/a11y_main.fi -- DIE BARRIEREFREIHEIT WIRD NACHGERECHNET.
+//
+// lib/fui/a11y.fi behauptet vier Dinge: jede Art hat eine Rolle, jedes
+// Bedienelement einen Namen aus der richtigen Quelle, einen Zustand, und
+// einen Platz in der Tab-Reihenfolge, der beim Wandern ins Bild rollt.
+// Dazu gibt es den ganzen Baum als Text aus. Jede dieser Behauptungen
+// wird hier mit Sollwerten gerechnet, die VON HAND bestimmt sind -- die
+// Zahl steht jeweils in der Beschriftung, und `got`/`want` daneben.
+//
+//   0. Die Klammer: fuer jeden Knoten des Baumes gibt es einen Platz.
+//   1. DIE ROLLEN. Alle 23 Arten aus widget.fi, jede einzeln, mit der
+//      Nummer ihrer Rolle (ROLE_* in a11y.fi). Dazu Bild und Kasten,
+//      die Ueberschreibung (Text -> heading) samt Ruecknahme, und der
+//      Zusammenhang: Text in einer Liste ist ein listitem, ein Knopf
+//      in einer Liste bleibt ein Knopf, Kasten in Tabelle ist row und
+//      Text darin cell.
+//   2. DER NAME. Jede der vier Quellen einmal gewinnend, in ihrer
+//      Reihenfolge: ausdruecklich (1) vor eigener Beschriftung (2) vor
+//      Etikett per Kennung (3) vor Inhalt (4). Leerraum wird
+//      zusammengezogen ("  Sichern  " -> 7 Zeichen), ein Name aus
+//      Leerzeichen ist keiner, das Textfeld nimmt seinen Text NICHT als
+//      Namen, eine Gruppe nimmt den Text ihrer Kinder nicht. Und: ein
+//      Knopf ohne Namen wird GEZAEHLT (a11y_unnamed).
+//   3. DER ZUSTAND. Angehakt (16), halb (32), Schalter an, einrastender
+//      Knopf gedrueckt (64), Reiter ausgewaehlt (8), das Auswahlbit
+//      eines Ankreuzfeldes NICHT als "ausgewaehlt", auf/zu (128/256),
+//      schreibgeschuetzt (512), gesperrt (4) und dann nicht
+//      fokussierbar, Wert 620 von 0..1000, "3 von 12" in einer Liste --
+//      und ein Trenner zaehlt dabei nicht mit.
+//   4. DIE TAB-REIHENFOLGE ueber einen Baum, dessen Feldreihenfolge von
+//      der Baumreihenfolge ABWEICHT, mit einem gesperrten Element: Tab,
+//      Umschalt+Tab, das Umlaufen am Ende, und das Freigeben.
+//   5. DER FOKUS ROLLT MIT. Eine Liste aus 20 Zeilen zu 40 Punkten in
+//      einem Ausschnitt von 200 Punkten Hoehe (Inhalt 800). Die
+//      Verschiebungen sind von Hand aus viewport.fi gerechnet:
+//      Zeile 6 liegt bei 200..240, also 240 - 200 = 40; Zeile 20 bei
+//      760..800, also 800 - 200 = 600 (= groesste Verschiebung);
+//      zurueck zu Zeile 1 heisst 0. Mit Polster 4: 200 - 4 = 196 bis
+//      240 + 4 = 244, also 244 - 200 = 44. Dazu, ob der Fokus sichtbar
+//      ist: ja im Bild, nein weggerollt, nein bei einer Zeile, deren
+//      Raender das Polster anschneidet (0..188 gegen 4..184), und ja,
+//      sobald sie 180 breit mittig bei x = 4 steht.
+//   6. DER BAUM ALS TEXT, Zeile fuer Zeile gegen eine von Hand
+//      geschriebene Erwartung, samt Zeilenzahl und der Laenge, die bei
+//      einem zu kleinen Puffer gemeldet wird.
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.widget
+import fui.flex
+import fui.painter
+import fui.render
+import fui.viewport
+import fui.control
+import fui.scene
+import fui.a11y
+
+const FONTSET_BYTES: usize = 4096
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 52 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Die Rolle eines frisch angelegten Widget-Knotens der Art `k`.
+fn rolle_von(k: u32) -> i64 {
+    var sc: scene.Scene = scene.scene_new()
+    var ax: a11y.A11y = a11y.a11y_new()
+    let r: usize = scene.scene_add(&sc, scene.SCENE_NONE, scene.N_BOX)
+    let e: usize = scene.scene_widget(&sc, r, k, 0, 0)
+    return a11y.a11y_role(&sc, &ax, e) as i64
+}
+
+// Vergleicht `n` Bytes ab `a` mit `b`. 1 = gleich.
+fn gleich(a: u64, b: u64, n: usize) -> i64 {
+    var k: usize = 0
+    while k < n {
+        if rt.ld8(a, k) != rt.ld8(b, k) {
+            return 0
+        }
+        k = k + 1
+    }
+    return 1
+}
+
+// Der Anfang der Zeile `z` (ab 0) in einem Text aus `n` Bytes, oder `n`.
+fn zeile_ab(p: u64, n: usize, z: usize) -> usize {
+    var k: usize = 0
+    var gesehen: usize = 0
+    if z == 0 {
+        return 0
+    }
+    while k < n {
+        if rt.ld8(p, k) == 10 as u8 {
+            gesehen = gesehen + 1
+            if gesehen == z {
+                return k + 1
+            }
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// Die Laenge der Zeile, die bei `a` beginnt (ohne den Zeilenwechsel).
+fn zeile_lang(p: u64, n: usize, a: usize) -> usize {
+    var k: usize = a
+    while k < n && rt.ld8(p, k) != 10 as u8 {
+        k = k + 1
+    }
+    return k - a
+}
+
+// Stimmt Zeile `z` des Textes GENAU mit der Erwartung ueberein? 1 = ja.
+fn zeile_gleich(p: u64, n: usize, z: usize, soll: u64, sn: usize) -> i64 {
+    let a: usize = zeile_ab(p, n, z)
+    if zeile_lang(p, n, a) != sn {
+        return 0
+    }
+    return gleich(p + a as u64, soll, sn)
+}
+
+// Einmal Tab (oder Umschalt+Tab) auf dem Baum -- und hat es gerollt,
+// wird der Baum neu angeordnet, wie es eine Anwendung nach jeder
+// Aenderung der Rollposition tut (a11y_reveal sagt, warum).
+fn tab(pn: *mut control.Panel, sc: *mut scene.Scene, c: *mut render.Ctx,
+    zurueck: bool) -> bool {
+    var gerollt: bool = false
+    a11y.a11y_tab(pn, sc, zurueck, &gerollt)
+    if gerollt {
+        scene.scene_layout(sc, c, 0.0, 0.0, 400.0, 400.0)
+    }
+    return gerollt
+}
+
+// Wie viele Zeilen der Text hat (jede endet auf einen Zeilenwechsel).
+fn zeilen_von(p: u64, n: usize) -> usize {
+    var k: usize = 0
+    var z: usize = 0
+    while k < n {
+        if rt.ld8(p, k) == 10 as u8 {
+            z = z + 1
+        }
+        k = k + 1
+    }
+    return z
+}
+
+fn main(start: u64) -> i32 {
+    // ================================================ 0. DIE KLAMMER
+    var n1: [u8; 46] = "0 fuer jeden der 128 Knoten ein Platz (1 = ja)"
+    report((&n1[0]) as u64, 46, a11y.a11y_limits_ok(),
+        a11y.a11y_limits_ok() as i64, 1)
+
+    // ================================================ 1. DIE ROLLEN
+    //
+    // Jede der 23 Arten einzeln, die Sollnummer ist die ROLE_*-Nummer
+    // aus a11y.fi, von Hand eingesetzt.
+    var n2: [u8; 27] = "1 KIND_NONE ist generic (1)"
+    report((&n2[0]) as u64, 27, rolle_von(widget.KIND_NONE) == 1,
+        rolle_von(widget.KIND_NONE), 1)
+    var n3: [u8; 25] = "1 KIND_LABEL ist text (2)"
+    report((&n3[0]) as u64, 25, rolle_von(widget.KIND_LABEL) == 2,
+        rolle_von(widget.KIND_LABEL), 2)
+    var n4: [u8; 28] = "1 KIND_BUTTON ist button (3)"
+    report((&n4[0]) as u64, 28, rolle_von(widget.KIND_BUTTON) == 3,
+        rolle_von(widget.KIND_BUTTON), 3)
+    var n5: [u8; 28] = "1 KIND_TOGGLE ist switch (6)"
+    report((&n5[0]) as u64, 28, rolle_von(widget.KIND_TOGGLE) == 6,
+        rolle_von(widget.KIND_TOGGLE), 6)
+    var n6: [u8; 32] = "1 KIND_CHECKBOX ist checkbox (4)"
+    report((&n6[0]) as u64, 32, rolle_von(widget.KIND_CHECKBOX) == 4,
+        rolle_von(widget.KIND_CHECKBOX), 4)
+    var n7: [u8; 26] = "1 KIND_RADIO ist radio (5)"
+    report((&n7[0]) as u64, 26, rolle_von(widget.KIND_RADIO) == 5,
+        rolle_von(widget.KIND_RADIO), 5)
+    var n8: [u8; 30] = "1 KIND_TEXTBOX ist textbox (8)"
+    report((&n8[0]) as u64, 30, rolle_von(widget.KIND_TEXTBOX) == 8,
+        rolle_von(widget.KIND_TEXTBOX), 8)
+    var n9: [u8; 28] = "1 KIND_SLIDER ist slider (7)"
+    report((&n9[0]) as u64, 28, rolle_von(widget.KIND_SLIDER) == 7,
+        rolle_von(widget.KIND_SLIDER), 7)
+    var n10: [u8; 35] = "1 KIND_PROGRESS ist progressbar (9)"
+    report((&n10[0]) as u64, 35, rolle_von(widget.KIND_PROGRESS) == 9,
+        rolle_von(widget.KIND_PROGRESS), 9)
+    var n11: [u8; 33] = "1 KIND_DROPDOWN ist combobox (10)"
+    report((&n11[0]) as u64, 33, rolle_von(widget.KIND_DROPDOWN) == 10,
+        rolle_von(widget.KIND_DROPDOWN), 10)
+    var n12: [u8; 25] = "1 KIND_LIST ist list (11)"
+    report((&n12[0]) as u64, 25, rolle_von(widget.KIND_LIST) == 11,
+        rolle_von(widget.KIND_LIST), 11)
+    var n13: [u8; 23] = "1 KIND_TAB ist tab (18)"
+    report((&n13[0]) as u64, 23, rolle_von(widget.KIND_TAB) == 18,
+        rolle_von(widget.KIND_TAB), 18)
+    var n14: [u8; 31] = "1 KIND_TOOLBAR ist toolbar (22)"
+    report((&n14[0]) as u64, 31, rolle_von(widget.KIND_TOOLBAR) == 22,
+        rolle_von(widget.KIND_TOOLBAR), 22)
+    var n15: [u8; 25] = "1 KIND_MENU ist menu (20)"
+    report((&n15[0]) as u64, 25, rolle_von(widget.KIND_MENU) == 20,
+        rolle_von(widget.KIND_MENU), 20)
+    var n16: [u8; 35] = "1 KIND_SCROLLBAR ist scrollbar (23)"
+    report((&n16[0]) as u64, 35, rolle_von(widget.KIND_SCROLLBAR) == 23,
+        rolle_von(widget.KIND_SCROLLBAR), 23)
+    var n17: [u8; 35] = "1 KIND_SEPARATOR ist separator (24)"
+    report((&n17[0]) as u64, 35, rolle_von(widget.KIND_SEPARATOR) == 24,
+        rolle_von(widget.KIND_SEPARATOR), 24)
+    var n18: [u8; 30] = "1 KIND_GROUPBOX ist group (25)"
+    report((&n18[0]) as u64, 30, rolle_von(widget.KIND_GROUPBOX) == 25,
+        rolle_von(widget.KIND_GROUPBOX), 25)
+    var n19: [u8; 27] = "1 KIND_TABLE ist table (15)"
+    report((&n19[0]) as u64, 27, rolle_von(widget.KIND_TABLE) == 15,
+        rolle_von(widget.KIND_TABLE), 15)
+    var n20: [u8; 25] = "1 KIND_TREE ist tree (13)"
+    report((&n20[0]) as u64, 25, rolle_von(widget.KIND_TREE) == 13,
+        rolle_von(widget.KIND_TREE), 13)
+    var n21: [u8; 26] = "1 KIND_TILE ist button (3)"
+    report((&n21[0]) as u64, 26, rolle_von(widget.KIND_TILE) == 3,
+        rolle_von(widget.KIND_TILE), 3)
+    var n22: [u8; 26] = "1 KIND_CARD ist group (25)"
+    report((&n22[0]) as u64, 26, rolle_von(widget.KIND_CARD) == 25,
+        rolle_von(widget.KIND_CARD), 25)
+    var n23: [u8; 28] = "1 KIND_BADGE ist status (30)"
+    report((&n23[0]) as u64, 28, rolle_von(widget.KIND_BADGE) == 30,
+        rolle_von(widget.KIND_BADGE), 30)
+    var n24: [u8; 31] = "1 KIND_TOOLTIP ist tooltip (29)"
+    report((&n24[0]) as u64, 31, rolle_von(widget.KIND_TOOLTIP) == 29,
+        rolle_von(widget.KIND_TOOLTIP), 29)
+
+    var sr: scene.Scene = scene.scene_new()
+    var ar: a11y.A11y = a11y.a11y_new()
+    let r0: usize = scene.scene_add(&sr, scene.SCENE_NONE, scene.N_BOX)
+    let r_bild: usize = scene.scene_add(&sr, r0, scene.N_IMAGE)
+    let r_text: usize = scene.scene_add(&sr, r0, scene.N_TEXT)
+    let r_liste: usize = scene.scene_add(&sr, r0, scene.N_BOX)
+    a11y.a11y_set_role(&ar, r_liste, a11y.ROLE_LIST)
+    let r_eintrag: usize = scene.scene_add(&sr, r_liste, scene.N_TEXT)
+    let r_knopf: usize = scene.scene_widget(&sr, r_liste, widget.KIND_BUTTON, 0, 0)
+    let r_tab: usize = scene.scene_widget(&sr, r0, widget.KIND_TABLE, 0, 0)
+    let r_zeile: usize = scene.scene_add(&sr, r_tab, scene.N_BOX)
+    let r_zelle: usize = scene.scene_add(&sr, r_zeile, scene.N_TEXT)
+    var n25: [u8; 31] = "1 ein Bildknoten ist image (28)"
+    report((&n25[0]) as u64, 31, a11y.a11y_role(&sr, &ar, r_bild) == 28,
+        a11y.a11y_role(&sr, &ar, r_bild) as i64, 28)
+    var n26: [u8; 28] = "1 ein Kasten ist generic (1)"
+    report((&n26[0]) as u64, 28, a11y.a11y_role(&sr, &ar, r0) == 1,
+        a11y.a11y_role(&sr, &ar, r0) as i64, 1)
+    a11y.a11y_set_role(&ar, r_text, a11y.ROLE_HEADING)
+    var n27: [u8; 40] = "1 Text mit role=heading ist heading (26)"
+    report((&n27[0]) as u64, 40, a11y.a11y_role(&sr, &ar, r_text) == 26,
+        a11y.a11y_role(&sr, &ar, r_text) as i64, 26)
+    a11y.a11y_set_role(&ar, r_text, a11y.ROLE_NONE)
+    var n28: [u8; 33] = "1 zurueckgenommen wieder text (2)"
+    report((&n28[0]) as u64, 33, a11y.a11y_role(&sr, &ar, r_text) == 2,
+        a11y.a11y_role(&sr, &ar, r_text) as i64, 2)
+    var n29: [u8; 39] = "1 Text in einer Liste ist listitem (12)"
+    report((&n29[0]) as u64, 39, a11y.a11y_role(&sr, &ar, r_eintrag) == 12,
+        a11y.a11y_role(&sr, &ar, r_eintrag) as i64, 12)
+    var n30: [u8; 40] = "1 Knopf in einer Liste bleibt button (3)"
+    report((&n30[0]) as u64, 40, a11y.a11y_role(&sr, &ar, r_knopf) == 3,
+        a11y.a11y_role(&sr, &ar, r_knopf) as i64, 3)
+    var n31: [u8; 38] = "1 Kasten in einer Tabelle ist row (16)"
+    report((&n31[0]) as u64, 38, a11y.a11y_role(&sr, &ar, r_zeile) == 16,
+        a11y.a11y_role(&sr, &ar, r_zeile) as i64, 16)
+    var n32: [u8; 36] = "1 Text in dieser Zeile ist cell (17)"
+    report((&n32[0]) as u64, 36, a11y.a11y_role(&sr, &ar, r_zelle) == 17,
+        a11y.a11y_role(&sr, &ar, r_zelle) as i64, 17)
+    var rn: [u8; 16] = [0 as u8; 16]
+    var n33: [u8; 41] = "1 der Name von progressbar hat 11 Zeichen"
+    report((&n33[0]) as u64, 41, a11y.a11y_role_name(a11y.ROLE_PROGRESSBAR, (&rn[0]) as u64, 16) == 11,
+        a11y.a11y_role_name(a11y.ROLE_PROGRESSBAR, (&rn[0]) as u64, 16) as i64, 11)
+
+    // ================================================= 2. DER NAME
+    var t_sichern: [u8; 11] = "  Sichern  "
+    var t_speichern: [u8; 9] = "Speichern"
+    var t_leer: [u8; 3] = "   "
+    var t_wert: [u8; 3] = "abc"
+    var t_suche: [u8; 5] = "Suche"
+    var t_neue: [u8; 4] = "Neue"
+    var t_datei: [u8; 7] = " Datei "
+    var sn: scene.Scene = scene.scene_new()
+    var an: a11y.A11y = a11y.a11y_new()
+    var nb: [u8; 64] = [0 as u8; 64]
+    let n0: usize = scene.scene_add(&sn, scene.SCENE_NONE, scene.N_BOX)
+    let k_own: usize = scene.scene_widget(&sn, n0, widget.KIND_BUTTON,
+        (&t_sichern[0]) as u64, 11)
+    var n34: [u8; 31] = "2 eigene Beschriftung: Quelle 2"
+    report((&n34[0]) as u64, 31, a11y.a11y_name_source(&sn, &an, k_own) == 2,
+        a11y.a11y_name_source(&sn, &an, k_own) as i64, 2)
+    var n35: [u8; 33] = "2 '  Sichern  ' wird zu 7 Zeichen"
+    report((&n35[0]) as u64, 33, a11y.a11y_name(&sn, &an, k_own, (&nb[0]) as u64, 64) == 7,
+        a11y.a11y_name(&sn, &an, k_own, (&nb[0]) as u64, 64) as i64, 7)
+    var n36: [u8; 35] = "2 und die 7 sind 'Sichern' (1 = ja)"
+    report((&n36[0]) as u64, 35, gleich((&nb[0]) as u64, (&t_sichern[2]) as u64, 7) == 1,
+        gleich((&nb[0]) as u64, (&t_sichern[2]) as u64, 7), 1)
+    a11y.a11y_set_name(&an, k_own, (&t_speichern[0]) as u64, 9)
+    var n37: [u8; 41] = "2 ausdruecklich schlaegt eigene: Quelle 1"
+    report((&n37[0]) as u64, 41, a11y.a11y_name_source(&sn, &an, k_own) == 1,
+        a11y.a11y_name_source(&sn, &an, k_own) as i64, 1)
+    var n38: [u8; 35] = "2 und heisst 'Speichern', 9 Zeichen"
+    report((&n38[0]) as u64, 35, a11y.a11y_name(&sn, &an, k_own, (&nb[0]) as u64, 64) == 9,
+        a11y.a11y_name(&sn, &an, k_own, (&nb[0]) as u64, 64) as i64, 9)
+    a11y.a11y_set_name(&an, k_own, (&t_leer[0]) as u64, 3)
+    var n39: [u8; 42] = "2 ein Name aus Leerzeichen zaehlt nicht: 2"
+    report((&n39[0]) as u64, 42, a11y.a11y_name_source(&sn, &an, k_own) == 2,
+        a11y.a11y_name_source(&sn, &an, k_own) as i64, 2)
+
+    // Das Etikett per Kennung: ein Text mit Kennung 7 und ein
+    // Textfeld, dessen eigener Text sein WERT ist.
+    let k_etikett: usize = scene.scene_add(&sn, n0, scene.N_TEXT)
+    scene.node_set_text(&sn, k_etikett, (&t_suche[0]) as u64, 5)
+    scene.node_set_id(&sn, k_etikett, 7 as u32)
+    let k_feld: usize = scene.scene_widget(&sn, n0, widget.KIND_TEXTBOX,
+        (&t_wert[0]) as u64, 3)
+    var n40: [u8; 38] = "2 Textfeld: sein Text ist kein Name, 0"
+    report((&n40[0]) as u64, 38, a11y.a11y_name_source(&sn, &an, k_feld) == 0,
+        a11y.a11y_name_source(&sn, &an, k_feld) as i64, 0)
+    a11y.a11y_set_labelled_by(&an, k_feld, 99 as u32)
+    var n41: [u8; 37] = "2 Etikett-Kennung 99 gibt es nicht: 0"
+    report((&n41[0]) as u64, 37, a11y.a11y_name_source(&sn, &an, k_feld) == 0,
+        a11y.a11y_name_source(&sn, &an, k_feld) as i64, 0)
+    a11y.a11y_set_labelled_by(&an, k_feld, 7 as u32)
+    var n42: [u8; 33] = "2 Etikett per Kennung 7: Quelle 3"
+    report((&n42[0]) as u64, 33, a11y.a11y_name_source(&sn, &an, k_feld) == 3,
+        a11y.a11y_name_source(&sn, &an, k_feld) as i64, 3)
+    var n43: [u8; 31] = "2 und heisst 'Suche', 5 Zeichen"
+    report((&n43[0]) as u64, 31, a11y.a11y_name(&sn, &an, k_feld, (&nb[0]) as u64, 64) == 5,
+        a11y.a11y_name(&sn, &an, k_feld, (&nb[0]) as u64, 64) as i64, 5)
+
+    // Der Inhalt: ein Knopf ohne eigenen Text mit zwei Textkindern.
+    let k_inh: usize = scene.scene_widget(&sn, n0, widget.KIND_BUTTON, 0, 0)
+    let k_i1: usize = scene.scene_add(&sn, k_inh, scene.N_TEXT)
+    scene.node_set_text(&sn, k_i1, (&t_neue[0]) as u64, 4)
+    let k_i2: usize = scene.scene_add(&sn, k_inh, scene.N_TEXT)
+    scene.node_set_text(&sn, k_i2, (&t_datei[0]) as u64, 7)
+    var n44: [u8; 32] = "2 Name aus den Kindern: Quelle 4"
+    report((&n44[0]) as u64, 32, a11y.a11y_name_source(&sn, &an, k_inh) == 4,
+        a11y.a11y_name_source(&sn, &an, k_inh) as i64, 4)
+    var n45: [u8; 39] = "2 'Neue' + ' Datei ' = 'Neue Datei', 10"
+    report((&n45[0]) as u64, 39, a11y.a11y_name(&sn, &an, k_inh, (&nb[0]) as u64, 64) == 10,
+        a11y.a11y_name(&sn, &an, k_inh, (&nb[0]) as u64, 64) as i64, 10)
+    let k_grp: usize = scene.scene_widget(&sn, n0, widget.KIND_CARD, 0, 0)
+    let k_g1: usize = scene.scene_add(&sn, k_grp, scene.N_TEXT)
+    scene.node_set_text(&sn, k_g1, (&t_neue[0]) as u64, 4)
+    var n46: [u8; 39] = "2 eine Gruppe nimmt Kindertext nicht: 0"
+    report((&n46[0]) as u64, 39, a11y.a11y_name_source(&sn, &an, k_grp) == 0,
+        a11y.a11y_name_source(&sn, &an, k_grp) as i64, 0)
+
+    // Bis hier: drei bedienbare Knoten (k_own, k_feld, k_inh), alle
+    // mit Namen. Jetzt ein Knopf OHNE jeden Namen -- er muss gezaehlt
+    // werden.
+    var n47: [u8; 18] = "2 bedienbar sind 3"
+    report((&n47[0]) as u64, 18, a11y.a11y_widgets(&sn, &an) == 3,
+        a11y.a11y_widgets(&sn, &an) as i64, 3)
+    var n48: [u8; 21] = "2 davon ohne Namen: 0"
+    report((&n48[0]) as u64, 21, a11y.a11y_unnamed(&sn, &an) == 0,
+        a11y.a11y_unnamed(&sn, &an) as i64, 0)
+    let k_stumm: usize = scene.scene_widget(&sn, n0, widget.KIND_BUTTON, 0, 0)
+    var n49: [u8; 39] = "2 ein Knopf ohne Namen wird gezaehlt: 1"
+    report((&n49[0]) as u64, 39, a11y.a11y_unnamed(&sn, &an) == 1,
+        a11y.a11y_unnamed(&sn, &an) as i64, 1)
+    var n50: [u8; 24] = "2 bedienbar sind jetzt 4"
+    report((&n50[0]) as u64, 24, a11y.a11y_widgets(&sn, &an) == 4,
+        a11y.a11y_widgets(&sn, &an) as i64, 4)
+    a11y.a11y_set_labelled_by(&an, k_feld, 0 as u32)
+    var n51: [u8; 39] = "2 Etikett geloest: ohne Namen sind es 2"
+    report((&n51[0]) as u64, 39, a11y.a11y_unnamed(&sn, &an) == 2,
+        a11y.a11y_unnamed(&sn, &an) as i64, 2)
+    a11y.a11y_set_name(&an, k_stumm, (&t_suche[0]) as u64, 5)
+    a11y.a11y_set_labelled_by(&an, k_feld, 7 as u32)
+    var n52: [u8; 36] = "2 beide benannt: wieder 0 ohne Namen"
+    report((&n52[0]) as u64, 36, a11y.a11y_unnamed(&sn, &an) == 0,
+        a11y.a11y_unnamed(&sn, &an) as i64, 0)
+
+    // ================================================ 3. DER ZUSTAND
+    var sz: scene.Scene = scene.scene_new()
+    var az: a11y.A11y = a11y.a11y_new()
+    let z0: usize = scene.scene_add(&sz, scene.SCENE_NONE, scene.N_BOX)
+    let z_cb: usize = scene.scene_widget(&sz, z0, widget.KIND_CHECKBOX, 0, 0)
+    let z_sw: usize = scene.scene_widget(&sz, z0, widget.KIND_TOGGLE, 0, 0)
+    let z_kn: usize = scene.scene_widget(&sz, z0, widget.KIND_BUTTON, 0, 0)
+    let z_tb: usize = scene.scene_widget(&sz, z0, widget.KIND_TAB, 0, 0)
+    let z_dd: usize = scene.scene_widget(&sz, z0, widget.KIND_DROPDOWN, 0, 0)
+    let z_tx: usize = scene.scene_widget(&sz, z0, widget.KIND_TEXTBOX, 0, 0)
+    let z_sl: usize = scene.scene_widget(&sz, z0, widget.KIND_SLIDER, 0, 0)
+    let hk: u32 = a11y.ST_CHECKED | a11y.ST_MIXED
+    widget.w_set_value(scene.node_widget(&sz, z_cb), 1)
+    var n53: [u8; 35] = "3 Ankreuzfeld Wert 1: angehakt (16)"
+    report((&n53[0]) as u64, 35, (a11y.a11y_state(&sz, &az, z_cb) & hk) == 16 as u32,
+        (a11y.a11y_state(&sz, &az, z_cb) & hk) as i64, 16)
+    widget.w_set_value(scene.node_widget(&sz, z_cb), 2)
+    var n54: [u8; 31] = "3 Ankreuzfeld Wert 2: halb (32)"
+    report((&n54[0]) as u64, 31, (a11y.a11y_state(&sz, &az, z_cb) & hk) == 32 as u32,
+        (a11y.a11y_state(&sz, &az, z_cb) & hk) as i64, 32)
+    widget.w_set_value(scene.node_widget(&sz, z_cb), 0)
+    var n55: [u8; 36] = "3 Ankreuzfeld Wert 0: weder noch (0)"
+    report((&n55[0]) as u64, 36, (a11y.a11y_state(&sz, &az, z_cb) & hk) == 0 as u32,
+        (a11y.a11y_state(&sz, &az, z_cb) & hk) as i64, 0)
+    // Ein Klick ueber control.fi setzt Wert 1 UND das Auswahlbit.
+    widget.w_set_value(scene.node_widget(&sz, z_cb), 1)
+    widget.w_set_selected(scene.node_widget(&sz, z_cb), true)
+    var n56: [u8; 42] = "3 sein Auswahlbit ist nicht 'selected' (0)"
+    report((&n56[0]) as u64, 42, (a11y.a11y_state(&sz, &az, z_cb) & a11y.ST_SELECTED) == 0 as u32,
+        (a11y.a11y_state(&sz, &az, z_cb) & a11y.ST_SELECTED) as i64, 0)
+    widget.w_set_value(scene.node_widget(&sz, z_sw), 1)
+    var n57: [u8; 28] = "3 Schalter an: angehakt (16)"
+    report((&n57[0]) as u64, 28, (a11y.a11y_state(&sz, &az, z_sw) & hk) == 16 as u32,
+        (a11y.a11y_state(&sz, &az, z_sw) & hk) as i64, 16)
+    widget.w_set_value(scene.node_widget(&sz, z_kn), 1)
+    var n58: [u8; 40] = "3 gewoehnlicher Knopf: nie gedrueckt (0)"
+    report((&n58[0]) as u64, 40, (a11y.a11y_state(&sz, &az, z_kn) & a11y.ST_PRESSED) == 0 as u32,
+        (a11y.a11y_state(&sz, &az, z_kn) & a11y.ST_PRESSED) as i64, 0)
+    a11y.a11y_set_toggle(&az, z_kn, true)
+    var n59: [u8; 43] = "3 einrastender Knopf Wert 1: gedrueckt (64)"
+    report((&n59[0]) as u64, 43, (a11y.a11y_state(&sz, &az, z_kn) & a11y.ST_PRESSED) == 64 as u32,
+        (a11y.a11y_state(&sz, &az, z_kn) & a11y.ST_PRESSED) as i64, 64)
+    widget.w_set_selected(scene.node_widget(&sz, z_tb), true)
+    var n60: [u8; 24] = "3 Reiter ausgewaehlt (8)"
+    report((&n60[0]) as u64, 24, (a11y.a11y_state(&sz, &az, z_tb) & a11y.ST_SELECTED) == 8 as u32,
+        (a11y.a11y_state(&sz, &az, z_tb) & a11y.ST_SELECTED) as i64, 8)
+    let auf_zu: u32 = a11y.ST_EXPANDED | a11y.ST_COLLAPSED
+    var n61: [u8; 46] = "3 Klappfeld ohne Angabe: weder auf noch zu (0)"
+    report((&n61[0]) as u64, 46, (a11y.a11y_state(&sz, &az, z_dd) & auf_zu) == 0 as u32,
+        (a11y.a11y_state(&sz, &az, z_dd) & auf_zu) as i64, 0)
+    a11y.a11y_set_expanded(&az, z_dd, a11y.EXP_COLLAPSED)
+    var n62: [u8; 20] = "3 Klappfeld zu (256)"
+    report((&n62[0]) as u64, 20, (a11y.a11y_state(&sz, &az, z_dd) & auf_zu) == 256 as u32,
+        (a11y.a11y_state(&sz, &az, z_dd) & auf_zu) as i64, 256)
+    a11y.a11y_set_expanded(&az, z_dd, a11y.EXP_EXPANDED)
+    var n63: [u8; 21] = "3 Klappfeld auf (128)"
+    report((&n63[0]) as u64, 21, (a11y.a11y_state(&sz, &az, z_dd) & auf_zu) == 128 as u32,
+        (a11y.a11y_state(&sz, &az, z_dd) & auf_zu) as i64, 128)
+    a11y.a11y_set_readonly(&az, z_tx, true)
+    var n64: [u8; 34] = "3 Textfeld schreibgeschuetzt (512)"
+    report((&n64[0]) as u64, 34, (a11y.a11y_state(&sz, &az, z_tx) & a11y.ST_READONLY) == 512 as u32,
+        (a11y.a11y_state(&sz, &az, z_tx) & a11y.ST_READONLY) as i64, 512)
+    let gf: u32 = a11y.ST_DISABLED | a11y.ST_FOCUSABLE
+    var n65: [u8; 40] = "3 frei: fokussierbar, nicht gesperrt (1)"
+    report((&n65[0]) as u64, 40, (a11y.a11y_state(&sz, &az, z_sl) & gf) == 1 as u32,
+        (a11y.a11y_state(&sz, &az, z_sl) & gf) as i64, 1)
+    widget.w_set_disabled(scene.node_widget(&sz, z_sl), true)
+    var n66: [u8; 37] = "3 gesperrt und nicht fokussierbar (4)"
+    report((&n66[0]) as u64, 37, (a11y.a11y_state(&sz, &az, z_sl) & gf) == 4 as u32,
+        (a11y.a11y_state(&sz, &az, z_sl) & gf) as i64, 4)
+    widget.w_set_value(scene.node_widget(&sz, z_sl), 620)
+    var n67: [u8; 37] = "3 Schieber hat einen Bereich (1 = ja)"
+    report((&n67[0]) as u64, 37, a11y.a11y_has_range(&sz, &az, z_sl),
+        a11y.a11y_has_range(&sz, &az, z_sl) as i64, 1)
+    var n68: [u8; 19] = "3 Schieber Wert 620"
+    report((&n68[0]) as u64, 19, a11y.a11y_value(&sz, z_sl) == 620,
+        a11y.a11y_value(&sz, z_sl), 620)
+    var n69: [u8; 34] = "3 Bereich bis 1000 (wave2.VAL_MAX)"
+    report((&n69[0]) as u64, 34, a11y.a11y_max() == 1000,
+        a11y.a11y_max(), 1000)
+    var n70: [u8; 34] = "3 ein Knopf hat keinen Bereich (0)"
+    report((&n70[0]) as u64, 34, !a11y.a11y_has_range(&sz, &az, z_kn),
+        a11y.a11y_has_range(&sz, &az, z_kn) as i64, 0)
+
+    // Die Stelle in der Reihe: zwoelf Eintraege, nach dem zweiten ein
+    // Trenner, der NICHT mitzaehlt.
+    let z_l: usize = scene.scene_add(&sz, z0, scene.N_BOX)
+    a11y.a11y_set_role(&az, z_l, a11y.ROLE_LIST)
+    var z_dritter: usize = 0
+    var zi: usize = 0
+    while zi < 12 {
+        let e: usize = scene.scene_add(&sz, z_l, scene.N_TEXT)
+        if zi == 2 {
+            z_dritter = e
+        }
+        if zi == 1 {
+            scene.scene_widget(&sz, z_l, widget.KIND_SEPARATOR, 0, 0)
+        }
+        zi = zi + 1
+    }
+    var n71: [u8; 38] = "3 der dritte Eintrag steht an Stelle 3"
+    report((&n71[0]) as u64, 38, a11y.a11y_pos(&sz, &az, z_dritter) == 3,
+        a11y.a11y_pos(&sz, &az, z_dritter) as i64, 3)
+    var n72: [u8; 41] = "3 die Reihe hat 12 (Trenner zaehlt nicht)"
+    report((&n72[0]) as u64, 41, a11y.a11y_set_size(&sz, &az, z_dritter) == 12,
+        a11y.a11y_set_size(&sz, &az, z_dritter) as i64, 12)
+    var n73: [u8; 37] = "3 ein Knopf steht in keiner Reihe (0)"
+    report((&n73[0]) as u64, 37, a11y.a11y_pos(&sz, &az, z_kn) == 0,
+        a11y.a11y_pos(&sz, &az, z_kn) as i64, 0)
+
+    // ====================================== 4. DIE TAB-REIHENFOLGE
+    //
+    // Der Baum:            Feld:  0 Wurzel
+    //   Wurzel                   1 Kasten A
+    //     Kasten A               2 Knopf Zwei   (Kind der Wurzel)
+    //       Knopf Eins           3 Knopf Eins   (Kind von A, SPAETER angelegt)
+    //     Knopf Zwei             4 Ankreuzfeld Drei, gesperrt
+    //     Ankreuzfeld Drei       5 Text
+    //     Text                   6 Textfeld Vier
+    //     Textfeld Vier
+    //
+    // Baumreihenfolge der fokussierbaren Arten: 3, 2, 4, 6 -- also vier,
+    // die gesperrte mitgezaehlt. Tab: 3 -> 2 -> 6 (4 gesperrt) -> 3.
+    var st: scene.Scene = scene.scene_new()
+    var at: a11y.A11y = a11y.a11y_new()
+    let t0: usize = scene.scene_add(&st, scene.SCENE_NONE, scene.N_BOX)
+    let t_a: usize = scene.scene_add(&st, t0, scene.N_BOX)
+    let t_zwei: usize = scene.scene_widget(&st, t0, widget.KIND_BUTTON,
+        (&t_suche[0]) as u64, 5)
+    let t_eins: usize = scene.scene_widget(&st, t_a, widget.KIND_BUTTON,
+        (&t_suche[0]) as u64, 5)
+    let t_drei: usize = scene.scene_widget(&st, t0, widget.KIND_CHECKBOX,
+        (&t_suche[0]) as u64, 5)
+    widget.w_set_disabled(scene.node_widget(&st, t_drei), true)
+    scene.scene_add(&st, t0, scene.N_TEXT)
+    let t_vier: usize = scene.scene_widget(&st, t0, widget.KIND_TEXTBOX, 0, 0)
+    var pt: control.Panel = control.panel_new()
+    a11y.a11y_bind_panel(&at, &pt, &st)
+    var gr: bool = false
+    var n74: [u8; 29] = "4 in der Reihenfolge stehen 4"
+    report((&n74[0]) as u64, 29, a11y.a11y_order_len(&at) == 4,
+        a11y.a11y_order_len(&at) as i64, 4)
+    var n75: [u8; 27] = "4 zuerst Eins (Feldplatz 3)"
+    report((&n75[0]) as u64, 27, a11y.a11y_order_at(&at, 0) == 3,
+        a11y.a11y_order_at(&at, 0) as i64, 3)
+    a11y.a11y_tab(&pt, &st, false, &gr)
+    var n76: [u8; 15] = "4 Tab: Eins (3)"
+    report((&n76[0]) as u64, 15, control.panel_focus(&pt) == t_eins,
+        control.panel_focus(&pt) as i64, 3)
+    a11y.a11y_tab(&pt, &st, false, &gr)
+    var n77: [u8; 15] = "4 Tab: Zwei (2)"
+    report((&n77[0]) as u64, 15, control.panel_focus(&pt) == t_zwei,
+        control.panel_focus(&pt) as i64, 2)
+    a11y.a11y_tab(&pt, &st, false, &gr)
+    var n78: [u8; 45] = "4 Tab: gesperrte Drei uebersprungen, Vier (6)"
+    report((&n78[0]) as u64, 45, control.panel_focus(&pt) == t_vier,
+        control.panel_focus(&pt) as i64, 6)
+    var n79: [u8; 28] = "4 Vier meldet fokussiert (2)"
+    report((&n79[0]) as u64, 28, (a11y.a11y_state(&st, &at, t_vier) & a11y.ST_FOCUSED) == 2 as u32,
+        (a11y.a11y_state(&st, &at, t_vier) & a11y.ST_FOCUSED) as i64, 2)
+    a11y.a11y_tab(&pt, &st, false, &gr)
+    var n80: [u8; 34] = "4 Tab am Ende: zurueck zu Eins (3)"
+    report((&n80[0]) as u64, 34, control.panel_focus(&pt) == t_eins,
+        control.panel_focus(&pt) as i64, 3)
+    a11y.a11y_tab(&pt, &st, true, &gr)
+    var n81: [u8; 24] = "4 Umschalt+Tab: Vier (6)"
+    report((&n81[0]) as u64, 24, control.panel_focus(&pt) == t_vier,
+        control.panel_focus(&pt) as i64, 6)
+    a11y.a11y_tab(&pt, &st, true, &gr)
+    var n82: [u8; 42] = "4 Umschalt+Tab: an Drei vorbei zu Zwei (2)"
+    report((&n82[0]) as u64, 42, control.panel_focus(&pt) == t_zwei,
+        control.panel_focus(&pt) as i64, 2)
+    widget.w_set_disabled(scene.node_widget(&st, t_drei), false)
+    a11y.a11y_tab(&pt, &st, false, &gr)
+    var n83: [u8; 36] = "4 freigegeben: Tab erreicht Drei (4)"
+    report((&n83[0]) as u64, 36, control.panel_focus(&pt) == t_drei,
+        control.panel_focus(&pt) as i64, 4)
+    var n84: [u8; 45] = "4 und nur einer hat den Fokus: Vier nicht (0)"
+    report((&n84[0]) as u64, 45, (a11y.a11y_state(&st, &at, t_vier) & a11y.ST_FOCUSED) == 0 as u32,
+        (a11y.a11y_state(&st, &at, t_vier) & a11y.ST_FOCUSED) as i64, 0)
+
+    // ======================================= 5. DER FOKUS ROLLT MIT
+    //
+    // Ab hier wird angeordnet, also braucht es einen Zeichenkontext.
+    // Jede Groesse ist fest gesetzt; die Schrift aendert an keiner der
+    // gerechneten Zahlen etwas.
+    var fbuf: rt.Buf = rt.buf_new()
+    var fpfad: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let hat_schrift: bool = rt.read_file((&fpfad[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+    rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if hat_schrift {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 400, 400) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 400, 400) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+
+    // Der Baum: oben ein Knopf (100 hoch), darunter der Ausschnitt
+    // (200 hoch, Inhalt 188 x 800, Balken 12) mit 20 Zeilen zu 40,
+    // unten ein Knopf (50 hoch). Der Ausschnitt beginnt also bei y = 100.
+    // Waagerecht passt der Inhalt: 188 ist nicht groesser als 200 - 12.
+    // Die Knotennummern: Wurzel 0, Oben 1, Ausschnitt 2, Zeile k = k + 2
+    // (Zeile 1 = 3, Zeile 5 = 7), Unten 23.
+    var vp: viewport.Viewport = viewport.viewport_new(0.0, 0.0, 200.0,
+        200.0, 188.0, 800.0)
+    viewport.viewport_set_bar(&vp, 12)
+    var sv: scene.Scene = scene.scene_new()
+    var av: a11y.A11y = a11y.a11y_new()
+    let v0: usize = scene.scene_add(&sv, scene.SCENE_NONE, scene.N_BOX)
+    let v_oben: usize = scene.scene_widget(&sv, v0, widget.KIND_BUTTON,
+        (&t_suche[0]) as u64, 5)
+    scene.node_set_size(&sv, v_oben, 400.0, 100.0)
+    let v_kasten: usize = scene.scene_add(&sv, v0, scene.N_VIEWPORT)
+    scene.node_set_viewport(&sv, v_kasten, &vp)
+    a11y.a11y_set_role(&av, v_kasten, a11y.ROLE_LIST)
+    var zeilen: [usize; 20] = [0; 20]
+    var zk: usize = 0
+    while zk < 20 {
+        zeilen[zk] = scene.scene_widget(&sv, v_kasten, widget.KIND_BUTTON,
+            (&t_suche[0]) as u64, 5)
+        scene.node_set_size(&sv, zeilen[zk], 188.0, 40.0)
+        zk = zk + 1
+    }
+    let v_unten: usize = scene.scene_widget(&sv, v0, widget.KIND_BUTTON,
+        (&t_suche[0]) as u64, 5)
+    scene.node_set_size(&sv, v_unten, 400.0, 50.0)
+    scene.scene_measure(&sv, &c)
+    scene.scene_layout(&sv, &c, 0.0, 0.0, 400.0, 400.0)
+    var pv: control.Panel = control.panel_new()
+    a11y.a11y_bind_panel(&av, &pv, &sv)
+    let voy0: i64 = viewport.viewport_y(&vp) as i64
+    var n85: [u8; 36] = "5 der Ausschnitt beginnt bei y = 100"
+    report((&n85[0]) as u64, 36, voy0 == 100,
+        voy0, 100)
+    var n86: [u8; 38] = "5 in der Reihenfolge stehen 22 Knoepfe"
+    report((&n86[0]) as u64, 38, a11y.a11y_order_len(&av) == 22,
+        a11y.a11y_order_len(&av) as i64, 22)
+    // Oben, dann Zeile 1 bis 5: alles schon im Bild (Zeile 5 liegt bei
+    // 160..200 im Inhalt), es rollt nichts.
+    var tk: usize = 0
+    var je_gerollt: bool = false
+    while tk < 6 {
+        if tab(&pv, &sv, &c, false) {
+            je_gerollt = true
+        }
+        tk = tk + 1
+    }
+    var n87: [u8; 30] = "5 bis Zeile 5 rollt nichts (0)"
+    report((&n87[0]) as u64, 30, !je_gerollt,
+        je_gerollt as i64, 0)
+    var n88: [u8; 40] = "5 der Fokus steht auf Zeile 5 = Knoten 7"
+    report((&n88[0]) as u64, 40, control.panel_focus(&pv) == 7,
+        control.panel_focus(&pv) as i64, 7)
+    let g6: bool = tab(&pv, &sv, &c, false)
+    var n89: [u8; 36] = "5 Zeile 6 zwingt zum Rollen (1 = ja)"
+    report((&n89[0]) as u64, 36, g6,
+        g6 as i64, 1)
+    var n90: [u8; 29] = "5 Verschiebung 240 - 200 = 40"
+    report((&n90[0]) as u64, 29, viewport.viewport_off_y(&vp) as i64 == 40,
+        viewport.viewport_off_y(&vp) as i64, 40)
+    var n91: [u8; 50] = "5 Zeile 6 steht jetzt bei y = 100 + 200 - 40 = 260"
+    report((&n91[0]) as u64, 50, scene.node_y(&sv, zeilen[5]) as i64 == 260,
+        scene.node_y(&sv, zeilen[5]) as i64, 260)
+    var n92: [u8; 33] = "5 ihr Fokus ist sichtbar (1 = ja)"
+    report((&n92[0]) as u64, 33, a11y.a11y_focus_visible(&sv, zeilen[5]),
+        a11y.a11y_focus_visible(&sv, zeilen[5]) as i64, 1)
+    // Gegenprobe: dieselbe Zeile, aber der Ausschnitt von Hand wieder
+    // nach oben gerollt -- dann liegt sie bei 200..240 unter dem
+    // sichtbaren Teil 0..200, und ihr Fokus ist NICHT zu sehen.
+    viewport.viewport_set_offset(&vp, 0.0, 0.0)
+    scene.scene_layout(&sv, &c, 0.0, 0.0, 400.0, 400.0)
+    var n93: [u8; 41] = "5 weggerollt ist ihr Fokus unsichtbar (0)"
+    report((&n93[0]) as u64, 41, !a11y.a11y_focus_visible(&sv, zeilen[5]),
+        a11y.a11y_focus_visible(&sv, zeilen[5]) as i64, 0)
+    a11y.a11y_reveal(&sv, zeilen[5])
+    scene.scene_layout(&sv, &c, 0.0, 0.0, 400.0, 400.0)
+    var n94: [u8; 41] = "5 a11y_reveal holt sie zurueck: wieder 40"
+    report((&n94[0]) as u64, 41, viewport.viewport_off_y(&vp) as i64 == 40,
+        viewport.viewport_off_y(&vp) as i64, 40)
+    tk = 0
+    while tk < 14 {
+        tab(&pv, &sv, &c, false)
+        tk = tk + 1
+    }
+    var n95: [u8; 40] = "5 Zeile 20: Verschiebung 800 - 200 = 600"
+    report((&n95[0]) as u64, 40, viewport.viewport_off_y(&vp) as i64 == 600,
+        viewport.viewport_off_y(&vp) as i64, 600)
+    var n96: [u8; 40] = "5 das ist die groesste Verschiebung, 600"
+    report((&n96[0]) as u64, 40, viewport.viewport_max_y(&vp) as i64 == 600,
+        viewport.viewport_max_y(&vp) as i64, 600)
+    let g_unten: bool = tab(&pv, &sv, &c, false)
+    var n97: [u8; 38] = "5 weiter zu Unten: es rollt nichts (0)"
+    report((&n97[0]) as u64, 38, !g_unten,
+        g_unten as i64, 0)
+    var n98: [u8; 39] = "5 der Fokus steht auf Unten = Knoten 23"
+    report((&n98[0]) as u64, 39, control.panel_focus(&pv) == 23,
+        control.panel_focus(&pv) as i64, 23)
+    let g_zurueck: bool = tab(&pv, &sv, &c, true)
+    var n99: [u8; 43] = "5 Umschalt+Tab zu Zeile 20: rollt nicht (0)"
+    report((&n99[0]) as u64, 43, !g_zurueck,
+        g_zurueck as i64, 0)
+    tk = 0
+    while tk < 19 {
+        tab(&pv, &sv, &c, true)
+        tk = tk + 1
+    }
+    var n100: [u8; 37] = "5 zurueck bis Zeile 1: Verschiebung 0"
+    report((&n100[0]) as u64, 37, viewport.viewport_off_y(&vp) as i64 == 0,
+        viewport.viewport_off_y(&vp) as i64, 0)
+    var n101: [u8; 40] = "5 der Fokus steht auf Zeile 1 = Knoten 3"
+    report((&n101[0]) as u64, 40, control.panel_focus(&pv) == 3,
+        control.panel_focus(&pv) as i64, 3)
+    // Mit Polster 4: Zeile 6 wird samt Polster hereingeholt, also
+    // 196..244, und 244 - 200 = 44.
+    viewport.viewport_set_inset(&vp, 4.0)
+    control.panel_set_focus(&pv, zeilen[5])
+    a11y.a11y_reveal(&sv, zeilen[5])
+    scene.scene_layout(&sv, &c, 0.0, 0.0, 400.0, 400.0)
+    var n102: [u8; 44] = "5 mit Polster 4: Verschiebung 244 - 200 = 44"
+    report((&n102[0]) as u64, 44, viewport.viewport_off_y(&vp) as i64 == 44,
+        viewport.viewport_off_y(&vp) as i64, 44)
+    // Senkrecht passt sie jetzt: 200..240 liegt in 44 + 4 .. 44 + 200 - 4
+    // = 48..240. WAAGERECHT aber nicht: die Zeile fuellt die ganze
+    // Inhaltsbreite 0..188, und das Polster schneidet links bei 4 und
+    // rechts bei 188 - 4 = 184 ab. Ihr Ring waere an beiden Seiten
+    // angeschnitten -- also KEIN sichtbarer Fokus.
+    var n103: [u8; 49] = "5 volle Breite 0..188, Schnitt bei 4 und 184: (0)"
+    report((&n103[0]) as u64, 49, !a11y.a11y_focus_visible(&sv, zeilen[5]),
+        a11y.a11y_focus_visible(&sv, zeilen[5]) as i64, 0)
+    // 180 breit und mittig: x = (188 - 180) / 2 = 4, rechts 184 --
+    // genau im sichtbaren Teil.
+    scene.node_set_size(&sv, zeilen[5], 180.0, 40.0)
+    scene.node_set_align_self(&sv, zeilen[5], flex.AL_CENTER)
+    scene.scene_measure(&sv, &c)
+    scene.scene_layout(&sv, &c, 0.0, 0.0, 400.0, 400.0)
+    var n104: [u8; 42] = "5 180 breit und mittig liegt sie bei x = 4"
+    report((&n104[0]) as u64, 42, scene.node_x(&sv, zeilen[5]) as i64 == 4,
+        scene.node_x(&sv, zeilen[5]) as i64, 4)
+    var n105: [u8; 42] = "5 und ihr Fokus ist ganz sichtbar (1 = ja)"
+    report((&n105[0]) as u64, 42, a11y.a11y_focus_visible(&sv, zeilen[5]),
+        a11y.a11y_focus_visible(&sv, zeilen[5]) as i64, 1)
+
+    // ===================================== 6. DER BAUM ALS TEXT
+    //
+    // Eine bekannte Oberflaeche: eine Spalte 300 breit, sechs Zeilen zu
+    // je 30 Punkten. Die Rechtecke folgen daraus von Hand: y = 0, 30,
+    // 60, 90, 120, 150.
+    var d_t0: [u8; 13] = "Einstellungen"
+    var d_t1: [u8; 5] = "Zebra"
+    var d_t2: [u8; 5] = "Tempo"
+    var sd: scene.Scene = scene.scene_new()
+    var ad: a11y.A11y = a11y.a11y_new()
+    let d0: usize = scene.scene_add(&sd, scene.SCENE_NONE, scene.N_BOX)
+    let d_h: usize = scene.scene_add(&sd, d0, scene.N_TEXT)
+    scene.node_set_text(&sd, d_h, (&d_t0[0]) as u64, 13)
+    a11y.a11y_set_role(&ad, d_h, a11y.ROLE_HEADING)
+    let d_cb: usize = scene.scene_widget(&sd, d0, widget.KIND_CHECKBOX,
+        (&d_t1[0]) as u64, 5)
+    widget.w_set_value(scene.node_widget(&sd, d_cb), 1)
+    let d_sl: usize = scene.scene_widget(&sd, d0, widget.KIND_SLIDER,
+        (&d_t2[0]) as u64, 5)
+    widget.w_set_value(scene.node_widget(&sd, d_sl), 620)
+    let d_et: usize = scene.scene_add(&sd, d0, scene.N_TEXT)
+    scene.node_set_text(&sd, d_et, (&t_suche[0]) as u64, 5)
+    scene.node_set_id(&sd, d_et, 7 as u32)
+    let d_tx: usize = scene.scene_widget(&sd, d0, widget.KIND_TEXTBOX,
+        (&t_wert[0]) as u64, 3)
+    a11y.a11y_set_labelled_by(&ad, d_tx, 7 as u32)
+    let d_kn: usize = scene.scene_widget(&sd, d0, widget.KIND_BUTTON, 0, 0)
+    var dk: usize = 1
+    while dk <= 6 {
+        scene.node_set_size(&sd, scene.scene_child_at(&sd, d0, dk - 1),
+            300.0, 30.0)
+        dk = dk + 1
+    }
+    scene.scene_measure(&sd, &c)
+    scene.scene_layout(&sd, &c, 0.0, 0.0, 300.0, 200.0)
+    var db: [u8; 1024] = [0 as u8; 1024]
+    let dn: usize = a11y.a11y_dump(&sd, &ad, (&db[0]) as u64, 1024)
+    rt.write_everything(1, (&db[0]) as u64, dn)
+    let dp: u64 = (&db[0]) as u64
+    var e0: [u8; 20] = "generic @0,0 300x200"
+    var e1: [u8; 37] = "  heading \"Einstellungen\" @0,0 300x30"
+    var e2: [u8; 49] = "  checkbox \"Zebra\" focusable checked @0,30 300x30"
+    var e3: [u8; 63] = "  slider \"Tempo\" focusable value=620 range=0..1000 @0,60 300x30"
+    var e4: [u8; 27] = "  text \"Suche\" @0,90 300x30"
+    var e5: [u8; 53] = "  textbox \"Suche\" focusable value=\"abc\" @0,120 300x30"
+    var e6: [u8; 38] = "  button !name focusable @0,150 300x30"
+    var n106: [u8; 23] = "6 der Baum hat 7 Zeilen"
+    report((&n106[0]) as u64, 23, zeilen_von(dp, dn) == 7,
+        zeilen_von(dp, dn) as i64, 7)
+    var n107: [u8; 41] = "6 Zeile 1 (generic) stimmt genau (1 = ja)"
+    report((&n107[0]) as u64, 41, zeile_gleich(dp, dn, 0, (&e0[0]) as u64, 20) == 1,
+        zeile_gleich(dp, dn, 0, (&e0[0]) as u64, 20), 1)
+    var n108: [u8; 41] = "6 Zeile 2 (heading) stimmt genau (1 = ja)"
+    report((&n108[0]) as u64, 41, zeile_gleich(dp, dn, 1, (&e1[0]) as u64, 37) == 1,
+        zeile_gleich(dp, dn, 1, (&e1[0]) as u64, 37), 1)
+    var n109: [u8; 42] = "6 Zeile 3 (checkbox) stimmt genau (1 = ja)"
+    report((&n109[0]) as u64, 42, zeile_gleich(dp, dn, 2, (&e2[0]) as u64, 49) == 1,
+        zeile_gleich(dp, dn, 2, (&e2[0]) as u64, 49), 1)
+    var n110: [u8; 40] = "6 Zeile 4 (slider) stimmt genau (1 = ja)"
+    report((&n110[0]) as u64, 40, zeile_gleich(dp, dn, 3, (&e3[0]) as u64, 63) == 1,
+        zeile_gleich(dp, dn, 3, (&e3[0]) as u64, 63), 1)
+    var n111: [u8; 38] = "6 Zeile 5 (text) stimmt genau (1 = ja)"
+    report((&n111[0]) as u64, 38, zeile_gleich(dp, dn, 4, (&e4[0]) as u64, 27) == 1,
+        zeile_gleich(dp, dn, 4, (&e4[0]) as u64, 27), 1)
+    var n112: [u8; 41] = "6 Zeile 6 (textbox) stimmt genau (1 = ja)"
+    report((&n112[0]) as u64, 41, zeile_gleich(dp, dn, 5, (&e5[0]) as u64, 53) == 1,
+        zeile_gleich(dp, dn, 5, (&e5[0]) as u64, 53), 1)
+    var n113: [u8; 40] = "6 Zeile 7 (button) stimmt genau (1 = ja)"
+    report((&n113[0]) as u64, 40, zeile_gleich(dp, dn, 6, (&e6[0]) as u64, 38) == 1,
+        zeile_gleich(dp, dn, 6, (&e6[0]) as u64, 38), 1)
+    var n114: [u8; 38] = "6 die ganze Ausgabe ist 294 Bytes lang"
+    report((&n114[0]) as u64, 38, dn == 294,
+        dn as i64, 294)
+    var klein: [u8; 10] = [0 as u8; 10]
+    var n115: [u8; 34] = "6 Puffer 10 zu klein: gemeldet 294"
+    report((&n115[0]) as u64, 34, a11y.a11y_dump(&sd, &ad, (&klein[0]) as u64, 10) == 294,
+        a11y.a11y_dump(&sd, &ad, (&klein[0]) as u64, 10) as i64, 294)
+    var n116: [u8; 40] = "6 im Text 1 Knopf ohne Namen, gezaehlt 1"
+    report((&n116[0]) as u64, 40, a11y.a11y_unnamed(&sd, &ad) == 1,
+        a11y.a11y_unnamed(&sd, &ad) as i64, 1)
+
+    canvas.canvas_free(&cv)
+    painter.painter_free(&z)
+    rt.buf_free(&fbuf)
+
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push(&t, 10 as u8)
+    if G_ERRORS > 0 {
+        var f: [u8; 22] = "A11Y IS NOT IN ORDER.\n"
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 22)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+        return 1
+    }
+    var o: [u8; 13] = "A11Y PASSED.\n"
+    rt.buf_push_bytes(&t, (&o[0]) as u64, 13)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 0
+}

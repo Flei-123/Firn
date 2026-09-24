@@ -1,0 +1,501 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/gallery10_main.fi -- DER BELEG ZUR ZWEIRICHTUNGSSCHRIFT.
+//
+// ====================================================== WAS DAS BLATT ZEIGT
+//
+// Arabisch und Hebraeisch NEBEN Lateinisch, gemalt ausschliesslich ueber
+// den normalen Weg der Bibliothek (render.draw_label, draw_button,
+// draw_textfield) -- kein Aufruf hier kennt bidi.fi oder shape.fi. Wenn
+// das Blatt richtig aussieht, dann weil jede Beschriftung in fUi richtig
+// aussieht:
+//
+//   1. Beschriftungen: ein arabischer und ein hebraeischer Satz, Zahlen
+//      mitten in arabischem Text, Klammern und Zahlen in hebraeischem
+//      Text, ein arabisches Wort in einem deutschen Satz, arabisch-
+//      indische Ziffern.
+//   2. Die Richtung als Stilwert: derselbe hebraeische Text einmal mit
+//      `direction: ltr`, einmal mit `direction: rtl` im selben Kasten --
+//      bei rtl beginnt er rechts. Dazu Knoepfe mit arabischer und
+//      hebraeischer Beschriftung.
+//   3. Umbruch und Kuerzung: ein arabischer Absatz ueber zwei Zeilen und
+//      ein zu langer hebraeischer Titel mit "..." -- am LINKEN Ende,
+//      denn dort geht ein Text von rechts nach links weiter.
+//   4. Textfelder: ein arabisches mit der Schreibmarke am Textende (auf
+//      dem Schirm links), ein gemischtes mit einer Auswahl ueber die
+//      Richtungsgrenze hinweg, die in zwei Stuecke zerfaellt.
+//
+// ====================================================== WAS ES NACHRECHNET
+//
+// Bevor ein PNG geschrieben wird, prueft das Programm am fertigen Bild:
+//
+//   * KEIN PUNKT AUSSERHALB SEINES KASTENS. Links und rechts neben jedem
+//     Kasten liegt ein Streifen von 6 Punkten, der nur die Seitenfarbe
+//     zeigen darf. Ein Text, der ueber sein Element hinauslaeuft, faerbt
+//     ihn -- und das Programm endet dann ohne Bild.
+//   * JEDE BESCHRIFTUNG, DIE NICHT ABSICHTLICH GEKUERZT IST, PASST: ihre
+//     mit render.pref_of gemessene Breite ist hoechstens die des
+//     Kastens.
+//   * DER TEXTANFANG: im RTL-Kasten liegt die rechteste Tinte hoechstens
+//     4 Punkte vor dem rechten Innenrand, im LTR-Kasten die linkeste
+//     hoechstens 4 Punkte hinter dem linken.
+//
+// Die Schrift ist DejaVu Sans; sie fuehrt arabische und hebraeische
+// Glyphen samt GSUB (fc-list ':lang=ar' und ':lang=he' nennen sie).
+// Fehlt sie, endet das Programm ohne Bild, wie jede Galerie hier.
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.textbuf
+import fui.editor
+
+const FONTSET_BYTES: usize = 4096
+const W: usize = 1000
+const H: usize = 900
+const RAND_UNTEN: f64 = 20.0
+const STREIFEN: usize = 6
+
+static mut G_SCHLECHT: usize = 0
+
+fn zuschnitt(src: *mut canvas.Canvas, dst: *mut canvas.Canvas,
+    hoehe: f64) -> bool {
+    var h: usize = (hoehe + 0.5) as usize
+    if h > canvas.canvas_height(src) {
+        h = canvas.canvas_height(src)
+    }
+    if h == 0 {
+        return false
+    }
+    let w: usize = canvas.canvas_width(src)
+    if !canvas.canvas_init(dst, w, h) {
+        return false
+    }
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            canvas.canvas_set_raw(dst, x, y, canvas.canvas_get(src, x, y))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+fn sag(p: u64, n: usize, a: i64, b: i64, ok: bool) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, p, n)
+    var i: usize = n
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 8] = "OK  got "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 8)
+    } else {
+        var f: [u8; 10] = "WRONG got "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 10)
+        G_SCHLECHT = G_SCHLECHT + 1
+    }
+    rt.buf_push_dec_i64(&t, a)
+    var w2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn heading(c: *mut render.Ctx, x: f64, y: f64, p: u64, n: usize) {
+    var e: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&e, x, y, 940.0, 18.0)
+    widget.w_set_text(&e, p, n)
+    let s: *mut style.Style = widget.w_style(&e)
+    *s = style.style_set_fg(*s, style.color_token(style.TOK_TEXT_MUTED))
+    *s = style.style_set_font(*s, 0, 12)
+    render.draw_label(c, &e)
+}
+
+// Die Kaesten, die nachgerechnet werden: x, y, w, h je Kasten.
+struct Kaesten {
+    v: [f64; 160],
+    n: usize,
+}
+
+fn merke(k: *mut Kaesten, e: *mut widget.Widget) {
+    if (*k).n >= 40 {
+        return
+    }
+    let i: usize = (*k).n * 4
+    (*k).v[i] = widget.w_x(e)
+    (*k).v[i + 1] = widget.w_y(e)
+    (*k).v[i + 2] = widget.w_w(e)
+    (*k).v[i + 3] = widget.w_h(e)
+    (*k).n = (*k).n + 1
+}
+
+// PASST DIE BESCHRIFTUNG? pref_of misst mit demselben Lauf, mit dem
+// gemalt wird -- Richtung und Gestalt eingeschlossen.
+fn passt(c: *mut render.Ctx, e: *mut widget.Widget) -> bool {
+    var pw: f64 = 0.0
+    var ph: f64 = 0.0
+    render.pref_of(c, e, &pw, &ph)
+    let ok: bool = pw <= widget.w_w(e) + 0.01
+    if !ok {
+        var zu: [u8; 44] = "Beschriftung breiter als ihr Kasten         "
+        sag((&zu[0]) as u64, 43, pw as i64, widget.w_w(e) as i64, false)
+    }
+    return ok
+}
+
+fn label(c: *mut render.Ctx, k: *mut Kaesten, x: f64, y: f64, w: f64,
+    h: f64, p: u64, n: usize, px: usize, dir: u32, karte: bool) {
+    var e: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&e, x, y, w, h)
+    widget.w_set_text(&e, p, n)
+    let s: *mut style.Style = widget.w_style(&e)
+    *s = style.style_set_font(*s, 0, px)
+    *s = style.style_set_direction(*s, dir)
+    if karte {
+        *s = kasten(*s)
+    } else {
+        *s = style.style_set_pad(*s, 0, 0)
+    }
+    render.draw_label(c, &e)
+    let ok: bool = passt(c, &e)
+    merke(k, &e)
+}
+
+// EIN KASTEN OHNE SCHATTEN. Eine Karte (KIND_CARD) wirft einen, und
+// der laege genau in den Streifen, die unten nachgerechnet werden; sie
+// steht ausserdem mittig. Eine Beschriftung mit Flaeche und Rand hat
+// beides nicht -- und ihre Vorgabe-Ausrichtung ist "am Anfang", also
+// genau das, was Abschnitt 2 zeigen soll.
+fn kasten(s0: style.Style) -> style.Style {
+    var s: style.Style = s0
+    s = style.style_set_bg(s, style.color_token(style.TOK_SURFACE_RAISED))
+    s = style.style_set_border(s, style.color_token(style.TOK_BORDER), 1)
+    s = style.style_set_radius(s, 8)
+    s = style.style_set_pad(s, 12, 6)
+    return s
+}
+
+// DIE STREIFEN NEBEN JEDEM KASTEN zeigen nur die Seitenfarbe.
+fn streifen_frei(cv: *mut canvas.Canvas, k: *mut Kaesten, bg: u32) -> i64 {
+    var fremd: i64 = 0
+    var i: usize = 0
+    while i < (*k).n {
+        let x0: usize = (*k).v[i * 4] as usize
+        let y0: usize = (*k).v[i * 4 + 1] as usize
+        let x1: usize = ((*k).v[i * 4] + (*k).v[i * 4 + 2]) as usize
+        let y1: usize = ((*k).v[i * 4 + 1] + (*k).v[i * 4 + 3]) as usize
+        var y: usize = y0
+        while y < y1 {
+            var d: usize = 2
+            while d <= STREIFEN {
+                if x0 >= d && canvas.canvas_get(cv, x0 - d, y) != bg {
+                    fremd = fremd + 1
+                }
+                if canvas.canvas_get(cv, x1 + d, y) != bg {
+                    fremd = fremd + 1
+                }
+                d = d + 1
+            }
+            y = y + 1
+        }
+        i = i + 1
+    }
+    return fremd
+}
+
+// Die aeusserste Spalte mit Tinte in einem Rechteck: `rechts` sucht von
+// rechts, sonst von links. -1, wenn keine.
+fn tinte(cv: *mut canvas.Canvas, x0: usize, y0: usize, x1: usize,
+    y1: usize, flaeche: u32, rechts: bool) -> i64 {
+    var k: usize = 0
+    while k < x1 - x0 {
+        var x: usize = x0 + k
+        if rechts {
+            x = x1 - 1 - k
+        }
+        var y: usize = y0
+        while y < y1 {
+            if canvas.canvas_get(cv, x, y) != flaeche {
+                return x as i64
+            }
+            y = y + 1
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        var u: [u8; 49] = "gallery10_main <out.png> [light|dark] [font.ttf]\n"
+        rt.write_everything(2, (&u[0]) as u64, 49)
+        return 2
+    }
+    let path: u64 = rt.arg_ptr(start, 1)
+    var dark: bool = true
+    if rt.arg_count(start) >= 3 {
+        if rt.ld8(rt.arg_ptr(start, 2), 0) == 108 as u8 {
+            dark = false
+        }
+    }
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 4 {
+        have = rt.read_file(rt.arg_ptr(start, 3), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    if fm == 0 {
+        var ks: [u8; 61] = "gallery10: keine Schrift gefunden -- ohne Schrift kein Beleg\n"
+        rt.write_everything(2, (&ks[0]) as u64, 61)
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, 300) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(dark)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    let bg: u32 = theme.opaque((*f).base)
+    canvas.canvas_clear(&cv, bg)
+    var ks: Kaesten = Kaesten { v: [0.0; 160], n: 0 }
+    let kp: *mut Kaesten = &ks
+
+    var y: f64 = 24.0
+    var t0: [u8; 73] = "ZWEIRICHTUNGSSCHRIFT -- Arabisch und Hebraeisch neben Lateinisch (UAX #9)"
+    heading(&c, 24.0, y, (&t0[0]) as u64, 73)
+    y = y + 28.0
+
+    // ==================================================================
+    // 1. BESCHRIFTUNGEN
+    // ==================================================================
+    var h1: [u8; 66] = "1  Beschriftungen, Richtung automatisch (das erste starke Zeichen)"
+    heading(&c, 24.0, y, (&h1[0]) as u64, 66)
+    y = y + 22.0
+    var a1: [u8; 104] = "مرحبا بالعالم — واجهة المستخدم تكتب من اليمين إلى اليسار"
+    label(&c, kp, 24.0, y, 460.0, 44.0, (&a1[0]) as u64, 104, 16, style.DIR_AUTO, true)
+    var he1: [u8; 74] = "שלום עולם — ממשק המשתמש נכתב מימין לשמאל"
+    label(&c, kp, 516.0, y, 460.0, 44.0, (&he1[0]) as u64, 74, 16, style.DIR_AUTO, true)
+    y = y + 56.0
+    var a2: [u8; 66] = "تم تحديث fUi إلى الإصدار 2.1 في 23 سبتمبر"
+    label(&c, kp, 24.0, y, 460.0, 44.0, (&a2[0]) as u64, 66, 16, style.DIR_AUTO, true)
+    var he2: [u8; 51] = "המחיר (כולל מס): 1,250 ש״ח לחודש"
+    label(&c, kp, 516.0, y, 460.0, 44.0, (&he2[0]) as u64, 51, 16, style.DIR_AUTO, true)
+    y = y + 56.0
+    var d1: [u8; 54] = "Die Datei [تقرير.pdf] wurde am 23.09. gespeichert"
+    label(&c, kp, 24.0, y, 460.0, 44.0, (&d1[0]) as u64, 54, 16, style.DIR_AUTO, true)
+    var a3: [u8; 54] = "رقم الطلب ١٢٣٤٥ (قيد المعالجة)"
+    label(&c, kp, 516.0, y, 460.0, 44.0, (&a3[0]) as u64, 54, 16, style.DIR_AUTO, true)
+    y = y + 64.0
+
+    // ==================================================================
+    // 2. DIE RICHTUNG ALS STILWERT
+    // ==================================================================
+    var h2: [u8; 73] = "2  direction: ltr gegen direction: rtl -- bei rtl beginnt der Text rechts"
+    heading(&c, 24.0, y, (&h2[0]) as u64, 73)
+    y = y + 22.0
+    var he3: [u8; 25] = "הגדרות המערכת"
+    let yl: f64 = y
+    label(&c, kp, 24.0, y, 460.0, 44.0, (&he3[0]) as u64, 25, 18, style.DIR_LTR, true)
+    label(&c, kp, 516.0, y, 460.0, 44.0, (&he3[0]) as u64, 25, 18, style.DIR_RTL, true)
+    y = y + 56.0
+    // Knoepfe: mittig, in beiden Schriften, und ein lateinischer daneben.
+    var b1: [u8; 17] = "حفظ الملف"
+    var b2: [u8; 10] = "إلغاء"
+    var b3: [u8; 23] = "שמור שינויים"
+    var b4: [u8; 9] = "Speichern"
+    let bx: [f64; 4] = [24.0, 180.0, 336.0, 516.0]
+    var bi: usize = 0
+    while bi < 4 {
+        var e: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+        widget.w_place(&e, bx[bi], y, 140.0, 40.0)
+        if bi == 0 {
+            widget.w_set_text(&e, (&b1[0]) as u64, 17)
+        } else if bi == 1 {
+            widget.w_set_text(&e, (&b2[0]) as u64, 10)
+        } else if bi == 2 {
+            widget.w_set_text(&e, (&b3[0]) as u64, 23)
+        } else {
+            widget.w_set_text(&e, (&b4[0]) as u64, 9)
+        }
+        let s: *mut style.Style = widget.w_style(&e)
+        *s = style.style_set_font(*s, 0, 15)
+        if bi < 3 {
+            *s = style.style_set_direction(*s, style.DIR_RTL)
+        }
+        render.draw_button(&c, &e)
+        let ok: bool = passt(&c, &e)
+        merke(kp, &e)
+        bi = bi + 1
+    }
+    y = y + 60.0
+
+    // ==================================================================
+    // 3. UMBRUCH UND KUERZUNG
+    // ==================================================================
+    var h3: [u8; 84] = "3  Umbruch ueber zwei Zeilen und Kuerzung -- die Punkte am Zeilenende, bei rtl links"
+    heading(&c, 24.0, y, (&h3[0]) as u64, 84)
+    y = y + 22.0
+    var a4: [u8; 159] = "هذا نص عربي يلتف على عدة أسطر داخل البطاقة، وكل سطر يُرتب من اليمين إلى اليسار مع 3 أرقام"
+    var pw: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&pw, 24.0, y, 460.0, 72.0)
+    widget.w_set_text(&pw, (&a4[0]) as u64, 159)
+    widget.w_set_text_lines(&pw, 3)
+    let pws: *mut style.Style = widget.w_style(&pw)
+    *pws = kasten(style.style_set_font(*pws, 0, 16))
+    *pws = style.style_set_direction(*pws, style.DIR_RTL)
+    render.draw_label(&c, &pw)
+    merke(kp, &pw)
+    // DIE UEBERSCHRIFT SAGT "ZWEI ZEILEN", also wird gezaehlt: mit dem
+    // Textlauf dieses Kastens und seiner Innenbreite (460 - 2 x 12).
+    var pr: painter.TextRun = render.text_run_of(&c, &pw,
+        render.len_of(&c, 16))
+    let zl: usize = painter.run_line_count(&z, &pr, (&a4[0]) as u64, 159, 436.0, 3)
+    var n0: [u8; 44] = "Abschnitt 3: der Absatz hat zwei Zeilen     "
+    sag((&n0[0]) as u64, 43, zl as i64, 2, zl == 2)
+    // Gekuerzt: ABSICHTLICH breiter als der Kasten, darum ohne `passt`.
+    var he4: [u8; 110] = "כותרת ארוכה מאוד שלא נכנסת בשורה אחת ולכן היא מקוצרת בנקודות"
+    var tw: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&tw, 516.0, y, 460.0, 44.0)
+    widget.w_set_text(&tw, (&he4[0]) as u64, 110)
+    let tws: *mut style.Style = widget.w_style(&tw)
+    *tws = kasten(style.style_set_font(*tws, 0, 18))
+    *tws = style.style_set_direction(*tws, style.DIR_RTL)
+    render.draw_label(&c, &tw)
+    merke(kp, &tw)
+    y = y + 84.0
+
+    // ==================================================================
+    // 4. TEXTFELDER
+    // ==================================================================
+    var h4: [u8; 92] = "4  Textfelder: Schreibmarke am Textende (arabisch: links), Auswahl ueber die Richtungsgrenze"
+    heading(&c, 24.0, y, (&h4[0]) as u64, 92)
+    y = y + 22.0
+    var raw1: [u8; 128] = [0; 128]
+    var ed1: editor.Editor = editor.editor_new()
+    if !editor.editor_init(&ed1, (&raw1[0]) as u64, 128) {
+        return 10
+    }
+    var f1w: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+    widget.w_place(&f1w, 24.0, y, 460.0, 40.0)
+    let f1s: *mut style.Style = widget.w_style(&f1w)
+    *f1s = style.style_set_font(*f1s, 0, 16)
+    *f1s = style.style_set_direction(*f1s, style.DIR_RTL)
+    var ms1: painter.Measure = render.field_measure(&c, &f1w)
+    editor.editor_set_visual(&ed1, painter.measure_x, painter.measure_hit,
+        painter.measure_width, painter.measure_rtl, (&ms1) as u64)
+    var ft1: [u8; 28] = "ابحث في الملفات"
+    textbuf.tb_set_text(editor.editor_buf(&ed1), (&ft1[0]) as u64, 28)
+    render.draw_textfield(&c, &f1w, &ed1, true)
+    merke(kp, &f1w)
+
+    var raw2: [u8; 128] = [0; 128]
+    var ed2: editor.Editor = editor.editor_new()
+    if !editor.editor_init(&ed2, (&raw2[0]) as u64, 128) {
+        return 10
+    }
+    var f2w: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+    widget.w_place(&f2w, 516.0, y, 460.0, 40.0)
+    let f2s: *mut style.Style = widget.w_style(&f2w)
+    *f2s = style.style_set_font(*f2s, 0, 16)
+    var ms2: painter.Measure = render.field_measure(&c, &f2w)
+    editor.editor_set_visual(&ed2, painter.measure_x, painter.measure_hit,
+        painter.measure_width, painter.measure_rtl, (&ms2) as u64)
+    // "Ordner" + Leerzeichen + hebraeisches Wort: markiert wird von
+    // Oktett 4 ("er ") bis 12 (die ersten drei hebraeischen Buchstaben)
+    // -- auf dem Schirm zwei Stuecke, weil das hebraeische Wort von
+    // rechts nach links steht.
+    var ft2: [u8; 24] = "Ordner מסמכים 2026"
+    textbuf.tb_set_text(editor.editor_buf(&ed2), (&ft2[0]) as u64, 24)
+    textbuf.tb_set_range(editor.editor_buf(&ed2), 12, 4)
+    render.draw_textfield(&c, &f2w, &ed2, true)
+    merke(kp, &f2w)
+    y = y + 40.0
+
+    // ==================================================================
+    // DIE NACHRECHNUNG AM FERTIGEN BILD
+    // ==================================================================
+    let fremd: i64 = streifen_frei(&cv, kp, bg)
+    var n1: [u8; 44] = "Punkte neben den Kaesten (Seitenfarbe)      "
+    sag((&n1[0]) as u64, 43, fremd, 0, fremd == 0)
+    // Der Textanfang in Abschnitt 2: dieselbe Karte, links ltr, rechts
+    // rtl. Innenrand = Kasten minus 12 Punkte Polster.
+    let flaeche: u32 = canvas.canvas_get(&cv, 250, (yl + 3.0) as usize)
+    let lx: i64 = tinte(&cv, 30, (yl + 8.0) as usize, 478,
+        (yl + 36.0) as usize, flaeche, false)
+    let rx: i64 = tinte(&cv, 522, (yl + 8.0) as usize, 970,
+        (yl + 36.0) as usize, flaeche, true)
+    var n2: [u8; 44] = "ltr: Tinte ab linkem Rand, hoechstens 4     "
+    sag((&n2[0]) as u64, 43, lx - 36, 4, lx >= 36 && lx - 36 <= 4)
+    var n3: [u8; 44] = "rtl: Tinte bis rechtem Rand, hoechstens 4   "
+    sag((&n3[0]) as u64, 43, 964 - rx, 4, rx >= 0 && rx <= 964 && 964 - rx <= 4)
+    var n4: [u8; 44] = "Kaesten nachgerechnet                       "
+    sag((&n4[0]) as u64, 43, ks.n as i64, 16, ks.n == 16)
+    if G_SCHLECHT != 0 {
+        var nix: [u8; 49] = "gallery10: eine Zusage stimmt nicht -- KEIN Bild\n"
+        rt.write_everything(2, (&nix[0]) as u64, 49)
+        return 8
+    }
+
+    let ende: f64 = y + RAND_UNTEN
+    var bild: canvas.Canvas = canvas.canvas_new()
+    if !zuschnitt(&cv, &bild, ende) {
+        return 8
+    }
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(&bild, &out) {
+        return 6
+    }
+    var pf: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < rt.c_length(path) {
+        rt.buf_push(&pf, rt.ld8(path, k))
+        k = k + 1
+    }
+    rt.buf_push(&pf, 0 as u8)
+    if !rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64,
+        mem.buf_len(&out)) {
+        return 7
+    }
+    var okm: [u8; 11] = "GALLERY 10\n"
+    rt.write_everything(1, (&okm[0]) as u64, 11)
+    editor.editor_free(&ed1)
+    editor.editor_free(&ed2)
+    painter.painter_free(&z)
+    canvas.canvas_free(&bild)
+    canvas.canvas_free(&cv)
+    return 0
+}

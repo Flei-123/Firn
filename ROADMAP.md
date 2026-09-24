@@ -215,7 +215,10 @@ the browser project. **That is the actual goal of this roadmap.**
 
 * **aarch64 backend** -- only once Osum targets ARM
 * **WASM backend** -- not needed for the browser; "Firn instead of JavaScript in
-  the browser" stays a distant goal, but it blocks nothing
+  the browser" stays a distant goal, but it blocks nothing. *Round WASM
+  (2026-09-23) built it anyway, for fUi pages in foreign browsers:*
+  `--target=wasm32-browser`, see `docs/ROUND-WASM.md`. SIMD and threads on
+  it are still open
 * **JIT**, dynamic libraries, C++ interop -- permanently excluded
 * **Hot reload level C** (real code swapping) -- `DESIGN_GOALS.md` 9:
   collides with static linking (`R5`) and with inlining across module boundaries

@@ -42,6 +42,9 @@ pub enum A64 {
     Direct(u32),
     /// `AT_FDCWD` in front of the arguments, then this number
     AtFdcwd(u32),
+    /// FIRN r64: rename(old, new) -> renameat(AT_FDCWD, old, AT_FDCWD, new)
+    /// -- TWO directory descriptors, which `AtFdcwd` cannot express.
+    RenameAt(u32),
     /// `fork()` -> `clone(SIGCHLD, 0, 0, 0, 0)`. The generic table has no
     /// `fork`; the call it is a special case of is there, and `SIGCHLD` as
     /// the flag word is exactly what makes it one.
@@ -49,6 +52,20 @@ pub enum A64 {
     /// `dup2(old, new)` -> `dup3(old, new, 0)`. Same difference: only the
     /// flag carrying form survived into the generic table.
     Dup3(u32),
+    /// ROUND C-059 (Certus): `poll(fds, n, ms)` -> `ppoll(fds, n, ts, 0, 0)`.
+    ///
+    /// The generic table has no `poll`, only `ppoll` — and that is not a
+    /// number change but a SHAPE change: the third argument is no longer a
+    /// count of milliseconds but a pointer to a `timespec {sec, nsec}`.
+    /// Writing `Direct(73)` here would hand the millisecond count to the
+    /// kernel AS AN ADDRESS; it would not fail, it would read rubbish.
+    ///
+    /// So the millisecond value is turned into a `timespec` on the stack
+    /// at the call site (see `codegen_a64.rs`). A negative timeout means
+    /// "wait forever" for `poll`, and for `ppoll` that is the NULL pointer
+    /// — which is why the constant -1 is translated as a null pointer and
+    /// a computed timeout is refused rather than guessed at.
+    PpollMs(u32),
     /// `arch_prctl(ARCH_SET_FS, p)` -> `msr tpidr_el0, p`. This one is not a
     /// system call at all here: AArch64 lets EL0 write its own thread
     /// pointer, so what costs a system call on x86 costs one instruction.
@@ -69,12 +86,49 @@ pub const AT_FDCWD: i64 = -100;
 /// The table. Left the canonical (x86-64) number, right what AArch64 makes
 /// of it. Sorted by the left column; the name in the comment is the one
 /// both sides carry in `unistd.h`.
+/// FIRN r64 -- THE x86_64 CALLS ANDROID'S SECCOMP FILTER REFUSES, and what
+/// they become (`--target=x86_64-android`). Each entry: canonical number,
+/// new number, and the argument list of the new call: `A(k)` is the k-th
+/// argument the program wrote, `I(v)` an immediate. poll is not here: it
+/// changes the SHAPE of its argument (codegen_x86.rs, like `PpollMs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X {
+    A(usize),
+    I(i64),
+}
+
+pub const X86_ANDROID: &[(i64, i64, &[X])] = &[
+    (2, 257, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::A(2)]), // open -> openat
+    (4, 262, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0)]), // stat -> newfstatat
+    (6, 262, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0x100)]), // lstat
+    (21, 269, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0)]), // access -> faccessat
+    (22, 293, &[X::A(0), X::I(0)]),                     // pipe -> pipe2
+    (33, 292, &[X::A(0), X::A(1), X::I(0)]),            // dup2 -> dup3
+    (57, 56, &[X::I(SIGCHLD), X::I(0), X::I(0), X::I(0), X::I(0)]), // fork -> clone
+    (82, 264, &[X::I(AT_FDCWD), X::A(0), X::I(AT_FDCWD), X::A(1)]), // rename -> renameat
+    (83, 258, &[X::I(AT_FDCWD), X::A(0), X::A(1)]),     // mkdir -> mkdirat
+    (84, 263, &[X::I(AT_FDCWD), X::A(0), X::I(0x200)]), // rmdir -> unlinkat
+    (87, 263, &[X::I(AT_FDCWD), X::A(0), X::I(0)]),     // unlink -> unlinkat
+    (89, 267, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::A(2)]), // readlink -> readlinkat
+    (90, 268, &[X::I(AT_FDCWD), X::A(0), X::A(1)]),     // chmod -> fchmodat
+];
+
+/// The Android form of an x86_64 call, `None` = the call stays as it is.
+pub fn x86_android(n: i64) -> Option<(i64, &'static [X])> {
+    X86_ANDROID.iter().find(|(k, _, _)| *k == n).map(|(_, m, a)| (*m, *a))
+}
+
 const TABLE: &[(i64, A64)] = &[
     (0, A64::Direct(63)),            // read
     (1, A64::Direct(64)),            // write
     (2, A64::AtFdcwd(56)),           // open      -> openat
     (3, A64::Direct(57)),            // close
     (5, A64::Direct(80)),            // fstat
+    // ROUND C-059 (Certus): without this line the browser is not
+    // translatable for the phone at all — `poll` sits in net/atem.fi and
+    // therefore under every socket, every TLS handshake and every HTTP
+    // request. Shape change, not just a number: see `PpollMs`.
+    (7, A64::PpollMs(73)),           // poll      -> ppoll
     (8, A64::Direct(62)),            // lseek
     (9, A64::Direct(222)),           // mmap
     (10, A64::Direct(226)),          // mprotect
@@ -87,6 +141,7 @@ const TABLE: &[(i64, A64)] = &[
     (18, A64::Direct(68)),           // pwrite64
     (19, A64::Direct(65)),           // readv
     (20, A64::Direct(66)),           // writev
+    (21, A64::AtFdcwd(48)),          // access    -> faccessat (Firn r64)
     (24, A64::Direct(124)),          // sched_yield
     (28, A64::Direct(233)),          // madvise
     (32, A64::Direct(23)),           // dup
@@ -119,11 +174,40 @@ const TABLE: &[(i64, A64)] = &[
     (61, A64::Direct(260)),          // wait4
     (62, A64::Direct(129)),          // kill
     (63, A64::Direct(160)),          // uname
+    (74, A64::Direct(82)), // fsync (Firn r64)
     (79, A64::Direct(17)),           // getcwd
+    // Round ABSCHLUSS (Certus): the same shape as `open` two lines up --
+    // the generic table has no `mkdir`, only `mkdirat`, and AT_FDCWD in
+    // front of the path makes it mean the same. Without this line every
+    // program that links lib/pdf/down.fi (the download folder) was
+    // untranslatable for the phone, and that is the whole browser.
+    (82, A64::RenameAt(38)),         // rename    -> renameat (Firn r64)
+    (83, A64::AtFdcwd(34)),          // mkdir     -> mkdirat
+    // ROUND VERIFY (Certus): the crash report deletes itself after it has
+    // been sent (lib/android/absturz.fi). Same shape as `open` and
+    // `mkdir` above -- the generic table has no `unlink`, only
+    // `unlinkat`, and AT_FDCWD in front of the path makes it mean the
+    // same thing. The third argument (flags) is 0, which is what
+    // `unlinkat` wants for a plain file.
+    (87, A64::AtFdcwd(35)),          // unlink    -> unlinkat
+    // RUNDE CSS/STAPEL (Certus, 10.09.2026): lib/js/interp.fi fragt den
+    // WIRKLICHEN Stapel ab (getrlimit(RLIMIT_STACK)) statt 6 MiB zu
+    // raten -- die geratene Zahl hat den Windows-Bau umgebracht, weil
+    // dort nur 2 MiB Stapel stehen. Ohne diese Zeile ist derselbe
+    // Quelltext fuer das Telefon nicht uebersetzbar.
+    (90, A64::AtFdcwd(53)),          // chmod     -> fchmodat (Firn r64)
     (96, A64::Direct(169)),          // gettimeofday
+    (97, A64::Direct(163)),          // getrlimit
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
+    // RUNDE C-059: stand bis hierher zwischen 13 und 14 und hat damit die
+    // Sortierung der Tafel gebrochen (eigener Test). Nur verschoben.
+    (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
+    // RUNDE C-059 (Certus): lib/js/interp.fi setzt den Stapel des
+    // Deuters (setrlimit(RLIMIT_STACK)). Dieselbe Gestalt, andere
+    // Nummer -- die generische Tafel hat setrlimit als 164.
+    (160, A64::Direct(164)),         // setrlimit
     (186, A64::Direct(178)),         // gettid
     (200, A64::Direct(131)),         // tgkill
     (202, A64::Direct(98)),          // futex
@@ -141,6 +225,144 @@ pub fn aarch64(n: i64) -> Option<A64> {
     TABLE.iter().find(|(k, _)| *k == n).map(|(_, v)| *v)
 }
 
+// ====================================================================
+// ROUND WASM -- the same numbers, read by a browser.
+// ====================================================================
+//
+// In the browser there is no kernel. There is a HOST: the JavaScript that
+// instantiated the module. What a Linux system call becomes there is
+// decided here, in one table, by the same canonical x86-64 number -- and
+// the third answer of the aarch64 table has a sharper edge here: a call
+// the browser does not have is refused at COMPILE time, with its name and
+// the reason (`codegen_wasm.rs` adds the path through which `main`
+// reaches it). Nothing is emulated that would behave differently from the
+// kernel's answer; where a call has an exact equivalent under "one
+// process, one thread, no files" it gets that equivalent.
+
+/// What becomes of an x86-64 system call number on `wasm32-browser`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wasm {
+    /// `firn.write(fd, buf, len)` -- the host decides what fd 1 and 2 are
+    /// (the console, the terminal)
+    Write,
+    /// `firn.read(fd, buf, len)` -- standard input, if the host has one
+    Read,
+    /// `firn.exit(code)` -- `exit` and `exit_group` alike: one thread
+    Exit,
+    /// the host's nanosecond clock, split into a `timespec`
+    ClockGettime,
+    /// `firn.random(buf, len)` -- `crypto.getRandomValues` in a browser
+    Getrandom,
+    /// `firn.sleep_ns(ns)`
+    Nanosleep,
+    /// anonymous memory on top of `memory.grow` (`wasm_rt.rs`)
+    Mmap,
+    /// back into the free list of `wasm_rt.rs`
+    Munmap,
+    /// the futex of a process with exactly one thread (`wasm_rt.rs`)
+    Futex,
+    /// a call whose answer is a fixed number here
+    Constant(i64),
+    /// no counterpart -- the reason goes into the error message
+    Missing(&'static str),
+}
+
+const NO_FILES: &str = "a browser page has no files and no file descriptors";
+const NO_SOCKETS: &str = "a browser page has no sockets (fetch/WebSocket are not system calls)";
+const NO_PROCESSES: &str = "a browser page cannot start, wait for or signal processes";
+const NO_THREADS: &str = "threads are not supported on wasm32 yet";
+const NO_SIGNALS: &str = "a browser page has no signals";
+
+/// The table: the canonical number, the name both `unistd.h` spell, the
+/// answer. Sorted by the number.
+const WASM_TABLE: &[(i64, &str, Wasm)] = &[
+    (0, "read", Wasm::Read),
+    (1, "write", Wasm::Write),
+    (2, "open", Wasm::Missing(NO_FILES)),
+    (3, "close", Wasm::Missing(NO_FILES)),
+    (4, "stat", Wasm::Missing(NO_FILES)),
+    (5, "fstat", Wasm::Missing(NO_FILES)),
+    (6, "lstat", Wasm::Missing(NO_FILES)),
+    (7, "poll", Wasm::Missing(NO_FILES)),
+    (8, "lseek", Wasm::Missing(NO_FILES)),
+    (9, "mmap", Wasm::Mmap),
+    (10, "mprotect", Wasm::Missing("WebAssembly memory has no page protection")),
+    (11, "munmap", Wasm::Munmap),
+    (12, "brk", Wasm::Missing("the program break does not exist in WebAssembly memory (use mmap)")),
+    (13, "rt_sigaction", Wasm::Missing(NO_SIGNALS)),
+    (14, "rt_sigprocmask", Wasm::Missing(NO_SIGNALS)),
+    (16, "ioctl", Wasm::Missing(NO_FILES)),
+    (17, "pread64", Wasm::Missing(NO_FILES)),
+    (18, "pwrite64", Wasm::Missing(NO_FILES)),
+    (19, "readv", Wasm::Missing(NO_FILES)),
+    (20, "writev", Wasm::Missing(NO_FILES)),
+    // One thread: yielding to nobody returns at once, as the kernel does
+    // when no other thread is runnable.
+    (21, "access", Wasm::Missing(NO_FILES)),
+    (24, "sched_yield", Wasm::Constant(0)),
+    // Advice may be ignored -- the kernel is allowed to do exactly that.
+    (28, "madvise", Wasm::Constant(0)),
+    (32, "dup", Wasm::Missing(NO_FILES)),
+    (33, "dup2", Wasm::Missing(NO_FILES)),
+    (35, "nanosleep", Wasm::Nanosleep),
+    // The one process of the page. 1 is as good a number as any, and it
+    // is never 0 (which a caller could read as "the child").
+    (39, "getpid", Wasm::Constant(1)),
+    (41, "socket", Wasm::Missing(NO_SOCKETS)),
+    (42, "connect", Wasm::Missing(NO_SOCKETS)),
+    (43, "accept", Wasm::Missing(NO_SOCKETS)),
+    (44, "sendto", Wasm::Missing(NO_SOCKETS)),
+    (45, "recvfrom", Wasm::Missing(NO_SOCKETS)),
+    (46, "sendmsg", Wasm::Missing(NO_SOCKETS)),
+    (47, "recvmsg", Wasm::Missing(NO_SOCKETS)),
+    (48, "shutdown", Wasm::Missing(NO_SOCKETS)),
+    (49, "bind", Wasm::Missing(NO_SOCKETS)),
+    (50, "listen", Wasm::Missing(NO_SOCKETS)),
+    (51, "getsockname", Wasm::Missing(NO_SOCKETS)),
+    (52, "getpeername", Wasm::Missing(NO_SOCKETS)),
+    (53, "socketpair", Wasm::Missing(NO_SOCKETS)),
+    (54, "setsockopt", Wasm::Missing(NO_SOCKETS)),
+    (55, "getsockopt", Wasm::Missing(NO_SOCKETS)),
+    (56, "clone", Wasm::Missing(NO_THREADS)),
+    (57, "fork", Wasm::Missing(NO_PROCESSES)),
+    (59, "execve", Wasm::Missing(NO_PROCESSES)),
+    (60, "exit", Wasm::Exit),
+    (61, "wait4", Wasm::Missing(NO_PROCESSES)),
+    (62, "kill", Wasm::Missing(NO_PROCESSES)),
+    (63, "uname", Wasm::Missing("a browser page has no kernel to name")),
+    (72, "fcntl", Wasm::Missing(NO_FILES)),
+    (74, "fsync", Wasm::Missing(NO_FILES)),
+    (79, "getcwd", Wasm::Missing(NO_FILES)),
+    (82, "rename", Wasm::Missing(NO_FILES)),
+    (83, "mkdir", Wasm::Missing(NO_FILES)),
+    (87, "unlink", Wasm::Missing(NO_FILES)),
+    (90, "chmod", Wasm::Missing(NO_FILES)),
+    (96, "gettimeofday", Wasm::Missing("use clock_gettime (228), which the host provides")),
+    (97, "getrlimit", Wasm::Missing("a browser page has no resource limits")),
+    (102, "getuid", Wasm::Missing("a browser page has no users")),
+    (107, "geteuid", Wasm::Missing("a browser page has no users")),
+    (131, "sigaltstack", Wasm::Missing(NO_SIGNALS)),
+    (158, "arch_prctl", Wasm::Missing(NO_THREADS)),
+    (160, "setrlimit", Wasm::Missing("a browser page has no resource limits")),
+    // The one thread of the process.
+    (186, "gettid", Wasm::Constant(1)),
+    (200, "tgkill", Wasm::Missing(NO_SIGNALS)),
+    (202, "futex", Wasm::Futex),
+    (217, "getdents64", Wasm::Missing(NO_FILES)),
+    (228, "clock_gettime", Wasm::ClockGettime),
+    (231, "exit_group", Wasm::Exit),
+    (257, "openat", Wasm::Missing(NO_FILES)),
+    (262, "newfstatat", Wasm::Missing(NO_FILES)),
+    (288, "accept4", Wasm::Missing(NO_SOCKETS)),
+    (318, "getrandom", Wasm::Getrandom),
+];
+
+/// The browser form of the canonical (x86-64) system call number `n`,
+/// with the call's name for the messages.
+pub fn wasm(n: i64) -> Option<(&'static str, Wasm)> {
+    WASM_TABLE.iter().find(|(k, _, _)| *k == n).map(|(_, nm, v)| (*nm, *v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,7 +370,7 @@ mod tests {
     #[test]
     fn the_calls_the_library_makes_are_all_in_the_table() {
         // Exactly the numbers that appear in lib/std/*.fi and tests/*.fi.
-        for n in [0i64, 1, 2, 3, 9, 11, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 231, 288]
+        for n in [0i64, 1, 2, 3, 7, 9, 11, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 231, 288]
         {
             assert!(aarch64(n).is_some(), "syscall {} missing from the table", n);
         }
@@ -184,6 +406,47 @@ mod tests {
     fn the_table_is_sorted_and_free_of_duplicates() {
         for w in TABLE.windows(2) {
             assert!(w[0].0 < w[1].0, "table not sorted at {}", w[0].0);
+        }
+    }
+
+    #[test]
+    fn the_browser_table_is_sorted_and_names_every_call() {
+        for w in WASM_TABLE.windows(2) {
+            assert!(w[0].0 < w[1].0, "wasm table not sorted at {}", w[0].0);
+        }
+        assert_eq!(wasm(1), Some(("write", Wasm::Write)));
+        assert!(matches!(wasm(2), Some(("open", Wasm::Missing(_)))));
+        assert!(matches!(wasm(41), Some(("socket", Wasm::Missing(_)))));
+        assert!(matches!(wasm(57), Some(("fork", Wasm::Missing(_)))));
+        assert_eq!(wasm(9), Some(("mmap", Wasm::Mmap)));
+        assert_eq!(wasm(4711), None);
+    }
+
+    #[test]
+    fn the_android_forms_of_x86_64_are_the_at_calls() {
+        // Firn r64: the calls Android's seccomp filter refuses (measured:
+        // dup2 and chmod killed the emulator's app with SIGSYS).
+        assert_eq!(x86_android(33), Some((292, &[X::A(0), X::A(1), X::I(0)][..])));
+        assert_eq!(x86_android(90), Some((268, &[X::I(AT_FDCWD), X::A(0), X::A(1)][..])));
+        assert_eq!(x86_android(2).map(|f| f.0), Some(257));
+        // Calls bionic makes itself stay untouched.
+        assert_eq!(x86_android(0), None);
+        assert_eq!(x86_android(41), None);
+        for w in X86_ANDROID.windows(2) {
+            assert!(w[0].0 < w[1].0, "x86 android table not sorted at {}", w[0].0);
+        }
+        // aarch64 got the two FIRNCHAT needed; stat, lstat, pipe, rmdir and
+        // readlink still have no aarch64 form (a compile error, not a guess).
+        assert_eq!(aarch64(90), Some(A64::AtFdcwd(53)));
+        assert_eq!(aarch64(82), Some(A64::RenameAt(38)));
+    }
+
+    #[test]
+    fn every_call_of_the_aarch64_table_has_a_browser_answer() {
+        // The two tables cover the same calls: a number the library uses
+        // on one target is never silently unknown on the other.
+        for (n, _) in TABLE {
+            assert!(wasm(*n).is_some(), "syscall {} has no wasm32 answer", n);
         }
     }
 }

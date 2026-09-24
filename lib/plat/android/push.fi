@@ -1,0 +1,855 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/push.fi -- NOTIFICATIONS AND AN OWN PUSH CONNECTION,
+// WITHOUT FIREBASE.
+//
+// ================================================================= WHY
+//
+// The usual way for a message to wake a phone is Firebase Cloud Messaging:
+// Google's server holds the connection, Google's library in the app. This
+// file is the other way: the app holds ONE TCP connection to its own relay
+// and shows a notification per line that arrives. What keeps that
+// connection alive while the app is not on screen is a FOREGROUND SERVICE
+// -- Android's own, documented mechanism, with a permanent notification
+// ("Verbindung zum Relay aktiv") so the user can see and stop it.
+//
+// ========================================================= THE PIECES
+//
+//   org.firn.FirnService   a class of four methods, WRITTEN BY FIRN into
+//                          classes.dex (tools/android/servicedex_main.fi).
+//                          Its methods are `native` and land here:
+//                          Java_org_firn_FirnService_onStartCommand & co.
+//   push_start(host, port) called by the program on its app thread: writes
+//                          firn-push.cfg into the app's files directory,
+//                          asks for POST_NOTIFICATIONS (Android 13+), starts
+//                          the service and tells the host to keep the
+//                          program alive when the activity goes away.
+//   the push thread        a bionic pthread started by the service:
+//                          connect, read lines, one notification per line,
+//                          reconnect every 3 s. It works without the
+//                          activity -- Android may restart the service in a
+//                          fresh process (START_STICKY), then there is no
+//                          program at all, and the static initialiser of
+//                          FirnService has loaded this library by itself.
+//
+// Everything here is #[no_gc]: it runs on Android's main thread (service
+// callbacks) and on the push thread, where the collector must never run.
+// Every local reference is deleted -- the push thread lives for days, and
+// the table of local references of an attached thread holds 512.
+//
+// ============================================================ LIMITS
+//
+// L1 The relay address is a dotted IPv4 address (no name lookup here yet).
+// L2 One line = one message, at most 1000 octets, UTF-8. Characters outside
+//    the Basic Multilingual Plane become '?': JNI wants MODIFIED UTF-8.
+// L3 No TLS: the connection is plain TCP. For anything but a test the
+//    relay must speak TLS (lib/std/crypto has the pieces, not wired here).
+import android.ndk
+import android.jnicall
+import android.activity
+
+export {
+    push_start, push_stop, push_notify, push_running, push_keep,
+    Java_org_firn_FirnService_onStartCommand,
+    Java_org_firn_FirnService_onBind,
+    Java_org_firn_FirnService_onDestroy,
+}
+
+// ---- BEGIN GENERATED STRINGS (tools/android/gen_push_strings.py) ----
+static TXT: [u8; 1754] = "android/content/Intent\0android/app/NotificationChannel\0android/app/Notification$Builder\0android/app/PendingIntent\0java/lang/String\0android/R$drawable\0<init>\0getSystemService\0(Ljava/lang/String;)Ljava/lang/Object;\0notification\0(Ljava/lang/String;Ljava/lang/CharSequence;I)V\0createNotificationChannel\0(Landroid/app/NotificationChannel;)V\0(Landroid/content/Context;Ljava/lang/String;)V\0setSmallIcon\0(I)Landroid/app/Notification$Builder;\0setContentTitle\0setContentText\0(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;\0setAutoCancel\0setOngoing\0(Z)Landroid/app/Notification$Builder;\0setContentIntent\0(Landroid/app/PendingIntent;)Landroid/app/Notification$Builder;\0build\0()Landroid/app/Notification;\0notify\0(ILandroid/app/Notification;)V\0getPackageManager\0()Landroid/content/pm/PackageManager;\0getPackageName\0()Ljava/lang/String;\0getLaunchIntentForPackage\0(Ljava/lang/String;)Landroid/content/Intent;\0getActivity\0(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;\0startForeground\0(ILandroid/app/Notification;I)V\0getFilesDir\0()Ljava/io/File;\0getAbsolutePath\0()V\0setClassName\0(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;\0startForegroundService\0(Landroid/content/Intent;)Landroid/content/ComponentName;\0stopService\0(Landroid/content/Intent;)Z\0checkSelfPermission\0(Ljava/lang/String;)I\0requestPermissions\0([Ljava/lang/String;I)V\0android.permission.POST_NOTIFICATIONS\0getApplicationContext\0()Landroid/content/Context;\0org.firn.FirnService\0stat_notify_chat\0I\0firn_push\0Nachrichten\0firn_service\0Verbindung\0Firn Push\0Verbindung zum Relay aktiv\0Neue Nachricht\0/firn-push.cfg\0firn-push\0connected\0connection lost, retrying\0service started\0service destroyed\0notification posted\0no relay configured (service only)\0"
+
+const C_INTENT: usize = 0   // android/content/Intent
+const C_CHANNEL: usize = 23   // android/app/NotificationChannel
+const C_BUILDER: usize = 55   // android/app/Notification$Builder
+const C_PENDING: usize = 88   // android/app/PendingIntent
+const C_STRING: usize = 114   // java/lang/String
+const C_DRAWABLE: usize = 131   // android/R$drawable
+const N_INIT: usize = 150   // <init>
+const N_GETSVC: usize = 157   // getSystemService
+const G_GETSVC: usize = 174   // (Ljava/lang/String;)Ljava/lang/Object;
+const S_NOTIFICATION: usize = 213   // notification
+const G_CHANNEL_INIT: usize = 226   // (Ljava/lang/String;Ljava/lang/CharSequence;I)V
+const N_CREATE_CHANNEL: usize = 273   // createNotificationChannel
+const G_CREATE_CHANNEL: usize = 299   // (Landroid/app/NotificationChannel;)V
+const G_BUILDER_INIT: usize = 336   // (Landroid/content/Context;Ljava/lang/String;)V
+const N_SMALL_ICON: usize = 383   // setSmallIcon
+const G_I_B: usize = 396   // (I)Landroid/app/Notification$Builder;
+const N_TITLE: usize = 434   // setContentTitle
+const N_TEXT: usize = 450   // setContentText
+const G_CS_B: usize = 465   // (Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;
+const N_AUTOCANCEL: usize = 526   // setAutoCancel
+const N_ONGOING: usize = 540   // setOngoing
+const G_Z_B: usize = 551   // (Z)Landroid/app/Notification$Builder;
+const N_CONTENT_INTENT: usize = 589   // setContentIntent
+const G_PI_B: usize = 606   // (Landroid/app/PendingIntent;)Landroid/app/Notification$Builder;
+const N_BUILD: usize = 670   // build
+const G_BUILD: usize = 676   // ()Landroid/app/Notification;
+const N_NOTIFY: usize = 705   // notify
+const G_NOTIFY: usize = 712   // (ILandroid/app/Notification;)V
+const N_GET_PM: usize = 743   // getPackageManager
+const G_GET_PM: usize = 761   // ()Landroid/content/pm/PackageManager;
+const N_GET_PKG: usize = 799   // getPackageName
+const G_STR: usize = 814   // ()Ljava/lang/String;
+const N_LAUNCH: usize = 835   // getLaunchIntentForPackage
+const G_LAUNCH: usize = 861   // (Ljava/lang/String;)Landroid/content/Intent;
+const N_GET_ACTIVITY: usize = 906   // getActivity
+const G_GET_ACTIVITY: usize = 918   // (Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;
+const N_START_FG: usize = 999   // startForeground
+const G_START_FG: usize = 1015   // (ILandroid/app/Notification;I)V
+const N_FILES_DIR: usize = 1047   // getFilesDir
+const G_FILES_DIR: usize = 1059   // ()Ljava/io/File;
+const N_ABS_PATH: usize = 1076   // getAbsolutePath
+const G_V: usize = 1092   // ()V
+const N_SET_CLASS: usize = 1096   // setClassName
+const G_SET_CLASS: usize = 1109   // (Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
+const N_START_FGS: usize = 1172   // startForegroundService
+const G_START_FGS: usize = 1195   // (Landroid/content/Intent;)Landroid/content/ComponentName;
+const N_STOP_SVC: usize = 1253   // stopService
+const G_STOP_SVC: usize = 1265   // (Landroid/content/Intent;)Z
+const N_CHECK_PERM: usize = 1293   // checkSelfPermission
+const G_CHECK_PERM: usize = 1313   // (Ljava/lang/String;)I
+const N_REQ_PERM: usize = 1335   // requestPermissions
+const G_REQ_PERM: usize = 1354   // ([Ljava/lang/String;I)V
+const S_POST_NOTIF: usize = 1378   // android.permission.POST_NOTIFICATIONS
+const N_GET_APP: usize = 1416   // getApplicationContext
+const G_GET_APP: usize = 1438   // ()Landroid/content/Context;
+const S_SERVICE_CLASS: usize = 1466   // org.firn.FirnService
+const S_ICON: usize = 1487   // stat_notify_chat
+const G_INT: usize = 1504   // I
+const S_CH_PUSH: usize = 1506   // firn_push
+const S_CH_PUSH_NAME: usize = 1516   // Nachrichten
+const S_CH_SVC: usize = 1528   // firn_service
+const S_CH_SVC_NAME: usize = 1541   // Verbindung
+const S_SVC_TITLE: usize = 1552   // Firn Push
+const S_SVC_TEXT: usize = 1562   // Verbindung zum Relay aktiv
+const S_MSG_TITLE: usize = 1589   // Neue Nachricht
+const S_CFG: usize = 1604   // /firn-push.cfg
+const S_TAG: usize = 1619   // firn-push
+const S_L_CONNECTED: usize = 1629   // connected
+const S_L_LOST: usize = 1639   // connection lost, retrying
+const S_L_START: usize = 1665   // service started
+const S_L_STOP: usize = 1681   // service destroyed
+const S_L_NOTE: usize = 1699   // notification posted
+const S_L_NOCFG: usize = 1719   // no relay configured (service only)
+// ---- END GENERATED STRINGS ----
+
+// ------------------------------------------------------------ bionic
+#[no_gc]
+extern fn usleep(us: u32) -> i32;
+#[no_gc]
+extern fn pthread_create(tid: u64, attr: u64, start: u64, arg: u64) -> i32;
+
+// ------------------------------------------------------- shared state
+// One raw block: host text, port, the pthread id. Offsets in octets.
+const P_HOST: u64 = 0        // 64 octets, zero terminated
+const P_PORT: u64 = 64
+const P_TID: u64 = 72
+const P_BYTES: usize = 4096
+
+static mut G_P: u64 = 0
+static mut G_VM: u64 = 0
+static mut G_SVC: u64 = 0     // global reference to the running service
+static mut G_APP: u64 = 0     // global reference to the application context
+static mut G_RUN: u64 = 0
+static mut G_STOP: u64 = 0
+static mut G_SOCK: i64 = -1
+static mut G_NID: u64 = 100
+
+const START_STICKY: i32 = 1
+const FGS_TYPE_REMOTE_MESSAGING: u64 = 512
+const IMPORTANCE_LOW: u64 = 2
+const IMPORTANCE_HIGH: u64 = 4
+const PI_FLAGS: u64 = 201326592    // FLAG_IMMUTABLE | FLAG_UPDATE_CURRENT
+const SVC_NOTE_ID: u64 = 1
+
+#[no_gc]
+fn t(i: usize) -> u64 {
+    return ((&TXT[0]) as u64) + i as u64
+}
+
+#[no_gc]
+fn log(i: usize) {
+    ndk.log_write(ndk.LOG_INFO, t(S_TAG), t(i))
+}
+
+#[no_gc]
+fn block() -> u64 {
+    if G_P == 0 {
+        let r: i64 = syscall(9, 0, P_BYTES as i64, 3, 34, -1, 0)
+        if r > 0 {
+            G_P = r as u64
+        }
+    }
+    return G_P
+}
+
+#[no_gc]
+fn laenge(p: u64) -> usize {
+    var n: usize = 0
+    while *((p + n as u64) as *mut u8) != 0 as u8 {
+        n = n + 1
+    }
+    return n
+}
+
+#[no_gc]
+fn kopie(z: u64, q: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        *((z + i as u64) as *mut u8) = *((q + i as u64) as *mut u8)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn warten_ms(ms: u32) {
+    let r: i32 = usleep(ms * 1000)
+}
+
+// ------------------------------------------------ the notification side
+
+#[no_gc]
+fn manager(env: u64, ctx: u64) -> u64 {
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    let m: u64 = jnicall.j_method(env, cc, t(N_GETSVC), t(G_GETSVC))
+    let s: u64 = jnicall.j_str(env, t(S_NOTIFICATION))
+    var a: [u64; 1] = [0; 1]
+    a[0] = s
+    let nm: u64 = jnicall.j_obj(env, ctx, m, (&a[0]) as u64)
+    jnicall.j_del(env, s)
+    jnicall.j_del(env, cc)
+    return nm
+}
+
+// Both channels, idempotent (Android ignores a second create with the same
+// id): "Nachrichten" makes a sound and a heads-up, "Verbindung" is the
+// quiet permanent one of the service.
+#[no_gc]
+fn kanaele(env: u64, ctx: u64) {
+    let nm: u64 = manager(env, ctx)
+    if nm == 0 {
+        return
+    }
+    let chc: u64 = jnicall.j_class(env, t(C_CHANNEL))
+    let ctor: u64 = jnicall.j_method(env, chc, t(N_INIT), t(G_CHANNEL_INIT))
+    let nmc: u64 = jnicall.j_obj_class(env, nm)
+    let mc: u64 = jnicall.j_method(env, nmc, t(N_CREATE_CHANNEL),
+        t(G_CREATE_CHANNEL))
+    var k: usize = 0
+    while k < 2 {
+        var id: usize = S_CH_PUSH
+        var name: usize = S_CH_PUSH_NAME
+        var imp: u64 = IMPORTANCE_HIGH
+        if k == 1 {
+            id = S_CH_SVC
+            name = S_CH_SVC_NAME
+            imp = IMPORTANCE_LOW
+        }
+        let jid: u64 = jnicall.j_str(env, t(id))
+        let jname: u64 = jnicall.j_str(env, t(name))
+        var a: [u64; 3] = [0; 3]
+        a[0] = jid
+        a[1] = jname
+        a[2] = imp
+        let ch: u64 = jnicall.j_new(env, chc, ctor, (&a[0]) as u64)
+        var b: [u64; 1] = [0; 1]
+        b[0] = ch
+        let ok: bool = jnicall.j_void(env, nm, mc, (&b[0]) as u64)
+        jnicall.j_del(env, ch)
+        jnicall.j_del(env, jid)
+        jnicall.j_del(env, jname)
+        k = k + 1
+    }
+    jnicall.j_del(env, nmc)
+    jnicall.j_del(env, chc)
+    jnicall.j_del(env, nm)
+}
+
+// Tapping the notification opens the app: the launch intent of our own
+// package, as a PendingIntent.
+#[no_gc]
+fn antippen(env: u64, ctx: u64) -> u64 {
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    let pm: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, cc, t(N_GET_PM), t(G_GET_PM)), 0)
+    let pk: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, cc, t(N_GET_PKG), t(G_STR)), 0)
+    let pmc: u64 = jnicall.j_obj_class(env, pm)
+    var a: [u64; 4] = [0; 4]
+    a[0] = pk
+    let it: u64 = jnicall.j_obj(env, pm,
+        jnicall.j_method(env, pmc, t(N_LAUNCH), t(G_LAUNCH)),
+        (&a[0]) as u64)
+    var pi: u64 = 0
+    if it != 0 {
+        let pic: u64 = jnicall.j_class(env, t(C_PENDING))
+        let mg: u64 = jnicall.j_smethod(env, pic, t(N_GET_ACTIVITY),
+            t(G_GET_ACTIVITY))
+        a[0] = ctx
+        a[1] = 0
+        a[2] = it
+        a[3] = PI_FLAGS
+        pi = jnicall.j_sobj(env, pic, mg, (&a[0]) as u64)
+        jnicall.j_del(env, pic)
+    }
+    jnicall.j_del(env, it)
+    jnicall.j_del(env, pmc)
+    jnicall.j_del(env, pk)
+    jnicall.j_del(env, pm)
+    jnicall.j_del(env, cc)
+    return pi
+}
+
+// Call a Builder setter with one argument and drop the returned builder
+// (it is the same object, as another local reference).
+#[no_gc]
+fn setzen(env: u64, b: u64, bc: u64, name: usize, sig: usize, v: u64) {
+    let m: u64 = jnicall.j_method(env, bc, t(name), t(sig))
+    var a: [u64; 1] = [0; 1]
+    a[0] = v
+    let r: u64 = jnicall.j_obj(env, b, m, (&a[0]) as u64)
+    jnicall.j_del(env, r)
+}
+
+// A finished `Notification`; `title`, `text`: zero terminated.
+#[no_gc]
+fn bauen(env: u64, ctx: u64, kanal: usize, title: u64, text: u64,
+    dauernd: bool) -> u64 {
+    let bc: u64 = jnicall.j_class(env, t(C_BUILDER))
+    let ctor: u64 = jnicall.j_method(env, bc, t(N_INIT), t(G_BUILDER_INIT))
+    let jk: u64 = jnicall.j_str(env, t(kanal))
+    var a: [u64; 2] = [0; 2]
+    a[0] = ctx
+    a[1] = jk
+    let b: u64 = jnicall.j_new(env, bc, ctor, (&a[0]) as u64)
+    if b == 0 {
+        jnicall.j_del(env, jk)
+        jnicall.j_del(env, bc)
+        return 0
+    }
+    let dc: u64 = jnicall.j_class(env, t(C_DRAWABLE))
+    let icon: i32 = jnicall.j_sfield_int(env, dc, t(S_ICON), t(G_INT))
+    jnicall.j_del(env, dc)
+    setzen(env, b, bc, N_SMALL_ICON, G_I_B, (icon as i64) as u64)
+    let jt: u64 = jnicall.j_str(env, title)
+    setzen(env, b, bc, N_TITLE, G_CS_B, jt)
+    jnicall.j_del(env, jt)
+    let jx: u64 = jnicall.j_str(env, text)
+    setzen(env, b, bc, N_TEXT, G_CS_B, jx)
+    jnicall.j_del(env, jx)
+    var an: u64 = 0
+    if dauernd {
+        an = 1
+    }
+    setzen(env, b, bc, N_ONGOING, G_Z_B, an)
+    setzen(env, b, bc, N_AUTOCANCEL, G_Z_B, 1 - an)
+    let pi: u64 = antippen(env, ctx)
+    if pi != 0 {
+        setzen(env, b, bc, N_CONTENT_INTENT, G_PI_B, pi)
+        jnicall.j_del(env, pi)
+    }
+    let note: u64 = jnicall.j_obj(env, b,
+        jnicall.j_method(env, bc, t(N_BUILD), t(G_BUILD)), 0)
+    jnicall.j_del(env, b)
+    jnicall.j_del(env, jk)
+    jnicall.j_del(env, bc)
+    return note
+}
+
+#[no_gc]
+fn zeigen(env: u64, ctx: u64, id: u64, note: u64) -> bool {
+    let nm: u64 = manager(env, ctx)
+    if nm == 0 || note == 0 {
+        return false
+    }
+    let nmc: u64 = jnicall.j_obj_class(env, nm)
+    let m: u64 = jnicall.j_method(env, nmc, t(N_NOTIFY), t(G_NOTIFY))
+    var a: [u64; 2] = [0; 2]
+    a[0] = id
+    a[1] = note
+    let ok: bool = jnicall.j_void(env, nm, m, (&a[0]) as u64)
+    jnicall.j_del(env, nmc)
+    jnicall.j_del(env, nm)
+    return ok
+}
+
+// JNI wants MODIFIED UTF-8: a character outside the BMP (four octets)
+// becomes '?', CR is dropped, NUL ends the text. At most `cap - 1`.
+#[no_gc]
+fn utf_sauber(q: u64, n: usize, z: u64, cap: usize) {
+    var i: usize = 0
+    var o: usize = 0
+    while i < n && o + 1 < cap {
+        let b: u8 = *((q + i as u64) as *mut u8)
+        if b == 0 as u8 {
+            break
+        }
+        if b == 13 as u8 {
+            i = i + 1
+        } else if b >= 240 as u8 {
+            *((z + o as u64) as *mut u8) = 63 as u8
+            o = o + 1
+            i = i + 4
+        } else {
+            *((z + o as u64) as *mut u8) = b
+            o = o + 1
+            i = i + 1
+        }
+    }
+    *((z + o as u64) as *mut u8) = 0 as u8
+}
+
+// A message notification with the next id.
+#[no_gc]
+fn nachricht(env: u64, ctx: u64, title: u64, q: u64, n: usize) {
+    var text: [u8; 1024] = [0 as u8; 1024]
+    utf_sauber(q, n, (&text[0]) as u64, 1024)
+    if text[0] == 0 as u8 {
+        return
+    }
+    let note: u64 = bauen(env, ctx, S_CH_PUSH, title, (&text[0]) as u64,
+        false)
+    let id: u64 = G_NID
+    G_NID = G_NID + 1
+    if zeigen(env, ctx, id, note) {
+        log(S_L_NOTE)
+    }
+    jnicall.j_del(env, note)
+}
+
+// ------------------------------------------------------ the program side
+
+// The VM and the APPLICATION context, kept as a global reference: they
+// outlive every activity. A program that keeps running after Back (see
+// activity_keep_alive) notifies through them -- the ANativeActivity it
+// started with is freed by then.
+#[no_gc]
+fn merken() {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return
+    }
+    G_VM = ndk.peek64(act + 8)
+    if G_APP != 0 {
+        return
+    }
+    let env: u64 = jnicall.j_env(G_VM)
+    let ctx: u64 = ndk.peek64(act + 24)
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    let app: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, cc, t(N_GET_APP), t(G_GET_APP)), 0)
+    if app != 0 {
+        G_APP = jnicall.j_global(env, app)
+        jnicall.j_del(env, app)
+    }
+    jnicall.j_del(env, cc)
+}
+
+// A notification from the program itself (app thread), with or without an
+// activity. `title`, `text`: zero terminated.
+#[no_gc]
+fn push_notify(title: u64, text: u64) -> bool {
+    merken()
+    var ctx: u64 = G_APP
+    if ctx == 0 {
+        ctx = G_SVC
+    }
+    if G_VM == 0 || ctx == 0 {
+        return false
+    }
+    let env: u64 = jnicall.j_env(G_VM)
+    if env == 0 {
+        return false
+    }
+    kanaele(env, ctx)
+    nachricht(env, ctx, title, text, laenge(text))
+    return true
+}
+
+#[no_gc]
+fn push_running() -> bool {
+    return G_RUN != 0
+}
+
+// The intent that names our service.
+#[no_gc]
+fn dienst_absicht(env: u64, ctx: u64) -> u64 {
+    let ic: u64 = jnicall.j_class(env, t(C_INTENT))
+    let it: u64 = jnicall.j_new(env, ic,
+        jnicall.j_method(env, ic, t(N_INIT), t(G_V)), 0)
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    let pk: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, cc, t(N_GET_PKG), t(G_STR)), 0)
+    let sn: u64 = jnicall.j_str(env, t(S_SERVICE_CLASS))
+    var a: [u64; 2] = [0; 2]
+    a[0] = pk
+    a[1] = sn
+    let r: u64 = jnicall.j_obj(env, it,
+        jnicall.j_method(env, ic, t(N_SET_CLASS), t(G_SET_CLASS)),
+        (&a[0]) as u64)
+    jnicall.j_del(env, r)
+    jnicall.j_del(env, sn)
+    jnicall.j_del(env, pk)
+    jnicall.j_del(env, cc)
+    jnicall.j_del(env, ic)
+    return it
+}
+
+// Start the push connection to `host` (dotted IPv4, zero terminated) and
+// `port`. Called on the app thread while the activity is on screen
+// (Android 12+ refuses to start a foreground service from the background).
+#[no_gc]
+fn push_start(host: u64, port: u32) -> bool {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return false
+    }
+    merken()
+    let env: u64 = jnicall.j_env(ndk.peek64(act + 8))
+    let ctx: u64 = ndk.peek64(act + 24)
+    if env == 0 {
+        return false
+    }
+    // 1. the configuration, where the service finds it without us
+    let dir: u64 = ndk.peek64(act + ndk.ACT_INTERNAL_DATA_PATH)
+    if dir == 0 {
+        return false
+    }
+    var pfad: [u8; 512] = [0 as u8; 512]
+    let dn: usize = laenge(dir)
+    let cn: usize = laenge(t(S_CFG))
+    if dn + cn + 1 > 512 {
+        return false
+    }
+    kopie((&pfad[0]) as u64, dir, dn)
+    kopie((&pfad[0]) as u64 + dn as u64, t(S_CFG), cn + 1)
+    var inhalt: [u8; 96] = [0 as u8; 96]
+    var n: usize = laenge(host)
+    if n > 63 {
+        return false
+    }
+    kopie((&inhalt[0]) as u64, host, n)
+    inhalt[n] = 10 as u8
+    n = n + 1
+    var ziffern: [u8; 8] = [0 as u8; 8]
+    var k: usize = 0
+    var p: u32 = port
+    while k == 0 || p > 0 as u32 {
+        ziffern[k] = (48 as u32 + p % 10 as u32) as u8
+        p = p / 10 as u32
+        k = k + 1
+    }
+    while k > 0 {
+        k = k - 1
+        inhalt[n] = ziffern[k]
+        n = n + 1
+    }
+    inhalt[n] = 10 as u8
+    n = n + 1
+    let fd: i64 = syscall(2, (&pfad[0]) as i64, 577, 384, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    syscall(1, fd, (&inhalt[0]) as i64, n as i64, 0, 0, 0)
+    syscall(3, fd, 0, 0, 0, 0, 0)
+    // 2. the permission to show notifications (Android 13, API 33+)
+    let sdk: i32 = ndk.peek32(act + ndk.ACT_SDK_VERSION)
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    if sdk >= 33 {
+        let ps: u64 = jnicall.j_str(env, t(S_POST_NOTIF))
+        var a: [u64; 2] = [0; 2]
+        a[0] = ps
+        let g: i32 = jnicall.j_int(env, ctx,
+            jnicall.j_method(env, cc, t(N_CHECK_PERM), t(G_CHECK_PERM)),
+            (&a[0]) as u64)
+        if g != 0 {
+            let sc: u64 = jnicall.j_class(env, t(C_STRING))
+            let arr: u64 = jnicall.j_array1(env, sc, ps)
+            a[0] = arr
+            a[1] = 7
+            let ok: bool = jnicall.j_void(env, ctx,
+                jnicall.j_method(env, cc, t(N_REQ_PERM), t(G_REQ_PERM)),
+                (&a[0]) as u64)
+            jnicall.j_del(env, arr)
+            jnicall.j_del(env, sc)
+        }
+        jnicall.j_del(env, ps)
+    }
+    // 3. the service
+    kanaele(env, ctx)
+    let it: u64 = dienst_absicht(env, ctx)
+    var b: [u64; 1] = [0; 1]
+    b[0] = it
+    let cn2: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, cc, t(N_START_FGS), t(G_START_FGS)),
+        (&b[0]) as u64)
+    jnicall.j_del(env, it)
+    jnicall.j_del(env, cc)
+    let ok2: bool = cn2 != 0
+    jnicall.j_del(env, cn2)
+    if ok2 {
+        activity.activity_keep_alive(true)
+    }
+    return ok2
+}
+
+// The foreground service WITHOUT a connection of its own: the program keeps
+// its connection itself (FIRNCHAT's relay session) and only needs the
+// process to stay when its activity goes. Port 0 = no push thread.
+#[no_gc]
+fn push_keep() -> bool {
+    var leer: [u8; 1] = [0 as u8; 1]
+    return push_start((&leer[0]) as u64, 0 as u32)
+}
+
+#[no_gc]
+fn push_stop() -> bool {
+    merken()
+    if G_VM == 0 || G_APP == 0 {
+        return false
+    }
+    let env: u64 = jnicall.j_env(G_VM)
+    let ctx: u64 = G_APP
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    let it: u64 = dienst_absicht(env, ctx)
+    var b: [u64; 1] = [0; 1]
+    b[0] = it
+    let ok: bool = jnicall.j_bool(env, ctx,
+        jnicall.j_method(env, cc, t(N_STOP_SVC), t(G_STOP_SVC)),
+        (&b[0]) as u64)
+    jnicall.j_del(env, it)
+    jnicall.j_del(env, cc)
+    activity.activity_keep_alive(false)
+    return ok
+}
+
+// ---------------------------------------------------------- the thread
+
+// "a.b.c.d" -> the four octets in network order as one u32 (little endian
+// memory: a is the lowest octet). 0 = not an address.
+#[no_gc]
+fn ipv4(p: u64) -> u32 {
+    var teile: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var i: usize = 0
+    var ziffern: usize = 0
+    while true {
+        let c: u8 = *((p + i as u64) as *mut u8)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            teile[k] = teile[k] * 10 as u32 + (c - 48 as u8) as u32
+            ziffern = ziffern + 1
+            if teile[k] > 255 as u32 || ziffern > 3 {
+                return 0 as u32
+            }
+        } else if c == 46 as u8 && ziffern > 0 && k < 3 {
+            k = k + 1
+            ziffern = 0
+        } else if (c == 0 as u8 || c == 10 as u8) && k == 3 && ziffern > 0 {
+            break
+        } else {
+            return 0 as u32
+        }
+        i = i + 1
+    }
+    return teile[0] | (teile[1] << 8) | (teile[2] << 16) | (teile[3] << 24)
+}
+
+#[no_gc]
+fn verbinden() -> i64 {
+    let adr: u32 = ipv4(G_P + P_HOST)
+    let port: u64 = *((G_P + P_PORT) as *mut u64)
+    if adr == 0 as u32 || port == 0 || port > 65535 {
+        return -1
+    }
+    let fd: i64 = syscall(41, 2, 1, 0, 0, 0, 0)
+    if fd < 0 {
+        return -1
+    }
+    // struct sockaddr_in: family (2), port (big endian), address, 8 zeroes
+    var sa: [u8; 16] = [0 as u8; 16]
+    sa[0] = 2 as u8
+    sa[2] = ((port >> 8) & 255) as u8
+    sa[3] = (port & 255) as u8
+    *(((&sa[0]) as u64 + 4) as *mut u32) = adr
+    let r: i64 = syscall(42, fd, (&sa[0]) as i64, 16, 0, 0, 0)
+    if r != 0 {
+        syscall(3, fd, 0, 0, 0, 0, 0)
+        return -1
+    }
+    return fd
+}
+
+#[no_gc]
+fn push_faden(arg: u64) -> u64 {
+    let env: u64 = jnicall.j_env(G_VM)
+    if env == 0 {
+        G_RUN = 0
+        return 0
+    }
+    var puf: [u8; 1024] = [0 as u8; 1024]
+    let pb: u64 = (&puf[0]) as u64
+    while __atomic_add((&G_STOP) as *mut u64, 0) == 0 as u64 {
+        let fd: i64 = verbinden()
+        if fd < 0 {
+            var w: usize = 0
+            while w < 30 && __atomic_add((&G_STOP) as *mut u64, 0) == 0 as u64 {
+                warten_ms(100 as u32)
+                w = w + 1
+            }
+        } else {
+            G_SOCK = fd
+            log(S_L_CONNECTED)
+            var n: usize = 0
+            while true {
+                let r: i64 = syscall(45, fd, (pb + n as u64) as i64,
+                    (1024 - n) as i64, 0, 0, 0)
+                if r <= 0 {
+                    break
+                }
+                n = n + r as usize
+                // every complete line is one message
+                var a: usize = 0
+                var i: usize = 0
+                while i < n {
+                    if puf[i] == 10 as u8 {
+                        nachricht(env, G_SVC, t(S_MSG_TITLE), pb + a as u64,
+                            i - a)
+                        a = i + 1
+                    }
+                    i = i + 1
+                }
+                if a > 0 {
+                    kopie(pb, pb + a as u64, n - a)
+                    n = n - a
+                } else if n == 1024 {
+                    // a line longer than the buffer: show what there is
+                    nachricht(env, G_SVC, t(S_MSG_TITLE), pb, n)
+                    n = 0
+                }
+            }
+            G_SOCK = -1
+            syscall(3, fd, 0, 0, 0, 0, 0)
+            log(S_L_LOST)
+            warten_ms(1000 as u32)
+        }
+    }
+    jnicall.j_detach(G_VM)
+    G_RUN = 0
+    return 0
+}
+
+// Read firn-push.cfg ("host\nport\n") from the service's files directory.
+#[no_gc]
+fn konfig_lesen(env: u64, svc: u64) -> bool {
+    let b: u64 = block()
+    if b == 0 {
+        return false
+    }
+    let cc: u64 = jnicall.j_obj_class(env, svc)
+    let f: u64 = jnicall.j_obj(env, svc,
+        jnicall.j_method(env, cc, t(N_FILES_DIR), t(G_FILES_DIR)), 0)
+    let fc: u64 = jnicall.j_obj_class(env, f)
+    let s: u64 = jnicall.j_obj(env, f,
+        jnicall.j_method(env, fc, t(N_ABS_PATH), t(G_STR)), 0)
+    let chars: u64 = jnicall.j_utf_chars(env, s)
+    var pfad: [u8; 512] = [0 as u8; 512]
+    var ok: bool = false
+    if chars != 0 {
+        let dn: usize = laenge(chars)
+        let cn: usize = laenge(t(S_CFG))
+        if dn + cn + 1 <= 512 {
+            kopie((&pfad[0]) as u64, chars, dn)
+            kopie((&pfad[0]) as u64 + dn as u64, t(S_CFG), cn + 1)
+            ok = true
+        }
+        jnicall.j_utf_release(env, s, chars)
+    }
+    jnicall.j_del(env, s)
+    jnicall.j_del(env, fc)
+    jnicall.j_del(env, f)
+    jnicall.j_del(env, cc)
+    if !ok {
+        return false
+    }
+    var inhalt: [u8; 128] = [0 as u8; 128]
+    let fd: i64 = syscall(2, (&pfad[0]) as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    let n: i64 = syscall(0, fd, (&inhalt[0]) as i64, 127, 0, 0, 0)
+    syscall(3, fd, 0, 0, 0, 0, 0)
+    if n <= 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < n as usize && inhalt[i] != 10 as u8 && i < 63 {
+        *((b + P_HOST + i as u64) as *mut u8) = inhalt[i]
+        i = i + 1
+    }
+    *((b + P_HOST + i as u64) as *mut u8) = 0 as u8
+    i = i + 1
+    var port: u64 = 0
+    while i < n as usize && inhalt[i] >= 48 as u8 && inhalt[i] <= 57 as u8 {
+        port = port * 10 + (inhalt[i] - 48 as u8) as u64
+        i = i + 1
+    }
+    *((b + P_PORT) as *mut u64) = port
+    return port > 0
+}
+
+// ------------------------------------------- the service (main thread)
+
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnService_onStartCommand(env: u64, svc: u64, intent: u64,
+    flags: i32, id: i32) -> i32 {
+    log(S_L_START)
+    G_VM = jnicall.j_vm(env)
+    if G_SVC == 0 {
+        G_SVC = jnicall.j_global(env, svc)
+    }
+    kanaele(env, svc)
+    // Within five seconds of startForegroundService, or Android kills us.
+    let note: u64 = bauen(env, svc, S_CH_SVC, t(S_SVC_TITLE), t(S_SVC_TEXT),
+        true)
+    let cc: u64 = jnicall.j_obj_class(env, svc)
+    var a: [u64; 3] = [0; 3]
+    a[0] = SVC_NOTE_ID
+    a[1] = note
+    a[2] = FGS_TYPE_REMOTE_MESSAGING
+    let ok: bool = jnicall.j_void(env, svc,
+        jnicall.j_method(env, cc, t(N_START_FG), t(G_START_FG)),
+        (&a[0]) as u64)
+    jnicall.j_del(env, cc)
+    jnicall.j_del(env, note)
+    if G_RUN == 0 {
+        if konfig_lesen(env, svc) {
+            G_STOP = 0
+            G_RUN = 1
+            let r: i32 = pthread_create(G_P + P_TID, 0,
+                ndk.code_of_thread(push_faden), 0)
+            if r != 0 {
+                G_RUN = 0
+            }
+        } else {
+            log(S_L_NOCFG)
+        }
+    }
+    return START_STICKY
+}
+
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnService_onBind(env: u64, svc: u64, intent: u64) -> u64 {
+    return 0
+}
+
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnService_onDestroy(env: u64, svc: u64) {
+    log(S_L_STOP)
+    __atomic_add((&G_STOP) as *mut u64, 1)
+    if G_SOCK >= 0 {
+        // shutdown wakes the thread out of its recv
+        syscall(48, G_SOCK, 2, 0, 0, 0, 0)
+    }
+}

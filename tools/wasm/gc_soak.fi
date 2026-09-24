@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/wasm/gc_soak.fi -- THE COLLECTOR UNDER WEBASSEMBLY, MANY TIMES OVER.
+//
+// ================================================================ WHY
+//
+// Natively the collector finds its roots by scanning the machine stack and
+// the saved registers (lib/gc/gc.fi, SPEC 3.5.3). WebAssembly has no
+// stack that could be scanned: a local of a WebAssembly function has no
+// address. codegen_wasm.rs therefore writes every pointer sized value that
+// is still LIVE across a call which may collect into the caller's frame on
+// the shadow stack -- and the collector scans the shadow stack instead.
+//
+// This program is built to break that exact promise if it were broken. The
+// only references to four long chains of objects live in LOCALS of `main`
+// and of `chain`, never in the heap and never in a named stack variable
+// whose address was taken. Every allocation can start or continue a
+// collection. If a single live local were missing from the shadow frame at
+// such a moment, its chain would be swept, its blocks handed out again, and
+// the next `verify` would read a foreign id or a wrong check word.
+//
+// Every object carries its id and a check word computed from the id, and
+// every chain is verified after every round, completely, node by node.
+//
+// THE COUNTER-CHECK (tools/wasm/gc_soak.sh): the same program, compiled
+// with FIRN_WASM_NO_SPILL=1 -- the spills switched off, nothing else -- has
+// to FAIL. A soak test that passes with the mechanism removed proves
+// nothing about the mechanism.
+//
+// The same source also runs natively; its verdict there is the reference.
+
+import std.rt
+
+const ROUNDS: u64 = 15000
+const CHAIN: u64 = 600
+// A run that collects less than this has not tested the collector.
+const MIN_COLLECTIONS: u64 = 1000
+
+gc class Node {
+    next: Gc[Node],
+    side: Gc[Node],
+    id: u64,
+    check: u64,
+    pad: u64,
+}
+
+fn mix(x: u64) -> u64 {
+    var v: u64 = x *% 11400714819323198485 +% 1442695040888963407
+    v = v ^ (v >> 29)
+    v = v *% 13787848793156543929
+    return v ^ (v >> 32)
+}
+
+fn make(id: u64, next: Gc[Node], side: Gc[Node]) -> AllocError!Gc[Node] {
+    return try gc Node { next: next, side: side, id: id, check: mix(id), pad: id + 1 }
+}
+
+// Builds a chain of `n` nodes. While it grows, the ONLY reference to it is
+// the local `head` of this frame -- and between two links a dead object is
+// allocated as well, so that the heap fills and collections run in the
+// middle of the build.
+fn chain(n: u64, base: u64) -> AllocError!Gc[Node] {
+    var head: Gc[Node] = gc_null[Node]()
+    var i: u64 = 0
+    while i < n {
+        let dead: Gc[Node] = try make(0, gc_null[Node](), gc_null[Node]())
+        head = try make(base + i, head, dead)
+        i = i + 1
+    }
+    return head
+}
+
+// Walks the chain from its head: ids descending from base + n - 1 to base,
+// every check word intact, every side object present and intact.
+fn verify(h: Gc[Node], n: u64, base: u64) -> bool {
+    var c: Gc[Node] = h
+    var k: u64 = n
+    while c != gc_null[Node]() {
+        if k == 0 {
+            return false
+        }
+        k = k - 1
+        if c.id != base + k || c.check != mix(c.id) || c.pad != c.id + 1 {
+            return false
+        }
+        let s: Gc[Node] = c.side
+        if s == gc_null[Node]() || s.id != 0 || s.check != mix(0) {
+            return false
+        }
+        c = c.next
+    }
+    return k == 0
+}
+
+fn say(t: *mut rt.Buf) {
+    rt.write_everything(1, rt.buf_ptr(t), rt.buf_len(t))
+}
+
+fn text(t: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(t, p, n)
+}
+
+fn main() -> i32 {
+    return run() catch 90
+}
+
+fn run() -> AllocError!i32 {
+    // Four chains, held by four locals and by nothing else.
+    var a: Gc[Node] = try chain(CHAIN, 1000000)
+    var b: Gc[Node] = try chain(CHAIN, 2000000)
+    var c: Gc[Node] = try chain(CHAIN, 3000000)
+    var d: Gc[Node] = try chain(CHAIN, 4000000)
+    var base_a: u64 = 1000000
+    var base_b: u64 = 2000000
+    var base_c: u64 = 3000000
+    var base_d: u64 = 4000000
+    var r: u64 = 0
+    var checked: u64 = 0
+    while r < ROUNDS {
+        // One chain is replaced per round; the other three live on in the
+        // locals while the new one is built.
+        let nb: u64 = 10000000 + r * 10000
+        let fresh: Gc[Node] = try chain(CHAIN, nb)
+        let slot: u64 = r % 4
+        if slot == 0 {
+            a = fresh
+            base_a = nb
+        } else if slot == 1 {
+            b = fresh
+            base_b = nb
+        } else if slot == 2 {
+            c = fresh
+            base_c = nb
+        } else {
+            d = fresh
+            base_d = nb
+        }
+        let ok_ab: bool = verify(a, CHAIN, base_a) && verify(b, CHAIN, base_b)
+        let ok_cd: bool = verify(c, CHAIN, base_c) && verify(d, CHAIN, base_d)
+        if !ok_ab || !ok_cd {
+            var t: rt.Buf = rt.buf_new()
+            var m: [u8; 30] = "gc_soak: CORRUPT after round  "
+            text(&t, (&m[0]) as u64, 29)
+            rt.buf_push_dec_u64(&t, r)
+            var nl: [u8; 1] = "\n"
+            text(&t, (&nl[0]) as u64, 1)
+            say(&t)
+            return 1
+        }
+        checked = checked + 4 * CHAIN
+        r = r + 1
+    }
+    let runs: u64 = gc_collections()
+    var t: rt.Buf = rt.buf_new()
+    var m1: [u8; 24] = "gc_soak: intact, rounds "
+    text(&t, (&m1[0]) as u64, 24)
+    rt.buf_push_dec_u64(&t, r)
+    var m2: [u8; 17] = ", nodes verified "
+    text(&t, (&m2[0]) as u64, 17)
+    rt.buf_push_dec_u64(&t, checked)
+    var nl: [u8; 1] = "\n"
+    text(&t, (&nl[0]) as u64, 1)
+    // The number of collections goes on a line of its own: the collector is
+    // incremental with a TIME budget per slice, so how many cycles a given
+    // amount of allocation takes depends on the speed of the machine. The
+    // first line is the verdict and is the same everywhere; this one is
+    // the evidence that the collector really ran, and it has a floor.
+    var m3: [u8; 22] = "gc_soak: collections  "
+    text(&t, (&m3[0]) as u64, 21)
+    rt.buf_push_dec_u64(&t, runs)
+    text(&t, (&nl[0]) as u64, 1)
+    say(&t)
+    if runs < MIN_COLLECTIONS {
+        return 2
+    }
+    return 0
+}

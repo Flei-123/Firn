@@ -523,6 +523,28 @@ into the generated file by hand but not into the template
 first line again. The template carries the line now; the generated file
 itself is unchanged, octet for octet.
 
+## 4f. WebAssembly: `--target=wasm32-browser` (round WASM)
+
+```sh
+compiler/target/release/firnc --target=wasm32-browser -o /tmp/hello.wasm examples/hello.fi
+node tools/wasm/run.mjs /tmp/hello.wasm ; echo "exit=$?"     # the greeting of hello.fi, exit=0
+compiler/target/release/firnc --target=wasm32-browser --emit=asm -o /tmp/hello.wat examples/hello.fi
+```
+
+`tools/wasm/run.mjs` is the host for the checks (stdout, stderr, stdin,
+exit code under node 18); a browser gets `demos/webdemo/firn.js`. Measured
+2026-09-23 (details, design and limits in `docs/ROUND-WASM.md`):
+
+| What | Command | Measured result |
+|---|---|---|
+| **native vs. WebAssembly, octet for octet** | `bash tools/wasm/run.sh` | 335 programs x 4 build levels: **314 identical**, 21 refused at compile time with a reason (files 10, threads 4, inline asm 4, SIMD 2, sockets 1), **0 different**; `wat2wasm` gives our binary for 314 of 314; the dispatch fallback 314 of 314; ends on `ALL WASM CHECKS PASSED` |
+| **the collector without a stack scan** | `bash tools/wasm/gc_soak.sh` | intact after 1096-1097 collections (36,000,000 nodes verified) in `dev`, `dev-fast`, `release-fast`; without the spills: `CORRUPT after round 9` -> `GC SOAK PASSED` |
+| **the fUi page in Chromium** | `bash tools/wasm/webdemo.sh` | runs `tools/fui/run.sh --images` for the reference, then headless Chromium: **0 differing pixels** in 4 of 4 pictures, from two build levels; hover, click, wheel and keys operate it; `WEBDEMO PASSED` |
+
+Needed: node (18 works), for section 2 of `run.sh` wabt (`wat2wasm`,
+`wasm-strip`; without it that section says SKIPPED), for the web demo
+`chromium` and python3 with PIL, numpy and websocket-client.
+
 ## 5. What does NOT work, because it was not built
 
 Honestly and completely (in detail in `ACCEPTANCE.md`):
