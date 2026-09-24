@@ -440,14 +440,14 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
                 }
             }
             let tc = std::time::Instant::now();
-            let cand = crate::promote::candidate_loops(f, &nounmap);
+            let (cand, kids) = crate::promote::candidate_loops(f, &nounmap);
             t_check += tc.elapsed().as_secs_f64() * 1000.0;
             if cand.is_empty() && std::env::var_os("FIRN_PROMOTE_ROTATE_ALL").is_none() {
                 continue;
             }
             n_check += 1;
             let mut g = f.clone();
-            let r = crate::promote::rotate_loops(&mut g, &cand);
+            let r = crate::promote::rotate_loops(&mut g, &cand, &kids);
             if r > 0 && std::env::var_os("FIRN_PROMOTE_CLEANUP_FIRST").is_some() {
                 optimize_func(&mut g, &mut st, cfg, &mut clk);
             }

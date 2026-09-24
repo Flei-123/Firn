@@ -357,7 +357,7 @@ fn fit(f: &Func) -> bool {
 
 /// Rotates every `while` shaped loop into a guarded `do while`. Yields the
 /// number of rotated loops. Needs a `mem2reg` round afterwards.
-pub(crate) fn rotate_loops(f: &mut Func, only: &HashSet<usize>) -> usize {
+pub(crate) fn rotate_loops(f: &mut Func, only: &HashSet<usize>, guards: &HashSet<usize>) -> usize {
     if !fit(f) {
         return 0;
     }
@@ -371,11 +371,12 @@ pub(crate) fn rotate_loops(f: &mut Func, only: &HashSet<usize>) -> usize {
         let mut hit = false;
         for l in &loops {
             let all = std::env::var_os("FIRN_PROMOTE_ROTATE_ALL").is_some();
-            if tried.contains(&l.head) || (!all && !only.contains(&l.head)) {
+            let full = all || only.contains(&l.head);
+            if tried.contains(&l.head) || (!full && !guards.contains(&l.head)) {
                 continue;
             }
             tried.insert(l.head);
-            if rotate_one(f, l, &preds) {
+            if rotate_one(f, l, &preds, !full) {
                 done += 1;
                 hit = true;
                 break;
@@ -388,7 +389,15 @@ pub(crate) fn rotate_loops(f: &mut Func, only: &HashSet<usize>) -> usize {
     done
 }
 
-fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
+/// `guard == false`: full rotation (the test moves to the bottom).
+/// `guard == true`: only a GUARD in front -- `P -> G(test) -> P2 -> H(test)`,
+/// the loop keeps testing at the top. That is what inner loops get: the
+/// preheader P2 still runs only when the body runs (the place for a
+/// write-back), and the loop keeps the shape V8's TurboFan unrolls (measured:
+/// a fully rotated inner loop cost chain-1000 six percent in Chromium, the
+/// guarded one nothing). The header then runs once more than before, so it
+/// may only hold instructions without side effects.
+fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>], guard: bool) -> bool {
     let h = l.head;
     let (cond, then_bb, else_bb) = match f.blocks[h].term {
         Term::BrCond { cond, then_bb, else_bb } => (cond, then_bb as usize, else_bb as usize),
@@ -424,6 +433,30 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
         if matches!(i.op, Op::Alloca { .. } | Op::Asm { .. } | Op::Phi { .. }) {
             return false;
         }
+        if guard {
+            let again = matches!(
+                i.op,
+                Op::Const(_)
+                    | Op::Bin(..)
+                    | Op::BinWrapSat { .. }
+                    | Op::Cmp { .. }
+                    | Op::Un(..)
+                    | Op::Cast { .. }
+                    | Op::PtrAdd { .. }
+                    | Op::Load { .. }
+                    | Op::Select { .. }
+                    | Op::GlobalAddr { .. }
+                    | Op::FnRef { .. }
+                    | Op::VtabAddr { .. }
+                    | Op::CheckedBin { .. }
+                    | Op::CheckedDiv { .. }
+                    | Op::CheckedCast { .. }
+                    | Op::CheckedIdx { .. }
+            );
+            if !again {
+                return false;
+            }
+        }
     }
     // Values defined in H.
     let mut defined: HashSet<Val> = HashSet::new();
@@ -443,13 +476,15 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
             match &i.op {
                 Op::Phi { incoming } => {
                     for (pb, v) in incoming {
-                        if *pb as usize != h && defined.contains(v) {
+                        // guard mode: H still dominates the whole loop, so
+                        // only reads from outside it need the slot
+                        if *pb as usize != h && defined.contains(v) && (!guard || !l.has(*pb as usize)) {
                             us.push(*v);
                         }
                     }
                 }
                 other => {
-                    if bi != h {
+                    if bi != h && (!guard || !l.has(bi)) {
                         other.uses(&mut us);
                         us.retain(|v| defined.contains(v));
                         if !us.is_empty() && crate::mem2reg::is_untouchable(other) {
@@ -464,7 +499,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
                 }
             }
         }
-        if bi != h {
+        if bi != h && (!guard || !l.has(bi)) {
             if let Some(v) = term_use(&b.term) {
                 if defined.contains(&v) && !need.contains(&v) {
                     need.push(v);
@@ -482,7 +517,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
         }
     }
     // The in-loop successor must have H as its only predecessor.
-    let x = if preds[x].len() != 1 { split_edge(f, h, x) } else { x };
+    let x = if !guard && preds[x].len() != 1 { split_edge(f, h, x) } else { x };
 
     // ---- demote the values used outside H into slots
     let mut slot_of: HashMap<Val, Val> = HashMap::new();
@@ -537,7 +572,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
                 for i in blk.insts.iter() {
                     if let Op::Phi { incoming } = &i.op {
                         for (pb, v) in incoming {
-                            if *pb as usize != h {
+                            if *pb as usize != h && (!guard || !l.has(*pb as usize)) {
                                 if let Some(&s) = slot_of.get(v) {
                                     tail_loads.push((*pb as usize, *v, s));
                                 }
@@ -564,8 +599,8 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
                     }
                 }
             }
-            if bi == h {
-                continue; // ordinary uses inside H read the value directly
+            if bi == h || (guard && l.has(bi)) {
+                continue; // ordinary uses inside H (the loop) read the value directly
             }
             // ordinary uses -> load right in front
             let old = std::mem::take(&mut f.blocks[bi].insts);
@@ -650,18 +685,25 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>]) -> bool {
     } else {
         Term::BrCond { cond: gcond, then_bb: p2 as BlockId, else_bb: e as BlockId }
     };
-    f.blocks[p2].term = Term::Br(x as BlockId);
     retarget(&mut f.blocks[p].term, h as BlockId, g as BlockId);
-    // H loses the entry from P.
-    for i in f.blocks[h].insts.iter_mut() {
-        if let Op::Phi { incoming } = &mut i.op {
-            incoming.retain(|(b, _)| *b as usize != p);
-        } else {
-            break;
+    if guard {
+        // P2 enters H in place of P: the entries of H stay, renamed
+        f.blocks[p2].term = Term::Br(h as BlockId);
+        rename_phi_pred(f, h, p as BlockId, p2 as BlockId);
+    } else {
+        f.blocks[p2].term = Term::Br(x as BlockId);
+        // H loses the entry from P.
+        for i in f.blocks[h].insts.iter_mut() {
+            if let Op::Phi { incoming } = &mut i.op {
+                incoming.retain(|(b, _)| *b as usize != p);
+            } else {
+                break;
+            }
         }
     }
-    // X and E gain an entry for the new edge.
-    for (succ, from) in [(x, p2), (e, g)] {
+    // X (rotation only) and E gain an entry for the new edge.
+    let edges: Vec<(usize, usize)> = if guard { vec![(e, g)] } else { vec![(x, p2), (e, g)] };
+    for (succ, from) in edges {
         for i in f.blocks[succ].insts.iter_mut() {
             if let Op::Phi { incoming } = &mut i.op {
                 if let Some(v) = incoming.iter().find(|(b, _)| *b as usize == h).map(|(_, v)| *v) {
@@ -1072,19 +1114,31 @@ impl<'a> Ctx<'a> {
 /// comes from outside the loop? Only then is rotating and promoting worth
 /// the compile time -- measured on bin/firnc1.fi, three functions of 1,300
 /// pass it.
-pub(crate) fn candidate_loops(f: &mut Func, nounmap: &HashSet<String>) -> HashSet<usize> {
+/// The loops worth rotating (promotion targets) and the inner loops worth a
+/// guard (their direct children).
+pub(crate) fn candidate_loops(f: &mut Func, nounmap: &HashSet<String>) -> (HashSet<usize>, HashSet<usize>) {
     let mut heads: HashSet<usize> = HashSet::new();
+    let mut kids: HashSet<usize> = HashSet::new();
     if !fit(f) {
-        return heads;
+        return (heads, kids);
     }
     let mut rejected: HashSet<(usize, Cell)> = HashSet::new();
     let mut found: Vec<(usize, Vec<usize>)> = Vec::new();
     scan(f, nounmap, &mut rejected, Some(&mut found));
+    let no_children = std::env::var_os("FIRN_PROMOTE_NO_CHILD_GUARD").is_some();
+    let rotate_children = std::env::var_os("FIRN_PROMOTE_ROTATE_CHILDREN").is_some();
     for (h, children) in found {
         heads.insert(h);
-        heads.extend(children);
+        if rotate_children {
+            heads.extend(children);
+        } else if !no_children {
+            kids.extend(children);
+        }
     }
-    heads
+    for h in &heads {
+        kids.remove(h);
+    }
+    (heads, kids)
 }
 
 /// Keeps memory cells in registers across loops (see the module text).
