@@ -221,8 +221,21 @@ fn canvas_clear(c: *mut Canvas, col: u32) {
     let g: u8 = ((color_g(col) * a + 127) / 255) as u8
     let b: u8 = ((color_b(col) * a + 127) / 255) as u8
     let base: u64 = (*c).px as u64
-    var i: usize = 0
     let n: usize = (*c).w * (*c).h
+    // TWO PIXELS PER STORE: the octets r g b a, twice, as one u64 (the
+    // canvas is little endian in memory, like every target Firn has).
+    // Measured (FirnChat, 24.09.2026): the octet loop cleared a 1996 x
+    // 1211 canvas in 15 ms of WebAssembly -- every frame.
+    let one: u64 = (r as u64) | ((g as u64) << 8) | ((b as u64) << 16) |
+        ((a as u64) << 24)
+    let two: u64 = one | (one << 32)
+    var i: usize = 0
+    if (base & 7 as u64) == 0 as u64 {
+        while i + 2 <= n {
+            *((base + (i * 4) as u64) as *mut u64) = two
+            i = i + 2
+        }
+    }
     while i < n {
         let p: u64 = base + (i * 4) as u64
         st8(p, r)
@@ -304,14 +317,41 @@ fn canvas_blend(c: *mut Canvas, x: usize, y: usize, col: u32, cov: f64) {
     if (*c).ok == 0 || x >= (*c).w || y >= (*c).h {
         return
     }
-    var f: f64 = cov * clip_factor(c, x, y)
+    let f: f64 = cov * clip_factor(c, x, y)
+    let p: u64 = (*c).px as u64 + ((y * (*c).w + x) * 4) as u64
+    blend_px(c, p, col, f)
+}
+
+// FULL COVERAGE OF A TRANSLUCENT COLOUR, IN INTEGERS -- and the same
+// octets as the float blend below. With f = 1 the float path computes
+// floor(N / 255 + 0.5) for N = S a + D (255 - a) (S the straight source
+// channel, D the premultiplied backdrop, a the source alpha): that is
+// floor((2N + 255) / 510), and 2N + 255 is odd, so the exact value is at
+// least 1/510 away from every integer -- further than the float error
+// (about 1e-13) and further than the error of an f that is 1e-6 short of
+// one (at most 255e-6 of a level). Measured on FirnChat's page
+// (24.09.2026): the float blend with its two conversions per channel
+// (ldf, to255) was the largest single item of a frame.
+#[no_gc]
+fn blend_full_int(p: u64, col: u32) {
+    let a: u32 = color_a(col)
+    let inv: u32 = 255 as u32 - a
+    st8(p, ((2 as u32 * (color_r(col) * a + ld8(p) * inv) + 255 as u32) / 510 as u32) as u8)
+    st8(p + 1, ((2 as u32 * (color_g(col) * a + ld8(p + 1) * inv) + 255 as u32) / 510 as u32) as u8)
+    st8(p + 2, ((2 as u32 * (color_b(col) * a + ld8(p + 2) * inv) + 255 as u32) / 510 as u32) as u8)
+    st8(p + 3, ((2 as u32 * (255 as u32 * a + ld8(p + 3) * inv) + 255 as u32) / 510 as u32) as u8)
+}
+
+// One pixel at address p, coverage f already multiplied with the clip.
+#[no_gc]
+fn blend_px(c: *mut Canvas, p: u64, col: u32, f0: f64) {
+    var f: f64 = f0
     if f <= 0.0 {
         return
     }
     if f > 1.0 {
         f = 1.0
     }
-    let p: u64 = (*c).px as u64 + ((y * (*c).w + x) * 4) as u64
     // FULL COVERAGE OF AN OPAQUE COLOUR IS A STORE. The inside of every
     // round rectangle, every glyph stem and every icon stroke lands here
     // with f = 1, and the blend below would compute s * 1 + d * 0 through
@@ -319,11 +359,17 @@ fn canvas_blend(c: *mut Canvas, x: usize, y: usize, col: u32, cov: f64) {
     // The result is the SAME octets: with sa >= 1 - 1e-6 the blend is
     // within 255e-6 of the source channel, and the rounding (+0.5, floor)
     // cannot tip over. Measured on FirnChat's page: see tests/fui-look.mjs.
-    if f >= 0.999999 && color_a(col) == 255 as u32 && (*c).mode == BLEND_NORMAL {
-        st8(p, color_r(col) as u8)
-        st8(p + 1, color_g(col) as u8)
-        st8(p + 2, color_b(col) as u8)
-        st8(p + 3, 255 as u8)
+    if f >= 0.999999 && (*c).mode == BLEND_NORMAL {
+        if color_a(col) == 255 as u32 {
+            st8(p, color_r(col) as u8)
+            st8(p + 1, color_g(col) as u8)
+            st8(p + 2, color_b(col) as u8)
+            st8(p + 3, 255 as u8)
+            return
+        }
+        if color_a(col) != 0 as u32 {
+            blend_full_int(p, col)
+        }
         return
     }
     let sa: f64 = (color_a(col) as f64) / 255.0 * f
@@ -660,6 +706,11 @@ fn blend_raw(c: *mut Canvas, x: usize, y: usize, col: u32, f: f64) {
         return
     }
     let p: u64 = (*c).px as u64 + ((y * (*c).w + x) * 4) as u64
+    // f = 1: the integer blend, the same octets (see blend_full_int)
+    if f >= 0.999999 && f <= 1.0 && (*c).mode == BLEND_NORMAL {
+        blend_full_int(p, col)
+        return
+    }
     let dr: f64 = ldf(p)
     let dg: f64 = ldf(p + 1)
     let db: f64 = ldf(p + 2)
@@ -713,10 +764,41 @@ fn canvas_fill_raster(c: *mut Canvas, r: *mut raster.Raster,
     let rh: usize = raster.raster_used_y1(r)
     let rw: usize = raster.raster_used_x1(r)
     let rx0: usize = raster.raster_used_x0(r)
+    // THE PIXELS WHOLLY INSIDE THE CLIP have a clip factor of exactly
+    // one (the overlap of [x, x+1] with a rectangle around it is 1.0,
+    // no rounding), so they skip the two overlaps per pixel -- the same
+    // octets, measured 12 ms less per FirnChat frame.
+    let d: usize = (*c).depth
+    var ix0: usize = 0
+    var ix1: usize = 0
+    var iy0: usize = 0
+    var iy1: usize = 0
+    if (*c).cmask[d] == 0 {
+        ix0 = ihi((*c).cx0[d], (*c).w)
+        ix1 = ilo((*c).cx1[d], (*c).w)
+        iy0 = ihi((*c).cy0[d], (*c).h)
+        iy1 = ilo((*c).cy1[d], (*c).h)
+    }
     var y: usize = raster.raster_used_y0(r)
     while y < rh {
         let cy: usize = oy + y
-        if cy < (*c).h {
+        if cy < (*c).h && cy >= iy0 && cy < iy1 {
+            let row: u64 = raster.raster_cov_row(r, y)
+            let prow: u64 = (*c).px as u64 + (cy * (*c).w * 4) as u64
+            var x: usize = rx0
+            while x < rw {
+                let v: f64 = *((row + (x * 8) as u64) as *mut f64)
+                if v > 0.0 {
+                    let cx: usize = ox + x
+                    if cx >= ix0 && cx < ix1 {
+                        blend_px(c, prow + (cx * 4) as u64, col, v)
+                    } else if cx < (*c).w {
+                        canvas_blend(c, cx, cy, col, v)
+                    }
+                }
+                x = x + 1
+            }
+        } else if cy < (*c).h {
             // The row ADDRESS, not `raster_cov` per pixel: inside a
             // country most cells are zero, and a bounds check plus a call
             // for each of them is what a fill of half a million pixels

@@ -84,6 +84,7 @@ export {
     WEB_MOVE, WEB_DOWN, WEB_UP, WEB_LEAVE, WEB_VIEWPORTS,
     // THE APPLICATION MODE (see "A PAGE THAT PAINTS ITSELF" below)
     WebEvent, web_app, web_css_width, web_css_height, web_set_dark,
+    web_set_keep, web_set_opaque,
     web_fetch, web_stream_open, web_stream_close, web_navigate,
     web_keyboard, web_location, web_store_get, web_store_set, web_cursor,
     WE_MOVE, WE_DOWN, WE_UP, WE_LEAVE, WE_WHEEL, WE_KEY, WE_TEXT,
@@ -232,6 +233,12 @@ struct Web {
     app: bool,
     paint: fn(u64, *mut Web) -> bool,
     event: fn(u64, *mut Web, *mut WebEvent) -> bool,
+    // an application that paints every pixel itself and keeps the last
+    // picture (to paint only what changed) asks for no clear before its
+    // paint; one that only ever paints opaque pixels needs no
+    // un-premultiplying before the hand-over (web_set_keep/_opaque)
+    keep: bool,
+    opaque: bool,
 }
 
 // The one Web of the page. The host has no other way to find it than
@@ -259,6 +266,7 @@ fn web_blank() -> Web {
         ud: 0, build: build_none, an: 0,
         px: 0.0, py: 0.0, hit: scene.SCENE_NONE, grab: scene.SCENE_NONE,
         frames: 0, app: false, paint: build_none, event: event_none,
+        keep: false, opaque: false,
     }
 }
 
@@ -841,6 +849,15 @@ fn unpremultiply(cv: *mut canvas.Canvas) {
     var i: usize = 0
     while i < n {
         let q: u64 = p + (i * 4) as u64
+        // two opaque pixels at once: one load, one test (the common case
+        // of every page; the octet walk below is for the rest)
+        if i + 2 <= n && (q & 7 as u64) == 0 as u64 {
+            let v2: u64 = *(q as *mut u64)
+            if (v2 & 18374686483949813760 as u64) == 18374686483949813760 as u64 {
+                i = i + 2
+                continue
+            }
+        }
         let a: u32 = rt.ld8(q, 3) as u32
         if a != 255 as u32 && a != 0 as u32 {
             var k: usize = 0
@@ -854,6 +871,30 @@ fn unpremultiply(cv: *mut canvas.Canvas) {
             }
         }
         i = i + 1
+    }
+}
+
+// THE LAST PICTURE STAYS (application mode). Without it the canvas is
+// cleared to the ground before every paint; with it the application finds
+// its last picture on the canvas and may paint only what changed -- it
+// then owns every pixel, the ground included. MEASURED (FirnChat,
+// 24.09.2026, 1996 x 1211 in Chromium): the clear alone was 15 ms of a
+// frame, and the page painted its ground over it anyway.
+fn web_set_keep(on: bool) {
+    if G_WEB != 0 {
+        (*the_web()).keep = on
+    }
+}
+
+// NOTHING TRANSLUCENT EVER REACHES THE CANVAS: the application promises
+// that every pixel it leaves is opaque (a ground first, then src-over,
+// which keeps alpha at one). Then there is nothing to un-premultiply and
+// the pass over every pixel before the hand-over -- 15 ms of the same
+// frame -- is skipped. A page that breaks the promise gets dark fringes,
+// not a crash.
+fn web_set_opaque(on: bool) {
+    if G_WEB != 0 {
+        (*the_web()).opaque = on
     }
 }
 
@@ -878,9 +919,13 @@ fn firn_web_frame(ms: f64) -> u32 {
         (*w).dirty = 0 as u32
         render.ctx_set_time(&(*w).c, now)
         let fa: *mut theme.Colors = theme.theme_colors(&(*w).m)
-        canvas.canvas_clear(&(*w).cv, theme.opaque((*fa).base))
+        if !(*w).keep {
+            canvas.canvas_clear(&(*w).cv, theme.opaque((*fa).base))
+        }
         let _p: bool = (*w).paint((*w).ud, w)
-        unpremultiply(&(*w).cv)
+        if !(*w).opaque {
+            unpremultiply(&(*w).cv)
+        }
         firn_web_present(canvas.canvas_pixels(&(*w).cv) as u64 as u32,
             (*w).w as u32, (*w).h as u32)
         (*w).frames = (*w).frames + 1
