@@ -907,42 +907,78 @@ fn encode(b: &mut Vec<u8>, i: &Ins) {
 
 // ------------------------------------------------------- SIMD opcodes
 // (the SIMD proposal, final numbering; each one checked against wat2wasm by
-// tools/wasm/run.sh, which assembles our text form and compares octets)
+// tools/wasm/run.sh, which assembles our text form and compares octets;
+// the f32x4 ones wait for the SIMD kinds of TEMPO 4/5 on branch `unroll`)
 
+#[allow(dead_code)]
 pub const V128_LOAD: Simd = Simd(0x00, "v128.load");
+#[allow(dead_code)]
 pub const V128_STORE: Simd = Simd(0x0B, "v128.store");
+#[allow(dead_code)]
 pub const I8X16_SWIZZLE: Simd = Simd(0x0E, "i8x16.swizzle");
+#[allow(dead_code)]
 pub const I32X4_SPLAT: Simd = Simd(0x11, "i32x4.splat");
+#[allow(dead_code)]
 pub const I64X2_SPLAT: Simd = Simd(0x12, "i64x2.splat");
+#[allow(dead_code)]
 pub const F32X4_SPLAT: Simd = Simd(0x13, "f32x4.splat");
+#[allow(dead_code)]
 pub const I32X4_EXTRACT_LANE: Simd = Simd(0x1B, "i32x4.extract_lane");
+#[allow(dead_code)]
 pub const I32X4_REPLACE_LANE: Simd = Simd(0x1C, "i32x4.replace_lane");
+#[allow(dead_code)]
 pub const I64X2_EXTRACT_LANE: Simd = Simd(0x1D, "i64x2.extract_lane");
+#[allow(dead_code)]
 pub const I64X2_REPLACE_LANE: Simd = Simd(0x1E, "i64x2.replace_lane");
+#[allow(dead_code)]
 pub const I32X4_GT_S: Simd = Simd(0x3B, "i32x4.gt_s");
+#[allow(dead_code)]
 pub const F32X4_NE: Simd = Simd(0x42, "f32x4.ne");
+#[allow(dead_code)]
 pub const F32X4_LT: Simd = Simd(0x43, "f32x4.lt");
+#[allow(dead_code)]
 pub const F32X4_LE: Simd = Simd(0x45, "f32x4.le");
+#[allow(dead_code)]
 pub const F32X4_GE: Simd = Simd(0x46, "f32x4.ge");
+#[allow(dead_code)]
 pub const V128_NOT: Simd = Simd(0x4D, "v128.not");
+#[allow(dead_code)]
 pub const V128_AND: Simd = Simd(0x4E, "v128.and");
+#[allow(dead_code)]
 pub const V128_ANDNOT: Simd = Simd(0x4F, "v128.andnot");
+#[allow(dead_code)]
 pub const V128_OR: Simd = Simd(0x50, "v128.or");
+#[allow(dead_code)]
 pub const V128_XOR: Simd = Simd(0x51, "v128.xor");
+#[allow(dead_code)]
 pub const V128_BITSELECT: Simd = Simd(0x52, "v128.bitselect");
+#[allow(dead_code)]
 pub const V128_STORE64_LANE: Simd = Simd(0x5B, "v128.store64_lane");
+#[allow(dead_code)]
 pub const I8X16_ADD: Simd = Simd(0x6E, "i8x16.add");
+#[allow(dead_code)]
 pub const I32X4_SHL: Simd = Simd(0xAB, "i32x4.shl");
+#[allow(dead_code)]
 pub const I32X4_SHR_U: Simd = Simd(0xAD, "i32x4.shr_u");
+#[allow(dead_code)]
 pub const I32X4_ADD: Simd = Simd(0xAE, "i32x4.add");
+#[allow(dead_code)]
 pub const I32X4_SUB: Simd = Simd(0xB1, "i32x4.sub");
+#[allow(dead_code)]
 pub const I64X2_SHL: Simd = Simd(0xCB, "i64x2.shl");
+#[allow(dead_code)]
 pub const I64X2_SHR_U: Simd = Simd(0xCD, "i64x2.shr_u");
+#[allow(dead_code)]
 pub const I64X2_ADD: Simd = Simd(0xCE, "i64x2.add");
+#[allow(dead_code)]
 pub const F32X4_ADD: Simd = Simd(0xE4, "f32x4.add");
+#[allow(dead_code)]
 pub const F32X4_SUB: Simd = Simd(0xE5, "f32x4.sub");
+#[allow(dead_code)]
 pub const F32X4_MUL: Simd = Simd(0xE6, "f32x4.mul");
+#[allow(dead_code)]
 pub const I32X4_TRUNC_SAT_F32X4_S: Simd = Simd(0xF8, "i32x4.trunc_sat_f32x4_s");
+#[allow(dead_code)]
 pub const F32X4_CONVERT_I32X4_S: Simd = Simd(0xFA, "f32x4.convert_i32x4_s");
 
 #[cfg(test)]
