@@ -42,14 +42,17 @@ $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 3
 $ADB shell am force-stop $PKG
 $ADB shell "rm -f $D/bob.id*"   # pins and session state of an older relay
 $ADB push "$W/bob.id" $D/bob.id >/dev/null
-printf -- '--id\n%s/bob.id\n--host\n10.0.2.2\n--port\n%s\n--font\n/system/fonts/RobotoStatic-Regular.ttf\n' \
+printf -- '--id\n%s/bob.id\n--host\n10.0.2.2\n--port\n%s\n--font\n/system/fonts/RobotoStatic-Regular.ttf\n--zeit\n' \
     "$D" "$PORT" > "$W/args.txt"
+# FIRNCHAT_ARGS: more arguments, one per word (e.g. --gpu=0: in memory)
+[ -n "${FIRNCHAT_ARGS:-}" ] && printf -- '%s\n' $FIRNCHAT_ARGS >> "$W/args.txt"
 $ADB push "$W/args.txt" $D/args.txt >/dev/null
 $ADB logcat -c
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 12
 check "relay: watch session from the phone" "$(grep -c 'watch session opened' "$W/relay.log" | awk '{print ($1>0)?"yes":"no"}')" yes
 check "foreground service (remoteMessaging)" \
     "$($ADB shell dumpsys activity services $PKG | grep -c 'isForeground=true.*types=0x00000200')" 1
+mkdir -p "$ROOT/build/android/belege"
 $ADB exec-out screencap -p > "$ROOT/build/android/belege/firnchat-live.png"
 P1=$($ADB shell pidof $PKG)
 n0=$(posted)
@@ -76,5 +79,16 @@ got=$(cd "$W" && "$FC" hist "$PORT" alice.id 2>/dev/null | grep -c 'Antwort vom 
 check "Alice receives the phone's answer (E2E)" "$([ "$got" -ge 1 ] && echo yes)" yes
 check "no crash" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|panic|ANR in '$PKG)" 0
 pgrep -f "$FC serve $PORT" | xargs -r kill
+# THE TIME OF A PICTURE (src/gui/app.fi --zeit, microseconds): fUi painting
+# the model, and showing it (GPU: copy + eglSwapBuffers; memory: the pixel
+# copy into the window buffer). On an emulator the GPU is SwiftShader.
+$ADB shell cat $D/stdout.txt 2>/dev/null | grep '^zeit ' > "$W/zeit.txt"
+if [ -s "$W/zeit.txt" ]; then
+    med() { sort -n | awk '{a[NR]=$1} END{if(NR) printf "%.1f", a[int((NR+1)/2)]/1000; else print "-"}'; }
+    echo "picture ms (median of $(wc -l < "$W/zeit.txt"), $(awk '{print $4}' "$W/zeit.txt" | sort | uniq -c | tr -s ' ' | sed 's/^ //')):" \
+        "paint $(awk '{print $2}' "$W/zeit.txt" | med)," \
+        "show $(awk '{print $3}' "$W/zeit.txt" | med)," \
+        "whole $(awk '{print $2+$3}' "$W/zeit.txt" | med)"
+fi
 echo "ANDROID FIRNCHAT: $PASS passed, $FAIL failed (relay log $W/relay.log)"
 [ $FAIL -eq 0 ]

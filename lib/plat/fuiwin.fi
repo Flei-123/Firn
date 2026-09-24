@@ -31,8 +31,10 @@
 // uebersetzbar; wer fUi in einem Fenster will, nimmt lib/plat.
 import std.rt
 import paint.canvas
+import paint.gl
 import fui.painter
 import fui.theme
+import fui.gpu
 import window.window
 import plat.fuiwirt
 
@@ -41,6 +43,8 @@ export {
     fenster_canvas, fenster_painter, fenster_w, fenster_h,
     fenster_window, fenster_set_font, fenster_protokoll, fenster_full,
     fenster_bilder, jetzt_ms,
+    // fUi tempo, stage 2b: THE GPU (see "AUF DER GPU" below)
+    fenster_set_gpu, fenster_gpu,
 }
 
 struct Fenster {
@@ -60,12 +64,72 @@ struct Fenster {
     offen: bool,
     // Escape beendet (die Demo will das; ein Programm mit Dialogen nicht).
     esc_zu: bool,
+    // AUF DER GPU: gewollt (Standard ja), und ob es laeuft; die GL-Tabelle
+    // des Fensters und fUis Renderer darauf
+    gpu_will: bool,
+    gpu_an: bool,
+    gl: gl.GlApi,
+    gp: gpu.Gpu,
 }
 
 fn fenster_new() -> Fenster {
     return Fenster { f: window.window_new(), cv: canvas.canvas_new(),
         z: painter.painter_new(), fm: 0, bgrx: 0, cap: 0, w: 0, h: 0,
-        voll: false, log: false, bilder: 0, offen: false, esc_zu: true }
+        voll: false, log: false, bilder: 0, offen: false, esc_zu: true,
+        gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new() }
+}
+
+// ============================================================ AUF DER GPU
+//
+// fUi tempo, Stufe 2b (24.09.2026). Bietet das Fenster eine GPU an
+// (`window.gpu_open`: heute Android, EGL + OpenGL ES 3), dann liegt die
+// Leinwand auf der GPU (lib/fui/gpu.fi): fUi malt dort hinein, ein Bild
+// endet mit EINER Kopie auf den Schirm und `window.gpu_swap` -- kein
+// RGBA -> BGRX, kein Oktett-fuer-Oktett-Kopieren in den Fensterpuffer.
+// Ohne GPU (X11, Windows, Osum, ein Geraet ohne GLES 3) malt fUi wie
+// bisher im Speicher. `fenster_set_gpu(fx, false)` VOR dem Aufmachen
+// schaltet es ab (zum Vergleichen).
+fn fenster_set_gpu(fx: *mut Fenster, an: bool) {
+    (*fx).gpu_will = an
+}
+
+fn fenster_gpu(fx: *mut Fenster) -> bool {
+    return (*fx).gpu_an
+}
+
+fn gpu_starten(fx: *mut Fenster) {
+    (*fx).gpu_an = false
+    if !(*fx).gpu_will || (*fx).cap == 0 {
+        return
+    }
+    if !window.gpu_open(&(*fx).f, (&(*fx).gl) as u64) {
+        return
+    }
+    if !gpu.gpu_open(&(*fx).gp, &(*fx).gl) {
+        return
+    }
+    if !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
+        return
+    }
+    (*fx).gpu_an = true
+    var nm: [u8; 3] = "gpu"
+    zeile(fx, (&nm[0]) as u64, 3, 1, (*fx).w as i64, (*fx).h as i64, 0)
+}
+
+// Schreibzugriffe, die an der GPU vorbeigingen (canvas.fi zaehlt sie):
+// ins Protokoll, sobald es neue gibt -- ein Loch im Bild faellt so auf.
+static mut G_STREU: u64 = 0
+
+fn streu_melden(fx: *mut Fenster) {
+    let n: u64 = canvas.canvas_stray_writes()
+    if n == G_STREU {
+        return
+    }
+    G_STREU = n
+    var nm: [u8; 5] = "streu"
+    zeile(fx, (&nm[0]) as u64, 5, n as i64, 0, 0, 0)
+    let s: str = "fui.gpu: writes that missed the GPU\n"
+    rt.write_everything(2, s.p as u64, s.n)
 }
 
 fn fenster_canvas(fx: *mut Fenster) -> *mut canvas.Canvas { return &(*fx).cv }
@@ -114,6 +178,10 @@ fn flaechen(fx: *mut Fenster, w: usize, h: usize) -> bool {
     (*fx).cap = w * h * 4
     (*fx).w = w
     (*fx).h = h
+    // die neue Leinwand wieder auf die GPU (ein Ziel der neuen Groesse)
+    if (*fx).gpu_an && !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
+        (*fx).gpu_an = false
+    }
     return true
 }
 
@@ -140,11 +208,17 @@ fn fenster_open(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
     if !window.show_window(&(*fx).f) {
         return false
     }
+    gpu_starten(fx)
     (*fx).offen = true
     return true
 }
 
 fn fenster_close(fx: *mut Fenster) {
+    if (*fx).gpu_an {
+        gpu.gpu_detach(&(*fx).gp, &(*fx).cv)
+        window.gpu_close(&(*fx).f)
+        (*fx).gpu_an = false
+    }
     if (*fx).cap > 0 {
         painter.painter_free(&(*fx).z)
         canvas.canvas_free(&(*fx).cv)
@@ -281,14 +355,37 @@ fn fenster_run(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
         fuiwirt.wirt_tick(w, jetzt_ms())
         if fuiwirt.wirt_dirty(w) {
             let q0: i64 = jetzt_ms()
-            male(ud, fx)
-            let q1: i64 = jetzt_ms()
-            fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64,
-                (*fx).bgrx, (*fx).w * (*fx).h)
-            let q2: i64 = jetzt_ms()
-            let ok: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
-            let ok2: bool = window.present(f)
-            let q3: i64 = jetzt_ms()
+            var q2: i64 = q0
+            var q3: i64 = q0
+            var q1: i64 = q0
+            if (*fx).gpu_an {
+                // AUF DER GPU: malen, eine Kopie auf den Schirm, tauschen
+                var pl: [u64; 4] = [0; 4]
+                window.gpu_place(f, (&pl[0]) as u64)
+                gpu.gpu_frame_begin(&(*fx).gp, pl[2] as i32, pl[3] as i32)
+                male(ud, fx)
+                q1 = jetzt_ms()
+                gpu.gpu_present_at(&(*fx).gp, pl[0] as i32, pl[1] as i32)
+                streu_melden(fx)
+                q2 = jetzt_ms()
+                let ok3: bool = window.gpu_swap(f)
+                q3 = jetzt_ms()
+                if window.gpu_lost(f) {
+                    // der Kontext ist weg und mit ihm jedes GL-Objekt: neu
+                    // aufmachen, und alles wird noch einmal gemalt
+                    gpu_starten(fx)
+                    fuiwirt.wirt_touch(w)
+                }
+            } else {
+                male(ud, fx)
+                q1 = jetzt_ms()
+                fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64,
+                    (*fx).bgrx, (*fx).w * (*fx).h)
+                q2 = jetzt_ms()
+                let ok: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
+                let ok2: bool = window.present(f)
+                q3 = jetzt_ms()
+            }
             // Wo die Zeit eines Bildes bleibt: fUi malen, RGBA->BGRX,
             // PutImage -- in ms. Gemessen, damit niemand die Plattform
             // verdaechtigt, wenn der Rasterer langsam ist (und umgekehrt).
