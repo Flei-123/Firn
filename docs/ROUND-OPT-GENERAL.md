@@ -42,8 +42,19 @@ Switches: `FIRN_NO_PROMOTE=1`, `FIRN_PROMOTE_TRACE=1`, `FIRN_PROMOTE_ONLY=fn`,
 `FIRN_PROMOTE_CLEANUP_FIRST=1` (stress mode: rotate every loop).
 
 **Native needs the register allocator of TEMPO 1-13 (branch `unroll`).** With
-the old allocator of main the promoted loop phis spill (sim.fi chain/rand 3x
-slower); with the new one it is a clear gain (below).
+the old allocator of main the promoted loop phis spill (sim.fi 2-2.3x
+slower); with the new one it is a clear gain (below). Therefore the pass is ON
+by default for `wasm32-browser` only; `FIRN_PROMOTE_NATIVE=1` switches it on
+natively, and `test.sh` section 64 (`tools/promote/run.sh`) keeps it proven
+there (release-fast/-safe, normal and stress mode). Once `unroll` is on main
+the gate in `main.rs` goes.
+
+Inner region loops are NOT rotated but only GUARDED (`P -> G(test) -> P2 ->
+H(test)`): the preheader P2 still runs only when the loop runs, and the loop
+keeps the top-tested shape V8's TurboFan unrolls. Measured in Chromium 151:
+fully rotated inner loops cost chain-1000 six percent (54.1 k -> 50.9 k
+ticks/s; with `--no-wasm-loop-unrolling` the gap vanished), guarded ones
+nothing (54.3 k).
 
 ## 2. The WebAssembly backend
 
@@ -92,10 +103,12 @@ sim.fi, ticks/s (`/root/bench/simcmp/opt/q.sh`, Chromium via `opt/web/cmp.sh`):
 
 | circuit | nat before* | nat after* | wasm node18 before | after | Chromium 151 before | after |
 |---|---|---|---|---|---|---|
-| idle-1000 | 149 M | 341 M | 89 M | 283 M | 94-98 M | 250-420 M |
-| chain-1000 | 74.8 k | 72.1 k | 50 k | 45-53 k | 52-54 k | 47-50 k |
-| rand-10000 | 2.47 M | 2.43 M | 1.86 M | 2.00 M | 1.62-1.94 M | 1.72-1.83 M |
+| idle-1000 | 149 M | 341 M | 89 M | 299 M | 102 M | 311 M |
+| chain-1000 | 74.8 k | 72.1 k | 50 k | 45-53 k | 53.5 k | 54.3 k |
+| rand-10000 | 2.47 M | 2.43 M | 1.86 M | 2.00 M | 1.84 M | 1.83 M |
 | fanout-1000 | 123 k | 141 k | | | 88 k | 88 k |
+
+(Chromium columns: the final guarded variant, 4 interleaved rounds.)
 
 \* native with the allocator of `unroll`, promote off/on.
 
