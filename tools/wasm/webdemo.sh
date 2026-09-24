@@ -12,6 +12,9 @@
 #      pixel, four pictures with the four PNGs of run.sh for the same page,
 #      then operates it with mouse, wheel and keyboard
 #      (tools/wasm/webcheck.py)
+#   4. loads it again with WebGL2 (SwiftShader) and holds the pictures fUi's
+#      GPU backend draws against the ones it paints in memory
+#      (tools/wasm/gpucheck.py)
 #
 # Needs: chromium, python3 with PIL, numpy and websocket-client.
 # Usage: bash tools/wasm/webdemo.sh      (exit 0 = all of it held)
@@ -61,6 +64,19 @@ cp "$W/gallery9-dev.wasm" demos/webdemo/.gallery9-dev.wasm
 W="$W/shots-dev" WASM=.gallery9-dev.wasm PICTURES_ONLY=1 \
     python3 tools/wasm/webcheck.py demos/webdemo "$REF/belege" | grep -E 'px differ|over all' || fail=1
 rm -f demos/webdemo/.gallery9-dev.wasm
+
+echo "== 4. the same page on the GPU (lib/fui/gpu.fi, WebGL2 on SwiftShader) =="
+# fUi tempo, stage 2: the four pictures once in memory (?gl=0) and once
+# drawn by the GPU backend (?gl=1), within bounds (tools/wasm/gpucheck.py:
+# at most 5 per mille of the pixels over 32 levels apart, a mean under 1),
+# idle, a lost and restored WebGL context, a wheel notch and back.
+# gpuzoo: every way fUi draws that gallery9 does not (pictures, turned
+# shapes, shadows, glass, text effects) -- built only for this check
+"$FIRNC" --opt-level=release-safe --target=wasm32-browser \
+    -o demos/webdemo/gpuzoo.wasm tools/fui/gpuzoo_web.fi || fail=1
+W="$W/gpu" python3 tools/wasm/gpucheck.py demos/webdemo > "$W/gpu.log" 2>&1 || fail=1
+rm -f demos/webdemo/gpuzoo.wasm
+grep -E 'over 32|lost|wheel|idle|missed|FAILED|BOUNDS' "$W/gpu.log" | sed 's/^/ /'
 
 if [ "$fail" = 0 ]; then
     echo "WEBDEMO PASSED"

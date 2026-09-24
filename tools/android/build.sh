@@ -15,6 +15,7 @@
 #   2. firnc --target=<arch> --pic -c            ->  ELF object
 #      (--pic: no TEXTREL, which Android's loader refuses since API 23)
 #   3. ld -shared -Bsymbolic, only the entry point exported -> lib<lib>.so
+#      (EGL + GLES 3 as needed: lib/window/android.fi draws fUi on the GPU)
 #   4. a manifest for android.app.NativeActivity that names
 #      `firn_activity_create` (lib/android/activity.fi) as the entry, then
 #      aapt2 + zipalign + apksigner                        ->  <name>.apk
@@ -119,7 +120,8 @@ build_abi() { # $1 abi dir, $2 firn target, $3 linker, $4 NDK triple
     "$linker" -shared -Bsymbolic --version-script="$out/exports.ver" \
         -z noexecstack -z max-page-size=16384 \
         -soname "lib$LIB.so" -o "$out/lib$LIB.so" "$out/app.o" \
-        -L"$syslib" -landroid -llog -lc -lm -ldl
+        -L"$syslib" -landroid -llog -lc -lm -ldl \
+        --as-needed -lEGL -lGLESv3 --no-as-needed
     if readelf -d "$out/lib$LIB.so" | grep -q TEXTREL; then
         echo "ERROR: $abi: TEXTREL -- Android would refuse the library" >&2
         exit 1

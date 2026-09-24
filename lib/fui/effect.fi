@@ -78,6 +78,7 @@
 import std.rt
 import paint.canvas
 import fui.painter
+import fui.gpu
 import svg.matrix
 
 export {
@@ -361,6 +362,10 @@ fn lerp4(a: u32, b: u32, t: u64) -> u32 {
 
 fn frost_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     blur: i64, tint: u32) -> bool {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        return gpu.gpu_frost(gpu_g, x, y, w, h, blur, tint)
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let cw: i64 = canvas.canvas_width(cv) as i64
     let ch: i64 = canvas.canvas_height(cv) as i64
@@ -599,6 +604,11 @@ fn band_of(cv: *mut canvas.Canvas, x: f64, y: f64, w: f64, h: f64,
 // ground and a frost over the same ground give the same colour.
 fn veil_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     tint: u32) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        gpu.gpu_veil(gpu_g, x, y, w, h, tint)
+        return
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     var b: [i64; 4] = [0; 4]
     if !band_of(cv, x, y, w, h, &b[0]) {
@@ -652,6 +662,11 @@ fn veil_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
 // offset the eye counts the bands.
 fn glow_ground(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     top: u32, bottom: u32, spots: u64, n: usize) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        gpu.gpu_glow(gpu_g, x, y, w, h, top, bottom, spots, n)
+        return
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     var b: [i64; 4] = [0; 4]
     if !band_of(cv, x, y, w, h, &b[0]) {
@@ -1042,15 +1057,140 @@ struct Keep {
     w: usize,
     h: usize,
     key: u64,
+    gt: u64, // on a GPU-backed canvas: the *mut gpu.Target the picture is kept in
 }
 
 fn keep_new() -> Keep {
-    return Keep { mem: 0, bytes: 0, w: 0, h: 0, key: 0 }
+    return Keep { mem: 0, bytes: 0, w: 0, h: 0, key: 0, gt: 0 }
+}
+
+// ============================================ KEPT PICTURES ON THE GPU
+//
+// fUi tempo, stage 2: on a GPU-backed canvas a Keep holds a target of the
+// canvas's size (lib/fui/gpu.fi), taking is one copy on the GPU, putting
+// back one copy of the band, mixing one quad. `mem` stays 0 -- `keep_has`
+// looks at the key and the size, which are set the same way.
+fn keep_target(g: *mut gpu.Gpu, k: *mut Keep) -> *mut gpu.Target {
+    if (*k).gt == 0 {
+        (*k).gt = rt.heap_alloc(64)
+        if (*k).gt == 0 {
+            return 0 as u64 as *mut gpu.Target
+        }
+        *((*k).gt as *mut gpu.Target) = gpu.target_new()
+    }
+    return (*k).gt as *mut gpu.Target
+}
+
+fn keep_take_gpu(g: *mut gpu.Gpu, k: *mut Keep, key: u64) -> bool {
+    let m: *mut gpu.Target = gpu.gpu_main(g)
+    let t: *mut gpu.Target = keep_target(g, k)
+    if t as u64 == 0 || !gpu.gpu_target_make(g, t, (*m).w, (*m).h) {
+        return false
+    }
+    gpu.gpu_copy(g, m, 0, 0, (*m).w, (*m).h, t, 0, 0)
+    (*k).w = (*m).w as usize
+    (*k).h = (*m).h as usize
+    (*k).key = key
+    (*k).mem = 1 // "there is a picture" (keep_has); the octets are on the GPU
+    return true
+}
+
+// The band back, whole (t = 256) or mixed in with t / 256.
+fn keep_put_gpu(g: *mut gpu.Gpu, k: *mut Keep, z: *mut painter.Painter, x: f64,
+    y: f64, w: f64, h: f64, t: i64) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    if (*k).gt == 0 || !gpu.gpu_target_ok(g, (*k).gt as *mut gpu.Target) ||
+        (*k).w != canvas.canvas_width(cv) || (*k).h != canvas.canvas_height(cv) {
+        return
+    }
+    var b: [i64; 4] = [0; 4]
+    if !band_of(cv, x, y, w, h, &b[0]) {
+        return
+    }
+    let kt: *mut gpu.Target = (*k).gt as *mut gpu.Target
+    if t >= 256 {
+        gpu.gpu_copy(g, kt, b[0] as i32, b[1] as i32, (b[2] - b[0]) as i32,
+            (b[3] - b[1]) as i32, gpu.gpu_main(g), b[0] as i32, b[1] as i32)
+        return
+    }
+    gpu.gpu_draw_target(g, kt, b[0] as f64, b[1] as f64, (b[2] - b[0]) as f64,
+        (b[3] - b[1]) as f64, b[0] as f64, b[1] as f64, ((t * 255 + 128) / 256) as u32)
+}
+
+fn slide_gpu(g: *mut gpu.Gpu, under: *mut Keep, over: *mut Keep, z: *mut painter.Painter,
+    sl: i64, cx: i64, shade: u32) -> bool {
+    let m: *mut gpu.Target = gpu.gpu_main(g)
+    let w: i64 = (*m).w as i64
+    let h: i64 = (*m).h as i64
+    if (*under).gt == 0 || (*over).gt == 0 ||
+        !gpu.gpu_target_ok(g, (*under).gt as *mut gpu.Target) ||
+        !gpu.gpu_target_ok(g, (*over).gt as *mut gpu.Target) || (*under).w != w as usize ||
+        (*under).h != h as usize || (*over).w != w as usize || (*over).h != h as usize {
+        return false
+    }
+    var c: i64 = cx
+    if c < 0 { c = 0 }
+    if c > w { c = w }
+    var s: i64 = sl
+    if s < 0 { s = 0 }
+    if s > w - c { s = w - c }
+    if c > 0 {
+        gpu.gpu_copy(g, (*under).gt as *mut gpu.Target, s as i32, 0, c as i32, h as i32,
+            m, 0, 0)
+    }
+    if c < w {
+        gpu.gpu_copy(g, (*over).gt as *mut gpu.Target, 0, 0, (w - c) as i32, h as i32,
+            m, c as i32, 0)
+    }
+    if shade > 0 as u32 && c > 0 {
+        veil_rect(z, 0.0, 0.0, c as f64, h as f64, shade << 24)
+    }
+    return true
+}
+
+// Scroll by copy on the GPU: the block goes through the scratch target
+// (a framebuffer cannot be copied onto itself where the two overlap).
+fn shift_rows_gpu(g: *mut gpu.Gpu, x0: i64, x1: i64, y0: i64, y1: i64, d: i64) {
+    let m: *mut gpu.Target = gpu.gpu_main(g)
+    var a0: i64 = x0
+    var e: i64 = x1
+    var t: i64 = y0
+    var u: i64 = y1
+    if a0 < 0 { a0 = 0 }
+    if e > (*m).w as i64 { e = (*m).w as i64 }
+    if t < 0 { t = 0 }
+    if u > (*m).h as i64 { u = (*m).h as i64 }
+    if e <= a0 || u <= t || d == 0 {
+        return
+    }
+    // the rows that land inside the block: from [t, u - d) to [t + d, u)
+    // for d > 0, from [t - d, u) to [t, u + d) for d < 0
+    var s0: i64 = t
+    var s1: i64 = u - d
+    if d < 0 {
+        s0 = t - d
+        s1 = u
+    }
+    if s1 <= s0 {
+        return
+    }
+    let tmp: *mut gpu.Target = gpu.gpu_tmp(g)
+    if tmp as u64 == 0 {
+        return
+    }
+    gpu.gpu_copy(g, m, a0 as i32, s0 as i32, (e - a0) as i32, (s1 - s0) as i32, tmp,
+        a0 as i32, s0 as i32)
+    gpu.gpu_copy(g, tmp, a0 as i32, s0 as i32, (e - a0) as i32, (s1 - s0) as i32, m,
+        a0 as i32, (s0 + d) as i32)
 }
 
 // Does the Keep hold a picture for this key and this canvas?
 fn keep_has(k: *mut Keep, z: *mut painter.Painter, key: u64) -> bool {
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g as u64 != 0 && ((*k).gt == 0 || !gpu.gpu_target_ok(g, (*k).gt as *mut gpu.Target)) {
+        return false // on the GPU the picture lives in a target (a lost one holds nothing)
+    }
     return (*k).mem != 0 && (*k).key == key &&
         (*k).w == canvas.canvas_width(cv) && (*k).h == canvas.canvas_height(cv)
 }
@@ -1058,6 +1198,10 @@ fn keep_has(k: *mut Keep, z: *mut painter.Painter, key: u64) -> bool {
 // Take the whole canvas into the Keep under `key`. False when there is no
 // memory for it (the caller simply paints again next time).
 fn keep_take(k: *mut Keep, z: *mut painter.Painter, key: u64) -> bool {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        return keep_take_gpu(gpu_g, k, key)
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let w: usize = canvas.canvas_width(cv)
     let h: usize = canvas.canvas_height(cv)
@@ -1089,6 +1233,16 @@ fn keep_take(k: *mut Keep, z: *mut painter.Painter, key: u64) -> bool {
 // over a ground with light in it, without a flat veil.
 fn keep_mix(k: *mut Keep, z: *mut painter.Painter, x: f64, y: f64, w: f64,
     h: f64, a: f64) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        var t: i64 = (a * 256.0 + 0.5) as i64
+        if t <= 0 {
+            return
+        }
+        if t > 256 { t = 256 }
+        keep_put_gpu(gpu_g, k, z, x, y, w, h, t)
+        return
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     if (*k).mem == 0 || (*k).w != canvas.canvas_width(cv) ||
         (*k).h != canvas.canvas_height(cv) {
@@ -1125,6 +1279,10 @@ fn keep_mix(k: *mut Keep, z: *mut painter.Painter, x: f64, y: f64, w: f64,
 // and a veil per frame -- the panes themselves are painted once, at rest.
 fn slide_compose(under: *mut Keep, over: *mut Keep, z: *mut painter.Painter,
     sl: i64, cx: i64, shade: u32) -> bool {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        return slide_gpu(gpu_g, under, over, z, sl, cx, shade)
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let w: usize = canvas.canvas_width(cv)
     let h: usize = canvas.canvas_height(cv)
@@ -1189,6 +1347,18 @@ fn layer_clear(cv: *mut canvas.Canvas, y0: i64, y1: i64) {
 
 fn layer_over(z: *mut painter.Painter, src: *mut canvas.Canvas, y0: i64,
     y1: i64) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        let lw: i32 = canvas.canvas_width(src) as i32
+        let lh: i32 = canvas.canvas_height(src) as i32
+        var a0: i64 = y0
+        var b0: i64 = y1
+        if a0 < 0 { a0 = 0 }
+        if b0 > lh as i64 { b0 = lh as i64 }
+        gpu.gpu_draw_pixels(gpu_g, canvas.canvas_pixels(src) as u64, (lw * 4) as usize,
+            lw, lh, 0, a0 as i32, lw, b0 as i32)
+        return
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let w: i64 = canvas.canvas_width(cv) as i64
     let h: i64 = canvas.canvas_height(cv) as i64
@@ -1227,6 +1397,11 @@ fn layer_over(z: *mut painter.Painter, src: *mut canvas.Canvas, y0: i64,
 // canvas is one copy; a band is one copy per row.
 fn keep_put(k: *mut Keep, z: *mut painter.Painter, x: f64, y: f64, w: f64,
     h: f64) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        keep_put_gpu(gpu_g, k, z, x, y, w, h, 256)
+        return
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     if (*k).mem == 0 || (*k).w != canvas.canvas_width(cv) ||
         (*k).h != canvas.canvas_height(cv) {
@@ -1463,6 +1638,11 @@ fn rbox_cov(px: f64, py: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: f64) -> f64
 // for a flat one). Canvas pixels; colours straight ARGB, alpha 0 = opaque.
 fn rrect_fast(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     r0: f64, top: u32, bottom: u32) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        gpu.gpu_rrect_fast(gpu_g, x, y, w, h, r0, top, bottom)
+        return
+    }
     if w <= 0.0 || h <= 0.0 {
         return
     }
@@ -1581,6 +1761,11 @@ fn rbox_q(px: f64, py: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: f64) -> f64 {
 // card itself is drawn over it right after.
 fn rrect_shadow(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     r0: f64, lift: f64, blur: f64, col: u32) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        gpu.gpu_rrect_shadow(gpu_g, x, y, w, h, r0, lift, blur, col)
+        return
+    }
     if w <= 0.0 || h <= 0.0 || blur <= 0.0 {
         return
     }
@@ -1654,6 +1839,11 @@ fn rrect_shadow(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
 // a bar or a panel, in integers.
 fn ramp_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     col: u32, dir: u32) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        gpu.gpu_ramp(gpu_g, x, y, w, h, col, dir)
+        return
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     var b: [i64; 4] = [0; 4]
     if !band_of(cv, x, y, w, h, &b[0]) {
@@ -1742,6 +1932,11 @@ fn ramp_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
 // it was overwritten.
 fn shift_rows(z: *mut painter.Painter, x0: i64, x1: i64, y0: i64, y1: i64,
     d: i64) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        shift_rows_gpu(gpu_g, x0, x1, y0, y1, d)
+        return
+    }
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let cw: i64 = canvas.canvas_width(cv) as i64
     let ch: i64 = canvas.canvas_height(cv) as i64
@@ -1781,6 +1976,13 @@ fn shift_rows(z: *mut painter.Painter, x0: i64, x1: i64, y0: i64, y1: i64,
 // verwischt und zurueckgeschrieben.
 fn blur_rect(cv: *mut canvas.Canvas, x0: i64, y0: i64, w: i64, h: i64,
     r: i64) -> bool {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if gpu_g as u64 != 0 && w > 0 && h > 0 {
+        gpu.gpu_sw_begin(gpu_g, cv, x0 as i32, y0 as i32, (x0 + w) as i32, (y0 + h) as i32)
+        let ok: bool = blur_rect(cv, x0, y0, w, h, r)
+        gpu.gpu_sw_end(gpu_g, cv, x0 as i32, y0 as i32, (x0 + w) as i32, (y0 + h) as i32)
+        return ok
+    }
     if w <= 0 || h <= 0 || r <= 0 {
         return true
     }
@@ -1884,6 +2086,25 @@ fn drop_shadow_round(z: *mut painter.Painter, x: f64, y: f64, w: f64,
 fn drop_shadow_spread(z: *mut painter.Painter, x: f64, y: f64, w: f64,
     h: f64, radius: f64, dx: f64, dy: f64, blur: i64, spread: f64,
     col: u32) -> bool {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        var m: f64 = spread
+        if m < 0.0 { m = 0.0 }
+        m = m + (blur as f64) * 3.0 + 4.0
+        var adx: f64 = dx
+        if adx < 0.0 { adx = 0.0 - adx }
+        var ady: f64 = dy
+        if ady < 0.0 { ady = 0.0 - ady }
+        let cv0: *mut canvas.Canvas = painter.painter_canvas(z)
+        var b: [i64; 4] = [0; 4]
+        if !band_of(cv0, x - m - adx, y - m - ady, w + 2.0 * (m + adx), h + 2.0 * (m + ady), &b[0]) {
+            return true
+        }
+        gpu.gpu_sw_begin(gpu_g, cv0, b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32)
+        let ok: bool = drop_shadow_spread(z, x, y, w, h, radius, dx, dy, blur, spread, col)
+        gpu.gpu_sw_end(gpu_g, cv0, b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32)
+        return ok
+    }
     let fw: f64 = w + 2.0 * spread
     let fh: f64 = h + 2.0 * spread
     if fw <= 0.0 || fh <= 0.0 {
@@ -2004,6 +2225,18 @@ fn backdrop_blur(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
 // Datei -- kein zweiter Saettigungsregler.
 fn glas_flaeche(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     radius: f64, blur: i64, tint: u32, sat: f64) -> bool {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        let cv0: *mut canvas.Canvas = painter.painter_canvas(z)
+        var b: [i64; 4] = [0; 4]
+        if !band_of(cv0, x - 2.0, y - 2.0, w + 4.0, h + 4.0, &b[0]) {
+            return true
+        }
+        gpu.gpu_sw_begin(gpu_g, cv0, b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32)
+        let ok: bool = glas_flaeche(z, x, y, w, h, radius, blur, tint, sat)
+        gpu.gpu_sw_end(gpu_g, cv0, b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32)
+        return ok
+    }
     let iw: i64 = w as i64
     let ih: i64 = h as i64
     if iw <= 0 || ih <= 0 {
@@ -2143,6 +2376,18 @@ fn glas_flaeche(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
 // ohne sie wird jede Scheibe grau, weil Verwischen Farben mittelt.
 fn glass_round(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     radius: f64, dark: bool) -> bool {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if gpu_g as u64 != 0 {
+        let cv0: *mut canvas.Canvas = painter.painter_canvas(z)
+        var b: [i64; 4] = [0; 4]
+        if !band_of(cv0, x - 2.0, y - 2.0, w + 4.0, h + 4.0, &b[0]) {
+            return true
+        }
+        gpu.gpu_sw_begin(gpu_g, cv0, b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32)
+        let ok: bool = glass_round(z, x, y, w, h, radius, dark)
+        gpu.gpu_sw_end(gpu_g, cv0, b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32)
+        return ok
+    }
     if w <= 0.0 || h <= 0.0 {
         return true
     }
@@ -2300,6 +2545,13 @@ fn cm_apply_pixel(c: *mut ColorMatrix, px: u32) -> u32 {
 // wieder hinein.
 fn cm_apply_rect(cv: *mut canvas.Canvas, c: *mut ColorMatrix, x0: i64,
     y0: i64, w: i64, h: i64) {
+    let gpu_g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if gpu_g as u64 != 0 && w > 0 && h > 0 {
+        gpu.gpu_sw_begin(gpu_g, cv, x0 as i32, y0 as i32, (x0 + w) as i32, (y0 + h) as i32)
+        cm_apply_rect(cv, c, x0, y0, w, h)
+        gpu.gpu_sw_end(gpu_g, cv, x0 as i32, y0 as i32, (x0 + w) as i32, (y0 + h) as i32)
+        return
+    }
     let cw: i64 = canvas.canvas_width(cv) as i64
     let ch: i64 = canvas.canvas_height(cv) as i64
     let p: u64 = canvas.canvas_pixels(cv) as u64

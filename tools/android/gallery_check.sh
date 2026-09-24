@@ -37,16 +37,28 @@ $ADB shell settings put system user_rotation 1
 $ADB shell am force-stop $PKG
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 3
 printf -- '--protokoll\n--dpi=132\n' > "$OUT/args.txt"
+# GALLERY_ARGS: more arguments, one per line (e.g. --gpu=0: in memory)
+[ -n "${GALLERY_ARGS:-}" ] && printf -- '%s\n' $GALLERY_ARGS >> "$OUT/args.txt"
 $ADB push "$OUT/args.txt" $D/args.txt >/dev/null
 $ADB shell am force-stop $PKG
 $ADB logcat -c
-$ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 5
+$ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 3
+# The first picture is waited for, not assumed: on the GPU (fUi tempo,
+# stage 2b) an emulator without a graphics card draws through SwiftShader,
+# and its first picture compiles the shaders -- seconds, not a frame.
+for _ in $(seq 1 40); do [ "$(field 1)" -ge 1 ] 2>/dev/null && break; sleep 0.5; done
 check "process runs" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 check "first frame" "$([ "$(field 1)" -ge 1 ] 2>/dev/null && echo yes)" yes
 check "scale 132 dpi -> 1375" "$(field 7)" 1375
+GPU=$(log | grep -c '^gpu 1 ')
+echo "  drawn on the GPU: $([ "$GPU" -ge 1 ] && echo yes || echo no)"
 
-# Calibration: one tap on empty space, the program reports where it landed.
-$ADB shell input tap 1500 900; sleep 2
+# Calibration: one tap on empty space, the program reports where it landed
+# (waited for as well: the event is logged when the program took it).
+n3=$(log | grep -c '^ereignis 3 ')
+$ADB shell input tap 1500 900
+for _ in $(seq 1 30); do [ "$(log | grep -c '^ereignis 3 ')" -gt "$n3" ] && break; sleep 0.5; done
+sleep 1
 read -r CX CY < <(log | grep '^ereignis 3 ' | tail -1 | awk '{print $4, $5}')
 OX=$((1500-CX)); OY=$((900-CY))
 echo "  screen = content + ($OX, $OY)"
@@ -77,6 +89,9 @@ check "Back ends main" "$(log | tail -1)" geschlossen
 check "process gone after Back" "$($ADB shell pidof $PKG)" ""
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 echo "paint ms (fUi frame, median of $(log | grep -c '^zeit')): $(log | grep '^zeit' | awk '{print $2}' | sort -n | awk '{a[NR]=$1} END{print a[int(NR/2)+1]}')"
+# the whole frame: paint + hand over + show (on the GPU: + eglSwapBuffers,
+# which waits for the GPU -- on an emulator that GPU is SwiftShader)
+echo "frame ms (paint + hand over + show, median): $(log | grep '^zeit' | awk '{print $2+$3+$4}' | sort -n | awk '{a[NR]=$1} END{print a[int(NR/2)+1]}')"
 $ADB shell rm -f $D/args.txt
 echo "ANDROID GALLERY: $PASS passed, $FAIL failed. Pictures in $OUT"
 [ $FAIL -eq 0 ]
