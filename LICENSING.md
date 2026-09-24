@@ -31,6 +31,12 @@ any more.
   Since MPL-2.0 is GPL-compatible, Certus can import the layer from Firn
   instead of keeping a copy of its own.
 
+* 24 September 2026: `lib/fui/lucide.fi` carries path data of the Lucide
+  icon set (ISC; the icons Lucide took from Feather are MIT). It is the one
+  file under a licence of its own; its header says so, the texts stand in
+  `LICENSES/Lucide-ISC.txt`, and `THIRD_PARTY.md` lists it. Both licences
+  are permissive and ask only for the notice to travel with the data.
+
 ## Why MPL-2.0
 
 A language is only useful if programs written in it may be closed. The MPL

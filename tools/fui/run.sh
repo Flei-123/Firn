@@ -137,6 +137,15 @@ build icon
 "$W/icon"
 
 echo
+echo "== 7b. THE LUCIDE ICONS AND THE GRADIENT AT THE PIXEL =="
+# lib/fui/icons.fi draws lib/fui/lucide.fi (ISC, LICENSES/Lucide-ISC.txt)
+# as stroked paths: every icon puts ink down, the stroke is 2 units, the
+# colour arrives per channel, the outline is rastered at the drawn size,
+# the canvas clip holds, and painter.round_rect_grad ramps as asked.
+build icons
+"$W/icons"
+
+echo
 echo "== 8. WAVE 1 AT THE PIXEL =="
 build wave1
 "$W/wave1"
@@ -879,6 +888,8 @@ if [ "$1" = "--images" ]; then
     # Icon, Beschriftung mit Bild und Icon-Toolbar, dasselbe SVG je Groesse
     # NEU gerastert (12..64) samt currentColor=TOK_ACCENT daneben, Bild mit
     # Transparenz ueber vier Gruenden, Reiter/Menue/Kachel.
+    # THE LUCIDE SET: every icon at 16, 24 and 32 (tools/fui/icons_main.fi)
+    "$W/icons" "$Z/fui-icons.png" > /dev/null
     build artshow
     kette artshow 900
     "$W/artshow" "$Z/fui-bild-svg-hell.png" light
