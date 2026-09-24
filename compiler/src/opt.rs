@@ -196,6 +196,16 @@ pub const PASSES: &[PassInfo] = &[
         debug_preserving: false,
         what: "inline calls (size heuristic) — makes the call stack unreadable",
     },
+    // Round EINBETTEN: the explicit request, on EVERY level except `dev`.
+    // It is debug preserving in the sense that it touches ONLY what the
+    // programmer marked with `#[inline]` -- whoever sets the mark knows
+    // that the frame disappears.
+    PassInfo {
+        name: "inline-requested",
+        scope: Scope::Module,
+        debug_preserving: true,
+        what: "#[inline]: only the explicitly requested inlinings (round EINBETTEN)",
+    },
 ];
 
 /// What shall be executed during a run.
@@ -344,6 +354,20 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     // works on bodies that are already simplified.
     for f in m.funcs.iter_mut() {
         optimize_func(f, &mut st, cfg, &mut clk);
+    }
+    // Round EINBETTEN -- the explicit will first. It holds on every level;
+    // the size rule below only on `release-*`. If both run, the second pass
+    // finds the requested sites already done.
+    if cfg.runs("inline-requested") && !cfg.runs("inline") {
+        let t = std::time::Instant::now();
+        st.inlined += crate::inline::inline_module_requested_only(m);
+        clk.add("inline-requested", t);
+        for f in m.funcs.iter() {
+            phi_check(f, "inline-requested");
+        }
+        for f in m.funcs.iter_mut() {
+            optimize_func(f, &mut st, cfg, &mut clk);
+        }
     }
     if cfg.runs("inline") {
         let t = std::time::Instant::now();
@@ -617,6 +641,8 @@ fn unk(o: UnOp) -> u8 {
     match o {
         UnOp::Neg => 1,
         UnOp::Not => 2,
+        UnOp::Sqrt => 3,
+        UnOp::Bits => 4,
     }
 }
 
@@ -1190,6 +1216,13 @@ fn fold_un(ty: FTy, op: UnOp, a: i128) -> i128 {
     let a = ty.truncate(a);
     match op {
         UnOp::Neg => ty.truncate(-a),
+        // Only defined on floats, and float operations are never folded
+        // (`op_has_float`); an integer sqrt cannot reach this point.
+        UnOp::Sqrt => a,
+        // The pattern stays what it is; only its type changes (fbits.rs).
+        // Reached for `__f64_from_bits(<const>)` -- a float constant is
+        // carried as its bit pattern anyway.
+        UnOp::Bits => a,
         UnOp::Not => {
             if ty == FTy::Bool {
                 if a & 1 != 0 {

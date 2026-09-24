@@ -575,7 +575,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // text is identical to the x86-64 one -- `.byte`/`.zero` in
     // `.bss`/`.data`/`.rodata` say the same thing on both machines; only
     // the two instructions that ADDRESS it differ (`Op::GlobalAddr`).
-    if crate::statics::any() {
+    if crate::statics::any_data() {
         e.raw(&crate::statics::data_asm());
     }
     if auxv {
@@ -867,24 +867,39 @@ fn emit_inst(
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
+            // Round GAPS (fbits.rs): a copy of the pattern, like on x86-64.
+            if matches!(op, UnOp::Bits) {
+                load_full(e, fr, A, *a);
+                if ty.bits() <= 32 {
+                    e.line(&format!("mov {}, {}", w(A), w(A)));
+                }
+                store_dst(e, fr, d, A);
+                return Ok(());
+            }
             if ty.is_float() {
-                if !matches!(op, UnOp::Neg) {
+                if matches!(op, UnOp::Not) {
                     return Err(format!("internal error: '!' is not defined for {}", ty.name()));
                 }
                 let single = ty == FTy::F32;
                 load_fp(e, fr, "d0", *a, single);
+                // Round GAPS: `fsqrt` next to `fneg` (fsqrt.rs).
+                let m = if matches!(op, UnOp::Sqrt) { "fsqrt" } else { "fneg" };
                 if single {
-                    e.line("fneg s0, s0");
+                    e.line(&format!("{} s0, s0", m));
                 } else {
-                    e.line("fneg d0, d0");
+                    e.line(&format!("{} d0, d0", m));
                 }
                 store_fp(e, fr, d, "d0", single);
                 return Ok(());
+            }
+            if matches!(op, UnOp::Sqrt) {
+                return Err(format!("internal error: sqrt is not defined for {}", ty.name()));
             }
             let bits = if ty.bits() > 32 { 64 } else { 32 };
             load_full(e, fr, A, *a);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}, {}", rw(A, bits), rw(A, bits))),
+                UnOp::Sqrt | UnOp::Bits => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line(&format!("eor {}, {}, #1", w(A), w(A)));

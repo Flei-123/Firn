@@ -378,7 +378,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
     // (round 89, SPEC 14.1.statics) — only when the program declares a
     // `static` at all.
-    if crate::statics::any() {
+    if crate::statics::any_data() {
         e.raw(&crate::statics::data_asm());
     }
     // ROUND 64: `.debug_abbrev` and `.debug_info` of our own -- names, types
@@ -916,10 +916,31 @@ fn emit_inst(
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
+            // Round GAPS (fbits.rs): every value -- float or not -- sits in
+            // its slot as its bit pattern, so the reinterpretation is a copy.
+            // The 32-bit forms clear the upper half (the slot does not
+            // guarantee it).
+            if matches!(op, UnOp::Bits) {
+                load_full(e, fr, "rax", *a);
+                if ty.bits() <= 32 {
+                    e.line("mov eax, eax");
+                }
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
             // FLOATING POINT: the sign is ONE bit. `neg` would treat the whole
             // bit pattern as two's complement — wrong. That is why only bit 63
             // is flipped.
             if ty.is_float() {
+                // Round GAPS: the square root is one SSE instruction
+                // (fsqrt.rs), computed in xmm0 like `emit_bin` does.
+                if matches!(op, UnOp::Sqrt) {
+                    let single = ty == FTy::F32;
+                    load_xmm(e, fr, "xmm0", *a, single);
+                    e.line(if single { "sqrtss xmm0, xmm0" } else { "sqrtsd xmm0, xmm0" });
+                    store_xmm(e, fr, d, "xmm0", single);
+                    return Ok(());
+                }
                 if !matches!(op, UnOp::Neg) {
                     return Err(format!(
                         "internal error: '!' is not defined for {}",
@@ -940,10 +961,14 @@ fn emit_inst(
                 store_dst(e, fr, d, "rax");
                 return Ok(());
             }
+            if matches!(op, UnOp::Sqrt) {
+                return Err(format!("internal error: sqrt is not defined for {}", ty.name()));
+            }
             let bits = if ty.bits() > 32 { 64 } else { 32 };
             load_full(e, fr, "rax", *a);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", reg("rax", bits))),
+                UnOp::Sqrt | UnOp::Bits => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");

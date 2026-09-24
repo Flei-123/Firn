@@ -328,3 +328,10 @@ ink on Malta afterwards, **0 before**.
   fn say(b: bool) -> str { if b { return "found" }  return "MISSED" }
   fn main() -> i32 { io.fmt_print_line(f"{say(true)} {say(false)}")  return 0 }
   ```
+
+  **Fixed in round GAPS (branch `runde-luecken`, docs/LUECKEN.md A10).**
+  The interpolation was only where it showed: the octets of a `str`
+  literal were written into the frame of the function that spelled it, so
+  `say` returned the address of a dead frame on EVERY level -- the
+  optimised ones were lucky. They live in `.rodata` now;
+  `tests/1659_str_literal_outlives_frame.fi`.

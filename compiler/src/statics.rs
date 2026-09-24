@@ -74,6 +74,10 @@ pub struct StaticInfo {
     /// The finished initial value, little endian, exactly `size_of(ty)` long.
     pub bytes: Vec<u8>,
     pub align: u64,
+    /// Round GAPS: the octets of a `str` literal (`intern_text`), not a
+    /// declared `static`. They go to `.rodata` like an immutable static but
+    /// do not change how the program is linked (see `any`).
+    pub text: bool,
 }
 
 thread_local! {
@@ -100,8 +104,47 @@ pub fn register(name: &str, mutable: bool, bytes: Vec<u8>, align: u64) {
             mutable,
             bytes,
             align: align.max(1),
+            text: false,
         });
     });
+}
+
+/// Round GAPS: the place of a `str` literal's octets -- one `.rodata`
+/// entry per distinct octet sequence, shared by every literal that spells
+/// it. Returns the name for `Op::GlobalAddr`.
+///
+/// Until this round the octets were written into the frame of the function
+/// that spelled the literal (round 70, "the honest price"), which made
+/// `fn f() -> str { return "x" }` hand out the address of a dead frame: the
+/// caller read whatever the next call had put there (`f"{f()}"` printed
+/// zeros under `--no-opt`, docs/LUECKEN.md B18). A literal is a constant;
+/// its octets now live as long as the program.
+///
+/// The name carries a `#`, which no Firn identifier can, so it can never
+/// meet a declared `static` (`label_of` turns it into `.`).
+pub fn intern_text(bytes: &[u8]) -> String {
+    TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(s) = t.iter().find(|s| s.text && s.bytes == bytes) {
+            return s.name.clone();
+        }
+        let n = t.iter().filter(|s| s.text).count();
+        let name = format!("text#{}", n);
+        t.push(StaticInfo {
+            name: name.clone(),
+            mutable: false,
+            bytes: bytes.to_vec(),
+            align: 1,
+            text: true,
+        });
+        name
+    })
+}
+
+/// Is there anything to write out at all (declared statics OR literal
+/// octets)? The code generators ask this; the linker asks `any`.
+pub fn any_data() -> bool {
+    TABLE.with(|t| !t.borrow().is_empty())
 }
 
 /// The assembler label of a `static`.
@@ -112,13 +155,13 @@ pub fn label_of(name: &str) -> String {
 /// Does this program have a `static` at all? Only then is a data section
 /// written; a program without one carries not one byte of this.
 pub fn any() -> bool {
-    TABLE.with(|t| !t.borrow().is_empty())
+    TABLE.with(|t| t.borrow().iter().any(|s| !s.text))
 }
 
 /// Is `name` a registered `static`? (`escape.rs` asks: the address of a
 /// global may leave a frame, unlike the address of a local.)
 pub fn is_static(name: &str) -> bool {
-    TABLE.with(|t| t.borrow().iter().any(|s| s.name == name))
+    TABLE.with(|t| t.borrow().iter().any(|s| s.name == name && !s.text))
 }
 
 fn p2align(a: u64) -> u32 {

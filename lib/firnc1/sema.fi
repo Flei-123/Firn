@@ -52,7 +52,9 @@ export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     sema_is_closure_name,
     // ROUND 89 (statics.rs, SPEC 14.1.statics) -- the global variables.
     sema_static_index, sema_static_count, sema_static_name, sema_static_mut,
-    sema_static_align, sema_static_bytes, sema_static_size }
+    sema_static_align, sema_static_bytes, sema_static_size,
+    // Round GAPS (statics.rs::intern_text) -- the octets of a `str` literal.
+    sema_text_static }
 
 const NONE: u32 = 4294967295
 
@@ -596,6 +598,76 @@ fn sema_static_bytes(s: *mut Sema, i: usize) -> u64 {
     return rt.buf_ptr(&(*s).g_data) + vec_at[u32](&(*s).g_off, i) as u64
 }
 
+// Round GAPS (statics.rs::intern_text): the place of a `str` literal's
+// octets -- one `.rodata` entry per distinct octet sequence, kept in the
+// table of the global variables with type NONE (no declared `static` has
+// that). The name `text#<k>` carries a `#`, which no identifier can, so it
+// never meets a declared `static`; the label turns it into `.`.
+// Returns the interned name for O_GLOBAL.
+fn sema_text_static(s: *mut Sema, p: u64, n: usize) -> u32 {
+    var k: u32 = 0
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).g_name) {
+        if vec_at[u32](&(*s).g_ty, i) == NONE {
+            if vec_at[u32](&(*s).g_len, i) as usize == n {
+                let q: u64 = rt.buf_ptr(&(*s).g_data) + vec_at[u32](&(*s).g_off, i) as u64
+                var same: bool = true
+                var j: usize = 0
+                while j < n {
+                    if rt.ld8(q, j) != rt.ld8(p, j) {
+                        same = false
+                        break
+                    }
+                    j = j + 1
+                }
+                if same {
+                    return vec_at[u32](&(*s).g_name, i)
+                }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    // "text#" + decimal k
+    var nm: [u8; 16] = [0 as u8; 16]
+    nm[0] = 116 as u8
+    nm[1] = 101 as u8
+    nm[2] = 120 as u8
+    nm[3] = 116 as u8
+    nm[4] = 35 as u8
+    var dg: [u8; 10] = [0 as u8; 10]
+    var nd: usize = 0
+    var v: u32 = k
+    while true {
+        dg[nd] = (48 + v % 10) as u8
+        nd = nd + 1
+        v = v / 10
+        if v == 0 {
+            break
+        }
+    }
+    var ln: usize = 5
+    while nd > 0 {
+        nd = nd - 1
+        nm[ln] = dg[nd]
+        ln = ln + 1
+    }
+    let name: u32 = intern.intern_number(names(s), (&nm[0]) as u64, ln) as u32
+    let at: u32 = rt.buf_len(&(*s).g_data) as u32
+    var j2: usize = 0
+    while j2 < n {
+        rt.buf_push(&(*s).g_data, rt.ld8(p, j2))
+        j2 = j2 + 1
+    }
+    vec_push[u32](&(*s).g_name, name)
+    vec_push[u32](&(*s).g_ty, NONE)
+    vec_push[u32](&(*s).g_mut, 0)
+    vec_push[u32](&(*s).g_off, at)
+    vec_push[u32](&(*s).g_len, n as u32)
+    vec_push[u32](&(*s).g_align, 1)
+    return name
+}
+
 // ROUND 58 (fnval.rs): the TYPE of the function `fi` as a value --
 // `fn(P1, P2) -> R` out of its declared signature.
 fn fn_value_ty(s: *mut Sema, fi: u32) -> u32 {
@@ -747,6 +819,16 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         }
         if op == 8 || op == 9 {
             return probe_t(s, ast.e_b(b, e), d + 1)
+        }
+        // Round GAPS (ptrarith.rs): `p +/- n` is the pointer, `p - q` i64.
+        if op == 0 || op == 1 {
+            let plp: u32 = probe_t(s, ast.e_b(b, e), d + 1)
+            if arith_ptr(s, plp) {
+                if op == 1 && arith_ptr(s, probe_t(s, ast.e_c(b, e), d + 1)) {
+                    return (*s).t_i64
+                }
+                return plp
+            }
         }
         // ROUND 71: the same rule as in `binary` -- with two floating point
         // operands of different width the wider one is what comes out.
@@ -1311,6 +1393,58 @@ fn const_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
     return false
 }
 
+// Round GAPS (sema.rs `const_order`): the names a constant's value uses.
+fn const_names(b: *mut ast.Tree, e: u32, out: *mut Vec[u32], d: u32) {
+    if d > 64 {
+        return
+    }
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_ID {
+        vec_push[u32](out, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_UN {
+        const_names(b, ast.e_b(b, e), out, d + 1)
+        return
+    }
+    if a == ast.E_BIN {
+        const_names(b, ast.e_b(b, e), out, d + 1)
+        const_names(b, ast.e_c(b, e), out, d + 1)
+        return
+    }
+    if a == ast.E_AS {
+        const_names(b, ast.e_a(b, e), out, d + 1)
+    }
+}
+
+// Depth first in source order: the constants a constant names are placed
+// in front of it. State 1 = on the path (a cycle, left to the evaluator),
+// 2 = placed.
+fn const_visit(b: *mut ast.Tree, i: u32, state: *mut Vec[u8], order: *mut Vec[u32]) {
+    if vec_at[u8](state, i as usize) != 0 as u8 {
+        return
+    }
+    vec_set[u8](state, i as usize, 1 as u8)
+    var ns: Vec[u32] = vec_new[u32]()
+    const_names(b, ast.const_value(b, i as usize), &ns, 0)
+    var k: usize = 0
+    while k < vec_len[u32](&ns) {
+        let n: u32 = vec_at[u32](&ns, k)
+        var j: usize = 0
+        while j < ast.const_count(b) {
+            if ast.const_name(b, j) == n && j != i as usize {
+                const_visit(b, j as u32, state, order)
+                break
+            }
+            j = j + 1
+        }
+        k = k + 1
+    }
+    vec_free[u32](&ns)
+    vec_set[u8](state, i as usize, 2 as u8)
+    vec_push[u32](order, i)
+}
+
 fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.e_kind(b, e)
@@ -1695,6 +1829,51 @@ fn unary(s: *mut Sema, e: u32, note: u32) -> u32 {
     return (*s).t_error
 }
 
+// Round GAPS (ptrarith.rs): a pointer the operators move -- every `*T`,
+// not a `Gc[T]` (one object the collector owns, no neighbour).
+fn arith_ptr(s: *mut Sema, t: u32) -> bool {
+    if t == NONE || !types.is_ptr(table(s), t) {
+        return false
+    }
+    if has_gc(s) && gc.gc_is_gc_ptr(gcp(s), table(s), t) {
+        return false
+    }
+    return true
+}
+
+// `p + n`, `p - n` (-> the pointer) and `p - q` (-> i64, in elements).
+fn ptr_binary(s: *mut Sema, op: u32, l: u32, r: u32) -> u32 {
+    let lt: u32 = expr(s, l, NONE)
+    if is_error(s, lt) {
+        infer(s, r)
+        return (*s).t_error
+    }
+    if op == 1 && arith_ptr(s, probe(s, r)) {
+        let rt: u32 = expr(s, r, NONE)
+        if is_error(s, rt) {
+            return (*s).t_error
+        }
+        if !types.is_ptr(table(s), rt) || !types.compatible(table(s), lt, rt) {
+            complain(s)
+            return (*s).t_error
+        }
+        if types.size_of(table(s), types.ty_a(table(s), lt)) == 0 {
+            complain(s)
+            return (*s).t_error
+        }
+        return (*s).t_i64
+    }
+    let rt2: u32 = expr(s, r, (*s).t_usize)
+    if is_error(s, rt2) {
+        return (*s).t_error
+    }
+    if !is_int(s, rt2) || types.size_of(table(s), types.ty_a(table(s), lt)) == 0 {
+        complain(s)
+        return (*s).t_error
+    }
+    return lt
+}
+
 fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
     let b: *mut ast.Tree = tree(s)
     let op: u32 = ast.e_a(b, e)
@@ -1806,6 +1985,10 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
         return binop_type(s, op, lt, rt)
     }
 
+    // HOOK ptrarith (round GAPS): `p + n`, `p - n`, `p - q`.
+    if (op == 0 || op == 1) && arith_ptr(s, probe(s, l)) {
+        return ptr_binary(s, op, l, r)
+    }
     // arithmetic and bit operations: the already typed operand takes
     // PRECEDENCE over the context type.
     // ROUND 71: with two floating point operands the WIDER one wins, and the
@@ -2694,6 +2877,108 @@ fn call(s: *mut Sema, e: u32) -> u32 {
         }
         return u64t3
     }
+    // Round GAPS (fnaddr.rs): `__code_of(f)` -- the machine code address of
+    // a function value (word 0 of its record).
+    var cow: [u8; 9] = "__code_of"
+    if intern.intern_equal(names(s), name, (&cow[0]) as u64, 9) && fn_search(s, name) == NONE {
+        if cnt != 1 {
+            var k5: u32 = 0
+            while k5 < cnt {
+                infer(s, ast.child_at(b, off + k5))
+                k5 = k5 + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        let cf: u32 = expr(s, ast.child_at(b, off), NONE)
+        if is_error(s, cf) {
+            return (*s).t_error
+        }
+        if types.ty_kind(table(s), cf) != types.K_FN {
+            complain(s)
+            return (*s).t_error
+        }
+        return types.new_ty(table(s), types.K_U64, 0, 0)
+    }
+    // Round GAPS (fbits.rs): `__bits(x)` f64 -> u64 / f32 -> u32, and the
+    // way back `__f64_from_bits(u: u64)`, `__f32_from_bits(u: u32)`.
+    var bw1: [u8; 6] = "__bits"
+    var bw2: [u8; 15] = "__f64_from_bits"
+    var bw3: [u8; 15] = "__f32_from_bits"
+    var bform: u32 = 0
+    if intern.intern_equal(names(s), name, (&bw1[0]) as u64, 6) && fn_search(s, name) == NONE {
+        bform = 1
+    } else if intern.intern_equal(names(s), name, (&bw2[0]) as u64, 15) && fn_search(s, name) == NONE {
+        bform = 2
+    } else if intern.intern_equal(names(s), name, (&bw3[0]) as u64, 15) && fn_search(s, name) == NONE {
+        bform = 3
+    }
+    if bform != 0 {
+        if cnt != 1 {
+            var k4: u32 = 0
+            while k4 < cnt {
+                infer(s, ast.child_at(b, off + k4))
+                k4 = k4 + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        if bform == 1 {
+            let bx: u32 = expr(s, ast.child_at(b, off), NONE)
+            if is_error(s, bx) {
+                return (*s).t_error
+            }
+            let bk: u32 = types.ty_kind(table(s), bx)
+            if bk == types.K_F64 {
+                return types.new_ty(table(s), types.K_U64, 0, 0)
+            }
+            if bk == types.K_F32 {
+                return types.new_ty(table(s), types.K_U32, 0, 0)
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        var wk: u32 = types.K_U64
+        var rk: u32 = types.K_F64
+        if bform == 3 {
+            wk = types.K_U32
+            rk = types.K_F32
+        }
+        let wt: u32 = types.new_ty(table(s), wk, 0, 0)
+        let ux: u32 = expr(s, ast.child_at(b, off), wt)
+        if is_error(s, ux) {
+            return (*s).t_error
+        }
+        if types.ty_kind(table(s), ux) != wk {
+            complain(s)
+            return (*s).t_error
+        }
+        return types.new_ty(table(s), rk, 0, 0)
+    }
+    // Round GAPS (fsqrt.rs): `__sqrt(x)` on f64 or f32, same type back.
+    // One machine instruction. A user function of that name wins.
+    var sqw: [u8; 6] = "__sqrt"
+    if intern.intern_equal(names(s), name, (&sqw[0]) as u64, 6) && fn_search(s, name) == NONE {
+        if cnt != 1 {
+            var k3: u32 = 0
+            while k3 < cnt {
+                infer(s, ast.child_at(b, off + k3))
+                k3 = k3 + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
+        let tx: u32 = expr(s, ast.child_at(b, off), NONE)
+        if is_error(s, tx) {
+            return (*s).t_error
+        }
+        let kx: u32 = types.ty_kind(table(s), tx)
+        if kx != types.K_F64 && kx != types.K_F32 {
+            complain(s)
+            return (*s).t_error
+        }
+        return tx
+    }
     // `__atomic_add(p, delta)` (atomic.rs, ROUND 47): atomic
     // read-add-write, the result is the OLD value. Basis of the
     // reference count of `Arc[T]` (SPEC 3.4). A user function wins.
@@ -3106,15 +3391,40 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
             }
         }
         var ih: u32 = NONE
-        if is_int(s, dst) {
+        let wrapping: bool = ast.e_c(b, e) == 1
+        if wrapping && is_int(s, dst) && probe(s, ast.e_a(b, e)) == NONE {
+            // Round GAPS (wrapcast.rs): an untyped literal under `as%` gets
+            // the widest type, not the target (it need not fit).
+            if ast.e_kind(b, ast.e_a(b, e)) == ast.E_UN && ast.e_a(b, ast.e_a(b, e)) == 0 {
+                ih = (*s).t_i64
+            } else {
+                ih = types.new_ty(table(s), types.K_U64, 0, 0)
+            }
+        } else if is_int(s, dst) {
             ih = dst
         } else if is_bool(s, dst) {
             ih = (*s).t_i64
         } else if types.is_ptr(table(s), dst) {
             ih = (*s).t_usize
+        } else if types.ty_kind(table(s), dst) == types.K_FN {
+            // Round GAPS (fnaddr.rs): `0 as fn(..)`, the null function.
+            ih = types.new_ty(table(s), types.K_U64, 0, 0)
         }
         let src: u32 = expr(s, ast.e_a(b, e), ih)
         if is_error(s, src) || is_error(s, dst) {
+            return dst
+        }
+        // Round GAPS (wrapcast.rs): `as%` between integer types only.
+        if wrapping && (!is_int(s, src) || !is_int(s, dst)) {
+            complain(s)
+            return (*s).t_error
+        }
+        // Round GAPS (fnaddr.rs): function value <-> u64/usize, the record
+        // address both ways.
+        let sk: u32 = types.ty_kind(table(s), src)
+        let dk: u32 = types.ty_kind(table(s), dst)
+        if (sk == types.K_FN && (dk == types.K_U64 || dk == types.K_USIZE))
+        || (dk == types.K_FN && (sk == types.K_U64 || sk == types.K_USIZE)) {
             return dst
         }
         if !convertible(s, src) || !convertible(s, dst) {
@@ -3306,7 +3616,25 @@ fn pattern_check(s: *mut Sema, pat: u32, ty: u32, sj_kind: u32, sj_ei: u32,
         return
     }
     if a == pattern.MU_BIND {
-        var_create(s, pattern.pat_mu_a(m, pat), ty)
+        // Round GAPS: a name that names a `const` is that constant
+        // (sema_match.rs `resolve_const_patterns`, Rust's rule).
+        let bname: u32 = pattern.pat_mu_a(m, pat)
+        let kty: u32 = const_search(s, bname)
+        if kty != NONE {
+            let kv: u64 = const_value(s, bname)
+            if is_bool(s, kty) {
+                var bv: u32 = 0
+                if kv != 0 {
+                    bv = 1
+                }
+                pattern.pat_mu_retag(m, pat, pattern.MU_BOOL, bv, 0)
+            } else {
+                pattern.pat_mu_retag(m, pat, pattern.MU_INT, 0, kv as i64)
+            }
+            pattern_check(s, pat, ty, sj_kind, sj_ei, top)
+            return
+        }
+        var_create(s, bname, ty)
         return
     }
     if a == pattern.MU_BOOL {
@@ -3749,6 +4077,14 @@ fn stmt(s: *mut Sema, i: u32) {
             expr(s, ast.s_b(b, i), (*s).t_i64)
             return
         }
+        // HOOK ptrarith (round GAPS): `p += n` / `p -= n`.
+        if (ast.s_c(b, i) == 0 || ast.s_c(b, i) == 1) && arith_ptr(s, t) {
+            let prt: u32 = expr(s, ast.s_b(b, i), (*s).t_usize)
+            if !is_error(s, prt) && !is_int(s, prt) {
+                complain(s)
+            }
+            return
+        }
         // The right side gets the type of the left one as its hint -- exactly
         // what `binary` would give it (`probe(l)`).
         let rt: u32 = expr(s, ast.s_b(b, i), t)
@@ -3768,7 +4104,7 @@ fn stmt(s: *mut Sema, i: u32) {
         if t == NONE {
             return
         }
-        if !is_error(s, t) && !is_int(s, t) {
+        if !is_error(s, t) && !is_int(s, t) && !arith_ptr(s, t) {
             complain(s)
         }
         return
@@ -4202,10 +4538,28 @@ fn sema_run(s: *mut Sema) {
         i = i + 1
     }
 
-    // 4. Constants one after another: a later one may use the earlier ones.
+    // 4. Constants in DEPENDENCY order (Round GAPS, sema.rs
+    //    `const_order`): every constant after the constants its value
+    //    names, source order otherwise. The merge puts the importing file
+    //    first, so `const L = km.K + 2` used to meet `km__K` too early.
     range_on(s)
+    var corder: Vec[u32] = vec_new[u32]()
+    var cstate: Vec[u8] = vec_new[u8]()
     i = 0
     while i < ast.const_count(b) {
+        vec_push[u8](&cstate, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < ast.const_count(b) {
+        const_visit(b, i as u32, &cstate, &corder)
+        i = i + 1
+    }
+    vec_free[u8](&cstate)
+    var co: usize = 0
+    while co < vec_len[u32](&corder) {
+        i = vec_at[u32](&corder, co) as usize
+        co = co + 1
         let t: u32 = ast_ty(s, ast.const_ty(b, i))
         let got: u32 = expr(s, ast.const_value(b, i), t)
         if !types.compatible(table(s), got, t) {
@@ -4252,8 +4606,8 @@ fn sema_run(s: *mut Sema) {
             vec_push[u64](&(*s).k_value, 0)
             complain(s)
         }
-        i = i + 1
     }
+    vec_free[u32](&corder)
 
     // 4b. ROUND 89 -- the global variables (SPEC 14.1.statics). AFTER the
     //     constants, because a `static`'s initial value may name a `const`

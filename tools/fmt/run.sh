@@ -87,8 +87,12 @@ echo "== 2. the whole tree: tokens, syntax tree, idempotence =="
 MIRROR="$TMPD/tree"
 mkdir -p "$MIRROR"
 # `.fi` plus the package manifests -- without them the module search in the
-# copy would not find the packages in demos/packages/.
+# copy would not find the packages in demos/packages/. Round GAPS: plus the
+# files the tests pull in with `__include_str` (tests/data/include_*),
+# otherwise the copy of such a test does not compile and its syntax tree
+# counts as changed.
 tar -chf - $(all_sources) $(find . -name 'firn.package' -not -path './.git/*' | sed 's|^\./||') \
+    $(ls tests/data/include_* 2>/dev/null) \
     | tar -xf - -C "$MIRROR"
 ( cd "$MIRROR" && "$FMT" -w $(find . -name '*.fi') 2>/dev/null )
 mrc=$?

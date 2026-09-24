@@ -575,12 +575,22 @@ impl<'a> Lower<'a> {
                 };
                 let pa = self.field_addr(addr, sidx, crate::strtype::F_PTR, e.span)?;
                 let na = self.field_addr(addr, sidx, crate::strtype::F_LEN, e.span)?;
+                // Round GAPS: the octets live in `.rodata`, not in the frame
+                // (statics.rs::intern_text) -- a returned literal stays valid.
                 let p = if n == 0 {
                     self.constant(FTy::Ptr, 0)
                 } else {
-                    let bytes = self.alloca(n, 1);
-                    self.write_into(bytes, inner)?;
-                    bytes
+                    match crate::strtype::literal_octets(inner) {
+                        Some(o) => {
+                            let name = crate::statics::intern_text(&o);
+                            self.push(FTy::Ptr, Op::GlobalAddr { name })
+                        }
+                        None => {
+                            let bytes = self.alloca(n, 1);
+                            self.write_into(bytes, inner)?;
+                            bytes
+                        }
+                    }
                 };
                 self.store(FTy::Ptr, pa, p);
                 let len = self.constant(FTy::U64, n as i128);
@@ -607,16 +617,12 @@ impl<'a> Lower<'a> {
                 };
                 let pa = self.field_addr(addr, sidx, crate::strtype::F_PTR, e.span)?;
                 let na = self.field_addr(addr, sidx, crate::strtype::F_LEN, e.span)?;
+                // Round GAPS: in `.rodata` like a literal (statics.rs::intern_text).
                 let p = if octets.is_empty() {
                     self.constant(FTy::Ptr, 0)
                 } else {
-                    let bytes = self.alloca(octets.len() as u64, 1);
-                    for (i, b) in octets.iter().enumerate() {
-                        let ea = self.elem_addr_const(bytes, 1, i as u64);
-                        let v = self.constant(FTy::U8, *b as i128);
-                        self.store(FTy::U8, ea, v);
-                    }
-                    bytes
+                    let name = crate::statics::intern_text(&octets);
+                    self.push(FTy::Ptr, Op::GlobalAddr { name })
                 };
                 self.store(FTy::Ptr, pa, p);
                 let len = self.constant(FTy::U64, octets.len() as i128);
@@ -856,7 +862,9 @@ impl<'a> Lower<'a> {
                 // that word. So this reads through the record once more —
                 // the same `load` a `*fn` dereference would do — instead of
                 // handing out the record's own address.
-                if self.ty_of(inner).is_fn() {
+                // Round GAPS (fnaddr.rs): `f as u64` is the record address
+                // itself -- that goes the ordinary way below (Ptr -> U64).
+                if self.ty_of(inner).is_fn() && self.ty_of(e).is_ptr() {
                     let record_addr = self.lower_expr(inner)?;
                     return Some(self.load(FTy::Ptr, record_addr));
                 }
@@ -935,6 +943,10 @@ impl<'a> Lower<'a> {
         use ast::BinOp as B;
         // HOOK fehlerunionen: comparison of two error values (lower_errors.rs)
         if let Some(r) = crate::lower_errors::hook_binary(self, op, a, b) {
+            return r;
+        }
+        // HOOK ptrarith: arithmetic on typed pointers (ptrarith.rs, round GAPS)
+        if let Some(r) = crate::ptrarith::lower_binary(self, op, a, b) {
             return r;
         }
         if op.is_logic() {
@@ -1191,6 +1203,22 @@ impl<'a> Lower<'a> {
         }
         if crate::atomic::is_atomic_call(name) && !self.info.fns.contains_key(name) {
             return crate::atomic::lower_atomic_call(self, name, args, span);
+        }
+        // HOOK bits (round GAPS): float bit pattern <-> integer (fbits.rs).
+        if crate::fbits::is_bits_call(name) && !self.info.fns.contains_key(name) {
+            return crate::fbits::lower_call(self, name, args, span);
+        }
+        // HOOK code_of (round GAPS): word 0 of a function record (fnaddr.rs).
+        if crate::fnaddr::is_code_of_call(name) && !self.info.fns.contains_key(name) {
+            return crate::fnaddr::lower_call(self, args, span);
+        }
+        // HOOK as% (round GAPS): the cast without the range check (wrapcast.rs).
+        if crate::wrapcast::is_wrap_call(name) && !self.info.fns.contains_key(name) {
+            return crate::wrapcast::lower_call(self, args, span);
+        }
+        // HOOK sqrt (round GAPS): `__sqrt` is one instruction (fsqrt.rs).
+        if crate::fsqrt::is_sqrt_call(name) && !self.info.fns.contains_key(name) {
+            return crate::fsqrt::lower_call(self, args, span);
         }
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
@@ -1670,6 +1698,16 @@ impl<'a> Lower<'a> {
                     r?;
                     return crate::gc_lower::hook_assign(self, target);
                 }
+                // HOOK ptrarith: `p += n` / `p -= n` move n elements (ptrarith.rs)
+                if matches!(op, ast::BinOp::Add | ast::BinOp::Sub) && crate::ptrarith::is_arith_ptr(&t) {
+                    let size = crate::ptrarith::elem_size(self, &t);
+                    let cur = self.load(FTy::Ptr, addr);
+                    let it = self.fty_of(value)?;
+                    let n = self.lower_expr(value)?;
+                    let res = crate::ptrarith::move_by(self, cur, size, n, it, *op == ast::BinOp::Sub);
+                    self.store(FTy::Ptr, addr, res);
+                    return Some(());
+                }
                 let ft = self.fty_of(target)?;
                 let cur = self.load(ft, addr);
                 let mut rhs = self.lower_expr(value)?;
@@ -1702,6 +1740,16 @@ impl<'a> Lower<'a> {
             // address is computed once here as well.
             Stmt::Step { target, up, .. } => {
                 let addr = self.lower_addr(target)?;
+                // HOOK ptrarith: `p++` / `p--` move one element (ptrarith.rs)
+                let pt = self.ty_of(target);
+                if crate::ptrarith::is_arith_ptr(&pt) {
+                    let size = crate::ptrarith::elem_size(self, &pt);
+                    let cur = self.load(FTy::Ptr, addr);
+                    let one = self.constant(FTy::U64, 1);
+                    let res = crate::ptrarith::move_by(self, cur, size, one, FTy::U64, !*up);
+                    self.store(FTy::Ptr, addr, res);
+                    return Some(());
+                }
                 let ft = self.fty_of(target)?;
                 let cur = self.load(ft, addr);
                 let one = self.constant(ft, 1);
@@ -2057,6 +2105,8 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     // HOOK kern: `#[interrupt]` — its own calling convention in the code
     // generator (core.rs/codegen_x86.rs, round 52).
     f.interrupt = crate::core::has_interrupt(d);
+    // HOOK inline: `#[inline]` / `#[no_inline]` (round EINBETTEN).
+    f.inline_hint = crate::core::inline_hint(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
         pinned: HashMap::new(),

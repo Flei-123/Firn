@@ -710,6 +710,19 @@ pub(crate) fn has_interrupt(f: &crate::ast::FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "interrupt")
 }
 
+/// Round EINBETTEN: read `#[inline]` / `#[no_inline]` from the source.
+/// Both at once is a contradiction; the prohibition wins here -- the safe
+/// side.
+pub(crate) fn inline_hint(f: &crate::ast::FnDecl) -> Option<bool> {
+    let yes = f.attrs.iter().any(|a| a.name == "inline");
+    let no = f.attrs.iter().any(|a| a.name == "no_inline");
+    match (yes, no) {
+        (_, true) => Some(false),
+        (true, false) => Some(true),
+        (false, false) => None,
+    }
+}
+
 /// `// HOOK kern` in `sema::run`: check the form of the `#[interrupt]`
 /// functions and make sure that nobody calls them.
 pub(crate) fn check_interrupts(ck: &mut Checker, prog: &crate::ast::Program) {

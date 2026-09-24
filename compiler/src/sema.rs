@@ -706,7 +706,16 @@ impl<'a> Checker<'a> {
     // -------------------------------------------------------------- Constants
 
     fn check_consts(&mut self, prog: &Program) {
-        for c in &prog.consts {
+        // Round GAPS: in DEPENDENCY order, not in the order of the merged
+        // program. The merge puts the importing file first, so
+        // `const L: i32 = km.K + 2` met `km__K` before it was declared
+        // ("unknown name 'km__K'", certus ROUND54 6.3). A constant is
+        // checked once every constant its value names is; a cycle or a
+        // name that is not a constant falls back to the source order and
+        // gets the message it always got.
+        let order = const_order(&prog.consts);
+        for &ci in &order {
+            let c = &prog.consts[ci];
             let ty = self.resolve_ty(&c.ty);
             // HOOK env (round FIRN-ENV): a `const` of type `str`. It is the
             // one aggregate a constant may have, and for the same reason a
@@ -1461,6 +1470,10 @@ constants declared before it, and '+ - * /'"
                     let note = fixed_note(&reason);
                     self.dg.error_note(*span, reason, note);
                 }
+                // HOOK ptrarith: `p += n` / `p -= n` (ptrarith.rs, round GAPS)
+                if crate::ptrarith::check_assign_op(self, *op, &ty, value, *span) {
+                    return;
+                }
                 // The right side gets the type of the left one as its hint -
                 // exactly what `binary` would give it (`probe(l)`).
                 let rt = self.expr(value, Some(&ty));
@@ -1490,7 +1503,8 @@ constants declared before it, and '+ - * /'"
                     let note = fixed_note(&reason);
                     self.dg.error_note(*span, reason, note);
                 }
-                if !ty.is_error() && !ty.is_concrete_int() {
+                // Round GAPS (ptrarith.rs): `p++` / `p--` move one element.
+                if !ty.is_error() && !ty.is_concrete_int() && !crate::ptrarith::is_arith_ptr(&ty) {
                     self.dg.error_note(
                         *span,
                         format!(
@@ -2057,12 +2071,23 @@ constants declared before it, and '+ - * /'"
             }
             ExprKind::Cast(inner, te) => {
                 let dst = self.resolve_ty(te);
-                let inner_hint = if dst.is_concrete_int() {
+                let wrap_hint = if dst.is_concrete_int() && self.probe(inner).is_none() {
+                    crate::wrapcast::literal_hint(e.id, inner)
+                } else {
+                    None
+                };
+                let inner_hint = if wrap_hint.is_some() {
+                    // Round GAPS (wrapcast.rs): an untyped literal under `as%`.
+                    wrap_hint
+                } else if dst.is_concrete_int() {
                     Some(dst.clone())
                 } else if dst == Type::Bool {
                     Some(Type::I64)
                 } else if dst.is_ptr() {
                     Some(Type::Usize)
+                } else if dst.is_fn() {
+                    // Round GAPS (fnaddr.rs): `0 as fn(..)`, the null function.
+                    Some(Type::U64)
                 } else {
                     None
                 };
@@ -2090,6 +2115,11 @@ constants declared before it, and '+ - * /'"
                 // pointer at all — that would silently hand out a captured
                 // closure's record as if it were a bare code pointer, which
                 // is exactly the unsound case this restriction rules out.
+                // Round GAPS (fnaddr.rs): function value <-> u64/usize, the
+                // RECORD address both ways (0 = the null function).
+                if crate::fnaddr::cast_allowed(&src, &dst) {
+                    return dst;
+                }
                 if let (Type::Fn { .. }, true) = (&src, dst.is_ptr()) {
                     if let ExprKind::Ident(name) = &inner.kind {
                         if self.fns.contains_key(name) && self.lookup_var(name).is_none() {
@@ -2320,6 +2350,10 @@ constants declared before it, and '+ - * /'"
     fn binary(&mut self, e: &Expr, op: BinOp, l: &Expr, r: &Expr, hint: Option<&Type>) -> Type {
         // HOOK fehlerunionen: comparison of two error values (errors.rs)
         if let Some(t) = crate::errors::hook_binary(self, op, l, r, e.span) {
+            return t;
+        }
+        // HOOK ptrarith: `p + n`, `p - n`, `p - q` on typed pointers (ptrarith.rs, round GAPS)
+        if let Some(t) = crate::ptrarith::hook_binary(self, op, l, r, e.span) {
             return t;
         }
         if op.is_logic() {
@@ -2579,6 +2613,22 @@ constants declared before it, and '+ - * /'"
         if let Some(t) = crate::atomic::hook_call(self, name, args, nspan, espan) {
             return t;
         }
+        // HOOK bits: float bit pattern <-> integer (fbits.rs, round GAPS)
+        if let Some(t) = crate::fbits::hook_call(self, name, args, espan) {
+            return t;
+        }
+        // HOOK code_of: the code address of a function value (fnaddr.rs)
+        if let Some(t) = crate::fnaddr::hook_call(self, name, args, espan) {
+            return t;
+        }
+        // HOOK sqrt: the square root instruction (fsqrt.rs, round GAPS)
+        // HOOK as%: the unchecked narrowing conversion (wrapcast.rs)
+        if let Some(t) = crate::wrapcast::hook_call(self, name, args, espan) {
+            return t;
+        }
+        if let Some(t) = crate::fsqrt::hook_call(self, name, args, espan) {
+            return t;
+        }
         // HOOK simd: the vector and crypto instructions (simd.rs, round 82)
         if let Some(t) = crate::simd::hook_call(self, name, args, nspan, espan) {
             return t;
@@ -2785,7 +2835,7 @@ constants declared before it, and '+ - * /'"
     /// Determines the type of an expression without reporting errors and
     /// without writing to the type table. Needed to obtain the type of the
     /// literal in `a + 1` from the other operand.
-    fn probe(&self, e: &Expr) -> Option<Type> {
+    pub(crate) fn probe(&self, e: &Expr) -> Option<Type> {
         self.probe_d(e, 0)
     }
 
@@ -2837,6 +2887,15 @@ constants declared before it, and '+ - * /'"
                     Some(Type::Bool)
                 } else if matches!(op, BinOp::Shl | BinOp::Shr) {
                     self.probe_d(l, d + 1)
+                } else if let Some(lp) = self.probe_d(l, d + 1).filter(|t| t.is_ptr() && !crate::gc::is_gc_ptr(t)) {
+                    // Round GAPS (ptrarith.rs): `p +/- n` is the pointer,
+                    // `p - q` the distance in i64.
+                    let rp = self.probe_d(r, d + 1);
+                    if *op == BinOp::Sub && rp.map(|t| t.is_ptr()).unwrap_or(false) {
+                        Some(Type::I64)
+                    } else {
+                        Some(lp)
+                    }
                 } else {
                     // ROUND 71: the same rule as in `binary` -- with two
                     // floating point operands of different width the wider
@@ -2862,6 +2921,10 @@ constants declared before it, and '+ - * /'"
                 _ => None,
             },
             ExprKind::Call(name, args, _) => {
+                // Round GAPS (wrapcast.rs): `x as% T` probes as `T`.
+                if crate::wrapcast::is_wrap_call(name) && args.len() == 1 && !self.fns.contains_key(name.as_str()) {
+                    return self.probe_d(&args[0], d + 1);
+                }
                 // HOOK fnval: a call THROUGH a function value yields the
                 // result type of the signature. Without that a literal
                 // beside it would get no type — `f(1, 2) != 13`
@@ -3203,6 +3266,13 @@ constants declared before it, and '+ - * /'"
             // branches and recursion (comptime.rs). That makes table sizes
             // and key figures computable instead of working them out by hand
             // and writing them down as a literal.
+            // Round GAPS (wrapcast.rs): `x as% T` in a constant is `x as T`
+            // -- the constant evaluator has always truncated.
+            ExprKind::Call(name, args, _)
+                if crate::wrapcast::is_wrap_call(name) && args.len() == 1 =>
+            {
+                self.eval_const_d(&args[0], d + 1)
+            }
             ExprKind::Call(name, args, _) => {
                 let mut values = Vec::with_capacity(args.len());
                 for a in args {
@@ -3354,6 +3424,54 @@ fn lit_fits(v: i128, t: &Type) -> bool {
 }
 
 /// May this type take part in an `as` conversion?
+/// Round GAPS: the order in which `check_consts` visits the constants --
+/// every constant after the constants its value names (stable otherwise).
+fn const_order(consts: &[crate::ast::ConstDecl]) -> Vec<usize> {
+    fn names(e: &Expr, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Ident(n) => out.push(n.clone()),
+            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => names(x, out),
+            ExprKind::Binary(_, l, r) => {
+                names(l, out);
+                names(r, out);
+            }
+            // (kept to what firnc1's `const_names` walks)
+            _ => {}
+        }
+    }
+    let index: HashMap<&str, usize> =
+        consts.iter().enumerate().map(|(i, c)| (c.name.as_str(), i)).collect();
+    let deps: Vec<Vec<usize>> = consts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut ns = Vec::new();
+            names(&c.value, &mut ns);
+            ns.iter().filter_map(|n| index.get(n.as_str()).copied()).filter(|&j| j != i).collect()
+        })
+        .collect();
+    // depth first in source order: a constant's dependencies are pulled
+    // in front of it, everything else keeps its place. State 1 = on the
+    // path (a cycle -- left to the evaluator), 2 = placed.
+    fn visit(i: usize, deps: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) {
+        if state[i] != 0 {
+            return;
+        }
+        state[i] = 1;
+        for &j in &deps[i] {
+            visit(j, deps, state, order);
+        }
+        state[i] = 2;
+        order.push(i);
+    }
+    let mut state = vec![0u8; consts.len()];
+    let mut order = Vec::with_capacity(consts.len());
+    for i in 0..consts.len() {
+        visit(i, &deps, &mut state, &mut order);
+    }
+    order
+}
+
 fn cast_kind(t: &Type) -> bool {
     t.is_concrete_int() || *t == Type::Bool || t.is_ptr() || t.is_float()
 }
