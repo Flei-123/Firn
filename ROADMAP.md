@@ -217,8 +217,10 @@ the browser project. **That is the actual goal of this roadmap.**
 * **WASM backend** -- not needed for the browser; "Firn instead of JavaScript in
   the browser" stays a distant goal, but it blocks nothing. *Round WASM
   (2026-09-23) built it anyway, for fUi pages in foreign browsers:*
-  `--target=wasm32-browser`, see `docs/ROUND-WASM.md`. SIMD and threads on
-  it are still open
+  `--target=wasm32-browser`, see `docs/ROUND-WASM.md`. *Round OPT-GENERAL
+  (2026-09-24):* WebAssembly SIMD for the SSE intrinsics is in (the crypto
+  intrinsics trap, `__cpu_features` = SSE2|SSE4.1|SSSE3); threads are
+  planned below
 * **JIT**, dynamic libraries, C++ interop -- permanently excluded
 * **Hot reload level C** (real code swapping) -- `DESIGN_GOALS.md` 9:
   collides with static linking (`R5`) and with inlining across module boundaries
@@ -227,6 +229,42 @@ the browser project. **That is the actual goal of this roadmap.**
 * **Stable ABI** (`#[abi_stable]`, `#[frozen]`) -- only once Osum needs
   interchangeable system components, phase 7/8. Until then IPC is the better
   route
+
+### WebAssembly threads -- the plan (round OPT-GENERAL, 2026-09-24)
+
+Checked, not built. It is feasible because the collector of round 49 stops
+the world COOPERATIVELY (safepoints + futex, `lib/gc/gc.fi`), not with
+signals -- nothing of it needs a feature WebAssembly lacks. What it needs:
+
+1. **Shared memory.** Imported `(memory ... shared)` with a maximum, and
+   the data segments PASSIVE plus one `memory.init` guarded by an atomic
+   flag -- active segments would rewrite the statics every time a worker
+   instantiates the module. Only for programs that start a thread; all
+   others keep the plain memory (engines without threads, Certus).
+2. **Atomics.** `Op::AtomicAdd` -> `i64.atomic.rmw.add`, `Op::AtomicCas` ->
+   `i64.atomic.rmw.cmpxchg`; `futex` (202) -> `memory.atomic.wait32` /
+   `memory.atomic.notify` (today: single-thread semantics in
+   `syscalls.rs::wasm`).
+3. **Thread start.** `Op::ThreadSpawn` -> host import
+   `firn.thread_spawn(arg, stack, ctid)`: the host starts a Worker (browser)
+   / `worker_threads` (node), instantiates the SAME module with the same
+   memory and calls an export `__thread_start_wasm(arg, stack_top)` that sets
+   `__sp` and calls `__thread_entry`. At thread end the host does what
+   `CLONE_CHILD_CLEARTID` does: `Atomics.store(ctid, 0)` + `Atomics.notify`.
+4. **Thread pointer.** `arch_prctl(ARCH_SET_FS)` -> `global.set $tp`,
+   `Op::ThreadSelf` -> `global.get $tp`; globals are per instance, i.e. per
+   thread -- exactly TLS.
+5. **Allocator state into memory.** `G_HEAP_TOP`/`G_FREE` (the `mmap`
+   emulation on `memory.grow`) are globals today, i.e. per thread: they move
+   into the linear memory under an atomic lock. `__gc_stack_bottom` returns
+   the thread's own shadow stack top.
+6. **Hosts.** `tools/wasm/run.mjs`, `demos/webdemo/firn.js`: workers, the
+   `memory.buffer` views refreshed after growth. A browser page needs
+   cross-origin isolation (COOP/COEP headers) for `SharedArrayBuffer`, and
+   `Atomics.wait` is forbidden on the page's main thread: a program that
+   joins must run its `main` in a worker.
+7. **Proof.** `tests/834_arc_thread`, `860_thread_basic`, `861_thread_gc`,
+   `862_thread_local` move from REFUSED to SAME in `tools/wasm/run.sh`.
 
 ---
 
