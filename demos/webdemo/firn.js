@@ -181,19 +181,20 @@ const firnTag = document.currentScript;
     // In the background or back: an event of its own on the stream path
     // (name "vis", data "0" hidden / "1" visible), sent at once when the
     // page starts hidden. A page that does not know the name ignores it.
-    const vis = () => x.firn_web_stream_event(...give('vis'), ...give(document.hidden ? '0' : '1'));
+    const vis = () => ev(x.firn_web_stream_event(...give('vis'), ...give(document.hidden ? '0' : '1')));
     document.addEventListener('visibilitychange', vis);
     if (document.hidden) vis();
     // The window's focus (name "focus", "0" lost / "1" back -- a caret
     // stops blinking) and the system's wish for less motion (name "motion",
     // "1" = prefers-reduced-motion), the same way; each sent at once when
     // it is not the ordinary state.
-    const ev = (n, v) => x.firn_web_stream_event(...give(n), ...give(v));
-    addEventListener('blur', () => ev('focus', '0'));
-    addEventListener('focus', () => ev('focus', '1'));
-    if (!document.hasFocus()) ev('focus', '0');
+    // (Each asks for a frame: a caret that may blink again needs one.)
+    const said = (n, v) => ev(x.firn_web_stream_event(...give(n), ...give(v)));
+    addEventListener('blur', () => said('focus', '0'));
+    addEventListener('focus', () => said('focus', '1'));
+    if (!document.hasFocus()) said('focus', '0');
     const rm = matchMedia('(prefers-reduced-motion: reduce)');
-    const motion = () => ev('motion', rm.matches ? '1' : '0');
+    const motion = () => said('motion', rm.matches ? '1' : '0');
     if (rm.addEventListener) rm.addEventListener('change', motion);
     if (rm.matches) motion();
 
