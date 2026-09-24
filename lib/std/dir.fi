@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/dir.fi -- std.dir: the entries of a directory.
+//
+// Round GAPS (docs/LUECKEN.md B23). Until this file Firn could open a file
+// by its name but not ask what names a directory holds -- Certus' Android
+// build ships its own copy of the TLS root store because "Firn kann kein
+// readdir" (certus tools/android/bau.sh:144).
+//
+//     import std.dir
+//     var d: dir.Dir = dir.open("/etc")
+//     while dir.next(&d) {
+//         io.print_line(d.name)          // valid until the next `next`
+//     }
+//     dir.close(&d)
+//
+// One `getdents64` fills a 4 KiB block; `next` walks the records in it and
+// asks the kernel again when the block is used up. No allocation, no libc.
+// "." and ".." are left out, like every directory walker does it -- they
+// are never what the caller is looking for, and forgetting them is how a
+// recursive walk loops forever.
+//
+// `name` is a view INTO the block: it is valid until the next call of
+// `next` (or `close`). Whoever keeps it copies it (`__str_copy`).
+//
+// `kind` is what the file system says (`d_type`): KIND_FILE, KIND_DIR,
+// KIND_LINK, ... -- or KIND_UNKNOWN on file systems that do not keep it;
+// then only a `stat` would tell, and std has none yet.
+//
+// The syscall numbers are the x86-64 ones, like everywhere in std; the
+// compiler translates them for AArch64 (compiler/src/syscalls.rs:
+// `open` -> `openat(AT_FDCWD, ..)`, `getdents64` 217 -> 61).
+
+import rt
+
+export {
+    Dir, open, next, is_open, close,
+    KIND_UNKNOWN, KIND_FIFO, KIND_CHAR, KIND_DIR, KIND_BLOCK, KIND_FILE,
+    KIND_LINK, KIND_SOCKET,
+}
+
+const DIR_SYS_OPEN: i64 = 2
+const DIR_SYS_CLOSE: i64 = 3
+const DIR_SYS_GETDENTS64: i64 = 217
+// O_RDONLY | O_CLOEXEC. O_DIRECTORY is left out on purpose: its value
+// differs between x86-64 and AArch64, and `getdents64` on a file answers
+// ENOTDIR anyway -- `next` then simply finds nothing.
+const DIR_O_FLAGS: i64 = 524288
+
+const KIND_UNKNOWN: u8 = 0
+const KIND_FIFO: u8 = 1
+const KIND_CHAR: u8 = 2
+const KIND_DIR: u8 = 4
+const KIND_BLOCK: u8 = 6
+const KIND_FILE: u8 = 8
+const KIND_LINK: u8 = 10
+const KIND_SOCKET: u8 = 12
+
+const DIR_BLOCK: usize = 4096
+
+struct Dir {
+    fd: i64,
+    // read position and fill level inside `block`
+    pos: usize,
+    len: usize,
+    // the current entry
+    name: str,
+    kind: u8,
+    block: [u8; 4096],
+}
+
+// Opens the directory `path`. `is_open` says whether it worked; a `Dir`
+// that did not open yields no entries and closing it is harmless.
+fn open(path: str) -> Dir {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(DIR_SYS_OPEN, rt.buf_ptr(&c) as i64, DIR_O_FLAGS, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    var d: Dir = Dir {
+        fd: fd,
+        pos: 0,
+        len: 0,
+        name: "",
+        kind: KIND_UNKNOWN,
+        block: [0 as u8; 4096],
+    }
+    if fd < 0 {
+        d.fd = -1
+    }
+    return d
+}
+
+fn is_open(d: *mut Dir) -> bool {
+    return (*d).fd >= 0
+}
+
+// The next entry: `true` and `d.name`/`d.kind` set, or `false` at the end
+// (or on an error -- a directory that vanished while being read ends).
+fn next(d: *mut Dir) -> bool {
+    if (*d).fd < 0 {
+        return false
+    }
+    while true {
+        if (*d).pos >= (*d).len {
+            let base: u64 = rt.addr_of(&(*d).block[0])
+            let got: i64 = syscall(DIR_SYS_GETDENTS64, (*d).fd, base as i64, DIR_BLOCK as i64, 0, 0, 0)
+            if got <= 0 {
+                (*d).name = ""
+                (*d).kind = KIND_UNKNOWN
+                return false
+            }
+            (*d).pos = 0
+            (*d).len = got as usize
+        }
+        // struct linux_dirent64: d_ino u64 @0, d_off i64 @8,
+        // d_reclen u16 @16, d_type u8 @18, d_name (NUL terminated) @19
+        let rec: u64 = rt.addr_of(&(*d).block[0]) + (*d).pos as u64
+        let reclen: usize = rt.ld16(rec, 8) as usize // element 8 of u16 = octet 16
+        if reclen == 0 {
+            // a record of length 0 would loop forever -- the block is broken
+            (*d).len = 0
+            return false
+        }
+        (*d).pos = (*d).pos + reclen
+        var n: usize = 0
+        while 19 + n < reclen && rt.ld8(rec, 19 + n) != 0 as u8 {
+            n = n + 1
+        }
+        let first: u8 = rt.ld8(rec, 19)
+        let second: u8 = rt.ld8(rec, 20)
+        let dot: u8 = 46
+        let is_self: bool = n == 1 && first == dot
+        let is_parent: bool = n == 2 && first == dot && second == dot
+        if !is_self && !is_parent {
+            (*d).name = str { p: (rec + 19) as *mut u8, n: n }
+            (*d).kind = rt.ld8(rec, 18)
+            return true
+        }
+    }
+    return false
+}
+
+fn close(d: *mut Dir) {
+    if (*d).fd >= 0 {
+        syscall(DIR_SYS_CLOSE, (*d).fd, 0, 0, 0, 0, 0)
+    }
+    (*d).fd = -1
+    (*d).pos = 0
+    (*d).len = 0
+    (*d).name = ""
+}

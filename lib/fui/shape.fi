@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/shape.fi -- VOM CODEPUNKT ZUR GLYPHE: SPIEGELN UND ARABISCHE
+// GESTALTEN.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// lib/fui/bidi.fi sagt, in welcher REIHENFOLGE die Zeichen stehen. Das
+// reicht fuer Hebraeisch, aber nicht fuer Arabisch: dort haengt die
+// GESTALT jedes Buchstabens an seinen Nachbarn. "بسم" sind im Text drei
+// Codepunkte in ihrer Grundform; gemalt werden muessen Beh am Anfang,
+// Seen in der Mitte und Meem am Ende. Wer die Grundformen nebeneinander
+// malt, zeigt drei einzelne Buchstaben, die ein Leser als Buchstabiertafel
+// erkennt und nicht als Wort -- im Bild "richtig herum" und trotzdem
+// falsch.
+//
+// Dazu kommt Regel L4 von UAX #9: eine Klammer in einer Strecke, die von
+// rechts nach links laeuft, wird GESPIEGELT gemalt -- "(" wird zu ")" --,
+// sonst zeigt sie in die falsche Richtung.
+//
+// ================================================================ DER WEG
+//
+//   1. die Glyphe jedes Zeichens aus der Schrift (cmap), bei ungerader
+//      Ebene die des Spiegelbildes aus der UCD (L4)
+//   2. die GESTALT jeder arabischen Stelle aus den Verbindungsarten
+//      (ArabicShaping.txt, ueber lib/str/ucd_bidi.fi): kann sich das
+//      Zeichen nach rechts an seinen Vorgaenger und nach links an seinen
+//      Nachfolger binden? Durchsichtige Zeichen (die Vokalzeichen,
+//      Verbindungsart T) werden beim Suchen des Nachbarn uebersprungen.
+//   3a. HAT DIE SCHRIFT GSUB fuer `arab`: die Lookups der Merkmale
+//      isol/fina/init/medi an den Stellen mit dieser Gestalt, rlig und
+//      liga an jeder arabischen Stelle, in der Reihenfolge der
+//      LookupList (lib/font/gsub.fi). Das ist der richtige Weg, und die
+//      Schrift dieses Hauses (DejaVu Sans) geht ihn.
+//   3b. HAT SIE KEINE -- DIE NAEHERUNG: die Gestalt wird ueber die
+//      arabischen Darstellungsformen des Unicode-Standards gewaehlt
+//      (U+FB50..U+FDFF, U+FE70..U+FEFF). Sie stehen in UnicodeData.txt
+//      als Zerlegung (`FE91;...;<initial> 0628`), und der Erzeuger der
+//      Bidi-Tabelle hat sie je Grundbuchstabe eingesammelt.
+//
+// ===================================== WARUM 3b EINE NAEHERUNG IST, OFFEN
+//
+// Die Darstellungsformen gibt es nur aus Gruenden der Vertraeglichkeit
+// mit alten Zeichensaetzen, und sie decken nur einen Teil ab:
+//
+//   * nur die Buchstaben, fuer die Unicode eine Form fuehrt (76
+//     Grundbuchstaben). Neuere Buchstaben fuer Urdu, Persisch, Kurdisch
+//     usw. ohne eigene Form bleiben in der Grundgestalt stehen.
+//   * von den Ligaturen nur Lam-Alif. Die ist PFLICHT (Unicode-Standard,
+//     Kapitel 9.2 "Arabic", Abschnitt Ligatures: die Lam-Alif-Ligatur
+//     ist in jeder Darstellung zwingend), alle anderen sind Zierde und
+//     werden in 3b nicht gebildet.
+//   * die Schrift muss die Formen selbst fuehren. Fehlt ihr eine, bleibt
+//     die Grundglyphe stehen -- und `shape_run` ZAEHLT solche Stellen
+//     (`missing`), statt so zu tun, als sei alles geformt.
+//   * keine Lage der Vokalzeichen (das waere GPOS; das fehlt in 3a
+//     genauso, siehe gsub.fi).
+//
+// 3b ist also lesbar und fuer die Grundbuchstaben richtig, aber nicht
+// das, was ein Setzer abliefern wuerde. Deshalb geht der Maler 3a, wann
+// immer die Schrift es zulaesst, und tools/fui/bidi_main.fi rechnet
+// nach, dass beide Wege bei DejaVu Sans DIESELBEN Glyphen liefern.
+//
+// Was hier NICHT geschieht: keine Ebene, keine Reihenfolge (bidi.fi),
+// kein Vorschub, kein Malen (painter.fi). Alle Felder gehoeren dem
+// Aufrufer, und alles ist #[no_gc].
+import str.ucd_bidi
+import font.ttf
+import font.gsub
+
+export {
+    shape_run, shape_forms, shape_is_arabic,
+    SHAPE_NONE, SHAPE_GSUB, SHAPE_FORMS,
+    FORM_NONE, FORM_OTHER,
+    LAM,
+}
+
+// Was `shape_run` getan hat.
+const SHAPE_NONE: u32 = 0     // kein arabisches Zeichen darin
+const SHAPE_GSUB: u32 = 1     // Weg 3a, die Schrift hat es gesagt
+const SHAPE_FORMS: u32 = 2    // Weg 3b, die Naeherung
+
+// Im Gestaltfeld: 0..3 sind ucd_bidi.FORM_*, dazu diese beiden.
+const FORM_NONE: u8 = 255     // keine arabische Stelle
+const FORM_OTHER: u8 = 254    // arabisch, aber ohne Gestalt (Vokal, Hamza)
+
+// Der eine Buchstabe, der in 3b eine Ligatur bilden darf (siehe oben).
+const LAM: u32 = 0x644
+
+#[no_gc]
+fn r8(p: u64, i: usize) -> u8 { return *((p + i as u64) as *mut u8) }
+#[no_gc]
+fn w8(p: u64, i: usize, v: u8) { *((p + i as u64) as *mut u8) = v }
+#[no_gc]
+fn r32(p: u64, i: usize) -> u32 { return *((p + (i * 4) as u64) as *mut u32) }
+#[no_gc]
+fn w32(p: u64, i: usize, v: u32) { *((p + (i * 4) as u64) as *mut u32) = v }
+
+// Eine arabische Stelle: ein Zeichen der Klasse AL, oder ein
+// durchsichtiges Zeichen (Vokal), das an einem solchen haengt.
+#[no_gc]
+fn shape_is_arabic(form: u64, i: usize) -> bool {
+    return r8(form, i) != FORM_NONE
+}
+
+#[no_gc]
+fn joins_left_side(j: u8) -> bool {
+    // Diese Verbindungsarten koennen einen NACHFOLGER annehmen.
+    return j == ucd_bidi.JOIN_L || j == ucd_bidi.JOIN_D
+        || j == ucd_bidi.JOIN_C
+}
+
+#[no_gc]
+fn joins_right_side(j: u8) -> bool {
+    // Diese koennen sich an einen VORGAENGER binden.
+    return j == ucd_bidi.JOIN_R || j == ucd_bidi.JOIN_D
+        || j == ucd_bidi.JOIN_C
+}
+
+// DIE GESTALTEN. `form[i]` bekommt ucd_bidi.FORM_* fuer jede arabische
+// Stelle mit Gestalt, FORM_OTHER fuer arabische Stellen ohne und
+// FORM_NONE fuer alles andere. Gerechnet wird in LOGISCHER Reihenfolge
+// -- vorher und nachher heisst im Text, nicht auf dem Schirm.
+#[no_gc]
+fn shape_forms(t: u64, cp: u64, cls0: u64, n: usize, form: u64) -> usize {
+    var arabic: usize = 0
+    var base_arab: bool = false
+    var i: usize = 0
+    while i < n {
+        let c: u32 = r32(cp, i)
+        let j: u8 = ucd_bidi.ucd_joining(t, c)
+        if r8(cls0, i) == ucd_bidi.BIDI_AL {
+            w8(form, i, FORM_OTHER)
+            base_arab = true
+            arabic = arabic + 1
+        } else if j == ucd_bidi.JOIN_T && base_arab {
+            w8(form, i, FORM_OTHER)
+        } else {
+            w8(form, i, FORM_NONE)
+            if j != ucd_bidi.JOIN_T {
+                base_arab = false
+            }
+        }
+        i = i + 1
+    }
+    if arabic == 0 {
+        return 0
+    }
+    i = 0
+    while i < n {
+        let jt: u8 = ucd_bidi.ucd_joining(t, r32(cp, i))
+        if r8(form, i) != FORM_NONE && (jt == ucd_bidi.JOIN_R
+            || jt == ucd_bidi.JOIN_D || jt == ucd_bidi.JOIN_L) {
+            // der Vorgaenger, ueber durchsichtige Zeichen hinweg
+            var prev: u8 = ucd_bidi.JOIN_U
+            var k: usize = i
+            while k > 0 {
+                k = k - 1
+                let pj: u8 = ucd_bidi.ucd_joining(t, r32(cp, k))
+                if pj != ucd_bidi.JOIN_T {
+                    prev = pj
+                    break
+                }
+            }
+            var next: u8 = ucd_bidi.JOIN_U
+            var q: usize = i + 1
+            while q < n {
+                let nj: u8 = ucd_bidi.ucd_joining(t, r32(cp, q))
+                if nj != ucd_bidi.JOIN_T {
+                    next = nj
+                    break
+                }
+                q = q + 1
+            }
+            let jp: bool = joins_right_side(jt) && joins_left_side(prev)
+            let jn: bool = joins_left_side(jt) && joins_right_side(next)
+            var fm: u32 = ucd_bidi.FORM_ISOL
+            if jp && jn {
+                fm = ucd_bidi.FORM_MEDI
+            } else if jp {
+                fm = ucd_bidi.FORM_FINA
+            } else if jn {
+                fm = ucd_bidi.FORM_INIT
+            }
+            w8(form, i, fm as u8)
+        }
+        i = i + 1
+    }
+    return arabic
+}
+
+#[no_gc]
+fn form_bit(fm: u8) -> u32 {
+    if fm == ucd_bidi.FORM_ISOL as u8 { return gsub.F_ISOL }
+    if fm == ucd_bidi.FORM_FINA as u8 { return gsub.F_FINA }
+    if fm == ucd_bidi.FORM_INIT as u8 { return gsub.F_INIT }
+    if fm == ucd_bidi.FORM_MEDI as u8 { return gsub.F_MEDI }
+    return 0
+}
+
+// ======================================================================
+// DER GANZE WEG FUER EINEN ABSATZ
+// ======================================================================
+//
+//   cp, cls0, lev   die Codepunkte, ihre UCD-Klassen und die aufgeloesten
+//                   Ebenen (aus bidi.fi, fuer L4)
+//   gid             bekommt je Stelle die Glyphe
+//   del             bekommt 1 fuer Stellen, die in einer Ligatur
+//                   aufgegangen sind (sie werden nicht gemalt und haben
+//                   keinen Vorschub, bleiben aber als Zeichen stehen --
+//                   die Schreibmarke steht in einem Lam-Alif hinter dem
+//                   Alif, nicht mitten in der Glyphe)
+//   form            Arbeitsfeld u8[n], danach die Gestalt je Stelle
+//   used            Arbeitsfeld u32[16] fuer die Ligatursuche
+//   use_gsub        false erzwingt die Naeherung 3b -- NUR fuer den
+//                   Nachweis in tools/fui/bidi_main.fi, dass beide Wege
+//                   dasselbe liefern
+//   missing         bekommt die Zahl der arabischen Stellen mit
+//                   Gestalt, fuer die der Weg 3b in der Schrift keine
+//                   Glyphe fand
+#[no_gc]
+fn shape_run(t: u64, f: *mut ttf.Font, g: *mut gsub.Gsub, use_gsub: bool,
+    cp: u64, cls0: u64, lev: u64, n: usize, gid: u64, del: u64,
+    form: u64, used: u64, missing: *mut usize) -> u32 {
+    *missing = 0
+    // 1. die Glyphen, samt L4
+    var i: usize = 0
+    while i < n {
+        var c: u32 = r32(cp, i)
+        if (r8(lev, i) & 1 as u8) != 0 as u8 {
+            let m: u32 = ucd_bidi.ucd_mirror(t, c)
+            if m != c && ttf.font_glyph_for(f, m) != 0 as u32 {
+                c = m
+            }
+        }
+        w32(gid, i, ttf.font_glyph_for(f, c))
+        w8(del, i, 0 as u8)
+        i = i + 1
+    }
+    // 2. die Gestalten
+    if shape_forms(t, cp, cls0, n, form) == 0 {
+        return SHAPE_NONE
+    }
+    // 3a. die Schrift
+    if use_gsub && gsub.gsub_ok(g) && gsub.gsub_count(g) > 0 {
+        var k: usize = 0
+        while k < gsub.gsub_count(g) {
+            let ty: u32 = gsub.gsub_lookup_type(f, g, k)
+            let mk: u32 = gsub.gsub_lookup_mask(g, k)
+            let every: bool = (mk & (gsub.F_RLIG | gsub.F_LIGA
+                | gsub.F_RQD)) != 0 as u32
+            let ign: bool = gsub.gsub_lookup_ignores_marks(f, g, k)
+            var p: usize = 0
+            while p < n {
+                let fm: u8 = r8(form, p)
+                var applies: bool = false
+                if fm != FORM_NONE && r8(del, p) == 0 as u8 {
+                    applies = every || (mk & form_bit(fm)) != 0 as u32
+                }
+                if applies {
+                    let g0: u32 = r32(gid, p)
+                    if ty == 1 as u32 {
+                        if !(ign && gsub.gsub_is_mark(f, g, g0)) {
+                            w32(gid, p, gsub.gsub_single(f, g, k, g0))
+                        }
+                    } else if ty == 4 as u32 {
+                        var nu: usize = 0
+                        let lg: u32 = gsub.gsub_ligature(f, g, k, gid, del,
+                            n, p, used, 16, &nu)
+                        if lg != 0 as u32 {
+                            w32(gid, p, lg)
+                            var u: usize = 0
+                            while u < nu {
+                                w8(del, r32(used, u) as usize, 1 as u8)
+                                u = u + 1
+                            }
+                        }
+                    }
+                }
+                p = p + 1
+            }
+            k = k + 1
+        }
+        return SHAPE_GSUB
+    }
+    // 3b. DIE NAEHERUNG ueber die Darstellungsformen -- siehe Kopf.
+    i = 0
+    while i < n {
+        let fm2: u8 = r8(form, i)
+        if fm2 <= ucd_bidi.FORM_MEDI as u8 && r8(del, i) == 0 as u8 {
+            let c2: u32 = r32(cp, i)
+            var done: bool = false
+            // Lam-Alif, die eine Pflichtligatur. Die Ligatur steht dort,
+            // wo der Lam steht; ihre Form ist "endend", wenn der Lam
+            // sich an seinen Vorgaenger bindet, sonst "isoliert" -- der
+            // Alif bindet sich nie an einen Nachfolger.
+            if c2 == LAM && (fm2 == ucd_bidi.FORM_INIT as u8
+                || fm2 == ucd_bidi.FORM_MEDI as u8) {
+                var q: usize = i + 1
+                while q < n && ucd_bidi.ucd_joining(t, r32(cp, q))
+                    == ucd_bidi.JOIN_T {
+                    q = q + 1
+                }
+                if q < n {
+                    var lf: u32 = ucd_bidi.FORM_ISOL
+                    if fm2 == ucd_bidi.FORM_MEDI as u8 {
+                        lf = ucd_bidi.FORM_FINA
+                    }
+                    let lig: u32 = ucd_bidi.ucd_arabic_ligature(t, c2,
+                        r32(cp, q), lf)
+                    if lig != 0 as u32 {
+                        let lg2: u32 = ttf.font_glyph_for(f, lig)
+                        if lg2 != 0 as u32 {
+                            w32(gid, i, lg2)
+                            w8(del, q, 1 as u8)
+                            done = true
+                        } else {
+                            *missing = *missing + 1
+                        }
+                    }
+                }
+            }
+            // ISOLIERT IST DIE GRUNDFORM. Die Grundglyphe der Schrift ist
+            // die isolierte Gestalt; U+FE8D (ALEF ISOLATED FORM) zu
+            // setzen, aendert kein Bild, nur die Glyphennummer -- und
+            // weicht dann ohne Grund vom Weg 3a ab, der fuer `isol` bei
+            // DejaVu gar keinen Lookup hat.
+            if !done && fm2 == ucd_bidi.FORM_ISOL as u8 {
+                done = true
+            }
+            if !done {
+                let pf: u32 = ucd_bidi.ucd_arabic_form(t, c2, fm2 as u32)
+                if pf != 0 as u32 {
+                    let pg: u32 = ttf.font_glyph_for(f, pf)
+                    if pg != 0 as u32 {
+                        w32(gid, i, pg)
+                    } else {
+                        *missing = *missing + 1
+                    }
+                } else {
+                    // Kein Eintrag fuer eine verbundene Gestalt: der
+                    // Buchstabe bleibt in der Grundform, und das wird
+                    // gezaehlt.
+                    *missing = *missing + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return SHAPE_FORMS
+}

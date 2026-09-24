@@ -231,6 +231,19 @@ fn ex_core(e: &Expr) -> String {
         ExprKind::Binary(op, a, b) => format!("(bin {} {} {})", op.text(), ex(a), ex(b)),
         ExprKind::Field(b, n, _) => format!("(field {} {})", ex(b), n),
         ExprKind::Index(b, i) => format!("(idx {} {})", ex(b), ex(i)),
+        // Round GAPS (wrapcast.rs): the parser's `__as_wrap(x as T)` is
+        // written as what the source said, `(as% x T)` -- the same text
+        // firnc1 prints for its flagged cast.
+        ExprKind::Call(n, args, _)
+            if crate::wrapcast::is_wrap_call(n)
+                && args.len() == 1
+                && matches!(args[0].kind, ExprKind::Cast(..)) =>
+        {
+            match &args[0].kind {
+                ExprKind::Cast(a, t) => format!("(as% {} {})", ex(a), ty(t)),
+                _ => String::new(),
+            }
+        }
         ExprKind::Call(n, args, _) => {
             let mut o = format!("(call {}", n);
             for a in args {

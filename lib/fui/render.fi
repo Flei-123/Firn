@@ -29,21 +29,39 @@
 //
 // `draw_base` does 1, 2 and 4 for EVERY widget. A new widget writes
 // only its content.
-import std.rt
-import paint.canvas
 import fui.style
 import fui.theme
 import fui.widget
 import fui.painter
+import fui.uiimage
+import fui.uisvg
+import fui.effect
+import fui.transform
+import fui.textbuf
+import fui.bidi
+import fui.editor
+import paint.canvas
 
 export {
     Ctx, ctx_new, ctx_theme, ctx_painter,
+    ctx_bind_anim, ctx_unbind_anim, ctx_set_time, ctx_time,
+    anim_run, anim_none, anim_bg_of,
+    shadow_color, is_raised, draw_elevation,
     draw_base, draw_widget, draw_label, draw_button,
     draw_text, draw_focus_ring,
     def_bg, def_bg_state, def_border, def_fg, def_radius, def_border_width,
     def_pad_x, def_pad_y, def_font, def_align,
     color_of, len_of, len_signed,
     text_run_of,
+    draw_widget_xf,
+    def_art_size, def_art_gap, art_box, draw_art, art_extra_w,
+    art_text_split, draw_widget_art, pady_of,
+    art_tint_of, draw_art_xf, draw_widget_art_xf,
+    pref_of, set_pref_from,
+    FieldMess, field_mess_new, field_mess, field_px, field_text_x0,
+    field_x_of, field_caret_x, field_line, field_underline, draw_field,
+    dir_of, is_rtl_style,
+    field_measure, draw_textfield, field_text_origin,
 }
 
 // What is needed for painting: the theme (Colors, Shape, scale) and the
@@ -52,10 +70,95 @@ export {
 struct Ctx {
     m: u64,   // *mut theme.Theme
     z: u64,   // *mut painter.Painter
+    // ================================================ DIE ZEIT IM BILD
+    //
+    // Ein Knopf, der beim Ueberfahren SPRINGT, sieht alt aus -- das ist
+    // der ganze Grund, aus dem es lib/fui/anim.fi gibt. Bis zur Runde
+    // FEHLERBEHEBUNG fuehrte den Uebergang aber NUR das Demoprogramm,
+    // und damit war er genau das, was diese Bibliothek verhindern soll:
+    // jede Anwendung haette ihren eigenen bauen muessen. Jetzt fuehrt
+    // ihn der Zeichenweg selbst.
+    //
+    // WARUM EIN FUNKTIONSZEIGER UND KEIN `anim.Animator` ALS FELD:
+    // anim.fi fragt render.fi nach den ZIELWERTEN eines Zustandes
+    // (`render.def_bg_state`, `def_radius`, `def_border_width` -- die
+    // Kaskade steht hier und darf kein zweites Mal geschrieben werden),
+    // also importiert anim.fi diese Datei. Andersherum waere ein
+    // Kreis, und keine der beiden Dateien liesse sich uebersetzen. Ein
+    // FELD hingegen wird zur Laufzeit gesetzt: `anim.transreg_bind`
+    // haengt das Register ein, und render.fi ruft eine Funktion, die
+    // es nicht kennt. Dieselbe Loesung wie die Trefferpruefung in
+    // control.fi, und aus demselben Grund.
+    //
+    // `ms` ist die Uhrzeit des laufenden Bildes. Sie gehoert dem
+    // Aufrufer (S2 in control.fi: die Uhr haelt, wer das Fenster
+    // haelt); hier steht nur, welchen Stand das gerade gemalte Bild
+    // zeigt.
+    an: u64,   // Zustand des Registers, sein Eigentuemer ist der Aufrufer
+    ah: fn(u64, u64, u64, i64) -> bool,
+    ms: i64,
 }
 
 fn ctx_new(m: *mut theme.Theme, z: *mut painter.Painter) -> Ctx {
-    return Ctx { m: m as u64, z: z as u64 }
+    return Ctx { m: m as u64, z: z as u64, an: 0, ah: anim_none, ms: 0 }
+}
+
+// DIE VORGABE: es gibt keine Zeit im Bild, und nichts ist veraltet.
+// Ohne eingehaengtes Register malt render.fi Bild fuer Bild genau das,
+// was es immer gemalt hat.
+fn anim_none(reg: u64, cx: u64, wx: u64, now_ms: i64) -> bool {
+    return false
+}
+
+fn ctx_bind_anim(c: *mut Ctx, reg: u64,
+    h: fn(u64, u64, u64, i64) -> bool) {
+    (*c).an = reg
+    (*c).ah = h
+}
+
+fn ctx_unbind_anim(c: *mut Ctx) {
+    (*c).an = 0
+    (*c).ah = anim_none
+}
+
+// Die Uhrzeit des Bildes setzen. Zurueck kommt nichts: ob etwas neu zu
+// malen ist, sagt `anim_run` beim Malen -- und nur das ist ehrlich,
+// denn die Antwort haengt am Widget und nicht an der Uhr.
+fn ctx_set_time(c: *mut Ctx, ms: i64) {
+    (*c).ms = ms
+}
+
+fn ctx_time(c: *mut Ctx) -> i64 { return (*c).ms }
+
+// DEN UEBERGANG EINES WIDGETS WEITERRECHNEN. `true` heisst: das Bild
+// ist veraltet, der Aufrufer soll im naechsten Takt wieder malen.
+//
+// Was dabei geschieht, entscheidet das eingehaengte Register: die
+// Fassung in anim.fi setzt den Tween bei einem Zustandswechsel neu an,
+// rechnet ihn auf `now_ms` und schreibt den Zwischenstand (Farbe,
+// Radius, Randstaerke, Deckung) in den Style des Widgets zurueck --
+// weshalb der Rest dieser Datei davon nichts merkt und einfach malt.
+fn anim_run(c: *mut Ctx, e: *mut widget.Widget) -> bool {
+    if (*c).an == 0 {
+        return false
+    }
+    return (*c).ah((*c).an, c as u64, e as u64, (*c).ms)
+}
+
+// DIE FLAECHENFARBE, DIE DIESER ZEICHENWEG GERADE MALEN WUERDE.
+//
+// Dieselbe Rechnung wie in `draw_base`, nur ohne Leinwand -- damit
+// eine Pruefung den Wert AUS DEM RENDER-PFAD lesen kann und nicht die
+// Kaskade nachbaut. Nach `anim_run` steht hier die gemischte Farbe des
+// laufenden Uebergangs.
+fn anim_bg_of(c: *mut Ctx, e: *mut widget.Widget) -> u32 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let bg: u32 = style.resolve_bg(sz, widget.w_state(e),
+        def_bg_state(widget.w_kind(e), widget.w_state(e)))
+    if !style.color_is_visible(bg) {
+        return 0 as u32
+    }
+    return theme.opaque(color_of(c, bg))
 }
 
 fn ctx_theme(c: *mut Ctx) -> *mut theme.Theme {
@@ -105,8 +208,27 @@ fn len_of(c: *mut Ctx, n: usize) -> f64 {
 //
 // THAT IS THE REASON THE GALLERY PAGE EXISTS: in the source both look
 // the same.
+// DER SCHALTER STAND IN BEIDEN ZWEIGEN, UND DAS WAR EIN WIDERSPRUCH.
+// Bis zum 21.09.2026 zaehlte `KIND_TOGGLE` hier zu den Knopf-artigen
+// Elementen und ZUGLEICH weiter unten in `def_bg` zu denen ohne eigene
+// Flaeche. Welche der beiden Regeln galt, entschied allein die
+// Reihenfolge der Abfragen -- also diese, denn `def_bg` wird erst
+// gerufen, wenn hier nichts passt. Gemalt wurde damit die ganze ZEILE
+// des Schalters in Knopfgrau, obwohl zwei Kommentare (hier unten bei
+// KIND_SLIDER und in wave2.draw_checkbox) ausdruecklich sagen: ein
+// Schalter faerbt seinen KASTEN, nicht seine Zeile. Zwei Orte, zwei
+// Aussagen, und die dokumentierte verlor still.
+//
+// Der Schalter ist darum HIER heraus und steht nur noch in `def_bg`
+// unter den durchsichtigen. Seine Zustaende gehen dabei nicht
+// verloren: die Pille nimmt TOK_ACCENT, sobald er an ist
+// (wave2.draw_toggle), und Hover/Fokus stehen im Ring. Was verschwindet,
+// ist ausschliesslich der graue Balken hinter der Beschriftung --
+// tools/fui/wave2_main.fi Abschnitt 14 misst nach, dass die Zeile
+// neben der Pille die Farbe des Untergrunds behaelt, und die Belege
+// 03/04 (fui-wave2-light/dark.png) zeigen es.
 fn def_bg_state(kind: u32, zu: u32) -> u32 {
-    if kind == widget.KIND_BUTTON || kind == widget.KIND_TOGGLE
+    if kind == widget.KIND_BUTTON
         || kind == widget.KIND_TILE || kind == widget.KIND_TAB {
         if zu == style.STATE_ACTIVE {
             return style.color_token(style.TOK_BUTTON_ACTIVE)
@@ -247,6 +369,78 @@ fn def_align(kind: u32) -> u32 {
 }
 
 // ======================================================================
+// THE SHADOW UNDER A RAISED SURFACE
+// ======================================================================
+//
+// A card, a menu and a tooltip are not on the page, they are IN FRONT
+// of it. Until now the only means of saying so was a line around them,
+// and a line around everything is exactly the look this library is
+// meant to leave behind. What says "in front" on every modern surface
+// is a SOFT shadow -- and since lib/fui/effect.fi has one, it is used
+// here, in the one place that paints widgets, and nowhere else.
+//
+// The numbers come from the theme and not from here: `Shape.shadow` is
+// the strength, `Shape.shadow_r` the blur radius. `shape_classic` has
+// both at zero, so the square theme gets NO shadow -- that is the
+// proof that the shadow is a theme decision and not an assumption in
+// the drawing code.
+
+// HOW DARK THE SHADOW IS, DEPENDS ON THE GROUND.
+//
+// The same black at the same alpha carries far less on a dark page
+// than on a white one: on 0xFFFFFF an alpha of 64 darkens by 64 steps,
+// on 0x1C1B22 there are barely 28 steps of room left below. Dark
+// therefore takes three times the alpha -- the value at which the
+// shadow under a card is as visible in the dark picture as in the
+// light one.
+fn shadow_color(c: *mut Ctx) -> u32 {
+    let m: *mut theme.Theme = ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    var a: usize = (*fo).shadow
+    if theme.theme_is_dark(m) {
+        a = a * 3
+    }
+    if a > 255 {
+        a = 255
+    }
+    return (a as u32) << 24
+}
+
+// Which kinds stand in front of the page. A button does NOT -- a
+// shadow under every button is the 2008 look, and Material dropped it
+// for the same reason.
+//
+// A TOOLTIP does not either, and that is not an oversight: the check
+// this library exists for (wave2_main.fi, section 8) measures the four
+// pixels diagonally outside a tooltip's corners and demands the
+// background UNCHANGED there, because in the real system a grey box
+// sat behind the tooltip. A tooltip is small and lies directly at the
+// pointer; it needs no shadow to be seen. Cards and menus do.
+fn is_raised(kind: u32) -> bool {
+    return kind == widget.KIND_CARD || kind == widget.KIND_MENU
+}
+
+// The shadow itself: offset downwards by half the blur, so that the
+// light comes from above, as it does everywhere else in the theme.
+// Whether it worked is returned -- the shape needs a canvas of its
+// own, and if there is no memory for it, the card is still painted.
+fn draw_elevation(c: *mut Ctx, e: *mut widget.Widget) -> bool {
+    let m: *mut theme.Theme = ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    if (*fo).shadow == 0 || (*fo).shadow_r == 0 {
+        return true
+    }
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize,
+        def_radius(c, widget.w_kind(e))))
+    let b: f64 = len_of(c, (*fo).shadow_r)
+    return effect.drop_shadow_round(ctx_painter(c), widget.w_x(e),
+        widget.w_y(e), widget.w_w(e), widget.w_h(e), r, 0.0, b * 0.5,
+        b as i64, shadow_color(c))
+}
+
+// ======================================================================
 // THE COMMON BASE
 // ======================================================================
 //
@@ -271,6 +465,18 @@ fn draw_base(c: *mut Ctx, e: *mut widget.Widget) {
     let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
         (*style.styleset_base(sz)).radius as usize, def_radius(c, kind)))
     if style.color_is_visible(bg) {
+        // What stands IN FRONT of the page gets its shadow first: it
+        // lies UNDER the surface, so it has to be painted before it --
+        // afterwards the surface would cover the part of it that falls
+        // inside the card, and the shadow would show through the
+        // rounded corners.
+        if is_raised(kind) {
+            if !draw_elevation(c, e) {
+                // No memory for the shadow's own canvas. The card is
+                // painted anyway -- a missing shadow is a blemish, a
+                // missing card is a hole.
+            }
+        }
         painter.round_rect(z, widget.w_x(e), widget.w_y(e),
             widget.w_w(e), widget.w_h(e), r, color_of(c, bg))
     }
@@ -309,6 +515,429 @@ fn draw_focus_ring(c: *mut Ctx, e: *mut widget.Widget) {
 }
 
 // ======================================================================
+// THE PICTURE OF A WIDGET
+// ======================================================================
+//
+// Justin, 13.09.2026: a button with an icon left of the text, a label
+// with a picture. The pointer lives on the Widget (widget.fi); the
+// geometry and the drawing are HERE, once, so that a button, a menu
+// entry, a tab and a toolbar button all place their icon by the same
+// arithmetic. Placing it per widget is exactly how the same drawing
+// drifts apart, which is the fault this library exists to stop.
+
+// THE DEFAULT ICON SIZE FOLLOWS THE FONT, not the widget height.
+//
+// The same rule as `wave2.box_side` for the tick box of a checkbox, and
+// the reason is the same: an icon next to a line of 15 point text should
+// be as big as that text, whether the row it sits in is 32 or 40 high.
+// Tie it to the height and the icon in a tall toolbar looks blown up.
+//
+// The factor is 1.0 -- an icon on the text's own em box. Material uses
+// 24 on a 16 point body, Fluent 16 on 14; both land within a point or
+// two of the em size, and taking the font size exactly means a caller who
+// changes the font gets an icon that follows without touching anything.
+fn def_art_size(c: *mut Ctx) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    return (*fo).font
+}
+
+// The gap between picture and text: the small grid step. `sp_s` is what
+// separates two elements of one group everywhere else in the theme, and
+// an icon and its label are exactly that.
+fn def_art_gap(c: *mut Ctx) -> usize {
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    return (*fo).sp_s
+}
+
+// THE SIZE OF THE PICTURE BOX IN PIXELS, out of the widget or the theme.
+fn art_box(c: *mut Ctx, e: *mut widget.Widget, aw: *mut f64,
+    ah: *mut f64) {
+    var w: usize = widget.w_art_w(e)
+    var h: usize = widget.w_art_h(e)
+    if w == 0 && h == 0 {
+        w = def_art_size(c)
+        h = w
+    } else if w == 0 {
+        w = h
+    } else if h == 0 {
+        h = w
+    }
+    *aw = len_of(c, w)
+    *ah = len_of(c, h)
+}
+
+// HOW MUCH ROOM THE PICTURE TAKES FROM THE TEXT, horizontally.
+//
+// Zero when there is no picture, and zero for ART_ONLY as well -- there
+// the picture is not beside the text, it IS the content. The layout
+// (layout.fi) and the text placement both ask this one function, so they
+// cannot disagree about the width.
+fn art_extra_w(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
+    if !widget.w_has_art(e) {
+        return 0.0
+    }
+    let al: u32 = widget.w_art_align(e)
+    if al == widget.ART_ONLY || al == widget.ART_ABOVE
+        || al == widget.ART_ABOVE_CENTER {
+        return 0.0
+    }
+    var aw: f64 = 0.0
+    var ah: f64 = 0.0
+    art_box(c, e, &aw, &ah)
+    var g: usize = widget.w_art_gap(e)
+    if g == 0 {
+        g = def_art_gap(c)
+    }
+    // The gap only counts when there IS text on the other side of it.
+    if widget.w_text_len(e) == 0 {
+        return aw
+    }
+    return aw + len_of(c, g)
+}
+
+// SPLIT THE CONTENT BOX INTO PICTURE AND TEXT.
+//
+// Hands back where the picture goes and what is left for the text. ONE
+// place, because the drawing and the measuring have to agree: if the text
+// were centred in the whole rect while the icon sat on the left, the two
+// would overlap, and that is the classic version of this bug.
+//
+// `cx`/`cw` is the content box (the rect minus the padding).
+fn art_text_split(c: *mut Ctx, e: *mut widget.Widget, cx: f64, cy: f64,
+    cw: f64, ch: f64, ax: *mut f64, ay: *mut f64, aw: *mut f64,
+    ah: *mut f64, tx: *mut f64, tw: *mut f64) {
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    art_box(c, e, &bw, &bh)
+    var g: usize = widget.w_art_gap(e)
+    if g == 0 {
+        g = def_art_gap(c)
+    }
+    var gap: f64 = len_of(c, g)
+    if widget.w_text_len(e) == 0 {
+        gap = 0.0
+    }
+    let al: u32 = widget.w_art_align(e)
+    // Vertically the picture is centred in the content box, always. An
+    // icon on the baseline of the text looks dropped.
+    *ay = cy + (ch - bh) / 2.0
+    *aw = bw
+    *ah = bh
+    if al == widget.ART_ONLY {
+        // The whole box, centred. No text is drawn.
+        *ax = cx + (cw - bw) / 2.0
+        *tx = cx
+        *tw = 0.0
+        return
+    }
+    if al == widget.ART_ABOVE || al == widget.ART_ABOVE_CENTER {
+        // Picture on top, text underneath. The two share the height, so
+        // the picture is centred horizontally and sits in the upper part.
+        // ABOVE_CENTER unterscheidet sich NUR in der Textausrichtung
+        // (siehe `text_align_of`) -- die Kaesten sind dieselben, und
+        // deshalb steht hier kein zweiter Zweig.
+        *ax = cx + (cw - bw) / 2.0
+        *ay = cy
+        *tx = cx
+        *tw = cw
+        return
+    }
+    // IN EINEM RTL-ELEMENT TAUSCHEN ANFANG UND ENDE. ART_LEFT meint "vor
+    // dem Text", und vor dem Text ist bei `direction: rtl` rechts -- ein
+    // Symbol, das links bliebe, stuende hinter dem arabischen Wort. Die
+    // Zerlegung ist sonst dieselbe; nur die Seite wechselt.
+    var right: bool = al == widget.ART_RIGHT
+    if is_rtl_style(e) {
+        right = !right
+    }
+    if right {
+        *ax = cx + cw - bw
+        *tx = cx
+        *tw = cw - bw - gap
+        return
+    }
+    // ART_LEFT, the default.
+    *ax = cx
+    *tx = cx + bw + gap
+    *tw = cw - bw - gap
+}
+
+// DRAW THE PICTURE OF A WIDGET into the box worked out above.
+//
+// The tint: `art_tint` is a style COLOUR TOKEN, so it follows the theme
+// like every other colour in fUi. A disabled widget draws its icon in the
+// pale text colour -- the same signal its label gets, and the reason is
+// the same as in `draw_text`: a disabled control has to read as disabled
+// in every part of it, not just the words.
+fn draw_widget_art(c: *mut Ctx, e: *mut widget.Widget) {
+    if !widget.w_has_art(e) {
+        return
+    }
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let kind: u32 = widget.w_kind(e)
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, kind)))
+    let pady: f64 = pady_of(c, e)
+    var ax: f64 = 0.0
+    var ay: f64 = 0.0
+    var aw: f64 = 0.0
+    var ah: f64 = 0.0
+    var tx: f64 = 0.0
+    var tw: f64 = 0.0
+    art_text_split(c, e, widget.w_x(e) + padx, widget.w_y(e) + pady,
+        widget.w_w(e) - 2.0 * padx, widget.w_h(e) - 2.0 * pady,
+        &ax, &ay, &aw, &ah, &tx, &tw)
+    draw_art(c, e, ax, ay, aw, ah)
+}
+
+// DIE TOENUNG EINES BILDES, AN EINER STELLE. Sie wird vom geraden und
+// vom umgeformten Zeichenweg gebraucht, und zwei Fassungen davon
+// waeren zwei Antworten auf die Frage, welche Farbe ein abgeschaltetes
+// Symbol hat.
+fn art_tint_of(c: *mut Ctx, e: *mut widget.Widget) -> u32 {
+    var tint: u32 = 0
+    let tk: u32 = widget.w_art_tint(e)
+    if tk != 0 as u32 {
+        tint = color_of(c, tk)
+    }
+    if widget.w_state(e) == style.STATE_DISABLED {
+        // A tinted icon goes pale with the text. An icon in its OWN
+        // colours is left alone: washing a company logo out would be a
+        // surprise, and the control reads as disabled from its label.
+        if tk != 0 as u32 {
+            tint = color_of(c, style.color_token(style.TOK_TEXT_DISABLED))
+        }
+    }
+    return tint
+}
+
+fn draw_art(c: *mut Ctx, e: *mut widget.Widget, x: f64, y: f64, w: f64,
+    h: f64) {
+    if !widget.w_has_art(e) || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let z: *mut painter.Painter = ctx_painter(c)
+    let tint: u32 = art_tint_of(c, e)
+    let k: u32 = widget.w_art_kind(e)
+    if k == widget.ART_IMAGE {
+        let im: *mut uiimage.Image = widget.w_art_p(e) as *mut uiimage.Image
+        uiimage.image_draw(z, im, x, y, w, h, uiimage.FIT_CONTAIN, tint)
+        return
+    }
+    if k == widget.ART_SVG {
+        // AB HIER IST EIN SYMBOL DASSELBE WIE EIN PNG.
+        //
+        // `w_set_svg` haelt einen `uisvg.Icon`, also ein SCHON GERASTERTES
+        // Symbol. Gerastert wird nicht hier: das laeuft den XML-Baum und
+        // alle Pfade ab, und wer das im Zeichenweg macht, bezahlt den
+        // Zerteiler bei jedem Bildaufbau. Der Aufrufer rastert mit
+        // `uisvg.icon_render` einmal je Groesse -- der Kopf von
+        // lib/fui/uisvg.fi sagt warum.
+        //
+        // Deshalb gibt es hier auch KEINEN zweiten Zeichenweg fuer SVG:
+        // dasselbe `uiimage.image_draw` wie beim Bild, mit demselben
+        // Alpha und derselben Toenung.
+        let ic: *mut uisvg.Icon = widget.w_art_p(e) as *mut uisvg.Icon
+        var vw: uiimage.Image = uisvg.icon_view(ic)
+        uiimage.image_draw(z, &vw, x, y, w, h, uiimage.FIT_CONTAIN, tint)
+    }
+}
+
+// ======================================================================
+// DASSELBE BILD UNTER EINER AFFINEN ABBILDUNG
+// ======================================================================
+//
+// WARUM ES DAS BRAUCHT. lib/fui/scene.fi darf einem Knoten eine
+// Umformung geben (`transform` im Stilblatt ist ein Stilwert wie jeder
+// andere). Fuer einen Kasten, einen Text und die meisten Widgets gibt
+// es dafuer `draw_widget_xf`; ein BILD oder ein SYMBOL fiel bis zum
+// 22.09.2026 heraus und wurde GERADE gemalt -- eine Karte mit einem
+// gedrehten Wappen zeigte das Wappen aufrecht, und im Quelltext stand
+// als Begruendung, ein Bild unter einer Matrix waere eine zweite
+// Abtastung. Das war nicht richtig: die Abtastung gibt es schon, sie
+// steht in `uiimage.sample_bilinear`, und der Weg darauf ist
+// `transform.tf_draw_image`. Hier wird er nur angeschlossen.
+//
+// ES WIRD NICHTS NACHGERECHNET: wohin das Bild im Widget gehoert, sagt
+// `art_text_split` (dieselbe Zerlegung wie im geraden Weg), wie es ins
+// Rechteck passt, sagt `uiimage.image_fit` (dieselbe Einpassung, die
+// `image_draw` benutzt), und wie es unter der Matrix abgetastet wird,
+// sagt transform.fi. Diese Funktion reicht drei Zahlen weiter.
+fn draw_art_xf(c: *mut Ctx, e: *mut widget.Widget,
+    xf: *mut transform.Xform, x: f64, y: f64, w: f64, h: f64) {
+    if !widget.w_has_art(e) || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let z: *mut painter.Painter = ctx_painter(c)
+    let tint: u32 = art_tint_of(c, e)
+    let k: u32 = widget.w_art_kind(e)
+    var im: uiimage.Image = uiimage.image_new()
+    if k == widget.ART_IMAGE {
+        im = *(widget.w_art_p(e) as *mut uiimage.Image)
+    } else if k == widget.ART_SVG {
+        im = uisvg.icon_view(widget.w_art_p(e) as *mut uisvg.Icon)
+    } else {
+        return
+    }
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var dw: f64 = 0.0
+    var dh: f64 = 0.0
+    uiimage.image_fit(&im, x, y, w, h, uiimage.FIT_CONTAIN, &dx, &dy,
+        &dw, &dh)
+    transform.tf_draw_image_tinted(z, xf, &im, dx, dy, dw, dh, 1.0,
+        tint)
+}
+
+// DIE GENAUE ENTSPRECHUNG VON `draw_widget_art`, nur unter einer
+// Abbildung: derselbe Kasten, dieselbe Zerlegung, dasselbe Bild --
+// und ausdruecklich NICHTS darueber hinaus. Wer zusaetzlich Flaeche
+// und Schrift gedreht haben will, ruft vorher `draw_widget_xf`; dass
+// diese Funktion es nicht von sich aus tut, haelt sie mit dem geraden
+// Weg deckungsgleich. Ein Zeichenweg, der mehr malt als sein gerades
+// Gegenstueck, faellt sonst genau dann auf, wenn eine Drehung
+// dazukommt.
+fn draw_widget_art_xf(c: *mut Ctx, e: *mut widget.Widget,
+    xf: *mut transform.Xform) {
+    if !widget.w_has_art(e) {
+        return
+    }
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let kind: u32 = widget.w_kind(e)
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, kind)))
+    let pady: f64 = pady_of(c, e)
+    var ax: f64 = 0.0
+    var ay: f64 = 0.0
+    var aw: f64 = 0.0
+    var ah: f64 = 0.0
+    var tx: f64 = 0.0
+    var tw: f64 = 0.0
+    art_text_split(c, e, widget.w_x(e) + padx, widget.w_y(e) + pady,
+        widget.w_w(e) - 2.0 * padx, widget.w_h(e) - 2.0 * pady,
+        &ax, &ay, &aw, &ah, &tx, &tw)
+    draw_art_xf(c, e, xf, ax, ay, aw, ah)
+}
+
+// ======================================================================
+// HOW BIG A WIDGET WANTS TO BE
+// ======================================================================
+//
+// THE LAYOUT HAS TO KNOW ABOUT THE PICTURE, or a button with an icon gets
+// exactly the width its text needs and the icon is clipped. Justin's point
+// C, 13.09.2026: "layout.fi must count the size into pref_w/pref_h".
+//
+// lib/fui/layout.fi deliberately takes NUMBERS and not widgets
+// (`box_measure(s, pref, n)`) -- it is the part that must stay testable
+// without a canvas or a font. So the measuring of a widget lives here,
+// where the theme and the painter already are, and the caller feeds the
+// result into the layout. That keeps the direction of the dependency the
+// way the rest of the library has it.
+//
+// `w_set_pref` on the widget is what this is for: measure once, lay out
+// many times.
+fn pref_of(c: *mut Ctx, e: *mut widget.Widget, pw: *mut f64,
+    ph: *mut f64) {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let kind: u32 = widget.w_kind(e)
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, kind)))
+    let pady: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_Y,
+        (*s).pad_y as usize, def_pad_y(c, kind)))
+    let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+
+    // --- the text
+    var tw: f64 = 0.0
+    var th: f64 = 0.0
+    if widget.w_text_len(e) != 0 {
+        var r: painter.TextRun = text_run_of(c, e, px)
+        tw = painter.run_width(z, &r, widget.w_text(e),
+            widget.w_text_len(e))
+        th = painter.run_line_height(z, &r)
+    }
+
+    // --- the picture
+    var aw: f64 = 0.0
+    var ah: f64 = 0.0
+    var gap: f64 = 0.0
+    if widget.w_has_art(e) {
+        art_box(c, e, &aw, &ah)
+        var g: usize = widget.w_art_gap(e)
+        if g == 0 {
+            g = def_art_gap(c)
+        }
+        if widget.w_text_len(e) != 0 {
+            gap = len_of(c, g)
+        }
+    }
+
+    let al: u32 = widget.w_art_align(e)
+    var cw: f64 = 0.0
+    var chh: f64 = 0.0
+    if !widget.w_has_art(e) {
+        cw = tw
+        chh = th
+    } else if al == widget.ART_ONLY {
+        // No text: the picture IS the content, and the box is square
+        // unless the caller asked for something else.
+        cw = aw
+        chh = ah
+    } else if al == widget.ART_ABOVE || al == widget.ART_ABOVE_CENTER {
+        // Stacked: the wider of the two, and the heights add.
+        cw = tw
+        if aw > cw {
+            cw = aw
+        }
+        chh = ah + gap + th
+        if widget.w_text_len(e) == 0 {
+            chh = ah
+        }
+        // MEHRZEILIGE BESCHRIFTUNG BRAUCHT MEHR HOEHE, und wer sie nicht
+        // einrechnet, bekommt genau den Fehler, den der Kopf dieser
+        // Datei beschreibt: die zweite Zeile laeuft unten aus der
+        // Kachel. Die Breite waechst dabei NICHT -- das ist ja der Sinn
+        // des Umbruchs.
+        let zl: usize = widget.w_text_lines(e)
+        if zl > 1 && widget.w_text_len(e) != 0 {
+            chh = chh + ((zl - 1) as f64) * line_h_of(c, e)
+        }
+    } else {
+        // Side by side: the widths add, the height is the taller.
+        cw = aw + gap + tw
+        chh = th
+        if ah > chh {
+            chh = ah
+        }
+    }
+    *pw = cw + 2.0 * padx
+    *ph = chh + 2.0 * pady
+    // A CONTROL IS AT LEAST AS HIGH AS ONE. `ctrl_h` is the theme's
+    // "what you touch is at least 32 high" -- a 16 point icon in a
+    // button must not make the button shorter than every other button
+    // in the row.
+    if kind != widget.KIND_LABEL {
+        let minh: f64 = len_of(c, (*fo).ctrl_h)
+        if *ph < minh {
+            *ph = minh
+        }
+    }
+}
+
+// Measure and store in one go -- what a caller does before laying out.
+fn set_pref_from(c: *mut Ctx, e: *mut widget.Widget) {
+    var pw: f64 = 0.0
+    var ph: f64 = 0.0
+    pref_of(c, e, &pw, &ph)
+    widget.w_set_pref(e, pw, ph)
+}
+
+// ======================================================================
 // THE TEXT OF A WIDGET
 // ======================================================================
 //
@@ -341,10 +970,10 @@ fn draw_text(c: *mut Ctx, e: *mut widget.Widget) {
         (*s).font_px as usize, def_font(c)))
     let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
         (*s).pad_x as usize, def_pad_x(c, kind)))
-    var align: u32 = def_align(kind)
-    if ((*s).set_mask & style.SF_ALIGN) != 0 as u32 {
-        align = (*s).align as u32
-    }
+    // DIE AUSRICHTUNG KOMMT AUS EINER FUNKTION und nicht mehr aus zwei
+    // Zeilen hier: ART_ABOVE_CENTER muss sie ueberschreiben koennen, und
+    // `pref_of` fragt dieselbe Regel.
+    let align: u32 = text_align_of(e)
     let base_y: f64 = painter.text_baseline_mid(z, widget.w_y(e),
         widget.w_h(e), px)
     // THE RUN CARRIES EVERYTHING THE STYLE SAYS ABOUT TEXT.
@@ -356,9 +985,139 @@ fn draw_text(c: *mut Ctx, e: *mut widget.Widget) {
     // `draw_text`, so every one of them gets tracking, kerning, the
     // outline and the shadow without knowing that any of it exists.
     var r: painter.TextRun = text_run_of(c, e, px)
-    let e2: f64 = painter.run_draw(z, &r, widget.w_x(e) + padx, base_y,
-        widget.w_w(e) - 2.0 * padx, color_of(c, tf),
-        widget.w_text(e), widget.w_text_len(e), align)
+
+    // THE PICTURE TAKES ITS ROOM OFF THE TEXT BOX.
+    //
+    // Without this the text would be laid out in the whole rect while the
+    // icon sits on the left of it, and a centred label would run straight
+    // through the icon. Both sides ask `art_text_split`, so they cannot
+    // disagree -- that is the whole reason it is one function.
+    var tx0: f64 = widget.w_x(e) + padx
+    var tw0: f64 = widget.w_w(e) - 2.0 * padx
+    if widget.w_has_art(e) {
+        let al: u32 = widget.w_art_align(e)
+        if al == widget.ART_ONLY {
+            // A picture-only widget draws no text at all.
+            return
+        }
+        var ax: f64 = 0.0
+        var ay: f64 = 0.0
+        var aw: f64 = 0.0
+        var ah: f64 = 0.0
+        var nx: f64 = 0.0
+        var nw: f64 = 0.0
+        art_text_split(c, e, widget.w_x(e) + padx,
+            widget.w_y(e) + pady_of(c, e), tw0,
+            widget.w_h(e) - 2.0 * pady_of(c, e),
+            &ax, &ay, &aw, &ah, &nx, &nw)
+        if al == widget.ART_ABOVE || al == widget.ART_ABOVE_CENTER {
+            // Text under the picture: the baseline moves down by the
+            // picture plus the gap, and the box keeps its width.
+            var g: usize = widget.w_art_gap(e)
+            if g == 0 {
+                g = def_art_gap(c)
+            }
+            let shift: f64 = ah + len_of(c, g)
+            let zl: usize = widget.w_text_lines(e)
+            let lh: f64 = painter.run_line_height(z, &r)
+            // MEHRZEILIG: die Grundlinie der ERSTEN Zeile so setzen, dass
+            // der ganze Block in der Restflaeche mittig steht. Wer
+            // stattdessen die erste Zeile mittig setzt und die weiteren
+            // darunter haengt, schiebt den Block nach unten aus dem
+            // Element -- im Quelltext unsichtbar, im Bild sofort.
+            if zl > 1 {
+                let blockh: f64 = ((zl - 1) as f64) * lh
+                let by2: f64 = painter.text_baseline_mid(z,
+                    widget.w_y(e) + shift,
+                    widget.w_h(e) - shift - blockh, px)
+                let nz: usize = painter.run_draw_wrapped(z, &r, tx0, by2,
+                    tw0, lh, color_of(c, tf), widget.w_text(e),
+                    widget.w_text_len(e), align, zl)
+                return
+            }
+            let by: f64 = painter.text_baseline_mid(z,
+                widget.w_y(e) + shift, widget.w_h(e) - shift, px)
+            let e3: f64 = painter.run_draw_ellipsis(z, &r, tx0, by, tw0,
+                color_of(c, tf), widget.w_text(e), widget.w_text_len(e),
+                align)
+            return
+        }
+        tx0 = nx
+        tw0 = nw
+    }
+    if tw0 <= 0.0 {
+        return
+    }
+    // AUCH DER GEWOEHNLICHE WEG KUERZT MIT PUNKTEN.
+    //
+    // Vorher schnitt `run_draw` hart auf dem letzten passenden Zeichen
+    // ab ("Netz vortaeusc"), und weil das im Quelltext nicht zu sehen
+    // ist, stand es monatelang so im Bild. `run_draw_ellipsis` malt
+    // unveraendert weiter, solange der Text passt -- der haeufige Fall
+    // kostet eine Breitenmessung und sonst nichts.
+    let zl2: usize = widget.w_text_lines(e)
+    if zl2 > 1 {
+        let lh2: f64 = painter.run_line_height(z, &r)
+        let blockh2: f64 = ((zl2 - 1) as f64) * lh2
+        let by3: f64 = painter.text_baseline_mid(z, widget.w_y(e),
+            widget.w_h(e) - blockh2, px)
+        let nz2: usize = painter.run_draw_wrapped(z, &r, tx0, by3, tw0,
+            lh2, color_of(c, tf), widget.w_text(e),
+            widget.w_text_len(e), align, zl2)
+        return
+    }
+    let e2: f64 = painter.run_draw_ellipsis(z, &r, tx0, base_y, tw0,
+        color_of(c, tf), widget.w_text(e), widget.w_text_len(e), align)
+}
+
+// The vertical padding in pixels -- pulled out because the art split
+// needs it and `draw_text` only had the horizontal one.
+fn pady_of(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    return len_of(c, style.resolve_num(sz, style.SF_PAD_Y,
+        (*s).pad_y as usize, def_pad_y(c, widget.w_kind(e))))
+}
+
+// DER ZEILENABSTAND DIESES ELEMENTS, in Bildpunkten.
+//
+// Eine eigene Funktion, weil ihn jetzt DREI Stellen brauchen: das Messen
+// (`pref_of`), das Malen (`draw_text`) und die Grundlinie der ersten
+// Zeile. Drei Rechnungen desselben Abstands gehen irgendwann auseinander.
+fn line_h_of(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+    var r: painter.TextRun = text_run_of(c, e, px)
+    return painter.run_line_height(z, &r)
+}
+
+// DIE TEXTAUSRICHTUNG DIESES ELEMENTS.
+//
+// ART_ABOVE_CENTER zwingt die Beschriftung in die Mitte -- das ist der
+// ganze Unterschied zu ART_ABOVE, und er steht hier und nicht im
+// Aufrufer, damit eine Kachel nicht zwei Dinge einstellen muss.
+fn text_align_of(e: *mut widget.Widget) -> u32 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    if widget.w_has_art(e)
+        && widget.w_art_align(e) == widget.ART_ABOVE_CENTER {
+        return style.ALIGN_CENTER
+    }
+    if ((*s).set_mask & style.SF_ALIGN) != 0 as u32 {
+        return (*s).align as u32
+    }
+    // IN EINEM RTL-ELEMENT BEGINNT DER TEXT RECHTS. Die Vorgabe "links"
+    // heisst eigentlich "am Anfang" (text-align: start), und der Anfang
+    // liegt bei `direction: rtl` rechts. Eine ausdruecklich gesetzte
+    // Ausrichtung (oben) bleibt, was sie ist, und "mittig" auch.
+    let da: u32 = def_align(widget.w_kind(e))
+    if da == style.ALIGN_LEFT && is_rtl_style(e) {
+        return style.ALIGN_RIGHT
+    }
+    return da
 }
 
 // ======================================================================
@@ -439,7 +1198,39 @@ fn text_run_of(c: *mut Ctx, e: *mut widget.Widget,
     if ((*s).set_mask & style.SF_GRADIENT) != 0 as u32 {
         r = painter.run_set_gradient(r, color_of(c, (*s).grad_col))
     }
+
+    // --- die Schreibrichtung (UAX #9). Ohne Angabe entscheidet das
+    // erste starke Zeichen -- eine arabische Beschriftung in einer
+    // Oberflaeche, die nichts ueber Richtung weiss, steht trotzdem
+    // richtig herum.
+    r = painter.run_set_dir(r, dir_of(e))
     return r
+}
+
+// DIE SCHREIBRICHTUNG EINES ELEMENTS als bidi.DIR_*. Einzeln
+// uebersetzt und nicht als Zahl durchgereicht: style.fi muss kernelrein
+// bleiben und kennt bidi.fi nicht, also stehen die Werte dort ein
+// zweites Mal -- und diese Funktion ist die Stelle, an der die beiden
+// Listen einander begegnen.
+fn dir_of(e: *mut widget.Widget) -> u32 {
+    let s: *mut style.Style = style.styleset_base(widget.w_styleset(e))
+    let d: u32 = style.style_direction(s)
+    if d == style.DIR_RTL {
+        return bidi.DIR_RTL
+    }
+    if d == style.DIR_LTR {
+        return bidi.DIR_LTR
+    }
+    return bidi.DIR_AUTO
+}
+
+// Steht im Stil ausdruecklich RTL? Nur dann beginnen Text und Bild
+// rechts. Bei DIR_AUTO entscheidet der Text nur ueber seine eigene
+// Reihenfolge, nicht ueber die Anordnung im Element -- sonst sprang eine
+// Beschriftung von links nach rechts, sobald jemand ein arabisches Wort
+// hineinschreibt.
+fn is_rtl_style(e: *mut widget.Widget) -> bool {
+    return dir_of(e) == bidi.DIR_RTL
 }
 
 // A SIGNED design length into pixels. `len_of` is unsigned because
@@ -463,6 +1254,7 @@ fn len_signed(c: *mut Ctx, n: i64) -> f64 {
 // code of its own.
 fn draw_label(c: *mut Ctx, e: *mut widget.Widget) {
     draw_base(c, e)
+    draw_widget_art(c, e)
     draw_text(c, e)
     draw_focus_ring(c, e)
 }
@@ -471,9 +1263,140 @@ fn draw_label(c: *mut Ctx, e: *mut widget.Widget) {
 // widget defaults (fill instead of transparent, text centred instead of
 // left).
 fn draw_button(c: *mut Ctx, e: *mut widget.Widget) {
+    // DER UEBERGANG LAEUFT HIER, nicht in der Anwendung. Ohne
+    // eingehaengtes Register kostet die Zeile einen Vergleich.
+    //
+    // WARUM IN `draw_button` UND NICHT IN `draw_base`: die Wellen 2/3
+    // malen ihre Bausteine (Kasten, Griff, Bahn) als KURZLEBIGE
+    // Widgets auf dem Stapel durch `draw_base`. Ein Register, das sich
+    // seine Eintraege nach der Adresse des Widgets merkt, bekaeme dort
+    // Adressen, die gleich wieder jemand anderem gehoeren. Der ganze
+    // Knopf ist langlebig, sein Griff ist es nicht.
+    let dirty: bool = anim_run(c, e)
     draw_base(c, e)
+    draw_widget_art(c, e)
     draw_text(c, e)
     draw_focus_ring(c, e)
+}
+
+// ======================================================================
+// DASSELBE WIDGET UNTER EINER AFFINEN ABBILDUNG
+// ======================================================================
+//
+// WARUM DAS HIER STEHT UND NICHT IM ANWENDUNGSPROGRAMM. lib/fui/
+// transform.fi konnte seit seinem ersten Tag ein gedrehtes Rechteck und
+// einen gedrehten Text malen -- aber nur, wer die Datei kannte, kam
+// daran. Ein Widget ging diesen Weg nirgends, und damit war die
+// Faehigkeit genau das, wogegen diese Bibliothek angetreten ist:
+// vorhanden, geprueft, nicht angeschlossen. Der Zeichenweg gehoert in
+// dieselbe Datei wie `draw_base`, und zwar aus demselben Grund, aus dem
+// `draw_elevation` hier steht und nicht in effect.fi: WAS ein Widget
+// malt, entscheidet render.fi; WIE die Unschaerfe oder die Matrix
+// gerechnet wird, entscheidet das Fachmodul.
+//
+// ES IST DERSELBE AUFBAU wie oben, Schritt fuer Schritt -- Flaeche,
+// Rand, Inhalt, Fokusring -- nur dass jede Form durch die Matrix geht:
+// die PUNKTE werden abgebildet und danach gerastert, nie das fertige
+// Bild gedreht (der Grund steht im Kopf von transform.fi: was einmal
+// Pixel ist, bekommt Treppen, die kein Kantenglaetten mehr wegnimmt).
+//
+// WAS DER AUFRUFER DAZU TUN MUSS: die Trefferpruefung mitdrehen. Sonst
+// klickt er neben das, was er sieht. Dafuer gibt es
+// `transform.tf_bind_panel` -- eine Zeile, und der normale Zeigerpfad
+// von control.fi trifft das gedrehte Widget.
+fn draw_widget_xf(c: *mut Ctx, e: *mut widget.Widget,
+    xf: *mut transform.Xform) {
+    // Auch der gedrehte Weg fuehrt den Uebergang -- sonst haette ein
+    // schief stehender Knopf kein Hover und niemand wuesste warum.
+    let dirty: bool = anim_run(c, e)
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let r: f64 = len_of(c, style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize, def_radius(c, kind)))
+
+    // ---- 1. DIE FLAECHE. Dieselbe Regel wie in `draw_base`: was nicht
+    // sichtbar ist, wird NICHT gemalt -- kein Ersatzanstrich.
+    // JEDE FARBE GEHT DECKEND HINEIN. `transform.tf_*` gibt die Farbe
+    // unveraendert an die Leinwand weiter, und die rechnet mit dem
+    // Alphakanal: eine Farbe ohne ihn ist eine unsichtbare Farbe. Das
+    // ist derselbe `theme.opaque`, den lib/svg und tools/fui/gallery8
+    // an dieser Stelle rufen.
+    let bg: u32 = style.resolve_bg(sz, zu, def_bg_state(kind, zu))
+    if style.color_is_visible(bg) {
+        transform.tf_fill_round_rect(z, xf, x, y, w, h, r, theme.opaque(color_of(c, bg)))
+    }
+
+    // ---- 2. DER RAND. Ein Ring ist die Flaeche minus die innere
+    // Flaeche; unter einer Abbildung heisst das: das aeussere
+    // abgerundete Rechteck malen und das innere in der FLAECHENFARBE
+    // daruebersetzen, wenn es eine gibt. Ohne Flaechenfarbe bleibt der
+    // Rand ein voller Kasten -- das waere falsch, also wird er dann
+    // nicht gemalt. Diese Einschraenkung steht hier ehrlich, statt
+    // einen zweiten Ringrasterer aufzumachen.
+    let ra: u32 = style.resolve_border(sz, zu, def_border(kind))
+    let st: f64 = len_of(c, style.resolve_num(sz, style.SF_BORDER_W,
+        (*style.styleset_base(sz)).border_w as usize,
+        def_border_width(c, kind)))
+    if style.color_is_visible(ra) && st > 0.0 && style.color_is_visible(bg) {
+        transform.tf_fill_round_rect(z, xf, x, y, w, h, r, theme.opaque(color_of(c, ra)))
+        var ir: f64 = r - st
+        if ir < 0.0 {
+            ir = 0.0
+        }
+        transform.tf_fill_round_rect(z, xf, x + st, y + st,
+            w - 2.0 * st, h - 2.0 * st, ir, theme.opaque(color_of(c, bg)))
+    }
+
+    // ---- 3. DER FOKUSRING. Er steht hier VOR dem Inhalt und nicht
+    // wie im geraden Weg dahinter, und das ist kein Versehen: unter
+    // einer Abbildung wird ein Ring aus zwei gefuellten Formen gebaut
+    // (aussen der Ring, innen die Flaechenfarbe wieder hinein), und
+    // die innere Fuellung wuerde die Schrift wegwischen, kaeme sie
+    // danach. Am Bild aendert die Reihenfolge nichts -- der Ring liegt
+    // am Rand, die Schrift in der Mitte.
+    if widget.w_is_focus(e) && !widget.w_is_disabled(e)
+        && style.color_is_visible(bg) {
+        let m: *mut theme.Theme = ctx_theme(c)
+        let fw: f64 = len_of(c, (*theme.theme_shape(m)).focus_w)
+        transform.tf_fill_round_rect(z, xf, x, y, w, h, r,
+            theme.opaque((*theme.theme_colors(m)).accent))
+        var ir2: f64 = r - fw
+        if ir2 < 0.0 {
+            ir2 = 0.0
+        }
+        transform.tf_fill_round_rect(z, xf, x + fw, y + fw,
+            w - 2.0 * fw, h - 2.0 * fw, ir2, theme.opaque(color_of(c, bg)))
+    }
+
+    // ---- 4. DER INHALT. Die Schrift geht Kontur fuer Kontur durch
+    // dieselbe Matrix, und sie wird EINMAL gerastert.
+    if widget.w_text_len(e) != 0 {
+        var fallback: u32 = def_fg(kind)
+        if zu == style.STATE_DISABLED {
+            fallback = style.color_token(style.TOK_TEXT_DISABLED)
+        }
+        let tf: u32 = style.resolve_fg(sz, zu, fallback)
+        if style.color_is_visible(tf) {
+            let s: *mut style.Style = style.styleset_base(sz)
+            let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+                (*s).font_px as usize, def_font(c)))
+            let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+                (*s).pad_x as usize, def_pad_x(c, kind)))
+            // Die Grundlinie kommt aus derselben Rechnung wie beim
+            // geraden Text -- sonst saesse die Schrift im gedrehten
+            // Knopf anders als im geraden.
+            let by: f64 = painter.text_baseline_mid(z, y, h, px)
+            transform.tf_text(z, xf, x + padx, by, w - 2.0 * padx, px,
+                theme.opaque(color_of(c, tf)), widget.w_text(e), widget.w_text_len(e),
+                text_align_of(e))
+        }
+    }
 }
 
 // THE DISPATCHER OF THE BUILD-UP. Paints a widget out of what THIS
@@ -515,4 +1438,370 @@ fn draw_widget(c: *mut Ctx, e: *mut widget.Widget) {
     // Button, toggle, tile ... they all paint the same base. What
     // tells them apart are the widget defaults.
     draw_button(c, e)
+}
+// ======================================================================
+// DAS TEXTFELD AUS SEINEM PUFFER
+// ======================================================================
+//
+// Bis hierher malte ein Textfeld (widget.KIND_TEXTBOX) den festen Text
+// seines Widgets -- es gab keinen Weg, den Puffer aus lib/fui/textbuf.fi
+// mit Schreibzeiger, Auswahl und Vorbearbeitungstext zu zeigen. Das
+// steht jetzt hier, weil hier gemessen und gemalt wird, und zwar mit
+// DERSELBEN Schrift, demselben Lauf (`text_run_of`) und denselben
+// Innenabstaenden wie jedes andere Widget. Ein Feld, das mit einer
+// anderen Rechnung misst, als es malt, setzt den Schreibzeiger neben den
+// Buchstaben, hinter dem er stehen soll.
+//
+// DER VORBEARBEITUNGSTEXT (textbuf `comp_a..comp_b`, siehe den Kopf von
+// lib/fui/ime.fi) ist UNTERSTRICHEN, in der Schriftfarbe des Feldes und
+// in der Strichstaerke des Randes (theme.Shape.border_w). Keine eigene
+// Farbe: so zeichnen ihn Windows, macOS und GTK, und eine zweite
+// Farbtabelle fuer eine Linie waere genau die Drift, gegen die diese
+// Bibliothek steht.
+//
+// WAS DIESE FUNKTION NICHT WEISS: welche Taste gedrueckt wurde (editor.fi)
+// und ob gerade eine Eingabe laeuft (ime.fi). Sie malt, was im Puffer
+// steht, und die Auswahl, die eine Eingabe beim Bestaetigen ersetzen
+// wird, bekommt sie als zwei Zahlen (`keep_a`, `keep_b`) -- so muss
+// render.fi die Eingabemethode nicht kennen.
+
+// Der Messer fuer textbuf.tb_x_of / tb_caret_from_x und
+// editor.editor_scroll_to_caret: die Rueckruf-Form `mess(ctx, p, n)`.
+// `ctx` zeigt auf eine FieldMess; sie haelt, womit gemessen wird.
+struct FieldMess {
+    c: u64,   // *mut Ctx
+    e: u64,   // *mut widget.Widget
+}
+
+fn field_mess_new(c: *mut Ctx, e: *mut widget.Widget) -> FieldMess {
+    return FieldMess { c: c as u64, e: e as u64 }
+}
+
+fn field_mess(ctx: u64, p: u64, n: usize) -> f64 {
+    let fm: *mut FieldMess = ctx as *mut FieldMess
+    let c: *mut Ctx = (*fm).c as *mut Ctx
+    let e: *mut widget.Widget = (*fm).e as *mut widget.Widget
+    var r: painter.TextRun = text_run_of(c, e, field_px(c, e))
+    return painter.run_width(ctx_painter(c), &r, p, n)
+}
+
+// Die Schriftgroesse des Feldes in Pixeln -- dieselbe Aufloesung wie in
+// `draw_text`.
+fn field_px(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    return len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+}
+
+// Wo der Text beginnt: linker Rand plus Innenabstand.
+fn field_text_x0(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, widget.w_kind(e))))
+    return widget.w_x(e) + padx
+}
+
+// Die Breite der ersten i Bytes, ab Textanfang und OHNE Verschiebung.
+fn field_x_of(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    i: usize) -> f64 {
+    var fm: FieldMess = field_mess_new(c, e)
+    return textbuf.tb_x_of(t, i, field_mess, (&fm) as u64)
+}
+
+// Der Schreibzeiger auf dem Schirm. Das braucht die Plattform fuer ihr
+// Kandidatenfenster (editor.editor_ime_spot) und lib/fui/imelist.fi fuer
+// die eigene Liste.
+fn field_caret_x(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    scroll: f64) -> f64 {
+    return field_text_x0(c, e) + field_x_of(c, e, t, textbuf.tb_caret(t)) - scroll
+}
+
+// Die Zeile, in der Schreibzeiger und Auswahl stehen: von der Oberlaenge
+// bis zur Unterlaenge der Schrift, um dieselbe Grundlinie wie der Text.
+fn field_line(c: *mut Ctx, e: *mut widget.Widget, top: *mut f64,
+    h: *mut f64) -> f64 {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let px: f64 = field_px(c, e)
+    let by: f64 = painter.text_baseline_mid(z, widget.w_y(e), widget.w_h(e), px)
+    let a: f64 = painter.font_ascent(z, px)
+    let d: f64 = painter.font_descent(z, px)
+    *top = ((by - a) as i64) as f64
+    *h = ((a + d + 0.5) as i64) as f64
+    return by
+}
+
+// Die Unterstreichung des Vorbearbeitungstextes als Rechteck -- eine
+// Funktion und keine Rechnung in `draw_field`, damit ein Pruefprogramm
+// dieselbe Zahl nachmessen kann, die gemalt wird. false: es gibt keinen
+// Vorbearbeitungstext.
+fn field_underline(c: *mut Ctx, e: *mut widget.Widget,
+    t: *mut textbuf.TextBuf, scroll: f64, x: *mut f64, y: *mut f64,
+    w: *mut f64, h: *mut f64) -> bool {
+    if !textbuf.tb_has_comp(t) {
+        return false
+    }
+    let fo: *mut theme.Shape = theme.theme_shape(ctx_theme(c))
+    var st: f64 = len_of(c, (*fo).border_w)
+    if st < 1.0 {
+        st = 1.0
+    }
+    var top: f64 = 0.0
+    var lh: f64 = 0.0
+    let by: f64 = field_line(c, e, &top, &lh)
+    let x0: f64 = field_text_x0(c, e)
+    let xa: f64 = x0 + field_x_of(c, e, t, textbuf.tb_comp_a(t)) - scroll
+    let xb: f64 = x0 + field_x_of(c, e, t, textbuf.tb_comp_b(t)) - scroll
+    // Zwei Punkte unter der Grundlinie: tief genug, dass die Linie keinen
+    // Buchstaben schneidet, der auf der Grundlinie steht, und hoch genug,
+    // dass sie im Feld bleibt.
+    *x = xa
+    *y = by + len_of(c, 2)
+    *w = xb - xa
+    *h = st
+    return true
+}
+
+// Ein Stueck Text [a, b) ab der Stelle, an der es im Feld steht, und nur
+// so weit, wie das Feld reicht.
+fn field_piece(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    r: *mut painter.TextRun, a: usize, b: usize, scroll: f64, by: f64,
+    rechts: f64, col: u32) {
+    if b <= a {
+        return
+    }
+    let x: f64 = field_text_x0(c, e) + field_x_of(c, e, t, a) - scroll
+    if x >= rechts {
+        return
+    }
+    let f: f64 = painter.run_draw(ctx_painter(c), r, x, by, rechts - x, col,
+        textbuf.tb_ptr(t) + a as u64, b - a, painter.TEXT_L)
+}
+
+// Eine Markierung [a, b) als Flaeche in der Zeile, auf das Feld begrenzt.
+fn field_mark(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    a: usize, b: usize, scroll: f64, top: f64, lh: f64, links: f64,
+    rechts: f64, col: u32) {
+    if b <= a {
+        return
+    }
+    let x0: f64 = field_text_x0(c, e)
+    var xa: f64 = x0 + field_x_of(c, e, t, a) - scroll
+    var xb: f64 = x0 + field_x_of(c, e, t, b) - scroll
+    if xa < links {
+        xa = links
+    }
+    if xb > rechts {
+        xb = rechts
+    }
+    if xb > xa {
+        painter.surface(ctx_painter(c), xa, top, xb - xa, lh, col)
+    }
+}
+
+// DAS FELD. `scroll` kommt aus editor.editor_scroll, `caret_on` aus
+// editor.editor_caret_tick. `keep_a..keep_b` ist die Auswahl, die eine
+// laufende Eingabe beim Bestaetigen ersetzen wird (ime.ime_repl_a/b) --
+// sie bleibt sichtbar markiert, damit man sieht, was gleich verschwindet.
+fn draw_field(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+    scroll: f64, caret_on: bool, keep_a: usize, keep_b: usize) {
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+    draw_base(c, e)
+
+    var fallback: u32 = def_fg(kind)
+    if zu == style.STATE_DISABLED {
+        fallback = style.color_token(style.TOK_TEXT_DISABLED)
+    }
+    let fg: u32 = color_of(c, style.resolve_fg(sz, zu, fallback))
+    let sel_bg: u32 = color_of(c, style.color_token(style.TOK_SELECTION))
+    let sel_fg: u32 = color_of(c, style.color_token(style.TOK_SELECTION_TEXT))
+    let px: f64 = field_px(c, e)
+    var r: painter.TextRun = text_run_of(c, e, px)
+    let x0: f64 = field_text_x0(c, e)
+    let rechts: f64 = widget.w_x(e) + widget.w_w(e) - (x0 - widget.w_x(e))
+    var top: f64 = 0.0
+    var lh: f64 = 0.0
+    let by: f64 = field_line(c, e, &top, &lh)
+
+    // ---- 1. DIE MARKIERUNGEN, unter dem Text.
+    let sa: usize = textbuf.tb_sel_a(t)
+    let sb: usize = textbuf.tb_sel_b(t)
+    field_mark(c, e, t, sa, sb, scroll, top, lh, x0, rechts, sel_bg)
+    field_mark(c, e, t, keep_a, keep_b, scroll, top, lh, x0, rechts, sel_bg)
+
+    // ---- 2. DER TEXT. Wo die Verschiebung ein Zeichen links anschneidet,
+    // beginnt das Malen erst beim ersten GANZ sichtbaren -- ein halber
+    // Buchstabe am linken Rand liest sich wie ein anderer.
+    let n: usize = textbuf.tb_len(t)
+    var ab: usize = 0
+    while ab < n && field_x_of(c, e, t, ab) < scroll {
+        ab = textbuf.tb_next(t, ab)
+    }
+    // Die markierten Stuecke in der Markierungsschrift, der Rest in der
+    // Feldschrift. Die Grenzen sind die der Auswahl ODER der gemerkten
+    // Auswahl -- es gibt nie beide zugleich (eine Eingabe hebt die
+    // Auswahl des Puffers auf und merkt sie sich).
+    var ma: usize = sa
+    var mb: usize = sb
+    if keep_b > keep_a {
+        ma = keep_a
+        mb = keep_b
+    }
+    if ma < ab {
+        ma = ab
+    }
+    if mb < ma {
+        mb = ma
+    }
+    field_piece(c, e, t, &r, ab, ma, scroll, by, rechts, fg)
+    field_piece(c, e, t, &r, ma, mb, scroll, by, rechts, sel_fg)
+    field_piece(c, e, t, &r, mb, n, scroll, by, rechts, fg)
+
+    // ---- 3. DER VORBEARBEITUNGSTEXT: unterstrichen.
+    var ux: f64 = 0.0
+    var uy: f64 = 0.0
+    var uw: f64 = 0.0
+    var uh: f64 = 0.0
+    if field_underline(c, e, t, scroll, &ux, &uy, &uw, &uh) {
+        var ua: f64 = ux
+        var ue: f64 = ux + uw
+        if ua < x0 {
+            ua = x0
+        }
+        if ue > rechts {
+            ue = rechts
+        }
+        if ue > ua {
+            painter.surface(z, ua, uy, ue - ua, uh, fg)
+        }
+    }
+
+    // ---- 4. DER SCHREIBZEIGER, mitten in einer Eingabe an seiner Stelle
+    // IM Vorbearbeitungstext.
+    if caret_on && widget.w_is_focus(e) {
+        let cx: f64 = field_caret_x(c, e, t, scroll)
+        if cx >= x0 - 1.0 && cx <= rechts + 1.0 {
+            painter.caret_bar(z, cx, top, lh, len_of(c, 1), fg)
+        }
+    }
+    draw_focus_ring(c, e)
+}
+// ======================================================================
+// DAS TEXTFELD MIT SEINEM EDITOR
+// ======================================================================
+//
+// lib/fui/editor.fi ist die Bedienung (Tasten, Maus, Rueckgaengig) und
+// kennt keine Leinwand; ein KIND_TEXTBOX-Widget malt bis hierher nur
+// seine Beschriftung. Diese beiden Funktionen verbinden beides -- und sie
+// sind die Stelle, an der die Schreibmarke in der Zweirichtungsschrift
+// ankommt:
+//
+//   `field_measure`   der Kontext fuer editor.editor_set_visual: der Maler
+//                     und DERSELBE Textlauf, mit dem gemalt wird (Groesse,
+//                     Laufweite, Richtung aus dem Stil). Wer mit einem
+//                     anderen Lauf misst als malt, setzt die Marke neben
+//                     die Buchstaben.
+//   `draw_textfield`  Flaeche und Rand wie jedes Element, dann -- auf den
+//                     Inhaltskasten beschnitten -- Auswahl, Text und Marke.
+//
+// DER TEXTANFANG. Ein Absatz von links nach rechts beginnt links, und ein
+// langer Text rollt um `editor_scroll`. Ein Absatz von rechts nach links,
+// der ins Feld passt, steht RECHTSBUENDIG -- sein Anfang ist rechts; ein
+// leeres Feld mit `direction: rtl` hat seine Marke deshalb am rechten
+// Rand. Ist er laenger als das Feld, rollt er wie jeder andere Text.
+fn field_measure(c: *mut Ctx, e: *mut widget.Widget) -> painter.Measure {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+    return painter.measure_new(ctx_painter(c), text_run_of(c, e, px))
+}
+
+// Der linke Rand des Textes im Feld (siehe oben). `cx`/`cw` ist der
+// Inhaltskasten.
+fn field_text_origin(c: *mut Ctx, e: *mut widget.Widget,
+    ed: *mut editor.Editor, cx: f64, cw: f64) -> f64 {
+    var m: painter.Measure = field_measure(c, e)
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let p: u64 = textbuf.tb_ptr(t)
+    let n: usize = textbuf.tb_len(t)
+    let z: *mut painter.Painter = ctx_painter(c)
+    let tw: f64 = painter.run_width(z, &m.r, p, n)
+    if painter.run_para_rtl(z, &m.r, p, n) && tw <= cw {
+        return cx + cw - tw
+    }
+    return cx - editor.editor_scroll(ed)
+}
+
+fn draw_textfield(c: *mut Ctx, e: *mut widget.Widget,
+    ed: *mut editor.Editor, caret_on: bool) {
+    draw_base(c, e)
+    let z: *mut painter.Painter = ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let s: *mut style.Style = style.styleset_base(sz)
+    let kind: u32 = widget.w_kind(e)
+    let zu: u32 = widget.w_state(e)
+    let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
+        (*s).font_px as usize, def_font(c)))
+    let padx: f64 = len_of(c, style.resolve_num(sz, style.SF_PAD_X,
+        (*s).pad_x as usize, def_pad_x(c, kind)))
+    let cx: f64 = widget.w_x(e) + padx
+    let cw: f64 = widget.w_w(e) - 2.0 * padx
+    if cw <= 0.0 {
+        return
+    }
+    editor.editor_set_width(ed, cw)
+    var r: painter.TextRun = text_run_of(c, e, px)
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let p: u64 = textbuf.tb_ptr(t)
+    let n: usize = textbuf.tb_len(t)
+    let ox: f64 = field_text_origin(c, e, ed, cx, cw)
+    let base_y: f64 = painter.text_baseline_mid(z, widget.w_y(e),
+        widget.w_h(e), px)
+    let top: f64 = base_y - painter.font_ascent(z, px)
+    let lh: f64 = painter.font_ascent(z, px) + painter.font_descent(z, px)
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    if !canvas.clip_push_rect(cv, cx, widget.w_y(e), cx + cw,
+        widget.w_y(e) + widget.w_h(e)) {
+        return
+    }
+    if textbuf.tb_has_sel(t) {
+        painter.run_sel_draw(z, &r, ox, top, lh, p, n, textbuf.tb_sel_a(t),
+            textbuf.tb_sel_b(t),
+            color_of(c, style.color_token(style.TOK_SELECTION)))
+    }
+    var fallback: u32 = def_fg(kind)
+    if zu == style.STATE_DISABLED {
+        fallback = style.color_token(style.TOK_TEXT_DISABLED)
+    }
+    let fg: u32 = color_of(c, style.resolve_fg(sz, zu, fallback))
+    if n > 0 {
+        let e1: f64 = painter.run_draw(z, &r, ox, base_y, 0.0, fg, p, n,
+            painter.TEXT_L)
+    }
+    if caret_on && !textbuf.tb_has_sel(t) {
+        let kx: f64 = ox + painter.run_caret_x(z, &r, p, n,
+            textbuf.tb_caret(t))
+        var st: f64 = len_of(c, 1)
+        if st < 1.0 {
+            st = 1.0
+        }
+        // Die Marke bleibt im Kasten: am rechten Rand (Anfang eines RTL-
+        // Absatzes, Ende eines vollen LTR-Feldes) steht sie EINEN Strich
+        // davor, sonst schnitte der Clip sie weg und das Feld saehe aus,
+        // als habe es keinen Fokus.
+        var kx2: f64 = kx
+        if kx2 > cx + cw - st {
+            kx2 = cx + cw - st
+        }
+        if kx2 < cx {
+            kx2 = cx
+        }
+        painter.caret_bar(z, kx2, top, lh, st, fg)
+    }
+    canvas.clip_pop(cv)
 }

@@ -1661,7 +1661,7 @@ pub fn allocate(f: &Func) -> Alloc {
         for (bi, b) in f.blocks.iter().enumerate() {
             seen.clear();
             {
-                let mut mark = |v: Val, p: usize, first: &mut Vec<usize>, last: &mut Vec<usize>, seen: &mut Vec<usize>| {
+                let mark = |v: Val, p: usize, first: &mut Vec<usize>, last: &mut Vec<usize>, seen: &mut Vec<usize>| {
                     let v = v as usize;
                     if v >= nv {
                         return;
@@ -4110,6 +4110,17 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     if debug_vars_active(f) {
         return Some("variable debug information active".into());
     }
+    // Round GAPS: `__sqrt` (fsqrt.rs) is emitted by the base path only. On
+    // main every function with a float already goes there (below); this
+    // check keeps it so once a float register class lands (branch xmm-ra),
+    // instead of hitting "sqrt in the integer register path".
+    if f
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Un(UnOp::Sqrt | UnOp::Bits, _))))
+    {
+        return Some("__sqrt / __bits".into());
+    }
     // FLOATING POINT: this allocator knows only the integer registers. `f64`
     // lives in the SSE registers and needs a second register class with
     // intervals of its own. As long as that is missing, a function containing
@@ -6002,9 +6013,17 @@ fn emit_inst(
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
+            if matches!(op, UnOp::Sqrt | UnOp::Bits) {
+                // Floats never reach this allocator (`unsupported`: "f64 in
+                // the value set"), sqrt exists only on floats, and a
+                // function with `__bits` is sent to the base path
+                // (`unsupported_basic`).
+                return Err("internal error: sqrt/bits in the integer register path".into());
+            }
             ra.load_full(e, "rax", *x);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", rn("rax", bits))),
+                UnOp::Sqrt | UnOp::Bits => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");
@@ -6427,6 +6446,11 @@ fn emit_inst(
             const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
             if args.is_empty() {
                 return Err("internal error: syscall without number".to_string());
+            }
+            // FIRN r64: the Android forms (codegen_x86.rs,
+            // `emit_syscall_android`, the same rewrite on the base path).
+            if crate::target::android() && emit_syscall_android_ra(e, ra, i, args)? {
+                return Ok(());
             }
             // The same class of bug as with the call: `r10`, `r8` and `r9`
             // are at the same time scratch registers of the allocation.
@@ -7357,7 +7381,7 @@ mod tests {
         f.set_term(bd, Term::Ret(Some(cd)));
         f.set_term(0, Term::Switch { val: 0, ty: FTy::U32, cases, default: bd });
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
-        assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
+        assert!(asm.contains("jmp qword ptr [rcx + rax*8]"), "{}", asm);
         assert!(!asm.contains("mov eax, eax"), "superfluous zero extension:\n{}", asm);
         let body = asm.split("main:").nth(1).unwrap();
         // The value is not written into its frame slot first.
@@ -7544,4 +7568,87 @@ mod tests {
             add
         );
     }
+}
+
+/// FIRN r64 -- `--target=x86_64-android` on the register allocated path.
+/// Same table and the same poll -> ppoll shape as the base path
+/// (codegen_x86.rs, `emit_syscall_android`); the clobbers are the ones of
+/// every syscall (`M_CALL`: rdi..r9 and r11, rax/rcx are scratch anyway).
+fn emit_syscall_android_ra(e: &mut Emitter, ra: &Ra, i: &Inst, args: &[Val]) -> Result<bool, String> {
+    const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
+    let Some(nr) = ra.a.imm(args[0]) else {
+        return Ok(false);
+    };
+    let given = &args[1..];
+    // Argument values into their registers: register sources as one
+    // parallel move (they may sit in each other's targets), then the rest.
+    fn move_args(e: &mut Emitter, ra: &Ra, srcs: &[(&str, Val)]) {
+        let mut moves: Vec<(String, String)> = Vec::new();
+        let mut later: Vec<(&str, Val)> = Vec::new();
+        for (r, v) in srcs {
+            let o = ra.opnd(*v);
+            if is_reg64(&o) {
+                moves.push((r.to_string(), o));
+            } else {
+                later.push((*r, *v));
+            }
+        }
+        parallel_reg_moves(e, &moves);
+        for (r, v) in later {
+            ra.load_full(e, r, v);
+        }
+    }
+    if nr == 7 {
+        if given.len() < 3 {
+            return Err("x86_64-android: poll needs three arguments".to_string());
+        }
+        move_args(e, ra, &[("rdi", given[0]), ("rsi", given[1]), ("rax", given[2])]);
+        e.line("mov r11, rax");
+        e.line("mov rcx, 1000");
+        e.line("cqo");
+        e.line("idiv rcx");
+        e.line("imul rdx, rdx, 1000000");
+        e.line("sub rsp, 16");
+        e.line("mov qword ptr [rsp], rax");
+        e.line("mov qword ptr [rsp + 8], rdx");
+        e.line("mov rdx, rsp");
+        e.line("xor ecx, ecx");
+        e.line("test r11, r11");
+        e.line("cmovs rdx, rcx");
+        e.line("xor r10d, r10d");
+        e.line("mov r8d, 8");
+        e.line("mov eax, 271");
+        e.line("syscall");
+        e.line("add rsp, 16");
+        if let Some(d) = i.dst {
+            ra.store_dst(e, d, "rax");
+        }
+        return Ok(true);
+    }
+    let Some((new_nr, form)) = crate::syscalls::x86_android(nr) else {
+        return Ok(false);
+    };
+    let mut srcs: Vec<(&str, Val)> = Vec::new();
+    let mut imms: Vec<(&str, i64)> = Vec::new();
+    for (k, x) in form.iter().enumerate() {
+        match x {
+            crate::syscalls::X::A(j) => {
+                let v = given.get(*j).ok_or_else(|| {
+                    format!("x86_64-android: system call {} needs argument {}", nr, j + 1)
+                })?;
+                srcs.push((SYS_REGS[k], *v));
+            }
+            crate::syscalls::X::I(c) => imms.push((SYS_REGS[k], *c)),
+        }
+    }
+    move_args(e, ra, &srcs);
+    for (r, c) in imms {
+        e.line(&format!("mov {}, {}", r, c));
+    }
+    e.line(&format!("mov eax, {}", new_nr));
+    e.line("syscall");
+    if let Some(d) = i.dst {
+        ra.store_dst(e, d, "rax");
+    }
+    Ok(true)
 }

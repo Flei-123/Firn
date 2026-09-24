@@ -24,7 +24,6 @@
 //
 // Everything antialiased through the rasteriser Certus also paints the
 // page with (lib/font/raster.fi) -- no GDI, no Xlib, no system font.
-// Systemschrift.
 //
 //   surface          a rectangle
 //   round_rect       a rectangle with round corners
@@ -36,11 +35,24 @@
 //
 // ================================= THE FOUR CORNERS WITHOUT lib/svg
 //
-// Certus rounds with `svg.pfad.pfad_rund_rechteck`. lib/svg does NOT
-// exist in the Firn tree (checked: lib/ has browser, css, dom, font,
-// gc, ..., but no svg), and fUi must not hang on an application
-// library. The four corners therefore stand here, as cubics straight in
-// the rasteriser.
+// Certus rounds with `svg.pfad.pfad_rund_rechteck`. THIS PARAGRAPH USED
+// TO SAY that lib/svg does not exist in the Firn tree -- it did not
+// when the file was written, but it does since the port in `2b82d78e`,
+// and a reason that has stopped being true is worse than none. The
+// corners stay here anyway, for the reason that actually carries:
+//
+// this file is the layer every widget draws through, and it draws
+// STRAIGHT INTO THE RASTERISER with four cubics and no allocation.
+// `svg.pfad` is the other direction -- a path object that is built,
+// kept and handed to a filler, which is what a DOCUMENT needs and what
+// a button does not. Pulling it in here would hang the drawing layer of
+// every control on the SVG stack (path, stroke, paint, xml) for four
+// corner arcs.
+//
+// Where lib/svg genuinely OWNS something, fUi uses it and does not
+// write a second copy: `lib/fui/transform.fi` takes all of its matrix
+// arithmetic from `lib/svg/matrix.fi`. The rule is one place per thing,
+// not one library per tree.
 //
 // The factor 0.5523 is the well known one: a cubic Bezier meets a
 // quarter circle with an error under 0.03 % of the radius when the
@@ -69,12 +81,17 @@ import paint.canvas
 import font.raster
 import font.metrics
 import font.ttf
+import font.gsub
+import str.ucd_bidi
 import fui.theme
+import fui.bidi
+import fui.shape
 
 export {
     Painter, painter_new, painter_init, painter_free, painter_ok,
     painter_canvas, painter_set_font, painter_font,
-    surface, round_rect, round_ring, border_col,
+    surface, round_rect, round_ring, border_col, mit_alpha,
+    round_rect_grad, mix_argb,
     text, text_width, text_fits_upto, text_baseline_mid,
     TEXT_L, TEXT_M, TEXT_R,
     caret_bar,
@@ -84,7 +101,14 @@ export {
     run_set_weight, run_set_slant, run_set_line_height,
     run_set_outline, run_set_shadow, run_set_gradient,
     run_width, run_fits_upto, run_draw, run_line_height,
+    run_fits_ellipsis, run_draw_ellipsis, ellipsis_w,
+    run_line_upto, run_line_count, run_draw_wrapped,
     advance_of, pair_kern,
+    // DIE ZWEIRICHTUNGSSCHRIFT (siehe "DER BIDI-WEG" weiter unten)
+    run_set_dir, run_dir, run_caret_x, run_hit, run_para_rtl,
+    run_sel_draw, run_is_bidi, BIDI_CAP,
+    Measure, measure_new, measure_x, measure_hit, measure_width,
+    measure_rtl,
 }
 
 // The alignment horizontally. Vertically there is only one sensible
@@ -108,6 +132,15 @@ struct Painter {
     w: usize,
     h: usize,
     ok: usize,
+    // ---- DER BIDI-WEG (siehe dort). Die Tabelle aus der UCD, der
+    // Arbeitsraum fuer BIDI_CAP Zeichen, und was gerade darin steht.
+    bt: u64,          // ucd_bidi.ucd_bidi_map, 0 = keine Tabelle
+    bx: u64,          // bidi_bytes() Oktette
+    bn: usize,        // vorbereitete Zeichen, 0 = der alte Weg
+    blev: u8,         // Absatzebene des ersten Absatzes
+    bvn: usize,       // sichtbare Glyphen der zuletzt gelegten Zeile
+    gs: gsub.Gsub,    // die arabischen Lookups der Schrift
+    gs_fm: u64,       // fuer welche Schrift `gs` gilt
 }
 
 #[no_gc]
@@ -115,6 +148,8 @@ fn painter_new() -> Painter {
     return Painter {
         cv: 0, ra: raster.raster_new(), rbuf: 0 as *mut u8, rcap: 0,
         scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
+        bt: 0, bx: 0, bn: 0, blev: 0 as u8, bvn: 0,
+        gs: gsub.gsub_new(), gs_fm: 0,
     }
 }
 
@@ -139,6 +174,18 @@ fn painter_init(z: *mut Painter, cv: *mut canvas.Canvas, w: usize,
     if (*z).scratch as usize == 0 {
         return false
     }
+    // DIE BIDI-TABELLE UND IHR ARBEITSRAUM. Scheitert eines davon, malt
+    // dieser Maler weiter -- aber jeden Text von links nach rechts, wie
+    // vor der Bidi-Runde. Das ist kein stiller Ersatz: `run_is_bidi`
+    // sagt es, und tools/fui/bidi_main.fi prueft es.
+    (*z).bt = ucd_bidi.ucd_bidi_map()
+    if (*z).bt != 0 {
+        (*z).bx = rt.heap_alloc(bidi_bytes())
+        if (*z).bx == 0 {
+            ucd_bidi.ucd_bidi_free((*z).bt)
+            (*z).bt = 0
+        }
+    }
     (*z).ok = 1
     return true
 }
@@ -151,6 +198,14 @@ fn painter_free(z: *mut Painter) {
     if (*z).scratch as usize != 0 {
         rt.heap_free((*z).scratch as u64, SCRATCH)
         (*z).scratch = 0 as *mut u8
+    }
+    if (*z).bx != 0 {
+        rt.heap_free((*z).bx, bidi_bytes())
+        (*z).bx = 0
+    }
+    if (*z).bt != 0 {
+        ucd_bidi.ucd_bidi_free((*z).bt)
+        (*z).bt = 0
     }
     (*z).ok = 0
 }
@@ -230,12 +285,39 @@ fn utf8_at(p: u64, n: usize, i: usize, adv: *mut usize) -> u32 {
 // A rectangle. The simplest thing, and it does NOT go through the
 // rasteriser: whole pixels need no antialiasing, and `canvas_fill_rect`
 // is many times faster.
+
+// ===================================== ALPHA ERGAENZEN, NICHT VERWERFEN
+//
+// UEBERNOMMEN AUS DEM CERTUS-ZWEIG (lib/fui/uipaint.fi, 13.09.2026),
+// wo dieser Fehler gefunden und ausgeschrieben wurde. Er steckte in
+// BEIDEN Schalen, und er steckte auch hier.
+//
+// Alle vier Fuellwege riefen `theme.opaque(col)`. Das SETZT das Alpha
+// auf voll -- auch dann, wenn der Aufrufer ausdruecklich eines
+// mitgegeben hat. Eine Farbe wie `0x22 << 24 | 0x1A73E8` ("der Akzent
+// mit 13 % Deckkraft") wurde damit zu vollem Blau.
+//
+// GEMESSEN (Certus): der Fokusrand der Adresszeile auf dem Telefon.
+// Gemeint war eine Lasur, unter der die Pille hell bleibt (rechnerisch
+// #D4E2F2); gemalt wurde die Pille VOLL in der Akzentfarbe. Warum es
+// niemandem auffiel: blau auf blau sieht aus wie Absicht. Erst mit
+// einem gruenen Akzent war die Flaeche knallgruen.
+//
+// `opaque` bleibt fuer den Normalfall: wer 0xRRGGBB uebergibt (Alpha
+// 0), will eine deckende Flaeche. Wer ein Alpha SETZT, meint es auch.
+#[no_gc]
+fn mit_alpha(col: u32) -> u32 {
+    if (col >> 24) & 255 as u32 == 0 as u32 {
+        return theme.opaque(col)
+    }
+    return col
+}
 fn surface(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, col: u32) {
     if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
         return
     }
     canvas.canvas_fill_rect(painter_canvas(z), x, y, x + w, y + h,
-        theme.opaque(col))
+        mit_alpha(col))
 }
 
 // A line. Horizontal or vertical -- a slanted line is only needed by a
@@ -365,7 +447,7 @@ fn round_rect(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
     path_round(&(*z).ra, x, y, w, h, r)
     raster.raster_finish(&(*z).ra)
     canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
-        wx as usize, wy as usize, theme.opaque(col))
+        wx as usize, wy as usize, mit_alpha(col))
 }
 
 // THE OUTLINE. A ring and not a filled area: it lies ON an already
@@ -402,7 +484,123 @@ fn round_ring(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
     }
     raster.raster_finish(&(*z).ra)
     canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
-        wx as usize, wy as usize, theme.opaque(col))
+        wx as usize, wy as usize, mit_alpha(col))
+}
+
+// A ROUND RECTANGLE WITH A LINEAR GRADIENT, antialiased.
+//
+// `c0` at the start, `c1` at the end of the direction (dx, dy): (0, 1)
+// runs top to bottom, (1, 1) from the upper left corner to the lower
+// right one -- the diagonal of avatars and accent buttons. The ramp is
+// laid over the box, not over the canvas, so the same call gives the
+// same picture wherever it stands. Colours carry alpha like every other
+// colour here (0 alpha = opaque, `mit_alpha`), and are mixed per channel
+// in sRGB, the way CSS `linear-gradient` mixes by default.
+//
+// Same path, same raster window as `round_rect` -- only the write-back
+// asks for a colour per pixel instead of one for all.
+fn round_rect_grad(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
+    r: f64, c0: u32, c1: u32, dx: f64, dy: f64) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
+        return
+    }
+    path_round(&(*z).ra, x, y, w, h, r)
+    raster.raster_finish(&(*z).ra)
+    let a: u32 = mit_alpha(c0)
+    let b: u32 = mit_alpha(c1)
+    // the length of the box along the direction: t runs 0..1 over it
+    var ax: f64 = dx
+    if ax < 0.0 {
+        ax = 0.0 - ax
+    }
+    var ay: f64 = dy
+    if ay < 0.0 {
+        ay = 0.0 - ay
+    }
+    var span: f64 = w * ax + h * ay
+    if span <= 0.0 {
+        span = 1.0
+    }
+    // the corner the ramp starts in
+    var ox: f64 = x
+    if dx < 0.0 {
+        ox = x + w
+    }
+    var oy: f64 = y
+    if dy < 0.0 {
+        oy = y + h
+    }
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let ra: *mut raster.Raster = &(*z).ra
+    let rh: usize = raster.raster_used_y1(ra)
+    let rw: usize = raster.raster_used_x1(ra)
+    let rx0: usize = raster.raster_used_x0(ra)
+    var yy: usize = raster.raster_used_y0(ra)
+    while yy < rh {
+        let row: u64 = raster.raster_cov_row(ra, yy)
+        let py: f64 = wy + (yy as f64) + 0.5
+        // a ramp that runs straight down has ONE colour per row: mixed
+        // once here, not once per pixel
+        var rowcol: u32 = 0 as u32
+        if dx == 0.0 {
+            rowcol = mix_argb(a, b, clamp01(((py - oy) * dy) / span))
+        }
+        var xx: usize = rx0
+        while xx < rw {
+            let v: f64 = *((row + (xx * 8) as u64) as *mut f64)
+            if v > 0.0 {
+                var col: u32 = rowcol
+                if dx != 0.0 {
+                    let px: f64 = wx + (xx as f64) + 0.5
+                    col = mix_argb(a, b,
+                        clamp01(((px - ox) * dx + (py - oy) * dy) / span))
+                }
+                var cov: f64 = v
+                if cov > 1.0 {
+                    cov = 1.0
+                }
+                canvas.canvas_blend(cv, (wx as usize) + xx, (wy as usize) + yy,
+                    col, cov)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+fn clamp01(t: f64) -> f64 {
+    if t < 0.0 {
+        return 0.0
+    }
+    if t > 1.0 {
+        return 1.0
+    }
+    return t
+}
+
+// Two colours mixed per channel, alpha included: t = 0 is `a`, 1 is `b`.
+fn mix_argb(a: u32, b: u32, t: f64) -> u32 {
+    var out: u32 = 0 as u32
+    var sh: u32 = 0 as u32
+    while sh < 32 as u32 {
+        let ca: f64 = ((a >> sh) & 255 as u32) as f64
+        let cb: f64 = ((b >> sh) & 255 as u32) as f64
+        var v: f64 = ca + (cb - ca) * t + 0.5
+        if v > 255.0 {
+            v = 255.0
+        }
+        if v < 0.0 {
+            v = 0.0
+        }
+        out = out | ((v as u32) << sh)
+        sh = sh + 8 as u32
+    }
+    return out
 }
 
 // The same path counter-clockwise. It stands as a function of its own
@@ -563,6 +761,10 @@ struct TextRun {
     // --- gradient
     grad_col: u32,
     grad_on: usize,
+    // --- die Absatzrichtung: bidi.DIR_AUTO (das erste starke Zeichen
+    // entscheidet), DIR_LTR oder DIR_RTL. render.text_run_of setzt sie
+    // aus `direction` im Stil.
+    dir: u32,
 }
 
 // A run with nothing switched on except the things that are always
@@ -575,7 +777,7 @@ fn run_new(size: f64) -> TextRun {
         kerning: 1, weight: 400, slant: 0,
         out_w: 0.0, out_col: 0, out_on: 0,
         sh_dx: 0.0, sh_dy: 0.0, sh_col: 0, sh_on: 0,
-        grad_col: 0, grad_on: 0,
+        grad_col: 0, grad_on: 0, dir: bidi.DIR_AUTO,
     }
 }
 
@@ -650,6 +852,16 @@ fn run_set_shadow(r: TextRun, dx: f64, dy: f64, col: u32) -> TextRun {
     o.sh_on = 1
     return o
 }
+
+#[no_gc]
+fn run_set_dir(r: TextRun, d: u32) -> TextRun {
+    var o: TextRun = r
+    o.dir = d
+    return o
+}
+
+#[no_gc]
+fn run_dir(r: *mut TextRun) -> u32 { return (*r).dir }
 
 #[no_gc]
 fn run_set_gradient(r: TextRun, col: u32) -> TextRun {
@@ -731,6 +943,10 @@ fn run_width(z: *mut Painter, r: *mut TextRun, p: u64,
     if !metrics.fm_present((*z).fm) || n == 0 {
         return 0.0
     }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k > 0 {
+        return bw_range(z, r, 0, k)
+    }
     var x: f64 = 0.0
     var i: usize = 0
     while i < n {
@@ -754,6 +970,10 @@ fn run_fits_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     room: f64) -> usize {
     if !metrics.fm_present((*z).fm) {
         return n
+    }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k > 0 {
+        return bo_byte(z, bidi_fits(z, r, 0, k, room))
     }
     var x: f64 = 0.0
     var i: usize = 0
@@ -786,6 +1006,273 @@ fn run_fits_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
         i = i + adv
     }
     return n
+}
+
+// ======================================================================
+// KUERZEN MIT AUSLASSUNGSPUNKTEN, UND UMBRECHEN
+// ======================================================================
+//
+// Justin, 13.09.2026, am Bild des Kontrollzentrums: eine Kachel, deren
+// Beschriftung als "Netz vortaeusc" endet, ist kein Ergebnis. Windows
+// bricht die Beschriftung um oder beendet sie mit "...".
+//
+// WARUM DAS HIERHER GEHOERT UND NICHT IN DEN AUFRUFER. `run_fits_upto`
+// schneidet hart auf dem letzten Zeichen, das noch passt -- das ist
+// richtig fuer einen Textcursor und falsch fuer eine Beschriftung. Wer
+// es im Programm nachbaut, misst mit einer zweiten Rechnung und bekommt
+// eine andere Breite als der Maler: genau der Fehler, den der Kopf von
+// `art_text_split` beschreibt. Also steht es in der Datei, die die
+// Vorschuebe kennt, und jedes Element bekommt es umsonst.
+//
+// DIE AUSLASSUNGSPUNKTE SIND DREI PUNKTE UND KEIN U+2026. Die
+// Symbolschrift dieses Baums fuehrt das einzelne Zeichen nicht
+// zwangslaeufig; drei Punkte hat jede Schrift. Gemessen wird mit
+// denselben Vorschueben wie der Rest der Zeile, Kerning eingeschlossen.
+
+// Wie breit sind die drei Punkte in diesem Lauf?
+fn ellipsis_w(z: *mut Painter, r: *mut TextRun) -> f64 {
+    var w: f64 = 0.0
+    var k: usize = 0
+    while k < 3 {
+        var nx: u32 = 0
+        if k < 2 {
+            nx = 46
+        }
+        w = w + advance_of(z, r, 46, nx)
+        k = k + 1
+    }
+    return w
+}
+
+// WIE VIELE OKTETTE PASSEN, WENN HINTER IHNEN NOCH "..." STEHEN MUSS.
+//
+// Gibt zusaetzlich ueber `gekuerzt` zurueck, OB gekuerzt wurde -- der
+// Aufrufer muss wissen, ob er die Punkte ueberhaupt malen soll, und
+// soll es nicht an einem Laengenvergleich zweiter Hand ablesen.
+fn run_fits_ellipsis(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    room: f64, gekuerzt: *mut bool) -> usize {
+    *gekuerzt = false
+    if !metrics.fm_present((*z).fm) || n == 0 {
+        return n
+    }
+    // Passt alles, ist nichts zu tun -- und das ist der haeufige Fall.
+    if run_width(z, r, p, n) <= room {
+        return n
+    }
+    *gekuerzt = true
+    let ew: f64 = ellipsis_w(z, r)
+    if ew > room {
+        return 0
+    }
+    return run_fits_upto(z, r, p, n, room - ew)
+}
+
+// EINE ZEILE MALEN, DIE MIT "..." ENDET, WENN SIE NICHT PASST.
+//
+// Rueckgabe wie `run_draw`: wo der Stift stehengeblieben ist.
+fn run_draw_ellipsis(z: *mut Painter, r: *mut TextRun, x: f64,
+    base_y: f64, w: f64, col: u32, p: u64, n: usize,
+    align: u32) -> f64 {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return x
+    }
+    if w <= 0.0 {
+        return run_draw(z, r, x, base_y, w, col, p, n, align)
+    }
+    let bk: usize = bidi_prepare(z, r, p, n)
+    if bk > 0 {
+        return bidi_draw_ellipsis(z, r, x, base_y, w, col, 0, bk, align)
+    }
+    var ab: bool = false
+    let nn: usize = run_fits_ellipsis(z, r, p, n, w, &ab)
+    if !ab {
+        return run_draw(z, r, x, base_y, w, col, p, n, align)
+    }
+    if nn == 0 {
+        return x
+    }
+    // DIE AUSRICHTUNG RECHNET MIT DER GESAMTBREITE AUS TEXT UND PUNKTEN,
+    // sonst sitzt eine mittige Beschriftung um die halbe Punktbreite
+    // daneben -- derselbe Fehler, den `run_draw` im Kopf beschreibt.
+    let bw: f64 = run_width(z, r, p, nn)
+    let ew: f64 = ellipsis_w(z, r)
+    var sx: f64 = x
+    if align == TEXT_M {
+        sx = x + (w - (bw + ew)) / 2.0
+    } else if align == TEXT_R {
+        sx = x + w - (bw + ew)
+    }
+    // Beide Stuecke linksbuendig ab `sx` -- die Ausrichtung ist oben
+    // schon eingerechnet, ein zweites Mal waere sie doppelt.
+    let e1: f64 = run_draw(z, r, sx, base_y, 0.0, col, p, nn, TEXT_L)
+    var pkt: [u8; 4] = "...\0"
+    let e2: f64 = run_draw(z, r, e1, base_y, 0.0, col,
+        (&pkt[0 as usize]) as u64, 3, TEXT_L)
+    return e2
+}
+
+// ================================================== UMBRECHEN AN WORTGRENZEN
+//
+// Sucht das Ende der Zeile, die in `room` passt, und gibt ueber `nach`
+// zurueck, wo die naechste Zeile ANFAENGT (das Leerzeichen dazwischen
+// wird uebersprungen, es gehoert keiner der beiden Zeilen).
+//
+// WARUM AN WORTGRENZEN UND NICHT AN ZEICHEN: ein Umbruch mitten im Wort
+// liest sich schlechter als eine kuerzere Zeile. Passt ein EINZELNES
+// Wort nicht in die Breite, wird es doch auf dem Zeichen getrennt --
+// sonst stuende die Zeile leer da und die Schleife kaeme nicht voran.
+fn run_line_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    room: f64, nach: *mut usize) -> usize {
+    *nach = n
+    if !metrics.fm_present((*z).fm) || n == 0 {
+        return n
+    }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k > 0 {
+        var nx: usize = k
+        let e: usize = bidi_line_break(z, r, 0, k, room, &nx)
+        *nach = bo_byte(z, nx)
+        return bo_byte(z, e)
+    }
+    var x: f64 = 0.0
+    var i: usize = 0
+    var letzte_luecke: usize = 0
+    var nach_luecke: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let nx: u32 = next_cp(p, n, i, adv)
+        if cp == 32 {
+            letzte_luecke = i
+            nach_luecke = i + adv
+        }
+        let step: f64 = advance_of(z, r, cp, nx)
+        if x + step > room {
+            if letzte_luecke > 0 {
+                *nach = nach_luecke
+                return letzte_luecke
+            }
+            // Ein einzelnes zu langes Wort: hart trennen, aber nie mit
+            // null Zeichen zurueckkommen.
+            if i == 0 {
+                *nach = adv
+                return adv
+            }
+            *nach = i
+            return i
+        }
+        x = x + step
+        i = i + adv
+    }
+    *nach = n
+    return n
+}
+
+// WIE VIELE ZEILEN BRAUCHT DIESER TEXT IN DIESER BREITE?
+// Zum Messen, bevor etwas gemalt wird -- das Layout fragt danach.
+// NUR LEERZEICHEN SIND KEINE ZEILE.
+//
+// GEFUNDEN IM PRUEFSTAND, nicht im Kopf: `run_line_count` sagte DREI
+// Zeilen voraus, wo `run_draw_wrapped` ZWEI malte. Die dritte war der
+// Rest "  " am Ende der Zeichenkette -- ein Umbruch hinter dem letzten
+// Wort laesst die Leerzeichen stehen, und eine Zeile aus zwei
+// Leerzeichen ist im Bild nichts, in der Rechnung aber eine Zeile.
+//
+// Das ist genau die Sorte Abweichung, vor der der Kopf dieser Datei
+// warnt: das Messen und das Malen muessen DASSELBE zaehlen. Wer die
+// Hoehe aus der Vorhersage nimmt, laesst sonst eine leere Zeile Platz.
+fn nur_leer(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if b8(p, i) != 32 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn run_line_count(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    room: f64, max_zeilen: usize) -> usize {
+    if n == 0 || room <= 0.0 {
+        return 0
+    }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k > 0 {
+        return bidi_wrapped(z, r, 0.0, 0.0, room, 0.0, 0 as u32, k, TEXT_L,
+            max_zeilen, false)
+    }
+    var zeilen: usize = 0
+    var i: usize = 0
+    while i < n && zeilen < max_zeilen {
+        if nur_leer(p + (i as u64), n - i) {
+            return zeilen
+        }
+        var weiter: usize = 0
+        let bis: usize = run_line_upto(z, r, p + (i as u64), n - i,
+            room, &weiter)
+        if bis == 0 {
+            return zeilen + 1
+        }
+        zeilen = zeilen + 1
+        i = i + weiter
+    }
+    return zeilen
+}
+
+// MEHRZEILIG MALEN. Die letzte erlaubte Zeile bekommt "...", wenn der
+// Text dort noch nicht zu Ende ist -- sonst bricht er stumm ab, und
+// genau das ist der Fehler, der ueberhaupt zu dieser Runde gefuehrt hat.
+//
+// `zeilen_h` ist der Zeilenabstand in Bildpunkten; `base_y` die
+// Grundlinie der ERSTEN Zeile. Rueckgabe: die Zahl der gemalten Zeilen.
+fn run_draw_wrapped(z: *mut Painter, r: *mut TextRun, x: f64,
+    base_y: f64, w: f64, zeilen_h: f64, col: u32, p: u64, n: usize,
+    align: u32, max_zeilen: usize) -> usize {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return 0
+    }
+    if w <= 0.0 || max_zeilen == 0 {
+        return 0
+    }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k > 0 {
+        return bidi_wrapped(z, r, x, base_y, w, zeilen_h, col, k, align,
+            max_zeilen, true)
+    }
+    var zeilen: usize = 0
+    var i: usize = 0
+    var y: f64 = base_y
+    while i < n && zeilen < max_zeilen {
+        // Siehe `nur_leer`: der Rest aus lauter Leerzeichen bekommt
+        // keine eigene Zeile, sonst zaehlt die Vorhersage anders als
+        // das Bild.
+        if nur_leer(p + (i as u64), n - i) {
+            return zeilen
+        }
+        var weiter: usize = 0
+        let bis: usize = run_line_upto(z, r, p + (i as u64), n - i, w,
+            &weiter)
+        if bis == 0 {
+            return zeilen
+        }
+        let ist_letzte: bool = (zeilen + 1 == max_zeilen)
+        let rest_bleibt: bool = (i + weiter < n)
+        if ist_letzte && rest_bleibt {
+            // Auf der letzten Zeile steht der GANZE Rest zur Wahl, nicht
+            // nur das, was das Umbrechen ihr zugeteilt hat -- sonst
+            // stuenden die Punkte schon nach dem vorletzten Wort.
+            let e4: f64 = run_draw_ellipsis(z, r, x, y, w, col,
+                p + (i as u64), n - i, align)
+        } else {
+            let e5: f64 = run_draw(z, r, x, y, w, col, p + (i as u64),
+                bis, align)
+        }
+        zeilen = zeilen + 1
+        y = y + zeilen_h
+        i = i + weiter
+    }
+    return zeilen
 }
 
 // ======================================================================
@@ -884,6 +1371,17 @@ fn run_into_raster(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     }
 }
 
+// Welcher Weg in das Raster? Siehe `paint_run`.
+#[no_gc]
+fn into_raster(z: *mut Painter, r: *mut TextRun, vis: bool, p: u64,
+    n: usize, sx: f64, base_y: f64, dx: f64, dy: f64) {
+    if vis {
+        bidi_into_raster(z, r, sx, base_y, dx, dy)
+    } else {
+        run_into_raster(z, r, p, n, sx, base_y, dx, dy)
+    }
+}
+
 // The eight directions the outline grows in.
 #[no_gc]
 fn out_dir_x(k: usize) -> f64 {
@@ -917,7 +1415,7 @@ fn out_dir_y(k: usize) -> f64 {
 #[no_gc]
 fn flush_raster(z: *mut Painter, wx: f64, wy: f64, col: u32) {
     canvas.canvas_fill_raster(painter_canvas(z), &(*z).ra,
-        wx as usize, wy as usize, theme.opaque(col))
+        wx as usize, wy as usize, mit_alpha(col))
 }
 
 // A GRADIENT OVER THE LINE.
@@ -992,6 +1490,25 @@ fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
     if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
         return x
     }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k > 0 {
+        var c: usize = k
+        if w > 0.0 {
+            c = bidi_fits(z, r, 0, k, w)
+        }
+        return bidi_draw_line(z, r, x, base_y, w, col, 0, c, align)
+    }
+    return run_draw_ltr(z, r, x, base_y, w, col, p, n, align)
+}
+
+// DER ALTE WEG, UNVERAENDERT: jedes Zeichen in logischer Reihenfolge von
+// links nach rechts. Jeder Text ohne rechtslaeufiges Zeichen kommt hier
+// an und wird Bildpunkt fuer Bildpunkt so gemalt wie vor der Bidi-Runde.
+fn run_draw_ltr(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
+    w: f64, col: u32, p: u64, n: usize, align: u32) -> f64 {
+    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+        return x
+    }
     var nn: usize = n
     if w > 0.0 {
         nn = run_fits_upto(z, r, p, n, w)
@@ -1007,7 +1524,19 @@ fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
         sx = x + w - br
     }
     sx = ((sx + 0.5) as i64) as f64
+    return paint_run(z, r, sx, base_y, br, col, p, nn, false)
+}
 
+// DIE DREI DURCHGAENGE (Schatten, Kontur, Glyphe) FUER EINE GELEGTE ZEILE.
+//
+// Eine Stelle fuer beide Wege: `vis` = false malt `p`/`nn` in logischer
+// Reihenfolge (der alte Weg), `vis` = true die zuletzt mit `bidi_layout`
+// gelegte Zeile in der Reihenfolge auf dem Schirm. Fenster, Schatten,
+// Kontur und Verlauf sind damit fuer Arabisch dieselben wie fuer
+// Lateinisch -- ein zweiter Satz Durchgaenge fuer den Bidi-Weg waere
+// genau der zweite Ort, der irgendwann anders rechnet.
+fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
+    br: f64, col: u32, p: u64, nn: usize, vis: bool) -> f64 {
     // THE WINDOW. It has to hold everything the passes reach into:
     // the shadow offset, the outline width and the shear of an italic.
     // Too small a window and the raster clips -- which is the class of
@@ -1070,7 +1599,7 @@ fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
 
     // ---- pass 1: THE SHADOW, furthest back
     if (*r).sh_on != 0 {
-        run_into_raster(z, r, p, nn, sx, base_y, (*r).sh_dx,
+        into_raster(z, r, vis, p, nn, sx, base_y, (*r).sh_dx,
             (*r).sh_dy)
         raster.raster_finish(&(*z).ra)
         flush_raster(z, wx, wy, (*r).sh_col)
@@ -1084,7 +1613,7 @@ fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
     if (*r).out_on != 0 && (*r).out_w > 0.0 {
         var k: usize = 0
         while k < 8 {
-            run_into_raster(z, r, p, nn, sx, base_y,
+            into_raster(z, r, vis, p, nn, sx, base_y,
                 out_dir_x(k) * (*r).out_w,
                 out_dir_y(k) * (*r).out_w)
             k = k + 1
@@ -1097,7 +1626,7 @@ fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
     }
 
     // ---- pass 3: THE GLYPH
-    run_into_raster(z, r, p, nn, sx, base_y, 0.0, 0.0)
+    into_raster(z, r, vis, p, nn, sx, base_y, 0.0, 0.0)
     raster.raster_finish(&(*z).ra)
     if (*r).grad_on != 0 {
         let asc: f64 = metrics.fm_ascent((*z).fm, (*r).size)
@@ -1191,4 +1720,677 @@ fn caret_bar(z: *mut Painter, x: f64, y: f64, h: f64, st: f64,
         s = 1.0
     }
     surface(z, ix, y, s, h, col)
+}
+
+// ======================================================================
+// DER BIDI-WEG
+// ======================================================================
+//
+// WARUM ER HIER STEHT. Jede Beschriftung, jeder Knopf, jede Tabelle und
+// jedes Textfeld misst und malt ueber `run_width`, `run_fits_upto`,
+// `run_draw`, `run_draw_ellipsis` und `run_draw_wrapped`. Wer die
+// Zweirichtungsschrift an EINER dieser Stellen vergisst, bekommt genau
+// den Fehler, den der Kopf dieser Datei beschreibt: gemessen wird etwas
+// anderes als gemalt. Also entscheidet jede von ihnen am Anfang dasselbe:
+//
+//   `bidi_prepare` -- braucht dieser Text den Algorithmus? NEIN heisst:
+//   kein R, AL, AN und kein RLE/RLO/RLI darin, und die Richtung ist nicht
+//   RTL (bidi.bidi_needed). Dann geht es den alten Weg, unveraendert --
+//   jede lateinische Zeile in jedem Beleg bleibt Bildpunkt fuer Bildpunkt,
+//   was sie war. JA heisst: der GANZE Text wird einmal vorbereitet
+//
+//     1. UTF-8 -> Codepunkte, samt der Oktettlage jedes Zeichens
+//     2. Ebenen (bidi.bidi_run) -- fuer den ganzen Absatz, nicht fuer die
+//        Zeile: ob ein umgebrochenes Stueck von rechts nach links laeuft,
+//        entscheidet sein Absatz
+//     3. Glyphen (shape.shape_run): Spiegelbilder, arabische Gestalten
+//     4. Vorschuebe je Zeichen aus der Schrift
+//
+//   und alles Weitere -- Messen, Umbrechen, Kuerzen, Malen, die
+//   Schreibmarke -- rechnet mit denselben vorbereiteten Zahlen.
+//
+// WAS DER BIDI-WEG ANDERS MACHT ALS DER ALTE, und warum:
+//
+//   * KEIN PAARWEISES KERNING. Die `kern`-Tabelle ist nach Glyphenpaaren
+//     von links nach rechts gebaut; in einer gemischten Zeile sind die
+//     Nachbarn auf dem Schirm andere als im Text, und ein Kerning, das
+//     beim Messen (logisch) ein anderes Paar sieht als beim Malen
+//     (visuell), macht genau die Abweichung, die hier verboten ist.
+//     DejaVu Sans kernt Arabisch und Hebraeisch ohnehin nicht.
+//   * DER ZEICHENABSTAND (tracking) steht zwischen SICHTBAREN Glyphen --
+//     ein Alif, das im Lam-Alif aufgegangen ist, bekommt keinen.
+//   * DIE VOKALZEICHEN. Ohne GPOS gibt es keine Ankerpunkte. DejaVu Sans
+//     zeichnet arabische und hebraeische Vokale mit Vorschub 0 und der
+//     Tinte RECHTS vom Ursprung, also fuer die Lage VOR ihrem
+//     Grundbuchstaben auf dem Schirm -- und genau dort stehen sie nach
+//     L2, denn die Umkehrung dreht "Grundbuchstabe, Vokal" zu "Vokal,
+//     Grundbuchstabe". Regel L3 (die Reihenfolge wieder umdrehen) ist fuer
+//     Schriften gedacht, die das Gegenteil erwarten; sie wird hier darum
+//     NICHT angewendet.
+//
+// DIE GRENZE: `BIDI_CAP` Zeichen je Text. Ein laengerer Text geht den
+// alten Weg (von links nach rechts). Fuer Beschriftungen und Eingabe-
+// felder ist das weit mehr als genug; ein Textverarbeitungsfenster
+// braucht einen eigenen Absatzspeicher und nicht diesen Arbeitsraum.
+
+const BIDI_CAP: usize = 4096
+
+// Die Teilfelder des Arbeitsraums, in dieser Reihenfolge ab `bx`:
+//   cp u32, boff u32 (CAP + 2), cls0/cls/lev/pl/del/form/ll u8,
+//   gid/ord/vis u32, used u32[16], adv/x f64, work (bidi.fi)
+#[no_gc]
+fn bo_cp() -> usize { return 0 }
+#[no_gc]
+fn bo_boff() -> usize { return BIDI_CAP * 4 }
+#[no_gc]
+fn bo_cls0() -> usize { return BIDI_CAP * 8 + 8 }
+#[no_gc]
+fn bo_cls() -> usize { return bo_cls0() + BIDI_CAP }
+#[no_gc]
+fn bo_lev() -> usize { return bo_cls() + BIDI_CAP }
+#[no_gc]
+fn bo_pl() -> usize { return bo_lev() + BIDI_CAP }
+#[no_gc]
+fn bo_del() -> usize { return bo_pl() + BIDI_CAP }
+#[no_gc]
+fn bo_form() -> usize { return bo_del() + BIDI_CAP }
+#[no_gc]
+fn bo_ll() -> usize { return bo_form() + BIDI_CAP }
+#[no_gc]
+fn bo_gid() -> usize { return bo_ll() + BIDI_CAP }
+#[no_gc]
+fn bo_ord() -> usize { return bo_gid() + BIDI_CAP * 4 }
+#[no_gc]
+fn bo_vis() -> usize { return bo_ord() + BIDI_CAP * 4 }
+#[no_gc]
+fn bo_used() -> usize { return bo_vis() + BIDI_CAP * 4 }
+#[no_gc]
+fn bo_adv() -> usize { return bo_used() + 64 }
+#[no_gc]
+fn bo_x() -> usize { return bo_adv() + BIDI_CAP * 8 }
+#[no_gc]
+fn bo_work() -> usize { return bo_x() + BIDI_CAP * 8 }
+#[no_gc]
+fn bidi_bytes() -> usize { return bo_work() + bidi.bidi_work_bytes(BIDI_CAP) }
+
+#[no_gc]
+fn bq(z: *mut Painter, off: usize) -> u64 { return (*z).bx + off as u64 }
+#[no_gc]
+fn br8(z: *mut Painter, off: usize, i: usize) -> u8 {
+    return *((bq(z, off) + i as u64) as *mut u8)
+}
+#[no_gc]
+fn br32(z: *mut Painter, off: usize, i: usize) -> u32 {
+    return *((bq(z, off) + (i * 4) as u64) as *mut u32)
+}
+#[no_gc]
+fn bw32(z: *mut Painter, off: usize, i: usize, v: u32) {
+    *((bq(z, off) + (i * 4) as u64) as *mut u32) = v
+}
+#[no_gc]
+fn brf(z: *mut Painter, off: usize, i: usize) -> f64 {
+    return *((bq(z, off) + (i * 8) as u64) as *mut f64)
+}
+#[no_gc]
+fn bwf(z: *mut Painter, off: usize, i: usize, v: f64) {
+    *((bq(z, off) + (i * 8) as u64) as *mut f64) = v
+}
+
+// Die Oktettlage des Zeichens `i` (bei `bn` das Textende).
+#[no_gc]
+fn bo_byte(z: *mut Painter, i: usize) -> usize {
+    return br32(z, bo_boff(), i) as usize
+}
+
+// Das Zeichen, das an Oktett `b` beginnt (oder das erste dahinter).
+#[no_gc]
+fn bo_char(z: *mut Painter, b: usize) -> usize {
+    var i: usize = 0
+    while i < (*z).bn && bo_byte(z, i) < b {
+        i = i + 1
+    }
+    return i
+}
+
+#[no_gc]
+fn bidi_para(z: *mut Painter) -> bidi.BidiPara {
+    return bidi.bidi_new((*z).bt, bq(z, bo_cp()), (*z).bn, bq(z, bo_cls0()),
+        bq(z, bo_cls()), bq(z, bo_lev()), bq(z, bo_pl()), bq(z, bo_work()))
+}
+
+// Ein Zeichen ohne Glyphe: in einer Ligatur aufgegangen, oder ein
+// Steuerzeichen, das X9 herausnimmt (LRM, RLE, ZWJ ...).
+#[no_gc]
+fn bidi_hidden(z: *mut Painter, i: usize) -> bool {
+    return br8(z, bo_del(), i) != 0 as u8
+        || bidi.bidi_is_removed(br8(z, bo_cls0(), i))
+}
+
+// Ist gerade ein Text auf dem Bidi-Weg vorbereitet? Fuer die Pruefung.
+#[no_gc]
+fn run_is_bidi(z: *mut Painter) -> bool { return (*z).bn > 0 }
+
+// DIE VORBEREITUNG. Rueckgabe: die Zahl der Zeichen, 0 = der alte Weg.
+#[no_gc]
+fn bidi_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize) -> usize {
+    (*z).bn = 0
+    if (*z).bt == 0 || (*z).bx == 0 || n == 0
+        || !metrics.fm_present((*z).fm) {
+        return 0
+    }
+    // 1. die Codepunkte
+    var i: usize = 0
+    var k: usize = 0
+    while i < n {
+        if k >= BIDI_CAP {
+            return 0
+        }
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        bw32(z, bo_cp(), k, cp)
+        bw32(z, bo_boff(), k, i as u32)
+        k = k + 1
+        i = i + adv
+    }
+    bw32(z, bo_boff(), k, n as u32)
+    if !bidi.bidi_needed((*z).bt, bq(z, bo_cp()), k, (*r).dir) {
+        return 0
+    }
+    // 2. die Ebenen
+    (*z).bn = k
+    var bp: bidi.BidiPara = bidi_para(z)
+    (*z).blev = bidi.bidi_run(&bp, (*r).dir)
+    // 3. die Glyphen
+    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
+    if (*z).gs_fm != (*z).fm {
+        let has: bool = gsub.gsub_init(f, &(*z).gs)
+        (*z).gs_fm = (*z).fm
+    }
+    var miss: usize = 0
+    let how: u32 = shape.shape_run((*z).bt, f, &(*z).gs, true,
+        bq(z, bo_cp()), bq(z, bo_cls0()), bq(z, bo_lev()), k,
+        bq(z, bo_gid()), bq(z, bo_del()), bq(z, bo_form()),
+        bq(z, bo_used()), &miss)
+    // 4. die Vorschuebe
+    let sc: f64 = (*r).size / metrics.fm_upem((*z).fm)
+    var j: usize = 0
+    while j < k {
+        var a: f64 = 0.0
+        if !bidi_hidden(z, j) {
+            a = (ttf.font_advance(f, br32(z, bo_gid(), j)) as f64) * sc
+            if br32(z, bo_cp(), j) == 32 as u32 {
+                a = a + (*r).word_spacing
+            }
+        }
+        bwf(z, bo_adv(), j, a)
+        j = j + 1
+    }
+    return k
+}
+
+// Die Breite der Zeichen a..b-1: Vorschuebe plus der Zeichenabstand
+// zwischen den sichtbaren Glyphen.
+#[no_gc]
+fn bw_range(z: *mut Painter, r: *mut TextRun, a: usize, b: usize) -> f64 {
+    var x: f64 = 0.0
+    var nv: usize = 0
+    var i: usize = a
+    while i < b {
+        x = x + brf(z, bo_adv(), i)
+        if !bidi_hidden(z, i) {
+            nv = nv + 1
+        }
+        i = i + 1
+    }
+    if nv > 1 {
+        x = x + ((nv - 1) as f64) * (*r).tracking
+    }
+    return x
+}
+
+// Der Schritt nach Zeichen i, wenn danach noch etwas bis b kommt -- das
+// Gegenstueck zu `advance_of` mit seinem `nxt`.
+#[no_gc]
+fn bidi_step(z: *mut Painter, r: *mut TextRun, i: usize, b: usize) -> f64 {
+    var s: f64 = brf(z, bo_adv(), i)
+    if !bidi_hidden(z, i) && i + 1 < b {
+        s = s + (*r).tracking
+    }
+    return s
+}
+
+// Wie viele Zeichen ab a passen in `room`? Rueckgabe: das Ende (a..b).
+// Unsichtbare Zeichen hinter dem letzten passenden gehen mit -- ein Alif,
+// das im Lam-Alif steckt, darf nicht allein auf der naechsten Zeile
+// landen.
+#[no_gc]
+fn bidi_fits(z: *mut Painter, r: *mut TextRun, a: usize, b: usize,
+    room: f64) -> usize {
+    var x: f64 = 0.0
+    var i: usize = a
+    while i < b {
+        let st: f64 = bidi_step(z, r, i, b)
+        if !bidi_hidden(z, i) && x + st > room {
+            return i
+        }
+        x = x + st
+        i = i + 1
+    }
+    return b
+}
+
+// Wo endet die Zeile ab a, und wo beginnt die naechste? Dieselbe Regel
+// wie `run_line_upto`: an Leerzeichen, und ein einzelnes zu langes Wort
+// wird doch auf dem Zeichen getrennt.
+#[no_gc]
+fn bidi_line_break(z: *mut Painter, r: *mut TextRun, a: usize, b: usize,
+    room: f64, nach: *mut usize) -> usize {
+    var x: f64 = 0.0
+    var i: usize = a
+    var gap: usize = a
+    var after: usize = a
+    while i < b {
+        if br32(z, bo_cp(), i) == 32 as u32 {
+            gap = i
+            after = i + 1
+        }
+        let st: f64 = bidi_step(z, r, i, b)
+        if !bidi_hidden(z, i) && x + st > room {
+            if gap > a {
+                *nach = after
+                return gap
+            }
+            if i == a {
+                var e: usize = a + 1
+                while e < b && bidi_hidden(z, e) {
+                    e = e + 1
+                }
+                *nach = e
+                return e
+            }
+            *nach = i
+            return i
+        }
+        x = x + st
+        i = i + 1
+    }
+    *nach = b
+    return b
+}
+
+// DIE ZEILE a..b-1 LEGEN: L1 fuer ihr Ende, L2 fuer die Reihenfolge, und
+// danach je Zeichen seine linke Kante (`bo_x`, relativ zum Zeilenanfang)
+// sowie die Liste der sichtbaren Glyphen von links nach rechts
+// (`bo_vis`, `bvn`). Rueckgabe: die Breite der Zeile.
+#[no_gc]
+fn bidi_layout(z: *mut Painter, r: *mut TextRun, a: usize, b: usize) -> f64 {
+    (*z).bvn = 0
+    if b <= a {
+        return 0.0
+    }
+    var bp: bidi.BidiPara = bidi_para(z)
+    bidi.bidi_line_levels(&bp, a, b, bq(z, bo_ll()))
+    bidi.bidi_reorder(bq(z, bo_ll()), b - a, bq(z, bo_ord()))
+    var tv: usize = 0
+    var i: usize = a
+    while i < b {
+        if !bidi_hidden(z, i) {
+            tv = tv + 1
+        }
+        i = i + 1
+    }
+    var x: f64 = 0.0
+    var seen: usize = 0
+    var k: usize = 0
+    while k < b - a {
+        let j: usize = a + br32(z, bo_ord(), k) as usize
+        bwf(z, bo_x(), j, x)
+        if !bidi_hidden(z, j) {
+            bw32(z, bo_vis(), (*z).bvn, j as u32)
+            (*z).bvn = (*z).bvn + 1
+            x = x + brf(z, bo_adv(), j)
+            seen = seen + 1
+            if seen < tv {
+                x = x + (*r).tracking
+            }
+        }
+        k = k + 1
+    }
+    return x
+}
+
+// Die zuletzt gelegte Zeile in das Raster.
+#[no_gc]
+fn bidi_into_raster(z: *mut Painter, r: *mut TextRun, sx: f64,
+    base_y: f64, dx: f64, dy: f64) {
+    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
+    let sc: f64 = (*r).size / metrics.fm_upem((*z).fm)
+    var k: usize = 0
+    while k < (*z).bvn {
+        let j: usize = br32(z, bo_vis(), k) as usize
+        glyph_into(z, r, f, br32(z, bo_gid(), j),
+            sx + dx + brf(z, bo_x(), j), base_y + dy, sc)
+        k = k + 1
+    }
+}
+
+// Eine Zeile a..b-1 ausgerichtet malen. Rueckgabe wie `run_draw`.
+fn bidi_draw_line(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
+    w: f64, col: u32, a: usize, b: usize, align: u32) -> f64 {
+    if b <= a {
+        return x
+    }
+    let br: f64 = bidi_layout(z, r, a, b)
+    var sx: f64 = x
+    if align == TEXT_M {
+        sx = x + (w - br) / 2.0
+    } else if align == TEXT_R {
+        sx = x + w - br
+    }
+    sx = ((sx + 0.5) as i64) as f64
+    return paint_run(z, r, sx, base_y, br, col, 0, 0, true)
+}
+
+// EINE ZEILE MIT "..." -- AM RICHTIGEN ENDE. Die Punkte stehen dort, wo
+// der Text weitergehen wuerde: in einem Absatz von links nach rechts
+// rechts, in einem von rechts nach links LINKS. Gekuerzt wird logisch
+// (der Anfang des Textes bleibt stehen), gelegt wird nur das, was bleibt.
+fn bidi_draw_ellipsis(z: *mut Painter, r: *mut TextRun, x: f64,
+    base_y: f64, w: f64, col: u32, a: usize, b: usize,
+    align: u32) -> f64 {
+    let full: f64 = bw_range(z, r, a, b)
+    if w <= 0.0 || full <= w {
+        return bidi_draw_line(z, r, x, base_y, w, col, a, b, align)
+    }
+    let ew: f64 = ellipsis_w(z, r)
+    if ew > w {
+        return x
+    }
+    let c: usize = bidi_fits(z, r, a, b, w - ew)
+    if c == a {
+        return x
+    }
+    let tw: f64 = bidi_layout(z, r, a, c)
+    var sx: f64 = x
+    if align == TEXT_M {
+        sx = x + (w - (tw + ew)) / 2.0
+    } else if align == TEXT_R {
+        sx = x + w - (tw + ew)
+    }
+    let rtl: bool = (br8(z, bo_pl(), a) & 1 as u8) != 0 as u8
+    var tx: f64 = sx
+    var dx: f64 = sx + tw
+    if rtl {
+        tx = sx + ew
+        dx = sx
+    }
+    tx = ((tx + 0.5) as i64) as f64
+    let e1: f64 = paint_run(z, r, tx, base_y, tw, col, 0, 0, true)
+    // Die Punkte gehen den alten Weg: drei ASCII-Zeichen brauchen keinen
+    // Algorithmus -- und `run_draw` wuerde den vorbereiteten Text
+    // ueberschreiben, den ein mehrzeiliger Aufrufer noch braucht.
+    var pkt: [u8; 4] = "...\0"
+    let e2: f64 = run_draw_ltr(z, r, dx, base_y, 0.0, col,
+        (&pkt[0 as usize]) as u64, 3, TEXT_L)
+    if rtl {
+        return tx + tw
+    }
+    return e2
+}
+
+// MEHRZEILIG, fuer Messen (`malen` = false) und Malen. Eine Funktion,
+// damit die Vorhersage der Zeilenzahl und das Bild nicht
+// auseinanderlaufen -- dieselbe Lehre wie bei `nur_leer`.
+fn bidi_wrapped(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
+    w: f64, zeilen_h: f64, col: u32, k: usize, align: u32,
+    max_zeilen: usize, malen: bool) -> usize {
+    var zeilen: usize = 0
+    var i: usize = 0
+    var y: f64 = base_y
+    while i < k && zeilen < max_zeilen {
+        var leer: bool = true
+        var q: usize = i
+        while q < k {
+            if br32(z, bo_cp(), q) != 32 as u32 {
+                leer = false
+                break
+            }
+            q = q + 1
+        }
+        if leer {
+            return zeilen
+        }
+        var weiter: usize = k
+        let bis: usize = bidi_line_break(z, r, i, k, w, &weiter)
+        if bis == i {
+            return zeilen
+        }
+        if malen {
+            if zeilen + 1 == max_zeilen && weiter < k {
+                let e4: f64 = bidi_draw_ellipsis(z, r, x, y, w, col, i, k,
+                    align)
+            } else {
+                let e5: f64 = bidi_draw_line(z, r, x, y, w, col, i, bis,
+                    align)
+            }
+        }
+        zeilen = zeilen + 1
+        y = y + zeilen_h
+        i = weiter
+    }
+    return zeilen
+}
+
+// ======================================================================
+// DIE SCHREIBMARKE IN DER ZWEIRICHTUNGSSCHRIFT
+// ======================================================================
+//
+// In einem gemischten Text liegt die Grenze hinter dem Zeichen i NICHT
+// bei "Breite der ersten i Zeichen": hinter einem hebraeischen Wort steht
+// die Marke LINKS von ihm. Die Regel, nach der jeder Texteditor sie
+// setzt: sie haengt an der HINTERKANTE des Zeichens davor -- rechts bei
+// gerader Ebene, links bei ungerader. Am Textanfang gibt es kein Zeichen
+// davor; dann haengt sie an der VORDERKANTE des ersten.
+//
+// Alle Zahlen sind relativ zum linken Rand des Textes, so wie `run_draw`
+// ihn mit TEXT_L legt. Ohne Bidi-Weg ist das die Breite der ersten
+// `bi` Oktette -- genau das, was das Textfeld vorher gerechnet hat.
+#[no_gc]
+fn run_caret_x(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    bi: usize) -> f64 {
+    var b: usize = bi
+    if b > n {
+        b = n
+    }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k == 0 {
+        if b == 0 {
+            return 0.0
+        }
+        return run_width(z, r, p, b)
+    }
+    let tw: f64 = bidi_layout(z, r, 0, k)
+    let ci: usize = bo_char(z, b)
+    if ci == 0 {
+        let x0: f64 = brf(z, bo_x(), 0)
+        if (br8(z, bo_ll(), 0) & 1 as u8) != 0 as u8 {
+            return x0 + brf(z, bo_adv(), 0)
+        }
+        return x0
+    }
+    let j: usize = ci - 1
+    let xj: f64 = brf(z, bo_x(), j)
+    if (br8(z, bo_ll(), j) & 1 as u8) != 0 as u8 {
+        return xj
+    }
+    return xj + brf(z, bo_adv(), j)
+}
+
+// DIE GRENZE UNTER EINEM PUNKT x (relativ zum linken Textrand), als
+// Oktettlage. Getroffen wird die naechste sichtbare Glyphe; die linke
+// Haelfte einer Glyphe gerader Ebene ist ihr Anfang, die linke Haelfte
+// einer Glyphe ungerader Ebene ihr ENDE.
+#[no_gc]
+fn run_hit(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    x: f64) -> usize {
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k == 0 {
+        // der alte Weg: die naechste Zeichengrenze nach der Breite davor
+        var best: usize = 0
+        var bestd: f64 = x
+        if bestd < 0.0 {
+            bestd = 0.0 - bestd
+        }
+        var i: usize = 0
+        while i < n {
+            var adv: usize = 1
+            let cp: u32 = utf8_at(p, n, i, &adv)
+            i = i + adv
+            var d: f64 = run_width(z, r, p, i) - x
+            if d < 0.0 {
+                d = 0.0 - d
+            }
+            if d < bestd {
+                bestd = d
+                best = i
+            }
+        }
+        return best
+    }
+    let tw: f64 = bidi_layout(z, r, 0, k)
+    var best_i: usize = k
+    var best_d: f64 = 0.0
+    var j: usize = 0
+    while j < k {
+        if !bidi_hidden(z, j) {
+            let l: f64 = brf(z, bo_x(), j)
+            let rr: f64 = l + brf(z, bo_adv(), j)
+            var d: f64 = 0.0
+            if x < l {
+                d = l - x
+            } else if x > rr {
+                d = x - rr
+            }
+            if best_i == k || d < best_d {
+                best_i = j
+                best_d = d
+            }
+        }
+        j = j + 1
+    }
+    if best_i == k {
+        return 0
+    }
+    let l2: f64 = brf(z, bo_x(), best_i)
+    let mid: f64 = l2 + brf(z, bo_adv(), best_i) / 2.0
+    let odd: bool = (br8(z, bo_ll(), best_i) & 1 as u8) != 0 as u8
+    var after: bool = x >= mid
+    if odd {
+        after = !after
+    }
+    var c: usize = best_i
+    if after {
+        c = best_i + 1
+        // hinter einem Lam-Alif steht die Marke hinter dem Alif
+        while c < k && bidi_hidden(z, c) && br8(z, bo_del(), c) != 0 as u8 {
+            c = c + 1
+        }
+    }
+    return bo_byte(z, c)
+}
+
+// Laeuft der Absatz dieses Textes von rechts nach links?
+#[no_gc]
+fn run_para_rtl(z: *mut Painter, r: *mut TextRun, p: u64, n: usize) -> bool {
+    if n == 0 {
+        return (*r).dir == bidi.DIR_RTL
+    }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k == 0 {
+        return false
+    }
+    return ((*z).blev & 1 as u8) != 0 as u8
+}
+
+// DIE AUSWAHL: die Oktette sa..sb-1 hinterlegen. Auf dem alten Weg ist
+// das EIN Rechteck; in der Zweirichtungsschrift kann eine logisch
+// zusammenhaengende Auswahl auf dem Schirm in mehrere Stuecke zerfallen
+// ("abc אבג" mit Auswahl ueber "c א" sind zwei Stuecke), und jedes wird
+// fuer sich gemalt. `ox` ist der linke Textrand.
+fn run_sel_draw(z: *mut Painter, r: *mut TextRun, ox: f64, y: f64, h: f64,
+    p: u64, n: usize, sa: usize, sb: usize, col: u32) {
+    if sb <= sa {
+        return
+    }
+    let k: usize = bidi_prepare(z, r, p, n)
+    if k == 0 {
+        let xa: f64 = run_width(z, r, p, sa)
+        let xb: f64 = run_width(z, r, p, sb)
+        surface(z, ox + xa, y, xb - xa, h, col)
+        return
+    }
+    let tw: f64 = bidi_layout(z, r, 0, k)
+    let ca: usize = bo_char(z, sa)
+    let cb: usize = bo_char(z, sb)
+    var open: bool = false
+    var x0: f64 = 0.0
+    var x1: f64 = 0.0
+    var q: usize = 0
+    while q < k {
+        let j: usize = br32(z, bo_ord(), q) as usize
+        let inside: bool = j >= ca && j < cb
+        let l: f64 = brf(z, bo_x(), j)
+        let rr: f64 = l + brf(z, bo_adv(), j)
+        if inside {
+            if !open {
+                open = true
+                x0 = l
+            }
+            x1 = rr
+        } else if open && !bidi_hidden(z, j) {
+            surface(z, ox + x0, y, x1 - x0, h, col)
+            open = false
+        }
+        q = q + 1
+    }
+    if open {
+        surface(z, ox + x0, y, x1 - x0, h, col)
+    }
+}
+
+// ======================================================================
+// DAS MESSEN FUER DAS TEXTFELD
+// ======================================================================
+//
+// lib/fui/editor.fi kennt keine Leinwand (mit Absicht, siehe dort) und
+// fragt die Lage der Schreibmarke ueber Funktionszeiger mit einem
+// Kontextwert -- dieselbe Form wie die Zwischenablage. `Measure` ist
+// dieser Kontext: ein Maler und der Textlauf, mit dem das Feld malt.
+struct Measure {
+    z: u64,
+    r: TextRun,
+}
+
+fn measure_new(z: *mut Painter, r: TextRun) -> Measure {
+    return Measure { z: z as u64, r: r }
+}
+
+fn measure_x(ctx: u64, p: u64, n: usize, i: usize) -> f64 {
+    let m: *mut Measure = ctx as *mut Measure
+    return run_caret_x((*m).z as *mut Painter, &(*m).r, p, n, i)
+}
+
+fn measure_hit(ctx: u64, p: u64, n: usize, x: f64) -> usize {
+    let m: *mut Measure = ctx as *mut Measure
+    return run_hit((*m).z as *mut Painter, &(*m).r, p, n, x)
+}
+
+fn measure_width(ctx: u64, p: u64, n: usize) -> f64 {
+    let m: *mut Measure = ctx as *mut Measure
+    return run_width((*m).z as *mut Painter, &(*m).r, p, n)
+}
+
+fn measure_rtl(ctx: u64, p: u64, n: usize) -> bool {
+    let m: *mut Measure = ctx as *mut Measure
+    return run_para_rtl((*m).z as *mut Painter, &(*m).r, p, n)
 }

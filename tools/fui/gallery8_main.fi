@@ -1,0 +1,555 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/gallery8_main.fi -- DIE ABBILDUNG ALS BILD.
+//
+// Eine Abbildung zeigt sich an KANTEN. Drei Sorten stehen hier
+// nebeneinander, und jede belegt etwas anderes:
+//
+//   1. GEDREHTE KACHELN MIT SCHRIFT. Rahmen, Flaeche und Text gehen
+//      durch dieselbe Matrix; die Glyphen werden als UMRISS gedreht
+//      und in der Zielgroesse gerastert. Waere hier ein fertiges
+//      Textbild gedreht, saehe man es an den ausgefransten Buchstaben
+//      sofort.
+//   2. SKALIERTE KACHELN. Die Schrift wird NEU gerastert und nicht
+//      vergroessert -- bei 1.5 sind die Striche gleich duenn wie bei
+//      0.65, nur groesser.
+//   3. EIN BILD, gedreht und vergroessert: rueckwaerts abgebildet und
+//      bilinear abgetastet, mit weicher Kante. Ein Gitter im Bild
+//      macht sichtbar, ob die Abtastung stimmt -- eine schiefe Linie
+//      mit Treppen faellt auf einem Gitter sofort auf.
+//   4. EINE SCHERUNG, wie CSS `skewX`.
+//
+//     gallery8_main <out.png> [light|dark] [<font.ttf>]
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import svg.matrix
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.uiimage
+import fui.transform
+
+const FONTSET_BYTES: usize = 4096
+const W: usize = 1280
+const H: usize = 716
+
+// ====================================================== DAS RASTER
+//
+// 20.09.2026 -- WAS HIER FALSCH WAR. Die Beschriftungen standen
+// durcheinander: die erste ueber ihrer Reihe, eine zweite UNTER
+// derselben Reihe, und zwischen der ersten und der zweiten Reihe lag
+// ein leeres Band von y 220 bis 350, in dem nichts als Grund war. Ein
+// Blatt, das seine eigene Ordnung nicht einhaelt, liest sich wie drei
+// Blaetter uebereinander.
+//
+// Also ein Raster mit ZWEI Zahlen, und beide gelten fuer jede Reihe:
+//
+//   LAB_ABSTAND     von der Oberkante der Beschriftung bis zur
+//                   Oberkante der Reihe. Die Beschriftung steht IMMER
+//                   darueber, nie darunter.
+//   REIHEN_ABSTAND  von der Unterkante einer Reihe bis zur
+//                   Beschriftung der naechsten.
+//
+// Die Oberkanten unten sind daraus gerechnet, und das Programm rechnet
+// am Ende nach, dass die wirklich GEMALTEN Kaesten (die vier
+// abgebildeten Ecken, nicht die Kaesten vor der Abbildung) in ihrem
+// Band liegen -- sonst endet es mit einem Fehler, statt ein schiefes
+// Blatt abzuliefern.
+const LAB_ABSTAND: f64 = 26.0
+const REIHEN_ABSTAND: f64 = 30.0
+
+// Reihe 1: gedrehte Kacheln. 170 x 64, um bis zu 48 Grad gedreht,
+// braucht in der Hoehe 85*sin48 + 32*cos48 = 63.2 + 21.4 = 84.6 nach
+// oben und unten. Die Mitte liegt darum 88 unter der Oberkante.
+const R1_LAB: f64 = 52.0
+const R1_TOP: f64 = 78.0
+const R1_MITTE: f64 = 166.0
+const R1_BOT: f64 = 254.0
+// Reihe 2: skalierte Kacheln. 150 x 56 mal 1.5 = 84 hoch, also 42 um
+// die Mitte.
+const R2_LAB: f64 = 284.0
+const R2_TOP: f64 = 310.0
+const R2_MITTE: f64 = 352.0
+const R2_BOT: f64 = 394.0
+// Reihe 3: die Bilder und die Scherung. Das 2.2fach vergroesserte
+// Bild ist mit 110*2.2 = 242 das hoechste Stueck; seine Mitte liegt
+// 121 unter der Oberkante.
+const R3_LAB: f64 = 424.0
+const R3_TOP: f64 = 450.0
+const R3_MITTE: f64 = 571.0
+const R3_BOT: f64 = 692.0
+// Die Kantenlaenge des gemalten Bildes. Klein genug, dass die
+// Vergroesserung rechts eine echte Vergroesserung ist.
+const BILD: usize = 64
+
+// Eine gerade Beschriftung -- sie erklaert, was darunter steht, und
+// geht darum den normalen Weg ueber render.draw_label.
+fn label(c: *mut render.Ctx, x: f64, y: f64, w: f64, px: usize, p: u64,
+    n: usize, tok: u32) {
+    var e: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&e, x, y, w, 18.0)
+    widget.w_set_text(&e, p, n)
+    let s: *mut style.Style = widget.w_style(&e)
+    *s = style.style_set_fg(*s, style.color_token(tok))
+    *s = style.style_set_font(*s, 0, px)
+    *s = style.style_set_pad(*s, 0, 0)
+    render.draw_label(c, &e)
+}
+
+// EINE KACHEL, DIE AUSSIEHT WIE EIN KNOPF, unter der Abbildung.
+//
+// `render.draw_button` kann das nicht: es malt achsenparallel durch
+// den Painter, und das ist richtig so -- der gerade Weg soll gerade
+// bleiben. Hier wird dieselbe Gestalt aus den abgebildeten Bausteinen
+// zusammengesetzt: Rahmen, Flaeche, Schrift. Der Rahmen ist die
+// groessere Rundung darunter, die Flaeche die um die Strichstaerke
+// eingerueckte darueber -- genau die Reihenfolge, in der painter.fi
+// einen Rahmen zeichnet.
+fn kachel(z: *mut painter.Painter, xf: *mut transform.Xform, x: f64,
+    y: f64, w: f64, h: f64, r: f64, rand: u32, fuell: u32, tcol: u32,
+    p: u64, n: usize, size: f64) {
+    let st: f64 = 1.5
+    transform.tf_fill_round_rect(z, xf, x, y, w, h, r, rand)
+    transform.tf_fill_round_rect(z, xf, x + st, y + st, w - 2.0 * st,
+        h - 2.0 * st, r - st, fuell)
+    if n == 0 {
+        return
+    }
+    // Die Grundlinie genau wie painter.text_baseline_mid sie rechnet,
+    // nur ohne das Runden auf ganze Pixel: gerundet wird unter einer
+    // Drehung nichts, dort gibt es keine Pixelzeile mehr, auf die man
+    // runden koennte.
+    let asc: f64 = painter.font_ascent(z, size)
+    let dsc: f64 = painter.font_descent(z, size)
+    let base: f64 = y + (h + asc - dsc) / 2.0
+    let pad: f64 = 10.0
+    transform.tf_text(z, xf, x + pad, base, w - 2.0 * pad, size, tcol,
+        p, n, painter.TEXT_M)
+}
+
+// DAS GEMALTE BILD. Ein Farbverlauf, ein heller Kreis und ein Gitter
+// alle 16 Punkte. Das Gitter ist der eigentliche Beleg: eine gedrehte
+// Gerade zeigt jede Treppe, die die Abtastung stehen laesst.
+//
+// KREIS UND LINIEN WERDEN HIER SCHON GEGLAETTET. Sonst zeigt das
+// vergroesserte Bild rechts die Treppen der QUELLE und nicht die
+// Guete der Abtastung -- eine bilineare Vergroesserung kann eine
+// harte Kante nur verbreitern, nicht erfinden.
+fn deckung(d: f64, halb: f64) -> f64 {
+    var v: f64 = halb - d + 0.5
+    if v < 0.0 {
+        return 0.0
+    }
+    if v > 1.0 {
+        return 1.0
+    }
+    return v
+}
+
+fn mische(a: f64, b: f64, t: f64) -> f64 {
+    return a + (b - a) * t
+}
+
+fn bild_bauen(p: u64, n: usize) {
+    var y: usize = 0
+    while y < n {
+        var x: usize = 0
+        while x < n {
+            let fx: f64 = (x as f64) / ((n - 1) as f64)
+            let fy: f64 = (y as f64) / ((n - 1) as f64)
+            var r: f64 = 30.0 + 190.0 * fx
+            var g: f64 = 80.0 + 110.0 * fy
+            var b: f64 = 210.0 - 130.0 * fx
+            // Der Kreis, mit weicher Kante ueber den Abstand zum Rand.
+            let dx: f64 = (x as f64) + 0.5 - (n as f64) / 2.0
+            let dy: f64 = (y as f64) + 0.5 - (n as f64) / 2.0
+            let rr: f64 = (n as f64) * 0.28
+            let dk: f64 = matrix.m_sqrt(dx * dx + dy * dy) - rr
+            let ck: f64 = deckung(dk, 0.0)
+            r = mische(r, 250.0, ck)
+            g = mische(g, 243.0, ck)
+            b = mische(b, 214.0, ck)
+            // Das Gitter: der Abstand zur naechsten Linie, in beiden
+            // Richtungen, und davon die weichere Kante.
+            let lx: f64 = abstand_zur_linie((x as f64) + 0.5, 16.0)
+            let ly: f64 = abstand_zur_linie((y as f64) + 0.5, 16.0)
+            var cl: f64 = deckung(lx, 0.9)
+            let cl2: f64 = deckung(ly, 0.9)
+            if cl2 > cl {
+                cl = cl2
+            }
+            r = mische(r, 22.0, cl)
+            g = mische(g, 26.0, cl)
+            b = mische(b, 44.0, cl)
+            let o: usize = (y * n + x) * 4
+            rt.st8(p, o, r as u8)
+            rt.st8(p, o + 1, g as u8)
+            rt.st8(p, o + 2, b as u8)
+            rt.st8(p, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Der Abstand zur naechsten Gitterlinie im Abstand `s`.
+fn abstand_zur_linie(v: f64, s: f64) -> f64 {
+    let m: f64 = v - matrix.m_floor(v / s) * s
+    if m > s - m {
+        return s - m
+    }
+    return m
+}
+
+// ================================ DAS BAND, DAS EINE REIHE BELEGT
+//
+// Gemessen wird das, was WIRKLICH auf dem Blatt landet: die vier Ecken
+// des Kastens NACH der Abbildung. Eine um 48 Grad gedrehte Kachel ist
+// hoeher als ihr Kasten, und genau deshalb kann man die Bandgrenzen
+// nicht aus der Kachelhoehe raten.
+static mut G_LO: f64 = 0.0
+static mut G_HI: f64 = 0.0
+
+fn band_auf() {
+    G_LO = 1000000.0
+    G_HI = 0.0 - 1000000.0
+}
+
+fn band_punkt(v: f64) {
+    if v < G_LO {
+        G_LO = v
+    }
+    if v > G_HI {
+        G_HI = v
+    }
+}
+
+fn band_kasten(xf: *mut transform.Xform, x: f64, y: f64, w: f64,
+    h: f64) {
+    band_punkt(transform.xf_point_y(xf, x, y))
+    band_punkt(transform.xf_point_y(xf, x + w, y))
+    band_punkt(transform.xf_point_y(xf, x, y + h))
+    band_punkt(transform.xf_point_y(xf, x + w, y + h))
+}
+
+// Eine Behauptung ueber das Raster. Sie steht nicht in einer
+// Pruefdatei, sondern HIER, weil nur dieses Programm seine Kaesten
+// kennt -- derselbe Weg, den demos/fuidemo/main.fi fuer die
+// Ueberdeckung seiner Phasen geht.
+static mut G_FEHLER: usize = 0
+
+fn verlange(nm: u64, nn: usize, ok: bool, a: f64, b: f64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 44 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "FALSCH  "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_FEHLER = G_FEHLER + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, (a * 10.0) as i64)
+    var w: [u8; 12] = "/10  want <="
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 12)
+    rt.buf_push_dec_i64(&t, (b * 10.0) as i64)
+    var e: [u8; 4] = "/10\n"
+    rt.buf_push_bytes(&t, (&e[0]) as u64, 4)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        var u: [u8; 47] = "gallery8_main <out.png> [light|dark] [font.ttf]"
+        rt.write_everything(2, (&u[0]) as u64, 47)
+        return 2
+    }
+    let path: u64 = rt.arg_ptr(start, 1)
+    var dark: bool = true
+    if rt.arg_count(start) >= 3 {
+        if rt.ld8(rt.arg_ptr(start, 2), 0) == 108 as u8 {
+            dark = false
+        }
+    }
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 4 {
+        have = rt.read_file(rt.arg_ptr(start, 3), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    // OHNE SCHRIFT KEIN BELEG. Ein Bild ohne einen einzigen
+    // Buchstaben sieht von weitem aus wie ein Bild, und genau so ist
+    // in OrientOS eine textlose Oberflaeche durch die Abnahme
+    // gekommen. Ein Beleg ohne Beschriftung belegt nichts -- also
+    // Fehler auf fd 2 und ein Rueckgabewert, an dem der Lauf
+    // haengenbleibt, statt ein stummes PNG zu schreiben.
+    if fm == 0 {
+        var ks: [u8; 60] = "gallery8: keine Schrift gefunden -- ohne Schrift kein Beleg\n"
+        rt.write_everything(2, (&ks[0]) as u64, 60)
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, 120) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(dark)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    canvas.canvas_clear(&cv, theme.opaque((*f).base))
+
+    let rand: u32 = theme.opaque((*f).border_col)
+    let flaeche: u32 = theme.opaque((*f).surface_raised)
+    let txt: u32 = theme.opaque((*f).text)
+    let akzent: u32 = theme.opaque((*f).accent)
+    let auf_akzent: u32 = theme.opaque((*f).text_on_accent)
+
+    var t1: [u8; 48] = "TRANSFORMS -- rotate, scale, skew, and a picture"
+    label(&c, 24.0, 20.0, 900.0, 15, (&t1[0]) as u64, 48, style.TOK_TEXT)
+
+    var x: transform.Xform = transform.xf_new()
+
+    // ---------------------------------------- 1. GEDREHTE KACHELN
+    //
+    // EINE Beschriftung ueber der Reihe, nicht eine darueber und eine
+    // darunter: was die Kacheln zeigen und um wie viel Grad sie
+    // gedreht sind, gehoert in DIESELBE Zeile.
+    var l1: [u8; 84] = "rotated widgets, 0 to 48 degrees about the centre -- every glyph outline turns along"
+    label(&c, 24.0, R1_LAB, 1100.0, 12, (&l1[0]) as u64, 84,
+        style.TOK_TEXT_MUTED)
+    band_auf()
+    var g0: [u8; 1] = "0"
+    var g1: [u8; 2] = "12"
+    var g2: [u8; 2] = "24"
+    var g3: [u8; 2] = "36"
+    var g4: [u8; 2] = "48"
+    var i: usize = 0
+    while i < 5 {
+        let cx: f64 = 140.0 + (i as f64) * 250.0
+        let cy: f64 = R1_MITTE
+        var grad: f64 = 0.0
+        var p: u64 = (&g0[0]) as u64
+        var n: usize = 1
+        if i == 1 {
+            grad = 12.0
+            p = (&g1[0]) as u64
+            n = 2
+        }
+        if i == 2 {
+            grad = 24.0
+            p = (&g2[0]) as u64
+            n = 2
+        }
+        if i == 3 {
+            grad = 36.0
+            p = (&g3[0]) as u64
+            n = 2
+        }
+        if i == 4 {
+            grad = 48.0
+            p = (&g4[0]) as u64
+            n = 2
+        }
+        transform.xf_reset(&x)
+        transform.xf_rotate_at(&x, grad, cx, cy)
+        // Der mittlere Knopf ist der Akzentknopf -- damit steht ein
+        // heller Text auf einer satten Flaeche daneben und man sieht,
+        // dass die Schrift in BEIDEN Fassungen sauber gedreht ist.
+        var fl: u32 = flaeche
+        var tc: u32 = txt
+        if i == 2 {
+            fl = akzent
+            tc = auf_akzent
+        }
+        kachel(&z, &x, cx - 85.0, cy - 32.0, 170.0, 64.0, 14.0, rand, fl,
+            tc, p, n, 17.0)
+        band_kasten(&x, cx - 85.0, cy - 32.0, 170.0, 64.0)
+        i = i + 1
+    }
+    let r1_lo: f64 = G_LO
+    let r1_hi: f64 = G_HI
+
+    // ---------------------------------------- 2. SKALIERTE KACHELN
+    var l2: [u8; 57] = "scaled widgets -- the text is re-rasterised, not blown up"
+    label(&c, 24.0, R2_LAB, 900.0, 12, (&l2[0]) as u64, 57,
+        style.TOK_TEXT_MUTED)
+    band_auf()
+    var s0: [u8; 4] = "0.65"
+    var s1: [u8; 4] = "0.85"
+    var s2: [u8; 4] = "1.00"
+    var s3: [u8; 4] = "1.25"
+    var s4: [u8; 4] = "1.50"
+    i = 0
+    while i < 5 {
+        let cx: f64 = 140.0 + (i as f64) * 250.0
+        let cy: f64 = R2_MITTE
+        var sk: f64 = 0.65
+        var p: u64 = (&s0[0]) as u64
+        if i == 1 {
+            sk = 0.85
+            p = (&s1[0]) as u64
+        }
+        if i == 2 {
+            sk = 1.0
+            p = (&s2[0]) as u64
+        }
+        if i == 3 {
+            sk = 1.25
+            p = (&s3[0]) as u64
+        }
+        if i == 4 {
+            sk = 1.5
+            p = (&s4[0]) as u64
+        }
+        transform.xf_reset(&x)
+        transform.xf_scale(&x, sk, sk, cx, cy)
+        kachel(&z, &x, cx - 75.0, cy - 28.0, 150.0, 56.0, 12.0, rand,
+            flaeche, txt, p, 4, 16.0)
+        band_kasten(&x, cx - 75.0, cy - 28.0, 150.0, 56.0)
+        i = i + 1
+    }
+    let r2_lo: f64 = G_LO
+    let r2_hi: f64 = G_HI
+
+    // ------------------------------------------------ 3. DAS BILD
+    let pix: u64 = rt.heap_alloc(BILD * BILD * 4)
+    if pix == 0 {
+        return 6
+    }
+    bild_bauen(pix, BILD)
+    var im: uiimage.Image = uiimage.image_wrap(pix, BILD, BILD, 0)
+
+    band_auf()
+    var l3: [u8; 31] = "a picture, turned by 25 degrees"
+    label(&c, 60.0, R3_LAB, 300.0, 12, (&l3[0]) as u64, 31,
+        style.TOK_TEXT_MUTED)
+    transform.xf_reset(&x)
+    transform.xf_rotate_at(&x, 25.0, 190.0, R3_MITTE)
+    transform.tf_draw_image(&z, &x, &im, 105.0, R3_MITTE - 85.0, 170.0,
+        170.0, 1.0)
+    band_kasten(&x, 105.0, R3_MITTE - 85.0, 170.0, 170.0)
+
+    var l4: [u8; 44] = "the same picture at 2.2x, sampled bilinearly"
+    label(&c, 430.0, R3_LAB, 400.0, 12, (&l4[0]) as u64, 44,
+        style.TOK_TEXT_MUTED)
+    transform.xf_reset(&x)
+    transform.xf_scale(&x, 2.2, 2.2, 560.0, R3_MITTE)
+    transform.tf_draw_image(&z, &x, &im, 505.0, R3_MITTE - 55.0, 110.0,
+        110.0, 1.0)
+    band_kasten(&x, 505.0, R3_MITTE - 55.0, 110.0, 110.0)
+
+    // ------------------------------------------------ 4. DIE SCHERUNG
+    var l5: [u8; 44] = "skewX 15 degrees about the lower left corner"
+    label(&c, 800.0, R3_LAB, 420.0, 12, (&l5[0]) as u64, 44,
+        style.TOK_TEXT_MUTED)
+    transform.xf_reset(&x)
+    transform.xf_skew(&x, 15.0, 0.0, 800.0, R3_BOT - 31.0)
+    var s5: [u8; 14] = "Sheared widget"
+    kachel(&z, &x, 810.0, R3_MITTE - 72.0, 330.0, 155.0, 18.0, rand,
+        flaeche, txt, (&s5[0]) as u64, 14, 20.0)
+    band_kasten(&x, 810.0, R3_MITTE - 72.0, 330.0, 155.0)
+    let r3_lo: f64 = G_LO
+    let r3_hi: f64 = G_HI
+
+    // ============================ DAS RASTER WIRD NACHGERECHNET
+    //
+    // Drei Behauptungen je Reihe, und alle ueber GEMESSENE Kanten:
+    //
+    //   a) Die Reihe faengt an ihrer Oberkante an. Sie darf ein paar
+    //      Punkte tiefer anfangen (eine um 12 Grad gedrehte Kachel ist
+    //      niedriger als eine um 48 gedrehte), aber nicht hoeher -- sonst
+    //      laeuft sie in ihre eigene Beschriftung.
+    //   b) Der Abstand von der Beschriftung zur Reihe ist LAB_ABSTAND.
+    //      Die Beschriftung steht 18 hoch; zwischen ihrer Unterkante und
+    //      der Reihe bleiben also 8 Punkte Luft.
+    //   c) Zwischen dem Ende einer Reihe und der Beschriftung der
+    //      naechsten liegen hoechstens REIHEN_ABSTAND + 8 Punkte. DAS
+    //      ist die Zahl, die das leere Band y 220..350 unmoeglich macht:
+    //      frueher waren es dort ueber hundert.
+    let luft: f64 = 8.0
+    var a1: [u8; 44] = "R1 starts at its top edge                   "
+    verlange((&a1[0]) as u64, 41, r1_lo >= R1_TOP - 0.5
+        && r1_lo <= R1_TOP + 12.0, r1_lo - R1_TOP, 12.0)
+    var a2: [u8; 44] = "R1 ends inside its band                     "
+    verlange((&a2[0]) as u64, 41, r1_hi <= R1_BOT + 0.5,
+        r1_hi, R1_BOT)
+    var a3: [u8; 44] = "R2 label sits LAB_ABSTAND above R2          "
+    verlange((&a3[0]) as u64, 41, R2_TOP - R2_LAB == LAB_ABSTAND,
+        R2_TOP - R2_LAB, LAB_ABSTAND)
+    var a4: [u8; 44] = "gap R1 -> label of R2 stays small           "
+    verlange((&a4[0]) as u64, 41,
+        R2_LAB - r1_hi <= REIHEN_ABSTAND + luft && R2_LAB - r1_hi >= 8.0,
+        R2_LAB - r1_hi, REIHEN_ABSTAND + luft)
+    var a5: [u8; 44] = "R2 starts at its top edge                   "
+    verlange((&a5[0]) as u64, 41, r2_lo >= R2_TOP - 0.5
+        && r2_lo <= R2_TOP + 12.0, r2_lo - R2_TOP, 12.0)
+    var a6: [u8; 44] = "gap R2 -> label of R3 stays small           "
+    verlange((&a6[0]) as u64, 41,
+        R3_LAB - r2_hi <= REIHEN_ABSTAND + luft && R3_LAB - r2_hi >= 8.0,
+        R3_LAB - r2_hi, REIHEN_ABSTAND + luft)
+    var a7: [u8; 44] = "R3 starts at its top edge                   "
+    verlange((&a7[0]) as u64, 41, r3_lo >= R3_TOP - 0.5
+        && r3_lo <= R3_TOP + 12.0, r3_lo - R3_TOP, 12.0)
+    var a8: [u8; 44] = "R3 ends inside the sheet                    "
+    verlange((&a8[0]) as u64, 41, r3_hi <= (H as f64) - 16.0,
+        r3_hi, (H as f64) - 16.0)
+    if G_FEHLER > 0 {
+        var gf: [u8; 60] = "gallery8: das Raster stimmt nicht -- kein Beleg geschrieben\n"
+        rt.write_everything(2, (&gf[0]) as u64, 60)
+        return 10
+    }
+
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(&cv, &out) {
+        return 7
+    }
+    var pf: rt.Buf = rt.buf_new()
+    var pk: usize = 0
+    while pk < rt.c_length(path) {
+        rt.buf_push(&pf, rt.ld8(path, pk))
+        pk = pk + 1
+    }
+    rt.buf_push(&pf, 0 as u8)
+    if !rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64,
+        mem.buf_len(&out)) {
+        return 8
+    }
+    var okm: [u8; 10] = "GALLERY 8\n"
+    rt.write_everything(1, (&okm[0]) as u64, 10)
+    rt.heap_free(pix, BILD * BILD * 4)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    return 0
+}

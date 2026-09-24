@@ -1,0 +1,805 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/anim_main.fi -- DIE ZEIT WIRD NACHGERECHNET.
+//
+// Eine Animation faellt nicht laut um. Sie laeuft ein bisschen falsch,
+// und "ein bisschen falsch" sieht man einer Bewegung nicht an -- man
+// spuert nur, dass die Oberflaeche billig wirkt. Deshalb stehen hier
+// ZAHLEN gegen von Hand gerechnete Sollwerte:
+//
+//   1. Die Stuetzstellen jeder Easing (linear, ease-in/out/in-out,
+//      steps, Feder) -- die Symmetriepunkte sind exakt bekannt.
+//   2. Die Newton-Umkehr der Bezierkurve: y(x) an einer Stelle, deren
+//      t von Hand bestimmt werden kann.
+//   3. Die Feder schwingt aus UND driftet nicht (das ist der Fehler,
+//      den ein Euler-Schritt macht).
+//   4. Der Takt meldet nur dann "veraendert", wenn sich wirklich etwas
+//      geaendert hat -- daran haengt das bedarfsgesteuerte Zeichnen.
+//   5. Farbmischung mit Alpha: kein grauer Zwischenton.
+//   6. Verzoegerung, Wiederholung und `alternate` an abgezaehlten
+//      Zeitpunkten -- eine Animation, die einen Zyklus zu frueh oder
+//      zu spaet umkehrt, sieht man auf dem Standbild nicht.
+//   7. DER UEBERGANG AM WIDGET: dass `trans_from_widget` dieselben
+//      Zielwerte holt, die `render` im Stand malen wuerde, und dass
+//      der Zwischenstand wirklich zwischen beiden liegt.
+import std.rt
+import paint.canvas
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.anim
+
+static mut G_ERRORS: usize = 0
+
+// DIE FARBE IN DER MITTE DES GEMALTEN KNOPFES, als 0xRRGGBB. Der
+// Knopf der Abschnitte 12/12b liegt bei (8,8) und ist 48x32 gross,
+// seine Mitte ist also (32,24). Dort ist die Deckung voll, der
+// Bildpunkt traegt die Farbe unverfaelscht.
+fn mitte(cv: *mut canvas.Canvas) -> i64 {
+    let p: u32 = canvas.canvas_get(cv, 32, 24)
+    return ((canvas.color_r(p) << 16) | (canvas.color_g(p) << 8) |
+        canvas.color_b(p)) as i64
+}
+
+// ================================= DIE PHASENREIHE DER BELEGBILDER
+//
+// tools/fui/gallery5_main.fi zeichnet jede Easing als neun Marken auf
+// einer Bahn. Ein Beleg taugt nur, wenn man die neun Phasen auch
+// EINZELN sieht -- am 20.09.2026 lagen bei der Feder drei Marken
+// uebereinander, weil der Ueberschuss der Feder bei 1.12 abgeschnitten
+// wurde. Damit das nicht wiederkommt, steht die Rechnung der Galerie
+// hier noch einmal und wird nachgerechnet: dieselben Konstanten,
+// dieselbe Skalierung auf den ganzen Wertebereich der Reihe.
+const PH: usize = 9
+const BAHN_X: f64 = 150.0
+const BAHN_W: f64 = 1066.0
+const MARKE_W: f64 = 14.0
+// Die geforderte Mindestluecke. Eine MARKENBREITE reichte nicht: zwei
+// Marken, die genau ihre eigene Breite auseinander liegen, beruehren
+// sich zwar nicht, aber zwischen ihnen bleibt kein Grund mehr stehen,
+// der breit genug waere, um ihn zu SEHEN -- im Bild lesen sich die
+// zwei dann als ein Block. Gefordert sind darum Markenbreite plus
+// sechs Punkt: sechs Punkt sichtbarer Grund zwischen je zwei Phasen.
+// Die Bahn in gallery5_main.fi ist dafuer auf 1066 Punkt gestreckt
+// und die Marke auf 14 Punkt verschmaelert worden.
+// (MARKE_W + 6) * 100, in Hundertstel Punkt.
+const LUECKE: i64 = 2000
+
+// Die neun x-Lagen einer Reihe, wie gallery5 sie malt.
+fn phasen_x(e: anim.Easing, xs: *mut f64, vs: *mut f64) {
+    var a: anim.Animation = anim.anim_new(0, 1000, 0.0, 1.0, e)
+    var lo: f64 = 0.0
+    var hi: f64 = 1.0
+    var k: usize = 0
+    while k < PH {
+        let v: f64 = anim.anim_value(&a, ((k * 1000) / (PH - 1)) as i64)
+        if v < lo {
+            lo = v
+        }
+        if v > hi {
+            hi = v
+        }
+        k = k + 1
+    }
+    let spanne: f64 = hi - lo
+    var i: usize = 0
+    while i < PH {
+        let v: f64 = anim.anim_value(&a, ((i * 1000) / (PH - 1)) as i64)
+        let anteil: f64 = (v - lo) / spanne
+        // Firn Stufe 0 kennt keinen Index auf einem Zeiger; die
+        // Schrittweite von acht Byte wird deshalb von Hand gerechnet.
+        let pv: *mut f64 = ((vs as u64) + (i * 8) as u64) as *mut f64
+        let px: *mut f64 = ((xs as u64) + (i * 8) as u64) as *mut f64
+        *pv = v
+        *px = BAHN_X + 12.0 + anteil * (BAHN_W - MARKE_W - 24.0)
+        i = i + 1
+    }
+}
+
+// Der kleinste Abstand ZWEIER BELIEBIGER Phasen, in Hundertstel
+// Punkt. Phasen mit demselben Wert (eine Treppe haelt still) zaehlen
+// nicht mit -- die stehen zu Recht am selben Ort; alle anderen
+// muessen mindestens MARKE_W + 6 Punkt auseinander liegen.
+fn min_abstand(e: anim.Easing) -> i64 {
+    var xs: [f64; 9] = [0.0; 9]
+    var vs: [f64; 9] = [0.0; 9]
+    phasen_x(e, &xs[0], &vs[0])
+    var best: f64 = 100000.0
+    var i: usize = 0
+    while i < PH {
+        var j: usize = i + 1
+        while j < PH {
+            if vs[i] != vs[j] {
+                var d: f64 = xs[j] - xs[i]
+                if d < 0.0 {
+                    d = 0.0 - d
+                }
+                if d < best {
+                    best = d
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return (best * 100.0) as i64
+}
+
+// Wie viele Paare stehen wirklich auf demselben Wert? Bei steps(5)
+// sind es genau drei (0/0, 200/200, 600/600) -- das ist die Aussage
+// einer Treppe und kein Fehler; bei jeder stetigen Kurve ist es null.
+fn gleiche_paare(e: anim.Easing) -> i64 {
+    var xs: [f64; 9] = [0.0; 9]
+    var vs: [f64; 9] = [0.0; 9]
+    phasen_x(e, &xs[0], &vs[0])
+    var n: i64 = 0
+    var i: usize = 0
+    while i < PH {
+        var j: usize = i + 1
+        while j < PH {
+            if vs[i] == vs[j] {
+                n = n + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Tausendstel, damit f64 als ganze Zahl geprueft werden kann.
+fn milli(x: f64) -> i64 {
+    return (x * 1000.0 + 0.5) as i64
+}
+
+// Der groesste Abstand eines Kanals von einem erwarteten Dreiklang.
+fn abw(c: u32, r: i64, g: i64, b: i64) -> i64 {
+    var d: i64 = betrag((((c >> 16) & 255 as u32) as i64) - r)
+    let e: i64 = betrag((((c >> 8) & 255 as u32) as i64) - g)
+    let f: i64 = betrag(((c & 255 as u32) as i64) - b)
+    if e > d { d = e }
+    if f > d { d = f }
+    return d
+}
+
+fn betrag(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+// Die BUNTHEIT einer Farbe als Abstand des groessten vom kleinsten
+// Kanal. Null heisst grau -- und genau das ist der Fehler, den eine
+// Mischung von Blau nach Gelb in sRGB macht.
+fn bunt(c: u32) -> i64 {
+    let r: i64 = ((c >> 16) & 255 as u32) as i64
+    let g: i64 = ((c >> 8) & 255 as u32) as i64
+    let b: i64 = (c & 255 as u32) as i64
+    var hi: i64 = r
+    var lo: i64 = r
+    if g > hi { hi = g }
+    if b > hi { hi = b }
+    if g < lo { lo = g }
+    if b < lo { lo = b }
+    return hi - lo
+}
+
+fn main(start: u64) -> i32 {
+    // ==================================================== 1. LINEAR
+    var lin: anim.Easing = anim.easing_linear()
+    var n1: [u8; 22] = "1 linear at 0.25 = 250"
+    report((&n1[0]) as u64, 22, milli(anim.ease_eval(&lin, 0.25)) == 250,
+        milli(anim.ease_eval(&lin, 0.25)), 250)
+
+    // ============================================== 2. DIE CSS-KURVEN
+    //
+    // ease-in-out ist punktsymmetrisch zu (0.5, 0.5): der Wert in der
+    // Mitte ist EXAKT 0.5. Das ist die Stuetzstelle, an der eine falsch
+    // geloeste Newton-Iteration sofort auffaellt.
+    var eio: anim.Easing = anim.easing_named(anim.EASE_IN_OUT)
+    var n2: [u8; 28] = "2 ease-in-out at 0.5 = 500  "
+    report((&n2[0]) as u64, 28, milli(anim.ease_eval(&eio, 0.5)) == 500,
+        milli(anim.ease_eval(&eio, 0.5)), 500)
+    // Die Enden sind fest.
+    var n3: [u8; 24] = "2 ease-in-out at 0 = 0  "
+    report((&n3[0]) as u64, 24, milli(anim.ease_eval(&eio, 0.0)) == 0,
+        milli(anim.ease_eval(&eio, 0.0)), 0)
+    var n4: [u8; 27] = "2 ease-in-out at 1 = 1000  "
+    report((&n4[0]) as u64, 27, milli(anim.ease_eval(&eio, 1.0)) == 1000,
+        milli(anim.ease_eval(&eio, 1.0)), 1000)
+
+    // ==================================================== 3. STEPS
+    //
+    // steps(4): bei 0.5 ist der zweite Sprung genommen, also 0.5.
+    var st: anim.Easing = anim.easing_steps(4)
+    var n5: [u8; 23] = "3 steps(4) at 0.6 = 500"
+    report((&n5[0]) as u64, 23, milli(anim.ease_eval(&st, 0.6)) == 500,
+        milli(anim.ease_eval(&st, 0.6)), 500)
+
+    // ==================================================== 4. DIE FEDER
+    //
+    // Bei t = 0 steht sie am Anfang, und nach langer Zeit steht sie
+    // GENAU auf 1 -- ein Euler-Schritt driftet hier davon.
+    let f0: f64 = anim.spring_eval(1.0, 100.0, 10.0, 0.0)
+    var n6: [u8; 22] = "4 spring at t = 0 is 0"
+    report((&n6[0]) as u64, 22, milli(f0) == 0, milli(f0), 0)
+    let f9: f64 = anim.spring_eval(1.0, 100.0, 10.0, 8.0)
+    var n7: [u8; 29] = "4 spring settles at 1 (x1000)"
+    report((&n7[0]) as u64, 29, milli(f9) == 1000, milli(f9), 1000)
+
+    // ================================================== 5. DER TAKT
+    var g: anim.Animator = anim.animator_new()
+    let i0: usize = anim.animator_add(&g,
+        anim.anim_new(0, 100, 0.0, 10.0, anim.easing_linear()))
+    var n8: [u8; 25] = "5 the register holds one "
+    report((&n8[0]) as u64, 25, anim.animator_count(&g) == 1,
+        anim.animator_count(&g) as i64, 1)
+    let ver: bool = anim.anim_tick(&g, 50)
+    var n9: [u8; 30] = "5 tick at 50 ms reports change"
+    report((&n9[0]) as u64, 30, ver, ver as i64, 1)
+    let v50: f64 = anim.anim_value(anim.animator_at(&g, i0), 50)
+    var n10: [u8; 26] = "5 halfway the value is 5.0"
+    report((&n10[0]) as u64, 26, milli(v50) == 5000, milli(v50), 5000)
+    // Nach dem Ende meldet der Takt NICHTS mehr -- sonst zeichnet die
+    // Oberflaeche fuer immer weiter.
+    anim.anim_tick(&g, 200)
+    let ruhe: bool = anim.anim_tick(&g, 300)
+    var n11: [u8; 31] = "5 after the end nothing changes"
+    report((&n11[0]) as u64, 31, !ruhe, ruhe as i64, 0)
+
+    // ================================================= 6. DIE FARBEN
+    //
+    // Halb zwischen deckendem Rot und deckendem Rot bleibt Rot -- die
+    // Probe darauf, dass die Premultiplikation nicht abfaerbt.
+    let c: u32 = anim.mix_srgb(0xFFFF0000 as u32, 0xFFFF0000 as u32, 0.5)
+    var n12: [u8; 30] = "6 red mixed with red stays red"
+    report((&n12[0]) as u64, 30, c == 0xFFFF0000 as u32, (c & 16777215 as u32) as i64,
+        16711680)
+    // Von voellig durchsichtig nach deckendem Rot: in der Mitte ist die
+    // FARBE schon ganz rot, nur das Alpha halb. Wer gerade mischt,
+    // bekommt hier ein dunkles Rot -- den grauen Zwischenton.
+    let d: u32 = anim.mix_srgb(0x00FF0000 as u32, 0xFFFF0000 as u32, 0.5)
+    var n13: [u8; 33] = "6 fade-in keeps the hue (R = 255)"
+    report((&n13[0]) as u64, 33, ((d >> 16) & 255 as u32) == 255 as u32,
+        ((d >> 16) & 255 as u32) as i64, 255)
+    var n14: [u8; 27] = "6 and its alpha is half way"
+    report((&n14[0]) as u64, 27, ((d >> 24) & 255 as u32) == 128 as u32,
+        ((d >> 24) & 255 as u32) as i64, 128)
+
+    // ====================== 7. DIE BEZIERKURVE MIT FREIEN PUNKTEN
+    //
+    // Newton wird nur dann wirklich geprueft, wenn das t zur Stelle x
+    // VON HAND bekannt ist. Fuer cubic-bezier(0.5, 0, 0.5, 1) ist
+    //     x(t) = 1.5t - 1.5t^2 + t^3,   y(t) = 3(1-t)t^2 + t^3.
+    // Bei t = 1/4: x = 0.375 - 0.09375 + 0.015625 = 0.296875 und
+    //              y = 0.140625 + 0.015625 = 0.15625.
+    // Also muss die Kurve an der Stelle 0.296875 genau 156 Tausendstel
+    // liefern. Eine Iteration, die bei der Umkehr schludert, landet
+    // hier sichtbar daneben.
+    var bz: anim.Easing = anim.easing_bezier(0.5, 0.0, 0.5, 1.0)
+    var n15: [u8; 37] = "7 bezier(.5,0,.5,1) at 0.296875 = 156"
+    report((&n15[0]) as u64, 37,
+        milli(anim.ease_eval(&bz, 0.296875)) == 156,
+        milli(anim.ease_eval(&bz, 0.296875)), 156)
+    // Und die Umkehr selbst: t zur Stelle 0.296875 ist 0.25.
+    let tt: f64 = anim.bezier_t_for_x(0.5, 0.5, 0.296875)
+    var n16: [u8; 26] = "7 and its solved t is 0.25"
+    report((&n16[0]) as u64, 26, milli(tt) == 250, milli(tt), 250)
+    // Eine zweite Kurve mit anderen Punkten: cubic-bezier(.25,.75,.25,.25)
+    //     x(t) = 0.75t(1-t) + t^3  ->  x(0.5) = 0.1875 + 0.125 = 0.3125
+    //     y(t) = 2.25(1-t)^2 t + 0.75(1-t)t^2 + t^3
+    //          -> y(0.5) = 0.28125 + 0.09375 + 0.125 = 0.5
+    var bz2: anim.Easing = anim.easing_bezier(0.25, 0.75, 0.25, 0.25)
+    var n17: [u8; 41] = "7 bezier(.25,.75,.25,.25) at 0.3125 = 500"
+    report((&n17[0]) as u64, 41,
+        milli(anim.ease_eval(&bz2, 0.3125)) == 500,
+        milli(anim.ease_eval(&bz2, 0.3125)), 500)
+    // Die beiden benannten CSS-Kurven sind bisher nur an den Enden und
+    // in der Mitte geprueft worden -- dort hilft die Symmetrie, und ein
+    // schiefer Newton faellt nicht auf. Also je ein INNENPUNKT, dessen
+    // t von Hand bestimmt ist.
+    //
+    // ease-in = cubic-bezier(0.42, 0, 1, 1):
+    //     x(t) = 3(1-t)^2 t * 0.42 + 3(1-t)t^2 + t^3
+    //     y(t) = 3(1-t)t^2 + t^3 = 3t^2 - 2t^3
+    // Bei t = 1/4: 3(1-t)^2 t = 3 * 0.5625 * 0.25 = 0.421875, davon
+    // 0.42 sind 0.17718750; 3(1-t)t^2 = 0.140625; t^3 = 0.015625.
+    //     x = 0.17718750 + 0.140625 + 0.015625 = 0.33343750
+    //     y = 0.1875 - 0.03125 = 0.15625
+    // Ein Drittel des Weges, ein Sechstel der Strecke: genau das ist
+    // das traege Anfahren, das ease-in ausmacht.
+    var ein: anim.Easing = anim.easing_named(anim.EASE_IN)
+    var n17b: [u8; 29] = "7 ease-in at 0.33343750 = 156"
+    report((&n17b[0]) as u64, 29,
+        milli(anim.ease_eval(&ein, 0.33343750)) == 156,
+        milli(anim.ease_eval(&ein, 0.33343750)), 156)
+    // ease-out = cubic-bezier(0, 0, 0.58, 1), gleiches y(t), anderes x:
+    //     x(t) = 3(1-t)t^2 * 0.58 + t^3
+    // Bei t = 3/4: 3(1-t)t^2 = 3 * 0.25 * 0.5625 = 0.421875, davon
+    // 0.58 sind 0.24468750; t^3 = 0.421875.
+    //     x = 0.24468750 + 0.421875 = 0.66656250
+    //     y = 1.6875 - 0.84375 = 0.84375
+    // Zwei Drittel des Weges, fuenf Sechstel der Strecke: das Auslaufen.
+    var eout: anim.Easing = anim.easing_named(anim.EASE_OUT)
+    var n17c: [u8; 30] = "7 ease-out at 0.66656250 = 844"
+    report((&n17c[0]) as u64, 30,
+        milli(anim.ease_eval(&eout, 0.66656250)) == 844,
+        milli(anim.ease_eval(&eout, 0.66656250)), 844)
+
+    // ================================ 8. STEPS AN DEN SPRUNGSTELLEN
+    //
+    // steps(4, jump-end) haelt auf [0, 0.25) den Wert 0 und springt BEI
+    // 0.25 auf 0.25. Genau an der Kante entscheidet sich, ob der
+    // Abschnitt links oder rechts offen ist.
+    var st4: anim.Easing = anim.easing_steps(4)
+    var n18: [u8; 31] = "8 steps(4) just below 0.25 is 0"
+    report((&n18[0]) as u64, 31, milli(anim.ease_eval(&st4, 0.2499)) == 0,
+        milli(anim.ease_eval(&st4, 0.2499)), 0)
+    var n19: [u8; 31] = "8 steps(4) at 0.25 jumps to 250"
+    report((&n19[0]) as u64, 31, milli(anim.ease_eval(&st4, 0.25)) == 250,
+        milli(anim.ease_eval(&st4, 0.25)), 250)
+    var n20: [u8; 36] = "8 steps(4) just below 1 is still 750"
+    report((&n20[0]) as u64, 36, milli(anim.ease_eval(&st4, 0.9999)) == 750,
+        milli(anim.ease_eval(&st4, 0.9999)), 750)
+    var n21: [u8; 28] = "8 steps(4) at 1 is exactly 1"
+    report((&n21[0]) as u64, 28, milli(anim.ease_eval(&st4, 1.0)) == 1000,
+        milli(anim.ease_eval(&st4, 1.0)), 1000)
+
+    // ============================ 9. DIE FEDER IN ALLEN DREI FAELLEN
+    //
+    // Jeder Fall hat seine eigene Formel, und jede ist von Hand
+    // nachgerechnet (m = 1, k = 100, also w0 = 10):
+    //
+    //   unterkritisch c = 10 -> z = 0.5, wd = 5*sqrt(3) = 8.660254
+    //     x(0.2) = e^-1 (cos 1.7320508 + 0.57735 sin 1.7320508)
+    //            = 0.3678794 * 0.409313 = 0.150578  -> 849
+    //   kritisch      c = 20 -> z = 1
+    //     x(0.1) = e^-1 (1 + 1) = 0.7357589           -> 264
+    //   ueberkritisch c = 25 -> z = 1.25, r = 0.75, a = -5, b = -20
+    //     x(0.1) = (4/3) e^-0.5 - (1/3) e^-2
+    //            = 0.8087084 - 0.0451118 = 0.7635966  -> 236
+    let su: f64 = anim.spring_eval(1.0, 100.0, 10.0, 0.2)
+    var n22: [u8; 34] = "9 underdamped spring at 0.2 is 849"
+    report((&n22[0]) as u64, 34, milli(su) == 849, milli(su), 849)
+    let sk: f64 = anim.spring_eval(1.0, 100.0, 20.0, 0.1)
+    var n23: [u8; 33] = "9 critically damped at 0.1 is 264"
+    report((&n23[0]) as u64, 33, milli(sk) == 264, milli(sk), 264)
+    let so: f64 = anim.spring_eval(1.0, 100.0, 25.0, 0.1)
+    var n24: [u8; 26] = "9 overdamped at 0.1 is 236"
+    report((&n24[0]) as u64, 26, milli(so) == 236, milli(so), 236)
+    // Und der Beleg, dass es wirklich eine Feder ist: die
+    // unterkritische schiesst UEBER das Ziel hinaus.
+    //   x(0.5) = e^-2.5 (cos 4.330127 + 0.57735 sin 4.330127)
+    //          = 0.0820850 * (-0.908296) = -0.074562  -> 1075
+    let sh: f64 = anim.spring_eval(1.0, 100.0, 10.0, 0.5)
+    var n25: [u8; 33] = "9 and it overshoots past 1 (1075)"
+    report((&n25[0]) as u64, 33, milli(sh) == 1075, milli(sh), 1075)
+    // Der ueberkritische Fall darf NIE ueberschwingen -- er kriecht.
+    var uebersch: bool = false
+    var q: i32 = 1
+    while q <= 100 {
+        if anim.spring_eval(1.0, 100.0, 25.0, (q as f64) * 0.02) > 1.0 {
+            uebersch = true
+        }
+        q = q + 1
+    }
+    var n26: [u8; 37] = "9 the overdamped one never overshoots"
+    report((&n26[0]) as u64, 37, !uebersch, uebersch as i64, 0)
+
+    // ==================== 10. VERZOEGERUNG, WIEDERHOLUNG, ALTERNATE
+    //
+    // dur = 100 ms, von 0 nach 10, linear. Mit 50 ms Verzoegerung ist
+    // bei 50 ms noch nichts passiert, bei 100 ms die Haelfte, bei
+    // 150 ms alles.
+    var av: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
+        anim.easing_linear())
+    anim.anim_set_delay(&av, 50)
+    var n27: [u8; 34] = "10 delayed run is still 0 at 50 ms"
+    report((&n27[0]) as u64, 34, milli(anim.anim_value(&av, 50)) == 0,
+        milli(anim.anim_value(&av, 50)), 0)
+    var n28: [u8; 31] = "10 halfway only at 100 ms (5.0)"
+    report((&n28[0]) as u64, 31, milli(anim.anim_value(&av, 100)) == 5000,
+        milli(anim.anim_value(&av, 100)), 5000)
+    var n29: [u8; 28] = "10 and done at 150 ms (10.0)"
+    report((&n29[0]) as u64, 28, milli(anim.anim_value(&av, 150)) == 10000,
+        milli(anim.anim_value(&av, 150)), 10000)
+    var n30: [u8; 35] = "10 done at 150 ms, not before (149)"
+    report((&n30[0]) as u64, 35,
+        !anim.anim_done(&av, 149) && anim.anim_done(&av, 150),
+        anim.anim_done(&av, 149) as i64, 0)
+
+    // Drei Durchlaeufe ohne Verzoegerung: 250 ms liegt in der Mitte des
+    // DRITTEN, 320 ms ist hinter dem Ende und bleibt auf 10 stehen.
+    var aw: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
+        anim.easing_linear())
+    anim.anim_set_repeat(&aw, 3)
+    var n31: [u8; 41] = "10 repeat(3): 250 ms is mid 3rd run (5.0)"
+    report((&n31[0]) as u64, 41, milli(anim.anim_value(&aw, 250)) == 5000,
+        milli(anim.anim_value(&aw, 250)), 5000)
+    var n32: [u8; 35] = "10 repeat(3): after 300 ms it rests"
+    report((&n32[0]) as u64, 35, milli(anim.anim_value(&aw, 320)) == 10000,
+        milli(anim.anim_value(&aw, 320)), 10000)
+
+    // Alternate: der zweite Durchlauf laeuft RUECKWAERTS. Bei 120 ms
+    // ist er 20 % weit, also auf 0.8 -> 8.0; bei 150 ms genau in der
+    // Mitte -> 5.0; am Ende steht er wieder bei 0.
+    var ax: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
+        anim.easing_linear())
+    anim.anim_set_repeat(&ax, 2)
+    anim.anim_set_direction(&ax, anim.DIR_ALTERNATE)
+    var n33: [u8; 36] = "10 alternate: 120 ms runs back (8.0)"
+    report((&n33[0]) as u64, 36, milli(anim.anim_value(&ax, 120)) == 8000,
+        milli(anim.anim_value(&ax, 120)), 8000)
+    var n34: [u8; 27] = "10 alternate: 150 ms is 5.0"
+    report((&n34[0]) as u64, 27, milli(anim.anim_value(&ax, 150)) == 5000,
+        milli(anim.anim_value(&ax, 150)), 5000)
+    var n35: [u8; 40] = "10 alternate: it ends where it began (0)"
+    report((&n35[0]) as u64, 40, milli(anim.anim_value(&ax, 200)) == 0,
+        milli(anim.anim_value(&ax, 200)), 0)
+    // Endlos heisst endlos: nach zehneinhalb Durchlaeufen steht sie in
+    // der Mitte und ist NICHT fertig.
+    var ay: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
+        anim.easing_linear())
+    anim.anim_set_repeat(&ay, anim.REPEAT_FOREVER)
+    var n36: [u8; 40] = "10 forever: 1050 ms is mid run and alive"
+    report((&n36[0]) as u64, 40,
+        milli(anim.anim_value(&ay, 1050)) == 5000
+            && !anim.anim_done(&ay, 1050),
+        milli(anim.anim_value(&ay, 1050)), 5000)
+
+    // ================== 11. ALPHA UND FARBRAUM GEGEN DAS GRAUE LOCH
+    //
+    // Von durchsichtigem SCHWARZ nach deckendem BLAU: wer gerade
+    // mischt, bekommt in der Mitte ein halbdunkles Blau (B = 128) --
+    // premultipliziert bleibt der Farbton voll (B = 255).
+    let fb: u32 = anim.mix_srgb(0 as u32, 0xFF0000FF as u32, 0.5)
+    var n37: [u8; 35] = "11 fade from nothing keeps B at 255"
+    report((&n37[0]) as u64, 35, (fb & 255 as u32) == 255 as u32,
+        (fb & 255 as u32) as i64, 255)
+    // Blau -> Gelb: in sRGB liegt in der Mitte ein totes Grau
+    // (0x808080, Buntheit max-min = 0). In OKLab bleibt der Weg bunt.
+    let mg: u32 = anim.mix_srgb(0xFF0000FF as u32, 0xFFFFFF00 as u32, 0.5)
+    let gr: i64 = bunt(mg)
+    var n38: [u8; 37] = "11 blue->yellow in sRGB goes grey (0)"
+    report((&n38[0]) as u64, 37, gr == 0, gr, 0)
+    let mo: u32 = anim.mix_oklab(0xFF0000FF as u32, 0xFFFFFF00 as u32, 0.5)
+    // Von Hand mit den Ottosson-Matrizen: die Mitte ist 0x6CABC7,
+    // Buntheit 199 - 108 = 91.
+    var n39: [u8; 35] = "11 in OKLab it stays colourful (91)"
+    report((&n39[0]) as u64, 35, bunt(mo) == 91, bunt(mo), 91)
+    // Und der Punkt selbst, Kanal fuer Kanal: 108 / 171 / 199. Die
+    // Kubikwurzel laeuft ueber math.powf, deren letzte Stellen nicht
+    // exakt sind -- geprueft wird deshalb der groesste Kanalabstand mit
+    // zwei zugelassenen Stufen, nicht das Bitmuster.
+    var n40: [u8; 36] = "11 the OKLab midpoint is 108/171/199"
+    report((&n40[0]) as u64, 36, abw(mo, 108, 171, 199) <= 2,
+        abw(mo, 108, 171, 199), 0)
+
+    // ================== 12. DER UEBERGANG AM WIDGET (Farbe/Radius/Rand)
+    //
+    // Ein Knopf im dunklen Schema. Die Zielfarben stehen in theme.fi:
+    // Ruhe 0x42414D, ueberfahren 0x52525E, gedrueckt 0x63636E. Der
+    // Radius kommt aus shape_osum (r_button = 8), die Bewegungsregel
+    // legt darauf +2 beim Ueberfahren und -2 beim Druecken.
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 64, 64) {
+        return 4
+    }
+    var pz: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&pz, &cv, 64, 64) {
+        return 5
+    }
+    var th: theme.Theme = theme.theme_new(true)
+    var cx: render.Ctx = render.ctx_new(&th, &pz)
+    var kn: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&kn, 8.0, 8.0, 48.0, 32.0)
+
+    let bg_n: u32 = anim.widget_target_bg(&cx, &kn, style.STATE_NORMAL)
+    var n41: [u8; 36] = "12 target colour at rest is 0x42414D"
+    report((&n41[0]) as u64, 36, bg_n == 0xFF42414D as u32,
+        (bg_n & 16777215 as u32) as i64, 4342093)
+    widget.w_set_hover(&kn, true)
+    let bg_h: u32 = anim.widget_target_bg(&cx, &kn, widget.w_state(&kn))
+    var n42: [u8; 30] = "12 hovered it aims at 0x52525E"
+    report((&n42[0]) as u64, 30, bg_h == 0xFF52525E as u32,
+        (bg_h & 16777215 as u32) as i64, 5395038)
+    var n43: [u8; 31] = "12 hovered radius is 8 + 2 = 10"
+    report((&n43[0]) as u64, 31,
+        milli(anim.widget_target_radius(&cx, &kn, style.STATE_HOVER)) == 10000,
+        milli(anim.widget_target_radius(&cx, &kn, style.STATE_HOVER)), 10000)
+    var n44: [u8; 30] = "12 pressed radius is 8 - 2 = 6"
+    report((&n44[0]) as u64, 30,
+        milli(anim.widget_target_radius(&cx, &kn, style.STATE_ACTIVE)) == 6000,
+        milli(anim.widget_target_radius(&cx, &kn, style.STATE_ACTIVE)), 6000)
+    // Der Rand eines Knopfes ist 0 -- im Fokus kommt focus_w (2) dazu,
+    // damit der Ring nicht aufploppt.
+    var n45: [u8; 30] = "12 focus grows the border to 2"
+    report((&n45[0]) as u64, 30,
+        milli(anim.widget_target_border(&cx, &kn, style.STATE_FOCUS)) == 2000,
+        milli(anim.widget_target_border(&cx, &kn, style.STATE_FOCUS)), 2000)
+
+    // Der Wechsel selbst: von Ruhe nach ueberfahren, 100 ms, linear.
+    // Bei 50 ms steht alles GENAU in der Mitte:
+    //   Farbe  R (0x42 + 0x52)/2 = 0x4A, G (0x41 + 0x52)/2 = 73.5 -> 74,
+    //          B (0x4D + 0x5E)/2 = 85.5 -> 86  =>  0x4A4A56
+    //   Radius (8 + 10)/2 = 9,  Verschiebung (0 + -1)/2 = -0.5
+    var tr: anim.Transition = anim.trans_new(0xFF42414D as u32, 8.0, 0.0, 1.0)
+    anim.trans_set_duration(&tr, 100)
+    anim.trans_set_easing(&tr, anim.easing_linear())
+    let gewechselt: bool = anim.trans_from_widget(&tr, &cx, &kn, 0)
+    var n46: [u8; 39] = "12 the widget state starts a transition"
+    report((&n46[0]) as u64, 39, gewechselt, gewechselt as i64, 1)
+    anim.trans_tick(&tr, 50)
+    var n47: [u8; 34] = "12 at 50 ms the colour is 0x4A4A56"
+    report((&n47[0]) as u64, 34,
+        (anim.trans_color(&tr) & 16777215 as u32) == 0x4A4A56 as u32,
+        (anim.trans_color(&tr) & 16777215 as u32) as i64, 4868694)
+    var n48: [u8; 27] = "12 at 50 ms the radius is 9"
+    report((&n48[0]) as u64, 27, milli(anim.trans_radius(&tr)) == 9000,
+        milli(anim.trans_radius(&tr)), 9000)
+    // Nach oben ist negativ; geprueft wird der BETRAG, weil `milli`
+    // zur Null hin abschneidet und -0.5 sonst als -499 erschiene.
+    var n49: [u8; 38] = "12 and it has risen half a point (500)"
+    report((&n49[0]) as u64, 38, milli(0.0 - anim.trans_dy(&tr)) == 500,
+        milli(0.0 - anim.trans_dy(&tr)), 500)
+    // Am Ende steht der Zielwert, und ein zweiter Aufruf mit
+    // unveraendertem Widget startet NICHTS neu.
+    anim.trans_tick(&tr, 100)
+    var n50: [u8; 38] = "12 at 100 ms it has arrived (0x52525E)"
+    report((&n50[0]) as u64, 38,
+        (anim.trans_color(&tr) & 16777215 as u32) == 0x52525E as u32,
+        (anim.trans_color(&tr) & 16777215 as u32) as i64, 5395038)
+    var n51: [u8; 33] = "12 no state change starts nothing"
+    report((&n51[0]) as u64, 33, !anim.trans_from_widget(&tr, &cx, &kn, 100),
+        anim.trans_from_widget(&tr, &cx, &kn, 100) as i64, 0)
+
+    // Der Zwischenstand landet wirklich im Style des Widgets --
+    // daran haengt, dass render ihn ohne Sonderbehandlung malt.
+    anim.trans_tick(&tr, 50)
+    anim.trans_apply(&tr, &kn)
+    let sp: *mut style.Style = widget.w_style(&kn)
+    let gemalt: u32 = style.resolve_bg(widget.w_styleset(&kn),
+        widget.w_state(&kn), 0 as u32)
+    var n52: [u8; 45] = "12 trans_apply writes 0x4A4A56 into the style"
+    report((&n52[0]) as u64, 45,
+        style.color_value(gemalt) == 0x4A4A56 as u32,
+        style.color_value(gemalt) as i64, 4868694)
+    var n53: [u8; 22] = "12 and the radius as 9"
+    report((&n53[0]) as u64, 22,
+        style.resolve_num(widget.w_styleset(&kn), style.SF_RADIUS,
+            (*sp).radius as usize, 0) == 9,
+        style.resolve_num(widget.w_styleset(&kn), style.SF_RADIUS,
+            (*sp).radius as usize, 0) as i64, 9)
+
+    // Je Zustand eine eigene Dauer: gedrueckt schnell (60), zurueck
+    // langsam (240). Bei 30 ms nach dem Druecken ist die Haelfte
+    // geschafft -- mit der Vorgabedauer waere es ein Viertel.
+    anim.trans_set_state_duration(&tr, style.STATE_ACTIVE, 60)
+    widget.w_set_active(&kn, true)
+    anim.trans_from_widget(&tr, &cx, &kn, 1000)
+    anim.trans_tick(&tr, 1030)
+    var n54: [u8; 42] = "12 pressed uses its own 60 ms (half at 30)"
+    report((&n54[0]) as u64, 42, milli(anim.trans_progress(&tr)) == 500,
+        milli(anim.trans_progress(&tr)), 500)
+    var n55: [u8; 37] = "12 and the duration in force is 60 ms"
+    report((&n55[0]) as u64, 37, anim.trans_duration(&tr) == 60,
+        anim.trans_duration(&tr), 60)
+    // OKLab laesst sich von aussen schalten -- das fehlte.
+    anim.trans_set_oklab(&tr, true)
+    var n56: [u8; 36] = "12 the OKLab path can be switched on"
+    report((&n56[0]) as u64, 36, anim.trans_oklab(&tr),
+        anim.trans_oklab(&tr) as i64, 1)
+
+    // ============ 12b. DERSELBE UEBERGANG, ABER AUS DEM RENDER-PFAD
+    //
+    // Bis zur Runde FEHLERBEHEBUNG stand alles oben Gerechnete NEBEN
+    // der Bibliothek: nur wer `anim.Transition` selbst anfasste, bekam
+    // einen weichen Knopf, und das tat genau ein Programm. Jetzt fuehrt
+    // `render` das Register (`anim.transreg_bind`), und der Wechsel
+    // laeuft im normalen Zeichenweg.
+    //
+    // DESHALB WIRD HIER AUS DEM BILD GELESEN und nicht aus dem Tween:
+    // der Wert, den die Pruefung vergleicht, ist der Bildpunkt in der
+    // Mitte des Knopfes, den `render.draw_button` gemalt hat.
+    // Von Hand: dunkles Schema, Ruhe 0x42414D, ueberfahren 0x52525E,
+    // 100 ms linear, also bei halber Zeit
+    //   R (66+82)/2 = 74 = 0x4A, G (65+82)/2 = 73.5 -> 74 = 0x4A,
+    //   B (77+94)/2 = 85.5 -> 86 = 0x56.
+    var reg: anim.TransReg = anim.transreg_new()
+    anim.transreg_set_duration(&reg, 100)
+    anim.transreg_set_easing(&reg, anim.easing_linear())
+    var kr: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&kr, 8.0, 8.0, 48.0, 32.0)
+    anim.transreg_bind(&reg, &cx)
+    // Bild 1 bei 0 ms: der Knopf ruht, das Register legt seinen
+    // Eintrag auf den WAHREN Werten des Widgets an.
+    render.ctx_set_time(&cx, 0)
+    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
+    render.draw_button(&cx, &kr)
+    var n65: [u8; 46] = "12b the render path knows one transition      "
+    report((&n65[0]) as u64, 45, anim.transreg_count(&reg) == 1,
+        anim.transreg_count(&reg) as i64, 1)
+    var n66: [u8; 46] = "12b at rest it paints 0x42414D                "
+    report((&n66[0]) as u64, 45, mitte(&cv) == 4342093, mitte(&cv), 4342093)
+    // Der Zeiger kommt darauf. Bild 2 bei 50 ms setzt den Uebergang an
+    // -- gemalt wird noch die Ruhefarbe, denn der Tween beginnt JETZT.
+    widget.w_set_hover(&kr, true)
+    render.ctx_set_time(&cx, 50)
+    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
+    render.draw_button(&cx, &kr)
+    var n67: [u8; 46] = "12b the frame that starts it still rests      "
+    report((&n67[0]) as u64, 45, mitte(&cv) == 4342093, mitte(&cv), 4342093)
+    // Bild 3 bei 100 ms: die Haelfte der Strecke, 0x4A4A56.
+    render.ctx_set_time(&cx, 100)
+    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
+    render.draw_button(&cx, &kr)
+    var n68: [u8; 46] = "12b halfway the render path paints 0x4A4A56   "
+    report((&n68[0]) as u64, 45, mitte(&cv) == 4868694, mitte(&cv), 4868694)
+    // Und derselbe Wert kommt aus der Kaskade, die render selbst
+    // befragt -- das ist der Wert AUS dem Zeichenweg, ohne Leinwand.
+    let rbg: u32 = render.anim_bg_of(&cx, &kr)
+    var n69: [u8; 46] = "12b and render.anim_bg_of says the same       "
+    report((&n69[0]) as u64, 45, (rbg & 16777215 as u32) == 4868694 as u32,
+        (rbg & 16777215 as u32) as i64, 4868694)
+    // Bild 4 bei 150 ms: angekommen. Danach ist nichts mehr veraltet.
+    render.ctx_set_time(&cx, 150)
+    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
+    render.draw_button(&cx, &kr)
+    var n70: [u8; 46] = "12b at the end it paints 0x52525E             "
+    report((&n70[0]) as u64, 45, mitte(&cv) == 5395038, mitte(&cv), 5395038)
+    render.ctx_set_time(&cx, 400)
+    var n71: [u8; 46] = "12b a settled button asks for no repaint      "
+    report((&n71[0]) as u64, 45, !render.anim_run(&cx, &kr),
+        render.anim_run(&cx, &kr) as i64, 0)
+    // DIE GEGENPROBE: ohne Register springt derselbe Knopf sofort auf
+    // die Hover-Farbe. Genau das ist der Unterschied, den das Register
+    // macht -- und er wird gemessen, nicht behauptet.
+    render.ctx_unbind_anim(&cx)
+    var ks: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&ks, 8.0, 8.0, 48.0, 32.0)
+    widget.w_set_hover(&ks, true)
+    render.ctx_set_time(&cx, 50)
+    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
+    render.draw_button(&cx, &ks)
+    var n72: [u8; 46] = "12b without the register it jumps at once     "
+    report((&n72[0]) as u64, 45, mitte(&cv) == 5395038, mitte(&cv), 5395038)
+
+    // ====================== 13. DIE NEUN PHASEN DES BELEGBILDES
+    //
+    // Gerechnet wird mit der Formel aus gallery5_main.fi. Gefordert
+    // ist: je zwei Phasen mit verschiedenem Wert liegen mindestens
+    // MARKE_W + 6 = 20 Punkt auseinander, also eine Markenbreite PLUS
+    // sechs Punkt sichtbarer Grund. Bei der Feder war schon die
+    // schwaechere Forderung "eine Markenbreite" frueher verletzt --
+    // drei Marken lagen auf dem Anschlag 1.12 uebereinander.
+    let d_fe: i64 = min_abstand(anim.easing_spring(1.0, 30.0, 4.5))
+    var n57: [u8; 46] = "13 spring: 9 phases, min gap x100 >= 2000     "
+    report((&n57[0]) as u64, 45, d_fe >= LUECKE, d_fe, LUECKE)
+    let d_li: i64 = min_abstand(anim.easing_linear())
+    var n58: [u8; 46] = "13 linear: the gap is exactly 12850 (x100)    "
+    report((&n58[0]) as u64, 45, d_li == 12850, d_li, 12850)
+    let d_ei: i64 = min_abstand(anim.easing_named(anim.EASE_IN))
+    var n59: [u8; 46] = "13 ease-in: min gap x100 >= 2000              "
+    report((&n59[0]) as u64, 45, d_ei >= LUECKE, d_ei, LUECKE)
+    let d_eo: i64 = min_abstand(anim.easing_named(anim.EASE_OUT))
+    var n60: [u8; 46] = "13 ease-out: min gap x100 >= 2000             "
+    report((&n60[0]) as u64, 45, d_eo >= LUECKE, d_eo, LUECKE)
+    let d_io: i64 = min_abstand(anim.easing_named(anim.EASE_IN_OUT))
+    var n61: [u8; 46] = "13 ease-in-out: min gap x100 >= 2000          "
+    report((&n61[0]) as u64, 45, d_io >= LUECKE, d_io, LUECKE)
+    let d_st: i64 = min_abstand(anim.easing_steps(5))
+    var n62: [u8; 46] = "13 steps(5): min gap x100 >= 2000             "
+    report((&n62[0]) as u64, 45, d_st >= LUECKE, d_st, LUECKE)
+    // Und die Treppe haelt an genau drei Stellen still, jede andere
+    // Kurve an keiner -- sonst waere die Ausnahme oben ein Freibrief.
+    var n63: [u8; 46] = "13 steps(5) rests on three pairs              "
+    let g_st: i64 = gleiche_paare(anim.easing_steps(5))
+    report((&n63[0]) as u64, 45, g_st == 3, g_st, 3)
+    var n64: [u8; 46] = "13 the spring rests on none                   "
+    let g_fe: i64 = gleiche_paare(anim.easing_spring(1.0, 30.0, 4.5))
+    report((&n64[0]) as u64, 45, g_fe == 0, g_fe, 0)
+
+    // ============ 14. JEDE KURVE SAGT, WELCHE SIE IST
+    //
+    // `easing_named` baute seine drei Kurven ueber `easing_bezier`, und
+    // das setzte AUSNAHMSLOS EASE_IN_OUT: ease-in, ease-out und
+    // ease-in-out waren am Kennzeichen nicht mehr zu unterscheiden.
+    // Wer das Kennzeichen liest, um eine Reihe zu beschriften oder
+    // gleiche Kurven zusammenzufassen, bekam dreimal dieselbe Auskunft
+    // bei drei verschiedenen Bewegungen. Hier wird fuer alle sechs
+    // Kurven nachgerechnet, dass `kind` die Kurve benennt.
+    var k_li: anim.Easing = anim.easing_linear()
+    var n80: [u8; 46] = "14 linear      .kind == EASE_LINEAR (0)       "
+    report((&n80[0]) as u64, 45, k_li.kind == anim.EASE_LINEAR,
+        k_li.kind as i64, anim.EASE_LINEAR as i64)
+    var k_in: anim.Easing = anim.easing_named(anim.EASE_IN)
+    var n81: [u8; 46] = "14 ease-in     .kind == EASE_IN (1)           "
+    report((&n81[0]) as u64, 45, k_in.kind == anim.EASE_IN,
+        k_in.kind as i64, anim.EASE_IN as i64)
+    var k_ou: anim.Easing = anim.easing_named(anim.EASE_OUT)
+    var n82: [u8; 46] = "14 ease-out    .kind == EASE_OUT (2)          "
+    report((&n82[0]) as u64, 45, k_ou.kind == anim.EASE_OUT,
+        k_ou.kind as i64, anim.EASE_OUT as i64)
+    var k_io: anim.Easing = anim.easing_named(anim.EASE_IN_OUT)
+    var n83: [u8; 46] = "14 ease-in-out .kind == EASE_IN_OUT (3)       "
+    report((&n83[0]) as u64, 45, k_io.kind == anim.EASE_IN_OUT,
+        k_io.kind as i64, anim.EASE_IN_OUT as i64)
+    var k_st: anim.Easing = anim.easing_steps(4)
+    var n84: [u8; 46] = "14 steps(4)    .kind == EASE_STEPS (4)        "
+    report((&n84[0]) as u64, 45, k_st.kind == anim.EASE_STEPS,
+        k_st.kind as i64, anim.EASE_STEPS as i64)
+    var k_fe: anim.Easing = anim.easing_spring(1.0, 100.0, 10.0)
+    var n85: [u8; 46] = "14 spring      .kind == EASE_SPRING (5)       "
+    report((&n85[0]) as u64, 45, k_fe.kind == anim.EASE_SPRING,
+        k_fe.kind as i64, anim.EASE_SPRING as i64)
+    // Die namenlose Kurve behaelt EASE_IN_OUT: eine frei gewaehlte
+    // cubic-bezier ist im allgemeinen Fall weder rein beschleunigend
+    // noch rein bremsend.
+    var k_bz: anim.Easing = anim.easing_bezier(0.25, 0.75, 0.25, 0.25)
+    var n86: [u8; 46] = "14 cubic-bezier(..) keeps EASE_IN_OUT (3)     "
+    report((&n86[0]) as u64, 45, k_bz.kind == anim.EASE_IN_OUT,
+        k_bz.kind as i64, anim.EASE_IN_OUT as i64)
+    // UND DIE BEWEGUNG BLEIBT DIESELBE. Das neue Kennzeichen darf den
+    // Wert nicht veraendern: `ease_eval` faellt fuer EASE_IN wie fuer
+    // EASE_IN_OUT in den Bezier-Zweig. ease-in = cubic-bezier(0.42,0,
+    // 1,1) hat bei x = 0.5 den Wert 0.315357 (t = 0.374253 aus der
+    // Newton-Umkehr), abgerundet auf Tausendstel also 315.
+    var n87: [u8; 46] = "14 ease-in(0.5) x1000 unchanged at 315        "
+    let v_in: i64 = milli(anim.ease_eval(&k_in, 0.5))
+    report((&n87[0]) as u64, 45, v_in == 315, v_in, 315)
+    // ease-out ist ihre Spiegelung: ease-out(0.5) = 1 - ease-in(0.5)
+    // = 0.684643, also 685 Tausendstel. Die beiden Werte ergeben
+    // zusammen 1000 -- daran haengt die Symmetrie der beiden Kurven.
+    var n88: [u8; 46] = "14 ease-out(0.5) x1000 is the mirror 685      "
+    let v_ou: i64 = milli(anim.ease_eval(&k_ou, 0.5))
+    report((&n88[0]) as u64, 45, v_ou == 685, v_ou, 685)
+    var n89: [u8; 46] = "14 both together are exactly 1000             "
+    report((&n89[0]) as u64, 45, v_in + v_ou == 1000, v_in + v_ou, 1000)
+
+    painter.painter_free(&pz)
+    canvas.canvas_free(&cv)
+
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push(&t, 10 as u8)
+    if G_ERRORS > 0 {
+        var f: [u8; 22] = "ANIM IS NOT IN ORDER.\n"
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 22)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+        return 1
+    }
+    var o: [u8; 13] = "ANIM PASSED.\n"
+    rt.buf_push_bytes(&t, (&o[0]) as u64, 13)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 0
+}

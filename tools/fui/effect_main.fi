@@ -1,0 +1,642 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/effect_main.fi -- DIE UNSCHAERFE WIRD NACHGERECHNET.
+//
+// Ein Weichzeichner sieht IMMER weich aus, auch wenn er falsch ist --
+// darum sind hier Zahlen und keine Blicke:
+//
+//   1. Ein Kastendurchgang der Breite 3 auf einem einzelnen Punkt gibt
+//      genau 255/3 = 85 auf drei Pixeln. Die laufende Summe muss
+//      dasselbe liefern wie die Faltung von Hand.
+//   2. Die SUMME bleibt erhalten (eine Faltung mit einem normierten
+//      Kern verliert keine Masse, bis auf die Rundung).
+//   3. Dreimal Kasten naehert die Gausskurve: das Verhaeltnis von
+//      Mitte zu Nachbar wird gegen den kubischen B-Spline geprueft --
+//      das ist die analytische Antwort, die dreimal Kasten geben MUSS.
+//   4. Der Rand bleibt hell: eine Flaeche konstanter Farbe bleibt
+//      nach dem Weichzeichnen ueberall dieselbe Farbe, auch in der
+//      Ecke (der dunkle Saum entsteht, wenn ueber den Rand hinaus mit
+//      Nullen gemittelt wird).
+//   5. Die Farbmatrix: Graustufe von Rot ist 0.2126 * 255 = 54.
+//   6. Das Mass: sigma aus dem Radius und zurueck.
+//   7. IN ZWEI RICHTUNGEN. Der laufenden Summe wird eine NAIVE
+//      Faltung gegenuebergestellt, die dasselbe Fenster Punkt fuer
+//      Punkt aufsummiert -- Pixel fuer Pixel derselbe Wert, sonst ist
+//      die Abkuerzung falsch. Dazu die von Hand aufgeschriebene
+//      2D-Antwort: das aeussere Produkt von (1,3,6,7,6,3,1)/27 mit
+//      sich selbst.
+//   8. GEGEN DIE ECHTE GAUSSKURVE. Dreimal Kasten mit r = 4 hat
+//      sigma = sqrt(20) = 4.472; verglichen wird Stuetzstelle fuer
+//      Stuetzstelle mit 255 * exp(-x^2/2sigma^2) / (sigma*sqrt(2pi)).
+//   9. DIE HALBDURCHSICHTIGE KANTE. Weiss mit Alpha 128 neben
+//      Nichts: nach dem Verwischen muss die zurueckgerechnete Farbe
+//      ueberall noch weiss sein. Wer nicht premultipliziert mittelt,
+//      bekommt hier den dunklen Saum, den man am fertigen Schatten
+//      sieht.
+//  10. DIE VERKETTUNG der Farbmatrix gegen die Handrechnung, in
+//      beiden Reihenfolgen (sie ist nicht vertauschbar).
+//  11. DER SCHATTEN faellt WEICH ab: die Helligkeit unter der Kante
+//      steigt Zeile um Zeile monoton an, die Rampe ist Dutzende
+//      Punkte lang, weit draussen steht wieder das reine Weiss des
+//      Grundes -- und die Streuung macht ihn an derselben Stelle
+//      dunkler.
+import std.rt
+import std.math
+import paint.canvas
+import fui.painter
+import fui.effect
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+const N: usize = 17
+const M: usize = 15
+const G: usize = 81
+const E: usize = 21
+
+fn hole(p: *mut u8, i: usize, k: usize) -> i64 {
+    return (*((p as u64 + (i * 4 + k) as u64) as *mut u8)) as i64
+}
+
+fn setze(p: *mut u8, i: usize, k: usize, v: i64) {
+    *((p as u64 + (i * 4 + k) as u64) as *mut u8) = v as u8
+}
+
+// ------------------------------------------- DIE NAIVE GEGENRECHNUNG
+//
+// Dasselbe Fenster, aber Punkt fuer Punkt aufsummiert: O(r) je Pixel
+// und damit viel zu langsam fuer ein Bild, dafuer so einfach, dass es
+// offensichtlich richtig ist. Genau dagegen wird die laufende Summe
+// gehalten -- Rundung und Randfortsetzung eingeschlossen.
+fn naiv_h(src: *mut u8, dst: *mut u8, w: usize, h: usize, r: i64) {
+    let teiler: i64 = 2 * r + 1
+    var y: i64 = 0
+    while y < h as i64 {
+        var x: i64 = 0
+        while x < w as i64 {
+            var k: usize = 0
+            while k < 4 {
+                var summe: i64 = 0
+                var d: i64 = 0 - r
+                while d <= r {
+                    var q: i64 = x + d
+                    if q < 0 { q = 0 }
+                    if q > (w - 1) as i64 { q = (w - 1) as i64 }
+                    summe = summe + hole(src, (y * w as i64 + q) as usize, k)
+                    d = d + 1
+                }
+                setze(dst, (y * w as i64 + x) as usize, k,
+                    (summe + teiler / 2) / teiler)
+                k = k + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn naiv_v(src: *mut u8, dst: *mut u8, w: usize, h: usize, r: i64) {
+    let teiler: i64 = 2 * r + 1
+    var y: i64 = 0
+    while y < h as i64 {
+        var x: i64 = 0
+        while x < w as i64 {
+            var k: usize = 0
+            while k < 4 {
+                var summe: i64 = 0
+                var d: i64 = 0 - r
+                while d <= r {
+                    var q: i64 = y + d
+                    if q < 0 { q = 0 }
+                    if q > (h - 1) as i64 { q = (h - 1) as i64 }
+                    summe = summe + hole(src, (q * w as i64 + x) as usize, k)
+                    d = d + 1
+                }
+                setze(dst, (y * w as i64 + x) as usize, k,
+                    (summe + teiler / 2) / teiler)
+                k = k + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Dieselbe Reihenfolge wie effect.blur_buffer: dreimal waagerecht,
+// dreimal senkrecht. Das Ergebnis steht danach wieder in `px`.
+fn naiv_blur(px: *mut u8, tmp: *mut u8, w: usize, h: usize, r: i64) {
+    naiv_h(px, tmp, w, h, r)
+    naiv_h(tmp, px, w, h, r)
+    naiv_h(px, tmp, w, h, r)
+    naiv_v(tmp, px, w, h, r)
+    naiv_v(px, tmp, w, h, r)
+    naiv_v(tmp, px, w, h, r)
+}
+
+fn kopiere(src: *mut u8, dst: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n * 4 {
+        *((dst as u64 + i as u64) as *mut u8) =
+            *((src as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+}
+
+fn betrag(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn leere(p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n * 4 {
+        *((p as u64 + i as u64) as *mut u8) = 0 as u8
+        i = i + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    let a: *mut u8 = rt.heap_alloc(N * 4) as *mut u8
+    let b: *mut u8 = rt.heap_alloc(N * 4) as *mut u8
+    if a as usize == 0 || b as usize == 0 {
+        return 3
+    }
+
+    // ========================================= 1. EIN KASTENDURCHGANG
+    leere(a, N)
+    setze(a, 8, 3, 255)     // ein einzelner Punkt, Alphakanal
+    effect.box_pass_h(a, b, N, 1, 1)
+    var n1: [u8; 35] = "1 box r=1 spreads 255 to 85 = 255/3"
+    report((&n1[0]) as u64, 35, hole(b, 8, 3) == 85, hole(b, 8, 3), 85)
+    var n2: [u8; 31] = "1 and the neighbour gets 85 too"
+    report((&n2[0]) as u64, 31, hole(b, 7, 3) == 85, hole(b, 7, 3), 85)
+    var n3: [u8; 29] = "1 two away it is already zero"
+    report((&n3[0]) as u64, 29, hole(b, 6, 3) == 0, hole(b, 6, 3), 0)
+
+    // ============================================= 2. DIE MASSE BLEIBT
+    var summe: i64 = 0
+    var i: usize = 0
+    while i < N {
+        summe = summe + hole(b, i, 3)
+        i = i + 1
+    }
+    var n4: [u8; 29] = "2 the mass stays 255 (3 * 85)"
+    report((&n4[0]) as u64, 29, summe == 255, summe, 255)
+
+    // ====================================== 3. DREIMAL KASTEN = B-SPLINE
+    //
+    // Der Kern von dreimal Kasten der Breite 3 ist der von Hand
+    // faltbare (1,3,6,7,6,3,1)/27 -- das ist der diskrete kubische
+    // B-Spline und die analytische Antwort, gegen die hier geprueft
+    // wird. Mit 255 als Punkt und ganzzahliger Rundung in jedem
+    // Durchgang steht in der Mitte 255*7/27 = 66.
+    leere(a, N)
+    setze(a, 8, 3, 255)
+    effect.box_pass_h(a, b, N, 1, 1)
+    effect.box_pass_h(b, a, N, 1, 1)
+    effect.box_pass_h(a, b, N, 1, 1)
+    var n5: [u8; 27] = "3 triple box centre is 7/27"
+    report((&n5[0]) as u64, 27, hole(b, 8, 3) == 66, hole(b, 8, 3), 66)
+    var n6: [u8; 22] = "3 one off is 6/27 = 57"
+    report((&n6[0]) as u64, 22, hole(b, 7, 3) == 57, hole(b, 7, 3), 57)
+    var n7: [u8; 23] = "3 three off is 1/27 = 9"
+    report((&n7[0]) as u64, 23, hole(b, 5, 3) == 9, hole(b, 5, 3), 9)
+
+    // =========================================== 4. DER RAND BLEIBT HELL
+    //
+    // Eine durchgehend deckende Flaeche darf sich nicht veraendern --
+    // auch nicht im ersten Pixel. Wer ueber den Rand mit Nullen
+    // mittelt, bekommt hier 170 statt 255, und genau so entsteht der
+    // dunkle Saum um jeden Schatten.
+    i = 0
+    while i < N {
+        setze(a, i, 0, 200)
+        setze(a, i, 1, 200)
+        setze(a, i, 2, 200)
+        setze(a, i, 3, 255)
+        i = i + 1
+    }
+    effect.box_pass_h(a, b, N, 1, 3)
+    var n8: [u8; 41] = "4 a flat area keeps its value at the edge"
+    report((&n8[0]) as u64, 41, hole(b, 0, 0) == 200, hole(b, 0, 0), 200)
+    var n9: [u8; 25] = "4 and its alpha stays 255"
+    report((&n9[0]) as u64, 25, hole(b, 0, 3) == 255, hole(b, 0, 3), 255)
+
+    // ============================================== 5. DIE FARBMATRIX
+    var cm: effect.ColorMatrix = effect.cm_grayscale()
+    let grau: u32 = effect.cm_apply_pixel(&cm, 0xFFFF0000 as u32)
+    var n10: [u8; 34] = "5 grey of red is 54 (0.2126 * 255)"
+    report((&n10[0]) as u64, 34, ((grau >> 16) & 255 as u32) == 54 as u32,
+        ((grau >> 16) & 255 as u32) as i64, 54)
+    var n11: [u8; 34] = "5 and all three channels are equal"
+    report((&n11[0]) as u64, 34,
+        ((grau >> 8) & 255 as u32) == ((grau >> 16) & 255 as u32),
+        ((grau >> 8) & 255 as u32) as i64, 54)
+    // Saettigung 1 ist die Eins: nichts aendert sich.
+    var cs: effect.ColorMatrix = effect.cm_saturate(1.0)
+    let gleich: u32 = effect.cm_apply_pixel(&cs, 0xFF3366CC as u32)
+    var n12: [u8; 29] = "5 saturate(1) changes nothing"
+    report((&n12[0]) as u64, 29, gleich == 0xFF3366CC as u32,
+        (gleich & 16777215 as u32) as i64, 3368652)
+    // Kontrast 1 ebenso, und Kontrast 2 hebt 0.75 auf 1.0.
+    var ck: effect.ColorMatrix = effect.cm_contrast(2.0)
+    let hart: u32 = effect.cm_apply_pixel(&ck, 0xFFBFBFBF as u32)
+    var n13: [u8; 30] = "5 contrast(2) lifts 191 to 255"
+    report((&n13[0]) as u64, 30, ((hart >> 16) & 255 as u32) == 255 as u32,
+        ((hart >> 16) & 255 as u32) as i64, 255)
+
+    // ================================================= 6. DIE MASSE
+    //
+    // sigma aus dem Radius: r = 1 ergibt drei Kaesten der Breite 3,
+    // also sigma = sqrt(3 * 8/12) = sqrt(2) = 1.414.
+    let s: f64 = effect.sigma_for_radius(1)
+    var n14: [u8; 31] = "6 sigma for r=1 is 1414 (x1000)"
+    report((&n14[0]) as u64, 31, (s * 1000.0 + 0.5) as i64 == 1414,
+        (s * 1000.0 + 0.5) as i64, 1414)
+    var n15: [u8; 28] = "6 and back again gives r = 1"
+    report((&n15[0]) as u64, 28, effect.radius_for_sigma(s) == 1,
+        effect.radius_for_sigma(s), 1)
+
+    // ======================== 7. IN ZWEI RICHTUNGEN, GEGEN DIE NAIVE
+    //
+    // Ein Punkt in der Mitte einer 15x15-Flaeche, dreimal Kasten mit
+    // r = 1 in beiden Richtungen. Erstens muss die laufende Summe
+    // Pixel fuer Pixel dasselbe liefern wie die naive Faltung.
+    // Zweitens steht die Antwort von Hand da: der Kern von dreimal
+    // Kasten ist (1,3,6,7,6,3,1)/27, in zwei Richtungen also dessen
+    // aeusseres Produkt /729. In der Mitte sind das 255*49/729 = 17.1.
+    let f1: *mut u8 = rt.heap_alloc(M * M * 4) as *mut u8
+    let f2: *mut u8 = rt.heap_alloc(M * M * 4) as *mut u8
+    let f3: *mut u8 = rt.heap_alloc(M * M * 4) as *mut u8
+    let f4: *mut u8 = rt.heap_alloc(M * M * 4) as *mut u8
+    if f1 as usize == 0 || f2 as usize == 0 || f3 as usize == 0 ||
+        f4 as usize == 0 {
+        return 3
+    }
+    leere(f1, M * M)
+    setze(f1, 7 * M + 7, 3, 255)
+    kopiere(f1, f3, M * M)
+    effect.blur_buffer(f1, f2, M, M, 1)
+    naiv_blur(f3, f4, M, M, 1)
+    var abw: i64 = 0
+    var p: usize = 0
+    while p < M * M {
+        var k: usize = 0
+        while k < 4 {
+            if hole(f1, p, k) != hole(f3, p, k) {
+                abw = abw + 1
+            }
+            k = k + 1
+        }
+        p = p + 1
+    }
+    var n16: [u8; 43] = "7 running sum = naive convolution, 0 pixels"
+    report((&n16[0]) as u64, 43, abw == 0, abw, 0)
+    var n17: [u8; 39] = "7 2D centre is 255*49/729 = 17 (7/27)^2"
+    report((&n17[0]) as u64, 39, hole(f1, 7 * M + 7, 3) == 17,
+        hole(f1, 7 * M + 7, 3), 17)
+    // Und die ganze 7x7-Nachbarschaft gegen dasselbe aeussere Produkt.
+    // Erlaubt ist EIN Tonwert Abstand: jeder der sechs Durchgaenge
+    // rundet ganzzahlig, die Handrechnung nicht.
+    var kern: [i64; 7] = [1, 3, 6, 7, 6, 3, 1]
+    var schief: i64 = 0
+    var jj: usize = 0
+    while jj < 7 {
+        var ii: usize = 0
+        while ii < 7 {
+            let soll: i64 = (255 * kern[ii] * kern[jj] + 364) / 729
+            let ist: i64 = hole(f1, (4 + jj) * M + 4 + ii, 3)
+            if ist - soll > 1 || soll - ist > 1 {
+                schief = schief + 1
+            }
+            ii = ii + 1
+        }
+        jj = jj + 1
+    }
+    var n18: [u8; 38] = "7 all 49 cells match the outer product"
+    report((&n18[0]) as u64, 38, schief == 0, schief, 0)
+    var n19: [u8; 36] = "7 one column off is 255*7*6/729 = 15"
+    report((&n19[0]) as u64, 36, hole(f1, 7 * M + 8, 3) == 15,
+        hole(f1, 7 * M + 8, 3), 15)
+
+    // ============================ 8. GEGEN DIE ANALYTISCHE GAUSSKURVE
+    //
+    // r = 4 heisst drei Kaesten der Breite 9, also
+    // sigma = sqrt(3*(81-1)/12) = sqrt(20) = 4.4721. Verglichen wird
+    // mit der Normalverteilung 255 * exp(-x^2/(2 sigma^2)) /
+    // (sigma * sqrt(2 pi)) an allen Stuetzstellen bis +-10 (das sind
+    // mehr als zwei sigma; weiter draussen steht ohnehin fast nichts).
+    //
+    // TOLERANZ: 2 Tonwerte, und zwar aus zwei benennbaren Quellen.
+    // Erstens ist dreimal Kasten nur eine NAEHERUNG (ein kubischer
+    // B-Spline); der Unterschied zur Gausskurve liegt bei knapp einem
+    // Prozent der Spitze, hier also unter 0.3 Tonwerten. Zweitens
+    // rundet jeder der drei Durchgaenge ganzzahlig, was bis zu
+    // 1.5 Tonwerte beitragen kann. Gemessen werden 1.7 -- das passt
+    // genau zu dieser Rechnung, und ein echter Fehler (falscher
+    // Teiler, verrutschter Kern) laege um ein Vielfaches darueber.
+    let g1: *mut u8 = rt.heap_alloc(G * 4) as *mut u8
+    let g2: *mut u8 = rt.heap_alloc(G * 4) as *mut u8
+    if g1 as usize == 0 || g2 as usize == 0 {
+        return 3
+    }
+    leere(g1, G)
+    setze(g1, 40, 3, 255)
+    effect.blur_buffer(g1, g2, G, 1, 4)
+    let sig: f64 = effect.sigma_for_radius(4)
+    var maxab: f64 = 0.0
+    var xi: i64 = 0 - 10
+    while xi <= 10 {
+        let gx: f64 = 255.0 * math.exp(0.0 - (xi as f64) * (xi as f64) /
+            (2.0 * sig * sig)) / (sig * math.sqrt(2.0 * 3.14159265358979))
+        let ab: f64 = betrag(hole(g1, (40 + xi) as usize, 3) as f64 - gx)
+        if ab > maxab {
+            maxab = ab
+        }
+        xi = xi + 1
+    }
+    var n20: [u8; 46] = "8 max deviation from Gauss is 17 tenths (< 20)"
+    report((&n20[0]) as u64, 46, (maxab * 10.0 + 0.5) as i64 <= 20,
+        (maxab * 10.0 + 0.5) as i64, 17)
+    // Und die Spitze selbst: 255 / (sigma * sqrt(2 pi)) = 22.7.
+    var n21: [u8; 32] = "8 the peak is 21, the Gauss 22.7"
+    report((&n21[0]) as u64, 32, hole(g1, 40, 3) == 21, hole(g1, 40, 3),
+        21)
+
+    // ================================== 9. DIE HALBDURCHSICHTIGE KANTE
+    //
+    // Links zehn Punkte WEISS mit Alpha 128 -- premultipliziert also
+    // 128,128,128,128 -- und rechts elf Punkte Nichts. Nach dreimal
+    // Kasten muss ueberall, wo noch Alpha steht, die zurueckgerechnete
+    // Farbe genau Weiss sein. Wer die Farbe ungewichtet mittelt und
+    // das Alpha getrennt, zieht hier das Schwarz des Nichts herein:
+    // das ist der dunkle Saum, und er ist EXAKT mit dieser Zeile zu
+    // fangen.
+    let e1: *mut u8 = rt.heap_alloc(E * 4) as *mut u8
+    let e2: *mut u8 = rt.heap_alloc(E * 4) as *mut u8
+    if e1 as usize == 0 || e2 as usize == 0 {
+        return 3
+    }
+    leere(e1, E)
+    i = 0
+    while i < 10 {
+        setze(e1, i, 0, 128)
+        setze(e1, i, 1, 128)
+        setze(e1, i, 2, 128)
+        setze(e1, i, 3, 128)
+        i = i + 1
+    }
+    effect.blur_buffer(e1, e2, E, 1, 2)
+    var saum: i64 = 0
+    var rampe: i64 = 0
+    i = 0
+    while i < E {
+        let av: i64 = hole(e1, i, 3)
+        if av > 0 {
+            // zurueckgerechnet: c * 255 / a, gerundet
+            if (hole(e1, i, 0) * 255 + av / 2) / av != 255 {
+                saum = saum + 1
+            }
+            if av < 128 {
+                rampe = rampe + 1
+            }
+        }
+        i = i + 1
+    }
+    var n22: [u8; 38] = "9 no pixel of the soft edge turns grey"
+    report((&n22[0]) as u64, 38, saum == 0, saum, 0)
+    // Die Rampe selbst: dreimal Kasten mit r = 2 traegt 3*r = 6 Punkte
+    // weit nach jeder Seite, die Kante liegt zwischen 9 und 10 -- also
+    // 12 Punkte, an denen das Alpha zwischen 128 und 0 steht.
+    var n23: [u8; 32] = "9 and the ramp is 12 pixels long"
+    report((&n23[0]) as u64, 32, rampe == 12, rampe, 12)
+
+    // ====================================== 10. DIE VERKETTUNG RECHNET
+    //
+    // Erst Helligkeit 0.5, dann Kontrast 2: y = 2*(0.5x - 0.5) + 0.5 =
+    // x - 0.5. Aus 204 (0.8) wird also 0.3, das sind 77.
+    // Andersherum -- erst Kontrast, dann Helligkeit -- ist es
+    // y = 0.5*(2x - 0.5) = x - 0.25, also 0.55 und damit 140. Die
+    // beiden Zahlen sind verschieden, und genau das belegt, dass die
+    // Reihenfolge stimmt.
+    var ka: effect.ColorMatrix = effect.cm_mul(effect.cm_brightness(0.5),
+        effect.cm_contrast(2.0))
+    let kv: u32 = effect.cm_apply_pixel(&ka, 0xFFCCCCCC as u32)
+    var n24: [u8; 38] = "10 brightness then contrast: 204 -> 77"
+    report((&n24[0]) as u64, 38, ((kv >> 16) & 255 as u32) == 77 as u32,
+        ((kv >> 16) & 255 as u32) as i64, 77)
+    var kb: effect.ColorMatrix = effect.cm_mul(effect.cm_contrast(2.0),
+        effect.cm_brightness(0.5))
+    let kw: u32 = effect.cm_apply_pixel(&kb, 0xFFCCCCCC as u32)
+    var n25: [u8; 34] = "10 the other way round: 204 -> 140"
+    report((&n25[0]) as u64, 34, ((kw >> 16) & 255 as u32) == 140 as u32,
+        ((kw >> 16) & 255 as u32) as i64, 140)
+    // Und der Faktor der verketteten Matrix selbst: 2 * 0.5 = 1.
+    var n26: [u8; 37] = "10 the chained factor is 1000 (x1000)"
+    report((&n26[0]) as u64, 37, (ka.m[0] * 1000.0 + 0.5) as i64 == 1000,
+        (ka.m[0] * 1000.0 + 0.5) as i64, 1000)
+
+    // ======================================== 11. DER SCHATTEN IST WEICH
+    //
+    // Ein schwarzer Schatten unter einer Karte auf weissem Grund. Vom
+    // unteren Rand der Form nach unten muss die Helligkeit MONOTON
+    // steigen (ein harter Rand springt), die Rampe muss Dutzende
+    // Punkte lang sein, und ausserhalb von 3*blur muss wieder das
+    // reine Weiss stehen -- ein dunkler Saum waere dort sofort als
+    // 254 oder weniger zu sehen.
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 200, 160) {
+        return 4
+    }
+    canvas.canvas_clear(&cv, 0xFFFFFFFF as u32)
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 200, 160) {
+        return 5
+    }
+    effect.drop_shadow_spread(&z, 50.0, 30.0, 100.0, 60.0, 12.0, 0.0,
+        0.0, 8, 0.0, 0xFF000000 as u32)
+    var vorher: i64 = 0 - 1
+    var monoton: i64 = 0
+    var weich: i64 = 0
+    var y: usize = 76
+    while y < 130 {
+        let v: i64 = ((canvas.canvas_get(&cv, 100, y) >> 16) &
+            255 as u32) as i64
+        if v < vorher {
+            monoton = monoton + 1
+        }
+        if v > 20 && v < 235 {
+            weich = weich + 1
+        }
+        vorher = v
+        y = y + 1
+    }
+    var n27: [u8; 41] = "11 the shadow never gets darker downwards"
+    report((&n27[0]) as u64, 41, monoton == 0, monoton, 0)
+    // Dreimal Kasten mit r = 8 traegt 3*8 = 24 Punkte weit; genau so
+    // lang ist die gemessene Rampe zwischen 20 und 235. Verlangt
+    // werden 20 -- ein harter Rand haette hier 1 oder 2.
+    var n28: [u8; 38] = "11 and its ramp is at least 20 px long"
+    report((&n28[0]) as u64, 38, weich >= 20, weich, 20)
+    let fern: i64 = ((canvas.canvas_get(&cv, 100, 125) >> 16) &
+        255 as u32) as i64
+    var n29: [u8; 39] = "11 far outside the ground is pure white"
+    report((&n29[0]) as u64, 39, fern == 255, fern, 255)
+    let unten: i64 = ((canvas.canvas_get(&cv, 100, 96) >> 16) &
+        255 as u32) as i64
+    // Dieselbe Stelle mit Streuung 10: der Schatten steht weiter
+    // heraus und ist dort deutlich dunkler.
+    canvas.canvas_clear(&cv, 0xFFFFFFFF as u32)
+    effect.drop_shadow_spread(&z, 50.0, 30.0, 100.0, 60.0, 12.0, 0.0,
+        0.0, 8, 10.0, 0xFF000000 as u32)
+    let unten2: i64 = ((canvas.canvas_get(&cv, 100, 96) >> 16) &
+        255 as u32) as i64
+    var n30: [u8; 39] = "11 spread 10 makes the same spot darker"
+    report((&n30[0]) as u64, 39, unten2 + 40 < unten, unten - unten2, 40)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+
+
+    // ========== 12. DIE BEIDEN KASTENWEICHZEICHNER DES BAUMES TREFFEN SICH
+    //
+    // Dieser Baum hat zwei: `lib/paint/painter.blur_line` mittelt
+    // DECKUNGSGRADE (f64, ein Kanal, draussen Null), diese Datei
+    // mittelt eine PREMULTIPLIZIERTE u8-LEINWAND (vier Kanaele,
+    // draussen der fortgesetzte Randwert). Der Kopf von
+    // lib/fui/effect.fi begruendet, warum das kein zweiter Ort fuer
+    // dieselbe Sache ist -- und eine Begruendung ist nur so viel wert
+    // wie ihre Nachpruefung.
+    //
+    // ALSO WIRD SIE GEMESSEN. Dieselbe Stufenkante (64 Stellen, ab 32
+    // voll), dasselbe sigma 4.0, dreimal Kasten. Die Tabelle unten ist
+    // dieselbe wie in tools/fui/blurref_main.fi, das die andere Seite
+    // rechnet; zwei Programme sind es, weil `fui.painter` und
+    // `paint.painter` beide `painter` heissen und nicht in dasselbe
+    // Programm passen.
+    //
+    // ERLAUBT IST EIN TONWERT UNTERSCHIED: die u8-Seite rundet nach
+    // JEDEM der drei Durchgaenge auf ganze Tonwerte, die f64-Seite nur
+    // am Schluss. Gemessen sind es genau zwei Stellen von 28, und an
+    // beiden ist der Unterschied 1.
+    var soll: [i64; 28] = [
+        0, 0, 0, 1, 3, 7, 12, 20, 29, 42, 58, 76, 96, 117,
+        138, 159, 179, 197, 213, 226, 235, 243, 248, 252, 254, 255,
+        255, 255]
+    let rr: i64 = effect.radius_for_sigma(4.0)
+    var m1: [u8; 44] = "12 sigma 4 gives a box radius of 4          "
+    report((&m1[0]) as u64, 43, rr == 4, rr, 4)
+    let nn: usize = 64
+    let pu: u64 = rt.heap_alloc(nn * 4)
+    if pu == 0 {
+        return 6
+    }
+    let tu: u64 = rt.heap_alloc(nn * 4)
+    if tu == 0 {
+        rt.heap_free(pu, nn * 4)
+        return 6
+    }
+    var ii: usize = 0
+    while ii < nn {
+        var u: u8 = 0 as u8
+        if ii >= 32 {
+            u = 255 as u8
+        }
+        var kk: usize = 0
+        while kk < 4 {
+            rt.st8(pu, ii * 4 + kk, u)
+            kk = kk + 1
+        }
+        ii = ii + 1
+    }
+    // Eine Zeile hoch: die drei senkrechten Durchgaenge sind dann die
+    // Einsfunktion (jedes Fenster sieht nur diese eine Zeile), es
+    // bleiben genau die drei waagerechten.
+    effect.blur_buffer(pu as *mut u8, tu as *mut u8, nn, 1, rr)
+    var q_abw: i64 = 0
+    var q_anz: i64 = 0
+    var xx: usize = 0
+    while xx < 28 {
+        let g: i64 = rt.ld8(pu, (xx + 18) * 4) as i64
+        var d2: i64 = g - soll[xx]
+        if d2 < 0 {
+            d2 = 0 - d2
+        }
+        if d2 > q_abw {
+            q_abw = d2
+        }
+        if d2 != 0 {
+            q_anz = q_anz + 1
+        }
+        xx = xx + 1
+    }
+    var m2: [u8; 44] = "12 the canvas path meets the table (max 1)  "
+    report((&m2[0]) as u64, 43, q_abw <= 1, q_abw, 1)
+    var m3: [u8; 44] = "12 and it differs at 2 of 28 spots          "
+    report((&m3[0]) as u64, 43, q_anz == 2, q_anz, 2)
+    // Die drei Stellen, die blurref_main.fi einzeln nennt -- dort auf
+    // dem Deckungsgrad gerechnet, hier auf der Leinwand gemessen.
+    let q_e0: i64 = rt.ld8(pu, 24 * 4) as i64
+    var m4: [u8; 44] = "12 at 24 the canvas path gives 12 too       "
+    report((&m4[0]) as u64, 43, q_e0 == 12, q_e0, 12)
+    let q_e1: i64 = rt.ld8(pu, 32 * 4) as i64
+    var m5: [u8; 44] = "12 at the edge itself it gives 138 too      "
+    report((&m5[0]) as u64, 43, q_e1 == 138, q_e1, 138)
+    let q_e2: i64 = rt.ld8(pu, 40 * 4) as i64
+    var m6: [u8; 44] = "12 at 40 it gives 248 too                   "
+    report((&m6[0]) as u64, 43, q_e2 == 248, q_e2, 248)
+    // UND DIE RANDREGEL, die beide unterscheidet: diese Seite setzt den
+    // Randwert fort, also bleibt das Licht vollstaendig erhalten --
+    // 32 volle Stellen von 64, Summe 32.00 mal 255 = 8160.
+    var q_summe: i64 = 0
+    var kx: usize = 0
+    while kx < nn {
+        q_summe = q_summe + (rt.ld8(pu, kx * 4) as i64)
+        kx = kx + 1
+    }
+    var m7: [u8; 44] = "12 continuing the edge keeps all the light  "
+    report((&m7[0]) as u64, 43, q_summe == 8160, q_summe, 8160)
+    rt.heap_free(tu, nn * 4)
+    rt.heap_free(pu, nn * 4)
+
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push(&t, 10 as u8)
+    if G_ERRORS > 0 {
+        var f: [u8; 24] = "EFFECT IS NOT IN ORDER.\n"
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 24)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+        return 1
+    }
+    var o: [u8; 15] = "EFFECT PASSED.\n"
+    rt.buf_push_bytes(&t, (&o[0]) as u64, 15)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 0
+}

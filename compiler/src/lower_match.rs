@@ -128,6 +128,9 @@ struct ArmPlan {
 fn plan_arm(pat: &Pattern, subject_enum: Option<&EnumDef>) -> ArmPlan {
     match pat {
         Pattern::Wild(_) | Pattern::Bind(..) => ArmPlan { keys: None, needs_test: false },
+        // Resolved to `Int`/`Bool` by the type check (sema_match.rs,
+        // `resolve_const_patterns`); never reaches the lowering.
+        Pattern::Const(..) => ArmPlan { keys: None, needs_test: true },
         Pattern::Int(v, _) => ArmPlan { keys: Some(vec![*v]), needs_test: false },
         Pattern::Bool(b, _) => {
             ArmPlan { keys: Some(vec![if *b { 1 } else { 0 }]), needs_test: false }
@@ -153,6 +156,30 @@ fn plan_arm(pat: &Pattern, subject_enum: Option<&EnumDef>) -> ArmPlan {
                 keys: Some(vec![tag]),
                 needs_test: subs.iter().any(|s| !s.is_irrefutable()),
             }
+        }
+        // Round GAPS: the union of the alternatives' keys. Only when every
+        // alternative is decided by its key alone can the arm skip the
+        // residual test -- then `1 | 2 | 7` sits in the jump table like
+        // three separate arms that share one body.
+        Pattern::Or(alts, _) => {
+            if alts.iter().any(|a| a.is_irrefutable()) {
+                return ArmPlan { keys: None, needs_test: false };
+            }
+            let plans: Vec<ArmPlan> = alts.iter().map(|a| plan_arm(a, subject_enum)).collect();
+            if plans.iter().any(|p| p.keys.is_none()) {
+                return ArmPlan { keys: None, needs_test: true };
+            }
+            let mut keys: Vec<i128> = Vec::new();
+            for p in &plans {
+                if let Some(ks) = &p.keys {
+                    for k in ks {
+                        if !keys.contains(k) {
+                            keys.push(*k);
+                        }
+                    }
+                }
+            }
+            ArmPlan { keys: Some(keys), needs_test: plans.iter().any(|p| p.needs_test) }
         }
     }
 }
@@ -313,6 +340,23 @@ fn emit_tests(
 ) -> Option<()> {
     match pat {
         Pattern::Wild(_) | Pattern::Bind(..) | Pattern::Int(..) | Pattern::Bool(..) => Some(()),
+        Pattern::Const(_, sp) => lo.ice(*sp, "unresolved constant pattern"),
+        // Round GAPS: the key dispatch only knows that ONE of the
+        // alternatives may match -- test each one in full (key and
+        // residual), the first that holds wins.
+        Pattern::Or(alts, _) => {
+            let ok = lo.new_block();
+            for a in alts {
+                let next = lo.new_block();
+                emit_key_test(lo, a, def, key, key_fty, next)?;
+                emit_tests(lo, base_addr, a, ty, def, key, key_fty, next)?;
+                lo.set_term(Term::Br(ok));
+                lo.cur = next;
+            }
+            lo.set_term(Term::Br(fail));
+            lo.cur = ok;
+            Some(())
+        }
         Pattern::Range { lo: rlo, hi, inclusive, .. } => {
             let last = if *inclusive { *hi } else { *hi - 1 };
             let c1 = {
@@ -362,6 +406,42 @@ fn emit_tests(
     }
 }
 
+/// Round GAPS: does the KEY of the subject fit this alternative? (For a
+/// plain arm the switch on the key answers that; inside `A | B` it must be
+/// asked per alternative.) Ranges check themselves in `emit_tests`.
+fn emit_key_test(
+    lo: &mut Lower,
+    pat: &Pattern,
+    def: Option<&EnumDef>,
+    key: Val,
+    key_fty: FTy,
+    fail: BlockId,
+) -> Option<()> {
+    let want: i128 = match pat {
+        Pattern::Int(v, _) => *v,
+        Pattern::Bool(b, _) => {
+            if *b {
+                1
+            } else {
+                0
+            }
+        }
+        Pattern::Variant { vname, span, .. } => {
+            match def.and_then(|d| d.variant(vname)).map(|v| v.tag) {
+                Some(t) => t,
+                None => return lo.ice(*span, "unknown variant in an alternative"),
+            }
+        }
+        _ => return Some(()),
+    };
+    let k = lo.constant(key_fty, want);
+    let c = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: key_fty, a: key, b: k });
+    let next = lo.new_block();
+    lo.set_term(Term::BrCond { cond: c, then_bb: next, else_bb: fail });
+    lo.cur = next;
+    Some(())
+}
+
 fn emit_sub_test(
     lo: &mut Lower,
     addr: Val,
@@ -371,6 +451,9 @@ fn emit_sub_test(
 ) -> Option<()> {
     match pat {
         Pattern::Wild(_) | Pattern::Bind(..) => Some(()),
+        Pattern::Const(_, sp) => lo.ice(*sp, "unresolved constant pattern"),
+        // The parser builds `A | B` only at the top of an arm.
+        Pattern::Or(_, sp) => lo.ice(*sp, "nested alternatives"),
         Pattern::Int(v, span) => {
             let ft = match scalar_fty(ty) {
                 Some(f) => f,
@@ -456,7 +539,12 @@ fn emit_sub_test(
 /// (enum values live in memory, bindings are immutable).
 fn bind_pattern(lo: &mut Lower, addr: Val, pat: &Pattern, ty: &Type, def: Option<&EnumDef>) {
     match pat {
-        Pattern::Wild(_) | Pattern::Int(..) | Pattern::Bool(..) | Pattern::Range { .. } => {}
+        Pattern::Wild(_)
+        | Pattern::Const(..)
+        | Pattern::Int(..)
+        | Pattern::Bool(..)
+        | Pattern::Range { .. }
+        | Pattern::Or(..) => {}
         Pattern::Bind(name, _) => lo.declare(name, addr),
         Pattern::Variant { vname, subs, .. } => {
             let d = match (def, ty) {

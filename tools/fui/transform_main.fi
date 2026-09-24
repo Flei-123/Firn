@@ -1,0 +1,779 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/transform_main.fi -- DIE ABBILDUNG WIRD NACHGERECHNET.
+//
+// Gegen bekannte Punktbilder, nicht gegen den Augenschein:
+//
+//   1. Drehung um 90 Grad um einen Punkt bildet bekannte Ecken auf
+//      bekannte Ecken ab -- und zwar EXAKT (die Argumentreduktion in
+//      Grad aus lib/svg/matrix.fi macht cos(90) zu einer echten Null;
+//      ohne sie stuende hier 1e-15 und die Kante schief).
+//   2. Der Stapel gibt nach push/pop genau den alten Stand zurueck.
+//   3. Verkettung: erst drehen, dann verschieben verschiebt IM
+//      gedrehten System.
+//   4. Die Kehrabbildung trifft den Ausgangspunkt wieder.
+//   5. DIE TREFFERPRUEFUNG unter Drehung: ein Punkt, der ohne
+//      Ruecktransformation im Rechteck laege, liegt mit ihr DRAUSSEN --
+//      und umgekehrt. Das ist der Fehler, der sich als "man klickt
+//      daneben" zeigt.
+//   6. SCHERUNG gegen die Handrechnung: `skewX(30)` ist der Tangens
+//      von 30 Grad, 0.5773502692, mal y -- und um einen freien
+//      Ursprung dasselbe, nur versetzt.
+//   7. Der Stapel laeuft NICHT UEBER: nach XF_MAX Ebenen sagt
+//      `xf_push` nein, statt ueber das Feld hinauszuschreiben.
+//   8. Eine ENTARTETE Matrix (scale(0)) hat kein Bild mit Flaeche:
+//      dort trifft nichts, und die Kehre gibt den Punkt selbst zurueck.
+//   9. DIE BILINEARE ABTASTUNG an bekannten Stellen -- mit Alpha
+//      gewichtet, sonst bekommt die Kante eines durchsichtigen Bildes
+//      einen grauen Saum (die Pruefung misst genau das).
+//  10. `tf_draw_image` auf einer echten Leinwand: ein um 90 Grad
+//      gedrehtes 2x2-Bild landet mit den bekannten Farben auf den
+//      bekannten Zielpixeln.
+//  11. `tf_hit_test` gegen ein PANEL aus drei Widgets unter Drehung,
+//      samt Ecken und Raendern.
+//  12. DER NORMALE ABLAUF an einem um 24 Grad gedrehten Knopf: gemalt
+//      mit `wave2.draw_any_xf` (also ueber `render.draw_widget_xf`),
+//      bedient mit `control.mouse_down`/`mouse_up` ohne dass der
+//      Aufrufer eine Matrix anfasst. Geprueft wird an EINEM Punkt, der
+//      im gedrehten Knopf liegt und im geraden Rechteck NICHT: dort
+//      muss Farbe sein UND der Klick muss ankommen. Ohne die
+//      eingehaengte Ruecktransformation geht genau dieser Klick
+//      daneben -- die Pruefung zeigt beides.
+import std.rt
+import paint.canvas
+import font.metrics
+import svg.matrix
+import fui.widget
+import fui.control
+import fui.painter
+import fui.uiimage
+import fui.theme
+import fui.render
+import fui.wave2
+import fui.transform
+
+// Die Leinwand fuer Abschnitt 17. Gross genug, dass 100 Punkt Schrift
+// samt Scherung hineinpasst, ohne am Rand abgeschnitten zu werden --
+// ein abgeschnittener Balken haette eine falsche Hoehe und damit ein
+// falsches Soll.
+const TW: usize = 640
+const TH: usize = 260
+const FONTSET_BYTES: usize = 262144
+
+static mut G_ERRORS: usize = 0
+
+// EIN BILDPUNKT ALS RGB, ohne den Alphakanal -- genau wie
+// tools/fui/text_main.fi ihn liest. Wer hier den Alphawert stehen
+// laesst, vergleicht ihn gegen einen Hintergrund ohne und findet
+// ueberall Farbe.
+fn pxl(cv: *mut canvas.Canvas, x: usize, y: usize) -> u32 {
+    let p: u64 = canvas.canvas_pixels(cv) as u64
+    let o: u64 = ((y * canvas.canvas_width(cv) + x) * 4) as u64
+    let r8: u8 = *((p + o) as *mut u8)
+    let g8: u8 = *((p + o + 1 as u64) as *mut u8)
+    let b8: u8 = *((p + o + 2 as u64) as *mut u8)
+    return ((r8 as u32) << 16) | ((g8 as u32) << 8) | (b8 as u32)
+}
+
+// DER BALKEN EINES BUCHSTABENS, VERMESSEN. Gesucht sind die linke
+// Kante der obersten und die der untersten Zeile, in der ueberhaupt
+// Farbe steht, samt beider Zeilennummern. Bei einem "I" ist die
+// Differenz der beiden Kanten der Scherungsversatz und sonst nichts;
+// bei einem senkrechten Balken ist sie null.
+fn balken(cv: *mut canvas.Canvas, bg: u32, oben: *mut i64, unten: *mut i64,
+    yoben: *mut i64, yunten: *mut i64) {
+    let br: usize = canvas.canvas_width(cv)
+    let ho: usize = canvas.canvas_height(cv)
+    var yt: i64 = 0 - 1
+    var yb: i64 = 0 - 1
+    var xt: i64 = 0
+    var xb: i64 = 0
+    var y: usize = 0
+    while y < ho {
+        var erst: i64 = 0 - 1
+        var x: usize = 0
+        while x < br {
+            if pxl(cv, x, y) != bg {
+                erst = x as i64
+                break
+            }
+            x = x + 1
+        }
+        if erst >= 0 {
+            if yt < 0 {
+                yt = y as i64
+                xt = erst
+            }
+            yb = y as i64
+            xb = erst
+        }
+        y = y + 1
+    }
+    *oben = xt
+    *unten = xb
+    *yoben = yt
+    *yunten = yb
+}
+
+fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Auf Tausendstel gerundet, SYMMETRISCH um die Null: `as i64`
+// schneidet zur Null hin ab, und ohne den eigenen Zweig waere -10.0
+// hier -9999 statt -10000 -- eine Pruefung, die an ihrer eigenen
+// Rundung scheitert, hilft niemandem.
+fn milli(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - (((0.0 - x) * 1000.0 + 0.5) as i64)
+    }
+    return (x * 1000.0 + 0.5) as i64
+}
+
+// EIN BILDPUNKT IN DIE OKTETTE, in der Reihenfolge R, G, B, A. Genau
+// so liest `uiimage.image_pixel_at`, und genau so liegt eine Leinwand
+// im Speicher. Wer hier ein 0xAARRGGBB als Zahl hinschreibt, vertauscht
+// auf dieser Maschine Rot und Blau -- der Fehler, den Abschnitt 10b des
+// Laufs schon einmal gefangen hat.
+fn punkt(p: u64, i: usize, r: u32, g: u32, b: u32, a: u32) {
+    rt.st8(p, i * 4, r as u8)
+    rt.st8(p, i * 4 + 1, g as u8)
+    rt.st8(p, i * 4 + 2, b as u8)
+    rt.st8(p, i * 4 + 3, a as u8)
+}
+
+fn main(start: u64) -> i32 {
+    // ================================================ 1. DREHUNG UM 90
+    //
+    // Um (10,10) gedreht geht (20,10) auf (10,20) und (10,0) auf
+    // (20,10). Von Hand: eine Vierteldrehung im Uhrzeigersinn, weil y
+    // auf dem Bildschirm nach unten zeigt.
+    var x: transform.Xform = transform.xf_new()
+    transform.xf_rotate_at(&x, 90.0, 10.0, 10.0)
+    var n1: [u8; 25] = "1 (20,10) turns to x = 10"
+    report((&n1[0]) as u64, 25,
+        milli(transform.xf_point_x(&x, 20.0, 10.0)) == 10000,
+        milli(transform.xf_point_x(&x, 20.0, 10.0)), 10000)
+    var n2: [u8; 23] = "1 and to y = 20 exactly"
+    report((&n2[0]) as u64, 23,
+        milli(transform.xf_point_y(&x, 20.0, 10.0)) == 20000,
+        milli(transform.xf_point_y(&x, 20.0, 10.0)), 20000)
+
+    // ================================================== 2. DER STAPEL
+    transform.xf_reset(&x)
+    transform.xf_translate(&x, 5.0, 7.0)
+    transform.xf_push(&x)
+    transform.xf_scale(&x, 2.0, 2.0, 0.0, 0.0)
+    var n3: [u8; 25] = "2 inside the push: x = 25"
+    report((&n3[0]) as u64, 25,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)) == 25000,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)), 25000)
+    transform.xf_pop(&x)
+    var n4: [u8; 23] = "2 after the pop: x = 15"
+    report((&n4[0]) as u64, 23,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)) == 15000,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)), 15000)
+
+    // ================================================= 3. VERKETTUNG
+    //
+    // Erst 90 Grad drehen, dann um (10,0) verschieben: die
+    // Verschiebung laeuft im gedrehten System, also nach UNTEN.
+    transform.xf_reset(&x)
+    transform.xf_rotate(&x, 90.0)
+    transform.xf_translate(&x, 10.0, 0.0)
+    var n5: [u8; 32] = "3 chained: the origin lands at y"
+    report((&n5[0]) as u64, 32,
+        milli(transform.xf_point_y(&x, 0.0, 0.0)) == 10000,
+        milli(transform.xf_point_y(&x, 0.0, 0.0)), 10000)
+    var n6: [u8; 14] = "3 and at x = 0"
+    report((&n6[0]) as u64, 14,
+        milli(transform.xf_point_x(&x, 0.0, 0.0)) == 0,
+        milli(transform.xf_point_x(&x, 0.0, 0.0)), 0)
+
+    // ================================================= 4. DIE KEHRE
+    transform.xf_reset(&x)
+    transform.xf_rotate_at(&x, 30.0, 40.0, 40.0)
+    transform.xf_scale(&x, 1.5, 1.5, 40.0, 40.0)
+    let px: f64 = transform.xf_point_x(&x, 12.0, 34.0)
+    let py: f64 = transform.xf_point_y(&x, 12.0, 34.0)
+    var n7: [u8; 31] = "4 forward and back gives x = 12"
+    report((&n7[0]) as u64, 31, milli(transform.xf_inv_x(&x, px, py)) == 12000,
+        milli(transform.xf_inv_x(&x, px, py)), 12000)
+    var n8: [u8; 12] = "4 and y = 34"
+    report((&n8[0]) as u64, 12, milli(transform.xf_inv_y(&x, px, py)) == 34000,
+        milli(transform.xf_inv_y(&x, px, py)), 34000)
+
+    // ============================================== 5. DIE TREFFER
+    //
+    // Ein Rechteck von (0,0) bis (100,20), um 90 Grad um (0,0)
+    // gedreht, liegt auf dem Schirm von (-20,0) bis (0,100). Der Punkt
+    // (50,10) liegt IM ungedrehten Rechteck und darf jetzt NICHT mehr
+    // treffen; der Punkt (-10,50) liegt im gedrehten und muss treffen.
+    transform.xf_reset(&x)
+    transform.xf_rotate(&x, 90.0)
+    let daneben: bool = transform.tf_hit_rect(&x, 0.0, 0.0, 100.0, 20.0,
+        50.0, 10.0)
+    var n9: [u8; 32] = "5 the untransformed point misses"
+    report((&n9[0]) as u64, 32, !daneben, daneben as i64, 0)
+    let treffer: bool = transform.tf_hit_rect(&x, 0.0, 0.0, 100.0, 20.0,
+        0.0 - 10.0, 50.0)
+    var n10: [u8; 21] = "5 the turned one hits"
+    report((&n10[0]) as u64, 21, treffer, treffer as i64, 1)
+
+    // Und das Laengenmass einer Skalierung um 2 ist 2.
+    transform.xf_reset(&x)
+    transform.xf_scale(&x, 2.0, 2.0, 0.0, 0.0)
+    var n11: [u8; 27] = "6 the scale hint of 2x is 2"
+    report((&n11[0]) as u64, 27, milli(transform.xf_scale_hint(&x)) == 2000,
+        milli(transform.xf_scale_hint(&x)), 2000)
+
+    // ============================================== 7. DIE SCHERUNG
+    //
+    // `skewX(30)` heisst x' = x + tan(30)*y, und tan(30) ist
+    // 0.5773502692. Fuer (10,10) also x = 10 + 5.7735027 = 15.7735027,
+    // auf Tausendstel gerundet 15774. y bleibt, was es war.
+    transform.xf_reset(&x)
+    transform.xf_skew(&x, 30.0, 0.0, 0.0, 0.0)
+    var n12: [u8; 29] = "7 skewX 30 takes x to 15.7735"
+    report((&n12[0]) as u64, 29,
+        milli(transform.xf_point_x(&x, 10.0, 10.0)) == 15774,
+        milli(transform.xf_point_x(&x, 10.0, 10.0)), 15774)
+    var n13: [u8; 25] = "7 and leaves y at 10 flat"
+    report((&n13[0]) as u64, 25,
+        milli(transform.xf_point_y(&x, 10.0, 10.0)) == 10000,
+        milli(transform.xf_point_y(&x, 10.0, 10.0)), 10000)
+    // Um einen freien Ursprung: derselbe Versatz, nur um (100,100)
+    // herum -- (110,110) liegt genau wie (10,10) daneben.
+    transform.xf_reset(&x)
+    transform.xf_skew(&x, 30.0, 0.0, 100.0, 100.0)
+    var n14: [u8; 34] = "7 about (100,100) that is 115.7735"
+    report((&n14[0]) as u64, 34,
+        milli(transform.xf_point_x(&x, 110.0, 110.0)) == 115774,
+        milli(transform.xf_point_x(&x, 110.0, 110.0)), 115774)
+    // `skewY(45)` ist der Tangens 1: y' = y + x, und das ist exakt.
+    transform.xf_reset(&x)
+    transform.xf_skew(&x, 0.0, 45.0, 0.0, 0.0)
+    var n15: [u8; 30] = "7 skewY 45 adds x to y exactly"
+    report((&n15[0]) as u64, 30,
+        milli(transform.xf_point_y(&x, 10.0, 3.0)) == 13000,
+        milli(transform.xf_point_y(&x, 10.0, 3.0)), 13000)
+
+    // ======================================= 8. DREI EBENEN VERKETTET
+    //
+    // Verschieben um (100,50), darin doppelt so gross, darin 90 Grad
+    // gedreht. Von Hand fuer (10,0): die Drehung macht (0,10), die
+    // Skalierung (0,20), die Verschiebung (100,70).
+    transform.xf_reset(&x)
+    transform.xf_translate(&x, 100.0, 50.0)
+    transform.xf_push(&x)
+    transform.xf_scale(&x, 2.0, 2.0, 0.0, 0.0)
+    transform.xf_push(&x)
+    transform.xf_rotate(&x, 90.0)
+    var n16: [u8; 33] = "8 three layers put (10,0) at x100"
+    report((&n16[0]) as u64, 33,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)) == 100000,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)), 100000)
+    var n17: [u8; 13] = "8 and at y 70"
+    report((&n17[0]) as u64, 13,
+        milli(transform.xf_point_y(&x, 10.0, 0.0)) == 70000,
+        milli(transform.xf_point_y(&x, 10.0, 0.0)), 70000)
+    var n18: [u8; 21] = "8 the depth is 3 deep"
+    report((&n18[0]) as u64, 21, transform.xf_depth(&x) == 3,
+        transform.xf_depth(&x) as i64, 3)
+    transform.xf_pop(&x)
+    var n19: [u8; 32] = "8 one pop: only scaled, x is 120"
+    report((&n19[0]) as u64, 32,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)) == 120000,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)), 120000)
+    transform.xf_pop(&x)
+    var n20: [u8; 32] = "8 two pops: only moved, x is 110"
+    report((&n20[0]) as u64, 32,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)) == 110000,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)), 110000)
+
+    // ========================================= 9. DER STAPEL IST VOLL
+    //
+    // XF_MAX Ebenen passen, die naechste nicht -- und dann steht `n`
+    // still, statt ueber das Feld hinauszulaufen.
+    transform.xf_reset(&x)
+    var geschafft: usize = 0
+    var k: usize = 1
+    while k < transform.XF_MAX {
+        if transform.xf_push(&x) {
+            geschafft = geschafft + 1
+        }
+        k = k + 1
+    }
+    var n21: [u8; 28] = "9 fifteen more layers do fit"
+    report((&n21[0]) as u64, 28, geschafft == transform.XF_MAX - 1,
+        geschafft as i64, (transform.XF_MAX - 1) as i64)
+    let voll: bool = transform.xf_push(&x)
+    var n22: [u8; 23] = "9 the sixteenth says no"
+    report((&n22[0]) as u64, 23, !voll, voll as i64, 0)
+    var n23: [u8; 28] = "9 and the depth stays XF_MAX"
+    report((&n23[0]) as u64, 28, transform.xf_depth(&x) == transform.XF_MAX,
+        transform.xf_depth(&x) as i64, transform.XF_MAX as i64)
+
+    // =================================== 10. DIE ENTARTETE ABBILDUNG
+    //
+    // `scale(0)` hat die Determinante 0: kein Bild mit Flaeche, also
+    // auch kein Treffer -- und die Kehre gibt den Punkt zurueck, statt
+    // durch null zu teilen.
+    transform.xf_reset(&x)
+    transform.xf_scale(&x, 0.0, 0.0, 0.0, 0.0)
+    let entartet: bool = transform.tf_hit_rect(&x, 0.0, 0.0, 100.0, 100.0,
+        0.0, 0.0)
+    var n24: [u8; 32] = "10 nothing is hit under scale(0)"
+    report((&n24[0]) as u64, 32, !entartet, entartet as i64, 0)
+    var n25: [u8; 35] = "10 the inverse hands the point back"
+    report((&n25[0]) as u64, 35,
+        milli(transform.xf_inv_x(&x, 7.0, 9.0)) == 7000,
+        milli(transform.xf_inv_x(&x, 7.0, 9.0)), 7000)
+
+    // ================================ 11. 90, 180, 270 GRAD SIND EXAKT
+    transform.xf_reset(&x)
+    transform.xf_rotate(&x, 180.0)
+    var n26: [u8; 33] = "11 rotate 180 sends (10,0) to -10"
+    report((&n26[0]) as u64, 33,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)) == 0 - 10000,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)), 0 - 10000)
+    var n27: [u8; 27] = "11 and its y is a true zero"
+    report((&n27[0]) as u64, 27,
+        milli(transform.xf_point_y(&x, 10.0, 0.0)) == 0,
+        milli(transform.xf_point_y(&x, 10.0, 0.0)), 0)
+    transform.xf_reset(&x)
+    transform.xf_rotate(&x, 270.0)
+    var n28: [u8; 37] = "11 rotate 270 sends (10,0) to (0,-10)"
+    report((&n28[0]) as u64, 37,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)) == 0,
+        milli(transform.xf_point_x(&x, 10.0, 0.0)), 0)
+    var n29: [u8; 19] = "11 and its y is -10"
+    report((&n29[0]) as u64, 19,
+        milli(transform.xf_point_y(&x, 10.0, 0.0)) == 0 - 10000,
+        milli(transform.xf_point_y(&x, 10.0, 0.0)), 0 - 10000)
+
+    // =========================== 12. DIE BILINEARE ABTASTUNG IN ZAHLEN
+    //
+    // Ein Bild von 2x2 mit den Rotwerten 0, 100 / 200, 255. Die Mitte
+    // zwischen den oberen beiden ist 50; die Mitte aller vier ist
+    // (0+100+200+255)/4 = 138.75, gerundet 139. Ausserhalb wird der
+    // RAND FORTGESETZT: bei u = -1 steht wieder die 0.
+    let bild: u64 = rt.heap_alloc(16)
+    if bild == 0 {
+        return 3
+    }
+    let VOLL: u32 = 255
+    punkt(bild, 0, 0, 0, 0, VOLL)
+    punkt(bild, 1, 100, 0, 0, VOLL)
+    punkt(bild, 2, 200, 0, 0, VOLL)
+    punkt(bild, 3, 255, 0, 0, VOLL)
+    var im: uiimage.Image = uiimage.image_wrap(bild, 2, 2, 0)
+    let s1: u32 = transform.tf_sample_bilinear(&im, 0.5, 0.0)
+    var n30: [u8; 37] = "12 halfway between 0 and 100 gives 50"
+    report((&n30[0]) as u64, 37, canvas.color_r(s1) == 50 as u32,
+        canvas.color_r(s1) as i64, 50)
+    let s2: u32 = transform.tf_sample_bilinear(&im, 0.5, 0.5)
+    var n31: [u8; 32] = "12 the middle of all four is 139"
+    report((&n31[0]) as u64, 32, canvas.color_r(s2) == 139 as u32,
+        canvas.color_r(s2) as i64, 139)
+    let s3: u32 = transform.tf_sample_bilinear(&im, 0.0 - 1.0, 0.0)
+    var n32: [u8; 32] = "12 outside the edge is continued"
+    report((&n32[0]) as u64, 32, canvas.color_r(s3) == 0 as u32,
+        canvas.color_r(s3) as i64, 0)
+
+    // ALPHA RICHTIG: links unsichtbar, rechts deckendes Rot. In der
+    // Mitte muss das Rot VOLL bleiben und nur die Deckung auf die
+    // Haelfte gehen -- wer die vier Farben gerade mittelt, bekommt hier
+    // ein halbes Rot und damit den grauen Saum.
+    punkt(bild, 0, 0, 0, 0, 0)
+    punkt(bild, 1, 255, 0, 0, VOLL)
+    punkt(bild, 2, 0, 0, 0, 0)
+    punkt(bild, 3, 255, 0, 0, VOLL)
+    let s4: u32 = transform.tf_sample_bilinear(&im, 0.5, 0.0)
+    var n33: [u8; 30] = "12 alpha halfway is 128 of 255"
+    report((&n33[0]) as u64, 30, canvas.color_a(s4) == 128 as u32,
+        canvas.color_a(s4) as i64, 128)
+    var n34: [u8; 38] = "12 and the red stays whole, not halved"
+    report((&n34[0]) as u64, 38, canvas.color_r(s4) == 255 as u32,
+        canvas.color_r(s4) as i64, 255)
+
+    // ============================= 13. DAS BILD AUF DER LEINWAND
+    //
+    // Ein 2x2-Bild (rot, gruen / blau, weiss) auf 8x8 gezogen und um 90
+    // Grad um die Mitte gedreht. Der linke obere Zielpixel holt sich
+    // dann den LINKEN UNTEREN Bildpunkt -- blau.
+    punkt(bild, 0, 255, 0, 0, VOLL)
+    punkt(bild, 1, 0, 255, 0, VOLL)
+    punkt(bild, 2, 0, 0, 255, VOLL)
+    punkt(bild, 3, 255, 255, 255, VOLL)
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 8, 8) {
+        return 4
+    }
+    canvas.canvas_clear(&cv, 255 as u32 << 24)
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 8, 8) {
+        return 5
+    }
+    transform.xf_reset(&x)
+    transform.xf_rotate_at(&x, 90.0, 4.0, 4.0)
+    transform.tf_draw_image(&z, &x, &im, 0.0, 0.0, 8.0, 8.0, 1.0)
+    let g1: u32 = canvas.canvas_get(&cv, 1, 1)
+    var n35: [u8; 36] = "13 turned by 90 the top left is blue"
+    report((&n35[0]) as u64, 36, canvas.color_b(g1) == 255 as u32 &&
+        canvas.color_r(g1) == 0 as u32, canvas.color_b(g1) as i64, 255)
+    // Auf halbem Weg zwischen blau und weiss, 0.625 weiss:
+    // 0.375*0 + 0.625*255 = 159.375, gerundet 159.
+    let g2: u32 = canvas.canvas_get(&cv, 1, 4)
+    var n36: [u8; 36] = "13 between blue and white red is 159"
+    report((&n36[0]) as u64, 36, canvas.color_r(g2) == 159 as u32,
+        canvas.color_r(g2) as i64, 159)
+
+    // DIE KANTE IST WEICH. Dasselbe Bild, ganz rot, unverdreht, aber um
+    // eine halbe Pixelbreite versetzt: die Spalte, deren Mitte genau
+    // auf der Kante liegt, bekommt die halbe Deckung -- 128 von 255 --
+    // und die Spalte davor gar nichts. Ohne diese Rechnung waere die
+    // Kante ein harter Vergleich und das gedrehte Bild haette Treppen.
+    punkt(bild, 0, 255, 0, 0, VOLL)
+    punkt(bild, 1, 255, 0, 0, VOLL)
+    punkt(bild, 2, 255, 0, 0, VOLL)
+    punkt(bild, 3, 255, 0, 0, VOLL)
+    canvas.canvas_clear(&cv, 255 as u32 << 24)
+    transform.xf_reset(&x)
+    transform.tf_draw_image(&z, &x, &im, 1.5, 0.0, 4.0, 4.0, 1.0)
+    let k0: u32 = canvas.canvas_get(&cv, 0, 1)
+    var n37: [u8; 36] = "14 left of the edge nothing is drawn"
+    report((&n37[0]) as u64, 36, canvas.color_r(k0) == 0 as u32,
+        canvas.color_r(k0) as i64, 0)
+    let k1: u32 = canvas.canvas_get(&cv, 1, 1)
+    var n38: [u8; 33] = "14 on the edge it is half covered"
+    report((&n38[0]) as u64, 33, canvas.color_r(k1) == 128 as u32,
+        canvas.color_r(k1) as i64, 128)
+    let k2: u32 = canvas.canvas_get(&cv, 2, 1)
+    var n39: [u8; 29] = "14 inside it is fully covered"
+    report((&n39[0]) as u64, 29, canvas.color_r(k2) == 255 as u32,
+        canvas.color_r(k2) as i64, 255)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    rt.heap_free(bild, 16)
+
+    // ================== 15. DIE TREFFERPRUEFUNG AN EINEM ECHTEN PANEL
+    //
+    // Drei Knoepfe untereinander, das Panel um 90 Grad um (0,0)
+    // gedreht. Ein Punkt im Widget-System bei (10,10) steht auf dem
+    // Schirm bei (-10,10); dort und nur dort trifft Knopf 0.
+    var ws: [widget.Widget; 3] =
+        [widget.widget_new(widget.KIND_BUTTON); 3]
+    var wi: usize = 0
+    while wi < 3 {
+        widget.w_place(&ws[wi], 0.0, (wi * 50) as f64, 100.0, 40.0)
+        wi = wi + 1
+    }
+    var pn: control.Panel = control.panel_new()
+    control.panel_attach(&pn, (&ws[0]) as u64, 3)
+    transform.xf_reset(&x)
+    transform.xf_rotate(&x, 90.0)
+    let h0: usize = transform.tf_hit_test(&pn, &x, 0.0 - 10.0, 10.0)
+    var n40: [u8; 29] = "15 the turned point hits nr 0"
+    report((&n40[0]) as u64, 29, h0 == 0, h0 as i64, 0)
+    let h1: usize = transform.tf_hit_test(&pn, &x, 0.0 - 60.0, 10.0)
+    var n41: [u8; 34] = "15 sixty down the screen hits nr 1"
+    report((&n41[0]) as u64, 34, h1 == 1, h1 as i64, 1)
+    let h2: usize = transform.tf_hit_test(&pn, &x, 0.0 - 110.0, 99.0)
+    var n42: [u8; 30] = "15 and the third one hits nr 2"
+    report((&n42[0]) as u64, 30, h2 == 2, h2 as i64, 2)
+    // DIE LUECKE zwischen Knopf 0 und 1 (y von 40 bis 50) trifft nichts.
+    let h3: usize = transform.tf_hit_test(&pn, &x, 0.0 - 45.0, 10.0)
+    var n43: [u8; 30] = "15 the gap between hits nobody"
+    report((&n43[0]) as u64, 30, h3 == control.NOBODY, h3 as i64,
+        control.NOBODY as i64)
+    // DIE ECKE: (0,0) im Widget-System gehoert noch dazu, (100,40) schon
+    // nicht mehr -- `w_hits` ist unten und links einschliessend.
+    let h4: usize = transform.tf_hit_test(&pn, &x, 0.0, 0.0)
+    var n44: [u8; 33] = "15 the top left corner still hits"
+    report((&n44[0]) as u64, 33, h4 == 0, h4 as i64, 0)
+    let h5: usize = transform.tf_hit_test(&pn, &x, 0.0 - 40.0, 100.0)
+    var n45: [u8; 36] = "15 the far corner is already outside"
+    report((&n45[0]) as u64, 36, h5 == control.NOBODY, h5 as i64,
+        control.NOBODY as i64)
+    // OHNE Ruecktransformation waere (10,10) ein Treffer -- genau der
+    // Fehler, der sich als "man klickt daneben" zeigt.
+    let h6: usize = transform.tf_hit_test(&pn, &x, 10.0, 10.0)
+    var n46: [u8; 38] = "15 the untransformed point hits nobody"
+    report((&n46[0]) as u64, 38, h6 == control.NOBODY, h6 as i64,
+        control.NOBODY as i64)
+    // Und der zurueckgeholte Punkt ist der, den control.fi selbst
+    // erwartet: dieselbe Antwort ueber tf_local_x/tf_local_y.
+    let h7: usize = control.hit_test(&pn,
+        transform.tf_local_x(&x, 0.0 - 60.0, 10.0),
+        transform.tf_local_y(&x, 0.0 - 60.0, 10.0))
+    var n47: [u8; 39] = "15 control.hit_test agrees on the point"
+    report((&n47[0]) as u64, 39, h7 == 1, h7 as i64, 1)
+
+
+    // ============ 16. DER GEDREHTE KNOPF IM NORMALEN ABLAUF
+    //
+    // Ein Knopf bei (40,40) mit 120x40, um 24 Grad um seine Mitte
+    // (100,60) gedreht. Der Punkt (56,24) auf dem Schirm liegt IM
+    // gedrehten Knopf und AUSSERHALB des geraden Rechtecks (y < 40) --
+    // von Hand gerechnet: die Kehrdrehung um -24 Grad bringt ihn nach
+    // (44.6, 60.8), und das liegt in (40,40)..(160,80).
+    //
+    // Er wird ueber den NORMALEN Einstieg gemalt (wave2.draw_any_xf)
+    // und ueber den NORMALEN Zeigerpfad bedient (control.mouse_down),
+    // nachdem `transform.tf_bind_panel` die Ruecktransformation in das
+    // Panel gehaengt hat. Kein Aufrufer rechnet hier eine Matrix.
+    var cv2: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv2, 200, 140) {
+        return 6
+    }
+    canvas.canvas_clear(&cv2, (255 as u32 << 24) | 16777215 as u32)
+    var z2: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z2, &cv2, 200, 140) {
+        return 7
+    }
+    var th: theme.Theme = theme.theme_new(false)
+    var cx2: render.Ctx = render.ctx_new(&th, &z2)
+    var kn: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&kn, 40.0, 40.0, 120.0, 40.0)
+    transform.xf_reset(&x)
+    transform.xf_rotate_at(&x, 24.0, 100.0, 60.0)
+    wave2.draw_any_xf(&cx2, &kn, &x)
+    // Die Mitte traegt die Flaechenfarbe des Knopfes; der schiefe Punkt
+    // traegt DIESELBE. Waere der Knopf gerade gemalt worden, stuende
+    // dort noch das Weiss der Seite.
+    let mitte: u32 = canvas.canvas_get(&cv2, 100, 60)
+    let schief: u32 = canvas.canvas_get(&cv2, 56, 24)
+    var n48: [u8; 38] = "16 the turned button covers (56,24)   "
+    report((&n48[0]) as u64, 38,
+        canvas.color_r(schief) == canvas.color_r(mitte),
+        canvas.color_r(schief) as i64, canvas.color_r(mitte) as i64)
+    // Und zwar die des hellen Themas: button 0xEDEDF0, also 237 --
+    // nicht das Weiss der Seite, das hier 255 waere.
+    var n49: [u8; 38] = "16 the surface is the button's 0xED   "
+    report((&n49[0]) as u64, 38, canvas.color_r(mitte) == 237 as u32,
+        canvas.color_r(mitte) as i64, 237)
+    // Das gerade Rechteck sagt an derselben Stelle NEIN -- das ist der
+    // Fehler, den die Einhaengung behebt.
+    var n50: [u8; 38] = "16 the straight rect misses the point "
+    report((&n50[0]) as u64, 38, !widget.w_hits(&kn, 56.0, 24.0),
+        0, 0)
+    var pn2: control.Panel = control.panel_new()
+    control.panel_attach(&pn2, (&kn) as u64, 1)
+    // OHNE Einhaengung: der normale Ablauf geht daneben.
+    let ohne: u32 = control.mouse_down(&pn2, 56.0, 24.0)
+    var n51: [u8; 38] = "16 unbound the click reaches nobody   "
+    report((&n51[0]) as u64, 38,
+        control.panel_pressed(&pn2) == control.NOBODY,
+        control.panel_pressed(&pn2) as i64, control.NOBODY as i64)
+    let egal: u32 = control.mouse_up(&pn2, 56.0, 24.0)
+    // MIT Einhaengung: derselbe Aufruf trifft.
+    var bd: transform.XfBind = transform.xfbind_new(&x, (&kn) as u64)
+    transform.tf_bind_panel(&pn2, &bd)
+    let mv: u32 = control.mouse_move(&pn2, 56.0, 24.0)
+    var n52: [u8; 38] = "16 the pointer hovers the turned one  "
+    report((&n52[0]) as u64, 38, control.panel_hot(&pn2) == 0,
+        control.panel_hot(&pn2) as i64, 0)
+    var n53: [u8; 38] = "16 hovering asks for a repaint        "
+    report((&n53[0]) as u64, 38, (mv & control.CH_REPAINT) != 0 as u32,
+        (mv & control.CH_REPAINT) as i64, control.CH_REPAINT as i64)
+    let dn: u32 = control.mouse_down(&pn2, 56.0, 24.0)
+    var n54: [u8; 38] = "16 the press lands on widget 0        "
+    report((&n54[0]) as u64, 38, control.panel_pressed(&pn2) == 0,
+        control.panel_pressed(&pn2) as i64, 0)
+    var n55: [u8; 38] = "16 and it takes the focus with it     "
+    report((&n55[0]) as u64, 38, control.panel_focus(&pn2) == 0,
+        control.panel_focus(&pn2) as i64, 0)
+    let up: u32 = control.mouse_up(&pn2, 56.0, 24.0)
+    var n56: [u8; 38] = "16 releasing on it is an activation   "
+    report((&n56[0]) as u64, 38, (up & control.CH_ACTIVATE) != 0 as u32,
+        (up & control.CH_ACTIVATE) as i64, control.CH_ACTIVATE as i64)
+    // Und die Gegenprobe: (41,41) liegt im GERADEN Rechteck, im
+    // gedrehten Knopf aber nicht -- die Kehrdrehung bringt den Punkt
+    // nach (38.4, 66.6), also links am Knopf vorbei.
+    let da: u32 = control.mouse_down(&pn2, 41.0, 41.0)
+    var n57: [u8; 38] = "16 the straight corner hits nobody    "
+    report((&n57[0]) as u64, 38,
+        control.panel_pressed(&pn2) == control.NOBODY,
+        control.panel_pressed(&pn2) as i64, control.NOBODY as i64)
+
+    // ================= 17. tf_text IN ZAHLEN: BREITE, GRUNDLINIE, SCHERUNG
+    //
+    // Der Umriss-Pfad war bisher durch KEINE Zahl gedeckt -- gemalt hat
+    // ihn nur die Galerie, und ein Bild sagt nicht, ob es stimmt. Die
+    // Scherung sieht man bei 20 Punkt Schrift ohnehin kaum (der Versatz
+    // ueber eine Versalhoehe ist dort unter vier Punkten); erst gross
+    // gesetzt wird daraus eine Zahl, die man messen kann.
+    //
+    // Gemessen wird an "I" -- ein senkrechter Balken ohne Rundung und
+    // ohne Unterlaenge. Bei skewX(g) um die Grundlinie muss die
+    // OBERSTE Bildpunktzeile des Balkens gegen die UNTERSTE genau um
+    // tan(g) * Balkenhoehe versetzt sein, und zwar nach LINKS: der
+    // Balken steht ueber der Grundlinie, also ist (y - oy) negativ.
+    // Steht der Scherungsanteil nicht in der Schriftmatrix, kommt hier
+    // eine Null heraus, und die Buchstaben stuenden senkrecht in einem
+    // schiefen Kasten -- genau der Fehler, den diese Pruefung faengt.
+    var fbuf: rt.Buf = rt.buf_new()
+    var fpath: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let hat_font: bool = rt.read_file((&fpath[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 8
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if hat_font {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    if fm == 0 as u64 {
+        // OHNE SCHRIFT WIRD NICHT STILL BESTANDEN. Der Lauf sagt, dass
+        // ihm die Schrift fehlt, und geht als Fehler aus -- eine
+        // uebersprungene Pruefung, die "OK" druckt, ist eine Luege.
+        var kf: [u8; 45] = "17 no font at all -- tf_text NOT measured\n\0\0\0"
+        rt.write_everything(2, (&kf[0]) as u64, 42)
+        G_ERRORS = G_ERRORS + 1
+    } else {
+        var cv3: canvas.Canvas = canvas.canvas_new()
+        if !canvas.canvas_init(&cv3, TW, TH) {
+            return 9
+        }
+        var z3: painter.Painter = painter.painter_new()
+        if !painter.painter_init(&z3, &cv3, TW, TH) {
+            return 10
+        }
+        painter.painter_set_font(&z3, fm)
+        let tint: u32 = theme.opaque(0 as u32)
+        let weiss: u32 = 16777215 as u32
+
+        // ---- a) DIE BREITE UNTER DREHUNG IST DIE GERADE BREITE.
+        //
+        // `tf_text` misst mit denselben Funktionen wie der gerade Weg
+        // und gibt das ENDE der Schrift IM SYSTEM DES AUFRUFERS
+        // zurueck. Unter einer Drehung darf sich diese Zahl deshalb
+        // NICHT aendern -- gedreht wird erst beim Zeichnen.
+        var wort: [u8; 8] = "HAMBURG "
+        let wp: u64 = (&wort[0]) as u64
+        let gerade_br: f64 = painter.text_width(&z3, wp, 7, 40.0)
+        canvas.canvas_clear(&cv3, theme.opaque(weiss))
+        transform.xf_reset(&x)
+        let ende0: f64 = transform.tf_text(&z3, &x, 20.0, 120.0, 600.0,
+            40.0, tint, wp, 7, painter.TEXT_L)
+        var n60: [u8; 46] = "17a straight: the end is start plus the width "
+        report((&n60[0]) as u64, 46, milli(ende0) == milli(20.0 + gerade_br),
+            milli(ende0), milli(20.0 + gerade_br))
+        canvas.canvas_clear(&cv3, theme.opaque(weiss))
+        transform.xf_reset(&x)
+        transform.xf_rotate_at(&x, 30.0, 20.0, 120.0)
+        let ende1: f64 = transform.tf_text(&z3, &x, 20.0, 120.0, 600.0,
+            40.0, tint, wp, 7, painter.TEXT_L)
+        var n61: [u8; 46] = "17a turned by 30 degrees it is the same number"
+        report((&n61[0]) as u64, 46, milli(ende1) == milli(ende0),
+            milli(ende1), milli(ende0))
+
+        // ---- b) DIE GRUNDLINIE LIEGT, WO SIE SOLL.
+        //
+        // Ohne Abbildung steht die unterste Zeile eines "I" auf der
+        // Grundlinie. Gesetzt wird bei y = 120; die unterste gesetzte
+        // Zeile darf also hoechstens einen Punkt darunter liegen (der
+        // Umriss darf die Metrik um Haaresbreite ueberragen, und die
+        // Kantenglaettung setzt die letzte Zeile schwach).
+        var ein_i: [u8; 2] = "I "
+        let ip: u64 = (&ein_i[0]) as u64
+        canvas.canvas_clear(&cv3, theme.opaque(weiss))
+        transform.xf_reset(&x)
+        let e2: f64 = transform.tf_text(&z3, &x, 60.0, 120.0, 400.0,
+            100.0, tint, ip, 1, painter.TEXT_L)
+        var o_a: i64 = 0
+        var u_a: i64 = 0
+        var yo_a: i64 = 0
+        var yu_a: i64 = 0
+        balken(&cv3, weiss, &o_a, &u_a, &yo_a, &yu_a)
+        var n62: [u8; 46] = "17b the baseline carries the foot of the I    "
+        report((&n62[0]) as u64, 46, yu_a >= 118 && yu_a <= 121,
+            yu_a, 120)
+
+        // ---- c) DIE SCHERUNG KOMMT AN DER GLYPHE AN.
+        //
+        // skewX(15) um die Grundlinie (60,120). Der Balken des "I" ist
+        // `hoch` Punkte hoch; sein Kopf muss gegen seinen Fuss um
+        // tan(15) * hoch = 0.26794919 * hoch nach links stehen. Bei 100
+        // Punkt Schrift sind das rund 19 Punkte -- eine Zahl, die kein
+        // Rundungsfehler mehr erklaert.
+        canvas.canvas_clear(&cv3, theme.opaque(weiss))
+        transform.xf_reset(&x)
+        transform.xf_skew(&x, 15.0, 0.0, 60.0, 120.0)
+        let e3: f64 = transform.tf_text(&z3, &x, 60.0, 120.0, 400.0,
+            100.0, tint, ip, 1, painter.TEXT_L)
+        var o_b: i64 = 0
+        var u_b: i64 = 0
+        var yo_b: i64 = 0
+        var yu_b: i64 = 0
+        balken(&cv3, weiss, &o_b, &u_b, &yo_b, &yu_b)
+        let hoch: i64 = yu_b - yo_b
+        let soll: i64 = (((hoch as f64) * 0.26794919) + 0.5) as i64
+        let ist: i64 = u_b - o_b
+        var n63: [u8; 46] = "17c the head of the I leans left by tan15*h   "
+        report((&n63[0]) as u64, 46, ist >= soll - 2 && ist <= soll + 2,
+            ist, soll)
+        // Und die Gegenprobe: OHNE Scherung steht derselbe Balken lot-
+        // recht. Ohne diese zweite Zahl koennte 17c auch von einer
+        // schiefen Schrift kommen statt von der Abbildung.
+        var n64: [u8; 46] = "17c without the skew the same I stands upright"
+        report((&n64[0]) as u64, 46, u_a - o_a >= 0 - 1 && u_a - o_a <= 1,
+            u_a - o_a, 0)
+        // Die Hoehe des Balkens aendert sich durch eine reine skewX
+        // NICHT -- eine Scherung in x laesst y unberuehrt. Damit ist
+        // ausgeschlossen, dass 17c von einer Stauchung kommt.
+        var n65: [u8; 46] = "17c and skewX leaves the height untouched     "
+        report((&n65[0]) as u64, 46,
+            (yu_b - yo_b) >= (yu_a - yo_a) - 1 &&
+            (yu_b - yo_b) <= (yu_a - yo_a) + 1,
+            yu_b - yo_b, yu_a - yo_a)
+        painter.painter_free(&z3)
+        canvas.canvas_free(&cv3)
+    }
+    rt.buf_free(&fbuf)
+
+    painter.painter_free(&z2)
+    canvas.canvas_free(&cv2)
+
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push(&t, 10 as u8)
+    if G_ERRORS > 0 {
+        var f: [u8; 27] = "TRANSFORM IS NOT IN ORDER.\n"
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 27)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+        return 1
+    }
+    var o: [u8; 18] = "TRANSFORM PASSED.\n"
+    rt.buf_push_bytes(&t, (&o[0]) as u64, 18)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 0
+}

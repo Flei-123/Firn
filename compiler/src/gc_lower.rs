@@ -14,13 +14,13 @@
 //!    CONSERVATIVE register scan (SPEC §3.5.3) sees them.
 //!
 //! The **insertion barrier** sits in exactly one place: the write of a
-//! `Gc[T]` pointer into a heap field (`hook_assign`). At this stage it counts
-//! the writes (`gc_barriers()`); the collector stops the world, so mark-sweep
-//! needs no greying here. The slot for incremental collection (`S5`, still
-//! open) is thereby present and provably exercised.
+//! `Gc[T]` pointer into a heap field (`hook_assign`). Since round B4 its fast
+//! half is written INLINE (`emit_barrier`): count the write
+//! (`gc_barriers()`), test the phase of the collector, and only while a
+//! cycle runs call the runtime (`__gc_barrier_slow`), which greys the target.
 
 use crate::ast::{Expr, ExprKind};
-use crate::fir::{CmpOp, FTy, Op, Val};
+use crate::fir::{BinOp, CmpOp, FTy, Op, Val};
 use crate::gc;
 use crate::lower::Lower;
 use crate::types::Type;
@@ -58,6 +58,18 @@ pub(crate) fn hook_call(
             Some(()) => Some(None),
             None => None,
         });
+    }
+    // Round B4: an explicit `__gc_barrier(field, value)` -- the collections
+    // in `lib/gc/gcvec.fi` / `gcmap.fi` write it by hand -- gets the same
+    // inline fast path as the barrier the compiler inserts itself. The
+    // field is still evaluated (order of side effects), not used.
+    if name == gc::FN_BARRIER && args.len() == 2 {
+        return Some((|| {
+            lo.lower_expr(&args[0])?;
+            let v = lo.lower_expr(&args[1])?;
+            emit_barrier(lo, v);
+            Some(None)
+        })());
     }
     if name == gc::INTR_STATE || name == gc::INTR_REGS {
         let regs = name == gc::INTR_REGS;
@@ -146,8 +158,9 @@ fn alloc_and_init(
 }
 
 /// `// HOOK gc` in `lower::lower_stmt` (assignment): the insertion barrier.
-/// It is called AFTER the write; `target` is the field written to.
-pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr) -> Option<()> {
+/// It is called AFTER the write; `target` is the field written to and
+/// `addr` the address the store went to (computed once, by the caller).
+pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr, addr: Val) -> Option<()> {
     let t = lo.ty_of(target);
     if !gc::is_gc_ptr(&t) {
         return Some(());
@@ -163,13 +176,56 @@ pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr) -> Option<()> {
     if !ins_heap {
         return Some(());
     }
-    let addr = lo.lower_addr(target)?;
+    // Round B4: the address the store went to, NOT a second evaluation of
+    // the target -- `pick().next = x` used to call `pick()` twice
+    // (tests/1664_gc_barrier_inline.fi counts the calls).
     let val = lo.load(FTy::Ptr, addr);
+    emit_barrier(lo, val);
+    Some(())
+}
+
+/// **Round B4** -- the insertion barrier, written INLINE at the store.
+///
+/// Before, every `Gc` pointer store was a call of `__gc_barrier` (measured
+/// 11.7 ns per store at dev-fast; the inliner only removed it on
+/// release-*). The runtime function did two things on the fast path --
+/// count the store, look at the phase -- and that is exactly what is
+/// emitted here:
+///
+/// ```text
+///     st  = gc_addr                      ; lea of the state block
+///     [st + S_BARRIEREN] += 1            ; gc_barriers() stays exact
+///     if [st + S_PHASE] != 0 { __gc_barrier_slow(value) }
+/// ```
+///
+/// The slow half (greying, the finalizer check, the lock) stays in the
+/// runtime and runs only while a cycle is marking or sweeping. The contract
+/// between compiler and runtime is therefore two offsets and one name
+/// (`gc.rs`, checked by `barrier_offsets_match_the_runtime`).
+///
+/// The old runtime test `field == 0 && value == 0` is gone on purpose: the
+/// field address of a store that just happened is never 0.
+pub(crate) fn emit_barrier(lo: &mut Lower, value: Val) {
+    let st = lo.push(FTy::Ptr, Op::GcAddr { regs: false });
+    let ca = lo.ptradd_const(st, gc::BARRIER_COUNT_OFF);
+    let c = lo.load(FTy::U64, ca);
+    let one = lo.constant(FTy::U64, 1);
+    let c1 = lo.push(FTy::U64, Op::Bin(BinOp::Add, c, one));
+    lo.store(FTy::U64, ca, c1);
+    let pa = lo.ptradd_const(st, gc::PHASE_OFF);
+    let ph = lo.load(FTy::U64, pa);
+    let zero = lo.constant(FTy::U64, 0);
+    let busy = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::U64, a: ph, b: zero });
+    let slow = lo.new_block();
+    let join = lo.new_block();
+    lo.set_term(crate::fir::Term::BrCond { cond: busy, then_bb: slow, else_bb: join });
+    lo.cur = slow;
     lo.push_void(
         FTy::Void,
-        Op::Call { name: gc::FN_BARRIER.to_string(), args: vec![addr, val] },
+        Op::Call { name: gc::FN_BARRIER_SLOW.to_string(), args: vec![value] },
     );
-    Some(())
+    lo.set_term(crate::fir::Term::Br(join));
+    lo.cur = join;
 }
 
 fn is_ptr(t: &Type) -> bool {

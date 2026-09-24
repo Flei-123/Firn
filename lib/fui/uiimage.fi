@@ -1,0 +1,457 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/uiimage.fi -- A PICTURE ON A WIDGET.
+//
+// WHY `uiimage` AND NOT `image`: lib/svg (ported into this tree on
+// 13.09.2026) has a `svg/image.fi` of its own, and Firn resolves a module
+// by the LAST segment of its path -- so `fui.image` and `svg.image` are
+// both `image` and cannot be imported into the same file. lib/svg is the
+// ported code and stays untouched, so this one carries the prefix. Same
+// reason as `uipaint.fi` in the Certus tree.
+//
+// ========================================================= WHY IT EXISTS
+//
+// Justin, 13.09.2026: a button should be able to carry an ICON, a label
+// a PICTURE. Up to now fUi could draw nine marks (lib/fui/icon.fi) and
+// nothing else: every mark is geometry, compiled in, and there is no way
+// to put a PNG from disk on a toolbar button.
+//
+// This file is the missing piece, and it is deliberately small: a
+// picture is a pointer, a width, a height and a row stride. That is all
+// a blitter needs, and it is all a widget stores.
+//
+// ==================================================== THE PIXEL FORMAT
+//
+// STRAIGHT (non-premultiplied) RGBA as 0xAARRGGBB per pixel, exactly
+// what `paint.png.image_pixel` hands back. The canvas underneath is
+// PREMULTIPLIED (lib/paint/canvas.fi line 84), and `canvas_blend` does
+// that multiplication itself from a straight colour plus a coverage.
+// So this file never premultiplies by hand -- it hands the straight
+// colour and the alpha-as-coverage to the canvas and lets the one place
+// that knows the format do the arithmetic.
+//
+// THE R/B ORDER IS NOT A MATTER OF TASTE. In this project a red/blue
+// swap has already shipped once without anybody seeing it, because a
+// swapped icon still looks like an icon. `tools/fui/image_main.fi`
+// therefore reads the channels back NUMERICALLY and compares them
+// against the colour that was asked for. A picture check that only
+// looks at "is something there" would not have caught it.
+//
+// ===================================== WHY NO DECODER OF ITS OWN HERE
+//
+// lib/paint/png.fi ALREADY decodes PNG (colour types 0/2/4/6 at eight
+// bits, all five row filters) on top of the DEFLATE written in Firn in
+// lib/std/deflate.fi. Writing a second one here would be exactly the
+// fault this library exists to stop -- the same drawing in two places.
+//
+// So: the BLITTER is here, the DECODER stays there, and `image_from_png`
+// is four lines of glue. That glue is the ONLY part of this file that
+// pulls lib/paint/png.fi in, and it is why the split below matters.
+//
+// ========================================= WHY THE DECODER IS ELSEWHERE
+//
+// MEASURED, NOT ASSUMED (13.09.2026): the kernel-clean part of fUi is
+// core.fi, style.fi and layout.fi -- those three are what
+// tools/fui/run.sh builds with `--profile=kernel`. painter.fi is NOT
+// among them and cannot be: it imports `std.rt` for the heap the
+// rasteriser needs. This file draws through painter.fi, so it is an
+// APPLICATION file too, and claiming otherwise would be a lie in a
+// comment.
+//
+// The decoder still lives in a file of its own (lib/fui/uiimagepng.fi),
+// for a reason that survives that correction:
+//
+//   * THE BLITTER takes a buffer and a rectangle. It does not care where
+//     the pixels came from -- PNG, a framebuffer, a decoded JPEG, a
+//     procedurally filled array. Nothing here allocates.
+//
+//   * THE DECODER is one format among several. Keeping it out means a
+//     caller who already has pixels in memory never links DEFLATE in.
+//
+// That is why you will not find an `import paint.png` below.
+//
+// ============================================ WHAT SCALING DOES HERE
+//
+// BOX SAMPLING for shrinking, BILINEAR for growing.
+//
+// Nearest neighbour was the first version and it is wrong for icons: a
+// 64x64 icon drawn at 17x17 with nearest neighbour drops five pixels out
+// of six, and the result has the ragged edge Justin calls "stairs". Box
+// sampling averages the whole source rectangle that falls under a
+// destination pixel, so no source pixel is ever ignored.
+//
+// Going the other way there is nothing to average, so bilinear
+// interpolation between the four neighbours is right.
+//
+// THE ALPHA IS WEIGHTED, THE COLOUR IS WEIGHTED BY ALPHA. That is the
+// part people get wrong: averaging the RGB of a transparent pixel in
+// with the same weight as an opaque one drags the colour of fully
+// transparent pixels (often black, or white) into the edge, and the icon
+// gets a dark or light halo. The sum below therefore weights the colour
+// by `w * a` and divides by the sum of `w * a`, which is the only way
+// the edge keeps the colour of the visible part.
+import paint.canvas
+import fui.painter
+
+export {
+    Image, image_new, image_wrap, image_ok, image_w, image_h,
+    image_pixel_at, image_draw, image_draw_rect, image_fit,
+    // Die Abtastung ist AUSGEFUEHRT, seit lib/fui/transform.fi das
+    // gedrehte Bild darueber holt: eine bilineare Abtastung im Baum
+    // reicht, und es ist diese hier.
+    sample_bilinear,
+    FIT_STRETCH, FIT_CONTAIN, FIT_NONE,
+}
+
+// How a picture fills the rectangle it is given.
+//
+// CONTAIN is the default for a widget icon: it keeps the aspect ratio
+// and centres, which is what you want when the icon is square and the
+// space is not. STRETCH ignores the ratio (right for a background),
+// NONE draws at the source size and centres (right when the icon was
+// authored for exactly this size and must not be resampled at all).
+const FIT_STRETCH: u32 = 0
+const FIT_CONTAIN: u32 = 1
+const FIT_NONE: u32 = 2
+
+// A PICTURE THE CALLER OWNS.
+//
+// Same rule as the text of a widget (widget.fi E1): the pixels belong to
+// whoever made them, this structure only points at them. That keeps
+// `Image` a value you can copy about and keeps the library
+// allocation-free -- nothing here ever calls the heap.
+//
+// `stride` is in BYTES per row, not pixels, so a picture that is a
+// sub-rectangle of a bigger buffer works without a copy.
+struct Image {
+    px: u64,      // the pixels, 0xAARRGGBB per pixel, straight alpha
+    w: usize,
+    h: usize,
+    stride: usize, // bytes per row; 0 means w * 4
+}
+
+#[no_gc]
+fn image_new() -> Image {
+    return Image { px: 0, w: 0, h: 0, stride: 0 }
+}
+
+// Point an Image at a buffer. `stride` 0 means tightly packed.
+#[no_gc]
+fn image_wrap(px: u64, w: usize, h: usize, stride: usize) -> Image {
+    var s: usize = stride
+    if s == 0 {
+        s = w * 4
+    }
+    return Image { px: px, w: w, h: h, stride: s }
+}
+
+#[no_gc]
+fn image_ok(im: *mut Image) -> bool {
+    return (*im).px != 0 && (*im).w != 0 && (*im).h != 0
+}
+
+#[no_gc]
+fn image_w(im: *mut Image) -> usize { return (*im).w }
+
+#[no_gc]
+fn image_h(im: *mut Image) -> usize { return (*im).h }
+
+// ONE PIXEL, 0xAARRGGBB, straight alpha. Outside the picture is
+// transparent -- that is what makes the samplers below safe at the edge
+// without a special case per loop.
+#[no_gc]
+fn image_pixel_at(im: *mut Image, x: usize, y: usize) -> u32 {
+    if (*im).px == 0 || x >= (*im).w || y >= (*im).h {
+        return 0 as u32
+    }
+    let o: usize = y * (*im).stride + x * 4
+    return ((b8((*im).px, o + 3) as u32) << 24)
+        | ((b8((*im).px, o) as u32) << 16)
+        | ((b8((*im).px, o + 1) as u32) << 8)
+        | (b8((*im).px, o + 2) as u32)
+}
+
+// The raw byte read, as a #[no_gc] of our own.
+//
+// `rt.ld8` does the same thing but is not marked #[no_gc], and the
+// promise holds transitively (SPEC 3.5.4). painter.fi has the identical
+// helper `b8` for the identical reason -- a one line read is not the
+// "same thing in two places" this library guards against, the DRAWING is.
+#[no_gc]
+fn b8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+#[no_gc]
+fn fmin(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+#[no_gc]
+fn fmax(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+#[no_gc]
+fn ffloor_i(v: f64) -> i64 {
+    let t: i64 = v as i64
+    if (t as f64) > v {
+        return t - 1
+    }
+    return t
+}
+
+// ====================================================================
+// WHERE THE PICTURE LANDS
+// ====================================================================
+//
+// Works the destination rectangle out from the fit mode. Separate from
+// the drawing because the LAYOUT needs the same arithmetic to ask how
+// much room an icon wants (see layout.fi / widget pref sizes).
+#[no_gc]
+fn image_fit(im: *mut Image, x: f64, y: f64, w: f64, h: f64, fit: u32,
+    ox: *mut f64, oy: *mut f64, ow: *mut f64, oh: *mut f64) {
+    if fit == FIT_STRETCH {
+        *ox = x
+        *oy = y
+        *ow = w
+        *oh = h
+        return
+    }
+    let sw: f64 = (*im).w as f64
+    let sh: f64 = (*im).h as f64
+    var dw: f64 = sw
+    var dh: f64 = sh
+    if fit == FIT_CONTAIN {
+        // The SMALLER of the two ratios, so the picture fits in both
+        // directions. Taking the larger one is `cover` and crops --
+        // wrong for an icon, because it cuts the edge off.
+        var s: f64 = fmin(w / sw, h / sh)
+        if s < 0.0 { s = 0.0 }
+        dw = sw * s
+        dh = sh * s
+    }
+    // Centred in the space that is left. Rounded to a whole pixel:
+    // an icon on a half pixel is blurred across two columns, and at
+    // sixteen pixels that is plainly visible.
+    *ox = x + ((w - dw) / 2.0 + 0.5) as i64 as f64
+    *oy = y + ((h - dh) / 2.0 + 0.5) as i64 as f64
+    *ow = dw
+    *oh = dh
+}
+
+// ====================================================================
+// THE BLITTER
+// ====================================================================
+
+// Draw the picture into the rectangle, honouring the fit mode.
+//
+// `tint` is 0 to draw the picture in its own colours, or a colour to
+// paint the picture's ALPHA in. The tint is what makes a single
+// monochrome glyph usable on a light and a dark theme: the shape comes
+// from the picture, the colour from the theme. A coloured logo is drawn
+// with tint 0 and keeps its own colours.
+fn image_draw(z: *mut painter.Painter, im: *mut Image, x: f64, y: f64,
+    w: f64, h: f64, fit: u32, tint: u32) {
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var dw: f64 = 0.0
+    var dh: f64 = 0.0
+    image_fit(im, x, y, w, h, fit, &dx, &dy, &dw, &dh)
+    image_draw_rect(z, im, dx, dy, dw, dh, tint)
+}
+
+// Draw into EXACTLY this rectangle, no fitting. The one that does the
+// work.
+fn image_draw_rect(z: *mut painter.Painter, im: *mut Image, dx: f64,
+    dy: f64, dw: f64, dh: f64, tint: u32) {
+    if !painter.painter_ok(z) || !image_ok(im) || dw <= 0.0 || dh <= 0.0 {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+
+    // Clip to the canvas in WHOLE pixels. The loop below walks
+    // destination pixels, so a fractional bound would sample outside.
+    var x0: i64 = ffloor_i(fmax(dx, 0.0))
+    var y0: i64 = ffloor_i(fmax(dy, 0.0))
+    var x1: i64 = ffloor_i(fmin(dx + dw, cw) + 0.999999)
+    var y1: i64 = ffloor_i(fmin(dy + dh, ch) + 0.999999)
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+
+    let sx: f64 = (*im).w as f64 / dw
+    let sy: f64 = (*im).h as f64 / dh
+    // SHRINKING OR GROWING decides the sampler, per axis independently:
+    // a 64x8 picture in a 16x16 box shrinks in x and grows in y.
+    let box_x: bool = sx > 1.0
+    let box_y: bool = sy > 1.0
+
+    var py: i64 = y0
+    while py < y1 {
+        var px: i64 = x0
+        while px < x1 {
+            // The source rectangle this destination pixel covers.
+            let u0: f64 = ((px as f64) - dx) * sx
+            let u1: f64 = ((px as f64) + 1.0 - dx) * sx
+            let v0: f64 = ((py as f64) - dy) * sy
+            let v1: f64 = ((py as f64) + 1.0 - dy) * sy
+            var col: u32 = 0
+            if box_x || box_y {
+                col = sample_box(im, u0, u1, v0, v1)
+            } else {
+                col = sample_bilinear(im, (u0 + u1) / 2.0 - 0.5,
+                    (v0 + v1) / 2.0 - 0.5)
+            }
+            let a: u32 = (col >> 24) & 255 as u32
+            if a != 0 as u32 {
+                // THE ALPHA BECOMES THE COVERAGE. `canvas_blend` takes a
+                // straight colour and a coverage 0..1 and does the
+                // premultiply itself -- so the one place that knows the
+                // canvas format keeps doing that arithmetic, and this
+                // file never touches premultiplied pixels.
+                var out: u32 = col | (255 as u32) << 24
+                if tint != 0 as u32 {
+                    // Tinted: the shape comes from the picture's alpha,
+                    // the colour from the caller.
+                    out = tint | (255 as u32) << 24
+                }
+                canvas.canvas_blend(cv, px as usize, py as usize, out,
+                    (a as f64) / 255.0)
+            }
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// BOX SAMPLING. Averages every source pixel under the destination
+// pixel, weighted by how much of it is covered.
+//
+// This is the half that kills the stairs when an icon is made smaller.
+#[no_gc]
+fn sample_box(im: *mut Image, u0: f64, u1: f64, v0: f64, v1: f64) -> u32 {
+    let iw: f64 = (*im).w as f64
+    let ih: f64 = (*im).h as f64
+    let a0: f64 = fmax(u0, 0.0)
+    let a1: f64 = fmin(u1, iw)
+    let b0: f64 = fmax(v0, 0.0)
+    let b1: f64 = fmin(v1, ih)
+    if a1 <= a0 || b1 <= b0 {
+        return 0 as u32
+    }
+    var sa: f64 = 0.0   // sum of weight * alpha
+    var sr: f64 = 0.0   // sum of weight * alpha * red   (see the head)
+    var sg: f64 = 0.0
+    var sb: f64 = 0.0
+    var sw: f64 = 0.0   // sum of weight
+    var yy: i64 = ffloor_i(b0)
+    let yend: i64 = ffloor_i(b1 - 0.0000001)
+    while yy <= yend {
+        let ry0: f64 = fmax(b0, yy as f64)
+        let ry1: f64 = fmin(b1, (yy as f64) + 1.0)
+        let fy: f64 = ry1 - ry0
+        if fy > 0.0 {
+            var xx: i64 = ffloor_i(a0)
+            let xend: i64 = ffloor_i(a1 - 0.0000001)
+            while xx <= xend {
+                let rx0: f64 = fmax(a0, xx as f64)
+                let rx1: f64 = fmin(a1, (xx as f64) + 1.0)
+                let fx: f64 = rx1 - rx0
+                if fx > 0.0 {
+                    let wgt: f64 = fx * fy
+                    let c: u32 = image_pixel_at(im, xx as usize,
+                        yy as usize)
+                    let av: f64 = (((c >> 24) & 255 as u32) as f64) / 255.0
+                    sw = sw + wgt
+                    sa = sa + wgt * av
+                    let wa: f64 = wgt * av
+                    sr = sr + wa * (((c >> 16) & 255 as u32) as f64)
+                    sg = sg + wa * (((c >> 8) & 255 as u32) as f64)
+                    sb = sb + wa * ((c & 255 as u32) as f64)
+                }
+                xx = xx + 1
+            }
+        }
+        yy = yy + 1
+    }
+    if sw <= 0.0 || sa <= 0.0 {
+        return 0 as u32
+    }
+    // The colour divides by the ALPHA-weighted sum, the alpha by the
+    // plain weight. Dividing both by `sw` would pull transparent black
+    // into the edge -- the halo named at the head of the file.
+    let r: u32 = to255(sr / sa)
+    let g: u32 = to255(sg / sa)
+    let b: u32 = to255(sb / sa)
+    let a: u32 = to255(sa / sw * 255.0)
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+// BILINEAR, for growing. `fx`/`fy` are in source pixel centres, so
+// (0,0) means the centre of the top left pixel.
+#[no_gc]
+fn sample_bilinear(im: *mut Image, fx: f64, fy: f64) -> u32 {
+    let x0: i64 = ffloor_i(fx)
+    let y0: i64 = ffloor_i(fy)
+    let tx: f64 = fx - (x0 as f64)
+    let ty: f64 = fy - (y0 as f64)
+    var sa: f64 = 0.0
+    var sr: f64 = 0.0
+    var sg: f64 = 0.0
+    var sb: f64 = 0.0
+    var j: i64 = 0
+    while j < 2 {
+        var i: i64 = 0
+        while i < 2 {
+            var wx: f64 = tx
+            if i == 0 { wx = 1.0 - tx }
+            var wy: f64 = ty
+            if j == 0 { wy = 1.0 - ty }
+            let wgt: f64 = wx * wy
+            if wgt > 0.0 {
+                let px: i64 = x0 + i
+                let py: i64 = y0 + j
+                var c: u32 = 0
+                // CLAMP AT THE EDGE, do not treat outside as
+                // transparent: a picture drawn at exactly its own size
+                // would otherwise fade out on the last half pixel of
+                // every side.
+                var cx: i64 = px
+                var cy: i64 = py
+                if cx < 0 { cx = 0 }
+                if cy < 0 { cy = 0 }
+                if cx >= (*im).w as i64 { cx = (*im).w as i64 - 1 }
+                if cy >= (*im).h as i64 { cy = (*im).h as i64 - 1 }
+                c = image_pixel_at(im, cx as usize, cy as usize)
+                let av: f64 = (((c >> 24) & 255 as u32) as f64) / 255.0
+                sa = sa + wgt * av
+                let wa: f64 = wgt * av
+                sr = sr + wa * (((c >> 16) & 255 as u32) as f64)
+                sg = sg + wa * (((c >> 8) & 255 as u32) as f64)
+                sb = sb + wa * ((c & 255 as u32) as f64)
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    if sa <= 0.0 {
+        return 0 as u32
+    }
+    let r: u32 = to255(sr / sa)
+    let g: u32 = to255(sg / sa)
+    let b: u32 = to255(sb / sa)
+    let a: u32 = to255(sa * 255.0)
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+#[no_gc]
+fn to255(v: f64) -> u32 {
+    var t: f64 = v + 0.5
+    if t < 0.0 { t = 0.0 }
+    if t > 255.0 { t = 255.0 }
+    return t as u32
+}

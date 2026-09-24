@@ -1,0 +1,1137 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// lib/svg/pfad.fi -- DER PFAD. Die Sprache des `d`-Attributs, und der
+// Speicher, in dem ein Pfad zwischen dem Lesen und dem Malen liegt.
+//
+// Ein Pfad ist hier zwei Puffer:
+//
+//   `vb`  ein Oktett je BEFEHL   -- Zug, Linie, Quadrat, Kubik, Zu
+//   `pt`  zwei `f64` je PUNKT    -- die Punkte in der Reihenfolge, in der
+//                                  die Befehle sie verbrauchen
+//
+// Warum getrennt und nicht ein Datensatz je Befehl: ein `moveto` braucht
+// einen Punkt, ein `curveto` drei, ein `closepath` keinen. Ein einheitlicher
+// Datensatz waere fuer jede Linie dreimal so gross wie noetig, und eine
+// Symbolsammlung wie Remixicon besteht fast nur aus Linien.
+//
+// KEINE KREISBOEGEN IM SPEICHER. Der Befehl `A` wird schon beim Lesen in
+// kubische Beziers umgerechnet. Das ist die wichtige Entscheidung dieser
+// Datei: alles hinter dem Zerteiler sieht nur noch vier Befehlsarten, und
+// der Rasterer, das Bestreichen, die Umrisse und die Trefferpruefung
+// muessen den Bogen nicht je einzeln koennen.
+//
+// ---------------------------------------------------- DER BOGEN, RICHTIG
+//
+// Der Befehl `A rx ry drehung gross sweep x y` gibt den ENDPUNKT an; die
+// Ellipse dahinter hat aber einen MITTELPUNKT, und der steht nirgends.
+// SVG 1.1, Anhang F.6.5 rechnet das eine ins andere um, und F.6.6 sagt,
+// was bei unmoeglichen Angaben passiert. Beides ist hier ausgeschrieben,
+// weil genau hier die meisten Fassungen falsch sind:
+//
+//   * Sind Anfang und Ende GLEICH, ist der Bogen nach F.6.2 nicht etwa
+//     ein Vollkreis, sondern er ENTFAELLT ganz. Wer stattdessen einen
+//     Kreis zeichnet, malt bei jedem zweiten Symbol einen Klecks.
+//   * Ist `rx` oder `ry` NULL, wird der Bogen zu einer GERADEN.
+//   * Sind die Radien ZU KLEIN, um die beiden Punkte zu verbinden, werden
+//     sie beide mit demselben Faktor VERGROESSERT (F.6.6.2), und zwar
+//     genau so weit, dass der Bogen aufgeht. Wer das weglaesst, bekommt
+//     unter der Wurzel eine negative Zahl und malt gar nichts -- das ist
+//     die Gegenprobe (i) in docs/ROUNDGRAFIK.md.
+//   * Die Radien werden mit dem BETRAG genommen; ein negativer Radius ist
+//     kein Fehler, sondern derselbe Bogen.
+import html.mem
+import font.raster
+import svg.matrix
+
+export {
+    Pfad,
+    V_ZUG, V_LINIE, V_QUAD, V_KUBIK, V_ZU,
+    pfad_neu, pfad_init, pfad_frei, pfad_leere, pfad_ok,
+    pfad_zug, pfad_linie, pfad_quad, pfad_kubik, pfad_zu,
+    pfad_verben, pfad_verb, pfad_punkte, pfad_px, pfad_py,
+    pfad_letzt_x, pfad_letzt_y, pfad_anfang_x, pfad_anfang_y,
+    pfad_ist_leer, pfad_hat_flaeche,
+    pfad_rechteck, pfad_rund_rechteck, pfad_ellipse, pfad_kreis,
+    pfad_bogen_zu, pfad_bogen_mitte,
+    zerteile_d, zerteile_punkte,
+    pfad_an_raster, pfad_grenzen, pfad_kopiere, pfad_anhaenge,
+    pfad_glaette,
+}
+
+// Die fuenf Befehlsarten. Mehr gibt es nicht, und das ist Absicht.
+const V_ZUG: u32 = 0 // moveto -- beginnt einen neuen Teilpfad
+const V_LINIE: u32 = 1 // lineto
+const V_QUAD: u32 = 2 // quadratic curveto, zwei Punkte
+const V_KUBIK: u32 = 3 // cubic curveto, drei Punkte
+const V_ZU: u32 = 4 // closepath, kein Punkt
+
+struct Pfad {
+    vb: mem.Buf, // ein Oktett je Befehl
+    pt: mem.Buf, // 16 Oktette je Punkt
+    lx: f64, // der aktuelle Punkt
+    ly: f64,
+    ax: f64, // der Anfang des laufenden Teilpfades (fuer `Z`)
+    ay: f64,
+    offen: usize, // 1, solange ein Teilpfad laeuft
+}
+
+#[no_gc]
+fn pfad_neu() -> Pfad {
+    return Pfad {
+        vb: mem.buf_new(),
+        pt: mem.buf_new(),
+        lx: 0.0,
+        ly: 0.0,
+        ax: 0.0,
+        ay: 0.0,
+        offen: 0,
+    }
+}
+
+#[no_gc]
+fn pfad_init(p: *mut Pfad) {
+    mem.buf_init(&(*p).vb)
+    mem.buf_init(&(*p).pt)
+    (*p).lx = 0.0
+    (*p).ly = 0.0
+    (*p).ax = 0.0
+    (*p).ay = 0.0
+    (*p).offen = 0
+}
+
+#[no_gc]
+fn pfad_frei(p: *mut Pfad) {
+    mem.buf_free(&(*p).vb)
+    mem.buf_free(&(*p).pt)
+    (*p).offen = 0
+}
+
+#[no_gc]
+fn pfad_leere(p: *mut Pfad) {
+    mem.buf_clear(&(*p).vb)
+    mem.buf_clear(&(*p).pt)
+    (*p).lx = 0.0
+    (*p).ly = 0.0
+    (*p).ax = 0.0
+    (*p).ay = 0.0
+    (*p).offen = 0
+}
+
+#[no_gc]
+fn pfad_ok(p: *mut Pfad) -> bool {
+    return true
+}
+
+#[no_gc]
+fn pfad_verben(p: *mut Pfad) -> usize {
+    return mem.buf_len(&(*p).vb)
+}
+
+#[no_gc]
+fn pfad_verb(p: *mut Pfad, i: usize) -> u32 {
+    return mem.buf_at(&(*p).vb, i) as u32
+}
+
+#[no_gc]
+fn pfad_punkte(p: *mut Pfad) -> usize {
+    return mem.buf_len(&(*p).pt) / 16
+}
+
+#[no_gc]
+fn pfad_px(p: *mut Pfad, i: usize) -> f64 {
+    if i >= pfad_punkte(p) {
+        return 0.0
+    }
+    return *((mem.buf_ptr(&(*p).pt) as u64 + (i * 16) as u64) as *mut f64)
+}
+
+#[no_gc]
+fn pfad_py(p: *mut Pfad, i: usize) -> f64 {
+    if i >= pfad_punkte(p) {
+        return 0.0
+    }
+    return *((mem.buf_ptr(&(*p).pt) as u64 + (i * 16 + 8) as u64) as *mut f64)
+}
+
+#[no_gc]
+fn pfad_letzt_x(p: *mut Pfad) -> f64 {
+    return (*p).lx
+}
+
+#[no_gc]
+fn pfad_letzt_y(p: *mut Pfad) -> f64 {
+    return (*p).ly
+}
+
+#[no_gc]
+fn pfad_anfang_x(p: *mut Pfad) -> f64 {
+    return (*p).ax
+}
+
+#[no_gc]
+fn pfad_anfang_y(p: *mut Pfad) -> f64 {
+    return (*p).ay
+}
+
+#[no_gc]
+fn pfad_ist_leer(p: *mut Pfad) -> bool {
+    return mem.buf_len(&(*p).vb) == 0
+}
+
+// Hat der Pfad ueberhaupt etwas, das eine Flaeche haben kann? Ein Pfad,
+// der nur aus `moveto` besteht, hat keine.
+#[no_gc]
+fn pfad_hat_flaeche(p: *mut Pfad) -> bool {
+    let n: usize = mem.buf_len(&(*p).vb)
+    var i: usize = 0
+    while i < n {
+        let v: u32 = mem.buf_at(&(*p).vb, i) as u32
+        if v == V_LINIE || v == V_QUAD || v == V_KUBIK {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+#[no_gc]
+fn punkt_an(p: *mut Pfad, x: f64, y: f64) {
+    let n: usize = mem.buf_len(&(*p).pt)
+    mem.buf_reserve(&(*p).pt, n + 16)
+    mem.buf_set_len(&(*p).pt, n + 16)
+    let b: u64 = mem.buf_ptr(&(*p).pt) as u64
+    *((b + n as u64) as *mut f64) = x
+    *((b + (n + 8) as u64) as *mut f64) = y
+}
+
+#[no_gc]
+fn pfad_zug(p: *mut Pfad, x: f64, y: f64) {
+    mem.buf_push(&(*p).vb, V_ZUG as u8)
+    punkt_an(p, x, y)
+    (*p).lx = x
+    (*p).ly = y
+    (*p).ax = x
+    (*p).ay = y
+    (*p).offen = 1
+}
+
+#[no_gc]
+fn pfad_linie(p: *mut Pfad, x: f64, y: f64) {
+    if (*p).offen == 0 {
+        pfad_zug(p, (*p).lx, (*p).ly)
+    }
+    mem.buf_push(&(*p).vb, V_LINIE as u8)
+    punkt_an(p, x, y)
+    (*p).lx = x
+    (*p).ly = y
+}
+
+#[no_gc]
+fn pfad_quad(p: *mut Pfad, cx: f64, cy: f64, x: f64, y: f64) {
+    if (*p).offen == 0 {
+        pfad_zug(p, (*p).lx, (*p).ly)
+    }
+    mem.buf_push(&(*p).vb, V_QUAD as u8)
+    punkt_an(p, cx, cy)
+    punkt_an(p, x, y)
+    (*p).lx = x
+    (*p).ly = y
+}
+
+#[no_gc]
+fn pfad_kubik(p: *mut Pfad, c1x: f64, c1y: f64, c2x: f64, c2y: f64,
+    x: f64, y: f64) {
+    if (*p).offen == 0 {
+        pfad_zug(p, (*p).lx, (*p).ly)
+    }
+    mem.buf_push(&(*p).vb, V_KUBIK as u8)
+    punkt_an(p, c1x, c1y)
+    punkt_an(p, c2x, c2y)
+    punkt_an(p, x, y)
+    (*p).lx = x
+    (*p).ly = y
+}
+
+// `closepath`. Der aktuelle Punkt springt zurueck auf den Anfang des
+// Teilpfades -- das ist der Unterschied, den ein `M 10 10 L 20 20 Z l 5 0`
+// sichtbar macht: das `l` beginnt bei (10,10) und nicht bei (20,20).
+#[no_gc]
+fn pfad_zu(p: *mut Pfad) {
+    if (*p).offen == 0 {
+        return
+    }
+    mem.buf_push(&(*p).vb, V_ZU as u8)
+    (*p).lx = (*p).ax
+    (*p).ly = (*p).ay
+    (*p).offen = 0
+}
+
+// ----------------------------------------------------------- Grundformen
+
+#[no_gc]
+fn pfad_rechteck(p: *mut Pfad, x: f64, y: f64, w: f64, h: f64) {
+    if w <= 0.0 || h <= 0.0 {
+        return
+    }
+    pfad_zug(p, x, y)
+    pfad_linie(p, x + w, y)
+    pfad_linie(p, x + w, y + h)
+    pfad_linie(p, x, y + h)
+    pfad_zu(p)
+}
+
+// Die Zahl, mit der ein Viertelkreis als kubische Bezier gebaut wird:
+// 4/3 * (sqrt(2) - 1). Als Funktion, weil `const` in dieser Sprache nur
+// ganze Zahlen kennt (SPEC 14.1, Punkt 4).
+#[no_gc]
+fn kappa() -> f64 {
+    return 0.5522847498307936
+}
+
+// `rect` mit `rx`/`ry`, nach SVG 1.1 Abschnitt 9.2: die Ecken sind
+// Viertelellipsen, und zu grosse Radien werden auf die halbe Seitenlaenge
+// gekuerzt.
+#[no_gc]
+fn pfad_rund_rechteck(p: *mut Pfad, x: f64, y: f64, w: f64, h: f64,
+    rx_in: f64, ry_in: f64) {
+    if w <= 0.0 || h <= 0.0 {
+        return
+    }
+    var rx: f64 = rx_in
+    var ry: f64 = ry_in
+    if rx < 0.0 {
+        rx = 0.0
+    }
+    if ry < 0.0 {
+        ry = 0.0
+    }
+    if rx > w / 2.0 {
+        rx = w / 2.0
+    }
+    if ry > h / 2.0 {
+        ry = h / 2.0
+    }
+    if rx <= 0.0 || ry <= 0.0 {
+        pfad_rechteck(p, x, y, w, h)
+        return
+    }
+    let kx: f64 = rx * kappa()
+    let ky: f64 = ry * kappa()
+    let x1: f64 = x + w
+    let y1: f64 = y + h
+    pfad_zug(p, x + rx, y)
+    pfad_linie(p, x1 - rx, y)
+    pfad_kubik(p, x1 - rx + kx, y, x1, y + ry - ky, x1, y + ry)
+    pfad_linie(p, x1, y1 - ry)
+    pfad_kubik(p, x1, y1 - ry + ky, x1 - rx + kx, y1, x1 - rx, y1)
+    pfad_linie(p, x + rx, y1)
+    pfad_kubik(p, x + rx - kx, y1, x, y1 - ry + ky, x, y1 - ry)
+    pfad_linie(p, x, y + ry)
+    pfad_kubik(p, x, y + ry - ky, x + rx - kx, y, x + rx, y)
+    pfad_zu(p)
+}
+
+// Eine Ellipse aus vier Viertelbogen. Die Richtung ist im Uhrzeigersinn
+// im Bildschirmsystem (y nach unten) -- dieselbe wie bei `rect`, damit
+// ein Loch in einer Figur mit `fill-rule: nonzero` nur dann eines ist,
+// wenn es wirklich andersherum laeuft.
+#[no_gc]
+fn pfad_ellipse(p: *mut Pfad, cx: f64, cy: f64, rx: f64, ry: f64) {
+    if rx <= 0.0 || ry <= 0.0 {
+        return
+    }
+    let kx: f64 = rx * kappa()
+    let ky: f64 = ry * kappa()
+    pfad_zug(p, cx + rx, cy)
+    pfad_kubik(p, cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry)
+    pfad_kubik(p, cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy)
+    pfad_kubik(p, cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry)
+    pfad_kubik(p, cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy)
+    pfad_zu(p)
+}
+
+#[no_gc]
+fn pfad_kreis(p: *mut Pfad, cx: f64, cy: f64, r: f64) {
+    pfad_ellipse(p, cx, cy, r, r)
+}
+
+// ---------------------------------------------------------- Der Bogen
+//
+// Ein Bogenstueck in MITTELPUNKT-Darstellung als kubische Beziers. Die
+// Winkel stehen in GRAD, `dtheta` darf negativ sein.
+//
+// Die Naeherung eines Ellipsenbogens durch eine kubische Bezier ist gut,
+// solange das Stueck nicht zu gross ist; bei 90 Grad liegt der Fehler bei
+// 2,7e-4 des Radius, also bei einem Radius von 1000 Bildpunkten unter
+// einem drittel Bildpunkt. Darum wird jeder Bogen in Stuecke von
+// hoechstens 90 Grad zerlegt.
+#[no_gc]
+fn pfad_bogen_mitte(p: *mut Pfad, cx: f64, cy: f64, rx: f64, ry: f64,
+    phi: f64, theta1: f64, dtheta: f64) {
+    var d: f64 = dtheta
+    if d == 0.0 {
+        return
+    }
+    var stuecke: i64 = ((matrix.m_abs(d) / 90.0) as i64) + 1
+    if stuecke > 64 {
+        stuecke = 64
+    }
+    let schritt: f64 = d / (stuecke as f64)
+    // alpha = 4/3 * tan(schritt/4), die Laenge der Tangentenstuecke.
+    let alpha: f64 = 4.0 / 3.0 * matrix.m_tan(schritt / 4.0)
+    let cphi: f64 = matrix.m_cos(phi)
+    let sphi: f64 = matrix.m_sin(phi)
+    var k: i64 = 0
+    var t: f64 = theta1
+    while k < stuecke {
+        let t2: f64 = t + schritt
+        let c1: f64 = matrix.m_cos(t)
+        let s1: f64 = matrix.m_sin(t)
+        let c2: f64 = matrix.m_cos(t2)
+        let s2: f64 = matrix.m_sin(t2)
+        // E(t) und E'(t) in Weltkoordinaten.
+        let e1x: f64 = cx + rx * c1 * cphi - ry * s1 * sphi
+        let e1y: f64 = cy + rx * c1 * sphi + ry * s1 * cphi
+        let e2x: f64 = cx + rx * c2 * cphi - ry * s2 * sphi
+        let e2y: f64 = cy + rx * c2 * sphi + ry * s2 * cphi
+        let d1x: f64 = 0.0 - rx * s1 * cphi - ry * c1 * sphi
+        let d1y: f64 = 0.0 - rx * s1 * sphi + ry * c1 * cphi
+        let d2x: f64 = 0.0 - rx * s2 * cphi - ry * c2 * sphi
+        let d2y: f64 = 0.0 - rx * s2 * sphi + ry * c2 * cphi
+        pfad_kubik(p, e1x + alpha * d1x, e1y + alpha * d1y,
+            e2x - alpha * d2x, e2y - alpha * d2y, e2x, e2y)
+        t = t2
+        k = k + 1
+    }
+}
+
+// Der Winkel zwischen zwei Vektoren, in Grad, mit Vorzeichen, in
+// (-180, 180].
+#[no_gc]
+fn winkel(ux: f64, uy: f64, vx: f64, vy: f64) -> f64 {
+    return matrix.m_atan2_grad(ux * vy - uy * vx, ux * vx + uy * vy)
+}
+
+// DER BOGEN IN ENDPUNKT-DARSTELLUNG -- SVG 1.1, F.6.5 und F.6.6.
+// Anfangspunkt ist der aktuelle Punkt des Pfades.
+#[no_gc]
+fn pfad_bogen_zu(p: *mut Pfad, rx_in: f64, ry_in: f64, phi_in: f64,
+    gross: bool, sweep: bool, x2: f64, y2: f64) {
+    let x1: f64 = (*p).lx
+    let y1: f64 = (*p).ly
+    // F.6.2: gleicher Anfang und gleiches Ende -> der Bogen ENTFAELLT.
+    if x1 == x2 && y1 == y2 {
+        return
+    }
+    var rx: f64 = matrix.m_abs(rx_in)
+    var ry: f64 = matrix.m_abs(ry_in)
+    // F.6.2: ein Radius von null -> eine GERADE.
+    if rx == 0.0 || ry == 0.0 {
+        pfad_linie(p, x2, y2)
+        return
+    }
+    let phi: f64 = phi_in
+    let cphi: f64 = matrix.m_cos(phi)
+    let sphi: f64 = matrix.m_sin(phi)
+    // Schritt 1: in das gedrehte, auf die Mitte der Sehne bezogene System.
+    let hx: f64 = (x1 - x2) / 2.0
+    let hy: f64 = (y1 - y2) / 2.0
+    let x1s: f64 = cphi * hx + sphi * hy
+    let y1s: f64 = 0.0 - sphi * hx + cphi * hy
+    // F.6.6.2: zu kleine Radien werden VERGROESSERT, beide mit demselben
+    // Faktor. Ohne das steht unter der Wurzel in Schritt 2 eine negative
+    // Zahl.
+    var rx2: f64 = rx * rx
+    var ry2: f64 = ry * ry
+    let lam: f64 = x1s * x1s / rx2 + y1s * y1s / ry2
+    if lam > 1.0 {
+        let s: f64 = matrix.m_sqrt(lam)
+        rx = rx * s
+        ry = ry * s
+        rx2 = rx * rx
+        ry2 = ry * ry
+    }
+    // Schritt 2: der Mittelpunkt im gedrehten System.
+    let nenner: f64 = rx2 * y1s * y1s + ry2 * x1s * x1s
+    var faktor: f64 = 0.0
+    if nenner > 0.0 {
+        var z: f64 = (rx2 * ry2 - nenner) / nenner
+        if z < 0.0 {
+            // Nur Rundung; nach der Korrektur oben kann das hoechstens
+            // eine winzige negative Zahl sein.
+            z = 0.0
+        }
+        faktor = matrix.m_sqrt(z)
+    }
+    if gross == sweep {
+        faktor = 0.0 - faktor
+    }
+    let cxs: f64 = faktor * rx * y1s / ry
+    let cys: f64 = 0.0 - faktor * ry * x1s / rx
+    // Schritt 3: zurueck in das Weltsystem.
+    let cx: f64 = cphi * cxs - sphi * cys + (x1 + x2) / 2.0
+    let cy: f64 = sphi * cxs + cphi * cys + (y1 + y2) / 2.0
+    // Schritt 4: Anfangswinkel und ueberstrichener Winkel.
+    let ux: f64 = (x1s - cxs) / rx
+    let uy: f64 = (y1s - cys) / ry
+    let vx: f64 = (0.0 - x1s - cxs) / rx
+    let vy: f64 = (0.0 - y1s - cys) / ry
+    let theta1: f64 = matrix.m_atan2_grad(uy, ux)
+    var dtheta: f64 = winkel(ux, uy, vx, vy)
+    if !sweep && dtheta > 0.0 {
+        dtheta = dtheta - 360.0
+    }
+    if sweep && dtheta < 0.0 {
+        dtheta = dtheta + 360.0
+    }
+    pfad_bogen_mitte(p, cx, cy, rx, ry, phi, theta1, dtheta)
+    // Der Endpunkt wird EXAKT gesetzt und nicht aus der Bezier
+    // uebernommen: die Naeherung trifft ihn auf 1e-16 genau, und ein
+    // folgendes `z` soll auf den Punkt zurueckgehen, der im Text steht.
+    (*p).lx = x2
+    (*p).ly = y2
+}
+
+// ------------------------------------------------------- Das `d`-Attribut
+//
+// Die Grammatik von SVG 1.1, Anhang F.10 -- kurz gesagt:
+//
+//   * ein Buchstabe, dann so viele Zahlen, wie der Befehl braucht;
+//   * folgen NOCH MEHR Zahlen, wird derselbe Befehl wiederholt. Die
+//     Ausnahme ist `M`/`m`: eine Wiederholung von `M` ist ein `L`, eine
+//     Wiederholung von `m` ein `l`. Das ist die Regel, die fast jede
+//     handgeschriebene Fassung vergisst, und ohne sie wird aus jedem
+//     Polygon eine Punktwolke.
+//   * Kleinbuchstaben sind RELATIV zum aktuellen Punkt.
+//   * `S`/`s` und `T`/`t` spiegeln den letzten Kontrollpunkt. Kam davor
+//     KEINE Kurve derselben Art, ist der gespiegelte Kontrollpunkt der
+//     aktuelle Punkt selbst.
+//   * Bei den Flags von `A` ist EIN Zeichen ein Flag: `a1 1 0 011 5 5` ist
+//     gueltig und heisst gross=0, sweep=1, x=1. Wer hier `zahl` aufruft,
+//     liest 011 als elf und malt Unsinn.
+//
+// FEHLER: die Verarbeitung bricht ab, der Pfad bis dahin BLEIBT. So sagt
+// es die Spezifikation (F.10, "error handling"), und so macht es Chromium.
+
+#[no_gc]
+fn ist_buchstabe(c: u32) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+#[no_gc]
+fn klein(c: u32) -> u32 {
+    if c >= 65 && c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+// Ein Flag von `A`: genau ein Zeichen, `0` oder `1`.
+#[no_gc]
+fn flagge(p: u64, n: usize, i: *mut usize, ok: *mut bool) -> bool {
+    matrix.ueberspringe_trenner(p, n, i)
+    if *i >= n {
+        *ok = false
+        return false
+    }
+    let c: u32 = matrix.lies_oktett(p, *i)
+    if c == 48 {
+        *i = *i + 1
+        *ok = true
+        return false
+    }
+    if c == 49 {
+        *i = *i + 1
+        *ok = true
+        return true
+    }
+    *ok = false
+    return false
+}
+
+#[no_gc]
+fn naechste_zahl(p: u64, n: usize, i: *mut usize, ok: *mut bool) -> f64 {
+    matrix.ueberspringe_trenner(p, n, i)
+    return matrix.zahl(p, n, i, ok)
+}
+
+// Steht an dieser Stelle noch eine Zahl (also eine Wiederholung des
+// Befehls)?
+#[no_gc]
+fn noch_eine_zahl(p: u64, n: usize, i: usize) -> bool {
+    var j: usize = i
+    matrix.ueberspringe_trenner(p, n, &j)
+    if j >= n {
+        return false
+    }
+    let c: u32 = matrix.lies_oktett(p, j)
+    return matrix.ist_ziffer(c) || c == 43 || c == 45 || c == 46
+}
+
+#[no_gc]
+fn zerteile_d(pf: *mut Pfad, p: u64, n: usize) -> bool {
+    var i: usize = 0
+    var befehl: u32 = 0
+    var hatte: bool = false
+    // Der gespiegelte Kontrollpunkt: `sk` fuer S/s (kubisch), `sq` fuer
+    // T/t (quadratisch). Steht `gilt` auf 0, ist er der aktuelle Punkt.
+    var skx: f64 = 0.0
+    var sky: f64 = 0.0
+    var sk_gilt: usize = 0
+    var sqx: f64 = 0.0
+    var sqy: f64 = 0.0
+    var sq_gilt: usize = 0
+    matrix.ueberspringe_leer(p, n, &i)
+    while i < n {
+        var c: u32 = matrix.lies_oktett(p, i)
+        if ist_buchstabe(c) {
+            befehl = c
+            i = i + 1
+        } else if !hatte {
+            // Ein `d`, das nicht mit einem Buchstaben beginnt, ist
+            // ungueltig -- und ein `d`, das nicht mit `M` oder `m`
+            // beginnt, ebenfalls.
+            return false
+        } else if !noch_eine_zahl(p, n, i) {
+            return false
+        }
+        let kb: u32 = klein(befehl)
+        let rel: bool = befehl >= 97
+        if !hatte && kb != 109 {
+            return false
+        }
+        hatte = true
+        var ok: bool = false
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        if rel {
+            bx = (*pf).lx
+            by = (*pf).ly
+        }
+        if kb == 109 {
+            // M / m
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_zug(pf, x, y)
+            sk_gilt = 0
+            sq_gilt = 0
+            // Die Wiederholung eines `M` ist ein `L`.
+            if befehl == 77 {
+                befehl = 76
+            } else {
+                befehl = 108
+            }
+        } else if kb == 108 {
+            // L / l
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_linie(pf, x, y)
+            sk_gilt = 0
+            sq_gilt = 0
+        } else if kb == 104 {
+            // H / h
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            pfad_linie(pf, x, (*pf).ly)
+            sk_gilt = 0
+            sq_gilt = 0
+        } else if kb == 118 {
+            // V / v
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_linie(pf, (*pf).lx, y)
+            sk_gilt = 0
+            sq_gilt = 0
+        } else if kb == 99 {
+            // C / c
+            let ax: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let ay: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            let cx: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let cy: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_kubik(pf, ax, ay, cx, cy, x, y)
+            skx = cx
+            sky = cy
+            sk_gilt = 1
+            sq_gilt = 0
+        } else if kb == 115 {
+            // S / s -- der erste Kontrollpunkt ist die Spiegelung des
+            // zweiten der vorigen kubischen Kurve am aktuellen Punkt.
+            var ax: f64 = (*pf).lx
+            var ay: f64 = (*pf).ly
+            if sk_gilt == 1 {
+                ax = 2.0 * (*pf).lx - skx
+                ay = 2.0 * (*pf).ly - sky
+            }
+            let cx: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let cy: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_kubik(pf, ax, ay, cx, cy, x, y)
+            skx = cx
+            sky = cy
+            sk_gilt = 1
+            sq_gilt = 0
+        } else if kb == 113 {
+            // Q / q
+            let cx: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let cy: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_quad(pf, cx, cy, x, y)
+            sqx = cx
+            sqy = cy
+            sq_gilt = 1
+            sk_gilt = 0
+        } else if kb == 116 {
+            // T / t
+            var cx: f64 = (*pf).lx
+            var cy: f64 = (*pf).ly
+            if sq_gilt == 1 {
+                cx = 2.0 * (*pf).lx - sqx
+                cy = 2.0 * (*pf).ly - sqy
+            }
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_quad(pf, cx, cy, x, y)
+            sqx = cx
+            sqy = cy
+            sq_gilt = 1
+            sk_gilt = 0
+        } else if kb == 97 {
+            // A / a
+            let rx: f64 = naechste_zahl(p, n, &i, &ok)
+            if !ok {
+                return false
+            }
+            let ry: f64 = naechste_zahl(p, n, &i, &ok)
+            if !ok {
+                return false
+            }
+            let dr: f64 = naechste_zahl(p, n, &i, &ok)
+            if !ok {
+                return false
+            }
+            let gross: bool = flagge(p, n, &i, &ok)
+            if !ok {
+                return false
+            }
+            let sweep: bool = flagge(p, n, &i, &ok)
+            if !ok {
+                return false
+            }
+            let x: f64 = naechste_zahl(p, n, &i, &ok) + bx
+            if !ok {
+                return false
+            }
+            let y: f64 = naechste_zahl(p, n, &i, &ok) + by
+            if !ok {
+                return false
+            }
+            pfad_bogen_zu(pf, rx, ry, dr, gross, sweep, x, y)
+            sk_gilt = 0
+            sq_gilt = 0
+        } else if kb == 122 {
+            // Z / z
+            pfad_zu(pf)
+            sk_gilt = 0
+            sq_gilt = 0
+        } else {
+            return false
+        }
+        matrix.ueberspringe_leer(p, n, &i)
+    }
+    return true
+}
+
+// `points` von `polyline` und `polygon`: nur Zahlenpaare. `zu` sagt, ob am
+// Ende geschlossen wird (`polygon` ja, `polyline` nein).
+//
+// FEHLERTOLERANZ wie in SVG 1.1, 9.7: eine ungerade Zahl von Werten oder
+// ein Schrott am Ende laesst alles STEHEN, was bis dahin gelesen wurde.
+#[no_gc]
+fn zerteile_punkte(pf: *mut Pfad, p: u64, n: usize, zu: bool) -> bool {
+    var i: usize = 0
+    var erster: bool = true
+    matrix.ueberspringe_leer(p, n, &i)
+    while i < n {
+        var ok: bool = false
+        let x: f64 = matrix.zahl(p, n, &i, &ok)
+        if !ok {
+            break
+        }
+        matrix.ueberspringe_trenner(p, n, &i)
+        var ok2: bool = false
+        let y: f64 = matrix.zahl(p, n, &i, &ok2)
+        if !ok2 {
+            break
+        }
+        if erster {
+            pfad_zug(pf, x, y)
+            erster = false
+        } else {
+            pfad_linie(pf, x, y)
+        }
+        matrix.ueberspringe_trenner(p, n, &i)
+    }
+    if !erster && zu {
+        pfad_zu(pf)
+    }
+    return !erster
+}
+
+// ------------------------------------------------------- In den Rasterer
+//
+// Der Pfad wird durch die Matrix geschickt und dem Rasterer von
+// lib/font/raster.fi uebergeben. Zwei Dinge passieren dabei:
+//
+//   * jeder Teilpfad wird GESCHLOSSEN, auch wenn kein `Z` da stand. Fuer
+//     eine FUELLUNG ist das die Regel der Spezifikation; fuer einen
+//     STRICH gilt sie nicht, aber der geht nicht hier durch, sondern
+//     durch lib/svg/strich.fi, der schon einen geschlossenen Umriss
+//     liefert.
+//   * die Kurven werden NICHT hier unterteilt: `raster_quad` und
+//     `raster_cubic` machen das selbst und richten die Feinheit nach der
+//     Laenge der Kurve. Die Punkte kommen also transformiert, aber als
+//     Kurve.
+#[no_gc]
+fn pfad_an_raster(pf: *mut Pfad, r: *mut raster.Raster, m: matrix.Mat) {
+    let nv: usize = mem.buf_len(&(*pf).vb)
+    var pi: usize = 0
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var sx: f64 = 0.0
+    var sy: f64 = 0.0
+    var offen: bool = false
+    var i: usize = 0
+    while i < nv {
+        let v: u32 = mem.buf_at(&(*pf).vb, i) as u32
+        if v == V_ZUG {
+            if offen && (cx != sx || cy != sy) {
+                raster.raster_line(r, cx, cy, sx, sy)
+            }
+            let x: f64 = pfad_px(pf, pi)
+            let y: f64 = pfad_py(pf, pi)
+            pi = pi + 1
+            cx = matrix.mat_x(m, x, y)
+            cy = matrix.mat_y(m, x, y)
+            sx = cx
+            sy = cy
+            offen = true
+        } else if v == V_LINIE {
+            let x: f64 = pfad_px(pf, pi)
+            let y: f64 = pfad_py(pf, pi)
+            pi = pi + 1
+            let nx: f64 = matrix.mat_x(m, x, y)
+            let ny: f64 = matrix.mat_y(m, x, y)
+            raster.raster_line(r, cx, cy, nx, ny)
+            cx = nx
+            cy = ny
+        } else if v == V_QUAD {
+            let ax: f64 = pfad_px(pf, pi)
+            let ay: f64 = pfad_py(pf, pi)
+            let bx: f64 = pfad_px(pf, pi + 1)
+            let by: f64 = pfad_py(pf, pi + 1)
+            pi = pi + 2
+            let qx: f64 = matrix.mat_x(m, ax, ay)
+            let qy: f64 = matrix.mat_y(m, ax, ay)
+            let nx: f64 = matrix.mat_x(m, bx, by)
+            let ny: f64 = matrix.mat_y(m, bx, by)
+            raster.raster_quad(r, cx, cy, qx, qy, nx, ny)
+            cx = nx
+            cy = ny
+        } else if v == V_KUBIK {
+            let ax: f64 = pfad_px(pf, pi)
+            let ay: f64 = pfad_py(pf, pi)
+            let bx: f64 = pfad_px(pf, pi + 1)
+            let by: f64 = pfad_py(pf, pi + 1)
+            let ex: f64 = pfad_px(pf, pi + 2)
+            let ey: f64 = pfad_py(pf, pi + 2)
+            pi = pi + 3
+            let c1x: f64 = matrix.mat_x(m, ax, ay)
+            let c1y: f64 = matrix.mat_y(m, ax, ay)
+            let c2x: f64 = matrix.mat_x(m, bx, by)
+            let c2y: f64 = matrix.mat_y(m, bx, by)
+            let nx: f64 = matrix.mat_x(m, ex, ey)
+            let ny: f64 = matrix.mat_y(m, ex, ey)
+            raster.raster_cubic(r, cx, cy, c1x, c1y, c2x, c2y, nx, ny)
+            cx = nx
+            cy = ny
+        } else {
+            if offen && (cx != sx || cy != sy) {
+                raster.raster_line(r, cx, cy, sx, sy)
+            }
+            cx = sx
+            cy = sy
+            offen = false
+        }
+        i = i + 1
+    }
+    if offen && (cx != sx || cy != sy) {
+        raster.raster_line(r, cx, cy, sx, sy)
+    }
+}
+
+// Die Umgrenzung des Pfades NACH der Abbildung. Fuer Kurven wird das
+// Kontrollpolygon genommen -- das ist etwas zu gross, aber nie zu klein,
+// und ein zu grosses Fenster kostet nur Zeit, ein zu kleines schneidet
+// das Bild ab.
+#[no_gc]
+fn pfad_grenzen(pf: *mut Pfad, m: matrix.Mat, x0: *mut f64, y0: *mut f64,
+    x1: *mut f64, y1: *mut f64) -> bool {
+    let np: usize = pfad_punkte(pf)
+    if np == 0 {
+        return false
+    }
+    var ax: f64 = 1.0e300
+    var ay: f64 = 1.0e300
+    var bx: f64 = 0.0 - 1.0e300
+    var by: f64 = 0.0 - 1.0e300
+    var i: usize = 0
+    while i < np {
+        let x: f64 = matrix.mat_x(m, pfad_px(pf, i), pfad_py(pf, i))
+        let y: f64 = matrix.mat_y(m, pfad_px(pf, i), pfad_py(pf, i))
+        if x < ax {
+            ax = x
+        }
+        if y < ay {
+            ay = y
+        }
+        if x > bx {
+            bx = x
+        }
+        if y > by {
+            by = y
+        }
+        i = i + 1
+    }
+    *x0 = ax
+    *y0 = ay
+    *x1 = bx
+    *y1 = by
+    return true
+}
+
+#[no_gc]
+fn pfad_kopiere(ziel: *mut Pfad, quelle: *mut Pfad) {
+    pfad_leere(ziel)
+    pfad_anhaenge(ziel, quelle, matrix.mat_eins())
+}
+
+// Einen Pfad an einen anderen anhaengen, durch eine Matrix geschickt.
+#[no_gc]
+fn pfad_anhaenge(ziel: *mut Pfad, quelle: *mut Pfad, m: matrix.Mat) {
+    let nv: usize = mem.buf_len(&(*quelle).vb)
+    var pi: usize = 0
+    var i: usize = 0
+    while i < nv {
+        let v: u32 = mem.buf_at(&(*quelle).vb, i) as u32
+        if v == V_ZUG {
+            let x: f64 = pfad_px(quelle, pi)
+            let y: f64 = pfad_py(quelle, pi)
+            pi = pi + 1
+            pfad_zug(ziel, matrix.mat_x(m, x, y), matrix.mat_y(m, x, y))
+        } else if v == V_LINIE {
+            let x: f64 = pfad_px(quelle, pi)
+            let y: f64 = pfad_py(quelle, pi)
+            pi = pi + 1
+            pfad_linie(ziel, matrix.mat_x(m, x, y), matrix.mat_y(m, x, y))
+        } else if v == V_QUAD {
+            let ax: f64 = pfad_px(quelle, pi)
+            let ay: f64 = pfad_py(quelle, pi)
+            let bx: f64 = pfad_px(quelle, pi + 1)
+            let by: f64 = pfad_py(quelle, pi + 1)
+            pi = pi + 2
+            pfad_quad(ziel, matrix.mat_x(m, ax, ay), matrix.mat_y(m, ax, ay),
+                matrix.mat_x(m, bx, by), matrix.mat_y(m, bx, by))
+        } else if v == V_KUBIK {
+            let ax: f64 = pfad_px(quelle, pi)
+            let ay: f64 = pfad_py(quelle, pi)
+            let bx: f64 = pfad_px(quelle, pi + 1)
+            let by: f64 = pfad_py(quelle, pi + 1)
+            let ex: f64 = pfad_px(quelle, pi + 2)
+            let ey: f64 = pfad_py(quelle, pi + 2)
+            pi = pi + 3
+            pfad_kubik(ziel, matrix.mat_x(m, ax, ay), matrix.mat_y(m, ax, ay),
+                matrix.mat_x(m, bx, by), matrix.mat_y(m, bx, by),
+                matrix.mat_x(m, ex, ey), matrix.mat_y(m, ex, ey))
+        } else {
+            pfad_zu(ziel)
+        }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------- Das Glaetten
+//
+// Fuer das Bestreichen muessen die Kurven zu Strecken werden -- eine
+// Strichbreite laesst sich an einer Bezier nicht direkt absetzen. Die
+// Feinheit richtet sich nach der Groesse der Kurve NACH der Abbildung
+// (`mass`, das Laengenmass der Matrix): eine Kurve, die auf dem Schirm
+// zwei Bildpunkte gross ist, braucht keine 32 Stuecke.
+//
+// Das Ergebnis ist wieder ein `Pfad`, aber nur aus `V_ZUG`, `V_LINIE` und
+// `V_ZU`.
+// Wieviele Strecken eine Kurve der Groesse `d` (in Bildpunkten) braucht.
+//
+// Der Sehnenfehler einer in `n` gleiche Stuecke geteilten Kurve faellt
+// mit `1/n^2`; fuer eine Zielgenauigkeit von etwa einem funfzigstel
+// Bildpunkt ist `n ~ 2,5 * sqrt(d)` die richtige Groessenordnung. Der
+// Faktor ist GEMESSEN und nicht geschaetzt: gegen Chromium gehalten
+// (tools/graphics/chrome_svg.py, Fall 04) sinkt die groesste Abweichung von
+// 73 bei 1,5 auf 63 bei 2,5 und danach nur noch auf 60 bei 6,0 -- der
+// Rest ist nicht mehr die Sehne, sondern die andere Kantenglaettung und
+// die Vier-Bezier-Naeherung des Kreises selbst.
+#[no_gc]
+fn stuecke_fuer(d: f64) -> i64 {
+    var s: i64 = ((matrix.m_sqrt(d) * 2.5) as i64) + 1
+    if s < 1 {
+        s = 1
+    }
+    if s > 400 {
+        s = 400
+    }
+    return s
+}
+
+#[no_gc]
+fn pfad_glaette(ziel: *mut Pfad, quelle: *mut Pfad, mass: f64) {
+    pfad_leere(ziel)
+    let nv: usize = mem.buf_len(&(*quelle).vb)
+    var pi: usize = 0
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var i: usize = 0
+    var m: f64 = mass
+    if m <= 0.0 {
+        m = 1.0
+    }
+    while i < nv {
+        let v: u32 = mem.buf_at(&(*quelle).vb, i) as u32
+        if v == V_ZUG {
+            cx = pfad_px(quelle, pi)
+            cy = pfad_py(quelle, pi)
+            pi = pi + 1
+            pfad_zug(ziel, cx, cy)
+        } else if v == V_LINIE {
+            cx = pfad_px(quelle, pi)
+            cy = pfad_py(quelle, pi)
+            pi = pi + 1
+            pfad_linie(ziel, cx, cy)
+        } else if v == V_QUAD {
+            let ax: f64 = pfad_px(quelle, pi)
+            let ay: f64 = pfad_py(quelle, pi)
+            let bx: f64 = pfad_px(quelle, pi + 1)
+            let by: f64 = pfad_py(quelle, pi + 1)
+            pi = pi + 2
+            let d: f64 = (matrix.m_abs(ax - cx) + matrix.m_abs(ay - cy)
+                + matrix.m_abs(bx - ax) + matrix.m_abs(by - ay)) * m
+            let s: i64 = stuecke_fuer(d)
+            var k: i64 = 1
+            while k <= s {
+                let t: f64 = (k as f64) / (s as f64)
+                let u: f64 = 1.0 - t
+                let x: f64 = u * u * cx + 2.0 * u * t * ax + t * t * bx
+                let y: f64 = u * u * cy + 2.0 * u * t * ay + t * t * by
+                pfad_linie(ziel, x, y)
+                k = k + 1
+            }
+            cx = bx
+            cy = by
+        } else if v == V_KUBIK {
+            let ax: f64 = pfad_px(quelle, pi)
+            let ay: f64 = pfad_py(quelle, pi)
+            let bx: f64 = pfad_px(quelle, pi + 1)
+            let by: f64 = pfad_py(quelle, pi + 1)
+            let ex: f64 = pfad_px(quelle, pi + 2)
+            let ey: f64 = pfad_py(quelle, pi + 2)
+            pi = pi + 3
+            let d: f64 = (matrix.m_abs(ax - cx) + matrix.m_abs(ay - cy)
+                + matrix.m_abs(bx - ax) + matrix.m_abs(by - ay)
+                + matrix.m_abs(ex - bx) + matrix.m_abs(ey - by)) * m
+            let s: i64 = stuecke_fuer(d)
+            var k: i64 = 1
+            while k <= s {
+                let t: f64 = (k as f64) / (s as f64)
+                let u: f64 = 1.0 - t
+                let x: f64 = u * u * u * cx + 3.0 * u * u * t * ax
+                    + 3.0 * u * t * t * bx + t * t * t * ex
+                let y: f64 = u * u * u * cy + 3.0 * u * u * t * ay
+                    + 3.0 * u * t * t * by + t * t * t * ey
+                pfad_linie(ziel, x, y)
+                k = k + 1
+            }
+            cx = ex
+            cy = ey
+        } else {
+            pfad_zu(ziel)
+            cx = (*ziel).lx
+            cy = (*ziel).ly
+        }
+        i = i + 1
+    }
+}

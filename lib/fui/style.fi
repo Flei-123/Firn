@@ -84,7 +84,9 @@ export {
     SF_PAD_Y, SF_FONT_PX, SF_WEIGHT, SF_SLANT, SF_ALIGN, SF_ALPHA,
     SF_FONT_ID,
     SF_TRACKING, SF_WORD_SPACING, SF_LINE_HEIGHT, SF_KERNING,
-    SF_OUTLINE, SF_SHADOW, SF_GRADIENT,
+    SF_OUTLINE, SF_SHADOW, SF_GRADIENT, SF_WIDTH, SF_HEIGHT,
+    SF_DIRECTION, DIR_AUTO, DIR_LTR, DIR_RTL,
+    style_set_direction, style_direction,
     style_set_bg, style_set_border, style_set_fg,
     style_set_radius, style_set_border_width, style_set_pad,
     style_set_font, style_set_weight, style_set_slant,
@@ -93,6 +95,9 @@ export {
     style_set_line_height, style_set_line_height_px,
     style_set_kerning, style_set_outline, style_set_shadow,
     style_set_gradient,
+    style_set_width, style_set_height, style_set_size,
+    style_width, style_height, style_has_width, style_has_height,
+    style_unset,
     override_set_bg, override_set_border, override_set_fg,
     override_set_alpha,
     resolve_bg, resolve_border, resolve_fg, resolve_alpha,
@@ -231,6 +236,38 @@ const SF_KERNING: u32 = 65536
 const SF_OUTLINE: u32 = 131072
 const SF_SHADOW: u32 = 262144
 const SF_GRADIENT: u32 = 524288
+// ---- DIE GROESSE, seit dem 23.09.2026. Bis dahin stand sie NUR im
+// Baum (scene.node_set_size): jede Zeilenhoehe, jede Knopfhoehe war
+// eine Zahl mitten in der Gliederung, und wer sie aendern wollte,
+// musste jede Stelle einzeln suchen. Im Web steht sie im Stilblatt,
+// aus genau dem Grund, aus dem auch Farbe und Radius dort stehen --
+// sie gilt fuer eine KLASSE von Dingen, nicht fuer ein einzelnes.
+//
+// Vererbt wird sie NICHT (sheet.INHERIT_MASK nennt sie nicht): ein
+// Kind, das die Hoehe seines Kastens erbte, waere immer so hoch wie
+// sein Elternteil.
+const SF_WIDTH: u32 = 1048576
+const SF_HEIGHT: u32 = 2097152
+// ---- DIE SCHREIBRICHTUNG, seit dem 23.09.2026 (Runde Bidi). `direction`
+// wie im Web: ltr oder rtl, und ohne Angabe entscheidet das erste starke
+// Zeichen des Textes (UAX #9, P2/P3 -- lib/fui/bidi.fi). Anders als die
+// Groesse wird sie VERERBT (sheet.INHERIT_MASK nennt sie): ein Dialog,
+// der auf Arabisch umgestellt wird, stellt alles in ihm um, und genau
+// das erwartet jeder, der `dir="rtl"` an ein <html> schreibt.
+//
+// Was sie bewirkt, steht in lib/fui/render.fi: die Absatzrichtung des
+// Textes, und in einem RTL-Element beginnt der Text RECHTS -- die
+// Vorgabe-Ausrichtung "links" wird zu "rechts", und ein Bild an der
+// Anfangsseite rueckt nach rechts. Eine ausdruecklich gesetzte
+// Ausrichtung bleibt, was sie ist (text-align: left bleibt links).
+//
+// Die drei Werte sind dieselben Zahlen wie bidi.DIR_*; render.fi
+// uebersetzt sie trotzdem einzeln, weil dieses Modul kernelrein bleiben
+// muss und lib/fui/bidi.fi nicht einbinden darf.
+const SF_DIRECTION: u32 = 4194304
+const DIR_AUTO: u32 = 0
+const DIR_LTR: u32 = 1
+const DIR_RTL: u32 = 2
 
 // ============================================================== THE STYLE
 //
@@ -283,6 +320,13 @@ struct Style {
     out_col: u32,
     sh_col: u32,
     grad_col: u32,
+    // Feste Groesse in Entwurfspunkten. Sie gilt nur, wenn ihr Bit
+    // steht -- 0 ist eine gueltige Breite (ein Trenner ohne
+    // Eigenbreite), die Zahl selbst kann die Frage also nicht
+    // beantworten.
+    width: u16,
+    height: u16,
+    dir: u8,           // DIR_AUTO / DIR_LTR / DIR_RTL, gilt mit SF_DIRECTION
     set_mask: u32,     // Bitmaske S_*
 }
 
@@ -296,7 +340,7 @@ fn style_new() -> Style {
         align: 0, alpha: 255,
         tracking: 0, word_spacing: 0, line_height: 0, line_h_abs: 0,
         kerning: 1,
-        out_w: 0, sh_dx: 0, sh_dy: 0,
+        out_w: 0, sh_dx: 0, sh_dy: 0, width: 0, height: 0, dir: 0,
         out_col: color_inherit(), sh_col: color_inherit(),
         grad_col: color_inherit(),
         set_mask: 0,
@@ -381,6 +425,70 @@ fn style_set_align(s: Style, a: u32) -> Style {
     o.align = a as u8
     o.set_mask = o.set_mask | SF_ALIGN
     return o
+}
+
+// ---- DIE GROESSE AUS DEM STILBLATT, in Entwurfspunkten. Wer nur
+// eine der beiden setzt, laesst die andere gemessen -- genau wie im
+// Web.
+fn style_set_width(s: Style, px: usize) -> Style {
+    var o: Style = s
+    o.width = px as u16
+    o.set_mask = o.set_mask | SF_WIDTH
+    return o
+}
+
+fn style_set_height(s: Style, px: usize) -> Style {
+    var o: Style = s
+    o.height = px as u16
+    o.set_mask = o.set_mask | SF_HEIGHT
+    return o
+}
+
+fn style_set_size(s: Style, w: usize, h: usize) -> Style {
+    return style_set_height(style_set_width(s, w), h)
+}
+
+// EINEN WERT WIEDER FREIGEBEN. Styles werden in diesem Haus gern
+// voneinander abgeleitet ("die Karte sieht aus wie die Leiste, nur
+// gerundeter"), und dabei erbt die Ableitung ALLES -- auch eine feste
+// Hoehe, die nur zum Vorbild gehoert. `style_unset` loescht die Bits
+// und macht die betroffenen Werte wieder "gemessen" bzw. "geerbt".
+// Das entspricht `unset` in CSS und ist der einzige Weg zurueck: den
+// Wert auf 0 zu setzen hiesse "null Punkte hoch", und das ist etwas
+// anderes als "sag nichts dazu".
+fn style_unset(s: Style, bits: u32) -> Style {
+    var o: Style = s
+    o.set_mask = o.set_mask ^ (o.set_mask & bits)
+    return o
+}
+
+// DIE SCHREIBRICHTUNG setzen (DIR_LTR / DIR_RTL; DIR_AUTO heisst "das
+// erste starke Zeichen entscheidet" und ist etwas anderes als "nichts
+// gesagt": es wird vererbt und ueberschreibt ein RTL des Elternteils).
+fn style_set_direction(s: Style, d: u32) -> Style {
+    var o: Style = s
+    o.dir = d as u8
+    o.set_mask = o.set_mask | SF_DIRECTION
+    return o
+}
+
+// Die Richtung eines Stils; ohne gesetztes Bit DIR_AUTO.
+fn style_direction(s: *mut Style) -> u32 {
+    if ((*s).set_mask & SF_DIRECTION) == 0 as u32 {
+        return DIR_AUTO
+    }
+    return (*s).dir as u32
+}
+
+fn style_width(s: *mut Style) -> usize { return (*s).width as usize }
+fn style_height(s: *mut Style) -> usize { return (*s).height as usize }
+
+fn style_has_width(s: *mut Style) -> bool {
+    return ((*s).set_mask & SF_WIDTH) != 0 as u32
+}
+
+fn style_has_height(s: *mut Style) -> bool {
+    return ((*s).set_mask & SF_HEIGHT) != 0 as u32
 }
 
 fn style_set_alpha(s: Style, d: usize) -> Style {

@@ -4,6 +4,31 @@ Everything here **has been run** exactly as it stands (2026-08-14, AMD EPYC
 7571, Linux x86_64, rustc 1.99.0-nightly, binutils `as`/`ld`). Relative paths
 only, everything inside this directory.
 
+## 0a. Integration pass, re-measured 2026-09-22
+
+The three modules of this round (`viewport.fi`, `scene.fi`, `sheet.fi`)
+were built by three people in parallel. This pass checked that they are
+ONE working whole and not three that happen to compile. What was run,
+and what it printed:
+
+```sh
+sh tools/fui/run.sh --images     # -> ALL CHECKS PASSED, 26 pictures
+W=/tmp/fui-clean sh tools/fui/run.sh   # clean working dir -> ALL CHECKS PASSED
+```
+
+Four things a green run does **not** prove were checked separately:
+
+| Checked | How | Result |
+|---|---|---|
+| The delivered evidence is what the code paints **today** | `cmp` of all 26 `.gauntlet-shots/*.png` against the freshly painted `$W/belege` | 26 of 26 **byte-identical** |
+| No name is defined in two modules | the `export { ... }` blocks of all 23 `lib/fui/*.fi` collected and `uniq -d` | 1017 exported names, **0 duplicates** |
+| The new modules contain no second copy of flex/anim/matrix/blur | grep for own `bezier`/`spring`/`matrix`/`blur` functions in the three files | none; instead 41 `flex.`, 31 `render.`, 13 `anim.`, 4 `transform.` calls |
+| The core is still kernel-pure | section 1 of the run | `core.o` / `style.o` / `layout.o`: **0 syscall, 0 foreign names** each |
+
+Nothing had to be repaired in this pass: the tree was already
+consistent. The numbers above are the evidence for that, so that the
+next reader does not have to take it on trust.
+
 ## 0. Prerequisites
 
 * `cargo`/`rustc` (only to build the compiler and the yardsticks -- the
@@ -50,13 +75,27 @@ compiler/target/release/firnc -o /tmp/mod tests/110_module.fi
 bash test.sh
 ```
 
-Measured result for this state: **PASS 485/485**
-(143 programs x 3 build stages `opt` / `--no-opt` / `--opt-level=dev-fast` = 429,
-51 negative tests, plus one section proof each for the optimizer (`test_opt.sh`,
-41 checks in its own right), the result-location guarantee, the architecture
-guards, the symbol scheme and the HTML5 tokenizer against html5lib; on top of
-that 122 Rust module tests, which do not count individually towards PASS).
-Runtime about 4 minutes.
+Measured result for THIS state (re-run 2026-09-21, same machine):
+**`FAIL 4/1592 failed`, exit code 1** -- 1588 of 1592 checks pass, four
+sections fail. Which four, and why, is in **section 4d**; none of them
+is a calculation of the UI library, and two of them are house-style
+debt this tree takes on knowingly.
+
+The number `PASS 485/485` stood here for a long time and is NOT what
+`bash test.sh` prints today: the suite has grown from 485 to 1592
+checks since, and it has ended non-zero since the rounds described in
+4d. It is corrected rather than kept, because a reader who runs the
+command in the box above has to read the same result here.
+
+Of those 1592: all 533 `tests/*.fi` in four build stages (`opt`,
+`noopt`, `devfast`, `safe`), the negative tests, and one section proof
+each for the optimizer (`test_opt.sh`, 41 checks in its own right), the
+result-location guarantee, the architecture guards, the symbol scheme
+and the HTML5 tokenizer against html5lib. Runtime on a loaded machine
+about 50 minutes, on an idle one a few minutes.
+
+The UI library's own acceptance run is separate and IS green -- see
+section 9: `sh tools/fui/run.sh --images` ends on `ALL CHECKS PASSED`.
 
 Machine-readable (CI, goal 9 / ACCEPTANCE item 4 A):
 
@@ -181,6 +220,330 @@ boot of the kernel example with **both** compilers.
 | **volatile holds** | `firnc --emit=fir tools/freestanding/volatile.fi \| grep -c 'asm.void "pause"'` | `3` -- three literally identical blocks, no CSE |
 
 In detail in `docs/ROUND52.md`.
+
+## 4c. fUi -- the UI library, and its acceptance run (round UI-WEB)
+
+`lib/fui/*.fi` is the house UI library, written in Firn only: no C, no
+libc, no foreign library. Round UI-WEB added the four modules that were
+missing for the expressiveness of modern HTML/CSS:
+
+| Module | What it is |
+|---|---|
+| `lib/fui/anim.fi` | Tween engine: linear, `cubic-bezier(x1,y1,x2,y2)` with Newton iteration, `steps(n)`, analytically solved spring; animator register with `anim_tick(ms)`; widget state transitions (colour in sRGB **and** OKLab, premultiplied alpha, radius, border, lift) |
+| `lib/fui/flex.fi` | CSS flexbox: direction/justify/align/wrap/align-content, gap, grow/shrink/basis with min/max clamping and the redistribution that follows from it. Extends `lib/fui/layout.fi`, does not replace it |
+| `lib/fui/effect.fi` | Separable box blur in three passes (running sum, O(1) per pixel) as a Gauss approximation, `drop_shadow`, `backdrop_blur`/glass, colour matrix |
+| `lib/fui/transform.fi` | Affine 2x3 transforms with a push/pop stack. The matrix arithmetic comes from `lib/svg/matrix.fi` -- **no second matrix library**. Text goes through the matrix as a glyph outline, pictures via inverse mapping with bilinear sampling, hit testing via the inverse |
+
+One thing the integration pass found and fixed: `lib/fui/editor.fi` (the
+key handling of a text field) **never compiled**. In the branch for the
+Backspace key the line `if ctrl && !tb_has_sel(t) {` was missing, so the
+brace below it closed the function and the parser hit an `if` at top
+level. Nobody noticed, because no program imported the file and the
+acceptance run did not know it. The guard is back, and the file is now
+built and measured by section 18 -- a check that fails with
+`got 10 want 7` if the guard is wrong again.
+
+The integration pass after the round found two more, both of the kind
+that breaks nothing today and something later:
+
+* **The five states stood in two files.** `lib/fui/theme.fi` declared
+  `STATE_NORMAL .. STATE_DISABLED` a second time, with the same values
+  as `lib/fui/style.fi`. The copies agreed only for as long as nobody
+  touched one of them -- and `style.fi` had already grown a sixth
+  state (`STATE_SELECTED`) that `theme.fi` never heard of. The copy is
+  gone; `theme.fi` and its one outside caller
+  (`tools/fui/preview_main.fi`) read `style.STATE_*`. Firn has no
+  cross-module constant alias (`const A: u32 = style.A` is an error),
+  so there is no way to keep a second name honest -- it had to go.
+  Proof that nothing moved: the 22 evidence pictures are byte for byte
+  identical before and after.
+* **A reason that had stopped being true.** The head of
+  `lib/fui/painter.fi` stated that `lib/svg` does not exist in the Firn
+  tree. It did not when the file was written and does since `2b82d78e`
+  -- `lib/fui/transform.fi` takes its matrix arithmetic from there. The
+  paragraph now gives the reason that actually carries (this layer
+  draws straight into the rasteriser, `svg.pfad` builds and keeps a
+  path object) and says where the rule points instead.
+
+### Round DECLARATIVE: describing a surface instead of painting it
+
+Three modules were added in this round, and they are what separates a
+UI library from a drawing library:
+
+| Module | What it is |
+|---|---|
+| `lib/fui/viewport.fi` | The scroll viewport: a cut-out with its own size over content of any size, **real clipping** through `canvas.clip_push_rect` (no second clip), wheel and keyboard scrolling, scrollbars whose thumb length follows from cut-out/content (computed in `wave2.scrollbar_thumb`, the one place), kinetic fling as a plain `anim.Animation` (no second clock), `viewport_ensure_visible`, and a hit test that accounts for the offset |
+| `lib/fui/scene.fi` | The tree: nodes with kind, `id`, classes, children and style, walked in four separated passes -- style, measure (`render.pref_of`), layout (`flex.flex_layout`), draw. No node may change its size while drawing; `scene_size_drift` counts every attempt and the check reads that number |
+| `lib/fui/sheet.fi` | The style sheet, built **in source** (no CSS parser -- `lib/browser` already has one): rules "selector -> style values", selecting by kind, id, class, state and ancestry, merged by a specificity that is worked out (id 10000 &gt; class 100 &gt; kind 1, ties go to the later rule), plus inheritance of exactly four values (`INHERIT_MASK` = 36996: colour, font size, font id, line height) |
+
+None of the three recomputes anything that already exists: flexbox from
+`flex.fi`, time and easing from `anim.fi`, matrices from
+`lib/svg/matrix.fi` through `transform.fi`, measuring and drawing from
+`render.fi`/`wave2`/`wave3`.
+
+Their checks are sections 18b, 18c and 18d of the acceptance run
+(`viewport_main.fi`, `sheet_main.fi`, `scene_main.fi`), all numeric:
+the cascade on deliberately contradictory cases, inheritance **and its
+boundary**, the clipping counted pixel by pixel on a real canvas (zero
+points outside the cut-out, 49632 inside, and the counter-test without
+the clip reports 44720 spilled points in red), the thumb length from
+the ratio, and the hit test under scrolling.
+
+Section 19c counts, mechanically, what the round is for: the same tool
+bar -- three buttons, a search field with `grow`, one accent button --
+painted call by call in `demos/fuidemo/main.fi` (`fn
+werkzeugleiste_gemalt`) against the same bar described in
+`tools/fui/gallery9_main.fi` (tree plus its rules in the style sheet).
+Counted are lines of code, without blanks and comments, in three cuts,
+because a single number here would necessarily hide something:
+
+| cut | painted | described |
+|---|---|---|
+| raw (everything inside the markers resp. the function) | 64 | 42 |
+| A -- without the captions, subtracted on **both** sides | 54 | 40 |
+| B -- additionally without the looks (fill, border, colour, radius) | 46 | 21 |
+
+Cut B is the honest headline: what is left is the structure alone, and
+there the description needs **21 lines where painting needs 46** -- the
+distribution, the setting of every single rectangle and the own drawing
+loop fall away entirely. In cut A the saving is small on purpose: a
+style sheet writes colour and radius **once for the whole page**, and
+this comparison still charges all of it to the described side. The run
+stops if A ever exceeds 90 % or B ever exceeds two thirds of the
+painted side. Shared helpers (`setze`, `item_von_widget`) are counted
+on neither side, because `titelzeile` and `dialog` call them too --
+charging shared lines to one side only would be talking the saving up.
+
+**And the same comparison inside ONE file (section 19d).** 19c counts
+across two files, and a reviewer may rightly ask whether that is still
+the same piece of surface. So the same bar is counted a second time
+where both versions stand next to each other and provably paint the
+same picture: `demos/fuidemo/main.fi`, `fn werkzeugleiste` (markers
+`>>> LEISTE BESCHRIEBEN` ... `<<< LEISTE BESCHRIEBEN`) against
+`fn werkzeugleiste_gemalt` in **the same file** (markers
+`>>> LEISTE GEMALT` ... `<<< LEISTE GEMALT`). `pruefe_leisten` in that
+file holds their five rectangles against each other as integers, at 952
+**and** at 260 points of width, where the 140-point clamp of the search
+field really bites.
+
+| cut | painted | described |
+|---|---|---|
+| raw | 52 | 51 |
+| A -- without the captions | 42 | 41 |
+| B -- the structure alone | 32 | **22** |
+
+The first two numbers say something uncomfortable, and they say it as
+numbers instead of as an excuse: for a **single** bar the description
+is not shorter (51 against 52 lines) -- a style sheet for one bar does
+not amortise. The structure is where it pays: 22 lines against 32,
+that is 69 %, and the run stops above 75 % (and also if the described
+version ever gets longer than the painted one in raw or in cut A).
+Outside the markers stands, on both sides, only the check itself: the
+handing out of the five rectangles and the message about an incomplete
+tree. Nothing of the surface.
+
+**One command checks all of it:**
+
+```sh
+sh tools/fui/run.sh              # the checks only
+sh tools/fui/run.sh --images     # additionally paint the evidence pictures
+```
+
+It needs `compiler/target/release/firnc` (section 1) plus `objdump` and
+`nm` for section 1 of the run. It ends on `ALL CHECKS PASSED`; every
+single check exits non-zero on failure and `set -e` stops the run, so a
+check cannot go missing silently -- that is the whole point of the file.
+
+**And that is not just claimed here.** `.gauntlet-shots/run-log.txt`
+holds the complete output of one such run (21.09.2026, sections 1 to
+19b including the check of every written PNG, all `got X want Y` lines
+verbatim, exit code 0, last line `ALL CHECKS PASSED.`). A reviewer who
+does not start the run can read what the run says -- the same reason
+the pictures are checked in next to it.
+
+What the eighteen sections do, in short: section 1 compiles
+`lib/fui/core.fi`, `style.fi` and `layout.fi` with `--profile=kernel` and
+**counts** that not one `syscall` instruction and no foreign name besides
+`osum_panic` is left in the objects (the core has to stay usable from
+inside a kernel). Sections 2-11 are the earlier rounds (contrast,
+icons, the three widget waves, pictures, the ported `lib/svg`, text).
+Sections 12-15 are the new modules, sections 16-17 the interaction and
+the line breaking, section 18 the operation of the text field
+(`lib/fui/editor.fi`: Ctrl+A replaces instead of appending, the word
+jumps, Ctrl+Backspace/Delete with and without a selection, undo/redo,
+and the keys the field hands back to the program). The numbers are
+checked **numerically** against
+values worked out by hand ("got X want Y"): easings at their support
+points, flex distribution in pixels, three box passes against the cubic
+B-spline `(1,3,6,7,6,3,1)/27`, known point images under the transform.
+
+The evidence pictures are written to `$W/belege` (with `W` defaulting to
+`/tmp/fui-acceptance`), that is: **inside the working directory**, never
+to a fixed system path -- a run that writes outside its own tree fails
+for anyone without rights there, and only after twenty passed sections.
+Set `BELEGE` to put them somewhere else. If that directory cannot be
+created or written, the run says so and exits non-zero; it does not
+print `ALL CHECKS PASSED` with pictures missing.
+
+The same twenty-six files are checked in under `.gauntlet-shots/`,
+light and dark for each, numbered in reading order. That is the whole
+delivered evidence set: a reviewer who does not start the run sees in
+this table which picture carries which point of the acceptance bar, and
+which program writes it.
+
+| File in `.gauntlet-shots/` | written by | what it has to show |
+|---|---|---|
+| `01/02-wave1-grundelemente-{hell,dunkel}.png` | `tools/fui/gallery_main.fi` | bar 5: button in five states, six style looks, label alignment and sizes, the box with the stretchy address field (the address stands there COMPLETE, measured against the field), the 6x2 grid, the window buttons from the core at 1x/2x/3x -- nothing overlaps, nothing is cut off, readable in light AND dark |
+| `03/04-wave2-widgets-{hell,dunkel}.png` | `tools/fui/gallery2_main.fi` | bar 5: checkbox, radio, switch, slider, progress, spinner, tooltip, tabs, menu -- each at its measured size, the tooltip without the grey box behind it, and **the switch without a grey slab behind its label**: `KIND_TOGGLE` stood in both branches of `render.def_bg_state`/`def_bg`, so the documented rule ("it colours its box, not its row") silently lost to the order of the tests. Measured in these two pictures, in the strip above the pill (y 282..288, x 150..599): **2830 foreign pixels before, 51 after** in light, 2832 -> 51 in dark -- what is left is the edge of the pill itself. The check for it is section 10 of `tools/fui/wave2_main.fi`, on a real canvas and with the counter-proof that a BUTTON of the same size does carry 790 points of surface |
+| `05/06-wave3-widgets-{hell,dunkel}.png` | `tools/fui/gallery3_main.fi` | bar 5: list, table, tree, card, badges, date and colour picker, modal dialog over the scrim -- and the dialog/menu shadow that `render` takes from `effect.drop_shadow_round` |
+| `07/08-text-{hell,dunkel}.png` | `tools/fui/gallery4_main.fi` | bar 5: line breaking, ellipsis, outline and text shadow -- no text runs out of its box |
+| `09/10-bild-svg-{hell,dunkel}.png` | `tools/fui/artshow_main.fi` | the round BILD+SVG: the same SVG re-rastered per size (12..64) instead of scaled, `currentColor`, pictures with alpha over four grounds |
+| `11/12-anim-phasen-{hell,dunkel}.png` | `tools/fui/gallery5_main.fi` | bar 4: one movement as a phase series with a visibly NON-linear course -- six curves (linear, ease-in/out/in-out, steps, spring), nine phases each, plus the state transition of a widget |
+| `13/14-flex-varianten-{hell,dunkel}.png` | `tools/fui/gallery6_main.fi` | bar 4: the flex variants side by side with correct gaps -- `justify-content` in all six forms, `align-items`/`align-self`, `wrap` with `align-content`, `grow`/`shrink`/`basis` with min/max clamping |
+| `15/16-effekt-blur-schatten-glas-{hell,dunkel}.png` | `tools/fui/gallery7_main.fi` | bar 4: soft shadows with a visible gradient and NO hard edge (four blur radii, one with spread, painted with the library's unchanged `render.shadow_color`), glass/backdrop blur over a patterned ground with the shapes behind it still recognisable, colour matrix (grey, saturate, contrast) |
+| `17/18-transform-rotate-scale-{hell,dunkel}.png` | `tools/fui/gallery8_main.fi` | bar 4: rotated, scaled and skewed widgets with clean edges (no stair-stepping), pictures under the inverse mapping with bilinear sampling, the hit test under rotation |
+| `19/20-demo-anwendung-{hell,dunkel}.png` | `demos/fuidemo/main.fi` | bar 2: the three new modules have a caller OUTSIDE their own check -- title bar and tool bar distributed by `flex.flex_layout` (grow on the field, every basis measured through `render.pref_of`), the hover transition of a button driven by `anim.Animator` in seven labelled phases, the dialog shadow from `effect.drop_shadow_spread` |
+| `21/22-preview-zustaende-{hell,dunkel}.png` | `tools/fui/preview_main.fi` | bar 5: the five button states, the text field at rest and focused with selection and caret, the same buttons under `shape_classic`, and the whole row at 150 % scale -- the proof that shape and scale are a theme decision |
+| `23/24-deklarativ-scene-sheet-{hell,dunkel}.png` | `tools/fui/gallery9_main.fi` | round DECLARATIVE: a whole page that is **described**, not painted -- a scroll viewport carrying 28 rows on 1130 points of content in a 528 point cut-out (rows visibly clipped top and bottom, scrollbar length from the cut-out/content ratio), the cascade in the picture (class 100 &lt; two classes 200 &lt; id 10000), inheritance of font and colour but not of the background |
+| `25/26-deklarativ-schmal-980px-{hell,dunkel}.png` | `tools/fui/gallery9_main.fi` | the same described page on 980 instead of 1240 points: the layout is really **computed**, not written down -- the right column gets narrower, the tool bar keeps its gaps, the viewport keeps its scrollbar, and still nothing overlaps and no text leaves its box |
+
+Every one of these pictures is measured before it is written: the
+programs check their own pixels (contrast against the ground it is
+really painted on, tone distance of the shadows, no band left empty)
+and exit non-zero instead of writing a picture that does not keep its
+promise. On top of that `tools/fui/belegpruef_main.fi` reads every
+written PNG back in and checks size, colour variety and that something
+stands in each of the six horizontal bands.
+
+The set is refreshed from the run with
+
+```sh
+sh tools/fui/run.sh --images
+sh tools/fui/collect_shots.sh
+```
+
+The second script holds the table "which painted picture becomes which
+delivered number" -- in ONE place, so that a new piece of evidence
+cannot end up in the run and be missing from the tree (or the other way
+round).
+
+Single checks without the whole run, if something is to be looked at:
+
+```sh
+export FIRNLIB="$(pwd)/lib"
+compiler/target/release/firnc --opt-level=dev -o /tmp/anim tools/fui/anim_main.fi
+/tmp/anim
+```
+
+## 4d. The state of `bash test.sh` (re-measured 2026-09-21)
+
+`test.sh` runs 59 sections and takes roughly an hour and a half. It has
+to be started with **`bash`**, not `sh`: line 216 uses `set -o pipefail`.
+Measured on the state of this branch, from a compiler rebuilt from
+source:
+
+```
+FAIL 4/1592 failed:
+
+  tools/fixpoint.sh failed (see .test-work/fixpoint.log)
+  tools/js/run.sh failed (see .test-work/js.log)
+  tools/english/check.sh reports German identifiers (see .test-work/english.log)
+  tools/fmt/run.sh failed (see .test-work/fmt.log)
+```
+
+All 533 `tests/*.fi` pass in all four build stages (`opt`, `noopt`,
+`devfast`, `safe`). Four sections fail. Not one of them is a
+CALCULATION of the UI library -- no measured value in `lib/fui` is
+wrong -- but two of them ARE made worse by this round, which the
+previous version of this section got wrong. They are named here so
+that nobody has to find that out twice:
+
+| Section | Fails because |
+|---|---|
+| `tools/fixpoint.sh` | `lib/firnc1/gctext.fi` does not match `lib/gc/*.fi` (`tools/gen_gctext.sh` was not re-run) |
+| `tools/js/run.sh` | `testdata/test262/subset.sha256` is missing from the tree |
+| `tools/english/check.sh` | 383 German identifiers; 223 of the reported lines name `lib/svg` (a port, `2b82d78e`), the other **160 are fUi, `demos/fuidemo` and `tools/fui` of this round** |
+| `tools/fmt/run.sh` | 54 files are not in canonical `firnfmt` shape -- **including files this round wrote** |
+
+**Two of the four fail partly BECAUSE of this round, and an earlier
+version of this section wrongly claimed that none of them did.** The
+claim was "every one of them names files that the round never touched";
+that is false, and the logs say so:
+
+* `.test-work/english.log` ends on `German identifiers: 383`. Counted
+  out of the log, 223 of those lines mention `lib/svg` and the
+  remaining **160 are fUi, `demos/fuidemo` and `tools/fui` alone**
+  -- `zyklus` in
+  `lib/fui/anim.fi`, `LUECKE` in `tools/fui/anim_main.fi`, `SCHRITT`
+  in `demos/fuidemo/main.fi`, and so on. The round was told to take
+  over the style of the modules around it, and those modules are half
+  German; it did, and the counter went up.
+* `.test-work/fmt.log` names `lib/fui/anim.fi`, `effect.fi`, `flex.fi`
+  and `demos/fuidemo/main.fi`. Counted with `firnfmt -c`, about 47 of
+  the 54 are fUi or `lib/svg` files.
+
+Neither is a wrong number in a picture or a check that does not hold --
+`sh tools/fui/run.sh --images` passes in full. They are house-style
+debts, and they are written down here rather than rounded off.
+
+It is left as debt on purpose, and the reason is checkable in ten
+seconds:
+
+```sh
+compiler/target/release/firnc --opt-level=dev -o /tmp/firnfmt tools/fmt/firnfmt.fi
+/tmp/firnfmt lib/fui/flex.fi | diff -u lib/fui/flex.fi -
+```
+
+The formatter pulls aligned trailing comments up against the field
+(`basis: i64, // flex-basis ...` instead of a column) and **de-indents
+continuation lines** -- a wrapped expression comes back at the
+indentation of the statement above it, which reads like a new
+statement. On `flex.fi` that is the whole diff: 24 lines, not one of
+them an improvement. Running `firnfmt -w` over the tree would trade
+readable code for a green check, and this tree values the first more.
+That is a decision about the formatter, not about the code, and it is
+why long-standing files like `lib/fui/core.fi` have never been
+formatted either. The fifth failure, round 95, **is** fixed -- see
+section 4e.
+
+## 4e. Rebuilding the Unicode table
+
+```sh
+bash tools/ucd/build.sh --verify
+```
+
+Expected: `identical, octet for octet (100862 octets)`. Without
+`--verify` the script **overwrites** `lib/generated/unicode_tables.fi`
+(`generated/` is a symlink to it); with `--verify` it only compares.
+
+This is the check that section 54 of `test.sh` runs. It was failing:
+the licence sweep `0cb03e98` put `// SPDX-License-Identifier: MPL-2.0`
+into the generated file by hand but not into the template
+`tools/ucd/table_head.fi.in`, so the second build could never match the
+first line again. The template carries the line now; the generated file
+itself is unchanged, octet for octet.
+
+## 4f. WebAssembly: `--target=wasm32-browser` (round WASM)
+
+```sh
+compiler/target/release/firnc --target=wasm32-browser -o /tmp/hello.wasm examples/hello.fi
+node tools/wasm/run.mjs /tmp/hello.wasm ; echo "exit=$?"     # the greeting of hello.fi, exit=0
+compiler/target/release/firnc --target=wasm32-browser --emit=asm -o /tmp/hello.wat examples/hello.fi
+```
+
+`tools/wasm/run.mjs` is the host for the checks (stdout, stderr, stdin,
+exit code under node 18); a browser gets `demos/webdemo/firn.js`. Measured
+2026-09-23 (details, design and limits in `docs/ROUND-WASM.md`):
+
+| What | Command | Measured result |
+|---|---|---|
+| **native vs. WebAssembly, octet for octet** | `bash tools/wasm/run.sh` | 335 programs x 4 build levels: **314 identical**, 21 refused at compile time with a reason (files 10, threads 4, inline asm 4, SIMD 2, sockets 1), **0 different**; `wat2wasm` gives our binary for 314 of 314; the dispatch fallback 314 of 314; ends on `ALL WASM CHECKS PASSED` |
+| **the collector without a stack scan** | `bash tools/wasm/gc_soak.sh` | intact after 1096-1097 collections (36,000,000 nodes verified) in `dev`, `dev-fast`, `release-fast`; without the spills: `CORRUPT after round 9` -> `GC SOAK PASSED` |
+| **the fUi page in Chromium** | `bash tools/wasm/webdemo.sh` | runs `tools/fui/run.sh --images` for the reference, then headless Chromium: **0 differing pixels** in 4 of 4 pictures, from two build levels; hover, click, wheel and keys operate it; `WEBDEMO PASSED` |
+
+Needed: node (18 works), for section 2 of `run.sh` wabt (`wat2wasm`,
+`wasm-strip`; without it that section says SKIPPED), for the web demo
+`chromium` and python3 with PIL, numpy and websocket-client.
 
 ## 5. What does NOT work, because it was not built
 

@@ -1,0 +1,779 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/imebeleg_main.fi -- DER BELEG ZUR EINGABEMETHODE.
+//
+// ====================================================== WAS ER ZEIGT
+//
+// Vier Textfelder, jedes mitten in einer Eingabe, und zwar ueber den
+// NORMALEN Weg getippt -- editor.editor_char/editor_key, Taste fuer
+// Taste, wie ein Fenster sie liefert:
+//
+//   Japanisch   "kore" Enter "ha" Enter "nihongo" Leertaste
+//               -> これは + Vorbearbeitung にほんご, Liste offen (2)
+//   Koreanisch  "dkssudgktpdy" -> 안녕하세 + Silbe im Bau 요
+//   Chinesisch  "wo" 1 "men" 1 "zhongguo" -> 我们 + Vorbearbeitung
+//               zhongguo, Liste fuer zhong offen (9 von 13)
+//   Auswahl     "Tokyo Tower", Tokyo ausgewaehlt, dann "toukyou":
+//               die Auswahl bleibt markiert stehen, bis bestaetigt wird
+//
+// Die Kandidatenlisten sind Baeume aus lib/fui/imelist.fi, gelegt unter
+// die Einfuegestelle, die das Feld selbst meldet (render.field_caret_x
+// -> editor.editor_ime_spot).
+//
+// ============================================ WAS DAS PROGRAMM NACHRECHNET
+//
+// Bevor ein PNG entsteht: dass jeder Text das ist, was getippt wurde;
+// dass die Unterstreichung genau unter dem Vorbearbeitungstext und im
+// Feld liegt und im Bild wirklich in der Schriftfarbe steht; dass jede
+// Liste unter ihrer Einfuegestelle steht, im Bild bleibt, kein Feld,
+// keine Beschriftung und keine andere Liste ueberdeckt; dass jede Zeile
+// in ihrer Tafel und jeder Text in seiner Zeile steht, ohne dass er
+// schmaler gemessen wurde, als er ist; dass die gewaehlte Zeile die
+// Markierungsfarbe traegt und die anderen nicht; und dass die Schrift
+// fuer JEDES gezeigte Zeichen eine Glyphe hat -- ein Beleg aus leeren
+// Kaesten waere keiner. Faellt eine Zusage, gibt es kein Bild.
+//
+// ============================================================ DIE SCHRIFT
+//
+// Gebraucht wird eine Schrift mit lateinischen, japanischen,
+// koreanischen und chinesischen Glyphen in TrueType-Umrissen. Auf
+// diesem Rechner ist das WenQuanYi Zen Hei, und die liegt als SAMMLUNG
+// vor (wqy-zenhei.ttc, drei Schriften in einer Datei). lib/font/ttf.fi
+// weist Sammlungen mit Absicht ab -- still die erste zu nehmen, verdeckt
+// einen Fehler. Dieses Programm nimmt die erste darum AUSDRUECKLICH:
+// es kopiert ihr Inhaltsverzeichnis an den Anfang der Datei. Das geht,
+// weil in einer Sammlung jede Tabellenlage vom Dateianfang aus zaehlt
+// und die Tabellen erst hinter allen Inhaltsverzeichnissen beginnen --
+// ueberschrieben wird nur der Kopf der Sammlung, keine Tabelle.
+// Noto Sans CJK ist hier NICHT zu gebrauchen: ihre Umrisse sind CFF, und
+// die liest ttf.fi (mit Absicht und benannt) nicht.
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import font.ttf
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.flex
+import fui.render
+import fui.sheet
+import fui.scene
+import fui.textbuf
+import fui.editor
+import fui.ime
+import fui.imelist
+
+const W: usize = 1000
+const H: usize = 485
+const FONTSET_BYTES: usize = 4096
+const FELD_W: f64 = 300.0
+const FELD_H: f64 = 44.0
+
+static mut G_FEHLER: usize = 0
+
+fn fordere(nm: u64, nn: usize, ok: bool, ist: i64, soll: i64) {
+    var t: rt.Buf = rt.buf_new()
+    var p1: [u8; 11] = "imebeleg:  "
+    rt.buf_push_bytes(&t, (&p1[0]) as u64, 11)
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 52 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_FEHLER = G_FEHLER + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, ist)
+    var w2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, soll)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn b2i(b: bool) -> i64 {
+    if b { return 1 }
+    return 0
+}
+
+fn gleich(ap: u64, an: usize, bp: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if rt.ld8(ap, i) != rt.ld8(bp, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn rd(p: u64, i: usize, k: usize) -> usize {
+    var v: usize = 0
+    var j: usize = 0
+    while j < k {
+        v = (v << 8) | (rt.ld8(p, i + j) as usize)
+        j = j + 1
+    }
+    return v
+}
+
+// Die erste Schrift einer Sammlung (siehe den Kopf dieser Datei). Eine
+// einzelne .ttf bleibt, wie sie ist.
+fn sammlung_erste(p: u64, n: usize) -> bool {
+    if n < 16 {
+        return false
+    }
+    if rt.ld8(p, 0) != 116 as u8 || rt.ld8(p, 1) != 116 as u8
+        || rt.ld8(p, 2) != 99 as u8 || rt.ld8(p, 3) != 102 as u8 {
+        return true
+    }
+    let off0: usize = rd(p, 12, 4)
+    if off0 + 12 > n {
+        return false
+    }
+    let nt: usize = rd(p, off0 + 4, 2)
+    let l: usize = 12 + 16 * nt
+    if off0 + l > n {
+        return false
+    }
+    // Vorwaerts kopieren ist richtig, auch wenn sich Quelle und Ziel
+    // ueberlappen: das Ziel liegt vor der Quelle.
+    var i: usize = 0
+    while i < l {
+        *((p + i as u64) as *mut u8) = rt.ld8(p, off0 + i)
+        i = i + 1
+    }
+    return true
+}
+
+fn tippe(e: *mut editor.Editor, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let r: u32 = editor.editor_char(e, rt.ld8(p, i) as u32, 0 as u32)
+        i = i + 1
+    }
+}
+
+fn enter(e: *mut editor.Editor) {
+    let r: u32 = editor.editor_key(e, editor.KEY_ENTER, 0 as u32)
+}
+
+// Der eigene Maler des Feldknotens: der Puffer des Editors, mit
+// Schreibzeiger, Markierung und Unterstreichung.
+fn male_feld(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let ed: *mut editor.Editor = ud as *mut editor.Editor
+    let m: *mut ime.Ime = editor.editor_ime(ed)
+    render.draw_field(c, e, editor.editor_buf(ed), editor.editor_scroll(ed),
+        true, ime.ime_repl_a(m), ime.ime_repl_b(m))
+}
+
+struct Kasten {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+fn kasten_von(sc: *mut scene.Scene, i: usize) -> Kasten {
+    return Kasten { x: scene.node_x(sc, i), y: scene.node_y(sc, i),
+        w: scene.node_w(sc, i), h: scene.node_h(sc, i) }
+}
+
+fn schneiden(a: Kasten, b: Kasten) -> bool {
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h
+        && b.y < a.y + a.h
+}
+
+fn innen(a: Kasten, b: Kasten) -> bool {
+    return a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w
+        && a.y + a.h <= b.y + b.h
+}
+
+// Wie viele Zeichen in [p, p+n) haben in der Schrift KEINE Glyphe?
+fn ohne_glyphe(f: *mut ttf.Font, p: u64, n: usize) -> usize {
+    var tb: textbuf.TextBuf = textbuf.tb_new()
+    textbuf.tb_init(&tb, p, n)
+    textbuf.tb_set_len(&tb, n)
+    var fehlt: usize = 0
+    var i: usize = 0
+    var adv: usize = 0
+    while i < n {
+        let cp: u32 = textbuf.tb_cp_at(&tb, i, &adv)
+        if adv == 0 {
+            break
+        }
+        if cp != 32 as u32 && ttf.font_glyph_for(f, cp) == 0 as u32 {
+            fehlt = fehlt + 1
+        }
+        i = i + adv
+    }
+    return fehlt
+}
+
+// Bildpunkte in einem Kasten, die NICHT die Farbe `grund` tragen.
+fn tinte(cv: *mut canvas.Canvas, k: Kasten, grund: u32) -> usize {
+    var n: usize = 0
+    var y: usize = k.y as usize
+    while y < (k.y + k.h) as usize && y < H {
+        var x: usize = k.x as usize
+        while x < (k.x + k.w) as usize && x < W {
+            if (canvas.canvas_get(cv, x, y) & 16777215 as u32) != (grund & 16777215 as u32) {
+                n = n + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+fn rgb(c: u32) -> i64 {
+    return (c & 16777215 as u32) as i64
+}
+
+// Prueft ein Feld: Text, Unterstreichung, Schreibzeiger. `nr` ist die
+// Nummer, unter der es im Bericht steht.
+fn pruefe_feld(c: *mut render.Ctx, cv: *mut canvas.Canvas, sc: *mut scene.Scene,
+    knoten: usize, ed: *mut editor.Editor, wp: u64, wn: usize,
+    lt: u64, ln: usize, lu: u64, lun: usize, lk: u64, lkn: usize,
+    lp: u64, lpn: usize, fg: u32) {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let e: *mut widget.Widget = scene.node_widget(sc, knoten)
+    let fk: Kasten = kasten_von(sc, knoten)
+    fordere(lt, ln, gleich(textbuf.tb_ptr(t), textbuf.tb_len(t), wp, wn),
+        textbuf.tb_len(t) as i64, wn as i64)
+    var ux: f64 = 0.0
+    var uy: f64 = 0.0
+    var uw: f64 = 0.0
+    var uh: f64 = 0.0
+    let da: bool = render.field_underline(c, e, t, 0.0, &ux, &uy, &uw, &uh)
+    let uk: Kasten = Kasten { x: ux, y: uy, w: uw, h: uh }
+    // Die Unterstreichung liegt ganz im Feld, innerhalb seines Randes.
+    let innenkasten: Kasten = Kasten { x: fk.x + 1.0, y: fk.y + 1.0,
+        w: fk.w - 2.0, h: fk.h - 2.0 }
+    fordere(lu, lun, da && uw > 0.0 && innen(uk, innenkasten),
+        b2i(da && uw > 0.0 && innen(uk, innenkasten)), 1)
+    // Und sie steht im Bild in der Schriftfarbe: der Punkt in ihrer Mitte.
+    let px: u32 = canvas.canvas_get(cv, (ux + uw / 2.0) as usize, uy as usize)
+    fordere(lk, lkn, rgb(px) == rgb(fg), rgb(px), rgb(fg))
+    // Der Text laeuft nicht aus dem Feld: sein Ende liegt vor dem
+    // rechten Innenabstand.
+    let ende: f64 = render.field_text_x0(c, e) + render.field_x_of(c, e, t,
+        textbuf.tb_len(t))
+    let rechts: f64 = fk.x + fk.w - (render.field_text_x0(c, e) - fk.x)
+    fordere(lp, lpn, ende <= rechts, ende as i64, rechts as i64)
+}
+
+// Legt die Liste eines Feldes unter seine Einfuegestelle und malt sie.
+// Zurueck kommt ihr Kasten.
+fn liste(c: *mut render.Ctx, sc: *mut scene.Scene, blatt: *mut sheet.Sheet,
+    seite: *mut scene.Scene, knoten: usize, ed: *mut editor.Editor) -> Kasten {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let e: *mut widget.Widget = scene.node_widget(seite, knoten)
+    // DIE EINFUEGESTELLE, WIE DAS FELD SIE MELDET: waagerecht der
+    // Schreibzeiger, senkrecht das ganze Feld. Eine Liste, die unter der
+    // Textzeile beginnt, laege sonst ueber dem unteren Innenrand und dem
+    // Rahmen des eigenen Feldes -- in einem einzeiligen Feld ist die
+    // Zeile das Feld.
+    editor.editor_ime_spot(ed, render.field_caret_x(c, e, t, 0.0),
+        widget.w_y(e), widget.w_h(e))
+    scene.scene_reset(sc)
+    let w: usize = imelist.imelist_build(sc, editor.editor_ime(ed))
+    imelist.imelist_layout(sc, blatt, c, editor.editor_ime(ed), W as f64, H as f64)
+    scene.scene_draw(sc, c)
+    return kasten_von(sc, w)
+}
+
+// Prueft eine gelegte Liste: Lage, Zeilen, Texte, Markierung.
+fn pruefe_liste(c: *mut render.Ctx, cv: *mut canvas.Canvas, sc: *mut scene.Scene,
+    ed: *mut editor.Editor, lk: Kasten, zeilen: usize, wahl: u32,
+    flaeche: u32) {
+    let m: *mut ime.Ime = editor.editor_ime(ed)
+    let wurzel: usize = scene.scene_root(sc)
+    // Die Zahl der Zeilen.
+    var zn: usize = scene.scene_child_count(sc, wurzel)
+    var a1: [u8; 18] = "  Zeilen der Liste"
+    fordere((&a1[0]) as u64, 18, zn == zeilen, zn as i64, zeilen as i64)
+    // Unter der Einfuegestelle und links an ihr.
+    let unten: f64 = ime.ime_spot_y(m) + ime.ime_spot_h(m)
+    var a2: [u8; 40] = "  Liste beginnt unter der Einfuegestelle"
+    fordere((&a2[0]) as u64, 40, lk.y >= unten, lk.y as i64, unten as i64)
+    var a3: [u8; 41] = "  Liste steht links an der Einfuegestelle"
+    let sx: i64 = (ime.ime_spot_x(m) + 0.5) as i64
+    fordere((&a3[0]) as u64, 41, (lk.x as i64) == sx, lk.x as i64, sx)
+    var a4: [u8; 34] = "  Liste bleibt in der Leinwand (1)"
+    let bild: Kasten = Kasten { x: 0.0, y: 0.0, w: W as f64, h: H as f64 }
+    fordere((&a4[0]) as u64, 34, innen(lk, bild), b2i(innen(lk, bild)), 1)
+    // Jede Zeile in der Tafel, keine ueber der naechsten, jeder Text in
+    // seiner Zeile und nicht schmaler, als er gemessen wurde.
+    var raus: usize = 0
+    var ueber: usize = 0
+    var eng: usize = 0
+    var leer: usize = 0
+    var vorher: f64 = 0.0 - 1.0
+    var k: usize = 0
+    while k < zn {
+        let z: usize = scene.scene_child_at(sc, wurzel, k)
+        let zk: Kasten = kasten_von(sc, z)
+        if !innen(zk, lk) {
+            raus = raus + 1
+        }
+        if zk.y < vorher {
+            ueber = ueber + 1
+        }
+        vorher = zk.y + zk.h
+        var j: usize = 0
+        while j < scene.scene_child_count(sc, z) {
+            let tx: usize = scene.scene_child_at(sc, z, j)
+            let tk: Kasten = kasten_von(sc, tx)
+            if !innen(tk, zk) {
+                raus = raus + 1
+            }
+            if scene.node_pref_w(sc, tx) > tk.w + 0.01 {
+                eng = eng + 1
+            }
+            // Der Punkt in der linken oberen Ecke des Textkastens ist
+            // Grund; steht ausser ihm nichts darin, fehlt die Schrift.
+            let gp: u32 = canvas.canvas_get(cv, tk.x as usize, tk.y as usize)
+            if tinte(cv, tk, gp) == 0 {
+                leer = leer + 1
+            }
+            j = j + 1
+        }
+        k = k + 1
+    }
+    var a5: [u8; 42] = "  Zeilen/Texte ausserhalb ihres Kastens: 0"
+    fordere((&a5[0]) as u64, 42, raus == 0, raus as i64, 0)
+    var a6: [u8; 29] = "  Zeilen ueber der vorigen: 0"
+    fordere((&a6[0]) as u64, 29, ueber == 0, ueber as i64, 0)
+    var a7: [u8; 32] = "  Texte schmaler als gemessen: 0"
+    fordere((&a7[0]) as u64, 32, eng == 0, eng as i64, 0)
+    var a7b: [u8; 35] = "  Texte ohne einen Punkt Schrift: 0"
+    fordere((&a7b[0]) as u64, 35, leer == 0, leer as i64, 0)
+    // Markierung: die gewaehlte Zeile (Kandidat 0) traegt TOK_SELECTION
+    // am linken Innenrand, die zweite die Tafelfarbe.
+    let z0: Kasten = kasten_von(sc, scene.scene_child_at(sc, wurzel, 0))
+    let z1: Kasten = kasten_von(sc, scene.scene_child_at(sc, wurzel, 1))
+    let p0: u32 = canvas.canvas_get(cv, (z0.x + 3.0) as usize, (z0.y + z0.h / 2.0) as usize)
+    let p1: u32 = canvas.canvas_get(cv, (z1.x + 3.0) as usize, (z1.y + z1.h / 2.0) as usize)
+    var a8: [u8; 41] = "  gewaehlte Zeile in der Markierungsfarbe"
+    fordere((&a8[0]) as u64, 41, rgb(p0) == rgb(wahl), rgb(p0), rgb(wahl))
+    var a9: [u8; 32] = "  die naechste in der Tafelfarbe"
+    fordere((&a9[0]) as u64, 32, rgb(p1) == rgb(flaeche), rgb(p1), rgb(flaeche))
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        var u: [u8; 58] = "imebeleg_main <out.png> light|dark <cjk-schrift.ttf|.ttc>\n"
+        rt.write_everything(2, (&u[0]) as u64, 58)
+        return 2
+    }
+    let path: u64 = rt.arg_ptr(start, 1)
+    var dark: bool = true
+    if rt.ld8(rt.arg_ptr(start, 2), 0) == 108 as u8 {
+        dark = false
+    }
+
+    // ---- DIE SCHRIFT. Ohne CJK-Glyphen waere das Bild eine Reihe leerer
+    // Kaesten -- dann gibt es KEIN Bild, sondern eine Meldung.
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 4 {
+        have = rt.read_file(rt.arg_ptr(start, 3), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 45] = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have && sammlung_erste(fbuf.ptr as u64, fbuf.len) {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    if fm == 0 {
+        var ks: [u8; 78] = "imebeleg: keine lesbare CJK-Schrift (TrueType-Umrisse) -- ohne sie kein Beleg\n"
+        rt.write_everything(2, (&ks[0]) as u64, 78)
+        return 9
+    }
+    let font: *mut ttf.Font = metrics.fontset_font(fm)
+
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, H) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(dark)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    canvas.canvas_clear(&cv, theme.opaque((*f).base))
+
+    // ==================================================================
+    // DIE VIER EINGABEN, GETIPPT
+    // ==================================================================
+    var roh1: [u8; 256] = [0; 256]
+    var roh2: [u8; 256] = [0; 256]
+    var roh3: [u8; 256] = [0; 256]
+    var roh4: [u8; 256] = [0; 256]
+    var ja: editor.Editor = editor.editor_new()
+    var ko: editor.Editor = editor.editor_new()
+    var zh: editor.Editor = editor.editor_new()
+    var au: editor.Editor = editor.editor_new()
+    if !editor.editor_init(&ja, (&roh1[0]) as u64, 256)
+        || !editor.editor_init(&ko, (&roh2[0]) as u64, 256)
+        || !editor.editor_init(&zh, (&roh3[0]) as u64, 256)
+        || !editor.editor_init(&au, (&roh4[0]) as u64, 256) {
+        return 3
+    }
+    editor.editor_ime_mode(&ja, ime.IME_KANA)
+    var j1: [u8; 4] = "kore"
+    tippe(&ja, (&j1[0]) as u64, 4)
+    enter(&ja)
+    var j2: [u8; 2] = "ha"
+    tippe(&ja, (&j2[0]) as u64, 2)
+    enter(&ja)
+    var j3: [u8; 8] = "nihongo "
+    tippe(&ja, (&j3[0]) as u64, 8)
+
+    editor.editor_ime_mode(&ko, ime.IME_HANGUL)
+    var k1: [u8; 12] = "dkssudgktpdy"
+    tippe(&ko, (&k1[0]) as u64, 12)
+
+    editor.editor_ime_mode(&zh, ime.IME_PINYIN)
+    var c1: [u8; 15] = "wo1men1zhongguo"
+    tippe(&zh, (&c1[0]) as u64, 15)
+
+    editor.editor_ime_mode(&au, ime.IME_KANA)
+    var t0: [u8; 11] = "Tokyo Tower"
+    textbuf.tb_set_text(editor.editor_buf(&au), (&t0[0]) as u64, 11)
+    textbuf.tb_set_range(editor.editor_buf(&au), 5, 0)
+    var au1: [u8; 7] = "toukyou"
+    tippe(&au, (&au1[0]) as u64, 7)
+
+    // ==================================================================
+    // DIE SEITE, BESCHRIEBEN
+    // ==================================================================
+    var ntitel: [u8; 5] = "titel"
+    var nnotiz: [u8; 5] = "notiz"
+    var nfeld: [u8; 4] = "feld"
+    let k_titel: u32 = sheet.sheet_name((&ntitel[0]) as u64, 5)
+    let k_notiz: u32 = sheet.sheet_name((&nnotiz[0]) as u64, 5)
+    let k_feld: u32 = sheet.sheet_name((&nfeld[0]) as u64, 4)
+    var blatt: sheet.Sheet = sheet.sheet_new()
+    var s1: style.Style = style.style_new()
+    s1 = style.style_set_font(s1, 0, 18)
+    s1 = style.style_set_fg(s1, style.color_token(style.TOK_TEXT))
+    s1 = style.style_set_pad(s1, 0, 0)
+    let r1: usize = sheet.sheet_rule(&blatt, sheet.sel_class(k_titel), s1)
+    var s2: style.Style = style.style_new()
+    s2 = style.style_set_font(s2, 0, 13)
+    s2 = style.style_set_fg(s2, style.color_token(style.TOK_TEXT_MUTED))
+    s2 = style.style_set_pad(s2, 0, 0)
+    let r2: usize = sheet.sheet_rule(&blatt, sheet.sel_class(k_notiz), s2)
+    var s3: style.Style = style.style_new()
+    s3 = style.style_set_font(s3, 0, 18)
+    let r3: usize = sheet.sheet_rule(&blatt, sheet.sel_class(k_feld), s3)
+    imelist.imelist_rules(&blatt)
+
+    var tt: [u8; 68] = "fUi -- Eingabemethode (IME): Vorbearbeitungstext und Kandidatenliste"
+    var cj: [u8; 40] = "Japanisch: kore, ha, nihongo + Leertaste"
+    var ck: [u8; 36] = "Koreanisch: dkssudgktpdy (Dubeolsik)"
+    var cz: [u8; 33] = "Chinesisch: wo 1, men 1, zhongguo"
+    var ca: [u8; 37] = "Auswahl Tokyo bleibt bis Enter stehen"
+    var le: [u8; 89] = "Unterstrichen: noch nicht bestaetigt. Liste: 1-9 waehlt, Pfeile blaettern, Esc schliesst."
+
+    var seite: scene.Scene = scene.scene_new()
+    let wurzel: usize = scene.scene_box(&seite, scene.SCENE_NONE, 0 as u32,
+        flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_padding(&seite, wurzel, 24, 20, 24, 20)
+    scene.node_set_gap(&seite, wurzel, 14, 0)
+    let titel: usize = scene.scene_add(&seite, wurzel, scene.N_TEXT)
+    let okt: bool = scene.node_add_class(&seite, titel, k_titel)
+    scene.node_set_text(&seite, titel, (&tt[0]) as u64, 68)
+    let reihe: usize = scene.scene_box(&seite, wurzel, 0 as u32, flex.FLEX_ROW,
+        flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_gap(&seite, reihe, 26, 0)
+    // Drei Spalten: Beschriftung und Feld.
+    var spalte: usize = 0
+    var feld_ja: usize = 0
+    var feld_ko: usize = 0
+    var feld_zh: usize = 0
+    var besch: [usize; 4] = [0; 4]
+    while spalte < 3 {
+        let sp: usize = scene.scene_box(&seite, reihe, 0 as u32, flex.FLEX_COLUMN,
+            flex.JUSTIFY_START, flex.AL_START)
+        scene.node_set_gap(&seite, sp, 8, 0)
+        let b: usize = scene.scene_add(&seite, sp, scene.N_TEXT)
+        let okb: bool = scene.node_add_class(&seite, b, k_notiz)
+        besch[spalte] = b
+        let fd: usize = scene.scene_add(&seite, sp, scene.N_WIDGET)
+        scene.node_set_widget_kind(&seite, fd, widget.KIND_TEXTBOX)
+        let okf: bool = scene.node_add_class(&seite, fd, k_feld)
+        scene.node_set_size(&seite, fd, FELD_W, FELD_H)
+        scene.node_set_state(&seite, fd, style.STATE_FOCUS)
+        if spalte == 0 {
+            scene.node_set_text(&seite, b, (&cj[0]) as u64, 40)
+            scene.node_set_draw(&seite, fd, (&ja) as u64, male_feld)
+            feld_ja = fd
+        } else if spalte == 1 {
+            scene.node_set_text(&seite, b, (&ck[0]) as u64, 36)
+            scene.node_set_draw(&seite, fd, (&ko) as u64, male_feld)
+            feld_ko = fd
+        } else {
+            scene.node_set_text(&seite, b, (&cz[0]) as u64, 33)
+            scene.node_set_draw(&seite, fd, (&zh) as u64, male_feld)
+            feld_zh = fd
+        }
+        spalte = spalte + 1
+    }
+    // Platz fuer die japanische Liste, dann das vierte Feld.
+    let luft: usize = scene.scene_box(&seite, wurzel, 0 as u32, flex.FLEX_COLUMN,
+        flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_size(&seite, luft, 10.0, 96.0)
+    let sp4: usize = scene.scene_box(&seite, wurzel, 0 as u32, flex.FLEX_COLUMN,
+        flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_gap(&seite, sp4, 8, 0)
+    let b4: usize = scene.scene_add(&seite, sp4, scene.N_TEXT)
+    let okb4: bool = scene.node_add_class(&seite, b4, k_notiz)
+    scene.node_set_text(&seite, b4, (&ca[0]) as u64, 37)
+    besch[3] = b4
+    let feld_au: usize = scene.scene_add(&seite, sp4, scene.N_WIDGET)
+    scene.node_set_widget_kind(&seite, feld_au, widget.KIND_TEXTBOX)
+    let okf4: bool = scene.node_add_class(&seite, feld_au, k_feld)
+    scene.node_set_size(&seite, feld_au, FELD_W, FELD_H)
+    scene.node_set_state(&seite, feld_au, style.STATE_FOCUS)
+    scene.node_set_draw(&seite, feld_au, (&au) as u64, male_feld)
+    let luft2: usize = scene.scene_box(&seite, wurzel, 0 as u32, flex.FLEX_COLUMN,
+        flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_size(&seite, luft2, 10.0, 98.0)
+    let legende: usize = scene.scene_add(&seite, wurzel, scene.N_TEXT)
+    let okl: bool = scene.node_add_class(&seite, legende, k_notiz)
+    scene.node_set_text(&seite, legende, (&le[0]) as u64, 89)
+
+    scene.scene_run(&seite, &c, &blatt, 0.0, 0.0, W as f64, H as f64)
+
+    // ---- DIE LISTEN, NACH DER SEITE: sie liegen oben auf.
+    var ls: scene.Scene = scene.scene_new()
+    let lk_ja: Kasten = liste(&c, &ls, &blatt, &seite, feld_ja, &ja)
+    let fehlt_ja: usize = ohne_glyphe(font, ime.ime_cand_text(editor.editor_ime(&ja), 0),
+        ime.ime_cand_len(editor.editor_ime(&ja), 0))
+        + ohne_glyphe(font, ime.ime_cand_text(editor.editor_ime(&ja), 1),
+        ime.ime_cand_len(editor.editor_ime(&ja), 1))
+    let wahl: u32 = theme.color_from_token(&m, style.TOK_SELECTION)
+    let tafel: u32 = theme.color_from_token(&m, style.TOK_SURFACE_RAISED)
+    var h1: [u8; 24] = "1 JAPANISCH -- die Liste"
+    fordere((&h1[0]) as u64, 24, true, 1, 1)
+    pruefe_liste(&c, &cv, &ls, &ja, lk_ja, 2, wahl, tafel)
+    let lk_zh: Kasten = liste(&c, &ls, &blatt, &seite, feld_zh, &zh)
+    var fehlt_zh: usize = 0
+    var q: usize = 0
+    while q < ime.ime_cand_count(editor.editor_ime(&zh)) {
+        fehlt_zh = fehlt_zh + ohne_glyphe(font,
+            ime.ime_cand_text(editor.editor_ime(&zh), q),
+            ime.ime_cand_len(editor.editor_ime(&zh), q))
+        q = q + 1
+    }
+    var h2: [u8; 25] = "2 CHINESISCH -- die Liste"
+    fordere((&h2[0]) as u64, 25, true, 1, 1)
+    pruefe_liste(&c, &cv, &ls, &zh, lk_zh, 9, wahl, tafel)
+    var q2: [u8; 46] = "2 Seite 1 zeigt 9 von 13 Kandidaten fuer zhong"
+    let nz: usize = ime.ime_cand_count(editor.editor_ime(&zh))
+    fordere((&q2[0]) as u64, 46, nz == 13, nz as i64, 13)
+
+    // ==================================================================
+    // WAS DAS BILD BELEGEN MUSS
+    // ==================================================================
+    let fg: u32 = theme.color_from_token(&m, style.TOK_TEXT)
+    var g0: [u8; 12] = "3 DIE FELDER"
+    fordere((&g0[0]) as u64, 12, true, 1, 1)
+    var q0: [u8; 40] = "3 keine Groesse driftet beim Zeichnen: 0"
+    fordere((&q0[0]) as u64, 40, scene.scene_size_drift(&seite) == 0,
+        scene.scene_size_drift(&seite) as i64, 0)
+    var q0b: [u8; 37] = "3 der Baum ist vollstaendig (Grund 0)"
+    fordere((&q0b[0]) as u64, 37,
+        scene.scene_overflow_reason(&seite) == scene.OF_NONE,
+        scene.scene_overflow_reason(&seite) as i64, 0)
+
+    var wj: [u8; 21] = "これはにほんご"
+    var lj1: [u8; 44] = "3 japanisch: これはにほんご, 21 Bytes"
+    var lj2: [u8; 40] = "3 japanisch: Unterstreichung im Feld (1)"
+    var lj3: [u8; 44] = "3 japanisch: Unterstreichung in Schriftfarbe"
+    var lj4: [u8; 39] = "3 japanisch: Textende vor dem Innenrand"
+    pruefe_feld(&c, &cv, &seite, feld_ja, &ja, (&wj[0]) as u64, 21,
+        (&lj1[0]) as u64, 44, (&lj2[0]) as u64, 40, (&lj3[0]) as u64, 44,
+        (&lj4[0]) as u64, 39, fg)
+    var wk: [u8; 15] = "안녕하세요"
+    var lk1: [u8; 39] = "3 koreanisch: 안녕하세요, 15 Bytes"
+    var lk2: [u8; 41] = "3 koreanisch: Unterstreichung im Feld (1)"
+    var lk3: [u8; 45] = "3 koreanisch: Unterstreichung in Schriftfarbe"
+    var lk4: [u8; 40] = "3 koreanisch: Textende vor dem Innenrand"
+    pruefe_feld(&c, &cv, &seite, feld_ko, &ko, (&wk[0]) as u64, 15,
+        (&lk1[0]) as u64, 39, (&lk2[0]) as u64, 41, (&lk3[0]) as u64, 45,
+        (&lk4[0]) as u64, 40, fg)
+    // Nur 요 ist Vorbearbeitung: ab Byte 12, 3 Bytes.
+    let kt: *mut textbuf.TextBuf = editor.editor_buf(&ko)
+    var lk5: [u8; 44] = "3 koreanisch: nur 요 ist im Bau, ab Byte 12"
+    fordere((&lk5[0]) as u64, 44, textbuf.tb_comp_a(kt) == 12,
+        textbuf.tb_comp_a(kt) as i64, 12)
+    var wz: [u8; 14] = "我们zhongguo"
+    var lz1: [u8; 38] = "3 chinesisch: 我们zhongguo, 14 Bytes"
+    var lz2: [u8; 41] = "3 chinesisch: Unterstreichung im Feld (1)"
+    var lz3: [u8; 45] = "3 chinesisch: Unterstreichung in Schriftfarbe"
+    var lz4: [u8; 40] = "3 chinesisch: Textende vor dem Innenrand"
+    pruefe_feld(&c, &cv, &seite, feld_zh, &zh, (&wz[0]) as u64, 14,
+        (&lz1[0]) as u64, 38, (&lz2[0]) as u64, 41, (&lz3[0]) as u64, 45,
+        (&lz4[0]) as u64, 40, fg)
+    var wa: [u8; 26] = "Tokyoとうきょう Tower"
+    var la1: [u8; 47] = "3 Auswahl: Tokyoとうきょう Tower, 26 Bytes"
+    var la2: [u8; 38] = "3 Auswahl: Unterstreichung im Feld (1)"
+    var la3: [u8; 42] = "3 Auswahl: Unterstreichung in Schriftfarbe"
+    var la4: [u8; 37] = "3 Auswahl: Textende vor dem Innenrand"
+    pruefe_feld(&c, &cv, &seite, feld_au, &au, (&wa[0]) as u64, 26,
+        (&la1[0]) as u64, 47, (&la2[0]) as u64, 38, (&la3[0]) as u64, 42,
+        (&la4[0]) as u64, 37, fg)
+    // Die gemerkte Auswahl (Tokyo, 0..5) ist im Bild markiert.
+    let ea: *mut widget.Widget = scene.node_widget(&seite, feld_au)
+    var ftop: f64 = 0.0
+    var flh: f64 = 0.0
+    let fby: f64 = render.field_line(&c, ea, &ftop, &flh)
+    let mx: f64 = render.field_text_x0(&c, ea) + 1.0
+    let pm: u32 = canvas.canvas_get(&cv, mx as usize, (ftop + 1.0) as usize)
+    var la5: [u8; 32] = "3 Auswahl: Tokyo bleibt markiert"
+    fordere((&la5[0]) as u64, 32, rgb(pm) == rgb(wahl), rgb(pm), rgb(wahl))
+
+    // ---- NICHTS UEBERDECKT ETWAS
+    var g1: [u8; 25] = "4 NICHTS UEBERDECKT ETWAS"
+    fordere((&g1[0]) as u64, 25, true, 1, 1)
+    var stoesst: usize = 0
+    var andere: [usize; 9] = [0; 9]
+    andere[0] = feld_ja
+    andere[1] = feld_ko
+    andere[2] = feld_zh
+    andere[3] = feld_au
+    andere[4] = besch[0]
+    andere[5] = besch[1]
+    andere[6] = besch[2]
+    andere[7] = besch[3]
+    andere[8] = legende
+    var i: usize = 0
+    while i < 9 {
+        let ak: Kasten = kasten_von(&seite, andere[i])
+        // Die Liste des japanischen Feldes steht unter IHREM Feld, die
+        // des chinesischen unter seinem -- gegen alles andere wird
+        // geprueft, gegen das eigene Feld auch: sie beginnt darunter.
+        if schneiden(lk_ja, ak) {
+            stoesst = stoesst + 1
+        }
+        if schneiden(lk_zh, ak) {
+            stoesst = stoesst + 1
+        }
+        i = i + 1
+    }
+    var q4: [u8; 45] = "4 Listen ueber Feldern oder Beschriftungen: 0"
+    fordere((&q4[0]) as u64, 45, stoesst == 0, stoesst as i64, 0)
+    var q5: [u8; 39] = "4 die beiden Listen ueberdecken sich: 0"
+    fordere((&q5[0]) as u64, 39, !schneiden(lk_ja, lk_zh),
+        b2i(schneiden(lk_ja, lk_zh)), 0)
+    // Kein Knoten der Seite laeuft aus der Leinwand, keine Beschriftung
+    // ist schmaler, als sie gemessen wurde.
+    var eng: usize = 0
+    var raus: usize = 0
+    let bild: Kasten = Kasten { x: 0.0, y: 0.0, w: W as f64, h: H as f64 }
+    var n: usize = 0
+    while n < scene.scene_count(&seite) {
+        if !innen(kasten_von(&seite, n), bild) {
+            raus = raus + 1
+        }
+        if scene.node_kind(&seite, n) == scene.N_TEXT
+            && scene.node_pref_w(&seite, n) > scene.node_w(&seite, n) + 0.01 {
+            eng = eng + 1
+        }
+        n = n + 1
+    }
+    var q6: [u8; 35] = "4 Knoten ausserhalb der Leinwand: 0"
+    fordere((&q6[0]) as u64, 35, raus == 0, raus as i64, 0)
+    var q7: [u8; 41] = "4 Beschriftungen schmaler als gemessen: 0"
+    fordere((&q7[0]) as u64, 41, eng == 0, eng as i64, 0)
+    // Die lange chinesische Liste endet ueber der Legende, mit Luft.
+    let lg0: Kasten = kasten_von(&seite, legende)
+    let spalt: i64 = (lg0.y - (lk_zh.y + lk_zh.h)) as i64
+    var q7b: [u8; 41] = "4 Luft zwischen Liste und Legende mind. 8"
+    fordere((&q7b[0]) as u64, 41, spalt >= 8, spalt, 8)
+    // Der unterste Inhalt (die Legende) laesst unten 16 bis 40 Punkte Rand.
+    let lg: Kasten = kasten_von(&seite, legende)
+    let rand: i64 = H as i64 - (lg.y + lg.h) as i64
+    var q8: [u8; 38] = "4 Rand unter der Legende hoechstens 40"
+    fordere((&q8[0]) as u64, 38, rand >= 16 && rand <= 40, rand, 40)
+
+    // ---- DIE SCHRIFT HAT JEDE GLYPHE
+    var g2: [u8; 13] = "5 DIE SCHRIFT"
+    fordere((&g2[0]) as u64, 13, true, 1, 1)
+    var fehlt: usize = fehlt_ja + fehlt_zh
+    fehlt = fehlt + ohne_glyphe(font, textbuf.tb_ptr(editor.editor_buf(&ja)),
+        textbuf.tb_len(editor.editor_buf(&ja)))
+    fehlt = fehlt + ohne_glyphe(font, textbuf.tb_ptr(editor.editor_buf(&ko)),
+        textbuf.tb_len(editor.editor_buf(&ko)))
+    fehlt = fehlt + ohne_glyphe(font, textbuf.tb_ptr(editor.editor_buf(&zh)),
+        textbuf.tb_len(editor.editor_buf(&zh)))
+    fehlt = fehlt + ohne_glyphe(font, textbuf.tb_ptr(editor.editor_buf(&au)),
+        textbuf.tb_len(editor.editor_buf(&au)))
+    fehlt = fehlt + ohne_glyphe(font, (&tt[0]) as u64, 68)
+    fehlt = fehlt + ohne_glyphe(font, (&le[0]) as u64, 89)
+    var q9: [u8; 33] = "5 gezeigte Zeichen ohne Glyphe: 0"
+    fordere((&q9[0]) as u64, 33, fehlt == 0, fehlt as i64, 0)
+
+    if G_FEHLER > 0 {
+        var gf: [u8; 59] = "imebeleg: das Blatt haelt seine Zusage nicht -- kein Beleg\n"
+        rt.write_everything(2, (&gf[0]) as u64, 59)
+        return 10
+    }
+
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(&cv, &out) {
+        return 6
+    }
+    var pf: rt.Buf = rt.buf_new()
+    var pk: usize = 0
+    while pk < rt.c_length(path) {
+        rt.buf_push(&pf, rt.ld8(path, pk))
+        pk = pk + 1
+    }
+    rt.buf_push(&pf, 0 as u8)
+    if !rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64,
+        mem.buf_len(&out)) {
+        return 7
+    }
+    var okm: [u8; 10] = "IME-BELEG\n"
+    rt.write_everything(1, (&okm[0]) as u64, 10)
+    editor.editor_free(&ja)
+    editor.editor_free(&ko)
+    editor.editor_free(&zh)
+    editor.editor_free(&au)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    return 0
+}

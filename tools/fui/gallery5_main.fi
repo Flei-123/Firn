@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/gallery5_main.fi -- DIE ZEIT ALS BILD.
+//
+// Eine Bewegung kann man auf einem Standbild nur auf eine Art zeigen:
+// als PHASENREIHE. Jede Zeile ist eine Easing, jede Spalte ein
+// Zeitpunkt; die Kachel wandert nach rechts und wechselt dabei ihre
+// Farbe. Dass die Reihen unterschiedlich AUSSEHEN -- die lineare
+// gleichmaessig, ease-in-out zusammengeschoben an den Enden, die Feder
+// ueber das Ziel hinaus -- ist der Beleg, dass die Kurven wirklich
+// verschieden rechnen.
+//
+// Die UNTERE HAELFTE ist der eigentliche Beleg fuer `transition`: dort
+// stehen ECHTE Knoepfe (widget.Widget, gemalt von render.draw_button)
+// in den Zwischenstaenden der Wechsel normal -> hover, normal ->
+// pressed, normal -> focus und eines Verblassens. Jede Kachel ist
+// derselbe Knopf, nur zu einem anderen Zeitpunkt des Uebergangs
+// abgelesen: die Farbe wandert, die Ecke wird runder oder enger, der
+// Rand waechst, die Kachel hebt sich oder senkt sich, die Deckung
+// faellt. Wer nur die erste und die letzte Spalte ansieht, sieht die
+// beiden Zustaende, die es heute schon gibt; die sieben dazwischen
+// sind das, was diese Runde dazugebaut hat.
+//
+//     gallery5_main <out.png> [light|dark] [<font.ttf>]
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.anim
+
+const FONTSET_BYTES: usize = 4096
+const W: usize = 1240
+const H: usize = 764
+const PHASEN: usize = 9
+
+// Die Masse der unteren Haelfte. Neun Spalten a 100 Punkt mit 11
+// Punkt Abstand beginnen bei 236 und enden bei 1224 -- 16 Punkt vor
+// dem rechten Rand, damit nichts anstoesst.
+const KX: f64 = 236.0
+const KS: f64 = 111.0
+const KW: f64 = 100.0
+const KH: f64 = 36.0
+const UEB_MS: i64 = 400
+// Die Marke einer Phase: 14 Punkt breit, und jede Phase steht 2.5
+// Punkt tiefer als die vorige. Beide Zahlen stehen genauso in
+// tools/fui/anim_main.fi Abschnitt 13, das die Lagen nachrechnet.
+//
+// 20.09.2026 -- WARUM DIE BAHN LAENGER UND DIE MARKE SCHMALER IST.
+// Gefordert ist nicht mehr bloss, dass zwei Phasen sich nicht
+// beruehren (eine Markenbreite Abstand), sondern dass zwischen ihnen
+// SICHTBARER GRUND stehen bleibt: MARKE_W + 6. Bei der Feder liegen
+// die beiden engsten Phasen 2.26 % der Bahn auseinander; mit der
+// alten Bahn (940 Punkt, Marke 18) waren das 20.2 Punkt und damit
+// nur 2 Punkt Grund. Die Bahn beginnt darum jetzt bei 150 statt 260
+// (die Reihenbeschriftung braucht keine 236 Punkt) und ist 1066
+// statt 940 Punkt lang, die Marke ist 14 statt 18 Punkt breit: aus
+// 20.2 werden 23.2 Punkt Abstand bei 14 Punkt Marke -- 9 Punkt
+// Grund zwischen den beiden engsten Marken der ganzen Seite.
+const MARKE_W: f64 = 14.0
+const STUFE: f64 = 2.5
+const BAHN_X: f64 = 150.0
+const BAHN_W: f64 = 1066.0
+
+// DER BREITESTE UEBERHANG DER GANZEN SEITE, IN PUNKT.
+//
+// Jede Beschriftung dieses Belegs geht durch `label`, und `label` misst
+// sie mit DEMSELBEN Weg, den das Layout nimmt (`render.pref_of`), gegen
+// das Feld, in das sie gemalt wird. Steht hier am Ende eine positive
+// Zahl, dann hat ein Text mehr Platz gebraucht als sein Band hergibt --
+// und dann wird das Bild NICHT geschrieben. Genau diese Sorte Fehler
+// hat aus "red fixed" ein "red fixe" gemacht: niemand hat die Sollbreite
+// gegen das Feld gerechnet, und im Bild sah es aus wie ein Wort.
+static mut G_UEBERHANG: f64 = -100000.0
+
+// Eine Beschriftung, und zurueck kommt die SOLLBREITE in Punkt (was der
+// Text bei dieser Groesse wirklich braucht). Der Ueberhang gegen das
+// Feld wird in G_UEBERHANG mitgefuehrt, damit `main` am Ende EINE Zahl
+// nachrechnen kann statt an dreissig Stellen.
+fn label(c: *mut render.Ctx, x: f64, y: f64, w: f64, px: usize, p: u64,
+    n: usize, tok: u32) -> f64 {
+    var e: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&e, x, y, w, 18.0)
+    widget.w_set_text(&e, p, n)
+    let s: *mut style.Style = widget.w_style(&e)
+    *s = style.style_set_fg(*s, style.color_token(tok))
+    *s = style.style_set_font(*s, 0, px)
+    *s = style.style_set_pad(*s, 0, 0)
+    var pw: f64 = 0.0
+    var ph: f64 = 0.0
+    render.pref_of(c, &e, &pw, &ph)
+    if pw - w > G_UEBERHANG {
+        G_UEBERHANG = pw - w
+    }
+    render.draw_label(c, &e)
+    return pw
+}
+
+// Der kleinere zweier Abstaende -- die engste Stelle der Seite
+// entsteht aus sechs Reihen, und gefordert ist sie fuer jede.
+fn enger(a: f64, b: f64) -> f64 {
+    if b < a {
+        return b
+    }
+    return a
+}
+
+// Eine Reihe: dieselbe Animation, an neun Zeitpunkten abgelesen.
+//
+// ZURUECK KOMMT DER KLEINSTE ABSTAND, DEN DIESE REIHE WIRKLICH GEMALT
+// HAT (in Punkt, Phasen auf demselben Wert zaehlen nicht mit). Nicht
+// der gerechnete, sondern der GEMALTE: `main` haelt damit nach, dass
+// zwischen je zwei Marken sichtbarer Grund stehen bleibt, und bricht
+// sonst mit einem Fehler ab -- genau wie demos/fuidemo/main.fi das mit
+// seinen Phasen tut. Ein Beleg, auf dem zwei Phasen zu einem Block
+// verschmelzen, behauptet neun und zeigt acht.
+fn reihe(c: *mut render.Ctx, m: *mut theme.Theme, y: f64, e: anim.Easing,
+    nm: u64, nn: usize) -> f64 {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    label(c, 24.0, y, 120.0, 12, nm, nn, style.TOK_TEXT)
+    var a: anim.Animation = anim.anim_new(0, 1000, 0.0, 1.0, e)
+    let bahn_x: f64 = BAHN_X
+    let bahn_w: f64 = BAHN_W
+    // Die Bahn, damit der Weg sichtbar ist und nicht nur die Kacheln.
+    painter.round_rect(z, bahn_x, y + 22.0, bahn_w, 2.0, 1.0,
+        theme.opaque((*f).separator))
+    // ERST LESEN, DANN ZEICHNEN. Eine Feder schiesst ueber 1 hinaus,
+    // und frueher wurde dieser Ueberschuss bei 1.12 ABGESCHNITTEN --
+    // drei Phasen landeten dadurch auf demselben Punkt und lagen im
+    // Bild uebereinander, also belegte die Reihe genau das nicht, was
+    // sie zeigen soll. Jetzt wird zuerst der ganze Wertebereich der
+    // Reihe bestimmt und die Bahn danach skaliert: der Ueberschuss
+    // bleibt sichtbar, und jede Phase bekommt ihre eigene Lage.
+    // Nachgerechnet wird das in tools/fui/anim_main.fi Abschnitt 8 --
+    // dort steht dieselbe Rechnung und fordert, dass die neun Lagen
+    // paarweise mindestens eine Markenbreite auseinander liegen.
+    var lo: f64 = 0.0
+    var hi: f64 = 1.0
+    var k: usize = 0
+    while k < PHASEN {
+        let vk: f64 = anim.anim_value(&a, ((k * 1000) / (PHASEN - 1)) as i64)
+        if vk < lo {
+            lo = vk
+        }
+        if vk > hi {
+            hi = vk
+        }
+        k = k + 1
+    }
+    let spanne: f64 = hi - lo
+    // Die Lagen und die Werte der neun Phasen, so wie sie gleich
+    // gemalt werden -- aus DIESEN Zahlen wird unten der kleinste
+    // Abstand bestimmt, nicht aus einer zweiten Rechnung daneben.
+    var lage: [f64; 9] = [0.0; 9]
+    var wert: [f64; 9] = [0.0; 9]
+    var i: usize = 0
+    while i < PHASEN {
+        let t: i64 = ((i * 1000) / (PHASEN - 1)) as i64
+        let v: f64 = anim.anim_value(&a, t)
+        let anteil: f64 = (v - lo) / spanne
+        let kx: f64 = bahn_x + 12.0 + anteil * (bahn_w - MARKE_W - 24.0)
+        lage[i] = kx
+        wert[i] = v
+        // Und zusaetzlich steht jede Phase eine Stufe tiefer als die
+        // vorige. Bei `steps(5)` fallen zwei Phasen auf denselben Wert
+        // -- das ist die Aussage einer Treppe und darf nicht
+        // weggerechnet werden; sichtbar bleiben beide trotzdem, weil
+        // sie sich in der Hoehe unterscheiden.
+        let ky: f64 = y + 4.0 + (i as f64) * STUFE
+        let col: u32 = anim.mix_oklab(theme.opaque((*f).button),
+            theme.opaque((*f).accent), (i as f64) / ((PHASEN - 1) as f64))
+        // Die spaeteren Phasen decken staerker: die Reihe liest sich
+        // von links nach rechts wie eine Bewegung.
+        let al: f64 = 0.25 + 0.75 * ((i as f64) / ((PHASEN - 1) as f64))
+        let a8: u32 = ((al * 255.0) as i64) as u32
+        painter.round_rect(z, kx, ky, MARKE_W, 26.0, 6.0,
+            (a8 << 24) | (col & 16777215 as u32))
+        i = i + 1
+    }
+    // Der kleinste Abstand ZWEIER BELIEBIGER Marken dieser Reihe. Zwei
+    // Phasen auf demselben Wert stehen zu Recht am selben Ort -- das
+    // ist die Aussage einer Treppe (`steps(5)` haelt dreimal still),
+    // und sie bleiben sichtbar, weil jede Phase eine Stufe tiefer
+    // steht als die vorige.
+    var klein: f64 = 100000.0
+    var p: usize = 0
+    while p < PHASEN {
+        var q: usize = p + 1
+        while q < PHASEN {
+            if wert[p] != wert[q] {
+                var d: f64 = lage[q] - lage[p]
+                if d < 0.0 {
+                    d = 0.0 - d
+                }
+                if d < klein {
+                    klein = d
+                }
+            }
+            q = q + 1
+        }
+        p = p + 1
+    }
+    return klein
+}
+
+// EINE REIHE ECHTER KNOEPFE DURCH EINEN ZUSTANDSWECHSEL.
+//
+// `ziel` ist der Zustand, auf den zugelaufen wird. Fuer hover und
+// pressed werden die Zustandsbits am Widget gesetzt, und der Uebergang
+// holt sich seine Zielwerte selbst (`anim.trans_from_widget`) -- das
+// ist der Weg, den eine Anwendung geht. Fuer den Fokus bleiben die
+// Bits aus und die Zielwerte werden einzeln geholt: sonst malte
+// `render.draw_focus_ring` den fertigen Ring in JEDE Phase, und der
+// weiche Anlauf des Randes waere nicht mehr zu sehen.
+fn uebergang(c: *mut render.Ctx, m: *mut theme.Theme, y: f64, nm: u64,
+    nn: usize, ziel: u32) -> usize {
+    label(c, 24.0, y + 9.0, 200.0, 12, nm, nn, style.TOK_TEXT)
+    var e: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    var bt: [u8; 6] = "Button"
+    widget.w_set_text(&e, (&bt[0]) as u64, 6)
+    widget.w_place(&e, KX, y, KW, KH)
+    let s: *mut style.Style = widget.w_style(&e)
+    *s = style.style_set_font(*s, 0, 13)
+    if ziel == style.STATE_FOCUS {
+        // Der Rand ist im Ruhezustand null Punkt breit; sichtbar wird
+        // er erst dadurch, dass der Uebergang ihn auf focus_w zieht.
+        // Die Farbe dazu ist der Akzent -- dieselbe wie die des Ringes.
+        *s = style.style_set_border(*s, style.color_token(style.TOK_ACCENT), 0)
+    }
+    var tr: anim.Transition = anim.trans_new(
+        anim.widget_target_bg(c, &e, style.STATE_NORMAL),
+        anim.widget_target_radius(c, &e, style.STATE_NORMAL),
+        anim.widget_target_border(c, &e, style.STATE_NORMAL), 1.0)
+    anim.trans_set_duration(&tr, UEB_MS)
+    anim.trans_set_easing(&tr, anim.easing_named(anim.EASE_OUT))
+    if ziel == style.STATE_HOVER {
+        widget.w_set_hover(&e, true)
+        anim.trans_from_widget(&tr, c, &e, 0)
+    } else if ziel == style.STATE_ACTIVE {
+        widget.w_set_active(&e, true)
+        anim.trans_from_widget(&tr, c, &e, 0)
+    } else {
+        anim.trans_to_state(&tr, 0, ziel,
+            anim.widget_target_bg(c, &e, ziel),
+            anim.widget_target_radius(c, &e, ziel),
+            anim.widget_target_border(c, &e, ziel),
+            anim.widget_target_alpha(c, &e, ziel),
+            anim.state_dx(ziel), anim.state_dy(ziel))
+    }
+    var i: usize = 0
+    while i < PHASEN {
+        let t: i64 = ((i as i64) * UEB_MS) / ((PHASEN - 1) as i64)
+        anim.trans_tick(&tr, t)
+        anim.trans_apply(&tr, &e)
+        anim.trans_place(&tr, &e, KX + (i as f64) * KS, y, KW, KH)
+        render.draw_button(c, &e)
+        i = i + 1
+    }
+    // Die EINS, die diese Reihe zur Kopfzeile beitraegt: die Zahl im
+    // Titel wird ADDIERT und nicht behauptet.
+    return 1
+}
+
+// DAS VERBLASSEN. Farbe UND Deckung zugleich, und die Farbe laeuft in
+// OKLab -- vom Akzent zur Erfolgsfarbe, also quer durch den Farbkreis.
+// In sRGB ginge dieser Weg durch ein totes Grau; hier bleibt jede
+// Zwischenstufe bunt.
+//
+// Die Deckung wird gegen den Grund VERRECHNET, weil `render` eine
+// Flaeche deckend malt: `anim.mix_srgb(Grund, Farbe, Deckung)` ist
+// genau das, was ein Alpha-Auftrag auf diesen einfarbigen Grund
+// ergibt -- dieselbe Rechnung, nur einen Schritt frueher.
+fn verblassen(c: *mut render.Ctx, m: *mut theme.Theme, y: f64, nm: u64,
+    nn: usize) -> usize {
+    label(c, 24.0, y + 9.0, 200.0, 12, nm, nn, style.TOK_TEXT)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    let grund: u32 = theme.opaque((*f).base)
+    var e: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&e, KX, y, KW, KH)
+    var tr: anim.Transition = anim.trans_new(theme.opaque((*f).accent),
+        10.0, 0.0, 1.0)
+    anim.trans_set_duration(&tr, UEB_MS)
+    anim.trans_set_easing(&tr, anim.easing_linear())
+    anim.trans_set_oklab(&tr, true)
+    anim.trans_to_state(&tr, 0, style.STATE_NORMAL,
+        theme.opaque((*f).success), 18.0, 0.0, 0.35, 0.0, 0.0)
+    var i: usize = 0
+    while i < PHASEN {
+        let t: i64 = ((i as i64) * UEB_MS) / ((PHASEN - 1) as i64)
+        anim.trans_tick(&tr, t)
+        anim.trans_apply(&tr, &e)
+        let s: *mut style.Style = widget.w_style(&e)
+        *s = style.style_set_bg(*s, style.color_literal(
+            anim.mix_srgb(grund, anim.trans_color(&tr),
+                anim.trans_alpha(&tr)) & 16777215 as u32))
+        anim.trans_place(&tr, &e, KX + (i as f64) * KS, y, KW, KH)
+        render.draw_button(c, &e)
+        i = i + 1
+    }
+    return 1
+}
+
+// ============ DAS RASTER WIRD NACHGERECHNET (wie gallery7/gallery8)
+//
+// Die Belegpruefung von aussen sieht nur, DASS irgendwo Farbe steht.
+// Ob eine Beschriftung wirklich in IHRER Zeile steht oder in das Band
+// darueber gerutscht ist, weiss nur dieses Programm.
+static mut G_FEHLER: usize = 0
+
+fn verlange(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 44 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "FALSCH  "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_FEHLER = G_FEHLER + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Wieviele Bildpunkte in y0..y1 sich vom Grund unterscheiden.
+fn band_hat_farbe(cv: *mut canvas.Canvas, y0: usize, y1: usize,
+    bg: u32) -> i64 {
+    let w: usize = canvas.canvas_width(cv)
+    var n: i64 = 0
+    var y: usize = y0
+    while y <= y1 && y < canvas.canvas_height(cv) {
+        var x: usize = 0
+        while x < w {
+            if canvas.canvas_get(cv, x, y) != bg {
+                n = n + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        var u: [u8; 47] = "gallery5_main <out.png> [light|dark] [font.ttf]"
+        rt.write_everything(2, (&u[0]) as u64, 47)
+        return 2
+    }
+    let path: u64 = rt.arg_ptr(start, 1)
+    var dark: bool = true
+    if rt.arg_count(start) >= 3 {
+        if rt.ld8(rt.arg_ptr(start, 2), 0) == 108 as u8 {
+            dark = false
+        }
+    }
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 4 {
+        have = rt.read_file(rt.arg_ptr(start, 3), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    // OHNE SCHRIFT KEIN BELEG. Ein Bild ohne einen einzigen
+    // Buchstaben sieht von weitem aus wie ein Bild, und genau so ist
+    // in OrientOS eine textlose Oberflaeche durch die Abnahme
+    // gekommen. Ein Beleg ohne Beschriftung belegt nichts -- also
+    // Fehler auf fd 2 und ein Rueckgabewert, an dem der Lauf
+    // haengenbleibt, statt ein stummes PNG zu schreiben.
+    if fm == 0 {
+        var ks: [u8; 60] = "gallery5: keine Schrift gefunden -- ohne Schrift kein Beleg\n"
+        rt.write_everything(2, (&ks[0]) as u64, 60)
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, 300) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(dark)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    canvas.canvas_clear(&cv, theme.opaque((*f).base))
+
+    // Die vier Kopfzeilen stehen am ENDE dieser Funktion: sie nennen,
+    // wie viele Kurven und wie viele Zustandswechsel das Blatt zeigt,
+    // und diese Zahlen entstehen erst beim Malen.
+    var kurven: usize = 0
+    var wechsel: usize = 0
+
+    var y: f64 = 90.0
+    // DIE ENGSTE STELLE DER GANZEN SEITE. Jede Reihe meldet, wie nah
+    // sich ihre beiden dichtesten Marken gekommen sind; gefordert ist
+    // MARKE_W + 2, also die Breite einer Marke PLUS zwei Punkt Grund
+    // dazwischen. Die engsten Stellen sind die Feder (sie kehrt um und
+    // legt zwei Phasen dicht nebeneinander) und der Auslauf von
+    // ease-out. Gerechnet wird mit den GEMALTEN Lagen, und ein Beleg,
+    // der die Bedingung verletzt, wird nicht geschrieben.
+    var eng: f64 = 100000.0
+    var l1: [u8; 6] = "linear"
+    eng = enger(eng, reihe(&c, &m, y, anim.easing_linear(),
+        (&l1[0]) as u64, 6))
+    kurven = kurven + 1
+    y = y + 66.0
+    var l2: [u8; 7] = "ease-in"
+    eng = enger(eng, reihe(&c, &m, y, anim.easing_named(anim.EASE_IN),
+        (&l2[0]) as u64, 7))
+    kurven = kurven + 1
+    y = y + 66.0
+    var l3: [u8; 8] = "ease-out"
+    eng = enger(eng, reihe(&c, &m, y, anim.easing_named(anim.EASE_OUT),
+        (&l3[0]) as u64, 8))
+    kurven = kurven + 1
+    y = y + 66.0
+    var l4: [u8; 11] = "ease-in-out"
+    eng = enger(eng, reihe(&c, &m, y, anim.easing_named(anim.EASE_IN_OUT),
+        (&l4[0]) as u64, 11))
+    kurven = kurven + 1
+    y = y + 66.0
+    var l5: [u8; 8] = "steps(5)"
+    eng = enger(eng, reihe(&c, &m, y, anim.easing_steps(5),
+        (&l5[0]) as u64, 8))
+    kurven = kurven + 1
+    y = y + 66.0
+    var l6: [u8; 18] = "spring(1, 30, 4.5)"
+    eng = enger(eng, reihe(&c, &m, y, anim.easing_spring(1.0, 30.0, 4.5),
+        (&l6[0]) as u64, 18))
+    kurven = kurven + 1
+    if eng < MARKE_W + 2.0 {
+        var pm: [u8; 57] = "gallery5: zwei Phasenmarken stehen zu dicht beieinander.\n"
+        rt.write_everything(2, (&pm[0]) as u64, 57)
+        return 8
+    }
+
+    // ============================ DIE ZUSTANDSWECHSEL AM ECHTEN WIDGET
+    var u1: [u8; 25] = "normal -> hover (rises 1)"
+    wechsel = wechsel + uebergang(&c, &m, 540.0, (&u1[0]) as u64, 25,
+        style.STATE_HOVER)
+    var u2: [u8; 27] = "normal -> pressed (sinks 1)"
+    wechsel = wechsel + uebergang(&c, &m, 596.0, (&u2[0]) as u64, 27,
+        style.STATE_ACTIVE)
+    var u3: [u8; 26] = "normal -> focus (border 2)"
+    wechsel = wechsel + uebergang(&c, &m, 652.0, (&u3[0]) as u64, 26,
+        style.STATE_FOCUS)
+    var u4: [u8; 24] = "OKLab blue->green, a .35"
+    wechsel = wechsel + verblassen(&c, &m, 708.0, (&u4[0]) as u64, 24)
+
+    // ========================================== JETZT DIE KOPFZEILEN
+    //
+    // JEDE ZEILE EIN GANZER SATZ. Frueher lief ein einziger Satz ueber
+    // Titel und Unterzeile ("ANIMATION -- the same tween, six" /
+    // "curves, nine phases each"), und wer nur die fette Zeile las,
+    // bekam ein abgerissenes Stueck Sprache. Jetzt traegt der Titel
+    // den Gegenstand, die graue Zeile den Messaufbau -- und beide
+    // nennen die Zahlen, die oben wirklich gemalt wurden.
+    var h1: rt.Buf = rt.buf_new()
+    var h1a: [u8; 13] = "ANIMATION -- "
+    var h1b: [u8; 15] = " easing curves."
+    rt.buf_push_bytes(&h1, (&h1a[0]) as u64, 13)
+    rt.buf_push_dec_u64(&h1, kurven as u64)
+    rt.buf_push_bytes(&h1, (&h1b[0]) as u64, 15)
+    let w1: f64 = label(&c, 24.0, 22.0, 900.0, 15, rt.buf_ptr(&h1),
+        rt.buf_len(&h1), style.TOK_TEXT)
+    rt.buf_free(&h1)
+
+    var h2: rt.Buf = rt.buf_new()
+    var h2a: [u8; 46] = "The same tween runs through each, read off at "
+    var h2b: [u8; 39] = " phases from 0 ms to 1000 ms per curve."
+    rt.buf_push_bytes(&h2, (&h2a[0]) as u64, 46)
+    rt.buf_push_dec_u64(&h2, PHASEN as u64)
+    rt.buf_push_bytes(&h2, (&h2b[0]) as u64, 39)
+    let w2: f64 = label(&c, 24.0, 44.0, 900.0, 12, rt.buf_ptr(&h2),
+        rt.buf_len(&h2), style.TOK_TEXT_MUTED)
+    rt.buf_free(&h2)
+
+    var h3: rt.Buf = rt.buf_new()
+    var h3a: [u8; 14] = "TRANSITION -- "
+    var h3b: [u8; 15] = " state changes."
+    rt.buf_push_bytes(&h3, (&h3a[0]) as u64, 14)
+    rt.buf_push_dec_u64(&h3, wechsel as u64)
+    rt.buf_push_bytes(&h3, (&h3b[0]) as u64, 15)
+    let w3: f64 = label(&c, 24.0, 490.0, 900.0, 15, rt.buf_ptr(&h3),
+        rt.buf_len(&h3), style.TOK_TEXT)
+    rt.buf_free(&h3)
+
+    var h4: rt.Buf = rt.buf_new()
+    var h4a: [u8; 31] = "The same button is read off at "
+    var h4b: [u8; 13] = " points of a "
+    var h4c: [u8; 46] = " ms ease-out: colour, radius, border and lift."
+    rt.buf_push_bytes(&h4, (&h4a[0]) as u64, 31)
+    rt.buf_push_dec_u64(&h4, PHASEN as u64)
+    rt.buf_push_bytes(&h4, (&h4b[0]) as u64, 13)
+    rt.buf_push_dec_u64(&h4, UEB_MS as u64)
+    rt.buf_push_bytes(&h4, (&h4c[0]) as u64, 46)
+    let w4: f64 = label(&c, 24.0, 512.0, 1000.0, 12, rt.buf_ptr(&h4),
+        rt.buf_len(&h4), style.TOK_TEXT_MUTED)
+    rt.buf_free(&h4)
+
+    // KEINE KOPFZEILE DARF AUS IHREM BAND LAUFEN. Gemessen wird mit
+    // der Sollbreite, die `label` ohnehin schon zurueckgibt (sie kommt
+    // aus `render.pref_of`, dem Mess-Protokoll der Bibliothek). Passt
+    // eine Zeile nicht, wird kein Bild geschrieben: ein hart
+    // abgeschnittenes Wort im Beleg ist genau der Fehler, den dieses
+    // Blatt aufdecken soll.
+    if w1 > 900.0 || w2 > 900.0 || w3 > 900.0 || w4 > 1000.0 {
+        var zb: [u8; 51] = "gallery5: eine Kopfzeile ist breiter als ihr Band.\n"
+        rt.write_everything(2, (&zb[0]) as u64, 51)
+        return 10
+    }
+    // UND KEINE ANDERE BESCHRIFTUNG AUCH NICHT. Die vier Kopfzeilen
+    // sind die auffaelligsten, aber abgeschnitten wird genauso gern
+    // eine Reihenbeschriftung. `label` hat den breitesten Ueberhang der
+    // ganzen Seite mitgefuehrt (Sollbreite minus Feld, ueber JEDE
+    // gemalte Zeile); ist er positiv, hat ein Text mehr Platz gebraucht
+    // als sein Feld hergibt, und dann entsteht kein Bild.
+    if G_UEBERHANG > 0.0 {
+        var zc: [u8; 54] = "gallery5: eine Beschriftung ist breiter als ihr Feld: "
+        rt.write_everything(2, (&zc[0]) as u64, 54)
+        var zt: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_i64(&zt, (G_UEBERHANG + 0.5) as i64)
+        rt.buf_push(&zt, 10 as u8)
+        rt.write_everything(2, rt.buf_ptr(&zt), rt.buf_len(&zt))
+        rt.buf_free(&zt)
+        return 11
+    }
+
+    // ---- DIE VIER KOPFZEILEN STEHEN WIRKLICH IN IHRER ZEILE.
+    //
+    // Sie sind bei y 22, 44, 490 und 512 gesetzt; ihre Oberlaengen
+    // liegen also in den Zeilen darunter. Steht dort nichts, ist die
+    // Zeile ins Leere gemalt oder in ein anderes Band gerutscht --
+    // ein Fehler, den die Bandpruefung von aussen nicht sieht, weil
+    // in den Baendern ja die Bilder stehen.
+    let pgrund: u32 = canvas.canvas_get(&cv, 2, 2)
+    var q1: [u8; 44] = "1 the EASING headline is really there       "
+    verlange((&q1[0]) as u64, 43,
+        band_hat_farbe(&cv, 25, 38, pgrund) > 200,
+        band_hat_farbe(&cv, 25, 38, pgrund), 200)
+    var q2: [u8; 44] = "1 its subline is really there               "
+    verlange((&q2[0]) as u64, 43,
+        band_hat_farbe(&cv, 47, 58, pgrund) > 200,
+        band_hat_farbe(&cv, 47, 58, pgrund), 200)
+    var q3: [u8; 44] = "2 the TRANSITION headline is really there   "
+    verlange((&q3[0]) as u64, 43,
+        band_hat_farbe(&cv, 493, 506, pgrund) > 200,
+        band_hat_farbe(&cv, 493, 506, pgrund), 200)
+    var q4: [u8; 44] = "2 its subline is really there               "
+    verlange((&q4[0]) as u64, 43,
+        band_hat_farbe(&cv, 515, 526, pgrund) > 200,
+        band_hat_farbe(&cv, 515, 526, pgrund), 200)
+    if G_FEHLER > 0 {
+        var gf: [u8; 60] = "gallery5: das Raster stimmt nicht -- kein Beleg geschrieben\n"
+        rt.write_everything(2, (&gf[0]) as u64, 60)
+        return 12
+    }
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(&cv, &out) {
+        return 6
+    }
+    var pf: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < rt.c_length(path) {
+        rt.buf_push(&pf, rt.ld8(path, k))
+        k = k + 1
+    }
+    rt.buf_push(&pf, 0 as u8)
+    if !rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64,
+        mem.buf_len(&out)) {
+        return 7
+    }
+    var okm: [u8; 10] = "GALLERY 5\n"
+    rt.write_everything(1, (&okm[0]) as u64, 10)
+    // DIE GEMESSENEN ZAHLEN IN DAS PROTOKOLL. Ein Beleg, der nur "in
+    // Ordnung" sagt, ist nachtraeglich nicht nachzurechnen: hier steht,
+    // was die vier Kopfzeilen an Punkt gebraucht haben und wie viel
+    // Platz die engste Beschriftung der Seite uebrig hatte.
+    var zl: rt.Buf = rt.buf_new()
+    var zk: [u8; 28] = "  Kopfzeilen (Bedarf/Band): "
+    rt.buf_push_bytes(&zl, (&zk[0]) as u64, 28)
+    rt.buf_push_dec_i64(&zl, (w1 + 0.5) as i64)
+    var zs: [u8; 5] = "/900 "
+    rt.buf_push_bytes(&zl, (&zs[0]) as u64, 5)
+    rt.buf_push_dec_i64(&zl, (w2 + 0.5) as i64)
+    rt.buf_push_bytes(&zl, (&zs[0]) as u64, 5)
+    rt.buf_push_dec_i64(&zl, (w3 + 0.5) as i64)
+    rt.buf_push_bytes(&zl, (&zs[0]) as u64, 5)
+    rt.buf_push_dec_i64(&zl, (w4 + 0.5) as i64)
+    var zr: [u8; 31] = "/1000, engste Beschriftung hat "
+    rt.buf_push_bytes(&zl, (&zr[0]) as u64, 31)
+    rt.buf_push_dec_i64(&zl, (0.0 - G_UEBERHANG + 0.5) as i64)
+    var zp: [u8; 16] = " Punkt Luft  OK\n"
+    rt.buf_push_bytes(&zl, (&zp[0]) as u64, 16)
+    rt.write_everything(1, rt.buf_ptr(&zl), rt.buf_len(&zl))
+    rt.buf_free(&zl)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    return 0
+}

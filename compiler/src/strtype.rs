@@ -24,14 +24,17 @@
 //!
 //! | origin | storage | freed by |
 //! |---|---|---|
-//! | literal `"hello"` | the frame of the enclosing function | the frame |
+//! | literal `"hello"` | `.rodata` (one entry per distinct text) | nobody |
 //! | `a + b` | the **GC heap** (`__str_concat`) | the collector |
 //! | `Span`/`Bytes` | wherever the buffer lies | its owner |
 //!
-//! The literal lands in the frame, not in `.rodata` — the same honest price
-//! that `SPEC §14.1.str` has been naming since round 39 for `[u8; N]`.
-//! Nothing changes about it here; a `str` literal simply puts the address of
-//! that frame array into `p`.
+//! Round 70 put the literal into the frame of the enclosing function, "the
+//! same honest price" as for `[u8; N]`. For a `str` that price was a
+//! dangling pointer: `fn f() -> str { return "x" }` returned the address of
+//! a dead frame. Round GAPS moved the octets to `.rodata`
+//! (`statics::intern_text`); a literal in an ARRAY context is still the
+//! array literal in the frame it always was -- that one is a copy the
+//! program may write to.
 //!
 //! ## Why the collector, and when it is pulled in
 //!
@@ -250,6 +253,21 @@ pub(crate) fn source_uses_str(toks: &[crate::lexer::Token]) -> bool {
 }
 
 // ------------------------------------------------------------- the type check
+
+/// Round GAPS: the octets of a text literal, if every element is a plain
+/// integer 0..=255 (always true for what the parser builds).
+pub(crate) fn literal_octets(inner: &Expr) -> Option<Vec<u8>> {
+    match &inner.kind {
+        ExprKind::ArrayLit(xs) => xs
+            .iter()
+            .map(|x| match &x.kind {
+                ExprKind::Int(v) if (0..=255).contains(v) => Some(*v as u8),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
 
 /// Number of elements of the array literal behind a text literal.
 pub(crate) fn literal_len(inner: &Expr) -> u64 {

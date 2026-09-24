@@ -1,0 +1,717 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/gallery7_main.fi -- DIE EFFEKTE ALS BILD.
+//
+// Unschaerfe zeigt sich nur ueber einem GEMUSTERTEN Grund: auf einer
+// glatten Flaeche sieht ein Weichzeichner aus wie gar nichts. Also
+// erst ein Schachbrett, dann darueber der weiche Schatten, die
+// Glasscheibe und die Farbmatrix.
+//
+// Drei Baender, jedes beantwortet eine Frage, die man am Bild und
+// nicht an einer Zahl entscheidet:
+//
+//   1. Faellt der Schatten WEICH ab, oder hat er einen Rand? Vier
+//      Karten mit wachsender Unschaerfe und eine mit Streuung.
+//   2. Sieht das Glas wie eine Scheibe aus? Dieselbe Flaeche einmal
+//      unter Glas und einmal frei daneben -- der Vergleich steht im
+//      selben Bild, sonst glaubt man ihn nicht.
+//   3. Tut die Farbmatrix, was sie sagt? Derselbe Grund viermal.
+//
+//     gallery7_main <out.png> [light|dark] [<font.ttf>]
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.layout
+import fui.effect
+
+const FONTSET_BYTES: usize = 4096
+const W: usize = 1240
+const H: usize = 700
+
+fn label(c: *mut render.Ctx, x: f64, y: f64, w: f64, px: usize, p: u64,
+    n: usize, tok: u32) {
+    var e: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&e, x, y, w, 18.0)
+    widget.w_set_text(&e, p, n)
+    let s: *mut style.Style = widget.w_style(&e)
+    *s = style.style_set_fg(*s, style.color_token(tok))
+    *s = style.style_set_font(*s, 0, px)
+    *s = style.style_set_pad(*s, 0, 0)
+    render.draw_label(c, &e)
+}
+
+// WIE DUNKEL DER SCHATTEN IN DIESEM BILD IST: WIE IN DER BIBLIOTHEK.
+//
+// Bis zum 21.09.2026 rechnete dieses Blatt die Deckkraft von
+// `render.shadow_color` selbst hoch (verdoppelt, mindestens 140) und
+// malte im dunklen Schema statt eines Schattens einen weissen
+// Lichtsaum. Damit belegte es den Schatten, den es gerne HAETTE, und
+// nicht den, den die Bibliothek wirklich zieht -- und das ist keine
+// Abnahme, sondern eine Vorfuehrung. Ein Beleg zeigt den Standardwert;
+// reicht der nicht, ist der Standardwert falsch und wird in
+// `lib/fui/theme.fi` (`Shape.shadow`) korrigiert, nicht hier.
+//
+// Deshalb steht hier keine Funktion mehr: der Wert kommt an der
+// Aufrufstelle aus `render.shadow_color(&c)`, und zwar unveraendert.
+
+// DER GRUND, AUF DEM DIE VIER PROBEN STEHEN.
+//
+// Ein Schatten ist dunkler als sein Grund. Im dunklen Schema liegt
+// der Grund der Seite (0x1C1B22, Tonwert 28) aber selbst schon fast
+// auf Schwarz -- darunter bleiben 28 Tonwerte, und auf so einer
+// Strecke ist jeder Verlauf eine Behauptung. Das Band der Proben
+// bekommt darum einen um wenige Tonwerte ANGEHOBENEN Grund: 43 % des
+// Weges von `base` nach `surface_raised`. Im dunklen Schema sind das
+// 28 -> 40, im hellen 244 -> 249. Darunter hat der schwarze Schatten
+// Platz zu fallen, und die Karte darf auf `surface_raised` bleiben,
+// wo sie hingehoert: eine Karte ist eine Karte und kein Sonderton
+// fuer ein Beweisfoto.
+fn grundton(m: *mut theme.Theme) -> u32 {
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    return theme.mix((*f).base, (*f).surface_raised, 430)
+}
+
+// DIE FARBE DER KACHELBESCHRIFTUNG.
+//
+// Im hellen Schema steht die Beschriftung auf dem Grund der Seite und
+// `text_muted` traegt dort mit 4.5:1 -- das ist die Nebenrolle, die
+// sie auch hat. Im DUNKLEN ist sie es nicht mehr: dieses Blatt hebt
+// seinen Grund fuer die Schattenproben an (siehe `grundton`), und
+// gegen einen aufgehellten Grund reicht ein gedaempftes Grau nicht
+// mehr mit Sicherheit. Dort gilt
+// darum der volle Textton. Welcher es ist, entscheidet nicht das
+// Auge, sondern die Rechnung am Ende dieses Programms: `theme.contrast`
+// gegen den wirklich gemalten Grund, gefordert sind 4.5:1.
+fn beschriftungston(dunkel: bool) -> u32 {
+    if dunkel {
+        return style.TOK_TEXT
+    }
+    return style.TOK_TEXT_MUTED
+}
+
+// ======================================================================
+// DAS MESSZEUG DIESES BLATTES
+// ======================================================================
+//
+// Der Tonwert nach Rec.601 in Tausendsteln: die Helligkeit, die das
+// Auge sieht. Fuer den Abstand zweier Flaechen ist das die richtige
+// Groesse -- dieselbe Aenderung wiegt im Gruenkanal schwerer als im
+// Blaukanal.
+fn tonwert(c: u32) -> i64 {
+    let r: i64 = ((c >> 16) & 255 as u32) as i64
+    let g: i64 = ((c >> 8) & 255 as u32) as i64
+    let b: i64 = (c & 255 as u32) as i64
+    return (299 * r + 587 * g + 114 * b) / 1000
+}
+
+fn betrag(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+// WIE WEIT DER SCHATTEN TRAEGT.
+//
+// Der Abstand unter der Unterkante der Karte, an dem der Schatten im
+// Grund verschwunden ist -- bis auf zwei Tonwerte, denn die letzte
+// Stufe eines Kastenweichzeichners liegt unter der Aufloesung des
+// Auges wie der des Tonwerts. Das ist die Groesse, an der sich zwei
+// Unschaerferadien wirklich unterscheiden: ein groesserer Radius
+// traegt WEITER, er ist nicht bloss an einer Stelle dunkler.
+fn reichweite(cv: *mut canvas.Canvas, x: usize, y0: usize,
+    grund: i64) -> i64 {
+    var d: usize = 0
+    while d < 60 {
+        if betrag(tonwert(canvas.canvas_get(cv, x, y0 + d)) - grund) <= 2 {
+            return d as i64
+        }
+        d = d + 1
+    }
+    return 60
+}
+
+// IST ES EIN VERLAUF ODER EIN RAND?
+//
+// Von der Unterkante der Karte `n` Punkte nach unten: ein Schatten
+// wird mit jedem Punkt heller und niemals wieder dunkler. Wird die
+// Folge irgendwo um mehr als einen Tonwert ruecklaeufig, ist es kein
+// Verlauf, sondern eine Kante -- dann kommt 0 zurueck und die
+// Forderung faellt durch. Sonst kommt die Spanne zurueck: der
+// hellste minus der dunkelste gemessene Tonwert. Ein Tonwert
+// Rueckgang wird geduldet, weil die Rec.601-Rechnung ganzzahlig ist
+// und an der Rundung zittert.
+fn verlauf_spanne(cv: *mut canvas.Canvas, x: usize, y0: usize,
+    n: usize) -> i64 {
+    let erst: i64 = tonwert(canvas.canvas_get(cv, x, y0))
+    var hoch: i64 = erst
+    var k: usize = 1
+    while k < n {
+        let t: i64 = tonwert(canvas.canvas_get(cv, x, y0 + k))
+        if t + 1 < hoch {
+            return 0
+        }
+        if t > hoch {
+            hoch = t
+        }
+        k = k + 1
+    }
+    return hoch - erst
+}
+
+// Der groesste Unterschied EINES Kanals. Zwei Farben koennen denselben
+// Tonwert haben und trotzdem klar verschieden sein (Blau und Gelb
+// sind das Beispiel) -- hinter der Glasscheibe wird deshalb so
+// gemessen und nicht ueber die Helligkeit.
+fn kanalabstand(a: u32, b: u32) -> i64 {
+    var d: i64 = betrag((((a >> 16) & 255 as u32) as i64)
+        - (((b >> 16) & 255 as u32) as i64))
+    let g: i64 = betrag((((a >> 8) & 255 as u32) as i64)
+        - (((b >> 8) & 255 as u32) as i64))
+    let u: i64 = betrag(((a & 255 as u32) as i64) - ((b & 255 as u32) as i64))
+    if g > d { d = g }
+    if u > d { d = u }
+    return d
+}
+
+// Eine Forderung an das eigene Bild. Wird sie verletzt, geht die
+// Meldung auf fd 2 und das Programm endet mit einem Fehler -- ein
+// Beleg, der seine eigene Aussage nicht erfuellt, darf nicht
+// ausgeliefert werden.
+fn fordere(nm: u64, nn: usize, ist: i64, soll: i64) -> usize {
+    if ist >= soll {
+        return 0
+    }
+    var t: rt.Buf = rt.buf_new()
+    var p1: [u8; 10] = "gallery7: "
+    rt.buf_push_bytes(&t, (&p1[0]) as u64, 10)
+    rt.buf_push_bytes(&t, nm, nn)
+    var p2: [u8; 6] = ": got "
+    rt.buf_push_bytes(&t, (&p2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, ist)
+    var p3: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&p3[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, soll)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(2, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 1
+}
+
+// Der gemusterte Grund. Ohne ihn ist "backdrop-blur" nicht zu belegen.
+fn muster(z: *mut painter.Painter, m: *mut theme.Theme, x: f64, y: f64,
+    w: f64, h: f64) {
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    painter.round_rect(z, x, y, w, h, 10.0, theme.opaque((*f).surface))
+    var j: f64 = 0.0
+    while j * 24.0 < h {
+        var i: f64 = 0.0
+        while i * 24.0 < w {
+            if ((i as i64) + (j as i64)) % 2 == 0 {
+                var cw: f64 = 24.0
+                var ch: f64 = 24.0
+                if i * 24.0 + cw > w { cw = w - i * 24.0 }
+                if j * 24.0 + ch > h { ch = h - j * 24.0 }
+                painter.surface(z, x + i * 24.0, y + j * 24.0, cw, ch,
+                    (64 as u32 << 24) | (theme.opaque((*f).accent) & 16777215 as u32))
+            }
+            i = i + 1.0
+        }
+        j = j + 1.0
+    }
+}
+
+// Ein paar bunte Formen AUF dem Muster. Sie sind der eigentliche
+// Beleg fuer das Glas: ein Schachbrett allein koennte auch ein grober
+// Verlauf sein, erkennbare Formen dahinter koennen es nicht.
+fn inhalt(z: *mut painter.Painter, m: *mut theme.Theme, x: f64, y: f64,
+    w: f64, h: f64) {
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    painter.round_rect(z, x + 30.0, y + 24.0, 120.0, 120.0, 60.0,
+        theme.opaque((*f).accent))
+    painter.round_rect(z, x + 200.0, y + 40.0, 180.0, 40.0, 20.0,
+        theme.opaque((*f).success))
+    painter.round_rect(z, x + 200.0, y + 96.0, 260.0, 40.0, 20.0,
+        theme.opaque((*f).warning))
+    painter.round_rect(z, x + 490.0, y + 24.0, 90.0, 120.0, 18.0,
+        theme.opaque((*f).err_col))
+    painter.round_rect(z, x + 650.0, y + 24.0, 120.0, 120.0, 60.0,
+        theme.opaque((*f).accent))
+    painter.round_rect(z, x + 820.0, y + 40.0, 180.0, 40.0, 20.0,
+        theme.opaque((*f).success))
+    painter.round_rect(z, x + 820.0, y + 96.0, 260.0, 40.0, 20.0,
+        theme.opaque((*f).warning))
+    painter.round_rect(z, x + 1110.0, y + 24.0, 30.0, 120.0, 14.0,
+        theme.opaque((*f).err_col))
+}
+
+// ==================== DAS RASTER WIRD NACHGERECHNET
+//
+// Die Belegpruefung von aussen (tools/fui/belegpruef_main.fi) kennt
+// die Baender dieses Blattes nicht; sie sieht nur, dass irgendwo
+// Farbe steht. WELCHES Band wohin gehoert, weiss nur dieses Programm
+// -- also rechnet es hier selbst nach, denselben Weg, den
+// tools/fui/gallery8_main.fi und demos/fuidemo/main.fi gehen.
+//
+// Geprueft wird das, was ein Mensch auf dem Blatt sieht:
+//
+//   a) In JEDER angemeldeten Zeile steht wirklich etwas. Eine
+//      Beschriftung, die ins Leere gemalt wurde (falsche Farbe,
+//      Laenge 0), faellt hier auf und nicht erst dem Leser.
+//   b) ZWISCHEN zwei Baendern bleibt eine leere Zeile. Laeuft ein
+//      Band in das naechste, ueberlappt auf dem Blatt etwas -- der
+//      Fehler, den die Bandpruefung von aussen NICHT sieht, weil in
+//      beiden Baendern ja Farbe steht.
+static mut G_FEHLER: usize = 0
+
+fn verlange(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 44 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "FALSCH  "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_FEHLER = G_FEHLER + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Wieviele Bildpunkte einer Zeile sich vom Grund unterscheiden.
+fn zeile_farbe(cv: *mut canvas.Canvas, y: usize, bg: u32) -> i64 {
+    let w: usize = canvas.canvas_width(cv)
+    var n: i64 = 0
+    var x: usize = 0
+    while x < w {
+        if canvas.canvas_get(cv, x, y) != bg {
+            n = n + 1
+        }
+        x = x + 1
+    }
+    return n
+}
+
+// Steht in y0..y1 (einschliesslich) ueberhaupt etwas?
+fn band_hat_farbe(cv: *mut canvas.Canvas, y0: usize, y1: usize,
+    bg: u32) -> i64 {
+    var n: i64 = 0
+    var y: usize = y0
+    while y <= y1 && y < canvas.canvas_height(cv) {
+        n = n + zeile_farbe(cv, y, bg)
+        y = y + 1
+    }
+    return n
+}
+
+// Die erste voellig leere Zeile in y0..y1 -- die Trennfuge zwischen
+// zwei Baendern. Gibt es keine, kommt -1 zurueck, und genau das
+// heisst: die beiden Baender beruehren sich.
+fn leere_zeile(cv: *mut canvas.Canvas, y0: usize, y1: usize,
+    bg: u32) -> i64 {
+    var y: usize = y0
+    while y <= y1 && y < canvas.canvas_height(cv) {
+        if zeile_farbe(cv, y, bg) == 0 {
+            return y as i64
+        }
+        y = y + 1
+    }
+    return 0 - 1
+}
+
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        var u: [u8; 47] = "gallery7_main <out.png> [light|dark] [font.ttf]"
+        rt.write_everything(2, (&u[0]) as u64, 47)
+        return 2
+    }
+    let path: u64 = rt.arg_ptr(start, 1)
+    var dark: bool = true
+    if rt.arg_count(start) >= 3 {
+        if rt.ld8(rt.arg_ptr(start, 2), 0) == 108 as u8 {
+            dark = false
+        }
+    }
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 4 {
+        have = rt.read_file(rt.arg_ptr(start, 3), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    // OHNE SCHRIFT KEIN BELEG. Ein Bild ohne einen einzigen
+    // Buchstaben sieht von weitem aus wie ein Bild, und genau so ist
+    // in OrientOS eine textlose Oberflaeche durch die Abnahme
+    // gekommen. Ein Beleg ohne Beschriftung belegt nichts -- also
+    // Fehler auf fd 2 und ein Rueckgabewert, an dem der Lauf
+    // haengenbleibt, statt ein stummes PNG zu schreiben.
+    if fm == 0 {
+        var ks: [u8; 60] = "gallery7: keine Schrift gefunden -- ohne Schrift kein Beleg\n"
+        rt.write_everything(2, (&ks[0]) as u64, 60)
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, H) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(dark)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    canvas.canvas_clear(&cv, theme.opaque(grundton(&m)))
+
+    // DER SCHATTEN KOMMT UNVERAENDERT AUS DER BIBLIOTHEK.
+    //
+    // `render.shadow_color` weiss, dass derselbe Alphawert auf
+    // schwarzem Grund weniger traegt als auf weissem, und gibt im
+    // dunklen Schema die dreifache Deckkraft. Genau dieser Wert wird
+    // hier gemalt -- kein Aufschlag, kein Mindestwert, keine zweite
+    // Regel neben der Bibliothek. Was das Bild zeigt, ist damit das,
+    // was jede Karte in jedem Programm bekommt.
+    let schatten: u32 = render.shadow_color(&c)
+    // Die Karte ist eine Karte: `surface_raised`, in beiden Schemata.
+    let kton: u32 = (*f).surface_raised
+    let bton: u32 = beschriftungston(dark)
+
+    var t1: [u8; 44] = "EFFECTS -- soft shadow, glass, colour matrix"
+    label(&c, 24.0, 20.0, 900.0, 16, (&t1[0]) as u64, 44, style.TOK_TEXT)
+
+    // ================================================= 1. DER SCHATTEN
+    var l1: [u8; 54] = "drop shadow: the blur grows, the last one has spread 8"
+    label(&c, 24.0, 52.0, 900.0, 12, (&l1[0]) as u64, 54,
+        style.TOK_TEXT_MUTED)
+    var i: usize = 0
+    while i < 4 {
+        let bx: f64 = 40.0 + (i as f64) * 290.0
+        var r: i64 = 3
+        var spread: f64 = 0.0
+        if i == 1 { r = 8 }
+        if i == 2 { r = 16 }
+        if i == 3 {
+            r = 16
+            spread = 8.0
+        }
+        effect.drop_shadow_spread(&z, bx, 84.0, 220.0, 96.0, 16.0, 0.0,
+            8.0, r, spread, schatten)
+        painter.round_rect(&z, bx, 84.0, 220.0, 96.0, 16.0,
+            theme.opaque(kton))
+        painter.round_ring(&z, bx, 84.0, 220.0, 96.0, 16.0, 1.0,
+            theme.opaque((*f).border_col))
+        i = i + 1
+    }
+    // DIE BESCHRIFTUNG STEHT IN EINER EIGENEN, SCHATTENFREIEN ZEILE.
+    //
+    // Sie stand frueher 22 Punkt unter der Karte -- mitten im Schatten.
+    // Im dunklen Schema ist der Schatten ein LICHTSAUM, und der legte
+    // sich als heller Hof unter die Buchstaben: das Wort stand nicht
+    // auf dem Grund, sondern in einer Wolke, und genau daran erkennt
+    // man eine Beschriftung, die nicht dorthin gehoert.
+    //
+    // BESCHRIFTUNGSZEILE ist deshalb so gelegt, dass sie AUSSERHALB
+    // der Reichweite des groessten Schattens dieses Bandes liegt. Die
+    // Reichweite steht in `lib/fui/effect.fi` und ist kein Gefuehl:
+    // drei Kaesten der Halbbreite `blur` tragen 3*blur weit, dazu die
+    // Versetzung und die Streuung. Fuer die staerkste Probe sind das
+    // 180 (Unterkante) + 8 (dy) + 8 (Streuung) + 48 (3*16) = 244 --
+    // die Zeile beginnt darunter, und damit liegt hinter der Schrift
+    // nichts als der Grund der Seite.
+    let beschriftung_y: f64 = 248.0
+    var c1: [u8; 9] = "blur 3 px"
+    label(&c, 40.0, beschriftung_y, 220.0, 12, (&c1[0]) as u64, 9, bton)
+    var c2: [u8; 9] = "blur 8 px"
+    label(&c, 330.0, beschriftung_y, 220.0, 12, (&c2[0]) as u64, 9, bton)
+    var c3: [u8; 10] = "blur 16 px"
+    label(&c, 620.0, beschriftung_y, 220.0, 12, (&c3[0]) as u64, 10,
+        bton)
+    var c4: [u8; 20] = "blur 16 px, spread 8"
+    label(&c, 910.0, beschriftung_y, 220.0, 12, (&c4[0]) as u64, 20,
+        bton)
+
+    // ==================================================== 2. DAS GLAS
+    var l2: [u8; 57] = "glass over content -- left under the pane, right unglazed"
+    label(&c, 24.0, 310.0, 1000.0, 12, (&l2[0]) as u64, 57,
+        style.TOK_TEXT_MUTED)
+    muster(&z, &m, 40.0, 336.0, 1160.0, 170.0)
+    inhalt(&z, &m, 40.0, 336.0, 1160.0, 170.0)
+    // Die Scheibe wirft selbst einen Schatten; er liegt UNTER ihr und
+    // wird deshalb vor ihr gemalt -- sonst verwischt sie ihn mit.
+    effect.drop_shadow_spread(&z, 70.0, 366.0, 570.0, 110.0, 22.0, 0.0,
+        10.0, 12, 0.0, schatten)
+    effect.glass_round(&z, 70.0, 366.0, 570.0, 110.0, 22.0, dark)
+    var g1: [u8; 28] = "backdrop blur + saturate 1.4"
+    label(&c, 100.0, 394.0, 520.0, 15, (&g1[0]) as u64, 28,
+        style.TOK_TEXT)
+    var g2: [u8; 43] = "the content behind stays readable as shapes"
+    label(&c, 100.0, 424.0, 520.0, 12, (&g2[0]) as u64, 43,
+        style.TOK_TEXT_MUTED)
+
+    // ============================================== 3. DIE FARBMATRIX
+    var l3: [u8; 64] = "colour matrix on the same ground: grey, saturate 2, contrast 1.6"
+    label(&c, 24.0, 530.0, 1000.0, 12, (&l3[0]) as u64, 64,
+        style.TOK_TEXT_MUTED)
+    var k: usize = 0
+    while k < 4 {
+        let bx: f64 = 40.0 + (k as f64) * 300.0
+        muster(&z, &m, bx, 556.0, 260.0, 110.0)
+        painter.round_rect(&z, bx + 30.0, 576.0, 70.0, 70.0, 35.0,
+            theme.opaque((*f).accent))
+        painter.round_rect(&z, bx + 120.0, 586.0, 110.0, 24.0, 12.0,
+            theme.opaque((*f).success))
+        painter.round_rect(&z, bx + 120.0, 618.0, 110.0, 24.0, 12.0,
+            theme.opaque((*f).warning))
+        if k > 0 {
+            var cm: effect.ColorMatrix = effect.cm_grayscale()
+            if k == 2 { cm = effect.cm_saturate(2.0) }
+            if k == 3 { cm = effect.cm_contrast(1.6) }
+            effect.cm_apply_rect(&cv, &cm, bx as i64, 556, 260, 110)
+        }
+        k = k + 1
+    }
+    var m1: [u8; 8] = "original"
+    label(&c, 40.0, 674.0, 260.0, 12, (&m1[0]) as u64, 8,
+        style.TOK_TEXT_MUTED)
+    var m2: [u8; 9] = "grayscale"
+    label(&c, 340.0, 674.0, 260.0, 12, (&m2[0]) as u64, 9,
+        style.TOK_TEXT_MUTED)
+    var m3: [u8; 10] = "saturate 2"
+    label(&c, 640.0, 674.0, 260.0, 12, (&m3[0]) as u64, 10,
+        style.TOK_TEXT_MUTED)
+    var m4: [u8; 12] = "contrast 1.6"
+    label(&c, 940.0, 674.0, 260.0, 12, (&m4[0]) as u64, 12,
+        style.TOK_TEXT_MUTED)
+
+    // ======================================================================
+    // DAS BILD RECHNET SICH SELBST NACH
+    // ======================================================================
+    //
+    // "Sieht weich aus" ist keine Aussage, und "im Dunklen sieht man
+    // halt weniger" ist eine Ausrede. Dieses Blatt behauptet fuenferlei,
+    // und jedes davon wird hier an den eigenen Pixeln GEMESSEN:
+    //
+    //   1. DER SCHATTEN IST DUNKLER ALS SEIN GRUND, und zwar mit der
+    //      Deckkraft, die `render.shadow_color` jedem Programm gibt --
+    //      ohne Aufschlag dieses Blattes. Gemessen wird EINEN Punkt
+    //      unter der Unterkante jeder Karte, in ihrer Mitte: dort muss
+    //      der Grundton um mindestens 18 Tonwerte gedrueckt sein.
+    //      Gemessen am 21.09.2026: hell 61/48/40/50, dunkel
+    //      30/24/20/25 Tonwerte Abstand.
+    //
+    //   2. ES IST EIN VERLAUF UND KEIN RAND. Von der Unterkante nach
+    //      unten wird der Schatten mit jedem Punkt heller, 48 Punkte
+    //      weit, ohne einmal wieder dunkler zu werden -- und zwischen
+    //      der dunkelsten und der hellsten Stelle liegen mindestens
+    //      zehn Tonwerte. Ein harter Rand faellt hier durch: er
+    //      springt und hat keine Spanne. Gemessen: hell 40, dunkel 20
+    //      Tonwerte unter der Probe mit blur 16.
+    //
+    //   3. DIE VIER PROBEN SIND AUSEINANDERZUHALTEN, und was sie
+    //      unterscheidet, ist die REICHWEITE: wie weit unter der Karte
+    //      der Schatten im Grund verschwunden ist (bis auf zwei
+    //      Tonwerte). Genau das tut ein groesserer Unschaerferadius,
+    //      und genau daran ist er zu erkennen -- ein einzelner
+    //      Messpunkt zwoelf Punkt unter der Karte war es nicht, denn
+    //      dort liegen blur 8 und blur 16 naturgemaess dicht
+    //      beieinander. Gemessen am 21.09.2026: hell 13/22/36, dunkel
+    //      12/20/32 Punkte -- die Abstaende also 9 und 14 (hell)
+    //      beziehungsweise 8 und 12 (dunkel). Gefordert sind sechs und
+    //      zehn Punkt, damit die Forderung die Aussage traegt und
+    //      nicht die letzte gemessene Stelle.
+    //
+    //   4. DIE STREUUNG LEGT ZU. Dieselbe Unschaerfe mit spread 8 ist
+    //      an derselben Stelle dunkler als ohne -- gefordert sind vier
+    //      Tonwerte, gemessen wurden hell 10 und dunkel 5.
+    //
+    //   5. DIE FORMEN HINTER DER GLASSCHEIBE SIND NOCH DA. Eine
+    //      Milchscheibe, die alles zu einem Ton verruehrt, ist kein
+    //      Backdrop-Blur, sondern ein Deckel. Gemessen wird der
+    //      Farbabstand (groesster Kanalunterschied) zwischen drei
+    //      Formen unter der Scheibe und dem Grund ZWISCHEN ihnen --
+    //      ebenfalls unter der Scheibe, damit nicht die Scheibe selbst
+    //      gegen den freien Grund gemessen wird. Gefordert sind 15;
+    //      gemessen wurden 21 bis 50.
+    //
+    // Alle Zahlen gelten in BEIDEN Schemata gleich: ein Beleg, der im
+    // Dunklen weniger zeigen darf, ist im Dunklen kein Beleg.
+    let grund: i64 = tonwert(theme.opaque(grundton(&m)))
+    var schlecht: usize = 0
+    var pi4: usize = 0
+    while pi4 < 4 {
+        let px4: usize = 150 + pi4 * 290
+        var n1: [u8; 24] = "Schatten unter der Karte"
+        schlecht = schlecht + fordere((&n1[0]) as u64, 24,
+            grund - tonwert(canvas.canvas_get(&cv, px4, 181)), 18)
+        var n2: [u8; 24] = "Verlauf, monoton fallend"
+        schlecht = schlecht + fordere((&n2[0]) as u64, 24,
+            verlauf_spanne(&cv, px4, 181, 48), 10)
+        pi4 = pi4 + 1
+    }
+    let w0: i64 = reichweite(&cv, 150, 181, grund)
+    let w1: i64 = reichweite(&cv, 440, 181, grund)
+    let w2: i64 = reichweite(&cv, 730, 181, grund)
+    var e1: [u8; 24] = "blur 8 traegt weiter    "
+    schlecht = schlecht + fordere((&e1[0]) as u64, 24, w1 - w0, 6)
+    var e2: [u8; 24] = "blur 16 traegt weiter   "
+    schlecht = schlecht + fordere((&e2[0]) as u64, 24, w2 - w1, 10)
+    var e3: [u8; 24] = "Streuung 8 legt zu      "
+    schlecht = schlecht + fordere((&e3[0]) as u64, 24,
+        tonwert(canvas.canvas_get(&cv, 730, 197))
+        - tonwert(canvas.canvas_get(&cv, 1020, 197)), 4)
+    // Unter der Scheibe: Kreis, Warnbalken, roter Block -- und der
+    // Grund zwischen Warnbalken und rotem Block.
+    let gg: u32 = canvas.canvas_get(&cv, 510, 457)
+    var e4: [u8; 24] = "Kreis hinter dem Glas   "
+    schlecht = schlecht + fordere((&e4[0]) as u64, 24,
+        kanalabstand(canvas.canvas_get(&cv, 130, 457), gg), 15)
+    var e5: [u8; 24] = "Balken hinter dem Glas  "
+    schlecht = schlecht + fordere((&e5[0]) as u64, 24,
+        kanalabstand(canvas.canvas_get(&cv, 330, 454), gg), 15)
+    var e6: [u8; 24] = "Block hinter dem Glas   "
+    schlecht = schlecht + fordere((&e6[0]) as u64, 24,
+        kanalabstand(canvas.canvas_get(&cv, 575, 457), gg), 15)
+    // DIE KACHELBESCHRIFTUNG IST LESBAR, und zwar gegen den Grund, auf
+    // dem sie WIRKLICH steht: gemessen wird das Bildpunktpaar aus dem
+    // fertigen Bild -- die Farbe des Texttokens gegen den Grund zwei
+    // Zeilen ueber der Beschriftung. 4.5:1 sind 450 Hundertstel, die
+    // Schwelle aus tools/fui/contrast_main.fi und der Skill-Vorgabe.
+    let tfarbe: u32 = theme.opaque(theme.color_from_token(&m, bton))
+    let tgrund: u32 = canvas.canvas_get(&cv, 60,
+        (beschriftung_y as i64 - 2) as usize)
+    let kk: i64 = (theme.contrast(tfarbe, tgrund) * 100.0 + 0.5) as i64
+    var e7: [u8; 24] = "Kachelbeschriftung 4.5:1"
+    schlecht = schlecht + fordere((&e7[0]) as u64, 24, kk, 450)
+    if schlecht > 0 {
+        return 8
+    }
+
+    // ---- DIE DREI BAENDER, NACHGERECHNET (siehe oben)
+    //
+    // Die Zahlen sind die y, mit denen oben gemalt wurde: die
+    // Schattenreihe unter ihrer Beschriftung bei 52, das Glas bei
+    // 310/336, die Farbmatrix bei 530. Geprueft wird gegen die
+    // LEINWAND, nicht gegen die Konstanten -- sonst pruefte sich die
+    // Rechnung selbst.
+    let pgrund: u32 = canvas.canvas_get(&cv, 2, 2)
+    var b1: [u8; 44] = "1 the shadow band carries ink               "
+    verlange((&b1[0]) as u64, 43,
+        band_hat_farbe(&cv, 60, 300, pgrund) > 1000,
+        band_hat_farbe(&cv, 60, 300, pgrund), 1000)
+    var b2: [u8; 44] = "2 the glass band carries ink                "
+    verlange((&b2[0]) as u64, 43,
+        band_hat_farbe(&cv, 336, 506, pgrund) > 1000,
+        band_hat_farbe(&cv, 336, 506, pgrund), 1000)
+    var b3: [u8; 44] = "3 the colour matrix band carries ink        "
+    verlange((&b3[0]) as u64, 43,
+        band_hat_farbe(&cv, 556, 660, pgrund) > 1000,
+        band_hat_farbe(&cv, 556, 660, pgrund), 1000)
+    // DIE FUGEN. Zwischen Schattenreihe und der Beschriftung des
+    // Glases (y 300..310) und zwischen Glas und Farbmatrix
+    // (y 506..530) muss eine ganz leere Zeile liegen. Fehlt sie,
+    // laeuft ein Band in das naechste.
+    // DIE FUGEN WERDEN ENG GEMESSEN. Der Schatten der Scheibe laeuft
+    // bis Zeile 514 aus, die Beschriftung der Farbmatrix beginnt bei
+    // 530; dazwischen gehoert das Blatt niemandem und muss
+    // VOLLSTAENDIG leer sein. Die weiche Fassung ("irgendwo in der
+    // Fuge liegt eine leere Zeile") liess eine um 38 Punkte zu hoch
+    // gesetzte Beschriftung durch, weil hinter ihr immer noch Luft
+    // lag -- nachgemessen am absichtlich verschobenen Blatt. Die
+    // strenge Fassung faengt genau das.
+    var b4: [u8; 44] = "1/2 the gap 301..309 is completely empty    "
+    verlange((&b4[0]) as u64, 43,
+        band_hat_farbe(&cv, 301, 309, pgrund) == 0,
+        band_hat_farbe(&cv, 301, 309, pgrund), 0)
+    var b5: [u8; 44] = "2/3 the gap 515..529 is completely empty    "
+    verlange((&b5[0]) as u64, 43,
+        band_hat_farbe(&cv, 515, 529, pgrund) == 0,
+        band_hat_farbe(&cv, 515, 529, pgrund), 0)
+    // UND DIE BESCHRIFTUNG DER FARBMATRIX STEHT, WO SIE HINGEHOERT.
+    //
+    // Die beiden Fugen oben fangen ein Band, das zu TIEF sitzt. Ein
+    // Band, das zu HOCH sitzt, faellt ihnen NICHT auf: es verschwindet
+    // dann in der Scheibe darueber, wo ohnehin Farbe steht, und die
+    // Fuge darunter bleibt leer. Das ist kein erfundener Fall --
+    // nachgemessen an einem absichtlich um 38 Punkte zu hoch
+    // gesetzten Blatt: Fugen und Baender blieben alle gruen, und nur
+    // die Zeilen 533..545 wurden von 1200 Bildpunkten auf 0 leer.
+    //
+    // Also wird genau das geprueft: in der Zeile, in der die
+    // Beschriftung steht, MUSS Farbe sein.
+    var b6: [u8; 44] = "3 the colour matrix label is really there   "
+    verlange((&b6[0]) as u64, 43,
+        band_hat_farbe(&cv, 533, 545, pgrund) > 200,
+        band_hat_farbe(&cv, 533, 545, pgrund), 200)
+    // Dieselbe Frage fuer die Beschriftung des Glases (y 310, also
+    // Oberlaengen um 313..325) und die der Schattenreihe (y 52).
+    var b7: [u8; 44] = "2 the glass label is really there           "
+    verlange((&b7[0]) as u64, 43,
+        band_hat_farbe(&cv, 313, 325, pgrund) > 200,
+        band_hat_farbe(&cv, 313, 325, pgrund), 200)
+    var b8: [u8; 44] = "1 the shadow label is really there          "
+    verlange((&b8[0]) as u64, 43,
+        band_hat_farbe(&cv, 55, 67, pgrund) > 200,
+        band_hat_farbe(&cv, 55, 67, pgrund), 200)
+    if G_FEHLER > 0 {
+        var gf: [u8; 60] = "gallery7: das Raster stimmt nicht -- kein Beleg geschrieben\n"
+        rt.write_everything(2, (&gf[0]) as u64, 60)
+        return 10
+    }
+
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(&cv, &out) {
+        return 6
+    }
+    var pf: rt.Buf = rt.buf_new()
+    var pk: usize = 0
+    while pk < rt.c_length(path) {
+        rt.buf_push(&pf, rt.ld8(path, pk))
+        pk = pk + 1
+    }
+    rt.buf_push(&pf, 0 as u8)
+    if !rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64,
+        mem.buf_len(&out)) {
+        return 7
+    }
+    var okm: [u8; 10] = "GALLERY 7\n"
+    rt.write_everything(1, (&okm[0]) as u64, 10)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    return 0
+}

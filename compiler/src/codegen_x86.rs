@@ -422,7 +422,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
     // (round 89, SPEC 14.1.statics) — only when the program declares a
     // `static` at all.
-    if crate::statics::any() {
+    if crate::statics::any_data() {
         e.raw(&crate::statics::data_asm());
     }
     // ROUND 64: `.debug_abbrev` and `.debug_info` of our own -- names, types
@@ -1067,10 +1067,31 @@ fn emit_inst(
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
+            // Round GAPS (fbits.rs): every value -- float or not -- sits in
+            // its slot as its bit pattern, so the reinterpretation is a copy.
+            // The 32-bit forms clear the upper half (the slot does not
+            // guarantee it).
+            if matches!(op, UnOp::Bits) {
+                load_full(e, fr, "rax", *a);
+                if ty.bits() <= 32 {
+                    e.line("mov eax, eax");
+                }
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
             // FLOATING POINT: the sign is ONE bit. `neg` would treat the whole
             // bit pattern as two's complement — wrong. That is why only bit 63
             // is flipped.
             if ty.is_float() {
+                // Round GAPS: the square root is one SSE instruction
+                // (fsqrt.rs), computed in xmm0 like `emit_bin` does.
+                if matches!(op, UnOp::Sqrt) {
+                    let single = ty == FTy::F32;
+                    load_xmm(e, fr, "xmm0", *a, single);
+                    e.line(if single { "sqrtss xmm0, xmm0" } else { "sqrtsd xmm0, xmm0" });
+                    store_xmm(e, fr, d, "xmm0", single);
+                    return Ok(());
+                }
                 if !matches!(op, UnOp::Neg) {
                     return Err(format!(
                         "internal error: '!' is not defined for {}",
@@ -1091,10 +1112,14 @@ fn emit_inst(
                 store_dst(e, fr, d, "rax");
                 return Ok(());
             }
+            if matches!(op, UnOp::Sqrt) {
+                return Err(format!("internal error: sqrt is not defined for {}", ty.name()));
+            }
             let bits = if ty.bits() > 32 { 64 } else { 32 };
             load_full(e, fr, "rax", *a);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", reg("rax", bits))),
+                UnOp::Sqrt | UnOp::Bits => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");
@@ -1368,6 +1393,9 @@ fn emit_inst(
             }
             if args.len() > 7 {
                 return Err("syscall with more than 6 arguments".to_string());
+            }
+            if crate::target::android() && emit_syscall_android(e, f, fr, i, args)? {
+                return Ok(());
             }
             for (k, a) in args.iter().skip(1).enumerate() {
                 load_full(e, fr, SYS_REGS[k], *a);
@@ -1849,4 +1877,94 @@ mod tests {
         assert!(asm.contains("mov qword ptr [rsp+8], rax"), "{}", asm);
         assert!(asm.contains("add rsp, 16"), "{}", asm);
     }
+}
+
+/// The constant a value is, if exactly one `const` defines it.
+fn const_of(f: &Func, v: Val) -> Option<i64> {
+    let mut found: Option<i64> = None;
+    let mut defs = 0;
+    for b in &f.blocks {
+        for ins in &b.insts {
+            if ins.dst == Some(v) {
+                defs += 1;
+                if let Op::Const(c) = &ins.op {
+                    found = Some(ins.ty.truncate(*c) as i64);
+                }
+            }
+        }
+    }
+    if defs == 1 {
+        found
+    } else {
+        None
+    }
+}
+
+/// FIRN r64 -- `--target=x86_64-android`: the legacy calls Android's
+/// seccomp filter refuses become their `*at` forms (syscalls.rs,
+/// `X86_ANDROID`), `poll` becomes `ppoll` with a timespec on the stack
+/// (a negative timeout -- "wait forever" -- becomes the NULL pointer).
+/// `Ok(false)` = not one of them, emit the call as it is.
+fn emit_syscall_android(
+    e: &mut Emitter,
+    f: &Func,
+    fr: &Frame,
+    i: &Inst,
+    args: &[Val],
+) -> Result<bool, String> {
+    let Some(nr) = const_of(f, args[0]) else {
+        return Ok(false);
+    };
+    let given = &args[1..];
+    if nr == 7 {
+        if given.len() < 3 {
+            return Err("x86_64-android: poll needs three arguments".to_string());
+        }
+        load_full(e, fr, "rax", given[2]);
+        e.line("mov r11, rax");
+        e.line("mov rcx, 1000");
+        e.line("cqo");
+        e.line("idiv rcx");
+        e.line("imul rdx, rdx, 1000000");
+        e.line("sub rsp, 16");
+        e.line("mov qword ptr [rsp], rax");
+        e.line("mov qword ptr [rsp + 8], rdx");
+        load_full(e, fr, "rdi", given[0]);
+        load_full(e, fr, "rsi", given[1]);
+        e.line("mov rdx, rsp");
+        e.line("xor ecx, ecx");
+        e.line("test r11, r11");
+        e.line("cmovs rdx, rcx");
+        e.line("xor r10d, r10d");
+        e.line("mov r8d, 8");
+        e.line("mov eax, 271");
+        e.line("syscall");
+        e.line("add rsp, 16");
+        if let Some(d) = i.dst {
+            store_dst(e, fr, d, "rax");
+        }
+        return Ok(true);
+    }
+    let Some((new_nr, form)) = crate::syscalls::x86_android(nr) else {
+        return Ok(false);
+    };
+    for (k, x) in form.iter().enumerate() {
+        match x {
+            crate::syscalls::X::A(j) => {
+                let v = given.get(*j).ok_or_else(|| {
+                    format!("x86_64-android: system call {} needs argument {}", nr, j + 1)
+                })?;
+                load_full(e, fr, SYS_REGS[k], *v);
+            }
+            crate::syscalls::X::I(c) => {
+                e.line(&format!("mov {}, {}", SYS_REGS[k], c));
+            }
+        }
+    }
+    e.line(&format!("mov eax, {}", new_nr));
+    e.line("syscall");
+    if let Some(d) = i.dst {
+        store_dst(e, fr, d, "rax");
+    }
+    Ok(true)
 }

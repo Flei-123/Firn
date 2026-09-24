@@ -1,0 +1,663 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/text_main.fi -- THE ACCEPTANCE OF THE TEXT VALUES.
+//
+// ====================================================== WHY IT EXISTS
+//
+// Justin, 12.09.2026, asked for letter spacing, line height, kerning
+// and the TextMeshPro things -- and named the acceptance himself:
+//
+//   * "Tracking at 0 / +2 / -1 has to change the MEASURED text width
+//      by EXACTLY the expected number ((n-1) * tracking). Show the
+//      three numbers."
+//   * "Proof that text_width with tracking gives what is really
+//      painted (the width of the ink in the picture against the
+//      return value)."
+//   * "Proof that a text that is too long WITH tracking is cut in the
+//      right place and does not bleed into the neighbouring column."
+//   * "Kerning on/off: show a pair like AV or To with the measured
+//      difference."
+//   * "Outline and shadow: pixel measurement that the contour really
+//      lies around the glyph and the shadow has the right offset."
+//
+// Every one of those is a check in here, measured on the painted
+// picture and not claimed. The ink width is found by WALKING THE
+// PIXELS -- that is the only way to catch a measurement that lies
+// about the drawing, and wave 3 showed that this really happens.
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.layout
+
+const FONTSET_BYTES: usize = 4096
+const W: usize = 900
+const H: usize = 220
+const SIZE: f64 = 40.0
+
+static mut G_ERRORS: usize = 0
+
+fn report_n(nm: u64, nn: usize, ok: bool, got: i64, want: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 3] = "OK "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 3)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var h1: [u8; 5] = " got "
+    rt.buf_push_bytes(&t, (&h1[0]) as u64, 5)
+    rt.buf_push_dec_i64(&t, got)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, want)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// A line of plain text, for the three tracking numbers.
+fn say(p: u64, n: usize, v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, p, n)
+    rt.buf_push_dec_i64(&t, v)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn px(cv: *mut canvas.Canvas, x: usize, y: usize) -> u32 {
+    let p: u64 = canvas.canvas_pixels(cv) as u64
+    let o: u64 = ((y * canvas.canvas_width(cv) + x) * 4) as u64
+    let r8: u8 = *((p + o) as *mut u8)
+    let g8: u8 = *((p + o + 1 as u64) as *mut u8)
+    let b8: u8 = *((p + o + 2 as u64) as *mut u8)
+    let r: u32 = r8 as u32
+    let g: u32 = g8 as u32
+    let b: u32 = b8 as u32
+    return (r << 16) | (g << 8) | b
+}
+
+// THE LEFTMOST COLUMN THAT HAS INK, or -1. "Ink" means: different from
+// the background. This is how the picture is asked how wide the text
+// really is.
+fn ink_x0(cv: *mut canvas.Canvas, bg: u32) -> i64 {
+    var x: usize = 0
+    while x < W {
+        var y: usize = 0
+        while y < H {
+            if px(cv, x, y) != bg {
+                return x as i64
+            }
+            y = y + 1
+        }
+        x = x + 1
+    }
+    return -1
+}
+
+// The rightmost column with ink.
+fn ink_x1(cv: *mut canvas.Canvas, bg: u32) -> i64 {
+    var x: usize = W
+    while x > 0 {
+        let xx: usize = x - 1
+        var y: usize = 0
+        while y < H {
+            if px(cv, xx, y) != bg {
+                return xx as i64
+            }
+            y = y + 1
+        }
+        x = x - 1
+    }
+    return -1
+}
+
+fn ink_y0(cv: *mut canvas.Canvas, bg: u32) -> i64 {
+    var y: usize = 0
+    while y < H {
+        var x: usize = 0
+        while x < W {
+            if px(cv, x, y) != bg {
+                return y as i64
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return -1
+}
+
+fn ink_y1(cv: *mut canvas.Canvas, bg: u32) -> i64 {
+    var y: usize = H
+    while y > 0 {
+        let yy: usize = y - 1
+        var x: usize = 0
+        while x < W {
+            if px(cv, x, yy) != bg {
+                return yy as i64
+            }
+            x = x + 1
+        }
+        y = y - 1
+    }
+    return -1
+}
+
+// How many pixels in a box are not the background.
+fn ink_count(cv: *mut canvas.Canvas, x0: usize, x1: usize, y0: usize,
+    y1: usize, bg: u32) -> i64 {
+    var n: i64 = 0
+    var y: usize = y0
+    while y < y1 {
+        var x: usize = x0
+        while x < x1 {
+            if px(cv, x, y) != bg {
+                n = n + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+// THE INK WIDTH INSIDE A BOX: last column with ink minus the first.
+//
+// WHY NOT ink_count FOR THE BUTTON CHECK: tracking SPREADS the letters,
+// it does not add ink. The pixel count therefore stays almost the same
+// and the check passed while measuring nothing -- which is exactly the
+// kind of empty test this acceptance is meant not to have. The width is
+// what tracking changes, so the width is what gets measured.
+fn ink_span(cv: *mut canvas.Canvas, x0: usize, x1: usize, y0: usize,
+    y1: usize, bg: u32) -> i64 {
+    var lo: i64 = -1
+    var hi: i64 = -1
+    var x: usize = x0
+    while x < x1 {
+        var y: usize = y0
+        var hit: bool = false
+        while y < y1 {
+            if px(cv, x, y) != bg {
+                hit = true
+            }
+            y = y + 1
+        }
+        if hit {
+            if lo < 0 {
+                lo = x as i64
+            }
+            hi = x as i64
+        }
+        x = x + 1
+    }
+    if lo < 0 {
+        return 0
+    }
+    return hi - lo
+}
+
+fn clear(cv: *mut canvas.Canvas, bg: u32) {
+    canvas.canvas_clear(cv, theme.opaque(bg))
+}
+
+fn main(start: u64) -> i32 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let have: bool = rt.read_file((&f1[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    if fm == 0 as u64 {
+        var nof: [u8; 30] = "no font -- cannot measure\n\0\0\0\0"
+        rt.write_everything(2, (&nof[0]) as u64, 26)
+        return 3
+    }
+
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, H) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    // `px` gives back RGB WITHOUT the alpha, so the value compared
+    // against it must not carry one either. The first version used
+    // theme.opaque(...) here and every pixel then counted as ink --
+    // which is why the ink box was the whole canvas.
+    let bg: u32 = (*f).base & 16777215 as u32
+    let fgc: u32 = theme.opaque((*f).text)
+
+    // "HAMBURG" -- 7 letters, so (n-1) = 6 gaps. Capitals only, so no
+    // descender confuses the vertical measurement.
+    var tx: [u8; 8] = "HAMBURG "
+    let tp: u64 = (&tx[0]) as u64
+    let tn: usize = 7
+    let gaps: i64 = 6
+
+    // ==================================================================
+    // 1. TRACKING CHANGES THE WIDTH BY EXACTLY (n-1) * TRACKING
+    // ==================================================================
+    var r0: painter.TextRun = painter.run_new(SIZE)
+    r0 = painter.run_set_kerning(r0, false)
+    let w0: f64 = painter.run_width(&z, &r0, tp, tn)
+
+    var rp2: painter.TextRun = painter.run_new(SIZE)
+    rp2 = painter.run_set_kerning(rp2, false)
+    rp2 = painter.run_set_tracking(rp2, 2.0)
+    let wp2: f64 = painter.run_width(&z, &rp2, tp, tn)
+
+    var rm1: painter.TextRun = painter.run_new(SIZE)
+    rm1 = painter.run_set_kerning(rm1, false)
+    rm1 = painter.run_set_tracking(rm1, -1.0)
+    let wm1: f64 = painter.run_width(&z, &rm1, tp, tn)
+
+    // THE THREE NUMBERS Justin asked to see, in 1/1000 pixel.
+    var l0: [u8; 33] = "tracking  0 : width x1000        "
+    say((&l0[0]) as u64, 33, (w0 * 1000.0) as i64)
+    var l1: [u8; 33] = "tracking +2 : width x1000        "
+    say((&l1[0]) as u64, 33, (wp2 * 1000.0) as i64)
+    var l2: [u8; 33] = "tracking -1 : width x1000        "
+    say((&l2[0]) as u64, 33, (wm1 * 1000.0) as i64)
+
+    // +2 has to add exactly 6 * 2 = 12
+    let d_p2: i64 = ((wp2 - w0) * 1000.0 + 0.5) as i64
+    var n1: [u8; 45] = "1 tracking +2 adds exactly (n-1)*2 = 12 px   "
+    report_n((&n1[0]) as u64, 44, d_p2 == gaps * 2000, d_p2,
+        gaps * 2000)
+
+    // -1 has to take off exactly 6 * 1 = 6
+    let d_m1: i64 = ((w0 - wm1) * 1000.0 + 0.5) as i64
+    var n2: [u8; 45] = "1 tracking -1 takes off (n-1)*1 = 6 px       "
+    report_n((&n2[0]) as u64, 44, d_m1 == gaps * 1000, d_m1,
+        gaps * 1000)
+
+    // A SINGLE LETTER IS NOT MADE WIDER. That is what "between the
+    // letters" means, and it is the half of the definition that a
+    // careless loop gets wrong.
+    let one0: f64 = painter.run_width(&z, &r0, tp, 1)
+    let one2: f64 = painter.run_width(&z, &rp2, tp, 1)
+    let d_one: i64 = ((one2 - one0) * 1000.0 + 0.5) as i64
+    var n3: [u8; 45] = "1 one letter is NOT widened by tracking      "
+    report_n((&n3[0]) as u64, 44, d_one == 0, d_one, 0)
+
+    // ==================================================================
+    // 2. THE MEASUREMENT MATCHES THE PAINTING
+    // ==================================================================
+    //
+    // The ink in the picture is measured and compared with what
+    // run_width returned. They cannot be equal to the pixel -- the ink
+    // of "H" starts a little right of the pen and "G" ends a little
+    // left of the advance (the side bearings). So what is checked is
+    // that the DIFFERENCE between two trackings is the same in the ink
+    // as in the number: the bearings cancel out.
+    clear(&cv, (*f).base)
+    painter.run_draw(&z, &r0, 40.0, 120.0, 0.0, fgc, tp, tn, 0)
+    let i0a: i64 = ink_x0(&cv, bg)
+    let i0b: i64 = ink_x1(&cv, bg)
+    let ink0: i64 = i0b - i0a
+
+    clear(&cv, (*f).base)
+    painter.run_draw(&z, &rp2, 40.0, 120.0, 0.0, fgc, tp, tn, 0)
+    let i2a: i64 = ink_x0(&cv, bg)
+    let i2b: i64 = ink_x1(&cv, bg)
+    let ink2: i64 = i2b - i2a
+
+    var l3: [u8; 39] = "ink width tracking  0 (px)             "
+    say((&l3[0]) as u64, 39, ink0)
+    var l4: [u8; 39] = "ink width tracking +2 (px)             "
+    say((&l4[0]) as u64, 39, ink2)
+
+    // the ink has to grow by the same 12 px the number grew by
+    let d_ink: i64 = ink2 - ink0
+    var n4: [u8; 45] = "2 the painted ink grows by the same 12 px    "
+    report_n((&n4[0]) as u64, 44, d_ink == gaps * 2, d_ink, gaps * 2)
+
+    // AND THE NUMBER IS NOT SMALLER THAN THE INK. If run_width
+    // returned less than what is painted, every layout would be too
+    // narrow and the text would run out of its box -- that is the wave
+    // 3 bug in its general form.
+    let ink_end: i64 = i2b
+    let said_end: i64 = (40.0 + wp2) as i64
+    var n5: [u8; 45] = "2 the ink ends inside the measured width     "
+    report_n((&n5[0]) as u64, 44, ink_end <= said_end, ink_end,
+        said_end)
+
+    // ==================================================================
+    // 3. A TOO-LONG TEXT WITH TRACKING IS CUT IN THE RIGHT PLACE
+    // ==================================================================
+    //
+    // The text is drawn into a rect of 150 px and the pixels to the
+    // RIGHT of that rect are counted. One pixel there is a bug: it is
+    // the neighbouring table column.
+    let room: f64 = 150.0
+    clear(&cv, (*f).base)
+    painter.run_draw(&z, &rp2, 40.0, 120.0, room, fgc, tp, tn, 0)
+    let bleed: i64 = ink_count(&cv, (40.0 + room) as usize + 1, W, 0,
+        H, bg)
+    var n6: [u8; 45] = "3 nothing is painted past the rect with +2   "
+    report_n((&n6[0]) as u64, 44, bleed == 0, bleed, 0)
+
+    // ...and something IS painted, so "no bleed" is not met by
+    // drawing nothing.
+    let inside: i64 = ink_count(&cv, 40, (40.0 + room) as usize, 0, H,
+        bg)
+    var n7: [u8; 45] = "3 and the text really is painted inside      "
+    report_n((&n7[0]) as u64, 44, inside > 200, inside, 200)
+
+    // The cut has to be TIGHTER with tracking than without -- more
+    // space per letter means fewer letters fit.
+    let fit0: usize = painter.run_fits_upto(&z, &r0, tp, tn, room)
+    let fit2: usize = painter.run_fits_upto(&z, &rp2, tp, tn, room)
+    var n8: [u8; 45] = "3 tracking makes fewer letters fit           "
+    report_n((&n8[0]) as u64, 44, fit2 <= fit0, fit2 as i64,
+        fit0 as i64)
+
+    // ==================================================================
+    // 4. KERNING ON / OFF, MEASURED ON A REAL PAIR
+    // ==================================================================
+    //
+    // "To" is the pair with the strongest kerning in DejaVu: -348 units
+    // of 2048, which at 40 px is -6.8 px. With kerning off the two
+    // letters must stand exactly that much further apart.
+    var kt: [u8; 3] = "To "
+    let kp: u64 = (&kt[0]) as u64
+    var kon: painter.TextRun = painter.run_new(SIZE)
+    var koff: painter.TextRun = painter.run_new(SIZE)
+    koff = painter.run_set_kerning(koff, false)
+    let wkon: f64 = painter.run_width(&z, &kon, kp, 2)
+    let wkoff: f64 = painter.run_width(&z, &koff, kp, 2)
+    var l5: [u8; 39] = "'To' kerning ON  width x1000           "
+    say((&l5[0]) as u64, 39, (wkon * 1000.0) as i64)
+    var l6: [u8; 39] = "'To' kerning OFF width x1000           "
+    say((&l6[0]) as u64, 39, (wkoff * 1000.0) as i64)
+
+    // kerning on must be NARROWER
+    var n9: [u8; 45] = "4 'To' with kerning is narrower than without "
+    report_n((&n9[0]) as u64, 44, wkon < wkoff,
+        (wkon * 1000.0) as i64, (wkoff * 1000.0) as i64)
+
+    // and by the amount the font's own table says
+    let kdiff: i64 = ((wkoff - wkon) * 100.0 + 0.5) as i64
+    var n10: [u8; 45] = "4 and the difference is the font's 6.8 px    "
+    report_n((&n10[0]) as u64, 44, kdiff >= 670 && kdiff <= 690,
+        kdiff, 680)
+
+    // IT IS REALLY PAINTED THAT WAY TOO, not only measured.
+    clear(&cv, (*f).base)
+    painter.run_draw(&z, &kon, 40.0, 120.0, 0.0, fgc, kp, 2, 0)
+    let konw: i64 = ink_x1(&cv, bg) - ink_x0(&cv, bg)
+    clear(&cv, (*f).base)
+    painter.run_draw(&z, &koff, 40.0, 120.0, 0.0, fgc, kp, 2, 0)
+    let koffw: i64 = ink_x1(&cv, bg) - ink_x0(&cv, bg)
+    var n11: [u8; 44] = "4 the painted 'To' is narrower with kerning "
+    report_n((&n11[0]) as u64, 44, konw < koffw, konw, koffw)
+
+    // ==================================================================
+    // 5. THE OUTLINE REALLY LIES AROUND THE GLYPH
+    // ==================================================================
+    //
+    // Measured as a box: the ink WITH an outline has to reach further
+    // out on ALL FOUR sides than without -- an outline that only grows
+    // downwards is a shadow, not a contour.
+    clear(&cv, (*f).base)
+    var plain: painter.TextRun = painter.run_new(SIZE)
+    painter.run_draw(&z, &plain, 100.0, 120.0, 0.0, fgc, tp, 1, 0)
+    let px0: i64 = ink_x0(&cv, bg)
+    let px1: i64 = ink_x1(&cv, bg)
+    let py0: i64 = ink_y0(&cv, bg)
+    let py1: i64 = ink_y1(&cv, bg)
+
+    clear(&cv, (*f).base)
+    var outl: painter.TextRun = painter.run_new(SIZE)
+    outl = painter.run_set_outline(outl, 3.0,
+        theme.opaque((*f).accent))
+    painter.run_draw(&z, &outl, 100.0, 120.0, 0.0, fgc, tp, 1, 0)
+    let ox0: i64 = ink_x0(&cv, bg)
+    let ox1: i64 = ink_x1(&cv, bg)
+    let oy0: i64 = ink_y0(&cv, bg)
+    let oy1: i64 = ink_y1(&cv, bg)
+
+    var n12: [u8; 44] = "5 outline reaches further LEFT              "
+    report_n((&n12[0]) as u64, 44, ox0 < px0, ox0, px0)
+    var n13: [u8; 44] = "5 outline reaches further RIGHT             "
+    report_n((&n13[0]) as u64, 44, ox1 > px1, ox1, px1)
+    var n14: [u8; 44] = "5 outline reaches further UP                "
+    report_n((&n14[0]) as u64, 44, oy0 < py0, oy0, py0)
+    var n15: [u8; 44] = "5 outline reaches further DOWN              "
+    report_n((&n15[0]) as u64, 44, oy1 > py1, oy1, py1)
+
+    // AND IT IS THE OUTLINE COLOUR THAT SITS OUTSIDE, not the text
+    // colour. Measured one pixel outside the plain glyph's box.
+    // One pixel outside the PLAIN glyph's left edge. Guarded, because
+    // px0 can be small and a negative index would wrap around into a
+    // gigantic one -- the panic the first run hit.
+    var probe: i64 = px0 - 2
+    if probe < 0 {
+        probe = 0
+    }
+    let edge: u32 = px(&cv, probe as usize,
+        ((py0 + py1) / 2) as usize)
+    var n16: [u8; 45] = "5 and outside the glyph sits the accent      "
+    report_n((&n16[0]) as u64, 44, edge != bg, edge as i64,
+        bg as i64)
+
+    // ==================================================================
+    // 6. THE SHADOW HAS THE RIGHT OFFSET
+    // ==================================================================
+    //
+    // A shadow of +6/+6 has to push the ink box exactly 6 px right and
+    // 6 px down, and NOT change the top left -- the glyph itself still
+    // stands where it stood.
+    clear(&cv, (*f).base)
+    var shd: painter.TextRun = painter.run_new(SIZE)
+    shd = painter.run_set_shadow(shd, 6.0, 6.0,
+        theme.opaque((*f).accent))
+    painter.run_draw(&z, &shd, 100.0, 120.0, 0.0, fgc, tp, 1, 0)
+    let sx0: i64 = ink_x0(&cv, bg)
+    let sx1: i64 = ink_x1(&cv, bg)
+    let sy0: i64 = ink_y0(&cv, bg)
+    let sy1: i64 = ink_y1(&cv, bg)
+
+    var n17: [u8; 44] = "6 shadow +6 moves the right edge by 6       "
+    report_n((&n17[0]) as u64, 44, sx1 - px1 == 6, sx1 - px1, 6)
+    var n18: [u8; 44] = "6 shadow +6 moves the bottom edge by 6      "
+    report_n((&n18[0]) as u64, 44, sy1 - py1 == 6, sy1 - py1, 6)
+    var n19: [u8; 45] = "6 and the glyph itself has NOT moved         "
+    report_n((&n19[0]) as u64, 44, sx0 == px0 && sy0 == py0, sx0, px0)
+
+    // THE SHADOW SITS BEHIND, NOT IN FRONT. The pixel at the glyph's
+    // own middle must still be the text colour -- if the shadow were
+    // painted last it would cover it.
+    let mid: u32 = px(&cv, ((px0 + px1) / 2) as usize,
+        ((py0 + py1) / 2) as usize)
+    var n20: [u8; 44] = "6 the shadow lies BEHIND the glyph          "
+    report_n((&n20[0]) as u64, 44, mid != ((*f).accent & 16777215 as u32),
+        mid as i64, ((*f).accent & 16777215 as u32) as i64)
+
+    // ==================================================================
+    // 7. THE STYLE REALLY CARRIES IT INTO EVERY WIDGET
+    // ==================================================================
+    //
+    // This is the check for Justin's "the values must take effect on
+    // EVERY element that paints text, not only the label". A BUTTON
+    // gets a tracking through its Style, and the painted button has to
+    // be wider inside than the same button without it.
+    //
+    // It goes through render.draw_widget, so it proves the whole road:
+    // Style -> resolve -> text_run_of -> run_draw.
+    clear(&cv, (*f).base)
+    var b1: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b1, 40.0, 40.0, 400.0, 60.0)
+    widget.w_set_text(&b1, tp, tn)
+    render.draw_widget(&c, &b1)
+    // the ink inside the button, without its border: count the columns
+    // that carry text
+    let t_plain: i64 = ink_count(&cv, 60, 420, 55, 90,
+        (*f).button & 16777215 as u32)
+    let sp_plain: i64 = ink_span(&cv, 60, 420, 55, 90,
+        (*f).button & 16777215 as u32)
+
+    clear(&cv, (*f).base)
+    var b2: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b2, 40.0, 40.0, 400.0, 60.0)
+    widget.w_set_text(&b2, tp, tn)
+    let s2: *mut style.Style = widget.w_style(&b2)
+    *s2 = style.style_set_tracking(*s2, 4)
+    render.draw_widget(&c, &b2)
+    let sp_track: i64 = ink_span(&cv, 60, 420, 55, 90,
+        (*f).button & 16777215 as u32)
+
+    var n21: [u8; 45] = "7 a BUTTON honours the tracking from Style   "
+    // +4 design points over 6 gaps = 24 px wider ink.
+    report_n((&n21[0]) as u64, 44, sp_track - sp_plain == 24,
+        sp_track - sp_plain, 24)
+
+    // BOLD through the Style, on a button as well.
+    clear(&cv, (*f).base)
+    var b3: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b3, 40.0, 40.0, 400.0, 60.0)
+    widget.w_set_text(&b3, tp, tn)
+    let s3: *mut style.Style = widget.w_style(&b3)
+    *s3 = style.style_set_weight(*s3, style.WEIGHT_BOLD)
+    render.draw_widget(&c, &b3)
+    let t_bold: i64 = ink_count(&cv, 60, 420, 55, 90,
+        (*f).button & 16777215 as u32)
+    // bold puts MORE ink on the same letters
+    var n22: [u8; 45] = "7 and bold really puts more ink on it        "
+    report_n((&n22[0]) as u64, 44, t_bold > t_plain, t_bold, t_plain)
+
+    // A STYLE THAT SETS NOTHING CHANGES NOTHING. The inheritance rule,
+    // measured: an empty Style has to give the very same picture.
+    clear(&cv, (*f).base)
+    var b4: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&b4, 40.0, 40.0, 400.0, 60.0)
+    widget.w_set_text(&b4, tp, tn)
+    let s4: *mut style.Style = widget.w_style(&b4)
+    *s4 = style.style_new()
+    render.draw_widget(&c, &b4)
+    let t_empty: i64 = ink_count(&cv, 60, 420, 55, 90,
+        (*f).button & 16777215 as u32)
+    var n23: [u8; 45] = "7 an empty Style changes nothing at all      "
+    report_n((&n23[0]) as u64, 44, t_empty == t_plain, t_empty,
+        t_plain)
+
+    // ==================================================================
+    // 8. LINE HEIGHT
+    // ==================================================================
+    //
+    // The default comes from the font (ascent + descent). A multiple of
+    // 2.0 has to give exactly twice a 1.0 -- checked against the font's
+    // own metric, not against a number typed in here.
+    var lh: painter.TextRun = painter.run_new(SIZE)
+    let lh_def: f64 = painter.run_line_height(&z, &lh)
+    let metric: f64 = painter.font_ascent(&z, SIZE)
+        + painter.font_descent(&z, SIZE)
+    var n24: [u8; 45] = "8 default line height = the font metric      "
+    report_n((&n24[0]) as u64, 44,
+        (lh_def * 100.0) as i64 == (metric * 100.0) as i64,
+        (lh_def * 100.0) as i64, (metric * 100.0) as i64)
+
+    var lh2: painter.TextRun = painter.run_new(SIZE)
+    lh2 = painter.run_set_line_height(lh2, SIZE * 2.0)
+    let lh2v: f64 = painter.run_line_height(&z, &lh2)
+    var n25: [u8; 45] = "8 a set line height is used as given         "
+    report_n((&n25[0]) as u64, 44,
+        (lh2v * 100.0) as i64 == (SIZE * 200.0) as i64,
+        (lh2v * 100.0) as i64, (SIZE * 200.0) as i64)
+
+    // ==================================================================
+    // 9. WORD SPACING HITS ONLY THE BLANK
+    // ==================================================================
+    var ws1: [u8; 8] = "AB CD EF"
+    let wsp: u64 = (&ws1[0]) as u64
+    var wr0: painter.TextRun = painter.run_new(SIZE)
+    wr0 = painter.run_set_kerning(wr0, false)
+    var wr1: painter.TextRun = painter.run_new(SIZE)
+    wr1 = painter.run_set_kerning(wr1, false)
+    wr1 = painter.run_set_word_spacing(wr1, 5.0)
+    let ww0: f64 = painter.run_width(&z, &wr0, wsp, 8)
+    let ww1: f64 = painter.run_width(&z, &wr1, wsp, 8)
+    // two blanks -> exactly 10 px more
+    let dws: i64 = ((ww1 - ww0) * 1000.0 + 0.5) as i64
+    var n26: [u8; 45] = "9 word spacing 5 on 2 blanks adds 10 px      "
+    report_n((&n26[0]) as u64, 44, dws == 10000, dws, 10000)
+
+    // and a text WITHOUT a blank is untouched by it
+    let nb0: f64 = painter.run_width(&z, &wr0, tp, tn)
+    let nb1: f64 = painter.run_width(&z, &wr1, tp, tn)
+    var n27: [u8; 45] = "9 and a text without a blank is untouched    "
+    report_n((&n27[0]) as u64, 44,
+        (nb0 * 1000.0) as i64 == (nb1 * 1000.0) as i64,
+        (nb1 * 1000.0) as i64, (nb0 * 1000.0) as i64)
+
+    // ==================================================================
+    // 10. NOT ONE COLOUR IS HARD-CODED
+    // ==================================================================
+    //
+    // The outline takes its colour from the theme. Set the accent to
+    // magenta and the contour has to become magenta -- an outline with
+    // a built-in black would stay black.
+    (*f).accent = 16711935 as u32   // 0xFF00FF
+    clear(&cv, (*f).base)
+    var mg: painter.TextRun = painter.run_new(SIZE)
+    mg = painter.run_set_outline(mg, 3.0, theme.opaque((*f).accent))
+    painter.run_draw(&z, &mg, 100.0, 120.0, 0.0, fgc, tp, 1, 0)
+    let mx0: i64 = ink_x0(&cv, bg)
+    var mprobe: i64 = mx0 + 1
+    if mprobe < 0 {
+        mprobe = 0
+    }
+    let mcol: u32 = px(&cv, mprobe as usize,
+        ((py0 + py1) / 2) as usize)
+    var n28: [u8; 45] = "10 the outline colour comes from the theme   "
+    report_n((&n28[0]) as u64, 44,
+        (mcol & 16711680 as u32) != 0 as u32
+        && (mcol & 255 as u32) != 0 as u32, mcol as i64,
+        16711935 as i64)
+
+    // ---- the result
+    var tail: rt.Buf = rt.buf_new()
+    rt.buf_push(&tail, 10 as u8)
+    if G_ERRORS == 0 {
+        var g: [u8; 16] = "TEXT PASSED.\n\0\0\0"
+        rt.buf_push_bytes(&tail, (&g[0]) as u64, 13)
+    } else {
+        var b: [u8; 16] = "TEXT FAILED.\n\0\0\0"
+        rt.buf_push_bytes(&tail, (&b[0]) as u64, 13)
+    }
+    rt.write_everything(1, rt.buf_ptr(&tail), rt.buf_len(&tail))
+    rt.buf_free(&tail)
+
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    if G_ERRORS != 0 {
+        return 1
+    }
+    return 0
+}

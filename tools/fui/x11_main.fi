@@ -1,0 +1,813 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/x11_main.fi -- DIE PLATTFORMSCHICHT OHNE BILDSCHIRM NACHGERECHNET.
+//
+// ===================================================== WARUM ES DAS GIBT
+//
+// Auf dem Rechner, auf dem dieser Lauf meist laeuft, gibt es keinen
+// X-Server. Wer die X11-Rueckwand (lib/window/x11.fi) und den Wirt
+// (lib/plat/fuiwirt.fi) trotzdem pruefen will, darf nicht die eigene
+// Rechnung gegen sich selbst halten -- sonst prueft er nur, dass er
+// zweimal denselben Fehler macht. Also stehen hier drei Arten von
+// Sollwerten, und keine davon stammt aus dem Code, den sie prueft:
+//
+//   1. VON HAND BESTIMMTE OKTETTS fuer jede Anfrage (Abschnitt 1),
+//      nach dem Oktettformat im Anhang B des X11-Protokolls.
+//   2. ECHTE MITSCHNITTE eines Xvfb (testdata/x11/, erzeugt von
+//      tools/fui/x11_capture.py, das roh und ohne Firn mit dem Server
+//      spricht), und daneben die Zahlen, die FREMDE Programme ueber
+//      denselben Server sagen: `xdpyinfo` (1400x900 Punkte, 370x238
+//      mm, 96x96 dpi, Visual 0x21, Masken ff0000/ff00/ff) und
+//      `xmodmap -pke` (testdata/x11/xmodmap_us.txt, xmodmap_de.txt).
+//   3. DIE ZAHLEN DER BESCHRIEBENEN SEITE aus tools/fui/gallery9_main.fi
+//      (Ausschnitt bei y = 168, Leiste 56, Inhalt 1130), die dort schon
+//      am Bild belegt sind -- hier bei Massstab 1000 UND 2000.
+//
+// Gezaehlt wird am Ende; eine einzige falsche Zahl macht den Lauf rot.
+//
+//     x11_main <font.ttf>     (Vorgabe DejaVuSans) -- aus der Wurzel des
+//                             Baums aufrufen, die Mitschnitte liegen
+//                             unter testdata/x11/.
+//
+// WIE DIE RUECKWAND HIER HEREINKOMMT. `import window.backend` wird neben
+// der Wurzeldatei gesucht (compiler/src/modules.rs, Regel 2); in
+// tools/fui/window/ liegt dafuer ein Verweis backend.fi ->
+// ../../../lib/window/x11.fi, genau wie in demos/x11demo/window/.
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.layout
+import fui.scene
+import fui.sheet
+import fui.viewport
+import fui.control
+import fui.anim
+import window.window
+import window.backend
+import plat.fuiwirt
+import gallery9_main
+
+const FONTSET_BYTES: usize = 4096
+// Aus testdata/x11/events.txt: die Atome, die der Server beim Mitschnitt
+// vergeben hat, und das Fenster.
+const A_DELETE: u32 = 241
+const WID: u32 = 2097153
+
+static mut G_FEHLER: usize = 0
+static mut G_ZAHL: usize = 0
+
+fn chk(t: u64, n: usize, ok: bool, got: i64, want: i64) {
+    G_ZAHL = G_ZAHL + 1
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, t, n)
+    var i: usize = n
+    while i < 50 {
+        rt.buf_push(&b, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&b, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&b, (&f[0]) as u64, 8)
+        G_FEHLER = G_FEHLER + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&b, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&b, got)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&b, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&b, want)
+    rt.buf_push(&b, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+// Oktett fuer Oktett. `got` ist die Zahl der gleichen Oktett, `want`
+// die Laenge des Sollwerts -- und nur gleich lang UND ganz gleich ist
+// OK. Bei einem Fehler steht die Anfrage in hex darunter.
+fn hexchk(t: u64, n: usize, b: *mut rt.Buf, soll: u64, sn: usize) {
+    var gleich: usize = 0
+    var i: usize = 0
+    while i < sn && i < (*b).len {
+        if rt.ld8((*b).ptr, i) == rt.ld8(soll, i) {
+            gleich = gleich + 1
+        }
+        i = i + 1
+    }
+    let ok: bool = (*b).len == sn && gleich == sn
+    chk(t, n, ok, gleich as i64, sn as i64)
+    if !ok {
+        var d: rt.Buf = rt.buf_new()
+        var k: usize = 0
+        while k < (*b).len {
+            rt.buf_push_hex_u64(&d, rt.ld8((*b).ptr, k) as u64, 2)
+            k = k + 1
+        }
+        rt.buf_push(&d, 10 as u8)
+        rt.write_everything(1, rt.buf_ptr(&d), rt.buf_len(&d))
+        rt.buf_free(&d)
+    }
+}
+
+fn b2i(b: bool) -> i64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+fn ld32(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+    | ((rt.ld8(p, off + 2) as u32) << 16)
+    | ((rt.ld8(p, off + 3) as u32) << 24)
+}
+
+// ======================================================================
+// DIE SEITE AUS gallery9 -- dieselben Funktionen, kein Nachbau
+// ======================================================================
+
+fn px(m: *mut theme.Theme, n: f64) -> f64 {
+    return theme.theme_px(m, (n + 0.5) as usize) as f64
+}
+
+// Die Hoehe des Inhalts wird GEMESSEN (letzte Zeile unten minus erste
+// Zeile oben plus zweimal der Innenrand) und nicht hingeschrieben --
+// sonst stuende hier bei jedem Massstab eine eigene Zahl.
+fn inhalt_messen(sc: *mut scene.Scene, v: *mut viewport.Viewport,
+    m: *mut theme.Theme, kasten: usize) -> f64 {
+    let n: usize = scene.scene_child_count(sc, kasten)
+    let erste: usize = scene.scene_child_at(sc, kasten, 0)
+    let letzte: usize = scene.scene_child_at(sc, kasten, n - 1)
+    let pad: f64 = theme.theme_px(m, 8) as f64
+    let h: f64 = scene.node_y(sc, letzte) + scene.node_h(sc, letzte)
+    - scene.node_y(sc, erste) + 2.0 * pad
+    viewport.viewport_set_content(v, viewport.viewport_content_w(v), h)
+    return h
+}
+
+fn baue_seite(sc: *mut scene.Scene, v: *mut viewport.Viewport,
+    sh: *mut sheet.Sheet, m: *mut theme.Theme, c: *mut render.Ctx,
+    texte: u64, feld: u64, breite: usize, hoehe: usize) -> usize {
+    var nleiste: [u8; 6] = "leiste"
+    var ntitel: [u8; 5] = "titel"
+    var nkarte: [u8; 5] = "karte"
+    var nueber: [u8; 5] = "ueber"
+    var nnotiz: [u8; 5] = "notiz"
+    var nliste: [u8; 5] = "liste"
+    var nzeile: [u8; 5] = "zeile"
+    var ngerade: [u8; 6] = "gerade"
+    var nakzent: [u8; 6] = "akzent"
+    let k_leiste: u32 = sheet.sheet_name((&nleiste[0]) as u64, 6)
+    let k_titel: u32 = sheet.sheet_name((&ntitel[0]) as u64, 5)
+    let k_karte: u32 = sheet.sheet_name((&nkarte[0]) as u64, 5)
+    let k_ueber: u32 = sheet.sheet_name((&nueber[0]) as u64, 5)
+    let k_notiz: u32 = sheet.sheet_name((&nnotiz[0]) as u64, 5)
+    let k_liste: u32 = sheet.sheet_name((&nliste[0]) as u64, 5)
+    let k_zeile: u32 = sheet.sheet_name((&nzeile[0]) as u64, 5)
+    let k_gerade: u32 = sheet.sheet_name((&ngerade[0]) as u64, 6)
+    let k_akzent: u32 = sheet.sheet_name((&nakzent[0]) as u64, 6)
+    *v = viewport.viewport_new(0.0, 0.0, px(m, gallery9_main.LISTE_W),
+        px(m, 400.0), px(m, gallery9_main.INHALT_W),
+        px(m, gallery9_main.INHALT_H))
+    viewport.viewport_set_bar(v, theme.theme_px(m, gallery9_main.BALKEN))
+    viewport.viewport_set_inset(v, px(m, gallery9_main.POLSTER))
+    *sh = sheet.sheet_new()
+    let spurfarbe: u32 = theme.color_from_token(m, style.TOK_SURFACE)
+    let grund_liste: u32 = theme.mix(spurfarbe,
+        theme.color_from_token(m, style.TOK_TEXT), 500)
+    gallery9_main.baue_blatt(sh, k_leiste, k_titel, k_karte, k_ueber,
+        k_notiz, k_liste, k_zeile, k_gerade, k_akzent,
+        style.color_literal(grund_liste))
+    *sc = scene.scene_new()
+    let kasten: usize = gallery9_main.baue_baum(sc, v, feld, k_leiste,
+        k_titel, k_karte, k_ueber, k_notiz, k_liste, k_zeile, k_gerade,
+        k_akzent, texte)
+    scene.scene_style(sc, sh)
+    scene.scene_measure(sc, c)
+    scene.scene_layout(sc, c, 0.0, 0.0, breite as f64, hoehe as f64)
+    let h: f64 = inhalt_messen(sc, v, m, kasten)
+    scene.scene_layout(sc, c, 0.0, 0.0, breite as f64, hoehe as f64)
+    return kasten
+}
+
+// Wie viele Text- und Widget-Knoten sind schmaler als ihr Text?
+fn zu_schmal(sc: *mut scene.Scene, c: *mut render.Ctx) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < scene.scene_count(sc) {
+        if scene.node_kind(sc, k) == scene.N_TEXT
+        || scene.node_kind(sc, k) == scene.N_WIDGET {
+            var pw: f64 = 0.0
+            var ph: f64 = 0.0
+            render.pref_of(c, scene.node_widget(sc, k), &pw, &ph)
+            if pw > scene.node_w(sc, k) + 0.5 {
+                n = n + 1
+            }
+        }
+        k = k + 1
+    }
+    return n
+}
+
+fn mitte_x(sc: *mut scene.Scene, i: usize) -> f64 {
+    return scene.node_x(sc, i) + scene.node_w(sc, i) / 2.0
+}
+
+fn mitte_y(sc: *mut scene.Scene, i: usize) -> f64 {
+    return scene.node_y(sc, i) + scene.node_h(sc, i) / 2.0
+}
+
+// ======================================================================
+// ABSCHNITT 8: DER MASSSTAB IM BAUM -- 1000 gegen 2000
+// ======================================================================
+fn massstab(fm: u64, texte: u64, feld: u64, promille: usize, soll_y: i64,
+    soll_leiste: i64, soll_zeile: i64, soll_inhalt: i64) {
+    var cv: canvas.Canvas = canvas.canvas_new()
+    let ok0: bool = canvas.canvas_init(&cv, 64, 64)
+    var z: painter.Painter = painter.painter_new()
+    let ok1: bool = painter.painter_init(&z, &cv, 64, 64)
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    var sc: scene.Scene = scene.scene_new()
+    var v: viewport.Viewport = viewport.viewport_new(0.0, 0.0, 1.0, 1.0,
+        1.0, 1.0)
+    var sh: sheet.Sheet = sheet.sheet_new()
+    var w: fuiwirt.Wirt = fuiwirt.wirt_new(&sc, &c)
+    // Der Massstab geht EINMAL ins Theme -- ueber den Wirt, wie im Fenster.
+    fuiwirt.wirt_set_scale(&w, &m, promille)
+    let breite: usize = (gallery9_main.W_STD * promille) / 1000
+    let hoehe: usize = (gallery9_main.H * promille) / 1000
+    let kasten: usize = baue_seite(&sc, &v, &sh, &m, &c, texte, feld, breite,
+        hoehe)
+    let wurzel: usize = scene.scene_root(&sc)
+    let kopf: usize = scene.scene_child_at(&sc, wurzel, 0)
+    let zeile: usize = scene.scene_child_at(&sc, kasten, 0)
+    var t1: [u8; 37] = "8 Theme traegt den Massstab des Wirts"
+    chk((&t1[0]) as u64, 37, theme.theme_scale(&m) == promille, (theme.theme_scale(&m)) as i64, (promille) as i64)
+    var t2: [u8; 28] = "8 die Kopfleiste ist so hoch"
+    chk((&t2[0]) as u64, 28, (scene.node_h(&sc, kopf) as i64) == soll_leiste, (scene.node_h(&sc, kopf)) as i64, (soll_leiste) as i64)
+    var t3: [u8; 30] = "8 der Ausschnitt beginnt bei y"
+    chk((&t3[0]) as u64, 30, (viewport.viewport_y(&v) as i64) == soll_y, (viewport.viewport_y(&v)) as i64, (soll_y) as i64)
+    var t4: [u8; 34] = "8 eine Zeile der Liste ist so hoch"
+    chk((&t4[0]) as u64, 34, (scene.node_h(&sc, zeile) as i64) == soll_zeile, (scene.node_h(&sc, zeile)) as i64, (soll_zeile) as i64)
+    var t5: [u8; 29] = "8 gemessener Inhalt der Liste"
+    chk((&t5[0]) as u64, 29, (viewport.viewport_content_h(&v) as i64) == soll_inhalt, (viewport.viewport_content_h(&v)) as i64, (soll_inhalt) as i64)
+    let schmal: usize = zu_schmal(&sc, &c)
+    var t6: [u8; 40] = "8 kein Knoten zu schmal fuer seinen Text"
+    chk((&t6[0]) as u64, 40, schmal == 0, (schmal) as i64, (0) as i64)
+    var t7: [u8; 37] = "8 der Baum ist vollstaendig (Grund 0)"
+    chk((&t7[0]) as u64, 37, scene.scene_overflow_reason(&sc) == scene.OF_NONE, (scene.scene_overflow_reason(&sc)) as i64, (0) as i64)
+    // Das Rad rollt eine Strecke aus dem Entwurf: 72 Punkte, also 72 *
+    // Massstab Bildpunkte.
+    let r: u32 = fuiwirt.wirt_pointer_down(&w, mitte_x(&sc, kasten), viewport.viewport_y(&v) + 60.0, fuiwirt.BTN_WHEEL_DOWN)
+    let soll_rad: i64 = ((72 * promille) / 1000) as i64
+    var t8: [u8; 36] = "8 ein Rasten rollt 72 Entwurfspunkte"
+    chk((&t8[0]) as u64, 36, (viewport.viewport_off_y(&v) as i64) == soll_rad, (viewport.viewport_off_y(&v)) as i64, (soll_rad) as i64)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+}
+
+// ======================================================================
+// ABSCHNITT 9 UND 10: DIE BEDIENUNG UND DER LEERLAUF
+// ======================================================================
+fn bedienung(fm: u64, texte: u64, feld: u64) {
+    var cv: canvas.Canvas = canvas.canvas_new()
+    let ok0: bool = canvas.canvas_init(&cv, 64, 64)
+    var z: painter.Painter = painter.painter_new()
+    let ok1: bool = painter.painter_init(&z, &cv, 64, 64)
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    var sc: scene.Scene = scene.scene_new()
+    var v: viewport.Viewport = viewport.viewport_new(0.0, 0.0, 1.0, 1.0,
+        1.0, 1.0)
+    var sh: sheet.Sheet = sheet.sheet_new()
+    let kasten: usize = baue_seite(&sc, &v, &sh, &m, &c, texte, feld,
+        gallery9_main.W_STD, gallery9_main.H)
+    var w: fuiwirt.Wirt = fuiwirt.wirt_new(&sc, &c)
+    fuiwirt.wirt_bind(&w)
+    let pn: *mut control.Panel = fuiwirt.wirt_panel(&w)
+    let wurzel: usize = scene.scene_root(&sc)
+    let kopf: usize = scene.scene_child_at(&sc, wurzel, 0)
+    let knopf1: usize = scene.scene_child_at(&sc, kopf, 1)
+    let rumpf: usize = scene.scene_child_at(&sc, wurzel, 2)
+    let rechts: usize = scene.scene_child_at(&sc, rumpf, 1)
+    let karte2: usize = scene.scene_child_at(&sc, rechts, 1)
+    let kbox: usize = scene.scene_child_at(&sc, karte2, 1)
+    let schalter: usize = scene.scene_child_at(&sc, karte2, 2)
+    let regler: usize = scene.scene_child_at(&sc, karte2, 4)
+    let sx: f64 = mitte_x(&sc, schalter)
+    let sy: f64 = mitte_y(&sc, schalter)
+
+    var t9: [u8; 34] = "9 das Panel haengt an allen Knoten"
+    chk((&t9[0]) as u64, 34, control.panel_count(pn) == scene.scene_count(&sc), (control.panel_count(pn)) as i64, (scene.scene_count(&sc)) as i64)
+    var t10: [u8; 35] = "9 Panel-Widget = Widget des Knotens"
+    chk((&t10[0]) as u64, 35, control.panel_widget(pn, schalter) as u64 == scene.node_widget(&sc, schalter) as u64, (1) as i64, (1) as i64)
+    let ch1: u32 = fuiwirt.wirt_pointer_move(&w, sx, sy)
+    var t11: [u8; 47] = "9 Zeiger auf den Schalter -> er ist ueberfahren"
+    chk((&t11[0]) as u64, 47, control.panel_hot(pn) == schalter, (control.panel_hot(pn)) as i64, (schalter) as i64)
+    var t12: [u8; 33] = "9 und das verlangt ein neues Bild"
+    chk((&t12[0]) as u64, 33, (ch1 & control.CH_REPAINT) != 0 as u32, (ch1 & control.CH_REPAINT) as i64, (1) as i64)
+    let vorher: i64 = widget.w_value(scene.node_widget(&sc, schalter))
+    let d1: u32 = fuiwirt.wirt_pointer_down(&w, sx, sy, fuiwirt.BTN_LEFT)
+    let u1: u32 = fuiwirt.wirt_pointer_up(&w, sx, sy, fuiwirt.BTN_LEFT)
+    let nachher: i64 = widget.w_value(scene.node_widget(&sc, schalter))
+    var t13: [u8; 46] = "9 Druecken+Loslassen kippt den Schalter 1 -> 0"
+    chk((&t13[0]) as u64, 46, vorher == 1 && nachher == 0, (nachher) as i64, (0) as i64)
+    let akt: usize = fuiwirt.wirt_take_activated(&w)
+    var t14: [u8; 39] = "9 ausgeloest meldet genau diesen Knoten"
+    chk((&t14[0]) as u64, 39, akt == schalter, (akt) as i64, (schalter) as i64)
+    let d2: u32 = fuiwirt.wirt_pointer_down(&w, sx, sy, fuiwirt.BTN_LEFT)
+    let m2: u32 = fuiwirt.wirt_pointer_move(&w, 5.0, 5.0)
+    let u2: u32 = fuiwirt.wirt_pointer_up(&w, 5.0, 5.0, fuiwirt.BTN_LEFT)
+    var t15: [u8; 31] = "9 Loslassen daneben kippt NICHT"
+    chk((&t15[0]) as u64, 31, widget.w_value(scene.node_widget(&sc, schalter)) == 0, (widget.w_value(scene.node_widget(&sc, schalter))) as i64, (0) as i64)
+    let zeile: usize = scene.scene_child_at(&sc, kasten, 1)
+    var t16: [u8; 36] = "9 eine Textzeile ist keine Bedienung"
+    chk((&t16[0]) as u64, 36, control.hit_test(pn, mitte_x(&sc, zeile), mitte_y(&sc, zeile)) == control.NOBODY, (0) as i64, (0) as i64)
+    // Weggerollte Zeile unter der Werkzeugleiste: nach dem Rollen liegt
+    // die erste Zeile mit ihrem Rechteck ueber dem Ausschnitt. Dort steht
+    // der erste Knopf der zweiten Leiste -- und nur ER darf getroffen werden.
+    let leiste: usize = scene.scene_child_at(&sc, wurzel, 1)
+    let lknopf: usize = scene.scene_child_at(&sc, leiste, 0)
+    var t17: [u8; 37] = "9 ein Knopf der Leiste wird getroffen"
+    chk((&t17[0]) as u64, 37, control.hit_test(pn, mitte_x(&sc, lknopf), mitte_y(&sc, lknopf)) == lknopf, (control.hit_test(pn, mitte_x(&sc, lknopf), mitte_y(&sc, lknopf))) as i64, (lknopf) as i64)
+    // Das Rad ueber der Liste und ueber den Karten.
+    let lx: f64 = mitte_x(&sc, kasten)
+    let ly: f64 = viewport.viewport_y(&v) + 100.0
+    let r1: u32 = fuiwirt.wirt_pointer_down(&w, lx, ly, fuiwirt.BTN_WHEEL_DOWN)
+    var t18: [u8; 36] = "9 Rad ueber der Liste: 72 nach unten"
+    chk((&t18[0]) as u64, 36, (viewport.viewport_off_y(&v) as i64) == 72, (viewport.viewport_off_y(&v)) as i64, (72) as i64)
+    let r2: u32 = fuiwirt.wirt_pointer_down(&w, sx, sy, fuiwirt.BTN_WHEEL_DOWN)
+    var t19: [u8; 35] = "9 Rad ueber den Karten rollt nichts"
+    chk((&t19[0]) as u64, 35, r2 == control.CH_NONE && (viewport.viewport_off_y(&v) as i64) == 72, (viewport.viewport_off_y(&v)) as i64, (72) as i64)
+    let r3: u32 = fuiwirt.wirt_pointer_down(&w, lx, ly, fuiwirt.BTN_WHEEL_UP)
+    var t20: [u8; 24] = "9 Rad hoch: wieder bei 0"
+    chk((&t20[0]) as u64, 24, (viewport.viewport_off_y(&v) as i64) == 0, (viewport.viewport_off_y(&v)) as i64, (0) as i64)
+    // Tasten: Pfeil (24 Punkte), Ende, Anfang.
+    let k1: u32 = fuiwirt.wirt_key(&w, fuiwirt.KEY_DOWN, 0)
+    var t21: [u8; 18] = "9 Pfeil runter: 24"
+    chk((&t21[0]) as u64, 18, (viewport.viewport_off_y(&v) as i64) == 24, (viewport.viewport_off_y(&v)) as i64, (24) as i64)
+    let k2: u32 = fuiwirt.wirt_key(&w, fuiwirt.KEY_END, 0)
+    var t22: [u8; 26] = "9 Ende: ganz unten (max_y)"
+    chk((&t22[0]) as u64, 26, viewport.viewport_off_y(&v) == viewport.viewport_max_y(&v) && viewport.viewport_max_y(&v) > 0.0, (viewport.viewport_off_y(&v)) as i64, (viewport.viewport_max_y(&v)) as i64)
+    let k3: u32 = fuiwirt.wirt_key(&w, fuiwirt.KEY_HOME, 0)
+    var t23: [u8; 19] = "9 Pos1: wieder oben"
+    chk((&t23[0]) as u64, 19, (viewport.viewport_off_y(&v) as i64) == 0, (viewport.viewport_off_y(&v)) as i64, (0) as i64)
+    // Die Fokuskette.
+    control.panel_clear(pn)
+    let t1: u32 = fuiwirt.wirt_key(&w, fuiwirt.KEY_TAB, 0)
+    var t24: [u8; 47] = "9 Tab: Fokus auf den ersten Knopf der Kopfzeile"
+    chk((&t24[0]) as u64, 47, control.panel_focus(pn) == knopf1, (control.panel_focus(pn)) as i64, (knopf1) as i64)
+    let t2: u32 = fuiwirt.wirt_key(&w, fuiwirt.KEY_TAB, fuiwirt.MOD_SHIFT)
+    var t25: [u8; 42] = "9 Umschalt+Tab davor: der Regler (letzter)"
+    chk((&t25[0]) as u64, 42, control.panel_focus(pn) == regler, (control.panel_focus(pn)) as i64, (regler) as i64)
+    // Die Eingabetaste und die Leertaste auf dem Kaestchen.
+    let kd: u32 = fuiwirt.wirt_pointer_down(&w, mitte_x(&sc, kbox), mitte_y(&sc, kbox), fuiwirt.BTN_LEFT)
+    let ku: u32 = fuiwirt.wirt_pointer_up(&w, mitte_x(&sc, kbox), mitte_y(&sc, kbox), fuiwirt.BTN_LEFT)
+    let akt2: usize = fuiwirt.wirt_take_activated(&w)
+    var t26: [u8; 40] = "9 Klick aufs Kaestchen: 1 -> 0, im Fokus"
+    chk((&t26[0]) as u64, 40, widget.w_value(scene.node_widget(&sc, kbox)) == 0 && control.panel_focus(pn) == kbox, (widget.w_value(scene.node_widget(&sc, kbox))) as i64, (0) as i64)
+    let e1: u32 = fuiwirt.wirt_key(&w, fuiwirt.KEY_RETURN, 0)
+    var t27: [u8; 37] = "9 Eingabetaste kippt es zurueck auf 1"
+    chk((&t27[0]) as u64, 37, widget.w_value(scene.node_widget(&sc, kbox)) == 1, (widget.w_value(scene.node_widget(&sc, kbox))) as i64, (1) as i64)
+    let e2: u32 = fuiwirt.wirt_char(&w, 32 as u32, 0)
+    var t28: [u8; 33] = "9 Leertaste kippt es wieder auf 0"
+    chk((&t28[0]) as u64, 33, widget.w_value(scene.node_widget(&sc, kbox)) == 0 && fuiwirt.wirt_take_activated(&w) == kbox, (widget.w_value(scene.node_widget(&sc, kbox))) as i64, (0) as i64)
+    // Der Rollbalken: am Schieber packen und 100 Punkte ziehen.
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    let hat: bool = viewport.viewport_bar_rect_v(&v, &bx, &by, &bw, &bh)
+    // Der Weg des Schiebers wird an der LEINWANDFORM des Schiebers
+    // abgelesen (oben bei 0, unten bei max) -- nicht aus dem Code, der
+    // das Ziehen rechnet.
+    viewport.viewport_set_offset(&v, 0.0, viewport.viewport_max_y(&v))
+    let t_ende: layout.Rect = viewport.viewport_bar_thumb(&c, &v, viewport.VP_BAR_V)
+    viewport.viewport_set_offset(&v, 0.0, 0.0)
+    let tr: layout.Rect = viewport.viewport_bar_thumb(&c, &v, viewport.VP_BAR_V)
+    let tx: f64 = bx + bw / 2.0
+    let ty: f64 = (layout.rect_y(&tr) + layout.rect_h(&tr) / 2) as f64
+    let weg: f64 = (layout.rect_y(&t_ende) - layout.rect_y(&tr)) as f64
+    // Ein ganzer Bildpunkt Schieber ist max/weg Punkte Inhalt: so genau
+    // (plus Rundung) muss es stimmen.
+    let tol: f64 = viewport.viewport_max_y(&v) / weg + 0.5
+    let b1: u32 = fuiwirt.wirt_pointer_down(&w, tx, ty, fuiwirt.BTN_LEFT)
+    let b2: u32 = fuiwirt.wirt_pointer_move(&w, tx, ty + 100.0)
+    let soll_b: f64 = 100.0 * viewport.viewport_max_y(&v) / weg
+    var t29: [u8; 43] = "9 Schieber 100 gezogen: 100*max/Weg gerollt"
+    chk((&t29[0]) as u64, 43, hat && weg > 0.0 && (viewport.viewport_off_y(&v) - soll_b) < tol && (soll_b - viewport.viewport_off_y(&v)) < tol, (viewport.viewport_off_y(&v)) as i64, (soll_b) as i64)
+    let b3: u32 = fuiwirt.wirt_pointer_up(&w, tx, ty + 100.0, fuiwirt.BTN_LEFT)
+    let stand: f64 = viewport.viewport_off_y(&v)
+    let b4: u32 = fuiwirt.wirt_pointer_move(&w, tx, ty + 300.0)
+    var t30: [u8; 38] = "9 nach dem Loslassen zieht nichts mehr"
+    chk((&t30[0]) as u64, 38, viewport.viewport_off_y(&v) == stand, (viewport.viewport_off_y(&v)) as i64, (stand) as i64)
+    let lv: u32 = fuiwirt.wirt_pointer_move(&w, sx, sy)
+    let lv2: u32 = fuiwirt.wirt_pointer_leave(&w)
+    var t31: [u8; 34] = "9 Hinaus: niemand mehr ueberfahren"
+    chk((&t31[0]) as u64, 34, control.panel_hot(pn) == control.NOBODY && (lv2 & control.CH_REPAINT) != 0 as u32, (0) as i64, (0) as i64)
+
+    // ------------------------------------------------ 10: DER LEERLAUF
+    var w2: fuiwirt.Wirt = fuiwirt.wirt_new(&sc, &c)
+    fuiwirt.wirt_bind(&w2)
+    var t32: [u8; 39] = "10 KEINER des Wirts == scene.SCENE_NONE"
+    chk((&t32[0]) as u64, 39, fuiwirt.KEINER == scene.SCENE_NONE, (fuiwirt.KEINER) as i64, (scene.SCENE_NONE) as i64)
+    var t33: [u8; 30] = "10 nichts ausgeloest -> KEINER"
+    chk((&t33[0]) as u64, 30, fuiwirt.wirt_take_activated(&w) == fuiwirt.KEINER, (0) as i64, (0) as i64)
+    var t34: [u8; 45] = "10 ein neuer Wirt will sofort ein Bild (0 ms)"
+    chk((&t34[0]) as u64, 45, fuiwirt.wirt_wait_ms(&w2) == 0, (fuiwirt.wirt_wait_ms(&w2)) as i64, (0) as i64)
+    fuiwirt.wirt_painted(&w2)
+    var t35: [u8; 39] = "10 gemalt, nichts laeuft: schlafen (-1)"
+    chk((&t35[0]) as u64, 39, fuiwirt.wirt_wait_ms(&w2) == fuiwirt.WAIT_FOREVER, (fuiwirt.wirt_wait_ms(&w2)) as i64, (-1) as i64)
+    let q1: u32 = fuiwirt.wirt_pointer_move(&w2, 3.0, 3.0)
+    fuiwirt.wirt_painted(&w2)
+    let q2: u32 = fuiwirt.wirt_pointer_move(&w2, 4.0, 4.0)
+    var t36: [u8; 45] = "10 Zeiger bewegt, nichts geaendert: kein Bild"
+    chk((&t36[0]) as u64, 45, q2 == control.CH_NONE && !fuiwirt.wirt_dirty(&w2), (q2) as i64, (0) as i64)
+    var t: i64 = 0
+    var bilder: u64 = fuiwirt.wirt_frames(&w2)
+    while t < 1600 {
+        fuiwirt.wirt_tick(&w2, t)
+        if fuiwirt.wirt_dirty(&w2) {
+            fuiwirt.wirt_painted(&w2)
+        }
+        t = t + 16
+    }
+    var t37: [u8; 31] = "10 100 Takte Leerlauf: 0 Bilder"
+    chk((&t37[0]) as u64, 31, fuiwirt.wirt_frames(&w2) == bilder, (fuiwirt.wirt_frames(&w2) - bilder) as i64, (0) as i64)
+    var g: anim.Animator = anim.animator_new()
+    fuiwirt.wirt_set_animator(&w2, &g)
+    let ai: usize = anim.animator_add(&g, anim.anim_new(2000, 160, 0.0, 1.0, anim.easing_linear()))
+    var t38: [u8; 31] = "10 ein Tween laeuft: alle 16 ms"
+    chk((&t38[0]) as u64, 31, fuiwirt.wirt_wait_ms(&w2) == fuiwirt.FRAME_MS, (fuiwirt.wirt_wait_ms(&w2)) as i64, (16) as i64)
+    bilder = fuiwirt.wirt_frames(&w2)
+    t = 2000
+    while t <= 2400 {
+        fuiwirt.wirt_tick(&w2, t)
+        if fuiwirt.wirt_dirty(&w2) {
+            fuiwirt.wirt_painted(&w2)
+        }
+        t = t + 16
+    }
+    // 2000..2160 in Schritten von 16: 2016 .. 2160 bewegen den Wert
+    // (10 Takte), 2000 selbst nicht (Fortschritt 0 == Startwert).
+    var t39: [u8; 41] = "10 160 ms Tween bei 16 ms Takt: 10 Bilder"
+    chk((&t39[0]) as u64, 41, fuiwirt.wirt_frames(&w2) - bilder == 10, (fuiwirt.wirt_frames(&w2) - bilder) as i64, (10) as i64)
+    var t40: [u8; 30] = "10 danach wieder schlafen (-1)"
+    chk((&t40[0]) as u64, 30, fuiwirt.wirt_wait_ms(&w2) == fuiwirt.WAIT_FOREVER, (fuiwirt.wirt_wait_ms(&w2)) as i64, (-1) as i64)
+    var t41: [u8; 46] = "10 animator_dirty ist nach dem Ende wieder aus"
+    chk((&t41[0]) as u64, 46, !anim.animator_dirty(&g), (0) as i64, (0) as i64)
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+}
+
+fn main(start: u64) -> i32 {
+    // ------------------------------------------------ 1: DIE ANFRAGEN
+    var b: rt.Buf = rt.buf_new()
+    backend.req_setup(&b, 0 as u64, 0, 0 as u64, 0)
+    var h43: [u8; 12] = [108, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var t42: [u8; 38] = "1 Aufbau ohne Berechtigung (12 Oktett)"
+    hexchk((&t42[0]) as u64, 38, &b, (&h43[0]) as u64, 12)
+    var keks: [u8; 18] = "MIT-MAGIC-COOKIE-1"
+    var daten: [u8; 16] = [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240]
+    rt.buf_clear(&b)
+    backend.req_setup(&b, (&keks[0]) as u64, 18, (&daten[0]) as u64, 16)
+    var h45: [u8; 48] = [108, 0, 11, 0, 0, 0, 18, 0, 16, 0, 0, 0, 77, 73, 84, 45, 77, 65, 71, 73, 67, 45, 67, 79, 79, 75, 73, 69, 45, 49, 0, 0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240]
+    var t44: [u8; 32] = "1 Aufbau mit MIT-Keks (12+20+16)"
+    hexchk((&t44[0]) as u64, 32, &b, (&h45[0]) as u64, 48)
+    var wmp: [u8; 12] = "WM_PROTOCOLS"
+    rt.buf_clear(&b)
+    backend.req_intern_atom(&b, (&wmp[0]) as u64, 12)
+    var h47: [u8; 20] = [16, 0, 5, 0, 12, 0, 0, 0, 87, 77, 95, 80, 82, 79, 84, 79, 67, 79, 76, 83]
+    var t46: [u8; 36] = "1 InternAtom WM_PROTOCOLS (Laenge 5)"
+    hexchk((&t46[0]) as u64, 36, &b, (&h47[0]) as u64, 20)
+    var wmd: [u8; 16] = "WM_DELETE_WINDOW"
+    rt.buf_clear(&b)
+    backend.req_intern_atom(&b, (&wmd[0]) as u64, 16)
+    var h49: [u8; 24] = [16, 0, 6, 0, 16, 0, 0, 0, 87, 77, 95, 68, 69, 76, 69, 84, 69, 95, 87, 73, 78, 68, 79, 87]
+    var t48: [u8; 40] = "1 InternAtom WM_DELETE_WINDOW (Laenge 6)"
+    hexchk((&t48[0]) as u64, 40, &b, (&h49[0]) as u64, 24)
+    rt.buf_clear(&b)
+    backend.req_create_window(&b, WID, 1293 as u32, 24 as u32, 33 as u32, 1240, 720, 16777215 as u32, 163967 as u32)
+    var h51: [u8; 40] = [1, 24, 10, 0, 1, 0, 32, 0, 13, 5, 0, 0, 0, 0, 0, 0, 216, 4, 208, 2, 0, 0, 1, 0, 33, 0, 0, 0, 2, 8, 0, 0, 255, 255, 255, 0, 127, 128, 2, 0]
+    var t50: [u8; 35] = "1 CreateWindow 1240x720, zwei Werte"
+    hexchk((&t50[0]) as u64, 35, &b, (&h51[0]) as u64, 40)
+    rt.buf_clear(&b)
+    backend.req_create_gc(&b, WID + 1 as u32, WID)
+    var h53: [u8; 16] = [55, 0, 4, 0, 2, 0, 32, 0, 1, 0, 32, 0, 0, 0, 0, 0]
+    var t52: [u8; 21] = "1 CreateGC ohne Werte"
+    hexchk((&t52[0]) as u64, 21, &b, (&h53[0]) as u64, 16)
+    var fui3: [u8; 3] = "fUi"
+    rt.buf_clear(&b)
+    backend.req_change_property(&b, WID, 39 as u32, 31 as u32, 8 as u32, (&fui3[0]) as u64, 3)
+    var h55: [u8; 28] = [18, 0, 7, 0, 1, 0, 32, 0, 39, 0, 0, 0, 31, 0, 0, 0, 8, 0, 0, 0, 3, 0, 0, 0, 102, 85, 105, 0]
+    var t54: [u8; 42] = "1 ChangeProperty WM_NAME fUi (+1 Fuellung)"
+    hexchk((&t54[0]) as u64, 42, &b, (&h55[0]) as u64, 28)
+    var del: [u32; 1] = [A_DELETE; 1]
+    rt.buf_clear(&b)
+    backend.req_change_property(&b, WID, 240 as u32, 4 as u32, 32 as u32, (&del[0]) as u64, 4)
+    var h57: [u8; 28] = [18, 0, 7, 0, 1, 0, 32, 0, 240, 0, 0, 0, 4, 0, 0, 0, 32, 0, 0, 0, 1, 0, 0, 0, 241, 0, 0, 0]
+    var t56: [u8; 38] = "1 ChangeProperty WM_PROTOCOLS = 1 Atom"
+    hexchk((&t56[0]) as u64, 38, &b, (&h57[0]) as u64, 28)
+    rt.buf_clear(&b)
+    backend.req_map_window(&b, WID)
+    var h59: [u8; 8] = [8, 0, 2, 0, 1, 0, 32, 0]
+    var t58: [u8; 11] = "1 MapWindow"
+    hexchk((&t58[0]) as u64, 11, &b, (&h59[0]) as u64, 8)
+    rt.buf_clear(&b)
+    backend.req_put_image_head(&b, WID, WID + 1 as u32, 1240, 13, 0, 26, 24 as u32, 64480)
+    var h61: [u8; 24] = [72, 2, 254, 62, 1, 0, 32, 0, 2, 0, 32, 0, 216, 4, 13, 0, 0, 0, 26, 0, 0, 24, 0, 0]
+    var t60: [u8; 41] = "1 PutImage-Kopf, 13 Zeilen (Laenge 16126)"
+    hexchk((&t60[0]) as u64, 41, &b, (&h61[0]) as u64, 24)
+    rt.buf_clear(&b)
+    backend.req_get_keyboard_mapping(&b, 8 as u32, 248 as u32)
+    var h63: [u8; 8] = [101, 0, 2, 0, 8, 248, 0, 0]
+    var t62: [u8; 27] = "1 GetKeyboardMapping 8..255"
+    hexchk((&t62[0]) as u64, 27, &b, (&h63[0]) as u64, 8)
+    rt.buf_clear(&b)
+    backend.req_get_property(&b, 1293 as u32, 23 as u32, 0 as u32, 0 as u32, 16384 as u32)
+    var h65: [u8; 24] = [20, 0, 6, 0, 13, 5, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0]
+    var t64: [u8; 30] = "1 GetProperty RESOURCE_MANAGER"
+    hexchk((&t64[0]) as u64, 30, &b, (&h65[0]) as u64, 24)
+    rt.buf_clear(&b)
+    backend.req_get_modifier_mapping(&b)
+    var h67: [u8; 4] = [119, 0, 1, 0]
+    var t66: [u8; 20] = "1 GetModifierMapping"
+    hexchk((&t66[0]) as u64, 20, &b, (&h67[0]) as u64, 4)
+
+    // ------------------------------------ 2: DIE ANTWORT DES AUFBAUS
+    var p_setup: [u8; 23] = "testdata/x11/setup.bin\0"
+    var sb: rt.Buf = rt.buf_new()
+    let da_s: bool = rt.read_file((&p_setup[0]) as u64, &sb)
+    var t68: [u8; 44] = "2 Mitschnitt setup.bin gelesen (9556 Oktett)"
+    chk((&t68[0]) as u64, 44, da_s && sb.len == 9556, (sb.len) as i64, (9556) as i64)
+    var su: backend.Setup = backend.setup_new()
+    let grund: u32 = backend.setup_parse(sb.ptr, sb.len, &su)
+    var t69: [u8; 29] = "2 Aufbau angenommen (Grund 0)"
+    chk((&t69[0]) as u64, 29, grund == 0 as u32, (grund) as i64, (0) as i64)
+    var t70: [u8; 44] = "2 Wurzelfenster 1293 (xwininfo -root: 0x50d)"
+    chk((&t70[0]) as u64, 44, su.root == 1293 as u32, (su.root) as i64, (1293) as i64)
+    var t71: [u8; 24] = "2 Kennungsbasis 0x200000"
+    chk((&t71[0]) as u64, 24, su.id_base == 2097152 as u32, (su.id_base) as i64, (2097152) as i64)
+    var t72: [u8; 24] = "2 Kennungsmaske 0x1fffff"
+    chk((&t72[0]) as u64, 24, su.id_mask == 2097151 as u32, (su.id_mask) as i64, (2097151) as i64)
+    var t73: [u8; 37] = "2 Schirm 1400 Punkte breit (xdpyinfo)"
+    chk((&t73[0]) as u64, 37, su.s_px_w == 1400, (su.s_px_w) as i64, (1400) as i64)
+    var t74: [u8; 35] = "2 Schirm 900 Punkte hoch (xdpyinfo)"
+    chk((&t74[0]) as u64, 35, su.s_px_h == 900, (su.s_px_h) as i64, (900) as i64)
+    var t75: [u8; 32] = "2 Schirm 370 mm breit (xdpyinfo)"
+    chk((&t75[0]) as u64, 32, su.s_mm_w == 370, (su.s_mm_w) as i64, (370) as i64)
+    var t76: [u8; 39] = "2 24-Bit-Visual 0x21 (xdpyinfo default)"
+    chk((&t76[0]) as u64, 39, su.visual == 33 as u32 && su.depth == 24 as u32, (su.visual) as i64, (33) as i64)
+    var t77: [u8; 35] = "2 Tastencodes 8..255 (xmodmap -pke)"
+    chk((&t77[0]) as u64, 35, su.kmin == 8 as u32 && su.kmax == 255 as u32, (su.kmax) as i64, (255) as i64)
+    let dpi_mm: usize = backend.dpi_from_mm(su.s_px_w, su.s_mm_w)
+    var t78: [u8; 36] = "2 Dichte aus mm: 96 (xdpyinfo 96x96)"
+    chk((&t78[0]) as u64, 36, dpi_mm == 96, (dpi_mm) as i64, (96) as i64)
+    var t79: [u8; 33] = "2 und 2800 Punkte auf 370 mm: 192"
+    chk((&t79[0]) as u64, 33, backend.dpi_from_mm(2800, 370) == 192, (backend.dpi_from_mm(2800, 370)) as i64, (192) as i64)
+    var abgelehnt: [u8; 8] = [0, 5, 11, 0, 0, 0, 2, 0]
+    var su2: backend.Setup = backend.setup_new()
+    let g2: u32 = backend.setup_parse((&abgelehnt[0]) as u64, 8, &su2)
+    var t80: [u8; 32] = "2 Status 0 = abgelehnt (Grund 5)"
+    chk((&t80[0]) as u64, 32, g2 == 5 as u32, (g2) as i64, (5) as i64)
+    let g3: u32 = backend.setup_parse(sb.ptr, 30, &su2)
+    var t81: [u8; 25] = "2 abgeschnitten = Grund 7"
+    chk((&t81[0]) as u64, 25, g3 == 7 as u32, (g3) as i64, (7) as i64)
+
+    // ----------------------------------- 3: Xft.dpi AUS DEM SERVER
+    var p_res: [u8; 24] = "testdata/x11/resman.bin\0"
+    var rb: rt.Buf = rt.buf_new()
+    let da_r: bool = rt.read_file((&p_res[0]) as u64, &rb)
+    let d144: usize = backend.resman_dpi(rb.ptr, rb.len)
+    var t82: [u8; 43] = "3 RESOURCE_MANAGER nach xrdb 'Xft.dpi: 144'"
+    chk((&t82[0]) as u64, 43, da_r && d144 == 144, (d144) as i64, (144) as i64)
+    var r192: [u8; 47] = "Xcursor.size: 24\nXft.dpi:\t192\nXft.antialias:\t1\n"
+    let d192: usize = backend.xft_dpi_in((&r192[0]) as u64, 47)
+    var t83: [u8; 29] = "3 Xft.dpi mitten im Text: 192"
+    chk((&t83[0]) as u64, 29, d192 == 192, (d192) as i64, (192) as i64)
+    var r0: [u8; 17] = "Xft.antialias:\t1\n"
+    var t84: [u8; 38] = "3 ohne Xft.dpi: 0 (dann gelten die mm)"
+    chk((&t84[0]) as u64, 38, backend.xft_dpi_in((&r0[0]) as u64, 17) == 0, (backend.xft_dpi_in((&r0[0]) as u64, 17)) as i64, (0) as i64)
+
+    // ------------------------------------------- 4: DIE TASTATUR
+    var p_kus: [u8; 27] = "testdata/x11/keymap_us.bin\0"
+    var p_kde: [u8; 27] = "testdata/x11/keymap_de.bin\0"
+    var p_mus: [u8; 27] = "testdata/x11/modmap_us.bin\0"
+    var p_mde: [u8; 27] = "testdata/x11/modmap_de.bin\0"
+    var kb: rt.Buf = rt.buf_new()
+    var mb: rt.Buf = rt.buf_new()
+    var us: backend.Keymap = backend.keymap_new()
+    var de: backend.Keymap = backend.keymap_new()
+    let a1: bool = rt.read_file((&p_kus[0]) as u64, &kb)
+    let a2: bool = backend.keymap_from_reply(&us, kb.ptr, kb.len, 8 as u32)
+    rt.buf_clear(&kb)
+    let a3: bool = rt.read_file((&p_kde[0]) as u64, &kb)
+    let a4: bool = backend.keymap_from_reply(&de, kb.ptr, kb.len, 8 as u32)
+    let a5: bool = rt.read_file((&p_mus[0]) as u64, &mb)
+    let a6: bool = backend.keymap_mods_from_reply(&us, mb.ptr, mb.len)
+    rt.buf_clear(&mb)
+    let a7: bool = rt.read_file((&p_mde[0]) as u64, &mb)
+    let a8: bool = backend.keymap_mods_from_reply(&de, mb.ptr, mb.len)
+    var t85: [u8; 45] = "4 Belegung US: 7 Keysyms je Taste, 248 Tasten"
+    chk((&t85[0]) as u64, 45, a1 && a2 && us.per == 7 && us.n == 248, (us.n) as i64, (248) as i64)
+    var t86: [u8; 28] = "4 Belegung DE ebenso gelesen"
+    chk((&t86[0]) as u64, 28, a3 && a4 && de.per == 7 && de.n == 248, (de.n) as i64, (248) as i64)
+    var t87: [u8; 38] = "4 AltGr ist Mod5 = 128 (Tasten 92/203)"
+    chk((&t87[0]) as u64, 38, a8 && de.lvl3 == 128 as u32, (de.lvl3) as i64, (128) as i64)
+    var t88: [u8; 34] = "4 NumLock ist Mod2 = 16 (Taste 77)"
+    chk((&t88[0]) as u64, 34, de.numlock == 16 as u32, (de.numlock) as i64, (16) as i64)
+    var t89: [u8; 19] = "4 US 38 -> a (0x61)"
+    chk((&t89[0]) as u64, 19, backend.keymap_sym(&us, 38 as u32, 0 as u32) == 97 as u32, (backend.keymap_sym(&us, 38 as u32, 0 as u32)) as i64, (97) as i64)
+    var t90: [u8; 30] = "4 US 38 + Umschalt -> A (0x41)"
+    chk((&t90[0]) as u64, 30, backend.keymap_sym(&us, 38 as u32, 1 as u32) == 65 as u32, (backend.keymap_sym(&us, 38 as u32, 1 as u32)) as i64, (65) as i64)
+    var t91: [u8; 23] = "4 US 38 + CapsLock -> A"
+    chk((&t91[0]) as u64, 23, backend.keymap_sym(&us, 38 as u32, 2 as u32) == 65 as u32, (backend.keymap_sym(&us, 38 as u32, 2 as u32)) as i64, (65) as i64)
+    var t92: [u8; 34] = "4 US 38 + CapsLock + Umschalt -> a"
+    chk((&t92[0]) as u64, 34, backend.keymap_sym(&us, 38 as u32, 3 as u32) == 97 as u32, (backend.keymap_sym(&us, 38 as u32, 3 as u32)) as i64, (97) as i64)
+    var t93: [u8; 35] = "4 US 47 + Umschalt -> colon (C-033)"
+    chk((&t93[0]) as u64, 35, backend.keymap_sym(&us, 47 as u32, 1 as u32) == 58 as u32, (backend.keymap_sym(&us, 47 as u32, 1 as u32)) as i64, (58) as i64)
+    var t94: [u8; 44] = "4 US 10 + CapsLock bleibt 1 (kein Buchstabe)"
+    chk((&t94[0]) as u64, 44, backend.keymap_sym(&us, 10 as u32, 2 as u32) == 49 as u32, (backend.keymap_sym(&us, 10 as u32, 2 as u32)) as i64, (49) as i64)
+    var t95: [u8; 40] = "4 US 20 -> minus, DE 20 -> ssharp (0xdf)"
+    chk((&t95[0]) as u64, 40, backend.keymap_sym(&us, 20 as u32, 0 as u32) == 45 as u32 && backend.keymap_sym(&de, 20 as u32, 0 as u32) == 223 as u32, (backend.keymap_sym(&de, 20 as u32, 0 as u32)) as i64, (223) as i64)
+    var t96: [u8; 30] = "4 DE 20 + Umschalt -> question"
+    chk((&t96[0]) as u64, 30, backend.keymap_sym(&de, 20 as u32, 1 as u32) == 63 as u32, (backend.keymap_sym(&de, 20 as u32, 1 as u32)) as i64, (63) as i64)
+    var t97: [u8; 24] = "4 US 29 -> y, DE 29 -> z"
+    chk((&t97[0]) as u64, 24, backend.keymap_sym(&us, 29 as u32, 0 as u32) == 121 as u32 && backend.keymap_sym(&de, 29 as u32, 0 as u32) == 122 as u32, (backend.keymap_sym(&de, 29 as u32, 0 as u32)) as i64, (122) as i64)
+    var t98: [u8; 28] = "4 DE 24 + AltGr -> at (0x40)"
+    chk((&t98[0]) as u64, 28, backend.keymap_sym(&de, 24 as u32, 128 as u32) == 64 as u32, (backend.keymap_sym(&de, 24 as u32, 128 as u32)) as i64, (64) as i64)
+    var t99: [u8; 34] = "4 DE 34 -> udiaeresis, Zeichen 252"
+    chk((&t99[0]) as u64, 34, backend.ks_char(backend.keymap_sym(&de, 34 as u32, 0 as u32)) == 252 as u32, (backend.ks_char(backend.keymap_sym(&de, 34 as u32, 0 as u32))) as i64, (252) as i64)
+    var t100: [u8; 41] = "4 US 23 + Umschalt -> ISO_Left_Tab 0xfe20"
+    chk((&t100[0]) as u64, 41, backend.keymap_sym(&us, 23 as u32, 1 as u32) == 65056 as u32, (backend.keymap_sym(&us, 23 as u32, 1 as u32)) as i64, (65056) as i64)
+    var t101: [u8; 34] = "4 ISO_Left_Tab ist die Taste K_TAB"
+    chk((&t101[0]) as u64, 34, backend.ks_key(65056 as u32) == window.K_TAB, (backend.ks_key(65056 as u32)) as i64, (window.K_TAB) as i64)
+    var t102: [u8; 28] = "4 US 9 -> Escape -> K_ESCAPE"
+    chk((&t102[0]) as u64, 28, backend.ks_key(backend.keymap_sym(&us, 9 as u32, 0 as u32)) == window.K_ESCAPE, (backend.ks_key(backend.keymap_sym(&us, 9 as u32, 0 as u32))) as i64, (window.K_ESCAPE) as i64)
+    var t103: [u8; 22] = "4 US 111 -> Up -> K_UP"
+    chk((&t103[0]) as u64, 22, backend.ks_key(backend.keymap_sym(&us, 111 as u32, 0 as u32)) == window.K_UP, (backend.ks_key(backend.keymap_sym(&us, 111 as u32, 0 as u32))) as i64, (window.K_UP) as i64)
+    var t104: [u8; 32] = "4 KP_Enter (0xff8d) ist K_RETURN"
+    chk((&t104[0]) as u64, 32, backend.ks_key(65421 as u32) == window.K_RETURN, (backend.ks_key(65421 as u32)) as i64, (window.K_RETURN) as i64)
+    // Spalte 6 von Taste 20 in der deutschen Belegung ist U1E9E
+    // (xmodmap_de.txt: "keycode 20 = ssharp question ... U1E9E").
+    let eszett: u32 = backend.keymap_col(&de, 20 as u32, 6)
+    var t105: [u8; 35] = "4 DE 20 Spalte 6 = Keysym 0x1001e9e"
+    chk((&t105[0]) as u64, 35, eszett == 16785054 as u32, (eszett) as i64, (16785054) as i64)
+    var t106: [u8; 42] = "4 U1E9E (grosses Eszett) -> Zeichen 0x1e9e"
+    chk((&t106[0]) as u64, 42, backend.ks_char(eszett) == 7838 as u32, (backend.ks_char(eszett)) as i64, (7838) as i64)
+    var t107: [u8; 22] = "4 KP_5 (0xffb5) -> '5'"
+    chk((&t107[0]) as u64, 22, backend.ks_char(65461 as u32) == 53 as u32, (backend.ks_char(65461 as u32)) as i64, (53) as i64)
+    var t108: [u8; 43] = "4 tote Taste dead_diaeresis -> kein Zeichen"
+    chk((&t108[0]) as u64, 43, backend.ks_char(65111 as u32) == 0 as u32, (backend.ks_char(65111 as u32)) as i64, (0) as i64)
+
+    // ------------------------------------------- 5: DIE EREIGNISSE
+    var p_ev: [u8; 24] = "testdata/x11/events.bin\0"
+    var eb: rt.Buf = rt.buf_new()
+    let da_e: bool = rt.read_file((&p_ev[0]) as u64, &eb)
+    var t109: [u8; 29] = "5 16 Ereignisse im Mitschnitt"
+    chk((&t109[0]) as u64, 29, da_e && eb.len == 512, (eb.len) as i64, (512) as i64)
+    var k: u32 = 0 as u32
+    var ea: u32 = 0 as u32
+    var ex: u32 = 0 as u32
+    var ey: u32 = 0 as u32
+    var es: u32 = 0 as u32
+    var ok: bool = backend.decode_event(eb.ptr, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t110: [u8; 10] = "5 0 Expose"
+    chk((&t110[0]) as u64, 10, ok && k == window.EV_EXPOSE, (k) as i64, (window.EV_EXPOSE) as i64)
+    ok = backend.decode_event(eb.ptr + 32 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t111: [u8; 40] = "5 1 Motion bei 50,40 (xdotool mousemove)"
+    chk((&t111[0]) as u64, 40, ok && k == window.EV_MOTION && ex == 50 as u32 && ey == 40 as u32, (ex * 1000 as u32 + ey) as i64, (50040) as i64)
+    ok = backend.decode_event(eb.ptr + 64 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t112: [u8; 21] = "5 2 Knopf 1 gedrueckt"
+    chk((&t112[0]) as u64, 21, ok && k == window.EV_BUTTON && ea == 1 as u32, (ea) as i64, (1) as i64)
+    ok = backend.decode_event(eb.ptr + 96 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t113: [u8; 46] = "5 3 Knopf 1 losgelassen, Zustand Button1 (256)"
+    chk((&t113[0]) as u64, 46, ok && k == window.EV_RELEASE && ea == 1 as u32 && es == 256 as u32, (es) as i64, (256) as i64)
+    ok = backend.decode_event(eb.ptr + 96 as u64, A_DELETE, &us, false, &k, &ea, &ex, &ey, &es)
+    var t114: [u8; 35] = "5 3 ohne full_input: kein Loslassen"
+    chk((&t114[0]) as u64, 35, !ok, (b2i(ok)) as i64, (0) as i64)
+    ok = backend.decode_event(eb.ptr + 128 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t115: [u8; 24] = "5 4 Rad runter = Knopf 5"
+    chk((&t115[0]) as u64, 24, ok && k == window.EV_BUTTON && ea == 5 as u32, (ea) as i64, (5) as i64)
+    ok = backend.decode_event(eb.ptr + 192 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t116: [u8; 41] = "5 6 Taste a -> Zeichen 97, Keysym in ev_x"
+    chk((&t116[0]) as u64, 41, ok && k == window.EV_CHAR && ea == 97 as u32 && ex == 97 as u32, (ea) as i64, (97) as i64)
+    ok = backend.decode_event(eb.ptr + 224 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t117: [u8; 43] = "5 7 a losgelassen: EV_KEY_UP, Tastencode 38"
+    chk((&t117[0]) as u64, 43, ok && k == window.EV_KEY_UP && ea == 38 as u32, (ea) as i64, (38) as i64)
+    ok = backend.decode_event(eb.ptr + 288 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t118: [u8; 28] = "5 9 Umschalt+a -> Zeichen 65"
+    chk((&t118[0]) as u64, 28, ok && k == window.EV_CHAR && ea == 65 as u32, (ea) as i64, (65) as i64)
+    ok = backend.decode_event(eb.ptr + 320 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t119: [u8; 24] = "5 10 Tab -> EV_KEY K_TAB"
+    chk((&t119[0]) as u64, 24, ok && k == window.EV_KEY && ea == window.K_TAB, (ea) as i64, (window.K_TAB) as i64)
+    ok = backend.decode_event(eb.ptr + 352 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t120: [u8; 30] = "5 11 Escape -> EV_KEY K_ESCAPE"
+    chk((&t120[0]) as u64, 30, ok && k == window.EV_KEY && ea == window.K_ESCAPE, (ea) as i64, (window.K_ESCAPE) as i64)
+    ok = backend.decode_event(eb.ptr + 384 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t121: [u8; 23] = "5 12 Hinaus bei 600,500"
+    chk((&t121[0]) as u64, 23, ok && k == window.EV_LEAVE && ex == 600 as u32 && ey == 500 as u32, (ex) as i64, (600) as i64)
+    ok = backend.decode_event(eb.ptr + 416 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t122: [u8; 21] = "5 13 Hinein bei 20,30"
+    chk((&t122[0]) as u64, 21, ok && k == window.EV_ENTER && ex == 20 as u32 && ey == 30 as u32, (ey) as i64, (30) as i64)
+    ok = backend.decode_event(eb.ptr + 448 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t123: [u8; 28] = "5 14 ConfigureNotify 320x240"
+    chk((&t123[0]) as u64, 28, ok && k == window.EV_CONFIGURE && ex == 320 as u32 && ey == 240 as u32, (ex) as i64, (320) as i64)
+    ok = backend.decode_event(eb.ptr + 480 as u64, A_DELETE, &us, true, &k, &ea, &ex, &ey, &es)
+    var t124: [u8; 46] = "5 15 SendEvent-Code 161 WM_DELETE -> EV_CLOSED"
+    chk((&t124[0]) as u64, 46, ok && k == window.EV_CLOSED && rt.ld8(eb.ptr, 480) == 161 as u8, (rt.ld8(eb.ptr, 480)) as i64, (161) as i64)
+    var leer: backend.Keymap = backend.keymap_new()
+    ok = backend.decode_event(eb.ptr + 192 as u64, A_DELETE, &leer, true, &k, &ea, &ex, &ey, &es)
+    var t125: [u8; 41] = "5 ohne Belegung: alter Weg key_ascii -> a"
+    chk((&t125[0]) as u64, 41, ok && k == window.EV_CHAR && ea == 97 as u32, (ea) as i64, (97) as i64)
+
+    // ----------------------------------------------- 6: ~/.Xauthority
+    var p_xa: [u8; 24] = "testdata/x11/xauthority\0"
+    var xb: rt.Buf = rt.buf_new()
+    var an: rt.Buf = rt.buf_new()
+    var ad: rt.Buf = rt.buf_new()
+    let da_x: bool = rt.read_file((&p_xa[0]) as u64, &xb)
+    let x7: bool = backend.auth_pick(xb.ptr, xb.len, 7, &an, &ad)
+    var t126: [u8; 41] = "6 Anzeige 7: Keks 0f1e..f0 (xauth add :7)"
+    chk((&t126[0]) as u64, 41, da_x && x7 && ad.len == 16 && rt.ld8(ad.ptr, 0) == 15 as u8 && rt.ld8(ad.ptr, 15) == 240 as u8, (rt.ld8(ad.ptr, 0)) as i64, (15) as i64)
+    var t127: [u8; 30] = "6 Name MIT-MAGIC-COOKIE-1 (18)"
+    chk((&t127[0]) as u64, 30, an.len == 18 && rt.ld8(an.ptr, 0) == 77 as u8, (an.len) as i64, (18) as i64)
+    let x12: bool = backend.auth_pick(xb.ptr, xb.len, 12, &an, &ad)
+    var t128: [u8; 39] = "6 Anzeige 12 (zweistellig): Keks dead.."
+    chk((&t128[0]) as u64, 39, x12 && rt.ld8(ad.ptr, 0) == 222 as u8, (rt.ld8(ad.ptr, 0)) as i64, (222) as i64)
+    let x9: bool = backend.auth_pick(xb.ptr, xb.len, 9, &an, &ad)
+    var t129: [u8; 45] = "6 Anzeige 9 fehlt: der erste Eintrag (0011..)"
+    chk((&t129[0]) as u64, 45, x9 && rt.ld8(ad.ptr, 1) == 17 as u8, (rt.ld8(ad.ptr, 1)) as i64, (17) as i64)
+
+    // ------------------------------------------------ 7: DAS BILDFORMAT
+    var q: [u8; 8] = [17, 34, 51, 255, 1, 2, 3, 255]
+    var zq: [u8; 8] = [0; 8]
+    fuiwirt.rgba_to_bgrx((&q[0]) as u64, (&zq[0]) as u64, 2)
+    var t130: [u8; 38] = "7 RGBA 11 22 33 ff -> BGRX 33 22 11 00"
+    chk((&t130[0]) as u64, 38, zq[0] == 51 as u8 && zq[1] == 34 as u8 && zq[2] == 17 as u8 && zq[3] == 0 as u8, (zq[0]) as i64, (51) as i64)
+    var t131: [u8; 39] = "7 zweiter Punkt 01 02 03 -> 03 02 01 00"
+    chk((&t131[0]) as u64, 39, zq[4] == 3 as u8 && zq[6] == 1 as u8 && zq[7] == 0 as u8, (zq[4]) as i64, (3) as i64)
+    var cv: canvas.Canvas = canvas.canvas_new()
+    let ci: bool = canvas.canvas_init(&cv, 4, 2)
+    canvas.canvas_clear(&cv, 4281558681 as u32)
+    var px8: [u8; 32] = [0; 32]
+    fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&cv) as u64, (&px8[0]) as u64, 8)
+    let pixel: u32 = ld32((&px8[0]) as u64, 20)
+    var t132: [u8; 41] = "7 Leinwand 0xFF336699 -> X-Pixel 0x336699"
+    chk((&t132[0]) as u64, 41, pixel == 3368601 as u32, (pixel) as i64, (3368601) as i64)
+    canvas.canvas_free(&cv)
+
+    // ------------------------------------ 8..10: DIE SEITE AUS gallery9
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if rt.arg_count(start) >= 2 {
+        have = rt.read_file(rt.arg_ptr(start, 1), &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    var t133: [u8; 44] = "8 Schrift geladen (ohne Schrift keine Masse)"
+    chk((&t133[0]) as u64, 44, fm != 0, (b2i(fm != 0)) as i64, (1) as i64)
+    let texte: u64 = rt.heap_alloc(640)
+    let feld: u64 = rt.heap_alloc(gallery9_main.ZEILEN * gallery9_main.SCHRITT)
+    gallery9_main.schreibe_texte(texte)
+    gallery9_main.schreibe_zeilen(feld)
+    // 1000: die Zahlen, die gallery9 am Bild belegt (168, 56, 34, 1130).
+    massstab(fm, texte, feld, 1000, 168, 56, 34, 1130)
+    // 2000: jede davon genau doppelt -- der Beweis, dass der Baum keinen
+    // zweiten Rechenweg hat.
+    massstab(fm, texte, feld, 2000, 336, 112, 68, 2260)
+    // 1500: 168 * 1,5 = 252, 56 -> 84, 34 -> 51; der Inhalt aus
+    // 12 + 28*51 + 27*9 + 12 = 1695.
+    massstab(fm, texte, feld, 1500, 252, 84, 51, 1695)
+    bedienung(fm, texte, feld)
+
+    var t134: [u8; 47] = "11 Zahl der Behauptungen in diesem Lauf (>= 30)"
+    chk((&t134[0]) as u64, 47, G_ZAHL >= 30, (G_ZAHL) as i64, (30) as i64)
+    if G_FEHLER != 0 {
+        var r1: [u8; 30] = "X11 NOT PASSED -- WRONG above\n"
+        rt.write_everything(1, (&r1[0]) as u64, 30)
+        return 1
+    }
+    var s1: [u8; 12] = "X11 PASSED.\n"
+    rt.write_everything(1, (&s1[0]) as u64, 12)
+    return 0
+}

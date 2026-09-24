@@ -46,8 +46,48 @@
 // missing, Ctrl+C/X/V work on an INTERNAL clipboard -- the field then
 // works within itself, only not with other programs.
 //
+// ============================================ UND DIE EINGABEMETHODE (IME)
+//
+// Chinesisch, Japanisch und Koreanisch kommen nach DEMSELBEN Muster
+// herein wie die Zwischenablage: `editor_set_ime` nimmt drei
+// Funktionszeiger der Plattform (Taste anbieten, Einfuegestelle melden,
+// Eingabe vergessen), und die Plattform antwortet ueber
+// `editor_ime_preedit` und `editor_ime_commit`. Fehlt sie, arbeitet das
+// Feld mit der eingebauten Umsetzung aus lib/fui/ime.fi (Romaji nach
+// Kana, Hangul, Pinyin), sobald `editor_ime_mode` eine waehlt.
+//
+// Was hier steht, ist nur, welche TASTE waehrend einer Eingabe was tut:
+// die Eingabetaste bestaetigt die Eingabe und schickt NICHT das
+// Formular ab (sonst geht jede japanische Suche beim ersten Enter halb
+// fertig los), Escape schliesst erst die Liste und bricht dann ab, die
+// Pfeile bleiben im Vorbearbeitungstext bzw. in der Kandidatenliste.
+//
+// ============================================= DIE ZWEIRICHTUNGSSCHRIFT
+//
+// In einem arabischen oder hebraeischen Text ist die Schreibmarke hinter
+// Zeichen i NICHT "so weit rechts, wie die ersten i Zeichen breit
+// sind": hinter einem hebraeischen Wort steht sie LINKS davon, und in
+// einem gemischten Satz springt sie an der Grenze zweier Richtungen.
+// Diese Datei rechnet das nicht selbst -- sie kennt keine Schrift --,
+// sondern fragt vier Funktionen, die der Aufrufer ueber
+// `editor_set_visual` einhaengt (painter.measure_* rechnet sie mit
+// lib/fui/bidi.fi):
+//
+//   x(ctx, p, n, i)       wo die Marke fuer die Grenze i steht
+//   hit(ctx, p, n, x)     welche Grenze unter dem Punkt x liegt
+//   width(ctx, p, n)      wie breit der ganze Text ist
+//   rtl(ctx, p, n)        ob der Absatz von rechts nach links laeuft
+//
+// DIE PFEILTASTEN LAUFEN LOGISCH: ein Druck ist ein Zeichen im Text, nie
+// ein Sprung auf dem Schirm -- das ist die Bewegung, die Windows in
+// Eingabefeldern macht, und sie laesst sich pruefen, ohne eine Glyphe
+// zu kennen. In einem Absatz von rechts nach links geht "links" dabei
+// zum NAECHSTEN Zeichen (dort liegt der Lesefluss), "rechts" zum
+// vorigen. Ohne eingehaengte Funktionen bleibt alles, wie es war.
+//
 import std.rt
 import fui.textbuf
+import fui.ime
 
 export {
     Editor, editor_new, editor_init, editor_free,
@@ -58,6 +98,9 @@ export {
     editor_select_all, editor_set_text, editor_clear,
     editor_copy, editor_cut, editor_paste,
     editor_scroll_to_caret, editor_scroll_x,
+    editor_ime, editor_set_ime, editor_ime_mode, editor_ime_preedit,
+    editor_ime_commit, editor_ime_spot, editor_ime_end,
+    editor_set_visual, editor_caret_x, editor_is_rtl, editor_visual_on,
     KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_BACKSPACE, KEY_DELETE, KEY_ENTER,
     KEY_ESC, KEY_TAB, KEY_UP, KEY_DOWN,
     MOD_SHIFT, MOD_CTRL, MOD_ALT,
@@ -149,12 +192,27 @@ struct Editor {
     klick_zeit: u64,
     klick_n: usize,       // 1 = einfach, 2 = doppelt, 3 = dreifach
     klick_x: f64,
+    // --- die Eingabemethode: ihr Zustand, nicht ihr Text (der steht in `tf`)
+    im: ime.Ime,
+    // --- die Zweirichtungsschrift (siehe Kopf)
+    v_on: u32,
+    v_ctx: u64,
+    v_x: fn(u64, u64, usize, usize) -> f64,
+    v_hit: fn(u64, u64, usize, f64) -> usize,
+    v_w: fn(u64, u64, usize) -> f64,
+    v_rtl: fn(u64, u64, usize) -> bool,
 }
 
 #[no_gc]
 fn clip_read_none(p: u64, cap: usize) -> usize { return 0 }
 #[no_gc]
 fn clip_write_none(p: u64, n: usize) -> bool { return false }
+// Die Vorgaben ohne eingehaengte Messung. Sie werden nie gerufen,
+// solange `v_on` 0 ist; ein Funktionszeiger braucht trotzdem ein Ziel.
+fn vis_x_none(c: u64, p: u64, n: usize, i: usize) -> f64 { return 0.0 }
+fn vis_hit_none(c: u64, p: u64, n: usize, x: f64) -> usize { return 0 }
+fn vis_w_none(c: u64, p: u64, n: usize) -> f64 { return 0.0 }
+fn vis_rtl_none(c: u64, p: u64, n: usize) -> bool { return false }
 
 #[no_gc]
 fn editor_new() -> Editor {
@@ -167,6 +225,9 @@ fn editor_new() -> Editor {
         width: 0.0, scroll: 0.0,
         blink_us: 0, blink_an: 1,
         klick_zeit: 0, klick_n: 0, klick_x: 0.0,
+        im: ime.ime_new(),
+        v_on: 0, v_ctx: 0, v_x: vis_x_none, v_hit: vis_hit_none,
+        v_w: vis_w_none, v_rtl: vis_rtl_none,
     }
 }
 
@@ -212,6 +273,47 @@ fn editor_set_clipboard(e: *mut Editor, lesen: fn(u64, usize) -> usize,
 
 #[no_gc]
 fn editor_set_width(e: *mut Editor, w: f64) { (*e).width = w }
+
+// DIE MESSUNG DER ZWEIRICHTUNGSSCHRIFT einhaengen (siehe Kopf).
+fn editor_set_visual(e: *mut Editor, x: fn(u64, u64, usize, usize) -> f64,
+    hit: fn(u64, u64, usize, f64) -> usize, w: fn(u64, u64, usize) -> f64,
+    rtl: fn(u64, u64, usize) -> bool, ctx: u64) {
+    (*e).v_x = x
+    (*e).v_hit = hit
+    (*e).v_w = w
+    (*e).v_rtl = rtl
+    (*e).v_ctx = ctx
+    (*e).v_on = 1
+}
+
+fn editor_visual_on(e: *mut Editor) -> bool { return (*e).v_on != 0 }
+
+// Laeuft der Absatz im Feld von rechts nach links? Ohne eingehaengte
+// Messung: nein.
+fn editor_is_rtl(e: *mut Editor) -> bool {
+    if (*e).v_on == 0 {
+        return false
+    }
+    let t: *mut textbuf.TextBuf = &(*e).tf
+    return (*e).v_rtl((*e).v_ctx, textbuf.tb_ptr(t), textbuf.tb_len(t))
+}
+
+// Wo steht die Schreibmarke, relativ zum linken Textrand (vor dem
+// Rollen)? Nur mit eingehaengter Messung -- sonst 0.
+fn editor_caret_x(e: *mut Editor) -> f64 {
+    if (*e).v_on == 0 {
+        return 0.0
+    }
+    let t: *mut textbuf.TextBuf = &(*e).tf
+    return (*e).v_x((*e).v_ctx, textbuf.tb_ptr(t), textbuf.tb_len(t),
+        textbuf.tb_caret(t))
+}
+
+// Die Grenze unter x (Textkoordinate, also schon mit `scroll`).
+fn vis_pos(e: *mut Editor, x: f64) -> usize {
+    let t: *mut textbuf.TextBuf = &(*e).tf
+    return (*e).v_hit((*e).v_ctx, textbuf.tb_ptr(t), textbuf.tb_len(t), x)
+}
 
 #[no_gc]
 fn editor_scroll(e: *mut Editor) -> f64 { return (*e).scroll }
@@ -378,21 +480,34 @@ fn editor_key(e: *mut Editor, key: u32, mods: u32) -> u32 {
     let extend: bool = (mods & MOD_SHIFT) != 0 as u32
     let ctrl: bool = (mods & MOD_CTRL) != 0 as u32
     editor_caret_wake(e)
-
-    if key == KEY_LEFT {
-        if ctrl {
-            word_left(e, extend)
-        } else {
-            textbuf.tb_left(t, extend)
-        }
-        (*e).coalescing = 0
-        return RES_MOVED
+    // Die Plattform zuerst: eine Taste, die ihrer Eingabe gehoert, darf
+    // hier nichts mehr tun.
+    if ime.ime_plat_filter(&(*e).im, key, mods, false) {
+        return RES_NONE
     }
-    if key == KEY_RIGHT {
-        if ctrl {
-            word_right(e, extend)
+    if ime.ime_on(&(*e).im) {
+        return ime_key(e, key, mods)
+    }
+
+    if key == KEY_LEFT || key == KEY_RIGHT {
+        // Logisch, mit der Richtung des Absatzes (siehe Kopf): in einem
+        // RTL-Absatz fuehrt "links" im Text VORWAERTS.
+        var fwd: bool = key == KEY_RIGHT
+        if editor_is_rtl(e) {
+            fwd = !fwd
+        }
+        if fwd {
+            if ctrl {
+                word_right(e, extend)
+            } else {
+                textbuf.tb_right(t, extend)
+            }
         } else {
-            textbuf.tb_right(t, extend)
+            if ctrl {
+                word_left(e, extend)
+            } else {
+                textbuf.tb_left(t, extend)
+            }
         }
         (*e).coalescing = 0
         return RES_MOVED
@@ -410,7 +525,10 @@ fn editor_key(e: *mut Editor, key: u32, mods: u32) -> u32 {
     if key == KEY_BACKSPACE {
         editor_push_undo(e, false)
         // Ctrl+Backspace deletes the word to the left -- that is what
-        // every field does.
+        // every field does. Only when nothing is selected: with a
+        // selection, Backspace removes exactly that selection, and the
+        // plain `tb_backspace` below already does it.
+        if ctrl && !textbuf.tb_has_sel(t) {
             let bis: usize = textbuf.tb_caret(t)
             word_left(e, true)
             let von: usize = textbuf.tb_caret(t)
@@ -456,6 +574,21 @@ fn editor_char(e: *mut Editor, cp: u32, mods: u32) -> u32 {
     let t: *mut textbuf.TextBuf = &(*e).tf
     editor_caret_wake(e)
     let ctrl: bool = (mods & MOD_CTRL) != 0 as u32
+    if ime.ime_plat_filter(&(*e).im, cp, mods, true) {
+        return RES_NONE
+    }
+    let kurz: bool = (cp >= 1 as u32 && cp <= 26 as u32) || ctrl
+    if !kurz {
+        let r: u32 = ime_char(e, cp)
+        if r != RES_PASS {
+            return r
+        }
+    } else if ime.ime_on(&(*e).im) {
+        // Strg+C, Strg+Z, Strg+A mitten in einer Eingabe: erst gilt,
+        // was dasteht, dann die Tastenkombination -- sonst kopierte
+        // Strg+C einen Text, den es gleich darauf nicht mehr gibt.
+        editor_ime_end(e)
+    }
 
     // Ctrl shortcuts: either as a control character (1..26) or as a
     // letter with the Ctrl bit set. Both ways are served.
@@ -611,6 +744,10 @@ fn editor_mouse_down(e: *mut Editor, x: f64, jetzt_us: u64,
     mess: fn(u64, u64, usize) -> f64, ctx: u64, extend: bool) -> u32 {
     let t: *mut textbuf.TextBuf = &(*e).tf
     editor_caret_wake(e)
+    // Ein Klick ins Feld beendet eine laufende Eingabe: was dasteht,
+    // gilt. So halten es alle Plattformen, und ein Vorbearbeitungstext,
+    // der beim Klicken mitwandert, waere ein zweiter Schreibzeiger.
+    editor_ime_end(e)
     var dx: f64 = x - (*e).klick_x
     if dx < 0.0 {
         dx = 0.0 - dx
@@ -622,7 +759,12 @@ fn editor_mouse_down(e: *mut Editor, x: f64, jetzt_us: u64,
     }
     (*e).klick_zeit = jetzt_us
     (*e).klick_x = x
-    let pos: usize = textbuf.tb_caret_from_x(t, x + (*e).scroll, mess, ctx)
+    var pos: usize = 0
+    if (*e).v_on != 0 {
+        pos = vis_pos(e, x + (*e).scroll)
+    } else {
+        pos = textbuf.tb_caret_from_x(t, x + (*e).scroll, mess, ctx)
+    }
 
     if (*e).klick_n >= 3 {
         // Triple click: everything.
@@ -648,7 +790,12 @@ fn editor_mouse_drag(e: *mut Editor, x: f64,
     if textbuf.tb_drag(t) == 0 as u32 {
         return RES_NONE
     }
-    let pos: usize = textbuf.tb_caret_from_x(t, x + (*e).scroll, mess, ctx)
+    var pos: usize = 0
+    if (*e).v_on != 0 {
+        pos = vis_pos(e, x + (*e).scroll)
+    } else {
+        pos = textbuf.tb_caret_from_x(t, x + (*e).scroll, mess, ctx)
+    }
     // `extend` is always true while dragging: the anchor stays where
     // the mouse went down.
     textbuf.tb_set_caret(t, pos, true)
@@ -711,7 +858,18 @@ fn editor_scroll_to_caret(e: *mut Editor, mess: fn(u64, u64, usize) -> f64,
     if (*e).width <= 0.0 {
         return
     }
-    let cx: f64 = textbuf.tb_x_of(t, textbuf.tb_caret(t), mess, ctx)
+    // Mit der Zweirichtungsschrift: die visuelle Lage der Marke und die
+    // ganze Breite -- die Breite "bis zum letzten Oktett" ist in einem
+    // RTL-Text die linke Kante und nicht die Breite.
+    var cx: f64 = 0.0
+    var total: f64 = 0.0
+    if (*e).v_on != 0 {
+        cx = editor_caret_x(e)
+        total = (*e).v_w((*e).v_ctx, textbuf.tb_ptr(t), textbuf.tb_len(t))
+    } else {
+        cx = textbuf.tb_x_of(t, textbuf.tb_caret(t), mess, ctx)
+        total = textbuf.tb_x_of(t, textbuf.tb_len(t), mess, ctx)
+    }
     // run out to the left
     if cx < (*e).scroll {
         (*e).scroll = cx
@@ -723,7 +881,6 @@ fn editor_scroll_to_caret(e: *mut Editor, mess: fn(u64, u64, usize) -> f64,
         (*e).scroll = cx - (*e).width + 2.0
     }
     // Never scroll further than there is text.
-    let total: f64 = textbuf.tb_x_of(t, textbuf.tb_len(t), mess, ctx)
     if (*e).scroll > total - (*e).width {
         (*e).scroll = total - (*e).width
     }
@@ -744,6 +901,7 @@ fn editor_select_all(e: *mut Editor) {
 // Set text from outside (a new address after loading). The selection is
 // gone afterwards and the caret stands at the end.
 fn editor_set_text(e: *mut Editor, p: u64, n: usize) {
+    editor_ime_drop(e)
     editor_push_undo(e, false)
     textbuf.tb_set_text(&(*e).tf, p, n)
     (*e).scroll = 0.0
@@ -751,8 +909,184 @@ fn editor_set_text(e: *mut Editor, p: u64, n: usize) {
 }
 
 fn editor_clear(e: *mut Editor) {
+    editor_ime_drop(e)
     editor_push_undo(e, false)
     textbuf.tb_clear(&(*e).tf)
     (*e).scroll = 0.0
     editor_caret_wake(e)
+}
+
+// ======================================================================
+// DIE EINGABEMETHODE
+// ======================================================================
+
+fn editor_ime(e: *mut Editor) -> *mut ime.Ime {
+    return &(*e).im
+}
+
+// Die Plattform meldet sich an -- dasselbe Muster wie
+// `editor_set_clipboard`.
+fn editor_set_ime(e: *mut Editor, filtern: fn(u32, u32, bool) -> bool,
+    stelle: fn(f64, f64, f64), vergessen: fn(u32)) {
+    ime.ime_set_platform(&(*e).im, filtern, stelle, vergessen)
+}
+
+// Die eingebaute Umsetzung waehlen (ime.IME_OFF/KANA/HANGUL/PINYIN).
+fn editor_ime_mode(e: *mut Editor, mode: u32) {
+    if ime.ime_on(&(*e).im) {
+        ime.ime_plat_reset(&(*e).im, 1 as u32)
+    }
+    ime.ime_set_mode(&(*e).im, &(*e).tf, mode)
+}
+
+// Wo die Einfuegestelle auf dem Schirm steht. Das weiss, wer malt
+// (render.field_caret_x); hier geht es an die Plattform weiter.
+fn editor_ime_spot(e: *mut Editor, x: f64, y: f64, h: f64) {
+    ime.ime_set_spot(&(*e).im, x, y, h)
+}
+
+// DIE PLATTFORM MELDET DEN VORBEARBEITUNGSTEXT, und zwar immer ganz.
+// Beim ersten Mal wird der Stand davor als Rueckgaengig-Schritt gemerkt:
+// wer nach dem Bestaetigen Strg+Z drueckt, will das ganze Wort los sein.
+fn editor_ime_preedit(e: *mut Editor, p: u64, n: usize, cur: usize) -> u32 {
+    if !ime.ime_on(&(*e).im) {
+        editor_push_undo(e, false)
+    }
+    if !ime.ime_update(&(*e).im, &(*e).tf, p, n, cur) {
+        return RES_NONE
+    }
+    return RES_CHANGED
+}
+
+// DIE PLATTFORM BESTAETIGT. Auch ohne vorherigen Vorbearbeitungstext
+// (eine Plattform, die ein Zeichen direkt liefert) ist das richtig: dann
+// ist es eine Eingabe, die in einem Schritt beginnt und endet.
+fn editor_ime_commit(e: *mut Editor, p: u64, n: usize) -> u32 {
+    if !ime.ime_on(&(*e).im) {
+        editor_push_undo(e, false)
+    }
+    if !ime.ime_commit_text(&(*e).im, &(*e).tf, p, n) {
+        return RES_NONE
+    }
+    return RES_CHANGED
+}
+
+// Das Feld beendet die Eingabe selbst (Fokus weg, Klick): was dasteht,
+// gilt, und die Plattform erfaehrt es.
+fn editor_ime_end(e: *mut Editor) {
+    if !ime.ime_on(&(*e).im) {
+        return
+    }
+    ime.ime_confirm(&(*e).im, &(*e).tf)
+    ime.ime_plat_reset(&(*e).im, 1 as u32)
+}
+
+// Der Text wird von aussen ersetzt: die Eingabe ist gegenstandslos.
+fn editor_ime_drop(e: *mut Editor) {
+    if !ime.ime_on(&(*e).im) {
+        return
+    }
+    ime.ime_cancel(&(*e).im, &(*e).tf)
+    ime.ime_plat_reset(&(*e).im, 2 as u32)
+}
+
+// Ein Zeichen, solange eine eingebaute Umsetzung gewaehlt ist. RES_PASS
+// heisst: nicht meins, der gewoehnliche Weg soll es einfuegen -- und
+// eine laufende Eingabe ist dann schon bestaetigt, damit das Zeichen
+// HINTER ihr landet und nicht in ihr.
+fn ime_char(e: *mut Editor, cp: u32) -> u32 {
+    let m: *mut ime.Ime = &(*e).im
+    let t: *mut textbuf.TextBuf = &(*e).tf
+    if ime.ime_on(m) {
+        if cp >= 49 as u32 && cp <= 57 as u32 && ime.ime_cand_shown(m) {
+            if ime.ime_cand_pick_digit(m, t, cp - 48 as u32) {
+                return RES_CHANGED
+            }
+            return RES_NONE
+        }
+        if cp == 32 as u32 {
+            if ime.ime_convert(m, t) {
+                return RES_CHANGED
+            }
+        }
+        if ime.ime_feed(m, t, cp) {
+            return RES_CHANGED
+        }
+        ime.ime_confirm(m, t)
+        (*e).coalescing = 0
+        return RES_PASS
+    }
+    if ime.ime_mode(m) == ime.IME_OFF || !ime.ime_accepts(m, cp) {
+        return RES_PASS
+    }
+    editor_push_undo(e, false)
+    if ime.ime_feed(m, t, cp) {
+        return RES_CHANGED
+    }
+    return RES_PASS
+}
+
+// Eine Taste mitten in einer Eingabe.
+fn ime_key(e: *mut Editor, key: u32, mods: u32) -> u32 {
+    let m: *mut ime.Ime = &(*e).im
+    let t: *mut textbuf.TextBuf = &(*e).tf
+    let a: usize = textbuf.tb_comp_a(t)
+    let b: usize = textbuf.tb_comp_b(t)
+    let c: usize = textbuf.tb_caret(t)
+    if key == KEY_ENTER {
+        ime.ime_confirm(m, t)
+        ime.ime_plat_reset(m, 1 as u32)
+        (*e).coalescing = 0
+        return RES_CHANGED
+    }
+    if key == KEY_ESC {
+        if ime.ime_escape(m, t) == 1 as u32 {
+            return RES_MOVED
+        }
+        ime.ime_plat_reset(m, 2 as u32)
+        return RES_CHANGED
+    }
+    if key == KEY_UP || key == KEY_DOWN {
+        if !ime.ime_cand_shown(m) {
+            return RES_NONE
+        }
+        if key == KEY_UP {
+            ime.ime_cand_move(m, 0 - 1)
+        } else {
+            ime.ime_cand_move(m, 1)
+        }
+        return RES_MOVED
+    }
+    // Links, rechts, Anfang, Ende: im Vorbearbeitungstext und nie aus
+    // ihm heraus. Eine Auswahl gibt es darin nicht.
+    if key == KEY_LEFT {
+        if c > a {
+            textbuf.tb_set_caret(t, textbuf.tb_prev(t, c), false)
+        }
+        return RES_MOVED
+    }
+    if key == KEY_RIGHT {
+        if c < b {
+            textbuf.tb_set_caret(t, textbuf.tb_next(t, c), false)
+        }
+        return RES_MOVED
+    }
+    if key == KEY_HOME {
+        textbuf.tb_set_caret(t, a, false)
+        return RES_MOVED
+    }
+    if key == KEY_END {
+        textbuf.tb_set_caret(t, b, false)
+        return RES_MOVED
+    }
+    if key == KEY_BACKSPACE {
+        ime.ime_backspace(m, t)
+        return RES_CHANGED
+    }
+    if key == KEY_TAB {
+        // Der Fokus geht weiter; was dasteht, gilt vorher.
+        editor_ime_end(e)
+        return RES_PASS
+    }
+    return RES_NONE
 }

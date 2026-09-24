@@ -1,0 +1,1181 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/anim.fi -- ZEIT IM BILD. Tweens, Easings, Zustandsuebergaenge.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Eine Oberflaeche, die zwischen zwei Zustaenden SPRINGT, sieht alt aus.
+// Was moderne Oberflaechen jung aussehen laesst, ist nicht eine hoehere
+// Farbtiefe, sondern dass ein Knopf beim Ueberfahren seine Farbe UEBER
+// EINE ZEIT annimmt -- genau das, was CSS `transition` heisst. In fUi
+// gab es dafuer bisher keinen Ort, also haette jedes Widget seine eigene
+// Uhr bekommen. Das ist die Sorte Wiederholung, die dieser Baum nicht
+// duldet: hier steht die Uhr EINMAL.
+//
+// ======================================================= WAS HIER STEHT
+//
+//   Animation   ein Tween: von -> bis, ueber eine Dauer, mit Easing
+//   Animator    ein Register laufender Tweens; `anim_tick` rechnet alle
+//               weiter und MELDET, ob sich etwas geaendert hat -- daran
+//               haengt das bedarfsgesteuerte Neuzeichnen. Wer immer neu
+//               zeichnet, verbrennt Strom; wer nie neu zeichnet, friert.
+//   Easings     linear, ease-in/out/in-out als cubic-bezier mit frei
+//               waehlbaren Kontrollpunkten (Newton fuer t aus x, genau
+//               wie es die CSS-Kurve verlangt), steps(n), und eine
+//               echte Feder (Masse/Steifigkeit/Daempfung, ANALYTISCH
+//               geloest -- ein Euler-Schritt driftet und kommt bei
+//               langer Laufzeit nie sauber zur Ruhe).
+//   Transition  der Zustandswechsel eines Widgets (normal/hover/pressed/
+//               focus) als interpolierter Style: Farbe, Radius, Rand,
+//               Alpha, Verschiebung.
+//
+// ============================================== DIE FARBEN, UND DER GRAUE FLECK
+//
+// Farbinterpolation ist der Ort, an dem es falsch aussieht, ohne dass
+// man sagen kann warum. Zwei Fallen:
+//
+//   1. ALPHA. Wer RGB und A getrennt linear mischt, laeuft von einem
+//      durchsichtigen Schwarz nach einem deckenden Rot durch ein
+//      dunkles Grau. Richtig ist PREMULTIPLIED mischen und danach
+//      zurueckteilen.
+//   2. DER FARBRAUM. sRGB-Mischung von Blau nach Gelb geht durch ein
+//      totes Grau. In OKLab bleibt der Weg bunt. Deshalb gibt es beides:
+//      `mix_srgb` (billig, genau wie CSS es per Vorgabe tut) und
+//      `mix_oklab` (schoener, fuer Verlaeufe).
+//
+// KEIN ZWEITER ORT: die Wurzel kommt aus lib/svg/matrix.fi (`m_sqrt`),
+// e^x und die Kosinusse aus `std.math`. Hier steht keine eigene
+// Arithmetik.
+//
+// WELCHER DER BEIDEN ORTE FUER floor/ceil/abs GILT. `std.math` und
+// lib/svg/matrix.fi koennen beide abrunden, und genau das ist die
+// Falle: zwei Module in lib/fui/ rechneten mit zwei verschiedenen
+// Abrundungen dieselbe Rasterkante aus, und die Kante lag um einen
+// Bildpunkt daneben. Deshalb gilt in GANZ lib/fui/ ausschliesslich
+// `matrix.m_floor`, `matrix.m_ceil`, `matrix.m_abs` -- auch hier, wo
+// `std.math` ohnehin schon fuer exp/cos/sin/powf importiert ist.
+// `math.floor`, `math.ceil` und `math.abs` sind in lib/fui/ verboten;
+// Abschnitt 19 von tools/fui/run.sh rechnet das nach und bricht den
+// Lauf ab, sobald einer dieser Namen hier wieder auftaucht.
+//
+// ============================================ WOHER DIE ZIELWERTE KOMMEN
+//
+// Ein Uebergang braucht ZIELWERTE, und die stehen bereits im Baum: die
+// Farbe eines Zustandes in `render.def_bg_state` ueber `style.resolve_bg`
+// und `theme.color_from_style`, der Radius in `render.def_radius`, die
+// Randstaerke in `render.def_border_width`, die Deckung in
+// `style.resolve_alpha`. Deshalb fragt `trans_from_widget` genau dort
+// nach und schreibt die Kaskade NICHT ein zweites Mal ab -- sonst
+// laeuft ein Knopf in der Bewegung auf eine andere Farbe zu als die,
+// die er im Stand haette, und niemand fände den Unterschied.
+//
+// Was hier NEU entschieden wird, ist allein die BEWEGUNGSREGEL (welcher
+// Zustand sich um wieviel hebt, senkt oder runder wird) -- die steht in
+// `state_dy`/`state_radius_delta`/`state_border_delta` und nirgends sonst.
+import std.math
+import svg.matrix
+import fui.style
+import fui.theme
+import fui.widget
+import fui.render
+
+export {
+    // --- Easings
+    EASE_LINEAR, EASE_IN, EASE_OUT, EASE_IN_OUT, EASE_STEPS, EASE_SPRING,
+    Easing, easing_linear, easing_bezier, easing_bezier_kind,
+    easing_steps, easing_spring,
+    easing_named, ease_eval,
+    bezier_t_for_x, spring_eval,
+    // --- Ein Tween
+    Animation, anim_new, anim_set_delay, anim_set_repeat,
+    anim_set_direction, anim_value, anim_done, anim_progress,
+    anim_start, anim_stop, anim_active,
+    DIR_NORMAL, DIR_ALTERNATE, REPEAT_FOREVER,
+    // --- Das Register
+    Animator, animator_new, animator_add, animator_count, animator_at,
+    animator_clear, anim_tick, animator_dirty,
+    ANIM_MAX,
+    // --- Farben
+    mix_srgb, mix_oklab, srgb_to_oklab, oklab_to_srgb,
+    // --- Zustandsuebergang
+    Transition, trans_new, trans_set_duration, trans_set_easing,
+    trans_to_state, trans_tick, trans_state, trans_alpha,
+    trans_color, trans_radius, trans_border, trans_dx, trans_dy,
+    trans_set_oklab, trans_oklab, trans_progress,
+    trans_set_state_duration, trans_state_duration, trans_duration,
+    // --- Der Uebergang AM WIDGET
+    state_dy, state_dx, state_radius_delta, state_border_delta,
+    widget_target_bg, widget_target_radius, widget_target_border,
+    widget_target_alpha,
+    trans_from_widget, trans_force_widget, trans_apply, trans_place,
+    // --- Das Register, das der Zeichenweg fuehrt
+    TransReg, transreg_new, transreg_bind, transreg_unbind,
+    transreg_hook, transreg_slot, transreg_find, transreg_count,
+    transreg_index, transreg_clear,
+    transreg_set_duration, transreg_set_easing, transreg_set_oklab,
+    transreg_kind_ok, transreg_dirty, TRANS_MAX,
+}
+
+// ================================================================ EASINGS
+const EASE_LINEAR: u32 = 0
+const EASE_IN: u32 = 1
+const EASE_OUT: u32 = 2
+const EASE_IN_OUT: u32 = 3
+const EASE_STEPS: u32 = 4
+const EASE_SPRING: u32 = 5
+
+// Eine Easing-Kurve als VALUE. Vier Bezier-Kontrollpunkte fuer die
+// Kurvenfaelle, `n` fuer steps(n), und drei Federzahlen. Ein Wert und
+// kein Zeiger, damit eine Animation ihre Kurve BEI SICH hat und nicht
+// in eine Tabelle zeigt, die jemand anders weiterschiebt.
+struct Easing {
+    kind: u32,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    steps: i64,
+    mass: f64,
+    stiff: f64,
+    damp: f64,
+}
+
+fn easing_linear() -> Easing {
+    return Easing { kind: EASE_LINEAR, x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0,
+        steps: 1, mass: 1.0, stiff: 100.0, damp: 10.0 }
+}
+
+// cubic-bezier(x1,y1,x2,y2) wie in CSS. Die beiden Endpunkte sind fest
+// (0,0) und (1,1), genau wie dort.
+//
+// DAS KENNZEICHEN IST EIN ARGUMENT, KEINE ANNAHME. Frueher trug jede
+// hier gebaute Kurve EASE_IN_OUT, auch die, die `easing_named(EASE_IN)`
+// zurueckgab: wer danach `(*e).kind` las -- etwa ein Beleg, der die
+// Reihen beschriftet, oder ein Zwischenspeicher, der gleiche Kurven
+// zusammenfasst -- bekam fuer drei verschiedene Kurven dieselbe
+// Auskunft. `ease_eval` faellt fuer JEDES Kennzeichen ausser linear,
+// steps und Feder in den Bezier-Zweig, das Kennzeichen darf also frei
+// die Kurve benennen. Wer eine eigene Kurve ohne Namen baut, nimmt
+// `easing_bezier` und bekommt EASE_IN_OUT wie bisher.
+fn easing_bezier_kind(kind: u32, x1: f64, y1: f64, x2: f64, y2: f64) -> Easing {
+    var e: Easing = easing_linear()
+    e.kind = kind
+    e.x1 = x1
+    e.y1 = y1
+    e.x2 = x2
+    e.y2 = y2
+    return e
+}
+
+// Die namenlose Form: eine frei gewaehlte Kurve traegt EASE_IN_OUT,
+// denn sie IST im allgemeinen Fall weder rein beschleunigend noch rein
+// bremsend.
+fn easing_bezier(x1: f64, y1: f64, x2: f64, y2: f64) -> Easing {
+    return easing_bezier_kind(EASE_IN_OUT, x1, y1, x2, y2)
+}
+
+fn easing_steps(n: i64) -> Easing {
+    var e: Easing = easing_linear()
+    e.kind = EASE_STEPS
+    if n < 1 {
+        e.steps = 1
+    } else {
+        e.steps = n
+    }
+    return e
+}
+
+fn easing_spring(mass: f64, stiff: f64, damp: f64) -> Easing {
+    var e: Easing = easing_linear()
+    e.kind = EASE_SPRING
+    e.mass = mass
+    e.stiff = stiff
+    e.damp = damp
+    return e
+}
+
+// Die drei benannten CSS-Kurven mit ihren echten Kontrollpunkten
+// (css-easing-1, 3.1): ease-in = (0.42,0,1,1), ease-out = (0,0,0.58,1),
+// ease-in-out = (0.42,0,0.58,1).
+// Jede von ihnen traegt IHR eigenes Kennzeichen, nicht das der
+// allgemeinen Bezierkurve -- `easing_named(EASE_IN).kind` ist EASE_IN.
+fn easing_named(kind: u32) -> Easing {
+    if kind == EASE_IN {
+        return easing_bezier_kind(EASE_IN, 0.42, 0.0, 1.0, 1.0)
+    }
+    if kind == EASE_OUT {
+        return easing_bezier_kind(EASE_OUT, 0.0, 0.0, 0.58, 1.0)
+    }
+    if kind == EASE_IN_OUT {
+        return easing_bezier_kind(EASE_IN_OUT, 0.42, 0.0, 0.58, 1.0)
+    }
+    return easing_linear()
+}
+
+// Ein Bezier-Polynom in einer Koordinate, mit P0 = 0 und P3 = 1.
+fn bez(a1: f64, a2: f64, t: f64) -> f64 {
+    let u: f64 = 1.0 - t
+    return 3.0 * u * u * t * a1 + 3.0 * u * t * t * a2 + t * t * t
+}
+
+fn bez_ableitung(a1: f64, a2: f64, t: f64) -> f64 {
+    let u: f64 = 1.0 - t
+    return 3.0 * u * u * a1 + 6.0 * u * t * (a2 - a1) + 3.0 * t * t * (1.0 - a2)
+}
+
+// DER KERN DER CSS-KURVE. Die Kurve gibt x und y beide ueber einen
+// Parameter t an -- gefragt ist aber y an einer STELLE x. Also erst t
+// aus x loesen. Newton, und wo die Ableitung zu flach wird (die Kurve
+// hat an den Enden waagerechte Stellen), Bisektion als Netz darunter.
+fn bezier_t_for_x(x1: f64, x2: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    if x >= 1.0 {
+        return 1.0
+    }
+    var t: f64 = x
+    var i: i32 = 0
+    while i < 8 {
+        let fx: f64 = bez(x1, x2, t) - x
+        if matrix.m_abs(fx) < 1.0e-9 {
+            return t
+        }
+        let d: f64 = bez_ableitung(x1, x2, t)
+        if matrix.m_abs(d) < 1.0e-6 {
+            i = 8
+        } else {
+            t = t - fx / d
+            if t < 0.0 {
+                t = 0.0
+            }
+            if t > 1.0 {
+                t = 1.0
+            }
+            i = i + 1
+        }
+    }
+    // Das Netz: Bisektion auf [0,1], 40 Halbierungen sind 1e-12.
+    var lo: f64 = 0.0
+    var hi: f64 = 1.0
+    var m: f64 = t
+    var k: i32 = 0
+    while k < 40 {
+        m = (lo + hi) * 0.5
+        if bez(x1, x2, m) < x {
+            lo = m
+        } else {
+            hi = m
+        }
+        k = k + 1
+    }
+    return m
+}
+
+// DIE FEDER, ANALYTISCH. Masse m, Steifigkeit k, Daempfung c; die
+// Auslenkung startet bei 1 (= "noch ganz am Anfang") und laeuft nach 0.
+// Zurueck kommt der Fortschritt 1 - x(t).
+//
+// Drei Faelle, und alle drei muessen dastehen, sonst bricht die Formel
+// genau am aperiodischen Grenzfall (w == 0 im Nenner):
+//
+//   unterkritisch  z < 1: e^(-z*w0*t) * (cos(wd*t) + z*w0/wd * sin(wd*t))
+//   kritisch       z = 1: e^(-w0*t) * (1 + w0*t)
+//   ueberkritisch  z > 1: zwei reelle Exponenten
+fn spring_eval(mass: f64, stiff: f64, damp: f64, t: f64) -> f64 {
+    var m: f64 = mass
+    if m <= 0.0 {
+        m = 1.0
+    }
+    var k: f64 = stiff
+    if k <= 0.0 {
+        k = 1.0
+    }
+    let w0: f64 = matrix.m_sqrt(k / m)
+    let z: f64 = damp / (2.0 * matrix.m_sqrt(k * m))
+    var x: f64 = 0.0
+    if z < 0.999999 {
+        let wd: f64 = w0 * matrix.m_sqrt(1.0 - z * z)
+        x = math.exp(0.0 - z * w0 * t) *
+            (math.cos(wd * t) + (z * w0 / wd) * math.sin(wd * t))
+    } else if z <= 1.000001 {
+        x = math.exp(0.0 - w0 * t) * (1.0 + w0 * t)
+    } else {
+        let r: f64 = matrix.m_sqrt(z * z - 1.0)
+        let a: f64 = 0.0 - w0 * (z - r)
+        let b: f64 = 0.0 - w0 * (z + r)
+        // x(0) = 1, x'(0) = 0 loest sich zu diesen beiden Gewichten.
+        let ca: f64 = 0.0 - b / (a - b)
+        let cb: f64 = a / (a - b)
+        x = ca * math.exp(a * t) + cb * math.exp(b * t)
+    }
+    return 1.0 - x
+}
+
+// Eine Easing an der Stelle `p` aus [0,1]. Fuer die Feder ist `p` die
+// normierte Zeit; die Dauer der Animation ist dann die Zeit, nach der
+// die Feder als ausgeschwungen gilt.
+fn ease_eval(e: *mut Easing, p: f64) -> f64 {
+    var t: f64 = p
+    if t < 0.0 {
+        t = 0.0
+    }
+    if t > 1.0 {
+        t = 1.0
+    }
+    let k: u32 = (*e).kind
+    if k == EASE_LINEAR {
+        return t
+    }
+    if k == EASE_STEPS {
+        // steps(n, jump-end): der Sprung passiert AM ENDE jedes
+        // Abschnitts, t = 1 gibt genau 1.
+        let n: f64 = (*e).steps as f64
+        let s: f64 = matrix.m_floor(t * n) / n
+        if s > 1.0 {
+            return 1.0
+        }
+        return s
+    }
+    if k == EASE_SPRING {
+        // Die Federzeit laeuft ueber die Dauer; 1.0 am Parameterende
+        // heisst "eine Sekunde Federzeit" -- bei Steifigkeit 100 ist
+        // das reichlich Zeit zum Ausschwingen.
+        return spring_eval((*e).mass, (*e).stiff, (*e).damp, t)
+    }
+    let u: f64 = bezier_t_for_x((*e).x1, (*e).x2, t)
+    return bez((*e).y1, (*e).y2, u)
+}
+
+// ============================================================= EIN TWEEN
+const DIR_NORMAL: u32 = 0
+const DIR_ALTERNATE: u32 = 1
+const REPEAT_FOREVER: i64 = 0 - 1
+
+struct Animation {
+    start_ms: i64,
+    delay_ms: i64,
+    dur_ms: i64,
+    von: f64,
+    bis: f64,
+    ease: Easing,
+    repeat: i64,      // wie oft im Ganzen; REPEAT_FOREVER = endlos
+    richtung: u32,
+    aktiv: u32,
+    now_ms: i64,
+}
+
+fn anim_new(start_ms: i64, dur_ms: i64, von: f64, bis: f64,
+    e: Easing) -> Animation {
+    var d: i64 = dur_ms
+    if d < 1 {
+        d = 1
+    }
+    return Animation { start_ms: start_ms, delay_ms: 0, dur_ms: d,
+        von: von, bis: bis, ease: e, repeat: 1, richtung: DIR_NORMAL,
+        aktiv: 1, now_ms: start_ms }
+}
+
+fn anim_set_delay(a: *mut Animation, ms: i64) { (*a).delay_ms = ms }
+fn anim_set_repeat(a: *mut Animation, n: i64) { (*a).repeat = n }
+fn anim_set_direction(a: *mut Animation, d: u32) { (*a).richtung = d }
+fn anim_start(a: *mut Animation, ms: i64) {
+    (*a).start_ms = ms
+    (*a).now_ms = ms
+    (*a).aktiv = 1
+}
+fn anim_stop(a: *mut Animation) { (*a).aktiv = 0 }
+fn anim_active(a: *mut Animation) -> bool { return (*a).aktiv != 0 }
+
+// Der Fortschritt in [0,1] zur Zeit `ms`, MIT Verzoegerung, Wiederholung
+// und Richtung, aber OHNE Easing.
+fn anim_progress(a: *mut Animation, ms: i64) -> f64 {
+    let t: i64 = ms - (*a).start_ms - (*a).delay_ms
+    if t <= 0 {
+        return 0.0
+    }
+    let d: i64 = (*a).dur_ms
+    var zyklus: i64 = t / d
+    var rest: f64 = ((t - zyklus * d) as f64) / (d as f64)
+    if (*a).repeat != REPEAT_FOREVER && zyklus >= (*a).repeat {
+        // Fertig: auf dem Endwert des LETZTEN Zyklus stehen bleiben.
+        zyklus = (*a).repeat - 1
+        rest = 1.0
+    }
+    if (*a).richtung == DIR_ALTERNATE && (zyklus & 1) == 1 {
+        return 1.0 - rest
+    }
+    return rest
+}
+
+fn anim_done(a: *mut Animation, ms: i64) -> bool {
+    if (*a).repeat == REPEAT_FOREVER {
+        return false
+    }
+    return ms - (*a).start_ms - (*a).delay_ms >= (*a).dur_ms * (*a).repeat
+}
+
+// Der Wert zur Zeit `ms`.
+fn anim_value(a: *mut Animation, ms: i64) -> f64 {
+    let p: f64 = ease_eval(&(*a).ease, anim_progress(a, ms))
+    return (*a).von + ((*a).bis - (*a).von) * p
+}
+
+// ========================================================== DAS REGISTER
+//
+// Feste Groesse, kein Allokator: fUi laeuft auch dort, wo es keinen
+// gibt. Wer mehr als ANIM_MAX Tweens gleichzeitig laufen hat, hat ein
+// anderes Problem als die Obergrenze.
+const ANIM_MAX: usize = 32
+
+struct Animator {
+    a: [Animation; 32],
+    n: usize,
+    dirty: u32,
+}
+
+fn animator_new() -> Animator {
+    return Animator {
+        a: [anim_new(0, 1, 0.0, 0.0, easing_linear()); 32],
+        n: 0, dirty: 0,
+    }
+}
+
+fn animator_count(g: *mut Animator) -> usize { return (*g).n }
+fn animator_clear(g: *mut Animator) { (*g).n = 0 }
+fn animator_at(g: *mut Animator, i: usize) -> *mut Animation {
+    return &(*g).a[i]
+}
+
+// Zurueck kommt der Platz, damit der Aufrufer seinen Tween
+// wiederfindet; ANIM_MAX heisst "kein Platz mehr".
+fn animator_add(g: *mut Animator, a: Animation) -> usize {
+    if (*g).n >= ANIM_MAX {
+        return ANIM_MAX
+    }
+    let i: usize = (*g).n
+    (*g).a[i] = a
+    (*g).n = i + 1
+    return i
+}
+
+// DER TAKT. Alle laufenden Tweens auf `ms` stellen und sagen, ob sich
+// ein Wert geaendert hat. Nur dann muss neu gezeichnet werden.
+//
+// `dirty` GILT FUER DIESEN TAKT, nicht fuer immer. Bis zum 23.09.2026
+// wurde es hier gesetzt und nirgends wieder geloescht: nach dem ersten
+// Tween sagte `animator_dirty` fuer den Rest des Programms "zeichne
+// neu", und eine Fensterschleife, die sich danach richtet, malte im
+// Leerlauf sechzig Bilder je Sekunde. Gefunden, als die erste echte
+// Fensterschleife (lib/plat/fuiwirt.fi) die Frage wirklich stellte.
+// Dieselbe Regel hat `TransReg.dirty` weiter unten schon immer.
+fn anim_tick(g: *mut Animator, ms: i64) -> bool {
+    (*g).dirty = 0
+    var geaendert: bool = false
+    var i: usize = 0
+    while i < (*g).n {
+        let a: *mut Animation = &(*g).a[i]
+        if (*a).aktiv != 0 {
+            let alt: f64 = anim_value(a, (*a).now_ms)
+            (*a).now_ms = ms
+            let neu: f64 = anim_value(a, ms)
+            if neu != alt {
+                geaendert = true
+            }
+            if anim_done(a, ms) {
+                (*a).aktiv = 0
+                geaendert = true
+            }
+        }
+        i = i + 1
+    }
+    if geaendert {
+        (*g).dirty = 1
+    }
+    return geaendert
+}
+
+fn animator_dirty(g: *mut Animator) -> bool { return (*g).dirty != 0 }
+
+// ================================================================ FARBEN
+//
+// Beide Mischer nehmen und geben 0xAARRGGBB und rechnen PREMULTIPLIED.
+fn kanal(c: u32, s: u32) -> f64 {
+    return (((c >> s) & 255 as u32) as f64) / 255.0
+}
+
+fn pack(a: f64, r: f64, g: f64, b: f64) -> u32 {
+    return (acht(a) << 24) | (acht(r) << 16) | (acht(g) << 8) | acht(b)
+}
+
+fn acht(v: f64) -> u32 {
+    var x: f64 = v * 255.0 + 0.5
+    if x < 0.0 {
+        x = 0.0
+    }
+    if x > 255.0 {
+        x = 255.0
+    }
+    return (x as i64) as u32
+}
+
+// Linear in sRGB, mit korrektem Alpha: die Farbanteile werden MIT dem
+// Alpha gewichtet gemischt und danach wieder herausgeteilt. Ohne das
+// laeuft der Weg von durchsichtig nach deckend durch ein Grau, das in
+// keiner der beiden Farben vorkommt.
+fn mix_srgb(c0: u32, c1: u32, t: f64) -> u32 {
+    var u: f64 = t
+    if u < 0.0 {
+        u = 0.0
+    }
+    if u > 1.0 {
+        u = 1.0
+    }
+    let a0: f64 = kanal(c0, 24)
+    let a1: f64 = kanal(c1, 24)
+    let a: f64 = a0 + (a1 - a0) * u
+    if a <= 0.0 {
+        return 0 as u32
+    }
+    let r: f64 = (kanal(c0, 16) * a0 + (kanal(c1, 16) * a1 - kanal(c0, 16) * a0) * u) / a
+    let g: f64 = (kanal(c0, 8) * a0 + (kanal(c1, 8) * a1 - kanal(c0, 8) * a0) * u) / a
+    let b: f64 = (kanal(c0, 0) * a0 + (kanal(c1, 0) * a1 - kanal(c0, 0) * a0) * u) / a
+    return pack(a, r, g, b)
+}
+
+// sRGB -> OKLab (Björn Ottosson, 2020). Erst die Gammakurve heraus,
+// dann die LMS-Matrix, dann die Kubikwurzel, dann die zweite Matrix.
+fn zu_linear(c: f64) -> f64 {
+    if c <= 0.04045 {
+        return c / 12.92
+    }
+    return math.powf((c + 0.055) / 1.055, 2.4)
+}
+
+fn zu_srgb(c: f64) -> f64 {
+    if c <= 0.0031308 {
+        return c * 12.92
+    }
+    return 1.055 * math.powf(c, 1.0 / 2.4) - 0.055
+}
+
+fn kubikwurzel(x: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0
+    }
+    if x < 0.0 {
+        return 0.0 - math.powf(0.0 - x, 1.0 / 3.0)
+    }
+    return math.powf(x, 1.0 / 3.0)
+}
+
+fn srgb_to_oklab(r: f64, g: f64, b: f64, ol: *mut f64, oa: *mut f64,
+    ob: *mut f64) {
+    let lr: f64 = zu_linear(r)
+    let lg: f64 = zu_linear(g)
+    let lb: f64 = zu_linear(b)
+    let l: f64 = kubikwurzel(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb)
+    let m: f64 = kubikwurzel(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb)
+    let s: f64 = kubikwurzel(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb)
+    *ol = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s
+    *oa = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+    *ob = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+}
+
+fn oklab_to_srgb(ll: f64, aa: f64, bb: f64, orr: *mut f64, og: *mut f64,
+    ob: *mut f64) {
+    let l_: f64 = ll + 0.3963377774 * aa + 0.2158037573 * bb
+    let m_: f64 = ll - 0.1055613458 * aa - 0.0638541728 * bb
+    let s_: f64 = ll - 0.0894841775 * aa - 1.2914855480 * bb
+    let l: f64 = l_ * l_ * l_
+    let m: f64 = m_ * m_ * m_
+    let s: f64 = s_ * s_ * s_
+    *orr = zu_srgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s)
+    *og = zu_srgb(0.0 - 1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s)
+    *ob = zu_srgb(0.0 - 0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+}
+
+// Der schoene Weg: in OKLab mischen. Alpha bleibt linear und wird NICHT
+// in den Farbraum gezogen -- es ist eine Deckung, keine Farbe.
+fn mix_oklab(c0: u32, c1: u32, t: f64) -> u32 {
+    var u: f64 = t
+    if u < 0.0 {
+        u = 0.0
+    }
+    if u > 1.0 {
+        u = 1.0
+    }
+    var l0: f64 = 0.0
+    var a0v: f64 = 0.0
+    var b0v: f64 = 0.0
+    var l1: f64 = 0.0
+    var a1v: f64 = 0.0
+    var b1v: f64 = 0.0
+    srgb_to_oklab(kanal(c0, 16), kanal(c0, 8), kanal(c0, 0), &l0, &a0v, &b0v)
+    srgb_to_oklab(kanal(c1, 16), kanal(c1, 8), kanal(c1, 0), &l1, &a1v, &b1v)
+    var r: f64 = 0.0
+    var g: f64 = 0.0
+    var b: f64 = 0.0
+    oklab_to_srgb(l0 + (l1 - l0) * u, a0v + (a1v - a0v) * u,
+        b0v + (b1v - b0v) * u, &r, &g, &b)
+    let al: f64 = kanal(c0, 24) + (kanal(c1, 24) - kanal(c0, 24)) * u
+    return pack(al, r, g, b)
+}
+
+// ==================================================== DER ZUSTANDSWECHSEL
+//
+// Das ist CSS `transition` fuer ein Widget: beim Wechsel des Zustandes
+// laeuft ein Tween von den ALTEN Werten auf die NEUEN. Die alten Werte
+// sind die, die gerade auf dem Schirm stehen -- nicht die des vorigen
+// Zustandes. Nur so bleibt ein Wechsel mitten in der Bewegung stetig
+// (Maus wieder herunter, bevor die Bewegung fertig ist).
+struct Transition {
+    state: u32,
+    dur_ms: i64,
+    ease: Easing,
+    t0_ms: i64,
+    // von / bis fuer jede Groesse
+    bg_von: u32,
+    bg_bis: u32,
+    rad_von: f64,
+    rad_bis: f64,
+    bor_von: f64,
+    bor_bis: f64,
+    alp_von: f64,
+    alp_bis: f64,
+    dx_von: f64,
+    dx_bis: f64,
+    dy_von: f64,
+    dy_bis: f64,
+    p: f64,        // der zuletzt gerechnete Fortschritt nach Easing
+    oklab: u32,    // 1 = Farbe in OKLab mischen
+    // JE ZUSTAND EINE EIGENE DAUER. CSS kann das ueber mehrere
+    // `transition`-Regeln, und man braucht es: ein Knopf soll beim
+    // DRUECKEN sofort reagieren (kurz) und beim Loslassen weich
+    // zurueckfliessen (lang). Eine einzige Dauer fuer beide Richtungen
+    // laesst die Oberflaeche entweder traege oder nervoes wirken.
+    // 0 heisst "nichts gesetzt, nimm dur_ms".
+    dur_state: [i64; 6],
+}
+
+fn trans_new(bg: u32, radius: f64, border: f64, alpha: f64) -> Transition {
+    return Transition {
+        state: 0, dur_ms: 120, ease: easing_named(EASE_OUT), t0_ms: 0,
+        bg_von: bg, bg_bis: bg, rad_von: radius, rad_bis: radius,
+        bor_von: border, bor_bis: border, alp_von: alpha, alp_bis: alpha,
+        dx_von: 0.0, dx_bis: 0.0, dy_von: 0.0, dy_bis: 0.0,
+        p: 1.0, oklab: 0, dur_state: [0 as i64; 6],
+    }
+}
+
+fn trans_set_duration(t: *mut Transition, ms: i64) {
+    if ms < 1 {
+        (*t).dur_ms = 1
+    } else {
+        (*t).dur_ms = ms
+    }
+}
+
+fn trans_set_easing(t: *mut Transition, e: Easing) { (*t).ease = e }
+
+// OKLab von aussen schaltbar. Die Vorgabe bleibt sRGB, weil CSS es so
+// macht und weil zwei benachbarte Grautoene in beiden Raeumen gleich
+// aussehen; wer von Blau nach Gelb laeuft, schaltet um und behaelt
+// einen bunten Weg statt des toten Graus in der Mitte.
+fn trans_set_oklab(t: *mut Transition, an: bool) {
+    if an {
+        (*t).oklab = 1
+    } else {
+        (*t).oklab = 0
+    }
+}
+
+fn trans_oklab(t: *mut Transition) -> bool { return (*t).oklab != 0 }
+
+// Der Fortschritt NACH Easing -- das ist der Wert, mit dem alle
+// Groessen gemischt werden. Nach aussen sichtbar, damit eine Pruefung
+// ihn nachrechnen kann, ohne sechs Getter zu vergleichen.
+fn trans_progress(t: *mut Transition) -> f64 { return (*t).p }
+
+// Eine eigene Dauer fuer EINEN Zielzustand. `ms <= 0` nimmt die
+// Vorgabe wieder zurueck.
+fn trans_set_state_duration(t: *mut Transition, state: u32, ms: i64) {
+    if (state as usize) >= style.STATE_COUNT {
+        return
+    }
+    if ms < 0 {
+        (*t).dur_state[state as usize] = 0
+    } else {
+        (*t).dur_state[state as usize] = ms
+    }
+}
+
+fn trans_state_duration(t: *mut Transition, state: u32) -> i64 {
+    if (state as usize) >= style.STATE_COUNT {
+        return (*t).dur_ms
+    }
+    let d: i64 = (*t).dur_state[state as usize]
+    if d > 0 {
+        return d
+    }
+    return (*t).dur_ms
+}
+
+// Die gerade wirksame Dauer: die des ZIELzustandes. Der Lauf gehoert
+// dem Zustand, auf den zugelaufen wird -- das ist die Lesart von CSS,
+// wo die `transition`-Angabe des Zielzustandes gilt.
+fn trans_duration(t: *mut Transition) -> i64 {
+    return trans_state_duration(t, (*t).state)
+}
+
+// Der Wechsel. Was jetzt zu sehen ist, wird zum Anfang; die Zielwerte
+// kommen vom Aufrufer, der sie aus Theme und Style holt.
+fn trans_to_state(t: *mut Transition, now_ms: i64, state: u32, bg: u32,
+    radius: f64, border: f64, alpha: f64, dx: f64, dy: f64) {
+    (*t).bg_von = trans_color(t)
+    (*t).rad_von = trans_radius(t)
+    (*t).bor_von = trans_border(t)
+    (*t).alp_von = trans_alpha(t)
+    (*t).dx_von = trans_dx(t)
+    (*t).dy_von = trans_dy(t)
+    (*t).bg_bis = bg
+    (*t).rad_bis = radius
+    (*t).bor_bis = border
+    (*t).alp_bis = alpha
+    (*t).dx_bis = dx
+    (*t).dy_bis = dy
+    (*t).state = state
+    (*t).t0_ms = now_ms
+    (*t).p = 0.0
+}
+
+// Weiterrechnen. `true` heisst: das Bild ist veraltet.
+fn trans_tick(t: *mut Transition, now_ms: i64) -> bool {
+    let alt: f64 = (*t).p
+    var roh: f64 = ((now_ms - (*t).t0_ms) as f64) / (trans_duration(t) as f64)
+    if roh < 0.0 {
+        roh = 0.0
+    }
+    if roh > 1.0 {
+        roh = 1.0
+    }
+    (*t).p = ease_eval(&(*t).ease, roh)
+    return (*t).p != alt
+}
+
+fn trans_state(t: *mut Transition) -> u32 { return (*t).state }
+
+fn trans_color(t: *mut Transition) -> u32 {
+    if (*t).oklab != 0 {
+        return mix_oklab((*t).bg_von, (*t).bg_bis, (*t).p)
+    }
+    return mix_srgb((*t).bg_von, (*t).bg_bis, (*t).p)
+}
+
+fn lerp(a: f64, b: f64, p: f64) -> f64 { return a + (b - a) * p }
+
+fn trans_radius(t: *mut Transition) -> f64 {
+    return lerp((*t).rad_von, (*t).rad_bis, (*t).p)
+}
+fn trans_border(t: *mut Transition) -> f64 {
+    return lerp((*t).bor_von, (*t).bor_bis, (*t).p)
+}
+fn trans_alpha(t: *mut Transition) -> f64 {
+    return lerp((*t).alp_von, (*t).alp_bis, (*t).p)
+}
+fn trans_dx(t: *mut Transition) -> f64 {
+    return lerp((*t).dx_von, (*t).dx_bis, (*t).p)
+}
+fn trans_dy(t: *mut Transition) -> f64 {
+    return lerp((*t).dy_von, (*t).dy_bis, (*t).p)
+}
+
+// ============================================ DER UEBERGANG AM WIDGET
+//
+// Bis hierher ist die `Transition` ein Rechenwerk ohne Anschluss: der
+// Aufrufer musste sechs Zielwerte selbst besorgen. Damit haette jedes
+// Programm seine eigene Vorstellung davon bekommen, welche Farbe ein
+// gedrueckter Knopf ansteuert -- also genau die Sorte Wiederholung,
+// gegen die lib/fui angetreten ist. Der Weg vom Widget zum Tween steht
+// deshalb HIER, einmal, und er fragt die bestehenden Quellen:
+//
+//   Farbe        style.resolve_bg(Styleset, Zustand, render.def_bg_state)
+//                -> theme.color_from_style (Token -> echte Farbe)
+//   Radius       style.resolve_num(SF_RADIUS, ..., render.def_radius)
+//   Randstaerke  style.resolve_num(SF_BORDER_W, ..., render.def_border_width)
+//   Deckung      style.resolve_alpha
+//
+// ALLE Laengen hier sind STILEINHEITEN, nicht Bildpunkte: `trans_apply`
+// schreibt sie in den Style zurueck, und render skaliert sie danach mit
+// `render.len_of`. Wer direkt malt, skaliert selbst.
+
+// ==================================================== DIE BEWEGUNGSREGEL
+//
+// Das ist der einzige Ort, an dem dieses Haus etwas NEUES festlegt, und
+// die Regel ist die, die man von Material und Fluent kennt: ueberfahren
+// hebt, druecken senkt. Ein Knopf, der sich beim Druecken NICHT bewegt,
+// fuehlt sich an wie ein Bild von einem Knopf.
+fn state_dy(state: u32) -> f64 {
+    if state == style.STATE_HOVER {
+        return 0.0 - 1.0
+    }
+    if state == style.STATE_ACTIVE {
+        return 1.0
+    }
+    return 0.0
+}
+
+// Waagerecht verschiebt kein Zustand. Die Groesse gehoert trotzdem in
+// den Uebergang (ein Schieber, ein Reiterwechsel braucht sie), und sie
+// ist ueber `trans_to_state` frei setzbar -- deshalb steht die Regel
+// als benannte Funktion da und nicht als verstreute Null.
+fn state_dx(state: u32) -> f64 {
+    return 0.0
+}
+
+// Gedrueckt wird die Ecke enger, ueberfahren weiter: dieselbe Lesart
+// wie bei der Hoehe -- was naeher kommt, wird runder.
+fn state_radius_delta(state: u32) -> f64 {
+    if state == style.STATE_HOVER {
+        return 2.0
+    }
+    if state == style.STATE_ACTIVE {
+        return 0.0 - 2.0
+    }
+    return 0.0
+}
+
+// Im Fokus wird der Rand um `shape.focus_w` staerker. Das ist KEIN
+// zweiter Fokusring -- render.draw_focus_ring malt den weiterhin; es
+// ist die weiche Vorstufe, damit der Ring nicht aufploppt.
+fn state_border_delta(m: *mut theme.Theme, state: u32) -> f64 {
+    if state == style.STATE_FOCUS {
+        return (*theme.theme_shape(m)).focus_w as f64
+    }
+    return 0.0
+}
+
+// ======================================================== DIE ZIELWERTE
+//
+// Die Flaechenfarbe, die das Widget im Zustand `state` HAETTE. Eine
+// Farbe, die nicht sichtbar ist (transparent/inherit), wird zur
+// durchsichtigen Null -- und weil premultipliziert gemischt wird,
+// laeuft der Weg von dort aus in der Zielfarbe und nicht durch Grau.
+fn widget_target_bg(c: *mut render.Ctx, e: *mut widget.Widget,
+    state: u32) -> u32 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let w: u32 = style.resolve_bg(sz, state, render.def_bg_state(kind, state))
+    if !style.color_is_visible(w) {
+        return 0 as u32
+    }
+    return theme.opaque(theme.color_from_style(render.ctx_theme(c), w))
+}
+
+fn widget_target_radius(c: *mut render.Ctx, e: *mut widget.Widget,
+    state: u32) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let r: f64 = style.resolve_num(sz, style.SF_RADIUS,
+        (*style.styleset_base(sz)).radius as usize,
+        render.def_radius(c, kind)) as f64
+    var v: f64 = r + state_radius_delta(state)
+    if v < 0.0 {
+        v = 0.0
+    }
+    return v
+}
+
+fn widget_target_border(c: *mut render.Ctx, e: *mut widget.Widget,
+    state: u32) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let kind: u32 = widget.w_kind(e)
+    let b: f64 = style.resolve_num(sz, style.SF_BORDER_W,
+        (*style.styleset_base(sz)).border_w as usize,
+        render.def_border_width(c, kind)) as f64
+    return b + state_border_delta(render.ctx_theme(c), state)
+}
+
+// Die Deckung als Bruchteil. 255 ist der Vorgabewert der Kaskade, also
+// ist 1.0 der Normalfall -- ein Widget wird nur durchsichtig, wenn es
+// jemand ausdruecklich sagt.
+fn widget_target_alpha(c: *mut render.Ctx, e: *mut widget.Widget,
+    state: u32) -> f64 {
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    return (style.resolve_alpha(sz, state) as f64) / 255.0
+}
+
+// DER ANSCHLUSS. Steht das Widget in einem anderen Zustand als der
+// Uebergang, dann wird der Tween AB DEM AKTUELLEN BILD neu angesetzt
+// und `true` gemeldet. Sonst passiert nichts -- besonders wird nichts
+// neu gestartet, denn ein Aufruf je Bild ist der Normalfall.
+fn trans_from_widget(t: *mut Transition, c: *mut render.Ctx,
+    e: *mut widget.Widget, now_ms: i64) -> bool {
+    let zu: u32 = widget.w_state(e)
+    if zu == (*t).state {
+        return false
+    }
+    trans_force_widget(t, c, e, now_ms)
+    return true
+}
+
+// Denselben Weg gehen, OHNE auf einen Wechsel zu warten: das braucht
+// man einmal beim Aufbau (damit der Uebergang auf den wahren Werten
+// des Widgets steht) und in der Galerie, die einen Zustand von Hand
+// stellt.
+fn trans_force_widget(t: *mut Transition, c: *mut render.Ctx,
+    e: *mut widget.Widget, now_ms: i64) {
+    let zu: u32 = widget.w_state(e)
+    trans_to_state(t, now_ms, zu,
+        widget_target_bg(c, e, zu),
+        widget_target_radius(c, e, zu),
+        widget_target_border(c, e, zu),
+        widget_target_alpha(c, e, zu),
+        state_dx(zu), state_dy(zu))
+}
+
+// Den Zwischenstand in den Style des Widgets zurueckschreiben, damit
+// render.draw_* ihn ohne jede Sonderbehandlung malt. Die Farbe wird
+// dabei zu einem LITERAL -- sie ist ja gemischt und keine Rolle mehr.
+fn trans_apply(t: *mut Transition, e: *mut widget.Widget) {
+    let s: *mut style.Style = widget.w_style(e)
+    let col: u32 = trans_color(t)
+    var a: f64 = trans_alpha(t) * (((col >> 24) & 255 as u32) as f64) / 255.0
+    if a < 0.0 {
+        a = 0.0
+    }
+    if a > 1.0 {
+        a = 1.0
+    }
+    var r: f64 = trans_radius(t) + 0.5
+    if r < 0.0 {
+        r = 0.0
+    }
+    var b: f64 = trans_border(t) + 0.5
+    if b < 0.0 {
+        b = 0.0
+    }
+    *s = style.style_set_bg(*s, style.color_literal(col & 16777215 as u32))
+    *s = style.style_set_radius(*s, (r as i64) as usize)
+    *s = style.style_set_border_width(*s, (b as i64) as usize)
+    *s = style.style_set_alpha(*s, ((a * 255.0) as i64) as usize)
+}
+
+// Das Widget an seinen Platz setzen, um die Verschiebung des
+// Uebergangs versetzt. Getrennt von `trans_apply`, weil ein Aufrufer
+// mit eigenem Layout die Farbe uebernehmen, den Versatz aber selbst
+// rechnen will.
+fn trans_place(t: *mut Transition, e: *mut widget.Widget, x: f64, y: f64,
+    w: f64, h: f64) {
+    widget.w_place(e, x + trans_dx(t), y + trans_dy(t), w, h)
+}
+
+// ======================================================================
+// DAS REGISTER, DAS DER ZEICHENWEG SELBST FUEHRT
+// ======================================================================
+//
+// WARUM ES DAS GIBT. Alles ueber dieser Zeile rechnet richtig und
+// wartet darauf, dass jemand es ruft -- und bis zur Runde
+// FEHLERBEHEBUNG rief es genau ein Programm (demos/fuidemo). Damit
+// waere `anim.Transition` das geworden, wogegen diese Bibliothek
+// angetreten ist: eine Faehigkeit, die jede Anwendung sich selbst
+// zusammensetzt, und neunzehn von zwanzig setzen sie anders zusammen.
+//
+// Das Register haelt JE WIDGET EINEN UEBERGANG und wird von
+// `render.draw_button` bei jedem Bild angestossen. Ein Aufrufer
+// braucht dafuer zwei Zeilen:
+//
+//     var reg: anim.TransReg = anim.transreg_new()
+//     anim.transreg_bind(&reg, &ctx)
+//
+// Danach laeuft der Wechsel normal -> hover -> gedrueckt -> Fokus
+// jedes Knopfes ueber die Zeit, ohne dass die Anwendung davon etwas
+// weiss. `render.anim_run` gibt zurueck, ob das Bild veraltet ist --
+// daran haengt das bedarfsgesteuerte Neuzeichnen.
+//
+// DER SCHLUESSEL IST DIE ADRESSE DES WIDGETS. Das passt zu der Art,
+// wie fUi Widgets haelt (der Aufrufer besitzt ein Feld, das laenger
+// lebt als ein Bild -- widget.fi E1). Kurzlebige Bausteine auf dem
+// Stapel gehoeren deshalb NICHT hierher, und darum stoesst render.fi
+// das Register in `draw_button` an und nicht in `draw_base`; der
+// Grund steht dort ausgeschrieben.
+const TRANS_MAX: usize = 32
+
+struct TransReg {
+    k: [u64; 32],          // die Widgets, nach Adresse
+    // DER RUHESTIL DES WIDGETS, wie er beim ersten Bild aussah.
+    //
+    // `trans_apply` schreibt den Zwischenstand IN den Style des
+    // Widgets -- das ist der Grund, aus dem render.fi davon nichts
+    // wissen muss. Genau daraus folgt aber eine Falle, und sie hat
+    // beim ersten Versuch zugeschnappt: beim naechsten Bild holt
+    // `widget_target_bg` die ZIELfarbe wieder aus derselben Kaskade,
+    // und dort steht jetzt die gemischte Farbe von eben. Der
+    // Uebergang liefe dann auf seinen eigenen Zwischenstand zu und
+    // ruehrte sich nie vom Fleck (gemessen: der Knopf blieb auf
+    // 0x42414D stehen).
+    //
+    // Deshalb merkt sich das Register den Stil, den das Widget beim
+    // ersten Bild hatte, und setzt ihn vor jeder Frage nach den
+    // Zielwerten zurueck. WER DEN STIL EINES WIDGETS SPAETER AENDERT,
+    // sagt es mit `transreg_clear` -- sonst malt das Register weiter
+    // den alten.
+    b: [style.Style; 32],
+    t: [Transition; 32],
+    n: usize,
+    dur: i64,              // die Dauer, die ein neuer Eintrag bekommt
+    ease: Easing,
+    oklab: u32,
+    dirty: u32,            // hat im letzten Takt etwas gearbeitet?
+}
+
+// 120 ms und ease-out ist die Vorgabe, die Material und Fluent fuer
+// einen Zustandswechsel nennen: kurz genug, dass es nicht traege
+// wirkt, lang genug, dass das Auge die Bewegung sieht.
+fn transreg_new() -> TransReg {
+    return TransReg {
+        k: [0 as u64; 32],
+        b: [style.style_new(); 32],
+        t: [trans_new(0 as u32, 0.0, 0.0, 1.0); 32],
+        n: 0, dur: 120, ease: easing_named(EASE_OUT), oklab: 0,
+        dirty: 0,
+    }
+}
+
+fn transreg_count(r: *mut TransReg) -> usize { return (*r).n }
+
+// Alles vergessen. Danach wird jedes Widget beim naechsten Bild neu
+// aufgenommen -- mit dem Stil, den es DANN hat.
+fn transreg_clear(r: *mut TransReg) {
+    (*r).n = 0
+    (*r).dirty = 0
+}
+fn transreg_dirty(r: *mut TransReg) -> bool { return (*r).dirty != 0 }
+
+fn transreg_set_duration(r: *mut TransReg, ms: i64) {
+    if ms < 1 {
+        (*r).dur = 1
+    } else {
+        (*r).dur = ms
+    }
+}
+
+fn transreg_set_easing(r: *mut TransReg, e: Easing) { (*r).ease = e }
+
+fn transreg_set_oklab(r: *mut TransReg, an: bool) {
+    if an {
+        (*r).oklab = 1
+    } else {
+        (*r).oklab = 0
+    }
+}
+
+// WELCHE ELEMENTE EINEN UEBERGANG BEKOMMEN. Die, deren Flaechenfarbe
+// am Zustand haengt -- genau die Liste, die `render.def_bg_state`
+// fuehrt. Ein Etikett hat keinen Zustand, den man sehen koennte, und
+// ein Trennstrich erst recht nicht; fuer sie waere der Eintrag im
+// Register nur verbrauchter Platz.
+fn transreg_kind_ok(k: u32) -> bool {
+    return k == widget.KIND_BUTTON || k == widget.KIND_TOGGLE
+        || k == widget.KIND_TILE || k == widget.KIND_TAB
+        || k == widget.KIND_TEXTBOX
+}
+
+// Den Eintrag eines Widgets suchen. TRANS_MAX heisst "keiner".
+fn transreg_find(r: *mut TransReg, e: *mut widget.Widget) -> usize {
+    var i: usize = 0
+    while i < (*r).n {
+        if (*r).k[i] == (e as u64) {
+            return i
+        }
+        i = i + 1
+    }
+    return TRANS_MAX
+}
+
+// Den Eintrag holen und, wenn es ihn noch nicht gibt, anlegen -- auf
+// den WAHREN Werten des Widgets (`trans_force_widget`), damit der
+// erste Wechsel von dort losgeht, wo der Knopf steht, und nicht von
+// einem Schwarz.
+//
+// Ist das Register voll, kommt 0 zurueck. Das ist sichtbar und ehrlich:
+// der Knopf springt dann wie frueher, statt dass irgendwo Speicher
+// angefordert wird, den fUi nicht hat.
+fn transreg_index(r: *mut TransReg, c: *mut render.Ctx,
+    e: *mut widget.Widget, now_ms: i64) -> usize {
+    let i: usize = transreg_find(r, e)
+    if i < TRANS_MAX {
+        return i
+    }
+    if (*r).n >= TRANS_MAX {
+        return TRANS_MAX
+    }
+    let j: usize = (*r).n
+    (*r).n = j + 1
+    (*r).k[j] = e as u64
+    (*r).b[j] = *widget.w_style(e)
+    (*r).t[j] = trans_new(widget_target_bg(c, e, widget.w_state(e)),
+        widget_target_radius(c, e, widget.w_state(e)),
+        widget_target_border(c, e, widget.w_state(e)),
+        widget_target_alpha(c, e, widget.w_state(e)))
+    trans_set_duration(&(*r).t[j], (*r).dur)
+    trans_set_easing(&(*r).t[j], (*r).ease)
+    trans_set_oklab(&(*r).t[j], (*r).oklab != 0)
+    trans_force_widget(&(*r).t[j], c, e, now_ms)
+    return j
+}
+
+fn transreg_slot(r: *mut TransReg, c: *mut render.Ctx,
+    e: *mut widget.Widget, now_ms: i64) -> *mut Transition {
+    let i: usize = transreg_index(r, c, e, now_ms)
+    if i >= TRANS_MAX {
+        return 0 as *mut Transition
+    }
+    return &(*r).t[i]
+}
+
+// DIE FUNKTION, DIE render.fi RUFT. Die Zeiger kommen als Zahlen an,
+// weil render.fi diese Datei nicht kennen darf (der Grund steht dort
+// bei `Ctx`): anim.fi fragt render.fi nach den Zielwerten, also zeigt
+// die Abhaengigkeit in diese Richtung und nicht zurueck.
+//
+// Der Ablauf ist der eines Bildes: bei einem Zustandswechsel den Tween
+// neu ansetzen, auf die Uhrzeit rechnen, den Zwischenstand in den Style
+// zurueckschreiben. Zurueck kommt "das Bild ist veraltet".
+fn transreg_hook(reg: u64, cx: u64, wx: u64, now_ms: i64) -> bool {
+    if reg == 0 || cx == 0 || wx == 0 {
+        return false
+    }
+    let r: *mut TransReg = reg as *mut TransReg
+    let c: *mut render.Ctx = cx as *mut render.Ctx
+    let e: *mut widget.Widget = wx as *mut widget.Widget
+    if !transreg_kind_ok(widget.w_kind(e)) {
+        return false
+    }
+    let i: usize = transreg_index(r, c, e, now_ms)
+    if i >= TRANS_MAX {
+        return false
+    }
+    // Erst den Ruhestil zurueck, DANN nach den Zielwerten fragen --
+    // der Grund steht oben am Feld `b`.
+    *widget.w_style(e) = (*r).b[i]
+    let t: *mut Transition = &(*r).t[i]
+    // Der Wechsel setzt den Tween neu an; die Dauer des ZIELzustandes
+    // gilt, und die steht im Uebergang selbst.
+    var d: bool = trans_from_widget(t, c, e, now_ms)
+    if trans_tick(t, now_ms) {
+        d = true
+    }
+    trans_apply(t, e)
+    if d {
+        (*r).dirty = 1
+    }
+    return d
+}
+
+fn transreg_bind(r: *mut TransReg, c: *mut render.Ctx) {
+    render.ctx_bind_anim(c, r as u64, transreg_hook)
+}
+
+fn transreg_unbind(r: *mut TransReg, c: *mut render.Ctx) {
+    render.ctx_unbind_anim(c)
+}

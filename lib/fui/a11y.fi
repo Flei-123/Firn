@@ -1,0 +1,1336 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/a11y.fi -- DIE BARRIEREFREIHEIT.
+//
+// ===================================================== WARUM ES SIE GIBT
+//
+// Eine Oberflaeche, die nur gemalt ist, gibt es fuer einen Menschen,
+// der nicht sieht, gar nicht. Ein Vorleseprogramm liest keine
+// Bildpunkte; es fragt das Programm, WAS dasteht: "Knopf, Sichern",
+// "Ankreuzfeld, Zebrastreifen, angehakt", "Schieberegler, 62 Prozent".
+// Und wer nur mit der Tastatur arbeitet, braucht eine Reihenfolge, in
+// der Tab von Element zu Element geht, und einen Fokus, der nicht
+// hinter dem Rand einer Liste verschwindet.
+//
+// Das Web hat dafuer vier Begriffe, und genau diese vier bekommt fUi:
+//
+//     ROLLE     was ein Element ist (button, checkbox, slider, ...),
+//     NAME      wie es heisst,
+//     ZUSTAND   ob es angehakt, gesperrt, ausgeklappt ist, und sein Wert,
+//     FOKUS     ob und in welcher Reihenfolge man es mit Tab erreicht.
+//
+// Dazu kommt die Ausgabe des ganzen Baumes in EINER Textform, die man
+// vergleichen und pruefen kann -- und an die spaeter ein Vorleseprogramm
+// angeschlossen wird (siehe DIE UEBERGABE NACH AUSSEN weiter unten).
+//
+// ================================================ WAS HIER NICHT STEHT
+//
+// Dieses Modul BILDET AB UND FUEHRT BUCH. Es baut nichts nach, was es
+// schon gibt, und das ist der wichtigste Satz dieser Datei:
+//
+//     der Baum            lib/fui/scene.fi (Knoten, Kinder, Kennung)
+//     die Arten           lib/fui/widget.fi (KIND_*)
+//     Zustand und Wert    am widget.Widget jedes Knotens
+//     Wertebereich        wave2.VAL_MAX, wave2.CHECK_PARTIAL
+//     was Fokus nehmen    control.can_focus
+//       kann
+//     wer den Fokus hat   control.Panel -- und NUR dort
+//     das Nachrollen      viewport.viewport_ensure_visible
+//
+// Es gibt hier also keinen zweiten Baum und keine zweite
+// Fokusverwaltung. Was dieses Modul SELBST haelt, ist nur das, was es
+// an keinem anderen Ort gibt: die Angaben, die ein Aufrufer fuer die
+// Barrierefreiheit ausdruecklich macht (eine ueberschriebene Rolle, ein
+// ausdruecklicher Name, ein verbundenes Etikett, "ausgeklappt",
+// "schreibgeschuetzt") -- das Gegenstueck zu den aria-Attributen im
+// Web -- und die berechnete Tab-Reihenfolge, die es dem Panel leiht.
+//
+// ======================================================= DER AUFBAU
+//
+//     var ax: a11y.A11y = a11y.a11y_new()
+//     a11y.a11y_set_name(&ax, suchfeld, (&t[0]) as u64, 5)
+//     a11y.a11y_set_role(&ax, ueberschrift, a11y.ROLE_HEADING)
+//     let fehler: usize = a11y.a11y_unnamed(&sc, &ax)
+//     let n: usize = a11y.a11y_dump(&sc, &ax, puffer, laenge)
+//
+// Die Angaben haengen an der NUMMER eines Knotens (seinem Platz im
+// scene.Scene), so wie ein aria-Attribut an einem Element haengt. Wer
+// den Baum mit scene_reset neu aufbaut, baut auch diese Angaben mit
+// a11y_reset neu auf -- aus demselben Grund, aus dem ein neues Dokument
+// neue Attribute hat.
+export {
+    A11y, a11y_new, a11y_reset, a11y_limits_ok,
+    ROLE_NONE, ROLE_GENERIC, ROLE_TEXT, ROLE_BUTTON, ROLE_CHECKBOX,
+    ROLE_RADIO, ROLE_SWITCH, ROLE_SLIDER, ROLE_TEXTBOX, ROLE_PROGRESSBAR,
+    ROLE_COMBOBOX, ROLE_LIST, ROLE_LISTITEM, ROLE_TREE, ROLE_TREEITEM,
+    ROLE_TABLE, ROLE_ROW, ROLE_CELL, ROLE_TAB, ROLE_TABPANEL, ROLE_MENU,
+    ROLE_MENUITEM, ROLE_TOOLBAR, ROLE_SCROLLBAR, ROLE_SEPARATOR,
+    ROLE_GROUP, ROLE_HEADING, ROLE_LINK, ROLE_IMAGE, ROLE_TOOLTIP,
+    ROLE_STATUS, ROLE_COUNT,
+    role_of_kind, role_is_widget, role_names_from_content,
+    a11y_set_role, a11y_role,
+    NAME_NONE, NAME_EXPLICIT, NAME_OWN, NAME_LABELLED, NAME_CONTENT,
+    a11y_set_name, a11y_clear_name, a11y_set_labelled_by,
+    a11y_name, a11y_name_source, a11y_unnamed, a11y_widgets,
+    ST_FOCUSABLE, ST_FOCUSED, ST_DISABLED, ST_SELECTED, ST_CHECKED,
+    ST_MIXED, ST_PRESSED, ST_EXPANDED, ST_COLLAPSED, ST_READONLY,
+    EXP_NONE, EXP_COLLAPSED, EXP_EXPANDED,
+    a11y_set_expanded, a11y_set_readonly, a11y_set_toggle,
+    a11y_state, a11y_has_range, a11y_value, a11y_min, a11y_max,
+    a11y_pos, a11y_set_size,
+    a11y_focusable, a11y_order, a11y_order_len, a11y_order_at,
+    a11y_bind_panel, a11y_reveal, a11y_tab, a11y_focus_visible,
+    a11y_role_name, a11y_dump,
+}
+
+import fui.widget
+import fui.scene
+import fui.wave2
+import fui.control
+import fui.viewport
+
+// ======================================================= DIE GROESSE
+//
+// Eine Angabe je Knoten, also so viele Plaetze, wie ein Baum Knoten
+// traegt. Die Zahl steht als Ziffer im Feld, weil Firn an einer
+// Feldlaenge keinen Namen annimmt (derselbe Grund wie bei
+// scene.WORK_MAX); `a11y_limits_ok` haelt sie gegen scene.SCENE_MAX,
+// und die Pruefdatei ruft diese Klammer auf. Waechst der Baum und
+// diese Zahl nicht mit, faellt es dort auf -- und nicht erst an einem
+// Knopf, dessen Name hinter dem Feld steht.
+const A11Y_MAX: usize = 128
+
+// ======================================================= DIE ROLLEN
+//
+// Die Namen folgen den ARIA-Rollen, weil beide Gegenstellen, die
+// spaeter angeschlossen werden (AT-SPI unter Linux, UIA unter Windows),
+// fuer genau diese Rollen eine feste Entsprechung haben. Eine eigene
+// Erfindung muesste man dort zweimal uebersetzen.
+//
+// ROLE_NONE heisst "keine Rolle gesetzt" und ist darum die Vorgabe
+// einer Angabe; ein Knoten, der wirklich nichts ist, heisst
+// ROLE_GENERIC (im Web ein <div>). ROLE_TEXT ist reiner Text -- im Web
+// ein Textknoten, in AT-SPI ein "label".
+//
+// DIE NUMMERN SIND FEST. Wer eine Rolle ergaenzt, haengt sie hinten an
+// und erhoeht ROLE_COUNT; eine Rolle in der Mitte wuerde jede
+// gespeicherte Zahl verschieben.
+const ROLE_NONE: u32 = 0
+const ROLE_GENERIC: u32 = 1
+const ROLE_TEXT: u32 = 2
+const ROLE_BUTTON: u32 = 3
+const ROLE_CHECKBOX: u32 = 4
+const ROLE_RADIO: u32 = 5
+const ROLE_SWITCH: u32 = 6
+const ROLE_SLIDER: u32 = 7
+const ROLE_TEXTBOX: u32 = 8
+const ROLE_PROGRESSBAR: u32 = 9
+const ROLE_COMBOBOX: u32 = 10
+const ROLE_LIST: u32 = 11
+const ROLE_LISTITEM: u32 = 12
+const ROLE_TREE: u32 = 13
+const ROLE_TREEITEM: u32 = 14
+const ROLE_TABLE: u32 = 15
+const ROLE_ROW: u32 = 16
+const ROLE_CELL: u32 = 17
+const ROLE_TAB: u32 = 18
+const ROLE_TABPANEL: u32 = 19
+const ROLE_MENU: u32 = 20
+const ROLE_MENUITEM: u32 = 21
+const ROLE_TOOLBAR: u32 = 22
+const ROLE_SCROLLBAR: u32 = 23
+const ROLE_SEPARATOR: u32 = 24
+const ROLE_GROUP: u32 = 25
+const ROLE_HEADING: u32 = 26
+const ROLE_LINK: u32 = 27
+const ROLE_IMAGE: u32 = 28
+const ROLE_TOOLTIP: u32 = 29
+const ROLE_STATUS: u32 = 30
+const ROLE_COUNT: u32 = 31
+
+// ================================================= DIE ANGABEN
+//
+// Was ein Aufrufer fuer die Barrierefreiheit AUSDRUECKLICH sagt, je
+// Knoten. Alles andere (Art, Text, Wert, gesperrt, ausgewaehlt) steht
+// schon am Widget des Knotens und wird dort gelesen, nicht hierher
+// kopiert -- sonst gaebe es zwei Stellen, an denen "angehakt" steht,
+// und irgendwann saegten sie verschiedene Dinge.
+struct Ann {
+    // Die ueberschriebene Rolle, ROLE_NONE = die Art entscheidet.
+    role: u32,
+    // Der ausdrueckliche Name (aria-label). Der Text gehoert dem
+    // Aufrufer, wie jeder Text in fUi; hier steht nur der Zeiger.
+    np: u64,
+    nn: usize,
+    has_name: u32,
+    // Das verbundene Etikett (aria-labelledby): die KENNUNG eines
+    // Knotens im selben Baum, nicht seine Nummer. Eine Kennung ueberlebt
+    // den Neuaufbau eines Baumes, eine Nummer nicht.
+    lby: u32,
+    // Ausgeklappt: 0 = kann gar nicht klappen, 1 = zu, 2 = auf.
+    exp: u32,
+    // Schreibgeschuetzt (aria-readonly).
+    ro: u32,
+    // Ein Knopf, der einrastet (aria-pressed). Sein Zustand ist der WERT
+    // des Widgets, 0 = oben, sonst gedrueckt.
+    toggle: u32,
+}
+
+fn ann_blank() -> Ann {
+    return Ann { role: ROLE_NONE, np: 0, nn: 0, has_name: 0 as u32,
+        lby: 0 as u32, exp: 0 as u32, ro: 0 as u32, toggle: 0 as u32 }
+}
+
+struct A11y {
+    a: [Ann; 128],
+    // DIE TAB-REIHENFOLGE, als Nummern von Knoten. Sie wird hier
+    // berechnet (Baumreihenfolge, siehe unten) und dem control.Panel
+    // GELIEHEN -- das Panel bleibt der einzige Ort, der weiss, wer den
+    // Fokus hat.
+    ord: [usize; 128],
+    nord: usize,
+}
+
+fn a11y_new() -> A11y {
+    return A11y { a: [ann_blank(); 128], ord: [0; 128], nord: 0 }
+}
+
+fn a11y_reset(ax: *mut A11y) {
+    var i: usize = 0
+    while i < A11Y_MAX {
+        (*ax).a[i] = ann_blank()
+        i = i + 1
+    }
+    (*ax).nord = 0
+}
+
+// Passt die Zahl der Angaben zur Zahl der Knoten? Siehe A11Y_MAX.
+fn a11y_limits_ok() -> bool {
+    return A11Y_MAX >= scene.SCENE_MAX
+}
+
+// Ein Knoten, fuer den es keinen Platz gibt, hat keine Angaben -- er
+// wird nicht beschrieben, sondern uebergangen. Diese Klammer steht vor
+// jedem Zugriff.
+fn slot_ok(i: usize) -> bool {
+    return i < A11Y_MAX
+}
+
+// ================================================ DIE ART WIRD ZUR ROLLE
+//
+// DAS IST DIE EINE STELLE, AN DER EINE ART IHRE ROLLE BEKOMMT. Wer eine
+// Art in widget.fi ergaenzt, ergaenzt sie hier -- und die Pruefdatei
+// tools/fui/a11y_main.fi geht alle Arten durch, so dass eine vergessene
+// als ROLE_GENERIC auffaellt.
+//
+// Drei Entscheidungen, die man sonst sucht:
+//   * KIND_TOGGLE ist ein SCHALTER (switch), kein Knopf: er hat einen
+//     Zustand an/aus, und ein Vorleseprogramm sagt "Schalter, an".
+//   * KIND_TILE ist ein KNOPF: eine Kachel im Startmenue tut etwas,
+//     wenn man sie drueckt, und mehr muss man ueber sie nicht wissen.
+//   * KIND_CARD und KIND_GROUPBOX sind eine GRUPPE, KIND_BADGE ein
+//     STATUS (eine kurze Zahl, die sich aendert: "3 neue").
+fn role_of_kind(k: u32) -> u32 {
+    if k == widget.KIND_LABEL { return ROLE_TEXT }
+    if k == widget.KIND_BUTTON { return ROLE_BUTTON }
+    if k == widget.KIND_TOGGLE { return ROLE_SWITCH }
+    if k == widget.KIND_CHECKBOX { return ROLE_CHECKBOX }
+    if k == widget.KIND_RADIO { return ROLE_RADIO }
+    if k == widget.KIND_TEXTBOX { return ROLE_TEXTBOX }
+    if k == widget.KIND_SLIDER { return ROLE_SLIDER }
+    if k == widget.KIND_PROGRESS { return ROLE_PROGRESSBAR }
+    if k == widget.KIND_DROPDOWN { return ROLE_COMBOBOX }
+    if k == widget.KIND_LIST { return ROLE_LIST }
+    if k == widget.KIND_TAB { return ROLE_TAB }
+    if k == widget.KIND_TOOLBAR { return ROLE_TOOLBAR }
+    if k == widget.KIND_MENU { return ROLE_MENU }
+    if k == widget.KIND_SCROLLBAR { return ROLE_SCROLLBAR }
+    if k == widget.KIND_SEPARATOR { return ROLE_SEPARATOR }
+    if k == widget.KIND_GROUPBOX { return ROLE_GROUP }
+    if k == widget.KIND_TABLE { return ROLE_TABLE }
+    if k == widget.KIND_TREE { return ROLE_TREE }
+    if k == widget.KIND_TILE { return ROLE_BUTTON }
+    if k == widget.KIND_CARD { return ROLE_GROUP }
+    if k == widget.KIND_BADGE { return ROLE_STATUS }
+    if k == widget.KIND_TOOLTIP { return ROLE_TOOLTIP }
+    return ROLE_GENERIC
+}
+
+// WAS BEDIENBAR IST. Eine Rolle, mit der man etwas TUT -- druecken,
+// anhaken, schieben, schreiben, auswaehlen. Genau bei diesen Rollen ist
+// ein fehlender Name ein FEHLER (a11y_unnamed zaehlt ihn): ein
+// Vorleseprogramm sagt sonst "Knopf" und nichts weiter, und niemand
+// weiss, was er tut.
+//
+// Die Behaelter (list, tree, table, menu, toolbar, group) stehen NICHT
+// hier. Ihr Name ist nuetzlich, aber sie tun selbst nichts; ihre
+// Eintraege tun etwas, und die werden einzeln gefragt.
+fn role_is_widget(r: u32) -> bool {
+    return r == ROLE_BUTTON || r == ROLE_CHECKBOX || r == ROLE_RADIO
+        || r == ROLE_SWITCH || r == ROLE_SLIDER || r == ROLE_TEXTBOX
+        || r == ROLE_COMBOBOX || r == ROLE_TAB || r == ROLE_MENUITEM
+        || r == ROLE_LINK || r == ROLE_TREEITEM
+}
+
+// WELCHE ROLLEN IHREN NAMEN AUS IHREM INHALT NEHMEN DUERFEN -- die
+// Regel "name from content" aus der ARIA-Spezifikation. Ein Knopf heisst
+// wie der Text in ihm, eine Liste heisst NICHT wie der Text all ihrer
+// Eintraege (sonst saegte ein Vorleseprogramm beim Betreten einer Liste
+// alle achtundzwanzig Zeilen vor).
+//
+// Das Textfeld und das Klappfeld stehen ausdruecklich NICHT hier: ihr
+// Text ist ihr WERT, nicht ihr Name. Ein Suchfeld, das nur "Im Baum
+// suchen ..." enthaelt, verliert seinen Namen in dem Augenblick, in dem
+// jemand etwas hineinschreibt.
+fn role_names_from_content(r: u32) -> bool {
+    return r == ROLE_TEXT || r == ROLE_BUTTON || r == ROLE_CHECKBOX
+        || r == ROLE_RADIO || r == ROLE_SWITCH || r == ROLE_TAB
+        || r == ROLE_MENUITEM || r == ROLE_LISTITEM || r == ROLE_TREEITEM
+        || r == ROLE_ROW || r == ROLE_CELL || r == ROLE_LINK
+        || r == ROLE_HEADING || r == ROLE_TOOLTIP || r == ROLE_STATUS
+        || r == ROLE_SLIDER || r == ROLE_PROGRESSBAR
+}
+
+// Eine Rolle ueberschreiben -- das `role=` des Webs. Eine Ueberschrift
+// ist in fUi ein Text (N_TEXT), ein Verweis ein Knopf; beides sagt erst
+// diese Angabe. ROLE_NONE nimmt die Ueberschreibung wieder zurueck.
+fn a11y_set_role(ax: *mut A11y, i: usize, r: u32) {
+    if !slot_ok(i) || r >= ROLE_COUNT {
+        return
+    }
+    (*ax).a[i].role = r
+}
+
+// DIE ROLLE EINES KNOTENS, in dieser Reihenfolge:
+//
+//   1. die ueberschriebene Rolle (a11y_set_role),
+//   2. die Rolle aus der Art: bei einem Widget-Knoten die Art des
+//      Widgets, bei einem Text ROLE_TEXT (scene_add gibt ihm
+//      KIND_LABEL), bei einem Bild ROLE_IMAGE, sonst ROLE_GENERIC,
+//   3. und dann DER ZUSAMMENHANG: ein Knoten ohne eigene Rolle (text
+//      oder generic), der direkt in einer Liste steht, IST ein
+//      Listeneintrag -- wie ein <li> in einem <ul>. Dasselbe gilt fuer
+//      Baum -> treeitem, Menue -> menuitem, Tabelle -> row und
+//      row -> cell (auch fuer eine Zeile, die selbst erst aus dem
+//      Zusammenhang eine ist). Damit muss eine Liste aus achtundzwanzig Zeilen
+//      nicht achtundzwanzig Mal "listitem" sagen.
+//
+// Der Zusammenhang greift NUR bei Knoten ohne eigene Rolle: ein Knopf in
+// einer Liste bleibt ein Knopf.
+fn a11y_role(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
+    if i >= scene.scene_count(sc) {
+        return ROLE_NONE
+    }
+    if slot_ok(i) && (*ax).a[i].role != ROLE_NONE {
+        return (*ax).a[i].role
+    }
+    let eigen: u32 = own_role(sc, i)
+    if eigen != ROLE_TEXT && eigen != ROLE_GENERIC {
+        return eigen
+    }
+    let p: usize = scene.scene_parent(sc, i)
+    if p == scene.SCENE_NONE || p >= scene.scene_count(sc) {
+        return eigen
+    }
+    // Gefragt wird die VOLLE Rolle des Elternteils, samt dessen
+    // Zusammenhang: so wird in einer Tabelle ein Kasten zur Zeile und
+    // der Text darin zur Zelle, ohne dass jemand "row" hinschreibt. Eine
+    // Kette ohne Ende entsteht dabei nicht -- aus einer Zelle folgt
+    // nichts mehr, und jede Stufe geht genau einen Elternteil hinauf.
+    let pr: u32 = a11y_role(sc, ax, p)
+    if pr == ROLE_LIST { return ROLE_LISTITEM }
+    if pr == ROLE_TREE { return ROLE_TREEITEM }
+    if pr == ROLE_MENU { return ROLE_MENUITEM }
+    if pr == ROLE_TABLE { return ROLE_ROW }
+    if pr == ROLE_ROW { return ROLE_CELL }
+    return eigen
+}
+
+// Was die Art eines Knotens von sich aus ist.
+fn own_role(sc: *mut scene.Scene, i: usize) -> u32 {
+    let nk: u32 = scene.node_kind(sc, i)
+    if nk == scene.N_IMAGE || nk == scene.N_SVG {
+        return ROLE_IMAGE
+    }
+    return role_of_kind(widget.w_kind(scene.node_widget(sc, i)))
+}
+
+// ======================================================================
+// DER ZUGAENGLICHE NAME
+// ======================================================================
+//
+// DIE REIHENFOLGE, IN DER GESUCHT WIRD -- und die erste Quelle, die
+// etwas Lesbares liefert, gewinnt:
+//
+//   1. NAME_EXPLICIT  der ausdrueckliche Name (a11y_set_name, das
+//                     aria-label des Webs). Wer ihn setzt, meint es.
+//   2. NAME_OWN       die Beschriftung des Elements selbst -- der Text
+//                     am Widget. AUSSER beim Textfeld und beim
+//                     Klappfeld: dort ist der Text der WERT (siehe
+//                     `own_text_names`).
+//   3. NAME_LABELLED  der Text eines verbundenen Etiketts
+//                     (a11y_set_labelled_by), gefunden ueber seine
+//                     KENNUNG im Baum (scene.scene_find_id).
+//   4. NAME_CONTENT   der Text der Kinder, der Reihe nach -- aber nur
+//                     bei Rollen, die ihren Namen aus dem Inhalt nehmen
+//                     duerfen (role_names_from_content).
+//
+// "Lesbar" heisst: mindestens ein Zeichen, das kein Leerraum ist. Die
+// Texte in fUi stehen oft in Feldern fester Laenge und sind mit
+// Leerzeichen aufgefuellt ("Neu     "); ein Vorleseprogramm soll "Neu"
+// sagen und nicht fuenf Pausen machen. Darum wird Leerraum wie im Web
+// behandelt: vorn und hinten weg, innen zu EINEM Leerzeichen
+// zusammengezogen. Ein Name aus lauter Leerzeichen ist KEIN Name.
+//
+// FEHLT DER NAME BEI ETWAS BEDIENBAREM, IST DAS EIN FEHLER, der
+// gezaehlt wird (a11y_unnamed) -- und in der Ausgabe des Baumes steht
+// an genau diesem Element "!name". Still durchgehen darf es nicht.
+const NAME_NONE: u32 = 0
+const NAME_EXPLICIT: u32 = 1
+const NAME_OWN: u32 = 2
+const NAME_LABELLED: u32 = 3
+const NAME_CONTENT: u32 = 4
+
+// Wie tief die Suche im Inhalt hinabsteigt. Ein Baum ist ohnehin nicht
+// tiefer als die Kette des Stilblattes; die Schranke steht hier nur,
+// damit ein verdrehter Baum (ein Knoten, der sich selbst als Kind
+// fuehrt) die Suche nicht endlos macht.
+const DEPTH_MAX: usize = 32
+
+// ---------------------------------------------------------- DAS SCHREIBEN
+//
+// Namen und Baum werden in einen Puffer DES AUFRUFERS geschrieben --
+// wie jeder Text in fUi dem Aufrufer gehoert. `n` zaehlt dabei auch das,
+// was nicht mehr hineinpasst: wie bei snprintf erfaehrt der Aufrufer so,
+// wie gross sein Puffer haette sein muessen, statt eines abgeschnittenen
+// Namens ohne Meldung. Ein Puffer der Laenge 0 ist erlaubt; dann wird
+// nur gezaehlt.
+struct Out {
+    p: u64,
+    cap: usize,
+    n: usize,
+    // Wo der gerade geschriebene Name beginnt, ob noch ein Leerzeichen
+    // aussteht, und ob Anfuehrungszeichen maskiert werden (in der
+    // Ausgabe des Baumes steht der Name zwischen zweien).
+    start: usize,
+    pend: u32,
+    esc: u32,
+}
+
+fn out_new(p: u64, cap: usize) -> Out {
+    return Out { p: p, cap: cap, n: 0, start: 0, pend: 0 as u32,
+        esc: 0 as u32 }
+}
+
+fn put(o: *mut Out, b: u8) {
+    if (*o).p != 0 && (*o).n < (*o).cap {
+        *(((*o).p + (*o).n as u64) as *mut u8) = b
+    }
+    (*o).n = (*o).n + 1
+}
+
+// Ein Stueck Namen, mit dem Leerraum des Webs: Leerraum vorn faellt
+// weg, Leerraum innen wird zu einem Leerzeichen, und das erst, wenn
+// danach noch etwas Lesbares kommt -- dadurch faellt der Leerraum
+// hinten von selbst weg.
+fn put_text(o: *mut Out, p: u64, n: usize) {
+    if p == 0 {
+        return
+    }
+    var k: usize = 0
+    while k < n {
+        let b: u8 = *((p + k as u64) as *mut u8)
+        if b <= 32 as u8 {
+            if (*o).n > (*o).start {
+                (*o).pend = 1 as u32
+            }
+        } else {
+            if (*o).pend != 0 as u32 {
+                put(o, 32 as u8)
+                (*o).pend = 0 as u32
+            }
+            if (*o).esc != 0 as u32 && (b == 34 as u8 || b == 92 as u8) {
+                put(o, 92 as u8)
+            }
+            put(o, b)
+        }
+        k = k + 1
+    }
+}
+
+// Zwischen zwei Teilen eines zusammengesetzten Namens steht ein
+// Leerzeichen -- aber nur, wenn schon etwas dasteht.
+fn put_gap(o: *mut Out) {
+    if (*o).n > (*o).start {
+        (*o).pend = 1 as u32
+    }
+}
+
+// ------------------------------------------------------ DIE ANGABEN SETZEN
+
+// Der ausdrueckliche Name. Der Text bleibt beim Aufrufer.
+fn a11y_set_name(ax: *mut A11y, i: usize, p: u64, n: usize) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].np = p
+    (*ax).a[i].nn = n
+    (*ax).a[i].has_name = 1 as u32
+}
+
+fn a11y_clear_name(ax: *mut A11y, i: usize) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].np = 0
+    (*ax).a[i].nn = 0
+    (*ax).a[i].has_name = 0 as u32
+}
+
+// Das verbundene Etikett, ueber seine KENNUNG (scene.node_set_id). Die
+// Kennung 0 heisst in scene.fi "keine" und nimmt die Verbindung darum
+// zurueck.
+fn a11y_set_labelled_by(ax: *mut A11y, i: usize, id: u32) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].lby = id
+}
+
+// Ob der Text am Widget der NAME ist. Beim Textfeld und beim Klappfeld
+// ist er es nicht, sondern der Wert -- der Grund steht bei
+// role_names_from_content.
+fn own_text_names(r: u32) -> bool {
+    return r != ROLE_TEXTBOX && r != ROLE_COMBOBOX
+}
+
+// ---------------------------------------------------------- DIE SUCHE
+
+// Den Namen schreiben und seine Quelle nennen. Jede Quelle wird der
+// Reihe nach VERSUCHT: bleibt sie leer, wird der Puffer auf den Anfang
+// zurueckgesetzt und die naechste gefragt. So gibt es genau eine
+// Funktion, die weiss, was "der Name" ist -- a11y_name, a11y_name_source
+// und die Ausgabe des Baumes rufen alle diese.
+fn name_into(sc: *mut scene.Scene, ax: *mut A11y, i: usize,
+    o: *mut Out) -> u32 {
+    (*o).start = (*o).n
+    (*o).pend = 0 as u32
+    let anfang: usize = (*o).n
+    if i >= scene.scene_count(sc) {
+        return NAME_NONE
+    }
+    let r: u32 = a11y_role(sc, ax, i)
+    // 1. ausdruecklich
+    if slot_ok(i) && (*ax).a[i].has_name != 0 as u32 {
+        put_text(o, (*ax).a[i].np, (*ax).a[i].nn)
+        if (*o).n > anfang {
+            return NAME_EXPLICIT
+        }
+    }
+    // 2. die eigene Beschriftung
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    if own_text_names(r) {
+        put_text(o, widget.w_text(e), widget.w_text_len(e))
+        if (*o).n > anfang {
+            return NAME_OWN
+        }
+    }
+    // 3. das verbundene Etikett
+    if slot_ok(i) && (*ax).a[i].lby != 0 as u32 {
+        let j: usize = scene.scene_find_id(sc, (*ax).a[i].lby)
+        if j != scene.SCENE_NONE && j != i {
+            label_text(sc, ax, j, o, 0)
+            if (*o).n > anfang {
+                return NAME_LABELLED
+            }
+        }
+    }
+    // 4. der Inhalt
+    if role_names_from_content(r) {
+        kids_text(sc, ax, i, o, 0)
+        if (*o).n > anfang {
+            return NAME_CONTENT
+        }
+    }
+    (*o).n = anfang
+    (*o).pend = 0 as u32
+    return NAME_NONE
+}
+
+// DER TEXT EINES ETIKETTS -- oder eines Kindes, das zum Namen seines
+// Elternteils beitraegt. Wie im Web: hat es selbst einen ausdruecklichen
+// Namen, zaehlt der (und nur der); sonst sein eigener Text und danach
+// der seiner Kinder. Einem WEITEREN verbundenen Etikett wird hier nicht
+// gefolgt -- auch das ist die Regel des Webs, und sie verhindert, dass
+// zwei Etiketten, die aufeinander zeigen, sich endlos gegenseitig
+// vorlesen.
+fn label_text(sc: *mut scene.Scene, ax: *mut A11y, j: usize, o: *mut Out,
+    tiefe: usize) {
+    if j >= scene.scene_count(sc) || tiefe > DEPTH_MAX {
+        return
+    }
+    put_gap(o)
+    if slot_ok(j) && (*ax).a[j].has_name != 0 as u32 {
+        let vorher: usize = (*o).n
+        put_text(o, (*ax).a[j].np, (*ax).a[j].nn)
+        if (*o).n > vorher {
+            return
+        }
+    }
+    let e: *mut widget.Widget = scene.node_widget(sc, j)
+    put_text(o, widget.w_text(e), widget.w_text_len(e))
+    kids_text(sc, ax, j, o, tiefe + 1)
+}
+
+fn kids_text(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
+    tiefe: usize) {
+    if tiefe > DEPTH_MAX {
+        return
+    }
+    var k: usize = scene.scene_first_child(sc, i)
+    while k != scene.SCENE_NONE && k < scene.scene_count(sc) {
+        label_text(sc, ax, k, o, tiefe)
+        k = scene.scene_next_sibling(sc, k)
+    }
+}
+
+// DER NAME, in den Puffer `p` (Laenge `cap`) geschrieben. Zurueck kommt
+// die volle Laenge -- ist sie groesser als `cap`, war der Puffer zu
+// klein, und es steht nur der Anfang darin. 0 heisst: kein Name.
+fn a11y_name(sc: *mut scene.Scene, ax: *mut A11y, i: usize, p: u64,
+    cap: usize) -> usize {
+    var o: Out = out_new(p, cap)
+    name_into(sc, ax, i, &o)
+    return o.n
+}
+
+// WOHER DER NAME KOMMT (NAME_*). Gezaehlt, nicht geschrieben.
+fn a11y_name_source(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
+    var o: Out = out_new(0, 0)
+    return name_into(sc, ax, i, &o)
+}
+
+// WIE VIELE BEDIENBARE KNOTEN KEINEN NAMEN HABEN. Das ist die Zahl, die
+// null sein muss -- jede andere ist ein Knopf, von dem ein
+// Vorleseprogramm nur "Knopf" sagen kann.
+fn a11y_unnamed(sc: *mut scene.Scene, ax: *mut A11y) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if role_is_widget(a11y_role(sc, ax, i))
+            && a11y_name_source(sc, ax, i) == NAME_NONE {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Wie viele bedienbare Knoten der Baum ueberhaupt hat -- der Nenner zu
+// a11y_unnamed. Ohne ihn waere "0 ohne Namen" auch bei einem Baum ohne
+// ein einziges Bedienelement wahr.
+fn a11y_widgets(sc: *mut scene.Scene, ax: *mut A11y) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if role_is_widget(a11y_role(sc, ax, i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ======================================================================
+// DER ZUSTAND
+// ======================================================================
+//
+// Als BITS, aus demselben Grund wie in widget.fi: sie gelten
+// gleichzeitig. Ein Ankreuzfeld kann angehakt UND gesperrt UND
+// fokussiert sein.
+//
+// WOHER JEDES BIT KOMMT -- und dass es fast ueberall das Widget ist:
+//
+//     gesperrt            widget.w_is_disabled
+//     ausgewaehlt         widget.w_is_selected, aber nur bei Rollen, die
+//                         auswaehlbar sind (Reiter, Eintraege, Zeilen).
+//                         Ein angehaktes Ankreuzfeld setzt in control.fi
+//                         AUCH das Auswahlbit -- es ist trotzdem
+//                         "angehakt" und nicht "ausgewaehlt".
+//     angehakt / halb     der WERT: 1 = angehakt, wave2.CHECK_PARTIAL =
+//                         halb (der Strich). Dieselbe Zahl, die wave2
+//                         malt und control.fi beim Klick umschaltet.
+//     gedrueckt           der Wert eines EINRASTENDEN Knopfes
+//                         (a11y_set_toggle). Ein gewoehnlicher Knopf hat
+//                         keinen Zustand "gedrueckt" -- dass die Maus
+//                         gerade auf ihm liegt, ist kein Zustand, den ein
+//                         Vorleseprogramm sagt.
+//     ausgeklappt / zu    a11y_set_expanded -- das weiss nur der Aufrufer,
+//                         denn fUi klappt nichts selbst auf.
+//     schreibgeschuetzt   a11y_set_readonly, aus demselben Grund.
+//     fokussierbar/-iert  control.can_focus und das Fokusbit (Abschnitt
+//                         DIE FOKUSREIHENFOLGE).
+const ST_FOCUSABLE: u32 = 1
+const ST_FOCUSED: u32 = 2
+const ST_DISABLED: u32 = 4
+const ST_SELECTED: u32 = 8
+const ST_CHECKED: u32 = 16
+const ST_MIXED: u32 = 32
+const ST_PRESSED: u32 = 64
+const ST_EXPANDED: u32 = 128
+const ST_COLLAPSED: u32 = 256
+const ST_READONLY: u32 = 512
+
+const EXP_NONE: u32 = 0
+const EXP_COLLAPSED: u32 = 1
+const EXP_EXPANDED: u32 = 2
+
+fn a11y_set_expanded(ax: *mut A11y, i: usize, x: u32) {
+    if !slot_ok(i) || x > EXP_EXPANDED {
+        return
+    }
+    (*ax).a[i].exp = x
+}
+
+fn a11y_set_readonly(ax: *mut A11y, i: usize, an: bool) {
+    if !slot_ok(i) {
+        return
+    }
+    if an {
+        (*ax).a[i].ro = 1 as u32
+    } else {
+        (*ax).a[i].ro = 0 as u32
+    }
+}
+
+// Ein Knopf, der einrastet -- "Fett" in einer Werkzeugleiste. Sein
+// Zustand ist der Wert des Widgets; eine zweite Zahl dafuer gibt es
+// nicht.
+fn a11y_set_toggle(ax: *mut A11y, i: usize, an: bool) {
+    if !slot_ok(i) {
+        return
+    }
+    if an {
+        (*ax).a[i].toggle = 1 as u32
+    } else {
+        (*ax).a[i].toggle = 0 as u32
+    }
+}
+
+// Welche Rollen AUSGEWAEHLT sein koennen.
+fn role_selects(r: u32) -> bool {
+    return r == ROLE_TAB || r == ROLE_LISTITEM || r == ROLE_TREEITEM
+        || r == ROLE_ROW || r == ROLE_CELL || r == ROLE_MENUITEM
+}
+
+fn a11y_state(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
+    if i >= scene.scene_count(sc) {
+        return 0 as u32
+    }
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    let r: u32 = a11y_role(sc, ax, i)
+    let v: i64 = widget.w_value(e)
+    var st: u32 = focus_bits(sc, i)
+    if widget.w_is_disabled(e) {
+        st = st | ST_DISABLED
+    }
+    if role_selects(r) && widget.w_is_selected(e) {
+        st = st | ST_SELECTED
+    }
+    if r == ROLE_CHECKBOX {
+        if v == wave2.CHECK_PARTIAL {
+            st = st | ST_MIXED
+        } else if v != 0 {
+            st = st | ST_CHECKED
+        }
+    }
+    if (r == ROLE_RADIO || r == ROLE_SWITCH) && v != 0 {
+        st = st | ST_CHECKED
+    }
+    if slot_ok(i) {
+        let an: *mut Ann = &(*ax).a[i]
+        if (*an).toggle != 0 as u32 && v != 0 {
+            st = st | ST_PRESSED
+        }
+        if (*an).exp == EXP_EXPANDED {
+            st = st | ST_EXPANDED
+        }
+        if (*an).exp == EXP_COLLAPSED {
+            st = st | ST_COLLAPSED
+        }
+        if (*an).ro != 0 as u32 {
+            st = st | ST_READONLY
+        }
+    }
+    return st
+}
+
+// Die beiden Fokusbits. Was fokussierbar ist, sagt control.fi; wer den
+// Fokus HAT, das Fokusbit am Widget, das control.panel_set_focus setzt.
+fn focus_bits(sc: *mut scene.Scene, i: usize) -> u32 {
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    var st: u32 = 0 as u32
+    if control.can_focus(e) {
+        st = st | ST_FOCUSABLE
+    }
+    if widget.w_is_focus(e) {
+        st = st | ST_FOCUSED
+    }
+    return st
+}
+
+// ------------------------------------------------ WERT UND WERTEBEREICH
+//
+// Schieberegler, Fortschritt und Rollbalken haben einen Wert in einem
+// Bereich. Der Bereich ist 0 .. wave2.VAL_MAX (Promille) -- der Grund,
+// warum es tausend Stufen sind und nicht hundert, steht in control.fi,
+// und hier wird die Zahl nicht ein drittes Mal hingeschrieben. Ein
+// Vorleseprogramm rechnet daraus selbst "62 Prozent".
+fn a11y_has_range(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> bool {
+    let r: u32 = a11y_role(sc, ax, i)
+    return r == ROLE_SLIDER || r == ROLE_PROGRESSBAR || r == ROLE_SCROLLBAR
+}
+
+fn a11y_value(sc: *mut scene.Scene, i: usize) -> i64 {
+    if i >= scene.scene_count(sc) {
+        return 0
+    }
+    return widget.w_value(scene.node_widget(sc, i))
+}
+
+fn a11y_min() -> i64 { return 0 }
+fn a11y_max() -> i64 { return wave2.VAL_MAX }
+
+// ------------------------------------------------ DIE STELLE IN DER REIHE
+//
+// "Eintrag, 3 von 12". Gezaehlt wird unter den GESCHWISTERN mit
+// derselben Rolle -- wie das Web aria-posinset und aria-setsize selbst
+// ausrechnet, wenn niemand sie angibt. Ein Trenner zwischen zwei
+// Menueeintraegen zaehlt darum nicht mit.
+//
+// Nur fuer Rollen, die in einer Reihe stehen: Listen-, Baum- und
+// Menueeintrag, Reiter, Tabellenzeile. Zurueck kommt die Stelle ab 1,
+// oder 0, wenn der Knoten in keiner Reihe steht.
+fn role_in_set(r: u32) -> bool {
+    return r == ROLE_LISTITEM || r == ROLE_TREEITEM || r == ROLE_MENUITEM
+        || r == ROLE_TAB || r == ROLE_ROW
+}
+
+fn a11y_pos(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> usize {
+    if i >= scene.scene_count(sc) {
+        return 0
+    }
+    let r: u32 = a11y_role(sc, ax, i)
+    let p: usize = scene.scene_parent(sc, i)
+    if !role_in_set(r) || p == scene.SCENE_NONE {
+        return 0
+    }
+    var n: usize = 0
+    var k: usize = scene.scene_first_child(sc, p)
+    while k != scene.SCENE_NONE {
+        if a11y_role(sc, ax, k) == r {
+            n = n + 1
+        }
+        if k == i {
+            return n
+        }
+        k = scene.scene_next_sibling(sc, k)
+    }
+    return 0
+}
+
+fn a11y_set_size(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> usize {
+    if a11y_pos(sc, ax, i) == 0 {
+        return 0
+    }
+    let r: u32 = a11y_role(sc, ax, i)
+    var n: usize = 0
+    var k: usize = scene.scene_first_child(sc, scene.scene_parent(sc, i))
+    while k != scene.SCENE_NONE {
+        if a11y_role(sc, ax, k) == r {
+            n = n + 1
+        }
+        k = scene.scene_next_sibling(sc, k)
+    }
+    return n
+}
+
+// ======================================================================
+// DIE FOKUSREIHENFOLGE
+// ======================================================================
+//
+// DREI FRAGEN, UND KEINE DAVON WIRD HIER ZUM ZWEITEN MAL BEANTWORTET:
+//
+//   WAS kann den Fokus nehmen?     control.can_focus -- die Regel, nach
+//                                  der auch das Panel wandert. Ein Text,
+//                                  ein Trenner, ein Fortschritt, eine
+//                                  Karte nicht; alles Gesperrte nicht.
+//   WER hat ihn?                   control.Panel (panel_focus). Dieses
+//                                  Modul haelt keinen eigenen Zeiger
+//                                  darauf.
+//   WIE kommt er ins Bild?         viewport.viewport_ensure_visible.
+//
+// Was dieses Modul beitraegt, ist die REIHENFOLGE: die Baumreihenfolge
+// (Tiefe zuerst, Kinder in der Reihenfolge, in der sie angelegt wurden)
+// -- also die Lesereihenfolge, wie im Web ohne tabindex. Sie ist NICHT
+// die Reihenfolge des Feldes in scene.Scene: wer einem Kasten nach
+// dessen Nachbarn noch ein Kind anhaengt, hat dieses Kind im Feld
+// HINTER dem Nachbarn, im Baum aber davor. Ein Panel, das nach dem Feld
+// wanderte, sprange dann ueber den Nachbarn hinweg und wieder zurueck.
+//
+// In die Reihenfolge kommt jeder Knoten, dessen ART fokussierbar ist --
+// AUCH wenn er gerade gesperrt ist. Uebersprungen wird ein gesperrter
+// Knoten erst beim Wandern (control.key_tab_order fragt can_focus in
+// dem Augenblick). So muss niemand die Reihenfolge neu ausrechnen, weil
+// ein Knopf gesperrt oder wieder freigegeben wurde.
+
+// Kann dieser Knoten JETZT den Fokus nehmen?
+fn a11y_focusable(sc: *mut scene.Scene, i: usize) -> bool {
+    if i >= scene.scene_count(sc) {
+        return false
+    }
+    return control.can_focus(scene.node_widget(sc, i))
+}
+
+// Koennte er es, wenn er nicht gesperrt waere? Gefragt wird DIESELBE
+// Regel an einer Kopie des Widgets ohne Sperrbit -- eine eigene Liste
+// fokussierbarer Arten waere die zweite, und die erste bekaeme dann
+// eines Tages eine Art dazu, die zweite nicht.
+fn kind_focusable(sc: *mut scene.Scene, i: usize) -> bool {
+    var probe: widget.Widget = *scene.node_widget(sc, i)
+    widget.w_set_disabled(&probe, false)
+    return control.can_focus(&probe)
+}
+
+// DIE REIHENFOLGE AUSRECHNEN. Zurueck kommt, wie viele Knoten darin
+// stehen; gelesen wird sie mit a11y_order_at.
+fn a11y_order(sc: *mut scene.Scene, ax: *mut A11y) -> usize {
+    (*ax).nord = 0
+    let r: usize = scene.scene_root(sc)
+    if r != scene.SCENE_NONE {
+        order_walk(sc, ax, r, 0)
+    }
+    return (*ax).nord
+}
+
+fn order_walk(sc: *mut scene.Scene, ax: *mut A11y, i: usize, tiefe: usize) {
+    if i >= scene.scene_count(sc) || tiefe > DEPTH_MAX {
+        return
+    }
+    if kind_focusable(sc, i) && (*ax).nord < A11Y_MAX {
+        (*ax).ord[(*ax).nord] = i
+        (*ax).nord = (*ax).nord + 1
+    }
+    var k: usize = scene.scene_first_child(sc, i)
+    while k != scene.SCENE_NONE {
+        order_walk(sc, ax, k, tiefe + 1)
+        k = scene.scene_next_sibling(sc, k)
+    }
+}
+
+fn a11y_order_len(ax: *mut A11y) -> usize { return (*ax).nord }
+
+fn a11y_order_at(ax: *mut A11y, k: usize) -> usize {
+    if k >= (*ax).nord {
+        return scene.SCENE_NONE
+    }
+    return (*ax).ord[k]
+}
+
+// DAS PANEL AN DEN BAUM HAENGEN. Die Widgets eines Baumes liegen in
+// seinen Knoten, also einen Knoten auseinander -- der Abstand wird
+// GEMESSEN (Adresse von Knoten 1 minus Adresse von Knoten 0), nicht
+// hingeschrieben. Danach ist die Nummer eines Widgets im Panel die
+// Nummer seines Knotens im Baum, und control.panel_set_focus(p, i)
+// nimmt einen Knoten direkt.
+//
+// Die Reihenfolge wird dem Panel GELIEHEN: `ax` muss so lange leben wie
+// das Panel sie benutzt. Aendert sich der Baum, wird diese Funktion noch
+// einmal gerufen.
+//
+// FUER DIE TASTATUR. Den Zeiger fuehrt bei einem Baum scene.scene_hit
+// (es kennt Scheibenkasten und Stapelung); wer einen Klick in den Fokus
+// umsetzen will, ruft control.panel_set_focus mit dem Knoten, den
+// scene_hit liefert.
+fn a11y_bind_panel(ax: *mut A11y, pn: *mut control.Panel,
+    sc: *mut scene.Scene) {
+    a11y_order(sc, ax)
+    let a0: u64 = scene.scene_node(sc, 0) as u64
+    let a1: u64 = scene.scene_node(sc, 1) as u64
+    control.panel_attach_stride(pn, scene.node_widget(sc, 0) as u64,
+        scene.scene_count(sc), (a1 - a0) as usize)
+    control.panel_set_order(pn, (&(*ax).ord[0]) as u64, (*ax).nord)
+}
+
+// DEN FOKUS INS BILD HOLEN. Fuer jeden Scheibenkasten, in dem der Knoten
+// steckt, von innen nach aussen: das Rechteck in INHALTSKOORDINATEN
+// umrechnen und viewport_ensure_visible fragen. Im naechsten Kasten
+// nach aussen wird dann nicht mehr der Knoten, sondern der innere
+// Kasten hereingeholt -- der Knoten liegt ja jetzt in ihm.
+//
+// DAS POLSTER DES KASTENS ZAEHLT MIT. viewport.fi schneidet ein Polster
+// frueher ab, als der Kasten endet; ein Eintrag, der genau an die
+// Unterkante gerollt wird, laege sonst mit seiner letzten Zeile unter
+// dem Polsterstreifen, und sein Fokusring waere halb weg. Also wird das
+// Rechteck um das Polster vergroessert hereingeholt.
+//
+// DIE RECHTECKE STAMMEN AUS DEM LETZTEN scene_layout, und in ihnen
+// steckt die Rollposition von damals. Hat diese Funktion gerollt
+// (Rueckgabe wahr), stimmen sie nicht mehr -- der Aufrufer laesst
+// scene_layout noch einmal laufen, bevor er zeichnet oder wieder
+// fragt. Das ist dieselbe Regel wie nach jeder anderen Aenderung der
+// Rollposition (Rad, Taste, Balken).
+fn a11y_reveal(sc: *mut scene.Scene, i: usize) -> bool {
+    if i >= scene.scene_count(sc) {
+        return false
+    }
+    var rx: f64 = scene.node_x(sc, i)
+    var ry: f64 = scene.node_y(sc, i)
+    var rw: f64 = scene.node_w(sc, i)
+    var rh: f64 = scene.node_h(sc, i)
+    var gerollt: bool = false
+    var p: usize = scene.scene_parent(sc, i)
+    var tiefe: usize = 0
+    while p != scene.SCENE_NONE && p < scene.scene_count(sc)
+        && tiefe <= DEPTH_MAX {
+        if scene.node_kind(sc, p) == scene.N_VIEWPORT
+            && scene.node_viewport(sc, p) as u64 != 0 {
+            let v: *mut viewport.Viewport = scene.node_viewport(sc, p)
+            let pad: f64 = viewport.viewport_inset(v)
+            let cx: f64 = rx - viewport.viewport_content_x(v) - pad
+            let cy: f64 = ry - viewport.viewport_content_y(v) - pad
+            if viewport.viewport_ensure_visible(v, cx, cy, rw + 2.0 * pad,
+                rh + 2.0 * pad) {
+                gerollt = true
+            }
+            rx = scene.node_x(sc, p)
+            ry = scene.node_y(sc, p)
+            rw = scene.node_w(sc, p)
+            rh = scene.node_h(sc, p)
+        }
+        p = scene.scene_parent(sc, p)
+        tiefe = tiefe + 1
+    }
+    return gerollt
+}
+
+// TAB UND UMSCHALT+TAB AUF EINEM BAUM. Gewandert wird im Panel
+// (control.key_tab), und danach wird der neue Fokus ins Bild geholt.
+// Zurueck kommen die Bits von control.fi, bei einem Rollen zusaetzlich
+// CH_REPAINT; `gerollt` sagt dem Aufrufer, dass er scene_layout neu
+// laufen lassen muss (siehe a11y_reveal).
+fn a11y_tab(pn: *mut control.Panel, sc: *mut scene.Scene, backwards: bool,
+    gerollt: *mut bool) -> u32 {
+    var ch: u32 = control.key_tab(pn, backwards)
+    *gerollt = false
+    let f: usize = control.panel_focus(pn)
+    if f != control.NOBODY && f < scene.scene_count(sc) {
+        if a11y_reveal(sc, f) {
+            *gerollt = true
+            ch = ch | control.CH_REPAINT
+        }
+    }
+    return ch
+}
+
+// ZEIGT DIESES ELEMENT SEINEN FOKUS SICHTBAR? Die Frage aus WCAG 2.4.7,
+// so weit sie sich ohne Leinwand beantworten laesst:
+//
+//   1. es HAT den Fokus und ist nicht gesperrt -- genau die Bedingung,
+//      unter der render.draw_focus_ring den Ring malt;
+//   2. es hat eine Flaeche (ein Ring um null Punkte ist keiner);
+//   3. es liegt GANZ im sichtbaren Teil jedes Scheibenkastens um es
+//      herum, das Polster eingerechnet. Ein Ring, der halb unter dem
+//      Rand einer Liste steckt, ist kein sichtbarer Fokus.
+//
+// Wie der Ring aussieht (Farbe, Dicke), steht in render.fi und
+// theme.fi und wird dort am Bildpunkt geprueft (tools/fui/run.sh
+// Abschnitt 6); das fragt diese Funktion nicht noch einmal.
+// Wie bei a11y_reveal gelten die Rechtecke des letzten scene_layout.
+fn a11y_focus_visible(sc: *mut scene.Scene, i: usize) -> bool {
+    if i >= scene.scene_count(sc) {
+        return false
+    }
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    if !widget.w_is_focus(e) || widget.w_is_disabled(e) {
+        return false
+    }
+    let rw: f64 = scene.node_w(sc, i)
+    let rh: f64 = scene.node_h(sc, i)
+    if rw <= 0.0 || rh <= 0.0 {
+        return false
+    }
+    var rx: f64 = scene.node_x(sc, i)
+    var ry: f64 = scene.node_y(sc, i)
+    var p: usize = scene.scene_parent(sc, i)
+    var tiefe: usize = 0
+    while p != scene.SCENE_NONE && p < scene.scene_count(sc)
+        && tiefe <= DEPTH_MAX {
+        if scene.node_kind(sc, p) == scene.N_VIEWPORT
+            && scene.node_viewport(sc, p) as u64 != 0 {
+            let v: *mut viewport.Viewport = scene.node_viewport(sc, p)
+            let pad: f64 = viewport.viewport_inset(v)
+            let cx: f64 = rx - viewport.viewport_content_x(v)
+            let cy: f64 = ry - viewport.viewport_content_y(v)
+            let ox: f64 = viewport.viewport_off_x(v)
+            let oy: f64 = viewport.viewport_off_y(v)
+            if cx < ox + pad || cy < oy + pad
+                || cx + rw > ox + viewport.viewport_inner_w(v) - pad
+                || cy + rh > oy + viewport.viewport_inner_h(v) - pad {
+                return false
+            }
+        }
+        p = scene.scene_parent(sc, p)
+        tiefe = tiefe + 1
+    }
+    return true
+}
+
+// ======================================================================
+// DER BAUM NACH AUSSEN
+// ======================================================================
+//
+// EINE TEXTFORM, ZEILE FUER ZEILE. Jeder Knoten des Baumes eine Zeile,
+// um zwei Leerzeichen je Ebene eingerueckt, in der Baumreihenfolge:
+//
+//     group "Einstellungen" @20,168 600x240
+//       checkbox "Zebrastreifen" focusable checked @40,200 150x30
+//       slider "Rollgeschwindigkeit" focusable value=620 range=0..1000 @40,270 540x30
+//       textbox !name focusable value="Im Baum suchen ..." @...
+//       list @...
+//         listitem "Eintrag 07" pos=7/28 @...
+//
+// Der Reihe nach: die ROLLE; der NAME in Anfuehrungszeichen, oder
+// "!name", wo ein bedienbares Element keinen hat (dieselbe Zahl, die
+// a11y_unnamed zaehlt, steht so im Text an der Stelle, wo sie entsteht);
+// die ZUSTAENDE in fester Reihenfolge; der WERT (Zahl und Bereich bei
+// Schieber/Fortschritt/Rollbalken, der Text bei Textfeld/Klappfeld);
+// die STELLE in der Reihe; das RECHTECK in ganzen Punkten.
+//
+// Warum Text und kein Feld von Strukturen: diese Form laesst sich
+// VERGLEICHEN. Die Pruefdatei haelt sie Zeile fuer Zeile gegen eine von
+// Hand geschriebene Erwartung, und ein Unterschied ist sofort lesbar --
+// "checked" fehlt, der Name heisst anders. Jede andere Form braeuchte
+// erst ein Programm, um sie anzusehen.
+//
+// ======================================== DIE UEBERGABE NACH AUSSEN
+//
+// Hier endet dieses Modul absichtlich. Ein Vorleseprogramm spricht
+// unter Linux AT-SPI (ueber D-Bus), unter Windows UI Automation (UIA)
+// -- beides wird HIER NICHT gebaut. Gedacht ist die Anbindung so:
+//
+//   * Eine BRUECKE je System (etwa lib/fui/a11y_atspi.fi), die NUR ueber
+//     die Fragen dieses Moduls liest: den Baum ueber scene_root /
+//     scene_first_child / scene_next_sibling, je Knoten a11y_role,
+//     a11y_name, a11y_state, a11y_value/a11y_min/a11y_max, a11y_pos /
+//     a11y_set_size und das Rechteck (scene.node_x/y/w/h). Sie haelt
+//     keine eigene Kopie der Angaben -- sie uebersetzt.
+//   * Die ROLLEN sind ARIA-Namen, weil beide Systeme dafuer eine feste
+//     Tafel haben: AT-SPI button -> ROLE_PUSH_BUTTON, checkbox ->
+//     ROLE_CHECK_BOX, switch -> ROLE_SWITCH, textbox -> ROLE_ENTRY,
+//     slider -> ROLE_SLIDER, listitem -> ROLE_LIST_ITEM ...; UIA
+//     button -> UIA_ButtonControlTypeId, checkbox -> CheckBox, textbox
+//     -> Edit, combobox -> ComboBox, slider -> Slider ...
+//   * Die ZUSTAENDE werden zu den Zustandsmengen des Systems (AT-SPI
+//     StateSet: FOCUSABLE, FOCUSED, SENSITIVE = nicht gesperrt,
+//     CHECKED, INDETERMINATE, PRESSED, EXPANDABLE/EXPANDED, READ_ONLY,
+//     SELECTED) bzw. zu den UIA-Mustern (Toggle, ExpandCollapse,
+//     RangeValue, SelectionItem, Value).
+//   * Die EREIGNISSE kommen schon heute aus control.fi: CH_FOCUS ist
+//     "focus changed" (AT-SPI object:state-changed:focused, UIA
+//     AutomationFocusChanged), CH_VALUE ist "value changed". Ein neu
+//     aufgebauter Baum ist "children changed".
+//   * DIESE TEXTFORM IST DAS ORAKEL DER BRUECKE: was sie nach aussen
+//     meldet, muss Zeile fuer Zeile mit a11y_dump uebereinstimmen. So
+//     wird die Bruecke pruefbar, ohne dass in der Pruefung ein D-Bus
+//     laeuft.
+
+// Die Namen der Rollen, je zwoelf Zeichen breit in EINER Kette. Die
+// Stelle einer Rolle ist ihre Nummer mal zwoelf; das Ende ihres Namens
+// ist das erste Leerzeichen.
+fn put_role(o: *mut Out, r: u32) {
+    var t: [u8; 372] = "none        generic     text        button      checkbox    radio       switch      slider      textbox     progressbar combobox    list        listitem    tree        treeitem    table       row         cell        tab         tabpanel    menu        menuitem    toolbar     scrollbar   separator   group       heading     link        image       tooltip     status      "
+    var q: u32 = r
+    if q >= ROLE_COUNT {
+        q = ROLE_NONE
+    }
+    let a: usize = (q as usize) * 12
+    var k: usize = 0
+    while k < 12 && t[a + k] != 32 as u8 {
+        put(o, t[a + k])
+        k = k + 1
+    }
+}
+
+// Der Name einer Rolle, in einen Puffer des Aufrufers. Zurueck kommt
+// die Laenge.
+fn a11y_role_name(r: u32, p: u64, cap: usize) -> usize {
+    var o: Out = out_new(p, cap)
+    put_role(&o, r)
+    return o.n
+}
+
+// Bytes unveraendert, ohne die Leerraumregel der Namen.
+fn put_raw(o: *mut Out, p: u64, n: usize) {
+    var k: usize = 0
+    while k < n {
+        put(o, *((p + k as u64) as *mut u8))
+        k = k + 1
+    }
+}
+
+fn put_dec(o: *mut Out, v: i64) {
+    if v < 0 {
+        put(o, 45 as u8)
+        put_dec(o, 0 - v)
+        return
+    }
+    if v >= 10 {
+        put_dec(o, v / 10)
+    }
+    put(o, (48 + v % 10) as u8)
+}
+
+fn put_flags(o: *mut Out, st: u32) {
+    if (st & ST_FOCUSABLE) != 0 as u32 {
+        var f0: [u8; 10] = " focusable"
+        put_raw(o, (&f0[0]) as u64, 10)
+    }
+    if (st & ST_FOCUSED) != 0 as u32 {
+        var f1: [u8; 8] = " focused"
+        put_raw(o, (&f1[0]) as u64, 8)
+    }
+    if (st & ST_DISABLED) != 0 as u32 {
+        var f2: [u8; 9] = " disabled"
+        put_raw(o, (&f2[0]) as u64, 9)
+    }
+    if (st & ST_SELECTED) != 0 as u32 {
+        var f3: [u8; 9] = " selected"
+        put_raw(o, (&f3[0]) as u64, 9)
+    }
+    if (st & ST_CHECKED) != 0 as u32 {
+        var f4: [u8; 8] = " checked"
+        put_raw(o, (&f4[0]) as u64, 8)
+    }
+    if (st & ST_MIXED) != 0 as u32 {
+        var f5: [u8; 6] = " mixed"
+        put_raw(o, (&f5[0]) as u64, 6)
+    }
+    if (st & ST_PRESSED) != 0 as u32 {
+        var f6: [u8; 8] = " pressed"
+        put_raw(o, (&f6[0]) as u64, 8)
+    }
+    if (st & ST_EXPANDED) != 0 as u32 {
+        var f7: [u8; 9] = " expanded"
+        put_raw(o, (&f7[0]) as u64, 9)
+    }
+    if (st & ST_COLLAPSED) != 0 as u32 {
+        var f8: [u8; 10] = " collapsed"
+        put_raw(o, (&f8[0]) as u64, 10)
+    }
+    if (st & ST_READONLY) != 0 as u32 {
+        var f9: [u8; 9] = " readonly"
+        put_raw(o, (&f9[0]) as u64, 9)
+    }
+}
+
+// Eine Zeile fuer einen Knoten, danach seine Kinder.
+fn dump_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
+    tiefe: usize) {
+    if i >= scene.scene_count(sc) || tiefe > DEPTH_MAX {
+        return
+    }
+    var k: usize = 0
+    while k < tiefe {
+        put(o, 32 as u8)
+        put(o, 32 as u8)
+        k = k + 1
+    }
+    let r: u32 = a11y_role(sc, ax, i)
+    put_role(o, r)
+    // Der Name, maskiert, damit ein Anfuehrungszeichen im Namen die
+    // Zeile nicht zerbricht.
+    put(o, 32 as u8)
+    put(o, 34 as u8)
+    let vor: usize = (*o).n
+    (*o).esc = 1 as u32
+    let q: u32 = name_into(sc, ax, i, o)
+    (*o).esc = 0 as u32
+    if q == NAME_NONE {
+        // Nichts geschrieben: die beiden Zeichen " und das Leerzeichen
+        // wieder zuruecknehmen.
+        (*o).n = vor - 2
+        if role_is_widget(r) {
+            var fehlt: [u8; 6] = " !name"
+            put_raw(o, (&fehlt[0]) as u64, 6)
+        }
+    } else {
+        put(o, 34 as u8)
+    }
+    put_flags(o, a11y_state(sc, ax, i))
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    if a11y_has_range(sc, ax, i) {
+        var wv: [u8; 7] = " value="
+        put_raw(o, (&wv[0]) as u64, 7)
+        put_dec(o, a11y_value(sc, i))
+        var wr: [u8; 7] = " range="
+        put_raw(o, (&wr[0]) as u64, 7)
+        put_dec(o, a11y_min())
+        put(o, 46 as u8)
+        put(o, 46 as u8)
+        put_dec(o, a11y_max())
+    }
+    if !own_text_names(r) {
+        // Textfeld und Klappfeld: ihr Text ist der WERT.
+        var tv: [u8; 7] = " value="
+        let vor2: usize = (*o).n
+        put_raw(o, (&tv[0]) as u64, 7)
+        put(o, 34 as u8)
+        (*o).start = (*o).n
+        (*o).pend = 0 as u32
+        (*o).esc = 1 as u32
+        put_text(o, widget.w_text(e), widget.w_text_len(e))
+        (*o).esc = 0 as u32
+        if (*o).n == vor2 + 8 {
+            (*o).n = vor2
+        } else {
+            put(o, 34 as u8)
+        }
+    }
+    let pos: usize = a11y_pos(sc, ax, i)
+    if pos > 0 {
+        var wp: [u8; 5] = " pos="
+        put_raw(o, (&wp[0]) as u64, 5)
+        put_dec(o, pos as i64)
+        put(o, 47 as u8)
+        put_dec(o, a11y_set_size(sc, ax, i) as i64)
+    }
+    put(o, 32 as u8)
+    put(o, 64 as u8)
+    put_dec(o, scene.node_x(sc, i) as i64)
+    put(o, 44 as u8)
+    put_dec(o, scene.node_y(sc, i) as i64)
+    put(o, 32 as u8)
+    put_dec(o, scene.node_w(sc, i) as i64)
+    put(o, 120 as u8)
+    put_dec(o, scene.node_h(sc, i) as i64)
+    put(o, 10 as u8)
+    var c: usize = scene.scene_first_child(sc, i)
+    while c != scene.SCENE_NONE {
+        dump_node(sc, ax, c, o, tiefe + 1)
+        c = scene.scene_next_sibling(sc, c)
+    }
+}
+
+// DEN GANZEN BAUM AUSGEBEN, in den Puffer `p` der Laenge `cap`. Zurueck
+// kommt die volle Laenge; ist sie groesser als `cap`, war der Puffer zu
+// klein (es steht dann nur der Anfang darin), und der Aufrufer weiss,
+// wie viel er braucht.
+fn a11y_dump(sc: *mut scene.Scene, ax: *mut A11y, p: u64,
+    cap: usize) -> usize {
+    var o: Out = out_new(p, cap)
+    let r: usize = scene.scene_root(sc)
+    if r != scene.SCENE_NONE {
+        dump_node(sc, ax, r, &o, 0)
+    }
+    return o.n
+}

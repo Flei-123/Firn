@@ -10,11 +10,18 @@ mod ast;
 mod ast_canon;
 mod layout_canon;
 mod atomic;
+mod fsqrt;
+mod fbits;
+mod fnaddr;
+mod ptrarith;
+mod wrapcast;
+mod include;
 mod thread;
 mod testrun;
 mod attrs;
 mod codegen_a64;
 mod codegen_switch;
+mod codegen_wasm;
 mod codegen_x86;
 mod comptime;
 mod env;
@@ -76,6 +83,9 @@ mod strtype;
 mod syscalls;
 mod target;
 mod types;
+mod wasm_cfg;
+mod wasm_enc;
+mod wasm_rt;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -217,8 +227,10 @@ fn usage() -> String {
          --lsp              language server over standard input/output\n  \
          -c, --object       only assemble: ELF object file, no ld\n  \
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
-         --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)
-  --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
+         --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
+                              | wasm32-browser (a .wasm module, round WASM)\n  \
+         --pic              position independent (shared library, round MOBIL)\n  \
+         --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -338,6 +350,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             // ROUND 80: the second machine. Without this option nothing
             // changes -- `target::active()` answers `x86_64-linux` and every
             // path below is the one that has always been walked.
+            // ROUND MOBIL (Certus): position independent code for a
+            // shared library. Without the flag every output stays
+            // character for character what it was.
+            "--pic" => target::pic_set(true),
             _ if a.starts_with("--target=") => {
                 if let Err(e) = target::flag_set(&a["--target=".len()..]) {
                     return Err(e);
@@ -964,9 +980,15 @@ fn run(opts: &Options) -> i32 {
         eprintln!("error: {}", e);
         return 1;
     }
+    // ROUND WASM: the third target writes no assembler text. Its module is
+    // finished in memory, so it leaves the pipeline here, before `as`/`ld`.
+    if target::active().is_wasm() {
+        return emit_wasm(opts, &module, path, target_out_manifest, &mut tm);
+    }
     let emitted = match target::active() {
         target::Target::X86_64 => codegen_x86::emit(&module),
         target::Target::Aarch64 => codegen_a64::emit(&module),
+        target::Target::Wasm32Browser => unreachable!("handled above"),
     };
     let asm = match emitted {
         Ok(a) => a,
@@ -1053,6 +1075,61 @@ fn run(opts: &Options) -> i32 {
             }
         }
     }
+    0
+}
+
+/// **ROUND WASM** — the end of the pipeline for `--target=wasm32-browser`.
+///
+/// `codegen_wasm::emit` hands back the finished binary module and its text
+/// form. `--emit=asm` writes the text (the same role the assembler listing
+/// plays for the two machines); everything else writes the `.wasm`. There
+/// is no object file and no linker step: one Firn program is one module.
+fn emit_wasm(
+    opts: &Options,
+    module: &fir::Module,
+    path: &Path,
+    target_out_manifest: Option<PathBuf>,
+    tm: &mut Timings,
+) -> i32 {
+    if opts.test_mode {
+        eprintln!("error: --test builds and runs a native test binary; with --target=wasm32-browser build the module and run it under a host (tools/wasm/run.mjs)");
+        return 2;
+    }
+    if opts.only_object {
+        eprintln!("error: --target=wasm32-browser has no object files: one program is one module (leave out -c)");
+        return 2;
+    }
+    let out = match codegen_wasm::emit(module) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    tm.mark("codegen");
+    if opts.stats {
+        eprintln!(
+            "wasm32:     {} functions, {} of them through the dispatch loop (irreducible), {} octets",
+            out.funcs,
+            out.dispatch_funcs,
+            out.binary.len()
+        );
+    }
+    let target = opts.output.clone().or(target_out_manifest).unwrap_or_else(|| {
+        let d = default_output(path);
+        if opts.emit == Emit::Asm {
+            d.with_extension("wat")
+        } else {
+            d.with_extension("wasm")
+        }
+    });
+    let bytes: &[u8] = if opts.emit == Emit::Asm { out.text.as_bytes() } else { &out.binary };
+    if let Err(e) = std::fs::write(&target, bytes) {
+        eprintln!("error: cannot write '{}': {}", target.display(), e);
+        return 2;
+    }
+    tm.mark("write .wasm");
+    tm.print();
     0
 }
 

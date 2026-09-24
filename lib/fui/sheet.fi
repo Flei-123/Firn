@@ -1,0 +1,787 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/sheet.fi -- DAS STILBLATT: AUSWAHL -> STILWERTE.
+//
+// ===================================================== WARUM ES SIE GIBT
+//
+// Bis hierher trug JEDES Widget seinen Stil selbst: wer zwanzig Knoepfe
+// gleich aussehen lassen wollte, rief zwanzigmal `style_set_bg`. Das ist
+// der Zustand, in dem HTML vor CSS war, und er hat genau die Folge, die
+// er dort hatte: das einundzwanzigste Element sieht anders aus, weil
+// jemand eine Zeile vergessen hat.
+//
+// Dieses Modul dreht die Richtung um. Man schreibt EINMAL eine Regel
+//
+//     "alles mit der Klasse `knopf` bekommt diesen Grund"
+//
+// und jeder Knoten, auf den die Auswahl passt, holt sich den Wert selbst.
+//
+// ================================================ WAS HIER NICHT STEHT
+//
+// 1. KEIN CSS-LESER. Das Blatt wird IM QUELLTEXT gebaut (`sheet_add`).
+//    Einen Text-Parser fuer CSS hat lib/browser bereits; ein zweiter
+//    waere der zweite Ort fuer dieselbe Sache, und der ist in diesem
+//    Baum ausdruecklich verboten.
+// 2. KEIN ZWEITER SATZ STILWERTE. Ein `Decl` traegt eine
+//    `style.Style` -- dieselbe, die jedes Widget schon hat, samt ihrer
+//    `set_mask`. Damit ist "dieser Wert ist gesetzt" an EINER Stelle
+//    erklaert, und die Regel "spaetere Regel gewinnt" ist nichts
+//    weiter als das Ueberschreiben von Feldern, deren Bit gesetzt ist.
+// 3. KEINE ZEIT UND KEINE MATRIX. `transition` und `transform` sind hier
+//    nur WERTE. Was daraus wird, rechnet lib/fui/anim.fi bzw.
+//    lib/fui/transform.fi -- dieses Modul reicht die Zahlen durch.
+// 4. KEIN BAUM. Dieses Modul kennt keinen Knoten und kein Kind. Es
+//    bekommt eine KETTE aus `NodeDesc` (Wurzel zuerst, der Knoten
+//    selbst zuletzt) und beantwortet daraus die Frage "welche Werte
+//    gelten". Der Baum steht in lib/fui/scene.fi, und die Abhaengigkeit
+//    zeigt nur in eine Richtung: scene -> sheet.
+//
+// ==================================================== DIE RANGFOLGE
+//
+// Wie in CSS, und aus demselben Grund: es muss AUSRECHENBAR sein, welche
+// von zwei widersprechenden Regeln gilt -- nicht "die, die zufaellig
+// zuletzt lief".
+//
+//     Kennung (id)              zaehlt 10000
+//     Klasse und Zustand        zaehlt   100
+//     Art (kind)                zaehlt     1
+//
+// Die Teile eines Vorfahren ("Klasse A innerhalb von Klasse B") zaehlen
+// MIT -- eine verschachtelte Auswahl ist spezifischer als dieselbe
+// Auswahl ohne Vorfahr. Bei gleichem Rang gewinnt die SPAETER
+// geschriebene Regel; darum traegt jede Regel ihre laufende Nummer.
+//
+// ===================================================== DIE VERERBUNG
+//
+// Ein Kind erbt vom Elternteil GENAU FUENF Werte: Schriftfamilie
+// (`SF_FONT_ID`), Schriftgroesse (`SF_FONT_PX`), Schriftfarbe (`SF_FG`),
+// Zeilenhoehe (`SF_LINE_HEIGHT`) und Schreibrichtung (`SF_DIRECTION`,
+// seit dem 23.09.2026) -- und nur dann, wenn es selbst
+// nichts dazu sagt. Alles andere erbt NICHT: ein Grund, der sich
+// vererbt, malt jede Schachtel eines Kastens noch einmal aus, und der
+// Rand des Elternteils saesse um jedes Kind herum. Das ist dieselbe
+// Grenze, die CSS zieht.
+export {
+    // --- Namen
+    sheet_name,
+    // --- Auswahl
+    Sel, sel_any, sel_kind, sel_id, sel_class,
+    sel_with_class, sel_with_state, sel_within_class,
+    sel_within_kind, sel_within_id,
+    sel_specificity, sel_class_overflow,
+    KIND_ANY, ID_ANY, STATE_ANY, SEL_CLASS_MAX,
+    // --- Werte
+    Decl, decl_new, decl_style, decl_set_style,
+    decl_set_transition, decl_transition_ms, decl_transition_ease,
+    decl_set_translate, decl_set_scale, decl_set_rotate,
+    decl_tx, decl_ty, decl_sx, decl_sy, decl_rot,
+    decl_has, decl_merge, decl_inherit,
+    EX_TRANSITION, EX_TRANSLATE, EX_SCALE, EX_ROTATE,
+    INHERIT_MASK, sheet_inheritable,
+    // --- Die Bruecken: hier wird nichts gerechnet, nur weitergereicht
+    decl_easing, decl_apply_transition,
+    decl_apply_transform, decl_apply_transform_at,
+    // --- Der beschriebene Knoten
+    NodeDesc, desc_new, desc_add_class, desc_set_state, desc_class_count,
+    sheet_desc_stride,
+    DESC_CLASS_MAX,
+    // --- Das Blatt
+    Sheet, sheet_new, sheet_add, sheet_rule, sheet_count, sheet_sel, sheet_decl,
+    sheet_match, sheet_resolve, sheet_order, sheet_rule_overflow,
+    RULE_MAX, CHAIN_MAX,
+}
+
+import fui.style
+import fui.anim
+import fui.transform
+
+// ======================================================================
+// NAMEN
+// ======================================================================
+//
+// Klassen und Kennungen sind ZAHLEN, keine Zeichenketten. Ein Vergleich
+// von Zeichenketten in der innersten Schleife der Regelaufloesung waere
+// der teuerste Teil des Zeichnens, und fUi kommt ohne Allokator aus --
+// es gibt keinen Ort, an dem eine Klassenliste als Text laege.
+//
+// Damit man trotzdem `sheet_name("knopf")` schreiben kann, steht hier
+// FNV-1a: dieselbe Zeichenkette gibt dieselbe Zahl, in jedem Programm
+// dieses Baums. Die 0 ist reserviert fuer "keine Klasse", darum wird
+// eine Null auf 1 gehoben.
+fn sheet_name(p: u64, n: usize) -> u32 {
+    var h: u32 = 2166136261 as u32
+    var i: usize = 0
+    while i < n {
+        let b: u32 = (*((p + i as u64) as *mut u8)) as u32
+        h = h ^ b
+        // ABSICHTLICH UEBER u64. Firn faengt den Ueberlauf einer
+        // u32-Multiplikation ab (und das ist gut so); FNV-1a BRAUCHT
+        // aber genau diesen Ueberlauf. Also wird breit gerechnet und
+        // hinterher auf 32 Bit beschnitten -- das ist dieselbe Zahl,
+        // die jede andere FNV-Fassung liefert.
+        let breit: u64 = (h as u64) * (16777619 as u64)
+        h = (breit & (4294967295 as u64)) as u32
+        i = i + 1
+    }
+    if h == 0 as u32 {
+        return 1 as u32
+    }
+    return h
+}
+
+// ======================================================================
+// DIE AUSWAHL
+// ======================================================================
+const KIND_ANY: u32 = 4294967295 as u32
+const ID_ANY: u32 = 0 as u32
+const STATE_ANY: u32 = 255 as u32
+const SEL_CLASS_MAX: usize = 4
+
+struct Sel {
+    kind: u32, // Art des Knotens, KIND_ANY = egal
+    id: u32, // Kennung, ID_ANY = egal
+    cls: [u32; 4], // ALLE diese Klassen muss der Knoten tragen
+    ncls: usize,
+    state: u32, // style.STATE_*, STATE_ANY = egal
+    // --- der Vorfahr ("innerhalb von"). Ein Teil reicht; alle drei
+    // muessen auf DENSELBEN Vorfahren passen.
+    anc_kind: u32,
+    anc_id: u32,
+    anc_cls: u32,
+    has_anc: u32,
+    // WIE VIELE KLASSEN NICHT MEHR HINEINPASSTEN. Eine Auswahl traegt
+    // hoechstens SEL_CLASS_MAX Klassen; die fuenfte verschluckte
+    // `sel_with_class` bis zum 21.09.2026 schweigend -- und eine Regel,
+    // die eine Klasse weniger fordert, PASST AUF MEHR Knoten als
+    // beabsichtigt. Das ist der Fehler, den man erst im Bild sieht.
+    // Darum zaehlt die Auswahl ihn mit, und `sel_class_overflow` gibt
+    // die Zahl heraus. Sie steht IN der Auswahl und nicht in einem
+    // globalen Zaehler, weil `Sel` ein Wert ist: sie wird kopiert,
+    // weitergegeben und bleibt dabei bei ihrer Regel.
+    clsof: usize,
+}
+
+fn sel_any() -> Sel {
+    return Sel { kind: KIND_ANY, id: ID_ANY, cls: [0 as u32; 4],
+        ncls: 0, state: STATE_ANY, anc_kind: KIND_ANY, anc_id: ID_ANY,
+        anc_cls: 0 as u32, has_anc: 0 as u32, clsof: 0 }
+}
+
+fn sel_kind(k: u32) -> Sel {
+    var s: Sel = sel_any()
+    s.kind = k
+    return s
+}
+
+fn sel_id(id: u32) -> Sel {
+    var s: Sel = sel_any()
+    s.id = id
+    return s
+}
+
+fn sel_class(c: u32) -> Sel {
+    var s: Sel = sel_any()
+    s.cls[0] = c
+    s.ncls = 1
+    return s
+}
+
+fn sel_with_class(s: Sel, c: u32) -> Sel {
+    var o: Sel = s
+    if o.ncls < SEL_CLASS_MAX {
+        o.cls[o.ncls] = c
+        o.ncls = o.ncls + 1
+        return o
+    }
+    o.clsof = o.clsof + 1
+    return o
+}
+
+// WIE VIELE KLASSEN DIESER AUSWAHL FEHLEN. Null heisst: sie fordert
+// genau das, was der Aufrufer geschrieben hat.
+fn sel_class_overflow(s: *mut Sel) -> usize { return (*s).clsof }
+
+fn sel_with_state(s: Sel, st: u32) -> Sel {
+    var o: Sel = s
+    o.state = st
+    return o
+}
+
+fn sel_within_class(s: Sel, c: u32) -> Sel {
+    var o: Sel = s
+    o.anc_cls = c
+    o.has_anc = 1 as u32
+    return o
+}
+
+fn sel_within_kind(s: Sel, k: u32) -> Sel {
+    var o: Sel = s
+    o.anc_kind = k
+    o.has_anc = 1 as u32
+    return o
+}
+
+fn sel_within_id(s: Sel, id: u32) -> Sel {
+    var o: Sel = s
+    o.anc_id = id
+    o.has_anc = 1 as u32
+    return o
+}
+
+// DER RANG EINER AUSWAHL. Siehe Kopf: Kennung 10000, Klasse und Zustand
+// 100, Art 1 -- und die Teile des Vorfahren zaehlen mit.
+fn sel_specificity(s: *mut Sel) -> i64 {
+    var v: i64 = 0
+    if (*s).id != ID_ANY {
+        v = v + 10000
+    }
+    v = v + 100 * ((*s).ncls as i64)
+    if (*s).state != STATE_ANY {
+        v = v + 100
+    }
+    if (*s).kind != KIND_ANY {
+        v = v + 1
+    }
+    if (*s).has_anc != 0 as u32 {
+        if (*s).anc_id != ID_ANY {
+            v = v + 10000
+        }
+        if (*s).anc_cls != 0 as u32 {
+            v = v + 100
+        }
+        if (*s).anc_kind != KIND_ANY {
+            v = v + 1
+        }
+    }
+    return v
+}
+
+// ======================================================================
+// DIE WERTE EINER REGEL
+// ======================================================================
+//
+// `style.Style` traegt die Stilwerte UND ihre `set_mask`. Was sie nicht
+// kennt, sind Uebergang und Umformung -- die stehen daneben, mit einer
+// eigenen kleinen Maske, damit "gesetzt" auch fuer sie heisst, was es
+// fuer jeden anderen Wert heisst.
+const EX_TRANSITION: u32 = 1
+const EX_TRANSLATE: u32 = 2
+const EX_SCALE: u32 = 4
+const EX_ROTATE: u32 = 8
+
+struct Decl {
+    s: style.Style,
+    trans_ms: i64,
+    trans_ease: u32, // anim.EASE_*
+    tx: f64,
+    ty: f64,
+    sx: f64,
+    sy: f64,
+    // IN GRAD, NICHT IM BOGENMASS. Gedreht wird am Ende von
+    // lib/svg/matrix.fi (`mat_drehe`), und das rechnet in Grad -- mit
+    // Argumentreduktion, damit rotate(90) eine exakte Null gibt. Wer
+    // hier im Bogenmass abliefe, muesste auf dem Weg zur Matrix
+    // umrechnen, und das waere die zweite Stelle, an der ein Winkel
+    // angefasst wird. Also steht hier dieselbe Einheit wie dort.
+    rot: f64,
+    ex: u32,
+}
+
+fn decl_new() -> Decl {
+    return Decl { s: style.style_new(), trans_ms: 0, trans_ease: 0 as u32,
+        tx: 0.0, ty: 0.0, sx: 1.0, sy: 1.0, rot: 0.0, ex: 0 as u32 }
+}
+
+fn decl_style(d: *mut Decl) -> *mut style.Style { return &(*d).s }
+
+fn decl_set_style(d: *mut Decl, s: style.Style) { (*d).s = s }
+
+// `transition: <ms> <easing>` -- die Zahlen gehen unveraendert an
+// anim.trans_set_duration / anim.easing_named.
+fn decl_set_transition(d: *mut Decl, ms: i64, ease: u32) {
+    (*d).trans_ms = ms
+    (*d).trans_ease = ease
+    (*d).ex = (*d).ex | EX_TRANSITION
+}
+
+fn decl_transition_ms(d: *mut Decl) -> i64 { return (*d).trans_ms }
+fn decl_transition_ease(d: *mut Decl) -> u32 { return (*d).trans_ease }
+
+fn decl_set_translate(d: *mut Decl, x: f64, y: f64) {
+    (*d).tx = x
+    (*d).ty = y
+    (*d).ex = (*d).ex | EX_TRANSLATE
+}
+
+fn decl_set_scale(d: *mut Decl, x: f64, y: f64) {
+    (*d).sx = x
+    (*d).sy = y
+    (*d).ex = (*d).ex | EX_SCALE
+}
+
+fn decl_set_rotate(d: *mut Decl, grad: f64) {
+    (*d).rot = grad
+    (*d).ex = (*d).ex | EX_ROTATE
+}
+
+fn decl_tx(d: *mut Decl) -> f64 { return (*d).tx }
+fn decl_ty(d: *mut Decl) -> f64 { return (*d).ty }
+fn decl_sx(d: *mut Decl) -> f64 { return (*d).sx }
+fn decl_sy(d: *mut Decl) -> f64 { return (*d).sy }
+fn decl_rot(d: *mut Decl) -> f64 { return (*d).rot }
+
+// Ist dieser Wert gesetzt? `bit` ist ein style.SF_* ODER ein EX_*; die
+// beiden Masken sind getrennt, darum sagt `extra`, welche gemeint ist.
+fn decl_has(d: *mut Decl, bit: u32, extra: bool) -> bool {
+    if extra {
+        return ((*d).ex & bit) != 0 as u32
+    }
+    return ((*d).s.set_mask & bit) != 0 as u32
+}
+
+// ======================================================================
+// DIE BRUECKEN: WO DER WERT ZUR WIRKUNG WIRD
+// ======================================================================
+//
+// Bis hierher waren `transition` und `transform` nur Zahlen in einem
+// `Decl` -- und Zahlen, die niemand abholt, sind eine Behauptung. Die
+// drei Funktionen hier holen sie ab, und zwar so, dass in dieser Datei
+// KEINE Zeile Zeit- oder Matrixarithmetik steht:
+//
+//   * Die Dauer geht an `anim.trans_set_duration`, die Kurve an
+//     `anim.easing_named` -- was aus beiden wird (Bezier, steps, Feder),
+//     entscheidet lib/fui/anim.fi allein.
+//   * Verschiebung, Streckung und Drehung gehen an `transform.xf_*`,
+//     die ihrerseits lib/svg/matrix.fi rufen. Hier wird kein Sinus
+//     angefasst und keine Matrix multipliziert.
+//
+// Das ist der ganze Sinn: das Stilblatt SAGT, was gelten soll; gerechnet
+// wird dort, wo die Rechnung ohnehin schon steht.
+
+// Die Kurve dieses Uebergangs als `anim.Easing`. Ist keine
+// `transition` gesetzt, ist es die lineare Kurve -- dieselbe Vorgabe,
+// die `anim.easing_named(EASE_LINEAR)` liefert.
+fn decl_easing(d: *mut Decl) -> anim.Easing {
+    if ((*d).ex & EX_TRANSITION) == 0 as u32 {
+        return anim.easing_named(anim.EASE_LINEAR)
+    }
+    return anim.easing_named((*d).trans_ease)
+}
+
+// Den Uebergang eines Widgets auf das stellen, was das Blatt sagt.
+// `false` heisst: dieses Decl nennt keine `transition`, der Uebergang
+// bleibt unangetastet (und behaelt damit, was ihm zuvor gesagt wurde).
+fn decl_apply_transition(d: *mut Decl, t: *mut anim.Transition) -> bool {
+    if ((*d).ex & EX_TRANSITION) == 0 as u32 {
+        return false
+    }
+    anim.trans_set_duration(t, (*d).trans_ms)
+    anim.trans_set_easing(t, anim.easing_named((*d).trans_ease))
+    return true
+}
+
+// Die Umformung auf den Stapel legen, um den Punkt (ox, oy) herum --
+// in einer Oberflaeche ist das die MITTE des Knotens, nicht die Ecke
+// der Leinwand: eine Kachel, die unter dem Zeiger waechst, waechst nach
+// allen Seiten.
+//
+// Die Reihenfolge ist die von CSS: erst verschieben, dann drehen, dann
+// strecken. Sie steht hier fest, damit zwei Knoten mit demselben Decl
+// nicht verschieden aussehen. `false` heisst: dieses Decl nennt keine
+// Umformung, der Stapel wurde nicht angefasst.
+fn decl_apply_transform_at(d: *mut Decl, x: *mut transform.Xform,
+    ox: f64, oy: f64) -> bool {
+    let e: u32 = (*d).ex
+    if (e & (EX_TRANSLATE | EX_SCALE | EX_ROTATE)) == 0 as u32 {
+        return false
+    }
+    if (e & EX_TRANSLATE) != 0 as u32 {
+        transform.xf_translate(x, (*d).tx, (*d).ty)
+    }
+    if (e & EX_ROTATE) != 0 as u32 {
+        transform.xf_rotate_at(x, (*d).rot, ox, oy)
+    }
+    if (e & EX_SCALE) != 0 as u32 {
+        transform.xf_scale(x, (*d).sx, (*d).sy, ox, oy)
+    }
+    return true
+}
+
+// Dieselbe Umformung um den Ursprung der Leinwand. Das ist der Fall,
+// in dem der Aufrufer seinen Ursprung bereits gesetzt hat.
+fn decl_apply_transform(d: *mut Decl, x: *mut transform.Xform) -> bool {
+    let e: u32 = (*d).ex
+    if (e & (EX_TRANSLATE | EX_SCALE | EX_ROTATE)) == 0 as u32 {
+        return false
+    }
+    if (e & EX_TRANSLATE) != 0 as u32 {
+        transform.xf_translate(x, (*d).tx, (*d).ty)
+    }
+    if (e & EX_ROTATE) != 0 as u32 {
+        transform.xf_rotate(x, (*d).rot)
+    }
+    if (e & EX_SCALE) != 0 as u32 {
+        transform.xf_scale(x, (*d).sx, (*d).sy, 0.0, 0.0)
+    }
+    return true
+}
+
+// ======================================================================
+// ZUSAMMENFUEHREN
+// ======================================================================
+//
+// `dst` ist die bisher gueltige Fassung, `src` die RANGHOEHERE (oder
+// spaetere) Regel. Uebernommen wird feldweise und nur, was `src` wirklich
+// setzt -- eine Regel, die nur die Schriftfarbe nennt, loescht den Grund
+// nicht, den eine andere gesetzt hat. Das ist der ganze Unterschied
+// zwischen "Stilblatt" und "letzter Aufruf gewinnt".
+fn decl_merge(dst: *mut Decl, src: *mut Decl) {
+    let m: u32 = (*src).s.set_mask
+    let a: *mut style.Style = &(*dst).s
+    let b: *mut style.Style = &(*src).s
+    if (m & style.SF_BG) != 0 as u32 { (*a).bg = (*b).bg }
+    if (m & style.SF_BORDER) != 0 as u32 {
+        (*a).border = (*b).border
+        (*a).border_w = (*b).border_w
+    }
+    if (m & style.SF_FG) != 0 as u32 { (*a).fg = (*b).fg }
+    if (m & style.SF_BORDER_W) != 0 as u32 { (*a).border_w = (*b).border_w }
+    if (m & style.SF_RADIUS) != 0 as u32 { (*a).radius = (*b).radius }
+    if (m & style.SF_PAD_X) != 0 as u32 { (*a).pad_x = (*b).pad_x }
+    if (m & style.SF_PAD_Y) != 0 as u32 { (*a).pad_y = (*b).pad_y }
+    if (m & style.SF_FONT_PX) != 0 as u32 { (*a).font_px = (*b).font_px }
+    if (m & style.SF_WEIGHT) != 0 as u32 { (*a).weight = (*b).weight }
+    if (m & style.SF_SLANT) != 0 as u32 { (*a).slant = (*b).slant }
+    if (m & style.SF_ALIGN) != 0 as u32 { (*a).align = (*b).align }
+    if (m & style.SF_ALPHA) != 0 as u32 { (*a).alpha = (*b).alpha }
+    if (m & style.SF_FONT_ID) != 0 as u32 { (*a).font_id = (*b).font_id }
+    if (m & style.SF_TRACKING) != 0 as u32 { (*a).tracking = (*b).tracking }
+    if (m & style.SF_WORD_SPACING) != 0 as u32 {
+        (*a).word_spacing = (*b).word_spacing
+    }
+    if (m & style.SF_LINE_HEIGHT) != 0 as u32 {
+        (*a).line_height = (*b).line_height
+        (*a).line_h_abs = (*b).line_h_abs
+    }
+    if (m & style.SF_KERNING) != 0 as u32 { (*a).kerning = (*b).kerning }
+    if (m & style.SF_OUTLINE) != 0 as u32 {
+        (*a).out_w = (*b).out_w
+        (*a).out_col = (*b).out_col
+    }
+    if (m & style.SF_SHADOW) != 0 as u32 {
+        (*a).sh_dx = (*b).sh_dx
+        (*a).sh_dy = (*b).sh_dy
+        (*a).sh_col = (*b).sh_col
+    }
+    if (m & style.SF_GRADIENT) != 0 as u32 { (*a).grad_col = (*b).grad_col }
+    // Die Groesse wie jeder andere Wert: feldweise, und nur wenn die
+    // ranghoehere Regel sie wirklich nennt. Breite und Hoehe stehen
+    // dabei EINZELN -- eine Regel, die nur die Hoehe einer Zeile
+    // festlegt, darf ihre Breite nicht auf null setzen.
+    if (m & style.SF_WIDTH) != 0 as u32 { (*a).width = (*b).width }
+    if (m & style.SF_HEIGHT) != 0 as u32 { (*a).height = (*b).height }
+    if (m & style.SF_DIRECTION) != 0 as u32 { (*a).dir = (*b).dir }
+    (*a).set_mask = (*a).set_mask | m
+
+    let e: u32 = (*src).ex
+    if (e & EX_TRANSITION) != 0 as u32 {
+        (*dst).trans_ms = (*src).trans_ms
+        (*dst).trans_ease = (*src).trans_ease
+    }
+    if (e & EX_TRANSLATE) != 0 as u32 {
+        (*dst).tx = (*src).tx
+        (*dst).ty = (*src).ty
+    }
+    if (e & EX_SCALE) != 0 as u32 {
+        (*dst).sx = (*src).sx
+        (*dst).sy = (*src).sy
+    }
+    if (e & EX_ROTATE) != 0 as u32 {
+        (*dst).rot = (*src).rot
+    }
+    (*dst).ex = (*dst).ex | e
+}
+
+// ======================================================================
+// VERERBUNG
+// ======================================================================
+//
+// GENAU FUENF Werte gehen vom Elternteil auf das Kind ueber, und nur
+// dorthin, wo das Kind selbst schweigt. Der fuenfte ist seit dem
+// 23.09.2026 die Schreibrichtung (style.SF_DIRECTION): ein Kasten, der
+// auf RTL steht, stellt alles in ihm auf RTL, wie `dir` im Web. Die Grenze ist Absicht und wird
+// in tools/fui/sheet_main.fi mit Zahlen nachgerechnet: der Grund des
+// Elternteils darf beim Kind NICHT ankommen.
+// FG (4) | FONT_PX (128) | FONT_ID (4096) | LINE_HEIGHT (32768)
+// | DIRECTION (4194304) = 4231300.
+// Die Zahl steht ausgerechnet da, damit tools/fui/sheet_main.fi sie
+// gegen die fuenf Bits nachrechnen kann.
+const INHERIT_MASK: u32 = 4231300 as u32
+
+fn sheet_inheritable(bit: u32) -> bool {
+    return (INHERIT_MASK & bit) != 0 as u32
+}
+
+fn decl_inherit(child: *mut Decl, parent: *mut Decl) {
+    let pm: u32 = (*parent).s.set_mask
+    let cm: u32 = (*child).s.set_mask
+    let a: *mut style.Style = &(*child).s
+    let b: *mut style.Style = &(*parent).s
+    if (pm & style.SF_FG) != 0 as u32 && (cm & style.SF_FG) == 0 as u32 {
+        (*a).fg = (*b).fg
+        (*a).set_mask = (*a).set_mask | style.SF_FG
+    }
+    if (pm & style.SF_FONT_PX) != 0 as u32
+    && (cm & style.SF_FONT_PX) == 0 as u32 {
+        (*a).font_px = (*b).font_px
+        (*a).set_mask = (*a).set_mask | style.SF_FONT_PX
+    }
+    if (pm & style.SF_FONT_ID) != 0 as u32
+    && (cm & style.SF_FONT_ID) == 0 as u32 {
+        (*a).font_id = (*b).font_id
+        (*a).set_mask = (*a).set_mask | style.SF_FONT_ID
+    }
+    if (pm & style.SF_LINE_HEIGHT) != 0 as u32
+    && (cm & style.SF_LINE_HEIGHT) == 0 as u32 {
+        (*a).line_height = (*b).line_height
+        (*a).line_h_abs = (*b).line_h_abs
+        (*a).set_mask = (*a).set_mask | style.SF_LINE_HEIGHT
+    }
+    if (pm & style.SF_DIRECTION) != 0 as u32
+    && (cm & style.SF_DIRECTION) == 0 as u32 {
+        (*a).dir = (*b).dir
+        (*a).set_mask = (*a).set_mask | style.SF_DIRECTION
+    }
+}
+
+// ======================================================================
+// DER BESCHRIEBENE KNOTEN
+// ======================================================================
+//
+// Das ist alles, was dieses Modul von einem Knoten wissen muss. Wer eine
+// andere Baumsorte hat, fuellt dasselbe Blatt aus -- darum haengt hier
+// kein scene.Node im Quelltext.
+const DESC_CLASS_MAX: usize = 8
+
+struct NodeDesc {
+    kind: u32,
+    id: u32,
+    cls: [u32; 8],
+    ncls: usize,
+    state: u32,
+}
+
+fn desc_new(kind: u32, id: u32) -> NodeDesc {
+    return NodeDesc { kind: kind, id: id, cls: [0 as u32; 8], ncls: 0,
+        state: style.STATE_NORMAL }
+}
+
+fn desc_add_class(d: *mut NodeDesc, c: u32) -> bool {
+    if (*d).ncls >= DESC_CLASS_MAX {
+        return false
+    }
+    (*d).cls[(*d).ncls] = c
+    (*d).ncls = (*d).ncls + 1
+    return true
+}
+
+fn desc_set_state(d: *mut NodeDesc, st: u32) { (*d).state = st }
+fn desc_class_count(d: *mut NodeDesc) -> usize { return (*d).ncls }
+
+// DIE SCHRITTWEITE EINES `NodeDesc` IM FELD. Wer eine Kette als
+// `*mut NodeDesc` weiterreicht, muss die Adresse des i-ten Gliedes
+// selbst ausrechnen -- und diese Zahl darf nirgends im Quelltext als
+// Ziffer stehen. Sie wird hier GEMESSEN: die Differenz zweier Nachbarn
+// eines echten Feldes ist das, was der Uebersetzer wirklich legt, und
+// nicht das, was jemand einmal nachgezaehlt hat. lib/fui/scene.fi holt
+// dieselbe Zahl von hier; ein zweiter Ort dafuer hiesse, dass ein
+// zusaetzliches Feld in `NodeDesc` an EINER Stelle unbemerkt bliebe.
+fn sheet_desc_stride() -> usize {
+    var probe: [NodeDesc; 2] = [desc_new(0 as u32, 0 as u32); 2]
+    return ((&probe[1]) as u64 - (&probe[0]) as u64) as usize
+}
+
+fn desc_has_class(d: *mut NodeDesc, c: u32) -> bool {
+    var i: usize = 0
+    while i < (*d).ncls {
+        if (*d).cls[i] == c {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ======================================================================
+// DAS BLATT
+// ======================================================================
+//
+// Feste Groesse, kein Allokator -- dieselbe Entscheidung wie bei
+// anim.Animator, und aus demselben Grund: fUi laeuft auch dort, wo es
+// keinen Allokator gibt.
+const RULE_MAX: usize = 64
+const CHAIN_MAX: usize = 16
+
+struct Rule {
+    sel: Sel,
+    d: Decl,
+}
+
+struct Sheet {
+    r: [Rule; 64],
+    n: usize,
+    // WIE VIELE REGELN DAS BLATT NICHT MEHR AUFNAHM. Dieselbe Regel wie
+    // bei scene.scene_add: RULE_MAX zurueckzugeben ist ehrlich, aber
+    // niemand sieht einen Rueckgabewert an, der in einer Aufbaufolge von
+    // vierzig Zeilen steht. Eine fehlende Regel heisst, dass ein Teil
+    // der Oberflaeche unbemalt bleibt -- also wird sie gezaehlt, und
+    // `sheet_rule_overflow` gibt die Zahl heraus.
+    ruleof: usize,
+}
+
+fn sheet_new() -> Sheet {
+    return Sheet { r: [Rule { sel: sel_any(), d: decl_new() }; 64], n: 0,
+        ruleof: 0 }
+}
+
+// Eine Regel anhaengen. Der Rueckgabewert ist ihre laufende Nummer --
+// und die ist zugleich das Entscheidende bei Ranggleichheit: die
+// spaetere Regel gewinnt.
+fn sheet_add(sh: *mut Sheet, s: Sel, d: Decl) -> usize {
+    if (*sh).n >= RULE_MAX {
+        (*sh).ruleof = (*sh).ruleof + 1
+        return RULE_MAX
+    }
+    let i: usize = (*sh).n
+    (*sh).r[i].sel = s
+    (*sh).r[i].d = d
+    (*sh).n = i + 1
+    return i
+}
+
+// EINE REGEL AUS EINEM STIL -- die Kurzform fuer den Normalfall.
+// Fast jede Regel dieses Hauses besteht aus einer Auswahl und einem
+// Satz Stilwerte; die drei Zeilen `decl_new`, `decl_set_style`,
+// `sheet_add` schreibt man dafuer jedes Mal neu. Hier stehen sie
+// EINMAL. Versteckt wird dabei nichts: wer einen Uebergang oder eine
+// Umformung braucht, baut seine Decl weiter selbst und ruft
+// `sheet_add` -- diese Funktion ruft genau dasselbe.
+fn sheet_rule(sh: *mut Sheet, s: Sel, st: style.Style) -> usize {
+    var d: Decl = decl_new()
+    decl_set_style(&d, st)
+    return sheet_add(sh, s, d)
+}
+
+fn sheet_count(sh: *mut Sheet) -> usize { return (*sh).n }
+
+// WIE VIELE REGELN ABGEWIESEN WURDEN, seit dieses Blatt entstand.
+fn sheet_rule_overflow(sh: *mut Sheet) -> usize { return (*sh).ruleof }
+fn sheet_sel(sh: *mut Sheet, i: usize) -> *mut Sel { return &(*sh).r[i].sel }
+fn sheet_decl(sh: *mut Sheet, i: usize) -> *mut Decl { return &(*sh).r[i].d }
+
+// Die Reihenfolge ist die Einfuegereihenfolge; sie steht hier als
+// Funktion, damit die Pruefung sie benennen kann, ohne im Inneren zu
+// wuehlen.
+fn sheet_order(sh: *mut Sheet, i: usize) -> i64 { return i as i64 }
+
+fn chain_at(chain: *mut NodeDesc, i: usize) -> *mut NodeDesc {
+    return (chain as u64 + (i * sheet_desc_stride()) as u64) as *mut NodeDesc
+}
+
+// Passt Regel `i` auf das LETZTE Glied der Kette?
+//
+// `chain` ist die Kette der Vorfahren, Wurzel zuerst, der Knoten selbst
+// an Stelle `depth - 1`.
+fn sheet_match(sh: *mut Sheet, i: usize, chain: *mut NodeDesc,
+    depth: usize) -> bool {
+    if depth == 0 || i >= (*sh).n {
+        return false
+    }
+    let s: *mut Sel = &(*sh).r[i].sel
+    let me: *mut NodeDesc = chain_at(chain, depth - 1)
+    if (*s).kind != KIND_ANY && (*s).kind != (*me).kind {
+        return false
+    }
+    if (*s).id != ID_ANY && (*s).id != (*me).id {
+        return false
+    }
+    if (*s).state != STATE_ANY && (*s).state != (*me).state {
+        return false
+    }
+    var k: usize = 0
+    while k < (*s).ncls {
+        if !desc_has_class(me, (*s).cls[k]) {
+            return false
+        }
+        k = k + 1
+    }
+    if (*s).has_anc == 0 as u32 {
+        return true
+    }
+    // "innerhalb von": IRGENDEIN echter Vorfahr muss auf alle drei
+    // genannten Teile passen. Das ist der Nachfahren-Kombinator aus CSS
+    // (" "), nicht der Kindkombinator (">").
+    var a: usize = 0
+    while a + 1 < depth {
+        let p: *mut NodeDesc = chain_at(chain, a)
+        var ok: bool = true
+        if (*s).anc_kind != KIND_ANY && (*s).anc_kind != (*p).kind {
+            ok = false
+        }
+        if (*s).anc_id != ID_ANY && (*s).anc_id != (*p).id {
+            ok = false
+        }
+        if (*s).anc_cls != 0 as u32 && !desc_has_class(p, (*s).anc_cls) {
+            ok = false
+        }
+        if ok {
+            return true
+        }
+        a = a + 1
+    }
+    return false
+}
+
+// ALLE passenden Regeln, in der Reihenfolge STEIGENDEN Ranges
+// zusammengefuehrt. Damit gewinnt der hoechste Rang, und bei
+// Ranggleichheit die spaetere Regel -- ohne dass irgendwo ein
+// Sonderfall dafuer stuende.
+//
+// Sortiert wird mit einem einfachen Auswahlsortieren ueber die
+// Regelnummern: RULE_MAX ist 64, und dieses Zusammenfuehren geschieht
+// einmal je Knoten und Bild.
+fn sheet_resolve(sh: *mut Sheet, chain: *mut NodeDesc, depth: usize,
+    out: *mut Decl) {
+    var idx: [usize; 64] = [0; 64]
+    var m: usize = 0
+    var i: usize = 0
+    while i < (*sh).n {
+        if sheet_match(sh, i, chain, depth) {
+            idx[m] = i
+            m = m + 1
+        }
+        i = i + 1
+    }
+    // Aufsteigend nach (Rang, Nummer).
+    var a: usize = 0
+    while a < m {
+        var best: usize = a
+        var b: usize = a + 1
+        while b < m {
+            let sb: i64 = sel_specificity(&(*sh).r[idx[b]].sel)
+            let sbest: i64 = sel_specificity(&(*sh).r[idx[best]].sel)
+            if sb < sbest || (sb == sbest && idx[b] < idx[best]) {
+                best = b
+            }
+            b = b + 1
+        }
+        let t: usize = idx[a]
+        idx[a] = idx[best]
+        idx[best] = t
+        a = a + 1
+    }
+    var j: usize = 0
+    while j < m {
+        decl_merge(out, &(*sh).r[idx[j]].d)
+        j = j + 1
+    }
+}

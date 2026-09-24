@@ -1,0 +1,993 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/belegpruef_main.fi -- DIE BELEGE WERDEN NACHGERECHNET.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Ein Belegbild wird geschrieben, der Lauf druckt "ALL CHECKS PASSED"
+// -- und niemand hat je HINEINGESEHEN. Genau so ist in OrientOS eine
+// Oberflaeche ohne einen einzigen Buchstaben durch die Abnahme
+// gekommen: die Datei war da, sie war sogar gross, sie war nur leer.
+// Ein Bild, das nur ENTSTANDEN ist, belegt nichts.
+//
+// Dieses Programm liest jedes erzeugte PNG mit `paint/png.decode_png`
+// wieder EIN und rechnet drei Dinge nach, die eine leere oder halb
+// gemalte Leinwand nicht bestehen kann:
+//
+//   1. DIE ABMESSUNGEN. Breite und Hoehe stehen im Aufruf und kommen
+//      aus dem Programm, das das Bild gemalt hat. Eine Leinwand, die
+//      ploetzlich anders gross ist, ist ein abgeschnittener Beleg.
+//   2. DIE ZAHL VERSCHIEDENER FARBEN. Eine geleerte Leinwand hat eine
+//      einzige; ein Bild mit Text, Kanten und Verlaeufen hat Hunderte.
+//      Gezaehlt wird mit einer offenen Streutabelle (4096 Plaetze) --
+//      ab `MAX_FARBEN` wird nicht weiter gezaehlt, die Schranke reicht.
+//   3. DER ANTEIL NICHT-HINTERGRUND-PIXEL JE BAND. Das Bild wird in
+//      `BAENDER` waagerechte Baender geschnitten, und in JEDEM muss
+//      etwas stehen. Das ist die Pruefung, die ein Bild nicht besteht,
+//      dessen untere Haelfte leer blieb, weil eine Zeichenschleife zu
+//      frueh abbrach -- der Fehler, den man auf einem Daumennagel
+//      uebersieht.
+//
+// Der Hintergrund wird NICHT geraten: er ist die Farbe des Pixels
+// (2,2), also der Ecke, in die kein Beleg etwas malt. Ein Pixel gilt
+// als "nicht Hintergrund", wenn sich einer seiner drei Kanaele um mehr
+// als `TOLERANZ` unterscheidet -- sonst zaehlte das Rauschen einer
+// Kantenglaettung als Inhalt.
+//
+//     belegpruef_main <bild.png> <breite> <h_min> <h_max> <min_farben>
+//
+// Die Breite steht EXAKT fest; bei der Hoehe wird eine Spanne
+// angegeben, weil drei Belege ihre Leinwand auf den Inhalt
+// zuschneiden (fui-wave2 ist im dunklen Schema drei Zeilen kuerzer als
+// im hellen). Die obere Grenze ist die Hoehe der Leinwand aus dem
+// malenden Programm -- zugeschnitten werden kann nur nach unten --,
+// die untere haelt fest, dass wirklich der ganze Satz gemalt wurde und
+// nicht nur die Kopfzeile.
+//
+// Jede Verletzung wird auf fd 1 benannt, und der Rueckgabewert ist
+// dann 1: `set -e` in tools/fui/run.sh bricht den Lauf damit ab.
+//
+// ====================================================== DIE ZWEITE BETRIEBSART
+//
+//     belegpruef_main --ketten <schrift.ttf|-> <breite> <quelle.fi> ...
+//
+// DER FEHLER, DER "red fixe" HIESS. In tools/fui/gallery_main.fi stand
+// `var t_v3: [u8; 10] = "red fixed "`, gemalt wurden davon 8 Bytes, und
+// im Beleg las ein Pruefer "red fixe". Kein Programm ist abgestuerzt,
+// kein Pixel war falsch, die Farbzahl stimmte, jedes Band war bemalt --
+// und das Wort war trotzdem kaputt. Ein Beleg mit einem halben Wort
+// belegt das Gegenteil von dem, was er behauptet.
+//
+// Diese Betriebsart liest die QUELLEN der Belegprogramme und rechnet
+// fuer jede gemalte Beschriftung zwei Zahlen nach:
+//
+//   1. DIE KETTENLAENGE GEGEN DIE FELDLAENGE. Zu jeder Verwendung
+//      `(&name[0]) as u64, M` wird die zugehoerige Deklaration
+//      `var name: [u8; N] = "..."` gesucht (die naechste davor, also
+//      dieselbe, die auch der Uebersetzer nimmt). Gefordert ist
+//      N - Fuellung <= M <= N: es wird die GANZE Kette gemalt.
+//      "Fuellung" sind die abschliessenden Leerzeichen, `\0` und `\n`
+//      des Literals -- sie tragen kein Wort, und eine Meldung, die sie
+//      weglaesst, ist keine abgeschnittene Beschriftung.
+//   2. DIE SOLLBREITE GEGEN DIE LEINWAND. Dieselbe Kette wird mit
+//      `render.pref_of` gemessen -- mit dem Mess-Protokoll der
+//      Bibliothek selbst, nicht mit einer Schaetzung daneben -- und
+//      muss bei `MESS_PX` Punkt Schriftgroesse in die Leinwand des
+//      Belegs passen (Breite minus zweimal `RAND`). Ein Text, der
+//      breiter ist als das Blatt, kann im Bild nur abgeschnitten
+//      stehen. Ohne Schrift ("-") und ohne Breite (0) entfaellt diese
+//      zweite Rechnung, damit die Laengenpruefung auch dann laeuft,
+//      wenn keine TTF-Datei erreichbar ist.
+//
+// Geprueft werden die GEMALTEN Verwendungen, und "gemalt" wird von der
+// Gegenseite her bestimmt (siehe `wird_gemalt`): eine Kette gilt als
+// gemalt, solange in ihren drei Zeilen davor kein Aufruf steht, der sie
+// ausdruckt oder bloss vermisst (`report`, `buf_push_*`,
+// `write_everything`, `text_width`, `run_width`, `c_length`, `mem_eq`,
+// `read_file`). Dort ist ein Stueck einer Kette Absicht --
+// tools/fui/contrast_main.fi schreibt "dE " und haengt die Zahl an --
+// und dafuer ist diese Pruefung nicht zustaendig. Ungeprueft bleiben
+// ebenso Verwendungen, die NICHT bei Byte 0 beginnen (`(&t[3])`): sie
+// behaupten nie, die ganze Kette zu malen.
+import std.rt
+import paint.png
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+
+const BAENDER: usize = 6
+// Wie viel von einem Band bemalt sein muss. Ein Tausendstel ist wenig
+// und trotzdem scharf: ein LEERES Band hat null, und selbst ein Band,
+// in dem nur eine Zeile Text steht, liegt darueber (ein 1240x764-Bild
+// hat je Band rund 158000 Pixel, ein Tausendstel davon sind 158).
+const MIN_PROMILLE: i64 = 1
+const TOLERANZ: i64 = 8
+const PLAETZE: usize = 4096
+const MAX_FARBEN: usize = 2000
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 4] = "OK  "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var g: [u8; 4] = "got "
+    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
+    rt.buf_push_dec_i64(&t, a)
+    var w: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, b)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Eine Dezimalzahl von der Befehlszeile. Alles, was keine Ziffer ist,
+// beendet die Zahl -- der abschliessende Nullbyte ebenso.
+fn zahl_von(p: u64) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < 20 {
+        let c: u32 = rt.ld8(p, i) as u32
+        if c < 48 as u32 || c > 57 as u32 {
+            return v
+        }
+        v = v * 10 + ((c - 48 as u32) as i64)
+        i = i + 1
+    }
+    return v
+}
+
+// Der Name der Datei in die Meldung -- ohne ihn weiss niemand, WELCHER
+// Beleg zerbrochen ist.
+fn sag_datei(p: u64) {
+    var t: rt.Buf = rt.buf_new()
+    var k: [u8; 8] = "BELEG:  "
+    rt.buf_push_bytes(&t, (&k[0]) as u64, 8)
+    rt.buf_push_bytes(&t, p, rt.c_length(p))
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// DIE FARBEN. Offene Adressierung mit linearem Sondieren; 0 heisst
+// "Platz frei", deshalb wird die Farbe mit 1 geoderrt, bevor sie
+// abgelegt wird (der Alphakanal eines Belegs ist immer 255, die
+// unterste Bitstelle der Blaustufe faellt hier nicht ins Gewicht --
+// gezaehlt wird die VIELFALT, nicht die einzelne Farbe).
+fn farbe_neu(tab: *mut u64, c: u32) -> bool {
+    let key: u64 = (c as u64) | 1099511627776 as u64
+    var h: usize = (((c as u64) * 2654435761 as u64) >> 13) as usize
+    var i: usize = 0
+    while i < PLAETZE {
+        let j: usize = (h + i) & (PLAETZE - 1)
+        let slot: *mut u64 = ((tab as u64) + (j * 8) as u64) as *mut u64
+        if *slot == 0 as u64 {
+            *slot = key
+            return true
+        }
+        if *slot == key {
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn abstand(a: u32, b: u32) -> i64 {
+    var d: i64 = (a as i64) - (b as i64)
+    if d < 0 {
+        d = 0 - d
+    }
+    return d
+}
+
+fn anders(a: u32, b: u32) -> bool {
+    if abstand((a >> 16) & 255 as u32, (b >> 16) & 255 as u32) > TOLERANZ {
+        return true
+    }
+    if abstand((a >> 8) & 255 as u32, (b >> 8) & 255 as u32) > TOLERANZ {
+        return true
+    }
+    return abstand(a & 255 as u32, b & 255 as u32) > TOLERANZ
+}
+
+// ======================================================================
+// DIE BESCHRIFTUNGEN, GEMESSEN STATT GERATEN
+// ======================================================================
+//
+// Ab hier wird nicht mehr das Bild gelesen, sondern die QUELLE, die es
+// gemalt hat. Warum steht im Kopf dieser Datei; kurz: ein Bild, auf dem
+// "red fixe" steht, ist von aussen nicht von einem richtigen zu
+// unterscheiden -- die Zahl, die dazu fehlt, steht im Quelltext.
+
+// Die Groesse, bei der eine Beschriftung gemessen wird. Es ist die
+// Groesse der Kopfzeilen der Belege (15 Punkt) und damit die
+// ungueltigste, die im Blatt vorkommt: was bei 15 Punkt hineinpasst,
+// passt bei 12 erst recht.
+const MESS_PX: usize = 15
+// Der Rand, den ein Beleg links und rechts frei laesst. Alle
+// Belegprogramme setzen ihre erste Spalte auf 24 Punkt.
+const RAND: i64 = 24
+// So viele Feldangaben je Datei werden mitgefuehrt. Die dichteste Datei
+// des Baums (tools/fui/anim_main.fi) hat 90.
+const MAX_FELDER: usize = 256
+
+fn at(p: u64, i: usize) -> u32 {
+    return rt.ld8(p, i) as u32
+}
+
+fn ist_namenszeichen(ch: u32) -> bool {
+    if ch >= 97 as u32 && ch <= 122 as u32 {
+        return true
+    }
+    if ch >= 65 as u32 && ch <= 90 as u32 {
+        return true
+    }
+    if ch >= 48 as u32 && ch <= 57 as u32 {
+        return true
+    }
+    return ch == 95 as u32
+}
+
+fn ist_leer(ch: u32) -> bool {
+    if ch == 32 as u32 || ch == 9 as u32 {
+        return true
+    }
+    return ch == 10 as u32 || ch == 13 as u32
+}
+
+fn ist_ziffer(ch: u32) -> bool {
+    return ch >= 48 as u32 && ch <= 57 as u32
+}
+
+fn passt(p: u64, n: usize, i: usize, lit: u64, ln: usize) -> bool {
+    if i + ln > n {
+        return false
+    }
+    return rt.mem_eq(p + (i as u64), lit, ln)
+}
+
+fn ueber_leer(p: u64, n: usize, i: usize) -> usize {
+    var j: usize = i
+    while j < n && ist_leer(at(p, j)) {
+        j = j + 1
+    }
+    return j
+}
+
+// Die Zeilennummer einer Stelle -- ohne sie sucht ein Mensch die
+// gemeldete Kette in achthundert Zeilen selbst.
+fn zeile_von(p: u64, pos: usize) -> i64 {
+    var z: i64 = 1
+    var i: usize = 0
+    while i < pos {
+        if at(p, i) == 10 as u32 {
+            z = z + 1
+        }
+        i = i + 1
+    }
+    return z
+}
+
+fn such(p: u64, von: usize, bis: usize, lit: u64, ln: usize) -> bool {
+    var i: usize = von
+    while i + ln <= bis {
+        if rt.mem_eq(p + (i as u64), lit, ln) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// WIRD DIESE KETTE GEMALT?
+//
+// Gefragt ist nicht, WELCHE Funktion den Text nimmt -- die heisst in
+// jedem Belegprogramm anders (`label`, `kachel`, `reihe`, `uebergang`)
+// und eine Liste davon waere am Tag darauf unvollstaendig. Gefragt ist
+// das Gegenteil: eine Kette gilt als gemalt, SOLANGE NICHTS DAGEGEN
+// SPRICHT. Dagegen sprechen die Aufrufe, die eine Kette auf fd 1 oder
+// fd 2 schreiben oder sie bloss vermessen -- dort ist ein Stueck einer
+// Kette Absicht (tools/fui/contrast_main.fi schreibt "dE " und haengt
+// die Zahl an, tools/fui/wave2_main.fi misst absichtlich ein Byte
+// weniger, um zu zeigen, dass der letzte Buchstabe Breite traegt).
+//
+// Diese Richtung deckt 378 der Ketten des Baums ab statt 151, und sie
+// wird nicht falsch, wenn jemand ein neues Belegprogramm mit einer
+// neuen Hilfsfunktion schreibt: eine neue Beschriftung ist dann von
+// selbst geprueft, und nicht erst, wenn jemand daran denkt.
+fn wird_gemalt(p: u64, pos: usize) -> bool {
+    var von: usize = pos
+    var zeilen: usize = 0
+    while von > 0 && zeilen < 3 {
+        von = von - 1
+        if at(p, von) == 10 as u32 {
+            zeilen = zeilen + 1
+        }
+    }
+    var m1: [u8; 6] = "report"
+    if such(p, von, pos, (&m1[0]) as u64, 6) {
+        return false
+    }
+    var m2: [u8; 9] = "buf_push_"
+    if such(p, von, pos, (&m2[0]) as u64, 9) {
+        return false
+    }
+    var m3: [u8; 16] = "write_everything"
+    if such(p, von, pos, (&m3[0]) as u64, 16) {
+        return false
+    }
+    var m4: [u8; 10] = "text_width"
+    if such(p, von, pos, (&m4[0]) as u64, 10) {
+        return false
+    }
+    var m5: [u8; 9] = "run_width"
+    if such(p, von, pos, (&m5[0]) as u64, 9) {
+        return false
+    }
+    var m6: [u8; 8] = "c_length"
+    if such(p, von, pos, (&m6[0]) as u64, 8) {
+        return false
+    }
+    var m7: [u8; 6] = "mem_eq"
+    if such(p, von, pos, (&m7[0]) as u64, 6) {
+        return false
+    }
+    var m8: [u8; 9] = "read_file"
+    return !such(p, von, pos, (&m8[0]) as u64, 9)
+}
+
+// DIE SOLLBREITE EINER BESCHRIFTUNG, AUF DEM WEG DER BIBLIOTHEK.
+// Gemessen wird mit `render.pref_of` und nicht mit einer eigenen
+// Summierung daneben: es gibt einen Ort fuer das Mess-Protokoll, und
+// das ist lib/fui/render.fi.
+fn mess_breite(c: *mut render.Ctx, p: u64, n: usize) -> f64 {
+    var e: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_place(&e, 0.0, 0.0, 100.0, 18.0)
+    widget.w_set_text(&e, p, n)
+    let s: *mut style.Style = widget.w_style(&e)
+    *s = style.style_set_font(*s, 0, MESS_PX)
+    *s = style.style_set_pad(*s, 0, 0)
+    var pw: f64 = 0.0
+    var ph: f64 = 0.0
+    render.pref_of(c, &e, &pw, &ph)
+    return pw
+}
+
+// Eine beschnittene Kette wird BENANNT: Datei, Zeile, Name, gemalte
+// Laenge, Feldlaenge. Genau diese Zeile hat gefehlt, als aus "red
+// fixed " acht Bytes wurden.
+fn sag_beschnitten(pfad: u64, zeile: i64, name: u64, nl: usize,
+    gemalt: i64, feld: i64) {
+    var t: rt.Buf = rt.buf_new()
+    var k1: [u8; 14] = "  BESCHNITTEN "
+    rt.buf_push_bytes(&t, (&k1[0]) as u64, 14)
+    rt.buf_push_bytes(&t, pfad, rt.c_length(pfad))
+    rt.buf_push(&t, 58 as u8)
+    rt.buf_push_dec_i64(&t, zeile)
+    var k2: [u8; 2] = "  "
+    rt.buf_push_bytes(&t, (&k2[0]) as u64, 2)
+    rt.buf_push_bytes(&t, name, nl)
+    var k3: [u8; 9] = ": gemalt "
+    rt.buf_push_bytes(&t, (&k3[0]) as u64, 9)
+    rt.buf_push_dec_i64(&t, gemalt)
+    var k4: [u8; 14] = " Byte von Feld"
+    rt.buf_push_bytes(&t, (&k4[0]) as u64, 14)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, feld)
+    var k5: [u8; 25] = " -- die Kette ist kuerzer"
+    rt.buf_push_bytes(&t, (&k5[0]) as u64, 25)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Eine Beschriftung, die breiter ist als das Blatt. Auch sie steht im
+// Bild nur abgeschnitten -- nur schneidet diesmal die Leinwand.
+fn sag_zu_breit(pfad: u64, zeile: i64, name: u64, nl: usize,
+    hat: i64, darf: i64) {
+    var t: rt.Buf = rt.buf_new()
+    var k1: [u8; 12] = "  ZU BREIT  "
+    rt.buf_push_bytes(&t, (&k1[0]) as u64, 12)
+    rt.buf_push_bytes(&t, pfad, rt.c_length(pfad))
+    rt.buf_push(&t, 58 as u8)
+    rt.buf_push_dec_i64(&t, zeile)
+    var k2: [u8; 2] = "  "
+    rt.buf_push_bytes(&t, (&k2[0]) as u64, 2)
+    rt.buf_push_bytes(&t, name, nl)
+    var k3: [u8; 10] = ": braucht "
+    rt.buf_push_bytes(&t, (&k3[0]) as u64, 10)
+    rt.buf_push_dec_i64(&t, hat)
+    var k4: [u8; 21] = " Punkt, das Blatt hat"
+    rt.buf_push_bytes(&t, (&k4[0]) as u64, 21)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, darf)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Die Zusammenfassung einer Datei, mit Zahlen: so viele gemalte Ketten
+// standen darin, so viele waren beschnitten, so breit war die breiteste.
+fn sag_datei_ketten(pfad: u64, ketten: i64, schlimm: i64, breitest: i64,
+    grenze: i64, messen: bool) {
+    var t: rt.Buf = rt.buf_new()
+    var k0: [u8; 2] = "  "
+    rt.buf_push_bytes(&t, (&k0[0]) as u64, 2)
+    rt.buf_push_bytes(&t, pfad, rt.c_length(pfad))
+    var i: usize = rt.c_length(pfad)
+    while i < 32 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    rt.buf_push_dec_i64(&t, ketten)
+    var k1: [u8; 22] = " gemalte Ketten, davon"
+    rt.buf_push_bytes(&t, (&k1[0]) as u64, 22)
+    rt.buf_push(&t, 32 as u8)
+    rt.buf_push_dec_i64(&t, schlimm)
+    var k2: [u8; 12] = " beschnitten"
+    rt.buf_push_bytes(&t, (&k2[0]) as u64, 12)
+    if messen {
+        var k3: [u8; 14] = ", breiteste = "
+        rt.buf_push_bytes(&t, (&k3[0]) as u64, 14)
+        rt.buf_push_dec_i64(&t, breitest)
+        var k4: [u8; 4] = " of "
+        rt.buf_push_bytes(&t, (&k4[0]) as u64, 4)
+        rt.buf_push_dec_i64(&t, grenze)
+        var k5: [u8; 6] = " Punkt"
+        rt.buf_push_bytes(&t, (&k5[0]) as u64, 6)
+    }
+    if schlimm == 0 {
+        var o: [u8; 5] = "  OK\n"
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 5)
+    } else {
+        var o: [u8; 8] = "  WRONG\n"
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 8)
+    }
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// EINE QUELLE, DURCHGERECHNET. Zurueck kommt die Zahl der Verletzungen,
+// oder -1, wenn die Datei nicht lesbar war (auch das ist eine: eine
+// Pruefung, die ihre Quelle nicht findet, hat nichts geprueft).
+fn ketten_datei(c: *mut render.Ctx, pfad: u64, breite: i64,
+    messen: bool) -> i64 {
+    var roh: rt.Buf = rt.buf_new()
+    if !rt.read_file(pfad, &roh) {
+        var e1: [u8; 32] = "  QUELLE FEHLT, nicht geprueft: "
+        rt.write_everything(1, (&e1[0]) as u64, 32)
+        rt.write_everything(1, pfad, rt.c_length(pfad))
+        var nl: [u8; 1] = "\n"
+        rt.write_everything(1, (&nl[0]) as u64, 1)
+        rt.buf_free(&roh)
+        return -1
+    }
+    let p: u64 = rt.buf_ptr(&roh)
+    let n: usize = rt.buf_len(&roh)
+    // Die Feldangaben dieser Datei, in der Reihenfolge des Quelltextes.
+    // Zu einer Verwendung gehoert die NAECHSTE davor -- dieselbe, die
+    // auch der Uebersetzer nimmt.
+    var d_pos: [usize; 256] = [0; 256]
+    var d_no: [usize; 256] = [0; 256]
+    var d_nl: [usize; 256] = [0; 256]
+    var d_feld: [usize; 256] = [0; 256]
+    var d_pad: [usize; 256] = [0; 256]
+    var d_lit: [usize; 256] = [0; 256]
+    var d_esc: [usize; 256] = [0; 256]
+    var nd: usize = 0
+    var ketten: i64 = 0
+    var schlimm: i64 = 0
+    var breitest: i64 = 0
+    let grenze: i64 = breite - 2 * RAND
+    var mfeld: [u8; 4] = "[u8;"
+    var mnull: [u8; 4] = "[0])"
+    var mas: [u8; 2] = "as"
+    var mu64: [u8; 3] = "u64"
+    var i: usize = 0
+    while i < n {
+        let b: u32 = at(p, i)
+        if b == 47 as u32 && i + 1 < n && at(p, i + 1) == 47 as u32 {
+            // Ein Kommentar. Was darin steht, malt niemand.
+            while i < n && at(p, i) != 10 as u32 {
+                i = i + 1
+            }
+        } else if b == 34 as u32 {
+            // Eine Zeichenkette, die zu keiner Feldangabe gehoert (etwa
+            // eine Adresse mit "//" darin). Sie wird uebersprungen,
+            // damit ihr Inhalt nicht als Quelltext gelesen wird.
+            i = i + 1
+            while i < n && at(p, i) != 34 as u32 {
+                if at(p, i) == 92 as u32 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            i = i + 1
+        } else if passt(p, n, i, (&mfeld[0]) as u64, 4) {
+            var j: usize = ueber_leer(p, n, i + 4)
+            var feld: usize = 0
+            var stellen: usize = 0
+            while j < n && ist_ziffer(at(p, j)) {
+                feld = feld * 10 + ((at(p, j) - 48 as u32) as usize)
+                j = j + 1
+                stellen = stellen + 1
+            }
+            j = ueber_leer(p, n, j)
+            if stellen == 0 || j >= n || at(p, j) != 93 as u32 {
+                i = i + 4
+            } else {
+                j = ueber_leer(p, n, j + 1)
+                // Der Name steht VOR der Feldangabe: "name: [u8; N]".
+                var q: usize = i
+                var no: usize = 0
+                var nlen: usize = 0
+                while q > 0 && ist_leer(at(p, q - 1)) {
+                    q = q - 1
+                }
+                if q > 0 && at(p, q - 1) == 58 as u32 {
+                    q = q - 1
+                    while q > 0 && ist_leer(at(p, q - 1)) {
+                        q = q - 1
+                    }
+                    let ende: usize = q
+                    while q > 0 && ist_namenszeichen(at(p, q - 1)) {
+                        q = q - 1
+                    }
+                    no = q
+                    nlen = ende - q
+                }
+                var lit: usize = 0
+                var pad: usize = 0
+                var esc: usize = 0
+                var weiter: usize = i + 4
+                if j < n && at(p, j) == 61 as u32 {
+                    let k0: usize = ueber_leer(p, n, j + 1)
+                    if k0 < n && at(p, k0) == 34 as u32 {
+                        lit = k0 + 1
+                        var k: usize = lit
+                        while k < n && at(p, k) != 34 as u32 {
+                            if at(p, k) == 92 as u32 {
+                                esc = 1
+                                k = k + 2
+                            } else {
+                                k = k + 1
+                            }
+                        }
+                        // DIE FUELLUNG AM ENDE. Abschliessende
+                        // Leerzeichen, `\0` und `\n` tragen kein Wort:
+                        // eine Kette, die sie weglaesst, ist nicht
+                        // beschnitten, sondern nur nicht aufgefuellt.
+                        var e: usize = k
+                        var fertig: bool = false
+                        while !fertig {
+                            if e > lit && at(p, e - 1) == 32 as u32 {
+                                e = e - 1
+                                pad = pad + 1
+                            } else if e > lit + 1 && at(p, e - 2) == 92 as u32
+                                && (at(p, e - 1) == 48 as u32
+                                || at(p, e - 1) == 110 as u32) {
+                                e = e - 2
+                                pad = pad + 1
+                            } else {
+                                fertig = true
+                            }
+                        }
+                        weiter = k + 1
+                    }
+                }
+                if nlen > 0 && nd < MAX_FELDER {
+                    d_pos[nd] = i
+                    d_no[nd] = no
+                    d_nl[nd] = nlen
+                    d_feld[nd] = feld
+                    d_pad[nd] = pad
+                    d_lit[nd] = lit
+                    d_esc[nd] = esc
+                    nd = nd + 1
+                }
+                i = weiter
+            }
+        } else if passt(p, n, i, (&mnull[0]) as u64, 4) {
+            // Eine Verwendung "(&name[0]) as u64, M" -- also der
+            // Anspruch, die GANZE Kette zu malen.
+            var q: usize = i
+            while q > 0 && ist_namenszeichen(at(p, q - 1)) {
+                q = q - 1
+            }
+            let nlen: usize = i - q
+            var gemalt: usize = 0
+            var gut: bool = false
+            if nlen > 0 {
+                var j: usize = ueber_leer(p, n, i + 4)
+                if passt(p, n, j, (&mas[0]) as u64, 2) {
+                    j = ueber_leer(p, n, j + 2)
+                    if passt(p, n, j, (&mu64[0]) as u64, 3) {
+                        j = ueber_leer(p, n, j + 3)
+                        if j < n && at(p, j) == 44 as u32 {
+                            j = ueber_leer(p, n, j + 1)
+                            var st: usize = 0
+                            while j < n && ist_ziffer(at(p, j)) {
+                                gemalt = gemalt * 10
+                                    + ((at(p, j) - 48 as u32) as usize)
+                                j = j + 1
+                                st = st + 1
+                            }
+                            gut = st > 0
+                        }
+                    }
+                }
+            }
+            if gut && wird_gemalt(p, i) {
+                var k: usize = nd
+                var fund: usize = MAX_FELDER
+                while k > 0 {
+                    k = k - 1
+                    if d_pos[k] < i && d_nl[k] == nlen
+                        && rt.mem_eq(p + (d_no[k] as u64), p + (q as u64),
+                            nlen) {
+                        fund = k
+                        break
+                    }
+                }
+                if fund < MAX_FELDER && d_lit[fund] != 0 {
+                    ketten = ketten + 1
+                    let feld: i64 = d_feld[fund] as i64
+                    let pad: i64 = d_pad[fund] as i64
+                    let gz: i64 = gemalt as i64
+                    if gz > feld || gz + pad < feld {
+                        schlimm = schlimm + 1
+                        sag_beschnitten(pfad, zeile_von(p, i),
+                            p + (d_no[fund] as u64), nlen, gz, feld)
+                    } else if messen && d_esc[fund] == 0 && grenze > 0
+                        && at(p, d_lit[fund]) != 60 as u32 {
+                        // KEINE BREITE FUER EIN DOKUMENT. Eine Kette, die
+                        // mit "<" anfaengt, ist ein SVG (tools/fui/
+                        // artshow_main.fi haelt seine Symbole als
+                        // Quelltext) und keine Beschriftung: sie wird
+                        // gerastert, nicht gesetzt, und ihre 179 Bytes
+                        // sagen ueber die Breite des Blattes nichts. Die
+                        // LAENGENrechnung gilt fuer sie weiter -- ein
+                        // halbes SVG ist genauso kaputt wie ein halbes
+                        // Wort.
+                        let need: f64 = mess_breite(c,
+                            p + (d_lit[fund] as u64), gemalt)
+                        let ni: i64 = (need + 0.5) as i64
+                        if ni > breitest {
+                            breitest = ni
+                        }
+                        if ni > grenze {
+                            schlimm = schlimm + 1
+                            sag_zu_breit(pfad, zeile_von(p, i),
+                                p + (d_no[fund] as u64), nlen, ni, grenze)
+                        }
+                    }
+                }
+            }
+            i = i + 4
+        } else {
+            i = i + 1
+        }
+    }
+    sag_datei_ketten(pfad, ketten, schlimm, breitest, grenze,
+        messen && grenze > 0)
+    rt.buf_free(&roh)
+    return schlimm
+}
+
+// Die Betriebsart "--ketten" von Anfang bis Ende: Schrift und Leinwand
+// einmal, dann jede genannte Quelle.
+fn ketten_lauf(start: u64) -> i32 {
+    let fpfad: u64 = rt.arg_ptr(start, 2)
+    let breite: i64 = zahl_von(rt.arg_ptr(start, 3))
+    var messen: bool = true
+    if rt.ld8(fpfad, 0) == 45 as u8 || breite == 0 {
+        // "-" statt einer Schrift, oder Breite 0: dann wird nur die
+        // Kettenlaenge gerechnet. Die Laengenpruefung braucht keine
+        // Schrift, und sie soll auch auf einem Rechner ohne DejaVu
+        // laufen.
+        messen = false
+    }
+    var fbuf: rt.Buf = rt.buf_new()
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(4096) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 3
+    }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if messen {
+        if !rt.read_file(fpfad, &fbuf) {
+            var ks: [u8; 54] = "  KETTEN: die Schrift ist nicht lesbar -- kein Beleg.\n"
+            rt.write_everything(2, (&ks[0]) as u64, 54)
+            return 9
+        }
+        if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            var kl: [u8; 49] = "  KETTEN: die Schrift laedt nicht -- kein Beleg.\n"
+            rt.write_everything(2, (&kl[0]) as u64, 49)
+            return 9
+        }
+        fm = fsp as u64
+    }
+    // Eine kleine Leinwand genuegt: gemessen wird, nicht gemalt.
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 64, 64) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 64, 64) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    var m: theme.Theme = theme.theme_new(false)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    var schlimm: i64 = 0
+    var i: usize = 4
+    while i < rt.arg_count(start) {
+        let r: i64 = ketten_datei(&c, rt.arg_ptr(start, i), breite, messen)
+        if r < 0 {
+            schlimm = schlimm + 1
+        } else {
+            schlimm = schlimm + r
+        }
+        i = i + 1
+    }
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    if schlimm != 0 {
+        var f: [u8; 51] = "  EINE BESCHRIFTUNG IST BESCHNITTEN -- KEIN BELEG.\n"
+        rt.write_everything(1, (&f[0]) as u64, 51)
+        return 1
+    }
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    // DIE BETRIEBSART STEHT IM ERSTEN WORT. "--ketten" liest Quellen
+    // und rechnet Beschriftungen nach, alles andere ist ein Bild.
+    if rt.arg_count(start) >= 5 {
+        var mk: [u8; 8] = "--ketten"
+        if rt.c_length(rt.arg_ptr(start, 1)) == 8
+            && rt.mem_eq(rt.arg_ptr(start, 1), (&mk[0]) as u64, 8) {
+            return ketten_lauf(start)
+        }
+    }
+    if rt.arg_count(start) < 6 {
+        var u: [u8; 59] = "belegpruef <png> <br> <hmin> <hmax> <farben> [rand] [seit]\n"
+        rt.write_everything(2, (&u[0]) as u64, 59)
+        return 2
+    }
+    let pfad: u64 = rt.arg_ptr(start, 1)
+    let soll_w: i64 = zahl_von(rt.arg_ptr(start, 2))
+    let h_min: i64 = zahl_von(rt.arg_ptr(start, 3))
+    let h_max: i64 = zahl_von(rt.arg_ptr(start, 4))
+    let min_farben: i64 = zahl_von(rt.arg_ptr(start, 5))
+    // DER HOECHSTE LEERE STREIFEN UNTEN, als sechstes Argument. Fehlt
+    // er, ist er 0 und Abschnitt 4 laesst den Zuschnitt ungeprueft --
+    // die Belege, die ihre Leinwand nicht zuschneiden, rufen ohne ihn.
+    var rand_max: i64 = 0
+    if rt.arg_count(start) >= 7 {
+        rand_max = zahl_von(rt.arg_ptr(start, 6))
+    }
+    // Ob auch links und rechts Luft verlangt wird (siebtes Argument,
+    // 1 = ja). Siehe Abschnitt 4.
+    var seiten: i64 = 0
+    if rt.arg_count(start) >= 8 {
+        seiten = zahl_von(rt.arg_ptr(start, 7))
+    }
+
+    var roh: rt.Buf = rt.buf_new()
+    if !rt.read_file(pfad, &roh) {
+        var e1: [u8; 37] = "BELEG FEHLT: die Datei ist nicht da.\n"
+        rt.write_everything(2, (&e1[0]) as u64, 37)
+        sag_datei(pfad)
+        return 1
+    }
+    var im: png.Image = png.image_new()
+    if !png.decode_png(rt.buf_ptr(&roh), rt.buf_len(&roh), &im) {
+        var e2: [u8; 42] = "BELEG UNLESBAR: kein gueltiges PNG darin.\n"
+        rt.write_everything(2, (&e2[0]) as u64, 42)
+        sag_datei(pfad)
+        rt.buf_free(&roh)
+        return 1
+    }
+    sag_datei(pfad)
+
+    // ================================================ 1. DIE ABMESSUNGEN
+    let w: usize = png.image_width(&im)
+    let h: usize = png.image_height(&im)
+    var n1: [u8; 22] = "1 the width as painted"
+    report((&n1[0]) as u64, 22, (w as i64) == soll_w, w as i64, soll_w)
+    var n2: [u8; 32] = "1 the height within its bounds  "
+    report((&n2[0]) as u64, 30,
+        (h as i64) >= h_min && (h as i64) <= h_max, h as i64, h_max)
+    if (w as i64) != soll_w || (h as i64) < h_min || (h as i64) > h_max ||
+        w < 8 || h < 8 {
+        png.image_free(&im)
+        rt.buf_free(&roh)
+        return 1
+    }
+
+    // ================ 2. DIE VIELFALT UND 3. DER INHALT JE BAND
+    let tab: *mut u64 = rt.heap_alloc(PLAETZE * 8) as *mut u64
+    if tab as usize == 0 {
+        png.image_free(&im)
+        rt.buf_free(&roh)
+        return 3
+    }
+    rt.mem_set(tab as u64, 0 as u8, PLAETZE * 8)
+    let grund: u32 = png.image_pixel(&im, 2, 2) & 16777215 as u32
+    var farben: usize = 0
+    var voll: [i64; 6] = [0; 6]
+    let bh: usize = h / BAENDER
+    var y: usize = 0
+    while y < h {
+        var b: usize = y / bh
+        if b >= BAENDER {
+            b = BAENDER - 1
+        }
+        var x: usize = 0
+        while x < w {
+            let c: u32 = png.image_pixel(&im, x, y) & 16777215 as u32
+            if farben < MAX_FARBEN {
+                if farbe_neu(tab, c) {
+                    farben = farben + 1
+                }
+            }
+            if anders(c, grund) {
+                voll[b] = voll[b] + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    rt.heap_free(tab as u64, PLAETZE * 8)
+
+    var n3: [u8; 31] = "2 distinct colours in the image"
+    report((&n3[0]) as u64, 31, (farben as i64) >= min_farben,
+        farben as i64, min_farben)
+
+    // Der Anteil je Band in Promille. Das letzte Band traegt den Rest
+    // der Division mit, deshalb wird seine Hoehe getrennt gerechnet --
+    // sonst faellt bei einer Hoehe wie 764 die letzte Zeile in ein
+    // Band, das als leer gilt.
+    var i: usize = 0
+    while i < BAENDER {
+        var hoehe: usize = bh
+        if i == BAENDER - 1 {
+            hoehe = h - bh * (BAENDER - 1)
+        }
+        let pro: i64 = (voll[i] * 1000) / ((hoehe * w) as i64)
+        var nb: [u8; 34] = "3 band 0: per mille painted over 0"
+        // Die Bandnummer in die Meldung schreiben, damit man sieht,
+        // WELCHES Band leer blieb.
+        nb[7] = (48 + i) as u8
+        report((&nb[0]) as u64, 34, pro >= MIN_PROMILLE, pro, MIN_PROMILLE)
+        i = i + 1
+    }
+
+    // ============================== 4. DER ZUSCHNITT UND DIE RAENDER
+    //
+    // Abschnitt 3 fragt nur, ob in jedem Band UEBERHAUPT etwas steht.
+    // Das uebersieht genau zwei Fehler, die man auf dem Blatt sofort
+    // sieht:
+    //
+    //   a) ABGESCHNITTEN. Ein Element, das ueber den Rand der Leinwand
+    //      hinausragt, hinterlaesst Farbe in der ERSTEN oder LETZTEN
+    //      Zeile bzw. Spalte. Ein sauber gesetztes Blatt hat dort
+    //      seinen Rand und sonst nichts -- jede Galerie dieses Baumes
+    //      faengt mit 20 Punkten Luft an.
+    //   b) EIN LEERER STREIFEN UNTEN. Wer die Leinwand auf eine
+    //      Konstante setzt statt auf den Inhalt, liefert unter dem
+    //      letzten Band einen leeren Block mit aus -- im dunklen Schema
+    //      ein schwarzer Balken, der wie ein halb gerenderter Beleg
+    //      aussieht. Erlaubt ist der Rand, mit dem das Blatt auch oben
+    //      anfaengt, plus etwas Spiel; mehr ist ein Zuschnittfehler.
+    //
+    // Gemessen wird an der TATSAECHLICHEN Farbe, nicht an einer
+    // Konstanten des malenden Programms: `oben`/`unten` sind die erste
+    // und die letzte Zeile, in der etwas steht.
+    var oben: i64 = 0 - 1
+    var unten: i64 = 0 - 1
+    var links: i64 = 0 - 1
+    var rechts: i64 = 0 - 1
+    var yy: usize = 0
+    while yy < h {
+        var xx: usize = 0
+        while xx < w {
+            // FUER DEN ZUSCHNITT WIRD JEDE ABWEICHUNG GEZAEHLT, nicht
+            // erst eine ueber TOLERANZ. Der Grund steht im Beleg
+            // fui-wave1: dort liegt unten eine Flaeche mit dem Ton
+            // 249,249,251 auf einem Grund von 244,244,246 -- ein
+            // Unterschied von 5, also UNTER der Schwelle, die gegen
+            // das Rauschen der Kantenglaettung gesetzt ist. Mit der
+            // Schwelle gemessen sah der Zuschnitt 53 Punkte leer, wo
+            // in Wahrheit noch die Knopfflaeche steht (nachgesehen:
+            // sie reicht bis Zeile 649 von 670). Eine Pruefung, die
+            // eine vorhandene Flaeche fuer Luft haelt, faerbt einen
+            // richtigen Beleg rot -- also zaehlt hier jeder
+            // Unterschied.
+            if png.image_pixel(&im, xx, yy) & 16777215 as u32 != grund {
+                if oben < 0 {
+                    oben = yy as i64
+                }
+                unten = yy as i64
+                if links < 0 || (xx as i64) < links {
+                    links = xx as i64
+                }
+                if (xx as i64) > rechts {
+                    rechts = xx as i64
+                }
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    // Ein Blatt ohne jede Farbe ist schon an Abschnitt 3 gescheitert;
+    // hier wird nur noch geteilt, wenn es etwas zu teilen gibt.
+    if oben >= 0 {
+        // DIE OBERKANTE GILT IMMER. Jede Galerie dieses Baumes faengt
+        // mit Luft an; Farbe in der ersten Zeile heisst, dass oben
+        // etwas abgeschnitten ist.
+        var n4: [u8; 40] = "4 nothing touches the top edge          "
+        report((&n4[0]) as u64, 38, oben >= 1, oben, 1)
+        // DIE SEITEN NUR AUF VERLANGEN. Zwei Belege setzen mit ABSICHT
+        // etwas ueber die volle Breite -- der Verdunkler hinter den
+        // Dialogen in fui-wave3 (Zeilen 634..923) und die Trennlinie
+        // unter der Titelzeile in fui-demo. Das ist kein
+        // abgeschnittenes Element, sondern eine Flaeche, die so
+        // gemeint ist. Wer `seiten` auf 1 setzt, verlangt Luft auch
+        // links und rechts; ohne die Angabe bleibt es bei der
+        // Oberkante, und eine falsche Pruefung, die jeden Lauf rot
+        // faerbt, entsteht gar nicht erst.
+        if seiten != 0 {
+            var n5: [u8; 40] = "4 nothing touches the left edge         "
+            report((&n5[0]) as u64, 38, links >= 1, links, 1)
+            var n6: [u8; 40] = "4 nothing touches the right edge        "
+            report((&n6[0]) as u64, 38, rechts <= (w as i64) - 2,
+                rechts, (w as i64) - 2)
+        }
+        // DER STREIFEN UNTEN. `rand_max` kommt als sechstes Argument;
+        // ohne Angabe gilt 0 und die Pruefung entfaellt -- so bleibt
+        // der Aufruf der Belege abwaertskompatibel, die ihre Hoehe
+        // nicht auf den Inhalt zuschneiden.
+        if rand_max > 0 {
+            let leer: i64 = (h as i64) - 1 - unten
+            var n7: [u8; 40] = "4 the empty strip below stays small     "
+            report((&n7[0]) as u64, 38, leer <= rand_max, leer, rand_max)
+        }
+    }
+
+    png.image_free(&im)
+    rt.buf_free(&roh)
+
+    var t: rt.Buf = rt.buf_new()
+    if G_ERRORS > 0 {
+        var f: [u8; 26] = "THIS PICTURE IS NO PROOF.\n"
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 26)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+        return 1
+    }
+    var o: [u8; 18] = "BELEG IN ORDNUNG.\n"
+    rt.buf_push_bytes(&t, (&o[0]) as u64, 18)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return 0
+}

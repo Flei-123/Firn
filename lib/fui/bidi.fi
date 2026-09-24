@@ -1,0 +1,1092 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/bidi.fi -- DIE ZWEIRICHTUNGSSCHRIFT: EBENEN UND REIHENFOLGE.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Arabisch und Hebraeisch werden von rechts nach links geschrieben, Zahlen
+// darin aber von links nach rechts, und ein lateinisches Wort mitten in
+// einem hebraeischen Satz auch. Eine Oberflaeche, die jede Zeichenkette
+// einfach von links nach rechts malt, zeigt einem arabischen Leser jedes
+// Wort spiegelverkehrt -- und kein Pruefprogramm merkt es, denn die
+// Zeichen stehen ja alle da. Welche Reihenfolge richtig ist, sagt nicht
+// der Geschmack, sondern der Unicode-Bidi-Algorithmus (UAX #9). Diese
+// Datei ist er.
+//
+// ================================================== WAS HIER GERECHNET WIRD
+//
+// NUR EBENEN UND REIHENFOLGE. Woher die Klasse eines Zeichens kommt, sagt
+// lib/str/ucd_bidi.fi (aus der UCD erzeugt, nicht von Hand); wie ein
+// arabischer Buchstabe seine Form waehlt, sagt lib/fui/shape.fi; wie breit
+// eine Glyphe ist, sagt lib/font/metrics.fi; gemalt wird in
+// lib/fui/painter.fi. Hier steht, auf welcher EBENE jedes Zeichen landet
+// und in welcher Reihenfolge die Zeichen einer Zeile auf dem Schirm
+// stehen -- sonst nichts. Genau diese Trennung macht es pruefbar:
+// tools/fui/bidi_main.fi rechnet die Ebenen und die Reihenfolge ohne
+// Schrift und ohne Leinwand nach.
+//
+// Die Regeln, in der Reihenfolge der Spezifikation (Unicode 17.0.0):
+//
+//   P2, P3   die Absatzebene: das erste starke Zeichen (L, R, AL), wobei
+//            der Inhalt von Isolaten uebersprungen wird -- oder vom
+//            Aufrufer vorgegeben (`direction: ltr|rtl` im Stilblatt)
+//   X1..X8   die expliziten Einbettungen, Ueberschreibungen und Isolate
+//            (LRE RLE LRO RLO PDF LRI RLI FSI PDI) mit dem Stapel der
+//            Tiefe 125
+//   X9       die Steuerzeichen fallen heraus (sie werden hier zu BN und
+//            in allen weiteren Regeln uebersprungen)
+//   X10      Laufabschnitte gleicher Ebene, verbunden ueber passende
+//            Isolate zu Folgen; sos und eos an ihren Raendern
+//   W1..W7   die schwachen Typen: NSM, Zahlen, Trenner
+//   N0       Klammerpaare (BD16, hoechstens 63 offene)
+//   N1, N2   die Neutralen zwischen starken Zeichen
+//   I1, I2   die impliziten Ebenen
+//   L1       Trenner und Leerraum am Zeilenende auf die Absatzebene
+//   L2       die Umkehrung von der hoechsten Ebene bis zur niedrigsten
+//            ungeraden
+//
+// L3 (Kombinationszeichen hinter ihren Grundbuchstaben halten) und L4
+// (Spiegelbilder in ungeraden Ebenen) gehoeren zum Malen der Glyphen und
+// stehen in lib/fui/shape.fi bzw. lib/fui/painter.fi -- sie aendern keine
+// Ebene.
+//
+// ================================================= WIE DIE FELDER AUSSEHEN
+//
+// Ohne Zuteilung. Der Aufrufer reicht Zeiger auf Felder, die er selbst
+// haelt (der Maler haelt sie einmal je Maler, siehe painter.fi), und
+// `bidi_work_bytes(n)` sagt, wie gross der Arbeitsbereich sein muss. Das
+// ist dieselbe Regel wie im TrueType-Leser: wer in einem Zeichenweg
+// zuteilt, bezahlt bei jedem Bild -- und im Osum-Fenster-Server gibt es
+// beim Malen gar keinen Haufen.
+//
+//   cp    u32[n]   die Codepunkte, in logischer Reihenfolge
+//   cls0  u8[n]    die Klasse aus der UCD, unveraendert (L1 braucht sie)
+//   cls   u8[n]    die Klasse im Lauf der Regeln
+//   lev   u8[n]    die aufgeloeste Ebene
+//   pl    u8[n]    die Absatzebene des Absatzes, zu dem das Zeichen gehoert
+//   work  bidi_work_bytes(n) Oktette
+//
+// Alle Funktionen sind #[no_gc]: die Messwege des Malers sind es, und das
+// Versprechen gilt fuer den ganzen Aufrufbaum.
+import str.ucd_bidi
+
+export {
+    BidiPara, bidi_new, bidi_work_bytes, bidi_run, bidi_needed,
+    bidi_para_level_of, bidi_first_strong,
+    bidi_line_levels, bidi_reorder, bidi_is_removed,
+    DIR_AUTO, DIR_LTR, DIR_RTL,
+    MAX_DEPTH,
+}
+
+// DIE ABSATZRICHTUNG. AUTO heisst P2/P3 (das erste starke Zeichen
+// entscheidet, ohne eines gilt links nach rechts); LTR und RTL geben die
+// Absatzebene fest vor (0 bzw. 1) -- das ist `direction: ltr|rtl` aus
+// lib/fui/style.fi.
+const DIR_AUTO: u32 = 0
+const DIR_LTR: u32 = 1
+const DIR_RTL: u32 = 2
+
+// Die groesste explizite Ebene (BD2). 125, damit 126 als ungerade Ebene
+// darueber fuer I1/I2 noch Platz hat.
+const MAX_DEPTH: u8 = 125
+
+// Hoechstens so viele offene Klammern verfolgt BD16. Wer mehr offen hat,
+// bekommt fuer den Rest der Folge keine Paare mehr -- so steht es in der
+// Spezifikation, und genau das tut `pair_brackets`.
+const BRACKET_STACK: usize = 63
+
+const NONE: u32 = 0xFFFFFFFF
+
+struct BidiPara {
+    t: u64,       // die Tabelle aus ucd_bidi.ucd_bidi_map
+    cp: u64,
+    n: usize,
+    cls0: u64,
+    cls: u64,
+    lev: u64,
+    pl: u64,
+    work: u64,
+}
+
+// ------------------------------------------------------------ Lesen/Schreiben
+
+#[no_gc]
+fn r8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+#[no_gc]
+fn w8(p: u64, i: usize, v: u8) {
+    *((p + i as u64) as *mut u8) = v
+}
+
+#[no_gc]
+fn r32(p: u64, i: usize) -> u32 {
+    return *((p + (i * 4) as u64) as *mut u32)
+}
+
+#[no_gc]
+fn w32(p: u64, i: usize, v: u32) {
+    *((p + (i * 4) as u64) as *mut u32) = v
+}
+
+// ------------------------------------------------------------ der Arbeitsraum
+//
+// Die Teilfelder, in dieser Reihenfolge ab `work`:
+//
+//   match   u32[n]   zu jedem Isolat-Anfang der passende PDI (BD9)
+//   mpdi    u8[n]    1, wenn dieser PDI zu einem Anfang gehoert
+//   rs, re  u32[n]   Anfang und Ende jedes Laufabschnittes (BD7)
+//   runat   u32[n]   welcher Abschnitt an diesem Zeichen beginnt
+//   seq     u32[n]   die Zeichen der gerade bearbeiteten Folge (BD13)
+//   pairs   u32[n]   Klammerpaare, je zwei Eintraege
+//   stk     3 x 128  Oktette: der Richtungsstapel von X1..X8
+//   bstk    u32[126] der Klammerstapel von BD16
+#[no_gc]
+fn off_match(n: usize) -> usize { return 0 }
+
+#[no_gc]
+fn off_mpdi(n: usize) -> usize { return n * 4 }
+
+#[no_gc]
+fn off_rs(n: usize) -> usize { return n * 5 }
+
+#[no_gc]
+fn off_re(n: usize) -> usize { return n * 9 }
+
+#[no_gc]
+fn off_runat(n: usize) -> usize { return n * 13 }
+
+#[no_gc]
+fn off_seq(n: usize) -> usize { return n * 17 }
+
+#[no_gc]
+fn off_pairs(n: usize) -> usize { return n * 21 }
+
+#[no_gc]
+fn off_stk(n: usize) -> usize { return n * 25 }
+
+#[no_gc]
+fn off_bstk(n: usize) -> usize { return n * 25 + 384 }
+
+#[no_gc]
+fn bidi_work_bytes(n: usize) -> usize {
+    // Aufgerundet auf acht, damit ein Aufrufer, der dahinter weitere
+    // Felder legt, ausgerichtet bleibt.
+    return (n * 25 + 384 + 126 * 4 + 7) / 8 * 8
+}
+
+#[no_gc]
+fn bidi_new(t: u64, cp: u64, n: usize, cls0: u64, cls: u64, lev: u64,
+    pl: u64, work: u64) -> BidiPara {
+    return BidiPara {
+        t: t, cp: cp, n: n, cls0: cls0, cls: cls, lev: lev, pl: pl,
+        work: work,
+    }
+}
+
+// ------------------------------------------------------------ Klassenfragen
+
+#[no_gc]
+fn is_isolate_init(c: u8) -> bool {
+    return c == ucd_bidi.BIDI_LRI || c == ucd_bidi.BIDI_RLI
+        || c == ucd_bidi.BIDI_FSI
+}
+
+// Die Zeichen, die X9 herausnimmt. Hier ist das nach X1..X8 immer die
+// Klasse BN -- die Einbettungszeichen werden dort zu BN umgeschrieben.
+#[no_gc]
+fn bidi_is_removed(c: u8) -> bool {
+    return c == ucd_bidi.BIDI_BN || c == ucd_bidi.BIDI_LRE
+        || c == ucd_bidi.BIDI_RLE || c == ucd_bidi.BIDI_LRO
+        || c == ucd_bidi.BIDI_RLO || c == ucd_bidi.BIDI_PDF
+}
+
+// NI aus BD6-Anmerkung: die Neutralen und die Isolatzeichen.
+#[no_gc]
+fn is_ni(c: u8) -> bool {
+    return c == ucd_bidi.BIDI_B || c == ucd_bidi.BIDI_S
+        || c == ucd_bidi.BIDI_WS || c == ucd_bidi.BIDI_ON
+        || c == ucd_bidi.BIDI_LRI || c == ucd_bidi.BIDI_RLI
+        || c == ucd_bidi.BIDI_FSI || c == ucd_bidi.BIDI_PDI
+}
+
+// Die starke Richtung im Sinne von N0/N1: L bleibt L, R/AL und die
+// Zahlen EN/AN zaehlen als R. 255 heisst "keine".
+#[no_gc]
+fn strong_n(c: u8) -> u8 {
+    if c == ucd_bidi.BIDI_L {
+        return ucd_bidi.BIDI_L
+    }
+    if c == ucd_bidi.BIDI_R || c == ucd_bidi.BIDI_AL
+        || c == ucd_bidi.BIDI_EN || c == ucd_bidi.BIDI_AN {
+        return ucd_bidi.BIDI_R
+    }
+    return 255 as u8
+}
+
+#[no_gc]
+fn dir_of_level(lv: u8) -> u8 {
+    if (lv & 1 as u8) != 0 as u8 {
+        return ucd_bidi.BIDI_R
+    }
+    return ucd_bidi.BIDI_L
+}
+
+// ======================================================================
+// P2/P3 -- DAS ERSTE STARKE ZEICHEN
+// ======================================================================
+//
+// Zwischen einem Isolat-Anfang und seinem PDI wird NICHT gesucht: ein
+// isoliertes lateinisches Wort am Anfang eines arabischen Satzes darf die
+// Richtung des Satzes nicht bestimmen, genau dafuer gibt es Isolate.
+// Rueckgabe: 0 fuer L, 1 fuer R/AL, -1, wenn keines vorkommt. `stop_pdi`
+// heisst: am ersten PDI der Tiefe 0 aufhoeren (so fragt FSI in X5c).
+#[no_gc]
+fn bidi_first_strong(cls: u64, from: usize, to: usize,
+    stop_pdi: bool) -> i32 {
+    var depth: usize = 0
+    var i: usize = from
+    while i < to {
+        let c: u8 = r8(cls, i)
+        if is_isolate_init(c) {
+            depth = depth + 1
+        } else if c == ucd_bidi.BIDI_PDI {
+            if depth > 0 {
+                depth = depth - 1
+            } else if stop_pdi {
+                return 0 - 1
+            }
+        } else if c == ucd_bidi.BIDI_B {
+            return 0 - 1
+        } else if depth == 0 {
+            if c == ucd_bidi.BIDI_L {
+                return 0
+            }
+            if c == ucd_bidi.BIDI_R || c == ucd_bidi.BIDI_AL {
+                return 1
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ======================================================================
+// BRAUCHT DIESER TEXT DEN ALGORITHMUS UEBERHAUPT?
+// ======================================================================
+//
+// Ohne R, AL, AN und ohne RLE/RLO/RLI bleibt in einem Absatz der Ebene 0
+// jede Ebene gerade (LRE/LRO heben um zwei, EN wird nach W7/I1 hoechstens
+// um zwei gehoben), und L2 kehrt dann nichts um: die Reihenfolge auf dem
+// Schirm ist die logische. Der Maler fragt das VOR allem anderen und geht
+// in diesem Fall seinen alten Weg -- dadurch malt jede lateinische
+// Beschriftung in jedem Beleg Bildpunkt fuer Bildpunkt wie vorher.
+#[no_gc]
+fn bidi_needed(t: u64, cp: u64, n: usize, dir: u32) -> bool {
+    if dir == DIR_RTL {
+        return true
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = ucd_bidi.ucd_bidi_class(t, r32(cp, i))
+        if c == ucd_bidi.BIDI_R || c == ucd_bidi.BIDI_AL
+            || c == ucd_bidi.BIDI_AN || c == ucd_bidi.BIDI_RLE
+            || c == ucd_bidi.BIDI_RLO || c == ucd_bidi.BIDI_RLI {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ======================================================================
+// DER GANZE LAUF: KLASSEN, ABSAETZE, EBENEN
+// ======================================================================
+//
+// Ein Absatz endet hinter jedem Zeichen der Klasse B (P1); jeder bekommt
+// seine eigene Ebene. `dir` gilt fuer alle Absaetze. Zurueck kommt die
+// Ebene des ERSTEN Absatzes -- fuer eine Beschriftung ist das die, nach
+// der sich die Ausrichtung richtet.
+#[no_gc]
+fn bidi_run(p: *mut BidiPara, dir: u32) -> u8 {
+    let n: usize = (*p).n
+    var i: usize = 0
+    while i < n {
+        let c: u8 = ucd_bidi.ucd_bidi_class((*p).t, r32((*p).cp, i))
+        w8((*p).cls0, i, c)
+        w8((*p).cls, i, c)
+        w8((*p).lev, i, 0 as u8)
+        i = i + 1
+    }
+    var first: u8 = 0 as u8
+    var start: usize = 0
+    var k: usize = 0
+    while start < n {
+        var end: usize = start
+        while end < n {
+            let c2: u8 = r8((*p).cls0, end)
+            end = end + 1
+            if c2 == ucd_bidi.BIDI_B {
+                break
+            }
+        }
+        var lv: u8 = 0 as u8
+        if dir == DIR_RTL {
+            lv = 1 as u8
+        } else if dir == DIR_AUTO {
+            if bidi_first_strong((*p).cls0, start, end, false) == 1 {
+                lv = 1 as u8
+            }
+        }
+        if k == 0 {
+            first = lv
+        }
+        resolve_paragraph(p, start, end, lv)
+        var j: usize = start
+        while j < end {
+            w8((*p).pl, j, lv)
+            j = j + 1
+        }
+        start = end
+        k = k + 1
+    }
+    return first
+}
+
+#[no_gc]
+fn bidi_para_level_of(p: *mut BidiPara, i: usize) -> u8 {
+    if (*p).n == 0 {
+        return 0 as u8
+    }
+    return r8((*p).pl, i)
+}
+
+// ------------------------------------------------------ BD9: passende PDIs
+#[no_gc]
+fn match_isolates(p: *mut BidiPara, a: usize, b: usize) {
+    let n: usize = (*p).n
+    let mt: u64 = (*p).work + off_match(n) as u64
+    let mp: u64 = (*p).work + off_mpdi(n) as u64
+    var i: usize = a
+    while i < b {
+        w32(mt, i, NONE)
+        w8(mp, i, 0 as u8)
+        i = i + 1
+    }
+    i = a
+    while i < b {
+        if is_isolate_init(r8((*p).cls0, i)) {
+            var depth: usize = 1
+            var j: usize = i + 1
+            while j < b {
+                let c: u8 = r8((*p).cls0, j)
+                if is_isolate_init(c) {
+                    depth = depth + 1
+                } else if c == ucd_bidi.BIDI_PDI {
+                    depth = depth - 1
+                    if depth == 0 {
+                        w32(mt, i, j as u32)
+                        w8(mp, j, 1 as u8)
+                        break
+                    }
+                } else if c == ucd_bidi.BIDI_B {
+                    break
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ======================================================================
+// X1..X8 -- DER RICHTUNGSSTAPEL
+// ======================================================================
+//
+// Ein Eintrag sind drei Oktette: die Ebene, die Ueberschreibung (0 keine,
+// 1 L, 2 R) und ob er von einem Isolat stammt. Ueberlauf wird GEZAEHLT
+// und nicht abgeschnitten, damit die spaeteren PDF/PDI an den richtigen
+// Eintrag kommen -- das ist der Sinn der drei Zaehler in X1.
+#[no_gc]
+fn next_odd(lv: u8) -> u8 {
+    return (lv + 1 as u8) | 1 as u8
+}
+
+#[no_gc]
+fn next_even(lv: u8) -> u8 {
+    return (lv + 2 as u8) & (254 as u8)
+}
+
+#[no_gc]
+fn explicit_levels(p: *mut BidiPara, a: usize, b: usize, para: u8) {
+    let n: usize = (*p).n
+    let stk: u64 = (*p).work + off_stk(n) as u64
+    let mt: u64 = (*p).work + off_match(n) as u64
+    // Eintrag k: Ebene bei 3k, Ueberschreibung bei 3k+1, Isolat bei 3k+2
+    var sp: usize = 1
+    w8(stk, 0, para)
+    w8(stk, 1, 0 as u8)
+    w8(stk, 2, 0 as u8)
+    var oi: usize = 0     // Ueberlauf der Isolate
+    var oe: usize = 0     // Ueberlauf der Einbettungen
+    var vi: usize = 0     // gueltige Isolate
+    var i: usize = a
+    while i < b {
+        let c: u8 = r8((*p).cls0, i)
+        let top: usize = (sp - 1) * 3
+        let cur: u8 = r8(stk, top)
+        let ovr: u8 = r8(stk, top + 1)
+        if c == ucd_bidi.BIDI_RLE || c == ucd_bidi.BIDI_LRE
+            || c == ucd_bidi.BIDI_RLO || c == ucd_bidi.BIDI_LRO {
+            // X2..X5
+            var nl: u8 = next_even(cur)
+            if c == ucd_bidi.BIDI_RLE || c == ucd_bidi.BIDI_RLO {
+                nl = next_odd(cur)
+            }
+            if nl <= MAX_DEPTH && oi == 0 && oe == 0 {
+                var o: u8 = 0 as u8
+                if c == ucd_bidi.BIDI_RLO {
+                    o = 2 as u8
+                } else if c == ucd_bidi.BIDI_LRO {
+                    o = 1 as u8
+                }
+                w8(stk, sp * 3, nl)
+                w8(stk, sp * 3 + 1, o)
+                w8(stk, sp * 3 + 2, 0 as u8)
+                sp = sp + 1
+            } else if oi == 0 {
+                oe = oe + 1
+            }
+            w8((*p).lev, i, cur)
+            w8((*p).cls, i, ucd_bidi.BIDI_BN)
+        } else if is_isolate_init(c) {
+            // X5a..X5c
+            w8((*p).lev, i, cur)
+            if ovr == 1 as u8 {
+                w8((*p).cls, i, ucd_bidi.BIDI_L)
+            } else if ovr == 2 as u8 {
+                w8((*p).cls, i, ucd_bidi.BIDI_R)
+            }
+            var rtl: bool = c == ucd_bidi.BIDI_RLI
+            if c == ucd_bidi.BIDI_FSI {
+                var e: usize = r32(mt, i) as usize
+                if r32(mt, i) == NONE {
+                    e = b
+                }
+                rtl = bidi_first_strong((*p).cls0, i + 1, e, true) == 1
+            }
+            var nl2: u8 = next_even(cur)
+            if rtl {
+                nl2 = next_odd(cur)
+            }
+            if nl2 <= MAX_DEPTH && oi == 0 && oe == 0 {
+                vi = vi + 1
+                w8(stk, sp * 3, nl2)
+                w8(stk, sp * 3 + 1, 0 as u8)
+                w8(stk, sp * 3 + 2, 1 as u8)
+                sp = sp + 1
+            } else {
+                oi = oi + 1
+            }
+        } else if c == ucd_bidi.BIDI_PDI {
+            // X6a
+            if oi > 0 {
+                oi = oi - 1
+            } else if vi == 0 {
+                // ein PDI ohne Anfang: nichts zu tun
+            } else {
+                oe = 0
+                while r8(stk, (sp - 1) * 3 + 2) == 0 as u8 {
+                    sp = sp - 1
+                }
+                sp = sp - 1
+                vi = vi - 1
+            }
+            let t2: usize = (sp - 1) * 3
+            w8((*p).lev, i, r8(stk, t2))
+            let o2: u8 = r8(stk, t2 + 1)
+            if o2 == 1 as u8 {
+                w8((*p).cls, i, ucd_bidi.BIDI_L)
+            } else if o2 == 2 as u8 {
+                w8((*p).cls, i, ucd_bidi.BIDI_R)
+            }
+        } else if c == ucd_bidi.BIDI_PDF {
+            // X7
+            if oi > 0 {
+                // nichts
+            } else if oe > 0 {
+                oe = oe - 1
+            } else if r8(stk, top + 2) == 0 as u8 && sp >= 2 {
+                sp = sp - 1
+            }
+            w8((*p).lev, i, cur)
+            w8((*p).cls, i, ucd_bidi.BIDI_BN)
+        } else if c == ucd_bidi.BIDI_B {
+            // X8: der Absatztrenner steht auf der Absatzebene
+            w8((*p).lev, i, para)
+        } else if c == ucd_bidi.BIDI_BN {
+            w8((*p).lev, i, cur)
+        } else {
+            // X6
+            w8((*p).lev, i, cur)
+            if ovr == 1 as u8 {
+                w8((*p).cls, i, ucd_bidi.BIDI_L)
+            } else if ovr == 2 as u8 {
+                w8((*p).cls, i, ucd_bidi.BIDI_R)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ======================================================================
+// X10 -- LAUFABSCHNITTE UND IHRE FOLGEN
+// ======================================================================
+#[no_gc]
+fn resolve_paragraph(p: *mut BidiPara, a: usize, b: usize, para: u8) {
+    let n: usize = (*p).n
+    match_isolates(p, a, b)
+    explicit_levels(p, a, b, para)
+
+    // BD7: Laufabschnitte ueber die nicht entfernten Zeichen.
+    let rs: u64 = (*p).work + off_rs(n) as u64
+    let re: u64 = (*p).work + off_re(n) as u64
+    let runat: u64 = (*p).work + off_runat(n) as u64
+    let mt: u64 = (*p).work + off_match(n) as u64
+    let mp: u64 = (*p).work + off_mpdi(n) as u64
+    var nr: usize = 0
+    var i: usize = a
+    var last: usize = NONE as usize
+    while i < b {
+        w32(runat, i, NONE)
+        if r8((*p).cls, i) != ucd_bidi.BIDI_BN {
+            if last != NONE as usize
+                && r8((*p).lev, last) == r8((*p).lev, i) {
+                w32(re, nr - 1, i as u32)
+            } else {
+                w32(rs, nr, i as u32)
+                w32(re, nr, i as u32)
+                w32(runat, i, nr as u32)
+                nr = nr + 1
+            }
+            last = i
+        }
+        i = i + 1
+    }
+
+    // BD13: jede Folge beginnt mit einem Abschnitt, dessen erstes Zeichen
+    // KEIN zu einem Anfang gehoerender PDI ist.
+    let seq: u64 = (*p).work + off_seq(n) as u64
+    var r: usize = 0
+    while r < nr {
+        let first: usize = r32(rs, r) as usize
+        if r8(mp, first) == 0 as u8 {
+            var m: usize = 0
+            var cr: usize = r
+            while true {
+                // den Abschnitt cr anhaengen, ohne die entfernten Zeichen
+                var j: usize = r32(rs, cr) as usize
+                let e: usize = r32(re, cr) as usize
+                while j <= e {
+                    if r8((*p).cls, j) != ucd_bidi.BIDI_BN {
+                        w32(seq, m, j as u32)
+                        m = m + 1
+                    }
+                    j = j + 1
+                }
+                // endet er mit einem Isolat-Anfang, der einen PDI hat,
+                // geht die Folge bei dem Abschnitt weiter, der mit
+                // diesem PDI beginnt
+                let lastc: usize = e
+                if is_isolate_init(r8((*p).cls0, lastc))
+                    && r32(mt, lastc) != NONE {
+                    let pdi: usize = r32(mt, lastc) as usize
+                    let nx: u32 = r32(runat, pdi)
+                    if nx == NONE {
+                        break
+                    }
+                    cr = nx as usize
+                } else {
+                    break
+                }
+            }
+            resolve_sequence(p, seq, m, a, b, para)
+        }
+        r = r + 1
+    }
+
+    // I1/I2 ERST HIER, NACH ALLEN FOLGEN. sos und eos einer Folge
+    // haengen an der Ebene ihrer Nachbarn, und gemeint ist die
+    // EXPLIZITE Ebene aus X1..X8. Wer I1/I2 schon am Ende jeder Folge
+    // anwendet, hebt die Nachbarn der naechsten Folge vorher an -- ein
+    // L auf Ebene 3 steht dann auf 4, und die Folge dahinter bekommt
+    // sos = L statt R. BidiCharacterTest.txt hat genau das in zehn
+    // Faellen gezeigt (Zeile 162 ff.).
+    i = a
+    while i < b {
+        let c: u8 = r8((*p).cls, i)
+        if c != ucd_bidi.BIDI_BN {
+            let l0: u8 = r8((*p).lev, i)
+            if (l0 & 1 as u8) == 0 as u8 {
+                if c == ucd_bidi.BIDI_R {
+                    w8((*p).lev, i, l0 + 1 as u8)
+                } else if c == ucd_bidi.BIDI_AN || c == ucd_bidi.BIDI_EN {
+                    w8((*p).lev, i, l0 + 2 as u8)
+                }
+            } else {
+                if c == ucd_bidi.BIDI_L || c == ucd_bidi.BIDI_AN
+                    || c == ucd_bidi.BIDI_EN {
+                    w8((*p).lev, i, l0 + 1 as u8)
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Die entfernten Zeichen bekommen die Ebene ihres Vorgaengers (oder
+    // die Absatzebene). Sichtbar sind sie nicht; so reissen sie aber
+    // keinen Abschnitt auseinander, wenn L2 umkehrt.
+    var prev: u8 = para
+    i = a
+    while i < b {
+        if r8((*p).cls, i) == ucd_bidi.BIDI_BN {
+            w8((*p).lev, i, prev)
+        } else {
+            prev = r8((*p).lev, i)
+        }
+        i = i + 1
+    }
+}
+
+// Die Ebene des nicht entfernten Nachbarn in Richtung `step` (+1/-1),
+// oder `para`, wenn es keinen gibt.
+#[no_gc]
+fn neighbour_level(p: *mut BidiPara, from: usize, a: usize, b: usize,
+    fwd: bool, para: u8) -> u8 {
+    if fwd {
+        var j: usize = from + 1
+        while j < b {
+            if r8((*p).cls, j) != ucd_bidi.BIDI_BN {
+                return r8((*p).lev, j)
+            }
+            j = j + 1
+        }
+        return para
+    }
+    var k: usize = from
+    while k > a {
+        k = k - 1
+        if r8((*p).cls, k) != ucd_bidi.BIDI_BN {
+            return r8((*p).lev, k)
+        }
+    }
+    return para
+}
+
+#[no_gc]
+fn cls_at(p: *mut BidiPara, seq: u64, k: usize) -> u8 {
+    return r8((*p).cls, r32(seq, k) as usize)
+}
+
+#[no_gc]
+fn set_at(p: *mut BidiPara, seq: u64, k: usize, v: u8) {
+    w8((*p).cls, r32(seq, k) as usize, v)
+}
+
+// ======================================================================
+// EINE FOLGE: W1..W7, N0..N2 (I1/I2 folgen in resolve_paragraph)
+// ======================================================================
+#[no_gc]
+fn resolve_sequence(p: *mut BidiPara, seq: u64, m: usize, a: usize,
+    b: usize, para: u8) {
+    if m == 0 {
+        return
+    }
+    let f0: usize = r32(seq, 0) as usize
+    let fl: usize = r32(seq, m - 1) as usize
+    let lv: u8 = r8((*p).lev, f0)
+    // sos/eos (X10): die hoehere der beiden Ebenen an der Grenze.
+    var before: u8 = neighbour_level(p, f0, a, b, false, para)
+    var after: u8 = neighbour_level(p, fl, a, b, true, para)
+    if is_isolate_init(r8((*p).cls0, fl)) {
+        after = para
+    }
+    if lv > before {
+        before = lv
+    }
+    if lv > after {
+        after = lv
+    }
+    let sos: u8 = dir_of_level(before)
+    let eos: u8 = dir_of_level(after)
+
+    // ---- W1: NSM nimmt den Typ des Vorgaengers, hinter einem Isolat-
+    // zeichen wird es ON.
+    var k: usize = 0
+    while k < m {
+        if cls_at(p, seq, k) == ucd_bidi.BIDI_NSM {
+            if k == 0 {
+                set_at(p, seq, k, sos)
+            } else {
+                let pv: u8 = cls_at(p, seq, k - 1)
+                if is_isolate_init(pv) || pv == ucd_bidi.BIDI_PDI {
+                    set_at(p, seq, k, ucd_bidi.BIDI_ON)
+                } else {
+                    set_at(p, seq, k, pv)
+                }
+            }
+        }
+        k = k + 1
+    }
+    // ---- W2: EN hinter AL wird AN. W3: AL wird R.
+    var ls: u8 = sos
+    k = 0
+    while k < m {
+        let c: u8 = cls_at(p, seq, k)
+        if c == ucd_bidi.BIDI_L || c == ucd_bidi.BIDI_R
+            || c == ucd_bidi.BIDI_AL {
+            ls = c
+        } else if c == ucd_bidi.BIDI_EN && ls == ucd_bidi.BIDI_AL {
+            set_at(p, seq, k, ucd_bidi.BIDI_AN)
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < m {
+        if cls_at(p, seq, k) == ucd_bidi.BIDI_AL {
+            set_at(p, seq, k, ucd_bidi.BIDI_R)
+        }
+        k = k + 1
+    }
+    // ---- W4: ein einzelnes ES zwischen EN und EN, ein einzelnes CS
+    // zwischen zwei Zahlen desselben Typs.
+    k = 1
+    while k + 1 < m {
+        let c: u8 = cls_at(p, seq, k)
+        let pv: u8 = cls_at(p, seq, k - 1)
+        let nx: u8 = cls_at(p, seq, k + 1)
+        if c == ucd_bidi.BIDI_ES && pv == ucd_bidi.BIDI_EN
+            && nx == ucd_bidi.BIDI_EN {
+            set_at(p, seq, k, ucd_bidi.BIDI_EN)
+        } else if c == ucd_bidi.BIDI_CS && pv == nx
+            && (pv == ucd_bidi.BIDI_EN || pv == ucd_bidi.BIDI_AN) {
+            set_at(p, seq, k, pv)
+        }
+        k = k + 1
+    }
+    // ---- W5: eine Folge von ET neben EN wird EN.
+    k = 0
+    while k < m {
+        if cls_at(p, seq, k) == ucd_bidi.BIDI_ET {
+            var e: usize = k
+            while e < m && cls_at(p, seq, e) == ucd_bidi.BIDI_ET {
+                e = e + 1
+            }
+            var to_en: bool = false
+            if k > 0 && cls_at(p, seq, k - 1) == ucd_bidi.BIDI_EN {
+                to_en = true
+            }
+            if e < m && cls_at(p, seq, e) == ucd_bidi.BIDI_EN {
+                to_en = true
+            }
+            if to_en {
+                var j: usize = k
+                while j < e {
+                    set_at(p, seq, j, ucd_bidi.BIDI_EN)
+                    j = j + 1
+                }
+            }
+            k = e
+        } else {
+            k = k + 1
+        }
+    }
+    // ---- W6: die uebrigen Trenner werden ON.
+    k = 0
+    while k < m {
+        let c: u8 = cls_at(p, seq, k)
+        if c == ucd_bidi.BIDI_ES || c == ucd_bidi.BIDI_ET
+            || c == ucd_bidi.BIDI_CS {
+            set_at(p, seq, k, ucd_bidi.BIDI_ON)
+        }
+        k = k + 1
+    }
+    // ---- W7: EN nach einem L (oder sos = L) wird L.
+    var ls2: u8 = sos
+    k = 0
+    while k < m {
+        let c: u8 = cls_at(p, seq, k)
+        if c == ucd_bidi.BIDI_L || c == ucd_bidi.BIDI_R {
+            ls2 = c
+        } else if c == ucd_bidi.BIDI_EN && ls2 == ucd_bidi.BIDI_L {
+            set_at(p, seq, k, ucd_bidi.BIDI_L)
+        }
+        k = k + 1
+    }
+
+    // ---- N0: die Klammerpaare
+    pair_brackets(p, seq, m, lv, sos)
+
+    // ---- N1/N2: Neutrale zwischen gleichen starken Seiten nehmen deren
+    // Richtung, alle anderen die der Einbettung.
+    let emb: u8 = dir_of_level(lv)
+    k = 0
+    while k < m {
+        if is_ni(cls_at(p, seq, k)) {
+            var e: usize = k
+            while e < m && is_ni(cls_at(p, seq, e)) {
+                e = e + 1
+            }
+            var lead: u8 = sos
+            if k > 0 {
+                lead = strong_n(cls_at(p, seq, k - 1))
+            }
+            var trail: u8 = eos
+            if e < m {
+                trail = strong_n(cls_at(p, seq, e))
+            }
+            var to: u8 = emb
+            if lead == trail && lead != 255 as u8 {
+                to = lead
+            }
+            var j: usize = k
+            while j < e {
+                set_at(p, seq, j, to)
+                j = j + 1
+            }
+            k = e
+        } else {
+            k = k + 1
+        }
+    }
+}
+
+// ======================================================================
+// N0 -- KLAMMERPAARE
+// ======================================================================
+//
+// BD16: Klammern werden paarweise gesucht, und zwar nur solche, deren
+// aktueller Typ ON ist (eine durch LRO/RLO ueberschriebene Klammer ist
+// keine mehr). Verglichen wird ueber die kanonische Entsprechung, damit
+// U+2329 zu U+3009 passt.
+//
+// Dann je Paar, in der Reihenfolge der oeffnenden Klammern: steht darin
+// ein starkes Zeichen der Einbettungsrichtung, nehmen beide Klammern
+// diese Richtung. Steht nur die Gegenrichtung darin, entscheidet der
+// Kontext VOR der oeffnenden Klammer: ist der auch gegenlaeufig, nehmen
+// die Klammern die Gegenrichtung, sonst die der Einbettung. Steht gar
+// nichts Starkes darin, bleiben sie neutral fuer N1.
+#[no_gc]
+fn pair_brackets(p: *mut BidiPara, seq: u64, m: usize, lv: u8, sos: u8) {
+    let n: usize = (*p).n
+    let bs: u64 = (*p).work + off_bstk(n) as u64
+    let pr: u64 = (*p).work + off_pairs(n) as u64
+    let t: u64 = (*p).t
+    var sp: usize = 0
+    var np: usize = 0
+    var k: usize = 0
+    while k < m {
+        let i: usize = r32(seq, k) as usize
+        if r8((*p).cls, i) == ucd_bidi.BIDI_ON {
+            let c: u32 = r32((*p).cp, i)
+            let ty: u8 = ucd_bidi.ucd_bracket_type(t, c)
+            if ty == ucd_bidi.BRACKET_OPEN {
+                if sp == BRACKET_STACK {
+                    break
+                }
+                let want: u32 = ucd_bidi.ucd_bracket_canon(t,
+                    ucd_bidi.ucd_bracket_pair(t, c))
+                w32(bs, sp * 2, want)
+                w32(bs, sp * 2 + 1, k as u32)
+                sp = sp + 1
+            } else if ty == ucd_bidi.BRACKET_CLOSE {
+                let me: u32 = ucd_bidi.ucd_bracket_canon(t, c)
+                var s: usize = sp
+                while s > 0 {
+                    s = s - 1
+                    if r32(bs, s * 2) == me {
+                        // einsortieren nach der Lage der oeffnenden
+                        let op: u32 = r32(bs, s * 2 + 1)
+                        var q: usize = np
+                        while q > 0 && r32(pr, (q - 1) * 2) > op {
+                            w32(pr, q * 2, r32(pr, (q - 1) * 2))
+                            w32(pr, q * 2 + 1, r32(pr, (q - 1) * 2 + 1))
+                            q = q - 1
+                        }
+                        w32(pr, q * 2, op)
+                        w32(pr, q * 2 + 1, k as u32)
+                        np = np + 1
+                        sp = s
+                        break
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+
+    let e: u8 = dir_of_level(lv)
+    var o: u8 = ucd_bidi.BIDI_R
+    if e == ucd_bidi.BIDI_R {
+        o = ucd_bidi.BIDI_L
+    }
+    var q2: usize = 0
+    while q2 < np {
+        let ko: usize = r32(pr, q2 * 2) as usize
+        let kc: usize = r32(pr, q2 * 2 + 1) as usize
+        var has_e: bool = false
+        var has_o: bool = false
+        var j: usize = ko + 1
+        while j < kc {
+            let s2: u8 = strong_n(cls_at(p, seq, j))
+            if s2 == e {
+                has_e = true
+                break
+            }
+            if s2 == o {
+                has_o = true
+            }
+            j = j + 1
+        }
+        var to: u8 = 255 as u8
+        if has_e {
+            to = e
+        } else if has_o {
+            var ctx: u8 = sos
+            var j2: usize = ko
+            while j2 > 0 {
+                j2 = j2 - 1
+                let s3: u8 = strong_n(cls_at(p, seq, j2))
+                if s3 != 255 as u8 {
+                    ctx = s3
+                    break
+                }
+            }
+            if ctx == o {
+                to = o
+            } else {
+                to = e
+            }
+        }
+        if to != 255 as u8 {
+            set_at(p, seq, ko, to)
+            set_at(p, seq, kc, to)
+            // Ein NSM direkt hinter einer so umgestellten Klammer war nach
+            // W1 zu ON geworden; es folgt jetzt seiner Klammer.
+            var a1: usize = ko + 1
+            while a1 < m && r8((*p).cls0, r32(seq, a1) as usize)
+                == ucd_bidi.BIDI_NSM {
+                set_at(p, seq, a1, to)
+                a1 = a1 + 1
+            }
+            var a2: usize = kc + 1
+            while a2 < m && r8((*p).cls0, r32(seq, a2) as usize)
+                == ucd_bidi.BIDI_NSM {
+                set_at(p, seq, a2, to)
+                a2 = a2 + 1
+            }
+        }
+        q2 = q2 + 1
+    }
+}
+
+// ======================================================================
+// L1 -- DIE EBENEN EINER ZEILE
+// ======================================================================
+//
+// Nach dem Umbruch, je Zeile: Segment- und Absatztrenner, jeder Leerraum
+// davor und jeder Leerraum am Zeilenende fallen auf die Absatzebene.
+// Leerraum heisst hier WS und die Isolatzeichen -- und die von X9
+// entfernten Zeichen, die dazwischen stehen. Gefragt wird die
+// URSPRUENGLICHE Klasse: ein Leerzeichen, das N1 zu R gemacht hat, ist
+// am Zeilenende trotzdem Leerraum. Ohne diese Regel haengt das
+// Leerzeichen am Ende einer arabischen Zeile links neben dem ersten Wort
+// der Zeile, und die Zeile sieht eingerueckt aus.
+//
+// `out` bekommt die Ebenen der Zeichen from..to-1, ab Stelle 0.
+#[no_gc]
+fn bidi_line_levels(p: *mut BidiPara, from: usize, to: usize, out: u64) {
+    var i: usize = from
+    while i < to {
+        w8(out, i - from, r8((*p).lev, i))
+        i = i + 1
+    }
+    if to <= from {
+        return
+    }
+    var trailing: bool = true
+    var k: usize = to
+    while k > from {
+        k = k - 1
+        let c: u8 = r8((*p).cls0, k)
+        let para: u8 = r8((*p).pl, k)
+        if c == ucd_bidi.BIDI_S || c == ucd_bidi.BIDI_B {
+            w8(out, k - from, para)
+            trailing = true
+        } else if c == ucd_bidi.BIDI_WS || is_isolate_init(c)
+            || c == ucd_bidi.BIDI_PDI || bidi_is_removed(c) {
+            if trailing {
+                w8(out, k - from, para)
+            }
+        } else {
+            trailing = false
+        }
+    }
+}
+
+// ======================================================================
+// L2 -- DIE REIHENFOLGE AUF DEM SCHIRM
+// ======================================================================
+//
+// `lv` haelt die Ebenen einer Zeile (nach L1), `order` bekommt je
+// Schirmstelle die LOGISCHE Stelle (0..n-1). Von der hoechsten Ebene
+// abwaerts bis zur niedrigsten ungeraden wird jede zusammenhaengende
+// Strecke mit mindestens dieser Ebene umgedreht.
+#[no_gc]
+fn bidi_reorder(lv: u64, n: usize, order: u64) {
+    var i: usize = 0
+    var hi: u8 = 0 as u8
+    var lo_odd: u8 = 255 as u8
+    while i < n {
+        w32(order, i, i as u32)
+        let l: u8 = r8(lv, i)
+        if l > hi {
+            hi = l
+        }
+        if (l & 1 as u8) != 0 as u8 && l < lo_odd {
+            lo_odd = l
+        }
+        i = i + 1
+    }
+    if lo_odd == 255 as u8 {
+        return
+    }
+    var cur: u8 = hi
+    while cur >= lo_odd {
+        var s: usize = 0
+        while s < n {
+            if r8(lv, r32(order, s) as usize) >= cur {
+                var e: usize = s
+                while e < n && r8(lv, r32(order, e) as usize) >= cur {
+                    e = e + 1
+                }
+                var x: usize = s
+                var y: usize = e - 1
+                while x < y {
+                    let tmp: u32 = r32(order, x)
+                    w32(order, x, r32(order, y))
+                    w32(order, y, tmp)
+                    x = x + 1
+                    y = y - 1
+                }
+                s = e
+            } else {
+                s = s + 1
+            }
+        }
+        if cur == 0 as u8 {
+            break
+        }
+        cur = cur - 1 as u8
+    }
+}

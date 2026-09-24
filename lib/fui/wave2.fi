@@ -59,7 +59,7 @@
 // a surface with a border, both from the theme, and nothing underneath
 // it. `tools/fui/wave2_main.fi` measures the pixels diagonally outside
 // each corner and requires that they are UNCHANGED (test 8).
-import std.rt
+import svg.matrix
 import fui.style
 import fui.theme
 import fui.widget
@@ -67,16 +67,18 @@ import fui.painter
 import fui.render
 import fui.icon
 import fui.layout
+import fui.transform
 
 export {
     draw_checkbox, draw_radio, draw_toggle, draw_slider,
     draw_scrollbar, draw_progress, draw_dropdown, draw_tab,
     draw_tabbar, draw_toolbar, draw_menubar, draw_menu,
     draw_menu_item, draw_tooltip, draw_separator, draw_groupbox,
-    draw_wave2, draw_any,
+    draw_wave2, draw_any, draw_any_xf, kind_xf_ready,
     box_side, mark_color, track_rect, handle_rect,
+    scrollbar_thumb, scrollbar_thumb_f,
     VAL_MAX, CHECK_PARTIAL,
-    tooltip_size, menu_item_height,
+    tooltip_size, tooltip_place, menu_item_height,
 }
 
 // The value range of everything that slides. The same number as in
@@ -158,13 +160,29 @@ fn text_after_box(c: *mut render.Ctx, e: *mut widget.Widget,
 // second drawing of the same thing, and that is the mistake the whole
 // library exists to prevent.
 fn label_at(c: *mut render.Ctx, e: *mut widget.Widget, x: f64, w: f64) {
-    if widget.w_text_len(e) == 0 {
+    // A widget with a picture and no text still has something to draw, so
+    // the early return has to let that case through.
+    if widget.w_text_len(e) == 0 && !widget.w_has_art(e) {
         return
     }
     var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
     widget.w_place(&l, x, widget.w_y(e), w, widget.w_h(e))
     widget.w_set_text(&l, widget.w_text(e), widget.w_text_len(e))
     widget.w_set_styleset(&l, *widget.w_styleset(e))
+    // THE PICTURE TRAVELS WITH THE LABEL. Without this a tab or a menu
+    // entry would carry an icon that never gets drawn -- the borrowed
+    // label is what actually paints, so it has to know about it.
+    if widget.w_has_art(e) {
+        if widget.w_art_kind(e) == widget.ART_IMAGE {
+            widget.w_set_image(&l, widget.w_art_p(e))
+        } else {
+            widget.w_set_svg(&l, widget.w_art_p(e))
+        }
+        widget.w_set_art_align(&l, widget.w_art_align(e))
+        widget.w_set_art_size(&l, widget.w_art_w(e), widget.w_art_h(e))
+        widget.w_set_art_gap(&l, widget.w_art_gap(e))
+        widget.w_set_art_tint(&l, widget.w_art_tint(e))
+    }
     // The label must not drag the background of the control along.
     let ls: *mut style.Style = widget.w_style(&l)
     *ls = style.style_set_bg(*ls, style.color_transparent())
@@ -176,6 +194,7 @@ fn label_at(c: *mut render.Ctx, e: *mut widget.Widget, x: f64, w: f64) {
     // ... but not the focus: the ring belongs round the control, not
     // round its text.
     widget.w_set_focus(&l, false)
+    render.draw_widget_art(c, &l)
     render.draw_text(c, &l)
 }
 
@@ -548,17 +567,29 @@ fn draw_slider(c: *mut render.Ctx, e: *mut widget.Widget) {
 // brief said why ("whoever needs two has two widgets") -- but a
 // scrollbar needs the second number to be drawable at all, and
 // `pref` is free on a scrollbar. That is the cheapest honest place.
-fn draw_scrollbar(c: *mut render.Ctx, e: *mut widget.Widget) {
-    let m: *mut theme.Theme = render.ctx_theme(c)
-    let fo: *mut theme.Shape = theme.theme_shape(m)
+// WHERE THE THUMB SITS, AND HOW LONG IT IS.
+//
+// This used to be worked out inside `draw_scrollbar`, in the middle of
+// the painting. That made the length unprovable: whoever wanted to
+// check "a viewport of 288 on a content of 900 gives a thumb of 288/900
+// of the track" had to paint the bar and guess at pixels, or work the
+// same formula out a SECOND time -- and a second place for the same
+// arithmetic is exactly what this library does not allow.
+//
+// So the arithmetic lives here, in ONE place, and `draw_scrollbar`
+// calls it. The numbers come out in full precision, because the
+// painting needs the fraction: a thumb whose offset is truncated to a
+// whole pixel jumps while scrolling, and every existing render would
+// change by a pixel.
+//
+// The share is taken from `w_pref_h` (upright) or `w_pref_w`: the
+// visible fraction in per mille. 0 or unset means "a third" -- a
+// sensible default that never gives a thumb of zero length. The
+// minimum length is the deliberate exception to the ratio: a long page
+// would otherwise give a thumb you cannot grab.
+fn scrollbar_thumb_f(c: *mut render.Ctx, e: *mut widget.Widget,
+    x: *mut f64, y: *mut f64, w: *mut f64, h: *mut f64) {
     let upright: bool = widget.w_h(e) > widget.w_w(e)
-
-    // The track is the widget itself -- that is what `def_bg` gives a
-    // scrollbar.
-    render.draw_base(c, e)
-
-    // How big a share is visible. 0 or unset means "a third" -- a
-    // sensible default that never gives a thumb of zero length.
     var share: f64 = 0.333
     var pref: f64 = widget.w_pref_h(e)
     if !upright {
@@ -572,6 +603,56 @@ fn draw_scrollbar(c: *mut render.Ctx, e: *mut widget.Widget) {
     if v < 0 { v = 0 }
     if v > VAL_MAX { v = VAL_MAX }
 
+    let pad: f64 = 2.0
+    let min: f64 = render.len_of(c, 24)
+    if upright {
+        let len: f64 = widget.w_h(e) - 2.0 * pad
+        var th: f64 = len * share
+        if th < min { th = min }
+        if th > len { th = len }
+        let off: f64 = (len - th) * (v as f64) / (VAL_MAX as f64)
+        *x = widget.w_x(e) + pad
+        *y = widget.w_y(e) + pad + off
+        *w = widget.w_w(e) - 2.0 * pad
+        *h = th
+        return
+    }
+    let len: f64 = widget.w_w(e) - 2.0 * pad
+    var tw2: f64 = len * share
+    if tw2 < min { tw2 = min }
+    if tw2 > len { tw2 = len }
+    let off: f64 = (len - tw2) * (v as f64) / (VAL_MAX as f64)
+    *x = widget.w_x(e) + pad + off
+    *y = widget.w_y(e) + pad
+    *w = tw2
+    *h = widget.w_h(e) - 2.0 * pad
+}
+
+// The same thumb as a Rect -- the form a check can compare, in the same
+// way `track_rect` and `handle_rect` hand out the parts of a slider. It
+// does not compute anything of its own: it rounds what
+// `scrollbar_thumb_f` says. Rounded, not truncated, because a length of
+// 90.88 that is asked for in whole pixels is 91 and not 90.
+fn scrollbar_thumb(c: *mut render.Ctx, e: *mut widget.Widget) -> layout.Rect {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    scrollbar_thumb_f(c, e, &x, &y, &w, &h)
+    return layout.rect_new(matrix.m_floor(x + 0.5) as i64,
+        matrix.m_floor(y + 0.5) as i64, matrix.m_floor(w + 0.5) as i64,
+        matrix.m_floor(h + 0.5) as i64)
+}
+
+fn draw_scrollbar(c: *mut render.Ctx, e: *mut widget.Widget) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fo: *mut theme.Shape = theme.theme_shape(m)
+    let upright: bool = widget.w_h(e) > widget.w_w(e)
+
+    // The track is the widget itself -- that is what `def_bg` gives a
+    // scrollbar.
+    render.draw_base(c, e)
+
     var zu: u32 = widget.w_state(e)
     var tc: u32 = style.color_token(style.TOK_BUTTON)
     if zu == style.STATE_ACTIVE {
@@ -580,44 +661,23 @@ fn draw_scrollbar(c: *mut render.Ctx, e: *mut widget.Widget) {
         tc = style.color_token(style.TOK_BUTTON_HOVER)
     }
 
-    let pad: f64 = 2.0
-    if upright {
-        let len: f64 = widget.w_h(e) - 2.0 * pad
-        // A minimum length, otherwise a long page gives a thumb you
-        // cannot grab.
-        var th: f64 = len * share
-        let min: f64 = render.len_of(c, 24)
-        if th < min { th = min }
-        if th > len { th = len }
-        let off: f64 = (len - th) * (v as f64) / (VAL_MAX as f64)
-        var t: widget.Widget = part(c, e, widget.KIND_NONE,
-            widget.w_x(e) + pad, widget.w_y(e) + pad + off,
-            widget.w_w(e) - 2.0 * pad, th, tc, true, (*fo).r_field)
-        render.draw_base(c, &t)
-        // The grip grooves: they say "this can be grabbed". Only when
-        // there is room for them.
-        if th > render.len_of(c, 28) {
-            icon.grip_lines(render.ctx_painter(c), widget.w_x(e) + pad,
-                widget.w_y(e) + pad + off, widget.w_w(e) - 2.0 * pad,
-                th, true, mark_color(c, e, false))
-        }
-    } else {
-        let len: f64 = widget.w_w(e) - 2.0 * pad
-        var tw2: f64 = len * share
-        let min: f64 = render.len_of(c, 24)
-        if tw2 < min { tw2 = min }
-        if tw2 > len { tw2 = len }
-        let off: f64 = (len - tw2) * (v as f64) / (VAL_MAX as f64)
-        var t: widget.Widget = part(c, e, widget.KIND_NONE,
-            widget.w_x(e) + pad + off, widget.w_y(e) + pad,
-            tw2, widget.w_h(e) - 2.0 * pad, tc, true, (*fo).r_field)
-        render.draw_base(c, &t)
-        if tw2 > render.len_of(c, 28) {
-            icon.grip_lines(render.ctx_painter(c),
-                widget.w_x(e) + pad + off, widget.w_y(e) + pad,
-                tw2, widget.w_h(e) - 2.0 * pad, false,
-                mark_color(c, e, false))
-        }
+    var tx: f64 = 0.0
+    var ty: f64 = 0.0
+    var tw: f64 = 0.0
+    var th: f64 = 0.0
+    scrollbar_thumb_f(c, e, &tx, &ty, &tw, &th)
+    var t: widget.Widget = part(c, e, widget.KIND_NONE, tx, ty, tw, th,
+        tc, true, (*fo).r_field)
+    render.draw_base(c, &t)
+    // The grip grooves: they say "this can be grabbed". Only when
+    // there is room for them.
+    var laenge: f64 = th
+    if !upright {
+        laenge = tw
+    }
+    if laenge > render.len_of(c, 28) {
+        icon.grip_lines(render.ctx_painter(c), tx, ty, tw, th, upright,
+            mark_color(c, e, false))
     }
     render.draw_focus_ring(c, e)
 }
@@ -738,6 +798,18 @@ fn draw_tab(c: *mut render.Ctx, e: *mut widget.Widget) {
     widget.w_place(&l, widget.w_x(e) + padx, widget.w_y(e),
         widget.w_w(e) - 2.0 * padx, widget.w_h(e))
     widget.w_set_text(&l, widget.w_text(e), widget.w_text_len(e))
+    // A tab may carry an icon just like a button (Justin, 13.09.2026).
+    if widget.w_has_art(e) {
+        if widget.w_art_kind(e) == widget.ART_IMAGE {
+            widget.w_set_image(&l, widget.w_art_p(e))
+        } else {
+            widget.w_set_svg(&l, widget.w_art_p(e))
+        }
+        widget.w_set_art_align(&l, widget.w_art_align(e))
+        widget.w_set_art_size(&l, widget.w_art_w(e), widget.w_art_h(e))
+        widget.w_set_art_gap(&l, widget.w_art_gap(e))
+        widget.w_set_art_tint(&l, widget.w_art_tint(e))
+    }
     let ls: *mut style.Style = widget.w_style(&l)
     *ls = style.style_set_align(*ls, style.ALIGN_CENTER)
     *ls = style.style_set_pad(*ls, 0, 0)
@@ -751,6 +823,7 @@ fn draw_tab(c: *mut render.Ctx, e: *mut widget.Widget) {
     }
     widget.w_set_state_bits(&l, state_bits_of(e))
     widget.w_set_focus(&l, false)
+    render.draw_widget_art(c, &l)
     render.draw_text(c, &l)
     render.draw_focus_ring(c, e)
 }
@@ -954,6 +1027,92 @@ fn draw_tooltip(c: *mut render.Ctx, e: *mut widget.Widget) {
 // HOW BIG A TOOLTIP HAS TO BE for its text. The caller places it, so
 // he has to be able to measure it -- and if he has to guess, the text
 // gets cut off. That is the "clipped label" the acceptance looks for.
+// ================================================= WHERE A TOOLTIP GOES
+//
+// Justin, 12.09.2026, on the dark control-centre shot of OrientOS: the
+// bubble "no network" sat at the bottom right over the clock. Measured
+// on that picture: the bubble box was y=730..753 and x=1140..1215, the
+// taskbar started at y=760, the clock ink stood at x=1166..1269. So it
+// did not cover the clock, but it stood in the same column and its
+// lower border touched the bar -- which is what it looks like.
+//
+// THE PLACEMENT BELONGS HERE AND NOT IN THE CALLER. Every caller that
+// shows a bubble has the same three questions -- does it fall off the
+// screen, does it cover the panel it came from, does it cover something
+// that must stay readable -- and answering them once per caller is how
+// they drift apart. This answers them once, for everybody.
+//
+// THE RULE, in the order the cases are decided:
+//
+//   1. PREFERRED SIDE FIRST. A bubble about something in a bottom bar
+//      goes ABOVE that bar, one gap clear of it; about something in a
+//      top bar it goes below. `avoid_y0`/`avoid_y1` is the band the
+//      bubble must not enter -- pass the bar rectangle.
+//   2. IF THE PREFERRED SIDE HAS NO ROOM, FLIP -- do not clamp.
+//      Clamping is exactly what pushes a bubble INTO the bar it was
+//      trying to avoid, and that is the bug this function exists for.
+//   3. HORIZONTALLY CENTRED on the anchor, then pulled back inside the
+//      screen; and if it would still sit over a reserved column
+//      (`avoid_x0`/`avoid_x1`, e.g. the clock), it moves to whichever
+//      side of that column has room.
+//
+// All values are screen coordinates in pixels; `out_x`/`out_y` get the
+// top left corner. Pass `avoid_x1 <= avoid_x0` if no column is
+// reserved. The function decides nothing about SIZE -- that is
+// `tooltip_size`, and a caller that wants both calls both.
+#[no_gc]
+fn tooltip_place(sx: f64, sy: f64, bw: f64, bh: f64,
+    screen_w: f64, screen_h: f64,
+    avoid_y0: f64, avoid_y1: f64,
+    avoid_x0: f64, avoid_x1: f64,
+    gap: f64, out_x: *mut f64, out_y: *mut f64) {
+    // ---- vertical: clear of the reserved band, preferring above it
+    var y: f64 = avoid_y0 - bh - gap
+    if y < 0.0 {
+        let below: f64 = avoid_y1 + gap
+        if below + bh <= screen_h {
+            y = below
+        } else {
+            // Neither side fits. Take the side with more room and sit
+            // flush against the screen edge -- still better than
+            // straddling the band.
+            if avoid_y0 >= screen_h - avoid_y1 {
+                y = 0.0
+            } else {
+                y = screen_h - bh
+            }
+        }
+    }
+    // ---- horizontal: centred on the anchor, kept on screen
+    var x: f64 = sx - bw / 2.0
+    if x < 0.0 {
+        x = 0.0
+    }
+    if x + bw > screen_w {
+        x = screen_w - bw
+    }
+    // ---- and out of the reserved column, if there is one
+    if avoid_x1 > avoid_x0 {
+        if x < avoid_x1 && x + bw > avoid_x0 {
+            let room_left: f64 = avoid_x0
+            let room_right: f64 = screen_w - avoid_x1
+            if room_left >= room_right && bw <= room_left {
+                x = avoid_x0 - bw
+            } else if bw <= room_right {
+                x = avoid_x1
+            }
+            if x < 0.0 {
+                x = 0.0
+            }
+            if x + bw > screen_w {
+                x = screen_w - bw
+            }
+        }
+    }
+    *out_x = x
+    *out_y = y
+}
+
 fn tooltip_size(c: *mut render.Ctx, p: u64, n: usize, w: *mut f64,
     h: *mut f64) {
     let m: *mut theme.Theme = render.ctx_theme(c)
@@ -1101,4 +1260,40 @@ fn draw_wave2(c: *mut render.Ctx, e: *mut widget.Widget) -> bool {
         return true
     }
     return false
+}
+
+// ======================================================================
+// DER GEDREHTE WEG -- DERSELBE EINSTIEG, EINE MATRIX MEHR
+// ======================================================================
+//
+// `render.draw_widget_xf` malt ein Widget unter einer affinen
+// Abbildung. Damit ein Anwender es benutzt, ohne die Datei
+// lib/fui/transform.fi zu kennen, haengt es hier am selben Einstieg
+// wie alles andere: wer `draw_any` ruft, ruft `draw_any_xf`, sobald
+// etwas schief stehen soll.
+//
+// WAS EHRLICH GESAGT WERDEN MUSS: nicht jedes Element dieser Welle ist
+// unter einer Abbildung zu haben. Ein Schieberegler besteht aus Bahn,
+// Fuellung und Griff, eine Ankreuzkaestchen-Reihe aus Kasten, Haken
+// und Beschriftung -- jede dieser Formen muesste einzeln durch die
+// Matrix, und das waere der zweite Zeichenweg fuer dieselbe Sache.
+// Darum sagt `kind_xf_ready`, welche Elemente den gedrehten Weg
+// WIRKLICH gehen: die, deren ganzes Aussehen der gemeinsame Aufbau ist
+// -- Flaeche, Rand, Schrift, Fokusring. Alle anderen werden GERADE
+// gemalt statt gar nicht: ein fehlendes Element ist schlimmer als ein
+// unverdrehtes, und es steht hier, statt dass es jemand im Bild
+// entdeckt.
+fn kind_xf_ready(k: u32) -> bool {
+    return k == widget.KIND_BUTTON || k == widget.KIND_TILE
+        || k == widget.KIND_LABEL || k == widget.KIND_TAB
+        || k == widget.KIND_NONE
+}
+
+fn draw_any_xf(c: *mut render.Ctx, e: *mut widget.Widget,
+    xf: *mut transform.Xform) {
+    if kind_xf_ready(widget.w_kind(e)) {
+        render.draw_widget_xf(c, e, xf)
+        return
+    }
+    draw_any(c, e)
 }
