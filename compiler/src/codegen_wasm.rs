@@ -434,7 +434,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
     if crate::fnval::has_records() {
         img.parse(&crate::fnval::records_asm())?;
     }
-    if crate::statics::any() {
+    if crate::statics::any_data() {
         img.parse(&crate::statics::data_asm())?;
     }
     let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -1868,7 +1868,24 @@ impl<'a> Fx<'a> {
                         self.ins(Ins::I64Const(-1));
                         self.num(w::I64_XOR);
                     }
-                    _ => return Err(format!("internal error: '!' is not defined for {}", ty.name())),
+                    // Round GAPS: `__sqrt` is one instruction here as well.
+                    (UnOp::Sqrt, VT::F32) => {
+                        self.get(*a, VT::F32);
+                        self.num(w::F32_SQRT);
+                    }
+                    (UnOp::Sqrt, VT::F64) => {
+                        self.get(*a, VT::F64);
+                        self.num(w::F64_SQRT);
+                    }
+                    // Round GAPS: `__bits` / `__f64_from_bits` / `__f32_from_bits`.
+                    // The instruction type is the target, the operand keeps its
+                    // own class of the same width -- a pure reinterpretation.
+                    (UnOp::Bits, _) => {
+                        let have = self.vt_of(*a).ok_or("internal error: bit cast of a value without a class")?;
+                        self.get(*a, have);
+                        self.coerce(have, vt, false);
+                    }
+                    _ => return Err(format!("internal error: unary {:?} is not defined for {}", op, ty.name())),
                 }
                 self.put(i, vt);
             }
