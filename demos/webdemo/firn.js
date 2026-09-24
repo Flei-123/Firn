@@ -138,6 +138,12 @@ const firnTag = document.currentScript;
     resize();
     addEventListener('resize', resize);
     if (window.visualViewport) visualViewport.addEventListener('resize', resize);
+    // In the background or back: an event of its own on the stream path
+    // (name "vis", data "0" hidden / "1" visible), sent at once when the
+    // page starts hidden. A page that does not know the name ignores it.
+    const vis = () => x.firn_web_stream_event(...give('vis'), ...give(document.hidden ? '0' : '1'));
+    document.addEventListener('visibilitychange', vis);
+    if (document.hidden) vis();
 
     // The events, as they come. Bit 8 of the buttons: a finger or a pen.
     const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];
