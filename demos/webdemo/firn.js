@@ -68,13 +68,52 @@ const firnTag = document.currentScript;
             return 0;
         },
     };
+    // THE FRAME CLOCK (lib/plat/web.fi, ONLY WHAT CHANGED): no loop of
+    // our own. A frame is asked for when something came in and afterwards
+    // only while the module answers FRAME_AGAIN (bit 1) or set a timer --
+    // a page that sits still costs nothing, not even a call per frame. A
+    // module without firn_web_clock gets the old loop.
+    let raf = 0, wakeT = 0, wakeAt = 0, onDemand = false;
+    const tick = (t) => {
+        raf = 0;
+        const r = x.firn_web_frame(t);
+        if (!onDemand || (r & 2)) frame();
+    };
+    const frame = () => { if (!raf) raf = requestAnimationFrame(tick); };
+    const ev = (r) => { frame(); return r; };
     let frames = 0, es = null;
     const ta = document.createElement('textarea'); // the keyboard's door
+    // THE PICTURE, wrapped once: an ImageData over the module's own memory
+    // (no copy), made again only when the memory grew (its buffer is then a
+    // new one) or the canvas got another size.
+    let img = null;
+    const image = (p, w, h) => {
+        if (!img || img.data.buffer !== mem.buffer || img.firnP !== p || img.width !== w || img.height !== h) {
+            img = new ImageData(new Uint8ClampedArray(mem.buffer, p >>> 0, w * h * 4), w, h);
+            img.firnP = p;
+        }
+        return img;
+    };
     const env = {
         firn_web_present(p, w, h) {
             if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-            g.putImageData(new ImageData(new Uint8ClampedArray(mem.buffer, p >>> 0, w * h * 4), w, h), 0, 0);
+            g.putImageData(image(p, w, h), 0, 0);
             window.firnFrames = ++frames;
+        },
+        // Only the rectangle that changed goes over (the dirty rectangle of
+        // putImageData); a canvas that got a new size takes the whole picture.
+        firn_web_present_rect(p, w, h, rx, ry, rw, rh) {
+            if (canvas.width !== w || canvas.height !== h) return env.firn_web_present(p, w, h);
+            g.putImageData(image(p, w, h), 0, 0, rx, ry, rw, rh);
+            window.firnFrames = ++frames;
+        },
+        // A timer of the page: a frame in `ms` milliseconds (the earliest wins).
+        firn_web_wake(ms) {
+            const at = performance.now() + ms;
+            if (wakeT && at >= wakeAt) return;
+            if (wakeT) clearTimeout(wakeT);
+            wakeAt = at;
+            wakeT = setTimeout(() => { wakeT = 0; frame(); }, Math.max(0, ms));
         },
         firn_web_fetch(id, mp, mn, up, un, bp, bn) {
             const o = { method: str(mp, mn) || 'GET', credentials: 'same-origin', cache: 'no-store',
@@ -82,15 +121,15 @@ const firnTag = document.currentScript;
             if (bn) { o.body = bytes(bp, bn).slice(); o.headers['Content-Type'] = 'application/json'; }
             fetch(str(up, un), o).then(async (r) => [r.status, new Uint8Array(await r.arrayBuffer())])
                 .catch(() => [0, new Uint8Array(0)])
-                .then(([st, b]) => x.firn_web_fetch_done(id, st, ...give(b)));
+                .then(([st, b]) => ev(x.firn_web_fetch_done(id, st, ...give(b))));
         },
         firn_web_stream_open(up, un) {
             if (es) es.close();
             const s = es = new EventSource(str(up, un));
-            const on = (name) => s.addEventListener(name, (e) => { if (s === es) x.firn_web_stream_event(...give(name), ...give(e.data || '')); });
+            const on = (name) => s.addEventListener(name, (e) => { if (s === es) ev(x.firn_web_stream_event(...give(name), ...give(e.data || ''))); });
             ['ready', 'msg', 'ping'].forEach(on);
-            s.onopen = () => { if (s === es) x.firn_web_stream_state(1); };
-            s.onerror = () => { if (s !== es) return; s.close(); es = null; x.firn_web_stream_state(0); };
+            s.onopen = () => { if (s === es) ev(x.firn_web_stream_state(1)); };
+            s.onerror = () => { if (s !== es) return; s.close(); es = null; ev(x.firn_web_stream_state(0)); };
         },
         firn_web_stream_close() { if (es) { es.close(); es = null; } },
         firn_web_navigate(up, un) { location.assign(str(up, un)); },
@@ -120,6 +159,7 @@ const firnTag = document.currentScript;
     }
     x = instance.exports;
     mem = x.memory;
+    onDemand = typeof x.firn_web_clock === 'function' && x.firn_web_clock() >= 2;
     try {
         x._start();
     } catch (e) {
@@ -132,7 +172,7 @@ const firnTag = document.currentScript;
     const font = new Uint8Array(await fontAsked);
     const fp = x.firn_web_alloc(font.length);
     bytes(fp, font.length).set(font);
-    if (!x.firn_web_font(fp, font.length)) console.error('firn: the font was refused');
+    if (!ev(x.firn_web_font(fp, font.length))) console.error('firn: the font was refused');
 
     // The size: CSS pixels, the device ratio in per mille, bit 0 = dark.
     const fixed = q.has('w') && q.has('h');
@@ -145,7 +185,7 @@ const firnTag = document.currentScript;
         canvas.style.width = w + 'px';
         canvas.style.height = h + 'px';
         const dark = q.has('theme') ? q.get('theme') === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
-        x.firn_web_resize(w, h, Math.round(devicePixelRatio * 1000), dark ? 1 : 0);
+        ev(x.firn_web_resize(w, h, Math.round(devicePixelRatio * 1000), dark ? 1 : 0));
     };
     resize();
     addEventListener('resize', resize);
@@ -159,16 +199,16 @@ const firnTag = document.currentScript;
 
     // The events, as they come. Bit 8 of the buttons: a finger or a pen.
     const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];
-    canvas.addEventListener('pointermove', (e) => x.firn_web_pointer(0, ...at(e)));
+    canvas.addEventListener('pointermove', (e) => ev(x.firn_web_pointer(0, ...at(e))));
     canvas.addEventListener('pointerdown', (e) => {
         canvas.setPointerCapture(e.pointerId);
         if (document.activeElement !== ta) canvas.focus({ preventScroll: true });
-        x.firn_web_pointer(1, ...at(e));
+        ev(x.firn_web_pointer(1, ...at(e)));
     });
-    canvas.addEventListener('pointerup', (e) => x.firn_web_pointer(2, ...at(e)));
-    canvas.addEventListener('pointercancel', (e) => x.firn_web_pointer(2, ...at(e)));
-    canvas.addEventListener('pointerleave', (e) => x.firn_web_pointer(3, ...at(e)));
-    canvas.addEventListener('wheel', (e) => { e.preventDefault(); x.firn_web_wheel(e.deltaX, e.deltaY, e.deltaMode); }, { passive: false });
+    canvas.addEventListener('pointerup', (e) => ev(x.firn_web_pointer(2, ...at(e))));
+    canvas.addEventListener('pointercancel', (e) => ev(x.firn_web_pointer(2, ...at(e))));
+    canvas.addEventListener('pointerleave', (e) => ev(x.firn_web_pointer(3, ...at(e))));
+    canvas.addEventListener('wheel', (e) => { e.preventDefault(); ev(x.firn_web_wheel(e.deltaX, e.deltaY, e.deltaMode)); }, { passive: false });
     const mods = (e) => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
     const key = (down) => (e) => {
         if (e.isComposing || e.key === 'Process' || e.key === 'Unidentified') return;
@@ -177,7 +217,7 @@ const firnTag = document.currentScript;
         const k = utf8.encode(e.key).subarray(0, 255);
         const p = x.firn_web_scratch();
         bytes(p, k.length).set(k);
-        if (x.firn_web_key(down, p, k.length, mods(e))) e.preventDefault();
+        if (ev(x.firn_web_key(down, p, k.length, mods(e)))) e.preventDefault();
     };
     for (const t of [canvas, ta]) { t.addEventListener('keydown', key(1)); t.addEventListener('keyup', key(0)); }
 
@@ -200,24 +240,20 @@ const firnTag = document.currentScript;
         const v = ta.value;
         if (!v.startsWith(MARK)) env.firn_web_key_name('Backspace');
         const t = v.split(MARK).join('');
-        if (t) x.firn_web_text(...give(t));
+        if (t) ev(x.firn_web_text(...give(t)));
         ta.value = MARK;
         ta.setSelectionRange(1, 1);
     };
     env.firn_web_key_name = (name) => {
         const k = utf8.encode(name), p = x.firn_web_scratch();
         bytes(p, k.length).set(k);
-        x.firn_web_key(1, p, k.length, 0);
+        ev(x.firn_web_key(1, p, k.length, 0));
     };
     ta.addEventListener('input', (e) => { if (!e.isComposing) flush(); });
     ta.addEventListener('compositionend', flush);
 
-    // The frame loop: the module decides whether there is anything to paint.
-    const tick = (t) => {
-        x.firn_web_frame(t);
-        requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
+    // The first frame; every later one is asked for (THE FRAME CLOCK above).
+    frame();
 })().catch((e) => {
     console.error(e);
     document.body.dataset.error = String(e);

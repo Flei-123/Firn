@@ -58,6 +58,7 @@ import svg.path
 import svg.stroke
 import fui.theme
 import fui.painter
+import fui.fcache
 import fui.render
 import fui.lucide
 
@@ -142,6 +143,58 @@ fn floor_px(v: f64) -> f64 {
 // square (half a stroke plus the antialiasing seam).
 fn fill_path(z: *mut painter.Painter, pf: *mut path.Pfad, x: f64, y: f64,
     size: f64, k: f64, luft: f64, col: u32, evenodd: bool) {
+    fill_path_kept(z, pf, x, y, size, k, luft, col, evenodd,
+        0 as u64 as *mut fcache.CKey)
+}
+
+// Is the window of the icon square (x, y, size, luft) wholly on the
+// canvas? Only such a coverage is kept or taken from the cache (see
+// lib/fui/fcache.fi, WHAT KEEPS IT EXACT).
+fn whole_on_canvas(z: *mut painter.Painter, x: f64, y: f64, size: f64,
+    luft: f64) -> bool {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    return x - luft >= 0.0 && y - luft >= 0.0 &&
+        x + size + luft + 1.0 <= canvas.canvas_width(cv) as f64 &&
+        y + size + luft + 1.0 <= canvas.canvas_height(cv) as f64
+}
+
+// THE KEPT ICON: the key of an icon of this id, size, stroke and fraction
+// of its position (the whole pixels only move it).
+fn icon_key(id: i64, x: f64, y: f64, size: f64, sw: f64, filled: bool) -> fcache.CKey {
+    var k: fcache.CKey = fcache.ckey_new(fcache.KIND_ICON)
+    k.a = id as u64
+    k.b = __bits(size)
+    k.c = __bits(sw)
+    k.d = __bits(x - floor_px(x))
+    k.e = __bits(y - floor_px(y))
+    if filled {
+        k.f = 1
+    }
+    return k
+}
+
+// Written back from the cache: true. Nothing kept (or a window the canvas
+// edge would cut): false, and the caller rasters.
+fn icon_hit(z: *mut painter.Painter, k: *mut fcache.CKey, x: f64, y: f64,
+    size: f64, luft: f64, col: u32) -> bool {
+    if !fcache.fc_on() || !whole_on_canvas(z, x, y, size, luft) {
+        return false
+    }
+    let e: u64 = fcache.fc_lookup(k, 0, 0)
+    if e == 0 {
+        return false
+    }
+    return fcache.fc_fill(painter.painter_canvas(z), e, floor_px(x) as i64,
+        floor_px(y) as i64, painter.mit_alpha(col))
+}
+
+// fill_path, and with a key the coverage is kept: then the window is not
+// cut to the rows of the clip (a kept coverage needs all of them).
+fn fill_path_kept(z: *mut painter.Painter, pf: *mut path.Pfad, x: f64, y: f64,
+    size: f64, k: f64, luft: f64, col: u32, evenodd: bool,
+    key: *mut fcache.CKey) {
+    let keep: bool = key as u64 != 0 && fcache.fc_on() &&
+        whole_on_canvas(z, x, y, size, luft)
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let cw: f64 = canvas.canvas_width(cv) as f64
     let ch: f64 = canvas.canvas_height(cv) as f64
@@ -161,6 +214,10 @@ fn fill_path(z: *mut painter.Painter, pf: *mut path.Pfad, x: f64, y: f64,
     if by > ch {
         by = ch
     }
+    // only the rows of the clip (painter.clip_rows: exact, rows only)
+    if !keep && !painter.clip_rows(cv, x - luft, x + size + luft + 1.0, &ay, &by) {
+        return
+    }
     if bx <= ax || by <= ay {
         return
     }
@@ -179,8 +236,23 @@ fn fill_path(z: *mut painter.Painter, pf: *mut path.Pfad, x: f64, y: f64,
     } else {
         raster.raster_finish(&(*z).ra)
     }
+    if keep {
+        fcache.fc_store(key, 0, 0, &(*z).ra, ax, ay, floor_px(x) as i64,
+            floor_px(y) as i64)
+    }
     canvas.canvas_fill_raster(cv, &(*z).ra, ax as usize, ay as usize,
         painter.mit_alpha(col))
+}
+
+// Is the square (x, y, size) with `luft` around it wholly outside the
+// canvas clip? Then nothing of the icon could show.
+fn off_clip(z: *mut painter.Painter, x: f64, y: f64, size: f64,
+    luft: f64) -> bool {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    return x + size + luft + 1.0 <= canvas.clip_x0(cv) ||
+        x - luft >= canvas.clip_x1(cv) ||
+        y + size + luft + 1.0 <= canvas.clip_y0(cv) ||
+        y - luft >= canvas.clip_y1(cv)
 }
 
 // Parse the icon into the work space. False for an unknown id.
@@ -205,6 +277,16 @@ fn icon_stroke(z: *mut painter.Painter, id: i64, x: f64, y: f64, size: f64,
     if (*z).ok == 0 || size <= 0.0 || sw <= 0.0 {
         return
     }
+    // outside the clip: not parsed, not stroked (fUi tempo, stage 1)
+    let luft: f64 = sw * (size / GRID) + 2.0
+    if off_clip(z, x, y, size, luft) {
+        return
+    }
+    // painted before at this size: written back (lib/fui/fcache.fi)
+    var key: fcache.CKey = icon_key(id, x, y, size, sw, false)
+    if icon_hit(z, &key, x, y, size, luft, col) {
+        return
+    }
     let w: *mut Work = work()
     if (w as u64) == 0 {
         return
@@ -221,7 +303,7 @@ fn icon_stroke(z: *mut painter.Painter, id: i64, x: f64, y: f64, size: f64,
     (*w).st.n_striche = 0
     (*w).st.versatz = 0.0
     stroke.strich_umriss(&(*w).out, &(*w).flat, &(*w).st, &(*w).hilf)
-    fill_path(z, &(*w).out, x, y, size, k, sw * k + 2.0, col, false)
+    fill_path_kept(z, &(*w).out, x, y, size, k, sw * k + 2.0, col, false, &key)
 }
 
 // The icon with Lucide's stroke of 2.
@@ -240,6 +322,13 @@ fn icon_filled(z: *mut painter.Painter, id: i64, x: f64, y: f64, size: f64,
     if (*z).ok == 0 || size <= 0.0 {
         return
     }
+    if off_clip(z, x, y, size, 2.0) {
+        return
+    }
+    var key: fcache.CKey = icon_key(id, x, y, size, 0.0, true)
+    if icon_hit(z, &key, x, y, size, 2.0, col) {
+        return
+    }
     let w: *mut Work = work()
     if (w as u64) == 0 {
         return
@@ -249,7 +338,7 @@ fn icon_filled(z: *mut painter.Painter, id: i64, x: f64, y: f64, size: f64,
     }
     let k: f64 = size / GRID
     path.pfad_glaette(&(*w).flat, &(*w).src, k)
-    fill_path(z, &(*w).flat, x, y, size, k, 2.0, col, true)
+    fill_path_kept(z, &(*w).flat, x, y, size, k, 2.0, col, true, &key)
 }
 
 // ------------------------------------------- the doors in design points
