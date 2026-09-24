@@ -75,6 +75,25 @@ before the fix and passes with it (and on the old `main`, which has no
 scaled fold). MP3: 124,033,353 -> 124,033,313 instructions, i.e. the fold
 never hit a two-writer value there.
 
+Two more came up in the full `test.sh` run on the merged tree (both
+TEMPO 1-13, both invisible to the MP3 decoder):
+
+* **Floating point parameters moved one by one.** System V hands the first
+  eight `f64` over in `xmm0`-`xmm7`; the allocator's homes are `xmm4`-`xmm15`.
+  The prologue emitted the moves in order, so `movaps xmm7, xmm2` (third
+  parameter) destroyed the eighth before `movaps xmm12, xmm7` read it.
+  `painter.which_side` (ten `f64` parameters) chose the wrong border and
+  `tools/paintb3` case `02_borders` drew differently in `release-fast` and
+  `dev-fast` than in `--no-opt`. The floating point moves now go through
+  `parallel_xmm_moves` (cycles broken by an in-place swap, no scratch
+  register). `tests/1706_fp_param_shuffle.fi` prints `WRONG` with the old
+  compiler and `ok` with the fix. The bank's instruction counts did not move.
+* **aarch64 copied half a `v128`.** Since TEMPO 4 `mem2reg` promotes `v128`
+  cells; the copy `phi.rs` makes of such a phi was emitted by the aarch64
+  backend as one 8-octet `ldr`/`str`. `tests/1613_crypto.fi` and
+  `1614_simd_ops.fi` failed under qemu in `dev-fast`. The copy now goes
+  through a `q` register (`simd_a64::emit_copy_v128`).
+
 ## Choosing the limit (measured, MP3 8 s, instructions)
 
 | budget | total | `synth` | `dct_ii_4` | `.text` MP3 | `.text` firnc1 (release-fast) |
