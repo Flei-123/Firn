@@ -173,6 +173,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "a loop that writes only zeroes becomes one block instruction",
     },
     PassInfo {
+        name: "unroll",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "fully unroll short loops with a trip count known at compile time (round TEMPO 14)",
+    },
+    PassInfo {
         name: "bce",
         scope: Scope::Func,
         debug_preserving: true,
@@ -549,6 +555,13 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             clk.add2("memset", t, m > 0);
             fx.note(11, m > 0);
             phi_check(f, "memset");
+        }
+        if cfg.runs("unroll") && fx.due(13) {
+            let t = std::time::Instant::now();
+            let u = crate::unroll::run(f);
+            clk.add2("unroll", t, u > 0);
+            fx.note(13, u > 0);
+            phi_check(f, "unroll");
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();

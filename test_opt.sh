@@ -140,6 +140,7 @@ tests/opt/inline_call.fi|call.i32 @square|1|0
 tests/opt/cse_common.fi|mul.i32|2|1
 tests/opt/redundant_check.fi|brcond|3|2
 tests/opt/block_merge.fi|bb|8|1
+tests/opt/unroll_counted.fi|cmp.lt.i32|1|0
 "
 
 echo "== Mustertabelle (mem2reg, tote Speicherung, Inlining, CSE, Pruefungen) =="
