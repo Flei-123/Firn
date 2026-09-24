@@ -104,8 +104,20 @@ const firnTag = document.currentScript;
         firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text'][k] || 'default'; },
     };
 
+    // The program and the font are asked for AT ONCE (they do not depend
+    // on each other), and the program is compiled while it downloads when
+    // the server says what it is (application/wasm) -- otherwise the old
+    // way, whole, then compiled.
     const wasm = q.get('wasm') || firnTag.dataset.wasm || 'gallery9.wasm';
-    const { instance } = await WebAssembly.instantiate(await (await fetch(wasm)).arrayBuffer(), { firn, env });
+    const fontAsked = fetch(q.get('font') || firnTag.dataset.font || 'DejaVuSans.ttf').then((r) => r.arrayBuffer());
+    const wasmAsked = fetch(wasm);
+    let instance;
+    const resp = await wasmAsked;
+    if (WebAssembly.instantiateStreaming && (resp.headers.get('Content-Type') || '').startsWith('application/wasm')) {
+        ({ instance } = await WebAssembly.instantiateStreaming(resp, { firn, env }));
+    } else {
+        ({ instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), { firn, env }));
+    }
     x = instance.exports;
     mem = x.memory;
     try {
@@ -117,7 +129,7 @@ const firnTag = document.currentScript;
 
     // The font. A page has no files, so the host fetches it and hands the
     // octets over; the module keeps them.
-    const font = new Uint8Array(await (await fetch(q.get('font') || firnTag.dataset.font || 'DejaVuSans.ttf')).arrayBuffer());
+    const font = new Uint8Array(await fontAsked);
     const fp = x.firn_web_alloc(font.length);
     bytes(fp, font.length).set(font);
     if (!x.firn_web_font(fp, font.length)) console.error('firn: the font was refused');

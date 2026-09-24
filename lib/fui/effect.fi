@@ -657,6 +657,10 @@ fn glow_ground(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     if !band_of(cv, x, y, w, h, &b[0]) {
         return
     }
+    let bw: i64 = b[2] - b[0]
+    if bw <= 0 || b[3] <= b[1] {
+        return
+    }
     var bay: [f64; 16] = [0.0; 16]
     let order: [i64; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
     var i: usize = 0
@@ -685,6 +689,31 @@ fn glow_ground(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
         }
         i = i + 1
     }
+    // THE ACROSS HALF OF EVERY DISTANCE, ONCE PER COLUMN (24.09.2026). The
+    // weight of a spot needs d^2 = dx^2/rx^2 + dy^2/ry^2 per pixel; the
+    // first half is the same in every row and the second the same in every
+    // column, so each is computed once and added -- the same two products
+    // and the same sum as before, the same octets (tools/fui: the look of
+    // FirnChat unchanged). And no helper per octet: the rounding is written
+    // out and the pixel stored as one word. 1996 x 1211 in WebAssembly:
+    // 125 ms before, the start frame of the chat page was mostly this.
+    let colp: u64 = rt.heap_alloc(m * (bw as usize) * 8 + 8)
+    if colp == 0 as u64 {
+        glow_ground_px(cv, &b[0], y, h, top, bottom, &sp[0], m, &bay[0])
+        return
+    }
+    var k0: usize = 0
+    while k0 < m {
+        let q0: usize = k0 * 8
+        var xi: i64 = 0
+        let row: u64 = colp + (k0 * (bw as usize) * 8) as u64
+        while xi < bw {
+            let dx: f64 = ((b[0] + xi) as f64) + 0.5 - sp[q0]
+            *((row + (xi * 8) as u64) as *mut f64) = dx * dx * sp[q0 + 2]
+            xi = xi + 1
+        }
+        k0 = k0 + 1
+    }
     let t0r: f64 = ((top >> 16) & 255 as u32) as f64
     let t0g: f64 = ((top >> 8) & 255 as u32) as f64
     let t0b: f64 = (top & 255 as u32) as f64
@@ -695,6 +724,9 @@ fn glow_ground(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     let stride: i64 = (canvas.canvas_width(cv) as i64) * 4
     var span: f64 = h
     if span < 1.0 { span = 1.0 }
+    var rowt: [f64; 4] = [0.0; 4]
+    var act: [u64; 4] = [0; 4] // the column halves of the spots this row meets
+    var ramp: [u32; 4] = [0; 4]
     var yy: i64 = b[1]
     while yy < b[3] {
         let fy: f64 = (yy as f64) + 0.5
@@ -704,29 +736,210 @@ fn glow_ground(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
         let rr: f64 = t0r + (t1r - t0r) * t
         let rg: f64 = t0g + (t1g - t0g) * t
         let rb: f64 = t0b + (t1b - t0b) * t
+        // the spots that reach this row at all (the column half is never
+        // negative, so a row half of 1 or more keeps d^2 at 1 or more)
+        var na: usize = 0
+        var k: usize = 0
+        while k < m {
+            let q: usize = k * 8
+            let dy: f64 = fy - sp[q + 1]
+            let rt2: f64 = dy * dy * sp[q + 3]
+            if rt2 < 1.0 {
+                rowt[na] = rt2
+                act[na] = (k as u64) | ((colp + (k * (bw as usize) * 8) as u64) << 3)
+                na = na + 1
+            }
+            k = k + 1
+        }
+        // the four dithered pixels of the bare ramp in this row
+        var j: usize = 0
+        while j < 4 {
+            let d0: f64 = bay[(((yy & 3) * 4) as usize) + j]
+            var vr: f64 = rr + d0 + 0.5
+            if vr < 0.0 { vr = 0.0 }
+            if vr > 255.0 { vr = 255.0 }
+            var vg: f64 = rg + d0 + 0.5
+            if vg < 0.0 { vg = 0.0 }
+            if vg > 255.0 { vg = 255.0 }
+            var vb: f64 = rb + d0 + 0.5
+            if vb < 0.0 { vb = 0.0 }
+            if vb > 255.0 { vb = 255.0 }
+            ramp[j] = ((vr as i64) | ((vg as i64) << 8) | ((vb as i64) << 16)
+                | (255 << 24)) as u32
+            j = j + 1
+        }
+        let dbase: usize = ((yy & 3) * 4) as usize
         var o: u64 = px + (yy * stride + b[0] * 4) as u64
-        var xx: i64 = b[0]
-        while xx < b[2] {
+        if na == 0 {
+            var xi2: i64 = 0
+            while xi2 < bw {
+                *(o as *mut u32) = ramp[((b[0] + xi2) & 3) as usize]
+                o = o + 4
+                xi2 = xi2 + 1
+            }
+        } else {
+            // the light itself at every GLOW_STEP-th column (and the last),
+            // exactly; in between it is a straight line -- it is a sum of
+            // (1 - d^2)^2 bumps hundreds of pixels wide, and the line is off
+            // by far less than the dither (tools/fui glow bench: at most one
+            // level at a few pixels in a thousand). Rounding and dither stay
+            // per pixel.
+            let actu: u64 = (&act[0]) as u64
+            let rowu: u64 = (&rowt[0]) as u64
+            let spu: u64 = (&sp[0]) as u64
+            // the dither of this row plus the half for rounding
+            var dfx: [f64; 4] = [0.0; 4]
+            var dj: usize = 0
+            while dj < 4 {
+                dfx[dj] = bay[dbase + dj] + 0.5
+                dj = dj + 1
+            }
+            let dfu: u64 = (&dfx[0]) as u64
+            let aend: u64 = (na * 8) as u64
+            var x0: i64 = 0
+            var c0r: f64 = 0.0
+            var c0g: f64 = 0.0
+            var c0b: f64 = 0.0
+            glow_at(actu, rowu, spu, aend, colp, 0, rr, rg, rb, &c0r, &c0g, &c0b)
+            var xx: u64 = b[0] as u64
+            while x0 < bw {
+                var x1: i64 = x0 + GLOW_STEP
+                if x1 > bw - 1 {
+                    x1 = bw - 1
+                }
+                var c1r: f64 = c0r
+                var c1g: f64 = c0g
+                var c1b: f64 = c0b
+                var n1: i64 = 1
+                if x1 > x0 {
+                    glow_at(actu, rowu, spu, aend, colp, x1, rr, rg, rb,
+                        &c1r, &c1g, &c1b)
+                    n1 = x1 - x0
+                }
+                let inv: f64 = 1.0 / (n1 as f64)
+                let sr: f64 = (c1r - c0r) * inv
+                let sg: f64 = (c1g - c0g) * inv
+                let sb: f64 = (c1b - c0b) * inv
+                var cr: f64 = c0r
+                var cg: f64 = c0g
+                var cb: f64 = c0b
+                // the span [x0, x1): the last column is painted with the
+                // last span's end
+                var cnt: i64 = n1
+                if x1 == bw - 1 {
+                    cnt = n1 + 1
+                }
+                // No clamps: a colour between two colours of 0..255, plus a
+                // dither of less than half a level, plus the half for the
+                // rounding, stays inside [0, 256).
+                var q: i64 = 0
+                while q < cnt {
+                    let d: f64 = *((dfu + ((xx & 3) << 3)) as *mut f64)
+                    *(o as *mut u32) = (((cr + d) as i64)
+                        | (((cg + d) as i64) << 8)
+                        | (((cb + d) as i64) << 16) | (255 << 24)) as u32
+                    cr = cr + sr
+                    cg = cg + sg
+                    cb = cb + sb
+                    o = o + 4
+                    xx = xx + 1
+                    q = q + 1
+                }
+                c0r = c1r
+                c0g = c1g
+                c0b = c1b
+                x0 = x0 + cnt
+            }
+        }
+        yy = yy + 1
+    }
+    rt.heap_free(colp, m * (bw as usize) * 8 + 8)
+}
+
+const GLOW_STEP: i64 = 8
+
+// The light of the spots that reach this row, at column `xi` of the band,
+// over the ramp colour (rr, rg, rb) -- exactly what the per pixel loop
+// computed.
+fn glow_at(actu: u64, rowu: u64, spu: u64, aend: u64, colp: u64, xi: i64,
+    rr: f64, rg: f64, rb: f64, outr: *mut f64, outg: *mut f64,
+    outb: *mut f64) {
+    var cr: f64 = rr
+    var cg: f64 = rg
+    var cb: f64 = rb
+    let xo: u64 = (xi * 8) as u64
+    var ao: u64 = 0
+    while ao < aend {
+        let ak: u64 = *((actu + ao) as *mut u64)
+        let d2: f64 = *(((ak >> 3) + xo) as *mut f64) + *((rowu + ao) as *mut f64)
+        if d2 < 1.0 {
+            let q: u64 = spu + ((ak & 7) << 6)
+            let u: f64 = 1.0 - d2
+            let wgt: f64 = u * u * *((q + 32) as *mut f64)
+            cr = cr + (*((q + 40) as *mut f64) - cr) * wgt
+            cg = cg + (*((q + 48) as *mut f64) - cg) * wgt
+            cb = cb + (*((q + 56) as *mut f64) - cb) * wgt
+        }
+        ao = ao + 8
+    }
+    *outr = cr
+    *outg = cg
+    *outb = cb
+}
+
+// The same ground, pixel by pixel -- what glow_ground falls back to when
+// the column table cannot be had.
+fn glow_ground_px(cv: *mut canvas.Canvas, bp: *mut i64, y: f64, h: f64,
+    top: u32, bottom: u32, spp: *mut f64, m: usize, bayp: *mut f64) {
+    let b0: i64 = *bp
+    let b1: i64 = *((bp as u64 + 8) as *mut i64)
+    let b2: i64 = *((bp as u64 + 16) as *mut i64)
+    let b3: i64 = *((bp as u64 + 24) as *mut i64)
+    let spu: u64 = spp as u64
+    let bayu: u64 = bayp as u64
+    let t0r: f64 = ((top >> 16) & 255 as u32) as f64
+    let t0g: f64 = ((top >> 8) & 255 as u32) as f64
+    let t0b: f64 = (top & 255 as u32) as f64
+    let t1r: f64 = ((bottom >> 16) & 255 as u32) as f64
+    let t1g: f64 = ((bottom >> 8) & 255 as u32) as f64
+    let t1b: f64 = (bottom & 255 as u32) as f64
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = (canvas.canvas_width(cv) as i64) * 4
+    var span: f64 = h
+    if span < 1.0 { span = 1.0 }
+    var yy: i64 = b1
+    while yy < b3 {
+        let fy: f64 = (yy as f64) + 0.5
+        var t: f64 = (fy - y) / span
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+        let rr: f64 = t0r + (t1r - t0r) * t
+        let rg: f64 = t0g + (t1g - t0g) * t
+        let rb: f64 = t0b + (t1b - t0b) * t
+        var o: u64 = px + (yy * stride + b0 * 4) as u64
+        var xx: i64 = b0
+        while xx < b2 {
             var cr: f64 = rr
             var cg: f64 = rg
             var cb: f64 = rb
             let fx: f64 = (xx as f64) + 0.5
             var k: usize = 0
             while k < m {
-                let q: usize = k * 8
-                let dx: f64 = fx - sp[q]
-                let dy: f64 = fy - sp[q + 1]
-                let d2: f64 = dx * dx * sp[q + 2] + dy * dy * sp[q + 3]
+                let q: u64 = spu + (k * 64) as u64
+                let dx: f64 = fx - *(q as *mut f64)
+                let dy: f64 = fy - *((q + 8) as *mut f64)
+                let d2: f64 = dx * dx * *((q + 16) as *mut f64)
+                    + dy * dy * *((q + 24) as *mut f64)
                 if d2 < 1.0 {
                     let u: f64 = 1.0 - d2
-                    let wgt: f64 = u * u * sp[q + 4]
-                    cr = cr + (sp[q + 5] - cr) * wgt
-                    cg = cg + (sp[q + 6] - cg) * wgt
-                    cb = cb + (sp[q + 7] - cb) * wgt
+                    let wgt: f64 = u * u * *((q + 32) as *mut f64)
+                    cr = cr + (*((q + 40) as *mut f64) - cr) * wgt
+                    cg = cg + (*((q + 48) as *mut f64) - cg) * wgt
+                    cb = cb + (*((q + 56) as *mut f64) - cb) * wgt
                 }
                 k = k + 1
             }
-            let d: f64 = bay[((yy & 3) * 4 + (xx & 3)) as usize]
+            let d: f64 = *((bayu + (((yy & 3) * 4 + (xx & 3)) * 8) as u64) as *mut f64)
             st8(o, oct8(cr + d) as u8)
             st8(o + 1, oct8(cg + d) as u8)
             st8(o + 2, oct8(cb + d) as u8)
