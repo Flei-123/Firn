@@ -6,23 +6,58 @@ The Rust side uses `std::hint::black_box` and the same unchecked pointer accesse
 
 * CPU: AMD EPYC 7571 32-Core Processor
 * system: Linux 7.0.14-5-pve x86_64
-* rustc 1.99.0-nightly (c98d0cb27 2026-08-12)
+* rustc 1.100.0-nightly (a36d05efa 2026-09-09)
 * Firn: its own code generator, no external crates
 
 | benchmark | Firn `release-fast` | Firn `release-safe` | Firn `dev-fast` (default) | `rustc -O` | factor fast | factor safe | factor devf | result |
 |---|---|---|---|---|---|---|---|
-| fib | 0.053 s | 0.051 s | 0.051 s | 0.033 s | **1.64x** | **1.56x** | **1.57x** | 4356618 |
-| sieve | 0.033 s | 0.048 s | 0.139 s | 0.033 s | **1.01x** | **1.47x** | **4.24x** | 697026 |
-| matmul | 0.044 s | 0.095 s | 0.253 s | 0.022 s | **2.01x** | **4.30x** | **11.42x** | 8291727 |
-| bytecount | 0.268 s | 0.230 s | 0.860 s | 0.205 s | **1.30x** | **1.12x** | **4.18x** | 1604208 |
-| bubblesort | 0.076 s | 0.106 s | 0.190 s | 0.041 s | **1.84x** | **2.57x** | **4.62x** | 12021846167 |
-| statemachine | 0.162 s | 0.138 s | 0.235 s | 0.095 s | **1.71x** | **1.46x** | **2.48x** | 6710880 |
+| fib | 0.052 s | 0.051 s | 0.051 s | 0.028 s | **1.83x** | **1.79x** | **1.82x** | 4356618 |
+| sieve | 0.039 s | 0.052 s | 0.135 s | 0.044 s | **0.87x** | **1.17x** | **3.04x** | 697026 |
+| matmul | 0.042 s | 0.099 s | 0.257 s | 0.024 s | **1.77x** | **4.15x** | **10.74x** | 8291727 |
+| bytecount | 0.269 s | 0.194 s | 0.820 s | 0.205 s | **1.31x** | **0.95x** | **4.01x** | 1604208 |
+| bubblesort | 0.069 s | 0.107 s | 0.205 s | 0.037 s | **1.85x** | **2.89x** | **5.51x** | 12021846167 |
+| statemachine | 0.138 s | 0.129 s | 0.233 s | 0.096 s | **1.43x** | **1.35x** | **2.43x** | 6710880 |
 
-Median Firn `release-fast` against `rustc -O`: **1.67x** (range 1.01x - 2.01x).
-Median Firn `release-safe` against `rustc -O`: **1.52x** (range 1.12x - 4.30x).
-Median Firn `dev-fast` (default) against `rustc -O`: **4.21x** (range 1.57x - 11.42x).
+Median Firn `release-fast` against `rustc -O`: **1.60x** (range 0.87x - 1.85x).
+Median Firn `release-safe` against `rustc -O`: **1.57x** (range 0.95x - 4.15x).
+Median Firn `dev-fast` (default) against `rustc -O`: **3.52x** (range 1.82x - 10.74x).
 
 `release-fast` is the like-for-like comparison: all passes, and integer arithmetic unchecked exactly as `rustc -O` leaves it. `release-safe` runs the same passes and CHECKS every integer operation, so it is Firn doing strictly more work than Rust. `dev-fast` is what a plain `firnc` gives you: checked, and without the one pass that would make the call stack unreadable.
+
+## Round TEMPO 14 (24.09.2026) — before and after
+
+The table above is the state after TEMPO 1-13 (register allocator, `xmm-ra`)
+merged onto `main` plus TEMPO 14 (full unrolling of short counted loops,
+`docs/TEMPO14.md`). "Before" is `main` at `893695bd`, measured with the
+same script on the same machine in the same hour, twice each, alternating.
+The machine was shared (two full test runs of other trees at the same time,
+load 15-20 on 20 cores), so the wall clock scatters by 10-20 % and the pairs
+are the honest statement:
+
+| median against `rustc -O` | before, pass 1 | before, pass 2 | after, pass 1 | after, pass 2 |
+|---|---:|---:|---:|---:|
+| `release-fast` | 1.83x | 1.83x | 1.51x | 1.60x |
+| `release-safe` | 1.71x | 1.65x | 1.59x | 1.57x |
+| `dev-fast` | 4.60x | 4.02x | 3.92x | 3.52x |
+
+The exact instrument is the count of executed instructions (callgrind, Firn
+against the `rustc -O` build of the same program, outputs identical):
+
+| median of the instruction factor | before (`main`) | after merge | after TEMPO 14 |
+|---|---:|---:|---:|
+| these six programs, `release-fast` | 1.37x | 1.09x | 1.09x |
+| these six programs, `dev-fast` | 4.77x | 4.47x | 4.47x |
+| all eleven with a Rust twin, `release-fast` | 1.51x | 1.45x | 1.45x |
+| all eleven with a Rust twin, `dev-fast` | 5.07x | 4.90x | 4.90x |
+
+So the step in this table is the register allocator of TEMPO 1-13. The
+unrolling does not touch these programs (none of them has a short counted
+loop in its hot path; `gc_barrier`, which has one and no Rust twin, went
+-16 %); its target was the MP3 decoder: 124.0 -> 106.8 million instructions.
+
+`matmul` is the largest factor left (2.66x in instructions): the inner loop
+costs Firn 11 instructions per pass, among them an `imul` for `k * n`, and
+Rust 3.75 (unrolled four times, the pointer stepped by `4n`).
 
 ## Round SPEED (27.08.2026) — the two passes, and what changed
 

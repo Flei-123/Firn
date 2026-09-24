@@ -273,12 +273,15 @@ and a `line:column` — it does not crash and it does not pretend.
   run itself and fragmentation with **changing** object sizes — the soak
   always allocates the same set, which is the friendly case
   ([ACCEPTANCE.md](ACCEPTANCE.md) item 2).
-* **The speed target of `<= 2x` Rust is missed — but only just.** Median
-  **2.08x** and **2.19x** in two passes of nine runs each, range
-  1.43x–4.16x. Three of the six programs are inside the target; `sieve` is
-  the outlier that carries the median, and the distance is where LLVM
-  vectorizes. The same target **is** met for the HTML tokenizer against
-  html5ever (1.18x on real pages, 0.80x on the pathological corpus).
+* **The speed target of `<= 2x` Rust is met at `release-fast`, not at the
+  default level.** Median against `rustc -O` over the six programs of
+  `bench/run.sh` (24.09.2026, after TEMPO 1-14): **1.51x** and **1.60x** in
+  two passes of nine runs at `release-fast` (1.09x in executed
+  instructions), **3.92x** and **3.52x** at `dev-fast`, the default, which
+  checks every integer operation and does not inline. `matmul` is the
+  largest factor left (2.66x in instructions). The same target is met for
+  the HTML tokenizer against html5ever (1.18x on real pages, 0.80x on the
+  pathological corpus).
   Raw tables: [bench/RESULTS.md](bench/RESULTS.md).
 
 ---

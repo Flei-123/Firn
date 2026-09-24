@@ -53,6 +53,28 @@ position, so it runs in `dev-fast` as well).
 5. **Left alone:** loops with a `break` or `return` in the body, inline
    assembler, `clone`, `secret` values, `#[constant_time]`.
 
+## A bug the merge brought to light
+
+Before this round, TEMPO 1-13 (`xmm-ra`) were merged onto `main`. The fUi
+check (`tools/wasm/webdemo.sh` -> `tools/fui/x11live.py`, step L8: x11demo at
+`Xft.dpi: 192`) crashed in `release-fast`: `canvas_fill_rect` wrote through a
+wild pointer. Cause, in `regalloc::foldable_addresses`: after phi
+elimination and coalescing, the `q` of
+
+```firn
+var q: u64 = px + ((y * w + ix0) * 4) as u64
+while k < ix1 { ...; q = q + 4; k = k + 1 }
+```
+
+is ONE value with TWO writers. The scaled sum of the first writer (TEMPO 3,
+`lea q, [px + idx*4]`) was keyed by the value and emitted for the second
+writer as well: `q = q + 4` became `lea r9, [r8+r9*4]`. Every address fold
+now requires a value with exactly one writer (and so does the offset it
+removes). `tests/1705_fold_one_writer.fi` is the loop cut down; it crashed
+before the fix and passes with it (and on the old `main`, which has no
+scaled fold). MP3: 124,033,353 -> 124,033,313 instructions, i.e. the fold
+never hit a two-writer value there.
+
 ## Choosing the limit (measured, MP3 8 s, instructions)
 
 | budget | total | `synth` | `dct_ii_4` | `.text` MP3 | `.text` firnc1 (release-fast) |
@@ -69,6 +91,16 @@ another 2.7 % of code. 640 is where the curve flattens. The self-hosting
 compiler grows by 0.6 % (`release-fast`) and 0.6 % (`dev-fast`); its
 compile time did not move (3.9 s dev-fast, 4.6 s release-fast, both with
 and without the pass).
+
+**What it costs in code.** The self-hosting compiler +0.6 %, the MP3
+decoder +1.9 %, fUi's x11demo +2.5 % (`release-fast`) / +2.8 %
+(`release-safe`), the fUi gallery as WebAssembly 482,521 -> 507,167 octets
+(+5.1 %). Two ways to cut that were measured and did not pay: at most 9
+passes instead of 16 (503,730 octets, the growth sits in short loops), and a
+separate small budget for loops that save nothing but their own test
+(0 to 128 instructions: 503,714 octets, but MP3 108.1 M instead of 106.8 M)
+-- the growth comes from exactly the loops that win. At most 4 passes would
+keep the gallery at +1.1 %, and loses `synth`.
 
 **Result: 124.0 -> 106.8 million instructions (-13.9 %), bit identical**
 (8 s and 60 s against `ref60.pcm`). Per function:
