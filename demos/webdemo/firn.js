@@ -87,6 +87,70 @@ const firnTag = document.currentScript;
     const ev = (r) => { frame(); return r; };
     let frames = 0, es = null;
     const ta = document.createElement('textarea'); // the keyboard's door
+    const MARK = '​'; // the marker letter of the unmirrored field (below)
+    // THE MIRRORED FIELD (web_edit_mode on). The field holds the page's whole
+    // line; every change -- a letter, a word Gboard completed, the caret the
+    // keyboard's space bar slid, a selection a finger dragged -- goes to the
+    // page whole, as octets: text, caret, anchor, the word being composed.
+    // What the page changes itself comes back through editSet. The field is
+    // transparent and lies exactly over the painted one (the page's face,
+    // size, line height and insets): the page paints, the field edits.
+    const PAGE_KEYS = new Set(['Enter', 'Escape', 'Tab', 'PageUp', 'PageDown']);
+    let mirror = false, composing = false, compText = '', lastSent = '';
+    const octs = (v, i) => utf8.encode(v.slice(0, i)).length;
+    const units = (v, o) => { const b = utf8.encode(v); return text.decode(b.subarray(0, Math.min(o, b.length))).length; };
+    const sel = () => {
+        const s0 = ta.selectionStart, e0 = ta.selectionEnd;
+        return ta.selectionDirection === 'backward' ? [s0, e0] : [e0, s0]; // [caret, anchor]
+    };
+    const editSend = () => {
+        if (!mirror) return;
+        const v = ta.value;
+        const [c, a] = sel();
+        let ca = 0, cb = 0;
+        if (composing && compText) { // the composed word ends at the caret
+            const end = ta.selectionEnd, st = end - compText.length;
+            if (st >= 0 && v.slice(st, end) === compText) { ca = octs(v, st); cb = octs(v, end); }
+        }
+        const oc = octs(v, c), oa = octs(v, a);
+        const k = v + '\u0000' + oc + ',' + oa + ',' + ca + ',' + cb;
+        if (k === lastSent) return;
+        lastSent = k;
+        ev(x.firn_web_edit(...give(v), oc, oa, ca, cb));
+    };
+    ta.addEventListener('compositionstart', () => { composing = true; compText = ''; });
+    ta.addEventListener('compositionupdate', (e) => { compText = e.data || ''; });
+    document.addEventListener('selectionchange', () => { if (mirror && document.activeElement === ta) editSend(); });
+    const editSet = (v, cur, anc, scroll) => {
+        if (!mirror) return;
+        const c = units(v, cur), a = units(v, anc);
+        if (ta.value !== v) ta.value = v;
+        const s0 = Math.min(c, a), e0 = Math.max(c, a);
+        if (ta.selectionStart !== s0 || ta.selectionEnd !== e0) ta.setSelectionRange(s0, e0, c < a ? 'backward' : 'forward');
+        ta.scrollTop = scroll;
+        lastSent = v + '\u0000' + cur + ',' + anc + ',0,0';
+    };
+    const selStyle = document.createElement('style');
+    selStyle.textContent = 'textarea.firn-edit::selection{background:transparent;color:transparent}';
+    document.head.appendChild(selStyle);
+    const editMode = (on, font, line, left, top, right) => {
+        if (on) {
+            mirror = true;
+            ta.classList.add('firn-edit');
+            Object.assign(ta.style, { opacity: 1, boxSizing: 'border-box', fontFamily: 'FirnText, Inter, sans-serif',
+                fontSize: font + 'px', lineHeight: line + 'px', paddingLeft: left + 'px', paddingTop: top + 'px',
+                paddingRight: right + 'px', paddingBottom: '0px', whiteSpace: 'pre-wrap', overflowWrap: 'break-word',
+                overflow: 'hidden', color: 'transparent', caretColor: 'transparent', background: 'transparent',
+                outline: 'none', letterSpacing: '0px', fontKerning: 'normal' });
+            ta.setAttribute('autocorrect', 'on'); ta.setAttribute('spellcheck', 'true');
+        } else if (mirror) {
+            mirror = false; composing = false; compText = ''; lastSent = '';
+            ta.classList.remove('firn-edit');
+            Object.assign(ta.style, { opacity: 0, padding: '0px', fontSize: '16px', lineHeight: 'normal' });
+            ta.value = MARK;
+            ta.setSelectionRange(1, 1);
+        }
+    };
     // THE PICTURE, wrapped once: an ImageData over the module's own memory
     // (no copy), made again only when the memory grew (its buffer is then a
     // new one) or the canvas got another size.
@@ -145,6 +209,10 @@ const firnTag = document.currentScript;
         firn_web_store_get(kp, kn, p, cap) { try { return put(localStorage.getItem(str(kp, kn)), p, cap); } catch (e) { return 0; } },
         firn_web_store_set(kp, kn, p, n) { try { localStorage.setItem(str(kp, kn), str(p, n)); } catch (e) { /* private mode */ } },
         firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text'][k] || 'default'; },
+        // THE FIELD THE KEYBOARD REALLY EDITS (lib/plat/web.fi web_edit_mode):
+        // the text field holds the page's whole line and lies over its field
+        firn_web_edit_mode(on, font, line, left, top, right) { editMode(on, font, line, left, top, right); },
+        firn_web_edit_set(p, n, cur, anc, scroll) { editSet(str(p, n), cur, anc, scroll); },
     };
 
     // THE GPU (lib/plat/webgl.fi, lib/fui/gpu.fi): WebGL2, one host call per
@@ -278,6 +346,10 @@ const firnTag = document.currentScript;
     // The font. A page has no files, so the host fetches it and hands the
     // octets over; the module keeps them.
     const font = new Uint8Array(await fontAsked);
+    // the same face for the text field that lies over the painted one (its
+    // letters are transparent, but where they stand decides where a finger
+    // puts the caret and where the selection handles go)
+    try { const ff = new FontFace('FirnText', font.slice(0).buffer); document.fonts.add(ff); ff.load().catch(() => {}); } catch (e) { /* no FontFace */ }
     const fp = x.firn_web_alloc(font.length);
     bytes(fp, font.length).set(font);
     if (!ev(x.firn_web_font(fp, font.length))) console.error('firn: the font was refused');
@@ -312,6 +384,10 @@ const firnTag = document.currentScript;
     const said = (n, v) => ev(x.firn_web_stream_event(...give(n), ...give(v)));
     addEventListener('blur', () => said('focus', '0'));
     addEventListener('focus', () => said('focus', '1'));
+    // A page in a phone's custom tab or web view may start without the
+    // window's focus and never get its 'focus' event: the text field that
+    // takes the keyboard and a finger on the page say it as well.
+    ta.addEventListener('focus', () => said('focus', '1'));
     if (!document.hasFocus()) said('focus', '0');
     const rm = matchMedia('(prefers-reduced-motion: reduce)');
     const motion = () => said('motion', rm.matches ? '1' : '0');
@@ -322,6 +398,7 @@ const firnTag = document.currentScript;
     const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];
     canvas.addEventListener('pointermove', (e) => ev(x.firn_web_pointer(0, ...at(e))));
     canvas.addEventListener('pointerdown', (e) => {
+        if (!document.hasFocus || document.hasFocus()) said('focus', '1');
         canvas.setPointerCapture(e.pointerId);
         if (document.activeElement !== ta) canvas.focus({ preventScroll: true });
         ev(x.firn_web_pointer(1, ...at(e)));
@@ -333,6 +410,9 @@ const firnTag = document.currentScript;
     const mods = (e) => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
     const key = (down) => (e) => {
         if (e.isComposing || e.key === 'Process' || e.key === 'Unidentified') return;
+        // The mirrored field edits itself (Backspace, the arrows, Home/End,
+        // Ctrl+A/C/V/X/Z): only the keys that are no editing go to the page.
+        if (mirror && e.target === ta && !PAGE_KEYS.has(e.key)) return;
         // Printable keys in the text field arrive as text (input below).
         if (e.target === ta && [...e.key].length === 1 && !e.ctrlKey && !e.metaKey) return;
         const k = utf8.encode(e.key).subarray(0, 255);
@@ -346,7 +426,6 @@ const firnTag = document.currentScript;
     // it, an input method composes in it, paste lands in it. It holds one
     // marker character; what stands behind the marker is new text, a
     // marker that is gone was a Backspace.
-    const MARK = '​';
     // Off the screen until the page places it (firn_web_keyboard puts it over
     // the field, so the tap that follows lands on it and keeps the focus).
     // Unplaced, the invisible box used to sit over the top left corner of the
@@ -370,8 +449,9 @@ const firnTag = document.currentScript;
         bytes(p, k.length).set(k);
         ev(x.firn_web_key(1, p, k.length, 0));
     };
-    ta.addEventListener('input', (e) => { if (!e.isComposing) flush(); });
-    ta.addEventListener('compositionend', flush);
+    ta.addEventListener('input', (e) => { if (mirror) editSend(); else if (!e.isComposing) flush(); });
+    ta.addEventListener('compositionend', () => { if (mirror) { composing = false; compText = ''; editSend(); } else flush(); });
+
 
     // The first frame; every later one is asked for (THE FRAME CLOCK above).
     frame();
