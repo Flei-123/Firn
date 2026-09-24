@@ -880,6 +880,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                     params: f.params.iter().filter_map(|p| class(*p)).collect(),
                     results: class(f.ret).into_iter().collect(),
                 };
+                let param_vts = sig.params.clone();
                 let ty = g.type_index(sig);
                 if OVERRIDES.contains(&f.name.as_str()) {
                     let body = match class(f.ret) {
@@ -894,7 +895,9 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                     dispatch += 1;
                 }
                 fx.translate()?;
-                out.push(w::Func { ty, locals: fx.locals, body: fx.out, sym });
+                let mut body = std::mem::take(&mut fx.out);
+                let locals = crate::wasm_locals::pack(&param_vts, std::mem::take(&mut fx.locals), &mut body);
+                out.push(w::Func { ty, locals, body, sym });
             }
             Ok((out, dispatch))
         });
@@ -997,6 +1000,269 @@ fn single_consts(f: &Func) -> HashMap<Val, i128> {
     out
 }
 
+/// Round OPT-GENERAL -- which values become expression trees.
+///
+/// A value used exactly once, in the same block, by an instruction whose
+/// translation reads each operand once, is computed right at that use: its
+/// instruction is emitted where the use reads it, and the result stays on
+/// the operand stack. That removes a `local.set` and a `local.get` per value
+/// and, more important for a one-pass engine, the local itself.
+///
+/// What may move: pure computations that cannot trap, and loads. A pure
+/// computation may move past anything except what writes a local (a phi
+/// copy) or calls (a call may run the collector, and a pointer the tree
+/// still has to read must be in the shadow frame then). A load may only move
+/// past other pure computations and loads.
+///
+/// Constants and data addresses defined once are simply computed again at
+/// every use.
+fn plan_trees(f: &Func, cfg: &Cfg) -> (HashMap<Val, (u32, usize)>, HashMap<Val, (u32, usize)>) {
+    let mut inline: HashMap<Val, (u32, usize)> = HashMap::new();
+    let mut remat: HashMap<Val, (u32, usize)> = HashMap::new();
+    if std::env::var_os("FIRN_WASM_NO_TREES").is_some() {
+        return (inline, remat);
+    }
+    let n = f.val_types.len();
+    let mut ndef = vec![0u32; n];
+    let mut nuse = vec![0u32; n];
+    let mut use_at = vec![(u32::MAX, usize::MAX); n];
+    let mut ops: Vec<Val> = Vec::new();
+    for &b in &cfg.order {
+        let blk = &f.blocks[b as usize];
+        for (k, i) in blk.insts.iter().enumerate() {
+            if let Some(d) = i.dst {
+                if (d as usize) < n {
+                    ndef[d as usize] += 1;
+                }
+            }
+            ops.clear();
+            i.op.uses(&mut ops);
+            for &v in &ops {
+                if (v as usize) < n {
+                    nuse[v as usize] += 1;
+                    use_at[v as usize] = (b, k);
+                }
+            }
+        }
+        let tv = match &blk.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Ret(Some(v)) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = tv {
+            if (v as usize) < n {
+                nuse[v as usize] += 1;
+                use_at[v as usize] = (b, blk.insts.len());
+            }
+        }
+    }
+    for &b in &cfg.order {
+        for (k, i) in f.blocks[b as usize].insts.iter().enumerate() {
+            if let Some(d) = i.dst {
+                if (d as usize) < n
+                    && std::env::var_os("FIRN_WASM_NO_REMAT").is_none()
+                    && ndef[d as usize] == 1
+                    && class(i.ty).is_some()
+                    && !f.is_secret(d)
+                    && matches!(i.op, Op::Const(_) | Op::GlobalAddr { .. } | Op::FnRef { .. } | Op::VtabAddr { .. })
+                {
+                    remat.insert(d, (b, k));
+                }
+            }
+        }
+    }
+    for &b in &cfg.order {
+        let blk = &f.blocks[b as usize];
+        let nb = blk.insts.len();
+        let mut fpos: HashMap<usize, usize> = HashMap::new();
+        for k in (0..nb).rev() {
+            let i = &blk.insts[k];
+            let d = match i.dst {
+                Some(d) => d,
+                None => continue,
+            };
+            let du = d as usize;
+            if du >= n || remat.contains_key(&d) || ndef[du] != 1 || nuse[du] != 1 || f.is_secret(d) {
+                continue;
+            }
+            let load = match &i.op {
+                Op::Load { .. } if std::env::var_os("FIRN_WASM_TREE_NOLOAD").is_none() => true,
+                op if tree_op(op, i.ty) => false,
+                _ => continue,
+            };
+            let (ub, up) = use_at[du];
+            if ub != b || up <= k || up == usize::MAX {
+                continue;
+            }
+            let consumer = if up == nb {
+                matches!(blk.term, Term::BrCond { .. } | Term::Ret(_) | Term::Switch { .. })
+            } else {
+                tree_consumer(&blk.insts[up].op)
+            };
+            if !consumer {
+                continue;
+            }
+            let end = *fpos.get(&up).unwrap_or(&up);
+            let mut blocked = false;
+            for j in (k + 1)..end.min(nb) {
+                if fpos.contains_key(&j) {
+                    continue;
+                }
+                if tree_barrier(&blk.insts[j], load) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                continue;
+            }
+            fpos.insert(k, end);
+            inline.insert(d, (b, k));
+        }
+    }
+    (inline, remat)
+}
+
+/// Round OPT-GENERAL -- the 64-bit values of which only the low 32 bits are
+/// ever needed. Pointers stay 64 bits wide in memory and at every call (see
+/// the module comment), but an address that is only computed to be used --
+/// `base + i * 4`, cut to 32 bits by the load -- can be computed in 32 bits
+/// from the start: the low 32 bits of a sum, difference, product, bit
+/// operation or constant left shift depend only on the low 32 bits of the
+/// operands. Greatest fixed point: start with every candidate and remove
+/// each value one of whose uses needs more.
+fn plan_low32(f: &Func, cfg: &Cfg) -> Vec<bool> {
+    let n = f.val_types.len();
+    let mut low = vec![false; n];
+    if std::env::var_os("FIRN_WASM_NO_LOW32").is_some() {
+        return low;
+    }
+    let np = f.params.len();
+    let consts = single_consts(f);
+    for b in &cfg.order {
+        for i in &f.blocks[*b as usize].insts {
+            if let Some(d) = i.dst {
+                let du = d as usize;
+                if du >= np && du < n && class(f.val_types[du]) == Some(VT::I64) && !f.is_secret(d) {
+                    low[du] = true;
+                }
+            }
+        }
+    }
+    let mut ops: Vec<Val> = Vec::new();
+    loop {
+        let mut changed = false;
+        for b in &cfg.order {
+            let blk = &f.blocks[*b as usize];
+            for i in &blk.insts {
+                ops.clear();
+                i.op.uses(&mut ops);
+                let dlow = i.dst.map(|d| (d as usize) < n && low[d as usize]).unwrap_or(false);
+                for &u in &ops {
+                    let uu = u as usize;
+                    if uu >= n || !low[uu] {
+                        continue;
+                    }
+                    let ok = match &i.op {
+                        Op::Load { .. } | Op::MmioLoad { .. } | Op::CopyMem { .. } => true,
+                        Op::Store { addr, val } | Op::MmioStore { addr, val } => *addr == u && *val != u,
+                        Op::AtomicAdd { addr, val } => *addr == u && *val != u,
+                        Op::AtomicCas { addr, erw, new } => *addr == u && *erw != u && *new != u,
+                        Op::SecureZero { .. } => true,
+                        Op::CallIndirect { target, args } => *target == u && !args.contains(&u),
+                        Op::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor, _, _) => dlow,
+                        Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Add | BinOp::Sub | BinOp::Mul, .. } => dlow,
+                        Op::Bin(BinOp::Shl, a, c) => {
+                            dlow && *a == u && *c != u && consts.get(c).map(|k| (0..32).contains(k)).unwrap_or(false)
+                        }
+                        Op::PtrAdd { .. } => dlow,
+                        Op::Copy { .. } => dlow,
+                        Op::Cast { .. } => {
+                            let to = i.ty;
+                            if to.is_float() || to == FTy::Bool {
+                                false
+                            } else if class(to) == Some(VT::I32) {
+                                true
+                            } else {
+                                dlow
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        low[uu] = false;
+                        changed = true;
+                    }
+                }
+            }
+            let tv = match &blk.term {
+                Term::BrCond { cond, .. } => Some(*cond),
+                Term::Switch { val, .. } => Some(*val),
+                Term::Ret(Some(v)) => Some(*v),
+                _ => None,
+            };
+            if let Some(v) = tv {
+                if (v as usize) < n && low[v as usize] {
+                    low[v as usize] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    low
+}
+
+/// A pure computation that cannot trap and reads each operand once.
+fn tree_op(op: &Op, ty: FTy) -> bool {
+    if class(ty).is_none() {
+        return false;
+    }
+    match op {
+        Op::Bin(o, _, _) => !matches!(o, BinOp::Div | BinOp::Rem),
+        Op::BinWrapSat { kind: WrapSatKind::Wrap, op: o, .. } => !matches!(o, BinOp::Div | BinOp::Rem),
+        Op::Cmp { .. } | Op::Un(..) | Op::Cast { .. } | Op::PtrAdd { .. } | Op::Alloca { .. } => true,
+        _ => false,
+    }
+}
+
+/// An instruction whose translation reads each operand exactly once.
+fn tree_consumer(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Load { .. }
+            | Op::Store { .. }
+            | Op::Bin(..)
+            | Op::Cmp { .. }
+            | Op::Un(..)
+            | Op::Cast { .. }
+            | Op::PtrAdd { .. }
+            | Op::Copy { .. }
+            | Op::Call { .. }
+            | Op::Select { .. }
+    ) || matches!(op, Op::BinWrapSat { kind: WrapSatKind::Wrap, .. })
+}
+
+/// May a tree (a load if `load`) move past this instruction?
+fn tree_barrier(i: &Inst, load: bool) -> bool {
+    match &i.op {
+        Op::Copy { .. }
+        | Op::Call { .. }
+        | Op::CallIndirect { .. }
+        | Op::Syscall { .. }
+        | Op::Asm { .. }
+        | Op::ThreadSpawn { .. }
+        | Op::GcAddr { .. }
+        | Op::Barrier { .. } => true,
+        _ if !load => false,
+        Op::Load { .. } | Op::Const(_) | Op::GlobalAddr { .. } | Op::FnRef { .. } | Op::VtabAddr { .. } => false,
+        op => !tree_op(op, i.ty),
+    }
+}
+
 fn reachable_blocks(f: &Func) -> Vec<bool> {
     let n = f.blocks.len();
     let mut r = vec![false; n];
@@ -1050,6 +1316,20 @@ struct Fx<'a> {
     /// dispatch fallback: the block number local and the block positions
     dispatch_local: u32,
     dispatch_pos: HashMap<BlockId, u32>,
+    /// Round OPT-GENERAL: values computed right where their one use is
+    /// (an expression tree on the operand stack instead of a local),
+    /// by (block, instruction index) of the definition
+    inline_def: HashMap<Val, (u32, usize)>,
+    /// constants and data addresses: computed again at every use, never
+    /// kept in a local
+    remat: HashMap<Val, (u32, usize)>,
+    /// the values whose definition is being emitted inline right now
+    emitting: Vec<Val>,
+    /// an error raised inside `get` (which cannot return one)
+    err: Option<String>,
+    /// Round OPT-GENERAL: 64-bit values of which every use needs only the
+    /// low 32 bits (addresses, mostly) -- kept and computed as `i32`
+    low32: Vec<bool>,
 }
 
 impl<'a> Fx<'a> {
@@ -1086,10 +1366,23 @@ impl<'a> Fx<'a> {
                 _ => {}
             }
         }
+        let (inline_def, remat) = plan_trees(f, &cfg);
+        let low32 = plan_low32(f, &cfg);
+        let cls = |v: usize| -> Option<VT> {
+            if low32[v] {
+                Some(VT::I32)
+            } else {
+                class(f.val_types[v])
+            }
+        };
         let mut locals: Vec<VT> = Vec::new();
         for want in [VT::I32, VT::I64, VT::F32, VT::F64] {
             for v in nparams as usize..n {
-                if used[v] && class(f.val_types[v]) == Some(want) {
+                let vv = v as Val;
+                if inline_def.contains_key(&vv) || remat.contains_key(&vv) {
+                    continue;
+                }
+                if used[v] && cls(v) == Some(want) {
                     loc[v] = nparams + locals.len() as u32;
                     locals.push(want);
                 }
@@ -1114,6 +1407,11 @@ impl<'a> Fx<'a> {
             free_tmp: Vec::new(),
             dispatch_local: u32::MAX,
             dispatch_pos: HashMap::new(),
+            inline_def,
+            remat,
+            emitting: Vec::new(),
+            err: None,
+            low32,
         };
         fx.plan_frame();
         Ok(fx)
@@ -1313,7 +1611,15 @@ impl<'a> Fx<'a> {
     }
 
     fn vt_of(&self, v: Val) -> Option<VT> {
+        if self.low32.get(v as usize).copied().unwrap_or(false) {
+            return Some(VT::I32);
+        }
         class(self.f.val_ty(v))
+    }
+
+    /// Is the result of this instruction kept as a 32-bit value?
+    fn dst_low(&self, i: &Inst) -> bool {
+        i.dst.map(|d| self.low32.get(d as usize).copied().unwrap_or(false)).unwrap_or(false)
     }
 
     /// Converts the value on the stack from `have` to `want`. Between the
@@ -1385,6 +1691,49 @@ impl<'a> Fx<'a> {
 
     /// Pushes a value, converted to `want`.
     fn get(&mut self, v: Val, want: VT) {
+        if self.remat.contains_key(&v) {
+            if let Some(&c) = self.consts.get(&v) {
+                let t = self.f.val_ty(v);
+                if !t.is_float() && matches!(class(t), Some(VT::I32) | Some(VT::I64)) {
+                    // the constant as the class wants it: the low bits for
+                    // i32, extended by the signedness of its type for i64
+                    // (exactly what `coerce` would do to the pushed value)
+                    let tc = t.truncate(c);
+                    match want {
+                        VT::I32 => {
+                            self.ins(Ins::I32Const(tc as i64 as i32));
+                            return;
+                        }
+                        VT::I64 => {
+                            let x: i64 = if class(t) == Some(VT::I32) && !t.signed() {
+                                (tc as i64) & 0xFFFF_FFFF
+                            } else {
+                                tc as i64
+                            };
+                            self.ins(Ins::I64Const(x));
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(&(b, k)) = self.inline_def.get(&v).or_else(|| self.remat.get(&v)) {
+            let f = self.f;
+            let inst = &f.blocks[b as usize].insts[k];
+            self.emitting.push(v);
+            if let Err(e) = self.inst(inst) {
+                if self.err.is_none() {
+                    self.err = Some(e);
+                }
+            }
+            self.emitting.pop();
+            if let Some(have) = self.vt_of(v) {
+                let signed = self.f.val_ty(v).signed();
+                self.coerce(have, want, signed);
+            }
+            return;
+        }
         let l = self.loc.get(v as usize).copied().unwrap_or(u32::MAX);
         match self.vt_of(v) {
             Some(have) if l != u32::MAX => {
@@ -1433,9 +1782,20 @@ impl<'a> Fx<'a> {
     /// Stores the value on the stack (class `have`, canonical for `t`) into
     /// the local of `d`.
     fn set(&mut self, d: Val, have: VT, t: FTy) {
-        let l = self.loc.get(d as usize).copied().unwrap_or(u32::MAX);
         let dt = self.f.val_ty(d);
-        match class(dt) {
+        if self.emitting.last() == Some(&d) {
+            // an expression tree: the value stays on the operand stack, in
+            // the class and canonical form a local of it would hold
+            if let Some(want) = self.vt_of(d) {
+                self.coerce(have, want, t.signed());
+                if want == VT::I32 && dt != t && narrow(dt) {
+                    self.normalize(dt);
+                }
+            }
+            return;
+        }
+        let l = self.loc.get(d as usize).copied().unwrap_or(u32::MAX);
+        match self.vt_of(d) {
             Some(want) if l != u32::MAX => {
                 self.coerce(have, want, t.signed());
                 if want == VT::I32 && dt != t && narrow(dt) {
@@ -1456,8 +1816,49 @@ impl<'a> Fx<'a> {
     }
 
     fn addr(&mut self, v: Val) {
-        self.get(v, VT::I64);
-        self.num(w::I32_WRAP_I64);
+        // `get` wraps an i64 value; a 32-bit value arrives as it is
+        self.get(v, VT::I32);
+    }
+
+    /// The address of a load or store: a constant, non-negative part of an
+    /// address that is computed only for this access goes into the offset
+    /// of the instruction. Yields the offset.
+    ///
+    /// WebAssembly adds the offset to the 32-bit address without wrapping
+    /// (an access past 4 GiB traps), where the i64 sum cut to 32 bits would
+    /// wrap. The two differ only for an address that lies outside the
+    /// linear memory either way.
+    fn mem_addr(&mut self, addr: Val) -> u32 {
+        let mut v = addr;
+        let mut off: i64 = 0;
+        let fold = std::env::var_os("FIRN_WASM_NO_OFFSET").is_none();
+        for _ in 0..(if fold { 16 } else { 0 }) {
+            let (b, k) = match self.inline_def.get(&v) {
+                Some(x) => *x,
+                None => break,
+            };
+            let inst = &self.f.blocks[b as usize].insts[k];
+            let (base, c) = match &inst.op {
+                Op::PtrAdd { base, off: o } => (*base, self.consts.get(o).copied()),
+                Op::Bin(BinOp::Add, a, c) if class(inst.ty) == Some(VT::I64) => {
+                    match (self.consts.get(c).copied(), self.consts.get(a).copied()) {
+                        (Some(k), _) => (*a, Some(k)),
+                        (None, Some(k)) => (*c, Some(k)),
+                        _ => break,
+                    }
+                }
+                _ => break,
+            };
+            match c {
+                Some(c) if c >= 0 && off as i128 + c <= i32::MAX as i128 => {
+                    off += c as i64;
+                    v = base;
+                }
+                _ => break,
+            }
+        }
+        self.addr(v);
+        off as u32
     }
 
     fn label_addr(&self, l: &str) -> Result<u32, String> {
@@ -1498,6 +1899,9 @@ impl<'a> Fx<'a> {
             self.do_tree(0)?;
         } else {
             self.dispatch()?;
+        }
+        if let Some(e) = self.err.take() {
+            return Err(e);
         }
         // Every path ended in a `return` or a branch; the end of the body is
         // never reached, but it has to type check.
@@ -1743,8 +2147,20 @@ impl<'a> Fx<'a> {
                 for v in vs {
                     let off = self.spill_off[&v];
                     self.ins(Ins::LocalGet(self.fp));
-                    self.get(v, VT::I64);
+                    if self.vt_of(v) == Some(VT::I32) {
+                        // an address kept in 32 bits: the collector wants
+                        // the 64-bit word, zero extended
+                        self.get(v, VT::I32);
+                        self.num(w::I64_EXTEND_I32_U);
+                    } else {
+                        self.get(v, VT::I64);
+                    }
                     self.ins(Ins::Store(w::I64_STORE, off));
+                }
+            }
+            if let Some(d) = i.dst {
+                if self.inline_def.contains_key(&d) || self.remat.contains_key(&d) {
+                    continue; // emitted where it is used
                 }
             }
             self.inst(i)?;
@@ -1906,11 +2322,18 @@ impl<'a> Fx<'a> {
                     self.ins(Ins::I32Const(off as i32));
                     self.num(w::I32_ADD);
                 }
-                self.num(w::I64_EXTEND_I32_U);
-                self.put(i, VT::I64);
+                if self.dst_low(i) {
+                    self.put(i, VT::I32);
+                } else {
+                    self.num(w::I64_EXTEND_I32_U);
+                    self.put(i, VT::I64);
+                }
             }
             Op::Load { addr } | Op::MmioLoad { addr } => {
-                self.addr(*addr);
+                let off = if matches!(i.op, Op::Load { .. }) { self.mem_addr(*addr) } else {
+                    self.addr(*addr);
+                    0
+                };
                 let (m, vt) = match ty {
                     FTy::I8 => (w::I32_LOAD8_S, VT::I32),
                     FTy::U8 | FTy::Bool => (w::I32_LOAD8_U, VT::I32),
@@ -1922,11 +2345,14 @@ impl<'a> Fx<'a> {
                     FTy::F64 => (w::F64_LOAD, VT::F64),
                     _ => return Err(format!("internal error: a load of type {} in '{}'", ty.name(), f.name)),
                 };
-                self.ins(Ins::Load(m, 0));
+                self.ins(Ins::Load(m, off));
                 self.put(i, vt);
             }
             Op::Store { addr, val } | Op::MmioStore { addr, val } => {
-                self.addr(*addr);
+                let off = if matches!(i.op, Op::Store { .. }) { self.mem_addr(*addr) } else {
+                    self.addr(*addr);
+                    0
+                };
                 let (m, vt) = match ty {
                     FTy::I8 | FTy::U8 | FTy::Bool => (w::I32_STORE8, VT::I32),
                     FTy::I16 | FTy::U16 => (w::I32_STORE16, VT::I32),
@@ -1937,13 +2363,20 @@ impl<'a> Fx<'a> {
                     _ => return Err(format!("internal error: a store of type {} in '{}'", ty.name(), f.name)),
                 };
                 self.get(*val, vt);
-                self.ins(Ins::Store(m, 0));
+                self.ins(Ins::Store(m, off));
             }
             Op::PtrAdd { base, off } => {
-                self.get(*base, VT::I64);
-                self.get(*off, VT::I64);
-                self.num(w::I64_ADD);
-                self.put(i, VT::I64);
+                if self.dst_low(i) {
+                    self.get(*base, VT::I32);
+                    self.get(*off, VT::I32);
+                    self.num(w::I32_ADD);
+                    self.put(i, VT::I32);
+                } else {
+                    self.get(*base, VT::I64);
+                    self.get(*off, VT::I64);
+                    self.num(w::I64_ADD);
+                    self.put(i, VT::I64);
+                }
             }
             Op::Call { name, args } => self.call(i, name, args)?,
             Op::CallIndirect { target, args } => {
@@ -2193,6 +2626,19 @@ impl<'a> Fx<'a> {
             return Ok(());
         }
         let s = ty.signed();
+        // Round OPT-GENERAL: a 64-bit result of which only the low 32 bits
+        // are ever needed is computed in 32 bits -- the low bits of a sum,
+        // difference, product, bit operation or left shift depend only on
+        // the low bits of the operands (a shift only while the count is a
+        // constant below 32, which `plan_low32` checks)
+        let vt = if vt == VT::I64
+            && self.dst_low(i)
+            && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl)
+        {
+            VT::I32
+        } else {
+            vt
+        };
         let wide = vt == VT::I64;
         let pick = |n32: w::Num, n64: w::Num| if wide { n64 } else { n32 };
         match op {
@@ -2650,6 +3096,17 @@ impl<'a> Fx<'a> {
             self.put(i, VT::I32);
             return Ok(());
         }
+        if tv == VT::I64 && self.dst_low(i) {
+            // only the low 32 bits of the result are needed: those of the
+            // canonical 32-bit form, or of the 64-bit source
+            if fv == VT::I32 {
+                self.get_norm(src, from);
+            } else {
+                self.get(src, VT::I32);
+            }
+            self.put(i, VT::I32);
+            return Ok(());
+        }
         match (fv, tv) {
             (VT::I32, VT::I32) => {
                 self.get_norm(src, from);
@@ -2657,8 +3114,7 @@ impl<'a> Fx<'a> {
             }
             (VT::I32, VT::I64) => self.get_ext64(src, from),
             (VT::I64, VT::I32) => {
-                self.get(src, VT::I64);
-                self.num(w::I32_WRAP_I64);
+                self.get(src, VT::I32);
                 self.normalize(to);
             }
             _ => self.get(src, VT::I64),

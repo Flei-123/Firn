@@ -87,6 +87,7 @@ mod target;
 mod types;
 mod wasm_cfg;
 mod wasm_enc;
+mod wasm_locals;
 mod wasm_rt;
 
 use std::path::{Path, PathBuf};

@@ -426,7 +426,11 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
             if r > 0 {
                 optimize_func(&mut g, &mut st, cfg, &mut clk);
             }
-            let p = crate::promote::promote_cells(&mut g, &nounmap);
+            let p = if std::env::var_os("FIRN_PROMOTE_ONLY_ROTATE").is_some() {
+                r
+            } else {
+                crate::promote::promote_cells(&mut g, &nounmap)
+            };
             if p > 0 {
                 if trace {
                     eprintln!("promote: @{} rotated {} loops, {} cells", f.name, r, p);
