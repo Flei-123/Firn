@@ -87,6 +87,9 @@ export {
     // Schatten und Glas
     drop_shadow_round, drop_shadow_spread, backdrop_blur, glass_round,
     frost_rect,
+    // Tiefe ohne Kosten je Bild
+    veil_rect, glow_ground, Keep, keep_new, keep_has, keep_take, keep_put,
+    rrect_fast, rrect_shadow, ramp_rect, shift_rows, keep_mix, copy_px, flo, cei, slide_compose, layer_clear, layer_over,
     // Farbmatrix
     ColorMatrix, cm_identity, cm_saturate, cm_brightness, cm_contrast,
     cm_grayscale, cm_mul, cm_apply_rect, cm_apply_pixel,
@@ -267,26 +270,121 @@ fn blur_buffer(px: *mut u8, tmp: *mut u8, w: usize, h: usize, r: i64) {
 // Rectangular on purpose (a bar, a sheet head): no mask, no saturation.
 // `tint` is a straight colour with alpha: 0xC0FFFFFF lays three quarters
 // of white over the frosted band. Coordinates are canvas pixels.
+// A box blur of radius r, once across and once down (a triangle), on a
+// small band of w x h pixels in `a` (`b` is scratch of the same size).
+// The mean is a multiplication by 65536 / (2r + 1), not a division;
+// the edge value continues past the rim.
+fn box2(a: *mut u8, b: *mut u8, w: i64, h: i64, r: i64) {
+    let n: i64 = 2 * r + 1
+    let inv: i64 = (65536 + n / 2) / n
+    // across: a -> b
+    var y: i64 = 0
+    while y < h {
+        let row: u64 = a as u64 + (y * w * 4) as u64
+        let out: u64 = b as u64 + (y * w * 4) as u64
+        var k: u64 = 0
+        while k < 4 {
+            var sum: i64 = ((*((row + k) as *mut u8)) as i64) * (r + 1)
+            var j: i64 = 1
+            while j <= r {
+                var q: i64 = j
+                if q > w - 1 { q = w - 1 }
+                sum = sum + ((*((row + (q * 4) as u64 + k) as *mut u8)) as i64)
+                j = j + 1
+            }
+            var x: i64 = 0
+            while x < w {
+                *((out + (x * 4) as u64 + k) as *mut u8) = ((sum * inv + 32768) >> 16) as u8
+                var rr: i64 = x + r + 1
+                if rr > w - 1 { rr = w - 1 }
+                var ll: i64 = x - r
+                if ll < 0 { ll = 0 }
+                sum = sum + ((*((row + (rr * 4) as u64 + k) as *mut u8)) as i64) -
+                    ((*((row + (ll * 4) as u64 + k) as *mut u8)) as i64)
+                x = x + 1
+            }
+            k = k + 1
+        }
+        y = y + 1
+    }
+    // down: b -> a
+    var x2: i64 = 0
+    let st: i64 = w * 4
+    while x2 < w {
+        let col: u64 = b as u64 + (x2 * 4) as u64
+        let out: u64 = a as u64 + (x2 * 4) as u64
+        var k: u64 = 0
+        while k < 4 {
+            var sum: i64 = ((*((col + k) as *mut u8)) as i64) * (r + 1)
+            var j: i64 = 1
+            while j <= r {
+                var q: i64 = j
+                if q > h - 1 { q = h - 1 }
+                sum = sum + ((*((col + (q * st) as u64 + k) as *mut u8)) as i64)
+                j = j + 1
+            }
+            var yy: i64 = 0
+            while yy < h {
+                *((out + (yy * st) as u64 + k) as *mut u8) = ((sum * inv + 32768) >> 16) as u8
+                var dd: i64 = yy + r + 1
+                if dd > h - 1 { dd = h - 1 }
+                var uu: i64 = yy - r
+                if uu < 0 { uu = 0 }
+                sum = sum + ((*((col + (dd * st) as u64 + k) as *mut u8)) as i64) -
+                    ((*((col + (uu * st) as u64 + k) as *mut u8)) as i64)
+                yy = yy + 1
+            }
+            k = k + 1
+        }
+        x2 = x2 + 1
+    }
+}
+
+// The mean of four pixels, per octet, rounded -- red/blue and green/alpha
+// each in two 16 bit lanes of one u64 (a sum of four octets needs ten).
+fn mean4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    let m: u64 = 16711935 // 0x00FF00FF
+    let lo: u64 = (a as u64 & m) + (b as u64 & m) + (c as u64 & m) + (d as u64 & m) + 131074
+    let hi: u64 = ((a as u64 >> 8) & m) + ((b as u64 >> 8) & m) + ((c as u64 >> 8) & m) +
+        ((d as u64 >> 8) & m) + 131074
+    return (((lo >> 2) & m) | (((hi >> 2) & m) << 8)) as u32
+}
+
+// a + (b - a) * t / 256 per octet, t in 0..256 -- two lanes at a time
+fn lerp4(a: u32, b: u32, t: u64) -> u32 {
+    let m: u64 = 16711935 // 0x00FF00FF
+    let it: u64 = 256 - t
+    let lo: u64 = (((a as u64 & m) * it + (b as u64 & m) * t + 8388736) >> 8) & m
+    let hi: u64 = ((((a as u64 >> 8) & m) * it + ((b as u64 >> 8) & m) * t + 8388736) >> 8) & m
+    return (lo | (hi << 8)) as u32
+}
+
 fn frost_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     blur: i64, tint: u32) -> bool {
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let cw: i64 = canvas.canvas_width(cv) as i64
     let ch: i64 = canvas.canvas_height(cv) as i64
-    var x0: i64 = runde(x)
-    var y0: i64 = runde(y)
-    var x1: i64 = runde(x + w)
-    var y1: i64 = runde(y + h)
-    if x0 < 0 { x0 = 0 }
-    if y0 < 0 { y0 = 0 }
-    if x1 > cw { x1 = cw }
-    if y1 > ch { y1 = ch }
+    var fb: [i64; 4] = [0; 4]
+    let rx0: i64 = runde(x)
+    let ry0: i64 = runde(y)
+    if !band_of(cv, rx0 as f64, ry0 as f64, (runde(x + w) - rx0) as f64,
+        (runde(y + h) - ry0) as f64, &fb[0]) {
+        return true
+    }
+    let x0: i64 = fb[0]
+    let y0: i64 = fb[1]
+    let x1: i64 = fb[2]
+    let y1: i64 = fb[3]
     let iw: i64 = x1 - x0
     let ih: i64 = y1 - y0
     if iw <= 0 || ih <= 0 {
         return true
     }
-    // the shrink: 4 for a real blur, less for a small one
+    // the shrink: 4 for a real blur, less for a small one -- and 8 for
+    // a wide one (16 pixels and more: the glass of a bar), where the
+    // stretch back is the whole cost and the blur hides the difference
     var f: i64 = 4
+    if blur >= 16 { f = 8 }
     if blur < 8 { f = 2 }
     if blur < 3 { f = 1 }
     let sw: i64 = (iw + f - 1) / f
@@ -331,22 +429,26 @@ fn frost_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
             if xb > iw - 1 { xb = iw - 1 }
             let qa: u64 = (xa * 4) as u64
             let qb: u64 = (xb * 4) as u64
-            var k: u64 = 0
-            while k < 4 {
-                let v: i64 = ((*((ra + qa + k) as *mut u8)) as i64) + ((*((ra + qb + k) as *mut u8)) as i64)
-                    + ((*((rb + qa + k) as *mut u8)) as i64) + ((*((rb + qb + k) as *mut u8)) as i64)
-                *((d + k) as *mut u8) = ((v + 2) >> 2) as u8
-                k = k + 1
-            }
+            // FOUR CHANNELS AT ONCE: two lanes of 16 bits each for red and
+            // blue, two for green and alpha -- a sum of four octets fits
+            *((d) as *mut u32) = mean4(*((ra + qa) as *mut u32), *((ra + qb) as *mut u32),
+                *((rb + qa) as *mut u32), *((rb + qb) as *mut u32))
             d = d + 4
             sx = sx + 1
         }
         sy = sy + 1
     }
-    // 2. BLUR the small band
+    // 2. BLUR the small band: three box passes each way where the band
+    // is fine (f < 8), two with a multiplied reciprocal where it is the
+    // eighth of a wide glass -- after the stretch nobody tells a triangle
+    // from a gaussian, and the divisions were 2 ms of every frame
     var rs: i64 = (blur + f / 2) / f
     if rs < 1 { rs = 1 }
-    blur_buffer(a, b, sw as usize, sh as usize, rs)
+    if f >= 8 {
+        box2(a, b, sw, sh, rs)
+    } else {
+        blur_buffer(a, b, sw as usize, sh as usize, rs)
+    }
     // 3. THE TINT, laid over the SMALL band: stretching is linear, so
     //    tinting before or after gives the same colours -- and before it
     //    is f^2 times fewer pixels. premultiplied: out = v (1 - ta) + t ta
@@ -401,28 +503,35 @@ fn frost_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
         var j: u64 = 0
         let jn: u64 = (sw * 4) as u64
         while j < jn {
-            let u: i64 = (*((s0 + j) as *mut u8)) as i64
-            *((vrow + j) as *mut u8) = (u + ((((*((s1 + j) as *mut u8)) as i64) - u) * wy >> 8)) as u8
-            j = j + 1
+            *((vrow + j) as *mut u32) = lerp4(*((s0 + j) as *mut u32), *((s1 + j) as *mut u32), wy as u64)
+            j = j + 4
         }
         var o: u64 = px + ((y0 + yy) * stride + x0 * 4) as u64
         var e: u64 = ctab
         xx = 0
         while xx < iw {
             let c: u64 = vrow + (*(e as *mut i64)) as u64
-            let wx: i64 = *((e + 8) as *mut i64)
+            let wx: u64 = (*((e + 8) as *mut i64)) as u64
+            if wx == 0 && xx + 1 < iw && (*((e + 24) as *mut i64)) == 0 &&
+                (*((e + 16) as *mut i64)) == (*(e as *mut i64)) {
+                // two pixels on the same small column (the right rim)
+                *((o) as *mut u32) = *((c) as *mut u32)
+                *((o + 4) as *mut u32) = *((c) as *mut u32)
+                o = o + 8
+                e = e + 32
+                xx = xx + 2
+                continue
+            }
             if wx == 0 {
-                *((o) as *mut u8) = (*((c) as *mut u8))
-                *((o + 1) as *mut u8) = (*((c + 1) as *mut u8))
-                *((o + 2) as *mut u8) = (*((c + 2) as *mut u8))
-                *((o + 3) as *mut u8) = (*((c + 3) as *mut u8))
+                *((o) as *mut u32) = *((c) as *mut u32)
             } else {
-                var k: u64 = 0
-                while k < 4 {
-                    let u: i64 = (*((c + k) as *mut u8)) as i64
-                    *((o + k) as *mut u8) = (u + ((((*((c + 4 + k) as *mut u8)) as i64) - u) * wx >> 8)) as u8
-                    k = k + 1
-                }
+                // lerp4, written out: a call per pixel was half the frost
+                let pa: u64 = (*((c) as *mut u32)) as u64
+                let pb: u64 = (*((c + 4) as *mut u32)) as u64
+                let iw8: u64 = 256 - wx
+                let lo: u64 = (((pa & 16711935) * iw8 + (pb & 16711935) * wx + 8388736) >> 8) & 16711935
+                let hi: u64 = ((((pa >> 8) & 16711935) * iw8 + ((pb >> 8) & 16711935) * wx + 8388736) >> 8) & 16711935
+                *((o) as *mut u32) = (lo | (hi << 8)) as u32
             }
             o = o + 4
             e = e + 16
@@ -432,6 +541,999 @@ fn frost_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
     }
     rt.heap_free(mem0, all)
     return true
+}
+
+// ============================================ DEPTH THAT A FRAME DOES NOT PAY
+//
+// Three small pieces for a surface with depth (FirnChat, THE LOOK, second
+// round, 24.09.2026). Glass over a ground of ONE colour is invisible:
+// frosting a plain colour gives the plain colour. So the ground gets
+// light in it -- a ramp and a few large, soft spots of colour -- and the
+// panels over it let it through. That ground is dear to compute and
+// never changes while the window keeps its size, so it is computed ONCE
+// and put back with one copy per frame.
+//
+//   veil_rect    a straight colour with alpha over a band, integer
+//                arithmetic (a fill with alpha goes through the float
+//                blend of canvas_blend per pixel -- several times this);
+//   glow_ground  the ground: a vertical ramp and up to four soft spots,
+//                DITHERED (a dark ramp in 8 bit shows bands otherwise);
+//   Keep         a copy of the canvas, taken once per key (size, scheme,
+//                layout) and put back whole or in part.
+//
+// Coordinates are canvas pixels.
+
+// The integer bounds of a band on the canvas; false when nothing is left.
+fn band_of(cv: *mut canvas.Canvas, x: f64, y: f64, w: f64, h: f64,
+    out: *mut i64) -> bool {
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    var x0: i64 = runde(x)
+    var y0: i64 = runde(y)
+    var x1: i64 = runde(x + w)
+    var y1: i64 = runde(y + h)
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > cw { x1 = cw }
+    if y1 > ch { y1 = ch }
+    // THE CLIP HOLDS here too (its rectangle, in whole pixels): a picture
+    // that repaints only a band of itself relies on it
+    let kx0: i64 = cei(canvas.clip_x0(cv))
+    let ky0: i64 = cei(canvas.clip_y0(cv))
+    let kx1: i64 = flo(canvas.clip_x1(cv))
+    let ky1: i64 = flo(canvas.clip_y1(cv))
+    if x0 < kx0 { x0 = kx0 }
+    if y0 < ky0 { y0 = ky0 }
+    if x1 > kx1 { x1 = kx1 }
+    if y1 > ky1 { y1 = ky1 }
+    *out = x0
+    *((out as u64 + 8) as *mut i64) = y0
+    *((out as u64 + 16) as *mut i64) = x1
+    *((out as u64 + 24) as *mut i64) = y1
+    return x1 > x0 && y1 > y0
+}
+
+// A VEIL: `tint` (straight ARGB, its alpha is the strength) over the band.
+// The canvas is premultiplied, so out = v (1 - ta) + t ta, per octet --
+// the same arithmetic as the tint of frost_rect, so a veil over a plain
+// ground and a frost over the same ground give the same colour.
+fn veil_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    tint: u32) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    var b: [i64; 4] = [0; 4]
+    if !band_of(cv, x, y, w, h, &b[0]) {
+        return
+    }
+    let ta: i64 = ((tint >> 24) & 255 as u32) as i64
+    if ta == 0 {
+        return
+    }
+    let inv: i64 = 255 - ta
+    let tr: i64 = (((tint >> 16) & 255 as u32) as i64) * ta + 128
+    let tg: i64 = (((tint >> 8) & 255 as u32) as i64) * ta + 128
+    let tb: i64 = ((tint & 255 as u32) as i64) * ta + 128
+    let tA: i64 = 255 * ta + 128
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = (canvas.canvas_width(cv) as i64) * 4
+    // the same arithmetic per octet, two lanes at a time
+    let m: u64 = 16711935
+    let tlo: u64 = (tr as u64) | ((tb as u64) << 16)
+    let thi: u64 = (tg as u64) | ((tA as u64) << 16)
+    let iv: u64 = inv as u64
+    var yy: i64 = b[1]
+    while yy < b[3] {
+        var o: u64 = px + (yy * stride + b[0] * 4) as u64
+        let end: u64 = o + ((b[2] - b[0]) * 4) as u64
+        while o < end {
+            let d: u64 = (*(o as *mut u32)) as u64
+            var lo: u64 = (d & m) * iv + tlo
+            lo = ((lo + ((lo >> 8) & m)) >> 8) & m
+            var hi: u64 = ((d >> 8) & m) * iv + thi
+            hi = ((hi + ((hi >> 8) & m)) >> 8) & m
+            *(o as *mut u32) = (lo | (hi << 8)) as u32
+            o = o + 4
+        }
+        yy = yy + 1
+    }
+}
+
+// THE GROUND WITH LIGHT IN IT. The band (x, y, w, h) gets a vertical ramp
+// from `top` to `bottom` (opaque RGB), and over it `n` soft spots (at most
+// four). A spot is 8 numbers at spots + 64 i: centre x, centre y, radius
+// across, radius down, strength 0..1, red, green, blue (0..255). Its
+// weight falls as (1 - d^2)^2 with d^2 = (dx/rx)^2 + (dy/ry)^2 -- smooth
+// to its rim, no exp per pixel. A spot with a huge `ry` is a column of
+// light: the same in every row, so a band painted with it can be moved
+// up and down (a scrolling history) without showing it.
+//
+// DITHERED: a 4 x 4 Bayer offset of less than one level before the
+// rounding. A ramp from 0x0B1120 to a spot a few levels lighter spans
+// only a handful of octet values over hundreds of pixels; without the
+// offset the eye counts the bands.
+fn glow_ground(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    top: u32, bottom: u32, spots: u64, n: usize) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    var b: [i64; 4] = [0; 4]
+    if !band_of(cv, x, y, w, h, &b[0]) {
+        return
+    }
+    var bay: [f64; 16] = [0.0; 16]
+    let order: [i64; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+    var i: usize = 0
+    while i < 16 {
+        bay[i] = ((order[i] as f64) + 0.5) / 16.0 - 0.5
+        i = i + 1
+    }
+    var m: usize = n
+    if m > 4 { m = 4 }
+    // the spots, read once: x, y, 1/rx^2, 1/ry^2, strength, r, g, b
+    var sp: [f64; 32] = [0.0; 32]
+    i = 0
+    while i < m * 8 {
+        sp[i] = *((spots + (i * 8) as u64) as *mut f64)
+        i = i + 1
+    }
+    i = 0
+    while i < m {
+        let rx: f64 = sp[i * 8 + 2]
+        let ry: f64 = sp[i * 8 + 3]
+        if rx > 0.0 {
+            sp[i * 8 + 2] = 1.0 / (rx * rx)
+        }
+        if ry > 0.0 {
+            sp[i * 8 + 3] = 1.0 / (ry * ry)
+        }
+        i = i + 1
+    }
+    let t0r: f64 = ((top >> 16) & 255 as u32) as f64
+    let t0g: f64 = ((top >> 8) & 255 as u32) as f64
+    let t0b: f64 = (top & 255 as u32) as f64
+    let t1r: f64 = ((bottom >> 16) & 255 as u32) as f64
+    let t1g: f64 = ((bottom >> 8) & 255 as u32) as f64
+    let t1b: f64 = (bottom & 255 as u32) as f64
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = (canvas.canvas_width(cv) as i64) * 4
+    var span: f64 = h
+    if span < 1.0 { span = 1.0 }
+    var yy: i64 = b[1]
+    while yy < b[3] {
+        let fy: f64 = (yy as f64) + 0.5
+        var t: f64 = (fy - y) / span
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+        let rr: f64 = t0r + (t1r - t0r) * t
+        let rg: f64 = t0g + (t1g - t0g) * t
+        let rb: f64 = t0b + (t1b - t0b) * t
+        var o: u64 = px + (yy * stride + b[0] * 4) as u64
+        var xx: i64 = b[0]
+        while xx < b[2] {
+            var cr: f64 = rr
+            var cg: f64 = rg
+            var cb: f64 = rb
+            let fx: f64 = (xx as f64) + 0.5
+            var k: usize = 0
+            while k < m {
+                let q: usize = k * 8
+                let dx: f64 = fx - sp[q]
+                let dy: f64 = fy - sp[q + 1]
+                let d2: f64 = dx * dx * sp[q + 2] + dy * dy * sp[q + 3]
+                if d2 < 1.0 {
+                    let u: f64 = 1.0 - d2
+                    let wgt: f64 = u * u * sp[q + 4]
+                    cr = cr + (sp[q + 5] - cr) * wgt
+                    cg = cg + (sp[q + 6] - cg) * wgt
+                    cb = cb + (sp[q + 7] - cb) * wgt
+                }
+                k = k + 1
+            }
+            let d: f64 = bay[((yy & 3) * 4 + (xx & 3)) as usize]
+            st8(o, oct8(cr + d) as u8)
+            st8(o + 1, oct8(cg + d) as u8)
+            st8(o + 2, oct8(cb + d) as u8)
+            st8(o + 3, 255 as u8)
+            o = o + 4
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// 0..255 with rounding, clamped
+fn oct8(v: f64) -> i64 {
+    var x: f64 = v + 0.5
+    if x < 0.0 { x = 0.0 }
+    if x > 255.0 { x = 255.0 }
+    return x as i64
+}
+
+// A COPY OF n OCTETS. Blocks of 4096, 512 and 64 octets are copied as
+// whole structs -- which the compiler turns into ONE bulk copy each (a
+// `memory.copy` in WebAssembly) -- and the rest eight at a time. rt.mem_copy
+// calls a function per word: 22 ms for one canvas of 1996 x 1211,
+// measured; this is the price of the memory.
+struct Blk4096 {
+    v: [u64; 512],
+}
+
+struct Blk512 {
+    v: [u64; 64],
+}
+
+struct Blk64 {
+    v: [u64; 8],
+}
+
+fn copy_px(dst: u64, src: u64, n: usize) {
+    var i: u64 = 0
+    let nn: u64 = n as u64
+    while i + 4096 <= nn {
+        *((dst + i) as *mut Blk4096) = *((src + i) as *mut Blk4096)
+        i = i + 4096
+    }
+    while i + 512 <= nn {
+        *((dst + i) as *mut Blk512) = *((src + i) as *mut Blk512)
+        i = i + 512
+    }
+    while i + 64 <= nn {
+        *((dst + i) as *mut Blk64) = *((src + i) as *mut Blk64)
+        i = i + 64
+    }
+    while i + 8 <= nn {
+        *((dst + i) as *mut u64) = *((src + i) as *mut u64)
+        i = i + 8
+    }
+    while i + 4 <= nn {
+        *((dst + i) as *mut u32) = *((src + i) as *mut u32)
+        i = i + 4
+    }
+    while i < nn {
+        *((dst + i) as *mut u8) = *((src + i) as *mut u8)
+        i = i + 1
+    }
+}
+
+// A KEPT PICTURE: the canvas as it was when `keep_take` was called, under
+// a key the caller chooses (size, scheme, layout -- whatever would change
+// the picture). The memory belongs to the Keep and is reused as long as
+// the canvas keeps its size.
+struct Keep {
+    mem: u64,
+    bytes: usize,
+    w: usize,
+    h: usize,
+    key: u64,
+}
+
+fn keep_new() -> Keep {
+    return Keep { mem: 0, bytes: 0, w: 0, h: 0, key: 0 }
+}
+
+// Does the Keep hold a picture for this key and this canvas?
+fn keep_has(k: *mut Keep, z: *mut painter.Painter, key: u64) -> bool {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    return (*k).mem != 0 && (*k).key == key &&
+        (*k).w == canvas.canvas_width(cv) && (*k).h == canvas.canvas_height(cv)
+}
+
+// Take the whole canvas into the Keep under `key`. False when there is no
+// memory for it (the caller simply paints again next time).
+fn keep_take(k: *mut Keep, z: *mut painter.Painter, key: u64) -> bool {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let w: usize = canvas.canvas_width(cv)
+    let h: usize = canvas.canvas_height(cv)
+    let need: usize = w * h * 4
+    if need == 0 {
+        return false
+    }
+    if (*k).mem == 0 || (*k).bytes != need {
+        if (*k).mem != 0 {
+            rt.heap_free((*k).mem, (*k).bytes)
+        }
+        (*k).mem = rt.heap_alloc(need)
+        (*k).bytes = need
+        if (*k).mem == 0 {
+            (*k).bytes = 0
+            (*k).key = 0
+            return false
+        }
+    }
+    copy_px((*k).mem, canvas.canvas_pixels(cv) as u64, need)
+    (*k).w = w
+    (*k).h = h
+    (*k).key = key
+    return true
+}
+
+// The kept picture laid OVER the band with strength a (0..1): what is
+// painted there fades towards the kept ground -- a thing that fades in
+// over a ground with light in it, without a flat veil.
+fn keep_mix(k: *mut Keep, z: *mut painter.Painter, x: f64, y: f64, w: f64,
+    h: f64, a: f64) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    if (*k).mem == 0 || (*k).w != canvas.canvas_width(cv) ||
+        (*k).h != canvas.canvas_height(cv) {
+        return
+    }
+    var b: [i64; 4] = [0; 4]
+    if !band_of(cv, x, y, w, h, &b[0]) {
+        return
+    }
+    var t: i64 = (a * 256.0 + 0.5) as i64
+    if t <= 0 {
+        return
+    }
+    if t > 256 { t = 256 }
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = ((*k).w as i64) * 4
+    var yy: i64 = b[1]
+    while yy < b[3] {
+        var off: u64 = (yy * stride + b[0] * 4) as u64
+        let end: u64 = (yy * stride + b[2] * 4) as u64
+        while off < end {
+            *((px + off) as *mut u32) = lerp4(*((px + off) as *mut u32),
+                *(((*k).mem + off) as *mut u32), t as u64)
+            off = off + 4
+        }
+        yy = yy + 1
+    }
+}
+
+// THE SLIDE OF TWO PANES, from two kept pictures: `under` moved `sl`
+// pixels to the left and shown up to column cx, `over` from column cx on
+// (its own column 0 there), and a shade of black with alpha `shade`
+// (0..255) over the part of `under` that shows. One copy of the canvas
+// and a veil per frame -- the panes themselves are painted once, at rest.
+fn slide_compose(under: *mut Keep, over: *mut Keep, z: *mut painter.Painter,
+    sl: i64, cx: i64, shade: u32) -> bool {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let w: usize = canvas.canvas_width(cv)
+    let h: usize = canvas.canvas_height(cv)
+    if (*under).mem == 0 || (*over).mem == 0 || (*under).w != w ||
+        (*under).h != h || (*over).w != w || (*over).h != h {
+        return false
+    }
+    let wi: i64 = w as i64
+    var c: i64 = cx
+    if c < 0 { c = 0 }
+    if c > wi { c = wi }
+    var s: i64 = sl
+    if s < 0 { s = 0 }
+    if s > wi - c { s = wi - c }
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: u64 = (w * 4) as u64
+    var y: u64 = 0
+    while y < h as u64 {
+        let row: u64 = y * stride
+        if c > 0 {
+            copy_px(px + row, (*under).mem + row + (s * 4) as u64, (c * 4) as usize)
+        }
+        if c < wi {
+            copy_px(px + row + (c * 4) as u64, (*over).mem + row,
+                ((wi - c) * 4) as usize)
+        }
+        y = y + 1
+    }
+    if shade > 0 as u32 && c > 0 {
+        veil_rect(z, 0.0, 0.0, c as f64, h as f64, shade << 24)
+    }
+    return true
+}
+
+// A LAYER: a second canvas of the same size that holds what stands OVER
+// something that changes (the title and the field over a glass band), with
+// alpha, premultiplied. `layer_clear` makes rows [y0, y1) of it empty,
+// `layer_over` lays rows [y0, y1) of it over the canvas of `z` -- src-over
+// per pixel, empty pixels skipped, full ones copied.
+fn layer_clear(cv: *mut canvas.Canvas, y0: i64, y1: i64) {
+    let w: i64 = canvas.canvas_width(cv) as i64
+    let h: i64 = canvas.canvas_height(cv) as i64
+    var a: i64 = y0
+    var b: i64 = y1
+    if a < 0 { a = 0 }
+    if b > h { b = h }
+    if b <= a {
+        return
+    }
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    var i: u64 = (a * w * 4) as u64
+    let e: u64 = (b * w * 4) as u64
+    while i + 8 <= e {
+        *((px + i) as *mut u64) = 0
+        i = i + 8
+    }
+    while i < e {
+        *((px + i) as *mut u8) = 0 as u8
+        i = i + 1
+    }
+}
+
+fn layer_over(z: *mut painter.Painter, src: *mut canvas.Canvas, y0: i64,
+    y1: i64) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let w: i64 = canvas.canvas_width(cv) as i64
+    let h: i64 = canvas.canvas_height(cv) as i64
+    if canvas.canvas_width(src) != w as usize || canvas.canvas_height(src) != h as usize {
+        return
+    }
+    var a: i64 = y0
+    var b: i64 = y1
+    if a < 0 { a = 0 }
+    if b > h { b = h }
+    let dp: u64 = canvas.canvas_pixels(cv) as u64
+    let sp: u64 = canvas.canvas_pixels(src) as u64
+    let m: u64 = 16711935 // 0x00FF00FF
+    var i: u64 = (a * w * 4) as u64
+    let e: u64 = (b * w * 4) as u64
+    while i < e {
+        let s: u64 = (*((sp + i) as *mut u32)) as u64
+        let sa: u64 = s >> 24
+        if sa == 255 {
+            *((dp + i) as *mut u32) = s as u32
+        } else if sa != 0 {
+            // d (255 - sa) / 255 + s, two lanes at a time
+            let d: u64 = (*((dp + i) as *mut u32)) as u64
+            let ia: u64 = 255 - sa
+            var lo: u64 = (d & m) * ia + 8388736
+            lo = ((lo + ((lo >> 8) & m)) >> 8) & m
+            var hi: u64 = ((d >> 8) & m) * ia + 8388736
+            hi = ((hi + ((hi >> 8) & m)) >> 8) & m
+            *((dp + i) as *mut u32) = ((lo | (hi << 8)) + s) as u32
+        }
+        i = i + 4
+    }
+}
+
+// Put the kept picture back into the band (canvas pixels). The whole
+// canvas is one copy; a band is one copy per row.
+fn keep_put(k: *mut Keep, z: *mut painter.Painter, x: f64, y: f64, w: f64,
+    h: f64) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    if (*k).mem == 0 || (*k).w != canvas.canvas_width(cv) ||
+        (*k).h != canvas.canvas_height(cv) {
+        return
+    }
+    var b: [i64; 4] = [0; 4]
+    if !band_of(cv, x, y, w, h, &b[0]) {
+        return
+    }
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = ((*k).w as i64) * 4
+    if b[0] == 0 && b[2] == (*k).w as i64 {
+        let off: u64 = (b[1] * stride) as u64
+        copy_px(px + off, (*k).mem + off, ((b[3] - b[1]) * stride) as usize)
+        return
+    }
+    let rowb: usize = ((b[2] - b[0]) * 4) as usize
+    var yy: i64 = b[1]
+    while yy < b[3] {
+        let off: u64 = (yy * stride + b[0] * 4) as u64
+        copy_px(px + off, (*k).mem + off, rowb)
+        yy = yy + 1
+    }
+}
+
+// ============================================ SHAPES AT THE PRICE OF A FILL
+//
+// MEASURED (FirnChat in Chromium, 1996 x 1211, 24.09.2026): a frame of
+// the conversation took 212 ms, and most of it was the round rectangles
+// of the bubbles going through the general rasteriser -- per pixel of the
+// box an accumulation cell, a running sum, the blend through the clip and
+// the reset of the cell: four passes and two float conversions per
+// channel, for a shape whose inside is simply one colour.
+//
+// A round rectangle does not need a rasteriser. Its coverage is known in
+// closed form: inside the straight parts it is the overlap of the pixel
+// with the box (exact), and in the four corner squares it is the signed
+// distance to the rounded box, 0.5 - d, clamped -- the same number for a
+// straight edge, and within a few hundredths of the exact area on the
+// arc. So a row is: the edge pixels with their coverage, and between
+// them a run of stores.
+//
+// NOT pixel-identical with painter.round_rect (whose arc is a cubic and
+// whose coverage is the exact area): the flat pictures that tests compare
+// octet for octet keep using that one. These are for the looks that are
+// judged by eye.
+
+// straight ARGB with the painter's rule: alpha 0 means opaque
+fn solid(col: u32) -> u32 {
+    if (col >> 24) & 255 as u32 == 0 as u32 {
+        return col | 4278190080 as u32
+    }
+    return col
+}
+
+fn flo(v: f64) -> i64 {
+    let t: i64 = v as i64
+    if (t as f64) > v {
+        return t - 1
+    }
+    return t
+}
+
+fn cei(v: f64) -> i64 {
+    let t: i64 = flo(v)
+    if (t as f64) < v {
+        return t + 1
+    }
+    return t
+}
+
+fn ovl(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+    var lo: f64 = a0
+    if b0 > lo { lo = b0 }
+    var hi: f64 = a1
+    if b1 < hi { hi = b1 }
+    if hi <= lo {
+        return 0.0
+    }
+    return hi - lo
+}
+
+// sqrt for the small distances of a corner (0 .. a few hundred pixels):
+// a start within 5 % and two Newton steps, closer than 1e-4 of a pixel.
+fn root(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    var g: f64 = v
+    if g > 1.0 {
+        g = 1.0
+        var o: f64 = v
+        while o > 4.0 {
+            o = o * 0.25
+            g = g * 2.0
+        }
+        g = g * (0.5 + 0.5 * o) // o in (1, 4]: within 10 %
+    }
+    g = 0.5 * (g + v / g)
+    g = 0.5 * (g + v / g)
+    g = 0.5 * (g + v / g)
+    return g
+}
+
+// Mix two straight ARGB colours, t in 0..1 (per channel, rounded).
+fn mix8(a: u32, b: u32, t: f64) -> u32 {
+    var k: i64 = (t * 256.0 + 0.5) as i64
+    if k < 0 { k = 0 }
+    if k > 256 { k = 256 }
+    var out: u32 = 0 as u32
+    var sh: u32 = 0 as u32
+    while sh < 32 as u32 {
+        let ca: i64 = ((a >> sh) & 255 as u32) as i64
+        let cb: i64 = ((b >> sh) & 255 as u32) as i64
+        let v: i64 = ca + (((cb - ca) * k) >> 8)
+        out = out | ((v as u32) << sh)
+        sh = sh + 8 as u32
+    }
+    return out
+}
+
+// src-over of a straight colour with coverage `cov` onto the premultiplied
+// pixel at p, in integers.
+fn over(p: u64, col: u32, cov: f64) {
+    let ca: i64 = ((col >> 24) & 255 as u32) as i64
+    let a: i64 = ((ca as f64) * cov + 0.5) as i64
+    if a <= 0 {
+        return
+    }
+    let c: u64 = col as u64
+    if a >= 255 {
+        // the octets r g b a of the canvas, as one word (little endian)
+        *(p as *mut u32) = (((c >> 16) & 255) | (((c >> 8) & 255) << 8) |
+            ((c & 255) << 16) | 4278190080) as u32
+        return
+    }
+    // c a + d (255 - a), rounded -- red/blue and green/alpha in two lanes
+    // each, written out (no helper per octet: engines that do not inline
+    // pay a call for each)
+    let m: u64 = 16711935
+    let aa: u64 = a as u64
+    let inv: u64 = 255 - aa
+    let d: u64 = (*(p as *mut u32)) as u64
+    let slo: u64 = ((c >> 16) & 255) | ((c & 255) << 16)
+    let shi: u64 = ((c >> 8) & 255) | 16711680
+    var lo: u64 = slo * aa + (d & m) * inv + 8388736
+    lo = ((lo + ((lo >> 8) & m)) >> 8) & m
+    var hi: u64 = shi * aa + ((d >> 8) & m) * inv + 8388736
+    hi = ((hi + ((hi >> 8) & m)) >> 8) & m
+    *(p as *mut u32) = (lo | (hi << 8)) as u32
+}
+
+// The signed distance of (px, py) to the round box (x, y, w, h, r):
+// negative inside.
+fn rbox_d(px: f64, py: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: f64) -> f64 {
+    var qx: f64 = px - cx
+    if qx < 0.0 { qx = 0.0 - qx }
+    qx = qx - hx
+    var qy: f64 = py - cy
+    if qy < 0.0 { qy = 0.0 - qy }
+    qy = qy - hy
+    var ox: f64 = qx
+    if ox < 0.0 { ox = 0.0 }
+    var oy: f64 = qy
+    if oy < 0.0 { oy = 0.0 }
+    var inside: f64 = qx
+    if qy > inside { inside = qy }
+    if inside > 0.0 { inside = 0.0 }
+    return root(ox * ox + oy * oy) + inside - r
+}
+
+// How much of a pixel lies inside a straight edge whose normal is (nx,
+// ny) (a = the smaller, b = the larger of |nx|, |ny|) and which passes at
+// signed distance d from the pixel's centre (d > 0: the centre is
+// outside). Exact for a straight edge: across the edge the pixel is a
+// trapezoid of widths a and b, and this is its area up to the edge.
+fn edge_cov(d: f64, a: f64, b: f64) -> f64 {
+    let t: f64 = 0.0 - d
+    let lo: f64 = (a + b) / 2.0
+    if t <= 0.0 - lo {
+        return 0.0
+    }
+    if t >= lo {
+        return 1.0
+    }
+    let k: f64 = (b - a) / 2.0
+    if a < 0.000001 {
+        return 0.5 + t / b
+    }
+    if t < 0.0 - k {
+        let s: f64 = t + lo
+        return s * s / (2.0 * a * b)
+    }
+    if t > k {
+        let s: f64 = lo - t
+        return 1.0 - s * s / (2.0 * a * b)
+    }
+    return 0.5 + t / b
+}
+
+// The coverage of pixel (px, py) (its centre) by the round box: the
+// overlap on the straight parts (0.5 - d there), and on the arc the area
+// under the tangent of the arc (edge_cov) -- within a few levels of the
+// exact area for any radius of a few pixels and more.
+fn rbox_cov(px: f64, py: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: f64) -> f64 {
+    var qx: f64 = px - cx
+    if qx < 0.0 { qx = 0.0 - qx }
+    qx = qx - hx
+    var qy: f64 = py - cy
+    if qy < 0.0 { qy = 0.0 - qy }
+    qy = qy - hy
+    var cov: f64 = 0.0
+    if qx > 0.0 && qy > 0.0 {
+        let len: f64 = root(qx * qx + qy * qy)
+        var a: f64 = qx / len
+        var b: f64 = qy / len
+        if a > b {
+            let t: f64 = a
+            a = b
+            b = t
+        }
+        cov = edge_cov(len - r, a, b)
+    } else {
+        var dd: f64 = qx
+        if qy > dd { dd = qy }
+        cov = 0.5 - (dd - r)
+    }
+    if cov < 0.0 { cov = 0.0 }
+    if cov > 1.0 { cov = 1.0 }
+    return cov
+}
+
+// A ROUND RECTANGLE, filled from `top` to `bottom` (the same colour twice
+// for a flat one). Canvas pixels; colours straight ARGB, alpha 0 = opaque.
+fn rrect_fast(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    r0: f64, top: u32, bottom: u32) {
+    if w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m { m = h }
+    if r > m / 2.0 { r = m / 2.0 }
+    if r < 0.0 { r = 0.0 }
+    var bb: [i64; 4] = [0; 4]
+    if !band_of(cv, flo(x) as f64, flo(y) as f64, (cei(x + w) - flo(x)) as f64,
+        (cei(y + h) - flo(y)) as f64, &bb[0]) {
+        return
+    }
+    let y0: i64 = bb[1]
+    let y1: i64 = bb[3]
+    let x0: i64 = bb[0]
+    let x1: i64 = bb[2]
+    let c0: u32 = solid(top)
+    let c1: u32 = solid(bottom)
+    let grad: bool = c0 != c1
+    // the columns and rows that need the distance (the corner squares)
+    let xl: i64 = cei(x + r)
+    let xr: i64 = flo(x + w - r)
+    let yt: i64 = cei(y + r)
+    let yb: i64 = flo(y + h - r)
+    // the columns that are wholly inside horizontally
+    let ix0: i64 = cei(x)
+    let ix1: i64 = flo(x + w)
+    let cx: f64 = x + w / 2.0
+    let cy: f64 = y + h / 2.0
+    let hx: f64 = w / 2.0 - r
+    let hy: f64 = h / 2.0 - r
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = cw * 4
+    var yy: i64 = y0
+    while yy < y1 {
+        let pyc: f64 = (yy as f64) + 0.5
+        var col: u32 = c0
+        if grad {
+            var t: f64 = (pyc - y) / h
+            if t < 0.0 { t = 0.0 }
+            if t > 1.0 { t = 1.0 }
+            col = mix8(c0, c1, t)
+        }
+        let fy: f64 = ovl(yy as f64, (yy as f64) + 1.0, y, y + h)
+        let corner: bool = yy < yt || yy >= yb
+        let row: u64 = px + (yy * stride) as u64
+        var xx: i64 = x0
+        while xx < x1 {
+            let p: u64 = row + (xx * 4) as u64
+            if corner && (xx < xl || xx >= xr) {
+                let cov: f64 = rbox_cov((xx as f64) + 0.5, pyc, cx, cy, hx, hy, r)
+                if cov > 0.0 {
+                    over(p, col, cov)
+                }
+                xx = xx + 1
+                continue
+            }
+            if xx >= ix0 && xx < ix1 && fy >= 1.0 && ((col >> 24) & 255 as u32) == 255 as u32 {
+                // THE RUN: every pixel up to the right edge column
+                var e: i64 = ix1
+                if corner && xr < e { e = xr }
+                if e > x1 { e = x1 }
+                let cw8: u64 = col as u64
+                let word: u32 = (((cw8 >> 16) & 255) | (((cw8 >> 8) & 255) << 8) |
+                    ((cw8 & 255) << 16) | 4278190080) as u32
+                var q: u64 = p
+                while xx < e {
+                    *(q as *mut u32) = word
+                    q = q + 4
+                    xx = xx + 1
+                }
+                continue
+            }
+            let fx: f64 = ovl(xx as f64, (xx as f64) + 1.0, x, x + w)
+            over(p, col, fx * fy)
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// rbox_d with an octagon for the circle (max + 0.414 min, within 8 %):
+// good enough for a shadow that is soft anyway, and no root per pixel
+fn rbox_q(px: f64, py: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: f64) -> f64 {
+    var qx: f64 = px - cx
+    if qx < 0.0 { qx = 0.0 - qx }
+    qx = qx - hx
+    var qy: f64 = py - cy
+    if qy < 0.0 { qy = 0.0 - qy }
+    qy = qy - hy
+    var ox: f64 = qx
+    if ox < 0.0 { ox = 0.0 }
+    var oy: f64 = qy
+    if oy < 0.0 { oy = 0.0 }
+    var inside: f64 = qx
+    if qy > inside { inside = qy }
+    if inside > 0.0 { inside = 0.0 }
+    var big: f64 = ox
+    var small: f64 = oy
+    if small > big {
+        big = oy
+        small = ox
+    }
+    return big + 0.414 * small + inside - r
+}
+
+// A SOFT SHADOW of a round card (x, y, w, h, r) that floats `lift` pixels
+// over the page: the card's shape moved down by `lift`, its edge
+// softened over `blur` pixels (a smoothstep of the signed distance -- the
+// look of a gaussian, not its price), in `col` (straight ARGB, its alpha
+// the darkest point). Only what the card will not cover is painted: the
+// card itself is drawn over it right after.
+fn rrect_shadow(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    r0: f64, lift: f64, blur: f64, col: u32) {
+    if w <= 0.0 || h <= 0.0 || blur <= 0.0 {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m { m = h }
+    if r > m / 2.0 { r = m / 2.0 }
+    let sy: f64 = y + lift
+    // ONLY THE LOWER HALF: the card floats `lift` pixels up, so its
+    // shadow shows under it and at its lower sides; above the middle the
+    // card covers nearly all of it -- and that half was half the price
+    var bb: [i64; 4] = [0; 4]
+    let fy0: i64 = flo(y + h / 2.0)
+    let fx0: i64 = flo(x - blur)
+    if !band_of(cv, fx0 as f64, fy0 as f64, (cei(x + w + blur) - fx0) as f64,
+        (cei(sy + h + blur) - fy0) as f64, &bb[0]) {
+        return
+    }
+    let y0: i64 = bb[1]
+    let y1: i64 = bb[3]
+    let x0: i64 = bb[0]
+    let x1: i64 = bb[2]
+    let cx: f64 = x + w / 2.0
+    let cy: f64 = sy + h / 2.0
+    let ccy: f64 = y + h / 2.0 // the card
+    let hx: f64 = w / 2.0 - r
+    let hy: f64 = h / 2.0 - r
+    // the band of each row that lies deep inside the card: skipped
+    let inx0: i64 = cei(x + r + 1.0)
+    let inx1: i64 = flo(x + w - r - 1.0)
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = cw * 4
+    var yy: i64 = y0
+    while yy < y1 {
+        let pyc: f64 = (yy as f64) + 0.5
+        let row: u64 = px + (yy * stride) as u64
+        // a row wholly inside the card (away from its round ends) skips
+        // its middle
+        let deep: bool = pyc > y + 1.0 && pyc < y + h - 1.0
+        var xx: i64 = x0
+        while xx < x1 {
+            if deep && xx >= inx0 && xx < inx1 {
+                xx = inx1
+                continue
+            }
+            let fx: f64 = (xx as f64) + 0.5
+            // under the card: nothing to do
+            if rbox_q(fx, pyc, cx, ccy, hx, hy, r) < 0.0 - 1.0 {
+                xx = xx + 1
+                continue
+            }
+            let d: f64 = rbox_q(fx, pyc, cx, cy, hx, hy, r)
+            var t: f64 = (d + blur * 0.5) / (blur * 1.5)
+            if t < 1.0 {
+                if t < 0.0 { t = 0.0 }
+                let cov: f64 = 1.0 - t * t * (3.0 - 2.0 * t)
+                over(row + (xx * 4) as u64, col, cov)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// A RAMP OF SHADE: `col` (straight ARGB, its alpha the strongest point)
+// running out to nothing over the band. dir 0 = strongest at the top,
+// 1 = at the bottom, 2 = at the left, 3 = at the right. The soft edge of
+// a bar or a panel, in integers.
+fn ramp_rect(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    col: u32, dir: u32) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    var b: [i64; 4] = [0; 4]
+    if !band_of(cv, x, y, w, h, &b[0]) {
+        return
+    }
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = (canvas.canvas_width(cv) as i64) * 4
+    let ca: f64 = ((col >> 24) & 255 as u32) as f64
+    let black: bool = (col & 16777215 as u32) == 0 as u32
+    // the strength of every column (dir 2, 3) as an integer alpha, once
+    var lut: [u32; 256] = [0; 256]
+    let nx: i64 = b[2] - b[0]
+    if (dir == 2 as u32 || dir == 3 as u32) && nx <= 256 {
+        var j: i64 = 0
+        while j < nx {
+            let xx: i64 = b[0] + j
+            var u: f64 = ((xx as f64) + 0.5 - x) / w
+            if dir == 3 as u32 {
+                u = (x + w - (xx as f64) - 0.5) / w
+            }
+            if u < 0.0 { u = 0.0 }
+            if u > 1.0 { u = 1.0 }
+            let k: f64 = 1.0 - u
+            lut[j as usize] = (ca * k * k + 0.5) as u32
+            j = j + 1
+        }
+    }
+    let m: u64 = 16711935
+    var yy: i64 = b[1]
+    while yy < b[3] {
+        let row: u64 = px + (yy * stride) as u64
+        var ra: u32 = 0 as u32
+        if dir == 0 as u32 || dir == 1 as u32 {
+            var t: f64 = ((yy as f64) + 0.5 - y) / h
+            if dir == 1 as u32 {
+                t = (y + h - (yy as f64) - 0.5) / h
+            }
+            if t < 0.0 { t = 0.0 }
+            if t > 1.0 { t = 1.0 }
+            let k: f64 = 1.0 - t
+            ra = (ca * k * k + 0.5) as u32
+        }
+        var xx: i64 = b[0]
+        while xx < b[2] {
+            var a: u32 = ra
+            if dir == 2 as u32 || dir == 3 as u32 {
+                if nx <= 256 {
+                    a = lut[(xx - b[0]) as usize]
+                } else {
+                    var u: f64 = ((xx as f64) + 0.5 - x) / w
+                    if dir == 3 as u32 {
+                        u = (x + w - (xx as f64) - 0.5) / w
+                    }
+                    if u < 0.0 { u = 0.0 }
+                    if u > 1.0 { u = 1.0 }
+                    let k: f64 = 1.0 - u
+                    a = (ca * k * k + 0.5) as u32
+                }
+            }
+            if a > 0 as u32 {
+                let p: u64 = row + (xx * 4) as u64
+                if black {
+                    // black over: d (255 - a) / 255, two lanes at a time
+                    let d: u64 = (*(p as *mut u32)) as u64
+                    let ia: u64 = 255 - a as u64
+                    var lo: u64 = (d & m) * ia + 8388736
+                    lo = ((lo + ((lo >> 8) & m)) >> 8) & m
+                    var hi: u64 = ((d >> 8) & m) * ia + 8388736
+                    hi = ((hi + ((hi >> 8) & m)) >> 8) & m
+                    // the alpha lane went the same way: a + da (255 - a)
+                    *(p as *mut u32) = ((lo | (hi << 8)) + ((a as u64) << 24)) as u32
+                } else {
+                    over(p, (col & 16777215 as u32) | 4278190080 as u32, (a as f64) / 255.0)
+                }
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// SCROLL BY COPY: the block of columns [x0, x1) and rows [y0, y1) moves
+// `d` rows down (up for a negative d) inside itself. The rows that come
+// in from outside the block are left as they were -- the caller paints
+// them. Rows are copied from the far end first, so nothing is read after
+// it was overwritten.
+fn shift_rows(z: *mut painter.Painter, x0: i64, x1: i64, y0: i64, y1: i64,
+    d: i64) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    var a: i64 = x0
+    var e: i64 = x1
+    var t: i64 = y0
+    var u: i64 = y1
+    if a < 0 { a = 0 }
+    if e > cw { e = cw }
+    if t < 0 { t = 0 }
+    if u > ch { u = ch }
+    if e <= a || u <= t || d == 0 {
+        return
+    }
+    let px: u64 = canvas.canvas_pixels(cv) as u64
+    let stride: i64 = cw * 4
+    let n: usize = ((e - a) * 4) as usize
+    if d > 0 {
+        var yy: i64 = u - 1
+        while yy - d >= t {
+            copy_px(px + (yy * stride + a * 4) as u64,
+                px + ((yy - d) * stride + a * 4) as u64, n)
+            yy = yy - 1
+        }
+    } else {
+        var yy: i64 = t
+        while yy - d < u {
+            copy_px(px + (yy * stride + a * 4) as u64,
+                px + ((yy - d) * stride + a * 4) as u64, n)
+            yy = yy + 1
+        }
+    }
 }
 
 // Einen Ausschnitt der Leinwand verwischen. Der Ausschnitt wird
