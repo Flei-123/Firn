@@ -90,8 +90,20 @@ pub(crate) const FN_STRONG: &str = "__gc_strong_raw";
 pub(crate) const FN_AS: &str = "__gc_as_raw";
 /// Runtime function behind `gc C{…}`.
 pub(crate) const FN_ALLOC: &str = "__gc_alloc_raw";
-/// Insertion barrier when writing a Gc pointer into the heap.
+/// Insertion barrier when writing a Gc pointer into the heap. Since round
+/// B4 the compiler no longer CALLS it: `gc_lower::emit_barrier` writes its
+/// fast half inline. The function stays for code that names it (the JIT
+/// helpers of Certus take its address).
 pub(crate) const FN_BARRIER: &str = "__gc_barrier";
+/// **Round B4** -- the slow half of the inline barrier: only called while a
+/// collection cycle is running (`S_PHASE != 0`).
+pub(crate) const FN_BARRIER_SLOW: &str = "__gc_barrier_slow";
+/// **Round B4** -- the two words of the state block the inline barrier
+/// touches. They are `S_BARRIEREN` and `S_PHASE` in `lib/gc/gc.fi`; the
+/// module test `barrier_offsets_match_the_runtime` holds the two in step,
+/// and `lib/firnc1/lower.fi` (`gc_barrier_inline`) carries the same values.
+pub(crate) const BARRIER_COUNT_OFF: u64 = 144;
+pub(crate) const PHASE_OFF: u64 = 320;
 /// Error set of the fallible allocation (DESIGN_GOALS §2).
 pub(crate) const ERR_SET: &str = "AllocError";
 /// **Round 47** — dispatcher of the finalizers (`SPEC` §3.5.3 `S4`).
@@ -219,6 +231,7 @@ pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
         || name == FN_STRONG
         || name == FN_AS
         || name == FN_BARRIER
+        || name == FN_BARRIER_SLOW
 }
 
 /// Is `t` a GC pointer type (`Gc[T]` or `GcWeak[T]`)? Writing into a field
@@ -1520,6 +1533,19 @@ mod tests {
         assert!(is_gc_alloc_call("dom__gc_collect"));
         assert!(!is_gc_alloc_call("gc_collectx"));
         assert!(!is_gc_alloc_call("tokenize"));
+    }
+
+    #[test]
+    fn barrier_offsets_match_the_runtime() {
+        // Round B4: the inline barrier hard-codes two offsets of the state
+        // block. If `lib/gc/gc.fi` moves a word, this fails before a single
+        // program counts into the wrong place.
+        let count = format!("const S_BARRIEREN: u64 = {}\n", BARRIER_COUNT_OFF);
+        let phase = format!("const S_PHASE: u64 = {}\n", PHASE_OFF);
+        assert!(RUNTIME.contains(&count), "S_BARRIEREN moved in lib/gc/gc.fi");
+        assert!(RUNTIME.contains(&phase), "S_PHASE moved in lib/gc/gc.fi");
+        assert!(RUNTIME.contains(&format!("fn {}(value: *mut u8) {{", FN_BARRIER_SLOW)));
+        assert!(is_gc_alloc_call(FN_BARRIER_SLOW));
     }
 
     #[test]

@@ -1670,7 +1670,7 @@ impl<'a> Lower<'a> {
                 self.write_into(addr, value)?;
                 // HOOK gc: insertion barrier when writing a Gc pointer into
                 // the heap (gc_lower.rs, SPEC 3.5.3)
-                crate::gc_lower::hook_assign(self, target)
+                crate::gc_lower::hook_assign(self, target, addr)
             }
             // ROUND 70 - `x op= e`.
             //
@@ -1696,7 +1696,7 @@ impl<'a> Lower<'a> {
                     let r = self.lower_call(crate::strtype::FN_CONCAT, &[a, b], Some(addr), *span);
                     self.pinned.remove(&target.id);
                     r?;
-                    return crate::gc_lower::hook_assign(self, target);
+                    return crate::gc_lower::hook_assign(self, target, addr);
                 }
                 // HOOK ptrarith: `p += n` / `p -= n` move n elements (ptrarith.rs)
                 if matches!(op, ast::BinOp::Add | ast::BinOp::Sub) && crate::ptrarith::is_arith_ptr(&t) {
@@ -1734,7 +1734,7 @@ impl<'a> Lower<'a> {
                 };
                 let res = self.push(ft, Op::Bin(bop, cur, rhs));
                 self.store(ft, addr, res);
-                crate::gc_lower::hook_assign(self, target)
+                crate::gc_lower::hook_assign(self, target, addr)
             }
             // ROUND 70 - `x++` / `x--`: load, plus/minus one, store. The
             // address is computed once here as well.

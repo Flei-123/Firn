@@ -1,0 +1,187 @@
+// expect_exit: 0
+// Round B4 -- the insertion barrier is written INLINE at every Gc store
+// (compiler/src/gc_lower.rs::emit_barrier). Three promises, three checks:
+//
+//   1. The target of the store is evaluated ONCE. The barrier used to
+//      compute the field address a second time, so `pick().next = x` called
+//      `pick()` twice (measured on runde-luecken: 2 calls, exit 11).
+//   2. `gc_barriers()` stays exact: every Gc store into the heap counts one,
+//      a store into a local variable counts nothing.
+//   3. The slow half still runs while a cycle is marking. Cells are MOVED
+//      between the chains of two holders by plain field stores during
+//      phase 1 (slice of two objects, so the move into an already traced
+//      holder is the normal case, as in 841_gcvec_incremental.fi). Without
+//      the greying the moved cell stays white and is swept.
+//      COUNTER-CHECK (really carried out, docs/ROUND-B4.md): with an empty
+//      `__gc_barrier_slow` this test exits 95 on dev-fast and release-fast --
+//      cells of a moved chain were swept and the chains came up short.
+
+gc class Cell {
+    next: Gc[Cell],
+    mark: u64,
+}
+
+gc class Holder {
+    next: Gc[Holder],
+    head: Gc[Cell],
+}
+
+const M: u64 = 64
+const K: u64 = 200
+const ROUNDS: u64 = 4
+
+fn pick(h: Gc[Holder], calls: *mut u64) -> Gc[Holder] {
+    *calls = *calls + 1
+    return h
+}
+
+fn garbage(k: u64) -> AllocError!u64 {
+    if k == 0 {
+        return 0
+    }
+    let dead: Gc[Cell] = try gc Cell { next: gc_null[Cell](), mark: 0 }
+    return try garbage(k - 1)
+}
+
+fn nth(all: Gc[Holder], j: u64) -> Gc[Holder] {
+    var h: Gc[Holder] = all
+    var i: u64 = 0
+    while i < j {
+        h = h.next
+        i = i + 1
+    }
+    return h
+}
+
+fn build() -> AllocError!Gc[Holder] {
+    var all: Gc[Holder] = gc_null[Holder]()
+    var j: u64 = 0
+    while j < M {
+        let h: Gc[Holder] = try gc Holder { next: all, head: gc_null[Cell]() }
+        var k: u64 = 0
+        while k < K {
+            let z: Gc[Cell] = try gc Cell { next: h.head, mark: (M - 1 - j) * K + k + 1 }
+            h.head = z
+            k = k + 1
+        }
+        all = h
+        j = j + 1
+    }
+    return all
+}
+
+fn relink(all: Gc[Holder], p1a: *mut u64) -> AllocError!bool {
+    var p1: u64 = 0
+    var r: u64 = 0
+    while r < ROUNDS {
+        var s: u64 = 0
+        while gc_phase() != 1 && s < 400000 {
+            let m: u64 = try garbage(1)
+            s = s + 1
+        }
+        let l0: u64 = gc_collections()
+        var t: u64 = 0
+        while gc_phase() == 1 && t < 60000 {
+            let j: u64 = (r * 7 + t) % M
+            let from: Gc[Holder] = nth(all, j)
+            let to: Gc[Holder] = nth(all, (j * 13 + 5) % M)
+            if from.head != gc_null[Cell]() && from != to {
+                p1 = p1 + 1
+                let z: Gc[Cell] = from.head
+                from.head = z.next
+                z.next = to.head
+                to.head = z
+            }
+            let m: u64 = try garbage(1)
+            t = t + 1
+        }
+        var g: u64 = 0
+        while gc_collections() == l0 && g < 400000 {
+            let m: u64 = try garbage(16)
+            g = g + 1
+        }
+        r = r + 1
+    }
+    *p1a = p1
+    return true
+}
+
+fn count_and_sum(all: Gc[Holder], sum: *mut u64) -> u64 {
+    var n: u64 = 0
+    var s: u64 = 0
+    var h: Gc[Holder] = all
+    while h != gc_null[Holder]() {
+        var c: Gc[Cell] = h.head
+        while c != gc_null[Cell]() {
+            n = n + 1
+            s = s + c.mark
+            c = c.next
+        }
+        h = h.next
+    }
+    *sum = s
+    return n
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    // 1. the target once
+    let a: Gc[Holder] = gc Holder { next: gc_null[Holder](), head: gc_null[Cell]() } catch gc_null[Holder]()
+    let c: Gc[Cell] = gc Cell { next: gc_null[Cell](), mark: 7 } catch gc_null[Cell]()
+    var calls: u64 = 0
+    pick(a, &calls).head = c
+    if calls != 1 {
+        return 11
+    }
+    if a.head.mark != 7 {
+        return 12
+    }
+
+    // 2. the count
+    let b0: u64 = gc_barriers()
+    var i: u64 = 0
+    while i < 1000 {
+        a.head = c
+        c.next = c
+        i = i + 1
+    }
+    var local: Gc[Cell] = c
+    local = a.head
+    if gc_barriers() - b0 != 2000 {
+        return 21
+    }
+
+    // 3. the slow half during marking
+    let all: Gc[Holder] = build() catch gc_null[Holder]()
+    if all == gc_null[Holder]() {
+        return 91
+    }
+    gc_collect()
+    let should: u64 = M * K * (M * K + 1) / 2
+    var p1: u64 = 0
+    gc_set_slice(2)
+    let ok: bool = relink(all, &p1) catch false
+    gc_set_slice(0)
+    if !ok {
+        return 93
+    }
+    if p1 < 10000 {
+        return 94
+    }
+    var w: u64 = 0
+    while w < 80 {
+        let m: u64 = garbage(2000) catch 0
+        w = w + 1
+    }
+    gc_collect()
+    var sum: u64 = 0
+    if count_and_sum(all, &sum) != M * K {
+        return 95
+    }
+    if sum != should {
+        return 96
+    }
+    return 0
+}
