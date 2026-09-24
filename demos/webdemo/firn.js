@@ -144,6 +144,18 @@ const firnTag = document.currentScript;
     const vis = () => x.firn_web_stream_event(...give('vis'), ...give(document.hidden ? '0' : '1'));
     document.addEventListener('visibilitychange', vis);
     if (document.hidden) vis();
+    // The window's focus (name "focus", "0" lost / "1" back -- a caret
+    // stops blinking) and the system's wish for less motion (name "motion",
+    // "1" = prefers-reduced-motion), the same way; each sent at once when
+    // it is not the ordinary state.
+    const ev = (n, v) => x.firn_web_stream_event(...give(n), ...give(v));
+    addEventListener('blur', () => ev('focus', '0'));
+    addEventListener('focus', () => ev('focus', '1'));
+    if (!document.hasFocus()) ev('focus', '0');
+    const rm = matchMedia('(prefers-reduced-motion: reduce)');
+    const motion = () => ev('motion', rm.matches ? '1' : '0');
+    if (rm.addEventListener) rm.addEventListener('change', motion);
+    if (rm.matches) motion();
 
     // The events, as they come. Bit 8 of the buttons: a finger or a pen.
     const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];
