@@ -1145,14 +1145,21 @@ fn plan_trees(f: &Func, cfg: &Cfg) -> (HashMap<Val, (u32, usize)>, HashMap<Val, 
                     continue;
                 }
                 let bj = &blk.insts[j];
-                // a phi copy only matters if it overwrites a value the
-                // tree reads (its own operands; deeper operands are checked
-                // by their own trees over the same stretch)
-                if let (Op::Copy { .. }, Some(cd)) = (&bj.op, bj.dst) {
-                    if reads.contains(&cd) {
+                // Anything that writes a value the tree reads blocks it
+                // (its own operands; deeper operands are checked by their
+                // own trees over the same stretch). After phi elimination
+                // that is not only a copy: `phi.rs` coalesces, so an
+                // ordinary instruction may write the local of a phi whose
+                // last use in FIR order came before it -- mandel.fi: the
+                // new `zi` is computed straight into the phi of `zi` while
+                // `zr*zr - zi*zi` still has to read the old one.
+                if let Some(dd) = bj.dst {
+                    if reads.contains(&dd) {
                         blocked = true;
                         break;
                     }
+                }
+                if let Op::Copy { .. } = &bj.op {
                     continue;
                 }
                 if tree_barrier(bj, load) {
@@ -1162,6 +1169,9 @@ fn plan_trees(f: &Func, cfg: &Cfg) -> (HashMap<Val, (u32, usize)>, HashMap<Val, 
             }
             if blocked {
                 continue;
+            }
+            if std::env::var_os("FIRN_WASM_TREE_TRACE").is_some() {
+                eprintln!("tree: @{} bb{} %{} (#{}) -> #{} end #{}", f.name, b, d, k, up, end);
             }
             fpos.insert(k, end);
             inline.insert(d, (b, k));
