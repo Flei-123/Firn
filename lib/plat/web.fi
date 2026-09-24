@@ -38,17 +38,20 @@
 //
 // ======================================================= WHEN IT PAINTS
 //
-// `firn_web_frame` is called by the host on every animation frame. It
-// paints ONLY when something is dirty: an event that control.fi or
-// viewport.fi answered with a change, a new size, a viewport still
-// gliding, or an animator of the page that reports `anim.animator_dirty`.
-// Otherwise it returns 0 and the host does nothing -- a page that sits
-// still costs no painting at all.
+// `firn_web_frame` is called by the host when a frame is due. It paints
+// ONLY when something is dirty: an event that control.fi or viewport.fi
+// answered with a change, a new size, a viewport still gliding, or an
+// animator of the page that reports `anim.animator_dirty`. Otherwise it
+// paints nothing -- and since fUi tempo (ONLY WHAT CHANGED, below) the
+// host does not even call it again until something happens: a page that
+// sits still costs nothing at all.
 //
 // ======================================================= THE HOST INTERFACE
 //
 // Imported (the host provides):
 //   firn_web_present(px, w, h)   put w*h RGBA octets at px on the canvas
+//   firn_web_present_rect(px, w, h, rx, ry, rw, rh)   ... only that part
+//   firn_web_wake(ms)            call firn_web_frame again in ms
 // Exported (the host calls):
 //   firn_web_alloc(n) -> p       n octets that stay (for the font file)
 //   firn_web_scratch() -> p      256 octets for a key name
@@ -59,7 +62,8 @@
 //   firn_web_wheel(dx, dy, mode) -> changed   (DOM deltaMode)
 //   firn_web_key(down, p, n, mods) -> used    the DOM key name at p;
 //                                mods bit 0 = shift
-//   firn_web_frame(ms) -> painted
+//   firn_web_frame(ms) -> FRAME_PAINTED | FRAME_AGAIN
+//   firn_web_clock() -> 2        the frame clock above (ONLY WHAT CHANGED)
 // Addresses and sizes are u32 on purpose: they reach JavaScript as plain
 // numbers, and wasm32 addresses fit.
 import std.rt
@@ -85,6 +89,9 @@ export {
     // THE APPLICATION MODE (see "A PAGE THAT PAINTS ITSELF" below)
     WebEvent, web_app, web_css_width, web_css_height, web_set_dark,
     web_set_keep, web_set_opaque,
+    // THE FRAME CLOCK AND THE DAMAGE (see "ONLY WHAT CHANGED" below)
+    web_on_demand, web_want_frame, web_wake_in, web_damage, web_damage_all,
+    FRAME_PAINTED, FRAME_AGAIN,
     web_fetch, web_stream_open, web_stream_close, web_navigate,
     web_keyboard, web_location, web_store_get, web_store_set, web_cursor,
     WE_MOVE, WE_DOWN, WE_UP, WE_LEAVE, WE_WHEEL, WE_KEY, WE_TEXT,
@@ -95,6 +102,13 @@ export {
 
 // The host's half.
 extern fn firn_web_present(px: u32, w: u32, h: u32);
+// ... only the rectangle (rx, ry, rw, rh) of the w x h picture at px
+// changed: the host hands only that over (putImageData with a dirty
+// rectangle). And a timer: call firn_web_frame again in `ms`
+// milliseconds even if nothing comes in (see "ONLY WHAT CHANGED").
+extern fn firn_web_present_rect(px: u32, w: u32, h: u32, rx: u32, ry: u32,
+    rw: u32, rh: u32);
+extern fn firn_web_wake(ms: f64);
 // ... and what an application page asks of it (see "A PAGE THAT PAINTS
 // ITSELF"). Every text crosses as address + length in octets, UTF-8.
 extern fn firn_web_fetch(id: u32, mp: u32, mn: u32, up: u32, un: u32, bp: u32, bn: u32);
@@ -241,7 +255,24 @@ struct Web {
     // un-premultiplying before the hand-over (web_set_keep/_opaque)
     keep: bool,
     opaque: bool,
+    // THE FRAME CLOCK: an application that asks for its ticks
+    // (web_on_demand) gets a frame only after an event, a web_want_frame
+    // or a web_wake_in; `again` is what it asked for during this frame
+    on_demand: bool,
+    again: bool,
+    // THE DAMAGE of the picture being painted, device pixels, half open;
+    // dmg_n = 0: the page said nothing, so the whole picture goes
+    dmg_n: usize,
+    dx0: i64,
+    dy0: i64,
+    dx1: i64,
+    dy1: i64,
 }
+
+// The answer of firn_web_frame, bits: a picture went to the host, and the
+// page wants the next animation frame too.
+const FRAME_PAINTED: u32 = 1
+const FRAME_AGAIN: u32 = 2
 
 // The one Web of the page. The host has no other way to find it than
 // through the exported functions, and those need it without a parameter.
@@ -269,6 +300,8 @@ fn web_blank() -> Web {
         px: 0.0, py: 0.0, hit: scene.SCENE_NONE, grab: scene.SCENE_NONE,
         frames: 0, app: false, paint: build_none, event: event_none,
         keep: false, opaque: false,
+        on_demand: false, again: false,
+        dmg_n: 0, dx0: 0, dy0: 0, dx1: 0, dy1: 0,
     }
 }
 
@@ -846,8 +879,25 @@ fn firn_web_key(down: u32, p: u32, n: u32, mods: u32) -> u32 {
 // divided by its alpha, in place. An opaque page (every page that starts
 // with the clear below) has none, and this is one comparison per pixel.
 fn unpremultiply(cv: *mut canvas.Canvas) {
-    let p: u64 = canvas.canvas_pixels(cv) as u64
-    let n: usize = canvas.canvas_width(cv) * canvas.canvas_height(cv)
+    unpremultiply_rect(cv, 0, 0, canvas.canvas_width(cv) as i64,
+        canvas.canvas_height(cv) as i64)
+}
+
+// ... over the rows [y0, y1) and columns [x0, x1) only: what is handed
+// over. The rest of the picture went over in an earlier frame.
+fn unpremultiply_rect(cv: *mut canvas.Canvas, x0: i64, y0: i64, x1: i64,
+    y1: i64) {
+    let cw: usize = canvas.canvas_width(cv)
+    var y: i64 = y0
+    while y < y1 {
+        let p: u64 = canvas.canvas_pixels(cv) as u64 + ((y as usize) * cw * 4) as u64 +
+            ((x0 as usize) * 4) as u64
+        unpremultiply_run(p, (x1 - x0) as usize)
+        y = y + 1
+    }
+}
+
+fn unpremultiply_run(p: u64, n: usize) {
     var i: usize = 0
     while i < n {
         let q: u64 = p + (i * 4) as u64
@@ -900,7 +950,149 @@ fn web_set_opaque(on: bool) {
     }
 }
 
-// One animation frame. Paints only when something is dirty, and says so.
+// ============================================= ONLY WHAT CHANGED
+//
+// fUi tempo, stage 1 (24.09.2026). MEASURED on chat.fleitec.com before
+// it (Chromium, 1996 x 1211, the look with glass): the host called
+// firn_web_frame sixty times a second whether anything moved or not,
+// every picture was handed over whole (putImageData of 9.7 MB), and the
+// whole canvas was walked once more before that to un-premultiply it.
+//
+// THE FRAME CLOCK. The host runs no loop of its own any more: it asks for
+// an animation frame when something came in (an event, an answer of the
+// network, a new size) and after that only while this function answers
+// FRAME_AGAIN. A described page wants the next frame while a scroll area
+// glides or its animator runs. An application wants every frame (as
+// before) -- unless it said `web_on_demand`: then it gets the next one
+// only when it asked during this one (`web_want_frame`: something moves)
+// or set a timer (`web_wake_in`: a toast that goes in three seconds).
+//
+// THE DAMAGE. A page that paints only part of its picture says which part
+// (`web_damage`, device pixels, as often as it likes; the union counts).
+// Then only that rectangle is un-premultiplied and handed over
+// (firn_web_present_rect). A page that says nothing hands over all of it,
+// as before.
+
+// The application asks for its ticks: after this, a frame comes only
+// after an event, a web_want_frame or a web_wake_in. (Like web_set_keep:
+// said once, right after web_app.)
+fn web_on_demand(on: bool) {
+    if G_WEB != 0 {
+        (*the_web()).on_demand = on
+    }
+}
+
+// Something moves: the next animation frame, please (with a WE_TICK).
+fn web_want_frame(w: *mut Web) {
+    (*w).again = true
+}
+
+// A timer: a frame (with a WE_TICK) in `ms` milliseconds, even if nothing
+// comes in. The host keeps the earliest one it was given.
+fn web_wake_in(w: *mut Web, ms: f64) {
+    var t: f64 = ms
+    if t < 0.0 {
+        t = 0.0
+    }
+    firn_web_wake(t)
+}
+
+// This picture changed (at least) here: device pixels.
+fn web_damage(w: *mut Web, x: f64, y: f64, dw: f64, dh: f64) {
+    if dw <= 0.0 || dh <= 0.0 {
+        return
+    }
+    var x0: i64 = x as i64
+    if (x0 as f64) > x {
+        x0 = x0 - 1
+    }
+    var y0: i64 = y as i64
+    if (y0 as f64) > y {
+        y0 = y0 - 1
+    }
+    var x1: i64 = (x + dw) as i64
+    if (x1 as f64) < x + dw {
+        x1 = x1 + 1
+    }
+    var y1: i64 = (y + dh) as i64
+    if (y1 as f64) < y + dh {
+        y1 = y1 + 1
+    }
+    if (*w).dmg_n == 0 {
+        (*w).dx0 = x0
+        (*w).dy0 = y0
+        (*w).dx1 = x1
+        (*w).dy1 = y1
+    } else {
+        if x0 < (*w).dx0 { (*w).dx0 = x0 }
+        if y0 < (*w).dy0 { (*w).dy0 = y0 }
+        if x1 > (*w).dx1 { (*w).dx1 = x1 }
+        if y1 > (*w).dy1 { (*w).dy1 = y1 }
+    }
+    (*w).dmg_n = (*w).dmg_n + 1
+}
+
+// The whole picture changed (the same as saying nothing -- for a page
+// that said something before in the same frame).
+fn web_damage_all(w: *mut Web) {
+    web_damage(w, 0.0, 0.0, (*w).w as f64, (*w).h as f64)
+}
+
+// Hand the picture over: the damage of this frame, or all of it.
+fn present(w: *mut Web) {
+    let cw: i64 = (*w).w as i64
+    let ch: i64 = (*w).h as i64
+    var x0: i64 = 0
+    var y0: i64 = 0
+    var x1: i64 = cw
+    var y1: i64 = ch
+    if (*w).dmg_n > 0 {
+        x0 = (*w).dx0
+        y0 = (*w).dy0
+        x1 = (*w).dx1
+        y1 = (*w).dy1
+        if x0 < 0 { x0 = 0 }
+        if y0 < 0 { y0 = 0 }
+        if x1 > cw { x1 = cw }
+        if y1 > ch { y1 = ch }
+        (*w).dmg_n = 0
+        if x1 <= x0 || y1 <= y0 {
+            return
+        }
+    }
+    if !(*w).opaque {
+        unpremultiply_rect(&(*w).cv, x0, y0, x1, y1)
+    }
+    let px: u32 = canvas.canvas_pixels(&(*w).cv) as u64 as u32
+    if x0 == 0 && y0 == 0 && x1 == cw && y1 == ch {
+        firn_web_present(px, (*w).w as u32, (*w).h as u32)
+    } else {
+        firn_web_present_rect(px, (*w).w as u32, (*w).h as u32, x0 as u32,
+            y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+    }
+    (*w).frames = (*w).frames + 1
+}
+
+// The canvas cleared to its ground.
+fn clear_canvas(w: *mut Web, col: u32) {
+    canvas.canvas_clear(&(*w).cv, col)
+}
+
+// The frame onto the screen.
+fn show(w: *mut Web) {
+    present(w)
+}
+
+// The host asks which frame clock this module speaks: 2 = firn_web_frame
+// answers FRAME_PAINTED | FRAME_AGAIN and the host runs no loop of its
+// own. (A host that finds no such export runs the old loop.)
+#[export_c]
+fn firn_web_clock() -> u32 {
+    return 2 as u32
+}
+
+// One animation frame. Paints only when something is dirty, and says so
+// -- and whether it wants the next one.
 #[export_c]
 fn firn_web_frame(ms: f64) -> u32 {
     if G_WEB == 0 {
@@ -912,35 +1104,42 @@ fn firn_web_frame(ms: f64) -> u32 {
     }
     let now: i64 = ms as i64
     if (*w).app {
+        (*w).again = false
         var te: WebEvent = event_blank(WE_TICK)
         te.ms = ms
         let _t: u32 = app_event(w, &te)
-        if (*w).dirty == 0 as u32 {
-            return 0 as u32
+        var r: u32 = 0 as u32
+        if (*w).dirty != 0 as u32 {
+            (*w).dirty = 0 as u32
+            render.ctx_set_time(&(*w).c, now)
+            let fa: *mut theme.Colors = theme.theme_colors(&(*w).m)
+            if !(*w).keep {
+                clear_canvas(w, theme.opaque((*fa).base))
+            }
+            (*w).dmg_n = 0
+            let _p: bool = (*w).paint((*w).ud, w)
+            show(w)
+            r = FRAME_PAINTED
         }
-        (*w).dirty = 0 as u32
-        render.ctx_set_time(&(*w).c, now)
-        let fa: *mut theme.Colors = theme.theme_colors(&(*w).m)
-        if !(*w).keep {
-            canvas.canvas_clear(&(*w).cv, theme.opaque((*fa).base))
+        if !(*w).on_demand || (*w).again {
+            r = r | FRAME_AGAIN
         }
-        let _p: bool = (*w).paint((*w).ud, w)
-        if !(*w).opaque {
-            unpremultiply(&(*w).cv)
-        }
-        firn_web_present(canvas.canvas_pixels(&(*w).cv) as u64 as u32,
-            (*w).w as u32, (*w).h as u32)
-        (*w).frames = (*w).frames + 1
-        return 1 as u32
+        return r
     }
     // Scroll areas that are still gliding.
     let sc: *mut scene.Scene = &(*w).sc
+    var moving: bool = false
     var k: usize = 0
     while k < scene.scene_count(sc) {
         if is_scroll_area(sc, k) {
             let v: *mut viewport.Viewport = scene.node_viewport(sc, k)
-            if viewport.viewport_moving(v) && viewport.viewport_tick(v, now) {
-                (*w).dirty = (*w).dirty | D_PAINT
+            if viewport.viewport_moving(v) {
+                if viewport.viewport_tick(v, now) {
+                    (*w).dirty = (*w).dirty | D_PAINT
+                }
+                if viewport.viewport_moving(v) {
+                    moving = true
+                }
             }
         }
         k = k + 1
@@ -953,20 +1152,25 @@ fn firn_web_frame(ms: f64) -> u32 {
             (*w).dirty = (*w).dirty | D_PAINT
             (*g).dirty = 0 as u32
         }
+        if anim.animator_busy(g) {
+            moving = true
+        }
+    }
+    var again: u32 = 0 as u32
+    if moving {
+        again = FRAME_AGAIN
     }
     if (*w).dirty == 0 as u32 {
-        return 0 as u32
+        return again
     }
     (*w).dirty = 0 as u32
     render.ctx_set_time(&(*w).c, now)
     let f: *mut theme.Colors = theme.theme_colors(&(*w).m)
-    canvas.canvas_clear(&(*w).cv, theme.opaque((*f).base))
+    clear_canvas(w, theme.opaque((*f).base))
     scene.scene_run(sc, &(*w).c, &(*w).sh, 0.0, 0.0, (*w).w as f64, (*w).h as f64)
-    unpremultiply(&(*w).cv)
-    firn_web_present(canvas.canvas_pixels(&(*w).cv) as u64 as u32, (*w).w as u32,
-        (*w).h as u32)
-    (*w).frames = (*w).frames + 1
-    return 1 as u32
+    (*w).dmg_n = 0
+    show(w)
+    return FRAME_PAINTED | again
 }
 
 // ------------------------------------------------ the host's answers

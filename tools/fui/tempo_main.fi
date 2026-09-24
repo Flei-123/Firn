@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/tempo_main.fi -- fUi TEMPO, STAGE 1, MEASURED AND PROVEN.
+//
+// The described page of gallery9 (the same page tools/fui/run.sh paints
+// and the web demo shows) is painted again and again into one canvas:
+//
+//   1. WITHOUT the coverage cache (lib/fui/fcache.fi, budget 0): the
+//      picture as fUi painted it before stage 1, and its time;
+//   2. WITH it, cold (every run rastered and kept) and warm (every run
+//      written back from the cache): the SAME OCTETS, byte for byte, and
+//      the time;
+//   3. a BAND of 96 rows painted again under a clip, the rest of the
+//      picture kept -- the way a page that paints only what changed does
+//      it (painter.clip_rows: shapes outside the clip are not rastered):
+//      the band has to come out exactly as in the whole picture.
+//
+//   tempo_main [breite] [runden]      exit 0 = all octets the same
+//
+// The numbers go to standard output (median of the rounds, ms).
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.viewport
+import fui.sheet
+import fui.scene
+import fui.fcache
+import gallery9_main
+
+fn now_ms() -> f64 {
+    var ts: [u64; 2] = [0; 2]
+    // SYS_clock_gettime = 228, CLOCK_MONOTONIC = 1
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as f64) * 1000.0 + (ts[1] as f64) / 1000000.0
+}
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_num(v: f64) {
+    // one decimal
+    var x: f64 = v
+    if x < 0.0 {
+        say("-")
+        x = 0.0 - x
+    }
+    let whole: u64 = x as u64
+    let tenth: u64 = ((x - (whole as f64)) * 10.0 + 0.5) as u64
+    var buf: [u8; 24] = [0; 24]
+    var n: usize = 0
+    var w: u64 = whole
+    if tenth >= 10 {
+        w = w + 1
+    }
+    if w == 0 {
+        buf[0] = 48 as u8
+        n = 1
+    }
+    while w > 0 {
+        buf[n] = (48 + (w % 10)) as u8
+        w = w / 10
+        n = n + 1
+    }
+    var out: [u8; 24] = [0; 24]
+    var i: usize = 0
+    while i < n {
+        out[i] = buf[n - 1 - i]
+        i = i + 1
+    }
+    out[n] = 46 as u8
+    out[n + 1] = (48 + (tenth % 10)) as u8
+    rt.write_everything(1, (&out[0]) as u64, n + 2)
+}
+
+fn say_int(v: u64) {
+    var buf: [u8; 24] = [0; 24]
+    var n: usize = 0
+    var w: u64 = v
+    if w == 0 {
+        buf[0] = 48 as u8
+        n = 1
+    }
+    while w > 0 {
+        buf[n] = (48 + (w % 10)) as u8
+        w = w / 10
+        n = n + 1
+    }
+    var out: [u8; 24] = [0; 24]
+    var i: usize = 0
+    while i < n {
+        out[i] = buf[n - 1 - i]
+        i = i + 1
+    }
+    rt.write_everything(1, (&out[0]) as u64, n)
+}
+
+fn median(t: *mut f64, n: usize) -> f64 {
+    // insertion sort of a copy (n is small)
+    var a: [f64; 64] = [0.0; 64]
+    var i: usize = 0
+    while i < n && i < 64 {
+        a[i] = *((t as u64 + (i * 8) as u64) as *mut f64)
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        var j: usize = i
+        while j > 0 && a[j - 1] > a[j] {
+            let x: f64 = a[j]
+            a[j] = a[j - 1]
+            a[j - 1] = x
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return a[n / 2]
+}
+
+fn arg_num(p: u64) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 + ((rt.ld8(p, i) - 48 as u8) as usize)
+        i = i + 1
+    }
+    return v
+}
+
+struct Page {
+    sc: scene.Scene,
+    sh: sheet.Sheet,
+    v: viewport.Viewport,
+}
+
+fn main(start: u64) -> i32 {
+    var breite: usize = 1240
+    var runden: usize = 12
+    if rt.arg_count(start) >= 2 {
+        breite = arg_num(rt.arg_ptr(start, 1))
+    }
+    if rt.arg_count(start) >= 3 {
+        runden = arg_num(rt.arg_ptr(start, 2))
+    }
+    if runden > 64 {
+        runden = 64
+    }
+    if runden < 3 {
+        runden = 3
+    }
+    let hoehe: usize = 720
+    // ---- the font
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&f1[0]) as u64, &fbuf) {
+        say("tempo: no font\n")
+        return 9
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, breite, hoehe) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, breite, hoehe) {
+        return 5
+    }
+    painter.painter_set_font(&z, fsp as u64)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+
+    // ---- the page (the lines of gallery9_web.fi's build_page)
+    let texte: u64 = rt.heap_alloc(640)
+    let feld: u64 = rt.heap_alloc(gallery9_main.ZEILEN * gallery9_main.SCHRITT)
+    gallery9_main.schreibe_texte(texte)
+    gallery9_main.schreibe_zeilen(feld)
+    var nleiste: [u8; 6] = "leiste"
+    var ntitel: [u8; 5] = "titel"
+    var nkarte: [u8; 5] = "karte"
+    var nueber: [u8; 5] = "ueber"
+    var nnotiz: [u8; 5] = "notiz"
+    var nliste: [u8; 5] = "liste"
+    var nzeile: [u8; 5] = "zeile"
+    var ngerade: [u8; 6] = "gerade"
+    var nakzent: [u8; 6] = "akzent"
+    let k_leiste: u32 = sheet.sheet_name((&nleiste[0]) as u64, 6)
+    let k_titel: u32 = sheet.sheet_name((&ntitel[0]) as u64, 5)
+    let k_karte: u32 = sheet.sheet_name((&nkarte[0]) as u64, 5)
+    let k_ueber: u32 = sheet.sheet_name((&nueber[0]) as u64, 5)
+    let k_notiz: u32 = sheet.sheet_name((&nnotiz[0]) as u64, 5)
+    let k_liste: u32 = sheet.sheet_name((&nliste[0]) as u64, 5)
+    let k_zeile: u32 = sheet.sheet_name((&nzeile[0]) as u64, 5)
+    let k_gerade: u32 = sheet.sheet_name((&ngerade[0]) as u64, 6)
+    let k_akzent: u32 = sheet.sheet_name((&nakzent[0]) as u64, 6)
+    let pg: *mut Page = rt.heap_alloc(262144) as *mut Page
+    (*pg).v = viewport.viewport_new(0.0, 0.0, gallery9_main.LISTE_W, 400.0,
+        gallery9_main.INHALT_W, gallery9_main.INHALT_H)
+    viewport.viewport_set_bar(&(*pg).v, gallery9_main.BALKEN)
+    viewport.viewport_set_inset(&(*pg).v, gallery9_main.POLSTER)
+    viewport.viewport_set_offset(&(*pg).v, 0.0, gallery9_main.ROLL_Y)
+    (*pg).sh = sheet.sheet_new()
+    (*pg).sc = scene.scene_new()
+    let spurfarbe: u32 = theme.color_from_token(&m, style.TOK_SURFACE)
+    let grund_liste: u32 = theme.mix(spurfarbe,
+        theme.color_from_token(&m, style.TOK_TEXT), 500)
+    gallery9_main.baue_blatt(&(*pg).sh, k_leiste, k_titel, k_karte, k_ueber,
+        k_notiz, k_liste, k_zeile, k_gerade, k_akzent,
+        style.color_literal(grund_liste))
+    let _k: usize = gallery9_main.baue_baum(&(*pg).sc, &(*pg).v, feld,
+        k_leiste, k_titel, k_karte, k_ueber, k_notiz, k_liste, k_zeile,
+        k_gerade, k_akzent, texte)
+
+    let n: usize = breite * hoehe * 4
+    let ref_off: u64 = rt.heap_alloc(n)
+    let ref_on: u64 = rt.heap_alloc(n)
+    var t: [f64; 64] = [0.0; 64]
+    var falsch: usize = 0
+
+    // ---- 1. without the cache
+    fcache.fc_set_budget(0)
+    var i: usize = 0
+    while i < runden {
+        let a: f64 = now_ms()
+        canvas.canvas_clear(&cv, theme.opaque((*f).base))
+        scene.scene_run(&(*pg).sc, &c, &(*pg).sh, 0.0, 0.0, breite as f64, hoehe as f64)
+        t[i] = now_ms() - a
+        i = i + 1
+    }
+    rt.mem_copy(ref_off, canvas.canvas_pixels(&cv) as u64, n)
+    let t_off: f64 = median(&t[0], runden)
+    say("tempo: gallery9 ")
+    say_int(breite as u64)
+    say("x720, whole picture without the cache  ")
+    say_num(t_off)
+    say(" ms\n")
+
+    // ---- 2. with the cache: cold, then warm
+    fcache.fc_set_budget(25165824)
+    let a0: f64 = now_ms()
+    canvas.canvas_clear(&cv, theme.opaque((*f).base))
+    scene.scene_run(&(*pg).sc, &c, &(*pg).sh, 0.0, 0.0, breite as f64, hoehe as f64)
+    let t_cold: f64 = now_ms() - a0
+    if !rt.mem_eq(canvas.canvas_pixels(&cv) as u64, ref_off, n) {
+        say("tempo: WRONG -- the cold picture with the cache differs\n")
+        falsch = falsch + 1
+    }
+    i = 0
+    while i < runden {
+        let a: f64 = now_ms()
+        canvas.canvas_clear(&cv, theme.opaque((*f).base))
+        scene.scene_run(&(*pg).sc, &c, &(*pg).sh, 0.0, 0.0, breite as f64, hoehe as f64)
+        t[i] = now_ms() - a
+        i = i + 1
+    }
+    rt.mem_copy(ref_on, canvas.canvas_pixels(&cv) as u64, n)
+    if !rt.mem_eq(ref_on, ref_off, n) {
+        say("tempo: WRONG -- the warm picture with the cache differs\n")
+        falsch = falsch + 1
+    }
+    let t_warm: f64 = median(&t[0], runden)
+    say("tempo: with the cache: cold ")
+    say_num(t_cold)
+    say(" ms, warm ")
+    say_num(t_warm)
+    say(" ms (")
+    say_int(fcache.fc_count() as u64)
+    say(" blocks, ")
+    say_int((fcache.fc_used() / 1024) as u64)
+    say(" KiB, hits ")
+    say_int(fcache.fc_hits())
+    say(", misses ")
+    say_int(fcache.fc_misses())
+    say(")\n")
+
+    // ---- 3. a band of 96 rows painted again under a clip
+    let y0: f64 = 300.0
+    let y1: f64 = 396.0
+    var tb: [f64; 64] = [0.0; 64]
+    i = 0
+    while i < runden {
+        // spoil the band, then paint only it again
+        let a: f64 = now_ms()
+        canvas.canvas_fill_rect(&cv, 0.0, y0, breite as f64, y1, 4294901760 as u32)
+        if canvas.clip_push_rect(&cv, 0.0, y0, breite as f64, y1) {
+            canvas.canvas_fill_rect(&cv, 0.0, y0, breite as f64, y1,
+                theme.opaque((*f).base))
+            scene.scene_run(&(*pg).sc, &c, &(*pg).sh, 0.0, 0.0, breite as f64,
+                hoehe as f64)
+            canvas.clip_pop(&cv)
+        }
+        tb[i] = now_ms() - a
+        i = i + 1
+    }
+    if !rt.mem_eq(canvas.canvas_pixels(&cv) as u64, ref_off, n) {
+        say("tempo: WRONG -- the band painted under a clip differs from the whole picture\n")
+        falsch = falsch + 1
+    }
+    say("tempo: a band of 96 rows under a clip ")
+    say_num(median(&tb[0], runden))
+    say(" ms\n")
+    if falsch == 0 {
+        say("TEMPO PASSED: the same octets with and without the cache, and in the band\n")
+        return 0
+    }
+    say("TEMPO FAILED\n")
+    return 1
+}

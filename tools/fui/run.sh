@@ -404,6 +404,15 @@ else
 fi
 
 echo
+echo "== 18j. fUi TEMPO: DER DECKUNGS-CACHE UND DER CLIP AENDERN KEIN OKTETT =="
+# lib/fui/fcache.fi (gerasterter Text und Icons werden aufgehoben) und
+# painter.clip_rows (Formen ausserhalb des Clips werden nicht gerastert):
+# die Galerie-Seite ohne Cache, mit Cache kalt und warm, und ein Streifen
+# unter einem Clip neu gemalt -- jedes Mal dieselben Oktette.
+"$FIRNC" --opt-level=release-fast -o "$W/tempo" tools/fui/tempo_main.fi
+"$W/tempo" 1240 5
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
