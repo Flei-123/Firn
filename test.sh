@@ -1399,6 +1399,19 @@ else
     tail -5 "$WORK/liveb4.log" | sed 's/^/   /'
 fi
 
+echo "== 64. the promotion pass natively (tools/promote/run.sh, round OPT-GENERAL) =="
+# `promote` runs by default for WebAssembly only until the register
+# allocator of TEMPO 1-13 is on main; this keeps it proven natively, in both
+# release levels and in the stress mode that rotates every loop.
+bash tools/promote/run.sh > "$WORK/promote.log" 2>&1 && PRRC=0 || PRRC=$?
+grep -E '^   promote natively' "$WORK/promote.log"
+if [ "$PRRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/promote/run.sh failed (see .test-work/promote.log)"
+    grep -E 'FAIL' "$WORK/promote.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

@@ -926,7 +926,16 @@ fn run(opts: &Options) -> i32 {
 
     // --- Optimizer ---
     if opts.optimize {
-        let st = opt::optimize_with(&mut module, &opts.optcfg);
+        // Round OPT-GENERAL: the promotion pass pays off natively only with
+        // the register allocator of TEMPO 1-13 (branch `unroll`); main's
+        // allocator spills the loop phis it creates (sim.fi 2-2.3x slower,
+        // docs/ROUND-OPT-GENERAL.md). Until that allocator is on main it runs
+        // for WebAssembly only; FIRN_PROMOTE_NATIVE=1 switches it on natively.
+        let mut optcfg = opts.optcfg.clone();
+        if !target::active().is_wasm() && std::env::var_os("FIRN_PROMOTE_NATIVE").is_none() {
+            optcfg.disabled.push("promote".to_string());
+        }
+        let st = opt::optimize_with(&mut module, &optcfg);
         if std::env::var(format!("{}_OPT_STATS", config::compiler_name().to_uppercase())).is_ok() {
             eprintln!(
                 "opt: {} constants folded, {} instructions removed, {} blocks removed",

@@ -191,6 +191,22 @@ fn cpu_features_wasm() -> i64 {
     }
 }
 
+/// Is this intrinsic translated to WebAssembly (`Fx::simd`)? A kind added to
+/// `simd.rs` later is refused at compile time, with its name, until it is.
+fn wasm_simd_kind(k: crate::simd::SimdKind) -> bool {
+    use crate::simd::SimdKind as K;
+    matches!(
+        k,
+        K::Load | K::Store | K::Zero | K::FromU64 | K::GetU64 | K::GetU32 | K::SetU32
+            | K::Xor | K::And | K::Or | K::AndNot | K::Add8 | K::Add32 | K::Add64 | K::Sub32
+            | K::ShuffleB | K::Shuffle32 | K::AlignR | K::UnpackLo32 | K::UnpackHi32
+            | K::UnpackLo64 | K::UnpackHi64 | K::ShlBytes | K::ShrBytes | K::Shl32 | K::Shr32
+            | K::Shl64 | K::Shr64 | K::Blend16 | K::AesEnc | K::AesEncLast | K::AesDec
+            | K::AesDecLast | K::AesImc | K::AesKeyGenAssist | K::Sha256Rnds2 | K::Sha256Msg1
+            | K::Sha256Msg2 | K::Pclmul | K::Crc32U8 | K::Crc32U64 | K::CpuFeatures
+    )
+}
+
 /// The class of a FIR type.
 fn class(t: FTy) -> Option<VT> {
     match t {
@@ -605,7 +621,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                         }
                     }
                     Op::Simd { kind, .. } => {
-                        if *kind != crate::simd::SimdKind::CpuFeatures && !simd_on() {
+                        if *kind != crate::simd::SimdKind::CpuFeatures && (!simd_on() || !wasm_simd_kind(*kind)) {
                             refusals.push(Refusal { func: name.clone(), what: format!("the SIMD instruction '{:?}' (SIMD is not supported on wasm32 yet)", kind) });
                         }
                     }
@@ -2834,6 +2850,10 @@ impl<'a> Fx<'a> {
                 }
                 self.put(i, vt);
             }
+            // a kind `simd.rs` gained after this table (refused before
+            // translation by `wasm_simd_kind`, so never reached)
+            #[allow(unreachable_patterns)]
+            _ => return Err(format!("wasm32: the SIMD instruction '{:?}' in '{}' has no WebAssembly form yet", kind, self.f.name)),
         }
         Ok(())
     }
