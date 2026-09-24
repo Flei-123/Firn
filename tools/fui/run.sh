@@ -270,6 +270,21 @@ build editor
 "$W/editor"
 
 echo
+echo "== 18a. DIE EINGABEMETHODE: CHINESISCH, JAPANISCH, KOREANISCH =="
+# lib/fui/ime.fi mit seinem Anschluss an editor.fi. Nachgerechnet
+# werden Romaji nach Kana (Doppelkonsonant, n-Regel, tch), die
+# Hangul-Silben nach Unicode Kapitel 3.12 (zusammensetzen UND zerlegen,
+# jede Zahl steht ausgerechnet daneben), der wandernde Auslaut, der
+# Vorbearbeitungstext mit dem Schreibzeiger davor und dahinter, die
+# Auswahl, die erst beim Bestaetigen ersetzt wird und beim Abbrechen
+# wiederkommt, die Kandidaten, Pinyin gegen die mitgelieferte Tabelle
+# und die Plattform-Schnittstelle ueber eine nachgeahmte Plattform.
+# Das Bild dazu (Feld mit offener Kandidatenliste) entsteht unten bei
+# --images mit tools/fui/imebeleg_main.fi.
+build ime
+"$W/ime"
+
+echo
 echo "== 18b. DER SCHEIBENKASTEN =="
 # lib/fui/viewport.fi: der Ausschnitt, der mehr Inhalt aufnimmt, als er
 # hoch ist. Nachgerechnet werden die Rechnung ueber Kreuz (ein
@@ -289,7 +304,8 @@ echo "== 18c. DAS STILBLATT: RANGFOLGE UND VERERBUNG =="
 # Kennung schlaegt Klasse schlaegt Art, bei Gleichstand gewinnt die
 # spaeter geschriebene Regel, und eine ranghohe Regel, die nur die
 # Schriftfarbe nennt, loescht keinen Grund. Dazu die Vererbung UND
-# ihre Grenze -- vier Werte gehen ueber, der Grund nicht.
+# ihre Grenze -- fuenf Werte gehen ueber (seit 23.09.2026 auch die
+# Schreibrichtung), der Grund nicht.
 build sheet
 "$W/sheet"
 
@@ -302,6 +318,81 @@ echo "== 18d. DER BESCHRIEBENE BAUM =="
 # Knoten liefert.
 build scene
 "$W/scene"
+
+echo
+echo "== 18e. DIE BARRIEREFREIHEIT: ROLLE, NAME, ZUSTAND, FOKUS =="
+# lib/fui/a11y.fi: jede der 23 Arten bekommt ihre Rolle, der Name
+# kommt aus der richtigen Quelle (ausdruecklich > eigene Beschriftung >
+# Etikett per Kennung > Kinder), ein Knopf ohne Namen wird GEZAEHLT,
+# Tab laeuft in Baumreihenfolge an gesperrten Elementen vorbei, der
+# Fokus rollt einen Eintrag einer langen Liste in den Ausschnitt (die
+# Verschiebungen aus viewport.fi von Hand nachgerechnet), und der
+# ausgegebene Baum einer bekannten Oberflaeche stimmt Zeile fuer Zeile.
+# Den Nachweis am echten Beispiel fuehrt tools/fui/gallery9_main.fi
+# (Abschnitt 10 dort) in der Galerie weiter unten.
+build a11y
+"$W/a11y"
+echo "== 18g. DIE ZWEIRICHTUNGSSCHRIFT: DATEN UND ALGORITHMUS =="
+# Arabisch und Hebraeisch stehen von rechts nach links, Zahlen und
+# lateinische Woerter darin von links nach rechts. Welche Reihenfolge
+# richtig ist, sagt der Unicode-Bidi-Algorithmus (UAX #9), und der steht
+# in lib/fui/bidi.fi. Hier wird zweierlei nachgerechnet:
+#
+#   1. die Bidi-Tabelle (lib/generated/bidi_tables.fi) entsteht aus der
+#      UCD 17.0.0 Oktett fuer Oktett gleich, und ein zweiter Zerleger
+#      (tools/ucd/verify_bidi.py) haelt sie ueber alle 1.114.112
+#      Codepunkte gegen die Dateien -- samt Gegenprobe mit einer
+#      gefaelschten Zeile;
+#   2. lib/fui/bidi.fi gegen BidiCharacterTest.txt, die Prueffaelle des
+#      Unicode-Konsortiums: 91.707 Absaetze mit erwarteter Absatzebene,
+#      Ebene je Zeichen und Reihenfolge auf dem Schirm. Kein einziger
+#      darf abweichen.
+BIDI_WORK="$W/ucd-bidi" bash tools/ucd/build_bidi.sh --verify > "$W/bidi_build.log" 2>&1 || {
+    cat "$W/bidi_build.log"
+    echo "  die Bidi-Tabelle ist nicht, was die UCD sagt -- NICHT bestanden"
+    exit 1
+}
+grep -E "gleich|Gegenprobe|VERSCHIEDEN|Oktette zur|Laufzeit" "$W/bidi_build.log" | sed 's/^ */  /'
+build bidiconf
+gzip -dc tools/ucd/BidiCharacterTest.txt.gz | "$W/bidiconf"
+# UND VON HAND: tools/fui/bidi_main.fi haelt dieselben Regeln gegen
+# Sollwerte, die ein Mensch mit Bleistift bestimmt hat -- 30 Absaetze
+# (reines RTL, gemischt, Zahlen in arabischem Text, gespiegelte
+# Klammern samt den drei N0-Beispielen aus UAX #9, Isolate), der
+# Zeilenumbruch in gemischtem Text, die Breiten, die der Maler misst
+# (aus der hmtx-Tabelle von DejaVu), die Schreibmarke und die
+# Pfeiltasten im Textfeld, und die arabischen Gestalten ueber GSUB und
+# ueber die Naeherung.
+build bidi
+"$W/bidi"
+echo "== 18h. DIE PLATTFORMSCHICHT OHNE BILDSCHIRM (X11 + WIRT) =="
+# lib/window/x11.fi spricht das X11-Protokoll selbst (kein Xlib, kein
+# xcb), lib/plat/fuiwirt.fi gibt die Ereignisse an lib/fui/control.fi.
+# Geprueft wird OHNE X-Server: jede Anfrage Oktett fuer Oktett gegen
+# von Hand bestimmte Werte, jede Antwort gegen echte Mitschnitte eines
+# Xvfb (testdata/x11/, tools/fui/x11_capture.py) und gegen xdpyinfo/
+# xmodmap, dazu die gallery9-Seite bei Massstab 1000/1500/2000, die
+# Bedienung ueber den Wirt und der Leerlauf (0 Bilder ohne Aenderung).
+# `import window.backend` findet die X11-Rueckwand ueber den Verweis
+# tools/fui/window/backend.fi.
+build x11
+"$W/x11"
+
+echo
+echo "== 18i. EIN ECHTES FENSTER AUF EINEM ECHTEN X-SERVER =="
+# Dieselbe Seite als Programm (demos/x11demo) auf einem eigenen Xvfb,
+# von aussen bedient: xdotool fuer Maus und Tastatur, eine rohe
+# ClientMessage WM_DELETE_WINDOW zum Schliessen, xwd fuer das Bild VOM
+# SERVER, /proc fuer die Rechenzeit im Leerlauf. Gebaut mit dem
+# Optimierer, weil der Lauf auf Bilder wartet (ein Vollbild braucht mit
+# --opt-level=dev ueber eine Sekunde). Fehlt Xvfb, sagt der Lauf SKIP
+# und warum -- ein fehlender X-Server ist kein Fehler der Demo.
+"$FIRNC" --opt-level=release-fast -o "$W/x11demo" demos/x11demo/main.fi
+if command -v Xvfb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    python3 tools/fui/x11live.py "$W/x11demo" "${BELEGE:-$W/belege}/x11"
+else
+    echo "  SKIP: kein Xvfb/python3 -- kein echtes Fenster in diesem Lauf"
+fi
 
 echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
@@ -318,8 +409,16 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 #   2. JEDE Datei tools/fui/*_main.fi und demos/fuidemo/main.fi muss in
 #      diesem Skript VORKOMMEN. (Die uebrigen Demos gehoeren anderen
 #      Baeumen; sie werden gebaut, aber nicht hier gerechnet.)
+#   An Android-only program (it imports plat.android, which links against
+#   the NDK: pthread, ANativeActivity) cannot be linked on this host. It
+#   is still built -- as an object for x86_64-android, the first half of
+#   tools/android/build.sh -- so it cannot silently stop building either.
 for f in tools/fui/*_main.fi demos/*/main.fi; do
-    "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
+    if grep -q '^import plat\.android' "$f"; then
+        "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
+    else
+        "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
+    fi
 done
 echo "  alle tools/fui/*_main.fi und demos/*/main.fi uebersetzen  OK"
 fehlt=0
@@ -827,7 +926,19 @@ if [ "$1" = "--images" ]; then
     # PNG und der Lauf bleibt daran haengen.
     build gallery9
     kette gallery9 1240
-    "$W/gallery9" "$Z/fui-deklarativ-hell.png" light
+    # Das sechste Argument laesst dieselbe Seite ihren Barrierefreiheits-
+    # Baum (lib/fui/a11y.fi, a11y_dump) als Text neben das Bild legen.
+    # Abschnitt 10 im Programm verlangt dabei, dass jedes der 12
+    # Bedienelemente Rolle und Namen hat; sonst gibt es kein Bild.
+    "$W/gallery9" "$Z/fui-deklarativ-hell.png" light - 1240 \
+        "$Z/fui-deklarativ-a11y.txt"
+    if ! grep -q '^    textbox "Im Baum suchen" focusable' \
+        "$Z/fui-deklarativ-a11y.txt"; then
+        echo "  FEHLER: fui-deklarativ-a11y.txt fehlt oder das Suchfeld hat"
+        echo "  darin keinen Namen."
+        exit 1
+    fi
+    echo "  fui-deklarativ-a11y.txt: $(wc -l < "$Z/fui-deklarativ-a11y.txt") Zeilen Barrierefreiheits-Baum  OK"
     "$W/gallery9" "$Z/fui-deklarativ-dunkel.png" dark
     beleg "$Z/fui-deklarativ-hell.png" 1240 700 740 200 40 1
     beleg "$Z/fui-deklarativ-dunkel.png" 1240 700 740 200 40 1
@@ -843,6 +954,23 @@ if [ "$1" = "--images" ]; then
     "$W/gallery9" "$Z/fui-deklarativ-schmal-dunkel.png" dark - 980
     beleg "$Z/fui-deklarativ-schmal-hell.png" 980 700 740 200 40 1
     beleg "$Z/fui-deklarativ-schmal-dunkel.png" 980 700 740 200 40 1
+    # DIE ZWEIRICHTUNGSSCHRIFT (Runde Bidi, 23.09.2026). Arabisch und
+    # Hebraeisch neben Lateinisch, alles ueber den normalen Weg der
+    # Bibliothek: Beschriftungen mit Zahlen und Klammern, dieselbe
+    # Beschriftung mit direction ltr und rtl, Knoepfe, ein Absatz ueber
+    # zwei Zeilen, eine Kuerzung mit den Punkten links, zwei Textfelder
+    # (Schreibmarke am arabischen Textende, Auswahl ueber die
+    # Richtungsgrenze). Das Programm rechnet selbst nach, dass neben
+    # keinem Kasten ein fremder Punkt steht, dass der Text im RTL-Kasten
+    # rechts beginnt und dass der Absatz wirklich zwei Zeilen hat --
+    # sonst schreibt es kein PNG. Die Schrift ist DejaVu Sans, die
+    # arabische und hebraeische Glyphen samt GSUB fuehrt.
+    build gallery10
+    kette gallery10 1000
+    "$W/gallery10" "$Z/fui-bidi-hell.png" light
+    "$W/gallery10" "$Z/fui-bidi-dunkel.png" dark
+    beleg "$Z/fui-bidi-hell.png" 1000 500 900 200 40 1
+    beleg "$Z/fui-bidi-dunkel.png" 1000 500 900 200 40 1
     # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
     # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
     # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet
@@ -870,6 +998,31 @@ if [ "$1" = "--images" ]; then
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     beleg "$Z/fui-demo-hell.png" 1000 350 500 200 40 0
     beleg "$Z/fui-demo-dunkel.png" 1000 350 500 200 40 0
+    # DIE EINGABEMETHODE (Runde IME, 23.09.2026). Vier Felder mitten in
+    # einer Eingabe -- Japanisch mit offener Liste, Koreanisch mit der
+    # Silbe im Bau, Chinesisch mit der Liste fuer zhong, und eine
+    # Auswahl, die bis zum Bestaetigen stehen bleibt. Dafuer braucht es
+    # eine Schrift mit CJK-GLYPHEN in TrueType-Umrissen; DejaVu hat
+    # keine, und ein Beleg aus leeren Kaesten belegt nichts. Fehlt sie,
+    # ist der Lauf NICHT bestanden -- dieselbe Regel wie bei $SCHRIFT.
+    # (Noto Sans CJK taugt nicht: CFF-Umrisse, die lib/font/ttf.fi
+    # benannt ablehnt.) Das Programm prueft selbst, dass jedes gezeigte
+    # Zeichen eine Glyphe hat, dass nichts ueberlappt und nichts aus
+    # seinem Kasten laeuft, und schreibt sonst kein PNG.
+    SCHRIFT_CJK="${SCHRIFT_CJK:-/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc}"
+    if [ ! -r "$SCHRIFT_CJK" ]; then
+        echo "  FEHLER: die CJK-Schrift \"$SCHRIFT_CJK\" ist nicht lesbar."
+        echo "  Ohne CJK-Glyphen zeigt der IME-Beleg leere Kaesten. Installiere"
+        echo "  fonts-wqy-zenhei oder setze SCHRIFT_CJK auf eine TrueType-Datei"
+        echo "  (glyf-Umrisse) mit Kana, Hangul und Hanzi."
+        exit 1
+    fi
+    build imebeleg
+    kette imebeleg 1000
+    "$W/imebeleg" "$Z/fui-ime-hell.png" light "$SCHRIFT_CJK"
+    "$W/imebeleg" "$Z/fui-ime-dunkel.png" dark "$SCHRIFT_CJK"
+    beleg "$Z/fui-ime-hell.png" 1000 400 485 200 40 1
+    beleg "$Z/fui-ime-dunkel.png" 1000 400 485 200 40 1
     ls -la "$Z"
 fi
 

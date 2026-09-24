@@ -1,0 +1,729 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/ime_main.fi -- DIE EINGABEMETHODE, NACHGERECHNET.
+//
+// ====================================================== WARUM ES SIE GIBT
+//
+// lib/fui/ime.fi setzt Romaji in Kana um, rechnet Hangul-Silben aus
+// ihren Jamo und schlaegt Pinyin in einer Tabelle nach. Jede dieser
+// Umsetzungen ist eine Folge von Regeln, und jede Regel hat einen Fall,
+// an dem sie bricht: das n vor einem Vokal, der Auslaut, der in die
+// naechste Silbe wandert, die Auswahl, die beim Abbrechen wiederkommen
+// muss. Diese Datei tippt genau diese Faelle und vergleicht mit Werten,
+// die VON HAND bestimmt sind -- die Kana aus der Romaji-Tabelle jeder
+// japanischen Tastatur, die Hangul-Codepunkte nach Unicode Kapitel 3.12
+// ausgerechnet (die Rechnung steht jeweils daneben), die Bytelagen im
+// Textpuffer abgezaehlt.
+//
+// Kein Fenster, keine Schrift: nur Tasten hinein und Text heraus. Die
+// Kandidatenliste als Bild prueft tools/fui/imebeleg_main.fi.
+import std.rt
+import fui.textbuf
+import fui.editor
+import fui.ime
+import fui.pinyin
+
+static mut G_ERRORS: usize = 0
+static mut G_N: usize = 0
+
+// Die nachgeahmte Plattform (Abschnitt 8) merkt sich hier, was bei ihr
+// ankam. Ein Funktionszeiger in Firn traegt keinen Zustand mit, also
+// liegt er an einem festen Ort -- genau so, wie eine echte Plattform
+// ihren Zustand neben dem Fenster haelt.
+static mut G_ED: u64 = 0
+static mut G_FILTER: usize = 0
+static mut G_SPOT_X: f64 = 0.0
+static mut G_RESET: u32 = 0
+
+fn spalte(t: *mut rt.Buf, nm: u64, nn: usize) {
+    rt.buf_push_bytes(t, nm, nn)
+    var i: usize = nn
+    while i < 48 {
+        rt.buf_push(t, 32 as u8)
+        i = i + 1
+    }
+}
+
+fn urteil(t: *mut rt.Buf, ok: bool) {
+    G_N = G_N + 1
+    if ok {
+        var o: [u8; 3] = "OK "
+        rt.buf_push_bytes(t, (&o[0]) as u64, 3)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+}
+
+// Eine Zahl gegen ihren Sollwert.
+fn report(nm: u64, nn: usize, ok: bool, got: i64, want: i64) {
+    var t: rt.Buf = rt.buf_new()
+    spalte(&t, nm, nn)
+    urteil(&t, ok)
+    var h1: [u8; 5] = " got "
+    rt.buf_push_bytes(&t, (&h1[0]) as u64, 5)
+    rt.buf_push_dec_i64(&t, got)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, want)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn gleich(ap: u64, an: usize, bp: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if rt.ld8(ap, i) != rt.ld8(bp, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Ein Text gegen seinen Sollwert -- Laenge UND Bytes, und beide werden
+// ausgegeben, damit ein Fehler zeigt, WAS dastand.
+fn report_s(nm: u64, nn: usize, gp: u64, gn: usize, wp: u64, wn: usize) {
+    var t: rt.Buf = rt.buf_new()
+    spalte(&t, nm, nn)
+    urteil(&t, gleich(gp, gn, wp, wn))
+    var h1: [u8; 5] = " got "
+    rt.buf_push_bytes(&t, (&h1[0]) as u64, 5)
+    rt.buf_push_bytes(&t, gp, gn)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_bytes(&t, wp, wn)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn b2i(b: bool) -> i64 {
+    if b { return 1 }
+    return 0
+}
+
+// ---- Romaji -> Kana als reine Funktion
+fn kana(nm: u64, nn: usize, sp: u64, sn: usize, fin: bool, wp: u64, wn: usize) {
+    var aus: [u8; 128] = [0; 128]
+    let k: usize = ime.kana_from_romaji(sp, sn, (&aus[0]) as u64, 128, fin)
+    report_s(nm, nn, (&aus[0]) as u64, k, wp, wn)
+}
+
+// ---- das Feld
+fn tb(e: *mut editor.Editor) -> *mut textbuf.TextBuf {
+    return editor.editor_buf(e)
+}
+
+fn feld(e: *mut editor.Editor, p: u64, n: usize) {
+    textbuf.tb_set_text(tb(e), p, n)
+    textbuf.tb_set_range(tb(e), n, n)
+}
+
+fn leer(e: *mut editor.Editor) {
+    textbuf.tb_clear(tb(e))
+}
+
+// Tippt n Bytes als einzelne Tastendruecke, wie sie ein Fenster liefert.
+fn tippe(e: *mut editor.Editor, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let r: u32 = editor.editor_char(e, rt.ld8(p, i) as u32, 0 as u32)
+        i = i + 1
+    }
+}
+
+fn text_s(nm: u64, nn: usize, e: *mut editor.Editor, wp: u64, wn: usize) {
+    report_s(nm, nn, textbuf.tb_ptr(tb(e)), textbuf.tb_len(tb(e)), wp, wn)
+}
+
+fn cand_s(nm: u64, nn: usize, e: *mut editor.Editor, k: usize, wp: u64, wn: usize) {
+    let m: *mut ime.Ime = editor.editor_ime(e)
+    report_s(nm, nn, ime.ime_cand_text(m, k), ime.ime_cand_len(m, k), wp, wn)
+}
+
+// ---- die nachgeahmte Plattform
+//
+// Sie nimmt 'x' und antwortet sofort mit dem Vorbearbeitungstext 日本,
+// sie nimmt 'y' und bestaetigt 日本語. Alles andere lehnt sie ab --
+// auch Escape: das bleibt beim Feld, und das Feld muss ihr dann sagen,
+// dass die Eingabe vorbei ist.
+fn p_filter(code: u32, mods: u32, is_char: bool) -> bool {
+    if is_char && code == 120 as u32 {
+        G_FILTER = G_FILTER + 1
+        var s: [u8; 6] = "日本"
+        let r: u32 = editor.editor_ime_preedit(G_ED as *mut editor.Editor,
+            (&s[0]) as u64, 6, 6)
+        return true
+    }
+    if is_char && code == 121 as u32 {
+        G_FILTER = G_FILTER + 1
+        var s2: [u8; 9] = "日本語"
+        let r2: u32 = editor.editor_ime_commit(G_ED as *mut editor.Editor,
+            (&s2[0]) as u64, 9)
+        return true
+    }
+    return false
+}
+fn p_spot(x: f64, y: f64, h: f64) {
+    G_SPOT_X = x
+}
+fn p_reset(why: u32) {
+    G_RESET = why
+}
+
+// ---- die Pinyin-Tabelle, von aussen durchgezaehlt
+fn py_zaehle(silben: *mut usize, zeichen: *mut usize, laengste: *mut usize,
+    schlecht: *mut usize) {
+    var b: u8 = 97 as u8
+    while b <= 122 as u8 {
+        var n: usize = 0
+        let p: u64 = pinyin.py_block(b, &n)
+        var i: usize = 0
+        while i < n {
+            // bis zum ':'
+            while i < n && rt.ld8(p, i) != 58 as u8 {
+                i = i + 1
+            }
+            i = i + 1
+            *silben = *silben + 1
+            var z: usize = 0
+            while i < n && rt.ld8(p, i) != 32 as u8 {
+                // Jedes Zeichen: ein Leitbyte 0xE0..0xEF und zwei Folgebytes.
+                let l: u8 = rt.ld8(p, i)
+                if l < 0xE0 as u8 || l > 0xEF as u8 || i + 3 > n {
+                    *schlecht = *schlecht + 1
+                    i = i + 1
+                } else {
+                    z = z + 1
+                    i = i + 3
+                }
+            }
+            i = i + 1
+            *zeichen = *zeichen + z
+            if z > *laengste {
+                *laengste = z
+            }
+        }
+        b = b + 1 as u8
+    }
+}
+
+// #[allow_escape]: Abschnitt 8 legt die Adresse von `ed` in G_ED ab,
+// damit die nachgeahmte Plattform das Feld zurueckrufen kann. Das ist
+// sicher, weil G_ED vor dem Ende von main wieder auf 0 gesetzt wird --
+// danach ruft niemand mehr.
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var roh: [u8; 512] = [0; 512]
+    var ed: editor.Editor = editor.editor_new()
+    if !editor.editor_init(&ed, (&roh[0]) as u64, 512) {
+        var oom: [u8; 27] = "editor_init: kein Speicher\n"
+        rt.write_everything(2, (&oom[0]) as u64, 27)
+        return 2
+    }
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&ed)
+    let m: *mut ime.Ime = editor.editor_ime(&ed)
+
+    // ==================================================================
+    // 1. ROMAJI NACH KANA
+    // ==================================================================
+    // Die Sollwerte sind die Kana, die jede japanische Tastatur fuer diese
+    // Folgen liefert. `fin` heisst: danach kommt nichts mehr (Bestaetigen).
+    var r1: [u8; 2] = "ka"
+    var w1: [u8; 3] = "か"
+    var l1: [u8; 13] = "1 ka wird か"
+    kana((&l1[0]) as u64, 13, (&r1[0]) as u64, 2, false, (&w1[0]) as u64, 3)
+    var r2: [u8; 3] = "kyo"
+    var w2: [u8; 6] = "きょ"
+    var l2: [u8; 25] = "1 kyo wird きょ (Youon)"
+    kana((&l2[0]) as u64, 25, (&r2[0]) as u64, 3, false, (&w2[0]) as u64, 6)
+    var r3: [u8; 3] = "shi"
+    var w3: [u8; 3] = "し"
+    var l3: [u8; 24] = "1 shi wird し (Hepburn)"
+    kana((&l3[0]) as u64, 24, (&r3[0]) as u64, 3, false, (&w3[0]) as u64, 3)
+    var r4: [u8; 2] = "si"
+    var l4: [u8; 29] = "1 si wird ebenso し (Kunrei)"
+    kana((&l4[0]) as u64, 29, (&r4[0]) as u64, 2, false, (&w3[0]) as u64, 3)
+    var r5: [u8; 3] = "tsu"
+    var w5: [u8; 3] = "つ"
+    var l5: [u8; 14] = "1 tsu wird つ"
+    kana((&l5[0]) as u64, 14, (&r5[0]) as u64, 3, false, (&w5[0]) as u64, 3)
+    var r6: [u8; 5] = "kitte"
+    var w6: [u8; 9] = "きって"
+    var l6: [u8; 40] = "1 kitte wird きって (Doppelkonsonant)"
+    kana((&l6[0]) as u64, 40, (&r6[0]) as u64, 5, false, (&w6[0]) as u64, 9)
+    var r7: [u8; 6] = "matcha"
+    var w7: [u8; 12] = "まっちゃ"
+    var l7: [u8; 32] = "1 matcha wird まっちゃ (tch)"
+    kana((&l7[0]) as u64, 32, (&r7[0]) as u64, 6, false, (&w7[0]) as u64, 12)
+    var r8: [u8; 5] = "kanji"
+    var w8: [u8; 9] = "かんじ"
+    var l8: [u8; 40] = "1 kanji wird かんじ (n vor Konsonant)"
+    kana((&l8[0]) as u64, 40, (&r8[0]) as u64, 5, false, (&w8[0]) as u64, 9)
+    var r9: [u8; 11] = "konnnichiha"
+    var w9: [u8; 15] = "こんにちは"
+    var l9: [u8; 39] = "1 konnnichiha wird こんにちは (nn)"
+    kana((&l9[0]) as u64, 39, (&r9[0]) as u64, 11, false, (&w9[0]) as u64, 15)
+    var r10: [u8; 6] = "hon'ya"
+    var w10: [u8; 9] = "ほんや"
+    var l10: [u8; 28] = "1 hon'ya wird ほんや (n')"
+    kana((&l10[0]) as u64, 28, (&r10[0]) as u64, 6, false, (&w10[0]) as u64, 9)
+    var r11: [u8; 5] = "honya"
+    var w11: [u8; 9] = "ほにゃ"
+    var l11: [u8; 32] = "1 honya wird ほにゃ (n vor y)"
+    kana((&l11[0]) as u64, 32, (&r11[0]) as u64, 5, false, (&w11[0]) as u64, 9)
+    var r12: [u8; 1] = "n"
+    var l12: [u8; 29] = "1 n am Ende wartet (bleibt n)"
+    kana((&l12[0]) as u64, 29, (&r12[0]) as u64, 1, false, (&r12[0]) as u64, 1)
+    var w13: [u8; 3] = "ん"
+    var l13: [u8; 37] = "1 n am Ende beim Bestaetigen wird ん"
+    kana((&l13[0]) as u64, 37, (&r12[0]) as u64, 1, true, (&w13[0]) as u64, 3)
+    var r14: [u8; 2] = "ky"
+    var l14: [u8; 37] = "1 ky wartet auf den Vokal (bleibt ky)"
+    kana((&l14[0]) as u64, 37, (&r14[0]) as u64, 2, false, (&r14[0]) as u64, 2)
+    var r15: [u8; 7] = "toukyou"
+    var w15: [u8; 15] = "とうきょう"
+    var l15: [u8; 30] = "1 toukyou wird とうきょう"
+    kana((&l15[0]) as u64, 30, (&r15[0]) as u64, 7, false, (&w15[0]) as u64, 15)
+    var r16: [u8; 6] = "ra-men"
+    var w16: [u8; 12] = "らーめん"
+    var l16: [u8; 38] = "1 ra-men wird らーめん (- ist ー)"
+    kana((&l16[0]) as u64, 38, (&r16[0]) as u64, 6, true, (&w16[0]) as u64, 12)
+    var r17: [u8; 4] = "xtsu"
+    var w17: [u8; 3] = "っ"
+    var l17: [u8; 29] = "1 xtsu wird っ (kleines tsu)"
+    kana((&l17[0]) as u64, 29, (&r17[0]) as u64, 4, false, (&w17[0]) as u64, 3)
+    var r18: [u8; 2] = "qa"
+    var w18: [u8; 4] = "qあ"
+    var l18: [u8; 32] = "1 qa wird qあ (q bleibt stehen)"
+    kana((&l18[0]) as u64, 32, (&r18[0]) as u64, 2, false, (&w18[0]) as u64, 4)
+    // Katakana: dieselbe Silbe 0x60 Codepunkte weiter, ー bleibt.
+    var kk: [u8; 64] = [0; 64]
+    var w19: [u8; 12] = "ラーメン"
+    let n19: usize = ime.hira_to_kata((&w16[0]) as u64, 12, (&kk[0]) as u64, 64)
+    var l19: [u8; 43] = "1 らーめん in Katakana ist ラーメン"
+    report_s((&l19[0]) as u64, 43, (&kk[0]) as u64, n19, (&w19[0]) as u64, 12)
+    // Die Tabelle selbst: 176 Eintraege, keiner der Anfang eines anderen.
+    var anzahl: usize = 0
+    let schlecht: usize = ime.kana_table_check(&anzahl)
+    var l20: [u8; 38] = "1 die Romaji-Tabelle hat 176 Eintraege"
+    report((&l20[0]) as u64, 38, anzahl == 176, anzahl as i64, 176)
+    var l21: [u8; 44] = "1 und 0 Schluessel sind Anfang eines anderen"
+    report((&l21[0]) as u64, 44, schlecht == 0, schlecht as i64, 0)
+
+    // ==================================================================
+    // 2. HANGUL, GERECHNET NACH UNICODE KAPITEL 3.12
+    // ==================================================================
+    // S = 0xAC00 + (L * 21 + V) * 28 + T
+    // 한 = ㅎ(L 18) ㅏ(V 0) ㄴ(T 4): 44032 + 378 * 28 + 4 = 54620 = U+D55C
+    var l22: [u8; 37] = "2 L18 V0 T4 ergibt 54620 (U+D55C 한)"
+    let s22: u32 = ime.hangul_compose(18 as u32, 0 as u32, 4 as u32)
+    report((&l22[0]) as u64, 37, s22 == 54620 as u32, s22 as i64, 54620)
+    // 가 ist die erste Silbe: 44032 = U+AC00
+    var l23: [u8; 36] = "2 L0 V0 T0 ergibt 44032 (U+AC00 가)"
+    let s23: u32 = ime.hangul_compose(0 as u32, 0 as u32, 0 as u32)
+    report((&l23[0]) as u64, 36, s23 == 44032 as u32, s23 as i64, 44032)
+    // 힣 ist die letzte: 44032 + (18 * 21 + 20) * 28 + 27 = 44032 + 398 * 28
+    // + 27 = 55203 = U+D7A3
+    var l24: [u8; 39] = "2 L18 V20 T27 ergibt 55203 (U+D7A3 힣)"
+    let s24: u32 = ime.hangul_compose(18 as u32, 20 as u32, 27 as u32)
+    report((&l24[0]) as u64, 39, s24 == 55203 as u32, s24 as i64, 55203)
+    // 글 = U+AE00 = 44544: 44544 - 44032 = 512; 512 / 588 = 0 (ㄱ),
+    // 512 % 588 / 28 = 18 (ㅡ), 512 % 28 = 8 (ㄹ).
+    var hl: u32 = 99
+    var hv: u32 = 99
+    var ht: u32 = 99
+    let ok25: bool = ime.hangul_decompose(0xAE00 as u32, &hl, &hv, &ht)
+    var l25: [u8; 38] = "2 U+AE00 (글) zerlegt: Anlaut 0 (ㄱ)"
+    report((&l25[0]) as u64, 38, ok25 && hl == 0 as u32, hl as i64, 0)
+    var l26: [u8; 38] = "2 U+AE00 (글) zerlegt: Vokal 18 (ㅡ)"
+    report((&l26[0]) as u64, 38, hv == 18 as u32, hv as i64, 18)
+    var l27: [u8; 39] = "2 U+AE00 (글) zerlegt: Auslaut 8 (ㄹ)"
+    report((&l27[0]) as u64, 39, ht == 8 as u32, ht as i64, 8)
+    // あ (U+3042) ist keine Hangul-Silbe.
+    let ok28: bool = ime.hangul_decompose(0x3042 as u32, &hl, &hv, &ht)
+    var l28: [u8; 34] = "2 U+3042 (あ) ist keine Silbe (0)"
+    report((&l28[0]) as u64, 34, !ok28, b2i(ok28), 0)
+    // Dubeolsik: g = ㅎ (U+314E, Lage 29), k = ㅏ (U+314F, Lage 30),
+    // R = ㄲ (U+3132, Lage 1).
+    var l29: [u8; 31] = "2 Taste g ist ㅎ, Jamo-Lage 29"
+    let j29: u32 = ime.hangul_jamo_of_key(103 as u32)
+    report((&l29[0]) as u64, 31, j29 == 29 as u32, j29 as i64, 29)
+    var l30: [u8; 31] = "2 Taste k ist ㅏ, Jamo-Lage 30"
+    let j30: u32 = ime.hangul_jamo_of_key(107 as u32)
+    report((&l30[0]) as u64, 31, j30 == 30 as u32, j30 as i64, 30)
+    var l31: [u8; 36] = "2 Taste R (Umschalt) ist ㄲ, Lage 1"
+    let j31: u32 = ime.hangul_jamo_of_key(82 as u32)
+    report((&l31[0]) as u64, 36, j31 == 1 as u32, j31 as i64, 1)
+
+    // ==================================================================
+    // 3. HANGUL IM FELD
+    // ==================================================================
+    editor.editor_ime_mode(&ed, ime.IME_HANGUL)
+    leer(&ed)
+    var k1: [u8; 3] = "gks"
+    tippe(&ed, (&k1[0]) as u64, 3)
+    var hg1: [u8; 3] = "한"
+    var l32: [u8; 27] = "3 gks steht als 한 im Feld"
+    text_s((&l32[0]) as u64, 27, &ed, (&hg1[0]) as u64, 3)
+    var l33: [u8; 33] = "3 und ist Vorbearbeitung: 3 Bytes"
+    let v33: usize = textbuf.tb_comp_b(t) - textbuf.tb_comp_a(t)
+    report((&l33[0]) as u64, 33, v33 == 3, v33 as i64, 3)
+    var k2: [u8; 3] = "rmf"
+    tippe(&ed, (&k2[0]) as u64, 3)
+    let e34: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    var hg2: [u8; 6] = "한글"
+    var l34: [u8; 30] = "3 gksrmf + Enter ergibt 한글"
+    text_s((&l34[0]) as u64, 30, &ed, (&hg2[0]) as u64, 6)
+    leer(&ed)
+    var k3: [u8; 6] = "dkssud"
+    tippe(&ed, (&k3[0]) as u64, 6)
+    let e35: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    var hg3: [u8; 6] = "안녕"
+    var l35: [u8; 30] = "3 dkssud + Enter ergibt 안녕"
+    text_s((&l35[0]) as u64, 30, &ed, (&hg3[0]) as u64, 6)
+    // 닭 = ㄷ(3) ㅏ(0) ㄺ(9): 44032 + 63 * 28 + 9 = 45805 = U+B2ED
+    leer(&ed)
+    var k4: [u8; 4] = "ekfr"
+    tippe(&ed, (&k4[0]) as u64, 4)
+    var hg4: [u8; 3] = "닭"
+    var l36: [u8; 37] = "3 ekfr ergibt 닭 (Doppelauslaut ㄺ)"
+    text_s((&l36[0]) as u64, 37, &ed, (&hg4[0]) as u64, 3)
+    // Dann ㅏ: ㄱ wandert, 닭 wird 달 (T 8: 45804 = U+B2EC), neu 가.
+    var k5: [u8; 1] = "k"
+    tippe(&ed, (&k5[0]) as u64, 1)
+    var hg5: [u8; 6] = "달가"
+    var l37: [u8; 37] = "3 dann k: der Auslaut wandert, 달가"
+    text_s((&l37[0]) as u64, 37, &ed, (&hg5[0]) as u64, 6)
+    var l38: [u8; 39] = "3 nur 가 ist noch Vorbearbeitung: ab 3"
+    report((&l38[0]) as u64, 39, textbuf.tb_comp_a(t) == 3,
+        textbuf.tb_comp_a(t) as i64, 3)
+    let e39: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    // 와 = ㅇ(11) ㅘ(9): 44032 + (231 + 9) * 28 = 50752 = U+C640
+    leer(&ed)
+    var k6: [u8; 3] = "dhk"
+    tippe(&ed, (&k6[0]) as u64, 3)
+    var hg6: [u8; 3] = "와"
+    var l39: [u8; 38] = "3 dhk ergibt 와 (Doppelvokal ㅗ+ㅏ)"
+    text_s((&l39[0]) as u64, 38, &ed, (&hg6[0]) as u64, 3)
+    let e40: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    // Ruecktaste nimmt Jamo fuer Jamo: 한 -> 하 (U+D558) -> ㅎ -> nichts
+    leer(&ed)
+    tippe(&ed, (&k1[0]) as u64, 3)
+    let b41: u32 = editor.editor_key(&ed, editor.KEY_BACKSPACE, 0 as u32)
+    var hg7: [u8; 3] = "하"
+    var l41: [u8; 26] = "3 Ruecktaste: 한 wird 하"
+    text_s((&l41[0]) as u64, 26, &ed, (&hg7[0]) as u64, 3)
+    let b42: u32 = editor.editor_key(&ed, editor.KEY_BACKSPACE, 0 as u32)
+    var hg8: [u8; 3] = "ㅎ"
+    var l42: [u8; 27] = "3 noch einmal: 하 wird ㅎ"
+    text_s((&l42[0]) as u64, 27, &ed, (&hg8[0]) as u64, 3)
+    let b43: u32 = editor.editor_key(&ed, editor.KEY_BACKSPACE, 0 as u32)
+    var l43: [u8; 37] = "3 und dann ist das Feld leer: 0 Bytes"
+    report((&l43[0]) as u64, 37, textbuf.tb_len(t) == 0,
+        textbuf.tb_len(t) as i64, 0)
+    var l44: [u8; 34] = "3 die Eingabe ist damit vorbei (0)"
+    report((&l44[0]) as u64, 34, !ime.ime_on(m), b2i(ime.ime_on(m)), 0)
+
+    // ==================================================================
+    // 4. DER VORBEARBEITUNGSTEXT IM FELD
+    // ==================================================================
+    // "hello world", Schreibzeiger hinter "hello" (Byte 5). Nach "ka"
+    // steht か (3 Bytes) an 5..8, der Rest ist um 3 nach hinten gerueckt.
+    editor.editor_ime_mode(&ed, ime.IME_KANA)
+    var hw: [u8; 11] = "hello world"
+    feld(&ed, (&hw[0]) as u64, 11)
+    textbuf.tb_set_range(t, 5, 5)
+    tippe(&ed, (&r1[0]) as u64, 2)
+    var hk: [u8; 14] = "helloか world"
+    var l45: [u8; 30] = "4 ka an Byte 5: helloか world"
+    text_s((&l45[0]) as u64, 30, &ed, (&hk[0]) as u64, 14)
+    var l46: [u8; 30] = "4 Vorbearbeitung beginnt bei 5"
+    report((&l46[0]) as u64, 30, textbuf.tb_comp_a(t) == 5,
+        textbuf.tb_comp_a(t) as i64, 5)
+    var l47: [u8; 17] = "4 und endet bei 8"
+    report((&l47[0]) as u64, 17, textbuf.tb_comp_b(t) == 8,
+        textbuf.tb_comp_b(t) as i64, 8)
+    var l48: [u8; 27] = "4 Schreibzeiger dahinter: 8"
+    report((&l48[0]) as u64, 27, textbuf.tb_caret(t) == 8,
+        textbuf.tb_caret(t) as i64, 8)
+    let p49: u32 = editor.editor_key(&ed, editor.KEY_LEFT, 0 as u32)
+    var l49: [u8; 23] = "4 Pfeil links: davor, 5"
+    report((&l49[0]) as u64, 23, textbuf.tb_caret(t) == 5,
+        textbuf.tb_caret(t) as i64, 5)
+    let p50: u32 = editor.editor_key(&ed, editor.KEY_LEFT, 0 as u32)
+    var l50: [u8; 35] = "4 noch einmal links: bleibt drin, 5"
+    report((&l50[0]) as u64, 35, textbuf.tb_caret(t) == 5,
+        textbuf.tb_caret(t) as i64, 5)
+    let p51: u32 = editor.editor_key(&ed, editor.KEY_END, 0 as u32)
+    var l51: [u8; 38] = "4 Ende: ans Ende der Vorbearbeitung, 8"
+    report((&l51[0]) as u64, 38, textbuf.tb_caret(t) == 8,
+        textbuf.tb_caret(t) as i64, 8)
+    let x52: u32 = editor.editor_key(&ed, editor.KEY_ESC, 0 as u32)
+    var l52: [u8; 28] = "4 Esc bricht ab: hello world"
+    text_s((&l52[0]) as u64, 28, &ed, (&hw[0]) as u64, 11)
+    var l53: [u8; 28] = "4 Schreibzeiger wieder bei 5"
+    report((&l53[0]) as u64, 28, textbuf.tb_caret(t) == 5,
+        textbuf.tb_caret(t) as i64, 5)
+    tippe(&ed, (&r1[0]) as u64, 2)
+    let x54: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    // Enter bestaetigt die Eingabe und schickt NICHT ab: RES_CHANGED (1),
+    // nicht RES_COMMIT (3).
+    var l54: [u8; 38] = "4 Enter bestaetigt, meldet CHANGED (1)"
+    report((&l54[0]) as u64, 38, x54 == editor.RES_CHANGED, x54 as i64,
+        editor.RES_CHANGED as i64)
+    var l55: [u8; 34] = "4 und helloか world bleibt stehen"
+    text_s((&l55[0]) as u64, 34, &ed, (&hk[0]) as u64, 14)
+    var l56: [u8; 29] = "4 Schreibzeiger hinter か: 8"
+    report((&l56[0]) as u64, 29, textbuf.tb_caret(t) == 8,
+        textbuf.tb_caret(t) as i64, 8)
+    var l57: [u8; 31] = "4 keine Vorbearbeitung mehr (0)"
+    report((&l57[0]) as u64, 31, !textbuf.tb_has_comp(t),
+        b2i(textbuf.tb_has_comp(t)), 0)
+    // Schreibzeiger ganz vorn und ganz hinten.
+    feld(&ed, (&hw[0]) as u64, 11)
+    textbuf.tb_set_range(t, 0, 0)
+    tippe(&ed, (&r1[0]) as u64, 2)
+    let x58: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    var hv1: [u8; 14] = "かhello world"
+    var l58: [u8; 30] = "4 Zeiger bei 0: かhello world"
+    text_s((&l58[0]) as u64, 30, &ed, (&hv1[0]) as u64, 14)
+    var l59: [u8; 21] = "4 Zeiger danach bei 3"
+    report((&l59[0]) as u64, 21, textbuf.tb_caret(t) == 3,
+        textbuf.tb_caret(t) as i64, 3)
+    feld(&ed, (&hw[0]) as u64, 11)
+    tippe(&ed, (&r1[0]) as u64, 2)
+    let x60: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    var hh1: [u8; 14] = "hello worldか"
+    var l60: [u8; 31] = "4 Zeiger bei 11: hello worldか"
+    text_s((&l60[0]) as u64, 31, &ed, (&hh1[0]) as u64, 14)
+
+    // ==================================================================
+    // 5. DIE AUSWAHL WIRD BEIM BESTAETIGEN ERSETZT
+    // ==================================================================
+    // "world" (6..11) ist ausgewaehlt. Waehrend der Eingabe bleibt es
+    // stehen, か kommt dahinter; erst Enter ersetzt es.
+    feld(&ed, (&hw[0]) as u64, 11)
+    textbuf.tb_set_range(t, 11, 6)
+    tippe(&ed, (&r1[0]) as u64, 2)
+    var l61: [u8; 38] = "5 waehrend der Eingabe: hello worldか"
+    text_s((&l61[0]) as u64, 38, &ed, (&hh1[0]) as u64, 14)
+    var l62: [u8; 32] = "5 gemerkte Auswahl beginnt bei 6"
+    report((&l62[0]) as u64, 32, ime.ime_repl_a(m) == 6,
+        ime.ime_repl_a(m) as i64, 6)
+    var l63: [u8; 18] = "5 und endet bei 11"
+    report((&l63[0]) as u64, 18, ime.ime_repl_b(m) == 11,
+        ime.ime_repl_b(m) as i64, 11)
+    let x64: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    var hr: [u8; 9] = "hello か"
+    var l64: [u8; 32] = "5 Enter ersetzt world: hello か"
+    text_s((&l64[0]) as u64, 32, &ed, (&hr[0]) as u64, 9)
+    var l65: [u8; 27] = "5 Schreibzeiger dahinter: 9"
+    report((&l65[0]) as u64, 27, textbuf.tb_caret(t) == 9,
+        textbuf.tb_caret(t) as i64, 9)
+    // Strg+Z nimmt das ganze Wort zurueck, nicht nur einen Buchstaben.
+    let z66: u32 = editor.editor_char(&ed, 122 as u32, editor.MOD_CTRL)
+    var l66: [u8; 35] = "5 Strg+Z danach: wieder hello world"
+    text_s((&l66[0]) as u64, 35, &ed, (&hw[0]) as u64, 11)
+    // Abbrechen gibt die Auswahl zurueck.
+    feld(&ed, (&hw[0]) as u64, 11)
+    textbuf.tb_set_range(t, 11, 6)
+    tippe(&ed, (&r1[0]) as u64, 2)
+    let x67: u32 = editor.editor_key(&ed, editor.KEY_ESC, 0 as u32)
+    var l67: [u8; 38] = "5 Esc: der Text ist wieder hello world"
+    text_s((&l67[0]) as u64, 38, &ed, (&hw[0]) as u64, 11)
+    var l68: [u8; 38] = "5 und die Auswahl beginnt wieder bei 6"
+    report((&l68[0]) as u64, 38, textbuf.tb_sel_a(t) == 6,
+        textbuf.tb_sel_a(t) as i64, 6)
+    var l69: [u8; 18] = "5 und endet bei 11"
+    report((&l69[0]) as u64, 18, textbuf.tb_sel_b(t) == 11,
+        textbuf.tb_sel_b(t) as i64, 11)
+
+    // ==================================================================
+    // 6. DIE KANDIDATEN DER KANA-EINGABE
+    // ==================================================================
+    // Ohne Woerterbuch gibt es genau zwei: Hiragana und Katakana.
+    leer(&ed)
+    var kn: [u8; 4] = "kana"
+    tippe(&ed, (&kn[0]) as u64, 4)
+    let u70: u32 = editor.editor_char(&ed, 32 as u32, 0 as u32)
+    var l70: [u8; 33] = "6 Leertaste oeffnet die Liste (1)"
+    report((&l70[0]) as u64, 33, ime.ime_cand_shown(m),
+        b2i(ime.ime_cand_shown(m)), 1)
+    var l71: [u8; 18] = "6 mit 2 Kandidaten"
+    report((&l71[0]) as u64, 18, ime.ime_cand_count(m) == 2,
+        ime.ime_cand_count(m) as i64, 2)
+    var kh: [u8; 6] = "かな"
+    var l72: [u8; 23] = "6 Kandidat 1 ist かな"
+    cand_s((&l72[0]) as u64, 23, &ed, 0, (&kh[0]) as u64, 6)
+    var kt: [u8; 6] = "カナ"
+    var l73: [u8; 23] = "6 Kandidat 2 ist カナ"
+    cand_s((&l73[0]) as u64, 23, &ed, 1, (&kt[0]) as u64, 6)
+    let d74: u32 = editor.editor_key(&ed, editor.KEY_DOWN, 0 as u32)
+    var l74: [u8; 36] = "6 Pfeil runter waehlt Kandidat 2 (1)"
+    report((&l74[0]) as u64, 36, ime.ime_cand_sel(m) == 1,
+        ime.ime_cand_sel(m) as i64, 1)
+    let d75: u32 = editor.editor_key(&ed, editor.KEY_UP, 0 as u32)
+    var l75: [u8; 34] = "6 Pfeil hoch wieder Kandidat 1 (0)"
+    report((&l75[0]) as u64, 34, ime.ime_cand_sel(m) == 0,
+        ime.ime_cand_sel(m) as i64, 0)
+    let d76: u32 = editor.editor_char(&ed, 50 as u32, 0 as u32)
+    var l76: [u8; 23] = "6 Ziffer 2 nimmt カナ"
+    text_s((&l76[0]) as u64, 23, &ed, (&kt[0]) as u64, 6)
+    var l77: [u8; 26] = "6 und bestaetigt damit (0)"
+    report((&l77[0]) as u64, 26, !ime.ime_on(m), b2i(ime.ime_on(m)), 0)
+    // Escape: erst die Liste zu, dann die Eingabe weg.
+    leer(&ed)
+    tippe(&ed, (&kn[0]) as u64, 4)
+    let u78: u32 = editor.editor_char(&ed, 32 as u32, 0 as u32)
+    let x78: u32 = editor.editor_key(&ed, editor.KEY_ESC, 0 as u32)
+    var l78: [u8; 40] = "6 erstes Esc schliesst nur die Liste (0)"
+    report((&l78[0]) as u64, 40, !ime.ime_cand_shown(m),
+        b2i(ime.ime_cand_shown(m)), 0)
+    var l79: [u8; 28] = "6 かな steht dabei noch da"
+    text_s((&l79[0]) as u64, 28, &ed, (&kh[0]) as u64, 6)
+    let x80: u32 = editor.editor_key(&ed, editor.KEY_ESC, 0 as u32)
+    var l80: [u8; 32] = "6 zweites Esc bricht ab: 0 Bytes"
+    report((&l80[0]) as u64, 32, textbuf.tb_len(t) == 0,
+        textbuf.tb_len(t) as i64, 0)
+    // Leertaste blaettert, Enter nimmt den gewaehlten.
+    tippe(&ed, (&kn[0]) as u64, 4)
+    let u81: u32 = editor.editor_char(&ed, 32 as u32, 0 as u32)
+    let u82: u32 = editor.editor_char(&ed, 32 as u32, 0 as u32)
+    let x81: u32 = editor.editor_key(&ed, editor.KEY_ENTER, 0 as u32)
+    var l81: [u8; 34] = "6 zweimal Leertaste, Enter: カナ"
+    text_s((&l81[0]) as u64, 34, &ed, (&kt[0]) as u64, 6)
+
+    // ==================================================================
+    // 7. PINYIN
+    // ==================================================================
+    var py1: [u8; 8] = "zhongguo"
+    var l82: [u8; 31] = "7 zhongguo beginnt mit zhong: 5"
+    let n82: usize = ime.py_prefix_len((&py1[0]) as u64, 8)
+    report((&l82[0]) as u64, 31, n82 == 5, n82 as i64, 5)
+    var py2: [u8; 3] = "iou"
+    var l83: [u8; 30] = "7 mit i beginnt keine Silbe: 0"
+    let n83: usize = ime.py_prefix_len((&py2[0]) as u64, 3)
+    report((&l83[0]) as u64, 30, n83 == 0, n83 as i64, 0)
+    editor.editor_ime_mode(&ed, ime.IME_PINYIN)
+    leer(&ed)
+    var py3: [u8; 5] = "nihao"
+    tippe(&ed, (&py3[0]) as u64, 5)
+    var l84: [u8; 31] = "7 nihao: die Liste steht da (1)"
+    report((&l84[0]) as u64, 31, ime.ime_cand_shown(m),
+        b2i(ime.ime_cand_shown(m)), 1)
+    var zn: [u8; 3] = "你"
+    var l85: [u8; 33] = "7 erster Kandidat fuer ni ist 你"
+    cand_s((&l85[0]) as u64, 33, &ed, 0, (&zn[0]) as u64, 3)
+    let d86: u32 = editor.editor_char(&ed, 49 as u32, 0 as u32)
+    var zh: [u8; 6] = "你hao"
+    var l86: [u8; 36] = "7 Ziffer 1: 你hao, hao bleibt offen"
+    text_s((&l86[0]) as u64, 36, &ed, (&zh[0]) as u64, 6)
+    var zo: [u8; 3] = "好"
+    var l87: [u8; 34] = "7 erster Kandidat fuer hao ist 好"
+    cand_s((&l87[0]) as u64, 34, &ed, 0, (&zo[0]) as u64, 3)
+    let u88: u32 = editor.editor_char(&ed, 32 as u32, 0 as u32)
+    var zz: [u8; 6] = "你好"
+    var l88: [u8; 29] = "7 Leertaste nimmt 好: 你好"
+    text_s((&l88[0]) as u64, 29, &ed, (&zz[0]) as u64, 6)
+    var l89: [u8; 36] = "7 und die Eingabe ist bestaetigt (0)"
+    report((&l89[0]) as u64, 36, !ime.ime_on(m), b2i(ime.ime_on(m)), 0)
+    // Der Apostroph trennt: xi'an ist xi + an, nicht xian.
+    leer(&ed)
+    var py4: [u8; 5] = "xi'an"
+    tippe(&ed, (&py4[0]) as u64, 5)
+    let d90: u32 = editor.editor_char(&ed, 49 as u32, 0 as u32)
+    var l90: [u8; 34] = "7 xi'an, Ziffer 1: 3 + 2 = 5 Bytes"
+    report((&l90[0]) as u64, 34, textbuf.tb_len(t) == 5,
+        textbuf.tb_len(t) as i64, 5)
+    var an: [u8; 2] = "an"
+    var l91: [u8; 37] = "7 dahinter bleibt an (ohne Apostroph)"
+    report_s((&l91[0]) as u64, 37, textbuf.tb_ptr(t) + 3 as u64, 2,
+        (&an[0]) as u64, 2)
+    let x91: u32 = editor.editor_key(&ed, editor.KEY_ESC, 0 as u32)
+    let x92: u32 = editor.editor_key(&ed, editor.KEY_ESC, 0 as u32)
+    // Die Tabelle, von aussen durchgezaehlt, gegen ihre eigenen Zahlen.
+    var silben: usize = 0
+    var zeichen: usize = 0
+    var laengste: usize = 0
+    var kaputt: usize = 0
+    py_zaehle(&silben, &zeichen, &laengste, &kaputt)
+    var l92: [u8; 28] = "7 die Tabelle hat 393 Silben"
+    report((&l92[0]) as u64, 28, silben == pinyin.PY_SILBEN && silben == 393,
+        silben as i64, 393)
+    var l93: [u8; 27] = "7 mit zusammen 3883 Zeichen"
+    report((&l93[0]) as u64, 27, zeichen == pinyin.PY_ZEICHEN && zeichen == 3883,
+        zeichen as i64, 3883)
+    var l94: [u8; 41] = "7 jedes davon 3 Bytes UTF-8: 0 Ausreisser"
+    report((&l94[0]) as u64, 41, kaputt == 0, kaputt as i64, 0)
+    var l95: [u8; 42] = "7 laengste Silbe hat hoechstens 64 Zeichen"
+    report((&l95[0]) as u64, 42, laengste <= ime.CAND_MAX,
+        laengste as i64, ime.CAND_MAX as i64)
+
+    // ==================================================================
+    // 8. DIE PLATTFORM
+    // ==================================================================
+    // Nach dem Muster der Zwischenablage: sie bekommt jede Taste zuerst.
+    editor.editor_ime_mode(&ed, ime.IME_OFF)
+    G_ED = (&ed) as u64
+    editor.editor_set_ime(&ed, p_filter, p_spot, p_reset)
+    leer(&ed)
+    let r96: u32 = editor.editor_char(&ed, 120 as u32, 0 as u32)
+    var l96: [u8; 33] = "8 die Plattform nimmt x: NONE (0)"
+    report((&l96[0]) as u64, 33, r96 == editor.RES_NONE, r96 as i64,
+        editor.RES_NONE as i64)
+    var l97: [u8; 32] = "8 ihr Filter wurde 1 Mal gerufen"
+    report((&l97[0]) as u64, 32, G_FILTER == 1, G_FILTER as i64, 1)
+    var nj: [u8; 6] = "日本"
+    var l98: [u8; 41] = "8 ihr Vorbearbeitungstext 日本 steht da"
+    text_s((&l98[0]) as u64, 41, &ed, (&nj[0]) as u64, 6)
+    var l99: [u8; 29] = "8 als Vorbearbeitung: 6 Bytes"
+    let v99: usize = textbuf.tb_comp_b(t) - textbuf.tb_comp_a(t)
+    report((&l99[0]) as u64, 29, v99 == 6, v99 as i64, 6)
+    editor.editor_ime_spot(&ed, 120.0, 40.0, 20.0)
+    var l100: [u8; 38] = "8 die Einfuegestelle kommt an: x = 120"
+    report((&l100[0]) as u64, 38, G_SPOT_X == 120.0, G_SPOT_X as i64, 120)
+    let r101: u32 = editor.editor_char(&ed, 121 as u32, 0 as u32)
+    var ng: [u8; 9] = "日本語"
+    var l101: [u8; 26] = "8 sie bestaetigt 日本語"
+    text_s((&l101[0]) as u64, 26, &ed, (&ng[0]) as u64, 9)
+    var l102: [u8; 33] = "8 danach keine Vorbearbeitung (0)"
+    report((&l102[0]) as u64, 33, !textbuf.tb_has_comp(t),
+        b2i(textbuf.tb_has_comp(t)), 0)
+    let r103: u32 = editor.editor_char(&ed, 120 as u32, 0 as u32)
+    let x103: u32 = editor.editor_key(&ed, editor.KEY_ESC, 0 as u32)
+    var l103: [u8; 41] = "8 Esc im Feld: die Plattform vergisst (2)"
+    report((&l103[0]) as u64, 41, G_RESET == 2 as u32, G_RESET as i64, 2)
+    var l104: [u8; 27] = "8 und 日本 ist wieder weg"
+    text_s((&l104[0]) as u64, 27, &ed, (&ng[0]) as u64, 9)
+    let r105: u32 = editor.editor_char(&ed, 97 as u32, 0 as u32)
+    var nga: [u8; 10] = "日本語a"
+    var l105: [u8; 33] = "8 a lehnt sie ab: es landet als a"
+    text_s((&l105[0]) as u64, 33, &ed, (&nga[0]) as u64, 10)
+
+    G_ED = 0
+    editor.editor_free(&ed)
+
+    // ---- das Urteil
+    var tz: rt.Buf = rt.buf_new()
+    var sz: [u8; 1] = "\n"
+    rt.buf_push_bytes(&tz, (&sz[0]) as u64, 1)
+    rt.buf_push_dec_i64(&tz, G_N as i64)
+    var sz2: [u8; 24] = " Behauptungen geprueft.\n"
+    rt.buf_push_bytes(&tz, (&sz2[0]) as u64, 24)
+    rt.write_everything(1, rt.buf_ptr(&tz), rt.buf_len(&tz))
+    rt.buf_free(&tz)
+    if G_ERRORS != 0 {
+        var bad: [u8; 13] = "\nIME FAILED.\n"
+        rt.write_everything(2, (&bad[0]) as u64, 13)
+        return 1
+    }
+    var end: [u8; 13] = "\nIME PASSED.\n"
+    rt.write_everything(1, (&end[0]) as u64, 13)
+    return 0
+}

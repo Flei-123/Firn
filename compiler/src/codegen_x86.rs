@@ -1206,6 +1206,9 @@ fn emit_inst(
             if args.len() > 7 {
                 return Err("syscall with more than 6 arguments".to_string());
             }
+            if crate::target::android() && emit_syscall_android(e, f, fr, i, args)? {
+                return Ok(());
+            }
             for (k, a) in args.iter().skip(1).enumerate() {
                 load_full(e, fr, SYS_REGS[k], *a);
             }
@@ -1668,4 +1671,94 @@ mod tests {
         assert!(asm.contains("mov qword ptr [rsp+8], rax"), "{}", asm);
         assert!(asm.contains("add rsp, 16"), "{}", asm);
     }
+}
+
+/// The constant a value is, if exactly one `const` defines it.
+fn const_of(f: &Func, v: Val) -> Option<i64> {
+    let mut found: Option<i64> = None;
+    let mut defs = 0;
+    for b in &f.blocks {
+        for ins in &b.insts {
+            if ins.dst == Some(v) {
+                defs += 1;
+                if let Op::Const(c) = &ins.op {
+                    found = Some(ins.ty.truncate(*c) as i64);
+                }
+            }
+        }
+    }
+    if defs == 1 {
+        found
+    } else {
+        None
+    }
+}
+
+/// FIRN r64 -- `--target=x86_64-android`: the legacy calls Android's
+/// seccomp filter refuses become their `*at` forms (syscalls.rs,
+/// `X86_ANDROID`), `poll` becomes `ppoll` with a timespec on the stack
+/// (a negative timeout -- "wait forever" -- becomes the NULL pointer).
+/// `Ok(false)` = not one of them, emit the call as it is.
+fn emit_syscall_android(
+    e: &mut Emitter,
+    f: &Func,
+    fr: &Frame,
+    i: &Inst,
+    args: &[Val],
+) -> Result<bool, String> {
+    let Some(nr) = const_of(f, args[0]) else {
+        return Ok(false);
+    };
+    let given = &args[1..];
+    if nr == 7 {
+        if given.len() < 3 {
+            return Err("x86_64-android: poll needs three arguments".to_string());
+        }
+        load_full(e, fr, "rax", given[2]);
+        e.line("mov r11, rax");
+        e.line("mov rcx, 1000");
+        e.line("cqo");
+        e.line("idiv rcx");
+        e.line("imul rdx, rdx, 1000000");
+        e.line("sub rsp, 16");
+        e.line("mov qword ptr [rsp], rax");
+        e.line("mov qword ptr [rsp + 8], rdx");
+        load_full(e, fr, "rdi", given[0]);
+        load_full(e, fr, "rsi", given[1]);
+        e.line("mov rdx, rsp");
+        e.line("xor ecx, ecx");
+        e.line("test r11, r11");
+        e.line("cmovs rdx, rcx");
+        e.line("xor r10d, r10d");
+        e.line("mov r8d, 8");
+        e.line("mov eax, 271");
+        e.line("syscall");
+        e.line("add rsp, 16");
+        if let Some(d) = i.dst {
+            store_dst(e, fr, d, "rax");
+        }
+        return Ok(true);
+    }
+    let Some((new_nr, form)) = crate::syscalls::x86_android(nr) else {
+        return Ok(false);
+    };
+    for (k, x) in form.iter().enumerate() {
+        match x {
+            crate::syscalls::X::A(j) => {
+                let v = given.get(*j).ok_or_else(|| {
+                    format!("x86_64-android: system call {} needs argument {}", nr, j + 1)
+                })?;
+                load_full(e, fr, SYS_REGS[k], *v);
+            }
+            crate::syscalls::X::I(c) => {
+                e.line(&format!("mov {}, {}", SYS_REGS[k], c));
+            }
+        }
+    }
+    e.line(&format!("mov eax, {}", new_nr));
+    e.line("syscall");
+    if let Some(d) = i.dst {
+        store_dst(e, fr, d, "rax");
+    }
+    Ok(true)
 }

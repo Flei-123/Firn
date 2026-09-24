@@ -74,6 +74,12 @@ export {
     drag_value,
     // Die Trefferpruefung, die ein anderer Ort stellt -- siehe unten.
     panel_hits, panel_set_hit, panel_clear_hit, hit_plain,
+    // Was den Fokus nehmen kann -- die EINE Regel dafuer, die auch
+    // lib/fui/a11y.fi fragt, statt eine eigene zu fuehren.
+    can_focus,
+    // Ein Panel ueber Widgets, die nicht dicht in einem Feld liegen
+    // (die Knoten eines scene.Scene), und eine geliehene Tab-Reihenfolge.
+    panel_attach_stride, panel_set_order, panel_clear_order,
 }
 
 // ===================================================== THE CHANGE BITS
@@ -123,12 +129,28 @@ struct Panel {
     // jemand kann die Frage besser beantworten als ich.
     zx: u64,       // der Zustand jener Antwort, ihr Eigentuemer ist der Aufrufer
     zh: fn(u64, *mut widget.Widget, f64, f64) -> bool,
+    // DER ABSTAND ZWISCHEN ZWEI WIDGETS IM FELD DES AUFRUFERS, in Bytes.
+    // 0 heisst: ein dichtes Feld von widget.Widget (die Vorgabe, wie
+    // es immer war). Ein beschriebener Baum haelt seine Widgets aber IN
+    // seinen Knoten (scene.Node traegt eines), und die liegen einen
+    // ganzen Knoten auseinander. Mit diesem Abstand bedient dasselbe
+    // Panel auch sie -- statt dass daneben eine zweite
+    // Fokusverwaltung fuer Baeume entsteht.
+    st: usize,
+    // DIE TAB-REIHENFOLGE, GELIEHEN. 0 heisst: die Reihenfolge des
+    // Feldes (die Vorgabe). Sonst die Adresse eines Feldes von usize,
+    // das `nord` Nummern von Widgets in der Reihenfolge nennt, in der
+    // Tab laufen soll -- lib/fui/a11y.fi rechnet sie aus der
+    // Baumreihenfolge aus. Das Feld gehoert dem Aufrufer; das Panel
+    // liest es nur, und WER den Fokus hat, steht weiterhin nur hier.
+    ord: u64,
+    nord: usize,
 }
 
 fn panel_new() -> Panel {
     return Panel { p: 0, n: 0, hot: NOBODY, press: NOBODY,
         focus: NOBODY, track: NOBODY, grab: 0,
-        zx: 0, zh: hit_plain }
+        zx: 0, zh: hit_plain, st: 0, ord: 0, nord: 0 }
 }
 
 // DIE VORGABE: das gerade Rechteck des Widgets, samt der Regel, dass
@@ -165,6 +187,31 @@ fn panel_attach(s: *mut Panel, p: u64, n: usize) {
     (*s).hot = NOBODY
     (*s).press = NOBODY
     (*s).track = NOBODY
+    (*s).st = 0
+    (*s).ord = 0
+    (*s).nord = 0
+}
+
+// DASSELBE MIT EINEM ABSTAND. `stride` ist der Abstand zweier Widgets
+// in Bytes und wird vom Aufrufer GEMESSEN (Differenz zweier Nachbarn
+// eines echten Feldes), nicht als Ziffer hingeschrieben -- dieselbe
+// Regel wie bei `widget_size` und layout.rect_stride.
+fn panel_attach_stride(s: *mut Panel, p: u64, n: usize, stride: usize) {
+    panel_attach(s, p, n)
+    (*s).st = stride
+}
+
+// Die Tab-Reihenfolge leihen: `ord` zeigt auf `n` Nummern (usize).
+// Nummern, die es im Panel nicht gibt, werden beim Wandern uebergangen,
+// statt ins Leere zu greifen.
+fn panel_set_order(s: *mut Panel, ord: u64, n: usize) {
+    (*s).ord = ord
+    (*s).nord = n
+}
+
+fn panel_clear_order(s: *mut Panel) {
+    (*s).ord = 0
+    (*s).nord = 0
 }
 
 fn panel_count(s: *mut Panel) -> usize { return (*s).n }
@@ -172,7 +219,11 @@ fn panel_count(s: *mut Panel) -> usize { return (*s).n }
 // The i-th widget. The arithmetic is the one the compiler would do --
 // it stands here because the array is held as a raw address.
 fn panel_widget(s: *mut Panel, i: usize) -> *mut widget.Widget {
-    return ((*s).p + ((i * widget_size()) as u64)) as *mut widget.Widget
+    var st: usize = (*s).st
+    if st == 0 {
+        st = widget_size()
+    }
+    return ((*s).p + ((i * st) as u64)) as *mut widget.Widget
 }
 
 // How big one widget is. `size_of` is not available in stage 0, so it
@@ -420,6 +471,9 @@ fn key_tab(s: *mut Panel, backwards: bool) -> u32 {
     if (*s).n == 0 {
         return CH_NONE
     }
+    if (*s).ord != 0 && (*s).nord > 0 {
+        return key_tab_order(s, backwards)
+    }
     var start: usize = (*s).focus
     var i: usize = 0
     while i < (*s).n {
@@ -444,6 +498,55 @@ fn key_tab(s: *mut Panel, backwards: bool) -> u32 {
         i = i + 1
     }
     return CH_NONE
+}
+
+// DASSELBE WANDERN UEBER DIE GELIEHENE REIHENFOLGE. Die Regeln sind
+// wortgleich mit `key_tab`: Uebersprungen wird, was `can_focus` ablehnt
+// (also auch alles Gesperrte, und zwar in dem Augenblick, in dem
+// gewandert wird -- ein Knopf, der erst nach dem Ausrechnen der
+// Reihenfolge gesperrt wurde, wird trotzdem uebersprungen), und am Ende
+// geht es vorn wieder los. Steht der Fokus gerade auf keinem Widget der
+// Reihenfolge, beginnt Tab beim ersten und Umschalt+Tab beim letzten.
+fn key_tab_order(s: *mut Panel, backwards: bool) -> u32 {
+    let m: usize = (*s).nord
+    var pos: usize = NOBODY
+    var k: usize = 0
+    while k < m {
+        if order_at(s, k) == (*s).focus {
+            pos = k
+        }
+        k = k + 1
+    }
+    var i: usize = 0
+    while i < m {
+        var j: usize = 0
+        if pos == NOBODY {
+            if backwards {
+                j = m - 1 - i
+            } else {
+                j = i
+            }
+        } else {
+            if backwards {
+                j = (pos + m - 1 - i) % m
+            } else {
+                j = (pos + 1 + i) % m
+            }
+        }
+        let w: usize = order_at(s, j)
+        if w < (*s).n && can_focus(panel_widget(s, w)) {
+            return panel_set_focus(s, w)
+        }
+        i = i + 1
+    }
+    return CH_NONE
+}
+
+// Die k-te Nummer der geliehenen Reihenfolge. Die 8 ist die Breite
+// eines usize und aendert sich nicht, wenn jemand einer Struktur ein
+// Feld hinzufuegt.
+fn order_at(s: *mut Panel, k: usize) -> usize {
+    return *(((*s).ord + (k * 8) as u64) as *mut usize)
 }
 
 // What can take the focus. A label cannot -- it does nothing, and a

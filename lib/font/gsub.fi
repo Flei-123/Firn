@@ -1,0 +1,448 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/font/gsub.fi -- DIE GLYPHENERSETZUNG (OpenType GSUB), SO WEIT EINE
+// OBERFLAECHE SIE FUER ARABISCH BRAUCHT.
+//
+// ========================================================= WARUM ES DAS GIBT
+//
+// Ein arabischer Buchstabe hat bis zu vier Gestalten -- allein, am
+// Wortanfang, in der Mitte, am Ende --, und welche davon gemalt wird,
+// steht NICHT im Text: im Text steht immer derselbe Codepunkt (U+0628
+// BEH), die Gestalt ergibt sich aus den Nachbarn. Welche Glyphe der
+// Schrift zu welcher Gestalt gehoert, sagt die Schrift selbst, in ihrer
+// GSUB-Tabelle: das Merkmal `init` ersetzt die Grundglyphe durch die
+// Anfangsglyphe, `medi`, `fina` und `isol` entsprechend, und `rlig`
+// verschmilzt Lam und Alif zu der Ligatur, ohne die Arabisch falsch
+// aussieht. WELCHE Stelle welches Merkmal bekommt, rechnet
+// lib/fui/shape.fi aus den Verbindungsarten der UCD aus; diese Datei
+// fuehrt nur aus, was die Schrift dazu sagt.
+//
+// ============================================================ WAS GELESEN WIRD
+//
+//   ScriptList    die Schrift `arab`, ihr DefaultLangSys (Sprachen werden
+//                 nicht unterschieden -- eine Oberflaeche weiss nicht, ob
+//                 ein Wort Urdu oder Arabisch ist)
+//   FeatureList   isol, fina, init, medi, rlig, liga und das Pflicht-
+//                 merkmal des LangSys
+//   LookupList    Typ 1 (Einzelersetzung, Format 1 und 2), Typ 4
+//                 (Ligatur) und Typ 7 (die Erweiterung, die auf einen der
+//                 beiden zeigt)
+//   Coverage      Format 1 und 2
+//   GDEF          die Glyphenklasse (Format 1 und 2) -- fuer das
+//                 Suchflag IgnoreMarks: ein Vokalzeichen zwischen Lam und
+//                 Alif darf die Ligatur nicht verhindern
+//
+// WAS NICHT GELESEN WIRD, und es steht hier, statt still zu fehlen:
+// Typ 2, 3, 5, 6 und 8 (Mehrfach-, Alternativ-, Kontext- und
+// Rueckwaertsersetzung). DejaVu Sans fuehrt fuer `arab` zwei solche
+// Kontext-Lookups unter `ccmp` (die Zerlegung von Zeichen mit Hamza); sie
+// werden uebersprungen, und das Ergebnis ist das vorzusammengesetzte
+// Zeichen statt der zerlegten Form -- lesbar und richtig, nur nicht
+// feiner. GPOS (die Lage der Vokalzeichen) wird ebenfalls nicht gelesen;
+// wie Vokalzeichen trotzdem an der richtigen Stelle landen, steht in
+// lib/fui/painter.fi beim Bidi-Weg.
+//
+// Keine Zuteilung, keine Kopie der Tabelle: alles wird bei jeder Frage
+// aus den Oktetten der Schrift gelesen, genau wie in ttf.fi. `gsub_init`
+// merkt sich nur, WELCHE Lookups fuer welches Merkmal gelten.
+import font.ttf
+
+export {
+    Gsub, gsub_new, gsub_init, gsub_ok, gsub_count,
+    gsub_lookup_index, gsub_lookup_mask, gsub_lookup_type,
+    gsub_lookup_ignores_marks, gsub_single, gsub_ligature,
+    gsub_is_mark,
+    F_ISOL, F_FINA, F_INIT, F_MEDI, F_RLIG, F_LIGA, F_RQD,
+    MAX_LOOKUPS,
+}
+
+// Die Merkmale als Bits. isol/fina/init/medi gelten nur an Stellen mit
+// dieser Gestalt, die drei anderen an jeder arabischen Stelle.
+const F_ISOL: u32 = 1
+const F_FINA: u32 = 2
+const F_INIT: u32 = 4
+const F_MEDI: u32 = 8
+const F_RLIG: u32 = 16
+const F_LIGA: u32 = 32
+const F_RQD: u32 = 64
+
+// So viele Lookups merkt sich `gsub_init` hoechstens. DejaVu Sans braucht
+// fuer `arab` neun.
+const MAX_LOOKUPS: usize = 48
+
+// Das Suchflag IgnoreMarks aus dem Lookup-Kopf.
+const LF_IGNORE_MARKS: u32 = 8
+
+struct Gsub {
+    ok: usize,
+    base: usize,       // Anfang der GSUB-Tabelle in der Datei
+    lookups: usize,    // Anfang der LookupList
+    classdef: usize,   // Anfang der Glyphenklassen in GDEF, 0 = keine
+    n: usize,
+    idx: [u16; 48],    // Lookup-Nummern, aufsteigend (= Anwendungsfolge)
+    mask: [u32; 48],   // fuer welche Merkmale sie gelten
+}
+
+#[no_gc]
+fn gsub_new() -> Gsub {
+    return Gsub {
+        ok: 0, base: 0, lookups: 0, classdef: 0, n: 0,
+        idx: [0; 48], mask: [0; 48],
+    }
+}
+
+#[no_gc]
+fn gsub_ok(g: *mut Gsub) -> bool { return (*g).ok != 0 }
+
+#[no_gc]
+fn gsub_count(g: *mut Gsub) -> usize { return (*g).n }
+
+#[no_gc]
+fn gsub_lookup_index(g: *mut Gsub, k: usize) -> u32 {
+    return (*g).idx[k] as u32
+}
+
+#[no_gc]
+fn gsub_lookup_mask(g: *mut Gsub, k: usize) -> u32 {
+    return (*g).mask[k]
+}
+
+#[no_gc]
+fn u16at(f: *mut ttf.Font, off: usize) -> u32 {
+    return ttf.font_u16(f, off)
+}
+
+#[no_gc]
+fn tag_is(f: *mut ttf.Font, off: usize, a: u32, b: u32, c: u32,
+    d: u32) -> bool {
+    return u16at(f, off) == (a << 8 | b) && u16at(f, off + 2) == (c << 8 | d)
+}
+
+// Welches Merkmalsbit hat der Eintrag an `rec` (Tag in vier Oktetten)?
+#[no_gc]
+fn feature_bit(f: *mut ttf.Font, rec: usize) -> u32 {
+    if tag_is(f, rec, 105, 115, 111, 108) { return F_ISOL }   // isol
+    if tag_is(f, rec, 102, 105, 110, 97) { return F_FINA }    // fina
+    if tag_is(f, rec, 105, 110, 105, 116) { return F_INIT }   // init
+    if tag_is(f, rec, 109, 101, 100, 105) { return F_MEDI }   // medi
+    if tag_is(f, rec, 114, 108, 105, 103) { return F_RLIG }   // rlig
+    if tag_is(f, rec, 108, 105, 103, 97) { return F_LIGA }    // liga
+    return 0
+}
+
+// Ein Lookup mit Merkmal `bit` aufnehmen; die Liste bleibt aufsteigend
+// sortiert, ein zweites Merkmal fuer denselben Lookup wird dazugeodert.
+#[no_gc]
+fn add_lookup(g: *mut Gsub, li: u32, bit: u32) {
+    var k: usize = 0
+    while k < (*g).n {
+        if (*g).idx[k] as u32 == li {
+            (*g).mask[k] = (*g).mask[k] | bit
+            return
+        }
+        k = k + 1
+    }
+    if (*g).n >= MAX_LOOKUPS {
+        return
+    }
+    var q: usize = (*g).n
+    while q > 0 && (*g).idx[q - 1] as u32 > li {
+        (*g).idx[q] = (*g).idx[q - 1]
+        (*g).mask[q] = (*g).mask[q - 1]
+        q = q - 1
+    }
+    (*g).idx[q] = li as u16
+    (*g).mask[q] = bit
+    (*g).n = (*g).n + 1
+}
+
+#[no_gc]
+fn add_feature(f: *mut ttf.Font, g: *mut Gsub, flist: usize, fi: u32,
+    bit: u32) {
+    let nfeat: u32 = u16at(f, flist)
+    if fi >= nfeat {
+        return
+    }
+    let rec: usize = flist + 2 + (fi as usize) * 6
+    let feat: usize = flist + u16at(f, rec + 4) as usize
+    let nl: u32 = u16at(f, feat + 2)
+    var k: u32 = 0
+    while k < nl {
+        add_lookup(g, u16at(f, feat + 4 + (k as usize) * 2), bit)
+        k = k + 1
+    }
+}
+
+// DIE LISTE DER LOOKUPS FUER DIE SCHRIFT `arab`. false, wenn die Schrift
+// keine GSUB-Tabelle hat oder darin kein `arab` steht -- dann nimmt
+// lib/fui/shape.fi die Naeherung ueber die Darstellungsformen.
+#[no_gc]
+fn gsub_init(f: *mut ttf.Font, g: *mut Gsub) -> bool {
+    (*g).ok = 0
+    (*g).n = 0
+    var o: usize = 0
+    var l: usize = 0
+    if !ttf.font_table(f, 71, 83, 85, 66, &o, &l) {     // GSUB
+        return false
+    }
+    (*g).base = o
+    let slist: usize = o + u16at(f, o + 4) as usize
+    let flist: usize = o + u16at(f, o + 6) as usize
+    (*g).lookups = o + u16at(f, o + 8) as usize
+    let ns: u32 = u16at(f, slist)
+    var script: usize = 0
+    var k: u32 = 0
+    while k < ns {
+        let rec: usize = slist + 2 + (k as usize) * 6
+        if tag_is(f, rec, 97, 114, 97, 98) {             // arab
+            script = slist + u16at(f, rec + 4) as usize
+        }
+        k = k + 1
+    }
+    if script == 0 {
+        return false
+    }
+    let dls: u32 = u16at(f, script)
+    if dls == 0 as u32 {
+        return false
+    }
+    let ls: usize = script + dls as usize
+    let req: u32 = u16at(f, ls + 2)
+    if req != 0xFFFF as u32 {
+        add_feature(f, g, flist, req, F_RQD)
+    }
+    let nfi: u32 = u16at(f, ls + 4)
+    var j: u32 = 0
+    while j < nfi {
+        let fi: u32 = u16at(f, ls + 6 + (j as usize) * 2)
+        if fi < u16at(f, flist) {
+            let rec2: usize = flist + 2 + (fi as usize) * 6
+            let bit: u32 = feature_bit(f, rec2)
+            if bit != 0 as u32 {
+                add_feature(f, g, flist, fi, bit)
+            }
+        }
+        j = j + 1
+    }
+    // GDEF, fuer IgnoreMarks. Fehlt es, gilt keine Glyphe als Zeichen --
+    // dann matcht eine Ligatur eben nur ohne Vokal dazwischen.
+    (*g).classdef = 0
+    var go: usize = 0
+    var gl: usize = 0
+    if ttf.font_table(f, 71, 68, 69, 70, &go, &gl) {    // GDEF
+        let cd: u32 = u16at(f, go + 4)
+        if cd != 0 as u32 {
+            (*g).classdef = go + cd as usize
+        }
+    }
+    (*g).ok = 1
+    return (*g).n > 0
+}
+
+// ------------------------------------------------------------ Coverage
+
+// Die Stelle einer Glyphe in einer Coverage-Tabelle, -1 wenn nicht darin.
+#[no_gc]
+fn coverage(f: *mut ttf.Font, cov: usize, gid: u32) -> i32 {
+    let fmt: u32 = u16at(f, cov)
+    let cnt: usize = u16at(f, cov + 2) as usize
+    var lo: usize = 0
+    var hi: usize = cnt
+    if fmt == 1 as u32 {
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let v: u32 = u16at(f, cov + 4 + mid * 2)
+            if v == gid {
+                return mid as i32
+            }
+            if v < gid {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        return 0 - 1
+    }
+    if fmt == 2 as u32 {
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let r: usize = cov + 4 + mid * 6
+            let s: u32 = u16at(f, r)
+            let e: u32 = u16at(f, r + 2)
+            if gid < s {
+                hi = mid
+            } else if gid > e {
+                lo = mid + 1
+            } else {
+                return (u16at(f, r + 4) + (gid - s)) as i32
+            }
+        }
+    }
+    return 0 - 1
+}
+
+// ------------------------------------------------------------ GDEF
+
+// Ist die Glyphe ein Kombinationszeichen (Glyphenklasse 3)?
+#[no_gc]
+fn gsub_is_mark(f: *mut ttf.Font, g: *mut Gsub, gid: u32) -> bool {
+    let cd: usize = (*g).classdef
+    if cd == 0 {
+        return false
+    }
+    let fmt: u32 = u16at(f, cd)
+    if fmt == 1 as u32 {
+        let start: u32 = u16at(f, cd + 2)
+        let cnt: u32 = u16at(f, cd + 4)
+        if gid < start || gid >= start + cnt {
+            return false
+        }
+        return u16at(f, cd + 6 + ((gid - start) as usize) * 2) == 3 as u32
+    }
+    if fmt == 2 as u32 {
+        var lo: usize = 0
+        var hi: usize = u16at(f, cd + 2) as usize
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let r: usize = cd + 4 + mid * 6
+            let s: u32 = u16at(f, r)
+            let e: u32 = u16at(f, r + 2)
+            if gid < s {
+                hi = mid
+            } else if gid > e {
+                lo = mid + 1
+            } else {
+                return u16at(f, r + 4) == 3 as u32
+            }
+        }
+    }
+    return false
+}
+
+// ------------------------------------------------------------ Lookups
+
+#[no_gc]
+fn lookup_at(f: *mut ttf.Font, g: *mut Gsub, k: usize) -> usize {
+    let li: usize = (*g).idx[k] as usize
+    return (*g).lookups + u16at(f, (*g).lookups + 2 + li * 2) as usize
+}
+
+// Der Typ eines Lookups -- bei Typ 7 der Typ, auf den er verweist.
+#[no_gc]
+fn gsub_lookup_type(f: *mut ttf.Font, g: *mut Gsub, k: usize) -> u32 {
+    let lk: usize = lookup_at(f, g, k)
+    let ty: u32 = u16at(f, lk)
+    if ty == 7 as u32 && u16at(f, lk + 4) > 0 as u32 {
+        let st: usize = lk + u16at(f, lk + 6) as usize
+        return u16at(f, st + 2)
+    }
+    return ty
+}
+
+#[no_gc]
+fn gsub_lookup_ignores_marks(f: *mut ttf.Font, g: *mut Gsub,
+    k: usize) -> bool {
+    let lk: usize = lookup_at(f, g, k)
+    return (u16at(f, lk + 2) & LF_IGNORE_MARKS) != 0 as u32
+}
+
+// Die Unterabelle `s` des Lookups, bei Typ 7 durch die Erweiterung
+// hindurch.
+#[no_gc]
+fn subtable(f: *mut ttf.Font, lk: usize, s: usize) -> usize {
+    let st: usize = lk + u16at(f, lk + 6 + s * 2) as usize
+    if u16at(f, lk) == 7 as u32 {
+        return st + ttf.font_u32(f, st + 4) as usize
+    }
+    return st
+}
+
+// EINZELERSETZUNG (Typ 1). Die neue Glyphe, oder `gid` selbst.
+#[no_gc]
+fn gsub_single(f: *mut ttf.Font, g: *mut Gsub, k: usize, gid: u32) -> u32 {
+    let lk: usize = lookup_at(f, g, k)
+    let ns: usize = u16at(f, lk + 4) as usize
+    var s: usize = 0
+    while s < ns {
+        let st: usize = subtable(f, lk, s)
+        let fmt: u32 = u16at(f, st)
+        let ci: i32 = coverage(f, st + u16at(f, st + 2) as usize, gid)
+        if ci >= 0 {
+            if fmt == 1 as u32 {
+                // deltaGlyphID ist vorzeichenbehaftet; modulo 65536
+                // gerechnet ist das dasselbe wie die Addition.
+                return (gid + u16at(f, st + 4)) & 0xFFFF as u32
+            }
+            if fmt == 2 as u32 {
+                if (ci as u32) < u16at(f, st + 4) {
+                    return u16at(f, st + 6 + (ci as usize) * 2)
+                }
+            }
+        }
+        s = s + 1
+    }
+    return gid
+}
+
+// LIGATUR (Typ 4). `gids` sind die Glyphen der Folge ab der ersten
+// Komponente, `skip[i] != 0` heisst "diese Stelle gibt es nicht mehr"
+// (schon in einer Ligatur aufgegangen). Passt eine Ligatur, kommt ihre
+// Glyphe zurueck und `used` bekommt die Stellen der weiteren Komponenten
+// (hoechstens `cap`), `nused` ihre Zahl; sonst 0.
+#[no_gc]
+fn gsub_ligature(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
+    skip: u64, n: usize, at: usize, used: u64, cap: usize,
+    nused: *mut usize) -> u32 {
+    *nused = 0
+    let lk: usize = lookup_at(f, g, k)
+    let ign: bool = (u16at(f, lk + 2) & LF_IGNORE_MARKS) != 0 as u32
+    let first: u32 = *((gids + (at * 4) as u64) as *mut u32)
+    let ns: usize = u16at(f, lk + 4) as usize
+    var s: usize = 0
+    while s < ns {
+        let st: usize = subtable(f, lk, s)
+        let ci: i32 = coverage(f, st + u16at(f, st + 2) as usize, first)
+        if ci >= 0 && (ci as u32) < u16at(f, st + 4) {
+            let set: usize = st + u16at(f, st + 6 + (ci as usize) * 2) as usize
+            let nlig: usize = u16at(f, set) as usize
+            var li: usize = 0
+            while li < nlig {
+                let lig: usize = set + u16at(f, set + 2 + li * 2) as usize
+                let comp: usize = u16at(f, lig + 2) as usize
+                var ok: bool = comp >= 1 && comp - 1 <= cap
+                var c: usize = 1
+                var pos: usize = at + 1
+                while ok && c < comp {
+                    // die naechste Stelle, die es noch gibt und die kein
+                    // uebersprungenes Zeichen ist
+                    while pos < n {
+                        if *((skip + pos as u64) as *mut u8) != 0 as u8 {
+                            pos = pos + 1
+                        } else if ign && gsub_is_mark(f, g,
+                            *((gids + (pos * 4) as u64) as *mut u32)) {
+                            pos = pos + 1
+                        } else {
+                            break
+                        }
+                    }
+                    if pos >= n {
+                        ok = false
+                    } else if *((gids + (pos * 4) as u64) as *mut u32)
+                        != u16at(f, lig + 4 + (c - 1) * 2) {
+                        ok = false
+                    } else {
+                        *((used + ((c - 1) * 4) as u64) as *mut u32) = pos as u32
+                        pos = pos + 1
+                        c = c + 1
+                    }
+                }
+                if ok {
+                    *nused = comp - 1
+                    return u16at(f, lig)
+                }
+                li = li + 1
+            }
+        }
+        s = s + 1
+    }
+    return 0
+}

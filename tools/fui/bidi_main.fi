@@ -1,0 +1,773 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/bidi_main.fi -- DIE ZWEIRICHTUNGSSCHRIFT, VON HAND NACHGERECHNET.
+//
+// ====================================================== WARUM ES SIE GIBT
+//
+// tools/fui/bidiconf_main.fi haelt lib/fui/bidi.fi gegen die 91.707
+// Faelle des Unicode-Konsortiums -- das zeigt, dass die Regeln in den
+// Ecken stimmen. Diese Datei zeigt etwas anderes: dass ein MENSCH, der
+// UAX #9 mit Bleistift durchgeht, auf dieselben Zahlen kommt wie das
+// Programm, und zwar an allen Stellen, an denen fUi die Richtung
+// beruehrt -- die Klassen aus der UCD, die Ebenen und die Reihenfolge,
+// der Umbruch, die arabischen Gestalten, die Breiten, die der Maler
+// misst, die Schreibmarke und die Pfeiltasten im Textfeld.
+//
+// Jeder Sollwert unten ist VON HAND bestimmt; wie, steht jeweils
+// daneben. Die Schreibweise der Faelle ist die der Spezifikation:
+//
+//   A..Z   hebraeische Buchstaben U+05D0.. (Klasse R)
+//   a..z   lateinische Buchstaben (L)
+//   0..9   europaeische Ziffern (EN)
+//   ~ ^    arabische Buchstaben Beh U+0628 und Lam U+0644 (AL)
+//   |      die arabisch-indische Eins U+0661 (AN)
+//   > `    die Isolate RLI U+2067 und LRI U+2066, < ist PDI U+2069
+//   *      das hebraeische Vokalzeichen Qamats U+05B8 (NSM)
+//   sonst  das ASCII-Zeichen selbst (Leerzeichen WS, + ES, , CS, $ ET,
+//          & und ! ON, Klammern ON mit Klammerpaar)
+//
+// Die Reihenfolge auf dem Schirm wird in derselben Schreibweise
+// ausgegeben, und zwar mit Regel L4: eine Klammer auf ungerader Ebene
+// steht gespiegelt da. "(DC)BA" heisst also: so sieht es aus.
+//
+// Die Breiten rechnet der Maler bei 2048 Punkt Schriftgroesse. DejaVu
+// Sans hat 2048 Einheiten je Geviert, eine Einheit ist dann ein Punkt,
+// und die Sollwerte sind die Vorschuebe aus der hmtx-Tabelle der Schrift
+// (DejaVu Sans 2.37, mit fontTools ausgelesen, nicht mit diesem Code):
+//
+//   U+05D0 1369   U+05D1 1184   U+05D2 844   U+0020 651
+//   a 1255   b 1300
+//   U+FE91 570 (Beh anfangs)   U+FEB4 1827 (Seen mittig)
+//   U+FEE2 1363 (Meem endend)  U+FEFB 1168 (Lam-Alif isoliert)
+//   U+0628 1928   U+0633 2500   U+0645 1268 (die Grundformen)
+import std.rt
+import str.ucd_bidi
+import font.metrics
+import font.ttf
+import font.gsub
+import paint.canvas
+import fui.bidi
+import fui.shape
+import fui.painter
+import fui.textbuf
+import fui.editor
+
+static mut G_ERRORS: usize = 0
+static mut G_CHECKS: usize = 0
+
+const FONTSET_BYTES: usize = 4096
+const CAP: usize = 64
+
+fn head(nm: u64, nn: usize, ok: bool, t: *mut rt.Buf) {
+    rt.buf_push_bytes(t, nm, nn)
+    var i: usize = nn
+    while i < 46 {
+        rt.buf_push(t, 32 as u8)
+        i = i + 1
+    }
+    G_CHECKS = G_CHECKS + 1
+    if ok {
+        var o: [u8; 3] = "OK "
+        rt.buf_push_bytes(t, (&o[0]) as u64, 3)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var h1: [u8; 5] = " got "
+    rt.buf_push_bytes(t, (&h1[0]) as u64, 5)
+}
+
+fn report(nm: u64, nn: usize, ok: bool, got: i64, want: i64) {
+    var t: rt.Buf = rt.buf_new()
+    head(nm, nn, ok, &t)
+    rt.buf_push_dec_i64(&t, got)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, want)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// Die gewoehnliche Pruefung: die Zahl gegen den von Hand bestimmten
+// Sollwert.
+fn check(nm: u64, nn: usize, got: i64, want: i64) {
+    report(nm, nn, got == want, got, want)
+}
+
+fn same(a: u64, an: usize, b: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if *((a + i as u64) as *mut u8) != *((b + i as u64) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn report_s(nm: u64, nn: usize, got: u64, gn: usize, want: u64, wn: usize) {
+    var t: rt.Buf = rt.buf_new()
+    head(nm, nn, same(got, gn, want, wn), &t)
+    rt.buf_push_bytes(&t, got, gn)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_bytes(&t, want, wn)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn b2i(b: bool) -> i64 {
+    if b { return 1 }
+    return 0
+}
+
+fn r8(p: u64, i: usize) -> u8 { return *((p + i as u64) as *mut u8) }
+fn w8(p: u64, i: usize, v: u8) { *((p + i as u64) as *mut u8) = v }
+fn r32(p: u64, i: usize) -> u32 { return *((p + (i * 4) as u64) as *mut u32) }
+fn w32(p: u64, i: usize, v: u32) { *((p + (i * 4) as u64) as *mut u32) = v }
+
+// ------------------------------------------------------ die Schreibweise
+fn cp_of(ch: u8) -> u32 {
+    if ch >= 65 as u8 && ch <= 90 as u8 {
+        return 0x5D0 + (ch - 65 as u8) as u32
+    }
+    if ch == 126 as u8 { return 0x628 }       // ~
+    if ch == 94 as u8 { return 0x644 }        // ^
+    if ch == 124 as u8 { return 0x661 }       // |
+    if ch == 62 as u8 { return 0x2067 }       // >
+    if ch == 96 as u8 { return 0x2066 }       // `
+    if ch == 60 as u8 { return 0x2069 }       // <
+    if ch == 42 as u8 { return 0x5B8 }        // *
+    return ch as u32
+}
+
+fn ch_of(cp: u32) -> u8 {
+    if cp >= 0x5D0 as u32 && cp <= 0x5E9 as u32 {
+        return (cp - 0x5D0 + 65) as u8
+    }
+    if cp == 0x628 as u32 { return 126 as u8 }
+    if cp == 0x644 as u32 { return 94 as u8 }
+    if cp == 0x661 as u32 { return 124 as u8 }
+    if cp == 0x2067 as u32 { return 62 as u8 }
+    if cp == 0x2066 as u32 { return 96 as u8 }
+    if cp == 0x2069 as u32 { return 60 as u8 }
+    if cp == 0x5B8 as u32 { return 42 as u8 }
+    if cp < 128 as u32 { return cp as u8 }
+    return 63 as u8
+}
+
+// Der Arbeitsplatz fuer bidi.fi.
+struct Lab {
+    t: u64,
+    cp: u64,
+    c0: u64,
+    c1: u64,
+    lv: u64,
+    pl: u64,
+    wk: u64,
+    ll: u64,
+    ord: u64,
+    lvs: u64,   // die Ebenen als Ziffern
+    vis: u64,   // die Reihenfolge in der Schreibweise
+    n: usize,
+    para: u8,
+}
+
+fn lab_new(t: u64) -> Lab {
+    return Lab {
+        t: t, cp: rt.heap_alloc(CAP * 4), c0: rt.heap_alloc(CAP),
+        c1: rt.heap_alloc(CAP), lv: rt.heap_alloc(CAP),
+        pl: rt.heap_alloc(CAP), wk: rt.heap_alloc(bidi.bidi_work_bytes(CAP)),
+        ll: rt.heap_alloc(CAP), ord: rt.heap_alloc(CAP * 4),
+        lvs: rt.heap_alloc(CAP), vis: rt.heap_alloc(CAP), n: 0,
+        para: 0 as u8,
+    }
+}
+
+// Einen Absatz in der Schreibweise aufloesen und die Zeile from..to-1
+// legen. Danach stehen in `lvs` die Ebenen der Zeile (nach L1) als
+// Ziffern und in `vis` die Zeile auf dem Schirm.
+fn run_line(k: *mut Lab, dir: u32, s: u64, n: usize, from: usize,
+    to: usize) {
+    var i: usize = 0
+    while i < n {
+        w32((*k).cp, i, cp_of(r8(s, i)))
+        i = i + 1
+    }
+    (*k).n = n
+    var bp: bidi.BidiPara = bidi.bidi_new((*k).t, (*k).cp, n, (*k).c0,
+        (*k).c1, (*k).lv, (*k).pl, (*k).wk)
+    (*k).para = bidi.bidi_run(&bp, dir)
+    bidi.bidi_line_levels(&bp, from, to, (*k).ll)
+    bidi.bidi_reorder((*k).ll, to - from, (*k).ord)
+    var j: usize = 0
+    while j < to - from {
+        w8((*k).lvs, j, r8((*k).ll, j) + 48 as u8)
+        let li: usize = from + r32((*k).ord, j) as usize
+        var c: u32 = r32((*k).cp, li)
+        if (r8((*k).ll, li - from) & 1 as u8) != 0 as u8 {
+            c = ucd_bidi.ucd_mirror((*k).t, c)
+        }
+        w8((*k).vis, j, ch_of(c))
+        j = j + 1
+    }
+}
+
+// Ein ganzer Fall: Absatzebene, Ebenen, Reihenfolge -- drei Zeilen.
+fn case3(k: *mut Lab, nm: u64, nn: usize, dir: u32, s: u64, n: usize,
+    want_para: i64, wl: u64, wv: u64) {
+    run_line(k, dir, s, n, 0, n)
+    var t1: [u8; 44] = "   Absatzebene                              "
+    report((&t1[0]) as u64, 43, (*k).para as i64 == want_para,
+        (*k).para as i64, want_para)
+    report_s(nm, nn, (*k).lvs, n, wl, n)
+    var t2: [u8; 44] = "   Schirm                                   "
+    report_s((&t2[0]) as u64, 43, (*k).vis, n, wv, n)
+}
+
+fn mess_none(c: u64, p: u64, i: usize) -> f64 { return 0.0 }
+
+fn main() -> i32 {
+    let t: u64 = ucd_bidi.ucd_bidi_map()
+    if t == 0 {
+        return 2
+    }
+
+    // ==================================================================
+    // 1. DIE KLASSEN AUS DER UCD (lib/str/ucd_bidi.fi)
+    // ==================================================================
+    // Sollwerte aus UnicodeData.txt Feld 4 bzw. den anderen Dateien,
+    // abgelesen; die Nummern sind die von ucd_bidi.BIDI_*.
+    var k1: [u8; 44] = "1 a (U+0061) ist L = 0                      "
+    check((&k1[0]) as u64, 43, ucd_bidi.ucd_bidi_class(t, 0x61 as u32) as i64, 0)
+    var k2: [u8; 44] = "1 Alef U+05D0 ist R = 1                     "
+    check((&k2[0]) as u64, 43, ucd_bidi.ucd_bidi_class(t, 0x5D0 as u32) as i64, 1)
+    var k3: [u8; 44] = "1 Alif U+0627 ist AL = 2                    "
+    check((&k3[0]) as u64, 43, ucd_bidi.ucd_bidi_class(t, 0x627 as u32) as i64, 2)
+    var k4: [u8; 44] = "1 U+0661 (arab. Eins) ist AN = 6            "
+    check((&k4[0]) as u64, 43, ucd_bidi.ucd_bidi_class(t, 0x661 as u32) as i64, 6)
+    var k5: [u8; 44] = "1 unbelegtes U+05FF ist R (@missing) = 1    "
+    check((&k5[0]) as u64, 43, ucd_bidi.ucd_bidi_class(t, 0x5FF as u32) as i64, 1)
+    var k6: [u8; 44] = "1 Beh U+0628 verbindet beidseitig D = 3     "
+    check((&k6[0]) as u64, 43, ucd_bidi.ucd_joining(t, 0x628 as u32) as i64, 3)
+    var k7: [u8; 44] = "1 Alif U+0627 nur nach rechts R = 1         "
+    check((&k7[0]) as u64, 43, ucd_bidi.ucd_joining(t, 0x627 as u32) as i64, 1)
+    var k8: [u8; 44] = "1 Fatha U+064E ist durchsichtig T = 5       "
+    check((&k8[0]) as u64, 43, ucd_bidi.ucd_joining(t, 0x64E as u32) as i64, 5)
+    var k9: [u8; 44] = "1 Spiegelbild von ( ist ) = 41              "
+    check((&k9[0]) as u64, 43, ucd_bidi.ucd_mirror(t, 0x28 as u32) as i64, 41)
+    var k10: [u8; 44] = "1 [ ist eine oeffnende Klammer = 1          "
+    check((&k10[0]) as u64, 43, ucd_bidi.ucd_bracket_type(t, 0x5B as u32) as i64, 1)
+    var k11: [u8; 44] = "1 U+2329 ist kanonisch U+3008 = 12296       "
+    check((&k11[0]) as u64, 43, ucd_bidi.ucd_bracket_canon(t, 0x2329 as u32) as i64, 12296)
+
+    // ==================================================================
+    // 2. EBENEN UND REIHENFOLGE (lib/fui/bidi.fi), VON HAND
+    // ==================================================================
+    var lab: Lab = lab_new(t)
+    let lk: *mut Lab = &lab
+
+    // 2a reines LTR
+    var s1: [u8; 3] = "abc"
+    var l1: [u8; 3] = "000"
+    var v1: [u8; 3] = "abc"
+    var c1: [u8; 44] = "2a abc, auto: Ebenen                        "
+    case3(lk, (&c1[0]) as u64, 43, bidi.DIR_AUTO, (&s1[0]) as u64, 3, 0, (&l1[0]) as u64, (&v1[0]) as u64)
+
+    // 2b reines RTL: jedes R auf 1 (I1), L2 dreht alles.
+    var s2: [u8; 3] = "ABC"
+    var l2: [u8; 3] = "111"
+    var v2: [u8; 3] = "CBA"
+    var c2: [u8; 44] = "2b ABC, auto: Ebenen                        "
+    case3(lk, (&c2[0]) as u64, 43, bidi.DIR_AUTO, (&s2[0]) as u64, 3, 1, (&l2[0]) as u64, (&v2[0]) as u64)
+
+    // 2c RTL-Absatz mit L-Wort: das Leerzeichen liegt zwischen R und L,
+    // N1 greift nicht, N2 gibt die Einbettung (1). def: L auf 1 -> 2.
+    var s3: [u8; 7] = "ABC def"
+    var l3: [u8; 7] = "1111222"
+    var v3: [u8; 7] = "def CBA"
+    var c3: [u8; 44] = "2c ABC def, auto: Ebenen                    "
+    case3(lk, (&c3[0]) as u64, 43, bidi.DIR_AUTO, (&s3[0]) as u64, 7, 1, (&l3[0]) as u64, (&v3[0]) as u64)
+
+    // 2d LTR-Absatz mit R-Wort: Leerzeichen zwischen L und R -> N2 -> 0.
+    var s4: [u8; 7] = "abc DEF"
+    var l4: [u8; 7] = "0000111"
+    var v4: [u8; 7] = "abc FED"
+    var c4: [u8; 44] = "2d abc DEF, auto: Ebenen                    "
+    case3(lk, (&c4[0]) as u64, 43, bidi.DIR_AUTO, (&s4[0]) as u64, 7, 0, (&l4[0]) as u64, (&v4[0]) as u64)
+
+    // 2e Zahlen in hebraeischem Text: EN bleibt EN (W2 sieht R, nicht
+    // AL), N1: Leerzeichen zwischen R und EN(=R) -> 1, I2: EN auf 1 -> 2.
+    var s5: [u8; 7] = "ABC 123"
+    var l5: [u8; 7] = "1111222"
+    var v5: [u8; 7] = "123 CBA"
+    var c5: [u8; 44] = "2e ABC 123, auto: Ebenen                    "
+    case3(lk, (&c5[0]) as u64, 43, bidi.DIR_AUTO, (&s5[0]) as u64, 7, 1, (&l5[0]) as u64, (&v5[0]) as u64)
+
+    // 2f Zahlen in ARABISCHEM Text: W2 macht EN hinter AL zu AN, I2
+    // hebt AN auf 2; die Ziffern bleiben in Leserichtung "12".
+    var s6: [u8; 5] = "~^ 12"
+    var l6: [u8; 5] = "11122"
+    var v6: [u8; 5] = "12 ^~"
+    var c6: [u8; 44] = "2f ~^ 12 (arabisch), auto: Ebenen           "
+    case3(lk, (&c6[0]) as u64, 43, bidi.DIR_AUTO, (&s6[0]) as u64, 5, 1, (&l6[0]) as u64, (&v6[0]) as u64)
+
+    // 2g gespiegelte Klammern: N0, das Paar umschliesst R -> R. Auf dem
+    // Schirm steht die Klammer nach L4 gespiegelt.
+    var s7: [u8; 6] = "AB(CD)"
+    var l7: [u8; 6] = "111111"
+    var v7: [u8; 6] = "(DC)BA"
+    var c7: [u8; 44] = "2g AB(CD), auto: Ebenen                     "
+    case3(lk, (&c7[0]) as u64, 43, bidi.DIR_AUTO, (&s7[0]) as u64, 6, 1, (&l7[0]) as u64, (&v7[0]) as u64)
+
+    // 2h UAX #9, N0 Beispiel 1 (RTL): ( ) umschliesst R -> R; [ ]
+    // umschliesst nur L, davor steht D (R) -> Einbettung R.
+    var s8: [u8; 14] = "AB(CD[&ef]!)gh"
+    var l8: [u8; 14] = "11111112211122"
+    var v8: [u8; 14] = "gh(![ef&]DC)BA"
+    var c8: [u8; 44] = "2h N0 Bsp. 1 AB(CD[&ef]!)gh: Ebenen         "
+    case3(lk, (&c8[0]) as u64, 43, bidi.DIR_RTL, (&s8[0]) as u64, 14, 1, (&l8[0]) as u64, (&v8[0]) as u64)
+
+    // 2i UAX #9, N0 Beispiel 2 (RTL): das Paar umschliesst L UND R;
+    // R ist die Einbettungsrichtung -> die Klammern werden R.
+    var s9: [u8; 30] = "smith (fabrikam ARABIC) HEBREW"
+    var l9: [u8; 30] = "222221122222222111111111111111"
+    var v9: [u8; 30] = "WERBEH (CIBARA fabrikam) smith"
+    var c9: [u8; 44] = "2i N0 Bsp. 2 smith (fabrikam ARABIC)        "
+    case3(lk, (&c9[0]) as u64, 43, bidi.DIR_RTL, (&s9[0]) as u64, 30, 1, (&l9[0]) as u64, (&v9[0]) as u64)
+
+    // 2j UAX #9, N0 Beispiel 3 (RTL): (s) umschliesst nur L, davor steht
+    // k (L) -> die Klammern werden L, Ebene 2, NICHT gespiegelt.
+    var s10: [u8; 14] = "ARABIC book(s)"
+    var l10: [u8; 14] = "11111112222222"
+    var v10: [u8; 14] = "book(s) CIBARA"
+    var c10: [u8; 44] = "2j N0 Bsp. 3 ARABIC book(s): Ebenen         "
+    case3(lk, (&c10[0]) as u64, 43, bidi.DIR_RTL, (&s10[0]) as u64, 14, 1, (&l10[0]) as u64, (&v10[0]) as u64)
+
+    // 2k ES zwischen R und R: W6 -> ON, N1 -> R.
+    var s11: [u8; 3] = "A-B"
+    var l11: [u8; 3] = "111"
+    var v11: [u8; 3] = "B-A"
+    var c11: [u8; 44] = "2k A-B, auto: Ebenen                        "
+    case3(lk, (&c11[0]) as u64, 43, bidi.DIR_AUTO, (&s11[0]) as u64, 3, 1, (&l11[0]) as u64, (&v11[0]) as u64)
+
+    // 2l W4: ein ES zwischen zwei EN wird EN; alles EN auf Ebene 1 -> 2.
+    var s12: [u8; 3] = "1+2"
+    var l12: [u8; 3] = "222"
+    var v12: [u8; 3] = "1+2"
+    var c12: [u8; 44] = "2l 1+2 im RTL-Absatz: Ebenen                "
+    case3(lk, (&c12[0]) as u64, 43, bidi.DIR_RTL, (&s12[0]) as u64, 3, 1, (&l12[0]) as u64, (&v12[0]) as u64)
+
+    // 2m W5: ET vor EN wird EN, W7: EN nach sos L wird L.
+    var s13: [u8; 3] = "$12"
+    var l13: [u8; 3] = "000"
+    var v13: [u8; 3] = "$12"
+    var c13: [u8; 44] = "2m $12 im LTR-Absatz: Ebenen                "
+    case3(lk, (&c13[0]) as u64, 43, bidi.DIR_LTR, (&s13[0]) as u64, 3, 0, (&l13[0]) as u64, (&v13[0]) as u64)
+
+    // 2n kein starkes Zeichen -> Absatz 0; W4: CS zwischen AN und AN
+    // wird AN; I2: AN auf 0 -> 2.
+    var s14: [u8; 3] = "|,|"
+    var l14: [u8; 3] = "222"
+    var v14: [u8; 3] = "|,|"
+    var c14: [u8; 44] = "2n |,| (AN CS AN), auto: Ebenen             "
+    case3(lk, (&c14[0]) as u64, 43, bidi.DIR_AUTO, (&s14[0]) as u64, 3, 0, (&l14[0]) as u64, (&v14[0]) as u64)
+
+    // 2o ein Isolat: RLI und PDI stehen auf 0, CD darin auf 1; die
+    // Folge ab_RLI+PDI_ef ist EINE isolierende Folge, N1 macht die
+    // Neutralen zu L.
+    var s15: [u8; 10] = "ab >CD< ef"
+    var l15: [u8; 10] = "0000110000"
+    var v15: [u8; 10] = "ab >DC< ef"
+    var c15: [u8; 44] = "2o ab >CD< ef (RLI...PDI): Ebenen           "
+    case3(lk, (&c15[0]) as u64, 43, bidi.DIR_LTR, (&s15[0]) as u64, 10, 0, (&l15[0]) as u64, (&v15[0]) as u64)
+
+    // 2p P2/P3 ueberspringt das Isolat: das erste starke Zeichen
+    // AUSSERHALB ist D (R) -> Absatz 1, obwohl "ab" vorne steht.
+    var s16: [u8; 6] = ">ab< D"
+    var l16: [u8; 6] = "144111"
+    var v16: [u8; 6] = "D <ab>"
+    var c16: [u8; 44] = "2p >ab< D: Isolat zaehlt nicht fuer P2      "
+    case3(lk, (&c16[0]) as u64, 43, bidi.DIR_AUTO, (&s16[0]) as u64, 6, 1, (&l16[0]) as u64, (&v16[0]) as u64)
+
+    // 2q LTR-Absatz, Klammer um R: davor steht a (L = Einbettung) ->
+    // die Klammern werden L und stehen ungespiegelt.
+    var s17: [u8; 5] = "a(B)c"
+    var l17: [u8; 5] = "00100"
+    var v17: [u8; 5] = "a(B)c"
+    var c17: [u8; 44] = "2q a(B)c, auto: Ebenen                      "
+    case3(lk, (&c17[0]) as u64, 43, bidi.DIR_AUTO, (&s17[0]) as u64, 5, 0, (&l17[0]) as u64, (&v17[0]) as u64)
+
+    // 2r RTL-Absatz, Klammer um L, davor A (R = Einbettung) -> R,
+    // gespiegelt.
+    var s18: [u8; 5] = "A(b)C"
+    var l18: [u8; 5] = "11211"
+    var v18: [u8; 5] = "C(b)A"
+    var c18: [u8; 44] = "2r A(b)C, auto: Ebenen                      "
+    case3(lk, (&c18[0]) as u64, 43, bidi.DIR_AUTO, (&s18[0]) as u64, 5, 1, (&l18[0]) as u64, (&v18[0]) as u64)
+
+    // 2s L auf einer RTL-Grundebene: I2 hebt es auf 2, die Reihenfolge
+    // bleibt ab.
+    var s19: [u8; 2] = "ab"
+    var l19: [u8; 2] = "22"
+    var v19: [u8; 2] = "ab"
+    var c19: [u8; 44] = "2s ab im RTL-Absatz: Ebenen                 "
+    case3(lk, (&c19[0]) as u64, 43, bidi.DIR_RTL, (&s19[0]) as u64, 2, 1, (&l19[0]) as u64, (&v19[0]) as u64)
+
+
+    // 2t W4 macht den Punkt zwischen zwei Ziffern zu EN, W5 das
+    // Prozentzeichen dahinter; die ganze Zahl steht auf 2 und bleibt in
+    // Leserichtung.
+    var s31: [u8; 6] = "A 1.5%"
+    var l31: [u8; 6] = "112222"
+    var v31: [u8; 6] = "1.5% A"
+    var c31: [u8; 44] = "2t A 1.5%, auto: Ebenen                     "
+    case3(lk, (&c31[0]) as u64, 43, bidi.DIR_AUTO, (&s31[0]) as u64, 6, 1, (&l31[0]) as u64, (&v31[0]) as u64)
+
+    // 2u W1: das Vokalzeichen nimmt den Typ seines Grundbuchstabens (R).
+    // Auf dem Schirm steht es VOR ihm -- so, wie DejaVu es zeichnet
+    // (siehe painter.fi, kein L3).
+    var s32: [u8; 3] = "A*B"
+    var l32: [u8; 3] = "111"
+    var v32: [u8; 3] = "B*A"
+    var c32: [u8; 44] = "2u A*B (NSM hinter R): Ebenen               "
+    case3(lk, (&c32[0]) as u64, 43, bidi.DIR_AUTO, (&s32[0]) as u64, 3, 1, (&l32[0]) as u64, (&v32[0]) as u64)
+
+    // 2v arabisch mit Tausenderkomma: beide Ziffern werden nach W2 AN,
+    // W4 macht das Komma dazwischen zu AN, alles auf 2.
+    var s33: [u8; 4] = "~1,2"
+    var l33: [u8; 4] = "1222"
+    var v33: [u8; 4] = "1,2~"
+    var c33: [u8; 44] = "2v ~1,2: Ebenen                             "
+    case3(lk, (&c33[0]) as u64, 43, bidi.DIR_AUTO, (&s33[0]) as u64, 4, 1, (&l33[0]) as u64, (&v33[0]) as u64)
+
+    // 2w W7: eine Ziffer nach einem L wird L; das R-Wort dahinter
+    // steht allein auf 1.
+    var s34: [u8; 7] = "ab 1 CD"
+    var l34: [u8; 7] = "0000011"
+    var v34: [u8; 7] = "ab 1 DC"
+    var c34: [u8; 44] = "2w ab 1 CD, auto: Ebenen                    "
+    case3(lk, (&c34[0]) as u64, 43, bidi.DIR_AUTO, (&s34[0]) as u64, 7, 0, (&l34[0]) as u64, (&v34[0]) as u64)
+
+    // 2x dieselbe Ziffer nach einem R bleibt EN (2); das Leerzeichen
+    // zwischen EN und c liegt zwischen R und L -> Einbettung R.
+    var s35: [u8; 7] = "AB 1 cd"
+    var l35: [u8; 7] = "1112122"
+    var v35: [u8; 7] = "cd 1 BA"
+    var c35: [u8; 44] = "2x AB 1 cd, auto: Ebenen                    "
+    case3(lk, (&c35[0]) as u64, 43, bidi.DIR_AUTO, (&s35[0]) as u64, 7, 1, (&l35[0]) as u64, (&v35[0]) as u64)
+
+    // 2y erzwungenes LTR fuer reinen hebraeischen Text: Absatz 0, die
+    // Buchstaben trotzdem auf 1 und gedreht.
+    var s36: [u8; 3] = "ABC"
+    var l36: [u8; 3] = "111"
+    var v36: [u8; 3] = "CBA"
+    var c36: [u8; 44] = "2y ABC mit direction ltr: Ebenen            "
+    case3(lk, (&c36[0]) as u64, 43, bidi.DIR_LTR, (&s36[0]) as u64, 3, 0, (&l36[0]) as u64, (&v36[0]) as u64)
+
+    // 2z erzwungenes RTL fuer lateinischen Text: abc auf 2, das "!" am
+    // Ende liegt zwischen L und eos (R) -> Einbettung R, Ebene 1, und
+    // steht auf dem Schirm LINKS.
+    var s37: [u8; 4] = "abc!"
+    var l37: [u8; 4] = "2221"
+    var v37: [u8; 4] = "!abc"
+    var c37: [u8; 44] = "2z abc! mit direction rtl: Ebenen           "
+    case3(lk, (&c37[0]) as u64, 43, bidi.DIR_RTL, (&s37[0]) as u64, 4, 1, (&l37[0]) as u64, (&v37[0]) as u64)
+
+    // ==================================================================
+    // 3. ZEILENUMBRUCH IN GEMISCHTEM TEXT (L1/L2 je Zeile)
+    // ==================================================================
+    // "abc DEF GHI jkl" im LTR-Absatz: abc 0, _ 0 (zwischen L und R),
+    // DEF_GHI 1 (das mittlere Leerzeichen zwischen R und R), _ 0, jkl 0.
+    var s20: [u8; 15] = "abc DEF GHI jkl"
+    var l20: [u8; 15] = "000011111110000"
+    var v20: [u8; 15] = "abc IHG FED jkl"
+    var c20: [u8; 44] = "3a abc DEF GHI jkl ungebrochen: Ebenen      "
+    case3(lk, (&c20[0]) as u64, 43, bidi.DIR_AUTO, (&s20[0]) as u64, 15, 0, (&l20[0]) as u64, (&v20[0]) as u64)
+    // Umbruch hinter "DEF ": das Leerzeichen am Zeilenende faellt nach L1
+    // auf die Absatzebene 0 -- und jede Zeile wird fuer sich gedreht,
+    // "IHG FED" gibt es gebrochen nicht mehr.
+    run_line(lk, bidi.DIR_AUTO, (&s20[0]) as u64, 15, 0, 8)
+    var l21: [u8; 8] = "00001110"
+    var c21: [u8; 44] = "3b Zeile 1 abc DEF_: Ebenen nach L1         "
+    report_s((&c21[0]) as u64, 43, lab.lvs, 8, (&l21[0]) as u64, 8)
+    var v21: [u8; 8] = "abc FED "
+    var c21b: [u8; 44] = "3b Zeile 1: Schirm                          "
+    report_s((&c21b[0]) as u64, 43, lab.vis, 8, (&v21[0]) as u64, 8)
+    run_line(lk, bidi.DIR_AUTO, (&s20[0]) as u64, 15, 8, 15)
+    var v22: [u8; 7] = "IHG jkl"
+    var c22: [u8; 44] = "3c Zeile 2 GHI jkl: Schirm                  "
+    report_s((&c22[0]) as u64, 43, lab.vis, 7, (&v22[0]) as u64, 7)
+
+    // Dasselbe im RTL-Absatz: "ABC def GHI", Umbruch hinter "def ".
+    // Das Leerzeichen am Zeilenende steht nach L1 auf 1 und damit auf
+    // dem Schirm LINKS -- dort endet eine Zeile von rechts nach links.
+    var s23: [u8; 11] = "ABC def GHI"
+    var l23: [u8; 11] = "11112221111"
+    var v23: [u8; 11] = "IHG def CBA"
+    var c23: [u8; 44] = "3d ABC def GHI ungebrochen: Ebenen          "
+    case3(lk, (&c23[0]) as u64, 43, bidi.DIR_AUTO, (&s23[0]) as u64, 11, 1, (&l23[0]) as u64, (&v23[0]) as u64)
+    run_line(lk, bidi.DIR_AUTO, (&s23[0]) as u64, 11, 0, 8)
+    var v24: [u8; 8] = " def CBA"
+    var c24: [u8; 44] = "3e Zeile 1 ABC def_: Schirm                 "
+    report_s((&c24[0]) as u64, 43, lab.vis, 8, (&v24[0]) as u64, 8)
+    run_line(lk, bidi.DIR_AUTO, (&s23[0]) as u64, 11, 8, 11)
+    var v25: [u8; 3] = "IHG"
+    var c25: [u8; 44] = "3f Zeile 2 GHI: Schirm                      "
+    report_s((&c25[0]) as u64, 43, lab.vis, 3, (&v25[0]) as u64, 3)
+
+    // ==================================================================
+    // 4. DIE MASSE DES MALERS (lib/fui/painter.fi) bei 2048 Punkt
+    // ==================================================================
+    var fbuf: rt.Buf = rt.buf_new()
+    var fpath: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&fpath[0]) as u64, &fbuf) {
+        var nof: [u8; 64] = "bidi_main: keine Schrift -- die Masse lassen sich nicht pruefen\n"
+        rt.write_everything(2, (&nof[0]) as u64, 64)
+        return 3
+    }
+    let fsp: *mut metrics.FontSet =
+        rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 3
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 64, 64) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 64, 64) {
+        return 5
+    }
+    painter.painter_set_font(&z, fsp as u64)
+    var r: painter.TextRun = painter.run_new(2048.0)
+
+    // "abc" braucht den Algorithmus nicht -- der alte Weg bleibt.
+    var pabc: [u8; 3] = "abc"
+    let wabc: f64 = painter.run_width(&z, &r, (&pabc[0]) as u64, 3)
+    var p1: [u8; 44] = "4a abc geht den alten Weg (Bidi = 0)        "
+    check((&p1[0]) as u64, 43, b2i(painter.run_is_bidi(&z)), 0)
+    // Hebraeisch: 1369 + 1184 + 844 = 3397.
+    var heb: [u8; 6] = "אבג"
+    let wh: f64 = painter.run_width(&z, &r, (&heb[0]) as u64, 6)
+    var p2: [u8; 44] = "4b Breite Alef Bet Gimel = 3397             "
+    check((&p2[0]) as u64, 43, wh as i64, 3397)
+    var p3: [u8; 44] = "4b ... und das auf dem Bidi-Weg (= 1)       "
+    check((&p3[0]) as u64, 43, b2i(painter.run_is_bidi(&z)), 1)
+    // Arabisch GEFORMT: Beh anfangs 570 + Seen mittig 1827 + Meem endend
+    // 1363 = 3760. Ungeformt waeren es 1928 + 2500 + 1268 = 5696 -- die
+    // Zahl zeigt, dass der Maler die Gestalt MISST und nicht nur malt.
+    var bsm: [u8; 6] = "بسم"
+    var p4: [u8; 44] = "4c Breite bsm geformt = 3760                "
+    check((&p4[0]) as u64, 43, painter.run_width(&z, &r, (&bsm[0]) as u64, 6) as i64, 3760)
+    // Lam-Alif ist EINE Glyphe: U+FEFB, 1168.
+    var la: [u8; 4] = "لا"
+    var p5: [u8; 44] = "4d Breite Lam-Alif (Ligatur) = 1168         "
+    check((&p5[0]) as u64, 43, painter.run_width(&z, &r, (&la[0]) as u64, 4) as i64, 1168)
+    // Was passt in 2100? Alef (1369) ja, Alef+Bet (2553) nicht -> nach
+    // dem ersten Zeichen, Oktett 2.
+    var p6: [u8; 44] = "4e in 2100 passt Alef: Oktett 2             "
+    check((&p6[0]) as u64, 43, painter.run_fits_upto(&z, &r, (&heb[0]) as u64, 6, 2100.0) as i64, 2)
+    // Umbruch: "אבג אבג" ist 3397 + 651 + 3397 = 7445 breit; in 4100
+    // sind das zwei Zeilen, in 8000 eine.
+    var heb2: [u8; 13] = "אבג אבג"
+    var p7: [u8; 44] = "4f zwei Worte in 4100: 2 Zeilen             "
+    check((&p7[0]) as u64, 43, painter.run_line_count(&z, &r, (&heb2[0]) as u64, 13, 4100.0, 9) as i64, 2)
+    var p8: [u8; 44] = "4f ... in 8000: 1 Zeile                     "
+    check((&p8[0]) as u64, 43, painter.run_line_count(&z, &r, (&heb2[0]) as u64, 13, 8000.0, 9) as i64, 1)
+
+    // ==================================================================
+    // 5. DIE SCHREIBMARKE (painter.run_caret_x / run_hit)
+    // ==================================================================
+    // "אבג" auf dem Schirm: Gimel [0,844] Bet [844,2028] Alef [2028,3397].
+    // Die Marke haengt an der Hinterkante des Zeichens davor, und die ist
+    // bei ungerader Ebene LINKS.
+    var m1: [u8; 44] = "5a Marke vor Alef (Oktett 0) bei x 3397     "
+    check((&m1[0]) as u64, 43, painter.run_caret_x(&z, &r, (&heb[0]) as u64, 6, 0) as i64, 3397)
+    var m2: [u8; 44] = "5a hinter Alef (Oktett 2) bei x 2028        "
+    check((&m2[0]) as u64, 43, painter.run_caret_x(&z, &r, (&heb[0]) as u64, 6, 2) as i64, 2028)
+    var m3: [u8; 44] = "5a hinter Bet (Oktett 4) bei x 844          "
+    check((&m3[0]) as u64, 43, painter.run_caret_x(&z, &r, (&heb[0]) as u64, 6, 4) as i64, 844)
+    var m4: [u8; 44] = "5a hinter Gimel (Oktett 6) bei x 0          "
+    check((&m4[0]) as u64, 43, painter.run_caret_x(&z, &r, (&heb[0]) as u64, 6, 6) as i64, 0)
+    // "ab אב" im LTR-Absatz: a [0,1255] b [1255,2555] _ [2555,3206],
+    // dann Bet [3206,4390] Alef [4390,5759]. Hinter dem Leerzeichen
+    // (Oktett 3) steht die Marke an dessen rechter Kante 3206, hinter
+    // Alef (Oktett 5) an Alefs LINKER Kante 4390, hinter Bet (Oktett 7)
+    // an Bets linker Kante -- wieder 3206.
+    var mix: [u8; 7] = "ab אב"
+    var m5: [u8; 44] = "5b ab_AB: Marke Oktett 3 bei x 3206         "
+    check((&m5[0]) as u64, 43, painter.run_caret_x(&z, &r, (&mix[0]) as u64, 7, 3) as i64, 3206)
+    var m6: [u8; 44] = "5b ab_AB: Marke Oktett 5 bei x 4390         "
+    check((&m6[0]) as u64, 43, painter.run_caret_x(&z, &r, (&mix[0]) as u64, 7, 5) as i64, 4390)
+    var m7: [u8; 44] = "5b ab_AB: Marke Oktett 7 bei x 3206         "
+    check((&m7[0]) as u64, 43, painter.run_caret_x(&z, &r, (&mix[0]) as u64, 7, 7) as i64, 3206)
+    // Treffer: x 100 liegt in der linken Haelfte von Gimel (Mitte 422);
+    // links heisst bei ungerader Ebene "hinter dem Zeichen" -> Oktett 6.
+    var m8: [u8; 44] = "5c Klick bei x 100 in ABG: Oktett 6         "
+    check((&m8[0]) as u64, 43, painter.run_hit(&z, &r, (&heb[0]) as u64, 6, 100.0) as i64, 6)
+    // x 3300 liegt in der rechten Haelfte von Alef (Mitte 2712) ->
+    // VOR Alef, Oktett 0.
+    var m9: [u8; 44] = "5c Klick bei x 3300 in ABG: Oktett 0        "
+    check((&m9[0]) as u64, 43, painter.run_hit(&z, &r, (&heb[0]) as u64, 6, 3300.0) as i64, 0)
+    var m10: [u8; 44] = "5d der Absatz ABG laeuft RTL (= 1)          "
+    check((&m10[0]) as u64, 43, b2i(painter.run_para_rtl(&z, &r, (&heb[0]) as u64, 6)), 1)
+    var m11: [u8; 44] = "5d ab_AB laeuft LTR (= 0)                   "
+    check((&m11[0]) as u64, 43, b2i(painter.run_para_rtl(&z, &r, (&mix[0]) as u64, 7)), 0)
+
+    // ==================================================================
+    // 6. DAS TEXTFELD (lib/fui/editor.fi mit painter.measure_*)
+    // ==================================================================
+    var raw: [u8; 64] = [0; 64]
+    var ed: editor.Editor = editor.editor_new()
+    if !editor.editor_init(&ed, (&raw[0]) as u64, 64) {
+        return 6
+    }
+    var ms: painter.Measure = painter.measure_new(&z, r)
+    editor.editor_set_visual(&ed, painter.measure_x, painter.measure_hit,
+        painter.measure_width, painter.measure_rtl, (&ms) as u64)
+    let tb: *mut textbuf.TextBuf = editor.editor_buf(&ed)
+    textbuf.tb_set_text(tb, (&heb[0]) as u64, 6)
+    textbuf.tb_set_range(tb, 0, 0)
+    var e1: [u8; 44] = "6a Feld mit ABG ist RTL (= 1)               "
+    check((&e1[0]) as u64, 43, b2i(editor.editor_is_rtl(&ed)), 1)
+    var e2: [u8; 44] = "6a Marke am Anfang steht RECHTS: x 3397     "
+    check((&e2[0]) as u64, 43, editor.editor_caret_x(&ed) as i64, 3397)
+    // Pfeil links im RTL-Absatz: logisch VORWAERTS, ein Zeichen = 2
+    // Oktette.
+    let r1: u32 = editor.editor_key(&ed, editor.KEY_LEFT, 0 as u32)
+    var e3: [u8; 44] = "6b Pfeil links: Oktett 2                    "
+    check((&e3[0]) as u64, 43, textbuf.tb_caret(tb) as i64, 2)
+    var e4: [u8; 44] = "6b ... und die Marke steht bei x 2028       "
+    check((&e4[0]) as u64, 43, editor.editor_caret_x(&ed) as i64, 2028)
+    let r2: u32 = editor.editor_key(&ed, editor.KEY_LEFT, 0 as u32)
+    var e5: [u8; 44] = "6b noch einmal links: Oktett 4              "
+    check((&e5[0]) as u64, 43, textbuf.tb_caret(tb) as i64, 4)
+    let r3: u32 = editor.editor_key(&ed, editor.KEY_RIGHT, 0 as u32)
+    var e6: [u8; 44] = "6b rechts: zurueck auf Oktett 2             "
+    check((&e6[0]) as u64, 43, textbuf.tb_caret(tb) as i64, 2)
+    // Ein Klick bei x 100 (Gimel links) setzt die Marke ans Textende.
+    let r4: u32 = editor.editor_mouse_down(&ed, 100.0, 5000000 as u64,
+        mess_none, 0, false)
+    var e7: [u8; 44] = "6c Klick bei x 100: Oktett 6                "
+    check((&e7[0]) as u64, 43, textbuf.tb_caret(tb) as i64, 6)
+    // Im LTR-Text bleibt links links: von 3 nach 2.
+    textbuf.tb_set_text(tb, (&pabc[0]) as u64, 3)
+    textbuf.tb_set_range(tb, 3, 3)
+    let r5: u32 = editor.editor_key(&ed, editor.KEY_LEFT, 0 as u32)
+    var e8: [u8; 44] = "6d abc: Pfeil links von 3 auf 2             "
+    check((&e8[0]) as u64, 43, textbuf.tb_caret(tb) as i64, 2)
+
+    // ==================================================================
+    // 7. DIE ARABISCHEN GESTALTEN (lib/fui/shape.fi, lib/font/gsub.fi)
+    // ==================================================================
+    // Die Glyphennummern sind die, die die cmap von DejaVu Sans den
+    // Darstellungsformen gibt (fontTools): U+FE91 5259, U+FEB4 5294,
+    // U+FEE2 5340, U+FEFB 5365. GSUB muss auf genau diese kommen.
+    let fnt: *mut ttf.Font = metrics.fontset_font(fsp as u64)
+    var gs: gsub.Gsub = gsub.gsub_new()
+    let gok: bool = gsub.gsub_init(fnt, &gs)
+    // arab in DejaVu: fina 9, medi 11, init 13, rlig 14 15 16, liga 17 19.
+    var g1: [u8; 44] = "7a GSUB arab: 8 Lookups                     "
+    check((&g1[0]) as u64, 43, gsub.gsub_count(&gs) as i64, 8)
+    let gid: u64 = rt.heap_alloc(CAP * 4)
+    let del: u64 = rt.heap_alloc(CAP)
+    let frm: u64 = rt.heap_alloc(CAP)
+    let used: u64 = rt.heap_alloc(64)
+    let gid2: u64 = rt.heap_alloc(CAP * 4)
+    let del2: u64 = rt.heap_alloc(CAP)
+    var miss: usize = 0
+    run_line(lk, bidi.DIR_AUTO, (&s6[0]) as u64, 5, 0, 5)
+    // bsm, als Codepunkte
+    w32(lab.cp, 0, 0x628 as u32)
+    w32(lab.cp, 1, 0x633 as u32)
+    w32(lab.cp, 2, 0x645 as u32)
+    var bp2: bidi.BidiPara = bidi.bidi_new(t, lab.cp, 3, lab.c0, lab.c1,
+        lab.lv, lab.pl, lab.wk)
+    let pl2: u8 = bidi.bidi_run(&bp2, bidi.DIR_AUTO)
+    let way: u32 = shape.shape_run(t, fnt, &gs, true, lab.cp, lab.c0,
+        lab.lv, 3, gid, del, frm, used, &miss)
+    var g2: [u8; 44] = "7b bsm geht den GSUB-Weg (= 1)              "
+    check((&g2[0]) as u64, 43, way as i64, 1)
+    var g3: [u8; 44] = "7b Beh anfangs = 5259                       "
+    check((&g3[0]) as u64, 43, r32(gid, 0) as i64, 5259)
+    var g4: [u8; 44] = "7b Seen mittig = 5294                       "
+    check((&g4[0]) as u64, 43, r32(gid, 1) as i64, 5294)
+    var g5: [u8; 44] = "7b Meem endend = 5340                       "
+    check((&g5[0]) as u64, 43, r32(gid, 2) as i64, 5340)
+    // Die Naeherung ueber die Darstellungsformen muss bei dieser Schrift
+    // DIESELBEN Glyphen liefern, und ohne Fehlstelle.
+    let way2: u32 = shape.shape_run(t, fnt, &gs, false, lab.cp, lab.c0,
+        lab.lv, 3, gid2, del2, frm, used, &miss)
+    var gleich: i64 = 0
+    var q: usize = 0
+    while q < 3 {
+        if r32(gid, q) == r32(gid2, q) {
+            gleich = gleich + 1
+        }
+        q = q + 1
+    }
+    var g6: [u8; 44] = "7c Naeherung = GSUB an 3 von 3 Stellen      "
+    check((&g6[0]) as u64, 43, gleich, 3)
+    var g7: [u8; 44] = "7c Naeherung: 0 Stellen ohne Form           "
+    check((&g7[0]) as u64, 43, miss as i64, 0)
+    // Lam-Alif: EINE Glyphe (5365), das Alif gilt als aufgegangen.
+    w32(lab.cp, 0, 0x644 as u32)
+    w32(lab.cp, 1, 0x627 as u32)
+    var bp3: bidi.BidiPara = bidi.bidi_new(t, lab.cp, 2, lab.c0, lab.c1,
+        lab.lv, lab.pl, lab.wk)
+    let pl3: u8 = bidi.bidi_run(&bp3, bidi.DIR_AUTO)
+    let way3: u32 = shape.shape_run(t, fnt, &gs, true, lab.cp, lab.c0,
+        lab.lv, 2, gid, del, frm, used, &miss)
+    var g8: [u8; 44] = "7d Lam-Alif ueber rlig = 5365               "
+    check((&g8[0]) as u64, 43, r32(gid, 0) as i64, 5365)
+    var g9: [u8; 44] = "7d das Alif ist aufgegangen (= 1)           "
+    check((&g9[0]) as u64, 43, r8(del, 1) as i64, 1)
+    let way4: u32 = shape.shape_run(t, fnt, &gs, false, lab.cp, lab.c0,
+        lab.lv, 2, gid, del, frm, used, &miss)
+    var g10: [u8; 44] = "7d ... und ueber die Naeherung = 5365       "
+    check((&g10[0]) as u64, 43, r32(gid, 0) as i64, 5365)
+    // L4 im Maler: "(" auf ungerader Ebene bekommt die Glyphe von ")".
+    w32(lab.cp, 0, 0x5D0 as u32)
+    w32(lab.cp, 1, 0x28 as u32)
+    w32(lab.cp, 2, 0x5D1 as u32)
+    w32(lab.cp, 3, 0x29 as u32)
+    var bp4: bidi.BidiPara = bidi.bidi_new(t, lab.cp, 4, lab.c0, lab.c1,
+        lab.lv, lab.pl, lab.wk)
+    let pl4: u8 = bidi.bidi_run(&bp4, bidi.DIR_AUTO)
+    let way5: u32 = shape.shape_run(t, fnt, &gs, true, lab.cp, lab.c0,
+        lab.lv, 4, gid, del, frm, used, &miss)
+    // parenright ist Glyphe 12, parenleft 11 (cmap).
+    var g11: [u8; 44] = "7e ( in A(B) wird gespiegelt: Glyphe 12     "
+    check((&g11[0]) as u64, 43, r32(gid, 1) as i64, 12)
+    var g12: [u8; 44] = "7e ) in A(B) wird gespiegelt: Glyphe 11     "
+    check((&g12[0]) as u64, 43, r32(gid, 3) as i64, 11)
+
+    editor.editor_free(&ed)
+    painter.painter_free(&z)
+
+    var o: rt.Buf = rt.buf_new()
+    rt.buf_push(&o, 10 as u8)
+    var sum1: [u8; 12] = "Pruefungen: "
+    rt.buf_push_bytes(&o, (&sum1[0]) as u64, 12)
+    rt.buf_push_dec_u64(&o, G_CHECKS as u64)
+    var sum2: [u8; 10] = ", falsch: "
+    rt.buf_push_bytes(&o, (&sum2[0]) as u64, 10)
+    rt.buf_push_dec_u64(&o, G_ERRORS as u64)
+    rt.buf_push(&o, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&o), rt.buf_len(&o))
+    if G_ERRORS != 0 {
+        var bad: [u8; 14] = "\nBIDI FAILED.\n"
+        rt.write_everything(1, (&bad[0]) as u64, 14)
+        return 1
+    }
+    var good: [u8; 14] = "\nBIDI PASSED.\n"
+    rt.write_everything(1, (&good[0]) as u64, 14)
+    return 0
+}

@@ -18,6 +18,18 @@ any more.
   `FirnOld`. The browser engine now lives in its own repository (Certus).
 * Since 5 September 2026: MPL-2.0 for everything, published as a fresh
   history in `Flei-123/Firn`.
+* 23 September 2026: the window layer `lib/window/` (`window.fi`, `x11.fi`,
+  `win32.fi`, `android.fi`, `osum.fi`) came over from Certus
+  (`lib/window/`, Certus commit `1f1ec17bdb68`, last changed in
+  `cbbc9d8c0475`), where it was GPL-2.0-only. `git log -- lib/window/` in
+  Certus shows 22 commits by Justin and one by JARVIS, his own tool, and no
+  other author; `x11.fi` speaks the X11 protocol itself, without Xlib or
+  xcb. As sole author Justin released these files for Firn under MPL-2.0 on
+  23 September 2026 -- the same step as the licence change of 5 September.
+  The first commit of `lib/window/` is the unchanged copy (only the SPDX
+  line and a note of origin differ); every later change is its own commit.
+  Since MPL-2.0 is GPL-compatible, Certus can import the layer from Firn
+  instead of keeping a copy of its own.
 
 ## Why MPL-2.0
 

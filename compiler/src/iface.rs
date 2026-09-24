@@ -1351,7 +1351,7 @@ pub(crate) fn tables_asm() -> String {
     if tables.is_empty() {
         return out;
     }
-    let _ = writeln!(out, ".section .rodata");
+    let _ = writeln!(out, "{}", crate::target::reloc_rodata());
     let _ = writeln!(out, "{}", crate::target::align(8));
     for (key, targets) in tables {
         let _ = writeln!(out, "{}{}:", TABLE_LABEL, key);
