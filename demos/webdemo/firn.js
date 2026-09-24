@@ -168,13 +168,14 @@ const firnTag = document.currentScript;
     // marker character; what stands behind the marker is new text, a
     // marker that is gone was a Backspace.
     const MARK = '​';
-    // pointer-events: none -- the field is focused by the page (firn_web_keyboard),
-    // never by a finger. Without it the invisible box sat over the top left
-    // corner of the canvas before its first placement and swallowed the taps
-    // there (FirnChat's back arrow on a phone, 24.09.2026).
+    // Off the screen until the page places it (firn_web_keyboard puts it over
+    // the field, so the tap that follows lands on it and keeps the focus).
+    // Unplaced, the invisible box used to sit over the top left corner of the
+    // canvas and swallowed the taps there -- FirnChat's back arrow on a phone
+    // (24.09.2026).
     Object.assign(ta.style, { position: 'fixed', opacity: 0, border: 0, padding: 0, resize: 'none',
         fontSize: '16px', background: 'transparent', color: 'transparent', caretColor: 'transparent',
-        pointerEvents: 'none', left: '0px', top: '0px', width: '1px', height: '1px' });
+        left: '-10000px', top: '0px', width: '1px', height: '1px' });
     ta.setAttribute('autocapitalize', 'sentences'); ta.value = MARK;
     document.body.appendChild(ta);
     const flush = () => {
