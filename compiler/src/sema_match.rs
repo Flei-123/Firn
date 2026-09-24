@@ -79,27 +79,65 @@ impl EnumDef {
 pub(crate) enum Pattern {
     /// `_`
     Wild(Span),
-    /// `x` — binds the whole value
+    /// `x` — binds the whole value. Round GAPS: if `x` names an integer or
+    /// bool `const`, the type check turns it into `Int`/`Bool` instead
+    /// (`resolve_const_patterns`), as in Rust.
     Bind(String, Span),
+    /// Round GAPS: `module.NAME` — a qualified constant. Exists only between
+    /// the parser and the type check; `resolve_const_patterns` replaces it
+    /// with `Int`/`Bool` (or reports that the name is no constant).
+    Const(String, Span),
     Int(i128, Span),
     Bool(bool, Span),
     /// `lo..hi` (half open) or `lo..=hi` (inclusive)
     Range { lo: i128, hi: i128, inclusive: bool, span: Span },
     /// `Enum::Variant(sub, pattern)` — `ename` may be absent (`::Variant`)
     Variant { ename: Option<String>, vname: String, subs: Vec<Pattern>, span: Span },
+    /// Round GAPS: `A | B | C` — alternatives. Only at the top of an arm and
+    /// without bindings (every alternative would have to bind the same
+    /// names with the same types; not needed so far). A dense `match` over
+    /// alternatives still becomes one jump table: every alternative adds its
+    /// keys to the same arm (lower_match.rs, `plan_arm`).
+    Or(Vec<Pattern>, Span),
 }
 
 impl Pattern {
     pub(crate) fn span(&self) -> Span {
         match self {
-            Pattern::Wild(s) | Pattern::Bind(_, s) | Pattern::Int(_, s) | Pattern::Bool(_, s) => *s,
+            Pattern::Wild(s)
+            | Pattern::Bind(_, s)
+            | Pattern::Const(_, s)
+            | Pattern::Int(_, s)
+            | Pattern::Bool(_, s) => *s,
             Pattern::Range { span, .. } => *span,
             Pattern::Variant { span, .. } => *span,
+            Pattern::Or(_, span) => *span,
         }
     }
     /// Does the pattern ALWAYS match (that is, does it only bind)?
     pub(crate) fn is_irrefutable(&self) -> bool {
-        matches!(self, Pattern::Wild(_) | Pattern::Bind(..))
+        match self {
+            Pattern::Wild(_) | Pattern::Bind(..) => true,
+            Pattern::Or(alts, _) => alts.iter().any(|a| a.is_irrefutable()),
+            _ => false,
+        }
+    }
+    /// The alternatives of a top-level pattern (`A | B` -> [A, B]; any other
+    /// pattern -> [itself]).
+    pub(crate) fn alternatives(&self) -> Vec<&Pattern> {
+        match self {
+            Pattern::Or(alts, _) => alts.iter().collect(),
+            p => vec![p],
+        }
+    }
+    /// Does the pattern introduce a name (a binding)?
+    pub(crate) fn binds(&self) -> Option<Span> {
+        match self {
+            Pattern::Bind(_, s) => Some(*s),
+            Pattern::Variant { subs, .. } => subs.iter().find_map(|p| p.binds()),
+            Pattern::Or(alts, _) => alts.iter().find_map(|p| p.binds()),
+            _ => None,
+        }
     }
 }
 
@@ -373,6 +411,27 @@ impl<'a> Parser<'a> {
                 Some(p) => p,
                 None => break,
             };
+            // Round GAPS: `A | B | C =>` -- alternatives.
+            let pat = if self.at(&TokKind::Pipe) {
+                let mut alts = vec![pat];
+                let mut ok = true;
+                while self.eat(&TokKind::Pipe) {
+                    match self.types_pattern(0) {
+                        Some(p) => alts.push(p),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                let span = Parser::join(alts[0].span(), alts[alts.len() - 1].span());
+                Pattern::Or(alts, span)
+            } else {
+                pat
+            };
             if !self.types_at_fat_arrow() {
                 self.error_here(format!(
                     "expected '=>' after the pattern, found '{}'",
@@ -456,6 +515,18 @@ impl<'a> Parser<'a> {
                     return Some(Pattern::Wild(sp));
                 }
                 self.bump();
+                // Round GAPS: `module.NAME` -- a constant of another module.
+                if self.tk(0) == TokKind::Dot {
+                    if let TokKind::Ident(rest) = self.tk(1) {
+                        self.bump();
+                        let rsp = self.span();
+                        self.bump();
+                        return Some(Pattern::Const(
+                            format!("{}.{}", name, rest),
+                            Parser::join(sp, rsp),
+                        ));
+                    }
+                }
                 if self.types_at_colon2(0) {
                     self.types_eat_colon2();
                     let (vname, vspan) = self.ident("after '::' in the pattern")?;
@@ -913,6 +984,17 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
     };
     let sty = ck.expr(&mi.subject, None);
     let subject = classify_subject(ck, &sty, mi.subject.span);
+    // Round GAPS: named constants in patterns become literals BEFORE
+    // anything looks at the arms -- reachability, exhaustiveness and the
+    // lowering all see plain `Int`/`Bool` from here on.
+    let mut mi = mi;
+    let mut changed = false;
+    for arm in mi.arms.iter_mut() {
+        changed |= resolve_const_patterns(ck, &mut arm.pat);
+    }
+    if changed {
+        put_match(idx, mi.clone());
+    }
 
     // 1. check patterns, create bindings, check the body
     for arm in &mi.arms {
@@ -992,13 +1074,87 @@ fn classify_subject(ck: &mut Checker, ty: &Type, span: Span) -> Subject {
     Subject::Bad
 }
 
+/// Round GAPS -- NAMED CONSTANTS AS PATTERNS.
+///
+/// `match op { OP_ADD => ..., bc.OP_SUB => ... }` used to be impossible: a
+/// bare name bound the value (so the second arm was "unreachable"), and a
+/// qualified name was a syntax error. Code that dispatches over named
+/// opcodes (Certus `lib/js/bc.fi`, `interp.fi`) therefore wrote a chain of
+/// `if op == ...` -- and a chain never becomes a jump table
+/// (`codegen_switch.rs`), a `match` does.
+///
+/// The rule is Rust's: a bare name that names an integer or bool `const`
+/// is that constant; any other bare name binds. A qualified name
+/// (`module.NAME`) must name a constant. Returns whether anything changed.
+fn resolve_const_patterns(ck: &mut Checker, pat: &mut Pattern) -> bool {
+    match pat {
+        Pattern::Bind(name, span) => match ck.consts.get(name.as_str()) {
+            Some((ty, v)) => {
+                *pat = if matches!(ty, Type::Bool) {
+                    Pattern::Bool(*v != 0, *span)
+                } else {
+                    Pattern::Int(*v, *span)
+                };
+                true
+            }
+            None => false,
+        },
+        Pattern::Const(name, span) => {
+            let sp = *span;
+            match ck.consts.get(name.as_str()) {
+                Some((ty, v)) => {
+                    *pat = if matches!(ty, Type::Bool) {
+                        Pattern::Bool(*v != 0, sp)
+                    } else {
+                        Pattern::Int(*v, sp)
+                    };
+                }
+                None => {
+                    ck.dg.error_note(
+                        sp,
+                        format!("'{}' in a pattern is not an integer or bool constant", name),
+                        "a qualified name in a pattern must name a `const`",
+                    );
+                    *pat = Pattern::Wild(sp);
+                }
+            }
+            true
+        }
+        Pattern::Variant { subs, .. } | Pattern::Or(subs, _) => {
+            let mut c = false;
+            for s in subs.iter_mut() {
+                c |= resolve_const_patterns(ck, s);
+            }
+            c
+        }
+        _ => false,
+    }
+}
+
 /// Checks a pattern against the expected type and creates its bindings.
 fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, top: bool) {
     match pat {
         Pattern::Wild(_) => {}
+        Pattern::Or(alts, _) => {
+            for a in alts {
+                if let Some(bs) = a.binds() {
+                    ck.dg.error_note(
+                        bs,
+                        "an alternative of a '|' pattern must not bind a name",
+                        "use '_' here, or write the alternatives as separate arms",
+                    );
+                    return;
+                }
+            }
+            for a in alts {
+                check_pattern(ck, a, ty, subject, top);
+            }
+        }
         Pattern::Bind(name, span) => {
             ck.declare_var(name, ty.clone(), false, *span);
         }
+        // Resolved by `resolve_const_patterns` before this runs.
+        Pattern::Const(..) => {}
         Pattern::Bool(_, span) => {
             if !matches!(ty, Type::Bool | Type::Error) {
                 ck.dg.error(
@@ -1143,11 +1299,13 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
             }
             let mut missing: Vec<String> = Vec::new();
             for v in &def.variants {
-                let covered = arms.iter().any(|a| match &a.pat {
-                    Pattern::Variant { vname, subs, .. } => {
-                        *vname == v.name && subs.iter().all(|s| s.is_irrefutable())
-                    }
-                    _ => false,
+                let covered = arms.iter().any(|a| {
+                    a.pat.alternatives().iter().any(|p| match p {
+                        Pattern::Variant { vname, subs, .. } => {
+                            *vname == v.name && subs.iter().all(|s| s.is_irrefutable())
+                        }
+                        _ => false,
+                    })
                 });
                 if !covered {
                     missing.push(format!("{}::{}", def.name, v.name));
@@ -1180,8 +1338,12 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
                 return Ok(());
             }
             let has = |b: bool| {
-                arms.iter()
-                    .any(|a| matches!(&a.pat, Pattern::Bool(x, _) if *x == b))
+                arms.iter().any(|a| {
+                    a.pat
+                        .alternatives()
+                        .iter()
+                        .any(|p| matches!(p, Pattern::Bool(x, _) if *x == b))
+                })
             };
             let mut missing = Vec::new();
             if !has(true) {

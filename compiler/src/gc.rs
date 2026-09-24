@@ -90,8 +90,20 @@ pub(crate) const FN_STRONG: &str = "__gc_strong_raw";
 pub(crate) const FN_AS: &str = "__gc_as_raw";
 /// Runtime function behind `gc C{…}`.
 pub(crate) const FN_ALLOC: &str = "__gc_alloc_raw";
-/// Insertion barrier when writing a Gc pointer into the heap.
+/// Insertion barrier when writing a Gc pointer into the heap. Since round
+/// B4 the compiler no longer CALLS it: `gc_lower::emit_barrier` writes its
+/// fast half inline. The function stays for code that names it (the JIT
+/// helpers of Certus take its address).
 pub(crate) const FN_BARRIER: &str = "__gc_barrier";
+/// **Round B4** -- the slow half of the inline barrier: only called while a
+/// collection cycle is running (`S_PHASE != 0`).
+pub(crate) const FN_BARRIER_SLOW: &str = "__gc_barrier_slow";
+/// **Round B4** -- the two words of the state block the inline barrier
+/// touches. They are `S_BARRIEREN` and `S_PHASE` in `lib/gc/gc.fi`; the
+/// module test `barrier_offsets_match_the_runtime` holds the two in step,
+/// and `lib/firnc1/lower.fi` (`gc_barrier_inline`) carries the same values.
+pub(crate) const BARRIER_COUNT_OFF: u64 = 144;
+pub(crate) const PHASE_OFF: u64 = 320;
 /// Error set of the fallible allocation (DESIGN_GOALS §2).
 pub(crate) const ERR_SET: &str = "AllocError";
 /// **Round 47** — dispatcher of the finalizers (`SPEC` §3.5.3 `S4`).
@@ -219,6 +231,7 @@ pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
         || name == FN_STRONG
         || name == FN_AS
         || name == FN_BARRIER
+        || name == FN_BARRIER_SLOW
 }
 
 /// Is `t` a GC pointer type (`Gc[T]` or `GcWeak[T]`)? Writing into a field
@@ -400,7 +413,14 @@ impl<'a> Parser<'a> {
         if !self.expect(TokKind::LBracket, what) {
             return None;
         }
-        let r = self.ident(what)?;
+        let mut r = self.ident(what)?;
+        // Round GAPS: `Gc[module.Class]`. gc classes are global names (the
+        // module pass does not mangle them), so the qualifier only says
+        // where the class comes from -- the last segment is the class.
+        while self.at(&TokKind::Dot) {
+            self.bump();
+            r = self.ident(what)?;
+        }
         if !self.expect(TokKind::RBracket, "after the type argument") {
             return None;
         }
@@ -469,14 +489,26 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     match name.as_str() {
         "gc" => {
             // `gc C{ … }` — allocation on the GC heap.
-            let class = match p.toks.get(p.pos + 1).map(|t| t.kind.clone()) {
+            let mut class = match p.toks.get(p.pos + 1).map(|t| t.kind.clone()) {
                 Some(TokKind::Ident(k)) if k != "class" => k,
                 _ => return None,
             };
-            if !matches!(p.toks.get(p.pos + 2).map(|t| &t.kind), Some(TokKind::LBrace)) {
+            // Round GAPS: `gc module.Class { … }` -- the class name is
+            // global (see `gc_ty_arg`), the qualifier is skipped.
+            let qualified = matches!(p.toks.get(p.pos + 2).map(|t| &t.kind), Some(TokKind::Dot))
+                && matches!(p.toks.get(p.pos + 3).map(|t| &t.kind), Some(TokKind::Ident(_)));
+            let brace_at = if qualified { 4 } else { 2 };
+            if !matches!(p.toks.get(p.pos + brace_at).map(|t| &t.kind), Some(TokKind::LBrace)) {
                 return None;
             }
             let sp = p.bump(); // 'gc'
+            if qualified {
+                p.bump(); // module
+                p.bump(); // '.'
+                if let Some(TokKind::Ident(k)) = p.toks.get(p.pos).map(|t| t.kind.clone()) {
+                    class = k;
+                }
+            }
             let ksp = p.bump(); // class label
             let span = Parser::join(sp, ksp);
             let saved = p.no_struct_lit;
@@ -1501,6 +1533,19 @@ mod tests {
         assert!(is_gc_alloc_call("dom__gc_collect"));
         assert!(!is_gc_alloc_call("gc_collectx"));
         assert!(!is_gc_alloc_call("tokenize"));
+    }
+
+    #[test]
+    fn barrier_offsets_match_the_runtime() {
+        // Round B4: the inline barrier hard-codes two offsets of the state
+        // block. If `lib/gc/gc.fi` moves a word, this fails before a single
+        // program counts into the wrong place.
+        let count = format!("const S_BARRIEREN: u64 = {}\n", BARRIER_COUNT_OFF);
+        let phase = format!("const S_PHASE: u64 = {}\n", PHASE_OFF);
+        assert!(RUNTIME.contains(&count), "S_BARRIEREN moved in lib/gc/gc.fi");
+        assert!(RUNTIME.contains(&phase), "S_PHASE moved in lib/gc/gc.fi");
+        assert!(RUNTIME.contains(&format!("fn {}(value: *mut u8) {{", FN_BARRIER_SLOW)));
+        assert!(is_gc_alloc_call(FN_BARRIER_SLOW));
     }
 
     #[test]

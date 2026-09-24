@@ -158,8 +158,14 @@ fn emit_table(
         e.line("cmp rax, rcx");
         e.line(&format!("ja {}", dflt));
     }
-    e.line(&format!("lea rdx, [rip + {}]", label));
-    e.line("jmp qword ptr [rdx + rax*8]");
+    // Round GAPS: the table base goes to `rcx`, NOT `rdx`. `rdx` is in the
+    // register allocator's POOL (regalloc.rs) and may carry a live value
+    // across the switch -- `tests/1652_switch_table_keeps_rdx.fi`: the
+    // operand of the taken arm sat in `rdx`, `lea rdx` overwrote it with the
+    // table address, and a bytecode loop jumped to garbage. `rcx` is pure
+    // scratch at every emission site and never holds a FIR value.
+    e.line(&format!("lea rcx, [rip + {}]", label));
+    e.line("jmp qword ptr [rcx + rax*8]");
 
     // table in .rodata; missing labels point to the default branch.
     e.raw(crate::target::reloc_rodata());
@@ -232,7 +238,7 @@ mod tests {
         f.set_term(bd, Term::Ret(Some(cd)));
         f.set_term(0, Term::Switch { val: v, ty: FTy::I32, cases, default: bd });
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
-        assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
+        assert!(asm.contains("jmp qword ptr [rcx + rax*8]"), "{}", asm);
         assert!(asm.contains(".section .rodata"), "{}", asm);
         assert!(asm.contains(".quad .Lmain__bb5"), "{}", asm);
         // no comparison chain any more

@@ -210,6 +210,13 @@ pub enum UnOp {
     Neg,
     /// bitwise not (integer) or logical not (bool)
     Not,
+    /// **Round GAPS** -- square root of a float (`__sqrt`, fsqrt.rs).
+    /// Correctly rounded by IEEE 754; only defined on `f64`/`f32`.
+    Sqrt,
+    /// **Round GAPS** -- reinterpret the bit pattern (`__bits`,
+    /// `__f64_from_bits`, `__f32_from_bits`, fbits.rs). The instruction type
+    /// is the target, the operand keeps its own type of the same width.
+    Bits,
 }
 
 #[derive(Clone, Debug)]
@@ -694,6 +701,18 @@ pub struct Func {
     /// generator rescues ALL general purpose registers and closes with `iretq`
     /// rather than `ret` (SPEC §2, kernel profile).
     pub interrupt: bool,
+    /// **Round EINBETTEN** -- `#[inline]` / `#[no_inline]`, the explicit will
+    /// of the programmer. `None` means: the compiler decides by its size
+    /// rule (`inline.rs`).
+    ///
+    /// `Some(true)`  -- INLINE, even if the body is above the size limit.
+    ///                 Recursion and the blocks of SPEC 9
+    ///                 (`secret`/`#[constant_time]`) still hold: they are
+    ///                 questions of correctness, not of taste.
+    /// `Some(false)` -- NEVER inline. Needed by whoever wants to see a frame
+    ///                 (debugging) or whose effect depends on the stack depth
+    ///                 (`__gc_scrub_deep`).
+    pub inline_hint: Option<bool>,
     /// **ROUND 94** -- the position every newly pushed instruction is stamped
     /// with. `lower.rs` sets it per statement and per expression; everything
     /// else leaves it alone. It belongs to the FUNCTION and not to a global:
@@ -716,6 +735,7 @@ impl Func {
             secret: std::collections::HashSet::new(),
             constant_time: false,
             interrupt: false,
+            inline_hint: None,
             loc_stamp: Loc::NONE,
         }
     }
@@ -971,6 +991,8 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Un(op, a) => match op {
             UnOp::Neg => format!("neg.{} %{}", t, a),
             UnOp::Not => format!("not.{} %{}", t, a),
+            UnOp::Sqrt => format!("sqrt.{} %{}", t, a),
+            UnOp::Bits => format!("bits.{} %{}", t, a),
         },
         Op::Cast { src, from } => format!("cast.{}.{} %{}", from.name(), t, src),
         Op::Alloca { size, align } => format!("alloca.ptr size={} align={}", size, align),

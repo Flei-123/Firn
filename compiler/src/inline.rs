@@ -99,6 +99,24 @@ fn reaches_itself_self(m: &Module, name: &str) -> bool {
     false
 }
 
+/// The HARD blocks: these are about correctness, not size. `#[inline]`
+/// lifts NONE of them.
+///
+///  * `#[constant_time]` / `secret` -- the check in the code generator works
+///    per function (SPEC 9.2). Inlined into a caller without the mark it
+///    would be gone, and a timing side channel promise silently broken.
+///  * `#[interrupt]` -- its own calling sequence, ends with `iretq` instead
+///    of `ret` (round 52). The body does not belong into an ordinary frame.
+///  * an unfinished block (`Term::Unset`) or a block list whose numbers are
+///    not in order -- then `blockmap` is wrong.
+fn allowed_at_all(callee: &Func) -> bool {
+    !callee.constant_time
+        && callee.secret.is_empty()
+        && !callee.interrupt
+        && !callee.blocks.iter().any(|b| matches!(b.term, Term::Unset))
+        && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
+}
+
 fn inlinable(callee: &Func) -> bool {
     // Loop free bodies WITHOUT a return value (effect through pointer
     // arguments, say the sink mutators of the tokenizer) may have more
@@ -110,25 +128,40 @@ fn inlinable(callee: &Func) -> bool {
     // for the stack scanning conservative GC (`tests/520_gc_weak.fi`,
     // round 37: `__gc_strong_raw` inlined into `create` produced phantom
     // pointers and exit 6).
-    !callee.constant_time
-        && callee.secret.is_empty()
-        && callee.inst_count() <= MAX_CALLEE_INSTS
-        && callee.blocks.len() <= MAX_CALLEE_BLOCKS
-        && !callee.blocks.iter().any(|b| matches!(b.term, Term::Unset))
-        && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
+    if !allowed_at_all(callee) {
+        return false;
+    }
+    // Round EINBETTEN -- the explicit will beats the size rule.
+    match callee.inline_hint {
+        // `#[no_inline]`: never, no exceptions.
+        Some(false) => return false,
+        // `#[inline]`: the size limits do not apply. That is what the JIT
+        // needs for its helpers -- their bodies are above 40 instructions,
+        // and without this path the call stays.
+        Some(true) => return true,
+        None => {}
+    }
+    callee.inst_count() <= MAX_CALLEE_INSTS && callee.blocks.len() <= MAX_CALLEE_BLOCKS
 }
 
 /// Looks for a worthwhile call site in the caller `ci`.
 /// `self_rec`: precomputed per function (does not change through
 /// embeddings — only the caller is mutated).
-fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, usize)> {
+fn find_site(
+    m: &Module,
+    ci: usize,
+    self_rec: &[bool],
+    requested_only: bool,
+) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
         return None;
     }
-    if caller.inst_count() > MAX_CALLER_INSTS {
-        return None;
-    }
+    // The caller limit protects compile time and code size. But it must not
+    // lock out an EXPLICITLY requested inlining -- otherwise `#[inline]`
+    // would depend on how big the caller happens to be. So it is checked
+    // per call site below, not here for the whole function.
+    let caller_full = caller.inst_count() > MAX_CALLER_INSTS;
     if caller.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return None;
     }
@@ -141,6 +174,14 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
                 };
                 let callee = &m.funcs[gi];
                 if gi == ci || !inlinable(callee) {
+                    continue;
+                }
+                // A full caller only takes what is explicitly requested.
+                if caller_full && callee.inline_hint != Some(true) {
+                    continue;
+                }
+                // Default level: ONLY what carries `#[inline]`.
+                if requested_only && callee.inline_hint != Some(true) {
                     continue;
                 }
                 if callee.params.len() != args.len() {
@@ -220,11 +261,14 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
 
     // 3. Create the blocks of the body + the continuation block.
     let mut blockmap: HashMap<u32, u32> = HashMap::new();
+    let mut new_ids: Vec<u32> = Vec::with_capacity(callee.blocks.len() + 1);
     for b in &callee.blocks {
         let nb = f.add_block();
         blockmap.insert(b.id, nb);
+        new_ids.push(nb);
     }
     let cont = f.add_block();
+    new_ids.push(cont);
 
     // 4. Split the calling block.
     let tail: Vec<Inst> = f.blocks[bi].insts.split_off(ii + 1);
@@ -318,6 +362,10 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
             Term::Unset => Term::Br(cont),
         };
     }
+
+    // Round EINBETTEN: move the body right behind the calling block.
+    // Reason and measurement are at `reorder_blocks`.
+    reorder_blocks(f, bi, &new_ids);
 }
 
 /// ROUND 92 -- `blockmap` is the callee's block numbering translated into
@@ -411,9 +459,120 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
     }
 }
 
+/// Round EINBETTEN -- only the EXPLICITLY requested inlinings.
+///
+/// This is the pass for the default level (`dev-fast`). The size rule stays
+/// off there: it makes the call stack unreadable, and `dev-fast` is the
+/// level people debug at. `#[inline]` on the other hand is a promise to the
+/// programmer -- it must not depend on the build switch, otherwise one
+/// silently measures something other than what one built (as round JIT
+/// did).
+pub fn inline_module_requested_only(m: &mut Module) -> usize {
+    inline_module_inner(m, true)
+}
+
+/// Round EINBETTEN -- MOVE THE BLOCKS OF THE INLINED BODY FORWARD.
+///
+/// `Func::add_block` only appends. An inlined body therefore lands at the
+/// END of the function, even if the call site sits in the first loop. That
+/// is not cosmetic:
+///
+/// `regalloc.rs` builds live intervals as `[smallest position, largest
+/// position]` over the LINEAR block order (`live.block_start` /
+/// `live.block_end`). If the body sits behind all other blocks, the
+/// interval of every value that lives into the body and back out spans the
+/// WHOLE function -- including unrelated loops. There it collides with
+/// their values and gets spilled.
+///
+/// MEASURED (dev-fast, round EINBETTEN):
+///   * one loop, the body lands right next to it:
+///     2.35 ns -> 1.08 ns per iteration = 2.2x BETTER.
+///   * the same computation, but TWO loops in `main`, the body lands behind
+///     the second: 2.37 ns -> 3.44 ns = WORSE.
+/// Same body, same inlining -- only the block distance decides.
+///
+/// So the blocks are reordered here: the body and the continuation block
+/// move right behind the calling block. Block numbers are an INDEX
+/// (everywhere in the compiler `b.id as usize == i`, see `mem2reg.rs`,
+/// `opt.rs`, `regalloc.rs`), so number, jump targets and the block operands
+/// of every `phi` have to be rewritten together.
+fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
+    let n = f.blocks.len();
+    if new_ids.is_empty() || after >= n {
+        return;
+    }
+    // The desired order: everything up to and including `after`, then the
+    // new blocks, then the rest.
+    let new_set: std::collections::HashSet<u32> = new_ids.iter().copied().collect();
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..=after {
+        let id = i as u32;
+        if !new_set.contains(&id) {
+            order.push(id);
+        }
+    }
+    for &b in new_ids {
+        order.push(b);
+    }
+    for i in (after + 1)..n {
+        let id = i as u32;
+        if !new_set.contains(&id) {
+            order.push(id);
+        }
+    }
+    if order.len() != n {
+        return; // something is off -- better not reorder at all
+    }
+    // old -> new
+    let mut map = vec![0u32; n];
+    for (new_i, &old) in order.iter().enumerate() {
+        map[old as usize] = new_i as u32;
+    }
+    // Bring the blocks into the new order ...
+    let old_blocks = std::mem::take(&mut f.blocks);
+    let mut by_id: Vec<Option<crate::fir::Block>> = old_blocks.into_iter().map(Some).collect();
+    let mut new_blocks: Vec<crate::fir::Block> = Vec::with_capacity(n);
+    for &old in &order {
+        let mut b = by_id[old as usize].take().expect("block handed out twice");
+        b.id = map[old as usize];
+        new_blocks.push(b);
+    }
+    f.blocks = new_blocks;
+    // ... and carry every block operand along: jump targets and phi edges.
+    let mv = |b: &u32| -> u32 { map[*b as usize] };
+    for b in f.blocks.iter_mut() {
+        b.term = match &b.term {
+            Term::Br(t) => Term::Br(mv(t)),
+            Term::BrCond { cond, then_bb, else_bb } => {
+                Term::BrCond { cond: *cond, then_bb: mv(then_bb), else_bb: mv(else_bb) }
+            }
+            Term::Switch { val, ty, cases, default } => Term::Switch {
+                val: *val,
+                ty: *ty,
+                cases: cases.iter().map(|(k, t)| (*k, mv(t))).collect(),
+                default: mv(default),
+            },
+            Term::Ret(v) => Term::Ret(*v),
+            Term::Unset => Term::Unset,
+        };
+        for i in b.insts.iter_mut() {
+            if let Op::Phi { incoming } = &mut i.op {
+                for e in incoming.iter_mut() {
+                    e.0 = map[e.0 as usize];
+                }
+                incoming.sort_by_key(|(p, _)| *p);
+            }
+        }
+    }
+}
+
 /// Embeds as long as the heuristic allows. Yields the number of embedded
 /// calls.
 pub fn inline_module(m: &mut Module) -> usize {
+    inline_module_inner(m, false)
+}
+
+fn inline_module_inner(m: &mut Module, requested_only: bool) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
     // Determined once: it hangs off the body of the callee only, which never
@@ -425,7 +584,7 @@ pub fn inline_module(m: &mut Module) -> usize {
         .collect();
     'outer: loop {
         for ci in 0..m.funcs.len() {
-            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec) {
+            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec, requested_only) {
                 if dbg {
                     eprintln!("inline: {} <- {} ({} insts, {} blocks)",
                         m.funcs[ci].name, m.funcs[gi].name,
@@ -519,6 +678,116 @@ mod tests {
         crate::opt::optimize(&mut m);
         let main = m.funcs.iter().find(|f| f.name == "main").expect("main");
         assert!(main.blocks[0].insts.iter().any(|i| matches!(i.op, Op::Const(9))));
+    }
+
+    /// Round EINBETTEN: `#[no_inline]` forbids inlining, even if the body is
+    /// tiny and the size rule would have taken it.
+    #[test]
+    fn no_inline_forbids_inlining() {
+        let mut m = Module::new();
+        let mut g = add_fn();
+        g.inline_hint = Some(false);
+        m.funcs.push(g);
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let a = f.push(0, FTy::I32, Op::Const(2));
+        let r = f.push(0, FTy::I32, Op::Call { name: "add".into(), args: vec![a, a] });
+        f.set_term(0, Term::Ret(Some(r)));
+        m.funcs.push(f);
+        assert_eq!(inline_module(&mut m), 0);
+    }
+
+    /// `#[inline]` lifts the SIZE LIMIT: a body above `MAX_CALLEE_INSTS` is
+    /// inlined, which the rule would otherwise refuse.
+    #[test]
+    fn inline_lifts_the_size_limit() {
+        // A body with clearly more than MAX_CALLEE_INSTS instructions.
+        let mut g = Func::new("big", vec![FTy::I32], FTy::I32);
+        let mut cur: Val = 0;
+        for _ in 0..(MAX_CALLEE_INSTS + 10) {
+            cur = g.push(0, FTy::I32, Op::Bin(BinOp::Add, cur, 0));
+        }
+        g.set_term(0, Term::Ret(Some(cur)));
+        assert!(g.inst_count() > MAX_CALLEE_INSTS);
+        let build = |g: Func| {
+            let mut m = Module::new();
+            m.funcs.push(g);
+            let mut f = Func::new("main", vec![], FTy::I32);
+            let a = f.push(0, FTy::I32, Op::Const(1));
+            let r = f.push(0, FTy::I32, Op::Call { name: "big".into(), args: vec![a] });
+            f.set_term(0, Term::Ret(Some(r)));
+            m.funcs.push(f);
+            m
+        };
+        // without the mark: the size rule refuses
+        let mut m1 = build(g.clone());
+        assert_eq!(inline_module(&mut m1), 0);
+        // with #[inline]: inlined
+        g.inline_hint = Some(true);
+        let mut m2 = build(g);
+        assert_eq!(inline_module(&mut m2), 1);
+    }
+
+    /// The HARD blocks stay: `#[inline]` on a `#[constant_time]` function
+    /// changes nothing. That is a question of correctness (SPEC 9.2).
+    #[test]
+    fn inline_does_not_lift_the_hard_blocks() {
+        let mut m = Module::new();
+        let mut g = add_fn();
+        g.constant_time = true;
+        g.inline_hint = Some(true);
+        m.funcs.push(g);
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let a = f.push(0, FTy::I32, Op::Const(2));
+        let r = f.push(0, FTy::I32, Op::Call { name: "add".into(), args: vec![a, a] });
+        f.set_term(0, Term::Ret(Some(r)));
+        m.funcs.push(f);
+        assert_eq!(inline_module(&mut m), 0);
+    }
+
+    /// Recursion stays blocked too, with `#[inline]` as without.
+    #[test]
+    fn inline_does_not_break_the_recursion_block() {
+        let mut m = Module::new();
+        let mut f = Func::new("fact", vec![FTy::I32], FTy::I32);
+        f.inline_hint = Some(true);
+        let one = f.push(0, FTy::I32, Op::Const(1));
+        let c = f.push(0, FTy::Bool, Op::Cmp { op: CmpOp::Le, ty: FTy::I32, a: 0, b: one });
+        let bt = f.add_block();
+        let be = f.add_block();
+        f.set_term(0, Term::BrCond { cond: c, then_bb: bt, else_bb: be });
+        f.set_term(bt, Term::Ret(Some(one)));
+        let sub = f.push(be, FTy::I32, Op::Bin(BinOp::Sub, 0, one));
+        let rc = f.push(be, FTy::I32, Op::Call { name: "fact".into(), args: vec![sub] });
+        let mu = f.push(be, FTy::I32, Op::Bin(BinOp::Mul, 0, rc));
+        f.set_term(be, Term::Ret(Some(mu)));
+        m.funcs.push(f);
+        assert_eq!(inline_module(&mut m), 0);
+    }
+
+    /// The pass of the default level takes ONLY what carries `#[inline]`.
+    #[test]
+    fn requested_only_takes_only_marked() {
+        let build = |hint: Option<bool>| {
+            let mut m = Module::new();
+            let mut g = add_fn();
+            g.inline_hint = hint;
+            m.funcs.push(g);
+            let mut f = Func::new("main", vec![], FTy::I32);
+            let a = f.push(0, FTy::I32, Op::Const(2));
+            let r = f.push(0, FTy::I32, Op::Call { name: "add".into(), args: vec![a, a] });
+            f.set_term(0, Term::Ret(Some(r)));
+            m.funcs.push(f);
+            m
+        };
+        // without the mark: the default pass leaves the call alone ...
+        let mut m1 = build(None);
+        assert_eq!(inline_module_requested_only(&mut m1), 0);
+        // ... although the size rule would have taken it.
+        let mut m2 = build(None);
+        assert_eq!(inline_module(&mut m2), 1);
+        // with the mark: the default pass takes it too.
+        let mut m3 = build(Some(true));
+        assert_eq!(inline_module_requested_only(&mut m3), 1);
     }
 
     #[test]
