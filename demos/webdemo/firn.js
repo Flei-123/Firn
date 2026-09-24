@@ -19,7 +19,11 @@ const firnTag = document.currentScript;
 (async () => {
     const q = new URLSearchParams(location.search);
     const canvas = document.getElementById('firn');
-    const g = canvas.getContext('2d', { alpha: false });
+    // One context per canvas, chosen by the module: WebGL2 when it asked
+    // for the GPU (firn_gl_init), else the 2d context for putImageData --
+    // made on first use, since a canvas that has one cannot get the other.
+    let g2 = null;
+    const ctx2d = () => g2 || (g2 = canvas.getContext('2d', { alpha: false }));
     const utf8 = new TextEncoder();
     const text = new TextDecoder();
     let mem = null, x = null; // the memory and the exports
@@ -97,14 +101,14 @@ const firnTag = document.currentScript;
     const env = {
         firn_web_present(p, w, h) {
             if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-            g.putImageData(image(p, w, h), 0, 0);
+            ctx2d().putImageData(image(p, w, h), 0, 0);
             window.firnFrames = ++frames;
         },
         // Only the rectangle that changed goes over (the dirty rectangle of
         // putImageData); a canvas that got a new size takes the whole picture.
         firn_web_present_rect(p, w, h, rx, ry, rw, rh) {
             if (canvas.width !== w || canvas.height !== h) return env.firn_web_present(p, w, h);
-            g.putImageData(image(p, w, h), 0, 0, rx, ry, rw, rh);
+            ctx2d().putImageData(image(p, w, h), 0, 0, rx, ry, rw, rh);
             window.firnFrames = ++frames;
         },
         // A timer of the page: a frame in `ms` milliseconds (the earliest wins).
@@ -143,8 +147,124 @@ const firnTag = document.currentScript;
         firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text'][k] || 'default'; },
     };
 
+    // THE GPU (lib/plat/webgl.fi, lib/fui/gpu.fi): WebGL2, one host call per
+    // GL call, no logic here. Objects cross as numbers (index into `O`).
+    // A frame the module drew on the GPU is on the canvas when the frame
+    // callback returns; `window.firnFrames` counts it (firn_gl_present).
+    let gl = null;
+    const O = [null];
+    const obj = (o) => { if (!o) return 0; O.push(o); return O.length - 1; };
+    const u8 = (p, n) => new Uint8Array(mem.buffer, p >>> 0, n >>> 0);
+    Object.assign(env, {
+        firn_gl_init(flags) {
+            if (gl) return 1;
+            if (q.get('gl') === '0') return 0;
+            try {
+                gl = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false,
+                    premultipliedAlpha: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
+            } catch (e) { gl = null; }
+            if (gl) {
+                // present = the frame ends: count it for the tests
+                // a lost context (a phone put the tab away): wait for it to
+                // come back, then the module makes its GPU objects anew
+                canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); console.error('firn: WebGL context lost'); });
+                canvas.addEventListener('webglcontextrestored', () => {
+                    for (let i = 1; i < O.length; i++) O[i] = null;
+                    O.length = 1;
+                    ev(x.firn_web_gl_restored());
+                });
+                window.firnGpu = true;
+            }
+            return gl ? 1 : 0;
+        },
+        firn_gl_size(w, h) { if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; } },
+        firn_gl_program(vp, vn, fp, fn, lp, lcap) {
+            const mk = (type, src) => {
+                const sh = gl.createShader(type);
+                gl.shaderSource(sh, src); gl.compileShader(sh);
+                if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { put(gl.getShaderInfoLog(sh), lp, lcap); return null; }
+                return sh;
+            };
+            const vs = mk(gl.VERTEX_SHADER, str(vp, vn)); if (!vs) return 0;
+            const fs = mk(gl.FRAGMENT_SHADER, str(fp, fn)); if (!fs) return 0;
+            const pr = gl.createProgram();
+            gl.attachShader(pr, vs); gl.attachShader(pr, fs); gl.linkProgram(pr);
+            if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) { put(gl.getProgramInfoLog(pr), lp, lcap); return 0; }
+            return obj(pr);
+        },
+        firn_gl_use_program(p) { gl.useProgram(O[p]); },
+        firn_gl_uniform_location(p, np, nn) { return obj(gl.getUniformLocation(O[p], str(np, nn))); },
+        firn_gl_uniform1i(l, v) { gl.uniform1i(O[l], v); },
+        firn_gl_uniform1f(l, v) { gl.uniform1f(O[l], v); },
+        firn_gl_uniform2f(l, a, b) { gl.uniform2f(O[l], a, b); },
+        firn_gl_uniform4f(l, a, b, c, d) { gl.uniform4f(O[l], a, b, c, d); },
+        firn_gl_create_buffer() { return obj(gl.createBuffer()); },
+        firn_gl_bind_buffer(t, b) { gl.bindBuffer(t, O[b]); },
+        firn_gl_buffer_data(t, p, n, u) { if (p) gl.bufferData(t, u8(p, n), u); else gl.bufferData(t, n, u); },
+        firn_gl_buffer_sub_data(t, off, p, n) { gl.bufferSubData(t, off, u8(p, n)); },
+        firn_gl_create_vertex_array() { return obj(gl.createVertexArray()); },
+        firn_gl_bind_vertex_array(v) { gl.bindVertexArray(O[v]); },
+        firn_gl_enable_vertex_attrib_array(i) { gl.enableVertexAttribArray(i); },
+        firn_gl_vertex_attrib_pointer(i, size, ty, norm, stride, off) { gl.vertexAttribPointer(i, size, ty, !!norm, stride, off); },
+        firn_gl_vertex_attrib_divisor(i, d) { gl.vertexAttribDivisor(i, d); },
+        firn_gl_create_texture() { return obj(gl.createTexture()); },
+        firn_gl_bind_texture(t, x) { gl.bindTexture(t, O[x]); },
+        firn_gl_active_texture(u) { gl.activeTexture(u); },
+        firn_gl_tex_image_2d(t, l, ifmt, w, h, fmt, ty, p, n) {
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+            gl.texImage2D(t, l, ifmt, w, h, 0, fmt, ty, p ? u8(p, n) : null);
+        },
+        firn_gl_tex_sub_image_2d(t, l, x, y, w, h, fmt, ty, p, n, rl) {
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+            gl.pixelStorei(gl.UNPACK_ROW_LENGTH, rl);
+            gl.texSubImage2D(t, l, x, y, w, h, fmt, ty, u8(p, n));
+            gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+        },
+        firn_gl_tex_parameteri(t, pn, v) { gl.texParameteri(t, pn, v); },
+        firn_gl_create_framebuffer() { return obj(gl.createFramebuffer()); },
+        firn_gl_bind_framebuffer(t, f) { gl.bindFramebuffer(t, f ? O[f] : null); },
+        firn_gl_framebuffer_texture_2d(t, at, tt, x, l) { gl.framebufferTexture2D(t, at, tt, O[x], l); },
+        firn_gl_check_framebuffer_status(t) { return gl.checkFramebufferStatus(t); },
+        firn_gl_blit_framebuffer(a, b, c, d, e, f, g_, h, m, fl) {
+            gl.blitFramebuffer(a, b, c, d, e, f, g_, h, m, fl);
+            // the picture onto the screen: the default framebuffer drawn
+            if (gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) === null) window.firnFrames = ++frames;
+        },
+        firn_gl_copy_tex_sub_image_2d(t, l, a, b, c, d, e, f) { gl.copyTexSubImage2D(t, l, a, b, c, d, e, f); },
+        firn_gl_viewport(x, y, w, h) { gl.viewport(x, y, w, h); },
+        firn_gl_scissor(x, y, w, h) { gl.scissor(x, y, w, h); },
+        firn_gl_enable(c) { gl.enable(c); },
+        firn_gl_disable(c) { gl.disable(c); },
+        firn_gl_blend_func_separate(a, b, c, d) { gl.blendFuncSeparate(a, b, c, d); },
+        firn_gl_clear_color(r, g_, b, a) { gl.clearColor(r, g_, b, a); },
+        firn_gl_clear(m) { gl.clear(m); },
+        firn_gl_draw_arrays(m, f, c) { gl.drawArrays(m, f, c); },
+        firn_gl_draw_arrays_instanced(m, f, c, n) { gl.drawArraysInstanced(m, f, c, n); },
+        firn_gl_read_pixels(x, y, w, h, p) { gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, u8(p, w * h * 4)); },
+        firn_gl_delete(kind, id) {
+            const o = O[id]; if (!o) return;
+            [null, 'deleteTexture', 'deleteBuffer', 'deleteFramebuffer', 'deleteProgram', 'deleteShader', 'deleteVertexArray']
+                .forEach((f, k) => { if (k === kind && f) gl[f](o); });
+            O[id] = null;
+        },
+        firn_gl_get_error() { return gl ? gl.getError() : 0; },
+        firn_gl_finish() { if (gl) gl.finish(); },
+    });
+
+    // The program and the font are asked for AT ONCE (they do not depend
+    // on each other), and the program is compiled while it downloads when
+    // the server says what it is (application/wasm) -- otherwise the old
+    // way, whole, then compiled.
     const wasm = q.get('wasm') || firnTag.dataset.wasm || 'gallery9.wasm';
-    const { instance } = await WebAssembly.instantiate(await (await fetch(wasm)).arrayBuffer(), { firn, env });
+    const fontAsked = fetch(q.get('font') || firnTag.dataset.font || 'DejaVuSans.ttf').then((r) => r.arrayBuffer());
+    const wasmAsked = fetch(wasm);
+    let instance;
+    const resp = await wasmAsked;
+    if (WebAssembly.instantiateStreaming && (resp.headers.get('Content-Type') || '').startsWith('application/wasm')) {
+        ({ instance } = await WebAssembly.instantiateStreaming(resp, { firn, env }));
+    } else {
+        ({ instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), { firn, env }));
+    }
     x = instance.exports;
     mem = x.memory;
     onDemand = typeof x.firn_web_clock === 'function' && x.firn_web_clock() >= 2;
@@ -157,7 +277,7 @@ const firnTag = document.currentScript;
 
     // The font. A page has no files, so the host fetches it and hands the
     // octets over; the module keeps them.
-    const font = new Uint8Array(await (await fetch(q.get('font') || firnTag.dataset.font || 'DejaVuSans.ttf')).arrayBuffer());
+    const font = new Uint8Array(await fontAsked);
     const fp = x.firn_web_alloc(font.length);
     bytes(fp, font.length).set(font);
     if (!ev(x.firn_web_font(fp, font.length))) console.error('firn: the font was refused');
@@ -181,9 +301,22 @@ const firnTag = document.currentScript;
     // In the background or back: an event of its own on the stream path
     // (name "vis", data "0" hidden / "1" visible), sent at once when the
     // page starts hidden. A page that does not know the name ignores it.
-    const vis = () => x.firn_web_stream_event(...give('vis'), ...give(document.hidden ? '0' : '1'));
+    const vis = () => ev(x.firn_web_stream_event(...give('vis'), ...give(document.hidden ? '0' : '1')));
     document.addEventListener('visibilitychange', vis);
     if (document.hidden) vis();
+    // The window's focus (name "focus", "0" lost / "1" back -- a caret
+    // stops blinking) and the system's wish for less motion (name "motion",
+    // "1" = prefers-reduced-motion), the same way; each sent at once when
+    // it is not the ordinary state.
+    // (Each asks for a frame: a caret that may blink again needs one.)
+    const said = (n, v) => ev(x.firn_web_stream_event(...give(n), ...give(v)));
+    addEventListener('blur', () => said('focus', '0'));
+    addEventListener('focus', () => said('focus', '1'));
+    if (!document.hasFocus()) said('focus', '0');
+    const rm = matchMedia('(prefers-reduced-motion: reduce)');
+    const motion = () => said('motion', rm.matches ? '1' : '0');
+    if (rm.addEventListener) rm.addEventListener('change', motion);
+    if (rm.matches) motion();
 
     // The events, as they come. Bit 8 of the buttons: a finger or a pen.
     const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];

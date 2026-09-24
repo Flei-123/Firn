@@ -1,0 +1,1553 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/gpu.fi -- THE GPU BACKEND OF fUi (fUi tempo, stage 2, 24.09.2026).
+//
+// ================================================================ WHY
+//
+// fUi rasters every picture on the CPU: rectangles, round shapes, text,
+// shadows, glass. MEASURED on chat.fleitec.com (Chromium, 1996 x 1211,
+// the look with glass): a whole picture of the conversation took 150 to
+// 350 ms in WebAssembly, and a picture on an Android emulator 885 ms. No
+// amount of "paint only what changed" makes the WHOLE pictures fast -- a
+// new line, a slide, a theme change, a new size -- and a GPU draws such a
+// picture in well under a millisecond.
+//
+// ================================================================ WHAT
+//
+// A canvas can be GPU-BACKED (`gpu_attach`): its pixels are a texture on
+// the GPU, and everything fUi paints into it goes there instead of into
+// memory -- through the same calls as before:
+//
+//   canvas.fi      carries the GPU's context and refuses writes that
+//                  would miss it (canvas_stray_writes counts them)
+//   painter.fi     round rectangles, rings and gradients as shapes of
+//                  their own; text as GLYPHS out of an atlas
+//   icons.fi       the coverage of an icon, rastered once, into the atlas
+//   effect.fi      rrect_fast, rrect_shadow, ramp_rect, veil_rect,
+//                  glow_ground, frost_rect (the glass), the kept pictures
+//                  (keep_*), layers and the slide -- each as a shader;
+//                  whatever has no shader yet is read back, done in
+//                  software and put back (`gpu_sw_begin/_end`) -- correct,
+//                  only slow: blur_rect, drop shadows, the colour matrix
+//   transform.fi   turned shapes and turned text as masks; turned
+//                  pictures through the read-back
+//   uiimage.fi     pictures through the read-back (sampled per pixel)
+//
+// WHERE IT RUNS: in a browser through WebGL2 (lib/plat/webgl.fi, the host
+// calls of demos/webdemo/firn.js; lib/plat/web.fi attaches the canvas when
+// the page says web_use_gpu), and on Android through OpenGL ES 3 on an EGL
+// window surface (lib/plat/gles.fi, lib/window/android.fi; the window loop
+// lib/plat/fuiwin.fi and FirnChat's window take it when window.gpu_open
+// says yes). X11, Windows and Osum answer no: a Firn program there has no
+// way to the system's GL library yet (it is linked statically).
+//
+// The software painter stays: it is the FALLBACK (no GPU, no WebGL2) and
+// the REFERENCE. The shaders replay the arithmetic of the software paths
+// (rrect_fast's closed-form corners, the shadow's octagon, the integer
+// shrink / box blur / tint / stretch of frost_rect); where the software
+// has integer rounding, the shader has the same integer rounding. What
+// stays different: glyphs are rastered once per quarter pixel instead of
+// at their exact position, coverage in the atlas is 8 bit, and painter
+// round rectangles are closed-form instead of the cubic arc -- a few
+// levels on antialiased edges (tools/wasm/gpucheck.py measures it).
+//
+// ================================================================ HOW
+//
+// Everything is ONE instanced draw of quads per batch: each quad carries
+// its kind (rectangle, mask, round rectangle, shadow, ...), its colours,
+// its geometry and the clip, and ONE fragment shader decides per pixel.
+// A batch ends when the target changes, a texture that is sampled
+// changes, or an effect needs what was drawn so far. The GL calls go
+// through a table (lib/paint/gl.fi) that the platform fills -- a program
+// that never switches the GPU on links no GL at all.
+//
+// COORDINATES are device pixels, y down, as everywhere in fUi. A target's
+// row y lies in texel row h - 1 - y (GL counts from the bottom); the
+// shaders and the read-back turn it around.
+import std.rt
+import paint.canvas
+import font.raster
+import paint.gl
+
+export {
+    Gpu, gpu_new, gpu_open, gpu_ok, gpu_attach, gpu_detach, gpu_of,
+    gpu_frame_begin, gpu_present, gpu_present_at, gpu_flush, gpu_read, gpu_finish,
+    gpu_clear, gpu_fill_raster,
+    gpu_rect, gpu_mask_at, gpu_rrect_fast, gpu_rrect_shadow, gpu_ramp,
+    gpu_veil, gpu_glow, gpu_round, gpu_frost,
+    gpu_sw_begin, gpu_sw_end, gpu_upload_band, gpu_stray,
+    Target, target_new, gpu_target_make, gpu_target_free, gpu_target_ok, gpu_copy,
+    gpu_draw_target, gpu_draw_pixels, gpu_main, gpu_clear_rows, gpu_tmp,
+    AKey, akey_new, gpu_atlas_find, gpu_atlas_put, gpu_atlas_draw,
+    gpu_stats, GPU_VERSION,
+}
+
+const GPU_VERSION: u32 = 1
+
+// ------------------------------------------------------------ the kinds
+const K_RECT: f64 = 0.0
+const K_MASK: f64 = 1.0
+const K_RRECT: f64 = 2.0
+const K_SHADOW: f64 = 3.0
+const K_RAMP: f64 = 4.0
+const K_VEIL: f64 = 5.0
+const K_GLOW: f64 = 6.0
+const K_TEX: f64 = 7.0
+const K_ROUND: f64 = 8.0
+const K_STRETCH: f64 = 9.0
+const K_SHRINK: f64 = 10.0
+const K_BOXH: f64 = 11.0
+const K_BOXV: f64 = 12.0
+const K_BOX2H: f64 = 13.0
+const K_BOX2V: f64 = 14.0
+const K_TINT: f64 = 15.0
+
+// One quad: 32 floats (f32), see VS/FS below.
+const INST_F: usize = 32
+const INST_B: usize = 128
+const INST_MAX: usize = 4096
+
+const ATLAS_W: usize = 2048
+const ATLAS_H: usize = 2048
+const STREAM_W: usize = 2048
+const STREAM_H: usize = 1024
+const TABLE_N: usize = 16384
+
+// ============================================================ THE SHADERS
+//
+// GLSL ES 3.00: WebGL2, OpenGL ES 3 and (with #version 330 core swapped in
+// by a desktop table) OpenGL 3.3 all take it.
+
+fn vs_src() -> str {
+    return __include_str("gpu_vs.glsl")
+}
+
+fn fs_src() -> str {
+    return __include_str("gpu_fs.glsl")
+}
+
+// ============================================================ THE STATE
+
+// A place the GPU draws into: a framebuffer with a texture behind it.
+struct Target {
+    fb: u32,
+    tex: u32,
+    w: i32,
+    h: i32,
+    gen: u32, // the generation of the GPU it was made on (see gpu_open)
+}
+
+fn target_new() -> Target {
+    return Target { fb: 0 as u32, tex: 0 as u32, w: 0, h: 0, gen: 0 as u32 }
+}
+
+// The key of a coverage in the atlas: what it is (glyph, icon, ...) and
+// everything it depends on, as eight words.
+struct AKey {
+    k: [u64; 8],
+}
+
+fn akey_new() -> AKey {
+    return AKey { k: [0; 8] }
+}
+
+struct Gpu {
+    api: *mut gl.GlApi,
+    ok: bool,
+    // THE GENERATION: a lost GL context takes every object with it; after
+    // a restore the renderer is opened anew (gen + 1) and every Target of
+    // an older generation is made again instead of being used
+    gen: u32,
+    prog: u32,
+    u_size: u32,
+    u_srcsize: u32,
+    u_atlas: u32,
+    u_stream: u32,
+    u_src: u32,
+    u_nspot: u32,
+    u_spot: [u32; 8],
+    vao: u32,
+    quad: u32,
+    ibuf: u32,
+    inst: u64, // INST_MAX quads of f32
+    n: usize,
+    // the batch: where it draws, whether it blends, what it samples
+    tgt: *mut Target,
+    blend: bool,
+    src: u32,
+    src_w: i32,
+    src_h: i32,
+    spots: bool,
+    // the canvas's own target and the screen
+    main: Target,
+    cv: u64, // *mut canvas.Canvas that is backed by `main`
+    screen_w: i32,
+    screen_h: i32,
+    // THE ATLAS of kept coverage (glyphs, icons): R8, a mirror in memory,
+    // shelves, the rectangle not yet uploaded, the table of keys
+    atlas: u32,
+    amem: u64,
+    shelf_x: usize,
+    shelf_y: usize,
+    shelf_h: usize,
+    ad_x0: usize,
+    ad_y0: usize,
+    ad_x1: usize,
+    ad_y1: usize,
+    table: u64,
+    tcount: usize,
+    // THE STREAM: coverage used once (a path rastered on the CPU)
+    stream: u32,
+    smem: u64,
+    ss_x: usize,
+    ss_y: usize,
+    ss_h: usize,
+    sd_y0: usize,
+    sd_y1: usize,
+    // one texture for pixels that come from memory (a software layer)
+    up: u32,
+    up_w: i32,
+    up_h: i32,
+    // scratch targets: two small ones (the glass), one of the canvas size
+    s1: Target,
+    s2: Target,
+    tmp: Target,
+    // counters
+    draws: u64,
+    quads: u64,
+    uploads: u64,
+    readbacks: u64,
+    stray: u64,
+    frames: u64,
+}
+
+fn gpu_new() -> Gpu {
+    return Gpu {
+        api: 0 as u64 as *mut gl.GlApi, ok: false, gen: 0 as u32, prog: 0 as u32,
+        u_size: 0 as u32, u_srcsize: 0 as u32, u_atlas: 0 as u32,
+        u_stream: 0 as u32, u_src: 0 as u32, u_nspot: 0 as u32,
+        u_spot: [0 as u32; 8], vao: 0 as u32, quad: 0 as u32, ibuf: 0 as u32,
+        inst: 0, n: 0, tgt: 0 as u64 as *mut Target, blend: true,
+        src: 0 as u32, src_w: 0, src_h: 0, spots: false,
+        main: target_new(), cv: 0,
+        screen_w: 0, screen_h: 0,
+        atlas: 0 as u32, amem: 0, shelf_x: 0, shelf_y: 0, shelf_h: 0,
+        ad_x0: 0, ad_y0: 0, ad_x1: 0, ad_y1: 0, table: 0, tcount: 0,
+        stream: 0 as u32, smem: 0, ss_x: 0, ss_y: 0, ss_h: 0, sd_y0: 0,
+        sd_y1: 0, up: 0 as u32, up_w: 0, up_h: 0,
+        s1: target_new(), s2: target_new(), tmp: target_new(),
+        draws: 0, quads: 0, uploads: 0, readbacks: 0, stray: 0, frames: 0,
+    }
+}
+
+fn gpu_ok(g: *mut Gpu) -> bool {
+    return (g as u64) != 0 && (*g).ok
+}
+
+// The GPU a canvas draws into, 0 when it paints in memory.
+#[no_gc]
+fn gpu_of(cv: *mut canvas.Canvas) -> *mut Gpu {
+    return canvas.canvas_gpu(cv) as *mut Gpu
+}
+
+fn a(g: *mut Gpu) -> *mut gl.GlApi {
+    return (*g).api
+}
+
+// ---- the table, called with the narrow types this file keeps (the table
+// itself takes everything 64 bits wide -- see lib/paint/gl.fi)
+fn x_program(t: *mut gl.GlApi, a0: u64, a1: usize, b0: u64, b1: usize, c0: u64, c1: usize) -> u32 { return (*t).program(a0, a1, b0, b1, c0, c1) as u32 }
+fn x_use_program(t: *mut gl.GlApi, p: u32) { (*t).use_program(p as u64) }
+fn x_uniform_location(t: *mut gl.GlApi, p: u32, np: u64, nn: usize) -> u32 { return (*t).uniform_location(p as u64, np, nn) as u32 }
+fn x_uniform1i(t: *mut gl.GlApi, l: u32, v: i32) { (*t).uniform1i(l as u64, v as i64) }
+fn x_uniform2f(t: *mut gl.GlApi, l: u32, a0: f64, b0: f64) { (*t).uniform2f(l as u64, a0, b0) }
+fn x_uniform4f(t: *mut gl.GlApi, l: u32, a0: f64, b0: f64, c0: f64, d0: f64) { (*t).uniform4f(l as u64, a0, b0, c0, d0) }
+fn x_create_buffer(t: *mut gl.GlApi) -> u32 { return (*t).create_buffer() as u32 }
+fn x_bind_buffer(t: *mut gl.GlApi, tg: u32, b: u32) { (*t).bind_buffer(tg as u64, b as u64) }
+fn x_buffer_data(t: *mut gl.GlApi, tg: u32, p: u64, n: usize, u: u32) { (*t).buffer_data(tg as u64, p, n, u as u64) }
+fn x_buffer_sub_data(t: *mut gl.GlApi, tg: u32, off: usize, p: u64, n: usize) { (*t).buffer_sub_data(tg as u64, off, p, n) }
+fn x_create_vertex_array(t: *mut gl.GlApi) -> u32 { return (*t).create_vertex_array() as u32 }
+fn x_bind_vertex_array(t: *mut gl.GlApi, v: u32) { (*t).bind_vertex_array(v as u64) }
+fn x_enable_vertex_attrib_array(t: *mut gl.GlApi, i: u32) { (*t).enable_vertex_attrib_array(i as u64) }
+fn x_vertex_attrib_pointer(t: *mut gl.GlApi, i: u32, size: i32, ty: u32, norm: bool, stride: i32, off: usize) {
+    var n: u64 = 0
+    if norm {
+        n = 1
+    }
+    (*t).vertex_attrib_pointer(i as u64, size as i64, ty as u64, n, stride as i64, off)
+}
+fn x_vertex_attrib_divisor(t: *mut gl.GlApi, i: u32, d: u32) { (*t).vertex_attrib_divisor(i as u64, d as u64) }
+fn x_create_texture(t: *mut gl.GlApi) -> u32 { return (*t).create_texture() as u32 }
+fn x_bind_texture(t: *mut gl.GlApi, tg: u32, x: u32) { (*t).bind_texture(tg as u64, x as u64) }
+fn x_active_texture(t: *mut gl.GlApi, u: u32) { (*t).active_texture(u as u64) }
+fn x_tex_image_2d(t: *mut gl.GlApi, tg: u32, l: i32, ifmt: u32, w: i32, h: i32, fmt: u32, ty: u32, p: u64, n: usize) {
+    (*t).tex_image_2d(tg as u64, l as i64, ifmt as u64, w as i64, h as i64, fmt as u64, ty as u64, p, n)
+}
+fn x_tex_sub_image_2d(t: *mut gl.GlApi, tg: u32, l: i32, x: i32, y: i32, w: i32, h: i32, fmt: u32, ty: u32, p: u64, n: usize, rl: i32) {
+    (*t).tex_sub_image_2d(tg as u64, l as i64, x as i64, y as i64, w as i64, h as i64, fmt as u64, ty as u64, p, n, rl as i64)
+}
+fn x_tex_parameteri(t: *mut gl.GlApi, tg: u32, pn: u32, v: i32) { (*t).tex_parameteri(tg as u64, pn as u64, v as i64) }
+fn x_create_framebuffer(t: *mut gl.GlApi) -> u32 { return (*t).create_framebuffer() as u32 }
+fn x_bind_framebuffer(t: *mut gl.GlApi, tg: u32, f: u32) { (*t).bind_framebuffer(tg as u64, f as u64) }
+fn x_framebuffer_texture_2d(t: *mut gl.GlApi, tg: u32, at: u32, tt: u32, x: u32, l: i32) {
+    (*t).framebuffer_texture_2d(tg as u64, at as u64, tt as u64, x as u64, l as i64)
+}
+fn x_check_framebuffer_status(t: *mut gl.GlApi, tg: u32) -> u32 { return (*t).check_framebuffer_status(tg as u64) as u32 }
+fn x_blit_framebuffer(t: *mut gl.GlApi, a0: i32, b0: i32, c0: i32, d0: i32, e0: i32, f0: i32, g0: i32, h0: i32, m: u32, fl: u32) {
+    (*t).blit_framebuffer(a0 as i64, b0 as i64, c0 as i64, d0 as i64, e0 as i64, f0 as i64, g0 as i64, h0 as i64, m as u64, fl as u64)
+}
+fn x_viewport(t: *mut gl.GlApi, x: i32, y: i32, w: i32, h: i32) { (*t).viewport(x as i64, y as i64, w as i64, h as i64) }
+fn x_scissor(t: *mut gl.GlApi, x: i32, y: i32, w: i32, h: i32) { (*t).scissor(x as i64, y as i64, w as i64, h as i64) }
+fn x_enable(t: *mut gl.GlApi, c: u32) { (*t).enable(c as u64) }
+fn x_disable(t: *mut gl.GlApi, c: u32) { (*t).disable(c as u64) }
+fn x_blend_func_separate(t: *mut gl.GlApi, a0: u32, b0: u32, c0: u32, d0: u32) { (*t).blend_func_separate(a0 as u64, b0 as u64, c0 as u64, d0 as u64) }
+fn x_clear_color(t: *mut gl.GlApi, r: f64, g0: f64, b0: f64, a0: f64) { (*t).clear_color(r, g0, b0, a0) }
+fn x_clear(t: *mut gl.GlApi, m: u32) { (*t).clear(m as u64) }
+fn x_draw_arrays_instanced(t: *mut gl.GlApi, m: u32, f: i32, c: i32, n: i32) { (*t).draw_arrays_instanced(m as u64, f as i64, c as i64, n as i64) }
+fn x_read_pixels(t: *mut gl.GlApi, x: i32, y: i32, w: i32, h: i32, p: u64) { (*t).read_pixels(x as i64, y as i64, w as i64, h as i64, p) }
+fn x_delete_obj(t: *mut gl.GlApi, k: u32, id: u32) { (*t).delete_obj(k as u64, id as u64) }
+fn x_finish(t: *mut gl.GlApi) { (*t).finish() }
+
+
+fn say(s: str) {
+    rt.write_everything(2, s.p as u64, s.n)
+}
+
+// ---------------------------------------------------------------- opening
+
+fn make_texture(g: *mut Gpu, ifmt: u32, w: i32, h: i32, fmt: u32) -> u32 {
+    let api: *mut gl.GlApi = a(g)
+    let t: u32 = x_create_texture(api)
+    x_active_texture(api, gl.GL_TEXTURE0)
+    x_bind_texture(api, gl.GL_TEXTURE_2D, t)
+    x_tex_image_2d(api, gl.GL_TEXTURE_2D, 0, ifmt, w, h, fmt, gl.GL_UNSIGNED_BYTE, 0, 0)
+    x_tex_parameteri(api, gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST as i32)
+    x_tex_parameteri(api, gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST as i32)
+    x_tex_parameteri(api, gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE as i32)
+    x_tex_parameteri(api, gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE as i32)
+    return t
+}
+
+// Open the renderer on a GL table the platform filled. False (and the
+// program paints in memory, as before) when anything is missing.
+fn gpu_open(g: *mut Gpu, api: *mut gl.GlApi) -> bool {
+    (*g).api = api
+    (*g).ok = false
+    if !gl.gl_api_ok(api) {
+        return false
+    }
+    // a new generation: whatever was made before (a lost context) is
+    // forgotten, not deleted -- its numbers mean nothing any more
+    (*g).gen = (*g).gen + 1 as u32
+    (*g).n = 0
+    (*g).tgt = 0 as u64 as *mut Target
+    (*g).src = 0 as u32
+    (*g).up = 0 as u32
+    (*g).up_w = 0
+    (*g).up_h = 0
+    (*g).main = target_new()
+    (*g).s1 = target_new()
+    (*g).s2 = target_new()
+    (*g).tmp = target_new()
+    if (*g).inst != 0 {
+        rt.heap_free((*g).inst, INST_MAX * INST_B)
+        (*g).inst = 0
+    }
+    if (*g).amem != 0 {
+        rt.heap_free((*g).amem, ATLAS_W * ATLAS_H)
+        (*g).amem = 0
+    }
+    if (*g).smem != 0 {
+        rt.heap_free((*g).smem, STREAM_W * STREAM_H)
+        (*g).smem = 0
+    }
+    if (*g).table != 0 {
+        rt.heap_free((*g).table, TABLE_N * ENT_B)
+        (*g).table = 0
+    }
+    var logb: [u8; 2048] = [0; 2048]
+    let vs: str = vs_src()
+    let fs: str = fs_src()
+    (*g).prog = x_program(api, vs.p as u64, vs.n, fs.p as u64, fs.n,
+        (&logb[0]) as u64, 2048)
+    if (*g).prog == 0 as u32 {
+        say("fui.gpu: the shaders did not build:\n")
+        var n: usize = 0
+        while n < 2047 && logb[n] != 0 as u8 {
+            n = n + 1
+        }
+        rt.write_everything(2, (&logb[0]) as u64, n)
+        say("\n")
+        return false
+    }
+    (*g).u_size = uloc(g, "u_size")
+    (*g).u_srcsize = uloc(g, "u_srcsize")
+    (*g).u_atlas = uloc(g, "u_atlas")
+    (*g).u_stream = uloc(g, "u_stream")
+    (*g).u_src = uloc(g, "u_src")
+    (*g).u_nspot = uloc(g, "u_nspot")
+    var names: [str; 8] = ["u_spot[0]", "u_spot[1]", "u_spot[2]", "u_spot[3]",
+        "u_spot[4]", "u_spot[5]", "u_spot[6]", "u_spot[7]"]
+    var i: usize = 0
+    while i < 8 {
+        (*g).u_spot[i] = uloc(g, names[i])
+        i = i + 1
+    }
+    // the unit quad, and the quads of a batch as instances
+    (*g).vao = x_create_vertex_array(api)
+    x_bind_vertex_array(api, (*g).vao)
+    (*g).quad = x_create_buffer(api)
+    x_bind_buffer(api, gl.GL_ARRAY_BUFFER, (*g).quad)
+    var corners: [f32; 8] = [0.0 as f32, 0.0 as f32, 1.0 as f32, 0.0 as f32,
+        0.0 as f32, 1.0 as f32, 1.0 as f32, 1.0 as f32]
+    x_buffer_data(api, gl.GL_ARRAY_BUFFER, (&corners[0]) as u64, 32, gl.GL_STATIC_DRAW)
+    x_enable_vertex_attrib_array(api, 0 as u32)
+    x_vertex_attrib_pointer(api, 0 as u32, 2, gl.GL_FLOAT, false, 8, 0)
+    (*g).inst = rt.heap_alloc(INST_MAX * INST_B)
+    if (*g).inst == 0 {
+        return false
+    }
+    (*g).ibuf = x_create_buffer(api)
+    x_bind_buffer(api, gl.GL_ARRAY_BUFFER, (*g).ibuf)
+    x_buffer_data(api, gl.GL_ARRAY_BUFFER, 0, INST_MAX * INST_B, gl.GL_DYNAMIC_DRAW)
+    var loc: u32 = 1 as u32
+    while loc <= 8 as u32 {
+        x_enable_vertex_attrib_array(api, loc)
+        x_vertex_attrib_pointer(api, loc, 4, gl.GL_FLOAT, false, INST_B as i32,
+            ((loc - 1 as u32) * 16 as u32) as usize)
+        x_vertex_attrib_divisor(api, loc, 1 as u32)
+        loc = loc + 1 as u32
+    }
+    // the atlas, the stream, their mirrors and the table
+    (*g).atlas = make_texture(g, gl.GL_R8, ATLAS_W as i32, ATLAS_H as i32, gl.GL_RED)
+    (*g).stream = make_texture(g, gl.GL_R8, STREAM_W as i32, STREAM_H as i32, gl.GL_RED)
+    (*g).amem = rt.heap_alloc(ATLAS_W * ATLAS_H)
+    (*g).smem = rt.heap_alloc(STREAM_W * STREAM_H)
+    (*g).table = rt.heap_alloc(TABLE_N * ENT_B)
+    if (*g).amem == 0 || (*g).smem == 0 || (*g).table == 0 {
+        return false
+    }
+    atlas_reset(g)
+    (*g).ok = true
+    return true
+}
+
+fn uloc(g: *mut Gpu, s: str) -> u32 {
+    return x_uniform_location(a(g), (*g).prog, s.p as u64, s.n)
+}
+
+// ---------------------------------------------------------------- targets
+
+fn gpu_target_make(g: *mut Gpu, t: *mut Target, w: i32, h: i32) -> bool {
+    let api: *mut gl.GlApi = a(g)
+    if (*t).fb != 0 as u32 && (*t).w == w && (*t).h == h && (*t).gen == (*g).gen {
+        return true
+    }
+    gpu_flush(g)
+    gpu_target_free(g, t)
+    (*t).gen = (*g).gen
+    (*t).tex = make_texture(g, gl.GL_RGBA8, w, h, gl.GL_RGBA)
+    (*t).fb = x_create_framebuffer(api)
+    x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, (*t).fb)
+    x_framebuffer_texture_2d(api, gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0,
+        gl.GL_TEXTURE_2D, (*t).tex, 0)
+    let st: u32 = x_check_framebuffer_status(api, gl.GL_FRAMEBUFFER)
+    (*t).w = w
+    (*t).h = h
+    (*g).tgt = 0 as u64 as *mut Target
+    return st == gl.GL_FRAMEBUFFER_COMPLETE
+}
+
+fn gpu_target_free(g: *mut Gpu, t: *mut Target) {
+    let api: *mut gl.GlApi = a(g)
+    if (*t).fb != 0 as u32 && (*t).gen == (*g).gen {
+        x_delete_obj(api, gl.GLK_FRAMEBUFFER, (*t).fb)
+        x_delete_obj(api, gl.GLK_TEXTURE, (*t).tex)
+    }
+    (*t).fb = 0 as u32
+    (*t).tex = 0 as u32
+    (*t).w = 0
+    (*t).h = 0
+}
+
+// Is the target made on this generation of the GPU (and not lost)?
+fn gpu_target_ok(g: *mut Gpu, t: *mut Target) -> bool {
+    return (*t).fb != 0 as u32 && (*t).gen == (*g).gen
+}
+
+fn gpu_main(g: *mut Gpu) -> *mut Target {
+    return &(*g).main
+}
+
+// A scratch target of the canvas's size (scroll by copy goes through it).
+fn gpu_tmp(g: *mut Gpu) -> *mut Target {
+    if !gpu_target_make(g, &(*g).tmp, (*g).main.w, (*g).main.h) {
+        return 0 as u64 as *mut Target
+    }
+    return &(*g).tmp
+}
+
+// THE CANVAS BECOMES GPU-BACKED: its pixels are `main` from now on, and
+// fill_rect / fill_raster / clear of canvas.fi land here. The canvas
+// keeps its memory (a read-back for a software fallback goes there).
+fn gpu_attach(g: *mut Gpu, cv: *mut canvas.Canvas) -> bool {
+    if !gpu_ok(g) {
+        return false
+    }
+    let w: i32 = canvas.canvas_width(cv) as i32
+    let h: i32 = canvas.canvas_height(cv) as i32
+    if !gpu_target_make(g, &(*g).main, w, h) {
+        return false
+    }
+    (*g).cv = cv as u64
+    canvas.canvas_set_gpu(cv, g as u64)
+    // a fresh target is black and transparent; the canvas's ground
+    return true
+}
+
+fn gpu_detach(g: *mut Gpu, cv: *mut canvas.Canvas) {
+    gpu_flush(g)
+    canvas.canvas_set_gpu(cv, 0)
+    if (*g).cv == cv as u64 {
+        (*g).cv = 0
+    }
+}
+
+// ---------------------------------------------------------------- batches
+
+fn bind_target(g: *mut Gpu, t: *mut Target) {
+    let api: *mut gl.GlApi = a(g)
+    x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, (*t).fb)
+    x_viewport(api, 0, 0, (*t).w, (*t).h)
+}
+
+// The batch goes out: the atlas and the stream uploaded where they
+// changed, the quads into the instance buffer, one draw.
+fn gpu_flush(g: *mut Gpu) {
+    if (*g).n == 0 {
+        return
+    }
+    let api: *mut gl.GlApi = a(g)
+    upload_atlas(g)
+    let t: *mut Target = (*g).tgt
+    bind_target(g, t)
+    x_use_program(api, (*g).prog)
+    x_bind_vertex_array(api, (*g).vao)
+    x_uniform2f(api, (*g).u_size, (*t).w as f64, (*t).h as f64)
+    x_uniform2f(api, (*g).u_srcsize, (*g).src_w as f64, (*g).src_h as f64)
+    x_active_texture(api, gl.GL_TEXTURE0)
+    x_bind_texture(api, gl.GL_TEXTURE_2D, (*g).atlas)
+    x_uniform1i(api, (*g).u_atlas, 0)
+    x_active_texture(api, gl.GL_TEXTURE0 + 1 as u32)
+    x_bind_texture(api, gl.GL_TEXTURE_2D, (*g).stream)
+    x_uniform1i(api, (*g).u_stream, 1)
+    x_active_texture(api, gl.GL_TEXTURE0 + 2 as u32)
+    var st: u32 = (*g).src
+    if st == 0 as u32 {
+        st = (*g).atlas // something must be bound
+    }
+    x_bind_texture(api, gl.GL_TEXTURE_2D, st)
+    x_uniform1i(api, (*g).u_src, 2)
+    x_active_texture(api, gl.GL_TEXTURE0)
+    if (*g).blend {
+        x_enable(api, gl.GL_BLEND)
+        x_blend_func_separate(api, gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA, gl.GL_ONE,
+            gl.GL_ONE_MINUS_SRC_ALPHA)
+    } else {
+        x_disable(api, gl.GL_BLEND)
+    }
+    if !(*g).spots {
+        x_uniform1i(api, (*g).u_nspot, 0)
+    }
+    x_bind_buffer(api, gl.GL_ARRAY_BUFFER, (*g).ibuf)
+    x_buffer_sub_data(api, gl.GL_ARRAY_BUFFER, 0, (*g).inst, (*g).n * INST_B)
+    x_draw_arrays_instanced(api, gl.GL_TRIANGLE_STRIP, 0, 4, (*g).n as i32)
+    (*g).draws = (*g).draws + 1
+    (*g).quads = (*g).quads + (*g).n as u64
+    (*g).n = 0
+    (*g).spots = false
+}
+
+// Make the batch draw into `t`, blending or not, sampling `src`.
+fn want(g: *mut Gpu, t: *mut Target, blend: bool, src: u32, sw: i32, sh: i32) {
+    if (*g).n > 0 && ((*g).tgt != t || (*g).blend != blend ||
+        ((src != 0 as u32) && ((*g).src != src || (*g).src_w != sw || (*g).src_h != sh))) {
+        gpu_flush(g)
+    }
+    (*g).tgt = t
+    (*g).blend = blend
+    if src != 0 as u32 {
+        (*g).src = src
+        (*g).src_w = sw
+        (*g).src_h = sh
+    }
+    if (*g).n >= INST_MAX {
+        gpu_flush(g)
+    }
+}
+
+#[inline]
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i * 4) as u64) as *mut f32) = v as f32
+}
+
+// One quad of kind `k` over the box (x0, y0, x1, y1) -- the pixels it may
+// touch, whole -- with the clip of the canvas. Returns the address of its
+// 32 floats; the caller fills colours and geometry.
+fn quad(g: *mut Gpu, k: f64, x0: f64, y0: f64, x1: f64, y1: f64, cx0: f64,
+    cy0: f64, cx1: f64, cy1: f64) -> u64 {
+    let p: u64 = (*g).inst + ((*g).n * INST_B) as u64
+    (*g).n = (*g).n + 1
+    stf(p, 0, x0)
+    stf(p, 1, y0)
+    stf(p, 2, x1)
+    stf(p, 3, y1)
+    var i: usize = 4
+    while i < 24 {
+        stf(p, i, 0.0)
+        i = i + 1
+    }
+    stf(p, 24, cx0)
+    stf(p, 25, cy0)
+    stf(p, 26, cx1)
+    stf(p, 27, cy1)
+    stf(p, 28, k)
+    stf(p, 29, 0.0)
+    stf(p, 30, 0.0)
+    stf(p, 31, 0.0)
+    return p
+}
+
+// a straight colour 0xAARRGGBB into floats 0..255 at float index i
+fn col4(p: u64, i: usize, c: u32) {
+    stf(p, i, ((c >> 16) & 255 as u32) as f64)
+    stf(p, i + 1, ((c >> 8) & 255 as u32) as f64)
+    stf(p, i + 2, (c & 255 as u32) as f64)
+    stf(p, i + 3, ((c >> 24) & 255 as u32) as f64)
+}
+
+fn v4(p: u64, i: usize, a0: f64, a1: f64, a2: f64, a3: f64) {
+    stf(p, i, a0)
+    stf(p, i + 1, a1)
+    stf(p, i + 2, a2)
+    stf(p, i + 3, a3)
+}
+
+fn flo(v: f64) -> f64 {
+    let t: f64 = (v as i64) as f64
+    if t > v {
+        return t - 1.0
+    }
+    return t
+}
+
+fn cei(v: f64) -> f64 {
+    let t: f64 = flo(v)
+    if t < v {
+        return t + 1.0
+    }
+    return t
+}
+
+// the box cut to the target: false when nothing is left
+fn cut(t: *mut Target, b: *mut f64) -> bool {
+    let w: f64 = (*t).w as f64
+    let h: f64 = (*t).h as f64
+    let q: u64 = b as u64
+    var x0: f64 = *(q as *mut f64)
+    var y0: f64 = *((q + 8) as *mut f64)
+    var x1: f64 = *((q + 16) as *mut f64)
+    var y1: f64 = *((q + 24) as *mut f64)
+    x0 = flo(x0)
+    y0 = flo(y0)
+    x1 = cei(x1)
+    y1 = cei(y1)
+    if x0 < 0.0 { x0 = 0.0 }
+    if y0 < 0.0 { y0 = 0.0 }
+    if x1 > w { x1 = w }
+    if y1 > h { y1 = h }
+    *(q as *mut f64) = x0
+    *((q + 8) as *mut f64) = y0
+    *((q + 16) as *mut f64) = x1
+    *((q + 24) as *mut f64) = y1
+    return x1 > x0 && y1 > y0
+}
+
+fn cvp(g: *mut Gpu) -> *mut canvas.Canvas {
+    return (*g).cv as *mut canvas.Canvas
+}
+
+// ============================================================ THE DOORS
+// of canvas.fi, for a GPU-backed canvas (its own functions refuse: they
+// cannot reach the GPU -- see canvas.fi, A CANVAS ON A GPU)
+
+// canvas_clear
+fn gpu_clear(g: *mut Gpu, col: u32) {
+    gpu_flush(g)
+    let api: *mut gl.GlApi = a(g)
+    bind_target(g, &(*g).main)
+    let al: f64 = ((col >> 24) & 255 as u32) as f64 / 255.0
+    x_clear_color(api, ((col >> 16) & 255 as u32) as f64 / 255.0 * al,
+        ((col >> 8) & 255 as u32) as f64 / 255.0 * al,
+        (col & 255 as u32) as f64 / 255.0 * al, al)
+    x_clear(api, gl.GL_COLOR_BUFFER_BIT)
+}
+
+// A raster the CPU filled (any path fUi has no shape for): its coverage
+// goes up through the stream and is drawn as a mask.
+fn gpu_fill_raster(g: *mut Gpu, r: *mut raster.Raster, ox: usize, oy: usize,
+    col: u32) {
+    let cv: *mut canvas.Canvas = cvp(g)
+    let x0: usize = raster.raster_used_x0(r)
+    let x1: usize = raster.raster_used_x1(r)
+    let y0: usize = raster.raster_used_y0(r)
+    let y1: usize = raster.raster_used_y1(r)
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+    let w: usize = x1 - x0
+    let h: usize = y1 - y0
+    var sx: usize = 0
+    var sy: usize = 0
+    if !stream_room(g, w, h, &sx, &sy) {
+        return
+    }
+    // coverage -> octets (to255 of the coverage)
+    var y: usize = 0
+    while y < h {
+        let row: u64 = raster.raster_cov_row(r, y0 + y) + (x0 * 8) as u64
+        let dst: u64 = (*g).smem + ((sy + y) * STREAM_W + sx) as u64
+        var x: usize = 0
+        while x < w {
+            var v: f64 = *((row + (x * 8) as u64) as *mut f64)
+            if v > 1.0 { v = 1.0 }
+            if v < 0.0 { v = 0.0 }
+            *((dst + x as u64) as *mut u8) = ((v * 255.0 + 0.5) as i64) as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+    stream_dirty(g, sy, sy + h)
+    let px: f64 = (ox + x0) as f64
+    let py: f64 = (oy + y0) as f64
+    mask_quad(g, cv, true, sx as f64, sy as f64, px, py, w as f64, h as f64, col, false,
+        0, 0.0, 0.0)
+}
+
+// ============================================================ PRIMITIVES
+
+fn clip4(cv: *mut canvas.Canvas, out: *mut f64) {
+    *out = canvas.clip_x0(cv)
+    *((out as u64 + 8) as *mut f64) = canvas.clip_y0(cv)
+    *((out as u64 + 16) as *mut f64) = canvas.clip_x1(cv)
+    *((out as u64 + 24) as *mut f64) = canvas.clip_y1(cv)
+}
+
+// canvas_fill_rect
+fn gpu_rect(g: *mut Gpu, x0: f64, y0: f64, x1: f64, y1: f64, col: u32) {
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+    let cv: *mut canvas.Canvas = cvp(g)
+    var c: [f64; 4] = [0.0; 4]
+    clip4(cv, &c[0])
+    var b: [f64; 4] = [x0, y0, x1, y1]
+    if b[0] < c[0] { b[0] = c[0] }
+    if b[1] < c[1] { b[1] = c[1] }
+    if b[2] > c[2] { b[2] = c[2] }
+    if b[3] > c[3] { b[3] = c[3] }
+    if b[2] <= b[0] || b[3] <= b[1] {
+        return
+    }
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    if !cut(&(*g).main, &b[0]) {
+        return
+    }
+    let p: u64 = quad(g, K_RECT, b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3])
+    col4(p, 4, col)
+    v4(p, 12, x0, y0, x1, y1)
+}
+
+// A mask out of the atlas (stream = false) or the stream: the w x h
+// coverage at texel (tx, ty) laid at picture pixel (px, py).
+fn mask_quad(g: *mut Gpu, cv: *mut canvas.Canvas, stream: bool, tx: f64,
+    ty: f64, px: f64, py: f64, w: f64, h: f64, col: u32, grad: bool,
+    col2: u32, gy0: f64, gy1: f64) {
+    var c: [f64; 4] = [0.0; 4]
+    clip4(cv, &c[0])
+    var b: [f64; 4] = [px, py, px + w, py + h]
+    if b[0] < c[0] { b[0] = c[0] }
+    if b[1] < c[1] { b[1] = c[1] }
+    if b[2] > c[2] { b[2] = c[2] }
+    if b[3] > c[3] { b[3] = c[3] }
+    if b[2] <= b[0] || b[3] <= b[1] {
+        return
+    }
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    if !cut(&(*g).main, &b[0]) {
+        return
+    }
+    let p: u64 = quad(g, K_MASK, b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3])
+    col4(p, 4, col)
+    v4(p, 20, tx, ty, px, py)
+    if stream {
+        stf(p, 29, 1.0)
+    }
+    if grad {
+        col4(p, 8, col2)
+        stf(p, 30, 1.0)
+        stf(p, 16, gy0)
+        stf(p, 17, gy1)
+    }
+}
+
+// effect.rrect_fast: (x, y, w, h), radius r0, a vertical ramp top ->
+// bottom. The band is the whole-pixel box cut by the clip (band_of).
+fn gpu_rrect_fast(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, r0: f64,
+    top: u32, bottom: u32) {
+    if w <= 0.0 || h <= 0.0 {
+        return
+    }
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m { m = h }
+    if r > m / 2.0 { r = m / 2.0 }
+    if r < 0.0 { r = 0.0 }
+    var b: [f64; 4] = [flo(x), flo(y), cei(x + w), cei(y + h)]
+    if !band(g, &b[0]) {
+        return
+    }
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    let p: u64 = quad(g, K_RRECT, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, solid(top))
+    col4(p, 8, solid(bottom))
+    v4(p, 12, x, y, w, h)
+    stf(p, 16, r)
+}
+
+fn solid(col: u32) -> u32 {
+    if (col >> 24) & 255 as u32 == 0 as u32 {
+        return col | 4278190080 as u32
+    }
+    return col
+}
+
+// effect.band_of: the whole-pixel band cut to the canvas and to the clip
+// rectangle in whole pixels
+fn band(g: *mut Gpu, b: *mut f64) -> bool {
+    let cv: *mut canvas.Canvas = cvp(g)
+    let q: u64 = b as u64
+    var x0: f64 = *(q as *mut f64)
+    var y0: f64 = *((q + 8) as *mut f64)
+    var x1: f64 = *((q + 16) as *mut f64)
+    var y1: f64 = *((q + 24) as *mut f64)
+    let kx0: f64 = cei(canvas.clip_x0(cv))
+    let ky0: f64 = cei(canvas.clip_y0(cv))
+    let kx1: f64 = flo(canvas.clip_x1(cv))
+    let ky1: f64 = flo(canvas.clip_y1(cv))
+    if x0 < kx0 { x0 = kx0 }
+    if y0 < ky0 { y0 = ky0 }
+    if x1 > kx1 { x1 = kx1 }
+    if y1 > ky1 { y1 = ky1 }
+    if x0 < 0.0 { x0 = 0.0 }
+    if y0 < 0.0 { y0 = 0.0 }
+    if x1 > (*g).main.w as f64 { x1 = (*g).main.w as f64 }
+    if y1 > (*g).main.h as f64 { y1 = (*g).main.h as f64 }
+    *(q as *mut f64) = x0
+    *((q + 8) as *mut f64) = y0
+    *((q + 16) as *mut f64) = x1
+    *((q + 24) as *mut f64) = y1
+    return x1 > x0 && y1 > y0
+}
+
+// effect.rrect_shadow
+fn gpu_rrect_shadow(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, r0: f64,
+    lift: f64, blur: f64, col: u32) {
+    if w <= 0.0 || h <= 0.0 || blur <= 0.0 {
+        return
+    }
+    var r: f64 = r0
+    var m: f64 = w
+    if h < m { m = h }
+    if r > m / 2.0 { r = m / 2.0 }
+    let sy: f64 = y + lift
+    let fy0: f64 = flo(y + h / 2.0)
+    let fx0: f64 = flo(x - blur)
+    var b: [f64; 4] = [fx0, fy0, cei(x + w + blur), cei(sy + h + blur)]
+    if !band(g, &b[0]) {
+        return
+    }
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    let p: u64 = quad(g, K_SHADOW, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, col)
+    v4(p, 12, x, y, w, h)
+    v4(p, 16, r, lift, blur, 0.0)
+}
+
+// effect.ramp_rect
+fn gpu_ramp(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, col: u32, dir: u32) {
+    var b: [f64; 4] = [flo_r(x), flo_r(y), flo_r(x + w), flo_r(y + h)]
+    if !band(g, &b[0]) {
+        return
+    }
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    let p: u64 = quad(g, K_RAMP, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, col)
+    v4(p, 12, x, y, w, h)
+    stf(p, 16, dir as f64)
+}
+
+// effect.runde: to the nearest whole pixel (band_of rounds, it does not
+// floor)
+fn flo_r(v: f64) -> f64 {
+    if v < 0.0 {
+        return ((v - 0.5) as i64) as f64
+    }
+    return ((v + 0.5) as i64) as f64
+}
+
+// effect.veil_rect
+fn gpu_veil(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, tint: u32) {
+    if ((tint >> 24) & 255 as u32) == 0 as u32 {
+        return
+    }
+    var b: [f64; 4] = [flo_r(x), flo_r(y), flo_r(x + w), flo_r(y + h)]
+    if !band(g, &b[0]) {
+        return
+    }
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    let p: u64 = quad(g, K_VEIL, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, tint)
+}
+
+// effect.glow_ground: `spots` is n x 8 f64 (x, y, rx, ry, strength, r, g, b)
+fn gpu_glow(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, top: u32,
+    bottom: u32, spots: u64, n: usize) {
+    var b: [f64; 4] = [flo_r(x), flo_r(y), flo_r(x + w), flo_r(y + h)]
+    if !band(g, &b[0]) {
+        return
+    }
+    // the spots are uniforms: a batch of its own
+    gpu_flush(g)
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    let api: *mut gl.GlApi = a(g)
+    var m: usize = n
+    if m > 4 { m = 4 }
+    x_use_program(api, (*g).prog)
+    var i: usize = 0
+    while i < m {
+        let q: u64 = spots + (i * 64) as u64
+        let rx: f64 = *((q + 16) as *mut f64)
+        let ry: f64 = *((q + 24) as *mut f64)
+        var irx: f64 = rx
+        var iry: f64 = ry
+        if rx > 0.0 { irx = 1.0 / (rx * rx) }
+        if ry > 0.0 { iry = 1.0 / (ry * ry) }
+        x_uniform4f(api, (*g).u_spot[i * 2], *(q as *mut f64), *((q + 8) as *mut f64), irx, iry)
+        x_uniform4f(api, (*g).u_spot[i * 2 + 1], *((q + 32) as *mut f64),
+            *((q + 40) as *mut f64), *((q + 48) as *mut f64), *((q + 56) as *mut f64))
+        i = i + 1
+    }
+    x_uniform1i(api, (*g).u_nspot, m as i32)
+    (*g).spots = true
+    let p: u64 = quad(g, K_GLOW, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, top | 4278190080 as u32)
+    col4(p, 8, bottom | 4278190080 as u32)
+    v4(p, 12, x, y, w, h)
+    gpu_flush(g)
+}
+
+// painter.round_rect / round_ring / round_rect_grad: a round rectangle
+// (x, y, w, h, r); `st` > 0 makes it a ring of that width; `grad` a
+// linear ramp c0 -> c1 along (dx, dy) over the box.
+fn gpu_round(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, r: f64, st: f64,
+    c0: u32, c1: u32, grad: bool, dx: f64, dy: f64) {
+    if w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let cv: *mut canvas.Canvas = cvp(g)
+    var c: [f64; 4] = [0.0; 4]
+    clip4(cv, &c[0])
+    var b: [f64; 4] = [x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0]
+    if b[0] < c[0] { b[0] = c[0] }
+    if b[1] < c[1] { b[1] = c[1] }
+    if b[2] > c[2] { b[2] = c[2] }
+    if b[3] > c[3] { b[3] = c[3] }
+    if b[2] <= b[0] || b[3] <= b[1] {
+        return
+    }
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    if !cut(&(*g).main, &b[0]) {
+        return
+    }
+    let p: u64 = quad(g, K_ROUND, b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3])
+    col4(p, 4, c0)
+    col4(p, 8, c1)
+    v4(p, 12, x, y, w, h)
+    v4(p, 16, r, st, dx, dy)
+    if grad {
+        stf(p, 29, 1.0)
+    }
+}
+
+// ============================================================ THE GLASS
+//
+// effect.frost_rect on the GPU: the same five steps with the same integer
+// arithmetic, each a pass into a small target (s1 <-> s2), the last one
+// back into the canvas without blending.
+fn gpu_frost(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, blur: i64,
+    tint: u32) -> bool {
+    let rx0: f64 = flo_r(x)
+    let ry0: f64 = flo_r(y)
+    var b: [f64; 4] = [rx0, ry0, flo_r(x + w), flo_r(y + h)]
+    if !band(g, &b[0]) {
+        return true
+    }
+    let x0: i64 = b[0] as i64
+    let y0: i64 = b[1] as i64
+    let iw: i64 = (b[2] - b[0]) as i64
+    let ih: i64 = (b[3] - b[1]) as i64
+    if iw <= 0 || ih <= 0 {
+        return true
+    }
+    var f: i64 = 4
+    if blur >= 16 { f = 8 }
+    if blur < 8 { f = 2 }
+    if blur < 3 { f = 1 }
+    let sw: i64 = (iw + f - 1) / f
+    let sh: i64 = (ih + f - 1) / f
+    if !small_targets(g, sw as i32, sh as i32) {
+        return false
+    }
+    gpu_flush(g)
+    let mw: i32 = (*g).main.w
+    let mh: i32 = (*g).main.h
+    // 1. shrink: main -> s1
+    want(g, &(*g).s1, false, (*g).main.tex, mw, mh)
+    var p: u64 = quad(g, K_SHRINK, 0.0, 0.0, sw as f64, sh as f64, 0.0, 0.0,
+        sw as f64, sh as f64)
+    v4(p, 12, x0 as f64, y0 as f64, 0.0, 0.0)
+    v4(p, 16, f as f64, iw as f64, ih as f64, 0.0)
+    gpu_flush(g)
+    // 2. blur: three box passes each way (f < 8) or one each way (box2)
+    var rs: i64 = (blur + f / 2) / f
+    if rs < 1 { rs = 1 }
+    if rs > 64 { rs = 64 }
+    if f >= 8 {
+        pass(g, K_BOX2H, &(*g).s1, &(*g).s2, sw, sh, rs)
+        pass(g, K_BOX2V, &(*g).s2, &(*g).s1, sw, sh, rs)
+    } else {
+        pass(g, K_BOXH, &(*g).s1, &(*g).s2, sw, sh, rs)
+        pass(g, K_BOXH, &(*g).s2, &(*g).s1, sw, sh, rs)
+        pass(g, K_BOXH, &(*g).s1, &(*g).s2, sw, sh, rs)
+        pass(g, K_BOXV, &(*g).s2, &(*g).s1, sw, sh, rs)
+        pass(g, K_BOXV, &(*g).s1, &(*g).s2, sw, sh, rs)
+        pass(g, K_BOXV, &(*g).s2, &(*g).s1, sw, sh, rs)
+    }
+    // 3. tint: s1 -> s2
+    want(g, &(*g).s2, false, (*g).s1.tex, (*g).s1.w, (*g).s1.h)
+    p = quad(g, K_TINT, 0.0, 0.0, sw as f64, sh as f64, 0.0, 0.0, sw as f64,
+        sh as f64)
+    col4(p, 4, tint)
+    gpu_flush(g)
+    // 5. stretch: s2 -> the band of main, no blending
+    want(g, &(*g).main, false, (*g).s2.tex, (*g).s2.w, (*g).s2.h)
+    p = quad(g, K_STRETCH, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    v4(p, 12, b[0], b[1], 0.0, 0.0)
+    v4(p, 16, f as f64, sw as f64, sh as f64, 0.0)
+    gpu_flush(g)
+    return true
+}
+
+fn pass(g: *mut Gpu, k: f64, from: *mut Target, to: *mut Target, sw: i64,
+    sh: i64, r: i64) {
+    // the box passes clamp at the band's size (sw, sh), which is not the
+    // target's: that one goes as u_srcsize (for the rows from the bottom)
+    want(g, to, false, (*from).tex, (*from).w, (*from).h)
+    let p: u64 = quad(g, k, 0.0, 0.0, sw as f64, sh as f64, 0.0, 0.0, sw as f64,
+        sh as f64)
+    v4(p, 16, r as f64, sw as f64, sh as f64, 0.0)
+    gpu_flush(g)
+}
+
+// The two small targets: at least (w, h), kept between frames.
+fn small_targets(g: *mut Gpu, w: i32, h: i32) -> bool {
+    if (*g).s1.fb != 0 as u32 && (*g).s1.w >= w && (*g).s1.h >= h {
+        return true
+    }
+    var nw: i32 = w
+    var nh: i32 = h
+    if (*g).s1.w > nw { nw = (*g).s1.w }
+    if (*g).s1.h > nh { nh = (*g).s1.h }
+    return gpu_target_make(g, &(*g).s1, nw, nh) && gpu_target_make(g, &(*g).s2, nw, nh)
+}
+
+// ============================================================ TARGET COPIES
+
+// Copy (sx, sy, w, h) of `from` to (dx, dy) of `to`, pixel for pixel.
+fn gpu_copy(g: *mut Gpu, from: *mut Target, sx: i32, sy: i32, w: i32, h: i32,
+    to: *mut Target, dx: i32, dy: i32) {
+    if w <= 0 || h <= 0 {
+        return
+    }
+    gpu_flush(g)
+    let api: *mut gl.GlApi = a(g)
+    x_bind_framebuffer(api, gl.GL_READ_FRAMEBUFFER, (*from).fb)
+    x_bind_framebuffer(api, gl.GL_DRAW_FRAMEBUFFER, (*to).fb)
+    // GL rows count from the bottom
+    let sy0: i32 = (*from).h - (sy + h)
+    let dy0: i32 = (*to).h - (dy + h)
+    x_blit_framebuffer(api, sx, sy0, sx + w, sy0 + h, dx, dy0, dx + w, dy0 + h,
+        gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
+    x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, 0 as u32)
+    (*g).tgt = 0 as u64 as *mut Target
+}
+
+// Draw (sx, sy, w, h) of target `from` at (dx, dy) of the canvas, src-over
+// with the strength `al` (0..255) -- a kept picture laid back, a layer.
+// The clip of the canvas holds (in whole pixels).
+fn gpu_draw_target(g: *mut Gpu, from: *mut Target, sx: f64, sy: f64, w: f64,
+    h: f64, dx: f64, dy: f64, al: u32) {
+    var b: [f64; 4] = [dx, dy, dx + w, dy + h]
+    if !band(g, &b[0]) {
+        return
+    }
+    want(g, &(*g).main, true, (*from).tex, (*from).w, (*from).h)
+    let p: u64 = quad(g, K_TEX, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, al << 24)
+    v4(p, 20, sx, sy, dx, dy)
+    stf(p, 29, 1.0) // a target: rows from the bottom
+}
+
+// Pixels from memory (premultiplied RGBA, `stride` octets a row), rows
+// [y0, y1) and columns [x0, x1) of it, laid over the canvas at the same
+// place, src-over. A software layer gets onto the GPU this way.
+fn gpu_draw_pixels(g: *mut Gpu, px: u64, stride: usize, pw: i32, ph: i32,
+    x0: i32, y0: i32, x1: i32, y1: i32) {
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+    gpu_flush(g)
+    let api: *mut gl.GlApi = a(g)
+    if (*g).up == 0 as u32 || (*g).up_w < pw || (*g).up_h < ph {
+        if (*g).up != 0 as u32 {
+            x_delete_obj(api, gl.GLK_TEXTURE, (*g).up)
+        }
+        (*g).up = make_texture(g, gl.GL_RGBA8, pw, ph, gl.GL_RGBA)
+        (*g).up_w = pw
+        (*g).up_h = ph
+    }
+    x_active_texture(api, gl.GL_TEXTURE0)
+    x_bind_texture(api, gl.GL_TEXTURE_2D, (*g).up)
+    let first: u64 = px + (y0 as usize * stride + x0 as usize * 4) as u64
+    x_tex_sub_image_2d(api, gl.GL_TEXTURE_2D, 0, x0, y0, x1 - x0, y1 - y0, gl.GL_RGBA,
+        gl.GL_UNSIGNED_BYTE, first, ((y1 - y0 - 1) as usize) * stride + ((x1 - x0) as usize) * 4,
+        (stride / 4) as i32)
+    (*g).uploads = (*g).uploads + 1
+    var b: [f64; 4] = [x0 as f64, y0 as f64, x1 as f64, y1 as f64]
+    if !band(g, &b[0]) {
+        return
+    }
+    want(g, &(*g).main, true, (*g).up, (*g).up_w, (*g).up_h)
+    let p: u64 = quad(g, K_TEX, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, 4278190080 as u32)
+    v4(p, 20, 0.0, 0.0, 0.0, 0.0)
+    gpu_flush(g)
+}
+
+// Rows [y0, y1) of a target made transparent (a layer cleared).
+fn gpu_clear_rows(g: *mut Gpu, t: *mut Target, y0: i32, y1: i32) {
+    if y1 <= y0 {
+        return
+    }
+    gpu_flush(g)
+    let api: *mut gl.GlApi = a(g)
+    bind_target(g, t)
+    x_enable(api, gl.GL_SCISSOR_TEST)
+    x_scissor(api, 0, (*t).h - y1, (*t).w, y1 - y0)
+    x_clear_color(api, 0.0, 0.0, 0.0, 0.0)
+    x_clear(api, gl.GL_COLOR_BUFFER_BIT)
+    x_disable(api, gl.GL_SCISSOR_TEST)
+}
+
+// ============================================================ READ BACK
+
+// The rows and columns (x0, y0, x1, y1) of the canvas's target into the
+// canvas's own memory (top row first) -- the software fallback works on
+// them there, `gpu_sw_end` puts them back.
+fn gpu_read(g: *mut Gpu, x0: i32, y0: i32, x1: i32, y1: i32, dst: u64,
+    stride: usize) {
+    gpu_flush(g)
+    let api: *mut gl.GlApi = a(g)
+    let w: i32 = x1 - x0
+    let h: i32 = y1 - y0
+    if w <= 0 || h <= 0 {
+        return
+    }
+    let tmp: u64 = rt.heap_alloc((w * h * 4) as usize)
+    if tmp == 0 {
+        return
+    }
+    x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, (*g).main.fb)
+    x_read_pixels(api, x0, (*g).main.h - y1, w, h, tmp)
+    var r: i32 = 0
+    while r < h {
+        // GL row 0 is the bottom one
+        rt.mem_copy(dst + ((y0 + r) as usize * stride + x0 as usize * 4) as u64,
+            tmp + ((h - 1 - r) * w * 4) as u64, (w * 4) as usize)
+        r = r + 1
+    }
+    rt.heap_free(tmp, (w * h * 4) as usize)
+    (*g).readbacks = (*g).readbacks + 1
+    (*g).tgt = 0 as u64 as *mut Target
+}
+
+// THE SOFTWARE FALLBACK for an effect without a shader: its band is read
+// back into the canvas's memory, the canvas paints in memory until
+// `gpu_sw_end`, which puts the band back up. Correct, and slow (the GPU
+// waits for the read); an effect that runs every frame gets a shader.
+fn gpu_sw_begin(g: *mut Gpu, cv: *mut canvas.Canvas, x0: i32, y0: i32, x1: i32,
+    y1: i32) {
+    gpu_read(g, x0, y0, x1, y1, canvas.canvas_pixels(cv) as u64,
+        canvas.canvas_width(cv) * 4)
+    canvas.canvas_set_gpu(cv, 0)
+}
+
+fn gpu_sw_end(g: *mut Gpu, cv: *mut canvas.Canvas, x0: i32, y0: i32, x1: i32,
+    y1: i32) {
+    canvas.canvas_set_gpu(cv, g as u64)
+    gpu_upload_band(g, cv, x0, y0, x1, y1)
+}
+
+// The band (x0, y0, x1, y1) of the canvas's memory up into its target,
+// replacing what is there.
+fn gpu_upload_band(g: *mut Gpu, cv: *mut canvas.Canvas, x0: i32, y0: i32,
+    x1: i32, y1: i32) {
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+    gpu_flush(g)
+    let api: *mut gl.GlApi = a(g)
+    let stride: usize = canvas.canvas_width(cv) * 4
+    let base: u64 = canvas.canvas_pixels(cv) as u64
+    // rows go up bottom first: one row per call keeps it simple and
+    // right (the band is small -- a fallback)
+    x_active_texture(api, gl.GL_TEXTURE0)
+    x_bind_texture(api, gl.GL_TEXTURE_2D, (*g).main.tex)
+    var r: i32 = y0
+    while r < y1 {
+        x_tex_sub_image_2d(api, gl.GL_TEXTURE_2D, 0, x0, (*g).main.h - 1 - r, x1 - x0, 1,
+            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, base + (r as usize * stride + x0 as usize * 4) as u64,
+            ((x1 - x0) * 4) as usize, 0)
+        r = r + 1
+    }
+    (*g).uploads = (*g).uploads + 1
+}
+
+fn gpu_stray(g: *mut Gpu) -> u64 {
+    return canvas.canvas_stray_writes()
+}
+
+// ============================================================ THE ATLAS
+//
+// Coverage that is kept: a glyph at a quarter pixel, an icon at a size.
+// Shelves of rows, filled left to right; when it is full everything goes
+// (the batch is drawn first -- its quads point into the atlas) and the
+// callers raster again what they need.
+
+// One entry of the table: 8 key words, then x, y, w, h, ox, oy (i64).
+const ENT_B: usize = 112
+
+fn atlas_reset(g: *mut Gpu) {
+    rt.mem_set((*g).table, 0 as u8, TABLE_N * ENT_B)
+    (*g).tcount = 0
+    (*g).shelf_x = 0
+    (*g).shelf_y = 0
+    (*g).shelf_h = 0
+    (*g).ad_x0 = ATLAS_W
+    (*g).ad_y0 = ATLAS_H
+    (*g).ad_x1 = 0
+    (*g).ad_y1 = 0
+}
+
+fn key_hash(k: *mut AKey) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < 8 {
+        h = (h ^ (*k).k[i]) *% 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+// The entry for `k`, 0 when it is not in the atlas. Entry words: 0..7 the
+// key (word 0 is never 0 for a used entry: the caller's kind), 8 x, 9 y,
+// 10 w, 11 h, 12 ox, 13 oy.
+fn gpu_atlas_find(g: *mut Gpu, k: *mut AKey) -> u64 {
+    var s: usize = (key_hash(k) % (TABLE_N as u64)) as usize
+    var probes: usize = 0
+    while probes < 64 {
+        let e: u64 = (*g).table + (s * ENT_B) as u64
+        let w0: u64 = *(e as *mut u64)
+        if w0 == 0 {
+            return 0
+        }
+        var same: bool = true
+        var i: usize = 0
+        while i < 8 {
+            if *((e + (i * 8) as u64) as *mut u64) != (*k).k[i] {
+                same = false
+                i = 8
+            }
+            i = i + 1
+        }
+        if same {
+            return e
+        }
+        s = (s + 1) % TABLE_N
+        probes = probes + 1
+    }
+    return 0
+}
+
+fn ent(e: u64, i: usize) -> i64 {
+    return *((e + ((8 + i) * 8) as u64) as *mut i64)
+}
+
+// Room of w x h in the atlas: false when it is full (after `atlas_reset`
+// the caller may try once more).
+fn atlas_room(g: *mut Gpu, w: usize, h: usize, ox: *mut usize, oy: *mut usize) -> bool {
+    if w > ATLAS_W || h > ATLAS_H {
+        return false
+    }
+    if (*g).shelf_x + w > ATLAS_W {
+        (*g).shelf_y = (*g).shelf_y + (*g).shelf_h
+        (*g).shelf_x = 0
+        (*g).shelf_h = 0
+    }
+    if (*g).shelf_y + h > ATLAS_H {
+        return false
+    }
+    *ox = (*g).shelf_x
+    *oy = (*g).shelf_y
+    (*g).shelf_x = (*g).shelf_x + w + 1
+    if h + 1 > (*g).shelf_h {
+        (*g).shelf_h = h + 1
+    }
+    return true
+}
+
+// KEEP the finished raster `r` (its window at (wx, wy) in the picture)
+// under key `k`, placed relative to the anchor (ax, ay). Returns the
+// entry, 0 when it does not fit even into an empty atlas.
+fn gpu_atlas_put(g: *mut Gpu, k: *mut AKey, r: *mut raster.Raster, wx: i64,
+    wy: i64, ax: i64, ay: i64) -> u64 {
+    var x0: usize = raster.raster_used_x0(r)
+    var x1: usize = raster.raster_used_x1(r)
+    var y0: usize = raster.raster_used_y0(r)
+    var y1: usize = raster.raster_used_y1(r)
+    if x1 <= x0 || y1 <= y0 {
+        x0 = 0
+        x1 = 0
+        y0 = 0
+        y1 = 0
+    }
+    let w: usize = x1 - x0
+    let h: usize = y1 - y0
+    var tx: usize = 0
+    var ty: usize = 0
+    if w > 0 && !atlas_room(g, w, h, &tx, &ty) {
+        // full: draw what points into it, forget everything, again
+        gpu_flush(g)
+        atlas_reset(g)
+        if !atlas_room(g, w, h, &tx, &ty) {
+            return 0
+        }
+    }
+    if (*g).tcount * 2 > TABLE_N {
+        gpu_flush(g)
+        atlas_reset(g)
+        if w > 0 && !atlas_room(g, w, h, &tx, &ty) {
+            return 0
+        }
+    }
+    // the coverage, as octets
+    var y: usize = 0
+    while y < h {
+        let row: u64 = raster.raster_cov_row(r, y0 + y) + (x0 * 8) as u64
+        let dst: u64 = (*g).amem + ((ty + y) * ATLAS_W + tx) as u64
+        var x: usize = 0
+        while x < w {
+            var v: f64 = *((row + (x * 8) as u64) as *mut f64)
+            if v > 1.0 { v = 1.0 }
+            if v < 0.0 { v = 0.0 }
+            *((dst + x as u64) as *mut u8) = ((v * 255.0 + 0.5) as i64) as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if w > 0 {
+        if tx < (*g).ad_x0 { (*g).ad_x0 = tx }
+        if ty < (*g).ad_y0 { (*g).ad_y0 = ty }
+        if tx + w > (*g).ad_x1 { (*g).ad_x1 = tx + w }
+        if ty + h > (*g).ad_y1 { (*g).ad_y1 = ty + h }
+    }
+    var s: usize = (key_hash(k) % (TABLE_N as u64)) as usize
+    while *(((*g).table + (s * ENT_B) as u64) as *mut u64) != 0 {
+        s = (s + 1) % TABLE_N
+    }
+    let e: u64 = (*g).table + (s * ENT_B) as u64
+    var i: usize = 0
+    while i < 8 {
+        *((e + (i * 8) as u64) as *mut u64) = (*k).k[i]
+        i = i + 1
+    }
+    *((e + 64) as *mut i64) = tx as i64
+    *((e + 72) as *mut i64) = ty as i64
+    *((e + 80) as *mut i64) = w as i64
+    *((e + 88) as *mut i64) = h as i64
+    *((e + 96) as *mut i64) = wx + (x0 as i64) - ax
+    *((e + 104) as *mut i64) = wy + (y0 as i64) - ay
+    (*g).tcount = (*g).tcount + 1
+    return e
+}
+
+// Draw the entry at the anchor (ax, ay) in `col` (a straight colour);
+// `grad` runs it from `col` at row gy0 to `col2` at gy1.
+fn gpu_atlas_draw(g: *mut Gpu, e: u64, ax: i64, ay: i64, col: u32, grad: bool,
+    col2: u32, gy0: f64, gy1: f64) {
+    let w: i64 = ent(e, 2)
+    let h: i64 = ent(e, 3)
+    if w <= 0 || h <= 0 {
+        return
+    }
+    let px: f64 = (ax + ent(e, 4)) as f64
+    let py: f64 = (ay + ent(e, 5)) as f64
+    mask_quad(g, cvp(g), false, ent(e, 0) as f64, ent(e, 1) as f64, px, py,
+        w as f64, h as f64, col, grad, col2, gy0, gy1)
+}
+
+// Draw a mask at an absolute place (for callers that keep their own).
+fn gpu_mask_at(g: *mut Gpu, e: u64, px: f64, py: f64, col: u32) {
+    mask_quad(g, cvp(g), false, ent(e, 0) as f64, ent(e, 1) as f64, px, py,
+        ent(e, 2) as f64, ent(e, 3) as f64, col, false, 0 as u32, 0.0, 0.0)
+}
+
+fn upload_atlas(g: *mut Gpu) {
+    let api: *mut gl.GlApi = a(g)
+    if (*g).ad_x1 > (*g).ad_x0 && (*g).ad_y1 > (*g).ad_y0 {
+        x_active_texture(api, gl.GL_TEXTURE0)
+        x_bind_texture(api, gl.GL_TEXTURE_2D, (*g).atlas)
+        let x0: usize = (*g).ad_x0
+        let y0: usize = (*g).ad_y0
+        let w: usize = (*g).ad_x1 - x0
+        let h: usize = (*g).ad_y1 - y0
+        x_tex_sub_image_2d(api, gl.GL_TEXTURE_2D, 0, x0 as i32, y0 as i32, w as i32,
+            h as i32, gl.GL_RED, gl.GL_UNSIGNED_BYTE, (*g).amem + (y0 * ATLAS_W + x0) as u64,
+            (h - 1) * ATLAS_W + w, ATLAS_W as i32)
+        (*g).uploads = (*g).uploads + 1
+        (*g).ad_x0 = ATLAS_W
+        (*g).ad_y0 = ATLAS_H
+        (*g).ad_x1 = 0
+        (*g).ad_y1 = 0
+    }
+    if (*g).sd_y1 > (*g).sd_y0 {
+        x_active_texture(api, gl.GL_TEXTURE0)
+        x_bind_texture(api, gl.GL_TEXTURE_2D, (*g).stream)
+        let y0: usize = (*g).sd_y0
+        let h: usize = (*g).sd_y1 - y0
+        x_tex_sub_image_2d(api, gl.GL_TEXTURE_2D, 0, 0, y0 as i32, STREAM_W as i32,
+            h as i32, gl.GL_RED, gl.GL_UNSIGNED_BYTE, (*g).smem + (y0 * STREAM_W) as u64,
+            h * STREAM_W, STREAM_W as i32)
+        (*g).uploads = (*g).uploads + 1
+        (*g).sd_y0 = STREAM_H
+        (*g).sd_y1 = 0
+    }
+}
+
+fn stream_room(g: *mut Gpu, w: usize, h: usize, ox: *mut usize, oy: *mut usize) -> bool {
+    if w > STREAM_W || h > STREAM_H {
+        return false
+    }
+    if (*g).ss_x + w > STREAM_W {
+        (*g).ss_y = (*g).ss_y + (*g).ss_h
+        (*g).ss_x = 0
+        (*g).ss_h = 0
+    }
+    if (*g).ss_y + h > STREAM_H {
+        // full: what points into it is drawn, then it starts again
+        gpu_flush(g)
+        (*g).ss_x = 0
+        (*g).ss_y = 0
+        (*g).ss_h = 0
+    }
+    *ox = (*g).ss_x
+    *oy = (*g).ss_y
+    (*g).ss_x = (*g).ss_x + w + 1
+    if h + 1 > (*g).ss_h {
+        (*g).ss_h = h + 1
+    }
+    return true
+}
+
+fn stream_dirty(g: *mut Gpu, y0: usize, y1: usize) {
+    if y0 < (*g).sd_y0 { (*g).sd_y0 = y0 }
+    if y1 > (*g).sd_y1 { (*g).sd_y1 = y1 }
+}
+
+// ============================================================ FRAMES
+
+fn gpu_frame_begin(g: *mut Gpu, screen_w: i32, screen_h: i32) {
+    (*g).screen_w = screen_w
+    (*g).screen_h = screen_h
+    (*g).ss_x = 0
+    (*g).ss_y = 0
+    (*g).ss_h = 0
+    (*g).sd_y0 = STREAM_H
+    (*g).sd_y1 = 0
+}
+
+// The picture of the canvas onto the screen (the default framebuffer).
+fn gpu_present(g: *mut Gpu) {
+    gpu_present_at(g, 0, 0)
+}
+
+// The same, with the canvas's top left corner at (ox, oy) of a screen of
+// the size gpu_frame_begin was given (a phone: the content between status
+// and navigation bar). What the canvas does not cover is black.
+fn gpu_present_at(g: *mut Gpu, ox: i32, oy: i32) {
+    gpu_flush(g)
+    let api: *mut gl.GlApi = a(g)
+    let w: i32 = (*g).main.w
+    let h: i32 = (*g).main.h
+    let sw: i32 = (*g).screen_w
+    let sh: i32 = (*g).screen_h
+    if ox > 0 || oy > 0 || ox + w < sw || oy + h < sh {
+        x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, 0 as u32)
+        x_viewport(api, 0, 0, sw, sh)
+        x_clear_color(api, 0.0, 0.0, 0.0, 1.0)
+        x_clear(api, gl.GL_COLOR_BUFFER_BIT)
+    }
+    x_bind_framebuffer(api, gl.GL_READ_FRAMEBUFFER, (*g).main.fb)
+    x_bind_framebuffer(api, gl.GL_DRAW_FRAMEBUFFER, 0 as u32)
+    // GL rows count from the bottom
+    let dy0: i32 = sh - oy - h
+    x_blit_framebuffer(api, 0, 0, w, h, ox, dy0, ox + w, dy0 + h,
+        gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
+    x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, 0 as u32)
+    (*g).tgt = 0 as u64 as *mut Target
+    (*g).frames = (*g).frames + 1
+}
+
+// Wait until the GPU is done (for measuring).
+fn gpu_finish(g: *mut Gpu) {
+    gpu_flush(g)
+    x_finish((*g).api)
+}
+
+// draws, quads, uploads, read-backs so far (into out[0..4])
+fn gpu_stats(g: *mut Gpu, out: *mut u64) {
+    *out = (*g).draws
+    *((out as u64 + 8) as *mut u64) = (*g).quads
+    *((out as u64 + 16) as *mut u64) = (*g).uploads
+    *((out as u64 + 24) as *mut u64) = (*g).readbacks
+}

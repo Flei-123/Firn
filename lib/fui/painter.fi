@@ -87,10 +87,12 @@ import fui.theme
 import fui.bidi
 import fui.shape
 import fui.fcache
+import fui.gpu
 
 export {
     Painter, painter_new, painter_init, painter_free, painter_ok,
-    painter_canvas, painter_set_font, painter_font,
+    painter_canvas, painter_set_font, painter_font, painter_clear,
+    painter_fill_raster,
     surface, round_rect, round_ring, border_col, mit_alpha, clip_rows,
     round_rect_grad, mix_argb,
     text, text_width, text_fits_upto, text_baseline_mid,
@@ -313,8 +315,41 @@ fn mit_alpha(col: u32) -> u32 {
     }
     return col
 }
+// The whole canvas cleared to `col` -- in memory, or on the GPU when the
+// canvas is backed by one (lib/fui/gpu.fi; canvas_clear itself cannot
+// reach the GPU). A program that clears its canvas before a picture calls
+// this instead of canvas.canvas_clear.
+fn painter_clear(z: *mut Painter, col: u32) {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g as u64 != 0 {
+        gpu.gpu_clear(g, col)
+        return
+    }
+    canvas.canvas_clear(cv, col)
+}
+
+// A finished raster (its window at (ox, oy)) filled with `col` -- into
+// memory, or on the GPU as a mask (lib/fui/gpu.fi). For a caller outside
+// this file that rasters a shape of its own (lib/fui/transform.fi).
+fn painter_fill_raster(z: *mut Painter, ra: *mut raster.Raster, ox: usize,
+    oy: usize, col: u32) {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g as u64 != 0 {
+        gpu.gpu_fill_raster(g, ra, ox, oy, col)
+        return
+    }
+    canvas.canvas_fill_raster(cv, ra, ox, oy, col)
+}
+
 fn surface(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, col: u32) {
     if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let g: *mut gpu.Gpu = gpu.gpu_of(painter_canvas(z))
+    if g as u64 != 0 {
+        gpu.gpu_rect(g, x, y, x + w, y + h, mit_alpha(col))
         return
     }
     canvas.canvas_fill_rect(painter_canvas(z), x, y, x + w, y + h,
@@ -494,6 +529,12 @@ fn round_rect(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
         surface(z, x, y, w, h, col)
         return
     }
+    let g: *mut gpu.Gpu = gpu.gpu_of(painter_canvas(z))
+    if g as u64 != 0 {
+        gpu.gpu_round(g, x, y, w, h, r, 0.0, mit_alpha(col), mit_alpha(col), false,
+            0.0, 0.0)
+        return
+    }
     var wx: f64 = 0.0
     var wy: f64 = 0.0
     if !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
@@ -517,6 +558,12 @@ fn round_rect(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
 fn round_ring(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
     st: f64, col: u32) {
     if (*z).ok == 0 || w <= 0.0 || h <= 0.0 || st <= 0.0 {
+        return
+    }
+    let g: *mut gpu.Gpu = gpu.gpu_of(painter_canvas(z))
+    if g as u64 != 0 {
+        gpu.gpu_round(g, x, y, w, h, r, st, mit_alpha(col), mit_alpha(col), false,
+            0.0, 0.0)
         return
     }
     var wx: f64 = 0.0
@@ -557,6 +604,12 @@ fn round_ring(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, r: f64,
 fn round_rect_grad(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
     r: f64, c0: u32, c1: u32, dx: f64, dy: f64) {
     if (*z).ok == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let g: *mut gpu.Gpu = gpu.gpu_of(painter_canvas(z))
+    if g as u64 != 0 {
+        gpu.gpu_round(g, x, y, w, h, r, 0.0, mit_alpha(c0), mit_alpha(c1), true,
+            dx, dy)
         return
     }
     var wx: f64 = 0.0
@@ -1648,6 +1701,12 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
     // here now, in the one place somebody will be standing when it
     // happens: give `painter_init` a raster height of at least
     // 3 * the largest font size.
+    // ---- ON THE GPU (lib/fui/gpu.fi): glyphs out of the atlas
+    let gg: *mut gpu.Gpu = gpu.gpu_of(painter_canvas(z))
+    if gg as u64 != 0 {
+        paint_run_gpu(gg, z, r, sx, base_y, br, col, p, nn, vis, wl, wt, ww, wh)
+        return sx + br
+    }
     // ---- THE KEPT PICTURE (lib/fui/fcache.fi): a plain run -- one pass,
     // one colour, left to right -- is rastered once and then only written
     // back, wherever it stands at a whole-pixel offset.
@@ -1701,6 +1760,137 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
         flush_raster(z, wx, wy, col)
     }
     return sx + br
+}
+
+// ============================================================ TEXT ON THE GPU
+//
+// fUi tempo, stage 2 (lib/fui/gpu.fi). Every glyph is rastered ONCE -- per
+// font, glyph, size, weight, slant and QUARTER PIXEL of its position --
+// by the same outline code as the CPU path (`glyph_into`: the same bold
+// passes, the same shear), and kept in the GPU's atlas; a run is then one
+// quad per glyph. The differences to the CPU picture: the position is
+// rounded to a quarter pixel (an eighth at most), the coverage to an
+// octet, and two glyphs that share an edge pixel blend one over the other
+// instead of adding in one raster. The outline pass stays on the CPU (eight
+// copies of the run in one raster) and goes up as a mask.
+const GLYPH_KEY: u64 = 1
+
+fn gpu_glyph(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun,
+    f: *mut ttf.Font, gid: u32, pen: f64, base_y: f64, sc: f64, col: u32,
+    grad: bool, col2: u32, gy0: f64, gy1: f64) {
+    var ax: f64 = floor_px(pen)
+    var q: i64 = ((pen - ax) * 4.0 + 0.5) as i64
+    if q >= 4 {
+        q = 0
+        ax = ax + 1.0
+    }
+    var ay: f64 = floor_px(base_y)
+    var qy: i64 = ((base_y - ay) * 4.0 + 0.5) as i64
+    if qy >= 4 {
+        qy = 0
+        ay = ay + 1.0
+    }
+    var k: gpu.AKey = gpu.akey_new()
+    k.k[0] = GLYPH_KEY
+    k.k[1] = (*z).fm
+    k.k[2] = gid as u64
+    k.k[3] = __bits((*r).size)
+    k.k[4] = ((*r).weight as u64) | (((*r).slant as u64) << 16)
+    k.k[5] = (q as u64) | ((qy as u64) << 8)
+    var e: u64 = gpu.gpu_atlas_find(g, &k)
+    if e == 0 {
+        // the glyph alone in a window around its pen: a font size left of
+        // it, three right, two above the baseline and one below
+        let sz: f64 = (*r).size
+        let wox: f64 = ax - sz - 2.0
+        let woy: f64 = ay - 2.0 * sz - 2.0
+        var ww: usize = (sz * 4.0 + 6.0) as usize
+        var wh: usize = (sz * 3.0 + 6.0) as usize
+        if ww > (*z).w { ww = (*z).w }
+        if wh > (*z).h { wh = (*z).h }
+        if !raster.raster_begin(&(*z).ra, wox, woy, ww, wh) {
+            return
+        }
+        glyph_into(z, r, f, gid, ax + (q as f64) * 0.25, ay + (qy as f64) * 0.25, sc)
+        raster.raster_finish(&(*z).ra)
+        e = gpu.gpu_atlas_put(g, &k, &(*z).ra, wox as i64, woy as i64, ax as i64,
+            ay as i64)
+        if e == 0 {
+            return
+        }
+    }
+    gpu.gpu_atlas_draw(g, e, ax as i64, ay as i64, col, grad, col2, gy0, gy1)
+}
+
+// All glyphs of the run (in visual order when it went through bidi_prepare)
+// at the offset (dx, dy), in one colour or a gradient.
+fn glyphs_gpu(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, vis: bool,
+    p: u64, n: usize, sx: f64, base_y: f64, dx: f64, dy: f64, col: u32,
+    grad: bool, col2: u32, gy0: f64, gy1: f64) {
+    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
+    let sc: f64 = (*r).size / metrics.fm_upem((*z).fm)
+    if vis {
+        var k: usize = 0
+        while k < (*z).bvn {
+            let j: usize = br32(z, bo_vis(), k) as usize
+            gpu_glyph(g, z, r, f, br32(z, bo_gid(), j), sx + dx + brf(z, bo_x(), j),
+                base_y + dy, sc, col, grad, col2, gy0, gy1)
+            k = k + 1
+        }
+        return
+    }
+    var pen: f64 = sx + dx
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let nx: u32 = next_cp(p, n, i, adv)
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        gpu_glyph(g, z, r, f, gid, pen, base_y + dy, sc, col, grad, col2, gy0, gy1)
+        pen = pen + advance_of(z, r, cp, nx)
+        i = i + adv
+    }
+}
+
+// paint_run on the GPU: the same three passes.
+fn paint_run_gpu(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, sx: f64,
+    base_y: f64, br: f64, col: u32, p: u64, nn: usize, vis: bool, wl: f64,
+    wt: f64, ww: f64, wh: f64) {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let sz: f64 = (*r).size
+    // wholly outside the clip: nothing (the CPU window would say so too)
+    if wl + ww + sz <= canvas.clip_x0(cv) || wl - sz >= canvas.clip_x1(cv) ||
+        wt + wh + sz <= canvas.clip_y0(cv) || wt - sz >= canvas.clip_y1(cv) {
+        return
+    }
+    if (*r).sh_on != 0 {
+        glyphs_gpu(g, z, r, vis, p, nn, sx, base_y, (*r).sh_dx, (*r).sh_dy,
+            mit_alpha((*r).sh_col), false, 0 as u32, 0.0, 0.0)
+    }
+    if (*r).out_on != 0 && (*r).out_w > 0.0 {
+        var wx: f64 = 0.0
+        var wy: f64 = 0.0
+        if raster_window(z, wl, wt, ww, wh, sz, &wx, &wy) {
+            var k: usize = 0
+            while k < 8 {
+                into_raster(z, r, vis, p, nn, sx, base_y, out_dir_x(k) * (*r).out_w,
+                    out_dir_y(k) * (*r).out_w)
+                k = k + 1
+            }
+            raster.raster_finish(&(*z).ra)
+            gpu.gpu_fill_raster(g, &(*z).ra, wx as usize, wy as usize,
+                mit_alpha((*r).out_col))
+        }
+    }
+    if (*r).grad_on != 0 {
+        let asc: f64 = metrics.fm_ascent((*z).fm, sz)
+        let dsc: f64 = metrics.fm_descent((*z).fm, sz)
+        glyphs_gpu(g, z, r, vis, p, nn, sx, base_y, 0.0, 0.0, theme.opaque(col),
+            true, theme.opaque((*r).grad_col), base_y - asc, base_y + dsc)
+        return
+    }
+    glyphs_gpu(g, z, r, vis, p, nn, sx, base_y, 0.0, 0.0, mit_alpha(col), false,
+        0 as u32, 0.0, 0.0)
 }
 
 // A PLAIN RUN THROUGH THE CACHE. True when it was painted here (from

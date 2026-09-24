@@ -59,6 +59,7 @@ import svg.stroke
 import fui.theme
 import fui.painter
 import fui.fcache
+import fui.gpu
 import fui.render
 import fui.lucide
 
@@ -177,7 +178,8 @@ fn icon_key(id: i64, x: f64, y: f64, size: f64, sw: f64, filled: bool) -> fcache
 // edge would cut): false, and the caller rasters.
 fn icon_hit(z: *mut painter.Painter, k: *mut fcache.CKey, x: f64, y: f64,
     size: f64, luft: f64, col: u32) -> bool {
-    if !fcache.fc_on() || !whole_on_canvas(z, x, y, size, luft) {
+    if !fcache.fc_on() || !whole_on_canvas(z, x, y, size, luft) ||
+        gpu.gpu_of(painter.painter_canvas(z)) as u64 != 0 {
         return false
     }
     let e: u64 = fcache.fc_lookup(k, 0, 0)
@@ -188,11 +190,65 @@ fn icon_hit(z: *mut painter.Painter, k: *mut fcache.CKey, x: f64, y: f64,
         floor_px(y) as i64, painter.mit_alpha(col))
 }
 
+// ON THE GPU (lib/fui/gpu.fi): the icon's coverage in the GPU's atlas,
+// under the same key as the cache's; true when it was drawn from there.
+fn gpu_key(k: *mut fcache.CKey) -> gpu.AKey {
+    var a: gpu.AKey = gpu.akey_new()
+    a.k[0] = 2 // an icon (painter.fi: 1 = a glyph)
+    a.k[1] = (*k).a
+    a.k[2] = (*k).b
+    a.k[3] = (*k).c
+    a.k[4] = (*k).d
+    a.k[5] = (*k).e
+    a.k[6] = (*k).f
+    return a
+}
+
+fn icon_gpu_hit(z: *mut painter.Painter, k: *mut fcache.CKey, x: f64, y: f64,
+    col: u32) -> bool {
+    let g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if g as u64 == 0 {
+        return false
+    }
+    var a: gpu.AKey = gpu_key(k)
+    let e: u64 = gpu.gpu_atlas_find(g, &a)
+    if e == 0 {
+        return false
+    }
+    gpu.gpu_atlas_draw(g, e, floor_px(x) as i64, floor_px(y) as i64,
+        painter.mit_alpha(col), false, 0 as u32, 0.0, 0.0)
+    return true
+}
+
 // fill_path, and with a key the coverage is kept: then the window is not
 // cut to the rows of the clip (a kept coverage needs all of them).
 fn fill_path_kept(z: *mut painter.Painter, pf: *mut path.Pfad, x: f64, y: f64,
     size: f64, k: f64, luft: f64, col: u32, evenodd: bool,
     key: *mut fcache.CKey) {
+    let g: *mut gpu.Gpu = gpu.gpu_of(painter.painter_canvas(z))
+    if g as u64 != 0 && key as u64 != 0 {
+        // the whole square, wherever it stands (the GPU cuts at drawing)
+        let gx: f64 = floor_px(x - luft)
+        let gy: f64 = floor_px(y - luft)
+        let gw: usize = (size + 2.0 * luft + 2.0) as usize + 1
+        if gw <= (*z).w && gw <= (*z).h && raster.raster_begin(&(*z).ra, gx, gy, gw, gw) {
+            path.pfad_an_raster(pf, &(*z).ra, matrix.mat_von_sechs(k, 0.0, 0.0, k,
+                x, y))
+            if evenodd {
+                raster.raster_finish_evenodd(&(*z).ra)
+            } else {
+                raster.raster_finish(&(*z).ra)
+            }
+            var a: gpu.AKey = gpu_key(key)
+            let e: u64 = gpu.gpu_atlas_put(g, &a, &(*z).ra, gx as i64, gy as i64,
+                floor_px(x) as i64, floor_px(y) as i64)
+            if e != 0 {
+                gpu.gpu_atlas_draw(g, e, floor_px(x) as i64, floor_px(y) as i64,
+                    painter.mit_alpha(col), false, 0 as u32, 0.0, 0.0)
+            }
+        }
+        return
+    }
     let keep: bool = key as u64 != 0 && fcache.fc_on() &&
         whole_on_canvas(z, x, y, size, luft)
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
@@ -240,6 +296,11 @@ fn fill_path_kept(z: *mut painter.Painter, pf: *mut path.Pfad, x: f64, y: f64,
         fcache.fc_store(key, 0, 0, &(*z).ra, ax, ay, floor_px(x) as i64,
             floor_px(y) as i64)
     }
+    let g2: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g2 as u64 != 0 {
+        gpu.gpu_fill_raster(g2, &(*z).ra, ax as usize, ay as usize, painter.mit_alpha(col))
+        return
+    }
     canvas.canvas_fill_raster(cv, &(*z).ra, ax as usize, ay as usize,
         painter.mit_alpha(col))
 }
@@ -282,9 +343,10 @@ fn icon_stroke(z: *mut painter.Painter, id: i64, x: f64, y: f64, size: f64,
     if off_clip(z, x, y, size, luft) {
         return
     }
-    // painted before at this size: written back (lib/fui/fcache.fi)
+    // painted before at this size: written back (lib/fui/fcache.fi), or
+    // drawn out of the GPU's atlas
     var key: fcache.CKey = icon_key(id, x, y, size, sw, false)
-    if icon_hit(z, &key, x, y, size, luft, col) {
+    if icon_gpu_hit(z, &key, x, y, col) || icon_hit(z, &key, x, y, size, luft, col) {
         return
     }
     let w: *mut Work = work()
@@ -326,7 +388,7 @@ fn icon_filled(z: *mut painter.Painter, id: i64, x: f64, y: f64, size: f64,
         return
     }
     var key: fcache.CKey = icon_key(id, x, y, size, 0.0, true)
-    if icon_hit(z, &key, x, y, size, 2.0, col) {
+    if icon_gpu_hit(z, &key, x, y, col) || icon_hit(z, &key, x, y, size, 2.0, col) {
         return
     }
     let w: *mut Work = work()
