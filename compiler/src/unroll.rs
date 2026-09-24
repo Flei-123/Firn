@@ -170,7 +170,7 @@ fn find(f: &Func) -> Option<Plan> {
     // Where is each value defined, and which values are constants?
     let nv = f.val_types.len();
     let mut defblock: Vec<usize> = vec![usize::MAX; nv];
-    let mut konst: Vec<Option<i128>> = vec![None; nv];
+    let mut consts: Vec<Option<i128>> = vec![None; nv];
     for (bi, b) in f.blocks.iter().enumerate() {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -178,7 +178,7 @@ fn find(f: &Func) -> Option<Plan> {
                 if d < nv {
                     defblock[d] = bi;
                     if let Op::Const(c) = i.op {
-                        konst[d] = Some(c);
+                        consts[d] = Some(c);
                     }
                 }
             }
@@ -266,7 +266,7 @@ fn find(f: &Func) -> Option<Plan> {
             continue;
         }
         // which side is the counter?
-        let (iv, lim, op) = match (konst.get(b as usize).copied().flatten(), konst.get(a as usize).copied().flatten()) {
+        let (iv, lim, op) = match (consts.get(b as usize).copied().flatten(), consts.get(a as usize).copied().flatten()) {
             (Some(l), _) => (a, l, op),
             (None, Some(l)) => (b, l, swap(op)),
             _ => continue,
@@ -287,7 +287,7 @@ fn find(f: &Func) -> Option<Plan> {
             Some((_, v)) => *v,
             None => continue,
         };
-        let init = match konst.get(init as usize).copied().flatten() {
+        let init = match consts.get(init as usize).copied().flatten() {
             Some(c) => c,
             None => continue,
         };
@@ -309,14 +309,14 @@ fn find(f: &Func) -> Option<Plan> {
         let step = match bop {
             crate::fir::BinOp::Add => {
                 if x1 == iv {
-                    konst.get(x2 as usize).copied().flatten()
+                    consts.get(x2 as usize).copied().flatten()
                 } else if x2 == iv {
-                    konst.get(x1 as usize).copied().flatten()
+                    consts.get(x1 as usize).copied().flatten()
                 } else {
                     None
                 }
             }
-            crate::fir::BinOp::Sub if x1 == iv => konst.get(x2 as usize).copied().flatten().map(|c| -c),
+            crate::fir::BinOp::Sub if x1 == iv => consts.get(x2 as usize).copied().flatten().map(|c| -c),
             _ => None,
         };
         let step = match step {

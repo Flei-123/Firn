@@ -149,6 +149,13 @@ pub(crate) fn emit_auxv_save(e: &mut Emitter) {
 // ----------------------------------------------------------------- helpers
 
 /// A `v128` value out of its frame slot into a vector register.
+/// A whole `v128` from one frame slot into another (the copies `phi.rs`
+/// leaves behind): through a q register, all sixteen octets.
+pub(crate) fn emit_copy_v128(e: &mut Emitter, fr: &Frame, d: Val, src: Val) {
+    vload(e, fr, VA, src);
+    vstore(e, fr, d, VA);
+}
+
 pub(crate) fn vload(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
     let m = at(e, fr, v, 16);
     e.line(&format!("ldr {}, {}", qn(r), m));

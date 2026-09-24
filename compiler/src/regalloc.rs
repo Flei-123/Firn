@@ -4488,6 +4488,11 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     // Ganzzahlregister -- vorher zaehlte dieser Weg stur die Position, was
     // richtig war, solange keine Funktion mit Fliesskomma hier ankam.
     let mut prolog_moves: Vec<(String, String)> = Vec::new();
+    // The floating point homes are moved IN PARALLEL too: `xmm4`-`xmm7` are
+    // argument registers AND homes. Emitted one by one, `movaps xmm7, xmm2`
+    // (third parameter) destroyed the eighth parameter before its own
+    // `movaps xmm12, xmm7` read it (paintb3 02_borders, painter.which_side).
+    let mut fp_moves: Vec<(String, String)> = Vec::new();
     let mut int_i = 0usize;
     let mut sse_i = 0usize;
     let mut stack_i = 0usize;
@@ -4506,11 +4511,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
                         off,
                         r
                     )),
-                    Loc::Reg(dst) => {
-                        if dst != r {
-                            e.line(&format!("movaps {}, {}", dst, r));
-                        }
-                    }
+                    Loc::Reg(dst) => fp_moves.push((dst.to_string(), r.to_string())),
                 }
                 continue;
             }
@@ -4530,6 +4531,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         stack_i += 1;
     }
     parallel_reg_moves(e, &prolog_moves);
+    parallel_xmm_moves(e, &fp_moves);
     for (i, of) in from_stack {
         let t = f.params[i];
         if t.is_float() {
@@ -5111,6 +5113,37 @@ fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
     }
 }
 
+/// `parallel_reg_moves` for SSE registers. A cycle is broken by swapping two
+/// registers in place (three `xorps`), so no scratch register is needed --
+/// every one of `xmm0`-`xmm7` may still hold an unread parameter.
+fn parallel_xmm_moves(e: &mut Emitter, pairs: &[(String, String)]) {
+    let mut open: Vec<(String, String)> =
+        pairs.iter().filter(|(z, q)| z != q).cloned().collect();
+    while !open.is_empty() {
+        if let Some(i) = open
+            .iter()
+            .position(|(z, _)| !open.iter().any(|(_, q)| q == z))
+        {
+            let (z, q) = open.remove(i);
+            e.line(&format!("movaps {}, {}", z, q));
+            continue;
+        }
+        // Only cycles left: swap target and source. The target now holds
+        // its value; the old content of the target sits in the source, so
+        // every move that read the target reads the source from now on.
+        let (z, q) = open.remove(0);
+        e.line(&format!("xorps {}, {}", z, q));
+        e.line(&format!("xorps {}, {}", q, z));
+        e.line(&format!("xorps {}, {}", z, q));
+        for (_, source) in open.iter_mut() {
+            if *source == z {
+                *source = q.clone();
+            }
+        }
+        open.retain(|(a, b)| a != b);
+    }
+}
+
 fn epilogue(e: &mut Emitter, a: &Alloc) {
     for (r, off) in &a.saved {
         e.line(&format!("mov {}, qword ptr [rbp-{}]", r, off));
@@ -5209,9 +5242,9 @@ fn emit_block(
             // Stand direkt davor ein Aufruf, der dasselbe Register vom
             // selben Platz zurueckgeholt hat, steht der Wert dort noch --
             // zwei Aufrufe hintereinander sichern nur einmal.
-            let vorher = if ii > 0 { ra.a.call_saves.get(&(b.id as usize, ii - 1)) } else { None };
+            let prev_saves = if ii > 0 { ra.a.call_saves.get(&(b.id as usize, ii - 1)) } else { None };
             for (r, off, t) in l {
-                if let Some(v) = vorher {
+                if let Some(v) = prev_saves {
                     if v.iter().any(|(q, o, _)| q == r && o == off) {
                         continue;
                     }

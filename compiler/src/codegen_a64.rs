@@ -1110,6 +1110,13 @@ fn emit_inst(
         // and a copy is one `ldr` plus one `str`.
         Op::Copy { src } => {
             let d = i.dst.ok_or("internal error: copy without target")?;
+            // A `v128` is sixteen octets: since round TEMPO 4 mem2reg
+            // promotes it, and the copy phi.rs makes of it must not leave
+            // the upper half behind (tests/1613_crypto, 1614_simd_ops).
+            if ty == FTy::V128 {
+                crate::simd_a64::emit_copy_v128(e, fr, d, *src);
+                return Ok(());
+            }
             load_full(e, fr, A, *src);
             store_dst(e, fr, d, A);
         }

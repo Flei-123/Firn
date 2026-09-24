@@ -55,47 +55,47 @@ pub(crate) fn split(f: &mut Func) -> usize {
         return 0;
     }
     // Konstanten (fuer die Versaetze).
-    let mut konst: HashMap<Val, i128> = HashMap::new();
-    let mut zellen: HashMap<Val, (u64, u64)> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut cells: HashMap<Val, (u64, u64)> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
             match (&i.op, i.dst) {
                 (Op::Const(c), Some(d)) => {
-                    konst.insert(d, *c);
+                    consts.insert(d, *c);
                 }
                 (Op::Alloca { size, align }, Some(d)) => {
-                    zellen.insert(d, (*size, *align));
+                    cells.insert(d, (*size, *align));
                 }
                 _ => {}
             }
         }
     }
-    if zellen.is_empty() {
+    if cells.is_empty() {
         return 0;
     }
     // ptradd-Ergebnis -> (Zelle, Versatz)
     let mut feldzeiger: HashMap<Val, (Val, i128)> = HashMap::new();
-    let mut schlecht: HashSet<Val> = HashSet::new();
+    let mut bad: HashSet<Val> = HashSet::new();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Op::PtrAdd { base, off }, Some(d)) = (&i.op, i.dst) {
-                if zellen.contains_key(base) {
-                    match konst.get(off) {
+                if cells.contains_key(base) {
+                    match consts.get(off) {
                         Some(&k) if k >= 0 => {
                             feldzeiger.insert(d, (*base, k));
                         }
                         _ => {
-                            schlecht.insert(*base);
+                            bad.insert(*base);
                         }
                     }
                 }
             }
         }
     }
-    // Zelle -> Versatz -> Typ; jede andere Benutzung macht die Zelle schlecht.
-    let mut felder: HashMap<Val, BTreeMap<i128, crate::fir::FTy>> = HashMap::new();
-    let wurzel = |v: Val| -> Option<(Val, i128)> {
-        if zellen.contains_key(&v) {
+    // Zelle -> Versatz -> Typ; jede andere Benutzung macht die Zelle bad.
+    let mut fields: HashMap<Val, BTreeMap<i128, crate::fir::FTy>> = HashMap::new();
+    let root = |v: Val| -> Option<(Val, i128)> {
+        if cells.contains_key(&v) {
             Some((v, 0))
         } else {
             feldzeiger.get(&v).copied()
@@ -106,25 +106,25 @@ pub(crate) fn split(f: &mut Func) -> usize {
         for i in &b.insts {
             match &i.op {
                 Op::Load { addr } | Op::Store { addr, .. } => {
-                    if let Some((z, k)) = wurzel(*addr) {
-                        let e = felder.entry(z).or_default();
+                    if let Some((z, k)) = root(*addr) {
+                        let e = fields.entry(z).or_default();
                         match e.get(&k) {
                             None => {
                                 e.insert(k, i.ty);
                             }
                             Some(t) if *t == i.ty => {}
                             _ => {
-                                schlecht.insert(z);
+                                bad.insert(z);
                             }
                         }
                     }
                     if let Op::Store { val, .. } = &i.op {
-                        if let Some((z, _)) = wurzel(*val) {
-                            schlecht.insert(z);
+                        if let Some((z, _)) = root(*val) {
+                            bad.insert(z);
                         }
                     }
                 }
-                Op::PtrAdd { base, .. } if zellen.contains_key(base) => {
+                Op::PtrAdd { base, .. } if cells.contains_key(base) => {
                     // schon oben eingeordnet; der Versatz selbst ist keine
                     // Benutzung einer Zelle
                 }
@@ -132,8 +132,8 @@ pub(crate) fn split(f: &mut Func) -> usize {
                     buf.clear();
                     other.uses(&mut buf);
                     for v in &buf {
-                        if let Some((z, _)) = wurzel(*v) {
-                            schlecht.insert(z);
+                        if let Some((z, _)) = root(*v) {
+                            bad.insert(z);
                         }
                     }
                 }
@@ -146,16 +146,16 @@ pub(crate) fn split(f: &mut Func) -> usize {
             _ => None,
         };
         if let Some(v) = t {
-            if let Some((z, _)) = wurzel(v) {
-                schlecht.insert(z);
+            if let Some((z, _)) = root(v) {
+                bad.insert(z);
             }
         }
         // phi-Eintraege zaehlen als Benutzung
         for i in &b.insts {
             if let Op::Phi { incoming } = &i.op {
                 for (_, v) in incoming.iter() {
-                    if let Some((z, _)) = wurzel(*v) {
-                        schlecht.insert(z);
+                    if let Some((z, _)) = root(*v) {
+                        bad.insert(z);
                     }
                 }
             }
@@ -163,45 +163,45 @@ pub(crate) fn split(f: &mut Func) -> usize {
     }
     // Auswahl: mindestens ein ptradd (sonst kann mem2reg es schon), keine
     // Ueberlappung, alles innerhalb der Zelle, kein geheimer Wert.
-    let mut kandidaten: Vec<Val> = felder
+    let mut candidates: Vec<Val> = fields
         .iter()
         .filter(|(z, fs)| {
-            if schlecht.contains(z) || f.is_secret(**z) {
+            if bad.contains(z) || f.is_secret(**z) {
                 return false;
             }
             if !feldzeiger.values().any(|(w, _)| w == *z) {
                 return false;
             }
-            let (size, _) = zellen[*z];
-            let mut ende: i128 = 0;
+            let (size, _) = cells[*z];
+            let mut end: i128 = 0;
             for (&k, t) in fs.iter() {
                 let n = t.bytes() as i128;
-                if n == 0 || k < ende || k + n > size as i128 {
+                if n == 0 || k < end || k + n > size as i128 {
                     return false;
                 }
-                ende = k + n;
+                end = k + n;
             }
             true
         })
         .map(|(z, _)| *z)
         .collect();
-    if kandidaten.is_empty() {
+    if candidates.is_empty() {
         return 0;
     }
     // Reihenfolge fest (Fixpunkt: zwei Laeufe muessen denselben Text geben).
-    kandidaten.sort_unstable();
+    candidates.sort_unstable();
     let mut neu: HashMap<(Val, i128), Val> = HashMap::new();
-    for z in &kandidaten {
-        let (_, align) = zellen[z];
-        for (&k, t) in felder[z].iter() {
+    for z in &candidates {
+        let (_, align) = cells[z];
+        for (&k, t) in fields[z].iter() {
             let n = t.bytes();
             let a = n.min(align).max(1);
             let nv = f.alloca(n, a);
             neu.insert((*z, k), nv);
         }
     }
-    let ziel = |v: Val| -> Option<Val> {
-        let (z, k) = if zellen.contains_key(&v) {
+    let target = |v: Val| -> Option<Val> {
+        let (z, k) = if cells.contains_key(&v) {
             (v, 0)
         } else {
             *feldzeiger.get(&v)?
@@ -212,7 +212,7 @@ pub(crate) fn split(f: &mut Func) -> usize {
         for i in b.insts.iter_mut() {
             match &mut i.op {
                 Op::Load { addr } | Op::Store { addr, .. } => {
-                    if let Some(nv) = ziel(*addr) {
+                    if let Some(nv) = target(*addr) {
                         *addr = nv;
                     }
                 }
@@ -221,5 +221,5 @@ pub(crate) fn split(f: &mut Func) -> usize {
         }
     }
     // Die alten ptradd und die alte Zelle sind jetzt tot; `dce` raeumt sie.
-    kandidaten.len()
+    candidates.len()
 }
