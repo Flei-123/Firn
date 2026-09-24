@@ -3047,6 +3047,26 @@ fn foldable_addresses(
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
         return (out, away, before, scale);
     }
+    // ONE WRITER ONLY. Every map below is keyed by the VALUE, and the code
+    // generator looks the value up at every instruction that writes it.
+    // After phi elimination and coalescing a value can have several
+    // writers -- the `q = q0` in front of a loop and the `q = q + 4` inside
+    // it are the same value then. A fold decided for one writer was applied
+    // to all of them: fUi's `canvas_fill_rect` got `lea r9, [r8+r9*4]` for
+    // its `q = q + 4` (the start address `px + idx*4` of the other writer)
+    // and wrote through a wild pointer -- x11demo at Xft.dpi 192 crashed
+    // in release-fast after the merge of TEMPO 1-13 onto main.
+    let mut defs: Vec<u32> = vec![0; f.val_types.len()];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                if let Some(c) = defs.get_mut(d as usize) {
+                    *c += 1;
+                }
+            }
+        }
+    }
+    let single = |v: Val| defs.get(v as usize).copied() == Some(1);
     // Does the value simply lie in a register — without special handling?
     let pure_reg = |v: Val| -> Option<&'static str> {
         if a.imm(v).is_some() || a.cell(v).is_some() || f.is_secret(v) {
@@ -3075,7 +3095,7 @@ fn foldable_addresses(
                 Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (*x, *y),
                 _ => continue,
             };
-            if read.get(d as usize).copied() != Some(1) || f.is_secret(d) {
+            if read.get(d as usize).copied() != Some(1) || f.is_secret(d) || !single(d) {
                 continue;
             }
             if a.alias.contains_key(&d) || a.frame_addr.contains_key(&d) || a.cell(d).is_some() {
@@ -3134,7 +3154,7 @@ fn foldable_addresses(
                 continue;
             }
             // (3b) index with factor: the scaling sits right in front of it
-            if read.get(off as usize).copied() == Some(1) && idx > 0 {
+            if read.get(off as usize).copied() == Some(1) && idx > 0 && single(off) {
                 let p = &b.insts[idx - 1];
                 let skal = if p.dst == Some(off) && p.ty.bits() == 64 {
                     match &p.op {
@@ -3219,6 +3239,9 @@ fn foldable_addresses(
                 if out.contains_key(&d) || away.contains(&d) || before.contains_key(&d) {
                     continue;
                 }
+                if !single(d) {
+                    continue;
+                }
                 if f.is_secret(d) || a.alias.contains_key(&d) || a.cell(d).is_some() {
                     continue;
                 }
@@ -3227,7 +3250,7 @@ fn foldable_addresses(
                     Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (*x, *y),
                     _ => continue,
                 };
-                if idx == 0 || read.get(off as usize).copied() != Some(1) {
+                if idx == 0 || read.get(off as usize).copied() != Some(1) || !single(off) {
                     continue;
                 }
                 if away.contains(&off) || out.contains_key(&off) || before.contains_key(&off) {
