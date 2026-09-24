@@ -78,6 +78,7 @@ mod statics;
 mod sema_generic;
 mod sema_match;
 mod peephole;
+mod promote;
 mod rangecheck;
 mod strings;
 mod strtype;

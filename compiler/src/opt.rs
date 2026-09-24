@@ -61,6 +61,8 @@ pub struct OptStats {
     pub strength: usize,
     /// ROUND 92: phi entries dropped or phis folded back into one value
     pub phis_folded: usize,
+    /// Round OPT-GENERAL: memory cells kept in registers across a loop
+    pub promoted_cells: usize,
 }
 
 // ----------------------------------------------------- Pass register ---
@@ -207,6 +209,18 @@ pub const PASSES: &[PassInfo] = &[
         scope: Scope::Func,
         debug_preserving: true,
         what: "remove unreachable blocks and unused pure instructions",
+    },
+    // Round OPT-GENERAL: after the fixpoint and after inlining, once per
+    // function: rotate loops into guarded do-while form and keep memory
+    // cells (struct fields behind a pointer) in registers across a loop
+    // (`promote.rs`). Memory holds the value only around the inner loops
+    // that may touch it, so a debugger sees stale fields -- NOT debug
+    // preserving.
+    PassInfo {
+        name: "promote",
+        scope: Scope::Module,
+        debug_preserving: false,
+        what: "loop rotation + keep struct fields in registers across loops (scalar promotion)",
     },
     PassInfo {
         name: "inline",
@@ -397,6 +411,37 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         for f in m.funcs.iter_mut() {
             optimize_func(f, &mut st, cfg, &mut clk);
         }
+    }
+    if cfg.runs("promote") && std::env::var_os("FIRN_NO_PROMOTE").is_none() {
+        let t = std::time::Instant::now();
+        let nounmap = crate::promote::nounmap_functions(m);
+        let trace = std::env::var_os("FIRN_PROMOTE_TRACE").is_some();
+        for f in m.funcs.iter_mut() {
+            // Rotation alone is kept only where it lets a cell move into a
+            // register: the other passes and both register allocators were
+            // tuned on top-tested loops, and a rotated loop that promotes
+            // nothing gains little.
+            let mut g = f.clone();
+            let r = crate::promote::rotate_loops(&mut g);
+            if r > 0 {
+                optimize_func(&mut g, &mut st, cfg, &mut clk);
+            }
+            let p = crate::promote::promote_cells(&mut g, &nounmap);
+            if p > 0 {
+                if trace {
+                    eprintln!("promote: @{} rotated {} loops, {} cells", f.name, r, p);
+                }
+                optimize_func(&mut g, &mut st, cfg, &mut clk);
+                if let Err(e) = g.verify_phis() {
+                    // never ship a broken function: keep the original
+                    eprintln!("promote: @{} skipped ({})", f.name, e);
+                    continue;
+                }
+                st.promoted_cells += p;
+                *f = g;
+            }
+        }
+        clk.add("promote", t);
     }
     clk.print();
     st
