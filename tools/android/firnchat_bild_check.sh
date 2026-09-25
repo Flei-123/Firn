@@ -64,7 +64,8 @@ px=im.load()
 for y in range(0,1800):
     for x in range(0,2400): px[x,y]=((x//9)%256,(y//7)%256,((x+y)//5)%256)
 im.save('$W/gross.jpg',quality=95)
-Image.new('RGB',(300,200),(220,30,30)).save('$W/rot.jpg',quality=90)"
+Image.new('RGB',(300,200),(220,30,30)).save('$W/rot.jpg',quality=90)
+Image.new('RGB',(800,600),(30,60,200)).save('$W/blau.jpg',quality=90)"
 
 $ADB root >/dev/null 2>&1; sleep 1
 $ADB install -r "$APK" >/dev/null || { echo "install failed"; exit 1; }
@@ -82,6 +83,10 @@ $ADB push "$W/gross.jpg" /sdcard/Pictures/firnbild.jpg >/dev/null
 # dated 2030, so it is the first of "Recent" in the picker whatever else
 # the gallery holds
 $ADB shell touch -t 203001011200 /sdcard/Pictures/firnbild.jpg
+$ADB push "$W/blau.jpg" /sdcard/Pictures/firnbild2.jpg >/dev/null
+$ADB shell touch -t 203001021200 /sdcard/Pictures/firnbild2.jpg
+$ADB shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
+    -d file:///sdcard/Pictures/firnbild2.jpg >/dev/null
 $ADB shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
     -d file:///sdcard/Pictures/firnbild.jpg >/dev/null
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 15
@@ -112,18 +117,25 @@ tap_spot 5 6; sleep 3
 check "taken away" "$(count 'bild-weg ')" 1
 check "still nothing sent" "$(cd "$W" && "$FC" hist "$PORT" alice.id | grep -c 'bild:')" 0
 
-echo "== 4. photo + text, Send: ONE message"
+echo "== 4. two photos + text, Send: ONE message"
 tap_spot 3 4; sleep 5
 tap_ui "(Media picker|Photos|Files|Gallery)"; sleep 6
 tap_ui "Photo taken on Jan 1, 2030"; sleep 9
+tap_spot 3 4; sleep 5
+tap_ui "(Media picker|Photos|Files|Gallery)"; sleep 6
+tap_ui "Photo taken on Jan 2, 2030"; sleep 9
+ID2=$(out | grep -oP '^bild-ok \K\S+' | tail -1)
+check "the second photo went up too" "$( [ -f "$W/pics/$ID2" ] && [ "$ID2" != "$ID" ] && echo yes)" yes
+check "still nothing sent" "$(cd "$W" && "$FC" hist "$PORT" alice.id | grep -c 'bild:')" 0
 $ADB shell input tap 600 "$(spot 2)"; sleep 1
-$ADB shell input text 'Schau%smal%sdas%sFoto'; sleep 2
+$ADB shell input text 'Schau%smal%sdie%sFotos'; sleep 2
 tap_spot 1 2; sleep 6
 check "sent" "$(count 'bild-gesendet ')" 1
 H=$(cd "$W" && "$FC" hist "$PORT" alice.id)
-LINE=$(echo "$H" | grep -oP '\[bild:[0-9a-f]{64}\.jpg [0-9]+x[0-9]+\]' | tail -1)
-check "alice got the photo's line" "$(echo "$LINE" | grep -c "$ID")" 1
-check "... with the text under it" "$(echo "$H" | grep -A1 "$ID" | tail -1)" "Schau mal das Foto"
+LINE=$(echo "$H" | grep -oP '\[bild:[0-9a-f]{64}\.jpg [0-9]+x[0-9]+\]' | grep "$ID" | tail -1)
+check "alice got the first photo's line" "$(echo "$LINE" | grep -c "$ID")" 1
+check "... the second one's under it (one message)" "$(echo "$H" | grep -A1 "$ID" | tail -1 | grep -c "$ID2")" 1
+check "... and the text under both" "$(echo "$H" | grep -A2 "$ID" | tail -1)" "Schau mal die Fotos"
 WH=$(echo "$LINE" | grep -oP ' \K[0-9]+x[0-9]+')
 check "made small by the system: 1600 x 1200" "$WH" 1600x1200
 (cd "$W" && "$FC" bildholen "$ID" back.jpg "$PORT" alice.id >/dev/null)
@@ -146,16 +158,16 @@ tap_spot 3 4; sleep 5
 tap_ui "Camera"; sleep 10
 tap_ui "Shutter"; sleep 6
 tap_ui "Done"; sleep 10
-check "the camera's photo went up" "$(out | grep -c '^bild-ok ')" 3
+check "the camera's photo went up" "$(out | grep -c '^bild-ok ')" 4
 tap_spot 1 2; sleep 6
 check "and out" "$(count 'bild-gesendet ')" 2
-check "alice got it" "$(cd "$W" && "$FC" hist "$PORT" alice.id | grep -c 'bild:')" 2
+check "alice got it" "$(cd "$W" && "$FC" hist "$PORT" alice.id | grep -c 'bild:')" 3
 
 echo "== 7. Back in the chooser sends nothing"
 tap_spot 3 4; sleep 5
 $ADB shell input keyevent KEYCODE_BACK; sleep 5
 check "no photo, said so" "$(count 'bild-kein 3')" 1
-check "nothing more went out" "$(cd "$W" && "$FC" hist "$PORT" alice.id | grep -c 'bild:')" 2
+check "nothing more went out" "$(cd "$W" && "$FC" hist "$PORT" alice.id | grep -c 'bild:')" 3
 check "the same process all along (no crash)" "$($ADB shell pidof $PKG)" "$P1"
 check "no crash in the log" "$($ADB logcat -d -b crash | grep -c "$PKG")" 0
 
