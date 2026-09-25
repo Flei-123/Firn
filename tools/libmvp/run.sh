@@ -13,6 +13,7 @@
 #             stand-in for the CUPS scheduler
 #   clipboard lib/window's X11 clipboard against Tk and python-xlib (Xvfb)
 #   twowin    two top-level windows of one program, window.wait_any (Xvfb)
+#   webclip   lib/plat/webclip.fi against Chromium's clipboard (Playwright)
 # std.fs has no second implementation to compare with; tests/1910_std_fs.fi
 # is its proof (against the kernel's own answers).
 set -uo pipefail
@@ -65,5 +66,17 @@ echo "-- window clipboard (X11)"
 python3 tools/libmvp/check_clip.py "$W/clip_probe" || rc=1
 echo "-- two windows in one program (X11)"
 python3 tools/libmvp/check_twowin.py "$W/twowin_probe" || rc=1
+echo "-- browser clipboard (Chromium)"
+PW="${PLAYWRIGHT:-}"
+[ -n "$PW" ] || { [ -d /root/jarvis/node_modules/playwright ] && PW=/root/jarvis/node_modules/playwright; }
+if command -v node > /dev/null && { [ -n "$PW" ] || node -e 'require("playwright")' 2> /dev/null; }; then
+    if "$FIRNC" --target=wasm32-browser -o "$W/webclip_probe.wasm" tools/libmvp/webclip_probe.fi > "$W/webclip.log" 2>&1; then
+        PLAYWRIGHT="${PW:-playwright}" node tools/libmvp/check_webclip.cjs "$W/webclip_probe.wasm" || rc=1
+    else
+        echo "  FAIL webclip_probe does not build"; head -5 "$W/webclip.log"; rc=1
+    fi
+else
+    echo "  skip: node or playwright missing"
+fi
 if [ $rc -eq 0 ]; then echo "LIBMVP PASSED"; else echo "LIBMVP FAILED"; fi
 exit $rc

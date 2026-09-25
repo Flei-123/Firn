@@ -27,6 +27,7 @@ const firnTag = document.currentScript;
     const utf8 = new TextEncoder();
     const text = new TextDecoder();
     let mem = null, x = null; // the memory and the exports
+    let clipKeep = null; // the last copy the browser refused (firn_web_clip_write)
     const bytes = (p, n) => new Uint8Array(mem.buffer, p >>> 0, n >>> 0);
     const str = (p, n) => text.decode(bytes(p, n).slice());
     const give = (v) => { // octets into the module: [address, length]
@@ -215,6 +216,41 @@ const firnTag = document.currentScript;
         // the text field holds the page's whole line and lies over its field
         firn_web_edit_mode(on, font, line, left, top, right) { editMode(on, font, line, left, top, right); },
         firn_web_edit_set(p, n, cur, anc, scroll) { editSet(str(p, n), cur, anc, scroll); },
+        // THE SYSTEM CLIPBOARD (lib/plat/webclip.fi). Text through
+        // writeText/readText, image/png and a page's own types through
+        // ClipboardItem ("web <type>" is Chromium's custom format). What the
+        // browser refuses stays in `clipKeep` for the page's own next read.
+        firn_web_clip_write(mp, mn, p, n) {
+            const type = str(mp, mn), data = bytes(p, n).slice();
+            clipKeep = { type, data };
+            const c = navigator.clipboard;
+            if (!c) return 0;
+            const isText = /^text\/plain\b/.test(type);
+            let job;
+            if (isText) job = c.writeText(text.decode(data));
+            else if (typeof ClipboardItem === 'undefined') return 0;
+            else if (type === 'image/png') job = c.write([new ClipboardItem({ 'image/png': new Blob([data], { type }) })]);
+            else job = c.write([new ClipboardItem({ ['web ' + type]: new Blob([data], { type }),
+                'text/plain': new Blob([data], { type: 'text/plain' }) })])
+                .catch(() => c.write([new ClipboardItem({ 'text/plain': new Blob([data], { type: 'text/plain' }) })]));
+            job.then(() => { clipKeep = null; }, () => { /* refused: clipKeep answers the page itself */ });
+            return 1;
+        },
+        firn_web_clip_read(mp, mn) {
+            const type = str(mp, mn);
+            const isText = /^text\/plain\b/.test(type);
+            const answer = (b, ok) => ev(x.firn_web_clip(...give(type), ...give(b), ok ? 1 : 0));
+            const kept = () => { const k = clipKeep; if (k && (k.type === type || (isText && /^text\/plain\b/.test(k.type)))) answer(k.data, true); else answer(new Uint8Array(0), false); };
+            const c = navigator.clipboard;
+            if (!c) return kept();
+            if (isText) { c.readText().then((t) => answer(utf8.encode(t), true), kept); return; }
+            if (!c.read) return kept();
+            c.read({ unsanitized: ['web ' + type] }).catch(() => c.read()).then(async (items) => {
+                for (const it of items) for (const t of [type, 'web ' + type])
+                    if (it.types.includes(t)) return answer(new Uint8Array(await (await it.getType(t)).arrayBuffer()), true);
+                kept();
+            }, kept);
+        },
     };
 
     // THE GPU (lib/plat/webgl.fi, lib/fui/gpu.fi): WebGL2, one host call per
