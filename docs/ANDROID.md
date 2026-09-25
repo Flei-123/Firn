@@ -28,6 +28,7 @@ needs the same key).
 | `lib/plat/sysfont.fi` | The system face: DejaVu on Linux, Roboto on Android. |
 | `tools/android/build.sh` | Any entry file -> APK. |
 | `tools/android/gallery_check.sh` | The acceptance run on a device or emulator. |
+| `lib/plat/android/pick.fi` | A photo from the gallery or the camera, pictures into pixels (see below). |
 
 ## Measured (emulator, Android 15 x86_64, 23.09.2026)
 
@@ -133,6 +134,40 @@ Found on the way, a compiler bug (fixed, `tests/1901_bool_cell_thread_reuse.fi`)
 `thread-bool` threaded a bool cell whose load was reused later as the value
 of the variable; in release-safe `let fr = window.in_front(f)` read false
 forever.
+
+## A photo from the gallery or the camera (25.09.2026)
+
+```sh
+bash tools/android/build.sh <firnchat>/src/gui/app.fi --name FirnChat \
+    --package org.firn.firnchat --push --pick --args-file firnchat-args.txt
+bash tools/android/firnchat_bild_check.sh <firnchat> <apk>   # 25 checks
+```
+
+A NativeActivity cannot receive another app's answer (onActivityResult is a
+Java method of the activity that asked). So `--pick` puts a second class,
+`org.firn.FirnPick`, into the classes.dex Firn writes
+(`tools/android/servicedex_main.fi`): an invisible, translucent activity
+whose `onCreate` calls the native `pick()` and whose `onActivityResult` is
+native too (`lib/plat/android/pick.fi`). It opens the system's chooser --
+the photo picker for `image/*` and the camera beside it (the camera writes
+into a MediaStore entry made for it; neither needs a permission). The
+chosen photo is decoded by BitmapFactory (down-sampled first), turned
+upright by its EXIF orientation, scaled to at most 1600 px and compressed
+to a JPEG of at most 190 kB -- what the page does in the browser before it
+sends. The program's thread picks it up with `window.pick_poll` /
+`window.pick_take`; `window.image_decode` turns JPEG/PNG/WebP octets into
+RGBA pixels of a given size (cut to that shape, like CSS `cover`).
+On X11, Windows and Osum all three honestly say no (`pick_poll` -1).
+
+FIRNCHAT uses it the page's way: the photo waits as a thumbnail over the
+input line, the x takes it away, text can be written to it, Send puts out
+one message. The photo itself goes through the relay (FIRNCHAT
+`src/blob.fi`: sealed pieces, stored where the page's server keeps its
+pictures), so page and app see the same photos.
+
+* Measured on the emulator (API 35): gallery photo 2400x1800 -> 1600x1200
+  JPEG, 132 kB; camera photo 1200x1600; a red photo sent from another
+  account painted in its bubble; Back in the chooser sends nothing.
 
 ## Open
 

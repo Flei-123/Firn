@@ -43,6 +43,10 @@
 #                         gets the foreground service (remoteMessaging) and
 #                         INTERNET, FOREGROUND_SERVICE(_REMOTE_MESSAGING),
 #                         POST_NOTIFICATIONS
+#   --pick                the program uses lib/plat/android/pick.fi (a photo
+#                         from the gallery or the camera): the manifest gets
+#                         the invisible org.firn.FirnPick activity (same
+#                         classes.dex as --push)
 #   --out <file.apk>      (default: build/android/<name>/<name>.apk)
 #
 # Environment: FIRNC, FIRNLIB (default: this tree), NDK, SDK, API (29),
@@ -60,7 +64,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
-PUSH=0; ARGSFILE=""
+PUSH=0; PICK=0; ARGSFILE=""
 OUT=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -76,6 +80,7 @@ while [ $# -gt 0 ]; do
         --manifest-extra) EXTRA=$2; shift 2 ;;
         --dex) DEX=$2; shift 2 ;;
         --push) PUSH=1; shift ;;
+        --pick) PICK=1; shift ;;
         --args-file) ARGSFILE=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; usage ;;
@@ -136,22 +141,32 @@ case "$ABI" in arm64|both) build_abi arm64-v8a aarch64-android aarch64-linux-gnu
 case "$ABI" in x86_64|both) build_abi x86_64 x86_64-android ld x86_64-linux-android ;; esac
 
 # ---- 3b. the push service: a class written by Firn ------------------------
-if [ $PUSH -eq 1 ]; then
+if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ]; then
     SDX=$BUILD/servicedex
     "$FIRNC" -o "$SDX" "$ROOT/tools/android/servicedex_main.fi"
     "$SDX" "$BUILD/classes.dex" "$LIB"
     DEX=$BUILD/classes.dex
-    PERMS+=(android.permission.INTERNET android.permission.FOREGROUND_SERVICE
-        android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING
-        android.permission.POST_NOTIFICATIONS)
     SVCXML=$BUILD/service.xml
     {
-        echo '        <service android:name="org.firn.FirnService" android:exported="false"'
-        echo '            android:foregroundServiceType="remoteMessaging" />'
+        if [ $PUSH -eq 1 ]; then
+            echo '        <service android:name="org.firn.FirnService" android:exported="false"'
+            echo '            android:foregroundServiceType="remoteMessaging" />'
+        fi
+        if [ $PICK -eq 1 ]; then
+            echo '        <activity android:name="org.firn.FirnPick" android:exported="false"'
+            echo '            android:theme="@android:style/Theme.Translucent.NoTitleBar"'
+            echo '            android:excludeFromRecents="true"'
+            echo '            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|density" />'
+        fi
         [ -n "$EXTRA" ] && cat "$EXTRA"
     } > "$SVCXML"
     EXTRA=$SVCXML
-    echo "  classes.dex: $(stat -c%s "$DEX") octets (org.firn.FirnService, written by Firn)"
+    if [ $PUSH -eq 1 ]; then
+        PERMS+=(android.permission.INTERNET android.permission.FOREGROUND_SERVICE
+            android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING
+            android.permission.POST_NOTIFICATIONS)
+    fi
+    echo "  classes.dex: $(stat -c%s "$DEX") octets (org.firn.FirnService, org.firn.FirnPick, written by Firn)"
 fi
 
 # ---- 4. manifest, package, sign ------------------------------------------

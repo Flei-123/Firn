@@ -1,0 +1,747 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/pick.fi -- A PHOTO FROM THE GALLERY OR THE CAMERA, AND
+// PICTURES INTO PIXELS -- through Android itself, without a codec of our own.
+//
+// ================================================================= WHY
+//
+// A NativeActivity cannot receive the answer of another app: the result of
+// startActivityForResult goes to the Java method onActivityResult of the
+// activity that asked, and NativeActivity has none for us. So the asking
+// is done by a second, invisible activity whose class Firn WRITES into
+// classes.dex (tools/android/servicedex_main.fi):
+//
+//     public class FirnPick extends android.app.Activity {
+//         static { System.loadLibrary("<lib>"); }
+//         protected void onCreate(Bundle b) { super.onCreate(b); pick(); }
+//         public native void pick();
+//         public native void onActivityResult(int req, int res, Intent d);
+//     }
+//
+// Both native methods land HERE, on Android's main thread, in the same
+// process as the program -- so the answer is simply left in this file's
+// statics, and the program's app thread picks it up (pick_poll).
+//
+//   pick_start()     app thread: opens FirnPick (translucent, no title)
+//   FirnPick.pick    main thread: a chooser -- the system's picker for
+//                    images, and the camera (it writes its photo into a
+//                    fresh MediaStore entry that we made; no permission
+//                    needed for that, and none for the picker)
+//   onActivityResult main thread: the chosen picture is decoded by
+//                    BitmapFactory (down-sampled), turned upright by its
+//                    EXIF orientation, scaled to at most SIDE_MAX pixels
+//                    and compressed to a JPEG of at most OUT_MAX octets
+//                    -- what the page does in the browser before it
+//                    sends (webui/firn.js) -- then FirnPick finishes
+//   pick_poll()      app thread: nothing / waiting / a JPEG / no picture
+//   image_decode()   app thread: JPEG/PNG/WebP octets -> RGBA pixels of a
+//                    given size (the thumbnails of a conversation)
+//
+// Everything is #[no_gc]: the main thread and a foreign thread must never
+// meet the collector. Local references are deleted where a thread lives
+// long (the app thread); on the main thread they go with the call.
+import android.ndk
+import android.jnicall
+import android.activity
+
+export {
+    pick_start, pick_poll, pick_take, image_decode,
+    Java_org_firn_FirnPick_pick,
+    Java_org_firn_FirnPick_onActivityResult,
+}
+
+// ---- BEGIN GENERATED STRINGS (tools/android/gen_pick_strings.py) ----
+static TXT: [u8; 2384] = "android/content/Intent\0android/provider/MediaStore$Images$Media\0android/content/ContentValues\0android/graphics/BitmapFactory\0android/graphics/BitmapFactory$Options\0android/graphics/Bitmap\0android/graphics/Bitmap$CompressFormat\0java/io/ByteArrayOutputStream\0android/media/ExifInterface\0android/graphics/Matrix\0<init>\0()V\0(Ljava/lang/String;)V\0(Ljava/io/InputStream;)V\0android.intent.action.GET_CONTENT\0android.media.action.IMAGE_CAPTURE\0image/*\0android.intent.category.OPENABLE\0setType\0addCategory\0(Ljava/lang/String;)Landroid/content/Intent;\0addFlags\0(I)Landroid/content/Intent;\0putExtra\0(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;\0(Ljava/lang/String;[Landroid/os/Parcelable;)Landroid/content/Intent;\0output\0android.intent.extra.INITIAL_INTENTS\0createChooser\0(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;\0Foto senden\0startActivityForResult\0(Landroid/content/Intent;I)V\0startActivity\0(Landroid/content/Intent;)V\0setClassName\0(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;\0getPackageName\0()Ljava/lang/String;\0org.firn.FirnPick\0finish\0getContentResolver\0()Landroid/content/ContentResolver;\0put\0(Ljava/lang/String;Ljava/lang/String;)V\0mime_type\0image/jpeg\0EXTERNAL_CONTENT_URI\0Landroid/net/Uri;\0insert\0(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;\0delete\0(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I\0getData\0()Landroid/net/Uri;\0openInputStream\0(Landroid/net/Uri;)Ljava/io/InputStream;\0close\0decodeStream\0(Ljava/io/InputStream;Landroid/graphics/Rect;Landroid/graphics/BitmapFactory$Options;)Landroid/graphics/Bitmap;\0decodeByteArray\0([BIILandroid/graphics/BitmapFactory$Options;)Landroid/graphics/Bitmap;\0inJustDecodeBounds\0Z\0inSampleSize\0I\0outWidth\0outHeight\0getAttributeInt\0(Ljava/lang/String;I)I\0Orientation\0postRotate\0(F)Z\0createBitmap\0(Landroid/graphics/Bitmap;IIIILandroid/graphics/Matrix;Z)Landroid/graphics/Bitmap;\0(Landroid/graphics/Bitmap;IIII)Landroid/graphics/Bitmap;\0createScaledBitmap\0(Landroid/graphics/Bitmap;IIZ)Landroid/graphics/Bitmap;\0getWidth\0getHeight\0()I\0compress\0(Landroid/graphics/Bitmap$CompressFormat;ILjava/io/OutputStream;)Z\0JPEG\0Landroid/graphics/Bitmap$CompressFormat;\0toByteArray\0()[B\0recycle\0copyPixelsToBuffer\0(Ljava/nio/Buffer;)V\0firn-pick\0picker started\0camera offered\0picture taken\0no picture chosen\0picture could not be read\0picker failed to open\0"
+
+const C_INTENT: usize = 0 // android/content/Intent
+const C_MEDIA: usize = 23 // android/provider/MediaStore$Images$Media
+const C_VALUES: usize = 64 // android/content/ContentValues
+const C_BF: usize = 94 // android/graphics/BitmapFactory
+const C_BFO: usize = 125 // android/graphics/BitmapFactory$Options
+const C_BITMAP: usize = 164 // android/graphics/Bitmap
+const C_FORMAT: usize = 188 // android/graphics/Bitmap$CompressFormat
+const C_BAOS: usize = 227 // java/io/ByteArrayOutputStream
+const C_EXIF: usize = 257 // android/media/ExifInterface
+const C_MATRIX: usize = 285 // android/graphics/Matrix
+const N_INIT: usize = 309 // <init>
+const G_V: usize = 316 // ()V
+const G_S_V: usize = 320 // (Ljava/lang/String;)V
+const G_IN_V: usize = 342 // (Ljava/io/InputStream;)V
+const S_GET_CONTENT: usize = 367 // android.intent.action.GET_CONTENT
+const S_CAPTURE: usize = 401 // android.media.action.IMAGE_CAPTURE
+const S_IMAGES: usize = 436 // image/*
+const S_OPENABLE: usize = 444 // android.intent.category.OPENABLE
+const N_SET_TYPE: usize = 477 // setType
+const N_ADD_CAT: usize = 485 // addCategory
+const G_S_I: usize = 497 // (Ljava/lang/String;)Landroid/content/Intent;
+const N_ADD_FLAGS: usize = 542 // addFlags
+const G_I_I: usize = 551 // (I)Landroid/content/Intent;
+const N_PUT_EXTRA: usize = 579 // putExtra
+const G_PUT_PARC: usize = 588 // (Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;
+const G_PUT_PARCS: usize = 656 // (Ljava/lang/String;[Landroid/os/Parcelable;)Landroid/content/Intent;
+const S_OUTPUT: usize = 725 // output
+const S_INITIAL: usize = 732 // android.intent.extra.INITIAL_INTENTS
+const N_CHOOSER: usize = 769 // createChooser
+const G_CHOOSER: usize = 783 // (Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;
+const S_TITLE: usize = 858 // Foto senden
+const N_START_RESULT: usize = 870 // startActivityForResult
+const G_START_RESULT: usize = 893 // (Landroid/content/Intent;I)V
+const N_START: usize = 922 // startActivity
+const G_START: usize = 936 // (Landroid/content/Intent;)V
+const N_SET_CLASS: usize = 964 // setClassName
+const G_SET_CLASS: usize = 977 // (Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
+const N_PKG: usize = 1040 // getPackageName
+const G_PKG: usize = 1055 // ()Ljava/lang/String;
+const S_PICK_CLASS: usize = 1076 // org.firn.FirnPick
+const N_FINISH: usize = 1094 // finish
+const N_RESOLVER: usize = 1101 // getContentResolver
+const G_RESOLVER: usize = 1120 // ()Landroid/content/ContentResolver;
+const N_PUT: usize = 1156 // put
+const G_PUT_SS: usize = 1160 // (Ljava/lang/String;Ljava/lang/String;)V
+const S_MIME: usize = 1200 // mime_type
+const S_JPEG_MIME: usize = 1210 // image/jpeg
+const N_EXT: usize = 1221 // EXTERNAL_CONTENT_URI
+const G_URI: usize = 1242 // Landroid/net/Uri;
+const N_INSERT: usize = 1260 // insert
+const G_INSERT: usize = 1267 // (Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;
+const N_DELETE: usize = 1335 // delete
+const G_DELETE: usize = 1342 // (Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I
+const N_GET_DATA: usize = 1400 // getData
+const G_GET_DATA: usize = 1408 // ()Landroid/net/Uri;
+const N_OPEN_IN: usize = 1428 // openInputStream
+const G_OPEN_IN: usize = 1444 // (Landroid/net/Uri;)Ljava/io/InputStream;
+const N_CLOSE: usize = 1485 // close
+const N_DECODE_STREAM: usize = 1491 // decodeStream
+const G_DECODE_STREAM: usize = 1504 // (Ljava/io/InputStream;Landroid/graphics/Rect;Landroid/graphics/BitmapFactory$Options;)Landroid/graphics/Bitmap;
+const N_DECODE_BYTES: usize = 1616 // decodeByteArray
+const G_DECODE_BYTES: usize = 1632 // ([BIILandroid/graphics/BitmapFactory$Options;)Landroid/graphics/Bitmap;
+const F_JUST: usize = 1704 // inJustDecodeBounds
+const G_Z: usize = 1723 // Z
+const F_SAMPLE: usize = 1725 // inSampleSize
+const G_I: usize = 1738 // I
+const F_OUTW: usize = 1740 // outWidth
+const F_OUTH: usize = 1749 // outHeight
+const N_ATTR: usize = 1759 // getAttributeInt
+const G_ATTR: usize = 1775 // (Ljava/lang/String;I)I
+const S_ORIENT: usize = 1798 // Orientation
+const N_ROTATE: usize = 1810 // postRotate
+const G_F_Z: usize = 1821 // (F)Z
+const N_CREATE: usize = 1826 // createBitmap
+const G_CREATE: usize = 1839 // (Landroid/graphics/Bitmap;IIIILandroid/graphics/Matrix;Z)Landroid/graphics/Bitmap;
+const G_CREATE5: usize = 1922 // (Landroid/graphics/Bitmap;IIII)Landroid/graphics/Bitmap;
+const N_SCALED: usize = 1979 // createScaledBitmap
+const G_SCALED: usize = 1998 // (Landroid/graphics/Bitmap;IIZ)Landroid/graphics/Bitmap;
+const N_WIDTH: usize = 2054 // getWidth
+const N_HEIGHT: usize = 2063 // getHeight
+const G_VI: usize = 2073 // ()I
+const N_COMPRESS: usize = 2077 // compress
+const G_COMPRESS: usize = 2086 // (Landroid/graphics/Bitmap$CompressFormat;ILjava/io/OutputStream;)Z
+const N_JPEG: usize = 2153 // JPEG
+const G_FORMAT: usize = 2158 // Landroid/graphics/Bitmap$CompressFormat;
+const N_TOBYTES: usize = 2199 // toByteArray
+const G_TOBYTES: usize = 2211 // ()[B
+const N_RECYCLE: usize = 2216 // recycle
+const N_COPYPX: usize = 2224 // copyPixelsToBuffer
+const G_COPYPX: usize = 2243 // (Ljava/nio/Buffer;)V
+const S_TAG: usize = 2264 // firn-pick
+const L_START: usize = 2274 // picker started
+const L_CAM: usize = 2289 // camera offered
+const L_GOT: usize = 2304 // picture taken
+const L_NONE: usize = 2318 // no picture chosen
+const L_FAIL: usize = 2336 // picture could not be read
+const L_OPEN: usize = 2362 // picker failed to open
+// ---- END GENERATED STRINGS ----
+
+const SIDE_MAX: i32 = 1600
+const OUT_MAX: usize = 190000
+const BUF_CAP: usize = 196608
+const REQ_PICK: i32 = 7
+const RESULT_OK: i32 = -1
+const FLAG_GRANT_RW: i32 = 3 // FLAG_GRANT_READ_URI_PERMISSION | WRITE
+
+// the answer, left here by the main thread for the app thread
+const P_IDLE: i32 = 0
+const P_WAIT: i32 = 1
+const P_READY: i32 = 2
+const P_NONE: i32 = 3
+const P_FAIL: i32 = 4
+
+static mut G_STATE: i32 = 0
+static mut G_BUF: [u8; 196608] = [0; 196608]
+static mut G_N: usize = 0
+static mut G_W: i32 = 0
+static mut G_H: i32 = 0
+static mut G_CAM: u64 = 0 // global reference: the MediaStore entry for the camera
+
+#[no_gc]
+fn t(i: usize) -> u64 {
+    return ((&TXT[0]) as u64) + i as u64
+}
+
+#[no_gc]
+fn log(i: usize) {
+    ndk.log_write(ndk.LOG_INFO, t(S_TAG), t(i))
+}
+
+#[no_gc]
+fn cls(env: u64, i: usize) -> u64 {
+    return jnicall.j_class(env, t(i))
+}
+
+#[no_gc]
+fn meth(env: u64, c: u64, n: usize, g: usize) -> u64 {
+    return jnicall.j_method(env, c, t(n), t(g))
+}
+
+#[no_gc]
+fn smeth(env: u64, c: u64, n: usize, g: usize) -> u64 {
+    return jnicall.j_smethod(env, c, t(n), t(g))
+}
+
+#[no_gc]
+fn jstr(env: u64, i: usize) -> u64 {
+    return jnicall.j_str(env, t(i))
+}
+
+// o.name() for a method without arguments that answers an object
+#[no_gc]
+fn call0(env: u64, o: u64, n: usize, g: usize) -> u64 {
+    if o == 0 {
+        return 0
+    }
+    let c: u64 = jnicall.j_obj_class(env, o)
+    let m: u64 = meth(env, c, n, g)
+    var a: [u64; 1] = [0; 1]
+    let r: u64 = jnicall.j_obj(env, o, m, (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    return r
+}
+
+#[no_gc]
+fn call_int0(env: u64, o: u64, n: usize) -> i32 {
+    if o == 0 {
+        return 0
+    }
+    let c: u64 = jnicall.j_obj_class(env, o)
+    let m: u64 = meth(env, c, n, G_VI)
+    var a: [u64; 1] = [0; 1]
+    let r: i32 = jnicall.j_int(env, o, m, (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    return r
+}
+
+#[no_gc]
+fn call_void0(env: u64, o: u64, n: usize) {
+    if o == 0 {
+        return
+    }
+    let c: u64 = jnicall.j_obj_class(env, o)
+    let m: u64 = meth(env, c, n, G_V)
+    var a: [u64; 1] = [0; 1]
+    let r: bool = jnicall.j_void(env, o, m, (&a[0]) as u64)
+    jnicall.j_del(env, c)
+}
+
+#[no_gc]
+fn int_arg(v: i32) -> u64 {
+    return (v as i64 as u64) & 4294967295
+}
+
+// ------------------------------------------------------ the app thread
+
+// Opens the picker. False: no activity, or Android refused.
+#[no_gc]
+fn pick_start() -> bool {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 || G_STATE == P_WAIT {
+        return false
+    }
+    let env: u64 = jnicall.j_env(ndk.peek64(act + 8))
+    let ctx: u64 = ndk.peek64(act + 24)
+    if env == 0 || ctx == 0 {
+        return false
+    }
+    let ci: u64 = cls(env, C_INTENT)
+    let ctor: u64 = meth(env, ci, N_INIT, G_V)
+    var a: [u64; 2] = [0; 2]
+    let it: u64 = jnicall.j_new(env, ci, ctor, (&a[0]) as u64)
+    let pkg: u64 = call0(env, ctx, N_PKG, G_PKG)
+    let cn: u64 = jstr(env, S_PICK_CLASS)
+    a[0] = pkg
+    a[1] = cn
+    let r0: u64 = jnicall.j_obj(env, it, meth(env, ci, N_SET_CLASS, G_SET_CLASS),
+        (&a[0]) as u64)
+    jnicall.j_del(env, r0)
+    let ac: u64 = jnicall.j_obj_class(env, ctx)
+    a[0] = it
+    G_STATE = P_WAIT
+    let ok: bool = it != 0 && pkg != 0 &&
+    jnicall.j_void(env, ctx, meth(env, ac, N_START, G_START), (&a[0]) as u64)
+    jnicall.j_del(env, ac)
+    jnicall.j_del(env, cn)
+    jnicall.j_del(env, pkg)
+    jnicall.j_del(env, it)
+    jnicall.j_del(env, ci)
+    if !ok {
+        G_STATE = P_IDLE
+        log(L_OPEN)
+    }
+    return ok
+}
+
+// What became of the picker: 0 nothing asked, 1 still open, 2 a picture
+// is here (pick_take), 3 the user chose none, 4 it could not be read.
+// 3 and 4 are said once; then it is 0 again.
+#[no_gc]
+fn pick_poll() -> i32 {
+    let s: i32 = G_STATE
+    if s == P_NONE || s == P_FAIL {
+        G_STATE = P_IDLE
+    }
+    return s
+}
+
+// The picture (a JPEG) into out (cap); its size into *n, *w, *h. False
+// when there is none or it does not fit. Afterwards it is 0 again.
+#[no_gc]
+fn pick_take(out: u64, cap: usize, n: *mut usize, w: *mut usize, h: *mut usize) -> bool {
+    if G_STATE != P_READY {
+        return false
+    }
+    G_STATE = P_IDLE
+    if G_N == 0 || G_N > cap {
+        return false
+    }
+    var i: usize = 0
+    while i < G_N {
+        *((out + i as u64) as *mut u8) = G_BUF[i]
+        i = i + 1
+    }
+    *n = G_N
+    *w = G_W as usize
+    *h = G_H as usize
+    return true
+}
+
+// Octets of a JPEG / PNG / WebP (p, n) as RGBA pixels, w x h, into out
+// (w * h * 4 octets; premultiplied as Android keeps them -- a photo is
+// opaque anyway). On the app thread; every local reference is deleted.
+#[no_gc]
+fn image_decode(p: u64, n: usize, w: usize, h: usize, out: u64) -> bool {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 || n == 0 || w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return false
+    }
+    let env: u64 = jnicall.j_env(ndk.peek64(act + 8))
+    if env == 0 {
+        return false
+    }
+    let arr: u64 = jnicall.j_new_bytes(env, n)
+    if arr == 0 {
+        return false
+    }
+    var ok: bool = jnicall.j_bytes_set(env, arr, 0, n, p)
+    let cf: u64 = cls(env, C_BF)
+    let co: u64 = cls(env, C_BFO)
+    var a: [u64; 6] = [0; 6]
+    let opts: u64 = jnicall.j_new(env, co, meth(env, co, N_INIT, G_V), (&a[0]) as u64)
+    let fj: u64 = jnicall.j_field(env, co, t(F_JUST), t(G_Z))
+    let fs: u64 = jnicall.j_field(env, co, t(F_SAMPLE), t(G_I))
+    let fw: u64 = jnicall.j_field(env, co, t(F_OUTW), t(G_I))
+    let fh: u64 = jnicall.j_field(env, co, t(F_OUTH), t(G_I))
+    let dm: u64 = smeth(env, cf, N_DECODE_BYTES, G_DECODE_BYTES)
+    // 1. only the size
+    jnicall.j_set_bool_field(env, opts, fj, true)
+    a[0] = arr
+    a[1] = 0
+    a[2] = n as u64
+    a[3] = opts
+    let none: u64 = jnicall.j_sobj(env, cf, dm, (&a[0]) as u64)
+    jnicall.j_del(env, none)
+    let ow: i32 = jnicall.j_get_int_field(env, opts, fw)
+    let oh: i32 = jnicall.j_get_int_field(env, opts, fh)
+    var sample: i32 = 1
+    while ow > 0 && (ow / (sample * 2)) as usize >= w && (oh / (sample * 2)) as usize >= h {
+        sample = sample * 2
+    }
+    // 2. the pixels, a power of two smaller where that still is big enough
+    jnicall.j_set_bool_field(env, opts, fj, false)
+    jnicall.j_set_int_field(env, opts, fs, sample)
+    var bmp: u64 = jnicall.j_sobj(env, cf, dm, (&a[0]) as u64)
+    var done: bool = false
+    if ok && bmp != 0 {
+        let cb: u64 = cls(env, C_BITMAP)
+        // cut to the wanted shape first (the middle, like CSS "cover"):
+        // the square thumbnail of a wide photo is not squeezed
+        let bw: i64 = call_int0(env, bmp, N_WIDTH) as i64
+        let bh: i64 = call_int0(env, bmp, N_HEIGHT) as i64
+        var cw: i64 = bw
+        var ch: i64 = bh
+        if bw * (h as i64) > bh * (w as i64) {
+            cw = (bh * (w as i64)) / (h as i64)
+        } else {
+            ch = (bw * (h as i64)) / (w as i64)
+        }
+        if cw >= 1 && ch >= 1 && (cw < bw || ch < bh) {
+            a[0] = bmp
+            a[1] = int_arg(((bw - cw) / 2) as i32)
+            a[2] = int_arg(((bh - ch) / 2) as i32)
+            a[3] = int_arg(cw as i32)
+            a[4] = int_arg(ch as i32)
+            let cut: u64 = jnicall.j_sobj(env, cb, smeth(env, cb, N_CREATE, G_CREATE5),
+                (&a[0]) as u64)
+            if cut != 0 && cut != bmp {
+                call_void0(env, bmp, N_RECYCLE)
+                jnicall.j_del(env, bmp)
+                bmp = cut
+            }
+        }
+        a[0] = bmp
+        a[1] = int_arg(w as i32)
+        a[2] = int_arg(h as i32)
+        a[3] = 1
+        let sc: u64 = jnicall.j_sobj(env, cb, smeth(env, cb, N_SCALED, G_SCALED),
+            (&a[0]) as u64)
+        if sc != 0 {
+            let buf: u64 = jnicall.j_direct_buffer(env, out, w * h * 4)
+            if buf != 0 {
+                a[0] = buf
+                done = jnicall.j_void(env, sc, meth(env, cb, N_COPYPX, G_COPYPX),
+                    (&a[0]) as u64)
+                jnicall.j_del(env, buf)
+            }
+            if sc != bmp {
+                call_void0(env, sc, N_RECYCLE)
+            }
+            jnicall.j_del(env, sc)
+        }
+        call_void0(env, bmp, N_RECYCLE)
+        jnicall.j_del(env, bmp)
+        jnicall.j_del(env, cb)
+    }
+    jnicall.j_del(env, opts)
+    jnicall.j_del(env, co)
+    jnicall.j_del(env, cf)
+    jnicall.j_del(env, arr)
+    return done
+}
+
+// ------------------------------------------------------ the main thread
+
+// FirnPick.pick(): the chooser -- the system's picker, the camera beside it.
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnPick_pick(env: u64, pa: u64) {
+    log(L_START)
+    let ci: u64 = cls(env, C_INTENT)
+    var a: [u64; 4] = [0; 4]
+    // the picker: GET_CONTENT image/*, openable
+    a[0] = jstr(env, S_GET_CONTENT)
+    let get: u64 = jnicall.j_new(env, ci, meth(env, ci, N_INIT, G_S_V), (&a[0]) as u64)
+    a[0] = jstr(env, S_IMAGES)
+    let r1: u64 = jnicall.j_obj(env, get, meth(env, ci, N_SET_TYPE, G_S_I), (&a[0]) as u64)
+    a[0] = jstr(env, S_OPENABLE)
+    let r2: u64 = jnicall.j_obj(env, get, meth(env, ci, N_ADD_CAT, G_S_I), (&a[0]) as u64)
+    a[0] = get
+    a[1] = jstr(env, S_TITLE)
+    let chooser: u64 = jnicall.j_sobj(env, ci, smeth(env, ci, N_CHOOSER, G_CHOOSER),
+        (&a[0]) as u64)
+    // the camera: its photo goes into a MediaStore entry made here
+    if G_CAM != 0 {
+        jnicall.j_del_global(env, G_CAM)
+        G_CAM = 0
+    }
+    let res: u64 = call0(env, pa, N_RESOLVER, G_RESOLVER)
+    let cv: u64 = cls(env, C_VALUES)
+    a[0] = 0
+    let vals: u64 = jnicall.j_new(env, cv, meth(env, cv, N_INIT, G_V), (&a[0]) as u64)
+    a[0] = jstr(env, S_MIME)
+    a[1] = jstr(env, S_JPEG_MIME)
+    let r3: bool = jnicall.j_void(env, vals, meth(env, cv, N_PUT, G_PUT_SS), (&a[0]) as u64)
+    let cm: u64 = cls(env, C_MEDIA)
+    let ext: u64 = jnicall.j_sfield_obj(env, cm, t(N_EXT), t(G_URI))
+    var uri: u64 = 0
+    if res != 0 && ext != 0 && vals != 0 {
+        let rc: u64 = jnicall.j_obj_class(env, res)
+        a[0] = ext
+        a[1] = vals
+        uri = jnicall.j_obj(env, res, meth(env, rc, N_INSERT, G_INSERT), (&a[0]) as u64)
+    }
+    if uri != 0 && chooser != 0 {
+        a[0] = jstr(env, S_CAPTURE)
+        let cam: u64 = jnicall.j_new(env, ci, meth(env, ci, N_INIT, G_S_V), (&a[0]) as u64)
+        a[0] = jstr(env, S_OUTPUT)
+        a[1] = uri
+        let r4: u64 = jnicall.j_obj(env, cam, meth(env, ci, N_PUT_EXTRA, G_PUT_PARC),
+            (&a[0]) as u64)
+        a[0] = int_arg(FLAG_GRANT_RW)
+        let r5: u64 = jnicall.j_obj(env, cam, meth(env, ci, N_ADD_FLAGS, G_I_I), (&a[0]) as u64)
+        let arr: u64 = jnicall.j_array1(env, ci, cam)
+        if cam != 0 && arr != 0 {
+            a[0] = jstr(env, S_INITIAL)
+            a[1] = arr
+            let r6: u64 = jnicall.j_obj(env, chooser, meth(env, ci, N_PUT_EXTRA, G_PUT_PARCS),
+                (&a[0]) as u64)
+            G_CAM = jnicall.j_global(env, uri)
+            log(L_CAM)
+        }
+    }
+    var ok: bool = false
+    if chooser != 0 {
+        let sc: u64 = jnicall.j_obj_class(env, pa)
+        a[0] = chooser
+        a[1] = int_arg(REQ_PICK)
+        ok = jnicall.j_void(env, pa, meth(env, sc, N_START_RESULT, G_START_RESULT),
+            (&a[0]) as u64)
+    }
+    if !ok {
+        log(L_OPEN)
+        forget_camera(env, pa, true)
+        G_STATE = P_FAIL
+        call_void0(env, pa, N_FINISH)
+    }
+}
+
+// The MediaStore entry for the camera goes again -- unless the camera
+// filled it (then it is the user's photo and stays in the gallery).
+#[no_gc]
+fn forget_camera(env: u64, pa: u64, remove: bool) {
+    if G_CAM == 0 {
+        return
+    }
+    if remove {
+        let res: u64 = call0(env, pa, N_RESOLVER, G_RESOLVER)
+        if res != 0 {
+            let rc: u64 = jnicall.j_obj_class(env, res)
+            var a: [u64; 3] = [0; 3]
+            a[0] = G_CAM
+            let n: i32 = jnicall.j_int(env, res, meth(env, rc, N_DELETE, G_DELETE),
+                (&a[0]) as u64)
+        }
+    }
+    jnicall.j_del_global(env, G_CAM)
+    G_CAM = 0
+}
+
+// FirnPick.onActivityResult(req, res, data): what the user chose.
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnPick_onActivityResult(env: u64, pa: u64, req: i32,
+    res: i32, data: u64) {
+    var uri: u64 = 0
+    var from_cam: bool = false
+    if res == RESULT_OK {
+        if data != 0 {
+            uri = call0(env, data, N_GET_DATA, G_GET_DATA)
+        }
+        if uri == 0 && G_CAM != 0 {
+            uri = G_CAM
+            from_cam = true
+        }
+    }
+    var st: i32 = P_NONE
+    if uri != 0 {
+        if read_picture(env, pa, uri) {
+            st = P_READY
+            log(L_GOT)
+        } else {
+            st = P_FAIL
+            log(L_FAIL)
+        }
+    } else {
+        log(L_NONE)
+    }
+    forget_camera(env, pa, !from_cam || st != P_READY)
+    G_STATE = st
+    call_void0(env, pa, N_FINISH)
+}
+
+// An input stream of the picture behind uri; 0 when it cannot be opened.
+#[no_gc]
+fn open_in(env: u64, res: u64, uri: u64) -> u64 {
+    let rc: u64 = jnicall.j_obj_class(env, res)
+    var a: [u64; 1] = [0; 1]
+    a[0] = uri
+    return jnicall.j_obj(env, res, meth(env, rc, N_OPEN_IN, G_OPEN_IN), (&a[0]) as u64)
+}
+
+// The picture behind uri, upright, at most SIDE_MAX, as a JPEG of at most
+// OUT_MAX octets in G_BUF (G_N, G_W, G_H).
+#[no_gc]
+fn read_picture(env: u64, pa: u64, uri: u64) -> bool {
+    let res: u64 = call0(env, pa, N_RESOLVER, G_RESOLVER)
+    if res == 0 {
+        return false
+    }
+    let cf: u64 = cls(env, C_BF)
+    let co: u64 = cls(env, C_BFO)
+    let cb: u64 = cls(env, C_BITMAP)
+    var a: [u64; 7] = [0; 7]
+    let opts: u64 = jnicall.j_new(env, co, meth(env, co, N_INIT, G_V), (&a[0]) as u64)
+    let fj: u64 = jnicall.j_field(env, co, t(F_JUST), t(G_Z))
+    let fs: u64 = jnicall.j_field(env, co, t(F_SAMPLE), t(G_I))
+    let fw: u64 = jnicall.j_field(env, co, t(F_OUTW), t(G_I))
+    let fh: u64 = jnicall.j_field(env, co, t(F_OUTH), t(G_I))
+    let dm: u64 = smeth(env, cf, N_DECODE_STREAM, G_DECODE_STREAM)
+    if opts == 0 || dm == 0 {
+        return false
+    }
+    // 1. the size
+    let in1: u64 = open_in(env, res, uri)
+    if in1 == 0 {
+        return false
+    }
+    jnicall.j_set_bool_field(env, opts, fj, true)
+    a[0] = in1
+    a[1] = 0
+    a[2] = opts
+    let none: u64 = jnicall.j_sobj(env, cf, dm, (&a[0]) as u64)
+    call_void0(env, in1, N_CLOSE)
+    let ow: i32 = jnicall.j_get_int_field(env, opts, fw)
+    let oh: i32 = jnicall.j_get_int_field(env, opts, fh)
+    if ow <= 0 || oh <= 0 {
+        return false
+    }
+    var sample: i32 = 1
+    while (ow / (sample * 2) >= SIDE_MAX) || (oh / (sample * 2) >= SIDE_MAX) {
+        sample = sample * 2
+    }
+    // 2. the pixels
+    let in2: u64 = open_in(env, res, uri)
+    if in2 == 0 {
+        return false
+    }
+    jnicall.j_set_bool_field(env, opts, fj, false)
+    jnicall.j_set_int_field(env, opts, fs, sample)
+    a[0] = in2
+    a[1] = 0
+    a[2] = opts
+    var bmp: u64 = jnicall.j_sobj(env, cf, dm, (&a[0]) as u64)
+    call_void0(env, in2, N_CLOSE)
+    if bmp == 0 {
+        return false
+    }
+    // 3. which way up (a camera writes it into the EXIF data)
+    var deg: u64 = 0
+    let in3: u64 = open_in(env, res, uri)
+    if in3 != 0 {
+        let ce: u64 = cls(env, C_EXIF)
+        a[0] = in3
+        let ex: u64 = jnicall.j_new(env, ce, meth(env, ce, N_INIT, G_IN_V), (&a[0]) as u64)
+        if ex != 0 {
+            a[0] = jstr(env, S_ORIENT)
+            a[1] = 1
+            let o: i32 = jnicall.j_int(env, ex, meth(env, ce, N_ATTR, G_ATTR), (&a[0]) as u64)
+            // IEEE 754 single: 90.0, 180.0, 270.0 (a jvalue float lies in the
+            // low four octets)
+            if o == 6 {
+                deg = 1119092736
+            }
+            if o == 3 {
+                deg = 1127481344
+            }
+            if o == 8 {
+                deg = 1132920832
+            }
+        }
+        call_void0(env, in3, N_CLOSE)
+    }
+    // 4. at most SIDE_MAX on the long side
+    var bw: i32 = call_int0(env, bmp, N_WIDTH)
+    var bh: i32 = call_int0(env, bmp, N_HEIGHT)
+    let sm: u64 = smeth(env, cb, N_SCALED, G_SCALED)
+    if bw > SIDE_MAX || bh > SIDE_MAX {
+        var nw: i32 = SIDE_MAX
+        var nh: i32 = SIDE_MAX
+        if bw >= bh {
+            nh = ((bh as i64 * SIDE_MAX as i64) / bw as i64) as i32
+        } else {
+            nw = ((bw as i64 * SIDE_MAX as i64) / bh as i64) as i32
+        }
+        if nw < 1 {
+            nw = 1
+        }
+        if nh < 1 {
+            nh = 1
+        }
+        a[0] = bmp
+        a[1] = int_arg(nw)
+        a[2] = int_arg(nh)
+        a[3] = 1
+        let sc: u64 = jnicall.j_sobj(env, cb, sm, (&a[0]) as u64)
+        if sc != 0 && sc != bmp {
+            call_void0(env, bmp, N_RECYCLE)
+            bmp = sc
+            bw = nw
+            bh = nh
+        }
+    }
+    if deg != 0 {
+        let cx: u64 = cls(env, C_MATRIX)
+        a[0] = 0
+        let mx: u64 = jnicall.j_new(env, cx, meth(env, cx, N_INIT, G_V), (&a[0]) as u64)
+        a[0] = deg
+        let rz: bool = jnicall.j_bool(env, mx, meth(env, cx, N_ROTATE, G_F_Z), (&a[0]) as u64)
+        a[0] = bmp
+        a[1] = 0
+        a[2] = 0
+        a[3] = int_arg(bw)
+        a[4] = int_arg(bh)
+        a[5] = mx
+        a[6] = 1
+        let rb: u64 = jnicall.j_sobj(env, cb, smeth(env, cb, N_CREATE, G_CREATE),
+            (&a[0]) as u64)
+        if rb != 0 && rb != bmp {
+            call_void0(env, bmp, N_RECYCLE)
+            bmp = rb
+        }
+    }
+    // 5. a JPEG small enough: the quality goes down, then the size
+    let cfm: u64 = cls(env, C_FORMAT)
+    let jpeg: u64 = jnicall.j_sfield_obj(env, cfm, t(N_JPEG), t(G_FORMAT))
+    let cz: u64 = cls(env, C_BAOS)
+    let cm: u64 = meth(env, cb, N_COMPRESS, G_COMPRESS)
+    var q: i32 = 85
+    var tries: usize = 0
+    var got: bool = false
+    while tries < 8 && !got && jpeg != 0 {
+        a[0] = 0
+        let bos: u64 = jnicall.j_new(env, cz, meth(env, cz, N_INIT, G_V), (&a[0]) as u64)
+        a[0] = jpeg
+        a[1] = int_arg(q)
+        a[2] = bos
+        let cok: bool = jnicall.j_bool(env, bmp, cm, (&a[0]) as u64)
+        let arr: u64 = call0(env, bos, N_TOBYTES, G_TOBYTES)
+        let n: usize = jnicall.j_array_len(env, arr)
+        if cok && n > 0 && n <= OUT_MAX {
+            if jnicall.j_bytes_get(env, arr, 0, n, (&G_BUF[0]) as u64) {
+                G_N = n
+                G_W = call_int0(env, bmp, N_WIDTH)
+                G_H = call_int0(env, bmp, N_HEIGHT)
+                got = G_W > 0 && G_H > 0
+            }
+        } else if q > 55 {
+            q = q - 10
+        } else {
+            // three quarters of the size, and the quality back up a little
+            let w0: i32 = call_int0(env, bmp, N_WIDTH)
+            let h0: i32 = call_int0(env, bmp, N_HEIGHT)
+            a[0] = bmp
+            a[1] = int_arg((w0 * 3) / 4 + 1)
+            a[2] = int_arg((h0 * 3) / 4 + 1)
+            a[3] = 1
+            let sc2: u64 = jnicall.j_sobj(env, cb, sm, (&a[0]) as u64)
+            if sc2 == 0 {
+                tries = 8
+            } else {
+                call_void0(env, bmp, N_RECYCLE)
+                bmp = sc2
+                q = 70
+            }
+        }
+        jnicall.j_del(env, arr)
+        jnicall.j_del(env, bos)
+        tries = tries + 1
+    }
+    call_void0(env, bmp, N_RECYCLE)
+    return got
+}
