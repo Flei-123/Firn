@@ -1,0 +1,177 @@
+// expect_exit: 42
+// tests/1910_std_fs.fi -- std.fs (OpenPlan LIB-001): directories, atomic
+// save, rename, stat, removal, and that every failure names its cause.
+//
+// Works in a directory of its own under /tmp (the process id in the name),
+// so parallel runs of the suite do not meet, and removes it at the end.
+import std.fs
+import std.rt
+import std.dir
+import std.str
+
+fn scratch() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_fs_1910_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn same(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.length())
+}
+
+// an error as a number that no successful count reaches here
+fn code(e: FsError) -> usize {
+    if e == FsError::IsDir { return 1021 }
+    if e == FsError::NotFound { return 1002 }
+    return 1999
+}
+
+fn main() -> i32 {
+    let root: str = scratch()
+    // a leftover of an aborted earlier run with the same pid
+    fs.remove_tree(root) catch false
+
+    // --- A. paths
+    if fs.path_join("a", "b") != "a/b" { return 1 as i32 }
+    if fs.path_join("a/", "b") != "a/b" { return 2 as i32 }
+    if fs.path_join("a", "/b") != "/b" { return 3 as i32 }
+    if fs.path_parent("/x/y/z.json") != "/x/y" { return 4 as i32 }
+    if fs.path_parent("/x") != "/" { return 5 as i32 }
+    if fs.path_parent("x") != "" { return 6 as i32 }
+    if fs.path_name("/x/y/z.json") != "z.json" { return 7 as i32 }
+    if fs.path_name("/x/y/") != "y" { return 8 as i32 }
+    if fs.temp_dir() != "/tmp" { return 9 as i32 }
+
+    // --- B. mkdir_all creates every level; a second time creates nothing
+    let deep: str = root + "/pages/0001/objects"
+    let made: bool = fs.mkdir_all(deep) catch false
+    if !made { return 10 as i32 }
+    if !fs.is_dir(deep) { return 11 as i32 }
+    let again: bool = fs.mkdir_all(deep) catch true
+    if again { return 12 as i32 }
+    // mkdir of an existing directory says Exists
+    let ex: bool = fs.mkdir(deep) catch |e| (e != FsError::Exists)
+    if ex { return 13 as i32 }
+    // mkdir below a missing parent says NotFound
+    let nf: bool = fs.mkdir(root + "/missing/child") catch |e| (e != FsError::NotFound)
+    if nf { return 14 as i32 }
+
+    // --- C. write, read back, stat
+    let file: str = root + "/project.json"
+    let text: str = "{\"name\": \"Wendeschuetz\"}\n"
+    let w: usize = fs.write_file(file, text.p as u64, text.length()) catch 0
+    if w != text.length() { return 20 as i32 }
+    var back: rt.Buf = rt.buf_new()
+    let r: usize = fs.read_file(file, &back) catch 0
+    if r != text.length() || !same(&back, text) { return 21 as i32 }
+    let info: fs.FileInfo = fs.stat(file) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    if info.kind != fs.KIND_FILE { return 22 as i32 }
+    if info.size != text.length() as u64 { return 23 as i32 }
+    // the modification time is now-ish: after 2026-01-01 and not in 2100
+    if info.mtime_ns < 1767225600000000000 || info.mtime_ns > 4102444800000000000 { return 24 as i32 }
+    if info.mode != 420 as u32 && info.mode != 416 as u32 && info.mode != 400 as u32 {
+        // 0644 minus whatever the umask takes
+        if (info.mode & 256 as u32) == 0 as u32 { return 25 as i32 }
+    }
+    let dinfo: fs.FileInfo = fs.stat(root) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    if dinfo.kind != fs.KIND_DIR { return 26 as i32 }
+    if !fs.exists(file) || fs.exists(root + "/nope") { return 27 as i32 }
+    if !fs.is_file(file) || fs.is_file(root) { return 28 as i32 }
+    // stat of something missing says NotFound, and errno 2 is kept
+    let sx: fs.FileInfo = fs.stat(root + "/nope") catch fs.FileInfo { kind: 99 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    if sx.kind != 99 as u8 || fs.last_errno() != 2 { return 29 as i32 }
+    // reading a directory as a file
+    var junk: rt.Buf = rt.buf_new()
+    let rd: usize = fs.read_file(root, &junk) catch |e| (code(e))
+    // (a count of 0 would be a successful read -- that is not what happens)
+    if rd != 1021 { return 30 as i32 }
+
+    // --- D. append
+    let more: str = "tail\n"
+    fs.append_file(file, more.p as u64, more.length()) catch 0
+    rt.buf_clear(&back)
+    fs.read_file(file, &back) catch 0
+    if !same(&back, text + more) { return 31 as i32 }
+
+    // --- E. atomic save replaces the content and leaves no temp file
+    let v2: str = "{\"name\": \"Stern-Dreieck\"}\n"
+    let saved: bool = fs.write_atomic(file, v2.p as u64, v2.length()) catch false
+    if !saved { return 40 as i32 }
+    rt.buf_clear(&back)
+    fs.read_file(file, &back) catch 0
+    if !same(&back, v2) { return 41 as i32 }
+    var d: dir.Dir = dir.open(root)
+    var entries: u32 = 0
+    while dir.next(&d) {
+        entries = entries + 1
+        if d.name.length() >= 17 && d.name.part(0, 17) == "project.json.tmp-" { return 42 as i32 }
+    }
+    dir.close(&d)
+    if entries != 2 { return 43 as i32 } // project.json and pages
+    // saving into a directory that does not exist fails and says why
+    let bad: bool = fs.write_atomic(root + "/no/such.json", v2.p as u64, v2.length()) catch |e| (e == FsError::NotFound)
+    if !bad { return 44 as i32 }
+    // a relative path works as well (the directory to flush is ".")
+    // -- not exercised: the suite's working directory is not ours to write
+
+    // --- F. fsync on a file and on a directory
+    let f1: bool = fs.fsync_file(file) catch false
+    let f2: bool = fs.fsync_dir(root) catch false
+    if !f1 || !f2 { return 50 as i32 }
+    let f3: bool = fs.fsync_file(root + "/nope") catch |e| (e != FsError::NotFound)
+    if f3 { return 51 as i32 }
+
+    // --- G. rename replaces an existing target in one step
+    let other: str = root + "/other.json"
+    fs.write_file(other, more.p as u64, more.length()) catch 0
+    let moved: bool = fs.rename(other, file) catch false
+    if !moved || fs.exists(other) { return 60 as i32 }
+    rt.buf_clear(&back)
+    fs.read_file(file, &back) catch 0
+    if !same(&back, more) { return 61 as i32 }
+    let rn: bool = fs.rename(other, file) catch |e| (e == FsError::NotFound)
+    if !rn { return 62 as i32 }
+
+    // --- H. remove: a file, an empty directory; a full one refuses
+    let full: bool = fs.remove(root + "/pages") catch |e| (e == FsError::NotEmpty)
+    if !full { return 70 as i32 }
+    let empty: bool = fs.remove(deep) catch false
+    if !empty || fs.exists(deep) { return 71 as i32 }
+    let rmf: bool = fs.remove(file) catch false
+    if !rmf || fs.exists(file) { return 72 as i32 }
+    let gone: bool = fs.remove(file) catch |e| (e == FsError::NotFound)
+    if !gone { return 73 as i32 }
+    // a path with a zero octet inside is refused, not cut
+    let z: bool = fs.remove(root + "/a\0b") catch |e| (e == FsError::Invalid)
+    if !z { return 74 as i32 }
+    let em: bool = fs.mkdir("") catch |e| (e == FsError::Invalid)
+    if !em { return 75 as i32 }
+
+    // --- I. remove_tree takes a whole tree, and a symlink in it is removed
+    // without following it (the target outside survives)
+    fs.mkdir_all(root + "/t/a/b/c") catch false
+    fs.write_file(root + "/t/a/x.txt", more.p as u64, more.length()) catch 0
+    fs.write_file(root + "/t/a/b/c/y.txt", more.p as u64, more.length()) catch 0
+    let outside: str = root + "/keep.txt"
+    fs.write_file(outside, more.p as u64, more.length()) catch 0
+    let sl: bool = fs.symlink(outside, root + "/t/a/link") catch false
+    if !sl { return 80 as i32 }
+    let dup: bool = fs.symlink(outside, root + "/t/a/link") catch |e| (e == FsError::Exists)
+    if !dup { return 85 as i32 }
+    let li: fs.FileInfo = fs.lstat(root + "/t/a/link") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    if li.kind != fs.KIND_LINK { return 81 as i32 }
+    let tree: bool = fs.remove_tree(root + "/t") catch false
+    if !tree || fs.exists(root + "/t") { return 82 as i32 }
+    if !fs.is_file(outside) { return 83 as i32 }
+    let tr: bool = fs.remove_tree(root) catch false
+    if !tr || fs.exists(root) { return 84 as i32 }
+    rt.buf_free(&back)
+    return 42
+}

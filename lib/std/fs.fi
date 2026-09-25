@@ -1,0 +1,592 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/fs.fi -- std.fs: create, rename, remove, inspect and flush files.
+//
+// OpenPlan LIB-001. Until this file std could read and write WHOLE files
+// (std.io, rt) and list a directory (std.dir), but not make a directory,
+// rename, delete, ask for size and time, or make a write durable. A program
+// that keeps a project as a directory tree and must survive a power cut
+// needs all of that, and it needs to know WHY a call failed: every call
+// here answers with an `FsError`, never with a silent `false`.
+//
+//     import std.fs
+//     fs.mkdir_all("/tmp/project/pages") catch |e| ...
+//     fs.write_atomic("/tmp/project/project.json", p, n) catch |e| ...
+//     let info: fs.FileInfo = fs.stat("/tmp/project/project.json") catch |e| ...
+//
+// SAVING SAFELY -- `write_atomic`. The new content goes into a temporary
+// file NEXT TO the target (same directory = same volume, so `rename` cannot
+// turn into a copy), is flushed with `fsync`, renamed over the target and
+// then the DIRECTORY is flushed, which is what makes the rename itself
+// durable. A crash at any point leaves either the old file or the new one,
+// never a half written one. The temporary name carries the process id and a
+// counter, so two processes saving the same file do not share one.
+//
+// PATHS are `str` without a terminating zero; every call copies the path
+// into a small buffer of its own and appends the zero the kernel wants. A
+// path containing a zero octet is refused (`FsError::Invalid`) -- the kernel
+// would silently cut it there.
+//
+// THE MACHINES. The syscall numbers are the x86-64 ones, like everywhere in
+// std; the compiler translates them for AArch64 (compiler/src/syscalls.rs).
+// `rmdir` has no generic form, so directories are removed with
+// `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)` on both machines, and file
+// information comes from `statx`, whose record has one layout everywhere
+// (`struct stat` has a different one on AArch64). In the browser
+// (wasm32-browser) a page has no files; a program that reaches one of these
+// calls there is refused at compile time with that reason.
+//
+// errno values are the same on x86-64 and AArch64 (asm-generic/errno*.h).
+
+import rt
+import dir
+import vec
+import str
+
+export {
+    FsError, FileInfo,
+    mkdir, mkdir_all, rename, remove, remove_tree, symlink,
+    stat, lstat, exists, is_dir, is_file,
+    fsync_file, fsync_dir,
+    read_file, write_file, append_file, write_atomic,
+    temp_dir, path_join, path_parent, path_name, last_errno,
+    KIND_OTHER, KIND_FILE, KIND_DIR, KIND_LINK,
+}
+
+error FsError {
+    NotFound, // ENOENT: the path (or a directory on the way) does not exist
+    Exists, // EEXIST: there is already something with that name
+    Permission, // EACCES, EPERM
+    NotDir, // ENOTDIR: a part of the path is not a directory
+    IsDir, // EISDIR: a directory where a file was expected
+    NotEmpty, // ENOTEMPTY: rmdir on a directory with entries
+    NoSpace, // ENOSPC, EDQUOT
+    CrossDevice, // EXDEV: rename between two volumes
+    ReadOnly, // EROFS
+    NameTooLong, // ENAMETOOLONG
+    Invalid, // EINVAL, or a path with a zero octet / an empty path
+    Busy, // EBUSY, ETXTBSY
+    Io, // EIO and everything else
+}
+
+const KIND_OTHER: u8 = 0
+const KIND_FILE: u8 = 1
+const KIND_DIR: u8 = 2
+const KIND_LINK: u8 = 3
+
+struct FileInfo {
+    kind: u8, // KIND_FILE, KIND_DIR, KIND_LINK (lstat only), KIND_OTHER
+    mode: u32, // permission bits (0o7777)
+    size: u64,
+    mtime_ns: i64, // modification time, nanoseconds since 1970-01-01 UTC
+}
+
+const FS_SYS_READ: i64 = 0
+const FS_SYS_WRITE: i64 = 1
+const FS_SYS_OPEN: i64 = 2
+const FS_SYS_CLOSE: i64 = 3
+const FS_SYS_GETPID: i64 = 39
+const FS_SYS_FSYNC: i64 = 74
+const FS_SYS_RENAME: i64 = 82
+const FS_SYS_MKDIR: i64 = 83
+const FS_SYS_UNLINK: i64 = 87
+const FS_SYS_UNLINKAT: i64 = 263
+const FS_SYS_SYMLINKAT: i64 = 266
+const FS_SYS_STATX: i64 = 332
+
+const FS_AT_FDCWD: i64 = -100
+const FS_AT_REMOVEDIR: i64 = 512 // 0x200
+const FS_AT_SYMLINK_NOFOLLOW: i64 = 256 // 0x100
+const FS_STATX_BASIC: i64 = 2047 // 0x7ff
+
+// O_RDONLY | O_CLOEXEC (0x80000); O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC;
+// O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC; O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC.
+// These bits are the same on x86-64 and AArch64 (O_DIRECTORY is not, and is
+// not used).
+const FS_O_READ: i64 = 524288
+const FS_O_TRUNC: i64 = 524865 // 0x80000 | 0x241
+const FS_O_APPEND: i64 = 525377 // 0x80000 | 0x441
+const FS_O_EXCL: i64 = 524481 // 0x80000 | 0xC1
+const FS_MODE_FILE: i64 = 420 // 0644
+const FS_MODE_DIR: i64 = 493 // 0755
+
+static mut fs_errno: i64 = 0
+static mut fs_counter: u64 = 0
+
+// The errno of the last failed call of this module (0 = none yet) -- for a
+// message that wants the number, not only the class.
+fn last_errno() -> i64 {
+    return fs_errno
+}
+
+fn fs_error(r: i64) -> FsError {
+    let e: i64 = 0 - r
+    fs_errno = e
+    if e == 2 { return FsError::NotFound }
+    if e == 17 { return FsError::Exists }
+    if e == 13 || e == 1 { return FsError::Permission }
+    if e == 20 { return FsError::NotDir }
+    if e == 21 { return FsError::IsDir }
+    if e == 39 { return FsError::NotEmpty }
+    if e == 28 || e == 122 { return FsError::NoSpace }
+    if e == 18 { return FsError::CrossDevice }
+    if e == 30 { return FsError::ReadOnly }
+    if e == 36 { return FsError::NameTooLong }
+    if e == 22 { return FsError::Invalid }
+    if e == 16 || e == 26 { return FsError::Busy }
+    return FsError::Io
+}
+
+// `path` with a terminating zero, in `c`. false = empty path or a zero
+// octet inside it.
+fn cpath(path: str, c: *mut rt.Buf) -> bool {
+    let n: usize = path.length()
+    if n == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if path.chars(i) == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    rt.buf_push_bytes(c, path.p as u64, n)
+    rt.buf_push(c, 0 as u8)
+    return true
+}
+
+// ------------------------------------------------------------ Directories
+
+// Creates ONE directory. Its parent must exist; an existing entry of that
+// name is `FsError::Exists`.
+fn mkdir(path: str) -> FsError!bool {
+    var c: rt.Buf = rt.buf_new()
+    if !cpath(path, &c) {
+        rt.buf_free(&c)
+        return FsError::Invalid
+    }
+    let r: i64 = syscall(FS_SYS_MKDIR, rt.buf_ptr(&c) as i64, FS_MODE_DIR, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+// Creates the directory and every missing parent. An existing DIRECTORY is
+// fine (the answer is then `false`: nothing was created); an existing FILE
+// on the way is `FsError::NotDir`/`Exists`.
+fn mkdir_all(path: str) -> FsError!bool {
+    var n: usize = path.length()
+    // "a/b/" is "a/b"
+    while n > 1 && path.chars(n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    if n == 0 {
+        return FsError::Invalid
+    }
+    let p: str = path.part(0, n)
+    var c: rt.Buf = rt.buf_new()
+    if !cpath(p, &c) {
+        rt.buf_free(&c)
+        return FsError::Invalid
+    }
+    let r: i64 = syscall(FS_SYS_MKDIR, rt.buf_ptr(&c) as i64, FS_MODE_DIR, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if r >= 0 {
+        return true
+    }
+    if r == -17 {
+        // EEXIST: fine if it is a directory
+        if is_dir(p) {
+            return false
+        }
+        return FsError::Exists
+    }
+    if r != -2 {
+        return fs_error(r)
+    }
+    // ENOENT: the parent is missing -- make it, then try again
+    let parent: str = path_parent(p)
+    if parent.length() == 0 || parent == p {
+        return fs_error(r)
+    }
+    try mkdir_all(parent)
+    var c2: rt.Buf = rt.buf_new()
+    cpath(p, &c2)
+    let r2: i64 = syscall(FS_SYS_MKDIR, rt.buf_ptr(&c2) as i64, FS_MODE_DIR, 0, 0, 0, 0)
+    rt.buf_free(&c2)
+    if r2 < 0 {
+        if r2 == -17 && is_dir(p) {
+            return false // somebody else was faster
+        }
+        return fs_error(r2)
+    }
+    return true
+}
+
+// ---------------------------------------------------- Rename and removal
+
+// Renames `from` to `to`. On the same volume this is ATOMIC: an existing
+// file `to` is replaced in one step, and every reader sees either the old
+// or the new one. Across volumes it is `FsError::CrossDevice`.
+fn rename(from: str, to: str) -> FsError!bool {
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    if !cpath(from, &a) || !cpath(to, &b) {
+        rt.buf_free(&a)
+        rt.buf_free(&b)
+        return FsError::Invalid
+    }
+    let r: i64 = syscall(FS_SYS_RENAME, rt.buf_ptr(&a) as i64, rt.buf_ptr(&b) as i64, 0, 0, 0, 0)
+    rt.buf_free(&a)
+    rt.buf_free(&b)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+// Creates the symbolic link `link` that points to `target` (which need not
+// exist).
+fn symlink(target: str, link: str) -> FsError!bool {
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    if !cpath(target, &a) || !cpath(link, &b) {
+        rt.buf_free(&a)
+        rt.buf_free(&b)
+        return FsError::Invalid
+    }
+    let r: i64 = syscall(FS_SYS_SYMLINKAT, rt.buf_ptr(&a) as i64, FS_AT_FDCWD, rt.buf_ptr(&b) as i64, 0, 0, 0)
+    rt.buf_free(&a)
+    rt.buf_free(&b)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+fn rmdir_c(c: *mut rt.Buf) -> i64 {
+    return syscall(FS_SYS_UNLINKAT, FS_AT_FDCWD, rt.buf_ptr(c) as i64, FS_AT_REMOVEDIR, 0, 0, 0)
+}
+
+// Removes a file, a symbolic link (not what it points to) or an EMPTY
+// directory.
+fn remove(path: str) -> FsError!bool {
+    var c: rt.Buf = rt.buf_new()
+    if !cpath(path, &c) {
+        rt.buf_free(&c)
+        return FsError::Invalid
+    }
+    var r: i64 = syscall(FS_SYS_UNLINK, rt.buf_ptr(&c) as i64, 0, 0, 0, 0, 0)
+    // unlink on a directory: EISDIR on Linux, EPERM by POSIX
+    if r == -21 || r == -1 {
+        let d: i64 = rmdir_c(&c)
+        if d >= 0 || d != -20 {
+            r = d
+        }
+    }
+    rt.buf_free(&c)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+// Removes `path` with everything below it. Symbolic links are removed, not
+// followed -- a link to "/" inside the tree must not take "/" with it. A
+// path that does not exist is `FsError::NotFound`.
+//
+// `#[allow_escape]`: the check sees `d.name` (a view into the frame's
+// directory block) flow into the vector. What is stored is `path + "/" +
+// d.name`, and `+` always copies into the GC heap -- the left side is never
+// empty -- so no address of the frame is kept.
+#[allow_escape]
+fn remove_tree(path: str) -> FsError!bool {
+    let info: FileInfo = try lstat(path)
+    if info.kind != KIND_DIR {
+        return try remove(path)
+    }
+    // collect first, remove afterwards: removing entries while getdents64
+    // walks the same directory may skip some
+    var names: Vec[str] = vec_new[str]()
+    var d: dir.Dir = dir.open(path)
+    if !dir.is_open(&d) {
+        vec_free[str](&names)
+        return FsError::Permission
+    }
+    while dir.next(&d) {
+        vec_push[str](&names, path + "/" + d.name)
+    }
+    dir.close(&d)
+    var i: usize = 0
+    let n: usize = vec_len[str](&names)
+    var failed: bool = false
+    while i < n && !failed {
+        let child: str = *vec_elem_ptr[str](&names, i)
+        // an entry that vanished meanwhile is what we wanted anyway
+        let ok: bool = remove_tree(child) catch |e| (e == FsError::NotFound)
+        if !ok {
+            failed = true
+        }
+        i = i + 1
+    }
+    vec_free[str](&names)
+    if failed {
+        return fs_error(0 - fs_errno)
+    }
+    return try remove(path)
+}
+
+// ------------------------------------------------------------ Inspection
+
+fn stat_with(path: str, flags: i64) -> FsError!FileInfo {
+    var c: rt.Buf = rt.buf_new()
+    if !cpath(path, &c) {
+        rt.buf_free(&c)
+        return FsError::Invalid
+    }
+    // struct statx is 256 octets: stx_mode u16 @28, stx_size u64 @40,
+    // stx_mtime {tv_sec i64, tv_nsec u32} @112
+    var sx: [u64; 32] = [0 as u64; 32]
+    let base: u64 = (&sx[0]) as u64
+    let r: i64 = syscall(FS_SYS_STATX, FS_AT_FDCWD, rt.buf_ptr(&c) as i64, flags, FS_STATX_BASIC, base as i64, 0)
+    rt.buf_free(&c)
+    if r < 0 {
+        return fs_error(r)
+    }
+    let mode: u32 = rt.ld16(base, 14) as u32 // octet 28
+    let fmt: u32 = mode & 61440 as u32 // S_IFMT 0o170000
+    var kind: u8 = KIND_OTHER
+    if fmt == 32768 as u32 { kind = KIND_FILE } // S_IFREG
+    if fmt == 16384 as u32 { kind = KIND_DIR } // S_IFDIR
+    if fmt == 40960 as u32 { kind = KIND_LINK } // S_IFLNK
+    let size: u64 = rt.ld64(base, 5) // octet 40
+    let sec: i64 = rt.ld64(base, 14) as i64 // octet 112
+    let nsec: i64 = rt.ld32(base, 30) as i64 // octet 120
+    return FileInfo { kind: kind, mode: mode & 4095 as u32, size: size, mtime_ns: sec * 1000000000 + nsec }
+}
+
+// Kind, size and modification time; symbolic links are followed.
+fn stat(path: str) -> FsError!FileInfo {
+    return stat_with(path, 0)
+}
+
+// Like `stat`, but a symbolic link is described itself (KIND_LINK).
+fn lstat(path: str) -> FsError!FileInfo {
+    return stat_with(path, FS_AT_SYMLINK_NOFOLLOW)
+}
+
+fn exists(path: str) -> bool {
+    let info: FileInfo = stat(path) catch FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return info.kind != 255 as u8
+}
+
+fn is_dir(path: str) -> bool {
+    let info: FileInfo = stat(path) catch FileInfo { kind: KIND_OTHER, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return info.kind == KIND_DIR
+}
+
+fn is_file(path: str) -> bool {
+    let info: FileInfo = stat(path) catch FileInfo { kind: KIND_OTHER, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return info.kind == KIND_FILE
+}
+
+// ------------------------------------------------------------ Durability
+
+fn open_c(path: str, flags: i64, mode: i64) -> FsError!i64 {
+    var c: rt.Buf = rt.buf_new()
+    if !cpath(path, &c) {
+        rt.buf_free(&c)
+        return FsError::Invalid
+    }
+    let fd: i64 = syscall(FS_SYS_OPEN, rt.buf_ptr(&c) as i64, flags, mode, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return fs_error(fd)
+    }
+    return fd
+}
+
+fn fsync_fd(fd: i64) -> FsError!bool {
+    let r: i64 = syscall(FS_SYS_FSYNC, fd, 0, 0, 0, 0, 0)
+    syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+// Flushes the content of a file to the disk.
+fn fsync_file(path: str) -> FsError!bool {
+    let fd: i64 = try open_c(path, FS_O_READ, 0)
+    return try fsync_fd(fd)
+}
+
+// Flushes a DIRECTORY -- what makes a create, rename or remove inside it
+// survive a power cut.
+fn fsync_dir(path: str) -> FsError!bool {
+    let fd: i64 = try open_c(path, FS_O_READ, 0)
+    return try fsync_fd(fd)
+}
+
+// ------------------------------------------------------ Whole files
+
+// Appends the whole file to `out`; the answer is the number of octets read.
+fn read_file(path: str, out: *mut rt.Buf) -> FsError!usize {
+    let fd: i64 = try open_c(path, FS_O_READ, 0)
+    var total: usize = 0
+    while true {
+        rt.buf_reserve(out, (*out).len + 65536)
+        if (*out).cap < (*out).len + 65536 {
+            syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+            return FsError::NoSpace
+        }
+        let r: i64 = syscall(FS_SYS_READ, fd, (rt.buf_ptr(out) + (*out).len as u64) as i64, 65536, 0, 0, 0)
+        if r < 0 {
+            syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+            return fs_error(r)
+        }
+        if r == 0 {
+            break
+        }
+        rt.buf_set_len(out, (*out).len + r as usize)
+        total = total + r as usize
+    }
+    syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return total
+}
+
+fn write_fd(fd: i64, p: u64, n: usize) -> i64 {
+    var done: usize = 0
+    while done < n {
+        let r: i64 = syscall(FS_SYS_WRITE, fd, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if r < 0 {
+            return r
+        }
+        if r == 0 {
+            return -28 // a write that makes no progress: treat as ENOSPC
+        }
+        done = done + r as usize
+    }
+    return 0
+}
+
+fn write_mode(path: str, p: u64, n: usize, flags: i64) -> FsError!usize {
+    let fd: i64 = try open_c(path, flags, FS_MODE_FILE)
+    let r: i64 = write_fd(fd, p, n)
+    let cr: i64 = syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if r < 0 {
+        return fs_error(r)
+    }
+    if cr < 0 {
+        return fs_error(cr) // NFS reports a failed write only at close
+    }
+    return n
+}
+
+// Creates or truncates the file and writes `n` octets (NOT durable by
+// itself -- see `write_atomic`).
+fn write_file(path: str, p: u64, n: usize) -> FsError!usize {
+    return try write_mode(path, p, n, FS_O_TRUNC)
+}
+
+// Appends `n` octets (creates the file if it is missing).
+fn append_file(path: str, p: u64, n: usize) -> FsError!usize {
+    return try write_mode(path, p, n, FS_O_APPEND)
+}
+
+// Replaces `path` with `n` octets so that a crash leaves either the old or
+// the new content (see the head of the file).
+fn write_atomic(path: str, p: u64, n: usize) -> FsError!bool {
+    let pid: i64 = syscall(FS_SYS_GETPID, 0, 0, 0, 0, 0, 0)
+    fs_counter = fs_counter + 1
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, path.p as u64, path.length())
+    let tail: str = ".tmp-"
+    rt.buf_push_bytes(&t, tail.p as u64, tail.length())
+    rt.buf_push_dec_i64(&t, pid)
+    rt.buf_push(&t, 45 as u8) // '-'
+    rt.buf_push_dec_u64(&t, fs_counter)
+    let tmp: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
+    rt.buf_free(&t)
+    let fd: i64 = try open_c(tmp, FS_O_EXCL, FS_MODE_FILE)
+    var r: i64 = write_fd(fd, p, n)
+    if r == 0 {
+        r = syscall(FS_SYS_FSYNC, fd, 0, 0, 0, 0, 0)
+    }
+    let cr: i64 = syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if r == 0 && cr < 0 {
+        r = cr
+    }
+    if r < 0 {
+        let e: FsError = fs_error(r)
+        remove(tmp) catch false
+        return e
+    }
+    let moved: bool = rename(tmp, path) catch false
+    if !moved {
+        let keep: i64 = fs_errno
+        remove(tmp) catch false
+        return fs_error(0 - keep)
+    }
+    var parent: str = path_parent(path)
+    if parent.length() == 0 {
+        parent = "."
+    }
+    return try fsync_dir(parent)
+}
+
+// ------------------------------------------------------------ Paths
+
+// The directory for temporary files. Firn has no environment access yet,
+// so $TMPDIR is not consulted: this is "/tmp".
+fn temp_dir() -> str {
+    return "/tmp"
+}
+
+// "a" + "b" -> "a/b"; an absolute `b` replaces `a`; no doubled slash.
+fn path_join(a: str, b: str) -> str {
+    if a.length() == 0 {
+        return b
+    }
+    if b.length() > 0 && b.chars(0) == 47 as u8 {
+        return b
+    }
+    if a.chars(a.length() - 1) == 47 as u8 {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+// "a/b/c" -> "a/b", "/a" -> "/", "a" -> "", "a/b/" -> "a"
+fn path_parent(p: str) -> str {
+    var n: usize = p.length()
+    while n > 1 && p.chars(n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    while n > 0 && p.chars(n - 1) != 47 as u8 {
+        n = n - 1
+    }
+    if n == 0 {
+        return ""
+    }
+    // strip the slash itself, but keep the root
+    while n > 1 && p.chars(n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    return p.part(0, n)
+}
+
+// "a/b/c.json" -> "c.json", "a/b/" -> "b"
+fn path_name(p: str) -> str {
+    var e: usize = p.length()
+    while e > 1 && p.chars(e - 1) == 47 as u8 {
+        e = e - 1
+    }
+    var s: usize = e
+    while s > 0 && p.chars(s - 1) != 47 as u8 {
+        s = s - 1
+    }
+    return p.part(s, e - s)
+}

@@ -1,0 +1,279 @@
+// expect_exit: 42
+// tests/1912_zip.fi -- lib/zip (OpenPlan LIB-004) inside one process: the
+// round trip, ZIP64 by entry count, and every refusal a hostile archive
+// has to meet. Whether OTHER programs read what this writes, and whether
+// this reads what they write, is tools/libmvp/run.sh (Python's zipfile and
+// Info-ZIP's unzip as the judges).
+import zip.zip
+import std.rt
+import std.str
+import std.deflate
+
+fn same(b: *mut rt.Buf, from: usize, s: str) -> bool {
+    if rt.buf_len(b) - from != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b) + from as u64, s.p as u64, s.length())
+}
+
+// an error as a number that no successful size reaches here
+fn zcode(e: ZipError) -> usize {
+    if e == ZipError::NotZip { return 1000001 }
+    if e == ZipError::Corrupt { return 1000002 }
+    if e == ZipError::Unsupported { return 1000003 }
+    if e == ZipError::Encrypted { return 1000004 }
+    if e == ZipError::UnsafeName { return 1000005 }
+    if e == ZipError::Duplicate { return 1000006 }
+    if e == ZipError::TooLarge { return 1000007 }
+    if e == ZipError::Checksum { return 1000008 }
+    if e == ZipError::Finished { return 1000009 }
+    return 1000010
+}
+
+// opens `b`, answers the entry count or the error code
+fn open_code(b: *mut rt.Buf) -> usize {
+    var why: usize = 0
+    var z: zip.ZipReader = zip.zip_reader_open(rt.buf_ptr(b), rt.buf_len(b)) catch |e| (fail_reader(e, &why))
+    if why != 0 {
+        return why
+    }
+    let n: usize = zip.zip_entry_count(&z)
+    zip.zip_reader_free(&z)
+    return n
+}
+
+fn fail_reader(e: ZipError, why: *mut usize) -> zip.ZipReader {
+    *why = zcode(e)
+    return empty_reader()
+}
+
+fn empty_reader() -> zip.ZipReader {
+    // a reader over a minimal valid archive: just the end record
+    var z: zip.ZipReader = zip.zip_reader_open(end_only(), 22) catch |f| (empty_reader())
+    return z
+}
+
+static mut eocd: [u8; 22] = [80 as u8, 75 as u8, 5 as u8, 6 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8]
+
+fn end_only() -> u64 {
+    return (&eocd[0]) as u64
+}
+
+fn copy_of(b: *mut rt.Buf) -> rt.Buf {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, rt.buf_ptr(b), rt.buf_len(b))
+    return c
+}
+
+// the offset of the first occurrence of `s` in `b` at or after `from`
+fn find(b: *mut rt.Buf, s: str, from: usize) -> usize {
+    var i: usize = from
+    while i + s.length() <= rt.buf_len(b) {
+        if rt.mem_eq(rt.buf_ptr(b) + i as u64, s.p as u64, s.length()) {
+            return i
+        }
+        i = i + 1
+    }
+    return 999999999
+}
+
+fn main() -> i32 {
+    let text: str = "Wendeschuetzschaltung K1 K2 -- Wendeschuetzschaltung K1 K2 -- Wendeschuetzschaltung K1 K2\n"
+    var noise: rt.Buf = rt.buf_new()
+    var x: u64 = 7
+    var i: usize = 0
+    while i < 5000 {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&noise, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+
+    // --- A. write an archive
+    var out: rt.Buf = rt.buf_new()
+    let prefix: str = "not part of the archive"
+    rt.buf_push_bytes(&out, prefix.p as u64, prefix.length())
+    var w: zip.ZipWriter = zip.zip_writer_new(&out)
+    zip.zip_set_time(&w, 1790351407123) // 2026-09-25 15:50:07 UTC
+    let a1: bool = zip.zip_add(&w, "project.json", text.p as u64, text.length(), true) catch false
+    let a2: bool = zip.zip_add_dir(&w, "pages") catch false
+    let a3: bool = zip.zip_add(&w, "pages/0001.json", text.p as u64, 10, false) catch false
+    let a4: bool = zip.zip_add(&w, "media/noise.bin", rt.buf_ptr(&noise), rt.buf_len(&noise), true) catch false
+    let a5: bool = zip.zip_add(&w, "empty.txt", 0, 0, true) catch false
+    let a6: bool = zip.zip_add(&w, "Übersicht/Schütz.txt", text.p as u64, 5, true) catch false
+    if !a1 || !a2 || !a3 || !a4 || !a5 || !a6 { return 1 as i32 }
+    // refused names and a duplicate
+    if (zip.zip_add(&w, "../evil", 0, 0, false) catch |e| (e == ZipError::UnsafeName)) == false { return 2 as i32 }
+    if (zip.zip_add(&w, "/etc/passwd", 0, 0, false) catch |e| (e == ZipError::UnsafeName)) == false { return 3 as i32 }
+    if (zip.zip_add(&w, "a\\b", 0, 0, false) catch |e| (e == ZipError::UnsafeName)) == false { return 4 as i32 }
+    if (zip.zip_add(&w, "project.json", 0, 0, false) catch |e| (e == ZipError::Duplicate)) == false { return 5 as i32 }
+    if (zip.zip_add(&w, "file/", 0, 0, false) catch |e| (e == ZipError::UnsafeName)) == false { return 6 as i32 }
+    let size: usize = zip.zip_finish(&w) catch 0
+    if size == 0 || size != rt.buf_len(&out) - prefix.length() { return 7 as i32 }
+    if (zip.zip_add(&w, "late", 0, 0, false) catch |e| (e == ZipError::Finished)) == false { return 8 as i32 }
+    zip.zip_writer_free(&w)
+    // the archive proper starts after the prefix
+    var arc: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&arc, rt.buf_ptr(&out) + prefix.length() as u64, size)
+
+    // --- B. read it back
+    var z: zip.ZipReader = zip.zip_reader_open(rt.buf_ptr(&arc), rt.buf_len(&arc)) catch |e| (fail_reader(e, &i))
+    if zip.zip_entry_count(&z) != 6 { return 10 as i32 }
+    if zip.zip_entry_name(&z, 0) != "project.json" { return 11 as i32 }
+    if zip.zip_entry_method(&z, 0) != zip.ZIP_DEFLATE { return 12 as i32 }
+    if zip.zip_entry_compressed_size(&z, 0) >= text.length() as u64 { return 13 as i32 }
+    if !zip.zip_entry_is_dir(&z, 1) || zip.zip_entry_name(&z, 1) != "pages/" { return 14 as i32 }
+    if zip.zip_entry_method(&z, 3) != zip.ZIP_STORE { return 15 as i32 } // noise does not shrink
+    if zip.zip_entry_crc(&z, 0) != deflate.crc32(text.p as u64, text.length()) { return 16 as i32 }
+    if zip.zip_find(&z, "Übersicht/Schütz.txt") != 5 { return 17 as i32 }
+    if zip.zip_find(&z, "nope") != -1 { return 18 as i32 }
+    var got: rt.Buf = rt.buf_new()
+    let keep: str = "kept"
+    rt.buf_push_bytes(&got, keep.p as u64, keep.length())
+    let n0: usize = zip.zip_extract(&z, 0, &got) catch 0
+    if n0 != text.length() || !same(&got, 4, text) { return 20 as i32 }
+    rt.buf_clear(&got)
+    zip.zip_extract(&z, 2, &got) catch 0
+    if !same(&got, 0, text.part(0, 10)) { return 21 as i32 }
+    rt.buf_clear(&got)
+    zip.zip_extract(&z, 3, &got) catch 0
+    if rt.buf_len(&got) != 5000 || !rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&noise), 5000) { return 22 as i32 }
+    rt.buf_clear(&got)
+    let ne: usize = zip.zip_extract(&z, 4, &got) catch 99
+    if ne != 0 { return 23 as i32 }
+    zip.zip_reader_free(&z)
+
+    // --- C. the same input gives the same octets
+    var out2: rt.Buf = rt.buf_new()
+    var w2: zip.ZipWriter = zip.zip_writer_new(&out2)
+    zip.zip_set_time(&w2, 1790351407123)
+    zip.zip_add(&w2, "project.json", text.p as u64, text.length(), true) catch false
+    zip.zip_add_dir(&w2, "pages/") catch false
+    zip.zip_add(&w2, "pages/0001.json", text.p as u64, 10, false) catch false
+    zip.zip_add(&w2, "media/noise.bin", rt.buf_ptr(&noise), rt.buf_len(&noise), true) catch false
+    zip.zip_add(&w2, "empty.txt", 0, 0, true) catch false
+    zip.zip_add(&w2, "Übersicht/Schütz.txt", text.p as u64, 5, true) catch false
+    zip.zip_finish(&w2) catch 0
+    zip.zip_writer_free(&w2)
+    if rt.buf_len(&out2) != size || !rt.mem_eq(rt.buf_ptr(&out2), rt.buf_ptr(&arc), size) { return 30 as i32 }
+
+    // --- D. hostile archives
+    // D1: a name that climbs out ("pages/" -> "../../" keeps the length)
+    var h1: rt.Buf = copy_of(&arc)
+    var at: usize = find(&h1, "pages/0001.json", 0)
+    while at != 999999999 {
+        let evil: str = "../../"
+        rt.mem_copy(rt.buf_ptr(&h1) + at as u64, evil.p as u64, 6)
+        at = find(&h1, "pages/0001.json", at + 1)
+    }
+    if open_code(&h1) != 1000005 { return 40 as i32 }
+    // D2: a flipped octet in the data: the CRC catches it
+    var h2: rt.Buf = copy_of(&arc)
+    let d2: usize = find(&h2, "pages/0001.json", 0) + 15 // the stored data
+    rt.st8(rt.buf_ptr(&h2), d2, rt.ld8(rt.buf_ptr(&h2), d2) ^ 1 as u8)
+    var z2: zip.ZipReader = zip.zip_reader_open(rt.buf_ptr(&h2), rt.buf_len(&h2)) catch |e| (fail_reader(e, &i))
+    rt.buf_clear(&got)
+    if (zip.zip_extract(&z2, 2, &got) catch |e| (zcode(e))) != 1000008 { return 41 as i32 }
+    if rt.buf_len(&got) != 0 { return 42 as i32 } // left as it was
+    zip.zip_reader_free(&z2)
+    // D3: cut off / not a zip at all
+    var h3: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&h3, rt.buf_ptr(&arc), size - 30)
+    let c3: usize = open_code(&h3)
+    if c3 != 1000001 && c3 != 1000002 { return 43 as i32 }
+    if open_code(&noise) != 1000001 { return 44 as i32 }
+    // D4: the central directory says the first entry is 1 octet long: the
+    // inflater stops there and refuses instead of writing 90
+    var h4: rt.Buf = copy_of(&arc)
+    let cd0: usize = find(&h4, "PK\x01\x02", 0)
+    rt.st8(rt.buf_ptr(&h4), cd0 + 24, 1 as u8)
+    rt.st8(rt.buf_ptr(&h4), cd0 + 25, 0 as u8)
+    var z4: zip.ZipReader = zip.zip_reader_open(rt.buf_ptr(&h4), rt.buf_len(&h4)) catch |e| (fail_reader(e, &i))
+    rt.buf_clear(&got)
+    if (zip.zip_extract(&z4, 0, &got) catch |e| (zcode(e))) != 1000007 { return 45 as i32 }
+    if rt.buf_len(&got) != 0 { return 46 as i32 }
+    zip.zip_reader_free(&z4)
+    // D5: two entries sharing the same data (the second central record
+    // points at the first local header): overlap
+    var h5: rt.Buf = copy_of(&arc)
+    let cd1: usize = find(&h5, "PK\x01\x02", cd0 + 4)
+    rt.st8(rt.buf_ptr(&h5), cd1 + 42, 0 as u8)
+    rt.st8(rt.buf_ptr(&h5), cd1 + 43, 0 as u8)
+    rt.st8(rt.buf_ptr(&h5), cd1 + 44, 0 as u8)
+    rt.st8(rt.buf_ptr(&h5), cd1 + 45, 0 as u8)
+    if open_code(&h5) != 1000002 { return 47 as i32 }
+    // D6: the same name twice -- write "aaa" and "bbb", then rename "bbb"
+    // in both of its records
+    var h6: rt.Buf = rt.buf_new()
+    var w6: zip.ZipWriter = zip.zip_writer_new(&h6)
+    zip.zip_add(&w6, "aaa", text.p as u64, 4, false) catch false
+    zip.zip_add(&w6, "bbb", text.p as u64, 4, false) catch false
+    zip.zip_finish(&w6) catch 0
+    zip.zip_writer_free(&w6)
+    if open_code(&h6) != 2 { return 48 as i32 }
+    at = find(&h6, "bbb", 0)
+    while at != 999999999 {
+        let dup: str = "aaa"
+        rt.mem_copy(rt.buf_ptr(&h6) + at as u64, dup.p as u64, 3)
+        at = find(&h6, "bbb", at + 1)
+    }
+    if open_code(&h6) != 1000006 { return 49 as i32 }
+    // D6b: encryption
+    var h7: rt.Buf = copy_of(&arc)
+    rt.st8(rt.buf_ptr(&h7), cd0 + 8, rt.ld8(rt.buf_ptr(&h7), cd0 + 8) | 1 as u8)
+    if open_code(&h7) != 1000004 { return 50 as i32 }
+    // D7: limits
+    var lim: zip.ZipLimits = zip.zip_limits_default()
+    lim.max_entry_size = 1000
+    var why: usize = 0
+    var z8: zip.ZipReader = zip.zip_reader_open_limits(rt.buf_ptr(&arc), size, lim) catch |e| (fail_reader(e, &why))
+    if why != 1000007 { return 51 as i32 }
+    lim = zip.zip_limits_default()
+    lim.max_entries = 3
+    why = 0
+    var z9: zip.ZipReader = zip.zip_reader_open_limits(rt.buf_ptr(&arc), size, lim) catch |e| (fail_reader(e, &why))
+    if why != 1000007 { return 52 as i32 }
+    // D8: an unknown method
+    var h9: rt.Buf = copy_of(&arc)
+    rt.st8(rt.buf_ptr(&h9), cd0 + 10, 12 as u8) // bzip2
+    var z10: zip.ZipReader = zip.zip_reader_open(rt.buf_ptr(&h9), rt.buf_len(&h9)) catch |e| (fail_reader(e, &i))
+    if (zip.zip_extract(&z10, 0, &got) catch |e| (zcode(e))) != 1000003 { return 53 as i32 }
+
+    // --- E. names
+    if !zip.zip_name_is_safe("a/b/c.txt") || !zip.zip_name_is_safe("dir/") { return 60 as i32 }
+    if zip.zip_name_is_safe("a/./b") || zip.zip_name_is_safe("a//b") || zip.zip_name_is_safe("") { return 61 as i32 }
+    if zip.zip_name_is_safe("C:/x") || zip.zip_name_is_safe("a/..") || zip.zip_name_is_safe("a\0b") { return 62 as i32 }
+    // a cut sequence and an encoded surrogate are not UTF-8
+    var raw: [u8; 6] = [98 as u8, 97 as u8, 195 as u8, 237 as u8, 160 as u8, 128 as u8]
+    let cut: str = str { p: &raw[0], n: 3 }
+    let sur: str = str { p: &raw[3], n: 3 }
+    if zip.zip_name_is_safe(cut) || zip.zip_name_is_safe(sur) { return 63 as i32 }
+    if !zip.zip_name_is_safe("ok..name") { return 64 as i32 }
+
+    // --- F. ZIP64 by entry count: 66000 entries
+    var big: rt.Buf = rt.buf_new()
+    var wb: zip.ZipWriter = zip.zip_writer_new(&big)
+    var k: u32 = 0
+    var nb: rt.Buf = rt.buf_new()
+    while k < 66000 {
+        rt.buf_clear(&nb)
+        let head: str = "e/"
+        rt.buf_push_bytes(&nb, head.p as u64, 2)
+        rt.buf_push_dec_u64(&nb, k as u64)
+        let nm: str = str { p: rt.buf_data(&nb), n: rt.buf_len(&nb) }
+        let ok: bool = zip.zip_add(&wb, nm, text.p as u64, 3, false) catch false
+        if !ok { return 70 as i32 }
+        k = k + 1
+    }
+    zip.zip_finish(&wb) catch 0
+    zip.zip_writer_free(&wb)
+    if open_code(&big) != 66000 { return 71 as i32 }
+    var zb: zip.ZipReader = zip.zip_reader_open(rt.buf_ptr(&big), rt.buf_len(&big)) catch |e| (fail_reader(e, &i))
+    if zip.zip_entry_name(&zb, 65999) != "e/65999" { return 72 as i32 }
+    rt.buf_clear(&got)
+    zip.zip_extract(&zb, 65999, &got) catch 0
+    if !same(&got, 0, "Wen") { return 73 as i32 }
+    zip.zip_reader_free(&zb)
+    return 42
+}

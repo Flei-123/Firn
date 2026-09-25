@@ -1,0 +1,916 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/time.fi -- std.time: clocks, the civil calendar, ISO 8601 and the
+// local UTC offset.
+//
+// OpenPlan LIB-002. Until this file the clocks lived only inside other
+// modules (gc.fi `__gc_now_ns`, net/httpstate.fi `now_unix`), and nothing
+// turned a count of seconds into a date or back. What is here:
+//
+//     now_unix_ms() / now_unix_ns()   the wall clock, UTC
+//     monotonic_ns()                  a clock that never jumps back
+//     civil_from_unix(ms)             ms since 1970 -> DateTime (UTC)
+//     unix_from_civil(t)              DateTime (with its offset) -> ms
+//     format_iso8601(t)               "2026-09-25T15:50:00.123Z"
+//     parse_iso8601(s)                the same forms back, and a few more
+//     weekday(t), day_of_year(t), days_in_month(y, m), is_leap_year(y)
+//     local_offset_min(ms)            the local offset from /etc/localtime
+//     tz_load / tz_offset_min         the same for any TZif file
+//
+// THE CALENDAR is the proleptic Gregorian one, for every year from -999999
+// to 999999, computed with the day-count formulas of Howard Hinnant
+// ("chrono-compatible low-level date algorithms"): no table, no loop over
+// years, exact for negative days as well. Leap seconds do not exist here,
+// just as they do not exist in Unix time.
+//
+// TIME ZONES: only what a program needs to show a local time -- the offset
+// in minutes at a given instant. It is read from a TZif file (RFC 8536,
+// versions 1 to 4). Modern tzdata ships "slim" files that list transitions
+// only up to 2037 or not at all and describe everything later with the
+// POSIX TZ rule in the footer ("CET-1CEST,M3.5.0,M10.5.0/3"); that rule is
+// evaluated too, so 2050 in Vienna is still CEST in July.
+//
+// THE MACHINES. `clock_gettime` (228) is translated for AArch64 and exists
+// in the browser (wasm32-browser: the host's clock, realtime and
+// monotonic). Reading /etc/localtime needs files, which a browser page does
+// not have; a browser program that reaches `local_offset_min` is refused at
+// compile time. Everything else in this file works everywhere.
+
+import rt
+import str
+
+export {
+    DateTime, TimeError, Tz,
+    now_unix_ms, now_unix_ns, monotonic_ns,
+    civil_from_unix, unix_from_civil, days_from_civil,
+    format_iso8601, format_date, parse_iso8601,
+    weekday, day_of_year, days_in_month, is_leap_year,
+    local_offset_min, local_from_unix,
+    tz_new, tz_free, tz_load, tz_parse, tz_offset_min, tz_rule,
+}
+
+error TimeError {
+    Syntax, // the text is not one of the accepted forms
+    Range, // a field outside its range (month 13, 31 April, hour 24, ...)
+    NoZone, // the zone file could not be read
+    BadZone, // the zone file is not a TZif file this reader understands
+}
+
+// A point in the civil calendar. `offset_min` is the offset of the fields
+// from UTC (+120 for 14:00 in Vienna in summer = 12:00 UTC).
+struct DateTime {
+    year: i32,
+    month: u32, // 1..12
+    day: u32, // 1..31
+    hour: u32, // 0..23
+    minute: u32,
+    second: u32, // 0..59
+    ms: u32, // 0..999
+    offset_min: i32,
+}
+
+const TIME_SYS_OPEN: i64 = 2
+const TIME_SYS_READ: i64 = 0
+const TIME_SYS_CLOSE: i64 = 3
+const TIME_SYS_CLOCK_GETTIME: i64 = 228
+const TIME_CLOCK_REALTIME: i64 = 0
+const TIME_CLOCK_MONOTONIC: i64 = 1
+const MS_PER_DAY: i64 = 86400000
+
+// ------------------------------------------------------------------ Clocks
+
+fn now_unix_ns() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(TIME_SYS_CLOCK_GETTIME, TIME_CLOCK_REALTIME, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000000000 + ts[1]
+}
+
+fn now_unix_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(TIME_SYS_CLOCK_GETTIME, TIME_CLOCK_REALTIME, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+fn monotonic_ns() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(TIME_SYS_CLOCK_GETTIME, TIME_CLOCK_MONOTONIC, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000000000 + ts[1]) as u64
+}
+
+// ---------------------------------------------------------------- Calendar
+
+// floor(a / b) for b > 0 -- `/` truncates towards zero, which is wrong for
+// instants before 1970
+fn floor_div(a: i64, b: i64) -> i64 {
+    var q: i64 = a / b
+    if a % b != 0 && a < 0 {
+        q = q - 1
+    }
+    return q
+}
+
+fn is_leap_year(y: i32) -> bool {
+    if y % 4 != 0 { return false }
+    if y % 100 != 0 { return true }
+    return y % 400 == 0
+}
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    if m == 2 {
+        if is_leap_year(y) { return 29 as u32 }
+        return 28 as u32
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30 as u32
+    }
+    return 31 as u32
+}
+
+// Days since 1970-01-01 of a civil date (Hinnant, days_from_civil).
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    var y: i64 = year as i64
+    let m: i64 = month as i64
+    if m <= 2 {
+        y = y - 1
+    }
+    var era: i64 = 0
+    if y >= 0 {
+        era = y / 400
+    } else {
+        era = (y - 399) / 400
+    }
+    let yoe: i64 = y - era * 400
+    var mp: i64 = m - 3
+    if m <= 2 {
+        mp = m + 9
+    }
+    let doy: i64 = (153 * mp + 2) / 5 + day as i64 - 1
+    let doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// The civil date of a day number (Hinnant, civil_from_days) into `t`.
+fn civil_from_days(z0: i64, t: *mut DateTime) {
+    let z: i64 = z0 + 719468
+    var era: i64 = 0
+    if z >= 0 {
+        era = z / 146097
+    } else {
+        era = (z - 146096) / 146097
+    }
+    let doe: i64 = z - era * 146097
+    let yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y: i64 = yoe + era * 400
+    let doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: i64 = (5 * doy + 2) / 153
+    let d: i64 = doy - (153 * mp + 2) / 5 + 1
+    var m: i64 = mp + 3
+    if mp >= 10 {
+        m = mp - 9
+    }
+    var yy: i64 = y
+    if m <= 2 {
+        yy = y + 1
+    }
+    (*t).year = yy as i32
+    (*t).month = m as u32
+    (*t).day = d as u32
+}
+
+fn civil_at(ms: i64, offset_min: i32) -> DateTime {
+    let local: i64 = ms + offset_min as i64 * 60000
+    let days: i64 = floor_div(local, MS_PER_DAY)
+    let rest: i64 = local - days * MS_PER_DAY
+    var t: DateTime = DateTime { year: 1970, month: 1 as u32, day: 1 as u32, hour: 0 as u32,
+        minute: 0 as u32, second: 0 as u32, ms: 0 as u32, offset_min: offset_min }
+    civil_from_days(days, &t)
+    t.hour = (rest / 3600000) as u32
+    t.minute = ((rest / 60000) % 60) as u32
+    t.second = ((rest / 1000) % 60) as u32
+    t.ms = (rest % 1000) as u32
+    return t
+}
+
+// Milliseconds since 1970-01-01T00:00:00Z -> the civil date and time in UTC.
+fn civil_from_unix(ms: i64) -> DateTime {
+    return civil_at(ms, 0 as i32)
+}
+
+// The instant a DateTime names (its `offset_min` taken into account).
+// Fields out of range are not checked here -- `parse_iso8601` does that.
+fn unix_from_civil(t: DateTime) -> i64 {
+    let days: i64 = days_from_civil(t.year, t.month, t.day)
+    let local: i64 = days * MS_PER_DAY + t.hour as i64 * 3600000 + t.minute as i64 * 60000 +
+        t.second as i64 * 1000 + t.ms as i64
+    return local - t.offset_min as i64 * 60000
+}
+
+// 1 = Monday ... 7 = Sunday (ISO 8601)
+fn weekday(t: DateTime) -> u32 {
+    let days: i64 = days_from_civil(t.year, t.month, t.day)
+    // 1970-01-01 was a Thursday (4)
+    let w: i64 = (days % 7 + 7 + 3) % 7
+    return (w + 1) as u32
+}
+
+// 1 ... 366
+fn day_of_year(t: DateTime) -> u32 {
+    return (days_from_civil(t.year, t.month, t.day) - days_from_civil(t.year, 1 as u32, 1 as u32) + 1) as u32
+}
+
+// ------------------------------------------------------------- Formatting
+
+fn push_dec(b: *mut rt.Buf, v: u64, width: usize) {
+    var digits: [u8; 20] = [0 as u8; 20]
+    var n: usize = 0
+    var x: u64 = v
+    while x > 0 || n == 0 {
+        digits[n] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n < width {
+        digits[n] = 48 as u8
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(b, digits[n])
+    }
+}
+
+fn push_year(b: *mut rt.Buf, y: i32) {
+    // ISO 8601: four digits for 0..9999, a sign and more digits outside
+    if y < 0 {
+        rt.buf_push(b, 45 as u8)
+        push_dec(b, (0 - y as i64) as u64, 4)
+    } else if y > 9999 {
+        rt.buf_push(b, 43 as u8)
+        push_dec(b, y as u64, 4)
+    } else {
+        push_dec(b, y as u64, 4)
+    }
+}
+
+fn to_str(b: *mut rt.Buf) -> str {
+    let s: str = __str_copy(str { p: rt.buf_data(b), n: rt.buf_len(b) })
+    rt.buf_free(b)
+    return s
+}
+
+// "YYYY-MM-DD"
+fn format_date(t: DateTime) -> str {
+    var b: rt.Buf = rt.buf_new()
+    push_year(&b, t.year)
+    rt.buf_push(&b, 45 as u8)
+    push_dec(&b, t.month as u64, 2)
+    rt.buf_push(&b, 45 as u8)
+    push_dec(&b, t.day as u64, 2)
+    return to_str(&b)
+}
+
+// "YYYY-MM-DDTHH:MM:SS.mmmZ", or "+HH:MM"/"-HH:MM" instead of "Z" when the
+// offset is not 0. Always with milliseconds, so that the same instant always
+// gives the same text (and texts sort like instants when the offset is 0).
+fn format_iso8601(t: DateTime) -> str {
+    var b: rt.Buf = rt.buf_new()
+    push_year(&b, t.year)
+    rt.buf_push(&b, 45 as u8)
+    push_dec(&b, t.month as u64, 2)
+    rt.buf_push(&b, 45 as u8)
+    push_dec(&b, t.day as u64, 2)
+    rt.buf_push(&b, 84 as u8) // T
+    push_dec(&b, t.hour as u64, 2)
+    rt.buf_push(&b, 58 as u8)
+    push_dec(&b, t.minute as u64, 2)
+    rt.buf_push(&b, 58 as u8)
+    push_dec(&b, t.second as u64, 2)
+    rt.buf_push(&b, 46 as u8)
+    push_dec(&b, t.ms as u64, 3)
+    if t.offset_min == 0 {
+        rt.buf_push(&b, 90 as u8) // Z
+    } else {
+        var o: i32 = t.offset_min
+        if o < 0 {
+            rt.buf_push(&b, 45 as u8)
+            o = 0 - o
+        } else {
+            rt.buf_push(&b, 43 as u8)
+        }
+        push_dec(&b, (o / 60) as u64, 2)
+        rt.buf_push(&b, 58 as u8)
+        push_dec(&b, (o % 60) as u64, 2)
+    }
+    return to_str(&b)
+}
+
+// ---------------------------------------------------------------- Parsing
+
+struct Cursor {
+    s: str,
+    i: usize,
+}
+
+fn cur_digits(c: *mut Cursor, n: usize, out: *mut i64) -> bool {
+    var v: i64 = 0
+    var k: usize = 0
+    while k < n {
+        if (*c).i >= (*c).s.length() {
+            return false
+        }
+        let ch: u8 = (*c).s.chars((*c).i)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            return false
+        }
+        v = v * 10 + (ch - 48 as u8) as i64
+        (*c).i = (*c).i + 1
+        k = k + 1
+    }
+    *out = v
+    return true
+}
+
+fn cur_peek(c: *mut Cursor) -> u8 {
+    if (*c).i >= (*c).s.length() {
+        return 0 as u8
+    }
+    return (*c).s.chars((*c).i)
+}
+
+fn cur_eat(c: *mut Cursor, ch: u8) -> bool {
+    if cur_peek(c) == ch && (*c).i < (*c).s.length() {
+        (*c).i = (*c).i + 1
+        return true
+    }
+    return false
+}
+
+// Accepted (the forms OpenPlan writes and the ones people type):
+//     2026-09-25                       midnight UTC
+//     2026-09-25T15:50                 (T or one blank between)
+//     2026-09-25T15:50:07
+//     2026-09-25T15:50:07.1 ... .123456789   (cut to milliseconds)
+// each time form followed by nothing (= UTC), "Z", "+HH:MM", "-HH:MM",
+// "+HHMM" or "+HH". A year with a sign has at least four digits.
+// Refused: everything else, and every field out of its range -- including
+// 29 February outside a leap year and the second 60.
+fn parse_iso8601(s0: str) -> TimeError!DateTime {
+    var c: Cursor = Cursor { s: s0.trim(), i: 0 }
+    var t: DateTime = DateTime { year: 1970, month: 1 as u32, day: 1 as u32, hour: 0 as u32,
+        minute: 0 as u32, second: 0 as u32, ms: 0 as u32, offset_min: 0 as i32 }
+    var v: i64 = 0
+    // year
+    var sign: i64 = 1
+    var signed: bool = false
+    if cur_eat(&c, 45 as u8) {
+        sign = -1
+        signed = true
+    } else if cur_eat(&c, 43 as u8) {
+        signed = true
+    }
+    if !cur_digits(&c, 4, &v) {
+        return TimeError::Syntax
+    }
+    var year: i64 = v
+    if signed {
+        // more digits allowed after the first four
+        while cur_peek(&c) >= 48 as u8 && cur_peek(&c) <= 57 as u8 && year < 100000000 {
+            year = year * 10 + (cur_peek(&c) - 48 as u8) as i64
+            c.i = c.i + 1
+        }
+        if year > 999999 {
+            return TimeError::Range
+        }
+    }
+    t.year = (sign * year) as i32
+    if !cur_eat(&c, 45 as u8) || !cur_digits(&c, 2, &v) {
+        return TimeError::Syntax
+    }
+    if v < 1 || v > 12 {
+        return TimeError::Range
+    }
+    t.month = v as u32
+    if !cur_eat(&c, 45 as u8) || !cur_digits(&c, 2, &v) {
+        return TimeError::Syntax
+    }
+    if v < 1 || v > days_in_month(t.year, t.month) as i64 {
+        return TimeError::Range
+    }
+    t.day = v as u32
+    if c.i == c.s.length() {
+        return t
+    }
+    if !cur_eat(&c, 84 as u8) && !cur_eat(&c, 116 as u8) && !cur_eat(&c, 32 as u8) {
+        return TimeError::Syntax
+    }
+    if !cur_digits(&c, 2, &v) {
+        return TimeError::Syntax
+    }
+    if v > 23 {
+        return TimeError::Range
+    }
+    t.hour = v as u32
+    if !cur_eat(&c, 58 as u8) || !cur_digits(&c, 2, &v) {
+        return TimeError::Syntax
+    }
+    if v > 59 {
+        return TimeError::Range
+    }
+    t.minute = v as u32
+    if cur_eat(&c, 58 as u8) {
+        if !cur_digits(&c, 2, &v) {
+            return TimeError::Syntax
+        }
+        if v > 59 {
+            return TimeError::Range
+        }
+        t.second = v as u32
+        if cur_eat(&c, 46 as u8) || cur_eat(&c, 44 as u8) {
+            var digits: usize = 0
+            var ms: u32 = 0
+            while cur_peek(&c) >= 48 as u8 && cur_peek(&c) <= 57 as u8 && c.i < c.s.length() {
+                if digits < 3 {
+                    ms = ms * 10 + (cur_peek(&c) - 48 as u8) as u32
+                }
+                digits = digits + 1
+                c.i = c.i + 1
+            }
+            if digits == 0 || digits > 9 {
+                return TimeError::Syntax
+            }
+            var k: usize = digits
+            while k < 3 {
+                ms = ms * 10
+                k = k + 1
+            }
+            t.ms = ms
+        }
+    }
+    // the offset
+    if c.i == c.s.length() {
+        return t
+    }
+    if cur_eat(&c, 90 as u8) || cur_eat(&c, 122 as u8) {
+        if c.i != c.s.length() {
+            return TimeError::Syntax
+        }
+        return t
+    }
+    var osign: i32 = 1
+    if cur_eat(&c, 45 as u8) {
+        osign = -1
+    } else if !cur_eat(&c, 43 as u8) {
+        return TimeError::Syntax
+    }
+    if !cur_digits(&c, 2, &v) {
+        return TimeError::Syntax
+    }
+    let oh: i64 = v
+    var om: i64 = 0
+    if c.i < c.s.length() {
+        cur_eat(&c, 58 as u8)
+        if !cur_digits(&c, 2, &v) {
+            return TimeError::Syntax
+        }
+        om = v
+    }
+    if c.i != c.s.length() {
+        return TimeError::Syntax
+    }
+    if oh > 23 || om > 59 {
+        return TimeError::Range
+    }
+    t.offset_min = osign * (oh * 60 + om) as i32
+    return t
+}
+
+// ----------------------------------------------------- Time zones (TZif)
+
+// A loaded zone: the transitions (UTC seconds), the type index of each, the
+// types (offset seconds, dst flag) and the POSIX rule of the footer.
+struct Tz {
+    data: rt.Buf, // the whole file
+    times: u64, // offset in data of the transition times
+    tsize: usize, // 4 (v1) or 8 (v2+)
+    count: usize, // number of transitions
+    idx: u64, // offset of the type indices
+    types: u64, // offset of the ttinfo records (6 octets each)
+    ntypes: usize,
+    rule: str, // footer ("" if none)
+    ok: bool,
+}
+
+fn tz_new() -> Tz {
+    return Tz { data: rt.buf_new(), times: 0, tsize: 4, count: 0, idx: 0, types: 0, ntypes: 0, rule: "", ok: false }
+}
+
+fn tz_free(z: *mut Tz) {
+    rt.buf_free(&(*z).data)
+    (*z).ok = false
+}
+
+fn be32(p: u64) -> u32 {
+    return (rt.ld8(p, 0) as u32 << 24) | (rt.ld8(p, 1) as u32 << 16) | (rt.ld8(p, 2) as u32 << 8) | rt.ld8(p, 3) as u32
+}
+
+// big-endian two's complement -- `as` on a value out of range is a checked
+// error in the safe build levels, so the sign is applied by hand
+fn be32s(p: u64) -> i64 {
+    let v: i64 = be32(p) as i64
+    if v >= 2147483648 {
+        return v - 4294967296
+    }
+    return v
+}
+
+fn be64(p: u64) -> i64 {
+    let v: u64 = (be32(p) as u64 << 32) | be32(p + 4) as u64
+    if v >= 9223372036854775808 {
+        return ((v - 9223372036854775808) as i64) - 9223372036854775807 - 1
+    }
+    return v as i64
+}
+
+// Reads a TZif file (e.g. "/usr/share/zoneinfo/Europe/Vienna").
+fn tz_load(path: str, z: *mut Tz) -> TimeError!bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.length())
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(TIME_SYS_OPEN, rt.buf_ptr(&c) as i64, 524288, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return TimeError::NoZone
+    }
+    rt.buf_clear(&(*z).data)
+    while true {
+        rt.buf_reserve(&(*z).data, (*z).data.len + 4096)
+        if (*z).data.cap < (*z).data.len + 4096 {
+            break
+        }
+        let r: i64 = syscall(TIME_SYS_READ, fd, (rt.buf_ptr(&(*z).data) + (*z).data.len as u64) as i64, 4096, 0, 0, 0)
+        if r <= 0 {
+            break
+        }
+        rt.buf_set_len(&(*z).data, (*z).data.len + r as usize)
+        if (*z).data.len > 1048576 {
+            break // no zone file is that large
+        }
+    }
+    syscall(TIME_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return try tz_parse(z)
+}
+
+// Parses the octets already in `z.data`.
+fn tz_parse(z: *mut Tz) -> TimeError!bool {
+    (*z).ok = false
+    let base: u64 = rt.buf_ptr(&(*z).data)
+    let n: usize = (*z).data.len
+    if n < 44 || rt.ld8(base, 0) != 84 as u8 || rt.ld8(base, 1) != 90 as u8 || rt.ld8(base, 2) != 105 as u8 || rt.ld8(base, 3) != 102 as u8 {
+        return TimeError::BadZone
+    }
+    let version: u8 = rt.ld8(base, 4)
+    var h: u64 = base
+    var tsize: usize = 4
+    // v1 block sizes
+    var isut: usize = be32(h + 20) as usize
+    var isstd: usize = be32(h + 24) as usize
+    var leap: usize = be32(h + 28) as usize
+    var timecnt: usize = be32(h + 32) as usize
+    var typecnt: usize = be32(h + 36) as usize
+    var charcnt: usize = be32(h + 40) as usize
+    var body: usize = timecnt * 5 + typecnt * 6 + charcnt + leap * 8 + isstd + isut
+    if 44 + body > n {
+        return TimeError::BadZone
+    }
+    if version >= 50 as u8 {
+        // '2', '3', '4': skip the v1 block, use the 64-bit one
+        h = base + 44 + body as u64
+        if 44 + body + 44 > n || rt.ld8(h, 0) != 84 as u8 {
+            return TimeError::BadZone
+        }
+        tsize = 8
+        isut = be32(h + 20) as usize
+        isstd = be32(h + 24) as usize
+        leap = be32(h + 28) as usize
+        timecnt = be32(h + 32) as usize
+        typecnt = be32(h + 36) as usize
+        charcnt = be32(h + 40) as usize
+        body = timecnt * 9 + typecnt * 6 + charcnt + leap * 12 + isstd + isut
+        if (h - base) as usize + 44 + body > n {
+            return TimeError::BadZone
+        }
+    }
+    if typecnt == 0 {
+        return TimeError::BadZone
+    }
+    (*z).tsize = tsize
+    (*z).times = h + 44 - base
+    (*z).count = timecnt
+    (*z).idx = (*z).times + (timecnt * tsize) as u64
+    (*z).types = (*z).idx + timecnt as u64
+    (*z).ntypes = typecnt
+    // every index must name a type
+    var i: usize = 0
+    while i < timecnt {
+        if rt.ld8(base + (*z).idx, i) as usize >= typecnt {
+            return TimeError::BadZone
+        }
+        i = i + 1
+    }
+    (*z).rule = ""
+    if tsize == 8 {
+        // footer: "\n<rule>\n"
+        let f: usize = (h - base) as usize + 44 + body
+        if f < n && rt.ld8(base, f) == 10 as u8 {
+            var e: usize = f + 1
+            while e < n && rt.ld8(base, e) != 10 as u8 {
+                e = e + 1
+            }
+            if e < n {
+                (*z).rule = __str_copy(str { p: rt.ptr_of(base + f as u64 + 1), n: e - f - 1 })
+            }
+        }
+    }
+    (*z).ok = true
+    return true
+}
+
+fn tz_time(z: *mut Tz, i: usize) -> i64 {
+    let p: u64 = rt.buf_ptr(&(*z).data) + (*z).times
+    if (*z).tsize == 8 {
+        return be64(p + (i * 8) as u64)
+    }
+    return be32s(p + (i * 4) as u64)
+}
+
+fn tz_type_off(z: *mut Tz, k: usize) -> i64 {
+    let p: u64 = rt.buf_ptr(&(*z).data) + (*z).types + (k * 6) as u64
+    return be32s(p)
+}
+
+// ---- the POSIX TZ rule of the footer
+
+struct Rule {
+    std_off: i64, // seconds EAST of UTC (the rule text has them west)
+    dst_off: i64,
+    has_dst: bool,
+    // start and end: kind 0 = Mm.w.d, 1 = Jn, 2 = n; time in seconds
+    s_kind: u32,
+    s_a: i64,
+    s_b: i64,
+    s_c: i64,
+    s_time: i64,
+    e_kind: u32,
+    e_a: i64,
+    e_b: i64,
+    e_c: i64,
+    e_time: i64,
+}
+
+fn r_name(c: *mut Cursor) -> bool {
+    if cur_eat(c, 60 as u8) {
+        // <+03> -- quoted
+        while (*c).i < (*c).s.length() && cur_peek(c) != 62 as u8 {
+            (*c).i = (*c).i + 1
+        }
+        return cur_eat(c, 62 as u8)
+    }
+    var k: usize = 0
+    while (*c).i < (*c).s.length() {
+        let ch: u8 = cur_peek(c)
+        let letter: bool = (ch >= 65 as u8 && ch <= 90 as u8) || (ch >= 97 as u8 && ch <= 122 as u8)
+        if !letter {
+            break
+        }
+        (*c).i = (*c).i + 1
+        k = k + 1
+    }
+    return k >= 3
+}
+
+fn r_num(c: *mut Cursor, out: *mut i64) -> bool {
+    var v: i64 = 0
+    var k: usize = 0
+    while (*c).i < (*c).s.length() && cur_peek(c) >= 48 as u8 && cur_peek(c) <= 57 as u8 {
+        v = v * 10 + (cur_peek(c) - 48 as u8) as i64
+        (*c).i = (*c).i + 1
+        k = k + 1
+    }
+    *out = v
+    return k > 0
+}
+
+// [+-]hh[:mm[:ss]] in seconds
+fn r_time(c: *mut Cursor, out: *mut i64) -> bool {
+    var sign: i64 = 1
+    if cur_eat(c, 45 as u8) {
+        sign = -1
+    } else {
+        cur_eat(c, 43 as u8)
+    }
+    var h: i64 = 0
+    if !r_num(c, &h) {
+        return false
+    }
+    var m: i64 = 0
+    var s: i64 = 0
+    if cur_eat(c, 58 as u8) {
+        if !r_num(c, &m) { return false }
+        if cur_eat(c, 58 as u8) {
+            if !r_num(c, &s) { return false }
+        }
+    }
+    *out = sign * (h * 3600 + m * 60 + s)
+    return true
+}
+
+// one of "Mm.w.d", "Jn", "n", with an optional "/time" (default 02:00)
+fn r_date(c: *mut Cursor, kind: *mut u32, a: *mut i64, b: *mut i64, d: *mut i64, time: *mut i64) -> bool {
+    if cur_eat(c, 77 as u8) {
+        *kind = 0 as u32
+        if !r_num(c, a) || !cur_eat(c, 46 as u8) || !r_num(c, b) || !cur_eat(c, 46 as u8) || !r_num(c, d) {
+            return false
+        }
+        if *a < 1 || *a > 12 || *b < 1 || *b > 5 || *d > 6 {
+            return false
+        }
+    } else if cur_eat(c, 74 as u8) {
+        *kind = 1 as u32
+        if !r_num(c, a) || *a < 1 || *a > 365 {
+            return false
+        }
+    } else {
+        *kind = 2 as u32
+        if !r_num(c, a) || *a > 365 {
+            return false
+        }
+    }
+    *time = 7200
+    if cur_eat(c, 47 as u8) {
+        if !r_time(c, time) {
+            return false
+        }
+    }
+    return true
+}
+
+fn rule_parse(text: str, r: *mut Rule) -> bool {
+    var c: Cursor = Cursor { s: text, i: 0 }
+    if !r_name(&c) {
+        return false
+    }
+    var off: i64 = 0
+    if !r_time(&c, &off) {
+        return false
+    }
+    (*r).std_off = 0 - off
+    (*r).has_dst = false
+    if c.i == c.s.length() {
+        return true
+    }
+    if !r_name(&c) {
+        return false
+    }
+    (*r).has_dst = true
+    (*r).dst_off = (*r).std_off + 3600
+    if c.i < c.s.length() && cur_peek(&c) != 44 as u8 {
+        if !r_time(&c, &off) {
+            return false
+        }
+        (*r).dst_off = 0 - off
+    }
+    if !cur_eat(&c, 44 as u8) {
+        // no rule given: POSIX leaves it to the implementation; tzdata never
+        // writes that, so it is refused rather than guessed
+        return false
+    }
+    if !r_date(&c, &(*r).s_kind, &(*r).s_a, &(*r).s_b, &(*r).s_c, &(*r).s_time) {
+        return false
+    }
+    if !cur_eat(&c, 44 as u8) {
+        return false
+    }
+    if !r_date(&c, &(*r).e_kind, &(*r).e_a, &(*r).e_b, &(*r).e_c, &(*r).e_time) {
+        return false
+    }
+    return c.i == c.s.length()
+}
+
+// the local day number (since 1970) of a rule date in `year`
+fn rule_day(kind: u32, a: i64, b: i64, d: i64, year: i32) -> i64 {
+    let jan1: i64 = days_from_civil(year, 1 as u32, 1 as u32)
+    if kind == 1 as u32 {
+        // Jn: 1..365, 29 February never counted
+        var n: i64 = a - 1
+        if is_leap_year(year) && a >= 60 {
+            n = n + 1
+        }
+        return jan1 + n
+    }
+    if kind == 2 as u32 {
+        return jan1 + a // n: 0..365, 29 February counted
+    }
+    // Mm.w.d: day d (0 = Sunday) of week w (5 = last) of month m
+    let first: i64 = days_from_civil(year, a as u32, 1 as u32)
+    let wd_first: i64 = (first % 7 + 7 + 4) % 7 // 0 = Sunday; 1970-01-01 was Thursday
+    var day: i64 = first + (d - wd_first + 7) % 7 + (b - 1) * 7
+    let last: i64 = first + days_in_month(year, a as u32) as i64 - 1
+    while day > last {
+        day = day - 7
+    }
+    return day
+}
+
+// offset in seconds at UTC second `t` under the rule
+fn rule_offset(r: *mut Rule, t: i64) -> i64 {
+    if !(*r).has_dst {
+        return (*r).std_off
+    }
+    let year: i32 = civil_at((t + (*r).std_off) * 1000, 0 as i32).year
+    // the start is given in local STANDARD time, the end in local DST time
+    let start: i64 = rule_day((*r).s_kind, (*r).s_a, (*r).s_b, (*r).s_c, year) * 86400 + (*r).s_time - (*r).std_off
+    let end: i64 = rule_day((*r).e_kind, (*r).e_a, (*r).e_b, (*r).e_c, year) * 86400 + (*r).e_time - (*r).dst_off
+    if start < end {
+        if t >= start && t < end {
+            return (*r).dst_off
+        }
+        return (*r).std_off
+    }
+    // southern hemisphere: DST across the new year
+    if t >= end && t < start {
+        return (*r).std_off
+    }
+    return (*r).dst_off
+}
+
+// The footer rule as text ("" if the file has none).
+fn tz_rule(z: *mut Tz) -> str {
+    return (*z).rule
+}
+
+// The offset from UTC in minutes at the instant `ms` (ms since 1970, UTC).
+fn tz_offset_min(z: *mut Tz, ms: i64) -> TimeError!i32 {
+    if !(*z).ok {
+        return TimeError::BadZone
+    }
+    let t: i64 = floor_div(ms, 1000)
+    let n: usize = (*z).count
+    if n > 0 && t < tz_time(z, 0) {
+        // before the first transition: type 0 (RFC 8536 3.2)
+        return (floor_div(tz_type_off(z, 0), 60)) as i32
+    }
+    if n == 0 || t >= tz_time(z, n - 1) {
+        if (*z).rule.length() > 0 {
+            var r: Rule = Rule { std_off: 0, dst_off: 0, has_dst: false, s_kind: 0 as u32, s_a: 0, s_b: 0, s_c: 0,
+                s_time: 0, e_kind: 0 as u32, e_a: 0, e_b: 0, e_c: 0, e_time: 0 }
+            if !rule_parse((*z).rule, &r) {
+                return TimeError::BadZone
+            }
+            return floor_div(rule_offset(&r, t), 60) as i32
+        }
+        if n == 0 {
+            return floor_div(tz_type_off(z, 0), 60) as i32
+        }
+    }
+    // binary search: the last transition <= t
+    var lo: usize = 0
+    var hi: usize = n
+    while hi - lo > 1 {
+        let mid: usize = (lo + hi) / 2
+        if tz_time(z, mid) <= t {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    let k: usize = rt.ld8(rt.buf_ptr(&(*z).data) + (*z).idx, lo) as usize
+    return floor_div(tz_type_off(z, k), 60) as i32
+}
+
+// The local offset at `ms`, from /etc/localtime. A system without that file
+// is `TimeError::NoZone` -- the caller decides whether UTC is good enough.
+fn local_offset_min(ms: i64) -> TimeError!i32 {
+    var z: Tz = tz_new()
+    let loaded: bool = tz_load("/etc/localtime", &z) catch false
+    if !loaded {
+        tz_free(&z)
+        return TimeError::NoZone
+    }
+    var bad: bool = false
+    let off: i32 = tz_offset_min(&z, ms) catch |e| (zone_fail(&bad))
+    tz_free(&z)
+    if bad {
+        return TimeError::BadZone
+    }
+    return off
+}
+
+fn zone_fail(flag: *mut bool) -> i32 {
+    *flag = true
+    return 0 as i32
+}
+
+// The local civil time at `ms` (offset_min set).
+fn local_from_unix(ms: i64) -> TimeError!DateTime {
+    let off: i32 = try local_offset_min(ms)
+    return civil_at(ms, off)
+}

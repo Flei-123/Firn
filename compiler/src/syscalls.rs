@@ -216,8 +216,14 @@ const TABLE: &[(i64, A64)] = &[
     (231, A64::Direct(94)),          // exit_group
     (257, A64::Direct(56)),          // openat
     (262, A64::Direct(79)),          // newfstatat
+    // OPENPLAN LIB-001 (std.fs): rmdir has no generic form -- std.fs calls
+    // unlinkat(AT_FDCWD, path, AT_REMOVEDIR) itself, and statx because its
+    // record has ONE layout on every machine (struct stat has two).
+    (263, A64::Direct(35)),          // unlinkat
+    (266, A64::Direct(36)),          // symlinkat (std.fs.symlink)
     (288, A64::Direct(242)),         // accept4
     (318, A64::Direct(278)),         // getrandom
+    (332, A64::Direct(291)),         // statx
 ];
 
 /// The AArch64 form of the canonical (x86-64) system call number `n`.
@@ -353,8 +359,11 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (231, "exit_group", Wasm::Exit),
     (257, "openat", Wasm::Missing(NO_FILES)),
     (262, "newfstatat", Wasm::Missing(NO_FILES)),
+    (263, "unlinkat", Wasm::Missing(NO_FILES)),
+    (266, "symlinkat", Wasm::Missing(NO_FILES)),
     (288, "accept4", Wasm::Missing(NO_SOCKETS)),
     (318, "getrandom", Wasm::Getrandom),
+    (332, "statx", Wasm::Missing(NO_FILES)),
 ];
 
 /// The browser form of the canonical (x86-64) system call number `n`,

@@ -125,7 +125,7 @@ export {
     // checksums
     adler32, adler32_more, CrcTable, crc_table, crc32, crc32_more,
     // raw DEFLATE
-    inflate, deflate,
+    inflate, deflate, inflate_limited,
     // the two frames
     zlib_decompress, zlib_compress, gzip_decompress, gzip_compress,
     // introspection, for the proofs
@@ -138,6 +138,7 @@ error DeflateError {
     OutOfMemory,
     Checksum, // Adler-32/CRC-32/ISIZE does not match
     Truncated, // the input ended in the middle of something
+    TooLarge, // more output than the caller allowed (inflate_limited)
 }
 
 const WSIZE: usize = 32768
@@ -316,6 +317,14 @@ struct Inflater {
     bitcnt: usize,
     out: u64, // *mut rt.Buf as a number -- see `out_buf`
     ran_out: bool, // the input ended in the middle of a symbol
+    // OpenPlan LIB-004: where this stream's output starts in `out` (a
+    // distance may not reach in front of it, into what the caller had in
+    // the buffer before), and the most octets it may produce (0 = no
+    // limit) -- the guard against a small archive entry that inflates to
+    // gigabytes.
+    base: usize,
+    limit: usize,
+    over: bool,
 }
 
 fn out_buf(s: *mut Inflater) -> *mut rt.Buf {
@@ -426,6 +435,10 @@ fn huff_decode(s: *mut Inflater, h: *mut Huff) -> i32 {
 // buffer; `rt.buf_push` would do the same thing plus a call per octet.
 fn out_push(s: *mut Inflater, v: u8) -> bool {
     let b: *mut rt.Buf = out_buf(s)
+    if (*s).limit > 0 && (*b).len - (*s).base >= (*s).limit {
+        (*s).over = true
+        return false
+    }
     if (*b).len == (*b).cap {
         // `buf_reserve` wants the TOTAL capacity, not the additional one.
         rt.buf_reserve(b, (*b).len + 1)
@@ -461,6 +474,9 @@ fn inflate_stored(s: *mut Inflater) -> DeflateError!bool {
         return DeflateError::Truncated
     }
     let b: *mut rt.Buf = out_buf(s)
+    if (*s).limit > 0 && (*b).len - (*s).base + len > (*s).limit {
+        return DeflateError::TooLarge
+    }
     rt.buf_reserve(b, (*b).len + len)
     if (*b).cap < (*b).len + len {
         return DeflateError::OutOfMemory
@@ -485,6 +501,9 @@ fn inflate_codes(s: *mut Inflater, lit: *mut Huff, dst: *mut Huff,
         }
         if sym < 256 {
             if !out_push(s, sym as u8) {
+                if (*s).over {
+                    return DeflateError::TooLarge
+                }
                 return DeflateError::OutOfMemory
             }
         } else if sym as usize == ENDBLOCK {
@@ -509,12 +528,15 @@ fn inflate_codes(s: *mut Inflater, lit: *mut Huff, dst: *mut Huff,
             if (*s).ran_out {
                 return DeflateError::Truncated
             }
-            if dist > out_len(s) {
+            if dist > out_len(s) - (*s).base {
                 return DeflateError::Data // reaches in front of the output
             }
             // OCTET BY OCTET, on purpose: `dist` may be smaller than `len`,
             // and then the copy reads what it has just written.
             let b: *mut rt.Buf = out_buf(s)
+            if (*s).limit > 0 && (*b).len - (*s).base + len > (*s).limit {
+                return DeflateError::TooLarge
+            }
             rt.buf_reserve(b, (*b).len + len)
             if (*b).cap < (*b).len + len {
                 return DeflateError::OutOfMemory
@@ -639,8 +661,15 @@ fn inflate_dynamic(s: *mut Inflater, lit: *mut Huff, dst: *mut Huff,
 // Raw DEFLATE into `out` (appended). The return value is the number of
 // octets written.
 fn inflate_into(src: u64, n: usize, out: *mut rt.Buf) -> DeflateError!usize {
+    return inflate_limited(src, n, 0, out)
+}
+
+// Raw DEFLATE into `out` (appended), producing at most `max` octets (0 = no
+// limit); more is `DeflateError::TooLarge`, and nothing beyond `max` is ever
+// written.
+fn inflate_limited(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> DeflateError!usize {
     var s: Inflater = Inflater { src: src, srclen: n, pos: 0, bitbuf: 0,
-        bitcnt: 0, out: out as u64, ran_out: false }
+        bitcnt: 0, out: out as u64, ran_out: false, base: (*out).len, limit: max, over: false }
     var c: Codes = codes_new()
     let before: usize = (*out).len
 

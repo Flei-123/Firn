@@ -1,0 +1,823 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/zip/zip.fi -- ZIP archives: read and write, with ZIP64.
+//
+// OpenPlan LIB-004. OpenPlan's .opz container, snapshots and packages are
+// ZIP files, and so is every XLSX file. The compression (DEFLATE) and the
+// checksum (CRC-32) already existed in lib/std/deflate.fi; this file is the
+// container around them (APPNOTE.TXT 6.3.10, PKWARE).
+//
+//     import zip.zip
+//     var z: zip.ZipReader = zip.zip_reader_open(p, n) catch |e| ...
+//     var i: usize = 0
+//     while i < zip.zip_entry_count(&z) {
+//         let name: str = zip.zip_entry_name(&z, i)
+//         zip.zip_extract(&z, i, &out) catch |e| ...
+//         i = i + 1
+//     }
+//     zip.zip_reader_free(&z)
+//
+//     var w: zip.ZipWriter = zip.zip_writer_new(&out)
+//     zip.zip_add(&w, "project.json", p, n, true) catch |e| ...
+//     zip.zip_finish(&w) catch |e| ...
+//
+// WHAT A READER REFUSES, and why -- an archive is input from strangers:
+//   * NAMES THAT LEAVE THE TARGET ("zip slip"): an absolute path, a drive
+//     letter, a backslash, a "." or ".." component, an empty component, a
+//     zero octet. OpenPlan never writes such a name, so an archive that has
+//     one is refused as a whole (`UnsafeName`) instead of being "cleaned".
+//     `zip_name_is_safe` is the same test for a caller's own names.
+//   * THE SAME NAME TWICE (`Duplicate`): two tools would pick different
+//     copies, which is how signed archives get content swapped under them.
+//   * SIZE BOMBS: every entry and the sum of all entries must stay under
+//     `ZipLimits`, measured on the DECLARED sizes when the archive is
+//     opened and on the REAL output while inflating (lib/std/deflate.fi
+//     `inflate_limited` stops at the declared size, so a lying header
+//     cannot make it write more). Entries whose data OVERLAP (the
+//     "better zip bomb", Fifield 2019) are refused when the archive is
+//     opened.
+//   * encryption (`Encrypted`) and methods other than store and DEFLATE
+//     (`Unsupported`); a CRC-32 that does not match (`Checksum`).
+//
+// WHAT A WRITER WRITES: UTF-8 names (general purpose flag bit 11), store or
+// DEFLATE per entry (DEFLATE only where it is smaller), CRC-32, and ZIP64
+// records as soon as a size, an offset or the entry count needs them. The
+// time stamp is 1980-01-01 00:00 unless `zip_set_time` sets one -- the same
+// input gives the same octets, which a golden test can compare.
+
+import std.rt
+import std.vec
+import std.map
+import std.deflate
+import std.time
+
+export {
+    ZipError, ZipReader, ZipWriter, ZipLimits,
+    zip_limits_default, zip_reader_open, zip_reader_open_limits, zip_reader_free,
+    zip_entry_count, zip_entry_name, zip_entry_size, zip_entry_compressed_size,
+    zip_entry_is_dir, zip_entry_crc, zip_entry_method, zip_find, zip_extract,
+    zip_name_is_safe,
+    zip_writer_new, zip_set_time, zip_add, zip_add_dir, zip_finish, zip_writer_free,
+    ZIP_STORE, ZIP_DEFLATE,
+}
+
+error ZipError {
+    NotZip, // no end of central directory record
+    Corrupt, // a record or an offset that contradicts the file
+    Unsupported, // a method other than store/DEFLATE, a multi-disk archive
+    Encrypted,
+    UnsafeName, // see the head of the file
+    Duplicate, // the same name twice
+    TooLarge, // over the limits
+    Checksum, // CRC-32 does not match
+    Finished, // zip_add after zip_finish
+    OutOfMemory,
+}
+
+const ZIP_STORE: u32 = 0
+const ZIP_DEFLATE: u32 = 8
+
+const SIG_LOCAL: u64 = 67324752 // 0x04034b50
+const SIG_CENTRAL: u64 = 33639248 // 0x02014b50
+const SIG_EOCD: u64 = 101010256 // 0x06054b50
+const SIG_EOCD64: u64 = 101075792 // 0x06064b50
+const SIG_LOC64: u64 = 117853008 // 0x07064b50
+const U32_MAX: u64 = 4294967295
+const U16_MAX: u64 = 65535
+
+struct ZipLimits {
+    max_entries: usize,
+    max_entry_size: u64, // uncompressed, one entry
+    max_total_size: u64, // uncompressed, all entries together
+}
+
+fn zip_limits_default() -> ZipLimits {
+    // 1 GiB per entry, 4 GiB in total, 200,000 entries: far above any
+    // OpenPlan project, far below what fills a disk
+    return ZipLimits { max_entries: 200000, max_entry_size: 1073741824, max_total_size: 4294967296 }
+}
+
+struct ZipEntry {
+    name_off: usize, // in the archive
+    name_len: usize,
+    flags: u32,
+    method: u32,
+    crc: u32,
+    csize: u64,
+    usize: u64,
+    local: u64, // offset of the local header
+    data: u64, // offset of the data (after the local header)
+    is_dir: bool,
+}
+
+struct ZipReader {
+    data: u64,
+    n: usize,
+    entries: Vec[ZipEntry],
+}
+
+// ------------------------------------------------------------ Octets
+
+fn le16(p: u64) -> u64 {
+    return rt.ld8(p, 0) as u64 | (rt.ld8(p, 1) as u64 << 8)
+}
+
+fn le32(p: u64) -> u64 {
+    return le16(p) | (le16(p + 2) << 16)
+}
+
+fn le64(p: u64) -> u64 {
+    return le32(p) | (le32(p + 4) << 32)
+}
+
+fn put16(b: *mut rt.Buf, v: u64) {
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+}
+
+fn put32(b: *mut rt.Buf, v: u64) {
+    put16(b, v & 65535)
+    put16(b, (v >> 16) & 65535)
+}
+
+fn put64(b: *mut rt.Buf, v: u64) {
+    put32(b, v & U32_MAX)
+    put32(b, v >> 32)
+}
+
+// ------------------------------------------------------------ Names
+
+fn utf8_ok(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        let c: u32 = rt.ld8(p, i) as u32
+        if c < 128 {
+            i = i + 1
+        } else {
+            var more: usize = 0
+            var min: u32 = 0
+            var cp: u32 = 0
+            if c >= 194 && c <= 223 {
+                more = 1
+                min = 128
+                cp = c & 31
+            } else if c >= 224 && c <= 239 {
+                more = 2
+                min = 2048
+                cp = c & 15
+            } else if c >= 240 && c <= 244 {
+                more = 3
+                min = 65536
+                cp = c & 7
+            } else {
+                return false
+            }
+            var k: usize = 1
+            while k <= more {
+                if i + k >= n {
+                    return false
+                }
+                let d: u32 = rt.ld8(p, i + k) as u32
+                if (d & 192) != 128 {
+                    return false
+                }
+                cp = (cp << 6) | (d & 63)
+                k = k + 1
+            }
+            if cp < min || cp > 1114111 || (cp >= 55296 && cp <= 57343) {
+                return false
+            }
+            i = i + more + 1
+        }
+    }
+    return true
+}
+
+fn name_safe_raw(p: u64, n: usize) -> bool {
+    if n == 0 || n > 65535 {
+        return false
+    }
+    if rt.ld8(p, 0) == 47 as u8 {
+        return false // absolute
+    }
+    if n >= 2 && rt.ld8(p, 1) == 58 as u8 {
+        return false // "C:"
+    }
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        var c: u8 = 47 as u8
+        if i < n {
+            c = rt.ld8(p, i)
+        }
+        if c == 0 as u8 || c == 92 as u8 {
+            return false // zero octet, backslash
+        }
+        if c == 47 as u8 {
+            let len: usize = i - start
+            // an empty component is only allowed as the trailing "/" of a
+            // directory entry
+            if len == 0 && i != n {
+                return false
+            }
+            if len == 1 && rt.ld8(p, start) == 46 as u8 {
+                return false
+            }
+            if len == 2 && rt.ld8(p, start) == 46 as u8 && rt.ld8(p, start + 1) == 46 as u8 {
+                return false
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Whether `name` may stand in an archive of this library: relative, "/"
+// as the separator, no "." or ".." component, no empty component (except
+// the trailing "/" of a directory), no backslash, no drive letter, no zero
+// octet, valid UTF-8.
+fn zip_name_is_safe(name: str) -> bool {
+    return name_safe_raw(name.p as u64, name.n) && utf8_ok(name.p as u64, name.n)
+}
+
+fn name_hash(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < n {
+        h = (h ^ rt.ld8(p, i) as u64) *% 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+// ------------------------------------------------------------ Reading
+
+fn zip_reader_open(p: u64, n: usize) -> ZipError!ZipReader {
+    return try zip_reader_open_limits(p, n, zip_limits_default())
+}
+
+// the end of central directory record: the LAST signature that is followed
+// by exactly its comment
+fn find_eocd(p: u64, n: usize) -> i64 {
+    if n < 22 {
+        return -1
+    }
+    var i: usize = n - 22
+    var steps: usize = 0
+    while steps <= 65535 {
+        if le32(p + i as u64) == SIG_EOCD {
+            let clen: usize = le16(p + i as u64 + 20) as usize
+            if i + 22 + clen == n {
+                return i as i64
+            }
+        }
+        if i == 0 {
+            return -1
+        }
+        i = i - 1
+        steps = steps + 1
+    }
+    return -1
+}
+
+fn zip_reader_open_limits(p: u64, n: usize, lim: ZipLimits) -> ZipError!ZipReader {
+    let e: i64 = find_eocd(p, n)
+    if e < 0 {
+        return ZipError::NotZip
+    }
+    let eo: u64 = p + e as u64
+    var count: u64 = le16(eo + 10)
+    var cd_size: u64 = le32(eo + 12)
+    var cd_off: u64 = le32(eo + 16)
+    if le16(eo + 4) != 0 || le16(eo + 6) != 0 || le16(eo + 8) != count {
+        return ZipError::Unsupported // spanned / multi-disk
+    }
+    if count == U16_MAX || cd_size == U32_MAX || cd_off == U32_MAX {
+        // ZIP64: the locator stands right in front of the record
+        if e < 20 || le32(eo - 20) != SIG_LOC64 {
+            return ZipError::Corrupt
+        }
+        let z64: u64 = le64(eo - 12)
+        if z64 + 56 > e as u64 - 20 || le32(p + z64) != SIG_EOCD64 {
+            return ZipError::Corrupt
+        }
+        let r: u64 = p + z64
+        count = le64(r + 32)
+        cd_size = le64(r + 40)
+        cd_off = le64(r + 48)
+        if le32(r + 16) != 0 || le32(r + 20) != 0 || le64(r + 24) != count {
+            return ZipError::Unsupported
+        }
+    }
+    if count > lim.max_entries as u64 {
+        return ZipError::TooLarge
+    }
+    if cd_off > n as u64 || cd_size > n as u64 - cd_off || count * 46 > cd_size {
+        return ZipError::Corrupt
+    }
+    var z: ZipReader = ZipReader { data: p, n: n, entries: vec_new[ZipEntry]() }
+    var names: Map[u64, u64] = map_new[u64, u64]()
+    var total: u64 = 0
+    var pos: u64 = cd_off
+    let end: u64 = cd_off + cd_size
+    var k: u64 = 0
+    var fail: u32 = 0 // 0 = fine, else the error below
+    while k < count && fail == 0 {
+        if pos + 46 > end || le32(p + pos) != SIG_CENTRAL {
+            fail = 1
+            break
+        }
+        let c: u64 = p + pos
+        let nlen: u64 = le16(c + 28)
+        let xlen: u64 = le16(c + 30)
+        let clen: u64 = le16(c + 32)
+        if pos + 46 + nlen + xlen + clen > end || nlen == 0 {
+            fail = 1
+            break
+        }
+        var ent: ZipEntry = ZipEntry { name_off: (pos + 46) as usize, name_len: nlen as usize,
+            flags: le16(c + 8) as u32, method: le16(c + 10) as u32, crc: le32(c + 16) as u32,
+            csize: le32(c + 20), usize: le32(c + 24), local: le32(c + 42), data: 0, is_dir: false }
+        // ZIP64 extra field (id 1): the fields that are all ones, in order
+        if ent.usize == U32_MAX || ent.csize == U32_MAX || ent.local == U32_MAX {
+            var x: u64 = pos + 46 + nlen
+            let xe: u64 = x + xlen
+            var found: bool = false
+            while x + 4 <= xe && !found {
+                let id: u64 = le16(p + x)
+                let sz: u64 = le16(p + x + 2)
+                if x + 4 + sz > xe {
+                    break
+                }
+                if id == 1 {
+                    found = true
+                    var f: u64 = x + 4
+                    let fe: u64 = f + sz
+                    if ent.usize == U32_MAX {
+                        if f + 8 > fe {
+                            fail = 1
+                        } else {
+                            ent.usize = le64(p + f)
+                            f = f + 8
+                        }
+                    }
+                    if ent.csize == U32_MAX && fail == 0 {
+                        if f + 8 > fe {
+                            fail = 1
+                        } else {
+                            ent.csize = le64(p + f)
+                            f = f + 8
+                        }
+                    }
+                    if ent.local == U32_MAX && fail == 0 {
+                        if f + 8 > fe {
+                            fail = 1
+                        } else {
+                            ent.local = le64(p + f)
+                        }
+                    }
+                }
+                x = x + 4 + sz
+            }
+            if !found {
+                fail = 1
+            }
+            if fail != 0 {
+                break
+            }
+        }
+        let np: u64 = p + pos + 46
+        if !name_safe_raw(np, nlen as usize) {
+            fail = 2
+            break
+        }
+        if (ent.flags & 2048) != 0 && !utf8_ok(np, nlen as usize) {
+            fail = 2
+            break
+        }
+        if (ent.flags & 1) != 0 {
+            fail = 3
+            break
+        }
+        ent.is_dir = rt.ld8(np, nlen as usize - 1) == 47 as u8
+        // the same name twice. A second, DIFFERENT name with the same 64-bit
+        // hash would be refused as well -- the safe side, and astronomically
+        // unlikely.
+        let h: u64 = name_hash(np, nlen as usize)
+        if map_has[u64, u64](&names, h) {
+            fail = 4
+            break
+        }
+        map_set[u64, u64](&names, h, k)
+        // the local header, and where the data begins
+        if ent.local > n as u64 || ent.local + 30 > n as u64 || le32(p + ent.local) != SIG_LOCAL {
+            fail = 1
+            break
+        }
+        let lnl: u64 = le16(p + ent.local + 26)
+        let lxl: u64 = le16(p + ent.local + 28)
+        ent.data = ent.local + 30 + lnl + lxl
+        if ent.data > n as u64 || ent.csize > n as u64 - ent.data {
+            fail = 1
+            break
+        }
+        if ent.data + ent.csize > cd_off {
+            fail = 1 // data reaching into the central directory
+            break
+        }
+        if ent.usize > lim.max_entry_size {
+            fail = 5
+            break
+        }
+        total = total + ent.usize
+        if total > lim.max_total_size {
+            fail = 5
+            break
+        }
+        vec_push[ZipEntry](&z.entries, ent)
+        pos = pos + 46 + nlen + xlen + clen
+        k = k + 1
+    }
+    map_free[u64, u64](&names)
+    if fail == 0 && !no_overlap(&z) {
+        fail = 6
+    }
+    if fail != 0 {
+        vec_free[ZipEntry](&z.entries)
+        if fail == 2 { return ZipError::UnsafeName }
+        if fail == 3 { return ZipError::Encrypted }
+        if fail == 4 { return ZipError::Duplicate }
+        if fail == 5 { return ZipError::TooLarge }
+        return ZipError::Corrupt
+    }
+    return z
+}
+
+// No two entries may share octets: sorted by local header offset, each
+// entry's data has to end before the next local header begins.
+fn no_overlap(z: *mut ZipReader) -> bool {
+    let n: usize = vec_len[ZipEntry](&(*z).entries)
+    if n < 2 {
+        return true
+    }
+    var keys: Vec[u64] = vec_new[u64]()
+    var i: usize = 0
+    while i < n {
+        let e: *mut ZipEntry = vec_elem_ptr[ZipEntry](&(*z).entries, i)
+        // offset in the high bits, index in the low 20 (n <= 200000 < 2^20
+        // by the limit; an archive over 2^44 octets does not fit in memory)
+        vec_push[u64](&keys, ((*e).local << 20) | i as u64)
+        i = i + 1
+    }
+    vec_sort[u64](&keys)
+    var ok: bool = true
+    i = 0
+    while i + 1 < n && ok {
+        let a: *mut ZipEntry = vec_elem_ptr[ZipEntry](&(*z).entries, (vec_at[u64](&keys, i) & 1048575) as usize)
+        let b: *mut ZipEntry = vec_elem_ptr[ZipEntry](&(*z).entries, (vec_at[u64](&keys, i + 1) & 1048575) as usize)
+        if (*a).data + (*a).csize > (*b).local {
+            ok = false
+        }
+        i = i + 1
+    }
+    vec_free[u64](&keys)
+    return ok
+}
+
+fn zip_reader_free(z: *mut ZipReader) {
+    vec_free[ZipEntry](&(*z).entries)
+}
+
+fn zip_entry_count(z: *mut ZipReader) -> usize {
+    return vec_len[ZipEntry](&(*z).entries)
+}
+
+fn ent_at(z: *mut ZipReader, i: usize) -> *mut ZipEntry {
+    return vec_elem_ptr[ZipEntry](&(*z).entries, i)
+}
+
+// The name as it stands in the archive (a view into the archive's octets).
+fn zip_entry_name(z: *mut ZipReader, i: usize) -> str {
+    let e: *mut ZipEntry = ent_at(z, i)
+    return str { p: rt.ptr_of((*z).data + (*e).name_off as u64), n: (*e).name_len }
+}
+
+fn zip_entry_size(z: *mut ZipReader, i: usize) -> u64 {
+    return (*ent_at(z, i)).usize
+}
+
+fn zip_entry_compressed_size(z: *mut ZipReader, i: usize) -> u64 {
+    return (*ent_at(z, i)).csize
+}
+
+fn zip_entry_is_dir(z: *mut ZipReader, i: usize) -> bool {
+    return (*ent_at(z, i)).is_dir
+}
+
+fn zip_entry_crc(z: *mut ZipReader, i: usize) -> u32 {
+    return (*ent_at(z, i)).crc
+}
+
+fn zip_entry_method(z: *mut ZipReader, i: usize) -> u32 {
+    return (*ent_at(z, i)).method
+}
+
+// The index of the entry called `name`, or -1.
+fn zip_find(z: *mut ZipReader, name: str) -> i64 {
+    let n: usize = zip_entry_count(z)
+    var i: usize = 0
+    while i < n {
+        if zip_entry_name(z, i) == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Appends the uncompressed content of entry `i` to `out`; the answer is its
+// length. On an error `out` is left as it was.
+fn zip_extract(z: *mut ZipReader, i: usize, out: *mut rt.Buf) -> ZipError!usize {
+    if i >= zip_entry_count(z) {
+        return ZipError::Corrupt
+    }
+    let e: *mut ZipEntry = ent_at(z, i)
+    let before: usize = (*out).len
+    let src: u64 = (*z).data + (*e).data
+    if (*e).method == ZIP_STORE {
+        if (*e).csize != (*e).usize {
+            return ZipError::Corrupt
+        }
+        rt.buf_reserve(out, before + (*e).csize as usize)
+        if (*out).cap < before + (*e).csize as usize {
+            return ZipError::OutOfMemory
+        }
+        rt.buf_push_bytes(out, src, (*e).csize as usize)
+    } else if (*e).method == ZIP_DEFLATE {
+        var lim: usize = (*e).usize as usize
+        if lim == 0 {
+            lim = 1 // 0 would mean "no limit"; one octet too many is caught below
+        }
+        var why: u32 = 0
+        let got: usize = deflate.inflate_limited(src, (*e).csize as usize, lim, out) catch |d| (inflate_fail(d, &why))
+        if why != 0 {
+            rt.buf_set_len(out, before)
+            if why == 2 { return ZipError::TooLarge }
+            if why == 3 { return ZipError::OutOfMemory }
+            return ZipError::Corrupt
+        }
+        if got as u64 != (*e).usize {
+            rt.buf_set_len(out, before)
+            return ZipError::Corrupt
+        }
+    } else {
+        return ZipError::Unsupported
+    }
+    let got2: usize = (*out).len - before
+    let crc: u32 = deflate.crc32(rt.buf_ptr(out) + before as u64, got2)
+    if crc != (*e).crc {
+        rt.buf_set_len(out, before)
+        return ZipError::Checksum
+    }
+    return got2
+}
+
+fn inflate_fail(d: DeflateError, why: *mut u32) -> usize {
+    if d == DeflateError::TooLarge {
+        *why = 2 as u32
+    } else if d == DeflateError::OutOfMemory {
+        *why = 3 as u32
+    } else {
+        *why = 1 as u32
+    }
+    return 0
+}
+
+// ------------------------------------------------------------ Writing
+
+struct ZipWriter {
+    out: u64, // *mut rt.Buf as a number (the caller owns the buffer)
+    start: usize, // where the archive begins in `out`
+    cd: rt.Buf, // the central directory, collected until zip_finish
+    count: u64,
+    dos_time: u64,
+    dos_date: u64,
+    finished: bool,
+    names: Map[u64, u64],
+}
+
+// A writer that APPENDS the archive to `out`.
+fn zip_writer_new(out: *mut rt.Buf) -> ZipWriter {
+    return ZipWriter { out: out as u64, start: (*out).len, cd: rt.buf_new(), count: 0,
+        dos_time: 0, dos_date: 33, finished: false, names: map_new[u64, u64]() }
+}
+
+fn zip_writer_free(w: *mut ZipWriter) {
+    rt.buf_free(&(*w).cd)
+    map_free[u64, u64](&(*w).names)
+}
+
+// The modification time written for every following entry (UTC; MS-DOS
+// time has two-second steps and covers 1980 to 2107 -- outside, it is
+// clamped).
+fn zip_set_time(w: *mut ZipWriter, ms: i64) {
+    var t: time.DateTime = time.civil_from_unix(ms)
+    if t.year < 1980 {
+        (*w).dos_time = 0
+        (*w).dos_date = 33
+        return
+    }
+    if t.year > 2107 {
+        t.year = 2107
+        t.month = 12 as u32
+        t.day = 31 as u32
+        t.hour = 23 as u32
+        t.minute = 59 as u32
+        t.second = 58 as u32
+    }
+    (*w).dos_time = (t.hour as u64 << 11) | (t.minute as u64 << 5) | (t.second as u64 / 2)
+    (*w).dos_date = ((t.year - 1980) as u64 << 9) | (t.month as u64 << 5) | t.day as u64
+}
+
+fn w_out(w: *mut ZipWriter) -> *mut rt.Buf {
+    return (*w).out as *mut rt.Buf
+}
+
+fn add_entry(w: *mut ZipWriter, name: str, p: u64, n: usize, want_deflate: bool, is_dir: bool) -> ZipError!bool {
+    if (*w).finished {
+        return ZipError::Finished
+    }
+    if !zip_name_is_safe(name) {
+        return ZipError::UnsafeName
+    }
+    let h: u64 = name_hash(name.p as u64, name.n)
+    if map_has[u64, u64](&(*w).names, h) {
+        return ZipError::Duplicate
+    }
+    let out: *mut rt.Buf = w_out(w)
+    let crc: u32 = deflate.crc32(p, n)
+    var method: u32 = ZIP_STORE
+    var packed: rt.Buf = rt.buf_new()
+    if want_deflate && n > 0 {
+        let got: usize = deflate.deflate(p, n, deflate.deflate_level_default(), &packed) catch 0
+        if got > 0 && got < n {
+            method = ZIP_DEFLATE
+        }
+    }
+    var csize: u64 = n as u64
+    var cp: u64 = p
+    if method == ZIP_DEFLATE {
+        csize = rt.buf_len(&packed) as u64
+        cp = rt.buf_ptr(&packed)
+    }
+    let local: u64 = ((*out).len - (*w).start) as u64
+    let big: bool = n as u64 >= U32_MAX || csize >= U32_MAX || local >= U32_MAX
+    var need: u64 = 20
+    if big {
+        need = 45
+    }
+    let flags: u64 = 2048 // UTF-8 names
+    // local header
+    put32(out, SIG_LOCAL)
+    put16(out, need)
+    put16(out, flags)
+    put16(out, method as u64)
+    put16(out, (*w).dos_time)
+    put16(out, (*w).dos_date)
+    put32(out, crc as u64)
+    if big {
+        put32(out, U32_MAX)
+        put32(out, U32_MAX)
+    } else {
+        put32(out, csize)
+        put32(out, n as u64)
+    }
+    put16(out, name.n as u64)
+    if big {
+        put16(out, 20)
+    } else {
+        put16(out, 0)
+    }
+    rt.buf_push_bytes(out, name.p as u64, name.n)
+    if big {
+        put16(out, 1)
+        put16(out, 16)
+        put64(out, n as u64)
+        put64(out, csize)
+    }
+    rt.buf_push_bytes(out, cp, csize as usize)
+    rt.buf_free(&packed)
+    // central directory record
+    let cd: *mut rt.Buf = &(*w).cd
+    put32(cd, SIG_CENTRAL)
+    put16(cd, 768 + need) // made by: 3 = Unix
+    put16(cd, need)
+    put16(cd, flags)
+    put16(cd, method as u64)
+    put16(cd, (*w).dos_time)
+    put16(cd, (*w).dos_date)
+    put32(cd, crc as u64)
+    if big {
+        put32(cd, U32_MAX)
+        put32(cd, U32_MAX)
+    } else {
+        put32(cd, csize)
+        put32(cd, n as u64)
+    }
+    put16(cd, name.n as u64)
+    if big {
+        put16(cd, 28)
+    } else {
+        put16(cd, 0)
+    }
+    put16(cd, 0) // comment
+    put16(cd, 0) // disk
+    put16(cd, 0) // internal attributes
+    if is_dir {
+        put32(cd, (16877 << 16) | 16) // drwxr-xr-x, MS-DOS directory bit
+    } else {
+        put32(cd, 33188 << 16) // -rw-r--r--
+    }
+    if big {
+        put32(cd, U32_MAX)
+    } else {
+        put32(cd, local)
+    }
+    rt.buf_push_bytes(cd, name.p as u64, name.n)
+    if big {
+        put16(cd, 1)
+        put16(cd, 24)
+        put64(cd, n as u64)
+        put64(cd, csize)
+        put64(cd, local)
+    }
+    map_set[u64, u64](&(*w).names, h, (*w).count)
+    (*w).count = (*w).count + 1
+    return true
+}
+
+// Adds a file. With `deflate` the content is compressed -- and stored
+// anyway if compression does not make it smaller.
+fn zip_add(w: *mut ZipWriter, name: str, p: u64, n: usize, deflate: bool) -> ZipError!bool {
+    if name.n > 0 && rt.ld8(name.p as u64, name.n - 1) == 47 as u8 {
+        return ZipError::UnsafeName // a file name ending in "/" would read as a directory
+    }
+    return try add_entry(w, name, p, n, deflate, false)
+}
+
+// Adds a directory entry; the trailing "/" is added if missing.
+fn zip_add_dir(w: *mut ZipWriter, name: str) -> ZipError!bool {
+    if name.n > 0 && rt.ld8(name.p as u64, name.n - 1) == 47 as u8 {
+        return try add_entry(w, name, 0, 0, false, true)
+    }
+    return try add_entry(w, name + "/", 0, 0, false, true)
+}
+
+// Writes the central directory and the end records. The answer is the size
+// of the whole archive.
+fn zip_finish(w: *mut ZipWriter) -> ZipError!usize {
+    if (*w).finished {
+        return ZipError::Finished
+    }
+    (*w).finished = true
+    let out: *mut rt.Buf = w_out(w)
+    let cd_off: u64 = ((*out).len - (*w).start) as u64
+    let cd_size: u64 = rt.buf_len(&(*w).cd) as u64
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*w).cd), cd_size as usize)
+    let count: u64 = (*w).count
+    let z64: bool = count >= U16_MAX || cd_off >= U32_MAX || cd_size >= U32_MAX
+    if z64 {
+        let rec: u64 = ((*out).len - (*w).start) as u64
+        put32(out, SIG_EOCD64)
+        put64(out, 44)
+        put16(out, 813) // made by Unix, 4.5
+        put16(out, 45)
+        put32(out, 0)
+        put32(out, 0)
+        put64(out, count)
+        put64(out, count)
+        put64(out, cd_size)
+        put64(out, cd_off)
+        put32(out, SIG_LOC64)
+        put32(out, 0)
+        put64(out, rec)
+        put32(out, 1)
+    }
+    put32(out, SIG_EOCD)
+    put16(out, 0)
+    put16(out, 0)
+    if z64 {
+        put16(out, U16_MAX)
+        put16(out, U16_MAX)
+        put32(out, U32_MAX)
+        put32(out, U32_MAX)
+    } else {
+        put16(out, count)
+        put16(out, count)
+        put32(out, cd_size)
+        put32(out, cd_off)
+    }
+    put16(out, 0) // comment length
+    rt.buf_free(&(*w).cd)
+    return (*out).len - (*w).start
+}
