@@ -772,7 +772,11 @@ fn run(opts: &Options) -> i32 {
         // not know ("unassigned file number").
         dwarf::add_file("<comptime>");
         let toks = lexer::lex_file(&generated, file, &mut dg);
-        let mut extra = parser::parse(&toks, &mut dg);
+        // `parse_module`, not `parse`: `parse` resets every registry of this
+        // compilation (generic templates and instantiations, gc classes,
+        // `str`, error sets) -- the injected text would wipe out what the
+        // program's own files registered (round MODGEN).
+        let mut extra = parser::parse_module(&toks, &mut dg, file, 0);
         // The expression ids of the addition start at 0 and have to move behind
         // those of the main program.
         let mut next = prog.expr_count;
@@ -834,7 +838,10 @@ fn run(opts: &Options) -> i32 {
         let file = dg.add_file("<test runner>", &src);
         dwarf::add_file("<test runner>");
         let toks = lexer::lex_file(&src, file, &mut dg);
-        let mut extra = parser::parse(&toks, &mut dg);
+        // `parse_module`, not `parse` -- see the comptime injection above:
+        // a reset here made every generic (`Vec[T]`) and every `str` method
+        // of the tested files unknown under `--test` (round MODGEN).
+        let mut extra = parser::parse_module(&toks, &mut dg, file, 0);
         let mut next = prog.expr_count;
         for f in extra.funcs.iter_mut() {
             crate::mono::renumber_block(&mut f.body, &mut next);

@@ -108,6 +108,13 @@ struct Registry {
     struct_names: Vec<String>,
     fns: HashMap<String, FnTemplate>,
     structs: HashMap<String, StructTemplate>,
+    /// Round MODGEN: instantiation names the module renamer replaced by a
+    /// qualified one (`Vec__Block` -> `Vec__refdes__Block`) ...
+    superseded: std::collections::HashSet<String>,
+    /// ... and names it saw in use unchanged. A superseded name that no file
+    /// still uses is not instantiated: its argument names a type that exists
+    /// only under the qualified name.
+    kept: std::collections::HashSet<String>,
     insts: HashMap<String, Instantiation>,
     order: Vec<String>,
     /// nesting depth while parsing a template
@@ -155,21 +162,29 @@ pub(crate) fn struct_templates_the_file(file: u32) -> Vec<String> {
 }
 
 /// Changes a function template in place.
+///
+/// The template is taken OUT of the registry while `f` runs, so that `f`
+/// may itself consult the registry (the module renamer looks up and records
+/// instantiations, round MODGEN) without a double borrow.
 pub(crate) fn with_fn_template<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: F) {
-    REG.with(|r| {
-        if let Some(t) = r.borrow_mut().fns.get_mut(name) {
-            f(&mut t.decl);
-        }
-    });
+    let taken = REG.with(|r| r.borrow_mut().fns.remove(name));
+    if let Some(mut t) = taken {
+        f(&mut t.decl);
+        REG.with(|r| {
+            r.borrow_mut().fns.insert(name.to_string(), t);
+        });
+    }
 }
 
 /// Changes a struct template in place.
 pub(crate) fn with_struct_template<F: FnOnce(&mut crate::ast::StructDecl)>(name: &str, f: F) {
-    REG.with(|r| {
-        if let Some(t) = r.borrow_mut().structs.get_mut(name) {
-            f(&mut t.decl);
-        }
-    });
+    let taken = REG.with(|r| r.borrow_mut().structs.remove(name));
+    if let Some(mut t) = taken {
+        f(&mut t.decl);
+        REG.with(|r| {
+            r.borrow_mut().structs.insert(name.to_string(), t);
+        });
+    }
 }
 
 pub(crate) fn struct_template(name: &str) -> Option<StructTemplate> {
@@ -195,16 +210,31 @@ pub(crate) fn instantiations() -> Vec<(String, Instantiation)> {
         let reg = r.borrow();
         reg.order
             .iter()
+            .filter(|k| !reg.superseded.contains(*k) || reg.kept.contains(*k))
             .filter_map(|k| reg.insts.get(k).map(|i| (k.clone(), i.clone())))
             .collect()
     })
+}
+
+/// Round MODGEN: see `Registry::superseded`.
+pub(crate) fn mark_superseded(mangled: &str) {
+    REG.with(|r| {
+        r.borrow_mut().superseded.insert(mangled.to_string());
+    });
+}
+
+/// Round MODGEN: see `Registry::kept`.
+pub(crate) fn mark_kept(mangled: &str) {
+    REG.with(|r| {
+        r.borrow_mut().kept.insert(mangled.to_string());
+    });
 }
 
 pub(crate) fn instantiation(mangled: &str) -> Option<Instantiation> {
     REG.with(|r| r.borrow().insts.get(mangled).cloned())
 }
 
-fn record_inst(mangled: &str, inst: Instantiation) {
+pub(crate) fn record_inst(mangled: &str, inst: Instantiation) {
     REG.with(|r| {
         let mut reg = r.borrow_mut();
         if !reg.insts.contains_key(mangled) {

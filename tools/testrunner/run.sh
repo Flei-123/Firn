@@ -213,6 +213,12 @@ fi
 has_not "$TMPD/mixed.json" '"name":"adds_up","status":"fail"' "the counter-check strikes"
 
 echo
+echo "== 7e. generics and str from a module under --test (round MODGEN) =="
+"$FIRNC" --test -o "$TMPD/genmod" "$CASES/generic_module.fi" > "$TMPD/genmod.json" 2> "$TMPD/genmod.err"
+num "a test file with Vec/str from a module builds and passes" "$?" eq 0
+has "$TMPD/genmod.json" '"passed":2,"failed":0' "both generic cases pass"
+
+echo
 echo "== 8. both compilers know the attribute =="
 # firnc1 has no test mode -- but `#[test]` has to be a KNOWN attribute for it,
 # otherwise a file full of test cases would not even be core language to it
