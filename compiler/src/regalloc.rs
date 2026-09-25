@@ -1289,7 +1289,13 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 Op::Store { .. } => inst.ty.is_float(),
                 // RUNDE TEMPO 4: `__v128_store` liest seinen Wert hier, die
                 // Adresse ist eine Ganzzahl und faellt nicht unter `ok`.
-                Op::Simd { kind, .. } => v128_ra_kind(*kind),
+                // TEMPO 15: `GetU32`/`GetU16` lesen ihren Vektor aus dem
+                // xmm-Register (`movd`/`pextrw`); ihr Ergebnis ist eine
+                // Ganzzahl und bekommt hier KEIN `ok`.
+                Op::Simd { kind, .. } => {
+                    v128_ra_kind(*kind)
+                        || matches!(kind, crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16)
+                }
                 _ => false,
             };
             if !use_ok {
@@ -3220,6 +3226,150 @@ fn foldable_addresses(
             }
         }
     }
+    // ---- TEMPO 15: base + constant with SEVERAL readers ---------------
+    //
+    // `l3_dct3_9` loads nine floats from `y`, `y+8`, ... and stores nine
+    // results to the same places. After `cse` each address is ONE value
+    // with two readers, so the rule above (exactly one reader, right behind)
+    // left `lea r9, [r8+8]` + `movss xmm14, [r9]` for every one of them --
+    // and a register per address for the whole function.
+    //
+    // An address `base + k` whose every reader is a memory access through
+    // it can be written as `[base + k]` at each of them -- provided the
+    // base's register still holds the base there, i.e. the base is LIVE at
+    // every reader (the allocator never gives a live value's register to
+    // anybody else, and `pure_reg` means one home for the whole life).
+    // `FIRN_NO_MULTIFOLD=1` switches it off.
+    if std::env::var_os("FIRN_NO_MULTIFOLD").is_none() {
+        let mut live: Option<Live> = None;
+        let nv = f.val_types.len();
+        // the readers of every value, as (block, index); a terminator
+        // reading it counts as (block, usize::MAX)
+        let mut readers: Option<HashMap<Val, Vec<(usize, usize)>>> = None;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let d = match i.dst {
+                    Some(d) if !out.contains_key(&d) && !away.contains(&d) => d,
+                    _ => continue,
+                };
+                let (base, k) = match &i.op {
+                    Op::PtrAdd { base, off } => match a.imm(*off) {
+                        Some(k) => (*base, k),
+                        None => continue,
+                    },
+                    Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => match (a.imm(*x), a.imm(*y)) {
+                        (None, Some(k)) => (*x, k),
+                        (Some(k), None) => (*y, k),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                if !(i32::MIN as i64 + 1..=i32::MAX as i64).contains(&k) {
+                    continue;
+                }
+                if read.get(d as usize).copied().unwrap_or(0) == 0 || f.is_secret(d) || !single(d) {
+                    continue;
+                }
+                if a.alias.contains_key(&d) || a.frame_addr.contains_key(&d) || a.cell(d).is_some() {
+                    continue;
+                }
+                let br = match pure_reg(base) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                if base == d || f.is_secret(base) {
+                    continue;
+                }
+                if readers.is_none() {
+                    // the readers of the CANDIDATES only (every address with
+                    // a constant offset) -- a list per value of the whole
+                    // function cost measurable compile time
+                    let mut want = vec![false; nv];
+                    for bb in &f.blocks {
+                        for ins in &bb.insts {
+                            let is_cand = match &ins.op {
+                                Op::PtrAdd { off, .. } => a.imm(*off).is_some(),
+                                Op::Bin(BinOp::Add, x, y) if ins.ty.bits() == 64 => {
+                                    a.imm(*x).is_some() != a.imm(*y).is_some()
+                                }
+                                _ => false,
+                            };
+                            if let (true, Some(dd)) = (is_cand, ins.dst) {
+                                if let Some(w) = want.get_mut(dd as usize) {
+                                    *w = true;
+                                }
+                            }
+                        }
+                    }
+                    let mut rd: HashMap<Val, Vec<(usize, usize)>> = HashMap::new();
+                    let mut buf = Vec::new();
+                    for (bj, bb) in f.blocks.iter().enumerate() {
+                        for (jj, ins) in bb.insts.iter().enumerate() {
+                            buf.clear();
+                            ins.op.uses(&mut buf);
+                            buf.sort();
+                            buf.dedup();
+                            for u in &buf {
+                                if want.get(*u as usize).copied().unwrap_or(false) {
+                                    rd.entry(*u).or_default().push((bj, jj));
+                                }
+                            }
+                        }
+                        match &bb.term {
+                            Term::Ret(Some(v)) | Term::BrCond { cond: v, .. } | Term::Switch { val: v, .. } => {
+                                if want.get(*v as usize).copied().unwrap_or(false) {
+                                    rd.entry(*v).or_default().push((bj, usize::MAX));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    readers = Some(rd);
+                }
+                let empty: Vec<(usize, usize)> = Vec::new();
+                let rd = readers.as_ref().unwrap().get(&d).unwrap_or(&empty);
+                if rd.is_empty() {
+                    continue;
+                }
+                let all_mem = rd.iter().all(|&(bj, jj)| {
+                    if jj == usize::MAX {
+                        return false;
+                    }
+                    match &f.blocks[bj].insts[jj].op {
+                        Op::Load { addr } => *addr == d,
+                        Op::Store { addr, val } => *addr == d && *val != d,
+                        Op::Simd { kind: crate::simd::SimdKind::Load, args, .. } => {
+                            args.len() == 1 && args[0] == d
+                        }
+                        Op::Simd {
+                            kind: crate::simd::SimdKind::Store | crate::simd::SimdKind::Store64,
+                            args,
+                            ..
+                        } => args.len() == 2 && args[0] == d && args[1] != d,
+                        _ => false,
+                    }
+                });
+                if !all_mem {
+                    continue;
+                }
+                if live.is_none() {
+                    live = Some(compute_live(f));
+                }
+                let lv = live.as_ref().unwrap();
+                let base_there = rd.iter().all(|&(bj, jj)| {
+                    if jj == 0 {
+                        lv.live_in[bj].get(base as usize).copied().unwrap_or(false)
+                    } else {
+                        live_after(f, lv, base, bj, jj - 1)
+                    }
+                });
+                if !base_there {
+                    continue;
+                }
+                out.insert(d, Address { base: br, index: None, offset: k });
+            }
+        }
+    }
     // ---- zweiter Durchgang: die Skalierung in die Summe ziehen ---------
     //
     // Bedingungen, alle noetig:
@@ -3597,7 +3747,130 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     if !supported(f) {
         return None;
     }
-    let a0 = allocate(f);
+    // TEMPO 15 (`addrsink.rs`): addresses `base + k` copied in front of each
+    // access, so that each folds into its operand. Taken without asking --
+    // see below for the comparison, which is only a measuring aid now.
+    let choose = std::env::var_os("FIRN_ADDRSINK_CHOOSE").is_some();
+    if !choose && !debug_vars_active(f) {
+        if let Some(g) = crate::addrsink::sink(f) {
+            if supported(&g) {
+                if let Ok(alt) = emit_variant(&g) {
+                    e.out.push_str(&alt);
+                    return Some(Ok(()));
+                }
+            }
+        }
+    }
+    let plain = match emit_variant(f) {
+        Ok(t) => t,
+        Err(err) => return Some(Err(err)),
+    };
+    // `FIRN_ADDRSINK_CHOOSE=1`: BOTH versions are emitted and the one with
+    // fewer instructions wins, every instruction weighted by the loop depth
+    // of its block (x 8 per level). Measured over `bin/firnc1.fi`: 174 of
+    // 260 functions better sunk, and the other 86 lose 3,587 weighted
+    // instructions against 27,121 won -- on the MP3 decoder and the bench
+    // bank the choice changes not one executed instruction. It doubled the
+    // code generation time (+0.8 s on `bin/firnc1.fi`), so sinking is taken
+    // unconditionally and the comparison stays for measuring.
+    if choose && !debug_vars_active(f) {
+        if let Some(g) = crate::addrsink::sink(f) {
+            if supported(&g) {
+                if let Ok(alt) = emit_variant(&g) {
+                    let depth = natural_loop_depth(f);
+                    let (wp, wa) = (weighted_len(&plain, &f.name, &depth), weighted_len(&alt, &f.name, &depth));
+                    if std::env::var_os("FIRN_ADDRSINK_DBG").is_some() {
+                        eprintln!("ADDRSINK {} weighted original={} sunk={} -> {}", f.name, wp, wa,
+                            if wa < wp { "sunk" } else { "original" });
+                    }
+                    if wa < wp {
+                        e.out.push_str(&alt);
+                        return Some(Ok(()));
+                    }
+                }
+            }
+        }
+    }
+    e.out.push_str(&plain);
+    Some(Ok(()))
+}
+
+/// Loop depth of every block (0 = not in a loop): the number of natural
+/// loops it lies in.
+fn natural_loop_depth(f: &Func) -> Vec<u32> {
+    let n = f.blocks.len();
+    let mut depth = vec![0u32; n];
+    if n < 2 {
+        return depth;
+    }
+    let dt = crate::mem2reg::idoms(f);
+    let dominates = |a: usize, b: usize| -> bool {
+        let mut x = b;
+        for _ in 0..=n {
+            if x == a {
+                return true;
+            }
+            let up = dt.idom[x] as usize;
+            if up == x {
+                return false;
+            }
+            x = up;
+        }
+        false
+    };
+    for (bi, blk) in f.blocks.iter().enumerate() {
+        if dt.rpo_num[bi] == usize::MAX {
+            continue;
+        }
+        for sb in blk.term.successors() {
+            let h = sb as usize;
+            if h < n && dominates(h, bi) {
+                for x in crate::licm::natural_loop(h, bi, &dt.preds) {
+                    depth[x] += 1;
+                }
+            }
+        }
+    }
+    depth
+}
+
+/// Instructions of an emitted function, each weighted 8^depth of the block
+/// it stands in (block labels `.L<fn>__bb<N>:`; the cold arms after the
+/// function count once).
+fn weighted_len(asm: &str, fname: &str, depth: &[u32]) -> u64 {
+    let prefix = format!(".L{}__bb", fname.replace('#', "."));
+    let mut w: u64 = 1;
+    let mut total: u64 = 0;
+    for line in asm.lines() {
+        let t = line.trim_start();
+        if t.is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            // a label
+            w = 1;
+            if let Some(rest) = t.strip_prefix(&prefix) {
+                if let Some(num) = rest.strip_suffix(':') {
+                    if let Ok(bi) = num.parse::<usize>() {
+                        let d = depth.get(bi).copied().unwrap_or(0).min(6);
+                        w = 8u64.pow(d);
+                    }
+                }
+            }
+            continue;
+        }
+        if t.starts_with('.') {
+            continue; // .loc and other directives
+        }
+        total += w;
+    }
+    total
+}
+
+/// Allocation, the split of TEMPO 10, and the emission of ONE version of
+/// the function -- the finished text.
+fn emit_variant(f: &Func) -> Result<String, String> {
+    let a0 = &allocate(f);
     // RUNDE TEMPO 10 -- LEBENSDAUERN ZERSCHNEIDEN, NACHDEM MAN WEISS, WO ES
     // KLEMMT.
     //
@@ -3684,19 +3957,14 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     if let Ok(nur) = std::env::var("FIRN_VEX_ONLY") {
         tmp.vex = tmp.vex && f.name.contains(&nur);
     }
-    match emit_with(&mut tmp, f, a) {
-        Ok(()) => {
-            // ROUND 90: the panic arms of the checked operations, behind the
-            // function they belong to. They go through the descriptor pass
-            // with the rest -- every one of them starts with a `.L` label,
-            // which resets the descriptor, so they can believe nothing.
-            tmp.flush_cold();
-            let nv = f.val_types.len();
-            e.out.push_str(&descriptor_peephole(&tmp.out, nv));
-            Some(Ok(()))
-        }
-        Err(err) => Some(Err(err)),
-    }
+    emit_with(&mut tmp, f, a)?;
+    // ROUND 90: the panic arms of the checked operations, behind the
+    // function they belong to. They go through the descriptor pass
+    // with the rest -- every one of them starts with a `.L` label,
+    // which resets the descriptor, so they can believe nothing.
+    tmp.flush_cold();
+    let nv = f.val_types.len();
+    Ok(descriptor_peephole(&tmp.out, nv))
 }
 
 // ------------------------------------------------- Register descriptor ---
@@ -4232,7 +4500,9 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 }
                 match &i.op {
                     Op::Simd { kind, .. } => {
-                        if !v128_ra_kind(*kind) {
+                        if !v128_ra_kind(*kind)
+                            && !matches!(kind, crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16)
+                        {
                             return Some("vector instruction outside the narrow set".into());
                         }
                     }
@@ -4293,6 +4563,8 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                         crate::simd::SimdKind::Crc32U8
                             | crate::simd::SimdKind::Crc32U64
                             | crate::simd::SimdKind::CpuFeatures
+                            | crate::simd::SimdKind::GetU32
+                            | crate::simd::SimdKind::GetU16
                     ) && !v128_ra_kind(*kind)
                     {
                         return Some("vector instruction".into());
@@ -5153,6 +5425,74 @@ fn epilogue(e: &mut Emitter, a: &Alloc) {
     e.line("ret");
 }
 
+/// TEMPO 15 -- the fusion wants the comparison LAST. After phi elimination
+/// the latch of a loop reads `cmp; copy; copy; brcond`: the copies of the
+/// phi edges stand between, and the bool is materialized (`setcc`, `movzx`,
+/// `test`, `jnz` -- five instructions instead of two). Measured in
+/// `l3_huffman` of the MP3 decoder, in every loop of it.
+///
+/// A copy emits `mov`/`movss`/`movaps` only (never an instruction that
+/// writes the flags), so the comparison may go behind the copies when none
+/// of them writes a place the comparison reads -- checked on the PLACES
+/// (registers, frame slots), not only the values, because a copy's target
+/// may share a register with an operand whose life ends at the comparison.
+/// Integer comparisons only: a float operand may sit in a handover register
+/// that a float copy uses as scratch.
+fn cmp_behind_copies(ra: &Ra, b: &Block) -> Option<Block> {
+    if std::env::var_os("FIRN_NO_CMPSINK").is_some() {
+        return None;
+    }
+    let cond = match &b.term {
+        Term::BrCond { cond, .. } => *cond,
+        _ => return None,
+    };
+    let c = b.insts.iter().rposition(|i| i.dst == Some(cond))?;
+    if c + 1 >= b.insts.len() {
+        return None; // already last
+    }
+    let (x, y) = match &b.insts[c].op {
+        Op::Cmp { ty, a, b, .. } if !ty.is_float() => (*a, *b),
+        _ => return None,
+    };
+    if ra.read.get(cond as usize).copied().unwrap_or(2) != 1 || ra.f.is_secret(cond) {
+        return None;
+    }
+    let tail = &b.insts[c + 1..];
+    if !tail.iter().all(|i| matches!(i.op, Op::Copy { .. })) {
+        return None;
+    }
+    let mut places = Vec::new();
+    for v in [x, y] {
+        if ra.a.imm(v).is_some() {
+            continue;
+        }
+        if ra.a.alias.contains_key(&v) || ra.a.cell(v).is_some() || ra.a.frame_addr.contains_key(&v)
+            || ra.fp_hand.contains_key(&v) || ra.offset.contains_key(&v)
+        {
+            return None;
+        }
+        places.push(ra.a.loc(v));
+    }
+    for i in tail {
+        let d = i.dst?;
+        if d == x || d == y {
+            return None;
+        }
+        if let Op::Copy { src } = &i.op {
+            if *src == cond {
+                return None;
+            }
+        }
+        if places.iter().any(|p| *p == ra.a.loc(d)) {
+            return None;
+        }
+    }
+    let mut nb = b.clone();
+    let cmp = nb.insts.remove(c);
+    nb.insts.push(cmp);
+    Some(nb)
+}
+
 /// Kann der Block als `cmp` + bedingter Sprung ausgegeben werden? (Siehe die
 /// Bedingungen in `emit_block`.) Eigene Funktion seit TEMPO 11, weil die
 /// Schleifenrotation dieselbe Frage fuer den ZIELblock eines `jmp` stellt.
@@ -5228,6 +5568,11 @@ fn emit_block(
     //   * its result is the jump condition,
     //   * it is read EXACTLY ONCE (otherwise the bool value is needed),
     //   * no `secret` value (SPEC §9.2).
+    // TEMPO 15: a comparison followed only by phi copies is moved behind
+    // them, so that the fusion below applies (see `cmp_behind_copies`).
+    if let Some(rb) = cmp_behind_copies(ra, b) {
+        return emit_block(e, ra, &rb, next, site);
+    }
     let mergeable = cmp_br_mergeable(ra, b);
     let n = if mergeable { b.insts.len() - 1 } else { b.insts.len() };
     for (ii, i) in b.insts[..n].iter().enumerate() {
@@ -5680,6 +6025,32 @@ fn emit_inst(
                 let d = i.dst.ok_or("internal error: cpu_features without target")?;
                 crate::simd::emit_cpuid_pub(e);
                 ra.store_dst(e, d, "rax");
+            }
+            // TEMPO 15: one lane as an integer. `vec2reg.rs` makes lane 0
+            // behind a `pshufd` (`movd`) and 16-bit lanes (`pextrw`), both
+            // SSE2; lanes 1-3 of `get_u32` are `pextrd` (SSE4.1), as on the
+            // base path. Straight into the target register when it has one.
+            crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16 => {
+                let d = i.dst.ok_or("internal error: get_u32 without target")?;
+                let q = ra.v_reg(e, args[0], "xmm0");
+                let imm = match &i.op {
+                    Op::Simd { imm, .. } => *imm,
+                    _ => 0,
+                };
+                let t = match ra.a.loc(d) {
+                    Loc::Reg(r) => r,
+                    Loc::Slot(_) => "rax",
+                };
+                if *kind == crate::simd::SimdKind::GetU16 {
+                    e.line(&format!("pextrw {}, {}, {}", rn(t, 32), q, imm));
+                } else if imm == 0 {
+                    e.line(&format!("movd {}, {}", rn(t, 32), q));
+                } else {
+                    e.line(&format!("pextrd {}, {}, {}", rn(t, 32), q, imm));
+                }
+                if t == "rax" {
+                    ra.store_dst(e, d, "rax");
+                }
             }
             _ => return Err("internal error: v128 reached the register path".to_string()),
         },

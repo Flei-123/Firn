@@ -53,7 +53,7 @@
 //! round. In `matmul` `r * n` reaches the head of the `cc` loop that way.
 
 use crate::fir::{BinOp, Func, Inst, Op, Term, Val};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Hoists loop invariant instructions into the preheader. Yields the count.
 pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
@@ -105,13 +105,18 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
         loops.push((h, natural_loop(h, b, &preds)));
     }
     loops.sort_by_key(|(_, body)| body.len());
+    // addresses in `.rodata`: they do not change when code moves
+    let mut ro: Option<HashMap<Val, u64>> = None;
 
     for (head, body) in loops {
         let preheader = match preheader_of(f, head, &body, &preds) {
             Some(p) => p,
             None => continue,
         };
-        moved += hoist_out(f, head, &body, preheader);
+        if ro.is_none() {
+            ro = Some(rodata_addrs(f));
+        }
+        moved += hoist_out(f, head, &body, preheader, ro.as_ref().unwrap());
     }
     moved
 }
@@ -152,6 +157,86 @@ pub(crate) fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: 
     }
 }
 
+/// TEMPO 15 -- addresses inside an IMMUTABLE `static` (`.rodata`): value ->
+/// how many octets from there to the end of the object. `GlobalAddr` of such
+/// a static, and `ptradd`/`add` of one with a constant.
+///
+/// A load from there is loop invariant (nothing can write `.rodata`) and
+/// cannot fault (the address is inside a mapped object), so `licm` may move
+/// it out of the loop like any pure computation. Measured on the MP3
+/// decoder: `synth` loads its four rounding constants and two limit vectors
+/// in every pass -- six loads and three shuffles, twice.
+pub(crate) fn rodata_addrs(f: &Func) -> HashMap<Val, u64> {
+    let mut ro: HashMap<Val, u64> = HashMap::new();
+    // cheap exit: no global address at all (most functions)
+    if !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, Op::GlobalAddr { .. }))) {
+        return ro;
+    }
+    let mut consts: HashMap<Val, i128> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            match (&i.op, i.dst) {
+                (Op::Const(c), Some(d)) => {
+                    consts.insert(d, *c);
+                }
+                (Op::GlobalAddr { name }, Some(d)) => {
+                    if let Some(n) = crate::statics::rodata_size(name) {
+                        ro.insert(d, n);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if ro.is_empty() {
+        return ro;
+    }
+    // offsets, in any order of definition: a few rounds suffice
+    for _ in 0..4 {
+        let mut grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let d = match i.dst {
+                    Some(d) if !ro.contains_key(&d) => d,
+                    _ => continue,
+                };
+                let (base, off) = match &i.op {
+                    Op::PtrAdd { base, off } => (*base, *off),
+                    Op::Bin(BinOp::Add, a, b) | Op::BinWrapSat { op: BinOp::Add, a, b, .. } => {
+                        if ro.contains_key(a) {
+                            (*a, *b)
+                        } else {
+                            (*b, *a)
+                        }
+                    }
+                    _ => continue,
+                };
+                if let (Some(&n), Some(&k)) = (ro.get(&base), consts.get(&off)) {
+                    if k >= 0 && (k as u64) < n {
+                        ro.insert(d, n - k as u64);
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    ro
+}
+
+/// A load (scalar or `simd.Load`) that reads only inside an immutable static.
+fn rodata_load(op: &Op, ty: crate::fir::FTy, ro: &HashMap<Val, u64>) -> bool {
+    match op {
+        Op::Load { addr } => ro.get(addr).map(|&n| ty.bytes() <= n).unwrap_or(false),
+        Op::Simd { kind: crate::simd::SimdKind::Load, args, .. } => {
+            args.len() == 1 && ro.get(&args[0]).map(|&n| n >= 16).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// May this instruction be moved at all? (purity + trap freedom)
 fn hoistable_op(op: &Op) -> bool {
     if crate::mem2reg::is_untouchable(op) {
@@ -167,6 +252,12 @@ fn hoistable_op(op: &Op) -> bool {
         | Op::Un(..)
         | Op::Cast { .. }
         | Op::PtrAdd { .. } => true,
+        // TEMPO 15: link time constants, and the pure vector instructions
+        // (no SSE instruction of the set traps: floating point exceptions
+        // are masked). The shuffles of loop invariant constants in `synth`
+        // were recomputed in every pass.
+        Op::GlobalAddr { .. } | Op::FnRef { .. } | Op::VtabAddr { .. } => true,
+        Op::Simd { kind, .. } => kind.is_pure(),
         _ => false,
     }
 }
@@ -189,7 +280,13 @@ fn hoistable_op(op: &Op) -> bool {
 // in which instructions move is unchanged and the result is the same
 // instruction sequence as before. Measured over bin/firnc1.fi, the assembler
 // is octet-identical.
-fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize) -> usize {
+fn hoist_out(
+    f: &mut Func,
+    head: usize,
+    body: &HashSet<usize>,
+    preheader: usize,
+    ro: &HashMap<Val, u64>,
+) -> usize {
     let mut moved = 0;
     let mut buf: Vec<Val> = Vec::new();
     let mut order: Vec<usize> = body.iter().copied().collect();
@@ -207,7 +304,7 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
         let mut hit: Option<(usize, usize)> = None;
         'search: for &b in &order {
             for (ix, i) in f.blocks[b].insts.iter().enumerate() {
-                if !hoistable_op(&i.op) {
+                if !hoistable_op(&i.op) && !rodata_load(&i.op, i.ty, ro) {
                     continue;
                 }
                 let d = match i.dst {

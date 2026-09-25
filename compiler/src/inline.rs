@@ -49,6 +49,14 @@ const MAX_CALLEE_BLOCKS: usize = 8;
 const MAX_CALLER_INSTS: usize = 24000;
 const MAX_INLINES: usize = 2000;
 
+/// `FIRN_MAX_INLINES=<n>` overrides the module bound (measuring aid).
+fn max_inlines() -> usize {
+    std::env::var("FIRN_MAX_INLINES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(MAX_INLINES)
+}
+
 /// Can `from` reach `to` through calls?
 fn reaches(m: &Module, from: &str, to: &str) -> bool {
     let mut seen: HashSet<&str> = HashSet::new();
@@ -153,10 +161,84 @@ fn find_site(
     self_rec: &[bool],
     requested_only: bool,
 ) -> Option<(usize, usize, usize)> {
+    find_site_x(m, ci, self_rec, requested_only, false, None)
+}
+
+/// Blocks of `f` that lie on a loop (inside the natural loop of some back
+/// edge).
+fn loop_blocks(f: &Func) -> Vec<bool> {
+    let n = f.blocks.len();
+    let mut on = vec![false; n];
+    if n < 2 {
+        return on;
+    }
+    let dt = crate::mem2reg::idoms(f);
+    let preds = dt.preds.clone();
+    let dominates = |a: usize, b: usize| -> bool {
+        let mut x = b;
+        for _ in 0..=n {
+            if x == a {
+                return true;
+            }
+            let up = dt.idom[x] as usize;
+            if up == x {
+                return false;
+            }
+            x = up;
+        }
+        false
+    };
+    for (b, blk) in f.blocks.iter().enumerate() {
+        if dt.rpo_num[b] == usize::MAX {
+            continue;
+        }
+        for s in blk.term.successors() {
+            let h = s as usize;
+            if h < n && dominates(h, b) {
+                for x in crate::licm::natural_loop(h, b, &preds) {
+                    on[x] = true;
+                }
+            }
+        }
+    }
+    on
+}
+
+/// `hot_only` (TEMPO 15, the second round): only call sites INSIDE a loop,
+/// and only callees that call nothing themselves -- the leaves whose body is
+/// what the loop runs, not a whole subtree.
+fn find_site_x(
+    m: &Module,
+    ci: usize,
+    self_rec: &[bool],
+    requested_only: bool,
+    hot_only: bool,
+    leaves: Option<&HashSet<String>>,
+) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
         return None;
     }
+    let hot: Vec<bool> = if hot_only {
+        // cheap exit first: no call of an eligible leaf at all (the set is
+        // fixed at the start of the round), or no backward edge
+        let has_call = caller.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| match &i.op {
+                Op::Call { name, .. } => leaves.map(|l| l.contains(name.as_str())).unwrap_or(true),
+                _ => false,
+            })
+        });
+        if !has_call {
+            return None;
+        }
+        let on = loop_blocks(caller);
+        if !on.iter().any(|x| *x) {
+            return None;
+        }
+        on
+    } else {
+        Vec::new()
+    };
     // The caller limit protects compile time and code size. But it must not
     // lock out an EXPLICITLY requested inlining -- otherwise `#[inline]`
     // would depend on how big the caller happens to be. So it is checked
@@ -166,6 +248,9 @@ fn find_site(
         return None;
     }
     for (bi, b) in caller.blocks.iter().enumerate() {
+        if hot_only && !hot[bi] {
+            continue;
+        }
         for (ii, inst) in b.insts.iter().enumerate() {
             if let Op::Call { name, args } = &inst.op {
                 let gi = match m.funcs.iter().position(|f| &f.name == name) {
@@ -174,6 +259,15 @@ fn find_site(
                 };
                 let callee = &m.funcs[gi];
                 if gi == ci || !inlinable(callee) {
+                    continue;
+                }
+                if hot_only
+                    && callee.blocks.iter().any(|b| {
+                        b.insts.iter().any(|i| {
+                            matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. })
+                        })
+                    })
+                {
                     continue;
                 }
                 // A full caller only takes what is explicitly requested.
@@ -572,29 +666,93 @@ pub fn inline_module(m: &mut Module) -> usize {
     inline_module_inner(m, false)
 }
 
+/// TEMPO 15 -- the SECOND round, after every function has been optimized
+/// again, restricted to call sites inside loops and to callees that call
+/// nothing (`find_site_x`, `hot_only`). Unrestricted it cost too much:
+/// `bin/firnc1.fi` +17 % `.text` and ~70 % compile time (measured). The first round works caller by caller in module order, not bottom
+/// up: `mp3__scale_pcm4` (31 instructions optimized) first received three
+/// copies of `bcast` and was then, UNoptimized, 55 instructions -- above the
+/// bound -- when `synth` asked for it. After the clean-up it is small again,
+/// and this round embeds it. Returns the number of embeddings and the
+/// callers that received one (only those need optimizing again).
+pub fn inline_module_again(m: &mut Module) -> (usize, Vec<usize>) {
+    let mut changed = Vec::new();
+    let n = inline_module_track_x(m, false, true, &mut changed);
+    changed.sort();
+    changed.dedup();
+    (n, changed)
+}
+
 fn inline_module_inner(m: &mut Module, requested_only: bool) -> usize {
+    let mut changed = Vec::new();
+    inline_module_track(m, requested_only, &mut changed)
+}
+
+fn inline_module_track(m: &mut Module, requested_only: bool, changed: &mut Vec<usize>) -> usize {
+    inline_module_track_x(m, requested_only, false, changed)
+}
+
+fn inline_module_track_x(
+    m: &mut Module,
+    requested_only: bool,
+    hot_only: bool,
+    changed: &mut Vec<usize>,
+) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
+    // the second round only embeds leaves: small bodies without any call
+    let leaves: Option<HashSet<String>> = if hot_only {
+        Some(
+            m.funcs
+                .iter()
+                .filter(|g| {
+                    inlinable(g)
+                        && !g.blocks.iter().any(|b| {
+                            b.insts.iter().any(|i| {
+                                matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. })
+                            })
+                        })
+                })
+                .map(|g| g.name.clone())
+                .collect(),
+        )
+    } else {
+        None
+    };
     // Determined once: it hangs off the body of the callee only, which never
     // changes through embeddings (only the caller is mutated).
-    let self_rec: Vec<bool> = m
-        .funcs
-        .iter()
-        .map(|f| reaches_itself_self(m, &f.name))
-        .collect();
+    // A leaf calls nothing and cannot recurse -- the second round embeds
+    // leaves only and skips this walk over the whole call graph (it was the
+    // bigger half of that round's cost on `bin/firnc1.fi`).
+    let self_rec: Vec<bool> = if hot_only {
+        vec![false; m.funcs.len()]
+    } else {
+        m.funcs.iter().map(|f| reaches_itself_self(m, &f.name)).collect()
+    };
+    // TEMPO 15: an embedding changes the CALLER only, so a caller that had
+    // no site left keeps having none -- the scan stays at `ci` until it is
+    // exhausted instead of starting again at function 0 after every
+    // embedding. Same result, but linear instead of quadratic in the number
+    // of embeddings (measured on `bin/firnc1.fi` with the bound lifted: the
+    // restart made it run for minutes).
+    let mut start = 0usize;
     'outer: loop {
-        for ci in 0..m.funcs.len() {
-            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec, requested_only) {
+        for ci in start..m.funcs.len() {
+            if let Some((bi, ii, gi)) =
+                find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref())
+            {
                 if dbg {
                     eprintln!("inline: {} <- {} ({} insts, {} blocks)",
                         m.funcs[ci].name, m.funcs[gi].name,
                         m.funcs[gi].inst_count(), m.funcs[gi].blocks.len());
                 }
                 inline_one(m, ci, bi, ii, gi);
+                changed.push(ci);
                 n += 1;
-                if n >= MAX_INLINES {
+                if n >= max_inlines() {
                     break 'outer;
                 }
+                start = ci;
                 continue 'outer;
             }
         }

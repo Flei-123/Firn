@@ -85,6 +85,11 @@ use std::collections::HashMap;
 
 /// Does this instruction change memory that we cannot survey?
 fn disturbs_memory(op: &Op) -> bool {
+    // TEMPO 15: the vector stores, the second atomic, the inline assembler
+    // and MMIO write memory too (the same gap `mem2reg::clobbers_memory` had).
+    if let Op::Simd { kind, .. } = op {
+        return matches!(kind, crate::simd::SimdKind::Store | crate::simd::SimdKind::Store64);
+    }
     matches!(
         op,
         Op::Store { .. }
@@ -93,6 +98,10 @@ fn disturbs_memory(op: &Op) -> bool {
             | Op::Syscall { .. }
             | Op::CopyMem { .. }
             | Op::AtomicAdd { .. }
+            | Op::AtomicCas { .. }
+            | Op::Asm { .. }
+            | Op::MmioStore { .. }
+            | Op::ThreadSpawn { .. }
             | Op::SecureZero { .. }
     )
 }

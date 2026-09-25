@@ -1,0 +1,236 @@
+// expect_out: ok
+// ROUND TEMPO 15 -- strength reduction of induction variables (ivsr.rs).
+//
+// Every function below computes `a * iv + b` in a loop in another shape:
+//
+//   * the matmul inner loop: two addresses, one stepping by 4, one by 4 n,
+//   * a counter running DOWN, multiplied by a run time value (the shape of
+//     `synth` in the MP3 decoder: `(15 - i) * nch`),
+//   * a u8 counter whose product WRAPS (`*%`): the reduced value must wrap
+//     in exactly the same places,
+//   * a step that is itself a run time value, and a step by subtraction,
+//   * nested loops (the preheader code of the inner loop is affine in the
+//     outer counter),
+//   * a product carried out of the loop through a variable,
+//   * a loop left through `break` after a product was computed,
+//   * i32 arithmetic that overflows (wrapping `*%`, `+%`).
+//
+// The inputs come from `start`, so that no loop is unrolled away.
+import std.io
+
+fn check(got: i64, want: i64, what: str) -> bool {
+    if got != want {
+        io.print("WRONG ")
+        io.print(what)
+        io.new_line()
+        return false
+    }
+    return true
+}
+
+fn start(x: i64) -> i64 {
+    return x
+}
+
+fn alloc(size: usize) -> usize {
+    let r: i64 = syscall(9, 0, size as i64, 3, 34, -1, 0)
+    return r as usize
+}
+
+fn ld32(p: usize, i: usize) -> i32 {
+    return *((p + i * 4) as *mut i32)
+}
+
+fn st32(p: usize, i: usize, v: i32) {
+    *((p + i * 4) as *mut i32) = v
+}
+
+fn matmul(n: usize) -> i64 {
+    let a: usize = alloc(n * n * 4)
+    let b: usize = alloc(n * n * 4)
+    let c: usize = alloc(n * n * 4)
+    var i: usize = 0
+    while i < n {
+        var j: usize = 0
+        while j < n {
+            st32(a, i * n + j, ((i + 2 * j) % 17) as i32)
+            st32(b, i * n + j, ((3 * i + j) % 13) as i32)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var r: usize = 0
+    while r < n {
+        var cc: usize = 0
+        while cc < n {
+            var s: i32 = 0
+            var k: usize = 0
+            while k < n {
+                s = s + ld32(a, r * n + k) * ld32(b, k * n + cc)
+                k = k + 1
+            }
+            st32(c, r * n + cc, s)
+            cc = cc + 1
+        }
+        r = r + 1
+    }
+    var total: i64 = 0
+    var d: usize = 0
+    while d < n {
+        total = total + (ld32(c, d * n + d) as i64) * ((d + 1) as i64)
+        d = d + 1
+    }
+    return total
+}
+
+// the same with plain arithmetic, no loop to reduce: the reference
+fn matmul_ref(n: usize) -> i64 {
+    var total: i64 = 0
+    var d: usize = 0
+    while d < n {
+        var s: i64 = 0
+        var k: usize = 0
+        while k < n {
+            s = s + (((d + 2 * k) % 17) as i64) * (((3 * k + d) % 13) as i64)
+            k = k + 1
+        }
+        total = total + (s as i32 as i64) * ((d + 1) as i64)
+        d = d + 1
+    }
+    return total
+}
+
+fn down(nch: i32) -> i64 {
+    var sum: i64 = 0
+    var i: i32 = 14
+    while i >= 0 {
+        sum = sum + (((15 - i) * nch) as i64) * 3 + (((17 + i) * nch) as i64)
+        i = i - 1
+    }
+    return sum
+}
+
+fn wrap_u8(n: i64) -> i64 {
+    var sum: i64 = 0
+    var k: u8 = 0
+    while (k as i64) < n {
+        sum = sum + ((k *% 37 +% 11) as i64)
+        k = k +% 1
+    }
+    return sum
+}
+
+fn wrap_u8_ref(n: i64) -> i64 {
+    var sum: i64 = 0
+    var k: i64 = 0
+    while k < n {
+        sum = sum + ((k * 37 + 11) % 256)
+        k = k + 1
+    }
+    return sum
+}
+
+fn runtime_step(step: i64, n: i64) -> i64 {
+    var sum: i64 = 0
+    var i: i64 = 3
+    while i < n {
+        sum = sum + i * 1000 + 7
+        i = i + step
+    }
+    return sum
+}
+
+fn sub_step(n: i64) -> i64 {
+    var sum: i64 = 0
+    var i: i64 = n
+    while i > 0 {
+        sum = sum + i * 12345
+        i = i - 3
+    }
+    return sum
+}
+
+fn nested(n: i64, m: i64) -> i64 {
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < m {
+            sum = sum + (i * m + j) * 3 + i * 7
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+fn carried_out(n: i64, f: i64) -> i64 {
+    var last: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        last = i * f + 5
+        i = i + 1
+    }
+    return last
+}
+
+fn with_break(n: i64, f: i64) -> i64 {
+    var i: i64 = 0
+    var x: i64 = 0
+    while i < n {
+        x = i * f + 1
+        if x > 500 {
+            break
+        }
+        i = i + 1
+    }
+    return x * 1000 + i
+}
+
+fn wrap_i32(n: i32) -> i64 {
+    var sum: i64 = 0
+    var i: i32 = 0
+    while i < n {
+        sum = sum + ((i *% 1000000007 +% 12345) as i64)
+        i = i + 1
+    }
+    return sum
+}
+
+fn wrap_i32_ref(n: i64) -> i64 {
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var v: i64 = (i * 1000000007 + 12345) % 4294967296
+        if v >= 2147483648 {
+            v = v - 4294967296
+        }
+        sum = sum + v
+        i = i + 1
+    }
+    return sum
+}
+
+fn main() -> i32 {
+    var ok = true
+    let n: usize = start(23) as usize
+    ok = check(matmul(n), matmul_ref(n), "matmul") && ok
+    // sum over i = 0..14 of 3 (15 - i) nch + (17 + i) nch
+    ok = check(down(start(2) as i32), 2 * (3 * 120 + 360), "count down times nch") && ok
+    ok = check(wrap_u8(start(250)), wrap_u8_ref(250), "u8 product wraps") && ok
+    // i = 3, 8, 13, ..., 98
+    ok = check(runtime_step(start(5), start(100)), 1000 * (20 * 3 + 5 * 190) + 7 * 20, "run time step") && ok
+    // i = 100, 97, ..., 1: 34 values, sum 1717
+    ok = check(sub_step(start(100)), 12345 * 1717, "step by subtraction") && ok
+    // sum (i m + j) 3 + 7 i  over i < 7, j < 5
+    ok = check(nested(start(7), start(5)), 3 * 595 + 7 * 21 * 5, "nested") && ok
+    ok = check(carried_out(start(10), start(13)), 9 * 13 + 5, "carried out") && ok
+    // x = 13 i + 1 > 500 first at i = 39 (508)
+    ok = check(with_break(start(100), start(13)), 508 * 1000 + 39, "break") && ok
+    ok = check(wrap_i32(start(3000) as i32), wrap_i32_ref(3000), "i32 wraps") && ok
+    if ok {
+        io.print("ok")
+        io.new_line()
+    }
+    return 0
+}

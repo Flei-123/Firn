@@ -431,7 +431,11 @@ impl Op {
             // pure register computation and may be removed when unused; CSE
             // may merge two of them. `__v128_load` reads memory and
             // `__v128_store` writes it — those two never.
-            Op::Simd { kind, .. } => kind.is_pure(),
+            // TEMPO 15: a vector LOAD without a reader may go, exactly like
+            // a scalar `load` above (`dce` is the only user of this
+            // question). `SimdKind::is_pure` stays false for it -- that one
+            // is asked by `cse`, and there memory matters.
+            Op::Simd { kind, .. } => kind.is_pure() || *kind == crate::simd::SimdKind::Load,
             // The state block is always there; rescuing the registers
             // writes memory, though, and must not fall away.
             Op::GcAddr { regs } => !*regs,

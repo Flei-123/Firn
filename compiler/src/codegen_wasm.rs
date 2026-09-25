@@ -197,7 +197,7 @@ fn wasm_simd_kind(k: crate::simd::SimdKind) -> bool {
     use crate::simd::SimdKind as K;
     matches!(
         k,
-        K::Load | K::Store | K::Zero | K::FromU64 | K::GetU64 | K::GetU32 | K::SetU32
+        K::Load | K::Store | K::Zero | K::FromU64 | K::GetU64 | K::GetU32 | K::GetU16 | K::SetU32
             | K::Xor | K::And | K::Or | K::AndNot | K::Add8 | K::Add32 | K::Add64 | K::Sub32
             | K::ShuffleB | K::Shuffle32 | K::AlignR | K::UnpackLo32 | K::UnpackHi32
             | K::UnpackLo64 | K::UnpackHi64 | K::ShlBytes | K::ShrBytes | K::Shl32 | K::Shr32
@@ -2676,6 +2676,11 @@ impl<'a> Fx<'a> {
             K::GetU32 => {
                 self.get(arg(0)?, v);
                 self.ins(Ins::SimdLane(w::I32X4_EXTRACT_LANE, imm & 3));
+                self.put(i, VT::I32);
+            }
+            K::GetU16 => {
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdLane(w::I16X8_EXTRACT_LANE_U, imm & 7));
                 self.put(i, VT::I32);
             }
             K::SetU32 => {

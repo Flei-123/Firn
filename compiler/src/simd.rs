@@ -130,6 +130,10 @@ pub enum SimdKind {
     GetU64,
     GetU32,
     SetU32,
+    /// TEMPO 15: one 16-bit lane (`pextrw`, SSE2) -- no intrinsic of its
+    /// own; `vec2reg.rs` makes it out of `(get_u32(v, l) as i16)`, the lane
+    /// narrowed right away (the PCM samples of the MP3 decoder).
+    GetU16,
     // --- bitwise ------------------------------------------------------
     Xor,
     And,
@@ -1159,6 +1163,12 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             } else {
                 e.line(&format!("pextrd eax, {}, {}", ra, imm));
             }
+            store_dst(e, fr, d, "rax");
+        }
+        SimdKind::GetU16 => {
+            let d = need(dst)?;
+            let ra = xget(e, fr, args[0]);
+            e.line(&format!("pextrw eax, {}, {}", ra, imm));
             store_dst(e, fr, d, "rax");
         }
         SimdKind::SetU32 => {

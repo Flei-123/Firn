@@ -136,7 +136,7 @@ pub const PASSES: &[PassInfo] = &[
         name: "sroa",
         scope: Scope::Func,
         debug_preserving: false,
-        what: "a struct on the stack whose address never escapes becomes one cell per field",
+        what: "a struct on the stack whose address never escapes becomes one cell per field; a 16-octet cell used as one vector becomes a v128 value",
     },
     PassInfo {
         name: "mem2reg",
@@ -179,6 +179,12 @@ pub const PASSES: &[PassInfo] = &[
         scope: Scope::Func,
         debug_preserving: true,
         what: "fully unroll short loops with a trip count known at compile time (round TEMPO 14)",
+    },
+    PassInfo {
+        name: "ivsr",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "strength reduction of induction variables: a * iv + b becomes its own phi stepped by a * c (round TEMPO 15)",
     },
     PassInfo {
         name: "bce",
@@ -411,6 +417,19 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         for f in m.funcs.iter_mut() {
             optimize_func(f, &mut st, cfg, &mut clk);
         }
+        // TEMPO 15: a second round on the cleaned up bodies (see
+        // `inline_module_again`); only the callers that got something are
+        // optimized once more. `FIRN_NO_INLINE2=1` switches it off.
+        if std::env::var_os("FIRN_NO_INLINE2").is_none() {
+            let t = std::time::Instant::now();
+            let (k, changed) = crate::inline::inline_module_again(m);
+            st.inlined += k;
+            clk.add("inline", t);
+            for ci in changed {
+                phi_check(&m.funcs[ci], "inline");
+                optimize_func(&mut m.funcs[ci], &mut st, cfg, &mut clk);
+            }
+        }
     }
     if cfg.runs("promote") && std::env::var_os("FIRN_NO_PROMOTE").is_none() {
         let t = std::time::Instant::now();
@@ -516,7 +535,7 @@ struct Fix {
 }
 
 /// as many slots as there are passes in `PASSES`
-const PASS_SLOTS: usize = 14;
+const PASS_SLOTS: usize = 15;
 
 impl Fix {
     fn new() -> Fix {
@@ -571,7 +590,10 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         if cfg.runs("sroa") && fx.due(12) {
             let t = std::time::Instant::now();
-            let n = crate::sroa::split(f);
+            // RUNDE TEMPO 15: a sixteen octet cell used as ONE vector is
+            // the same question one size up (`vec2reg.rs`) -- and just as
+            // little debug preserving, so it lives in this slot.
+            let n = crate::sroa::split(f) + crate::vec2reg::run(f);
             clk.add2("sroa", t, n > 0);
             fx.note(12, n > 0);
             phi_check(f, "sroa");
@@ -640,6 +662,13 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             clk.add2("unroll", t, u > 0);
             fx.note(13, u > 0);
             phi_check(f, "unroll");
+        }
+        if cfg.runs("ivsr") && fx.due(14) {
+            let t = std::time::Instant::now();
+            let r = crate::ivsr::run(f);
+            clk.add2("ivsr", t, r > 0);
+            fx.note(14, r > 0);
+            phi_check(f, "ivsr");
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
@@ -712,6 +741,13 @@ enum Key {
     Un(u8, u8, Val),
     Cast(u8, u8, Val),
     PtrAdd(Val, Val),
+    /// TEMPO 15: the address of a global (a link time constant)
+    GAddr(String),
+    /// TEMPO 15: a pure vector instruction
+    Simd(crate::simd::SimdKind, Vec<Val>, u8),
+    /// TEMPO 15: a load from an immutable `static` (`.rodata` never changes)
+    RoLoad(u8, Val),
+    RoVLoad(Val),
 }
 
 /// Number of a FIR type (fir::FTy does not derive `Hash`).
@@ -769,8 +805,20 @@ fn unk(o: UnOp) -> u8 {
     }
 }
 
-fn key_of(i: &crate::fir::Inst) -> Option<Key> {
+fn key_of(i: &crate::fir::Inst, ro: &HashMap<Val, u64>) -> Option<Key> {
     match &i.op {
+        Op::GlobalAddr { name } => Some(Key::GAddr(name.clone())),
+        Op::Simd { kind, args, imm } if kind.is_pure() && i.ty == FTy::V128 => {
+            Some(Key::Simd(*kind, args.clone(), *imm))
+        }
+        Op::Load { addr } if ro.get(addr).map(|&n| i.ty.bytes() <= n).unwrap_or(false) => {
+            Some(Key::RoLoad(tyk(i.ty), *addr))
+        }
+        Op::Simd { kind: crate::simd::SimdKind::Load, args, .. }
+            if args.len() == 1 && ro.get(&args[0]).map(|&n| n >= 16).unwrap_or(false) =>
+        {
+            Some(Key::RoVLoad(args[0]))
+        }
         Op::Const(c) => Some(Key::Const(tyk(i.ty), *c)),
         Op::Bin(o, a, b) => Some(Key::Bin(tyk(i.ty), bink(*o), *a, *b)),
         Op::Cmp { op, ty, a, b } => Some(Key::Cmp(tyk(*ty), cmpk(*op), *a, *b)),
@@ -792,6 +840,7 @@ fn cse(f: &mut Func) -> usize {
     }
     let dom = crate::mem2reg::dominators(f);
     let n = f.blocks.len();
+    let ro = crate::licm::rodata_addrs(f);
     let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::new();
     let mut map: HashMap<Val, Val> = HashMap::new();
     for bi in 0..n {
@@ -804,7 +853,7 @@ fn cse(f: &mut Func) -> usize {
             if f.is_secret(d) {
                 continue;
             }
-            let k = match key_of(inst) {
+            let k = match key_of(inst, &ro) {
                 Some(k) => k,
                 None => continue,
             };
