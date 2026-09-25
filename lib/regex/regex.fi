@@ -1,0 +1,1339 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/regex/regex.fi -- regular expressions in linear time.
+//
+// OpenPlan LIB-008 (find and replace, F-EDT-014; later filters in reports
+// and rules). Until this file the only regular expressions in Firn were
+// the JavaScript engine's (lib/js/regexp.fi), bound to the JS value model.
+//
+//     import regex.regex
+//     var r: regex.Regex = regex.regex_compile("-K(\\d+)", regex.REGEX_ICASE) catch |e| ...
+//     var m: regex.Match = regex.match_new()
+//     if regex.regex_find(&r, "-Q1 -k12", 0, &m) { ... m.start, m.end ... }
+//     let t: str = regex.regex_replace_all(&r, "-K1 -K2", "-Q$1")      // "-Q1 -Q2"
+//
+// THE GUARANTEE is the one of RE2 and of Rust's regex crate: the time is
+// linear in the length of the text times the size of the pattern, for
+// every pattern and every text. There is no backtracking, so there is no
+// pattern that takes exponential time ("catastrophic backtracking",
+// ReDoS). The price is the same as there: no backreferences (\1) and no
+// lookaround ((?=...), (?<=...)) -- both are refused with
+// `RegexError::Unsupported`, not approximated.
+//
+// THE METHOD. The pattern is parsed into a tree, the tree is compiled into
+// a program for a small machine (Thompson 1968), and the program runs on
+// all positions at once as a Pike VM (Pike 1987, Cox 2009): every thread
+// is a program counter plus its capture positions; the threads advance
+// together over the text, one character at a time, and a thread that
+// arrives where another already is is dropped. Threads keep their
+// priority order, which gives the Perl/RE2 LEFTMOST-FIRST semantics:
+// `a|ab` on "ab" matches "a", `a*?` is lazy.
+//
+// THE SYNTAX (RE2's, in the parts a find-and-replace needs):
+//   literals, `.`, `[abc]`, `[^a-z]`, `[\d_]`, escapes \n \t \r \f \v \0
+//   \xHH \x{HHHH} and every punctuation character escaped;
+//   \d \D \w \W \s \S (ASCII classes, as in RE2), \b \B word boundary,
+//   ^ $ (text start/end; line start/end with REGEX_MULTILINE), \A \z;
+//   ( ) capturing, (?: ) not capturing, (?P<name> ) and (?<name> ) named;
+//   | alternation; * + ? {n} {n,} {n,m} and their lazy forms *? +? ?? {..}?;
+//   inline flags (?i) (?m) (?s) (?-i) and scoped (?i: ... ).
+// The text is UTF-8 and is matched by CODE POINT: `.` is one character,
+// `[äö]` is two characters, not four octets. An invalid octet in the text
+// is one character U+FFFD, which only `.` and negated classes match.
+//
+// CASE-INSENSITIVE matching (REGEX_ICASE, (?i)) folds ASCII, Latin-1,
+// Latin Extended-A, Greek and Cyrillic by simple one-to-one case mapping
+// (Ä/ä, Ω/ω, Ж/ж). One-to-many foldings (ß = ss) are not done.
+//
+// LIMITS: 31 capture groups, a program of at most 20,000 instructions
+// (`x{1000}{1000}` is refused with `TooBig`, not built), repetition counts
+// up to 1000.
+
+import std.rt
+import std.vec
+
+export {
+    Regex, Match, RegexError,
+    REGEX_ICASE, REGEX_MULTILINE, REGEX_DOTALL,
+    regex_compile, regex_free, regex_find, regex_is_match, regex_replace_all,
+    regex_group_count, regex_group_index, regex_error_offset,
+    match_new, match_group, match_group_text,
+}
+
+error RegexError {
+    Syntax, // the pattern is not well formed (see regex_error_offset)
+    Unsupported, // backreference or lookaround: not possible in linear time
+    TooBig, // over the size or repetition limit
+    TooManyGroups, // more than 31 capture groups
+}
+
+const REGEX_ICASE: u32 = 1
+const REGEX_MULTILINE: u32 = 2
+const REGEX_DOTALL: u32 = 4
+
+const MAX_GROUPS: u32 = 32 // group 0 = the whole match
+const MAX_PROG: usize = 20000
+const MAX_REPEAT: u32 = 1000
+const INF: u32 = 4294967295
+
+// ---- the tree
+const N_EMPTY: u32 = 0
+const N_LIT: u32 = 1 // a = code point, b = 1 if case-insensitive
+const N_ANY: u32 = 2 // a = 1 if it matches \n as well
+const N_CLASS: u32 = 3 // a = first range, b = count, c = flags (1 negated, 2 icase)
+const N_CAT: u32 = 4 // left, right
+const N_ALT: u32 = 5 // left, right
+const N_REPEAT: u32 = 6 // left = child, a = min, b = max, c = 1 greedy
+const N_GROUP: u32 = 7 // left = child, a = capture index (0 = none)
+const N_ASSERT: u32 = 8 // a = kind
+
+// assertion kinds
+const A_TEXT_START: u32 = 0
+const A_TEXT_END: u32 = 1
+const A_LINE_START: u32 = 2
+const A_LINE_END: u32 = 3
+const A_WORD: u32 = 4
+const A_NOT_WORD: u32 = 5
+
+// ---- the program
+const I_CHAR: u32 = 0 // a = code point
+const I_CHAR_I: u32 = 1 // a = folded code point
+const I_ANY: u32 = 2 // any but \n
+const I_ANY_NL: u32 = 3 // any
+const I_CLASS: u32 = 4 // a = first range, b = count, c = flags
+const I_SPLIT: u32 = 5 // a preferred, b other
+const I_JMP: u32 = 6 // a
+const I_SAVE: u32 = 7 // a = slot
+const I_ASSERT: u32 = 8 // a = kind
+const I_MATCH: u32 = 9
+
+struct Node {
+    kind: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    left: u32,
+    right: u32,
+}
+
+struct Inst {
+    op: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+}
+
+struct Regex {
+    prog: Vec[Inst],
+    ranges: Vec[u32], // pairs lo, hi (inclusive)
+    ngroups: u32, // including group 0
+    names: Vec[str], // index = group, "" = unnamed
+}
+
+struct Match {
+    start: i64,
+    end: i64,
+    caps: [i64; 64], // 2 per group, -1 = did not take part
+}
+
+// ------------------------------------------------------------ Case
+
+// The simple lower-case partner of `c` (or `c`).
+fn lower(c: u32) -> u32 {
+    if c >= 65 && c <= 90 { return c + 32 }
+    if c < 192 { return c }
+    if c >= 192 && c <= 222 && c != 215 { return c + 32 }
+    if c >= 256 && c <= 311 && c != 304 && c != 305 && c % 2 == 0 { return c + 1 }
+    if c >= 313 && c <= 328 && c % 2 == 1 { return c + 1 }
+    if c >= 330 && c <= 375 && c % 2 == 0 { return c + 1 }
+    if c == 376 { return 255 }
+    if c >= 377 && c <= 382 && c % 2 == 1 { return c + 1 }
+    if c >= 913 && c <= 937 && c != 930 { return c + 32 }
+    if c >= 1040 && c <= 1071 { return c + 32 }
+    if c >= 1024 && c <= 1039 { return c + 80 }
+    return c
+}
+
+fn upper(c: u32) -> u32 {
+    if c >= 97 && c <= 122 { return c - 32 }
+    if c < 224 { return c }
+    if c >= 224 && c <= 254 && c != 247 { return c - 32 }
+    if c == 255 { return 376 }
+    if c >= 257 && c <= 311 && c != 305 && c % 2 == 1 { return c - 1 }
+    if c >= 314 && c <= 328 && c % 2 == 0 { return c - 1 }
+    if c >= 331 && c <= 375 && c % 2 == 1 { return c - 1 }
+    if c >= 378 && c <= 382 && c % 2 == 0 { return c - 1 }
+    if c >= 945 && c <= 969 && c != 962 { return c - 32 }
+    if c == 962 { return 931 } // final sigma
+    if c >= 1072 && c <= 1103 { return c - 32 }
+    if c >= 1104 && c <= 1119 { return c - 80 }
+    return c
+}
+
+fn fold(c: u32) -> u32 {
+    let l: u32 = lower(c)
+    if l == 962 { return 963 } // ς and σ are the same letter
+    return l
+}
+
+// ------------------------------------------------------------ Parser
+
+struct Parser {
+    p: u64,
+    n: usize,
+    i: usize,
+    flags: u32,
+    nodes: Vec[Node],
+    ranges: Vec[u32],
+    ngroups: u32,
+    names: Vec[str],
+    err: u32, // 0 fine, 1 syntax, 2 unsupported, 3 too big, 4 groups
+    err_at: usize,
+}
+
+static mut last_error_offset: usize = 0
+
+// The octet offset in the pattern where the last compile error was found.
+fn regex_error_offset() -> usize {
+    return last_error_offset
+}
+
+fn fail(ps: *mut Parser, kind: u32) -> u32 {
+    if (*ps).err == 0 {
+        (*ps).err = kind
+        (*ps).err_at = (*ps).i
+    }
+    return 0 as u32
+}
+
+fn node(ps: *mut Parser, kind: u32, a: u32, b: u32, c: u32, left: u32, right: u32) -> u32 {
+    vec_push[Node](&(*ps).nodes, Node { kind: kind, a: a, b: b, c: c, left: left, right: right })
+    return (vec_len[Node](&(*ps).nodes) - 1) as u32
+}
+
+fn nd(ps: *mut Parser, k: u32) -> *mut Node {
+    return vec_elem_ptr[Node](&(*ps).nodes, k as usize)
+}
+
+fn at_end(ps: *mut Parser) -> bool {
+    return (*ps).i >= (*ps).n
+}
+
+fn peek(ps: *mut Parser) -> u32 {
+    if (*ps).i >= (*ps).n {
+        return 0 as u32
+    }
+    return rt.ld8((*ps).p, (*ps).i) as u32
+}
+
+// the next code point of the pattern (UTF-8), advancing
+fn next_cp(ps: *mut Parser) -> u32 {
+    var len: usize = 0
+    let c: u32 = decode((*ps).p, (*ps).n, (*ps).i, &len)
+    (*ps).i = (*ps).i + len
+    return c
+}
+
+// UTF-8 at `i` in p/n: the code point and its length (U+FFFD, 1 if broken)
+fn decode(p: u64, n: usize, i: usize, len: *mut usize) -> u32 {
+    let c: u32 = rt.ld8(p, i) as u32
+    if c < 128 {
+        *len = 1
+        return c
+    }
+    var more: usize = 0
+    var v: u32 = 0
+    var min: u32 = 0
+    if c >= 194 && c <= 223 {
+        more = 1
+        v = c & 31
+        min = 128
+    } else if c >= 224 && c <= 239 {
+        more = 2
+        v = c & 15
+        min = 2048
+    } else if c >= 240 && c <= 244 {
+        more = 3
+        v = c & 7
+        min = 65536
+    } else {
+        *len = 1
+        return 65533 as u32
+    }
+    var k: usize = 1
+    while k <= more {
+        if i + k >= n {
+            *len = 1
+            return 65533 as u32
+        }
+        let d: u32 = rt.ld8(p, i + k) as u32
+        if (d & 192) != 128 {
+            *len = 1
+            return 65533 as u32
+        }
+        v = (v << 6) | (d & 63)
+        k = k + 1
+    }
+    if v < min || v > 1114111 || (v >= 55296 && v <= 57343) {
+        *len = 1
+        return 65533 as u32
+    }
+    *len = more + 1
+    return v
+}
+
+fn is_digit(c: u32) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn hexval(c: u32) -> i64 {
+    if c >= 48 && c <= 57 { return (c - 48) as i64 }
+    if c >= 97 && c <= 102 { return (c - 87) as i64 }
+    if c >= 65 && c <= 70 { return (c - 55) as i64 }
+    return -1
+}
+
+fn add_range(ps: *mut Parser, lo: u32, hi: u32) {
+    vec_push[u32](&(*ps).ranges, lo)
+    vec_push[u32](&(*ps).ranges, hi)
+}
+
+// the ranges of \d \w \s (negated: the complement), appended
+fn perl_class(ps: *mut Parser, c: u32) {
+    let neg: bool = c == 68 || c == 87 || c == 83 // D W S
+    let k: u32 = lower(c)
+    var lo: [u32; 8] = [0 as u32; 8]
+    var hi: [u32; 8] = [0 as u32; 8]
+    var n: usize = 0
+    if k == 100 { // d
+        lo[0] = 48
+        hi[0] = 57
+        n = 1
+    } else if k == 119 { // w
+        lo[0] = 48
+        hi[0] = 57
+        lo[1] = 65
+        hi[1] = 90
+        lo[2] = 95
+        hi[2] = 95
+        lo[3] = 97
+        hi[3] = 122
+        n = 4
+    } else { // s: \t \n \v \f \r and blank
+        lo[0] = 9
+        hi[0] = 13
+        lo[1] = 32
+        hi[1] = 32
+        n = 2
+    }
+    if !neg {
+        var i: usize = 0
+        while i < n {
+            add_range(ps, lo[i], hi[i])
+            i = i + 1
+        }
+        return
+    }
+    var from: u32 = 0
+    var i: usize = 0
+    while i < n {
+        if lo[i] > from {
+            add_range(ps, from, lo[i] - 1)
+        }
+        from = hi[i] + 1
+        i = i + 1
+    }
+    add_range(ps, from, 1114111)
+}
+
+// an escape after the backslash, outside a class: a node
+fn parse_escape(ps: *mut Parser) -> u32 {
+    if at_end(ps) {
+        return fail(ps, 1)
+    }
+    let c: u32 = next_cp(ps)
+    if c == 100 || c == 68 || c == 119 || c == 87 || c == 115 || c == 83 {
+        let first: u32 = (vec_len[u32](&(*ps).ranges) / 2) as u32
+        perl_class(ps, c)
+        let count: u32 = (vec_len[u32](&(*ps).ranges) / 2) as u32 - first
+        return node(ps, N_CLASS, first, count, 0, 0, 0)
+    }
+    if c == 98 { return node(ps, N_ASSERT, A_WORD, 0, 0, 0, 0) } // \b
+    if c == 66 { return node(ps, N_ASSERT, A_NOT_WORD, 0, 0, 0, 0) } // \B
+    if c == 65 { return node(ps, N_ASSERT, A_TEXT_START, 0, 0, 0, 0) } // \A
+    if c == 122 { return node(ps, N_ASSERT, A_TEXT_END, 0, 0, 0, 0) } // \z
+    if c >= 49 && c <= 57 {
+        return fail(ps, 2) // backreference
+    }
+    if c == 107 { // \k<name>
+        return fail(ps, 2)
+    }
+    let v: u32 = escape_char(ps, c)
+    if (*ps).err != 0 {
+        return 0 as u32
+    }
+    return lit(ps, v)
+}
+
+// the literal code point an escape stands for (after the backslash `c`)
+fn escape_char(ps: *mut Parser, c: u32) -> u32 {
+    if c == 110 { return 10 as u32 }
+    if c == 116 { return 9 as u32 }
+    if c == 114 { return 13 as u32 }
+    if c == 102 { return 12 as u32 }
+    if c == 118 { return 11 as u32 }
+    if c == 97 { return 7 as u32 }
+    if c == 48 { return 0 as u32 }
+    if c == 120 { // \xHH or \x{H...}
+        if peek(ps) == 123 {
+            (*ps).i = (*ps).i + 1
+            var v: i64 = 0
+            var digits: u32 = 0
+            while !at_end(ps) && peek(ps) != 125 {
+                let h: i64 = hexval(peek(ps))
+                if h < 0 || digits >= 6 {
+                    return fail(ps, 1)
+                }
+                v = v * 16 + h
+                digits = digits + 1
+                (*ps).i = (*ps).i + 1
+            }
+            if at_end(ps) || digits == 0 || v > 1114111 {
+                return fail(ps, 1)
+            }
+            (*ps).i = (*ps).i + 1
+            return v as u32
+        }
+        if (*ps).i + 2 > (*ps).n {
+            return fail(ps, 1)
+        }
+        let h1: i64 = hexval(peek(ps))
+        (*ps).i = (*ps).i + 1
+        let h2: i64 = hexval(peek(ps))
+        (*ps).i = (*ps).i + 1
+        if h1 < 0 || h2 < 0 {
+            return fail(ps, 1)
+        }
+        return (h1 * 16 + h2) as u32
+    }
+    // any other non-alphanumeric ASCII character stands for itself
+    let alnum: bool = is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    if c < 128 && !alnum {
+        return c
+    }
+    return fail(ps, 1)
+}
+
+fn lit(ps: *mut Parser, c: u32) -> u32 {
+    if ((*ps).flags & REGEX_ICASE) != 0 && (lower(c) != c || upper(c) != c) {
+        return node(ps, N_LIT, fold(c), 1, 0, 0, 0)
+    }
+    return node(ps, N_LIT, c, 0, 0, 0, 0)
+}
+
+// [ ... ] -- the opening bracket is already consumed
+fn parse_class(ps: *mut Parser) -> u32 {
+    var neg: bool = false
+    if peek(ps) == 94 {
+        neg = true
+        (*ps).i = (*ps).i + 1
+    }
+    let first: u32 = (vec_len[u32](&(*ps).ranges) / 2) as u32
+    var count_items: u32 = 0
+    while true {
+        if at_end(ps) {
+            return fail(ps, 1)
+        }
+        // "]" first in the class is a literal
+        if peek(ps) == 93 && count_items > 0 {
+            (*ps).i = (*ps).i + 1
+            break
+        }
+        count_items = count_items + 1
+        var lo: u32 = 0
+        let c: u32 = next_cp(ps)
+        if c == 91 && peek(ps) == 58 {
+            return fail(ps, 2) // [:alpha:] POSIX classes: not supported
+        }
+        if c == 92 {
+            if at_end(ps) {
+                return fail(ps, 1)
+            }
+            let e: u32 = next_cp(ps)
+            if e == 100 || e == 68 || e == 119 || e == 87 || e == 115 || e == 83 {
+                perl_class(ps, e)
+                continue
+            }
+            if e == 98 {
+                lo = 8 // \b in a class is backspace
+            } else {
+                lo = escape_char(ps, e)
+                if (*ps).err != 0 {
+                    return 0 as u32
+                }
+            }
+        } else {
+            lo = c
+        }
+        var hi: u32 = lo
+        // a range? "-" followed by something other than "]"
+        if peek(ps) == 45 && (*ps).i + 1 < (*ps).n && rt.ld8((*ps).p, (*ps).i + 1) != 93 as u8 {
+            (*ps).i = (*ps).i + 1
+            var h: u32 = next_cp(ps)
+            if h == 92 {
+                if at_end(ps) {
+                    return fail(ps, 1)
+                }
+                h = escape_char(ps, next_cp(ps))
+                if (*ps).err != 0 {
+                    return 0 as u32
+                }
+            }
+            if h < lo {
+                return fail(ps, 1) // [z-a]
+            }
+            hi = h
+        }
+        add_range(ps, lo, hi)
+    }
+    let count: u32 = (vec_len[u32](&(*ps).ranges) / 2) as u32 - first
+    var fl: u32 = 0
+    if neg {
+        fl = fl | 1
+    }
+    if ((*ps).flags & REGEX_ICASE) != 0 {
+        fl = fl | 2
+    }
+    return node(ps, N_CLASS, first, count, fl, 0, 0)
+}
+
+// a decimal number; -1 if there is none
+fn number(ps: *mut Parser) -> i64 {
+    if !is_digit(peek(ps)) {
+        return -1
+    }
+    var v: i64 = 0
+    while is_digit(peek(ps)) {
+        v = v * 10 + (peek(ps) - 48) as i64
+        if v > 100000 {
+            v = 100000
+        }
+        (*ps).i = (*ps).i + 1
+    }
+    return v
+}
+
+// inline flags after "(?": "i", "m", "s", "-" ... up to ")" or ":"
+fn parse_flags(ps: *mut Parser, flags: *mut u32) -> bool {
+    var on: bool = true
+    var any: bool = false
+    while !at_end(ps) {
+        let c: u32 = peek(ps)
+        if c == 41 || c == 58 {
+            return any
+        }
+        var bit: u32 = 0
+        if c == 105 {
+            bit = REGEX_ICASE
+        } else if c == 109 {
+            bit = REGEX_MULTILINE
+        } else if c == 115 {
+            bit = REGEX_DOTALL
+        } else if c == 45 && on {
+            on = false
+            (*ps).i = (*ps).i + 1
+            continue
+        } else {
+            return false
+        }
+        if on {
+            *flags = *flags | bit
+        } else {
+            *flags = *flags & (7 - bit)
+        }
+        any = true
+        (*ps).i = (*ps).i + 1
+    }
+    return false
+}
+
+fn parse_group(ps: *mut Parser) -> u32 {
+    (*ps).i = (*ps).i + 1 // "("
+    var cap: u32 = 0
+    let saved: u32 = (*ps).flags
+    if peek(ps) == 63 { // (?
+        (*ps).i = (*ps).i + 1
+        let k: u32 = peek(ps)
+        var after: u32 = 0
+        if (*ps).i + 1 < (*ps).n {
+            after = rt.ld8((*ps).p, (*ps).i + 1) as u32
+        }
+        if k == 58 { // (?:
+            (*ps).i = (*ps).i + 1
+        } else if k == 61 || k == 33 {
+            return fail(ps, 2) // lookahead
+        } else if k == 60 && (after == 61 || after == 33) {
+            return fail(ps, 2) // lookbehind
+        } else if k == 80 || k == 60 { // (?P<name> or (?<name>
+            if k == 80 {
+                (*ps).i = (*ps).i + 1
+                if peek(ps) != 60 {
+                    return fail(ps, 1)
+                }
+            }
+            (*ps).i = (*ps).i + 1
+            let st: usize = (*ps).i
+            while !at_end(ps) && peek(ps) != 62 {
+                let ch: u32 = peek(ps)
+                let ok: bool = is_digit(ch) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95
+                if !ok {
+                    return fail(ps, 1)
+                }
+                (*ps).i = (*ps).i + 1
+            }
+            if at_end(ps) || (*ps).i == st {
+                return fail(ps, 1)
+            }
+            let name: str = __str_copy(str { p: rt.ptr_of((*ps).p + st as u64), n: (*ps).i - st })
+            (*ps).i = (*ps).i + 1
+            if (*ps).ngroups >= MAX_GROUPS {
+                return fail(ps, 4)
+            }
+            cap = (*ps).ngroups
+            (*ps).ngroups = (*ps).ngroups + 1
+            vec_push[str](&(*ps).names, name)
+        } else {
+            var fl: u32 = (*ps).flags
+            if !parse_flags(ps, &fl) {
+                return fail(ps, 1)
+            }
+            if peek(ps) == 41 {
+                // (?i) -- for the rest of the enclosing group
+                (*ps).i = (*ps).i + 1
+                (*ps).flags = fl
+                return node(ps, N_EMPTY, 0, 0, 0, 0, 0)
+            }
+            (*ps).i = (*ps).i + 1 // ":"
+            (*ps).flags = fl
+        }
+    } else {
+        if (*ps).ngroups >= MAX_GROUPS {
+            return fail(ps, 4)
+        }
+        cap = (*ps).ngroups
+        (*ps).ngroups = (*ps).ngroups + 1
+        vec_push[str](&(*ps).names, "")
+    }
+    let inner: u32 = parse_alt(ps)
+    (*ps).flags = saved
+    if (*ps).err != 0 {
+        return 0 as u32
+    }
+    if peek(ps) != 41 || at_end(ps) {
+        return fail(ps, 1)
+    }
+    (*ps).i = (*ps).i + 1
+    return node(ps, N_GROUP, cap, 0, 0, inner, 0)
+}
+
+fn parse_atom(ps: *mut Parser) -> u32 {
+    let c: u32 = peek(ps)
+    if c == 40 {
+        return parse_group(ps)
+    }
+    if c == 91 { // [
+        (*ps).i = (*ps).i + 1
+        return parse_class(ps)
+    }
+    if c == 46 { // .
+        (*ps).i = (*ps).i + 1
+        var nl: u32 = 0
+        if ((*ps).flags & REGEX_DOTALL) != 0 {
+            nl = 1
+        }
+        return node(ps, N_ANY, nl, 0, 0, 0, 0)
+    }
+    if c == 94 { // ^
+        (*ps).i = (*ps).i + 1
+        if ((*ps).flags & REGEX_MULTILINE) != 0 {
+            return node(ps, N_ASSERT, A_LINE_START, 0, 0, 0, 0)
+        }
+        return node(ps, N_ASSERT, A_TEXT_START, 0, 0, 0, 0)
+    }
+    if c == 36 { // $
+        (*ps).i = (*ps).i + 1
+        if ((*ps).flags & REGEX_MULTILINE) != 0 {
+            return node(ps, N_ASSERT, A_LINE_END, 0, 0, 0, 0)
+        }
+        return node(ps, N_ASSERT, A_TEXT_END, 0, 0, 0, 0)
+    }
+    if c == 92 { // backslash
+        (*ps).i = (*ps).i + 1
+        return parse_escape(ps)
+    }
+    if c == 42 || c == 43 || c == 63 {
+        return fail(ps, 1) // a quantifier with nothing before it
+    }
+    return lit(ps, next_cp(ps))
+}
+
+// an atom with its quantifiers
+fn parse_repeat(ps: *mut Parser) -> u32 {
+    var a: u32 = parse_atom(ps)
+    while (*ps).err == 0 && !at_end(ps) {
+        let c: u32 = peek(ps)
+        var min: u32 = 0
+        var max: u32 = INF
+        if c == 42 {
+            (*ps).i = (*ps).i + 1
+        } else if c == 43 {
+            (*ps).i = (*ps).i + 1
+            min = 1
+        } else if c == 63 {
+            (*ps).i = (*ps).i + 1
+            max = 1
+        } else if c == 123 {
+            // {n}, {n,}, {n,m} -- anything else is a literal "{"
+            let st: usize = (*ps).i
+            (*ps).i = (*ps).i + 1
+            let lo: i64 = number(ps)
+            if lo < 0 {
+                (*ps).i = st
+                return a
+            }
+            var hi: i64 = lo
+            if peek(ps) == 44 {
+                (*ps).i = (*ps).i + 1
+                hi = number(ps)
+                if hi < 0 {
+                    hi = -2 // open
+                }
+            }
+            if peek(ps) != 125 || at_end(ps) {
+                (*ps).i = st
+                return a
+            }
+            (*ps).i = (*ps).i + 1
+            if lo > MAX_REPEAT as i64 || hi > MAX_REPEAT as i64 {
+                return fail(ps, 3)
+            }
+            if hi != -2 && hi < lo {
+                return fail(ps, 1)
+            }
+            min = lo as u32
+            if hi == -2 {
+                max = INF
+            } else {
+                max = hi as u32
+            }
+        } else {
+            return a
+        }
+        var greedy: u32 = 1
+        if peek(ps) == 63 && !at_end(ps) {
+            (*ps).i = (*ps).i + 1
+            greedy = 0
+        }
+        let k: u32 = (*nd(ps, a)).kind
+        if k == N_EMPTY {
+            return fail(ps, 1) // (?i)* and the like
+        }
+        a = node(ps, N_REPEAT, min, max, greedy, a, 0)
+        // a** / a+* / a{2}{3}: refused, as RE2 and Python do
+        let q: u32 = peek(ps)
+        if !at_end(ps) && (q == 42 || q == 43 || q == 63) {
+            return fail(ps, 1)
+        }
+        if !at_end(ps) && q == 123 && (*ps).i + 1 < (*ps).n && is_digit(rt.ld8((*ps).p, (*ps).i + 1) as u32) {
+            return fail(ps, 1)
+        }
+    }
+    return a
+}
+
+// a "{" that is not a quantifier stands for itself; a literal "{" at the
+// start of an atom must not be read as a quantifier
+fn parse_concat(ps: *mut Parser) -> u32 {
+    var left: u32 = node(ps, N_EMPTY, 0, 0, 0, 0, 0)
+    while (*ps).err == 0 && !at_end(ps) && peek(ps) != 124 && peek(ps) != 41 {
+        let r: u32 = parse_repeat(ps)
+        left = node(ps, N_CAT, 0, 0, 0, left, r)
+    }
+    return left
+}
+
+fn parse_alt(ps: *mut Parser) -> u32 {
+    var left: u32 = parse_concat(ps)
+    while (*ps).err == 0 && !at_end(ps) && peek(ps) == 124 {
+        (*ps).i = (*ps).i + 1
+        let r: u32 = parse_concat(ps)
+        left = node(ps, N_ALT, 0, 0, 0, left, r)
+    }
+    return left
+}
+
+// ------------------------------------------------------------ Compiler
+
+fn emit(r: *mut Regex, op: u32, a: u32, b: u32, c: u32) -> u32 {
+    vec_push[Inst](&(*r).prog, Inst { op: op, a: a, b: b, c: c })
+    return (vec_len[Inst](&(*r).prog) - 1) as u32
+}
+
+fn inst(r: *mut Regex, k: u32) -> *mut Inst {
+    return vec_elem_ptr[Inst](&(*r).prog, k as usize)
+}
+
+fn pc(r: *mut Regex) -> u32 {
+    return vec_len[Inst](&(*r).prog) as u32
+}
+
+// false = the program grew over the limit
+fn compile_node(r: *mut Regex, ps: *mut Parser, k: u32) -> bool {
+    if vec_len[Inst](&(*r).prog) > MAX_PROG {
+        return false
+    }
+    let n: Node = *nd(ps, k)
+    if n.kind == N_EMPTY {
+        return true
+    }
+    if n.kind == N_LIT {
+        if n.b != 0 {
+            emit(r, I_CHAR_I, n.a, 0, 0)
+        } else {
+            emit(r, I_CHAR, n.a, 0, 0)
+        }
+        return true
+    }
+    if n.kind == N_ANY {
+        if n.a != 0 {
+            emit(r, I_ANY_NL, 0, 0, 0)
+        } else {
+            emit(r, I_ANY, 0, 0, 0)
+        }
+        return true
+    }
+    if n.kind == N_CLASS {
+        emit(r, I_CLASS, n.a, n.b, n.c)
+        return true
+    }
+    if n.kind == N_ASSERT {
+        emit(r, I_ASSERT, n.a, 0, 0)
+        return true
+    }
+    if n.kind == N_CAT {
+        return compile_node(r, ps, n.left) && compile_node(r, ps, n.right)
+    }
+    if n.kind == N_ALT {
+        let split: u32 = emit(r, I_SPLIT, 0, 0, 0)
+        (*inst(r, split)).a = pc(r)
+        if !compile_node(r, ps, n.left) { return false }
+        let jmp: u32 = emit(r, I_JMP, 0, 0, 0)
+        (*inst(r, split)).b = pc(r)
+        if !compile_node(r, ps, n.right) { return false }
+        (*inst(r, jmp)).a = pc(r)
+        return true
+    }
+    if n.kind == N_GROUP {
+        if n.a == 0 {
+            return compile_node(r, ps, n.left)
+        }
+        emit(r, I_SAVE, n.a * 2, 0, 0)
+        if !compile_node(r, ps, n.left) { return false }
+        emit(r, I_SAVE, n.a * 2 + 1, 0, 0)
+        return true
+    }
+    // N_REPEAT: min copies, then the optional part
+    var i: u32 = 0
+    while i < n.a {
+        if !compile_node(r, ps, n.left) { return false }
+        i = i + 1
+    }
+    if n.b == INF {
+        // L: SPLIT body, out; body; JMP L
+        let split: u32 = emit(r, I_SPLIT, 0, 0, 0)
+        let body: u32 = pc(r)
+        if !compile_node(r, ps, n.left) { return false }
+        emit(r, I_JMP, split, 0, 0)
+        let out: u32 = pc(r)
+        if n.c != 0 {
+            (*inst(r, split)).a = body
+            (*inst(r, split)).b = out
+        } else {
+            (*inst(r, split)).a = out
+            (*inst(r, split)).b = body
+        }
+        return true
+    }
+    // up to max - min optional copies, nested: SPLIT body, out; body; ...
+    var splits: Vec[u32] = vec_new[u32]()
+    i = n.a
+    while i < n.b {
+        let split: u32 = emit(r, I_SPLIT, 0, 0, 0)
+        vec_push[u32](&splits, split)
+        (*inst(r, split)).a = pc(r)
+        if !compile_node(r, ps, n.left) {
+            vec_free[u32](&splits)
+            return false
+        }
+        i = i + 1
+    }
+    let out: u32 = pc(r)
+    var s: usize = 0
+    while s < vec_len[u32](&splits) {
+        let sp: u32 = vec_at[u32](&splits, s)
+        if n.c != 0 {
+            (*inst(r, sp)).b = out
+        } else {
+            (*inst(r, sp)).b = (*inst(r, sp)).a
+            (*inst(r, sp)).a = out
+        }
+        s = s + 1
+    }
+    vec_free[u32](&splits)
+    return true
+}
+
+// Compiles `pattern` with the flags REGEX_ICASE, REGEX_MULTILINE,
+// REGEX_DOTALL (or'ed).
+fn regex_compile(pattern: str, flags: u32) -> RegexError!Regex {
+    var ps: Parser = Parser { p: pattern.p as u64, n: pattern.n, i: 0, flags: flags & 7, nodes: vec_new[Node](),
+        ranges: vec_new[u32](), ngroups: 1, names: vec_new[str](), err: 0, err_at: 0 }
+    vec_push[str](&ps.names, "")
+    let root: u32 = parse_alt(&ps)
+    if ps.err == 0 && !at_end(&ps) {
+        fail(&ps, 1) // an unmatched ")"
+    }
+    var r: Regex = Regex { prog: vec_new[Inst](), ranges: ps.ranges, ngroups: ps.ngroups, names: ps.names }
+    var err: u32 = ps.err
+    if err == 0 {
+        emit(&r, I_SAVE, 0, 0, 0)
+        if !compile_node(&r, &ps, root) {
+            err = 3
+        } else {
+            emit(&r, I_SAVE, 1, 0, 0)
+            emit(&r, I_MATCH, 0, 0, 0)
+        }
+        if vec_len[Inst](&r.prog) > MAX_PROG {
+            err = 3
+        }
+    }
+    vec_free[Node](&ps.nodes)
+    if err != 0 {
+        last_error_offset = ps.err_at
+        regex_free(&r)
+        if err == 2 { return RegexError::Unsupported }
+        if err == 3 { return RegexError::TooBig }
+        if err == 4 { return RegexError::TooManyGroups }
+        return RegexError::Syntax
+    }
+    return r
+}
+
+fn regex_free(r: *mut Regex) {
+    vec_free[Inst](&(*r).prog)
+    vec_free[u32](&(*r).ranges)
+    vec_free[str](&(*r).names)
+}
+
+// Number of groups including group 0 (the whole match).
+fn regex_group_count(r: *mut Regex) -> u32 {
+    return (*r).ngroups
+}
+
+// The number of the group called `name`, or -1.
+fn regex_group_index(r: *mut Regex, name: str) -> i64 {
+    var i: usize = 1
+    while i < vec_len[str](&(*r).names) {
+        if *vec_elem_ptr[str](&(*r).names, i) == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ------------------------------------------------------------ The machine
+
+struct Threads {
+    pcs: Vec[u32], // the program counters in priority order
+    caps: Vec[i64], // ncap per thread, parallel to pcs
+    mark: Vec[u32], // generation per pc: in the list already?
+}
+
+struct Vm {
+    r: u64, // *mut Regex
+    p: u64, // the text
+    n: usize,
+    ncap: usize,
+    gen: u32,
+    cur: Vec[i64], // capture positions while following epsilon edges
+    stack: Vec[u64], // (pc << 1) | 0 = visit, (slot << 33) | 1 = restore
+    saved: Vec[i64], // old values for the restore entries
+}
+
+fn is_word(c: u32) -> bool {
+    return is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+fn assert_holds(vm: *mut Vm, kind: u32, pos: usize) -> bool {
+    let n: usize = (*vm).n
+    if kind == A_TEXT_START { return pos == 0 }
+    if kind == A_TEXT_END { return pos == n }
+    if kind == A_LINE_START { return pos == 0 || rt.ld8((*vm).p, pos - 1) == 10 as u8 }
+    if kind == A_LINE_END { return pos == n || rt.ld8((*vm).p, pos) == 10 as u8 }
+    // \w is ASCII: the octet before and after is enough (a continuation or
+    // lead octet of a longer character is never a word octet)
+    let before: bool = pos > 0 && is_word(rt.ld8((*vm).p, pos - 1) as u32)
+    let after: bool = pos < n && is_word(rt.ld8((*vm).p, pos) as u32)
+    if kind == A_WORD { return before != after }
+    return before == after
+}
+
+// Adds the thread `pc0` with the capture positions in vm.cur to `t`,
+// following JMP, SPLIT, SAVE and ASSERT at `pos` in priority order.
+fn add_thread(vm: *mut Vm, t: *mut Threads, pc0: u32, pos: usize) {
+    let r: *mut Regex = (*vm).r as *mut Regex
+    vec_clear[u64](&(*vm).stack)
+    vec_clear[i64](&(*vm).saved)
+    vec_push[u64](&(*vm).stack, (pc0 as u64) << 1)
+    while vec_len[u64](&(*vm).stack) > 0 {
+        let e: u64 = vec_pop[u64](&(*vm).stack)
+        if (e & 1) == 1 {
+            // restore a capture slot
+            let slot: usize = (e >> 33) as usize
+            *vec_elem_ptr[i64](&(*vm).cur, slot) = vec_pop[i64](&(*vm).saved)
+            continue
+        }
+        let at: u32 = (e >> 1) as u32
+        if vec_at[u32](&(*t).mark, at as usize) == (*vm).gen {
+            continue
+        }
+        vec_set[u32](&(*t).mark, at as usize, (*vm).gen)
+        let ins: Inst = *inst(r, at)
+        if ins.op == I_JMP {
+            vec_push[u64](&(*vm).stack, (ins.a as u64) << 1)
+        } else if ins.op == I_SPLIT {
+            // the preferred branch is explored first: pushed last
+            vec_push[u64](&(*vm).stack, (ins.b as u64) << 1)
+            vec_push[u64](&(*vm).stack, (ins.a as u64) << 1)
+        } else if ins.op == I_SAVE {
+            let slot: usize = ins.a as usize
+            vec_push[i64](&(*vm).saved, *vec_elem_ptr[i64](&(*vm).cur, slot))
+            vec_push[u64](&(*vm).stack, ((slot as u64) << 33) | 1)
+            *vec_elem_ptr[i64](&(*vm).cur, slot) = pos as i64
+            vec_push[u64](&(*vm).stack, ((at + 1) as u64) << 1)
+        } else if ins.op == I_ASSERT {
+            if assert_holds(vm, ins.a, pos) {
+                vec_push[u64](&(*vm).stack, ((at + 1) as u64) << 1)
+            }
+        } else {
+            // a consuming instruction or MATCH: the thread lives here
+            vec_push[u32](&(*t).pcs, at)
+            var k: usize = 0
+            while k < (*vm).ncap {
+                vec_push[i64](&(*t).caps, *vec_elem_ptr[i64](&(*vm).cur, k))
+                k = k + 1
+            }
+        }
+    }
+}
+
+fn class_has(r: *mut Regex, first: u32, count: u32, c: u32) -> bool {
+    var i: u32 = 0
+    while i < count {
+        let lo: u32 = vec_at[u32](&(*r).ranges, ((first + i) * 2) as usize)
+        let hi: u32 = vec_at[u32](&(*r).ranges, ((first + i) * 2 + 1) as usize)
+        if c >= lo && c <= hi {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn step_matches(r: *mut Regex, ins: Inst, c: u32) -> bool {
+    if ins.op == I_CHAR { return c == ins.a }
+    if ins.op == I_CHAR_I { return fold(c) == ins.a }
+    if ins.op == I_ANY { return c != 10 }
+    if ins.op == I_ANY_NL { return true }
+    if ins.op == I_CLASS {
+        var hit: bool = class_has(r, ins.a, ins.b, c)
+        if !hit && (ins.c & 2) != 0 {
+            hit = class_has(r, ins.a, ins.b, lower(c)) || class_has(r, ins.a, ins.b, upper(c))
+            if !hit && (c == 962 || c == 963 || c == 931) {
+                hit = class_has(r, ins.a, ins.b, 962) || class_has(r, ins.a, ins.b, 963) ||
+                class_has(r, ins.a, ins.b, 931)
+            }
+        }
+        if (ins.c & 1) != 0 {
+            return !hit
+        }
+        return hit
+    }
+    return false
+}
+
+fn threads_new(size: usize) -> Threads {
+    var t: Threads = Threads { pcs: vec_new[u32](), caps: vec_new[i64](), mark: vec_new[u32]() }
+    var i: usize = 0
+    while i < size {
+        vec_push[u32](&t.mark, 0 as u32)
+        i = i + 1
+    }
+    return t
+}
+
+fn threads_free(t: *mut Threads) {
+    vec_free[u32](&(*t).pcs)
+    vec_free[i64](&(*t).caps)
+    vec_free[u32](&(*t).mark)
+}
+
+fn match_new() -> Match {
+    return Match { start: -1, end: -1, caps: [-1 as i64; 64] }
+}
+
+// The leftmost-first match starting at octet `from` or later. true = found
+// (m.start, m.end and the groups set).
+fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
+    if from > s.n {
+        return false
+    }
+    let size: usize = vec_len[Inst](&(*r).prog)
+    let ncap: usize = (*r).ngroups as usize * 2
+    var vm: Vm = Vm { r: r as u64, p: s.p as u64, n: s.n, ncap: ncap, gen: 0, cur: vec_new[i64](),
+        stack: vec_new[u64](), saved: vec_new[i64]() }
+    var k: usize = 0
+    while k < ncap {
+        vec_push[i64](&vm.cur, -1)
+        k = k + 1
+    }
+    var la: Threads = threads_new(size)
+    var lb: Threads = threads_new(size)
+    var clist: *mut Threads = &la
+    var nlist: *mut Threads = &lb
+    var found: bool = false
+    var pos: usize = from
+    vm.gen = 1
+    while true {
+        // a new thread at this position, lowest priority -- as long as
+        // nothing has matched yet
+        if !found {
+            k = 0
+            while k < ncap {
+                *vec_elem_ptr[i64](&vm.cur, k) = -1
+                k = k + 1
+            }
+            add_thread(&vm, clist, 0 as u32, pos)
+        }
+        var c: u32 = 0
+        var len: usize = 0
+        if pos < s.n {
+            c = decode(s.p as u64, s.n, pos, &len)
+        }
+        if vec_len[u32](&(*clist).pcs) == 0 {
+            // no thread alive: done if something matched or the text is
+            // used up -- otherwise try the next position
+            if found || pos >= s.n {
+                break
+            }
+            pos = pos + len
+            vm.gen = vm.gen + 1 // the marks of this position are spent
+            continue
+        }
+        vm.gen = vm.gen + 1
+        vec_clear[u32](&(*nlist).pcs)
+        vec_clear[i64](&(*nlist).caps)
+        var t: usize = 0
+        let nt: usize = vec_len[u32](&(*clist).pcs)
+        while t < nt {
+            let tpc: u32 = vec_at[u32](&(*clist).pcs, t)
+            let ins: Inst = *inst(r, tpc)
+            if ins.op == I_MATCH {
+                found = true
+                k = 0
+                while k < ncap {
+                    (*m).caps[k] = *vec_elem_ptr[i64](&(*clist).caps, t * ncap + k)
+                    k = k + 1
+                }
+                // lower-priority threads are cut off
+                t = nt
+            } else {
+                if pos < s.n && step_matches(r, ins, c) {
+                    k = 0
+                    while k < ncap {
+                        *vec_elem_ptr[i64](&vm.cur, k) = *vec_elem_ptr[i64](&(*clist).caps, t * ncap + k)
+                        k = k + 1
+                    }
+                    add_thread(&vm, nlist, tpc + 1, pos + len)
+                }
+                t = t + 1
+            }
+        }
+        if pos >= s.n {
+            break
+        }
+        pos = pos + len
+        let tmp: *mut Threads = clist
+        clist = nlist
+        nlist = tmp
+        // the next position's threads were marked with this generation;
+        // the list about to be filled gets a fresh one
+        vec_clear[u32](&(*nlist).pcs)
+        vec_clear[i64](&(*nlist).caps)
+        if found && vec_len[u32](&(*clist).pcs) == 0 {
+            break
+        }
+    }
+    threads_free(&la)
+    threads_free(&lb)
+    vec_free[i64](&vm.cur)
+    vec_free[u64](&vm.stack)
+    vec_free[i64](&vm.saved)
+    if found {
+        (*m).start = (*m).caps[0]
+        (*m).end = (*m).caps[1]
+        k = ncap
+        while k < 64 {
+            (*m).caps[k] = -1
+            k = k + 1
+        }
+    }
+    return found
+}
+
+fn regex_is_match(r: *mut Regex, s: str) -> bool {
+    var m: Match = match_new()
+    return regex_find(r, s, 0, &m)
+}
+
+// Group `g` of the match: true and its octet range, or false if the group
+// did not take part.
+fn match_group(m: *mut Match, g: u32, start: *mut usize, end: *mut usize) -> bool {
+    if g >= 32 {
+        return false
+    }
+    let a: i64 = (*m).caps[(g * 2) as usize]
+    let b: i64 = (*m).caps[(g * 2 + 1) as usize]
+    if a < 0 || b < 0 {
+        return false
+    }
+    *start = a as usize
+    *end = b as usize
+    return true
+}
+
+// The text of group `g` in `s` ("" if it did not take part).
+fn match_group_text(m: *mut Match, s: str, g: u32) -> str {
+    var a: usize = 0
+    var b: usize = 0
+    if !match_group(m, g, &a, &b) {
+        return ""
+    }
+    return str { p: rt.ptr_of(s.p as u64 + a as u64), n: b - a }
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+// Every non-overlapping match replaced by `repl`, in which $0..$99 or
+// ${n} is a group, ${name} a named group and $$ a dollar sign. A group
+// that did not take part is empty. After an empty match the search moves
+// on by one character, so "" on "ab" matches three times.
+fn regex_replace_all(r: *mut Regex, s: str, repl: str) -> str {
+    var out: rt.Buf = rt.buf_new()
+    var m: Match = match_new()
+    var pos: usize = 0
+    var last: usize = 0
+    while pos <= s.n && regex_find(r, s, pos, &m) {
+        let a: usize = m.start as usize
+        let b: usize = m.end as usize
+        rt.buf_push_bytes(&out, s.p as u64 + last as u64, a - last)
+        expand(r, &m, s, repl, &out)
+        last = b
+        if b > a {
+            pos = b
+        } else {
+            // an empty match: copy one character and go on after it
+            if b >= s.n {
+                break
+            }
+            var len: usize = 0
+            decode(s.p as u64, s.n, b, &len)
+            rt.buf_push_bytes(&out, s.p as u64 + b as u64, len)
+            last = b + len
+            pos = b + len
+        }
+    }
+    if last < s.n {
+        rt.buf_push_bytes(&out, s.p as u64 + last as u64, s.n - last)
+    }
+    let res: str = __str_copy(str { p: rt.buf_data(&out), n: rt.buf_len(&out) })
+    rt.buf_free(&out)
+    return res
+}
+
+fn expand(r: *mut Regex, m: *mut Match, s: str, repl: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    let p: u64 = repl.p as u64
+    while i < repl.n {
+        let c: u8 = rt.ld8(p, i)
+        if c != 36 as u8 || i + 1 >= repl.n {
+            rt.buf_push(out, c)
+            i = i + 1
+            continue
+        }
+        let d: u8 = rt.ld8(p, i + 1)
+        if d == 36 as u8 {
+            rt.buf_push(out, 36 as u8)
+            i = i + 2
+        } else if d >= 48 as u8 && d <= 57 as u8 {
+            var g: u32 = (d - 48 as u8) as u32
+            i = i + 2
+            if i < repl.n && rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+                let g2: u32 = g * 10 + (rt.ld8(p, i) - 48 as u8) as u32
+                if g2 < (*r).ngroups {
+                    g = g2
+                    i = i + 1
+                }
+            }
+            push_str(out, match_group_text(m, s, g))
+        } else if d == 123 as u8 {
+            var e: usize = i + 2
+            while e < repl.n && rt.ld8(p, e) != 125 as u8 {
+                e = e + 1
+            }
+            if e >= repl.n {
+                rt.buf_push(out, c) // no closing brace: a literal "$"
+                i = i + 1
+                continue
+            }
+            let name: str = str { p: rt.ptr_of(p + (i + 2) as u64), n: e - i - 2 }
+            var g: i64 = -1
+            var digits: bool = name.n > 0
+            var v: i64 = 0
+            var k: usize = 0
+            while k < name.n {
+                let ch: u8 = rt.ld8(name.p as u64, k)
+                if ch < 48 as u8 || ch > 57 as u8 {
+                    digits = false
+                } else if v < 100 {
+                    v = v * 10 + (ch - 48 as u8) as i64
+                }
+                k = k + 1
+            }
+            if digits {
+                g = v
+            } else {
+                g = regex_group_index(r, name)
+            }
+            if g >= 0 && g < 32 {
+                push_str(out, match_group_text(m, s, g as u32))
+            }
+            i = e + 1
+        } else {
+            rt.buf_push(out, c)
+            i = i + 1
+        }
+    }
+}

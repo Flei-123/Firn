@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MPL-2.0
-# tools/libmvp/run.sh -- the libraries OpenPlan asked for (LIB-001..004),
+# tools/libmvp/run.sh -- the libraries OpenPlan asked for (LIB-001..008),
 # held against other implementations:
 #   std.time  20,000 instants x 5 zones against Python's datetime/zoneinfo
 #   lib/zip   Python's zipfile and Info-ZIP's unzip, both directions, and
 #             the hostile archives (zip slip, duplicates, other methods)
 #   lib/pdf   poppler (pdfinfo, pdffonts, pdftotext, pdftoppm) and pypdf
+#   lib/regex Python's re on 20,000 random patterns plus a fixed corpus
+#   lib/i18n  ICU (PyICU): plural rules, numbers and dates in 8 languages
 # std.fs has no second implementation to compare with; tests/1910_std_fs.fi
 # is its proof (against the kernel's own answers).
 set -uo pipefail
@@ -15,7 +17,7 @@ FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 rc=0
-for t in time_probe zip_probe pdf_probe; do
+for t in time_probe zip_probe pdf_probe regex_probe i18n_probe; do
     "$FIRNC" -o "$W/$t" "tools/libmvp/$t.fi" > "$W/$t.log" 2>&1 || { echo "  FAIL $t does not build"; grep -v RWX "$W/$t.log" | head -5; rc=1; }
 done
 [ $rc -eq 0 ] || exit 1
@@ -25,6 +27,10 @@ if [ -r /usr/share/zoneinfo/Europe/Vienna ]; then
 else
     echo "  skip: no /usr/share/zoneinfo"
 fi
+echo "-- lib/regex"
+python3 tools/libmvp/check_regex.py "$W/regex_probe" 20000 || rc=1
+echo "-- lib/i18n"
+python3 tools/libmvp/check_i18n.py "$W/i18n_probe" || rc=1
 echo "-- lib/zip"
 mkdir -p "$W/zip"
 if command -v unzip > /dev/null && command -v zip > /dev/null; then

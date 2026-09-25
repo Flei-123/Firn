@@ -1,0 +1,1191 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/i18n/i18n.fi -- message catalogs, plural rules, number and date
+// formatting, pseudo-localization.
+//
+// OpenPlan LIB-007 (F-UEB-009, SDD 6.9). OpenPlan's user interface is
+// English first; every visible text is a MESSAGE ID in a catalog, one
+// catalog per language, in the `.opmsg` format:
+//
+//     # catalogs/de.opmsg
+//     @lang de
+//     page-of = Seite {page:number} von {total:number}
+//     devices-selected[one] = {count:number} Gerät ausgewählt
+//     devices-selected[other] = {count:number} Geräte ausgewählt
+//     revision-date = Revision {index}, freigegeben am {date:date}
+//
+//     import i18n.i18n
+//     var de: i18n.Catalog = i18n.catalog_load(p, n, "de") catch |e| ...
+//     var b: i18n.Bundle = i18n.bundle_new()
+//     i18n.bundle_add(&b, de)              // first choice
+//     i18n.bundle_add(&b, en)              // fallback
+//     var a: i18n.Args = i18n.args_new()
+//     i18n.args_num(&a, "count", 3.0)
+//     i18n.msg(&b, "devices-selected", &a) // "3 Geräte ausgewählt"
+//
+// THE FORMAT (SDD 6.9): UTF-8, one message per line, `#` starts a comment
+// line, `@lang <tag>` names the language. `key = text` or
+// `key[selector] = text`; keys are kebab-case (a-z, 0-9, "-", "." and
+// "_"). A selector is a CLDR plural category (zero one two few many
+// other), an exact number (`=0`) or a value of a `select` argument; a key
+// with variants must have `other`. Arguments are `{name}`,
+// `{name:number}`, `{name:date}` or `{name:select}`; escapes `\n`, `\{`,
+// `\}` and `\\`. Leading and trailing blanks of the text are dropped.
+//
+// WHICH VARIANT: the first `:number` or `:select` argument of the `other`
+// variant decides. A number first looks for its exact `=N`, then for its
+// plural category in the catalog's language, then `other`; a select value
+// looks for a variant of that name, then `other`.
+//
+// LOCALE DATA -- plural rules, decimal and grouping separators, date
+// patterns and month names -- for en (en-US), de, fr, it, es, pl, cs and
+// ru, taken from CLDR 42 as ICU 72.1 ships it (Unicode License v3,
+// THIRD_PARTY.md); tools/libmvp/check_i18n.py compares every function
+// here with ICU. Another language falls back to the en rules and
+// formats; its plural category is then "one"/"other" as in English.
+//
+// A MISSING message gives its own ID back, so it shows up on screen
+// instead of an empty label; a missing argument stays as `{name}`.
+
+import std.rt
+import std.vec
+import std.str
+import std.num
+import std.time
+
+export {
+    Catalog, Bundle, Args, I18nError,
+    catalog_load, catalog_free, catalog_lang, catalog_has, catalog_error_line,
+    bundle_new, bundle_add, bundle_free, msg,
+    args_new, args_free, args_str, args_num, args_date,
+    plural_category, plural_category_v, plural_name,
+    format_number, format_date, lang_parent, pseudo_localize,
+    PLURAL_ZERO, PLURAL_ONE, PLURAL_TWO, PLURAL_FEW, PLURAL_MANY, PLURAL_OTHER,
+    DATE_ISO, DATE_SHORT, DATE_MEDIUM, DATE_LONG,
+}
+
+error I18nError {
+    Syntax, // a line that is not a comment, directive or message
+    MissingOther, // a key with variants but without `other`
+    Duplicate, // the same key (and selector) twice
+    BadLang, // @lang is missing/empty, or not the language asked for
+}
+
+const PLURAL_ZERO: u32 = 0
+const PLURAL_ONE: u32 = 1
+const PLURAL_TWO: u32 = 2
+const PLURAL_FEW: u32 = 3
+const PLURAL_MANY: u32 = 4
+const PLURAL_OTHER: u32 = 5
+
+const DATE_ISO: u32 = 0 // 2026-09-25
+const DATE_SHORT: u32 = 1 // 9/25/26, 25.09.26
+const DATE_MEDIUM: u32 = 2 // Sep 25, 2026, 25.09.2026
+const DATE_LONG: u32 = 3 // September 25, 2026, 25. September 2026
+
+// the languages with data of their own
+const L_EN: u32 = 0
+const L_DE: u32 = 1
+const L_FR: u32 = 2
+const L_IT: u32 = 3
+const L_ES: u32 = 4
+const L_PL: u32 = 5
+const L_CS: u32 = 6
+const L_RU: u32 = 7
+
+// ------------------------------------------------------------ Languages
+
+fn lower_ascii(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// the primary subtag of `tag`, lower case, compared with `code`
+fn primary_is(tag: str, code: str) -> bool {
+    var n: usize = 0
+    while n < tag.n && rt.ld8(tag.p as u64, n) != 45 as u8 && rt.ld8(tag.p as u64, n) != 95 as u8 {
+        n = n + 1
+    }
+    if n != code.n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if lower_ascii(rt.ld8(tag.p as u64, i)) != rt.ld8(code.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn lang_id(tag: str) -> u32 {
+    if primary_is(tag, "de") { return L_DE }
+    if primary_is(tag, "fr") { return L_FR }
+    if primary_is(tag, "it") { return L_IT }
+    if primary_is(tag, "es") { return L_ES }
+    if primary_is(tag, "pl") { return L_PL }
+    if primary_is(tag, "cs") { return L_CS }
+    if primary_is(tag, "ru") { return L_RU }
+    return L_EN
+}
+
+// The next language in the fallback chain: "de-AT" -> "de" -> "en-US" ->
+// "" (the end); "en-GB" -> "en-US". The last subtag is dropped, a bare
+// language falls back to en-US, the source language of OpenPlan.
+fn lang_parent(tag: str) -> str {
+    if tag.n == 0 || same_tag(tag, "en-US") {
+        return ""
+    }
+    var i: usize = tag.n
+    while i > 0 {
+        i = i - 1
+        let c: u8 = rt.ld8(tag.p as u64, i)
+        if c == 45 as u8 || c == 95 as u8 {
+            let head: str = str { p: tag.p, n: i }
+            if same_tag(head, "en") {
+                return "en-US"
+            }
+            return head
+        }
+    }
+    return "en-US"
+}
+
+fn same_tag(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        var x: u8 = lower_ascii(rt.ld8(a.p as u64, i))
+        var y: u8 = lower_ascii(rt.ld8(b.p as u64, i))
+        if x == 95 as u8 { x = 45 as u8 }
+        if y == 95 as u8 { y = 45 as u8 }
+        if x != y {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ Plurals
+
+fn plural_name(c: u32) -> str {
+    if c == PLURAL_ZERO { return "zero" }
+    if c == PLURAL_ONE { return "one" }
+    if c == PLURAL_TWO { return "two" }
+    if c == PLURAL_FEW { return "few" }
+    if c == PLURAL_MANY { return "many" }
+    return "other"
+}
+
+fn category_of(s: str) -> i64 {
+    if s == "zero" { return PLURAL_ZERO as i64 }
+    if s == "one" { return PLURAL_ONE as i64 }
+    if s == "two" { return PLURAL_TWO as i64 }
+    if s == "few" { return PLURAL_FEW as i64 }
+    if s == "many" { return PLURAL_MANY as i64 }
+    if s == "other" { return PLURAL_OTHER as i64 }
+    return -1
+}
+
+// visible fraction digits of `n` as it would be written (at most 6)
+fn visible_digits(n: f64) -> u32 {
+    var a: f64 = n
+    if a < 0.0 {
+        a = 0.0 - a
+    }
+    var v: u32 = 0
+    var scaled: f64 = a
+    while v < 6 {
+        let whole: f64 = (scaled as i64) as f64
+        let rest: f64 = scaled - whole
+        if rest < 0.0000005 || rest > 0.9999995 {
+            return v
+        }
+        scaled = scaled * 10.0
+        v = v + 1
+    }
+    return v
+}
+
+// The CLDR plural category of `n` in `lang`, the number written with as
+// many fraction digits as it has.
+fn plural_category(lang: str, n: f64) -> u32 {
+    return plural_category_v(lang, n, visible_digits(n))
+}
+
+// The same with `v` visible fraction digits ("1.0" is v = 1, and in
+// English that is "other", not "one").
+fn plural_category_v(lang: str, n0: f64, v: u32) -> u32 {
+    var n: f64 = n0
+    if n < 0.0 {
+        n = 0.0 - n
+    }
+    if n > 1000000000000000.0 {
+        return PLURAL_OTHER
+    }
+    let i: i64 = n as i64 // the integer digits
+    let integral: bool = (i as f64) == n
+    let l: u32 = lang_id(lang)
+    let m10: i64 = i % 10
+    let m100: i64 = i % 100
+    if l == L_EN || l == L_DE {
+        if i == 1 && v == 0 { return PLURAL_ONE }
+        return PLURAL_OTHER
+    }
+    if l == L_FR {
+        if i == 0 || i == 1 { return PLURAL_ONE }
+        if i != 0 && i % 1000000 == 0 && v == 0 { return PLURAL_MANY }
+        return PLURAL_OTHER
+    }
+    if l == L_IT {
+        if i == 1 && v == 0 { return PLURAL_ONE }
+        if i != 0 && i % 1000000 == 0 && v == 0 { return PLURAL_MANY }
+        return PLURAL_OTHER
+    }
+    if l == L_ES {
+        if n == 1.0 && integral { return PLURAL_ONE }
+        if i != 0 && i % 1000000 == 0 && v == 0 { return PLURAL_MANY }
+        return PLURAL_OTHER
+    }
+    if l == L_PL {
+        if i == 1 && v == 0 { return PLURAL_ONE }
+        if v == 0 && m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) { return PLURAL_FEW }
+        if v == 0 && ((i != 1 && m10 <= 1) || m10 >= 5 || (m100 >= 12 && m100 <= 14)) { return PLURAL_MANY }
+        return PLURAL_OTHER
+    }
+    if l == L_CS {
+        if i == 1 && v == 0 { return PLURAL_ONE }
+        if i >= 2 && i <= 4 && v == 0 { return PLURAL_FEW }
+        if v != 0 { return PLURAL_MANY }
+        return PLURAL_OTHER
+    }
+    // ru
+    if v == 0 && m10 == 1 && m100 != 11 { return PLURAL_ONE }
+    if v == 0 && m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) { return PLURAL_FEW }
+    if v == 0 && (m10 == 0 || m10 >= 5 || (m100 >= 11 && m100 <= 14)) { return PLURAL_MANY }
+    return PLURAL_OTHER
+}
+
+// ------------------------------------------------------------ Numbers
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn decimal_sep(l: u32) -> str {
+    if l == L_EN { return "." }
+    return ","
+}
+
+fn group_sep(l: u32) -> str {
+    if l == L_EN { return "," }
+    if l == L_DE || l == L_IT || l == L_ES { return "." }
+    if l == L_FR { return "\u{202F}" } // narrow no-break space
+    return "\u{A0}" // no-break space: pl, cs, ru
+}
+
+fn to_str(b: *mut rt.Buf) -> str {
+    let s: str = __str_copy(str { p: rt.buf_data(b), n: rt.buf_len(b) })
+    rt.buf_free(b)
+    return s
+}
+
+// `v` with exactly `frac` fraction digits (at most 9), rounded half to
+// even, with the grouping and decimal separator of `lang`:
+// 1234567.891, 2 -> "1,234,567.89" (en), "1.234.567,89" (de),
+// "1 234 567,89" (fr, narrow no-break spaces).
+//
+// The rounding works on the SHORTEST decimal form of the double (the
+// digits std.num writes, which read back as the same double) -- as ICU
+// does: 0.125 with two digits is "0.12", and 340567382001.595 (a double
+// that is really ...594970703125) is "...001.60", because the number the
+// user typed was .595. A zero is never written with a minus sign (ICU
+// writes "-0").
+fn format_number(lang: str, v: f64, frac0: u32) -> str {
+    let l: u32 = lang_id(lang)
+    var frac: usize = frac0 as usize
+    if frac > 9 {
+        frac = 9
+    }
+    var x: f64 = v
+    var neg: bool = x < 0.0
+    if neg {
+        x = 0.0 - x
+    }
+    if x > 1000000000000000.0 {
+        x = 1000000000000000.0
+    }
+    // the shortest digits and where the decimal point goes
+    var t: num.Bytes = num.bytes_new()
+    num.write_f64(&t, x)
+    var dg: [u8; 40] = [0 as u8; 40]
+    var nd: usize = 0
+    var point: i64 = -1 // digits before the point
+    var exp: i64 = 0
+    var i: usize = 0
+    let tp: u64 = rt.addr_of(t.ptr)
+    while i < t.len {
+        let c: u8 = rt.ld8(tp, i)
+        if c == 46 as u8 {
+            point = nd as i64
+        } else if c == 101 as u8 {
+            // e+NN / e-NN
+            var sign: i64 = 1
+            i = i + 1
+            if i < t.len && rt.ld8(tp, i) == 45 as u8 {
+                sign = -1
+            }
+            if i < t.len && (rt.ld8(tp, i) == 45 as u8 || rt.ld8(tp, i) == 43 as u8) {
+                i = i + 1
+            }
+            while i < t.len {
+                exp = exp * 10 + (rt.ld8(tp, i) - 48 as u8) as i64
+                i = i + 1
+            }
+            exp = exp * sign
+        } else if c >= 48 as u8 && c <= 57 as u8 && nd < 40 {
+            dg[nd] = c - 48 as u8
+            nd = nd + 1
+        }
+        i = i + 1
+    }
+    num.bytes_free(&t)
+    if point < 0 {
+        point = nd as i64
+    }
+    point = point + exp
+    // the digit at decimal position q (q = 0: first after the point; q < 0
+    // integer digits), 0 outside
+    // integer part: positions point-1 .. 0 of dg; keep = point + frac digits
+    let keep: i64 = point + frac as i64
+    var out_d: [u8; 48] = [0 as u8; 48]
+    var nout: usize = 0
+    // leading zeros when the number is below 1
+    var lead: i64 = 0
+    if point < 1 {
+        lead = 1 - point
+    }
+    var k: i64 = 0
+    while k < lead + keep && nout < 48 {
+        let src: i64 = k - lead
+        var d: u8 = 0
+        if src >= 0 && src < nd as i64 {
+            d = dg[src as usize]
+        }
+        out_d[nout] = d
+        nout = nout + 1
+        k = k + 1
+    }
+    // round half to even on the digits that were dropped
+    var up: bool = false
+    if keep >= 0 && keep < nd as i64 {
+        let first: u8 = dg[keep as usize]
+        var rest_zero: bool = true
+        var q: usize = keep as usize + 1
+        while q < nd {
+            if dg[q] != 0 as u8 {
+                rest_zero = false
+            }
+            q = q + 1
+        }
+        if first > 5 as u8 || (first == 5 as u8 && !rest_zero) {
+            up = true
+        } else if first == 5 as u8 && rest_zero {
+            up = nout > 0 && out_d[nout - 1] % 2 as u8 == 1 as u8
+        }
+    } else if keep < 0 {
+        nout = 0
+    }
+    if up {
+        var q: usize = nout
+        var carry: bool = true
+        while carry && q > 0 {
+            q = q - 1
+            if out_d[q] == 9 as u8 {
+                out_d[q] = 0
+            } else {
+                out_d[q] = out_d[q] + 1 as u8
+                carry = false
+            }
+        }
+        if carry {
+            // 9.99 -> 10.00: one digit more in front
+            var m: usize = nout
+            while m > 0 {
+                out_d[m] = out_d[m - 1]
+                m = m - 1
+            }
+            out_d[0] = 1
+            nout = nout + 1
+            lead = lead - 1
+        }
+    }
+    // integer digits = nout - frac
+    var nint: usize = 0
+    if nout > frac {
+        nint = nout - frac
+    }
+    var all_zero: bool = true
+    var q: usize = 0
+    while q < nout {
+        if out_d[q] != 0 as u8 {
+            all_zero = false
+        }
+        q = q + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    if neg && !all_zero {
+        rt.buf_push(&b, 45 as u8)
+    }
+    // skip superfluous leading zeros of the integer part, keep one
+    var st: usize = 0
+    while st + 1 < nint && out_d[st] == 0 as u8 {
+        st = st + 1
+    }
+    let gs: str = group_sep(l)
+    if nint == 0 {
+        rt.buf_push(&b, 48 as u8)
+    }
+    q = st
+    while q < nint {
+        rt.buf_push(&b, 48 as u8 + out_d[q])
+        let left: usize = nint - q - 1
+        if left > 0 && left % 3 == 0 {
+            put(&b, gs)
+        }
+        q = q + 1
+    }
+    if frac > 0 {
+        put(&b, decimal_sep(l))
+        q = 0
+        while q < frac {
+            var d: u8 = 0
+            if nint + q < nout {
+                d = out_d[nint + q]
+            }
+            rt.buf_push(&b, 48 as u8 + d)
+            q = q + 1
+        }
+    }
+    return to_str(&b)
+}
+
+// as many fraction digits as the number has, at most 3 (the default of a
+// {name:number} argument)
+fn format_auto(lang: str, v: f64) -> str {
+    var d: u32 = visible_digits(v)
+    if d > 3 {
+        d = 3
+    }
+    return format_number(lang, v, d)
+}
+
+// ------------------------------------------------------------ Dates
+
+fn date_pattern(l: u32, style: u32) -> str {
+    if style == DATE_SHORT {
+        if l == L_EN { return "M/d/yy" }
+        if l == L_DE || l == L_CS { return "dd.MM.yy" }
+        if l == L_FR { return "dd/MM/y" }
+        if l == L_IT { return "dd/MM/yy" }
+        if l == L_ES { return "d/M/yy" }
+        if l == L_PL { return "d.MM.y" }
+        return "dd.MM.y" // ru
+    }
+    if style == DATE_MEDIUM {
+        if l == L_EN { return "MMM d, y" }
+        if l == L_DE { return "dd.MM.y" }
+        if l == L_CS { return "d. M. y" }
+        if l == L_RU { return "d MMM y\u{202F}'г'." }
+        return "d MMM y" // fr, it, es, pl
+    }
+    if l == L_EN { return "MMMM d, y" }
+    if l == L_DE || l == L_CS { return "d. MMMM y" }
+    if l == L_ES { return "d 'de' MMMM 'de' y" }
+    if l == L_RU { return "d MMMM y\u{202F}'г'." }
+    return "d MMMM y" // fr, it, pl
+}
+
+fn months(l: u32, abbr: bool) -> str {
+    if abbr {
+        if l == L_EN { return "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec" }
+        if l == L_DE { return "Jan.|Feb.|März|Apr.|Mai|Juni|Juli|Aug.|Sept.|Okt.|Nov.|Dez." }
+        if l == L_FR { return "janv.|févr.|mars|avr.|mai|juin|juil.|août|sept.|oct.|nov.|déc." }
+        if l == L_IT { return "gen|feb|mar|apr|mag|giu|lug|ago|set|ott|nov|dic" }
+        if l == L_ES { return "ene|feb|mar|abr|may|jun|jul|ago|sept|oct|nov|dic" }
+        if l == L_PL { return "sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|lis|gru" }
+        if l == L_CS { return "led|úno|bře|dub|kvě|čvn|čvc|srp|zář|říj|lis|pro" }
+        return "янв.|февр.|мар.|апр.|мая|июн.|июл.|авг.|сент.|окт.|нояб.|дек."
+    }
+    if l == L_EN { return "January|February|March|April|May|June|July|August|September|October|November|December" }
+    if l == L_DE { return "Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember" }
+    if l == L_FR { return "janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre" }
+    if l == L_IT { return "gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre" }
+    if l == L_ES { return "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre" }
+    if l == L_PL { return "stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|października|listopada|grudnia" }
+    if l == L_CS { return "ledna|února|března|dubna|května|června|července|srpna|září|října|listopadu|prosince" }
+    return "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря"
+}
+
+// field `k` (0-based) of a "|"-separated list
+fn field(list: str, k: u32) -> str {
+    var start: usize = 0
+    var seen: u32 = 0
+    var i: usize = 0
+    while i <= list.n {
+        if i == list.n || rt.ld8(list.p as u64, i) == 124 as u8 {
+            if seen == k {
+                return str { p: rt.ptr_of(list.p as u64 + start as u64), n: i - start }
+            }
+            seen = seen + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn put_dec(b: *mut rt.Buf, v: i64, width: u32) {
+    var digits: [u8; 20] = [0 as u8; 20]
+    var n: u32 = 0
+    var x: i64 = v
+    if x < 0 {
+        rt.buf_push(b, 45 as u8)
+        x = 0 - x
+    }
+    while x > 0 || n == 0 {
+        digits[n as usize] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n < width {
+        digits[n as usize] = 48 as u8
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(b, digits[n as usize])
+    }
+}
+
+// The calendar date of `t` (its fields as they are -- the offset is the
+// caller's business) in `lang`, in one of DATE_ISO, DATE_SHORT,
+// DATE_MEDIUM, DATE_LONG.
+fn format_date(lang: str, t: time.DateTime, style: u32) -> str {
+    if style == DATE_ISO {
+        return time.format_date(t)
+    }
+    let l: u32 = lang_id(lang)
+    let pat: str = date_pattern(l, style)
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    let p: u64 = pat.p as u64
+    while i < pat.n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 39 as u8 {
+            // 'quoted literal'
+            i = i + 1
+            while i < pat.n && rt.ld8(p, i) != 39 as u8 {
+                rt.buf_push(&b, rt.ld8(p, i))
+                i = i + 1
+            }
+            i = i + 1
+            continue
+        }
+        if c == 121 as u8 || c == 77 as u8 || c == 100 as u8 {
+            var run: u32 = 0
+            while i < pat.n && rt.ld8(p, i) == c {
+                run = run + 1
+                i = i + 1
+            }
+            if c == 121 as u8 { // y
+                if run == 2 {
+                    put_dec(&b, (t.year % 100) as i64, 2)
+                } else {
+                    put_dec(&b, t.year as i64, run)
+                }
+            } else if c == 77 as u8 { // M
+                if run >= 4 {
+                    put(&b, field(months(l, false), t.month - 1))
+                } else if run == 3 {
+                    put(&b, field(months(l, true), t.month - 1))
+                } else {
+                    put_dec(&b, t.month as i64, run)
+                }
+            } else {
+                put_dec(&b, t.day as i64, run)
+            }
+            continue
+        }
+        rt.buf_push(&b, c)
+        i = i + 1
+    }
+    return to_str(&b)
+}
+
+// ------------------------------------------------------------ Pseudo
+
+// en-XA: every ASCII letter replaced by an accented look-alike, the text
+// made about 40 % longer, and bracketed -- so that a label that is cut off
+// or a text that was never translated stands out in a screenshot. `{...}`
+// arguments are left alone.
+fn pseudo_localize(s: str) -> str {
+    let upper: str = "ÅƁÇÐÉƑĜĤÎĴĶĻṀÑÖÞǪŔŠŢÛṼŴẊÝŽ"
+    let lower: str = "åƀçðéƒĝĥîĵķļɱñöþǫŕšţûṽŵẋýž"
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push(&b, 91 as u8)
+    var depth: u32 = 0
+    var letters: u32 = 0
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if c == 123 as u8 {
+            depth = depth + 1
+        } else if c == 125 as u8 && depth > 0 {
+            depth = depth - 1
+            rt.buf_push(&b, c)
+            i = i + 1
+            continue
+        }
+        if depth == 0 && c >= 65 as u8 && c <= 90 as u8 {
+            put(&b, nth_char(upper, (c - 65 as u8) as usize))
+            letters = letters + 1
+        } else if depth == 0 && c >= 97 as u8 && c <= 122 as u8 {
+            put(&b, nth_char(lower, (c - 97 as u8) as usize))
+            letters = letters + 1
+        } else {
+            rt.buf_push(&b, c)
+            if depth == 0 && c >= 128 as u8 && (c & 192 as u8) != 128 as u8 {
+                letters = letters + 1
+            }
+        }
+        i = i + 1
+    }
+    // 40 % longer, counted in characters outside the arguments
+    var pad: u32 = (letters * 2 + 4) / 5
+    if pad > 0 {
+        rt.buf_push(&b, 32 as u8)
+    }
+    let filler: str = "one two three four five six seven eight nine ten "
+    var k: u32 = 0
+    while k < pad {
+        rt.buf_push(&b, rt.ld8(filler.p as u64, (k % filler.n as u32) as usize))
+        k = k + 1
+    }
+    rt.buf_push(&b, 93 as u8)
+    return to_str(&b)
+}
+
+// the k-th UTF-8 character of `s`
+fn nth_char(s: str, k: usize) -> str {
+    var i: usize = 0
+    var seen: usize = 0
+    while i < s.n {
+        var len: usize = 1
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if c >= 240 as u8 { len = 4 } else if c >= 224 as u8 { len = 3 } else if c >= 192 as u8 { len = 2 }
+        if seen == k {
+            return str { p: rt.ptr_of(s.p as u64 + i as u64), n: len }
+        }
+        seen = seen + 1
+        i = i + len
+    }
+    return "?"
+}
+
+// ------------------------------------------------------------ Catalogs
+
+struct Msg {
+    key: str,
+    sel: str, // "" = the plain form (counts as "other")
+    text: str, // escapes already resolved
+}
+
+struct Catalog {
+    lang: str,
+    msgs: Vec[Msg],
+}
+
+static mut error_line: u32 = 0
+
+// The 1-based line of the last catalog_load error.
+fn catalog_error_line() -> u32 {
+    return error_line
+}
+
+fn is_key_char(c: u8) -> bool {
+    return (c >= 97 as u8 && c <= 122 as u8) || (c >= 48 as u8 && c <= 57 as u8) || c == 45 as u8 || c == 46 as u8 || c == 95 as u8
+}
+
+fn is_blank(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 13 as u8
+}
+
+// the text of a message with its escapes resolved; false = a stray "{" or
+// "}" or an argument that is not {name} / {name:kind}
+fn unescape(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    var open: bool = false
+    var arg_start: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 && i + 1 < n {
+            let d: u8 = rt.ld8(p, i + 1)
+            if d == 110 as u8 {
+                rt.buf_push(out, 10 as u8)
+            } else if d == 123 as u8 || d == 125 as u8 || d == 92 as u8 {
+                // an escaped brace stays escaped for the formatter
+                rt.buf_push(out, 92 as u8)
+                rt.buf_push(out, d)
+            } else {
+                return false
+            }
+            i = i + 2
+            continue
+        }
+        if c == 92 as u8 {
+            return false // a backslash at the end of the line
+        }
+        if c == 123 as u8 {
+            if open {
+                return false
+            }
+            open = true
+            arg_start = i + 1
+        } else if c == 125 as u8 {
+            if !open || !arg_ok(p + arg_start as u64, i - arg_start) {
+                return false
+            }
+            open = false
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+    return !open
+}
+
+fn arg_ok(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n && rt.ld8(p, i) != 58 as u8 {
+        let c: u8 = rt.ld8(p, i)
+        let ok: bool = (c >= 97 as u8 && c <= 122 as u8) || (c >= 65 as u8 && c <= 90 as u8) ||
+        (c >= 48 as u8 && c <= 57 as u8) || c == 95 as u8 || c == 45 as u8
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    if i == 0 {
+        return false
+    }
+    if i == n {
+        return true
+    }
+    let kind: str = str { p: rt.ptr_of(p + (i + 1) as u64), n: n - i - 1 }
+    return kind == "number" || kind == "date" || kind == "select"
+}
+
+fn fail_at(line: u32, e: I18nError) -> I18nError {
+    error_line = line
+    return e
+}
+
+// Parses an .opmsg catalog. `lang` is the language expected ("" = take
+// whatever @lang says); the catalog must name it with @lang.
+fn catalog_load(p: u64, n: usize, lang: str) -> I18nError!Catalog {
+    var c: Catalog = Catalog { lang: "", msgs: vec_new[Msg]() }
+    var i: usize = 0
+    var line: u32 = 0
+    // a UTF-8 byte order mark is tolerated
+    if n >= 3 && rt.ld8(p, 0) == 239 as u8 && rt.ld8(p, 1) == 187 as u8 && rt.ld8(p, 2) == 191 as u8 {
+        i = 3
+    }
+    var bad: u32 = 0 // 0 fine, 1 syntax, 2 duplicate, 3 lang
+    while i < n && bad == 0 {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        line = line + 1
+        var a: usize = i
+        while a < e && is_blank(rt.ld8(p, a)) {
+            a = a + 1
+        }
+        var z: usize = e
+        while z > a && is_blank(rt.ld8(p, z - 1)) {
+            z = z - 1
+        }
+        i = e + 1
+        if a == z || rt.ld8(p, a) == 35 as u8 {
+            continue // blank or comment
+        }
+        if rt.ld8(p, a) == 64 as u8 {
+            // @lang <tag>
+            let d: str = str { p: rt.ptr_of(p + a as u64), n: z - a }
+            if d.n > 6 && d.part(0, 6) == "@lang " {
+                c.lang = __str_copy(d.part(6, d.n - 6).trim())
+                if c.lang.n == 0 {
+                    bad = 3
+                }
+            } else {
+                bad = 1
+            }
+            continue
+        }
+        // key [ '[' selector ']' ] '=' text
+        var k: usize = a
+        while k < z && is_key_char(rt.ld8(p, k)) {
+            k = k + 1
+        }
+        if k == a {
+            bad = 1
+            continue
+        }
+        let key: str = __str_copy(str { p: rt.ptr_of(p + a as u64), n: k - a })
+        var sel: str = ""
+        if k < z && rt.ld8(p, k) == 91 as u8 {
+            var s: usize = k + 1
+            while s < z && rt.ld8(p, s) != 93 as u8 {
+                s = s + 1
+            }
+            if s >= z || s == k + 1 {
+                bad = 1
+                continue
+            }
+            sel = __str_copy(str { p: rt.ptr_of(p + (k + 1) as u64), n: s - k - 1 })
+            k = s + 1
+        }
+        while k < z && is_blank(rt.ld8(p, k)) {
+            k = k + 1
+        }
+        if k >= z || rt.ld8(p, k) != 61 as u8 {
+            bad = 1
+            continue
+        }
+        k = k + 1
+        while k < z && is_blank(rt.ld8(p, k)) {
+            k = k + 1
+        }
+        var txt: rt.Buf = rt.buf_new()
+        if !unescape(p + k as u64, z - k, &txt) {
+            rt.buf_free(&txt)
+            bad = 1
+            continue
+        }
+        let text: str = to_str(&txt)
+        // the same key and selector twice
+        var j: usize = 0
+        while j < vec_len[Msg](&c.msgs) {
+            let m: *mut Msg = vec_elem_ptr[Msg](&c.msgs, j)
+            if (*m).key == key && ((*m).sel == sel || ((*m).sel == "" && sel == "other") || ((*m).sel == "other" && sel == "")) {
+                bad = 2
+            }
+            j = j + 1
+        }
+        if bad == 0 {
+            vec_push[Msg](&c.msgs, Msg { key: key, sel: sel, text: text })
+        }
+    }
+    if bad != 0 {
+        vec_free[Msg](&c.msgs)
+        if bad == 2 { return fail_at(line, I18nError::Duplicate) }
+        if bad == 3 { return fail_at(line, I18nError::BadLang) }
+        return fail_at(line, I18nError::Syntax)
+    }
+    if c.lang.n == 0 || (lang.n > 0 && !(c.lang == lang)) {
+        vec_free[Msg](&c.msgs)
+        return fail_at(0 as u32, I18nError::BadLang)
+    }
+    // every key with variants has "other" (or a plain form)
+    var q: usize = 0
+    while q < vec_len[Msg](&c.msgs) {
+        let m: *mut Msg = vec_elem_ptr[Msg](&c.msgs, q)
+        if (*m).sel.n > 0 && !has_other(&c, (*m).key) {
+            vec_free[Msg](&c.msgs)
+            return fail_at(0 as u32, I18nError::MissingOther)
+        }
+        q = q + 1
+    }
+    return c
+}
+
+fn has_other(c: *mut Catalog, key: str) -> bool {
+    var j: usize = 0
+    while j < vec_len[Msg](&(*c).msgs) {
+        let m: *mut Msg = vec_elem_ptr[Msg](&(*c).msgs, j)
+        if (*m).key == key && ((*m).sel == "other" || (*m).sel == "") {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+fn catalog_free(c: *mut Catalog) {
+    vec_free[Msg](&(*c).msgs)
+}
+
+fn catalog_lang(c: *mut Catalog) -> str {
+    return (*c).lang
+}
+
+fn catalog_has(c: *mut Catalog, key: str) -> bool {
+    return has_other(c, key)
+}
+
+// ------------------------------------------------------------ Arguments
+
+const K_STR: u32 = 0
+const K_NUM: u32 = 1
+const K_DATE: u32 = 2
+
+struct Args {
+    names: Vec[str],
+    kinds: Vec[u32],
+    strs: Vec[str],
+    nums: Vec[f64],
+    dates: Vec[i64], // ms since 1970 UTC
+    offs: Vec[i64], // offset in minutes for the date
+}
+
+fn args_new() -> Args {
+    return Args { names: vec_new[str](), kinds: vec_new[u32](), strs: vec_new[str](), nums: vec_new[f64](),
+        dates: vec_new[i64](), offs: vec_new[i64]() }
+}
+
+fn args_free(a: *mut Args) {
+    vec_free[str](&(*a).names)
+    vec_free[u32](&(*a).kinds)
+    vec_free[str](&(*a).strs)
+    vec_free[f64](&(*a).nums)
+    vec_free[i64](&(*a).dates)
+    vec_free[i64](&(*a).offs)
+}
+
+fn args_add(a: *mut Args, name: str, kind: u32, s: str, v: f64, ms: i64, off: i64) {
+    vec_push[str](&(*a).names, __str_copy(name))
+    vec_push[u32](&(*a).kinds, kind)
+    vec_push[str](&(*a).strs, __str_copy(s))
+    vec_push[f64](&(*a).nums, v)
+    vec_push[i64](&(*a).dates, ms)
+    vec_push[i64](&(*a).offs, off)
+}
+
+// A text argument ({name} or {name:select}).
+fn args_str(a: *mut Args, name: str, value: str) {
+    args_add(a, name, K_STR, value, 0.0, 0, 0)
+}
+
+// A number argument ({name:number}; also as {name}).
+fn args_num(a: *mut Args, name: str, value: f64) {
+    args_add(a, name, K_NUM, "", value, 0, 0)
+}
+
+// A date argument: the instant and the UTC offset to show it in.
+fn args_date(a: *mut Args, name: str, ms: i64, offset_min: i32) {
+    args_add(a, name, K_DATE, "", 0.0, ms, offset_min as i64)
+}
+
+fn arg_index(a: *mut Args, name: str) -> i64 {
+    var i: usize = 0
+    while i < vec_len[str](&(*a).names) {
+        if *vec_elem_ptr[str](&(*a).names, i) == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ------------------------------------------------------------ Bundles
+
+// Catalogs in the order they are asked: the first one that has a message
+// wins, and formats it in its own language.
+struct Bundle {
+    cats: Vec[Catalog],
+}
+
+fn bundle_new() -> Bundle {
+    return Bundle { cats: vec_new[Catalog]() }
+}
+
+// Adds a catalog behind the ones already there. The bundle owns it now.
+fn bundle_add(b: *mut Bundle, c: Catalog) {
+    vec_push[Catalog](&(*b).cats, c)
+}
+
+fn bundle_free(b: *mut Bundle) {
+    var i: usize = 0
+    while i < vec_len[Catalog](&(*b).cats) {
+        catalog_free(vec_elem_ptr[Catalog](&(*b).cats, i))
+        i = i + 1
+    }
+    vec_free[Catalog](&(*b).cats)
+}
+
+// the name and kind of the first :number / :select argument of `text`
+fn selector_arg(text: str, kind: *mut str) -> str {
+    var i: usize = 0
+    let p: u64 = text.p as u64
+    while i < text.n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 {
+            i = i + 2
+            continue
+        }
+        if c == 123 as u8 {
+            var e: usize = i + 1
+            var colon: usize = 0
+            while e < text.n && rt.ld8(p, e) != 125 as u8 {
+                if rt.ld8(p, e) == 58 as u8 {
+                    colon = e
+                }
+                e = e + 1
+            }
+            if colon > 0 {
+                let k: str = str { p: rt.ptr_of(p + (colon + 1) as u64), n: e - colon - 1 }
+                if k == "number" || k == "select" {
+                    *kind = k
+                    return str { p: rt.ptr_of(p + (i + 1) as u64), n: colon - i - 1 }
+                }
+            }
+            i = e
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// The message `id`, with its arguments, in the language of the first
+// catalog that has it; `id` itself if none has it.
+fn msg(b: *mut Bundle, id: str, a: *mut Args) -> str {
+    var ci: usize = 0
+    while ci < vec_len[Catalog](&(*b).cats) {
+        let c: *mut Catalog = vec_elem_ptr[Catalog](&(*b).cats, ci)
+        if has_other(c, id) {
+            return render(c, id, a)
+        }
+        ci = ci + 1
+    }
+    return id
+}
+
+fn find_variant(c: *mut Catalog, key: str, sel: str) -> i64 {
+    var j: usize = 0
+    while j < vec_len[Msg](&(*c).msgs) {
+        let m: *mut Msg = vec_elem_ptr[Msg](&(*c).msgs, j)
+        if (*m).key == key && (*m).sel == sel {
+            return j as i64
+        }
+        j = j + 1
+    }
+    return -1
+}
+
+fn render(c: *mut Catalog, key: str, a: *mut Args) -> str {
+    var other: i64 = find_variant(c, key, "other")
+    if other < 0 {
+        other = find_variant(c, key, "")
+    }
+    var pick: i64 = other
+    let base: str = (*vec_elem_ptr[Msg](&(*c).msgs, other as usize)).text
+    var kind: str = ""
+    let sname: str = selector_arg(base, &kind)
+    if sname.n > 0 {
+        let ai: i64 = arg_index(a, sname)
+        if ai >= 0 {
+            let k: u32 = vec_at[u32](&(*a).kinds, ai as usize)
+            if k == K_NUM {
+                let v: f64 = *vec_elem_ptr[f64](&(*a).nums, ai as usize)
+                // exact "=N" first
+                var exact: rt.Buf = rt.buf_new()
+                rt.buf_push(&exact, 61 as u8)
+                let t: str = format_number("en", v, visible_digits(v))
+                // "=1,000" would not be written: use plain digits
+                var q: usize = 0
+                while q < t.n {
+                    let ch: u8 = rt.ld8(t.p as u64, q)
+                    if ch != 44 as u8 {
+                        rt.buf_push(&exact, ch)
+                    }
+                    q = q + 1
+                }
+                let es: str = str { p: rt.buf_data(&exact), n: rt.buf_len(&exact) }
+                let hit: i64 = find_variant(c, key, es)
+                rt.buf_free(&exact)
+                if hit >= 0 {
+                    pick = hit
+                } else {
+                    let cat: u32 = plural_category((*c).lang, v)
+                    let hit2: i64 = find_variant(c, key, plural_name(cat))
+                    if hit2 >= 0 {
+                        pick = hit2
+                    }
+                }
+            } else if k == K_STR {
+                let hit: i64 = find_variant(c, key, *vec_elem_ptr[str](&(*a).strs, ai as usize))
+                if hit >= 0 {
+                    pick = hit
+                }
+            }
+        }
+    }
+    let text: str = (*vec_elem_ptr[Msg](&(*c).msgs, pick as usize)).text
+    return fill(c, text, a)
+}
+
+// the arguments put in, escapes of braces resolved
+fn fill(c: *mut Catalog, text: str, a: *mut Args) -> str {
+    var out: rt.Buf = rt.buf_new()
+    let p: u64 = text.p as u64
+    var i: usize = 0
+    while i < text.n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 92 as u8 && i + 1 < text.n {
+            rt.buf_push(&out, rt.ld8(p, i + 1))
+            i = i + 2
+            continue
+        }
+        if ch != 123 as u8 {
+            rt.buf_push(&out, ch)
+            i = i + 1
+            continue
+        }
+        var e: usize = i + 1
+        var colon: usize = 0
+        while e < text.n && rt.ld8(p, e) != 125 as u8 {
+            if rt.ld8(p, e) == 58 as u8 && colon == 0 {
+                colon = e
+            }
+            e = e + 1
+        }
+        var nend: usize = e
+        if colon > 0 {
+            nend = colon
+        }
+        let name: str = str { p: rt.ptr_of(p + (i + 1) as u64), n: nend - i - 1 }
+        let ai: i64 = arg_index(a, name)
+        if ai < 0 {
+            rt.buf_push_bytes(&out, p + i as u64, e + 1 - i) // left as {name}
+        } else {
+            let k: u32 = vec_at[u32](&(*a).kinds, ai as usize)
+            if k == K_NUM {
+                put(&out, format_auto((*c).lang, *vec_elem_ptr[f64](&(*a).nums, ai as usize)))
+            } else if k == K_DATE {
+                let ms: i64 = *vec_elem_ptr[i64](&(*a).dates, ai as usize)
+                let off: i64 = *vec_elem_ptr[i64](&(*a).offs, ai as usize)
+                let t: time.DateTime = time.civil_from_unix(ms + off * 60000)
+                put(&out, format_date((*c).lang, t, DATE_MEDIUM))
+            } else {
+                put(&out, *vec_elem_ptr[str](&(*a).strs, ai as usize))
+            }
+        }
+        i = e + 1
+    }
+    return to_str(&out)
+}
