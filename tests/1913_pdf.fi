@@ -1,0 +1,191 @@
+// expect_exit: 42
+// tests/1913_pdf.fi -- lib/pdf (OpenPlan LIB-003) inside one process: the
+// file structure (every cross-reference offset lands on its object), the
+// numbers in the content stream, determinism, and the refusals. Whether
+// real PDF readers agree -- text, fonts, links, bookmarks, layers and the
+// rendered pixels -- is tools/libmvp/check_pdf.py (poppler and pypdf).
+import pdf.pdf
+import std.fs
+import std.rt
+import std.str
+
+fn has(b: *mut rt.Buf, s: str) -> bool {
+    return find(b, s, 0) != 999999999
+}
+
+fn find(b: *mut rt.Buf, s: str, from: usize) -> usize {
+    var i: usize = from
+    while i + s.length() <= rt.buf_len(b) {
+        if rt.mem_eq(rt.buf_ptr(b) + i as u64, s.p as u64, s.length()) {
+            return i
+        }
+        i = i + 1
+    }
+    return 999999999
+}
+
+fn num_at(b: *mut rt.Buf, at: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = at
+    while i < rt.buf_len(b) && rt.buf_at(b, i) >= 48 as u8 && rt.buf_at(b, i) <= 57 as u8 {
+        v = v * 10 + (rt.buf_at(b, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+// every "n 0 obj" the cross-reference table promises is where it says
+fn xref_ok(b: *mut rt.Buf) -> bool {
+    let sx: usize = find(b, "startxref\n", 0)
+    if sx == 999999999 { return false }
+    let xref: usize = num_at(b, sx + 10) as usize
+    if find(b, "xref\n0 ", xref) != xref { return false }
+    let count: u64 = num_at(b, xref + 7)
+    var line: usize = find(b, "\n", xref + 7) + 1 + 20 // skip entry 0
+    var k: u64 = 1
+    while k < count {
+        let off: usize = num_at(b, line) as usize
+        // the object header at that offset
+        if num_at(b, off) != k { return false }
+        var d: usize = 0
+        var q: u64 = k
+        while q > 0 {
+            d = d + 1
+            q = q / 10
+        }
+        if find(b, " 0 obj", off + d) != off + d { return false }
+        line = line + 20
+        k = k + 1
+    }
+    return true
+}
+
+fn build(out: *mut rt.Buf, font: *mut rt.Buf, compress: bool) -> usize {
+    var opts: pdf.PdfOptions = pdf.pdf_options_default()
+    opts.compress = compress
+    opts.title = "Schaltplan"
+    var doc: pdf.Pdf = pdf.pdf_new(out, opts)
+    let f: u32 = pdf.pdf_font_load(&doc, rt.buf_ptr(font), rt.buf_len(font)) catch 99 as u32
+    let later: u32 = pdf.pdf_dest_new(&doc)
+    let layer: u32 = pdf.pdf_layer(&doc, "Rahmen")
+    pdf.pdf_page_begin(&doc, 420.0, 297.0)
+    pdf.pdf_layer_begin(&doc, layer) catch false
+    pdf.pdf_line_width(&doc, 0.35)
+    pdf.pdf_rect(&doc, 10.5, 20.25, 400.0, 277.0)
+    pdf.pdf_stroke(&doc)
+    pdf.pdf_layer_end(&doc)
+    pdf.pdf_fill_rgb(&doc, 1.0, 0.5, 0.0)
+    pdf.pdf_move_to(&doc, 0.0 - 1.5, 0.0001)
+    pdf.pdf_line_to(&doc, 1.23456, 99.99999)
+    pdf.pdf_fill(&doc)
+    pdf.pdf_text(&doc, f, 10.0, 20.0, 30.0, "-K1 Schütz") catch false
+    pdf.pdf_link_internal(&doc, 20.0, 25.0, 30.0, 6.0, later) catch false
+    pdf.pdf_page_begin(&doc, 210.0, 297.0)
+    pdf.pdf_dest_set(&doc, later, 0.0, 0.0) catch false
+    pdf.pdf_outline(&doc, "Seite 2", later, 0 as u32) catch false
+    let n: usize = pdf.pdf_finish(&doc) catch 0
+    pdf.pdf_free(&doc)
+    return n
+}
+
+fn main() -> i32 {
+    var font: rt.Buf = rt.buf_new()
+    let fl: usize = fs.read_file("tests/data/fonts/FirnSans.ttf", &font) catch 0
+    if fl == 0 { return 1 as i32 }
+
+    // --- A. the file
+    var a: rt.Buf = rt.buf_new()
+    let na: usize = build(&a, &font, true)
+    if na == 0 || na != rt.buf_len(&a) { return 2 as i32 }
+    if find(&a, "%PDF-1.7\n%", 0) != 0 { return 3 as i32 }
+    if find(&a, "%%EOF\n", 0) != na - 6 { return 4 as i32 }
+    if !xref_ok(&a) { return 5 as i32 }
+    if !has(&a, "/FontFile2") || !has(&a, "/CIDFontType2") || !has(&a, "/ToUnicode") { return 6 as i32 }
+    if !has(&a, "/Outlines") || !has(&a, "/OCProperties") || !has(&a, "/Subtype /Link") { return 7 as i32 }
+    if !has(&a, "/MediaBox [0 0 1190.5512 841.8898]") { return 8 as i32 }
+    if !has(&a, "/MediaBox [0 0 595.2756 841.8898]") { return 9 as i32 }
+    if !has(&a, "/Filter /FlateDecode") { return 10 as i32 }
+
+    // --- B. the same calls, the same octets
+    var b: rt.Buf = rt.buf_new()
+    let nb: usize = build(&b, &font, true)
+    if nb != na || !rt.mem_eq(rt.buf_ptr(&a), rt.buf_ptr(&b), na) { return 20 as i32 }
+
+    // --- C. the numbers, readable without compression
+    var c: rt.Buf = rt.buf_new()
+    let nc: usize = build(&c, &font, false)
+    if nc == 0 || !xref_ok(&c) { return 30 as i32 }
+    if has(&c, "/Filter /FlateDecode") { return 31 as i32 }
+    // the page matrix: points per mm, y flipped, origin at the top
+    if !has(&c, "q 2.8346 0 0 -2.8346 0 841.8898 cm\n") { return 32 as i32 }
+    if !has(&c, "10.5 20.25 400 277 re\nS\n") { return 33 as i32 }
+    if !has(&c, "0.35 w\n") || !has(&c, "1 0.5 0 rg\n") { return 34 as i32 }
+    if !has(&c, "-1.5 0.0001 m\n1.2346 100 l\nf\n") { return 35 as i32 }
+    if !has(&c, "/OC /OC0 BDC\n") || !has(&c, "EMC\n") { return 36 as i32 }
+    // text: size 10 pt = 3.5278 mm, flipped back upright, glyph numbers
+    if !has(&c, "BT /F0 1 Tf 3.5278 0 0 -3.5278 20 30 Tm <") { return 37 as i32 }
+    // a link rectangle is in points from the bottom: y 25..31 mm on A3
+    if !has(&c, "/Rect [56.6929 754.0157 141.7323 771.0236]") { return 38 as i32 }
+    // the destination on page 2 at its top
+    if !has(&c, "/XYZ 0 841.8898 null]") { return 39 as i32 }
+    // non-ASCII text strings are UTF-16BE with a BOM ("Schaltplan" is ASCII)
+    if !has(&c, "/Title (Schaltplan)") { return 40 as i32 }
+
+    // --- D. measuring
+    var d: rt.Buf = rt.buf_new()
+    var doc: pdf.Pdf = pdf.pdf_new(&d, pdf.pdf_options_default())
+    let f: u32 = pdf.pdf_font_load(&doc, rt.buf_ptr(&font), rt.buf_len(&font)) catch 99 as u32
+    let one: f64 = pdf.pdf_text_width(&doc, f, 12.0, "A")
+    let four: f64 = pdf.pdf_text_width(&doc, f, 12.0, "AAAA")
+    if one <= 0.0 || four - 4.0 * one > 0.000001 || 4.0 * one - four > 0.000001 { return 50 as i32 }
+    // twice the size, twice the width
+    let big: f64 = pdf.pdf_text_width(&doc, f, 24.0, "AAAA")
+    if big - 2.0 * four > 0.000001 || 2.0 * four - big > 0.000001 { return 51 as i32 }
+    if pdf.pdf_font_ascent(&doc, f, 10.0) <= 0.0 || pdf.pdf_font_descent(&doc, f, 10.0) <= 0.0 { return 52 as i32 }
+    if pdf.pdf_text_width(&doc, 7 as u32, 12.0, "A") != 0.0 { return 53 as i32 }
+
+    // --- E. refusals
+    // drawing without a page
+    if (pdf.pdf_text(&doc, f, 10.0, 0.0, 0.0, "x") catch | e | (e == PdfError::NoPage)) == false { return 60 as i32 }
+    // not a font
+    let bad: u32 = pdf.pdf_font_load(&doc, rt.buf_ptr(&d), rt.buf_len(&d)) catch 77 as u32
+    if bad != 77 { return 61 as i32 }
+    pdf.pdf_page_begin(&doc, 100.0, 100.0)
+    if (pdf.pdf_image_rgba(&doc, 0, 0 as u32, 0 as u32, 0.0, 0.0, 1.0, 1.0) catch | e | (e == PdfError::BadImage)) == false { return 62 as i32 }
+    if (pdf.pdf_text(&doc, 5 as u32, 10.0, 0.0, 0.0, "x") catch | e | (e == PdfError::BadFont)) == false { return 63 as i32 }
+    if (pdf.pdf_link_internal(&doc, 0.0, 0.0, 1.0, 1.0, 9 as u32) catch | e | (e == PdfError::BadDest)) == false { return 64 as i32 }
+    if (pdf.pdf_layer_begin(&doc, 3 as u32) catch | e | (e == PdfError::BadLayer)) == false { return 65 as i32 }
+    // a link to a destination that never gets a page
+    let never: u32 = pdf.pdf_dest_new(&doc)
+    pdf.pdf_link_internal(&doc, 0.0, 0.0, 1.0, 1.0, never) catch false
+    let nd: usize = pdf.pdf_finish(&doc) catch | e | (if_dest(e))
+    if nd != 1 { return 66 as i32 }
+    // fixing it lets the document finish; after that, everything refuses
+    pdf.pdf_dest_set(&doc, never, 1.0, 1.0) catch false
+    let ok: usize = pdf.pdf_finish(&doc) catch 0
+    if ok == 0 { return 67 as i32 }
+    if (pdf.pdf_finish(&doc) catch | e | (if_finished(e))) != 1 { return 68 as i32 }
+    if (pdf.pdf_font_load(&doc, rt.buf_ptr(&font), rt.buf_len(&font)) catch | e | (if_finished32(e))) != 1 { return 69 as i32 }
+
+    // --- F. no page at all is still a valid PDF: one empty A4
+    var e: rt.Buf = rt.buf_new()
+    var empty: pdf.Pdf = pdf.pdf_new(&e, pdf.pdf_options_default())
+    let ne: usize = pdf.pdf_finish(&empty) catch 0
+    if ne == 0 || !xref_ok(&e) || !has(&e, "/Count 1") { return 70 as i32 }
+    return 42
+}
+
+fn if_dest(e: PdfError) -> usize {
+    if e == PdfError::BadDest { return 1 }
+    return 2
+}
+
+fn if_finished(e: PdfError) -> usize {
+    if e == PdfError::Finished { return 1 }
+    return 2
+}
+
+fn if_finished32(e: PdfError) -> u32 {
+    if e == PdfError::Finished { return 1 as u32 }
+    return 2 as u32
+}

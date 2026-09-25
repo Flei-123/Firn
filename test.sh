@@ -1412,6 +1412,22 @@ else
     grep -E 'FAIL' "$WORK/promote.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 65. the libraries OpenPlan asked for, against other implementations (tools/libmvp/run.sh, LIB-001..004) =="
+# std.fs and std.time, lib/zip and lib/pdf have their own positive tests
+# (tests/1910..1913, in every build level above). This section holds them
+# against programs nobody here wrote: Python's datetime/zoneinfo for 100,000
+# UTC offsets, Python's zipfile and Info-ZIP both ways plus hostile
+# archives, and poppler/pypdf for text, fonts, links, bookmarks, layers and
+# the rendered pixels of a PDF.
+bash tools/libmvp/run.sh > "$WORK/libmvp.log" 2>&1 && LMRC=0 || LMRC=$?
+grep -E '^(time|zip|pdf):|^LIBMVP' "$WORK/libmvp.log" | sed 's/^/ /'
+if [ "$LMRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/libmvp/run.sh failed (see .test-work/libmvp.log)"
+    grep -E 'FAIL|DIFF' "$WORK/libmvp.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

@@ -1,0 +1,1502 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/pdf/pdf.fi -- a PDF writer: vector paths, embedded TrueType text,
+// images, links, bookmarks and layers.
+//
+// OpenPlan LIB-003. The deliverable of every electrical project is a PDF
+// of its pages; this is the library that writes it.
+//
+//     import pdf.pdf
+//     var out: rt.Buf = rt.buf_new()
+//     var doc: pdf.Pdf = pdf.pdf_new(&out, pdf.pdf_options_default())
+//     let f: u32 = pdf.pdf_font_load(&doc, font_ptr, font_len) catch ...
+//     pdf.pdf_page_begin(&doc, 420.0, 297.0)                 // A3 landscape, mm
+//     pdf.pdf_line_width(&doc, 0.35)
+//     pdf.pdf_rect(&doc, 10.0, 10.0, 400.0, 277.0)
+//     pdf.pdf_stroke(&doc)
+//     pdf.pdf_text(&doc, f, 10.0, 20.0, 30.0, "-K1 Schütz")
+//     pdf.pdf_finish(&doc) catch ...
+//
+// UNITS AND AXES. Every coordinate and length is in MILLIMETRES, measured
+// from the TOP LEFT corner of the page, y growing DOWNWARDS -- the way a
+// drawing is dimensioned and the way a screen is addressed. Font sizes are
+// in POINTS, as everybody quotes them. The page's content stream starts
+// with the one matrix that maps this onto PDF's points-from-the-bottom-left,
+// so the numbers in the file are the caller's numbers.
+//
+// TEXT is written with an embedded TrueType font as a CIDFontType2 with
+// Identity-H: every glyph by its glyph number, the font cut down to the
+// glyphs used (lib/pdf/ttfsub.fi), widths from `hmtx`, and a ToUnicode map
+// so that text can be searched, selected and copied out of the PDF.
+// Characters are mapped to glyphs with the font's `cmap`; there is no
+// shaping (no ligatures, no right-to-left, no kerning) -- a schematic does
+// not need it, and `pdf_text_width` measures exactly what is drawn.
+//
+// IMAGES are 8-bit RGBA, straight (not premultiplied) alpha; they are
+// written as an RGB image with a soft mask when any pixel is not opaque.
+//
+// LINKS AND BOOKMARKS point to DESTINATIONS: `pdf_dest_new` makes one,
+// `pdf_dest_set` fixes it on the current page, and it may be used before it
+// is fixed -- a link on page 1 to page 40 is written like one to page 0.
+//
+// LAYERS are optional content groups (PDF 1.5): `pdf_layer_begin/end`
+// bracket what belongs to a layer, and a viewer can switch it off.
+//
+// THE FILE is PDF 1.7, streams compressed with zlib (DEFLATE), a classic
+// cross-reference table, and a document ID computed from the content: the
+// same calls give the same octets (a creation date is only written when
+// `created_ms` is set).
+
+import std.rt
+import std.vec
+import std.map
+import std.deflate
+import std.md5
+import std.time
+import font.ttf
+import pdf.ttfsub
+
+export {
+    Pdf, PdfOptions, PdfError,
+    pdf_options_default, pdf_new, pdf_finish, pdf_free,
+    pdf_page_begin, pdf_page_end, pdf_page_count,
+    pdf_stroke_rgb, pdf_fill_rgb, pdf_line_width, pdf_line_cap, pdf_line_join,
+    pdf_dash, pdf_dash_off, pdf_save, pdf_restore,
+    pdf_move_to, pdf_line_to, pdf_curve_to, pdf_close_path, pdf_rect, pdf_circle,
+    pdf_stroke, pdf_fill, pdf_fill_evenodd, pdf_fill_stroke, pdf_clip,
+    pdf_font_load, pdf_text, pdf_text_width, pdf_font_ascent, pdf_font_descent,
+    pdf_image_rgba,
+    pdf_dest_new, pdf_dest_set, pdf_link_internal, pdf_link_uri, pdf_outline,
+    pdf_layer, pdf_layer_begin, pdf_layer_end,
+    CAP_BUTT, CAP_ROUND, CAP_SQUARE, JOIN_MITER, JOIN_ROUND, JOIN_BEVEL,
+}
+
+error PdfError {
+    NoPage, // drawing outside pdf_page_begin .. pdf_page_end
+    BadFont, // not a TrueType font (CFF/OTTO and collections are refused)
+    BadImage, // zero size or no pixels
+    BadDest, // an unknown destination, or one never fixed on a page
+    BadLayer,
+    Finished, // a call after pdf_finish
+    OutOfMemory,
+}
+
+const CAP_BUTT: u32 = 0
+const CAP_ROUND: u32 = 1
+const CAP_SQUARE: u32 = 2
+const JOIN_MITER: u32 = 0
+const JOIN_ROUND: u32 = 1
+const JOIN_BEVEL: u32 = 2
+
+const MM: f64 = 2.834645669291339 // points per millimetre
+
+struct PdfOptions {
+    title: str,
+    author: str,
+    subject: str,
+    creator: str,
+    created_ms: i64, // 0 = no creation date (reproducible output)
+    compress: bool,
+}
+
+fn pdf_options_default() -> PdfOptions {
+    return PdfOptions { title: "", author: "", subject: "", creator: "", created_ms: 0, compress: true }
+}
+
+struct Pdf {
+    out: u64, // *mut rt.Buf as a number (the caller owns the buffer)
+    start: usize,
+    opts: PdfOptions,
+    offsets: Vec[u64], // index = object number, 0 unused
+    finished: bool,
+    // objects known from the start
+    catalog: u32,
+    pages: u32,
+    resources: u32,
+    // pages
+    page_obj: Vec[u32],
+    page_content: Vec[u32],
+    page_w: Vec[f64], // points
+    page_h: Vec[f64],
+    in_page: bool,
+    cur: rt.Buf, // the content stream of the current page
+    // fonts
+    fonts: Vec[ttf.Font],
+    font_obj: Vec[u32],
+    font_src: Vec[u64],
+    font_len: Vec[usize],
+    glyphs: Map[u64, u64], // (font << 32 | glyph) -> code point + 1
+    // images
+    image_obj: Vec[u32],
+    // layers
+    layer_obj: Vec[u32],
+    layer_name: Vec[str],
+    layer_depth: u32,
+    // destinations: page index (-1 = not fixed yet), x, y in mm
+    dest_page: Vec[i64],
+    dest_x: Vec[f64],
+    dest_y: Vec[f64],
+    // link annotations
+    ann_page: Vec[u32],
+    ann_rect: Vec[f64], // 4 per link, points
+    ann_uri: Vec[str], // "" = internal
+    ann_dest: Vec[u32],
+    // bookmarks
+    ol_title: Vec[str],
+    ol_dest: Vec[u32],
+    ol_level: Vec[u32],
+}
+
+// ------------------------------------------------------------ Output
+
+fn o(p: *mut Pdf) -> *mut rt.Buf {
+    return (*p).out as *mut rt.Buf
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn put_int(b: *mut rt.Buf, v: i64) {
+    rt.buf_push_dec_i64(b, v)
+}
+
+// A number with at most four decimals, trailing zeros dropped, never an
+// exponent (PDF has none): 12.5, -0.3528, 100.
+fn put_num(b: *mut rt.Buf, v0: f64) {
+    var v: f64 = v0
+    if v > 1000000000.0 {
+        v = 1000000000.0
+    }
+    if v < -1000000000.0 {
+        v = -1000000000.0
+    }
+    var neg: bool = v < 0.0
+    if neg {
+        v = 0.0 - v
+    }
+    let scaled: i64 = (v * 10000.0 + 0.5) as i64
+    if scaled == 0 {
+        rt.buf_push(b, 48 as u8)
+        return
+    }
+    if neg {
+        rt.buf_push(b, 45 as u8)
+    }
+    put_int(b, scaled / 10000)
+    var frac: i64 = scaled % 10000
+    if frac != 0 {
+        rt.buf_push(b, 46 as u8)
+        var digits: i64 = 1000
+        while frac != 0 {
+            rt.buf_push(b, (48 + frac / digits) as u8)
+            frac = frac % digits
+            digits = digits / 10
+        }
+    }
+}
+
+fn sp(b: *mut rt.Buf) {
+    rt.buf_push(b, 32 as u8)
+}
+
+fn nl(b: *mut rt.Buf) {
+    rt.buf_push(b, 10 as u8)
+}
+
+fn obj_new(p: *mut Pdf) -> u32 {
+    vec_push[u64](&(*p).offsets, 0)
+    return (vec_len[u64](&(*p).offsets) - 1) as u32
+}
+
+fn obj_begin(p: *mut Pdf, num: u32) {
+    let b: *mut rt.Buf = o(p)
+    vec_set[u64](&(*p).offsets, num as usize, ((*b).len - (*p).start) as u64)
+    put_int(b, num as i64)
+    put(b, " 0 obj\n")
+}
+
+fn obj_end(p: *mut Pdf) {
+    put(o(p), "\nendobj\n")
+}
+
+fn put_ref(b: *mut rt.Buf, num: u32) {
+    put_int(b, num as i64)
+    put(b, " 0 R")
+}
+
+// A stream object: `dict` holds the entries besides /Length and /Filter.
+fn put_stream(p: *mut Pdf, num: u32, dict: str, data: u64, n: usize, compress: bool) {
+    let b: *mut rt.Buf = o(p)
+    var packed: rt.Buf = rt.buf_new()
+    var use_zip: bool = false
+    if compress && (*p).opts.compress && n > 0 {
+        let got: usize = deflate.zlib_compress(data, n, deflate.deflate_level_default(), &packed) catch 0
+        use_zip = got > 0
+    }
+    obj_begin(p, num)
+    put(b, "<<")
+    put(b, dict)
+    put(b, " /Length ")
+    if use_zip {
+        put_int(b, rt.buf_len(&packed) as i64)
+        put(b, " /Filter /FlateDecode")
+    } else {
+        put_int(b, n as i64)
+    }
+    put(b, " >>\nstream\n")
+    if use_zip {
+        rt.buf_push_bytes(b, rt.buf_ptr(&packed), rt.buf_len(&packed))
+    } else {
+        rt.buf_push_bytes(b, data, n)
+    }
+    put(b, "\nendstream")
+    obj_end(p)
+    rt.buf_free(&packed)
+}
+
+// A text string: plain ASCII as a literal string, anything else as UTF-16BE
+// with a byte order mark (PDF 1.7, 7.9.2.2).
+fn put_text(b: *mut rt.Buf, s: str) {
+    var ascii: bool = true
+    var i: usize = 0
+    while i < s.n {
+        if rt.ld8(s.p as u64, i) >= 128 as u8 {
+            ascii = false
+        }
+        i = i + 1
+    }
+    if ascii {
+        put_literal(b, s)
+        return
+    }
+    put(b, "<FEFF")
+    i = 0
+    while i < s.n {
+        var cp: u32 = 0
+        i = utf8_next(s, i, &cp)
+        if cp >= 65536 {
+            let v: u32 = cp - 65536
+            put_hex4(b, 55296 + (v >> 10))
+            put_hex4(b, 56320 + (v & 1023))
+        } else {
+            put_hex4(b, cp)
+        }
+    }
+    rt.buf_push(b, 62 as u8)
+}
+
+// ( ... ) with \, ( and ) escaped and everything outside 32..126 as \ooo
+fn put_literal(b: *mut rt.Buf, s: str) {
+    rt.buf_push(b, 40 as u8)
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if c == 40 as u8 || c == 41 as u8 || c == 92 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, c)
+        } else if c < 32 as u8 || c > 126 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, (48 + (c >> 6)) as u8)
+            rt.buf_push(b, (48 + ((c >> 3) & 7 as u8)) as u8)
+            rt.buf_push(b, (48 + (c & 7 as u8)) as u8)
+        } else {
+            rt.buf_push(b, c)
+        }
+        i = i + 1
+    }
+    rt.buf_push(b, 41 as u8)
+}
+
+fn hex_digit(v: u32) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (55 + v) as u8
+}
+
+fn put_hex4(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, hex_digit((v >> 12) & 15))
+    rt.buf_push(b, hex_digit((v >> 8) & 15))
+    rt.buf_push(b, hex_digit((v >> 4) & 15))
+    rt.buf_push(b, hex_digit(v & 15))
+}
+
+// The code point at `i`, and the index after it. A broken sequence yields
+// U+FFFD and moves on by one octet.
+fn utf8_next(s: str, i: usize, cp: *mut u32) -> usize {
+    let p: u64 = s.p as u64
+    let c: u32 = rt.ld8(p, i) as u32
+    if c < 128 {
+        *cp = c
+        return i + 1
+    }
+    var more: usize = 0
+    var v: u32 = 0
+    var min: u32 = 0
+    if c >= 194 && c <= 223 {
+        more = 1
+        v = c & 31
+        min = 128
+    } else if c >= 224 && c <= 239 {
+        more = 2
+        v = c & 15
+        min = 2048
+    } else if c >= 240 && c <= 244 {
+        more = 3
+        v = c & 7
+        min = 65536
+    } else {
+        *cp = 65533 as u32
+        return i + 1
+    }
+    var k: usize = 1
+    while k <= more {
+        if i + k >= s.n {
+            *cp = 65533 as u32
+            return i + 1
+        }
+        let d: u32 = rt.ld8(p, i + k) as u32
+        if (d & 192) != 128 {
+            *cp = 65533 as u32
+            return i + 1
+        }
+        v = (v << 6) | (d & 63)
+        k = k + 1
+    }
+    if v < min || v > 1114111 || (v >= 55296 && v <= 57343) {
+        *cp = 65533 as u32
+        return i + 1
+    }
+    *cp = v
+    return i + more + 1
+}
+
+// ------------------------------------------------------------ Document
+
+// A document that APPENDS itself to `out`.
+fn pdf_new(out: *mut rt.Buf, opts: PdfOptions) -> Pdf {
+    var p: Pdf = Pdf {
+        out: out as u64, start: (*out).len, opts: opts, offsets: vec_new[u64](), finished: false,
+        catalog: 0, pages: 0, resources: 0,
+        page_obj: vec_new[u32](), page_content: vec_new[u32](), page_w: vec_new[f64](), page_h: vec_new[f64](),
+        in_page: false, cur: rt.buf_new(),
+        fonts: vec_new[ttf.Font](), font_obj: vec_new[u32](), font_src: vec_new[u64](), font_len: vec_new[usize](),
+        glyphs: map_new[u64, u64](),
+        image_obj: vec_new[u32](),
+        layer_obj: vec_new[u32](), layer_name: vec_new[str](), layer_depth: 0,
+        dest_page: vec_new[i64](), dest_x: vec_new[f64](), dest_y: vec_new[f64](),
+        ann_page: vec_new[u32](), ann_rect: vec_new[f64](), ann_uri: vec_new[str](), ann_dest: vec_new[u32](),
+        ol_title: vec_new[str](), ol_dest: vec_new[u32](), ol_level: vec_new[u32](),
+    }
+    vec_push[u64](&p.offsets, 0) // object 0 is the head of the free list
+    p.catalog = obj_new(&p)
+    p.pages = obj_new(&p)
+    p.resources = obj_new(&p)
+    // the header, with four octets over 127 so that transfer programs see
+    // a binary file
+    put(out, "%PDF-1.7\n%")
+    rt.buf_push(out, 226 as u8)
+    rt.buf_push(out, 227 as u8)
+    rt.buf_push(out, 207 as u8)
+    rt.buf_push(out, 211 as u8)
+    nl(out)
+    return p
+}
+
+fn pdf_free(p: *mut Pdf) {
+    vec_free[u64](&(*p).offsets)
+    vec_free[u32](&(*p).page_obj)
+    vec_free[u32](&(*p).page_content)
+    vec_free[f64](&(*p).page_w)
+    vec_free[f64](&(*p).page_h)
+    rt.buf_free(&(*p).cur)
+    vec_free[ttf.Font](&(*p).fonts)
+    vec_free[u32](&(*p).font_obj)
+    vec_free[u64](&(*p).font_src)
+    vec_free[usize](&(*p).font_len)
+    map_free[u64, u64](&(*p).glyphs)
+    vec_free[u32](&(*p).image_obj)
+    vec_free[u32](&(*p).layer_obj)
+    vec_free[str](&(*p).layer_name)
+    vec_free[i64](&(*p).dest_page)
+    vec_free[f64](&(*p).dest_x)
+    vec_free[f64](&(*p).dest_y)
+    vec_free[u32](&(*p).ann_page)
+    vec_free[f64](&(*p).ann_rect)
+    vec_free[str](&(*p).ann_uri)
+    vec_free[u32](&(*p).ann_dest)
+    vec_free[str](&(*p).ol_title)
+    vec_free[u32](&(*p).ol_dest)
+    vec_free[u32](&(*p).ol_level)
+}
+
+fn pdf_page_count(p: *mut Pdf) -> usize {
+    return vec_len[u32](&(*p).page_obj)
+}
+
+// Starts a page of `w_mm` x `h_mm`; a page still open is ended first.
+fn pdf_page_begin(p: *mut Pdf, w_mm: f64, h_mm: f64) {
+    if (*p).finished {
+        return
+    }
+    if (*p).in_page {
+        pdf_page_end(p)
+    }
+    vec_push[u32](&(*p).page_obj, obj_new(p))
+    vec_push[u32](&(*p).page_content, 0)
+    vec_push[f64](&(*p).page_w, w_mm * MM)
+    vec_push[f64](&(*p).page_h, h_mm * MM)
+    (*p).in_page = true
+    (*p).layer_depth = 0
+    rt.buf_clear(&(*p).cur)
+    // millimetres from the top left: scale, flip y, move the origin up
+    let c: *mut rt.Buf = &(*p).cur
+    put(c, "q ")
+    put_num(c, MM)
+    put(c, " 0 0 ")
+    put_num(c, 0.0 - MM)
+    put(c, " 0 ")
+    put_num(c, h_mm * MM)
+    put(c, " cm\n")
+}
+
+// Ends the current page and writes its content stream.
+fn pdf_page_end(p: *mut Pdf) {
+    if !(*p).in_page {
+        return
+    }
+    let c: *mut rt.Buf = &(*p).cur
+    while (*p).layer_depth > 0 {
+        put(c, "EMC\n")
+        (*p).layer_depth = (*p).layer_depth - 1
+    }
+    put(c, "Q\n")
+    let num: u32 = obj_new(p)
+    put_stream(p, num, "", rt.buf_ptr(c), rt.buf_len(c), true)
+    vec_set[u32](&(*p).page_content, pdf_page_count(p) - 1, num)
+    (*p).in_page = false
+}
+
+fn cur(p: *mut Pdf) -> *mut rt.Buf {
+    return &(*p).cur
+}
+
+// ------------------------------------------------------------ Graphics state
+
+fn put_rgb(p: *mut Pdf, r: f64, g: f64, b: f64, op: str) {
+    if !(*p).in_page {
+        return
+    }
+    let c: *mut rt.Buf = cur(p)
+    put_num(c, clamp01(r))
+    sp(c)
+    put_num(c, clamp01(g))
+    sp(c)
+    put_num(c, clamp01(b))
+    sp(c)
+    put(c, op)
+    nl(c)
+}
+
+fn clamp01(v: f64) -> f64 {
+    if v < 0.0 { return 0.0 }
+    if v > 1.0 { return 1.0 }
+    return v
+}
+
+// Colours as 0..1 per channel (DeviceRGB).
+fn pdf_stroke_rgb(p: *mut Pdf, r: f64, g: f64, b: f64) {
+    put_rgb(p, r, g, b, "RG")
+}
+
+fn pdf_fill_rgb(p: *mut Pdf, r: f64, g: f64, b: f64) {
+    put_rgb(p, r, g, b, "rg")
+}
+
+fn op1(p: *mut Pdf, v: f64, op: str) {
+    if !(*p).in_page {
+        return
+    }
+    let c: *mut rt.Buf = cur(p)
+    put_num(c, v)
+    sp(c)
+    put(c, op)
+    nl(c)
+}
+
+fn pdf_line_width(p: *mut Pdf, mm: f64) {
+    op1(p, mm, "w")
+}
+
+fn pdf_line_cap(p: *mut Pdf, cap: u32) {
+    op1(p, cap as f64, "J")
+}
+
+fn pdf_line_join(p: *mut Pdf, join: u32) {
+    op1(p, join as f64, "j")
+}
+
+// A dash pattern: `on` mm drawn, `off` mm gap.
+fn pdf_dash(p: *mut Pdf, on: f64, off: f64) {
+    if !(*p).in_page {
+        return
+    }
+    let c: *mut rt.Buf = cur(p)
+    put(c, "[")
+    put_num(c, on)
+    sp(c)
+    put_num(c, off)
+    put(c, "] 0 d\n")
+}
+
+fn pdf_dash_off(p: *mut Pdf) {
+    if (*p).in_page {
+        put(cur(p), "[] 0 d\n")
+    }
+}
+
+fn pdf_save(p: *mut Pdf) {
+    if (*p).in_page {
+        put(cur(p), "q\n")
+    }
+}
+
+fn pdf_restore(p: *mut Pdf) {
+    if (*p).in_page {
+        put(cur(p), "Q\n")
+    }
+}
+
+// ------------------------------------------------------------ Paths
+
+fn pt2(c: *mut rt.Buf, x: f64, y: f64) {
+    put_num(c, x)
+    sp(c)
+    put_num(c, y)
+    sp(c)
+}
+
+fn pdf_move_to(p: *mut Pdf, x: f64, y: f64) {
+    if !(*p).in_page { return }
+    pt2(cur(p), x, y)
+    put(cur(p), "m\n")
+}
+
+fn pdf_line_to(p: *mut Pdf, x: f64, y: f64) {
+    if !(*p).in_page { return }
+    pt2(cur(p), x, y)
+    put(cur(p), "l\n")
+}
+
+// A cubic Bézier curve from the current point, two control points, the end.
+fn pdf_curve_to(p: *mut Pdf, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) {
+    if !(*p).in_page { return }
+    let c: *mut rt.Buf = cur(p)
+    pt2(c, x1, y1)
+    pt2(c, x2, y2)
+    pt2(c, x3, y3)
+    put(c, "c\n")
+}
+
+fn pdf_close_path(p: *mut Pdf) {
+    if (*p).in_page {
+        put(cur(p), "h\n")
+    }
+}
+
+// A rectangle with its top left corner at x, y.
+fn pdf_rect(p: *mut Pdf, x: f64, y: f64, w: f64, h: f64) {
+    if !(*p).in_page { return }
+    let c: *mut rt.Buf = cur(p)
+    pt2(c, x, y)
+    pt2(c, w, h)
+    put(c, "re\n")
+}
+
+// A circle as four Bézier quarters (error < 0.03 % of the radius).
+fn pdf_circle(p: *mut Pdf, cx: f64, cy: f64, r: f64) {
+    if !(*p).in_page { return }
+    let k: f64 = 0.5522847498 * r
+    pdf_move_to(p, cx + r, cy)
+    pdf_curve_to(p, cx + r, cy + k, cx + k, cy + r, cx, cy + r)
+    pdf_curve_to(p, cx - k, cy + r, cx - r, cy + k, cx - r, cy)
+    pdf_curve_to(p, cx - r, cy - k, cx - k, cy - r, cx, cy - r)
+    pdf_curve_to(p, cx + k, cy - r, cx + r, cy - k, cx + r, cy)
+    pdf_close_path(p)
+}
+
+fn paint(p: *mut Pdf, op: str) {
+    if (*p).in_page {
+        put(cur(p), op)
+        nl(cur(p))
+    }
+}
+
+fn pdf_stroke(p: *mut Pdf) {
+    paint(p, "S")
+}
+
+fn pdf_fill(p: *mut Pdf) {
+    paint(p, "f")
+}
+
+fn pdf_fill_evenodd(p: *mut Pdf) {
+    paint(p, "f*")
+}
+
+fn pdf_fill_stroke(p: *mut Pdf) {
+    paint(p, "B")
+}
+
+// The current path becomes the clip (until the enclosing pdf_restore).
+fn pdf_clip(p: *mut Pdf) {
+    paint(p, "W n")
+}
+
+// ------------------------------------------------------------ Text
+
+// Loads a TrueType font. The octets `data`/`n` must stay valid until
+// pdf_finish (the subset is cut there, from the glyphs actually used).
+fn pdf_font_load(p: *mut Pdf, data: u64, n: usize) -> PdfError!u32 {
+    if (*p).finished {
+        return PdfError::Finished
+    }
+    var f: ttf.Font = ttf.font_new()
+    if !ttf.font_init(&f, rt.ptr_of(data), n) {
+        return PdfError::BadFont
+    }
+    vec_push[ttf.Font](&(*p).fonts, f)
+    vec_push[u32](&(*p).font_obj, obj_new(p))
+    vec_push[u64](&(*p).font_src, data)
+    vec_push[usize](&(*p).font_len, n)
+    return (vec_len[u32](&(*p).font_obj) - 1) as u32
+}
+
+fn font_at(p: *mut Pdf, font: u32) -> *mut ttf.Font {
+    return vec_elem_ptr[ttf.Font](&(*p).fonts, font as usize)
+}
+
+// The width of `s` in mm at `size_pt` -- exactly the advance pdf_text uses.
+fn pdf_text_width(p: *mut Pdf, font: u32, size_pt: f64, s: str) -> f64 {
+    if font as usize >= vec_len[u32](&(*p).font_obj) {
+        return 0.0
+    }
+    let f: *mut ttf.Font = font_at(p, font)
+    var units: i64 = 0
+    var i: usize = 0
+    while i < s.n {
+        var cp: u32 = 0
+        i = utf8_next(s, i, &cp)
+        units = units + ttf.font_advance(f, ttf.font_glyph_for(f, cp)) as i64
+    }
+    return units as f64 / ttf.font_upem(f) as f64 * size_pt / MM
+}
+
+// The ascent / descent (positive) of the font at `size_pt`, in mm.
+fn pdf_font_ascent(p: *mut Pdf, font: u32, size_pt: f64) -> f64 {
+    if font as usize >= vec_len[u32](&(*p).font_obj) {
+        return 0.0
+    }
+    let f: *mut ttf.Font = font_at(p, font)
+    return ttf.font_ascent(f) as f64 / ttf.font_upem(f) as f64 * size_pt / MM
+}
+
+fn pdf_font_descent(p: *mut Pdf, font: u32, size_pt: f64) -> f64 {
+    if font as usize >= vec_len[u32](&(*p).font_obj) {
+        return 0.0
+    }
+    let f: *mut ttf.Font = font_at(p, font)
+    return ttf.font_descent(f) as f64 / ttf.font_upem(f) as f64 * size_pt / MM
+}
+
+// Draws `s` with its BASELINE starting at x, y (mm), in the fill colour.
+fn pdf_text(p: *mut Pdf, font: u32, size_pt: f64, x: f64, y: f64, s: str) -> PdfError!bool {
+    if !(*p).in_page {
+        return PdfError::NoPage
+    }
+    if font as usize >= vec_len[u32](&(*p).font_obj) {
+        return PdfError::BadFont
+    }
+    let f: *mut ttf.Font = font_at(p, font)
+    let c: *mut rt.Buf = cur(p)
+    let size: f64 = size_pt / MM
+    put(c, "BT /F")
+    put_int(c, font as i64)
+    put(c, " 1 Tf ")
+    put_num(c, size)
+    put(c, " 0 0 ")
+    put_num(c, 0.0 - size)
+    sp(c)
+    pt2(c, x, y)
+    put(c, "Tm <")
+    var i: usize = 0
+    while i < s.n {
+        var cp: u32 = 0
+        i = utf8_next(s, i, &cp)
+        let g: u32 = ttf.font_glyph_for(f, cp)
+        put_hex4(c, g)
+        let key: u64 = (font as u64 << 32) | g as u64
+        if !map_has[u64, u64](&(*p).glyphs, key) {
+            map_set[u64, u64](&(*p).glyphs, key, cp as u64 + 1)
+        }
+    }
+    put(c, "> Tj ET\n")
+    return true
+}
+
+// the glyphs of font `k` in use, sorted
+fn used_glyphs(p: *mut Pdf, k: u32, out: *mut Vec[u32]) {
+    var slot: usize = 0
+    let cap: usize = map_cap[u64, u64](&(*p).glyphs)
+    while slot < cap {
+        if map_slot_used[u64, u64](&(*p).glyphs, slot) {
+            let key: u64 = map_slot_key[u64, u64](&(*p).glyphs, slot)
+            if (key >> 32) == k as u64 {
+                vec_push[u32](out, (key & 4294967295) as u32)
+            }
+        }
+        slot = slot + 1
+    }
+    vec_sort[u32](out)
+}
+
+fn write_font(p: *mut Pdf, k: u32) {
+    let b: *mut rt.Buf = o(p)
+    let f: *mut ttf.Font = font_at(p, k)
+    let src: u64 = vec_at[u64](&(*p).font_src, k as usize)
+    let n: usize = vec_at[usize](&(*p).font_len, k as usize)
+    var used: Vec[u32] = vec_new[u32]()
+    used_glyphs(p, k, &used)
+    // the name: six capitals from the glyph set (PDF 1.7, 9.6.4), then
+    // the PostScript name
+    var h: u64 = 14695981039346656037 +% k as u64
+    var i: usize = 0
+    while i < vec_len[u32](&used) {
+        h = (h ^ vec_at[u32](&used, i) as u64) *% 1099511628211
+        i = i + 1
+    }
+    var name: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 6 {
+        rt.buf_push(&name, (65 + h % 26) as u8)
+        h = h / 26
+        i = i + 1
+    }
+    rt.buf_push(&name, 43 as u8)
+    ttfsub.ttf_postscript_name(src, n, &name)
+    let fname: str = str { p: rt.buf_data(&name), n: rt.buf_len(&name) }
+    let upem: f64 = ttf.font_upem(f) as f64
+    // the embedded font
+    var sub: rt.Buf = rt.buf_new()
+    ttfsub.ttf_subset(src, n, &used, &sub)
+    let file_obj: u32 = obj_new(p)
+    var d: rt.Buf = rt.buf_new()
+    put(&d, " /Length1 ")
+    put_int(&d, rt.buf_len(&sub) as i64)
+    put_stream(p, file_obj, str { p: rt.buf_data(&d), n: rt.buf_len(&d) }, rt.buf_ptr(&sub), rt.buf_len(&sub), true)
+    rt.buf_free(&d)
+    rt.buf_free(&sub)
+    // the descriptor
+    let desc_obj: u32 = obj_new(p)
+    obj_begin(p, desc_obj)
+    put(b, "<< /Type /FontDescriptor /FontName /")
+    put(b, fname)
+    put(b, " /Flags 32 /FontBBox [")
+    var q: usize = 0
+    while q < 4 {
+        if q > 0 { sp(b) }
+        put_int(b, (ttfsub.ttf_bbox(src, n, q) as f64 * 1000.0 / upem) as i64)
+        q = q + 1
+    }
+    put(b, "] /ItalicAngle 0 /Ascent ")
+    put_int(b, (ttf.font_ascent(f) as f64 * 1000.0 / upem) as i64)
+    put(b, " /Descent ")
+    put_int(b, (0.0 - ttf.font_descent(f) as f64 * 1000.0 / upem) as i64)
+    put(b, " /CapHeight ")
+    put_int(b, (ttf.font_ascent(f) as f64 * 1000.0 / upem) as i64)
+    put(b, " /StemV 80 /FontFile2 ")
+    put_ref(b, file_obj)
+    put(b, " >>")
+    obj_end(p)
+    // the CID font with its widths
+    let cid_obj: u32 = obj_new(p)
+    obj_begin(p, cid_obj)
+    put(b, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /")
+    put(b, fname)
+    put(b, " /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor ")
+    put_ref(b, desc_obj)
+    put(b, " /CIDToGIDMap /Identity /DW 1000 /W [")
+    i = 0
+    while i < vec_len[u32](&used) {
+        let g: u32 = vec_at[u32](&used, i)
+        if i > 0 { sp(b) }
+        put_int(b, g as i64)
+        put(b, " [")
+        put_int(b, (ttf.font_advance(f, g) as f64 * 1000.0 / upem + 0.5) as i64)
+        put(b, "]")
+        i = i + 1
+    }
+    put(b, "] >>")
+    obj_end(p)
+    // ToUnicode
+    var cm: rt.Buf = rt.buf_new()
+    put(&cm, "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n")
+    put(&cm, "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n")
+    put(&cm, "/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n")
+    put(&cm, "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n")
+    i = 0
+    let total: usize = vec_len[u32](&used)
+    while i < total {
+        var chunk: usize = total - i
+        if chunk > 100 {
+            chunk = 100
+        }
+        put_int(&cm, chunk as i64)
+        put(&cm, " beginbfchar\n")
+        var j: usize = 0
+        while j < chunk {
+            let g: u32 = vec_at[u32](&used, i + j)
+            let cp: u32 = (map_get[u64, u64](&(*p).glyphs, (k as u64 << 32) | g as u64) - 1) as u32
+            put(&cm, "<")
+            put_hex4(&cm, g)
+            put(&cm, "> <")
+            if cp >= 65536 {
+                put_hex4(&cm, 55296 + ((cp - 65536) >> 10))
+                put_hex4(&cm, 56320 + ((cp - 65536) & 1023))
+            } else {
+                put_hex4(&cm, cp)
+            }
+            put(&cm, ">\n")
+            j = j + 1
+        }
+        put(&cm, "endbfchar\n")
+        i = i + chunk
+    }
+    put(&cm, "endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n")
+    let tu_obj: u32 = obj_new(p)
+    put_stream(p, tu_obj, "", rt.buf_ptr(&cm), rt.buf_len(&cm), true)
+    rt.buf_free(&cm)
+    // the Type 0 font the pages refer to
+    obj_begin(p, vec_at[u32](&(*p).font_obj, k as usize))
+    put(b, "<< /Type /Font /Subtype /Type0 /BaseFont /")
+    put(b, fname)
+    put(b, " /Encoding /Identity-H /DescendantFonts [")
+    put_ref(b, cid_obj)
+    put(b, "] /ToUnicode ")
+    put_ref(b, tu_obj)
+    put(b, " >>")
+    obj_end(p)
+    rt.buf_free(&name)
+    vec_free[u32](&used)
+}
+
+// ------------------------------------------------------------ Images
+
+// Draws a w x h image of straight RGBA octets (row 0 = top) into the
+// rectangle x, y, w_mm, h_mm.
+fn pdf_image_rgba(p: *mut Pdf, px: u64, w: u32, h: u32, x: f64, y: f64, w_mm: f64, h_mm: f64) -> PdfError!bool {
+    if !(*p).in_page {
+        return PdfError::NoPage
+    }
+    if w == 0 || h == 0 || px == 0 {
+        return PdfError::BadImage
+    }
+    let n: usize = w as usize * h as usize
+    var rgb: rt.Buf = rt.buf_new()
+    var alpha: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&rgb, n * 3)
+    rt.buf_reserve(&alpha, n)
+    if (rgb).cap < n * 3 || alpha.cap < n {
+        rt.buf_free(&rgb)
+        rt.buf_free(&alpha)
+        return PdfError::OutOfMemory
+    }
+    var opaque: bool = true
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&rgb, rt.ld8(px, i * 4))
+        rt.buf_push(&rgb, rt.ld8(px, i * 4 + 1))
+        rt.buf_push(&rgb, rt.ld8(px, i * 4 + 2))
+        let a: u8 = rt.ld8(px, i * 4 + 3)
+        rt.buf_push(&alpha, a)
+        if a != 255 as u8 {
+            opaque = false
+        }
+        i = i + 1
+    }
+    var dims: rt.Buf = rt.buf_new()
+    put(&dims, " /Width ")
+    put_int(&dims, w as i64)
+    put(&dims, " /Height ")
+    put_int(&dims, h as i64)
+    put(&dims, " /BitsPerComponent 8")
+    var smask: u32 = 0
+    if !opaque {
+        smask = obj_new(p)
+        var dm: rt.Buf = rt.buf_new()
+        put(&dm, "/Type /XObject /Subtype /Image /ColorSpace /DeviceGray")
+        rt.buf_push_bytes(&dm, rt.buf_ptr(&dims), rt.buf_len(&dims))
+        put_stream(p, smask, str { p: rt.buf_data(&dm), n: rt.buf_len(&dm) }, rt.buf_ptr(&alpha), n, true)
+        rt.buf_free(&dm)
+    }
+    let img: u32 = obj_new(p)
+    var di: rt.Buf = rt.buf_new()
+    put(&di, "/Type /XObject /Subtype /Image /ColorSpace /DeviceRGB")
+    rt.buf_push_bytes(&di, rt.buf_ptr(&dims), rt.buf_len(&dims))
+    if smask != 0 {
+        put(&di, " /SMask ")
+        put_ref(&di, smask)
+    }
+    put_stream(p, img, str { p: rt.buf_data(&di), n: rt.buf_len(&di) }, rt.buf_ptr(&rgb), n * 3, true)
+    rt.buf_free(&di)
+    rt.buf_free(&dims)
+    rt.buf_free(&rgb)
+    rt.buf_free(&alpha)
+    vec_push[u32](&(*p).image_obj, img)
+    let c: *mut rt.Buf = cur(p)
+    // the unit square of the image onto the rectangle; y is flipped once by
+    // the page matrix and once here, so row 0 lands at the top
+    put(c, "q ")
+    put_num(c, w_mm)
+    put(c, " 0 0 ")
+    put_num(c, 0.0 - h_mm)
+    sp(c)
+    pt2(c, x, y + h_mm)
+    put(c, "cm /Im")
+    put_int(c, (vec_len[u32](&(*p).image_obj) - 1) as i64)
+    put(c, " Do Q\n")
+    return true
+}
+
+// ------------------------------------------------------------ Destinations
+
+// A new destination, not yet on a page.
+fn pdf_dest_new(p: *mut Pdf) -> u32 {
+    vec_push[i64](&(*p).dest_page, -1)
+    vec_push[f64](&(*p).dest_x, 0.0)
+    vec_push[f64](&(*p).dest_y, 0.0)
+    return (vec_len[i64](&(*p).dest_page) - 1) as u32
+}
+
+// Fixes destination `d` at x, y (mm) on the CURRENT page.
+fn pdf_dest_set(p: *mut Pdf, d: u32, x: f64, y: f64) -> PdfError!bool {
+    if !(*p).in_page {
+        return PdfError::NoPage
+    }
+    if d as usize >= vec_len[i64](&(*p).dest_page) {
+        return PdfError::BadDest
+    }
+    vec_set[i64](&(*p).dest_page, d as usize, (pdf_page_count(p) - 1) as i64)
+    *vec_elem_ptr[f64](&(*p).dest_x, d as usize) = x
+    *vec_elem_ptr[f64](&(*p).dest_y, d as usize) = y
+    return true
+}
+
+fn add_annot(p: *mut Pdf, x: f64, y: f64, w: f64, h: f64, uri: str, dest: u32) {
+    let ph: f64 = *vec_elem_ptr[f64](&(*p).page_h, pdf_page_count(p) - 1)
+    vec_push[u32](&(*p).ann_page, (pdf_page_count(p) - 1) as u32)
+    vec_push[f64](&(*p).ann_rect, x * MM)
+    vec_push[f64](&(*p).ann_rect, ph - (y + h) * MM)
+    vec_push[f64](&(*p).ann_rect, (x + w) * MM)
+    vec_push[f64](&(*p).ann_rect, ph - y * MM)
+    vec_push[str](&(*p).ann_uri, uri)
+    vec_push[u32](&(*p).ann_dest, dest)
+}
+
+// A clickable rectangle (mm) on the current page that jumps to `dest`.
+fn pdf_link_internal(p: *mut Pdf, x: f64, y: f64, w: f64, h: f64, dest: u32) -> PdfError!bool {
+    if !(*p).in_page {
+        return PdfError::NoPage
+    }
+    if dest as usize >= vec_len[i64](&(*p).dest_page) {
+        return PdfError::BadDest
+    }
+    add_annot(p, x, y, w, h, "", dest)
+    return true
+}
+
+// A clickable rectangle (mm) on the current page that opens `uri`.
+fn pdf_link_uri(p: *mut Pdf, x: f64, y: f64, w: f64, h: f64, uri: str) -> PdfError!bool {
+    if !(*p).in_page {
+        return PdfError::NoPage
+    }
+    add_annot(p, x, y, w, h, __str_copy(uri), 0 as u32)
+    return true
+}
+
+// A bookmark. `level` 0 is the top; a bookmark belongs under the nearest
+// earlier one with a smaller level.
+fn pdf_outline(p: *mut Pdf, title: str, dest: u32, level: u32) -> PdfError!bool {
+    if dest as usize >= vec_len[i64](&(*p).dest_page) {
+        return PdfError::BadDest
+    }
+    vec_push[str](&(*p).ol_title, __str_copy(title))
+    vec_push[u32](&(*p).ol_dest, dest)
+    vec_push[u32](&(*p).ol_level, level)
+    return true
+}
+
+// [page /XYZ left top null] in points
+fn put_dest(p: *mut Pdf, b: *mut rt.Buf, d: u32) {
+    let pg: usize = vec_at[i64](&(*p).dest_page, d as usize) as usize
+    put(b, "[")
+    put_ref(b, vec_at[u32](&(*p).page_obj, pg))
+    put(b, " /XYZ ")
+    put_num(b, *vec_elem_ptr[f64](&(*p).dest_x, d as usize) * MM)
+    sp(b)
+    put_num(b, *vec_elem_ptr[f64](&(*p).page_h, pg) - *vec_elem_ptr[f64](&(*p).dest_y, d as usize) * MM)
+    put(b, " null]")
+}
+
+// ------------------------------------------------------------ Layers
+
+// A new layer (optional content group), visible by default.
+fn pdf_layer(p: *mut Pdf, name: str) -> u32 {
+    vec_push[u32](&(*p).layer_obj, obj_new(p))
+    vec_push[str](&(*p).layer_name, __str_copy(name))
+    return (vec_len[u32](&(*p).layer_obj) - 1) as u32
+}
+
+// What is drawn until pdf_layer_end belongs to `layer`. Layers nest.
+fn pdf_layer_begin(p: *mut Pdf, layer: u32) -> PdfError!bool {
+    if !(*p).in_page {
+        return PdfError::NoPage
+    }
+    if layer as usize >= vec_len[u32](&(*p).layer_obj) {
+        return PdfError::BadLayer
+    }
+    put(cur(p), "/OC /OC")
+    put_int(cur(p), layer as i64)
+    put(cur(p), " BDC\n")
+    (*p).layer_depth = (*p).layer_depth + 1
+    return true
+}
+
+fn pdf_layer_end(p: *mut Pdf) {
+    if (*p).in_page && (*p).layer_depth > 0 {
+        put(cur(p), "EMC\n")
+        (*p).layer_depth = (*p).layer_depth - 1
+    }
+}
+
+// ------------------------------------------------------------ Finish
+
+fn put_date(b: *mut rt.Buf, ms: i64) {
+    let t: time.DateTime = time.civil_from_unix(ms)
+    put(b, "(D:")
+    put_int(b, t.year as i64)
+    var v: [u32; 5] = [t.month, t.day, t.hour, t.minute, t.second]
+    var i: usize = 0
+    while i < 5 {
+        if v[i] < 10 {
+            rt.buf_push(b, 48 as u8)
+        }
+        put_int(b, v[i] as i64)
+        i = i + 1
+    }
+    put(b, "Z)")
+}
+
+// Writes everything that waited for the end -- fonts, resources, pages,
+// links, bookmarks, layers, the catalog, the cross-reference table -- and
+// answers the size of the whole file.
+fn pdf_finish(p: *mut Pdf) -> PdfError!usize {
+    if (*p).finished {
+        return PdfError::Finished
+    }
+    // every destination a link or bookmark uses must be on a page -- checked
+    // before anything is closed, so the caller can still fix it
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).ann_dest) {
+        if (*vec_elem_ptr[str](&(*p).ann_uri, i)).n == 0 && vec_at[i64](&(*p).dest_page, vec_at[u32](&(*p).ann_dest, i) as usize) < 0 {
+            return PdfError::BadDest
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < vec_len[u32](&(*p).ol_dest) {
+        if vec_at[i64](&(*p).dest_page, vec_at[u32](&(*p).ol_dest, i) as usize) < 0 {
+            return PdfError::BadDest
+        }
+        i = i + 1
+    }
+    if (*p).in_page {
+        pdf_page_end(p)
+    }
+    if pdf_page_count(p) == 0 {
+        // a PDF needs at least one page: an empty A4
+        pdf_page_begin(p, 210.0, 297.0)
+        pdf_page_end(p)
+    }
+    (*p).finished = true
+    let b: *mut rt.Buf = o(p)
+    // fonts
+    var k: u32 = 0
+    while (k as usize) < vec_len[u32](&(*p).font_obj) {
+        write_font(p, k)
+        k = k + 1
+    }
+    // layers
+    i = 0
+    while i < vec_len[u32](&(*p).layer_obj) {
+        obj_begin(p, vec_at[u32](&(*p).layer_obj, i))
+        put(b, "<< /Type /OCG /Name ")
+        put_text(b, *vec_elem_ptr[str](&(*p).layer_name, i))
+        put(b, " >>")
+        obj_end(p)
+        i = i + 1
+    }
+    // the one resource dictionary all pages share
+    obj_begin(p, (*p).resources)
+    put(b, "<< /ProcSet [/PDF /Text /ImageB /ImageC]")
+    if vec_len[u32](&(*p).font_obj) > 0 {
+        put(b, " /Font <<")
+        i = 0
+        while i < vec_len[u32](&(*p).font_obj) {
+            put(b, " /F")
+            put_int(b, i as i64)
+            sp(b)
+            put_ref(b, vec_at[u32](&(*p).font_obj, i))
+            i = i + 1
+        }
+        put(b, " >>")
+    }
+    if vec_len[u32](&(*p).image_obj) > 0 {
+        put(b, " /XObject <<")
+        i = 0
+        while i < vec_len[u32](&(*p).image_obj) {
+            put(b, " /Im")
+            put_int(b, i as i64)
+            sp(b)
+            put_ref(b, vec_at[u32](&(*p).image_obj, i))
+            i = i + 1
+        }
+        put(b, " >>")
+    }
+    if vec_len[u32](&(*p).layer_obj) > 0 {
+        put(b, " /Properties <<")
+        i = 0
+        while i < vec_len[u32](&(*p).layer_obj) {
+            put(b, " /OC")
+            put_int(b, i as i64)
+            sp(b)
+            put_ref(b, vec_at[u32](&(*p).layer_obj, i))
+            i = i + 1
+        }
+        put(b, " >>")
+    }
+    put(b, " >>")
+    obj_end(p)
+    // link annotations
+    let na: usize = vec_len[u32](&(*p).ann_page)
+    var ann_obj: Vec[u32] = vec_new[u32]()
+    i = 0
+    while i < na {
+        let num: u32 = obj_new(p)
+        vec_push[u32](&ann_obj, num)
+        obj_begin(p, num)
+        put(b, "<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [")
+        var q: usize = 0
+        while q < 4 {
+            if q > 0 { sp(b) }
+            put_num(b, *vec_elem_ptr[f64](&(*p).ann_rect, i * 4 + q))
+            q = q + 1
+        }
+        put(b, "]")
+        let uri: str = *vec_elem_ptr[str](&(*p).ann_uri, i)
+        if uri.n > 0 {
+            put(b, " /A << /S /URI /URI ")
+            put_literal(b, uri)
+            put(b, " >>")
+        } else {
+            put(b, " /Dest ")
+            put_dest(p, b, vec_at[u32](&(*p).ann_dest, i))
+        }
+        put(b, " >>")
+        obj_end(p)
+        i = i + 1
+    }
+    // pages
+    let np: usize = pdf_page_count(p)
+    i = 0
+    while i < np {
+        obj_begin(p, vec_at[u32](&(*p).page_obj, i))
+        put(b, "<< /Type /Page /Parent ")
+        put_ref(b, (*p).pages)
+        put(b, " /MediaBox [0 0 ")
+        put_num(b, *vec_elem_ptr[f64](&(*p).page_w, i))
+        sp(b)
+        put_num(b, *vec_elem_ptr[f64](&(*p).page_h, i))
+        put(b, "] /Resources ")
+        put_ref(b, (*p).resources)
+        put(b, " /Contents ")
+        put_ref(b, vec_at[u32](&(*p).page_content, i))
+        var first: bool = true
+        var a: usize = 0
+        while a < na {
+            if vec_at[u32](&(*p).ann_page, a) as usize == i {
+                if first {
+                    put(b, " /Annots [")
+                    first = false
+                } else {
+                    sp(b)
+                }
+                put_ref(b, vec_at[u32](&ann_obj, a))
+            }
+            a = a + 1
+        }
+        if !first {
+            put(b, "]")
+        }
+        put(b, " >>")
+        obj_end(p)
+        i = i + 1
+    }
+    vec_free[u32](&ann_obj)
+    obj_begin(p, (*p).pages)
+    put(b, "<< /Type /Pages /Count ")
+    put_int(b, np as i64)
+    put(b, " /Kids [")
+    i = 0
+    while i < np {
+        if i > 0 { sp(b) }
+        put_ref(b, vec_at[u32](&(*p).page_obj, i))
+        i = i + 1
+    }
+    put(b, "] >>")
+    obj_end(p)
+    // bookmarks
+    let outlines: u32 = write_outlines(p)
+    // catalog
+    obj_begin(p, (*p).catalog)
+    put(b, "<< /Type /Catalog /Pages ")
+    put_ref(b, (*p).pages)
+    if outlines != 0 {
+        put(b, " /Outlines ")
+        put_ref(b, outlines)
+        put(b, " /PageMode /UseOutlines")
+    }
+    if vec_len[u32](&(*p).layer_obj) > 0 {
+        put(b, " /OCProperties << /OCGs [")
+        i = 0
+        while i < vec_len[u32](&(*p).layer_obj) {
+            if i > 0 { sp(b) }
+            put_ref(b, vec_at[u32](&(*p).layer_obj, i))
+            i = i + 1
+        }
+        put(b, "] /D << /Order [")
+        i = 0
+        while i < vec_len[u32](&(*p).layer_obj) {
+            if i > 0 { sp(b) }
+            put_ref(b, vec_at[u32](&(*p).layer_obj, i))
+            i = i + 1
+        }
+        put(b, "] >> >>")
+    }
+    put(b, " >>")
+    obj_end(p)
+    // document information
+    let info: u32 = obj_new(p)
+    obj_begin(p, info)
+    put(b, "<< /Producer (Firn lib/pdf)")
+    if (*p).opts.title.n > 0 {
+        put(b, " /Title ")
+        put_text(b, (*p).opts.title)
+    }
+    if (*p).opts.author.n > 0 {
+        put(b, " /Author ")
+        put_text(b, (*p).opts.author)
+    }
+    if (*p).opts.subject.n > 0 {
+        put(b, " /Subject ")
+        put_text(b, (*p).opts.subject)
+    }
+    if (*p).opts.creator.n > 0 {
+        put(b, " /Creator ")
+        put_text(b, (*p).opts.creator)
+    }
+    if (*p).opts.created_ms != 0 {
+        put(b, " /CreationDate ")
+        put_date(b, (*p).opts.created_ms)
+    }
+    put(b, " >>")
+    obj_end(p)
+    // the ID: MD5 of everything written so far
+    var id: [u8; 16] = [0 as u8; 16]
+    md5.md5(rt.buf_ptr(b) + (*p).start as u64, (*b).len - (*p).start, (&id[0]) as u64)
+    // the cross-reference table
+    let xref: usize = (*b).len - (*p).start
+    let count: usize = vec_len[u64](&(*p).offsets)
+    put(b, "xref\n0 ")
+    put_int(b, count as i64)
+    put(b, "\n0000000000 65535 f \n")
+    i = 1
+    while i < count {
+        var digits: [u8; 10] = [48 as u8; 10]
+        var v: u64 = vec_at[u64](&(*p).offsets, i)
+        var d: usize = 10
+        while d > 0 {
+            d = d - 1
+            digits[d] = (48 + v % 10) as u8
+            v = v / 10
+        }
+        rt.buf_push_bytes(b, (&digits[0]) as u64, 10)
+        put(b, " 00000 n \n")
+        i = i + 1
+    }
+    put(b, "trailer\n<< /Size ")
+    put_int(b, count as i64)
+    put(b, " /Root ")
+    put_ref(b, (*p).catalog)
+    put(b, " /Info ")
+    put_ref(b, info)
+    put(b, " /ID [<")
+    var twice: usize = 0
+    while twice < 2 {
+        if twice == 1 {
+            put(b, "> <")
+        }
+        i = 0
+        while i < 16 {
+            rt.buf_push(b, hex_digit((id[i] >> 4) as u32))
+            rt.buf_push(b, hex_digit((id[i] & 15 as u8) as u32))
+            i = i + 1
+        }
+        twice = twice + 1
+    }
+    put(b, ">] >>\nstartxref\n")
+    put_int(b, xref as i64)
+    put(b, "\n%%EOF\n")
+    return (*b).len - (*p).start
+}
+
+// The outline tree out of the flat (title, dest, level) list; 0 = none.
+fn write_outlines(p: *mut Pdf) -> u32 {
+    let n: usize = vec_len[str](&(*p).ol_title)
+    if n == 0 {
+        return 0 as u32
+    }
+    let b: *mut rt.Buf = o(p)
+    let root: u32 = obj_new(p)
+    var num: Vec[u32] = vec_new[u32]()
+    var parent: Vec[i64] = vec_new[i64]() // -1 = root
+    var level: Vec[u32] = vec_new[u32]()
+    var i: usize = 0
+    while i < n {
+        vec_push[u32](&num, obj_new(p))
+        // clamp: a jump of more than one level hangs under the previous one
+        var lv: u32 = vec_at[u32](&(*p).ol_level, i)
+        if i == 0 {
+            lv = 0
+        } else if lv > vec_at[u32](&level, i - 1) + 1 {
+            lv = vec_at[u32](&level, i - 1) + 1
+        }
+        vec_push[u32](&level, lv)
+        // the parent: the nearest earlier item with level lv - 1
+        var par: i64 = -1
+        if lv > 0 {
+            var j: i64 = i as i64 - 1
+            while j >= 0 && par < 0 {
+                if vec_at[u32](&level, j as usize) == lv - 1 {
+                    par = j
+                }
+                j = j - 1
+            }
+        }
+        vec_push[i64](&parent, par)
+        i = i + 1
+    }
+    // for every item and the root: first child, last child, number of
+    // descendants; for every item: previous and next sibling
+    i = 0
+    var root_first: i64 = -1
+    var root_last: i64 = -1
+    while i < n {
+        let me: i64 = i as i64
+        obj_begin(p, vec_at[u32](&num, i))
+        put(b, "<< /Title ")
+        put_text(b, *vec_elem_ptr[str](&(*p).ol_title, i))
+        put(b, " /Parent ")
+        let par: i64 = vec_at[i64](&parent, i)
+        if par < 0 {
+            put_ref(b, root)
+            if root_first < 0 { root_first = me }
+            root_last = me
+        } else {
+            put_ref(b, vec_at[u32](&num, par as usize))
+        }
+        // siblings: same parent, scanning both ways
+        var prev: i64 = -1
+        var j: i64 = me - 1
+        while j >= 0 && prev < 0 {
+            if vec_at[i64](&parent, j as usize) == par {
+                prev = j
+            }
+            if par >= 0 && j == par {
+                j = -1
+            } else {
+                j = j - 1
+            }
+        }
+        var next: i64 = -1
+        var q: usize = i + 1
+        while q < n && next < 0 {
+            if vec_at[i64](&parent, q) == par {
+                next = q as i64
+            }
+            // leaving the parent's subtree ends the search
+            if vec_at[u32](&level, q) < vec_at[u32](&level, i) {
+                q = n
+            } else {
+                q = q + 1
+            }
+        }
+        if prev >= 0 {
+            put(b, " /Prev ")
+            put_ref(b, vec_at[u32](&num, prev as usize))
+        }
+        if next >= 0 {
+            put(b, " /Next ")
+            put_ref(b, vec_at[u32](&num, next as usize))
+        }
+        // children: the items right after with a deeper level
+        var first_child: i64 = -1
+        var last_child: i64 = -1
+        var desc: i64 = 0
+        q = i + 1
+        while q < n && vec_at[u32](&level, q) > vec_at[u32](&level, i) {
+            desc = desc + 1
+            if vec_at[i64](&parent, q) == me {
+                if first_child < 0 { first_child = q as i64 }
+                last_child = q as i64
+            }
+            q = q + 1
+        }
+        if first_child >= 0 {
+            put(b, " /First ")
+            put_ref(b, vec_at[u32](&num, first_child as usize))
+            put(b, " /Last ")
+            put_ref(b, vec_at[u32](&num, last_child as usize))
+            put(b, " /Count ")
+            put_int(b, desc)
+        }
+        put(b, " /Dest ")
+        put_dest(p, b, vec_at[u32](&(*p).ol_dest, i))
+        put(b, " >>")
+        obj_end(p)
+        i = i + 1
+    }
+    obj_begin(p, root)
+    put(b, "<< /Type /Outlines /First ")
+    put_ref(b, vec_at[u32](&num, root_first as usize))
+    put(b, " /Last ")
+    put_ref(b, vec_at[u32](&num, root_last as usize))
+    put(b, " /Count ")
+    put_int(b, n as i64)
+    put(b, " >>")
+    obj_end(p)
+    vec_free[u32](&num)
+    vec_free[i64](&parent)
+    vec_free[u32](&level)
+    return root
+}
