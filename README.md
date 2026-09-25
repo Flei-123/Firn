@@ -404,6 +404,7 @@ firnc [OPTIONS] file.fi
 | `lib/firnc1/` | the same compiler **in Firn** — the one that reaches the fixpoint |
 | `lib/std/`, `lib/str/`, `lib/num/`, `lib/rt/`, `lib/gc/` | the standard library, written in Firn |
 | `lib/html/`, `lib/css/`, `lib/dom/`, `lib/layout/`, `lib/js/` | the browser stack: tokenizer, CSS, DOM, layout, JavaScript |
+| `lib/pdf/`, `lib/zip/`, `lib/jpeg/`, `lib/regex/`, `lib/i18n/`, `lib/print/`, `lib/fuishell/` | application libraries (PDF writer, ZIP, JPEG, regular expressions, message catalogs, IPP printing, desktop shell) -- [docs/APPLICATION_LIBS.md](docs/APPLICATION_LIBS.md) |
 | `tests/`, `tests/opt/`, `tests/neg/` | the test programs (positive, optimizer, negative) |
 | `examples/`, `demos/` | small programs; `demos/kernel` boots in QEMU, `demos/mcserver` |
 | `bench/`, `tools/` | the benchmarks (Firn + Rust in duplicate) and every proof script |
@@ -420,6 +421,7 @@ firnc [OPTIONS] file.fi
 | [RUN.md](RUN.md) | build everything, run everything, measure everything |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | every number with the command that produced it, including the ones Firn loses |
 | [docs/FIR.md](docs/FIR.md) | the IR: instructions, types, invariants |
+| [docs/APPLICATION_LIBS.md](docs/APPLICATION_LIBS.md) | std.fs, std.time, PDF, ZIP, JPEG, regex, i18n, printing, clipboard, docking -- the libraries OpenPlan asked for, and what proves each |
 | [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) | the bootstrap plan and how far it got |
 | [docs/MODULE_REPORTS.md](docs/MODULE_REPORTS.md) | the long round-by-round reports that used to live in this file |
 | [docs/DEBUGGER.md](docs/DEBUGGER.md) · [docs/ERROR_UNIONS.md](docs/ERROR_UNIONS.md) · [docs/RC.md](docs/RC.md) | debugger session, error unions, reference counting |

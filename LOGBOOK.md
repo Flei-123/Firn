@@ -1,3 +1,24 @@
+## Round OPENPLAN-LIBS (2026-09-25) -- the application libraries OpenPlan asked for; branches mvp-libs, clipboard
+OpenPlan (the electrical CAD on Firn) listed what it cannot do without (LIB-001..010). Built in one
+round, each with a positive test in every build level and on AArch64, and each held against an
+implementation nobody here wrote (tools/libmvp/run.sh, test.sh section 65): std.fs (the kernel's
+own answers), std.time (Python zoneinfo, 20,000 instants x 5 zones, 0 differ), lib/zip (Python
+zipfile and Info-ZIP both ways, plus zip slip, duplicates, overlapping entries, lying sizes),
+lib/pdf (poppler text/fonts/pixels and pypdf strict; the TrueType subset checks out with fontTools),
+lib/regex (Python re, 20,043 cases, 0 differ; `(a|a)*b` on 20,000 "a" in one pass), lib/i18n (ICU 72,
+8,885 cases), lib/jpeg (46 files octet-identical to libjpeg-turbo: libjpeg's islow IDCT, fancy
+upsampling and colour tables ported exactly), lib/print (CUPS' ippeveprinter received the PDF octet
+for octet), the X11 clipboard (Tk and python-xlib, INCR both ways with 1 MB), two top-level windows
+in one program, and the dock/file-chooser models of the desktop shell. The compiler learned
+unlinkat, symlinkat and statx for AArch64; std.deflate got `inflate_limited` and stopped letting a
+back-reference reach into what the caller already had in the output buffer. lib/svg became MPL-2.0.
+FOUND ON THE WAY, NOT FIXED HERE: tests/860_thread_basic.fi and tests/834_arc_thread.fi fail their
+counter-check ("the unlocked counter must lose increments") when the host is loaded (17 of 20 runs
+at load 20 on 20 cores, 0 of 12 an hour later; the binary is octet-identical to main's), which also
+makes the fixpoint section flip; tools/fui/x11live.py L5 indexes the state lines by the frame count
+and catches a line of the frame before the click about one run in six. OPEN: drawing the dock and
+the file chooser with fUi widgets (LIB-005), the clipboard on Windows (with the Windows target).
+
 ## Round K5 (2026-08-25) -- four processors in Osum; branch k5-smp
 The kernel of rounds 59/62/K1/K2 was an operating system on ONE core, and said so in
 kstate.fi: "NOT atomic -- it does not have to be: the kernel runs on one processor". It now
