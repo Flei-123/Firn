@@ -38,8 +38,9 @@ def firn(*a, wait=True):
 def tk_get(typ=None):
     code = "import tkinter\nr=tkinter.Tk()\ntry:\n  print(repr(r.clipboard_get(%s)))\nexcept Exception as e:\n  print('ERR')\n" % ("type=%r" % typ if typ else "")
     return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30).stdout.strip()
-def tk_own(text, secs):
-    code = "import tkinter\nr=tkinter.Tk()\nr.clipboard_clear()\nr.clipboard_append(%r)\nr.update()\nr.after(%d, r.destroy)\nr.mainloop()\n" % (text, secs * 1000)
+def tk_own(text, secs, from_file=None):
+    what = "open(%r).read()" % from_file if from_file else repr(text)
+    code = "import tkinter\nr=tkinter.Tk()\nr.clipboard_clear()\nr.clipboard_append(%s)\nr.update()\nr.after(%d, r.destroy)\nr.mainloop()\n" % (what, secs * 1000)
     t = subprocess.Popen([sys.executable, "-c", code.replace("r.update()\n", "r.update()\nprint('OWNED', flush=True)\n")],
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     t.stdout.readline()  # Tk owns the clipboard now
@@ -96,6 +97,31 @@ try:
     (ok if "UTF8_STRING" in r else fail)("Tk's TARGETS read by Firn (%s)" % " ".join(r))
     r = firn("get", "application/x-openplan+json")
     (ok if r == "NONE" else fail)("a type the owner does not have: refused (%s)" % r)
+    t.wait()
+    # --- large contents go as INCR transfers (ICCCM 2.7.2), both ways
+    import random, tempfile
+    rng = random.Random(3)
+    big = "".join(rng.choice("abcdeäöü€ \n") for _ in range(700000))
+    blob = bytes(rng.getrandbits(8) for _ in range(1500000))
+    tmp = tempfile.mkdtemp()
+    bigf, blobf, outf = os.path.join(tmp, "big.txt"), os.path.join(tmp, "blob.png"), os.path.join(tmp, "out")
+    open(bigf, "w").write(big)
+    open(blobf, "wb").write(blob)
+    p = firn("ownfile", "6", "text/plain", bigf, wait=False)
+    assert p.stdout.readline().strip() == "OWNING"
+    r = tk_get()
+    (ok if r == repr(big) else fail)("Firn -> Tk: %d octets of text through INCR" % len(big.encode()))
+    r = firn("getfile", "text/plain", outf)
+    (ok if r == "GOT" and open(outf, "rb").read() == big.encode() else fail)("Firn -> Firn: the same through INCR")
+    p.communicate(timeout=20)
+    p = firn("ownfile", "4", "image/png", blobf, wait=False)
+    assert p.stdout.readline().strip() == "OWNING"
+    r = firn("getfile", "image/png", outf)
+    (ok if r == "GOT" and open(outf, "rb").read() == blob else fail)("Firn -> Firn: %d octets of binary data (image/png) through INCR" % len(blob))
+    p.communicate(timeout=20)
+    t = tk_own(None, 5, from_file=bigf)
+    r = firn("getfile", "text/plain", outf)
+    (ok if r == "GOT" and open(outf, "rb").read() == big.encode() else fail)("Tk -> Firn: %d octets through INCR" % len(big.encode()))
     t.wait()
 finally:
     xvfb.terminate()

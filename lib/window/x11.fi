@@ -202,6 +202,15 @@ struct Platte {
     a_firn: u32,
     a_incr: u32,
     clip_own: bool,
+    // INCR transfers (ICCCM 2.7.2) in both directions
+    mask: u32, // the event mask of our window (CreateWindow)
+    prop_events: bool, // PropertyChangeMask selected on our window
+    incr_win: [u32; 4],
+    incr_prop: [u32; 4],
+    incr_type: [u32; 4],
+    incr_slot: [u32; 4],
+    incr_off: [usize; 4],
+    incr_on: [bool; 4],
     clip_n: u32,
     clip_atom: [u32; 8],
     clip_mime: [str; 8],
@@ -215,7 +224,8 @@ fn surface_new() -> Platte {
         id_mask: 0, next_id: 0, visual: 0, depth: 0, win: 0, gc: 0,
         font: 0, w: 0, h: 0, seq: 0, rb: rt.buf_new(), rpos: 0,
         req_left: 0, a_clipboard: 0, a_targets: 0, a_utf8: 0, a_text: 0, a_plain: 0, a_firn: 0, a_incr: 0,
-        clip_own: false, clip_n: 0, clip_atom: [0 as u32; 8], clip_mime: ["", "", "", "", "", "", "", ""],
+        clip_own: false, mask: 0, prop_events: false, incr_win: [0 as u32; 4], incr_prop: [0 as u32; 4],
+        incr_type: [0 as u32; 4], incr_slot: [0 as u32; 4], incr_off: [0; 4], incr_on: [false; 4], clip_n: 0, clip_atom: [0 as u32; 8], clip_mime: ["", "", "", "", "", "", "", ""],
         clip_data: [rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new()],
         a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
         dark_bekannt: false, dark_us: 0, inj: 0, gift: 0, fail: 0,
@@ -1638,6 +1648,7 @@ fn r_make(x: *mut Platte, w: usize, h: usize) -> bool {
     if (*x).voll {
         maske = maske | 2 as u32 | 8 as u32 | 16 as u32 | 32 as u32
     }
+    (*x).mask = maske
     req_create_window(&r, (*x).win, (*x).root, (*x).depth, (*x).visual,
         w, h, 16777215 as u32, maske)
     req_create_gc(&r, (*x).gc, (*x).win)
@@ -2168,6 +2179,13 @@ fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
             answer_selection(x, (&ev[0]) as u64)
             continue
         }
+        if code == 28 as u8 { // PropertyNotify: the next piece of an INCR transfer
+            let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
+            var ev: [u8; 32] = [0 as u8; 32]
+            rt.mem_copy((&ev[0]) as u64, q, 32)
+            incr_next(x, (&ev[0]) as u64)
+            continue
+        }
         if code == 29 as u8 { // SelectionClear: another program owns it now
             let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
             if ld32le(q, 12) == (*x).a_clipboard {
@@ -2469,18 +2487,23 @@ fn r_gpu_lost(x: *mut Platte) -> bool {
 // ConvertSelection with the wanted type, wait for SelectionNotify, read
 // the property (ICCCM 2.4-2.6).
 //
-// What this backend offers: any number of MIME types up to eight per
-// copy; text is offered as UTF8_STRING, STRING, TEXT and
-// text/plain;charset=utf-8, and TARGETS lists them all. Limits, said here
-// rather than found out: data larger than one request (about 256 KiB)
-// is refused in both directions -- the incremental transfer (INCR) is not
-// implemented; and asking waits at most one second for the owner.
+// What this backend offers: up to eight MIME types per copy; text is
+// offered as UTF8_STRING, STRING, TEXT and text/plain;charset=utf-8, and
+// TARGETS lists them all. Data larger than 200,000 octets goes as an INCR
+// transfer (ICCCM 2.7.2) in pieces of 64 KiB, in both directions, up to
+// 64 MiB. Asking waits at most one second for the owner, and two seconds
+// for every piece.
 
 fn is_text_mime(m: str) -> bool {
     return m == "text/plain;charset=utf-8" || m == "text/plain" || m == "UTF8_STRING" || m == "text/plain;charset=UTF-8"
 }
 
 fn clip_drop(x: *mut Platte) {
+    var t: usize = 0
+    while t < 4 {
+        (*x).incr_on[t] = false // a transfer of data that is gone ends
+        t = t + 1
+    }
     var i: usize = 0
     while i < 8 {
         rt.buf_free(&(*x).clip_data[i])
@@ -2534,6 +2557,14 @@ fn wait_record(x: *mut Platte, kind: u32, seq: u32, ms: i64, out: *mut rt.Buf) -
                     hit = true
                 }
                 if kind == 2 && code == 31 as u8 && ld32le(p, 8) == (*x).win && ld32le(p, 12) == (*x).a_clipboard {
+                    hit = true
+                }
+                // a new value of our property (the next INCR piece)
+                if kind == 3 && code == 28 as u8 && ld32le(p, 4) == (*x).win && ld32le(p, 8) == (*x).a_firn && rt.ld8(p, 16) == 0 as u8 {
+                    hit = true
+                }
+                // any change of our property (skipping up to our own delete)
+                if kind == 5 && code == 28 as u8 && ld32le(p, 4) == (*x).win && ld32le(p, 8) == (*x).a_firn {
                     hit = true
                 }
                 if hit {
@@ -2615,7 +2646,7 @@ fn set_owner(x: *mut Platte, owner: u32) -> bool {
 // Offers `n` octets as `mime` on the clipboard (adding to what this
 // program offers already, or replacing that type).
 fn r_clip_set(x: *mut Platte, mime: str, p: u64, n: usize) -> bool {
-    if !(*x).open || (*x).win == 0 || n > 262000 {
+    if !(*x).open || (*x).win == 0 || n > 67108864 {
         return false
     }
     let atom: u32 = mime_atom(x, mime)
@@ -2659,6 +2690,15 @@ fn r_clip_clear(x: *mut Platte) {
 // then GetProperty(20) with delete. The value (without the reply head)
 // into `out`; `typ` its type.
 fn fetch_selection(x: *mut Platte, target: u32, out: *mut rt.Buf, typ: *mut u32) -> bool {
+    if !(*x).prop_events {
+        // PropertyNotify on our own window: an INCR transfer announces
+        // every piece with it, and it has to be selected BEFORE the owner
+        // starts
+        if !select_events(x, (*x).win, (*x).mask | 4194304 as u32) {
+            return false
+        }
+        (*x).prop_events = true
+    }
     var r: rt.Buf = rt.buf_new()
     rt.buf_push(&r, 24 as u8)
     rt.buf_push(&r, 0 as u8)
@@ -2701,13 +2741,157 @@ fn fetch_selection(x: *mut Platte, target: u32, out: *mut rt.Buf, typ: *mut u32)
     var count: usize = ld32le(rp, 16) as usize
     if format == 16 { count = count * 2 }
     if format == 32 { count = count * 4 }
-    if *typ == (*x).a_incr || 32 + count > rt.buf_len(&rep) {
+    if 32 + count > rt.buf_len(&rep) {
         rt.buf_free(&rep)
-        return false // INCR: not implemented (see the head of this part)
+        return false
+    }
+    if *typ == (*x).a_incr {
+        // INCR: the property is deleted (GetProperty above), which asks the
+        // owner for the first piece; every piece arrives as a new value,
+        // an empty one ends it
+        rt.buf_free(&rep)
+        let start: usize = rt.buf_len(out)
+        while true {
+            // every notice about our property up to our own delete is old
+            // news (the INCR announcement, the previous piece)
+            if !skip_until_deleted(x) {
+                rt.buf_set_len(out, start)
+                return false
+            }
+            var ev: rt.Buf = rt.buf_new()
+            let got: bool = wait_record(x, 3 as u32, 0 as u32, 2000, &ev)
+            rt.buf_free(&ev)
+            if !got {
+                rt.buf_set_len(out, start)
+                return false
+            }
+            var piece: rt.Buf = rt.buf_new()
+            var ptype: u32 = 0
+            if !get_prop_delete(x, &piece, &ptype) {
+                rt.buf_free(&piece)
+                rt.buf_set_len(out, start)
+                return false
+            }
+            let n: usize = rt.buf_len(&piece)
+            if n == 0 {
+                rt.buf_free(&piece)
+                return true
+            }
+            *typ = ptype
+            if rt.buf_len(out) - start + n > 67108864 {
+                rt.buf_free(&piece)
+                rt.buf_set_len(out, start)
+                return false
+            }
+            rt.buf_push_bytes(out, rt.buf_ptr(&piece), n)
+            rt.buf_free(&piece)
+        }
+        return false
     }
     rt.buf_push_bytes(out, rp + 32, count)
     rt.buf_free(&rep)
     return true
+}
+
+// Takes the PropertyNotify records of our property out of the stream up
+// to and including the one that reports our own delete.
+fn skip_until_deleted(x: *mut Platte) -> bool {
+    while true {
+        var ev: rt.Buf = rt.buf_new()
+        let got: bool = wait_record(x, 5 as u32, 0 as u32, 2000, &ev)
+        var state: u8 = 0
+        if got {
+            state = rt.ld8(rt.buf_ptr(&ev), 16)
+        }
+        rt.buf_free(&ev)
+        if !got {
+            return false
+        }
+        if state == 1 as u8 {
+            return true
+        }
+    }
+    return false
+}
+
+// GetProperty(20) of our property with delete; the value into `out`
+fn get_prop_delete(x: *mut Platte, out: *mut rt.Buf, typ: *mut u32) -> bool {
+    var g: rt.Buf = rt.buf_new()
+    rt.buf_push(&g, 20 as u8)
+    rt.buf_push(&g, 1 as u8)
+    put16(&g, 6 as u32)
+    put32(&g, (*x).win)
+    put32(&g, (*x).a_firn)
+    put32(&g, 0 as u32)
+    put32(&g, 0 as u32)
+    put32(&g, 16777216 as u32)
+    if !send_request(x, &g) {
+        return false
+    }
+    var rep: rt.Buf = rt.buf_new()
+    if !wait_record(x, 1 as u32, (*x).seq, 2000, &rep) {
+        rt.buf_free(&rep)
+        return false
+    }
+    let rp: u64 = rt.buf_ptr(&rep)
+    let format: u32 = rt.ld8(rp, 1) as u32
+    *typ = ld32le(rp, 8)
+    var count: usize = ld32le(rp, 16) as usize
+    if format == 16 { count = count * 2 }
+    if format == 32 { count = count * 4 }
+    if 32 + count > rt.buf_len(&rep) {
+        rt.buf_free(&rep)
+        return false
+    }
+    rt.buf_push_bytes(out, rp + 32, count)
+    rt.buf_free(&rep)
+    return true
+}
+
+// ChangeWindowAttributes(2): the event mask our connection selects on
+// window `w` (for other programs' windows this concerns only us)
+fn select_events(x: *mut Platte, w: u32, mask: u32) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 2 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, w)
+    put32(&r, 2048 as u32) // CWEventMask
+    put32(&r, mask)
+    return send_request(x, &r)
+}
+
+// The owner's half of INCR: the requestor deleted the property -- write
+// the next piece, or the empty one that ends the transfer.
+fn incr_next(x: *mut Platte, ev: u64) {
+    let w: u32 = ld32le(ev, 4)
+    let atom: u32 = ld32le(ev, 8)
+    if rt.ld8(ev, 16) != 1 as u8 {
+        return // NewValue: our own piece arriving
+    }
+    var t: usize = 0
+    while t < 4 {
+        if (*x).incr_on[t] && (*x).incr_win[t] == w && (*x).incr_prop[t] == atom {
+            let d: *mut rt.Buf = &(*x).clip_data[(*x).incr_slot[t] as usize]
+            let total: usize = rt.buf_len(d)
+            var n: usize = 0
+            if (*x).incr_off[t] < total {
+                n = total - (*x).incr_off[t]
+                if n > 65536 {
+                    n = 65536
+                }
+            }
+            var r: rt.Buf = rt.buf_new()
+            req_change_property(&r, w, atom, (*x).incr_type[t], 8 as u32, rt.buf_ptr(d) + (*x).incr_off[t] as u64, n)
+            send_request(x, &r)
+            (*x).incr_off[t] = (*x).incr_off[t] + n
+            if n == 0 {
+                (*x).incr_on[t] = false // the empty piece was the last
+            }
+            return
+        }
+        t = t + 1
+    }
 }
 
 // The clipboard's content as `mime`, appended to `out`.
@@ -2851,8 +3035,36 @@ fn answer_selection(x: *mut Platte, ev: u64) {
             while i < (*x).clip_n && !ok {
                 if (*x).clip_atom[i as usize] == want {
                     let d: *mut rt.Buf = &(*x).clip_data[i as usize]
-                    req_change_property(&r, requestor, prop, typ, 8 as u32, rt.buf_ptr(d), rt.buf_len(d))
-                    ok = true
+                    if rt.buf_len(d) <= 200000 {
+                        req_change_property(&r, requestor, prop, typ, 8 as u32, rt.buf_ptr(d), rt.buf_len(d))
+                        ok = true
+                    } else {
+                        // INCR: announce the size, send the pieces as the
+                        // requestor deletes the property (incr_next)
+                        var t: usize = 0
+                        var free: i64 = -1
+                        while t < 4 {
+                            if !(*x).incr_on[t] && free < 0 {
+                                free = t as i64
+                            }
+                            t = t + 1
+                        }
+                        if free >= 0 {
+                            let f: usize = free as usize
+                            (*x).incr_on[f] = true
+                            (*x).incr_win[f] = requestor
+                            (*x).incr_prop[f] = prop
+                            (*x).incr_type[f] = typ
+                            (*x).incr_slot[f] = i
+                            (*x).incr_off[f] = 0
+                            select_events(x, requestor, 4194304 as u32) // PropertyChangeMask
+                            var sz: rt.Buf = rt.buf_new()
+                            put32(&sz, rt.buf_len(d) as u32)
+                            req_change_property(&r, requestor, prop, (*x).a_incr, 32 as u32, rt.buf_ptr(&sz), 4)
+                            rt.buf_free(&sz)
+                            ok = true
+                        }
+                    }
                 }
                 i = i + 1
             }
