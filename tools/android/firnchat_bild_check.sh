@@ -168,6 +168,14 @@ tap_spot 3 4; sleep 5
 $ADB shell input keyevent KEYCODE_BACK; sleep 5
 check "no photo, said so" "$(count 'bild-kein 3')" 1
 check "nothing more went out" "$(cd "$W" && "$FC" hist "$PORT" alice.id | grep -c 'bild:')" 3
+echo "== 8. a photo while the app is in the background: the notification"
+$ADB shell input keyevent KEYCODE_HOME; sleep 3
+(cd "$W" && "$FC" send "$BOB" "[bild:$RID $RDIM]
+Rot im Hintergrund" "$PORT" alice.id >/dev/null); sleep 8
+NT=$($ADB shell dumpsys notification --noredact | awk '/android.title=String \(Alice/ {f=1}
+    f && /android.text=String/ {sub(/.*android.text=String \(/, ""); sub(/\)$/, ""); print; exit}')
+check "it says Foto and the text, not the raw line" "$NT" "Foto: Rot im Hintergrund"
+$ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 4
 check "the same process all along (no crash)" "$($ADB shell pidof $PKG)" "$P1"
 check "no crash in the log" "$($ADB logcat -d -b crash | grep -c "$PKG")" 0
 
