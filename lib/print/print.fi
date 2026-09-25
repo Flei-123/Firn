@@ -1,0 +1,653 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/print/print.fi -- printing through IPP: list printers, send a PDF,
+// follow and cancel the job.
+//
+// OpenPlan LIB-009 (F-IEX-002). A page is printed by handing the PDF of
+// lib/pdf to the system's print service. On Linux (and macOS) that is CUPS,
+// and CUPS speaks IPP (the Internet Printing Protocol, RFC 8010/8011) over
+// HTTP on port 631 -- so is every network printer sold since about 2010
+// (IPP Everywhere). This file is an IPP client on top of lib/net/http.fi;
+// it needs no libcups and no driver.
+//
+//     import print.print
+//     var list: Vec[print.PrinterInfo] = vec_new[print.PrinterInfo]()
+//     print.printers(&list) catch |e| ...                 // CUPS on localhost
+//     var o: print.PrintOptions = print.print_options_default()
+//     o.copies = 2
+//     o.media = "iso_a3_297x420mm"
+//     let job: u32 = print.print_pdf("Office", pdf_ptr, pdf_len, o) catch |e| ...
+//
+// A PRINTER is named either by its CUPS queue name ("Office" ->
+// ipp://localhost:631/printers/Office) or by a full URI
+// (ipp://192.168.1.20/ipp/print, http://...:631/...). `localhost` is
+// 127.0.0.1: the HTTP client takes numeric addresses only. `ipps://`
+// (IPP over TLS) is refused like https:// is (lib/net/http.fi): a network
+// printer that insists on TLS has to be reached through CUPS.
+//
+// THE OPERATIONS: CUPS-Get-Printers and CUPS-Get-Default (list, default),
+// Get-Printer-Attributes (one printer), Print-Job (the document goes in
+// the same request), Get-Job-Attributes (job state), Cancel-Job. Errors
+// from the printer keep their IPP status code (`print_last_status`), e.g.
+// 0x040A document-format-not-supported.
+//
+// Windows printing (GDI/XPS) comes with the Windows target (LIB-016).
+
+import std.rt
+import std.vec
+import std.str
+import net.http
+
+export {
+    PrintError, PrinterInfo, PrintOptions,
+    print_options_default, printers, printers_at, printer_attributes,
+    print_pdf, print_document, job_state, cancel_job, print_last_status,
+    printer_uri, ipp_encode_request,
+    SIDES_ONE, SIDES_LONG_EDGE, SIDES_SHORT_EDGE,
+    COLOR_AUTO, COLOR_MONO, COLOR_COLOR,
+    JOB_PENDING, JOB_HELD, JOB_PROCESSING, JOB_STOPPED, JOB_CANCELED, JOB_ABORTED, JOB_COMPLETED,
+}
+
+error PrintError {
+    NoServer, // nothing answers at the address (CUPS not running, printer off)
+    Http, // an HTTP-level failure (status other than 200, broken framing)
+    Ipp, // the printer refused the operation -- see print_last_status()
+    BadPrinter, // the printer name or URI cannot be used
+    Protocol, // the answer is not well-formed IPP
+}
+
+const SIDES_ONE: u32 = 0
+const SIDES_LONG_EDGE: u32 = 1
+const SIDES_SHORT_EDGE: u32 = 2
+const COLOR_AUTO: u32 = 0
+const COLOR_MONO: u32 = 1
+const COLOR_COLOR: u32 = 2
+
+// job-state (RFC 8011 5.3.7)
+const JOB_PENDING: u32 = 3
+const JOB_HELD: u32 = 4
+const JOB_PROCESSING: u32 = 5
+const JOB_STOPPED: u32 = 6
+const JOB_CANCELED: u32 = 7
+const JOB_ABORTED: u32 = 8
+const JOB_COMPLETED: u32 = 9
+
+// operation ids
+const OP_PRINT_JOB: u32 = 2
+const OP_CANCEL_JOB: u32 = 8
+const OP_GET_JOB_ATTRIBUTES: u32 = 9
+const OP_GET_PRINTER_ATTRIBUTES: u32 = 11
+const OP_CUPS_GET_DEFAULT: u32 = 16385 // 0x4001
+const OP_CUPS_GET_PRINTERS: u32 = 16386 // 0x4002
+
+// delimiter and value tags (RFC 8010 3.5)
+const T_OPERATION: u8 = 1
+const T_JOB: u8 = 2
+const T_END: u8 = 3
+const T_PRINTER: u8 = 4
+const V_INTEGER: u8 = 33 // 0x21
+const V_BOOLEAN: u8 = 34 // 0x22
+const V_ENUM: u8 = 35 // 0x23
+const V_TEXT: u8 = 65 // 0x41 textWithoutLanguage
+const V_NAME: u8 = 66 // 0x42 nameWithoutLanguage
+const V_KEYWORD: u8 = 68 // 0x44
+const V_URI: u8 = 69 // 0x45
+const V_CHARSET: u8 = 71 // 0x47
+const V_LANGUAGE: u8 = 72 // 0x48
+const V_MIME: u8 = 73 // 0x49
+
+struct PrinterInfo {
+    name: str,
+    uri: str,
+    info: str, // the human description
+    location: str,
+    make: str, // printer-make-and-model
+    state: u32, // 3 idle, 4 processing, 5 stopped
+    accepting: bool,
+    color: bool,
+    duplex: bool,
+    is_default: bool,
+    media: str, // media-supported, comma-separated
+    formats: str, // document-format-supported, comma-separated
+}
+
+struct PrintOptions {
+    copies: u32,
+    sides: u32,
+    color: u32,
+    media: str, // "" = the printer's default, e.g. "iso_a4_210x297mm"
+    job_name: str,
+    user: str,
+    landscape: bool,
+}
+
+fn print_options_default() -> PrintOptions {
+    return PrintOptions { copies: 1, sides: SIDES_ONE, color: COLOR_AUTO, media: "", job_name: "OpenPlan",
+        user: "openplan", landscape: false }
+}
+
+static mut last_status: u32 = 0
+static mut request_id: u32 = 0
+
+// The IPP status code of the last answer (0 = successful-ok).
+fn print_last_status() -> u32 {
+    return last_status
+}
+
+fn info_new() -> PrinterInfo {
+    return PrinterInfo { name: "", uri: "", info: "", location: "", make: "", state: 0, accepting: false,
+        color: false, duplex: false, is_default: false, media: "", formats: "" }
+}
+
+// ------------------------------------------------------------ Addresses
+
+// The printer URI for a queue name or a URI; "" if it cannot be used.
+fn printer_uri(printer: str) -> str {
+    if printer.n == 0 {
+        return ""
+    }
+    if printer.starts_with("ipp://") || printer.starts_with("http://") {
+        return printer
+    }
+    if printer.contains("://") || printer.contains("/") {
+        return "" // ipps://, https://, a path
+    }
+    return "ipp://localhost:631/printers/" + printer
+}
+
+// ipp://host[:port]/path -> http://host:port/path, localhost -> 127.0.0.1
+fn http_url(uri: str) -> str {
+    var rest: str = ""
+    var default_port: bool = false
+    if uri.starts_with("ipp://") {
+        rest = uri.ab(6)
+        default_port = true
+    } else if uri.starts_with("http://") {
+        rest = uri.ab(7)
+    } else {
+        return ""
+    }
+    var slash: usize = rest.n
+    var k: usize = 0
+    while k < rest.n {
+        if rt.ld8(rest.p as u64, k) == 47 as u8 {
+            slash = k
+            k = rest.n
+        }
+        k = k + 1
+    }
+    var host: str = rest.part(0, slash)
+    let path: str = rest.ab(slash)
+    var has_port: bool = false
+    k = 0
+    while k < host.n {
+        if rt.ld8(host.p as u64, k) == 58 as u8 {
+            has_port = true
+        }
+        k = k + 1
+    }
+    if host.starts_with("localhost") {
+        host = "127.0.0.1" + host.ab(9)
+    }
+    if !has_port && default_port {
+        host = host + ":631"
+    }
+    if path.n == 0 {
+        return "http://" + host + "/"
+    }
+    return "http://" + host + path
+}
+
+// ------------------------------------------------------------ Encoding
+
+fn put8(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255) as u8)
+}
+
+fn put16(b: *mut rt.Buf, v: u32) {
+    put8(b, v >> 8)
+    put8(b, v)
+}
+
+fn put32(b: *mut rt.Buf, v: u32) {
+    put16(b, v >> 16)
+    put16(b, v & 65535)
+}
+
+fn attr(b: *mut rt.Buf, tag: u8, name: str, value: str) {
+    put8(b, tag as u32)
+    put16(b, name.n as u32)
+    rt.buf_push_bytes(b, name.p as u64, name.n)
+    put16(b, value.n as u32)
+    rt.buf_push_bytes(b, value.p as u64, value.n)
+}
+
+// an additional value of the attribute before
+fn attr_more(b: *mut rt.Buf, tag: u8, value: str) {
+    put8(b, tag as u32)
+    put16(b, 0 as u32)
+    put16(b, value.n as u32)
+    rt.buf_push_bytes(b, value.p as u64, value.n)
+}
+
+fn attr_int(b: *mut rt.Buf, tag: u8, name: str, v: u32) {
+    put8(b, tag as u32)
+    put16(b, name.n as u32)
+    rt.buf_push_bytes(b, name.p as u64, name.n)
+    put16(b, 4 as u32)
+    put32(b, v)
+}
+
+// The head of an IPP/2.0 request with the three operation attributes
+// every request starts with (RFC 8011 4.1.4). `uri` "" = none.
+fn ipp_encode_request(b: *mut rt.Buf, op: u32, uri: str) {
+    request_id = request_id + 1
+    put16(b, 512 as u32) // version 2.0
+    put16(b, op)
+    put32(b, request_id)
+    put8(b, T_OPERATION as u32)
+    attr(b, V_CHARSET, "attributes-charset", "utf-8")
+    attr(b, V_LANGUAGE, "attributes-natural-language", "en")
+    if uri.n > 0 {
+        attr(b, V_URI, "printer-uri", uri)
+    }
+}
+
+// ------------------------------------------------------------ Transport
+
+fn why_http(e: HttpError, kind: *mut u32) -> bool {
+    if e == HttpError::Connect || e == HttpError::Resolve {
+        *kind = 1 as u32
+    } else if e == HttpError::Url || e == HttpError::Scheme || e == HttpError::Tls {
+        *kind = 2 as u32
+    } else {
+        *kind = 3 as u32
+    }
+    return false
+}
+
+// POSTs the request `req` to `url`; the answer's octets into `out`
+fn exchange(url: str, req: *mut rt.Buf, out: *mut rt.Buf) -> PrintError!bool {
+    var c: http.Client = http.client_new()
+    if !http.client_init(&c) {
+        return PrintError::Http
+    }
+    http.client_set_cache(&c, false)
+    http.client_set_gzip(&c, false)
+    http.client_set_timeout(&c, 30000)
+    var r: http.Response = http.resp_new()
+    http.resp_init(&r)
+    let ct: str = "application/ipp"
+    var kind: u32 = 0
+    let ok: bool = http.http_post(&c, url.p as u64, url.n, rt.buf_ptr(req), rt.buf_len(req), ct.p as u64, ct.n, &r) catch | e | (why_http(e, &kind))
+    if !ok {
+        http.resp_free(&r)
+        http.client_free(&c)
+        if kind == 1 {
+            return PrintError::NoServer
+        }
+        if kind == 2 {
+            return PrintError::BadPrinter
+        }
+        return PrintError::Http
+    }
+    let status: u32 = http.resp_status(&r)
+    if status != 200 {
+        http.resp_free(&r)
+        http.client_free(&c)
+        return PrintError::Http
+    }
+    rt.buf_push_bytes(out, http.resp_body_ptr(&r), http.resp_body_len(&r))
+    http.resp_free(&r)
+    http.client_free(&c)
+    return true
+}
+
+// ------------------------------------------------------------ Decoding
+
+struct Reader {
+    p: u64,
+    n: usize,
+    i: usize,
+    group: u8,
+    groups: u32, // delimiter tags passed so far: a new printer, a new job
+    name: str, // the current attribute (kept for additional values)
+    tag: u8,
+    value: str,
+    bad: bool,
+}
+
+fn rd16(r: *mut Reader, i: usize) -> u32 {
+    if i + 2 > (*r).n {
+        (*r).bad = true
+        return 0 as u32
+    }
+    return (rt.ld8((*r).p, i) as u32 << 8) | rt.ld8((*r).p, i + 1) as u32
+}
+
+fn value_int(r: *mut Reader) -> u32 {
+    let v: str = (*r).value
+    if v.n != 4 {
+        return 0 as u32
+    }
+    let p: u64 = v.p as u64
+    return (rt.ld8(p, 0) as u32 << 24) | (rt.ld8(p, 1) as u32 << 16) | (rt.ld8(p, 2) as u32 << 8) | rt.ld8(p, 3) as u32
+}
+
+// the next attribute value; false at end-of-attributes or on a malformed
+// answer (r.bad). A delimiter tag switches r.group; `r.name` stays the same
+// for additional values.
+fn next_attr(r: *mut Reader) -> bool {
+    while (*r).i < (*r).n {
+        let t: u8 = rt.ld8((*r).p, (*r).i)
+        if t == T_END {
+            (*r).i = (*r).i + 1
+            return false
+        }
+        if t < 16 as u8 {
+            (*r).group = t
+            (*r).groups = (*r).groups + 1
+            (*r).i = (*r).i + 1
+            continue
+        }
+        let nl: usize = rd16(r, (*r).i + 1) as usize
+        if (*r).i + 3 + nl > (*r).n {
+            (*r).bad = true
+            return false
+        }
+        if nl > 0 {
+            (*r).name = str { p: rt.ptr_of((*r).p + ((*r).i + 3) as u64), n: nl }
+        }
+        let vl: usize = rd16(r, (*r).i + 3 + nl) as usize
+        let vs: usize = (*r).i + 5 + nl
+        if vs + vl > (*r).n || (*r).bad {
+            (*r).bad = true
+            return false
+        }
+        (*r).tag = t
+        (*r).value = str { p: rt.ptr_of((*r).p + vs as u64), n: vl }
+        (*r).i = vs + vl
+        return true
+    }
+    (*r).bad = true
+    return false
+}
+
+fn reader(b: *mut rt.Buf) -> Reader {
+    return Reader { p: rt.buf_ptr(b), n: rt.buf_len(b), i: 8, group: 0, groups: 0, name: "", tag: 0, value: "", bad: false }
+}
+
+// the status code of an answer; false if it is too short to be IPP
+fn answer_status(b: *mut rt.Buf) -> bool {
+    if rt.buf_len(b) < 9 {
+        return false
+    }
+    let p: u64 = rt.buf_ptr(b)
+    last_status = (rt.ld8(p, 2) as u32 << 8) | rt.ld8(p, 3) as u32
+    return true
+}
+
+fn ok_status() -> bool {
+    return last_status < 256 // 0x00xx: successful-ok and its variants
+}
+
+fn join(list: str, v: str) -> str {
+    if list.n == 0 {
+        return __str_copy(v)
+    }
+    return list + "," + v
+}
+
+// one printer attribute into `pi`
+fn take(pi: *mut PrinterInfo, r: *mut Reader) {
+    let nm: str = (*r).name
+    let v: str = (*r).value
+    if nm == "printer-name" { (*pi).name = __str_copy(v) }
+    else if nm == "printer-uri-supported" { if (*pi).uri.n == 0 { (*pi).uri = __str_copy(v) } }
+    else if nm == "printer-info" { (*pi).info = __str_copy(v) }
+    else if nm == "printer-location" { (*pi).location = __str_copy(v) }
+    else if nm == "printer-make-and-model" { (*pi).make = __str_copy(v) }
+    else if nm == "printer-state" { (*pi).state = value_int(r) }
+    else if nm == "printer-is-accepting-jobs" { (*pi).accepting = v.n == 1 && rt.ld8(v.p as u64, 0) != 0 as u8 }
+    else if nm == "color-supported" { (*pi).color = v.n == 1 && rt.ld8(v.p as u64, 0) != 0 as u8 }
+    else if nm == "sides-supported" { if v.starts_with("two-sided") { (*pi).duplex = true } }
+    else if nm == "media-supported" { (*pi).media = join((*pi).media, v) }
+    else if nm == "document-format-supported" { (*pi).formats = join((*pi).formats, v) }
+}
+
+fn requested(b: *mut rt.Buf) {
+    // requested-attributes: 1setOf keyword
+    attr(b, V_KEYWORD, "requested-attributes", "printer-name")
+    attr_more(b, V_KEYWORD, "printer-uri-supported")
+    attr_more(b, V_KEYWORD, "printer-info")
+    attr_more(b, V_KEYWORD, "printer-location")
+    attr_more(b, V_KEYWORD, "printer-make-and-model")
+    attr_more(b, V_KEYWORD, "printer-state")
+    attr_more(b, V_KEYWORD, "printer-is-accepting-jobs")
+    attr_more(b, V_KEYWORD, "color-supported")
+    attr_more(b, V_KEYWORD, "sides-supported")
+    attr_more(b, V_KEYWORD, "media-supported")
+    attr_more(b, V_KEYWORD, "document-format-supported")
+}
+
+// ------------------------------------------------------------ Operations
+
+// The printers of the local CUPS (http://127.0.0.1:631), appended to `out`;
+// the answer is how many. The default printer is marked.
+fn printers(out: *mut Vec[PrinterInfo]) -> PrintError!usize {
+    return try printers_at("http://127.0.0.1:631/", out)
+}
+
+// The same against a given CUPS server.
+fn printers_at(server: str, out: *mut Vec[PrinterInfo]) -> PrintError!usize {
+    var req: rt.Buf = rt.buf_new()
+    ipp_encode_request(&req, OP_CUPS_GET_PRINTERS, "")
+    requested(&req)
+    put8(&req, T_END as u32)
+    var ans: rt.Buf = rt.buf_new()
+    try exchange(server, &req, &ans)
+    rt.buf_free(&req)
+    if !answer_status(&ans) {
+        return PrintError::Protocol
+    }
+    if !ok_status() {
+        if last_status == 1030 { // 0x0406 client-error-not-found: no printers
+            return 0
+        }
+        return PrintError::Ipp
+    }
+    var r: Reader = reader(&ans)
+    var count: usize = 0
+    var cur: PrinterInfo = info_new()
+    var cur_group: u32 = 0
+    while next_attr(&r) {
+        if r.group == T_PRINTER {
+            // every printer-attributes tag starts the next printer
+            if r.groups != cur_group {
+                if cur.name.n > 0 {
+                    vec_push[PrinterInfo](out, cur)
+                    count = count + 1
+                }
+                cur = info_new()
+                cur_group = r.groups
+            }
+            take(&cur, &r)
+        }
+    }
+    if r.bad {
+        return PrintError::Protocol
+    }
+    if cur.name.n > 0 {
+        vec_push[PrinterInfo](out, cur)
+        count = count + 1
+    }
+    // mark the default
+    var dreq: rt.Buf = rt.buf_new()
+    ipp_encode_request(&dreq, OP_CUPS_GET_DEFAULT, "")
+    attr(&dreq, V_KEYWORD, "requested-attributes", "printer-name")
+    put8(&dreq, T_END as u32)
+    var dans: rt.Buf = rt.buf_new()
+    let got: bool = exchange(server, &dreq, &dans) catch false
+    if got && answer_status(&dans) && ok_status() {
+        var dr: Reader = reader(&dans)
+        while next_attr(&dr) {
+            if dr.name == "printer-name" {
+                var k: usize = vec_len[PrinterInfo](out) - count
+                while k < vec_len[PrinterInfo](out) {
+                    let pi: *mut PrinterInfo = vec_elem_ptr[PrinterInfo](out, k)
+                    if (*pi).name == dr.value {
+                        (*pi).is_default = true
+                    }
+                    k = k + 1
+                }
+            }
+        }
+    }
+    last_status = 0
+    return count
+}
+
+// Get-Printer-Attributes on one printer (queue name or URI).
+fn printer_attributes(printer: str, pi: *mut PrinterInfo) -> PrintError!bool {
+    let uri: str = printer_uri(printer)
+    let url: str = http_url(uri)
+    if uri.n == 0 || url.n == 0 {
+        return PrintError::BadPrinter
+    }
+    var req: rt.Buf = rt.buf_new()
+    ipp_encode_request(&req, OP_GET_PRINTER_ATTRIBUTES, uri)
+    requested(&req)
+    put8(&req, T_END as u32)
+    var ans: rt.Buf = rt.buf_new()
+    try exchange(url, &req, &ans)
+    rt.buf_free(&req)
+    if !answer_status(&ans) {
+        return PrintError::Protocol
+    }
+    if !ok_status() {
+        return PrintError::Ipp
+    }
+    *pi = info_new()
+    var r: Reader = reader(&ans)
+    while next_attr(&r) {
+        if r.group == T_PRINTER {
+            take(pi, &r)
+        }
+    }
+    if r.bad {
+        return PrintError::Protocol
+    }
+    if (*pi).uri.n == 0 {
+        (*pi).uri = __str_copy(uri)
+    }
+    return true
+}
+
+// Prints a PDF; the answer is the job id.
+fn print_pdf(printer: str, p: u64, n: usize, o: PrintOptions) -> PrintError!u32 {
+    return try print_document(printer, p, n, "application/pdf", o)
+}
+
+// Prints a document of the given MIME type ("application/pdf",
+// "image/pwg-raster", "application/octet-stream" for "let the printer
+// decide").
+fn print_document(printer: str, p: u64, n: usize, format: str, o: PrintOptions) -> PrintError!u32 {
+    let uri: str = printer_uri(printer)
+    let url: str = http_url(uri)
+    if uri.n == 0 || url.n == 0 {
+        return PrintError::BadPrinter
+    }
+    var req: rt.Buf = rt.buf_new()
+    ipp_encode_request(&req, OP_PRINT_JOB, uri)
+    attr(&req, V_NAME, "requesting-user-name", o.user)
+    attr(&req, V_NAME, "job-name", o.job_name)
+    attr(&req, V_MIME, "document-format", format)
+    put8(&req, T_JOB as u32)
+    if o.copies > 1 {
+        attr_int(&req, V_INTEGER, "copies", o.copies)
+    }
+    if o.sides == SIDES_LONG_EDGE {
+        attr(&req, V_KEYWORD, "sides", "two-sided-long-edge")
+    } else if o.sides == SIDES_SHORT_EDGE {
+        attr(&req, V_KEYWORD, "sides", "two-sided-short-edge")
+    }
+    if o.color == COLOR_MONO {
+        attr(&req, V_KEYWORD, "print-color-mode", "monochrome")
+    } else if o.color == COLOR_COLOR {
+        attr(&req, V_KEYWORD, "print-color-mode", "color")
+    }
+    if o.media.n > 0 {
+        attr(&req, V_KEYWORD, "media", o.media)
+    }
+    if o.landscape {
+        attr_int(&req, V_ENUM, "orientation-requested", 4 as u32)
+    }
+    put8(&req, T_END as u32)
+    rt.buf_push_bytes(&req, p, n)
+    var ans: rt.Buf = rt.buf_new()
+    try exchange(url, &req, &ans)
+    rt.buf_free(&req)
+    if !answer_status(&ans) {
+        return PrintError::Protocol
+    }
+    if !ok_status() {
+        return PrintError::Ipp
+    }
+    var r: Reader = reader(&ans)
+    var job: u32 = 0
+    while next_attr(&r) {
+        if r.name == "job-id" && r.tag == V_INTEGER {
+            job = value_int(&r)
+        }
+    }
+    if r.bad || job == 0 {
+        return PrintError::Protocol
+    }
+    return job
+}
+
+fn job_request(printer: str, job: u32, op: u32, ans: *mut rt.Buf) -> PrintError!bool {
+    let uri: str = printer_uri(printer)
+    let url: str = http_url(uri)
+    if uri.n == 0 || url.n == 0 {
+        return PrintError::BadPrinter
+    }
+    var req: rt.Buf = rt.buf_new()
+    ipp_encode_request(&req, op, uri)
+    attr_int(&req, V_INTEGER, "job-id", job)
+    attr(&req, V_NAME, "requesting-user-name", "openplan")
+    if op == OP_GET_JOB_ATTRIBUTES {
+        attr(&req, V_KEYWORD, "requested-attributes", "job-state")
+    }
+    put8(&req, T_END as u32)
+    try exchange(url, &req, ans)
+    rt.buf_free(&req)
+    if !answer_status(ans) {
+        return PrintError::Protocol
+    }
+    if !ok_status() {
+        return PrintError::Ipp
+    }
+    return true
+}
+
+// The state of a job: JOB_PENDING .. JOB_COMPLETED.
+fn job_state(printer: str, job: u32) -> PrintError!u32 {
+    var ans: rt.Buf = rt.buf_new()
+    try job_request(printer, job, OP_GET_JOB_ATTRIBUTES, &ans)
+    var r: Reader = reader(&ans)
+    var st: u32 = 0
+    while next_attr(&r) {
+        if r.name == "job-state" {
+            st = value_int(&r)
+        }
+    }
+    if r.bad || st == 0 {
+        return PrintError::Protocol
+    }
+    return st
+}
+
+fn cancel_job(printer: str, job: u32) -> PrintError!bool {
+    var ans: rt.Buf = rt.buf_new()
+    return try job_request(printer, job, OP_CANCEL_JOB, &ans)
+}
