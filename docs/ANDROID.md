@@ -93,6 +93,47 @@ To reach the relay the firnc targets `x86_64-android`/`aarch64-android`
 write the legacy system calls as `*at` forms (Android's seccomp filter
 killed the app on chmod and dup2).
 
+### Push like a messenger (25.09.2026)
+
+```sh
+bash tools/android/firnchat_push_check.sh <firnchat> <apk>   # 24 checks
+```
+
+* **One notification per chat** (`window.notify_at(f, key, ...)`, key =
+  the row): the sender's chat as title ("Alice", "#kanal", "Alice (3)" for
+  three unread), the newest line as text -- an emoji survives (JNI gets
+  modified UTF-8: a four octet character goes over as a surrogate pair).
+  Channel `firn_msg` "Nachrichten": importance high (heads-up), the
+  default sound, vibration allowed -- what really rings follows the
+  phone's own settings. The old channel `firn_push` (made without
+  vibration, and Android keeps a channel as it was made) is deleted.
+* **Our own group with a summary.** Android bundles the notifications of
+  one app by itself, and a tap on a line of ITS bundle is a tap on its
+  summary: the message stays and nobody can tell which chat was meant
+  (measured, API 35). In our group a heads-up or a line of the expanded
+  bundle is the message itself.
+* **The tap opens that chat, without a Java class.** A tapped
+  notification is auto-cancelled, so when the window comes back the
+  program asks which of its notifications are gone
+  (`window.notify_shown`: `NotificationManager.getActiveNotifications`)
+  -- the newest gone one is the chat to open. Android removes it a moment
+  AFTER the activity is resumed, so the question is asked for 2.5 s.
+  `window.notify_cancel` takes a chat's notification away once it is read.
+* **Nothing is painted while the window is not in front** -- a picture
+  painted into no surface put glyphs into fUi's atlas bookkeeping that
+  never reached the GPU (letters missing after coming back).
+* **The relay comes back by itself:** a dead live session is reopened
+  after 1 s, then 4 s doubling up to 60 s, with everything read again;
+  what came meanwhile is notified from the unread counts.
+* Measured on the emulator (API 35): Home, Back, swiped out of the recent
+  apps -- the foreground service keeps the process and the notification
+  comes; relay restarted -> live again after 6 s.
+
+Found on the way, a compiler bug (fixed, `tests/1901_bool_cell_thread_reuse.fi`):
+`thread-bool` threaded a bool cell whose load was reused later as the value
+of the variable; in release-safe `let fr = window.in_front(f)` read false
+forever.
+
 ## Open
 
 * The soft keyboard composes nothing yet (no InputConnection without a dex
@@ -101,6 +142,12 @@ killed the app on chmod and dup2).
 * Only tested in the emulator; the arm64 build still needs a real phone.
 * Push: the relay address is a dotted IPv4 address (no name lookup), the
   connection is plain TCP (no TLS yet), one line = one message.
+* Push after a phone restart or after Android killed the process: the
+  service comes back (START_STICKY) but the program does not -- no
+  BOOT_COMPLETED receiver, no headless start of the program yet. Opening
+  the app once brings everything back.
+* A tap on the COLLAPSED bundle of several chats opens the newest chat
+  (the summary takes the whole group with it).
 * FIRNCHAT's desktop layout is not a phone layout (fixed side bar).
 * aarch64 still lacks stat/lstat/pipe/rmdir/readlink forms (compile error
   when a program uses them, not a silent guess).

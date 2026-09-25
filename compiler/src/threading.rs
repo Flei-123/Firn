@@ -169,7 +169,47 @@ pub(crate) fn fork_at(f: &Func, bi: usize) -> Option<(Val, BlockId, BlockId)> {
     if f.blocks[then as usize].has_phi() || f.blocks[els as usize].has_phi() {
         return None;
     }
+    // ROUND PUSH (25.09.2026): the loaded value must serve ONLY this
+    // fork. Threading every predecessor past the fork leaves the fork block
+    // unreachable, and dce removes it -- with the load. When `cse`/`mem2reg`
+    // had meanwhile reused that load for a later read of the same variable
+    // (`let fr = f(); if fr && !x {..}; if fr != y {..}; y = fr`), those
+    // later uses pointed at a value defined in a dead block: the register
+    // allocator handed them whatever the register held. Measured in
+    // FIRNCHAT's window loop (release-safe, x86_64-android): `fr` read as
+    // false forever although `window.in_front` returned true; --opt-level
+    // dev and --no-pass=thread-bool were right. Such a cell is left to
+    // mem2reg (fork_cells asks this same function).
+    if !used_only_by_term(f, d, bi) {
+        return None;
+    }
     Some((addr, then, els))
+}
+
+/// Is `v` read nowhere but in the terminator of block `bi`?
+fn used_only_by_term(f: &Func, v: Val, bi: usize) -> bool {
+    let mut buf = Vec::new();
+    for (k, b) in f.blocks.iter().enumerate() {
+        for i in &b.insts {
+            buf.clear();
+            i.op.uses(&mut buf);
+            if buf.contains(&v) {
+                return false;
+            }
+        }
+        if k == bi {
+            continue;
+        }
+        match &b.term {
+            Term::BrCond { cond: c, .. } | Term::Ret(Some(c)) | Term::Switch { val: c, .. } => {
+                if *c == v {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// **ROUND SPEED** — the same threading, one step later: through a **phi**.
