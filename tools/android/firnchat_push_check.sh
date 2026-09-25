@@ -120,10 +120,15 @@ check "after Back + tap: still the same process" "$($ADB shell pidof $PKG)" "$P1
 check "no notification left" "$(keyed)" 0
 
 echo "== 4. swiped out of the recent apps"
-$ADB shell input keyevent KEYCODE_APP_SWITCH; sleep 3
 read -r SW SH <<< "$($ADB shell wm size | grep -oP '\d+x\d+' | tail -1 | tr x ' ')"
-$ADB shell input swipe $((SW/2)) $((SH/2)) $((SW/2)) $((SH/12)) 300; sleep 3
-$ADB shell input keyevent KEYCODE_HOME; sleep 2
+# a loaded software emulator animates the recents screen slower than 3 s:
+# swipe again until the task is really gone (at most 3 times)
+for try in 1 2 3; do
+    $ADB shell input keyevent KEYCODE_APP_SWITCH; sleep $((2 + 2*try))
+    $ADB shell input swipe $((SW/2)) $((SH/2)) $((SW/2)) $((SH/12)) 300; sleep $((2 + try))
+    $ADB shell input keyevent KEYCODE_HOME; sleep 2
+    [ "$($ADB shell dumpsys activity recents | grep -c "Recent #.*A=.*:$PKG")" = 0 ] && break
+done
 check "task gone from recents" "$($ADB shell dumpsys activity recents | grep -c "Recent #.*A=.*:$PKG")" 0
 check "swiped: the process lives on (foreground service)" "$($ADB shell pidof $PKG)" "$P1"
 send carol "nach Wegwischen"; sleep 5
