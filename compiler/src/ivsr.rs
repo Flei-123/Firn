@@ -463,6 +463,7 @@ fn reduce_loop(
     }
     // 3. roots: affine, with a multiplication, used by something non-affine
     let mut used_outside: HashSet<Val> = HashSet::new();
+    let mut no_root: HashSet<Val> = HashSet::new();
     let mut buf = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for i in &b.insts {
@@ -473,8 +474,29 @@ fn reduce_loop(
             }
             buf.clear();
             i.op.uses(&mut buf);
+            // a CHECKED reader needs the range of its operand (`bce` proves
+            // from it that the check cannot fire); a phi in its place has
+            // none -- such a value stays as it is
+            //
+            // A CALL argument neither: the optimizer runs once over every
+            // function before `inline`, and a chain reduced there is gone by
+            // the time the call is embedded and the whole address becomes
+            // visible (`matmul`: `ld32(b, k * n + cc)`, at `release-safe`
+            // the `* 4` inside `ld32` then stayed checked, +13 %).
+            let checked = matches!(
+                i.op,
+                Op::CheckedBin { .. }
+                    | Op::CheckedDiv { .. }
+                    | Op::CheckedCast { .. }
+                    | Op::CheckedIdx { .. }
+                    | Op::Call { .. }
+                    | Op::CallIndirect { .. }
+            );
             for u in &buf {
                 if aff.contains_key(u) {
+                    if checked {
+                        no_root.insert(*u);
+                    }
                     used_outside.insert(*u);
                 }
             }
@@ -495,7 +517,7 @@ fn reduce_loop(
         .into_iter()
         .filter(|v| {
             let x = &aff[v];
-            worth(f, *v, x) && !ivs.contains_key(v) && !ivs.values().any(|(_, _, n)| n == v)
+            worth(f, *v, x) && !ivs.contains_key(v) && !no_root.contains(v) && !ivs.values().any(|(_, _, n)| n == v)
                 // a value used after the loop keeps its old definition (the
                 // phi would hold the value of the NEXT pass there)
                 && !used_after_loop(f, *v, body)

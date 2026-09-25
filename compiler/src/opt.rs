@@ -181,16 +181,16 @@ pub const PASSES: &[PassInfo] = &[
         what: "fully unroll short loops with a trip count known at compile time (round TEMPO 14)",
     },
     PassInfo {
-        name: "ivsr",
-        scope: Scope::Func,
-        debug_preserving: false,
-        what: "strength reduction of induction variables: a * iv + b becomes its own phi stepped by a * c (round TEMPO 15)",
-    },
-    PassInfo {
         name: "bce",
         scope: Scope::Func,
         debug_preserving: true,
         what: "remove provably always satisfied range, index and arithmetic checks",
+    },
+    PassInfo {
+        name: "ivsr",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "strength reduction of induction variables: a * iv + b becomes its own phi stepped by a * c (round TEMPO 15)",
     },
     PassInfo {
         name: "thread-bool",
@@ -663,13 +663,6 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             fx.note(13, u > 0);
             phi_check(f, "unroll");
         }
-        if cfg.runs("ivsr") && fx.due(14) {
-            let t = std::time::Instant::now();
-            let r = crate::ivsr::run(f);
-            clk.add2("ivsr", t, r > 0);
-            fx.note(14, r > 0);
-            phi_check(f, "ivsr");
-        }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
             // ROUND SPEED -- the third question in the same slot: an
@@ -684,6 +677,19 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
             phi_check(f, "bce");
+        }
+        // TEMPO 15: AFTER `bce`. At `release-safe` the address arithmetic is
+        // checked until `bce` proves it cannot overflow -- and it proves that
+        // from the ranges of `k * n + cc`. Reduced first, the chain became a
+        // phi of unknown range, the `* 4` behind it stayed checked, and
+        // `matmul` got 13 % slower (958 -> 1083 M instructions) instead of
+        // faster.
+        if cfg.runs("ivsr") && fx.due(14) {
+            let t = std::time::Instant::now();
+            let r = crate::ivsr::run(f);
+            clk.add2("ivsr", t, r > 0);
+            fx.note(14, r > 0);
+            phi_check(f, "ivsr");
         }
         if cfg.runs("thread-bool") && fx.due(7) {
             let clock = std::time::Instant::now();

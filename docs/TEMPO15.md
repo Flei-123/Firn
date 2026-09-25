@@ -22,14 +22,16 @@ all general, none of them specific to the decoder.
    lane loads, each behind an address reloaded from the frame. The register
    allocator learned `GetU32`/`GetU16` (before, one of them sent the whole
    function down the base path).
-2. **`ivsr.rs`** (new pass, slot 14, release levels). Strength reduction of
+2. **`ivsr.rs`** (new pass, slot 14 -- run right after `bce` --, release levels). Strength reduction of
    induction variables: for a loop with one back edge and a preheader,
    every value `base + a * iv + b` (`a`, `b` loop invariant; `add`, `sub`,
    `mul`, `shl`, `ptradd`; plain or wrapping arithmetic in the type of the
    induction variable, so the identity is exact modulo 2^w) whose chain
    costs at least two instructions per pass becomes a phi of its own,
    stepped by `a * c`. Scaling by 1/2/4/8 and a last addition feeding only
-   addresses count nothing (x86 folds them into the operand). Dead phi
+   addresses count nothing (x86 folds them into the operand). It runs after
+   `bce`, and a value read by a call or a checked operation is not reduced
+   (see "Tried and dropped"). Dead phi
    cycles and twin phis that the pass leaves when it runs before and after
    inlining are cleaned up by the pass itself. `FIRN_NO_IVSR=1`,
    `FIRN_IVSR_TRACE=1`.
@@ -107,8 +109,9 @@ past the end of a four-value array -- `licm` rightly refuses to move a load
 that leaves its object): **90.59 M**.
 
 Benchmark bank (`bench/firn`, `release-fast`, instructions, output identical
-old/new): `matmul` 459.6 -> 418.7 M (**-8.9 %**, inner loop 11 -> 10
-instructions, two stepped pointers), `gc_barrier` 2051.8 -> 1901.8 M
+old/new): `matmul` 459.6 -> 418.8 M (**-8.9 %**, inner loop 11 -> 10
+instructions, two stepped pointers; at `release-safe` unchanged, 958.3 M --
+see below), `gc_barrier` 2051.8 -> 1901.8 M
 (**-7.3 %**), all others unchanged.
 
 The self-hosting compiler `bin/firnc1.fi` built by the new `firnc`:
@@ -132,6 +135,14 @@ reader lists for every value. `.text` of `firnc1`: 1,198,165 -> about
   a bound of 20,000: 20 s instead of 5 s, `.text` 1.20 -> 1.77 MB.
 * **Second inline round for everything**: `.text` of `firnc1` +17 %,
   compile time +70 %. Restricted to leaves in loops: +1.4 %.
+* **`ivsr` before `bce`, and on call arguments.** The first version ran in
+  front of `bce` and took call arguments as roots. At `release-safe`
+  `matmul` became 13 % SLOWER (958.3 -> 1082.9 M): the optimizer runs once
+  over every function before `inline`, `ld32(b, k * n + cc)` had its
+  argument reduced to a phi there, and after the embedding `bce` could no
+  longer prove that the `* 4` inside `ld32` does not overflow -- the phi has
+  no range. Now `ivsr` runs after `bce`, and a value read by a call or by a
+  checked operation is never a root.
 * **Strength reduction of every chain with a multiplication**: MP3 +0.7 M
   (`dct_ii_4` +0.64 M, `l3_imdct36` +0.20 M): `j * 18` is one `imul`, the
   phi one `add` plus a register for the whole loop. Hence the cost model.
