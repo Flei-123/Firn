@@ -31,6 +31,18 @@ any more.
   Since MPL-2.0 is GPL-compatible, Certus can import the layer from Firn
   instead of keeping a copy of its own.
 
+* 25 September 2026: the SVG painter `lib/svg/` (`color.fi`, `fontsel.fi`,
+  `image.fi`, `matrix.fi`, `paint.fi`, `path.fi`, `stroke.fi`,
+  `svg_main.fi`, `xml.fi`) had come over from Certus (`lib/svg/`, state of
+  Certus commit `8f138f02`) in `0e1a1196` still carrying its Certus header
+  `GPL-2.0-only`. `git log --all -- lib/svg/` in Certus shows 19 commits,
+  all by Justin (16 as `Justin`, 3 as his account `Flei123`), and no other
+  author; in Firn the one commit is his as well. As sole author Justin
+  released these files for Firn under MPL-2.0 on 25 September 2026 -- the
+  same step as for `lib/window/`. Only the SPDX line changed and a note of
+  origin was added. This lets fUi (which imports `svg.*`) be used inside
+  GPL-3.0-or-later programs such as OpenPlan.
+
 * 24 September 2026: `lib/fui/lucide.fi` carries path data of the Lucide
   icon set (ISC; the icons Lucide took from Feather are MIT). It is the one
   file under a licence of its own; its header says so, the texts stand in
