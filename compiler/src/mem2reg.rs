@@ -1002,7 +1002,17 @@ pub(crate) fn remove_dead_stores(f: &mut Func) -> usize {
 // ----------------------------------------------------- local store forwarding ---
 
 /// Does this instruction change memory (not provable to be alias free)?
+///
+/// TEMPO 15: `__v128_store` / `__v128_store64` were missing. A block with
+/// `load p+8; simd.Store p, v; load p+8` forwarded the first load to the
+/// second -- found by `tests/1723_vec2reg.fi` (`read_before_write`: a loop
+/// of six passes inlined and unrolled into `main` summed the value of the
+/// first pass six times, 0 instead of 35, at `release-safe` and
+/// `release-fast` on `main`).
 fn clobbers_memory(op: &Op) -> bool {
+    if let Op::Simd { kind, .. } = op {
+        return matches!(kind, crate::simd::SimdKind::Store | crate::simd::SimdKind::Store64);
+    }
     matches!(
         op,
         Op::Store { .. }

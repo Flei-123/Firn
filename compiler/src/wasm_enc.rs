@@ -915,6 +915,7 @@ pub const V128_STORE: Simd = Simd(0x0B, "v128.store");
 pub const I8X16_SWIZZLE: Simd = Simd(0x0E, "i8x16.swizzle");
 pub const I64X2_SPLAT: Simd = Simd(0x12, "i64x2.splat");
 pub const F32X4_SPLAT: Simd = Simd(0x13, "f32x4.splat");
+pub const I16X8_EXTRACT_LANE_U: Simd = Simd(0x19, "i16x8.extract_lane_u");
 pub const I32X4_EXTRACT_LANE: Simd = Simd(0x1B, "i32x4.extract_lane");
 pub const I32X4_REPLACE_LANE: Simd = Simd(0x1C, "i32x4.replace_lane");
 pub const I64X2_EXTRACT_LANE: Simd = Simd(0x1D, "i64x2.extract_lane");

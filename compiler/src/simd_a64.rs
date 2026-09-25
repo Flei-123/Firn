@@ -344,6 +344,12 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             e.line(&format!("umov {}, {}.s[{}]", w(A), VA, imm));
             store_dst(e, fr, d, A);
         }
+        SimdKind::GetU16 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            e.line(&format!("umov {}, {}.h[{}]", w(A), VA, imm));
+            store_dst(e, fr, d, A);
+        }
         SimdKind::SetU32 => {
             let d = need(dst)?;
             vload(e, fr, VA, args[0]);

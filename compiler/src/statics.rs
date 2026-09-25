@@ -158,6 +158,18 @@ pub fn any() -> bool {
     TABLE.with(|t| t.borrow().iter().any(|s| !s.text))
 }
 
+/// TEMPO 15: the size of an IMMUTABLE `static` (it sits in `.rodata`, so no
+/// store of the program can ever change it), `None` for a `static mut` or an
+/// unknown name. `licm.rs` asks: a load from there is loop invariant.
+pub fn rodata_size(name: &str) -> Option<u64> {
+    TABLE.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|s| s.name == name && !s.mutable)
+            .map(|s| s.bytes.len() as u64)
+    })
+}
+
 /// Is `name` a registered `static`? (`escape.rs` asks: the address of a
 /// global may leave a frame, unlike the address of a local.)
 pub fn is_static(name: &str) -> bool {
