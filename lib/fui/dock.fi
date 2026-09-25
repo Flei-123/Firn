@@ -1,0 +1,857 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/dock.fi -- split panes and docked panels with tabs: where they
+// sit, how they are dragged, and how the arrangement is saved.
+//
+// OpenPlan LIB-005 (F-UIX-004 docked navigators with saveable
+// workspaces). An engineering program shows its drawing in the middle and
+// its navigators around it -- pages and devices on the left, properties on
+// the right, messages at the bottom -- and every user arranges them
+// differently. This file is that arrangement as a MODEL: it computes
+// rectangles, answers the mouse, and writes/reads the layout as JSON. It
+// draws nothing (the tabs and the splitter bars are drawn by the program
+// with fUi's painter into the rectangles this file gives out) -- the same
+// cut as lib/fui/layout.fi and lib/fui/editor.fi, so that it can be
+// checked without a window.
+//
+//     var d: dock.Dock = dock.dock_new()
+//     let pages: u32 = dock.dock_add(&d, 1, dock.AREA_LEFT, "Pages")
+//     let props: u32 = dock.dock_add(&d, 2, dock.AREA_RIGHT, "Properties")
+//     dock.dock_layout(&d, 0, 0, 1600, 900)
+//     dock.dock_center(&d)            // where the drawing goes
+//     dock.dock_content(&d, pages)    // where the panel draws (empty if hidden)
+//     dock.dock_mouse_down(&d, x, y)  // tabs, splitters, dragging a tab away
+//
+// THE ARRANGEMENT: four areas -- LEFT and RIGHT over the full height,
+// BOTTOM under the middle column, CENTER what is left. Every area holds
+// any number of panels as tabs, one of them active. An area without a
+// visible panel takes no space. Sizes are in pixels; they are clamped so
+// that every visible area keeps `min_area` and the centre `min_center`.
+//
+// `Split` is the same splitter on its own: one rectangle cut in two, the
+// bar draggable -- for a program's own panes.
+//
+// Pixels are integers, as everywhere in fUi's layout (lib/fui/layout.fi).
+
+import std.rt
+import std.vec
+import std.str
+import std.json
+import fui.layout
+
+export {
+    Dock, Split,
+    dock_new, dock_free, dock_add, dock_move, dock_activate, dock_set_visible,
+    dock_set_tab_width, dock_set_metrics, dock_panel_count, dock_panel_of, dock_area_of,
+    dock_is_visible, dock_active, dock_layout, dock_center, dock_area_rect, dock_content,
+    dock_tab, dock_splitter, dock_mouse_down, dock_mouse_drag, dock_mouse_up,
+    dock_drop_hint, dock_size, dock_set_size, dock_layout_save, dock_layout_load,
+    split_new, split_layout, split_first, split_second, split_bar, split_mouse_down,
+    split_mouse_drag, split_mouse_up, split_ratio,
+    AREA_LEFT, AREA_RIGHT, AREA_BOTTOM, AREA_CENTER, AREA_NONE,
+    HIT_NONE, HIT_TAB, HIT_SPLITTER, HIT_CONTENT, HIT_CENTER,
+    SPLIT_H, SPLIT_V,
+}
+
+const AREA_LEFT: u32 = 0
+const AREA_RIGHT: u32 = 1
+const AREA_BOTTOM: u32 = 2
+const AREA_CENTER: u32 = 3
+const AREA_NONE: u32 = 4
+
+const HIT_NONE: u32 = 0
+const HIT_TAB: u32 = 1
+const HIT_SPLITTER: u32 = 2
+const HIT_CONTENT: u32 = 3
+const HIT_CENTER: u32 = 4
+
+const SPLIT_H: u32 = 0 // side by side, the bar vertical
+const SPLIT_V: u32 = 1 // one above the other, the bar horizontal
+
+const DRAG_START: i64 = 8 // pixels before pressing a tab becomes dragging it
+
+struct Panel {
+    id: u32,
+    area: u32,
+    title: str,
+    visible: bool,
+    tab_w: i64, // 0 = share the strip
+    order: i64, // the tab order: a panel moved to an area goes to its end
+    // computed by dock_layout
+    tab: layout.Rect,
+}
+
+struct Dock {
+    panels: Vec[Panel],
+    active: [i64; 4], // panel index per area, -1 = none
+    size: [i64; 3], // wished width of LEFT and RIGHT, height of BOTTOM
+    tab_h: i64,
+    bar: i64,
+    min_area: i64,
+    min_center: i64,
+    // computed
+    rect: [layout.Rect; 4],
+    bars: [layout.Rect; 3],
+    whole: layout.Rect,
+    // the mouse
+    drag_bar: i64, // splitter being dragged, -1 = none
+    grab: i64,
+    press_panel: i64, // tab pressed, -1 = none
+    press_x: i64,
+    press_y: i64,
+    dragging_tab: bool,
+    hint: u32, // the area a dragged tab would land in
+    next_order: i64,
+}
+
+fn zero() -> layout.Rect {
+    return layout.rect_new(0, 0, 0, 0)
+}
+
+fn dock_new() -> Dock {
+    return Dock { panels: vec_new[Panel](), active: [-1 as i64; 4], size: [240, 260, 180], tab_h: 28, bar: 5,
+        min_area: 80, min_center: 120, rect: [zero(), zero(), zero(), zero()], bars: [zero(), zero(), zero()],
+        whole: zero(), drag_bar: -1, grab: 0, press_panel: -1, press_x: 0, press_y: 0, dragging_tab: false,
+        hint: AREA_NONE, next_order: 0 }
+}
+
+fn dock_free(d: *mut Dock) {
+    vec_free[Panel](&(*d).panels)
+}
+
+// Tab strip height, splitter thickness and the minimum sizes, in pixels
+// (a program at scale 2 passes twice the numbers).
+fn dock_set_metrics(d: *mut Dock, tab_h: i64, bar: i64, min_area: i64, min_center: i64) {
+    (*d).tab_h = tab_h
+    (*d).bar = bar
+    (*d).min_area = min_area
+    (*d).min_center = min_center
+}
+
+fn pn(d: *mut Dock, i: u32) -> *mut Panel {
+    return vec_elem_ptr[Panel](&(*d).panels, i as usize)
+}
+
+fn dock_panel_count(d: *mut Dock) -> u32 {
+    return vec_len[Panel](&(*d).panels) as u32
+}
+
+// The panel index of the program's panel id, or -1.
+fn dock_panel_of(d: *mut Dock, id: u32) -> i64 {
+    var i: u32 = 0
+    while i < dock_panel_count(d) {
+        if (*pn(d, i)).id == id {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn dock_area_of(d: *mut Dock, p: u32) -> u32 {
+    return (*pn(d, p)).area
+}
+
+fn dock_is_visible(d: *mut Dock, p: u32) -> bool {
+    return (*pn(d, p)).visible
+}
+
+// The active panel of an area, or -1.
+fn dock_active(d: *mut Dock, area: u32) -> i64 {
+    return (*d).active[area as usize]
+}
+
+// Adds a panel (`id` is the program's own number, `title` its tab text);
+// the answer is its index. The first panel of an area becomes active.
+fn dock_add(d: *mut Dock, id: u32, area: u32, title: str) -> u32 {
+    var a: u32 = area
+    if a > AREA_CENTER {
+        a = AREA_CENTER
+    }
+    (*d).next_order = (*d).next_order + 1
+    vec_push[Panel](&(*d).panels, Panel { id: id, area: a, title: __str_copy(title), visible: true, tab_w: 0,
+            order: (*d).next_order, tab: zero() })
+    let k: u32 = dock_panel_count(d) - 1
+    if (*d).active[a as usize] < 0 {
+        (*d).active[a as usize] = k as i64
+    }
+    return k
+}
+
+// the first visible panel of `area` in tab order, or -1
+fn first_visible(d: *mut Dock, area: u32) -> i64 {
+    var best: i64 = -1
+    var i: u32 = 0
+    while i < dock_panel_count(d) {
+        let p: *mut Panel = pn(d, i)
+        if (*p).area == area && (*p).visible && (best < 0 || (*p).order < (*pn(d, best as u32)).order) {
+            best = i as i64
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn fix_active(d: *mut Dock, area: u32) {
+    let a: i64 = (*d).active[area as usize]
+    if a >= 0 {
+        let p: *mut Panel = pn(d, a as u32)
+        if (*p).area == area && (*p).visible {
+            return
+        }
+    }
+    (*d).active[area as usize] = first_visible(d, area)
+}
+
+// Moves a panel into another area (it becomes the active one there, and
+// its tab goes to the end). Panel indices never change.
+fn dock_move(d: *mut Dock, p: u32, area: u32) {
+    if p >= dock_panel_count(d) || area > AREA_CENTER {
+        return
+    }
+    let from: u32 = (*pn(d, p)).area
+    (*d).next_order = (*d).next_order + 1
+    (*pn(d, p)).order = (*d).next_order
+    (*pn(d, p)).area = area
+    (*pn(d, p)).visible = true
+    (*d).active[area as usize] = p as i64
+    if from != area {
+        fix_active(d, from)
+    }
+}
+
+fn dock_activate(d: *mut Dock, p: u32) {
+    if p >= dock_panel_count(d) {
+        return
+    }
+    (*pn(d, p)).visible = true
+    (*d).active[(*pn(d, p)).area as usize] = p as i64
+}
+
+// Hides or shows a panel (a hidden panel keeps its place and size).
+fn dock_set_visible(d: *mut Dock, p: u32, on: bool) {
+    if p >= dock_panel_count(d) {
+        return
+    }
+    (*pn(d, p)).visible = on
+    if on {
+        (*d).active[(*pn(d, p)).area as usize] = p as i64
+    }
+    fix_active(d, (*pn(d, p)).area)
+}
+
+// The width of a tab (measured by the program from its title); 0 = the
+// tabs share the strip.
+fn dock_set_tab_width(d: *mut Dock, p: u32, w: i64) {
+    if p < dock_panel_count(d) {
+        (*pn(d, p)).tab_w = w
+    }
+}
+
+// The wished size of LEFT, RIGHT (widths) or BOTTOM (height).
+fn dock_size(d: *mut Dock, area: u32) -> i64 {
+    if area > AREA_BOTTOM {
+        return 0
+    }
+    return (*d).size[area as usize]
+}
+
+fn dock_set_size(d: *mut Dock, area: u32, px: i64) {
+    if area <= AREA_BOTTOM {
+        (*d).size[area as usize] = px
+    }
+}
+
+fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
+    if hi < lo {
+        return lo
+    }
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// Computes every rectangle for the space x, y, w, h.
+fn dock_layout(d: *mut Dock, x: i64, y: i64, w: i64, h: i64) {
+    (*d).whole = layout.rect_new(x, y, w, h)
+    var a: u32 = 0
+    while a < 4 {
+        fix_active(d, a)
+        a = a + 1
+    }
+    let has_l: bool = first_visible(d, AREA_LEFT) >= 0
+    let has_r: bool = first_visible(d, AREA_RIGHT) >= 0
+    let has_b: bool = first_visible(d, AREA_BOTTOM) >= 0
+    let bar: i64 = (*d).bar
+    var lw: i64 = 0
+    var rw: i64 = 0
+    // what the two sides may take together
+    var room: i64 = w - (*d).min_center
+    if has_l { room = room - bar }
+    if has_r { room = room - bar }
+    if has_l {
+        lw = (*d).size[0]
+    }
+    if has_r {
+        rw = (*d).size[1]
+    }
+    if lw + rw > room {
+        // shrink both in proportion, but not under the minimum
+        let total: i64 = lw + rw
+        if total > 0 && room > 0 {
+            lw = lw * room / total
+            rw = room - lw
+        }
+    }
+    if has_l { lw = clamp(lw, (*d).min_area, w) }
+    if has_r { rw = clamp(rw, (*d).min_area, w) }
+    var cx: i64 = x
+    var cw: i64 = w
+    if has_l {
+        (*d).rect[0] = layout.rect_new(x, y, lw, h)
+        (*d).bars[0] = layout.rect_new(x + lw, y, bar, h)
+        cx = x + lw + bar
+        cw = cw - lw - bar
+    } else {
+        (*d).rect[0] = zero()
+        (*d).bars[0] = zero()
+    }
+    if has_r {
+        (*d).rect[1] = layout.rect_new(x + w - rw, y, rw, h)
+        (*d).bars[1] = layout.rect_new(x + w - rw - bar, y, bar, h)
+        cw = cw - rw - bar
+    } else {
+        (*d).rect[1] = zero()
+        (*d).bars[1] = zero()
+    }
+    if cw < 0 {
+        cw = 0
+    }
+    var ch: i64 = h
+    if has_b {
+        let bh: i64 = clamp((*d).size[2], (*d).min_area, h - (*d).min_center - bar)
+        (*d).rect[2] = layout.rect_new(cx, y + h - bh, cw, bh)
+        (*d).bars[2] = layout.rect_new(cx, y + h - bh - bar, cw, bar)
+        ch = h - bh - bar
+    } else {
+        (*d).rect[2] = zero()
+        (*d).bars[2] = zero()
+    }
+    if ch < 0 {
+        ch = 0
+    }
+    (*d).rect[3] = layout.rect_new(cx, y, cw, ch)
+    // the tabs of every area
+    a = 0
+    while a < 4 {
+        layout_tabs(d, a)
+        a = a + 1
+    }
+}
+
+fn layout_tabs(d: *mut Dock, area: u32) {
+    let r: layout.Rect = (*d).rect[area as usize]
+    var n: i64 = 0
+    var i: u32 = 0
+    while i < dock_panel_count(d) {
+        let p: *mut Panel = pn(d, i)
+        if (*p).area == area && (*p).visible {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    var share: i64 = 0
+    if n > 0 {
+        share = r.w / n
+        if share > 180 {
+            share = 180
+        }
+    }
+    var at: i64 = r.x
+    i = 0
+    while i < dock_panel_count(d) {
+        if (*pn(d, i)).area == area {
+            (*pn(d, i)).tab = zero() // hidden ones keep no tab
+        }
+        i = i + 1
+    }
+    // the panels of this area in tab order: repeatedly the smallest order
+    // greater than the last one placed
+    var last: i64 = -1
+    var k: i64 = 0
+    while k < n && r.w > 0 {
+        var pick: i64 = -1
+        i = 0
+        while i < dock_panel_count(d) {
+            let p: *mut Panel = pn(d, i)
+            if (*p).area == area && (*p).visible && (*p).order > last && (pick < 0 || (*p).order < (*pn(d, pick as u32)).order) {
+                pick = i as i64
+            }
+            i = i + 1
+        }
+        if pick < 0 {
+            break
+        }
+        let p: *mut Panel = pn(d, pick as u32)
+        last = (*p).order
+        var tw: i64 = (*p).tab_w
+        if tw <= 0 {
+            tw = share
+        }
+        if at + tw > r.x + r.w {
+            tw = r.x + r.w - at // the last tabs get narrower, never outside
+        }
+        if tw < 0 {
+            tw = 0
+        }
+        (*p).tab = layout.rect_new(at, r.y, tw, (*d).tab_h)
+        at = at + tw
+        k = k + 1
+    }
+}
+
+// Where the drawing (the centre) goes.
+fn dock_center(d: *mut Dock) -> layout.Rect {
+    return content_of((*d).rect[3], d, AREA_CENTER)
+}
+
+fn content_of(r: layout.Rect, d: *mut Dock, area: u32) -> layout.Rect {
+    // the centre shows a tab strip only when it holds panels
+    if area == AREA_CENTER && first_visible(d, AREA_CENTER) < 0 {
+        return r
+    }
+    var h: i64 = r.h - (*d).tab_h
+    if h < 0 {
+        h = 0
+    }
+    return layout.rect_new(r.x, r.y + (*d).tab_h, r.w, h)
+}
+
+// The whole rectangle of an area (tab strip included).
+fn dock_area_rect(d: *mut Dock, area: u32) -> layout.Rect {
+    if area > AREA_CENTER {
+        return zero()
+    }
+    return (*d).rect[area as usize]
+}
+
+// Where panel `p` draws its content: empty unless it is visible AND the
+// active tab of its area.
+fn dock_content(d: *mut Dock, p: u32) -> layout.Rect {
+    if p >= dock_panel_count(d) {
+        return zero()
+    }
+    let a: u32 = (*pn(d, p)).area
+    if !(*pn(d, p)).visible || (*d).active[a as usize] != p as i64 {
+        return zero()
+    }
+    return content_of((*d).rect[a as usize], d, a)
+}
+
+// The tab of panel `p` (empty when hidden).
+fn dock_tab(d: *mut Dock, p: u32) -> layout.Rect {
+    if p >= dock_panel_count(d) {
+        return zero()
+    }
+    return (*pn(d, p)).tab
+}
+
+// The splitter bar next to LEFT, RIGHT or above BOTTOM (empty if the area
+// is empty).
+fn dock_splitter(d: *mut Dock, area: u32) -> layout.Rect {
+    if area > AREA_BOTTOM {
+        return zero()
+    }
+    return (*d).bars[area as usize]
+}
+
+fn inside(r: layout.Rect, x: i64, y: i64) -> bool {
+    return r.w > 0 && r.h > 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+fn area_at(d: *mut Dock, x: i64, y: i64) -> u32 {
+    var a: u32 = 0
+    while a < 4 {
+        if inside((*d).rect[a as usize], x, y) {
+            return a
+        }
+        a = a + 1
+    }
+    return AREA_NONE
+}
+
+// A button press. The answer says what was hit: a tab (it is active now,
+// and dragging it may move it), a splitter (dragging it resizes), the
+// content of a panel, the centre, or nothing.
+fn dock_mouse_down(d: *mut Dock, x: i64, y: i64) -> u32 {
+    (*d).drag_bar = -1
+    (*d).press_panel = -1
+    (*d).dragging_tab = false
+    (*d).hint = AREA_NONE
+    var b: u32 = 0
+    while b < 3 {
+        let r: layout.Rect = (*d).bars[b as usize]
+        // a splitter is thin: two pixels either side count as well
+        let wide: layout.Rect = layout.rect_new(r.x - 2, r.y - 2, r.w + 4, r.h + 4)
+        if r.w > 0 && inside(wide, x, y) {
+            (*d).drag_bar = b as i64
+            if b == AREA_LEFT {
+                (*d).grab = x - (r.x)
+            } else if b == AREA_RIGHT {
+                (*d).grab = x - r.x
+            } else {
+                (*d).grab = y - r.y
+            }
+            return HIT_SPLITTER
+        }
+        b = b + 1
+    }
+    var i: u32 = 0
+    while i < dock_panel_count(d) {
+        if inside((*pn(d, i)).tab, x, y) {
+            dock_activate(d, i)
+            (*d).press_panel = i as i64
+            (*d).press_x = x
+            (*d).press_y = y
+            return HIT_TAB
+        }
+        i = i + 1
+    }
+    let a: u32 = area_at(d, x, y)
+    if a == AREA_CENTER && first_visible(d, AREA_CENTER) < 0 {
+        return HIT_CENTER
+    }
+    if a != AREA_NONE {
+        return HIT_CONTENT
+    }
+    return HIT_NONE
+}
+
+// The pointer moved with the button held. true = the layout changed
+// (call dock_layout again) or the drop hint moved (repaint).
+fn dock_mouse_drag(d: *mut Dock, x: i64, y: i64) -> bool {
+    if (*d).drag_bar >= 0 {
+        let wh: layout.Rect = (*d).whole
+        let b: u32 = (*d).drag_bar as u32
+        if b == AREA_LEFT {
+            (*d).size[0] = clamp(x - (*d).grab - wh.x, (*d).min_area, wh.w - (*d).min_center)
+        } else if b == AREA_RIGHT {
+            (*d).size[1] = clamp(wh.x + wh.w - (x - (*d).grab) - (*d).bar, (*d).min_area, wh.w - (*d).min_center)
+        } else {
+            (*d).size[2] = clamp(wh.y + wh.h - (y - (*d).grab) - (*d).bar, (*d).min_area, wh.h - (*d).min_center)
+        }
+        dock_layout(d, wh.x, wh.y, wh.w, wh.h)
+        return true
+    }
+    if (*d).press_panel >= 0 {
+        let dx: i64 = x - (*d).press_x
+        let dy: i64 = y - (*d).press_y
+        if !(*d).dragging_tab && dx * dx + dy * dy >= DRAG_START * DRAG_START {
+            (*d).dragging_tab = true
+        }
+        if (*d).dragging_tab {
+            let before: u32 = (*d).hint
+            (*d).hint = drop_area(d, x, y)
+            return before != (*d).hint
+        }
+    }
+    return false
+}
+
+// where a dragged tab would land: the area under the pointer, or an empty
+// side when the pointer is at the edge of the whole space
+fn drop_area(d: *mut Dock, x: i64, y: i64) -> u32 {
+    let wh: layout.Rect = (*d).whole
+    let edge: i64 = 24
+    if x < wh.x + edge { return AREA_LEFT }
+    if x >= wh.x + wh.w - edge { return AREA_RIGHT }
+    if y >= wh.y + wh.h - edge { return AREA_BOTTOM }
+    return area_at(d, x, y)
+}
+
+// The area a dragged tab would land in now (AREA_NONE when no tab is
+// being dragged) -- for the program to draw a hint.
+fn dock_drop_hint(d: *mut Dock) -> u32 {
+    if !(*d).dragging_tab {
+        return AREA_NONE
+    }
+    return (*d).hint
+}
+
+// The button was released. true = the arrangement changed.
+fn dock_mouse_up(d: *mut Dock, x: i64, y: i64) -> bool {
+    var changed: bool = (*d).drag_bar >= 0
+    if (*d).press_panel >= 0 && (*d).dragging_tab {
+        let target: u32 = drop_area(d, x, y)
+        let p: u32 = (*d).press_panel as u32
+        if target != AREA_NONE && target != (*pn(d, p)).area {
+            dock_move(d, p, target)
+            changed = true
+        }
+    }
+    (*d).drag_bar = -1
+    (*d).press_panel = -1
+    (*d).dragging_tab = false
+    (*d).hint = AREA_NONE
+    if changed {
+        let wh: layout.Rect = (*d).whole
+        dock_layout(d, wh.x, wh.y, wh.w, wh.h)
+    }
+    return changed
+}
+
+// ------------------------------------------------------------ Saving
+
+fn area_name(a: u32) -> str {
+    if a == AREA_LEFT { return "left" }
+    if a == AREA_RIGHT { return "right" }
+    if a == AREA_BOTTOM { return "bottom" }
+    return "center"
+}
+
+fn area_of_name(s: str) -> u32 {
+    if s == "left" { return AREA_LEFT }
+    if s == "right" { return AREA_RIGHT }
+    if s == "bottom" { return AREA_BOTTOM }
+    if s == "center" { return AREA_CENTER }
+    return AREA_NONE
+}
+
+fn key(w: *mut json.JsonWriter, s: str) {
+    json.jw_key(w, s.p as u64, s.n)
+}
+
+// The arrangement as JSON (appended to `out`):
+//     {"version": 1, "sizes": {"left": 240, "right": 260, "bottom": 180},
+//      "panels": [{"id": 1, "area": "left", "visible": true, "active": true}, ...]}
+// The panels in tab order; titles are not saved (they are the program's,
+// in the user's language).
+fn dock_layout_save(d: *mut Dock, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    key(&w, "version")
+    json.jw_int(&w, 1)
+    key(&w, "sizes")
+    json.jw_begin_object(&w)
+    key(&w, "left")
+    json.jw_int(&w, (*d).size[0])
+    key(&w, "right")
+    json.jw_int(&w, (*d).size[1])
+    key(&w, "bottom")
+    json.jw_int(&w, (*d).size[2])
+    json.jw_end(&w)
+    key(&w, "panels")
+    json.jw_begin_array(&w)
+    // every panel, in tab order (the order numbers themselves are not
+    // saved: loading gives out new ones in the file's order)
+    var last: i64 = -1
+    var k: u32 = 0
+    while k < dock_panel_count(d) {
+        var pick: i64 = -1
+        var i: u32 = 0
+        while i < dock_panel_count(d) {
+            let q: *mut Panel = pn(d, i)
+            if (*q).order > last && (pick < 0 || (*q).order < (*pn(d, pick as u32)).order) {
+                pick = i as i64
+            }
+            i = i + 1
+        }
+        let p: *mut Panel = pn(d, pick as u32)
+        last = (*p).order
+        json.jw_begin_object(&w)
+        key(&w, "id")
+        json.jw_int(&w, (*p).id as i64)
+        key(&w, "area")
+        let an: str = area_name((*p).area)
+        json.jw_string(&w, an.p as u64, an.n)
+        key(&w, "visible")
+        json.jw_bool(&w, (*p).visible)
+        key(&w, "active")
+        json.jw_bool(&w, (*d).active[(*p).area as usize] == pick)
+        json.jw_end(&w)
+        k = k + 1
+    }
+    json.jw_end(&w)
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+fn jget(doc: *mut json.Json, obj: u32, k: str) -> u32 {
+    return json.json_get(doc, obj, k.p as u64, k.n)
+}
+
+// Applies a saved arrangement to the panels that exist (by id; ids the
+// program no longer has are skipped, panels the file does not know keep
+// their place). false = not a layout this file wrote -- then nothing
+// changes.
+fn dock_layout_load(d: *mut Dock, p: u64, n: usize) -> bool {
+    var doc: json.Json = json.json_new()
+    let parsed: bool = json.json_parse(&doc, p, n) catch false
+    if !parsed {
+        json.json_free(&doc)
+        return false
+    }
+    let root: u32 = json.json_root(&doc)
+    let ver: u32 = jget(&doc, root, "version")
+    let sizes: u32 = jget(&doc, root, "sizes")
+    let panels: u32 = jget(&doc, root, "panels")
+    if json.json_kind(&doc, root) != json.JSON_OBJECT || ver == json.JSON_NONE || json.json_int(&doc, ver) != 1 ||
+    panels == json.JSON_NONE || json.json_kind(&doc, panels) != json.JSON_ARRAY {
+        json.json_free(&doc)
+        return false
+    }
+    // check everything before changing anything
+    var k: usize = 0
+    while k < json.json_count(&doc, panels) {
+        let e: u32 = json.json_child_at(&doc, panels, k)
+        let idv: u32 = jget(&doc, e, "id")
+        let ar: u32 = jget(&doc, e, "area")
+        if idv == json.JSON_NONE || ar == json.JSON_NONE || json.json_kind(&doc, ar) != json.JSON_STRING {
+            json.json_free(&doc)
+            return false
+        }
+        let asp: str = json.json_string(&doc, ar)
+        if area_of_name(asp) == AREA_NONE {
+            json.json_free(&doc)
+            return false
+        }
+        k = k + 1
+    }
+    if sizes != json.JSON_NONE {
+        var a: u32 = 0
+        while a < 3 {
+            let v: u32 = jget(&doc, sizes, area_name(a))
+            if v != json.JSON_NONE && json.json_kind(&doc, v) == json.JSON_NUMBER {
+                (*d).size[a as usize] = clamp(json.json_int(&doc, v), 1, 100000)
+            }
+            a = a + 1
+        }
+    }
+    // the panels: in the file's order, known ids only
+    var actives: [i64; 4] = [-1 as i64; 4]
+    k = 0
+    while k < json.json_count(&doc, panels) {
+        let e: u32 = json.json_child_at(&doc, panels, k)
+        let id: u32 = json.json_int(&doc, jget(&doc, e, "id")) as u32
+        let idx: i64 = dock_panel_of(d, id)
+        if idx >= 0 {
+            let area: u32 = area_of_name(json.json_string(&doc, jget(&doc, e, "area")))
+            dock_move(d, idx as u32, area)
+            let moved: u32 = idx as u32
+            let vis: u32 = jget(&doc, e, "visible")
+            if vis != json.JSON_NONE && json.json_kind(&doc, vis) == json.JSON_FALSE {
+                (*pn(d, moved)).visible = false
+            }
+            let act: u32 = jget(&doc, e, "active")
+            if act != json.JSON_NONE && json.json_kind(&doc, act) == json.JSON_TRUE {
+                actives[area as usize] = id as i64
+            }
+        }
+        k = k + 1
+    }
+    json.json_free(&doc)
+    var a: u32 = 0
+    while a < 4 {
+        (*d).active[a as usize] = -1
+        if actives[a as usize] >= 0 {
+            (*d).active[a as usize] = dock_panel_of(d, actives[a as usize] as u32)
+        }
+        fix_active(d, a)
+        a = a + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ Split
+
+struct Split {
+    orient: u32,
+    pos: i64, // the first pane's size in pixels
+    bar: i64,
+    min_a: i64,
+    min_b: i64,
+    whole: layout.Rect,
+    a: layout.Rect,
+    b: layout.Rect,
+    barr: layout.Rect,
+    dragging: bool,
+    grab: i64,
+}
+
+// A splitter: SPLIT_H puts the panes side by side, SPLIT_V one above the
+// other; `pos` is the size of the first pane in pixels.
+fn split_new(orient: u32, pos: i64) -> Split {
+    return Split { orient: orient, pos: pos, bar: 5, min_a: 40, min_b: 40, whole: zero(), a: zero(), b: zero(),
+        barr: zero(), dragging: false, grab: 0 }
+}
+
+fn split_layout(s: *mut Split, x: i64, y: i64, w: i64, h: i64) {
+    (*s).whole = layout.rect_new(x, y, w, h)
+    if (*s).orient == SPLIT_H {
+        let p: i64 = clamp((*s).pos, (*s).min_a, w - (*s).bar - (*s).min_b)
+        (*s).a = layout.rect_new(x, y, p, h)
+        (*s).barr = layout.rect_new(x + p, y, (*s).bar, h)
+        (*s).b = layout.rect_new(x + p + (*s).bar, y, w - p - (*s).bar, h)
+    } else {
+        let p: i64 = clamp((*s).pos, (*s).min_a, h - (*s).bar - (*s).min_b)
+        (*s).a = layout.rect_new(x, y, w, p)
+        (*s).barr = layout.rect_new(x, y + p, w, (*s).bar)
+        (*s).b = layout.rect_new(x, y + p + (*s).bar, w, h - p - (*s).bar)
+    }
+}
+
+fn split_first(s: *mut Split) -> layout.Rect { return (*s).a }
+fn split_second(s: *mut Split) -> layout.Rect { return (*s).b }
+fn split_bar(s: *mut Split) -> layout.Rect { return (*s).barr }
+
+// The first pane's share of the whole, in thousandths (for saving a
+// split independent of the window size).
+fn split_ratio(s: *mut Split) -> i64 {
+    var whole: i64 = (*s).whole.w
+    var first: i64 = (*s).a.w
+    if (*s).orient == SPLIT_V {
+        whole = (*s).whole.h
+        first = (*s).a.h
+    }
+    if whole <= 0 {
+        return 0
+    }
+    return first * 1000 / whole
+}
+
+fn split_mouse_down(s: *mut Split, x: i64, y: i64) -> bool {
+    let r: layout.Rect = (*s).barr
+    if inside(layout.rect_new(r.x - 2, r.y - 2, r.w + 4, r.h + 4), x, y) {
+        (*s).dragging = true
+        if (*s).orient == SPLIT_H {
+            (*s).grab = x - r.x
+        } else {
+            (*s).grab = y - r.y
+        }
+        return true
+    }
+    return false
+}
+
+fn split_mouse_drag(s: *mut Split, x: i64, y: i64) -> bool {
+    if !(*s).dragging {
+        return false
+    }
+    let wh: layout.Rect = (*s).whole
+    if (*s).orient == SPLIT_H {
+        (*s).pos = x - (*s).grab - wh.x
+    } else {
+        (*s).pos = y - (*s).grab - wh.y
+    }
+    split_layout(s, wh.x, wh.y, wh.w, wh.h)
+    // the clamped value is the one that counts from now on
+    if (*s).orient == SPLIT_H {
+        (*s).pos = (*s).a.w
+    } else {
+        (*s).pos = (*s).a.h
+    }
+    return true
+}
+
+fn split_mouse_up(s: *mut Split) {
+    (*s).dragging = false
+}

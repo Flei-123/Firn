@@ -1,0 +1,401 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/filechooser.fi -- the model of an open/save dialog: a directory,
+// its entries sorted and filtered, a selection, the chosen path.
+//
+// OpenPlan LIB-005 (open and save dialogs). fUi draws its own dialogs; this
+// file is what such a dialog shows and how it answers the keyboard and a
+// double click -- on std.dir and std.fs, checkable without a window (the
+// same cut as lib/fui/editor.fi). A fUi table or list draws the rows.
+//
+//     var fc: filechooser.FileChooser = filechooser.fc_new(filechooser.FC_OPEN, "*.opz;*.json")
+//     filechooser.fc_open_dir(&fc, "/home/user/projects")
+//     row i: fc_name(&fc, i), fc_is_dir(&fc, i), fc_size(&fc, i), fc_mtime_ns(&fc, i)
+//     filechooser.fc_activate(&fc, i)     // a directory: go in; a file: chosen
+//     filechooser.fc_result(&fc)          // the chosen path
+//
+// SORTED directories first, then files, each by name without regard to
+// case (ASCII), ".." never listed (`fc_up` goes there). Hidden entries
+// (a leading ".") only with `fc_show_hidden`. The FILTER is a list of
+// patterns separated by ";" with "*" and "?" (case-insensitive, as users
+// expect from "*.PDF"); directories are always listed. In FC_SAVE mode
+// the result is the directory plus the typed name, with the filter's
+// first extension added when the name has none; FC_DIR chooses a
+// directory.
+
+import std.rt
+import std.vec
+import std.str
+import std.dir
+import std.fs
+
+export {
+    FileChooser,
+    fc_new, fc_free, fc_open_dir, fc_dir, fc_count, fc_name, fc_is_dir, fc_size, fc_mtime_ns,
+    fc_up, fc_activate, fc_select, fc_selected, fc_move, fc_set_name, fc_result, fc_matches,
+    fc_show_hidden, fc_set_filter,
+    FC_OPEN, FC_SAVE, FC_DIR,
+    FC_NOTHING, FC_ENTERED, FC_CHOSEN,
+}
+
+const FC_OPEN: u32 = 0
+const FC_SAVE: u32 = 1
+const FC_DIR: u32 = 2
+
+const FC_NOTHING: u32 = 0
+const FC_ENTERED: u32 = 1 // went into a directory
+const FC_CHOSEN: u32 = 2 // the dialog is done: fc_result
+
+struct Entry {
+    name: str,
+    is_dir: bool,
+    size: u64,
+    mtime_ns: i64,
+}
+
+struct FileChooser {
+    mode: u32,
+    filter: str,
+    hidden: bool,
+    dir: str,
+    entries: Vec[Entry],
+    sel: i64,
+    name: str, // FC_SAVE: the typed file name
+    result: str,
+}
+
+fn fc_new(mode: u32, filter: str) -> FileChooser {
+    return FileChooser { mode: mode, filter: __str_copy(filter), hidden: false, dir: "", entries: vec_new[Entry](),
+        sel: -1, name: "", result: "" }
+}
+
+fn fc_free(fc: *mut FileChooser) {
+    vec_free[Entry](&(*fc).entries)
+}
+
+fn fc_show_hidden(fc: *mut FileChooser, on: bool) {
+    (*fc).hidden = on
+}
+
+fn fc_set_filter(fc: *mut FileChooser, filter: str) {
+    (*fc).filter = __str_copy(filter)
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// glob with * and ?, case-insensitive (iterative, with one backtrack
+// point -- linear enough for file names)
+fn glob(pat: str, name: str) -> bool {
+    var p: usize = 0
+    var n: usize = 0
+    var star: i64 = -1
+    var mark: usize = 0
+    while n < name.n {
+        if p < pat.n && (rt.ld8(pat.p as u64, p) == 63 as u8 || lower(rt.ld8(pat.p as u64, p)) == lower(rt.ld8(name.p as u64, n))) {
+            p = p + 1
+            n = n + 1
+        } else if p < pat.n && rt.ld8(pat.p as u64, p) == 42 as u8 {
+            star = p as i64
+            mark = n
+            p = p + 1
+        } else if star >= 0 {
+            p = star as usize + 1
+            mark = mark + 1
+            n = mark
+        } else {
+            return false
+        }
+    }
+    while p < pat.n && rt.ld8(pat.p as u64, p) == 42 as u8 {
+        p = p + 1
+    }
+    return p == pat.n
+}
+
+// Whether `name` passes the filter ("" or "*" = everything).
+fn fc_matches(filter: str, name: str) -> bool {
+    if filter.n == 0 {
+        return true
+    }
+    var start: usize = 0
+    var i: usize = 0
+    while i <= filter.n {
+        if i == filter.n || rt.ld8(filter.p as u64, i) == 59 as u8 {
+            let pat: str = str { p: rt.ptr_of(filter.p as u64 + start as u64), n: i - start }.trim()
+            if pat.n > 0 && glob(pat, name) {
+                return true
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// a before b: directories first, then by name ignoring ASCII case, then
+// by octets (so that the order is total)
+fn before(a: *mut Entry, b: *mut Entry) -> bool {
+    if (*a).is_dir != (*b).is_dir {
+        return (*a).is_dir
+    }
+    let n: usize = if_less((*a).name.n, (*b).name.n)
+    var i: usize = 0
+    while i < n {
+        let x: u8 = lower(rt.ld8((*a).name.p as u64, i))
+        let y: u8 = lower(rt.ld8((*b).name.p as u64, i))
+        if x != y {
+            return x < y
+        }
+        i = i + 1
+    }
+    if (*a).name.n != (*b).name.n {
+        return (*a).name.n < (*b).name.n
+    }
+    return (*a).name.compare((*b).name) < 0
+}
+
+fn if_less(a: usize, b: usize) -> usize {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// merge sort of the entry indices (a directory may hold thousands)
+fn sort(fc: *mut FileChooser, idx: *mut Vec[u32]) {
+    let n: usize = vec_len[u32](idx)
+    var tmp: Vec[u32] = vec_new[u32]()
+    var k: usize = 0
+    while k < n {
+        vec_push[u32](&tmp, 0 as u32)
+        k = k + 1
+    }
+    var width: usize = 1
+    while width < n {
+        var lo: usize = 0
+        while lo < n {
+            var mid: usize = lo + width
+            if mid > n { mid = n }
+            var hi: usize = lo + 2 * width
+            if hi > n { hi = n }
+            var a: usize = lo
+            var b: usize = mid
+            var o: usize = lo
+            while o < hi {
+                var take_a: bool = b >= hi
+                if a < mid && b < hi {
+                    let ea: *mut Entry = vec_elem_ptr[Entry](&(*fc).entries, vec_at[u32](idx, a) as usize)
+                    let eb: *mut Entry = vec_elem_ptr[Entry](&(*fc).entries, vec_at[u32](idx, b) as usize)
+                    take_a = !before(eb, ea)
+                }
+                if a < mid && take_a {
+                    vec_set[u32](&tmp, o, vec_at[u32](idx, a))
+                    a = a + 1
+                } else {
+                    vec_set[u32](&tmp, o, vec_at[u32](idx, b))
+                    b = b + 1
+                }
+                o = o + 1
+            }
+            lo = lo + 2 * width
+        }
+        k = 0
+        while k < n {
+            vec_set[u32](idx, k, vec_at[u32](&tmp, k))
+            k = k + 1
+        }
+        width = width * 2
+    }
+    vec_free[u32](&tmp)
+}
+
+// Reads the directory. false = it cannot be read (the old listing stays).
+#[allow_escape]
+fn fc_open_dir(fc: *mut FileChooser, path: str) -> bool {
+    var d: dir.Dir = dir.open(path)
+    if !dir.is_open(&d) {
+        return false
+    }
+    var raw: Vec[Entry] = vec_new[Entry]()
+    while dir.next(&d) {
+        let nm: str = __str_copy(d.name)
+        if nm.n > 0 && rt.ld8(nm.p as u64, 0) == 46 as u8 && !(*fc).hidden {
+            continue
+        }
+        let full: str = fs.path_join(path, nm)
+        let info: fs.FileInfo = fs.stat(full) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+        let isdir: bool = info.kind == fs.KIND_DIR
+        if !isdir && ((*fc).mode == FC_DIR || !fc_matches((*fc).filter, nm)) {
+            continue
+        }
+        vec_push[Entry](&raw, Entry { name: nm, is_dir: isdir, size: info.size, mtime_ns: info.mtime_ns })
+    }
+    dir.close(&d)
+    vec_free[Entry](&(*fc).entries)
+    (*fc).entries = raw
+    var idx: Vec[u32] = vec_new[u32]()
+    var i: usize = 0
+    while i < vec_len[Entry](&(*fc).entries) {
+        vec_push[u32](&idx, i as u32)
+        i = i + 1
+    }
+    sort(fc, &idx)
+    var sorted: Vec[Entry] = vec_new[Entry]()
+    i = 0
+    while i < vec_len[u32](&idx) {
+        vec_push[Entry](&sorted, *vec_elem_ptr[Entry](&(*fc).entries, vec_at[u32](&idx, i) as usize))
+        i = i + 1
+    }
+    vec_free[u32](&idx)
+    vec_free[Entry](&(*fc).entries)
+    (*fc).entries = sorted
+    (*fc).dir = __str_copy(path)
+    (*fc).sel = -1
+    if vec_len[Entry](&(*fc).entries) > 0 {
+        (*fc).sel = 0
+    }
+    return true
+}
+
+fn fc_dir(fc: *mut FileChooser) -> str {
+    return (*fc).dir
+}
+
+fn fc_count(fc: *mut FileChooser) -> usize {
+    return vec_len[Entry](&(*fc).entries)
+}
+
+fn ent(fc: *mut FileChooser, i: usize) -> *mut Entry {
+    return vec_elem_ptr[Entry](&(*fc).entries, i)
+}
+
+fn fc_name(fc: *mut FileChooser, i: usize) -> str {
+    if i >= fc_count(fc) {
+        return ""
+    }
+    return (*ent(fc, i)).name
+}
+
+fn fc_is_dir(fc: *mut FileChooser, i: usize) -> bool {
+    return i < fc_count(fc) && (*ent(fc, i)).is_dir
+}
+
+fn fc_size(fc: *mut FileChooser, i: usize) -> u64 {
+    if i >= fc_count(fc) {
+        return 0
+    }
+    return (*ent(fc, i)).size
+}
+
+fn fc_mtime_ns(fc: *mut FileChooser, i: usize) -> i64 {
+    if i >= fc_count(fc) {
+        return 0
+    }
+    return (*ent(fc, i)).mtime_ns
+}
+
+// Up one directory ("/" stays "/").
+fn fc_up(fc: *mut FileChooser) -> bool {
+    let parent: str = fs.path_parent((*fc).dir)
+    if parent.n == 0 || parent == (*fc).dir {
+        return false
+    }
+    return fc_open_dir(fc, parent)
+}
+
+fn fc_select(fc: *mut FileChooser, i: i64) {
+    if i >= 0 && (i as usize) < fc_count(fc) {
+        (*fc).sel = i
+        if (*fc).mode == FC_SAVE && !(*ent(fc, i as usize)).is_dir {
+            (*fc).name = (*ent(fc, i as usize)).name
+        }
+    }
+}
+
+fn fc_selected(fc: *mut FileChooser) -> i64 {
+    return (*fc).sel
+}
+
+// Moves the selection by `delta` rows (arrow keys, page keys), clamped.
+fn fc_move(fc: *mut FileChooser, delta: i64) {
+    let n: i64 = fc_count(fc) as i64
+    if n == 0 {
+        return
+    }
+    var s: i64 = (*fc).sel + delta
+    if s < 0 { s = 0 }
+    if s >= n { s = n - 1 }
+    fc_select(fc, s)
+}
+
+// The typed name of a FC_SAVE dialog.
+fn fc_set_name(fc: *mut FileChooser, name: str) {
+    (*fc).name = __str_copy(name)
+}
+
+// Double click or Enter on row `i` (-1 = the selected one; in FC_SAVE and
+// FC_DIR also "the typed name" / "this directory"). A directory is
+// entered; a file (FC_OPEN), a name (FC_SAVE) or the current directory
+// (FC_DIR, i = -1) is chosen.
+fn fc_activate(fc: *mut FileChooser, i0: i64) -> u32 {
+    var i: i64 = i0
+    if i < 0 && (*fc).mode == FC_OPEN {
+        i = (*fc).sel
+    }
+    if i >= 0 && (i as usize) < fc_count(fc) {
+        let e: *mut Entry = ent(fc, i as usize)
+        if (*e).is_dir {
+            if fc_open_dir(fc, fs.path_join((*fc).dir, (*e).name)) {
+                return FC_ENTERED
+            }
+            return FC_NOTHING
+        }
+        if (*fc).mode == FC_OPEN {
+            (*fc).result = fs.path_join((*fc).dir, (*e).name)
+            return FC_CHOSEN
+        }
+        if (*fc).mode == FC_SAVE {
+            (*fc).name = (*e).name
+        }
+    }
+    if (*fc).mode == FC_DIR && i0 < 0 {
+        (*fc).result = (*fc).dir
+        return FC_CHOSEN
+    }
+    if (*fc).mode == FC_SAVE && (*fc).name.n > 0 {
+        let nm: str = (*fc).name
+        if nm.contains("/") {
+            return FC_NOTHING // a name, not a path
+        }
+        var full: str = fs.path_join((*fc).dir, nm)
+        // the filter's first extension when the name has none
+        if !nm.contains(".") {
+            full = full + first_ext((*fc).filter)
+        }
+        (*fc).result = full
+        return FC_CHOSEN
+    }
+    return FC_NOTHING
+}
+
+// ".opz" out of "*.opz;*.json" ("" if the first pattern has no "*.ext")
+fn first_ext(filter: str) -> str {
+    var e: usize = 0
+    while e < filter.n && rt.ld8(filter.p as u64, e) != 59 as u8 {
+        e = e + 1
+    }
+    let first: str = str { p: filter.p, n: e }.trim()
+    if first.n > 2 && first.starts_with("*.") && !first.ab(1).contains("*") && !first.contains("?") {
+        return first.ab(1)
+    }
+    return ""
+}
+
+// The chosen path ("" until fc_activate answered FC_CHOSEN).
+fn fc_result(fc: *mut FileChooser) -> str {
+    return (*fc).result
+}
