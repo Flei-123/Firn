@@ -204,6 +204,8 @@ fn wasm_simd_kind(k: crate::simd::SimdKind) -> bool {
             | K::Shl64 | K::Shr64 | K::Blend16 | K::AesEnc | K::AesEncLast | K::AesDec
             | K::AesDecLast | K::AesImc | K::AesKeyGenAssist | K::Sha256Rnds2 | K::Sha256Msg1
             | K::Sha256Msg2 | K::Pclmul | K::Crc32U8 | K::Crc32U64 | K::CpuFeatures
+            | K::Store64 | K::AddF32 | K::SubF32 | K::MulF32 | K::TruncF32I32 | K::CvtI32F32
+            | K::CmpLtF32 | K::CmpLeF32 | K::CmpNltF32 | K::CmpGt32
     )
 }
 
@@ -2819,6 +2821,79 @@ impl<'a> Fx<'a> {
                 self.get(arg(0)?, v);
                 self.get(arg(1)?, v);
                 shuf(self, idx);
+                self.put(i, v);
+            }
+            K::Store64 => {
+                // the low eight octets only (two `f32`, TEMPO 7)
+                self.addr(arg(0)?);
+                self.get(arg(1)?, v);
+                self.ins(Ins::SimdMemLane(w::V128_STORE64_LANE, 3, 0, 0));
+            }
+            K::AddF32 | K::SubF32 | K::MulF32 | K::CmpLtF32 | K::CmpLeF32 | K::CmpGt32 => {
+                // lane for lane what the scalar instruction computes (TEMPO 4/5);
+                // the comparisons give all ones / all zeros per lane, as
+                // `cmpltps`/`cmpleps`/`pcmpgtd` do
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                let op = match kind {
+                    K::AddF32 => w::F32X4_ADD,
+                    K::SubF32 => w::F32X4_SUB,
+                    K::MulF32 => w::F32X4_MUL,
+                    K::CmpLtF32 => w::F32X4_LT,
+                    K::CmpLeF32 => w::F32X4_LE,
+                    _ => w::I32X4_GT_S,
+                };
+                self.ins(Ins::SimdOp(op));
+                self.put(i, v);
+            }
+            K::CmpNltF32 => {
+                // NOT less-than: TRUE for an unordered pair (NaN), exactly
+                // `cmpnltps`
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                self.ins(Ins::SimdOp(w::F32X4_LT));
+                self.ins(Ins::SimdOp(w::V128_NOT));
+                self.put(i, v);
+            }
+            K::CvtI32F32 => {
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdOp(w::F32X4_CONVERT_I32X4_S));
+                self.put(i, v);
+            }
+            K::TruncF32I32 => {
+                // `cvttps2dq` answers 0x80000000 for NaN and for everything
+                // out of range; `trunc_sat` saturates (NaN -> 0, too big ->
+                // 0x7FFFFFFF). The lower side already agrees; NaN and the
+                // upper side are put right with a mask.
+                let x = self.tmp(v);
+                self.get(arg(0)?, v);
+                self.ins(Ins::LocalTee(x));
+                self.ins(Ins::SimdOp(w::I32X4_TRUNC_SAT_F32X4_S));
+                // bitselect(a = 0x80000000, b = trunc, mask)
+                self.ins(Ins::V128Const([0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80]));
+                self.ins(Ins::LocalGet(x));
+                self.ins(Ins::LocalGet(x));
+                self.ins(Ins::SimdOp(w::F32X4_NE));
+                self.ins(Ins::LocalGet(x));
+                self.ins(Ins::F32Const(((1u64 << 31) as f32).to_bits()));
+                self.ins(Ins::SimdOp(w::F32X4_SPLAT));
+                self.ins(Ins::SimdOp(w::F32X4_GE));
+                self.ins(Ins::SimdOp(w::V128_OR));
+                // stack: trunc, MIN, mask -> bitselect(MIN, trunc, mask)
+                let m = self.tmp(v);
+                self.ins(Ins::LocalSet(m));
+                let mn = self.tmp(v);
+                self.ins(Ins::LocalSet(mn));
+                let t = self.tmp(v);
+                self.ins(Ins::LocalSet(t));
+                self.ins(Ins::LocalGet(mn));
+                self.ins(Ins::LocalGet(t));
+                self.ins(Ins::LocalGet(m));
+                self.ins(Ins::SimdOp(w::V128_BITSELECT));
+                self.release(v, x);
+                self.release(v, m);
+                self.release(v, mn);
+                self.release(v, t);
                 self.put(i, v);
             }
             K::AesEnc

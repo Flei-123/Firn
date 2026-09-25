@@ -902,7 +902,22 @@ fn load_args(
                 if f.val_ty(*a) == FTy::V128 {
                     crate::simd::reg_from_slot(e, fr, r, *a);
                 } else {
-                    load_xmm(e, fr, r, *a, f.val_ty(*a) == FTy::F32);
+                    // Straight out of the frame slot, NOT through the xmm
+                    // cache (`load_xmm`): the cache hands out xmm4-xmm7 as
+                    // its own registers, and those are argument registers
+                    // 5-8. A seventh argument loaded through it landed in
+                    // xmm5 -- already set as the sixth -- and `body(k, 0, 0.0,
+                    // ..., sm)` of the nbody kernel got vz = sm. The caller
+                    // flushed the cache in front of the call, so every slot
+                    // is current.
+                    let single = f.val_ty(*a) == FTy::F32;
+                    e.line(&format!(
+                        "{} {}, {} ptr [rbp-{}]",
+                        if single { "movss" } else { "movsd" },
+                        r,
+                        if single { "dword" } else { "qword" },
+                        fr.slot[*a as usize]
+                    ));
                 }
             }
         }

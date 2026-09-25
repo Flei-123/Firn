@@ -41,13 +41,13 @@ Switches: `FIRN_NO_PROMOTE=1`, `FIRN_PROMOTE_TRACE=1`, `FIRN_PROMOTE_ONLY=fn`,
 `FIRN_PROMOTE_LIMIT=n` (bisecting), `FIRN_PROMOTE_ROTATE_ALL=1` +
 `FIRN_PROMOTE_CLEANUP_FIRST=1` (stress mode: rotate every loop).
 
-**Native needs the register allocator of TEMPO 1-13 (branch `unroll`).** With
-the old allocator of main the promoted loop phis spill (sim.fi 2-2.3x
-slower); with the new one it is a clear gain (below). Therefore the pass is ON
-by default for `wasm32-browser` only; `FIRN_PROMOTE_NATIVE=1` switches it on
-natively, and `test.sh` section 64 (`tools/promote/run.sh`) keeps it proven
-there (release-fast/-safe, normal and stress mode). Once `unroll` is on main
-the gate in `main.rs` goes.
+**Native needs the register allocator of TEMPO 1-13** (on main since
+2026-09-24). With the old allocator the promoted loop phis spilled (sim.fi
+2-2.3x slower); with the new one: idle-1000 120 -> 311 M ticks/s (2.6x),
+fanout-1000 +19 %, chain/rand -2..-4 % (sim.fi, interleaved runs). The pass
+runs at both release levels on every target; `test.sh` section 64
+(`tools/promote/run.sh`) holds it against its tests in the stress mode that
+rotates every loop.
 
 Inner region loops are NOT rotated but only GUARDED (`P -> G(test) -> P2 ->
 H(test)`): the preheader P2 still runs only when the loop runs, and the loop
@@ -80,17 +80,32 @@ Switches: `FIRN_WASM_NO_TREES`, `_NO_OFFSET`, `_NO_LOW32`, `_NO_PACK`,
 ## 3. WebAssembly SIMD
 
 `v128` is a value type now. The SSE-style intrinsics map to WebAssembly
-SIMD with their exact x86 meaning (`pshufb` -> `swizzle` of `b & 0x8F`,
+SIMD with their exact x86 meaning, the f32x4 kinds of TEMPO 4/5 included (`pshufb` -> `swizzle` of `b & 0x8F`,
 `pshufd`/`palignr`/`punpck*`/`pslldq`/`psrldq`/`pblendw` -> `i8x16.shuffle`,
 `pandn` -> `andnot` with swapped operands). The crypto intrinsics (AES,
 SHA-256, PCLMUL, crc32) have no WebAssembly form: they trap, and
 `__cpu_features()` answers SSE2|SSE4.1|SSSE3, so code that asks first takes
 its scalar path. `tests/1614_simd_ops.fi` moves from REFUSED to SAME; the
 encoding agrees with `wat2wasm` octet for octet. `FIRN_WASM_NO_SIMD=1` restores
-the refusal. (The f32x4 kinds of TEMPO 4/5 are mapped as well once `unroll`
-is on main; checked there against tests 1615-1617.)
+the refusal. The f32x4 kinds of TEMPO 4/5 (add/sub/mul, compares, cvt/trunc
+with the x86 answer for NaN and overflow, store64) are mapped too, checked by
+tests 1615-1617.
 
-## 4. WebAssembly threads
+## 4. A bug of main found on the way: seven f64 arguments
+
+The kernel nbody computed a wrong energy after the TEMPO 1-13 merge, at
+every build level. The base path (`codegen_x86.rs::load_args`) loaded float
+arguments through the xmm cache, and the cache hands out xmm4-xmm7 as its own
+registers -- which are argument registers 5-8. The seventh argument was
+loaded through xmm5, already set as the sixth: `body(k, 0, 0.0, ..., sm)` got
+vz = sm. It needs a function that also holds a loop full of float
+temporaries, which is why the suite never saw it. Now float arguments come
+straight out of their frame slots (the cache is flushed in front of every
+call anyway), and the allocator path moves register sources in parallel like
+the prologue does. `tests/1722_fp_args_cache.fi` is red on main before this
+round.
+
+## 5. WebAssembly threads
 
 Feasible, planned in `ROADMAP.md` ("WebAssembly threads -- the plan"): the
 collector stops the world cooperatively (safepoints + futex), so shared
@@ -110,7 +125,7 @@ sim.fi, ticks/s (`/root/bench/simcmp/opt/q.sh`, Chromium via `opt/web/cmp.sh`):
 
 (Chromium columns: the final guarded variant, 4 interleaved rounds.)
 
-\* native with the allocator of `unroll`, promote off/on.
+\* native with the allocator of TEMPO 1-13, promote off/on.
 
 Seven C kernels of Certus (`tools/wasm/tempo/*.c`) ported 1:1 to Firn
 (`/root/bench/kern`), ms, Firn wasm before -> after (and C = clang -O2 wasm):
