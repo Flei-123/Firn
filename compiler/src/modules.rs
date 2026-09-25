@@ -778,6 +778,35 @@ impl<'a, 'b> Renamer<'a, 'b> {
         }
     }
 
+    /// ROUND MODGEN: the type arguments of a generic instantiation get the
+    /// module qualification like every other type name.
+    ///
+    /// The parser writes `Vec[Block]` down as `Vec__Block` and keeps the
+    /// argument `Block` aside in `sema_generic::REG`. Inside a module the
+    /// struct is renamed to `refdes__Block`, but the argument stayed
+    /// `Block` -- so `Vec[T]` of a struct of the module's own reported
+    /// "unknown type 'Block'" at instantiation, and a library could not
+    /// keep a `Vec` of its own records. Here the arguments are rewritten
+    /// with `ty`, and if one changed, the instantiation is recorded again
+    /// under its new name (`Vec__refdes__Block`), which also keeps two
+    /// modules with a struct of the same name apart.
+    fn inst(&mut self, name: &str) -> Option<String> {
+        let mut inst = crate::sema_generic::instantiation(name)?;
+        let before: Vec<String> = inst.args.iter().map(crate::sema_generic::type_tag).collect();
+        for a in inst.args.iter_mut() {
+            self.ty(a);
+        }
+        let after: Vec<String> = inst.args.iter().map(crate::sema_generic::type_tag).collect();
+        if before == after {
+            crate::sema_generic::mark_kept(name);
+            return None;
+        }
+        crate::sema_generic::mark_superseded(name);
+        let mangled = crate::sema_generic::mangle(&inst.base, &inst.args);
+        crate::sema_generic::record_inst(&mangled, inst);
+        Some(mangled)
+    }
+
     fn ty(&mut self, t: &mut TypeExpr) {
         match t {
             TypeExpr::Named(name, span) => {
@@ -790,6 +819,10 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 if let Some((idx, mut inner)) = crate::errors::pending_inner(name) {
                     self.ty(&mut inner);
                     crate::errors::set_pending_inner(idx, inner);
+                    return;
+                }
+                if let Some(n) = self.inst(name) {
+                    *name = n;
                     return;
                 }
                 if let Some(n) = self.resolve(name, *span, false) {
@@ -932,7 +965,9 @@ impl<'a, 'b> Renamer<'a, 'b> {
                     }
                     return;
                 }
-                if let Some(n) = self.resolve(name, *nspan, false) {
+                if let Some(n) = self.inst(name) {
+                    *name = n;
+                } else if let Some(n) = self.resolve(name, *nspan, false) {
                     *name = n;
                 }
                 for a in args.iter_mut() {
@@ -949,7 +984,9 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 self.ty(t);
             }
             ExprKind::StructLit(name, fields, nspan) => {
-                if let Some(n) = self.resolve(name, *nspan, false) {
+                if let Some(n) = self.inst(name) {
+                    *name = n;
+                } else if let Some(n) = self.resolve(name, *nspan, false) {
                     *name = n;
                 }
                 for (_, v, _) in fields.iter_mut() {
