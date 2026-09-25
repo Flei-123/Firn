@@ -12,6 +12,7 @@
 #   lib/print CUPS' ippeveprinter (a real IPP Everywhere printer) and a
 #             stand-in for the CUPS scheduler
 #   clipboard lib/window's X11 clipboard against Tk and python-xlib (Xvfb)
+#   twowin    two top-level windows of one program, window.wait_any (Xvfb)
 # std.fs has no second implementation to compare with; tests/1910_std_fs.fi
 # is its proof (against the kernel's own answers).
 set -uo pipefail
@@ -21,7 +22,7 @@ FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 rc=0
-for t in time_probe zip_probe pdf_probe regex_probe i18n_probe jpeg_probe print_probe clip_probe; do
+for t in time_probe zip_probe pdf_probe regex_probe i18n_probe jpeg_probe print_probe clip_probe twowin_probe; do
     "$FIRNC" -o "$W/$t" "tools/libmvp/$t.fi" > "$W/$t.log" 2>&1 || { echo "  FAIL $t does not build"; grep -v RWX "$W/$t.log" | head -5; rc=1; }
 done
 [ $rc -eq 0 ] || exit 1
@@ -62,5 +63,7 @@ else
 fi
 echo "-- window clipboard (X11)"
 python3 tools/libmvp/check_clip.py "$W/clip_probe" || rc=1
+echo "-- two windows in one program (X11)"
+python3 tools/libmvp/check_twowin.py "$W/twowin_probe" || rc=1
 if [ $rc -eq 0 ]; then echo "LIBMVP PASSED"; else echo "LIBMVP FAILED"; fi
 exit $rc

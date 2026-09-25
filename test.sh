@@ -1420,7 +1420,7 @@ echo "== 65. the libraries OpenPlan asked for, against other implementations (to
 # archives, and poppler/pypdf for text, fonts, links, bookmarks, layers and
 # the rendered pixels of a PDF.
 bash tools/libmvp/run.sh > "$WORK/libmvp.log" 2>&1 && LMRC=0 || LMRC=$?
-grep -E '^(time|zip|pdf|regex|i18n|jpeg|print|clipboard):|^LIBMVP' "$WORK/libmvp.log" | sed 's/^/ /'
+grep -E '^(time|zip|pdf|regex|i18n|jpeg|print|clipboard|twowin):|^LIBMVP' "$WORK/libmvp.log" | sed 's/^/ /'
 if [ "$LMRC" -eq 0 ]; then
     ok
 else

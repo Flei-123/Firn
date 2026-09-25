@@ -47,6 +47,8 @@ export {
     fenster_set_gpu, fenster_gpu,
     // OpenPlan LIB-006: the system clipboard for fUi text fields
     fenster_clip_read, fenster_clip_write,
+    // OpenPlan LIB-005: more than one window
+    fenster_step, fenster_wait_many,
 }
 
 struct Fenster {
@@ -221,6 +223,50 @@ fn fenster_open(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
     return true
 }
 
+// ================================================ SEVERAL WINDOWS
+//
+// OpenPlan LIB-005. Every Fenster is a window of its own (under X11 with
+// a connection of its own). A program with several of them waits for all
+// at once and then steps each:
+//
+//     var fs: [u64; 8] = [(&a) as u64, (&b) as u64, 0, 0, 0, 0, 0, 0]
+//     var ws: [u64; 8] = [(&wa) as u64, (&wb) as u64, 0, 0, 0, 0, 0, 0]
+//     while open_a || open_b {
+//         fuiwin.fenster_wait_many(&fs, &ws, 2)
+//         if open_a { open_a = fuiwin.fenster_step(&a, &wa, &ma, male_a, akt_a, ud) }
+//         if open_b { open_b = fuiwin.fenster_step(&b, &wb, &mb, male_b, akt_b, ud) }
+//     }
+//
+// It waits as long as the most impatient window allows (an animation
+// wants its next frame in 16 ms) or until one of them has an event. A
+// closed window (0 in `fs`) is skipped. The answer is the index of a
+// window with an event, or -1 when the time ran out.
+fn fenster_wait_many(fs: *mut [u64; 8], ws: *mut [u64; 8], n: usize) -> i64 {
+    var ms: i64 = fuiwirt.WAIT_FOREVER
+    var wins: [u64; 8] = [0 as u64; 8]
+    var k: usize = 0
+    var i: usize = 0
+    while i < n && i < 8 {
+        if (*fs)[i] != 0 && (*ws)[i] != 0 {
+            let fx: *mut Fenster = (*fs)[i] as *mut Fenster
+            let wm: i64 = fuiwirt.wirt_wait_ms((*ws)[i] as *mut fuiwirt.Wirt)
+            if wm == 0 {
+                return i as i64
+            }
+            if wm > 0 && (ms < 0 || wm < ms) {
+                ms = wm
+            }
+            wins[k] = (&(*fx).f) as u64
+            k = k + 1
+        }
+        i = i + 1
+    }
+    if k == 0 {
+        return -1
+    }
+    return window.wait_any(&wins, k, ms)
+}
+
 // ================================================ THE SYSTEM CLIPBOARD
 //
 // OpenPlan LIB-006. The two functions a text field wants
@@ -390,73 +436,85 @@ fn fenster_run(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
         if ms != 0 {
             let da: bool = window.wait_event(f, ms)
         }
-        var k: u32 = window.next_event(f)
-        while k != window.EV_NONE && laeuft {
-            if !weiche(fx, w, m, k) {
-                laeuft = false
-            } else {
-                k = window.next_event(f)
-            }
-        }
-        if !laeuft {
-            break
-        }
-        let akt: usize = fuiwirt.wirt_take_activated(w)
-        if akt != fuiwirt.KEINER {
-            aktion(ud, fx, akt)
-        }
-        fuiwirt.wirt_tick(w, jetzt_ms())
-        if fuiwirt.wirt_dirty(w) {
-            let q0: i64 = jetzt_ms()
-            var q2: i64 = q0
-            var q3: i64 = q0
-            var q1: i64 = q0
-            if (*fx).gpu_an {
-                // AUF DER GPU: malen, eine Kopie auf den Schirm, tauschen
-                var pl: [u64; 4] = [0; 4]
-                window.gpu_place(f, (&pl[0]) as u64)
-                gpu.gpu_frame_begin(&(*fx).gp, pl[2] as i32, pl[3] as i32)
-                male(ud, fx)
-                q1 = jetzt_ms()
-                gpu.gpu_present_at(&(*fx).gp, pl[0] as i32, pl[1] as i32)
-                streu_melden(fx)
-                q2 = jetzt_ms()
-                let ok3: bool = window.gpu_swap(f)
-                q3 = jetzt_ms()
-                if window.gpu_lost(f) {
-                    // der Kontext ist weg und mit ihm jedes GL-Objekt: neu
-                    // aufmachen, und alles wird noch einmal gemalt
-                    gpu_starten(fx)
-                    fuiwirt.wirt_touch(w)
-                }
-            } else {
-                male(ud, fx)
-                q1 = jetzt_ms()
-                fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64,
-                    (*fx).bgrx, (*fx).w * (*fx).h)
-                q2 = jetzt_ms()
-                let ok: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
-                let ok2: bool = window.present(f)
-                q3 = jetzt_ms()
-            }
-            // Wo die Zeit eines Bildes bleibt: fUi malen, RGBA->BGRX,
-            // PutImage -- in ms. Gemessen, damit niemand die Plattform
-            // verdaechtigt, wenn der Rasterer langsam ist (und umgekehrt).
-            var tn: [u8; 4] = "zeit"
-            zeile(fx, (&tn[0]) as u64, 4, q1 - q0, q2 - q1, q3 - q2, 0)
-            fuiwirt.wirt_painted(w)
-            (*fx).bilder = (*fx).bilder + 1
-            var nm: [u8; 4] = "bild"
-            zeile(fx, (&nm[0]) as u64, 4, (*fx).bilder as i64,
-                (*fx).w as i64, (*fx).h as i64,
-                theme.theme_scale(m) as i64)
-            // Nach dem Anordnen kann unter dem stehenden Zeiger ein
-            // anderer Knoten liegen (gerollt) -- das zieht der Wirt nach,
-            // und dann wird noch einmal gemalt.
-            let c: u32 = fuiwirt.wirt_after_layout(w)
-        }
-        if !window.is_open(f) {
+        laeuft = fenster_step(fx, w, m, male, aktion, ud)
+    }
+}
+
+// ONE TURN of the loop without the waiting: the events that are there,
+// the activated control, the animation tick, a frame if something
+// changed. false = the window is closed (or the program asked to end).
+// `fenster_run` is this in a loop with the wait in front; a program with
+// SEVERAL windows (OpenPlan LIB-005: pages in windows of their own) waits
+// with `fenster_wait_many` and then steps every window.
+fn fenster_step(fx: *mut Fenster, w: *mut fuiwirt.Wirt, m: *mut theme.Theme,
+    male: fn(u64, *mut Fenster), aktion: fn(u64, *mut Fenster, usize),
+    ud: u64) -> bool {
+    let f: *mut window.Window = &(*fx).f
+    var laeuft: bool = true
+    var k: u32 = window.next_event(f)
+    while k != window.EV_NONE && laeuft {
+        if !weiche(fx, w, m, k) {
             laeuft = false
+        } else {
+            k = window.next_event(f)
         }
     }
+    if !laeuft {
+        return false
+    }
+    let akt: usize = fuiwirt.wirt_take_activated(w)
+    if akt != fuiwirt.KEINER {
+        aktion(ud, fx, akt)
+    }
+    fuiwirt.wirt_tick(w, jetzt_ms())
+    if fuiwirt.wirt_dirty(w) {
+        let q0: i64 = jetzt_ms()
+        var q2: i64 = q0
+        var q3: i64 = q0
+        var q1: i64 = q0
+        if (*fx).gpu_an {
+            // AUF DER GPU: malen, eine Kopie auf den Schirm, tauschen
+            var pl: [u64; 4] = [0; 4]
+            window.gpu_place(f, (&pl[0]) as u64)
+            gpu.gpu_frame_begin(&(*fx).gp, pl[2] as i32, pl[3] as i32)
+            male(ud, fx)
+            q1 = jetzt_ms()
+            gpu.gpu_present_at(&(*fx).gp, pl[0] as i32, pl[1] as i32)
+            streu_melden(fx)
+            q2 = jetzt_ms()
+            let ok3: bool = window.gpu_swap(f)
+            q3 = jetzt_ms()
+            if window.gpu_lost(f) {
+                // der Kontext ist weg und mit ihm jedes GL-Objekt: neu
+                // aufmachen, und alles wird noch einmal gemalt
+                gpu_starten(fx)
+                fuiwirt.wirt_touch(w)
+            }
+        } else {
+            male(ud, fx)
+            q1 = jetzt_ms()
+            fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64,
+                (*fx).bgrx, (*fx).w * (*fx).h)
+            q2 = jetzt_ms()
+            let ok: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
+            let ok2: bool = window.present(f)
+            q3 = jetzt_ms()
+        }
+        // Wo die Zeit eines Bildes bleibt: fUi malen, RGBA->BGRX,
+        // PutImage -- in ms. Gemessen, damit niemand die Plattform
+        // verdaechtigt, wenn der Rasterer langsam ist (und umgekehrt).
+        var tn: [u8; 4] = "zeit"
+        zeile(fx, (&tn[0]) as u64, 4, q1 - q0, q2 - q1, q3 - q2, 0)
+        fuiwirt.wirt_painted(w)
+        (*fx).bilder = (*fx).bilder + 1
+        var nm: [u8; 4] = "bild"
+        zeile(fx, (&nm[0]) as u64, 4, (*fx).bilder as i64,
+            (*fx).w as i64, (*fx).h as i64,
+            theme.theme_scale(m) as i64)
+        // Nach dem Anordnen kann unter dem stehenden Zeiger ein
+        // anderer Knoten liegen (gerollt) -- das zieht der Wirt nach,
+        // und dann wird noch einmal gemalt.
+        let c: u32 = fuiwirt.wirt_after_layout(w)
+    }
+    return window.is_open(f)
 }
