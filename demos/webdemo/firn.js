@@ -206,6 +206,8 @@ const firnTag = document.currentScript;
             if (show) { if (document.activeElement !== ta) ta.focus({ preventScroll: true }); } else if (document.activeElement === ta) canvas.focus({ preventScroll: true });
         },
         firn_web_location(p, cap) { return put(location.pathname + location.search, p, cap); },
+        // minutes EAST of UTC at one instant (lib/plat/web.fi web_tz_offset)
+        firn_web_tz(lo, hi) { return -new Date(((hi >>> 0) * 4294967296 + (lo >>> 0)) * 1000).getTimezoneOffset() | 0; },
         firn_web_store_get(kp, kn, p, cap) { try { return put(localStorage.getItem(str(kp, kn)), p, cap); } catch (e) { return 0; } },
         firn_web_store_set(kp, kn, p, n) { try { localStorage.setItem(str(kp, kn), str(p, n)); } catch (e) { /* private mode */ } },
         firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text'][k] || 'default'; },
