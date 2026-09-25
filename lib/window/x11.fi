@@ -100,6 +100,7 @@ export {
     r_notify, r_stay_alive, r_in_front,
     r_notify_at, r_notify_shown, r_notify_cancel,
     r_pick_image, r_pick_poll, r_pick_take, r_image_decode,
+    r_clip_set, r_clip_get, r_clip_types, r_clip_clear,
     // fUi tempo, stage 2b: THE GPU (only Android has it so far)
     r_gpu_open, r_gpu_swap, r_gpu_close, r_gpu_place, r_gpu_lost,
     r_dragging,
@@ -188,6 +189,23 @@ struct Platte {
     // F1: die Belegung des Servers. F2: Loslassen/Hinein/Hinaus melden?
     km: Keymap,
     voll: bool,
+    // OpenPlan LIB-006 -- THE CLIPBOARD (the CLIPBOARD selection, ICCCM 2).
+    // `req_left` counts the octets of the request `send` is in the middle
+    // of, so that `seq` is the sequence number of the last request the
+    // server got: a reply is found by it among the events.
+    req_left: usize,
+    a_clipboard: u32,
+    a_targets: u32,
+    a_utf8: u32,
+    a_text: u32,
+    a_plain: u32,
+    a_firn: u32,
+    a_incr: u32,
+    clip_own: bool,
+    clip_n: u32,
+    clip_atom: [u32; 8],
+    clip_mime: [str; 8],
+    clip_data: [rt.Buf; 8],
 }
 
 fn surface_new() -> Platte {
@@ -196,6 +214,9 @@ fn surface_new() -> Platte {
         root: 0, id_base: 0,
         id_mask: 0, next_id: 0, visual: 0, depth: 0, win: 0, gc: 0,
         font: 0, w: 0, h: 0, seq: 0, rb: rt.buf_new(), rpos: 0,
+        req_left: 0, a_clipboard: 0, a_targets: 0, a_utf8: 0, a_text: 0, a_plain: 0, a_firn: 0, a_incr: 0,
+        clip_own: false, clip_n: 0, clip_atom: [0 as u32; 8], clip_mime: ["", "", "", "", "", "", "", ""],
+        clip_data: [rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new()],
         a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
         dark_bekannt: false, dark_us: 0, inj: 0, gift: 0, fail: 0,
         spos: 0, ein_n: 0, ein_hook: ein_nichts, ein_ud: 0,
@@ -263,6 +284,31 @@ fn pad4(n: usize) -> usize {
 }
 
 fn send(x: *mut Platte, p: u64, n: usize) -> bool {
+    if (*x).open {
+        // count the requests in this buffer (a request may be split over
+        // two sends -- a PutImage head and its pixels -- but its first
+        // four octets never are)
+        var at: usize = 0
+        while at < n {
+            if (*x).req_left == 0 {
+                if at + 4 > n {
+                    break
+                }
+                var len: usize = ld16le(p, at + 2) as usize * 4
+                if len == 0 {
+                    len = 4
+                }
+                (*x).req_left = len
+                (*x).seq = ((*x).seq + 1) & 65535
+            }
+            var take: usize = n - at
+            if take > (*x).req_left {
+                take = (*x).req_left
+            }
+            (*x).req_left = (*x).req_left - take
+            at = at + take
+        }
+    }
     let k: usize = net.write_all(&(*x).c, p, n) catch RD_ERR
     return k == n
 }
@@ -1286,6 +1332,18 @@ fn fetch_atoms(x: *mut Platte) {
     var n2: [u8; 16] = "WM_DELETE_WINDOW"
     (*x).a_protocols = atom_von(x, (&n1[0]) as u64, 12)
     (*x).a_delete = atom_von(x, (&n2[0]) as u64, 16)
+    // the clipboard's atoms, also before the window
+    (*x).a_clipboard = atom_str(x, "CLIPBOARD")
+    (*x).a_targets = atom_str(x, "TARGETS")
+    (*x).a_utf8 = atom_str(x, "UTF8_STRING")
+    (*x).a_text = atom_str(x, "TEXT")
+    (*x).a_plain = atom_str(x, "text/plain;charset=utf-8")
+    (*x).a_firn = atom_str(x, "FIRN_CLIPBOARD")
+    (*x).a_incr = atom_str(x, "INCR")
+}
+
+fn atom_str(x: *mut Platte, s: str) -> u32 {
+    return atom_von(x, s.p as u64, s.n)
 }
 
 fn atom_von(x: *mut Platte, p: u64, n: usize) -> u32 {
@@ -2103,6 +2161,20 @@ fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
         // `want` kann den Puffer eben verlegt haben -- die Stelle wird
         // darum NEU bestimmt und nicht aus `p` von oben genommen.
         // Antworten (1) und Fehler (0) sind keine Ereignisse.
+        if code == 30 as u8 { // SelectionRequest: somebody wants our clipboard
+            let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
+            var ev: [u8; 32] = [0 as u8; 32]
+            rt.mem_copy((&ev[0]) as u64, q, 32)
+            answer_selection(x, (&ev[0]) as u64)
+            continue
+        }
+        if code == 29 as u8 { // SelectionClear: another program owns it now
+            let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
+            if ld32le(q, 12) == (*x).a_clipboard {
+                clip_drop(x)
+            }
+            continue
+        }
         if code != 1 as u8 && code != 0 as u8 {
             let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
             if decode_event(q, (*x).a_delete, &(*x).km, (*x).voll, k, a,
@@ -2384,4 +2456,429 @@ fn r_gpu_place(x: *mut Platte, out: u64) {
 
 fn r_gpu_lost(x: *mut Platte) -> bool {
     return false
+}
+
+// ======================================================================
+// OpenPlan LIB-006 -- THE CLIPBOARD
+// ======================================================================
+//
+// X11 has no clipboard storage: the program that "copies" becomes the
+// OWNER of the CLIPBOARD selection and answers every program that asks
+// (SelectionRequest) by writing the data into a property of the asking
+// window and telling it (SelectionNotify). Asking is the reverse:
+// ConvertSelection with the wanted type, wait for SelectionNotify, read
+// the property (ICCCM 2.4-2.6).
+//
+// What this backend offers: any number of MIME types up to eight per
+// copy; text is offered as UTF8_STRING, STRING, TEXT and
+// text/plain;charset=utf-8, and TARGETS lists them all. Limits, said here
+// rather than found out: data larger than one request (about 256 KiB)
+// is refused in both directions -- the incremental transfer (INCR) is not
+// implemented; and asking waits at most one second for the owner.
+
+fn is_text_mime(m: str) -> bool {
+    return m == "text/plain;charset=utf-8" || m == "text/plain" || m == "UTF8_STRING" || m == "text/plain;charset=UTF-8"
+}
+
+fn clip_drop(x: *mut Platte) {
+    var i: usize = 0
+    while i < 8 {
+        rt.buf_free(&(*x).clip_data[i])
+        (*x).clip_atom[i] = 0
+        (*x).clip_mime[i] = ""
+        i = i + 1
+    }
+    (*x).clip_n = 0
+    (*x).clip_own = false
+}
+
+// removes the record at `at` (`size` octets) from the receive buffer --
+// the events in front of and behind it stay in order
+fn compact(x: *mut Platte, at: usize, size: usize) {
+    let tail: usize = (*x).rb.len - at - size
+    var i: usize = 0
+    while i < tail {
+        rt.st8((*x).rb.ptr, at + i, rt.ld8((*x).rb.ptr, at + size + i))
+        i = i + 1
+    }
+    rt.buf_set_len(&(*x).rb, (*x).rb.len - size)
+    if (*x).spos > at {
+        if (*x).spos >= at + size {
+            (*x).spos = (*x).spos - size
+        } else {
+            (*x).spos = at
+        }
+    }
+}
+
+// Waits up to `ms` for a record: a reply (or error) to request `seq`
+// (kind 1), or a SelectionNotify for our window (kind 2). It is copied to
+// `out` and taken out of the buffer; everything else stays where it is.
+fn wait_record(x: *mut Platte, kind: u32, seq: u32, ms: i64, out: *mut rt.Buf) -> bool {
+    let t0: u64 = jetzt_us()
+    var rel: usize = 0 // scan position relative to rpos
+    while true {
+        let at: usize = (*x).rpos + rel
+        var have_record: bool = (*x).rb.len >= at + 32
+        var size: usize = 32
+        if have_record {
+            let p: u64 = (*x).rb.ptr + at as u64
+            let code: u8 = rt.ld8(p, 0) & 127 as u8
+            if code == 1 as u8 {
+                size = 32 + ld32le(p, 4) as usize * 4
+                have_record = (*x).rb.len >= at + size
+            }
+            if have_record {
+                var hit: bool = false
+                if kind == 1 && (code == 1 as u8 || code == 0 as u8) && ld16le(p, 2) == seq {
+                    hit = true
+                }
+                if kind == 2 && code == 31 as u8 && ld32le(p, 8) == (*x).win && ld32le(p, 12) == (*x).a_clipboard {
+                    hit = true
+                }
+                if hit {
+                    rt.buf_clear(out)
+                    rt.buf_push_bytes(out, p, size)
+                    compact(x, at, size)
+                    return rt.ld8(rt.buf_ptr(out), 0) != 0 as u8
+                }
+                rel = rel + size
+                continue
+            }
+        }
+        // more octets needed
+        let spent: i64 = ((jetzt_us() - t0) / 1000) as i64
+        if spent >= ms || !(*x).open {
+            return false
+        }
+        let fd: i32 = net.conn_fd(&(*x).c)
+        var pfd: [i32; 2] = [0; 2]
+        pfd[0] = fd
+        pfd[1] = 1
+        let r: i64 = syscall(7, (&pfd[0]) as i64, 1, ms - spent, 0, 0, 0)
+        if r > 0 {
+            let keep: usize = (*x).rpos
+            if !lese_nach(x) {
+                return false
+            }
+            if (*x).rpos != keep {
+                rel = 0 // the buffer started over (it was empty)
+            }
+        }
+    }
+    return false
+}
+
+// InternAtom while the window lives: the reply is found among the events
+fn intern_live(x: *mut Platte, s: str) -> u32 {
+    var r: rt.Buf = rt.buf_new()
+    req_intern_atom(&r, s.p as u64, s.n)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !ok {
+        return 0 as u32
+    }
+    var rep: rt.Buf = rt.buf_new()
+    var atom: u32 = 0
+    if wait_record(x, 1 as u32, (*x).seq, 2000, &rep) {
+        atom = ld32le(rt.buf_ptr(&rep), 8)
+    }
+    rt.buf_free(&rep)
+    return atom
+}
+
+fn mime_atom(x: *mut Platte, mime: str) -> u32 {
+    if is_text_mime(mime) {
+        return (*x).a_utf8
+    }
+    return intern_live(x, mime)
+}
+
+fn send_request(x: *mut Platte, r: *mut rt.Buf) -> bool {
+    let ok: bool = send(x, (*r).ptr, (*r).len)
+    rt.buf_free(r)
+    return ok
+}
+
+// SetSelectionOwner(22)
+fn set_owner(x: *mut Platte, owner: u32) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 22 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 4 as u32)
+    put32(&r, owner)
+    put32(&r, (*x).a_clipboard)
+    put32(&r, 0 as u32) // CurrentTime
+    return send_request(x, &r)
+}
+
+// Offers `n` octets as `mime` on the clipboard (adding to what this
+// program offers already, or replacing that type).
+fn r_clip_set(x: *mut Platte, mime: str, p: u64, n: usize) -> bool {
+    if !(*x).open || (*x).win == 0 || n > 262000 {
+        return false
+    }
+    let atom: u32 = mime_atom(x, mime)
+    if atom == 0 {
+        return false
+    }
+    if !(*x).clip_own {
+        clip_drop(x)
+    }
+    var slot: u32 = (*x).clip_n
+    var i: u32 = 0
+    while i < (*x).clip_n {
+        if (*x).clip_atom[i as usize] == atom {
+            slot = i
+        }
+        i = i + 1
+    }
+    if slot >= 8 {
+        return false
+    }
+    rt.buf_clear(&(*x).clip_data[slot as usize])
+    rt.buf_push_bytes(&(*x).clip_data[slot as usize], p, n)
+    (*x).clip_atom[slot as usize] = atom
+    (*x).clip_mime[slot as usize] = __str_copy(mime)
+    if slot == (*x).clip_n {
+        (*x).clip_n = (*x).clip_n + 1
+    }
+    (*x).clip_own = true
+    return set_owner(x, (*x).win)
+}
+
+// Gives the clipboard up.
+fn r_clip_clear(x: *mut Platte) {
+    if (*x).clip_own && (*x).open {
+        set_owner(x, 0 as u32)
+    }
+    clip_drop(x)
+}
+
+// ConvertSelection(24) into our property, wait for the owner's answer,
+// then GetProperty(20) with delete. The value (without the reply head)
+// into `out`; `typ` its type.
+fn fetch_selection(x: *mut Platte, target: u32, out: *mut rt.Buf, typ: *mut u32) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 24 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 6 as u32)
+    put32(&r, (*x).win)
+    put32(&r, (*x).a_clipboard)
+    put32(&r, target)
+    put32(&r, (*x).a_firn)
+    put32(&r, 0 as u32)
+    if !send_request(x, &r) {
+        return false
+    }
+    var ev: rt.Buf = rt.buf_new()
+    let got: bool = wait_record(x, 2 as u32, 0 as u32, 1000, &ev)
+    let prop: u32 = ld32le(rt.buf_ptr(&ev), 20)
+    rt.buf_free(&ev)
+    if !got || prop == 0 {
+        return false // no owner, or it cannot give that type
+    }
+    var g: rt.Buf = rt.buf_new()
+    rt.buf_push(&g, 20 as u8)
+    rt.buf_push(&g, 1 as u8) // delete: the ICCCM asks the requestor to
+    put16(&g, 6 as u32)
+    put32(&g, (*x).win)
+    put32(&g, prop)
+    put32(&g, 0 as u32) // AnyPropertyType
+    put32(&g, 0 as u32)
+    put32(&g, 16777216 as u32) // up to 64 MiB
+    if !send_request(x, &g) {
+        return false
+    }
+    var rep: rt.Buf = rt.buf_new()
+    if !wait_record(x, 1 as u32, (*x).seq, 2000, &rep) {
+        rt.buf_free(&rep)
+        return false
+    }
+    let rp: u64 = rt.buf_ptr(&rep)
+    let format: u32 = rt.ld8(rp, 1) as u32
+    *typ = ld32le(rp, 8)
+    var count: usize = ld32le(rp, 16) as usize
+    if format == 16 { count = count * 2 }
+    if format == 32 { count = count * 4 }
+    if *typ == (*x).a_incr || 32 + count > rt.buf_len(&rep) {
+        rt.buf_free(&rep)
+        return false // INCR: not implemented (see the head of this part)
+    }
+    rt.buf_push_bytes(out, rp + 32, count)
+    rt.buf_free(&rep)
+    return true
+}
+
+// The clipboard's content as `mime`, appended to `out`.
+fn r_clip_get(x: *mut Platte, mime: str, out: *mut rt.Buf) -> bool {
+    if !(*x).open || (*x).win == 0 {
+        return false
+    }
+    let atom: u32 = mime_atom(x, mime)
+    if atom == 0 {
+        return false
+    }
+    if (*x).clip_own {
+        var i: u32 = 0
+        while i < (*x).clip_n {
+            if (*x).clip_atom[i as usize] == atom {
+                rt.buf_push_bytes(out, rt.buf_ptr(&(*x).clip_data[i as usize]), rt.buf_len(&(*x).clip_data[i as usize]))
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    var typ: u32 = 0
+    let before: usize = rt.buf_len(out)
+    if fetch_selection(x, atom, out, &typ) {
+        return true
+    }
+    rt.buf_set_len(out, before)
+    if atom == (*x).a_utf8 {
+        // an old owner that only knows STRING (Latin-1): take it as it is
+        var typ2: u32 = 0
+        return fetch_selection(x, 31 as u32, out, &typ2)
+    }
+    return false
+}
+
+// GetAtomName(17)
+fn atom_name(x: *mut Platte, atom: u32, out: *mut rt.Buf) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 17 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 2 as u32)
+    put32(&r, atom)
+    if !send_request(x, &r) {
+        return false
+    }
+    var rep: rt.Buf = rt.buf_new()
+    if !wait_record(x, 1 as u32, (*x).seq, 2000, &rep) {
+        rt.buf_free(&rep)
+        return false
+    }
+    let n: usize = ld16le(rt.buf_ptr(&rep), 8) as usize
+    rt.buf_push_bytes(out, rt.buf_ptr(&rep) + 32, n)
+    rt.buf_free(&rep)
+    return true
+}
+
+// The types the clipboard offers, one per line, into `out`; the answer is
+// how many.
+fn r_clip_types(x: *mut Platte, out: *mut rt.Buf) -> usize {
+    if !(*x).open || (*x).win == 0 {
+        return 0
+    }
+    if (*x).clip_own {
+        var i: u32 = 0
+        while i < (*x).clip_n {
+            let m: str = (*x).clip_mime[i as usize]
+            if i > 0 {
+                rt.buf_push(out, 10 as u8)
+            }
+            rt.buf_push_bytes(out, m.p as u64, m.n)
+            i = i + 1
+        }
+        return (*x).clip_n as usize
+    }
+    var atoms: rt.Buf = rt.buf_new()
+    var typ: u32 = 0
+    if !fetch_selection(x, (*x).a_targets, &atoms, &typ) {
+        rt.buf_free(&atoms)
+        return 0
+    }
+    var count: usize = 0
+    var i: usize = 0
+    while i + 4 <= rt.buf_len(&atoms) {
+        let a: u32 = ld32le(rt.buf_ptr(&atoms), i)
+        if a != (*x).a_targets && a != 0 {
+            if count > 0 {
+                rt.buf_push(out, 10 as u8)
+            }
+            if atom_name(x, a, out) {
+                count = count + 1
+            }
+        }
+        i = i + 4
+    }
+    rt.buf_free(&atoms)
+    return count
+}
+
+// ChangeProperty(18) on the requestor's window, then SendEvent(25) with a
+// SelectionNotify -- the owner's half (ICCCM 2.2).
+fn answer_selection(x: *mut Platte, ev: u64) {
+    let time: u32 = ld32le(ev, 4)
+    let requestor: u32 = ld32le(ev, 12)
+    let selection: u32 = ld32le(ev, 16)
+    let target: u32 = ld32le(ev, 20)
+    var prop: u32 = ld32le(ev, 24)
+    if prop == 0 {
+        prop = target // an obsolete client
+    }
+    var r: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    if selection == (*x).a_clipboard && (*x).clip_own {
+        if target == (*x).a_targets {
+            var list: rt.Buf = rt.buf_new()
+            put32(&list, (*x).a_targets)
+            var i: u32 = 0
+            while i < (*x).clip_n {
+                let a: u32 = (*x).clip_atom[i as usize]
+                put32(&list, a)
+                if a == (*x).a_utf8 {
+                    put32(&list, 31 as u32) // STRING
+                    put32(&list, (*x).a_text)
+                    put32(&list, (*x).a_plain)
+                }
+                i = i + 1
+            }
+            req_change_property(&r, requestor, prop, 4 as u32, 32 as u32, rt.buf_ptr(&list), rt.buf_len(&list))
+            rt.buf_free(&list)
+            ok = true
+        } else {
+            var want: u32 = target
+            var typ: u32 = target
+            if target == 31 || target == (*x).a_text || target == (*x).a_plain {
+                want = (*x).a_utf8 // the text slot answers for all its names
+                if target == (*x).a_text {
+                    typ = (*x).a_utf8
+                }
+            }
+            var i: u32 = 0
+            while i < (*x).clip_n && !ok {
+                if (*x).clip_atom[i as usize] == want {
+                    let d: *mut rt.Buf = &(*x).clip_data[i as usize]
+                    req_change_property(&r, requestor, prop, typ, 8 as u32, rt.buf_ptr(d), rt.buf_len(d))
+                    ok = true
+                }
+                i = i + 1
+            }
+        }
+    }
+    if !ok {
+        prop = 0 // refused
+    }
+    // SendEvent: propagate no, destination the requestor, no mask
+    rt.buf_push(&r, 25 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 11 as u32)
+    put32(&r, requestor)
+    put32(&r, 0 as u32)
+    rt.buf_push(&r, 31 as u8) // SelectionNotify
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 0 as u32)
+    put32(&r, time)
+    put32(&r, requestor)
+    put32(&r, selection)
+    put32(&r, target)
+    put32(&r, prop)
+    var k: u32 = 0
+    while k < 8 {
+        rt.buf_push(&r, 0 as u8)
+        k = k + 1
+    }
+    send_request(x, &r)
 }
