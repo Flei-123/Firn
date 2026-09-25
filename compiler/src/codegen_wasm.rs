@@ -17,7 +17,7 @@
 //! | `i8 i16 i32 u8 u16 u32 bool` | `i32` | ALWAYS normalised: sign extended for the signed types, zero extended for the others, `bool` is 0 or 1 |
 //! | `i64 u64 ptr` | `i64` | the full 64 bits |
 //! | `f32` / `f64` | `f32` / `f64` | the IEEE value |
-//! | `v128` | — | refused: SIMD is not part of this round |
+//! | `v128` | `v128` | the sixteen octets (round OPT-GENERAL; `FIRN_WASM_NO_SIMD=1` refuses it as before) |
 //!
 //! A pointer stays SIXTY-FOUR bits wide, in a register and in memory. That
 //! is deliberate: every struct layout, every `size_of`, every offset the
@@ -107,9 +107,15 @@
 //!
 //! ## What this generator does NOT do (stated, not hidden)
 //!
-//!   * SIMD (`v128`, the 42 intrinsics) and threads (`__thread_start`) —
-//!     refused at compile time with the function that uses them.
-//!     `__cpu_features()` answers 0: none of the x86/ARM extensions exists.
+//!   * threads (`__thread_start`) -- refused at compile time with the
+//!     function that uses them.
+//!   * the CRYPTO intrinsics (AES, SHA-256, carry-less multiply, crc32):
+//!     WebAssembly has no such instructions. `__cpu_features()` answers
+//!     SSE2 | SSE4.1 | SSSE3 -- the families this backend translates to
+//!     WebAssembly SIMD (round OPT-GENERAL) -- and never AES/SHA/PCLMUL/
+//!     SSE4.2, so a program that asks first (the house rule of round 82)
+//!     takes its scalar path; one that does not traps with `unreachable`,
+//!     as an x86 without the extension raises SIGILL.
 //!   * inline assembler, `#[interrupt]`, the `kernel` profile — x86 texts
 //!     and bare metal by nature.
 //!   * files, sockets, processes, signals — refused at compile time, by
@@ -167,6 +173,42 @@ const G_SP: u32 = 0;
 const G_HEAP_TOP: u32 = 1;
 const G_FREE: u32 = 2;
 
+/// Round OPT-GENERAL: is WebAssembly SIMD switched on? (`FIRN_WASM_NO_SIMD=1`
+/// restores the refusal of every `v128`, for an engine without SIMD.)
+fn simd_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FIRN_WASM_NO_SIMD").is_none())
+}
+
+/// What `__cpu_features()` answers here: SSE2 | SSE4.1 | SSSE3 (bits 0, 1
+/// and 8 of `lib/std/cpu.fi`) -- the families translated to WebAssembly
+/// SIMD. Without SIMD: nothing.
+fn cpu_features_wasm() -> i64 {
+    if simd_on() {
+        1 | 2 | 256
+    } else {
+        0
+    }
+}
+
+/// Is this intrinsic translated to WebAssembly (`Fx::simd`)? A kind added to
+/// `simd.rs` later is refused at compile time, with its name, until it is.
+fn wasm_simd_kind(k: crate::simd::SimdKind) -> bool {
+    use crate::simd::SimdKind as K;
+    matches!(
+        k,
+        K::Load | K::Store | K::Zero | K::FromU64 | K::GetU64 | K::GetU32 | K::SetU32
+            | K::Xor | K::And | K::Or | K::AndNot | K::Add8 | K::Add32 | K::Add64 | K::Sub32
+            | K::ShuffleB | K::Shuffle32 | K::AlignR | K::UnpackLo32 | K::UnpackHi32
+            | K::UnpackLo64 | K::UnpackHi64 | K::ShlBytes | K::ShrBytes | K::Shl32 | K::Shr32
+            | K::Shl64 | K::Shr64 | K::Blend16 | K::AesEnc | K::AesEncLast | K::AesDec
+            | K::AesDecLast | K::AesImc | K::AesKeyGenAssist | K::Sha256Rnds2 | K::Sha256Msg1
+            | K::Sha256Msg2 | K::Pclmul | K::Crc32U8 | K::Crc32U64 | K::CpuFeatures
+            | K::Store64 | K::AddF32 | K::SubF32 | K::MulF32 | K::TruncF32I32 | K::CvtI32F32
+            | K::CmpLtF32 | K::CmpLeF32 | K::CmpNltF32 | K::CmpGt32
+    )
+}
+
 /// The class of a FIR type.
 fn class(t: FTy) -> Option<VT> {
     match t {
@@ -174,7 +216,14 @@ fn class(t: FTy) -> Option<VT> {
         FTy::I64 | FTy::U64 | FTy::Ptr => Some(VT::I64),
         FTy::F32 => Some(VT::F32),
         FTy::F64 => Some(VT::F64),
-        FTy::V128 | FTy::Void => None,
+        FTy::V128 => {
+            if simd_on() {
+                Some(VT::V128)
+            } else {
+                None
+            }
+        }
+        FTy::Void => None,
     }
 }
 
@@ -491,7 +540,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                 refusals.push(Refusal { func: name.clone(), what: format!("a parameter of type '{}' (SIMD is not supported on wasm32 yet)", p.name()) });
             }
         }
-        if f.ret == FTy::V128 {
+        if f.ret == FTy::V128 && !simd_on() {
             refusals.push(Refusal { func: name.clone(), what: "a result of type 'v128' (SIMD is not supported on wasm32 yet)".into() });
         }
         let consts = single_consts(f);
@@ -574,7 +623,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                         }
                     }
                     Op::Simd { kind, .. } => {
-                        if *kind != crate::simd::SimdKind::CpuFeatures {
+                        if *kind != crate::simd::SimdKind::CpuFeatures && (!simd_on() || !wasm_simd_kind(*kind)) {
                             refusals.push(Refusal { func: name.clone(), what: format!("the SIMD instruction '{:?}' (SIMD is not supported on wasm32 yet)", kind) });
                         }
                     }
@@ -595,7 +644,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                     _ => {}
                 }
                 if let Some(d) = i.dst {
-                    if f.val_ty(d) == FTy::V128 && !matches!(i.op, Op::Simd { .. }) {
+                    if f.val_ty(d) == FTy::V128 && !matches!(i.op, Op::Simd { .. }) && !simd_on() {
                         refusals.push(Refusal { func: name.clone(), what: "a 'v128' value (SIMD is not supported on wasm32 yet)".into() });
                     }
                 }
@@ -880,6 +929,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                     params: f.params.iter().filter_map(|p| class(*p)).collect(),
                     results: class(f.ret).into_iter().collect(),
                 };
+                let param_vts = sig.params.clone();
                 let ty = g.type_index(sig);
                 if OVERRIDES.contains(&f.name.as_str()) {
                     let body = match class(f.ret) {
@@ -894,7 +944,11 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                     dispatch += 1;
                 }
                 fx.translate()?;
-                out.push(w::Func { ty, locals: fx.locals, body: fx.out, sym });
+                let mut body = std::mem::take(&mut fx.out);
+                crate::wasm_locals::branches(&mut body);
+                let locals = crate::wasm_locals::pack(&param_vts, std::mem::take(&mut fx.locals), &mut body);
+                crate::wasm_locals::copies(&mut body);
+                out.push(w::Func { ty, locals, body, sym });
             }
             Ok((out, dispatch))
         });
@@ -997,6 +1051,292 @@ fn single_consts(f: &Func) -> HashMap<Val, i128> {
     out
 }
 
+/// Round OPT-GENERAL -- which values become expression trees.
+///
+/// A value used exactly once, in the same block, by an instruction whose
+/// translation reads each operand once, is computed right at that use: its
+/// instruction is emitted where the use reads it, and the result stays on
+/// the operand stack. That removes a `local.set` and a `local.get` per value
+/// and, more important for a one-pass engine, the local itself.
+///
+/// What may move: pure computations that cannot trap, and loads. A pure
+/// computation may move past anything except what writes a local (a phi
+/// copy) or calls (a call may run the collector, and a pointer the tree
+/// still has to read must be in the shadow frame then). A load may only move
+/// past other pure computations and loads.
+///
+/// Constants and data addresses defined once are simply computed again at
+/// every use.
+fn plan_trees(f: &Func, cfg: &Cfg) -> (HashMap<Val, (u32, usize)>, HashMap<Val, (u32, usize)>) {
+    let mut inline: HashMap<Val, (u32, usize)> = HashMap::new();
+    let mut remat: HashMap<Val, (u32, usize)> = HashMap::new();
+    if std::env::var_os("FIRN_WASM_NO_TREES").is_some() {
+        return (inline, remat);
+    }
+    let n = f.val_types.len();
+    let mut ndef = vec![0u32; n];
+    let mut nuse = vec![0u32; n];
+    let mut use_at = vec![(u32::MAX, usize::MAX); n];
+    let mut ops: Vec<Val> = Vec::new();
+    for &b in &cfg.order {
+        let blk = &f.blocks[b as usize];
+        for (k, i) in blk.insts.iter().enumerate() {
+            if let Some(d) = i.dst {
+                if (d as usize) < n {
+                    ndef[d as usize] += 1;
+                }
+            }
+            ops.clear();
+            i.op.uses(&mut ops);
+            for &v in &ops {
+                if (v as usize) < n {
+                    nuse[v as usize] += 1;
+                    use_at[v as usize] = (b, k);
+                }
+            }
+        }
+        let tv = match &blk.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Ret(Some(v)) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = tv {
+            if (v as usize) < n {
+                nuse[v as usize] += 1;
+                use_at[v as usize] = (b, blk.insts.len());
+            }
+        }
+    }
+    for &b in &cfg.order {
+        for (k, i) in f.blocks[b as usize].insts.iter().enumerate() {
+            if let Some(d) = i.dst {
+                if (d as usize) < n
+                    && std::env::var_os("FIRN_WASM_NO_REMAT").is_none()
+                    && ndef[d as usize] == 1
+                    && class(i.ty).is_some()
+                    && !f.is_secret(d)
+                    && matches!(i.op, Op::Const(_) | Op::GlobalAddr { .. } | Op::FnRef { .. } | Op::VtabAddr { .. })
+                {
+                    remat.insert(d, (b, k));
+                }
+            }
+        }
+    }
+    for &b in &cfg.order {
+        let blk = &f.blocks[b as usize];
+        let nb = blk.insts.len();
+        let mut fpos: HashMap<usize, usize> = HashMap::new();
+        for k in (0..nb).rev() {
+            let i = &blk.insts[k];
+            let d = match i.dst {
+                Some(d) => d,
+                None => continue,
+            };
+            let du = d as usize;
+            if du >= n || remat.contains_key(&d) || ndef[du] != 1 || nuse[du] != 1 || f.is_secret(d) {
+                continue;
+            }
+            let load = match &i.op {
+                Op::Load { .. } if std::env::var_os("FIRN_WASM_TREE_NOLOAD").is_none() => true,
+                op if tree_op(op, i.ty) => false,
+                _ => continue,
+            };
+            let (ub, up) = use_at[du];
+            if ub != b || up <= k || up == usize::MAX {
+                continue;
+            }
+            let consumer = if up == nb {
+                matches!(blk.term, Term::BrCond { .. } | Term::Ret(_) | Term::Switch { .. })
+            } else {
+                tree_consumer(&blk.insts[up].op)
+            };
+            if !consumer {
+                continue;
+            }
+            let end = *fpos.get(&up).unwrap_or(&up);
+            let mut blocked = false;
+            let mut reads: Vec<Val> = Vec::new();
+            i.op.uses(&mut reads);
+            for j in (k + 1)..end.min(nb) {
+                if fpos.contains_key(&j) {
+                    continue;
+                }
+                let bj = &blk.insts[j];
+                // Anything that writes a value the tree reads blocks it
+                // (its own operands; deeper operands are checked by their
+                // own trees over the same stretch). After phi elimination
+                // that is not only a copy: `phi.rs` coalesces, so an
+                // ordinary instruction may write the local of a phi whose
+                // last use in FIR order came before it -- mandel.fi: the
+                // new `zi` is computed straight into the phi of `zi` while
+                // `zr*zr - zi*zi` still has to read the old one.
+                if let Some(dd) = bj.dst {
+                    if reads.contains(&dd) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if let Op::Copy { .. } = &bj.op {
+                    continue;
+                }
+                if tree_barrier(bj, load) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                continue;
+            }
+            if std::env::var_os("FIRN_WASM_TREE_TRACE").is_some() {
+                eprintln!("tree: @{} bb{} %{} (#{}) -> #{} end #{}", f.name, b, d, k, up, end);
+            }
+            fpos.insert(k, end);
+            inline.insert(d, (b, k));
+        }
+    }
+    (inline, remat)
+}
+
+/// Round OPT-GENERAL -- the 64-bit values of which only the low 32 bits are
+/// ever needed. Pointers stay 64 bits wide in memory and at every call (see
+/// the module comment), but an address that is only computed to be used --
+/// `base + i * 4`, cut to 32 bits by the load -- can be computed in 32 bits
+/// from the start: the low 32 bits of a sum, difference, product, bit
+/// operation or constant left shift depend only on the low 32 bits of the
+/// operands. Greatest fixed point: start with every candidate and remove
+/// each value one of whose uses needs more.
+fn plan_low32(f: &Func, cfg: &Cfg) -> Vec<bool> {
+    let n = f.val_types.len();
+    let mut low = vec![false; n];
+    if std::env::var_os("FIRN_WASM_NO_LOW32").is_some() {
+        return low;
+    }
+    let np = f.params.len();
+    let consts = single_consts(f);
+    for b in &cfg.order {
+        for i in &f.blocks[*b as usize].insts {
+            if let Some(d) = i.dst {
+                let du = d as usize;
+                if du >= np && du < n && class(f.val_types[du]) == Some(VT::I64) && !f.is_secret(d) {
+                    low[du] = true;
+                }
+            }
+        }
+    }
+    let mut ops: Vec<Val> = Vec::new();
+    loop {
+        let mut changed = false;
+        for b in &cfg.order {
+            let blk = &f.blocks[*b as usize];
+            for i in &blk.insts {
+                ops.clear();
+                i.op.uses(&mut ops);
+                let dlow = i.dst.map(|d| (d as usize) < n && low[d as usize]).unwrap_or(false);
+                for &u in &ops {
+                    let uu = u as usize;
+                    if uu >= n || !low[uu] {
+                        continue;
+                    }
+                    let ok = match &i.op {
+                        Op::Load { .. } | Op::MmioLoad { .. } | Op::CopyMem { .. } => true,
+                        Op::Store { addr, val } | Op::MmioStore { addr, val } => *addr == u && *val != u,
+                        Op::AtomicAdd { addr, val } => *addr == u && *val != u,
+                        Op::AtomicCas { addr, erw, new } => *addr == u && *erw != u && *new != u,
+                        Op::SecureZero { .. } => true,
+                        Op::CallIndirect { target, args } => *target == u && !args.contains(&u),
+                        Op::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor, _, _) => dlow,
+                        Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Add | BinOp::Sub | BinOp::Mul, .. } => dlow,
+                        Op::Bin(BinOp::Shl, a, c) => {
+                            dlow && *a == u && *c != u && consts.get(c).map(|k| (0..32).contains(k)).unwrap_or(false)
+                        }
+                        Op::PtrAdd { .. } => dlow,
+                        Op::Copy { .. } => dlow,
+                        Op::Cast { .. } => {
+                            let to = i.ty;
+                            if to.is_float() || to == FTy::Bool {
+                                false
+                            } else if class(to) == Some(VT::I32) {
+                                true
+                            } else {
+                                dlow
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        low[uu] = false;
+                        changed = true;
+                    }
+                }
+            }
+            let tv = match &blk.term {
+                Term::BrCond { cond, .. } => Some(*cond),
+                Term::Switch { val, .. } => Some(*val),
+                Term::Ret(Some(v)) => Some(*v),
+                _ => None,
+            };
+            if let Some(v) = tv {
+                if (v as usize) < n && low[v as usize] {
+                    low[v as usize] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    low
+}
+
+/// A pure computation that cannot trap and reads each operand once.
+fn tree_op(op: &Op, ty: FTy) -> bool {
+    if class(ty).is_none() {
+        return false;
+    }
+    match op {
+        Op::Bin(o, _, _) => !matches!(o, BinOp::Div | BinOp::Rem),
+        Op::BinWrapSat { kind: WrapSatKind::Wrap, op: o, .. } => !matches!(o, BinOp::Div | BinOp::Rem),
+        Op::Cmp { .. } | Op::Un(..) | Op::Cast { .. } | Op::PtrAdd { .. } | Op::Alloca { .. } => true,
+        _ => false,
+    }
+}
+
+/// An instruction whose translation reads each operand exactly once.
+fn tree_consumer(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Load { .. }
+            | Op::Store { .. }
+            | Op::Bin(..)
+            | Op::Cmp { .. }
+            | Op::Un(..)
+            | Op::Cast { .. }
+            | Op::PtrAdd { .. }
+            | Op::Copy { .. }
+            | Op::Call { .. }
+            | Op::Select { .. }
+    ) || matches!(op, Op::BinWrapSat { kind: WrapSatKind::Wrap, .. })
+}
+
+/// May a tree (a load if `load`) move past this instruction?
+fn tree_barrier(i: &Inst, load: bool) -> bool {
+    match &i.op {
+        Op::Copy { .. }
+        | Op::Call { .. }
+        | Op::CallIndirect { .. }
+        | Op::Syscall { .. }
+        | Op::Asm { .. }
+        | Op::ThreadSpawn { .. }
+        | Op::GcAddr { .. }
+        | Op::Barrier { .. } => true,
+        _ if !load => false,
+        Op::Load { .. } | Op::Const(_) | Op::GlobalAddr { .. } | Op::FnRef { .. } | Op::VtabAddr { .. } => false,
+        op => !tree_op(op, i.ty),
+    }
+}
+
 fn reachable_blocks(f: &Func) -> Vec<bool> {
     let n = f.blocks.len();
     let mut r = vec![false; n];
@@ -1050,6 +1390,20 @@ struct Fx<'a> {
     /// dispatch fallback: the block number local and the block positions
     dispatch_local: u32,
     dispatch_pos: HashMap<BlockId, u32>,
+    /// Round OPT-GENERAL: values computed right where their one use is
+    /// (an expression tree on the operand stack instead of a local),
+    /// by (block, instruction index) of the definition
+    inline_def: HashMap<Val, (u32, usize)>,
+    /// constants and data addresses: computed again at every use, never
+    /// kept in a local
+    remat: HashMap<Val, (u32, usize)>,
+    /// the values whose definition is being emitted inline right now
+    emitting: Vec<Val>,
+    /// an error raised inside `get` (which cannot return one)
+    err: Option<String>,
+    /// Round OPT-GENERAL: 64-bit values of which every use needs only the
+    /// low 32 bits (addresses, mostly) -- kept and computed as `i32`
+    low32: Vec<bool>,
 }
 
 impl<'a> Fx<'a> {
@@ -1086,10 +1440,23 @@ impl<'a> Fx<'a> {
                 _ => {}
             }
         }
+        let (inline_def, remat) = plan_trees(f, &cfg);
+        let low32 = plan_low32(f, &cfg);
+        let cls = |v: usize| -> Option<VT> {
+            if low32[v] {
+                Some(VT::I32)
+            } else {
+                class(f.val_types[v])
+            }
+        };
         let mut locals: Vec<VT> = Vec::new();
-        for want in [VT::I32, VT::I64, VT::F32, VT::F64] {
+        for want in [VT::I32, VT::I64, VT::F32, VT::F64, VT::V128] {
             for v in nparams as usize..n {
-                if used[v] && class(f.val_types[v]) == Some(want) {
+                let vv = v as Val;
+                if inline_def.contains_key(&vv) || remat.contains_key(&vv) {
+                    continue;
+                }
+                if used[v] && cls(v) == Some(want) {
                     loc[v] = nparams + locals.len() as u32;
                     locals.push(want);
                 }
@@ -1114,6 +1481,11 @@ impl<'a> Fx<'a> {
             free_tmp: Vec::new(),
             dispatch_local: u32::MAX,
             dispatch_pos: HashMap::new(),
+            inline_def,
+            remat,
+            emitting: Vec::new(),
+            err: None,
+            low32,
         };
         fx.plan_frame();
         Ok(fx)
@@ -1313,7 +1685,15 @@ impl<'a> Fx<'a> {
     }
 
     fn vt_of(&self, v: Val) -> Option<VT> {
+        if self.low32.get(v as usize).copied().unwrap_or(false) {
+            return Some(VT::I32);
+        }
         class(self.f.val_ty(v))
+    }
+
+    /// Is the result of this instruction kept as a 32-bit value?
+    fn dst_low(&self, i: &Inst) -> bool {
+        i.dst.map(|d| self.low32.get(d as usize).copied().unwrap_or(false)).unwrap_or(false)
     }
 
     /// Converts the value on the stack from `have` to `want`. Between the
@@ -1385,6 +1765,49 @@ impl<'a> Fx<'a> {
 
     /// Pushes a value, converted to `want`.
     fn get(&mut self, v: Val, want: VT) {
+        if self.remat.contains_key(&v) {
+            if let Some(&c) = self.consts.get(&v) {
+                let t = self.f.val_ty(v);
+                if !t.is_float() && matches!(class(t), Some(VT::I32) | Some(VT::I64)) {
+                    // the constant as the class wants it: the low bits for
+                    // i32, extended by the signedness of its type for i64
+                    // (exactly what `coerce` would do to the pushed value)
+                    let tc = t.truncate(c);
+                    match want {
+                        VT::I32 => {
+                            self.ins(Ins::I32Const(tc as i64 as i32));
+                            return;
+                        }
+                        VT::I64 => {
+                            let x: i64 = if class(t) == Some(VT::I32) && !t.signed() {
+                                (tc as i64) & 0xFFFF_FFFF
+                            } else {
+                                tc as i64
+                            };
+                            self.ins(Ins::I64Const(x));
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(&(b, k)) = self.inline_def.get(&v).or_else(|| self.remat.get(&v)) {
+            let f = self.f;
+            let inst = &f.blocks[b as usize].insts[k];
+            self.emitting.push(v);
+            if let Err(e) = self.inst(inst) {
+                if self.err.is_none() {
+                    self.err = Some(e);
+                }
+            }
+            self.emitting.pop();
+            if let Some(have) = self.vt_of(v) {
+                let signed = self.f.val_ty(v).signed();
+                self.coerce(have, want, signed);
+            }
+            return;
+        }
         let l = self.loc.get(v as usize).copied().unwrap_or(u32::MAX);
         match self.vt_of(v) {
             Some(have) if l != u32::MAX => {
@@ -1404,6 +1827,7 @@ impl<'a> Fx<'a> {
             VT::I64 => self.ins(Ins::I64Const(0)),
             VT::F32 => self.ins(Ins::F32Const(0)),
             VT::F64 => self.ins(Ins::F64Const(0)),
+            VT::V128 => self.ins(Ins::V128Const([0; 16])),
         }
     }
 
@@ -1433,9 +1857,20 @@ impl<'a> Fx<'a> {
     /// Stores the value on the stack (class `have`, canonical for `t`) into
     /// the local of `d`.
     fn set(&mut self, d: Val, have: VT, t: FTy) {
-        let l = self.loc.get(d as usize).copied().unwrap_or(u32::MAX);
         let dt = self.f.val_ty(d);
-        match class(dt) {
+        if self.emitting.last() == Some(&d) {
+            // an expression tree: the value stays on the operand stack, in
+            // the class and canonical form a local of it would hold
+            if let Some(want) = self.vt_of(d) {
+                self.coerce(have, want, t.signed());
+                if want == VT::I32 && dt != t && narrow(dt) {
+                    self.normalize(dt);
+                }
+            }
+            return;
+        }
+        let l = self.loc.get(d as usize).copied().unwrap_or(u32::MAX);
+        match self.vt_of(d) {
             Some(want) if l != u32::MAX => {
                 self.coerce(have, want, t.signed());
                 if want == VT::I32 && dt != t && narrow(dt) {
@@ -1456,8 +1891,49 @@ impl<'a> Fx<'a> {
     }
 
     fn addr(&mut self, v: Val) {
-        self.get(v, VT::I64);
-        self.num(w::I32_WRAP_I64);
+        // `get` wraps an i64 value; a 32-bit value arrives as it is
+        self.get(v, VT::I32);
+    }
+
+    /// The address of a load or store: a constant, non-negative part of an
+    /// address that is computed only for this access goes into the offset
+    /// of the instruction. Yields the offset.
+    ///
+    /// WebAssembly adds the offset to the 32-bit address without wrapping
+    /// (an access past 4 GiB traps), where the i64 sum cut to 32 bits would
+    /// wrap. The two differ only for an address that lies outside the
+    /// linear memory either way.
+    fn mem_addr(&mut self, addr: Val) -> u32 {
+        let mut v = addr;
+        let mut off: i64 = 0;
+        let fold = std::env::var_os("FIRN_WASM_NO_OFFSET").is_none();
+        for _ in 0..(if fold { 16 } else { 0 }) {
+            let (b, k) = match self.inline_def.get(&v) {
+                Some(x) => *x,
+                None => break,
+            };
+            let inst = &self.f.blocks[b as usize].insts[k];
+            let (base, c) = match &inst.op {
+                Op::PtrAdd { base, off: o } => (*base, self.consts.get(o).copied()),
+                Op::Bin(BinOp::Add, a, c) if class(inst.ty) == Some(VT::I64) => {
+                    match (self.consts.get(c).copied(), self.consts.get(a).copied()) {
+                        (Some(k), _) => (*a, Some(k)),
+                        (None, Some(k)) => (*c, Some(k)),
+                        _ => break,
+                    }
+                }
+                _ => break,
+            };
+            match c {
+                Some(c) if c >= 0 && off as i128 + c <= i32::MAX as i128 => {
+                    off += c as i64;
+                    v = base;
+                }
+                _ => break,
+            }
+        }
+        self.addr(v);
+        off as u32
     }
 
     fn label_addr(&self, l: &str) -> Result<u32, String> {
@@ -1498,6 +1974,9 @@ impl<'a> Fx<'a> {
             self.do_tree(0)?;
         } else {
             self.dispatch()?;
+        }
+        if let Some(e) = self.err.take() {
+            return Err(e);
         }
         // Every path ended in a `return` or a branch; the end of the body is
         // never reached, but it has to type check.
@@ -1743,8 +2222,20 @@ impl<'a> Fx<'a> {
                 for v in vs {
                     let off = self.spill_off[&v];
                     self.ins(Ins::LocalGet(self.fp));
-                    self.get(v, VT::I64);
+                    if self.vt_of(v) == Some(VT::I32) {
+                        // an address kept in 32 bits: the collector wants
+                        // the 64-bit word, zero extended
+                        self.get(v, VT::I32);
+                        self.num(w::I64_EXTEND_I32_U);
+                    } else {
+                        self.get(v, VT::I64);
+                    }
                     self.ins(Ins::Store(w::I64_STORE, off));
+                }
+            }
+            if let Some(d) = i.dst {
+                if self.inline_def.contains_key(&d) || self.remat.contains_key(&d) {
+                    continue; // emitted where it is used
                 }
             }
             self.inst(i)?;
@@ -1768,6 +2259,7 @@ impl<'a> Fx<'a> {
                     VT::I64 => self.ins(Ins::I64Const(ty.truncate(*c) as i64)),
                     VT::F32 => self.ins(Ins::F32Const(*c as u32)),
                     VT::F64 => self.ins(Ins::F64Const(*c as u64)),
+                    VT::V128 => self.ins(Ins::V128Const(c.to_le_bytes())),
                 }
                 self.put(i, vt);
             }
@@ -1906,11 +2398,28 @@ impl<'a> Fx<'a> {
                     self.ins(Ins::I32Const(off as i32));
                     self.num(w::I32_ADD);
                 }
-                self.num(w::I64_EXTEND_I32_U);
-                self.put(i, VT::I64);
+                if self.dst_low(i) {
+                    self.put(i, VT::I32);
+                } else {
+                    self.num(w::I64_EXTEND_I32_U);
+                    self.put(i, VT::I64);
+                }
+            }
+            Op::Load { addr } if ty == FTy::V128 => {
+                let off = self.mem_addr(*addr);
+                self.ins(Ins::SimdMem(w::V128_LOAD, 4, off));
+                self.put(i, VT::V128);
+            }
+            Op::Store { addr, val } if ty == FTy::V128 => {
+                let off = self.mem_addr(*addr);
+                self.get(*val, VT::V128);
+                self.ins(Ins::SimdMem(w::V128_STORE, 4, off));
             }
             Op::Load { addr } | Op::MmioLoad { addr } => {
-                self.addr(*addr);
+                let off = if matches!(i.op, Op::Load { .. }) { self.mem_addr(*addr) } else {
+                    self.addr(*addr);
+                    0
+                };
                 let (m, vt) = match ty {
                     FTy::I8 => (w::I32_LOAD8_S, VT::I32),
                     FTy::U8 | FTy::Bool => (w::I32_LOAD8_U, VT::I32),
@@ -1922,11 +2431,14 @@ impl<'a> Fx<'a> {
                     FTy::F64 => (w::F64_LOAD, VT::F64),
                     _ => return Err(format!("internal error: a load of type {} in '{}'", ty.name(), f.name)),
                 };
-                self.ins(Ins::Load(m, 0));
+                self.ins(Ins::Load(m, off));
                 self.put(i, vt);
             }
             Op::Store { addr, val } | Op::MmioStore { addr, val } => {
-                self.addr(*addr);
+                let off = if matches!(i.op, Op::Store { .. }) { self.mem_addr(*addr) } else {
+                    self.addr(*addr);
+                    0
+                };
                 let (m, vt) = match ty {
                     FTy::I8 | FTy::U8 | FTy::Bool => (w::I32_STORE8, VT::I32),
                     FTy::I16 | FTy::U16 => (w::I32_STORE16, VT::I32),
@@ -1937,13 +2449,20 @@ impl<'a> Fx<'a> {
                     _ => return Err(format!("internal error: a store of type {} in '{}'", ty.name(), f.name)),
                 };
                 self.get(*val, vt);
-                self.ins(Ins::Store(m, 0));
+                self.ins(Ins::Store(m, off));
             }
             Op::PtrAdd { base, off } => {
-                self.get(*base, VT::I64);
-                self.get(*off, VT::I64);
-                self.num(w::I64_ADD);
-                self.put(i, VT::I64);
+                if self.dst_low(i) {
+                    self.get(*base, VT::I32);
+                    self.get(*off, VT::I32);
+                    self.num(w::I32_ADD);
+                    self.put(i, VT::I32);
+                } else {
+                    self.get(*base, VT::I64);
+                    self.get(*off, VT::I64);
+                    self.num(w::I64_ADD);
+                    self.put(i, VT::I64);
+                }
             }
             Op::Call { name, args } => self.call(i, name, args)?,
             Op::CallIndirect { target, args } => {
@@ -1992,7 +2511,11 @@ impl<'a> Fx<'a> {
                 self.get(*a, vt);
                 self.get(*b, vt);
                 self.get(*cond, VT::I32);
-                self.ins(Ins::Select);
+                if vt == VT::V128 {
+                    self.ins(Ins::SelectT(VT::V128));
+                } else {
+                    self.ins(Ins::Select);
+                }
                 self.put(i, vt);
             }
             Op::Copy { src } | Op::Barrier { val: src } => {
@@ -2089,12 +2612,14 @@ impl<'a> Fx<'a> {
                 self.put(i, class(ty).unwrap_or(VT::I64));
                 self.release(VT::I64, v);
             }
+            Op::Simd { kind, args, imm } if *kind != crate::simd::SimdKind::CpuFeatures && simd_on() => {
+                self.simd(i, *kind, args, *imm)?;
+            }
             Op::Simd { kind, .. } => {
                 if *kind == crate::simd::SimdKind::CpuFeatures {
-                    // No x86/ARM extension exists in WebAssembly: none of
-                    // the feature bits is set, so every caller takes its
-                    // plain path.
-                    self.ins(Ins::I64Const(0));
+                    // The families translated to WebAssembly SIMD, and
+                    // nothing else (see `cpu_features_wasm`).
+                    self.ins(Ins::I64Const(cpu_features_wasm()));
                     let vt = class(ty).unwrap_or(VT::I64);
                     if vt == VT::I32 {
                         self.num(w::I32_WRAP_I64);
@@ -2107,6 +2632,303 @@ impl<'a> Fx<'a> {
             Op::Asm { .. } | Op::ThreadSpawn { .. } => {
                 return Err(format!("wasm32: '{}' contains an instruction this target refuses", f.name))
             }
+        }
+        Ok(())
+    }
+
+    /// Round OPT-GENERAL -- one SIMD intrinsic (`simd.rs`) in WebAssembly
+    /// SIMD, with exactly the x86 meaning `simd.rs` gives it.
+    fn simd(&mut self, i: &Inst, kind: crate::simd::SimdKind, args: &[Val], imm: u8) -> Result<(), String> {
+        use crate::simd::SimdKind as K;
+        let v = VT::V128;
+        let arg = |k: usize| -> Result<Val, String> {
+            args.get(k).copied().ok_or_else(|| format!("internal error: SIMD {:?} without operand {}", kind, k))
+        };
+        // `i8x16.shuffle` over (first, second) with the given lane indices
+        let shuf = |me: &mut Self, idx: [u8; 16]| me.ins(Ins::Shuffle(idx));
+        match kind {
+            K::Load => {
+                self.addr(arg(0)?);
+                self.ins(Ins::SimdMem(w::V128_LOAD, 4, 0));
+                self.put(i, v);
+            }
+            K::Store => {
+                self.addr(arg(0)?);
+                self.get(arg(1)?, v);
+                self.ins(Ins::SimdMem(w::V128_STORE, 4, 0));
+            }
+            K::Zero => {
+                self.ins(Ins::V128Const([0; 16]));
+                self.put(i, v);
+            }
+            K::FromU64 => {
+                self.get(arg(0)?, VT::I64);
+                self.ins(Ins::SimdOp(w::I64X2_SPLAT));
+                self.get(arg(1)?, VT::I64);
+                self.ins(Ins::SimdLane(w::I64X2_REPLACE_LANE, 1));
+                self.put(i, v);
+            }
+            K::GetU64 => {
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdLane(w::I64X2_EXTRACT_LANE, imm & 1));
+                self.put(i, VT::I64);
+            }
+            K::GetU32 => {
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdLane(w::I32X4_EXTRACT_LANE, imm & 3));
+                self.put(i, VT::I32);
+            }
+            K::SetU32 => {
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, VT::I32);
+                self.ins(Ins::SimdLane(w::I32X4_REPLACE_LANE, imm & 3));
+                self.put(i, v);
+            }
+            K::Xor | K::And | K::Or | K::Add8 | K::Add32 | K::Add64 | K::Sub32 => {
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                let op = match kind {
+                    K::Xor => w::V128_XOR,
+                    K::And => w::V128_AND,
+                    K::Or => w::V128_OR,
+                    K::Add8 => w::I8X16_ADD,
+                    K::Add32 => w::I32X4_ADD,
+                    K::Add64 => w::I64X2_ADD,
+                    _ => w::I32X4_SUB,
+                };
+                self.ins(Ins::SimdOp(op));
+                self.put(i, v);
+            }
+            K::AndNot => {
+                // `pandn`: ~a & b. WebAssembly's andnot(x, y) is x & ~y.
+                self.get(arg(1)?, v);
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdOp(w::V128_ANDNOT));
+                self.put(i, v);
+            }
+            K::ShuffleB => {
+                // `pshufb`: lane = b & 0x80 ? 0 : a[b & 15]. `swizzle` gives
+                // 0 for every index >= 16, so b & 0x8F says the same.
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                self.ins(Ins::V128Const([0x8F; 16]));
+                self.ins(Ins::SimdOp(w::V128_AND));
+                self.ins(Ins::SimdOp(w::I8X16_SWIZZLE));
+                self.put(i, v);
+            }
+            K::Shuffle32 => {
+                // `pshufd`: lane l = src[(imm >> 2l) & 3]
+                let mut idx = [0u8; 16];
+                for l in 0..4 {
+                    let s = (imm >> (2 * l)) & 3;
+                    for k in 0..4 {
+                        idx[l * 4 + k] = s * 4 + k as u8;
+                    }
+                }
+                self.get(arg(0)?, v);
+                self.get(arg(0)?, v);
+                shuf(self, idx);
+                self.put(i, v);
+            }
+            K::AlignR => {
+                // `palignr a, b, imm`: the 32 octets b (low) : a (high),
+                // shifted right by imm octets, the low sixteen of it
+                let n = imm as usize;
+                let mut idx = [0u8; 16];
+                if n <= 16 {
+                    for (k, x) in idx.iter_mut().enumerate() {
+                        *x = (k + n) as u8; // 0..15 = b, 16..31 = a
+                    }
+                    self.get(arg(1)?, v);
+                    self.get(arg(0)?, v);
+                } else {
+                    for (k, x) in idx.iter_mut().enumerate() {
+                        let j = k + n - 16;
+                        *x = if j < 16 { j as u8 } else { 16 };
+                    }
+                    self.get(arg(0)?, v);
+                    self.ins(Ins::V128Const([0; 16]));
+                }
+                shuf(self, idx);
+                self.put(i, v);
+            }
+            K::UnpackLo32 | K::UnpackHi32 | K::UnpackLo64 | K::UnpackHi64 => {
+                // a = lanes 0..15, b = lanes 16..31
+                let lanes: [u8; 4] = match kind {
+                    K::UnpackLo32 => [0, 16, 4, 20],
+                    K::UnpackHi32 => [8, 24, 12, 28],
+                    K::UnpackLo64 => [0, 4, 16, 20],
+                    _ => [8, 12, 24, 28],
+                };
+                let mut idx = [0u8; 16];
+                for (q, base) in lanes.iter().enumerate() {
+                    for k in 0..4 {
+                        idx[q * 4 + k] = base + k as u8;
+                    }
+                }
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                shuf(self, idx);
+                self.put(i, v);
+            }
+            K::ShlBytes => {
+                // `pslldq`: lane k = k >= imm ? v[k - imm] : 0
+                let n = imm as usize;
+                let mut idx = [0u8; 16];
+                for (k, x) in idx.iter_mut().enumerate() {
+                    *x = if k >= n { (16 + k - n) as u8 } else { 0 };
+                }
+                self.ins(Ins::V128Const([0; 16]));
+                self.get(arg(0)?, v);
+                shuf(self, idx);
+                self.put(i, v);
+            }
+            K::ShrBytes => {
+                // `psrldq`: lane k = k + imm < 16 ? v[k + imm] : 0
+                let n = imm as usize;
+                let mut idx = [0u8; 16];
+                for (k, x) in idx.iter_mut().enumerate() {
+                    *x = if k + n < 16 { (k + n) as u8 } else { 16 };
+                }
+                self.get(arg(0)?, v);
+                self.ins(Ins::V128Const([0; 16]));
+                shuf(self, idx);
+                self.put(i, v);
+            }
+            K::Shl32 | K::Shr32 | K::Shl64 | K::Shr64 => {
+                // the counts are literals below the lane width (simd.rs), so
+                // WebAssembly's count modulo the width changes nothing
+                self.get(arg(0)?, v);
+                self.ins(Ins::I32Const(imm as i32));
+                let op = match kind {
+                    K::Shl32 => w::I32X4_SHL,
+                    K::Shr32 => w::I32X4_SHR_U,
+                    K::Shl64 => w::I64X2_SHL,
+                    _ => w::I64X2_SHR_U,
+                };
+                self.ins(Ins::SimdOp(op));
+                self.put(i, v);
+            }
+            K::Blend16 => {
+                // `pblendw a, b, imm`: 16-bit lane l = imm bit l ? b : a
+                let mut idx = [0u8; 16];
+                for l in 0..8 {
+                    let from_b = (imm >> l) & 1 != 0;
+                    let base = if from_b { 16 } else { 0 } + (2 * l) as u8;
+                    idx[2 * l] = base;
+                    idx[2 * l + 1] = base + 1;
+                }
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                shuf(self, idx);
+                self.put(i, v);
+            }
+            K::Store64 => {
+                // the low eight octets only (two `f32`, TEMPO 7)
+                self.addr(arg(0)?);
+                self.get(arg(1)?, v);
+                self.ins(Ins::SimdMemLane(w::V128_STORE64_LANE, 3, 0, 0));
+            }
+            K::AddF32 | K::SubF32 | K::MulF32 | K::CmpLtF32 | K::CmpLeF32 | K::CmpGt32 => {
+                // lane for lane what the scalar instruction computes (TEMPO 4/5);
+                // the comparisons give all ones / all zeros per lane, as
+                // `cmpltps`/`cmpleps`/`pcmpgtd` do
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                let op = match kind {
+                    K::AddF32 => w::F32X4_ADD,
+                    K::SubF32 => w::F32X4_SUB,
+                    K::MulF32 => w::F32X4_MUL,
+                    K::CmpLtF32 => w::F32X4_LT,
+                    K::CmpLeF32 => w::F32X4_LE,
+                    _ => w::I32X4_GT_S,
+                };
+                self.ins(Ins::SimdOp(op));
+                self.put(i, v);
+            }
+            K::CmpNltF32 => {
+                // NOT less-than: TRUE for an unordered pair (NaN), exactly
+                // `cmpnltps`
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                self.ins(Ins::SimdOp(w::F32X4_LT));
+                self.ins(Ins::SimdOp(w::V128_NOT));
+                self.put(i, v);
+            }
+            K::CvtI32F32 => {
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdOp(w::F32X4_CONVERT_I32X4_S));
+                self.put(i, v);
+            }
+            K::TruncF32I32 => {
+                // `cvttps2dq` answers 0x80000000 for NaN and for everything
+                // out of range; `trunc_sat` saturates (NaN -> 0, too big ->
+                // 0x7FFFFFFF). The lower side already agrees; NaN and the
+                // upper side are put right with a mask.
+                let x = self.tmp(v);
+                self.get(arg(0)?, v);
+                self.ins(Ins::LocalTee(x));
+                self.ins(Ins::SimdOp(w::I32X4_TRUNC_SAT_F32X4_S));
+                // bitselect(a = 0x80000000, b = trunc, mask)
+                self.ins(Ins::V128Const([0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80]));
+                self.ins(Ins::LocalGet(x));
+                self.ins(Ins::LocalGet(x));
+                self.ins(Ins::SimdOp(w::F32X4_NE));
+                self.ins(Ins::LocalGet(x));
+                self.ins(Ins::F32Const(((1u64 << 31) as f32).to_bits()));
+                self.ins(Ins::SimdOp(w::F32X4_SPLAT));
+                self.ins(Ins::SimdOp(w::F32X4_GE));
+                self.ins(Ins::SimdOp(w::V128_OR));
+                // stack: trunc, MIN, mask -> bitselect(MIN, trunc, mask)
+                let m = self.tmp(v);
+                self.ins(Ins::LocalSet(m));
+                let mn = self.tmp(v);
+                self.ins(Ins::LocalSet(mn));
+                let t = self.tmp(v);
+                self.ins(Ins::LocalSet(t));
+                self.ins(Ins::LocalGet(mn));
+                self.ins(Ins::LocalGet(t));
+                self.ins(Ins::LocalGet(m));
+                self.ins(Ins::SimdOp(w::V128_BITSELECT));
+                self.release(v, x);
+                self.release(v, m);
+                self.release(v, mn);
+                self.release(v, t);
+                self.put(i, v);
+            }
+            K::AesEnc
+            | K::AesEncLast
+            | K::AesDec
+            | K::AesDecLast
+            | K::AesImc
+            | K::AesKeyGenAssist
+            | K::Sha256Rnds2
+            | K::Sha256Msg1
+            | K::Sha256Msg2
+            | K::Pclmul
+            | K::Crc32U8
+            | K::Crc32U64 => {
+                // No such instruction in WebAssembly, and `__cpu_features`
+                // says so (see the module comment): reaching it is the
+                // program's error, like SIGILL on an x86 without it.
+                self.ins(Ins::Unreachable);
+                if let Some(d) = i.dst {
+                    let vt = self.vt_of(d).unwrap_or(VT::I64);
+                    self.put(i, vt);
+                }
+            }
+            K::CpuFeatures => {
+                self.ins(Ins::I64Const(cpu_features_wasm()));
+                let vt = class(i.ty).unwrap_or(VT::I64);
+                if vt == VT::I32 {
+                    self.num(w::I32_WRAP_I64);
+                }
+                self.put(i, vt);
+            }
+            // a kind `simd.rs` gained after this table (refused before
+            // translation by `wasm_simd_kind`, so never reached)
+            #[allow(unreachable_patterns)]
+            _ => return Err(format!("wasm32: the SIMD instruction '{:?}' in '{}' has no WebAssembly form yet", kind, self.f.name)),
         }
         Ok(())
     }
@@ -2193,6 +3015,19 @@ impl<'a> Fx<'a> {
             return Ok(());
         }
         let s = ty.signed();
+        // Round OPT-GENERAL: a 64-bit result of which only the low 32 bits
+        // are ever needed is computed in 32 bits -- the low bits of a sum,
+        // difference, product, bit operation or left shift depend only on
+        // the low bits of the operands (a shift only while the count is a
+        // constant below 32, which `plan_low32` checks)
+        let vt = if vt == VT::I64
+            && self.dst_low(i)
+            && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl)
+        {
+            VT::I32
+        } else {
+            vt
+        };
         let wide = vt == VT::I64;
         let pick = |n32: w::Num, n64: w::Num| if wide { n64 } else { n32 };
         match op {
@@ -2650,6 +3485,17 @@ impl<'a> Fx<'a> {
             self.put(i, VT::I32);
             return Ok(());
         }
+        if tv == VT::I64 && self.dst_low(i) {
+            // only the low 32 bits of the result are needed: those of the
+            // canonical 32-bit form, or of the 64-bit source
+            if fv == VT::I32 {
+                self.get_norm(src, from);
+            } else {
+                self.get(src, VT::I32);
+            }
+            self.put(i, VT::I32);
+            return Ok(());
+        }
         match (fv, tv) {
             (VT::I32, VT::I32) => {
                 self.get_norm(src, from);
@@ -2657,8 +3503,7 @@ impl<'a> Fx<'a> {
             }
             (VT::I32, VT::I64) => self.get_ext64(src, from),
             (VT::I64, VT::I32) => {
-                self.get(src, VT::I64);
-                self.num(w::I32_WRAP_I64);
+                self.get(src, VT::I32);
                 self.normalize(to);
             }
             _ => self.get(src, VT::I64),

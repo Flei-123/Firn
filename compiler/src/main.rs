@@ -78,6 +78,7 @@ mod statics;
 mod sema_generic;
 mod sema_match;
 mod peephole;
+mod promote;
 mod rangecheck;
 mod strings;
 mod strtype;
@@ -86,6 +87,7 @@ mod target;
 mod types;
 mod wasm_cfg;
 mod wasm_enc;
+mod wasm_locals;
 mod wasm_rt;
 
 use std::path::{Path, PathBuf};
@@ -931,7 +933,8 @@ fn run(opts: &Options) -> i32 {
 
     // --- Optimizer ---
     if opts.optimize {
-        let st = opt::optimize_with(&mut module, &opts.optcfg);
+        let optcfg = opts.optcfg.clone();
+        let st = opt::optimize_with(&mut module, &optcfg);
         if std::env::var(format!("{}_OPT_STATS", config::compiler_name().to_uppercase())).is_ok() {
             eprintln!(
                 "opt: {} constants folded, {} instructions removed, {} blocks removed",

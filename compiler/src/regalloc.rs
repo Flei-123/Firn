@@ -6399,6 +6399,14 @@ fn emit_inst(
             }
             let mut reg_moves: Vec<(String, String)> = Vec::new();
             let mut later: Vec<(&'static str, Val)> = Vec::new();
+            // Floating point arguments IN PARALLEL as well: xmm4-xmm7 are
+            // argument registers AND homes of the allocation, so a value that
+            // lives in xmm5 must be read before the sixth argument is written
+            // there (the same trap as in the prologue; round OPT-GENERAL found
+            // its twin on the base path, `load_args`). Register sources first,
+            // all at once; memory and constant sources read no register.
+            let mut fp_moves: Vec<(String, String)> = Vec::new();
+            let mut fp_later: Vec<(&'static str, Val)> = Vec::new();
             for (k, arg) in args.iter().enumerate() {
                 let r = match spot[k] {
                     Some(r) => r,
@@ -6406,7 +6414,14 @@ fn emit_inst(
                 };
                 if is_xmm(r) {
                     let single = ra.f.val_ty(*arg) == FTy::F32;
-                    ra.fp_into(e, r, *arg, single);
+                    let o = ra.fpo(*arg, single);
+                    if is_xmm(&o) {
+                        if o != r {
+                            fp_moves.push((r.to_string(), o));
+                        }
+                    } else {
+                        fp_later.push((r, *arg));
+                    }
                     continue;
                 }
                 let o = ra.opnd(*arg);
@@ -6415,6 +6430,11 @@ fn emit_inst(
                 } else {
                     later.push((r, *arg));
                 }
+            }
+            parallel_xmm_moves(e, &fp_moves);
+            for (r, arg) in fp_later {
+                let single = ra.f.val_ty(arg) == FTy::F32;
+                ra.fp_into(e, r, arg, single);
             }
             parallel_reg_moves(e, &reg_moves);
             for (r, arg) in later {
