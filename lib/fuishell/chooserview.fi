@@ -1,0 +1,454 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fuishell/chooserview.fi -- the file chooser on the screen: a path bar
+// with an "up" button, the list of entries, and at the bottom the name
+// field (save dialogs) and the two buttons. It draws a
+// filechooser.FileChooser with fUi's painter and turns the mouse, the
+// wheel and the keyboard into calls on that model.
+//
+// OpenPlan LIB-005 (open and save dialogs). filechooser.fi is the model
+// and knows nothing of pixels; this file is the dialog's face and hands:
+//
+//     var v: chooserview.ChooserView = chooserview.fcv_new(24)
+//     chooserview.fcv_layout(&v, 0, 0, 640, 420, false) // true: a save dialog
+//     chooserview.fcv_paint(&v, &fc, &z, theme.theme_colors(&m), 13.0)
+//     let what: u32 = chooserview.fcv_mouse_down(&v, &fc, x, y, clicks)
+//     if what == chooserview.FCV_CHOSEN { open(filechooser.fc_result(&fc)) }
+//
+// THE KEYS are this file's own numbers (FCK_*), so that it does not
+// depend on one platform's key codes; the program maps its keys onto them.
+// Up/Down/PageUp/PageDown/Home/End move the selection, Enter activates it
+// (a directory is entered, a file chosen), Escape cancels, Backspace goes
+// up one directory -- except in a save dialog, where it edits the name.
+// Typed text (fcv_type) goes into the name of a save dialog.
+//
+// Pixels are integers, as in fUi's layout; the list scrolls by whole rows.
+
+import std.rt
+import fuishell.filechooser
+import fui.layout
+import fui.painter
+import fui.theme
+
+export {
+    ChooserView,
+    fcv_new, fcv_set_labels, fcv_layout, fcv_top, fcv_visible_rows, fcv_row_rect, fcv_row_at,
+    fcv_up_rect, fcv_path_rect, fcv_list_rect, fcv_name_rect, fcv_ok_rect, fcv_cancel_rect,
+    fcv_mouse_down, fcv_key, fcv_type, fcv_scroll, fcv_paint, fcv_size_text,
+    FCV_NOTHING, FCV_ENTERED, FCV_CHOSEN, FCV_CANCEL, FCV_SELECTED,
+    FCK_UP, FCK_DOWN, FCK_PAGE_UP, FCK_PAGE_DOWN, FCK_HOME, FCK_END, FCK_ENTER, FCK_ESCAPE,
+    FCK_BACKSPACE,
+}
+
+// what an input did (the first three are the model's own answers)
+const FCV_NOTHING: u32 = 0
+const FCV_ENTERED: u32 = 1 // went into another directory
+const FCV_CHOSEN: u32 = 2 // done: filechooser.fc_result
+const FCV_CANCEL: u32 = 3 // the dialog was cancelled
+const FCV_SELECTED: u32 = 4 // only the selection (or the name) changed
+
+const FCK_UP: u32 = 1
+const FCK_DOWN: u32 = 2
+const FCK_PAGE_UP: u32 = 3
+const FCK_PAGE_DOWN: u32 = 4
+const FCK_HOME: u32 = 5
+const FCK_END: u32 = 6
+const FCK_ENTER: u32 = 7
+const FCK_ESCAPE: u32 = 8
+const FCK_BACKSPACE: u32 = 9
+
+const PAD: i64 = 8
+const BTN_W: i64 = 96
+const SIZE_W: i64 = 90 // the size column
+
+struct ChooserView {
+    row_h: i64,
+    top: i64, // the first row shown
+    ok_label: str,
+    cancel_label: str,
+    whole: layout.Rect,
+    up: layout.Rect,
+    path: layout.Rect,
+    list: layout.Rect,
+    name: layout.Rect, // empty unless the program lays out a save dialog
+    ok: layout.Rect,
+    cancel: layout.Rect,
+}
+
+fn zero() -> layout.Rect {
+    return layout.rect_new(0, 0, 0, 0)
+}
+
+// `row_h` is the height of one list row in pixels (the path bar and the
+// bottom bar take the same height plus padding).
+fn fcv_new(row_h: i64) -> ChooserView {
+    return ChooserView { row_h: row_h, top: 0, ok_label: "OK", cancel_label: "Cancel", whole: zero(), up: zero(),
+        path: zero(), list: zero(), name: zero(), ok: zero(), cancel: zero() }
+}
+
+// The button texts ("Open"/"Save", "Cancel" -- the program translates).
+fn fcv_set_labels(v: *mut ChooserView, ok: str, cancel: str) {
+    (*v).ok_label = __str_copy(ok)
+    (*v).cancel_label = __str_copy(cancel)
+}
+
+// Lays the dialog out in x, y, w, h. `with_name` = a save dialog (the name
+// field left of the buttons).
+fn fcv_layout(v: *mut ChooserView, x: i64, y: i64, w: i64, h: i64, with_name: bool) {
+    let rh: i64 = (*v).row_h
+    let bar: i64 = rh + PAD
+    (*v).whole = layout.rect_new(x, y, w, h)
+    (*v).up = layout.rect_new(x + PAD / 2, y + PAD / 2, rh, rh)
+    (*v).path = layout.rect_new(x + PAD + rh, y + PAD / 2, w - rh - PAD - PAD / 2, rh)
+    let bottom: i64 = rh + 2 * PAD
+    var lh: i64 = h - bar - bottom
+    if lh < 0 {
+        lh = 0
+    }
+    (*v).list = layout.rect_new(x, y + bar, w, lh)
+    let by: i64 = y + h - bottom + PAD
+    (*v).ok = layout.rect_new(x + w - PAD - BTN_W, by, BTN_W, rh)
+    (*v).cancel = layout.rect_new(x + w - 2 * PAD - 2 * BTN_W, by, BTN_W, rh)
+    if with_name {
+        var nw: i64 = w - 4 * PAD - 2 * BTN_W
+        if nw < 0 {
+            nw = 0
+        }
+        (*v).name = layout.rect_new(x + PAD, by, nw, rh)
+    } else {
+        (*v).name = zero()
+    }
+}
+
+fn fcv_top(v: *mut ChooserView) -> i64 { return (*v).top }
+fn fcv_up_rect(v: *mut ChooserView) -> layout.Rect { return (*v).up }
+fn fcv_path_rect(v: *mut ChooserView) -> layout.Rect { return (*v).path }
+fn fcv_list_rect(v: *mut ChooserView) -> layout.Rect { return (*v).list }
+fn fcv_name_rect(v: *mut ChooserView) -> layout.Rect { return (*v).name }
+fn fcv_ok_rect(v: *mut ChooserView) -> layout.Rect { return (*v).ok }
+fn fcv_cancel_rect(v: *mut ChooserView) -> layout.Rect { return (*v).cancel }
+
+// How many whole rows fit into the list.
+fn fcv_visible_rows(v: *mut ChooserView) -> i64 {
+    if (*v).row_h <= 0 {
+        return 0
+    }
+    return (*v).list.h / (*v).row_h
+}
+
+// The rectangle of entry `i` on the screen (empty when scrolled away).
+fn fcv_row_rect(v: *mut ChooserView, i: i64) -> layout.Rect {
+    let k: i64 = i - (*v).top
+    if k < 0 || k >= fcv_visible_rows(v) {
+        return zero()
+    }
+    let l: layout.Rect = (*v).list
+    return layout.rect_new(l.x, l.y + k * (*v).row_h, l.w, (*v).row_h)
+}
+
+fn inside(r: layout.Rect, x: i64, y: i64) -> bool {
+    return r.w > 0 && r.h > 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+// The entry under x, y, or -1.
+fn fcv_row_at(v: *mut ChooserView, fc: *mut filechooser.FileChooser, x: i64, y: i64) -> i64 {
+    let l: layout.Rect = (*v).list
+    if !inside(l, x, y) || (*v).row_h <= 0 {
+        return -1
+    }
+    let k: i64 = (y - l.y) / (*v).row_h
+    if k >= fcv_visible_rows(v) {
+        return -1
+    }
+    let i: i64 = (*v).top + k
+    if i >= filechooser.fc_count(fc) as i64 {
+        return -1
+    }
+    return i
+}
+
+fn clamp_top(v: *mut ChooserView, fc: *mut filechooser.FileChooser) {
+    var most: i64 = filechooser.fc_count(fc) as i64 - fcv_visible_rows(v)
+    if most < 0 {
+        most = 0
+    }
+    if (*v).top > most {
+        (*v).top = most
+    }
+    if (*v).top < 0 {
+        (*v).top = 0
+    }
+}
+
+// scrolls just enough that the selected row is shown
+fn follow(v: *mut ChooserView, fc: *mut filechooser.FileChooser) {
+    let s: i64 = filechooser.fc_selected(fc)
+    let n: i64 = fcv_visible_rows(v)
+    if s >= 0 && n > 0 {
+        if s < (*v).top {
+            (*v).top = s
+        }
+        if s >= (*v).top + n {
+            (*v).top = s - n + 1
+        }
+    }
+    clamp_top(v, fc)
+}
+
+// the answer of fc_activate, with the list back at the top when the
+// directory changed
+fn after(v: *mut ChooserView, fc: *mut filechooser.FileChooser, what: u32) -> u32 {
+    if what == filechooser.FC_ENTERED {
+        (*v).top = 0
+        return FCV_ENTERED
+    }
+    if what == filechooser.FC_CHOSEN {
+        return FCV_CHOSEN
+    }
+    return FCV_NOTHING
+}
+
+// A press of the main button; `clicks` is 2 for a double click.
+fn fcv_mouse_down(v: *mut ChooserView, fc: *mut filechooser.FileChooser, x: i64, y: i64, clicks: u32) -> u32 {
+    if inside((*v).up, x, y) {
+        if filechooser.fc_up(fc) {
+            (*v).top = 0
+            return FCV_ENTERED
+        }
+        return FCV_NOTHING
+    }
+    if inside((*v).cancel, x, y) {
+        return FCV_CANCEL
+    }
+    if inside((*v).ok, x, y) {
+        return after(v, fc, filechooser.fc_activate(fc, -1))
+    }
+    let i: i64 = fcv_row_at(v, fc, x, y)
+    if i >= 0 {
+        filechooser.fc_select(fc, i)
+        if clicks >= 2 {
+            return after(v, fc, filechooser.fc_activate(fc, i))
+        }
+        return FCV_SELECTED
+    }
+    return FCV_NOTHING
+}
+
+// the name without its last character (UTF-8: a whole character goes)
+fn drop_last(s: str) -> str {
+    if s.n == 0 {
+        return s
+    }
+    var e: usize = s.n - 1
+    while e > 0 && (rt.ld8(s.p as u64, e) & 192 as u8) == 128 as u8 {
+        e = e - 1
+    }
+    return str { p: s.p, n: e }
+}
+
+fn fcv_key(v: *mut ChooserView, fc: *mut filechooser.FileChooser, key: u32) -> u32 {
+    let page: i64 = fcv_visible_rows(v)
+    let n: i64 = filechooser.fc_count(fc) as i64
+    let save: bool = filechooser.fc_mode(fc) == filechooser.FC_SAVE
+    if key == FCK_ESCAPE {
+        return FCV_CANCEL
+    }
+    if key == FCK_ENTER {
+        // in a save dialog Enter takes the typed name, else the selection
+        if save {
+            return after(v, fc, filechooser.fc_activate(fc, -1))
+        }
+        let s: i64 = filechooser.fc_selected(fc)
+        if filechooser.fc_mode(fc) == filechooser.FC_DIR && (s < 0 || !filechooser.fc_is_dir(fc, s as usize)) {
+            return after(v, fc, filechooser.fc_activate(fc, -1))
+        }
+        return after(v, fc, filechooser.fc_activate(fc, s))
+    }
+    if key == FCK_BACKSPACE {
+        if save {
+            filechooser.fc_set_name(fc, drop_last(filechooser.fc_typed_name(fc)))
+            return FCV_SELECTED
+        }
+        if filechooser.fc_up(fc) {
+            (*v).top = 0
+            return FCV_ENTERED
+        }
+        return FCV_NOTHING
+    }
+    if n == 0 {
+        return FCV_NOTHING
+    }
+    var delta: i64 = 0
+    if key == FCK_UP { delta = -1 }
+    if key == FCK_DOWN { delta = 1 }
+    if key == FCK_PAGE_UP { delta = 0 - page }
+    if key == FCK_PAGE_DOWN { delta = page }
+    if key == FCK_HOME { delta = 0 - n }
+    if key == FCK_END { delta = n }
+    if delta == 0 {
+        return FCV_NOTHING
+    }
+    if filechooser.fc_selected(fc) < 0 {
+        filechooser.fc_select(fc, 0)
+        if delta > 0 {
+            delta = delta - 1
+        }
+    }
+    filechooser.fc_move(fc, delta)
+    follow(v, fc)
+    return FCV_SELECTED
+}
+
+// Typed text: goes into the name of a save dialog (elsewhere ignored).
+fn fcv_type(v: *mut ChooserView, fc: *mut filechooser.FileChooser, text: str) -> u32 {
+    if filechooser.fc_mode(fc) != filechooser.FC_SAVE || text.n == 0 {
+        return FCV_NOTHING
+    }
+    filechooser.fc_set_name(fc, filechooser.fc_typed_name(fc) + text)
+    return FCV_SELECTED
+}
+
+// The wheel: `rows` > 0 scrolls down.
+fn fcv_scroll(v: *mut ChooserView, fc: *mut filechooser.FileChooser, rows: i64) {
+    (*v).top = (*v).top + rows
+    clamp_top(v, fc)
+}
+
+// "0 B", "999 B", "1.0 KB", "12.3 MB" -- 1024 steps, one decimal; into `b`.
+fn fcv_size_text(b: *mut rt.Buf, size: u64) {
+    rt.buf_clear(b)
+    if size < 1024 as u64 {
+        rt.buf_push_dec_u64(b, size)
+        rt.buf_push_bytes(b, " B".p as u64, 2)
+        return
+    }
+    var unit: usize = 0
+    var tenths: u64 = size * 10 as u64 / 1024 as u64
+    while tenths >= 10240 as u64 && unit < 3 {
+        tenths = tenths / 1024 as u64
+        unit = unit + 1
+    }
+    rt.buf_push_dec_u64(b, tenths / 10 as u64)
+    rt.buf_push(b, 46 as u8)
+    rt.buf_push_dec_u64(b, tenths % 10 as u64)
+    let units: str = " KB MB GB TB"
+    rt.buf_push_bytes(b, units.p as u64 + (unit * 3) as u64, 3)
+}
+
+fn fill(z: *mut painter.Painter, r: layout.Rect, col: u32) {
+    if r.w <= 0 || r.h <= 0 {
+        return
+    }
+    painter.surface(z, r.x as f64, r.y as f64, r.w as f64, r.h as f64, col)
+}
+
+fn frame(z: *mut painter.Painter, r: layout.Rect, col: u32) {
+    if r.w <= 0 || r.h <= 0 {
+        return
+    }
+    let x: f64 = r.x as f64
+    let y: f64 = r.y as f64
+    let w: f64 = r.w as f64
+    let h: f64 = r.h as f64
+    painter.surface(z, x, y, w, 1.0, col)
+    painter.surface(z, x, y + h - 1.0, w, 1.0, col)
+    painter.surface(z, x, y, 1.0, h, col)
+    painter.surface(z, x + w - 1.0, y, 1.0, h, col)
+}
+
+// text in a box, vertically centred; back comes where it ends
+fn label(z: *mut painter.Painter, r: layout.Rect, inset: i64, col: u32, p: u64, n: usize, size: f64,
+    align: u32) -> f64 {
+    let w: f64 = (r.w - 2 * inset) as f64
+    if w <= 0.0 || n == 0 {
+        return (r.x + inset) as f64
+    }
+    let by: f64 = painter.text_baseline_mid(z, r.y as f64, r.h as f64, size)
+    var run: painter.TextRun = painter.run_new(size)
+    return painter.run_draw_ellipsis(z, &run, (r.x + inset) as f64, by, w, col, p, n, align)
+}
+
+fn button(z: *mut painter.Painter, c: *mut theme.Colors, r: layout.Rect, s: str, primary: bool, size: f64) {
+    if primary {
+        fill(z, r, (*c).accent)
+        label(z, r, 4, (*c).text_on_accent, s.p as u64, s.n, size, painter.TEXT_M)
+    } else {
+        fill(z, r, (*c).button)
+        frame(z, r, (*c).border_col)
+        label(z, r, 4, (*c).text, s.p as u64, s.n, size, painter.TEXT_M)
+    }
+}
+
+// Draws the dialog as laid out by fcv_layout.
+fn fcv_paint(v: *mut ChooserView, fc: *mut filechooser.FileChooser, z: *mut painter.Painter, c: *mut theme.Colors,
+    size: f64) {
+    let wh: layout.Rect = (*v).whole
+    fill(z, wh, (*c).surface)
+    // --- the path bar: the "up" button (an arrow of three bars) and the path
+    let up: layout.Rect = (*v).up
+    fill(z, up, (*c).button)
+    frame(z, up, (*c).border_col)
+    let cx: f64 = (up.x + up.w / 2) as f64
+    let cy: f64 = (up.y + up.h / 2) as f64
+    painter.surface(z, cx - 1.0, cy - 5.0, 2.0, 11.0, (*c).text)
+    painter.surface(z, cx - 3.0, cy - 3.0, 6.0, 2.0, (*c).text)
+    painter.surface(z, cx - 5.0, cy - 1.0, 2.0, 2.0, (*c).text)
+    painter.surface(z, cx + 3.0, cy - 1.0, 2.0, 2.0, (*c).text)
+    let pr: layout.Rect = (*v).path
+    fill(z, pr, (*c).field)
+    frame(z, pr, (*c).border_col)
+    let d: str = filechooser.fc_dir(fc)
+    label(z, pr, PAD, (*c).text, d.p as u64, d.n, size, painter.TEXT_L)
+    // --- the list
+    let l: layout.Rect = (*v).list
+    fill(z, l, (*c).base)
+    painter.surface(z, l.x as f64, l.y as f64, l.w as f64, 1.0, (*c).separator)
+    painter.surface(z, l.x as f64, (l.y + l.h - 1) as f64, l.w as f64, 1.0, (*c).separator)
+    var sb: rt.Buf = rt.buf_new()
+    let n: i64 = filechooser.fc_count(fc) as i64
+    let sel: i64 = filechooser.fc_selected(fc)
+    var i: i64 = (*v).top
+    while i < n && i < (*v).top + fcv_visible_rows(v) {
+        let r: layout.Rect = fcv_row_rect(v, i)
+        var tcol: u32 = (*c).text
+        var mcol: u32 = (*c).text_muted
+        if i == sel {
+            fill(z, r, (*c).selection)
+            tcol = (*c).selection_text
+            mcol = (*c).selection_text
+        }
+        // the mark: a filled block for a directory, a frame for a file
+        let ms: i64 = (*v).row_h / 2
+        let mark: layout.Rect = layout.rect_new(r.x + PAD, r.y + ((*v).row_h - ms) / 2, ms, ms)
+        let isdir: bool = filechooser.fc_is_dir(fc, i as usize)
+        if isdir {
+            fill(z, mark, (*c).accent)
+        } else {
+            frame(z, mark, mcol)
+        }
+        let nm: str = filechooser.fc_name(fc, i as usize)
+        let name_r: layout.Rect = layout.rect_new(r.x + 2 * PAD + ms, r.y, r.w - 3 * PAD - ms - SIZE_W, r.h)
+        label(z, name_r, 0, tcol, nm.p as u64, nm.n, size, painter.TEXT_L)
+        if !isdir {
+            fcv_size_text(&sb, filechooser.fc_size(fc, i as usize))
+            let size_r: layout.Rect = layout.rect_new(r.x + r.w - PAD - SIZE_W, r.y, SIZE_W, r.h)
+            label(z, size_r, 0, mcol, rt.buf_ptr(&sb), rt.buf_len(&sb), size, painter.TEXT_R)
+        }
+        i = i + 1
+    }
+    rt.buf_free(&sb)
+    // --- the bottom: name field (save dialogs), then the buttons
+    let nr: layout.Rect = (*v).name
+    if nr.w > 0 {
+        fill(z, nr, (*c).field_focus)
+        frame(z, nr, (*c).accent)
+        let t: str = filechooser.fc_typed_name(fc)
+        let end: f64 = label(z, nr, PAD, (*c).text, t.p as u64, t.n, size, painter.TEXT_L)
+        var caret: f64 = end
+        if t.n == 0 {
+            caret = (nr.x + PAD) as f64
+        }
+        painter.surface(z, caret + 1.0, (nr.y + 4) as f64, 1.0, (nr.h - 8) as f64, (*c).text)
+    }
+    button(z, c, (*v).cancel, (*v).cancel_label, false, size)
+    button(z, c, (*v).ok, (*v).ok_label, true, size)
+}
