@@ -106,7 +106,11 @@ echo
 echo "== the counter check: the same graph, held onto -- RSS MUST grow =="
 # The counter check only has to SHOW the growth, not run as long: it holds
 # everything, so every collection walks a live set that keeps growing.
-LEAKR=$((ROUNDS / 10 + 2000))
+# It has to run long enough past the skipped start-up samples: at
+# ROUNDS/10+2000 it lasted ~0.5 s and the growth sat at the limit
+# (4388 KiB against 4296 on main), so a faster engine or a busy machine
+# failed it. Twice as many rounds give ~10.7 MiB in ~1 s.
+LEAKR=$((ROUNDS / 5 + 2400))
 sed -i "s|^var rounds = .*;|var rounds = $LEAKR;|" "$WORK/leak.js"
 measure "$WORK/leak.js" "leak" | tee "$WORK/leak.log"
 
