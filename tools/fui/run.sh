@@ -106,6 +106,14 @@ build contrast
 "$W/contrast"
 
 echo
+echo "== 2b. THE THEME FILE (lib/fui/themefile.fi) =="
+# A theme from a text file is applied only if it keeps the same
+# promise: the cases, then every theme shipped with fUi.
+build themefile
+"$W/themefile"
+"$W/themefile" --builtin
+
+echo
 echo "== 3. THE CLOSE CROSS =="
 build capicon
 "$W/capicon"
