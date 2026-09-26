@@ -292,7 +292,7 @@ the ratio, and the hit test under scrolling.
 Section 19c counts, mechanically, what the round is for: the same tool
 bar -- three buttons, a search field with `grow`, one accent button --
 painted call by call in `demos/fuidemo/main.fi` (`fn
-werkzeugleiste_gemalt`) against the same bar described in
+toolbar_painted`) against the same bar described in
 `tools/fui/gallery9_main.fi` (tree plus its rules in the style sheet).
 Counted are lines of code, without blanks and comments, in three cuts,
 because a single number here would necessarily hide something:
@@ -320,7 +320,7 @@ the same piece of surface. So the same bar is counted a second time
 where both versions stand next to each other and provably paint the
 same picture: `demos/fuidemo/main.fi`, `fn werkzeugleiste` (markers
 `>>> LEISTE BESCHRIEBEN` ... `<<< LEISTE BESCHRIEBEN`) against
-`fn werkzeugleiste_gemalt` in **the same file** (markers
+`fn toolbar_painted` in **the same file** (markers
 `>>> LEISTE GEMALT` ... `<<< LEISTE GEMALT`). `pruefe_leisten` in that
 file holds their five rectangles against each other as integers, at 952
 **and** at 260 points of width, where the 140-point clamp of the search

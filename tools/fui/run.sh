@@ -577,7 +577,7 @@ echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
 # das es zweimal gibt: die Werkzeugleiste -- drei Knoepfe, ein Suchfeld
 # mit grow, ein Knopf im Akzent.
 #
-#   gemalt      demos/fuidemo/main.fi, fn werkzeugleiste_gemalt.
+#   gemalt      demos/fuidemo/main.fi, fn toolbar_painted.
 #   beschrieben tools/fui/gallery9_main.fi, zwischen den Marken
 #               ">>> WERKZEUGLEISTE" und "<<< WERKZEUGLEISTE" (der Baum)
 #               UND zwischen ">>> LEISTENREGELN" und "<<<
@@ -626,7 +626,7 @@ ohne_aussehen() {
         -e 'let rs:' -e 'sheet\.decl_new' -e 'style\.style_new' \
         -e 'sheet\.decl_set_style' -e 'regel(sh' -e 'sheet\.sheet_rule'
 }
-awk '/^fn werkzeugleiste_gemalt\(/{p=1} p{print} p&&/^}$/{exit}' \
+awk '/^fn toolbar_painted\(/{p=1} p{print} p&&/^}$/{exit}' \
     demos/fuidemo/main.fi > "$W/gemalt.txt"
 sed -n '/>>> WERKZEUGLEISTE/,/<<< WERKZEUGLEISTE/p' \
     tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
@@ -648,7 +648,7 @@ echo "  B (ohne Texte und Aussehen): gemalt $gemalt_b, beschrieben $beschrieben_
 if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
     echo "  Es fehlen die Marken WERKZEUGLEISTE/LEISTENREGELN in"
-    echo "  tools/fui/gallery9_main.fi oder fn werkzeugleiste_gemalt in"
+    echo "  tools/fui/gallery9_main.fi oder fn toolbar_painted in"
     echo "  demos/fuidemo/main.fi."
     exit 1
 fi
@@ -712,7 +712,7 @@ echo "== 19d. DIESELBE LEISTE, DIESELBE DATEI, ZWEI FASSUNGEN =="
 # Suchfeldes). Verglichen werden die Marken
 #
 #   >>> LEISTE BESCHRIEBEN ... <<< LEISTE BESCHRIEBEN   (fn werkzeugleiste)
-#   >>> LEISTE GEMALT      ... <<< LEISTE GEMALT        (fn werkzeugleiste_gemalt)
+#   >>> LEISTE GEMALT      ... <<< LEISTE GEMALT        (fn toolbar_painted)
 #
 # beide in demos/fuidemo/main.fi. Ausserhalb der Marken liegt in BEIDEN
 # Faellen nur die Pruefung (das Herausreichen der Rechtecke, die

@@ -14,7 +14,7 @@
 # caps and round joins, no fill. Its elements (path, circle, ellipse,
 # rect, line, polyline, polygon) are turned into ONE SVG path string here,
 # so the drawing side (lib/fui/icons.fi) needs exactly one parser,
-# svg.path.zerteile_d, and no XML at all:
+# svg.path.split_d, and no XML at all:
 #
 #   circle  cx cy r        M cx-r cy  a r r 0 1 0 2r 0  a r r 0 1 0 -2r 0 z
 #   ellipse cx cy rx ry    the same with rx/ry

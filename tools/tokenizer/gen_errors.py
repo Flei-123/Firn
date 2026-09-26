@@ -96,9 +96,9 @@ def main():
     z.append("//")
     z.append("//   name_chunk(code, i) -> u64      Stueck i des Namens von `code`")
     z.append("//   ANZAHL                          Anzahl der Codes (Codes sind 1..ANZAHL)")
-    z.append("//   STUECKE_MAX                     hoechste Stueckzahl eines Namens")
+    z.append("//   PIECES_MAX                     hoechste Stueckzahl eines Namens")
     z.append("")
-    export = ["ANZAHL", "STUECKE_MAX", "name_chunk"] + [konstante(c) for c in CODES]
+    export = ["ANZAHL", "PIECES_MAX", "name_chunk"] + [konstante(c) for c in CODES]
     line = "export {"
     for e in export:
         if len(line) + len(e) + 2 > 92:
@@ -109,7 +109,7 @@ def main():
     z.append("}")
     z.append("")
     z.append("const ANZAHL: u32 = %d" % len(CODES))
-    z.append("const STUECKE_MAX: usize = %d" % max_st)
+    z.append("const PIECES_MAX: usize = %d" % max_st)
     z.append("")
     for i, c in enumerate(CODES, start=1):
         z.append("const %s: u32 = %d" % (konstante(c), i))

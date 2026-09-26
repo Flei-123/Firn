@@ -4617,26 +4617,26 @@ fn fp_handover(
     // Werten sind das zehn.
     let mut hand: Vec<&'static str> = vec!["xmm2", "xmm3"];
     {
-        let mut benutzt: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for l in a.locs.iter() {
             if let Loc::Reg(r) = l {
                 if is_xmm(r) {
-                    benutzt.insert(r);
+                    used.insert(r);
                 }
             }
         }
         for r in a.cells.values() {
             if is_xmm(r) {
-                benutzt.insert(r);
+                used.insert(r);
             }
         }
         for r in FP_POOL.iter() {
-            if !benutzt.contains(r) {
+            if !used.contains(r) {
                 hand.push(r);
             }
         }
     }
-    const FENSTER: usize = 16;
+    const WINDOW: usize = 16;
     let mut uses: Vec<Val> = Vec::new();
     for b in &f.blocks {
         // (Beginn, Ende, Wert) je Kandidat, in Reihenfolge der Erzeugung.
@@ -4673,7 +4673,7 @@ fn fp_handover(
             // Anweisungen weiter, und dazwischen kein Aufruf (jedes `xmm` ist
             // caller-saved).
             let mut readers: Option<usize> = None;
-            for (j, n) in b.insts.iter().enumerate().skip(idx + 1).take(FENSTER) {
+            for (j, n) in b.insts.iter().enumerate().skip(idx + 1).take(WINDOW) {
                 if matches!(
                     &n.op,
                     Op::Call { .. }

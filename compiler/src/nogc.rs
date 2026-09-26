@@ -470,7 +470,7 @@ mod tests {
     // -------------------------------------------------------------- Rules
 
     #[test]
-    fn regel1_gc_allocation_is_forbidden() {
+    fn rule1_gc_allocation_is_forbidden() {
         let mut b = Build::new();
         let call = b.call("gc_new", span(7, 12));
         let n = b.next;
@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn regel2_call_without_no_gc_is_forbidden() {
+    fn rule2_call_without_no_gc_is_forbidden() {
         let mut b = Build::new();
         let call = b.call("cold", span(9, 5));
         let n = b.next;
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn regel2_marked_call_is_allowed() {
+    fn rule2_marked_call_is_allowed() {
         let mut b = Build::new();
         let call = b.call("also_hot", span(9, 5));
         let n = b.next;
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn regel3_write_in_gc_field_is_forbidden() {
+    fn rule3_write_in_gc_field_is_forbidden() {
         let mut b = Build::new();
         let base = b.ident("node", span(4, 5));
         let target = b.field(base, "parent", span(4, 12));
@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn regel3_assign_an_local_mutable_is_allowed() {
+    fn rule3_assign_an_local_mutable_is_allowed() {
         let mut b = Build::new();
         let target = b.ident("x", span(4, 5));
         let value = b.ident("y", span(4, 9));
