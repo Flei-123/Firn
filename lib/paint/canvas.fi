@@ -797,6 +797,168 @@ fn ihi(v: f64, cap: usize) -> usize {
     return i as usize
 }
 
+// The runs of one row of coverage: cells [x0, x1) that all get the same
+// treatment -- the same coverage, or (opaque colour) all at least
+// 0.999999, which `fill_span` stores as the colour word.
+const LIST_MAX: usize = 64
+const LIST_NONE: usize = 65
+
+#[allow_fp]
+struct SpanList {
+    n: usize, // LIST_NONE = no list (too many runs, or none built)
+    x0: [u32; 64],
+    x1: [u32; 64],
+    v: [f64; 64],
+}
+
+#[no_gc]
+#[no_inline]
+fn list_build(sl: *mut SpanList, row: u64, xa: usize, xb: usize, solid: bool) {
+    (*sl).n = 0
+    var x: usize = xa
+    while x < xb {
+        let v: f64 = *((row + (x * 8) as u64) as *mut f64)
+        if v > 0.0 {
+            if (*sl).n >= LIST_MAX {
+                (*sl).n = LIST_NONE
+                return
+            }
+            let st: usize = x
+            x = x + 1
+            if solid && v >= 0.999999 {
+                while x < xb && *((row + (x * 8) as u64) as *mut f64) >= 0.999999 {
+                    x = x + 1
+                }
+            } else {
+                while x < xb && *((row + (x * 8) as u64) as *mut f64) == v {
+                    x = x + 1
+                }
+            }
+            let i: usize = (*sl).n
+            (*sl).x0[i] = st as u32
+            (*sl).x1[i] = x as u32
+            (*sl).v[i] = v
+            (*sl).n = i + 1
+        } else {
+            x = x + 1
+        }
+    }
+}
+
+// `fill_span` for a row whose cells are described by `sl`: the same
+// operation on the same pixel for every cell with ink.
+#[no_gc]
+#[no_inline]
+fn fill_list(c: *mut Canvas, q: u64, sl: *mut SpanList, col: u32, word: u32,
+    solid: bool) {
+    let sr: f64 = (color_r(col) as f64) / 255.0
+    let sg: f64 = (color_g(col) as f64) / 255.0
+    let sb: f64 = (color_b(col) as f64) / 255.0
+    var m_dst: u32 = 0 as u32
+    var m_cov: f64 = 0.0 - 1.0
+    var m_out: u32 = 0 as u32
+    var i: usize = 0
+    while i < (*sl).n {
+        let v: f64 = (*sl).v[i]
+        var x: usize = (*sl).x0[i] as usize
+        let e: usize = (*sl).x1[i] as usize
+        if solid && v >= 0.999999 {
+            while x < e {
+                *((q + (x * 4) as u64) as *mut u32) = word
+                x = x + 1
+            }
+        } else if solid {
+            while x < e {
+                blend_solid(q + (x * 4) as u64, sr, sg, sb, v)
+                x = x + 1
+            }
+        } else {
+            while x < e {
+                let p: u64 = q + (x * 4) as u64
+                let d: u32 = *(p as *mut u32)
+                if d == m_dst && v == m_cov {
+                    *(p as *mut u32) = m_out
+                } else {
+                    blend_px(c, p, col, v)
+                    m_dst = d
+                    m_cov = v
+                    m_out = *(p as *mut u32)
+                }
+                x = x + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// `blend_px` for an opaque colour in the normal mode and 0 < f < 1,
+// with the colour's channels already divided (`fill_span`).
+#[no_gc]
+fn blend_solid(p: u64, sr: f64, sg: f64, sb: f64, f: f64) {
+    let dr: f64 = ldf(p)
+    let dg: f64 = ldf(p + 1)
+    let db: f64 = ldf(p + 2)
+    let da: f64 = ldf(p + 3)
+    let inv: f64 = 1.0 - f
+    st8(p, to255(sr * f + dr * inv))
+    st8(p + 1, to255(sg * f + dg * inv))
+    st8(p + 2, to255(sb * f + db * inv))
+    st8(p + 3, to255(f + da * inv))
+}
+
+// THE CELLS [x0, x1) OF ONE ROW whose pixels all lie inside the clip:
+// `q` is the address of the pixel of cell 0, `row` the first cell. What
+// the per-pixel loop of `canvas_fill_raster` did for them, in a function
+// small enough to keep its loop in registers. For a colour that is not
+// opaque the last blend is remembered: `blend_px` is a function of the
+// pixel below, the colour, the coverage and the mode and nothing else,
+// and inside a translucent card both repeat from pixel to pixel -- the
+// same octets without the twelve multiplications.
+#[no_gc]
+#[no_inline]
+fn fill_span(c: *mut Canvas, q: u64, row: u64, x0: usize, x1: usize,
+    col: u32, word: u32, solid: bool) {
+    var x: usize = x0
+    if solid {
+        // An opaque colour in the normal mode: `blend_px` with sa = f
+        // (255 / 255.0 * f is f, exactly) and the colour's channels
+        // divided once here instead of once per pixel -- the same
+        // divisions, the same products, the same octets.
+        let sr: f64 = (color_r(col) as f64) / 255.0
+        let sg: f64 = (color_g(col) as f64) / 255.0
+        let sb: f64 = (color_b(col) as f64) / 255.0
+        while x < x1 {
+            let v: f64 = *((row + (x * 8) as u64) as *mut f64)
+            if v >= 0.999999 {
+                *((q + (x * 4) as u64) as *mut u32) = word
+            } else if v > 0.0 {
+                blend_solid(q + (x * 4) as u64, sr, sg, sb, v)
+            }
+            x = x + 1
+        }
+        return
+    }
+    var m_dst: u32 = 0 as u32
+    var m_cov: f64 = 0.0 - 1.0
+    var m_out: u32 = 0 as u32
+    while x < x1 {
+        let v: f64 = *((row + (x * 8) as u64) as *mut f64)
+        if v > 0.0 {
+            let p: u64 = q + (x * 4) as u64
+            let d: u32 = *(p as *mut u32)
+            if d == m_dst && v == m_cov {
+                *(p as *mut u32) = m_out
+            } else {
+                blend_px(c, p, col, v)
+                m_dst = d
+                m_cov = v
+                m_out = *(p as *mut u32)
+            }
+        }
+        x = x + 1
+    }
+}
+
 // Everything that is not a rectangle: the rasteriser has been filled and
 // finished, its window sits at (ox, oy) on the canvas.
 #[no_gc]
@@ -835,26 +997,62 @@ fn canvas_fill_raster(c: *mut Canvas, r: *mut raster.Raster,
     let solid: bool = (col >> 24) == 255 as u32 && (*c).mode == BLEND_NORMAL
     let word: u32 = ((col >> 16) & 255 as u32) | (((col >> 8) & 255 as u32) << 8) |
         ((col & 255 as u32) << 16) | 4278190080 as u32
+    // THE RUNS OF A REPEATED ROW (fUi tempo r23). Between the corners of
+    // a round rectangle the rasteriser hands out one row of coverage for
+    // many (`raster_finish_band`): the runs of equal coverage in it are
+    // found once, and every further row of the band is written from them
+    // -- no zero cell of a ring's hollow middle is looked at again.
+    var sl: SpanList = SpanList { n: LIST_NONE, x0: [0 as u32; 64],
+        x1: [0 as u32; 64], v: [0.0; 64] }
     var y: usize = raster.raster_used_y0(r)
     while y < rh {
         let cy: usize = oy + y
         if cy < (*c).h && cy >= iy0 && cy < iy1 {
             let row: u64 = raster.raster_cov_row(r, y)
             let prow: u64 = (*c).px as u64 + (cy * (*c).w * 4) as u64
+            // The cells whose pixel lies inside the clip columns go
+            // through `fill_span` (a small function of its own: in here
+            // the loop had no registers left and kept x on the stack --
+            // fUi tempo r23); the ones left and right of it the careful
+            // way, as before.
+            var xa: i64 = rx0 as i64
+            if (ix0 as i64) - (ox as i64) > xa {
+                xa = (ix0 as i64) - (ox as i64)
+            }
+            var xb: i64 = rw as i64
+            if (ix1 as i64) - (ox as i64) < xb {
+                xb = (ix1 as i64) - (ox as i64)
+            }
+            if xb < xa {
+                xb = xa
+            }
+            if xa > rw as i64 {
+                xa = rw as i64
+                xb = xa
+            }
             var x: usize = rx0
+            while x < xa as usize {
+                let v: f64 = *((row + (x * 8) as u64) as *mut f64)
+                if v > 0.0 && ox + x < (*c).w {
+                    canvas_blend(c, ox + x, cy, col, v)
+                }
+                x = x + 1
+            }
+            if raster.raster_row_repeats(r, y) && sl.n != LIST_NONE {
+                // the same cells as the row above: the runs found there
+                fill_list(c, prow + (ox * 4) as u64, &sl, col, word, solid)
+            } else {
+                fill_span(c, prow + (ox * 4) as u64, row, xa as usize, xb as usize,
+                    col, word, solid)
+                if raster.raster_row_repeats(r, y + 1) {
+                    list_build(&sl, row, xa as usize, xb as usize, solid)
+                }
+            }
+            x = xb as usize
             while x < rw {
                 let v: f64 = *((row + (x * 8) as u64) as *mut f64)
-                if v > 0.0 {
-                    let cx: usize = ox + x
-                    if cx >= ix0 && cx < ix1 && v >= 0.999999 && solid {
-                        // full coverage of an opaque colour: the store of
-                        // blend_px, without the call
-                        *((prow + (cx * 4) as u64) as *mut u32) = word
-                    } else if cx >= ix0 && cx < ix1 {
-                        blend_px(c, prow + (cx * 4) as u64, col, v)
-                    } else if cx < (*c).w {
-                        canvas_blend(c, cx, cy, col, v)
-                    }
+                if v > 0.0 && ox + x < (*c).w {
+                    canvas_blend(c, ox + x, cy, col, v)
                 }
                 x = x + 1
             }

@@ -78,7 +78,7 @@ export {
     raster_cov, raster_cov_row, raster_bytes_needed,
     raster_width, raster_height, raster_ok,
     raster_used_x0, raster_used_y0, raster_used_x1, raster_used_y1,
-    raster_mark, raster_view,
+    raster_mark, raster_view, raster_finish_band, raster_row_repeats,
 }
 
 // The window a path is rasterised into. `ox`/`oy` is its top left corner
@@ -144,6 +144,13 @@ struct Raster {
     vx1: usize,
     vy1: usize,
     vok: usize, // 1 as soon as `raster_finish` has computed the coverage
+    // THE REPEATED BAND (fUi tempo r23, 29.09.2026). `raster_finish_band`
+    // finishes row `rsrc` once and leaves rows [rep0, rep1) unfinished:
+    // their coverage is row `rsrc`'s, and `raster_cov` / `raster_cov_row`
+    // answer with that row. rep1 <= rep0 = no band.
+    rep0: usize,
+    rep1: usize,
+    rsrc: usize,
 }
 
 // ------------------------------------------------- The arithmetic, in house
@@ -248,6 +255,9 @@ fn raster_new() -> Raster {
         vx1: 0,
         vy1: 0,
         vok: 0,
+        rep0: 0,
+        rep1: 0,
+        rsrc: 0,
     }
 }
 
@@ -287,6 +297,8 @@ fn raster_view(r: *mut Raster, p: *mut u8, w: usize, h: usize) {
     (*r).vx1 = w
     (*r).vy1 = h
     (*r).vok = 1
+    (*r).rep0 = 0
+    (*r).rep1 = 0
 }
 
 // Hand the rasteriser memory. It never frees it and never grows it; a
@@ -490,6 +502,8 @@ fn mark_used(r: *mut Raster, y0: usize, y1: usize, x0: usize, x1: usize) {
 #[allow_fp]
 fn reset_used(r: *mut Raster) {
     (*r).vok = 0
+    (*r).rep0 = 0
+    (*r).rep1 = 0
     if (*r).uy1 <= (*r).uy0 || (*r).acc as usize == 0 {
         (*r).ux0 = 0
         (*r).ux1 = 0
@@ -499,20 +513,31 @@ fn reset_used(r: *mut Raster) {
     }
     let base: u64 = (*r).acc as u64
     let st: usize = (*r).dstride
+    // octets per row; the byte loop in zero_octets is what the compiler
+    // turns into one `rep stosb` (compiler/src/memset.rs) -- the cells are
+    // f64, and 0.0 is eight zero octets.
+    let n: usize = ((*r).ux1 - (*r).ux0) * 8
     var y: usize = (*r).uy0
     while y < (*r).uy1 {
-        let row: u64 = base + ((y * st) * 8) as u64
-        var x: usize = (*r).ux0
-        while x < (*r).ux1 {
-            *((row + (x * 8) as u64) as *mut f64) = 0.0
-            x = x + 1
-        }
+        zero_octets(base + ((y * st + (*r).ux0) * 8) as u64, n)
         y = y + 1
     }
     (*r).ux0 = 0
     (*r).ux1 = 0
     (*r).uy0 = 0
     (*r).uy1 = 0
+}
+
+// `n` octets from `p` to zero. Kept in exactly the shape the memset pass
+// recognises (start 0, step 1, one u8 store of the constant 0, nothing
+// else in the body): natively it becomes `rep stosb`.
+#[no_gc]
+fn zero_octets(p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        *((p + i as u64) as *mut u8) = 0 as u8
+        i = i + 1
+    }
 }
 
 #[no_gc]
@@ -565,11 +590,7 @@ fn raster_begin(r: *mut Raster, ox: f64, oy: f64, w: usize, h: usize) -> bool {
     let cells: usize = (*r).stride * h
     if cells > (*r).zeroed {
         let base: u64 = (*r).acc as u64
-        var i: usize = (*r).zeroed
-        while i < cells {
-            *((base + (i * 8) as u64) as *mut f64) = 0.0
-            i = i + 1
-        }
+        zero_octets(base + ((*r).zeroed * 8) as u64, (cells - (*r).zeroed) * 8)
         (*r).zeroed = cells
     }
     return true
@@ -596,16 +617,52 @@ fn cell_add(r: *mut Raster, row: usize, col: i64, v: f64) {
 #[no_gc]
 #[allow_fp]
 fn span(r: *mut Raster, row: usize, lx: f64, rx: f64, d: f64) {
-    let x0floor: f64 = ffloor(lx)
+    // ffloor/fceil/cell_add written out in place (fUi tempo r23): the
+    // compiler embeds at most 2000 calls per program, and in a program of
+    // fUi's size the rasteriser's helpers were past that bound -- every
+    // cell of every glyph paid for four calls. Same operations, same order.
+    var x0floor: f64 = 0.0
+    if lx == lx {
+        if lx > 9.0e15 {
+            x0floor = 9.0e15
+        } else if lx < 0.0 - 9.0e15 {
+            x0floor = 0.0 - 9.0e15
+        } else {
+            x0floor = (lx as i64) as f64
+        }
+    }
+    if x0floor > lx {
+        x0floor = x0floor - 1.0
+    }
     let x0i: i64 = x0floor as i64
-    let x1ceil: f64 = fceil(rx)
+    var x1ceil: f64 = 0.0
+    if rx == rx {
+        if rx > 9.0e15 {
+            x1ceil = 9.0e15
+        } else if rx < 0.0 - 9.0e15 {
+            x1ceil = 0.0 - 9.0e15
+        } else {
+            x1ceil = (rx as i64) as f64
+        }
+    }
+    if x1ceil < rx {
+        x1ceil = x1ceil + 1.0
+    }
     let x1i: i64 = x1ceil as i64
+    let st: i64 = (*r).stride as i64
+    let rb: u64 = (*r).acc as u64 + ((row * (*r).stride) * 8) as u64
     if x1i <= x0i + 1 {
         // The whole piece lies inside one pixel: split it between that
         // pixel and its right neighbour by where its MIDDLE sits.
         let xmf: f64 = 0.5 * (lx + rx) - x0floor
-        cell_add(r, row, x0i, d - d * xmf)
-        cell_add(r, row, x0i + 1, d * xmf)
+        if x0i >= 0 && x0i < st {
+            let a: u64 = rb + (x0i * 8) as u64
+            *(a as *mut f64) = *(a as *mut f64) + (d - d * xmf)
+        }
+        if x0i + 1 >= 0 && x0i + 1 < st {
+            let a: u64 = rb + ((x0i + 1) * 8) as u64
+            *(a as *mut f64) = *(a as *mut f64) + d * xmf
+        }
         return
     }
     let s: f64 = 1.0 / (rx - lx)
@@ -613,21 +670,40 @@ fn span(r: *mut Raster, row: usize, lx: f64, rx: f64, d: f64) {
     let a0: f64 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f)
     let x1f: f64 = rx - x1ceil + 1.0
     let am: f64 = 0.5 * s * x1f * x1f
-    cell_add(r, row, x0i, d * a0)
+    if x0i >= 0 && x0i < st {
+        let a: u64 = rb + (x0i * 8) as u64
+        *(a as *mut f64) = *(a as *mut f64) + d * a0
+    }
     if x1i == x0i + 2 {
-        cell_add(r, row, x0i + 1, d * (1.0 - a0 - am))
+        if x0i + 1 >= 0 && x0i + 1 < st {
+            let a: u64 = rb + ((x0i + 1) * 8) as u64
+            *(a as *mut f64) = *(a as *mut f64) + d * (1.0 - a0 - am)
+        }
     } else {
         let a1: f64 = s * (1.5 - x0f)
-        cell_add(r, row, x0i + 1, d * (a1 - a0))
+        if x0i + 1 >= 0 && x0i + 1 < st {
+            let a: u64 = rb + ((x0i + 1) * 8) as u64
+            *(a as *mut f64) = *(a as *mut f64) + d * (a1 - a0)
+        }
         var xi: i64 = x0i + 2
+        let ds: f64 = d * s
         while xi < x1i - 1 {
-            cell_add(r, row, xi, d * s)
+            if xi >= 0 && xi < st {
+                let a: u64 = rb + (xi * 8) as u64
+                *(a as *mut f64) = *(a as *mut f64) + ds
+            }
             xi = xi + 1
         }
         let a2: f64 = a1 + ((x1i - x0i - 3) as f64) * s
-        cell_add(r, row, x1i - 1, d * (1.0 - a2 - am))
+        if x1i - 1 >= 0 && x1i - 1 < st {
+            let a: u64 = rb + ((x1i - 1) * 8) as u64
+            *(a as *mut f64) = *(a as *mut f64) + d * (1.0 - a2 - am)
+        }
     }
-    cell_add(r, row, x1i, d * am)
+    if x1i >= 0 && x1i < st {
+        let a: u64 = rb + (x1i * 8) as u64
+        *(a as *mut f64) = *(a as *mut f64) + d * am
+    }
 }
 
 // ------------------------------------------------------------- One edge
@@ -640,8 +716,7 @@ fn accumulate(r: *mut Raster, p0x: f64, p0y: f64, p1x: f64, p1y: f64) {
     if p0y == p1y {
         return // a horizontal edge changes no coverage anywhere
     }
-    if fis_nan(p0x) || fis_nan(p0y) || fis_nan(p1x) ||
-    fis_nan(p1y) {
+    if p0x != p0x || p0y != p0y || p1x != p1x || p1y != p1y {
         return
     }
     // Run downwards, remember which way round it really was.
@@ -700,28 +775,80 @@ fn accumulate(r: *mut Raster, p0x: f64, p0y: f64, p1x: f64, p1y: f64) {
     if mlo > wf {
         mlo = wf
     }
-    var my0: i64 = ffloor(ys) as i64
+    var fys: f64 = 0.0
+    if ys == ys {
+        if ys > 9.0e15 {
+            fys = 9.0e15
+        } else if ys < 0.0 - 9.0e15 {
+            fys = 0.0 - 9.0e15
+        } else {
+            fys = (ys as i64) as f64
+        }
+    }
+    if fys > ys {
+        fys = fys - 1.0
+    }
+    var cye: f64 = 0.0
+    if ye == ye {
+        if ye > 9.0e15 {
+            cye = 9.0e15
+        } else if ye < 0.0 - 9.0e15 {
+            cye = 0.0 - 9.0e15
+        } else {
+            cye = (ye as i64) as f64
+        }
+    }
+    if cye < ye {
+        cye = cye + 1.0
+    }
+    var my0: i64 = fys as i64
     if my0 < 0 {
         my0 = 0
     }
-    var my1: i64 = fceil(ye) as i64
+    var my1: i64 = cye as i64
     if my1 > (*r).h as i64 {
         my1 = (*r).h as i64
     }
     if my1 > my0 {
-        var mx0: i64 = ffloor(mlo) as i64
+        var fmlo: f64 = 0.0
+        if mlo == mlo {
+            if mlo > 9.0e15 {
+                fmlo = 9.0e15
+            } else if mlo < 0.0 - 9.0e15 {
+                fmlo = 0.0 - 9.0e15
+            } else {
+                fmlo = (mlo as i64) as f64
+            }
+        }
+        if fmlo > mlo {
+            fmlo = fmlo - 1.0
+        }
+        var cmhi: f64 = 0.0
+        if mhi == mhi {
+            if mhi > 9.0e15 {
+                cmhi = 9.0e15
+            } else if mhi < 0.0 - 9.0e15 {
+                cmhi = 0.0 - 9.0e15
+            } else {
+                cmhi = (mhi as i64) as f64
+            }
+        }
+        if cmhi < mhi {
+            cmhi = cmhi + 1.0
+        }
+        var mx0: i64 = fmlo as i64
         if mx0 < 0 {
             mx0 = 0
         }
-        var mx1: i64 = (fceil(mhi) as i64) + 2
+        var mx1: i64 = (cmhi as i64) + 2
         if mx1 > (*r).stride as i64 {
             mx1 = (*r).stride as i64
         }
         mark_used(r, my0 as usize, my1 as usize, mx0 as usize, mx1 as usize)
     }
     var x: f64 = xs
-    var yrow: i64 = ffloor(ys) as i64
-    let ylast: i64 = fceil(ye) as i64
+    var yrow: i64 = fys as i64
+    let ylast: i64 = cye as i64
     while yrow < ylast {
         let rowtop: f64 = yrow as f64
         var ytop: f64 = rowtop
@@ -871,75 +998,165 @@ fn raster_finish(r: *mut Raster) {
     if (*r).ok == 0 {
         return
     }
-    // ROUND FIRN-LUECKEN: only the rows that were written. To the left of
-    // `ux0` every cell is zero, so the running sum starts at zero there --
-    // that is not an approximation, it is the same number the walk from
-    // column zero would have arrived at.
-    let base: u64 = (*r).acc as u64
-    var y: usize = (*r).uy0
+    raster_finish_band(r, 0, 0)
+}
+
+// ONE ROW of `raster_finish`. Returns in `*lo`/`*hi` the first and last
+// column + 1 that carry ink (`*hi` == 0: none), in `*far` the column the
+// walk stopped at. Split out of the old per-cell loop (fUi tempo r23): the
+// written part [ux0, ux1) runs without the look-ahead test, and the ink
+// is found per row instead of per cell -- the same numbers, fewer tests.
+#[no_gc]
+#[allow_fp]
+fn finish_row(r: *mut Raster, y: usize, lo: *mut usize, hi: *mut usize,
+    far: *mut usize) {
+    let base: u64 = (*r).acc as u64 + ((y * (*r).stride) * 8) as u64
+    let w: usize = (*r).w
+    var lim: usize = (*r).ux1
+    if lim > w {
+        lim = w
+    }
+    var acc: f64 = 0.0
+    var x: usize = (*r).ux0
+    var first: usize = w
+    var last: usize = 0
+    var inked: bool = false
+    while x < lim {
+        let a: u64 = base + (x * 8) as u64
+        acc = acc + *(a as *mut f64)
+        var v: f64 = acc
+        if v < 0.0 {
+            v = 0.0 - v
+        }
+        if v > 1.0 {
+            v = 1.0
+        }
+        *(a as *mut f64) = v
+        if v > 0.0 {
+            if !inked {
+                inked = true
+                first = x
+            }
+            last = x
+        }
+        x = x + 1
+    }
+    // Past the written rectangle there is nothing left to add. The walk
+    // runs on only while the sum has NOT come back to zero -- a contour
+    // that was cut off at the right border is the one case where coverage
+    // continues.
+    while x < w {
+        if acc < 0.001953125 && acc > 0.0 - 0.001953125 {
+            break
+        }
+        let a: u64 = base + (x * 8) as u64
+        acc = acc + *(a as *mut f64)
+        var v: f64 = acc
+        if v < 0.0 {
+            v = 0.0 - v
+        }
+        if v > 1.0 {
+            v = 1.0
+        }
+        *(a as *mut f64) = v
+        if v > 0.0 {
+            if !inked {
+                inked = true
+                first = x
+            }
+            last = x
+        }
+        x = x + 1
+    }
+    *far = x
+    if inked {
+        *lo = first
+        *hi = last + 1
+    } else {
+        *lo = 0
+        *hi = 0
+    }
+}
+
+// `raster_finish` with a PROMISE from the caller: the rows [b0, b1) of
+// the window got exactly the same differences, cell for cell (a round
+// rectangle between its corners: only its two vertical sides cross those
+// rows, at the same x, over the whole row -- lib/fui/painter.fi,
+// `band_rows`). Then row b0 is finished once and the others are not
+// touched: `raster_cov` and `raster_cov_row` answer for them with row b0.
+// That is the same coverage the full walk computes for each of them --
+// the same differences, summed in the same order -- without the walk.
+// b1 <= b0 + 1 is the plain `raster_finish`.
+#[no_gc]
+#[allow_fp]
+fn raster_finish_band(r: *mut Raster, b0: usize, b1: usize) {
+    if (*r).ok == 0 {
+        return
+    }
+    var s0: usize = b0
+    var s1: usize = b1
+    if s0 < (*r).uy0 {
+        s0 = (*r).uy0
+    }
+    if s1 > (*r).uy1 {
+        s1 = (*r).uy1
+    }
+    if s1 <= s0 + 1 {
+        s0 = (*r).uy1
+        s1 = (*r).uy1
+    }
     var far: usize = (*r).ux1
-    // The rectangle that really carries COVERAGE. It is at most the one
-    // that was written to, and usually smaller: a contour whose edges all
-    // lie left of the window writes cells in column zero, and they all
-    // cancel out. Whoever asks afterwards ("did anything land in the
-    // picture?") gets the honest answer, and `canvas_fill_raster` walks
-    // the ink instead of the paper.
     var cy0: usize = 0
     var cy1: usize = 0
     var cx0: usize = 0
     var cx1: usize = 0
     var any: bool = false
+    var y: usize = (*r).uy0
     while y < (*r).uy1 {
-        var acc: f64 = 0.0
-        var x: usize = (*r).ux0
-        let row: usize = y * (*r).stride
-        while x < (*r).w {
-            if x >= (*r).ux1 {
-                // Past the written rectangle there is nothing left to add.
-                // The loop runs on only while the sum has NOT come back to
-                // zero -- a contour that was cut off at the right border is
-                // the one case where coverage continues, and it kept
-                // continuing before this round as well.
-                if acc < 0.001953125 && acc > 0.0 - 0.001953125 {
-                    break
+        var lo: usize = 0
+        var hi: usize = 0
+        var fx: usize = 0
+        finish_row(r, y, &lo, &hi, &fx)
+        if fx > far {
+            far = fx
+        }
+        var ylast: usize = y
+        if y == s0 {
+            // the band: its rows are this one
+            ylast = s1 - 1
+        }
+        if hi > 0 {
+            if !any {
+                any = true
+                cy0 = y
+                cx0 = lo
+                cx1 = hi
+            } else {
+                if lo < cx0 {
+                    cx0 = lo
+                }
+                if hi > cx1 {
+                    cx1 = hi
                 }
             }
-            let a: u64 = base + ((row + x) * 8) as u64
-            acc = acc + *(a as *mut f64)
-            var v: f64 = acc
-            if v < 0.0 {
-                v = 0.0 - v
-            }
-            if v > 1.0 {
-                v = 1.0
-            }
-            *(a as *mut f64) = v
-            if v > 0.0 {
-                if !any {
-                    any = true
-                    cy0 = y
-                    cy1 = y + 1
-                    cx0 = x
-                    cx1 = x + 1
-                } else {
-                    cy1 = y + 1
-                    if x < cx0 {
-                        cx0 = x
-                    }
-                    if x + 1 > cx1 {
-                        cx1 = x + 1
-                    }
-                }
-            }
-            x = x + 1
+            cy1 = ylast + 1
         }
-        if x > far {
-            far = x
+        if y == s0 {
+            y = s1
+        } else {
+            y = y + 1
         }
-        y = y + 1
     }
     if far > (*r).ux1 {
         (*r).ux1 = far
+    }
+    if s1 > s0 + 1 {
+        (*r).rep0 = s0 + 1
+        (*r).rep1 = s1
+        (*r).rsrc = s0
+    } else {
+        (*r).rep0 = 0
+        (*r).rep1 = 0
     }
     // The ink, kept BESIDE the written rectangle and not instead of it:
     // the cells at `w` and `w + 1` are never read here and never cleared
@@ -956,6 +1173,22 @@ fn raster_finish(r: *mut Raster) {
         (*r).vx0 = 0
         (*r).vx1 = 0
     }
+}
+
+// Row `y` of the band is row `rsrc` (see `raster_finish_band`).
+#[no_gc]
+fn row_of(r: *mut Raster, y: usize) -> usize {
+    if y >= (*r).rep0 && y < (*r).rep1 {
+        return (*r).rsrc
+    }
+    return y
+}
+
+// Whether row `y` has the same coverage as row `y - 1` by construction
+// (both in one band) -- a writer may copy what it made of the row above.
+#[no_gc]
+fn raster_row_repeats(r: *mut Raster, y: usize) -> bool {
+    return y >= (*r).rep0 && y < (*r).rep1 && y > (*r).rsrc
 }
 
 // ======================================================================
@@ -1086,7 +1319,7 @@ fn raster_cov(r: *mut Raster, x: usize, y: usize) -> f64 {
     if x >= (*r).w || y >= (*r).h || (*r).ok == 0 {
         return 0.0
     }
-    let idx: usize = y * (*r).stride + x
+    let idx: usize = row_of(r, y) * (*r).stride + x
     return *(((*r).acc as u64 + (idx * 8) as u64) as *mut f64)
 }
 
@@ -1094,5 +1327,5 @@ fn raster_cov(r: *mut Raster, x: usize, y: usize) -> f64 {
 // to pay for the bounds check per pixel.
 #[no_gc]
 fn raster_cov_row(r: *mut Raster, y: usize) -> u64 {
-    return (*r).acc as u64 + ((y * (*r).stride) * 8) as u64
+    return (*r).acc as u64 + ((row_of(r, y) * (*r).stride) * 8) as u64
 }
