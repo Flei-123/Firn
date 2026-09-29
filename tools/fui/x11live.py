@@ -269,12 +269,20 @@ try:
     srv.run("xdotool", "key", "Home")
     ok = d.warte(lambda z: (d.letzter_zustand() or [0, 1])[1] == 0)
     chk("L4", "Taste Pos1: oben", ok is not None, d.letzter_zustand()[1], 0)
+    # The focus BEFORE the key, read once the window is quiet: waiting for
+    # "some focus" returned at once when a focus was already set, before
+    # the Tab was handled -- a race that fast frames (r23) made visible
+    # ("51 -> 51").
+    d.ruhig(0.3)
+    f0 = (d.letzter_zustand() or [0] * 6)[5]
     srv.run("xdotool", "key", "Tab")
-    ok = d.warte(lambda z: (d.letzter_zustand() or [0] * 6)[5] != 7 and
+    ok = d.warte(lambda z: (d.letzter_zustand() or [0] * 6)[5] != f0 and
                  (d.letzter_zustand() or [0] * 6)[5] >= 0)
+    d.ruhig(0.3)
     f1 = d.letzter_zustand()[5]
     srv.run("xdotool", "key", "shift+Tab")
     ok2 = d.warte(lambda z: (d.letzter_zustand() or [0] * 6)[5] != f1)
+    d.ruhig(0.3)
     f2 = d.letzter_zustand()[5]
     chk("L4", "Tab / Umschalt+Tab bewegen den Fokus", ok is not None and
         ok2 is not None and f1 != f2, "%d -> %d" % (f1, f2), "verschieden")
@@ -287,6 +295,7 @@ try:
     d.ruhig()
     n1 = d.bilder()
     c2 = d.cpu()
+    vorher = (d.letzter_zustand() or [0] * 5)[4]
     sx, sy = d.mitte("starten")
     srv.run("xdotool", "mousemove", str(sx), str(sy), "click", "1")
     ok = d.warte(lambda z: (d.letzter_zustand() or [0] * 5)[4] == 1000, 8)
@@ -295,6 +304,12 @@ try:
         d.letzter_zustand()[4], 1000)
     werte = [int(l.split()[5]) for l in d.zeilen()
              if l.startswith("zustand ")][n1:]
+    # Frames that still show the value from BEFORE the click are not part
+    # of the animation: since the rasteriser got fast (r23, 29.09.2026)
+    # the pressed button is painted on its own, before the release starts
+    # the tween -- with the old progress (450) still in it.
+    while len(werte) > 1 and werte[0] == vorher:
+        werte = werte[1:]
     steigt = all(b >= a for a, b in zip(werte, werte[1:]))
     zwischen = [v for v in werte if 0 < v < 1000]
     chk("L5", "Bild fuer Bild steigend, mit Zwischenstaenden",

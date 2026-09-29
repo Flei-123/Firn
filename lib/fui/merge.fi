@@ -1,0 +1,547 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/merge.fi -- MERGE GROUPS: shapes that melt into each other when
+// they come close (fUi, prototype of 29.09.2026, roadmap r68).
+//
+// ================================================================ WHAT
+//
+// A merge group holds up to MERGE_MAX shapes (round rectangles, circles
+// as round rectangles with r = w/2) and paints them as ONE outline: far
+// apart every shape looks exactly like itself, and when two of them come
+// closer than `k` pixels the gap between them fills with a smooth neck --
+// the "gooey" look of two drops touching. Moving the shapes (a spring
+// from lib/fui/anim.fi) makes them melt and tear apart again.
+//
+// ================================================================ HOW
+//
+// Every shape has a SIGNED DISTANCE FIELD: negative inside, zero on the
+// outline, the distance in pixels outside (`sd_box`, the exact Euclidean
+// distance to a round rectangle). The group's field combines them:
+//
+//   MODE_SMOOTH   quadratic smooth minimum (Quilez): min(a, b) minus a
+//                 bump that is zero as soon as |a - b| >= k. Two shapes
+//                 more than k apart are therefore the PLAIN union --
+//                 nothing moves, nothing grows.
+//   MODE_SMOOTH3  the cubic smooth minimum: the same, with a neck whose
+//                 curvature is continuous too (C2 instead of C1).
+//   MODE_FACING   the quadratic minimum, but its bump weighted with
+//                 min(1, 1 - cos) of the angle between the two shapes'
+//                 gradients: full between FACING edges (the gap between
+//                 two pills), nothing along edges that run the SAME way
+//                 (the top edges of two overlapping pills) -- so
+//                 overlapping pills become one pill without a bulge.
+//   MODE_SUM      the classic metaball rule, "add the fields, cut at a
+//                 threshold": each shape contributes (1 - d/k)^2 within
+//                 k of it, the outline is where the sum crosses 1. A lone
+//                 shape's outline is its own (sum 1 exactly at d = 0).
+//
+// `k` is the MELT GAP, the same for all three rules: two parallel edges
+// closer than k pixels are bridged. Each rule turns it into its own
+// reach (`reach_of`): the quadratic minimum starts to pull at 2k, the
+// cubic at 3k, the sum at k / (2 - sqrt 2) -- closer than that the shapes
+// already lean towards each other, further apart nothing changes.
+//
+// The edge is antialiased from the distance: coverage = 0.5 - d, clamped
+// to [0, 1] -- one pixel of ramp across the outline. MODE_SUM has no
+// distance, only a field; its distance is k' (1 - sqrt F) with k' the
+// reach, which IS the distance where one shape alone contributes (F =
+// (1 - d/k')^2), so a lone shape's edge is the same as in the smooth
+// rules.
+//
+// MODE_FACING is the default: tools/fui/merge_main.fi measured the four
+// rules on the same pills (29.09.2026) -- all four leave shapes further
+// apart than their reach untouched, melt at k/2, change no octet with the
+// tiles and never jump by more than 0.8 % of a circle per quarter pixel;
+// only MODE_FACING keeps two OVERLAPPING pills one straight pill (bulge
+// 1 px against 7 px for the other three).
+//
+// ================================================================ HOW FAST
+//
+// Only the bounding box of the group plus the reach is visited, in blocks
+// of 16 x 16 pixels. For the smooth modes the field is 1-Lipschitz (each
+// shape's distance is; the smooth minimum mixes the gradients convexly),
+// for MODE_SUM at most sqrt(n)-Lipschitz (the norm of n terms that are
+// each 1/k'-Lipschitz, times k'). So ONE evaluation at the centre of a
+// block tells whether the whole block is outside (skip), inside (filled
+// without a single further evaluation) or crosses the outline -- then it
+// is split in four, down to 4 x 4, and only those are walked per pixel.
+// The cost is the perimeter, not the area. `merge_paint_tiles(.., false)`
+// walks every pixel instead -- the proof that the shortcut changes no
+// octet (tools/fui/merge_main.fi).
+import paint.canvas
+import fui.painter
+
+export {
+    MergeGroup, MERGE_MAX, MODE_SMOOTH, MODE_SMOOTH3, MODE_SUM, MODE_FACING,
+    merge_new, merge_clear, merge_set_mode, merge_mode, merge_set_k,
+    merge_add_rect, merge_add_circle, merge_count, merge_field,
+    merge_paint, merge_paint_tiles,
+    merge_tiles_full, merge_tiles_edge, merge_tiles_empty, merge_evals,
+}
+
+const MERGE_MAX: usize = 16
+const MODE_SMOOTH: u32 = 0
+const MODE_SMOOTH3: u32 = 1
+const MODE_SUM: u32 = 2
+const MODE_FACING: u32 = 3
+const BLOCK: usize = 16
+const SMALL: usize = 4
+
+#[allow_fp]
+struct MergeGroup {
+    n: usize,
+    cx: [f64; 16], // centre
+    cy: [f64; 16],
+    hw: [f64; 16], // half width / half height
+    hh: [f64; 16],
+    rad: [f64; 16], // corner radius, clamped to the shorter half side
+    k: f64, // the melt distance in pixels
+    mode: u32,
+    // what the last paint did -- measured, not guessed
+    t_full: usize,
+    t_edge: usize,
+    t_empty: usize,
+    evals: usize,
+}
+
+#[allow_fp]
+fn merge_new(k: f64) -> MergeGroup {
+    return MergeGroup {
+        n: 0, cx: [0.0; 16], cy: [0.0; 16], hw: [0.0; 16], hh: [0.0; 16],
+        rad: [0.0; 16], k: k, mode: MODE_FACING,
+        t_full: 0, t_edge: 0, t_empty: 0, evals: 0,
+    }
+}
+
+fn merge_clear(g: *mut MergeGroup) {
+    (*g).n = 0
+}
+
+fn merge_set_mode(g: *mut MergeGroup, m: u32) {
+    (*g).mode = m
+}
+
+fn merge_mode(g: *mut MergeGroup) -> u32 {
+    return (*g).mode
+}
+
+#[allow_fp]
+fn merge_set_k(g: *mut MergeGroup, k: f64) {
+    (*g).k = k
+}
+
+fn merge_count(g: *mut MergeGroup) -> usize {
+    return (*g).n
+}
+
+fn merge_tiles_full(g: *mut MergeGroup) -> usize { return (*g).t_full }
+fn merge_tiles_edge(g: *mut MergeGroup) -> usize { return (*g).t_edge }
+fn merge_tiles_empty(g: *mut MergeGroup) -> usize { return (*g).t_empty }
+fn merge_evals(g: *mut MergeGroup) -> usize { return (*g).evals }
+
+// A round rectangle, top left corner (x, y). false = the group is full or
+// the box is empty.
+#[allow_fp]
+fn merge_add_rect(g: *mut MergeGroup, x: f64, y: f64, w: f64, h: f64,
+    r: f64) -> bool {
+    if (*g).n >= MERGE_MAX || !(w > 0.0) || !(h > 0.0) {
+        return false
+    }
+    let i: usize = (*g).n
+    (*g).cx[i] = x + w * 0.5
+    (*g).cy[i] = y + h * 0.5
+    (*g).hw[i] = w * 0.5
+    (*g).hh[i] = h * 0.5
+    var rr: f64 = r
+    if rr > w * 0.5 {
+        rr = w * 0.5
+    }
+    if rr > h * 0.5 {
+        rr = h * 0.5
+    }
+    if rr < 0.0 {
+        rr = 0.0
+    }
+    (*g).rad[i] = rr
+    (*g).n = i + 1
+    return true
+}
+
+#[allow_fp]
+fn merge_add_circle(g: *mut MergeGroup, cx: f64, cy: f64, r: f64) -> bool {
+    return merge_add_rect(g, cx - r, cy - r, 2.0 * r, 2.0 * r, r)
+}
+
+#[allow_fp]
+fn fabs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// The exact signed distance from (px, py) to shape i.
+#[allow_fp]
+fn sd_box(g: *mut MergeGroup, i: usize, px: f64, py: f64) -> f64 {
+    let r: f64 = (*g).rad[i]
+    let qx: f64 = fabs(px - (*g).cx[i]) - (*g).hw[i] + r
+    let qy: f64 = fabs(py - (*g).cy[i]) - (*g).hh[i] + r
+    var ox: f64 = qx
+    if ox < 0.0 {
+        ox = 0.0
+    }
+    var oy: f64 = qy
+    if oy < 0.0 {
+        oy = 0.0
+    }
+    // one instruction (sqrtsd), not the Newton loop of svg.matrix --
+    // this runs per edge pixel
+    let outside: f64 = __sqrt(ox * ox + oy * oy)
+    var inside: f64 = qx
+    if qy > inside {
+        inside = qy
+    }
+    if inside > 0.0 {
+        inside = 0.0
+    }
+    return outside + inside - r
+}
+
+// The internal width of each rule for the melt gap k (see the head).
+#[allow_fp]
+fn reach_of(g: *mut MergeGroup) -> f64 {
+    let k: f64 = (*g).k
+    if k <= 0.0 {
+        return 0.0
+    }
+    if (*g).mode == MODE_SMOOTH3 {
+        return 3.0 * k
+    }
+    if (*g).mode == MODE_SUM {
+        return k / (2.0 - 1.4142135623730951)
+    }
+    return 2.0 * k
+}
+
+// sd_box with its gradient (unit length) in *gx, *gy.
+#[allow_fp]
+fn sd_box_g(g: *mut MergeGroup, i: usize, px: f64, py: f64, gx: *mut f64,
+    gy: *mut f64) -> f64 {
+    let r: f64 = (*g).rad[i]
+    let dx: f64 = px - (*g).cx[i]
+    let dy: f64 = py - (*g).cy[i]
+    var sx: f64 = 1.0
+    if dx < 0.0 {
+        sx = 0.0 - 1.0
+    }
+    var sy: f64 = 1.0
+    if dy < 0.0 {
+        sy = 0.0 - 1.0
+    }
+    let qx: f64 = fabs(dx) - (*g).hw[i] + r
+    let qy: f64 = fabs(dy) - (*g).hh[i] + r
+    var ox: f64 = qx
+    if ox < 0.0 {
+        ox = 0.0
+    }
+    var oy: f64 = qy
+    if oy < 0.0 {
+        oy = 0.0
+    }
+    let l: f64 = __sqrt(ox * ox + oy * oy)
+    if l > 0.0 {
+        *gx = sx * ox / l
+        *gy = sy * oy / l
+        return l - r
+    }
+    if qx > qy {
+        *gx = sx
+        *gy = 0.0
+        return qx - r
+    }
+    *gx = 0.0
+    *gy = sy
+    return qy - r
+}
+
+#[allow_fp]
+fn smin2(a: f64, b: f64, k: f64) -> f64 {
+    var m: f64 = a
+    if b < m {
+        m = b
+    }
+    if k <= 0.0 {
+        return m
+    }
+    var h: f64 = k - fabs(a - b)
+    if h <= 0.0 {
+        return m
+    }
+    h = h / k
+    return m - h * h * k * 0.25
+}
+
+#[allow_fp]
+fn smin3(a: f64, b: f64, k: f64) -> f64 {
+    var m: f64 = a
+    if b < m {
+        m = b
+    }
+    if k <= 0.0 {
+        return m
+    }
+    var h: f64 = k - fabs(a - b)
+    if h <= 0.0 {
+        return m
+    }
+    h = h / k
+    return m - h * h * h * k * (1.0 / 6.0)
+}
+
+// MODE_SUM: the sum of the falloffs (1 - d/k)^2 (d < k), 0 beyond.
+#[allow_fp]
+fn field_sum(g: *mut MergeGroup, px: f64, py: f64, k: f64) -> f64 {
+    var s: f64 = 0.0
+    var i: usize = 0
+    while i < (*g).n {
+        let d: f64 = sd_box(g, i, px, py)
+        if d < k {
+            let t: f64 = 1.0 - d / k
+            s = s + t * t
+        }
+        i = i + 1
+    }
+    return s
+}
+
+// THE GROUP'S FIELD at (px, py): a signed distance in pixels (negative
+// inside). For MODE_SUM it is the distance ESTIMATE (1 - F) / |grad F|,
+// the gradient by central differences.
+#[allow_fp]
+fn merge_field(g: *mut MergeGroup, px: f64, py: f64) -> f64 {
+    (*g).evals = (*g).evals + 1
+    if (*g).n == 0 {
+        return 1.0e9
+    }
+    let kk: f64 = reach_of(g)
+    if (*g).mode == MODE_SUM && kk > 0.0 {
+        let f: f64 = field_sum(g, px, py, kk)
+        if f <= 0.0 {
+            return kk // outside every falloff
+        }
+        return kk * (1.0 - __sqrt(f))
+    }
+    if (*g).mode == MODE_FACING && kk > 0.0 {
+        var ax: f64 = 0.0
+        var ay: f64 = 0.0
+        var a: f64 = sd_box_g(g, 0, px, py, &ax, &ay)
+        var j: usize = 1
+        while j < (*g).n {
+            var bx: f64 = 0.0
+            var by: f64 = 0.0
+            let b: f64 = sd_box_g(g, j, px, py, &bx, &by)
+            var h: f64 = kk - fabs(a - b)
+            var m: f64 = a
+            if b < m {
+                m = b
+            }
+            if h > 0.0 {
+                h = h / kk
+                // 1 - cos, capped at 1: full from a right angle on
+                // (measured against (1 - cos) / 2: the same 0-pixel
+                // bulge within a pixel, but the crease at the seam of
+                // two overlapping pills 0.18 instead of 0.47 px)
+                var w: f64 = 1.0 - (ax * bx + ay * by)
+                if w > 1.0 {
+                    w = 1.0
+                }
+                m = m - h * h * kk * 0.25 * w
+            }
+            if b < a {
+                ax = bx
+                ay = by
+            }
+            a = m
+            j = j + 1
+        }
+        return a
+    }
+    var d: f64 = sd_box(g, 0, px, py)
+    var i: usize = 1
+    while i < (*g).n {
+        let e: f64 = sd_box(g, i, px, py)
+        if kk <= 0.0 || (*g).mode == MODE_SUM {
+            if e < d {
+                d = e
+            }
+        } else if (*g).mode == MODE_SMOOTH3 {
+            d = smin3(d, e, kk)
+        } else {
+            d = smin2(d, e, kk)
+        }
+        i = i + 1
+    }
+    return d
+}
+
+#[allow_fp]
+fn cov_of(d: f64) -> f64 {
+    var c: f64 = 0.5 - d
+    if c < 0.0 {
+        c = 0.0
+    }
+    if c > 1.0 {
+        c = 1.0
+    }
+    return c
+}
+
+// Paint the group in `col` (alpha as everywhere in fUi: 0 = opaque).
+#[allow_fp]
+fn merge_paint(z: *mut painter.Painter, g: *mut MergeGroup, col: u32) {
+    merge_paint_tiles(z, g, col, true)
+}
+
+#[allow_fp]
+fn merge_paint_tiles(z: *mut painter.Painter, g: *mut MergeGroup, col: u32,
+    tiles: bool) {
+    (*g).t_full = 0
+    (*g).t_edge = 0
+    (*g).t_empty = 0
+    (*g).evals = 0
+    if (*g).n == 0 {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let c: u32 = painter.mit_alpha(col)
+    if canvas.canvas_gpu(cv) != 0 {
+        // ON THE GPU there is no field shader yet: every shape on its
+        // own (not melted) -- visible, never missing.
+        var j: usize = 0
+        while j < (*g).n {
+            painter.round_rect(z, (*g).cx[j] - (*g).hw[j], (*g).cy[j] - (*g).hh[j],
+                2.0 * (*g).hw[j], 2.0 * (*g).hh[j], (*g).rad[j], col)
+            j = j + 1
+        }
+        return
+    }
+    // the box: every shape plus k (a neck never reaches further) plus
+    // one pixel of ramp
+    var bx0: f64 = 1.0e18
+    var by0: f64 = 1.0e18
+    var bx1: f64 = 0.0 - 1.0e18
+    var by1: f64 = 0.0 - 1.0e18
+    var i: usize = 0
+    while i < (*g).n {
+        let x0: f64 = (*g).cx[i] - (*g).hw[i]
+        let y0: f64 = (*g).cy[i] - (*g).hh[i]
+        let x1: f64 = (*g).cx[i] + (*g).hw[i]
+        let y1: f64 = (*g).cy[i] + (*g).hh[i]
+        if x0 < bx0 { bx0 = x0 }
+        if y0 < by0 { by0 = y0 }
+        if x1 > bx1 { bx1 = x1 }
+        if y1 > by1 { by1 = y1 }
+        i = i + 1
+    }
+    let pad: f64 = 2.0 + reach_of(g)
+    bx0 = bx0 - pad
+    by0 = by0 - pad
+    bx1 = bx1 + pad
+    by1 = by1 + pad
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+    if bx0 < 0.0 { bx0 = 0.0 }
+    if by0 < 0.0 { by0 = 0.0 }
+    if bx1 > cw { bx1 = cw }
+    if by1 > ch { by1 = ch }
+    if bx1 <= bx0 || by1 <= by0 {
+        return
+    }
+    let ix0: usize = bx0 as usize
+    let iy0: usize = by0 as usize
+    var ix1: usize = bx1 as usize
+    if (ix1 as f64) < bx1 {
+        ix1 = ix1 + 1
+    }
+    var iy1: usize = by1 as usize
+    if (iy1 as f64) < by1 {
+        iy1 = iy1 + 1
+    }
+    // the Lipschitz bound of the field (see the head)
+    var lip: f64 = 1.0
+    if (*g).mode == MODE_SUM {
+        lip = __sqrt((*g).n as f64)
+    }
+    var ty: usize = iy0
+    while ty < iy1 {
+        var ty1: usize = ty + BLOCK
+        if ty1 > iy1 {
+            ty1 = iy1
+        }
+        var tx: usize = ix0
+        while tx < ix1 {
+            var tx1: usize = tx + BLOCK
+            if tx1 > ix1 {
+                tx1 = ix1
+            }
+            paint_block(cv, g, c, tx, ty, tx1, ty1, lip, tiles)
+            tx = tx1
+        }
+        ty = ty1
+    }
+}
+
+// One block [x0, x1) x [y0, y1): skipped, filled, split or walked.
+#[allow_fp]
+fn paint_block(cv: *mut canvas.Canvas, g: *mut MergeGroup, c: u32, x0: usize,
+    y0: usize, x1: usize, y1: usize, lip: f64, tiles: bool) {
+    if tiles {
+        // centre of the pixel centres, and their half diagonal
+        let mx: f64 = ((x0 + x1) as f64) * 0.5
+        let my: f64 = ((y0 + y1) as f64) * 0.5
+        let hx: f64 = ((x1 - x0) as f64 - 1.0) * 0.5
+        let hy: f64 = ((y1 - y0) as f64 - 1.0) * 0.5
+        let hd: f64 = lip * __sqrt(hx * hx + hy * hy)
+        let dc: f64 = merge_field(g, mx, my)
+        if dc - hd >= 0.5 {
+            (*g).t_empty = (*g).t_empty + 1
+            return
+        }
+        if dc + hd <= 0.0 - 0.5 {
+            (*g).t_full = (*g).t_full + 1
+            // every pixel has coverage 1: one rectangle on whole pixels
+            // (the same octets as the walk below, tools/fui/merge_main.fi
+            // check 3)
+            canvas.canvas_fill_rect(cv, x0 as f64, y0 as f64, x1 as f64, y1 as f64, c)
+            return
+        }
+        if x1 - x0 > SMALL || y1 - y0 > SMALL {
+            let xm: usize = x0 + (x1 - x0 + 1) / 2
+            let ym: usize = y0 + (y1 - y0 + 1) / 2
+            paint_block(cv, g, c, x0, y0, xm, ym, lip, tiles)
+            if x1 > xm {
+                paint_block(cv, g, c, xm, y0, x1, ym, lip, tiles)
+            }
+            if y1 > ym {
+                paint_block(cv, g, c, x0, ym, xm, y1, lip, tiles)
+                if x1 > xm {
+                    paint_block(cv, g, c, xm, ym, x1, y1, lip, tiles)
+                }
+            }
+            return
+        }
+    }
+    (*g).t_edge = (*g).t_edge + 1
+    var yy: usize = y0
+    while yy < y1 {
+        var xx: usize = x0
+        while xx < x1 {
+            let d: f64 = merge_field(g, (xx as f64) + 0.5, (yy as f64) + 0.5)
+            let cov: f64 = cov_of(d)
+            if cov > 0.0 {
+                canvas.canvas_blend(cv, xx, yy, c, cov)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}

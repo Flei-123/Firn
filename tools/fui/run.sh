@@ -421,6 +421,15 @@ echo "== 18j. fUi TEMPO: DER DECKUNGS-CACHE UND DER CLIP AENDERN KEIN OKTETT =="
 "$W/tempo" 1240 5
 
 echo
+echo "== 18k. SCHMELZGRUPPE: FORMEN VERSCHMELZEN, WENN SIE SICH NAEHERN =="
+# lib/fui/merge.fi (Prototyp r68): weit auseinander dieselben Oktette wie
+# die blosse Vereinigung, bei k/2 ist die Luecke Tinte, die Kacheln
+# aendern kein Oktett, kein Sprung beim Naeherruecken, eine Feder, die
+# Zeit -- vier Regeln nebeneinander gemessen.
+"$FIRNC" --opt-level=release-fast -o "$W/merge" tools/fui/merge_main.fi
+"$W/merge"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
@@ -982,6 +991,10 @@ if [ "$1" = "--images" ]; then
     "$W/gallery9" "$Z/fui-deklarativ-schmal-dunkel.png" dark - 980
     beleg "$Z/fui-deklarativ-schmal-hell.png" 980 700 740 200 40 1
     beleg "$Z/fui-deklarativ-schmal-dunkel.png" 980 700 740 200 40 1
+    # DIE SCHMELZGRUPPE (lib/fui/merge.fi, r68): vier Regeln je eine
+    # Reihe, sechs Abstaende, die Pillen mit Beschriftung; darunter die
+    # Feder alle 100 ms.
+    "$W/merge" "$Z/fui-merge.png"
     # DIE ZWEIRICHTUNGSSCHRIFT (Runde Bidi, 23.09.2026). Arabisch und
     # Hebraeisch neben Lateinisch, alles ueber den normalen Weg der
     # Bibliothek: Beschriftungen mit Zahlen und Klammern, dieselbe

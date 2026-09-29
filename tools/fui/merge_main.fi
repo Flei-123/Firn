@@ -1,0 +1,642 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/merge_main.fi -- THE MERGE GROUP (lib/fui/merge.fi), PROVEN AND
+// MEASURED (fUi prototype, 29.09.2026, roadmap r68).
+//
+// Three rules for the melted outline are held against each other
+// (MODE_SMOOTH, MODE_SMOOTH3, MODE_SUM), each through the same checks:
+//
+//   1. APART IS UNCHANGED. Two pills further apart than k paint the SAME
+//      octets as the same group with k = 0 (the plain union): the melt
+//      reaches nothing it should not. Beside it the difference to fUi's
+//      own round_rect is REPORTED (another antialiasing: distance ramp
+//      against the rasteriser's area coverage) -- a number, not a check.
+//   2. CLOSE MELTS. At a gap of k/2 the middle of the gap is ink; with
+//      k = 0 it is not.
+//   3. THE TILES CHANGE NO OCTET: the same picture with the tile shortcut
+//      and pixel by pixel.
+//   4. NO POP. Two circles are moved together in steps of 1/4 pixel from
+//      far apart to overlapping; the inked area may change only by a
+//      small amount per step (the largest jump is printed per mode, and
+//      has to stay under 2 % of a circle).
+//   5. A SPRING. The same two circles on lib/fui/anim.fi's spring over
+//      700 ms at 60 frames per second; the paint time of every frame.
+//   6. THE TIME: a small region (two pills, 400 x 120) and a whole picture
+//      of 1240 x 720 with a bar of six pills and two large moving drops
+//      (reported against 16 ms; failed only beyond 100 ms).
+//
+//   merge_main [<out.png>]     exit 0 = all checks passed
+//
+// With a file name the contact sheet is written: one row per mode (smooth,
+// smooth3, sum, facing), six gaps each, the pills with their labels on top
+// (the "widgets"), and a fifth row: the spring of check 5, every 100 ms.
+//   7. THE BULGE AND THE CREASE: two pills overlapping by 24 -- the rows
+//      of ink above their common top edge at the seam, and the largest
+//      second difference of the top outline around the seam.
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.painter
+import fui.anim
+import fui.merge
+
+const W: usize = 640
+const H: usize = 200
+const BG: u32 = 4294967295 // opaque white
+const INK: u32 = 4281041654 // 0xFF2D6CF6, an accent blue
+
+fn now_ms() -> f64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as f64) * 1000.0 + (ts[1] as f64) / 1000000.0
+}
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_int(v: u64) {
+    var buf: [u8; 24] = [0; 24]
+    var n: usize = 0
+    var w: u64 = v
+    if w == 0 {
+        buf[0] = 48 as u8
+        n = 1
+    }
+    while w > 0 {
+        buf[n] = (48 + (w % 10)) as u8
+        w = w / 10
+        n = n + 1
+    }
+    var out: [u8; 24] = [0; 24]
+    var i: usize = 0
+    while i < n {
+        out[i] = buf[n - 1 - i]
+        i = i + 1
+    }
+    rt.write_everything(1, (&out[0]) as u64, n)
+}
+
+// three decimals
+fn say_num(v: f64) {
+    var x: f64 = v
+    if x < 0.0 {
+        say("-")
+        x = 0.0 - x
+    }
+    let milli: u64 = (x * 1000.0 + 0.5) as u64
+    say_int(milli / 1000)
+    say(".")
+    let f: u64 = milli % 1000
+    if f < 100 {
+        say("0")
+    }
+    if f < 10 {
+        say("0")
+    }
+    say_int(f)
+}
+
+fn mode_name(m: u32) {
+    if m == merge.MODE_SMOOTH {
+        say("smooth ")
+    } else if m == merge.MODE_SMOOTH3 {
+        say("smooth3")
+    } else if m == merge.MODE_FACING {
+        say("facing ")
+    } else {
+        say("sum    ")
+    }
+}
+
+fn median(t: *mut f64, n: usize) -> f64 {
+    var a: [f64; 64] = [0.0; 64]
+    var i: usize = 0
+    while i < n && i < 64 {
+        a[i] = *((t as u64 + (i * 8) as u64) as *mut f64)
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        var j: usize = i
+        while j > 0 && a[j - 1] > a[j] {
+            let x: f64 = a[j]
+            a[j] = a[j - 1]
+            a[j - 1] = x
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return a[n / 2]
+}
+
+fn px_at(cv: *mut canvas.Canvas, x: usize, y: usize) -> u32 {
+    let p: u64 = canvas.canvas_pixels(cv) as u64 + ((y * canvas.canvas_width(cv) + x) * 4) as u64
+    return *(p as *mut u32)
+}
+
+// the ink of a pixel on white: how far the red channel went from 255
+// towards the red of INK (0x2D), 0 .. 1
+fn ink_at(cv: *mut canvas.Canvas, x: usize, y: usize) -> f64 {
+    let r: u32 = px_at(cv, x, y) & 255 as u32
+    return ((255 as u32 - r) as f64) / ((255 - 45) as f64)
+}
+
+fn ink_sum(cv: *mut canvas.Canvas) -> f64 {
+    var s: f64 = 0.0
+    var y: usize = 0
+    while y < canvas.canvas_height(cv) {
+        var x: usize = 0
+        while x < canvas.canvas_width(cv) {
+            s = s + ink_at(cv, x, y)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return s
+}
+
+// Two pills 180 x 64 (r = 32) with `gap` pixels between them, left one
+// at x0.
+fn two_pills(g: *mut merge.MergeGroup, x0: f64, y0: f64, gap: f64) {
+    merge.merge_clear(g)
+    let a: bool = merge.merge_add_rect(g, x0, y0, 180.0, 64.0, 32.0)
+    let b: bool = merge.merge_add_rect(g, x0 + 180.0 + gap, y0, 180.0, 64.0, 32.0)
+}
+
+fn two_circles(g: *mut merge.MergeGroup, cx: f64, cy: f64, r: f64, gap: f64) {
+    merge.merge_clear(g)
+    let a: bool = merge.merge_add_circle(g, cx - gap * 0.5 - r, cy, r)
+    let b: bool = merge.merge_add_circle(g, cx + gap * 0.5 + r, cy, r)
+}
+
+// how far each rule reaches for the melt gap k (lib/fui/merge.fi)
+fn reach(m: u32, k: f64) -> f64 {
+    if m == merge.MODE_SMOOTH3 {
+        return 3.0 * k
+    }
+    if m == merge.MODE_SUM {
+        return k / (2.0 - 1.4142135623730951)
+    }
+    return 2.0 * k
+}
+
+fn same(a: *mut canvas.Canvas, b: *mut canvas.Canvas) -> bool {
+    let n: usize = canvas.canvas_width(a) * canvas.canvas_height(a) * 4
+    return rt.mem_eq(canvas.canvas_pixels(a) as u64, canvas.canvas_pixels(b) as u64, n)
+}
+
+struct Sheet {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+}
+
+fn main(start: u64) -> i32 {
+    var bad: usize = 0
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&f1[0]) as u64, &fbuf) {
+        say("merge: no font\n")
+        return 9
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 9
+    }
+    var ca: canvas.Canvas = canvas.canvas_new()
+    var cb: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&ca, W, H) || !canvas.canvas_init(&cb, W, H) {
+        return 4
+    }
+    var za: painter.Painter = painter.painter_new()
+    var zb: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&za, &ca, W, H) || !painter.painter_init(&zb, &cb, W, H) {
+        return 5
+    }
+    painter.painter_set_font(&za, fsp as u64)
+    painter.painter_set_font(&zb, fsp as u64)
+    let k: f64 = 24.0
+    var g: merge.MergeGroup = merge.merge_new(k)
+    var h: merge.MergeGroup = merge.merge_new(0.0)
+
+    var m: u32 = 0 as u32
+    while m < 4 as u32 {
+        merge.merge_set_mode(&g, m)
+        merge.merge_set_mode(&h, m)
+        // ---- 1. apart is unchanged
+        canvas.canvas_clear(&ca, BG)
+        canvas.canvas_clear(&cb, BG)
+        let far: f64 = reach(m, k) + 2.0
+        two_pills(&g, 20.0, 60.3, far)
+        two_pills(&h, 20.0, 60.3, far)
+        merge.merge_paint(&za, &g, INK)
+        merge.merge_paint(&zb, &h, INK)
+        say("merge ")
+        mode_name(m)
+        if same(&ca, &cb) {
+            say(" 1 apart = plain union (k 0)          OK")
+        } else {
+            say(" 1 apart = plain union (k 0)          WRONG")
+            bad = bad + 1
+        }
+        // against the rasteriser's round rectangles: reported
+        canvas.canvas_clear(&cb, BG)
+        painter.round_rect(&zb, 20.0, 60.3, 180.0, 64.0, 32.0, INK)
+        painter.round_rect(&zb, 20.0 + 180.0 + far, 60.3, 180.0, 64.0, 32.0, INK)
+        var ndiff: u64 = 0
+        var maxd: f64 = 0.0
+        var sumd: f64 = 0.0
+        var yy: usize = 0
+        while yy < H {
+            var xx: usize = 0
+            while xx < W {
+                let d: f64 = ink_at(&ca, xx, yy) - ink_at(&cb, xx, yy)
+                var ad: f64 = d
+                if ad < 0.0 {
+                    ad = 0.0 - ad
+                }
+                if ad > 0.0 {
+                    ndiff = ndiff + 1
+                    sumd = sumd + ad
+                }
+                if ad > maxd {
+                    maxd = ad
+                }
+                xx = xx + 1
+            }
+            yy = yy + 1
+        }
+        say("   vs round_rect: ")
+        say_int(ndiff)
+        say(" px differ, max ")
+        say_num(maxd)
+        say(", ink sum ")
+        say_num(sumd)
+        say("\n")
+        // ---- 2. close melts
+        canvas.canvas_clear(&ca, BG)
+        canvas.canvas_clear(&cb, BG)
+        two_pills(&g, 40.0, 60.0, k * 0.5)
+        two_pills(&h, 40.0, 60.0, k * 0.5)
+        merge.merge_paint(&za, &g, INK)
+        merge.merge_paint(&zb, &h, INK)
+        let gx: usize = (40.0 + 180.0 + k * 0.25) as usize
+        let gy: usize = 92
+        say("merge ")
+        mode_name(m)
+        let im: f64 = ink_at(&ca, gx, gy)
+        let ip: f64 = ink_at(&cb, gx, gy)
+        if im > 0.99 && ip < 0.01 {
+            say(" 2 gap k/2: middle is ink, k 0: paper OK   (ink ")
+        } else {
+            say(" 2 gap k/2: middle is ink, k 0: paper WRONG (ink ")
+            bad = bad + 1
+        }
+        say_num(im)
+        say(" / ")
+        say_num(ip)
+        say(")\n")
+        // ---- 3. the tiles change no octet (melted and apart, and a
+        //         fractional position)
+        var t3: usize = 0
+        var ok3: bool = true
+        while t3 < 3 {
+            canvas.canvas_clear(&ca, BG)
+            canvas.canvas_clear(&cb, BG)
+            var gap: f64 = k * 0.5
+            if t3 == 1 {
+                gap = 0.0 - 20.25
+            }
+            if t3 == 2 {
+                gap = reach(m, k) + 3.7
+            }
+            two_pills(&g, 13.4, 57.8, gap)
+            merge.merge_paint_tiles(&zb, &g, INK, false)
+            merge.merge_paint_tiles(&za, &g, INK, true)
+            if !same(&ca, &cb) {
+                ok3 = false
+            }
+            t3 = t3 + 1
+        }
+        say("merge ")
+        mode_name(m)
+        if ok3 {
+            say(" 3 tiles vs pixel by pixel: same octets OK")
+        } else {
+            say(" 3 tiles vs pixel by pixel: same octets WRONG")
+            bad = bad + 1
+        }
+        say(" (tiled, apart: ")
+        say_int(merge.merge_tiles_full(&g) as u64)
+        say(" full, ")
+        say_int(merge.merge_tiles_edge(&g) as u64)
+        say(" edge, ")
+        say_int(merge.merge_tiles_empty(&g) as u64)
+        say(" empty tiles, ")
+        say_int(merge.merge_evals(&g) as u64)
+        say(" evaluations)\n")
+        // ---- 4. no pop: 1/4 pixel steps from gap 3k to -40
+        let r: f64 = 40.0
+        let circle: f64 = 3.141592653589793 * r * r
+        var gap4: f64 = reach(m, k) + 8.0
+        var prev: f64 = 0.0 - 1.0
+        var jump: f64 = 0.0
+        var at: f64 = 0.0
+        while gap4 >= 0.0 - 40.0 {
+            canvas.canvas_clear(&ca, BG)
+            two_circles(&g, 320.0, 100.0, r, gap4)
+            merge.merge_paint(&za, &g, INK)
+            let a: f64 = ink_sum(&ca)
+            if prev >= 0.0 {
+                var d: f64 = a - prev
+                if d < 0.0 {
+                    d = 0.0 - d
+                }
+                if d > jump {
+                    jump = d
+                    at = gap4
+                }
+            }
+            prev = a
+            gap4 = gap4 - 0.25
+        }
+        say("merge ")
+        mode_name(m)
+        let rel: f64 = jump / circle * 100.0
+        if rel < 2.0 {
+            say(" 4 no pop: largest step ")
+        } else {
+            say(" 4 POP: largest step ")
+            bad = bad + 1
+        }
+        say_num(rel)
+        say(" % of a circle (at gap ")
+        say_num(at)
+        say(")\n")
+        // ---- 5. a spring, 700 ms at 60 frames per second
+        var sp: anim.Animation = anim.anim_new(0, 700, reach(m, k) + 8.0, 0.0 - 30.0,
+            anim.easing_spring(1.0, 120.0, 11.0))
+        var tf: [f64; 64] = [0.0; 64]
+        var nf: usize = 0
+        var ms: i64 = 0
+        var worst: f64 = 0.0
+        while ms <= 700 && nf < 64 {
+            let gap5: f64 = anim.anim_value(&sp, ms)
+            canvas.canvas_clear(&ca, BG)
+            two_circles(&g, 320.0, 100.0, r, gap5)
+            let a0: f64 = now_ms()
+            merge.merge_paint(&za, &g, INK)
+            tf[nf] = now_ms() - a0
+            if tf[nf] > worst {
+                worst = tf[nf]
+            }
+            nf = nf + 1
+            ms = ms + 16
+        }
+        say("merge ")
+        mode_name(m)
+        say(" 5 spring: ")
+        say_int(nf as u64)
+        say(" frames, paint median ")
+        say_num(median(&tf[0], nf))
+        say(" ms, worst ")
+        say_num(worst)
+        say(" ms\n")
+        // ---- 7. the bulge: two pills overlapping by 24, top edges at
+        //         y = 60 -- how many rows of ink stand above the edge at
+        //         the seam (0 = the union is one straight pill)
+        canvas.canvas_clear(&ca, BG)
+        two_pills(&g, 40.0, 60.0, 0.0 - 24.0)
+        merge.merge_paint(&za, &g, INK)
+        let sx: usize = (40.0 + 180.0 - 12.0) as usize
+        var bulge: usize = 0
+        var by: usize = 0
+        while by < 60 {
+            if ink_at(&ca, sx, by) > 0.5 {
+                bulge = bulge + 1
+            }
+            by = by + 1
+        }
+        say("merge ")
+        mode_name(m)
+        say(" 7 overlap by 24: bulge above the edge at the seam ")
+        say_int(bulge as u64)
+        say(" px")
+        // ---- 8. the crease: the top outline y(x) (subpixel, from the ink
+        //         of the column) around the seam, for an overlap of 24, 0
+        //         and a gap of k/4; the largest |y(x+1) - 2 y(x) + y(x-1)|
+        var kink: f64 = 0.0
+        var cse: usize = 0
+        while cse < 3 {
+            var gp: f64 = 0.0 - 24.0
+            if cse == 1 {
+                gp = 0.0
+            }
+            if cse == 2 {
+                gp = k * 0.25
+            }
+            canvas.canvas_clear(&ca, BG)
+            two_pills(&g, 40.0, 60.0, gp)
+            merge.merge_paint(&za, &g, INK)
+            let seam: i64 = (40.0 + 180.0 + gp * 0.5) as i64
+            var y0: f64 = 0.0
+            var y1: f64 = 0.0
+            var xx: i64 = seam - 40
+            while xx <= seam + 40 {
+                // the top outline: 92 (the middle) minus the ink above it
+                var col_ink: f64 = 0.0
+                var yy2: usize = 0
+                while yy2 < 92 {
+                    col_ink = col_ink + ink_at(&ca, xx as usize, yy2)
+                    yy2 = yy2 + 1
+                }
+                let yt: f64 = 92.0 - col_ink
+                if xx >= seam - 38 {
+                    var d2: f64 = yt - 2.0 * y1 + y0
+                    if d2 < 0.0 {
+                        d2 = 0.0 - d2
+                    }
+                    if d2 > kink {
+                        kink = d2
+                    }
+                }
+                y0 = y1
+                y1 = yt
+                xx = xx + 1
+            }
+            cse = cse + 1
+        }
+        say(", crease ")
+        say_num(kink)
+        say(" px\n")
+        m = m + 1 as u32
+    }
+
+    // ---- 6. the time: small region and a whole picture
+    var tt: [f64; 64] = [0.0; 64]
+    m = 0 as u32
+    while m < 4 as u32 {
+        merge.merge_set_mode(&g, m)
+        var i: usize = 0
+        while i < 31 {
+            canvas.canvas_clear(&ca, BG)
+            two_pills(&g, 40.0, 60.0, k * 0.5 + (i as f64) * 0.1)
+            let a0: f64 = now_ms()
+            merge.merge_paint(&za, &g, INK)
+            tt[i] = now_ms() - a0
+            i = i + 1
+        }
+        say("merge ")
+        mode_name(m)
+        say(" 6 small region (two pills): ")
+        say_num(median(&tt[0], 31))
+        say(" ms per paint\n")
+        m = m + 1 as u32
+    }
+    var big: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&big, 1240, 720) {
+        return 4
+    }
+    var zbig: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&zbig, &big, 1240, 720) {
+        return 5
+    }
+    painter.painter_set_font(&zbig, fsp as u64)
+    var tc: [f64; 21] = [0.0; 21]
+    var ic: usize = 0
+    while ic < 21 {
+        let a0: f64 = now_ms()
+        canvas.canvas_clear(&big, BG)
+        tc[ic] = now_ms() - a0
+        ic = ic + 1
+    }
+    say("merge         6 clearing 1240x720 alone: ")
+    say_num(median(&tc[0], 21))
+    say(" ms\n")
+    var bar: merge.MergeGroup = merge.merge_new(k)
+    var drops: merge.MergeGroup = merge.merge_new(60.0)
+    m = 0 as u32
+    var t_big_smooth: f64 = 0.0
+    while m < 4 as u32 {
+        merge.merge_set_mode(&bar, m)
+        merge.merge_set_mode(&drops, m)
+        var i: usize = 0
+        while i < 21 {
+            let a0: f64 = now_ms()
+            canvas.canvas_clear(&big, BG)
+            merge.merge_clear(&bar)
+            var j: usize = 0
+            while j < 6 {
+                // six pills in a bar; the third and fourth breathe
+                // towards each other
+                var dx: f64 = 0.0
+                if j == 2 {
+                    dx = (i as f64) * 1.5
+                }
+                if j == 3 {
+                    dx = 0.0 - (i as f64) * 1.5
+                }
+                let ok: bool = merge.merge_add_rect(&bar, 40.0 + (j as f64) * 196.0 + dx,
+                    40.0, 160.0, 56.0, 28.0)
+                j = j + 1
+            }
+            merge.merge_paint(&zbig, &bar, INK)
+            merge.merge_clear(&drops)
+            let ok1: bool = merge.merge_add_circle(&drops, 460.0 + (i as f64) * 4.0, 400.0, 150.0)
+            let ok2: bool = merge.merge_add_circle(&drops, 820.0 - (i as f64) * 4.0, 420.0, 130.0)
+            merge.merge_paint(&zbig, &drops, INK)
+            tt[i] = now_ms() - a0
+            i = i + 1
+        }
+        let tb: f64 = median(&tt[0], 21)
+        if m == merge.MODE_FACING {
+            t_big_smooth = tb
+        }
+        say("merge ")
+        mode_name(m)
+        say(" 6 whole picture 1240x720 (bar of 6 + 2 drops, with clear): ")
+        say_num(tb)
+        say(" ms per frame\n")
+        m = m + 1 as u32
+    }
+    // Reported against 16 ms, failed only far beyond: a busy build host
+    // stretches wall time, and a check that fails under load is noise
+    // (roadmap r49). 100 ms is what a return to per-pixel blocks costs.
+    if t_big_smooth > 16.0 {
+        say("merge: note -- the whole picture (default rule) took longer than 16 ms\n")
+    }
+    if t_big_smooth > 100.0 {
+        say("merge: WRONG -- the whole picture (default rule) takes longer than 100 ms\n")
+        bad = bad + 1
+    }
+
+    // ---- the contact sheet
+    if rt.arg_count(start) >= 2 {
+        let sw: usize = 6 * 220
+        let sh: usize = 5 * 110
+        let s: *mut Sheet = rt.heap_alloc(65536) as *mut Sheet
+        (*s).cv = canvas.canvas_new()
+        (*s).z = painter.painter_new()
+        if !canvas.canvas_init(&(*s).cv, sw, sh) || !painter.painter_init(&(*s).z, &(*s).cv, sw, sh) {
+            return 4
+        }
+        painter.painter_set_font(&(*s).z, fsp as u64)
+        canvas.canvas_clear(&(*s).cv, BG)
+        var gaps: [f64; 6] = [40.0, 20.0, 12.0, 6.0, 0.0, 0.0 - 24.0]
+        var lh: [u8; 4] = "Home"
+        var ls: [u8; 5] = "Suche"
+        m = 0 as u32
+        while m < 4 as u32 {
+            var c: usize = 0
+            while c < 6 {
+                var q: merge.MergeGroup = merge.merge_new(k)
+                merge.merge_set_mode(&q, m)
+                let ox: f64 = (c * 220) as f64 + 10.0
+                let oy: f64 = (m as f64) * 110.0 + 30.0
+                let pw: f64 = (200.0 - gaps[c]) * 0.5
+                let a1: bool = merge.merge_add_rect(&q, ox, oy, pw, 44.0, 22.0)
+                let a2: bool = merge.merge_add_rect(&q, ox + pw + gaps[c], oy, pw, 44.0, 22.0)
+                merge.merge_paint(&(*s).z, &q, INK)
+                let bl: f64 = painter.text_baseline_mid(&(*s).z, oy, 44.0, 14.0)
+                let t1: f64 = painter.text(&(*s).z, ox, bl, pw, 14.0, BG,
+                    (&lh[0]) as u64, 4, painter.TEXT_M)
+                let t2: f64 = painter.text(&(*s).z, ox + pw + gaps[c], bl, pw, 14.0, BG,
+                    (&ls[0]) as u64, 5, painter.TEXT_M)
+                c = c + 1
+            }
+            m = m + 1 as u32
+        }
+        // the fifth row: the spring of check 5 with the default rule, two
+        // drops at 0, 100, .. 600 ms
+        var sp6: anim.Animation = anim.anim_new(0, 700, reach(merge.MODE_FACING, k) + 8.0,
+            0.0 - 30.0, anim.easing_spring(1.0, 120.0, 11.0))
+        var c6: usize = 0
+        while c6 < 6 {
+            var q6: merge.MergeGroup = merge.merge_new(k)
+            let gp6: f64 = anim.anim_value(&sp6, (c6 * 100) as i64)
+            let cx6: f64 = (c6 * 220) as f64 + 110.0
+            let r6: f64 = 30.0
+            let b1: bool = merge.merge_add_circle(&q6, cx6 - gp6 * 0.5 - r6, 4.0 * 110.0 + 52.0, r6)
+            let b2: bool = merge.merge_add_circle(&q6, cx6 + gp6 * 0.5 + r6, 4.0 * 110.0 + 52.0, r6)
+            merge.merge_paint(&(*s).z, &q6, INK)
+            c6 = c6 + 1
+        }
+        var out: mem.Buf = mem.buf_new()
+        mem.buf_init(&out)
+        if !png.write_png(&(*s).cv, &out) {
+            return 6
+        }
+        if !rt.write_file(rt.arg_ptr(start, 1), mem.buf_ptr(&out) as u64, mem.buf_len(&out)) {
+            return 7
+        }
+        say("merge: contact sheet written\n")
+    }
+    if bad == 0 {
+        say("MERGE PASSED\n")
+        return 0
+    }
+    say("MERGE FAILED\n")
+    return 1
+}
