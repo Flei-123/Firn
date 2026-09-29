@@ -363,6 +363,12 @@ const firnTag = document.currentScript;
     // way, whole, then compiled.
     const wasm = q.get('wasm') || firnTag.dataset.wasm || 'gallery9.wasm';
     const fontAsked = fetch(q.get('font') || firnTag.dataset.font || 'DejaVuSans.ttf').then((r) => r.arrayBuffer());
+    // More faces (a monospace one, a bold one): data-fonts="a.ttf,b.ttf",
+    // handed over into slots 0, 1, ... before the main font (web_font_extra).
+    // Separated by commas or blanks; a data: URL (it has a comma of its
+    // own) is taken whole up to the next blank.
+    const extraAsked = ((firnTag.dataset.fonts || '').match(/data:\S+|[^\s,]+/g) || [])
+        .map((f) => fetch(f).then((r) => r.arrayBuffer()));
     const wasmAsked = fetch(wasm);
     let instance;
     const resp = await wasmAsked;
@@ -373,6 +379,7 @@ const firnTag = document.currentScript;
     }
     x = instance.exports;
     mem = x.memory;
+    window.firnExports = x; // for tests (a page's own exported stopwatch)
     onDemand = typeof x.firn_web_clock === 'function' && x.firn_web_clock() >= 2;
     try {
         x._start();
@@ -381,6 +388,15 @@ const firnTag = document.currentScript;
         if (e.code !== 0) console.error(`firn: main ended with exit code ${e.code}`);
     }
 
+    if (extraAsked.length && typeof x.firn_web_font_extra === 'function') {
+        const extra = await Promise.all(extraAsked);
+        extra.forEach((b, i) => {
+            const f = new Uint8Array(b);
+            const p = x.firn_web_alloc(f.length);
+            bytes(p, f.length).set(f);
+            if (!x.firn_web_font_extra(i, p, f.length)) console.error(`firn: extra font ${i} was refused`);
+        });
+    }
     // The font. A page has no files, so the host fetches it and hands the
     // octets over; the module keeps them.
     const font = new Uint8Array(await fontAsked);

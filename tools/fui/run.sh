@@ -448,14 +448,14 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 #   the NDK: pthread, ANativeActivity) cannot be linked on this host. It
 #   is still built -- as an object for x86_64-android, the first half of
 #   tools/android/build.sh -- so it cannot silently stop building either.
-for f in tools/fui/*_main.fi demos/*/main.fi; do
+for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     if grep -q '^import plat\.android' "$f"; then
         "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
     else
         "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
     fi
 done
-echo "  alle tools/fui/*_main.fi und demos/*/main.fi uebersetzen  OK"
+echo "  alle tools/fui/*_main.fi, demos/*/main.fi und examples/*/main.fi uebersetzen  OK"
 fehlt=0
 for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     n=$(basename "$f" _main.fi)

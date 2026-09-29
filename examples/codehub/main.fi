@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/codehub/main.fi -- THE CODEHUB PAGE NATIVELY: an X11 window, a
+// PNG, or a stopwatch. The page itself is examples/codehub/codehub.fi; the
+// browser build of the same page is examples/codehub/web.fi.
+//
+//     firnc --opt-level=release-fast -o codehub examples/codehub/main.fi
+//
+//     codehub [--size=WxH] [--dpi=N] [--display=N]   a window (Esc closes)
+//     codehub --png=out.png [--size=WxH] [--at=MS] [--full] [--hover=I]
+//         one frame into a PNG, MS milliseconds after the start (default:
+//         everything typed and faded in); --full: as tall as the page;
+//         --hover=I: the pointer on hot target I (3 = red button)
+//     codehub --bench=N [--size=WxH]
+//         N frames, each painted whole; prints the times (ms)
+//
+// `import window.backend` resolves next to this file: window/backend.fi
+// points at lib/window/x11.fi (as in demos/x11demo).
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.painter
+import fui.render
+import fui.scene
+import fui.anim
+import window.window
+import plat.fuiwirt
+import plat.fuiwin
+import plat.sysfont
+import codehub
+
+const FONTSET_BYTES: usize = 4096
+
+struct App {
+    m: theme.Theme,
+    c: render.Ctx,
+    w: fuiwirt.Host,
+    g: anim.Animator,
+    sc0: scene.Scene, // the host's scene: the page keeps its own
+    pg: u64,
+    fx: u64,
+}
+
+fn now_us() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000000 + ts[1] / 1000
+}
+
+fn starts(p: u64, lit: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != rt.ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn number_after(p: u64, at: usize) -> usize {
+    var v: usize = 0
+    var i: usize = at
+    while rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 + (rt.ld8(p, i) - 48 as u8) as usize
+        i = i + 1
+    }
+    return v
+}
+
+// "1996x1211" after `at` -> w, h
+fn size_after(p: u64, at: usize, w: *mut usize, h: *mut usize) {
+    *w = number_after(p, at)
+    var i: usize = at
+    while rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        i = i + 1
+    }
+    if rt.ld8(p, i) == 120 as u8 {
+        *h = number_after(p, i + 1)
+    }
+}
+
+fn say(p: u64, n: usize) {
+    rt.write_everything(1, p, n)
+}
+
+fn say_num(label: u64, ln: usize, v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, label, ln)
+    rt.buf_push_dec_i64(&t, v)
+    rt.buf_push(&t, 10 as u8)
+    say(rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// microseconds as "12.345"
+fn say_ms(label: u64, ln: usize, us: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, label, ln)
+    rt.buf_push_dec_i64(&t, us / 1000)
+    rt.buf_push(&t, 46 as u8)
+    let f: i64 = us % 1000
+    if f < 100 {
+        rt.buf_push(&t, 48 as u8)
+    }
+    if f < 10 {
+        rt.buf_push(&t, 48 as u8)
+    }
+    rt.buf_push_dec_i64(&t, f)
+    rt.buf_push_bytes(&t, (&MS_SUFFIX[0]) as u64, 4)
+    say(rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+static MS_SUFFIX: [u8; 4] = " ms\n"
+
+// A font file into a font set; 0 when it is not there.
+fn load_font(path: u64) -> u64 {
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &b) {
+        return 0
+    }
+    let fs: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    *fs = metrics.fontset_new()
+    if !metrics.fontset_load(fs, b.ptr as *mut u8, b.len) {
+        return 0
+    }
+    return fs as u64
+}
+
+static F_MONO: [u8; 52] = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf\0"
+static F_BOLD: [u8; 53] = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf\0"
+
+// ---------------------------------------------------------------- window
+fn paint(ud: u64, fx: *mut fuiwin.Window) {
+    let app: *mut App = ud as *mut App
+    let pg: *mut codehub.Page = (*app).pg as *mut codehub.Page
+    let now: i64 = fuiwin.now_ms()
+    codehub.page_frame(pg, &(*app).c, fuiwin.window_w(fx), fuiwin.window_h(fx),
+        now)
+    // keep the loop ticking while the page moves: one short tween in the
+    // host's animator, renewed every frame (lib/plat/fuiwirt.fi W5)
+    if codehub.page_busy(pg, now) {
+        anim.animator_clear(&(*app).g)
+        let k: usize = anim.animator_add(&(*app).g, anim.anim_new(now, 40,
+                0.0, 1.0, anim.easing_linear()))
+    }
+}
+
+fn act(ud: u64, fx: *mut fuiwin.Window, node: usize) {
+}
+
+// The pointer and the wheel, raw, from the host (fuiwirt.host_set_hook).
+fn hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let app: *mut App = ud as *mut App
+    let pg: *mut codehub.Page = (*app).pg as *mut codehub.Page
+    let now: i64 = fuiwin.now_ms()
+    var ch: bool = false
+    if kind == fuiwirt.HOOK_MOVE {
+        ch = codehub.page_pointer(pg, codehub.PTR_MOVE, x, y, now)
+    } else if kind == fuiwirt.HOOK_LEAVE {
+        ch = codehub.page_pointer(pg, codehub.PTR_LEAVE, x, y, now)
+    } else if kind == fuiwirt.HOOK_DOWN {
+        ch = codehub.page_pointer(pg, codehub.PTR_DOWN, x, y, now)
+    } else if kind == fuiwirt.HOOK_UP {
+        ch = codehub.page_pointer(pg, codehub.PTR_UP, x, y, now)
+    } else if kind == fuiwirt.HOOK_WHEEL {
+        let s: f64 = (theme.theme_scale(&(*app).m) as f64) / 1000.0
+        ch = codehub.page_wheel(pg, y * 60.0 * s)
+    }
+    if ch {
+        anim.animator_clear(&(*app).g)
+        let k: usize = anim.animator_add(&(*app).g, anim.anim_new(now, 40,
+                0.0, 1.0, anim.easing_linear()))
+    }
+    return ch
+}
+
+// ---------------------------------------------------------------- main
+// The page keeps the theme of this frame; main outlives it.
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var o_size: [u8; 7] = "--size="
+    var o_dpi: [u8; 6] = "--dpi="
+    var o_disp: [u8; 10] = "--display="
+    var o_png: [u8; 6] = "--png="
+    var o_at: [u8; 5] = "--at="
+    var o_full: [u8; 6] = "--full"
+    var o_hover: [u8; 8] = "--hover="
+    var o_bench: [u8; 8] = "--bench="
+    var bw: usize = 1240
+    var bh: usize = 760
+    var dpi: usize = 0
+    var disp: usize = 0
+    var png_path: u64 = 0
+    var at: i64 = 6000
+    var full: bool = false
+    var hover: usize = 99
+    var bench: usize = 0
+    var i: usize = 1
+    while i < rt.arg_count(start) {
+        let a: u64 = rt.arg_ptr(start, i)
+        if starts(a, (&o_size[0]) as u64, 7) {
+            size_after(a, 7, &bw, &bh)
+        } else if starts(a, (&o_dpi[0]) as u64, 6) {
+            dpi = number_after(a, 6)
+        } else if starts(a, (&o_disp[0]) as u64, 10) {
+            disp = number_after(a, 10)
+        } else if starts(a, (&o_png[0]) as u64, 6) {
+            png_path = a + 6
+        } else if starts(a, (&o_at[0]) as u64, 5) {
+            at = number_after(a, 5) as i64
+        } else if starts(a, (&o_full[0]) as u64, 6) {
+            full = true
+        } else if starts(a, (&o_hover[0]) as u64, 8) {
+            hover = number_after(a, 8)
+        } else if starts(a, (&o_bench[0]) as u64, 8) {
+            bench = number_after(a, 8)
+        }
+        i = i + 1
+    }
+
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fsp) {
+        var ks: [u8; 28] = "codehub: no font (DejaVu)  \n"
+        rt.write_everything(2, (&ks[0]) as u64, 28)
+        return 9
+    }
+    let fm: u64 = fsp as u64
+    let mono: u64 = load_font((&F_MONO[0]) as u64)
+    let bold: u64 = load_font((&F_BOLD[0]) as u64)
+
+    if png_path != 0 || bench > 0 {
+        return offline(fm, mono, bold, bw, bh, png_path, at, full, hover, bench)
+    }
+
+    // ---- the window
+    var fx: fuiwin.Window = fuiwin.window_new()
+    fuiwin.window_set_font(&fx, fm)
+    // the page copies its baked ground into the canvas: memory, not GPU
+    fuiwin.window_set_gpu(&fx, false)
+    if dpi > 0 {
+        window.set_dpi(fuiwin.window_window(&fx), dpi)
+    }
+    var app: App = App { m: theme.theme_new(true),
+        c: render.ctx_new((0 as u64) as *mut theme.Theme,
+            (0 as u64) as *mut painter.Painter),
+        w: fuiwirt.host_new((0 as u64) as *mut scene.Scene,
+            (0 as u64) as *mut render.Ctx),
+        g: anim.animator_new(), sc0: scene.scene_new(), pg: 0, fx: 0 }
+    app.c = render.ctx_new(&app.m, fuiwin.window_painter(&fx))
+    app.w = fuiwirt.host_new(&app.sc0, &app.c)
+    let pg: *mut codehub.Page = codehub.page_new(&app.m, fm)
+    if pg as u64 == 0 {
+        return 3
+    }
+    app.pg = pg as u64
+    var title: [u8; 25] = "CodeHub -- fUi, natively "
+    if !fuiwin.window_open(&fx, &app.w, &app.m, disp, bw, bh,
+        (&title[0]) as u64, 24) {
+        var ko: [u8; 45] = "codehub: no X server reachable ($DISPLAY)   \n"
+        rt.write_everything(2, (&ko[0]) as u64, 45)
+        return 1
+    }
+    if !codehub.page_theme(pg) {
+        var tk: [u8; 30] = "codehub: theme file refused  \n"
+        rt.write_everything(2, (&tk[0]) as u64, 30)
+    }
+    codehub.page_set_fonts(pg, fuiwin.window_painter(&fx), mono, bold)
+    fuiwirt.host_bind(&app.w)
+    fuiwirt.host_set_animator(&app.w, &app.g)
+    fuiwirt.host_set_hook(&app.w, (&app) as u64, hook)
+    fuiwin.window_run(&fx, &app.w, &app.m, paint, act, (&app) as u64)
+    fuiwin.window_close(&fx)
+    return 0
+}
+
+// ---------------------------------------------------------------- offline
+#[allow_escape]
+fn offline(fm: u64, mono: u64, bold: u64, w: usize, h0: usize,
+    png_path: u64, at: i64, full: bool, hover: usize, bench: usize) -> i32 {
+    var m: theme.Theme = theme.theme_new(true)
+    let pg: *mut codehub.Page = codehub.page_new(&m, fm)
+    if pg as u64 == 0 {
+        return 3
+    }
+    if !codehub.page_theme(pg) {
+        var tk: [u8; 30] = "codehub: theme file refused  \n"
+        rt.write_everything(2, (&tk[0]) as u64, 30)
+        say_num((&tk[0]) as u64, 19, codehub.page_theme_error(pg) as i64)
+    }
+    var h: usize = h0
+    if full {
+        // one frame on a scratch canvas to learn how tall the page is
+        var cv0: canvas.Canvas = canvas.canvas_new()
+        if !canvas.canvas_init(&cv0, w, h0) {
+            return 4
+        }
+        var z0: painter.Painter = painter.painter_new()
+        if !painter.painter_init(&z0, &cv0, w, h0) {
+            return 5
+        }
+        painter.painter_set_font(&z0, fm)
+        codehub.page_set_fonts(pg, &z0, mono, bold)
+        var c0: render.Ctx = render.ctx_new(&m, &z0)
+        codehub.page_frame(pg, &c0, w, h0, 0)
+        h = codehub.page_height(pg) as usize
+        painter.painter_free(&z0)
+        canvas.canvas_free(&cv0)
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, w, h) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, w, h) {
+        return 5
+    }
+    painter.painter_set_font(&z, fm)
+    codehub.page_set_fonts(pg, &z, mono, bold)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    codehub.page_frame(pg, &c, w, h, 0)
+    if hover < 99 {
+        // the pointer on the middle of that target, the spring settled
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        if codehub.page_hot_centre(pg, hover, &cx, &cy) {
+            let ch: bool = codehub.page_pointer(pg, codehub.PTR_MOVE, cx, cy,
+                at - 1500)
+        }
+    }
+
+    if bench > 0 {
+        // frame 1 bakes the ground; every frame after it is what a hover
+        // or a scroll costs
+        var tb: [u8; 21] = "first frame (bake):  "
+        let t0: i64 = now_us()
+        codehub.page_frame(pg, &c, w, h, at)
+        say_ms((&tb[0]) as u64, 21, now_us() - t0)
+        var sum: i64 = 0
+        var worst: i64 = 0
+        var best: i64 = 999999999
+        var k: usize = 0
+        while k < bench {
+            let t1: i64 = now_us()
+            codehub.page_frame(pg, &c, w, h, at + (k as i64) * 16)
+            let d: i64 = now_us() - t1
+            sum = sum + d
+            if d > worst {
+                worst = d
+            }
+            if d < best {
+                best = d
+            }
+            k = k + 1
+        }
+        var ta: [u8; 21] = "frame mean:          "
+        say_ms((&ta[0]) as u64, 21, sum / (bench as i64))
+        var tw2: [u8; 21] = "frame best:          "
+        say_ms((&tw2[0]) as u64, 21, best)
+        var tw3: [u8; 21] = "frame worst:         "
+        say_ms((&tw3[0]) as u64, 21, worst)
+        var tn: [u8; 21] = "bakes:               "
+        say_num((&tn[0]) as u64, 21, codehub.page_bakes(pg) as i64)
+    }
+    // the scene's guards: every node placed, no size drifting while painting
+    var tc: [u8; 21] = "scene check (0 = ok):"
+    say_num((&tc[0]) as u64, 21, codehub.page_check(pg) as i64)
+    if codehub.page_check(pg) != 0 as u32 {
+        return 8
+    }
+    if png_path != 0 {
+        codehub.page_frame(pg, &c, w, h, at)
+        var out: mem.Buf = mem.buf_new()
+        mem.buf_init(&out)
+        if !png.write_png(&cv, &out) {
+            return 6
+        }
+        if !rt.write_file(png_path, mem.buf_ptr(&out) as u64, mem.buf_len(&out)) {
+            return 7
+        }
+        var tp: [u8; 21] = "page height (px):    "
+        say_num((&tp[0]) as u64, 21, codehub.page_height(pg) as i64)
+    }
+    painter.painter_free(&z)
+    canvas.canvas_free(&cv)
+    return 0
+}
