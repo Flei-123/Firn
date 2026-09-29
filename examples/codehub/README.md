@@ -40,20 +40,32 @@ python3 examples/codehub/bundle.py codehub.html       # ONE file, opens from dis
 - **The host's ear** (`fuiwirt.host_set_hook`): raw pointer and wheel for a
   page that paints its own hover or scrolls itself.
 - **More faces in the browser** (`firn_web_font_extra`, `data-fonts`).
+- **Hidden nodes and single subtrees** (`scene.node_set_hidden`,
+  `scene.scene_draw_subtree`): paint the still part once, then only the
+  moving parts on top of the copy.
 
 What the page does itself (and fUi could take over later): the baked
 background band, the fluid headline size, counting lines for wrapped text.
 
-## Measured (29.09.2026, one core, software rasteriser)
+## Measured (29.09.2026, one core, software rasteriser, machine shared)
 
-| | native | Chromium (WASM) |
+"Everything painted" is every node of the page painted anew (the intro, or
+any frame without the still cache); "at rest" is a frame after the intro:
+the still content is baked, a frame is the copy plus the hot parts (hover,
+press). Both give the same pixels (check.sh compares them).
+
+| frame | native | Chromium (WASM) |
 |---|---|---|
-| frame 1996x1211 | 5.6 ms | 5.3 ms |
-| frame 360x800 | 3.7 ms | 3.1 ms |
-| frame 360x800 at device ratio 3 | -- | 15.7 ms |
-| first picture after navigation | -- | 0.26 s (phone) .. 0.74 s (desktop), local server |
+| 1996x1211, everything painted | 4.6 ms | 4.9 ms |
+| 1996x1211, at rest | 2.8 ms | 2.6 .. 3.8 ms |
+| 360x800, everything painted | 2.7 ms | 2.7 ms |
+| 360x800, at rest | 1.2 ms | 0.7 .. 0.9 ms |
+| 360x800 at device ratio 3, everything painted | 13.2 ms | 13.2 ms |
+| 360x800 at device ratio 3, at rest | 5.6 ms | 4.7 ms |
 
-`codehub.wasm` 428 KB (155 KB gzip); fonts 1.8 MB (not subset).
+First picture after navigation (local server, headless Chromium): 0.2 s on
+the phone size, 0.5 .. 0.7 s at 1996x1211. `codehub.wasm` 430 KB (155 KB
+gzip); the three fonts 1.8 MB (not subset).
 
 ## The fonts
 

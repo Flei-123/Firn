@@ -26,11 +26,21 @@ for s in 1996x1211 360x800; do
     "$W/codehub" --png="$W/native-$s.png" --size=$s > "$W/png-$s.log" || { cat "$W/png-$s.log"; fail=1; }
     grep -q 'scene check (0 = ok): *0' "$W/png-$s.log" && echo "   $s: PNG, scene check 0" || { echo "   FAIL $s scene check"; fail=1; }
     "$W/codehub" --bench=60 --size=$s > "$W/bench-$s.log"
-    mean=$(awk '/frame mean/ {print $3}' "$W/bench-$s.log")
-    echo "   $s: frame mean $mean ms ($(awk '/first frame/ {print $4}' "$W/bench-$s.log") ms with the bake)"
-    awk -v m="$mean" 'BEGIN { exit !(m <= 16.0) }' || { echo "   FAIL: over 16 ms"; fail=1; }
+    rest=$(awk '/frame at rest, best/ {print $5}' "$W/bench-$s.log")
+    full=$(awk '/frame full, best/ {print $4}' "$W/bench-$s.log")
+    echo "   $s: frame at rest $rest ms, everything painted $full ms (best of 60)"
+    awk -v m="$full" 'BEGIN { exit !(m <= 16.0) }' || { echo "   FAIL: over 16 ms"; fail=1; }
 done
 "$W/codehub" --png="$W/native-360-full.png" --size=360x800 --full > /dev/null || fail=1
+# the still cache must not change a pixel
+for s in 1996x1211 360x800; do
+    "$W/codehub" --png="$W/native-$s-nostill.png" --size=$s --no-still > /dev/null || fail=1
+    n=$(python3 -c "
+from PIL import Image, ImageChops
+a=Image.open('$W/native-$s.png').convert('RGB'); b=Image.open('$W/native-$s-nostill.png').convert('RGB')
+print(sum(1 for p in ImageChops.difference(a,b).getdata() if max(p)>2))")
+    [ "$n" = 0 ] && echo "   $s: still cache = everything painted (0 px differ)" || { echo "   FAIL $s: still cache differs in $n px"; fail=1; }
+done
 "$W/codehub" --png="$W/native-1996x1211-hover.png" --size=1996x1211 --hover=3 > /dev/null || fail=1
 cmp -s "$W/native-1996x1211.png" "$W/native-1996x1211-hover.png" && { echo "   FAIL: hover changes nothing"; fail=1; } || echo "   hover on the red button changes the picture"
 echo "== 3. the theme file =="
