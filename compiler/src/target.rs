@@ -243,6 +243,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn platform_dir_follows_the_target() {
+        reset();
+        assert_eq!(platform_dir(), "@linux");
+        flag_set("aarch64-linux").unwrap();
+        assert_eq!(platform_dir(), "@linux");
+        flag_set("x86_64-android").unwrap();
+        assert_eq!(platform_dir(), "@android");
+        flag_set("wasm32-browser").unwrap();
+        assert_eq!(platform_dir(), "@web");
+        reset();
+    }
+
+    #[test]
     fn default_is_x86_and_align_stays_byte_counted() {
         reset();
         assert_eq!(active(), Target::X86_64);
