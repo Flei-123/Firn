@@ -105,6 +105,8 @@ struct Waiting {
 ///      belongs to
 ///   4. in a `needs` dependency of that package, if the first path part is
 ///      its name
+///   5a. in `@<platform>/` inside $FIRNLIB and the installed lib/
+///       (`lib/@web/`, `lib/@linux/`, `lib/@android/`; `target::platform_dir`)
 ///   5. in `$FIRNLIB`
 ///   6. in `<directory of the compiler binary>/../lib`
 ///
@@ -210,6 +212,18 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                 if let Some(pi) = my_package {
                     if let Some(q) = package_candidate(world, pi, &parts) {
                         p = q;
+                    }
+                }
+            }
+            // (5a) the platform directory of the target inside every
+            // library directory (`lib/@web/`, `lib/@linux/`, ...), before
+            // the directory itself -- see `target::platform_dir`.
+            if !p.exists() {
+                for z in &extras {
+                    let q = module_path(&z.join(crate::target::platform_dir()), &parts);
+                    if q.exists() {
+                        p = q;
+                        break;
                     }
                 }
             }

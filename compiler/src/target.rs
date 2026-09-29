@@ -200,6 +200,25 @@ pub fn flag_set(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The PLATFORM DIRECTORY of this compilation (fUi app layer, 29.09.2026).
+///
+/// `import` looks into `<search dir>/@<platform>/` before `<search dir>/`
+/// for `$FIRNLIB` and the installed `lib/` (see `modules::resolve`, step
+/// 5a). That is how ONE source file -- `import fui.app` -- gets the X11
+/// window loop natively and the canvas host in the browser, without a
+/// symlink next to the program and without the program knowing either.
+/// The names are directories, not identifiers: `@` cannot start a module
+/// name, so no `import` can reach one by accident.
+pub fn platform_dir() -> &'static str {
+    if active().is_wasm() {
+        "@web"
+    } else if android() {
+        "@android"
+    } else {
+        "@linux"
+    }
+}
+
 /// The machine of this compilation unit.
 pub fn active() -> Target {
     ACTIVE.with(|a| a.get())

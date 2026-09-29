@@ -1,0 +1,656 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/app.fi -- A WINDOW IN TEN LINES.
+//
+// ========================================================= WHY IT EXISTS
+//
+// Justin, 29.09.2026: "Can you open a window with Firn as easily as with
+// Python's tkinter?" The honest answer that day was no. The tkinter
+// "Test Window" -- a label in a 16 point font, a Close button -- took 81
+// lines of code against scene.fi, sheet.fi, fuiwirt.fi and fuiwin.fi,
+// plus a symlink window/backend.fi next to the program
+// (examples/fui/lowlevel/hello_lowlevel.fi keeps that version). Every
+// one of those lines was plumbing the program does not care about: a
+// font set, a canvas, a render context, a host, a stylesheet rule for
+// one font size, a hand-written event loop.
+//
+// This file is the layer on top. The same window:
+//
+//     import fui.app
+//
+//     fn close(a: *mut app.App) {
+//         app.quit(a)
+//     }
+//
+//     fn main() -> i32 {
+//         let a: *mut app.App = app.window("Test Window", 400, 250)
+//         app.label(a, "Hello, this is a test window!", 16)
+//         app.button(a, "Close", close)
+//         return app.run(a)
+//     }
+//
+// ========================================================= WHAT IS HIDDEN
+//
+// The platform. `import fui.apphost` resolves by TARGET, not by symlink:
+// firnc looks into lib/@<platform>/ first (compiler/src/target.rs,
+// `platform_dir`), so a native build gets lib/@linux/fui/apphost.fi (an
+// X11 window through lib/plat/fuiwin.fi) and `--target=wasm32-browser`
+// gets lib/@web/fui/apphost.fi (the canvas of lib/plat/web.fi). This file
+// imports neither; it only fills in `apphost.Hooks`. The window loop, the
+// font (DejaVu Sans natively, the page's font in the browser), the theme
+// (light or dark as the system says), the scale (Xft.dpi, devicePixelRatio),
+// the focus chain (Tab / Shift+Tab), Enter and the space bar on a button,
+// the mouse -- all of it lives in those two files and in fuiwirt.fi,
+// which is ONE implementation of the controls for every platform.
+//
+// ========================================================= THE MODEL
+//
+// Widgets are added top to bottom into the current CONTAINER. The window
+// itself is a column whose children stand centred with a gap -- tkinter's
+// `pack()` default. `row(a)` / `column(a)` open a nested container,
+// `end(a)` closes it. Every add returns an id (the node of the scene),
+// which `set_text`, `text`, `set_number` take.
+//
+// Callbacks are plain functions `fn(*mut app.App)`; state lives in
+// `static mut` of the program or behind `app.data(a)`.
+//
+// ========================================================= LIMITS (today)
+//
+//   * 128 nodes per window (scene.SCENE_MAX), 8 text fields, 256 octets
+//     per text; beyond that an add returns NONE and changes nothing.
+//   * One window. A second one is lib/plat/fuiwin.fi's window_step.
+//   * A click into a text field focuses it; it does not move the caret
+//     to the click (the caret stays where the keys put it).
+//   * No Win32 / Android host yet (lib/@win32, lib/@android): the fUi
+//     roadmap has them.
+import std.rt
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.scene
+import fui.sheet
+import fui.flex
+import fui.widget
+import fui.editor
+import fui.textbuf
+import plat.fuiwirt
+import fui.apphost
+
+export {
+    App, window, label, button, entry, row, column, end, spacer,
+    set_text, append_text, set_number, text, number, quit, run,
+    set_data, data, set_dark, focus,
+    NONE,
+    // the side a host and the tests see (lib/@*/fui/apphost.fi,
+    // tools/fui/app_main.fi)
+    app_paint, app_attach, app_key, app_char, app_press, app_act,
+    app_done, app_host, app_theme, app_entry_box, app_scene,
+    ENTRIES_MAX, TEXT_CAP,
+}
+
+const NONE: usize = 4294967295
+const ENTRIES_MAX: usize = 8
+const TEXT_CAP: usize = 256
+const STACK_MAX: usize = 16
+// design points: tkinter's pack() puts widgets close together; these are
+// fUi's own spacing steps (theme.fi)
+const GAP: i64 = 14
+const ROW_GAP: i64 = 10
+const PAD: i64 = 16
+const ENTRY_W: usize = 240
+
+struct App {
+    sc: scene.Scene,
+    sh: sheet.Sheet,
+    m: theme.Theme,
+    c: render.Ctx,
+    w: fuiwirt.Host,
+    hk: apphost.Hooks,
+    // the open containers, innermost last
+    stack: [usize; 16],
+    depth: usize,
+    // per node: a click handler, and the node's own text
+    cb: [fn(*mut App); 128],
+    has_cb: [bool; 128],
+    texts: u64,
+    tlen: [usize; 128],
+    // labels this frame had to wrap (fit_labels)
+    wrapped: [bool; 128],
+    // the text fields: their editor, their node, their hint
+    ed: [editor.Editor; 8],
+    ed_node: [usize; 8],
+    hint: [str; 8],
+    n_ed: usize,
+    ed_bufs: u64,
+    quit: bool,
+    user: u64,
+}
+
+fn cb_none(a: *mut App) {
+}
+
+// How big an App is -- measured like lib/plat/web.fi measures a Web:
+// there is no size_of in stage 0, and a written number would be wrong the
+// day a field is added.
+fn app_size() -> usize {
+    var probe: [App; 2] = [app_blank(); 2]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn app_blank() -> App {
+    return App { sc: scene.scene_new(), sh: sheet.sheet_new(),
+        m: theme.theme_new(false),
+        c: render.ctx_new(0 as u64 as *mut theme.Theme,
+            0 as u64 as *mut painter.Painter),
+        w: fuiwirt.host_new(0 as u64 as *mut scene.Scene,
+            0 as u64 as *mut render.Ctx),
+        hk: apphost.hooks_blank(),
+        stack: [0; 16], depth: 0,
+        cb: [cb_none; 128], has_cb: [false; 128], texts: 0,
+        tlen: [0; 128], wrapped: [false; 128],
+        ed: [editor.editor_new(); 8], ed_node: [NONE; 8], hint: [""; 8],
+        n_ed: 0, ed_bufs: 0, quit: false, user: 0 }
+}
+
+// ============================================================ THE WINDOW
+
+// A window of `w` x `h` design points (at 96 dpi: pixels) titled `title`.
+// Nothing is shown before `run`. Returns 0 only when there is no memory.
+fn window(title: str, w: usize, h: usize) -> *mut App {
+    let n: usize = app_size()
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return 0 as u64 as *mut App
+    }
+    let a: *mut App = p as *mut App
+    *a = app_blank()
+    (*a).texts = rt.heap_alloc(scene.SCENE_MAX * TEXT_CAP)
+    (*a).ed_bufs = rt.heap_alloc(ENTRIES_MAX * TEXT_CAP)
+    (*a).w = fuiwirt.host_new(&(*a).sc, &(*a).c)
+    let root: usize = scene.scene_box(&(*a).sc, scene.SCENE_NONE, 0 as u32,
+        flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    scene.node_set_gap(&(*a).sc, root, GAP, GAP)
+    scene.node_set_padding(&(*a).sc, root, PAD, PAD, PAD, PAD)
+    (*a).stack[0] = root
+    (*a).depth = 1
+    // A label that has to wrap (fit_labels) keeps its lines centred, like
+    // the column it stands in; per-label rules (a font size) only add. A
+    // text node is selected by 1000 + its node kind (scene.desc_kind_of).
+    let r: usize = sheet.sheet_rule(&(*a).sh, sheet.sel_kind(1000 as u32 + scene.N_TEXT),
+        style.style_set_align(style.style_new(), style.ALIGN_CENTER))
+    (*a).hk = apphost.hooks_new(a as u64, &(*a).m, &(*a).w, app_attach,
+        app_paint, app_key, app_char, app_press, app_act, app_done,
+        app_entry_box, title, w, h)
+    return a
+}
+
+// Show the window and run until it is closed or `quit` is called. The
+// answer is the exit code for `main` (0 = closed normally). In the
+// browser `run` returns at once and the page lives on in the host.
+fn run(a: *mut App) -> i32 {
+    if a as u64 == 0 {
+        return 12
+    }
+    fuiwirt.host_bind(&(*a).w)
+    return apphost.run(&(*a).hk)
+}
+
+// Close the window (from a callback). In the browser the page goes blank.
+fn quit(a: *mut App) {
+    (*a).quit = true
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// Anything the program wants to reach from its callbacks.
+fn set_data(a: *mut App, p: u64) {
+    (*a).user = p
+}
+
+fn data(a: *mut App) -> u64 {
+    return (*a).user
+}
+
+// Force light (false) or dark (true) instead of the system's choice.
+fn set_dark(a: *mut App, dark: bool) {
+    theme.theme_set_dark(&(*a).m, dark)
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// ============================================================ CONTAINERS
+
+fn parent(a: *mut App) -> usize {
+    return (*a).stack[(*a).depth - 1]
+}
+
+fn open_box(a: *mut App, dir: u32) -> usize {
+    if (*a).depth >= STACK_MAX {
+        return NONE
+    }
+    let b: usize = scene.scene_box(&(*a).sc, parent(a), 0 as u32, dir,
+        flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    if b == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_gap(&(*a).sc, b, ROW_GAP, ROW_GAP)
+    (*a).stack[(*a).depth] = b
+    (*a).depth = (*a).depth + 1
+    return b
+}
+
+// Widgets after this stand side by side, until `end`.
+fn row(a: *mut App) -> usize {
+    return open_box(a, flex.FLEX_ROW)
+}
+
+// Widgets after this stand one below the other, until `end`.
+fn column(a: *mut App) -> usize {
+    return open_box(a, flex.FLEX_COLUMN)
+}
+
+// Close the innermost row/column. The window itself cannot be closed so.
+fn end(a: *mut App) {
+    if (*a).depth > 1 {
+        (*a).depth = (*a).depth - 1
+    }
+}
+
+// Empty room of `w` x `h` design points.
+fn spacer(a: *mut App, w: usize, h: usize) -> usize {
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_BOX)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
+    return i
+}
+
+// ============================================================ WIDGETS
+
+// The node's own copy of `s`: a node only POINTS at its text
+// (scene.node_set_text), so the text has to live as long as the window.
+fn keep_text(a: *mut App, i: usize, s: str, at: usize) {
+    var n: usize = s.n
+    if at + n > TEXT_CAP {
+        n = TEXT_CAP - at
+        // cut at a character boundary, not in the middle of one
+        while n > 0 && (rt.ld8(s.p as u64, n) & 192 as u8) == 128 as u8 {
+            n = n - 1
+        }
+    }
+    let dst: u64 = (*a).texts + (i * TEXT_CAP) as u64
+    if n > 0 {
+        rt.mem_copy(dst + at as u64, s.p as u64, n)
+    }
+    (*a).tlen[i] = at + n
+    scene.node_set_text(&(*a).sc, i, dst, at + n)
+}
+
+// One stylesheet rule for this node alone (by its id).
+fn node_rule(a: *mut App, i: usize, st: style.Style) {
+    scene.node_set_id(&(*a).sc, i, (i + 1) as u32)
+    let r: usize = sheet.sheet_rule(&(*a).sh, sheet.sel_id((i + 1) as u32), st)
+}
+
+// A line of text. `size` in points (0 = the theme's text size).
+fn label(a: *mut App, s: str, size: usize) -> usize {
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_TEXT)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    keep_text(a, i, s, 0)
+    if size > 0 {
+        node_rule(a, i, style.style_set_font(style.style_new(), 0, size))
+    }
+    return i
+}
+
+// A push button; `on_click(a)` runs on a click, on Enter and on the space
+// bar while it has the focus.
+fn button(a: *mut App, s: str, on_click: fn(*mut App)) -> usize {
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_WIDGET)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_widget_kind(&(*a).sc, i, widget.KIND_BUTTON)
+    keep_text(a, i, s, 0)
+    (*a).cb[i] = on_click
+    (*a).has_cb[i] = true
+    return i
+}
+
+// A one-line text field; `hint` stands in it (dimmed) while it is empty.
+fn entry(a: *mut App, hint: str) -> usize {
+    if (*a).n_ed >= ENTRIES_MAX {
+        return NONE
+    }
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_WIDGET)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    let k: usize = (*a).n_ed
+    scene.node_set_widget_kind(&(*a).sc, i, widget.KIND_TEXTBOX)
+    if !editor.editor_init(&(*a).ed[k],
+        (*a).ed_bufs + (k * TEXT_CAP) as u64, TEXT_CAP) {
+        return NONE
+    }
+    (*a).ed_node[k] = i
+    (*a).hint[k] = hint
+    (*a).n_ed = k + 1
+    // an empty field measures only its padding: it gets a width here
+    node_rule(a, i, style.style_set_width(style.style_new(), ENTRY_W))
+    scene.node_set_draw(&(*a).sc, i, a as u64, draw_entry)
+    return i
+}
+
+fn slot_of(a: *mut App, i: usize) -> usize {
+    var k: usize = 0
+    while k < (*a).n_ed {
+        if (*a).ed_node[k] == i {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+// The field over the button base that wave3 already painted: text, caret,
+// selection (render.draw_textfield) -- or the dimmed hint.
+fn draw_entry(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let a: *mut App = ud as *mut App
+    let k: usize = slot_of(a, scene.scene_node_of(&(*a).sc, e))
+    if k == NONE {
+        return
+    }
+    let ed: *mut editor.Editor = &(*a).ed[k]
+    let focus: bool = widget.w_is_focus(e)
+    render.draw_textfield(c, e, ed, focus)
+    let h: str = (*a).hint[k]
+    if textbuf.tb_len(editor.editor_buf(ed)) == 0 && !focus && h.n > 0 {
+        let z: *mut painter.Painter = render.ctx_painter(c)
+        let px: f64 = render.field_px(c, e)
+        var r: painter.TextRun = render.text_run_of(c, e, px)
+        let by: f64 = painter.text_baseline_mid(z, widget.w_y(e),
+            widget.w_h(e), px)
+        let col: u32 = render.color_of(c,
+            style.color_token(style.TOK_TEXT_DISABLED))
+        let x1: f64 = painter.run_draw(z, &r, render.field_text_x0(c, e), by,
+            0.0, col, h.p as u64, h.n, painter.TEXT_L)
+    }
+}
+
+// ============================================================ TEXT
+
+// Replace the text of a label, a button or a text field.
+fn set_text(a: *mut App, id: usize, s: str) {
+    if id >= scene.scene_count(&(*a).sc) {
+        return
+    }
+    let k: usize = slot_of(a, id)
+    if k != NONE {
+        editor.editor_set_text(&(*a).ed[k], s.p as u64, s.n)
+    } else {
+        keep_text(a, id, s, 0)
+    }
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// Add `s` to the end of the text of a label or a button.
+fn append_text(a: *mut App, id: usize, s: str) {
+    if id >= scene.scene_count(&(*a).sc) || slot_of(a, id) != NONE {
+        return
+    }
+    keep_text(a, id, s, (*a).tlen[id])
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// The text of a label, a button or a text field. It is a view: it stays
+// valid until the text is changed.
+fn text(a: *mut App, id: usize) -> str {
+    if id >= scene.scene_count(&(*a).sc) {
+        return ""
+    }
+    let k: usize = slot_of(a, id)
+    if k != NONE {
+        let t: *mut textbuf.TextBuf = editor.editor_buf(&(*a).ed[k])
+        return str { p: textbuf.tb_ptr(t) as *mut u8, n: textbuf.tb_len(t) }
+    }
+    return str { p: ((*a).texts + (id * TEXT_CAP) as u64) as *mut u8,
+        n: (*a).tlen[id] }
+}
+
+// A whole number as the text of a label or a button.
+// `#[allow_escape]`: `d` only passes through set_text, which copies it
+// (keep_text / editor_set_text) before this frame ends.
+#[allow_escape]
+fn set_number(a: *mut App, id: usize, v: i64) {
+    var d: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var neg: bool = v < 0
+    var u: u64 = v as u64
+    if neg {
+        u = (0 - v) as u64
+    }
+    if u == 0 {
+        d[23] = 48 as u8
+        n = 1
+    }
+    while u > 0 {
+        d[23 - n] = (48 + u % 10) as u8
+        u = u / 10
+        n = n + 1
+    }
+    if neg {
+        d[23 - n] = 45 as u8
+        n = n + 1
+    }
+    set_text(a, id, str { p: (&d[24 - n]) as *mut u8, n: n })
+}
+
+// The text of a node read as a whole number (0 when it is none).
+fn number(a: *mut App, id: usize) -> i64 {
+    let s: str = text(a, id)
+    var v: i64 = 0
+    var i: usize = 0
+    var neg: bool = false
+    if s.n > 0 && rt.ld8(s.p as u64, 0) == 45 as u8 {
+        neg = true
+        i = 1
+    }
+    while i < s.n && rt.ld8(s.p as u64, i) >= 48 as u8
+    && rt.ld8(s.p as u64, i) <= 57 as u8 {
+        v = v * 10 + (rt.ld8(s.p as u64, i) - 48 as u8) as i64
+        i = i + 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+// Who has the keyboard (NONE = nobody).
+fn focus(a: *mut App) -> usize {
+    let f: usize = fuiwirt.host_focus(&(*a).w)
+    if f == fuiwirt.KEINER {
+        return NONE
+    }
+    return f
+}
+
+// ============================================================ THE HOST SIDE
+//
+// What lib/@*/fui/apphost.fi calls. Positions are device pixels, keys
+// are editor.KEY_*, modifiers editor.MOD_*.
+
+fn app_host(a: *mut App) -> *mut fuiwirt.Host { return &(*a).w }
+fn app_theme(a: *mut App) -> *mut theme.Theme { return &(*a).m }
+fn app_scene(a: *mut App) -> *mut scene.Scene { return &(*a).sc }
+
+// The painter the platform paints with is known: the render context.
+fn app_attach(ud: u64, z: *mut painter.Painter) {
+    let a: *mut App = ud as *mut App
+    (*a).c = render.ctx_new(&(*a).m, z)
+}
+
+// One frame of `w` x `h` device pixels into the attached painter.
+fn app_paint(ud: u64, w: usize, h: usize) {
+    let a: *mut App = ud as *mut App
+    let f: *mut theme.Colors = theme.theme_colors(&(*a).m)
+    painter.painter_clear(render.ctx_painter(&(*a).c), theme.opaque((*f).base))
+    if (*a).quit {
+        return
+    }
+    fit_labels(a, w)
+    scene.scene_run(&(*a).sc, &(*a).c, &(*a).sh, 0.0, 0.0, w as f64,
+        h as f64)
+}
+
+// How many lines `p`/`n` needs at width `w` -- the loop of
+// painter.run_draw_wrapped without the drawing, so the count is the
+// picture's count.
+fn count_lines(z: *mut painter.Painter, r: *mut painter.TextRun, p: u64,
+    n: usize, w: f64) -> usize {
+    var lines: usize = 0
+    var i: usize = 0
+    while i < n && lines < 8 {
+        var j: usize = i
+        while j < n && rt.ld8(p, j) == 32 as u8 {
+            j = j + 1
+        }
+        if j >= n {
+            return lines
+        }
+        var next: usize = 0
+        let upto: usize = painter.run_line_upto(z, r, p + (i as u64), n - i,
+            w, &next)
+        if upto == 0 || next == 0 {
+            return lines + 1
+        }
+        lines = lines + 1
+        i = i + next
+    }
+    return lines
+}
+
+// A LABEL WIDER THAN THE WINDOW WRAPS. Measured, a flex item keeps its
+// text width, and a centred child wider than its column starts left of
+// the window -- the whole line then vanished (tools/fui/app_main.fi,
+// "an answer wider than the window"). So before each frame: every text
+// node that measures wider than the window's inner width gets that width
+// and as many lines as run_line_upto says it needs (at most 8), and gives
+// both back when it fits again.
+fn fit_labels(a: *mut App, w: usize) {
+    let sc: *mut scene.Scene = &(*a).sc
+    let n: usize = scene.scene_count(sc)
+    var i: usize = 0
+    while i < n {
+        if (*a).wrapped[i] {
+            scene.node_set_size(sc, i, 0.0, 0.0)
+            widget.w_set_text_lines(scene.node_widget(sc, i), 1)
+            (*a).wrapped[i] = false
+        }
+        i = i + 1
+    }
+    let s: f64 = (theme.theme_scale(&(*a).m) as f64) / 1000.0
+    let avail: f64 = (w as f64) - 2.0 * (PAD as f64) * s
+    if avail <= 0.0 {
+        return
+    }
+    scene.scene_style(sc, &(*a).sh)
+    scene.scene_measure(sc, &(*a).c)
+    let z: *mut painter.Painter = render.ctx_painter(&(*a).c)
+    i = 0
+    while i < n {
+        if scene.node_kind(sc, i) == scene.N_TEXT
+        && scene.node_pref_w(sc, i) > avail {
+            let e: *mut widget.Widget = scene.node_widget(sc, i)
+            let px: f64 = render.field_px(&(*a).c, e)
+            var r: painter.TextRun = render.text_run_of(&(*a).c, e, px)
+            var lines: usize = count_lines(z, &r, widget.w_text(e),
+                widget.w_text_len(e), avail)
+            if lines < 1 {
+                lines = 1
+            }
+            let lh: f64 = painter.run_line_height(z, &r)
+            let hh: f64 = scene.node_pref_h(sc, i) + ((lines - 1) as f64) * lh
+            scene.node_set_size(sc, i, avail / s, hh / s)
+            widget.w_set_text_lines(e, lines)
+            (*a).wrapped[i] = true
+        }
+        i = i + 1
+    }
+}
+
+fn focused_slot(a: *mut App) -> usize {
+    let f: usize = fuiwirt.host_focus(&(*a).w)
+    if f == fuiwirt.KEINER {
+        return NONE
+    }
+    return slot_of(a, f)
+}
+
+// A key. true = a text field took it; false = it goes on to the host
+// (Tab moves the focus, Enter presses the focused button).
+fn app_key(ud: u64, key: u32, mods: u32) -> bool {
+    let a: *mut App = ud as *mut App
+    let k: usize = focused_slot(a)
+    if k == NONE {
+        return false
+    }
+    let r: u32 = editor.editor_key(&(*a).ed[k], key, mods)
+    if r == editor.RES_PASS || r == editor.RES_COMMIT
+    || r == editor.RES_CANCEL {
+        return false
+    }
+    fuiwirt.host_touch(&(*a).w)
+    return true
+}
+
+// A character (a code point). true = a text field took it.
+fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
+    let a: *mut App = ud as *mut App
+    let k: usize = focused_slot(a)
+    if k == NONE {
+        return false
+    }
+    let r: u32 = editor.editor_char(&(*a).ed[k], cp, mods)
+    if r == editor.RES_PASS {
+        return false
+    }
+    fuiwirt.host_touch(&(*a).w)
+    return true
+}
+
+// A press at (x, y) -- only reported; focus and clicks stay the host's.
+fn app_press(ud: u64, x: f64, y: f64) {
+}
+
+// The host says node `i` was activated (click, Enter, space).
+fn app_act(ud: u64, i: usize) {
+    let a: *mut App = ud as *mut App
+    if i < scene.SCENE_MAX && (*a).has_cb[i] {
+        let f: fn(*mut App) = (*a).cb[i]
+        f(a)
+        fuiwirt.host_touch(&(*a).w)
+    }
+}
+
+fn app_done(ud: u64) -> bool {
+    let a: *mut App = ud as *mut App
+    return (*a).quit
+}
+
+// The focused text field's rectangle in device pixels (for a phone's
+// keyboard); false = no text field has the focus.
+fn app_entry_box(ud: u64, out: *mut [f64; 4]) -> bool {
+    let a: *mut App = ud as *mut App
+    let k: usize = focused_slot(a)
+    if k == NONE {
+        return false
+    }
+    let i: usize = (*a).ed_node[k]
+    (*out)[0] = scene.node_x(&(*a).sc, i)
+    (*out)[1] = scene.node_y(&(*a).sc, i)
+    (*out)[2] = scene.node_w(&(*a).sc, i)
+    (*out)[3] = scene.node_h(&(*a).sc, i)
+    return true
+}
