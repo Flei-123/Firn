@@ -1,0 +1,1505 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/http/server.fi -- an HTTP/1.1 SERVER with WebSocket, Server-Sent
+// Events and optional TLS 1.3, in one poll loop.
+//
+// ============================================================ IN SHORT
+//
+//     import http.server as http
+//
+//     fn hello(r: *mut http.Req) { http.reply(r, 200, "text/plain", "hi\n") }
+//     fn echo(w: *mut http.Ws, msg: str) { http.ws_send(w, msg) }
+//
+//     fn main() -> i32 {
+//         var app: http.App = http.app(8080)
+//         http.pair(&app)                       // every request needs the token
+//         http.route_text(&app, "/", "text/html", PAGE)
+//         http.route(&app, "/hello", hello)
+//         http.route_ws(&app, "/ws", echo)
+//         http.route_sse(&app, "/events")       // http.sse_send(&app, "/events", "", "data")
+//         io.fmt_print_line(f"{http.url(&app)}")
+//         return http.serve(&app)
+//     }
+//
+// ============================================================ THE SHAPE
+//
+// ONE THREAD, NON-BLOCKING SOCKETS, poll(2). A phone that steers a laptop,
+// a dashboard with a live feed: a few dozen connections that are mostly
+// silent. One thread per connection (demos/mcserver) would be as many
+// stacks; a poll loop holds all of them in one. Every socket is created
+// with SOCK_NONBLOCK, so no call here can block except poll itself.
+//
+// A handler is called with the request and answers SYNCHRONOUSLY
+// (`reply`). A handler that returns without answering gets a 500 -- the
+// protocol does not leave a request hanging.
+//
+// The strings a handler sees (path, query, headers, body, a WebSocket
+// message) point into the connection's buffer and are valid DURING the
+// call. Whoever wants to keep one copies it.
+//
+// ============================================================ HTTP/1.1
+//
+//   * request line + header block up to 16 KiB (431 above), a body by
+//     Content-Length or chunked (RFC 9112 7.1) up to `max_body` (413)
+//   * Content-Length together with Transfer-Encoding, two different
+//     Content-Lengths, a header name with white space before the colon,
+//     an obsolete line folding: 400 -- the request smuggling vectors
+//   * HTTP/1.1 without Host: 400
+//   * keep-alive (1.1 by default, 1.0 with "Connection: keep-alive"),
+//     pipelined requests answered in order, "Expect: 100-continue"
+//   * HEAD answered without a body
+//
+// ============================================================ WEBSOCKET
+//
+// The Upgrade of RFC 6455 4.2 (426 with the version it speaks when the
+// version is not 13), then frames through lib/ws/ws.fi's codec. The
+// checks and close codes are listed in that file. Pings are answered,
+// idle connections are pinged every 25 s, fragmented messages are
+// reassembled up to `max_msg` (1009 above).
+//
+// ============================================================ PAIRING
+//
+// `pair(&app)` makes a 128-bit random token (lib/std/crypto/random.fi,
+// getrandom). From then on every request has to carry it: once in the URL
+// (`?t=...`, the URL the program prints) -- answered with a redirect that
+// sets the cookie `firn_pair` (HttpOnly, SameSite=Strict) and drops the
+// token from the address bar -- and afterwards in that cookie, which the
+// browser also sends with the page's WebSocket. Without it: 403. The
+// comparison is constant time. A WebSocket upgrade whose Origin names
+// another host than the Host header is refused too (cross-site WebSocket
+// hijacking). There is no password and no default token.
+//
+// ============================================================ HONEST
+//
+// H1 IPv4 only (lib/std/net.fi N2).
+// H2 No HTTP/2. ALPN, when the client asks, picks http/1.1.
+// H3 A handler runs on the poll thread: a slow handler stalls every
+//    connection for that long.
+// H4 No percent-decoding of the path; `query_param` returns the raw value.
+import std.rt
+import std.vec
+import std.net
+import std.io
+import std.crypto.random
+import std.crypto.hmac
+import std.base64
+import ws.ws
+import tls.tls_server
+
+export {
+    App, Req, Ws,
+    app, route, route_text, route_ws, route_ws_full, route_sse, every,
+    pair, token, url, serve, run_for, step, stop,
+    tls_pem, tls_files, tls_enabled,
+    reply, reply_ex, header, query_param, cookie, method, path, query, body,
+    ws_send, ws_send_binary, ws_close, ws_broadcast, ws_count,
+    sse_send, sse_count, set_quiet, set_limits,
+    requests_served,
+}
+
+const K_FREE: u32 = 0
+const K_HTTP: u32 = 1
+const K_WS: u32 = 2
+const K_SSE: u32 = 3
+
+const R_TEXT: u32 = 1
+const R_FN: u32 = 2
+const R_WS: u32 = 3
+const R_SSE: u32 = 4
+
+const SYS_READ_FROM: i64 = 45 // recvfrom
+const SYS_SEND_TO: i64 = 44 // sendto
+const SYS_CLOSE_FD: i64 = 3
+const SYS_POLL_FDS: i64 = 7
+const SYS_SOCKET_NEW: i64 = 41
+const SYS_BIND_ADDR: i64 = 49
+const SYS_BACKLOG: i64 = 50
+const SYS_ACCEPT4: i64 = 288
+const SYS_SETSOCKOPT: i64 = 54
+const SYS_CLOCK: i64 = 228
+
+const POLLIN: u32 = 1
+const POLLOUT: u32 = 4
+const POLLERR: u32 = 8
+const POLLHUP: u32 = 16
+
+const EAGAIN: i64 = -11
+const EINTR: i64 = -4
+
+const MAX_HEAD: usize = 16384
+
+// ------------------------------------------------------------ The types
+
+struct Route {
+    path: str,
+    kind: u32,
+    ctype: str,
+    body: str,
+    handler: fn(*mut Req),
+    on_msg: fn(*mut Ws, str),
+    on_open: fn(*mut Ws),
+    on_close: fn(*mut Ws),
+}
+
+struct Conn {
+    fd: i32,
+    kind: u32,
+    inb: rt.Buf,
+    inpos: usize,
+    outb: rt.Buf,
+    outpos: usize,
+    secure: bool,
+    t: tls_server.TlsServer,
+    last_ms: i64,
+    ping_ms: i64,
+    close_after: bool,
+    dead: bool,
+    route: usize,
+    msg: rt.Buf,
+    msg_op: u32,
+    in_msg: bool,
+    utf: ws.Utf8,
+    close_sent: bool,
+    cont_sent: bool,
+    chunked: rt.Buf,
+    fr_done: usize, // payload octets of the current, incomplete frame already checked
+    fr_started: bool,
+}
+
+struct App {
+    port: u16,
+    addr: u32,
+    fd: i32,
+    routes: Vec[Route],
+    conns: Vec[Conn],
+    max_conn: usize,
+    token: [u8; 32],
+    paired: bool,
+    tls_on: bool,
+    cfg: tls_server.TlsConfig,
+    tick: fn(*mut App),
+    tick_ms: i64,
+    next_tick: i64,
+    max_body: usize,
+    max_msg: usize,
+    idle_ms: i64,
+    quiet: bool,
+    running: bool,
+    requests: u64,
+    urlbuf: rt.Buf,
+    polls: rt.Buf,
+    pmap: rt.Buf,
+    scratch: rt.Buf,
+}
+
+// What a handler sees of one request.
+struct Req {
+    app: *mut App,
+    ci: usize,
+    method: str,
+    path: str,
+    query: str,
+    head: str, // the header lines, each ending in CRLF
+    body: str,
+    v11: bool,
+    keep: bool,
+    head_only: bool,
+    replied: bool,
+    set_cookie: bool,
+}
+
+// What a WebSocket callback sees of its connection.
+struct Ws {
+    app: *mut App,
+    ci: usize,
+    binary: bool,
+}
+
+fn no_req(r: *mut Req) {}
+fn no_msg(w: *mut Ws, m: str) {}
+fn no_ws(w: *mut Ws) {}
+fn no_tick(a: *mut App) {}
+
+fn now_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(SYS_CLOCK, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn as_str(p: u64, n: usize) -> str {
+    return str { p: p as *mut u8, n: n }
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 { return c + 32 as u8 }
+    return c
+}
+
+fn same_ci(a: str, b: str) -> bool {
+    if a.n != b.n { return false }
+    var i: usize = 0
+    while i < a.n {
+        if lower(*(a.p + i)) != lower(*(b.p + i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Does the comma separated header value contain `tok` (case-insensitive)?
+fn has_token(v: str, tok: str) -> bool {
+    var i: usize = 0
+    while i < v.n {
+        while i < v.n && (*(v.p + i) == 32 as u8 || *(v.p + i) == 44 as u8 || *(v.p + i) == 9 as u8) {
+            i = i + 1
+        }
+        var j: usize = i
+        while j < v.n && *(v.p + j) != 44 as u8 { j = j + 1 }
+        var e: usize = j
+        while e > i && (*(v.p + e - 1) == 32 as u8 || *(v.p + e - 1) == 9 as u8) { e = e - 1 }
+        if same_ci(as_str((v.p + i) as u64, e - i), tok) { return true }
+        i = j + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------ Building
+
+fn app(port: u16) -> App {
+    return App { port: port, addr: net.ADDR_ANY, fd: 0 - 1,
+        routes: vec_new[Route](), conns: vec_new[Conn](), max_conn: 64,
+        token: [0; 32], paired: false, tls_on: false, cfg: tls_server.config_new(),
+        tick: no_tick, tick_ms: 0, next_tick: 0, max_body: 1048576,
+        max_msg: 1048576, idle_ms: 60000, quiet: false, running: false,
+        requests: 0, urlbuf: rt.buf_new(), polls: rt.buf_new(), pmap: rt.buf_new(),
+        scratch: rt.buf_new() }
+}
+
+fn add_route(a: *mut App, path: str, kind: u32) -> *mut Route {
+    vec_push[Route](&(*a).routes, Route { path: path, kind: kind, ctype: "", body: "",
+            handler: no_req, on_msg: no_msg, on_open: no_ws, on_close: no_ws })
+    return vec_elem_ptr[Route](&(*a).routes, vec_len[Route](&(*a).routes) - 1)
+}
+
+// GET/HEAD on `path` answers with a fixed body (a page, a script).
+fn route_text(a: *mut App, path: str, ctype: str, body: str) {
+    let r: *mut Route = add_route(a, path, R_TEXT)
+    (*r).ctype = ctype
+    (*r).body = body
+}
+
+// Any method on `path` calls `handler`.
+fn route(a: *mut App, path: str, handler: fn(*mut Req)) {
+    let r: *mut Route = add_route(a, path, R_FN)
+    (*r).handler = handler
+}
+
+// A WebSocket on `path`; every text or binary message goes to `on_msg`.
+fn route_ws(a: *mut App, path: str, on_msg: fn(*mut Ws, str)) {
+    let r: *mut Route = add_route(a, path, R_WS)
+    (*r).on_msg = on_msg
+}
+
+fn route_ws_full(a: *mut App, path: str, on_open: fn(*mut Ws),
+    on_msg: fn(*mut Ws, str), on_close: fn(*mut Ws)) {
+    let r: *mut Route = add_route(a, path, R_WS)
+    (*r).on_msg = on_msg
+    (*r).on_open = on_open
+    (*r).on_close = on_close
+}
+
+// A stream of Server-Sent Events on `path`; fill it with `sse_send`.
+fn route_sse(a: *mut App, path: str) {
+    add_route(a, path, R_SSE)
+}
+
+// `f` every `ms` milliseconds, on the poll thread.
+fn every(a: *mut App, ms: i64, f: fn(*mut App)) {
+    (*a).tick = f
+    (*a).tick_ms = ms
+    (*a).next_tick = now_ms() + ms
+}
+
+fn set_quiet(a: *mut App, q: bool) { (*a).quiet = q }
+
+fn set_limits(a: *mut App, max_body: usize, max_msg: usize, max_conn: usize) {
+    (*a).max_body = max_body
+    (*a).max_msg = max_msg
+    (*a).max_conn = max_conn
+}
+
+fn requests_served(a: *mut App) -> u64 { return (*a).requests }
+
+fn stop(a: *mut App) { (*a).running = false }
+
+// The pairing token: 16 random octets as 32 hex digits. Returns it.
+fn pair(a: *mut App) -> str {
+    var raw: [u8; 16] = [0; 16]
+    if !random.random_bytes((&raw[0]) as u64, 16) {
+        io.eprint_line("http: no randomness for the pairing token -- refusing to serve")
+        rt.finish(1)
+    }
+    var d: [u8; 16] = "0123456789abcdef"
+    var i: usize = 0
+    while i < 16 {
+        (*a).token[2 * i] = d[(raw[i] >> 4) as usize]
+        (*a).token[2 * i + 1] = d[(raw[i] & 15 as u8) as usize]
+        i = i + 1
+    }
+    (*a).paired = true
+    return token(a)
+}
+
+fn token(a: *mut App) -> str {
+    if !(*a).paired { return "" }
+    return as_str((&(*a).token[0]) as u64, 32)
+}
+
+// TLS from PEM text (chain + P-256 key). False: refused, see tls_server.
+fn tls_pem(a: *mut App, cert: u64, cn: usize, key: u64, kn: usize) -> bool {
+    (*a).tls_on = tls_server.config_load_pem(&(*a).cfg, cert, cn, key, kn)
+    return (*a).tls_on
+}
+
+fn tls_files(a: *mut App, cert_path: str, key_path: str) -> bool {
+    var cp: rt.Buf = rt.buf_new()
+    var kp: rt.Buf = rt.buf_new()
+    push_str(&cp, cert_path)
+    rt.buf_push(&cp, 0 as u8)
+    push_str(&kp, key_path)
+    rt.buf_push(&kp, 0 as u8)
+    var cert: rt.Buf = rt.buf_new()
+    var key: rt.Buf = rt.buf_new()
+    var ok: bool = io.read_file(cp.ptr, &cert) && io.read_file(kp.ptr, &key)
+    if ok {
+        ok = tls_pem(a, cert.ptr, cert.len, key.ptr, key.len)
+    }
+    rt.mem_set(key.ptr, 0 as u8, key.len)
+    rt.buf_free(&cert)
+    rt.buf_free(&key)
+    rt.buf_free(&cp)
+    rt.buf_free(&kp)
+    return ok
+}
+
+fn tls_enabled(a: *mut App) -> bool { return (*a).tls_on }
+
+// "http://192.168.1.23:8080/?t=<token>" -- what to open on the phone.
+fn url(a: *mut App) -> str {
+    rt.buf_clear(&(*a).urlbuf)
+    if (*a).tls_on {
+        push_str(&(*a).urlbuf, "https://")
+    } else {
+        push_str(&(*a).urlbuf, "http://")
+    }
+    var ip: u32 = (*a).addr
+    if ip == net.ADDR_ANY { ip = net.local_ipv4() }
+    net.ipv4_text(ip, &(*a).urlbuf)
+    rt.buf_push(&(*a).urlbuf, 58 as u8)
+    rt.buf_push_dec_u64(&(*a).urlbuf, (*a).port as u64)
+    rt.buf_push(&(*a).urlbuf, 47 as u8)
+    if (*a).paired {
+        push_str(&(*a).urlbuf, "?t=")
+        push_str(&(*a).urlbuf, token(a))
+    }
+    return as_str((*a).urlbuf.ptr, (*a).urlbuf.len)
+}
+
+// ------------------------------------------------------------ Sockets
+
+fn bind_port(a: *mut App) -> bool {
+    let fd: i64 = syscall(SYS_SOCKET_NEW, 2, 1 | 2048 | 524288, 0, 0, 0, 0)
+    if fd < 0 { return false }
+    var one: [i32; 1] = [1]
+    syscall(SYS_SETSOCKOPT, fd, 1, 2, (&one[0]) as i64, 4, 0) // SO_REUSEADDR
+    var sa: [u8; 16] = [0; 16]
+    sa[0] = 2 as u8
+    sa[2] = (((*a).port as u32 >> 8) & 255) as u8
+    sa[3] = ((*a).port as u32 & 255) as u8
+    sa[4] = (((*a).addr >> 24) & 255) as u8
+    sa[5] = (((*a).addr >> 16) & 255) as u8
+    sa[6] = (((*a).addr >> 8) & 255) as u8
+    sa[7] = ((*a).addr & 255) as u8
+    if syscall(SYS_BIND_ADDR, fd, (&sa[0]) as i64, 16, 0, 0, 0) < 0 {
+        syscall(SYS_CLOSE_FD, fd, 0, 0, 0, 0, 0)
+        return false
+    }
+    if syscall(SYS_BACKLOG, fd, 128, 0, 0, 0, 0) < 0 {
+        syscall(SYS_CLOSE_FD, fd, 0, 0, 0, 0, 0)
+        return false
+    }
+    (*a).fd = fd as i32
+    return true
+}
+
+fn conn(a: *mut App, ci: usize) -> *mut Conn {
+    return vec_elem_ptr[Conn](&(*a).conns, ci)
+}
+
+fn conn_init(a: *mut App) {
+    var i: usize = vec_len[Conn](&(*a).conns)
+    while i < (*a).max_conn {
+        vec_push[Conn](&(*a).conns, Conn { fd: 0 - 1, kind: K_FREE, inb: rt.buf_new(),
+                inpos: 0, outb: rt.buf_new(), outpos: 0, secure: false,
+                t: tls_server.server_new(&(*a).cfg), last_ms: 0, ping_ms: 0,
+                close_after: false, dead: false, route: 0, msg: rt.buf_new(), msg_op: 0,
+                in_msg: false, utf: ws.utf8_new(), close_sent: false, cont_sent: false,
+                chunked: rt.buf_new(), fr_done: 0, fr_started: false })
+        i = i + 1
+    }
+}
+
+fn accept_all(a: *mut App, now: i64) {
+    while true {
+        let fd: i64 = syscall(SYS_ACCEPT4, (*a).fd as i64, 0, 0, 2048 | 524288, 0, 0)
+        if fd < 0 { return }
+        var slot: usize = (*a).max_conn
+        var i: usize = 0
+        while i < (*a).max_conn {
+            if (*conn(a, i)).kind == K_FREE {
+                slot = i
+                break
+            }
+            i = i + 1
+        }
+        if slot == (*a).max_conn {
+            syscall(SYS_CLOSE_FD, fd, 0, 0, 0, 0, 0)
+            continue
+        }
+        var one: [i32; 1] = [1]
+        syscall(SYS_SETSOCKOPT, fd, 6, 1, (&one[0]) as i64, 4, 0) // TCP_NODELAY
+        let c: *mut Conn = conn(a, slot)
+        (*c).fd = fd as i32
+        (*c).kind = K_HTTP
+        rt.buf_clear(&(*c).inb)
+        (*c).inpos = 0
+        rt.buf_clear(&(*c).outb)
+        (*c).outpos = 0
+        (*c).secure = (*a).tls_on
+        if (*c).secure {
+            (*c).t = tls_server.server_new(&(*a).cfg)
+        }
+        (*c).last_ms = now
+        (*c).ping_ms = 0
+        (*c).close_after = false
+        (*c).dead = false
+        (*c).in_msg = false
+        (*c).close_sent = false
+        (*c).cont_sent = false
+        rt.buf_clear(&(*c).msg)
+    }
+}
+
+// Sends what stands in `outb` until the kernel would block.
+fn flush(c: *mut Conn) {
+    while (*c).outpos < (*c).outb.len && !(*c).dead {
+        let n: i64 = syscall(SYS_SEND_TO, (*c).fd as i64,
+            ((*c).outb.ptr + (*c).outpos as u64) as i64,
+            ((*c).outb.len - (*c).outpos) as i64, 16384 | 64, 0, 0) // MSG_NOSIGNAL|MSG_DONTWAIT
+        if n == EINTR { continue }
+        if n == EAGAIN { return }
+        if n <= 0 {
+            (*c).dead = true
+            return
+        }
+        (*c).outpos = (*c).outpos + n as usize
+    }
+    if (*c).outpos >= (*c).outb.len {
+        rt.buf_clear(&(*c).outb)
+        (*c).outpos = 0
+    }
+}
+
+fn move_tls_out(c: *mut Conn) {
+    let n: usize = tls_server.out_len(&(*c).t)
+    if n > 0 {
+        rt.buf_push_bytes(&(*c).outb, tls_server.out_ptr(&(*c).t), n)
+        tls_server.out_consume(&(*c).t, n)
+    }
+}
+
+// Plaintext for the peer: through TLS when the connection has it. A peer
+// that does not read gets no more than `limit` octets queued.
+fn conn_send(c: *mut Conn, p: u64, n: usize) {
+    conn_send_max(c, p, n, 16777216)
+}
+
+fn conn_send_max(c: *mut Conn, p: u64, n: usize, limit: usize) {
+    if (*c).dead { return }
+    if (*c).secure {
+        tls_server.send(&(*c).t, p, n)
+        move_tls_out(c)
+    } else {
+        rt.buf_push_bytes(&(*c).outb, p, n)
+    }
+    if (*c).outb.len - (*c).outpos > limit + n {
+        (*c).dead = true
+        return
+    }
+    flush(c)
+}
+
+fn read_all(a: *mut App, ci: usize, now: i64) {
+    let c: *mut Conn = conn(a, ci)
+    var buf: [u8; 16384] = [0; 16384]
+    var got: bool = false
+    while !(*c).dead {
+        let n: i64 = syscall(SYS_READ_FROM, (*c).fd as i64, (&buf[0]) as i64, 16384, 0, 0, 0)
+        if n == EINTR { continue }
+        if n == EAGAIN { break }
+        if n <= 0 {
+            // the peer is gone (or reset); what is queued cannot arrive
+            (*c).close_after = true
+            if (*c).outb.len == (*c).outpos { (*c).dead = true }
+            break
+        }
+        got = true
+        (*c).last_ms = now
+        if (*c).secure {
+            let alive: bool = tls_server.feed(&(*c).t, (&buf[0]) as u64, n as usize)
+            let an: usize = tls_server.app_len(&(*c).t)
+            if an > 0 {
+                rt.buf_push_bytes(&(*c).inb, tls_server.app_ptr(&(*c).t), an)
+                tls_server.app_consume(&(*c).t, an)
+            }
+            move_tls_out(c)
+            if !alive {
+                (*c).close_after = true
+            }
+        } else {
+            rt.buf_push_bytes(&(*c).inb, (&buf[0]) as u64, n as usize)
+        }
+        if (*c).inb.len - (*c).inpos > MAX_HEAD + (*a).max_body + (*a).max_msg + 65536 {
+            break // enough to work on; poll comes back for the rest
+        }
+    }
+    if got && !(*c).dead {
+        if (*c).kind == K_HTTP { http_input(a, ci) }
+        if (*c).kind == K_WS { ws_input(a, ci) }
+        if (*c).kind == K_SSE { (*c).inpos = (*c).inb.len }
+        compact(c)
+    }
+    flush(c)
+}
+
+fn compact(c: *mut Conn) {
+    if (*c).inpos == 0 { return }
+    let rest: usize = (*c).inb.len - (*c).inpos
+    if rest > 0 {
+        rt.mem_copy((*c).inb.ptr, (*c).inb.ptr + (*c).inpos as u64, rest)
+    }
+    rt.buf_set_len(&(*c).inb, rest)
+    (*c).inpos = 0
+}
+
+fn reap(a: *mut App, ci: usize) {
+    let c: *mut Conn = conn(a, ci)
+    if (*c).kind == K_WS {
+        var w: Ws = Ws { app: a, ci: ci, binary: false }
+        let r: *mut Route = vec_elem_ptr[Route](&(*a).routes, (*c).route)
+        let f: fn(*mut Ws) = (*r).on_close
+        (*c).kind = K_FREE // no sends to a closing connection from the callback
+        f(&w)
+    }
+    syscall(SYS_CLOSE_FD, (*c).fd as i64, 0, 0, 0, 0, 0)
+    (*c).fd = 0 - 1
+    (*c).kind = K_FREE
+    if (*c).secure {
+        tls_server.server_free(&(*c).t)
+        (*c).secure = false
+    }
+    // big buffers go back, small ones are kept for the next connection
+    if (*c).inb.cap > 262144 { rt.buf_free(&(*c).inb) }
+    if (*c).outb.cap > 262144 { rt.buf_free(&(*c).outb) }
+    if (*c).msg.cap > 262144 { rt.buf_free(&(*c).msg) }
+    if (*c).chunked.cap > 262144 { rt.buf_free(&(*c).chunked) }
+}
+
+// ------------------------------------------------------------ The loop
+
+// One round: wait up to `timeout_ms` for anything, act on it. False when
+// the server could not be started.
+// The App owns its connections, and a connection keeps a pointer back to
+// the App's TLS config and hands `a` to the callbacks: a pointer into the
+// App stored inside the App, never outliving it. The escape check cannot
+// see that ownership, so it is vouched for here (compiler/src/escape.rs).
+#[allow_escape]
+fn step(a: *mut App, timeout_ms: i64) -> bool {
+    if (*a).fd < 0 {
+        if !bind_port(a) { return false }
+        conn_init(a)
+        (*a).running = true
+    }
+    rt.buf_clear(&(*a).polls)
+    rt.buf_clear(&(*a).pmap)
+    var n: usize = 0
+    push_poll(a, (*a).fd, POLLIN, 0)
+    n = 1
+    var i: usize = 0
+    while i < (*a).max_conn {
+        let c: *mut Conn = conn(a, i)
+        if (*c).kind != K_FREE {
+            var ev: u32 = POLLIN
+            if (*c).outb.len > (*c).outpos { ev = ev | POLLOUT }
+            push_poll(a, (*c).fd, ev, i)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    var wait: i64 = timeout_ms
+    if (*a).tick_ms > 0 {
+        let until: i64 = (*a).next_tick - now_ms()
+        if until < wait { wait = until }
+        if wait < 0 { wait = 0 }
+    }
+    let r: i64 = syscall(SYS_POLL_FDS, (*a).polls.ptr as i64, n as i64, wait, 0, 0, 0)
+    let now: i64 = now_ms()
+    if r > 0 {
+        var k: usize = 0
+        while k < n {
+            let rev: u32 = (rt.ld8((*a).polls.ptr, k * 8 + 6) as u32)
+            | ((rt.ld8((*a).polls.ptr, k * 8 + 7) as u32) << 8)
+            if rev != 0 {
+                if k == 0 {
+                    accept_all(a, now)
+                } else {
+                    let ci: usize = rt.ld64((*a).pmap.ptr, k) as usize
+                    let c: *mut Conn = conn(a, ci)
+                    if (rev & (POLLIN | POLLHUP | POLLERR)) != 0 {
+                        read_all(a, ci, now)
+                    }
+                    if (rev & POLLOUT) != 0 { flush(c) }
+                }
+            }
+            k = k + 1
+        }
+    }
+    // timers
+    if (*a).tick_ms > 0 && now >= (*a).next_tick {
+        (*a).next_tick = now + (*a).tick_ms
+        let f: fn(*mut App) = (*a).tick
+        f(a)
+    }
+    i = 0
+    while i < (*a).max_conn {
+        let c: *mut Conn = conn(a, i)
+        if (*c).kind != K_FREE {
+            let quiet: i64 = now - (*c).last_ms
+            if (*c).kind == K_HTTP && quiet > (*a).idle_ms {
+                (*c).dead = true
+            }
+            if (*c).kind == K_WS && !(*c).close_sent {
+                if quiet > 25000 && now - (*c).ping_ms > 25000 {
+                    (*c).ping_ms = now
+                    ws_frame(c, ws.OP_PING, 0, 0)
+                }
+                if quiet > 90000 { (*c).dead = true }
+            }
+            if (*c).kind == K_SSE && now - (*c).ping_ms > 25000 {
+                (*c).ping_ms = now
+                conn_send(c, ": keep-alive\n\n".p as u64, 14)
+            }
+            if (*c).close_after && (*c).outb.len == (*c).outpos { (*c).dead = true }
+            if (*c).dead { reap(a, i) }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn push_poll(a: *mut App, fd: i32, ev: u32, ci: usize) {
+    var e: [u8; 8] = [0; 8]
+    let u: u32 = fd as u32
+    e[0] = (u & 255) as u8
+    e[1] = ((u >> 8) & 255) as u8
+    e[2] = ((u >> 16) & 255) as u8
+    e[3] = ((u >> 24) & 255) as u8
+    e[4] = (ev & 255) as u8
+    rt.buf_push_bytes(&(*a).polls, (&e[0]) as u64, 8)
+    var m: [u64; 1] = [0]
+    m[0] = ci as u64
+    rt.buf_push_bytes(&(*a).pmap, (&m[0]) as u64, 8)
+}
+
+// Serves until `stop` (or forever). Returns 1 when the port is not free.
+#[allow_escape]
+fn serve(a: *mut App) -> i32 {
+    if !step(a, 0) {
+        io.eprint_line("http: cannot listen on that port (in use?)")
+        return 1
+    }
+    while (*a).running {
+        step(a, 1000)
+    }
+    return 0
+}
+
+// Serves for `ms` milliseconds (tests, tools).
+#[allow_escape]
+fn run_for(a: *mut App, ms: i64) -> i32 {
+    let end: i64 = now_ms() + ms
+    if !step(a, 0) { return 1 }
+    while (*a).running && now_ms() < end {
+        step(a, end - now_ms())
+    }
+    return 0
+}
+
+// ------------------------------------------------------------ HTTP
+
+fn reason(status: u32) -> str {
+    if status == 100 { return "Continue" }
+    if status == 101 { return "Switching Protocols" }
+    if status == 200 { return "OK" }
+    if status == 201 { return "Created" }
+    if status == 204 { return "No Content" }
+    if status == 301 { return "Moved Permanently" }
+    if status == 302 { return "Found" }
+    if status == 303 { return "See Other" }
+    if status == 304 { return "Not Modified" }
+    if status == 400 { return "Bad Request" }
+    if status == 401 { return "Unauthorized" }
+    if status == 403 { return "Forbidden" }
+    if status == 404 { return "Not Found" }
+    if status == 405 { return "Method Not Allowed" }
+    if status == 408 { return "Request Timeout" }
+    if status == 411 { return "Length Required" }
+    if status == 413 { return "Content Too Large" }
+    if status == 426 { return "Upgrade Required" }
+    if status == 431 { return "Request Header Fields Too Large" }
+    if status == 500 { return "Internal Server Error" }
+    if status == 501 { return "Not Implemented" }
+    if status == 505 { return "HTTP Version Not Supported" }
+    return "Status"
+}
+
+// A response written straight to a connection (errors outside a handler).
+fn raw_reply(c: *mut Conn, status: u32, text: str, close: bool) {
+    var b: rt.Buf = rt.buf_new()
+    push_str(&b, "HTTP/1.1 ")
+    rt.buf_push_dec_u64(&b, status as u64)
+    rt.buf_push(&b, 32 as u8)
+    push_str(&b, reason(status))
+    push_str(&b, "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ")
+    rt.buf_push_dec_u64(&b, text.n as u64)
+    if close { push_str(&b, "\r\nConnection: close") }
+    push_str(&b, "\r\n\r\n")
+    push_str(&b, text)
+    conn_send(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    if close { (*c).close_after = true }
+}
+
+fn reply_ex(r: *mut Req, status: u32, ctype: str, extra: str, body: str) {
+    if (*r).replied { return }
+    (*r).replied = true
+    let c: *mut Conn = conn((*r).app, (*r).ci)
+    var b: rt.Buf = rt.buf_new()
+    push_str(&b, "HTTP/1.1 ")
+    rt.buf_push_dec_u64(&b, status as u64)
+    rt.buf_push(&b, 32 as u8)
+    push_str(&b, reason(status))
+    push_str(&b, "\r\n")
+    if ctype.n > 0 {
+        push_str(&b, "Content-Type: ")
+        push_str(&b, ctype)
+        push_str(&b, "\r\n")
+    }
+    push_str(&b, "Content-Length: ")
+    rt.buf_push_dec_u64(&b, body.n as u64)
+    push_str(&b, "\r\nX-Content-Type-Options: nosniff\r\n")
+    if (*r).set_cookie {
+        push_str(&b, "Set-Cookie: firn_pair=")
+        push_str(&b, token((*r).app))
+        push_str(&b, "; Path=/; HttpOnly; SameSite=Strict\r\n")
+    }
+    if !(*r).keep {
+        push_str(&b, "Connection: close\r\n")
+    } else if !(*r).v11 {
+        push_str(&b, "Connection: keep-alive\r\n")
+    }
+    push_str(&b, extra)
+    push_str(&b, "\r\n")
+    if !(*r).head_only { push_str(&b, body) }
+    conn_send(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    (*(*r).app).requests = (*(*r).app).requests + 1
+}
+
+fn reply(r: *mut Req, status: u32, ctype: str, body: str) {
+    reply_ex(r, status, ctype, "", body)
+}
+
+fn method(r: *mut Req) -> str { return (*r).method }
+fn path(r: *mut Req) -> str { return (*r).path }
+fn query(r: *mut Req) -> str { return (*r).query }
+fn body(r: *mut Req) -> str { return (*r).body }
+
+fn trim(s: str) -> str {
+    var i: usize = 0
+    var e: usize = s.n
+    while i < e && (*(s.p + i) == 32 as u8 || *(s.p + i) == 9 as u8) { i = i + 1 }
+    while e > i && (*(s.p + e - 1) == 32 as u8 || *(s.p + e - 1) == 9 as u8) { e = e - 1 }
+    return as_str((s.p + i) as u64, e - i)
+}
+
+// The value of the first header `name` (any case), "" when absent.
+fn header(r: *mut Req, name: str) -> str {
+    let h: str = (*r).head
+    var i: usize = 0
+    while i < h.n {
+        var e: usize = i
+        while e + 1 < h.n && !(*(h.p + e) == 13 as u8 && *(h.p + e + 1) == 10 as u8) { e = e + 1 }
+        var colon: usize = i
+        while colon < e && *(h.p + colon) != 58 as u8 { colon = colon + 1 }
+        if colon < e && same_ci(as_str((h.p + i) as u64, colon - i), name) {
+            return trim(as_str((h.p + colon + 1) as u64, e - colon - 1))
+        }
+        i = e + 2
+    }
+    return ""
+}
+
+// `name=value` pairs separated by `sep` (& for queries, ; for cookies).
+fn pair_value(s: str, name: str, sep: u8) -> str {
+    var i: usize = 0
+    while i < s.n {
+        while i < s.n && (*(s.p + i) == 32 as u8) { i = i + 1 }
+        var e: usize = i
+        while e < s.n && *(s.p + e) != sep { e = e + 1 }
+        var eq: usize = i
+        while eq < e && *(s.p + eq) != 61 as u8 { eq = eq + 1 }
+        if eq < e && as_str((s.p + i) as u64, eq - i) == name {
+            return as_str((s.p + eq + 1) as u64, e - eq - 1)
+        }
+        i = e + 1
+    }
+    return ""
+}
+
+fn query_param(r: *mut Req, name: str) -> str {
+    return pair_value((*r).query, name, 38 as u8)
+}
+
+fn cookie(r: *mut Req, name: str) -> str {
+    return pair_value(header(r, "Cookie"), name, 59 as u8)
+}
+
+fn token_ok(a: *mut App, s: str) -> bool {
+    if s.n != 32 { return false }
+    return hmac.hmac_equal(s.p as u64, (&(*a).token[0]) as u64, 32)
+}
+
+fn parse_dec(s: str, out: *mut u64) -> bool {
+    if s.n == 0 || s.n > 18 { return false }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.n {
+        let ch: u8 = *(s.p + i)
+        if ch < 48 as u8 || ch > 57 as u8 { return false }
+        v = v * 10 + (ch - 48 as u8) as u64
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn hexv(ch: u8) -> i64 {
+    if ch >= 48 as u8 && ch <= 57 as u8 { return (ch - 48 as u8) as i64 }
+    if ch >= 97 as u8 && ch <= 102 as u8 { return (ch - 87 as u8) as i64 }
+    if ch >= 65 as u8 && ch <= 70 as u8 { return (ch - 55 as u8) as i64 }
+    return -1
+}
+
+// A chunked body starting at p[0..n). Returns the octets consumed
+// (0 = incomplete, -1 = malformed, -2 = too large); the data goes to `out`.
+fn dechunk(p: u64, n: usize, out: *mut rt.Buf, max: usize) -> i64 {
+    rt.buf_clear(out)
+    var at: usize = 0
+    while true {
+        // chunk-size [; ext] CRLF
+        var e: usize = at
+        while e + 1 < n && !(rt.ld8(p, e) == 13 as u8 && rt.ld8(p, e + 1) == 10 as u8) { e = e + 1 }
+        if e + 1 >= n { return 0 }
+        var size: u64 = 0
+        var k: usize = at
+        var digits: usize = 0
+        while k < e && hexv(rt.ld8(p, k)) >= 0 {
+            size = size * 16 + hexv(rt.ld8(p, k)) as u64
+            digits = digits + 1
+            if digits > 15 { return -1 }
+            k = k + 1
+        }
+        if digits == 0 { return -1 }
+        if k < e && rt.ld8(p, k) != 59 as u8 && rt.ld8(p, k) != 32 as u8 && rt.ld8(p, k) != 9 as u8 {
+            return -1
+        }
+        at = e + 2
+        if size == 0 {
+            // trailers until an empty line
+            while true {
+                var t: usize = at
+                while t + 1 < n && !(rt.ld8(p, t) == 13 as u8 && rt.ld8(p, t + 1) == 10 as u8) { t = t + 1 }
+                if t + 1 >= n { return 0 }
+                if t == at { return (t + 2) as i64 }
+                at = t + 2
+            }
+        }
+        if (*out).len as u64 + size > max as u64 { return -2 }
+        if (at as u64) + size + 2 > n as u64 { return 0 }
+        rt.buf_push_bytes(out, p + at as u64, size as usize)
+        at = at + size as usize
+        if rt.ld8(p, at) != 13 as u8 || rt.ld8(p, at + 1) != 10 as u8 { return -1 }
+        at = at + 2
+    }
+    return -1
+}
+
+fn find_head_end(p: u64, n: usize) -> usize {
+    var i: usize = 0
+    while i + 4 <= n {
+        if rt.ld8(p, i) == 13 as u8 && rt.ld8(p, i + 1) == 10 as u8
+        && rt.ld8(p, i + 2) == 13 as u8 && rt.ld8(p, i + 3) == 10 as u8 {
+            return i + 4
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Works through every complete request in the connection's buffer.
+fn http_input(a: *mut App, ci: usize) {
+    let c: *mut Conn = conn(a, ci)
+    while (*c).kind == K_HTTP && !(*c).dead && !(*c).close_after {
+        let p: u64 = (*c).inb.ptr + (*c).inpos as u64
+        let n: usize = (*c).inb.len - (*c).inpos
+        if n == 0 { return }
+        // blank lines before a request are allowed (RFC 9112 2.2)
+        if rt.ld8(p, 0) == 13 as u8 || rt.ld8(p, 0) == 10 as u8 {
+            (*c).inpos = (*c).inpos + 1
+            continue
+        }
+        var hend: usize = find_head_end(p, n)
+        if hend == 0 {
+            if n > MAX_HEAD { raw_reply(c, 431, "header block too large\n", true) }
+            return
+        }
+        if hend > MAX_HEAD {
+            raw_reply(c, 431, "header block too large\n", true)
+            return
+        }
+        // the request line
+        var e: usize = 0
+        while e + 1 < hend && !(rt.ld8(p, e) == 13 as u8 && rt.ld8(p, e + 1) == 10 as u8) { e = e + 1 }
+        let line: str = as_str(p, e)
+        let s1: usize = line.find_char(32 as u8)
+        if s1 >= line.n || s1 == 0 {
+            raw_reply(c, 400, "bad request line\n", true)
+            return
+        }
+        let rest: str = line.ab(s1 + 1)
+        let s2: usize = rest.find_char(32 as u8)
+        if s2 >= rest.n || s2 == 0 {
+            raw_reply(c, 400, "bad request line\n", true)
+            return
+        }
+        let target: str = rest.to(s2)
+        let version: str = rest.ab(s2 + 1)
+        var v11: bool = false
+        if version == "HTTP/1.1" {
+            v11 = true
+        } else if version != "HTTP/1.0" {
+            raw_reply(c, 505, "HTTP/1.1 only\n", true)
+            return
+        }
+        var r: Req = Req { app: a, ci: ci, method: line.to(s1), path: target, query: "",
+            head: as_str(p + (e + 2) as u64, hend - e - 4), body: "", v11: v11,
+            keep: v11, head_only: false, replied: false, set_cookie: false }
+        let qm: usize = target.find_char(63 as u8)
+        if qm < target.n {
+            r.path = target.to(qm)
+            r.query = target.ab(qm + 1)
+        }
+        r.head_only = r.method == "HEAD"
+        // header block checks: folding, white space before the colon
+        let h: str = r.head
+        var i: usize = 0
+        var bad: bool = false
+        while i < h.n && !bad {
+            if *(h.p + i) == 32 as u8 || *(h.p + i) == 9 as u8 { bad = true }
+            var le: usize = i
+            while le + 1 < h.n && !(*(h.p + le) == 13 as u8 && *(h.p + le + 1) == 10 as u8) { le = le + 1 }
+            var colon: usize = i
+            while colon < le && *(h.p + colon) != 58 as u8 { colon = colon + 1 }
+            if colon >= le || colon == i { bad = true }
+            if colon > i && (*(h.p + colon - 1) == 32 as u8 || *(h.p + colon - 1) == 9 as u8) { bad = true }
+            if !bad && same_ci(as_str((h.p + i) as u64, colon - i), "Content-Length") {
+                // two different Content-Lengths are a smuggling attempt
+                let v: str = trim(as_str((h.p + colon + 1) as u64, le - colon - 1))
+                if v != header(&r, "Content-Length") { bad = true }
+            }
+            i = le + 2
+        }
+        if bad {
+            raw_reply(c, 400, "malformed header block\n", true)
+            return
+        }
+        if v11 && header(&r, "Host").n == 0 {
+            raw_reply(c, 400, "Host header missing\n", true)
+            return
+        }
+        let conn_h: str = header(&r, "Connection")
+        if has_token(conn_h, "close") { r.keep = false }
+        if !v11 && has_token(conn_h, "keep-alive") { r.keep = true }
+        // the body
+        let te: str = header(&r, "Transfer-Encoding")
+        let cl: str = header(&r, "Content-Length")
+        var blen: usize = 0
+        var used: usize = hend
+        if te.n > 0 {
+            if cl.n > 0 {
+                raw_reply(c, 400, "Content-Length together with Transfer-Encoding\n", true)
+                return
+            }
+            if !same_ci(trim(te), "chunked") {
+                raw_reply(c, 501, "only chunked transfer coding\n", true)
+                return
+            }
+            let got: i64 = dechunk(p + hend as u64, n - hend, &(*c).chunked, (*a).max_body)
+            if got == -1 {
+                raw_reply(c, 400, "malformed chunked body\n", true)
+                return
+            }
+            if got == -2 {
+                raw_reply(c, 413, "body too large\n", true)
+                return
+            }
+            if got == 0 {
+                continue_if_expected(c, &r)
+                return
+            }
+            r.body = as_str((*c).chunked.ptr, (*c).chunked.len)
+            used = hend + got as usize
+        } else if cl.n > 0 {
+            var v: u64 = 0
+            if !parse_dec(cl, &v) {
+                raw_reply(c, 400, "bad Content-Length\n", true)
+                return
+            }
+            if v > (*a).max_body as u64 {
+                raw_reply(c, 413, "body too large\n", true)
+                return
+            }
+            blen = v as usize
+            if n - hend < blen {
+                continue_if_expected(c, &r)
+                return
+            }
+            r.body = as_str(p + hend as u64, blen)
+            used = hend + blen
+        }
+        (*c).cont_sent = false
+        dispatch(a, &r)
+        if !r.keep { (*c).close_after = true }
+        // the request is done: its octets go (dispatch may have turned the
+        // connection into a WebSocket; what follows are frames then)
+        (*c).inpos = (*c).inpos + used
+    }
+}
+
+fn continue_if_expected(c: *mut Conn, r: *mut Req) {
+    if (*r).v11 && !(*c).cont_sent && same_ci(header(r, "Expect"), "100-continue") {
+        (*c).cont_sent = true
+        let s: str = "HTTP/1.1 100 Continue\r\n\r\n"
+        conn_send(c, s.p as u64, s.n)
+    }
+}
+
+fn find_route(a: *mut App, path: str) -> usize {
+    var i: usize = 0
+    while i < vec_len[Route](&(*a).routes) {
+        if (*vec_elem_ptr[Route](&(*a).routes, i)).path == path { return i }
+        i = i + 1
+    }
+    return vec_len[Route](&(*a).routes)
+}
+
+fn dispatch(a: *mut App, r: *mut Req) {
+    // pairing
+    if (*a).paired {
+        let t: str = query_param(r, "t")
+        if t.n > 0 && token_ok(a, t) {
+            if (*r).method == "GET" && header(r, "Upgrade").n == 0 {
+                // the token leaves the address bar: redirect to the path
+                (*r).set_cookie = true
+                var loc: rt.Buf = rt.buf_new()
+                push_str(&loc, "Location: ")
+                push_str(&loc, (*r).path)
+                push_str(&loc, "\r\nCache-Control: no-store\r\n")
+                reply_ex(r, 303, "text/plain", as_str(loc.ptr, loc.len), "paired\n")
+                rt.buf_free(&loc)
+                return
+            }
+        } else if !token_ok(a, cookie(r, "firn_pair")) {
+            reply(r, 403, "text/plain; charset=utf-8",
+                "not paired: open the address the server printed (it carries the token)\n")
+            return
+        }
+    }
+    let ri: usize = find_route(a, (*r).path)
+    if ri >= vec_len[Route](&(*a).routes) {
+        reply(r, 404, "text/plain", "not found\n")
+        return
+    }
+    let rt0: *mut Route = vec_elem_ptr[Route](&(*a).routes, ri)
+    let kind: u32 = (*rt0).kind
+    if kind == R_TEXT {
+        if (*r).method != "GET" && (*r).method != "HEAD" {
+            reply_ex(r, 405, "text/plain", "Allow: GET, HEAD\r\n", "method not allowed\n")
+            return
+        }
+        reply_ex(r, 200, (*rt0).ctype, "Cache-Control: no-cache\r\n", (*rt0).body)
+        return
+    }
+    if kind == R_FN {
+        let f: fn(*mut Req) = (*rt0).handler
+        f(r)
+        if !(*r).replied { reply(r, 500, "text/plain", "the handler did not reply\n") }
+        return
+    }
+    if kind == R_WS {
+        ws_upgrade(a, r, ri)
+        return
+    }
+    if kind == R_SSE {
+        if (*r).method != "GET" {
+            reply_ex(r, 405, "text/plain", "Allow: GET\r\n", "method not allowed\n")
+            return
+        }
+        (*r).replied = true
+        let c: *mut Conn = conn(a, (*r).ci)
+        var b: rt.Buf = rt.buf_new()
+        push_str(&b, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\n")
+        if (*r).set_cookie {
+            push_str(&b, "Set-Cookie: firn_pair=")
+            push_str(&b, token(a))
+            push_str(&b, "; Path=/; HttpOnly; SameSite=Strict\r\n")
+        }
+        push_str(&b, "\r\n: stream open\n\n")
+        conn_send(c, b.ptr, b.len)
+        rt.buf_free(&b)
+        (*c).kind = K_SSE
+        (*c).route = ri
+        (*c).ping_ms = now_ms()
+        (*r).keep = true
+        (*a).requests = (*a).requests + 1
+        return
+    }
+}
+
+// ------------------------------------------------------------ WebSocket
+
+fn ws_upgrade(a: *mut App, r: *mut Req, ri: usize) {
+    if (*r).method != "GET" || !(*r).v11 {
+        reply_ex(r, 405, "text/plain", "Allow: GET\r\n", "WebSocket needs GET over HTTP/1.1\n")
+        return
+    }
+    if !has_token(header(r, "Upgrade"), "websocket") || !has_token(header(r, "Connection"), "upgrade") {
+        reply_ex(r, 426, "text/plain", "Upgrade: websocket\r\n", "this path speaks WebSocket\n")
+        return
+    }
+    if header(r, "Sec-WebSocket-Version") != "13" {
+        reply_ex(r, 426, "text/plain", "Sec-WebSocket-Version: 13\r\n", "WebSocket version 13 only\n")
+        return
+    }
+    let key: str = header(r, "Sec-WebSocket-Key")
+    var raw: rt.Buf = rt.buf_new()
+    let good: bool = base64.decode(key.p as u64, key.n, &raw) && raw.len == 16
+    rt.buf_free(&raw)
+    if !good {
+        reply(r, 400, "text/plain", "bad Sec-WebSocket-Key\n")
+        return
+    }
+    if (*a).paired {
+        // Origin (when sent) has to name this very host
+        let origin: str = header(r, "Origin")
+        if origin.n > 0 {
+            let host: str = header(r, "Host")
+            var at: usize = origin.find_char(58 as u8)
+            var ok: bool = at + 3 <= origin.n
+            if ok { ok = origin.ab(at + 3) == host }
+            if !ok {
+                reply(r, 403, "text/plain", "cross-origin WebSocket refused\n")
+                return
+            }
+        }
+    }
+    (*r).replied = true
+    let c: *mut Conn = conn(a, (*r).ci)
+    var b: rt.Buf = rt.buf_new()
+    push_str(&b, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+    ws.accept_key(key, &b)
+    push_str(&b, "\r\n\r\n")
+    conn_send(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    (*c).kind = K_WS
+    (*c).route = ri
+    (*c).in_msg = false
+    (*c).close_sent = false
+    (*c).fr_done = 0
+    (*c).fr_started = false
+    (*c).ping_ms = now_ms()
+    rt.buf_clear(&(*c).msg)
+    (*r).keep = true
+    (*a).requests = (*a).requests + 1
+    var w: Ws = Ws { app: a, ci: (*r).ci, binary: false }
+    let f: fn(*mut Ws) = (*vec_elem_ptr[Route](&(*a).routes, ri)).on_open
+    f(&w)
+}
+
+fn ws_frame(c: *mut Conn, op: u32, p: u64, n: usize) {
+    var b: rt.Buf = rt.buf_new()
+    ws.write_frame(&b, op, true, p, n, 0)
+    conn_send(c, b.ptr, b.len)
+    rt.buf_free(&b)
+}
+
+// Sends a close frame with `code` and ends the connection once it is out.
+fn ws_fail(c: *mut Conn, code: u32) {
+    if !(*c).close_sent {
+        var b: [u8; 2] = [0, 0]
+        b[0] = ((code >> 8) & 255) as u8
+        b[1] = (code & 255) as u8
+        ws_frame(c, ws.OP_CLOSE, (&b[0]) as u64, 2)
+        (*c).close_sent = true
+    }
+    (*c).close_after = true
+}
+
+fn ws_input(a: *mut App, ci: usize) {
+    let c: *mut Conn = conn(a, ci)
+    while (*c).kind == K_WS && !(*c).dead && !(*c).close_after {
+        let p: u64 = (*c).inb.ptr + (*c).inpos as u64
+        let n: usize = (*c).inb.len - (*c).inpos
+        var f: ws.Frame = ws.frame_new()
+        let r: i32 = ws.parse_frame(p, n, &f)
+        if r == ws.PARSE_MORE { return }
+        if r == ws.PARSE_ERROR {
+            ws_fail(c, f.err)
+            return
+        }
+        if !f.masked {
+            ws_fail(c, 1002)
+            return
+        }
+        if f.plen > (*a).max_msg as u64 || ((*c).in_msg && (*c).msg.len as u64 + f.plen > (*a).max_msg as u64) {
+            ws_fail(c, 1009)
+            return
+        }
+        let pp: u64 = p + f.hlen as u64
+        let text_frame: bool = f.op == ws.OP_TEXT
+        || (f.op == ws.OP_CONT && (*c).in_msg && (*c).msg_op == ws.OP_TEXT)
+        if (n as u64) < f.hlen as u64 + f.plen {
+            // FAIL FAST: the text that is already here is checked now,
+            // not when the last octet of the frame arrives
+            if text_frame && n > f.hlen && n - f.hlen > (*c).fr_done && !(*c).close_sent {
+                if !(*c).fr_started {
+                    if !ws_start(c, &f) { return }
+                    (*c).fr_started = true
+                }
+                let avail: usize = n - f.hlen
+                let d0: usize = (*c).fr_done
+                ws.unmask(pp + d0 as u64, avail - d0, (&f.mask[0]) as u64, d0)
+                if !ws.utf8_feed(&(*c).utf, pp + d0 as u64, avail - d0) {
+                    ws_fail(c, 1007)
+                    return
+                }
+                (*c).fr_done = avail
+            }
+            return
+        }
+        let pl: usize = f.plen as usize
+        let done: usize = (*c).fr_done
+        let started: bool = (*c).fr_started
+        (*c).fr_done = 0
+        (*c).fr_started = false
+        ws.unmask(pp + done as u64, pl - done, (&f.mask[0]) as u64, done)
+        (*c).inpos = (*c).inpos + f.hlen + pl
+        if (*c).close_sent && f.op != ws.OP_CLOSE { continue }
+        if f.op == ws.OP_PING {
+            ws_frame(c, ws.OP_PONG, pp, pl)
+            continue
+        }
+        if f.op == ws.OP_PONG { continue }
+        if f.op == ws.OP_CLOSE {
+            if pl == 1 {
+                ws_fail(c, 1002)
+                return
+            }
+            if pl >= 2 {
+                let code: u32 = ((rt.ld8(pp, 0) as u32) << 8) | (rt.ld8(pp, 1) as u32)
+                if !ws.close_code_ok(code) {
+                    ws_fail(c, 1002)
+                    return
+                }
+                var u: ws.Utf8 = ws.utf8_new()
+                if !ws.utf8_feed(&u, pp + 2, pl - 2) || !ws.utf8_complete(&u) {
+                    ws_fail(c, 1007)
+                    return
+                }
+                if !(*c).close_sent {
+                    ws_frame(c, ws.OP_CLOSE, pp, 2)
+                    (*c).close_sent = true
+                }
+            } else if !(*c).close_sent {
+                ws_frame(c, ws.OP_CLOSE, 0, 0)
+                (*c).close_sent = true
+            }
+            (*c).close_after = true
+            return
+        }
+        if !started {
+            if !ws_start(c, &f) { return }
+        }
+        rt.buf_push_bytes(&(*c).msg, pp, pl)
+        if (*c).msg_op == ws.OP_TEXT && !ws.utf8_feed(&(*c).utf, pp + done as u64, pl - done) {
+            ws_fail(c, 1007)
+            return
+        }
+        if f.fin {
+            if (*c).msg_op == ws.OP_TEXT && !ws.utf8_complete(&(*c).utf) {
+                ws_fail(c, 1007)
+                return
+            }
+            (*c).in_msg = false
+            var w: Ws = Ws { app: a, ci: ci, binary: (*c).msg_op == ws.OP_BINARY }
+            let rte: *mut Route = vec_elem_ptr[Route](&(*a).routes, (*c).route)
+            let fm: fn(*mut Ws, str) = (*rte).on_msg
+            fm(&w, as_str((*c).msg.ptr, (*c).msg.len))
+            rt.buf_clear(&(*c).msg)
+        }
+    }
+}
+
+// The bookkeeping at the first sight of a data frame: a continuation
+// needs a message, a new message must not start inside one.
+fn ws_start(c: *mut Conn, f: *mut ws.Frame) -> bool {
+    if (*f).op == ws.OP_CONT {
+        if !(*c).in_msg {
+            ws_fail(c, 1002)
+            return false
+        }
+        return true
+    }
+    if (*c).in_msg {
+        ws_fail(c, 1002)
+        return false
+    }
+    (*c).in_msg = true
+    (*c).msg_op = (*f).op
+    (*c).utf = ws.utf8_new()
+    rt.buf_clear(&(*c).msg)
+    return true
+}
+
+fn ws_live(w: *mut Ws) -> *mut Conn {
+    let c: *mut Conn = conn((*w).app, (*w).ci)
+    if (*c).kind != K_WS || (*c).close_sent || (*c).dead { return 0 as *mut Conn }
+    return c
+}
+
+// Sends a text message on this WebSocket.
+fn ws_send(w: *mut Ws, text: str) -> bool {
+    let c: *mut Conn = ws_live(w)
+    if (c as u64) == 0 { return false }
+    ws_frame(c, ws.OP_TEXT, text.p as u64, text.n)
+    return true
+}
+
+fn ws_send_binary(w: *mut Ws, p: u64, n: usize) -> bool {
+    let c: *mut Conn = ws_live(w)
+    if (c as u64) == 0 { return false }
+    ws_frame(c, ws.OP_BINARY, p, n)
+    return true
+}
+
+fn ws_close(w: *mut Ws, code: u32) {
+    let c: *mut Conn = ws_live(w)
+    if (c as u64) == 0 { return }
+    ws_fail(c, code)
+}
+
+// The same text to every WebSocket on `path`. Returns how many.
+fn ws_broadcast(a: *mut App, path: str, text: str) -> usize {
+    let ri: usize = find_route(a, path)
+    var sent: usize = 0
+    var i: usize = 0
+    while i < vec_len[Conn](&(*a).conns) {
+        let c: *mut Conn = conn(a, i)
+        if (*c).kind == K_WS && (*c).route == ri && !(*c).close_sent && !(*c).dead {
+            ws_frame(c, ws.OP_TEXT, text.p as u64, text.n)
+            sent = sent + 1
+        }
+        i = i + 1
+    }
+    return sent
+}
+
+fn ws_count(a: *mut App, path: str) -> usize {
+    return count_kind(a, path, K_WS)
+}
+
+fn count_kind(a: *mut App, path: str, kind: u32) -> usize {
+    let ri: usize = find_route(a, path)
+    var n: usize = 0
+    var i: usize = 0
+    while i < vec_len[Conn](&(*a).conns) {
+        let c: *mut Conn = conn(a, i)
+        if (*c).kind == kind && (*c).route == ri && !(*c).dead { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ------------------------------------------------------------ SSE
+
+// One event to every stream on `path`: "event: <event>" (when not empty)
+// and one "data:" line per line of `data`. Returns how many got it.
+fn sse_send(a: *mut App, path: str, event: str, data: str) -> usize {
+    var b: rt.Buf = rt.buf_new()
+    if event.n > 0 {
+        push_str(&b, "event: ")
+        push_str(&b, event)
+        rt.buf_push(&b, 10 as u8)
+    }
+    var i: usize = 0
+    while true {
+        var e: usize = i
+        while e < data.n && *(data.p + e) != 10 as u8 { e = e + 1 }
+        push_str(&b, "data: ")
+        rt.buf_push_bytes(&b, (data.p + i) as u64, e - i)
+        rt.buf_push(&b, 10 as u8)
+        if e >= data.n { break }
+        i = e + 1
+    }
+    rt.buf_push(&b, 10 as u8)
+    let ri: usize = find_route(a, path)
+    var sent: usize = 0
+    var k: usize = 0
+    while k < vec_len[Conn](&(*a).conns) {
+        let c: *mut Conn = conn(a, k)
+        if (*c).kind == K_SSE && (*c).route == ri && !(*c).dead {
+            conn_send(c, b.ptr, b.len)
+            sent = sent + 1
+        }
+        k = k + 1
+    }
+    rt.buf_free(&b)
+    return sent
+}
+
+fn sse_count(a: *mut App, path: str) -> usize {
+    return count_kind(a, path, K_SSE)
+}

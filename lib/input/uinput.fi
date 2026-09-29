@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/uinput.fi -- mouse and keyboard input on LINUX, through
+// /dev/uinput (Documentation/input/uinput.rst).
+//
+// The kernel lets a program create a virtual input device and feed it
+// events; to every consumer -- X11, Wayland compositors through libinput,
+// the console -- it is a mouse and a keyboard like any other. No X
+// extension, no compositor protocol: it works under X11 and Wayland alike.
+//
+// ONE device carries both: EV_REL (X, Y, wheel, horizontal wheel), EV_KEY
+// (the three mouse buttons and the keyboard keys 1..248, which includes
+// the media keys) and EV_SYN. Every call writes its events and a
+// SYN_REPORT in one write(2).
+//
+// PERMISSION. /dev/uinput belongs to root on most systems. A user in the
+// group `input` (or with a udev rule granting access) can open it; the
+// error text says which of the two is missing instead of failing quietly.
+//
+// struct input_event on a 64-bit kernel: timeval (2 x 8 octets, may be 0
+// for uinput), u16 type, u16 code, i32 value = 24 octets -- the same on
+// x86-64 and AArch64.
+import std.rt
+
+export { open, close, is_open, error_text, error_code, rel, button, key, DEVICE_NAME }
+
+const DEVICE_NAME: str = "Firn virtual input"
+
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_WRITE: i64 = 1
+const SYS_IOCTL: i64 = 16
+
+const UI_SET_EVBIT: i64 = 1074025828 // _IOW('U', 100, int) 0x40045564
+const UI_SET_KEYBIT: i64 = 1074025829 // 0x40045565
+const UI_SET_RELBIT: i64 = 1074025830 // 0x40045566
+const UI_DEV_SETUP: i64 = 1079792899 // _IOW('U', 3, struct uinput_setup) 0x405c5503
+const UI_DEV_CREATE: i64 = 21761 // _IO('U', 1) 0x5501
+const UI_DEV_DESTROY: i64 = 21762 // 0x5502
+
+const EV_SYN: u32 = 0
+const EV_KEY: u32 = 1
+const EV_REL: u32 = 2
+
+static mut UI_FD: i64 = -1
+static mut UI_ERR: i64 = 0
+
+fn is_open() -> bool { return UI_FD >= 0 }
+fn error_code() -> i64 { return UI_ERR }
+
+fn error_text() -> str {
+    if UI_ERR == 0 { return "" }
+    if UI_ERR == 2 { return "/dev/uinput does not exist (modprobe uinput)" }
+    if UI_ERR == 13 || UI_ERR == 1 {
+        return "no permission for /dev/uinput (add the user to group 'input' or run as root)"
+    }
+    return "/dev/uinput could not be set up"
+}
+
+fn ctl(fd: i64, req: i64, arg: i64) -> bool {
+    return syscall(SYS_IOCTL, fd, req, arg, 0, 0, 0) >= 0
+}
+
+// Creates the virtual device once. False (and `error_text`) when the
+// system does not allow it.
+fn open() -> bool {
+    if UI_FD >= 0 { return true }
+    var path: [u8; 12] = "/dev/uinput\0"
+    let fd: i64 = syscall(SYS_OPEN, (&path[0]) as i64, 1 | 2048 | 524288, 0, 0, 0, 0) // O_WRONLY|O_NONBLOCK|O_CLOEXEC
+    if fd < 0 {
+        UI_ERR = 0 - fd
+        return false
+    }
+    var ok: bool = ctl(fd, UI_SET_EVBIT, EV_SYN as i64) && ctl(fd, UI_SET_EVBIT, EV_KEY as i64)
+    && ctl(fd, UI_SET_EVBIT, EV_REL as i64)
+    ok = ok && ctl(fd, UI_SET_RELBIT, 0) && ctl(fd, UI_SET_RELBIT, 1) // REL_X, REL_Y
+    && ctl(fd, UI_SET_RELBIT, 6) && ctl(fd, UI_SET_RELBIT, 8) // REL_HWHEEL, REL_WHEEL
+    var k: i64 = 272 // BTN_LEFT, BTN_RIGHT, BTN_MIDDLE
+    while ok && k <= 274 {
+        ok = ctl(fd, UI_SET_KEYBIT, k)
+        k = k + 1
+    }
+    k = 1 // KEY_ESC .. 248: the keyboard, media keys included
+    while ok && k <= 248 {
+        ok = ctl(fd, UI_SET_KEYBIT, k)
+        k = k + 1
+    }
+    // struct uinput_setup { struct input_id { u16 bustype, vendor, product,
+    // version }; char name[80]; u32 ff_effects_max; } -- 92 octets
+    var setup: [u8; 92] = [0; 92]
+    setup[0] = 6 as u8 // BUS_VIRTUAL
+    setup[2] = 9 as u8 // vendor 0x1209 (pid.codes, the open source vendor id)
+    setup[3] = 18 as u8
+    setup[4] = 1 as u8 // product 0x0001
+    setup[6] = 1 as u8 // version 1
+    let nm: str = DEVICE_NAME
+    var i: usize = 0
+    while i < nm.n && i < 79 {
+        setup[8 + i] = *(nm.p + i)
+        i = i + 1
+    }
+    ok = ok && ctl(fd, UI_DEV_SETUP, (&setup[0]) as i64) && ctl(fd, UI_DEV_CREATE, 0)
+    if !ok {
+        UI_ERR = 5
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return false
+    }
+    UI_FD = fd
+    UI_ERR = 0
+    return true
+}
+
+fn close() {
+    if UI_FD >= 0 {
+        ctl(UI_FD, UI_DEV_DESTROY, 0)
+        syscall(SYS_CLOSE, UI_FD, 0, 0, 0, 0, 0)
+        UI_FD = -1
+    }
+}
+
+fn put(b: *mut rt.Buf, t: u32, code: u32, value: i32) {
+    var e: [u8; 24] = [0; 24]
+    e[16] = (t & 255) as u8
+    e[17] = ((t >> 8) & 255) as u8
+    e[18] = (code & 255) as u8
+    e[19] = ((code >> 8) & 255) as u8
+    let v: u32 = ((value as i64) & 4294967295) as u32 // the two's complement bits
+    e[20] = (v & 255) as u8
+    e[21] = ((v >> 8) & 255) as u8
+    e[22] = ((v >> 16) & 255) as u8
+    e[23] = ((v >> 24) & 255) as u8
+    rt.buf_push_bytes(b, (&e[0]) as u64, 24)
+}
+
+fn send(b: *mut rt.Buf) -> bool {
+    put(b, EV_SYN, 0, 0) // SYN_REPORT
+    let len: i64 = (*b).len as i64
+    let n: i64 = syscall(SYS_WRITE, UI_FD, (*b).ptr as i64, len, 0, 0, 0)
+    rt.buf_free(b)
+    return n == len
+}
+
+// Relative motion and wheels in one report. Zero axes are left out.
+fn rel(dx: i32, dy: i32, wheel: i32, hwheel: i32) -> bool {
+    if !open() { return false }
+    var b: rt.Buf = rt.buf_new()
+    if dx != 0 { put(&b, EV_REL, 0, dx) }
+    if dy != 0 { put(&b, EV_REL, 1, dy) }
+    if hwheel != 0 { put(&b, EV_REL, 6, hwheel) }
+    if wheel != 0 { put(&b, EV_REL, 8, wheel) }
+    return send(&b)
+}
+
+// BTN_LEFT (272), BTN_RIGHT (273), BTN_MIDDLE (274).
+fn button(code: u32, down: bool) -> bool {
+    return key(code, down)
+}
+
+// A key by its Linux code (linux/input-event-codes.h).
+fn key(code: u32, down: bool) -> bool {
+    if !open() { return false }
+    var b: rt.Buf = rt.buf_new()
+    var v: i32 = 0
+    if down { v = 1 }
+    put(&b, EV_KEY, code, v)
+    return send(&b)
+}

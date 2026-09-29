@@ -1799,7 +1799,7 @@ compute it",
         }
     }
 
-    /// `import path.module`
+    /// `import path.module` or `import path.module as name`
     fn import_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'import'
         let mut path: Vec<String> = Vec::new();
@@ -1816,8 +1816,24 @@ compute it",
                 break;
             }
         }
-        let alias = match path.last() {
-            Some(a) => a.clone(),
+        // `import http.server as http`: the module is reached under a name
+        // of the program's choosing. Without `as` the name is the last part
+        // of the path, as it always was. The renamer (modules.rs) maps the
+        // alias to the module name of the target file, so nothing else
+        // changes.
+        let mut chosen: Option<String> = None;
+        if self.eat(&TokKind::KwAs) {
+            match self.ident("as the module alias after 'as'") {
+                Some((n, _)) => chosen = Some(n),
+                None => {
+                    self.recovering = false;
+                    self.sync_item();
+                    return;
+                }
+            }
+        }
+        let alias = match chosen.or_else(|| path.last().cloned()) {
+            Some(a) => a,
             None => {
                 self.recovering = false;
                 self.sync_item();

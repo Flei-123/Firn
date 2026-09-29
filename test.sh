@@ -1428,6 +1428,40 @@ else
     grep -E 'FAIL|DIFF' "$WORK/libmvp.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 66. TLS 1.3 client AND server, ECDSA signing (tools/tls/run.sh, round NET-REMOTE) =="
+# Against Python's cryptography, openssl s_server/s_client, curl and
+# Python's ssl -- with the refusals counted as counter-checks.
+bash tools/tls/run.sh > "$WORK/tls.log" 2>&1 && TLSRC=0 || TLSRC=$?
+grep -E '^(CRYPTO|CERT|TLS|P256|TLS SERVER) ' "$WORK/tls.log" | sed 's/^/   /'
+if [ "$TLSRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/tls/run.sh failed (see .test-work/tls.log)"
+    grep -E 'FAIL' "$WORK/tls.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 67. HTTP/1.1 server, WebSocket (Autobahn), SSE, pairing (tools/http/run.sh, round NET-REMOTE) =="
+bash tools/http/run.sh > "$WORK/http.log" 2>&1 && HTRC=0 || HTRC=$?
+grep -E '^(HTTP|WS CLIENT|AUTOBAHN) |Autobahn' "$WORK/http.log" | sed 's/^/   /'
+if [ "$HTRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/http/run.sh failed (see .test-work/http.log)"
+    grep -E 'FAIL' "$WORK/http.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 68. input (uinput in a VM with the real kernel) and examples/phone_remote end to end (round NET-REMOTE) =="
+bash tools/input/run.sh > "$WORK/input.log" 2>&1 && INRC=0 || INRC=$?
+grep -E '^(INPUT|SKIP)|events compared' "$WORK/input.log" | sed 's/^/   /'
+bash tools/phone_remote/run.sh > "$WORK/phone_remote.log" 2>&1 && PRRC2=0 || PRRC2=$?
+grep -E 'PHONE REMOTE|SKIP|builds' "$WORK/phone_remote.log" | sed 's/^/   /'
+if [ "$INRC" -eq 0 ] && [ "$PRRC2" -eq 0 ]; then
+    ok
+else
+    bad "tools/input/run.sh or tools/phone_remote/run.sh failed (see .test-work/input.log, phone_remote.log)"
+    grep -E 'FAIL' "$WORK/input.log" "$WORK/phone_remote.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

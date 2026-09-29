@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/tls/server_main.fi -- a blocking, one-connection-at-a-time driver of
+// lib/tls/tls_server.fi for tools/tls/server_check.py.
+//
+//   server_main <port> <cert.pem> <key.pem> [connections]
+//
+// Application data that starts with "GET " is answered with a small
+// HTTP/1.1 response (keep-alive); anything else is echoed back. After
+// `connections` connections (default: unlimited) the program ends. One
+// line per connection on stderr: "conn <n> suite <hex> alert_out <n>
+// alert_in <n> app_in <octets>".
+import std.rt
+import std.io
+import std.net
+import tls.tls_server as server
+
+fn say(t: *mut server.TlsServer, n: u64, app_in: u64) {
+    io.fmt_eprint_line(f"conn {n} suite {server.suite(t) as u64} alert_out {server.alert_sent(t) as u64} alert_in {server.alert_got(t) as u64} app_in {app_in} established_seen")
+}
+
+fn has(b: *mut rt.Buf, lit: str) -> bool {
+    var i: usize = 0
+    while i + lit.n <= (*b).len {
+        if rt.mem_eq((*b).ptr + i as u64, lit.p as u64, lit.n) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn flush(c: *mut net.Conn, t: *mut server.TlsServer) -> bool {
+    let n: usize = server.out_len(t)
+    if n == 0 { return true }
+    let k: usize = net.write_all(c, server.out_ptr(t), n) catch 0
+    server.out_consume(t, n)
+    return k == n
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 4 { return 2 }
+    var port: u64 = 0
+    let pp: u64 = rt.arg_ptr(start, 1)
+    var i: usize = 0
+    while i < rt.c_length(pp) {
+        port = port * 10 + (rt.ld8(pp, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    var limit: u64 = 0
+    if rt.arg_count(start) > 4 {
+        let lp: u64 = rt.arg_ptr(start, 4)
+        i = 0
+        while i < rt.c_length(lp) {
+            limit = limit * 10 + (rt.ld8(lp, i) - 48 as u8) as u64
+            i = i + 1
+        }
+    }
+    var cert: rt.Buf = rt.buf_new()
+    var key: rt.Buf = rt.buf_new()
+    if !io.read_file(rt.arg_ptr(start, 2), &cert) { return 3 }
+    if !io.read_file(rt.arg_ptr(start, 3), &key) { return 3 }
+    var cfg: server.TlsConfig = server.config_new()
+    if !server.config_load_pem(&cfg, cert.ptr, cert.len, key.ptr, key.len) {
+        io.eprint_line("config refused")
+        return 4
+    }
+    var l: net.Listener = net.listen_tcp(net.ADDR_LOCAL, port as u16) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&l) { return 5 }
+    io.eprint_line("ready")
+    var count: u64 = 0
+    var buf: [u8; 16384] = [0; 16384]
+    while limit == 0 || count < limit {
+        var c: net.Conn = net.accept(&l) catch net.conn_from_fd(0 - 1)
+        if !net.conn_is_open(&c) { continue }
+        count = count + 1
+        var t: server.TlsServer = server.server_new(&cfg)
+        var app_in: u64 = 0
+        var pending: rt.Buf = rt.buf_new()
+        var going: bool = true
+        while going {
+            let n: usize = net.read(&c, (&buf[0]) as u64, 16384) catch 0
+            if n == 0 { break }
+            going = server.feed(&t, (&buf[0]) as u64, n)
+            let an: usize = server.app_len(&t)
+            if an > 0 {
+                app_in = app_in + an as u64
+                rt.buf_push_bytes(&pending, server.app_ptr(&t), an)
+                server.app_consume(&t, an)
+                if pending.len >= 4 && rt.ld8(pending.ptr, 0) == 71 as u8
+                && rt.ld8(pending.ptr, 1) == 69 as u8 && rt.ld8(pending.ptr, 2) == 84 as u8 {
+                    // answer once the header block is complete
+                    var k: usize = 0
+                    var whole: bool = false
+                    while k + 4 <= pending.len {
+                        if rt.ld8(pending.ptr, k) == 13 as u8 && rt.ld8(pending.ptr, k + 1) == 10 as u8
+                        && rt.ld8(pending.ptr, k + 2) == 13 as u8 && rt.ld8(pending.ptr, k + 3) == 10 as u8 {
+                            whole = true
+                            break
+                        }
+                        k = k + 1
+                    }
+                    if whole {
+                        let resp: str = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nhello from firn tls\n"
+                        server.send(&t, resp.p as u64, resp.n)
+                        if has(&pending, "Connection: close") {
+                            server.close(&t)
+                            going = false
+                        }
+                        rt.buf_clear(&pending)
+                    }
+                } else {
+                    server.send(&t, pending.ptr, pending.len)
+                    if has(&pending, "QUIT") {
+                        server.close(&t)
+                        going = false
+                    }
+                    rt.buf_clear(&pending)
+                }
+            }
+            if !flush(&c, &t) { break }
+        }
+        flush(&c, &t)
+        say(&t, count, app_in)
+        server.server_free(&t)
+        rt.buf_free(&pending)
+        net.close(&c)
+    }
+    return 0
+}
