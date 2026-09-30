@@ -91,11 +91,11 @@ import fui.gpu
 
 export {
     Painter, painter_new, painter_init, painter_free, painter_ok,
-    painter_canvas, painter_set_font, painter_font, painter_clear,
+    painter_canvas, painter_swap_canvas, painter_set_font, painter_font, painter_clear,
     painter_set_font_slot, painter_font_slot, FONT_SLOTS,
     painter_fill_raster, painter_set_band,
     surface, round_rect, round_ring, border_col, mit_alpha, clip_rows,
-    round_rect_grad, mix_argb,
+    round_rect_grad, round_rect_radial, mix_argb,
     text, text_width, text_fits_upto, text_baseline_mid,
     TEXT_L, TEXT_M, TEXT_R,
     caret_bar,
@@ -223,6 +223,15 @@ fn painter_ok(z: *mut Painter) -> bool { return (*z).ok != 0 }
 #[no_gc]
 fn painter_canvas(z: *mut Painter) -> *mut canvas.Canvas {
     return (*z).cv as *mut canvas.Canvas
+}
+
+// PAINT SOMEWHERE ELSE for a while (lib/fui/layer.fi): the painter draws
+// into `cv` from now on and gives back the canvas it drew into so far.
+// `cv` must be at least as large -- the raster windows are clipped to it.
+fn painter_swap_canvas(z: *mut Painter, cv: *mut canvas.Canvas) -> *mut canvas.Canvas {
+    let old: u64 = (*z).cv
+    (*z).cv = cv as u64
+    return old as *mut canvas.Canvas
 }
 
 #[no_gc]
@@ -725,6 +734,8 @@ fn round_rect_grad(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
     var wx: f64 = 0.0
     var wy: f64 = 0.0
     if !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
+        grad_rect(painter_canvas(z), x, y, w, h, mit_alpha(c0), mit_alpha(c1),
+            dx, dy)
         return
     }
     path_round(&(*z).ra, x, y, w, h, r)
@@ -786,6 +797,222 @@ fn round_rect_grad(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
                     col, cov)
             }
             xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// A SOFT LIGHT IN A ROUND RECTANGLE -- a radial gradient from `col` in
+// the centre (cx, cy) to nothing at the ellipse (rx, ry), over whatever is
+// there already. The weight falls as (1 - d^2)^2 (d^2 = (dx/rx)^2 +
+// (dy/ry)^2), the same fall-off as effect.glow_ground: smooth to its rim,
+// no exp per pixel. `col` carries the strongest opacity.
+//
+// On a GPU canvas the band is painted in memory (gpu.gpu_sw_begin): the
+// GPU has no shader for it yet, and correct beats fast.
+fn round_rect_radial(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
+    r: f64, col: u32, cx: f64, cy: f64, rx: f64, ry: f64) {
+    if (*z).ok == 0 || w <= 0.0 || h <= 0.0 || rx <= 0.0 || ry <= 0.0 {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    var b0: i32 = 0
+    var b1: i32 = 0
+    var b2: i32 = 0
+    var b3: i32 = 0
+    if g as u64 != 0 {
+        b0 = floor_px(clamp(x, 0.0, canvas.canvas_width(cv) as f64)) as i32
+        b1 = floor_px(clamp(y, 0.0, canvas.canvas_height(cv) as f64)) as i32
+        b2 = (clamp(x + w + 1.0, 0.0, canvas.canvas_width(cv) as f64)) as i32
+        b3 = (clamp(y + h + 1.0, 0.0, canvas.canvas_height(cv) as f64)) as i32
+        if b2 <= b0 || b3 <= b1 {
+            return
+        }
+        gpu.gpu_sw_begin(g, cv, b0, b1, b2, b3)
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if r <= 0.0 || !raster_window(z, x, y, w, h, 1.0, &wx, &wy) {
+        // square corners, or larger than the raster window: every pixel
+        // of the box (clipped to the canvas) with full coverage
+        radial_rect(cv, x, y, w, h, mit_alpha(col), cx, cy, rx, ry)
+    } else {
+        path_round(&(*z).ra, x, y, w, h, r)
+        raster.raster_finish(&(*z).ra)
+        let base: u32 = mit_alpha(col)
+        let a0: f64 = ((base >> 24) & 255 as u32) as f64
+        let rgb: u32 = base & 16777215 as u32
+        let irx: f64 = 1.0 / (rx * rx)
+        let iry: f64 = 1.0 / (ry * ry)
+        let ra: *mut raster.Raster = &(*z).ra
+        let rh: usize = raster.raster_used_y1(ra)
+        let rw: usize = raster.raster_used_x1(ra)
+        let rx0: usize = raster.raster_used_x0(ra)
+        var yy: usize = raster.raster_used_y0(ra)
+        while yy < rh {
+            let row: u64 = raster.raster_cov_row(ra, yy)
+            let py: f64 = wy + (yy as f64) + 0.5 - cy
+            let qy: f64 = py * py * iry
+            if qy < 1.0 {
+                var xx: usize = rx0
+                while xx < rw {
+                    let v: f64 = *((row + (xx * 8) as u64) as *mut f64)
+                    if v > 0.0 {
+                        let px: f64 = wx + (xx as f64) + 0.5 - cx
+                        let d2: f64 = px * px * irx + qy
+                        if d2 < 1.0 {
+                            let u: f64 = 1.0 - d2
+                            var cov: f64 = v
+                            if cov > 1.0 {
+                                cov = 1.0
+                            }
+                            let a: u32 = (a0 * u * u + 0.5) as u32
+                            if a > 0 as u32 {
+                                canvas.canvas_blend(cv, (wx as usize) + xx,
+                                    (wy as usize) + yy, (a << 24) | rgb, cov)
+                            }
+                        }
+                    }
+                    xx = xx + 1
+                }
+            }
+            yy = yy + 1
+        }
+    }
+    if g as u64 != 0 {
+        gpu.gpu_sw_end(g, cv, b0, b1, b2, b3)
+    }
+}
+
+// The pixel rows of (x, y, w, h) clipped to the canvas: *y0..*y1,
+// *x0..*x1. False when nothing is left.
+fn px_span(cv: *mut canvas.Canvas, x: f64, y: f64, w: f64, h: f64,
+    x0: *mut usize, y0: *mut usize, x1: *mut usize, y1: *mut usize) -> bool {
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+    let a: f64 = clamp(x + 0.5, 0.0, cw)
+    let b: f64 = clamp(y + 0.5, 0.0, ch)
+    let c: f64 = clamp(x + w + 0.5, 0.0, cw)
+    let d: f64 = clamp(y + h + 0.5, 0.0, ch)
+    *x0 = a as usize
+    *y0 = b as usize
+    *x1 = c as usize
+    *y1 = d as usize
+    return *x1 > *x0 && *y1 > *y0
+}
+
+fn radial_rect(cv: *mut canvas.Canvas, x: f64, y: f64, w: f64, h: f64,
+    base: u32, cx: f64, cy: f64, rx: f64, ry: f64) {
+    var x0: usize = 0
+    var y0: usize = 0
+    var x1: usize = 0
+    var y1: usize = 0
+    if !px_span(cv, x, y, w, h, &x0, &y0, &x1, &y1) {
+        return
+    }
+    let a0: f64 = ((base >> 24) & 255 as u32) as f64
+    let rgb: u32 = base & 16777215 as u32
+    let irx: f64 = 1.0 / (rx * rx)
+    let iry: f64 = 1.0 / (ry * ry)
+    var yy: usize = y0
+    while yy < y1 {
+        let py: f64 = (yy as f64) + 0.5 - cy
+        let qy: f64 = py * py * iry
+        if qy < 1.0 {
+            // only the columns inside the ellipse on this row
+            let half: f64 = rx * root_of(1.0 - qy)
+            var xa: usize = x0
+            let fa: f64 = cx - half
+            if fa > xa as f64 {
+                xa = fa as usize
+            }
+            var xb: usize = x1
+            let fb: f64 = cx + half + 1.0
+            if fb < xb as f64 {
+                xb = fb as usize
+            }
+            var xx: usize = xa
+            while xx < xb {
+                let px: f64 = (xx as f64) + 0.5 - cx
+                let d2: f64 = px * px * irx + qy
+                if d2 < 1.0 {
+                    let u: f64 = 1.0 - d2
+                    let a: u32 = (a0 * u * u + 0.5) as u32
+                    if a > 0 as u32 {
+                        canvas.canvas_blend(cv, xx, yy, (a << 24) | rgb, 1.0)
+                    }
+                }
+                xx = xx + 1
+            }
+        }
+        yy = yy + 1
+    }
+}
+
+// A square root by Newton (no libm in the kernel profile of the callers).
+fn root_of(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    var g: f64 = v
+    if g < 1.0 {
+        g = 1.0
+    }
+    var i: usize = 0
+    while i < 24 {
+        g = 0.5 * (g + v / g)
+        i = i + 1
+    }
+    return g
+}
+
+// The linear ramp of `round_rect_grad` over a box with square corners or
+// one larger than the raster window: every pixel, full coverage.
+fn grad_rect(cv: *mut canvas.Canvas, x: f64, y: f64, w: f64, h: f64,
+    a: u32, b: u32, dx: f64, dy: f64) {
+    var x0: usize = 0
+    var y0: usize = 0
+    var x1: usize = 0
+    var y1: usize = 0
+    if !px_span(cv, x, y, w, h, &x0, &y0, &x1, &y1) {
+        return
+    }
+    var ax: f64 = dx
+    if ax < 0.0 {
+        ax = 0.0 - ax
+    }
+    var ay: f64 = dy
+    if ay < 0.0 {
+        ay = 0.0 - ay
+    }
+    var span: f64 = w * ax + h * ay
+    if span <= 0.0 {
+        span = 1.0
+    }
+    var ox: f64 = x
+    if dx < 0.0 {
+        ox = x + w
+    }
+    var oy: f64 = y
+    if dy < 0.0 {
+        oy = y + h
+    }
+    var yy: usize = y0
+    while yy < y1 {
+        let py: f64 = (yy as f64) + 0.5
+        if dx == 0.0 {
+            let col: u32 = mix_argb(a, b, clamp01(((py - oy) * dy) / span))
+            canvas.canvas_fill_rect(cv, x0 as f64, yy as f64, x1 as f64,
+                (yy + 1) as f64, col)
+        } else {
+            var xx: usize = x0
+            while xx < x1 {
+                let px: f64 = (xx as f64) + 0.5
+                canvas.canvas_blend(cv, xx, yy, mix_argb(a, b,
+                    clamp01(((px - ox) * dx + (py - oy) * dy) / span)), 1.0)
+                xx = xx + 1
+            }
         }
         yy = yy + 1
     }

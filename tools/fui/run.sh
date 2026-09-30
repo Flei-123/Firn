@@ -430,7 +430,37 @@ echo "== 18k. SCHMELZGRUPPE: FORMEN VERSCHMELZEN, WENN SIE SICH NAEHERN =="
 "$W/merge"
 
 echo
-echo "== 18l. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
+echo "== 18l. DER SEITEN-LOOK: VERLAUF, LICHT, SCHATTEN, FLUIDE SCHRIFT, ABSAETZE, GRUPPEN =="
+# lib/fui/style.fi (SF_BG_GRAD, SF_BG_GLOW, SF_BOX_SHADOW, SF_FLUID),
+# lib/fui/scene.fi (node_set_text_wrap, node_set_opacity/offset,
+# scene_draw_still/live) und lib/fui/layer.fi -- auf echten Pixeln.
+"$FIRNC" --opt-level=release-fast -o "$W/pagelook" tools/fui/pagelook_main.fi
+"$W/pagelook"
+
+echo
+echo "== 18m. DER APP-BAUM: SZENE ALS DOM, EINMAL KURZ DURCHGEMESSEN =="
+# tools/fui/apptree_main.fi (docs/APP-TREE.md): gallery9 und kuenstliche
+# Baeume bis 128 Knoten -- bauen, stylen, messen, legen, malen, treffen,
+# abfragen, vorlesen. Hier nur EINE Runde: laufen muss es und jeder Knoten
+# braucht einen Namen (unnamed=0); die Zahlen misst tools/fui/apptree.sh.
+"$FIRNC" --opt-level=release-fast -o "$W/apptree" tools/fui/apptree_main.fi
+"$W/apptree" 128 1 > "$W/apptree.log" || { cat "$W/apptree.log"; echo "  FAIL: apptree"; exit 1; }
+n=$(grep -c '^apptree tree=' "$W/apptree.log" || true)
+bad=$(grep '^apptree tree=' "$W/apptree.log" | grep -vc ' unnamed=0 ' || true)
+[ "$n" -ge 2 ] && [ "$bad" = 0 ] || { cat "$W/apptree.log"; echo "  FAIL: apptree ($n Baeume, $bad mit Knoten ohne Namen)"; exit 1; }
+echo "  APP-BAUM OK: $n Baeume, jeder Knoten hat einen Namen"
+echo
+echo "== 18n. THE APP TREE: SECRETS, KEYS, QUERIES, CULLING, MEMO, INSPECTOR =="
+# tools/fui/dom_main.fi (docs/APP-TREE.md 7): a password never leaves the
+# process (canary, not even its length), key paths survive a rebuild,
+# queries by selector / role + name / text, culling paints the same
+# octets, the measure memo gives the same sizes, the inspector picks,
+# describes (without secrets) and edits live.
+build dom
+"$W/dom"
+
+echo
+echo "== 18o. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
 # for BOTH platforms from one source -- `import fui.apphost` resolves to
 # lib/@linux/ natively and to lib/@web/ with --target=wasm32-browser --

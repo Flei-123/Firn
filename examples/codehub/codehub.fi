@@ -30,11 +30,12 @@
 //
 // RESPONSIVE. Below 1000 design points of usable width the hero stacks
 // (text over terminal), the header drops its two links, the tiles go
-// two by two, and the headline takes the size at which "Made in Austria."
-// fits the column (measured with the bold face -- the fluid type a CSS page
-// writes as clamp()). The paragraph and the terminal lines are wrapped by
-// fUi's own line breaker (painter.run_line_count / run_draw_wrapped); the
-// page only asks how many lines they need at this width.
+// two by two. The headline has a FLUID size (style.style_set_font_fluid,
+// CSS clamp(min, base + k vw, max)) so that "Made in Austria." fits the
+// column; the paragraph and the tile captions are PARAGRAPHS
+// (scene.node_set_text_wrap) -- fUi breaks and sizes them. The terminal's
+// lines are paragraphs too that RESERVE the text still to be typed
+// (scene.node_set_text_reserve), so the card does not grow while it types.
 //
 // THREE FACES. The theme's font, a monospace one (slot 1) for the terminal
 // and a bold one (slot 2) for headline, buttons and figures -- chosen by
@@ -45,19 +46,24 @@
 // THE BACKGROUND IS BAKED. Red light (effect.glow_ground, dithered), a
 // faint grid, the mountains (SVG, lib/svg through fui/uisvg), and the two
 // glass panels (card, figures: effect.glass_area over what lies below,
-// effect.rrect_shadow under them) are painted once per size into a canvas
-// of their own; a frame copies the visible band of it and paints only
-// what can change on top: texts, buttons, hover. That is what keeps a
-// 1996 x 1211 frame inside 16 ms on one core.
+// effect.rrect_shadow under them) are painted once per size into a
+// layer.Bake; once the intro is over the rest of the page goes in too
+// (scene_draw_still), and a frame is one copy plus the LIVE nodes -- what
+// answers the pointer (scene.node_set_live, scene_draw_live). That is what
+// keeps a 1996 x 1211 frame inside 16 ms on one core.
 //
-// MOTION. The hero fades in and rises (staggered, ease-out), the terminal
+// MOTION. The hero fades in and rises group by group (staggered,
+// ease-out; scene.node_set_opacity + node_set_offset -- each group one
+// picture), the terminal
 // types itself, and every button, link and tile answers the pointer on a
-// spring (anim.easing_spring): the red button glows up, the dark one gets
+// spring (anim.easing_spring): the red button glows up (its style's
+// SF_BOX_SHADOW grows), the dark one gets
 // a red rim, a link grows its underline, a tile lights. Nothing moves when
 // nothing happens -- `page_busy` says when the host may sleep.
 import std.rt
 import paint.canvas
 import fui.theme
+import fui.layer
 import fui.style
 import fui.widget
 import fui.painter
@@ -128,6 +134,8 @@ const K_TOUT: u32 = 114
 const K_TOK: u32 = 115
 const K_STATV: u32 = 116
 const K_STATC: u32 = 117
+const K_B1: u32 = 118 // the red button's box
+const K_B2: u32 = 119 // the dark one's
 
 const LINES_T: usize = 7 // terminal lines
 const TYPE_START: i64 = 700 // ms after the start: the terminal begins
@@ -214,6 +222,9 @@ const SVG_LOGIN_N: usize = 287
 // ================================================================ THE PAGE
 struct Page {
     sc: scene.Scene,
+    // the measure memo: the page is described anew every frame, and an
+    // unchanged text is not shaped again (lib/fui/scene.fi, r100)
+    memo: scene.Memo,
     sh: sheet.Sheet,
     m: u64, // *mut theme.Theme, the host's
     fm: u64,
@@ -224,14 +235,9 @@ struct Page {
     login: uisvg.Icon,
     tf: themefile.ThemeFile,
     theme_ok: bool,
-    // the baked background (see the head of this file)
-    bg: canvas.Canvas,
-    bz: painter.Painter,
-    bg_w: usize,
-    bg_h: usize,
-    bg_key: f64,
-    bakes: usize,
-    rest: bool, // the still content is baked into `bg` as well
+    // the baked background (see the head of this file): fUi's layer.Bake
+    bk: layer.Bake,
+    rest: bool, // the still content (scene_draw_still) is baked in as well
     rests: usize,
     no_rest: bool, // page_set_still_cache(false): always paint everything
     // what can be pointed at
@@ -264,13 +270,13 @@ struct Page {
 
 fn page_blank() -> Page {
     return Page {
-        sc: scene.scene_new(), sh: sheet.sheet_new(), m: 0, fm: 0,
+        sc: scene.scene_new(), memo: scene.memo_new(), sh: sheet.sheet_new(),
+        m: 0, fm: 0,
         fm_mono: 0, fm_bold: 0,
         logo: uisvg.icon_new(), hills: uisvg.icon_new(),
         login: uisvg.icon_new(), tf: themefile.themefile_new(),
         theme_ok: false,
-        bg: canvas.canvas_new(), bz: painter.painter_new(), bg_w: 0, bg_h: 0,
-        bg_key: 0.0, bakes: 0, rest: false, rests: 0, no_rest: false,
+        bk: layer.bake_new(), rest: false, rests: 0, no_rest: false,
         hot: [scene.SCENE_NONE; 10],
         ha: [anim.anim_new(0, 1, 0.0, 0.0, anim.easing_linear()); 10],
         hto: [0.0; 10], pressed: HOT_N, px: 0.0, py: 0.0, inside: false,
@@ -331,7 +337,7 @@ fn page_set_fonts(pg: *mut Page, z: *mut painter.Painter, mono: u64,
 
 fn page_height(pg: *mut Page) -> f64 { return (*pg).page_h }
 fn page_scroll(pg: *mut Page) -> f64 { return (*pg).scroll }
-fn page_bakes(pg: *mut Page) -> usize { return (*pg).bakes }
+fn page_bakes(pg: *mut Page) -> usize { return layer.bake_count(&(*pg).bk) }
 fn page_set_scroll(pg: *mut Page, y: f64) {
     (*pg).scroll = y
     (*pg).sa_on = false
@@ -375,14 +381,6 @@ fn intro(pg: *mut Page, delay: i64) -> f64 {
         return 1.0
     }
     return ease_out((t as f64) / (INTRO_MS as f64))
-}
-
-// `col` faded in from the ground.
-fn fade(col: u32, p: f64) -> u32 {
-    if p >= 1.0 {
-        return col
-    }
-    return mixc(C_BASE, col, p)
 }
 
 // Two colours mixed (straight sRGB), opaque. anim.mix_srgb weighs the
@@ -437,23 +435,6 @@ fn text_w(pg: *mut Page, z: *mut painter.Painter, fid: usize, px: f64,
     return w
 }
 
-// How many lines a text needs in `room` device pixels.
-fn text_lines(pg: *mut Page, z: *mut painter.Painter, fid: usize, px: f64,
-    p: u64, n: usize, room: f64) -> usize {
-    let old: u64 = painter.painter_font(z)
-    let f: u64 = painter.painter_font_slot(z, fid)
-    if f != 0 {
-        painter.painter_set_font(z, f)
-    }
-    var r: painter.TextRun = painter.run_new(px)
-    var k: usize = painter.run_line_count(z, &r, p, n, room, 12)
-    painter.painter_set_font(z, old)
-    if k < 1 {
-        k = 1
-    }
-    return k
-}
-
 fn hover_of(pg: *mut Page, i: usize) -> f64 {
     return anim.anim_value(&(*pg).ha[i], (*pg).now)
 }
@@ -472,6 +453,24 @@ fn rule(sh: *mut sheet.Sheet, k: u32, fid: usize, px: usize, fg: u32,
     if lh != 0 {
         st = style.style_set_line_height_px(st, lh)
     }
+    sheet.sheet_rule(sh, sheet.sel_class(k), st)
+}
+
+// The headline: bold, a FLUID size (clamp(26, base + k vw, max)), tight
+// lines and letters pulled together a little -- both follow `h1`, the size
+// the view gives today.
+fn rule_fluid(sh: *mut sheet.Sheet, k: u32, fg: u32, fake_bold: bool,
+    h1: f64, base: i64, vw_pm: usize, max: f64) {
+    var st: style.Style = style.style_new()
+    st = style.style_set_font(st, FONT_BOLD, max as usize)
+    st = style.style_set_font_fluid(st, 26, base, vw_pm, max as usize)
+    st = style.style_set_fg(st, style.color_literal(fg))
+    if fake_bold {
+        st = style.style_set_weight(st, style.WEIGHT_BOLD)
+    }
+    st = style.style_set_pad(st, 0, 0)
+    st = style.style_set_line_height_px(st, (h1 * 1.1) as usize)
+    st = style.style_set_tracking(st, 0 - ((h1 / 30.0) as i64))
     sheet.sheet_rule(sh, sheet.sel_class(k), st)
 }
 
@@ -509,6 +508,33 @@ fn add_box(sc: *mut scene.Scene, parent: usize, dir: u32, justify: u32,
 fn add_space(sc: *mut scene.Scene, parent: usize, h: f64) {
     let b: usize = scene.scene_add(sc, parent, scene.N_BOX)
     scene.node_set_size(sc, b, 1.0, h)
+}
+
+// THE INTRO OF A GROUP: fUi fades the whole subtree as one picture
+// (scene.node_set_opacity) and lets it rise into its place
+// (scene.node_set_offset) -- nothing around it moves.
+fn rise_in(sc: *mut scene.Scene, i: usize, p: f64) {
+    scene.node_set_opacity(sc, i, p)
+    scene.node_set_offset(sc, i, 0.0, (1.0 - p) * 26.0)
+}
+
+// A button's face as a style: surface, radius, and a glow under it
+// (style.SF_BOX_SHADOW) -- the hover spring changes the numbers.
+fn rule_btn(sh: *mut sheet.Sheet, k: u32, bg: u32, rim: u32, glow: f64,
+    hv: f64) {
+    var st: style.Style = style.style_new()
+    st = style.style_set_bg(st, style.color_literal(bg))
+    st = style.style_set_radius(st, 10)
+    st = style.style_set_pad(st, 0, 0)
+    if rim != 0 as u32 {
+        st = style.style_set_border(st, style.color_literal(rim), 1)
+    }
+    if glow > 0.0 {
+        st = style.style_set_box_shadow(st, (4.0 + 6.0 * hv) as i64,
+            (12.0 + 18.0 * hv) as usize, style.color_literal(C_RED),
+            ((0.30 + 0.35 * hv) * 255.0) as usize)
+    }
+    sheet.sheet_rule(sh, sheet.sel_class(k), st)
 }
 
 // When the terminal shows how much of line `i` (octets). Commands are
@@ -599,17 +625,9 @@ fn tile(pg: *mut Page, z: *mut painter.Painter, sc: *mut scene.Scene,
     scene.node_set_draw(sc, t, pack(pg, H_TILE0 + i), draw_tile)
     (*pg).hot[H_TILE0 + i] = t
     let v: usize = add_text(sc, t, K_STATV, vp, vn)
-    var cpx: f64 = 13.0
-    var clh: f64 = 18.0
-    if narrow {
-        cpx = 12.0
-        clh = 16.0
-    }
-    let room: f64 = tw - 24.0
-    let k: usize = text_lines(pg, z, 0, cpx * s, cp, cn, room * s)
+    // a paragraph: fUi breaks it at the tile's inner width
     let c: usize = add_text(sc, t, K_STATC, cp, cn)
-    scene.node_set_size(sc, c, room, (k as f64) * clh)
-    widget.w_set_text_lines(scene.node_widget(sc, c), k)
+    scene.node_set_text_wrap(sc, c, 4)
 }
 
 // THE WHOLE PAGE, described for this width. `z` is only asked for widths.
@@ -638,20 +656,25 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
         left_w = fmin(560.0, avail * 0.48)
         card_w = fmin(620.0, avail - left_w - 64.0)
     }
-    // the headline: as large as "Made in Austria." fits the column
+    // the headline: a FLUID size (style.style_set_font_fluid, CSS
+    // clamp(min, base + k vw, max)) that keeps "Made in Austria." inside
+    // its column. k comes from the face: how wide the line is at 100 px.
     let w100: f64 = text_w(pg, z, FONT_BOLD, 100.0 * s,
         (&T_H2[0]) as u64, T_H2_N) / s
-    var h1: f64 = ffloor(left_w * 97.0 / w100)
+    let fit: f64 = 97.0 / w100 // px of headline per px of column
     var h1max: f64 = 72.0
-    if !wide {
+    var col_k: f64 = 1.0 // the column's width = col_k * (vw - 2 pad)
+    if wide {
+        h1max = fmin(72.0, ffloor(560.0 * fit))
+        col_k = 0.48
+    } else {
         h1max = 60.0
     }
-    if h1 > h1max {
-        h1 = h1max
-    }
-    if h1 < 26.0 {
-        h1 = 26.0
-    }
+    let vw_pm: usize = ffloor(fit * col_k * 1000.0) as usize
+    let h1_base: i64 = 0 - ((2.0 * pad * fit * col_k) as i64) - 1
+    scene.scene_set_view(sc, css_w)
+    let h1: f64 = style.style_fluid_px_of(26, h1_base, vw_pm,
+        h1max as usize, css_w as usize) as f64
     var sub_px: f64 = 19.0
     var sub_lh: f64 = 30.0
     var mono: f64 = 14.0
@@ -664,7 +687,7 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
     }
     (*pg).mono_px = mono
 
-    // ---- the stylesheet of this frame (the intro fades live in it)
+    // ---- the stylesheet of this frame; the intro fades whole groups
     let p_pill: f64 = intro(pg, 0)
     let p_head: f64 = intro(pg, 90)
     let p_sub: f64 = intro(pg, 200)
@@ -677,17 +700,28 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
     rule(sh, K_BRAND, FONT_BOLD, 18, C_WHITE, true, fake_bold, L, 0)
     rule(sh, K_LINK, 0, 15, C_MUTED, false, false, L, 0)
     rule(sh, K_LOGIN, 0, 15, C_WHITE, false, false, L, 0)
-    rule(sh, K_PILL, 0, 13, fade(C_PILL_T, p_pill), false, false, L, 0)
-    rule_track(sh, K_H1, FONT_BOLD, h1 as usize, fade(C_WHITE, p_head),
-        fake_bold, (h1 * 1.1) as usize, 0 - ((h1 / 30.0) as i64))
-    rule_track(sh, K_H1R, FONT_BOLD, h1 as usize, fade(C_RED_HI, p_head),
-        fake_bold, (h1 * 1.1) as usize, 0 - ((h1 / 30.0) as i64))
-    rule(sh, K_SUB, 0, sub_px as usize, fade(12764876, p_sub), false, false,
-        L, sub_lh as usize)
-    rule(sh, K_BTN, FONT_BOLD, 16, fade(16777215, p_btn), true, fake_bold,
-        CE, 0)
-    rule(sh, K_TICK, 0, 14, fade(C_RED_HI, p_chk), false, false, L, 0)
-    rule(sh, K_CHECK, 0, 14, fade(C_MUTED, p_chk), false, false, L, 0)
+    rule(sh, K_PILL, 0, 13, C_PILL_T, false, false, L, 0)
+    rule_fluid(sh, K_H1, C_WHITE, fake_bold, h1, h1_base, vw_pm, h1max)
+    rule_fluid(sh, K_H1R, C_RED_HI, fake_bold, h1, h1_base, vw_pm, h1max)
+    rule(sh, K_SUB, 0, sub_px as usize, 12764876, false, false, L,
+        sub_lh as usize)
+    rule(sh, K_BTN, FONT_BOLD, 16, 16777215, true, fake_bold, CE, 0)
+    rule(sh, K_TICK, 0, 14, C_RED_HI, false, false, L, 0)
+    rule(sh, K_CHECK, 0, 14, C_MUTED, false, false, L, 0)
+    // the two buttons: red with a glow that grows, dark with a rim that
+    // turns red; pressed is darker
+    let hv1: f64 = fmax(0.0, hover_of(pg, H_BTN1))
+    var c1: u32 = mixc(C_RED, 16726860, fmin(hv1, 1.2) * 0.7)
+    if (*pg).pressed == H_BTN1 && hv1 > 0.5 {
+        c1 = mixc(c1, 10358556, 0.5)
+    }
+    rule_btn(sh, K_B1, c1, 0 as u32, 1.0, hv1)
+    let hv2: f64 = fmin(fmax(0.0, hover_of(pg, H_BTN2)), 1.0)
+    var c2: u32 = mixc(1448222, 2106669, hv2)
+    if (*pg).pressed == H_BTN2 && hv2 > 0.5 {
+        c2 = 1119256
+    }
+    rule_btn(sh, K_B2, c2, mixc(3817287, C_RED, hv2), 0.0, 0.0)
     rule(sh, K_TTITLE, 0, 12, 8028298, false, false, CE, 0)
     rule(sh, K_TPROMPT, FONT_MONO, mono as usize, C_RED_HI, false, false, L,
         mono_lh as usize)
@@ -773,10 +807,7 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
 
     let left: usize = add_box(sc, hero, flex.FLEX_COLUMN, flex.JUSTIFY_START,
         flex.AL_START)
-    // the rise of the intro: the column keeps its height, its content
-    // moves inside it -- so nothing below it moves while it rises
-    let rise: i64 = ((1.0 - p_head) * 26.0) as i64
-    scene.node_set_padding(sc, left, 0, rise, 0, 26 - rise)
+    scene.node_set_padding(sc, left, 0, 0, 0, 26)
     scene.node_set_size(sc, left, left_w, 0.0)
 
     let pill: usize = add_box(sc, left, flex.FLEX_ROW, flex.JUSTIFY_START,
@@ -789,15 +820,18 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
     scene.node_set_size(sc, dot, 8.0, 8.0)
     scene.node_set_draw(sc, dot, pack(pg, 0), draw_dot)
     let pt: usize = add_text(sc, pill, K_PILL, (&T_PILL[0]) as u64, T_PILL_N)
+    rise_in(sc, pill, p_pill)
     add_space(sc, left, 22.0)
-    let a1: usize = add_text(sc, left, K_H1, (&T_H1[0]) as u64, T_H1_N)
-    let a2: usize = add_text(sc, left, K_H1R, (&T_H2[0]) as u64, T_H2_N)
+    let hg: usize = add_box(sc, left, flex.FLEX_COLUMN, flex.JUSTIFY_START,
+        flex.AL_START)
+    let a1: usize = add_text(sc, hg, K_H1, (&T_H1[0]) as u64, T_H1_N)
+    let a2: usize = add_text(sc, hg, K_H1R, (&T_H2[0]) as u64, T_H2_N)
+    rise_in(sc, hg, p_head)
     add_space(sc, left, 16.0)
-    let sl: usize = text_lines(pg, z, 0, sub_px * s, (&T_SUB[0]) as u64,
-        T_SUB_N, left_w * s)
+    // a paragraph: fUi breaks it at the column and sizes it
     let sub: usize = add_text(sc, left, K_SUB, (&T_SUB[0]) as u64, T_SUB_N)
-    scene.node_set_size(sc, sub, left_w, (sl as f64) * sub_lh)
-    widget.w_set_text_lines(scene.node_widget(sc, sub), sl)
+    scene.node_set_text_wrap(sc, sub, 12)
+    rise_in(sc, sub, p_sub)
     add_space(sc, left, 30.0)
 
     let br: usize = add_box(sc, left, flex.FLEX_ROW, flex.JUSTIFY_START,
@@ -807,6 +841,7 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
     scene.node_set_size(sc, br, left_w, 0.0)
     let b1: usize = add_box(sc, br, flex.FLEX_ROW, flex.JUSTIFY_CENTER,
         flex.AL_CENTER)
+    scene.node_add_class(sc, b1, K_B1)
     scene.node_set_padding(sc, b1, 22, 0, 22, 0)
     scene.node_set_size(sc, b1, 0.0, 48.0)
     scene.node_set_draw(sc, b1, pack(pg, H_BTN1), draw_btn)
@@ -814,11 +849,13 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
     let b1t: usize = add_text(sc, b1, K_BTN, (&T_BTN1[0]) as u64, T_BTN1_N)
     let b2: usize = add_box(sc, br, flex.FLEX_ROW, flex.JUSTIFY_CENTER,
         flex.AL_CENTER)
+    scene.node_add_class(sc, b2, K_B2)
     scene.node_set_padding(sc, b2, 22, 0, 22, 0)
     scene.node_set_size(sc, b2, 0.0, 48.0)
     scene.node_set_draw(sc, b2, pack(pg, H_BTN2), draw_btn)
     (*pg).hot[H_BTN2] = b2
     let b2t: usize = add_text(sc, b2, K_BTN, (&T_BTN2[0]) as u64, T_BTN2_N)
+    rise_in(sc, br, p_btn)
     add_space(sc, left, 28.0)
 
     // the ticks: wrapped by flexbox, which also counts the lines for the
@@ -833,6 +870,7 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
     check_item(sc, ck, (&T_C2[0]) as u64, T_C2_N)
     check_item(sc, ck, (&T_C3[0]) as u64, T_C3_N)
     check_item(sc, ck, (&T_C4[0]) as u64, T_C4_N)
+    rise_in(sc, ck, p_chk)
 
     // the terminal card: its glass is baked, its text is live
     let card: usize = add_box(sc, hero, flex.FLEX_COLUMN, flex.JUSTIFY_START,
@@ -849,11 +887,11 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
         flex.AL_STRETCH)
     scene.node_set_padding(sc, body, 20, 16, 20, 20)
     scene.node_set_gap(sc, body, 2, 0)
-    let inner: f64 = card_w - 40.0
-    let prompt_w: f64 = text_w(pg, z, FONT_MONO, mono * s,
-        (&T_PROMPT[0]) as u64, T_PROMPT_N) / s + 1.0
     (*pg).cursor_node = scene.SCENE_NONE
     let done: bool = (*pg).now - (*pg).t0 >= type_end(pg)
+    // Every line is a PARAGRAPH that RESERVES its whole text
+    // (scene.node_set_text_reserve): fUi breaks and sizes it for what will
+    // be typed, so the card keeps its size while the terminal types.
     var li: usize = 0
     while li < LINES_T {
         let vis: usize = typed(pg, li)
@@ -863,15 +901,12 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
             let row: usize = add_box(sc, body, flex.FLEX_ROW,
                 flex.JUSTIFY_START, flex.AL_START)
             scene.node_set_gap(sc, row, 10, 0)
-            let room: f64 = inner - prompt_w - 10.0
-            let kl: usize = text_lines(pg, z, FONT_MONO, mono * s, p, n,
-                room * s)
             let pr: usize = add_text(sc, row, K_TPROMPT,
                 (&T_PROMPT[0]) as u64, T_PROMPT_N)
-            scene.node_set_size(sc, pr, prompt_w, mono_lh)
             let cm: usize = add_text(sc, row, K_TCMD, p, vis)
-            scene.node_set_size(sc, cm, room, (kl as f64) * mono_lh)
-            widget.w_set_text_lines(scene.node_widget(sc, cm), kl)
+            scene.node_set_text_reserve(sc, cm, p, n)
+            scene.node_set_text_wrap(sc, cm, 6)
+            scene.node_set_grow(sc, cm, 1000, 1000)
             if vis > 0 && vis < n {
                 (*pg).cursor_node = cm
                 scene.node_set_draw(sc, cm, pack(pg, 0), draw_cursor)
@@ -881,11 +916,9 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
             if (*pg).lk[li] == 2 as u32 {
                 cls = K_TOK
             }
-            let kl2: usize = text_lines(pg, z, FONT_MONO, mono * s, p, n,
-                inner * s)
             let o: usize = add_text(sc, body, cls, p, vis)
-            scene.node_set_size(sc, o, inner, (kl2 as f64) * mono_lh)
-            widget.w_set_text_lines(scene.node_widget(sc, o), kl2)
+            scene.node_set_text_reserve(sc, o, p, n)
+            scene.node_set_text_wrap(sc, o, 6)
         }
         li = li + 1
     }
@@ -895,14 +928,16 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
     scene.node_set_gap(sc, last, 10, 0)
     let lp: usize = add_text(sc, last, K_TPROMPT, (&T_PROMPT[0]) as u64,
         T_PROMPT_N)
-    scene.node_set_size(sc, lp, prompt_w, mono_lh)
     let lc: usize = add_text(sc, last, K_TCMD, (&T_PROMPT[0]) as u64, 0)
-    scene.node_set_size(sc, lc, inner - prompt_w - 10.0, mono_lh)
+    scene.node_set_text_reserve(sc, lc, (&T_PROMPT[0]) as u64, T_PROMPT_N)
+    scene.node_set_grow(sc, lc, 1000, 1000)
     if done {
         (*pg).cursor_node = lc
         scene.node_set_draw(sc, lc, pack(pg, 0), draw_cursor)
     } else {
         scene.node_set_text(sc, lp, (&T_PROMPT[0]) as u64, 0)
+        scene.node_set_text_reserve(sc, lp, (&T_PROMPT[0]) as u64,
+            T_PROMPT_N)
     }
 
     // what is left of the window goes between the hero and the figures --
@@ -935,6 +970,13 @@ fn describe(pg: *mut Page, z: *mut painter.Painter, w: usize) {
         (&T_S2C[0]) as u64, T_S2C_N, !wide)
     tile(pg, z, sc, panel, 3, tw, th, (&T_S3V[0]) as u64, T_S3V_N,
         (&T_S3C[0]) as u64, T_S3C_N, !wide)
+    // what answers the pointer is LIVE: left out of the baked still
+    // picture, painted every frame on top of it (scene_draw_live)
+    k = 0
+    while k < HOT_N {
+        scene.node_set_live(sc, (*pg).hot[k], true)
+        k = k + 1
+    }
 }
 
 // ================================================================ PAINTERS
@@ -981,7 +1023,7 @@ fn draw_link(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
 
 fn draw_pill(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     let pg: *mut Page = unpack_page(ud)
-    let p: f64 = intro(pg, 0)
+    let p: f64 = 1.0
     let s: f64 = (*pg).s
     let z: *mut painter.Painter = render.ctx_painter(c)
     let x: f64 = widget.w_x(e)
@@ -995,7 +1037,7 @@ fn draw_pill(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
 
 fn draw_dot(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     let pg: *mut Page = unpack_page(ud)
-    let p: f64 = intro(pg, 0)
+    let p: f64 = 1.0
     let s: f64 = (*pg).s
     let z: *mut painter.Painter = render.ctx_painter(c)
     let x: f64 = widget.w_x(e)
@@ -1006,41 +1048,21 @@ fn draw_dot(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     painter.round_rect(z, x, y, w, w, w / 2.0, argb(p, C_GREEN))
 }
 
-// The two buttons. Red: a glow that grows on the spring and a brighter
-// face. Dark: a lighter face and a rim that turns red. Pressed: darker.
+// The red button's face, glow and rim are its style (rule_btn); what
+// is left is a hairline of light on its top edge.
 fn draw_btn(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     let pg: *mut Page = unpack_page(ud)
     let i: usize = unpack_i(ud)
+    if i != H_BTN1 {
+        return
+    }
     let hv: f64 = fmax(0.0, hover_of(pg, i))
-    let p: f64 = intro(pg, 310)
     let s: f64 = (*pg).s
     let z: *mut painter.Painter = render.ctx_painter(c)
-    let x: f64 = widget.w_x(e)
-    let y: f64 = widget.w_y(e)
-    let w: f64 = widget.w_w(e)
-    let h: f64 = widget.w_h(e)
     let r: f64 = 10.0 * s
-    let down: bool = (*pg).pressed == i && hv > 0.5
-    if i == H_BTN1 {
-        effect.rrect_shadow(z, x, y, w, h, r, (4.0 + 6.0 * hv) * s,
-            (12.0 + 18.0 * hv) * s, argb((0.30 + 0.35 * hv) * p, C_RED))
-        var col: u32 = mixc(C_RED, 16726860, fmin(hv, 1.2) * 0.7)
-        if down {
-            col = mixc(col, 10358556, 0.5)
-        }
-        painter.round_rect(z, x, y, w, h, r, argb(p, col))
-        // a hairline of light on the top edge
-        painter.round_rect(z, x + r, y + 1.0 * s, w - 2.0 * r, 1.0 * s, 0.0,
-            argb((0.18 + 0.12 * hv) * p, 16777215))
-    } else {
-        var bg: u32 = mixc(1448222, 2106669, fmin(hv, 1.0))
-        if down {
-            bg = 1119256
-        }
-        painter.round_rect(z, x, y, w, h, r, argb(p, bg))
-        let rim: u32 = mixc(3817287, C_RED, fmin(hv, 1.0))
-        painter.round_ring(z, x, y, w, h, r, 1.0 * s, argb(p, rim))
-    }
+    painter.round_rect(z, widget.w_x(e) + r, widget.w_y(e) + 1.0 * s,
+        widget.w_w(e) - 2.0 * r, 1.0 * s, 0.0,
+        argb(0.18 + 0.12 * hv, 16777215))
 }
 
 // A tile of the figure bar: a light and a red line that grow on hover.
@@ -1196,44 +1218,18 @@ fn paint_ground(pg: *mut Page, z: *mut painter.Painter, w: f64, ph: f64,
     }
 }
 
-// Bake the ground when the size or a glass panel moved.
-fn bake(pg: *mut Page, w: usize, ph: usize, cr: *mut f64, pr: *mut f64) {
-    var key: f64 = (w as f64) * 7.0 + (ph as f64) * 13.0
+// The key of the baked ground: size and the two glass panels.
+fn ground_key(w: usize, ph: usize, cr: *mut f64, pr: *mut f64) -> u64 {
+    var key: u64 = (w as u64) * 1000003 + (ph as u64) * 7919
     var i: usize = 0
     while i < 4 {
-        key = key + (*((cr as u64 + (i * 8) as u64) as *mut f64)) * (17.0 + i as f64)
-        key = key + (*((pr as u64 + (i * 8) as u64) as *mut f64)) * (29.0 + i as f64)
+        let a: f64 = *((cr as u64 + (i * 8) as u64) as *mut f64)
+        let b: f64 = *((pr as u64 + (i * 8) as u64) as *mut f64)
+        key = key * 31 + ((a * 4.0 + 100000.0) as u64)
+        key = key * 37 + ((b * 4.0 + 100000.0) as u64)
         i = i + 1
     }
-    if (*pg).bg_w == w && (*pg).bg_h == ph && (*pg).bg_key == key {
-        return
-    }
-    if canvas.canvas_ok(&(*pg).bg) {
-        painter.painter_free(&(*pg).bz)
-        canvas.canvas_free(&(*pg).bg)
-    }
-    (*pg).bg_w = 0
-    if !canvas.canvas_init(&(*pg).bg, w, ph) {
-        return
-    }
-    var rh: usize = ph
-    if rh > 700 {
-        rh = 700
-    }
-    if !painter.painter_init(&(*pg).bz, &(*pg).bg, w, rh) {
-        canvas.canvas_free(&(*pg).bg)
-        return
-    }
-    painter.painter_set_font(&(*pg).bz, (*pg).fm)
-    painter.painter_set_font_slot(&(*pg).bz, FONT_MONO, (*pg).fm_mono)
-    painter.painter_set_font_slot(&(*pg).bz, FONT_BOLD, (*pg).fm_bold)
-    canvas.canvas_clear(&(*pg).bg, theme.opaque(C_BASE))
-    paint_ground(pg, &(*pg).bz, w as f64, ph as f64, 0.0, cr, pr)
-    (*pg).rest = false
-    (*pg).bg_w = w
-    (*pg).bg_h = ph
-    (*pg).bg_key = key
-    (*pg).bakes = (*pg).bakes + 1
+    return key
 }
 
 // ================================================================ A FRAME
@@ -1252,6 +1248,7 @@ fn page_frame(pg: *mut Page, c: *mut render.Ctx, w: usize, h: usize,
     (*pg).view_h = h as f64
     let sc: *mut scene.Scene = &(*pg).sc
     describe(pg, z, w)
+    scene.scene_attach_memo(sc, &(*pg).memo)
     scene.scene_style(sc, &(*pg).sh)
     scene.scene_measure(sc, c)
     let root: usize = scene.scene_root(sc)
@@ -1275,6 +1272,19 @@ fn page_frame(pg: *mut Page, c: *mut render.Ctx, w: usize, h: usize,
     }
     let sy: f64 = ffloor((*pg).scroll + 0.5)
     scene.scene_layout(sc, c, 0.0, 0.0 - sy, w as f64, ph)
+    // a paragraph that got another width than it guessed (the first frame,
+    // a new size) changed the page's height: lay it out once more for that
+    if scene.scene_reflows(sc) > 0 {
+        var ph2: f64 = ffloor(scene.node_pref_h(sc, root) + 0.5)
+        if ph2 < h as f64 {
+            ph2 = h as f64
+        }
+        if ph2 != ph {
+            ph = ph2
+            (*pg).page_h = ph
+            scene.scene_layout(sc, c, 0.0, 0.0 - sy, w as f64, ph)
+        }
+    }
     // the glass panels in page coordinates
     var cr: [f64; 4] = [0.0; 4]
     var pr: [f64; 4] = [0.0; 4]
@@ -1288,43 +1298,41 @@ fn page_frame(pg: *mut Page, c: *mut render.Ctx, w: usize, h: usize,
     pr[1] = scene.node_y(sc, pn) + sy
     pr[2] = scene.node_w(sc, pn)
     pr[3] = scene.node_h(sc, pn)
-    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
-    var copied: bool = false
-    if canvas.canvas_gpu(cv) == 0 && canvas.canvas_width(cv) == w
-    && canvas.canvas_height(cv) >= h {
-        bake(pg, w, ph as usize, &cr[0], &pr[0])
-        if (*pg).bg_w == w && (*pg).bg_h == ph as usize && !(*pg).rest
-        && !(*pg).no_rest && page_still(pg, now) {
-            // AT REST: nothing but the hot parts can change any more, so
-            // everything else is painted once into the baked picture (laid
-            // out at the page's top), and a frame is the copy plus those
-            // parts (scene.node_set_hidden / scene_draw_subtree)
-            scene.scene_layout(sc, c, 0.0, 0.0, w as f64, ph)
-            hot_hidden(pg, true)
-            var cb: render.Ctx = render.ctx_new(m, &(*pg).bz)
-            scene.scene_draw(sc, &cb)
-            hot_hidden(pg, false)
-            (*pg).rest = true
-            (*pg).rests = (*pg).rests + 1
-            scene.scene_layout(sc, c, 0.0, 0.0 - sy, w as f64, ph)
-        }
-        if (*pg).bg_w == w && (*pg).bg_h == ph as usize {
-            let src: u64 = (canvas.canvas_pixels(&(*pg).bg) as u64)
-            +((sy as usize) * w * 4) as u64
-            rt.mem_copy(canvas.canvas_pixels(cv) as u64, src, w * h * 4)
-            copied = true
+    // THE GROUND IS BAKED (layer.Bake) at the page's full height, once per
+    // size; a frame copies the visible band of it.
+    let bk: *mut layer.Bake = &(*pg).bk
+    let key: u64 = ground_key(w, ph as usize, &cr[0], &pr[0])
+    if !layer.bake_valid(bk, w, ph as usize, key) {
+        (*pg).rest = false
+        if layer.bake_start(bk, w, ph as usize, key, theme.opaque(C_BASE), z) {
+            paint_ground(pg, layer.bake_painter(bk), w as f64, ph, 0.0,
+                &cr[0], &pr[0])
         }
     }
+    let baked: bool = layer.bake_valid(bk, w, ph as usize, key)
+    if baked && !(*pg).rest && !(*pg).no_rest && page_still(pg, now) {
+        // AT REST nothing but the live nodes can change any more: the
+        // rest of the page goes into the bake too (scene_draw_still, laid
+        // out at the page's top), and a frame is the copy plus
+        // scene_draw_live
+        scene.scene_layout(sc, c, 0.0, 0.0, w as f64, ph)
+        var cb: render.Ctx = render.ctx_new(m, layer.bake_painter(bk))
+        scene.scene_draw_still(sc, &cb)
+        (*pg).rest = true
+        (*pg).rests = (*pg).rests + 1
+        scene.scene_layout(sc, c, 0.0, 0.0 - sy, w as f64, ph)
+    }
+    var copied: bool = false
+    if baked {
+        copied = layer.bake_copy_to(bk, z, sy as usize, h)
+    }
     if !copied {
-        // on the GPU (or out of memory): the ground is painted every frame
+        // (out of memory, or a canvas of another width): paint it all
+        (*pg).rest = false
         paint_ground(pg, z, w as f64, ph, 0.0 - sy, &cr[0], &pr[0])
     }
     if copied && (*pg).rest {
-        var i: usize = 0
-        while i < HOT_N {
-            scene.scene_draw_subtree(sc, c, (*pg).hot[i])
-            i = i + 1
-        }
+        scene.scene_draw_live(sc, c)
     } else {
         scene.scene_draw(sc, c)
     }
@@ -1336,20 +1344,12 @@ fn page_still(pg: *mut Page, now: i64) -> bool {
     && now - (*pg).t0 >= 420 + INTRO_MS + 50
 }
 
-fn hot_hidden(pg: *mut Page, on: bool) {
-    var i: usize = 0
-    while i < HOT_N {
-        scene.node_set_hidden(&(*pg).sc, (*pg).hot[i], on)
-        i = i + 1
-    }
-}
-
 // Bake the still content at rest (true, the default) or paint every node
 // every frame (false -- the worst case, for the stopwatch).
 fn page_set_still_cache(pg: *mut Page, on: bool) {
     (*pg).no_rest = !on
     // the ground is baked anew, without the still content in it
-    (*pg).bg_key = 0.0
+    layer.bake_free(&(*pg).bk)
     (*pg).rest = false
 }
 
