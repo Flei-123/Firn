@@ -43,6 +43,7 @@ impl Target {
     /// The name as it is written on the command line.
     pub fn name(self) -> &'static str {
         match self {
+            Target::X86_64 if windows() => "x86_64-windows",
             Target::X86_64 => "x86_64-linux",
             Target::Aarch64 => "aarch64-linux",
             Target::Wasm32Browser => "wasm32-browser",
@@ -56,6 +57,10 @@ impl Target {
     /// The assembler for this machine.
     pub fn assembler(self) -> &'static str {
         match self {
+            // ROUND WINDOWS: the same instruction set, but `as` writes ELF
+            // and a PE image cannot be built out of ELF objects -- the COFF
+            // port of the same binutils does the job (compiler/src/win.rs).
+            Target::X86_64 if windows() => "x86_64-w64-mingw32-as",
             Target::X86_64 => "as",
             Target::Aarch64 => "aarch64-linux-gnu-as",
             Target::Wasm32Browser => "",
@@ -64,6 +69,7 @@ impl Target {
     /// The arguments the assembler needs in front of `-o`.
     pub fn as_flags(self) -> &'static [&'static str] {
         match self {
+            Target::X86_64 if windows() => &[],
             Target::X86_64 => &["--64"],
             Target::Aarch64 | Target::Wasm32Browser => &[],
         }
@@ -71,6 +77,7 @@ impl Target {
     /// The linker for this machine.
     pub fn linker(self) -> &'static str {
         match self {
+            Target::X86_64 if windows() => "x86_64-w64-mingw32-ld",
             Target::X86_64 => "ld",
             Target::Aarch64 => "aarch64-linux-gnu-ld",
             Target::Wasm32Browser => "",
@@ -107,6 +114,17 @@ thread_local! {
     /// written as their `*at`/`3` forms -- what the aarch64 table has
     /// always done, because aarch64 never had the legacy calls.
     static ANDROID: Cell<bool> = const { Cell::new(false) };
+    /// ROUND WINDOWS (r33): the program runs on Windows. The instruction set
+    /// is x86-64 and every instruction the code generators write stays the
+    /// same; what changes is the binary format (PE/COFF), the calling
+    /// convention at the outer boundary (win.rs) and the system calls,
+    /// which go to the seam written in Firn (win_seam.rs).
+    static WINDOWS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Is this a Windows build (`--target=x86_64-windows`)?
+pub fn windows() -> bool {
+    WINDOWS.with(|w| w.get())
 }
 
 /// `--cpu=<baseline|avx>`. `Err` = unbekannter Name.
@@ -175,6 +193,7 @@ pub fn reloc_rodata() -> &'static str {
 /// `--target=<name>`. `Err` = unknown name.
 pub fn flag_set(name: &str) -> Result<(), String> {
     let mut on_android = false;
+    let mut on_windows = false;
     let t = match name {
         "x86_64-linux" | "x86-64-linux" | "x86_64" => Target::X86_64,
         "aarch64-linux" | "arm64-linux" | "aarch64" => Target::Aarch64,
@@ -188,15 +207,21 @@ pub fn flag_set(name: &str) -> Result<(), String> {
             Target::Aarch64
         }
         "wasm32-browser" | "wasm32" => Target::Wasm32Browser,
+        // ROUND WINDOWS (r33): x86-64 with Windows underneath (see `windows`).
+        "x86_64-windows" | "x86_64-pc-windows" | "x86_64-w64-mingw32" => {
+            on_windows = true;
+            Target::X86_64
+        }
         other => {
             return Err(format!(
-                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser, x86_64-android, aarch64-android)",
+                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser, x86_64-android, aarch64-android, x86_64-windows)",
                 other
             ))
         }
     };
     ACTIVE.with(|a| a.set(t));
     ANDROID.with(|a| a.set(on_android));
+    WINDOWS.with(|w| w.set(on_windows));
     Ok(())
 }
 
@@ -217,6 +242,7 @@ pub fn reset() {
     ACTIVE.with(|a| a.set(Target::X86_64));
     PIC.with(|p| p.set(false));
     ANDROID.with(|a| a.set(false));
+    WINDOWS.with(|w| w.set(false));
 }
 
 #[cfg(test)]

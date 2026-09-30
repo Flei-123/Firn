@@ -1462,6 +1462,30 @@ else
     grep -E 'FAIL' "$WORK/input.log" "$WORK/phone_remote.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 69. WINDOWS: the same programs on two operating systems (x86_64-windows, under Wine) =="
+# machine.sh  what the FILE is: PE32+, our own import table, the Win64
+#             thunks, the stack probe, no `syscall` instruction left.
+# run.sh      what the program DOES: every case of tests/ built for both
+#             systems and compared; differences grouped by cause
+#             (tools/windows/causes.txt), floor tools/windows/minquota.txt.
+# net.sh      a TCP client over ws2_32.dll against a fixed-reply server.
+# input/win.sh      lib/input over SendInput, the pointer read back.
+# phone_remote/win.sh  examples/phone_remote as a .exe: pairing, refusals,
+#             and the X server sees the pointer move.
+# All of them SKIP (exit 0) without mingw binutils / Wine / Xvfb.
+WINRC=0
+for t in tools/windows/machine.sh tools/windows/net.sh tools/windows/run.sh tools/input/win.sh tools/phone_remote/win.sh; do
+    lg="$WORK/win_$(basename "$(dirname "$t")")_$(basename "$t" .sh).log"
+    bash "$t" > "$lg" 2>&1 || WINRC=1
+    grep -E '^  (passed|SKIP|RESULT)|^(SKIP|INPUT-WIN)' "$lg" | sed 's/^/   /'
+done
+if [ "$WINRC" -eq 0 ]; then
+    ok
+else
+    bad "the windows target failed (see .test-work/win_*.log)"
+    grep -hE 'FAIL' "$WORK"/win_*.log | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

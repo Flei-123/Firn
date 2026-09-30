@@ -199,6 +199,11 @@ pub fn ret_of(name: &str) -> Option<DType> {
 
 /// Round 64: is debug information for variables being produced at all?
 pub fn with_variables() -> bool {
+    // ROUND WINDOWS: the DWARF sections use ELF section flags, which the
+    // COFF assembler does not take. Debug information is off on Windows.
+    if crate::target::windows() {
+        return false;
+    }
     with(|t| t.variables && !t.files.is_empty())
 }
 
@@ -206,12 +211,18 @@ pub fn with_variables() -> bool {
 /// are source files -- at EVERY build level, because the positions sit on
 /// the instructions and survive the optimizer (`fir::Loc`).
 pub fn with_lines() -> bool {
+    if crate::target::windows() {
+        return false;
+    }
     with(|t| !t.files.is_empty())
 }
 
 /// `.file` directives for all source files (numbers are 1-based).
 pub fn file_directives() -> String {
     let mut out = String::new();
+    if crate::target::windows() {
+        return out;
+    }
     for (i, f) in files().iter().enumerate() {
         out.push_str(&format!(".file {} \"{}\"\n", i + 1, f.replace('"', "\\\"")));
     }

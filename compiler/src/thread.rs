@@ -271,6 +271,11 @@ pub(crate) fn lower_thread_call(
 /// The local label `1:` is a **numeric** label of the assembler: `jnz 1f`
 /// jumps forward to the next `1:`. That way this sequence needs no counter
 /// and may appear as often as you like in the same module.
+pub(crate) fn spawn_unsupported(e: &mut crate::codegen_x86::Emitter) {
+    e.raw("    # windows: clone(2) has no equivalent -- ENOSYS");
+    e.line("mov rax, -38");
+}
+
 pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     // Put the argument on the CHILD stack — in the child `rdi` is overwritten
     // with the flags, and there is no other way to reach the value.

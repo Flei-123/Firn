@@ -48,6 +48,17 @@ fn module_path(base: &Path, parts: &[String]) -> PathBuf {
         p.push(part);
     }
     p.set_extension(config::FILE_EXT);
+    // ROUND NET-REMOTE: an OS-specific twin. On the Windows target
+    // `import input.backend` takes `input/backend.windows.fi` when that file
+    // exists next to `backend.fi`; every other target takes `backend.fi`.
+    // One import in the library, the platform choice at build time.
+    if crate::target::windows() {
+        let mut alt = p.clone();
+        alt.set_extension(format!("windows.{}", config::FILE_EXT));
+        if alt.is_file() {
+            return alt;
+        }
+    }
     p
 }
 
@@ -379,9 +390,11 @@ fn module_name(f: &SourceFile) -> String {
     if f.path == Path::new(crate::gc::RUNTIME_PATH) {
         return String::new();
     }
+    // `backend.windows.fi` is module `backend` (see `module_path`).
     f.path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
+        .map(|s| s.strip_suffix(".windows").map(str::to_string).unwrap_or(s))
         .unwrap_or_else(|| format!("m{}", f.id))
 }
 
