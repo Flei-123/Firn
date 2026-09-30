@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/web/dom.fi -- THE PAGE'S DOM FROM FIRN (--target=wasm32-browser).
+//
+// No browser lets WebAssembly touch the DOM by itself (2026: the component
+// model's DOM bindings are a prototype, nothing ships). Every language that
+// does it -- Rust (wasm-bindgen), Go, Zig -- goes through a thin JavaScript
+// layer. Firn's is lib/web/dom.js: one fixed file, no generator, no build
+// step. It keeps the page's nodes in a table and hands the module small
+// numbers (handles) for them; everything the page does is decided here.
+//
+//   import web.dom
+//   fn main() -> i32 {
+//       let b: u32 = dom.create("button")
+//       dom.set_text(b, "click")
+//       dom.append(dom.query("body"), b)
+//       dom.on(b, "click", clicked, 0)
+//       return 0            // the page lives on; events call back
+//   }
+//
+// Handles: 0 is "no node". A handle stays valid until `release` (the node
+// itself stays in the page). Texts cross as UTF-8 (pointer, length); texts
+// coming back (`text`, `value`, `attr`, `eval`) are copied into the GC heap
+// and are ordinary `str`s.
+//
+// Page:  <script src="dom.js" data-wasm="app.wasm"></script>
+// Build: firnc --target=wasm32-browser -o app.wasm app.fi
+
+extern fn firn_dom_query(sp: u32, sn: u32) -> u32;
+extern fn firn_dom_query_in(h: u32, sp: u32, sn: u32) -> u32;
+extern fn firn_dom_create(tp: u32, tn: u32) -> u32;
+extern fn firn_dom_append(parent: u32, child: u32);
+extern fn firn_dom_remove(h: u32);
+extern fn firn_dom_clear(h: u32);
+extern fn firn_dom_release(h: u32);
+extern fn firn_dom_set_text(h: u32, p: u32, n: u32);
+extern fn firn_dom_set_value(h: u32, p: u32, n: u32);
+extern fn firn_dom_set_attr(h: u32, kp: u32, kn: u32, vp: u32, vn: u32);
+extern fn firn_dom_set_style(h: u32, kp: u32, kn: u32, vp: u32, vn: u32);
+extern fn firn_dom_class(h: u32, np: u32, nn: u32, on: u32);
+extern fn firn_dom_get(h: u32, what: u32, kp: u32, kn: u32) -> i32;
+extern fn firn_dom_take(dst: u32, cap: u32) -> u32;
+extern fn firn_dom_listen(h: u32, ep: u32, en: u32, id: u32, prevent: u32);
+extern fn firn_js_eval(p: u32, n: u32) -> i32;
+
+import std.rt
+import std.io
+
+// what firn_dom_get reads
+const GET_TEXT: u32 = 0 as u32
+const GET_VALUE: u32 = 1 as u32
+const GET_ATTR: u32 = 2 as u32
+const GET_EVENT_KEY: u32 = 3 as u32
+const GET_EVENT_VALUE: u32 = 4 as u32
+
+fn a(s: str) -> u32 {
+    return s.p as u64 as u32
+}
+
+fn l(s: str) -> u32 {
+    return s.n as u32
+}
+
+// ------------------------------------------------------------ the nodes
+
+// The first node that matches a CSS selector ("body", "#out", ".row"), 0 = none.
+fn query(sel: str) -> u32 {
+    return firn_dom_query(a(sel), l(sel))
+}
+
+// The same, below `h` only.
+fn query_in(h: u32, sel: str) -> u32 {
+    return firn_dom_query_in(h, a(sel), l(sel))
+}
+
+// A new element ("div", "button", "input"), not yet in the page.
+fn create(tag: str) -> u32 {
+    return firn_dom_create(a(tag), l(tag))
+}
+
+fn append(parent: u32, child: u32) {
+    firn_dom_append(parent, child)
+}
+
+// Takes the node out of the page and releases its handle.
+fn remove(h: u32) {
+    firn_dom_remove(h)
+}
+
+// Removes every child of `h`.
+fn clear(h: u32) {
+    firn_dom_clear(h)
+}
+
+// Forgets the handle; the node stays in the page.
+fn release(h: u32) {
+    firn_dom_release(h)
+}
+
+// ------------------------------------------------------------ writing
+
+// textContent -- the text is shown as text, never parsed as HTML.
+fn set_text(h: u32, s: str) {
+    firn_dom_set_text(h, a(s), l(s))
+}
+
+// An f"..." text: set_text_f(h, f"clicked {n} times"). Frees the builder.
+fn set_text_f(h: u32, f: io.Fmt) {
+    var g: io.Fmt = f
+    firn_dom_set_text(h, rt.buf_ptr(&g.b) as u32, rt.buf_len(&g.b) as u32)
+    rt.buf_free(&g.b)
+}
+
+// The value of an <input>/<textarea>/<select>.
+fn set_value(h: u32, s: str) {
+    firn_dom_set_value(h, a(s), l(s))
+}
+
+fn set_attr(h: u32, k: str, v: str) {
+    firn_dom_set_attr(h, a(k), l(k), a(v), l(v))
+}
+
+// One CSS property: set_style(h, "color", "#c00"); an empty value removes it.
+fn set_style(h: u32, k: str, v: str) {
+    firn_dom_set_style(h, a(k), l(k), a(v), l(v))
+}
+
+fn add_class(h: u32, c: str) {
+    firn_dom_class(h, a(c), l(c), 1 as u32)
+}
+
+fn remove_class(h: u32, c: str) {
+    firn_dom_class(h, a(c), l(c), 0 as u32)
+}
+
+// ------------------------------------------------------------ reading
+
+// The text the host holds after firn_dom_get/firn_js_eval, as a `str`.
+fn take(n: i32) -> str {
+    if n <= 0 as i32 {
+        return ""
+    }
+    let p: *mut u8 = rt.ptr_of(rt.heap_alloc(n as usize))
+    let got: u32 = firn_dom_take(p as u64 as u32, n as u32)
+    return __str_copy(str { p: p, n: got as usize })
+}
+
+fn text(h: u32) -> str {
+    return take(firn_dom_get(h, GET_TEXT, 0 as u32, 0 as u32))
+}
+
+fn value(h: u32) -> str {
+    return take(firn_dom_get(h, GET_VALUE, 0 as u32, 0 as u32))
+}
+
+// The attribute's value; "" when it is not there.
+fn attr(h: u32, k: str) -> str {
+    return take(firn_dom_get(h, GET_ATTR, a(k), l(k)))
+}
+
+// Runs JavaScript on the page and returns String(result) -- the escape
+// hatch for every Web API this file does not wrap (localStorage, history,
+// alert ...). The code is the program's own; never pass user text into it.
+fn eval(code: str) -> str {
+    return take(firn_js_eval(a(code), l(code)))
+}
+
+// ------------------------------------------------------------ events
+
+// Handlers: fn(user data, handle of the node) in a table of 256.
+const MAX_ON: usize = 256
+static mut G_ON_F: [u64; 256] = [0 as u64; 256]
+static mut G_ON_UD: [u64; 256] = [0 as u64; 256]
+static mut G_ON_N: usize = 0
+
+fn listen(h: u32, event: str, f: fn(u64, u32), ud: u64, prevent: u32) -> bool {
+    if G_ON_N >= MAX_ON {
+        return false
+    }
+    let id: usize = G_ON_N
+    G_ON_F[id] = f as u64
+    G_ON_UD[id] = ud
+    G_ON_N = G_ON_N + 1
+    firn_dom_listen(h, a(event), l(event), (id + 1) as u32, prevent)
+    return true
+}
+
+// Calls f(ud, h) on every `event` ("click", "input", "keydown", ...) of h.
+fn on(h: u32, event: str, f: fn(u64, u32), ud: u64) -> bool {
+    return listen(h, event, f, ud, 0 as u32)
+}
+
+// The same, and the browser's own reaction is prevented (a form's submit).
+fn on_prevent(h: u32, event: str, f: fn(u64, u32), ud: u64) -> bool {
+    return listen(h, event, f, ud, 1 as u32)
+}
+
+// Inside a handler: event.key of a keyboard event ("Enter", "a").
+fn event_key() -> str {
+    return take(firn_dom_get(0 as u32, GET_EVENT_KEY, 0 as u32, 0 as u32))
+}
+
+// Inside a handler: event.target.value (for "input"/"change").
+fn event_value() -> str {
+    return take(firn_dom_get(0 as u32, GET_EVENT_VALUE, 0 as u32, 0 as u32))
+}
+
+// The host calls this for every event registered with `on`.
+#[export_c]
+fn firn_dom_event(id: u32, h: u32) -> u32 {
+    let i: usize = id as usize
+    if i == 0 || i > G_ON_N {
+        return 0 as u32
+    }
+    let f: fn(u64, u32) = G_ON_F[i - 1] as fn(u64, u32)
+    f(G_ON_UD[i - 1], h)
+    return 1 as u32
+}

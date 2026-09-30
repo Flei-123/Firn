@@ -4746,7 +4746,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     e.line("push rbp");
     e.line("mov rbp, rsp");
     if a.frame.size > 0 {
-        e.line(&format!("sub rsp, {}", a.frame.size));
+        crate::codegen_x86::emit_frame(e, a.frame.size);
     }
     for (r, off) in &a.saved {
         e.line(&format!("mov qword ptr [rbp-{}], {}", off, r));
@@ -6894,6 +6894,44 @@ fn emit_inst(
             if args.is_empty() {
                 return Err("internal error: syscall without number".to_string());
             }
+            // ROUND WINDOWS: not an instruction but a call into the seam.
+            // Seven System V arguments -- the seventh over the stack -- and
+            // the same parallel move problem as an ordinary call, because
+            // `r8`/`r9` are homes of the allocation as well.
+            if crate::target::windows() {
+                e.line("sub rsp, 16");
+                if args.len() >= 7 {
+                    ra.load_full(e, "rax", args[6]);
+                } else {
+                    e.line("xor eax, eax");
+                }
+                e.line("mov qword ptr [rsp], rax");
+                let mut wmoves: Vec<(String, String)> = Vec::new();
+                let mut wlater: Vec<(usize, Val)> = Vec::new();
+                for k in 0..ARG_REGS.len().min(args.len()) {
+                    let o = ra.opnd(args[k]);
+                    if is_reg64(&o) {
+                        wmoves.push((ARG_REGS[k].to_string(), o));
+                    } else {
+                        wlater.push((k, args[k]));
+                    }
+                }
+                parallel_reg_moves(e, &wmoves);
+                for (k, arg) in wlater {
+                    ra.load_full(e, ARG_REGS[k], arg);
+                }
+                // The unused ones LAST: before the moves they could have
+                // destroyed a source that still had to travel.
+                for k in args.len()..ARG_REGS.len() {
+                    e.line(&format!("mov {}, 0", ARG_REGS[k]));
+                }
+                e.line(&format!("call {}", label(crate::win_seam::SYSCALL_FN)));
+                e.line("add rsp, 16");
+                if let Some(d) = i.dst {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             // FIRN r64: the Android forms (codegen_x86.rs,
             // `emit_syscall_android`, the same rewrite on the base path).
             if crate::target::android() && emit_syscall_android_ra(e, ra, i, args)? {
@@ -6990,6 +7028,14 @@ fn emit_inst(
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
+            // ROUND WINDOWS: see codegen_x86.rs -- ENOSYS instead of clone(2).
+            if crate::target::windows() {
+                crate::thread::spawn_unsupported(e);
+                if let Some(d) = i.dst {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
+            }
             let d = i.dst.ok_or("internal error: spawn without target")?;
             ra.load_full(e, "rdi", *arg);
             ra.load_full(e, "rsi", *stack);

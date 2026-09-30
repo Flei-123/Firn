@@ -510,6 +510,10 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     if grep -q '^import plat\.android' "$f"; then
         "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
+    elif grep -q '^import web\.dom' "$f"; then
+        # A browser-only program (lib/web/dom.fi imports its functions
+        # from the page's JavaScript): it is built for wasm32-browser.
+        "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/baupruefung.wasm" "$f" >/dev/null
     else
         "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
     fi

@@ -92,6 +92,8 @@ mod wasm_cfg;
 mod wasm_enc;
 mod wasm_locals;
 mod wasm_rt;
+mod win;
+mod win_seam;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -235,6 +237,10 @@ fn usage() -> String {
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
                               | wasm32-browser (a .wasm module, round WASM)\n  \
+                              | x86_64-windows (a PE/COFF .exe, round WINDOWS)\n  \
+                              | x86_64-android | aarch64-android (with --pic -c,\n  \
+                                packed by tools/android/build.sh)\n  \
+         --win-subsystem=<s> console (default) | windows (no console window)\n  \
          --pic              position independent (shared library, round MOBIL)\n  \
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
@@ -362,6 +368,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--pic" => target::pic_set(true),
             _ if a.starts_with("--target=") => {
                 if let Err(e) = target::flag_set(&a["--target=".len()..]) {
+                    return Err(e);
+                }
+            }
+            // ROUND WINDOWS: a WINDOW program is not a console program;
+            // without this a black console opens next to it.
+            _ if a.starts_with("--win-subsystem=") => {
+                if let Err(e) = win::set_subsystem(&a["--win-subsystem=".len()..]) {
                     return Err(e);
                 }
             }
@@ -859,6 +872,36 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    // --- ROUND WINDOWS (r33): the system seam --------------------------
+    //
+    // The same shape as the `comptime` injection above and the `--test`
+    // one: source text that arises DURING the compilation is lexed, parsed
+    // and appended. What is injected is `win_seam.rs` -- the layer that
+    // answers a `syscall(...)` over Win32, written in Firn. It goes in
+    // whenever the target is Windows, because `_start` itself calls into
+    // it (standard handles, command line) even in a program that never
+    // says `syscall`.
+    if target::windows() && !dg.has_errors() {
+        let src = win_seam::source();
+        let file = dg.add_file("<windows seam>", &src);
+        dwarf::add_file("<windows seam>");
+        let toks = lexer::lex_file(&src, file, &mut dg);
+        let mut extra = parser::parse_module(&toks, &mut dg, file, 0);
+        let mut next = prog.expr_count;
+        for f in extra.funcs.iter_mut() {
+            crate::mono::renumber_block(&mut f.body, &mut next);
+        }
+        for c in extra.consts.iter_mut() {
+            crate::mono::renumber_expr(&mut c.value, &mut next);
+        }
+        prog.expr_count = next;
+        prog.funcs.extend(extra.funcs);
+        prog.structs.extend(extra.structs);
+        prog.consts.extend(extra.consts);
+        prog.statics.extend(extra.statics);
+        win::note_baseline();
+    }
+
     tm.mark("comptime");
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
@@ -1223,7 +1266,14 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     // page aligned segments, everything else stays bit for bit what it was
     // (`tools/repro`).
     let mut cmd = Command::new(t.linker());
-    if !crate::statics::any() {
+    if target::windows() {
+        // ROUND WINDOWS. The linker gets the entry point (ours, `_start`)
+        // and the subsystem, and no library at all: the import table comes
+        // out of our own object file (`win.rs::idata_asm`) -- `-lkernel32`
+        // never appears here, and no foreign object file enters the image.
+        cmd.arg("-e").arg("_start");
+        cmd.arg("--subsystem").arg(win::subsystem());
+    } else if !crate::statics::any() {
         cmd.arg("-n");
     }
     let st = cmd.arg("-o").arg(out).arg(obj).status();

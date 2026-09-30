@@ -106,6 +106,12 @@ pub fn register(prog: &crate::ast::Program) {
         } else if f.attrs.iter().any(|a| a.name == "export_c") {
             mark_exported(&f.name, &source_name(&f.name));
         }
+        // ROUND CERTUS-WINDOWS: a function Windows is allowed to call back.
+        // The arity is recorded here because the thunk cannot be written
+        // without it.
+        if f.attrs.iter().any(|a| a.name == "win_callback") {
+            crate::win::mark_callback(&f.name, f.params.len() as u32);
+        }
     }
 }
 

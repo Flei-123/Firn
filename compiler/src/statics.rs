@@ -215,7 +215,11 @@ pub fn data_asm() -> String {
             let section = if !s.mutable {
                 ".section .rodata"
             } else if zero {
-                ".section .bss,\"aw\",@nobits"
+                if crate::target::windows() {
+                    ".section .bss,\"bw\""
+                } else {
+                    ".section .bss,\"aw\",@nobits"
+                }
             } else {
                 ".section .data"
             };

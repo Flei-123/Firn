@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/sendinput.fi -- synthetic mouse and keyboard input on Windows
+// through SendInput (user32.dll). Only built for x86_64-windows; the
+// portable interface is lib/input/input.fi.
+//
+// struct INPUT is 40 octets on x64: `type` u32 at 0, the union at 8.
+//   MOUSEINPUT:    dx i32 @8, dy i32 @12, mouseData u32 @16, dwFlags u32 @20
+//   KEYBDINPUT:    wVk u16 @8, wScan u16 @10, dwFlags u32 @12
+// The key codes coming in are Linux's (input.fi); `vk_of` maps them.
+
+export { open, close, error_text, rel, button, key, vk_of }
+
+extern fn SendInput(n: i64, inputs: u64, size: i64) -> i32;
+extern fn GetLastError() -> i32;
+
+const INPUT_SIZE: i64 = 40
+const INPUT_MOUSE: u32 = 0
+const INPUT_KEYBOARD: u32 = 1
+
+const MOUSEEVENTF_MOVE: u32 = 1
+const MOUSEEVENTF_LEFTDOWN: u32 = 2
+const MOUSEEVENTF_LEFTUP: u32 = 4
+const MOUSEEVENTF_RIGHTDOWN: u32 = 8
+const MOUSEEVENTF_RIGHTUP: u32 = 16
+const MOUSEEVENTF_MIDDLEDOWN: u32 = 32
+const MOUSEEVENTF_MIDDLEUP: u32 = 64
+const MOUSEEVENTF_WHEEL: u32 = 2048
+const MOUSEEVENTF_HWHEEL: u32 = 4096
+const WHEEL_DELTA: i32 = 120
+
+const KEYEVENTF_EXTENDEDKEY: u32 = 1
+const KEYEVENTF_KEYUP: u32 = 2
+
+static mut SI_ERR: i64 = 0
+
+// SendInput needs no device to open; kept for the common interface.
+fn open() -> bool { return true }
+fn close() {}
+
+fn error_text() -> str {
+    if SI_ERR == 0 {
+        return ""
+    }
+    // ERROR_ACCESS_DENIED: UIPI blocks input into a window of a higher
+    // integrity level (an elevated program) -- the documented limit.
+    if SI_ERR == 5 {
+        return "SendInput was blocked (the target window runs elevated)"
+    }
+    return "SendInput failed"
+}
+
+fn put32(p: *mut u8, off: usize, v: u32) {
+    *(p + off) = (v & 255) as u8
+    *(p + off + 1) = ((v >> 8) & 255) as u8
+    *(p + off + 2) = ((v >> 16) & 255) as u8
+    *(p + off + 3) = ((v >> 24) & 255) as u8
+}
+
+// Sends `n` prepared records; true when Windows took all of them.
+fn send(buf: *mut u8, n: i64) -> bool {
+    let got: i32 = SendInput(n, buf as u64, INPUT_SIZE)
+    if got as i64 != n {
+        SI_ERR = (GetLastError() as i64) & 65535
+        if SI_ERR == 0 {
+            SI_ERR = 1
+        }
+        return false
+    }
+    SI_ERR = 0
+    return true
+}
+
+// the two's complement bits of a signed value (negative motion)
+fn bits(v: i32) -> u32 { return ((v as i64) & 4294967295) as u32 }
+
+fn mouse(buf: *mut u8, k: usize, dx: i32, dy: i32, data: i32, flags: u32) {
+    let off: usize = k * 40
+    var i: usize = 0
+    while i < 40 {
+        *(buf + off + i) = 0 as u8
+        i = i + 1
+    }
+    put32(buf, off, INPUT_MOUSE)
+    put32(buf, off + 8, bits(dx))
+    put32(buf, off + 12, bits(dy))
+    put32(buf, off + 16, bits(data))
+    put32(buf, off + 20, flags)
+}
+
+fn rel(dx: i32, dy: i32, wheel: i32, hwheel: i32) -> bool {
+    var b: [u8; 120] = [0; 120]
+    let p: *mut u8 = &b[0]
+    var n: usize = 0
+    if dx != 0 || dy != 0 {
+        mouse(p, n, dx, dy, 0, MOUSEEVENTF_MOVE)
+        n = n + 1
+    }
+    if wheel != 0 {
+        mouse(p, n, 0, 0, wheel * WHEEL_DELTA, MOUSEEVENTF_WHEEL)
+        n = n + 1
+    }
+    if hwheel != 0 {
+        mouse(p, n, 0, 0, hwheel * WHEEL_DELTA, MOUSEEVENTF_HWHEEL)
+        n = n + 1
+    }
+    if n == 0 {
+        return true
+    }
+    return send(p, n as i64)
+}
+
+// Linux BTN_LEFT 272, BTN_RIGHT 273, BTN_MIDDLE 274.
+fn button(code: u32, down: bool) -> bool {
+    var f: u32 = 0
+    if code == 272 {
+        f = if down { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP }
+    } else if code == 273 {
+        f = if down { MOUSEEVENTF_RIGHTDOWN } else { MOUSEEVENTF_RIGHTUP }
+    } else if code == 274 {
+        f = if down { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }
+    } else {
+        return false
+    }
+    var b: [u8; 40] = [0; 40]
+    mouse(&b[0], 0, 0, 0, 0, f)
+    return send(&b[0], 1)
+}
+
+// Linux key code -> Windows virtual-key code; bit 8 = extended key.
+// 0 = no mapping.
+fn vk_of(code: u32) -> u32 {
+    // letters by keyboard row: Q..P = 16..25, A..L = 30..38, Z..M = 44..50
+    var row1: [u8; 10] = [81, 87, 69, 82, 84, 89, 85, 73, 79, 80]
+    var row2: [u8; 9] = [65, 83, 68, 70, 71, 72, 74, 75, 76]
+    var row3: [u8; 7] = [90, 88, 67, 86, 66, 78, 77]
+    if code >= 16 && code <= 25 { return row1[(code - 16) as usize] as u32 }
+    if code >= 30 && code <= 38 { return row2[(code - 30) as usize] as u32 }
+    if code >= 44 && code <= 50 { return row3[(code - 44) as usize] as u32 }
+    if code >= 2 && code <= 10 { return 47 + code } // '1'..'9' = 0x31..0x39
+    if code == 11 { return 48 } // '0'
+    if code >= 59 && code <= 68 { return 112 + (code - 59) } // F1..F10
+    if code == 87 { return 122 } // F11
+    if code == 88 { return 123 } // F12
+    if code == 1 { return 27 } // Esc
+    if code == 14 { return 8 } // Backspace
+    if code == 15 { return 9 } // Tab
+    if code == 28 { return 13 } // Enter
+    if code == 57 { return 32 } // Space
+    if code == 29 { return 162 } // left Ctrl
+    if code == 42 { return 160 } // left Shift
+    if code == 56 { return 164 } // left Alt
+    if code == 125 { return 91 | 256 } // left Windows key
+    if code == 102 { return 36 | 256 } // Home
+    if code == 103 { return 38 | 256 } // Up
+    if code == 104 { return 33 | 256 } // Page Up
+    if code == 105 { return 37 | 256 } // Left
+    if code == 106 { return 39 | 256 } // Right
+    if code == 107 { return 35 | 256 } // End
+    if code == 108 { return 40 | 256 } // Down
+    if code == 109 { return 34 | 256 } // Page Down
+    if code == 110 { return 45 | 256 } // Insert
+    if code == 111 { return 46 | 256 } // Delete
+    if code == 113 { return 173 } // VK_VOLUME_MUTE
+    if code == 114 { return 174 } // VK_VOLUME_DOWN
+    if code == 115 { return 175 } // VK_VOLUME_UP
+    if code == 163 { return 176 } // VK_MEDIA_NEXT_TRACK
+    if code == 164 { return 179 } // VK_MEDIA_PLAY_PAUSE
+    if code == 165 { return 177 } // VK_MEDIA_PREV_TRACK
+    if code == 12 { return 189 } // -
+    if code == 13 { return 187 } // =
+    if code == 26 { return 219 } // [
+    if code == 27 { return 221 } // ]
+    if code == 39 { return 186 } // ;
+    if code == 40 { return 222 } // '
+    if code == 41 { return 192 } // `
+    if code == 43 { return 220 } // backslash
+    if code == 51 { return 188 } // ,
+    if code == 52 { return 190 } // .
+    if code == 53 { return 191 } // /
+    return 0
+}
+
+fn key(code: u32, down: bool) -> bool {
+    let v: u32 = vk_of(code)
+    if v == 0 {
+        return false
+    }
+    var f: u32 = 0
+    if (v & 256) != 0 {
+        f = f | KEYEVENTF_EXTENDEDKEY
+    }
+    if !down {
+        f = f | KEYEVENTF_KEYUP
+    }
+    var b: [u8; 40] = [0; 40]
+    let p: *mut u8 = &b[0]
+    put32(p, 0, INPUT_KEYBOARD)
+    *(p + 8) = (v & 255) as u8
+    put32(p, 12, f)
+    return send(p, 1)
+}
