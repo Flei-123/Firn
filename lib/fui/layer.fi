@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/layer.fi -- PICTURES OFF THE SCREEN: group opacity and baking.
+//
+// ========================================================= WHY IT EXISTS
+//
+// Two things every modern page does and fUi could not do by itself until
+// 30.09.2026 (examples/codehub did both by hand):
+//
+//   1. A GROUP FADES IN. CSS `opacity: 0.4` on a box makes the box AND
+//      everything in it translucent -- as ONE picture, not as twenty
+//      translucent pieces over each other (then the text would show the
+//      button's face through it). That needs the group painted off the
+//      screen first and laid over the page once: `group_begin` /
+//      `group_end`, used by scene.fi for node_set_opacity.
+//
+//   2. WHAT DOES NOT CHANGE IS PAINTED ONCE. A page's ground (light,
+//      grid, mountains, glass) costs more than everything on it; it
+//      changes only with the size. A `Bake` keeps it: painted when its
+//      key changes, copied every other frame (`bake_*`, used by
+//      scene.scene_draw_still / scene_draw_live).
+//
+// ======================================================= HOW A GROUP WORKS
+//
+// The painter is pointed at a scratch canvas of the SAME size as its own
+// (painter.painter_swap_canvas) -- so every coordinate, every raster
+// window, every custom painter of a node works unchanged. Only the
+// group's rectangle (plus a margin for shadows) is cleared before and
+// laid over after, so a small group costs its own size, not the window's.
+// Groups nest up to GROUP_MAX deep; deeper ones are painted without their
+// opacity and counted (group_overflow).
+//
+// On a GPU canvas the group is painted in memory and laid over with
+// gpu.gpu_draw_pixels -- the same way effect.layer_over gets a software
+// layer onto the GPU.
+
+export {
+    group_begin, group_end, group_overflow, group_depth, GROUP_MAX,
+    Bake, bake_new, bake_valid, bake_start, bake_painter, bake_canvas,
+    bake_copy_to, bake_count, bake_free, bake_width, bake_height,
+}
+
+import std.rt
+import paint.canvas
+import fui.painter
+import fui.gpu
+
+const GROUP_MAX: usize = 4
+
+// The scratch canvases, one per depth, allocated on first use and kept
+// (a fade runs for many frames; allocating each frame would be the cost).
+static mut G_POOL: u64 = 0 // GROUP_MAX Canvas structs on the heap
+static mut G_DEPTH: usize = 0
+static mut G_OVER: usize = 0
+static mut G_OLD: [u64; 4] = [0 as u64; 4]
+static mut G_R: [i64; 16] = [0; 16] // x0, y0, x1, y1 per depth
+static mut G_SKIP: [u32; 4] = [0 as u32; 4] // 1 = this level paints straight
+
+fn canvas_size() -> usize {
+    var probe: [canvas.Canvas; 2] = [canvas.canvas_new(); 2]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn pool_at(i: usize) -> *mut canvas.Canvas {
+    if G_POOL == 0 {
+        let n: usize = canvas_size()
+        G_POOL = rt.heap_alloc(n * GROUP_MAX)
+        if G_POOL == 0 {
+            return (0 as u64) as *mut canvas.Canvas
+        }
+        var k: usize = 0
+        while k < GROUP_MAX {
+            *((G_POOL + (k * n) as u64) as *mut canvas.Canvas) = canvas.canvas_new()
+            k = k + 1
+        }
+    }
+    return (G_POOL + (i * canvas_size()) as u64) as *mut canvas.Canvas
+}
+
+// How many groups were painted without their opacity (too deep / no
+// memory) since the program started.
+fn group_overflow() -> usize { return G_OVER }
+fn group_depth() -> usize { return G_DEPTH }
+
+fn clampi(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+// A GROUP STARTS: from here until `group_end` the painter paints into a
+// scratch canvas. (x, y, w, h) is the group's rectangle in pixels,
+// `margin` how far its paint may reach out of it (a shadow). Always pair
+// with group_end -- also when this returns false (then the group is
+// painted straight onto the page, without its opacity).
+fn group_begin(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    margin: f64) -> bool {
+    let d: usize = G_DEPTH
+    G_DEPTH = d + 1
+    if d >= GROUP_MAX {
+        G_OVER = G_OVER + 1
+        return false
+    }
+    G_SKIP[d] = 1 as u32
+    let dst: *mut canvas.Canvas = painter.painter_canvas(z)
+    let cw: usize = canvas.canvas_width(dst)
+    let ch: usize = canvas.canvas_height(dst)
+    let sc: *mut canvas.Canvas = pool_at(d)
+    if sc as u64 == 0 {
+        G_OVER = G_OVER + 1
+        return false
+    }
+    if canvas.canvas_ok(sc) && (canvas.canvas_width(sc) != cw
+    || canvas.canvas_height(sc) != ch) {
+        canvas.canvas_free(sc)
+    }
+    if !canvas.canvas_ok(sc) {
+        if !canvas.canvas_init(sc, cw, ch) {
+            G_OVER = G_OVER + 1
+            return false
+        }
+        rt.mem_set(canvas.canvas_pixels(sc) as u64, 0 as u8, cw * ch * 4)
+    }
+    let x0: i64 = clampi((x - margin) as i64, 0, cw as i64)
+    let y0: i64 = clampi((y - margin) as i64, 0, ch as i64)
+    let x1: i64 = clampi((x + w + margin + 1.0) as i64, 0, cw as i64)
+    let y1: i64 = clampi((y + h + margin + 1.0) as i64, 0, ch as i64)
+    G_R[d * 4] = x0
+    G_R[d * 4 + 1] = y0
+    G_R[d * 4 + 2] = x1
+    G_R[d * 4 + 3] = y1
+    // the rectangle empty (the rest of the scratch canvas is never read)
+    let px: u64 = canvas.canvas_pixels(sc) as u64
+    if x1 > x0 {
+        var yy: i64 = y0
+        while yy < y1 {
+            rt.mem_set(px + ((yy * (cw as i64) + x0) * 4) as u64, 0 as u8,
+                ((x1 - x0) * 4) as usize)
+            yy = yy + 1
+        }
+    }
+    G_OLD[d] = painter.painter_swap_canvas(z, sc) as u64
+    G_SKIP[d] = 0 as u32
+    return true
+}
+
+// THE GROUP ENDS: its picture is laid over the page at opacity `alpha`
+// (0..255), and the painter paints onto the page again.
+fn group_end(z: *mut painter.Painter, alpha: u32) {
+    if G_DEPTH == 0 {
+        return
+    }
+    let d: usize = G_DEPTH - 1
+    G_DEPTH = d
+    if d >= GROUP_MAX || G_SKIP[d] != 0 as u32 {
+        return
+    }
+    let sc: *mut canvas.Canvas = painter.painter_canvas(z)
+    let dst: *mut canvas.Canvas = G_OLD[d] as *mut canvas.Canvas
+    let ignore: *mut canvas.Canvas = painter.painter_swap_canvas(z, dst)
+    let x0: i64 = G_R[d * 4]
+    let y0: i64 = G_R[d * 4 + 1]
+    let x1: i64 = G_R[d * 4 + 2]
+    let y1: i64 = G_R[d * 4 + 3]
+    if x1 <= x0 || y1 <= y0 || alpha == 0 as u32 {
+        return
+    }
+    let cw: i64 = canvas.canvas_width(sc) as i64
+    let sp: u64 = canvas.canvas_pixels(sc) as u64
+    let m: u64 = 16711935 // 0x00FF00FF
+    // 1. the opacity into the (premultiplied) pixels: all four channels
+    if alpha < 255 as u32 {
+        let k: u64 = alpha as u64
+        var yy: i64 = y0
+        while yy < y1 {
+            var i: u64 = sp + ((yy * cw + x0) * 4) as u64
+            let e: u64 = sp + ((yy * cw + x1) * 4) as u64
+            while i < e {
+                let s: u64 = (*(i as *mut u32)) as u64
+                if s != 0 {
+                    var lo: u64 = (s & m) * k + 8388736
+                    lo = ((lo + ((lo >> 8) & m)) >> 8) & m
+                    var hi: u64 = ((s >> 8) & m) * k + 8388736
+                    hi = ((hi + ((hi >> 8) & m)) >> 8) & m
+                    *(i as *mut u32) = (lo | (hi << 8)) as u32
+                }
+                i = i + 4
+            }
+            yy = yy + 1
+        }
+    }
+    // 2. over the page: on a GPU by its pixel path, in memory src-over,
+    //    inside the page's clip rectangle (a group in a scroll area)
+    let g: *mut gpu.Gpu = gpu.gpu_of(dst)
+    if g as u64 != 0 {
+        gpu.gpu_draw_pixels(g, sp, (cw * 4) as usize, cw as i32,
+            canvas.canvas_height(sc) as i32, x0 as i32, y0 as i32, x1 as i32,
+            y1 as i32)
+        return
+    }
+    let dw: i64 = canvas.canvas_width(dst) as i64
+    let a0: i64 = clampi(x0, clampi((canvas.clip_x0(dst) + 0.5) as i64, 0, dw), dw)
+    let b0: i64 = clampi(y0, clampi((canvas.clip_y0(dst) + 0.5) as i64, 0, y1), y1)
+    let a1: i64 = clampi(x1, a0, clampi((canvas.clip_x1(dst) + 0.5) as i64, 0, dw))
+    let b1: i64 = clampi(y1, b0, clampi((canvas.clip_y1(dst) + 0.5) as i64, 0, y1))
+    let dp: u64 = canvas.canvas_pixels(dst) as u64
+    var yy2: i64 = b0
+    while yy2 < b1 {
+        var o: u64 = ((yy2 * dw + a0) * 4) as u64
+        var i2: u64 = sp + ((yy2 * cw + a0) * 4) as u64
+        let e2: u64 = sp + ((yy2 * cw + a1) * 4) as u64
+        while i2 < e2 {
+            let s: u64 = (*(i2 as *mut u32)) as u64
+            let sa: u64 = s >> 24
+            if sa == 255 {
+                *((dp + o) as *mut u32) = s as u32
+            } else if sa != 0 {
+                let dd: u64 = (*((dp + o) as *mut u32)) as u64
+                let ia: u64 = 255 - sa
+                var lo2: u64 = (dd & m) * ia + 8388736
+                lo2 = ((lo2 + ((lo2 >> 8) & m)) >> 8) & m
+                var hi2: u64 = ((dd >> 8) & m) * ia + 8388736
+                hi2 = ((hi2 + ((hi2 >> 8) & m)) >> 8) & m
+                *((dp + o) as *mut u32) = ((lo2 | (hi2 << 8)) + s) as u32
+            }
+            i2 = i2 + 4
+            o = o + 4
+        }
+        yy2 = yy2 + 1
+    }
+}
+
+// ======================================================================
+// THE BAKE
+// ======================================================================
+//
+// A picture of `w` x `h` pixels that is painted only when its KEY
+// changes (the caller's number for "what it shows": size, positions,
+// theme). It may be taller than the window: a page baked at its full
+// height scrolls by copying another band of rows.
+struct Bake {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    w: usize,
+    h: usize,
+    key: u64,
+    ok: bool,
+    n: usize, // how often it was painted
+}
+
+fn bake_new() -> Bake {
+    return Bake { cv: canvas.canvas_new(), z: painter.painter_new(), w: 0,
+        h: 0, key: 0, ok: false, n: 0 }
+}
+
+// Does the bake show `key` at w x h already?
+fn bake_valid(b: *mut Bake, w: usize, h: usize, key: u64) -> bool {
+    return (*b).ok && (*b).w == w && (*b).h == h && (*b).key == key
+}
+
+// START PAINTING IT: (re)allocates w x h, clears it to `ground` and gives
+// the painter that paints into it -- with the fonts of `like`. False when
+// there is no memory (then paint the frame directly, as without a bake).
+fn bake_start(b: *mut Bake, w: usize, h: usize, key: u64, ground: u32,
+    like: *mut painter.Painter) -> bool {
+    if (*b).ok && ((*b).w != w || (*b).h != h) {
+        painter.painter_free(&(*b).z)
+        canvas.canvas_free(&(*b).cv)
+        (*b).ok = false
+    }
+    if !(*b).ok {
+        if !canvas.canvas_init(&(*b).cv, w, h) {
+            return false
+        }
+        // the raster window: as wide as the picture, at most 700 rows at
+        // once (a glass panel, a card -- never the whole page)
+        var rh: usize = h
+        if rh > 700 {
+            rh = 700
+        }
+        if !painter.painter_init(&(*b).z, &(*b).cv, w, rh) {
+            canvas.canvas_free(&(*b).cv)
+            return false
+        }
+        (*b).ok = true
+        (*b).w = w
+        (*b).h = h
+    }
+    painter.painter_set_font(&(*b).z, painter.painter_font(like))
+    var k: usize = 1
+    while k < painter.FONT_SLOTS {
+        painter.painter_set_font_slot(&(*b).z, k,
+            painter.painter_font_slot(like, k))
+        k = k + 1
+    }
+    canvas.canvas_clear(&(*b).cv, ground)
+    (*b).key = key
+    (*b).n = (*b).n + 1
+    return true
+}
+
+fn bake_painter(b: *mut Bake) -> *mut painter.Painter { return &(*b).z }
+fn bake_canvas(b: *mut Bake) -> *mut canvas.Canvas { return &(*b).cv }
+fn bake_count(b: *mut Bake) -> usize { return (*b).n }
+fn bake_width(b: *mut Bake) -> usize { return (*b).w }
+fn bake_height(b: *mut Bake) -> usize { return (*b).h }
+
+// ROWS [sy, sy + rows) OF THE BAKE onto the painter's canvas at row 0 --
+// one copy per frame instead of the whole ground. The canvas must be as
+// wide as the bake. False when it does not fit (then paint directly).
+fn bake_copy_to(b: *mut Bake, z: *mut painter.Painter, sy: usize,
+    rows: usize) -> bool {
+    if !(*b).ok {
+        return false
+    }
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let w: usize = (*b).w
+    if canvas.canvas_width(cv) != w || sy + rows > (*b).h
+    || canvas.canvas_height(cv) < rows {
+        return false
+    }
+    let src: u64 = canvas.canvas_pixels(&(*b).cv) as u64 + (sy * w * 4) as u64
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g as u64 != 0 {
+        // the bake is opaque, so src-over is a copy
+        gpu.gpu_draw_pixels(g, src, w * 4, w as i32, rows as i32, 0, 0,
+            w as i32, rows as i32)
+        return true
+    }
+    rt.mem_copy(canvas.canvas_pixels(cv) as u64, src, w * rows * 4)
+    return true
+}
+
+fn bake_free(b: *mut Bake) {
+    if (*b).ok {
+        painter.painter_free(&(*b).z)
+        canvas.canvas_free(&(*b).cv)
+        (*b).ok = false
+    }
+}

@@ -430,6 +430,14 @@ echo "== 18k. SCHMELZGRUPPE: FORMEN VERSCHMELZEN, WENN SIE SICH NAEHERN =="
 "$W/merge"
 
 echo
+echo "== 18l. DER SEITEN-LOOK: VERLAUF, LICHT, SCHATTEN, FLUIDE SCHRIFT, ABSAETZE, GRUPPEN =="
+# lib/fui/style.fi (SF_BG_GRAD, SF_BG_GLOW, SF_BOX_SHADOW, SF_FLUID),
+# lib/fui/scene.fi (node_set_text_wrap, node_set_opacity/offset,
+# scene_draw_still/live) und lib/fui/layer.fi -- auf echten Pixeln.
+"$FIRNC" --opt-level=release-fast -o "$W/pagelook" tools/fui/pagelook_main.fi
+"$W/pagelook"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
