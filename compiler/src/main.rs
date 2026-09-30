@@ -238,6 +238,8 @@ fn usage() -> String {
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
                               | wasm32-browser (a .wasm module, round WASM)\n  \
                               | x86_64-windows (a PE/COFF .exe, round WINDOWS)\n  \
+                              | x86_64-android | aarch64-android (with --pic -c,\n  \
+                                packed by tools/android/build.sh)\n  \
          --win-subsystem=<s> console (default) | windows (no console window)\n  \
          --pic              position independent (shared library, round MOBIL)\n  \
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
