@@ -460,6 +460,18 @@ build dom
 "$W/dom"
 
 echo
+echo "== 18o. THE APP TREE: EVENTS, POINTERS, GESTURES, CHANGE RECORDS =="
+# tools/fui/event_main.fi (docs/APP-TREE.md T3, T4, T6): capture -> target
+# -> bubble with stop / stop-now / prevent-default and control.fi as the
+# default action; pointer ids, primary, pointer capture (also across a
+# rebuild); tap, double tap, long press, pan + fling, pinch + rotate with an
+# arena that lets exactly one win and cancels the loser's press; change
+# records by key -- none for a renumbering rebuild, none for a secret.
+# Everything with synthetic event streams.
+build event
+"$W/event"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
