@@ -522,8 +522,9 @@ Measured 7 × alternating (9 rounds each):
 - Without culling, every off-screen node still costs about 5 µs of draw time.
 - With culling, the 505-node and 1009-node trees (same visible picture) cost the
   same.
-- **Kept as a roadmap item, not merged.** A real version needs per-style ink overflow
-  (large glows, merge groups) instead of a fixed 40-point margin.
+- **Kept as a roadmap item, not merged** at the time. A real version needed ink
+  overflow from the style instead of a fixed 40-point margin. It was built
+  that way on 30.09.2026 (§4.5).
 
 **The logbook in one line each:**
 
@@ -535,6 +536,59 @@ Measured 7 × alternating (9 rounds each):
   same octets.
 
 ---
+
+### 4.5 Built (30.09.2026): culling, the measure memo, keys, queries, secrets, inspector
+
+The first items of §7 are in the library now, each checked by
+`tools/fui/dom_main.fi` (run.sh section 18n):
+
+- **Secrets (r99).** `widget.w_set_secret` marks a password field. The field
+  paints and measures masked (one bullet per character, the same octets as a
+  field that holds bullets). The accessibility export writes role, name and the
+  flag `secret` only — no `value=`, so not even the length leaves. A name read
+  through the field (labelled-by, a row named by its children) skips its text.
+  The canary `CANARY7hunter2` is in no dump, name, query or inspector text.
+- **Keys and queries (r92, r93)** in `lib/fui/query.fi`. The key is the node id
+  (`sheet_name` of a word); the key path (`login/pass/field`) is the automation
+  id. `query_key_dups` counts duplicates; `query_keep`/`query_restore` carry
+  focus, hover, press and drag across a rebuild that moved every number.
+  Queries: by `sheet.Sel` through `sheet.sel_match` (the stylesheet's own
+  matcher), by role + name, and by text — `button[name="Save"]`,
+  `checkbox[name*="Remember"]`, `.actions button`, `#pass textbox`,
+  `checkbox:checked`. A query that is not understood finds nothing.
+- **Culling (r101)** in `scene_draw`, on by default. Ink bounds per subtree:
+  40 points plus twice the theme's shadow radius, plus box shadow (lift + 2 ×
+  blur), text shadow and outline from the style. Transforms, offsets and
+  custom painters without `node_set_ink` are never culled; offsets move the
+  bounds with the paint.
+- **Measure memo (r100, first part)**: `scene_attach_memo`. A leaf whose
+  fingerprint (widget without its outputs, text bytes, reserved text, node
+  inputs, theme shape, scale, font) did not change takes its size from the memo.
+  CodeHub attaches one.
+- **Inspector (r97)** in `lib/fui/inspect.fi`: pick (also boxes and texts),
+  describe (kind, key path, role, name, state, box, matching rules with
+  specificity, every resolved value with the winning rule or "inherited"),
+  overlay, live edit of rule values and the accent.
+
+Measured with `tools/fui/apptree.sh` (build `big`, one run, shared server
+under load, so ±15 %):
+
+| nodes | measure | measure with memo | draw with culling | draw without |
+|---:|---:|---:|---:|---:|
+| 123 | 305 µs | 130 µs | 5.55 ms | 5.10 ms |
+| 505 | 1,111 µs | 546 µs | 14.1 ms | 14.7 ms |
+| 1009 | 2,228 µs | 1,175 µs | **14.1 ms** | 17.4 ms |
+
+- The memo halves the measure pass.
+- Culling saves about 19 % of the draw at 1009 nodes, where half the tree is off
+  screen. When everything is visible it gains nothing, and small trees scatter
+  in both directions.
+- **Not reached:** the goal of ≤2 ms tree work at 1000 nodes. Style
+  (~1.1 ms) and layout (~1.7 ms) still run in full. Keeping style and layout
+  results per unchanged subtree is the rest of r100.
+- **CodeHub** (1996 × 1211, best of 60, three alternating runs): a full frame
+  takes 5.1 / 5.4 / 4.6 ms with the memo against 5.5 / 6.0 / 6.3 ms without.
+  The pictures are the same octets as main at all three sizes.
 
 ## 5. The decision
 
@@ -736,6 +790,11 @@ Measured 7 × alternating (9 rounds each):
 | r103 | Accessibility export on demand as pushed updates — base for r19 (AT-SPI/UIA) and the web ARIA mirror (Firn r177) | T7, §5.5, §5.6 |
 | r104 | Action id per control, linked to the OrientOS action bus | §5.3 |
 
+**Status 30.09.2026 (§4.5):** done — r92 (keys, key paths, duplicates,
+focus/hover/press/drag kept by key), r93, r97, r99, r101. Partly done — r100
+(the measure memo; style and layout still run in full). Open — r94, r95, r96,
+r98, r102, r103, r104.
+
 **Linked in the OrientOS roadmap:**
 
 - **r44, S-007 (A11Y-2).** Build it on fUi's a11y model (r92, r96, r99, r103), and
@@ -755,9 +814,9 @@ Measured 7 × alternating (9 rounds each):
 ## 8. How to reproduce
 
 ```
-tools/fui/apptree.sh            # cap128, big (1024) and cull, 3 runs, medians, checksum check
+tools/fui/apptree.sh            # cap128 and big (1024), 3 runs, medians; with/without culling, memo; checksum check
 tools/fui/apptree.sh --quick    # the library as it is, one run
-tools/fui/run.sh                # section 18l runs apptree_main (exit 0 = trees complete)
+tools/fui/run.sh                # 18m runs apptree_main once, 18n runs dom_main (secrets, keys, queries, culling, memo, inspector)
 ```
 
 ---

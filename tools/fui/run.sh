@@ -449,6 +449,15 @@ n=$(grep -c '^apptree tree=' "$W/apptree.log" || true)
 bad=$(grep '^apptree tree=' "$W/apptree.log" | grep -vc ' unnamed=0 ' || true)
 [ "$n" -ge 2 ] && [ "$bad" = 0 ] || { cat "$W/apptree.log"; echo "  FAIL: apptree ($n Baeume, $bad mit Knoten ohne Namen)"; exit 1; }
 echo "  APP-BAUM OK: $n Baeume, jeder Knoten hat einen Namen"
+echo
+echo "== 18n. THE APP TREE: SECRETS, KEYS, QUERIES, CULLING, MEMO, INSPECTOR =="
+# tools/fui/dom_main.fi (docs/APP-TREE.md 7): a password never leaves the
+# process (canary, not even its length), key paths survive a rebuild,
+# queries by selector / role + name / text, culling paints the same
+# octets, the measure memo gives the same sizes, the inspector picks,
+# describes (without secrets) and edits live.
+build dom
+"$W/dom"
 
 echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
