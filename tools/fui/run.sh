@@ -438,6 +438,19 @@ echo "== 18l. DER SEITEN-LOOK: VERLAUF, LICHT, SCHATTEN, FLUIDE SCHRIFT, ABSAETZ
 "$W/pagelook"
 
 echo
+echo "== 18m. DER APP-BAUM: SZENE ALS DOM, EINMAL KURZ DURCHGEMESSEN =="
+# tools/fui/apptree_main.fi (docs/APP-TREE.md): gallery9 und kuenstliche
+# Baeume bis 128 Knoten -- bauen, stylen, messen, legen, malen, treffen,
+# abfragen, vorlesen. Hier nur EINE Runde: laufen muss es und jeder Knoten
+# braucht einen Namen (unnamed=0); die Zahlen misst tools/fui/apptree.sh.
+"$FIRNC" --opt-level=release-fast -o "$W/apptree" tools/fui/apptree_main.fi
+"$W/apptree" 128 1 > "$W/apptree.log" || { cat "$W/apptree.log"; echo "  FAIL: apptree"; exit 1; }
+n=$(grep -c '^apptree tree=' "$W/apptree.log" || true)
+bad=$(grep '^apptree tree=' "$W/apptree.log" | grep -vc ' unnamed=0 ' || true)
+[ "$n" -ge 2 ] && [ "$bad" = 0 ] || { cat "$W/apptree.log"; echo "  FAIL: apptree ($n Baeume, $bad mit Knoten ohne Namen)"; exit 1; }
+echo "  APP-BAUM OK: $n Baeume, jeder Knoten hat einen Namen"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
