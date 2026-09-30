@@ -438,6 +438,20 @@ echo "== 18l. DER SEITEN-LOOK: VERLAUF, LICHT, SCHATTEN, FLUIDE SCHRIFT, ABSAETZ
 "$W/pagelook"
 
 echo
+echo "== 18m. THE APP TREE: SECRETS, KEYS, QUERIES, CULLING (docs/APP-TREE.md) =="
+# tools/fui/dom_main.fi: a password never leaves the process (canary),
+# key paths survive a rebuild, queries by selector / role + name / text,
+# culling paints the same octets, the inspector. tools/fui/apptree_main.fi
+# is the measurement behind docs/APP-TREE.md; here it runs short (3
+# rounds, the 128-node cap) so that it keeps building and every tree it
+# builds stays complete -- its numbers are not judged here.
+build dom
+"$W/dom"
+build apptree
+"$W/apptree" 128 3 > "$W/apptree.txt"
+echo "  apptree: $(grep -c '^apptree tree=' "$W/apptree.txt") trees measured, all complete  OK"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi

@@ -80,8 +80,11 @@ export {
     node_set_wrap, node_set_flexitem, node_set_hidden, node_hidden,
     scene_draw_subtree,
     node_set_opacity, node_set_offset, node_set_live, node_live,
-    node_set_text_wrap, node_text_lines, scene_set_view, scene_view,
+    node_set_text_wrap, node_text_lines, node_set_text_reserve,
+    node_set_min_lines, scene_set_view, scene_view,
     scene_draw_still, scene_draw_live, scene_reflows,
+    node_set_ink, scene_set_cull, scene_culled,
+    Memo, memo_new, memo_clear, memo_hits, memo_misses, scene_attach_memo,
     node_set_grow, node_set_base, node_set_bounds, node_set_align_self,
     node_set_size, node_set_viewport, node_viewport,
     node_set_draw, node_style, node_decl,
@@ -114,6 +117,8 @@ import fui.sheet
 import fui.viewport
 import fui.layer
 import fui.painter
+import fui.theme
+import paint.canvas
 
 // ======================================================= DIE ARTEN
 //
@@ -285,6 +290,26 @@ struct Node {
     wrap: usize,
     avail: f64,
     lines: usize,
+    // RESERVED ROOM (node_set_text_reserve, node_set_min_lines): a paragraph
+    // is as large as this text would make it -- a terminal that types its
+    // lines keeps the room of what is not typed yet -- and at least
+    // `min_lines` lines high.
+    rsv_p: u64,
+    rsv_n: usize,
+    min_lines: usize,
+    // ---- CULLING (docs/APP-TREE.md T10, 4.4)
+    // `ink`: how far a custom painter (node_set_draw) paints past the
+    // node's rectangle, design points; < 0 = it did not say, and such a
+    // node is never skipped. bx0..by1: the ink bounds of the whole
+    // subtree in pixels (cull_bounds), bxf = 1: somewhere in the subtree
+    // is a node whose ink cannot be bounded (a transform, an offset, an
+    // unannounced painter) -- then this node is always painted.
+    ink: f64,
+    bx0: f64,
+    by0: f64,
+    bx1: f64,
+    by1: f64,
+    bxf: u32,
 }
 
 // Der Maler, den ein Knoten hat, solange ihm niemand einen gibt. Er
@@ -334,6 +359,12 @@ struct Scene {
     dmode: u32,
     // how many extra measure + layout rounds the paragraphs cost
     reflows: usize,
+    // culling: 1 = skip subtrees whose ink misses the clip (default);
+    // `culled` counts the skipped subtrees of the last paint
+    cull: u32,
+    culled: usize,
+    // the measure memo (scene_attach_memo), *mut Memo; 0 = none
+    memo: u64,
 }
 
 fn node_blank() -> Node {
@@ -351,13 +382,17 @@ fn node_blank() -> Node {
         dr: draw_none, du: 0, has_dr: 0 as u32, hidden: 0 as u32,
         alpha: 255 as u32, off_x: 0.0, off_y: 0.0, live: 0 as u32,
         wrap: 0, avail: 0.0 - 1.0, lines: 1,
+        rsv_p: 0, rsv_n: 0, min_lines: 0,
+        ink: 0.0 - 1.0, bx0: 0.0, by0: 0.0, bx1: 0.0, by1: 0.0,
+        bxf: 0 as u32,
     }
 }
 
 fn scene_new() -> Scene {
     return Scene { nodes: [node_blank(); 128], n: 0, root: SCENE_NONE,
         phase: PHASE_BUILD, drift: 0, kidof: 0, depthof: 0, nodeof: 0,
-        xfof: 0, limof: 0, view_w: 0, dmode: 0 as u32, reflows: 0 }
+        xfof: 0, limof: 0, view_w: 0, dmode: 0 as u32, reflows: 0,
+        cull: 1 as u32, culled: 0, memo: 0 }
 }
 
 fn scene_reset(sc: *mut Scene) {
@@ -875,6 +910,27 @@ fn node_set_text_wrap(sc: *mut Scene, i: usize, max_lines: usize) {
     (*sc).nodes[i].wrap = max_lines
 }
 
+// RESERVE THE ROOM OF A LONGER TEXT: the paragraph (node_set_text_wrap)
+// measures as if it showed `p[0..n]` -- its width and its lines -- while it
+// paints its own text. A terminal typing a command, a counter running up,
+// a label that will get longer: the page does not jump when it does. The
+// text belongs to the caller, like every text in fUi.
+fn node_set_text_reserve(sc: *mut Scene, i: usize, p: u64, n: usize) {
+    if i >= (*sc).n {
+        return
+    }
+    (*sc).nodes[i].rsv_p = p
+    (*sc).nodes[i].rsv_n = n
+}
+
+// A PARAGRAPH AT LEAST `n` LINES HIGH (CSS min-height in lines).
+fn node_set_min_lines(sc: *mut Scene, i: usize, n: usize) {
+    if i >= (*sc).n {
+        return
+    }
+    (*sc).nodes[i].min_lines = n
+}
+
 // The lines a paragraph got in the last layout (1 for any other node).
 fn node_text_lines(sc: *mut Scene, i: usize) -> usize {
     if i >= (*sc).n {
@@ -1064,9 +1120,23 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         pw = viewport.viewport_w(v)
         ph = viewport.viewport_h(v)
     } else if (*nd).nkids == 0 {
-        render.pref_of(c, &(*nd).e, &pw, &ph)
-        if (*nd).wrap > 0 && widget.w_text_len(&(*nd).e) != 0 {
-            measure_para(sc, c, i, &pw, &ph)
+        if !memo_get(sc, c, i, &pw, &ph) {
+            render.pref_of(c, &(*nd).e, &pw, &ph)
+            if (*nd).rsv_n > 0 {
+                // the room of the whole text, not of the part shown
+                var full: widget.Widget = (*nd).e
+                widget.w_set_text(&full, (*nd).rsv_p, (*nd).rsv_n)
+                var fw: f64 = 0.0
+                var fh: f64 = 0.0
+                render.pref_of(c, &full, &fw, &fh)
+                if fw > pw { pw = fw }
+                if fh > ph { ph = fh }
+            }
+            if (*nd).wrap > 0 && (widget.w_text_len(&(*nd).e) != 0
+                || (*nd).rsv_n > 0) {
+                measure_para(sc, c, i, &pw, &ph)
+            }
+            memo_put(sc, i, pw, ph)
         }
     } else {
         var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
@@ -1155,7 +1225,23 @@ fn measure_para(sc: *mut Scene, c: *mut render.Ctx, i: usize,
         w = (*nd).avail
     }
     var h: f64 = 0.0
-    let n: usize = render.text_lines_at(c, &(*nd).e, w, (*nd).wrap, &h)
+    var n: usize = render.text_lines_at(c, &(*nd).e, w, (*nd).wrap, &h)
+    if (*nd).rsv_n > 0 {
+        var full: widget.Widget = (*nd).e
+        widget.w_set_text(&full, (*nd).rsv_p, (*nd).rsv_n)
+        var fh: f64 = 0.0
+        let fn2: usize = render.text_lines_at(c, &full, w, (*nd).wrap, &fh)
+        if fn2 > n {
+            n = fn2
+            h = fh
+        }
+    }
+    if (*nd).min_lines > n {
+        let pad: f64 = 2.0 * render.pady_of(c, &(*nd).e)
+        let lh: f64 = (h - pad) / (n as f64)
+        h = h + lh * (((*nd).min_lines - n) as f64)
+        n = (*nd).min_lines
+    }
     (*nd).lines = n
     widget.w_set_text_lines(&(*nd).e, n)
     *pw = w
@@ -1286,10 +1372,187 @@ fn box_px(c: *mut render.Ctx, fb: *mut flex.FlexBox) -> flex.FlexBox {
     return b
 }
 
+// ======================================================================
+// THE MEASURE MEMO (docs/APP-TREE.md T10, r100)
+// ======================================================================
+//
+// A tree rebuilt every frame (CodeHub, fui.app) measures every text every
+// frame -- and measuring text is the dearest of the four passes (2.6 of
+// 5.8 us per node, docs/APP-TREE.md 4.3). Almost all of it is the same
+// text in the same style as one frame before. The memo remembers, per
+// node number, WHAT was measured (a fingerprint of everything a leaf's
+// size depends on) and WHAT CAME OUT; a leaf whose fingerprint did not
+// change takes its size from the memo instead of shaping its text again.
+//
+// The fingerprint covers: the widget as a whole (kind, text pointer and
+// length, the resolved style set, the picture, the line limit) with its
+// OUTPUTS (place, preferred size) left out; the text's BYTES (a caller may
+// reuse one buffer for another text); the node's own measure inputs
+// (kind, fixed size, paragraph lines and width); and the context --
+// the theme's shape, the scale, and the font the text is set in. What it
+// does not see: a font slot's file being swapped under the same pointer.
+// Whoever does that calls memo_clear.
+//
+// The memo belongs to the CALLER, like a viewport: it outlives the tree
+// (scene_reset keeps it attached) and costs the kernel profile nothing,
+// which never attaches one. Without it every leaf is measured, as before.
+struct MemoSlot {
+    key: u64,
+    pw: f64,
+    ph: f64,
+    lines: usize,
+}
+
+struct Memo {
+    s: [MemoSlot; 128],
+    hits: usize,
+    misses: usize,
+    // the context fingerprint of the running scene_measure
+    ctx: u64,
+    // the byte size of a widget.Widget and a theme.Shape, measured once
+    wsz: usize,
+    shsz: usize,
+    // the fingerprint of the leaf being measured (memo_get -> memo_put)
+    cur: u64,
+}
+
+fn memo_new() -> Memo {
+    var pw: [widget.Widget; 2] = [widget.widget_new(widget.KIND_NONE); 2]
+    var ps: [theme.Shape; 2] = [theme.shape_osum(); 2]
+    return Memo { s: [MemoSlot { key: 0, pw: 0.0, ph: 0.0, lines: 0 }; 128],
+        hits: 0, misses: 0, ctx: 0,
+        wsz: ((&pw[1]) as u64 - (&pw[0]) as u64) as usize,
+        shsz: ((&ps[1]) as u64 - (&ps[0]) as u64) as usize, cur: 0 }
+}
+
+fn memo_clear(m: *mut Memo) {
+    var i: usize = 0
+    while i < SCENE_MAX {
+        (*m).s[i].key = 0
+        i = i + 1
+    }
+    (*m).hits = 0
+    (*m).misses = 0
+}
+
+fn memo_hits(m: *mut Memo) -> usize { return (*m).hits }
+fn memo_misses(m: *mut Memo) -> usize { return (*m).misses }
+
+// Attach a memo (0 detaches). It stays attached across scene_reset.
+fn scene_attach_memo(sc: *mut Scene, m: *mut Memo) {
+    (*sc).memo = m as u64
+}
+
+fn mix(h: u64, w: u64) -> u64 {
+    var x: u64 = (h ^ w) *% (11400714819323198485 as u64)
+    x = x ^ (x >> 29)
+    return x
+}
+
+fn mix_bytes(h0: u64, p: u64, n: usize) -> u64 {
+    var h: u64 = mix(h0, n as u64)
+    if p == 0 {
+        return h
+    }
+    var k: usize = 0
+    while k + 8 <= n {
+        h = mix(h, *((p + k as u64) as *mut u64))
+        k = k + 8
+    }
+    var t: u64 = 0
+    var sh: u64 = 0
+    while k < n {
+        let byte: u8 = *((p + k as u64) as *mut u8)
+        t = t | ((byte as u64) << sh)
+        sh = sh + 8
+        k = k + 1
+    }
+    return mix(h, t)
+}
+
+fn mix_f64(h: u64, v: f64) -> u64 {
+    var t: f64 = v
+    return mix(h, *(((&t) as u64) as *mut u64))
+}
+
+fn memo_ctx(sc: *mut Scene, c: *mut render.Ctx) {
+    if (*sc).memo == 0 {
+        return
+    }
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    var h: u64 = mix_bytes(7, theme.theme_shape(render.ctx_theme(c)) as u64,
+        (*m).shsz)
+    h = mix_f64(h, render.len_of(c, 1000))
+    h = mix(h, painter.painter_font(render.ctx_painter(c)))
+    h = mix(h, (*sc).view_w as u64)
+    (*m).ctx = h
+}
+
+// The leaf `i` from the memo: true = pw/ph are set and nothing is left
+// to measure. On a miss the fingerprint is kept for memo_put.
+fn memo_get(sc: *mut Scene, c: *mut render.Ctx, i: usize, pw: *mut f64,
+    ph: *mut f64) -> bool {
+    if (*sc).memo == 0 || i >= SCENE_MAX {
+        return false
+    }
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    let nd: *mut Node = &(*sc).nodes[i]
+    // the widget without its outputs
+    var e: widget.Widget = (*nd).e
+    widget.w_place(&e, 0.0, 0.0, 0.0, 0.0)
+    widget.w_set_pref(&e, 0.0, 0.0)
+    var h: u64 = mix_bytes((*m).ctx, (&e) as u64, (*m).wsz)
+    h = mix_bytes(h, widget.w_text(&e), widget.w_text_len(&e))
+    // the font this text is set in (render.font_enter's choice)
+    let sz: *mut style.StyleSet = widget.w_styleset(&e)
+    let fid: usize = style.resolve_num(sz, style.SF_FONT_ID,
+        (*style.styleset_base(sz)).font_id as usize, 0)
+    if fid != 0 {
+        h = mix(h, painter.painter_font_slot(render.ctx_painter(c), fid))
+    }
+    h = mix(h, (*nd).kind as u64)
+    h = mix(h, (*nd).wrap as u64)
+    h = mix_bytes(h, (*nd).rsv_p, (*nd).rsv_n)
+    h = mix(h, (*nd).min_lines as u64)
+    h = mix_f64(h, (*nd).avail)
+    h = mix_f64(h, (*nd).fix_w)
+    h = mix_f64(h, (*nd).fix_h)
+    if h == 0 {
+        h = 1
+    }
+    (*m).cur = h
+    let slot: *mut MemoSlot = &(*m).s[i]
+    if (*slot).key != h {
+        (*m).misses = (*m).misses + 1
+        return false
+    }
+    (*m).hits = (*m).hits + 1
+    *pw = (*slot).pw
+    *ph = (*slot).ph
+    if (*nd).wrap > 0 && widget.w_text_len(&(*nd).e) != 0 {
+        (*nd).lines = (*slot).lines
+        widget.w_set_text_lines(&(*nd).e, (*slot).lines)
+    }
+    return true
+}
+
+fn memo_put(sc: *mut Scene, i: usize, pw: f64, ph: f64) {
+    if (*sc).memo == 0 || i >= SCENE_MAX {
+        return
+    }
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    let slot: *mut MemoSlot = &(*m).s[i]
+    (*slot).key = (*m).cur
+    (*slot).pw = pw
+    (*slot).ph = ph
+    (*slot).lines = (*sc).nodes[i].lines
+}
+
 fn scene_measure(sc: *mut Scene, c: *mut render.Ctx) {
     if (*sc).root == SCENE_NONE {
         return
     }
+    memo_ctx(sc, c)
     // MELDEN STATT SCHREIBEN. Stimmen die Schranken nicht mehr, ist der
     // erste Schreibzugriff in `fill_items` einer hinter das Feld --
     // also wird hier gar nicht erst angefangen.
@@ -1513,6 +1776,15 @@ fn draw_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     if a == 0 as u32 || (*nd).hidden != 0 as u32 {
         return
     }
+    // NOTHING OF IT CAN BE SEEN: its ink bounds miss the clip.
+    if (*sc).cull != 0 as u32 && (*nd).bxf == 0 as u32 {
+        let cv: *mut canvas.Canvas = painter.painter_canvas(render.ctx_painter(c))
+        if (*nd).bx1 <= canvas.clip_x0(cv) || (*nd).bx0 >= canvas.clip_x1(cv)
+        || (*nd).by1 <= canvas.clip_y0(cv) || (*nd).by0 >= canvas.clip_y1(cv) {
+            (*sc).culled = (*sc).culled + 1
+            return
+        }
+    }
     // design points to whole pixels (a text half a pixel off is blurred)
     let k: f64 = render.len_of(c, 1000) / 1000.0
     let dx: f64 = round_px((*nd).off_x * k)
@@ -1546,6 +1818,12 @@ fn shift_tree(sc: *mut Scene, i: usize, dx: f64, dy: f64) {
     let nd: *mut Node = &(*sc).nodes[i]
     (*nd).x = (*nd).x + dx
     (*nd).y = (*nd).y + dy
+    // the ink bounds move with the paint, so a culled test inside a
+    // moved group compares like with like
+    (*nd).bx0 = (*nd).bx0 + dx
+    (*nd).by0 = (*nd).by0 + dy
+    (*nd).bx1 = (*nd).bx1 + dx
+    (*nd).by1 = (*nd).by1 + dy
     widget.w_place(&(*nd).e, widget.w_x(&(*nd).e) + dx,
         widget.w_y(&(*nd).e) + dy, widget.w_w(&(*nd).e), widget.w_h(&(*nd).e))
     var k: usize = (*nd).first
@@ -1631,6 +1909,7 @@ fn scene_draw_subtree(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     if i == SCENE_NONE || i >= (*sc).n {
         return
     }
+    cull_bounds(sc, c)
     draw_node(sc, c, i)
 }
 
@@ -1651,6 +1930,7 @@ fn scene_draw_live(sc: *mut Scene, c: *mut render.Ctx) {
     if (*sc).root == SCENE_NONE {
         return
     }
+    cull_bounds(sc, c)
     live_walk(sc, c, (*sc).root)
 }
 
@@ -1679,9 +1959,110 @@ fn scene_draw(sc: *mut Scene, c: *mut render.Ctx) {
     }
     (*sc).drift = 0
     (*sc).xfof = 0
+    cull_bounds(sc, c)
     draw_node(sc, c, (*sc).root)
     (*sc).phase = PHASE_DRAW
 }
+
+// ======================================================================
+// CULLING: WHAT CANNOT BE SEEN IS NOT PAINTED (docs/APP-TREE.md 4.4)
+// ======================================================================
+//
+// Before a paint every subtree gets its INK BOUNDS: its rectangle grown
+// by how far its paint may reach past it, joined with its children's.
+// draw_node skips a subtree whose bounds miss the canvas clip -- a
+// scrolled-away list row, a card below the window. The picture stays the
+// same octets (tools/fui/dom_main.fi paints both ways and compares).
+//
+// HOW FAR PAINT REACHES PAST A RECTANGLE: 40 points for the focus ring,
+// a text's overhang and the theme's drop shadow (plus twice its blur
+// radius), plus what the style adds -- a box shadow's lift and twice its
+// blur, a text shadow's offset, an outline. Some paint cannot be bounded
+// here at all: a transform (it moves the node anywhere), an offset
+// (node_set_offset; it shifts during the paint), and a custom painter
+// that did not announce its overflow (node_set_ink). Such a node is
+// always painted, and so is every ancestor of it -- its own children
+// can still be skipped.
+//
+// The fold runs from the back: a child always has a higher number than
+// its parent (scene_add appends), so one pass sees every child first.
+fn ink_margin(sc: *mut Scene, c: *mut render.Ctx, nd: *mut Node) -> f64 {
+    let fo: *mut theme.Shape = theme.theme_shape(render.ctx_theme(c))
+    var m: f64 = 40.0 + 2.0 * ((*fo).shadow_r as f64)
+    let st: *mut style.Style = widget.w_style(&(*nd).e)
+    if ((*st).set_mask & style.SF_BOX_SHADOW) != 0 as u32 {
+        var lift: f64 = (*st).bs_lift as f64
+        if lift < 0.0 {
+            lift = 0.0 - lift
+        }
+        m = m + lift + 2.0 * ((*st).bs_blur as f64)
+    }
+    var sx: f64 = (*st).sh_dx as f64
+    var sy: f64 = (*st).sh_dy as f64
+    if sx < 0.0 { sx = 0.0 - sx }
+    if sy < 0.0 { sy = 0.0 - sy }
+    if sy > sx { sx = sy }
+    m = m + sx + ((*st).out_w as f64)
+    if (*nd).has_dr != 0 as u32 && (*nd).ink > 0.0 {
+        m = m + (*nd).ink
+    }
+    return m * render.len_of(c, 1000) / 1000.0
+}
+
+fn cull_bounds(sc: *mut Scene, c: *mut render.Ctx) {
+    (*sc).culled = 0
+    if (*sc).cull == 0 as u32 {
+        return
+    }
+    var k: usize = 0
+    while k < (*sc).n {
+        let nd: *mut Node = &(*sc).nodes[k]
+        let m: f64 = ink_margin(sc, c, nd)
+        (*nd).bx0 = (*nd).x - m
+        (*nd).by0 = (*nd).y - m
+        (*nd).bx1 = (*nd).x + (*nd).w + m
+        (*nd).by1 = (*nd).y + (*nd).h + m
+        (*nd).bxf = 0 as u32
+        if ((*nd).has_dr != 0 as u32 && (*nd).ink < 0.0)
+            || (*nd).off_x != 0.0 || (*nd).off_y != 0.0
+            || sheet.decl_has(&(*nd).d,
+            sheet.EX_TRANSLATE | sheet.EX_SCALE | sheet.EX_ROTATE, true) {
+            (*nd).bxf = 1 as u32
+        }
+        k = k + 1
+    }
+    var i: usize = (*sc).n
+    while i > 0 {
+        i = i - 1
+        let nd: *mut Node = &(*sc).nodes[i]
+        let p: usize = (*nd).parent
+        if p != SCENE_NONE && p < i {
+            let pn: *mut Node = &(*sc).nodes[p]
+            if (*nd).bx0 < (*pn).bx0 { (*pn).bx0 = (*nd).bx0 }
+            if (*nd).by0 < (*pn).by0 { (*pn).by0 = (*nd).by0 }
+            if (*nd).bx1 > (*pn).bx1 { (*pn).bx1 = (*nd).bx1 }
+            if (*nd).by1 > (*pn).by1 { (*pn).by1 = (*nd).by1 }
+            if (*nd).bxf != 0 as u32 { (*pn).bxf = 1 as u32 }
+        }
+    }
+}
+
+// HOW FAR A CUSTOM PAINTER (node_set_draw) PAINTS PAST THE NODE, design
+// points. Without this call such a node is never culled.
+fn node_set_ink(sc: *mut Scene, i: usize, pts: f64) {
+    if i >= (*sc).n {
+        return
+    }
+    (*sc).nodes[i].ink = pts
+}
+
+// Culling on (the default) or off -- off paints every node, as before.
+fn scene_set_cull(sc: *mut Scene, on: bool) {
+    if on { (*sc).cull = 1 as u32 } else { (*sc).cull = 0 as u32 }
+}
+
+// How many subtrees the last paint skipped.
+fn scene_culled(sc: *mut Scene) -> usize { return (*sc).culled }
 
 // ======================================================================
 // TREFFER UND SUCHE

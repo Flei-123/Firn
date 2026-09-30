@@ -1,0 +1,647 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/query.fi -- FINDING THINGS IN THE TREE (docs/APP-TREE.md T2, T5).
+//
+// ======================================================== WHY IT EXISTS
+//
+// A test, a script, an inspector or an AI agent asks the same questions a
+// web page answers with `querySelectorAll` and Playwright's `getByRole`:
+// "the button called Save", "every checkbox inside a card", "the node with
+// the key settings/network/save". Before this module every program walked
+// lib/fui/scene.fi by hand, and node NUMBERS were the only handle -- and a
+// number changes whenever the tree is rebuilt.
+//
+// This module gives three things, and builds nothing twice:
+//
+//   1. STABLE KEYS. A node's key is its id (scene.node_set_id): a name
+//      turned into a number by sheet.sheet_name, so `key("save")` is the
+//      same number in every build of every program. The KEY PATH of a node
+//      is the keys of its keyed ancestors plus its own --
+//      "settings/network/save" -- and that is the automation id: it
+//      survives a rebuild, a number does not. Keys must be unique among
+//      the keyed nodes under the same keyed ancestor; `query_key_dups`
+//      counts every violation (like scene_node_overflow counts refused
+//      nodes), and tools/fui/run.sh wants it at 0.
+//      `query_keep` / `query_restore` carry the focus, the hovered, the
+//      pressed and the dragged control of a control.Panel across a
+//      rebuild by key path (reconciliation, Flutter-style).
+//   2. QUERY BY SELECTOR. `query_sel` takes a sheet.Sel -- the very
+//      selector type a stylesheet rule has -- and asks sheet.sel_match,
+//      the stylesheet's own matcher. Whatever a stylesheet can select, a
+//      query finds.
+//   3. QUERY BY TEXT, for scripts and agents:
+//
+//          button[name="Save"]        role + accessible name (exact)
+//          textbox[name*="mail"]      name contains
+//          .card checkbox             descendant, class
+//          #save   #settings #save    key, key under key
+//          button:focused             states: focused disabled checked
+//                                     selected expanded collapsed
+//                                     pressed readonly secret
+//          *                          any node
+//
+//      The type is the ACCESSIBILITY ROLE (lib/fui/a11y.fi), not the
+//      widget kind: an agent sees "button", whether it was drawn as a
+//      tile or a button. Names come from a11y_name, so a query sees what
+//      a screen reader hears -- and a secret field's value is never part
+//      of any name (a11y.a11y_is_secret), so no query can find a password
+//      by its text.
+//
+// Nothing here allocates: a query is parsed into a fixed array on the
+// stack, results go into the caller's array of usize, and the answer is
+// always the FULL count (more than `cap` means the array was too small).
+export {
+    Kept, query_key, query_key_path, query_key_hash, query_find_hash,
+    query_find_path, query_key_dups, query_keep, query_restore,
+    query_sel, query_role_name, query_text, query_str, query_first_str,
+    QUERY_PART_MAX, query_parse_ok,
+}
+
+import fui.scene
+import fui.sheet
+import fui.widget
+import fui.control
+import fui.a11y
+
+// How many compounds a text query may chain ("a b c d ..."), and how many
+// classes one compound may name.
+const QUERY_PART_MAX: usize = 8
+const PART_CLS_MAX: usize = 4
+const NAME_BUF: usize = 256
+const NAME_EXACT: u32 = 1
+const NAME_HAS: u32 = 2
+
+// ======================================================= 1. KEYS
+
+// THE KEY OF A NAME -- the same number sheet.sheet_name gives a class.
+fn query_key(p: u64, n: usize) -> u32 {
+    return sheet.sheet_name(p, n)
+}
+
+// The nearest keyed ancestor of `i` (not `i` itself), or SCENE_NONE.
+fn keyed_parent(sc: *mut scene.Scene, i: usize) -> usize {
+    var p: usize = scene.scene_parent(sc, i)
+    while p != scene.SCENE_NONE && p < scene.scene_count(sc) {
+        if scene.node_id(sc, p) != 0 as u32 {
+            return p
+        }
+        p = scene.scene_parent(sc, p)
+    }
+    return scene.SCENE_NONE
+}
+
+// THE KEY PATH AS ONE NUMBER: the keys of the keyed ancestors and the
+// node's own, root first, folded with FNV-1a. Two nodes with the same
+// path have the same number in every rebuild. 0 = the node has no key.
+fn query_key_hash(sc: *mut scene.Scene, i: usize) -> u64 {
+    if i >= scene.scene_count(sc) || scene.node_id(sc, i) == 0 as u32 {
+        return 0
+    }
+    var keys: [u32; 32] = [0 as u32; 32]
+    var n: usize = 0
+    var j: usize = i
+    while j != scene.SCENE_NONE && n < 32 {
+        keys[n] = scene.node_id(sc, j)
+        n = n + 1
+        j = keyed_parent(sc, j)
+    }
+    var h: u64 = 14695981039346656037 as u64
+    while n > 0 {
+        n = n - 1
+        h = fold(h, keys[n])
+    }
+    if h == 0 {
+        h = 1
+    }
+    return h
+}
+
+// FNV-1a over the four bytes of `k`, 64 bits (wrapping on purpose: `*%`).
+fn fold(h0: u64, k: u32) -> u64 {
+    var h: u64 = h0
+    var b: usize = 0
+    while b < 4 {
+        h = h ^ (((k >> ((b * 8) as u32)) & (255 as u32)) as u64)
+        h = h *% (1099511628211 as u64)
+        b = b + 1
+    }
+    return h
+}
+
+// The node whose key path has the number `h`, or SCENE_NONE.
+fn query_find_hash(sc: *mut scene.Scene, h: u64) -> usize {
+    if h == 0 {
+        return scene.SCENE_NONE
+    }
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if scene.node_id(sc, i) != 0 as u32 && query_key_hash(sc, i) == h {
+            return i
+        }
+        i = i + 1
+    }
+    return scene.SCENE_NONE
+}
+
+// THE NODE WITH THE KEY PATH "a/b/c" (the names, not the numbers).
+fn query_find_path(sc: *mut scene.Scene, p: u64, n: usize) -> usize {
+    var h: u64 = 14695981039346656037 as u64
+    var a: usize = 0
+    var k: usize = 0
+    var parts: usize = 0
+    while k <= n {
+        var end: bool = k == n
+        if !end {
+            end = *((p + k as u64) as *mut u8) == 47 as u8
+        }
+        if end {
+            if k > a {
+                h = fold(h, sheet.sheet_name(p + a as u64, k - a))
+                parts = parts + 1
+            }
+            a = k + 1
+        }
+        k = k + 1
+    }
+    if parts == 0 {
+        return scene.SCENE_NONE
+    }
+    if h == 0 {
+        h = 1
+    }
+    return query_find_hash(sc, h)
+}
+
+// THE KEY PATH AS NUMBERS, root first, into `out` (u32, at most `cap`).
+// A key is a hash; the text form is the caller's (it knows its names).
+fn query_key_path(sc: *mut scene.Scene, i: usize, out: u64,
+    cap: usize) -> usize {
+    if i >= scene.scene_count(sc) || scene.node_id(sc, i) == 0 as u32 {
+        return 0
+    }
+    var keys: [u32; 32] = [0 as u32; 32]
+    var n: usize = 0
+    var j: usize = i
+    while j != scene.SCENE_NONE && n < 32 {
+        keys[n] = scene.node_id(sc, j)
+        n = n + 1
+        j = keyed_parent(sc, j)
+    }
+    var k: usize = 0
+    while k < n && k < cap {
+        *((out + (k * 4) as u64) as *mut u32) = keys[n - 1 - k]
+        k = k + 1
+    }
+    return n
+}
+
+// HOW MANY KEYS ARE NOT UNIQUE: every keyed node whose key an EARLIER
+// keyed node under the same keyed ancestor already has counts once. 0 =
+// every key path names exactly one node.
+fn query_key_dups(sc: *mut scene.Scene) -> usize {
+    var d: usize = 0
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        let k: u32 = scene.node_id(sc, i)
+        if k != 0 as u32 {
+            let pi: usize = keyed_parent(sc, i)
+            var j: usize = 0
+            var seen: bool = false
+            while j < i && !seen {
+                if scene.node_id(sc, j) == k && keyed_parent(sc, j) == pi {
+                    seen = true
+                }
+                j = j + 1
+            }
+            if seen {
+                d = d + 1
+            }
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ================================================ RECONCILING A PANEL
+//
+// A tree rebuilt every frame gets new numbers whenever something is added
+// in front. What the user holds -- the focus, the pressed button, the
+// slider being dragged -- must stay with the SAME control. `query_keep`
+// writes the key paths of the four down before the rebuild,
+// `query_restore` finds them again afterwards. A control without a key
+// cannot be followed and is let go (NOBODY), which is the honest answer.
+struct Kept {
+    focus: u64,
+    hot: u64,
+    press: u64,
+    track: u64,
+}
+
+fn slot_hash(sc: *mut scene.Scene, i: usize) -> u64 {
+    if i >= scene.scene_count(sc) {
+        return 0
+    }
+    return query_key_hash(sc, i)
+}
+
+fn query_keep(sc: *mut scene.Scene, pn: *mut control.Panel) -> Kept {
+    return Kept {
+        focus: slot_hash(sc, control.panel_focus(pn)),
+        hot: slot_hash(sc, control.panel_hot(pn)),
+        press: slot_hash(sc, control.panel_pressed(pn)),
+        track: slot_hash(sc, control.track_widget(pn)),
+    }
+}
+
+// After the rebuild (and scene_bind_panel): the four again, by key.
+// Returns how many of the kept ones were found.
+fn query_restore(sc: *mut scene.Scene, pn: *mut control.Panel,
+    k: *mut Kept) -> usize {
+    var found: usize = 0
+    let f: usize = query_find_hash(sc, (*k).focus)
+    let h: usize = query_find_hash(sc, (*k).hot)
+    let p: usize = query_find_hash(sc, (*k).press)
+    let t: usize = query_find_hash(sc, (*k).track)
+    control.panel_restore(pn, f, h, p, t)
+    if f != scene.SCENE_NONE { found = found + 1 }
+    if h != scene.SCENE_NONE { found = found + 1 }
+    if p != scene.SCENE_NONE { found = found + 1 }
+    if t != scene.SCENE_NONE { found = found + 1 }
+    return found
+}
+
+// ============================================ 2. QUERY BY SELECTOR
+
+fn sel_walk(sc: *mut scene.Scene, s: *mut sheet.Sel, i: usize,
+    chain: *mut sheet.NodeDesc, depth: usize, out: u64, cap: usize,
+    n: *mut usize) {
+    if i == scene.SCENE_NONE || i >= scene.scene_count(sc) {
+        return
+    }
+    if depth >= sheet.CHAIN_MAX {
+        return
+    }
+    *((chain as u64 + (depth * sheet.sheet_desc_stride()) as u64)
+        as *mut sheet.NodeDesc) = scene.scene_desc(sc, i)
+    if sheet.sel_match(s, chain, depth + 1) {
+        put_hit(out, cap, n, i)
+    }
+    var c: usize = scene.scene_first_child(sc, i)
+    while c != scene.SCENE_NONE {
+        sel_walk(sc, s, c, chain, depth + 1, out, cap, n)
+        c = scene.scene_next_sibling(sc, c)
+    }
+}
+
+fn put_hit(out: u64, cap: usize, n: *mut usize, i: usize) {
+    if *n < cap {
+        *((out + (*n * 8) as u64) as *mut usize) = i
+    }
+    *n = *n + 1
+}
+
+// EVERY NODE THE SELECTOR MATCHES, in tree order, into `out` (usize, at
+// most `cap`). The answer is the full count.
+fn query_sel(sc: *mut scene.Scene, s: *mut sheet.Sel, out: u64,
+    cap: usize) -> usize {
+    var chain: [sheet.NodeDesc; 16] =
+    [sheet.desc_new(0 as u32, 0 as u32); 16]
+    var n: usize = 0
+    sel_walk(sc, s, scene.scene_root(sc), &chain[0], 0, out, cap, &n)
+    return n
+}
+
+// EVERY NODE WITH THIS ROLE (a11y.ROLE_*, ROLE_NONE = any) AND THIS
+// ACCESSIBLE NAME (n == 0 = any name), in tree order -- getByRole.
+fn query_role_name(sc: *mut scene.Scene, ax: *mut a11y.A11y, role: u32,
+    p: u64, pn: usize, out: u64, cap: usize) -> usize {
+    var part: Part = part_new()
+    part.role = role
+    if pn > 0 {
+        part.np = p
+        part.nn = pn
+        part.nop = NAME_EXACT
+    }
+    var n: usize = 0
+    var i: usize = 0
+    while i < scene.scene_count(sc) {
+        if part_match(sc, ax, &part, i) {
+            put_hit(out, cap, &n, i)
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ================================================ 3. QUERY BY TEXT
+
+struct Part {
+    any: u32,       // 1 = "*" or nothing but classes/keys/states
+    role: u32,      // a11y.ROLE_NONE = any
+    key: u32,       // 0 = any
+    cls: [u32; 4],
+    ncls: usize,
+    np: u64,        // the name to compare, in the caller's query text
+    nn: usize,
+    nop: u32,       // 0 = no name test, NAME_EXACT, NAME_HAS
+    st: u32,        // a11y.ST_* that must all be set
+}
+
+fn part_new() -> Part {
+    return Part { any: 1 as u32, role: a11y.ROLE_NONE, key: 0 as u32,
+        cls: [0 as u32; 4], ncls: 0, np: 0, nn: 0, nop: 0 as u32,
+        st: 0 as u32 }
+}
+
+fn ch(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn is_word(b: u8) -> bool {
+    return (b >= 97 as u8 && b <= 122 as u8) || (b >= 65 as u8 && b <= 90 as u8)
+        || (b >= 48 as u8 && b <= 57 as u8) || b == 95 as u8 || b == 45 as u8
+}
+
+fn same(a: u64, an: usize, b: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var k: usize = 0
+    while k < an {
+        if ch(a, k) != ch(b, k) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// The role called `p[0..n]`, or ROLE_COUNT when there is none.
+fn role_by_name(p: u64, n: usize) -> u32 {
+    var buf: [u8; 16] = [0 as u8; 16]
+    var r: u32 = 0 as u32
+    while r < a11y.ROLE_COUNT {
+        let m: usize = a11y.a11y_role_name(r, (&buf[0]) as u64, 16)
+        if same((&buf[0]) as u64, m, p, n) {
+            return r
+        }
+        r = r + 1 as u32
+    }
+    return a11y.ROLE_COUNT
+}
+
+fn state_by_name(p: u64, n: usize) -> u32 {
+    var t: [u8; 108] = "focused     disabled    checked     selected    expanded    collapsed   pressed     readonly    secret      "
+    var bits: [u32; 9] = [a11y.ST_FOCUSED, a11y.ST_DISABLED, a11y.ST_CHECKED,
+        a11y.ST_SELECTED, a11y.ST_EXPANDED, a11y.ST_COLLAPSED,
+        a11y.ST_PRESSED, a11y.ST_READONLY, a11y.ST_SECRET]
+    var k: usize = 0
+    while k < 9 {
+        var m: usize = 0
+        while m < 12 && t[k * 12 + m] != 32 as u8 {
+            m = m + 1
+        }
+        if same((&t[k * 12]) as u64, m, p, n) {
+            return bits[k]
+        }
+        k = k + 1
+    }
+    return 0 as u32
+}
+
+// PARSE the query into `parts`; the answer is the number of compounds,
+// 0 = the query is not understood (an unknown role or state, a bad
+// bracket, too many parts). A query that is not understood finds NOTHING
+// -- it must never find everything.
+fn parse(q: u64, qn: usize, parts: *mut Part) -> usize {
+    var np: usize = 0
+    var i: usize = 0
+    while i < qn {
+        while i < qn && ch(q, i) == 32 as u8 {
+            i = i + 1
+        }
+        if i >= qn {
+            break
+        }
+        if np >= QUERY_PART_MAX {
+            return 0
+        }
+        var pt: Part = part_new()
+        var took: bool = false
+        while i < qn && ch(q, i) != 32 as u8 {
+            let b: u8 = ch(q, i)
+            if b == 42 as u8 {
+                // *
+                i = i + 1
+                took = true
+            } else if is_word(b) {
+                let a: usize = i
+                while i < qn && is_word(ch(q, i)) {
+                    i = i + 1
+                }
+                let r: u32 = role_by_name(q + a as u64, i - a)
+                if r == a11y.ROLE_COUNT {
+                    return 0
+                }
+                pt.role = r
+                pt.any = 0 as u32
+                took = true
+            } else if b == 46 as u8 || b == 35 as u8 {
+                // .class or #key
+                i = i + 1
+                let a: usize = i
+                while i < qn && is_word(ch(q, i)) {
+                    i = i + 1
+                }
+                if i == a {
+                    return 0
+                }
+                let h: u32 = sheet.sheet_name(q + a as u64, i - a)
+                if b == 46 as u8 {
+                    if pt.ncls >= PART_CLS_MAX {
+                        return 0
+                    }
+                    pt.cls[pt.ncls] = h
+                    pt.ncls = pt.ncls + 1
+                } else {
+                    pt.key = h
+                }
+                took = true
+            } else if b == 58 as u8 {
+                // :state
+                i = i + 1
+                let a: usize = i
+                while i < qn && is_word(ch(q, i)) {
+                    i = i + 1
+                }
+                let s: u32 = state_by_name(q + a as u64, i - a)
+                if s == 0 as u32 {
+                    return 0
+                }
+                pt.st = pt.st | s
+                took = true
+            } else if b == 91 as u8 {
+                // [name="..."] or [name*="..."]
+                var nm: [u8; 4] = "name"
+                if i + 5 > qn || !same(q + (i + 1) as u64, 4, (&nm[0]) as u64, 4) {
+                    return 0
+                }
+                i = i + 5
+                var op: u32 = NAME_EXACT
+                if i < qn && ch(q, i) == 42 as u8 {
+                    op = NAME_HAS
+                    i = i + 1
+                }
+                if i + 1 >= qn || ch(q, i) != 61 as u8 || ch(q, i + 1) != 34 as u8 {
+                    return 0
+                }
+                i = i + 2
+                let a: usize = i
+                while i < qn && ch(q, i) != 34 as u8 {
+                    i = i + 1
+                }
+                if i + 1 >= qn || ch(q, i + 1) != 93 as u8 {
+                    return 0
+                }
+                pt.np = q + a as u64
+                pt.nn = i - a
+                pt.nop = op
+                i = i + 2
+                took = true
+            } else {
+                return 0
+            }
+        }
+        if !took {
+            return 0
+        }
+        *((parts as u64 + (np * part_stride()) as u64) as *mut Part) = pt
+        np = np + 1
+    }
+    return np
+}
+
+fn part_stride() -> usize {
+    var probe: [Part; 2] = [part_new(); 2]
+    return ((&probe[1]) as u64 - (&probe[0]) as u64) as usize
+}
+
+fn part_at(parts: *mut Part, k: usize) -> *mut Part {
+    return (parts as u64 + (k * part_stride()) as u64) as *mut Part
+}
+
+// IS THIS QUERY UNDERSTOOD? For a script that wants to tell "not found"
+// from "not understood".
+fn query_parse_ok(q: str) -> bool {
+    var parts: [Part; 8] = [part_new(); 8]
+    return parse(q.p as u64, q.n, &parts[0]) > 0
+}
+
+fn contains(h: u64, hn: usize, nd: u64, nn: usize) -> bool {
+    if nn == 0 {
+        return true
+    }
+    var a: usize = 0
+    while a + nn <= hn {
+        if same(h + a as u64, nn, nd, nn) {
+            return true
+        }
+        a = a + 1
+    }
+    return false
+}
+
+fn part_match(sc: *mut scene.Scene, ax: *mut a11y.A11y, pt: *mut Part,
+    i: usize) -> bool {
+    if (*pt).role != a11y.ROLE_NONE && a11y.a11y_role(sc, ax, i) != (*pt).role {
+        return false
+    }
+    if (*pt).key != 0 as u32 && scene.node_id(sc, i) != (*pt).key {
+        return false
+    }
+    var k: usize = 0
+    while k < (*pt).ncls {
+        if !scene.node_has_class(sc, i, (*pt).cls[k]) {
+            return false
+        }
+        k = k + 1
+    }
+    if (*pt).st != 0 as u32
+        && (a11y.a11y_state(sc, ax, i) & (*pt).st) != (*pt).st {
+        return false
+    }
+    if (*pt).nop != 0 as u32 {
+        var buf: [u8; 256] = [0 as u8; 256]
+        var m: usize = a11y.a11y_name(sc, ax, i, (&buf[0]) as u64, NAME_BUF)
+        if m > NAME_BUF {
+            m = NAME_BUF
+        }
+        if (*pt).nop == NAME_EXACT {
+            return same((&buf[0]) as u64, m, (*pt).np, (*pt).nn)
+        }
+        return contains((&buf[0]) as u64, m, (*pt).np, (*pt).nn)
+    }
+    return true
+}
+
+// Does the chain of compounds 0..k-1 match ancestors of `i`, right to
+// left, nearest first (the CSS descendant combinator)?
+fn anc_match(sc: *mut scene.Scene, ax: *mut a11y.A11y, parts: *mut Part,
+    k: usize, i: usize) -> bool {
+    if k == 0 {
+        return true
+    }
+    var a: usize = scene.scene_parent(sc, i)
+    while a != scene.SCENE_NONE && a < scene.scene_count(sc) {
+        if part_match(sc, ax, part_at(parts, k - 1), a)
+            && anc_match(sc, ax, parts, k - 1, a) {
+            return true
+        }
+        a = scene.scene_parent(sc, a)
+    }
+    return false
+}
+
+// EVERY NODE THE TEXT QUERY `q[0..qn]` FINDS, in tree order.
+fn query_text(sc: *mut scene.Scene, ax: *mut a11y.A11y, q: u64, qn: usize,
+    out: u64, cap: usize) -> usize {
+    var parts: [Part; 8] = [part_new(); 8]
+    let np: usize = parse(q, qn, &parts[0])
+    if np == 0 {
+        return 0
+    }
+    var n: usize = 0
+    // tree order: a node's children come after it in the walk
+    walk_text(sc, ax, &parts[0], np, scene.scene_root(sc), out, cap, &n, 0)
+    return n
+}
+
+fn walk_text(sc: *mut scene.Scene, ax: *mut a11y.A11y, parts: *mut Part,
+    np: usize, i: usize, out: u64, cap: usize, n: *mut usize, depth: usize) {
+    if i == scene.SCENE_NONE || i >= scene.scene_count(sc) || depth > 64 {
+        return
+    }
+    if part_match(sc, ax, part_at(parts, np - 1), i)
+        && anc_match(sc, ax, parts, np - 1, i) {
+        put_hit(out, cap, n, i)
+    }
+    var c: usize = scene.scene_first_child(sc, i)
+    while c != scene.SCENE_NONE {
+        walk_text(sc, ax, parts, np, c, out, cap, n, depth + 1)
+        c = scene.scene_next_sibling(sc, c)
+    }
+}
+
+fn query_str(sc: *mut scene.Scene, ax: *mut a11y.A11y, q: str, out: u64,
+    cap: usize) -> usize {
+    return query_text(sc, ax, q.p as u64, q.n, out, cap)
+}
+
+// The first node the query finds, or SCENE_NONE.
+fn query_first_str(sc: *mut scene.Scene, ax: *mut a11y.A11y,
+    q: str) -> usize {
+    var one: [usize; 1] = [0; 1]
+    if query_str(sc, ax, q, (&one[0]) as u64, 1) == 0 {
+        return scene.SCENE_NONE
+    }
+    return one[0]
+}

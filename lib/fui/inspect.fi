@@ -1,0 +1,529 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/inspect.fi -- THE INSPECTOR (docs/APP-TREE.md T9, r97).
+//
+// ======================================================== WHY IT EXISTS
+//
+// A browser has its developer tools, GTK its GtkInspector, WPF Snoop,
+// Flutter its DevTools: point at something on the screen and see what it
+// IS -- its box, its role and name, where its colour comes from -- and
+// change a value and see the result at once. For a fUi program that was
+// guessing: the tree existed, but nobody could look into it while the
+// program ran.
+//
+// This module is that inspector, inside the process, on the one tree:
+//
+//   inspect_pick     the node under a point -- the deepest painted node,
+//                    also a box or a text that takes no clicks (scene_hit
+//                    only finds what can be clicked).
+//   inspect_text     what it is, as text: node, kind, key path, role, name,
+//                    state, rectangle, classes; every stylesheet rule that
+//                    matches it with its specificity; and every resolved
+//                    style value with the rule that WON it (or "inherited").
+//                    A secret field stays secret here too: its text is
+//                    never written (a11y.a11y_is_secret, T8).
+//   inspect_draw     the overlay: the box tinted and outlined, a chip above
+//                    it with role, name and size.
+//   inspect_set_*    live editing: a value of a rule changes in the
+//                    stylesheet; the next scene_style shows it everywhere
+//                    the rule applies. The theme's accent likewise.
+//
+// A remote view (another process, an agent) gets inspect_text only -- a
+// read-only description; editing is for the program's own developer.
+export {
+    inspect_pick, inspect_text, inspect_draw,
+    inspect_set_bg, inspect_set_fg, inspect_set_radius, inspect_set_pad,
+    inspect_set_font, inspect_set_accent, inspect_rules_of,
+}
+
+import fui.scene
+import fui.sheet
+import fui.style
+import fui.theme
+import fui.widget
+import fui.render
+import fui.painter
+import fui.a11y
+import fui.query
+
+// ================================================================ PICK
+
+fn pick_node(sc: *mut scene.Scene, i: usize, x: f64, y: f64,
+    depth: usize) -> usize {
+    if i == scene.SCENE_NONE || i >= scene.scene_count(sc) || depth > 64 {
+        return scene.SCENE_NONE
+    }
+    if scene.node_hidden(sc, i) {
+        return scene.SCENE_NONE
+    }
+    let nx: f64 = scene.node_x(sc, i)
+    let ny: f64 = scene.node_y(sc, i)
+    if x < nx || y < ny || x >= nx + scene.node_w(sc, i)
+        || y >= ny + scene.node_h(sc, i) {
+        return scene.SCENE_NONE
+    }
+    // the LAST child under the point was painted last, so it is on top
+    var best: usize = scene.SCENE_NONE
+    var c: usize = scene.scene_first_child(sc, i)
+    while c != scene.SCENE_NONE {
+        let h: usize = pick_node(sc, c, x, y, depth + 1)
+        if h != scene.SCENE_NONE {
+            best = h
+        }
+        c = scene.scene_next_sibling(sc, c)
+    }
+    if best != scene.SCENE_NONE {
+        return best
+    }
+    return i
+}
+
+// THE NODE UNDER THE POINT, or SCENE_NONE.
+fn inspect_pick(sc: *mut scene.Scene, x: f64, y: f64) -> usize {
+    return pick_node(sc, scene.scene_root(sc), x, y, 0)
+}
+
+// ============================================================== OUTPUT
+
+struct Out {
+    p: u64,
+    cap: usize,
+    n: usize,
+}
+
+fn put(o: *mut Out, b: u8) {
+    if (*o).n < (*o).cap {
+        *(((*o).p + (*o).n as u64) as *mut u8) = b
+    }
+    (*o).n = (*o).n + 1
+}
+
+fn put_s(o: *mut Out, s: str) {
+    var k: usize = 0
+    while k < s.n {
+        put(o, *((s.p as u64 + k as u64) as *mut u8))
+        k = k + 1
+    }
+}
+
+fn put_bytes(o: *mut Out, p: u64, n: usize) {
+    var k: usize = 0
+    while k < n {
+        put(o, *((p + k as u64) as *mut u8))
+        k = k + 1
+    }
+}
+
+fn put_dec(o: *mut Out, v0: i64) {
+    var v: i64 = v0
+    if v < 0 {
+        put(o, 45 as u8)
+        v = 0 - v
+    }
+    var d: [u8; 20] = [0 as u8; 20]
+    var n: usize = 0
+    if v == 0 {
+        d[0] = 48 as u8
+        n = 1
+    }
+    while v > 0 {
+        d[n] = (48 + v % 10) as u8
+        v = v / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        put(o, d[n])
+    }
+}
+
+fn put_hex(o: *mut Out, v: u64, digits: usize) {
+    var k: usize = digits
+    while k > 0 {
+        k = k - 1
+        let q: u64 = (v >> ((k * 4) as u64)) & (15 as u64)
+        if q < 10 {
+            put(o, (48 + q) as u8)
+        } else {
+            put(o, (87 + q) as u8)
+        }
+    }
+}
+
+// ============================================================ THE RULES
+
+// The chain of `i` (root first) into `chain`; its length, 0 = too deep.
+fn chain_of(sc: *mut scene.Scene, i: usize, chain: *mut sheet.NodeDesc) -> usize {
+    var up: [usize; 16] = [0; 16]
+    var n: usize = 0
+    var j: usize = i
+    while j != scene.SCENE_NONE && j < scene.scene_count(sc) {
+        if n >= sheet.CHAIN_MAX {
+            return 0
+        }
+        up[n] = j
+        n = n + 1
+        j = scene.scene_parent(sc, j)
+    }
+    var k: usize = 0
+    while k < n {
+        *((chain as u64 + (k * sheet.sheet_desc_stride()) as u64)
+            as *mut sheet.NodeDesc) = scene.scene_desc(sc, up[n - 1 - k])
+        k = k + 1
+    }
+    return n
+}
+
+// THE RULES THAT MATCH NODE `i`, in stylesheet order, into `out` (usize,
+// at most `cap`); the answer is the full count.
+fn inspect_rules_of(sc: *mut scene.Scene, sh: *mut sheet.Sheet, i: usize,
+    out: u64, cap: usize) -> usize {
+    var chain: [sheet.NodeDesc; 16] = [sheet.desc_new(0 as u32, 0 as u32); 16]
+    let d: usize = chain_of(sc, i, &chain[0])
+    if d == 0 {
+        return 0
+    }
+    var n: usize = 0
+    var r: usize = 0
+    while r < sheet.sheet_count(sh) {
+        if sheet.sheet_match(sh, r, &chain[0], d) {
+            if n < cap {
+                *((out + (n * 8) as u64) as *mut usize) = r
+            }
+            n = n + 1
+        }
+        r = r + 1
+    }
+    return n
+}
+
+// The names of the style bits, in bit order (SF_BG = bit 0 ...).
+fn prop_name(o: *mut Out, bit: usize) {
+    var t: [u8; 324] = "bg          border      fg          border-w    radius      pad-x       pad-y       font-px     weight      slant       align       alpha       font-id     tracking    word-space  line-height kerning     outline     shadow      gradient    width       height      direction   bg-grad     box-shadow  bg-glow     fluid       "
+    if bit >= 27 {
+        put_s(o, "?")
+        return
+    }
+    var k: usize = 0
+    while k < 12 && t[bit * 12 + k] != 32 as u8 {
+        put(o, t[bit * 12 + k])
+        k = k + 1
+    }
+}
+
+// The value of one style bit, as the style holds it.
+fn prop_value(o: *mut Out, s: *mut style.Style, bit: usize) {
+    if bit == 0 {
+        put_col(o, (*s).bg)
+    } else if bit == 1 {
+        put_col(o, (*s).border)
+    } else if bit == 2 {
+        put_col(o, (*s).fg)
+    } else if bit == 3 {
+        put_dec(o, (*s).border_w as i64)
+    } else if bit == 4 {
+        put_dec(o, (*s).radius as i64)
+    } else if bit == 5 {
+        put_dec(o, (*s).pad_x as i64)
+    } else if bit == 6 {
+        put_dec(o, (*s).pad_y as i64)
+    } else if bit == 7 {
+        put_dec(o, (*s).font_px as i64)
+    } else if bit == 8 {
+        put_dec(o, (*s).weight as i64)
+    } else if bit == 12 {
+        put_dec(o, (*s).font_id as i64)
+    } else if bit == 20 {
+        put_dec(o, (*s).width as i64)
+    } else if bit == 21 {
+        put_dec(o, (*s).height as i64)
+    } else {
+        put_s(o, "set")
+    }
+}
+
+fn put_col(o: *mut Out, c: u32) {
+    if style.color_is_token(c) {
+        put_s(o, "token:")
+        put_dec(o, style.color_value(c) as i64)
+        return
+    }
+    put(o, 35 as u8)
+    put_hex(o, style.color_value(c) as u64, 6)
+}
+
+// ========================================================= DESCRIPTION
+
+// WHAT NODE `i` IS, as lines of text into `p` (length `cap`); the answer
+// is the full length. `sh` may be 0 (no stylesheet: no rule lines).
+fn inspect_text(sc: *mut scene.Scene, ax: *mut a11y.A11y,
+    sh: *mut sheet.Sheet, i: usize, p: u64, cap: usize) -> usize {
+    var o: Out = Out { p: p, cap: cap, n: 0 }
+    if i >= scene.scene_count(sc) {
+        put_s(&o, "no node\n")
+        return o.n
+    }
+    // --- identity
+    put_s(&o, "node ")
+    put_dec(&o, i as i64)
+    let k: u32 = scene.node_kind(sc, i)
+    put_s(&o, " kind=")
+    if k == scene.N_BOX { put_s(&o, "box") }
+    if k == scene.N_TEXT { put_s(&o, "text") }
+    if k == scene.N_IMAGE { put_s(&o, "image") }
+    if k == scene.N_SVG { put_s(&o, "svg") }
+    if k == scene.N_WIDGET {
+        put_s(&o, "widget:")
+        put_dec(&o, widget.w_kind(scene.node_widget(sc, i)) as i64)
+    }
+    if k == scene.N_VIEWPORT { put_s(&o, "viewport") }
+    var keys: [u32; 16] = [0 as u32; 16]
+    let kn: usize = query.query_key_path(sc, i, (&keys[0]) as u64, 16)
+    if kn > 0 {
+        put_s(&o, " key=")
+        var q: usize = 0
+        while q < kn && q < 16 {
+            if q > 0 {
+                put(&o, 47 as u8)
+            }
+            put(&o, 35 as u8)
+            put_hex(&o, keys[q] as u64, 8)
+            q = q + 1
+        }
+    }
+    put(&o, 10 as u8)
+    // --- accessibility: role, name, state
+    put_s(&o, "  role=")
+    var rb: [u8; 16] = [0 as u8; 16]
+    let rn: usize = a11y.a11y_role_name(a11y.a11y_role(sc, ax, i), (&rb[0]) as u64, 16)
+    put_bytes(&o, (&rb[0]) as u64, rn)
+    put_s(&o, " name=\"")
+    var nb: [u8; 128] = [0 as u8; 128]
+    var nn: usize = a11y.a11y_name(sc, ax, i, (&nb[0]) as u64, 128)
+    if nn > 128 {
+        nn = 128
+    }
+    put_bytes(&o, (&nb[0]) as u64, nn)
+    put_s(&o, "\"")
+    let st: u32 = a11y.a11y_state(sc, ax, i)
+    if (st & a11y.ST_FOCUSED) != 0 as u32 { put_s(&o, " focused") }
+    if (st & a11y.ST_DISABLED) != 0 as u32 { put_s(&o, " disabled") }
+    if (st & a11y.ST_CHECKED) != 0 as u32 { put_s(&o, " checked") }
+    if (st & a11y.ST_SELECTED) != 0 as u32 { put_s(&o, " selected") }
+    if (st & a11y.ST_SECRET) != 0 as u32 { put_s(&o, " secret") }
+    put(&o, 10 as u8)
+    // --- the text: written only when it is not a secret
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    if widget.w_text_len(e) > 0 {
+        if a11y.a11y_is_secret(sc, i) {
+            put_s(&o, "  text=(secret, not shown)\n")
+        } else {
+            put_s(&o, "  text=\"")
+            var tn: usize = widget.w_text_len(e)
+            if tn > 80 {
+                tn = 80
+            }
+            put_bytes(&o, widget.w_text(e), tn)
+            put_s(&o, "\"\n")
+        }
+    }
+    // --- the box
+    put_s(&o, "  box @")
+    put_dec(&o, scene.node_x(sc, i) as i64)
+    put(&o, 44 as u8)
+    put_dec(&o, scene.node_y(sc, i) as i64)
+    put(&o, 32 as u8)
+    put_dec(&o, scene.node_w(sc, i) as i64)
+    put(&o, 120 as u8)
+    put_dec(&o, scene.node_h(sc, i) as i64)
+    put_s(&o, " pref ")
+    put_dec(&o, scene.node_pref_w(sc, i) as i64)
+    put(&o, 120 as u8)
+    put_dec(&o, scene.node_pref_h(sc, i) as i64)
+    put_s(&o, " classes=")
+    put_dec(&o, scene.node_class_count(sc, i) as i64)
+    put(&o, 10 as u8)
+    if sh as u64 == 0 {
+        return o.n
+    }
+    // --- the rules that match, and who wins each value
+    var rules: [usize; 64] = [0; 64]
+    var rn2: usize = inspect_rules_of(sc, sh, i, (&rules[0]) as u64, 64)
+    if rn2 > 64 {
+        rn2 = 64
+    }
+    var q2: usize = 0
+    while q2 < rn2 {
+        let r: usize = rules[q2]
+        put_s(&o, "  rule #")
+        put_dec(&o, r as i64)
+        put_s(&o, " specificity=")
+        put_dec(&o, sheet.sel_specificity(sheet.sheet_sel(sh, r)))
+        put_s(&o, " sets")
+        let m: u32 = (*sheet.decl_style(sheet.sheet_decl(sh, r))).set_mask
+        var b: usize = 0
+        while b < 27 {
+            if (m & ((1 as u32) << (b as u32))) != 0 as u32 {
+                put(&o, 32 as u8)
+                prop_name(&o, b)
+            }
+            b = b + 1
+        }
+        put(&o, 10 as u8)
+        q2 = q2 + 1
+    }
+    let fs: *mut style.Style = widget.w_style(e)
+    var b2: usize = 0
+    while b2 < 27 {
+        let bit: u32 = (1 as u32) << (b2 as u32)
+        if ((*fs).set_mask & bit) != 0 as u32 {
+            // the winner: the highest (specificity, order) that sets it
+            var win: usize = sheet.RULE_MAX
+            var wspec: i64 = 0 - 1
+            var q3: usize = 0
+            while q3 < rn2 {
+                let r: usize = rules[q3]
+                let sp: i64 = sheet.sel_specificity(sheet.sheet_sel(sh, r))
+                let m2: u32 = (*sheet.decl_style(sheet.sheet_decl(sh, r))).set_mask
+                if (m2 & bit) != 0 as u32 && (sp > wspec || (sp == wspec && r > win)) {
+                    win = r
+                    wspec = sp
+                }
+                q3 = q3 + 1
+            }
+            put_s(&o, "  ")
+            prop_name(&o, b2)
+            put(&o, 61 as u8)
+            prop_value(&o, fs, b2)
+            if win == sheet.RULE_MAX {
+                put_s(&o, "  (inherited)\n")
+            } else {
+                put_s(&o, "  (rule #")
+                put_dec(&o, win as i64)
+                put_s(&o, ")\n")
+            }
+        }
+        b2 = b2 + 1
+    }
+    return o.n
+}
+
+// ============================================================ OVERLAY
+
+// THE OVERLAY over node `i`: the box tinted in the accent, outlined, and
+// a chip above it (below, when there is no room) with role, name, size.
+fn inspect_draw(sc: *mut scene.Scene, ax: *mut a11y.A11y, c: *mut render.Ctx,
+    i: usize) {
+    if i >= scene.scene_count(sc) {
+        return
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let acc: u32 = theme.color_from_token(render.ctx_theme(c), style.TOK_ACCENT)
+    let x: f64 = scene.node_x(sc, i)
+    let y: f64 = scene.node_y(sc, i)
+    let w: f64 = scene.node_w(sc, i)
+    let h: f64 = scene.node_h(sc, i)
+    let tint: u32 = (acc & (16777215 as u32)) | (1073741824 as u32)
+    painter.round_rect(z, x, y, w, h, 0.0, tint)
+    let lw: f64 = render.len_of(c, 2)
+    let line: u32 = (acc & (16777215 as u32)) | (4278190080 as u32)
+    painter.round_rect(z, x, y, w, lw, 0.0, line)
+    painter.round_rect(z, x, y + h - lw, w, lw, 0.0, line)
+    painter.round_rect(z, x, y, lw, h, 0.0, line)
+    painter.round_rect(z, x + w - lw, y, lw, h, 0.0, line)
+    // the chip text: role "name" WxH
+    var tb: [u8; 160] = [0 as u8; 160]
+    var o: Out = Out { p: (&tb[0]) as u64, cap: 160, n: 0 }
+    var rb: [u8; 16] = [0 as u8; 16]
+    let rn: usize = a11y.a11y_role_name(a11y.a11y_role(sc, ax, i), (&rb[0]) as u64, 16)
+    put_bytes(&o, (&rb[0]) as u64, rn)
+    var nb: [u8; 96] = [0 as u8; 96]
+    var nn: usize = a11y.a11y_name(sc, ax, i, (&nb[0]) as u64, 96)
+    if nn > 96 {
+        nn = 96
+    }
+    if nn > 0 {
+        put_s(&o, " \"")
+        put_bytes(&o, (&nb[0]) as u64, nn)
+        put_s(&o, "\"")
+    }
+    put(&o, 32 as u8)
+    put_dec(&o, w as i64)
+    put(&o, 120 as u8)
+    put_dec(&o, h as i64)
+    var n: usize = o.n
+    if n > 160 {
+        n = 160
+    }
+    var chip: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+    widget.w_set_text(&chip, (&tb[0]) as u64, n)
+    var cs: style.Style = style.style_new()
+    cs = style.style_set_bg(cs, style.color_literal(line))
+    cs = style.style_set_fg(cs, style.color_literal(4294967295 as u32))
+    cs = style.style_set_pad(cs, 6, 3)
+    cs = style.style_set_radius(cs, 4)
+    *widget.w_style(&chip) = cs
+    var pw: f64 = 0.0
+    var ph: f64 = 0.0
+    render.pref_of(c, &chip, &pw, &ph)
+    var cy: f64 = y - ph - lw
+    if cy < 0.0 {
+        cy = y + h + lw
+    }
+    widget.w_place(&chip, x, cy, pw, ph)
+    render.draw_widget(c, &chip)
+}
+
+// ========================================================= LIVE EDITING
+//
+// Each changes ONE value of rule `r` in the stylesheet; the next
+// scene_style applies it wherever the rule matches. False = no such rule.
+
+fn rule_style(sh: *mut sheet.Sheet, r: usize) -> *mut style.Style {
+    return sheet.decl_style(sheet.sheet_decl(sh, r))
+}
+
+fn inspect_set_bg(sh: *mut sheet.Sheet, r: usize, col: u32) -> bool {
+    if r >= sheet.sheet_count(sh) {
+        return false
+    }
+    *rule_style(sh, r) = style.style_set_bg(*rule_style(sh, r), style.color_literal(col))
+    return true
+}
+
+fn inspect_set_fg(sh: *mut sheet.Sheet, r: usize, col: u32) -> bool {
+    if r >= sheet.sheet_count(sh) {
+        return false
+    }
+    *rule_style(sh, r) = style.style_set_fg(*rule_style(sh, r), style.color_literal(col))
+    return true
+}
+
+fn inspect_set_radius(sh: *mut sheet.Sheet, r: usize, v: usize) -> bool {
+    if r >= sheet.sheet_count(sh) {
+        return false
+    }
+    *rule_style(sh, r) = style.style_set_radius(*rule_style(sh, r), v)
+    return true
+}
+
+fn inspect_set_pad(sh: *mut sheet.Sheet, r: usize, x: usize, y: usize) -> bool {
+    if r >= sheet.sheet_count(sh) {
+        return false
+    }
+    *rule_style(sh, r) = style.style_set_pad(*rule_style(sh, r), x, y)
+    return true
+}
+
+fn inspect_set_font(sh: *mut sheet.Sheet, r: usize, px: usize) -> bool {
+    if r >= sheet.sheet_count(sh) {
+        return false
+    }
+    let cur: *mut style.Style = rule_style(sh, r)
+    *cur = style.style_set_font(*cur, (*cur).font_id as usize, px)
+    return true
+}
+
+// The theme's accent, live (theme.theme_set_accent derives the rest).
+fn inspect_set_accent(m: *mut theme.Theme, col: u32) {
+    theme.theme_set_accent(m, col)
+}
