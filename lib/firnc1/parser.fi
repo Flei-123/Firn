@@ -2341,6 +2341,12 @@ fn basic_expr(p: *mut Parser) -> u32 {
 
 fn basic_expr_at(p: *mut Parser) -> u32 {
     let a: u32 = kind(p, 0)
+    // ROUND FUI-ALL (include.rs): `__include_str("file")` is the text of
+    // a file next to the SOURCE file, as a `str` literal.
+    if a == A_IDENT && kind(p, 1) == A_LPAREN && kind(p, 2) == A_STR
+    && kind(p, 3) == A_RPAREN && is_include_str(p) {
+        return include_str(p)
+    }
     // HOOK ifexpr: `if c { a } else { b }` AS AN EXPRESSION. The `if`
     // STATEMENT is caught in `stmt_inner` before this and never arrives here.
     if a == A_KWIF {
@@ -3943,6 +3949,9 @@ fn extensions_search(p: *mut Parser) {
                         // the runner itself (`--test`) is firnc0's, and this
                         // stage compiles a marked function as an ordinary one.
                         var tw: [u8; 4] = "test"
+                        // ROUND FUI-ALL: plus `#[inline]` / `#[no_inline]`.
+                        var inw: [u8; 6] = "inline"
+                        var niw: [u8; 9] = "no_inline"
                         let anr: u32 = lexer.lex_nr(lx(p), i + 2)
                         let itn: *mut intern.Interner = lexer.lex_names(lx(p))
                         ok_attr = intern.intern_equal(itn, anr, (&an[0]) as u64, 5) ||
@@ -3952,7 +3961,9 @@ fn extensions_search(p: *mut Parser) {
                         intern.intern_equal(itn, anr, (&esw[0]) as u64, 12) ||
                         intern.intern_equal(itn, anr, (&phw[0]) as u64, 13) ||
                         intern.intern_equal(itn, anr, (&tw[0]) as u64, 4) ||
-                        intern.intern_equal(itn, anr, (&ec[0]) as u64, 8)
+                        intern.intern_equal(itn, anr, (&ec[0]) as u64, 8) ||
+                        intern.intern_equal(itn, anr, (&inw[0]) as u64, 6) ||
+                        intern.intern_equal(itn, anr, (&niw[0]) as u64, 9)
                     }
                 }
             }
@@ -4016,10 +4027,9 @@ fn extensions_search(p: *mut Parser) {
             // Round GAPS (include.rs): `__include_str` reads a file relative
             // to the SOURCE file -- this parser does not know that path.
             var incw: [u8; 13] = "__include_str"
-            if intern.intern_equal(lexer.lex_names(lx(p)), lexer.lex_nr(lx(p), i), (&incw[0]) as u64, 13) {
-                (*p).not_core = true
-                return
-            }
+            // ROUND FUI-ALL: ported (`include_str` below) -- core now.
+            let _incw_known: bool = intern.intern_equal(lexer.lex_names(lx(p)),
+                lexer.lex_nr(lx(p), i), (&incw[0]) as u64, 13)
             if gc_nr >= 0 && nr == gc_nr {
                 // ROUND 34: `gc`/`gc class`/`gc C{}` belong to the core language
                 // as soon as the gc registry is registered (the same
@@ -4698,7 +4708,17 @@ fn attr(p: *mut Parser) {
     // ROUND ARM-FREESTANDING (archsel.rs): `#[arch(x86_64)]` -- this
     // definition belongs to ONE machine. Exactly one argument, an identifier.
     var arw: [u8; 4] = "arch"
+    // ROUND FUI-ALL (attrs.rs, round EINBETTEN): `#[inline]` and
+    // `#[no_inline]` -- hints for firnc0's inliner, 0 arguments. This stage
+    // does not inline across functions, so both are accepted and leave
+    // nothing in the tree; before, a file with either one made the whole
+    // program "not core" (exit 3, no message), which is how fUi's canvas.fi
+    // kept every fUi program away from firnc1 (fUi r90).
+    var inw: [u8; 6] = "inline"
+    var niw: [u8; 9] = "no_inline"
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let is_inl: bool = intern.intern_equal(it, tok_nr(p, 0), (&inw[0]) as u64, 6) ||
+    intern.intern_equal(it, tok_nr(p, 0), (&niw[0]) as u64, 9)
     let is_nogc: bool = intern.intern_equal(it, tok_nr(p, 0), (&an[0]) as u64, 5)
     let is_mc: bool = intern.intern_equal(it, tok_nr(p, 0), (&mc[0]) as u64, 12)
     let is_int: bool = intern.intern_equal(it, tok_nr(p, 0), (&iw[0]) as u64, 9)
@@ -4710,7 +4730,7 @@ fn attr(p: *mut Parser) {
     let is_test: bool = intern.intern_equal(it, tok_nr(p, 0), (&tw[0]) as u64, 4)
     let is_arch: bool = intern.intern_equal(it, tok_nr(p, 0), (&arw[0]) as u64, 4)
     if !is_nogc && !is_mc && !is_int && !is_fp && !is_link && !is_export && !is_esc && !is_ph
-    && !is_test && !is_arch {
+    && !is_test && !is_arch && !is_inl {
         complain(p)
         return
     }
@@ -4771,6 +4791,9 @@ fn attr(p: *mut Parser) {
         (*p).int_pending = 1
     } else if is_ph {
         (*p).ph_pending = 1
+    } else if is_inl {
+        // A hint only (see above): nothing to record.
+        (*p).nogc_pending = (*p).nogc_pending
     } else if is_test {
         // ROUND 94: `#[test]` marks a case for `firnc --test`. This stage has
         // no test mode, so nothing of it is left in the tree -- the function
@@ -4970,4 +4993,75 @@ fn par_run(p: *mut Parser) {
         // statement in front of which the text segments could be hoisted.
         complain(p)
     }
+}
+
+// ------------------------------------------------------------ __include_str
+//
+// ROUND FUI-ALL, the stage-1 half of compiler/src/include.rs. The path is
+// taken RELATIVE TO THE DIRECTORY OF THE FILE BEING PARSED -- the same rule
+// as firnc0 -- and the file's bytes become an ordinary text literal, so
+// everything after the parser sees `"...contents..."`. Before this, a file
+// that used it made the whole program "not core" (exit 3), and fUi's
+// gpu.fi (the shader sources) uses it: no fUi program could be built by
+// firnc1 (fUi r90).
+fn is_include_str(p: *mut Parser) -> bool {
+    var incw: [u8; 13] = "__include_str"
+    return intern.intern_equal(lexer.lex_names(lx(p)), tok_nr(p, 0),
+        (&incw[0]) as u64, 13)
+}
+
+fn include_str(p: *mut Parser) -> u32 {
+    next_bump(p) // __include_str
+    next_bump(p) // (
+    let k: usize = tok_nr(p, 0) as usize
+    var path: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&path)
+    // the directory of the current file, with its slash
+    var fname: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&fname)
+    lexer.lex_file_name(lx(p), &fname)
+    let fp: u64 = rt.buf_ptr(&fname)
+    var cut: usize = 0
+    var j: usize = 0
+    while j < rt.buf_len(&fname) {
+        if *((fp + j as u64) as *mut u8) == 47 as u8 {
+            cut = j + 1
+        }
+        j = j + 1
+    }
+    let n: usize = lexer.lex_lit_len(lx(p), k)
+    var abs: bool = false
+    if n > 0 && lexer.lex_lit_byte(lx(p), k, 0) == 47 as u8 {
+        abs = true
+    }
+    if !abs {
+        rt.buf_push_bytes(&path, fp, cut)
+    }
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&path, lexer.lex_lit_byte(lx(p), k, i))
+        i = i + 1
+    }
+    rt.buf_push(&path, 0 as u8)
+    next_bump(p) // "file"
+    expect(p, A_RPAREN)
+    var body: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&body)
+    if !rt.read_file(rt.buf_ptr(&path), &body) {
+        complain(p)
+        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    var tmp: Vec[u32] = vec_new[u32]()
+    let bp: u64 = rt.buf_ptr(&body)
+    let bn: usize = rt.buf_len(&body)
+    var q: usize = 0
+    while q < bn {
+        vec_push[u32](&tmp, ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0,
+            (*((bp + q as u64) as *mut u8)) as u64))
+        q = q + 1
+    }
+    let off: u32 = list_store(p, &tmp)
+    vec_free[u32](&tmp)
+    let alit: u32 = ast.expr_new(par_tree(p), ast.E_ALIT, 0, off, bn as u32, 0)
+    return ast.expr_new(par_tree(p), ast.E_TEXT, alit, 0, 0, 0)
 }
