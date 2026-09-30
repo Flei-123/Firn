@@ -438,18 +438,26 @@ echo "== 18l. DER SEITEN-LOOK: VERLAUF, LICHT, SCHATTEN, FLUIDE SCHRIFT, ABSAETZ
 "$W/pagelook"
 
 echo
-echo "== 18m. THE APP TREE: SECRETS, KEYS, QUERIES, CULLING (docs/APP-TREE.md) =="
-# tools/fui/dom_main.fi: a password never leaves the process (canary),
-# key paths survive a rebuild, queries by selector / role + name / text,
-# culling paints the same octets, the inspector. tools/fui/apptree_main.fi
-# is the measurement behind docs/APP-TREE.md; here it runs short (3
-# rounds, the 128-node cap) so that it keeps building and every tree it
-# builds stays complete -- its numbers are not judged here.
+echo "== 18m. DER APP-BAUM: SZENE ALS DOM, EINMAL KURZ DURCHGEMESSEN =="
+# tools/fui/apptree_main.fi (docs/APP-TREE.md): gallery9 und kuenstliche
+# Baeume bis 128 Knoten -- bauen, stylen, messen, legen, malen, treffen,
+# abfragen, vorlesen. Hier nur EINE Runde: laufen muss es und jeder Knoten
+# braucht einen Namen (unnamed=0); die Zahlen misst tools/fui/apptree.sh.
+"$FIRNC" --opt-level=release-fast -o "$W/apptree" tools/fui/apptree_main.fi
+"$W/apptree" 128 1 > "$W/apptree.log" || { cat "$W/apptree.log"; echo "  FAIL: apptree"; exit 1; }
+n=$(grep -c '^apptree tree=' "$W/apptree.log" || true)
+bad=$(grep '^apptree tree=' "$W/apptree.log" | grep -vc ' unnamed=0 ' || true)
+[ "$n" -ge 2 ] && [ "$bad" = 0 ] || { cat "$W/apptree.log"; echo "  FAIL: apptree ($n Baeume, $bad mit Knoten ohne Namen)"; exit 1; }
+echo "  APP-BAUM OK: $n Baeume, jeder Knoten hat einen Namen"
+echo
+echo "== 18n. THE APP TREE: SECRETS, KEYS, QUERIES, CULLING, MEMO, INSPECTOR =="
+# tools/fui/dom_main.fi (docs/APP-TREE.md 7): a password never leaves the
+# process (canary, not even its length), key paths survive a rebuild,
+# queries by selector / role + name / text, culling paints the same
+# octets, the measure memo gives the same sizes, the inspector picks,
+# describes (without secrets) and edits live.
 build dom
 "$W/dom"
-build apptree
-"$W/apptree" 128 3 > "$W/apptree.txt"
-echo "  apptree: $(grep -c '^apptree tree=' "$W/apptree.txt") trees measured, all complete  OK"
 
 echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="

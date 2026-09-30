@@ -80,8 +80,7 @@ export {
     node_set_wrap, node_set_flexitem, node_set_hidden, node_hidden,
     scene_draw_subtree,
     node_set_opacity, node_set_offset, node_set_live, node_live,
-    node_set_text_wrap, node_text_lines, node_set_text_reserve,
-    node_set_min_lines, scene_set_view, scene_view,
+    node_set_text_wrap, node_text_lines, node_set_text_reserve, scene_set_view, scene_view,
     scene_draw_still, scene_draw_live, scene_reflows,
     node_set_ink, scene_set_cull, scene_culled,
     Memo, memo_new, memo_clear, memo_hits, memo_misses, scene_attach_memo,
@@ -290,13 +289,10 @@ struct Node {
     wrap: usize,
     avail: f64,
     lines: usize,
-    // RESERVED ROOM (node_set_text_reserve, node_set_min_lines): a paragraph
-    // is as large as this text would make it -- a terminal that types its
-    // lines keeps the room of what is not typed yet -- and at least
-    // `min_lines` lines high.
-    rsv_p: u64,
-    rsv_n: usize,
-    min_lines: usize,
+    // ROOM FOR A TEXT NOT SHOWN YET (node_set_text_reserve): measured as
+    // if it showed `res_p`/`res_n`, painted with its own text
+    res_p: u64,
+    res_n: usize,
     // ---- CULLING (docs/APP-TREE.md T10, 4.4)
     // `ink`: how far a custom painter (node_set_draw) paints past the
     // node's rectangle, design points; < 0 = it did not say, and such a
@@ -381,8 +377,7 @@ fn node_blank() -> Node {
         x: 0.0, y: 0.0, w: 0.0, h: 0.0, vp: 0,
         dr: draw_none, du: 0, has_dr: 0 as u32, hidden: 0 as u32,
         alpha: 255 as u32, off_x: 0.0, off_y: 0.0, live: 0 as u32,
-        wrap: 0, avail: 0.0 - 1.0, lines: 1,
-        rsv_p: 0, rsv_n: 0, min_lines: 0,
+        wrap: 0, avail: 0.0 - 1.0, lines: 1, res_p: 0, res_n: 0,
         ink: 0.0 - 1.0, bx0: 0.0, by0: 0.0, bx1: 0.0, by1: 0.0,
         bxf: 0 as u32,
     }
@@ -518,7 +513,14 @@ fn scene_add(sc: *mut Scene, parent: usize, kind: u32) -> usize {
         return SCENE_NONE
     }
     let i: usize = (*sc).n
+    // A PARAGRAPH REMEMBERS ITS WIDTH ACROSS scene_reset. A program that
+    // describes its tree anew every frame builds the same node in the same
+    // slot; the width the last layout gave it is the best first guess, so
+    // the frame needs no extra measure + layout round (scene_reflows = 0).
+    // Only a hint: para_widths checks it after the layout like any width.
+    let hint: f64 = (*sc).nodes[i].avail
     (*sc).nodes[i] = node_blank()
+    (*sc).nodes[i].avail = hint
     (*sc).nodes[i].kind = kind
     (*sc).nodes[i].parent = parent
     // Eine Art bekommt ihren Traeger: ein Text ist eine Beschriftung,
@@ -910,25 +912,18 @@ fn node_set_text_wrap(sc: *mut Scene, i: usize, max_lines: usize) {
     (*sc).nodes[i].wrap = max_lines
 }
 
-// RESERVE THE ROOM OF A LONGER TEXT: the paragraph (node_set_text_wrap)
-// measures as if it showed `p[0..n]` -- its width and its lines -- while it
-// paints its own text. A terminal typing a command, a counter running up,
-// a label that will get longer: the page does not jump when it does. The
-// text belongs to the caller, like every text in fUi.
+// ROOM FOR THE WHOLE TEXT while only a part of it shows -- a terminal
+// that types, a counter that runs up, a text that streams in. The node is
+// MEASURED with (p, n) (its width, and as a paragraph its lines and
+// height) and PAINTED with its own text, so nothing around it moves while
+// the shown part grows. (p, n) should start with the shown text. n = 0
+// ends the reservation.
 fn node_set_text_reserve(sc: *mut Scene, i: usize, p: u64, n: usize) {
     if i >= (*sc).n {
         return
     }
-    (*sc).nodes[i].rsv_p = p
-    (*sc).nodes[i].rsv_n = n
-}
-
-// A PARAGRAPH AT LEAST `n` LINES HIGH (CSS min-height in lines).
-fn node_set_min_lines(sc: *mut Scene, i: usize, n: usize) {
-    if i >= (*sc).n {
-        return
-    }
-    (*sc).nodes[i].min_lines = n
+    (*sc).nodes[i].res_p = p
+    (*sc).nodes[i].res_n = n
 }
 
 // The lines a paragraph got in the last layout (1 for any other node).
@@ -1120,23 +1115,21 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         pw = viewport.viewport_w(v)
         ph = viewport.viewport_h(v)
     } else if (*nd).nkids == 0 {
+        // a reserved text is measured in place of the shown one
+        let sp: u64 = widget.w_text(&(*nd).e)
+        let sn: usize = widget.w_text_len(&(*nd).e)
+        if (*nd).res_n > 0 {
+            widget.w_set_text(&(*nd).e, (*nd).res_p, (*nd).res_n)
+        }
         if !memo_get(sc, c, i, &pw, &ph) {
             render.pref_of(c, &(*nd).e, &pw, &ph)
-            if (*nd).rsv_n > 0 {
-                // the room of the whole text, not of the part shown
-                var full: widget.Widget = (*nd).e
-                widget.w_set_text(&full, (*nd).rsv_p, (*nd).rsv_n)
-                var fw: f64 = 0.0
-                var fh: f64 = 0.0
-                render.pref_of(c, &full, &fw, &fh)
-                if fw > pw { pw = fw }
-                if fh > ph { ph = fh }
-            }
-            if (*nd).wrap > 0 && (widget.w_text_len(&(*nd).e) != 0
-                || (*nd).rsv_n > 0) {
+            if (*nd).wrap > 0 && widget.w_text_len(&(*nd).e) != 0 {
                 measure_para(sc, c, i, &pw, &ph)
             }
             memo_put(sc, i, pw, ph)
+        }
+        if (*nd).res_n > 0 {
+            widget.w_set_text(&(*nd).e, sp, sn)
         }
     } else {
         var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
@@ -1225,23 +1218,7 @@ fn measure_para(sc: *mut Scene, c: *mut render.Ctx, i: usize,
         w = (*nd).avail
     }
     var h: f64 = 0.0
-    var n: usize = render.text_lines_at(c, &(*nd).e, w, (*nd).wrap, &h)
-    if (*nd).rsv_n > 0 {
-        var full: widget.Widget = (*nd).e
-        widget.w_set_text(&full, (*nd).rsv_p, (*nd).rsv_n)
-        var fh: f64 = 0.0
-        let fn2: usize = render.text_lines_at(c, &full, w, (*nd).wrap, &fh)
-        if fn2 > n {
-            n = fn2
-            h = fh
-        }
-    }
-    if (*nd).min_lines > n {
-        let pad: f64 = 2.0 * render.pady_of(c, &(*nd).e)
-        let lh: f64 = (h - pad) / (n as f64)
-        h = h + lh * (((*nd).min_lines - n) as f64)
-        n = (*nd).min_lines
-    }
+    let n: usize = render.text_lines_at(c, &(*nd).e, w, (*nd).wrap, &h)
     (*nd).lines = n
     widget.w_set_text_lines(&(*nd).e, n)
     *pw = w
@@ -1512,8 +1489,6 @@ fn memo_get(sc: *mut Scene, c: *mut render.Ctx, i: usize, pw: *mut f64,
     }
     h = mix(h, (*nd).kind as u64)
     h = mix(h, (*nd).wrap as u64)
-    h = mix_bytes(h, (*nd).rsv_p, (*nd).rsv_n)
-    h = mix(h, (*nd).min_lines as u64)
     h = mix_f64(h, (*nd).avail)
     h = mix_f64(h, (*nd).fix_w)
     h = mix_f64(h, (*nd).fix_h)
