@@ -44,8 +44,17 @@ python3 examples/codehub/bundle.py codehub.html       # ONE file, opens from dis
   `scene.scene_draw_subtree`): paint the still part once, then only the
   moving parts on top of the copy.
 
-What the page does itself (and fUi could take over later): the baked
-background band, the fluid headline size, counting lines for wrapped text.
+## And since 30.09.2026
+
+- **Page look as styles**: gradients, glow and box shadow (`style.fi`), a
+  fluid font size (`style_set_font_fluid`), baked still layers (`layer.fi`),
+  opacity and offset for whole groups (`node_set_opacity/offset`).
+- **Paragraphs** (`scene.node_set_text_wrap`): fUi breaks and sizes them;
+  a rebuilt tree keeps each paragraph's last width, so a frame needs no
+  extra layout round.
+- **Reserved text** (`scene.node_set_text_reserve`): the terminal's lines
+  are measured for the whole text while only the typed part shows -- the
+  card keeps its size while it types. The page counts no lines itself.
 
 ## Measured (29.09.2026, one core, software rasteriser, machine shared)
 
