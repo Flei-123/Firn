@@ -111,6 +111,26 @@ Platforms: Linux (X11, spoken directly without Xlib), Windows (Win32),
 Android (NativeActivity + EGL/GLES), and the browser (`wasm32-browser`,
 canvas or WebGL). `lib/plat/fuiwin.fi` connects fUi to a window.
 
+The quickest way in is `fui.app` ([docs/fui-quickstart.md](docs/fui-quickstart.md)):
+a window with a label and a button is ten lines, and the same file builds as
+an X11 program and as a browser page (`--target=wasm32-browser`). `fui.app`
+has no Windows or Android host yet; there, use `lib/plat/fuiwin.fi` directly.
+
+```firn
+import fui.app
+
+fn close(a: *mut app.App) {
+    app.quit(a)
+}
+
+fn main() -> i32 {
+    let a: *mut app.App = app.window("Test Window", 400, 250)
+    app.label(a, "Hello, this is a test window!", 16)
+    app.button(a, "Close", close)
+    return app.run(a)
+}
+```
+
 ## Example: phone remote
 
 [examples/phone_remote](examples/phone_remote) turns a phone into a touchpad
