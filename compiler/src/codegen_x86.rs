@@ -296,6 +296,12 @@ pub(crate) fn block_label(fname: &str, b: u32) -> String {
     format!(".L{}__bb{}", fname.replace('#', "."), b)
 }
 
+/// `FIRN_FUNCTION_SECTIONS=1` and no variable debug info (see `emit`).
+pub fn function_sections() -> bool {
+    !dwarf::with_variables()
+        && std::env::var("FIRN_FUNCTION_SECTIONS").map(|v| v == "1").unwrap_or(false)
+}
+
 pub fn emit(m: &Module) -> Result<String, String> {
     crate::fpool::reset();
     let mut e = Emitter {
@@ -369,8 +375,33 @@ pub fn emit(m: &Module) -> Result<String, String> {
         return Err("no entry point: 'fn main() -> i32' is missing".to_string());
     }
 
+    // ROUND FUI-ALL (OrientOS): ONE SECTION PER FUNCTION, on request.
+    //
+    // x86 has no pruning of unreachable functions (the wasm backend has,
+    // codegen_wasm.rs section 2): every function of every imported module
+    // lands in the object. With `FIRN_FUNCTION_SECTIONS=1` each function
+    // (and its cold half, which `flush_cold` writes right behind it) goes
+    // into `.text.<symbol>`, so `ld --gc-sections` can drop what nothing
+    // references -- the linker follows the relocations, so calls, function
+    // values (records in .rodata), switch tables and names in inline asm
+    // all keep their targets. Measured on OrientOS `settings` after the fUi
+    // update: see docs/FUI-ALL.md there. Off by default -- the assembly is
+    // byte for byte what it was -- and off with variable debug info, whose
+    // unit range (`.Ltext_end - start`) has to lie in one section.
+    let fsec = !freestanding && function_sections();
+    // Byte range of every function (with its cold half) in `e.out`, for
+    // the pruning below.
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(m.funcs.len());
     for f in &m.funcs {
+        let start = e.out.len();
+        if fsec {
+            e.raw(&format!(".section .text.{},\"ax\",@progbits", label(&f.name)));
+        }
         emit_func(&mut e, f)?;
+        ranges.push((start, e.out.len()));
+    }
+    if fsec {
+        e.raw(".text");
     }
     // ROUND 64: the address range of the compilation unit.
     if dwarf::with_variables() {
@@ -450,7 +481,124 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(".text");
     }
     e.raw(".section .note.GNU-stack,\"\",@progbits");
+    if !freestanding && prune_enabled() {
+        return Ok(prune_unreachable(m, &e.out, &ranges));
+    }
     Ok(e.out)
+}
+
+/// ROUND FUI-ALL (OrientOS): drop the functions nothing can reach.
+///
+/// x86 used to put every function of every imported module into the
+/// object -- a program that imports a big library carried all of it
+/// (OrientOS `settings` grew past its file system limit when fUi grew).
+/// The wasm backend has pruned since its first day; this is the same for
+/// x86, done on the finished assembly so that NOTHING can be missed:
+///
+/// * roots are every symbol named OUTSIDE a function body -- `_start`
+///   (which calls `main` and the collector's init), the method tables,
+///   the function records of function values, the collector's type
+///   table, the panic tables, the statics -- plus every exported /
+///   `#[export_c]` function and the panic handler;
+/// * a function is kept when a kept text names its symbol: calls, jumps,
+///   `lea` of a function value, switch tables and inline asm all spell the
+///   symbol, so a reference the pruning cannot see does not exist.
+///
+/// Only for hosted programs (the kernel profile's entry points are named by
+/// linker scripts and assembly files the compiler never sees) and without
+/// variable debug info (its unit range runs across functions). The line
+/// table is no obstacle: every function starts with `forget_loc` (both the
+/// base path and `regalloc::emit_func_ra`) and announces its own position,
+/// so dropping a whole function never leaves the next one on a stale line.
+/// `FIRN_KEEP_ALL=1` switches it off.
+pub fn prune_enabled() -> bool {
+    !dwarf::with_variables()
+        && std::env::var("FIRN_KEEP_ALL").map(|v| v != "1").unwrap_or(true)
+}
+
+fn asm_symbols(text: &str, mut each: impl FnMut(&str)) {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
+    while i < b.len() {
+        if word(b[i]) {
+            let st = i;
+            while i < b.len() && word(b[i]) {
+                i += 1;
+            }
+            each(&text[st..i]);
+        } else if b[i] == b'"' {
+            // string literals (.ascii) name no symbol
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else if b[i] == b'#' {
+            // comment up to the end of the line
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn prune_unreachable(m: &Module, out: &str, ranges: &[(usize, usize)]) -> String {
+    use std::collections::HashMap;
+    let mut by_sym: HashMap<String, usize> = HashMap::with_capacity(m.funcs.len());
+    for (i, f) in m.funcs.iter().enumerate() {
+        by_sym.insert(label(&f.name), i);
+    }
+    let n = m.funcs.len();
+    let mut keep = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut mark = |sym: &str, keep: &mut Vec<bool>, stack: &mut Vec<usize>| {
+        if let Some(&i) = by_sym.get(sym) {
+            if !keep[i] {
+                keep[i] = true;
+                stack.push(i);
+            }
+        }
+    };
+    // roots: everything outside the function bodies
+    let mut pos = 0usize;
+    for &(a, z) in ranges {
+        asm_symbols(&out[pos..a], |s| mark(s, &mut keep, &mut stack));
+        pos = z;
+        let _ = a;
+    }
+    asm_symbols(&out[pos..], |s| mark(s, &mut keep, &mut stack));
+    for f in &m.funcs {
+        if f.name == "main" || crate::extfn::export_link_name(&f.name).is_some() {
+            mark(&label(&f.name), &mut keep, &mut stack);
+        }
+    }
+    if let Some(h) = crate::panic_rt::handler() {
+        mark(&label(&h), &mut keep, &mut stack);
+    }
+    while let Some(i) = stack.pop() {
+        let (a, z) = ranges[i];
+        asm_symbols(&out[a..z], |s| mark(s, &mut keep, &mut stack));
+    }
+    if keep.iter().all(|k| *k) {
+        return out.to_string();
+    }
+    let mut r = String::with_capacity(out.len());
+    let mut pos = 0usize;
+    for (i, &(a, z)) in ranges.iter().enumerate() {
+        r.push_str(&out[pos..a]);
+        if keep[i] {
+            r.push_str(&out[a..z]);
+        }
+        pos = z;
+    }
+    r.push_str(&out[pos..]);
+    r
 }
 
 /// `Op::GcAddr` — address of the state block of the collector in `rax`.

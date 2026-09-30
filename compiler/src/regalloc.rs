@@ -7866,6 +7866,8 @@ mod tests {
         let mut empty = Func::new("empty", vec![], FTy::Void);
         empty.set_term(0, Term::Ret(None));
         let mut m = Func::new("main", vec![], FTy::I32);
+        // main calls it, so the pruning of unreachable functions keeps it
+        m.push(0, FTy::Void, Op::Call { name: "empty".to_string(), args: vec![] });
         let n = m.push(0, FTy::I32, Op::Const(7));
         m.set_term(0, Term::Ret(Some(n)));
         let asm = emit(&Module { funcs: vec![empty, m] }).expect("codegen");
