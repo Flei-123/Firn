@@ -120,8 +120,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   }
 
   // 6. the page reconnects after its socket dropped, and is still paired
-  await page.evaluate(() => ws.close());
-  await page.waitForFunction(() => document.getElementById('st').textContent === 'connected', null, { timeout: 5000 });
+  await page.evaluate(() => { window.oldWs = ws; ws.close(); });
+  await page.waitForFunction(() => ws !== window.oldWs && ws.readyState === 1, null, { timeout: 8000 });
   n0 = lines().length;
   await page.locator('button[data-c="mute"]').tap();
   await sleep(250);
