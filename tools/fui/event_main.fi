@@ -1,0 +1,700 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/event_main.fi -- EVENTS THROUGH THE TREE, CHECKED WITH
+// SYNTHETIC STREAMS (lib/fui/event.fi, docs/APP-TREE.md T3, T4, T6).
+//
+//   1. DISPATCH (r94): capture -> target -> bubble in that order, capture
+//      handlers first at the target, stop / stop-now / prevent-default,
+//      the default action (control.fi) and the click (EV_TAP).
+//   2. POINTERS (r95): ids, `primary` per type, pointer capture per id
+//      (explicit, implicit for touch, surviving a rebuild).
+//   3. GESTURES (r95): tap, double tap, long press (tick and deadline at
+//      the up), pan with and without fling, a dragging control keeps its
+//      pointer, pinch scale and angle, pan -> pinch, host cancel -- and
+//      exactly one winner per sequence; the loser's press is cancelled.
+//   4. CHANGE RECORDS (r96): nothing for a renumbering rebuild; TEXT,
+//      VALUE, STATE, FOCUS, ADDED, REMOVED, MOVED; nothing at all for a
+//      secret field; the full count past the buffer.
+import std.rt
+import font.metrics
+import paint.canvas
+import fui.theme
+import fui.widget
+import fui.painter
+import fui.render
+import fui.control
+import fui.scene
+import fui.query
+import fui.event
+
+static mut G_ERRORS: usize = 0
+static mut G_LOG: [i64; 64] = [0; 64]
+static mut G_N: usize = 0
+static mut G_KC: [i64; 16] = [0; 16]
+static mut G_PID: i64 = 0
+static mut G_PRIMARY: i64 = 0
+static mut G_TARGET: usize = 0
+static mut G_DX: f64 = 0.0
+static mut G_DY: f64 = 0.0
+static mut G_VX: f64 = 0.0
+static mut G_FLING: i64 = 0
+static mut G_SCALE: f64 = 0.0
+static mut G_ANGLE: f64 = 0.0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_int(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn check(name: str, ok: bool, got: i64, want: i64) {
+    say("  ")
+    say(name)
+    var k: usize = name.n
+    while k < 64 {
+        say(" ")
+        k = k + 1
+    }
+    if ok {
+        say("OK    got ")
+    } else {
+        say("WRONG got ")
+        G_ERRORS = G_ERRORS + 1
+    }
+    say_int(got)
+    say(" want ")
+    say_int(want)
+    say("\n")
+}
+
+fn eq(name: str, got: i64, want: i64) {
+    check(name, got == want, got, want)
+}
+
+fn near(name: str, got: f64, want: f64, tol: f64) {
+    let d: f64 = got - want
+    check(name, d <= tol && d >= 0.0 - tol, (got * 100.0) as i64,
+        (want * 100.0) as i64)
+}
+
+fn key(s: str) -> u32 {
+    return query.query_key(s.p as u64, s.n)
+}
+
+fn clear_log() {
+    G_N = 0
+    var k: usize = 0
+    while k < 16 {
+        G_KC[k] = 0
+        k = k + 1
+    }
+}
+
+fn logged(k: usize) -> i64 {
+    if k >= G_N {
+        return 0 - 1
+    }
+    return G_LOG[k]
+}
+
+fn kc(kind: u32) -> i64 { return G_KC[kind as usize] }
+
+// THE ONE HANDLER. `ud`: bits 0..7 a tag, bits 8..15 what to answer.
+// It logs kind * 10000 + phase * 1000 + tag.
+fn h_log(ud: u64, e: *mut event.Ev) -> u32 {
+    let tag: i64 = (ud & (255 as u64)) as i64
+    let ret: u32 = ((ud >> (8 as u64)) & (255 as u64)) as u32
+    let kind: u32 = event.ev_kind(e)
+    if G_N < 64 {
+        G_LOG[G_N] = (kind as i64) * 10000 + (event.ev_phase(e) as i64) * 1000 + tag
+        G_N = G_N + 1
+    }
+    if kind < 16 as u32 {
+        G_KC[kind as usize] = G_KC[kind as usize] + 1
+    }
+    G_PID = event.ev_pid(e) as i64
+    G_PRIMARY = 0
+    if event.ev_primary(e) {
+        G_PRIMARY = 1
+    }
+    G_TARGET = event.ev_target(e)
+    if kind == event.EV_PAN_START || kind == event.EV_PAN_MOVE {
+        G_DX = event.ev_dx(e)
+        G_DY = event.ev_dy(e)
+    }
+    if kind == event.EV_PAN_END {
+        G_VX = event.ev_vx(e)
+        G_FLING = 0
+        if event.ev_fling(e) {
+            G_FLING = 1
+        }
+    }
+    if kind == event.EV_PINCH_START || kind == event.EV_PINCH_MOVE
+        || kind == event.EV_PINCH_END {
+        G_SCALE = event.ev_scale(e)
+        G_ANGLE = event.ev_angle(e)
+    }
+    return ret
+}
+
+fn ud(tag: u64, ret: u32) -> u64 {
+    return tag | ((ret as u64) << (8 as u64))
+}
+
+// ============================================================ THE TREE
+//
+//   app (#app)
+//     [banner, unkeyed, only with `banner`]
+//     row (#row):   button A (#a), button B (#b), slider (#s)
+//     list (#list): button "Item" (#item)
+//     password field (#pw, secret)
+//     checkbox (#cb)
+//     [#x1 .. #xN, `extra` keyed labels]
+//
+// `swap` puts B before A; `textb` changes B's text; `cbv` the checkbox;
+// `dis` disables A; `pwn` the length of the password typed so far.
+fn build(sc: *mut scene.Scene, banner: bool, swap: bool, textb: bool,
+    cbv: i64, dis: bool, pwn: usize, extra: usize) {
+    scene.scene_reset(sc)
+    let root: usize = scene.scene_add(sc, scene.SCENE_NONE, scene.N_BOX)
+    scene.node_set_id(sc, root, key("app"))
+    if banner {
+        let b: usize = scene.scene_add(sc, root, scene.N_TEXT)
+        let t0: str = "A banner that moves every number"
+        scene.node_set_text(sc, b, t0.p as u64, t0.n)
+        scene.node_set_size(sc, b, 300.0, 30.0)
+    }
+    let row: usize = scene.scene_box(sc, root, 0 as u32, 0 as u32, 0 as u32, 0 as u32)
+    scene.node_set_id(sc, row, key("row"))
+    scene.node_set_size(sc, row, 480.0, 60.0)
+    let ta: str = "Alpha"
+    var tb: str = "Beta"
+    if textb {
+        tb = "Beta!"
+    }
+    if swap {
+        let b1: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, tb.p as u64, tb.n)
+        scene.node_set_id(sc, b1, key("b"))
+        scene.node_set_size(sc, b1, 120.0, 50.0)
+        let a1: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, ta.p as u64, ta.n)
+        scene.node_set_id(sc, a1, key("a"))
+        scene.node_set_size(sc, a1, 120.0, 50.0)
+        widget.w_set_disabled(scene.node_widget(sc, a1), dis)
+    } else {
+        let a2: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, ta.p as u64, ta.n)
+        scene.node_set_id(sc, a2, key("a"))
+        scene.node_set_size(sc, a2, 120.0, 50.0)
+        widget.w_set_disabled(scene.node_widget(sc, a2), dis)
+        let b2: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, tb.p as u64, tb.n)
+        scene.node_set_id(sc, b2, key("b"))
+        scene.node_set_size(sc, b2, 120.0, 50.0)
+    }
+    let sl: usize = scene.scene_widget(sc, row, widget.KIND_SLIDER, 0, 0)
+    scene.node_set_id(sc, sl, key("s"))
+    scene.node_set_size(sc, sl, 200.0, 40.0)
+
+    let list: usize = scene.scene_box(sc, root, 0 as u32, 2 as u32, 0 as u32, 0 as u32)
+    scene.node_set_id(sc, list, key("list"))
+    scene.node_set_size(sc, list, 480.0, 300.0)
+    let ti: str = "Item"
+    let it: usize = scene.scene_widget(sc, list, widget.KIND_BUTTON, ti.p as u64, ti.n)
+    scene.node_set_id(sc, it, key("item"))
+    scene.node_set_size(sc, it, 400.0, 200.0)
+
+    let pw: str = "CANARY7hunter2"
+    var n: usize = pwn
+    if n > pw.n {
+        n = pw.n
+    }
+    let f: usize = scene.scene_widget(sc, root, widget.KIND_TEXTBOX, pw.p as u64, n)
+    scene.node_set_id(sc, f, key("pw"))
+    widget.w_set_secret(scene.node_widget(sc, f), true)
+    scene.node_set_size(sc, f, 200.0, 30.0)
+
+    let tc: str = "Remember"
+    let cb: usize = scene.scene_widget(sc, root, widget.KIND_CHECKBOX, tc.p as u64, tc.n)
+    scene.node_set_id(sc, cb, key("cb"))
+    widget.w_set_value(scene.node_widget(sc, cb), cbv)
+    scene.node_set_size(sc, cb, 200.0, 30.0)
+
+    var k: usize = 0
+    var nm: [u8; 8] = [0 as u8; 8]
+    while k < extra {
+        let x: usize = scene.scene_add(sc, root, scene.N_TEXT)
+        // x0 .. x99: a key per label
+        nm[0] = 120 as u8
+        nm[1] = (48 + k / 10) as u8
+        nm[2] = (48 + k % 10) as u8
+        scene.node_set_id(sc, x, query.query_key((&nm[0]) as u64, 3))
+        scene.node_set_size(sc, x, 10.0, 4.0)
+        k = k + 1
+    }
+}
+
+fn lay(sc: *mut scene.Scene, c: *mut render.Ctx) {
+    scene.scene_measure(sc, c)
+    scene.scene_layout(sc, c, 0.0, 0.0, 480.0, 800.0)
+}
+
+fn node(sc: *mut scene.Scene, path: str) -> usize {
+    return query.query_find_path(sc, path.p as u64, path.n)
+}
+fn cx(sc: *mut scene.Scene, i: usize) -> f64 {
+    return scene.node_x(sc, i) + scene.node_w(sc, i) / 2.0
+}
+fn cy(sc: *mut scene.Scene, i: usize) -> f64 {
+    return scene.node_y(sc, i) + scene.node_h(sc, i) / 2.0
+}
+
+fn has_rec(o: *mut event.Obs, kind: u32, h: u64) -> bool {
+    var k: usize = 0
+    while k < event.obs_kept(o) {
+        if event.obs_kind(o, k) == kind && event.obs_key(o, k) == h {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn main(start: u64) -> i32 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&f1[0]) as u64, &fbuf) {
+        say("event: no font\n")
+        return 9
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 480, 800) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 480, 800) {
+        return 5
+    }
+    painter.painter_set_font(&z, fsp as u64)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+
+    let sc: *mut scene.Scene = rt.heap_alloc(1048576) as *mut scene.Scene
+    *sc = scene.scene_new()
+    let r: *mut event.Router = rt.heap_alloc(65536) as *mut event.Router
+    *r = event.router_new()
+    let o: *mut event.Obs = rt.heap_alloc(65536) as *mut event.Obs
+    *o = event.obs_new()
+    let pnp: *mut control.Panel = rt.heap_alloc(4096) as *mut control.Panel
+    *pnp = control.panel_new()
+
+    build(sc, false, false, false, 0, false, 3, 0)
+    lay(sc, &c)
+    scene.scene_bind_panel(sc, pnp)
+    event.router_bind_panel(r, pnp)
+    let na: usize = node(sc, "app/row/a")
+    let nb: usize = node(sc, "app/row/b")
+    let nrow: usize = node(sc, "app/row")
+    let nitem: usize = node(sc, "app/list/item")
+    let nsl: usize = node(sc, "app/row/s")
+    check("the tree has its keyed nodes", na != scene.SCENE_NONE
+        && nb != scene.SCENE_NONE && nitem != scene.SCENE_NONE
+        && nsl != scene.SCENE_NONE, 1, 1)
+    eq("scene_hit at A's centre is A", scene.scene_hit(sc, cx(sc, na), cy(sc, na)) as i64, na as i64)
+    eq("scene_hit at the item's centre is the item",
+        scene.scene_hit(sc, cx(sc, nitem), cy(sc, nitem)) as i64, nitem as i64)
+    let ax: f64 = cx(sc, na)
+    let ay: f64 = cy(sc, na)
+    let bx: f64 = cx(sc, nb)
+    let by: f64 = cy(sc, nb)
+    let ix: f64 = cx(sc, nitem)
+    let iy: f64 = cy(sc, nitem)
+    let down: u32 = event.ev_bit(event.EV_POINTER_DOWN)
+    let tapb: u32 = event.ev_bit(event.EV_TAP)
+    let dtapb: u32 = event.ev_bit(event.EV_DOUBLE_TAP)
+    let longb: u32 = event.ev_bit(event.EV_LONG_PRESS)
+
+    // ============================================================ 1. DISPATCH
+    say("== 1. dispatch: capture -> target -> bubble\n")
+    let ok1: bool = event.ev_on(r, key("app"), down, true, h_log, ud(51, 0 as u32))
+    let ok2: bool = event.ev_on(r, key("app"), down, false, h_log, ud(1, 0 as u32))
+    let ok3: bool = event.ev_on(r, key("row"), down, false, h_log, ud(2, 0 as u32))
+    let ok4: bool = event.ev_on(r, key("row"), down, true, h_log, ud(52, 0 as u32))
+    let ok5: bool = event.ev_on(r, key("a"), down, false, h_log, ud(3, 0 as u32))
+    let ok6: bool = event.ev_on(r, key("a"), down, true, h_log, ud(53, 0 as u32))
+    let ok7: bool = event.ev_on(r, key("app"), tapb, false, h_log, ud(1, 0 as u32))
+    eq("7 handlers registered", event.ev_handler_count(r) as i64, 7)
+    clear_log()
+    let d1: bool = event.ev_pointer_down(r, sc, 1 as u32, event.PT_MOUSE, ax, ay, 0)
+    eq("6 calls", G_N as i64, 6)
+    eq("1st: capture at app", logged(0), 11051)
+    eq("2nd: capture at row", logged(1), 11052)
+    eq("3rd: at target, the capture handler first", logged(2), 12053)
+    eq("4th: at target, the bubble handler", logged(3), 12003)
+    eq("5th: bubble at row", logged(4), 13002)
+    eq("6th: bubble at app", logged(5), 13001)
+    check("default action: A is pressed (panel)", control.panel_pressed(pnp) != control.NOBODY, 1, 1)
+    let u1: bool = event.ev_pointer_up(r, sc, 1 as u32, ax, ay, 50)
+    check("the up on A activates (CH_ACTIVATE)",
+        (event.router_changes(r) & control.CH_ACTIVATE) != 0 as u32, 1, 1)
+    eq("one TAP (click)", kc(event.EV_TAP), 1)
+    eq("... bubbled to app with target A", tap_target_is(na) as i64, 1)
+
+    say("-- stopPropagation at row (capture)\n")
+    let off1: usize = event.ev_off(r, key("row"))
+    let ok8: bool = event.ev_on(r, key("row"), down, true, h_log, ud(52, event.H_STOP))
+    clear_log()
+    let d2: bool = event.ev_pointer_down(r, sc, 1 as u32, event.PT_MOUSE, ax, ay, 1000)
+    eq("only app and row saw it", G_N as i64, 2)
+    eq("... the last was row", logged(1), 11052)
+    let u2: bool = event.ev_pointer_up(r, sc, 1 as u32, ax, ay, 1010)
+    let off2: usize = event.ev_off(r, key("row"))
+
+    say("-- stopImmediatePropagation at the target\n")
+    let off3: usize = event.ev_off(r, key("a"))
+    let ok9: bool = event.ev_on(r, key("a"), down, true, h_log, ud(53, event.H_STOP_NOW))
+    let ok10: bool = event.ev_on(r, key("a"), down, true, h_log, ud(54, 0 as u32))
+    let ok11: bool = event.ev_on(r, key("a"), down, false, h_log, ud(3, 0 as u32))
+    clear_log()
+    let d3: bool = event.ev_pointer_down(r, sc, 1 as u32, event.PT_MOUSE, ax, ay, 2000)
+    eq("app capture + A's first handler, nobody else", G_N as i64, 2)
+    eq("... the last was A's first", logged(1), 12053)
+    let u3: bool = event.ev_pointer_up(r, sc, 1 as u32, ax, ay, 2010)
+    let off4: usize = event.ev_off(r, key("a"))
+
+    say("-- stopPropagation at the target still runs its other handlers\n")
+    let ok12: bool = event.ev_on(r, key("a"), down, true, h_log, ud(53, event.H_STOP))
+    let ok13: bool = event.ev_on(r, key("a"), down, false, h_log, ud(3, 0 as u32))
+    clear_log()
+    let d4: bool = event.ev_pointer_down(r, sc, 1 as u32, event.PT_MOUSE, ax, ay, 3000)
+    eq("app capture, A capture, A bubble -- no bubbling up", G_N as i64, 3)
+    eq("... the last was A's bubble handler", logged(2), 12003)
+    let u4: bool = event.ev_pointer_up(r, sc, 1 as u32, ax, ay, 3010)
+    let off5: usize = event.ev_off(r, key("a"))
+
+    say("-- preventDefault: no press, no activation\n")
+    let off6: usize = event.ev_off(r, key("app"))
+    let ok14: bool = event.ev_on(r, key("app"), down, false, h_log, ud(1, event.H_PREVENT))
+    let cl0: u32 = event.router_changes(r)
+    let d5: bool = event.ev_pointer_down(r, sc, 1 as u32, event.PT_MOUSE, ax, ay, 4000)
+    check("nothing pressed", control.panel_pressed(pnp) == control.NOBODY, 1, 1)
+    let u5: bool = event.ev_pointer_up(r, sc, 1 as u32, ax, ay, 4010)
+    check("no activation", (event.router_changes(r) & control.CH_ACTIVATE) == 0 as u32, 1, 1)
+    let off7: usize = event.ev_off(r, key("app"))
+    eq("all handlers gone", event.ev_handler_count(r) as i64, 0)
+
+    // ============================================================ 2. POINTERS
+    say("== 2. pointers: ids, primary, capture\n")
+    let ok15: bool = event.ev_on(r, key("app"), down, true, h_log, ud(1, 0 as u32))
+    clear_log()
+    let t1: bool = event.ev_pointer_down(r, sc, 7 as u32, event.PT_TOUCH, ax, ay, 5000)
+    eq("touch 7: id", G_PID, 7)
+    eq("touch 7: primary", G_PRIMARY, 1)
+    let t2: bool = event.ev_pointer_down(r, sc, 9 as u32, event.PT_TOUCH, bx, by, 5010)
+    eq("touch 9: id", G_PID, 9)
+    eq("touch 9: not primary", G_PRIMARY, 0)
+    let m1: bool = event.ev_pointer_down(r, sc, 1 as u32, event.PT_MOUSE, 5.0, 700.0, 5015)
+    eq("the mouse beside two fingers: primary of its type", G_PRIMARY, 1)
+    let m2: bool = event.ev_pointer_up(r, sc, 1 as u32, 5.0, 700.0, 5016)
+    let t3: bool = event.ev_pointer_up(r, sc, 7 as u32, ax, ay, 5020)
+    let t4: bool = event.ev_pointer_down(r, sc, 11 as u32, event.PT_TOUCH, ax, ay, 5030)
+    eq("touch 11 while 9 is down: not primary", G_PRIMARY, 0)
+    eq("two touches down (9 and 11)", event.ev_pointers_down(r) as i64, 2)
+    let t5: bool = event.ev_pointer_up(r, sc, 9 as u32, bx, by, 5040)
+    let t6: bool = event.ev_pointer_up(r, sc, 11 as u32, ax, ay, 5050)
+    let t7: bool = event.ev_pointer_down(r, sc, 12 as u32, event.PT_TOUCH, ax, ay, 5060)
+    eq("touch 12 alone: primary again", G_PRIMARY, 1)
+    let t8: bool = event.ev_pointer_up(r, sc, 12 as u32, ax, ay, 5070)
+    eq("nothing down", event.ev_pointers_down(r) as i64, 0)
+    let off8: usize = event.ev_off(r, key("app"))
+
+    let moveb: u32 = event.ev_bit(event.EV_POINTER_MOVE)
+    let ok16: bool = event.ev_on(r, key("app"), moveb, true, h_log, ud(1, 0 as u32))
+    let c1: bool = event.ev_pointer_down(r, sc, 1 as u32, event.PT_MOUSE, ax, ay, 6000)
+    check("set capture to row", event.ev_set_capture(r, sc, 1 as u32, nrow), 1, 1)
+    let c2: bool = event.ev_pointer_move(r, sc, 1 as u32, ix, iy, 6010)
+    eq("mouse captured by row: a move over the item goes to row", G_TARGET as i64, nrow as i64)
+    check("release", event.ev_release_capture(r, 1 as u32), 1, 1)
+    let c3: bool = event.ev_pointer_move(r, sc, 1 as u32, ix, iy, 6020)
+    eq("released: the move goes to the item", G_TARGET as i64, nitem as i64)
+    let c4: bool = event.ev_pointer_up(r, sc, 1 as u32, ix, iy, 6030)
+    let c5: bool = event.ev_pointer_down(r, sc, 3 as u32, event.PT_TOUCH, ax, ay, 6100)
+    eq("touch captures implicitly where it went down", event.ev_capture_of(r, sc, 3 as u32) as i64, na as i64)
+    let c6: bool = event.ev_pointer_move(r, sc, 3 as u32, bx, by, 6110)
+    eq("a finger slid onto B still talks to A", G_TARGET as i64, na as i64)
+    // a rebuild that moves every number
+    build(sc, true, false, false, 0, false, 3, 0)
+    lay(sc, &c)
+    scene.scene_bind_panel(sc, pnp)
+    let na2: usize = node(sc, "app/row/a")
+    check("the rebuild moved A's number", na2 != na, na2 as i64, na as i64 + 1)
+    let c7: bool = event.ev_pointer_move(r, sc, 3 as u32, cx(sc, nb), cy(sc, nb), 6120)
+    eq("the capture follows A's key to its new number", G_TARGET as i64, na2 as i64)
+    let c8: bool = event.ev_pointer_cancel(r, sc, 3 as u32, 6130)
+    let off9: usize = event.ev_off(r, key("app"))
+    build(sc, false, false, false, 0, false, 3, 0)
+    lay(sc, &c)
+    scene.scene_bind_panel(sc, pnp)
+    let ch0: u32 = event.router_changes(r)
+
+    // ============================================================ 3. GESTURES
+    say("== 3. gestures: an arena, one winner\n")
+    let all: u32 = tapb | dtapb | longb | event.EV_PAN_ALL | event.EV_PINCH_ALL
+        | event.ev_bit(event.EV_POINTER_CANCEL)
+    let ok17: bool = event.ev_on(r, key("row"), tapb | dtapb, false, h_log, ud(2, 0 as u32))
+    var w0: usize = event.router_winners(r)
+
+    say("-- tap\n")
+    clear_log()
+    let g1: bool = event.ev_pointer_down(r, sc, 20 as u32, event.PT_TOUCH, ax, ay, 10000)
+    let g2: bool = event.ev_pointer_up(r, sc, 20 as u32, ax + 3.0, ay + 2.0, 10080)
+    eq("a short touch is a TAP", kc(event.EV_TAP), 1)
+    check("... and activates A", (event.router_changes(r) & control.CH_ACTIVATE) != 0 as u32, 1, 1)
+    eq("... one winner", (event.router_winners(r) - w0) as i64, 1)
+    check("... the arena is closed", !event.ev_arena_open(r), 1, 1)
+
+    say("-- double tap\n")
+    clear_log()
+    let g3: bool = event.ev_pointer_down(r, sc, 21 as u32, event.PT_TOUCH, ax, ay, 11000)
+    let g4: bool = event.ev_pointer_up(r, sc, 21 as u32, ax, ay, 11060)
+    let g5: bool = event.ev_pointer_down(r, sc, 22 as u32, event.PT_TOUCH, ax + 10.0, ay, 11200)
+    let g6: bool = event.ev_pointer_up(r, sc, 22 as u32, ax + 10.0, ay, 11260)
+    eq("two TAPs", kc(event.EV_TAP), 2)
+    eq("one DOUBLE_TAP", kc(event.EV_DOUBLE_TAP), 1)
+    eq("... after the second TAP", logged(2), 63002)
+    clear_log()
+    let g7: bool = event.ev_pointer_down(r, sc, 23 as u32, event.PT_TOUCH, ax, ay, 12000)
+    let g8: bool = event.ev_pointer_up(r, sc, 23 as u32, ax, ay, 12060)
+    let g9: bool = event.ev_pointer_down(r, sc, 24 as u32, event.PT_TOUCH, ax, ay, 12500)
+    let g10: bool = event.ev_pointer_up(r, sc, 24 as u32, ax, ay, 12560)
+    eq("440 ms apart: no DOUBLE_TAP", kc(event.EV_DOUBLE_TAP), 0)
+    clear_log()
+    let g11: bool = event.ev_pointer_down(r, sc, 25 as u32, event.PT_TOUCH, ax, ay, 13000)
+    let g12: bool = event.ev_pointer_up(r, sc, 25 as u32, ax, ay, 13060)
+    let g13: bool = event.ev_pointer_down(r, sc, 26 as u32, event.PT_TOUCH, bx, by, 13150)
+    let g14: bool = event.ev_pointer_up(r, sc, 26 as u32, bx, by, 13200)
+    eq("the second tap on another node: no DOUBLE_TAP", kc(event.EV_DOUBLE_TAP), 0)
+    let ch1: u32 = event.router_changes(r)
+
+    say("-- long press\n")
+    let ok18: bool = event.ev_on(r, key("app"), longb, false, h_log, ud(1, 0 as u32))
+    clear_log()
+    w0 = event.router_winners(r)
+    let l1: bool = event.ev_pointer_down(r, sc, 30 as u32, event.PT_TOUCH, ax, ay, 20000)
+    event.ev_tick(r, sc, 20300)
+    eq("300 ms: not yet", kc(event.EV_LONG_PRESS), 0)
+    event.ev_tick(r, sc, 20510)
+    eq("510 ms: LONG_PRESS", kc(event.EV_LONG_PRESS), 1)
+    eq("... the winner is G_LONG", event.ev_winner(r) as i64, event.G_LONG as i64)
+    check("... A's press was cancelled", control.panel_pressed(pnp) == control.NOBODY, 1, 1)
+    event.ev_tick(r, sc, 20900)
+    eq("... only once", kc(event.EV_LONG_PRESS), 1)
+    let l2: bool = event.ev_pointer_up(r, sc, 30 as u32, ax, ay, 21000)
+    eq("... the up is no TAP", kc(event.EV_TAP), 0)
+    check("... and no activation", (event.router_changes(r) & control.CH_ACTIVATE) == 0 as u32, 1, 1)
+    eq("... one winner", (event.router_winners(r) - w0) as i64, 1)
+    clear_log()
+    let l3: bool = event.ev_pointer_down(r, sc, 31 as u32, event.PT_TOUCH, ax, ay, 22000)
+    let l4: bool = event.ev_pointer_up(r, sc, 31 as u32, ax, ay, 22700)
+    eq("no tick at all: the deadline still decides at the up", kc(event.EV_LONG_PRESS), 1)
+    eq("... no TAP", kc(event.EV_TAP), 0)
+    clear_log()
+    let l5: bool = event.ev_pointer_down(r, sc, 32 as u32, event.PT_TOUCH, ax, ay, 23000)
+    let l6: bool = event.ev_pointer_move(r, sc, 32 as u32, ax + 30.0, ay, 23100)
+    event.ev_tick(r, sc, 23600)
+    eq("a finger that moved is no long press", kc(event.EV_LONG_PRESS), 0)
+    let l7: bool = event.ev_pointer_up(r, sc, 32 as u32, ax + 30.0, ay, 23700)
+    eq("... and no TAP", kc(event.EV_TAP), 0)
+    let off10: usize = event.ev_off(r, key("app"))
+    clear_log()
+    let ch2: u32 = event.router_changes(r)
+    let l8: bool = event.ev_pointer_down(r, sc, 33 as u32, event.PT_TOUCH, ax, ay, 24000)
+    event.ev_tick(r, sc, 24600)
+    let l9: bool = event.ev_pointer_up(r, sc, 33 as u32, ax, ay, 24700)
+    eq("nobody listens to a long press: a slow touch is a TAP", kc(event.EV_TAP), 1)
+    check("... that activates", (event.router_changes(r) & control.CH_ACTIVATE) != 0 as u32, 1, 1)
+
+    say("-- pan and fling\n")
+    let ok19: bool = event.ev_on(r, key("list"), event.EV_PAN_ALL, false, h_log, ud(5, 0 as u32))
+    clear_log()
+    w0 = event.router_winners(r)
+    let p1: bool = event.ev_pointer_down(r, sc, 40 as u32, event.PT_TOUCH, ix, iy, 30000)
+    check("the item is pressed", control.panel_pressed(pnp) != control.NOBODY, 1, 1)
+    let p2: bool = event.ev_pointer_move(r, sc, 40 as u32, ix, iy - 5.0, 30010)
+    eq("5 px: no pan yet", kc(event.EV_PAN_START), 0)
+    let p3: bool = event.ev_pointer_move(r, sc, 40 as u32, ix, iy - 40.0, 30020)
+    eq("40 px: PAN_START", kc(event.EV_PAN_START), 1)
+    near("... dy since the down", G_DY, 0.0 - 40.0, 0.01)
+    check("... the item's press was cancelled", control.panel_pressed(pnp) == control.NOBODY, 1, 1)
+    var k: usize = 1
+    while k <= 5 {
+        let pm: bool = event.ev_pointer_move(r, sc, 40 as u32, ix, iy - 40.0 - 30.0 * (k as f64),
+            30020 + 10 * (k as i64))
+        k = k + 1
+    }
+    eq("5 PAN_MOVE", kc(event.EV_PAN_MOVE), 5)
+    near("... each 30 px up", G_DY, 0.0 - 30.0, 0.01)
+    let p4: bool = event.ev_pointer_up(r, sc, 40 as u32, ix, iy - 190.0, 30080)
+    eq("PAN_END", kc(event.EV_PAN_END), 1)
+    eq("... a fling", G_FLING, 1)
+    eq("... no TAP", kc(event.EV_TAP), 0)
+    check("... no activation", (event.router_changes(r) & control.CH_ACTIVATE) == 0 as u32, 1, 1)
+    eq("... one winner", (event.router_winners(r) - w0) as i64, 1)
+    clear_log()
+    let p5: bool = event.ev_pointer_down(r, sc, 41 as u32, event.PT_TOUCH, ix, iy, 31000)
+    let p6: bool = event.ev_pointer_move(r, sc, 41 as u32, ix + 60.0, iy, 31020)
+    let p7: bool = event.ev_pointer_move(r, sc, 41 as u32, ix + 60.0, iy, 31300)
+    let p8: bool = event.ev_pointer_up(r, sc, 41 as u32, ix + 60.0, iy, 31320)
+    eq("a pan that came to rest: no fling", G_FLING, 0)
+    near("... velocity 0", G_VX, 0.0, 0.01)
+    clear_log()
+    let p9: bool = event.ev_pointer_down(r, sc, 42 as u32, event.PT_TOUCH, ax, ay, 32000)
+    let p10: bool = event.ev_pointer_move(r, sc, 42 as u32, ax, ay + 40.0, 32020)
+    let p11: bool = event.ev_pointer_up(r, sc, 42 as u32, ax, ay + 40.0, 32040)
+    eq("nobody on A's path listens to a pan: no PAN", kc(event.EV_PAN_START), 0)
+    let off11: usize = event.ev_off(r, key("list"))
+
+    say("-- a dragging control keeps its pointer\n")
+    let ok20: bool = event.ev_on(r, key("app"), event.EV_PAN_ALL, false, h_log, ud(1, 0 as u32))
+    clear_log()
+    let nsl2: usize = node(sc, "app/row/s")
+    let sx: f64 = cx(sc, nsl2)
+    let sy: f64 = cy(sc, nsl2)
+    let s1: bool = event.ev_pointer_down(r, sc, 43 as u32, event.PT_TOUCH, sx, sy, 33000)
+    check("the slider tracks", control.track_active(pnp), 1, 1)
+    let s2: bool = event.ev_pointer_move(r, sc, 43 as u32, sx + 50.0, sy, 33020)
+    eq("the app listens to pans, the slider still wins: no PAN", kc(event.EV_PAN_START), 0)
+    check("... the slider still tracks", control.track_active(pnp), 1, 1)
+    let s3: bool = event.ev_pointer_up(r, sc, 43 as u32, sx + 50.0, sy, 33040)
+
+    say("-- pinch and rotate\n")
+    let ok21: bool = event.ev_on(r, key("app"), event.EV_PINCH_ALL | event.ev_bit(event.EV_POINTER_CANCEL),
+        false, h_log, ud(1, 0 as u32))
+    clear_log()
+    w0 = event.router_winners(r)
+    let q1: bool = event.ev_pointer_down(r, sc, 50 as u32, event.PT_TOUCH, 100.0, 300.0, 40000)
+    let q2: bool = event.ev_pointer_down(r, sc, 51 as u32, event.PT_TOUCH, 200.0, 300.0, 40010)
+    eq("second finger: PINCH_START", kc(event.EV_PINCH_START), 1)
+    near("... scale 1", G_SCALE, 1.0, 0.001)
+    check("... the first finger's press was cancelled", control.panel_pressed(pnp) == control.NOBODY, 1, 1)
+    let q3: bool = event.ev_pointer_move(r, sc, 51 as u32, 300.0, 300.0, 40020)
+    near("fingers twice as far apart: scale 2", G_SCALE, 2.0, 0.001)
+    near("... angle 0", G_ANGLE, 0.0, 0.01)
+    let q4: bool = event.ev_pointer_move(r, sc, 51 as u32, 100.0, 500.0, 40030)
+    near("turned a quarter: angle 90", G_ANGLE, 90.0, 0.05)
+    near("... scale still 2", G_SCALE, 2.0, 0.001)
+    let q5: bool = event.ev_pointer_move(r, sc, 51 as u32, 100.0, 100.0, 40040)
+    near("turned the other way: angle -90", G_ANGLE, 0.0 - 90.0, 0.05)
+    let q6: bool = event.ev_pointer_up(r, sc, 51 as u32, 100.0, 100.0, 40050)
+    eq("a finger lifts: PINCH_END", kc(event.EV_PINCH_END), 1)
+    let q7: bool = event.ev_pointer_move(r, sc, 50 as u32, 150.0, 300.0, 40060)
+    eq("the rest of the sequence stays the pinch's: no PAN", kc(event.EV_PAN_START), 0)
+    let q8: bool = event.ev_pointer_up(r, sc, 50 as u32, 150.0, 300.0, 40070)
+    eq("... no TAP", kc(event.EV_TAP), 0)
+    eq("... one winner", (event.router_winners(r) - w0) as i64, 1)
+
+    say("-- a pan, then a second finger: the pinch takes over\n")
+    clear_log()
+    let q9: bool = event.ev_pointer_down(r, sc, 52 as u32, event.PT_TOUCH, ix, iy, 41000)
+    let q10: bool = event.ev_pointer_move(r, sc, 52 as u32, ix + 40.0, iy, 41010)
+    eq("PAN_START", kc(event.EV_PAN_START), 1)
+    let q11: bool = event.ev_pointer_down(r, sc, 53 as u32, event.PT_TOUCH, ix + 140.0, iy, 41020)
+    eq("... PAN_END", kc(event.EV_PAN_END), 1)
+    eq("... without a fling", G_FLING, 0)
+    eq("... PINCH_START", kc(event.EV_PINCH_START), 1)
+    let q12: bool = event.ev_pointer_up(r, sc, 53 as u32, ix + 140.0, iy, 41030)
+    let q13: bool = event.ev_pointer_up(r, sc, 52 as u32, ix + 40.0, iy, 41040)
+
+    say("-- the host cancels\n")
+    clear_log()
+    let q14: bool = event.ev_pointer_down(r, sc, 54 as u32, event.PT_TOUCH, ix, iy, 42000)
+    let q15: bool = event.ev_pointer_move(r, sc, 54 as u32, ix + 80.0, iy, 42010)
+    let q16: bool = event.ev_pointer_cancel(r, sc, 54 as u32, 42020)
+    eq("POINTER_CANCEL is dispatched", kc(event.EV_POINTER_CANCEL), 1)
+    eq("the pan ends", kc(event.EV_PAN_END), 1)
+    eq("... without a fling", G_FLING, 0)
+    check("... the arena is closed", !event.ev_arena_open(r), 1, 1)
+    eq("nothing is down", event.ev_pointers_down(r) as i64, 0)
+    let off12: usize = event.ev_off(r, key("app"))
+    let off13: usize = event.ev_off(r, key("row"))
+    eq("no handler refused, no path too deep, no pointer refused",
+        (event.ev_handlers_refused(r) + event.ev_path_overflow(r)
+        + event.ev_pointers_refused(r)) as i64, 0)
+
+    // ============================================================ 4. CHANGE RECORDS
+    say("== 4. change records by key\n")
+    event.obs_reset(o)
+    build(sc, false, false, false, 0, false, 3, 0)
+    eq("the first call takes the baseline", event.obs_observe(o, sc) as i64, 0)
+    build(sc, false, false, false, 0, false, 3, 0)
+    eq("an unchanged rebuild: no record", event.obs_observe(o, sc) as i64, 0)
+    build(sc, true, false, false, 0, false, 3, 0)
+    eq("a rebuild that renumbers every node: no record", event.obs_observe(o, sc) as i64, 0)
+    build(sc, true, false, true, 0, false, 3, 0)
+    let hb: u64 = query.query_key_hash(sc, node(sc, "app/row/b"))
+    eq("B's text changed: one record", event.obs_observe(o, sc) as i64, 1)
+    check("... TEXT for B", has_rec(o, event.MC_TEXT, hb), 1, 1)
+    eq("... it names B's node", event.obs_node(o, 0) as i64, node(sc, "app/row/b") as i64)
+    build(sc, true, false, true, 1, false, 3, 0)
+    let hc: u64 = query.query_key_hash(sc, node(sc, "app/cb"))
+    eq("the checkbox ticked: one record", event.obs_observe(o, sc) as i64, 1)
+    check("... VALUE for the checkbox", has_rec(o, event.MC_VALUE, hc), 1, 1)
+    build(sc, true, false, true, 1, true, 3, 0)
+    let ha: u64 = query.query_key_hash(sc, node(sc, "app/row/a"))
+    eq("A disabled: one record", event.obs_observe(o, sc) as i64, 1)
+    check("... STATE for A", has_rec(o, event.MC_STATE, ha), 1, 1)
+    build(sc, true, false, true, 1, true, 3, 0)
+    widget.w_set_focus(scene.node_widget(sc, node(sc, "app/row/b")), true)
+    eq("B takes the focus: one record", event.obs_observe(o, sc) as i64, 1)
+    check("... FOCUS for B", has_rec(o, event.MC_FOCUS, hb), 1, 1)
+    build(sc, true, false, true, 1, true, 3, 0)
+    eq("B loses it (a plain rebuild): one record", event.obs_observe(o, sc) as i64, 1)
+    build(sc, true, false, true, 1, true, 3, 2)
+    eq("two keyed labels added: two records", event.obs_observe(o, sc) as i64, 2)
+    check("... ADDED", event.obs_kind(o, 0) == event.MC_ADDED
+        && event.obs_kind(o, 1) == event.MC_ADDED, 1, 1)
+    build(sc, true, false, true, 1, true, 3, 1)
+    eq("one removed: one record", event.obs_observe(o, sc) as i64, 1)
+    check("... REMOVED, no node", event.obs_kind(o, 0) == event.MC_REMOVED
+        && event.obs_node(o, 0) == scene.SCENE_NONE, 1, 1)
+    build(sc, true, true, true, 1, true, 3, 1)
+    eq("A and B swapped: two records", event.obs_observe(o, sc) as i64, 2)
+    check("... MOVED for both", has_rec(o, event.MC_MOVED, ha)
+        && has_rec(o, event.MC_MOVED, hb), 1, 1)
+    say("-- the secret field\n")
+    var n: usize = 4
+    var secret_recs: i64 = 0
+    while n <= 14 {
+        build(sc, true, true, true, 1, true, n, 1)
+        secret_recs = secret_recs + event.obs_observe(o, sc) as i64
+        n = n + 1
+    }
+    eq("eleven keystrokes into the password: not one record", secret_recs, 0)
+    build(sc, true, true, true, 1, true, 14, 1)
+    widget.w_set_focus(scene.node_widget(sc, node(sc, "app/pw")), true)
+    eq("its focus is reported (that is no secret)", event.obs_observe(o, sc) as i64, 1)
+    say("-- more records than the buffer\n")
+    build(sc, true, true, true, 1, true, 14, 70)
+    let tot: usize = event.obs_observe(o, sc)
+    eq("70 labels (69 new) + the pw focus lost: the full count", tot as i64, 70)
+    eq("... 64 held", event.obs_kept(o) as i64, event.OBS_REC_MAX as i64)
+
+    say("\n")
+    if G_ERRORS > 0 {
+        say("EVENTS ARE NOT IN ORDER.\n")
+        return 1
+    }
+    say("EVENTS PASSED.\n")
+    return 0
+}
+
+// the TAP of section 1 bubbled with A as its target
+fn tap_target_is(na: usize) -> bool {
+    return G_TARGET == na
+}

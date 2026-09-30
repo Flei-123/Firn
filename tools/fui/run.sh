@@ -460,7 +460,19 @@ build dom
 "$W/dom"
 
 echo
-echo "== 18o. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
+echo "== 18o. THE APP TREE: EVENTS, POINTERS, GESTURES, CHANGE RECORDS =="
+# tools/fui/event_main.fi (docs/APP-TREE.md T3, T4, T6): capture -> target
+# -> bubble with stop / stop-now / prevent-default and control.fi as the
+# default action; pointer ids, primary, pointer capture (also across a
+# rebuild); tap, double tap, long press, pan + fling, pinch + rotate with an
+# arena that lets exactly one win and cancels the loser's press; change
+# records by key -- none for a renumbering rebuild, none for a secret.
+# Everything with synthetic event streams.
+build event
+"$W/event"
+
+echo
+echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
 # for BOTH platforms from one source -- `import fui.apphost` resolves to
 # lib/@linux/ natively and to lib/@web/ with --target=wasm32-browser --
