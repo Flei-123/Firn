@@ -1,0 +1,1309 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/event.fi -- EVENTS THROUGH THE TREE (docs/APP-TREE.md T3, T4, T6).
+//
+// ======================================================== WHY IT EXISTS
+//
+// Before this module a fUi program had ONE hovered, ONE pressed and ONE
+// focused widget (lib/fui/control.fi) and polled for activations. There
+// was no path an event travelled, no handler a node could own, no second
+// finger and no gesture. Every toolkit the concept compares settles the
+// same three questions the same way (docs/APP-TREE.md §2):
+//
+//   1. DISPATCH (T3, roadmap r94). An event goes CAPTURE -> TARGET ->
+//      BUBBLE along the path from the root to the node under the pointer
+//      (DOM [45], WPF tunnel/bubble [8], GTK phases [16]). Handlers are
+//      registered PER KEY (scene.node_id, the same key query.fi and the
+//      key paths use), so a rebuilt tree keeps its handlers without
+//      anyone re-registering them. A handler answers with bits:
+//
+//          H_STOP       stopPropagation: no further NODE sees it (the
+//                       other handlers of the current node still run)
+//          H_STOP_NOW   stopImmediatePropagation: nobody else at all
+//          H_PREVENT    preventDefault: the default action is skipped
+//
+//      At the target the capture handlers run first, then the bubble
+//      handlers -- the order the DOM standard settled on in 2021.
+//      DEFAULT ACTIONS are control.fi, unchanged: the primary pointer's
+//      down/move/up become control.mouse_down/move/up unless a handler
+//      prevented it. control.fi stays drawing-free and event-free.
+//
+//   2. POINTERS (T3/T4, roadmap r95). Every pointer carries an id, a type
+//      (mouse, touch, pen) and `primary` -- Pointer Events [47]: a pointer
+//      is primary when no other pointer of its type was down as it went
+//      down. Up to EV_PTR_MAX pointers at once. POINTER CAPTURE per id:
+//      a captured pointer's moves and its up go to the capturing node,
+//      wherever it is. Touch and pen capture IMPLICITLY at the node they
+//      went down on, as the Pointer Events spec asks for direct
+//      manipulation. A capture is remembered by KEY PATH, so it survives
+//      a rebuild between two moves.
+//
+//   3. GESTURES WITH AN ARENA (T4, roadmap r95). Flutter's GestureArena
+//      [40]: every recogniser that someone listens to joins when the
+//      first finger goes down; exactly ONE wins; the others lose, and the
+//      loser that already acted -- the press in control.fi -- is
+//      CANCELLED (control.mouse_cancel), as Android cancels a child whose
+//      gesture the parent intercepted [32]. Members:
+//
+//          G_TAP    always. Wins on the last up if nothing else won, the
+//                   finger never left TOUCH_SLOP and no second finger
+//                   came. A second tap within DOUBLE_MS and DOUBLE_DIST
+//                   on the same node adds EV_DOUBLE_TAP -- after its
+//                   EV_TAP, as the DOM sends click, click, dblclick.
+//          G_LONG   if someone on the path listens to EV_LONG_PRESS.
+//                   Wins after LONG_MS without leaving the slop
+//                   (ev_tick; or at the up, if the host never ticked).
+//                   Without a listener there is no deadline: a slow tap
+//                   is still a tap.
+//          G_PAN    if someone listens to EV_PAN_*. Wins when ONE finger
+//                   leaves the slop. EV_PAN_END carries the velocity of
+//                   the last 100 ms; at >= FLING_MIN px/s it is a fling
+//                   (Firn r71), clamped to FLING_MAX.
+//          G_PINCH  if someone listens to EV_PINCH_*. Wins when a second
+//                   finger comes down -- also over a running pan, which
+//                   then ends without a fling. Scale is the distance of
+//                   the two fingers against the start, angle their turn
+//                   in degrees (-180..180).
+//
+//      A control that DRAGS (slider, scrollbar -- control.track_active
+//      after the press) keeps its pointer: G_PAN does not join then.
+//      Mouse pointers do not take part in the arena (they have hover,
+//      drag and the wheel); they only get EV_TAP / EV_DOUBLE_TAP, like
+//      click and dblclick. `touch-action` in CSS is the same split.
+//
+//   4. CHANGE RECORDS (T6, roadmap r96). `obs_observe` compares the tree
+//      with the one of the last call, BY KEY PATH, and writes batched
+//      records -- MutationObserver [46], not the synchronous mutation
+//      events Chrome removed [48]: ADDED, REMOVED, MOVED (the order among
+//      keyed siblings changed), TEXT, VALUE, STATE (disabled, selected),
+//      FOCUS. A rebuild that only renumbers nodes gives NO record. A
+//      SECRET field (a11y.a11y_is_secret) never gives a TEXT or VALUE
+//      record: even "it changed" would count the keystrokes of a
+//      password (T8). Only keyed nodes are reported -- an unkeyed node
+//      has no identity across two frames.
+//
+// Everything is tested with synthetic event streams in
+// tools/fui/event_main.fi, not by looking. Nothing here allocates.
+export {
+    Ev, Router, Obs,
+    router_new, router_bind_panel, router_changes, router_winners,
+    ev_on, ev_off, ev_handler_count, ev_handlers_refused, ev_dispatch,
+    ev_path_overflow, ev_pointers_refused,
+    ev_pointer_down, ev_pointer_move, ev_pointer_up, ev_pointer_cancel,
+    ev_tick, ev_set_capture, ev_release_capture, ev_capture_of,
+    ev_pointers_down, ev_winner, ev_arena_open,
+    ev_kind, ev_phase, ev_target, ev_current, ev_pid, ev_ptype,
+    ev_primary, ev_x, ev_y, ev_dx, ev_dy, ev_vx, ev_vy, ev_scale,
+    ev_angle, ev_count, ev_fling, ev_time, ev_bit, ev_new,
+    obs_new, obs_observe, obs_count, obs_kept, obs_kind, obs_key,
+    obs_node, obs_reset,
+    EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_POINTER_CANCEL,
+    EV_TAP, EV_DOUBLE_TAP, EV_LONG_PRESS, EV_PAN_START, EV_PAN_MOVE,
+    EV_PAN_END, EV_PINCH_START, EV_PINCH_MOVE, EV_PINCH_END,
+    EV_POINTER_ALL, EV_PAN_ALL, EV_PINCH_ALL,
+    PH_NONE, PH_CAPTURE, PH_TARGET, PH_BUBBLE,
+    H_GO, H_STOP, H_STOP_NOW, H_PREVENT,
+    PT_MOUSE, PT_TOUCH, PT_PEN,
+    G_NONE, G_TAP, G_LONG, G_PAN, G_PINCH,
+    MC_ADDED, MC_REMOVED, MC_MOVED, MC_TEXT, MC_VALUE, MC_STATE, MC_FOCUS,
+    TOUCH_SLOP, LONG_MS, DOUBLE_MS, DOUBLE_DIST, FLING_MIN, FLING_MAX,
+    EV_HANDLER_MAX, EV_PTR_MAX, EV_PATH_MAX, OBS_REC_MAX,
+}
+
+import fui.scene
+import fui.widget
+import fui.control
+import fui.query
+import fui.a11y
+import svg.matrix
+
+// ============================================================ CONSTANTS
+
+// Event kinds. A handler names the kinds it wants as a bit mask
+// (ev_bit(kind), or the *_ALL masks).
+const EV_POINTER_DOWN: u32 = 1
+const EV_POINTER_MOVE: u32 = 2
+const EV_POINTER_UP: u32 = 3
+const EV_POINTER_CANCEL: u32 = 4
+const EV_TAP: u32 = 5
+const EV_DOUBLE_TAP: u32 = 6
+const EV_LONG_PRESS: u32 = 7
+const EV_PAN_START: u32 = 8
+const EV_PAN_MOVE: u32 = 9
+const EV_PAN_END: u32 = 10
+const EV_PINCH_START: u32 = 11
+const EV_PINCH_MOVE: u32 = 12
+const EV_PINCH_END: u32 = 13
+// 2+4+8+16, 256+512+1024, 2048+4096+8192
+const EV_POINTER_ALL: u32 = 30
+const EV_PAN_ALL: u32 = 1792
+const EV_PINCH_ALL: u32 = 14336
+
+const PH_NONE: u32 = 0
+const PH_CAPTURE: u32 = 1
+const PH_TARGET: u32 = 2
+const PH_BUBBLE: u32 = 3
+
+const H_GO: u32 = 0
+const H_STOP: u32 = 1
+const H_STOP_NOW: u32 = 2
+const H_PREVENT: u32 = 4
+
+const PT_MOUSE: u32 = 1
+const PT_TOUCH: u32 = 2
+const PT_PEN: u32 = 3
+
+// arena members and winners (bits)
+const G_NONE: u32 = 0
+const G_TAP: u32 = 1
+const G_LONG: u32 = 2
+const G_PAN: u32 = 4
+const G_PINCH: u32 = 8
+
+// change records
+const MC_ADDED: u32 = 1
+const MC_REMOVED: u32 = 2
+const MC_MOVED: u32 = 3
+const MC_TEXT: u32 = 4
+const MC_VALUE: u32 = 5
+const MC_STATE: u32 = 6
+const MC_FOCUS: u32 = 7
+
+// THE NUMBERS OF THE GESTURES, in pixels and milliseconds. They are the
+// ones the platforms use: Android's long press 500 ms and double tap
+// 300 ms, Flutter's kMinFlingVelocity 50 and kMaxFlingVelocity 8000
+// logical px/s. The slop is 16 px, between Android's 8 dp and Flutter's
+// 18 logical px; double-tap slop 100 like Flutter's kDoubleTapSlop.
+const TOUCH_SLOP: f64 = 16.0
+const LONG_MS: i64 = 500
+const DOUBLE_MS: i64 = 300
+const DOUBLE_DIST: f64 = 100.0
+const FLING_MIN: f64 = 50.0
+const FLING_MAX: f64 = 8000.0
+// the window the fling velocity is measured over
+const VEL_MS: i64 = 100
+
+// The fixed sizes. The lengths below must be written as digits (Firn takes
+// no name as an array length); these names are the same numbers.
+const EV_HANDLER_MAX: usize = 64
+const EV_PTR_MAX: usize = 10
+const EV_PATH_MAX: usize = 32
+const SAMPLE_MAX: usize = 16
+const OBS_REC_MAX: usize = 64
+const NONE: usize = 4294967295
+
+// ============================================================ THE EVENT
+
+struct Ev {
+    kind: u32,
+    phase: u32,
+    target: usize,
+    current: usize,
+    pid: u32,
+    ptype: u32,
+    primary: u32,
+    x: f64,
+    y: f64,
+    // pan: the movement since the last pan event (PAN_START: since down)
+    dx: f64,
+    dy: f64,
+    // PAN_END: velocity in px/s; `fling` 1 when it is a fling
+    vx: f64,
+    vy: f64,
+    fling: u32,
+    // pinch: the scale against the start and the turn in degrees
+    scale: f64,
+    angle: f64,
+    // how many pointers of the sequence are down
+    count: usize,
+    t: i64,
+    // dispatch state: 0 go, 1 stopped after this node, 2 stopped now
+    stop: u32,
+    prevented: u32,
+}
+
+fn ev_new(kind: u32) -> Ev {
+    return Ev { kind: kind, phase: PH_NONE, target: NONE, current: NONE,
+        pid: 0 as u32, ptype: 0 as u32, primary: 0 as u32, x: 0.0, y: 0.0,
+        dx: 0.0, dy: 0.0, vx: 0.0, vy: 0.0, fling: 0 as u32, scale: 1.0,
+        angle: 0.0, count: 0, t: 0, stop: 0 as u32, prevented: 0 as u32 }
+}
+
+fn ev_bit(kind: u32) -> u32 { return (1 as u32) << kind }
+
+fn ev_kind(e: *mut Ev) -> u32 { return (*e).kind }
+fn ev_phase(e: *mut Ev) -> u32 { return (*e).phase }
+fn ev_target(e: *mut Ev) -> usize { return (*e).target }
+fn ev_current(e: *mut Ev) -> usize { return (*e).current }
+fn ev_pid(e: *mut Ev) -> u32 { return (*e).pid }
+fn ev_ptype(e: *mut Ev) -> u32 { return (*e).ptype }
+fn ev_primary(e: *mut Ev) -> bool { return (*e).primary != 0 as u32 }
+fn ev_x(e: *mut Ev) -> f64 { return (*e).x }
+fn ev_y(e: *mut Ev) -> f64 { return (*e).y }
+fn ev_dx(e: *mut Ev) -> f64 { return (*e).dx }
+fn ev_dy(e: *mut Ev) -> f64 { return (*e).dy }
+fn ev_vx(e: *mut Ev) -> f64 { return (*e).vx }
+fn ev_vy(e: *mut Ev) -> f64 { return (*e).vy }
+fn ev_fling(e: *mut Ev) -> bool { return (*e).fling != 0 as u32 }
+fn ev_scale(e: *mut Ev) -> f64 { return (*e).scale }
+fn ev_angle(e: *mut Ev) -> f64 { return (*e).angle }
+fn ev_count(e: *mut Ev) -> usize { return (*e).count }
+fn ev_time(e: *mut Ev) -> i64 { return (*e).t }
+
+// ============================================================ THE ROUTER
+
+struct Handler {
+    key: u32,
+    kinds: u32,
+    capture: u32,
+    f: fn(u64, *mut Ev) -> u32,
+    ud: u64,
+}
+
+fn h_none(ud: u64, e: *mut Ev) -> u32 { return H_GO }
+
+fn handler_blank() -> Handler {
+    return Handler { key: 0 as u32, kinds: 0 as u32, capture: 0 as u32,
+        f: h_none, ud: 0 }
+}
+
+struct Ptr {
+    used: u32,
+    id: u32,
+    ptype: u32,
+    primary: u32,
+    x: f64,
+    y: f64,
+    x0: f64,
+    y0: f64,
+    t0: i64,
+    // the node it went down on
+    down: usize,
+    // the capturing node (NONE = none) and its key path (0 = unkeyed)
+    cap: usize,
+    caph: u64,
+    // left the slop at some point
+    moved: u32,
+}
+
+fn ptr_blank() -> Ptr {
+    return Ptr { used: 0 as u32, id: 0 as u32, ptype: 0 as u32,
+        primary: 0 as u32, x: 0.0, y: 0.0, x0: 0.0, y0: 0.0, t0: 0,
+        down: NONE, cap: NONE, caph: 0, moved: 0 as u32 }
+}
+
+struct Sample {
+    t: i64,
+    x: f64,
+    y: f64,
+}
+
+fn sample_blank() -> Sample { return Sample { t: 0, x: 0.0, y: 0.0 } }
+
+struct Router {
+    hs: [Handler; 64],
+    nh: usize,
+    hof: usize,
+    ps: [Ptr; 10],
+    pof: usize,
+    pathof: usize,
+    // control.Panel for the default actions (0 = none) and the change
+    // bits they returned since the last router_changes
+    pn: u64,
+    ch: u32,
+    // THE ARENA of the running touch/pen sequence
+    seq: u32,
+    members: u32,
+    winner: u32,
+    tap_ok: u32,
+    lead: usize,
+    seq_t0: i64,
+    seq_target: usize,
+    winners: usize,
+    // pan
+    pan_x: f64,
+    pan_y: f64,
+    smp: [Sample; 16],
+    nsmp: usize,
+    // pinch: the two pointers (slots), start distance and angle, done
+    pa: usize,
+    pb: usize,
+    pd0: f64,
+    pang0: f64,
+    pdone: u32,
+    // the last tap, for the double tap
+    lt_has: u32,
+    lt_t: i64,
+    lt_x: f64,
+    lt_y: f64,
+    lt_node: usize,
+}
+
+fn router_new() -> Router {
+    return Router { hs: [handler_blank(); 64], nh: 0, hof: 0,
+        ps: [ptr_blank(); 10], pof: 0, pathof: 0, pn: 0, ch: 0 as u32,
+        seq: 0 as u32, members: 0 as u32, winner: G_NONE,
+        tap_ok: 0 as u32, lead: NONE, seq_t0: 0, seq_target: NONE,
+        winners: 0, pan_x: 0.0, pan_y: 0.0,
+        smp: [sample_blank(); 16], nsmp: 0,
+        pa: NONE, pb: NONE, pd0: 1.0, pang0: 0.0, pdone: 0 as u32,
+        lt_has: 0 as u32, lt_t: 0, lt_x: 0.0, lt_y: 0.0, lt_node: NONE }
+}
+
+// The panel whose widgets get the default actions. Without one the
+// router only dispatches.
+fn router_bind_panel(r: *mut Router, pn: *mut control.Panel) {
+    (*r).pn = pn as u64
+}
+
+// The control.fi change bits (CH_REPAINT, CH_ACTIVATE, ...) the default
+// actions produced since the last call; taking them clears them.
+fn router_changes(r: *mut Router) -> u32 {
+    let c: u32 = (*r).ch
+    (*r).ch = control.CH_NONE
+    return c
+}
+
+// How many arenas were decided (one per winner) -- for the tests.
+fn router_winners(r: *mut Router) -> usize { return (*r).winners }
+
+// ============================================================ 1. HANDLERS
+
+// Register a handler for the node(s) with key `key`, for the kinds in
+// `kinds` (bit mask), in the capture (`capture` true) or bubble phase.
+// False when the table is full; ev_handlers_refused counts that.
+fn ev_on(r: *mut Router, key: u32, kinds: u32, capture: bool,
+    f: fn(u64, *mut Ev) -> u32, ud: u64) -> bool {
+    if (*r).nh >= EV_HANDLER_MAX {
+        (*r).hof = (*r).hof + 1
+        return false
+    }
+    var cp: u32 = 0 as u32
+    if capture {
+        cp = 1 as u32
+    }
+    (*r).hs[(*r).nh] = Handler { key: key, kinds: kinds, capture: cp,
+        f: f, ud: ud }
+    (*r).nh = (*r).nh + 1
+    return true
+}
+
+// Remove every handler of `key`; how many went.
+fn ev_off(r: *mut Router, key: u32) -> usize {
+    var w: usize = 0
+    var k: usize = 0
+    var gone: usize = 0
+    while k < (*r).nh {
+        if (*r).hs[k].key == key {
+            gone = gone + 1
+        } else {
+            (*r).hs[w] = (*r).hs[k]
+            w = w + 1
+        }
+        k = k + 1
+    }
+    (*r).nh = w
+    return gone
+}
+
+fn ev_handler_count(r: *mut Router) -> usize { return (*r).nh }
+fn ev_handlers_refused(r: *mut Router) -> usize { return (*r).hof }
+fn ev_path_overflow(r: *mut Router) -> usize { return (*r).pathof }
+fn ev_pointers_refused(r: *mut Router) -> usize { return (*r).pof }
+
+// ============================================================ 2. DISPATCH
+
+// The handlers of one node for one phase. `want` 1: the capture
+// handlers, 0: the bubble handlers.
+fn call_node(r: *mut Router, sc: *mut scene.Scene, e: *mut Ev, i: usize,
+    phase: u32, want: u32) {
+    let key: u32 = scene.node_id(sc, i)
+    if key == 0 as u32 {
+        return
+    }
+    let bit: u32 = ev_bit((*e).kind)
+    var k: usize = 0
+    while k < (*r).nh {
+        let h: *mut Handler = &(*r).hs[k]
+        if (*h).key == key && ((*h).kinds & bit) != 0 as u32
+            && (*h).capture == want {
+            (*e).current = i
+            (*e).phase = phase
+            let res: u32 = (*h).f((*h).ud, e)
+            if (res & H_PREVENT) != 0 as u32 {
+                (*e).prevented = 1 as u32
+            }
+            if (res & H_STOP_NOW) != 0 as u32 {
+                (*e).stop = 2 as u32
+                return
+            }
+            if (res & H_STOP) != 0 as u32 {
+                (*e).stop = 1 as u32
+            }
+        }
+        k = k + 1
+    }
+}
+
+// Send `e` from the root to (*e).target and back. True when the default
+// action may run (nobody answered H_PREVENT).
+fn ev_dispatch(r: *mut Router, sc: *mut scene.Scene, e: *mut Ev) -> bool {
+    (*e).stop = 0 as u32
+    (*e).prevented = 0 as u32
+    let t: usize = (*e).target
+    if t == NONE || t >= scene.scene_count(sc) {
+        (*e).phase = PH_NONE
+        return true
+    }
+    // path[0] = target ... path[n-1] = root
+    var path: [usize; 32] = [0; 32]
+    var n: usize = 0
+    var j: usize = t
+    while j != NONE && j < scene.scene_count(sc) {
+        if n == EV_PATH_MAX {
+            (*r).pathof = (*r).pathof + 1
+            j = NONE
+        } else {
+            path[n] = j
+            n = n + 1
+            j = scene.scene_parent(sc, j)
+        }
+    }
+    // CAPTURE: root down to the target's parent
+    var d: usize = n
+    while d > 1 && (*e).stop == 0 as u32 {
+        d = d - 1
+        call_node(r, sc, e, path[d], PH_CAPTURE, 1 as u32)
+    }
+    // TARGET: capture handlers first, then bubble handlers
+    if (*e).stop == 0 as u32 {
+        call_node(r, sc, e, t, PH_TARGET, 1 as u32)
+        if (*e).stop != 2 as u32 {
+            call_node(r, sc, e, t, PH_TARGET, 0 as u32)
+        }
+    }
+    // BUBBLE: the parent up to the root
+    d = 1
+    while d < n && (*e).stop == 0 as u32 {
+        call_node(r, sc, e, path[d], PH_BUBBLE, 0 as u32)
+        d = d + 1
+    }
+    (*e).phase = PH_NONE
+    (*e).current = NONE
+    return (*e).prevented == 0 as u32
+}
+
+// Which gesture kinds does anyone on the path of `t` listen to? The arena
+// members besides G_TAP.
+fn members_on_path(r: *mut Router, sc: *mut scene.Scene, t: usize) -> u32 {
+    var m: u32 = G_TAP
+    var j: usize = t
+    var depth: usize = 0
+    while j != NONE && j < scene.scene_count(sc) && depth < EV_PATH_MAX {
+        let key: u32 = scene.node_id(sc, j)
+        if key != 0 as u32 {
+            var k: usize = 0
+            while k < (*r).nh {
+                if (*r).hs[k].key == key {
+                    let ks: u32 = (*r).hs[k].kinds
+                    if (ks & ev_bit(EV_LONG_PRESS)) != 0 as u32 {
+                        m = m | G_LONG
+                    }
+                    if (ks & EV_PAN_ALL) != 0 as u32 {
+                        m = m | G_PAN
+                    }
+                    if (ks & EV_PINCH_ALL) != 0 as u32 {
+                        m = m | G_PINCH
+                    }
+                }
+                k = k + 1
+            }
+        }
+        j = scene.scene_parent(sc, j)
+        depth = depth + 1
+    }
+    return m
+}
+
+// ============================================================ 3. POINTERS
+
+fn slot_of(r: *mut Router, pid: u32) -> usize {
+    var k: usize = 0
+    while k < EV_PTR_MAX {
+        if (*r).ps[k].used != 0 as u32 && (*r).ps[k].id == pid {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+fn free_slot(r: *mut Router) -> usize {
+    var k: usize = 0
+    while k < EV_PTR_MAX {
+        if (*r).ps[k].used == 0 as u32 {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+// How many pointers of a kind are down; `touch` true: touch and pen.
+fn count_down(r: *mut Router, touch: bool) -> usize {
+    var c: usize = 0
+    var k: usize = 0
+    while k < EV_PTR_MAX {
+        if (*r).ps[k].used != 0 as u32 {
+            let tt: bool = (*r).ps[k].ptype != PT_MOUSE
+            if tt == touch {
+                c = c + 1
+            }
+        }
+        k = k + 1
+    }
+    return c
+}
+
+fn ev_pointers_down(r: *mut Router) -> usize {
+    return count_down(r, true) + count_down(r, false)
+}
+
+// Where the events of this pointer go: its capture (by key path first,
+// so a rebuild does not lose it), otherwise the node under it.
+fn route(r: *mut Router, sc: *mut scene.Scene, s: usize) -> usize {
+    let p: *mut Ptr = &(*r).ps[s]
+    if (*p).cap != NONE {
+        if (*p).caph != 0 {
+            let f: usize = query.query_find_hash(sc, (*p).caph)
+            if f != NONE {
+                return f
+            }
+        } else if (*p).cap < scene.scene_count(sc) {
+            return (*p).cap
+        }
+    }
+    return scene.scene_hit(sc, (*p).x, (*p).y)
+}
+
+// setPointerCapture: the moves and the up of `pid` go to `node`.
+fn ev_set_capture(r: *mut Router, sc: *mut scene.Scene, pid: u32,
+    node: usize) -> bool {
+    let s: usize = slot_of(r, pid)
+    if s == NONE || node >= scene.scene_count(sc) {
+        return false
+    }
+    (*r).ps[s].cap = node
+    (*r).ps[s].caph = query.query_key_hash(sc, node)
+    return true
+}
+
+fn ev_release_capture(r: *mut Router, pid: u32) -> bool {
+    let s: usize = slot_of(r, pid)
+    if s == NONE {
+        return false
+    }
+    (*r).ps[s].cap = NONE
+    (*r).ps[s].caph = 0
+    return true
+}
+
+// The node capturing `pid`, NONE when none (or the pointer is not down).
+fn ev_capture_of(r: *mut Router, sc: *mut scene.Scene, pid: u32) -> usize {
+    let s: usize = slot_of(r, pid)
+    if s == NONE || (*r).ps[s].cap == NONE {
+        return NONE
+    }
+    if (*r).ps[s].caph != 0 {
+        return query.query_find_hash(sc, (*r).ps[s].caph)
+    }
+    return (*r).ps[s].cap
+}
+
+fn ev_winner(r: *mut Router) -> u32 { return (*r).winner }
+fn ev_arena_open(r: *mut Router) -> bool { return (*r).seq != 0 as u32 }
+
+// A pointer event for slot `s`.
+fn ptr_event(r: *mut Router, kind: u32, s: usize, target: usize,
+    t: i64) -> Ev {
+    var e: Ev = ev_new(kind)
+    let p: *mut Ptr = &(*r).ps[s]
+    e.target = target
+    e.pid = (*p).id
+    e.ptype = (*p).ptype
+    e.primary = (*p).primary
+    e.x = (*p).x
+    e.y = (*p).y
+    e.count = count_down(r, (*p).ptype != PT_MOUSE)
+    e.t = t
+    return e
+}
+
+// A gesture event at the node the sequence started on.
+fn gesture_event(r: *mut Router, sc: *mut scene.Scene, kind: u32,
+    x: f64, y: f64, t: i64) -> Ev {
+    var e: Ev = ev_new(kind)
+    e.target = (*r).seq_target
+    if (*r).lead != NONE {
+        e.pid = (*r).ps[(*r).lead].id
+        e.ptype = (*r).ps[(*r).lead].ptype
+        e.primary = (*r).ps[(*r).lead].primary
+    }
+    e.x = x
+    e.y = y
+    e.count = count_down(r, true)
+    e.t = t
+    return e
+}
+
+fn without(m: u32, g: u32) -> u32 {
+    return m & ((4294967295 as u32) ^ g)
+}
+
+fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    return matrix.m_sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
+}
+
+// The panel's press loses: it must not end as a click.
+fn cancel_press(r: *mut Router) {
+    if (*r).pn != 0 {
+        (*r).ch = (*r).ch | control.mouse_cancel((*r).pn as *mut control.Panel)
+    }
+}
+
+// Recogniser `g` wins the arena; every other member loses.
+fn win(r: *mut Router, g: u32) {
+    (*r).winner = g
+    (*r).winners = (*r).winners + 1
+    (*r).tap_ok = 0 as u32
+    if g != G_TAP {
+        cancel_press(r)
+    }
+}
+
+fn add_sample(r: *mut Router, t: i64, x: f64, y: f64) {
+    if (*r).nsmp == SAMPLE_MAX {
+        var k: usize = 1
+        while k < SAMPLE_MAX {
+            (*r).smp[k - 1] = (*r).smp[k]
+            k = k + 1
+        }
+        (*r).nsmp = SAMPLE_MAX - 1
+    }
+    (*r).smp[(*r).nsmp] = Sample { t: t, x: x, y: y }
+    (*r).nsmp = (*r).nsmp + 1
+}
+
+// The pinch values of the two pinch pointers: distance and angle.
+fn pinch_now(r: *mut Router, d: *mut f64, a: *mut f64) {
+    let p: *mut Ptr = &(*r).ps[(*r).pa]
+    let q: *mut Ptr = &(*r).ps[(*r).pb]
+    *d = dist((*p).x, (*p).y, (*q).x, (*q).y)
+    *a = matrix.m_atan2_grad((*q).y - (*p).y, (*q).x - (*p).x)
+}
+
+fn pinch_mid_x(r: *mut Router) -> f64 {
+    return ((*r).ps[(*r).pa].x + (*r).ps[(*r).pb].x) / 2.0
+}
+fn pinch_mid_y(r: *mut Router) -> f64 {
+    return ((*r).ps[(*r).pa].y + (*r).ps[(*r).pb].y) / 2.0
+}
+
+fn turn(a: f64) -> f64 {
+    var v: f64 = a
+    while v > 180.0 {
+        v = v - 360.0
+    }
+    while v < 0.0 - 180.0 {
+        v = v + 360.0
+    }
+    return v
+}
+
+fn pinch_event(r: *mut Router, sc: *mut scene.Scene, kind: u32, t: i64) {
+    var d: f64 = 0.0
+    var a: f64 = 0.0
+    pinch_now(r, &d, &a)
+    var e: Ev = gesture_event(r, sc, kind, pinch_mid_x(r), pinch_mid_y(r), t)
+    if (*r).pd0 > 0.0 {
+        e.scale = d / (*r).pd0
+    }
+    e.angle = turn(a - (*r).pang0)
+    let ok: bool = ev_dispatch(r, sc, &e)
+}
+
+fn pan_end(r: *mut Router, sc: *mut scene.Scene, t: i64, fling_ok: bool) {
+    let p: *mut Ptr = &(*r).ps[(*r).lead]
+    var e: Ev = gesture_event(r, sc, EV_PAN_END, (*p).x, (*p).y, t)
+    if fling_ok {
+        // the oldest sample inside the window, against the last one
+        var k: usize = 0
+        var o: usize = NONE
+        while k < (*r).nsmp {
+            if o == NONE && (*r).smp[k].t >= t - VEL_MS {
+                o = k
+            }
+            k = k + 1
+        }
+        if o != NONE && (*r).nsmp > 0 {
+            let l: usize = (*r).nsmp - 1
+            let dt: i64 = (*r).smp[l].t - (*r).smp[o].t
+            if dt > 0 {
+                var vx: f64 = ((*r).smp[l].x - (*r).smp[o].x) * 1000.0 / (dt as f64)
+                var vy: f64 = ((*r).smp[l].y - (*r).smp[o].y) * 1000.0 / (dt as f64)
+                let sp: f64 = matrix.m_sqrt(vx * vx + vy * vy)
+                if sp > FLING_MAX {
+                    vx = vx * FLING_MAX / sp
+                    vy = vy * FLING_MAX / sp
+                }
+                e.vx = vx
+                e.vy = vy
+                if sp >= FLING_MIN {
+                    e.fling = 1 as u32
+                }
+            }
+        }
+    }
+    let ok: bool = ev_dispatch(r, sc, &e)
+}
+
+fn close_arena(r: *mut Router) {
+    (*r).seq = 0 as u32
+    (*r).members = 0 as u32
+    (*r).winner = G_NONE
+    (*r).tap_ok = 0 as u32
+    (*r).lead = NONE
+    (*r).pa = NONE
+    (*r).pb = NONE
+    (*r).pdone = 0 as u32
+    (*r).nsmp = 0
+}
+
+// A tap at node `node`, time `t_down` of its down, `t` of its up: EV_TAP,
+// and EV_DOUBLE_TAP when it is the second of two.
+fn tap(r: *mut Router, sc: *mut scene.Scene, s: usize, node: usize,
+    t_down: i64, t: i64) {
+    let p: *mut Ptr = &(*r).ps[s]
+    var e: Ev = ptr_event(r, EV_TAP, s, node, t)
+    let ok: bool = ev_dispatch(r, sc, &e)
+    if (*r).lt_has != 0 as u32 && t_down - (*r).lt_t <= DOUBLE_MS
+        && (*r).lt_node == node
+        && dist((*r).lt_x, (*r).lt_y, (*p).x, (*p).y) <= DOUBLE_DIST {
+        var e2: Ev = ptr_event(r, EV_DOUBLE_TAP, s, node, t)
+        let ok2: bool = ev_dispatch(r, sc, &e2)
+        (*r).lt_has = 0 as u32
+        return
+    }
+    (*r).lt_has = 1 as u32
+    (*r).lt_t = t
+    (*r).lt_x = (*p).x
+    (*r).lt_y = (*p).y
+    (*r).lt_node = node
+}
+
+// A POINTER GOES DOWN. The host calls this for every pointer, with its
+// id, type, position and a time in milliseconds. Returns false when
+// there is no free slot (EV_PTR_MAX pointers are already down).
+fn ev_pointer_down(r: *mut Router, sc: *mut scene.Scene, pid: u32,
+    ptype: u32, x: f64, y: f64, t: i64) -> bool {
+    if slot_of(r, pid) != NONE {
+        // a down without an up: the host lost the up
+        let gone: bool = ev_pointer_cancel(r, sc, pid, t)
+    }
+    let s: usize = free_slot(r)
+    if s == NONE {
+        (*r).pof = (*r).pof + 1
+        return false
+    }
+    let touch: bool = ptype != PT_MOUSE
+    var primary: u32 = 0 as u32
+    if count_down(r, touch) == 0 {
+        primary = 1 as u32
+    }
+    let target: usize = scene.scene_hit(sc, x, y)
+    (*r).ps[s] = Ptr { used: 1 as u32, id: pid, ptype: ptype,
+        primary: primary, x: x, y: y, x0: x, y0: y, t0: t, down: target,
+        cap: NONE, caph: 0, moved: 0 as u32 }
+    if touch && target != NONE {
+        // implicit capture for direct manipulation
+        (*r).ps[s].cap = target
+        (*r).ps[s].caph = query.query_key_hash(sc, target)
+    }
+
+    var e: Ev = ptr_event(r, EV_POINTER_DOWN, s, target, t)
+    let dflt: bool = ev_dispatch(r, sc, &e)
+    if dflt && primary != 0 as u32 && (*r).pn != 0 {
+        (*r).ch = (*r).ch | control.mouse_down((*r).pn as *mut control.Panel, x, y)
+    }
+    if !touch {
+        return true
+    }
+
+    // THE ARENA
+    if (*r).seq == 0 as u32 {
+        close_arena(r)
+        (*r).seq = 1 as u32
+        (*r).members = members_on_path(r, sc, target)
+        // a control that drags keeps its pointer
+        if (*r).pn != 0 && control.track_active((*r).pn as *mut control.Panel) {
+            (*r).members = without((*r).members, G_PAN)
+        }
+        (*r).winner = G_NONE
+        (*r).tap_ok = 1 as u32
+        (*r).lead = s
+        (*r).seq_t0 = t
+        (*r).seq_target = target
+        add_sample(r, t, x, y)
+        return true
+    }
+    // a further finger: no tap, no long press any more
+    (*r).tap_ok = 0 as u32
+    (*r).members = without((*r).members, G_TAP | G_LONG)
+    if ((*r).winner == G_NONE || (*r).winner == G_PAN)
+        && ((*r).members & G_PINCH) != 0 as u32 && (*r).lead != NONE {
+        if (*r).winner == G_PAN {
+            pan_end(r, sc, t, false)
+        }
+        win(r, G_PINCH)
+        (*r).pa = (*r).lead
+        (*r).pb = s
+        var d: f64 = 0.0
+        var a: f64 = 0.0
+        pinch_now(r, &d, &a)
+        (*r).pd0 = d
+        (*r).pang0 = a
+        pinch_event(r, sc, EV_PINCH_START, t)
+    } else if (*r).winner == G_NONE && (*r).lead != NONE
+        && (*r).ps[(*r).lead].primary != 0 as u32 {
+        // nobody listens to a pinch: the first finger's press still must
+        // not become a click, it is no tap any more
+        cancel_press(r)
+    }
+    return true
+}
+
+fn ev_pointer_move(r: *mut Router, sc: *mut scene.Scene, pid: u32,
+    x: f64, y: f64, t: i64) -> bool {
+    let s: usize = slot_of(r, pid)
+    if s == NONE {
+        return false
+    }
+    let p: *mut Ptr = &(*r).ps[s]
+    (*p).x = x
+    (*p).y = y
+    var e: Ev = ptr_event(r, EV_POINTER_MOVE, s, route(r, sc, s), t)
+    let dflt: bool = ev_dispatch(r, sc, &e)
+    if dflt && (*p).primary != 0 as u32 && (*r).pn != 0 {
+        (*r).ch = (*r).ch | control.mouse_move((*r).pn as *mut control.Panel, x, y)
+    }
+    if (*p).ptype == PT_MOUSE || (*r).seq == 0 as u32 {
+        return true
+    }
+    if dist(x, y, (*p).x0, (*p).y0) > TOUCH_SLOP {
+        (*p).moved = 1 as u32
+    }
+    if s == (*r).lead {
+        add_sample(r, t, x, y)
+    }
+    if (*r).winner == G_NONE && (*p).moved != 0 as u32 {
+        (*r).tap_ok = 0 as u32
+        (*r).members = without((*r).members, G_TAP | G_LONG)
+        if ((*r).members & G_PAN) != 0 as u32 && s == (*r).lead
+            && count_down(r, true) == 1 {
+            win(r, G_PAN)
+            var ps: Ev = gesture_event(r, sc, EV_PAN_START, x, y, t)
+            ps.dx = x - (*p).x0
+            ps.dy = y - (*p).y0
+            let ok: bool = ev_dispatch(r, sc, &ps)
+            (*r).pan_x = x
+            (*r).pan_y = y
+            return true
+        }
+    }
+    if (*r).winner == G_PAN && s == (*r).lead {
+        var pm: Ev = gesture_event(r, sc, EV_PAN_MOVE, x, y, t)
+        pm.dx = x - (*r).pan_x
+        pm.dy = y - (*r).pan_y
+        (*r).pan_x = x
+        (*r).pan_y = y
+        let ok: bool = ev_dispatch(r, sc, &pm)
+    }
+    if (*r).winner == G_PINCH && (*r).pdone == 0 as u32
+        && (s == (*r).pa || s == (*r).pb) {
+        pinch_event(r, sc, EV_PINCH_MOVE, t)
+    }
+    return true
+}
+
+fn ev_pointer_up(r: *mut Router, sc: *mut scene.Scene, pid: u32,
+    x: f64, y: f64, t: i64) -> bool {
+    let s: usize = slot_of(r, pid)
+    if s == NONE {
+        return false
+    }
+    let p: *mut Ptr = &(*r).ps[s]
+    (*p).x = x
+    (*p).y = y
+    let target: usize = route(r, sc, s)
+    var e: Ev = ptr_event(r, EV_POINTER_UP, s, target, t)
+    let dflt: bool = ev_dispatch(r, sc, &e)
+    if dflt && (*p).primary != 0 as u32 && (*r).pn != 0 {
+        (*r).ch = (*r).ch | control.mouse_up((*r).pn as *mut control.Panel, x, y)
+    }
+
+    if (*p).ptype == PT_MOUSE {
+        // click: up on the node it went down on
+        let under: usize = scene.scene_hit(sc, x, y)
+        if under != NONE && under == (*p).down {
+            tap(r, sc, s, under, (*p).t0, t)
+        }
+        (*p).used = 0 as u32
+        return true
+    }
+
+    if (*r).seq != 0 as u32 {
+        if s == (*r).lead {
+            add_sample(r, t, x, y)
+        }
+        if (*r).winner == G_PINCH && (*r).pdone == 0 as u32
+            && (s == (*r).pa || s == (*r).pb) {
+            pinch_event(r, sc, EV_PINCH_END, t)
+            (*r).pdone = 1 as u32
+        }
+        if (*r).winner == G_PAN && s == (*r).lead {
+            pan_end(r, sc, t, true)
+        }
+        // the last finger of the sequence
+        if count_down(r, true) == 1 {
+            if (*r).winner == G_NONE && ((*r).members & G_LONG) != 0 as u32
+                && (*r).tap_ok != 0 as u32 && t - (*r).seq_t0 >= LONG_MS {
+                // the host never ticked: the deadline passed all the same
+                win(r, G_LONG)
+                var lp: Ev = gesture_event(r, sc, EV_LONG_PRESS, x, y, t)
+                let ok: bool = ev_dispatch(r, sc, &lp)
+            }
+            if (*r).winner == G_NONE && (*r).tap_ok != 0 as u32 {
+                win(r, G_TAP)
+                tap(r, sc, s, (*r).seq_target, (*r).seq_t0, t)
+            }
+            (*p).used = 0 as u32
+            close_arena(r)
+            return true
+        }
+    }
+    (*p).used = 0 as u32
+    return true
+}
+
+// The host took the pointer away (Android ACTION_CANCEL, pointercancel):
+// no click, the running gesture ends without a fling.
+fn ev_pointer_cancel(r: *mut Router, sc: *mut scene.Scene, pid: u32,
+    t: i64) -> bool {
+    let s: usize = slot_of(r, pid)
+    if s == NONE {
+        return false
+    }
+    let p: *mut Ptr = &(*r).ps[s]
+    var e: Ev = ptr_event(r, EV_POINTER_CANCEL, s, route(r, sc, s), t)
+    let ok: bool = ev_dispatch(r, sc, &e)
+    if (*p).primary != 0 as u32 {
+        cancel_press(r)
+    }
+    if (*p).ptype != PT_MOUSE && (*r).seq != 0 as u32 {
+        (*r).tap_ok = 0 as u32
+        if (*r).winner == G_PAN && s == (*r).lead {
+            pan_end(r, sc, t, false)
+        }
+        if (*r).winner == G_PINCH && (*r).pdone == 0 as u32
+            && (s == (*r).pa || s == (*r).pb) {
+            pinch_event(r, sc, EV_PINCH_END, t)
+            (*r).pdone = 1 as u32
+        }
+        if count_down(r, true) == 1 {
+            (*p).used = 0 as u32
+            close_arena(r)
+            return true
+        }
+    }
+    (*p).used = 0 as u32
+    return true
+}
+
+// TIME PASSES. The host calls this from its frame or timer; it is what
+// lets a long press win while the finger does not move.
+fn ev_tick(r: *mut Router, sc: *mut scene.Scene, t: i64) {
+    if (*r).seq == 0 as u32 || (*r).winner != G_NONE || (*r).lead == NONE {
+        return
+    }
+    if ((*r).members & G_LONG) == 0 as u32 || (*r).tap_ok == 0 as u32 {
+        return
+    }
+    let p: *mut Ptr = &(*r).ps[(*r).lead]
+    if (*p).used == 0 as u32 || (*p).moved != 0 as u32 {
+        return
+    }
+    if t - (*r).seq_t0 >= LONG_MS {
+        win(r, G_LONG)
+        var e: Ev = gesture_event(r, sc, EV_LONG_PRESS, (*p).x, (*p).y, t)
+        let ok: bool = ev_dispatch(r, sc, &e)
+    }
+}
+
+// ============================================================ 4. CHANGE RECORDS
+
+struct Snap {
+    h: u64,
+    // the key path of the nearest keyed ancestor (0 = none)
+    ph: u64,
+    // the rank among the keyed siblings present in both trees
+    rank: usize,
+    th: u64,
+    val: i64,
+    st: u32,
+    foc: u32,
+    sec: u32,
+    node: usize,
+}
+
+fn snap_blank() -> Snap {
+    return Snap { h: 0, ph: 0, rank: 0, th: 0, val: 0, st: 0 as u32,
+        foc: 0 as u32, sec: 0 as u32, node: NONE }
+}
+
+struct Change {
+    kind: u32,
+    h: u64,
+    node: usize,
+}
+
+fn change_blank() -> Change {
+    return Change { kind: 0 as u32, h: 0, node: NONE }
+}
+
+struct Obs {
+    a: [Snap; 128],
+    na: usize,
+    b: [Snap; 128],
+    nb: usize,
+    rs: [Change; 64],
+    nr: usize,
+    total: usize,
+    started: u32,
+}
+
+fn obs_new() -> Obs {
+    return Obs { a: [snap_blank(); 128], na: 0, b: [snap_blank(); 128],
+        nb: 0, rs: [change_blank(); 64], nr: 0, total: 0,
+        started: 0 as u32 }
+}
+
+// Forget the last tree: the next obs_observe only takes a new baseline.
+fn obs_reset(o: *mut Obs) {
+    (*o).na = 0
+    (*o).nb = 0
+    (*o).nr = 0
+    (*o).total = 0
+    (*o).started = 0 as u32
+}
+
+fn obs_count(o: *mut Obs) -> usize { return (*o).total }
+// how many records are held (<= OBS_REC_MAX)
+fn obs_kept(o: *mut Obs) -> usize { return (*o).nr }
+fn obs_kind(o: *mut Obs, k: usize) -> u32 {
+    if k >= (*o).nr {
+        return 0 as u32
+    }
+    return (*o).rs[k].kind
+}
+// the key path (query.query_find_hash finds the node)
+fn obs_key(o: *mut Obs, k: usize) -> u64 {
+    if k >= (*o).nr {
+        return 0
+    }
+    return (*o).rs[k].h
+}
+// the node number now (NONE for REMOVED)
+fn obs_node(o: *mut Obs, k: usize) -> usize {
+    if k >= (*o).nr {
+        return NONE
+    }
+    return (*o).rs[k].node
+}
+
+fn text_hash(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var k: usize = 0
+    while k < n {
+        let b: u8 = *((p + k as u64) as *mut u8)
+        h = h ^ (b as u64)
+        h = h *% (1099511628211 as u64)
+        k = k + 1
+    }
+    return h
+}
+
+fn keyed_parent_hash(sc: *mut scene.Scene, i: usize) -> u64 {
+    var j: usize = scene.scene_parent(sc, i)
+    while j != NONE && j < scene.scene_count(sc) {
+        if scene.node_id(sc, j) != 0 as u32 {
+            return query.query_key_hash(sc, j)
+        }
+        j = scene.scene_parent(sc, j)
+    }
+    return 0
+}
+
+fn snap_walk(o: *mut Obs, sc: *mut scene.Scene, i: usize, depth: usize) {
+    if i == NONE || i >= scene.scene_count(sc) || depth > EV_PATH_MAX {
+        return
+    }
+    let h: u64 = query.query_key_hash(sc, i)
+    if h != 0 && (*o).nb < scene.SCENE_MAX {
+        let e: *mut widget.Widget = scene.node_widget(sc, i)
+        var s: Snap = snap_blank()
+        s.h = h
+        s.ph = keyed_parent_hash(sc, i)
+        s.node = i
+        if a11y.a11y_is_secret(sc, i) {
+            s.sec = 1 as u32
+        } else {
+            s.th = text_hash(widget.w_text(e), widget.w_text_len(e))
+            s.val = widget.w_value(e)
+        }
+        var st: u32 = 0 as u32
+        if widget.w_is_disabled(e) {
+            st = st | (1 as u32)
+        }
+        if widget.w_is_selected(e) {
+            st = st | (2 as u32)
+        }
+        s.st = st
+        if widget.w_is_focus(e) {
+            s.foc = 1 as u32
+        }
+        (*o).b[(*o).nb] = s
+        (*o).nb = (*o).nb + 1
+    }
+    var k: usize = scene.scene_first_child(sc, i)
+    while k != NONE {
+        snap_walk(o, sc, k, depth + 1)
+        k = scene.scene_next_sibling(sc, k)
+    }
+}
+
+fn find_a(o: *mut Obs, h: u64) -> usize {
+    var k: usize = 0
+    while k < (*o).na {
+        if (*o).a[k].h == h {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+fn find_b(o: *mut Obs, h: u64) -> usize {
+    var k: usize = 0
+    while k < (*o).nb {
+        if (*o).b[k].h == h {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+fn put_rec(o: *mut Obs, kind: u32, h: u64, node: usize) {
+    if (*o).nr < OBS_REC_MAX {
+        (*o).rs[(*o).nr] = Change { kind: kind, h: h, node: node }
+        (*o).nr = (*o).nr + 1
+    }
+    (*o).total = (*o).total + 1
+}
+
+// The ranks: among the entries with the same keyed parent that exist in
+// BOTH trees, in tree order. An insertion or removal moves no rank; a
+// swap does.
+fn rank_b(o: *mut Obs) {
+    var k: usize = 0
+    while k < (*o).nb {
+        var r: usize = 0
+        var j: usize = 0
+        while j < k {
+            if (*o).b[j].ph == (*o).b[k].ph && find_a(o, (*o).b[j].h) != NONE {
+                r = r + 1
+            }
+            j = j + 1
+        }
+        (*o).b[k].rank = r
+        k = k + 1
+    }
+}
+
+fn rank_a_of(o: *mut Obs, k: usize) -> usize {
+    var r: usize = 0
+    var j: usize = 0
+    while j < k {
+        if (*o).a[j].ph == (*o).a[k].ph && find_b(o, (*o).a[j].h) != NONE {
+            r = r + 1
+        }
+        j = j + 1
+    }
+    return r
+}
+
+// ONCE PER FRAME: compare the tree with the last one, write the records.
+// Returns the FULL count; more than OBS_REC_MAX means only the first
+// OBS_REC_MAX are held. The first call only takes the baseline.
+fn obs_observe(o: *mut Obs, sc: *mut scene.Scene) -> usize {
+    (*o).nb = 0
+    (*o).nr = 0
+    (*o).total = 0
+    snap_walk(o, sc, scene.scene_root(sc), 0)
+    if (*o).started != 0 as u32 {
+        rank_b(o)
+        var k: usize = 0
+        while k < (*o).nb {
+            let n: *mut Snap = &(*o).b[k]
+            let f: usize = find_a(o, (*n).h)
+            if f == NONE {
+                put_rec(o, MC_ADDED, (*n).h, (*n).node)
+            } else {
+                let old: *mut Snap = &(*o).a[f]
+                if (*n).rank != rank_a_of(o, f) {
+                    put_rec(o, MC_MOVED, (*n).h, (*n).node)
+                }
+                if (*n).sec == 0 as u32 && (*old).sec == 0 as u32 {
+                    if (*n).th != (*old).th {
+                        put_rec(o, MC_TEXT, (*n).h, (*n).node)
+                    }
+                    if (*n).val != (*old).val {
+                        put_rec(o, MC_VALUE, (*n).h, (*n).node)
+                    }
+                }
+                if (*n).st != (*old).st {
+                    put_rec(o, MC_STATE, (*n).h, (*n).node)
+                }
+                if (*n).foc != (*old).foc {
+                    put_rec(o, MC_FOCUS, (*n).h, (*n).node)
+                }
+            }
+            k = k + 1
+        }
+        k = 0
+        while k < (*o).na {
+            if find_b(o, (*o).a[k].h) == NONE {
+                put_rec(o, MC_REMOVED, (*o).a[k].h, NONE)
+            }
+            k = k + 1
+        }
+    }
+    // the new tree becomes the old one
+    var c: usize = 0
+    while c < (*o).nb {
+        (*o).a[c] = (*o).b[c]
+        c = c + 1
+    }
+    (*o).na = (*o).nb
+    (*o).started = 1 as u32
+    return (*o).total
+}

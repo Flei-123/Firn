@@ -460,6 +460,35 @@ build dom
 "$W/dom"
 
 echo
+echo "== 18o. THE APP TREE: EVENTS, POINTERS, GESTURES, CHANGE RECORDS =="
+# tools/fui/event_main.fi (docs/APP-TREE.md T3, T4, T6): capture -> target
+# -> bubble with stop / stop-now / prevent-default and control.fi as the
+# default action; pointer ids, primary, pointer capture (also across a
+# rebuild); tap, double tap, long press, pan + fling, pinch + rotate with an
+# arena that lets exactly one win and cancels the loser's press; change
+# records by key -- none for a renumbering rebuild, none for a secret.
+# Everything with synthetic event streams.
+build event
+"$W/event"
+
+echo
+echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
+# lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
+# for BOTH platforms from one source -- `import fui.apphost` resolves to
+# lib/@linux/ natively and to lib/@web/ with --target=wasm32-browser --
+# and tools/fui/app_main.fi drives them without a window (layout, clicks,
+# keys, text fields, wrapping, scale 2). The browser half with Chromium:
+# bash tools/wasm/appdemo.sh.
+for ex in hello_window counter form; do
+    "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
+    "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
+        "examples/fui/$ex.fi"
+done
+echo "  examples/fui/{hello_window,counter,form}.fi build native + wasm32   OK"
+build app
+"$W/app"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
@@ -1025,6 +1054,10 @@ if [ "$1" = "--images" ]; then
     # Reihe, sechs Abstaende, die Pillen mit Beschriftung; darunter die
     # Feder alle 100 ms.
     "$W/merge" "$Z/fui-merge.png"
+    # fui.app (lib/fui/app.fi): the three examples of examples/fui/ as
+    # app_main paints them -- the native reference tools/wasm/appcheck.py
+    # holds the browser against, pixel for pixel.
+    "$W/app" "$Z" > /dev/null
     # DIE ZWEIRICHTUNGSSCHRIFT (Runde Bidi, 23.09.2026). Arabisch und
     # Hebraeisch neben Lateinisch, alles ueber den normalen Weg der
     # Bibliothek: Beschriftungen mit Zahlen und Klammern, dieselbe

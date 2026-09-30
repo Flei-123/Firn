@@ -590,6 +590,65 @@ under load, so ±15 %):
   takes 5.1 / 5.4 / 4.6 ms with the memo against 5.5 / 6.0 / 6.3 ms without.
   The pictures are the same octets as main at all three sizes.
 
+### 4.6 Built (30.09.2026, later): typing a password, the style/layout memo, events
+
+- **Typing into a password field (r108).** The field with an editor
+  (`render.draw_textfield`) and the plain buffer field (`draw_field`) paint and
+  measure every typed letter as a bullet — while typing, with the caret and a
+  selection — the same octets as a field that holds bullets; copy is refused.
+  `dom_main` 1b checks it key by key.
+- **Style, box-measure and layout memo per unchanged subtree (r109, the rest
+  of r100)** in `scene.fi`. A node whose parent style key and own description
+  did not change takes its resolved style from the memo; a box whose
+  children's sizes and its own inputs did not change takes its size; a
+  subtree whose layout fingerprint and rectangle did not change is replayed
+  (moved) instead of laid out. `apptree_main` compares every rectangle and
+  style of a memo frame with a frame without memo — also on hover frames with
+  a hover rule that changes colour and padding.
+
+  Measured with `tools/fui/apptree.sh` (build `big`, median of three runs,
+  shared server): tree work per frame (style + measure + layout)
+
+  | nodes | without memo | with memo |
+  |---:|---:|---:|
+  | 123 | 646 µs | 129 µs |
+  | 505 | 3,164 µs | 495 µs |
+  | 1009 | 5,414 µs | **899 µs** |
+
+  At 1009 nodes: style 1,378 → 231 µs, measure 2,569 → 324 µs, layout
+  1,757 → 16 µs. **The goal of ≤ 2 ms tree work at 1000 nodes is reached.**
+
+- **Events through the tree (r94, r95 core, r96)** in `lib/fui/event.fi`,
+  checked by `tools/fui/event_main.fi` (run.sh section 18o) with synthetic
+  event streams only:
+  - *Dispatch:* capture → target → bubble along the path from `scene_hit`;
+    handlers per key (so a rebuild keeps them); `H_STOP`, `H_STOP_NOW`,
+    `H_PREVENT`; at the target capture handlers first. The default action is
+    `control.fi`, unchanged (down/move/up of the primary pointer).
+  - *Pointers:* id, type (mouse/touch/pen), `primary` per type, up to 10 at
+    once; pointer capture per id, implicit for touch and pen, held by key
+    path so it survives a rebuild.
+  - *Gestures with an arena:* tap, double tap (after its second tap, like
+    click/click/dblclick), long press (500 ms, by `ev_tick` or at the up),
+    pan with fling (velocity over the last 100 ms, 50..8000 px/s), pinch with
+    scale and angle, pan → pinch when a second finger comes. A recogniser
+    joins only when someone on the path listens; exactly one wins; a win
+    cancels the press in `control.fi` (`mouse_cancel`), so no click follows.
+    A control that drags (slider, scrollbar) keeps its pointer. Mouse
+    pointers only get tap/double tap.
+  - *Change records:* `obs_observe` once per frame, diffed by key path,
+    batched: ADDED, REMOVED, MOVED (order among keyed siblings), TEXT,
+    VALUE, STATE, FOCUS. A renumbering rebuild gives none. A secret field
+    never gives TEXT or VALUE — not even "changed".
+  - Counter-checks (the test must fail when the code is broken): reversed
+    capture order, no press cancel, no implicit capture, stop-now as stop,
+    no MOVED, no slider exception, no fling threshold, no secret check —
+    each makes `event_main` fail.
+  - **Still open (r95 rest):** the hosts do not deliver pointer ids yet.
+    Android turns pointer 0 into a mouse and ignores `ACTION_POINTER_*`; the
+    web host drops `pointerId`; `fuiwirt` has no router. Until then the
+    gestures run in tests and in programs that feed `event.fi` themselves.
+
 ## 5. The decision
 
 ### 5.1 Options
@@ -790,10 +849,11 @@ under load, so ±15 %):
 | r103 | Accessibility export on demand as pushed updates — base for r19 (AT-SPI/UIA) and the web ARIA mirror (Firn r177) | T7, §5.5, §5.6 |
 | r104 | Action id per control, linked to the OrientOS action bus | §5.3 |
 
-**Status 30.09.2026 (§4.5):** done — r92 (keys, key paths, duplicates,
-focus/hover/press/drag kept by key), r93, r97, r99, r101. Partly done — r100
-(the measure memo; style and layout still run in full). Open — r94, r95, r96,
-r98, r102, r103, r104.
+**Status 30.09.2026 (§4.5, §4.6):** done — r92 (keys, key paths, duplicates,
+focus/hover/press/drag kept by key), r93, r94, r96, r97, r99, r100 (measure,
+style and layout memo: 0.9 ms tree work at 1009 nodes), r101. Partly done —
+r95 (pointer ids, capture, gestures and arena in `event.fi`; the hosts do not
+deliver pointer ids yet). Open — r98, r102, r103, r104.
 
 **Linked in the OrientOS roadmap:**
 

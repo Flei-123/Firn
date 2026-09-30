@@ -60,6 +60,7 @@ export {
     pref_of, set_pref_from, text_lines_at,
     FieldMeas, field_meas_new, field_meas, field_px, field_text_x0,
     field_x_of, field_caret_x, field_line, field_underline, draw_field,
+    field_secret_sync,
     dir_of, is_rtl_style,
     field_measure, draw_textfield, field_text_origin,
 }
@@ -1629,10 +1630,15 @@ fn draw_widget(c: *mut Ctx, e: *mut widget.Widget) {
 struct FieldMeas {
     c: u64,   // *mut Ctx
     e: u64,   // *mut widget.Widget
+    secret: u32,  // 1 = measure the mask (r108)
 }
 
 fn field_meas_new(c: *mut Ctx, e: *mut widget.Widget) -> FieldMeas {
-    return FieldMeas { c: c as u64, e: e as u64 }
+    var s: u32 = 0
+    if widget.w_is_secret(e) {
+        s = 1
+    }
+    return FieldMeas { c: c as u64, e: e as u64, secret: s }
 }
 
 fn field_meas(ctx: u64, p: u64, n: usize) -> f64 {
@@ -1640,6 +1646,13 @@ fn field_meas(ctx: u64, p: u64, n: usize) -> f64 {
     let c: *mut Ctx = (*fm).c as *mut Ctx
     let e: *mut widget.Widget = (*fm).e as *mut widget.Widget
     var r: painter.TextRun = text_run_of(c, e, field_px(c, e))
+    if (*fm).secret != 0 {
+        // a secret is measured as it is painted: as its mask (r108)
+        var mk: [u8; 1024] = [0 as u8; 1024]
+        let mn: usize = painter.mask_build(p, n, (&mk[0]) as u64,
+            painter.MASK_CAP)
+        return painter.run_width(ctx_painter(c), &r, (&mk[0]) as u64, mn)
+    }
     return painter.run_width(ctx_painter(c), &r, p, n)
 }
 
@@ -1665,6 +1678,9 @@ fn field_text_x0(c: *mut Ctx, e: *mut widget.Widget) -> f64 {
 fn field_x_of(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
     i: usize) -> f64 {
     var fm: FieldMeas = field_meas_new(c, e)
+    if textbuf.tb_secret(t) {
+        fm.secret = 1
+    }
     return textbuf.tb_x_of(t, i, field_meas, (&fm) as u64)
 }
 
@@ -1733,6 +1749,15 @@ fn field_piece(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
     if x >= right {
         return
     }
+    if widget.w_is_secret(e) || textbuf.tb_secret(t) {
+        // A SECRET: the bullets for [a, b), never its letters (r108)
+        var mk: [u8; 1024] = [0 as u8; 1024]
+        let mn: usize = painter.mask_build(textbuf.tb_ptr(t) + a as u64,
+            b - a, (&mk[0]) as u64, painter.MASK_CAP)
+        let g: f64 = painter.run_draw(ctx_painter(c), r, x, by, right - x,
+            col, (&mk[0]) as u64, mn, painter.TEXT_L)
+        return
+    }
     let f: f64 = painter.run_draw(ctx_painter(c), r, x, by, right - x, col,
         textbuf.tb_ptr(t) + a as u64, b - a, painter.TEXT_L)
 }
@@ -1762,8 +1787,13 @@ fn field_mark(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
 // editor.editor_caret_tick. `keep_a..keep_b` ist die Auswahl, die eine
 // laufende Eingabe beim Bestaetigen ersetzen wird (ime.ime_repl_a/b) --
 // sie bleibt sichtbar markiert, damit man sieht, was gleich verschwindet.
-fn draw_field(c: *mut Ctx, e: *mut widget.Widget, t: *mut textbuf.TextBuf,
+fn draw_field(c: *mut Ctx, e0: *mut widget.Widget, t: *mut textbuf.TextBuf,
     scroll: f64, caret_on: bool, keep_a: usize, keep_b: usize) {
+    // A secret on either side -- the widget or its buffer -- is a secret
+    // on both: the buffer then refuses copy, the painter paints bullets.
+    var mw: widget.Widget = *e0
+    let e: *mut widget.Widget = &mw
+    field_secret_sync(e, t)
     let z: *mut painter.Painter = ctx_painter(c)
     let sz: *mut style.StyleSet = widget.w_styleset(e)
     let kind: u32 = widget.w_kind(e)
@@ -1876,7 +1906,21 @@ fn field_measure(c: *mut Ctx, e: *mut widget.Widget) -> painter.Measure {
     let s: *mut style.Style = style.styleset_base(sz)
     let px: f64 = len_of(c, style.resolve_num(sz, style.SF_FONT_PX,
         (*s).font_px as usize, def_font(c)))
-    return painter.measure_new(ctx_painter(c), text_run_of(c, e, px))
+    var m: painter.Measure = painter.measure_new(ctx_painter(c),
+        text_run_of(c, e, px))
+    painter.measure_set_secret(&m, widget.w_is_secret(e))
+    return m
+}
+
+// A password field is secret when the widget says so (widget.w_set_secret)
+// OR its buffer does (textbuf.tb_set_secret). Both are made to agree
+// here, so copy and cut refuse (editor_copy) and the painter masks.
+fn field_secret_sync(e: *mut widget.Widget, t: *mut textbuf.TextBuf) {
+    if widget.w_is_secret(e) {
+        textbuf.tb_set_secret(t, true)
+    } else if textbuf.tb_secret(t) {
+        widget.w_set_secret(e, true)
+    }
 }
 
 // Der linke Rand des Textes im Feld (siehe oben). `cx`/`cw` ist der
@@ -1885,18 +1929,23 @@ fn field_text_origin(c: *mut Ctx, e: *mut widget.Widget,
     ed: *mut editor.Editor, cx: f64, cw: f64) -> f64 {
     var m: painter.Measure = field_measure(c, e)
     let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    if textbuf.tb_secret(t) {
+        painter.measure_set_secret(&m, true)
+    }
     let p: u64 = textbuf.tb_ptr(t)
     let n: usize = textbuf.tb_len(t)
-    let z: *mut painter.Painter = ctx_painter(c)
-    let tw: f64 = painter.run_width(z, &m.r, p, n)
-    if painter.run_para_rtl(z, &m.r, p, n) && tw <= cw {
+    let tw: f64 = painter.measure_width((&m) as u64, p, n)
+    if painter.measure_rtl((&m) as u64, p, n) && tw <= cw {
         return cx + cw - tw
     }
     return cx - editor.editor_scroll(ed)
 }
 
-fn draw_textfield(c: *mut Ctx, e: *mut widget.Widget,
+fn draw_textfield(c: *mut Ctx, e0: *mut widget.Widget,
     ed: *mut editor.Editor, caret_on: bool) {
+    var mw: widget.Widget = *e0
+    let e: *mut widget.Widget = &mw
+    field_secret_sync(e, editor.editor_buf(ed))
     draw_base(c, e)
     let z: *mut painter.Painter = ctx_painter(c)
     let sz: *mut style.StyleSet = widget.w_styleset(e)
@@ -1915,9 +1964,24 @@ fn draw_textfield(c: *mut Ctx, e: *mut widget.Widget,
     editor.editor_set_width(ed, cw)
     var r: painter.TextRun = text_run_of(c, e, px)
     let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
-    let p: u64 = textbuf.tb_ptr(t)
-    let n: usize = textbuf.tb_len(t)
+    var p: u64 = textbuf.tb_ptr(t)
+    var n: usize = textbuf.tb_len(t)
+    var sel_a: usize = textbuf.tb_sel_a(t)
+    var sel_b: usize = textbuf.tb_sel_b(t)
+    var car: usize = textbuf.tb_caret(t)
     let ox: f64 = field_text_origin(c, e, ed, cx, cw)
+    // A SECRET (r108): from here on the field paints its mask -- one
+    // bullet per character -- and every offset (selection, caret) is
+    // moved into the mask. The typed letters are never handed to the
+    // painter, not even while typing.
+    var mk: [u8; 1024] = [0 as u8; 1024]
+    if widget.w_is_secret(e) {
+        sel_a = painter.mask_index(p, n, sel_a)
+        sel_b = painter.mask_index(p, n, sel_b)
+        car = painter.mask_index(p, n, car)
+        n = painter.mask_build(p, n, (&mk[0]) as u64, painter.MASK_CAP)
+        p = (&mk[0]) as u64
+    }
     let base_y: f64 = painter.text_baseline_mid(z, widget.w_y(e),
         widget.w_h(e), px)
     let top: f64 = base_y - painter.font_ascent(z, px)
@@ -1928,8 +1992,7 @@ fn draw_textfield(c: *mut Ctx, e: *mut widget.Widget,
         return
     }
     if textbuf.tb_has_sel(t) {
-        painter.run_sel_draw(z, &r, ox, top, lh, p, n, textbuf.tb_sel_a(t),
-            textbuf.tb_sel_b(t),
+        painter.run_sel_draw(z, &r, ox, top, lh, p, n, sel_a, sel_b,
             color_of(c, style.color_token(style.TOK_SELECTION)))
     }
     var fallback: u32 = def_fg(kind)
@@ -1942,8 +2005,7 @@ fn draw_textfield(c: *mut Ctx, e: *mut widget.Widget,
             painter.TEXT_L)
     }
     if caret_on && !textbuf.tb_has_sel(t) {
-        let kx: f64 = ox + painter.run_caret_x(z, &r, p, n,
-            textbuf.tb_caret(t))
+        let kx: f64 = ox + painter.run_caret_x(z, &r, p, n, car)
         var st: f64 = len_of(c, 1)
         if st < 1.0 {
             st = 1.0

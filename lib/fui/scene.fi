@@ -84,6 +84,8 @@ export {
     scene_draw_still, scene_draw_live, scene_reflows,
     node_set_ink, scene_set_cull, scene_culled,
     Memo, memo_new, memo_clear, memo_hits, memo_misses, scene_attach_memo,
+    memo_style_hits, memo_style_misses, memo_box_hits, memo_box_misses,
+    memo_layout_hits, memo_layout_misses,
     node_set_grow, node_set_base, node_set_bounds, node_set_align_self,
     node_set_size, node_set_viewport, node_viewport,
     node_set_draw, node_style, node_decl,
@@ -1039,7 +1041,7 @@ fn desc_kind_of(sc: *mut Scene, i: usize) -> u32 {
 }
 
 fn style_walk(sc: *mut Scene, sh: *mut sheet.Sheet, i: usize,
-    chain: *mut sheet.NodeDesc, depth: usize) {
+    chain: *mut sheet.NodeDesc, depth: usize, pk: u64) {
     if i == SCENE_NONE || i >= (*sc).n {
         return
     }
@@ -1055,27 +1057,99 @@ fn style_walk(sc: *mut Scene, sh: *mut sheet.Sheet, i: usize,
     // Die Schrittweite kommt aus sheet.fi -- dort liegt der Typ, dort
     // wird sie gemessen. Eine 56 an dieser Stelle waere ein zweiter Ort
     // fuer dieselbe Sache und beim naechsten Feld in `NodeDesc` falsch.
-    *((chain as u64 + (depth * sheet.sheet_desc_stride()) as u64)
-        as *mut sheet.NodeDesc) = scene_desc(sc, i)
-    var d: sheet.Decl = sheet.decl_new()
-    sheet.sheet_resolve(sh, chain, depth + 1, &d)
+    let dp: *mut sheet.NodeDesc = (chain as u64
+        + (depth * sheet.sheet_desc_stride()) as u64) as *mut sheet.NodeDesc
+    *dp = scene_desc(sc, i)
     let nd: *mut Node = &(*sc).nodes[i]
-    if (*nd).parent != SCENE_NONE {
-        sheet.decl_inherit(&d, &(*sc).nodes[(*nd).parent].d)
+    // THE STYLE MEMO: a node's resolved style depends on its chain (its own
+    // description and its ancestors') and on the sheet -- nothing else. The
+    // key folds the parent's key with this node's description, so an equal
+    // key means an equal chain under an equal sheet (scene_style seeds the
+    // root with the sheet's fingerprint).
+    var sk: u64 = 0
+    var hit: bool = false
+    if pk != 0 && i < SCENE_MAX {
+        let m: *mut Memo = (*sc).memo as *mut Memo
+        sk = mix_desc(pk, dp)
+        let slot: *mut MemoSlot = &(*m).s[i]
+        if (*slot).skey == sk {
+            (*nd).d = (*slot).sd
+            (*m).shits = (*m).shits + 1
+            hit = true
+        }
     }
-    // A FLUID FONT SIZE becomes a plain one here, against the view's
-    // width -- before the children inherit it.
-    let ds: *mut style.Style = sheet.decl_style(&d)
-    if ((*ds).set_mask & style.SF_FLUID) != 0 as u32 {
-        (*ds).font_px = style.style_fluid_px(ds, (*sc).view_w) as u16
+    if !hit {
+        var d: sheet.Decl = sheet.decl_new()
+        sheet.sheet_resolve(sh, chain, depth + 1, &d)
+        if (*nd).parent != SCENE_NONE {
+            sheet.decl_inherit(&d, &(*sc).nodes[(*nd).parent].d)
+        }
+        // A FLUID FONT SIZE becomes a plain one here, against the view's
+        // width -- before the children inherit it.
+        let ds: *mut style.Style = sheet.decl_style(&d)
+        if ((*ds).set_mask & style.SF_FLUID) != 0 as u32 {
+            (*ds).font_px = style.style_fluid_px(ds, (*sc).view_w) as u16
+        }
+        (*nd).d = d
+        if sk != 0 {
+            let m2: *mut Memo = (*sc).memo as *mut Memo
+            (*m2).s[i].skey = sk
+            (*m2).s[i].sd = d
+            (*m2).smisses = (*m2).smisses + 1
+        }
     }
-    (*nd).d = d
     *widget.w_style(&(*nd).e) = *sheet.decl_style(&(*nd).d)
     var c: usize = (*nd).first
     while c != SCENE_NONE {
-        style_walk(sc, sh, c, chain, depth + 1)
+        style_walk(sc, sh, c, chain, depth + 1, sk)
         c = (*sc).nodes[c].next
     }
+}
+
+// A description folded into a style key, field by field (the padding
+// of a NodeDesc is not part of it).
+fn mix_desc(pk: u64, d: *mut sheet.NodeDesc) -> u64 {
+    var h: u64 = mix(pk, (*d).kind as u64)
+    h = mix(h, (*d).id as u64)
+    h = mix(h, (*d).state as u64)
+    h = mix(h, (*d).ncls as u64)
+    var k: usize = 0
+    while k < (*d).ncls && k < sheet.DESC_CLASS_MAX {
+        h = mix(h, (*d).cls[k] as u64)
+        k = k + 1
+    }
+    if h == 0 {
+        h = 1
+    }
+    return h
+}
+
+// The root's style key: the sheet's rules as bytes, their number, and the
+// view's width (fluid font sizes). Any edit of the sheet -- a new rule, a
+// value changed by the inspector -- changes it, and every node misses.
+fn style_root_key(sc: *mut Scene, sh: *mut sheet.Sheet) -> u64 {
+    let n: usize = sheet.sheet_count(sh)
+    var h: u64 = mix(0x5157, n as u64)
+    h = mix(h, (*sc).view_w as u64)
+    if n > 0 {
+        let a: u64 = sheet.sheet_sel(sh, 0) as u64
+        var stride: usize = 0
+        if n > 1 {
+            stride = (sheet.sheet_sel(sh, 1) as u64 - a) as usize
+            h = mix_bytes(h, a, n * stride)
+        } else {
+            // one rule: its selector up to the declaration, then the
+            // declaration itself
+            let m: *mut Memo = (*sc).memo as *mut Memo
+            let dd: u64 = sheet.sheet_decl(sh, 0) as u64
+            h = mix_bytes(h, a, (dd - a) as usize)
+            h = mix_bytes(h, dd, (*m).dsz)
+        }
+    }
+    if h == 0 {
+        h = 1
+    }
+    return h
 }
 
 fn scene_style(sc: *mut Scene, sh: *mut sheet.Sheet) {
@@ -1085,7 +1159,11 @@ fn scene_style(sc: *mut Scene, sh: *mut sheet.Sheet) {
     var chain: [sheet.NodeDesc; 16] =
     [sheet.desc_new(0 as u32, 0 as u32); 16]
     (*sc).depthof = 0
-    style_walk(sc, sh, (*sc).root, &chain[0], 0)
+    var rk: u64 = 0
+    if (*sc).memo != 0 {
+        rk = style_root_key(sc, sh)
+    }
+    style_walk(sc, sh, (*sc).root, &chain[0], 0, rk)
     (*sc).phase = PHASE_STYLE
 }
 
@@ -1132,6 +1210,13 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
             widget.w_set_text(&(*nd).e, sp, sn)
         }
     } else {
+        // THE BOX MEMO: a box's size is a function of its own flex values,
+        // its fixed size and its children's items -- `box_key` folds all
+        // of them (and the children's own layout keys) into one number.
+        let bk: u64 = box_key(sc, i)
+        if bk != 0 && memo_box_get(sc, i, bk, &pw, &ph) {
+            // pw/ph came from the memo
+        } else {
         var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
         let n: usize = fill_items(sc, c, i, &items[0])
         // DIE RICHTUNGSFRAGE STELLT flex.fi. `flex_is_row` ist dieselbe
@@ -1159,7 +1244,10 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
             pw = q as f64
             ph = m as f64
         }
+        memo_box_put(sc, i, bk, pw, ph)
+        }
     }
+    memo_set_lk(sc, i)
     // ================================== DIE GROESSE AUS DEM STILBLATT
     //
     // `width`/`height` sind ganz normale Stilwerte (style.SF_WIDTH,
@@ -1378,6 +1466,25 @@ struct MemoSlot {
     pw: f64,
     ph: f64,
     lines: usize,
+    // the style memo: key (parent's key + own description) and result
+    skey: u64,
+    sd: sheet.Decl,
+    // the layout memo: `lk` is this measure's fingerprint of everything
+    // the subtree's layout depends on except its rectangle; `lkin` the
+    // same with the rectangle, as of the last layout; ax..ah the rectangle
+    // the node got in the last layout (absolute)
+    lk: u64,
+    lkin: u64,
+    ax: f64,
+    ay: f64,
+    aw: f64,
+    ah: f64,
+}
+
+fn memo_slot_blank() -> MemoSlot {
+    return MemoSlot { key: 0, pw: 0.0, ph: 0.0, lines: 0, skey: 0,
+        sd: sheet.decl_new(), lk: 0, lkin: 0, ax: 0.0, ay: 0.0, aw: 0.0,
+        ah: 0.0 }
 }
 
 struct Memo {
@@ -1391,29 +1498,56 @@ struct Memo {
     shsz: usize,
     // the fingerprint of the leaf being measured (memo_get -> memo_put)
     cur: u64,
+    // the byte size of a sheet.Decl
+    dsz: usize,
+    // style, box-measure and layout hits and misses
+    shits: usize,
+    smisses: usize,
+    bhits: usize,
+    bmisses: usize,
+    lhits: usize,
+    lmisses: usize,
 }
 
 fn memo_new() -> Memo {
     var pw: [widget.Widget; 2] = [widget.widget_new(widget.KIND_NONE); 2]
     var ps: [theme.Shape; 2] = [theme.shape_osum(); 2]
-    return Memo { s: [MemoSlot { key: 0, pw: 0.0, ph: 0.0, lines: 0 }; 128],
+    var pd: [sheet.Decl; 2] = [sheet.decl_new(); 2]
+    return Memo { s: [memo_slot_blank(); 128],
         hits: 0, misses: 0, ctx: 0,
         wsz: ((&pw[1]) as u64 - (&pw[0]) as u64) as usize,
-        shsz: ((&ps[1]) as u64 - (&ps[0]) as u64) as usize, cur: 0 }
+        shsz: ((&ps[1]) as u64 - (&ps[0]) as u64) as usize, cur: 0,
+        dsz: ((&pd[1]) as u64 - (&pd[0]) as u64) as usize,
+        shits: 0, smisses: 0, bhits: 0, bmisses: 0, lhits: 0, lmisses: 0 }
 }
 
 fn memo_clear(m: *mut Memo) {
     var i: usize = 0
     while i < SCENE_MAX {
         (*m).s[i].key = 0
+        (*m).s[i].skey = 0
+        (*m).s[i].lk = 0
+        (*m).s[i].lkin = 0
         i = i + 1
     }
     (*m).hits = 0
     (*m).misses = 0
+    (*m).shits = 0
+    (*m).smisses = 0
+    (*m).bhits = 0
+    (*m).bmisses = 0
+    (*m).lhits = 0
+    (*m).lmisses = 0
 }
 
 fn memo_hits(m: *mut Memo) -> usize { return (*m).hits }
 fn memo_misses(m: *mut Memo) -> usize { return (*m).misses }
+fn memo_style_hits(m: *mut Memo) -> usize { return (*m).shits }
+fn memo_style_misses(m: *mut Memo) -> usize { return (*m).smisses }
+fn memo_box_hits(m: *mut Memo) -> usize { return (*m).bhits }
+fn memo_box_misses(m: *mut Memo) -> usize { return (*m).bmisses }
+fn memo_layout_hits(m: *mut Memo) -> usize { return (*m).lhits }
+fn memo_layout_misses(m: *mut Memo) -> usize { return (*m).lmisses }
 
 // Attach a memo (0 detaches). It stays attached across scene_reset.
 fn scene_attach_memo(sc: *mut Scene, m: *mut Memo) {
@@ -1523,6 +1657,104 @@ fn memo_put(sc: *mut Scene, i: usize, pw: f64, ph: f64) {
     (*slot).lines = (*sc).nodes[i].lines
 }
 
+// THE FINGERPRINT OF A BOX: what its measure and the layout of its
+// children read. Its flex values (field by field), its fixed size, and per
+// child: the child's number, its measured size and flex item values, and
+// the child's own layout key -- so an equal key means an equal subtree as
+// far as sizes and places go. 0 = no memo (or not cacheable: a box with
+// more children than KIDS_MAX).
+fn box_key(sc: *mut Scene, i: usize) -> u64 {
+    if (*sc).memo == 0 || i >= SCENE_MAX {
+        return 0
+    }
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    let nd: *mut Node = &(*sc).nodes[i]
+    if (*nd).nkids > KIDS_MAX {
+        return 0
+    }
+    let fb: *mut flex.FlexBox = &(*nd).fb
+    var h: u64 = mix((*m).ctx, 0xB0C5)
+    h = mix(h, (*nd).kind as u64)
+    h = mix(h, (*fb).dir as u64)
+    h = mix(h, (*fb).justify as u64)
+    h = mix(h, (*fb).align_items as u64)
+    h = mix(h, (*fb).align_content as u64)
+    h = mix(h, (*fb).wrap as u64)
+    h = mix(h, (*fb).gap_main as u64)
+    h = mix(h, (*fb).gap_cross as u64)
+    h = mix(h, (*fb).pad_l as u64)
+    h = mix(h, (*fb).pad_t as u64)
+    h = mix(h, (*fb).pad_r as u64)
+    h = mix(h, (*fb).pad_b as u64)
+    h = mix_f64(h, (*nd).fix_w)
+    h = mix_f64(h, (*nd).fix_h)
+    var k: usize = (*nd).first
+    while k != SCENE_NONE {
+        let kid: *mut Node = &(*sc).nodes[k]
+        h = mix(h, k as u64)
+        h = mix_f64(h, (*kid).pw)
+        h = mix_f64(h, (*kid).ph)
+        h = mix(h, (*kid).basis as u64)
+        h = mix(h, (*kid).grow as u64)
+        h = mix(h, (*kid).shrink as u64)
+        h = mix(h, (*kid).min_main as u64)
+        h = mix(h, (*kid).max_main as u64)
+        h = mix(h, (*kid).align_self as u64)
+        h = mix(h, (*kid).wrap as u64)
+        h = mix(h, (*m).s[k].lk)
+        k = (*kid).next
+    }
+    if h == 0 {
+        h = 1
+    }
+    return h
+}
+
+fn memo_box_get(sc: *mut Scene, i: usize, bk: u64, pw: *mut f64,
+    ph: *mut f64) -> bool {
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    let slot: *mut MemoSlot = &(*m).s[i]
+    if (*slot).key != bk {
+        (*m).bmisses = (*m).bmisses + 1
+        return false
+    }
+    (*m).bhits = (*m).bhits + 1
+    *pw = (*slot).pw
+    *ph = (*slot).ph
+    return true
+}
+
+fn memo_box_put(sc: *mut Scene, i: usize, bk: u64, pw: f64, ph: f64) {
+    if bk == 0 {
+        return
+    }
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    (*m).s[i].key = bk
+    (*m).s[i].pw = pw
+    (*m).s[i].ph = ph
+}
+
+// The layout key of node i, after it was measured: a leaf's own layout
+// depends on nothing but its rectangle; a box's on its box key; a scroll
+// box is never taken from the memo (its scroll position moves its content
+// without any size changing) -- 0.
+fn memo_set_lk(sc: *mut Scene, i: usize) {
+    if (*sc).memo == 0 || i >= SCENE_MAX {
+        return
+    }
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    let nd: *mut Node = &(*sc).nodes[i]
+    var lk: u64 = 0
+    if (*nd).kind == N_VIEWPORT {
+        lk = 0
+    } else if (*nd).nkids == 0 {
+        lk = 0x1EAF
+    } else {
+        lk = box_key(sc, i)
+    }
+    (*m).s[i].lk = lk
+}
+
 fn scene_measure(sc: *mut Scene, c: *mut render.Ctx) {
     if (*sc).root == SCENE_NONE {
         return
@@ -1585,6 +1817,46 @@ fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
         iw = viewport.viewport_content_w(v)
         ih = viewport.viewport_content_h(v)
     }
+    // THE LAYOUT MEMO. Same key as last time (layout key + width, height
+    // and the fraction of x/y the flex pass truncates) = the same places
+    // for the whole subtree, only moved by (dx, dy).
+    var lkin: u64 = 0
+    if (*sc).memo != 0 && i < SCENE_MAX {
+        let m: *mut Memo = (*sc).memo as *mut Memo
+        let slot: *mut MemoSlot = &(*m).s[i]
+        let lk: u64 = (*slot).lk
+        if lk != 0 && (*nd).nkids > 0 {
+            lkin = mix(lk, 0x1A70)
+            lkin = mix_f64(lkin, w)
+            lkin = mix_f64(lkin, h)
+            lkin = mix_f64(lkin, x - ((x as i64) as f64))
+            lkin = mix_f64(lkin, y - ((y as i64) as f64))
+            if lkin == 0 {
+                lkin = 1
+            }
+            if (*slot).lkin == lkin {
+                let dx: f64 = x - (*slot).ax
+                let dy: f64 = y - (*slot).ay
+                (*m).lhits = (*m).lhits + 1
+                var k0: usize = (*nd).first
+                while k0 != SCENE_NONE {
+                    replay_node(sc, c, k0, dx, dy)
+                    k0 = (*sc).nodes[k0].next
+                }
+                (*slot).ax = x
+                (*slot).ay = y
+                (*slot).aw = w
+                (*slot).ah = h
+                return
+            }
+            (*m).lmisses = (*m).lmisses + 1
+        }
+        (*slot).lkin = lkin
+        (*slot).ax = x
+        (*slot).ay = y
+        (*slot).aw = w
+        (*slot).ah = h
+    }
     if (*nd).nkids == 0 {
         return
     }
@@ -1606,6 +1878,34 @@ fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
             layout.rect_h(&out[j]) as f64)
         k = (*sc).nodes[k].next
         j = j + 1
+    }
+}
+
+// A node below a layout-memo hit: its last rectangle, moved. A node that
+// is never taken from the memo (a scroll box, a box over KIDS_MAX) is laid
+// out for real at that rectangle.
+fn replay_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, dx: f64,
+    dy: f64) {
+    let m: *mut Memo = (*sc).memo as *mut Memo
+    let slot: *mut MemoSlot = &(*m).s[i]
+    let nx: f64 = (*slot).ax + dx
+    let ny: f64 = (*slot).ay + dy
+    if (*slot).lk == 0 {
+        layout_node(sc, c, i, nx, ny, (*slot).aw, (*slot).ah)
+        return
+    }
+    let nd: *mut Node = &(*sc).nodes[i]
+    (*nd).x = nx
+    (*nd).y = ny
+    (*nd).w = (*slot).aw
+    (*nd).h = (*slot).ah
+    widget.w_place(&(*nd).e, nx, ny, (*slot).aw, (*slot).ah)
+    (*slot).ax = nx
+    (*slot).ay = ny
+    var k: usize = (*nd).first
+    while k != SCENE_NONE {
+        replay_node(sc, c, k, dx, dy)
+        k = (*sc).nodes[k].next
     }
 }
 
