@@ -430,6 +430,14 @@ echo "== 18k. SCHMELZGRUPPE: FORMEN VERSCHMELZEN, WENN SIE SICH NAEHERN =="
 "$W/merge"
 
 echo
+echo "== 18l. DER SEITEN-LOOK: VERLAUF, LICHT, SCHATTEN, FLUIDE SCHRIFT, ABSAETZE, GRUPPEN =="
+# lib/fui/style.fi (SF_BG_GRAD, SF_BG_GLOW, SF_BOX_SHADOW, SF_FLUID),
+# lib/fui/scene.fi (node_set_text_wrap, node_set_opacity/offset,
+# scene_draw_still/live) und lib/fui/layer.fi -- auf echten Pixeln.
+"$FIRNC" --opt-level=release-fast -o "$W/pagelook" tools/fui/pagelook_main.fi
+"$W/pagelook"
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 # DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
 # liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
@@ -448,14 +456,14 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 #   the NDK: pthread, ANativeActivity) cannot be linked on this host. It
 #   is still built -- as an object for x86_64-android, the first half of
 #   tools/android/build.sh -- so it cannot silently stop building either.
-for f in tools/fui/*_main.fi demos/*/main.fi; do
+for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     if grep -q '^import plat\.android' "$f"; then
         "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
     else
         "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
     fi
 done
-echo "  alle tools/fui/*_main.fi und demos/*/main.fi uebersetzen  OK"
+echo "  alle tools/fui/*_main.fi, demos/*/main.fi und examples/*/main.fi uebersetzen  OK"
 fehlt=0
 for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     n=$(basename "$f" _main.fi)
