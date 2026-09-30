@@ -86,6 +86,9 @@ export {
     SF_TRACKING, SF_WORD_SPACING, SF_LINE_HEIGHT, SF_KERNING,
     SF_OUTLINE, SF_SHADOW, SF_GRADIENT, SF_WIDTH, SF_HEIGHT,
     SF_DIRECTION, DIR_AUTO, DIR_LTR, DIR_RTL,
+    SF_BG_GRAD, SF_BOX_SHADOW, SF_BG_GLOW, SF_FLUID,
+    style_set_bg_gradient, style_set_box_shadow, style_set_bg_glow,
+    style_set_font_fluid, style_fluid_px, style_fluid_px_of,
     style_set_direction, style_direction,
     style_set_bg, style_set_border, style_set_fg,
     style_set_radius, style_set_border_width, style_set_pad,
@@ -269,6 +272,24 @@ const DIR_AUTO: u32 = 0
 const DIR_LTR: u32 = 1
 const DIR_RTL: u32 = 2
 
+// ================================================ THE PAGE LOOK (30.09.2026)
+//
+// Four values a modern web page takes for granted and fUi had to paint
+// by hand until now (examples/codehub did all four itself):
+//
+//   SF_BG_GRAD     background: linear-gradient(dir, bg, bg2)
+//   SF_BOX_SHADOW  box-shadow: 0 lift blur col  -- a coloured one is a glow
+//   SF_BG_GLOW     background: radial-gradient(...) -- a soft light INSIDE
+//                  the box, over its surface
+//   SF_FLUID       font-size: clamp(min, base + k vw, max)
+//
+// All numbers stay integers (the kernel profile of this file): directions
+// and positions are per mille, lengths design points.
+const SF_BG_GRAD: u32 = 8388608
+const SF_BOX_SHADOW: u32 = 16777216
+const SF_BG_GLOW: u32 = 33554432
+const SF_FLUID: u32 = 67108864
+
 // ============================================================== THE STYLE
 //
 // A pure value structure, 32 bytes. Copyable, no pointer, no
@@ -327,6 +348,26 @@ struct Style {
     width: u16,
     height: u16,
     dir: u8,           // DIR_AUTO / DIR_LTR / DIR_RTL, gilt mit SF_DIRECTION
+    // ---- the page look (see SF_BG_GRAD above)
+    bg2: u32,          // SF_BG_GRAD: the colour at the end of the ramp
+    g_a0: u8,          // opacity of `bg` and `bg2` in the ramp (255 = opaque)
+    g_a1: u8,
+    g_dx: i16,         // the ramp's direction, per mille (0, 1000 = down)
+    g_dy: i16,
+    bs_lift: i16,      // SF_BOX_SHADOW: design points down, blur, colour
+    bs_blur: u16,
+    bs_a: u8,          // its darkest opacity
+    bs_col: u32,
+    gl_col: u32,       // SF_BG_GLOW: colour, centre and radii in per mille
+    gl_x: i16,         // of the box, strength in per mille
+    gl_y: i16,
+    gl_rx: u16,
+    gl_ry: u16,
+    gl_k: u16,
+    fl_min: u16,       // SF_FLUID: clamp(fl_min, fl_base + fl_vw/1000 vw, fl_max)
+    fl_max: u16,
+    fl_base: i16,
+    fl_vw: u16,
     set_mask: u32,     // Bitmaske S_*
 }
 
@@ -343,6 +384,11 @@ fn style_new() -> Style {
         out_w: 0, sh_dx: 0, sh_dy: 0, width: 0, height: 0, dir: 0,
         out_col: color_inherit(), sh_col: color_inherit(),
         grad_col: color_inherit(),
+        bg2: color_inherit(), g_a0: 255 as u8, g_a1: 255 as u8, g_dx: 0,
+        g_dy: 1000, bs_lift: 0, bs_blur: 0, bs_a: 0 as u8,
+        bs_col: color_inherit(), gl_col: color_inherit(), gl_x: 500,
+        gl_y: 500, gl_rx: 500, gl_ry: 500, gl_k: 0,
+        fl_min: 0, fl_max: 0, fl_base: 0, fl_vw: 0,
         set_mask: 0,
     }
 }
@@ -709,6 +755,103 @@ fn style_set_gradient(s: Style, col: u32) -> Style {
     o.grad_col = col
     o.set_mask = o.set_mask | SF_GRADIENT
     return o
+}
+
+// A LINEAR GRADIENT AS THE BACKGROUND -- CSS `linear-gradient`. From
+// `c0` to `c1` along (dx, dy) per mille: (0, 1000) runs top to bottom,
+// (1000, 1000) from the upper left corner to the lower right one. `a0`/`a1`
+// are the opacities of the two ends (255 = opaque, 0 = gone): a ramp that
+// fades out is the usual case on a page. `c0` is the background colour as
+// well, so a painter without gradients still shows the right tone.
+fn style_set_bg_gradient(s: Style, c0: u32, a0: usize, c1: u32, a1: usize,
+    dx: i64, dy: i64) -> Style {
+    var o: Style = s
+    o.bg = c0
+    o.bg2 = c1
+    o.g_a0 = clamp255(a0)
+    o.g_a1 = clamp255(a1)
+    o.g_dx = dx as i16
+    o.g_dy = dy as i16
+    o.set_mask = o.set_mask | SF_BG | SF_BG_GRAD
+    return o
+}
+
+// A SHADOW UNDER THE BOX -- CSS `box-shadow: 0 lift blur col`. A shadow
+// in the accent colour with no lift is a glow. `a` is its darkest opacity.
+fn style_set_box_shadow(s: Style, lift: i64, blur: usize, col: u32,
+    a: usize) -> Style {
+    var o: Style = s
+    o.bs_lift = lift as i16
+    o.bs_blur = blur as u16
+    o.bs_col = col
+    o.bs_a = clamp255(a)
+    o.set_mask = o.set_mask | SF_BOX_SHADOW
+    return o
+}
+
+// A SOFT LIGHT IN THE BOX -- CSS `radial-gradient(ellipse rx ry at x y,
+// col, transparent)`, painted over the surface. Centre (x, y) and radii
+// (rx, ry) are per mille of the box, `k` the strength in per mille. The
+// light falls as (1 - d^2)^2: smooth to its rim, gone at it.
+fn style_set_bg_glow(s: Style, col: u32, x: i64, y: i64, rx: usize,
+    ry: usize, k: usize) -> Style {
+    var o: Style = s
+    o.gl_col = col
+    o.gl_x = x as i16
+    o.gl_y = y as i16
+    o.gl_rx = rx as u16
+    o.gl_ry = ry as u16
+    o.gl_k = k as u16
+    o.set_mask = o.set_mask | SF_BG_GLOW
+    return o
+}
+
+// A FONT SIZE THAT FOLLOWS THE WINDOW -- CSS `font-size: clamp(min,
+// base + k vw, max)`, `vw_pm` being k in per mille of the view's width
+// (40 = 4vw). The scene resolves it (scene.scene_set_view gives the width)
+// into an ordinary font size, so everything that measures or paints text
+// sees a plain number. Without a view the size is `max`.
+fn style_set_font_fluid(s: Style, min: usize, base: i64, vw_pm: usize,
+    max: usize) -> Style {
+    var o: Style = s
+    o.fl_min = min as u16
+    o.fl_max = max as u16
+    o.fl_base = base as i16
+    o.fl_vw = vw_pm as u16
+    o.font_px = max as u16
+    o.set_mask = o.set_mask | SF_FLUID | SF_FONT_PX
+    return o
+}
+
+// The fluid size for a view `view_w` design points wide (0 = unknown ->
+// the maximum), in whole design points.
+fn style_fluid_px(s: *mut Style, view_w: usize) -> usize {
+    return style_fluid_px_of((*s).fl_min as usize, (*s).fl_base as i64,
+        (*s).fl_vw as usize, (*s).fl_max as usize, view_w)
+}
+
+// The same rule without a style -- for a program that needs the number
+// itself (a line height or a tracking that follows the size).
+fn style_fluid_px_of(min: usize, base: i64, vw_pm: usize, max: usize,
+    view_w: usize) -> usize {
+    if view_w == 0 {
+        return max
+    }
+    var v: i64 = base + ((view_w as i64) * (vw_pm as i64) + 500) / 1000
+    if v < min as i64 {
+        v = min as i64
+    }
+    if v > max as i64 {
+        v = max as i64
+    }
+    return v as usize
+}
+
+fn clamp255(a: usize) -> u8 {
+    if a > 255 {
+        return 255 as u8
+    }
+    return a as u8
 }
 
 // A SIGNED NUMBER out of the cascade. `resolve_num` is unsigned and

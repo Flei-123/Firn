@@ -79,6 +79,9 @@ export {
     node_set_flex, node_set_gap, node_set_padding, node_set_space,
     node_set_wrap, node_set_flexitem, node_set_hidden, node_hidden,
     scene_draw_subtree,
+    node_set_opacity, node_set_offset, node_set_live, node_live,
+    node_set_text_wrap, node_text_lines, scene_set_view, scene_view,
+    scene_draw_still, scene_draw_live, scene_reflows,
     node_set_grow, node_set_base, node_set_bounds, node_set_align_self,
     node_set_size, node_set_viewport, node_viewport,
     node_set_draw, node_style, node_decl,
@@ -109,6 +112,8 @@ import fui.uiimage
 import fui.uisvg
 import fui.sheet
 import fui.viewport
+import fui.layer
+import fui.painter
 
 // ======================================================= DIE ARTEN
 //
@@ -264,6 +269,22 @@ struct Node {
     // NOT PAINTED, NOT HIT (node_set_hidden) -- CSS `visibility: hidden`:
     // the node keeps its room in the layout, only its picture is gone.
     hidden: u32,
+    // ---- 30.09.2026: the page look
+    // OPACITY OF THE WHOLE SUBTREE (0..255, node_set_opacity) and its
+    // OFFSET in design points (node_set_offset) -- CSS `opacity` and
+    // `transform: translate`, the two halves of every fade-in.
+    alpha: u32,
+    off_x: f64,
+    off_y: f64,
+    // LIVE (node_set_live): changes every frame; scene_draw_still leaves it
+    // out, scene_draw_live paints only it.
+    live: u32,
+    // A PARAGRAPH (node_set_text_wrap): the text breaks into lines at the
+    // width the layout gives it, at most `wrap` lines; its height follows.
+    // `avail` is that width (pixels) from the last layout, < 0 = unknown.
+    wrap: usize,
+    avail: f64,
+    lines: usize,
 }
 
 // Der Maler, den ein Knoten hat, solange ihm niemand einen gibt. Er
@@ -306,6 +327,13 @@ struct Scene {
     // angeordnet und nichts gemessen, denn der erste Schreibzugriff
     // laege hinter dem Feld -- gezaehlt wird stattdessen.
     limof: usize,
+    // the view's width in design points, for fluid font sizes
+    // (style.SF_FLUID); 0 = unknown
+    view_w: usize,
+    // what scene_draw paints: 0 everything, 1 all but the live nodes
+    dmode: u32,
+    // how many extra measure + layout rounds the paragraphs cost
+    reflows: usize,
 }
 
 fn node_blank() -> Node {
@@ -321,13 +349,15 @@ fn node_blank() -> Node {
         pw: 0.0, ph: 0.0, mw: 0.0, mh: 0.0,
         x: 0.0, y: 0.0, w: 0.0, h: 0.0, vp: 0,
         dr: draw_none, du: 0, has_dr: 0 as u32, hidden: 0 as u32,
+        alpha: 255 as u32, off_x: 0.0, off_y: 0.0, live: 0 as u32,
+        wrap: 0, avail: 0.0 - 1.0, lines: 1,
     }
 }
 
 fn scene_new() -> Scene {
     return Scene { nodes: [node_blank(); 128], n: 0, root: SCENE_NONE,
         phase: PHASE_BUILD, drift: 0, kidof: 0, depthof: 0, nodeof: 0,
-        xfof: 0, limof: 0 }
+        xfof: 0, limof: 0, view_w: 0, dmode: 0 as u32, reflows: 0 }
 }
 
 fn scene_reset(sc: *mut Scene) {
@@ -340,6 +370,7 @@ fn scene_reset(sc: *mut Scene) {
     (*sc).nodeof = 0
     (*sc).xfof = 0
     (*sc).limof = 0
+    (*sc).dmode = 0 as u32
 }
 
 fn scene_count(sc: *mut Scene) -> usize { return (*sc).n }
@@ -778,6 +809,97 @@ fn node_hidden(sc: *mut Scene, i: usize) -> bool {
     return (*sc).nodes[i].hidden != 0 as u32
 }
 
+// ======================================================================
+// THE PAGE LOOK (30.09.2026)
+// ======================================================================
+
+// THE OPACITY OF A NODE AND EVERYTHING IN IT, 0..1 -- CSS `opacity`. The
+// subtree is painted as ONE picture off the screen and laid over at this
+// opacity (lib/fui/layer.fi), so overlapping parts do not show through
+// each other. 0 paints nothing (the node keeps its room); 1 costs nothing.
+fn node_set_opacity(sc: *mut Scene, i: usize, a: f64) {
+    if i >= (*sc).n {
+        return
+    }
+    var k: f64 = a
+    if k < 0.0 {
+        k = 0.0
+    }
+    if k > 1.0 {
+        k = 1.0
+    }
+    (*sc).nodes[i].alpha = (k * 255.0 + 0.5) as u32
+}
+
+// THE OFFSET OF A NODE AND EVERYTHING IN IT, design points -- CSS
+// `transform: translate(dx, dy)`: painted there, laid out here. Nothing
+// around it moves (the rise of a fade-in). A scroll area inside keeps its
+// clip where the layout put it; hits still find the laid-out place.
+fn node_set_offset(sc: *mut Scene, i: usize, dx: f64, dy: f64) {
+    if i >= (*sc).n {
+        return
+    }
+    (*sc).nodes[i].off_x = dx
+    (*sc).nodes[i].off_y = dy
+}
+
+// A LIVE NODE changes every frame (a hovered button, a blinking cursor):
+// scene_draw_still paints the page without it, scene_draw_live only it.
+fn node_set_live(sc: *mut Scene, i: usize, on: bool) {
+    if i >= (*sc).n {
+        return
+    }
+    if on {
+        (*sc).nodes[i].live = 1 as u32
+    } else {
+        (*sc).nodes[i].live = 0 as u32
+    }
+}
+
+fn node_live(sc: *mut Scene, i: usize) -> bool {
+    if i >= (*sc).n {
+        return false
+    }
+    return (*sc).nodes[i].live != 0 as u32
+}
+
+// A PARAGRAPH: the text breaks into lines at the width the layout gives
+// it (at most `max_lines`, 0 = one line as before), and its height is the
+// height of those lines -- nobody counts lines or fixes sizes by hand. In
+// a column it is at most as wide as the column; in a row it shrinks with
+// the row. scene_layout measures again when a width changed (scene_reflows).
+fn node_set_text_wrap(sc: *mut Scene, i: usize, max_lines: usize) {
+    if i >= (*sc).n {
+        return
+    }
+    (*sc).nodes[i].wrap = max_lines
+}
+
+// The lines a paragraph got in the last layout (1 for any other node).
+fn node_text_lines(sc: *mut Scene, i: usize) -> usize {
+    if i >= (*sc).n {
+        return 0
+    }
+    return (*sc).nodes[i].lines
+}
+
+// THE VIEW'S WIDTH in design points -- what a fluid font size
+// (style.style_set_font_fluid) is measured against, CSS `vw`. Set it
+// before scene_style.
+fn scene_set_view(sc: *mut Scene, w: f64) {
+    if w <= 0.0 {
+        (*sc).view_w = 0
+        return
+    }
+    (*sc).view_w = (w + 0.5) as usize
+}
+
+fn scene_view(sc: *mut Scene) -> usize { return (*sc).view_w }
+
+// Extra measure + layout rounds of the last scene_layout (paragraphs whose
+// width changed).
+fn scene_reflows(sc: *mut Scene) -> usize { return (*sc).reflows }
+
 // Eine feste Groesse. 0 oder weniger heisst "gemessen".
 fn node_set_size(sc: *mut Scene, i: usize, w: f64, h: f64) {
     if i >= (*sc).n {
@@ -890,6 +1012,12 @@ fn style_walk(sc: *mut Scene, sh: *mut sheet.Sheet, i: usize,
     if (*nd).parent != SCENE_NONE {
         sheet.decl_inherit(&d, &(*sc).nodes[(*nd).parent].d)
     }
+    // A FLUID FONT SIZE becomes a plain one here, against the view's
+    // width -- before the children inherit it.
+    let ds: *mut style.Style = sheet.decl_style(&d)
+    if ((*ds).set_mask & style.SF_FLUID) != 0 as u32 {
+        (*ds).font_px = style.style_fluid_px(ds, (*sc).view_w) as u16
+    }
     (*nd).d = d
     *widget.w_style(&(*nd).e) = *sheet.decl_style(&(*nd).d)
     var c: usize = (*nd).first
@@ -937,6 +1065,9 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         ph = viewport.viewport_h(v)
     } else if (*nd).nkids == 0 {
         render.pref_of(c, &(*nd).e, &pw, &ph)
+        if (*nd).wrap > 0 && widget.w_text_len(&(*nd).e) != 0 {
+            measure_para(sc, c, i, &pw, &ph)
+        }
     } else {
         var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
         let n: usize = fill_items(sc, c, i, &items[0])
@@ -1011,6 +1142,62 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     widget.w_set_pref(&(*nd).e, pw, ph)
 }
 
+// A PARAGRAPH'S SIZE: as wide as its text in one line, but not wider
+// than the room the last layout gave it; as high as its lines at that
+// width. Without a layout yet it is one line -- scene_layout comes back.
+fn measure_para(sc: *mut Scene, c: *mut render.Ctx, i: usize,
+    pw: *mut f64, ph: *mut f64) {
+    let nd: *mut Node = &(*sc).nodes[i]
+    var w: f64 = *pw
+    if (*nd).fix_w > 0.0 {
+        w = px_of(c, (*nd).fix_w)
+    } else if (*nd).avail >= 0.0 && (*nd).avail < w {
+        w = (*nd).avail
+    }
+    var h: f64 = 0.0
+    let n: usize = render.text_lines_at(c, &(*nd).e, w, (*nd).wrap, &h)
+    (*nd).lines = n
+    widget.w_set_text_lines(&(*nd).e, n)
+    *pw = w
+    *ph = h
+}
+
+// AFTER A LAYOUT: the width each paragraph really has. In a column that
+// is the column's inner width (a paragraph that is not stretched must
+// still break at the column's edge); anywhere else the width it was laid
+// out at. True when one changed -- then the tree is measured again.
+fn para_widths(sc: *mut Scene, c: *mut render.Ctx) -> bool {
+    var changed: bool = false
+    var i: usize = 0
+    while i < (*sc).n {
+        let nd: *mut Node = &(*sc).nodes[i]
+        if (*nd).wrap > 0 && (*nd).nkids == 0 && (*nd).fix_w <= 0.0 {
+            var a: f64 = (*nd).w
+            let p: usize = (*nd).parent
+            if p != SCENE_NONE && !flex.flex_is_row(&(*sc).nodes[p].fb) {
+                var fb: flex.FlexBox = box_px(c, &(*sc).nodes[p].fb)
+                let inner: f64 = (*sc).nodes[p].w - (fb.pad_l as f64)
+                - (fb.pad_r as f64)
+                if inner > 0.0 {
+                    a = inner
+                }
+            }
+            var dd: f64 = a - (*nd).avail
+            if dd < 0.0 {
+                dd = 0.0 - dd
+            }
+            if (*nd).avail < 0.0 || dd > 0.5 {
+                (*nd).avail = a
+                // only a change of the LINES matters for the tree; a
+                // paragraph that still fits keeps its measure
+                changed = true
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
 // Aus den gemessenen Kindern werden FlexItems. Die Umrechnung f64 ->
 // ganzzahlige Basis macht flex.flex_item_from_pref, und zwar als
 // einzige Stelle -- wer hier selbst rundet, bekommt zwei Kaesten mit
@@ -1048,6 +1235,11 @@ fn fill_items(sc: *mut Scene, cx: *mut render.Ctx, i: usize,
                 render.len_signed(cx, (*kid).max_main) as i64)
         }
         flex.item_set_align(&it, (*kid).align_self)
+        // A PARAGRAPH MAY SHRINK below its one-line width -- that is the
+        // point of it (CSS: its min-content is a word, not the line).
+        if (*kid).wrap > 0 && line && (*kid).min_main == 0 {
+            it.min_main = 0
+        }
         // Dieselbe Regel wie bei der Kette oben: die Schrittweite eines
         // FlexItem kennt flex.fi, nicht dieses Modul.
         *((items as u64 + (n * flex.flex_item_stride()) as u64)
@@ -1192,6 +1384,17 @@ fn scene_layout(sc: *mut Scene, c: *mut render.Ctx, x: f64, y: f64,
     }
     (*sc).kidof = 0
     layout_node(sc, c, (*sc).root, x, y, w, h)
+    // PARAGRAPHS: their height depends on the width they got. Measure and
+    // lay out again while a width changed -- twice is the usual case (the
+    // first layout gives the widths), the third round catches a row whose
+    // widths moved because a height did.
+    (*sc).reflows = 0
+    while (*sc).reflows < 3 && para_widths(sc, c) {
+        measure_node(sc, c, (*sc).root)
+        (*sc).kidof = 0
+        layout_node(sc, c, (*sc).root, x, y, w, h)
+        (*sc).reflows = (*sc).reflows + 1
+    }
     (*sc).phase = PHASE_LAYOUT
 }
 
@@ -1293,7 +1496,66 @@ fn draw_self(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     }
 }
 
+// A NODE WITH ITS EFFECTS: offset and opacity of its subtree around the
+// plain paint. The offset moves the rectangles of the whole subtree for
+// the length of the paint and back -- so custom painters, text and
+// children all see the moved place, and the drift guard compares like
+// with like.
 fn draw_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
+    if i == SCENE_NONE || i >= (*sc).n {
+        return
+    }
+    let nd: *mut Node = &(*sc).nodes[i]
+    if (*sc).dmode == 1 as u32 && (*nd).live != 0 as u32 {
+        return
+    }
+    let a: u32 = (*nd).alpha
+    if a == 0 as u32 || (*nd).hidden != 0 as u32 {
+        return
+    }
+    // design points to whole pixels (a text half a pixel off is blurred)
+    let k: f64 = render.len_of(c, 1000) / 1000.0
+    let dx: f64 = round_px((*nd).off_x * k)
+    let dy: f64 = round_px((*nd).off_y * k)
+    let moved: bool = dx != 0.0 || dy != 0.0
+    if moved {
+        shift_tree(sc, i, dx, dy)
+    }
+    if a >= 255 as u32 {
+        draw_plain(sc, c, i)
+    } else {
+        let z: *mut painter.Painter = render.ctx_painter(c)
+        let ok: bool = layer.group_begin(z, (*nd).x, (*nd).y, (*nd).w,
+            (*nd).h, render.len_of(c, 64))
+        draw_plain(sc, c, i)
+        layer.group_end(z, a)
+    }
+    if moved {
+        shift_tree(sc, i, 0.0 - dx, 0.0 - dy)
+    }
+}
+
+fn round_px(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - round_px(0.0 - v)
+    }
+    return ((v + 0.5) as i64) as f64
+}
+
+fn shift_tree(sc: *mut Scene, i: usize, dx: f64, dy: f64) {
+    let nd: *mut Node = &(*sc).nodes[i]
+    (*nd).x = (*nd).x + dx
+    (*nd).y = (*nd).y + dy
+    widget.w_place(&(*nd).e, widget.w_x(&(*nd).e) + dx,
+        widget.w_y(&(*nd).e) + dy, widget.w_w(&(*nd).e), widget.w_h(&(*nd).e))
+    var k: usize = (*nd).first
+    while k != SCENE_NONE {
+        shift_tree(sc, k, dx, dy)
+        k = (*sc).nodes[k].next
+    }
+}
+
+fn draw_plain(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     if i == SCENE_NONE || i >= (*sc).n {
         return
     }
@@ -1370,6 +1632,45 @@ fn scene_draw_subtree(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         return
     }
     draw_node(sc, c, i)
+}
+
+// THE PAGE WITHOUT ITS LIVE NODES (node_set_live) -- what a program
+// bakes once (layer.Bake) and copies every frame, painting only
+// scene_draw_live over it.
+fn scene_draw_still(sc: *mut Scene, c: *mut render.Ctx) {
+    (*sc).dmode = 1 as u32
+    scene_draw(sc, c)
+    (*sc).dmode = 0 as u32
+}
+
+// ONLY THE LIVE NODES, each with everything in it. Offset and opacity of
+// the nodes AROUND a live node are not applied (it is painted where the
+// layout put it) -- a live node inside a fading group waits until the
+// fade is over, or the page paints everything (scene_draw) meanwhile.
+fn scene_draw_live(sc: *mut Scene, c: *mut render.Ctx) {
+    if (*sc).root == SCENE_NONE {
+        return
+    }
+    live_walk(sc, c, (*sc).root)
+}
+
+fn live_walk(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
+    if i == SCENE_NONE || i >= (*sc).n {
+        return
+    }
+    let nd: *mut Node = &(*sc).nodes[i]
+    if (*nd).hidden != 0 as u32 {
+        return
+    }
+    if (*nd).live != 0 as u32 {
+        draw_node(sc, c, i)
+        return
+    }
+    var k: usize = (*nd).first
+    while k != SCENE_NONE {
+        live_walk(sc, c, k)
+        k = (*sc).nodes[k].next
+    }
 }
 
 fn scene_draw(sc: *mut Scene, c: *mut render.Ctx) {
