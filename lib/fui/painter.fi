@@ -112,7 +112,9 @@ export {
     run_set_dir, run_dir, run_caret_x, run_hit, run_para_rtl,
     run_sel_draw, run_is_bidi, BIDI_CAP,
     Measure, measure_new, measure_x, measure_hit, measure_width,
-    measure_rtl,
+    measure_rtl, measure_set_secret,
+    // A SECRET (password) IS MEASURED AND PAINTED AS ITS MASK
+    MASK_CAP, mask_build, mask_index, mask_source,
 }
 
 // The alignment horizontally. Vertically there is only one sensible
@@ -3015,28 +3017,124 @@ fn run_sel_draw(z: *mut Painter, r: *mut TextRun, ox: f64, y: f64, h: f64,
 struct Measure {
     z: u64,
     r: TextRun,
+    secret: u32,   // 1 = a password: measure the mask, never the text
 }
 
 fn measure_new(z: *mut Painter, r: TextRun) -> Measure {
-    return Measure { z: z as u64, r: r }
+    return Measure { z: z as u64, r: r, secret: 0 }
+}
+
+// A field that holds a secret measures what it paints: one bullet per
+// character (mask_build). Otherwise the caret and the scroll position
+// would follow the widths of the real letters -- a side channel -- and
+// the caret would stand beside the bullets.
+fn measure_set_secret(m: *mut Measure, on: bool) {
+    if on { (*m).secret = 1 } else { (*m).secret = 0 }
 }
 
 fn measure_x(ctx: u64, p: u64, n: usize, i: usize) -> f64 {
     let m: *mut Measure = ctx as *mut Measure
+    if (*m).secret != 0 {
+        var mk: [u8; 1024] = [0 as u8; 1024]
+        let mn: usize = mask_build(p, n, (&mk[0]) as u64, MASK_CAP)
+        return run_caret_x((*m).z as *mut Painter, &(*m).r, (&mk[0]) as u64,
+            mn, mask_index(p, n, i))
+    }
     return run_caret_x((*m).z as *mut Painter, &(*m).r, p, n, i)
 }
 
 fn measure_hit(ctx: u64, p: u64, n: usize, x: f64) -> usize {
     let m: *mut Measure = ctx as *mut Measure
+    if (*m).secret != 0 {
+        var mk: [u8; 1024] = [0 as u8; 1024]
+        let mn: usize = mask_build(p, n, (&mk[0]) as u64, MASK_CAP)
+        let k: usize = run_hit((*m).z as *mut Painter, &(*m).r,
+            (&mk[0]) as u64, mn, x)
+        return mask_source(p, n, k)
+    }
     return run_hit((*m).z as *mut Painter, &(*m).r, p, n, x)
 }
 
 fn measure_width(ctx: u64, p: u64, n: usize) -> f64 {
     let m: *mut Measure = ctx as *mut Measure
+    if (*m).secret != 0 {
+        var mk: [u8; 1024] = [0 as u8; 1024]
+        let mn: usize = mask_build(p, n, (&mk[0]) as u64, MASK_CAP)
+        return run_width((*m).z as *mut Painter, &(*m).r, (&mk[0]) as u64, mn)
+    }
     return run_width((*m).z as *mut Painter, &(*m).r, p, n)
 }
 
+// A mask has no strong letter; the direction of a secret field comes
+// from its style alone, never from what was typed.
 fn measure_rtl(ctx: u64, p: u64, n: usize) -> bool {
     let m: *mut Measure = ctx as *mut Measure
+    if (*m).secret != 0 {
+        var mk: [u8; 4] = [0 as u8; 4]
+        return run_para_rtl((*m).z as *mut Painter, &(*m).r, (&mk[0]) as u64,
+            mask_build(p, n, (&mk[0]) as u64, 3))
+    }
     return run_para_rtl((*m).z as *mut Painter, &(*m).r, p, n)
+}
+
+// ======================================================================
+// THE MASK OF A SECRET
+// ======================================================================
+//
+// U+2022 (bullet, 3 bytes in UTF-8) once per character of the text. The
+// buffer holds MASK_CAP bytes, so at most MASK_CAP / 3 = 341 bullets; a
+// longer password shows 341 of them (its length stays hidden beyond
+// that anyway). `mask_index` maps a byte offset of the text to the byte
+// offset in the mask, `mask_source` the other way (a hit in the mask to
+// the character boundary in the text).
+const MASK_CAP: usize = 1023
+
+fn mask_build(p: u64, n: usize, out: u64, cap: usize) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < n && k + 3 <= cap {
+        let b: u8 = *((p + i as u64) as *mut u8)
+        // count lead bytes only: continuation bytes are 10xxxxxx
+        if (b & (192 as u8)) != (128 as u8) {
+            *((out + k as u64) as *mut u8) = 226 as u8
+            *((out + (k + 1) as u64) as *mut u8) = 128 as u8
+            *((out + (k + 2) as u64) as *mut u8) = 162 as u8
+            k = k + 3
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn mask_index(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = 0
+    var j: usize = 0
+    while j < i && j < n {
+        let b: u8 = *((p + j as u64) as *mut u8)
+        if (b & (192 as u8)) != (128 as u8) {
+            k = k + 3
+        }
+        j = j + 1
+    }
+    if k > MASK_CAP - (MASK_CAP % 3) {
+        k = MASK_CAP - (MASK_CAP % 3)
+    }
+    return k
+}
+
+fn mask_source(p: u64, n: usize, k: usize) -> usize {
+    let want: usize = k / 3
+    var seen: usize = 0
+    var j: usize = 0
+    while j < n {
+        let b: u8 = *((p + j as u64) as *mut u8)
+        if (b & (192 as u8)) != (128 as u8) {
+            if seen == want {
+                return j
+            }
+            seen = seen + 1
+        }
+        j = j + 1
+    }
+    return n
 }
