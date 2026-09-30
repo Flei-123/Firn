@@ -90,9 +90,16 @@ mkdir -p "$MIRROR"
 # copy would not find the packages in demos/packages/. Round GAPS: plus the
 # files the tests pull in with `__include_str` (tests/data/include_*),
 # otherwise the copy of such a test does not compile and its syntax tree
-# counts as changed.
+# counts as changed. The same for every other `__include_str("x")` in the
+# tree (lib/fui/gpu.fi pulls in its shaders, examples/phone_remote its page):
+# the named file sits next to the source, so it is copied along.
+included() {
+    grep -o '__include_\(str\|bytes\)("[^"]*")' $(sources) 2>/dev/null \
+        | sed 's|^\(.*\)/[^/]*:__include_[a-z]*("\([^"]*\)")$|\1/\2|' \
+        | sort -u | while IFS= read -r g; do [ -f "$g" ] && echo "$g"; done
+}
 tar -chf - $(all_sources) $(find . -name 'firn.package' -not -path './.git/*' | sed 's|^\./||') \
-    $(ls tests/data/include_* 2>/dev/null) \
+    $(ls tests/data/include_* 2>/dev/null) $(included) \
     | tar -xf - -C "$MIRROR"
 ( cd "$MIRROR" && "$FMT" -w $(find . -name '*.fi') 2>/dev/null )
 mrc=$?
