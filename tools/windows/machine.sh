@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/windows/machine.sh -- the IMAGE, not the behaviour (round WINDOWS).
 #
 # tools/windows/run.sh asks what a program DOES. This asks what the file IS:

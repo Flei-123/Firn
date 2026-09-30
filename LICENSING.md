@@ -61,6 +61,14 @@ any more.
   same step as for `lib/window/` and `lib/svg/`. Only the SPDX line changed
   and a note of origin was added.
 
+* 30 September 2026: the Windows target came over from the Firn branches
+  `windows` (`fec370f9`) and `certus-windows` (`bf3800f1`):
+  `compiler/src/win.rs`, `compiler/src/win_seam.rs` and `tools/windows/`.
+  The tools still carried `GPL-2.0-only` from the time of the split.
+  `git log` over these paths on both branches shows commits by Justin and
+  no other author. As sole author Justin released them for Firn under
+  MPL-2.0 -- the same step as above. Only the SPDX line changed.
+
 ## Why MPL-2.0
 
 A language is only useful if programs written in it may be closed. The MPL

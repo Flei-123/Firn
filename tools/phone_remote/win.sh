@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/phone_remote/win.sh -- examples/phone_remote as a WINDOWS program.
 #
 # The example is built unchanged for x86_64-windows (its input backend is

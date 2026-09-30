@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/windows/seam.sh -- ROUND MERGE-WIN: the seam's answer table, MEASURED.
 #
 # `tools/windows/seam.fi` calls a list of system call numbers without a side

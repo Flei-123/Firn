@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/windows/net.sh -- the network proof of round WINDOWS.
 #
 # A server of six lines of Python answers with a FIXED reply, so that the

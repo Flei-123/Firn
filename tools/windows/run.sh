@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/windows/run.sh -- THE CROSS CHECK OF ROUND WINDOWS.
 #
 # The same Firn program is compiled TWICE and both results are RUN. What is

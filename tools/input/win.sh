@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MPL-2.0
 # tools/input/win.sh -- lib/input on the Windows target: tools/input/
 # win_check.fi built for x86_64-windows (backend: SendInput) and run under
 # Wine on a virtual X display. GetCursorPos has to see the pointer move;
