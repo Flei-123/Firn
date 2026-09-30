@@ -1477,7 +1477,7 @@ WINRC=0
 for t in tools/windows/machine.sh tools/windows/net.sh tools/windows/run.sh tools/input/win.sh tools/phone_remote/win.sh; do
     lg="$WORK/win_$(basename "$(dirname "$t")")_$(basename "$t" .sh).log"
     bash "$t" > "$lg" 2>&1 || WINRC=1
-    grep -E '^  (passed|SKIP|RESULT)|^(SKIP|INPUT-WIN)' "$lg" | sed 's/^/   /'
+    grep -E '^  (passed|SKIP|RESULT)|^(SKIP|INPUT-WIN)' "$lg" | sed 's/^/   /' || true
 done
 if [ "$WINRC" -eq 0 ]; then
     ok
@@ -1493,7 +1493,7 @@ echo "== 70. web.dom: the page's DOM from Firn in a real browser (lib/web/dom.fi
 DOMRC=0
 for o in --no-opt --opt-level=release-fast; do
     OPT="$o" bash tools/web/run.sh > "$WORK/web_dom.log" 2>&1 || DOMRC=1
-    grep -E '^(dom:|SKIP)' "$WORK/web_dom.log" | sed "s/^/   $o /"
+    grep -E '^(dom:|SKIP)' "$WORK/web_dom.log" | sed "s/^/   $o /" || true
     [ "$DOMRC" -eq 0 ] || break
 done
 if [ "$DOMRC" -eq 0 ]; then

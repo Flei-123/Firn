@@ -45,7 +45,7 @@ WORK="$ROOT/.win-work/selfhost"
 JOBS=${JOBS:-6}
 FILTER=${SH_FILTER:-}
 
-export WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn}
+export WINEPREFIX=${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}
 export WINEDEBUG=${WINEDEBUG:--all}
 WINE=${WINE:-}
 if [ -z "$WINE" ]; then

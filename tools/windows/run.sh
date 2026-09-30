@@ -51,7 +51,7 @@ fi
 FILTER=${WIN_FILTER:-}
 
 # Wine: one prefix of our own, no debug chatter.
-export WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn}
+export WINEPREFIX=${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}
 export WINEDEBUG=${WINEDEBUG:--all}
 WINE=${WINE:-}
 if [ -z "$WINE" ]; then

@@ -14,7 +14,7 @@ done
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 "$FIRNC" --target=x86_64-windows -o "$W/check.exe" tools/input/win_check.fi 2> "$W/b.log" || { cat "$W/b.log"; exit 1; }
-export WINEDEBUG=-all WINEPREFIX="${WINEPREFIX:-$HOME/.wine-firn}"
+export WINEDEBUG=-all WINEPREFIX="${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}"
 timeout 120 xvfb-run -a wine "$W/check.exe" > "$W/out.log" 2>&1
 RC=$?
 cat "$W/out.log"

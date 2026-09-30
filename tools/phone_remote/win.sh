@@ -28,7 +28,7 @@ sed "s/http.app(8080)/http.app($PORT)/" examples/phone_remote/main.fi > "$W/shad
 Xvfb ":$DNUM" -screen 0 1280x800x24 >/dev/null 2>&1 &
 XV=$!
 sleep 1
-export DISPLAY=":$DNUM" WINEDEBUG=-all WINEPREFIX="${WINEPREFIX:-$HOME/.wine-firn}"
+export DISPLAY=":$DNUM" WINEDEBUG=-all WINEPREFIX="${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}"
 xdotool mousemove 400 300
 wine "$W/remote.exe" > "$W/out.log" 2>&1 &
 SRV=$!

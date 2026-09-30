@@ -14,7 +14,7 @@ export FIRNLIB="$ROOT/lib"
 FIRNC="$ROOT/compiler/target/release/firnc"
 WORK="$ROOT/.win-machine"
 OBJDUMP=x86_64-w64-mingw32-objdump
-export WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn}
+export WINEPREFIX=${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}
 export WINEDEBUG=${WINEDEBUG:--all}
 WINE=${WINE:-/usr/lib/wine/wine64}
 
