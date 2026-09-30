@@ -298,7 +298,10 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
 ///    entry naming the phi's own value does not count as a reader — that is
 ///    what a collapsed chain leaves behind;
 ///  * no ORDINARY instruction of `B` reads `%Y` — it would read the new
-///    content where it wanted the old. A phi of `B` reading `%Y` is fine and
+///    content where it wanted the old;
+///  * no OTHER phi of `C` reads `%Y` on the edge from `B` (r178) — that
+///    copy runs at the end of `B`, after `B`'s predecessors have already
+///    overwritten `%Y`: the lost copy. A phi of `B` reading `%Y` is fine and
 ///    is the case this exists for: after the merge that entry is either the
 ///    phi's own value (no copy at all) or one copy among several on the same
 ///    edge, and `sequentialize` orders a parallel copy so that every source
@@ -414,6 +417,27 @@ fn coalesce_chains(f: &mut Func) {
                         if buf.contains(&y) {
                             reads_y = true;
                             break;
+                        }
+                    }
+                    // r178: ANOTHER phi of C that reads %Y on the edge from
+                    // B wants the OLD content of %Y -- the copies of that
+                    // edge happen at the end of B, after the merge has let
+                    // B's predecessors overwrite %Y already. That is the
+                    // lost copy: `prev = x; x = next(x)` in a loop whose
+                    // `x = ...` is itself a join made `prev` read the new
+                    // `x` (OpenPlan, a linked list unlinked at the wrong
+                    // node, release builds only).
+                    if !reads_y {
+                        for k in c.insts[..np].iter() {
+                            if k.dst == Some(y) {
+                                continue;
+                            }
+                            if let Op::Phi { incoming } = &k.op {
+                                if incoming.iter().any(|(q, v)| *q as usize == bi && *v == y) {
+                                    reads_y = true;
+                                    break;
+                                }
+                            }
                         }
                     }
                     if !reads_y {
@@ -719,6 +743,72 @@ mod tests {
         }
         assert_eq!(env[&a], 22);
         assert_eq!(env[&b], 11);
+    }
+
+    /// r178, the lost copy: `prev = x; x = join(...)` in a loop. The join
+    /// `%j` must not be merged into `%x`, because `%p` reads the OLD `%x`
+    /// on the same back edge -- merged, the predecessors of the join would
+    /// overwrite `%x` before that copy runs, and `prev` would get the new
+    /// value (OpenPlan's list unlink, release builds only).
+    #[test]
+    fn a_join_is_not_merged_into_a_value_a_sibling_phi_still_reads() {
+        let mut f = Func::new("lost", vec![FTy::I64, FTy::I64], FTy::I64);
+        let head = f.add_block();
+        let body = f.add_block();
+        let left = f.add_block();
+        let right = f.add_block();
+        let join = f.add_block();
+        let done = f.add_block();
+        f.set_term(0, Term::Br(head));
+        let p = f.new_val_pub(FTy::I64);
+        let x = f.new_val_pub(FTy::I64);
+        let j = f.new_val_pub(FTy::I64);
+        // head: %p = phi [bb0 %0, join %x] ; %x = phi [bb0 %1, join %j]
+        f.blocks[head as usize].insts.push(Inst {
+            dst: Some(p),
+            ty: FTy::I64,
+            op: Op::Phi { incoming: vec![(0, 0), (join, x)] },
+            loc: crate::fir::Loc::NONE,
+        });
+        f.blocks[head as usize].insts.push(Inst {
+            dst: Some(x),
+            ty: FTy::I64,
+            op: Op::Phi { incoming: vec![(0, 1), (join, j)] },
+            loc: crate::fir::Loc::NONE,
+        });
+        let c = f.push(head, FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::I64, a: p, b: x });
+        f.set_term(head, Term::BrCond { cond: c, then_bb: body, else_bb: done });
+        let c2 = f.push(body, FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::I64, a: x, b: 0 });
+        f.set_term(body, Term::BrCond { cond: c2, then_bb: left, else_bb: right });
+        f.set_term(left, Term::Br(join));
+        f.set_term(right, Term::Br(join));
+        // join: %j = phi [left %0, right %1]
+        f.blocks[join as usize].insts.push(Inst {
+            dst: Some(j),
+            ty: FTy::I64,
+            op: Op::Phi { incoming: vec![(left, 0), (right, 1)] },
+            loc: crate::fir::Loc::NONE,
+        });
+        f.set_term(join, Term::Br(head));
+        f.set_term(done, Term::Ret(Some(p)));
+        assert!(f.verify_phis().is_ok(), "{:?}", f.verify_phis());
+
+        coalesce_chains(&mut f);
+        assert_eq!(f.blocks[join as usize].insts[0].dst, Some(j), "%j merged into %x: the lost copy");
+        eliminate_func(&mut f).unwrap();
+        assert!(!f.has_phi());
+        // the back edge copies %p <- %x before %x <- %j
+        let copies: Vec<(Val, Val)> = f.blocks[join as usize]
+            .insts
+            .iter()
+            .filter_map(|i| match (&i.op, i.dst) {
+                (Op::Copy { src }, Some(d)) => Some((d, *src)),
+                _ => None,
+            })
+            .collect();
+        let rp = copies.iter().position(|&(d, s)| d == p && s == x);
+        let wx = copies.iter().position(|&(d, _)| d == x);
+        assert!(matches!((rp, wx), (Some(a), Some(b)) if a < b), "{:?}", copies);
     }
 
     /// A chain (not a cycle) needs no rescue, and the order matters: the
