@@ -94,6 +94,7 @@ Everything lives under `lib/` and is written in Firn.
 | images and fonts | `jpeg.jpeg` (baseline + progressive), `paint.png` (PNG in and out), `svg.*` (SVG painter), `font.*` (TrueType reader and rasteriser) |
 | input | `input.input`: mouse, buttons, wheel, keys, text, volume and media keys; `/dev/uinput` on Linux, `SendInput` on Windows, one interface |
 | UI | `window.window` (X11, Win32, Android), `fui.*`, `plat.*`, `fuishell.*` |
+| web page | `web.dom`: the page's DOM from `wasm32-browser` code -- query, create, text, attributes, styles, classes, events, `eval`; through one fixed JS file (`lib/web/dom.js`), no generator |
 | web engine | `html`, `css`, `dom`, `layout`, `js`, `paint` -- the parts of a browser engine (HTML tokenizer and tree builder, CSS cascade, layout, painting, a JavaScript interpreter) |
 
 ## fUi
@@ -123,6 +124,18 @@ $FIRNC -o /tmp/remote examples/phone_remote/main.fi && /tmp/remote
 
 Only the browser that opened the printed URL (with its one-time token) is let
 in. The same source builds as a Windows `.exe`.
+
+## Example: DOM from WebAssembly
+
+[examples/dom](examples/dom) builds a small list app whose whole logic is Firn:
+it creates the elements, handles clicks and reads input fields. No browser
+lets WebAssembly touch the DOM directly, so `lib/web/dom.js` passes node
+handles and UTF-8 text across; texts are always set as text, never as HTML.
+
+```sh
+$FIRNC --target=wasm32-browser -o app.wasm examples/dom/main.fi
+cp lib/web/dom.js examples/dom/index.html . && python3 -m http.server
+```
 
 ## Licence
 

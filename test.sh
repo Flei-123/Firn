@@ -1486,6 +1486,23 @@ else
     grep -hE 'FAIL' "$WORK"/win_*.log | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 70. web.dom: the page's DOM from Firn in a real browser (lib/web/dom.fi + dom.js) =="
+# examples/dom built for wasm32-browser, driven in headless Chromium: nodes
+# created, real clicks reach the Firn handler, text never parsed as HTML,
+# 5000 list items, no page errors. SKIPs (exit 0) without Playwright.
+DOMRC=0
+for o in --no-opt --opt-level=release-fast; do
+    OPT="$o" bash tools/web/run.sh > "$WORK/web_dom.log" 2>&1 || DOMRC=1
+    grep -E '^(dom:|SKIP)' "$WORK/web_dom.log" | sed "s/^/   $o /"
+    [ "$DOMRC" -eq 0 ] || break
+done
+if [ "$DOMRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/web/run.sh failed (see .test-work/web_dom.log)"
+    grep -E 'FAIL' "$WORK/web_dom.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
