@@ -1,0 +1,644 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/dom_main.fi -- THE APP TREE, CHECKED (docs/APP-TREE.md §7).
+//
+// The app-tree work turns scene.Scene into the one tree that tests,
+// scripts, the inspector and agents read. Every promise of it is checked
+// here with hand-made expectations:
+//
+//   1. SECRETS (T8, r99). A password field's value and its LENGTH never
+//      leave the process: not in the accessibility dump, not in any name
+//      (not even as the label of another control), not through a query. A
+//      canary word proves it -- it must not appear in any export. The
+//      field paints and measures masked (one bullet per character), the
+//      same octets as a field that really holds bullets.
+//   2. KEYS (T2, r92). Key paths find the same control after a rebuild
+//      that moved every number; duplicate keys are counted; the focus,
+//      the hovered and the pressed control follow their key.
+//   3. QUERIES (T5, r93). By selector (sheet.Sel through sel_match), by
+//      role and name, and by text: role, [name=], [name*=], .class, #key,
+//      descendant, :state -- plus queries that must find NOTHING because
+//      they are not understood.
+//   4. CULLING (T10, r101). The same picture with and without culling
+//      (pixel checksum), and culled nodes are really skipped.
+//   5. MEASURE MEMO (T10, r100). A rebuilt, unchanged tree measures from
+//      the memo -- the same sizes, and a changed text is measured anew.
+//   6. THE INSPECTOR (T9, r97). Pick, describe (role, name, key, rect,
+//      the winning rule of every style value), secret-safe, live edit.
+import std.rt
+import html.mem
+import paint.png
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.control
+import fui.sheet
+import fui.scene
+import fui.a11y
+import fui.query
+import fui.viewport
+import fui.inspect
+
+static mut G_ERRORS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_int(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn check(name: str, ok: bool, got: i64, want: i64) {
+    say("  ")
+    say(name)
+    var k: usize = name.n
+    while k < 60 {
+        say(" ")
+        k = k + 1
+    }
+    if ok {
+        say("OK    got ")
+    } else {
+        say("WRONG got ")
+        G_ERRORS = G_ERRORS + 1
+    }
+    say_int(got)
+    say(" want ")
+    say_int(want)
+    say("\n")
+}
+
+fn eq(name: str, got: i64, want: i64) {
+    check(name, got == want, got, want)
+}
+
+// Does the text `h[0..hn]` contain `nd`?
+fn has(h: u64, hn: usize, nd: str) -> bool {
+    var a: usize = 0
+    while a + nd.n <= hn {
+        var k: usize = 0
+        var ok: bool = true
+        while k < nd.n && ok {
+            if rt.ld8(h, a + k) != rt.ld8(nd.p as u64, k) {
+                ok = false
+            }
+            k = k + 1
+        }
+        if ok {
+            return true
+        }
+        a = a + 1
+    }
+    return false
+}
+
+fn key(s: str) -> u32 {
+    return query.query_key(s.p as u64, s.n)
+}
+
+// FNV-1a over the canvas (32 bit, the product cut back).
+fn pixel_sum(cv: *mut canvas.Canvas, n: usize) -> i64 {
+    let p: u64 = canvas.canvas_pixels(cv) as u64
+    var h: u32 = 2166136261 as u32
+    var i: usize = 0
+    while i < n {
+        h = h ^ (rt.ld8(p, i) as u32)
+        let wide: u64 = (h as u64) * (16777619 as u64)
+        h = (wide & (4294967295 as u64)) as u32
+        i = i + 1
+    }
+    return h as i64
+}
+
+// ============================================================ THE FORM
+//
+// A login form, described with keys:
+//
+//   root (#login)
+//     heading "Sign in"
+//     box.row  (#user)   label "User", textbox value "justin"
+//     box.row  (#pass)   label "Password", textbox SECRET "CANARY7hunter2"
+//     box.row.actions    button "Save" (#save), button "Cancel" (#cancel),
+//                        checkbox "Remember" (#remember)
+//     button (#peek), labelled by the whole password row (#pass) -- its
+//                    name is read from the row's children, the secret
+//                    field among them
+//
+// `extra` puts one more row in FRONT of everything, which moves every
+// node number -- the rebuild the keys have to survive.
+fn build(sc: *mut scene.Scene, ax: *mut a11y.A11y, extra: bool,
+    secret: bool) -> usize {
+    scene.scene_reset(sc)
+    a11y.a11y_reset(ax)
+    let root: usize = scene.scene_add(sc, scene.SCENE_NONE, scene.N_BOX)
+    scene.node_set_id(sc, root, key("login"))
+    if extra {
+        let b: usize = scene.scene_add(sc, root, scene.N_TEXT)
+        let t0: str = "A banner that moves every number"
+        scene.node_set_text(sc, b, t0.p as u64, t0.n)
+        scene.node_set_size(sc, b, 300.0, 30.0)
+    }
+    let h: usize = scene.scene_add(sc, root, scene.N_TEXT)
+    let t1: str = "Sign in"
+    scene.node_set_text(sc, h, t1.p as u64, t1.n)
+    a11y.a11y_set_role(ax, h, a11y.ROLE_HEADING)
+    scene.node_set_size(sc, h, 300.0, 30.0)
+
+    let row: u32 = key("row")
+    let r1: usize = scene.scene_box(sc, root, row, 0 as u32, 0 as u32, 0 as u32)
+    scene.node_set_id(sc, r1, key("user"))
+    let l1: usize = scene.scene_add(sc, r1, scene.N_TEXT)
+    let t2: str = "User"
+    scene.node_set_text(sc, l1, t2.p as u64, t2.n)
+    scene.node_set_id(sc, l1, key("user-label"))
+    let t3: str = "justin"
+    let f1: usize = scene.scene_widget(sc, r1, widget.KIND_TEXTBOX, t3.p as u64, t3.n)
+    scene.node_set_id(sc, f1, key("field"))
+    a11y.a11y_set_labelled_by(ax, f1, key("user-label"))
+
+    let r2: usize = scene.scene_box(sc, root, row, 0 as u32, 0 as u32, 0 as u32)
+    scene.node_set_id(sc, r2, key("pass"))
+    let l2: usize = scene.scene_add(sc, r2, scene.N_TEXT)
+    let t4: str = "Password"
+    scene.node_set_text(sc, l2, t4.p as u64, t4.n)
+    scene.node_set_id(sc, l2, key("pass-label"))
+    let t5: str = "CANARY7hunter2"
+    let f2: usize = scene.scene_widget(sc, r2, widget.KIND_TEXTBOX, t5.p as u64, t5.n)
+    // the SAME key as the user field: unique under its own keyed parent
+    scene.node_set_id(sc, f2, key("field"))
+    widget.w_set_secret(scene.node_widget(sc, f2), secret)
+    a11y.a11y_set_labelled_by(ax, f2, key("pass-label"))
+
+    let r3: usize = scene.scene_box(sc, root, row, 0 as u32, 0 as u32, 0 as u32)
+    scene.node_add_class(sc, r3, key("actions"))
+    let t6: str = "Save"
+    let bs: usize = scene.scene_widget(sc, r3, widget.KIND_BUTTON, t6.p as u64, t6.n)
+    scene.node_set_id(sc, bs, key("save"))
+    let t7: str = "Cancel"
+    let bc: usize = scene.scene_widget(sc, r3, widget.KIND_BUTTON, t7.p as u64, t7.n)
+    scene.node_set_id(sc, bc, key("cancel"))
+    let t8: str = "Remember me"
+    let cb: usize = scene.scene_widget(sc, r3, widget.KIND_CHECKBOX, t8.p as u64, t8.n)
+    scene.node_set_id(sc, cb, key("remember"))
+    widget.w_set_value(scene.node_widget(sc, cb), 1)
+
+    // A button whose only name source is the password field -- the name
+    // must NOT become the password.
+    let pk: usize = scene.scene_widget(sc, root, widget.KIND_BUTTON, 0, 0)
+    scene.node_set_id(sc, pk, key("peek"))
+    a11y.a11y_set_labelled_by(ax, pk, key("pass"))
+    return root
+}
+
+// A painter that paints 200 pixels BELOW its node -- onto the canvas while
+// its node lies below it. It never says so (no node_set_ink).
+fn paint_far(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.round_rect(z, 20.0, widget.w_y(e) - 200.0, 60.0, 30.0, 0.0,
+        4278231040 as u32)
+}
+
+fn main(start: u64) -> i32 {
+    let width: usize = 480
+    let height: usize = 360
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&f1[0]) as u64, &fbuf) {
+        say("dom: no font\n")
+        return 9
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, width, height) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, width, height) {
+        return 5
+    }
+    painter.painter_set_font(&z, fsp as u64)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let base: u32 = theme.opaque((*theme.theme_colors(&m)).base)
+    let npix: usize = width * height * 4
+
+    let sc: *mut scene.Scene = rt.heap_alloc(1048576) as *mut scene.Scene
+    *sc = scene.scene_new()
+    let ax: *mut a11y.A11y = rt.heap_alloc(262144) as *mut a11y.A11y
+    *ax = a11y.a11y_new()
+    let dcap: usize = 16384
+    let dbuf: u64 = rt.heap_alloc(dcap)
+    var hits: [usize; 64] = [0; 64]
+    let hp: u64 = (&hits[0]) as u64
+
+    // ====================================================== 1. SECRETS
+    say("== 1. secrets: the password never leaves the process\n")
+    let root: usize = build(sc, ax, false, true)
+    scene.scene_measure(sc, &c)
+    scene.scene_layout(sc, &c, 0.0, 0.0, 480.0, 360.0)
+    let dn: usize = a11y.a11y_dump(sc, ax, dbuf, dcap)
+    rt.write_everything(1, dbuf, dn)
+    check("dump fits its buffer", dn < dcap, dn as i64, 1)
+    check("canary word is NOT in the dump", !has(dbuf, dn, "CANARY7"), 0, 0)
+    check("no fragment of it either (hunter2)", !has(dbuf, dn, "hunter2"), 0, 0)
+    check("the field is flagged secret", has(dbuf, dn, "\"Password\" focusable secret"), 1, 1)
+    check("the other field keeps its value", has(dbuf, dn, "value=\"justin\""), 1, 1)
+    // exactly one value= in the whole dump: the length of the secret
+    // would otherwise show as the length of an empty/short value
+    var nval: i64 = 0
+    var a: usize = 0
+    while a + 6 <= dn {
+        if rt.ld8(dbuf, a) == 118 as u8 && rt.ld8(dbuf, a + 1) == 97 as u8
+            && rt.ld8(dbuf, a + 2) == 108 as u8 && rt.ld8(dbuf, a + 3) == 117 as u8
+            && rt.ld8(dbuf, a + 4) == 101 as u8 && rt.ld8(dbuf, a + 5) == 61 as u8 {
+            nval = nval + 1
+        }
+        a = a + 1
+    }
+    eq("value= appears once (only the user field)", nval, 1)
+    // the peek button is labelled by the row that holds the secret: its
+    // name is the label only, the secret adds nothing
+    let peek: usize = query.query_find_path(sc, "login/peek".p as u64, 10)
+    var nb: [u8; 128] = [0 as u8; 128]
+    let pn: usize = a11y.a11y_name(sc, ax, peek, (&nb[0]) as u64, 128)
+    eq("a name read through the secret's row: 8 bytes", pn as i64, 8)
+    check("... it is \"Password\", nothing more", has((&nb[0]) as u64, pn, "Password")
+        && !has((&nb[0]) as u64, pn, "CANARY"), 1, 1)
+    check("the peek line of the dump says Password", has(dbuf, dn, "button \"Password\""), 1, 1)
+    // no query finds the secret by its text
+    eq("[name*=\"hunter\"] finds nothing",
+        query.query_str(sc, ax, "*[name*=\"hunter\"]", hp, 64) as i64, 0)
+    eq("textbox:secret finds the one field",
+        query.query_str(sc, ax, "textbox:secret", hp, 64) as i64, 1)
+    // PAINTED MASKED: the same octets as a widget that holds 14 bullets
+    let passf: usize = query.query_find_path(sc, "login/pass/field".p as u64, 16)
+    var wa: widget.Widget = *scene.node_widget(sc, passf)
+    widget.w_place(&wa, 10.0, 10.0, 300.0, 36.0)
+    var bullets: [u8; 42] = [0 as u8; 42]
+    var b: usize = 0
+    while b < 14 {
+        bullets[b * 3] = 226 as u8
+        bullets[b * 3 + 1] = 128 as u8
+        bullets[b * 3 + 2] = 162 as u8
+        b = b + 1
+    }
+    var wb: widget.Widget = wa
+    widget.w_set_secret(&wb, false)
+    widget.w_set_text(&wb, (&bullets[0]) as u64, 42)
+    var wc: widget.Widget = wa
+    widget.w_set_secret(&wc, false)
+    canvas.canvas_clear(&cv, base)
+    render.draw_widget(&c, &wa)
+    let sa: i64 = pixel_sum(&cv, npix)
+    canvas.canvas_clear(&cv, base)
+    render.draw_widget(&c, &wb)
+    let sb: i64 = pixel_sum(&cv, npix)
+    canvas.canvas_clear(&cv, base)
+    render.draw_widget(&c, &wc)
+    let s_plain: i64 = pixel_sum(&cv, npix)
+    eq("secret paints like 14 bullets (checksum)", sa, sb)
+    check("... and not like the plain text", sa != s_plain, sa, s_plain)
+    var pwa: f64 = 0.0
+    var pha: f64 = 0.0
+    var pwb: f64 = 0.0
+    var phb: f64 = 0.0
+    render.pref_of(&c, &wa, &pwa, &pha)
+    render.pref_of(&c, &wb, &pwb, &phb)
+    eq("secret measures like 14 bullets (width)", pwa as i64, pwb as i64)
+
+    // ========================================================= 2. KEYS
+    say("== 2. keys: the key path is the automation id\n")
+    let save0: usize = query.query_find_path(sc, "login/save".p as u64, 10)
+    check("login/save is found", save0 != scene.SCENE_NONE, save0 as i64, 1)
+    let uf: usize = query.query_find_path(sc, "login/user/field".p as u64, 16)
+    let pf: usize = query.query_find_path(sc, "login/pass/field".p as u64, 16)
+    check("two fields, same key, different paths", uf != pf && uf != scene.SCENE_NONE
+        && pf != scene.SCENE_NONE, uf as i64, pf as i64)
+    eq("no duplicate keys in the form", query.query_key_dups(sc) as i64, 0)
+    eq("an unknown path finds nothing",
+        query.query_find_path(sc, "login/nope".p as u64, 10) as i64,
+        scene.SCENE_NONE as i64)
+    var kp: [u32; 8] = [0 as u32; 8]
+    let kn: usize = query.query_key_path(sc, pf, (&kp[0]) as u64, 8)
+    eq("the path of the password field has 3 keys", kn as i64, 3)
+    check("... login, pass, field", kp[0] == key("login") && kp[1] == key("pass")
+        && kp[2] == key("field"), 1, 1)
+    // the panel: focus on the checkbox, hover on Save, press on Cancel
+    var pnl: control.Panel = control.panel_new()
+    scene.scene_bind_panel(sc, &pnl)
+    let rem0: usize = query.query_find_path(sc, "login/remember".p as u64, 14)
+    let can0: usize = query.query_find_path(sc, "login/cancel".p as u64, 12)
+    let fc: u32 = control.panel_set_focus(&pnl, rem0)
+    let mv: u32 = control.mouse_move(&pnl, scene.node_x(sc, save0) + 2.0,
+        scene.node_y(sc, save0) + 2.0)
+    eq("hover is on Save before the rebuild", control.panel_hot(&pnl) as i64, save0 as i64)
+    var kept: query.Kept = query.query_keep(sc, &pnl)
+    // REBUILD with a banner in front: every number moves by one
+    let root2: usize = build(sc, ax, true, true)
+    scene.scene_measure(sc, &c)
+    scene.scene_layout(sc, &c, 0.0, 0.0, 480.0, 360.0)
+    scene.scene_bind_panel(sc, &pnl)
+    let save1: usize = query.query_find_path(sc, "login/save".p as u64, 10)
+    let rem1: usize = query.query_find_path(sc, "login/remember".p as u64, 14)
+    eq("after the rebuild Save has a new number", save1 as i64, (save0 + 1) as i64)
+    let back: usize = query.query_restore(sc, &pnl, &kept)
+    eq("focus and hover were found again (2)", back as i64, 2)
+    eq("the focus is on the checkbox again", control.panel_focus(&pnl) as i64, rem1 as i64)
+    check("... and its widget carries the focus bit",
+        widget.w_is_focus(scene.node_widget(sc, rem1)), 1, 1)
+    eq("the hover is on Save again", control.panel_hot(&pnl) as i64, save1 as i64)
+    // a duplicate is counted
+    let dupe: usize = scene.scene_widget(sc, root2, widget.KIND_BUTTON,
+        "Again".p as u64, 5)
+    scene.node_set_id(sc, dupe, key("save"))
+    eq("a second #save under login is counted", query.query_key_dups(sc) as i64, 1)
+
+    // ====================================================== 3. QUERIES
+    say("== 3. queries: selector, role + name, text\n")
+    let root3: usize = build(sc, ax, false, true)
+    scene.scene_measure(sc, &c)
+    scene.scene_layout(sc, &c, 0.0, 0.0, 480.0, 360.0)
+    var sel: sheet.Sel = sheet.sel_within_class(sheet.sel_kind(widget.KIND_BUTTON),
+        key("actions"))
+    eq("Sel: button within .actions = 2", query.query_sel(sc, &sel, hp, 64) as i64, 2)
+    var sel2: sheet.Sel = sheet.sel_class(key("row"))
+    eq("Sel: .row = 3", query.query_sel(sc, &sel2, hp, 64) as i64, 3)
+    eq("role button + name Save = 1",
+        query.query_role_name(sc, ax, a11y.ROLE_BUTTON, "Save".p as u64, 4, hp, 64) as i64, 1)
+    eq("... and it is login/save", hits[0] as i64,
+        query.query_find_path(sc, "login/save".p as u64, 10) as i64)
+    eq("role button, any name = 3",
+        query.query_role_name(sc, ax, a11y.ROLE_BUTTON, 0, 0, hp, 64) as i64, 3)
+    eq("text: button[name=\"Save\"] = 1",
+        query.query_str(sc, ax, "button[name=\"Save\"]", hp, 64) as i64, 1)
+    eq("text: button[name=\"save\"] = 0 (exact)",
+        query.query_str(sc, ax, "button[name=\"save\"]", hp, 64) as i64, 0)
+    eq("text: checkbox[name*=\"Remember\"] = 1",
+        query.query_str(sc, ax, "checkbox[name*=\"Remember\"]", hp, 64) as i64, 1)
+    eq("text: .actions button = 2",
+        query.query_str(sc, ax, ".actions button", hp, 64) as i64, 2)
+    eq("text: #pass textbox = 1",
+        query.query_str(sc, ax, "#pass textbox", hp, 64) as i64, 1)
+    eq("text: #login #field = 2",
+        query.query_str(sc, ax, "#login #field", hp, 64) as i64, 2)
+    eq("text: textbox[name=\"User\"] = 1 (named by its label)",
+        query.query_str(sc, ax, "textbox[name=\"User\"]", hp, 64) as i64, 1)
+    eq("text: checkbox:checked = 1",
+        query.query_str(sc, ax, "checkbox:checked", hp, 64) as i64, 1)
+    eq("text: heading = 1", query.query_str(sc, ax, "heading", hp, 64) as i64, 1)
+    eq("text: * = every node", query.query_str(sc, ax, "*", hp, 64) as i64,
+        scene.scene_count(sc) as i64)
+    eq("text: an unknown role finds nothing (buton)",
+        query.query_str(sc, ax, "buton", hp, 64) as i64, 0)
+    check("... and is reported as not understood", !query.query_parse_ok("buton"), 0, 0)
+    eq("text: an unknown state finds nothing",
+        query.query_str(sc, ax, "button:hot", hp, 64) as i64, 0)
+    eq("text: an open bracket finds nothing",
+        query.query_str(sc, ax, "button[name=\"Save\"", hp, 64) as i64, 0)
+    eq("text: a small array still gets the full count",
+        query.query_str(sc, ax, "*", hp, 2) as i64, scene.scene_count(sc) as i64)
+    eq("first: button = login/save",
+        query.query_first_str(sc, ax, "button") as i64,
+        query.query_find_path(sc, "login/save".p as u64, 10) as i64)
+
+    // ====================================================== 4. CULLING
+    say("== 4. culling: what cannot be seen is not painted\n")
+    // A heading, a scroll list of 40 rows (40 high) in a 200-high window
+    // onto it, scrolled to 300, and six cards with a box shadow and a
+    // text shadow, three of them below the canvas. Painted with culling
+    // and without: the same octets.
+    let vp: *mut viewport.Viewport = rt.heap_alloc(4096) as *mut viewport.Viewport
+    *vp = viewport.viewport_new(0.0, 0.0, 300.0, 200.0, 288.0, 1600.0)
+    viewport.viewport_set_bar(vp, 12)
+    viewport.viewport_set_offset(vp, 0.0, 300.0)
+    var sh: sheet.Sheet = sheet.sheet_new()
+    var cs: style.Style = style.style_new()
+    cs = style.style_set_box_shadow(cs, 12, 16, 4278190080 as u32, 120)
+    cs = style.style_set_shadow(cs, 3, 3, 4291297280 as u32)
+    let r0: usize = sheet.sheet_rule(&sh, sheet.sel_class(key("card")), cs)
+    scene.scene_reset(sc)
+    let croot: usize = scene.scene_add(sc, scene.SCENE_NONE, scene.N_BOX)
+    let ch1: usize = scene.scene_add(sc, croot, scene.N_TEXT)
+    scene.node_set_text(sc, ch1, "Rows".p as u64, 4)
+    let lv: usize = scene.scene_add(sc, croot, scene.N_VIEWPORT)
+    scene.node_set_viewport(sc, lv, vp)
+    var rk: usize = 0
+    while rk < 40 {
+        let rw: usize = scene.scene_widget(sc, lv, widget.KIND_BUTTON,
+            "A row in a long list".p as u64, 20)
+        scene.node_set_size(sc, rw, 288.0, 40.0)
+        rk = rk + 1
+    }
+    var ck: usize = 0
+    while ck < 6 {
+        let cd: usize = scene.scene_widget(sc, croot, widget.KIND_CARD,
+            "Card with a shadow".p as u64, 18)
+        scene.node_add_class(sc, cd, key("card"))
+        scene.node_set_size(sc, cd, 300.0, 50.0)
+        ck = ck + 1
+    }
+    scene.scene_style(sc, &sh)
+    scene.scene_measure(sc, &c)
+    scene.scene_layout(sc, &c, 0.0, 0.0, 480.0, 360.0)
+    scene.scene_set_cull(sc, false)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    let s_all: i64 = pixel_sum(&cv, npix)
+    eq("without culling nothing is skipped", scene.scene_culled(sc) as i64, 0)
+    scene.scene_set_cull(sc, true)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    let s_cull: i64 = pixel_sum(&cv, npix)
+    eq("culled: the same octets", s_cull, s_all)
+    let nculled: usize = scene.scene_culled(sc)
+    check("culled: rows off the list and cards off the canvas skipped",
+        nculled >= 30, nculled as i64, 30)
+    eq("culled: the drift guard stays quiet", scene.scene_size_drift(sc) as i64, 0)
+    // a custom painter without an announced overflow is never skipped
+    let last: usize = scene.scene_count(sc) - 1
+    scene.node_set_draw(sc, last, 0, paint_far)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    eq("a painter without node_set_ink is painted", scene.scene_culled(sc) as i64,
+        (nculled - 1) as i64)
+    let s_far: i64 = pixel_sum(&cv, npix)
+    scene.scene_set_cull(sc, false)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    eq("... and its far paint is in the picture", pixel_sum(&cv, npix), s_far)
+    scene.scene_set_cull(sc, true)
+    // scrolled to the end: other rows, still the same octets
+    viewport.viewport_set_offset(vp, 0.0, 1400.0)
+    scene.scene_layout(sc, &c, 0.0, 0.0, 480.0, 360.0)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    let e_cull: i64 = pixel_sum(&cv, npix)
+    scene.scene_set_cull(sc, false)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    eq("scrolled to the end: the same octets", e_cull, pixel_sum(&cv, npix))
+    scene.scene_set_cull(sc, true)
+    // an offset group (node_set_offset) moves its cards INTO the canvas:
+    // the moved subtree must be painted where it lands
+    scene.node_set_offset(sc, croot, 0.0, -160.0)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    let o_cull: i64 = pixel_sum(&cv, npix)
+    scene.scene_set_cull(sc, false)
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    eq("an offset group: the same octets", o_cull, pixel_sum(&cv, npix))
+    scene.scene_set_cull(sc, true)
+
+    // ================================================= 5. MEASURE MEMO
+    say("== 5. the measure memo: a rebuilt, unchanged tree is not shaped again\n")
+    let mm: *mut scene.Memo = rt.heap_alloc(65536) as *mut scene.Memo
+    *mm = scene.memo_new()
+    // without a memo: the reference sizes of the form
+    let fr0: usize = build(sc, ax, false, true)
+    scene.scene_measure(sc, &c)
+    var refw: [f64; 64] = [0.0; 64]
+    var refh: [f64; 64] = [0.0; 64]
+    var q: usize = 0
+    while q < scene.scene_count(sc) {
+        refw[q] = scene.node_pref_w(sc, q)
+        refh[q] = scene.node_pref_h(sc, q)
+        q = q + 1
+    }
+    scene.scene_attach_memo(sc, mm)
+    let fr1: usize = build(sc, ax, false, true)
+    scene.scene_measure(sc, &c)
+    let leaves: usize = scene.memo_misses(mm)
+    eq("first measure with a memo: every leaf missed, none hit",
+        scene.memo_hits(mm) as i64, 0)
+    let fr2: usize = build(sc, ax, false, true)
+    scene.scene_measure(sc, &c)
+    eq("rebuilt, unchanged: every leaf hits", scene.memo_hits(mm) as i64,
+        leaves as i64)
+    var same: bool = true
+    q = 0
+    while q < scene.scene_count(sc) {
+        if scene.node_pref_w(sc, q) != refw[q] || scene.node_pref_h(sc, q) != refh[q] {
+            same = false
+        }
+        q = q + 1
+    }
+    check("... and every size is the one measured without memo", same, 1, 1)
+    // a changed text in the same buffer is measured anew
+    let tbp: u64 = rt.heap_alloc(8)
+    let tb: *mut u8 = tbp as *mut u8
+    *tb = 83 as u8
+    *((tbp + 1) as *mut u8) = 97 as u8
+    *((tbp + 2) as *mut u8) = 118 as u8
+    *((tbp + 3) as *mut u8) = 101 as u8
+    let fr3: usize = build(sc, ax, false, true)
+    let sv: usize = query.query_find_path(sc, "login/save".p as u64, 10)
+    scene.node_set_text(sc, sv, tbp, 4)
+    scene.scene_measure(sc, &c)
+    let w_save: f64 = scene.node_pref_w(sc, sv)
+    let h0: usize = scene.memo_hits(mm)
+    let m0: usize = scene.memo_misses(mm)
+    let fr4: usize = build(sc, ax, false, true)
+    rt.mem_set(tbp, 87 as u8, 4)
+    scene.node_set_text(sc, query.query_find_path(sc, "login/save".p as u64, 10),
+        tbp, 4)
+    scene.scene_measure(sc, &c)
+    eq("same buffer, new bytes: exactly one miss", (scene.memo_misses(mm) - m0) as i64, 1)
+    check("... and the new width is measured (WWWW wider than Save)",
+        scene.node_pref_w(sc, sv) > w_save, scene.node_pref_w(sc, sv) as i64,
+        w_save as i64)
+    scene.scene_attach_memo(sc, 0 as *mut scene.Memo)
+
+    // =================================================== 6. INSPECTOR
+    say("== 6. the inspector: pick, describe, overlay, live edit\n")
+    var ish: sheet.Sheet = sheet.sheet_new()
+    var st0: style.Style = style.style_new()
+    st0 = style.style_set_radius(st0, 4)
+    let ir0: usize = sheet.sheet_rule(&ish, sheet.sel_kind(widget.KIND_BUTTON), st0)
+    var st1: style.Style = style.style_new()
+    st1 = style.style_set_bg(st1, style.color_literal(3355596 as u32))
+    st1 = style.style_set_radius(st1, 12)
+    let ir1: usize = sheet.sheet_rule(&ish, sheet.sel_id(key("save")), st1)
+    var st2: style.Style = style.style_new()
+    st2 = style.style_set_fg(st2, style.color_literal(16777215 as u32))
+    let ir2: usize = sheet.sheet_rule(&ish, sheet.sel_class(key("actions")), st2)
+    let fr5: usize = build(sc, ax, false, true)
+    scene.scene_style(sc, &ish)
+    scene.scene_measure(sc, &c)
+    scene.scene_layout(sc, &c, 0.0, 0.0, 480.0, 360.0)
+    let isv: usize = query.query_find_path(sc, "login/save".p as u64, 10)
+    let px0: f64 = scene.node_x(sc, isv) + 5.0
+    let py0: f64 = scene.node_y(sc, isv) + 5.0
+    eq("pick at Save finds Save", inspect.inspect_pick(sc, px0, py0) as i64, isv as i64)
+    let ihd: usize = query.query_first_str(sc, ax, "heading")
+    eq("pick finds a text that takes no clicks (the heading)",
+        inspect.inspect_pick(sc, scene.node_x(sc, ihd) + 2.0,
+        scene.node_y(sc, ihd) + 2.0) as i64, ihd as i64)
+    eq("pick outside the tree finds nothing",
+        inspect.inspect_pick(sc, 9999.0, 9999.0) as i64, scene.SCENE_NONE as i64)
+    var rl: [usize; 8] = [0; 8]
+    eq("rules on Save: button, #save (2)",
+        inspect.inspect_rules_of(sc, &ish, isv, (&rl[0]) as u64, 8) as i64, 2)
+    let itn: usize = inspect.inspect_text(sc, ax, &ish, isv, dbuf, dcap)
+    rt.write_everything(1, dbuf, itn)
+    check("text: role and name", has(dbuf, itn, "role=button name=\"Save\""), 1, 1)
+    check("text: radius 12 won by rule #1 (#save beats button)",
+        has(dbuf, itn, "radius=12  (rule #1)"), 1, 1)
+    check("text: bg from rule #1", has(dbuf, itn, "bg=#3333cc  (rule #1)"), 1, 1)
+    check("text: fg inherited from .actions", has(dbuf, itn, "fg=#ffffff  (inherited)"), 1, 1)
+    check("text: the key path is shown", has(dbuf, itn, " key=#"), 1, 1)
+    let ipf: usize = query.query_find_path(sc, "login/pass/field".p as u64, 16)
+    let itp: usize = inspect.inspect_text(sc, ax, &ish, ipf, dbuf, dcap)
+    rt.write_everything(1, dbuf, itp)
+    check("text of the password field: no canary", !has(dbuf, itp, "CANARY"), 0, 0)
+    check("... says it is a secret", has(dbuf, itp, "(secret, not shown)"), 1, 1)
+    // the overlay changes the picture, and only around the node
+    canvas.canvas_clear(&cv, base)
+    scene.scene_draw(sc, &c)
+    let o_before: i64 = pixel_sum(&cv, npix)
+    inspect.inspect_draw(sc, ax, &c, isv)
+    check("the overlay paints", pixel_sum(&cv, npix) != o_before, 1, 1)
+    // `dom_main <out.png>` keeps this picture: the form with the overlay
+    if rt.arg_count(start) >= 2 {
+        var pout: mem.Buf = mem.buf_new()
+        mem.buf_init(&pout)
+        if png.write_png(&cv, &pout) {
+            let ok: bool = rt.write_file(rt.arg_ptr(start, 1),
+                mem.buf_ptr(&pout) as u64, mem.buf_len(&pout))
+        }
+    }
+    // live edit: radius 12 -> 2, next style pass shows it
+    check("live edit of rule #1", inspect.inspect_set_radius(&ish, ir1, 2), 1, 1)
+    check("live edit of a rule that is not there fails",
+        !inspect.inspect_set_radius(&ish, 99, 2), 0, 0)
+    scene.scene_style(sc, &ish)
+    let itn2: usize = inspect.inspect_text(sc, ax, &ish, isv, dbuf, dcap)
+    check("after the edit: radius=2 from rule #1", has(dbuf, itn2, "radius=2  (rule #1)"), 1, 1)
+    check("live edit of the font size", inspect.inspect_set_font(&ish, ir0, 22), 1, 1)
+    scene.scene_style(sc, &ish)
+    scene.scene_measure(sc, &c)
+    let icn: usize = query.query_find_path(sc, "login/cancel".p as u64, 12)
+    let itn3: usize = inspect.inspect_text(sc, ax, &ish, icn, dbuf, dcap)
+    check("Cancel now has font-px=22 from rule #0", has(dbuf, itn3, "font-px=22  (rule #0)"), 1, 1)
+    check("... and measures taller than 34", scene.node_pref_h(sc, icn) > 34.0,
+        scene.node_pref_h(sc, icn) as i64, 35)
+
+    say("\n")
+    if G_ERRORS > 0 {
+        say("DOM IS NOT IN ORDER.\n")
+        return 1
+    }
+    say("DOM PASSED.\n")
+    return 0
+}
