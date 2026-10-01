@@ -378,9 +378,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     return Err(e);
                 }
             }
-            // RUNDE TEMPO 2: die CPU-Stufe. `avx` erlaubt die
-            // Dreioperandenform (VEX) -- sie spart in jeder
-            // Fliesskommarechnung die Kopie, die SSE erzwingt.
+            // ROUND TEMPO 2: the CPU level. `avx` allows the
+            // three-operand form (VEX) -- it saves, in every
+            // floating-point calculation, the copy that SSE forces.
             _ if a.starts_with("--cpu=") => {
                 if let Err(e) = target::cpu_set(&a["--cpu=".len()..]) {
                     return Err(e);

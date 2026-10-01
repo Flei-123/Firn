@@ -146,11 +146,11 @@ pub(crate) struct Emitter {
     /// is the cheapest shape x86 has -- and the whole panic arm is flushed
     /// out behind the `ret` of the function it belongs to.
     pub(crate) cold: String,
-    /// **RUNDE TEMPO 2** — darf diese Funktion die Dreioperandenform (VEX)
-    /// benutzen? Nur der Weg mit Registerzuteilung setzt das (`--cpu=avx`);
-    /// der Grundweg bleibt bei SSE, weil dort der `v128`-Zwischenspeicher
-    /// (`simd.rs`) mit den Halbregistern rechnet und eine Umschrift ihm die
-    /// obere Haelfte ausloeschen wuerde.
+    /// **ROUND TEMPO 2** — may this function use the three-operand form (VEX)?
+    /// Only the path with register allocation sets this (`--cpu=avx`);
+    /// the basic path stays with SSE, because there the `v128` cache
+    /// (`simd.rs`) calculates with the half registers and a rewrite would wipe
+    /// out the upper half for it.
     pub(crate) vex: bool,
     /// **ROUND 82** — the `xmm` value cache of the base path (`simd.rs`).
     /// Empty and harmless in every function without a `v128` in it.
@@ -210,21 +210,20 @@ impl Emitter {
         self.here = crate::fir::Loc::NONE;
     }
     pub(crate) fn line(&mut self, s: &str) {
-        // ROUND XMM2 -- DIE REGEL, DIE DEN ZWISCHENSPEICHER SICHER MACHT.
+        // ROUND XMM2 -- THE RULE THAT MAKES THE CACHE SAFE.
         //
-        // Seit er auch Skalare haelt, ueberlebt ein Wert mehrere
-        // Anweisungen in einem `xmm`-Register. Das ist nur so lange
-        // richtig, wie der Weg dorthin GERADE ist. Der Erzeuger setzt aber
-        // mitten in einen Grundblock Spruenge und Marken (saettigende
-        // Arithmetik, Division durch eine Konstante, die Sonderfaelle der
-        // Umwandlung, die geprueften Rechnungen): hinter einer Marke kann
-        // der Zustand von zwei Wegen kommen, und dann darf nichts geglaubt
-        // werden.
+        // Since it also holds scalars, a value survives several
+        // instructions in an `xmm` register. That is only right as long
+        // as the path there is STRAIGHT. But the generator puts jumps and
+        // labels into the middle of a basic block (saturating
+        // arithmetic, division by a constant, the special cases of the
+        // conversion, the checked calculations): behind a label the
+        // state can come from two paths, and then nothing may be believed.
         //
-        // Deshalb: VOR jedem Sprung alles Schmutzige in seinen Platz, HINTER
-        // jeder Marke alles vergessen. Das kostet in geradem Code nichts --
-        // dort steht kein Sprung -- und macht die Buchfuehrung unabhaengig
-        // davon, welche Stelle im Erzeuger als naechstes eine Marke setzt.
+        // Therefore: BEFORE every jump everything dirty into its place, BEHIND
+        // every label forget everything. That costs nothing in straight code --
+        // there is no jump there -- and makes the bookkeeping independent
+        // of which place in the generator sets a label next.
         if is_jump(s) || is_call(s) {
             crate::simd::xflush_free(self);
         }
@@ -437,8 +436,8 @@ pub fn emit(m: &Module) -> Result<String, String> {
         }
         e.raw(&crate::panic_rt::trampoline_asm());
     }
-    // RUNDE TEMPO 6: der Vorrat der Gleitzahl-Konstanten (`fpool.rs`). Er
-    // steht am Ende, weil er erst beim Erzeugen der Funktionen entsteht.
+    // ROUND TEMPO 6: the pool of the floating-point constants (`fpool.rs`). It
+    // stands at the end because it only arises while generating the functions.
     if crate::fpool::any() {
         if dwarf::with_lines() {
             e.raw("    .loc 1 0 0");
@@ -492,21 +491,21 @@ pub fn emit(m: &Module) -> Result<String, String> {
 /// Without that step the promise "CONSERVATIVE stack AND register scan"
 /// (SPEC §3.5.3) would be false: the register allocation (`regalloc.rs`)
 /// keeps values across calls in `rbx`/`r12`–`r15`.
-/// RUNDE TEMPO 2 -- SSE ALS VEX SCHREIBEN.
+/// ROUND TEMPO 2 -- WRITING SSE AS VEX.
 ///
-/// `addss d, s` und `vaddss d, d, s` tun dasselbe; die VEX-Form kann nur
-/// zusaetzlich ein eigenes Ziel nennen. Diese Umschrift ist deshalb Wort fuer
-/// Wort bedeutungsgleich -- sie bringt selbst KEIN Tempo. Sie sorgt dafuer,
-/// dass in einer Funktion nicht beide Formen gemischt stehen: auf Intel
-/// kostet jeder Wechsel zwischen altem SSE und VEX zweistellige Taktzahlen,
-/// und genau das wuerde jeden Gewinn der Dreioperandenform auffressen.
+/// `addss d, s` and `vaddss d, d, s` do the same; the VEX form can only
+/// additionally name a destination of its own. This rewrite is therefore
+/// word for word equivalent in meaning -- it brings NO speed by itself. It makes sure
+/// that in one function both forms do not stand mixed: on Intel
+/// every switch between old SSE and VEX costs two-digit cycle counts,
+/// and exactly that would eat up every gain of the three-operand form.
 ///
-/// `None` = nichts umzuschreiben (Ganzzahlbefehle, Spruenge, alles andere).
+/// `None` = nothing to rewrite (integer instructions, jumps, everything else).
 ///
-/// EINE Feinheit: `movss xmm1, xmm2` laesst die oberen 96 Bit von `xmm1`
-/// stehen, `vmovaps xmm1, xmm2` nicht. Auf diesem Weg ist das gleichgueltig,
-/// weil er nur Skalare haelt -- `v128` geht ueber den Grundweg, und der setzt
-/// `vex` nie.
+/// ONE subtlety: `movss xmm1, xmm2` leaves the upper 96 bits of `xmm1`
+/// standing, `vmovaps xmm1, xmm2` does not. On this path that is irrelevant,
+/// because it only holds scalars -- `v128` goes via the basic path, and that
+/// never sets `vex`.
 fn vexify(s: &str) -> Option<String> {
     let (mn, rest) = match s.find(' ') {
         Some(i) => (&s[..i], s[i + 1..].trim()),
@@ -518,7 +517,7 @@ fn vexify(s: &str) -> Option<String> {
     let ops: Vec<&str> = rest.split(", ").map(|x| x.trim()).collect();
     let is_reg = |o: &str| o.starts_with("xmm");
     match mn {
-        // Zwei Operanden, das Ziel ist gleichzeitig erste Quelle.
+        // Two operands, the destination is at the same time the first source.
         "addss" | "addsd" | "subss" | "subsd" | "mulss" | "mulsd" | "divss" | "divsd"
         | "xorps" | "xorpd" | "andps" | "andpd" | "orps" | "orpd" | "minss" | "minsd"
         | "maxss" | "maxsd" | "sqrtss" | "sqrtsd" | "cvtss2sd" | "cvtsd2ss" | "cvtsi2ss"
@@ -528,8 +527,8 @@ fn vexify(s: &str) -> Option<String> {
             }
             Some(format!("v{} {}, {}, {}", mn, ops[0], ops[0], ops[1]))
         }
-        // RUNDE TEMPO 4: die gepackten Rechnungen, auch zweistellig mit dem
-        // Ziel als erster Quelle.
+        // ROUND TEMPO 4: the packed calculations, also two-operand with the
+        // destination as the first source.
         "addps" | "subps" | "mulps" | "divps" | "minps" | "maxps" | "cmpltps" | "cmpleps"
         | "cmpnltps" | "pcmpgtd" | "punpckldq" | "punpckhdq" | "pand" | "pandn" | "por" | "pxor" | "paddd" | "psubd" => {
             if ops.len() != 2 {
@@ -537,15 +536,15 @@ fn vexify(s: &str) -> Option<String> {
             }
             Some(format!("v{} {}, {}, {}", mn, ops[0], ops[0], ops[1]))
         }
-        // Dreistellig und schon in der richtigen Form: nur der Name aendert
-        // sich (`pshufd d, s, imm`).
+        // Three-operand and already in the right form: only the name
+        // changes (`pshufd d, s, imm`).
         "pshufd" => {
             if ops.len() != 3 {
                 return None;
             }
             Some(format!("v{} {}, {}, {}", mn, ops[0], ops[1], ops[2]))
         }
-        // Reine Kopien und Vergleiche: dieselbe Zahl von Operanden.
+        // Pure copies and comparisons: the same number of operands.
         "movaps" | "movapd" | "movups" | "movdqu" | "movdqa" | "movlps" | "ucomiss" | "ucomisd"
         | "comiss" | "comisd" | "cvttss2si" | "cvttsd2si" | "cvttps2dq" | "cvtdq2ps"
         | "movd" | "movq" => {
@@ -554,9 +553,9 @@ fn vexify(s: &str) -> Option<String> {
             }
             Some(format!("v{} {}, {}", mn, ops[0], ops[1]))
         }
-        // `movss`/`movsd`: von Register zu Register hat die VEX-Form DREI
-        // Operanden -- dafuer steht hier die volle Kopie. Laden und Speichern
-        // bleiben zweistellig.
+        // `movss`/`movsd`: from register to register the VEX form has THREE
+        // operands -- for that the full copy stands here. Loads and stores
+        // stay two-operand.
         "movss" | "movsd" => {
             if ops.len() != 2 {
                 return None;
@@ -821,18 +820,18 @@ fn emit_block(
     Ok(())
 }
 
-/// Ist diese Anweisung ein AUFRUF? Auf System V sind alle sechzehn
-/// `xmm`-Register caller-saved: hinter einem `call`/`syscall` haelt keines
-/// mehr seinen Wert. Der Erzeuger spuelt zwar vor einem Aufruf aus, laedt
-/// danach aber die ARGUMENTE -- und legt damit neue Eintraege an, die der
-/// Aufruf gleich darauf zerstoert. Genau dieser Fall war der Fehler der
-/// Runde (tests/1002_js_interp.fi, `toFixed`): nach `call math__fmod`
-/// stand `movaps xmm0, xmm4` mit einem laengst ueberschriebenen xmm4.
+/// Is this instruction a CALL? On System V all sixteen
+/// `xmm` registers are caller-saved: after a `call`/`syscall` none
+/// holds its value any more. The generator does flush before a call,
+/// but afterwards loads the ARGUMENTS -- and thereby creates new entries that the
+/// call destroys right after. Exactly this case was the bug of the
+/// round (tests/1002_js_interp.fi, `toFixed`): after `call math__fmod`
+/// stood `movaps xmm0, xmm4` with an xmm4 overwritten long ago.
 fn is_call(s: &str) -> bool {
     s.starts_with("call") || s.starts_with("syscall")
 }
 
-/// Ist diese Anweisung ein Sprung? (Siehe `Emitter::line`.)
+/// Is this instruction a jump? (See `Emitter::line`.)
 fn is_jump(s: &str) -> bool {
     let mn = s.split(|c: char| c == ' ' || c == '\t').next().unwrap_or("");
     mn.len() >= 2 && mn.starts_with('j') && mn.chars().all(|c| c.is_ascii_alphabetic())
@@ -840,9 +839,9 @@ fn is_jump(s: &str) -> bool {
 
 /// Loads the complete 8-byte slot of a value into a register.
 pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
-    // ROUND XMM2: der Wert kann schmutzig in einem `xmm` stehen (der
-    // Zwischenspeicher haelt jetzt auch Skalare). Wer ihn ueber ein
-    // GANZZAHLregister liest, braucht den Platz auf dem neuesten Stand.
+    // ROUND XMM2: the value can stand dirty in an `xmm` (the
+    // cache now also holds scalars). Whoever reads it through an
+    // INTEGER register needs the slot up to date.
     crate::simd::xsync_off(e, fr.slot[v as usize]);
     e.line(&format!("mov {}, qword ptr [rbp-{}]", r, fr.slot[v as usize]));
 }
@@ -870,8 +869,8 @@ pub(crate) fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to
 
 /// Writes rax (full) into the slot of the target value.
 pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
-    // ROUND XMM2: der Platz bekommt einen neuen Inhalt -- ein
-    // Zwischenspeicher-Eintrag darauf ist ab jetzt falsch.
+    // ROUND XMM2: the slot gets a new content -- a
+    // cache entry on it is wrong from now on.
     crate::simd::xkill_off(e, fr.slot[d as usize]);
     e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[d as usize], r));
 }
@@ -881,10 +880,10 @@ pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
 /// pattern, `movq` brings all 8 of them over. For an `f32` only the lower 4
 /// count, and those are exactly the ones the SSE instructions read.
 fn load_xmm(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
-    // ROUND XMM1/XMM2: der Wert kommt aus dem Zwischenspeicher, wenn er dort
-    // schon liegt -- sonst UNMITTELBAR aus dem Rahmenplatz. Bis Runde XMM1
-    // lief jeder Fliesskommawert ueber `rax` als Faehre: zwei Anweisungen
-    // statt einer, bei JEDEM Operanden JEDER Rechnung.
+    // ROUND XMM1/XMM2: the value comes from the cache if it is already
+    // there -- otherwise DIRECTLY from the frame slot. Until round XMM1
+    // every floating-point value went through `rax` as a ferry: two instructions
+    // instead of one, for EVERY operand of EVERY calculation.
     let r = crate::simd::xget_fp(e, fr, v, single);
     crate::simd::xmove(e, x, r);
 }
@@ -895,12 +894,12 @@ fn load_xmm(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
 /// instruction.
 fn store_xmm(e: &mut Emitter, fr: &Frame, d: Val, x: &str, single: bool) {
     crate::simd::xkill_off(e, fr.slot[d as usize]);
-    // ROUND XMM1: ebenfalls direkt. Fuer `f32` werden nur vier Oktett
-    // geschrieben -- die oberen vier des acht Oktett breiten Platzes bleiben
-    // stehen. Das ist zulaessig, weil ein `f32`-Platz AUSSCHLIESSLICH als
-    // `dword` gelesen wird (`load_xmm` mit `single`, `cvtss2sd`, die
-    // Argumentuebergabe); wer acht Oktett kopiert, kopiert die oberen mit,
-    // ohne sie je zu deuten.
+    // ROUND XMM1: also direct. For `f32` only four octets
+    // are written -- the upper four of the eight-octet slot stay
+    // standing. That is permitted because an `f32` slot is read EXCLUSIVELY
+    // as `dword` (`load_xmm` with `single`, `cvtss2sd`, the
+    // argument passing); whoever copies eight octets copies the upper ones along,
+    // without ever interpreting them.
     if single {
         e.line(&format!("movss dword ptr [rbp-{}], {}", fr.slot[d as usize], x));
     } else {
@@ -1296,11 +1295,11 @@ fn emit_inst(
                 return Ok(());
             }
             load_full(e, fr, "rcx", *addr);
-            // ROUND XMM2: ein Fliesskommawert geht UNMITTELBAR in ein
-            // `xmm`-Register des Zwischenspeichers. Vorher lief er ueber
-            // `eax` und den Rahmenplatz -- drei Anweisungen und ein
-            // Speicherhin-und-her fuer jedes geladene Wort. Das ist der Weg,
-            // den ein Dekoder oder ein Rasterer millionenfach geht.
+            // ROUND XMM2: a floating-point value goes DIRECTLY into an
+            // `xmm` register of the cache. Before, it went through
+            // `eax` and the frame slot -- three instructions and a
+            // memory back and forth for every loaded word. That is the path
+            // a decoder or a rasteriser takes millions of times.
             if ty.is_float() {
                 let single = ty == FTy::F32;
                 crate::simd::xunlock_pub(e);
@@ -1332,12 +1331,12 @@ fn emit_inst(
                 crate::simd::emit_ptr_store(e, fr, *addr, *val);
                 return Ok(());
             }
-            // ROUND XMM2: Gegenstueck zum Laden -- der Wert steht (oder
-            // landet) in einem `xmm` und geht von dort unmittelbar in den
-            // Speicher. Ein Schreiben durch einen Zeiger kann keinen
-            // Zwischenspeicher-Eintrag treffen: der haelt nur Plaetze von
-            // FIR-WERTEN, und deren Adresse gibt es im Programm nicht
-            // (Adressen gibt es nur von `alloca`-Speicher).
+            // ROUND XMM2: counterpart to loading -- the value stands (or
+            // lands) in an `xmm` and goes from there directly into
+            // memory. A write through a pointer cannot hit a
+            // cache entry: that holds only slots of
+            // FIR VALUES, and their address does not exist in the program
+            // (addresses exist only of `alloca` memory).
             if ty.is_float() {
                 let single = ty == FTy::F32;
                 crate::simd::xunlock_pub(e);
@@ -1521,8 +1520,8 @@ fn emit_inst(
         // already share one.
         Op::Copy { src } => {
             let d = i.dst.ok_or("internal error: copy without target")?;
-            // RUNDE TEMPO 4: ein `v128` ist sechzehn Oktette breit -- `mov rax`
-            // haette die obere Haelfte liegen lassen.
+            // ROUND TEMPO 4: a `v128` is sixteen octets wide -- `mov rax`
+            // would have left the upper half lying.
             if ty == FTy::V128 {
                 crate::simd::emit_copy_v128(e, fr, d, *src);
                 return Ok(());
@@ -1707,15 +1706,15 @@ fn emit_bin(
                 ))
             }
         };
-        // ROUND XMM2: beide Operanden und das Ergebnis liegen in Registern
-        // des Zwischenspeichers. `xdef_fp` kann keines der beiden
-        // Operandenregister waehlen -- die sind fuer diese Anweisung
-        // gesperrt (`xtouch` setzt die Sperre) -- also ist die Kopie
-        // `rd <- ra` immer sicher.
-        // ROUND XMM2: beide Operanden und das Ergebnis liegen in Registern
-        // des Zwischenspeichers. `xdef_fp` kann keines der beiden
-        // Operandenregister waehlen -- die sind fuer diese Anweisung
-        // gesperrt -- also ist die Kopie `rd <- ra` immer sicher.
+        // ROUND XMM2: both operands and the result lie in registers of
+        // the cache. `xdef_fp` cannot choose either of the
+        // operand registers -- those are locked for this instruction
+        // (`xtouch` sets the lock) -- so the copy
+        // `rd <- ra` is always safe.
+        // ROUND XMM2: both operands and the result lie in registers of
+        // the cache. `xdef_fp` cannot choose either of the
+        // operand registers -- those are locked for this instruction
+        // -- so the copy `rd <- ra` is always safe.
         let single = ty == FTy::F32;
         crate::simd::xunlock_pub(e);
         let ra = crate::simd::xget_fp(e, fr, a, single);

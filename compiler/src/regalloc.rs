@@ -77,30 +77,30 @@ fn used_register(alloc: &Alloc, v: Val, r: &'static str) -> bool {
 /// callee-saved registers that may get handed out (prologue/epilogue save).
 const CALLEE_SAVED: [&str; 5] = ["rbx", "r12", "r13", "r14", "r15"];
 
-/// ROUND XMM3 -- DIE ZWEITE REGISTERKLASSE.
+/// ROUND XMM3 -- THE SECOND REGISTER CLASS.
 ///
-/// Bis hierher kannte der Zuteiler nur Ganzzahlregister, und JEDE Funktion
-/// mit einem `f32`/`f64` fiel deshalb auf den Grundweg zurueck, der jeden
-/// Zwischenwert auf den Stapel legt. Gemessen war das der Unterschied
-/// zwischen dem Faktor drei und dem Faktor siebzehn gegenueber C
+/// Until now the allocator knew only integer registers, and EVERY function
+/// with an `f32`/`f64` therefore fell back to the basic path, which puts every
+/// intermediate value on the stack. Measured, that was the difference
+/// between a factor of three and a factor of seventeen against C
 /// (`docs/TON2.md`).
 ///
-/// Ausgegeben werden `xmm4`-`xmm15`; `xmm0`-`xmm3` bleiben Kratzregister
-/// der Ausgabe (die Umwandlungen und die Vergleiche brauchen sie).
+/// Handed out are `xmm4`-`xmm15`; `xmm0`-`xmm3` stay scratch registers
+/// of the output (the conversions and the comparisons need them).
 ///
-/// EINE REGEL IST HART: auf System V sind ALLE sechzehn `xmm` caller-saved.
-/// Ein Wert, dessen Lebensdauer einen Aufruf kreuzt, bekommt deshalb KEIN
-/// Register -- nicht als Vorsicht, sondern weil es keines gibt, das der
-/// Aufruf nicht zerstoert. (Sichern und Zurueckholen um jeden Aufruf herum
-/// waere die naechste Stufe; sie lohnt erst, wenn gemessen ist, dass die
-/// betroffenen Werte heiss sind.)
+/// ONE RULE IS HARD: on System V ALL sixteen `xmm` are caller-saved.
+/// A value whose lifetime crosses a call therefore gets NO
+/// register -- not as a precaution, but because there is none that the
+/// call does not destroy. (Saving and restoring around every call
+/// would be the next stage; it only pays off once it is measured that the
+/// affected values are hot.)
 const FP_POOL: [&str; 12] = [
     "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
     "xmm13", "xmm14", "xmm15",
 ];
 
-/// RUNDE TEMPO 4 -- die Vektorbefehle, die DIESER Weg selbst ausgeben kann.
-/// Alles andere schickt `unsupported_basic` weiter auf den Grundweg.
+/// ROUND TEMPO 4 -- the vector instructions that THIS path can emit itself.
+/// Everything else `unsupported_basic` sends on to the basic path.
 pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
     use crate::simd::SimdKind as K;
     matches!(
@@ -115,8 +115,8 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
             | K::SubF32
             | K::MulF32
             | K::Shuffle32
-            // RUNDE TEMPO 5: wandeln, vergleichen, verknuepfen -- alles
-            // einfache Zweistellerformen ohne Sonderregeln.
+            // ROUND TEMPO 5: convert, compare, combine -- all
+            // simple two-operand forms without special rules.
             | K::TruncF32I32
             | K::CvtI32F32
             | K::CmpLtF32
@@ -132,14 +132,14 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
     )
 }
 
-/// **RUNDE TEMPO 10** — rechnet dieser Vektorbefehl IN seinem ersten
-/// Operanden?
+/// **ROUND TEMPO 10** — does this vector instruction calculate IN its first
+/// operand?
 ///
-/// SSE hat keine Dreioperandenform: `mulps d, s` heisst `d = d * s`. Der
-/// Erzeuger kopiert darum erst den ersten Operanden ins Ziel (`movaps d, a`)
-/// und rechnet dann. Wenn `a` nach dieser Anweisung ohnehin tot ist, ist die
-/// Kopie ueberfluessig — `a` und `d` duerfen dasselbe Register haben. Genau
-/// diese Befehle sind gemeint.
+/// SSE has no three-operand form: `mulps d, s` means `d = d * s`. The
+/// generator therefore first copies the first operand into the destination (`movaps d, a`)
+/// and then calculates. If `a` is dead after this instruction anyway, the
+/// copy is superfluous — `a` and `d` may have the same register. Exactly
+/// these instructions are meant.
 pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
     use crate::simd::SimdKind as K;
     matches!(
@@ -162,24 +162,24 @@ pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
     )
 }
 
-/// Dasselbe fuer die vier Grundrechenarten auf Gleitzahlen (`addss`,
-/// `subss`, `mulss`, `divss` und ihre `sd`-Fassungen).
+/// The same for the four basic arithmetic operations on floating-point numbers (`addss`,
+/// `subss`, `mulss`, `divss` and their `sd` versions).
 fn two_address_bin(op: BinOp) -> bool {
     matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
 }
 
-/// Gehoert dieser Typ in die SSE-Klasse (Gleitzahl oder Vektor)?
+/// Does this type belong in the SSE class (floating-point number or vector)?
 fn sse_class(t: FTy) -> bool {
     t.is_float() || t == FTy::V128
 }
 
-/// Ist dieser Platz ein SSE-Register?
+/// Is this slot an SSE register?
 pub(crate) fn is_xmm(r: &str) -> bool {
     r.starts_with("xmm")
 }
 
-/// Ist dieser OPERAND genau ein Register? (`xmmword ptr [...]` faengt auch mit
-/// `xmm` an -- deshalb diese zweite Frage.)
+/// Is this OPERAND exactly one register? (`xmmword ptr [...]` also starts with
+/// `xmm` -- hence this second question.)
 fn is_xmm_reg(o: &str) -> bool {
     o.starts_with("xmm") && !o.contains(' ')
 }
@@ -442,8 +442,8 @@ pub struct Alloc {
     imms: HashMap<Val, i64>,
     /// `alloca` values with a fixed frame offset (addressing without a detour).
     frame_addr: HashMap<Val, u64>,
-    /// RUNDE TEMPO 6: Gleitzahl-Konstanten, die als SPEICHEROPERAND aus
-    /// `.rodata` gelesen werden. Sie brauchen weder Register noch Platz.
+    /// ROUND TEMPO 6: floating-point constants that are read as a MEMORY OPERAND from
+    /// `.rodata`. They need neither a register nor a slot.
     fconst: HashMap<Val, (String, bool)>,
     /// promoted `alloca` cells: pointer value -> register
     cells: HashMap<Val, &'static str>,
@@ -451,9 +451,9 @@ pub struct Alloc {
     cell_ty: HashMap<Val, FTy>,
     /// callee-saved registers used and their save slot
     saved: Vec<(&'static str, u64)>,
-    /// RUNDE TEMPO 12: je Aufruf (Block, Anweisung) die Werte, die in einem
-    /// caller-saved Register ueber ihn hinweg leben und darum direkt davor
-    /// abgelegt und direkt danach zurueckgeholt werden: (Register, Platz, Typ).
+    /// ROUND TEMPO 12: per call (block, instruction) the values that live in a
+    /// caller-saved register across it and are therefore stored directly before it
+    /// and restored directly after it: (register, slot, type).
     call_saves: HashMap<(usize, usize), Vec<(&'static str, u64, FTy)>>,
     frame: Frame,
     /// Round 87: why did the values that got no register not get one? Only
@@ -527,12 +527,12 @@ fn layout(f: &Func, extra_slots: u64) -> (Frame, Vec<(&'static str, u64)>) {
     let mut slot = vec![0u64; n];
     let mut cursor = 0u64;
     for (idx, s) in slot.iter_mut().enumerate() {
-        // RUNDE TEMPO 4: ein `v128` braucht SECHZEHN Oktette, und zwar
-        // sechzehnfach ausgerichtet, damit `movaps` sie erreicht. `rbp` steht
-        // nach dem Vorspann auf einem Vielfachen von sechzehn (System V: `rsp`
-        // ist beim Aufruf 16-ausgerichtet, die Ruecksprungadresse und `rbp`
-        // machen zusammen wieder sechzehn) -- ein Abstand, der ein Vielfaches
-        // von sechzehn ist, genuegt also.
+        // ROUND TEMPO 4: a `v128` needs SIXTEEN octets, and aligned
+        // to sixteen, so that `movaps` reaches them. After the prologue `rbp` stands
+        // on a multiple of sixteen (System V: `rsp` is 16-aligned
+        // at the call, the return address and `rbp` together make
+        // sixteen again) -- a distance that is a multiple
+        // of sixteen therefore suffices.
         if f.val_types.get(idx) == Some(&FTy::V128) {
             cursor = align_up(cursor + 16, 16);
         } else {
@@ -983,12 +983,12 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
                 if defs.get(&d).copied().unwrap_or(0) != 1 {
                     continue;
                 }
-                // ROUND XMM3: eine GLEITZAHL ist nie ein unmittelbarer
-                // Operand. SSE kennt keine Form mit Konstante, und ihr
-                // Bitmuster als Zahl in einen `movss`-Operanden zu setzen
-                // ergibt stillen Unsinn -- vor dieser Runde konnte der Fall
-                // nicht auftreten, weil Funktionen mit Fliesskomma diesen
-                // Weg nie erreicht haben.
+                // ROUND XMM3: a FLOATING-POINT NUMBER is never an immediate
+                // operand. SSE knows no form with a constant, and putting its
+                // bit pattern as a number into a `movss` operand
+                // yields silent nonsense -- before this round the case
+                // could not occur, because functions with floating point never
+                // reached this path.
                 if i.ty.is_float() {
                     continue;
                 }
@@ -1214,29 +1214,29 @@ fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Optio
 }
 
 /// Carries out the complete allocation.
-/// ROUND XMM3 -- WELCHE FLIESSKOMMAWERTE DUERFEN IN EIN REGISTER?
+/// ROUND XMM3 -- WHICH FLOATING-POINT VALUES MAY GO INTO A REGISTER?
 ///
-/// Nur die, deren Erzeugung UND jede Verwendung im Fliesskommaweg der
-/// Ausgabe steht. Der Grund ist kein Misstrauen gegen den Zuteiler, sondern
-/// die Bauart des Erzeugers: an vielen Stellen steht `ra.load_full(e,
-/// "rax", v)`, und das defines `mov rax, <platz von v>`. Stuende dort ein
-/// `xmm`, waere das ein stiller Fehler. Ein Wert, der irgendwo anders
-/// angefasst wird, bleibt deshalb auf seinem Platz -- dort ist er fuer
-/// jeden Weg lesbar.
+/// Only those whose creation AND every use stand in the floating-point path of the
+/// output. The reason is not distrust of the allocator, but
+/// the construction of the generator: in many places there stands `ra.load_full(e,
+/// "rax", v)`, and that emits `mov rax, <slot of v>`. If an
+/// `xmm` stood there, that would be a silent error. A value that is touched
+/// anywhere else therefore stays in its slot -- there it is readable for
+/// every path.
 ///
-/// DRAUSSEN sind damit ausdruecklich: Parameter (der Vorspann schreibt sie
-/// in ihre Plaetze), Ergebnisse von Aufrufen, geprueste Umwandlungen,
-/// `Select`, `Barrier`, `CopyMem`, Vektoranweisungen und alles, was als
-/// Aufrufargument dient.
+/// OUTSIDE are thereby expressly: parameters (the prologue writes them
+/// into their slots), results of calls, checked conversions,
+/// `Select`, `Barrier`, `CopyMem`, vector instructions and everything that serves
+/// as a call argument.
 fn fp_taugt(f: &Func) -> Vec<bool> {
     let nv = f.val_types.len();
     let mut ok: Vec<bool> = (0..nv).map(|v| sse_class(f.val_ty(v as Val))).collect();
-    // RUNDE TEMPO: ein Fliesskomma-PARAMETER darf jetzt in seinem Register
-    // bleiben. Der Vorspann kann das laengst (`Loc::Reg` oben, eine
-    // `movaps`-Kopie oder gar nichts); ausgeschlossen war er nur, weil der
-    // Zuteilerweg zu Beginn der Runde XMM3 kein Fliesskomma ausgab. Jede
-    // andere Bedingung bleibt: wer ausserhalb des Fliesskommaweges angefasst
-    // wird oder einen Aufruf ueberlebt, behaelt seinen Platz.
+    // ROUND TEMPO: a floating-point PARAMETER may now stay in its register.
+    // The prologue has long been able to do that (`Loc::Reg` above, a
+    // `movaps` copy or nothing at all); it was excluded only because the
+    // allocator path emitted no floating point at the beginning of round XMM3. Every
+    // other condition stays: whoever is touched outside the floating-point path
+    // or survives a call keeps its slot.
     for i in 0..f.params.len().min(nv) {
         if !f.params[i].is_float() {
             ok[i] = false;
@@ -1250,48 +1250,48 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                     &inst.op,
                     Op::Const(_) | Op::Bin(..) | Op::Cast { .. } | Op::Load { .. } | Op::Copy { .. }
                 ) || matches!(&inst.op, Op::Un(UnOp::Neg, _))
-                    // RUNDE TEMPO 4: die Vektorbefehle dieses Weges.
+                    // ROUND TEMPO 4: the vector instructions of this path.
                     || matches!(&inst.op, Op::Simd { kind, .. } if v128_ra_kind(*kind));
                 if !def_ok && (d as usize) < nv {
                     ok[d as usize] = false;
                 }
             }
-            // RUNDE TEMPO -- FEHLER AUS RUNDE XMM3 BEHOBEN. Hier stand
-            // frueher "Bin, Cmp, Cast, Copy, Store: immer gut". Das war zu
-            // grosszuegig: die Aufrufkonvention kopiert einen Verbund
-            // ACHTBYTEWEISE, und dabei steht eine `store.u64` mit einem
-            // Wert, dessen Typ `f64` ist (ein Feld `{f32,f32}` reist als ein
-            // Achtbyte in xmm0). Diese Anweisung geht ueber den GANZZAHLWEG,
-            // holt ihren Operanden mit `mov` -- und wenn der Wert inzwischen
-            // in einem xmm lebte, schrieb sie Unsinn in den Rahmen
-            // (gemessen: `tests/1452_f32_abi.fi` gab 6 statt 0; im Erzeugten
-            // stand `mov qword ptr [rbp-360], rbp`).
+            // ROUND TEMPO -- BUG FROM ROUND XMM3 FIXED. Here there stood
+            // formerly "Bin, Cmp, Cast, Copy, Store: always good". That was too
+            // generous: the calling convention copies an aggregate
+            // EIGHT BYTES AT A TIME, and in doing so there stands a `store.u64` with a
+            // value whose type is `f64` (a field `{f32,f32}` travels as one
+            // eight-byte in xmm0). This instruction goes through the INTEGER PATH,
+            // fetches its operand with `mov` -- and if the value in the meantime
+            // lived in an xmm, it wrote nonsense into the frame
+            // (measured: `tests/1452_f32_abi.fi` gave 6 instead of 0; in the generated code
+            // there stood `mov qword ptr [rbp-360], rbp`).
             //
-            // Es zaehlt deshalb nicht die Art der Anweisung, sondern ob sie
-            // WIRKLICH im Fliesskommaweg steht -- also genau die Bedingung,
-            // unter der die Ausgabe unten ihren Fliesskomma-Zweig nimmt.
+            // What counts is therefore not the kind of instruction, but whether it
+            // REALLY stands in the floating-point path -- that is, exactly the condition
+            // under which the output below takes its floating-point branch.
             let use_ok = match &inst.op {
                 Op::Bin(..) => inst.ty.is_float(),
-                // RUNDE TEMPO 8: eine Kopie mit `v128` steht ebenfalls im
-                // SSE-Weg -- `emit_inst` hat dafuer einen eigenen Zweig
-                // (`Op::Copy` mit `FTy::V128`, `v_into`/`v_out`). Hier stand
-                // `is_float()`, und das ist fuer `v128` FALSCH: jeder Wert,
-                // den eine Vektorkopie liest, verlor damit sein Register.
-                // Gemessen an den beiden Sammlern der Synthesefilterbank:
-                // sie fielen aus dem Zuteiler und liefen ueber den Rahmen.
+                // ROUND TEMPO 8: a copy with `v128` likewise stands in the
+                // SSE path -- `emit_inst` has a branch of its own for it
+                // (`Op::Copy` with `FTy::V128`, `v_into`/`v_out`). Here there stood
+                // `is_float()`, and that is WRONG for `v128`: every value
+                // that a vector copy reads thereby lost its register.
+                // Measured on the two accumulators of the synthesis filter bank:
+                // they fell out of the allocator and ran through the frame.
                 Op::Copy { .. } => sse_class(inst.ty),
                 Op::Un(UnOp::Neg, _) => inst.ty.is_float(),
                 Op::Cmp { ty, .. } => ty.is_float(),
                 Op::Cast { from, .. } => from.is_float() || inst.ty.is_float(),
-                // Beim Speichern ist der WERT eine Gleitzahl, die Adresse nie
-                // -- aber nur, wenn die Anweisung selbst eine Gleitzahl
-                // speichert.
+                // On a store the VALUE is a floating-point number, the address never
+                // -- but only if the instruction itself stores a floating-point
+                // number.
                 Op::Store { .. } => inst.ty.is_float(),
-                // RUNDE TEMPO 4: `__v128_store` liest seinen Wert hier, die
-                // Adresse ist eine Ganzzahl und faellt nicht unter `ok`.
-                // TEMPO 15: `GetU32`/`GetU16` lesen ihren Vektor aus dem
-                // xmm-Register (`movd`/`pextrw`); ihr Ergebnis ist eine
-                // Ganzzahl und bekommt hier KEIN `ok`.
+                // ROUND TEMPO 4: `__v128_store` reads its value here, the
+                // address is an integer and does not fall under `ok`.
+                // TEMPO 15: `GetU32`/`GetU16` read their vector from the
+                // xmm register (`movd`/`pextrw`); their result is an
+                // integer and gets NO `ok` here.
                 Op::Simd { kind, .. } => {
                     v128_ra_kind(*kind)
                         || matches!(kind, crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16)
@@ -1312,8 +1312,8 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
     ok
 }
 
-/// RUNDE TEMPO 13: teilen zwei Stueck-Listen (je aufsteigend, geschlossene
-/// Stuecke) eine Stelle?
+/// ROUND TEMPO 13: do two piece lists (each ascending, closed
+/// pieces) share a position?
 fn segs_meet(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
@@ -1331,7 +1331,7 @@ fn segs_meet(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
     false
 }
 
-/// Vereinigung zweier Stueck-Listen, wieder aufsteigend und ohne Ueberlappung.
+/// Union of two piece lists, again ascending and without overlap.
 fn seg_union(a: &[(usize, usize)], b: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut all: Vec<(usize, usize)> = a.iter().chain(b.iter()).copied().collect();
     all.sort_unstable();
@@ -1350,7 +1350,7 @@ fn seg_union(a: &[(usize, usize)], b: &[(usize, usize)]) -> Vec<(usize, usize)> 
     out
 }
 
-/// Gesamtlaenge einer Stueck-Liste (Anzahl Stellen).
+/// Total length of a piece list (number of positions).
 fn seg_len(a: &[(usize, usize)]) -> u64 {
     a.iter().map(|(x, y)| (y - x + 1) as u64).sum()
 }
@@ -1407,12 +1407,12 @@ pub fn allocate(f: &Func) -> Alloc {
     let depth = loop_depth(f);
     let cells = promotable_cells(f);
 
-    // RUNDE TEMPO 6 -- GLEITZAHL-KONSTANTEN IN DEN VORRAT.
+    // ROUND TEMPO 6 -- FLOATING-POINT CONSTANTS INTO THE POOL.
     //
-    // Sie brauchen dann weder Register noch Platz: jede Verwendung liest sie
-    // als Speicheroperand aus `.rodata`. Bedingung: der Wert wird NUR im
-    // Fliesskommaweg der Ausgabe angefasst (sonst holte ihn jemand mit `mov`
-    // aus einem Platz, den es nicht gibt) und ist nicht `secret`.
+    // They then need neither a register nor a slot: every use reads them
+    // as a memory operand from `.rodata`. Condition: the value is touched ONLY
+    // in the floating-point path of the output (otherwise someone would fetch it with `mov`
+    // from a slot that does not exist) and is not `secret`.
     let mut fconst: HashMap<Val, (String, bool)> = HashMap::new();
     let only_here = match std::env::var("FIRN_FPOOL_ONLY") {
         Ok(v) => f.name.contains(&v),
@@ -1420,13 +1420,13 @@ pub fn allocate(f: &Func) -> Alloc {
     };
     if std::env::var_os("FIRN_NO_FPOOL").is_none() && only_here {
         let fp_ok_pre = fp_taugt(f);
-        // ROUND 92 GILT AUCH HIER: nach der Aufloesung der `phi`-Knoten darf
-        // ein Wert MEHRMALS geschrieben werden -- eine Schleifenvariable, die
-        // bei `1.0` beginnt, hat den `const` im Vorkopf und eine Kopie auf der
-        // Rueckwaertskante, beide auf DENSELBEN Wert. Wer so einen Wert in den
-        // Vorrat legt, liest in der Schleife ewig die 1.0 -- gemessen:
-        // `math.powi(2.0, 10)` gab 1.0 statt 1024.0. Also nur Werte mit GENAU
-        // EINER Schreibstelle (dieselbe Regel wie in `immediate_consts`).
+        // ROUND 92 APPLIES HERE TOO: after the resolution of the `phi` nodes
+        // a value may be written SEVERAL TIMES -- a loop variable that
+        // starts at `1.0` has the `const` in the pre-header and a copy on the
+        // back edge, both to the SAME value. Whoever puts such a value into the
+        // pool reads the 1.0 forever in the loop -- measured:
+        // `math.powi(2.0, 10)` gave 1.0 instead of 1024.0. So only values with EXACTLY
+        // ONE write site (the same rule as in `immediate_consts`).
         let mut defs: HashMap<Val, u32> = HashMap::new();
         for b in &f.blocks {
             for i in &b.insts {
@@ -1457,21 +1457,20 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     }
 
-    // RUNDE TEMPO 2 -- FLIESSKOMMA-ZELLEN IN EIN `xmm`.
+    // ROUND TEMPO 2 -- FLOATING-POINT CELLS INTO AN `xmm`.
     //
-    // Eine Zelle ist eine `alloca`, die eine Variable haelt (Schleifensumme,
-    // Zaehler). Bisher konnte sie nur ein GANZZAHLregister bekommen: eine
-    // `f32`-Summe reiste dann bei jedem Zugriff per `movd` zwischen `r13` und
-    // der Recheneinheit hin und her -- oder blieb, wenn kein Register frei
-    // war, ganz auf ihrem Platz. Gemessen im Tondekoder: `synth` haelt acht
-    // Summen und ging deswegen pro Durchlauf sechzehnmal in den Rahmen und
-    // zurueck.
+    // A cell is an `alloca` that holds a variable (loop sum,
+    // counter). Until now it could only get an INTEGER register: an
+    // `f32` sum then travelled with every access via `movd` between `r13` and
+    // the arithmetic unit -- or, if no register was free, stayed entirely in its
+    // slot. Measured in the sound decoder: `synth` holds eight
+    // sums and therefore went into the frame and back sixteen times per iteration.
     //
-    // Eine Zelle darf in die SSE-Klasse, wenn sie eine Gleitzahl haelt UND
-    // jeder Wert, der aus ihr geladen wird, nur im Fliesskommaweg der Ausgabe
-    // gelesen wird (`fp_taugt` -- dieselbe Bedingung, die den Fehler aus
-    // Runde XMM 3 abgestellt hat: die Aufrufkonvention kopiert Verbunde
-    // achtbyteweise und reads eine `f64` dabei mit `mov`).
+    // A cell may go into the SSE class if it holds a floating-point number AND
+    // every value that is loaded from it is read only in the floating-point path of the output
+    // (`fp_taugt` -- the same condition that fixed the bug from
+    // round XMM 3: the calling convention copies aggregates
+    // eight bytes at a time and reads an `f64` with `mov` in doing so).
     let fp_ok = fp_taugt(f);
     let mut fp_cells: std::collections::HashSet<Val> = std::collections::HashSet::new();
     if std::env::var_os("FIRN_NO_FP_CELLS").is_none() {
@@ -1530,19 +1529,19 @@ pub fn allocate(f: &Func) -> Alloc {
         m
     };
 
-    // RUNDE TEMPO 12 -- WAS EIN AUFRUF WIRKLICH KOSTET.
+    // ROUND TEMPO 12 -- WHAT A CALL REALLY COSTS.
     //
-    // Bis hierher hiess "kreuzt einen Aufruf": nur die fuenf callee-saved
-    // Register, bei Gleitzahlen GAR KEIN Register. In `l3_huffman` kreuzen
-    // 92 Werte den einen, selten genommenen Aufruf `l3_pow_43` -- und lagen
-    // deshalb im Rahmen, auch in der heissen Schleife, die ihn nie ausfuehrt.
+    // Until now "crosses a call" meant: only the five callee-saved
+    // registers, for floating-point numbers NO register AT ALL. In `l3_huffman` 92 values cross
+    // the one, rarely taken call `l3_pow_43` -- and therefore lay
+    // in the frame, also in the hot loop that never executes it.
     //
-    // Die Alternative ist, was jeder Uebersetzer macht: der Wert bekommt ein
-    // beliebiges Register, und nur AM AUFRUF wird es abgelegt und
-    // zurueckgeholt. Das kostet zwei Befehle je Aufruf und lohnt, wenn der
-    // Wert oefter gebraucht wird, als die Aufrufe laufen, die er kreuzt.
-    // Nur echte Aufrufe (`call`, `call rax`); `syscall`, Faeden und `cpuid`
-    // bleiben harte Grenzen. `FIRN_NO_CALLSAVE=1` schaltet es ab.
+    // The alternative is what every translator does: the value gets an
+    // arbitrary register, and only AT THE CALL is it stored and
+    // restored. That costs two instructions per call and pays off when the
+    // value is used more often than the calls that it crosses run.
+    // Only real calls (`call`, `call rax`); `syscall`, threads and `cpuid`
+    // stay hard boundaries. `FIRN_NO_CALLSAVE=1` switches it off.
     let callsave_on = std::env::var_os("FIRN_NO_CALLSAVE").is_none()
         && match std::env::var("FIRN_CS_FN") {
             Ok(x) => f.name.contains(&x),
@@ -1569,9 +1568,9 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         m
     };
-    // Kosten der Aufrufe, die echt INNERHALB liegen (s < p < e): Ablegen +
-    // Zurueckholen je Lauf. Ein Aufruf AM Rand ist der letzte Leser bzw.
-    // der Erzeuger und braucht nichts.
+    // Cost of the calls that really lie INSIDE (s < p < e): store +
+    // restore per run. A call AT the edge is the last reader or
+    // the producer and needs nothing.
     let call_cost = |sp: usize, ep: usize| -> u64 {
         let mut c: u64 = 0;
         for &(p, w, _, _) in calls.iter() {
@@ -1639,24 +1638,24 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     }
 
-    // ---- RUNDE TEMPO 13: LEBENSDAUER MIT LUECKEN -------------------------
+    // ---- ROUND TEMPO 13: LIFETIME WITH GAPS ------------------------------
     //
-    // Bis hierher war ein Intervall `[erstes Beruehren, letztes Beruehren]`
-    // am Stueck. Ein Wert, der am Anfang der Funktion gebraucht wird und am
-    // Ende noch einmal, belegte sein Register dazwischen durchgehend -- auch
-    // durch jede Schleife, in der er gar nicht vorkommt. `l3_huffman`: 86
-    // "gleichzeitig lebende" Werte bei 14 Registern.
+    // Until now an interval was `[first touch, last touch]`
+    // in one piece. A value that is needed at the beginning of the function and
+    // once more at the end occupied its register continuously in between -- also
+    // through every loop in which it does not occur at all. `l3_huffman`: 86
+    // "simultaneously live" values with 14 registers.
     //
-    // Jetzt bekommt jeder Wert je Block ein STUECK: ab Blockanfang, wenn er
-    // hineinlebt (sonst ab dem ersten Beruehren), bis Blockende, wenn er
-    // hinauslebt (sonst bis zum letzten Beruehren). Zwei Werte stoeren sich
-    // genau dann, wenn sich zwei ihrer Stuecke ueberschneiden. Das ist die
-    // Lebendigkeit aus der Datenflussanalyse, also richtig fuer jede
-    // Kontrollflussform -- die Blockreihenfolge spielt keine Rolle mehr.
+    // Now every value gets one PIECE per block: from the block start, if it lives
+    // in (otherwise from the first touch), to the block end, if it lives
+    // out (otherwise to the last touch). Two values interfere
+    // exactly when two of their pieces overlap. That is the
+    // liveness from the data-flow analysis, hence correct for every control-flow
+    // shape -- the block order no longer matters.
     //
-    // Nur mit Fixpunkt der Lebendigkeit (sonst koennten die Mengen zu klein
-    // sein, dieselbe Vorsicht wie bei `exact_crossings`). `FIRN_NO_HOLES=1`
-    // stellt den alten Scan wieder her.
+    // Only with a fixed point of the liveness (otherwise the sets could
+    // be too small, the same caution as with `exact_crossings`). `FIRN_NO_HOLES=1`
+    // restores the old scan.
     let holes = live.converged && std::env::var_os("FIRN_NO_HOLES").is_none();
     let mut segs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nv];
     if holes {
@@ -1730,59 +1729,59 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     }
 
-    // ---- RUNDE TEMPO 8: KOPIEN VERSCHMELZEN (copy coalescing) ----------
+    // ---- ROUND TEMPO 8: MERGING COPIES (copy coalescing) ----------------
     //
-    // WARUM. `phi.rs` loest jeden phi-Knoten in eine Kopie am Ende des
-    // Vorgaengers auf, und `fold_into_definitions` gibt die Kopie dort
-    // zurueck, wo der eingehende Wert IM SELBEN Block gerechnet wird. In
-    // einer Schleife mit Verzweigung ist das genau nicht der Fall: die
-    // Laufvariable wird oben im Rumpf fortgeschaltet, die Rueckwaertskante
-    // verlaesst den Rumpf aber unten, hinter dem `if`. Gemessen an der
-    // heissen Schleife der Synthesefilterbank (667 440 Durchlaeufe, vier
-    // Laufzeiger, zwei Sammler) stand darum je Wert
+    // WHY. `phi.rs` resolves every phi node into a copy at the end of the
+    // predecessor, and `fold_into_definitions` gives the copy back where the
+    // incoming value is calculated IN THE SAME block. In a loop with a
+    // branch that is exactly not the case: the loop variable
+    // is advanced at the top of the body, but the back edge
+    // leaves the body at the bottom, behind the `if`. Measured on the
+    // hot loop of the synthesis filter bank (667,440 iterations, four
+    // running pointers, two accumulators), there therefore stood per value
     //
-    //     mov %rbx,%rax           # Kopie, weil das Ziel keinen Platz hat
+    //     mov %rbx,%rax           # copy, because the target has no slot
     //     add $0x2,%rax
-    //     mov %rax,-0xa18(%rbp)   # in den Rahmen
+    //     mov %rax,-0xa18(%rbp)   # into the frame
     //     ...
-    //     mov -0xa18(%rbp),%rbx   # auf der Rueckwaertskante zurueck
+    //     mov -0xa18(%rbp),%rbx   # back on the back edge
     //
-    // -- vier Befehle fuer das, was C mit `add $2,%rbx` erledigt.
+    // -- four instructions for what C does with `add $2,%rbx`.
     //
-    // WAS. Die Quelle einer Kopie und ihr Ziel werden zu EINEM Intervall
-    // zusammengelegt, BEVOR der lineare Scan laeuft. Beide bekommen damit
-    // denselben Platz; `emit_bin` rechnet gleich dort (`load_full` schreibt
-    // nichts, wenn der Wert schon steht) und die Kopie selbst gibt keinen
-    // Befehl aus -- alle drei Kopiewege in `emit_inst` pruefen das.
+    // WHAT. The source of a copy and its target are put together into ONE interval
+    // BEFORE the linear scan runs. Both thereby get
+    // the same slot; `emit_bin` calculates right there (`load_full` writes
+    // nothing if the value is already there) and the copy itself emits no
+    // instruction -- all three copy paths in `emit_inst` check this.
     //
-    // WARUM VOR DEM SCAN und nicht danach: ein `t`, das der Scan selbst
-    // schon in ein Register gelegt hat, ist danach nicht mehr zu bewegen,
-    // ohne dem Nachbarn sein Register wegzunehmen. Gemessen: die
-    // nachtraegliche Fassung verschmolz vier Werte, diese elf.
+    // WHY BEFORE THE SCAN and not after: a `t` that the scan itself
+    // has already put into a register can afterwards not be moved
+    // without taking the neighbour's register away. Measured: the
+    // after-the-fact version merged four values, this one eleven.
     //
-    // WANN ES ERLAUBT IST. Drei Bedingungen, jede einzeln notwendig:
+    // WHEN IT IS ALLOWED. Three conditions, each individually necessary:
     //
-    //  1. `t` wird GENAU EINMAL geschrieben und GENAU EINMAL gelesen, und
-    //     zwar von dieser Kopie. Ein zweiter Leser saehe sonst ein Register,
-    //     das die Rueckwaertskante laengst weitergedreht hat.
-    //  2. Beide haben denselben Typ (und damit dieselbe Registerklasse), und
-    //     keiner der beiden hat einen Sonderplatz: ein unmittelbarer Wert
-    //     traegt `Slot(0)` als Platzhalter, ein Vorrats-Wert steht in
-    //     `.rodata`, eine Zelle und ein `alloca` liegen woanders.
-    //  3. `t` und `p` STOEREN SICH NICHT (Chaitin): an keiner Stelle, an der
-    //     das eine geschrieben wird, lebt das andere noch. Die Kopie selbst
-    //     ist ausgenommen -- sie ist der Grund, aus dem verschmolzen wird.
+    //  1. `t` is written EXACTLY ONCE and read EXACTLY ONCE, namely
+    //     by this copy. A second reader would otherwise see a register
+    //     that the back edge has long since turned further.
+    //  2. Both have the same type (and thereby the same register class), and
+    //     neither of the two has a special slot: an immediate value
+    //     carries `Slot(0)` as a placeholder, a pool value stands
+    //     in `.rodata`, a cell and an `alloca` lie elsewhere.
+    //  3. `t` and `p` DO NOT INTERFERE (Chaitin): at no place at which
+    //     the one is written does the other still live. The copy itself
+    //     is excepted -- it is the reason for merging.
     //
-    // Mehrere Quellen je `p` sind erlaubt, solange sie sich untereinander
-    // nicht stoeren: ein `if` im Schleifenrumpf schreibt die
-    // Schleifenvariable in jedem Zweig einmal, und die Zweige schliessen
-    // einander aus.
+    // Several sources per `p` are allowed as long as they do not interfere
+    // with one another: an `if` in the loop body writes the
+    // loop variable once in each branch, and the branches
+    // exclude each other.
     let mut coalesced: HashMap<Val, Val> = HashMap::new();
-    // OHNE FIXPUNKT DER LEBENDIGKEIT NICHT. Unterhalb der Rundengrenze von
-    // `compute_live` sind die Mengen moeglicherweise ZU KLEIN -- und ein
-    // Wert, von dem faelschlich angenommen wird, er lebe nicht mehr, wuerde
-    // mit einem verschmolzen, der ihn ueberschreibt. Dieselbe Vorsicht wie
-    // bei `exact_crossings`.
+    // NOT WITHOUT A FIXED POINT OF THE LIVENESS. Below the round limit of
+    // `compute_live` the sets are possibly TOO SMALL -- and a
+    // value that is wrongly assumed to be no longer alive would be
+    // merged with one that overwrites it. The same caution as
+    // with `exact_crossings`.
     let coal_scope_ok = match std::env::var("FIRN_COAL_ONLY") {
         Ok(v) => f.name.contains(&v),
         Err(_) => true,
@@ -1792,9 +1791,9 @@ pub fn allocate(f: &Func) -> Alloc {
             Ok(x) => f.name.contains(&x),
             Err(_) => false,
         };
-        // Die Schreibstellen EINMAL sammeln. Die erste Fassung lief fuer
-        // jeden Kandidaten die ganze Funktion ab -- bei `bin/firnc1.fi`
-        // kostete das zwoelf Prozent Uebersetzungszeit fuer nichts.
+        // Collect the write sites ONCE. The first version walked the
+        // whole function for every candidate -- in `bin/firnc1.fi`
+        // that cost twelve percent of translation time for nothing.
         let mut defs: Vec<u32> = vec![0; nv];
         let mut defsites: HashMap<Val, Vec<(usize, usize)>> = HashMap::new();
         for (bi, b) in f.blocks.iter().enumerate() {
@@ -1813,20 +1812,20 @@ pub fn allocate(f: &Func) -> Alloc {
         let mut sources: HashMap<Val, Vec<Val>> = HashMap::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, i) in b.insts.iter().enumerate() {
-                // RUNDE TEMPO 10 -- DIE ZWEIOPERANDENFORM IST AUCH EINE
-                // KOPIE.
+                // ROUND TEMPO 10 -- THE TWO-OPERAND FORM IS ALSO A
+                // COPY.
                 //
-                // `d = a * b` wird auf SSE zu `movaps d, a` + `mulps d, b`.
-                // Stirbt `a` hier, ist die Kopie fuer nichts — dasselbe
-                // Register fuer `a` und `d` macht daraus einen einzigen
-                // Befehl. Gemessen im MP3-Dekoder: `movaps xmm,xmm` stand
-                // fuer 16,3 von 146,3 Millionen Befehlen, also elf Prozent
-                // des ganzen Programms, und war damit der groesste
-                // Einzelposten ueberhaupt.
+                // `d = a * b` becomes `movaps d, a` + `mulps d, b` on SSE.
+                // If `a` dies here, the copy is for nothing — the same
+                // register for `a` and `d` turns it into a single
+                // instruction. Measured in the MP3 decoder: `movaps xmm,xmm` stood
+                // for 16.3 of 146.3 million instructions, that is eleven percent
+                // of the whole program, and was thereby the biggest
+                // single item overall.
                 //
-                // Die Bedingungen darunter sind dieselben wie fuer eine
-                // echte Kopie; die wichtigste (`a` hat genau einen Leser)
-                // ist genau die Frage "stirbt `a` hier".
+                // The conditions below are the same as for a real
+                // copy; the most important one (`a` has exactly one reader)
+                // is exactly the question "does `a` die here".
                 let (t, p, two_address) = match (&i.op, i.dst) {
                     (Op::Copy { src }, Some(p)) => (*src, p, false),
                     (Op::Bin(op, a, _), Some(p))
@@ -1853,7 +1852,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 if t == p || t as usize >= nv || p as usize >= nv {
                     reject!("selbst")
                 }
-                // RUNDE TEMPO 10: ein Schnitt darf nicht wieder zuwachsen.
+                // ROUND TEMPO 10: a cut must not grow shut again.
                 if f.no_coalesce.contains(&t) || f.no_coalesce.contains(&p) {
                     reject!("Schnitt")
                 }
@@ -1863,20 +1862,18 @@ pub fn allocate(f: &Func) -> Alloc {
                 if coalesced.contains_key(&p) {
                     reject!("p ist selbst Quelle")
                 }
-                // (1) Eine Schreibstelle, und der Wert wird hier zum
-                // LETZTEN Mal gebraucht.
+                // (1) One write site, and the value is needed here for the
+                // LAST time.
                 //
-                // Fuer eine echte Kopie ist das "genau ein Leser" -- die
-                // Kopie selbst. Fuer die Zweioperandenform waere das zu
-                // streng: in der heissen Schleife der Synthesefilterbank
-                // wird derselbe Vektor ZWEIMAL multipliziert, und beim
-                // zweiten Mal stirbt er. Genau dort darf das Ziel sein
-                // Register erben. Die Frage ist also nicht, wie oft der Wert
-                // gelesen wird, sondern ob er NACH dieser Anweisung noch
-                // lebt.
-                // RUNDE TEMPO 13: mit mehreren Schreibstellen ist Chaitins
-                // Regel genauso richtig -- `interferes` prueft JEDE davon.
-                // Bisher blieb so jede phi-Variable einer Schleife aussen vor.
+                // For a real copy that is "exactly one reader" -- the copy
+                // itself. For the two-operand form that would be too
+                // strict: in the hot loop of the synthesis filter bank
+                // the same vector is multiplied TWICE, and the second time it dies.
+                // Exactly there the destination may inherit its register. The question is therefore not how often the value
+                // is read, but whether it still lives AFTER this instruction.
+                // ROUND TEMPO 13: with several write sites Chaitin's
+                // rule is just as correct -- `interferes` checks EACH of them.
+                // Until now every phi variable of a loop was left out.
                 if defs[t as usize] != 1 && !coal_multi {
                     reject!("mehrere Schreibstellen")
                 }
@@ -1889,7 +1886,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 {
                     reject!("defs/reads")
                 }
-                // (2) gleicher Typ, kein Sonderplatz.
+                // (2) same type, no special slot.
                 if f.val_ty(t) != f.val_ty(p) || f.val_ty(t) != i.ty {
                     reject!("Typ")
                 }
@@ -1907,18 +1904,18 @@ pub fn allocate(f: &Func) -> Alloc {
                 {
                     reject!("Sonderplatz")
                 }
-                // DIESELBE SCHRANKE WIE DER SCAN: wer nicht `fp_taugt`, darf
-                // kein `xmm` sehen -- sonst liest irgendein Weg des Erzeugers
-                // ein SSE-Register als Ganzzahlregister. Genau das war der
-                // Fehler aus Runde TEMPO 1 (`tests/1452_f32_abi.fi`).
+                // THE SAME BARRIER AS THE SCAN: whoever is not `fp_taugt` may
+                // see no `xmm` -- otherwise some path of the generator
+                // reads an SSE register as an integer register. Exactly that was the
+                // bug from round TEMPO 1 (`tests/1452_f32_abi.fi`).
                 if sse_class(f.val_ty(t)) && !(fp_ok[t as usize] && fp_ok[p as usize]) {
                     reject!("taugt nicht fuer xmm")
                 }
                 if start[t as usize] == usize::MAX || start[p as usize] == usize::MAX {
                     reject!("kein Intervall")
                 }
-                // (3) keine Stoerung -- weder mit `p` noch mit einer Quelle,
-                // die `p` schon hat.
+                // (3) no interference -- neither with `p` nor with a source
+                // that `p` already has.
                 if interferes(f, &live, &defsites, t, p, Some((bi, ii))) {
                     reject!("Stoerung")
                 }
@@ -1938,11 +1935,11 @@ pub fn allocate(f: &Func) -> Alloc {
                 coalesced.insert(t, p);
             }
         }
-        // Die Intervalle zusammenlegen: `p` traegt ab jetzt die Lebensdauer,
-        // das Gewicht und die zerstoerten Register BEIDER Werte, `t` faellt
-        // aus der Liste. Das Gewicht ist der Grund, aus dem das hier und
-        // nicht spaeter steht -- ein Laufzeiger, der in jedem Durchlauf
-        // fortgeschaltet wird, ist damit so schwer, wie er wirklich ist.
+        // Put the intervals together: `p` carries from now on the lifetime,
+        // the weight and the destroyed registers of BOTH values, `t` drops
+        // out of the list. The weight is the reason it stands here and not
+        // later -- a running pointer that is advanced in every iteration
+        // is thereby as heavy as it really is.
         for (t, ptgt) in coalesced.iter() {
             let (tv, pv) = (*t as usize, *ptgt as usize);
             if start[tv] < start[pv] {
@@ -1996,9 +1993,9 @@ pub fn allocate(f: &Func) -> Alloc {
             let c = call_cost(s, e);
             if c.saturating_mul(cs_k) < weight[v] {
                 killed = rough_nc(s, e) | (killed & !M_CALL);
-                // Was nicht von einem Aufruf kommt, bleibt: `rough_nc`
-                // deckt div/rep/select usw. ab, das exakte Ergebnis ohne
-                // die Aufrufbits das, was die Kontrollflussanalyse wusste.
+                // What does not come from a call stays: `rough_nc`
+                // covers div/rep/select etc., the exact result without
+                // the call bits what the control-flow analysis knew.
                 save_set.insert(v as Val);
             }
         }
@@ -2067,12 +2064,12 @@ pub fn allocate(f: &Func) -> Alloc {
     }
     ivs.sort_by_key(|i| (i.start, i.end, i.val));
 
-    // ROUND XMM3 -- die Fliesskommawerte, getrennt gesammelt. `fp_taugt`
-    // sagt, welche ueberhaupt in Frage kommen: ein Wert bekommt nur dann ein
-    // `xmm`, wenn JEDE Stelle, die ihn defines oder reads, im Fliesskommaweg
-    // der Ausgabe steht. Alles andere bleibt auf seinem Platz und wird
-    // gelesen wie bisher -- so kann kein Weg im Erzeuger versehentlich ein
-    // `xmm` als Ganzzahlregister behandeln.
+    // ROUND XMM3 -- the floating-point values, collected separately. `fp_taugt`
+    // says which come into question at all: a value only gets an
+    // `xmm` if EVERY place that defines or reads it stands in the floating-point path
+    // of the output. Everything else stays in its slot and is read
+    // as before -- so no path in the generator can accidentally treat an
+    // `xmm` as an integer register.
     let mut fp_ivs: Vec<Iv> = Vec::new();
     for v in 0..nv {
         if !sse_class(f.val_ty(v as Val)) || !fp_ok[v] {
@@ -2092,8 +2089,8 @@ pub fn allocate(f: &Func) -> Alloc {
             Some(x) => x[v],
             None => rough(sp, ep),
         };
-        // Ein Aufruf zerstoert jedes SSE-Register: dann bleibt der Platz --
-        // ausser das Ablegen am Aufruf ist billiger (RUNDE TEMPO 12).
+        // A call destroys every SSE register: then the slot stays --
+        // unless storing at the call is cheaper (ROUND TEMPO 12).
         if killed & M_CALL != 0 {
             if !(callsave_on && call_cost(sp, ep).saturating_mul(cs_k) < weight[v]) {
                 continue;
@@ -2102,10 +2099,10 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         fp_ivs.push(Iv { val: v as Val, start: sp, end: ep, weight: weight[v], killed: 0, is_cell: false });
     }
-    // Die Fliesskomma-ZELLEN: wie oben bei den Ganzzahlzellen vom Beginn der
-    // Funktion bis zum letzten Zugriff (ihr Inhalt ueberlebt Bloecke ohne
-    // Zugriff), doppeltes Gewicht. Alle sechzehn `xmm` sind caller-saved --
-    // kreuzt die Lebensdauer einen Aufruf, bleibt die Zelle im Rahmen.
+    // The floating-point CELLS: as above with the integer cells from the beginning of the
+    // function to the last access (their content survives blocks without
+    // access), double weight. All sixteen `xmm` are caller-saved --
+    // if the lifetime crosses a call, the cell stays in the frame.
     for &c in fp_cells.iter() {
         let cv = c as usize;
         if start[cv] == usize::MAX {
@@ -2128,8 +2125,8 @@ pub fn allocate(f: &Func) -> Alloc {
         });
     }
     fp_ivs.sort_by_key(|i| (i.start, i.end, i.val));
-    // Zur Fehlersuche: FIRN_NO_FP_RA=1 laesst die Fliesskommawerte auf ihren
-    // Plaetzen, der Rest des Weges bleibt wie er ist.
+    // For debugging: FIRN_NO_FP_RA=1 leaves the floating-point values in their
+    // slots, the rest of the path stays as it is.
     if std::env::var_os("FIRN_NO_FP_RA").is_some() {
         fp_ivs.clear();
     }
@@ -2170,9 +2167,9 @@ pub fn allocate(f: &Func) -> Alloc {
         let b = reg_bit(r);
         b != 0 && iv.killed & b == 0
     }
-    /// Gewicht JE LAENGE -- was ein Register an dieser Stelle wirklich wert
-    /// ist. `FIRN_RA_SUMME=1` stellt die alte Antwort (die reine Summe) zum
-    /// Vergleichen wieder her.
+    /// Weight PER LENGTH -- what a register is really worth at this place.
+    /// `FIRN_RA_SUMME=1` restores the old answer (the plain sum) for
+    /// comparison.
     fn density(iv: &Iv) -> u64 {
         if std::env::var_os("FIRN_RA_SUMME").is_some() {
             return iv.weight;
@@ -2205,17 +2202,17 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     };
 
-    // RUNDE TEMPO 13: der Scan mit Luecken. Statt einer Liste aktiver
-    // Intervalle haelt jedes Register die Intervalle, die es gerade traegt
-    // (abgelaufene fallen heraus, sobald der Scan an ihrem Ende vorbei ist).
-    // Frei ist ein Register fuer `iv`, wenn es passt (`fits`) und keines
-    // seiner Intervalle ein Stueck mit `iv` teilt. Die Reihenfolge der
-    // Vorlieben ist die des alten Scans: erst die eingeschraenkten Register,
-    // die callee-saved zuletzt.
+    // ROUND TEMPO 13: the scan with gaps. Instead of a list of active
+    // intervals, every register holds the intervals it currently carries
+    // (expired ones drop out as soon as the scan is past their end).
+    // A register is free for `iv` if it fits (`fits`) and none of
+    // its intervals shares a piece with `iv`. The order of the
+    // preferences is that of the old scan: first the restricted registers,
+    // the callee-saved last.
     if holes {
-        // Sicherheitsnetz: ein Intervall ohne Stuecke stiesse mit NIEMANDEM
-        // zusammen und teilte sein Register mit allen. Dann gilt das ganze
-        // Intervall am Stueck.
+        // Safety net: an interval without pieces would collide with NOBODY
+        // and share its register with everyone. Then the whole
+        // interval counts in one piece.
         for iv in ivs.iter().chain(fp_ivs.iter()) {
             if segs[iv.val as usize].is_empty() {
                 segs[iv.val as usize] = vec![(iv.start, iv.end)];
@@ -2243,8 +2240,8 @@ pub fn allocate(f: &Func) -> Alloc {
             }
             let sv = &segs[iv.val as usize];
             let mut pick: Option<usize> = None;
-            // Wer nur wegen der Sicherung am Aufruf hier ist, nimmt zuerst
-            // ein callee-saved Register (TEMPO 12) -- das kostet dort nichts.
+            // Whoever is here only because of the save at the call takes a
+            // callee-saved register first (TEMPO 12) -- that costs nothing there.
             let order: Vec<usize> = if save_set.contains(&iv.val) {
                 let mut o: Vec<usize> = (0..pref.len()).filter(|&k| CALLEE_SAVED.contains(&pref[k])).collect();
                 o.extend((0..pref.len()).filter(|&k| !CALLEE_SAVED.contains(&pref[k])));
@@ -2272,9 +2269,9 @@ pub fn allocate(f: &Func) -> Alloc {
                 on_reg[k].push(iv);
                 continue;
             }
-            // Verdraengen: das Register, dessen stoerende Intervalle
-            // zusammen am wenigsten wert sind -- und nur, wenn JEDES davon
-            // weniger dicht ist als `iv`.
+            // Displacing: the register whose interfering intervals
+            // together are worth the least -- and only if EACH of them is
+            // less dense than `iv`.
             let di = dens(&iv);
             let mut best: Option<(usize, u64)> = None;
             for (k, r) in pref.iter().enumerate() {
@@ -2379,9 +2376,9 @@ pub fn allocate(f: &Func) -> Alloc {
         // (tools/bench90/icount.py). So the order stays one order for
         // everybody: the cheap registers first, the ones that cost a push
         // and a pop last.
-        // RUNDE TEMPO 12: wer einen Aufruf kreuzt und nur wegen der
-        // Sicherung am Aufruf ueberhaupt hier ist, nimmt ZUERST ein
-        // callee-saved Register -- das kostet am Aufruf nichts.
+        // ROUND TEMPO 12: whoever crosses a call and is here only because of
+        // the save at the call takes a callee-saved register FIRST
+        // -- that costs nothing at the call.
         let pick = if save_set.contains(&iv.val) {
             take(&mut free_saved)
                 .or_else(|| take(&mut free_temp))
@@ -2406,12 +2403,12 @@ pub fn allocate(f: &Func) -> Alloc {
                 // (uses x loop depth) clears the register. At equal weight
                 // the later end decides.
                 //
-                // RUNDE TEMPO 10 -- DICHTE STATT SUMME.
-                // Die Summe bevorzugt lange Intervalle: ein Wert mit fuenfzig
-                // ueber die ganze Funktion verstreuten Verwendungen schlaegt
-                // einen mit dreien in der innersten Schleife, obwohl er sein
-                // Register die ganze Zeit belegt und der andere es nur kurz
-                // braeuchte. Was zaehlen sollte, ist Gewicht JE LAENGE.
+                // ROUND TEMPO 10 -- DENSITY INSTEAD OF SUM.
+                // The sum favours long intervals: a value with fifty
+                // uses scattered over the whole function beats
+                // one with three in the innermost loop, although it occupies its
+                // register the whole time and the other would need it only briefly.
+                // What should count is weight PER LENGTH.
                 let mut worst: Option<usize> = None;
                 for (k, (a, r)) in active.iter().enumerate() {
                     if !fits(&iv, r) {
@@ -2448,16 +2445,16 @@ pub fn allocate(f: &Func) -> Alloc {
 
     }
 
-    // ---- ROUND XMM3: derselbe Durchlauf noch einmal, fuer die SSE-Klasse --
+    // ---- ROUND XMM3: the same pass once more, for the SSE class ---------
     //
-    // Er ist einfacher als der obere: alle zwoelf Register sind
-    // gleichwertig (keines ist Argument-, Divisions- oder callee-saved
-    // Register), und was einen Aufruf kreuzt, ist oben schon aussortiert.
+    // It is simpler than the upper one: all twelve registers are
+    // equivalent (none is an argument, division or callee-saved
+    // register), and what crosses a call has already been sorted out above.
     {
         let mut free_fp: Vec<&'static str> = FP_POOL.to_vec();
         let mut active_fp: Vec<(Iv, &'static str)> = Vec::new();
         if holes {
-            // RUNDE TEMPO 13: dieselben Luecken fuer die SSE-Klasse.
+            // ROUND TEMPO 13: the same gaps for the SSE class.
             let mut on_fp: Vec<Vec<Iv>> = vec![Vec::new(); FP_POOL.len()];
             for iv in fp_ivs.iter().copied() {
                 for l in on_fp.iter_mut() {
@@ -2524,7 +2521,7 @@ pub fn allocate(f: &Func) -> Alloc {
                     active_fp.push((iv, r));
                 }
                 None => {
-                    // Verdraengung nach Gewicht, wie oben.
+                    // Displacement by weight, as above.
                     let mut worst: Option<usize> = None;
                     for (k, (a, _)) in active_fp.iter().enumerate() {
                         let better = match worst {
@@ -2597,16 +2594,16 @@ pub fn allocate(f: &Func) -> Alloc {
                 (Op::Load { addr }, Some(d)) => (*addr, d),
                 _ => continue,
             };
-            // ROUND XMM3: der Alias sagt "der Wert steht schon im
-            // Zellregister" -- das ist ein GANZZAHLregister. Fuer einen
-            // Gleitzahlwert waere das eine Verwechslung der Registerklassen.
+            // ROUND XMM3: the alias says "the value is already in the
+            // cell register" -- that is an INTEGER register. For a
+            // floating-point value that would be a confusion of the register classes.
             if f.val_ty(d).is_float() {
                 continue;
             }
-            // RUNDE TEMPO 8: eine verschmolzene Quelle NICHT aliasen. Der
-            // Alias laesst das Laden ganz weg ("der Wert steht schon im
-            // Zellregister") -- der Platz, mit dem sie verschmolzen ist,
-            // bekaeme ihn dann nie.
+            // ROUND TEMPO 8: do NOT alias a merged source. The
+            // alias omits the load entirely ("the value is already in the
+            // cell register") -- the slot with which it was merged
+            // would then never get it.
             if coalesced.contains_key(&d) || coalesced.values().any(|q| *q == d) {
                 continue;
             }
@@ -2714,8 +2711,8 @@ pub fn allocate(f: &Func) -> Alloc {
             if alloc.imm(k).is_none()
                 || read.get(v as usize).copied().unwrap_or(0) != 1
                 || f.is_secret(v)
-                // RUNDE TEMPO 10: verschmolzene Werte haben ihren Platz
-                // schon; ein zweiter Weg, der ihn vergibt, macht ihn kaputt.
+                // ROUND TEMPO 10: merged values already have their slot;
+                // a second path that hands it out breaks it.
                 || coalesced.contains_key(&v)
                 || coalesced.values().any(|q| *q == v)
             {
@@ -2754,37 +2751,36 @@ pub fn allocate(f: &Func) -> Alloc {
 
     }
 
-    // ---- RUNDE TEMPO 8, ZWEITER TEIL: die Verschmelzung eintragen ------
-    // `t` bekommt den Platz von `p`. Erst JETZT, nach dem Alias- und dem
-    // Zellweg -- beide vergeben eigene Plaetze und wuerden die
-    // Verschmelzung sonst wieder ueberschreiben.
-    // NUR WENN `p` WIRKLICH EIN REGISTER BEKOMMEN HAT.
+    // ---- ROUND TEMPO 8, SECOND PART: enter the merge -------------------
+    // `t` gets the slot of `p`. Only NOW, after the alias path and the
+    // cell path -- both hand out slots of their own and would otherwise
+    // overwrite the merge again.
+    // ONLY IF `p` HAS REALLY GOT A REGISTER.
     //
-    // Sonst teilten sich zwei Werte EINEN RAHMENPLATZ. Das bringt nichts
-    // (gemessen: null Befehle) und macht die Wege kaputt, die einem Wert
-    // OHNE Register nachtraeglich doch einen Platz geben -- vor allem die
-    // Fliesskomma-Uebergabe `fp_handover`, die einen Wert mit genau einem
-    // Leser in `xmm2` legt statt in den Rahmen. Die Kopie haette dann
-    // geglaubt, Quelle und Ziel seien derselbe Platz, und nichts ausgegeben,
-    // waehrend der Wert in `xmm2` stand und niemand ihn ablegte.
+    // Otherwise two values would share ONE FRAME SLOT. That brings nothing
+    // (measured: zero instructions) and breaks the paths that give a value
+    // WITHOUT a register a slot after all -- above all the
+    // floating-point handover `fp_handover`, which puts a value with exactly one
+    // reader into `xmm2` instead of the frame. The copy would then have
+    // believed that source and destination are the same slot, and emitted nothing,
+    // while the value stood in `xmm2` and nobody stored it.
     for (t, ptgt) in coalesced.iter() {
         match alloc.loc(*ptgt) {
             Loc::Reg(r) => alloc.locs[*t as usize] = Loc::Reg(r),
-            // RUNDE TEMPO 10 -- AUCH ZWEI RAHMENPLAETZE, ABER NUR FUER
-            // GANZZAHLEN.
+            // ROUND TEMPO 10 -- ALSO TWO FRAME SLOTS, BUT ONLY FOR
+            // INTEGERS.
             //
-            // In `l3_huffman` bekommt fast nichts ein Register (maxlive=63
-            // bei vierzehn), und die Kopien der Rueckwaertskante stehen dort
-            // als ZWEI Befehle da: `mov rax,[quelle]` + `mov [ziel],rax`.
-            // Teilen sich beide denselben Platz, faellt die Kopie ganz weg.
+            // In `l3_huffman` almost nothing gets a register (maxlive=63
+            // at fourteen), and the copies of the back edge stand there as
+            // TWO instructions: `mov rax,[source]` + `mov [target],rax`.
+            // If both share the same slot, the copy drops out entirely.
             //
-            // Bei Gleitzahlen ist das VERBOTEN, und zwar wegen
-            // `fp_handover`: das legt einen Wert ohne Register mit genau
-            // einem Leser in `xmm2`, statt ihn abzulegen. Die Kopie haette
-            // dann geglaubt, Quelle und Ziel seien derselbe Platz, und
-            // nichts ausgegeben -- waehrend der Wert nie in den Rahmen kam.
-            // Genau daran ist `tests/1182_layout_float_probe.fi` in TEMPO 8
-            // gestorben.
+            // For floating-point numbers that is FORBIDDEN, because of
+            // `fp_handover`: it puts a value without a register with exactly
+            // one reader into `xmm2`, instead of storing it. The copy would
+            // then have believed that source and destination are the same slot, and
+            // emitted nothing -- while the value never came into the frame.
+            // That is exactly what `tests/1182_layout_float_probe.fi` died of in TEMPO 8.
             Loc::Slot(off) => {
                 if !sse_class(f.val_ty(*t)) {
                     alloc.locs[*t as usize] = Loc::Slot(off);

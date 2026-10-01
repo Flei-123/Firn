@@ -777,216 +777,216 @@ path exists without duplicating code.
 ---
 ---
 
-# RUNDE UI-WEB (20.09.2026) -- fUi auf das Ausdrucksniveau von HTML/CSS
+# ROUND UI-WEB (20.09.2026) -- fUi to the expressive level of HTML/CSS
 
-*Alles oberhalb dieser Linie gehoert zur Runde `firnc0` und bleibt
-unveraendert stehen. Was folgt, ist der Bauplan der laufenden Runde auf
-dem Zweig `ui-web`.*
+*Everything above this line belongs to the round `firnc0` and stays
+unchanged. What follows is the construction plan of the current round on
+the branch `ui-web`.*
 
-## 0. Der Stand, auf dem gebaut wird
+## 0. The state that is built on
 
-`sh tools/fui/run.sh --images` lief vor dieser Runde gruen durch
-(Abschnitte 1 bis 11, dazu die Galerien 1-4 und die Bild/SVG-Schau).
-lib/svg ist seit 2b82d78e im Baum, Bilder und SVG haengen ueber
-`lib/fui/uiimage.fi`, `uiimagepng.fi`, `uisvg.fi` am Widget.
+`sh tools/fui/run.sh --images` ran green before this round
+(sections 1 to 11, plus galleries 1-4 and the image/SVG show).
+lib/svg has been in the tree since 2b82d78e, images and SVG hang on the widget
+via `lib/fui/uiimage.fi`, `uiimagepng.fi`, `uisvg.fi`.
 
-Das GERUEST dieser Runde steht bereits und ist gruen -- jedes Modul
-UEBERNIMMT eine fertige, uebersetzbare Datei und baut sie aus; keines
-faengt bei null an:
+The SCAFFOLD of this round already stands and is green -- every module
+TAKES OVER a finished, translatable file and builds it out; none
+starts from zero:
 
-| Datei | Stand |
+| File | State |
 |---|---|
-| `lib/fui/anim.fi` | Easings (linear, cubic-bezier mit Newton, steps, analytische Feder), `Animation`, `Animator`/`anim_tick`, `mix_srgb`/`mix_oklab` (premultipliziert), `Transition` |
-| `lib/fui/flex.fi` | `profile kernel`, ganzzahlig: `FlexItem`/`FlexBox`, Verteilung mit grow/shrink/Klemmung samt Nachverteilung, justify/align/wrap/gap |
-| `lib/fui/effect.fi` | Kastenweichzeichner mit laufender Summe (3x je Richtung), `blur_rect`, `drop_shadow_round`, `backdrop_blur`, `ColorMatrix` |
-| `lib/fui/transform.fi` | `Xform`-Stapel ueber `lib/svg/matrix.fi`, `tf_fill_round_rect` (Pfadpunkte durch die Matrix), `tf_draw_image` (invers, bilinear), `tf_text`, `tf_hit_rect`/`tf_hit_test` |
-| `tools/fui/{anim,flex,effect,transform}_main.fi` | je 11-15 numerische Behauptungen, alle gruen, Abschluss `<NAME> PASSED.` |
-| `tools/fui/gallery{5,6,7,8}_main.fi` | je ein Belegbild, hell und dunkel, laufen durch |
-| `tools/fui/run.sh` | Abschnitte 12-15 und die vier neuen Galerien sind EINGEHAENGT |
+| `lib/fui/anim.fi` | Easings (linear, cubic-bezier with Newton, steps, analytic spring), `Animation`, `Animator`/`anim_tick`, `mix_srgb`/`mix_oklab` (premultiplied), `Transition` |
+| `lib/fui/flex.fi` | `profile kernel`, integer: `FlexItem`/`FlexBox`, distribution with grow/shrink/clamping including redistribution, justify/align/wrap/gap |
+| `lib/fui/effect.fi` | Box blur with running sum (3x per direction), `blur_rect`, `drop_shadow_round`, `backdrop_blur`, `ColorMatrix` |
+| `lib/fui/transform.fi` | `Xform` stack over `lib/svg/matrix.fi`, `tf_fill_round_rect` (path points through the matrix), `tf_draw_image` (inverse, bilinear), `tf_text`, `tf_hit_rect`/`tf_hit_test` |
+| `tools/fui/{anim,flex,effect,transform}_main.fi` | 11-15 numeric claims each, all green, ending `<NAME> PASSED.` |
+| `tools/fui/gallery{5,6,7,8}_main.fi` | one proof image each, light and dark, run through |
+| `tools/fui/run.sh` | sections 12-15 and the four new galleries are HOOKED IN |
 
-## 1. Wem welche Datei gehoert
+## 1. Which file belongs to whom
 
-| Modul | AUSSCHLIESSLICH diese Dateien |
+| Module | EXCLUSIVELY these files |
 |---|---|
 | **anim** | `lib/fui/anim.fi`, `tools/fui/anim_main.fi`, `tools/fui/gallery5_main.fi` |
 | **flex** | `lib/fui/flex.fi`, `tools/fui/flex_main.fi`, `tools/fui/gallery6_main.fi` |
 | **effect** | `lib/fui/effect.fi`, `tools/fui/effect_main.fi`, `tools/fui/gallery7_main.fi` |
 | **transform** | `lib/fui/transform.fi`, `tools/fui/transform_main.fi`, `tools/fui/gallery8_main.fi`, `lib/fui/control.fi` |
 
-NIEMAND ausser dem Architekten fasst `tools/fui/run.sh` an -- die
-Abschnitte 12 bis 15 und die Galerieaufrufe stehen schon drin, mit
-genau diesen Dateinamen. Wer eine weitere Pruefung braucht, haengt sie
-in seine EIGENE `*_main.fi`, nicht in eine neue Datei.
+NOBODY but the architect touches `tools/fui/run.sh` -- sections 12 to 15
+and the gallery calls are already in it, with exactly these file names.
+Whoever needs another check hangs it in their OWN `*_main.fi`, not in a
+new file.
 
-NIEMAND aendert `lib/fui/core.fi`, `style.fi`, `layout.fi`, `theme.fi`,
+NOBODY changes `lib/fui/core.fi`, `style.fi`, `layout.fi`, `theme.fi`,
 `painter.fi`, `render.fi`, `widget.fi`, `wave2.fi`, `wave3.fi`,
-`lib/svg/*`, `lib/paint/*`. Reicht eine Schnittstelle nicht: im eigenen
-Modul umgehen und es im Bericht benennen.
+`lib/svg/*`, `lib/paint/*`. If an interface is not enough: work around it
+in your own module and name it in the report.
 
 ## 2. Die Schnittstellen -- festgeschrieben
 
-Diese Namen sind BESTAND. Sie duerfen ERWEITERT, aber nicht umbenannt
-oder in ihrer Bedeutung geaendert werden, denn die Galerien und
-Pruefungen der anderen Module rufen sie auf:
+These names are EXISTING. They may be EXTENDED, but not renamed
+or changed in their meaning, because the galleries and
+checks of the other modules call them:
 
 * **anim**: `Easing`, `easing_linear/bezier/steps/spring/named`,
-  `ease_eval(&Easing, p) -> f64` mit p in [0,1];
-  `Animation`, `anim_new(start_ms, dur_ms, von, bis, Easing)`,
+  `ease_eval(&Easing, p) -> f64` with p in [0,1];
+  `Animation`, `anim_new(start_ms, dur_ms, from, to, Easing)`,
   `anim_value(&Animation, ms) -> f64`, `anim_progress`, `anim_done`;
   `Animator`, `animator_add`, `animator_at`, `anim_tick(&Animator, ms) -> bool`
-  (`true` = das Bild ist veraltet);
-  `mix_srgb(c0, c1, t) -> u32`, `mix_oklab(...)` auf 0xAARRGGBB;
-  `Transition` mit `trans_to_state`, `trans_tick`, `trans_color`,
+  (`true` = the picture is stale);
+  `mix_srgb(c0, c1, t) -> u32`, `mix_oklab(...)` on 0xAARRGGBB;
+  `Transition` with `trans_to_state`, `trans_tick`, `trans_color`,
   `trans_radius`, `trans_border`, `trans_alpha`, `trans_dx`, `trans_dy`.
-* **flex**: `FlexItem` (64 Oktette -- die Schrittweite steht in
-  `item_at`, wer Felder hinzufuegt, prueft sie nach),
-  `flex_item(basis, cross)`, `item_set_flex(grow, shrink, basis)` mit
-  PROMILLE (1000 = 1.0), `item_set_bounds(min, max)`, `item_set_align`;
+* **flex**: `FlexItem` (64 octets -- the stride is in
+  `item_at`, whoever adds fields checks it again),
+  `flex_item(basis, cross)`, `item_set_flex(grow, shrink, basis)` with
+  PER MILLE (1000 = 1.0), `item_set_bounds(min, max)`, `item_set_align`;
   `FlexBox`, `flexbox_new(dir)`, `flex_set_gap(main, cross)`,
   `flex_set_justify/align_items/align_content/wrap/padding`;
   `flex_layout(&FlexBox, Rect, *FlexItem, n, *Rect out, *i64, *i64)`,
   `flex_measure_main`, `flex_measure_cross`, `flex_line_count`.
-  Die beiden `*i64` sind Arbeitsfelder des Aufrufers mit je `n`
-  Eintraegen -- dieselbe Regel A1 wie in `layout.fi`.
-* **effect**: `box_pass_h/v(src, dst, w, h, r)` auf dichten RGBA-Puffern
+  The two `*i64` are work fields of the caller with `n` entries each --
+  the same rule A1 as in `layout.fi`.
+* **effect**: `box_pass_h/v(src, dst, w, h, r)` on dense RGBA buffers
   (src != dst), `blur_buffer(px, tmp, w, h, r)`,
   `blur_rect(&Canvas, x, y, w, h, r) -> bool`,
   `drop_shadow_round(&Painter, x, y, w, h, radius, dx, dy, blur, col)`,
   `backdrop_blur(&Painter, x, y, w, h, radius, blur, tint)`,
-  `ColorMatrix` mit `cm_identity/saturate/brightness/contrast/grayscale/mul`,
+  `ColorMatrix` with `cm_identity/saturate/brightness/contrast/grayscale/mul`,
   `cm_apply_pixel`, `cm_apply_rect`.
 * **transform**: `Xform`, `xf_new/reset/push/pop`,
-  `xf_translate/scale/rotate/rotate_at/skew` (Skalierung und Scherung
-  um einen frei waehlbaren Ursprung), `xf_point_x/y`, `xf_inv_x/y`,
+  `xf_translate/scale/rotate/rotate_at/skew` (scaling and skewing
+  about a freely chosen origin), `xf_point_x/y`, `xf_inv_x/y`,
   `xf_scale_hint`, `tf_fill_quad`, `tf_fill_round_rect`,
   `tf_draw_image`, `tf_text`, `tf_hit_rect`, `tf_hit_widget`,
   `tf_hit_test(&Panel, &Xform, x, y)`.
 
 ## 3. Harte Regeln
 
-1. **Firn, sonst nichts.** Kein C, kein Rust, kein JS, keine libc, keine
-   fremde Bibliothek. `export { ... }` oben, Kommentare als ganze
-   Saetze, die das WARUM sagen, `#[no_gc]` wo der Kern es braucht.
-2. **Kein zweiter Ort fuer dieselbe Sache.** Matrix: `lib/svg/matrix.fi`.
-   PNG: `lib/paint/png.fi`. Runde Ecken: `painter.round_rect` bzw. die
-   Kubiken mit dem Faktor 0.5523. Pixel: `lib/paint/canvas.fi`.
-   e^x/ln/sin: `std.math`. Wer etwas zum zweiten Mal schreibt, begruendet
-   es im Kopfkommentar oder laesst es.
-3. **Kernel-rein bleiben.** `core.fi`, `style.fi`, `layout.fi` (und neu
-   `flex.fi`) uebersetzen mit `--profile=kernel` ohne Syscall und ohne
-   fremden Namen ausser `osum_panic`. Abschnitt 1 von `run.sh` prueft es.
-   Neue Module duerfen nach unten haengen, nie umgekehrt.
-4. **Zahlen, keine Blicke.** Jede Behauptung in einer `*_main.fi` ist ein
-   von Hand gerechneter Sollwert mit `got X want Y`. Kein Test wird
-   abgeschwaecht oder entfernt -- auch kein alter.
-5. **Bilder in hell UND dunkel.** Nichts ueberlappt, nichts ist
-   abgeschnitten, kein Text laeuft aus seinem Kasten. Die Laengen der
-   `[u8; N]`-Beschriftungen richtet `tools/fui/fixlen.py`; der
-   LAENGENPARAMETER am Aufruf muss dazu passen, sonst steht die
-   Beschriftung abgeschnitten im Bild (im Geruest ist das erledigt,
-   beim Erweitern wieder pruefen).
-6. **Git**: kleine, erklaerte Commits auf `ui-web`. Kein force-push, kein
-   Zweigwechsel, nichts loeschen, was man nicht selbst angelegt hat.
-7. Am Ende muss `sh tools/fui/run.sh --images` durchlaufen und
-   `ALL CHECKS PASSED` drucken.
+1. **Firn, nothing else.** No C, no Rust, no JS, no libc, no
+   foreign library. `export { ... }` at the top, comments as whole
+   sentences that say the WHY, `#[no_gc]` where the core needs it.
+2. **No second place for the same thing.** Matrix: `lib/svg/matrix.fi`.
+   PNG: `lib/paint/png.fi`. Round corners: `painter.round_rect` or the
+   cubics with the factor 0.5523. Pixels: `lib/paint/canvas.fi`.
+   e^x/ln/sin: `std.math`. Whoever writes something a second time justifies
+   it in the header comment or leaves it.
+3. **Stay kernel-pure.** `core.fi`, `style.fi`, `layout.fi` (and new
+   `flex.fi`) translate with `--profile=kernel` without a syscall and without
+   a foreign name except `osum_panic`. Section 1 of `run.sh` checks it.
+   New modules may hang downwards, never the other way round.
+4. **Numbers, not glances.** Every claim in a `*_main.fi` is a
+   hand-calculated expected value with `got X want Y`. No test is
+   weakened or removed -- not an old one either.
+5. **Images in light AND dark.** Nothing overlaps, nothing is
+   cut off, no text runs out of its box. The lengths of the
+   `[u8; N]` labels are set by `tools/fui/fixlen.py`; the
+   LENGTH PARAMETER at the call has to match, otherwise the
+   label stands cut off in the picture (in the scaffold this is done,
+   check again when extending).
+6. **Git**: small, explained commits on `ui-web`. No force-push, no
+   branch switch, do not delete anything you did not create yourself.
+7. At the end `sh tools/fui/run.sh --images` must run through and
+   print `ALL CHECKS PASSED`.
 
-## 4. Was im Geruest noch fehlt (der eigentliche Bauauftrag)
+## 4. What is still missing in the scaffold (the actual build job)
 
-* **anim**: die `Transition` ist noch an kein Widget gebunden -- es
-  fehlt der Weg von `widget.w_state()`/`theme`/`style` in
-  `trans_to_state` und ein Beispiel, das hover/pressed/focus wirklich
-  interpoliert zeigt; OKLab ist eingebaut, aber `Transition.oklab`
-  laesst sich noch nicht von aussen setzen; Verzoegerung, Wiederholung
-  und `alternate` sind da, aber unbelegt im Bild.
-* **flex**: `align-content` kennt erst Anfang und Abstand ueber dieselbe
-  Rechnung wie `justify-content`; `AL_BASELINE` ist verdrahtet, aber im
-  Bild nicht belegt; `wrap-reverse` und Spaltenrichtung sind
-  ungeprueft; die Bruecke zu `render.pref_of` (f64 -> ganzzahlige Basis)
-  fehlt als eigene, benannte Funktion.
-* **effect**: `backdrop_blur` ist im Bild noch zu schwach zu sehen (die
-  Toenung greift zu wenig, der Radius ist zu klein gewaehlt); der
-  Schatten der kombinierten Karte in gallery7 wirkt als grauer Klumpen
-  statt als Verlauf; `blur_rect` ist ungenutzt; die Kanten von
-  `cm_apply_rect` sind ungeprueft gegen den Clip.
-* **transform**: `tf_draw_image` ist gebaut, aber weder geprueft noch im
-  Bild belegt (ein gedrehtes Bild mit bilinearer Abtastung gehoert in
-  gallery8); `tf_text` dreht den Ankerpunkt, aber nicht die Grundlinie;
-  `tf_hit_test` ist geprueft, `control.fi` selbst noch unberuehrt --
-  falls dort eine Fassung mit Matrix gewuenscht ist, gehoert sie in die
-  Hand dieses Moduls und darf `control.hit_test` NICHT ersetzen.
+* **anim**: the `Transition` is not yet bound to any widget -- what is
+  missing is the path from `widget.w_state()`/`theme`/`style` into
+  `trans_to_state` and an example that really shows hover/pressed/focus
+  interpolated; OKLab is built in, but `Transition.oklab`
+  cannot yet be set from outside; delay, repetition
+  and `alternate` are there, but unproven in the picture.
+* **flex**: `align-content` so far knows only start and spacing by the same
+  calculation as `justify-content`; `AL_BASELINE` is wired but not
+  proven in the picture; `wrap-reverse` and column direction are
+  unchecked; the bridge to `render.pref_of` (f64 -> integer basis)
+  is missing as its own named function.
+* **effect**: `backdrop_blur` is still too weakly visible in the picture (the
+  tint takes too little, the radius is chosen too small); the
+  shadow of the combined card in gallery7 looks like a grey lump
+  instead of a gradient; `blur_rect` is unused; the edges of
+  `cm_apply_rect` are unchecked against the clip.
+* **transform**: `tf_draw_image` is built, but neither checked nor proven
+  in the picture (a rotated image with bilinear sampling belongs in
+  gallery8); `tf_text` rotates the anchor point, but not the baseline;
+  `tf_hit_test` is checked, `control.fi` itself still untouched --
+  if a version with a matrix is wanted there, it belongs in the
+  hand of this module and must NOT replace `control.hit_test`.
 
 ---
 
 # RUNDE fUi-DEKLARATIV (21.09.2026) -- beschreiben statt malen
 
-Zweig `fui-deklarativ`. Ziel der Runde: fUi bekommt die letzte grosse
-Sache, die es von HTML/CSS trennt -- man BESCHREIBT eine Oberflaeche,
-statt sie Aufruf fuer Aufruf zu malen. Dazu drei neue Module:
+Branch `fui-deklarativ`. Goal of the round: fUi gets the last big
+thing that separates it from HTML/CSS -- you DESCRIBE a surface
+instead of painting it call by call. For that three new modules:
 
-* `lib/fui/viewport.fi` -- der Scheibenkasten (Ausschnitt, echtes
-  Clipping, Rollbalken aus dem Verhaeltnis, kinetisches Rollen).
-* `lib/fui/sheet.fi` -- das Stilblatt (Auswahl -> Stilwerte, Rangfolge,
-  Vererbung).
-* `lib/fui/scene.fi` -- der Baum (messen, anordnen, zeichnen -- in
-  dieser Reihenfolge und getrennt).
+* `lib/fui/viewport.fi` -- the pane box (viewport, real
+  clipping, scrollbars from the ratio, kinetic scrolling).
+* `lib/fui/sheet.fi` -- the style sheet (selector -> style values, precedence,
+  inheritance).
+* `lib/fui/scene.fi` -- the tree (measure, arrange, draw -- in
+  this order and separated).
 
-## 0. Was der Lead-Architekt in dieser Runde schon gebaut hat
+## 0. What the lead architect has already built in this round
 
-Es steht, es uebersetzt, es rechnet, und der Lauf ist damit gruen
-(`sh tools/fui/run.sh --images` -> `ALL CHECKS PASSED`). NICHTS davon
-wird neu gebaut; erweitert wird es sehr wohl.
+It stands, it translates, it calculates, and the run is thereby green
+(`sh tools/fui/run.sh --images` -> `ALL CHECKS PASSED`). NONE of it
+is rebuilt; it is extended, though.
 
-| Datei | Stand |
+| File | State |
 |---|---|
-| `lib/fui/sheet.fi` | vollstaendig: `Sel`/`Decl`/`Sheet`/`NodeDesc`, FNV-Namen, Rangfolge, `sheet_resolve`, `decl_merge`, `decl_inherit` |
-| `lib/fui/viewport.fi` | vollstaendig: Ausschnitt/Inhalt/Verschiebung, Balkenbedarf ueber Kreuz, Anteil+Stellung, `ensure_visible`, `viewport_hit`, Clip ueber `canvas.clip_push_rect`, Fling ueber `anim.Animation` |
-| `lib/fui/scene.fi` | tragend: Baum, vier Durchgaenge (`scene_style`/`_measure`/`_layout`/`_draw`), Treffer, Drift-Wache |
-| `tools/fui/sheet_main.fi` | 16 Behauptungen, `SHEET PASSED.` |
-| `tools/fui/viewport_main.fi` | 17 Behauptungen, `VIEWPORT PASSED.` |
-| `tools/fui/scene_main.fi` | 12 Behauptungen, `SCENE PASSED.` |
-| `tools/fui/run.sh` | Abschnitte 18b/18c/18d haengen die drei ein |
+| `lib/fui/sheet.fi` | complete: `Sel`/`Decl`/`Sheet`/`NodeDesc`, FNV names, precedence, `sheet_resolve`, `decl_merge`, `decl_inherit` |
+| `lib/fui/viewport.fi` | complete: viewport/content/offset, bar need across, share+position, `ensure_visible`, `viewport_hit`, clip via `canvas.clip_push_rect`, fling via `anim.Animation` |
+| `lib/fui/scene.fi` | load-bearing: tree, four passes (`scene_style`/`_measure`/`_layout`/`_draw`), hit, drift guard |
+| `tools/fui/sheet_main.fi` | 16 claims, `SHEET PASSED.` |
+| `tools/fui/viewport_main.fi` | 17 claims, `VIEWPORT PASSED.` |
+| `tools/fui/scene_main.fi` | 12 claims, `SCENE PASSED.` |
+| `tools/fui/run.sh` | sections 18b/18c/18d hook the three in |
 
-Die SCHNITTSTELLEN dieser drei Dateien sind ab jetzt FESTGESCHRIEBEN
-(siehe Abschnitt 2). Wer eine Signatur wirklich aendern muss, meldet
-das im Bericht -- er aendert sie nicht still, denn zwei Module bauen
-darauf.
+The INTERFACES of these three files are FIXED from now on
+(see section 2). Whoever really has to change a signature reports
+it in the report -- they do not change it silently, because two modules build
+on it.
 
-## 1. Wem welche Datei gehoert -- zwei Module fassen NIE dieselbe Datei an
+## 1. Which file belongs to whom -- two modules NEVER touch the same file
 
-| Modul | ausschliesslich diese Dateien |
+| Module | exclusively these files |
 |---|---|
-| **viewport** | `lib/fui/viewport.fi`, `tools/fui/viewport_main.fi`, `lib/fui/wave2.fi` (NUR die benannte Auslagerung, siehe 3.1) |
+| **viewport** | `lib/fui/viewport.fi`, `tools/fui/viewport_main.fi`, `lib/fui/wave2.fi` (ONLY the named extraction, see 3.1) |
 | **sheet** | `lib/fui/sheet.fi`, `tools/fui/sheet_main.fi` |
 | **scene** | `lib/fui/scene.fi`, `tools/fui/scene_main.fi` |
-| **galerie** | `tools/fui/gallery9_main.fi`, `tools/fui/gallery10_main.fi`, `tools/fui/scenedemo_main.fi`, `tools/fui/run.sh`, `LOGBOOK.md`, `ACCEPTANCE.md` |
+| **gallery** | `tools/fui/gallery9_main.fi`, `tools/fui/gallery10_main.fi`, `tools/fui/scenedemo_main.fi`, `tools/fui/run.sh`, `LOGBOOK.md`, `ACCEPTANCE.md` |
 
-`PLAN.md` gehoert dem Lead. `lib/fui/core.fi`, `style.fi`, `layout.fi`,
+`PLAN.md` belongs to the lead. `lib/fui/core.fi`, `style.fi`, `layout.fi`,
 `flex.fi`, `anim.fi`, `effect.fi`, `transform.fi`, `render.fi`,
-`wave3.fi`, `lib/paint/*`, `lib/svg/*` und JEDE bestehende
-`tools/fui/*_main.fi` bleiben unberuehrt. Keine bestehende Pruefung
-wird abgeschwaecht, umbenannt oder entfernt.
+`wave3.fi`, `lib/paint/*`, `lib/svg/*` and EVERY existing
+`tools/fui/*_main.fi` stay untouched. No existing check
+is weakened, renamed or removed.
 
 ## 2. Die festgeschriebenen Schnittstellen
 
 ### `lib/fui/sheet.fi`
 ```
-sheet_name(p: u64, n: usize) -> u32          // FNV-1a, nie 0
+sheet_name(p: u64, n: usize) -> u32          // FNV-1a, never 0
 Sel   sel_any/sel_kind/sel_id/sel_class
       sel_with_class/sel_with_state
       sel_within_class/sel_within_kind/sel_within_id
-      sel_specificity(*mut Sel) -> i64       // id 10000, Klasse/Zustand 100, Art 1
+      sel_specificity(*mut Sel) -> i64       // id 10000, class/state 100, kind 1
 Decl  decl_new, decl_style -> *mut style.Style, decl_set_style,
       decl_set_transition(ms, anim.EASE_*), decl_set_translate/_scale/_rotate,
       decl_has(bit, extra), decl_merge(dst, src), decl_inherit(child, parent)
-NodeDesc desc_new(kind, id), desc_add_class, desc_set_state   // 56 Oktette!
+NodeDesc desc_new(kind, id), desc_add_class, desc_set_state   // 56 octets!
 Sheet sheet_new, sheet_add(sel, decl) -> usize, sheet_count,
       sheet_sel, sheet_decl, sheet_match, sheet_resolve(chain, depth, out)
 INHERIT_MASK = SF_FG|SF_FONT_PX|SF_FONT_ID|SF_LINE_HEIGHT
 ```
-Die Kette `chain` ist ein Feld aus `NodeDesc`, Wurzel zuerst, der
-Knoten selbst an `depth - 1`. `sheet.chain_at` rechnet mit der
-Schrittweite 56; wer `NodeDesc` aendert, aendert BEIDES und die
-Messung in `sheet_main.fi` Abschnitt 6 faengt es.
+The chain `chain` is an array of `NodeDesc`, root first, the node
+itself at `depth - 1`. `sheet.chain_at` calculates with the
+stride 56; whoever changes `NodeDesc` changes BOTH and the
+measurement in `sheet_main.fi` section 6 catches it.
 
 ### `lib/fui/viewport.fi`
 ```
@@ -1018,112 +1018,110 @@ Scene scene_new, scene_add(parent, kind) -> usize, SCENE_NONE
       node_x/_y/_w/_h/_pref_w/_pref_h, scene_hit(px, py), scene_find_id(id)
       scene_phase, scene_size_drift
 ```
-Die Rechtecke sind ABSOLUT, die Rollposition ist beim Anordnen schon
-eingerechnet. Nach dem Rollen wird `scene_layout` erneut gerufen --
-und NICHT beim Zeichnen nachgeschoben.
+The rectangles are ABSOLUTE, the scroll position is already
+included when arranging. After scrolling, `scene_layout` is called again --
+and NOT pushed in afterwards while drawing.
 
-## 3. Der eigentliche Bauauftrag je Modul
+## 3. The actual build job per module
 
 ### 3.1 viewport
-* `wave2.draw_scrollbar` rechnet die Laenge des Schiebers heute IN SICH
-  (Zeilen 601 ff.). Sie wird als `wave2.scrollbar_thumb(c, e) -> layout.Rect`
-  herausgezogen und von `draw_scrollbar` gerufen -- eine Auslagerung
-  ohne jede Verhaltensaenderung, damit `viewport_main.fi` die Laenge
-  gegen `Ausschnitt/Inhalt` PRUEFEN kann, ohne sie ein zweites Mal
-  auszurechnen. Die Bilder aller bestehenden Belege muessen danach
-  Bildpunkt fuer Bildpunkt dieselben sein.
-* Abschnitt 8 von `viewport_main.fi`: HARTES CLIPPING auf einer echten
-  Leinwand. Ein Inhalt, der absichtlich weit ueber den Ausschnitt
-  hinausragt, wird zwischen `viewport_begin`/`viewport_end` gemalt;
-  danach wird JEDER Bildpunkt ausserhalb des Ausschnitts geprueft. Ein
-  einziger gesetzter Punkt ist ein Fehlschlag. Die GEGENPROBE gehoert
-  dazu: derselbe Inhalt OHNE Clip muss von demselben Test rot gemeldet
-  werden (die Zahl der uebergelaufenen Punkte wird gedruckt).
-* Rollbalkenlaenge im Bild: die Laenge des Schiebers wird aus der
-  Leinwand GEMESSEN und gegen `Ausschnitt/Inhalt * Spurlaenge`
-  gerechnet (mit der Mindestlaenge aus wave2 als benannte Ausnahme).
-* Radrasten, Tasten (`VP_PAGE_DOWN` am Ende klemmt), Fling mit
-  Verzoegerung und `viewport_tick` mitten in der Bewegung.
+* `wave2.draw_scrollbar` today calculates the thumb length INSIDE ITSELF
+  (lines 601 ff.). It is pulled out as `wave2.scrollbar_thumb(c, e) -> layout.Rect`
+  and called by `draw_scrollbar` -- an extraction without
+  any change of behaviour, so that `viewport_main.fi` can CHECK the length
+  against `viewport/content` without calculating it a second time. The images
+  of all existing proofs must afterwards be the same pixel for pixel.
+* Section 8 of `viewport_main.fi`: HARD CLIPPING on a real
+  canvas. Content that deliberately reaches far beyond the viewport
+  is painted between `viewport_begin`/`viewport_end`;
+  afterwards EVERY pixel outside the viewport is checked. A
+  single set pixel is a failure. The COUNTER-CHECK belongs to it:
+  the same content WITHOUT a clip must be reported red by the same test
+  (the number of overflowed pixels is printed).
+* Scrollbar length in the picture: the length of the thumb is MEASURED from the
+  canvas and calculated against `viewport/content * track length`
+  (with the minimum length from wave2 as a named exception).
+* Wheel notches, keys (`VP_PAGE_DOWN` clamps at the end), fling with
+  deceleration and `viewport_tick` in the middle of the motion.
 
 ### 3.2 sheet
-* Uebergaenge und Umformungen WIRKSAM machen: eine Brueckenfunktion, die
-  ein `Decl` an `anim.trans_set_duration`/`anim.easing_named` bzw. an
-  `transform.xf_translate/_scale/_rotate` reicht. Gerechnet wird dort,
-  nicht hier.
-* `sheet_resolve` gegen einen Fall mit VIER passenden Regeln, deren
-  Raenge sich paarweise widersprechen, und gegen eine Kette der Tiefe 4
-  ("Klasse A in Klasse B in Kennung C").
-* Der Zustand: dieselbe Auswahl mit `STATE_HOVER` und ohne, am selben
-  Knoten, einmal mit gesetztem Hover und einmal ohne -- die Zahlen
-  muessen kippen.
-* Die Grenze der Vererbung mit ZAHLEN je nicht vererbbarem Wert
-  (Grund, Rahmen, Radius, Polster, Ausrichtung, Alpha).
+* Make transitions and transformations EFFECTIVE: a bridge function that
+  hands a `Decl` to `anim.trans_set_duration`/`anim.easing_named` or to
+  `transform.xf_translate/_scale/_rotate`. The calculation happens there,
+  not here.
+* `sheet_resolve` against a case with FOUR matching rules whose
+  ranks contradict each other pairwise, and against a chain of depth 4
+  ("class A in class B in id C").
+* The state: the same selector with `STATE_HOVER` and without, on the same
+  node, once with hover set and once without -- the numbers
+  must flip.
+* The limit of inheritance with NUMBERS per non-inheritable value
+  (background, border, radius, padding, alignment, alpha).
 
 ### 3.3 scene
-* Messen und Anordnen mit echtem `render.Ctx` (Schrift, Leinwand,
-  Theme): von Hand gerechnete Sollwerte fuer eine Zeile aus drei
-  Knoepfen mit Luecke und Innenrand, gegen `flex_main.fi`-Manier.
-* Ein `N_VIEWPORT`-Knoten mit 40 Kindern: es wird geprueft, dass die
-  Kinder ausserhalb des Ausschnitts NICHT anklickbar sind und dass
-  `scene_hit` nach dem Rollen einen ANDEREN Knoten liefert.
-* Die Drift-Wache scharf machen: ein absichtlich falscher Knoten, der
-  beim Zeichnen seine Groesse aendert, muss `scene_size_drift` auf 1
-  bringen (Gegenprobe im Test, nicht in der Bibliothek).
-* Vererbung durch DREI Ebenen im Baum, und `scene_desc` gegen die
-  Art-Verschiebung um 1000 (Widget-Arten und Knotenarten duerfen sich
-  nicht ueberschneiden).
+* Measuring and arranging with a real `render.Ctx` (font, canvas,
+  theme): hand-calculated expected values for a row of three
+  buttons with gap and inner margin, in the manner of `flex_main.fi`.
+* An `N_VIEWPORT` node with 40 children: it is checked that the
+  children outside the viewport are NOT clickable and that
+  `scene_hit` returns a DIFFERENT node after scrolling.
+* Arm the drift guard: a deliberately wrong node that changes
+  its size while drawing must bring `scene_size_drift` to 1
+  (counter-check in the test, not in the library).
+* Inheritance through THREE levels in the tree, and `scene_desc` against the
+  kind shift by 1000 (widget kinds and node kinds must not
+  overlap).
 
-### 3.4 galerie
-* `tools/fui/gallery9_main.fi` -- hell UND dunkel: eine LANGE Liste in
-  einem Scheibenkasten, sichtbar abgeschnitten, mit Rollbalken, dessen
-  Laenge dem Verhaeltnis entspricht; daneben derselbe Kasten in drei
-  Rollstellungen (Anfang, Mitte, Ende).
-* `tools/fui/gallery10_main.fi` -- hell UND dunkel: eine VOLLSTAENDIGE,
-  mit `scene`+`sheet` beschriebene Oberflaeche (Titelzeile,
-  Werkzeugleiste, Seitenleiste, Inhalt, Statuszeile), die aussieht wie
-  eine moderne Anwendung.
-* `tools/fui/scenedemo_main.fi` -- DER NACHWEIS: dieselbe Oberflaeche
-  wie `demos/fuidemo/main.fi`, aber mit `scene`+`sheet` beschrieben.
-  Das bestehende Demo bleibt UNVERAENDERT stehen (es ist eine laufende
-  Pruefung). Das Programm druckt die beiden Zeilenzahlen -- vorher
-  (`demos/fuidemo/main.fi`) und nachher -- und das Bild ist mindestens
-  so gut.
-* `tools/fui/run.sh`: die drei Programme einhaengen, mit `kette` und
-  `beleg` wie jedes andere Blatt. Die Zahlen hinter `beleg` sind
-  ABSICHTLICH je Blatt gesetzt und muessen zur Leinwand des Programms
-  passen.
-* `LOGBOOK.md`/`ACCEPTANCE.md`: was diese Runde gebaut hat, mit den
-  Zahlen (Zeilen vorher/nachher, Zahl der Behauptungen).
+### 3.4 gallery
+* `tools/fui/gallery9_main.fi` -- light AND dark: a LONG list in
+  a pane box, visibly cut off, with a scrollbar whose
+  length corresponds to the ratio; next to it the same box in three
+  scroll positions (start, middle, end).
+* `tools/fui/gallery10_main.fi` -- light AND dark: a COMPLETE surface
+  described with `scene`+`sheet` (title row,
+  toolbar, side bar, content, status row) that looks like
+  a modern application.
+* `tools/fui/scenedemo_main.fi` -- THE PROOF: the same surface
+  as `demos/fuidemo/main.fi`, but described with `scene`+`sheet`.
+  The existing demo stays UNCHANGED (it is a running check). The program prints the two
+  line counts -- before
+  (`demos/fuidemo/main.fi`) and after -- and the picture is at least
+  as good.
+* `tools/fui/run.sh`: hook the three programs in, with `kette` and
+  `beleg` like every other sheet. The numbers behind `beleg` are
+  DELIBERATELY set per sheet and must fit the canvas of the program.
+* `LOGBOOK.md`/`ACCEPTANCE.md`: what this round built, with the
+  numbers (lines before/after, number of claims).
 
-## 4. Harte Regeln (fuer alle, nicht verhandelbar)
+## 4. Hard rules (for everyone, not negotiable)
 
-1. **Sprache ist Firn.** Kein C, kein Rust, kein JS, keine libc, keine
-   fremde Bibliothek. `export { ... }` oben, Kommentare als ganze
-   Saetze, die das WARUM erklaeren.
-2. **Kein zweiter Ort fuer dieselbe Sache.** Flexbox aus `flex.fi`,
-   Zeit und Easing aus `anim.fi`, Matrizen aus `lib/svg/matrix.fi`,
-   Weichzeichner aus `effect.fi`, Messen und Malen aus
-   `render.fi`/`wave2.fi`/`wave3.fi`, Clip aus `lib/paint/canvas.fi`.
-   In `lib/fui/` gilt weiter `matrix.m_floor/m_ceil/m_abs`, nie
-   `math.floor/ceil/abs` (Abschnitt 19 des Laufs verbietet es
-   maschinell).
-3. **Kernel-rein bleibt kernel-rein.** `core.fi`, `style.fi`,
-   `layout.fi` uebersetzen weiter mit `--profile=kernel`, ohne
-   Syscall und ohne fremden Namen ausser `osum_panic`. Die neuen
-   Module haengen nach unten, nie umgekehrt.
-4. **Zahlen, keine Blicke.** Jede Behauptung ist ein von Hand
-   gerechneter Sollwert mit `got X want Y`; am Ende steht
-   `<NAME> PASSED.`. Wo eine Pruefung etwas ausschliesst (Clipping,
-   Drift), gehoert die GEGENPROBE dazu.
-5. **Bilder hell UND dunkel.** Nichts ueberlappt, nichts ist
-   abgeschnitten -- ausser dort, wo der Scheibenkasten es soll --, kein
-   Text laeuft aus seinem Kasten. Die Laengen der `[u8; N]`-
-   Beschriftungen richtet `tools/fui/fixlen.py`; der LAENGENPARAMETER am
-   Aufruf muss dazu passen, sonst steht die Beschriftung abgeschnitten
-   im Bild.
-6. **Git**: kleine, erklaerte Commits auf `fui-deklarativ`. Kein
-   force-push, kein Zweigwechsel, nichts loeschen, was man nicht selbst
-   angelegt hat.
-7. Am Ende muss `sh tools/fui/run.sh --images` VOLLSTAENDIG durchlaufen
-   und `ALL CHECKS PASSED` drucken -- mit allen alten Pruefungen
-   unveraendert darin.
+1. **The language is Firn.** No C, no Rust, no JS, no libc, no
+   foreign library. `export { ... }` at the top, comments as whole
+   sentences that explain the WHY.
+2. **No second place for the same thing.** Flexbox from `flex.fi`,
+   time and easing from `anim.fi`, matrices from `lib/svg/matrix.fi`,
+   blur from `effect.fi`, measuring and painting from
+   `render.fi`/`wave2.fi`/`wave3.fi`, clip from `lib/paint/canvas.fi`.
+   In `lib/fui/` `matrix.m_floor/m_ceil/m_abs` still applies, never
+   `math.floor/ceil/abs` (section 19 of the run forbids it
+   mechanically).
+3. **Kernel-pure stays kernel-pure.** `core.fi`, `style.fi`,
+   `layout.fi` still translate with `--profile=kernel`, without
+   a syscall and without a foreign name except `osum_panic`. The new
+   modules hang downwards, never the other way round.
+4. **Numbers, not glances.** Every claim is a hand-calculated
+   expected value with `got X want Y`; at the end stands
+   `<NAME> PASSED.`. Where a check rules something out (clipping,
+   drift), the COUNTER-CHECK belongs to it.
+5. **Images in light AND dark.** Nothing overlaps, nothing is
+   cut off -- except where the pane box is meant to --, no
+   text runs out of its box. The lengths of the `[u8; N]`
+   labels are set by `tools/fui/fixlen.py`; the LENGTH PARAMETER at the
+   call has to match, otherwise the label stands cut off
+   in the picture.
+6. **Git**: small, explained commits on `fui-deklarativ`. No
+   force-push, no branch switch, do not delete anything you did not
+   create yourself.
+7. At the end `sh tools/fui/run.sh --images` must run COMPLETELY
+   and print `ALL CHECKS PASSED` -- with all old checks
+   unchanged in it.
