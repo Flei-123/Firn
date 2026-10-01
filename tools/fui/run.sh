@@ -1078,44 +1078,43 @@ if [ "$1" = "--images" ]; then
     "$W/gallery10" "$Z/fui-bidi-dunkel.png" dark
     beleg "$Z/fui-bidi-hell.png" 1000 500 900 200 40 1
     beleg "$Z/fui-bidi-dunkel.png" 1000 500 900 200 40 1
-    # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
-    # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
-    # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet
-    # erst recht nicht. Jetzt entsteht ihr Bild hier und wird
-    # nachgerechnet wie jeder andere Beleg.
+    # THE OVERVIEW FROM THE FIRST HOUR. tools/fui/preview_main.fi
+    # paints the basic elements in all states; it lay BESIDE this run since its
+    # creation -- nobody built it, and nobody calculated it either. Now its image arises here and is
+    # re-calculated like every other proof.
     build preview
     kette preview 760
     "$W/preview" "$Z/fui-preview-hell.png" light
     "$W/preview" "$Z/fui-preview-dunkel.png" dark
     beleg "$Z/fui-preview-hell.png" 760 200 240 120 40 1
     beleg "$Z/fui-preview-dunkel.png" 760 200 240 120 40 1
-    # DIE DEMO-ANWENDUNG. Kein Pruefblatt, sondern eine Oberflaeche, wie
-    # ein Anwender sie schreibt: Titelzeile und Werkzeugleiste von
-    # `flex.flex_layout` verteilt, der Hover-Uebergang eines Knopfes aus
-    # `anim.Animator`, der Dialogschatten aus
-    # `effect.drop_shadow_spread`. Sie liegt unter demos/ und nicht
-    # unter tools/fui, weil sie den NORMALEN Weg zeigt -- und sie laeuft
-    # hier mit, damit ein Bruch in einem der drei Module auffliegt,
-    # bevor der naechste Anwender darueber stolpert. Das Programm
-    # rechnet selbst nach, dass seine Phasen sich nicht ueberdecken,
-    # und endet sonst mit einem Fehler (set -e bricht den Lauf ab).
+    # THE DEMO APPLICATION. No test sheet, but a surface as a
+    # user writes it: title bar and toolbar distributed by
+    # `flex.flex_layout`, the hover transition of a button from
+    # `anim.Animator`, the dialog shadow from
+    # `effect.drop_shadow_spread`. It lies under demos/ and not
+    # under tools/fui, because it shows the NORMAL way -- and it runs along
+    # here so that a break in one of the three modules is noticed
+    # before the next user stumbles over it. The program
+    # re-calculates itself that its phases do not overlap,
+    # and otherwise ends with an error (set -e aborts the run).
     "$FIRNC" --opt-level=dev -o "$W/fuidemo" demos/fuidemo/main.fi
     "$W/belegpruef" --ketten "$SCHRIFT" 1000 demos/fuidemo/main.fi
     "$W/fuidemo" "$Z/fui-demo-hell.png" light
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     beleg "$Z/fui-demo-hell.png" 1000 350 500 200 40 0
     beleg "$Z/fui-demo-dunkel.png" 1000 350 500 200 40 0
-    # DIE EINGABEMETHODE (Runde IME, 23.09.2026). Vier Felder mitten in
-    # einer Eingabe -- Japanisch mit offener Liste, Koreanisch mit der
-    # Silbe im Bau, Chinesisch mit der Liste fuer zhong, und eine
-    # Auswahl, die bis zum Bestaetigen stehen bleibt. Dafuer braucht es
-    # eine Schrift mit CJK-GLYPHEN in TrueType-Umrissen; DejaVu hat
-    # keine, und ein Beleg aus leeren Kaesten belegt nichts. Fehlt sie,
-    # ist der Lauf NICHT bestanden -- dieselbe Regel wie bei $SCHRIFT.
-    # (Noto Sans CJK taugt nicht: CFF-Umrisse, die lib/font/ttf.fi
-    # benannt ablehnt.) Das Programm prueft selbst, dass jedes gezeigte
-    # Zeichen eine Glyphe hat, dass nichts ueberlappt und nichts aus
-    # seinem Kasten laeuft, und schreibt sonst kein PNG.
+    # THE INPUT METHOD (round IME, 23.09.2026). Four fields in the middle of
+    # an input -- Japanese with open list, Korean with the
+    # syllable under construction, Chinese with the list for zhong, and a
+    # selection that stays standing until confirmed. For that it needs
+    # a font with CJK GLYPHS in TrueType outlines; DejaVu has
+    # none, and a proof of empty boxes proves nothing. If it is missing,
+    # the run has NOT passed -- the same rule as for $SCHRIFT.
+    # (Noto Sans CJK is no good: CFF outlines, which lib/font/ttf.fi
+    # rejects by name.) The program itself checks that every shown
+    # character has a glyph, that nothing overlaps and nothing runs out of
+    # its box, and otherwise writes no PNG.
     SCHRIFT_CJK="${SCHRIFT_CJK:-/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc}"
     if [ ! -r "$SCHRIFT_CJK" ]; then
         echo "  FEHLER: die CJK-Schrift \"$SCHRIFT_CJK\" ist nicht lesbar."
