@@ -329,7 +329,7 @@ ink on Malta afterwards, **0 before**.
   fn main() -> i32 { io.fmt_print_line(f"{say(true)} {say(false)}")  return 0 }
   ```
 
-  **Fixed in round GAPS (branch `runde-luecken`, docs/LUECKEN.md A10).**
+  **Fixed in round GAPS (branch `runde-luecken`, docs/GAPS.md A10).**
   The interpolation was only where it showed: the octets of a `str`
   literal were written into the frame of the function that spelled it, so
   `say` returned the address of a dead frame on EVERY level -- the

@@ -1021,7 +1021,7 @@ for f in baum2.spalte(.flags) { ... }
   `lower_match.rs` were converted. Introducing a second arrangement now means:
   add a case distinction **in this one module**.
 * **And the rule is enforced, not merely written down.**
-  `tools/schichten/run.sh` (section 7 of `test.sh`) checks that `Op::PtrAdd`
+  `tools/layers/run.sh` (section 7 of `test.sh`) checks that `Op::PtrAdd`
   outside `layout.rs` is only built in the one helper function `ptradd_const`,
   that the direct calls to it are exclusively aggregate hand-overs marked
   `// ABI-Wortkopie` (not field accesses), and that no field offset is computed
@@ -1170,7 +1170,7 @@ irreversible rules) and things that come on top later.
 | 5 | **The speed of debug builds** | **done 2026-08-14:** the registry `PASSES` with labels, `--list-passes`, `--no-pass=`, `--opt-level=`; measured **2.06x** | the forbidden passes do not exist at all yet; `--release-safe` = `--release-fast` as long as there are no run-time checks | **FOUNDATION** done | done / 3 |
 | 6 | **In-place initialization** | **Write the result location down as a guarantee** -- already implemented for aggregate returns (`lower.rs:604`, checked), missing for literals and `init` | the `init` expression with partial cleanup, `#[no_move]` | **FOUNDATION** (expensive, but cheapest now) | 2 -> 3 |
 | 7 | **Comptime + reflection** | **done 2026-08-14:** `Checker::add_items` + 3 tests; FIR stays interpretable | the `comptime` interpreter, `reflect.*`, `emit`, build scripts | **FOUNDATION** done | done / 3 |
-| 8 | **Data layout / SoA** | **done 2026-08-14:** `layout.rs` with four accessors, the architecture guard `tools/schichten/run.sh` in `test.sh` | `SoaVec[T]`, `#[layout(soa)]`, `#[bitfeld]`, `#[klein(N)]` | **FOUNDATION** done | done / 3-4 |
+| 8 | **Data layout / SoA** | **done 2026-08-14:** `layout.rs` with four accessors, the architecture guard `tools/layers/run.sh` in `test.sh` | `SoaVec[T]`, `#[layout(soa)]`, `#[bitfeld]`, `#[klein(N)]` | **FOUNDATION** done | done / 3-4 |
 | 9 | **Hot reload** | **nothing** -- only do not rule it out | stage B (reloading data), possibly `#[hot]` | can be retrofitted | 4 / no date |
 | -- | *(already decided)* opt-in GC, WTF-16, constant time, unwinding | see `SPEC.md` 3, 8, 9, 5.3 | -- | **FOUNDATION** | 2-4 |
 
@@ -1193,7 +1193,7 @@ almost nothing today, because they are architectural decisions and not features:
    result location was already present for aggregate returns and is now written
    down as a guarantee and secured with `tools/result_location/run.sh`; the
    separation of field access sits in `compiler/src/layout.rs` and is enforced
-   by `tools/schichten/run.sh`. It was worth doing that while `lower.rs` has
+   by `tools/layers/run.sh`. It was worth doing that while `lower.rs` has
    1,500 lines and not 15,000 -- the conversion came to about 30 lines.
 
 **Four things can wait** -- they are additive:

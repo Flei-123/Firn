@@ -286,7 +286,7 @@ impl<'a> Lower<'a> {
     /// **Do not use for field accesses** — `layout.rs` exists for that
     /// (`field_addr`, `field_addr_at`, `elem_addr`, `elem_addr_const`).
     /// Direct calls are allowed for ABI word copies only and are marked with
-    /// `// ABI-Wortkopie`; `tools/schichten/run.sh` checks that.
+    /// `// ABI-Wortkopie`; `tools/layers/run.sh` checks that.
     pub(crate) fn ptradd_const(&mut self, base: Val, off: u64) -> Val {
         if off == 0 {
             return base;

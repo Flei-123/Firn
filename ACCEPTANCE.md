@@ -546,7 +546,7 @@ reachable at all later on (`DESIGN_GOALS.md` 10):
 | Build stages `--opt-level=dev/dev-fast/release-safe/release-fast` | **`[x]`** | `bash tools/build_stages/run.sh 3` -> **dev-fast 2.06x**, dev 10.54x against release-fast |
 | Result-location guarantee for aggregate returns | **`[x]`** | `bash tools/result_location/run.sh` -> 1 MB structure, `baue` has a 224 byte frame, no bulk copy |
 | Result location for struct/array literals and `init` | **`[~]`** | literals already write into the destination field by field (`lower.rs: write_into`); written into SPEC as a guarantee, `init` does not exist yet |
-| Field access separated from storage location (precondition for SoA) | **`[x]`** | `compiler/src/layout.rs` (4 accessors); `bash tools/schichten/run.sh` enforces it, the counter-check with a deliberate violation triggers |
+| Field access separated from storage location (precondition for SoA) | **`[x]`** | `compiler/src/layout.rs` (4 accessors); `bash tools/layers/run.sh` enforces it, the counter-check with a deliberate violation triggers |
 | Checking phases re-entrant (precondition for `comptime emit`) | **`[x]`** | `Checker::add_items` (`sema.rs`); 3 tests: an addition reaches the first pass, an unknown name is caught, a duplicated `main` is caught |
 | `!T` + `#[must_consume]` | **`[~]`** | `#[must_consume]` done (`firnc --list-attrs`, `tests/130_must_consume.fi`, 5 negative tests); `!T` is still outstanding |
 | Symbol naming scheme with a version slot | **`[x]`** | `modules::symbol` (`_F0.<name>`, room for `.v<n>`); `bash tools/symbole/run.sh` checks it against the real symbol table |
@@ -565,7 +565,7 @@ Six foundation items from `DESIGN_GOALS.md` 10.4 -- **all six done**:
 |---|---|---|
 | 1 | Pass registry with the label *debug-preserving* + four build stages | `firnc --list-passes`; `tools/build_stages/run.sh` -> **dev-fast 2.06x** |
 | 2 | Result-location guarantee | `tools/result_location/run.sh` -> 1 MB structure, `baue` 224 B frame |
-| 3 | Field access separated from storage location | `compiler/src/layout.rs`; `tools/schichten/run.sh` |
+| 3 | Field access separated from storage location | `compiler/src/layout.rs`; `tools/layers/run.sh` |
 | 4 | `#[must_consume]` + attribute system | `firnc --list-attrs`; `tests/130_*`, 5 negative tests |
 | 5 | Symbol naming scheme with a version slot | `modules::symbol`; `tools/symbole/run.sh` |
 | 6 | Checking phases re-entrant | `Checker::add_items`; 3 tests in `sema.rs` |

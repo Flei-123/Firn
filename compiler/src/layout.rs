@@ -21,7 +21,7 @@
 //! # Architecture rule
 //!
 //! Outside this module nobody in the lowering computes `field.offset` and
-//! nobody builds element addresses by hand. `tools/schichten/run.sh` checks
+//! nobody builds element addresses by hand. `tools/layers/run.sh` checks
 //! that and is part of `test.sh`.
 //!
 //! # What is (still) NOT here

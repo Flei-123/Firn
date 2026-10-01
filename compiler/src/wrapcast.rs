@@ -12,7 +12,7 @@
 //! panics. That is right for a value that is supposed to fit -- and wrong
 //! for the places where dropping the high bits IS the point: a hash, a
 //! checksum, a pixel packed into a word, an `u32` bit pattern read as
-//! `i32` (certus `paint/ico.fi:99`, docs/LUECKEN.md B12). Those had to be
+//! `i32` (certus `paint/ico.fi:99`, docs/GAPS.md B12). Those had to be
 //! written with masks (`(x & 255) as u8`) or not at all. `+% -% *%` exist
 //! for exactly that reason on the arithmetic side (SPEC 13, item L9);
 //! `as%` is the same promise for the conversion: the programmer says the

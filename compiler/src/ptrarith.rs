@@ -9,7 +9,7 @@
 //!
 //! Until this round every one of these was written by hand through an
 //! integer: `((p as usize) + 8) as *mut i32` (certus `anim/mix.fi:298`,
-//! `css/cascade.fi:2297`, docs/LUECKEN.md B13). The `8` is the element size
+//! `css/cascade.fi:2297`, docs/GAPS.md B13). The `8` is the element size
 //! done in the head -- change the element type and the offset is silently
 //! wrong. The operator does the multiplication itself.
 //!

@@ -2323,7 +2323,7 @@ R3. **`-x` works on `f64`.** 14.1.f64 named it as implemented and it was
     (`tests/neg/1248_f64_has_no_bitnot.fi`).
 
 
-#### 14.1.gaps -- what round GAPS added (docs/LUECKEN.md)
+#### 14.1.gaps -- what round GAPS added (docs/GAPS.md)
 
 G1. **`__sqrt(x)`** -- `f64 -> f64` / `f32 -> f32`, ONE instruction
     (`sqrtsd`/`sqrtss`/`fsqrt`), exact by IEEE 754. `tests/1653_sqrt_instruction.fi`.

@@ -17,7 +17,7 @@
 #   6. Proof of the result-location guarantee (tools/result_location/run.sh:
 #      frame sizes in the emitted assembly).
 #   7. Architecture check: field access is separated from the memory location
-#      (tools/schichten/run.sh, a precondition for SoA).
+#      (tools/layers/run.sh, a precondition for SoA).
 #   8. Symbol naming scheme: reserved prefix, room for the
 #      ABI version, modules free of collisions (tools/symbole/run.sh).
 #   8b. The atomic primitive `__atomic_add` really produces a
@@ -407,12 +407,12 @@ else
 fi
 
 echo "== 7. architecture: field access <-> memory location separated =="
-bash tools/schichten/run.sh > "$WORK/layers.log" 2>&1 && SCRC=0 || SCRC=$?
+bash tools/layers/run.sh > "$WORK/layers.log" 2>&1 && SCRC=0 || SCRC=$?
 if [ "$SCRC" -eq 0 ]; then
     ok
     tail -1 "$WORK/layers.log" | sed 's/^/   /'
 else
-    bad "tools/schichten/run.sh failed (see .test-work/layers.log)"
+    bad "tools/layers/run.sh failed (see .test-work/layers.log)"
     tail -20 "$WORK/layers.log" | sed 's/^/   /'
 fi
 

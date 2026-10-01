@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-# tools/fui/pinyin_tabelle.py -- ERZEUGT lib/fui/pinyin.fi AUS DER UNIHAN-DATENBANK.
+# tools/fui/pinyin_table.py -- ERZEUGT lib/fui/pinyin.fi AUS DER UNIHAN-DATENBANK.
 #
 # WARUM ES DIESES SKRIPT GIBT. Chinesisch laesst sich nicht rechnen wie
 # Hangul und nicht ueber eine Handvoll Regeln abbilden wie Romaji: zu
@@ -25,7 +25,7 @@
 # liefert die Plattform-Eingabemethode, nicht diese Tabelle.
 #
 # Aufruf (auf einem Debian mit dem Paket unicode-data):
-#   python3 tools/fui/pinyin_tabelle.py > lib/fui/pinyin.fi
+#   python3 tools/fui/pinyin_table.py > lib/fui/pinyin.fi
 import bz2, re, sys, unicodedata, collections
 
 QUELLE = "/usr/share/unicode/"
@@ -77,7 +77,7 @@ aus = sys.stdout
 aus.write("""// SPDX-License-Identifier: MPL-2.0
 // lib/fui/pinyin.fi -- DIE SILBENTABELLE DER EINGEBAUTEN PINYIN-EINGABE.
 //
-// DIESE DATEI IST ERZEUGT. Sie entsteht mit tools/fui/pinyin_tabelle.py
+// DIESE DATEI IST ERZEUGT. Sie entsteht mit tools/fui/pinyin_table.py
 // aus Unihan (Unicode 15.0, Feld kHanyuPinlu), und wer sie aendern will,
 // aendert das Skript und nicht diese Datei -- sonst stimmt beim naechsten
 // Erzeugen etwas anderes, als hier stand. Die Daten stehen unter der

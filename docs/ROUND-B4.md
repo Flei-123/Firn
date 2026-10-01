@@ -4,7 +4,7 @@ Branch `runde-b4-barrier` (worktree `/root/firn-b4`), based on
 `runde-luecken` (460cbfcb). Not merged. Everything below is measured on
 this machine (AMD EPYC 7571, Linux x86_64, host under foreign load).
 
-Gap B4 of `docs/LUECKEN.md`: every store of a `Gc[T]` pointer into a heap
+Gap B4 of `docs/GAPS.md`: every store of a `Gc[T]` pointer into a heap
 field was a CALL of `__gc_barrier(field, value)`. On `release-*` the
 inliner removed it; on `dev-fast` -- the level Certus is built at (B2) --
 and in `firnc1` it stayed a real call.

@@ -259,7 +259,7 @@ try:
     ok = d.warte(lambda z: (d.letzter_zustand() or [0, 0])[1] == 216)
     chk("L3", "3 Rasten Rad ueber der Liste: 216", ok is not None,
         d.letzter_zustand()[1], 216)
-    bild_r, png_r = xwd(srv, wid, "x11demo-1x-gerollt")
+    bild_r, png_r = xwd(srv, wid, "x11demo-1x-scrolled")
 
     # ---------------------------------------------- TASTATUR
     srv.run("xdotool", "key", "End")
@@ -406,7 +406,7 @@ finally:
     srv2.zu()
 
 print("Belege: %s" % ", ".join(os.path.join(BELEG, n) for n in
-      ("x11demo-1x.png", "x11demo-1x-gerollt.png", "x11demo-900x600.png",
+      ("x11demo-1x.png", "x11demo-1x-scrolled.png", "x11demo-900x600.png",
        "x11demo-2x.png")))
 if fehler:
     print("X11 LIVE NOT PASSED (%d von %d falsch)" % (fehler, zahl))

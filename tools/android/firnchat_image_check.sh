@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MPL-2.0
-# tools/android/firnchat_bild_check.sh -- FIRNCHAT's photos on the emulator,
+# tools/android/firnchat_image_check.sh -- FIRNCHAT's photos on the emulator,
 # the way a person sends one: the picture button opens the system's chooser
 # (camera + picker), a photo chosen there WAITS as a thumbnail over the
 # input line (nothing is sent yet), the x takes it away again, text can be
@@ -10,7 +10,7 @@
 # painted in its bubble. The camera works the same way; Back in the chooser
 # sends nothing. (lib/plat/android/pick.fi, FIRNCHAT src/gui/app.fi)
 #
-#   bash tools/android/firnchat_bild_check.sh <firnchat checkout> <apk>
+#   bash tools/android/firnchat_image_check.sh <firnchat checkout> <apk>
 #
 # The APK has to be built with --push --pick. Own relay on RELAY_PORT
 # (default 7783) with its own picture directory, throw-away identities.

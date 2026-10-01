@@ -140,7 +140,7 @@ forever.
 ```sh
 bash tools/android/build.sh <firnchat>/src/gui/app.fi --name FirnChat \
     --package org.firn.firnchat --push --pick --args-file firnchat-args.txt
-bash tools/android/firnchat_bild_check.sh <firnchat> <apk>   # 25 checks
+bash tools/android/firnchat_image_check.sh <firnchat> <apk>   # 25 checks
 ```
 
 A NativeActivity cannot receive another app's answer (onActivityResult is a

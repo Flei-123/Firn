@@ -117,7 +117,7 @@ pub fn register(name: &str, mutable: bool, bytes: Vec<u8>, align: u64) {
 /// that spelled the literal (round 70, "the honest price"), which made
 /// `fn f() -> str { return "x" }` hand out the address of a dead frame: the
 /// caller read whatever the next call had put there (`f"{f()}"` printed
-/// zeros under `--no-opt`, docs/LUECKEN.md B18). A literal is a constant;
+/// zeros under `--no-opt`, docs/GAPS.md B18). A literal is a constant;
 /// its octets now live as long as the program.
 ///
 /// The name carries a `#`, which no Firn identifier can, so it can never

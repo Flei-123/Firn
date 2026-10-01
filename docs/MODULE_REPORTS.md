@@ -797,7 +797,7 @@ keeps its object alive. `docs/reports/dom.md` describes both with measurements.
 RUN.md                   how to build everything, run it and measure it
 SPEC.md, ROADMAP.md      language specification and roadmap (the contract)
 tools/build_stages/         measures dev / dev-fast / release against each other
-tools/schichten/         architecture guard: field access <-> storage location
+tools/layers/         architecture guard: field access <-> storage location
 tools/result_location/       checks the result-location guarantee in the assembly
 DESIGN_GOALS.md          10 foundation decisions (async colours, fallible
                          allocation, capabilities, ABI, debug build, in-place
@@ -1170,7 +1170,7 @@ call sites.
 The rule is **enforced**, not merely written down:
 
 ```
-$ bash tools/schichten/run.sh
+$ bash tools/layers/run.sh
 OK: field access and memory location separated (4 entry points in layout.rs, no bypass).
 ```
 

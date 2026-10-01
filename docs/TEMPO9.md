@@ -109,7 +109,7 @@ hat.
 | **nach TEMPO 9** | **146,3 Mio** |
 
 `mp3_decode_frame` faellt von 17,2 auf 3,0 Mio. Die PCM-Ausgabe ist
-bitgleich. `tests/1700_memset_schleife.fi` prueft die Raender: genau `n`
+bitgleich. `tests/1700_memset_loop.fi` prueft die Raender: genau `n`
 Oktette null, davor und dahinter unberuehrt, Laenge 0 schreibt nichts, ein
 Wert ungleich null bleibt eine Schleife, und eine erst zur Laufzeit bekannte
 Laenge funktioniert genauso — der letzte Punkt ist der wichtigste, weil der
