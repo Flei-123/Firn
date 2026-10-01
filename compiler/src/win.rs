@@ -230,7 +230,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // `/proc/self/environ` does not exist here; the environment comes as
     // a block of UTF-16 from kernel32.
     ("FreeEnvironmentStringsW", "KERNEL32.dll", 1),
-    // --- user32/gdi32: was die Groessenaenderung und die Leiste brauchen
+    // --- user32/gdi32: what resizing and the bar need
     ("GetSysColor", "USER32.dll", 1),
     // --- user32: synthetic input (lib/input/sendinput.fi) -------------
     ("SendInput", "USER32.dll", 3),
@@ -240,22 +240,22 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // exported under, and Microsoft's own header only gives it the other
     // one through a macro.
     ("SystemFunction036", "ADVAPI32.dll", 2),
-    // --- advapi32: die Systemeinstellung hell/dunkel -------------------
+    // --- advapi32: the system setting light/dark -----------------------
     // HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize,
-    // Wert `AppsUseLightTheme`. `RegGetValueW` macht Oeffnen, Lesen und
-    // Schliessen in einem Aufruf.
+    // value `AppsUseLightTheme`. `RegGetValueW` does opening, reading and
+    // closing in one call.
     ("RegGetValueW", "ADVAPI32.dll", 7),
-    // --- dwmapi: DIE TITELLEISTE (Runde CERTUS C-039) -----------------
-    // Justin, 18.09.2026: "die fensterleiste oben passt auch nicht zum
-    // style". Certus malte seine Schale dunkel, waehrend Windows
-    // darueber die helle Titelleiste zeichnete.
+    // --- dwmapi: THE TITLE BAR (round CERTUS C-039) -------------------
+    // Justin, 18.09.2026: "the window bar at the top does not fit the
+    // style either". Certus painted its shell dark, while Windows
+    // drew the light title bar above it.
     //
-    // `DwmSetWindowAttribute` faerbt die Leiste, die das SYSTEM
-    // zeichnet -- Merkmal 20 (DWMWA_USE_IMMERSIVE_DARK_MODE, ab
-    // Windows 10 1809; auf den Staenden davor 19) und Merkmal 35
-    // (DWMWA_CAPTION_COLOR, ab Windows 11) fuer die genaue Farbe.
-    // Die Systemknoepfe, das Ziehen und Aero-Snap bleiben dabei
-    // Windows' Sache. Vier Argumente: hwnd, Merkmal, Zeiger, Laenge.
+    // `DwmSetWindowAttribute` colours the bar that the SYSTEM
+    // draws -- attribute 20 (DWMWA_USE_IMMERSIVE_DARK_MODE, from
+    // Windows 10 1809; 19 on the builds before) and attribute 35
+    // (DWMWA_CAPTION_COLOR, from Windows 11) for the exact colour.
+    // The system buttons, dragging and Aero Snap remain
+    // Windows' business. Four arguments: hwnd, attribute, pointer, length.
     ("DwmSetWindowAttribute", "dwmapi.dll", 4),
 ];
 
