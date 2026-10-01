@@ -114,11 +114,11 @@ instructions says where the work lies: **204 `mov`, 31 `add`, 27 `lea`** against
 C gets by with less there, because `gcc` does two things that Firn does not
 do yet:
 
-1. **Zeiger weiterschalten statt Adressen neu rechnen** (Induktionsvariablen
-   mit Staerkereduktion auf der ADRESSE, nicht nur auf der Multiplikation —
-   die allein hat Runde TEMPO 3 gemessen und wieder verworfen).
-2. **Lebensdauern an Aufrufen zerschneiden**, damit ein Zeiger, der einen
-   Aufruf ueberlebt, nicht bei jedem Zugriff neu aus dem Rahmen geholt wird.
+1. **Advance pointers instead of recalculating addresses** (induction variables
+   with strength reduction on the ADDRESS, not only on the multiplication —
+   round TEMPO 3 measured that alone and discarded it again).
+2. **Cut lifetimes at calls**, so that a pointer that survives a
+   call is not fetched anew from the frame at every access.
 
-Beides ist Arbeit am Zuteiler, nicht an der Rechnung — und der naechste
-grosse Brocken.
+Both are work on the allocator, not on the calculation — and the next
+big chunk.
