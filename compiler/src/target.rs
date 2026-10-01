@@ -99,9 +99,9 @@ impl Target {
 
 thread_local! {
     static ACTIVE: Cell<Target> = const { Cell::new(Target::X86_64) };
-    /// RUNDE TEMPO 2 -- `--cpu=avx`. Aus, bis es einer einschaltet: ein
-    /// Programm, das mit AVX uebersetzt ist, laeuft auf einer Maschine ohne
-    /// AVX gar nicht, und die Grundausstattung von x86-64 ist SSE2.
+    /// ROUND TEMPO 2 -- `--cpu=avx`. Off until someone switches it on: a
+    /// program that is translated with AVX does not run at all on a machine without
+    /// AVX, and the baseline of x86-64 is SSE2.
     static AVX: Cell<bool> = const { Cell::new(false) };
     /// ROUND MOBIL (Certus): position independent code for a shared
     /// library (`.so`). Default OFF — the path for programmes and for
@@ -143,11 +143,11 @@ pub fn cpu_set(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Darf die Dreioperandenform (VEX) benutzt werden?
+/// May the three-operand form (VEX) be used?
 ///
-/// Umgebungsvariable `FIRN_CPU=avx` wirkt wie die Schalterstellung -- damit
-/// laesst sich die volle Testreihe einmal in jeder Stufe fahren, ohne jedes
-/// Werkzeug im Baum anzufassen.
+/// The environment variable `FIRN_CPU=avx` acts like the switch position -- with it
+/// the full test series can be run once in every stage without touching every
+/// tool in the tree.
 pub fn avx() -> bool {
     if AVX.with(|a| a.get()) {
         return true;

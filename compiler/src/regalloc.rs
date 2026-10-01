@@ -2796,17 +2796,16 @@ pub fn allocate(f: &Func) -> Alloc {
     alloc.frame = frame;
     alloc.saved = used_saved.iter().copied().zip(slots.iter().map(|(_, o)| *o)).collect();
 
-    // RUNDE TEMPO 12: die Sicherungen je Aufruf. Nur Werte aus `save_set`,
-    // die wirklich ein caller-saved Register behalten haben, und nur an
-    // Aufrufen echt innerhalb ihres Intervalls. Das Intervall ist eine
-    // Obermenge der Lebensdauer; ein Wert, der am Aufruf schon tot ist, wird
-    // umsonst gesichert, aber nie falsch: das Register gehoert ihm auf dem
-    // ganzen Intervall allein.
+    // ROUND TEMPO 12: the saves per call. Only values from `save_set`
+    // that really kept a caller-saved register, and only at
+    // calls really inside their interval. The interval is a
+    // superset of the lifetime; a value that is already dead at the call is
+    // saved for nothing, but never wrongly: the register belongs to it alone
+    // over the whole interval.
     //
-    // EINE AUSNAHME ist Pflicht: das Ziel des Aufrufs. Ist es mit einem
-    // gesicherten Wert verschmolzen (`x = f(x)` in einer Schleife), steht es
-    // im selben Register, und das Zurueckholen wuerde das Ergebnis
-    // ueberschreiben.
+    // ONE EXCEPTION is mandatory: the target of the call. If it is merged with
+    // a saved value (`x = f(x)` in a loop), it stands
+    // in the same register, and restoring would overwrite the result.
     if !save_set.is_empty() {
         let mut sv: Vec<Val> = save_set.iter().copied().collect();
         sv.sort_unstable();
@@ -2818,15 +2817,15 @@ pub fn allocate(f: &Func) -> Alloc {
             let mut list: Vec<(&'static str, u64, FTy)> = Vec::new();
             for &v in &sv {
                 let vi = v as usize;
-                // Mit Luecken (TEMPO 13) gehoert das Register dem Wert nur
-                // auf seinen Stuecken -- gesichert wird nur, wo der Aufruf
-                // echt IN einem Stueck liegt. Sonst koennte das
-                // Zurueckholen einen anderen Wert ueberschreiben.
+                // With gaps (TEMPO 13) the register belongs to the value only
+                // on its pieces -- saving happens only where the call
+                // really lies IN a piece. Otherwise the
+                // restore could overwrite another value.
                 let inside = if holes {
-                    // `a <= p`: ein Stueck, das AM Aufruf beginnt, lebt in
-                    // den Block hinein (Blockanfang == Stelle des Aufrufs).
-                    // Ist der Wert das Ziel des Aufrufs, faengt das die
-                    // Ausnahme `dst_reg` unten ab.
+                    // `a <= p`: a piece that begins AT the call lives into
+                    // the block (block start == place of the call).
+                    // If the value is the target of the call, the exception
+                    // `dst_reg` below catches that.
                     segs[vi].iter().any(|&(a, z)| a <= p && p < z)
                 } else {
                     start[vi] < p && p < end[vi]
@@ -2925,12 +2924,12 @@ struct Ra<'a> {
     /// value -> source value. The rest of the computation sits in the memory
     /// operand of the following access.
     preloader: HashMap<Val, Val>,
-    /// RUNDE TEMPO 3 -- Summen, in denen die Skalierung des Index steckt:
-    /// Wert -> (Grundregister, Indexregister, Faktor). Ein einziges `lea`.
+    /// ROUND TEMPO 3 -- sums in which the scaling of the index sits:
+    /// value -> (base register, index register, factor). A single `lea`.
     scale: HashMap<Val, (&'static str, &'static str, i64)>,
-    /// RUNDE TEMPO 2 -- die UEBERGABE. Gleitzahlen, die kein Register
-    /// bekommen haben, deren einziger Leser aber kurz darauf im selben Block
-    /// steht: sie gehen durch `xmm2`/`xmm3` statt durch den Rahmen. Siehe
+    /// ROUND TEMPO 2 -- the HANDOVER. Floating-point numbers that got no register
+    /// but whose only reader stands shortly after in the same block:
+    /// they go through `xmm2`/`xmm3` instead of through the frame. See
     /// `fp_handover`.
     fp_hand: HashMap<Val, &'static str>,
 }
@@ -3037,14 +3036,14 @@ fn foldable_addresses(
     let mut out: HashMap<Val, Address> = HashMap::new();
     let mut away: HashSet<Val> = HashSet::new();
     let mut before: HashMap<Val, Val> = HashMap::new();
-    // RUNDE TEMPO 3 -- die SKALIERUNG IN DIE ADRESSRECHNUNG.
+    // ROUND TEMPO 3 -- the SCALING INTO THE ADDRESS CALCULATION.
     //
-    // Ein Basiszeiger, den MEHRERE Zugriffe benutzen, kann nicht in den
-    // Operanden eines einzelnen Befehls wandern (dafuer ist `out` da). Die
-    // Skalierung des Index aber schon: `lea d, [base + idx*4]` rechnet
-    // dasselbe wie `lea t, [idx*4]` gefolgt von `lea d, [base + t]` -- in
-    // einem Befehl statt zwei. Gemessen in der heissen Schleife der
-    // Synthesefilterbank: dort steht dieses Paar zweimal je Durchlauf.
+    // A base pointer that SEVERAL accesses use cannot move into the
+    // operand of a single instruction (that is what `out` is for). The
+    // scaling of the index can, though: `lea d, [base + idx*4]` calculates
+    // the same as `lea t, [idx*4]` followed by `lea d, [base + t]` -- in
+    // one instruction instead of two. Measured in the hot loop of the
+    // synthesis filter bank: there this pair stands twice per iteration.
     let mut scale: HashMap<Val, (&'static str, &'static str, i64)> = HashMap::new();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
         return (out, away, before, scale);
@@ -3366,15 +3365,15 @@ fn foldable_addresses(
             }
         }
     }
-    // ---- zweiter Durchgang: die Skalierung in die Summe ziehen ---------
+    // ---- second pass: pull the scaling into the sum --------------------
     //
-    // Bedingungen, alle noetig:
-    //   * die Summe ist eine Adressrechnung mit voller Breite und hat selbst
-    //     KEINE Faltung bekommen (sonst waere der Befehl schon weg),
-    //   * der skalierte Teil steht UNMITTELBAR davor und wird nur hier
-    //     gelesen -- dann darf er ganz entfallen, ohne dass sich an den
-    //     Lebensdauern etwas aendert,
-    //   * Grundwert und Index liegen in Registern.
+    // Conditions, all necessary:
+    //   * the sum is an address calculation of full width and has itself
+    //     received NO folding (otherwise the instruction would already be gone),
+    //   * the scaled part stands IMMEDIATELY before it and is read only here --
+    //     then it may be dropped entirely without anything changing in the
+    //     lifetimes,
+    //   * base value and index lie in registers.
     if std::env::var_os("FIRN_NO_SKALA").is_none() {
         for b in &f.blocks {
             for (idx, i) in b.insts.iter().enumerate() {
@@ -3483,10 +3482,10 @@ impl<'a> Ra<'a> {
             Loc::Slot(off) => format!("{} [rbp-{}]", size_word(bits), off),
         }
     }
-    /// ROUND XMM3 -- der Operand eines Fliesskommawerts: entweder sein
-    /// `xmm`-Register oder sein Platz. SSE-Anweisungen nehmen den Speicher
-    /// als zweiten Operanden unmittelbar an, also braucht keiner der beiden
-    /// Faelle eine Hilfsanweisung.
+    /// ROUND XMM3 -- the operand of a floating-point value: either its
+    /// `xmm` register or its slot. SSE instructions accept memory
+    /// as second operand directly, so neither of the two
+    /// cases needs a helper instruction.
     fn fpo(&self, v: Val, single: bool) -> String {
         if let Some((label, _)) = self.a.fconst.get(&v) {
             return crate::fpool::operand(label, single);
@@ -3501,10 +3500,10 @@ impl<'a> Ra<'a> {
             }
         }
     }
-    // ---- RUNDE TEMPO 4: dieselben drei Helfer fuer `v128` ---------------
+    // ---- ROUND TEMPO 4: the same three helpers for `v128` ---------------
     //
-    // Unterschied zur Gleitzahl: sechzehn Oktette breit, und der Platz ist
-    // sechzehnfach ausgerichtet (`layout`), also darf `movaps` ihn lesen.
+    // Difference to the floating-point number: sixteen octets wide, and the slot is
+    // sixteen-fold aligned (`layout`), so `movaps` may read it.
     fn vo(&self, v: Val) -> String {
         match self.a.place(v) {
             Loc::Reg(r) => r.to_string(),
@@ -3534,8 +3533,8 @@ impl<'a> Ra<'a> {
             Loc::Slot(off) => e.line(&format!("movaps xmmword ptr [rbp-{}], {}", off, x)),
         }
     }
-    /// Den Wert in einem Register liefern -- entweder liegt er schon in einem,
-    /// oder er kommt ins Kratzregister.
+    /// Deliver the value in a register -- either it already lies in one,
+    /// or it goes into the scratch register.
     fn v_reg(&self, e: &mut Emitter, v: Val, scratch: &'static str) -> String {
         let o = self.vo(v);
         if is_xmm_reg(&o) {
@@ -3544,8 +3543,8 @@ impl<'a> Ra<'a> {
         e.line(&format!("movaps {}, {}", scratch, o));
         scratch.to_string()
     }
-    /// Den Wert in ein bestimmtes `xmm` holen (fuer die Kratzregister der
-    /// Umwandlungen und Vergleiche).
+    /// Fetch the value into a specific `xmm` (for the scratch registers of the
+    /// conversions and comparisons).
     fn fp_into(&self, e: &mut Emitter, x: &str, v: Val, single: bool) {
         let o = self.fpo(v, single);
         if o == x {
@@ -3557,8 +3556,8 @@ impl<'a> Ra<'a> {
             e.line(&format!("{} {}, {}", if single { "movss" } else { "movsd" }, x, o));
         }
     }
-    /// Das Ergebnis aus einem `xmm` an seinen Platz bringen -- wenn der Wert
-    /// selbst in einem Register lebt, ist das eine Kopie, sonst ein Schreiben.
+    /// Bring the result from an `xmm` to its slot -- if the value
+    /// itself lives in a register, that is a copy, otherwise a write.
     fn fp_out(&self, e: &mut Emitter, d: Val, x: &str, single: bool) {
         if let Some(r) = self.fp_hand.get(&d) {
             if x != *r {
@@ -3581,8 +3580,8 @@ impl<'a> Ra<'a> {
             )),
         }
     }
-    /// Das Register, IN dem gerechnet wird: das Zielregister, wenn es eines
-    /// hat, sonst das Kratzregister `xmm0`.
+    /// The register IN which the calculation is done: the destination register, if it
+    /// has one, otherwise the scratch register `xmm0`.
     fn fp_work(&self, d: Val) -> &'static str {
         if let Some(r) = self.fp_hand.get(&d) {
             return *r;
@@ -3593,29 +3592,28 @@ impl<'a> Ra<'a> {
         }
     }
 
-    /// ROUND XMM3 -- der Speicherort, auf den ein Zeigerwert zeigt.
+    /// ROUND XMM3 -- the memory location a pointer value points to.
     ///
-    /// Zwei Faelle, und der zweite war der Fehler dieser Runde: ein
-    /// `alloca`, dessen Adresse fest im Rahmen steht (`frame_addr`), hat
-    /// GAR KEINEN Platz, in dem die Adresse stuende -- sie wird an jeder
-    /// Verwendung als `[rbp-off]` eingesetzt. Wer sie mit `load_full` in ein
-    /// Register holen will, reads einen nie beschriebenen Platz und springt
-    /// ins Nichts.
+    /// Two cases, and the second was the bug of this round: an
+    /// `alloca` whose address stands fixed in the frame (`frame_addr`) has
+    /// NO slot at all in which the address would stand -- it is inserted at every
+    /// use as `[rbp-off]`. Whoever wants to fetch it into a register with `load_full`
+    /// reads a slot that was never written and jumps into nothing.
     fn addr_mem(&self, e: &mut Emitter, v: Val) -> String {
-        // Eine Adressrechnung, die ganz in den Speicherzugriff gewandert ist
-        // (`foldable_addresses`), steht in KEINEM Register und in keinem
-        // Platz -- sie ist nur noch dieser Text. Wer sie stattdessen laedt,
-        // reads einen nie beschriebenen Platz.
+        // An address calculation that has moved entirely into the memory access
+        // (`foldable_addresses`) stands in NO register and in no
+        // slot -- it is only this text. Whoever loads it instead
+        // reads a slot that was never written.
         if let Some(a) = self.offset.get(&v) {
             return a.text();
         }
         if let Some(off) = self.a.frame_addr.get(&v) {
             return format!("[rbp-{}]", off);
         }
-        // RUNDE TEMPO 6: liegt die Adresse schon in einem Register, ist sie
-        // der Speicheroperand. Bis hierher wurde sie IMMER erst nach `rcx`
-        // kopiert -- ein `mov` vor jedem Zugriff, gemessen neun Stueck allein
-        // in `l3_dct3_9`.
+        // ROUND TEMPO 6: if the address already lies in a register, it is
+        // the memory operand. Until now it was ALWAYS copied to `rcx` first
+        // -- a `mov` before every access, measured nine of them in `l3_dct3_9`
+        // alone.
         if self.a.imm(v).is_none() && self.a.cell(v).is_none() && !self.a.alias.contains_key(&v) {
             if let Loc::Reg(r) = self.a.place(v) {
                 return format!("[{}]", r);
@@ -3671,11 +3669,11 @@ impl<'a> Ra<'a> {
     }
 }
 
-/// Lebt `v` unmittelbar NACH der Anweisung `ii` des Blocks `bi`?
+/// Does `v` live immediately AFTER instruction `ii` of block `bi`?
 ///
-/// Rueckwaertslauf vom Blockende: `live_out` ist der Anfang, jede
-/// Schreibstelle loescht, jede Lesestelle setzt. Innerhalb EINER Anweisung
-/// gewinnt das Lesen -- `v = v + 1` liest `v` vor dem Schreiben.
+/// Backward walk from the block end: `live_out` is the start, every
+/// write site deletes, every read site sets. Within ONE instruction
+/// the read wins -- `v = v + 1` reads `v` before the write.
 fn live_after(f: &Func, live: &Live, v: Val, bi: usize, ii: usize) -> bool {
     let b = &f.blocks[bi];
     let mut alive = live.live_out[bi].get(v as usize).copied().unwrap_or(true);
@@ -3700,13 +3698,12 @@ fn live_after(f: &Func, live: &Live, v: Val, bi: usize, ii: usize) -> bool {
     alive
 }
 
-/// Stoeren sich `a` und `b` (Chaitin)? Ja, sobald an einer Schreibstelle des
-/// einen der andere noch lebt. Die Kopie `ausnahme`, die `b` aus `a`
-/// schreibt, zaehlt nicht mit -- sie ist der Grund, aus dem verschmolzen
-/// wird.
+/// Do `a` and `b` interfere (Chaitin)? Yes, as soon as at a write site of
+/// the one the other still lives. The copy `exception` that writes `b` from `a`
+/// does not count -- it is the reason for merging.
 ///
-/// Geprueft werden nur die SCHREIBSTELLEN der beiden Werte; alles andere
-/// kann sie nicht gleichzeitig lebendig machen. Sie stehen fertig in
+/// Only the WRITE SITES of the two values are checked; nothing else
+/// can make them live at the same time. They stand ready in
 /// `defsites`.
 fn interferes(
     f: &Func,
@@ -3716,10 +3713,10 @@ fn interferes(
     b: Val,
     ausnahme: Option<(usize, usize)>,
 ) -> bool {
-    // Ein Parameter wird beim Eintritt geschrieben, ohne Anweisung. Dort
-    // duerfte der andere nicht schon leben -- was nur fuer einen Wert mit
-    // mehreren Schreibstellen ueberhaupt vorkommen kann. Einfacher und
-    // sicher: ein Parameter wird nicht verschmolzen.
+    // A parameter is written on entry, without an instruction. The other
+    // would not be allowed to live there already -- which can only occur for a value
+    // with several write sites at all. Simpler and
+    // safe: a parameter is not merged.
     let np = f.params.len() as Val;
     if a < np || b < np {
         return true;
@@ -3867,29 +3864,28 @@ fn weighted_len(asm: &str, fname: &str, depth: &[u32]) -> u64 {
 /// the function -- the finished text.
 fn emit_variant(f: &Func) -> Result<String, String> {
     let a0 = &allocate(f);
-    // RUNDE TEMPO 10 -- LEBENSDAUERN ZERSCHNEIDEN, NACHDEM MAN WEISS, WO ES
-    // KLEMMT.
+    // ROUND TEMPO 10 -- CUTTING LIFETIMES UP AFTER YOU KNOW WHERE IT
+    // PINCHES.
     //
-    // Der lineare Scan kennt je Wert EIN Intervall und EINEN Platz. Ein
-    // Zeiger, der am Anfang gesetzt und am Ende noch einmal gebraucht wird,
-    // belegt sein Register also ueber die ganze Funktion -- oder keines, und
-    // dann wird er in der heissen Schleife dazwischen bei JEDER Verwendung
-    // aus dem Rahmen geholt. Gemessen ueber den MP3-Dekoder: "aus dem Rahmen
-    // holen" war mit 10,0 von 137,7 Mio Befehlen der groesste Posten, der
-    // nach TEMPO 9 noch stand.
+    // The linear scan knows ONE interval and ONE slot per value. A
+    // pointer that is set at the beginning and needed once more at the end
+    // thus occupies its register over the whole function -- or none, and
+    // then in the hot loop in between it is fetched from the frame at EVERY use. Measured over the MP3 decoder: "fetch from the frame"
+    // was, with 10.0 of 137.7 million instructions, the biggest item that
+    // still stood after TEMPO 9.
     //
-    // `split::nach_zuteilung` setzt fuer genau diese Werte eine Kopie in den
-    // Vorkopf der Schleife und laesst den Rumpf die Kopie lesen. Das neue,
-    // kurze Intervall hat das Gewicht der Schleife und gewinnt sein Register
-    // meistens -- aus einem Holen je Durchlauf wird eines je Eintritt.
+    // `split::nach_zuteilung` puts a copy into the pre-header of the loop for exactly these values
+    // and lets the body read the copy. The new,
+    // short interval has the weight of the loop and mostly wins its register
+    // -- a fetch per iteration becomes one per entry.
     //
-    // ES WIRD ZWEIMAL ZUGETEILT, und das ist der Punkt: eine erste Fassung
-    // schnitt im Optimierer, also bevor jemand weiss, wer ueberhaupt ein
-    // Register bekommt, und war gemessen ZWEI PROZENT SCHLECHTER (137,7 ->
-    // 140,4). Wo der neue Wert auch nur einen Platz bekommt, zahlt man die
-    // Kopie und gewinnt nichts. Also erst zuteilen, dann fragen, dann
-    // schneiden -- und wenn beim zweiten Zuteilen kein einziger der neuen
-    // Werte ein Register bekommt, wird das Ergebnis verworfen.
+    // ALLOCATION HAPPENS TWICE, and that is the point: a first version
+    // cut in the optimiser, that is before anyone knows who gets a
+    // register at all, and was measured TWO PERCENT WORSE (137.7 ->
+    // 140.4). Where the new value gets only a slot, you pay for the
+    // copy and gain nothing. So first allocate, then ask, then
+    // cut -- and if in the second allocation not a single one of the new
+    // values gets a register, the result is discarded.
     let mut own: Option<(Func, Alloc)> = None;
     if std::env::var_os("FIRN_NO_SPLIT").is_none() && !debug_vars_active(f) {
         let in_frame = |v: Val| matches!(a0.loc(v), Loc::Slot(_))
@@ -3945,10 +3941,10 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
     let mut tmp = Emitter::default();
-    // RUNDE TEMPO 2: nur dieser Weg darf VEX schreiben (`--cpu=avx`). Der
-    // Grundweg bleibt bei SSE -- dort haelt `simd.rs` `v128`-Werte in den
-    // Registern, und eine Umschrift von `movss` auf `vmovaps` wuerde deren
-    // obere Haelfte ausloeschen.
+    // ROUND TEMPO 2: only this path may write VEX (`--cpu=avx`). The
+    // basic path stays with SSE -- there `simd.rs` holds `v128` values in the
+    // registers, and a rewrite of `movss` to `vmovaps` would wipe out their
+    // upper half.
     tmp.vex = crate::target::avx();
     if let Ok(nur) = std::env::var("FIRN_VEX_ONLY") {
         tmp.vex = tmp.vex && f.name.contains(&nur);
@@ -4416,15 +4412,15 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     // ROUND 71: `f32` too. The linear scan knows only the integer registers;
     // as long as that is so, EVERY function with floating point in it goes
     // through the base path (SPEC 14.1.f64, restriction F1).
-    // ROUND XMM3: Fliesskomma ist auf diesem Weg zuhause -- mit einer
-    // scharf gezogenen Grenze. Was die Ausgabe hier NICHT selbst kann,
-    // schickt die ganze Funktion weiterhin ueber den Grundweg:
+    // ROUND XMM3: floating point is at home on this path -- with a
+    // sharply drawn boundary. What the output cannot do ITSELF here
+    // still sends the whole function over the basic path:
     //
-    //   * `bool`-Umwandlung aus einer Gleitzahl (der Vergleich mit Null hat
-    //     bei NaN eine eigene Regel, die hier nicht steht),
-    //   * die GEPRUEFTE Umwandlung (`CheckedCast`) mit Gleitzahlen,
-    //   * `Select`, `Un`, `BinWrapSat` und Systemaufrufe mit Gleitzahlen,
-    //   * alles, was `v128` anfasst (schon oben ausgeschlossen).
+    //   * `bool` conversion from a floating-point number (the comparison with zero has
+    //     its own rule for NaN, which is not here),
+    //   * the CHECKED conversion (`CheckedCast`) with floating-point numbers,
+    //   * `Select`, `Un`, `BinWrapSat` and system calls with floating-point numbers,
+    //   * everything that touches `v128` (already excluded above).
     for b in &f.blocks {
         for i in &b.insts {
             match &i.op {
@@ -4438,10 +4434,10 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                         return Some("gepruefte Umwandlung mit Gleitzahl".into());
                     }
                 }
-                // ROUND XMM4: die Vorzeichenumkehr einer Gleitzahl kann
-                // dieser Weg selbst (ein Bit kippen, `xorps`/`xorpd`). `!`
-                // ist fuer Gleitzahlen ueberhaupt nicht definiert -- das
-                // faengt der Grundweg mit seiner Fehlermeldung ab.
+                // ROUND XMM4: the sign reversal of a floating-point number can be done by
+                // this path itself (flip a bit, `xorps`/`xorpd`). `!`
+                // is not defined for floating-point numbers at all -- the
+                // basic path catches that with its error message.
                 Op::Un(op, x) => {
                     let fp = f.val_ty(*x).is_float() || i.ty.is_float();
                     if fp && !matches!(op, UnOp::Neg) {
@@ -4467,18 +4463,18 @@ fn unsupported_basic(f: &Func) -> Option<String> {
             }
         }
     }
-    // ROUND 82 hat jede Funktion mit einem `v128` auf den Grundweg geschickt.
+    // ROUND 82 sent every function with a `v128` to the basic path.
     //
-    // RUNDE TEMPO 4 laesst eine ENGE Auswahl herein: die Befehle, die der
-    // Tondekoder braucht (`__v128_load`, `__v128_store`, `__v128_zero`,
-    // `addps`/`subps`/`mulps`, `pshufd`). Fuer sie steht die Ausgabe unten in
-    // diesem Weg, und dann bekommt auch der Rest der Funktion -- die ganze
-    // Adressrechnung -- ihre Registerzuteilung. Alles andere (Krypto,
-    // Byteschieben, die Ein- und Ausgaenge einzelner Spuren) geht weiterhin
-    // ueber den Grundweg mit dem Zwischenspeicher aus `simd.rs`.
+    // ROUND TEMPO 4 lets a NARROW selection in: the instructions that the
+    // sound decoder needs (`__v128_load`, `__v128_store`, `__v128_zero`,
+    // `addps`/`subps`/`mulps`, `pshufd`). For them the output stands below in
+    // this path, and then the rest of the function -- the whole
+    // address calculation -- gets its register allocation too. Everything else (crypto,
+    // byte shifting, the inputs and outputs of individual lanes) still goes
+    // over the basic path with the cache from `simd.rs`.
     //
-    // Ein `v128` als Parameter oder Rueckgabewert bleibt draussen: das waere
-    // Arbeit an der Aufrufkonvention, und der Dekoder braucht es nicht.
+    // A `v128` as parameter or return value stays outside: that would be
+    // work on the calling convention, and the decoder does not need it.
     if f.params.iter().any(|t| *t == FTy::V128) || f.ret == FTy::V128 {
         return Some("v128 as parameter or result".into());
     }
@@ -4503,8 +4499,8 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                         }
                     }
                     Op::Copy { .. } => {}
-                    // Laden und Schreiben eines ganzen Vektors -- kommt von
-                    // einer `alloca`, die nicht befoerdert wurde.
+                    // Loading and writing a whole vector -- comes from
+                    // an `alloca` that was not promoted.
                     Op::Load { .. } | Op::Store { .. } => {}
                     _ => return Some("v128 in an instruction this path cannot emit".into()),
                 }
@@ -4576,27 +4572,27 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     None
 }
 
-/// RUNDE TEMPO 2 -- EIN UEBERGABEREGISTER FUER GLEITZAHLEN.
+/// ROUND TEMPO 2 -- A HANDOVER REGISTER FOR FLOATING-POINT NUMBERS.
 ///
-/// Zwoelf `xmm` reichen in einer dicht gerechneten Schleife nicht. Wer keines
-/// bekommt, liegt im Rahmen, und dann stand im Erzeugten woertlich das:
+/// Twelve `xmm` are not enough in a densely calculated loop. Whoever gets none
+/// lies in the frame, and then in the generated code there stood literally this:
 ///
 /// ```text
 ///     movaps xmm0, xmm12
 ///     mulss  xmm0, xmm5
-///     movss  [rbp-3912], xmm0     <- hinschreiben
-///     movss  xmm0, [rbp-3912]     <- und gleich wieder holen
+///     movss  [rbp-3912], xmm0     <- write it out
+///     movss  xmm0, [rbp-3912]     <- and fetch it right back
 ///     addss  xmm0, [rbp-3936]
 /// ```
 ///
-/// Das Hinschreiben ist unnoetig, wenn der Wert nur EINEN Leser hat und der
-/// die unmittelbar folgende Anweisung ist: dann kann er einfach im Register
-/// stehen bleiben. `xmm3` ist dafuer reserviert (der Zuteiler gibt nur
-/// `xmm4`-`xmm15` aus, `xmm0`/`xmm1` sind die Kratzregister der Rechnung).
+/// Writing it out is unnecessary if the value has only ONE reader and that is
+/// the immediately following instruction: then it can simply stay in the
+/// register. `xmm3` is reserved for that (the allocator hands out only
+/// `xmm4`-`xmm15`, `xmm0`/`xmm1` are the scratch registers of the calculation).
 ///
-/// Mehr als eine Uebergabe kann nie gleichzeitig offen sein -- eine zweite
-/// bekaeme ihren Leser erst nach der ersten, und dann waere deren Leser nicht
-/// mehr die unmittelbar folgende Anweisung.
+/// More than one handover can never be open at the same time -- a second
+/// would get its reader only after the first, and then the reader of the first would no
+/// longer be the immediately following instruction.
 fn fp_handover(
     f: &Func,
     a: &Alloc,
@@ -4606,11 +4602,11 @@ fn fp_handover(
     if std::env::var_os("FIRN_NO_FP_HAND").is_some() {
         return out;
     }
-    // `xmm2` und `xmm3` gibt der Zuteiler NIE aus (`FP_POOL` beginnt bei
-    // `xmm4`), und die Rechnung benutzt sie nicht als Kratzregister (das sind
-    // `xmm0` und `xmm1`). Dazu kommen die Register des Vorrats, die diese
-    // Funktion ueberhaupt nicht braucht -- in einer Funktion mit zwei heissen
-    // Werten sind das zehn.
+    // `xmm2` and `xmm3` the allocator NEVER hands out (`FP_POOL` begins at
+    // `xmm4`), and the calculation does not use them as scratch registers (those are
+    // `xmm0` and `xmm1`). In addition there are the registers of the pool that this
+    // function does not need at all -- in a function with two hot
+    // values those are ten.
     let mut hand: Vec<&'static str> = vec!["xmm2", "xmm3"];
     {
         let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -4635,7 +4631,7 @@ fn fp_handover(
     const WINDOW: usize = 16;
     let mut uses: Vec<Val> = Vec::new();
     for b in &f.blocks {
-        // (Beginn, Ende, Wert) je Kandidat, in Reihenfolge der Erzeugung.
+        // (start, end, value) per candidate, in order of generation.
         let mut cand: Vec<(usize, usize, Val)> = Vec::new();
         for (idx, i) in b.insts.iter().enumerate() {
             let d = match i.dst {
@@ -4645,7 +4641,7 @@ fn fp_handover(
             if !f.val_ty(d).is_float() || f.is_secret(d) {
                 continue;
             }
-            // Wer schon ein Register hat, braucht keine Uebergabe.
+            // Whoever already has a register needs no handover.
             if !matches!(a.loc(d), Loc::Slot(_)) {
                 continue;
             }
@@ -4655,7 +4651,7 @@ fn fp_handover(
             if read.get(d as usize).copied() != Some(1) {
                 continue;
             }
-            // Der Erzeuger muss im Fliesskommaweg der Ausgabe stehen.
+            // The producer must stand in the floating-point path of the output.
             let defines = match &i.op {
                 Op::Bin(..) | Op::Copy { .. } | Op::Load { .. } | Op::Const(_) => true,
                 Op::Un(UnOp::Neg, _) => true,
@@ -4665,8 +4661,8 @@ fn fp_handover(
             if !defines {
                 continue;
             }
-            // Den EINEN Leser suchen: im selben Block, hoechstens `FENSTER`
-            // Anweisungen weiter, und dazwischen kein Aufruf (jedes `xmm` ist
+            // Look for the ONE reader: in the same block, at most `FENSTER`
+            // instructions further on, and no call in between (every `xmm` is
             // caller-saved).
             let mut readers: Option<usize> = None;
             for (j, n) in b.insts.iter().enumerate().skip(idx + 1).take(WINDOW) {
@@ -4701,10 +4697,10 @@ fn fp_handover(
                 cand.push((idx, j, d));
             }
         }
-        // Zwei Register, gierig nach Beginn: ein Kandidat bekommt eines, wenn
-        // es bis zu seinem Leser frei ist. Ueberschneidungen gibt es sonst
-        // wirklich -- `t1` wird defines, dann `t2`, und erst danach werden
-        // beide gelesen.
+        // Two registers, greedy by start: a candidate gets one if
+        // it is free until its reader. Overlaps otherwise really exist
+        // -- `t1` is defined, then `t2`, and only afterwards are
+        // both read.
         let mut busy_until: Vec<usize> = vec![0; hand.len()];
         for (s0, e0, d) in cand.into_iter() {
             let mut genommen = None;
@@ -4751,10 +4747,10 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     // CAUTION: `r8`/`r9` are argument registers 5/6 AND at the same time
     // possible homes of earlier parameters. That is why all slot targets come
     // first (they overwrite no register), then the register targets IN PARALLEL.
-    // ROUND XMM3: System V zaehlt die beiden Klassen GETRENNT. Ein
-    // Fliesskomma-Parameter kommt in xmm0-xmm7 an und verbraucht KEIN
-    // Ganzzahlregister -- vorher zaehlte dieser Weg stur die Position, was
-    // richtig war, solange keine Funktion mit Fliesskomma hier ankam.
+    // ROUND XMM3: System V counts the two classes SEPARATELY. A
+    // floating-point parameter arrives in xmm0-xmm7 and uses NO
+    // integer register -- before, this path stubbornly counted the position, which was
+    // right as long as no function with floating point arrived here.
     let mut prolog_moves: Vec<(String, String)> = Vec::new();
     // The floating point homes are moved IN PARALLEL too: `xmm4`-`xmm7` are
     // argument registers AND homes. Emitted one by one, `movaps xmm7, xmm2`
@@ -4792,9 +4788,9 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             }
             continue;
         }
-        // Kein Register der eigenen Klasse mehr frei: der Wert liegt im
-        // Rahmen des AUFRUFERS, ab [rbp+16], in der Reihenfolge der
-        // Uebergabe.
+        // No register of its own class free any more: the value lies in the
+        // frame of the CALLER, from [rbp+16], in the order of
+        // the handover.
         from_stack.push((i, 16 + 8 * stack_i as u64));
         stack_i += 1;
     }
@@ -5489,9 +5485,9 @@ fn cmp_behind_copies(ra: &Ra, b: &Block) -> Option<Block> {
     Some(nb)
 }
 
-/// Kann der Block als `cmp` + bedingter Sprung ausgegeben werden? (Siehe die
-/// Bedingungen in `emit_block`.) Eigene Funktion seit TEMPO 11, weil die
-/// Schleifenrotation dieselbe Frage fuer den ZIELblock eines `jmp` stellt.
+/// Can the block be emitted as `cmp` + conditional jump? (See the
+/// conditions in `emit_block`.) A function of its own since TEMPO 11, because
+/// the loop rotation asks the same question for the TARGET block of a `jmp`.
 fn cmp_br_mergeable(ra: &Ra, b: &Block) -> bool {
     match (&b.term, b.insts.last()) {
         (Term::BrCond { cond, .. }, Some(last)) => {
@@ -5499,10 +5495,10 @@ fn cmp_br_mergeable(ra: &Ra, b: &Block) -> bool {
                 && last.dst == Some(*cond)
                 && ra.read.get(*cond as usize).copied().unwrap_or(2) == 1
                 && !ra.f.is_secret(*cond)
-                // ROUND XMM3: `==`/`!=` auf Gleitzahlen braucht hinter dem
-                // Vergleich noch die Paritaetskorrektur fuer NaN. Die passt
-                // nicht zwischen Vergleich und Sprung, also wird hier nicht
-                // verschmolzen.
+                // ROUND XMM3: `==`/`!=` on floating-point numbers needs after the
+                // comparison still the parity correction for NaN. That does
+                // not fit between comparison and jump, so no merging
+                // happens here.
                 && !matches!(&last.op,
                     Op::Cmp { op: CmpOp::Eq, ty, .. } if ty.is_float())
                 && !matches!(&last.op,
@@ -5512,8 +5508,8 @@ fn cmp_br_mergeable(ra: &Ra, b: &Block) -> bool {
     }
 }
 
-/// RUNDE TEMPO 12: ein Register in seinen Platz legen (`hin`) bzw. von dort
-/// zurueckholen.
+/// ROUND TEMPO 12: put a register into its slot (`hin`) or fetch it back
+/// from there.
 fn save_line(r: &str, off: u64, t: FTy, hin: bool) -> String {
     let m = if is_xmm(r) {
         match t {
@@ -5577,12 +5573,12 @@ fn emit_block(
         // optimized build claimed the function's first line for its whole
         // body (measured: `inl.fi:7` for code out of `inl.fi:3`).
         e.loc_at(i.loc);
-        // RUNDE TEMPO 12: caller-saved Register ueber einen Aufruf retten.
+        // ROUND TEMPO 12: save caller-saved registers across a call.
         let saves = ra.a.call_saves.get(&(b.id as usize, ii));
         if let Some(l) = saves {
-            // Stand direkt davor ein Aufruf, der dasselbe Register vom
-            // selben Platz zurueckgeholt hat, steht der Wert dort noch --
-            // zwei Aufrufe hintereinander sichern nur einmal.
+            // If directly before there stood a call that restored the same register from
+            // the same slot, the value still stands there --
+            // two calls in a row save only once.
             let prev_saves = if ii > 0 { ra.a.call_saves.get(&(b.id as usize, ii - 1)) } else { None };
             for (r, off, t) in l {
                 if let Some(v) = prev_saves {
@@ -5610,44 +5606,44 @@ fn emit_block(
     match &b.term {
         Term::Br(t) => {
             if next != Some(*t) {
-                // RUNDE TEMPO 11 -- DER SPRUNG ZUM VERGLEICH WIRD DER VERGLEICH.
+                // ROUND TEMPO 11 -- THE JUMP TO THE COMPARISON BECOMES THE COMPARISON.
                 //
-                // Ein Schleifenkopf, der nur aus `cmp` + bedingtem Sprung
-                // besteht, kostete jeden Durchlauf drei Befehle:
+                // A loop head that consists only of `cmp` + conditional jump
+                // cost three instructions every iteration:
                 //
                 //     latch: ...
-                //            jmp  head          <- jedes Mal genommen
+                //            jmp  head          <- taken every time
                 //     head:  cmp  r11d, 8
                 //            jge  exit
                 //
-                // Steht der Kopf-Vergleich statt des `jmp` direkt im
-                // Rueckweg, sind es zwei (`cmp`, `jl body`) -- gcc nennt das
-                // Schleifenrotation. Gemessen: 4,46 Mio unbedingte
-                // Rueckspruenge im MP3-Dekoder, praktisch alle von dieser Art.
+                // If the head comparison stands directly in the way back instead of the `jmp`,
+                // it is two (`cmp`, `jl body`) -- gcc calls that
+                // loop rotation. Measured: 4.46 million unconditional
+                // back jumps in the MP3 decoder, practically all of this kind.
                 //
-                // Warum das nichts brechen kann: der Kopf enthaelt NUR den
-                // Vergleich, dessen Ergebnis genau einmal gelesen wird (die
-                // Bedingung fuer die Verschmelzung oben). Er schreibt also
-                // nichts ausser den Flaggen. Jeder Wert steht sein ganzes
-                // Leben am selben Platz, also liest der kopierte Vergleich
-                // dieselben Operanden am selben Ort wie das Original. Die
-                // Uebergaberegister (`fp_handover`) gelten nur innerhalb
-                // EINES Blocks -- die Operanden des Kopfes stammen aus
-                // anderen Bloecken und liegen deshalb nie dort.
+                // Why this cannot break anything: the head contains ONLY the
+                // comparison, whose result is read exactly once (the
+                // condition for the merge above). So it writes
+                // nothing but the flags. Every value stands its whole
+                // life in the same slot, so the copied comparison reads
+                // the same operands at the same place as the original. The
+                // handover registers (`fp_handover`) apply only within
+                // ONE block -- the operands of the head come from
+                // other blocks and therefore never lie there.
                 //
-                // Abschaltbar mit `FIRN_NO_ROTATE=1` (Fehlersuche).
+                // Can be switched off with `FIRN_NO_ROTATE=1` (debugging).
                 //
-                // Zweite Stufe: vor dem Vergleich duerfen bis zu drei
-                // schlichte Rechnungen stehen (`lea 0x8(r11),rdx; cmp r10,rdx`
-                // in `rt.mem_copy`, `i += 1; cmp i,8` im Rueckweg von
-                // `synth`). Die Begruendung ist dieselbe und gilt fuer jede
-                // Anweisung: der Maschinenzustand am Ende von `b` IST der am
-                // Eingang von `t` (einzige Kante, keine Kopien mehr dahinter),
-                // und die Ausgabe einer Anweisung haengt nur an den festen
-                // Plaetzen ihrer Werte, nicht daran, wo sie steht. Zugelassen
-                // ist nur, was keine eigenen Sprungmarken erzeugt (keine
-                // geprueften Rechnungen) und nichts ausser seinem Ziel
-                // veraendert (kein Schreiben, kein Aufruf).
+                // Second stage: before the comparison up to three
+                // plain calculations may stand (`lea 0x8(r11),rdx; cmp r10,rdx`
+                // in `rt.mem_copy`, `i += 1; cmp i,8` in the way back of
+                // `synth`). The reasoning is the same and holds for every
+                // instruction: the machine state at the end of `b` IS the one at the
+                // entry of `t` (single edge, no copies behind it any more),
+                // and the output of an instruction depends only on the fixed
+                // slots of its values, not on where it stands. Admitted
+                // is only what creates no jump labels of its own (no
+                // checked calculations) and changes nothing but its target
+                // (no writing, no call).
                 if let Some(tb) = f.blocks.iter().find(|x| x.id == *t) {
                     let schlicht = tb.insts.len() <= 4
                         && tb.insts[..tb.insts.len().saturating_sub(1)].iter().all(|i| {
@@ -5737,7 +5733,7 @@ fn emit_block(
         Term::Ret(v) => {
             if let Some(v) = v {
                 if f.ret.is_float() {
-                    // ROUND XMM3: System V gibt ein Fliesskommaergebnis in xmm0 zurueck.
+                    // ROUND XMM3: System V returns a floating-point result in xmm0.
                     ra.fp_into(e, "xmm0", *v, f.ret == FTy::F32);
                 } else {
                 ra.load_full(e, "rax", *v);
@@ -5775,8 +5771,8 @@ fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Re
         Term::BrCond { then_bb, else_bb, .. } => (*then_bb, *else_bb),
         _ => return Err("internal error: cmp+jcc without brcond".to_string()),
     };
-    // ROUND XMM3: Fliesskomma setzt die Flaggen mit `ucomis*`, sonst gilt
-    // alles Weitere unveraendert.
+    // ROUND XMM3: floating point sets the flags with `ucomis*`, otherwise
+    // everything else applies unchanged.
     if oty.is_float() {
         let single = oty == FTy::F32;
         let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
@@ -5857,13 +5853,13 @@ fn emit_inst(
 ) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
-        // RUNDE TEMPO 4 -- DIE VEKTORBEFEHLE, DIE DIESER WEG SELBST AUSGIBT.
+        // ROUND TEMPO 4 -- THE VECTOR INSTRUCTIONS THAT THIS PATH EMITS ITSELF.
         //
-        // Gerechnet wird im Zielregister, wenn der Wert eines hat, sonst in
-        // `xmm0`; `xmm1` ist das zweite Kratzregister. Geladen und geschrieben
-        // wird mit `movdqu` (der Zeiger kommt aus dem Programm und verspricht
-        // keine Ausrichtung), zwischen Register und Platz mit `movaps` (der
-        // Platz IST ausgerichtet, siehe `layout`).
+        // The calculation is done in the destination register if the value has one, otherwise in
+        // `xmm0`; `xmm1` is the second scratch register. Loading and writing
+        // is done with `movdqu` (the pointer comes from the program and promises
+        // no alignment), between register and slot with `movaps` (the
+        // slot IS aligned, see `layout`).
         Op::Simd { kind, args, imm } if v128_ra_kind(*kind) => {
             use crate::simd::SimdKind as K;
             match kind {
@@ -5875,13 +5871,13 @@ fn emit_inst(
                     ra.v_out(e, d, w);
                 }
                 K::Store => {
-                    // ZUERST der Wert ins Kratzregister, DANN die Adresse --
-                    // `addr_mem` darf `rax`/`rcx` benutzen, das stoert kein xmm.
+                    // FIRST the value into the scratch register, THEN the address --
+                    // `addr_mem` may use `rax`/`rcx`, that disturbs no xmm.
                     let q = ra.v_reg(e, args[1], "xmm0");
                     let mem = ra.addr_mem(e, args[0]);
                     e.line(&format!("movdqu xmmword ptr {}, {}", mem, q));
                 }
-                // RUNDE TEMPO 7: nur die untere Haelfte.
+                // ROUND TEMPO 7: only the lower half.
                 K::Store64 => {
                     let q = ra.v_reg(e, args[1], "xmm0");
                     let mem = ra.addr_mem(e, args[0]);
@@ -5930,8 +5926,8 @@ fn emit_inst(
                         K::CmpLeF32 => "cmpleps",
                         K::CmpNltF32 => "cmpnltps",
                         K::CmpGt32 => "pcmpgtd",
-                        // `pandn d, s` rechnet `~d & s` -- der ERSTE Operand
-                        // ist der verneinte, genau wie im Grundweg.
+                        // `pandn d, s` calculates `~d & s` -- the FIRST operand
+                        // is the negated one, exactly as in the basic path.
                         K::And => "pand",
                         K::AndNot => "pandn",
                         K::Or => "por",
@@ -5948,9 +5944,9 @@ fn emit_inst(
                         e.line(&format!("v{} {}, {}, {}", m, w, sa, sb));
                         ra.v_out(e, d, w);
                     } else {
-                        // Liegt der zweite Operand im Zielregister, wird er
-                        // vorher gerettet -- sonst ueberschriebe ihn die Kopie
-                        // des ersten.
+                        // If the second operand lies in the destination register, it is
+                        // saved beforehand -- otherwise the copy of the first
+                        // would overwrite it.
                         let mut ob = ra.vo(args[1]);
                         if is_xmm_reg(&ob) && ob == w {
                             e.line(&format!("movaps xmm1, {}", ob));
@@ -5971,9 +5967,9 @@ fn emit_inst(
                 _ => return Err("internal error: unexpected vector instruction".to_string()),
             }
         }
-        // RUNDE TEMPO 4: ein ganzer Vektor aus dem Speicher und zurueck.
-        // `movdqu`, weil die Adresse aus dem Programm kommt (eine `alloca`
-        // von vier `f32` ist nur vierfach ausgerichtet).
+        // ROUND TEMPO 4: a whole vector from memory and back.
+        // `movdqu`, because the address comes from the program (an `alloca`
+        // of four `f32` is only four-fold aligned).
         Op::Load { addr } if ty == FTy::V128 => {
             let d = i.dst.ok_or("internal error: load without target")?;
             let mem = ra.addr_mem(e, *addr);
@@ -5986,8 +5982,8 @@ fn emit_inst(
             let mem = ra.addr_mem(e, *addr);
             e.line(&format!("movdqu xmmword ptr {}, {}", mem, q));
         }
-        // RUNDE TEMPO 4: eine Kopie eines Vektorwertes (kommt aus der
-        // Auflösung der `phi`-Knoten).
+        // ROUND TEMPO 4: a copy of a vector value (comes from the
+        // resolution of the `phi` nodes).
         Op::Copy { src } if ty == FTy::V128 => {
             let d = i.dst.ok_or("internal error: copy without target")?;
             match (ra.a.loc(d), ra.a.place(*src)) {
@@ -6051,9 +6047,9 @@ fn emit_inst(
             _ => return Err("internal error: v128 reached the register path".to_string()),
         },
         Op::Const(c) if ty.is_float() => {
-            // ROUND XMM3: das Bitmuster ueber `rax` -- SSE hat keine Form
-            // mit unmittelbarer Konstante. Liegt der Wert auf seinem Platz,
-            // reicht das Schreiben als Ganzzahl.
+            // ROUND XMM3: the bit pattern via `rax` -- SSE has no form
+            // with an immediate constant. If the value lies in its slot,
+            // writing it as an integer suffices.
             let d = i.dst.ok_or("internal error: const without target")?;
             let single = ty == FTy::F32;
             let bits = ty.truncate(*c) as i64;
@@ -6097,9 +6093,9 @@ fn emit_inst(
         Op::Copy { src } if ty.is_float() => {
             let d = i.dst.ok_or("internal error: copy without target")?;
             let single = ty == FTy::F32;
-            // RUNDE TEMPO 6: NICHT nach `place()` fragen, sondern nach
-            // `fpo()` -- eine Konstante aus dem Vorrat hat gar keinen Platz,
-            // sondern steht in `.rodata`.
+            // ROUND TEMPO 6: do NOT ask `place()`, but ask
+            // `fpo()` -- a constant from the pool has no slot at all,
+            // but stands in `.rodata`.
             let o = ra.fpo(*src, single);
             match (ra.a.loc(d), is_xmm_reg(&o)) {
                 (Loc::Reg(r), _) => ra.fp_into(e, r, *src, single),
@@ -6111,20 +6107,20 @@ fn emit_inst(
             }
         }
         Op::Load { addr } if ty.is_float() && ra.a.cell(*addr).is_some() => {
-            // ROUND XMM3: die Zelle liegt in einem GANZZAHLregister (dort
-            // steht das Bitmuster). Von da in ein `xmm` geht es mit `movq`/
-            // `movd` -- ohne den Umweg ueber den Speicher.
+            // ROUND XMM3: the cell lies in an INTEGER register (there
+            // stands the bit pattern). From there into an `xmm` it goes with `movq`/
+            // `movd` -- without the detour through memory.
             let d = i.dst.ok_or("internal error: load without target")?;
             if ra.a.alias.contains_key(&d) {
                 return Ok(());
             }
             let (cr, _) = ra.a.cell(*addr).ok_or("internal error: cell lost")?;
             let single = ty == FTy::F32;
-            // RUNDE TEMPO 2: liegt die Zelle selbst in einem `xmm`, ist das
-            // Laden nur noch eine Kopie -- oft nicht einmal das, weil
-            // `fp_out` sie weglaesst, wenn Ziel und Quelle dasselbe Register
-            // sind. Vorher stand hier IMMER `movd`/`movq` durch ein
-            // Ganzzahlregister.
+            // ROUND TEMPO 2: if the cell itself lies in an `xmm`, loading is
+            // only a copy -- often not even that, because
+            // `fp_out` omits it when destination and source are the same register.
+            // Before, there stood here ALWAYS `movd`/`movq` through an
+            // integer register.
             if is_xmm(cr) {
                 ra.fp_out(e, d, cr, single);
                 return Ok(());
@@ -6140,9 +6136,9 @@ fn emit_inst(
         Op::Store { addr, val } if ty.is_float() && ra.a.cell(*addr).is_some() => {
             let (cr, _) = ra.a.cell(*addr).ok_or("internal error: cell lost")?;
             let single = ty == FTy::F32;
-            // RUNDE TEMPO 2: Zelle in einem `xmm` -- das Schreiben ist eine
-            // Kopie in dieses Register (`fp_into` laesst sie weg, wenn der
-            // Wert schon dort liegt).
+            // ROUND TEMPO 2: cell in an `xmm` -- writing is a
+            // copy into this register (`fp_into` omits it if the
+            // value already lies there).
             if is_xmm(cr) {
                 ra.fp_into(e, cr, *val, single);
                 return Ok(());
@@ -6221,7 +6217,7 @@ fn emit_inst(
         }
         Op::Bin(op, x, y) => {
             let d = i.dst.ok_or("internal error: binary operation without target")?;
-            // RUNDE TEMPO 3: die Summe MIT Skalierung -- ein `lea`.
+            // ROUND TEMPO 3: the sum WITH scaling -- one `lea`.
             if let Some((br, ir, fact)) = ra.scale.get(&d).copied() {
                 let target = match ra.a.loc(d) {
                     Loc::Reg(r) => r,
@@ -6315,10 +6311,10 @@ fn emit_inst(
             emit_wrap_sat_ra(e, ra, *kind, *op, ty, *a, *b, d, site)?;
         }
         Op::Cmp { op, ty: oty, a, b } if oty.is_float() => {
-            // ROUND XMM3 -- der Fliesskommavergleich, nach demselben Muster
-            // wie im Grundweg: `ucomiss`/`ucomisd` setzen CF/ZF wie ein
-            // UNSIGNED Vergleich, und fuer `<`/`<=` werden die Operanden
-            // getauscht, statt hinterher mit dem Paritaetsbit zu rechnen.
+            // ROUND XMM3 -- the floating-point comparison, on the same pattern
+            // as in the basic path: `ucomiss`/`ucomisd` set CF/ZF like an
+            // UNSIGNED comparison, and for `<`/`<=` the operands are
+            // swapped, instead of calculating with the parity bit afterwards.
             let d = i.dst.ok_or("internal error: comparison without target")?;
             let single = *oty == FTy::F32;
             let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
@@ -6333,10 +6329,10 @@ fn emit_inst(
                 CmpOp::Le | CmpOp::Ge => "setae",
             };
             e.line(&format!("{} al", cc));
-            // NaN ist mit nichts vergleichbar, auch nicht mit sich selbst:
-            // `ucomis*` setzt dann ZF UND PF. `sete` allein saehe NaN == NaN
-            // als wahr an, `setne` saehe NaN != NaN als falsch -- beides
-            // verkehrt herum. Das Paritaetsbit korrigiert genau diesen Fall.
+            // NaN is comparable with nothing, not even with itself:
+            // `ucomis*` then sets ZF AND PF. `sete` alone would see NaN == NaN
+            // as true, `setne` would see NaN != NaN as false -- both
+            // the wrong way round. The parity bit corrects exactly this case.
             if matches!(op, CmpOp::Eq) {
                 e.line("setnp cl");
                 e.line("and al, cl");
@@ -6390,16 +6386,16 @@ fn emit_inst(
                 }
             }
         }
-        // ROUND XMM4 -- Vorzeichenumkehr einer Gleitzahl: das Vorzeichen ist
-        // EIN Bit. `neg` laese das Bitmuster als Zweierkomplement, also wird
-        // nur Bit 31 bzw. 63 gekippt. Die Maske kommt ueber `rax` in ein
-        // Kratzregister (`xmm1`); SSE hat keine Form mit Konstante.
+        // ROUND XMM4 -- sign reversal of a floating-point number: the sign is
+        // ONE bit. `neg` would read the bit pattern as two's complement, so
+        // only bit 31 or 63 is flipped. The mask comes via `rax` into a
+        // scratch register (`xmm1`); SSE has no form with a constant.
         Op::Un(UnOp::Neg, x) if ty.is_float() => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let single = ty == FTy::F32;
             let target = ra.fp_work(d);
-            // Die Maske zuerst -- sie liegt in `xmm1`, dem Kratzregister der
-            // Rechnung.
+            // The mask first -- it lies in `xmm1`, the scratch register of the
+            // calculation.
             if single {
                 e.line("mov eax, -2147483648");
                 e.line("movd xmm1, eax");
@@ -6408,8 +6404,8 @@ fn emit_inst(
                 e.line("movq xmm1, rax");
             }
             if crate::target::avx() && std::env::var_os("FIRN_NO_VEX3").is_none() {
-                // RUNDE TEMPO 2: Dreioperandenform -- die Quelle bleibt
-                // stehen, das Ergebnis geht direkt ins Ziel.
+                // ROUND TEMPO 2: three-operand form -- the source stays
+                // standing, the result goes directly into the destination.
                 let ox = ra.fpo(*x, single);
                 let src = if is_xmm(&ox) {
                     ox
@@ -6458,13 +6454,13 @@ fn emit_inst(
             ra.store_dst(e, d, "rax");
         }
         Op::Cast { src, from } if ty.is_float() || from.is_float() => {
-            // ROUND XMM3 -- die Umwandlungen, Wort fuer Wort wie im Grundweg,
-            // nur mit den Operanden der Zuteilung. `xmm0` ist das
-            // Kratzregister; es wird nie als Heimat vergeben.
+            // ROUND XMM3 -- the conversions, word for word as in the basic path,
+            // only with the operands of the allocation. `xmm0` is the
+            // scratch register; it is never handed out as a home.
             let d = i.dst.ok_or("internal error: conversion without target")?;
             if ty.is_float() && from.is_float() {
                 if ty == *from {
-                    // Gleiche Breite: das Bitmuster wandert unveraendert.
+                    // Same width: the bit pattern travels unchanged.
                     let single = ty == FTy::F32;
                     ra.fp_into(e, "xmm0", *src, single);
                     ra.fp_out(e, d, "xmm0", single);
@@ -6476,8 +6472,8 @@ fn emit_inst(
                 return Ok(());
             }
             if ty.is_float() {
-                // Ganzzahl -> Fliesskomma. Die Quelle wird auf 64 Bit
-                // gebracht; `cvtsi2ss/sd` reads vorzeichenbehaftet.
+                // Integer -> floating point. The source is brought to 64 bits;
+                // `cvtsi2ss/sd` reads signed.
                 ra.load_ext(e, "rax", *src, *from, 64);
                 let w = ra.fp_work(d);
                 e.line(&format!(
@@ -6488,7 +6484,7 @@ fn emit_inst(
                 ra.fp_out(e, d, w, ty == FTy::F32);
                 return Ok(());
             }
-            // Fliesskomma -> Ganzzahl, abschneidend zur Null hin (wie in C).
+            // Floating point -> integer, truncating towards zero (as in C).
             ra.fp_into(e, "xmm0", *src, *from == FTy::F32);
             e.line(if *from == FTy::F32 { "cvttss2si rax, xmm0" } else { "cvttsd2si rax, xmm0" });
             match ra.a.loc(d) {
@@ -6739,11 +6735,11 @@ fn emit_inst(
             // After `push rbp` + `sub rsp, <multiple of 16>` it is; the argument
             // area is therefore rounded up to 16 as well — word for word like
             // the base path in codegen_x86.rs.
-            // ROUND XMM3: System V hat ZWEI Registerfolgen -- Ganzzahlen in
-            // rdi/rsi/rdx/rcx/r8/r9, Fliesskomma in xmm0-xmm7, jede fuer
-            // sich gezaehlt. Vorher zaehlte dieser Weg nur Positionen, was
-            // richtig war, solange keine Funktion mit Fliesskomma hier
-            // ankam.
+            // ROUND XMM3: System V has TWO register sequences -- integers in
+            // rdi/rsi/rdx/rcx/r8/r9, floating point in xmm0-xmm7, each
+            // counted on its own. Before, this path counted only positions, which was
+            // right as long as no function with floating point arrived
+            // here.
             let (spot, stack_args) = crate::codegen_x86::place_args(ra.f, args);
             let space = align_up(stack_args.len() as u64 * 8, 16);
             if space > 0 {
@@ -6976,11 +6972,11 @@ fn emit_inst(
         // even though FIR now writes a copy per back edge.
         Op::Copy { src } => {
             let d = i.dst.ok_or("internal error: copy without target")?;
-            // RUNDE TEMPO 10: verschmolzen -- Quelle und Ziel liegen am
-            // selben Platz, die Kopie ist ein `mov [X], [X]` ueber `rax`.
-            // Fuer Register erledigt `load_full` das von selbst, fuer zwei
-            // gleiche RAHMENPLAETZE nicht. Ein Alias zaehlt nicht mit: dort
-            // steht der Wert im Zellregister und nicht im Platz.
+            // ROUND TEMPO 10: merged -- source and destination lie in the
+            // same slot, the copy is a `mov [X], [X]` via `rax`.
+            // For registers `load_full` does that by itself, for two
+            // identical FRAME SLOTS it does not. An alias does not count: there
+            // the value stands in the cell register and not in the slot.
             if ra.a.alias.get(src).is_none() && ra.a.loc(d) == ra.a.loc(*src) {
                 return Ok(());
             }
@@ -7105,25 +7101,24 @@ fn add_over_rax(ra: &Ra, a: Val, b: Val) -> bool {
 /// register. For `sub` additionally `k != i64::MIN`, because `-k` would
 /// overflow otherwise.
 ///
-/// **RUNDE TEMPO 11 — AUCH MIT 32-BIT-ERGEBNIS.** Hier stand
-/// `ty.bits() <= 32 -> nein`, und das kostete zwei Millionen Befehle im
-/// MP3-Dekoder: jedes `i + 1` auf einem `i32` wurde `mov rdx,r10` +
-/// `add edx,1` statt `lea edx,[r10+1]`.
+/// **ROUND TEMPO 11 — ALSO WITH A 32-BIT RESULT.** Here there stood
+/// `ty.bits() <= 32 -> no`, and that cost two million instructions in the
+/// MP3 decoder: every `i + 1` on an `i32` became `mov rdx,r10` +
+/// `add edx,1` instead of `lea edx,[r10+1]`.
 ///
-/// Es ist erlaubt, und der Grund ist eine Rechnung, keine Meinung: `lea r32,
-/// m` bildet die Adresse in vollen 64 Bit und legt die unteren 32 davon ab
-/// (der Rest des Registers wird null, genau wie bei jedem Schreiben auf ein
-/// 32-Bit-Register). Addition ist mit der Restklassenbildung vertraeglich --
-/// die unteren 32 Bit von `(x + y)` haengen nur von den unteren 32 Bit von
-/// `x` und `y` ab. Also ist `lea r32,[x64+y64]` bis aufs Bit dasselbe wie
-/// `add r32, y32`. Fuer die schmaleren Typen gilt dasselbe: der Weg hier
-/// rechnet sie ohnehin in 32 Bit (`bits = if wide {64} else {32}`).
+/// It is allowed, and the reason is a calculation, not an opinion: `lea r32,
+/// m` forms the address in full 64 bits and stores the lower 32 of it
+/// (the rest of the register becomes zero, exactly as with any write to a
+/// 32-bit register). Addition is compatible with taking the residue class --
+/// the lower 32 bits of `(x + y)` depend only on the lower 32 bits of
+/// `x` and `y`. So `lea r32,[x64+y64]` is, down to the bit, the same as
+/// `add r32, y32`. For the narrower types the same holds: the path here
+/// calculates them in 32 bits anyway (`bits = if wide {64} else {32}`).
 ///
-/// Die Verschiebung im `lea` ist ein VORZEICHENBEHAFTETES 32-Bit-Feld. Ein
-/// unmittelbarer Wert darf bei 32 Bit aber den ganzen vorzeichenlosen
-/// Bereich ausschoepfen (`immediate_consts`), also wird er beim Schreiben
-/// umgedeutet -- `0xFFFFFFFF` wird `-1`, und das ist modulo 2^32 dieselbe
-/// Zahl.
+/// The displacement in the `lea` is a SIGNED 32-bit field. An
+/// immediate value may, however, exhaust the whole unsigned range at 32 bits
+/// (`immediate_consts`), so it is reinterpreted when written
+/// -- `0xFFFFFFFF` becomes `-1`, and that is the same number modulo 2^32.
 fn lea_possible(ra: &Ra, op: BinOp, ty: FTy, a: Val, b: Val, d: Val) -> bool {
     if ty.is_float() || ty == FTy::V128 || !matches!(ra.a.loc(d), Loc::Reg(_)) {
         return false;
@@ -7157,10 +7152,10 @@ fn emit_bin(
     b: Val,
     d: Val,
 ) -> Result<(), String> {
-    // ROUND XMM3 -- die vier Grundrechenarten auf der SSE-Einheit. Gerechnet
-    // wird IM Zielregister, wenn der Wert eines hat; sonst in `xmm0`. Liegt
-    // der zweite Operand ausgerechnet im Zielregister, wird er vorher nach
-    // `xmm1` gerettet -- sonst ueberschriebe ihn die Kopie des ersten.
+    // ROUND XMM3 -- the four basic arithmetic operations on the SSE unit. The calculation
+    // is done IN the destination register if the value has one; otherwise in `xmm0`. If
+    // the second operand happens to lie in the destination register, it is saved beforehand to
+    // `xmm1` -- otherwise the copy of the first would overwrite it.
     if ty.is_float() {
         let single = ty == FTy::F32;
         let m = match (op, single) {
@@ -7181,11 +7176,11 @@ fn emit_bin(
             }
         };
         let w = ra.fp_work(d);
-        // RUNDE TEMPO 2 -- DIE DREIOPERANDENFORM. `vmulss d, a, b` nennt sein
-        // Ziel selbst; damit entfaellt die Kopie, die SSE erzwingt (in der
-        // heissen Schleife der Synthesefilterbank standen 50 solche
-        // `movaps`). Die erste Quelle MUSS ein Register sein, die zweite darf
-        // Speicher sein.
+        // ROUND TEMPO 2 -- THE THREE-OPERAND FORM. `vmulss d, a, b` names its
+        // destination itself; with that the copy that SSE forces drops out (in the
+        // hot loop of the synthesis filter bank there stood 50 such
+        // `movaps`). The first source MUST be a register, the second may be
+        // memory.
         if crate::target::avx() && std::env::var_os("FIRN_NO_VEX3").is_none() {
             let oa = ra.fpo(a, single);
             let src1 = if is_xmm(&oa) {
@@ -7199,15 +7194,15 @@ fn emit_bin(
             ra.fp_out(e, d, w, single);
             return Ok(());
         }
-        // RUNDE TEMPO -- VERTAUSCHEN STATT KOPIEREN. `addss`/`mulss` haben nur
-        // die zweistellige Form: gerechnet wird ins Zielregister, also muss
-        // der erste Operand vorher hinein. Liegt der ZWEITE Operand schon
-        // dort, kostete das bisher zwei Befehle (Rettung nach `xmm1`, dann die
-        // Kopie des ersten). Addition und Multiplikation sind vertauschbar --
-        // auch in Fliesskomma, Bit fuer Bit, weil beide Operationen
-        // symmetrisch runden (fuer NaN gilt dasselbe: das Ergebnis ist ein
-        // stilles NaN, und Firn verspricht kein bestimmtes Nutzlastmuster).
-        // Subtraktion und Division bleiben unberuehrt.
+        // ROUND TEMPO -- SWAP INSTEAD OF COPY. `addss`/`mulss` have only
+        // the two-operand form: the calculation is done into the destination register, so
+        // the first operand must go in beforehand. If the SECOND operand already lies
+        // there, that used to cost two instructions (saving to `xmm1`, then the
+        // copy of the first). Addition and multiplication are commutative --
+        // also in floating point, bit for bit, because both operations
+        // round symmetrically (for NaN the same holds: the result is a
+        // quiet NaN, and Firn promises no particular payload pattern).
+        // Subtraction and division stay untouched.
         let (a, b) = if matches!(op, BinOp::Add | BinOp::Mul) {
             let wb = matches!(ra.a.place(b), Loc::Reg(r) if r == w);
             let wa = matches!(ra.a.place(a), Loc::Reg(r) if r == w);
@@ -7310,17 +7305,17 @@ fn emit_bin(
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("lea_possible requires a target register"),
             };
-            // RUNDE TEMPO 11: das ZIEL in der Breite der Rechnung, die
-            // Adressteile immer in 64 Bit -- `lea eax,[rbx+1]` ist die
-            // richtige Form, `lea eax,[ebx+1]` waere eine Adressrechnung mit
-            // 32-Bit-Adressgroesse und damit eine andere Frage.
+            // ROUND TEMPO 11: the DESTINATION in the width of the calculation, the
+            // address parts always in 64 bits -- `lea eax,[rbx+1]` is the
+            // right form, `lea eax,[ebx+1]` would be an address calculation with
+            // 32-bit address size and thereby a different question.
             let dr = rn(dr0, bits);
             let dr = dr.as_str();
             let reg_of = |v: Val| match (ra.a.imm(v), ra.a.place(v)) {
                 (None, Loc::Reg(r)) => Some(r),
                 _ => None,
             };
-            // Die Verschiebung ist ein vorzeichenbehaftetes 32-Bit-Feld.
+            // The displacement is a signed 32-bit field.
             let disp = |k: i64| -> i64 {
                 if bits == 64 {
                     k

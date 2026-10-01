@@ -191,19 +191,19 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("SetWindowLongPtrW", "USER32.dll", 3),
     ("GetWindowLongPtrW", "USER32.dll", 2),
     ("SetCapture", "USER32.dll", 1),
-    // Runde CERTUS-WIN2: WM_SETTINGCHANGE an alle Fenster schicken --
-    // damit sich der Wechsel hell/dunkel im laufenden Betrieb BELEGEN
-    // laesst und nicht nur behauptet wird (tools/windows/farbruf.fi).
+    // Round CERTUS-WIN2: send WM_SETTINGCHANGE to all windows --
+    // so that the switch light/dark can be PROVEN in running operation
+    // and not only claimed (tools/windows/farbruf.fi).
     ("SendMessageTimeoutW", "USER32.dll", 7),
-    // ... und die zwei, mit denen sich ein Fenster VON EINEM ANDEREN
-    // PROZESS aus vergroessern laesst -- der Weg, auf dem die Abnahme
-    // dieser Runde ein echtes WM_SIZE erzeugt (tools/windows/groesse.fi).
+    // ... and the two with which a window can be enlarged FROM ANOTHER
+    // PROCESS -- the way in which the acceptance of this round produces a real WM_SIZE
+    // (tools/windows/groesse.fi).
     ("FindWindowW", "USER32.dll", 2),
     ("SetWindowPos", "USER32.dll", 7),
-    // Runde CERTUS-WIN4: die STARTGROESSE. SPI_GETWORKAREA gibt den
-    // Schirm OHNE Taskleiste; GetWindowRect braucht es, um das Fenster
-    // mittig zu setzen. Ohne die zwei Zeilen findet der Binder die
-    // Symbole nicht -- diese Liste IST die Importtabelle.
+    // Round CERTUS-WIN4: the START SIZE. SPI_GETWORKAREA gives the
+    // screen WITHOUT the taskbar; GetWindowRect needs it to place the window
+    // in the centre. Without the two lines the linker does not find the
+    // symbols -- this list IS the import table.
     ("SystemParametersInfoW", "USER32.dll", 4),
     ("GetWindowRect", "USER32.dll", 2),
     ("ReleaseCapture", "USER32.dll", 0),
@@ -220,15 +220,15 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("TextOutA", "GDI32.dll", 5),
     ("GetStockObject", "GDI32.dll", 1),
     ("GdiFlush", "GDI32.dll", 0),
-    // --- iphlpapi: WEN FRAGT MAN NACH NAMEN? (Runde CERTUS-WIN2) ------
-    // Windows hat kein `/etc/resolv.conf`. Die Namensserver stehen je
-    // Netzwerkkarte in `IP_ADAPTER_ADDRESSES.FirstDnsServerAddress`;
-    // `GetNetworkParams` ist der aeltere, einfachere Weg fuer IPv4.
+    // --- iphlpapi: WHOM DO YOU ASK FOR NAMES? (round CERTUS-WIN2) -----
+    // Windows has no `/etc/resolv.conf`. The name servers are listed per
+    // network card in `IP_ADAPTER_ADDRESSES.FirstDnsServerAddress`;
+    // `GetNetworkParams` is the older, simpler way for IPv4.
     ("GetAdaptersAddresses", "IPHLPAPI.DLL", 5),
     ("GetNetworkParams", "IPHLPAPI.DLL", 2),
-    // --- kernel32: die Umgebung ---------------------------------------
-    // `/proc/self/environ` gibt es hier nicht; die Umgebung kommt als
-    // ein Block UTF-16 aus kernel32.
+    // --- kernel32: the environment ------------------------------------
+    // `/proc/self/environ` does not exist here; the environment comes as
+    // a block of UTF-16 from kernel32.
     ("FreeEnvironmentStringsW", "KERNEL32.dll", 1),
     // --- user32/gdi32: was die Groessenaenderung und die Leiste brauchen
     ("GetSysColor", "USER32.dll", 1),

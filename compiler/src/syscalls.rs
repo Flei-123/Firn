@@ -190,23 +190,23 @@ const TABLE: &[(i64, A64)] = &[
     // same thing. The third argument (flags) is 0, which is what
     // `unlinkat` wants for a plain file.
     (87, A64::AtFdcwd(35)),          // unlink    -> unlinkat
-    // RUNDE CSS/STAPEL (Certus, 10.09.2026): lib/js/interp.fi fragt den
-    // WIRKLICHEN Stapel ab (getrlimit(RLIMIT_STACK)) statt 6 MiB zu
-    // raten -- die geratene Zahl hat den Windows-Bau umgebracht, weil
-    // dort nur 2 MiB Stapel stehen. Ohne diese Zeile ist derselbe
-    // Quelltext fuer das Telefon nicht uebersetzbar.
+    // ROUND CSS/STACK (Certus, 10.09.2026): lib/js/interp.fi asks for the
+    // REAL stack (getrlimit(RLIMIT_STACK)) instead of guessing 6 MiB
+    // -- the guessed number killed the Windows build, because
+    // there only 2 MiB of stack exist. Without this line the same
+    // source is not translatable for the phone.
     (90, A64::AtFdcwd(53)),          // chmod     -> fchmodat (Firn r64)
     (96, A64::Direct(169)),          // gettimeofday
     (97, A64::Direct(163)),          // getrlimit
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
-    // RUNDE C-059: stand bis hierher zwischen 13 und 14 und hat damit die
-    // Sortierung der Tafel gebrochen (eigener Test). Nur verschoben.
+    // ROUND C-059: stood until now between 13 and 14 and thereby broke
+    // the sorting of the table (a test of its own). Only moved.
     (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
-    // RUNDE C-059 (Certus): lib/js/interp.fi setzt den Stapel des
-    // Deuters (setrlimit(RLIMIT_STACK)). Dieselbe Gestalt, andere
-    // Nummer -- die generische Tafel hat setrlimit als 164.
+    // ROUND C-059 (Certus): lib/js/interp.fi sets the stack of the
+    // interpreter (setrlimit(RLIMIT_STACK)). The same shape, different
+    // number -- the generic table has setrlimit as 164.
     (160, A64::Direct(164)),         // setrlimit
     (186, A64::Direct(178)),         // gettid
     (200, A64::Direct(131)),         // tgkill

@@ -1,86 +1,85 @@
 // SPDX-License-Identifier: MPL-2.0
-//! **Runde TEMPO 10 — Lebensdauern zerschneiden.**
+//! **Round TEMPO 10 — cutting up lifetimes.**
 //!
-//! ## Das gemessene Problem
+//! ## The measured problem
 //!
-//! `FIRN_RA_STATS=1` sagt fuer den MP3-Dekoder: `synth` hat 44 gleichzeitig
-//! lebende Werte, `l3_huffman` 63 — bei **vierzehn** Registern. Was darueber
-//! liegt, bleibt im Rahmen, und jede Verwendung holt es von dort:
+//! `FIRN_RA_STATS=1` says for the MP3 decoder: `synth` has 44 simultaneously
+//! live values, `l3_huffman` 63 — with **fourteen** registers. What lies above that
+//! stays in the frame, and every use fetches it from there:
 //!
 //! ```text
-//!   mov  -0x1760(%rbp),%rax      ; den Zeiger holen
-//!   lea  (%rax,%r10,1),%r11      ; benutzen
+//!   mov  -0x1760(%rbp),%rax      ; fetch the pointer
+//!   lea  (%rax,%r10,1),%r11      ; use it
 //! ```
 //!
-//! Zwei Befehle statt einem, und das **je Durchlauf**. Ueber das ganze
-//! Programm gezaehlt: 10,0 von 137,7 Millionen Befehlen sind "aus dem Rahmen
-//! holen" — der groesste Einzelposten, der noch steht.
+//! Two instructions instead of one, and that **per iteration**. Counted over the whole
+//! program: 10.0 of 137.7 million instructions are "fetch from the frame" — the
+//! biggest single item that still stands.
 //!
-//! ## Warum der Zuteiler das nicht von selbst loest
+//! ## Why the allocator does not solve this by itself
 //!
-//! Der lineare Scan kennt je Wert EIN Intervall, von der ersten bis zur
-//! letzten Beruehrung, und EINEN Platz. Ein Zeiger, der am Anfang der
-//! Funktion gesetzt und am Ende noch einmal gebraucht wird, belegt sein
-//! Register also ueber die ganze Funktion — oder gar keines. Dazwischen
-//! liegt die heisse Schleife, in der genau dieses Register fehlt.
+//! The linear scan knows ONE interval per value, from the first to the
+//! last touch, and ONE slot. A pointer that is set at the beginning of the
+//! function and needed once more at the end thus occupies its
+//! register over the whole function — or none at all. In between
+//! lies the hot loop, in which exactly this register is missing.
 //!
-//! Die Lehrbuchantwort heisst *live range splitting*: das Intervall in
-//! Stuecke schneiden und jedem Stueck einen eigenen Platz geben. Im Zuteiler
-//! selbst waere das ein Umbau jeder Ausgabestelle — `loc(v)` muesste von der
-//! POSITION abhaengen.
+//! The textbook answer is called *live range splitting*: cut the interval into
+//! pieces and give each piece a slot of its own. In the allocator
+//! itself that would be a rebuild of every output site — `loc(v)` would have to depend on the
+//! POSITION.
 //!
-//! ## Der Weg ohne Umbau: schneiden mit einer Kopie
+//! ## The way without a rebuild: cutting with a copy
 //!
-//! Dasselbe Ergebnis bekommt man, indem man das Stueck zu einem EIGENEN WERT
-//! macht. Vor der Schleife steht
+//! The same result is obtained by making the piece a SEPARATE VALUE. Before
+//! the loop there stands
 //!
 //! ```text
 //! P:  %v2 = copy %v
 //! ```
 //!
-//! und jede Verwendung von `%v` **innerhalb** der Schleife liest ab jetzt
-//! `%v2`. Damit hat `%v2` ein kurzes Intervall mit hohem Gewicht (Leser mal
-//! Schleifentiefe) und bekommt fast sicher ein Register, waehrend `%v`
-//! ruhig im Rahmen liegen bleiben darf. Aus einem Holen je Durchlauf wird
-//! eines je Schleifeneintritt.
+//! and every use of `%v` **inside** the loop reads `%v2` from now on. With that `%v2` has
+//! a short interval with high weight (readers times loop depth) and almost
+//! certainly gets a register, while `%v` may quietly stay in the frame. A fetch
+//! per iteration becomes one per loop entry.
 //!
-//! Der Zuteiler braucht dafuer keine Zeile. Und wenn der Schnitt nichts
-//! bringt — weil `%v` nach der Schleife gar nicht mehr gebraucht wird —,
-//! macht ihn das Verschmelzen aus TEMPO 8/10 von selbst wieder rueckgaengig:
-//! `%v` und `%v2` stoeren sich dann nicht und bekommen denselben Platz, die
-//! Kopie verschwindet.
+//! The allocator needs not a line for this. And if the cut brings nothing — because
+//! `%v` is no longer needed after the loop —, the merging from TEMPO 8/10
+//! undoes it again by itself:
+//! `%v` and `%v2` then do not interfere and get the same slot, the
+//! copy disappears.
 //!
-//! ## Wann geschnitten wird
+//! ## When it is cut
 //!
-//! * Der Wert wird in der Schleife **mindestens zweimal gelesen**. Bei einem
-//!   einzigen Leser waere die Kopie genau so teuer wie das Holen.
-//! * Der Wert wird in der Schleife **nicht geschrieben** — sonst waeren `%v`
-//!   und `%v2` nach dem ersten Durchlauf verschiedene Dinge.
-//! * Er ist **keine Konstante** (die steht als unmittelbarer Operand im
-//!   Befehl und braucht nie einen Platz) und **kein `alloca`** (dessen
-//!   Adresse rechnet `direct_frame_addrs` ohnehin ohne Register aus).
-//! * Er ist nicht `secret` (SPEC §9.2).
-//! * Die Schleife hat einen **Vorkopf** mit genau einem Ausgang, wie bei
+//! * The value is **read at least twice** in the loop. With a
+//!   single reader the copy would be exactly as expensive as the fetch.
+//! * The value is **not written** in the loop — otherwise `%v`
+//!   and `%v2` would be different things after the first iteration.
+//! * It is **not a constant** (that stands as an immediate operand in the
+//!   instruction and never needs a slot) and **not an `alloca`** (whose
+//!   address `direct_frame_addrs` calculates without a register anyway).
+//! * It is not `secret` (SPEC §9.2).
+//! * The loop has a **pre-header** with exactly one exit, as with
 //!   `licm`.
 //!
-//! **`phi`-Anweisungen werden nicht umgeschrieben.** Ein `phi` im
-//! Schleifenkopf liest fuer die Kante aus dem Vorkopf einen Wert, der VOR
-//! der Kopie gilt; die Kante aus dem Rumpf liest einen anderen. Das
-//! auseinanderzuhalten waere moeglich, aber der Gewinn liegt in den
-//! gewoehnlichen Verwendungen, nicht in den phis.
+//! **`phi` instructions are not rewritten.** A `phi` in the
+//! loop head reads for the edge from the pre-header a value that applies BEFORE
+//! the copy; the edge from the body reads a different one. Telling
+//! these apart would be possible, but the gain lies in the
+//! ordinary uses, not in the phis.
 
 use crate::fir::{Func, Inst, Op, Term, Val};
 use std::collections::HashSet;
 
-/// Schneidet Lebensdauern an Schleifengrenzen. Liefert die Anzahl der
-/// eingesetzten Kopien.
+/// Cuts lifetimes at loop boundaries. Returns the number of
+/// inserted copies.
 pub(crate) fn split_at_loops(f: &mut Func) -> usize {
     let n = f.blocks.len();
     if n < 3 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
     }
-    // Dieselbe billige Vorpruefung wie in `licm`: ohne Rueckwaertskante gibt
-    // es keine Schleife.
+    // The same cheap pre-check as in `licm`: without a back edge there
+    // is no loop.
     let backward = f
         .blocks
         .iter()
@@ -104,14 +103,14 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
     if edges.is_empty() {
         return 0;
     }
-    // Innerste Schleifen zuerst: der kleinere Rumpf liegt weiter innen.
+    // Innermost loops first: the smaller body lies further inside.
     let mut loops: Vec<(usize, HashSet<usize>)> = edges
         .into_iter()
         .map(|(h, b)| (h, crate::licm::natural_loop(h, b, &preds)))
         .collect();
     loops.sort_by_key(|(_, body)| body.len());
 
-    // Wo wird was geschrieben? (einmal fuer die ganze Funktion)
+    // Where is what written? (once for the whole function)
     let nv = f.val_types.len();
     let mut def_in: Vec<Option<usize>> = vec![None; nv];
     for (bi, b) in f.blocks.iter().enumerate() {
@@ -123,7 +122,7 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
             }
         }
     }
-    // Welche Werte sind Konstanten oder `alloca`-Adressen?
+    // Which values are constants or `alloca` addresses?
     let mut raw: Vec<bool> = vec![false; nv];
     for b in &f.blocks {
         for i in &b.insts {
@@ -150,7 +149,7 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
             Some(p) => p,
             None => continue,
         };
-        // --- zaehlen: welcher Wert wird im Rumpf wie oft GELESEN? --------
+        // --- count: how often is which value READ in the body? ------------
         let mut readers: Vec<u32> = vec![0; f.val_types.len()];
         let mut written: HashSet<Val> = HashSet::new();
         let mut buf = Vec::new();
@@ -159,8 +158,8 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
                 if let Some(d) = i.dst {
                     written.insert(d);
                 }
-                // Ein `phi` wird nicht umgeschrieben, also zaehlt er auch
-                // nicht als Leser.
+                // A `phi` is not rewritten, so it does not count
+                // as a reader either.
                 if matches!(i.op, Op::Phi { .. }) {
                     continue;
                 }
@@ -193,8 +192,8 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
             if f.is_secret(vv) || raw.get(v).copied().unwrap_or(false) {
                 continue;
             }
-            // Ausserhalb der Schleife definiert, und die Definition muss den
-            // Vorkopf beherrschen (sonst gibt es den Wert dort nicht).
+            // Defined outside the loop, and the definition must dominate the
+            // pre-header (otherwise the value does not exist there).
             if v >= f.params.len() {
                 match def_in.get(v).copied().flatten() {
                     Some(db) => {
@@ -259,29 +258,27 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
 
 
 // ---------------------------------------------------------------------------
-// NACH DER ZUTEILUNG — der Schnitt, der weiss, wofuer er gut ist
+// AFTER THE ALLOCATION — the cut that knows what it is good for
 // ---------------------------------------------------------------------------
 //
-// DIE MESSUNG, DIE DIESEN ZWEITEN ANLAUF ERZWUNGEN HAT. Die Fassung oben
-// schneidet im Optimierer, also BEVOR jemand weiss, welcher Wert ueberhaupt
-// ein Register bekommt. Gemessen am MP3-Dekoder: 137,7 -> 140,4 Mio Befehle,
-// also zwei Prozent SCHLECHTER. Der Grund ist einfach und im Nachhinein
-// offensichtlich: wo der neue Wert auch nur einen Platz bekommt, zahlt man
-// die Kopie im Vorkopf und gewinnt nichts, denn der Rumpf liest dann eben
-// den anderen Platz.
+// THE MEASUREMENT THAT FORCED THIS SECOND ATTEMPT. The version above
+// cuts in the optimiser, that is BEFORE anyone knows which value gets
+// a register at all. Measured on the MP3 decoder: 137.7 -> 140.4 million instructions,
+// that is two percent WORSE. The reason is simple and obvious in hindsight: where the new value
+// gets only a slot, you pay for the copy in the pre-header and gain nothing, because the body
+// then simply reads the other slot.
 //
-// Also andersherum. `emit_func_ra` teilt EINMAL zu, fragt hier nach, welche
-// Werte wirklich im Rahmen gelandet sind UND in einer Schleife mehrfach
-// gelesen werden, schneidet nur diese, und teilt noch einmal zu. Bekommt
-// dabei kein einziger der neuen Werte ein Register, wird der Schnitt
-// verworfen — dann kostet er nur Uebersetzungszeit und kein einziges Bit im
-// Programm.
+// So the other way round. `emit_func_ra` allocates ONCE, asks here which
+// values really landed in the frame AND are read several times in a loop, cuts only
+// these, and allocates once more. If in doing so not a single one of the new values
+// gets a register, the cut is discarded — then it costs only
+// translation time and not a single bit in the program.
 
-/// Werte, die im Rahmen gelandet sind und in einer Schleife mehrfach gelesen
-/// werden: fuer jeden eine Kopie in den Vorkopf, und im Rumpf liest alles
-/// die Kopie. `None` = es gibt nichts zu schneiden.
+/// Values that landed in the frame and are read several times in a loop:
+/// for each a copy into the pre-header, and in the body everything reads
+/// the copy. `None` = there is nothing to cut.
 ///
-/// Liefert die geaenderte Funktion und die Liste der neuen Werte.
+/// Returns the changed function and the list of the new values.
 pub(crate) fn after_allocation(
     f: &Func,
     in_frame: &dyn Fn(Val) -> bool,
@@ -386,8 +383,8 @@ pub(crate) fn after_allocation(
             if f.is_secret(vv) || raw[v] {
                 continue;
             }
-            // DAS IST DER UNTERSCHIED ZUR FASSUNG OBEN: nur was der Zuteiler
-            // wirklich in den Rahmen gelegt hat.
+            // THAT IS THE DIFFERENCE TO THE VERSION ABOVE: only what the allocator
+            // really put into the frame.
             if !in_frame(vv) {
                 continue;
             }
@@ -447,7 +444,7 @@ pub(crate) fn after_allocation(
     if fresh.is_empty() {
         None
     } else {
-        // Der Schnitt darf nicht sofort wieder verschmolzen werden.
+        // The cut must not be merged again at once.
         for v in fresh.iter() {
             g.no_coalesce.insert(*v);
         }
