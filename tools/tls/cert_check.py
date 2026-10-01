@@ -283,14 +283,18 @@ def main():
     real_ok = 0
     real_bad = []
     if real:
-        cases2 = [("real " + h, h, NOW_UNIX, [p], "OK") for h, p in real]
+        # the chains are frozen files; check them at the day they were
+        # harvested (2026-08-26), not today -- a harvested leaf expires
+        REAL_NOW = int(datetime.datetime(2026, 8, 26, 12, 0,
+                                         tzinfo=UTC).timestamp())
+        cases2 = [("real " + h, h, REAL_NOW, [p], "OK") for h, p in real]
         # And the counter-check: every one of them under a WRONG name. The
         # name has a suffix rather than a prefix, because a prefix is
         # exactly what a `*.` wildcard matches -- `not-en.wikipedia.org`
         # really IS covered by Wikipedia's `*.wikipedia.org`, and the first
         # run of this file said so. A trailing `.invalid` cannot be
         # wildcarded by anything (RFC 2606).
-        cases2 += [("real wrong name " + h, h + ".invalid", NOW_UNIX, [p],
+        cases2 += [("real wrong name " + h, h + ".invalid", REAL_NOW, [p],
                     "NAME") for h, p in real]
         # ... and every one of them at a time long past its notAfter
         cases2 += [("real expired " + h, h, 2145916800, [p],

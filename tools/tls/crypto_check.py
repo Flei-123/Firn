@@ -174,6 +174,12 @@ def gcm_cases():
             h(want))
         add("AEADGCMOPEN %s %s %s %s" % (h(k), h(n), h(aad), h(want)),
             h(p))
+    # an EMPTY message is a valid message: open must answer ".", not ERR
+    k = secrets.token_bytes(16)
+    n = secrets.token_bytes(12)
+    add("AEADGCMOPEN %s %s %s %s" % (h(k), h(n), h(b"head"),
+                                      h(AESGCM(k).encrypt(n, b"", b"head"))),
+        h(b""))
     k = secrets.token_bytes(16)
     n = secrets.token_bytes(12)
     ct = bytearray(AESGCM(k).encrypt(n, b"the message", b"head"))
