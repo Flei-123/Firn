@@ -1,96 +1,96 @@
-# Runde TEMPO 2 — das Uebergaberegister, Zellen in `xmm`, und `--cpu=avx`
+# Round TEMPO 2 — the handover register, cells in `xmm`, and `--cpu=avx`
 
-Stand 21.09.2026, Zweig `xmm-ra`. Alles gemessen, nicht geschaetzt. Zeiten:
-kleinste von neun Laeufen, Ausgabe nach `/dev/null` (das Schreiben von
-10,6 MB PCM verdeckt sonst genau den Unterschied, um den es geht), ruhige
-Maschine, AMD EPYC 7571. Befehlszahlen: `valgrind --tool=callgrind` auf 8 s
-Ton, Zuordnung per `nm`.
+State 21.09.2026, branch `xmm-ra`. Everything measured, not estimated. Times:
+smallest of nine runs, output to `/dev/null` (writing 10.6 MB of PCM
+otherwise covers exactly the difference we are after), quiet
+machine, AMD EPYC 7571. Instruction counts: `valgrind --tool=callgrind` on 8 s
+of sound, mapping via `nm`.
 
 ## Wo Runde TEMPO 1 aufgehoert hat
 
-Der MP3-Dekoder stand bei 324 Mio Befehlen. Die Messung zeigte zwei Dinge
-klar:
+The MP3 decoder stood at 324 M instructions. The measurement showed two things
+clearly:
 
-* `synth` allein waren **112 Mio** davon, und im Erzeugten stand pro
-  Rechenschritt ein Paar wie dieses:
+* `synth` alone was **112 M** of them, and in the generated code there stood per
+  calculation step a pair like this:
 
-      movss  [rbp-3912], xmm0     <- hinschreiben
-      movss  xmm0, [rbp-3912]     <- und gleich wieder holen
+      movss  [rbp-3912], xmm0     <- write it out
+      movss  xmm0, [rbp-3912]     <- and fetch it right back
 
-* 51 `movaps` in derselben Funktion: SSE hat nur die zweistellige Form,
-  `mulss d, s` rechnet also immer INS Ziel, und wenn der erste Operand
-  woanders liegt, muss er vorher kopiert werden.
+* 51 `movaps` in the same function: SSE has only the two-operand form,
+  `mulss d, s` therefore always calculates INTO the destination, and if the first operand
+  lies elsewhere, it has to be copied beforehand.
 
-## 1. Das Uebergaberegister (wirkt, −4,7 %)
+## 1. The handover register (works, −4.7 %)
 
-Zwoelf `xmm` reichen in einer dicht gerechneten Schleife nicht; wer keines
-bekommt, liegt im Rahmen. Aber: hat so ein Wert **genau einen** Leser, und
-steht der kurz darauf im selben Block, dann braucht er den Rahmen ueberhaupt
-nicht — er kann im Register stehen bleiben.
+Twelve `xmm` are not enough in a densely calculated loop; whoever gets none
+lies in the frame. But: if such a value has **exactly one** reader, and
+it stands shortly after in the same block, then it does not need the frame at all
+— it can stay in the register.
 
-`fp_handover` (in `regalloc.rs`) sammelt diese Werte je Grundblock und
-verteilt sie gierig auf die Register, die der Zuteiler nie ausgibt: `xmm2`,
-`xmm3` und alles aus dem Vorrat `xmm4`–`xmm15`, was die Funktion gar nicht
-braucht. Bedingungen, alle noetig:
+`fp_handover` (in `regalloc.rs`) collects these values per basic block and
+distributes them greedily onto the registers that the allocator never hands out: `xmm2`,
+`xmm3` and everything from the pool `xmm4`–`xmm15` that the function does not
+need at all. Conditions, all necessary:
 
-* der Wert ist eine Gleitzahl, hat **keinen** Platz im Register bekommen,
-  ist keine Zelle, kein Alias, keine unmittelbare Konstante, nicht `secret`,
-* er wird **genau einmal** gelesen,
-* Erzeuger UND Leser stehen im Fliesskommaweg der Ausgabe (dieselbe
-  Bedingung, die den Fehler aus Runde XMM 3 abgestellt hat),
-* der Leser steht im selben Block, hoechstens sechzehn Anweisungen weiter,
-  und dazwischen liegt **kein Aufruf** — jedes `xmm` ist caller-saved.
+* the value is a floating-point number, got **no** slot in a register,
+  is no cell, no alias, no immediate constant, not `secret`,
+* it is read **exactly once**,
+* producer AND reader stand in the floating-point path of the output (the same
+  condition that fixed the bug from round XMM 3),
+* the reader stands in the same block, at most sixteen instructions further on,
+  and in between lies **no call** — every `xmm` is caller-saved.
 
-Ueberschneidungen gibt es wirklich (`t1` wird erzeugt, dann `t2`, erst
-danach werden beide gelesen); deshalb steht dahinter eine kleine
-Intervallverteilung und kein einzelnes Register.
+Overlaps do really exist (`t1` is produced, then `t2`, only
+afterwards are both read); that is why a small
+interval distribution stands behind this and not a single register.
 
 **324 Mio -> 308 Mio Befehle, 0,29 s -> 0,25 s.**
 
-## 2. Fliesskomma-Zellen in `xmm` (ehrlich: hier ohne Wirkung)
+## 2. Floating-point cells in `xmm` (honestly: no effect here)
 
-Eine Zelle ist eine `alloca`, die eine Variable haelt. Bis jetzt konnte sie
-nur ein GANZZAHLregister bekommen — eine `f32`-Summe reiste dann bei jedem
-Zugriff per `movd` zwischen `r13` und der Recheneinheit hin und her. Jetzt
-darf eine Zelle, die eine Gleitzahl haelt und nur im Fliesskommaweg angefasst
-wird, ein `xmm` bekommen; Laden und Schreiben sind dann eine Kopie oder gar
-nichts.
+A cell is an `alloca` that holds a variable. Until now it could
+only get an INTEGER register — an `f32` sum then travelled at every
+access via `movd` between `r13` and the arithmetic unit. Now
+a cell that holds a floating-point number and is touched only in the floating-point path
+may get an `xmm`; loading and writing are then a copy or nothing
+at all.
 
-**Gemessen im Dekoder: null Wirkung** — und der Grund ist ehrlich zu nennen:
-`mem2reg` befoerdert diese Variablen laengst zu gewoehnlichen Werten mit
-`phi`, es gibt in `lib/ton/mp3.fi` bei `release-fast` **keine** einzige
-Fliesskomma-Zelle (`FIRN_FPCELL_DEBUG=1` sagt es je Funktion). Uebrig bleibt
-die Wirkung dort, wo `mem2reg` nicht laeuft — `--opt-level=dev` — und in
-Funktionen, deren `alloca` aus anderen Gruenden stehen bleibt. Der Code
-bleibt drin, weil er nichts kostet und die Klassenverwechslung, die es
-vorher gab (`movd` durch ein Ganzzahlregister), ohnehin niemand will.
+**Measured in the decoder: zero effect** — and the reason is to be stated honestly:
+`mem2reg` has long since promoted these variables to ordinary values with
+`phi`, there is in `lib/ton/mp3.fi` at `release-fast` **not a single**
+floating-point cell (`FIRN_FPCELL_DEBUG=1` says so per function). What remains is
+the effect where `mem2reg` does not run — `--opt-level=dev` — and in
+functions whose `alloca` stays for other reasons. The code
+stays in, because it costs nothing and nobody wants the class confusion that
+existed before (`movd` through an integer register) anyway.
 
 ## 3. `--cpu=avx`: die Dreioperandenform (−11 % Befehle, −8 % Zeit)
 
-`vmulss d, a, b` nennt sein Ziel selbst. Damit entfaellt die Kopie, die SSE
-erzwingt. Neu ist der Schalter `--cpu=<baseline|avx>` (Voreinstellung
-`baseline`, also SSE2 wie bisher; `FIRN_CPU=avx` wirkt genauso, damit die
-volle Testreihe in beiden Stufen laufen kann).
+`vmulss d, a, b` names its destination itself. With that the copy that SSE
+forces is gone. New is the switch `--cpu=<baseline|avx>` (default
+`baseline`, so SSE2 as before; `FIRN_CPU=avx` acts the same, so that the
+full test series can run in both stages).
 
 Zwei Teile:
 
-1. **Die Umschrift.** `addss d, s` und `vaddss d, d, s` bedeuten dasselbe;
-   `vexify` in `codegen_x86.rs` schreibt jede SSE-Anweisung des Weges in ihre
-   VEX-Form um. Das bringt selbst **kein** Tempo — es verhindert, dass in
-   einer Funktion beide Formen gemischt stehen. Auf Intel kostet jeder
-   Wechsel zwischen altem SSE und VEX zweistellige Taktzahlen und wuerde den
-   Gewinn auffressen.
-2. **Die echte Dreioperandenform** in der Rechnung selbst (`emit_bin`,
-   Vorzeichenumkehr): erste Quelle ein Register, zweite darf Speicher sein,
-   Ziel frei — die Kopie verschwindet.
+1. **The rewrite.** `addss d, s` and `vaddss d, d, s` mean the same;
+   `vexify` in `codegen_x86.rs` rewrites every SSE instruction of the path into its
+   VEX form. That brings **no** speed by itself — it prevents both forms from standing
+   mixed in one function. On Intel every
+   switch between old SSE and VEX costs two-digit cycle counts and would eat up the
+   gain.
+2. **The real three-operand form** in the calculation itself (`emit_bin`,
+   sign reversal): first source a register, second may be memory,
+   destination free — the copy disappears.
 
-Nur der Weg mit Registerzuteilung schreibt VEX. Der Grundweg bleibt bei SSE,
-weil dort `simd.rs` `v128`-Werte in den Registern haelt und eine Umschrift von
-`movss` auf `vmovaps` deren obere Haelfte ausloeschen wuerde.
+Only the path with register allocation writes VEX. The basic path stays with SSE,
+because there `simd.rs` holds `v128` values in the registers and a rewrite from
+`movss` to `vmovaps` would wipe out their upper half.
 
-Eine Feinheit ist dokumentiert: `movss xmm1, xmm2` laesst die oberen 96 Bit
-stehen, `vmovaps xmm1, xmm2` nicht. Auf diesem Weg ist das gleichgueltig, weil
-er nur Skalare haelt.
+One subtlety is documented: `movss xmm1, xmm2` leaves the upper 96 bits
+standing, `vmovaps xmm1, xmm2` does not. On this path that is irrelevant, because
+it holds only scalars.
 
 ## Die Zahlen
 
@@ -106,12 +106,12 @@ MP3-Dekoder, 60 s Ton (192 kbit/s, Stereo), `release-fast`:
 | dasselbe C, `-O2 -fno-tree-vectorize` | — | 0,10 s |
 | dasselbe C, `-O0` | — | 0,39 s |
 
-**Abstand zu C:** 3,3x gegen `gcc -O2` (das seine Schleifen selbst
-vektorisiert), **2,3x** gegen dasselbe C ohne Vektorisierung. Gegen `-O0` ist
-Firn schneller.
+**Distance to C:** 3.3x against `gcc -O2` (which vectorises its loops itself),
+**2.3x** against the same C without vectorisation. Against `-O0` Firn is
+faster.
 
-Ein reiner `f32`-Rechenkern (vier Summen, acht Fensterpaare, `bench/kern.c`
-gegen dieselbe Schleife in Firn):
+A pure `f32` calculation kernel (four sums, eight window pairs, `bench/kern.c`
+against the same loop in Firn):
 
 | | Zeit |
 |---|---|
@@ -120,23 +120,22 @@ gegen dieselbe Schleife in Firn):
 | C `gcc -O2` | 0,03 s |
 | C `gcc -O2 -mavx2` | 0,02 s |
 
-Richtigkeit: die PCM-Ausgabe ist in **allen** Stufen bitgleich
-(`cmp` ueber 10,6 MB, in `baseline` wie in `avx`), der Selbsttest des
-Dekoders gibt PASS 4/4. `bash test.sh` laeuft ohne neuen Fehler, in
-`baseline` und mit `FIRN_CPU=avx`.
+Correctness: the PCM output is bit-identical in **all** stages
+(`cmp` over 10.6 MB, in `baseline` as in `avx`), the self-test of the
+decoder gives PASS 4/4. `bash test.sh` runs without a new error, in
+`baseline` and with `FIRN_CPU=avx`.
 
-## Was jetzt noch zwischen Firn und C steht
+## What still stands between Firn and C
 
-Gemessen, nicht geraten:
+Measured, not guessed:
 
-1. **Vektorisierung.** 30 % des Vorsprungs von `gcc -O2` kommen daher, dass
-   es die Schleifen selbst in `packed`-Befehle giesst (vier `f32` je
-   Anweisung). Firn hat `v128` als Sprachmittel, aber keinen Pass, der es
-   von sich aus benutzt.
-2. **Lebensdauern an Aufrufen zerschneiden.** Wer einen Aufruf ueberlebt,
-   bekommt heute gar kein Register. In `synth` stehen deshalb drei
-   Basiszeiger im Rahmen und werden vor jedem Zugriff neu geholt.
-3. **Anordnung der Befehle.** Firn gibt die Anweisungen in FIR-Reihenfolge
-   aus. Ein Laden dicht vor seinen Verbraucher zu ziehen, senkt den Druck auf
-   die Register und damit die Zahl der Werte, die ueberhaupt in den Rahmen
-   muessen.
+1. **Vectorisation.** 30 % of the lead of `gcc -O2` comes from it
+   pouring the loops itself into `packed` instructions (four `f32` per
+   instruction). Firn has `v128` as a language feature, but no pass that uses it
+   by itself.
+2. **Cutting lifetimes at calls.** Whoever survives a call
+   gets no register today. In `synth` three
+   base pointers therefore stand in the frame and are fetched anew before every access.
+3. **Ordering of the instructions.** Firn emits the instructions in FIR order.
+   Pulling a load close to its consumer lowers the pressure on
+   the registers and thereby the number of values that have to go into the frame at all.

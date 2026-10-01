@@ -125,61 +125,61 @@ Threshold: three readers in the loop (`FIRN_SPLIT_MIN`), switchable off with
 
 MP3-Dekoder, 8 s Ton, `release-fast`, `valgrind --tool=callgrind`:
 
-| | Befehle |
+| | Instructions |
 |---|---|
-| nach TEMPO 9 | 146,3 Mio |
-| + Zweioperandenform | 138,8 Mio |
-| + aggressives Verschmelzen, Plaetze | 137,7 Mio |
-| **+ Dichte + Schnitt (TEMPO 10)** | **135,4 Mio** |
-| dasselbe mit `--cpu=avx` | **127,1 Mio** |
-| `minimp3` in C, `gcc -O2` | 74,8 Mio |
+| after TEMPO 9 | 146.3 M |
+| + two-operand form | 138.8 M |
+| + aggressive merging, slots | 137.7 M |
+| **+ density + cut (TEMPO 10)** | **135.4 M** |
+| the same with `--cpu=avx` | **127.1 M** |
+| `minimp3` in C, `gcc -O2` | 74.8 M |
 
-Und die Wanduhr, 60 s Ton, kleinste von elf Laeufen, Ausgabe nach
+And the wall clock, 60 s of sound, smallest of eleven runs, output to
 `/dev/null`:
 
-| | Zeit |
+| | Time |
 |---|---|
-| Firn nach TEMPO 8 | 0,15 s |
-| **Firn jetzt** | **0,13 s** |
-| Firn mit `--cpu=avx` | 0,12 s |
-| C, `gcc -O2` | 0,06 s |
-| dasselbe C ohne Auto-Vektorisierung | 0,09 s |
-| dasselbe C mit `-O0` | 0,36 s |
+| Firn after TEMPO 8 | 0.15 s |
+| **Firn now** | **0.13 s** |
+| Firn with `--cpu=avx` | 0.12 s |
+| C, `gcc -O2` | 0.06 s |
+| the same C without auto-vectorisation | 0.09 s |
+| the same C with `-O0` | 0.36 s |
 
-Also **2,2x hinter `gcc -O2`** (mit AVX 2,0x) und **1,4x** hinter demselben
-C ohne Auto-Vektorisierung. Zu Beginn der Tempo-Runden waren es 8,3x.
+So **2.2x behind `gcc -O2`** (with AVX 2.0x) and **1.4x** behind the same
+C without auto-vectorisation. At the start of the tempo rounds it was 8.3x.
 
-Die Bank (`bench/firn/`) zeigt keine Verschlechterung: zehn von elf
-Programmen Befehl fuer Befehl gleich, `jsonscan` −1,8 %. Diese Programme
-haben kaum Registerdruck — dort gibt es nichts zu verteilen.
+The bank (`bench/firn/`) shows no deterioration: ten of eleven
+programs instruction for instruction the same, `jsonscan` −1.8 %. These programs
+have hardly any register pressure — there is nothing to distribute there.
 
-Die Uebersetzung von `bin/firnc1.fi` dauert 4,9 statt 4,5 Sekunden (+7 %);
-das ist die zweite Zuteilung fuer Funktionen mit Schleifen und Ueberlauf.
+The translation of `bin/firnc1.fi` takes 4.9 instead of 4.5 seconds (+7 %);
+that is the second allocation for functions with loops and overflow.
 
 ## Geprueft
 
-Alle 318 Testprogramme in vier Baustufen, `self_compare` 339 von 339 mit
-gleichem Verhalten (0 abweichend, 0 fehlerhaft), und der **Fixpunkt**: Firn
-uebersetzt sich selbst, Stufe 2 und Stufe 3 zeichengleich (793 453 Zeilen
-Assembler). Die PCM-Ausgabe des Dekoders ist nach jedem einzelnen Schritt
-bitgleich, in beiden CPU-Stufen. Die drei roten Punkte des Laufs
-(`tools/js/run.sh` an einer fehlenden `testdata/test262/subset.sha256`,
-`tools/fmt/run.sh` an ungeformten Dateien in `lib/fui/`,
-`tools/english/check.sh` an Bezeichnern in `lib/fui/`) sind aelter als diese
-Runde; die Bezeichner IM UEBERSETZER sind seit dieser Runde alle englisch
-(25 -> 18 gemeldete, keiner mehr unter `compiler/src/`).
+All 318 test programs in four build stages, `self_compare` 339 of 339 with
+the same behaviour (0 deviating, 0 faulty), and the **fixed point**: Firn
+translates itself, stage 2 and stage 3 character-identical (793,453 lines of
+assembler). The PCM output of the decoder is bit-identical after every single step,
+in both CPU stages. The three red points of the run
+(`tools/js/run.sh` on a missing `testdata/test262/subset.sha256`,
+`tools/fmt/run.sh` on unformatted files in `lib/fui/`,
+`tools/english/check.sh` on identifiers in `lib/fui/`) are older than this
+round; the identifiers IN THE TRANSLATOR are all English since this round
+(25 -> 18 reported, none any more under `compiler/src/`).
 
-## Was jetzt noch dasteht
+## What still stands there now
 
-| Muster | Befehle |
+| Pattern | Instructions |
 |---|---|
-| aus dem Rahmen holen | 10,0 Mio |
-| `movaps xmm,xmm` (die Quelle lebt wirklich weiter) | 8,7 Mio |
-| `mov rA,rB` + `add $K` | 2,0 Mio |
-| `mov $K,r` + `imul` | 0,8 Mio |
+| fetch from the frame | 10.0 M |
+| `movaps xmm,xmm` (the source really lives on) | 8.7 M |
+| `mov rA,rB` + `add $K` | 2.0 M |
+| `mov $K,r` + `imul` | 0.8 M |
 
-Die letzten beiden sind der naechste, einfache Schritt: `lea` darf auch mit
-32-Bit-Ziel benutzt werden (`lea %edx,0x1(%r10)` rechnet die Adresse in 64
-Bit und schneidet auf 32 — genau die Arithmetik modulo 2^32, die ein 32-Bit
-`add` macht), und bei einer vertauschbaren Rechnung gehoert die Konstante
-nach rechts, damit die vorhandene Faltung sie sieht.
+The last two are the next, simple step: `lea` may also be used with a
+32-bit destination (`lea %edx,0x1(%r10)` calculates the address in 64
+bits and cuts to 32 — exactly the arithmetic modulo 2^32 that a 32-bit
+`add` does), and for a commutative calculation the constant belongs
+on the right, so that the existing folding sees it.

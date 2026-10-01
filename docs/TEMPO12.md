@@ -1,57 +1,57 @@
-# TEMPO 12 -- zwei Versuche, beide gemessen und NICHT uebernommen
+# TEMPO 12 -- two attempts, both measured and NOT adopted
 
-Stand vorher: TEMPO 11, MP3-Dekoder 8 s Ton = 128,5 Mio Befehle.
-Der Code liegt auf dem Zweig `tempo12-versuch` (Commit 67548aa4).
+State before: TEMPO 11, MP3 decoder 8 s of sound = 128.5 M instructions.
+The code lies on the branch `tempo12-versuch` (commit 67548aa4).
 
 ## Die Frage
 
-`l3_huffman` braucht 20,0 Mio Befehle, C 12,1 Mio. Der Zustand des
-Bitlesers (`HuffLage { cache, sh, next }`) liegt die ganze Funktion ueber im
-Rahmen, weil der Dekoder einen Zeiger darauf an die Helfer gibt.
-`FIRN_RA_STATS`: 958 Werte, 163 in Registern, **maxlive = 86**, 92 Werte
-kreuzen einen Aufruf.
+`l3_huffman` needs 20.0 M instructions, C 12.1 M. The state of the
+bit reader (`HuffLage { cache, sh, next }`) lies in the frame
+the whole function, because the decoder passes a pointer to it to the helpers.
+`FIRN_RA_STATS`: 958 values, 163 in registers, **maxlive = 86**, 92 values
+cross a call.
 
 ## Versuch 1: SROA (`sroa.rs`)
 
-Ein `alloca`, dessen Adresse nur als `load`/`store`-Adresse benutzt wird
-(direkt oder ueber `ptradd` mit konstantem Versatz), wird in eine Zelle je
-Feld zerlegt; `mem2reg` befoerdert die Felder danach.
+An `alloca` whose address is used only as a `load`/`store` address
+(directly or via `ptradd` with a constant offset) is split into one cell per
+field; `mem2reg` promotes the fields afterwards.
 
-Er greift: die Speicherzugriffe in `l3_huffman` fallen im FIR von 110 auf 42.
-Und das Programm wird **langsamer: 128,5 -> 132,1 Mio (+2,8 %)**,
-`l3_huffman` 20,0 -> 23,6 Mio. Die drei Felder werden zu Werten, die ueber
-alle Schleifen leben; bei 86 gleichzeitig lebenden Werten auf 14 Registern
-bekommen sie keins, und statt eines Speicheroperanden stehen jetzt
-Rahmenkopien an jeder Rueckwaertskante. Auf der Benchmark-Bank: keine
-Aenderung.
+It takes effect: the memory accesses in `l3_huffman` fall in FIR from 110 to 42.
+And the program gets **slower: 128.5 -> 132.1 M (+2.8 %)**,
+`l3_huffman` 20.0 -> 23.6 M. The three fields become values that live across
+all loops; with 86 simultaneously live values on 14 registers
+they get none, and instead of a memory operand there now stand
+frame copies at every back edge. On the benchmark bank: no
+change.
 
-## Versuch 2: caller-saved Register ueber einen Aufruf retten
+## Attempt 2: save caller-saved registers across a call
 
-Bisher: ein Wert, der einen Aufruf kreuzt, bekommt nur eines der fuenf
-callee-saved Register, eine Gleitzahl gar keins. Neu: jedes Register, und
-am Aufruf wird abgelegt/zurueckgeholt, wenn das billiger ist als der Wert im
-Rahmen (Kosten = 2 x Gewicht der gekreuzten Aufrufe).
+Until now: a value that crosses a call gets only one of the five
+callee-saved registers, a floating-point number none at all. New: any register, and
+at the call it is stored/restored if that is cheaper than the value in the
+frame (cost = 2 x weight of the crossed calls).
 
-| Variante | MP3 (Mio) |
+| Variant | MP3 (M) |
 |---|---|
-| aus | 128,5 |
-| Ganzzahl + Gleitzahl, Faktor 1..100 | 129,3 -- 134,0 |
-| nur Gleitzahl | +0,01 % |
+| off | 128.5 |
+| integer + floating point, factor 1..100 | 129.3 -- 134.0 |
+| floating point only | +0.01 % |
 
-Warum es verliert: Die Zuteilung ist ein linearer Durchlauf nach Beginn.
-Werte, die frueher gar kein Register bekamen, nehmen jetzt die callee-saved
-Register zuerst, und die Werte, die sie vorher hatten, landen in
-caller-saved Registern und muessen an JEDEM Aufruf gesichert werden
-(`l3_imdct36`: fuenf Sicherungen um zwei Aufrufe von `l3_dct3_9` je Band).
-`fib` gewann in der ersten Fassung 5,4 %, nach der Korrektur nichts mehr.
+Why it loses: the allocation is a linear pass by start.
+Values that formerly got no register at all now take the callee-saved
+registers first, and the values that had them before end up in
+caller-saved registers and have to be saved at EVERY call
+(`l3_imdct36`: five saves around two calls of `l3_dct3_9` per band).
+`fib` gained 5.4 % in the first version, after the correction nothing more.
 
-## Was daraus folgt
+## What follows from this
 
-Beide Versuche scheitern an derselben Stelle: die Intervalle haben keine
-**Luecken**. Ein Wert lebt vom ersten bis zum letzten Beruehren am Stueck;
-in `l3_huffman` sind das 86 gleichzeitig, obwohl in der heissen
-count1-Schleife vielleicht zwoelf wirklich gebraucht werden. Solange das so
-ist, verschiebt jede Aenderung nur, WER im Rahmen landet. Der naechste
-echte Schritt ist ein Zuteiler mit Lebensdauer-Luecken (Intervall = Liste von
-Stuecken, wie bei Wimmer/Franz) -- danach lohnen sich SROA und die
-Aufrufsicherung vermutlich von selbst, und sie liegen fertig auf dem Zweig.
+Both attempts fail at the same place: the intervals have no
+**gaps**. A value lives from the first to the last touch in one piece;
+in `l3_huffman` that is 86 at the same time, although in the hot
+count1 loop perhaps twelve are really needed. As long as that is so,
+every change only shifts WHO ends up in the frame. The next
+real step is an allocator with lifetime gaps (interval = list of
+pieces, as with Wimmer/Franz) -- after that SROA and the
+call save presumably pay off by themselves, and they lie ready on the branch.
