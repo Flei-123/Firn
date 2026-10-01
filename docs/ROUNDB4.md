@@ -339,7 +339,7 @@ https://...` — and demands the refusal both times.
 
 What it would have taken, so that nobody thinks it was almost there: TLS
 1.3 is a record layer, X25519, AES-GCM or ChaCha20-Poly1305, HKDF,
-SHA-256, ASN.1/DER, certificate chain building and a trust store. It is a
+SHA-256, `ASN.1/DER`, certificate chain building and a trust store. It is a
 round of its own, and anything less than all of it is a lie in the address
 bar.
 

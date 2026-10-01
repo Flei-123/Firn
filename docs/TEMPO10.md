@@ -1,123 +1,122 @@
-# Runde TEMPO 10 — drei Antworten auf dieselbe Frage: wem gehoert das Register?
+# Round TEMPO 10 — three answers to the same question: who owns the register?
 
-Stand 23.09.2026, Zweig `xmm-ra`. Ausgangspunkt war die Zaehlung nach
-TEMPO 9 — nicht je Funktion, sondern **je Muster ueber das ganze Programm**
-(`/tmp`-Werkzeug, Vorlage in TEMPO 9):
+State 23.09.2026, branch `xmm-ra`. The starting point was the count after
+TEMPO 9 — not per function, but **per pattern over the whole program**
+(`/tmp` tool, template in TEMPO 9):
 
-| Muster | Befehle | Anteil |
+| Pattern | Instructions | Share |
 |---|---|---|
-| **`movaps xmm,xmm`** (SSE-Zweioperandenform) | **16,3 Mio** | **11,1 %** |
-| **aus dem Rahmen holen** | **10,3 Mio** | **7,0 %** |
-| `mov rA,rB` + `add $K` (statt `lea`) | 2,1 Mio | 1,4 % |
-| `mov $K,r` + `imul` (statt `lea`/`shl`) | 0,8 Mio | 0,6 % |
+| **`movaps xmm,xmm`** (SSE two-operand form) | **16.3 M** | **11.1 %** |
+| **fetch from the frame** | **10.3 M** | **7.0 %** |
+| `mov rA,rB` + `add $K` (instead of `lea`) | 2.1 M | 1.4 % |
+| `mov $K,r` + `imul` (instead of `lea`/`shl`) | 0.8 M | 0.6 % |
 
-Die beiden ersten sind dieselbe Frage in zwei Kleidern: **wer bekommt ein
-Register, und wie lange behaelt er es.** Diese Runde gibt drei Antworten.
+The first two are the same question in two disguises: **who gets a
+register, and how long does he keep it.** This round gives three answers.
 
 ---
 
-## 1. Die Zweioperandenform ist auch eine Kopie (16,3 → 8,7 Mio)
+## 1. The two-operand form is also a copy (16.3 → 8.7 M)
 
-SSE hat keine Dreioperandenform: `mulps d, s` heisst `d = d * s`. Der
-Erzeuger kopiert deshalb erst den ersten Operanden ins Ziel und rechnet dann:
+SSE has no three-operand form: `mulps d, s` means `d = d * s`. The
+generator therefore first copies the first operand into the destination and then calculates:
 
 ```text
 movaps %xmm13,%xmm7
 mulps  %xmm12,%xmm7
 ```
 
-Stirbt `%xmm13` bei dieser Multiplikation, ist die Kopie fuer nichts — `a`
-und `d` duerfen dasselbe Register haben. Das ist **genau die Frage, die das
-Verschmelzen aus TEMPO 8 schon beantwortet**, nur fuer eine andere
-Anweisungsart. Die Kandidatensuche nimmt jetzt zusaetzlich
+If `%xmm13` dies at this multiplication, the copy is for nothing — `a`
+and `d` may have the same register. That is **exactly the question that the
+merging from TEMPO 8 already answers**, only for a different kind of
+instruction. The candidate search now additionally takes
 
-* `Op::Bin(+,-,*,/)` mit Gleitzahltyp,
-* `Op::Un(Neg)` mit Gleitzahltyp,
-* jeden `Op::Simd`, der in seinem ersten Operanden rechnet
-  (`addps`, `subps`, `mulps`, die drei Vergleiche, `pcmpgtd`, `pand`,
+* `Op::Bin(+,-,*,/)` with a floating-point type,
+* `Op::Un(Neg)` with a floating-point type,
+* every `Op::Simd` that calculates in its first operand
+  (`addps`, `subps`, `mulps`, the three comparisons, `pcmpgtd`, `pand`,
   `pandn`, `por`, `pxor`, `paddd`, `psubd`, `punpckldq/hi`).
 
-**Die Bedingung musste dafuer geschaerft werden**, und das war der lehrreiche
-Teil. Fuer eine echte Kopie hiess sie "die Quelle hat genau einen Leser".
-Fuer die Zweioperandenform ist das zu streng: in der heissen Schleife der
-Synthesefilterbank wird derselbe Vektor ZWEIMAL multipliziert, und beim
-zweiten Mal stirbt er — genau dort darf das Ziel sein Register erben. Die
-richtige Frage ist nicht, wie oft der Wert gelesen wird, sondern ob er **nach
-dieser Anweisung noch lebt**. Mit "genau ein Leser": 146,3 → 141,6 Mio. Mit
-"stirbt hier": 146,3 → **138,8 Mio**.
+**The condition had to be sharpened for this**, and that was the instructive
+part. For a real copy it said "the source has exactly one reader".
+For the two-operand form that is too strict: in the hot loop of the
+synthesis filter bank the same vector is multiplied TWICE, and the
+second time it dies — exactly there the destination may inherit its register. The
+right question is not how often the value is read, but whether it **still lives
+after this instruction**. With "exactly one reader": 146.3 → 141.6 M. With
+"dies here": 146.3 → **138.8 M**.
 
-Dieselbe Lockerung gilt seitdem auch fuer echte Kopien: die Chaitin-Frage
-("stoeren sie sich?") ist die vollstaendige Bedingung, "genau ein Leser" war
-nur Vorsicht. `FIRN_COAL_ENG=1` stellt die vorsichtige Fassung wieder her
-(gemessen 1,0 Mio schlechter).
+The same relaxation has applied since to real copies too: the Chaitin question
+("do they interfere?") is the complete condition, "exactly one reader" was
+only caution. `FIRN_COAL_ENG=1` restores the cautious version
+(measured 1.0 M worse).
 
-Dazu kommt, dass jetzt auch **zwei Rahmenplaetze** verschmolzen werden, aber
-**nur fuer Ganzzahlen**: bei Gleitzahlen legt `fp_handover` einen Wert ohne
-Register in `xmm2` statt in den Rahmen, und die Kopie haette dann geglaubt,
-Quelle und Ziel seien derselbe Platz. An genau dieser Falle ist TEMPO 8 schon
-einmal gestorben (`tests/1182_layout_float_probe.fi`).
-
----
-
-## 2. Dichte statt Summe (137,7 → 136,7 Mio, und der Tueroeffner)
-
-Wenn kein Register frei ist, verdraengt der lineare Scan das aktive Intervall
-mit dem **kleinsten Gewicht** (Verwendungen mal Schleifentiefe). Das
-bevorzugt lange Intervalle: ein Wert mit fuenfzig ueber die ganze Funktion
-verstreuten Verwendungen schlaegt einen mit dreien in der innersten Schleife
-— obwohl der erste sein Register die ganze Zeit belegt und der zweite es nur
-kurz braeuchte.
-
-Verglichen wird jetzt **Gewicht je Laenge**. Eine Zeile Aenderung,
-`FIRN_RA_SUMME=1` stellt die alte Antwort wieder her.
+In addition, **two frame slots** are now also merged, but
+**only for integers**: for floating-point numbers `fp_handover` puts a value without a
+register into `xmm2` instead of the frame, and the copy would then have believed that
+source and destination were the same slot. TEMPO 8 already died of exactly this trap
+once (`tests/1182_layout_float_probe.fi`).
 
 ---
 
-## 3. Lebensdauern zerschneiden — und warum der erste Anlauf falsch war
+## 2. Density instead of sum (137.7 → 136.7 M, and the door opener)
 
-Der lineare Scan kennt je Wert EIN Intervall und EINEN Platz. Ein Zeiger, der
-am Anfang gesetzt und am Ende noch einmal gebraucht wird, belegt sein
-Register ueber die ganze Funktion — oder keines, und dann wird er in der
-heissen Schleife dazwischen bei JEDER Verwendung aus dem Rahmen geholt.
+When no register is free, the linear scan displaces the active interval
+with the **smallest weight** (uses times loop depth). That
+favours long intervals: a value with fifty uses scattered over the whole function
+beats one with three in the innermost loop
+— although the first occupies its register the whole time and the second would need it
+only briefly.
 
-Die Lehrbuchantwort ist *live range splitting*. Im Zuteiler selbst waere das
-ein Umbau jeder Ausgabestelle (`loc(v)` muesste von der POSITION abhaengen).
-Dasselbe Ergebnis bekommt man ohne diesen Umbau, indem man das Stueck zu
-einem eigenen WERT macht: eine Kopie in den Vorkopf der Schleife, und der
-Rumpf liest die Kopie.
+Now **weight per length** is compared. A one-line change,
+`FIRN_RA_SUMME=1` restores the old answer.
 
-**Erster Anlauf: ein Pass im Optimierer.** Er schnitt jeden Wert, der in
-einer Schleife mehrfach gelesen und dort nicht geschrieben wird. Gemessen:
-137,7 → **140,4 Mio, also zwei Prozent SCHLECHTER**. Der Grund ist im
-Nachhinein offensichtlich: wo der neue Wert auch nur einen Rahmenplatz
-bekommt, zahlt man die Kopie im Vorkopf und gewinnt nichts — der Rumpf liest
-dann eben den anderen Platz. Erhoehen der Schwelle half nicht (min=8: immer
-noch 138,0).
+---
 
-**Zweiter Anlauf: schneiden, nachdem man weiss, wo es klemmt.**
-`emit_func_ra` teilt jetzt einmal zu, fragt `split::nach_zuteilung`, welche
-Werte wirklich **im Rahmen gelandet sind UND in einer Schleife mehrfach
-gelesen werden**, schneidet nur diese, und teilt noch einmal zu. Bekommt beim
-zweiten Zuteilen kein einziger der neuen Werte ein Register, wird das
-Ergebnis verworfen — dann kostet der Schnitt nur Uebersetzungszeit und kein
-einziges Bit im Programm.
+## 3. Cutting lifetimes — and why the first attempt was wrong
 
-**Und dann passierte genau das: null Register, jedes Mal.** Zwei Ursachen,
-nacheinander gefunden:
+The linear scan knows ONE interval and ONE slot per value. A pointer that is
+set at the beginning and needed once more at the end occupies its
+register over the whole function — or none, and then in the
+hot loop in between it is fetched from the frame at EVERY use.
 
-1. **Das Verschmelzen machte den Schnitt sofort wieder zu.** `%v2 = copy %v`
-   ist fuer TEMPO 8 ein perfekter Kandidat. Dafuer gibt es jetzt
-   `Func::no_coalesce` — eine Liste von Werten, die nicht verschmolzen werden
-   duerfen, gefuellt allein vom Zuteiler fuer seine eigene Zweitfassung.
-2. **Auch danach: null.** Und das war kein Fehler, sondern die Antwort des
-   Zuteilers. Mit der SUMME als Massstab verliert ein kurzes Intervall mit
-   drei Verwendungen gegen ein langes mit fuenfzig — immer. Erst mit der
-   Dichte aus Punkt 2 gewinnt der Schnitt seine Register.
+The textbook answer is *live range splitting*. In the allocator itself that would be
+a rebuild of every output site (`loc(v)` would have to depend on the POSITION).
+The same result is obtained without this rebuild by making the piece
+a separate VALUE: a copy into the pre-header of the loop, and the
+body reads the copy.
 
-Die beiden Aenderungen haengen also zusammen: **Dichte ohne Schnitt bringt
-1,0 Mio, Schnitt ohne Dichte bringt nichts, beide zusammen 2,3 Mio.**
+**First attempt: a pass in the optimiser.** It cut every value that is read several times in
+a loop and not written there. Measured:
+137.7 → **140.4 M, so two percent WORSE**. The reason is obvious in hindsight: where the new value gets
+only a frame slot, you pay for the copy in the pre-header and gain nothing — the body
+then simply reads the other slot. Raising the threshold did not help (min=8: still
+138.0).
 
-Schwelle: drei Leser in der Schleife (`FIRN_SPLIT_MIN`), abschaltbar mit
+**Second attempt: cut after you know where it pinches.**
+`emit_func_ra` now allocates once, asks `split::nach_zuteilung` which
+values really **landed in the frame AND are read several times in a loop**,
+cuts only these, and allocates once more. If in the second allocation not a single one of the new values
+gets a register, the
+result is discarded — then the cut costs only translation time and not a
+single bit in the program.
+
+**And then exactly this happened: zero registers, every time.** Two causes,
+found one after the other:
+
+1. **The merging closed the cut at once again.** `%v2 = copy %v`
+   is a perfect candidate for TEMPO 8. For that there is now
+   `Func::no_coalesce` — a list of values that must not be merged,
+   filled solely by the allocator for its own second version.
+2. **Even after that: zero.** And that was no bug, but the answer of the
+   allocator. With the SUM as the yardstick a short interval with
+   three uses loses against a long one with fifty — always. Only with the
+   density from point 2 does the cut win its registers.
+
+The two changes are thus connected: **density without the cut brings
+1.0 M, the cut without density brings nothing, both together 2.3 M.**
+
+Threshold: three readers in the loop (`FIRN_SPLIT_MIN`), switchable off with
 `FIRN_NO_SPLIT=1`.
 
 ---
