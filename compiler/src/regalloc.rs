@@ -4254,8 +4254,18 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
             continue;
         }
         if mn.starts_with("set") {
-            kill_reg("rax", &mut sync, &mut holds); // the target is always `al` at the RA path
+            // The target is NOT always `al`: the float comparisons write a
+            // second flag into `cl` (`setnp cl` / `setp cl`). Invalidate the
+            // register that is really named, or a reload of the spill slot
+            // that `cl` aliases is struck although `rcx` was overwritten
+            // (wrong store address after `x != y` on floats).
+            kill_reg("rax", &mut sync, &mut holds);
             nullab.remove("rax"); // `setcc al` leaves the upper bits standing
+            let tgt = stem(ops.trim());
+            if is_reg64(tgt) {
+                kill_reg(tgt, &mut sync, &mut holds);
+                nullab.remove(tgt);
+            }
             out.push_str(line);
             out.push('\n');
             continue;
@@ -7647,6 +7657,22 @@ mod tests {
     use super::*;
     use crate::codegen_x86::emit;
     use crate::fir::{Module, Term};
+
+    /// `setp cl` (float `!=`) overwrites rcx: the reload of the spill slot
+    /// that rcx was stored to must NOT be struck afterwards (it was, and the
+    /// following store went through a pointer with a clobbered low byte).
+    #[test]
+    fn setcc_cl_invalidates_rcx_in_the_descriptor() {
+        let reload = "    mov rcx, qword ptr [rbp-16]\n";
+        let base = "    mov qword ptr [rbp-16], rcx\n";
+        let kept = descriptor_peephole(&format!("{}    setp cl\n{}", base, reload), 4);
+        assert!(kept.contains(reload.trim()), "reload struck after setp cl:\n{}", kept);
+        let kept2 = descriptor_peephole(&format!("{}    setnp cl\n{}", base, reload), 4);
+        assert!(kept2.contains(reload.trim()), "reload struck after setnp cl:\n{}", kept2);
+        // Control: without a write to rcx the redundant reload is still struck.
+        let struck = descriptor_peephole(&format!("{}    setne al\n{}", base, reload), 4);
+        assert!(!struck.contains(reload.trim()), "control: reload should be struck:\n{}", struck);
+    }
 
     /// Loop with a counter in an `alloca`: the counter has to land in a
     /// register (cell promotion), not on the stack.
