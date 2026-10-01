@@ -190,8 +190,8 @@ echo
 echo "== 10d. THE PICTURE ON THE WIDGET =="
 # Icon left/right/only, the measure, the tint, and the tab and menu entry
 # that paint through the borrowed label.
-build art
-"$W/art"
+build picture
+"$W/picture"
 
 echo
 echo "== 11. THE TEXT VALUES AT THE PIXEL =="
