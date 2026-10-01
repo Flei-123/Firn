@@ -105,5 +105,77 @@ for font in fonts:
         ok("%s: the same calls give the same octets" % tag)
     else:
         fail("%s: output differs between two runs" % tag)
+    # PDF/A-2b: the same page, plus metadata and an output intent, held against veraPDF
+    pa = os.path.join(work, "probe_a_%s.pdf" % tag)
+    rc, out, err = run(probe, pa, font, "pdfa")
+    if rc != 0:
+        fail("%s: pdf_probe pdfa exit %d" % (tag, rc))
+        continue
+    rc, out, err = run("pdftotext", pa, "-")
+    got = [l for l in out.splitlines() if l.strip() and l != "\f"]
+    if got == want and not err.strip():
+        ok("%s: PDF/A file: same text" % tag)
+    else:
+        fail("%s: PDF/A file text %s %s" % (tag, got, err[:200]))
+    raw = open(pa, "rb").read()
+    import re, xml.dom.minidom
+    m = re.search(rb"<\?xpacket begin=.*?<\?xpacket end=\"w\"\?>", raw, re.S)
+    try:
+        dom = xml.dom.minidom.parseString(m.group(0).split(b"?>", 1)[1].rsplit(b"<?xpacket", 1)[0])
+        txt = dom.documentElement.toxml()
+        good = all(t in txt for t in ["<pdfaid:part>2</pdfaid:part>", "<pdfaid:conformance>B</pdfaid:conformance>",
+            "OpenPlan \u2013 Wendesch\u00fctzschaltung", "pdf_probe &amp; &lt;Firn&gt;", "2026-09-"])
+        if good and raw.count(b"/GTS_PDFA1") == 1 and raw.count(b"/Subtype /XML") == 1:
+            ok("%s: XMP packet is well-formed XML with the claim, title, escaped tool and date; one intent" % tag)
+        else:
+            fail("%s: XMP content: %s" % (tag, txt[:300]))
+    except Exception as e:
+        fail("%s: XMP packet: %r" % (tag, e))
+    # the embedded profile: a valid ICC file that lcms turns into exactly the sRGB of lcms
+    try:
+        import zlib
+        from PIL import ImageCms, Image
+        mm = re.search(rb"/N 3 /Length (\d+)( /Filter /FlateDecode)? >>\nstream\n", raw)
+        icc = raw[mm.end():mm.end() + int(mm.group(1))]
+        if mm.group(2):
+            icc = zlib.decompress(icc)
+        prof = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        tr = ImageCms.buildTransform(prof, ImageCms.createProfile("sRGB"), "RGB", "RGB")
+        px = [(r, g, b) for r in (0, 7, 128, 255) for g in (0, 64, 200) for b in (0, 3, 255)]
+        im = Image.new("RGB", (len(px), 1))
+        im.putdata(px)
+        got = list(ImageCms.applyTransform(im, tr).get_flattened_data() if hasattr(Image.Image, "get_flattened_data") else ImageCms.applyTransform(im, tr).getdata())
+        if len(icc) == struct.unpack(">I", icc[:4])[0] == 440 and got == px:
+            ok("%s: embedded sRGB profile: 440 octets, lcms maps %d colours to themselves" % (tag, len(px)))
+        else:
+            fail("%s: embedded profile: size %d, colours %s" % (tag, len(icc), got[:4]))
+    except Exception as e:
+        fail("%s: embedded profile: %r" % (tag, e))
+    if b"/F 4" in raw and b"/Name (Default)" in raw:
+        ok("%s: link flags and optional-content configuration name" % tag)
+    else:
+        fail("%s: PDF/A: no /F 4 or /Name" % tag)
+    if b"GTS_PDFA1" in open(pdf, "rb").read():
+        fail("%s: a plain file claims PDF/A" % tag)
+    vera = os.environ.get("VERAPDF") or "/opt/verapdf/verapdf"
+    if os.path.exists(vera):
+        rc, out, err = run(vera, "--flavour", "2b", "--format", "text", pa)
+        if rc == 0 and out.startswith("PASS"):
+            ok("%s: veraPDF: PDF/A-2b compliant" % tag)
+        else:
+            fail("%s: veraPDF: %s" % (tag, out[:300]))
+        rc, out, err = run(vera, "--flavour", "2b", "--format", "text", pdf)
+        if out.startswith("FAIL"):
+            ok("%s: veraPDF: the plain file is not PDF/A (the check can fail)" % tag)
+        else:
+            fail("%s: veraPDF accepts the plain file: %s" % (tag, out[:200]))
+    else:
+        print("  skip  (no veraPDF: set VERAPDF)")
+    pa2 = pa + ".again"
+    run(probe, pa2, font, "pdfa")
+    if open(pa, "rb").read() == open(pa2, "rb").read():
+        ok("%s: PDF/A: the same calls give the same octets" % tag)
+    else:
+        fail("%s: PDF/A output differs between two runs" % tag)
 print("pdf: %d failed" % bad)
 sys.exit(1 if bad else 0)
