@@ -197,7 +197,7 @@ def build_cases():
     add("the issuer is not a CA", "notca.example",
         [pem(lnot), pem(inot)], "NOT_CA")
 
-    # a signature that belongs to a different key: take the leaf's DER and
+    # a signature that belongs to a different key: take the leaf's `DER` and
     # graft the signature of another certificate of the same length on it.
     good_der = l1.public_bytes(serialization.Encoding.DER)
     other, _ = leaf("other.example", ["good.example"], ir, ir_key)

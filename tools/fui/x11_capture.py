@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-# tools/fui/x11_capture.py -- ECHTE PROTOKOLLMITSCHNITTE fuer tools/fui/x11_main.fi.
+# tools/fui/x11_capture.py -- REAL PROTOCOL CAPTURES for tools/fui/x11_main.fi.
 #
-# WARUM ES DAS GIBT. Die Pruefung der X11-Rueckwand (lib/window/x11.fi) soll
-# nicht ihre eigene Rechnung gegen sich selbst pruefen, sondern gegen das, was
-# ein ECHTER X-Server schickt. Dieses Skript spricht deshalb mit einem echten
-# Xvfb -- unabhaengig vom Firn-Client, roh ueber den Unix-Socket -- und legt die
-# Antworten Oktett fuer Oktett unter testdata/x11/ ab:
+# WHY IT EXISTS. The check of the X11 backend (lib/window/x11.fi) is not meant
+# to check its own calculation against itself, but against what
+# a REAL X server sends. This script therefore talks to a real
+# Xvfb -- independently of the Firn client, raw over the Unix socket -- and stores
+# the replies octet for octet under testdata/x11/:
 #
-#   setup.bin       die Antwort auf den Verbindungsaufbau (Xvfb 1400x900, -dpi 96)
-#   keymap_us.bin   GetKeyboardMapping(min..max) mit der US-Belegung
-#   keymap_de.bin   dasselbe nach `setxkbmap de`
-#   xmodmap_us.txt, xmodmap_de.txt  `xmodmap -pke` -- die Gegenprobe eines
-#                   zweiten, fremden Programms fuer dieselben Zahlen
-#   modmap_us.bin, modmap_de.bin  GetModifierMapping -- welche Modifikator-
-#                   Taste (Mod1..Mod5) AltGr bzw. NumLock ist
-#   resman.bin      GetProperty(root, RESOURCE_MANAGER) nach
+#   setup.bin       the reply to the connection setup (Xvfb 1400x900, -dpi 96)
+#   keymap_us.bin   GetKeyboardMapping(min..max) with the US layout
+#   keymap_de.bin   the same after `setxkbmap de`
+#   xmodmap_us.txt, xmodmap_de.txt  `xmodmap -pke` -- the counter-test of a
+#                   second, foreign program for the same numbers
+#   modmap_us.bin, modmap_de.bin  GetModifierMapping -- which modifier
+#                   key (Mod1..Mod5) is AltGr or NumLock
+#   resman.bin      GetProperty(root, RESOURCE_MANAGER) after
 #                   `echo 'Xft.dpi: 144' | xrdb -merge`
-#   events.bin      32-Oktett-Ereignisse, ausgeloest mit xdotool bzw. SendEvent,
-#                   in der Reihenfolge von events.txt
-#   xauthority      eine Datei, die `xauth` (nicht Firn) geschrieben hat
+#   events.bin      32-octet events, triggered with xdotool or SendEvent,
+#                   in the order of events.txt
+#   xauthority      a file that `xauth` (not Firn) wrote
 #
-# Es ist ein WERKZEUG zum Erzeugen von Testdaten, kein Teil des Produkts; es
-# wird nur neu laufen gelassen, wenn sich die Mitschnitte aendern sollen.
-#     python3 tools/fui/x11_capture.py [ziel=testdata/x11] [anzeige=61]
+# It is a TOOL for generating test data, not part of the product; it
+# is re-run only if the captures are to change.
+#     python3 tools/fui/x11_capture.py [target=testdata/x11] [display=61]
 import os, socket, struct, subprocess, sys, time
 
 ZIEL = sys.argv[1] if len(sys.argv) > 1 else "testdata/x11"
@@ -38,11 +38,11 @@ def schreibe(name, data):
         f.write(data)
 
 
-# EINE EIGENE ANZEIGE, NIE EINE FREMDE. Beim ersten Lauf lief auf der
-# gewaehlten Nummer schon ein fremder Xvfb; das eigene Xvfb scheiterte still,
-# und die Mitschnitte (samt `setxkbmap`/`xrdb`) gingen an den fremden Server.
-# Also: ist die Anzeige belegt, wird abgebrochen, und nach dem Start muss
-# unser eigener Prozess noch leben.
+# AN OWN DISPLAY, NEVER A FOREIGN ONE. On the first run a foreign Xvfb was already
+# running on the chosen number; the own Xvfb failed silently,
+# and the captures (including `setxkbmap`/`xrdb`) went to the foreign server.
+# So: if the display is occupied, it aborts, and after starting
+# our own process must still be alive.
 if os.path.exists("/tmp/.X11-unix/X" + ANZ) or os.path.exists("/tmp/.X%s-lock" % ANZ):
     raise SystemExit("Anzeige :%s ist belegt -- nimm eine andere" % ANZ)
 xvfb = subprocess.Popen(["Xvfb", ":" + ANZ, "-screen", "0", "1400x900x24",
@@ -69,7 +69,7 @@ try:
             b += k
         return b
 
-    # Verbindungsaufbau ohne Berechtigung (Xvfb ohne -auth).
+    # Connection setup without authorisation (Xvfb without -auth).
     s.sendall(struct.pack("<BxHHHHxx", 0x6C, 11, 0, 0, 0))
     kopf = lies(8)
     setup = kopf + lies(struct.unpack_from("<H", kopf, 6)[0] * 4)
@@ -84,7 +84,7 @@ try:
     seq = [0]
 
     def antwort():
-        # Ereignisse, die vor der Antwort kommen, werden uebersprungen.
+        # Events that come before the reply are skipped.
         while True:
             b = lies(32)
             if b[0] == 1:
@@ -120,12 +120,12 @@ try:
     s.sendall(struct.pack("<BBHIIIII", 20, 0, 6, root, 23, 0, 0, 16384))
     schreibe("resman.bin", antwort())
 
-    # Ein Fenster bei (0,0), 200x100, mit allen Ereignissen, die x11.fi liest.
+    # A window at (0,0), 200x100, with all events that x11.fi reads.
     wid = id_base | 1
     maske = (1 | 2 | 4 | 8 | 16 | 32 | 64 | 32768 | 131072)
     s.sendall(struct.pack("<BBHIIhhHHHHIIII", 1, 24, 10, wid, root, 0, 0,
                           200, 100, 0, 1, root_visual, 2050, 0xFFFFFF, maske))
-    # WM_PROTOCOLS / WM_DELETE_WINDOW: die Atome holen wie x11.fi.
+    # WM_PROTOCOLS / WM_DELETE_WINDOW: fetch the atoms like x11.fi.
     def atom(name):
         nb = name.encode()
         pad = (4 - len(nb) % 4) % 4
@@ -140,8 +140,8 @@ try:
     namen = []
 
     def sammle(name, bis_code, warte=2.0):
-        # Liest Ereignisse, bis eines mit `bis_code` kam; alle werden behalten,
-        # aber nur das erste passende bekommt den Namen.
+        # Reads events until one with `bis_code` came; all are kept,
+        # but only the first matching one gets the name.
         ende = time.time() + warte
         while time.time() < ende:
             b = lies(32)
@@ -186,8 +186,8 @@ try:
     # Fenstergroesse aendern: ConfigureWindow(12), Maske Breite|Hoehe.
     s.sendall(struct.pack("<BxHIHxxII", 12, 5, wid, 4 | 8, 320, 240))
     sammle("configure 320x240", 22)
-    # Schliessen, wie ein Fenstermanager es tut: SendEvent(25) mit einer
-    # ClientMessage(33) WM_PROTOCOLS / WM_DELETE_WINDOW an das Fenster.
+    # Closing, as a window manager does it: SendEvent(25) with a
+    # ClientMessage(33) WM_PROTOCOLS / WM_DELETE_WINDOW to the window.
     cm = struct.pack("<BBHIII", 33, 32, 0, wid, a_prot, a_del) + b"\0" * 16
     s.sendall(struct.pack("<BBHII", 25, 0, 11, wid, 0) + cm)
     sammle("clientmessage delete", 33)
@@ -202,8 +202,8 @@ finally:
     xvfb.terminate()
     xvfb.wait()
 
-# Eine Xauthority-Datei, die `xauth` schreibt -- drei Eintraege, damit die
-# Auswahl nach Anzeigenummer etwas zu entscheiden hat.
+# An Xauthority file that `xauth` writes -- three entries, so that the
+# selection by display number has something to decide.
 xa = os.path.join(ZIEL, "xauthority")
 if os.path.exists(xa):
     os.remove(xa)

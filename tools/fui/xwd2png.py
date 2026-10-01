@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-# tools/fui/xwd2png.py -- ein Bildschirmfoto von `xwd` als PNG.
+# tools/fui/xwd2png.py -- a screenshot from `xwd` as PNG.
 #
-# WARUM: der Beleg fuer das echte Fenster kommt VOM SERVER (`xwd -root`
-# bzw. `xwd -id <fenster>`), nicht aus dem Speicherpuffer des Programms --
-# ein Programm, das nur behauptet, gemalt zu haben, faellt so auf. Auf
-# diesem Rechner gibt es kein ImageMagick; PIL liest XWD nicht. Also steht
-# der Kopf des XWD-Formats (X11R7, XWDFileHeader, 25 Worte grossendisch)
-# hier selbst. Nur ZPixmap mit 24/32 Bit je Punkt -- das, was Xvfb -screen
-# ...x24 liefert.
+# WHY: the proof for the real window comes FROM THE SERVER (`xwd -root`
+# or `xwd -id <window>`), not from the memory buffer of the program --
+# a program that only claims to have painted is thereby caught. On
+# this machine there is no ImageMagick; PIL does not read XWD. So the
+# head of the XWD format (X11R7, XWDFileHeader, 25 words big-endian)
+# stands here itself. Only ZPixmap with 24/32 bits per point -- what Xvfb -screen
+# ...x24 delivers.
 #
-#     python3 tools/fui/xwd2png.py ein.xwd aus.png [x y w h]
+#     python3 tools/fui/xwd2png.py in.xwd out.png [x y w h]
 import struct, sys
 from PIL import Image
 

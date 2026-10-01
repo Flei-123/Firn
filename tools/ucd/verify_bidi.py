@@ -139,7 +139,7 @@ def expected(d):
         v = ligs[(a, b)]
         if v[0] and v[1] and 0x600 <= a < 0x700 and 0x600 <= b < 0x700:
             out.append("G %d %d %d %d" % (a, b, v[0], v[1]))
-    # Die Reihenfolge der G-Zeilen ist die der Befragung: a aussen, b innen.
+    # The order of the G lines is that of the query: a outside, b inside.
     g = [l for l in out if l.startswith("G ")]
     g.sort(key=lambda l: (int(l.split()[1]), int(l.split()[2])))
     out = [l for l in out if not l.startswith("G ")] + g
