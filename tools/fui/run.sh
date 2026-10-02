@@ -489,7 +489,8 @@ echo "== 18o2b. TOUCH FROM X11 AND WIN32 (r112) =="
 # (xinput_main: XInput 2.2 present, XIGetSelectedEvents shows the touch
 # selection). No finger is played in -- the build machine has no uinput.
 # win32.fi must build for the Windows target.
-FIRNC="$FIRNC" W="$W" bash tools/fui/xinput.sh
+build xinput
+XINPUT_BIN="$W/xinput" FIRNC="$FIRNC" W="$W" bash tools/fui/xinput.sh
 rm -rf "$W/wn"; mkdir -p "$W/wn/window"
 cp demos/x11demo/main.fi demos/x11demo/gallery9_main.fi "$W/wn/"
 ln -s "$PWD/lib/window/win32.fi" "$W/wn/window/backend.fi"
