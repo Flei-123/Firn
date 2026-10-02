@@ -1,0 +1,1705 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/android/inputmethod.fi -- THE ON-SCREEN KEYBOARD OF A NATIVE ACTIVITY (r114).
+//
+// Provenance: the chain (dex classes made in memory, an InputConnection of
+// `native` methods, a one pixel View that holds the focus) is Certus',
+// lib/android/inputmethod.fi, rounds MOBIL4 / TEXTBOX-2, by the sole author Justin.
+// Here it is written anew for the host of lib/android/activity.fi, where the
+// program lives on a THREAD OF ITS OWN -- which changes every detail.
+//
+// ===================================================================
+// THE PROBLEM
+// ===================================================================
+//
+// A keyboard never types into a NativeActivity: the input method asks the
+// focused view for an InputConnection, the NativeContentView answers null,
+// and Android logs "showSoftInput() ignored: view is not served". A view of
+// our own, with an InputConnection of our own, is the only way in -- and
+// both are Java classes, so they are made as DEX at run time
+// (lib/android/imedex.fi) and loaded with an InMemoryDexClassLoader.
+//
+// ===================================================================
+// THE THREADS
+// ===================================================================
+//
+// Two threads matter and they must never touch the other's things:
+//
+//   MAIN THREAD  (Android's UI thread). Owns every View. The keyboard calls
+//                the InputConnection's methods HERE. It has no collector, so
+//                everything it runs is #[no_gc] and works on raw memory.
+//   APP THREAD   (lib/android/activity.fi). Owns the program and its text
+//                fields (lib/fui/textbuf.fi, an editor.Editor's buffer).
+//
+// So:
+//
+//   * Everything that needs the main thread (build the classes, add the
+//     view, ask for focus, show and hide the keyboard, tell it that the
+//     selection moved) is posted as ONE OCTET into a socket pair whose read
+//     end hangs in the main thread's looper (`ALooper_addFd` with a
+//     callback); `looper_callback` then runs it there.
+//   * Everything the KEYBOARD asks (commitText, getTextBeforeCursor, ...)
+//     arrives on the main thread as a call of a `native` method. That
+//     method copies its arguments (the text as UTF-16 units) into a request
+//     in shared raw memory, wakes the app thread with a command octet
+//     (CMD_IME), and WAITS for the answer -- at most 400 ms, then it says
+//     "no". The app thread does the work on the real TextBuf (`ime_serve`),
+//     writes the answer and the main thread builds the Java object from it.
+//
+// One request is in flight at a time (the main thread does one call at a
+// time), so a sequence number and a done number are all the synchronisation
+// there is (`__atomic_add` is the barrier; plain stores in between).
+//
+// The TextBuf is only ever touched by the app thread. That is the point.
+//
+// ===================================================================
+// WHAT IS NOT DONE
+// ===================================================================
+//
+//   * One line of text, up to 16384 UTF-16 units visible to the keyboard.
+//   * No extracted-text (full screen) UI: the flags ask the keyboard not to
+//     use it, and getExtractedText gives the whole text anyway.
+//   * No hardware-keyboard shortcuts through the connection.
+import std.rt
+import android.ndk
+import android.dex
+import android.imedex
+import android.jnicall
+import fui.textbuf
+
+export {
+    ime_activity, ime_attach, ime_sync, ime_serve, ime_status,
+    ime_available, IME_CMD, IME_CHANGED, IME_ENTER,
+}
+
+// The command octet that wakes the app thread (activity.CMD_IME).
+const IME_CMD: i32 = 11
+// What `ime_sync` reports: the text or caret changed / Enter was pressed.
+const IME_CHANGED: u32 = 1
+const IME_ENTER: u32 = 2
+
+// ---------------------------------------------------- the shared block
+// Raw memory (mmap), never touched by the collector. Offsets in octets;
+// every number is eight octets and signed ones are read as i64.
+const IM_BYTES: usize = 131072
+const O_SEQ: u64 = 0 // the request in flight (main thread writes, +1 each)
+const O_DONE: u64 = 8 // the last request the app thread answered
+const O_OP: u64 = 16
+const O_A: u64 = 24
+const O_B: u64 = 32
+const O_C: u64 = 40
+const O_D: u64 = 48
+const O_REQ_N: u64 = 56 // UTF-16 units in REQ_TEXT
+const O_RES_OK: u64 = 64
+const O_RES_A: u64 = 72
+const O_RES_B: u64 = 80
+const O_RES_C: u64 = 88
+const O_RES_N: u64 = 96 // UTF-16 units in RES_TEXT
+const O_ATTACHED: u64 = 104 // 1 = a text field has the input
+const O_KIND: u64 = 112 // 0 text, 1 secret
+const O_SYNC_SA: u64 = 120 // what the app thread tells the keyboard
+const O_SYNC_SB: u64 = 128
+const O_SYNC_CA: u64 = 136
+const O_SYNC_CB: u64 = 144
+const O_REQ_TEXT: u64 = 256 // TXT_CAP units
+const O_RES_TEXT: u64 = 16640 // TXT_CAP units
+const O_SCRATCH: u64 = 33024 // SCRATCH_CAP octets (UTF-8 of a request)
+const O_TEXT16: u64 = 57600 // TEXT16_CAP units: the whole field as UTF-16
+const TXT_CAP: usize = 8192
+const SCRATCH_CAP: usize = 24576
+const TEXT16_CAP: usize = 16384
+
+// Requests (O_OP).
+const OP_COMMIT: u64 = 1
+const OP_SETCOMP: u64 = 2
+const OP_FINISH: u64 = 3
+const OP_DELSUR: u64 = 4
+const OP_DELCP: u64 = 5
+const OP_KEY: u64 = 6
+const OP_BEFORE: u64 = 7
+const OP_AFTER: u64 = 8
+const OP_SELTEXT: u64 = 9
+const OP_ACTION: u64 = 10
+const OP_SETSEL: u64 = 11
+const OP_SETREG: u64 = 12
+const OP_REPLACE: u64 = 13
+const OP_SURR: u64 = 14
+const OP_EXTRACT: u64 = 15
+const OP_INFO: u64 = 16
+
+// Posts to the main thread (one octet each).
+const MP_SHOW: u8 = 1
+const MP_HIDE: u8 = 2
+const MP_SYNC: u8 = 3
+
+// Android numbers.
+const TYPE_CLASS_TEXT: i32 = 1
+const TYPE_TEXT_VARIATION_PASSWORD: i32 = 128
+const IME_ACTION_DONE: i32 = 6
+const IME_FLAG_NO_PERSONALIZED_LEARNING: i32 = 16777216
+const IME_FLAG_NO_FULLSCREEN: i32 = 33554432
+const IME_FLAG_NO_EXTRACT_UI: i32 = 268435456
+const META_SHIFT_ON: i32 = 1
+const META_SHIFT_LEFT_ON: i32 = 64
+const META_SHIFT_RIGHT_ON: i32 = 128
+const REQUEST_WAIT_US: i64 = 400000
+
+// ---------------------------------------------------------------- state
+static mut G_IM: u64 = 0
+// the main thread's
+static mut G_ENV: u64 = 0
+static mut G_ACT: u64 = 0 // a global reference to the activity
+static mut G_STATE: u32 = 0 // 0 = not built, 1 = ready, 2 = failed
+static mut G_WARNED: u32 = 0
+static mut G_STATUS: u32 = 0 // how far the build got (for the log)
+static mut G_FD_W: i32 = 0 // the command socket (app thread's wake-up)
+static mut G_SENT: u64 = 0 // the host's counter of commands written
+static mut G_PIPE_R: i32 = 0
+static mut G_PIPE_W: i32 = 0
+static mut G_LOOPER: u64 = 0
+static mut G_KLS_VIEW: u64 = 0
+static mut G_KLS_CONN: u64 = 0
+static mut G_VIEW: u64 = 0
+static mut G_IMM: u64 = 0
+static mut G_FID_E: u64 = 0
+static mut G_CTOR_CONN: u64 = 0
+static mut G_M_FOCUS: u64 = 0
+static mut G_M_TOKEN: u64 = 0
+static mut G_M_SHOW: u64 = 0
+static mut G_M_HIDE: u64 = 0
+static mut G_M_RESTART: u64 = 0
+static mut G_M_UPDATE: u64 = 0
+static mut G_M_TOSTR: u64 = 0
+static mut G_M_ACTION: u64 = 0
+static mut G_M_KEYCODE: u64 = 0
+static mut G_M_UNICODE: u64 = 0
+static mut G_M_META: u64 = 0
+static mut G_KLS_ST: u64 = 0 // SurroundingText (API 31)
+static mut G_CTOR_ST: u64 = 0
+static mut G_FID_INPUTTYPE: u64 = 0
+static mut G_FID_IMEOPT: u64 = 0
+static mut G_FID_SELSTART: u64 = 0
+static mut G_FID_SELEND: u64 = 0
+static mut G_FID_CAPS: u64 = 0
+static mut G_KLS_ET: u64 = 0 // ExtractedText
+static mut G_CTOR_ET: u64 = 0
+static mut G_FID_ET_TEXT: u64 = 0
+static mut G_FID_ET_SS: u64 = 0
+static mut G_FID_ET_SE: u64 = 0
+static mut G_FID_ET_FLAGS: u64 = 0
+// the app thread's
+static mut G_TB: u64 = 0
+static mut G_SIG: u64 = 0
+static mut G_FLAGS: u32 = 0
+
+const TAG: str = "firn\0"
+
+// ---------------------------------------------------------- raw access
+#[no_gc]
+fn ld(o: u64) -> u64 {
+    return *((G_IM + o) as *mut u64)
+}
+
+#[no_gc]
+fn st(o: u64, v: u64) {
+    *((G_IM + o) as *mut u64) = v
+}
+
+#[no_gc]
+fn ldi(o: u64) -> i64 {
+    return *((G_IM + o) as *mut i64)
+}
+
+#[no_gc]
+fn sti(o: u64, v: i64) {
+    *((G_IM + o) as *mut i64) = v
+}
+
+// A load other threads' stores become visible to (a full barrier on both
+// machines: `lock xadd` / ldaxr-stlxr).
+#[no_gc]
+fn ld_sync(o: u64) -> u64 {
+    return __atomic_add((G_IM + o) as *mut u64, 0)
+}
+
+#[no_gc]
+fn u16_at(o: u64, i: usize) -> u32 {
+    return (*((G_IM + o + i as u64 * 2) as *mut u16)) as u32
+}
+
+#[no_gc]
+fn u16_put(o: u64, i: usize, v: u32) {
+    *((G_IM + o + i as u64 * 2) as *mut u16) = v as u16
+}
+
+#[no_gc]
+fn sleep_us(us: i64) {
+    var ts: [i64; 2] = [0; 2]
+    ts[0] = 0
+    ts[1] = us * 1000
+    syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+#[no_gc]
+fn say(text: u64) {
+    ndk.log_write(ndk.LOG_INFO, TAG.p as u64, text)
+    // also into stdout.txt (the app's own log file), one octet at a time
+    var n: i64 = 0
+    while *((text + n as u64) as *mut u8) != 0 as u8 {
+        n = n + 1
+    }
+    syscall(1, 2, text as i64, n, 0, 0, 0)
+    var nl: [u8; 1] = [10 as u8; 1]
+    syscall(1, 2, (&nl[0]) as i64, 1, 0, 0, 0)
+}
+
+#[no_gc]
+fn block() -> bool {
+    if G_IM != 0 {
+        return true
+    }
+    let b: u64 = rt.heap_alloc(IM_BYTES)
+    if b == 0 {
+        return false
+    }
+    // mmap hands out zeroed pages.
+    G_IM = b
+    return true
+}
+
+// ================================================================
+// THE MAIN THREAD
+// ================================================================
+
+// Called by the host on EVERY firn_activity_create (the main thread): the
+// activity this input method belongs to, and how to wake the app thread.
+// Nothing is built yet -- that waits for the first field that wants the
+// keyboard.
+#[no_gc]
+fn ime_activity(act: u64, fd_w: i32, sent_addr: u64) {
+    if act == 0 || !block() {
+        return
+    }
+    G_ENV = ndk.peek64(act + 16)
+    G_FD_W = fd_w
+    G_SENT = sent_addr
+    let clazz: u64 = ndk.peek64(act + 24)
+    if G_ENV == 0 || clazz == 0 {
+        return
+    }
+    // `clazz` is a LOCAL reference: it dies when this call returns.
+    if G_ACT != 0 {
+        jnicall.j_del_global(G_ENV, G_ACT)
+    }
+    G_ACT = jnicall.j_global(G_ENV, clazz)
+    // a new activity needs its own view
+    G_STATE = 0
+    G_VIEW = 0
+    G_KLS_VIEW = 0
+    G_KLS_CONN = 0
+    // the socket pair the app thread posts to, and its end in OUR looper
+    if G_PIPE_R == 0 {
+        var fds: [i32; 2] = [0; 2]
+        // socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
+        let r: i64 = syscall(53, 1, 526337, 0, (&fds[0]) as i64, 0, 0)
+        if r != 0 {
+            return
+        }
+        G_PIPE_R = fds[0]
+        G_PIPE_W = fds[1]
+    }
+    let lp: u64 = ndk.ALooper_forThread()
+    if lp != 0 && lp != G_LOOPER {
+        G_LOOPER = lp
+        let a: i32 = ndk.ALooper_addFd(lp, G_PIPE_R, 0, ndk.ALOOPER_EVENT_INPUT,
+            ndk.code_of_looper(looper_callback), 0)
+    }
+}
+
+// Is a keyboard possible at all (the main thread has a looper and we know
+// its activity)? The first `ime_attach` still has to build the classes.
+#[no_gc]
+fn ime_available() -> bool {
+    return G_IM != 0 && G_PIPE_W != 0 && G_ACT != 0
+}
+
+// 0 = not built, 1 = ready, 2 = it failed (see `ime_status` for how far).
+#[no_gc]
+fn ime_status() -> u32 {
+    return G_STATE
+}
+
+#[no_gc]
+fn post_main(op: u8) {
+    if G_PIPE_W == 0 {
+        return
+    }
+    var b: [u8; 1] = [0 as u8; 1]
+    b[0] = op
+    syscall(1, G_PIPE_W as i64, (&b[0]) as i64, 1, 0, 0, 0)
+}
+
+// The app thread's command socket: one octet, counted like the host does.
+#[no_gc]
+fn wake_app() {
+    if G_FD_W == 0 || G_SENT == 0 {
+        return
+    }
+    let seq: u64 = *(G_SENT as *mut u64) + 1
+    *(G_SENT as *mut u64) = seq
+    var b: [u8; 1] = [0 as u8; 1]
+    b[0] = IME_CMD as u8
+    syscall(1, G_FD_W as i64, (&b[0]) as i64, 1, 0, 0, 0)
+}
+
+// The looper calls this on the MAIN thread when the app thread wrote an
+// octet. Returns 1: stay registered.
+#[no_gc]
+fn looper_callback(fd: i32, events: i32, data: u64) -> i32 {
+    var buf: [u8; 16] = [0 as u8; 16]
+    var more: bool = true
+    while more {
+        // recvfrom(fd, buf, 16, MSG_DONTWAIT, 0, 0)
+        let r: i64 = syscall(45, fd as i64, (&buf[0]) as i64, 16, 64, 0, 0)
+        if r <= 0 {
+            more = false
+        } else {
+            var i: i64 = 0
+            while i < r {
+                run_main(buf[i as usize])
+                i = i + 1
+            }
+        }
+    }
+    return 1
+}
+
+#[no_gc]
+fn run_main(op: u8) {
+    if op == MP_SHOW {
+        main_show()
+    } else if op == MP_HIDE {
+        main_hide()
+    } else if op == MP_SYNC {
+        main_sync()
+    }
+}
+
+#[no_gc]
+fn main_show() {
+    if G_STATE == 0 {
+        if !build() {
+            G_STATE = 2
+        } else {
+            G_STATE = 1
+        }
+    }
+    if G_STATE != 1 {
+        // no input method of our own: nothing to show (the hardware keys
+        // and the key events Android synthesises still arrive)
+        return
+    }
+    let env: u64 = G_ENV
+    jnicall.j_set_static_bool(env, G_KLS_VIEW, G_FID_E, true)
+    let f: bool = jnicall.j_bool(env, G_VIEW, G_M_FOCUS, 0)
+    var args: [u64; 2] = [0; 2]
+    args[0] = G_VIEW
+    let r: bool = jnicall.j_void(env, G_IMM, G_M_RESTART, (&args[0]) as u64)
+    args[0] = G_VIEW
+    args[1] = 0
+    let s: bool = jnicall.j_bool(env, G_IMM, G_M_SHOW, (&args[0]) as u64)
+}
+
+#[no_gc]
+fn main_hide() {
+    if G_STATE != 1 {
+        return
+    }
+    let env: u64 = G_ENV
+    jnicall.j_set_static_bool(env, G_KLS_VIEW, G_FID_E, false)
+    let tok: u64 = jnicall.j_obj(env, G_VIEW, G_M_TOKEN, 0)
+    var args: [u64; 2] = [0; 2]
+    args[0] = tok
+    args[1] = 0
+    let h: bool = jnicall.j_bool(env, G_IMM, G_M_HIDE, (&args[0]) as u64)
+    jnicall.j_del(env, tok)
+    args[0] = G_VIEW
+    let r: bool = jnicall.j_void(env, G_IMM, G_M_RESTART, (&args[0]) as u64)
+}
+
+// The app thread moved the caret or changed the text itself: the keyboard
+// is told (it keeps its own copy of the surroundings).
+#[no_gc]
+fn main_sync() {
+    if G_STATE != 1 {
+        return
+    }
+    var args: [u64; 5] = [0; 5]
+    args[0] = G_VIEW
+    args[1] = int_arg(ldi(O_SYNC_SA))
+    args[2] = int_arg(ldi(O_SYNC_SB))
+    args[3] = int_arg(ldi(O_SYNC_CA))
+    args[4] = int_arg(ldi(O_SYNC_CB))
+    let u: bool = jnicall.j_void(G_ENV, G_IMM, G_M_UPDATE, (&args[0]) as u64)
+}
+
+// A jvalue for an int: the low 32 bits, the rest zero.
+#[no_gc]
+fn int_arg(v: i64) -> u64 {
+    var x: i64 = v
+    if x < 0 {
+        x = x + 4294967296
+    }
+    return x as u64
+}
+
+// ---------------------------------------------------- the build chain
+const S_LOADER: str = "dalvik/system/InMemoryDexClassLoader\0"
+const S_LOADER_SIG: str = "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V\0"
+const S_INIT: str = "<init>\0"
+const S_LOADCLASS: str = "loadClass\0"
+const S_LOADCLASS_SIG: str = "(Ljava/lang/String;)Ljava/lang/Class;\0"
+const S_GETCL: str = "getClassLoader\0"
+const S_GETCL_SIG: str = "()Ljava/lang/ClassLoader;\0"
+const S_LP: str = "android/view/ViewGroup$LayoutParams\0"
+const S_II_V: str = "(II)V\0"
+const S_ADDCV: str = "addContentView\0"
+const S_ADDCV_SIG: str = "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V\0"
+const S_GETSVC: str = "getSystemService\0"
+const S_GETSVC_SIG: str = "(Ljava/lang/String;)Ljava/lang/Object;\0"
+const S_IMSVC: str = "input_method\0"
+const S_CTX_V: str = "(Landroid/content/Context;)V\0"
+const S_VIEWZ_V: str = "(Landroid/view/View;Z)V\0"
+const S_SETFOCUSABLE: str = "setFocusable\0"
+const S_SETFOCUSABLE_T: str = "setFocusableInTouchMode\0"
+const S_Z_V: str = "(Z)V\0"
+const S_REQFOCUS: str = "requestFocus\0"
+const S_Z: str = "()Z\0"
+const S_VOID_V: str = "()V\0"
+const S_TOKEN: str = "getWindowToken\0"
+const S_TOKEN_SIG: str = "()Landroid/os/IBinder;\0"
+const S_SHOW: str = "showSoftInput\0"
+const S_SHOW_SIG: str = "(Landroid/view/View;I)Z\0"
+const S_HIDE: str = "hideSoftInputFromWindow\0"
+const S_HIDE_SIG: str = "(Landroid/os/IBinder;I)Z\0"
+const S_RESTART: str = "restartInput\0"
+const S_RESTART_SIG: str = "(Landroid/view/View;)V\0"
+const S_UPDATE: str = "updateSelection\0"
+const S_UPDATE_SIG: str = "(Landroid/view/View;IIII)V\0"
+const S_CSEQ: str = "java/lang/CharSequence\0"
+const S_TOSTR: str = "toString\0"
+const S_TOSTR_SIG: str = "()Ljava/lang/String;\0"
+const S_KEY: str = "android/view/KeyEvent\0"
+const S_GETACTION: str = "getAction\0"
+const S_GETKEYCODE: str = "getKeyCode\0"
+const S_GETUNICODE: str = "getUnicodeChar\0"
+const S_GETMETA: str = "getMetaState\0"
+const S_II: str = "()I\0"
+const S_ST: str = "android/view/inputmethod/SurroundingText\0"
+const S_ST_SIG: str = "(Ljava/lang/CharSequence;III)V\0"
+const S_ET: str = "android/view/inputmethod/ExtractedText\0"
+const S_FIELD_TEXT: str = "text\0"
+const S_FIELD_CS: str = "Ljava/lang/CharSequence;\0"
+const S_FIELD_SS: str = "selectionStart\0"
+const S_FIELD_SE: str = "selectionEnd\0"
+const S_FIELD_FLAGS: str = "flags\0"
+const S_I: str = "I\0"
+const S_FIELD_E: str = "e\0"
+const S_Z1: str = "Z\0"
+const S_INPUTTYPE: str = "inputType\0"
+const S_IMEOPTIONS: str = "imeOptions\0"
+const S_SELSTART: str = "initialSelStart\0"
+const S_SELEND: str = "initialSelEnd\0"
+const S_CAPSMODE: str = "initialCapsMode\0"
+const S_MSG_START: str = "ime: building the classes\0"
+const S_MSG_FAIL: str = "ime: build failed\0"
+const S_MSG_NOAVAIL: str = "ime: not available\0"
+const S_MSG_READY: str = "ime: ready\0"
+
+// The chain, step for step. All on the main thread. False = it broke
+// (G_STATUS tells where; the exception, if any, is in logcat).
+#[no_gc]
+fn build() -> bool {
+    say((S_MSG_START.p as u64))
+    let env: u64 = G_ENV
+    if env == 0 || G_ACT == 0 || !block() {
+        return false
+    }
+    // 1. the dex, in memory that stays (the loader reads it as long as the
+    //    classes live)
+    let d: u64 = dex.dex_neu()
+    if d == 0 {
+        return false
+    }
+    if !imedex.imedex_build(d) {
+        dex.dex_free(d)
+        return false
+    }
+    let raw: u64 = rt.heap_alloc(dex.DEX_CAP)
+    if raw == 0 {
+        dex.dex_free(d)
+        return false
+    }
+    let n: usize = dex.dex_build(d, raw, dex.DEX_CAP)
+    dex.dex_free(d)
+    if n == 0 {
+        return false
+    }
+    G_STATUS = 1
+    // 2. a java.nio.ByteBuffer over it (no copy)
+    let bb: u64 = jnicall.j_direct_buffer(env, raw, n)
+    if bb == 0 {
+        return false
+    }
+    G_STATUS = 2
+    // 3. the activity's own class loader as the parent, so that the
+    //    framework's classes are found
+    let ak: u64 = jnicall.j_obj_class(env, G_ACT)
+    let m_gcl: u64 = jnicall.j_method(env, ak, S_GETCL.p as u64,
+        S_GETCL_SIG.p as u64)
+    let parent: u64 = jnicall.j_obj(env, G_ACT, m_gcl, 0)
+    let lk: u64 = jnicall.j_class(env, S_LOADER.p as u64)
+    let lctor: u64 = jnicall.j_method(env, lk, S_INIT.p as u64,
+        S_LOADER_SIG.p as u64)
+    if lk == 0 || lctor == 0 {
+        return false
+    }
+    var la: [u64; 2] = [0; 2]
+    la[0] = bb
+    la[1] = parent
+    let loader: u64 = jnicall.j_new(env, lk, lctor, (&la[0]) as u64)
+    if loader == 0 {
+        return false
+    }
+    G_STATUS = 3
+    // 4. the two classes
+    let m_load: u64 = jnicall.j_method(env, lk, S_LOADCLASS.p as u64,
+        S_LOADCLASS_SIG.p as u64)
+    let ka: u64 = load_class(loader, m_load, imedex.CLS_VIEW_DOT.p as u64)
+    let kb: u64 = load_class(loader, m_load, imedex.CLS_CONN_DOT.p as u64)
+    if ka == 0 || kb == 0 {
+        return false
+    }
+    G_KLS_VIEW = jnicall.j_global(env, ka)
+    G_KLS_CONN = jnicall.j_global(env, kb)
+    jnicall.j_del(env, ka)
+    jnicall.j_del(env, kb)
+    if G_KLS_VIEW == 0 || G_KLS_CONN == 0 {
+        return false
+    }
+    G_STATUS = 4
+    // 5. RegisterNatives
+    if !register() {
+        return false
+    }
+    G_STATUS = 5
+    // 6. ids, the view, the keyboard service
+    if !make_view() {
+        return false
+    }
+    G_STATUS = 6
+    say((S_MSG_READY.p as u64))
+    return true
+}
+
+#[no_gc]
+fn load_class(loader: u64, m_load: u64, dotted: u64) -> u64 {
+    let js: u64 = jnicall.j_str(G_ENV, dotted)
+    if js == 0 {
+        return 0
+    }
+    var a: [u64; 1] = [0; 1]
+    a[0] = js
+    let k: u64 = jnicall.j_obj(G_ENV, loader, m_load, (&a[0]) as u64)
+    jnicall.j_del(G_ENV, js)
+    return k
+}
+
+// -------------------------------------------- the `native` method table
+struct NA { f: fn(u64, u64, u64) -> u64 }
+struct NB { f: fn(u64, u64, u64, i32) -> i32 }
+struct NC { f: fn(u64, u64) -> i32 }
+struct ND { f: fn(u64, u64, i32, i32) -> i32 }
+struct NE { f: fn(u64, u64, u64) -> i32 }
+struct NF { f: fn(u64, u64, i32, i32) -> u64 }
+struct NG { f: fn(u64, u64, i32) -> u64 }
+struct NH { f: fn(u64, u64, i32) -> i32 }
+struct NI { f: fn(u64, u64, i32, i32, u64, i32, u64) -> i32 }
+struct NJ { f: fn(u64, u64, i32, i32, i32) -> u64 }
+struct NK { f: fn(u64, u64, u64, i32) -> u64 }
+
+// The code address of a Firn function (a `fn` value is a pointer to a record
+// whose first word is the address; see lib/android/ndk.fi).
+#[no_gc]
+fn adr_a(f: fn(u64, u64, u64) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NA = (&roh[0]) as *mut NA
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_b(f: fn(u64, u64, u64, i32) -> i32) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NB = (&roh[0]) as *mut NB
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_c(f: fn(u64, u64) -> i32) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NC = (&roh[0]) as *mut NC
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_d(f: fn(u64, u64, i32, i32) -> i32) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut ND = (&roh[0]) as *mut ND
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_e(f: fn(u64, u64, u64) -> i32) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NE = (&roh[0]) as *mut NE
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_f(f: fn(u64, u64, i32, i32) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NF = (&roh[0]) as *mut NF
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_g(f: fn(u64, u64, i32) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NG = (&roh[0]) as *mut NG
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_h(f: fn(u64, u64, i32) -> i32) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NH = (&roh[0]) as *mut NH
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_i(f: fn(u64, u64, i32, i32, u64, i32, u64) -> i32) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NI = (&roh[0]) as *mut NI
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_j(f: fn(u64, u64, i32, i32, i32) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NJ = (&roh[0]) as *mut NJ
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+#[no_gc]
+fn adr_k(f: fn(u64, u64, u64, i32) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut NK = (&roh[0]) as *mut NK
+    (*h).f = f
+    return ndk.peek64(roh[0])
+}
+
+// One entry of a JNINativeMethod table: { name, signature, code }.
+#[no_gc]
+fn nm(t: u64, i: usize, name: u64, sig: u64, code: u64) {
+    ndk.poke64(t + (i * 24) as u64, name)
+    ndk.poke64(t + (i * 24 + 8) as u64, sig)
+    ndk.poke64(t + (i * 24 + 16) as u64, code)
+}
+
+const N_OCIC: str = "onCreateInputConnection\0"
+const SIG_OCIC: str = "(Landroid/view/inputmethod/EditorInfo;)Landroid/view/inputmethod/InputConnection;\0"
+const N_COMMIT: str = "commitText\0"
+const N_SETCOMP: str = "setComposingText\0"
+const SIG_CSI_Z: str = "(Ljava/lang/CharSequence;I)Z\0"
+const N_FINCOMP: str = "finishComposingText\0"
+const SIG_Z: str = "()Z\0"
+const N_DELSUR: str = "deleteSurroundingText\0"
+const N_DELCP: str = "deleteSurroundingTextInCodePoints\0"
+const SIG_II_Z: str = "(II)Z\0"
+const N_SENDKEY: str = "sendKeyEvent\0"
+const SIG_KEY_Z: str = "(Landroid/view/KeyEvent;)Z\0"
+const N_BEFORE: str = "getTextBeforeCursor\0"
+const N_AFTER: str = "getTextAfterCursor\0"
+const SIG_II_CS: str = "(II)Ljava/lang/CharSequence;\0"
+const N_SELTEXT: str = "getSelectedText\0"
+const SIG_I_CS: str = "(I)Ljava/lang/CharSequence;\0"
+const N_CAPS: str = "getCursorCapsMode\0"
+const SIG_I_I: str = "(I)I\0"
+const N_ACTION: str = "performEditorAction\0"
+const SIG_I_Z: str = "(I)Z\0"
+const N_SETSEL: str = "setSelection\0"
+const N_SETREG: str = "setComposingRegion\0"
+const N_REPLACE: str = "replaceText\0"
+const SIG_REPLACE: str = "(IILjava/lang/CharSequence;ILandroid/view/inputmethod/TextAttribute;)Z\0"
+const N_SURR: str = "getSurroundingText\0"
+const SIG_SURR: str = "(III)Landroid/view/inputmethod/SurroundingText;\0"
+const N_EXTRACT: str = "getExtractedText\0"
+const SIG_EXTRACT: str = "(Landroid/view/inputmethod/ExtractedTextRequest;I)Landroid/view/inputmethod/ExtractedText;\0"
+
+#[no_gc]
+fn register() -> bool {
+    let env: u64 = G_ENV
+    // ImeView: one native
+    var ta: [u64; 3] = [0; 3]
+    nm((&ta[0]) as u64, 0, N_OCIC.p as u64, SIG_OCIC.p as u64,
+        adr_a(n_ocic))
+    if !jnicall.j_register(env, G_KLS_VIEW, (&ta[0]) as u64, 1) {
+        return false
+    }
+    // ImeConn: sixteen natives
+    var tb: [u64; 54] = [0; 54]
+    let t: u64 = (&tb[0]) as u64
+    nm(t, 0, N_COMMIT.p as u64, SIG_CSI_Z.p as u64, adr_b(n_commit))
+    nm(t, 1, N_SETCOMP.p as u64, SIG_CSI_Z.p as u64, adr_b(n_setcomp))
+    nm(t, 2, N_FINCOMP.p as u64, SIG_Z.p as u64, adr_c(n_fincomp))
+    nm(t, 3, N_DELSUR.p as u64, SIG_II_Z.p as u64, adr_d(n_delsur))
+    nm(t, 4, N_DELCP.p as u64, SIG_II_Z.p as u64, adr_d(n_delcp))
+    nm(t, 5, N_SENDKEY.p as u64, SIG_KEY_Z.p as u64, adr_e(n_sendkey))
+    nm(t, 6, N_BEFORE.p as u64, SIG_II_CS.p as u64, adr_f(n_before))
+    nm(t, 7, N_AFTER.p as u64, SIG_II_CS.p as u64, adr_f(n_after))
+    nm(t, 8, N_SELTEXT.p as u64, SIG_I_CS.p as u64, adr_g(n_seltext))
+    nm(t, 9, N_CAPS.p as u64, SIG_I_I.p as u64, adr_h(n_caps))
+    nm(t, 10, N_ACTION.p as u64, SIG_I_Z.p as u64, adr_h(n_action))
+    nm(t, 11, N_SETSEL.p as u64, SIG_II_Z.p as u64, adr_d(n_setsel))
+    nm(t, 12, N_SETREG.p as u64, SIG_II_Z.p as u64, adr_d(n_setreg))
+    nm(t, 13, N_REPLACE.p as u64, SIG_REPLACE.p as u64, adr_i(n_replace))
+    nm(t, 14, N_SURR.p as u64, SIG_SURR.p as u64, adr_j(n_surr))
+    nm(t, 15, N_EXTRACT.p as u64, SIG_EXTRACT.p as u64, adr_k(n_extract))
+    // The methods of API 31 / 34 may be missing from the framework's
+    // BaseInputConnection; a `native` method that overrides nothing is
+    // harmless, so all sixteen are registered in one go.
+    return jnicall.j_register(env, G_KLS_CONN, t, 16)
+}
+
+// The view, the ids, the keyboard service. All the class lookups happen
+// HERE (a looper callback has no Java frame, but the boot classes are
+// always found; the two of ours were loaded by the loader already).
+#[no_gc]
+fn make_view() -> bool {
+    let env: u64 = G_ENV
+    G_FID_E = jnicall.j_static_field(env, G_KLS_VIEW, S_FIELD_E.p as u64,
+        S_Z1.p as u64)
+    G_CTOR_CONN = jnicall.j_method(env, G_KLS_CONN, S_INIT.p as u64,
+        S_VIEWZ_V.p as u64)
+    if G_FID_E == 0 || G_CTOR_CONN == 0 {
+        return false
+    }
+    G_M_FOCUS = jnicall.j_method(env, G_KLS_VIEW, S_REQFOCUS.p as u64,
+        S_Z.p as u64)
+    G_M_TOKEN = jnicall.j_method(env, G_KLS_VIEW, S_TOKEN.p as u64,
+        S_TOKEN_SIG.p as u64)
+    let m_foc: u64 = jnicall.j_method(env, G_KLS_VIEW, S_SETFOCUSABLE.p as u64,
+        S_Z_V.p as u64)
+    let m_foct: u64 = jnicall.j_method(env, G_KLS_VIEW,
+        S_SETFOCUSABLE_T.p as u64, S_Z_V.p as u64)
+    let vctor: u64 = jnicall.j_method(env, G_KLS_VIEW, S_INIT.p as u64,
+        S_CTX_V.p as u64)
+    if vctor == 0 || m_foc == 0 || m_foct == 0 || G_M_FOCUS == 0
+    || G_M_TOKEN == 0 {
+        return false
+    }
+    // the view: ImeView(activity)
+    var a1: [u64; 2] = [0; 2]
+    a1[0] = G_ACT
+    let v: u64 = jnicall.j_new(env, G_KLS_VIEW, vctor, (&a1[0]) as u64)
+    if v == 0 {
+        return false
+    }
+    G_VIEW = jnicall.j_global(env, v)
+    jnicall.j_del(env, v)
+    if G_VIEW == 0 {
+        return false
+    }
+    a1[0] = 1
+    let s1: bool = jnicall.j_void(env, G_VIEW, m_foc, (&a1[0]) as u64)
+    let s2: bool = jnicall.j_void(env, G_VIEW, m_foct, (&a1[0]) as u64)
+    // ONE PIXEL, in the corner: a view of no size does not take the focus
+    // (View.canTakeFocus wants right > left and bottom > top), and one the
+    // size of the screen would lie in the hit path of every event.
+    let lpk: u64 = jnicall.j_class(env, S_LP.p as u64)
+    let lpc: u64 = jnicall.j_method(env, lpk, S_INIT.p as u64,
+        S_II_V.p as u64)
+    var a2: [u64; 2] = [0; 2]
+    a2[0] = 1
+    a2[1] = 1
+    let lp: u64 = jnicall.j_new(env, lpk, lpc, (&a2[0]) as u64)
+    let ak: u64 = jnicall.j_obj_class(env, G_ACT)
+    let m_add: u64 = jnicall.j_method(env, ak, S_ADDCV.p as u64,
+        S_ADDCV_SIG.p as u64)
+    a2[0] = G_VIEW
+    a2[1] = lp
+    let added: bool = jnicall.j_void(env, G_ACT, m_add, (&a2[0]) as u64)
+    jnicall.j_del(env, lp)
+    jnicall.j_del(env, lpk)
+    if !added {
+        return false
+    }
+    // the keyboard service
+    let m_svc: u64 = jnicall.j_method(env, ak, S_GETSVC.p as u64,
+        S_GETSVC_SIG.p as u64)
+    let js: u64 = jnicall.j_str(env, S_IMSVC.p as u64)
+    var a3: [u64; 1] = [0; 1]
+    a3[0] = js
+    let imm: u64 = jnicall.j_obj(env, G_ACT, m_svc, (&a3[0]) as u64)
+    jnicall.j_del(env, js)
+    G_IMM = jnicall.j_global(env, imm)
+    jnicall.j_del(env, imm)
+    jnicall.j_del(env, ak)
+    if G_IMM == 0 {
+        return false
+    }
+    let ik: u64 = jnicall.j_obj_class(env, G_IMM)
+    G_M_SHOW = jnicall.j_method(env, ik, S_SHOW.p as u64, S_SHOW_SIG.p as u64)
+    G_M_HIDE = jnicall.j_method(env, ik, S_HIDE.p as u64, S_HIDE_SIG.p as u64)
+    G_M_RESTART = jnicall.j_method(env, ik, S_RESTART.p as u64,
+        S_RESTART_SIG.p as u64)
+    G_M_UPDATE = jnicall.j_method(env, ik, S_UPDATE.p as u64,
+        S_UPDATE_SIG.p as u64)
+    jnicall.j_del(env, ik)
+    if G_M_SHOW == 0 || G_M_HIDE == 0 || G_M_RESTART == 0 || G_M_UPDATE == 0 {
+        return false
+    }
+    // CharSequence.toString, KeyEvent's getters
+    let csk: u64 = jnicall.j_class(env, S_CSEQ.p as u64)
+    G_M_TOSTR = jnicall.j_method(env, csk, S_TOSTR.p as u64,
+        S_TOSTR_SIG.p as u64)
+    jnicall.j_del(env, csk)
+    let kk: u64 = jnicall.j_class(env, S_KEY.p as u64)
+    G_M_ACTION = jnicall.j_method(env, kk, S_GETACTION.p as u64, S_II.p as u64)
+    G_M_KEYCODE = jnicall.j_method(env, kk, S_GETKEYCODE.p as u64, S_II.p as u64)
+    G_M_UNICODE = jnicall.j_method(env, kk, S_GETUNICODE.p as u64, S_II.p as u64)
+    G_M_META = jnicall.j_method(env, kk, S_GETMETA.p as u64, S_II.p as u64)
+    jnicall.j_del(env, kk)
+    if G_M_TOSTR == 0 || G_M_ACTION == 0 || G_M_KEYCODE == 0 {
+        return false
+    }
+    // API 31: SurroundingText. API < 31: none, and getSurroundingText is
+    // never called.
+    let sk: u64 = jnicall.j_class(env, S_ST.p as u64)
+    if sk != 0 {
+        G_KLS_ST = jnicall.j_global(env, sk)
+        G_CTOR_ST = jnicall.j_method(env, sk, S_INIT.p as u64, S_ST_SIG.p as u64)
+        jnicall.j_del(env, sk)
+    }
+    let ek: u64 = jnicall.j_class(env, S_ET.p as u64)
+    if ek != 0 {
+        G_KLS_ET = jnicall.j_global(env, ek)
+        G_CTOR_ET = jnicall.j_method(env, ek, S_INIT.p as u64, S_VOID_V.p as u64)
+        G_FID_ET_TEXT = jnicall.j_field(env, ek, S_FIELD_TEXT.p as u64,
+            S_FIELD_CS.p as u64)
+        G_FID_ET_SS = jnicall.j_field(env, ek, S_FIELD_SS.p as u64, S_I.p as u64)
+        G_FID_ET_SE = jnicall.j_field(env, ek, S_FIELD_SE.p as u64, S_I.p as u64)
+        G_FID_ET_FLAGS = jnicall.j_field(env, ek, S_FIELD_FLAGS.p as u64,
+            S_I.p as u64)
+        jnicall.j_del(env, ek)
+    }
+    return true
+}
+
+// ================================================================
+// THE NATIVE METHODS (main thread, called by the keyboard)
+// ================================================================
+
+// One request to the app thread and its answer. false = no field, no
+// answer in time, or the app thread said no.
+#[no_gc]
+fn rpc(op: u64, a: i64, b: i64, c: i64, d: i64, nreq: usize) -> bool {
+    if G_IM == 0 || ld_sync(O_ATTACHED) == 0 {
+        return false
+    }
+    st(O_OP, op)
+    sti(O_A, a)
+    sti(O_B, b)
+    sti(O_C, c)
+    sti(O_D, d)
+    st(O_REQ_N, nreq as u64)
+    st(O_RES_OK, 0)
+    st(O_RES_N, 0)
+    let seq: u64 = ld(O_SEQ) + 1
+    // the new number goes out through a barrier: the request is complete
+    __atomic_add((G_IM + O_SEQ) as *mut u64, 1)
+    wake_app()
+    var waited: i64 = 0
+    while ld_sync(O_DONE) != seq {
+        sleep_us(100)
+        waited = waited + 100
+        if waited > REQUEST_WAIT_US {
+            // give up; the app thread, if it comes later, finds nothing
+            st(O_DONE, seq)
+            return false
+        }
+    }
+    return ld(O_RES_OK) != 0
+}
+
+// A Java CharSequence into REQ_TEXT as UTF-16 units; the count.
+#[no_gc]
+fn cs_to_req(env: u64, cs: u64) -> usize {
+    if cs == 0 || G_M_TOSTR == 0 {
+        return 0
+    }
+    let js: u64 = jnicall.j_obj(env, cs, G_M_TOSTR, 0)
+    if js == 0 {
+        return 0
+    }
+    var n: usize = jnicall.j_string_len(env, js)
+    if n > TXT_CAP {
+        n = TXT_CAP
+    }
+    if n > 0 {
+        let p: u64 = jnicall.j_string_chars(env, js)
+        if p != 0 {
+            var i: usize = 0
+            while i < n {
+                u16_put(O_REQ_TEXT, i, (*((p + i as u64 * 2) as *mut u16)) as u32)
+                i = i + 1
+            }
+            jnicall.j_string_release(env, js, p)
+        } else {
+            n = 0
+        }
+    }
+    jnicall.j_del(env, js)
+    return n
+}
+
+// RES_TEXT as a Java String (a CharSequence).
+#[no_gc]
+fn res_string(env: u64) -> u64 {
+    var n: usize = ld(O_RES_N) as usize
+    if n > TXT_CAP {
+        n = TXT_CAP
+    }
+    return jnicall.j_new_string16(env, G_IM + O_RES_TEXT, n)
+}
+
+#[no_gc]
+fn b2i(ok: bool) -> i32 {
+    if ok {
+        return 1
+    }
+    return 0
+}
+
+// ImeView.onCreateInputConnection(EditorInfo): the connection, and the
+// EditorInfo told what kind of field this is.
+#[no_gc]
+fn n_ocic(env: u64, this: u64, ei: u64) -> u64 {
+    var sa: i64 = 0
+    var sb: i64 = 0
+    var kind: i64 = 0
+    if rpc(OP_INFO, 0, 0, 0, 0, 0) {
+        sa = ldi(O_RES_A)
+        sb = ldi(O_RES_B)
+        kind = ldi(O_RES_C)
+    }
+    if ei != 0 {
+        if G_FID_INPUTTYPE == 0 {
+            let ek: u64 = jnicall.j_obj_class(env, ei)
+            G_FID_INPUTTYPE = jnicall.j_field(env, ek, S_INPUTTYPE.p as u64,
+                S_I.p as u64)
+            G_FID_IMEOPT = jnicall.j_field(env, ek, S_IMEOPTIONS.p as u64,
+                S_I.p as u64)
+            G_FID_SELSTART = jnicall.j_field(env, ek, S_SELSTART.p as u64,
+                S_I.p as u64)
+            G_FID_SELEND = jnicall.j_field(env, ek, S_SELEND.p as u64,
+                S_I.p as u64)
+            G_FID_CAPS = jnicall.j_field(env, ek, S_CAPSMODE.p as u64,
+                S_I.p as u64)
+            jnicall.j_del(env, ek)
+        }
+        var it: i32 = TYPE_CLASS_TEXT
+        var opt: i32 = IME_ACTION_DONE | IME_FLAG_NO_EXTRACT_UI
+        | IME_FLAG_NO_FULLSCREEN
+        if kind == 1 {
+            it = it | TYPE_TEXT_VARIATION_PASSWORD
+            opt = opt | IME_FLAG_NO_PERSONALIZED_LEARNING
+        }
+        jnicall.j_set_int_field(env, ei, G_FID_INPUTTYPE, it)
+        jnicall.j_set_int_field(env, ei, G_FID_IMEOPT, opt)
+        jnicall.j_set_int_field(env, ei, G_FID_SELSTART, sa as i32)
+        jnicall.j_set_int_field(env, ei, G_FID_SELEND, sb as i32)
+        jnicall.j_set_int_field(env, ei, G_FID_CAPS, 0)
+    }
+    var args: [u64; 2] = [0; 2]
+    args[0] = this
+    args[1] = 1
+    return jnicall.j_new(env, G_KLS_CONN, G_CTOR_CONN, (&args[0]) as u64)
+}
+
+#[no_gc]
+fn n_commit(env: u64, this: u64, cs: u64, pos: i32) -> i32 {
+    let n: usize = cs_to_req(env, cs)
+    return b2i(rpc(OP_COMMIT, pos as i64, 0, 0, 0, n))
+}
+
+#[no_gc]
+fn n_setcomp(env: u64, this: u64, cs: u64, pos: i32) -> i32 {
+    let n: usize = cs_to_req(env, cs)
+    return b2i(rpc(OP_SETCOMP, pos as i64, 0, 0, 0, n))
+}
+
+#[no_gc]
+fn n_fincomp(env: u64, this: u64) -> i32 {
+    return b2i(rpc(OP_FINISH, 0, 0, 0, 0, 0))
+}
+
+#[no_gc]
+fn n_delsur(env: u64, this: u64, before: i32, after: i32) -> i32 {
+    return b2i(rpc(OP_DELSUR, before as i64, after as i64, 0, 0, 0))
+}
+
+#[no_gc]
+fn n_delcp(env: u64, this: u64, before: i32, after: i32) -> i32 {
+    return b2i(rpc(OP_DELCP, before as i64, after as i64, 0, 0, 0))
+}
+
+// A KeyEvent from the keyboard (Backspace, Enter, arrows, a character).
+#[no_gc]
+fn n_sendkey(env: u64, this: u64, ev: u64) -> i32 {
+    if ev == 0 || G_M_ACTION == 0 {
+        return 0
+    }
+    let action: i32 = jnicall.j_int(env, ev, G_M_ACTION, 0)
+    if action != ndk.KEY_ACTION_DOWN {
+        return 1
+    }
+    let code: i32 = jnicall.j_int(env, ev, G_M_KEYCODE, 0)
+    var uni: i32 = 0
+    if G_M_UNICODE != 0 {
+        uni = jnicall.j_int(env, ev, G_M_UNICODE, 0)
+    }
+    var meta: i32 = 0
+    if G_M_META != 0 {
+        meta = jnicall.j_int(env, ev, G_M_META, 0)
+    }
+    var shift: i64 = 0
+    if (meta & META_SHIFT_ON) != 0 || (meta & META_SHIFT_LEFT_ON) != 0
+    || (meta & META_SHIFT_RIGHT_ON) != 0 {
+        shift = 1
+    }
+    return b2i(rpc(OP_KEY, code as i64, uni as i64, shift, 0, 0))
+}
+
+// The surroundings. The answer is at most TXT_CAP units.
+#[no_gc]
+fn n_before(env: u64, this: u64, n: i32, flags: i32) -> u64 {
+    if !rpc(OP_BEFORE, n as i64, 0, 0, 0, 0) {
+        return 0
+    }
+    return res_string(env)
+}
+
+#[no_gc]
+fn n_after(env: u64, this: u64, n: i32, flags: i32) -> u64 {
+    if !rpc(OP_AFTER, n as i64, 0, 0, 0, 0) {
+        return 0
+    }
+    return res_string(env)
+}
+
+#[no_gc]
+fn n_seltext(env: u64, this: u64, flags: i32) -> u64 {
+    if !rpc(OP_SELTEXT, 0, 0, 0, 0, 0) {
+        return 0
+    }
+    return res_string(env)
+}
+
+#[no_gc]
+fn n_caps(env: u64, this: u64, modes: i32) -> i32 {
+    return 0
+}
+
+#[no_gc]
+fn n_action(env: u64, this: u64, action: i32) -> i32 {
+    return b2i(rpc(OP_ACTION, action as i64, 0, 0, 0, 0))
+}
+
+#[no_gc]
+fn n_setsel(env: u64, this: u64, a: i32, b: i32) -> i32 {
+    return b2i(rpc(OP_SETSEL, a as i64, b as i64, 0, 0, 0))
+}
+
+#[no_gc]
+fn n_setreg(env: u64, this: u64, a: i32, b: i32) -> i32 {
+    return b2i(rpc(OP_SETREG, a as i64, b as i64, 0, 0, 0))
+}
+
+// replaceText(start, end, text, newCursorPosition, attribute) (API 34)
+#[no_gc]
+fn n_replace(env: u64, this: u64, a: i32, b: i32, cs: u64, pos: i32,
+    attr: u64) -> i32 {
+    let n: usize = cs_to_req(env, cs)
+    return b2i(rpc(OP_REPLACE, a as i64, b as i64, pos as i64, 0, n))
+}
+
+// getSurroundingText(before, after, flags): a SurroundingText (API 31).
+#[no_gc]
+fn n_surr(env: u64, this: u64, before: i32, after: i32, flags: i32) -> u64 {
+    if G_KLS_ST == 0 || G_CTOR_ST == 0 {
+        return 0
+    }
+    if !rpc(OP_SURR, before as i64, after as i64, 0, 0, 0) {
+        return 0
+    }
+    let js: u64 = res_string(env)
+    if js == 0 {
+        return 0
+    }
+    var args: [u64; 4] = [0; 4]
+    args[0] = js
+    args[1] = int_arg(ldi(O_RES_A))
+    args[2] = int_arg(ldi(O_RES_B))
+    args[3] = int_arg(ldi(O_RES_C))
+    let r: u64 = jnicall.j_new(env, G_KLS_ST, G_CTOR_ST, (&args[0]) as u64)
+    jnicall.j_del(env, js)
+    return r
+}
+
+// getExtractedText(request, flags): the whole text and the selection.
+#[no_gc]
+fn n_extract(env: u64, this: u64, req: u64, flags: i32) -> u64 {
+    if G_KLS_ET == 0 || G_CTOR_ET == 0 {
+        return 0
+    }
+    if !rpc(OP_EXTRACT, 0, 0, 0, 0, 0) {
+        return 0
+    }
+    var args: [u64; 1] = [0; 1]
+    let et: u64 = jnicall.j_new(env, G_KLS_ET, G_CTOR_ET, 0)
+    if et == 0 {
+        return 0
+    }
+    let js: u64 = res_string(env)
+    jnicall.j_set_obj_field(env, et, G_FID_ET_TEXT, js)
+    jnicall.j_set_int_field(env, et, G_FID_ET_SS, ldi(O_RES_A) as i32)
+    jnicall.j_set_int_field(env, et, G_FID_ET_SE, ldi(O_RES_B) as i32)
+    jnicall.j_set_int_field(env, et, G_FID_ET_FLAGS, 1)
+    jnicall.j_del(env, js)
+    return et
+}
+
+// ================================================================
+// THE APP THREAD
+// ================================================================
+
+// A text field wants the keyboard (on) or lets go of it (off). `tb` is
+// its `textbuf.TextBuf`; `secret` = a password field.
+#[no_gc]
+fn ime_attach(on: bool, tb: u64, secret: bool) -> bool {
+    if !ime_available() {
+        if G_WARNED == 0 as u32 {
+            G_WARNED = 1 as u32
+            say(S_MSG_NOAVAIL.p as u64)
+        }
+        return false
+    }
+    if on {
+        G_TB = tb
+        var k: u64 = 0
+        if secret {
+            k = 1
+        }
+        st(O_KIND, k)
+        G_SIG = signature(tb)
+        st(O_ATTACHED, 1)
+        ld_sync(O_ATTACHED)
+        post_main(MP_SHOW)
+    } else {
+        G_TB = 0
+        st(O_ATTACHED, 0)
+        ld_sync(O_ATTACHED)
+        post_main(MP_HIDE)
+    }
+    return true
+}
+
+// Once per turn of the loop while a field has the input. Serves what the
+// keyboard asked, tells the keyboard what the program did to the text on
+// its own, and returns IME_CHANGED / IME_ENTER (what the keyboard did).
+#[no_gc]
+fn ime_sync(tb: u64) -> u32 {
+    if !ime_available() {
+        return 0
+    }
+    G_TB = tb
+    let r: u32 = ime_serve()
+    let s: u64 = signature(tb)
+    if s != G_SIG {
+        // the text or the caret moved by hand (a hardware key, a tap, the
+        // program): the keyboard has to hear of it
+        G_SIG = s
+        publish_sync(tb)
+        post_main(MP_SYNC)
+    }
+    let f: u32 = G_FLAGS | r
+    G_FLAGS = 0
+    return f
+}
+
+#[no_gc]
+fn publish_sync(tb: u64) {
+    let t: *mut textbuf.TextBuf = tb as *mut textbuf.TextBuf
+    sti(O_SYNC_SA, textbuf.tb_u16_of(t, textbuf.tb_sel_a(t)) as i64)
+    sti(O_SYNC_SB, textbuf.tb_u16_of(t, textbuf.tb_sel_b(t)) as i64)
+    if textbuf.tb_has_comp(t) {
+        sti(O_SYNC_CA, textbuf.tb_u16_of(t, textbuf.tb_comp_a(t)) as i64)
+        sti(O_SYNC_CB, textbuf.tb_u16_of(t, textbuf.tb_comp_b(t)) as i64)
+    } else {
+        sti(O_SYNC_CA, 0 - 1)
+        sti(O_SYNC_CB, 0 - 1)
+    }
+}
+
+// A number for "the text, the caret, the anchor and the composing range":
+// when it changes the keyboard has to be told.
+#[no_gc]
+fn signature(tb: u64) -> u64 {
+    if tb == 0 {
+        return 0
+    }
+    let t: *mut textbuf.TextBuf = tb as *mut textbuf.TextBuf
+    var h: u64 = 7
+    let n: usize = textbuf.tb_len(t)
+    let p: u64 = textbuf.tb_ptr(t)
+    var i: usize = 0
+    while i < n {
+        h = (h * 31 + ((*((p + i as u64) as *mut u8)) as u64) + 1) % 1000000007
+        i = i + 1
+    }
+    h = (h * 31 + textbuf.tb_caret(t) as u64 + 1) % 1000000007
+    h = (h * 31 + textbuf.tb_anchor(t) as u64 + 1) % 1000000007
+    h = (h * 31 + textbuf.tb_comp_a(t) as u64 + 1) % 1000000007
+    h = (h * 31 + textbuf.tb_comp_b(t) as u64 + 1) % 1000000007
+    return h
+}
+
+// If the keyboard has a request waiting, do it. Called by the host when
+// CMD_IME arrives and again from `ime_sync`. Returns IME_CHANGED / IME_ENTER
+// for what it did (also accumulated for the next `ime_sync`).
+#[no_gc]
+fn ime_serve() -> u32 {
+    if G_IM == 0 {
+        return 0
+    }
+    let seq: u64 = ld_sync(O_SEQ)
+    if seq == ld_sync(O_DONE) {
+        return 0
+    }
+    var flags: u32 = 0
+    var ok: bool = false
+    st(O_RES_OK, 0)
+    if G_TB != 0 {
+        ok = serve_op(ld(O_OP), &flags)
+    }
+    if ok {
+        st(O_RES_OK, 1)
+    }
+    if G_TB != 0 {
+        // the keyboard knows what it did: no sync message for it
+        G_SIG = signature(G_TB)
+    }
+    // the answer goes out through a barrier
+    st(O_DONE, seq)
+    ld_sync(O_DONE)
+    G_FLAGS = G_FLAGS | flags
+    return flags
+}
+
+// ------------------------------------------------ UTF-16 <-> the TextBuf
+// The whole buffer as UTF-16 units into O_TEXT16; the count.
+#[no_gc]
+fn text_units(t: *mut textbuf.TextBuf) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    var adv: usize = 0
+    let len: usize = textbuf.tb_len(t)
+    while i < len {
+        let cp: u32 = textbuf.tb_cp_at(t, i, &adv)
+        if adv == 0 {
+            break
+        }
+        if cp >= 65536 as u32 {
+            if n + 2 > TEXT16_CAP {
+                break
+            }
+            let c: u32 = cp - 65536 as u32
+            u16_put(O_TEXT16, n, 55296 as u32 + (c >> 10))
+            u16_put(O_TEXT16, n + 1, 56320 as u32 + (c & 1023 as u32))
+            n = n + 2
+        } else {
+            if n + 1 > TEXT16_CAP {
+                break
+            }
+            u16_put(O_TEXT16, n, cp)
+            n = n + 1
+        }
+        i = i + adv
+    }
+    return n
+}
+
+// n UTF-16 units at G_IM + `src` into WTF-8 at O_SCRATCH; the octets.
+#[no_gc]
+fn encode_units(src: u64, n: usize) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < n && k + 4 <= SCRATCH_CAP {
+        let u: u32 = (*((G_IM + src + i as u64 * 2) as *mut u16)) as u32
+        var cp: u32 = u
+        i = i + 1
+        if u >= 55296 as u32 && u < 56320 as u32 && i < n {
+            let v: u32 = (*((G_IM + src + i as u64 * 2) as *mut u16)) as u32
+            if v >= 56320 as u32 && v < 57344 as u32 {
+                cp = 65536 as u32 + ((u - 55296 as u32) << 10) + (v - 56320 as u32)
+                i = i + 1
+            }
+        }
+        k = k + textbuf.tb_cp_encode(cp, G_IM + O_SCRATCH + k as u64)
+    }
+    return k
+}
+
+#[no_gc]
+fn u16_of(t: *mut textbuf.TextBuf, byte: usize) -> usize {
+    return textbuf.tb_u16_of(t, byte)
+}
+
+#[no_gc]
+fn byte_of(t: *mut textbuf.TextBuf, unit: usize) -> usize {
+    return textbuf.tb_byte_from_u16(t, unit)
+}
+
+// A signed unit position, clamped to 0..=hi.
+#[no_gc]
+fn clamp(v: i64, hi: usize) -> usize {
+    if v < 0 {
+        return 0
+    }
+    if v as usize > hi {
+        return hi
+    }
+    return v as usize
+}
+
+// Replace the BYTE range [a, b) with the request's text (nreq units).
+#[no_gc]
+fn replace_bytes(t: *mut textbuf.TextBuf, a: usize, b: usize, nreq: usize) -> bool {
+    let k: usize = encode_units(O_REQ_TEXT, nreq)
+    return textbuf.tb_replace(t, a, b, G_IM + O_SCRATCH, k)
+}
+
+// After an insert at byte `a` of `k` octets: the caret as the keyboard
+// asked (newCursorPosition: > 0 behind the text, <= 0 before it).
+#[no_gc]
+fn place_caret(t: *mut textbuf.TextBuf, a: usize, k: usize, pos: i64) {
+    let total: usize = textbuf.tb_u16_len(t)
+    let a16: usize = u16_of(t, a)
+    let len16: usize = u16_of(t, a + k) - a16
+    var c: i64 = 0
+    if pos > 0 {
+        c = a16 as i64 + len16 as i64 + pos - 1
+    } else {
+        c = a16 as i64 + pos
+    }
+    let at: usize = byte_of(t, clamp(c, total))
+    textbuf.tb_set_range(t, at, at)
+}
+
+// Where new text goes: the composing text, else the selection, else the caret.
+#[no_gc]
+fn target(t: *mut textbuf.TextBuf, a: *mut usize, b: *mut usize) {
+    if textbuf.tb_has_comp(t) {
+        *a = textbuf.tb_comp_a(t)
+        *b = textbuf.tb_comp_b(t)
+    } else if textbuf.tb_has_sel(t) {
+        *a = textbuf.tb_sel_a(t)
+        *b = textbuf.tb_sel_b(t)
+    } else {
+        *a = textbuf.tb_caret(t)
+        *b = textbuf.tb_caret(t)
+    }
+}
+
+// RES_TEXT = units [from, to) of the whole text; the count in O_RES_N.
+#[no_gc]
+fn slice_res(t: *mut textbuf.TextBuf, from: usize, to: usize) {
+    let n: usize = text_units(t)
+    var f: usize = from
+    var e: usize = to
+    if e > n {
+        e = n
+    }
+    if f > e {
+        f = e
+    }
+    var k: usize = 0
+    while f + k < e && k < TXT_CAP {
+        u16_put(O_RES_TEXT, k, u16_at(O_TEXT16, f + k))
+        k = k + 1
+    }
+    st(O_RES_N, k as u64)
+}
+
+// The request. true = done (the keyboard hears "true").
+#[no_gc]
+fn serve_op(op: u64, flags: *mut u32) -> bool {
+    let t: *mut textbuf.TextBuf = G_TB as *mut textbuf.TextBuf
+    let a: i64 = ldi(O_A)
+    let b: i64 = ldi(O_B)
+    let c: i64 = ldi(O_C)
+    let nreq: usize = ld(O_REQ_N) as usize
+    if op == OP_COMMIT || op == OP_SETCOMP {
+        var x: usize = 0
+        var y: usize = 0
+        target(t, &x, &y)
+        let k: usize = encode_units(O_REQ_TEXT, nreq)
+        if !textbuf.tb_replace(t, x, y, G_IM + O_SCRATCH, k) {
+            return false
+        }
+        if op == OP_SETCOMP && k > 0 {
+            textbuf.tb_comp_set(t, x, x + k)
+        } else {
+            textbuf.tb_comp_end(t)
+        }
+        place_caret(t, x, k, a)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if op == OP_FINISH {
+        textbuf.tb_comp_end(t)
+        return true
+    }
+    if op == OP_REPLACE {
+        let total: usize = textbuf.tb_u16_len(t)
+        var s: usize = clamp(a, total)
+        var e: usize = clamp(b, total)
+        if e < s {
+            let z: usize = s
+            s = e
+            e = z
+        }
+        let x: usize = byte_of(t, s)
+        let y: usize = byte_of(t, e)
+        let k: usize = encode_units(O_REQ_TEXT, nreq)
+        if !textbuf.tb_replace(t, x, y, G_IM + O_SCRATCH, k) {
+            return false
+        }
+        textbuf.tb_comp_end(t)
+        place_caret(t, x, k, c)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if op == OP_DELSUR || op == OP_DELCP {
+        delete_around(t, a, b, op == OP_DELCP)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if op == OP_KEY {
+        return key(t, a as i32, b as i32, c != 0, flags)
+    }
+    if op == OP_BEFORE {
+        let sa: usize = u16_of(t, textbuf.tb_sel_a(t))
+        var from: usize = 0
+        if a > 0 && (a as usize) < sa {
+            from = sa - a as usize
+        }
+        slice_res(t, from, sa)
+        return true
+    }
+    if op == OP_AFTER {
+        let sb: usize = u16_of(t, textbuf.tb_sel_b(t))
+        var n: usize = 0
+        if a > 0 {
+            n = a as usize
+        }
+        slice_res(t, sb, sb + n)
+        return true
+    }
+    if op == OP_SELTEXT {
+        if !textbuf.tb_has_sel(t) {
+            return false
+        }
+        slice_res(t, u16_of(t, textbuf.tb_sel_a(t)), u16_of(t, textbuf.tb_sel_b(t)))
+        return true
+    }
+    if op == OP_SURR {
+        let sa: usize = u16_of(t, textbuf.tb_sel_a(t))
+        let sb: usize = u16_of(t, textbuf.tb_sel_b(t))
+        var from: usize = 0
+        if a > 0 && (a as usize) < sa {
+            from = sa - a as usize
+        }
+        var upto: usize = sb
+        if b > 0 {
+            upto = sb + b as usize
+        }
+        slice_res(t, from, upto)
+        sti(O_RES_A, (sa - from) as i64)
+        sti(O_RES_B, (sb - from) as i64)
+        sti(O_RES_C, from as i64)
+        return true
+    }
+    if op == OP_EXTRACT {
+        slice_res(t, 0, TEXT16_CAP)
+        sti(O_RES_A, u16_of(t, textbuf.tb_sel_a(t)) as i64)
+        sti(O_RES_B, u16_of(t, textbuf.tb_sel_b(t)) as i64)
+        return true
+    }
+    if op == OP_SETSEL {
+        let total: usize = textbuf.tb_u16_len(t)
+        textbuf.tb_set_range(t, byte_of(t, clamp(b, total)),
+            byte_of(t, clamp(a, total)))
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if op == OP_SETREG {
+        let total: usize = textbuf.tb_u16_len(t)
+        var s: usize = clamp(a, total)
+        var e: usize = clamp(b, total)
+        if e < s {
+            let z: usize = s
+            s = e
+            e = z
+        }
+        if s == e {
+            textbuf.tb_comp_end(t)
+        } else {
+            textbuf.tb_comp_set(t, byte_of(t, s), byte_of(t, e))
+        }
+        return true
+    }
+    if op == OP_ACTION {
+        // Go, Search, Send, Next, Done: for a one line field all of them
+        // are what Enter is
+        *flags = *flags | IME_ENTER
+        return true
+    }
+    if op == OP_INFO {
+        sti(O_RES_A, u16_of(t, textbuf.tb_sel_a(t)) as i64)
+        sti(O_RES_B, u16_of(t, textbuf.tb_sel_b(t)) as i64)
+        sti(O_RES_C, ldi(O_KIND))
+        return true
+    }
+    return false
+}
+
+// deleteSurroundingText(before, after): `before` units (or code points)
+// before the selection and `after` behind it go; the selection stays.
+#[no_gc]
+fn delete_around(t: *mut textbuf.TextBuf, before: i64, after: i64, points: bool) {
+    textbuf.tb_comp_end(t)
+    let sa: usize = textbuf.tb_sel_a(t)
+    let sb: usize = textbuf.tb_sel_b(t)
+    var e: usize = sb
+    var s: usize = sa
+    if points {
+        var k: i64 = 0
+        while k < after && e < textbuf.tb_len(t) {
+            e = textbuf.tb_next(t, e)
+            k = k + 1
+        }
+        k = 0
+        while k < before && s > 0 {
+            s = textbuf.tb_prev(t, s)
+            k = k + 1
+        }
+    } else {
+        let sb16: usize = u16_of(t, sb)
+        let sa16: usize = u16_of(t, sa)
+        let total: usize = textbuf.tb_u16_len(t)
+        var e16: usize = sb16
+        if after > 0 {
+            e16 = sb16 + after as usize
+        }
+        if e16 > total {
+            e16 = total
+        }
+        var s16: usize = 0
+        if before > 0 && (before as usize) < sa16 {
+            s16 = sa16 - before as usize
+        }
+        if before <= 0 {
+            s16 = sa16
+        }
+        e = byte_of(t, e16)
+        s = byte_of(t, s16)
+    }
+    // the back first, so that the front offsets stay
+    if e > sb {
+        let ok: bool = textbuf.tb_replace(t, sb, e, 0, 0)
+    }
+    if s < sa {
+        let ok2: bool = textbuf.tb_replace(t, s, sa, 0, 0)
+    }
+    // the selection (now shifted left by what went before it)
+    let moved: usize = sa - s
+    textbuf.tb_set_range(t, sb - moved, sa - moved)
+}
+
+// A key event: Backspace, Delete, arrows, Home, End, Enter, a character.
+#[no_gc]
+fn key(t: *mut textbuf.TextBuf, code: i32, uni: i32, shift: bool,
+    flags: *mut u32) -> bool {
+    if code == ndk.KEYCODE_ENTER || code == ndk.KEYCODE_NUMPAD_ENTER {
+        *flags = *flags | IME_ENTER
+        return true
+    }
+    textbuf.tb_comp_end(t)
+    if code == ndk.KEYCODE_DEL {
+        let ok: bool = textbuf.tb_backspace(t)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if code == ndk.KEYCODE_FORWARD_DEL {
+        let ok: bool = textbuf.tb_delete_fwd(t)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if code == ndk.KEYCODE_DPAD_LEFT {
+        textbuf.tb_left(t, shift)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if code == ndk.KEYCODE_DPAD_RIGHT {
+        textbuf.tb_right(t, shift)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if code == ndk.KEYCODE_MOVE_HOME {
+        textbuf.tb_home(t, shift)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if code == ndk.KEYCODE_MOVE_END {
+        textbuf.tb_end(t, shift)
+        *flags = *flags | IME_CHANGED
+        return true
+    }
+    if uni > 0 {
+        let ok: bool = textbuf.tb_insert_cp(t, uni as u32)
+        *flags = *flags | IME_CHANGED
+        return ok
+    }
+    return true
+}

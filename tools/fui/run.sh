@@ -498,6 +498,14 @@ ln -s "$PWD/lib/window/win32.fi" "$W/wn/window/backend.fi"
     || { echo "  FAILED  win32.fi does not build"; exit 1; }
 
 echo
+echo "== 18o2c. THE ON-SCREEN KEYBOARD'S CLASSES (r114) =="
+# lib/android/inputmethod.fi makes an InputConnection out of two classes it
+# writes as dex at run time (lib/android/imedex.fi); the SDK's own dexdump
+# reads the bytes and the script looks at the result. (On an emulator:
+# tools/android/keyboard_check.sh types on the real keyboard,
+# tools/android/lifecycle_check.sh checks pause, rotation and screen off.)
+FIRNC="$FIRNC" W="$W" bash tools/android/ime_dex_check.sh
+echo
 echo "== 18o3. A TRANSITION SURVIVES A REBUILD (r110) =="
 # tools/fui/animkey_main.fi: the transition registry keyed by key path --
 # the button half way to its hover colour keeps its colour when the tree is

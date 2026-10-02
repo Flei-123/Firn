@@ -198,7 +198,7 @@ the compiler looks into a **platform directory** of the library first
 |---|---|---|
 | native Linux (default) | `lib/@linux/` | `lib/@linux/fui/apphost.fi` -- an X11 window through `lib/plat/fuiwin.fi` |
 | `--target=wasm32-browser` | `lib/@web/` | `lib/@web/fui/apphost.fi` -- a `<canvas>` through `lib/plat/web.fi` |
-| `--target=*-android` | `lib/@android/` | `lib/@android/fui/apphost.fi` -- the Linux host again, through `lib/window/android.fi` (build with `tools/android/build.sh`; soft keyboard and lifecycle polish still open) |
+| `--target=*-android` | `lib/@android/` | `lib/@android/fui/apphost.fi` -- the Linux host again, through `lib/window/android.fi` (build with `tools/android/build.sh`; the on-screen keyboard types into the focused text field, pause / resume / rotation / screen off are checked on an emulator: `tools/android/keyboard_check.sh`, `tools/android/lifecycle_check.sh`) |
 
 `lib/@linux/window/backend.fi` links `lib/window/x11.fi`, so any native
 program that imports `window.window` gets X11 without a symlink of its own.
@@ -211,7 +211,7 @@ A `window/backend.fi` next to the program still wins (search step 2).
   `window_step` / `window_wait_many`).
 * A click into a text field focuses it but does not move the caret to the
   click position.
-* No Windows host yet (fUi roadmap); the Android one runs but has no soft keyboard hook.
+* No Windows host yet (fUi roadmap). The Android one has been run on an emulator only, not on a real phone.
 * `firnc1` (the self-hosted compiler) knows the platform directory but
   cannot build fUi programs yet -- use `firnc`.
 

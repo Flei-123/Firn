@@ -22,6 +22,7 @@ import font.metrics
 import fui.theme
 import fui.painter
 import fui.editor
+import fui.textbuf
 import window.window
 import plat.fuiwirt
 import plat.fuiwin
@@ -29,7 +30,7 @@ import plat.sysfont
 import plat.envvar
 
 export {
-    Hooks, hooks_blank, hooks_new, hooks_set_audit, run, PLATFORM,
+    Hooks, hooks_blank, hooks_new, hooks_set_audit, hooks_set_buf, run, PLATFORM,
     PLATFORM_LINUX, PLATFORM_WEB,
 }
 
@@ -61,9 +62,17 @@ struct Hooks {
     // and returns that as the exit code. 0 = no hook.
     audit: fn(u64) -> i32,
     has_audit: bool,
+    // THE FOCUSED TEXT FIELD'S BUFFER (r114): a *mut textbuf.TextBuf as u64,
+    // 0 = no field has the focus. A phone's on-screen keyboard follows it and
+    // types into it (window.text_input / window.text_sync).
+    buf: fn(u64) -> u64,
 }
 
 fn audit_none(ud: u64) -> i32 {
+    return 0
+}
+
+fn buf_none(ud: u64) -> u64 {
     return 0
 }
 
@@ -95,7 +104,7 @@ fn hooks_blank() -> Hooks {
     return Hooks { ud: 0, m: 0, host: 0, attach: attach_none,
         paint: paint_none, key: key_none, text: key_none, press: press_none,
         act: act_none, done: done_none, field: field_none, title: "",
-        w: 0, h: 0, audit: audit_none, has_audit: false }
+        w: 0, h: 0, audit: audit_none, has_audit: false, buf: buf_none }
 }
 
 fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
@@ -107,12 +116,16 @@ fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
     return Hooks { ud: ud, m: m as u64, host: host as u64, attach: attach,
         paint: paint, key: key, text: text, press: press, act: act,
         done: done, field: field, title: title, w: w, h: h,
-        audit: audit_none, has_audit: false }
+        audit: audit_none, has_audit: false, buf: buf_none }
 }
 
 fn hooks_set_audit(h: *mut Hooks, f: fn(u64) -> i32) {
     (*h).audit = f
     (*h).has_audit = true
+}
+
+fn hooks_set_buf(h: *mut Hooks, f: fn(u64) -> u64) {
+    (*h).buf = f
 }
 
 // The keys of the window system -> the keys of a text field (editor.fi).
@@ -134,6 +147,11 @@ fn edit_key(k: u32) -> u32 {
 
 // fuiwin's input hook. The state bits of lib/window (X11 order: shift 1,
 // control 4, alt 8) are editor.fi's bits already.
+// A press happened since the loop last looked: a press into the focused text
+// field asks for the on-screen keyboard again (the user may have put it away
+// with Back while the field kept the focus).
+static mut G_PRESSED: bool = false
+
 fn on_input(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
     let h: *mut Hooks = ud as *mut Hooks
     let mods: u32 = st & (editor.MOD_SHIFT | editor.MOD_CTRL | editor.MOD_ALT)
@@ -152,6 +170,7 @@ fn on_input(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
     }
     if kind == window.EV_BUTTON && a == window.BTN_LEFT {
         (*h).press((*h).ud, x, y)
+        G_PRESSED = true
     }
     return false
 }
@@ -202,24 +221,40 @@ fn run(h: *mut Hooks) -> i32 {
         fuiwirt.host_touch(w)
     }
     var open: bool = true
-    // r114: the on-screen keyboard follows the focus (Android; a desktop
-    // back end answers false and nothing happens)
-    var kbd: bool = false
-    var kbox: [f64; 4] = [0.0; 4]
+    // r114: the on-screen keyboard follows the focused text field and types
+    // into its buffer (Android; a desktop back end answers false / 0 and
+    // nothing happens)
+    var kbuf: u64 = 0
     while open && !(*h).done((*h).ud) {
         let ms: i64 = fuiwirt.host_wait_ms(w)
         if ms != 0 {
             let e: bool = window.wait_event(f, ms)
         }
         open = fuiwin.window_step(&fx, w, m, on_paint, on_act, h as u64)
-        let want: bool = (*h).field((*h).ud, &kbox)
-        if want != kbd {
-            kbd = want
-            let shown: bool = window.soft_keyboard(f, want)
+        let tb: u64 = (*h).buf((*h).ud)
+        let pressed: bool = G_PRESSED
+        G_PRESSED = false
+        if tb != 0 as u64 {
+            if tb != kbuf || pressed {
+                kbuf = tb
+                let secret: bool = textbuf.tb_secret(tb as *mut textbuf.TextBuf)
+                let up: bool = window.text_input(f, true, secret, tb)
+            }
+            let got: u32 = window.text_sync(f, tb)
+            if (got & window.TI_CHANGED) != 0 as u32 {
+                fuiwirt.host_touch(w)
+            }
+            if (got & window.TI_ENTER) != 0 as u32 {
+                let used: bool = (*h).key((*h).ud, editor.KEY_ENTER, 0 as u32)
+                fuiwirt.host_touch(w)
+            }
+        } else if kbuf != 0 as u64 {
+            kbuf = 0
+            let down: bool = window.text_input(f, false, false, 0 as u64)
         }
     }
-    if kbd {
-        let hid: bool = window.soft_keyboard(f, false)
+    if kbuf != 0 as u64 {
+        let down2: bool = window.text_input(f, false, false, 0 as u64)
     }
     fuiwin.window_close(&fx)
     return 0
