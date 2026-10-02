@@ -6832,16 +6832,15 @@ fn emit_inst(
         // register — so the load can destroy neither an argument already set
         // nor the target itself.
         Op::CallIndirect { target, args } => {
-            // ROUND HOSTS2 (r113): the arguments are placed EXACTLY like in
-            // `Op::Call` above -- two register sequences (integers in
-            // rdi..r9, floating point in xmm0..xmm7), the rest on the stack.
-            // Before, this arm counted every argument as an integer and
-            // returned every result in `rax`: a `fn(f64, f64, f64, f64)`
-            // value called from allocated code got the bit patterns of its
-            // floats in rdi/rsi/rdx/rcx and whatever the xmm registers held
-            // by chance (the base path in codegen_x86.rs always did it right,
-            // which is why `dev` hid it). Found on Android: the clear colour
-            // of lib/plat/gles.fi arrived as (b, 0, 0, 0) at release-safe.
+            // ROUND CALLI-FLOAT: like `Op::Call` above in EVERY respect --
+            // floating point arguments in xmm0-xmm7 (counted on their own),
+            // the rest on the stack, and a floating point RESULT from xmm0.
+            // This arm used to count positions only and always took `rax`
+            // as the result: a call through a function value that returned
+            // `f64` (fui textbuf `meas`) came back as garbage in the
+            // optimised build, and its float arguments went to integer
+            // registers. The base path (codegen_x86.rs) was right all along;
+            // `--no-opt` hid the bug.
             let (spot, stack_args) = crate::codegen_x86::place_args(ra.f, args);
             let space = align_up(stack_args.len() as u64 * 8, 16);
             if space > 0 {
@@ -6894,6 +6893,8 @@ fn emit_inst(
             for (r, arg) in later {
                 ra.load_full(e, r, arg);
             }
+            // the target LAST, into `rax`: never the home of a value and no
+            // argument register
             ra.load_full(e, "rax", *target);
             e.line("call rax");
             if space > 0 {
