@@ -224,5 +224,6 @@ focus; nothing is built before.
   f64, f64)` value at `release-safe` on x86_64 put the floats in the wrong
   registers (the register allocated path of `Op::CallIndirect` counted every
   argument as an integer). The GL clear colour arrived as (b, 0, 0, 0) and the
-  Android window kept its old texture. Fixed in `compiler/src/regalloc.rs`,
-  checked by `tests/2002_fnval_float.fi`.
+  Android window kept its old texture. Fixed in `compiler/src/regalloc.rs` (the OrientOS worker found the same bug
+  at the same time through fUi's caret and fixed it identically on main; both
+  tests stay: `tests/2002_calli_float.fi`, `tests/2002_fnval_float.fi`).
