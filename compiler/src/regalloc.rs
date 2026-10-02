@@ -1492,7 +1492,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 fp_cells.insert(c);
             }
             if std::env::var_os("FIRN_FPCELL_DEBUG").is_some() {
-                eprintln!("FPCELL {} zelle={} typ={} tauglich={}", f.name, c, t.name(), gut);
+                eprintln!("FPCELL {} cell={} type={} suitable={}", f.name, c, t.name(), gut);
             }
         }
     }
@@ -1850,17 +1850,17 @@ pub fn allocate(f: &Func) -> Alloc {
                     }};
                 }
                 if t == p || t as usize >= nv || p as usize >= nv {
-                    reject!("selbst")
+                    reject!("itself")
                 }
                 // ROUND TEMPO 10: a cut must not grow shut again.
                 if f.no_coalesce.contains(&t) || f.no_coalesce.contains(&p) {
                     reject!("Schnitt")
                 }
                 if t < np || coalesced.contains_key(&t) || sources.contains_key(&t) {
-                    reject!("t schon vergeben")
+                    reject!("t already assigned")
                 }
                 if coalesced.contains_key(&p) {
-                    reject!("p ist selbst Quelle")
+                    reject!("p is itself a source")
                 }
                 // (1) One write site, and the value is needed here for the
                 // LAST time.
@@ -1875,11 +1875,11 @@ pub fn allocate(f: &Func) -> Alloc {
                 // rule is just as correct -- `interferes` checks EACH of them.
                 // Until now every phi variable of a loop was left out.
                 if defs[t as usize] != 1 && !coal_multi {
-                    reject!("mehrere Schreibstellen")
+                    reject!("several write sites")
                 }
                 if two_address {
                     if live_after(f, &live, t, bi, ii) {
-                        reject!("stirbt hier nicht")
+                        reject!("does not die here")
                     }
                 } else if read0.get(t as usize).copied() != Some(1)
                     && std::env::var_os("FIRN_COAL_ENG").is_some()
@@ -1909,10 +1909,10 @@ pub fn allocate(f: &Func) -> Alloc {
                 // reads an SSE register as an integer register. Exactly that was the
                 // bug from round TEMPO 1 (`tests/1452_f32_abi.fi`).
                 if sse_class(f.val_ty(t)) && !(fp_ok[t as usize] && fp_ok[p as usize]) {
-                    reject!("taugt nicht fuer xmm")
+                    reject!("not suitable for xmm")
                 }
                 if start[t as usize] == usize::MAX || start[p as usize] == usize::MAX {
-                    reject!("kein Intervall")
+                    reject!("no interval")
                 }
                 // (3) no interference -- neither with `p` nor with a source
                 // that `p` already has.
@@ -1921,11 +1921,11 @@ pub fn allocate(f: &Func) -> Alloc {
                 }
                 let taken = sources.entry(p).or_default();
                 if taken.iter().any(|&u| interferes(f, &live, &defsites, u, t, None)) {
-                    reject!("stoert eine schon verschmolzene Quelle")
+                    reject!("disturbs an already merged source")
                 }
                 if let Ok(n) = std::env::var("FIRN_COAL_N") {
                     if coalesced.len() >= n.parse::<usize>().unwrap_or(usize::MAX) {
-                        reject!("Grenze FIRN_COAL_N")
+                        reject!("limit FIRN_COAL_N")
                     }
                 }
                 if dbg {
@@ -3898,7 +3898,7 @@ fn emit_variant(f: &Func) -> Result<String, String> {
             let a2 = allocate(&g);
             let gewonnen = fresh.iter().filter(|v| matches!(a2.loc(**v), Loc::Reg(_))).count();
             if std::env::var_os("FIRN_SPLIT_DBG").is_some() {
-                eprintln!("SPLIT {} geschnitten={} mit Register={}", f.name, fresh.len(), gewonnen);
+                eprintln!("SPLIT {} cut={} with register={}", f.name, fresh.len(), gewonnen);
             }
             if gewonnen > 0 {
                 own = Some((g, a2));
@@ -4436,12 +4436,12 @@ fn unsupported_basic(f: &Func) -> Option<String> {
             match &i.op {
                 Op::Cast { from, .. } => {
                     if i.ty == FTy::Bool && from.is_float() {
-                        return Some("Umwandlung Gleitzahl -> bool".into());
+                        return Some("conversion float -> bool".into());
                     }
                 }
                 Op::CheckedCast { from, .. } => {
                     if from.is_float() || i.ty.is_float() {
-                        return Some("gepruefte Umwandlung mit Gleitzahl".into());
+                        return Some("checked conversion with float".into());
                     }
                 }
                 // ROUND XMM4: the sign reversal of a floating-point number can be done by
@@ -4451,22 +4451,22 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 Op::Un(op, x) => {
                     let fp = f.val_ty(*x).is_float() || i.ty.is_float();
                     if fp && !matches!(op, UnOp::Neg) {
-                        return Some("einstellige Rechnung mit Gleitzahl".into());
+                        return Some("unary operation with float".into());
                     }
                 }
                 Op::Select { a, b: bv, .. } => {
                     if f.val_ty(*a).is_float() || f.val_ty(*bv).is_float() {
-                        return Some("Select mit Gleitzahl".into());
+                        return Some("select with float".into());
                     }
                 }
                 Op::BinWrapSat { .. } => {
                     if i.ty.is_float() {
-                        return Some("umlaufende Rechnung mit Gleitzahl".into());
+                        return Some("wrapping operation with float".into());
                     }
                 }
                 Op::Syscall { args } => {
                     if args.iter().any(|a| f.val_ty(*a).is_float()) {
-                        return Some("Systemaufruf mit Gleitzahl".into());
+                        return Some("system call with float".into());
                     }
                 }
                 _ => {}
