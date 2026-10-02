@@ -461,6 +461,23 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// A temporary that owns a value with a `drop` is only ever handed over:
+    /// looking into it (`mk().f`, `mk().m()` with a borrowing receiver) would
+    /// leave nobody to destroy it.
+    fn temp_check(&mut self, e: &Expr) {
+        let temp = !matches!(
+            e.kind,
+            ExprKind::Ident(_) | ExprKind::Field(..) | ExprKind::Index(..)
+        ) && !matches!(e.kind, ExprKind::Unary(UnOp::Deref, _));
+        if temp && self.is_nt(e) {
+            self.err(
+                e.span,
+                "a temporary that owns a value with a 'drop' is looked into".to_string(),
+                "bind it with 'let' first (it is then dropped at the end of the block)",
+            );
+        }
+    }
+
     /// `e` is looked at, not handed over.
     fn read(&mut self, e: &Expr) {
         match &e.kind {
@@ -469,8 +486,12 @@ impl<'a> Walk<'a> {
                     self.use_var(i, e.span, n);
                 }
             }
-            ExprKind::Field(b, ..) => self.read(b),
+            ExprKind::Field(b, ..) => {
+                self.temp_check(b);
+                self.read(b);
+            }
             ExprKind::Index(b, i) => {
+                self.temp_check(b);
                 self.read(b);
                 self.read(i);
             }
@@ -515,6 +536,7 @@ impl<'a> Walk<'a> {
                 };
                 for (i, a) in args.iter().enumerate() {
                     if i == 0 && by_address_recv {
+                        self.temp_check(a);
                         self.read(a);
                     } else {
                         self.consume(a);

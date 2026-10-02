@@ -1525,6 +1525,8 @@ without a `drop` is not touched by any of this.
   moved away is tracked statically in source order.
 * The error path (`try`, `return E::Variant`) leaves through the same cleanup:
   the locals still owning a value are dropped there as well.
+* A temporary that owns a value (`mk().f`, `mk().m()` with a borrowing
+  receiver) is an error: bind it with `let` first, so that somebody drops it.
 * **Not yet:** `drop` for a `gc class` or `Rc[T]`, moves inside `defer`,
   partial moves, the self-hosted compiler (`firnc1` treats a file with a `drop` as an
   extension that is not ported).
