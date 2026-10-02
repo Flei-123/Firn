@@ -1721,16 +1721,8 @@ impl<'a> Lower<'a> {
                     let name = format!("{}__drop", prefix);
                     self.push_void(FTy::Void, Op::Call { name, args: vec![addr] });
                 }
-                let fields: Vec<(u64, Type)> = info.tcx.structs[*i]
-                    .fields
-                    .iter()
-                    .map(|f| (f.offset, f.ty.clone()))
-                    .collect();
-                for (off, ft) in fields {
-                    if self.needs_drop(&ft) {
-                        let a = self.ptradd_const(addr, off);
-                        self.emit_drop(a, &ft);
-                    }
+                for (a, ft) in self.drop_field_addrs(addr, *i) {
+                    self.emit_drop(a, &ft);
                 }
             }
             Type::Array(inner, n) => {
@@ -1743,7 +1735,7 @@ impl<'a> Lower<'a> {
                 }
                 let esz = self.info.tcx.size_of(inner);
                 for k in 0..*n {
-                    let a = self.ptradd_const(addr, k * esz);
+                    let a = self.elem_addr_const(addr, esz, k);
                     self.emit_drop(a, inner);
                 }
             }
@@ -2377,7 +2369,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
                 let ws: Vec<Val> = (0..n).map(|k| lo.f.param_val(next + k)).collect();
                 next += n;
                 for (k, w) in ws.iter().enumerate() {
-                    let a = lo.ptradd_const(slot, k as u64 * 8);
+                    let a = lo.ptradd_const(slot, k as u64 * 8); // ABI-Wortkopie
                     lo.store(FTy::I64, a, *w);
                 }
                 lo.declare_ty(&p.name, slot, ty.clone());

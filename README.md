@@ -73,7 +73,10 @@ $FIRNC --target=x86_64-windows --win-subsystem=windows -o window.exe examples/wi
 
 Structs, arrays, `enum` + `match` with exhaustiveness checking, generics,
 interfaces, closures and function values, error unions (`E!T`, `try`,
-`catch`), `defer`/`errdefer`, `comptime`, `f32`/`f64`, `str` with f-strings
+`catch`), `defer`/`errdefer`, reference parameters (`x: &T`, `x: inout T`, also
+`&self` / `inout self`), `for x in array` and `for i in a..=b`, destructors
+(`fn drop(inout self)`, run at the end of the block, with a move checker),
+`comptime`, `f32`/`f64`, `str` with f-strings
 (`f"x = {x}"`), checked integer arithmetic and bounds checks, `import a.b as c`,
 `__include_str("file")` to embed a file at build time, `extern fn` and
 `#[export_c]` for the C ABI, inline assembly, `profile kernel` for
@@ -177,6 +180,11 @@ files came from.
 ## Known limits
 
 * Pre-1.0: the language and the library interfaces may still change.
+* Ownership is checked conservatively, not by a full borrow checker: moves of
+  values with a `drop` and the "one `inout` per call" rule are enforced; a
+  reference can still be copied into a raw pointer, and `drop` does not apply
+  to `gc class` / `Rc[T]` yet. The self-hosted compiler `firnc1` does not know
+  `drop` and `for x in array` (it reports such files as not ported).
 * Windows: no threads and no child processes yet (they report `ENOSYS`); no
   debug information in `.exe` files. Creating symbolic links needs Windows
   developer mode or administrator rights.

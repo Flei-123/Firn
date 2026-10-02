@@ -66,6 +66,26 @@ impl Lower<'_> {
         self.ptradd_const(base, offset)
     }
 
+    /// **ROUND OWN-2** -- the address and the type of every field of structure
+    /// `sidx` (its value sits at `base`) that owns a value with a `drop`, in
+    /// order of declaration. For the destruction glue; the offsets are turned
+    /// into addresses here, like everywhere else.
+    pub(crate) fn drop_field_addrs(
+        &mut self,
+        base: Val,
+        sidx: usize,
+    ) -> Vec<(Val, crate::types::Type)> {
+        let info = self.info;
+        let mut out = Vec::new();
+        for f in &info.tcx.structs[sidx].fields {
+            if self.needs_drop(&f.ty) {
+                let a = self.field_addr_at(base, f.offset);
+                out.push((a, f.ty.clone()));
+            }
+        }
+        out
+    }
+
     /// Address of the element with the **constant** index `index` in a field
     /// of elements of size `elem_size` starting at `base`.
     ///

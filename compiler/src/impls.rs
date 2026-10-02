@@ -364,7 +364,7 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
         });
     }
     p.error_here(
-        "the first parameter of a method is the receiver: 'self', '*self', '*mut self', '&self' or 'inout self'",
+        "the first parameter of a method is the receiver: 'self', '*self' or '*mut self' (or '&self', 'inout self')",
     );
     None
 }
