@@ -527,7 +527,7 @@ impl<'a> Pass<'a> {
     fn value(&self, e: &Expr) -> Taint {
         match &e.kind {
             ExprKind::Ident(n) => self.taint_under(n),
-            ExprKind::Unary(UnOp::AddrOf, inner) => self.address_of(inner, e.span),
+            ExprKind::Unary(UnOp::AddrOf | UnOp::InoutOf, inner) => self.address_of(inner, e.span),
             // A LOAD out of memory yields data, not the address that led
             // there. Without this line the analysis would call every
             // `(*v).ptr` a pointer into the caller's frame and `vec_push`
@@ -895,7 +895,7 @@ impl<'a> Pass<'a> {
     /// is one indirection further out than in `store`.
     fn store_through(&mut self, dst: &Expr, t: Taint, sp: Span, callee: &str, argno: usize) {
         // `f(&out, &x)`: what lands in `out` stays in this frame.
-        if let ExprKind::Unary(UnOp::AddrOf, place) = &dst.kind {
+        if let ExprKind::Unary(UnOp::AddrOf | UnOp::InoutOf, place) = &dst.kind {
             if let Some(p) = self.path(place) {
                 let mut cur = self.taint_under(&p);
                 cur.unite(t);

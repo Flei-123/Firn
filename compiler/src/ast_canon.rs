@@ -224,6 +224,7 @@ fn ex_core(e: &Expr) -> String {
                 UnOp::Not => "!",
                 UnOp::BitNot => "~",
                 UnOp::AddrOf => "&",
+                UnOp::InoutOf => "inout ",
                 UnOp::Deref => "*",
             },
             ex(a)

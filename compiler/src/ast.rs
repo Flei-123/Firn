@@ -134,6 +134,8 @@ pub enum UnOp {
     BitNot,
     /// `&x` — address of
     AddrOf,
+    /// `inout x` (ROUND REF) — address of `x` that must be modifiable
+    InoutOf,
     /// `*p` — dereference
     Deref,
 }

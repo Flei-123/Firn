@@ -57,6 +57,10 @@ pub(crate) struct Parser<'a> {
     /// `let_stmt` switches it on around exactly that call; everywhere else a
     /// `_` is refused in the parser, so `ast::LEN_INFER` never leaves it.
     pub(crate) infer_len_ok: bool,
+    /// **ROUND REF** -- `fn_decl` allows the parameter spellings `&T` and
+    /// `inout T` while it parses its list (`refparam.rs`).
+    pub(crate) allow_ref_params: bool,
+    pub(crate) ref_params: Vec<crate::refparam::RefParam>,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -657,7 +661,26 @@ impl<'a> Parser<'a> {
         lhs
     }
 
+    /// **ROUND REF** -- does the token after the current one begin a type
+    /// (or an operand)? Used to tell the keyword-like `inout T` / `inout x`
+    /// from a variable that happens to be called `inout`.
+    fn next_starts_type(&self) -> bool {
+        matches!(
+            self.toks.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokKind::Ident(_)) | Some(TokKind::Star) | Some(TokKind::LBracket) | Some(TokKind::KwFn)
+        )
+    }
+
     pub(crate) fn unary(&mut self) -> Expr {
+        // ROUND REF: `inout x` as an argument is the address of `x`.
+        if matches!(self.kind(), TokKind::Ident(n) if n == "inout") && self.next_starts_type() {
+            let start = self.bump();
+            self.depth += 1;
+            let inner = self.unary();
+            self.depth -= 1;
+            let sp = Parser::join(start, inner.span);
+            return self.mk(sp, ExprKind::Unary(UnOp::InoutOf, Box::new(inner)));
+        }
         let op = match self.kind() {
             TokKind::Minus => Some(UnOp::Neg),
             TokKind::Not => Some(UnOp::Not),
@@ -1562,9 +1585,35 @@ compute it",
             if !self.expect(TokKind::Colon, "after the parameter name") {
                 break;
             }
+            // ROUND REF: `x: &T` / `x: inout T` (plain functions only).
+            let mut ref_kind: Option<bool> = None;
+            if self.allow_ref_params {
+                if self.at(&TokKind::Amp) {
+                    self.bump();
+                    ref_kind = Some(false);
+                } else if matches!(self.kind(), TokKind::Ident(n) if n == "inout")
+                    && self.next_starts_type()
+                {
+                    self.bump();
+                    ref_kind = Some(true);
+                }
+            }
             let ty = match self.parse_type() {
                 Some(t) => t,
                 None => break,
+            };
+            let ty = match ref_kind {
+                None => ty,
+                Some(inout) => {
+                    let array = matches!(ty, TypeExpr::Array { .. });
+                    self.ref_params.push(crate::refparam::RefParam {
+                        name: name.clone(),
+                        inout,
+                        array,
+                    });
+                    let span = ty.span();
+                    TypeExpr::Ptr { mutable: inout, inner: Box::new(ty), span }
+                }
             };
             out.push(Param { name, ty, span: sp });
             if !self.eat(&TokKind::Comma) {
@@ -1601,7 +1650,11 @@ compute it",
             self.sync_item();
             return;
         }
+        self.ref_params.clear();
+        self.allow_ref_params = true;
         let params = self.params();
+        self.allow_ref_params = false;
+        let ref_params = std::mem::take(&mut self.ref_params);
         self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {
@@ -1660,8 +1713,9 @@ compute it",
             self.sync_item();
             return;
         }
-        let body = self.block("at the start of the function body");
+        let mut body = self.block("at the start of the function body");
         self.recovering = false;
+        crate::refparam::desugar(&ref_params, &mut body, &mut self.next_id, self.dg);
         prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None });
     }
 
@@ -2303,6 +2357,8 @@ fn in_expr(
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 1,
+        allow_ref_params: false,
+        ref_params: Vec::new(),
         infer_len_ok: false,
     };
     let e = p.nested_expr();
@@ -2357,6 +2413,8 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 0,
+        allow_ref_params: false,
+        ref_params: Vec::new(),
         infer_len_ok: false,
     };
     let prog = p.program();
@@ -2426,6 +2484,7 @@ mod tests {
                     UnOp::Not => "!",
                     UnOp::BitNot => "~",
                     UnOp::AddrOf => "&",
+                    UnOp::InoutOf => "inout ",
                     UnOp::Deref => "*",
                 },
                 dump(a)

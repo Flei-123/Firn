@@ -917,7 +917,7 @@ impl<'a> Lower<'a> {
 
     fn lower_unary(&mut self, e: &Expr, op: ast::UnOp, inner: &Expr) -> Option<Val> {
         match op {
-            ast::UnOp::AddrOf => self.lower_addr(inner),
+            ast::UnOp::AddrOf | ast::UnOp::InoutOf => self.lower_addr(inner),
             ast::UnOp::Deref => {
                 let addr = self.lower_expr(inner)?;
                 let ft = self.fty_of(e)?;

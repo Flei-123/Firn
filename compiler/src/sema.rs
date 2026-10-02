@@ -2317,12 +2317,23 @@ constants declared before it, and '+ - * /'"
                 }
                 Type::Bool
             }
-            UnOp::AddrOf => {
-                let (t, _m) = match self.lvalue(inner) {
+            UnOp::AddrOf | UnOp::InoutOf => {
+                let (t, m) = match self.lvalue(inner) {
                     Some(x) => x,
                     None => return Type::Error,
                 };
                 if t.is_error() {
+                    return Type::Error;
+                }
+                // ROUND REF: `inout x` hands out write access, so `x` must
+                // be modifiable (`var`, a `mut` static, or reached through
+                // a pointer).
+                if let (UnOp::InoutOf, Mutability::Fixed(why)) = (op, &m) {
+                    self.dg.error_note(
+                        e.span,
+                        "'inout' needs a variable that can be modified",
+                        why.clone(),
+                    );
                     return Type::Error;
                 }
                 Type::ptr(t, true)
@@ -2876,7 +2887,7 @@ constants declared before it, and '+ - * /'"
                 UnOp::Neg => self.probe_d(inner, d + 1),
                 UnOp::BitNot => self.probe_d(inner, d + 1),
                 UnOp::Not => Some(Type::Bool),
-                UnOp::AddrOf => self.probe_d(inner, d + 1).map(|t| Type::ptr(t, true)),
+                UnOp::AddrOf | UnOp::InoutOf => self.probe_d(inner, d + 1).map(|t| Type::ptr(t, true)),
                 UnOp::Deref => match self.probe_d(inner, d + 1) {
                     Some(Type::Ptr { inner: i, .. }) => Some((*i).clone()),
                     _ => None,

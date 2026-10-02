@@ -1457,6 +1457,19 @@ the move checker in ROADMAP phase 2. This restriction is documented in the
 compiler and named explicitly here, so that `#[must_consume]` does not promise
 more than it delivers.
 
+**Round REF (reference parameters, `compiler/src/refparam.rs`).** `x: &T`
+(read-only) and `x: inout T` (modifiable) are accepted in the parameter list of
+plain functions (second class: parameters only). They lower to the pointer types
+`*T` / `*mut T`; inside the body `x.f` and, for an array target, `x[i]`
+dereference automatically, and `x` passed on (`g(x)`, `g(inout x)`, `g(&x)`)
+re-uses the reference. At the call, `&v` hands out a reference and `inout v` a
+modifiable one (`v` must be a `var`). Checked: no write through `&T`, no `&T`
+passed on as `inout`, no `inout` of a `let`, no re-declaration of the name.
+**Not yet checked** (borrow checker, ROADMAP r18): the *exactly one `inout`*
+rule, and a reference can still be copied into a raw pointer. Reference
+parameters are not available in generic functions, methods or closures yet.
+Proof: `tests/2000_ref_params.fi`, `tests/neg/ref_*.fi`.
+
 ### 14.1 Addendum: deliberate deviations of the stage 0 implementation (`firnc0`)
 
 Records where the implementation is narrower than the text above -- so that the

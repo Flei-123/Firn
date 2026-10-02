@@ -37,6 +37,7 @@ mod extfn;
 mod threading;
 mod fir;
 mod fnval;
+mod refparam;
 mod fpool;
 mod gc;
 mod ifexpr;
