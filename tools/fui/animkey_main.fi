@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/animkey_main.fi -- A TRANSITION SURVIVES A REBUILD (roadmap
+// r110, docs/APP-TREE.md T2).
+//
+// The registry of lib/fui/anim.fi keeps one transition per widget. It used
+// to find it by the widget's ADDRESS. A tree that is rebuilt puts a node
+// (and with it its widget) elsewhere as soon as something is inserted in
+// front or two siblings swap, so the button that was half way to its hover
+// colour jumped back and its neighbour started to glow. With a keyer
+// (anim.transreg_set_keyer + query.query_widget_key) the entry is found by
+// the KEY PATH and stays with the same control.
+//
+// Measured from the PAINTED PIXEL inside the button (left of its label), in a dark
+// scheme, 100 ms linear:
+//   * A rests; the pointer comes; at 100 ms (half way) A has a colour
+//     between rest and hover;
+//   * the tree is REBUILT (A and B swap, a banner is inserted in front,
+//     the panel is restored by key) and painted AGAIN AT THE SAME TIME:
+//     with the keyer A has the SAME colour as before the rebuild, B rests,
+//     and at 150 ms A has arrived;
+//   * THE COUNTER-CHECK: the same without a keyer (the address is the key)
+//     -- A is NOT the same colour (it started again), proving that the
+//     keyer is what makes the difference;
+//   * the keyed buttons make no second entry through the rebuild (only the
+//     unkeyed widget, which moved to another address, gets a new one);
+//   * an unkeyed widget is still found by its address;
+//   * the keyer answers 0 for a widget that is no node's carrier.
+import std.rt
+import font.metrics
+import paint.canvas
+import fui.theme
+import fui.widget
+import fui.painter
+import fui.render
+import fui.control
+import fui.scene
+import fui.query
+import fui.anim
+
+static mut G_ERRORS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_int(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn check(name: str, ok: bool, got: i64, want: i64) {
+    say("  ")
+    say(name)
+    var k: usize = name.n
+    while k < 66 {
+        say(" ")
+        k = k + 1
+    }
+    if ok {
+        say("OK    got ")
+    } else {
+        say("WRONG got ")
+        G_ERRORS = G_ERRORS + 1
+    }
+    say_int(got)
+    say(" want ")
+    say_int(want)
+    say("\n")
+}
+
+fn eq(name: str, got: i64, want: i64) {
+    check(name, got == want, got, want)
+}
+
+fn key(s: str) -> u32 {
+    return query.query_key(s.p as u64, s.n)
+}
+
+// app (#app) [banner] / row (#row): buttons #a and #b (swapped on `swap`) /
+// an UNKEYED button "u" / the text field #pw
+fn build(sc: *mut scene.Scene, swap: bool, lead: bool) {
+    scene.scene_reset(sc)
+    let root: usize = scene.scene_add(sc, scene.SCENE_NONE, scene.N_BOX)
+    scene.node_set_id(sc, root, key("app"))
+    if lead {
+        let b: usize = scene.scene_add(sc, root, scene.N_TEXT)
+        let t0: str = "A banner that moves every number"
+        scene.node_set_text(sc, b, t0.p as u64, t0.n)
+        scene.node_set_size(sc, b, 300.0, 30.0)
+    }
+    let row: usize = scene.scene_box(sc, root, 0 as u32, 0 as u32, 0 as u32, 0 as u32)
+    scene.node_set_id(sc, row, key("row"))
+    scene.node_set_size(sc, row, 480.0, 60.0)
+    let ta: str = "Alpha"
+    let tb: str = "Beta"
+    if swap {
+        let b1: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, tb.p as u64, tb.n)
+        scene.node_set_id(sc, b1, key("b"))
+        scene.node_set_size(sc, b1, 120.0, 50.0)
+        let a1: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, ta.p as u64, ta.n)
+        scene.node_set_id(sc, a1, key("a"))
+        scene.node_set_size(sc, a1, 120.0, 50.0)
+    } else {
+        let a2: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, ta.p as u64, ta.n)
+        scene.node_set_id(sc, a2, key("a"))
+        scene.node_set_size(sc, a2, 120.0, 50.0)
+        let b2: usize = scene.scene_widget(sc, row, widget.KIND_BUTTON, tb.p as u64, tb.n)
+        scene.node_set_id(sc, b2, key("b"))
+        scene.node_set_size(sc, b2, 120.0, 50.0)
+    }
+    let tu: str = "Unkeyed"
+    let u: usize = scene.scene_widget(sc, root, widget.KIND_BUTTON, tu.p as u64, tu.n)
+    scene.node_set_size(sc, u, 120.0, 40.0)
+}
+
+fn lay(sc: *mut scene.Scene, c: *mut render.Ctx) {
+    scene.scene_measure(sc, c)
+    scene.scene_layout(sc, c, 0.0, 0.0, 480.0, 800.0)
+}
+
+fn node(sc: *mut scene.Scene, path: str) -> usize {
+    return query.query_find_path(sc, path.p as u64, path.n)
+}
+
+fn cx(sc: *mut scene.Scene, i: usize) -> f64 {
+    return scene.node_x(sc, i) + scene.node_w(sc, i) / 2.0
+}
+
+fn cy(sc: *mut scene.Scene, i: usize) -> f64 {
+    return scene.node_y(sc, i) + scene.node_h(sc, i) / 2.0
+}
+
+// The colour inside node `i`, left of its text (the middle of a button is a
+// letter), 0xRRGGBB.
+fn at(cv: *mut canvas.Canvas, sc: *mut scene.Scene, i: usize) -> i64 {
+    let p: u32 = canvas.canvas_get(cv, (scene.node_x(sc, i) + 8.0) as usize,
+        cy(sc, i) as usize)
+    return ((canvas.color_r(p) << 16) | (canvas.color_g(p) << 8) |
+        canvas.color_b(p)) as i64
+}
+
+fn frame(cv: *mut canvas.Canvas, sc: *mut scene.Scene, c: *mut render.Ctx,
+    ms: i64) {
+    render.ctx_set_time(c, ms)
+    canvas.canvas_clear(cv, (255 as u32 << 24) | 16777215 as u32)
+    scene.scene_draw(sc, c)
+}
+
+static mut R_REST: i64 = 0
+static mut R_MID: i64 = 0
+static mut R_MID2: i64 = 0
+static mut R_END: i64 = 0
+static mut R_B2: i64 = 0
+static mut R_U_REST: i64 = 0
+static mut R_U_MID: i64 = 0
+static mut R_N1: i64 = 0
+static mut R_N2: i64 = 0
+
+// One run of the scenario, with or without the keyer. The registry is bound
+// to the context and unbound again before the function returns.
+#[allow_escape]
+fn scenario(sc: *mut scene.Scene, cv: *mut canvas.Canvas, c: *mut render.Ctx,
+    keyed: bool) {
+    var reg: anim.TransReg = anim.transreg_new()
+    anim.transreg_set_duration(&reg, 100)
+    anim.transreg_set_easing(&reg, anim.easing_linear())
+    if keyed {
+        anim.transreg_set_keyer(&reg, sc as u64, query.query_widget_key)
+    }
+    anim.transreg_bind(&reg, c)
+    var pn: control.Panel = control.panel_new()
+    build(sc, false, false)
+    lay(sc, c)
+    scene.scene_bind_panel(sc, &pn)
+    let a0: usize = node(sc, "app/row/a")
+    let u0: usize = scene.scene_count(sc) - 1
+    frame(cv, sc, c, 0)
+    R_REST = at(cv, sc, a0)
+    R_U_REST = at(cv, sc, u0)
+    R_N1 = anim.transreg_count(&reg) as i64
+    // the pointer arrives on A (and the unkeyed button is hovered too, to
+    // watch the address path)
+    let ch: u32 = control.mouse_move(&pn, cx(sc, a0), cy(sc, a0))
+    frame(cv, sc, c, 50)
+    frame(cv, sc, c, 100)
+    R_MID = at(cv, sc, a0)
+    // THE REBUILD: swap A and B, insert a banner in front, restore the panel
+    var kept: query.Kept = query.query_keep(sc, &pn)
+    build(sc, true, true)
+    lay(sc, c)
+    scene.scene_bind_panel(sc, &pn)
+    let found: usize = query.query_restore(sc, &pn, &kept)
+    let a1: usize = node(sc, "app/row/a")
+    let b1: usize = node(sc, "app/row/b")
+    frame(cv, sc, c, 100)
+    R_MID2 = at(cv, sc, a1)
+    R_B2 = at(cv, sc, b1)
+    frame(cv, sc, c, 150)
+    R_END = at(cv, sc, a1)
+    R_N2 = anim.transreg_count(&reg) as i64
+    anim.transreg_unbind(&reg, c)
+}
+
+fn main(start: u64) -> i32 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&f1[0]) as u64, &fbuf) {
+        say("animkey: no font\n")
+        return 9
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 480, 800) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 480, 800) {
+        return 5
+    }
+    painter.painter_set_font(&z, fsp as u64)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let sc: *mut scene.Scene = rt.heap_alloc(1048576) as *mut scene.Scene
+    *sc = scene.scene_new()
+
+    say("== 1. WITH the keyer (the key path is the key)\n")
+    scenario(sc, &cv, &c, true)
+    let rest: i64 = R_REST
+    let mid: i64 = R_MID
+    check("A rests, half way it is another colour", mid != rest, mid, rest)
+    check("half way is between rest and hover (R rises)",
+        ((mid >> 16) & 255) > ((rest >> 16) & 255), (mid >> 16) & 255, (rest >> 16) & 255)
+    eq("after the rebuild A has the SAME colour (no jump)", R_MID2, mid)
+    eq("B, which swapped into A's place, rests (it did not start to glow)",
+        R_B2, rest)
+    check("at 150 ms A has arrived (the hover colour)", R_END != mid && R_END != rest, R_END, mid)
+    // the keyed buttons were found again; only the UNKEYED one moved to a
+    // new address and made a new entry
+    eq("no second entry for the keyed buttons (3 -> 4: only the unkeyed one)", R_N2 - R_N1, 1)
+    check("the unkeyed button painted at rest too", R_U_REST != 0, R_U_REST, 1)
+    let kmid: i64 = mid
+    let kend: i64 = R_END
+
+    say("== 2. WITHOUT the keyer (the address is the key): the counter-check\n")
+    scenario(sc, &cv, &c, false)
+    eq("same rest colour", R_REST, rest)
+    eq("same colour half way before the rebuild", R_MID, kmid)
+    check("after the rebuild A is NOT the same colour: it jumped", R_MID2 != kmid, R_MID2, kmid)
+    eq("it fell back to the rest colour and starts again from there", R_MID2, rest)
+
+    say("== 3. the keyer\n")
+    build(sc, false, false)
+    lay(sc, &c)
+    let na: usize = node(sc, "app/row/a")
+    let wa: u64 = scene.node_widget(sc, na) as u64
+    let ka: u64 = query.query_widget_key(sc as u64, wa)
+    check("a keyed node has a key (top bit set)", ka >= 9223372036854775808 as u64, (ka >> 60) as i64, 8)
+    let kb: u64 = query.query_widget_key(sc as u64, scene.node_widget(sc, node(sc, "app/row/b")) as u64)
+    check("two nodes, two keys", ka != kb, 1, 1)
+    let nu: usize = scene.scene_count(sc) - 1
+    eq("an unkeyed node has none (0: the address is its key)",
+        query.query_widget_key(sc as u64, scene.node_widget(sc, nu) as u64) as i64, 0)
+    var lone: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    eq("a widget outside the scene has none",
+        query.query_widget_key(sc as u64, (&lone) as u64) as i64, 0)
+    // the same key path in another rebuild: same number
+    let wa_old: u64 = ka
+    build(sc, true, true)
+    lay(sc, &c)
+    let ka2: u64 = query.query_widget_key(sc as u64,
+        scene.node_widget(sc, node(sc, "app/row/a")) as u64)
+    check("the key survives the rebuild (same number, other address)", ka2 == wa_old, 1, 1)
+
+    if G_ERRORS == 0 {
+        say("ANIMKEY PASSED\n")
+        return 0
+    }
+    say("ANIMKEY FAILED: ")
+    say_int(G_ERRORS as i64)
+    say("\n")
+    return 1
+}

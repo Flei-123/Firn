@@ -471,6 +471,25 @@ build event
 "$W/event"
 
 echo
+echo "== 18o2. REAL POINTERS FROM THE WINDOW LAYER (r111) =="
+# tools/fui/pointers_main.fi: synthetic Android MotionEvent streams through
+# lib/window/pointers.fi -- one record per finger, ids that outlive the
+# index, primary per type, lost UPs cancelled, the ring. (The same stream in
+# a real browser: tools/wasm/touchcheck.py; on an emulator with real
+# fingers: tools/android/pointers_check.sh.)
+build pointers
+"$W/pointers"
+
+echo
+echo "== 18o3. A TRANSITION SURVIVES A REBUILD (r110) =="
+# tools/fui/animkey_main.fi: the transition registry keyed by key path --
+# the button half way to its hover colour keeps its colour when the tree is
+# rebuilt (A and B swap, a node is inserted in front); without the keyer the
+# same rebuild makes it jump (counter-check).
+build animkey
+"$W/animkey"
+
+echo
 echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
 # for BOTH platforms from one source -- `import fui.apphost` resolves to
