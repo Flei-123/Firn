@@ -41,6 +41,7 @@
 //    job.
 import std.rt
 import window.window
+import window.pointers
 // ROUND C-040 -- THE INPUT PRIORITY, SHARED INSTEAD OF TWICE.
 //
 // Until this round `G_EIN_VORRANG` occurred ONLY in lib/android/a_main.fi
@@ -71,7 +72,7 @@ export {
     // fUi tempo, stage 2b: THE GPU (only Android has it so far)
     r_gpu_open, r_gpu_swap, r_gpu_close, r_gpu_place, r_gpu_lost,
     Platte, surface_new, r_input_hook, r_full_input, r_pointers,
-    r_next_pointer,
+    r_next_pointer, r_pointer_mouse, r_soft_keyboard,
     r_open, r_make, r_show, r_title, r_close, r_is_open,
     r_width, r_height, r_dpi, r_maximise,
     r_image, r_fill, r_font, r_text, r_present, r_ppm,
@@ -238,6 +239,9 @@ static mut G_POSTM: u64 = 0 // PostMessageW
 static mut G_SENDM: u64 = 0 // SendMessageW
 static mut G_GSYSM: u64 = 0 // GetSystemMenu
 static mut G_TPM: u64 = 0 // TrackPopupMenu
+static mut G_GPT: u64 = 0 // GetPointerType (Windows 8)
+static mut G_S2C: u64 = 0 // ScreenToClient
+static mut G_GMT: u64 = 0 // GetMessageTime
 
 fn u32_once() {
     if G_U32_GESUCHT != 0 as u32 {
@@ -256,6 +260,12 @@ fn u32_once() {
     G_GSYSM = user32_get((&n5[0]) as u64)
     var n6: [u8; 15] = "TrackPopupMenu\0"
     G_TPM = user32_get((&n6[0]) as u64)
+    var n7: [u8; 15] = "GetPointerType\0"
+    G_GPT = user32_get((&n7[0]) as u64)
+    var n8: [u8; 15] = "ScreenToClient\0"
+    G_S2C = user32_get((&n8[0]) as u64)
+    var n9: [u8; 15] = "GetMessageTime\0"
+    G_GMT = user32_get((&n9[0]) as u64)
 }
 
 // The callers. The pattern (record -> value -> holder -> function value)
@@ -341,6 +351,24 @@ fn GetSystemMenu(h: i64, rev: i64) -> i64 {
     return ruf_i2(G_GSYSM, h, rev)
 }
 
+fn GetPointerType(id: i64, out: u64) -> i32 {
+    u32_once()
+    return ruf_i2u(G_GPT, id, out)
+}
+
+fn ScreenToClient(h: i64, pt: u64) -> i32 {
+    u32_once()
+    return ruf_i2u(G_S2C, h, pt)
+}
+
+// GetMessageTime takes nothing; the two zero arguments are harmless in the
+// Win64 calling convention. It returns a LONG: the upper half of rax is
+// not defined.
+fn GetMessageTime() -> i64 {
+    u32_once()
+    return ruf_i2(G_GMT, 0, 0) & 4294967295
+}
+
 fn TrackPopupMenu(m: i64, f: i64, x: i64, y: i64, res: i64, h: i64,
     r: u64) -> i32 {
     u32_once()
@@ -386,6 +414,11 @@ const WM_KEYDOWN: i64 = 256
 const WM_CHAR: i64 = 258
 const WM_SYSKEYDOWN: i64 = 260
 const WM_MOUSEMOVE: i64 = 512
+// WM_POINTER (Windows 8): touch and pen, one message per pointer
+const WM_POINTERUPDATE: i64 = 581
+const WM_POINTERDOWN: i64 = 582
+const WM_POINTERUP: i64 = 583
+const WM_POINTERCAPTURECHANGED: i64 = 588
 const WM_LBUTTONDOWN: i64 = 513
 const WM_RBUTTONDOWN: i64 = 516
 const WM_MBUTTONDOWN: i64 = 519
@@ -538,6 +571,8 @@ struct Platte {
     // The hook for the input message, see above.
     ein_hook: fn(u64),
     ein_ud: u64,
+    // REAL POINTERS (r112): touch and pen from WM_POINTER*
+    pq: pointers.Pointers,
 }
 
 // The holder with which a Firn function value becomes an address.
@@ -564,7 +599,7 @@ fn surface_new() -> Platte {
         dark: false, dark_known: false, gift: 0,
         bar_rgb: 0, bar_at: 0, frame: 0, header_h: 0,
         knopf_x0: 0, knopf_x1: 0, war_max: 0,
-        ein_hook: in_nothing, ein_ud: 0 }
+        ein_hook: in_nothing, ein_ud: 0, pq: pointers.pointers_new() }
 }
 
 fn in_nothing(ud: u64) {}
@@ -577,15 +612,70 @@ fn r_full_input(w: *mut Platte, an: bool) -> bool {
     return false
 }
 
-// REAL POINTERS (r111, window.real_pointers / window.next_pointer): this
-// back end has only the one pointer of EV_MOTION / EV_BUTTON. Honestly
-// `false`, so that the host knows it. (XInput2 touch / WM_POINTER later.)
+// REAL POINTERS (r112, window.real_pointers / window.next_pointer): TOUCH
+// and PEN through WM_POINTERDOWN / UPDATE / UP (Windows 8 and later), one
+// record per finger with the pointer id Windows gave it. The MOUSE keeps
+// the legacy messages (WM_MOUSEMOVE, WM_LBUTTONDOWN ...): a mouse pointer
+// message goes on to DefWindowProc, which makes them, and so does a pen
+// that hovers. A touch or pen that is IN CONTACT is taken here and NOT
+// passed on, so Windows does not make a mouse click of it as well.
+// `false` = no GetPointerType (older Windows): the one pointer stays.
+//
+// The messages themselves are not run here (no Windows machine, wine does
+// not inject touch); the decoding is pure (`pointer_decode`) and is
+// checked in tools/fui/pointers_main.fi section 9; the program builds for the
+// Windows target.
 fn r_pointers(w: *mut Platte, an: bool) -> bool {
+    u32_once()
+    if G_GPT == 0 as u64 || G_S2C == 0 as u64 {
+        return false
+    }
+    pointers.pointers_enable(&(*w).pq, an)
+    return true
+}
+
+fn r_pointer_mouse(w: *mut Platte) -> bool {
     return false
 }
 
 fn r_next_pointer(w: *mut Platte, out: u64) -> bool {
-    return false
+    return pointers.pointers_next(&(*w).pq, out as *mut pointers.Pointer)
+}
+
+// Hand one WM_POINTER* to the feed. true = taken (touch or pen), the
+// window procedure then returns 0; false = pass it to DefWindowProc.
+fn pointer_message(w: *mut Platte, m: i64, wp: i64, lp: i64) -> bool {
+    let id: i64 = wp & 65535
+    let flags: i64 = (wp >> 16) & 65535
+    var ty: [u32; 2] = [0 as u32; 2]
+    if GetPointerType(id, (&ty[0]) as u64) == 0 {
+        return false
+    }
+    // mouse (4), touch pad (5): the legacy messages
+    let ptype: u32 = pointers.winptr_type(ty[0])
+    if ptype == 0 as u32 {
+        return false
+    }
+    let kind: u32 = pointers.winptr_kind(m, flags)
+    if kind == 0 as u32 {
+        return false // a pen that hovers
+    }
+    var pt: [i32; 2] = [0; 2]
+    pt[0] = pointers.winptr_coord(lp, 0)
+    pt[1] = pointers.winptr_coord(lp, 1)
+    let ok: i32 = ScreenToClient((*w).hwnd, (&pt[0]) as u64)
+    var fx: f64 = pt[0] as f64
+    var fy: f64 = pt[1] as f64
+    if fx < 0.0 {
+        fx = 0.0
+    }
+    if fy < 0.0 {
+        fy = 0.0
+    }
+    // the mouse is pointer 1 for the router; ids of touch and pen never meet it
+    pointers.pointers_single(&(*w).pq, kind, (id + 1000) as u32, ptype,
+        fx, fy, GetMessageTime())
+    return true
 }
 
 fn r_input_hook(w: *mut Platte, h: fn(u64), ud: u64) {
@@ -969,6 +1059,18 @@ fn wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
         if m == WM_NCHITTEST {
             return nchit(w, lp)
         }
+    }
+    if m == WM_POINTERDOWN || m == WM_POINTERUPDATE || m == WM_POINTERUP
+    || m == WM_POINTERCAPTURECHANGED {
+        if pointers.pointers_enabled(&(*w).pq) {
+            if pointer_message(w, m, wp as i64, lp as i64) {
+                if m == WM_POINTERDOWN {
+                    (*w).ein_hook((*w).ein_ud)
+                }
+                return 0 as u64
+            }
+        }
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
     }
     if m == WM_ERASEBKGND {
         // Nothing is erased here: the blit covers every pixel, and
@@ -2089,6 +2191,11 @@ fn r_pick_take(x: *mut Platte, out: u64, cap: usize, n: *mut usize, w: *mut usiz
 
 fn r_image_decode(x: *mut Platte, p: u64, n: usize, w: usize, h: usize,
     out: u64) -> bool {
+    return false
+}
+
+// No on-screen keyboard: the keys come from the real keyboard.
+fn r_soft_keyboard(x: *mut Platte, show: bool) -> bool {
     return false
 }
 

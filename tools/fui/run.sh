@@ -481,6 +481,23 @@ build pointers
 "$W/pointers"
 
 echo
+echo "== 18o2b. TOUCH FROM X11 AND WIN32 (r112) =="
+# XInput2 touch (lib/window/x11.fi) and WM_POINTER (lib/window/win32.fi) feed
+# the same records as Android (lib/window/pointers.fi, `pointers_single`).
+# The byte layouts are checked by hand in x11_main (section 12) and
+# pointers_main (sections 8, 9); the handshake runs against a real Xvfb
+# (xinput_main: XInput 2.2 present, XIGetSelectedEvents shows the touch
+# selection). No finger is played in -- the build machine has no uinput.
+# win32.fi must build for the Windows target.
+FIRNC="$FIRNC" W="$W" bash tools/fui/xinput.sh
+rm -rf "$W/wn"; mkdir -p "$W/wn/window"
+cp demos/x11demo/main.fi demos/x11demo/gallery9_main.fi "$W/wn/"
+ln -s "$PWD/lib/window/win32.fi" "$W/wn/window/backend.fi"
+"$FIRNC" --target=x86_64-windows -o "$W/wn/w.exe" "$W/wn/main.fi" \
+    && echo "  OK      the window layer builds for Windows (win32.fi)" \
+    || { echo "  FAILED  win32.fi does not build"; exit 1; }
+
+echo
 echo "== 18o3. A TRANSITION SURVIVES A REBUILD (r110) =="
 # tools/fui/animkey_main.fi: the transition registry keyed by key path --
 # the button half way to its hover colour keeps its colour when the tree is
