@@ -63,6 +63,8 @@ mod vec2reg;
 mod ivsr;
 mod addrsink;
 mod escape;
+mod foreach;
+mod moves;
 mod nogc;
 mod opt;
 mod panic_rt;

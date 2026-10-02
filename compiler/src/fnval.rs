@@ -210,7 +210,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if !p.expect(TokKind::LParen, "after 'fn' in a closure") {
         return Some(p.broken_expr(start));
     }
-    let params: Vec<Param> = p.params();
+    let (params, ref_params) = p.params_ref();
     p.close(TokKind::RParen, "after the parameters of a closure");
     p.recovering = false;
     let ret = if p.eat(&TokKind::Arrow) {
@@ -229,8 +229,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // surrounding condition must not reach into it.
     let saved = p.no_struct_lit;
     p.no_struct_lit = false;
-    let body = p.block("of a closure");
+    let mut body = p.block("of a closure");
     p.no_struct_lit = saved;
+    p.finish_body(&ref_params, &mut body);
     let span = Parser::join(start, body.span);
     let d = LambdaDecl { id: next_id(), heap, params, ret, body, span };
     Some(p.mk(span, ExprKind::Lambda(Box::new(d))))

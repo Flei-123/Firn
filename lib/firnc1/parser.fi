@@ -179,6 +179,8 @@ const U_DEREF: u32 = 3
 // ROUND 68: `~x`, the bitwise complement. Deliberately NOT the same
 // operator as `!`: `!` negates a bool, `~` flips every bit.
 const U_BITNOT: u32 = 4
+// ROUND REF: `inout x` -- the address of `x`, which must be modifiable.
+const U_INOUT: u32 = 5
 
 struct Parser {
     lx: u64, // pointer to the lexer
@@ -199,6 +201,14 @@ struct Parser {
     no_slit: usize, // > 0: no struct literal at the top level
     err: usize,
     not_core: bool, // file uses an extension that is not ported
+    // ROUND REF: the reference parameters of the function being parsed
+    // (`x: &T` flag 0, `x: inout T` flag 1, +2 when the target is an array).
+    // Twin of `refparam.rs`: the rewrite (`p.f` -> `(*p).f`) happens while
+    // parsing instead of in a pass afterwards. Scoped like `local`: `loc_on`
+    // remembers the length (`rp_mark`), `loc_off` cuts back to it.
+    rp_name: Vec[u32],
+    rp_flag: Vec[u32],
+    rp_mark: Vec[u32],
     // GENERIC TEMPLATES. The store sits OUTSIDE the parser because it has to be
     // shared by all files of a translation: the root file may use `Vec[i32]`
     // while `Vec[T]` is declared in some module.
@@ -299,6 +309,7 @@ fn par_new(lx: u64) -> Parser {
         module: vec_new[u32](),
         scratch: rt.buf_new(),
         parens: 0, no_slit: 0, err: 0, not_core: false,
+        rp_name: vec_new[u32](), rp_flag: vec_new[u32](), rp_mark: vec_new[u32](),
         gen: 0, mu: 0, feh: 0, time: false, gcr: 0, ifr: 0, nogc_pending: 0, int_pending: 0, ph_pending: 0, mc_pending: 0,
         link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1,
         local: vec_new[u32](), llimit: vec_new[u32](),
@@ -403,6 +414,9 @@ fn par_free(p: *mut Parser) {
     vec_free[u32](&(*p).local)
     vec_free[u32](&(*p).llimit)
     vec_free[u32](&(*p).hoist)
+    vec_free[u32](&(*p).rp_name)
+    vec_free[u32](&(*p).rp_flag)
+    vec_free[u32](&(*p).rp_mark)
 }
 
 fn par_error(p: *mut Parser) -> usize { return (*p).err }
@@ -550,6 +564,16 @@ fn next(p: *mut Parser) -> bool {
     return continues_line(kind(p, 0))
 }
 
+// `..=`: is the current `=` glued to the `..` before it (same line, next column)?
+fn continues_dd(p: *mut Parser) -> bool {
+    if (*p).pos == 0 || (*p).pos >= (*p).n {
+        return false
+    }
+    let i: usize = (*p).pos
+    return lexer.lex_line(lx(p), i - 1) == lexer.lex_line(lx(p), i)
+        && lexer.lex_col(lx(p), i - 1) + 2 == lexer.lex_col(lx(p), i)
+}
+
 fn complain(p: *mut Parser) {
     (*p).err = (*p).err + 1
 }
@@ -601,6 +625,7 @@ fn is_own(p: *mut Parser, nr: u32) -> bool {
 // always does.
 fn loc_on(p: *mut Parser) {
     vec_push[u32](&(*p).llimit, vec_len[u32](&(*p).local) as u32)
+    vec_push[u32](&(*p).rp_mark, vec_len[u32](&(*p).rp_name) as u32)
 }
 
 fn loc_off(p: *mut Parser) {
@@ -610,6 +635,111 @@ fn loc_off(p: *mut Parser) {
     let g: u32 = vec_pop[u32](&(*p).llimit)
     while vec_len[u32](&(*p).local) > g as usize {
         vec_pop[u32](&(*p).local)
+    }
+    if vec_len[u32](&(*p).rp_mark) > 0 {
+        let rg: u32 = vec_pop[u32](&(*p).rp_mark)
+        while vec_len[u32](&(*p).rp_name) > rg as usize {
+            vec_pop[u32](&(*p).rp_name)
+            vec_pop[u32](&(*p).rp_flag)
+        }
+    }
+}
+
+// ---------------------------------------------------- reference parameters
+
+// Index of the reference parameter `nr`, or -1.
+fn rp_find(p: *mut Parser, nr: u32) -> i64 {
+    var i: usize = vec_len[u32](&(*p).rp_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*p).rp_name, i) == nr {
+            return i as i64
+        }
+    }
+    return -1
+}
+
+// Is the current token the word `inout`?
+fn at_inout(p: *mut Parser) -> bool {
+    if !actual(p, A_IDENT) {
+        return false
+    }
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let nr: u32 = tok_nr(p, 0)
+    if intern.intern_length(it, nr) != 5 {
+        return false
+    }
+    var w: [u8; 5] = "inout"
+    return same_bytes(intern.intern_ptr(it, nr), (&w[0]) as u64, 5)
+}
+
+// Does the token AFTER the current one begin a type (or an operand)? Tells
+// the keyword-like `inout T` / `inout x` from a variable named `inout`.
+fn next_starts_type(p: *mut Parser) -> bool {
+    let k: u32 = kind(p, 1)
+    return k == A_IDENT || k == A_STAR || k == A_LBRACKET || k == A_KWFN
+}
+
+// `p` as the base of `.f` (indexing = false) or `[i]` (true): a reference
+// parameter is dereferenced automatically.
+fn rp_base(p: *mut Parser, e: u32, indexing: bool) -> u32 {
+    if vec_len[u32](&(*p).rp_name) == 0 {
+        return e
+    }
+    let b: *mut ast.Tree = par_tree(p)
+    if ast.e_kind(b, e) != ast.E_ID {
+        return e
+    }
+    let i: i64 = rp_find(p, ast.e_a(b, e))
+    if i < 0 {
+        return e
+    }
+    let fl: u32 = vec_at[u32](&(*p).rp_flag, i as usize)
+    if indexing && (fl & 2) == 0 {
+        return e
+    }
+    let d: u32 = ast.expr_new(b, ast.E_UN, U_DEREF, e, 0, 0)
+    ast.expr_pos_set(b, d, ast.expr_pos(b, e))
+    return d
+}
+
+// The write-through-`&T` check: is this place rooted in a read-only
+// reference parameter? A bare name is the business of the ordinary check.
+fn rp_readonly_write(p: *mut Parser, target: u32) -> bool {
+    if vec_len[u32](&(*p).rp_name) == 0 {
+        return false
+    }
+    let b: *mut ast.Tree = par_tree(p)
+    if ast.e_kind(b, target) == ast.E_ID {
+        return false
+    }
+    var x: u32 = target
+    var guard: u32 = 0
+    while guard < 1000 {
+        guard = guard + 1
+        let k: u32 = ast.e_kind(b, x)
+        if k == ast.E_ID {
+            let i: i64 = rp_find(p, ast.e_a(b, x))
+            if i < 0 {
+                return false
+            }
+            return (vec_at[u32](&(*p).rp_flag, i as usize) & 1) == 0
+        }
+        if k == ast.E_FIELD || k == ast.E_IDX {
+            x = ast.e_a(b, x)
+        } else if k == ast.E_UN && ast.e_a(b, x) == U_DEREF {
+            x = ast.e_b(b, x)
+        } else {
+            return false
+        }
+    }
+    return false
+}
+
+// A name that would hide a reference parameter is refused.
+fn rp_shadow(p: *mut Parser, nr: u32) {
+    if rp_find(p, nr) >= 0 {
+        complain(p)
     }
 }
 
@@ -1277,6 +1407,23 @@ fn un_expr(p: *mut Parser) -> u32 {
 
 fn un_expr_inner(p: *mut Parser) -> u32 {
     let a: u32 = kind(p, 0)
+    // ROUND REF: `inout x` as an argument is the address of `x`.
+    if at_inout(p) && next_starts_type(p) {
+        next_bump(p)
+        let io: u32 = un_expr(p)
+        let ib: *mut ast.Tree = par_tree(p)
+        if ast.e_kind(ib, io) == ast.E_ID {
+            let ri: i64 = rp_find(p, ast.e_a(ib, io))
+            if ri >= 0 {
+                // A reborrow. A read-only `&T` cannot be handed on as `inout`.
+                if (vec_at[u32](&(*p).rp_flag, ri as usize) & 1) == 0 {
+                    complain(p)
+                }
+                return io
+            }
+        }
+        return ast.expr_new(ib, ast.E_UN, U_INOUT, io, 0, 0)
+    }
     var op: i32 = -1
     if a == A_MINUS { op = U_NEG as i32 }
     else if a == A_NOT { op = U_NOT as i32 }
@@ -1288,6 +1435,12 @@ fn un_expr_inner(p: *mut Parser) -> u32 {
     }
     next_bump(p)
     let inner: u32 = un_expr(p)
+    // ROUND REF: `&p` on a reference parameter passes the reference on.
+    if op == U_ADDR as i32 && ast.e_kind(par_tree(p), inner) == ast.E_ID {
+        if rp_find(p, ast.e_a(par_tree(p), inner)) >= 0 {
+            return inner
+        }
+    }
     return ast.expr_new(par_tree(p), ast.E_UN, op as u32, inner, 0, 0)
 }
 
@@ -1425,6 +1578,7 @@ fn after_expr(p: *mut Parser) -> u32 {
                 pos_default(p, e, base_pos)
                 continue
             }
+            e = rp_base(p, e, false)
             e = ast.expr_new(par_tree(p), ast.E_FIELD, e, nr, 0, 0)
             pos_default(p, e, base_pos)
         } else if a == A_LBRACKET {
@@ -1456,6 +1610,7 @@ fn after_expr(p: *mut Parser) -> u32 {
                 next_bump(p)
                 let idx: u32 = inner_expr(p)
                 expect(p, A_RBRACKET)
+                e = rp_base(p, e, true)
                 e = ast.expr_new(par_tree(p), ast.E_IDX, e, idx, 0, 0)
                 pos_default(p, e, base_pos)
             }
@@ -2709,6 +2864,7 @@ fn let_stmt(p: *mut Parser) -> u32 {
     }
     let name: u32 = tok_nr(p, 0)
     next_bump(p)
+    rp_shadow(p, name)
     var t: u32 = ast.NOTHING
     if eat(p, A_COLON) {
         // ROUND 79: `[T; _]` is allowed HERE and only here.
@@ -2836,20 +2992,29 @@ fn for_stmt(p: *mut Parser) -> u32 {
     if !expect(p, A_KWIN) {
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
     }
+    rp_shadow(p, name)
     let of: u32 = cond_expr(p)
+    // ROUND REF4: `for x in array { .. }` (no `..`) is not ported yet.
+    if actual(p, A_LBRACE) {
+        (*p).not_core = true
+    }
     if !expect(p, A_DOTDOT) {
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
     }
-    // ROUND REF2: `for i in a..=b` (inclusive range) is not ported yet.
-    if actual(p, A_ASSIGN) {
-        (*p).not_core = true
+    // ROUND REF2: `start..=end` -- the `=` must follow the `..` DIRECTLY.
+    var incl: u32 = 0
+    if actual(p, A_ASSIGN) && continues_dd(p) {
+        next_bump(p)
+        incl = 1
     }
     let to: u32 = cond_expr(p)
     loc_on(p)
     loc_add(p, name)
     let body: u32 = block(p)
     loc_off(p)
-    return ast.stmt_new(par_tree(p), ast.S_FOR, name, of, to, body)
+    let fs: u32 = ast.stmt_new(par_tree(p), ast.S_FOR, name, of, to, body)
+    ast.s_f_set(par_tree(p), fs, incl)
+    return fs
 }
 
 fn return_stmt(p: *mut Parser) -> u32 {
@@ -2939,6 +3104,7 @@ fn stmt_inner(p: *mut Parser) -> u32 {
         next_bump(p)
         let cv: u32 = expr(p)
         end_stmt(p)
+        if rp_readonly_write(p, e) { complain(p) }
         return ast.stmt_new(par_tree(p), ast.S_ZUWOP, e, cv, cop, 0)
     }
     if actual(p, A_PLUSPLUS) || actual(p, A_MINUSMINUS) {
@@ -2948,12 +3114,14 @@ fn stmt_inner(p: *mut Parser) -> u32 {
         }
         next_bump(p)
         end_stmt(p)
+        if rp_readonly_write(p, e) { complain(p) }
         return ast.stmt_new(par_tree(p), ast.S_STEP, e, up, 0, 0)
     }
     if actual(p, A_ASSIGN) {
         next_bump(p)
         let v: u32 = expr(p)
         end_stmt(p)
+        if rp_readonly_write(p, e) { complain(p) }
         return ast.stmt_new(par_tree(p), ast.S_ZUW, e, v, 0, 0)
     }
     end_stmt(p)
@@ -3056,13 +3224,33 @@ fn param_list(p: *mut Parser) -> u32 {
         if !expect(p, A_COLON) {
             break
         }
-        // ROUND REF: `x: &T` is a reference parameter -- not ported yet.
+        // ROUND REF: `x: &T` / `x: inout T` -- reference parameters. The type
+        // becomes `*T` / `*mut T`; the body is rewritten while it is parsed.
+        var rk: u32 = 0
         if actual(p, A_AMP) {
-            (*p).not_core = true
+            next_bump(p)
+            rk = 1
+        } else if at_inout(p) && next_starts_type(p) {
+            next_bump(p)
+            rk = 2
         }
-        let t: u32 = ty(p)
+        var t: u32 = ty(p)
         if t == ast.NOTHING {
             break
+        }
+        if rk != 0 {
+            var fl: u32 = 0
+            var pm: u64 = 0
+            if rk == 2 {
+                fl = 1
+                pm = 1
+            }
+            if ast.t_kind(par_tree(p), t) == ast.T_ARR {
+                fl = fl | 2
+            }
+            vec_push[u32](&(*p).rp_name, name)
+            vec_push[u32](&(*p).rp_flag, fl)
+            t = ast.ty_new(par_tree(p), ast.T_PTR, t, pm)
         }
         let pidx: u32 = ast.param_add(par_tree(p), name, t)
         ast.param_pos_set(par_tree(p), pidx, pat)
@@ -3860,14 +4048,6 @@ fn extensions_search(p: *mut Parser) {
     let ct1_nr: i64 = intern.intern_find(it, (&ct1[0]) as u64, 6)
     let ct2_nr: i64 = intern.intern_find(it, (&ct2[0]) as u64, 7)
     let ct3_nr: i64 = intern.intern_find(it, (&ct3[0]) as u64, 11)
-    // ROUND REF: `x: &T` / `x: inout T` (reference parameters) are not ported
-    // yet -- the identifier `inout` alone marks the file as an extension.
-    var io1: [u8; 5] = "inout"
-    let io1_nr: i64 = intern.intern_find(it, (&io1[0]) as u64, 5)
-    if io1_nr >= 0 {
-        (*p).not_core = true
-        return
-    }
 
     var i: usize = 0
     while i < (*p).n {
@@ -4336,6 +4516,30 @@ fn self_param(p: *mut Parser, tname0: u32) -> bool {
             return true
         }
     }
+    // ROUND REF3: `&self` (read-only) and `inout self` (modifiable).
+    var rk: u32 = 0
+    if actual(p, A_AMP) && kind(p, 1) == A_IDENT && tok_nr(p, 1) == snr {
+        rk = 1
+    } else if at_inout(p) && kind(p, 1) == A_IDENT && tok_nr(p, 1) == snr {
+        rk = 2
+    }
+    if rk != 0 {
+        next_bump(p)
+        next_bump(p)
+        var m2: u64 = 0
+        var fl: u32 = 0
+        if rk == 2 {
+            m2 = 1
+            fl = 1
+        }
+        let inner2: u32 = ast.ty_new(par_tree(p), ast.T_NAME, tname, 0)
+        let t2: u32 = ast.ty_new(par_tree(p), ast.T_PTR, inner2, m2)
+        ast.param_add(par_tree(p), snr, t2)
+        loc_add(p, snr)
+        vec_push[u32](&(*p).rp_name, snr)
+        vec_push[u32](&(*p).rp_flag, fl)
+        return true
+    }
     complain(p)
     return false
 }
@@ -4349,6 +4553,14 @@ fn methods_decl(p: *mut Parser, tname: u32) {
         return
     }
     let mnr: u32 = tok_nr(p, 0)
+    // ROUND OWN-2: a method called `drop` makes the type own something --
+    // the move checker and the calls of `drop` at the end of a block are not
+    // ported yet, so the file counts as an extension.
+    let mit: *mut intern.Interner = lexer.lex_names(lx(p))
+    var dw: [u8; 4] = "drop"
+    if intern.intern_length(mit, mnr) == 4 && same_bytes(intern.intern_ptr(mit, mnr), (&dw[0]) as u64, 4) {
+        (*p).not_core = true
+    }
     next_bump(p)
     if actual(p, A_LBRACKET) {
         complain(p)

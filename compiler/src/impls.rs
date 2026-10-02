@@ -244,8 +244,11 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
         }
     };
     let mut params = vec![slf];
+    let mut ref_params = std::mem::take(&mut p.ref_params);
     if p.eat(&TokKind::Comma) {
-        params.extend(p.params());
+        let (more, refs) = p.params_ref();
+        params.extend(more);
+        ref_params.extend(refs);
     }
     p.close(TokKind::RParen, "after the parameter list");
     p.recovering = false;
@@ -270,8 +273,9 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
         p.sync_item();
         return false;
     }
-    let body = p.block("at the start of the method body");
+    let mut body = p.block("at the start of the method body");
     p.recovering = false;
+    p.finish_body(&ref_params, &mut body);
     let attrs = std::mem::take(&mut p.pending_attrs);
     prog.funcs.push(FnDecl {
         name: fn_name(ty, &name),
@@ -333,8 +337,34 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
             });
         }
     }
+    // ROUND REF3: `&self` (read-only) and `inout self` (modifiable) -- the
+    // reference receivers. Like every reference parameter they lower to
+    // `*T` / `*mut T`, and `self.f` dereferences automatically.
+    let amp = p.at(&TokKind::Amp);
+    let io = matches!(p.kind(), TokKind::Ident(n) if n == "inout");
+    if (amp || io)
+        && matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::Ident(n)) if n == "self")
+    {
+        let start = p.span();
+        p.bump(); // '&' or 'inout'
+        let sp = p.bump(); // 'self'
+        p.ref_params.push(crate::refparam::RefParam {
+            name: "self".to_string(),
+            inout: io,
+            array: false,
+        });
+        return Some(Param {
+            name: "self".to_string(),
+            ty: TypeExpr::Ptr {
+                mutable: io,
+                inner: Box::new(TypeExpr::Named(tname, tsp)),
+                span: Parser::join(start, sp),
+            },
+            span: sp,
+        });
+    }
     p.error_here(
-        "the first parameter of a method is the receiver: 'self', '*self' or '*mut self'",
+        "the first parameter of a method is the receiver: 'self', '*self', '*mut self', '&self' or 'inout self'",
     );
     None
 }

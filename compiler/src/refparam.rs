@@ -222,3 +222,187 @@ fn expr(cx: &mut Ctx, e: &mut Expr) {
         | ExprKind::Ident(_) => {}
     }
 }
+
+// ---------------------------------------------------------------------------
+// "Exactly one `inout`" (SPEC 3.2): while a call holds modifiable access to a
+// place, no other argument of the SAME call may touch an overlapping place.
+// `f(inout a, a)`, `f(inout a, &a)`, `f(inout a, inout a)` and
+// `f(inout a.x, a.x)` are refused; `f(inout a.x, a.y)` is fine (different
+// fields). An index counts as the whole array. The check is purely syntactic
+// and runs on every body, because `inout v` can appear in any call.
+
+/// A place: root variable plus the path below it (`*` = dereference).
+type Path = (String, Vec<String>);
+
+/// The place an expression names, if it names one.
+fn place_path(e: &Expr) -> Option<Path> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some((n.clone(), Vec::new())),
+        ExprKind::Field(b, f, _) => {
+            let (r, mut p) = place_path(b)?;
+            p.push(f.clone());
+            Some((r, p))
+        }
+        ExprKind::Index(b, _) => place_path(b),
+        ExprKind::Unary(UnOp::Deref, b) => {
+            let (r, mut p) = place_path(b)?;
+            p.push("*".to_string());
+            Some((r, p))
+        }
+        _ => None,
+    }
+}
+
+fn overlap(a: &Path, b: &Path) -> bool {
+    if a.0 != b.0 {
+        return false;
+    }
+    let n = a.1.len().min(b.1.len());
+    a.1[..n] == b.1[..n]
+}
+
+/// Does `e` touch a place that overlaps `p`?
+fn touches(e: &Expr, p: &Path) -> bool {
+    if let Some(q) = place_path(e) {
+        if overlap(&q, p) {
+            return true;
+        }
+        // The index expressions inside the path still have to be looked at.
+        return index_touches(e, p);
+    }
+    let mut hit = false;
+    children(e, &mut |c| {
+        if !hit && touches(c, p) {
+            hit = true;
+        }
+    });
+    hit
+}
+
+fn index_touches(e: &Expr, p: &Path) -> bool {
+    match &e.kind {
+        ExprKind::Index(b, i) => touches(i, p) || index_touches(b, p),
+        ExprKind::Field(b, ..) | ExprKind::Unary(UnOp::Deref, b) => index_touches(b, p),
+        _ => false,
+    }
+}
+
+/// Calls `f` on every direct sub-expression.
+fn children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    match &e.kind {
+        ExprKind::Field(b, ..) => f(b),
+        ExprKind::Index(b, i) => {
+            f(b);
+            f(i);
+        }
+        ExprKind::IfElse(c, a, b) => {
+            f(c);
+            f(a);
+            f(b);
+        }
+        ExprKind::Text(_, inner) => f(inner),
+        ExprKind::Call(_, args, _) | ExprKind::Syscall(args) | ExprKind::ArrayLit(args) => {
+            for a in args {
+                f(a);
+            }
+        }
+        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => f(a),
+        ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) => {
+            f(a);
+            f(b);
+        }
+        ExprKind::StructLit(_, fields, _) => {
+            for (_, a, _) in fields {
+                f(a);
+            }
+        }
+        // A closure body is walked as statements by the caller.
+        ExprKind::Lambda(_)
+        | ExprKind::Float(..)
+        | ExprKind::FloatF32(_)
+        | ExprKind::Int(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_) => {}
+    }
+}
+
+/// Entry point: checks every call in `body`.
+pub fn check_exclusive(body: &Block, dg: &mut Diags) {
+    ex_block(body, dg);
+}
+
+fn ex_block(b: &Block, dg: &mut Diags) {
+    for s in &b.stmts {
+        ex_stmt(s, dg);
+    }
+}
+
+fn ex_stmt(s: &Stmt, dg: &mut Diags) {
+    match s {
+        Stmt::Let { init, .. } => ex_expr(init, dg),
+        Stmt::AssignOp { target, value, .. } | Stmt::Assign { target, value, .. } => {
+            ex_expr(target, dg);
+            ex_expr(value, dg);
+        }
+        Stmt::Step { target, .. } => ex_expr(target, dg),
+        Stmt::If { cond, then, els, .. } => {
+            ex_expr(cond, dg);
+            ex_block(then, dg);
+            if let Some(e) = els {
+                ex_stmt(e, dg);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            ex_expr(cond, dg);
+            ex_block(body, dg);
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(v) = value {
+                ex_expr(v, dg);
+            }
+        }
+        Stmt::For { start, end, body, .. } => {
+            ex_expr(start, dg);
+            ex_expr(end, dg);
+            ex_block(body, dg);
+        }
+        Stmt::Defer(inner, _, _) => ex_stmt(inner, dg),
+        Stmt::Expr(e) => ex_expr(e, dg),
+        Stmt::Block(b) => ex_block(b, dg),
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Error(_) => {}
+    }
+}
+
+fn ex_expr(e: &Expr, dg: &mut Diags) {
+    if let ExprKind::Call(_, args, _) = &e.kind {
+        for (i, a) in args.iter().enumerate() {
+            let inner = match &a.kind {
+                ExprKind::Unary(UnOp::InoutOf, inner) => inner,
+                _ => continue,
+            };
+            let path = match place_path(inner) {
+                Some(p) => p,
+                None => continue,
+            };
+            for (j, other) in args.iter().enumerate() {
+                if i != j && touches(other, &path) {
+                    dg.error_note(
+                        a.span,
+                        format!(
+                            "'{}' is passed as 'inout' and used again in the same call",
+                            path.0
+                        ),
+                        "'inout' is exclusive access: while it is modifiable, nothing else may \
+                         touch the same place -- use another variable or call twice",
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    if let ExprKind::Lambda(d) = &e.kind {
+        ex_block(&d.body, dg);
+        return;
+    }
+    children(e, &mut |c| ex_expr(c, dg));
+}

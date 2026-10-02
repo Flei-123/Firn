@@ -1459,23 +1459,77 @@ more than it delivers.
 
 **Round REF (reference parameters, `compiler/src/refparam.rs`).** `x: &T`
 (read-only) and `x: inout T` (modifiable) are accepted in the parameter list of
-plain functions (second class: parameters only). They lower to the pointer types
+plain functions, generic functions, methods and closures (second class:
+parameters only; round REF3). They lower to the pointer types
 `*T` / `*mut T`; inside the body `x.f` and, for an array target, `x[i]`
 dereference automatically, and `x` passed on (`g(x)`, `g(inout x)`, `g(&x)`)
 re-uses the reference. At the call, `&v` hands out a reference and `inout v` a
 modifiable one (`v` must be a `var`). Checked: no write through `&T`, no `&T`
 passed on as `inout`, no `inout` of a `let`, no re-declaration of the name.
-**Not yet checked** (borrow checker, ROADMAP r18): the *exactly one `inout`*
-rule, and a reference can still be copied into a raw pointer. Reference
-parameters are not available in generic functions, methods or closures yet.
-Proof: `tests/2000_ref_params.fi`, `tests/neg/ref_*.fi`.
+**Exactly one `inout` (round REF3):** inside ONE call an `inout` place may not
+be touched by another argument -- `f(inout a, a)`, `f(inout a, &a)`,
+`f(inout a, inout a)` and `f(inout a.x, a.x)` are errors, `f(inout a.x, a.y)` is
+fine (an index counts as the whole array). Purely syntactic, checked in every
+body (`refparam.rs::check_exclusive`). **Not yet checked** (borrow checker,
+ROADMAP r18): exclusivity across statements, and a reference can still be
+copied into a raw pointer. The self-hosted parser (`lib/firnc1/parser.fi`)
+reads reference parameters in all four places and rewrites the body while it
+parses; it does not check the "exactly one" rule or the read-only rule with
+messages (it only counts errors, as everywhere), the negative tests belong to
+`firnc0`.
+Proof: `tests/2000_ref_params.fi`, `tests/2002_ref_params_more.fi`,
+`tests/neg/ref_*.fi`, `tests/neg/inout_*_in_call.fi`.
 
 **Round REF2 (inclusive range).** `for i in a..=b` includes `b`. The `=` has to
 follow the `..` directly. The loop stops after the iteration with `i == b`
 *before* incrementing, so `250u8..=255u8` ends instead of wrapping around; with
 `a > b` the body does not run. Lowered in `lower_for`. Proof:
-`tests/2001_for_inclusive.fi`. `for x in array` (element iteration) does not
-exist yet.
+`tests/2001_for_inclusive.fi`. Compile-time (`comptime`) loops and the
+self-hosted compiler (`firnc1`) know `..=` too.
+
+**Round REF4 (element loop).** `for x in array { ... }` walks the elements of a
+fixed size array: `x` is an immutable copy of the element (so the element type
+must be trivial -- a value with a `drop` cannot be moved out of an array).
+The array can be a local, a field path, `*p`, an array behind `&` / `inout`;
+the parser turns it into `for __each#N in 0 as usize..__each_len(a) { let x =
+a[__each#N]; ... }` (`compiler/src/foreach.rs`), `__each_len` being a `usize`
+constant. Because the array expression is read twice it has to be a place
+without calls; otherwise "'for ... in' needs an array variable". `break` and
+`continue` work as in every `for`. `firnc1` treats the form as an extension
+that is not ported. Proof: `tests/2008_for_each.fi`,
+`tests/neg/for_each_*.fi`.
+
+**Round OWN (destructors and the move checker, `compiler/src/moves.rs`,
+`lower.rs`).** A struct with `fn drop(inout self)` in its `impl` owns something;
+so does every struct or array that contains one (*non-trivial* types, SPEC 3.3).
+`&self` and `inout self` are the reference receivers (round REF3). A program
+without a `drop` is not touched by any of this.
+
+* **Moves** (checked in `moves.rs`): `let y = x`, `y = x`, `return x`, a call
+  argument (also a method receiver that takes `self` by value) and a field in a
+  struct or array literal MOVE a non-trivial `x`. Afterwards `x` is dead: every
+  use ("use of moved value"), including `&x` / `inout x`, is an error until a
+  new value is assigned (`x = fresh()`).
+* **Conservative rules** (SPEC 3.3, no run-time flags): a value moved in only
+  one branch of an `if` (the other branch not leaving through
+  `return`/`break`/`continue`), a value moved inside a loop that was declared
+  outside it, a move out of a field / array element / `*p`, a move inside
+  `defer`, and a call result of a non-trivial type that is thrown away, are
+  errors. `drop` must be exactly `fn drop(inout self)`.
+* **Destruction** (`lower.rs`): at the end of the block, and at `return`,
+  `break` and `continue`, the locals that still own a value are dropped in
+  REVERSE order of declaration (their `drop`, then the fields in order of
+  declaration, an array element by element). A by-value parameter is dropped
+  when the function ends. Overwriting an owner (`x = fresh()`, `s.f = fresh()`)
+  drops the old value first -- unless it was moved away. Which values are
+  moved away is tracked statically in source order.
+* The error path (`try`, `return E::Variant`) leaves through the same cleanup:
+  the locals still owning a value are dropped there as well.
+* **Not yet:** `drop` for a `gc class` or `Rc[T]`, moves inside `defer`,
+  partial moves, the self-hosted compiler (`firnc1` treats a file with a `drop` as an
+  extension that is not ported).
+* Proof: `tests/2004_move_ok.fi`, `tests/2005_drop_order.fi`,
+  `tests/neg/move_*.fi`, `tests/neg/drop_wrong_shape.fi`.
 
 ### 14.1 Addendum: deliberate deviations of the stage 0 implementation (`firnc0`)
 

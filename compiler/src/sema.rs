@@ -61,9 +61,22 @@ pub struct TypeInfo {
     /// language, and it is lossless: every binary32 is a binary64
     /// (SPEC 8.6).
     pub widen_f32: HashSet<crate::ast::ExprId>,
+    /// **ROUND OWN-2** (`moves.rs`) -- the structs that have a `drop`.
+    pub drops: HashSet<usize>,
+    /// Identifier expressions that MOVE a variable of a non-trivial type
+    /// (the value is handed over; the name is dead afterwards).
+    pub moved: HashSet<crate::ast::ExprId>,
+    /// Per `if` statement, keyed by the id of its condition: does the
+    /// `then` / the `else` branch surely leave (return/break/continue)?
+    pub if_leaves: HashMap<crate::ast::ExprId, (bool, bool)>,
 }
 
 impl TypeInfo {
+    /// Does destroying a value of this type run code (`moves.rs`)?
+    pub fn needs_drop(&self, t: &Type) -> bool {
+        !self.drops.is_empty() && crate::moves::nontrivial_in(&self.tcx, &self.drops, t, 0)
+    }
+
     pub fn expr_ty(&self, id: crate::ast::ExprId) -> &Type {
         self.expr_types.get(id as usize).unwrap_or(&Type::Error)
     }
@@ -116,6 +129,10 @@ pub(crate) struct Checker<'a> {
     /// the values captured so far. A name found BELOW that depth is a
     /// capture.
     pub(crate) capture_frames: Vec<(usize, Vec<(String, Type)>)>,
+    /// ROUND OWN-2 (`moves.rs`): see `TypeInfo`.
+    pub(crate) drops: HashSet<usize>,
+    pub(crate) moved: HashSet<crate::ast::ExprId>,
+    pub(crate) if_leaves: HashMap<crate::ast::ExprId, (bool, bool)>,
 }
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
@@ -135,6 +152,9 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         depth: 0,
         must_consume_fns: HashSet::new(),
         capture_frames: Vec::new(),
+        drops: HashSet::new(),
+        moved: HashSet::new(),
+        if_leaves: HashMap::new(),
     };
     ck.run(prog);
     if ck.dg.has_errors() {
@@ -157,6 +177,9 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         statics: ck.statics,
         fns: ck.fns,
         widen_f32: ck.widen_f32,
+        drops: ck.drops,
+        moved: ck.moved,
+        if_leaves: ck.if_leaves,
     })
 }
 
@@ -189,6 +212,9 @@ impl<'a> Checker<'a> {
         // type check as well: it has to tell `a[i]` on an ARRAY from `p[i]`
         // on a pointer, and only the type table knows which is which.
         crate::escape::hook_check(self, prog);
+        // HOOK moves: the move checker for values with a `drop` (moves.rs,
+        // round OWN-1, SPEC 3.3). Silent unless the program declares a `drop`.
+        crate::moves::hook_check(self, prog);
         // HOOK kern: `#[interrupt]` — check the form and forbid calls
         // (core.rs, round 52).
         crate::core::check_interrupts(self, prog);
@@ -2640,6 +2666,11 @@ constants declared before it, and '+ - * /'"
         if let Some(t) = crate::fsqrt::hook_call(self, name, args, espan) {
             return t;
         }
+        // HOOK foreach: `__each_len(a)`, the length behind `for x in array`
+        // (foreach.rs, round REF4)
+        if let Some(t) = crate::foreach::hook_call(self, name, args, espan) {
+            return t;
+        }
         // HOOK simd: the vector and crypto instructions (simd.rs, round 82)
         if let Some(t) = crate::simd::hook_call(self, name, args, nspan, espan) {
             return t;
@@ -3682,6 +3713,9 @@ mod tests {
             depth: 0,
             must_consume_fns: HashSet::new(),
             capture_frames: Vec::new(),
+            drops: HashSet::new(),
+            moved: HashSet::new(),
+            if_leaves: HashMap::new(),
             prog: None,
         };
         ck.run(first);

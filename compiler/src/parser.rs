@@ -661,6 +661,27 @@ impl<'a> Parser<'a> {
         lhs
     }
 
+    /// **ROUND REF** -- a parameter list in which `x: &T` / `x: inout T` are
+    /// allowed: plain functions, generic templates, methods and closures.
+    pub(crate) fn params_ref(&mut self) -> (Vec<Param>, Vec<crate::refparam::RefParam>) {
+        self.ref_params.clear();
+        self.allow_ref_params = true;
+        let params = self.params();
+        self.allow_ref_params = false;
+        (params, std::mem::take(&mut self.ref_params))
+    }
+
+    /// **ROUND REF** -- after a body: rewrite the reference parameters and
+    /// check that no `inout` is shared inside one call (exactly one).
+    pub(crate) fn finish_body(
+        &mut self,
+        refs: &[crate::refparam::RefParam],
+        body: &mut Block,
+    ) {
+        crate::refparam::desugar(refs, body, &mut self.next_id, self.dg);
+        crate::refparam::check_exclusive(body, self.dg);
+    }
+
     /// **ROUND REF** -- does the token after the current one begin a type
     /// (or an operand)? Used to tell the keyword-like `inout T` / `inout x`
     /// from a variable that happens to be called `inout`.
@@ -1507,6 +1528,13 @@ compute it",
             return Stmt::Error(start);
         }
         let from = self.cond_expr();
+        // ROUND REF4: `for x in array { ... }` -- no `..`, the body follows.
+        if self.at(&TokKind::LBrace) {
+            self.loop_depth += 1;
+            let body = self.block("after 'for ... in array'");
+            self.loop_depth -= 1;
+            return crate::foreach::build(self, name, name_span, from, body, start);
+        }
         if !self.expect(TokKind::DotDot, "between start and end of the range") {
             self.recovering = false;
             self.sync_stmt();
@@ -1662,11 +1690,7 @@ compute it",
             self.sync_item();
             return;
         }
-        self.ref_params.clear();
-        self.allow_ref_params = true;
-        let params = self.params();
-        self.allow_ref_params = false;
-        let ref_params = std::mem::take(&mut self.ref_params);
+        let (params, ref_params) = self.params_ref();
         self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {
@@ -1727,7 +1751,7 @@ compute it",
         }
         let mut body = self.block("at the start of the function body");
         self.recovering = false;
-        crate::refparam::desugar(&ref_params, &mut body, &mut self.next_id, self.dg);
+        self.finish_body(&ref_params, &mut body);
         prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None });
     }
 
