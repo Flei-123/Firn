@@ -184,7 +184,7 @@ files came from.
   values with a `drop` and the "one `inout` per call" rule are enforced; a
   reference can still be copied into a raw pointer, and `drop` does not apply
   to `gc class` / `Rc[T]` yet. The self-hosted compiler `firnc1` does not know
-  `drop` and `for x in array` (it reports such files as not ported).
+  `drop` (it reports such files as not ported).
 * Windows: no threads and no child processes yet (they report `ENOSYS`); no
   debug information in `.exe` files. Creating symbolic links needs Windows
   developer mode or administrator rights.

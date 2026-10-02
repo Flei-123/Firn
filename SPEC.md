@@ -1495,8 +1495,9 @@ the parser turns it into `for __each#N in 0 as usize..__each_len(a) { let x =
 a[__each#N]; ... }` (`compiler/src/foreach.rs`), `__each_len` being a `usize`
 constant. Because the array expression is read twice it has to be a place
 without calls; otherwise "'for ... in' needs an array variable". `break` and
-`continue` work as in every `for`. `firnc1` treats the form as an extension
-that is not ported. Proof: `tests/2008_for_each.fi`,
+`continue` work as in every `for`. The self-hosted compiler (`firnc1`) does the
+same desugaring in its parser (`for_each`) and knows `__each_len` in the type
+checker and the lowering. Proof: `tests/2008_for_each.fi`,
 `tests/neg/for_each_*.fi`.
 
 **Round OWN (destructors and the move checker, `compiler/src/moves.rs`,
