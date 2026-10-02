@@ -44,6 +44,7 @@ $ADB root >/dev/null 2>&1; sleep 2; $ADB wait-for-device
 $ADB install -r "$APK" | tail -1
 $ADB shell settings put system accelerometer_rotation 0
 $ADB shell settings put system user_rotation 0
+$ADB shell wm user-rotation lock 0 >/dev/null 2>&1
 # the soft keyboard is shown although the emulator has a hardware keyboard
 $ADB shell settings put secure show_ime_with_hard_keyboard 1
 SIZE=$($ADB shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1)
@@ -59,26 +60,26 @@ wait_shown() { # 1 = shown, 0 = hidden; at most 30 s
     done
     return 1
 }
-# the pixels of a field: a hash of a crop (permille box), after the screen
-# stopped changing
+# the pixels of a field: the hashes of a crop (permille box) over some
+# seconds, as a sorted set. The caret blinks, so one picture shows it or not
+# by chance; the set of what the field looks like contains both states.
 crop() { # name x0 y0 x1 y1
-    local prev="" cur="" i=0
-    while [ $i -lt 20 ]; do
+    local i=0 all=""
+    while [ $i -lt 8 ]; do
         $ADB exec-out screencap -p > "$OUT/$1.png"
-        cur=$(python3 - "$OUT/$1.png" $2 $3 $4 $5 <<'PY'
+        all="$all $(python3 - "$OUT/$1.png" $2 $3 $4 $5 <<'PY'
 import sys, hashlib
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('RGB')
 w, h = im.size
 x0, y0, x1, y1 = [int(v) for v in sys.argv[2:6]]
 c = im.crop((x0 * w // 1000, y0 * h // 1000, x1 * w // 1000, y1 * h // 1000))
-print(hashlib.md5(c.tobytes()).hexdigest()[:8])
+print(hashlib.md5(c.tobytes()).hexdigest()[:6])
 PY
-)
-        [ "$cur" = "$prev" ] && { echo "$cur"; return; }
-        prev=$cur; sleep 1; i=$((i + 1))
+)"
+        sleep 0.35; i=$((i + 1))
     done
-    echo "$cur"
+    echo $all | tr ' ' '\n' | sort -u | tr '\n' ',' | sed 's/,$//'
 }
 # keyboard up: where the two fields are (permille), the keys of LatinIME
 F1="100 255 900 310"        # first field box, keyboard up

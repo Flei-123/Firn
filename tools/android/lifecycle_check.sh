@@ -70,6 +70,7 @@ tap_plus() { $ADB shell input tap $((XM * 58 / 100)) $((YM * 54 / 100)); sleep 1
 
 $ADB shell settings put system accelerometer_rotation 0
 $ADB shell settings put system user_rotation 0
+$ADB shell wm user-rotation lock 0 >/dev/null 2>&1
 $ADB shell am force-stop $PKG
 SIZE=$($ADB shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1)
 XM=${SIZE%x*}; YM=${SIZE#*x}
@@ -94,10 +95,10 @@ tap_plus; M3=$(settle s3); echo "   tap after resume: $M3"
 check "it still answers a tap" "[ '$(echo "$M2" | awk '{print $3}')' != '$(echo "$M3" | awk '{print $3}')' ]"
 
 echo "== 4. rotation: landscape and back =="
-$ADB shell settings put system user_rotation 1; sleep 3
+$ADB shell settings put system user_rotation 1; $ADB shell wm user-rotation lock 1 >/dev/null 2>&1; sleep 3
 ML=$(settle r1); echo "   landscape: $ML"
 check "landscape: the picture covers the window (${XM}x${YM} turned)" "[ '$(echo "$ML" | awk '{print $1}')' = '${YM}x${XM}' ] && [ $(echo "$ML" | awk '{print $2}') -ge 70 ]"
-$ADB shell settings put system user_rotation 0; sleep 3
+$ADB shell settings put system user_rotation 0; $ADB shell wm user-rotation lock 0 >/dev/null 2>&1; sleep 3
 MB=$(settle r2); echo "   portrait again: $MB"
 check "portrait again: the whole window is covered, to the bottom" "[ '$(echo "$MB" | awk '{print $1}')' = '${XM}x${YM}' ] && [ $(echo "$MB" | awk '{print $2}') -ge 70 ] && [ $(echo "$MB" | awk '{print $4}') -ge $((YM - 400)) ]"
 check "the state survived the rotation" "[ '$(echo "$M3" | awk '{print $3}')' = '$(echo "$MB" | awk '{print $3}')' ]"
