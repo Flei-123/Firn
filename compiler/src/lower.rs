@@ -1829,8 +1829,8 @@ impl<'a> Lower<'a> {
             }
             Stmt::If { cond, then, els, .. } => self.lower_if(cond, then, els.as_deref()),
             Stmt::While { cond, body, .. } => self.lower_while(cond, body),
-            Stmt::For { name, start, end, body, .. } => {
-                self.lower_for(name, start, end, body)
+            Stmt::For { name, start, end, body, inclusive, .. } => {
+                self.lower_for(name, start, end, body, *inclusive)
             }
             Stmt::Break(span) => {
                 let (target, depth) = match self.loops.last() {
@@ -1947,6 +1947,7 @@ impl<'a> Lower<'a> {
         start: &Expr,
         end: &Expr,
         body: &ast::Block,
+        inclusive: bool,
     ) -> Option<()> {
         let ty = self.ty_of(start);
         let ft = match scalar_fty(&ty) {
@@ -1971,7 +1972,9 @@ impl<'a> Lower<'a> {
         self.cur = head_bb;
         let iv = self.load(ft, islot);
         let lim = self.load(ft, eslot);
-        let c = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: ft, a: iv, b: lim });
+        // ROUND REF2: `..=` includes the end value (`<=`).
+        let cmp = if inclusive { CmpOp::Le } else { CmpOp::Lt };
+        let c = self.push(FTy::Bool, Op::Cmp { op: cmp, ty: ft, a: iv, b: lim });
         self.set_term(Term::BrCond { cond: c, then_bb: body_bb, else_bb: end_bb });
 
         self.cur = body_bb;
@@ -1991,8 +1994,18 @@ impl<'a> Lower<'a> {
 
         self.cur = step_bb;
         let iv2 = self.load(ft, islot);
+        if inclusive {
+            // After the last value (`i == end`) stop BEFORE incrementing:
+            // `0..=255u8` must not wrap around to 0 and loop forever.
+            let lim2 = self.load(ft, eslot);
+            let last = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: ft, a: iv2, b: lim2 });
+            let inc_bb = self.new_block();
+            self.set_term(Term::BrCond { cond: last, then_bb: end_bb, else_bb: inc_bb });
+            self.cur = inc_bb;
+        }
+        let iv3 = if inclusive { self.load(ft, islot) } else { iv2 };
         let one = self.constant(ft, 1);
-        let inc = self.push(ft, Op::Bin(FBin::Add, iv2, one));
+        let inc = self.push(ft, Op::Bin(FBin::Add, iv3, one));
         self.store(ft, islot, inc);
         self.set_term(Term::Br(head_bb));
 

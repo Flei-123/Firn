@@ -1470,6 +1470,13 @@ rule, and a reference can still be copied into a raw pointer. Reference
 parameters are not available in generic functions, methods or closures yet.
 Proof: `tests/2000_ref_params.fi`, `tests/neg/ref_*.fi`.
 
+**Round REF2 (inclusive range).** `for i in a..=b` includes `b`. The `=` has to
+follow the `..` directly. The loop stops after the iteration with `i == b`
+*before* incrementing, so `250u8..=255u8` ends instead of wrapping around; with
+`a > b` the body does not run. Lowered in `lower_for`. Proof:
+`tests/2001_for_inclusive.fi`. `for x in array` (element iteration) does not
+exist yet.
+
 ### 14.1 Addendum: deliberate deviations of the stage 0 implementation (`firnc0`)
 
 Records where the implementation is narrower than the text above -- so that the

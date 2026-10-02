@@ -1512,6 +1512,18 @@ compute it",
             self.sync_stmt();
             return Stmt::Error(start);
         }
+        // ROUND REF2: `start..=end` -- the `=` must follow the `..` directly.
+        let mut inclusive = false;
+        if self.at(&TokKind::Assign) {
+            let dd = self.toks.get(self.pos.wrapping_sub(1)).map(|t| t.span);
+            let eq = self.span();
+            if let Some(d) = dd {
+                if d.line == eq.line && d.col + 2 == eq.col {
+                    self.bump();
+                    inclusive = true;
+                }
+            }
+        }
         let to = self.cond_expr();
         if self.recovering {
             self.recovering = false;
@@ -1523,7 +1535,7 @@ compute it",
         self.loop_depth += 1;
         let body = self.block("after the range of 'for'");
         self.loop_depth -= 1;
-        Stmt::For { name, start: from, end: to, body, name_span, span: start }
+        Stmt::For { name, start: from, end: to, body, inclusive, name_span, span: start }
     }
 
     /// `break` / `continue`
