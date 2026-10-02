@@ -6832,36 +6832,80 @@ fn emit_inst(
         // register — so the load can destroy neither an argument already set
         // nor the target itself.
         Op::CallIndirect { target, args } => {
-            let stack = args.len().saturating_sub(ARG_REGS.len());
-            let space = align_up(stack as u64 * 8, 16);
+            // ROUND CALLI-FLOAT: like `Op::Call` above in EVERY respect --
+            // floating point arguments in xmm0-xmm7 (counted on their own),
+            // the rest on the stack, and a floating point RESULT from xmm0.
+            // This arm used to count positions only and always took `rax`
+            // as the result: a call through a function value that returned
+            // `f64` (fui textbuf `meas`) came back as garbage in the
+            // optimised build, and its float arguments went to integer
+            // registers. The base path (codegen_x86.rs) was right all along;
+            // `--no-opt` hid the bug.
+            let (spot, stack_args) = crate::codegen_x86::place_args(ra.f, args);
+            let space = align_up(stack_args.len() as u64 * 8, 16);
             if space > 0 {
                 e.line(&format!("sub rsp, {}", space));
-                for (k, arg) in args.iter().skip(ARG_REGS.len()).enumerate() {
-                    ra.load_full(e, "rax", *arg);
-                    e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
+                for (k, arg) in stack_args.iter().enumerate() {
+                    if ra.f.val_ty(*arg).is_float() {
+                        let single = ra.f.val_ty(*arg) == FTy::F32;
+                        ra.fp_into(e, "xmm0", *arg, single);
+                        e.line(&format!("movsd qword ptr [rsp+{}], xmm0", k * 8));
+                    } else {
+                        ra.load_full(e, "rax", *arg);
+                        e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
+                    }
                 }
             }
             let mut reg_moves: Vec<(String, String)> = Vec::new();
-            let mut later: Vec<(usize, Val)> = Vec::new();
-            for (k, arg) in args.iter().enumerate().take(ARG_REGS.len()) {
+            let mut later: Vec<(&'static str, Val)> = Vec::new();
+            let mut fp_moves: Vec<(String, String)> = Vec::new();
+            let mut fp_later: Vec<(&'static str, Val)> = Vec::new();
+            for (k, arg) in args.iter().enumerate() {
+                let r = match spot[k] {
+                    Some(r) => r,
+                    None => continue,
+                };
+                if is_xmm(r) {
+                    let single = ra.f.val_ty(*arg) == FTy::F32;
+                    let o = ra.fpo(*arg, single);
+                    if is_xmm(&o) {
+                        if o != r {
+                            fp_moves.push((r.to_string(), o));
+                        }
+                    } else {
+                        fp_later.push((r, *arg));
+                    }
+                    continue;
+                }
                 let o = ra.opnd(*arg);
                 if is_reg64(&o) {
-                    reg_moves.push((ARG_REGS[k].to_string(), o));
+                    reg_moves.push((r.to_string(), o));
                 } else {
-                    later.push((k, *arg));
+                    later.push((r, *arg));
                 }
             }
-            parallel_reg_moves(e, &reg_moves);
-            for (k, arg) in later {
-                ra.load_full(e, ARG_REGS[k], arg);
+            parallel_xmm_moves(e, &fp_moves);
+            for (r, arg) in fp_later {
+                let single = ra.f.val_ty(arg) == FTy::F32;
+                ra.fp_into(e, r, arg, single);
             }
+            parallel_reg_moves(e, &reg_moves);
+            for (r, arg) in later {
+                ra.load_full(e, r, arg);
+            }
+            // the target LAST, into `rax`: never the home of a value and no
+            // argument register
             ra.load_full(e, "rax", *target);
             e.line("call rax");
             if space > 0 {
                 e.line(&format!("add rsp, {}", space));
             }
             if let Some(d) = i.dst {
-                ra.store_dst(e, d, "rax");
+                if ty.is_float() {
+                    ra.fp_out(e, d, "xmm0", ty == FTy::F32);
+                } else {
+                    ra.store_dst(e, d, "rax");
+                }
             }
         }
         Op::VtabAddr { table } => {
