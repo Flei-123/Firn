@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/audit.fi -- THE ACCESSIBILITY AUDIT OF A TREE (roadmap r98,
+// docs/APP-TREE.md T2, T8, §6).
+//
+// ======================================================== WHY IT EXISTS
+//
+// The numbers that must be zero were checked by hand: tools/fui/gallery9
+// counted `a11y_unnamed` for ITS tree, dom_main counted key duplicates for
+// ITS form, and nothing looked at the tree of any other program. A button
+// no screen reader can name, two nodes with the same key path (the
+// automation id of a test or an agent would hit the wrong one), a password
+// that shows in a dump -- each is invisible in a picture. So the checks live
+// here, once, and every fUi program is run through them:
+//
+//     var a: audit.Audit = audit.audit_tree(sc)
+//     if !audit.audit_ok(&a) { ... }
+//
+// What is counted:
+//
+//   controls   the operable nodes (role_is_widget): the denominator -- "0
+//              unnamed" says little for a tree with a single control
+//   unnamed    operable nodes without any name (a11y_unnamed). MUST be 0.
+//   key_dups   keyed nodes whose key an earlier node under the same keyed
+//              ancestor already has (query_key_dups). MUST be 0.
+//   leaks      secret nodes (a11y_is_secret) whose text reaches the
+//              accessibility dump. The audit puts a CANARY into every secret
+//              node's text for the time of one dump, looks for it in the
+//              export, and puts the old text back. MUST be 0. (The canary
+//              is used because a password field that is EMPTY today leaks
+//              the day somebody types into it.)
+//   nodes      the tree is not empty (an empty tree passes every count)
+//
+// A tree without a control (a window of labels, or one that only hears
+// gestures) is fine; the count of controls is reported so that a program
+// whose controls are all drawn by hand shows up as "0 controls" in the log.
+//
+// `audit_ok` is true when unnamed, key_dups and leaks are 0 and the tree
+// has nodes. Nothing here allocates except one buffer for the dump,
+// freed again before the function returns.
+import std.rt
+import fui.scene
+import fui.widget
+import fui.a11y
+import fui.query
+
+export {
+    Audit, audit_tree, audit_tree_ax, audit_ok, audit_find, audit_line,
+    AUDIT_DUMP_CAP,
+}
+
+const AUDIT_DUMP_CAP: usize = 65536
+
+// The text put into secret nodes for the dump. Long enough and odd enough
+// not to occur by itself in a role name.
+static mut CANARY_TEXT: [u8; 22] = "FUI-AUDIT-CANARY-7-XYZ"
+const CANARY_N: usize = 22
+
+struct Audit {
+    nodes: usize,
+    controls: usize,
+    unnamed: usize,
+    key_dups: usize,
+    secrets: usize,
+    leaks: usize,
+    dump_n: usize, // the length of the dump (> AUDIT_DUMP_CAP: cut)
+    // the first operable node without a name, for the message (SCENE_NONE: none)
+    first_unnamed: usize,
+}
+
+fn audit_blank() -> Audit {
+    return Audit { nodes: 0, controls: 0, unnamed: 0, key_dups: 0,
+        secrets: 0, leaks: 0, dump_n: 0, first_unnamed: scene.SCENE_NONE }
+}
+
+// Where in `p`[0, n) the bytes `q`[0, m) occur first; n when they do not.
+fn audit_find(p: u64, n: usize, q: u64, m: usize) -> usize {
+    if m == 0 || n < m {
+        return n
+    }
+    var i: usize = 0
+    while i + m <= n {
+        var j: usize = 0
+        while j < m && rt.ld8(p, i + j) == rt.ld8(q, j) {
+            j = j + 1
+        }
+        if j == m {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// The audit with the statements the tree itself carries (`ax`: explicit
+// names and roles a program gave through a11y_set_*), or an empty set.
+fn audit_tree_ax(sc: *mut scene.Scene, ax: *mut a11y.A11y) -> Audit {
+    var r: Audit = audit_blank()
+    r.nodes = scene.scene_count(sc)
+    r.controls = a11y.a11y_widgets(sc, ax)
+    r.unnamed = a11y.a11y_unnamed(sc, ax)
+    r.key_dups = query.query_key_dups(sc)
+    var i: usize = 0
+    while i < r.nodes {
+        if r.first_unnamed == scene.SCENE_NONE
+        && a11y.role_is_widget(a11y.a11y_role(sc, ax, i))
+        && a11y.a11y_name_source(sc, ax, i) == a11y.NAME_NONE {
+            r.first_unnamed = i
+        }
+        if a11y.a11y_is_secret(sc, i) {
+            r.secrets = r.secrets + 1
+        }
+        i = i + 1
+    }
+    if r.secrets > 0 {
+        // the canary in every secret node, one dump, the old text back
+        let buf: u64 = rt.heap_alloc(AUDIT_DUMP_CAP)
+        if buf != 0 {
+            var keep_p: [u64; 128] = [0; 128]
+            var keep_n: [usize; 128] = [0; 128]
+            var k: usize = 0
+            while k < r.nodes && k < 128 {
+                if a11y.a11y_is_secret(sc, k) {
+                    let e: *mut widget.Widget = scene.node_widget(sc, k)
+                    keep_p[k] = widget.w_text(e)
+                    keep_n[k] = widget.w_text_len(e)
+                    widget.w_set_text(e, (&CANARY_TEXT[0]) as u64, CANARY_N)
+                }
+                k = k + 1
+            }
+            r.dump_n = a11y.a11y_dump(sc, ax, buf, AUDIT_DUMP_CAP)
+            var shown: usize = r.dump_n
+            if shown > AUDIT_DUMP_CAP {
+                shown = AUDIT_DUMP_CAP
+            }
+            // a piece of it is enough: the first eight bytes
+            if audit_find(buf, shown, (&CANARY_TEXT[0]) as u64, 8) < shown {
+                r.leaks = r.secrets
+            }
+            k = 0
+            while k < r.nodes && k < 128 {
+                if a11y.a11y_is_secret(sc, k) {
+                    widget.w_set_text(scene.node_widget(sc, k), keep_p[k], keep_n[k])
+                }
+                k = k + 1
+            }
+            rt.heap_free(buf, AUDIT_DUMP_CAP)
+        }
+    }
+    return r
+}
+
+// The audit of a tree that has no statements of its own (what fui.app
+// programs are: names come from the nodes' text).
+fn audit_tree(sc: *mut scene.Scene) -> Audit {
+    // how big an A11y is: measured, like app.fi measures an App
+    var probe: [a11y.A11y; 2] = [a11y.a11y_new(); 2]
+    let n: usize = ((&probe[1]) as u64 - (&probe[0]) as u64) as usize
+    let ax: *mut a11y.A11y = rt.heap_alloc(n) as *mut a11y.A11y
+    *ax = a11y.a11y_new()
+    let r: Audit = audit_tree_ax(sc, ax)
+    rt.heap_free(ax as u64, n)
+    return r
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+// One line for a log: counts, and which node is the first without a name.
+//   audit: 7 nodes, 2 controls, 0 unnamed, 0 duplicate keys, 0 secrets, 0 leaks -- OK
+fn audit_line(a: *mut Audit, b: *mut rt.Buf) {
+    put(b, "audit: ")
+    rt.buf_push_dec_i64(b, (*a).nodes as i64)
+    put(b, " nodes, ")
+    rt.buf_push_dec_i64(b, (*a).controls as i64)
+    put(b, " controls, ")
+    rt.buf_push_dec_i64(b, (*a).unnamed as i64)
+    put(b, " unnamed, ")
+    rt.buf_push_dec_i64(b, (*a).key_dups as i64)
+    put(b, " duplicate keys, ")
+    rt.buf_push_dec_i64(b, (*a).secrets as i64)
+    put(b, " secrets, ")
+    rt.buf_push_dec_i64(b, (*a).leaks as i64)
+    put(b, " leaks -- ")
+    if audit_ok(a) {
+        put(b, "OK\n")
+    } else {
+        put(b, "FAILED")
+        if (*a).unnamed > 0 && (*a).first_unnamed != scene.SCENE_NONE {
+            put(b, " (first unnamed: node ")
+            rt.buf_push_dec_i64(b, (*a).first_unnamed as i64)
+            put(b, ")")
+        }
+        if (*a).nodes == 0 {
+            put(b, " (the tree is empty)")
+        }
+        put(b, "\n")
+    }
+}
+
+fn audit_ok(a: *mut Audit) -> bool {
+    return (*a).unnamed == 0 && (*a).key_dups == 0 && (*a).leaks == 0
+        && (*a).nodes > 0
+}

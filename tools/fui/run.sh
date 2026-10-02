@@ -497,14 +497,27 @@ echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # and tools/fui/app_main.fi drives them without a window (layout, clicks,
 # keys, text fields, wrapping, scale 2). The browser half with Chromium:
 # bash tools/wasm/appdemo.sh.
-for ex in hello_window counter form; do
+for ex in hello_window counter form touchpad; do
     "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
     "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
         "examples/fui/$ex.fi"
 done
-echo "  examples/fui/{hello_window,counter,form}.fi build native + wasm32   OK"
+echo "  examples/fui/{hello_window,counter,form,touchpad}.fi build native + wasm32   OK"
 build app
 "$W/app"
+
+echo
+echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="
+# tools/fui/audit_main.fi shows that lib/fui/audit.fi has teeth (an unnamed
+# button, a duplicate key, a secret in the export are each found);
+# tools/fui/audit.sh then runs every program of examples/fui/*.fi through it
+# (FUI_AUDIT=1: no window, the tree it built, exit code = the result) and
+# requires that a program with a nameless text field FAILS. The programs with
+# a main of their own run the same audit in their own checks: gallery9_main
+# (section 10) and examples/codehub/main.fi (the "audit:" line).
+build audit
+"$W/audit"
+W="$W" sh tools/fui/audit.sh
 
 echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
