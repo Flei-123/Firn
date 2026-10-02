@@ -649,6 +649,58 @@ under load, so ±15 %):
     web host drops `pointerId`; `fuiwirt` has no router. Until then the
     gestures run in tests and in programs that feed `event.fi` themselves.
 
+### 4.7 Built (02.10.2026): real pointers from the hosts, transitions by key, the audit
+
+- **Real pointers (r111).** The hosts now deliver what `event.fi` was written
+  for. *Browser:* `firn.js` hands the DOM `pointerId`, `pointerType`, `isPrimary`
+  and `timeStamp` to `firn_web_pointer_ex` (the old `firn_web_pointer` stays for
+  old modules); `pointercancel` is its own event (`WE_CANCEL`, only for pages
+  that ask — others still get an up); a page that handles touch itself gets
+  `touch-action: none`. *Android:* `lib/window/pointers.fi` turns one
+  `AMotionEvent` — which batches all fingers into one MOVE and names the finger
+  of POINTER_DOWN/UP by *index* — into one record per finger with its stable
+  id, tool type, `primary` and time; `window.real_pointers` / `window.next_pointer`
+  hand them to the program, in addition to the old first-finger events.
+  `fuiwirt.host_pointer` feeds every pointer to the router and the primary one
+  also to the old way (hover, press, scroll bars, hook); the router runs in
+  *host mode* (it dispatches and cancels a press that lost the arena but does not
+  run the defaults twice; `H_PREVENT` is honoured). `app.on(a, node, kinds,
+  handler)` gives `fui.app` programs the events; `examples/fui/touchpad.fi` shows
+  them. Checked: `pointers_main` (synthetic Android streams, run.sh 18o2),
+  `tools/wasm/touchcheck.py` (real multi-touch in headless Chromium: tap, pan
+  120 px, pinch 100→160 %, rotation 90°, first finger lifting first, long press,
+  cancel, mouse), and `tools/android/pointers_check.sh` (raw multi-touch on an
+  emulator: ids 0/1, second finger not primary, pinch 100→170 %). With it
+  `fui.app` runs on Android (`lib/@android/fui/apphost.fi` is the Linux host;
+  soft keyboard and lifecycle polish are r87).
+- **Transitions by key path (r110).** The transition registry
+  (`anim.TransReg`) found its entry by the widget's address. After a rebuild
+  the address belongs to another node: the button half way to its hover colour
+  jumped back and its neighbour glowed. `anim.transreg_set_keyer` +
+  `query.query_widget_key` key the entry by the key path (an unkeyed widget
+  still by address). `tools/fui/animkey_main.fi` (18o3) measures the painted
+  pixel: with the keyer the colour after a swap-and-insert rebuild is the same
+  as before (0x4A4A56 at 50 %); without it the button falls back to rest.
+- **The accessibility audit (r98).** `lib/fui/audit.fi` counts operable nodes
+  without a name, duplicate keys under one parent and secrets that reach the
+  export (a canary is put into every secret node for one dump). Every
+  `fui.app` program is run through it with `FUI_AUDIT=1` (no window, exit code
+  = result): `tools/fui/audit.sh`, run.sh 18p2. It found two real gaps at once:
+  the text fields of `form.fi` had no name (now the hint is the name). The
+  programs with their own main call it from their checks (`gallery9_main`,
+  `examples/codehub/main.fi`). A program with a nameless field must fail
+  (`audit_bad.fi`).
+- **The fill rule (Justin, 02.10.2026).** A bordered widget must not have the
+  fill of the ground it sits on. The resting field, the focused field and the
+  button each differ from `base`, `surface` and `surface_raised` — and the resting
+  field from the focused one — by an OKLab distance of at least 0.012
+  (`themefile.check_fill_distinct`; theme files that break it are refused with
+  the pair named; `contrast_main` prints the table for the built-in schemes).
+  It caught the focused field of the dark scheme (it was the page colour), the
+  light one (the white of the raised card), Nord (field = surface, button = raised
+  card), Solarized (field = surface), High Contrast (field = page) and the CodeHub
+  theme; all were moved by one step.
+
 ## 5. The decision
 
 ### 5.1 Options
@@ -854,6 +906,10 @@ focus/hover/press/drag kept by key), r93, r94, r96, r97, r99, r100 (measure,
 style and layout memo: 0.9 ms tree work at 1009 nodes), r101. Partly done —
 r95 (pointer ids, capture, gestures and arena in `event.fi`; the hosts do not
 deliver pointer ids yet). Open — r98, r102, r103, r104.
+
+**Status 02.10.2026 (§4.7):** r111 (web `pointerId`, Android fingers), r110
+(transitions by key path) and r98 (audit of every fUi program) are done; r95 is
+complete with them.
 
 **Linked in the OrientOS roadmap:**
 

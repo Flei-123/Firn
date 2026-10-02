@@ -160,6 +160,34 @@ Keyboard, as in any desktop toolkit: Tab / Shift+Tab move the focus, Enter
 and the space bar press the focused button. Escape does **not** close the
 window.
 
+## Touch and gestures
+
+`app.on(a, node, kinds, handler)` lets a handler hear what happens on a
+node or below it. Every pointer has an id, a type (mouse, touch, pen) and
+`primary`; a browser's `pointerId` and every Android finger arrive as such.
+Taps, double taps, long presses, pans (with fling) and pinches (scale and
+turn) are told apart by an arena -- exactly one wins:
+
+```
+fn heard(ud: u64, e: *mut event.Ev) -> u32 {
+    if event.ev_kind(e) == event.EV_PINCH_MOVE {
+        ... event.ev_scale(e), event.ev_angle(e) ...
+    }
+    return event.H_GO
+}
+...
+app.on(a, app.root(a), event.EV_PINCH_ALL | event.ev_bit(event.EV_TAP), heard)
+```
+
+`examples/fui/touchpad.fi` is a complete one (`--log` prints every event).
+
+## The accessibility audit
+
+`FUI_AUDIT=1 ./program` opens no window; it runs `lib/fui/audit.fi` on the
+tree the program built and exits with 0 (every operable node named, no key
+twice under one parent, no secret in the export) or 1. A text field is named
+by its hint. `sh tools/fui/audit.sh` runs every program of `examples/fui/`.
+
 ## How the platform is chosen
 
 `lib/fui/app.fi` imports `fui.apphost`. There is no `lib/fui/apphost.fi`:
@@ -170,7 +198,7 @@ the compiler looks into a **platform directory** of the library first
 |---|---|---|
 | native Linux (default) | `lib/@linux/` | `lib/@linux/fui/apphost.fi` -- an X11 window through `lib/plat/fuiwin.fi` |
 | `--target=wasm32-browser` | `lib/@web/` | `lib/@web/fui/apphost.fi` -- a `<canvas>` through `lib/plat/web.fi` |
-| `--target=*-android` | `lib/@android/` | not written yet |
+| `--target=*-android` | `lib/@android/` | `lib/@android/fui/apphost.fi` -- the Linux host again, through `lib/window/android.fi` (build with `tools/android/build.sh`; soft keyboard and lifecycle polish still open) |
 
 `lib/@linux/window/backend.fi` links `lib/window/x11.fi`, so any native
 program that imports `window.window` gets X11 without a symlink of its own.
@@ -183,7 +211,7 @@ A `window/backend.fi` next to the program still wins (search step 2).
   `window_step` / `window_wait_many`).
 * A click into a text field focuses it but does not move the caret to the
   click position.
-* No Windows or Android host yet (fUi roadmap).
+* No Windows host yet (fUi roadmap); the Android one runs but has no soft keyboard hook.
 * `firnc1` (the self-hosted compiler) knows the platform directory but
   cannot build fUi programs yet -- use `firnc`.
 
@@ -192,6 +220,7 @@ A `window/backend.fi` next to the program still wins (search step 2).
 * `tools/fui/app_main.fi` (section 18l of `tools/fui/run.sh`): the
   examples driven without a window -- layout and centring, clicks, Tab,
   space, typing, Backspace, Send/Clear, wrapping, scale 2.
-* `bash tools/wasm/appdemo.sh`: the three modules in headless Chromium;
+* `bash tools/wasm/appdemo.sh`: the four modules in headless Chromium (the
+  touch pad with several real fingers: `tools/wasm/touchcheck.py`);
   the first picture of each is the native picture **pixel for pixel**, and
   the pages are operated with the browser's own mouse and key events.

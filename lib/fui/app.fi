@@ -74,12 +74,15 @@ import fui.widget
 import fui.editor
 import fui.textbuf
 import plat.fuiwirt
+import fui.event
+import fui.audit
+import fui.a11y
 import fui.apphost
 
 export {
     App, window, label, button, entry, row, column, end, spacer,
     set_text, append_text, set_number, text, number, quit, run,
-    set_data, data, set_dark, focus,
+    set_data, data, set_dark, focus, root, on, audit,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
@@ -124,6 +127,14 @@ struct App {
     ed_bufs: u64,
     quit: bool,
     user: u64,
+    // THE EVENT ROUTER (lib/fui/event.fi), attached to the host by the first
+    // `on`; next_key numbers the nodes that get a key for their handlers
+    rt: event.Router,
+    next_key: u32,
+    rt_on: bool,
+    // what the program says for accessibility: a text field is named by its
+    // hint (the grey text in the empty field)
+    ax: a11y.A11y,
 }
 
 fn cb_none(a: *mut App) {
@@ -149,7 +160,9 @@ fn app_blank() -> App {
         cb: [cb_none; 128], has_cb: [false; 128], texts: 0,
         tlen: [0; 128], wrapped: [false; 128],
         ed: [editor.editor_new(); 8], ed_node: [NONE; 8], hint: [""; 8],
-        n_ed: 0, ed_bufs: 0, quit: false, user: 0 }
+        n_ed: 0, ed_bufs: 0, quit: false, user: 0,
+        rt: event.router_new(), next_key: 60000 as u32, rt_on: false,
+        ax: a11y.a11y_new() }
 }
 
 // ============================================================ THE WINDOW
@@ -181,6 +194,7 @@ fn window(title: str, w: usize, h: usize) -> *mut App {
     (*a).hk = apphost.hooks_new(a as u64, &(*a).m, &(*a).w, app_attach,
         app_paint, app_key, app_char, app_press, app_act, app_done,
         app_entry_box, title, w, h)
+    apphost.hooks_set_audit(&(*a).hk, app_audit)
     return a
 }
 
@@ -193,6 +207,68 @@ fn run(a: *mut App) -> i32 {
     }
     fuiwirt.host_bind(&(*a).w)
     return apphost.run(&(*a).hk)
+}
+
+// The window's own column -- a node that every other node sits under, so a
+// handler on it hears what happens anywhere in the window.
+fn root(a: *mut App) -> usize {
+    return (*a).stack[0]
+}
+
+// POINTERS AND GESTURES. `on(a, node, kinds, handler)` lets `handler` hear the
+// events of lib/fui/event.fi that happen on `node` or below it (they bubble):
+//
+//     fn pinched(ud: u64, e: *mut event.Ev) -> u32 {
+//         let a: *mut app.App = ud as *mut app.App
+//         ... event.ev_scale(e), event.ev_angle(e) ...
+//         return event.H_GO
+//     }
+//     app.on(a, app.root(a), event.EV_PINCH_ALL | event.ev_bit(event.EV_TAP), pinched)
+//
+// `kinds` is a bit mask: event.ev_bit(event.EV_TAP), or the groups
+// event.EV_POINTER_ALL, EV_PAN_ALL, EV_PINCH_ALL. The handler's answer is
+// event.H_GO, H_STOP, H_STOP_NOW or H_PREVENT (|). `ud` is the App.
+// Every pointer carries its id (event.ev_pid), type (ev_ptype: mouse, touch,
+// pen) and ev_primary; a browser's pointerId and every Android finger arrive
+// as such (r111). False when the handler table is full or the node is bad.
+fn on(a: *mut App, node: usize, kinds: u32,
+    f: fn(u64, *mut event.Ev) -> u32) -> bool {
+    if a as u64 == 0 || node >= scene.scene_count(&(*a).sc) {
+        return false
+    }
+    if !(*a).rt_on {
+        fuiwirt.host_set_router(&(*a).w, &(*a).rt)
+        (*a).rt_on = true
+    }
+    var key: u32 = scene.node_id(&(*a).sc, node)
+    if key == 0 as u32 {
+        key = (*a).next_key
+        (*a).next_key = (*a).next_key + 1 as u32
+        scene.node_set_id(&(*a).sc, node, key)
+    }
+    return event.ev_on(&(*a).rt, key, kinds, false, f, a as u64)
+}
+
+// THE ACCESSIBILITY AUDIT (r98, lib/fui/audit.fi) of the tree built so far:
+// every operable node named, no duplicate key, no secret in the export.
+// Returns 0 when everything holds. `run` does this by itself, WITHOUT opening a
+// window, when the environment variable FUI_AUDIT is set (natively), prints
+// one line and returns the result as the exit code -- that is how
+// tools/fui/audit.sh checks every program of examples/fui/.
+fn audit(a: *mut App) -> i32 {
+    var ra: audit.Audit = audit.audit_tree_ax(&(*a).sc, &(*a).ax)
+    var b: rt.Buf = rt.buf_new()
+    audit.audit_line(&ra, &b)
+    rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    if audit.audit_ok(&ra) {
+        return 0
+    }
+    return 1
+}
+
+fn app_audit(ud: u64) -> i32 {
+    return audit(ud as *mut App)
 }
 
 // Close the window (from a callback). In the browser the page goes blank.
@@ -343,6 +419,9 @@ fn entry(a: *mut App, hint: str) -> usize {
     (*a).ed_node[k] = i
     (*a).hint[k] = hint
     (*a).n_ed = k + 1
+    // the hint is the field's accessible name (a screen reader says it, and
+    // the audit counts a field without a name as an error)
+    a11y.a11y_set_name(&(*a).ax, i, hint.p as u64, hint.n)
     // an empty field measures only its padding: it gets a width here
     node_rule(a, i, style.style_set_width(style.style_new(), ENTRY_W))
     scene.node_set_draw(&(*a).sc, i, a as u64, draw_entry)
@@ -503,6 +582,11 @@ fn app_paint(ud: u64, w: usize, h: usize) {
     let a: *mut App = ud as *mut App
     let f: *mut theme.Colors = theme.theme_colors(&(*a).m)
     painter.painter_clear(render.ctx_painter(&(*a).c), theme.opaque((*f).base))
+    // Also a full-window fill: on the GPU path (Android) the clear alone left
+    // the texture's old content showing (roadmap: gpu_clear), a filled
+    // rectangle is the same pixels everywhere and works there too.
+    painter.surface(render.ctx_painter(&(*a).c), 0.0, 0.0, w as f64, h as f64,
+        theme.opaque((*f).base))
     if (*a).quit {
         return
     }

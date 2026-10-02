@@ -449,17 +449,28 @@ const firnTag = document.currentScript;
     if (rm.matches) motion();
 
     // The events, as they come. Bit 8 of the buttons: a finger or a pen.
+    // A module that has firn_web_pointer_ex gets what a PointerEvent has --
+    // pointerId, type, isPrimary, timeStamp -- so a second finger is a second
+    // pointer and not a second mouse; an older module gets the one pointer.
     const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];
-    canvas.addEventListener('pointermove', (e) => ev(x.firn_web_pointer(0, ...at(e))));
+    const PTYPE = { mouse: 1, touch: 2, pen: 3 };
+    const ptr = (kind, e) => x.firn_web_pointer_ex
+        ? x.firn_web_pointer_ex(kind, ...at(e), e.pointerId, PTYPE[e.pointerType] || 1, e.isPrimary ? 1 : 0, e.timeStamp)
+        : x.firn_web_pointer(kind === 4 ? 2 : kind, ...at(e));
+    // A page that handles touch itself (the module says so) must not be
+    // panned or zoomed by the browser -- that would end every gesture with a
+    // pointercancel.
+    if (typeof x.firn_web_touch_own === 'function' && x.firn_web_touch_own()) canvas.style.touchAction = 'none';
+    canvas.addEventListener('pointermove', (e) => ev(ptr(0, e)));
     canvas.addEventListener('pointerdown', (e) => {
         if (!document.hasFocus || document.hasFocus()) said('focus', '1');
         canvas.setPointerCapture(e.pointerId);
         if (document.activeElement !== ta) canvas.focus({ preventScroll: true });
-        ev(x.firn_web_pointer(1, ...at(e)));
+        ev(ptr(1, e));
     });
-    canvas.addEventListener('pointerup', (e) => ev(x.firn_web_pointer(2, ...at(e))));
-    canvas.addEventListener('pointercancel', (e) => ev(x.firn_web_pointer(2, ...at(e))));
-    canvas.addEventListener('pointerleave', (e) => ev(x.firn_web_pointer(3, ...at(e))));
+    canvas.addEventListener('pointerup', (e) => ev(ptr(2, e)));
+    canvas.addEventListener('pointercancel', (e) => ev(ptr(4, e)));
+    canvas.addEventListener('pointerleave', (e) => ev(ptr(3, e)));
     canvas.addEventListener('wheel', (e) => { e.preventDefault(); ev(x.firn_web_wheel(e.deltaX, e.deltaY, e.deltaMode)); }, { passive: false });
     const mods = (e) => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
     const key = (down) => (e) => {

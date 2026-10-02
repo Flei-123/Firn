@@ -61,11 +61,15 @@ import fui.control
 import fui.viewport
 import fui.anim
 import fui.theme
+import fui.event
 
 export {
     Host, host_new, host_bind, host_set_animator,
     host_pointer_move, host_pointer_down, host_pointer_up,
     host_pointer_leave, host_key, host_char,
+    // r111: real pointers (id, type, primary, time) into the router
+    host_set_router, host_router, host_pointer, host_pointer_cancel,
+    PE_DOWN, PE_MOVE, PE_UP, PE_CANCEL, PE_LEAVE,
     host_resize, host_expose, host_set_scale, host_touch,
     host_tick, host_wait_ms, host_dirty, host_painted, host_frames,
     host_after_layout, host_take_activated, host_panel,
@@ -150,6 +154,8 @@ struct Host {
     hook: fn(u64, u32, f64, f64) -> bool,
     hook_ud: u64,
     has_hook: u32,
+    // the event router (lib/fui/event.fi) or 0; see host_set_router
+    rt: u64,
 }
 
 fn hook_none(ud: u64, kind: u32, x: f64, y: f64) -> bool {
@@ -181,7 +187,7 @@ fn host_new(sc: *mut scene.Scene, c: *mut render.Ctx) -> Host {
         px: 0.0, py: 0.0, inside: false,
         bar_node: scene.SCENE_NONE, kbd_node: scene.SCENE_NONE,
         act: scene.SCENE_NONE, chars: 0,
-        hook: hook_none, hook_ud: 0, has_hook: 0 as u32 }
+        hook: hook_none, hook_ud: 0, has_hook: 0 as u32, rt: 0 }
 }
 
 // Hang the panel on the tree. Call AFTER building the tree, and
@@ -345,6 +351,89 @@ fn host_pointer_leave(w: *mut Host) -> u32 {
     return ch | call_hook(w, HOOK_LEAVE, (*w).px, (*w).py)
 }
 
+// ------------------------------------------------ REAL POINTERS (r111)
+//
+// A host that knows more than "the mouse" -- a browser's pointerId, an
+// Android finger -- reports every pointer through `host_pointer` with its
+// id, type (event.PT_*), `primary` and time. Two things happen:
+//   * the ROUTER (lib/fui/event.fi), if one is attached, sees ALL pointers:
+//     handlers per key, capture, tap / double tap / long press / pan /
+//     pinch with its arena;
+//   * the PRIMARY pointer also takes the old way (host_pointer_move/down/up:
+//     hover, press, scroll bars, the application hook) -- unless a handler
+//     prevented the default. A second finger never presses a button.
+// The router is bound in HOST MODE: it does not run those defaults itself
+// (they would run twice) but still cancels a press that lost the arena.
+const PE_DOWN: u32 = 1
+const PE_MOVE: u32 = 2
+const PE_UP: u32 = 3
+const PE_CANCEL: u32 = 4
+// the pointer left the window (a mouse; a finger just ends)
+const PE_LEAVE: u32 = 5
+
+fn host_set_router(w: *mut Host, r: *mut event.Router) {
+    (*w).rt = r as u64
+    event.router_host_mode(r, &(*w).pn)
+}
+
+fn host_router(w: *mut Host) -> *mut event.Router {
+    return (*w).rt as *mut event.Router
+}
+
+// The primary pointer was taken away (pointercancel, ACTION_CANCEL): the
+// press ends WITHOUT a click, a dragged scroll bar is let go.
+fn host_pointer_cancel(w: *mut Host) -> u32 {
+    var ch: u32 = control.CH_NONE
+    if (*w).bar_node != scene.SCENE_NONE {
+        let v: *mut viewport.Viewport = scene.node_viewport(wsc(w),
+            (*w).bar_node)
+        viewport.viewport_bar_release(v)
+        (*w).bar_node = scene.SCENE_NONE
+        ch = ch | control.CH_REPAINT
+    }
+    ch = ch | control.mouse_cancel(&(*w).pn)
+    return schmutzig(w, ch)
+}
+
+fn host_pointer(w: *mut Host, kind: u32, pid: u32, ptype: u32,
+    primary: bool, x: f64, y: f64, t: i64) -> u32 {
+    var ch: u32 = control.CH_NONE
+    var prevented: bool = false
+    let r: *mut event.Router = host_router(w)
+    if r as u64 != 0 as u64 {
+        let sc: *mut scene.Scene = wsc(w)
+        if kind == PE_DOWN {
+            let ok: bool = event.ev_pointer_down(r, sc, pid, ptype, x, y, t)
+            prevented = event.router_default_prevented(r)
+        } else if kind == PE_MOVE {
+            let ok: bool = event.ev_pointer_move(r, sc, pid, x, y, t)
+            prevented = event.router_default_prevented(r)
+        } else if kind == PE_UP {
+            let ok: bool = event.ev_pointer_up(r, sc, pid, x, y, t)
+            prevented = event.router_default_prevented(r)
+        } else if kind == PE_CANCEL {
+            let ok: bool = event.ev_pointer_cancel(r, sc, pid, t)
+        }
+        ch = ch | schmutzig(w, event.router_changes(r))
+    }
+    if !primary {
+        return ch
+    }
+    if kind == PE_DOWN && !prevented {
+        ch = ch | host_pointer_move(w, x, y)
+        ch = ch | host_pointer_down(w, x, y, BTN_LEFT)
+    } else if kind == PE_MOVE && !prevented {
+        ch = ch | host_pointer_move(w, x, y)
+    } else if kind == PE_UP && !prevented {
+        ch = ch | host_pointer_up(w, x, y, BTN_LEFT)
+    } else if kind == PE_CANCEL {
+        ch = ch | host_pointer_cancel(w)
+    } else if kind == PE_LEAVE {
+        ch = ch | host_pointer_leave(w)
+    }
+    return ch
+}
+
 // AFTER A NEW ARRANGING. Whoever has scrolled has a different node under the
 // standing pointer; the hover must be caught up with,
 // otherwise the row that has scrolled away lights up. The caller calls it
@@ -487,6 +576,9 @@ fn host_set_scale(w: *mut Host, m: *mut theme.Theme, promille: usize) {
 // Set the animations and the run-out of the pane boxes to `ms`.
 // It becomes dirty only if the tick REALLY moved something.
 fn host_tick(w: *mut Host, ms: i64) {
+    if (*w).rt != 0 {
+        event.ev_tick(host_router(w), wsc(w), ms)
+    }
     if (*w).g != 0 {
         let g: *mut anim.Animator = (*w).g as *mut anim.Animator
         let b: bool = anim.anim_tick(g, ms)
@@ -510,6 +602,10 @@ fn host_tick(w: *mut Host, ms: i64) {
 }
 
 fn runs_something(w: *mut Host) -> bool {
+    // a finger is down: the long-press deadline needs ticks
+    if (*w).rt != 0 && event.ev_arena_open(host_router(w)) {
+        return true
+    }
     if (*w).g != 0 {
         let g: *mut anim.Animator = (*w).g as *mut anim.Animator
         var i: usize = 0

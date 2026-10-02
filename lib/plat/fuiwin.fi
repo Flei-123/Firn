@@ -36,7 +36,9 @@ import fui.painter
 import fui.theme
 import fui.gpu
 import window.window
+import window.pointers
 import plat.fuiwirt
+import fui.event
 
 export {
     Window, window_new, window_open, window_run, window_close,
@@ -52,6 +54,8 @@ export {
     // fUi app layer (lib/fui/app.fi): keys and characters for a text field
     // first, and Escape that does not close the window
     window_set_input_hook, window_set_escape_closes,
+    // r111: real pointers (every finger with its id) into the event router
+    window_use_pointers,
 }
 
 struct Window {
@@ -81,6 +85,10 @@ struct Window {
     hook_on: bool,
     hook_ud: u64,
     hook: fn(u64, u32, u32, u32, f64, f64) -> bool,
+    // REAL POINTERS (window_use_pointers): the back end delivers every
+    // finger as a record; `pdown` counts the ones that are down
+    real: bool,
+    pdown: usize,
 }
 
 fn hook_none(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
@@ -101,6 +109,36 @@ fn window_set_input_hook(fx: *mut Window, ud: u64,
     (*fx).hook = f
 }
 
+// REAL POINTERS (roadmap r111). Call after `window_open`, when the program
+// has an event router on the host (fuiwirt.host_set_router -- fui.app does
+// it with its first `app.on`). A back end that has them (Android: every
+// finger with its id, window.real_pointers) then feeds the host through
+// fuiwirt.host_pointer with id, type, primary and time; the old events for
+// the first finger (EV_BUTTON / EV_RELEASE / EV_LEAVE, and EV_MOTION while a
+// pointer is down) are left out, or the finger would act twice. A back end
+// without them (X11, Win32) keeps the one pointer: the mouse, which the
+// router now sees as pointer 1 of type mouse. False = the one pointer.
+fn window_use_pointers(fx: *mut Window, w: *mut fuiwirt.Host) -> bool {
+    (*fx).real = false
+    if fuiwirt.host_router(w) as u64 != 0 as u64 {
+        (*fx).real = window.real_pointers(&(*fx).f, true)
+    }
+    return (*fx).real
+}
+
+// One pointer record of the window layer -> the host.
+fn pointer_record(fx: *mut Window, w: *mut fuiwirt.Host, p: *mut pointers.Pointer) {
+    if (*p).kind == pointers.PK_DOWN {
+        (*fx).pdown = (*fx).pdown + 1
+    } else if ((*p).kind == pointers.PK_UP || (*p).kind == pointers.PK_CANCEL)
+    && (*fx).pdown > 0 {
+        (*fx).pdown = (*fx).pdown - 1
+    }
+    // pointers.PK_* and fuiwirt.PE_* are the same numbers
+    let c: u32 = fuiwirt.host_pointer(w, (*p).kind, (*p).id, (*p).ptype,
+        (*p).primary != 0 as u32, (*p).x, (*p).y, (*p).t)
+}
+
 // Escape closes the window by default (the demos want that); an
 // application with its own Close button does not.
 fn window_set_escape_closes(fx: *mut Window, on: bool) {
@@ -112,7 +150,7 @@ fn window_new() -> Window {
         z: painter.painter_new(), fm: 0, bgrx: 0, cap: 0, w: 0, h: 0,
         full: false, log: false, images: 0, open: false, esc_zu: true,
         gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new(),
-        hook_on: false, hook_ud: 0, hook: hook_none }
+        hook_on: false, hook_ud: 0, hook: hook_none, real: false, pdown: 0 }
 }
 
 // ============================================================ ON THE GPU
@@ -403,6 +441,7 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     let x: f64 = window.ev_x(f) as f64
     let y: f64 = window.ev_y(f) as f64
     let s: u32 = window.ev_state(f)
+    let routed: bool = fuiwirt.host_router(w) as u64 != 0 as u64
     var nm: [u8; 8] = "ereignis"
     line(fx, (&nm[0]) as u64, 8, k as i64, a as i64, x as i64, y as i64)
     if k == window.EV_CLOSED {
@@ -429,18 +468,53 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
         fuiwirt.host_set_scale(w, m, window.uiscale(f))
         fuiwirt.host_resize(w)
     } else if k == window.EV_MOTION || k == window.EV_ENTER {
-        let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+        if (*fx).real {
+            // the fingers come as records; a hovering mouse still moves
+            if (*fx).pdown == 0 {
+                let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+            }
+        } else if routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_MOVE, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+        } else {
+            let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+        }
     } else if k == window.EV_LEAVE {
-        let c: u32 = fuiwirt.host_pointer_leave(w)
+        if (*fx).real {
+            // a finger that lifts is an UP record, not a leave
+        } else if routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_LEAVE, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+        } else {
+            let c: u32 = fuiwirt.host_pointer_leave(w)
+        }
     } else if k == window.EV_BUTTON {
-        let c: u32 = fuiwirt.host_pointer_down(w, x, y, a)
-        // Without release from the back end a click is the press
-        // alone -- honestly worse, but operable.
-        if !(*fx).full && a == fuiwirt.BTN_LEFT {
-            let c2: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+        if a == fuiwirt.BTN_LEFT && (*fx).real {
+            // comes as a record
+        } else if a == fuiwirt.BTN_LEFT && routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_DOWN, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+            if !(*fx).full {
+                let c2: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_UP, 1 as u32,
+                    event.PT_MOUSE, true, x, y, now_ms())
+            }
+        } else {
+            let c: u32 = fuiwirt.host_pointer_down(w, x, y, a)
+            // Without release from the back end a click is the press
+            // alone -- honestly worse, but operable.
+            if !(*fx).full && a == fuiwirt.BTN_LEFT {
+                let c2: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+            }
         }
     } else if k == window.EV_RELEASE {
-        let c: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+        if a == fuiwirt.BTN_LEFT && (*fx).real {
+            // comes as a record
+        } else if a == fuiwirt.BTN_LEFT && routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_UP, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+        } else {
+            let c: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+        }
     } else if k == window.EV_KEY {
         if a == window.K_ESCAPE && (*fx).esc_zu {
             return false
@@ -490,6 +564,12 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     ud: u64) -> bool {
     let f: *mut window.Window = &(*fx).f
     var runs: bool = true
+    if (*fx).real {
+        var pr: pointers.Pointer = pointers.ptr_blank()
+        while window.next_pointer(f, (&pr) as u64) {
+            pointer_record(fx, w, &pr)
+        }
+    }
     var k: u32 = window.next_event(f)
     while k != window.EV_NONE && runs {
         if !fork(fx, w, m, k) {

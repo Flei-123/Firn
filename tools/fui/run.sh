@@ -471,6 +471,25 @@ build event
 "$W/event"
 
 echo
+echo "== 18o2. REAL POINTERS FROM THE WINDOW LAYER (r111) =="
+# tools/fui/pointers_main.fi: synthetic Android MotionEvent streams through
+# lib/window/pointers.fi -- one record per finger, ids that outlive the
+# index, primary per type, lost UPs cancelled, the ring. (The same stream in
+# a real browser: tools/wasm/touchcheck.py; on an emulator with real
+# fingers: tools/android/pointers_check.sh.)
+build pointers
+"$W/pointers"
+
+echo
+echo "== 18o3. A TRANSITION SURVIVES A REBUILD (r110) =="
+# tools/fui/animkey_main.fi: the transition registry keyed by key path --
+# the button half way to its hover colour keeps its colour when the tree is
+# rebuilt (A and B swap, a node is inserted in front); without the keyer the
+# same rebuild makes it jump (counter-check).
+build animkey
+"$W/animkey"
+
+echo
 echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
 # for BOTH platforms from one source -- `import fui.apphost` resolves to
@@ -478,14 +497,27 @@ echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # and tools/fui/app_main.fi drives them without a window (layout, clicks,
 # keys, text fields, wrapping, scale 2). The browser half with Chromium:
 # bash tools/wasm/appdemo.sh.
-for ex in hello_window counter form; do
+for ex in hello_window counter form touchpad; do
     "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
     "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
         "examples/fui/$ex.fi"
 done
-echo "  examples/fui/{hello_window,counter,form}.fi build native + wasm32   OK"
+echo "  examples/fui/{hello_window,counter,form,touchpad}.fi build native + wasm32   OK"
 build app
 "$W/app"
+
+echo
+echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="
+# tools/fui/audit_main.fi shows that lib/fui/audit.fi has teeth (an unnamed
+# button, a duplicate key, a secret in the export are each found);
+# tools/fui/audit.sh then runs every program of examples/fui/*.fi through it
+# (FUI_AUDIT=1: no window, the tree it built, exit code = the result) and
+# requires that a program with a nameless text field FAILS. The programs with
+# a main of their own run the same audit in their own checks: gallery9_main
+# (section 10) and examples/codehub/main.fi (the "audit:" line).
+build audit
+"$W/audit"
+W="$W" sh tools/fui/audit.sh
 
 echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
@@ -658,9 +690,9 @@ echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
 #
 #   painted     demos/fuidemo/main.fi, fn toolbar_painted.
 #   described   tools/fui/gallery9_main.fi, between the marks
-#               ">>> WERKZEUGLEISTE" and "<<< WERKZEUGLEISTE" (the tree)
-#               AND between ">>> LEISTENREGELN" and "<<<
-#               LEISTENREGELN" (its look in the style sheet).
+#               ">>> TOOLBAR" and "<<< TOOLBAR" (the tree)
+#               AND between ">>> BAR RULES" and "<<<
+#               BAR RULES" (its look in the style sheet).
 #
 # WHAT IS NEW IN THIS TAILORING, AND WHY. Until 21.09.2026 there stood
 # on the painted side still the two helpers `setze` and
@@ -707,9 +739,9 @@ ohne_aussehen() {
 }
 awk '/^fn toolbar_painted\(/{p=1} p{print} p&&/^}$/{exit}' \
     demos/fuidemo/main.fi > "$W/gemalt.txt"
-sed -n '/>>> WERKZEUGLEISTE/,/<<< WERKZEUGLEISTE/p' \
+sed -n '/>>> TOOLBAR/,/<<< TOOLBAR/p' \
     tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
-sed -n '/>>> LEISTENREGELN/,/<<< LEISTENREGELN/p' \
+sed -n '/>>> BAR RULES/,/<<< BAR RULES/p' \
     tools/fui/gallery9_main.fi >> "$W/beschrieben.txt"
 ohne_text < "$W/gemalt.txt" > "$W/gemalt_a.txt"
 ohne_text < "$W/beschrieben.txt" > "$W/beschrieben_a.txt"
@@ -726,7 +758,7 @@ echo "  A (ohne Texte): gemalt $gemalt_a, beschrieben $beschrieben_a"
 echo "  B (ohne Texte und Aussehen): gemalt $gemalt_b, beschrieben $beschrieben_b"
 if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
-    echo "  Es fehlen die Marken WERKZEUGLEISTE/LEISTENREGELN in"
+    echo "  Es fehlen die Marken TOOLBAR/BAR RULES in"
     echo "  tools/fui/gallery9_main.fi oder fn toolbar_painted in"
     echo "  demos/fuidemo/main.fi."
     exit 1
@@ -790,8 +822,8 @@ echo "== 19d. DIESELBE LEISTE, DIESELBE DATEI, ZWEI FASSUNGEN =="
 # 952 AND at 260 points of width (there the clamping of the
 # search field takes effect). What is compared are the marks
 #
-#   >>> LEISTE BESCHRIEBEN ... <<< LEISTE BESCHRIEBEN   (fn werkzeugleiste)
-#   >>> LEISTE GEMALT      ... <<< LEISTE GEMALT        (fn toolbar_painted)
+#   >>> TOOLBAR DESCRIBED ... <<< TOOLBAR DESCRIBED   (fn werkzeugleiste)
+#   >>> TOOLBAR PAINTED   ... <<< TOOLBAR PAINTED     (fn toolbar_painted)
 #
 # both in demos/fuidemo/main.fi. Outside the marks lies in BOTH
 # cases only the check (handing out the rectangles, the
@@ -819,9 +851,9 @@ ohne_aussehen_d() {
         -e 'sheet\.sheet_rule' \
         -e 'sheet\.sheet_name' -e 'var n[a-z]*: \[u8;'
 }
-sed -n '/>>> LEISTE BESCHRIEBEN/,/<<< LEISTE BESCHRIEBEN/p' \
+sed -n '/>>> TOOLBAR DESCRIBED/,/<<< TOOLBAR DESCRIBED/p' \
     demos/fuidemo/main.fi > "$W/leiste_b.txt"
-sed -n '/>>> LEISTE GEMALT/,/<<< LEISTE GEMALT/p' \
+sed -n '/>>> TOOLBAR PAINTED/,/<<< TOOLBAR PAINTED/p' \
     demos/fuidemo/main.fi > "$W/leiste_g.txt"
 ohne_text < "$W/leiste_b.txt" > "$W/leiste_ba.txt"
 ohne_text < "$W/leiste_g.txt" > "$W/leiste_ga.txt"
@@ -840,7 +872,7 @@ if [ "$lb" -lt 30 ] || [ "$lg" -lt 30 ] || [ "$lbb" -lt 12 ] \
     || [ "$lgb" -lt 20 ]; then
     echo "  FEHLER: eine der beiden Fassungen wurde nicht gefunden oder"
     echo "  die Filter haben zu viel weggenommen. Es fehlen die Marken"
-    echo "  LEISTE BESCHRIEBEN / LEISTE GEMALT in demos/fuidemo/main.fi."
+    echo "  TOOLBAR DESCRIBED / TOOLBAR PAINTED in demos/fuidemo/main.fi."
     exit 1
 fi
 # RAW AND A: the description must not be LONGER. More is not
