@@ -47,6 +47,14 @@ if [ "$rebuild" -eq 1 ]; then
 fi
 
 same=0
+# Per-run timeout in seconds: 20 on an idle machine, scaled up with the load
+# (load average per core, at most x6) so that a busy server does not turn
+# slow-but-correct programs into false deviations. Override: SELF_COMPARE_TIMEOUT.
+run_timeout() {
+    if [ -n "${SELF_COMPARE_TIMEOUT:-}" ]; then echo "$SELF_COMPARE_TIMEOUT"; return; fi
+    awk -v n="$(nproc)" '{f=$1/n; if (f<1) f=1; if (f>6) f=6; printf "%d", 20*f}' /proc/loadavg
+}
+
 different=0
 noncore=0
 comptime=0
@@ -83,9 +91,10 @@ while IFS= read -r f; do
         [ -z "$first" ] && first="$f (no executable file)"
         continue
     fi
-    timeout 20 "$WORK/ref" > "$WORK/ref.out" 2>/dev/null
+    tmo=$(run_timeout)
+    timeout "$tmo" "$WORK/ref" > "$WORK/ref.out" 2>/dev/null
     rref=$?
-    timeout 20 "$WORK/a.bin" > "$WORK/a.out" 2>/dev/null
+    timeout "$tmo" "$WORK/a.bin" > "$WORK/a.out" 2>/dev/null
     ra=$?
     if [ "$rref" -eq "$ra" ] && cmp -s "$WORK/ref.out" "$WORK/a.out"; then
         same=$((same+1))
